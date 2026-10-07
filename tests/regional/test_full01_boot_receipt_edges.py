@@ -383,18 +383,19 @@ def test_bootstrap_completion_requires_the_current_cpu_and_gpu(
         write_json_atomic(journal, value)
     if damage == "none":
         result = receipts.verify_journal(
-            path, state=state, stage=stage, gpu_arn=GPU_EKS, cpu_arn=CPU_EKS
+            path, state=state, stage=stage, gpu_arns=[GPU_EKS], cpu_arn=CPU_EKS
         )
         assert result == {
             "phase": "site-ready",
             "journal_path_sha256": hashlib.sha256(b"bootstrap-state.json").hexdigest(),
             "journal_sha256": hashlib.sha256(journal.read_bytes()).hexdigest(),
             "attempt_sha256": hashlib.sha256(b"example-deploy-attempt").hexdigest(),
+            "gpu_cluster_count": 1,
         }
     else:
         with pytest.raises(ValueError, match="exactly one current, target-bound"):
             receipts.verify_journal(
-                path, state=state, stage=stage, gpu_arn=GPU_EKS, cpu_arn=CPU_EKS
+                path, state=state, stage=stage, gpu_arns=[GPU_EKS], cpu_arn=CPU_EKS
             )
 
 
@@ -411,16 +412,19 @@ def test_lifecycle_completion_accepts_direct_eks_identity_only_after_completion(
     write_json_atomic(journal, value)
     if completed:
         result = receipts.verify_journal(
-            record, state=state, stage=stage, gpu_arn=GPU_EKS, cpu_arn=CPU_EKS
+            record, state=state, stage=stage, gpu_arns=[GPU_EKS], cpu_arn=CPU_EKS
         )
+        # Cluster stages (2, 3) report one proof per GPU cluster; the uninstall
+        # (4) is one proof.
+        proof = result if stage == 4 else result["journals"][0]
         assert (
-            result["journal_sha256"] == hashlib.sha256(journal.read_bytes()).hexdigest()
+            proof["journal_sha256"] == hashlib.sha256(journal.read_bytes()).hexdigest()
         )
         assert result["phase"] == "COMPLETED"
     else:
         with pytest.raises(ValueError, match="exactly one"):
             receipts.verify_journal(
-                record, state=state, stage=stage, gpu_arn=GPU_EKS, cpu_arn=CPU_EKS
+                record, state=state, stage=stage, gpu_arns=[GPU_EKS], cpu_arn=CPU_EKS
             )
 
 
@@ -430,7 +434,7 @@ def test_join_completion_for_another_gpu_is_not_a_witness(tmp_path: Path) -> Non
     write_json_atomic(journal, value)
     with pytest.raises(ValueError, match="exactly one"):
         receipts.verify_journal(
-            record, state=state, stage=3, gpu_arn=CPU_EKS, cpu_arn=CPU_EKS
+            record, state=state, stage=3, gpu_arns=[CPU_EKS], cpu_arn=CPU_EKS
         )
 
 
@@ -445,7 +449,7 @@ def test_uninstall_witness_requires_keep_and_database_reset(
     write_json_atomic(journal, {**value, **change})
     with pytest.raises(ValueError, match="exactly one"):
         receipts.verify_journal(
-            record, state=state, stage=4, gpu_arn=GPU_EKS, cpu_arn=CPU_EKS
+            record, state=state, stage=4, gpu_arns=[GPU_EKS], cpu_arn=CPU_EKS
         )
 
 
@@ -878,7 +882,7 @@ def test_snapshot_verification_rejects_wrong_stage_or_policy_before_reading(
             state=tmp_path / "state",
             stage=stage,
             cpu_arn=CPU_EKS,
-            gpu_arn=GPU_EKS,
+            gpu_arns=[GPU_EKS],
             aurora_final_snapshot=policy,
         )
     assert not (tmp_path / "missing.json").exists(), (

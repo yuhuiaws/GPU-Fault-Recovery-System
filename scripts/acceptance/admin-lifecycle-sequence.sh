@@ -4,8 +4,10 @@
 #
 #   1  cold first deploy (BuildKit caches, local runtime images and the site's
 #      ECR image/buildcache tags are gone before the build)
-#   2  remove-cluster of the site's only GPU cluster
-#   3  join-cluster --gpu-cluster-arn re-attach
+#   2  remove-cluster of every GPU cluster, one ARN at a time in the given
+#      order, ending in the zero-GPU-cluster steady state
+#   3  one join-cluster re-attaching every GPU cluster (a plain-EKS member's
+#      --gpu-nodegroup / --node-selector passed through as given)
 #   4  uninstall --cpu-cluster keep --reset-database
 #      (--aurora-final-snapshot retain|skip, default retain)
 #   5  cold first deploy again, into a second empty state directory, strictly
@@ -31,7 +33,9 @@ umask 077
 usage() {
   cat >&2 <<'USAGE'
 usage: admin-lifecycle-sequence.sh --state-dir DIR --cpu-cluster-arn ARN
-         --gpu-cluster-arn ARN --admin-email EMAIL --repo CHECKOUT
+         --gpu-cluster-arn ARN [--gpu-cluster-arn ARN ...]
+         [--gpu-nodegroup NODEGROUP | --node-selector SELECTOR  (plain-EKS members)]
+         --admin-email EMAIL --repo CHECKOUT
          [--stage N] [--second-state-dir DIR] [--email-wait-minutes M  (stage 1 only)]
          [--previous-site-id ID] [--aurora-final-snapshot retain|skip]
          --confirm-isolated-build-host
@@ -39,14 +43,18 @@ USAGE
   exit 2
 }
 
-STATE_DIR="" CPU_ARN="" GPU_ARN="" ADMIN_EMAIL="" REPO="" START_STAGE=1
+STATE_DIR="" CPU_ARN="" ADMIN_EMAIL="" REPO="" START_STAGE=1
+GPU_ARNS=() EKS_FLAG_NAME="" EKS_FLAG_VALUE=""
 SECOND_STATE_DIR="" EMAIL_WAIT=0 PREVIOUS_SITE_ID="" ISOLATED_BUILD_HOST=false
 AURORA_FINAL_SNAPSHOT=retain
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --state-dir) STATE_DIR="$2"; shift 2 ;;
     --cpu-cluster-arn) CPU_ARN="$2"; shift 2 ;;
-    --gpu-cluster-arn) GPU_ARN="$2"; shift 2 ;;
+    --gpu-cluster-arn) [[ $# -ge 2 ]] || usage; GPU_ARNS+=("$2"); shift 2 ;;
+    --gpu-nodegroup|--node-selector)
+      [[ $# -ge 2 && -z "$EKS_FLAG_NAME" ]] || usage
+      EKS_FLAG_NAME="$1"; EKS_FLAG_VALUE="$2"; shift 2 ;;
     --admin-email) ADMIN_EMAIL="$2"; shift 2 ;;
     --repo) REPO="$2"; shift 2 ;;
     --stage) START_STAGE="$2"; shift 2 ;;
@@ -58,7 +66,19 @@ while [[ $# -gt 0 ]]; do
     *) usage ;;
   esac
 done
-[[ -n "$STATE_DIR" && -n "$CPU_ARN" && -n "$GPU_ARN" && -n "$ADMIN_EMAIL" && -n "$REPO" ]] || usage
+[[ -n "$STATE_DIR" && -n "$CPU_ARN" && ${#GPU_ARNS[@]} -ge 1 && -n "$ADMIN_EMAIL" && -n "$REPO" ]] || usage
+[[ -z "$EKS_FLAG_NAME" || -n "$EKS_FLAG_VALUE" ]] || usage
+# The repeated flag for deploy/join-cluster, the per-ARN receipt arguments and
+# the plain-EKS selector pass-through, in the operator's order.
+GPU_ARN_ARGS=() GPU_RECEIPT_ARGS=() EKS_ARGS=() EKS_FLAG=""
+for arn in "${GPU_ARNS[@]}"; do
+  GPU_ARN_ARGS+=(--gpu-cluster-arn "$arn")
+  GPU_RECEIPT_ARGS+=(--gpu-arn "$arn")
+done
+if [[ -n "$EKS_FLAG_NAME" ]]; then
+  EKS_ARGS=("$EKS_FLAG_NAME" "$EKS_FLAG_VALUE")
+  EKS_FLAG="${EKS_FLAG_NAME}=${EKS_FLAG_VALUE}"
+fi
 [[ "$START_STAGE" =~ ^[1-5]$ ]] || usage
 [[ "$EMAIL_WAIT" =~ ^[0-9]+$ ]] || usage
 [[ "$AURORA_FINAL_SNAPSHOT" =~ ^(retain|skip)$ ]] || usage
@@ -104,7 +124,8 @@ init_record() {
   install -d -m 0700 "$ACCEPT_DIR"
   python3 -m scripts.e2e.regional.boot029_receipts init --record "$RECORD" \
     --state "$STATE_DIR" --second-state "$SECOND_STATE_DIR" --stage "$START_STAGE" \
-    --cpu-arn "$CPU_ARN" --gpu-arn "$GPU_ARN" --email "$ADMIN_EMAIL" \
+    --cpu-arn "$CPU_ARN" "${GPU_RECEIPT_ARGS[@]}" "--eks-flag=$EKS_FLAG" \
+    --email "$ADMIN_EMAIL" \
     --repo "$REPO" --previous-site-id "$PREVIOUS_SITE_ID" --email-wait "$EMAIL_WAIT" \
     --aurora-final-snapshot "$AURORA_FINAL_SNAPSHOT"
 }
@@ -153,14 +174,20 @@ run_admin() {  # waits for the command to exit; never backgrounds a deploy
   "${command[@]}" 2>&1 | tee -a "$STAGE_LOG" || return "$?"
 }
 
-assert_current_journal() {
-  local policy=()
+assert_current_journal() {  # STATE_DIR [GPU_ARN ...]: default every GPU cluster
+  local state="$1" policy=() arns=()
+  shift
+  if [[ $# -gt 0 ]]; then
+    for arn in "$@"; do arns+=(--gpu-arn "$arn"); done
+  else
+    arns=("${GPU_RECEIPT_ARGS[@]}")
+  fi
   if [[ "$CURRENT_STAGE" == 4 ]]; then
     policy=(--aurora-final-snapshot "$AURORA_FINAL_SNAPSHOT")
   fi
   python3 -m scripts.e2e.regional.boot029_receipts verify --record "$RECORD" \
-    --state "$1" --stage "$CURRENT_STAGE" --cpu-arn "$CPU_ARN" --gpu-arn "$GPU_ARN" \
-    "${policy[@]}" >>"${STAGE_LOG}.extra.json"
+    --state "$state" --stage "$CURRENT_STAGE" --cpu-arn "$CPU_ARN" "${arns[@]}" \
+    ${policy[@]+"${policy[@]}"} >>"${STAGE_LOG}.extra.json"
 }
 
 # --- cold build ------------------------------------------------------------
@@ -198,15 +225,17 @@ assert_cold_build() {  # the stage log must show a full, uncached image build
 run_path_deploy() {  # STATE_DIR: the driver's own four-argument deploy (stage 1)
   local wait=()
   [[ "$EMAIL_WAIT" -gt 0 ]] && wait=(--wait-for-email-confirmation "$EMAIL_WAIT")
-  run_admin deploy --cpu-cluster-arn "$CPU_ARN" --gpu-cluster-arn "$GPU_ARN" \
-    --state-dir "$1" --admin-email "$ADMIN_EMAIL" "${wait[@]}"
+  run_admin deploy --cpu-cluster-arn "$CPU_ARN" "${GPU_ARN_ARGS[@]}" \
+    ${EKS_ARGS[@]+"${EKS_ARGS[@]}"} \
+    --state-dir "$1" --admin-email "$ADMIN_EMAIL" ${wait[@]+"${wait[@]}"}
 }
 
 run_readme_deploy() {  # STATE_DIR: README.md's procedure, verbatim, clean environment
   log "README procedure from $REPO/README.md (waiting for the process to exit)"
   python3 -m scripts.e2e.regional.boot029_readme --readme "$REPO/README.md" \
     --repo "$REPO" --work-dir "$ACCEPT_DIR/stage-5-readme" --attempt "$CURRENT_ATTEMPT" \
-    --cpu-arn "$CPU_ARN" --gpu-arn "$GPU_ARN" --state-dir "$1" \
+    --cpu-arn "$CPU_ARN" "${GPU_RECEIPT_ARGS[@]}" ${EKS_ARGS[@]+"${EKS_ARGS[@]}"} \
+    --state-dir "$1" \
     --admin-email "$ADMIN_EMAIL" --receipt "${STAGE_LOG}.extra.json" 2>&1 |
     tee -a "$STAGE_LOG" || return "$?"
 }
@@ -225,14 +254,19 @@ deploy_fresh() {  # STATE_DIR SITE_ID_FOR_ECR_CHECK DEPLOY_FUNCTION
 
 stage_1() { deploy_fresh "$STATE_DIR" "$PREVIOUS_SITE_ID" run_path_deploy; }
 
-stage_2() {
-  run_admin remove-cluster --state-dir "$STATE_DIR" --gpu-cluster-arn "$GPU_ARN" \
-    --confirm REMOVE_GPU_CLUSTER
-  assert_current_journal "$STATE_DIR"
+stage_2() {  # one ARN at a time; every removed cluster's journal is asserted
+  local removed=()
+  for arn in "${GPU_ARNS[@]}"; do
+    run_admin remove-cluster --state-dir "$STATE_DIR" --gpu-cluster-arn "$arn" \
+      --confirm REMOVE_GPU_CLUSTER
+    removed+=("$arn")
+    assert_current_journal "$STATE_DIR" "${removed[@]}"
+  done
 }
 
-stage_3() {
-  run_admin join-cluster --state-dir "$STATE_DIR" --gpu-cluster-arn "$GPU_ARN"
+stage_3() {  # one join-cluster for every GPU cluster; one journal per ARN
+  run_admin join-cluster --state-dir "$STATE_DIR" "${GPU_ARN_ARGS[@]}" \
+    ${EKS_ARGS[@]+"${EKS_ARGS[@]}"}
   assert_current_journal "$STATE_DIR"
 }
 

@@ -310,7 +310,9 @@ def test_make_binding_requires_same_agent_incarnation_and_runtime_pins() -> None
             expires_at=value["expires_at"],
             node_identity=scope["node_uid"],
         )
-    with pytest.raises(probe.RecoveryError):
+    # An Agent record without an identity is refused as the node's non-Agent
+    # before the probe's own binding validation gets to its missing pins.
+    with pytest.raises(controller.RegionalFixtureError, match="provider identity"):
         controller.make_binding(
             scope=scope,
             owner=value["owner"],

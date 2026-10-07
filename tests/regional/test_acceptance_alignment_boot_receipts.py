@@ -50,25 +50,25 @@ def test_completion_journal_cannot_be_stale_or_from_a_different_target(tmp_path)
     receipts.start_stage(path, state=state, stage=2)
     with pytest.raises(ValueError, match="exactly one"):
         receipts.verify_journal(
-            path, state=state, stage=2, gpu_arn="gpu", cpu_arn="cpu"
+            path, state=state, stage=2, gpu_arns=["gpu"], cpu_arn="cpu"
         )
     value["updated_at"] = "new-mtime-is-not-new-operation"
     write_json_atomic(old, value)
     with pytest.raises(ValueError, match="exactly one"):
         receipts.verify_journal(
-            path, state=state, stage=2, gpu_arn="gpu", cpu_arn="cpu"
+            path, state=state, stage=2, gpu_arns=["gpu"], cpu_arn="cpu"
         )
     value["attempt_id"] = "b" * 32
     write_json_atomic(old, value)
     assert (
         receipts.verify_journal(
-            path, state=state, stage=2, gpu_arn="gpu", cpu_arn="cpu"
+            path, state=state, stage=2, gpu_arns=["gpu"], cpu_arn="cpu"
         )["phase"]
         == "COMPLETED"
     )
     with pytest.raises(ValueError, match="exactly one"):
         receipts.verify_journal(
-            path, state=state, stage=2, gpu_arn="sibling", cpu_arn="cpu"
+            path, state=state, stage=2, gpu_arns=["sibling"], cpu_arn="cpu"
         )
 
 

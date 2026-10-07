@@ -3616,6 +3616,11 @@ When the corresponding lifecycle was not performed the companion stays `NOT_RUN`
 
 **`remove-cluster` deregisters the site's only GPU cluster: full state machine, label-owned RBAC cleanup, second annotation clear and CPU-only steady state**
 
+> Both providers: an `eks-managed` cluster is deregistered with the same `remove-cluster --gpu-cluster-arn <EKS ARN>`; it has no
+> HyperPod identity, the DISCOVERED evidence's `provider_identity` carries the EKS ARN only and `target` must not carry a HyperPod
+> row (the `is_eks_managed` branch of `cluster_removal.py`). On a site with several GPU clusters `BOOT-029` S2 runs this once per
+> GPU cluster; the last removal reaches this case's step-6 zero-cluster steady state.
+
 - Level: `live-service-action`. Deletes the product data plane on the target GPU cluster and its registration in the CPU
   control plane; does not reboot/replace nodes, does not stop training jobs (the precondition requires that the target cluster has
   no managed jobs); the underlying CPU/GPU EKS and HyperPod clusters are retained.
@@ -3753,6 +3758,12 @@ node names appear only as sha256 digests; per-step durations are not recorded.
 ### GF-REGIONAL-BOOT-025
 
 **`join-cluster --gpu-cluster-arn` re-attach after removal: node subnet CIDRs, DNS gate retry, collector events during PENDING, executor ready before the first claim, wave safety looks only at live Agents, rollback after a forced failure and rediscovery on retry**
+
+> Both providers: an `eks-managed` cluster is re-attached with the same `join-cluster`, and one command may carry several
+> `--gpu-cluster-arn`; a plain-EKS member adds `--gpu-nodegroup <managed node group>` (or `--node-selector`, default
+> `nvidia.com/gpu.present=true`), its node image must carry `python3.12`/`strace`, and the managed workload namespaces (`training`
+> by default) must already exist; every ARN has its own `join-cluster/<arn_sha256_12>/state.json`. `BOOT-029` S3 re-attaches every
+> GPU cluster in one command.
 
 - Level: `live-service-action`. Reinstalls the product data plane on the same GPU cluster removed by `BOOT-024`
   and registers it back into the CPU control plane; the negative segment uses one reversible cluster DNS outage to force a release failure and
@@ -4202,9 +4213,10 @@ and does not count towards its sequence.
 
 **Administrator deployment lifecycle sequence: cold-build first `deploy` → `remove-cluster` → `join-cluster` → `uninstall keep + reset-database` → cold-build first `deploy` again**
 
-- Level: `live-service-action`. On a pair of empty clusters, fully installs the product, deregisters and re-joins the
-  only GPU cluster, uninstalls the whole site and deletes Aurora, then installs from zero again; no node reboot/replace,
-  no stopping of training jobs (the GPU cluster is required to have no managed job throughout); the underlying CPU/GPU
+- Level: `live-service-action`. On a set of empty clusters, fully installs the product, deregisters every GPU cluster one by one and
+  re-joins them all in one command (HyperPod and `eks-managed` members alike), uninstalls the whole site and deletes Aurora, then
+  installs from zero again; no node reboot/replace, no stopping of training jobs (every GPU cluster is required to have no managed
+  job throughout); the underlying CPU/GPU
   EKS and HyperPod clusters are retained.
   The second first-time deployment (S5) is executed **strictly by the text of the repository root README**: the README
   is the object under test, and no parameter, environment variable or precondition beyond the three steps it spells out
@@ -4248,7 +4260,7 @@ and does not count towards its sequence.
 
 #### Preconditions and isolation
 
-1. A pair of **empty** clusters: the CPU and GPU EKS/HyperPod clusters exist, but there is no product namespace, no
+1. A set of **empty** clusters: the CPU cluster and every GPU EKS/HyperPod cluster to be managed exist, but there is no product namespace, no
    registry Secret, no Aurora cluster, no `gpu-fault/runtime-*` ECR repository.
    Uninstalling the site left by a `BOOT-028` PASS with the command of `BOOT-027` step 1 (without injecting the
    interruption) yields this state; another pair of never-deployed clusters also works. The isolation and permission
@@ -4277,11 +4289,15 @@ and does not count towards its sequence.
    For an unattended S1 give the driver `--email-wait-minutes <M>` (passed through as `--wait-for-email-confirmation`,
    **applies to S1 only**); S5 runs by the README's literal text without a wait parameter, see the note under S5
    about the two attempts.
-5. Throughout, the GPU cluster has no PENDING/RUNNING/WAITING workflow, open remote command,
+5. Throughout, no GPU cluster has a PENDING/RUNNING/WAITING workflow, open remote command,
    budget claim or managed training job, and no node carries `gpu-fault.io/quarantined`.
 6. Baseline (read-only): `aws ecr describe-repositories` shows no `gpu-fault/runtime-*`;
    `docker images` shows no `gpu-fault-runtime*`; `docker buildx du` is empty after cleanup;
-   Aurora has no cluster; the target namespace does not exist on either cluster.
+   Aurora has no cluster; the target namespace does not exist on any cluster.
+7. `eks-managed` members: the GPU node image carries `python3.12` and `strace`, the workload namespace `training` exists, and the
+   GPU nodes carry `nvidia.com/gpu.present=true` (or the operator gives the driver `--gpu-nodegroup <nodegroup>` /
+   `--node-selector <selector>`, passed through as given to S1's `deploy` and S3's `join-cluster`; S5 adds it only when the README's
+   deployment section documents that parameter, see S5).
 
 #### Steps
 
@@ -4297,11 +4313,18 @@ that the command has stopped:
 scripts/acceptance/admin-lifecycle-sequence.sh \
   --state-dir <STATE_DIR> \
   --cpu-cluster-arn <CPU_EKS_ARN> \
-  --gpu-cluster-arn <GPU_EKS_ARN> \
+  --gpu-cluster-arn <GPU_ARN_1> \
+  --gpu-cluster-arn <GPU_ARN_2> \
+  --gpu-nodegroup <EKS_NODEGROUP> \
   --admin-email <ADMIN_EMAIL> \
   --repo <CHECKOUT> \
   --confirm-isolated-build-host
 ```
+
+`--gpu-cluster-arn` is given once per GPU cluster in the order they are managed (a single-GPU-cluster site has one line);
+`--gpu-nodegroup`/`--node-selector` is given only when an `eks-managed` member is present, and the driver passes it through as
+given to S1's `deploy` and S3's `join-cluster` (HyperPod members ignore it). The ARN list (with its order) and that flag enter the
+sequence's input digest (`gpu_cluster_arns_sha256`, `eks_flag_sha256`); a resume may not change them.
 
 After all five stages PASS, uninstalling the second site and starting again with `--stage 5` is the S5 rerun: the
 receipt keeps the already-passed S5 receipt under `reruns`, S5's attempt numbers keep counting up and mark the rerun
@@ -4335,12 +4358,15 @@ stages or after everything has finished, following the references below.
    ```bash
    gpu-fault-admin deploy \
      --cpu-cluster-arn <CPU_EKS_ARN> \
-     --gpu-cluster-arn <GPU_EKS_ARN> \
+     --gpu-cluster-arn <GPU_ARN_1> \
+     --gpu-cluster-arn <GPU_ARN_2> \
+     --gpu-nodegroup <EKS_NODEGROUP> \
      --state-dir <STATE_DIR> \
      --admin-email <ADMIN_EMAIL>
    ```
 
-   Check: the `phase` of `<STATE_DIR>/bootstrap-state.json` goes through `new` → `discovered` →
+   The driver asserts that `initial_deploy_target.gpu_clusters` in `bootstrap-state.json` lists exactly the GPU clusters given
+   (receipt `gpu_cluster_count`). Check: the `phase` of `<STATE_DIR>/bootstrap-state.json` goes through `new` → `discovered` →
    `aws-infrastructure-ready` → `platform-prerequisites-ready` → `site-ready`;
    the checks of `BOOT-028` steps 3–6 hold item by item (SNS has exactly one confirmed subscription; the ECR runtime
    repository goes from empty to three release-bound images each with signature and build proof rather than registry
@@ -4350,33 +4376,38 @@ stages or after everything has finished, following the references below.
    the BuildKit output in the deployment log (the driver sets `BUILDKIT_PROGRESS=plain`) and binds the
    `control_plane`, `executor` and `node_dependencies` descriptors separately:
    `registry_reused=false`, each with no `CACHED` layer and with a base-image pull record.
-2. **S2: deregister the only GPU cluster.**
+2. **S2: deregister every GPU cluster, one at a time.** Once per GPU cluster, in the order given (one ARN per call):
 
    ```bash
    gpu-fault-admin remove-cluster \
      --state-dir <STATE_DIR> \
-     --gpu-cluster-arn <GPU_EKS_ARN> \
+     --gpu-cluster-arn <GPU_ARN_N> \
      --confirm REMOVE_GPU_CLUSTER
    ```
 
-   The driver asserts that `<STATE_DIR>/remove-cluster/<cluster_id>/state.json` ends in
-   `phase=COMPLETED`. The checklist is `BOOT-024` step 2 (all `completed_steps`:
+   After each removal the driver asserts that this cluster's `<STATE_DIR>/remove-cluster/<cluster_id>/state.json` ends in
+   `phase=COMPLETED` (the receipt's `journals` records one proof per ARN, in order); after the last removal the site is in the
+   zero-GPU-cluster CPU-only steady state (`BOOT-024` step 6). An `eks-managed` member goes through the same command (see the
+   provider note of `BOOT-024`). The checklist is `BOOT-024` step 2 (all `completed_steps`:
    `DISCOVERED` → `CONTROL_REGISTRY_DRAINING` → `KUBERNETES_QUIESCED` →
    `KUBERNETES_REMOVED` → `CONTROL_REGISTRY_REMOVED`/`AWS_DETACHED` →
    `AURORA_UPDATED` → `SITE_COMMIT_STARTED` → `SITE_UPDATED` →
    `RELEASE_STATE_UPDATED` → `VERIFIED`),
    step 4 (GPU side) and step 5 (CPU side). The SIGINT resume of `BOOT-024` step 3 and the zero-cluster `deploy` and
    idempotent rerun of steps 6–7 are not executed in this stage (optional; doing them does not affect later stages).
-3. **S3: re-join the same GPU cluster.**
+3. **S3: one `join-cluster` re-attaches every GPU cluster.**
 
    ```bash
    gpu-fault-admin join-cluster \
      --state-dir <STATE_DIR> \
-     --gpu-cluster-arn <GPU_EKS_ARN>
+     --gpu-cluster-arn <GPU_ARN_1> \
+     --gpu-cluster-arn <GPU_ARN_2> \
+     --gpu-nodegroup <EKS_NODEGROUP>
    ```
 
-   The driver asserts that `<STATE_DIR>/join-cluster/<arn_sha256_12>/state.json` ends in
-   `phase=COMPLETED`. The checklist is the step sequence of `BOOT-025` step 2 (`PRECHECKED` →
+   For every ARN the driver asserts that `<STATE_DIR>/join-cluster/<arn_sha256_12>/state.json` ends in
+   `phase=COMPLETED` (the receipt's `journals` records one proof per ARN); `--gpu-nodegroup`/`--node-selector` only applies to
+   `eks-managed` members. The checklist is the step sequence of `BOOT-025` step 2 (`PRECHECKED` →
    `DISCOVERED` → `LOCAL_INPUTS_READY` → `PREREQUISITES_READY` → `CANDIDATE_READY` →
    `RELEASE_STARTED` → `JOINED` → `COLLECTORS_READY` → `VERIFIED` → `SITE_UPDATED` →
    `RELEASE_STATE_UPDATED` → `REGISTRY_UPDATED` → `ACTIVATION_STARTED` → `ACTIVATED` →
@@ -4426,11 +4457,17 @@ stages or after everything has finished, following the references below.
      block is executed. The deploy block must start with `gpu-fault-admin deploy`, and the four placeholders
      `<cpu-eks-or-hyperpod-arn>`, `<gpu-eks-or-hyperpod-arn>`, the example path
      `/secure/gpu-fault` and `<operations-email>` must each appear exactly once; they are replaced by
-     `<CPU_EKS_ARN>`, `<GPU_EKS_ARN>`, `<STATE_DIR_SECOND>` and `<ADMIN_EMAIL>` respectively;
-     no `--wait-for-email-confirmation` or any other parameter is added. A missing heading, a missing code block, a
+     `<CPU_EKS_ARN>`, each GPU cluster ARN, `<STATE_DIR_SECOND>` and `<ADMIN_EMAIL>` respectively: with more than one GPU
+     cluster the `--gpu-cluster-arn` line holding the placeholder is expanded into one line per ARN (indentation and
+     continuation kept) exactly as the README's own deployment-section sentence "repeat `--gpu-cluster-arn` for several GPU
+     clusters" authorises, and is refused when the README no longer says so; the `--gpu-nodegroup`/`--node-selector` the
+     operator gave the driver is appended as one line only when the README's deployment section documents that parameter,
+     and is refused -- naming the missing sentence -- when it does not: that is the README defect S5 exists to find, never
+     patched in the driver; no `--wait-for-email-confirmation` or any other parameter is added. A missing heading, a missing code block, a
      wrong placeholder count, or a build block that lacks the two lines above or has them in reverse order fails the
      stage immediately and names the heading.
-     S5 therefore executes exactly and only the README's three steps: `make deploy-host-setup-online`,
+     S5 therefore executes exactly and only the README's three steps (the deploy command being the README's own, its GPU
+     cluster line expanded by the README's rule): `make deploy-host-setup-online`,
      `. .venv/bin/activate`, and the four-argument `gpu-fault-admin deploy`.
    - **Pristine source copy.** The three steps run in a copy of `<CHECKOUT>` constructed the same way as the deploy
      source snapshot (`scripts/staging_source_snapshot.py::prepare_source_checkout`):
@@ -10018,7 +10055,15 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   the warm-spare node view (labels + `providerID`) and records it as `sibling_identity` in `preflight.json` -- the plain
   `regional.node_snapshot` projection has neither, resolving from it fell back to the Node UID and refused an Agent that
   correctly recorded the instance id (attempt 12); `node_agent_identity.agent_node_identity` answers None for a view that
-  cannot tell its provider (fail-closed) instead of falling back. The binding itself still keys on the Node UID.
+  cannot tell its provider (fail-closed) instead of falling back. The binding itself still keys on the Node UID. The host
+  recovery probe (`probes/destr014_recovery_probe.py`) pins the Agent env's `GPU_FAULT_NODE_INSTANCE_ID` to the binding's
+  `agent_identity` (the same provider identity) and no longer compares it with the Node UID -- on eks, prepare used to
+  refuse with "Node Agent target or release pins changed" before installing any unit while the runner only saw
+  "error RecoveryError; output withheld"; every RecoveryError is a constant sentence and now travels back in the
+  `HostProbeError` (`recovery refused: …`). prepare also compiles and imports the helper under the system interpreter the
+  recovery timer will use (`/usr/bin/python3`, 3.9 on AL2023), refusing by name ("recovery helper interpreter …") and
+  recording the version as the journal's `interpreter`. Judgement: `tests/regional/test_destr014_binding_identity.py`,
+  `tests/regional/test_destr014_recovery_probe.py`.
   Judgement: `tests/regional/test_destr014_binding_identity.py`.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr014_branch_exhaustion.py`. By default it only generates the

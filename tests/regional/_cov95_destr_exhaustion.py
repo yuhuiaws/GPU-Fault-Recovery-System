@@ -165,6 +165,9 @@ class ExhaustionHarness(BranchHarness):
             cluster_id=self.settings.regional.cluster_id,
             node=data.SIBLING,
             node_uid=self.nodes[data.SIBLING]["uid"],
+            # HyperPod shape: the Agent env's GPU_FAULT_NODE_INSTANCE_ID is the
+            # Node UID, which is also what the runner's make_binding pins.
+            agent_identity=self.nodes[data.SIBLING]["uid"],
             boot_id=self.nodes[data.SIBLING]["boot_id"],
             profile_version=self.profile["profile_version"],
         )

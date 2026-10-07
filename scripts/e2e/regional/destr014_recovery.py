@@ -398,6 +398,8 @@ def make_binding(
         "cluster_id": scope["cluster_id"],
         "node": scope["node"],
         "node_uid": scope["node_uid"],
+        # The host probe pins the Agent env's GPU_FAULT_NODE_INSTANCE_ID to this.
+        "agent_identity": node_identity,
         "boot_id": scope["boot_id"],
         "artifact_sha256": agent.get("artifact_sha256"),
         "bundle_sha256": agent.get("installer_bundle_sha256"),
@@ -405,13 +407,15 @@ def make_binding(
         "restore_at": restore_at,
         "expires_at": expires_at,
     }
-    host.binding_key(binding)
+    # The identity refusal comes first: a missing provider identity would
+    # otherwise surface as the probe's generic "binding identity is invalid".
     if not node_identity or agent.get("node_instance_id") != node_identity:
         raise RegionalFixtureError(
             "DESTR-014 Agent identity differs from the node's provider identity "
             f"(Agent node_instance_id={agent.get('node_instance_id')!r}, "
             f"node={scope.get('node')!r} expects {node_identity!r})"
         )
+    host.binding_key(binding)
     return binding
 
 

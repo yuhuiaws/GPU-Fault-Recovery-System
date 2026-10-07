@@ -227,8 +227,10 @@ def test_main_rejects_a_journal_key_that_no_longer_matches_binding(
     assert probe.main(["tick", "--key", host.recovery.key]) == 1
     assert json.loads(capsys.readouterr().out) == {
         "error": "RecoveryError",
+        "error_kind": "recovery",
+        "message": "recovery journal key changed",
         "recovery_required": True,
-    }
+    }, "a refusal names its constant reason; nothing else leaves the probe"
 
 
 def test_disabled_phase_requires_durable_disable_intent(host: HostHarness) -> None:

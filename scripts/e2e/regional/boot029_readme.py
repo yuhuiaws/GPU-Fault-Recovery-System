@@ -8,6 +8,13 @@ checkout in a clean environment. The README text is the source of truth:
 nothing here spells out the commands, so a README that no longer deploys fails
 this stage, and so does a README procedure that only works with something the
 README does not mention.
+
+A site with several GPU clusters (a mixed HyperPod + plain-EKS site) renders
+one ``--gpu-cluster-arn`` line per cluster, and a plain-EKS member's selector
+flag (``--gpu-nodegroup`` / ``--node-selector``) -- each only because, and only
+when, the README's deployment section itself says so. A README that does not
+state the repetition or the flag refuses the stage: that missing sentence is
+the README defect the stage exists to find.
 """
 
 from __future__ import annotations
@@ -21,7 +28,7 @@ import subprocess
 import sys
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from scripts.e2e.regional.boot029_receipts import digest
 from scripts.staging_source_snapshot import prepare_source_checkout
@@ -42,6 +49,12 @@ PLACEHOLDERS = (
     STATE_DIR_PLACEHOLDER,
     EMAIL_PLACEHOLDER,
 )
+GPU_FLAG = "--gpu-cluster-arn"
+#: The flags a plain-EKS GPU cluster may need; rendered only when the README's
+#: deployment section documents the one the operator gave.
+EKS_FLAGS = ("--gpu-nodegroup", "--node-selector")
+#: Words with which the README's deployment section says the GPU flag repeats.
+REPEAT_WORDS = ("多个", "重复", "repeat", "several", "multiple")
 VENV_COMPONENTS = frozenset({".venv", "deployer-venv", ".deployer-venv.versions"})
 KEPT_NAMES = frozenset(
     {
@@ -74,6 +87,47 @@ class ReadmeProcedure:
     deploy_block: str
     executed_lines: tuple[str, ...]
     skipped_verification_lines: tuple[str, ...]
+    #: The deployment section says ``--gpu-cluster-arn`` is repeated per cluster.
+    repeat_gpu_arn_documented: bool = False
+    #: The plain-EKS selector flags the deployment section documents.
+    documented_eks_flags: frozenset[str] = frozenset()
+
+
+def deploy_section(text: str) -> str:
+    """The README text from the deploy heading to the next level-2 heading."""
+
+    lines = text.splitlines()
+    try:
+        start = next(
+            index for index, line in enumerate(lines) if line.strip() == DEPLOY_HEADING
+        )
+    except StopIteration:
+        raise ReadmeProcedureError(
+            f"README lacks the heading {DEPLOY_HEADING!r}"
+        ) from None
+    section: list[str] = []
+    for line in lines[start + 1 :]:
+        if re.match(r"^ {0,3}##(?:\s|$)", line):
+            break
+        section.append(line)
+    return "\n".join(section)
+
+
+def _mentions_flag(text: str, flag: str) -> bool:
+    """``flag`` named in code font, alone or with its argument (`--x <value>`)."""
+
+    return re.search("`" + re.escape(flag) + r"(?=[\s`])", text) is not None
+
+
+def repeat_gpu_arn_documented(section: str) -> bool:
+    return any(
+        _mentions_flag(line, GPU_FLAG) and any(word in line for word in REPEAT_WORDS)
+        for line in section.splitlines()
+    )
+
+
+def documented_eks_flags(section: str) -> frozenset[str]:
+    return frozenset(flag for flag in EKS_FLAGS if _mentions_flag(section, flag))
 
 
 def fenced_bash_block(text: str, heading: str) -> str:
@@ -163,12 +217,15 @@ def parse_readme(text: str) -> ReadmeProcedure:
             f"the block under {BUILD_HEADING!r} must run {SETUP_LINE!r} and then "
             f"{ACTIVATE_LINES[0]!r} before the deploy command"
         )
+    section = deploy_section(text)
     return ReadmeProcedure(
         readme_sha256=digest(text.encode()),
         build_block=build_block,
         deploy_block=deploy_block,
         executed_lines=tuple(executed),
         skipped_verification_lines=tuple(skipped),
+        repeat_gpu_arn_documented=repeat_gpu_arn_documented(section),
+        documented_eks_flags=documented_eks_flags(section),
     )
 
 
@@ -178,16 +235,53 @@ def substitute(block: str, values: Mapping[str, str]) -> str:
     return block
 
 
-def render_deploy_command(
-    block: str, *, cpu_arn: str, gpu_arn: str, state_dir: str, admin_email: str
+def expand_gpu_lines(
+    block: str, gpu_values: Sequence[str], extra: Sequence[str]
 ) -> str:
-    """The README command with the run's values; nothing added."""
+    """The block with its GPU placeholder line repeated once per value.
 
+    The README writes one ``--gpu-cluster-arn <placeholder>`` line and says the
+    flag is repeated for several clusters: that line is reproduced once per
+    value, keeping its indentation and continuation, and ``extra`` lines (a
+    documented plain-EKS flag) follow it in the same shape.
+    """
+
+    if not gpu_values:
+        raise ReadmeProcedureError("at least one GPU cluster is required")
+    lines = block.splitlines()
+    index = next(
+        position for position, line in enumerate(lines) if GPU_PLACEHOLDER in line
+    )
+    template = lines[index].rstrip()
+    indent = template[: len(template) - len(template.lstrip())]
+    continued = template.endswith("\\")
+    core = template[:-1].rstrip() if continued else template
+    rendered = [core.replace(GPU_PLACEHOLDER, value) for value in gpu_values]
+    rendered.extend(f"{indent}{text}" for text in extra)
+    if continued:
+        rendered = [f"{line} \\" for line in rendered]
+    else:
+        rendered = [f"{line} \\" for line in rendered[:-1]] + rendered[-1:]
+    lines[index : index + 1] = rendered
+    return "\n".join(lines)
+
+
+def render_deploy_command(
+    block: str,
+    *,
+    cpu_arn: str,
+    gpu_arns: Sequence[str],
+    state_dir: str,
+    admin_email: str,
+    eks_flag: tuple[str, str] | None = None,
+) -> str:
+    """The README command with the run's values; nothing else added."""
+
+    extra = [f"{eks_flag[0]} {shlex.quote(eks_flag[1])}"] if eks_flag else []
     return substitute(
-        block,
+        expand_gpu_lines(block, [shlex.quote(arn) for arn in gpu_arns], extra),
         {
             CPU_PLACEHOLDER: shlex.quote(cpu_arn),
-            GPU_PLACEHOLDER: shlex.quote(gpu_arn),
             STATE_DIR_PLACEHOLDER: shlex.quote(state_dir),
             EMAIL_PLACEHOLDER: shlex.quote(admin_email),
         },
@@ -195,22 +289,50 @@ def render_deploy_command(
 
 
 def redacted_deploy_command(
-    block: str, *, cpu_arn: str, gpu_arn: str, state_dir: str, admin_email: str
+    block: str,
+    *,
+    cpu_arn: str,
+    gpu_arns: Sequence[str],
+    state_dir: str,
+    admin_email: str,
+    eks_flag: tuple[str, str] | None = None,
 ) -> str:
     """The same command for the receipt: every substituted value as a digest."""
 
+    def redacted(value: str) -> str:
+        return "sha256:" + digest(value.encode())
+
+    extra = [f"{eks_flag[0]} {redacted(eks_flag[1])}"] if eks_flag else []
     return substitute(
-        block,
+        expand_gpu_lines(block, [redacted(arn) for arn in gpu_arns], extra),
         {
-            placeholder: "sha256:" + digest(value.encode())
-            for placeholder, value in (
-                (CPU_PLACEHOLDER, cpu_arn),
-                (GPU_PLACEHOLDER, gpu_arn),
-                (STATE_DIR_PLACEHOLDER, state_dir),
-                (EMAIL_PLACEHOLDER, admin_email),
-            )
+            CPU_PLACEHOLDER: redacted(cpu_arn),
+            STATE_DIR_PLACEHOLDER: redacted(state_dir),
+            EMAIL_PLACEHOLDER: redacted(admin_email),
         },
     )
+
+
+def require_readme_authority(
+    procedure: ReadmeProcedure,
+    *,
+    gpu_arns: Sequence[str],
+    eks_flag: tuple[str, str] | None,
+) -> None:
+    """Refuse to render what the README's deployment section does not state."""
+
+    if len(gpu_arns) > 1 and not procedure.repeat_gpu_arn_documented:
+        raise ReadmeProcedureError(
+            f"README's section {DEPLOY_HEADING!r} does not say that {GPU_FLAG} is "
+            "repeated for several GPU clusters; the stage adds nothing the README "
+            "does not state"
+        )
+    if eks_flag is not None and eks_flag[0] not in procedure.documented_eks_flags:
+        raise ReadmeProcedureError(
+            f"README's section {DEPLOY_HEADING!r} does not document {eks_flag[0]} "
+            "for a plain EKS GPU cluster; the stage adds nothing the README does "
+            "not state"
+        )
 
 
 def is_venv_entry(entry: str) -> bool:
@@ -393,22 +515,25 @@ def run(
     work_dir: Path,
     attempt: int,
     cpu_arn: str,
-    gpu_arn: str,
+    gpu_arns: Sequence[str],
     state_dir: Path,
     admin_email: str,
     receipt: Path,
     parent_environment: Mapping[str, str],
+    eks_flag: tuple[str, str] | None = None,
 ) -> int:
     procedure = parse_readme(readme.read_text(encoding="utf-8"))
+    require_readme_authority(procedure, gpu_arns=gpu_arns, eks_flag=eks_flag)
     attempt_dir = work_dir / f"attempt-{attempt}"
     attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     base_commit = _git(repository, "rev-parse", "HEAD")
     checkout = pristine_source(repository, attempt_dir)
-    values = {
+    values: dict[str, Any] = {
         "cpu_arn": cpu_arn,
-        "gpu_arn": gpu_arn,
+        "gpu_arns": list(gpu_arns),
         "state_dir": str(state_dir),
         "admin_email": admin_email,
+        "eks_flag": eks_flag,
     }
     script = stage_script(
         checkout.repository_root,
@@ -431,6 +556,12 @@ def run(
         attempt=attempt,
         shadow_root=shadow_root,
     )
+    entry["readme"].update(
+        gpu_cluster_count=len(gpu_arns),
+        repeat_gpu_arn_documented=procedure.repeat_gpu_arn_documented,
+        documented_eks_flags=sorted(procedure.documented_eks_flags),
+        eks_flag=eks_flag[0] if eks_flag else None,
+    )
     with receipt.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(entry, sort_keys=True) + "\n")
     print(
@@ -452,13 +583,26 @@ def main() -> None:
     parser.add_argument("--work-dir", type=Path, required=True)
     parser.add_argument("--attempt", type=int, required=True)
     parser.add_argument("--cpu-arn", required=True)
-    parser.add_argument("--gpu-arn", required=True)
+    parser.add_argument(
+        "--gpu-arn",
+        action="append",
+        required=True,
+        help="GPU cluster ARN, once per managed GPU cluster in the run's order",
+    )
+    selector = parser.add_mutually_exclusive_group()
+    selector.add_argument("--gpu-nodegroup", metavar="NODEGROUP")
+    selector.add_argument("--node-selector", metavar="SELECTOR")
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--admin-email", required=True)
     parser.add_argument("--receipt", type=Path, required=True)
     args = parser.parse_args()
     if args.attempt < 1:
         parser.error("attempt must be positive")
+    eks_flag: tuple[str, str] | None = None
+    if args.gpu_nodegroup:
+        eks_flag = ("--gpu-nodegroup", args.gpu_nodegroup)
+    elif args.node_selector:
+        eks_flag = ("--node-selector", args.node_selector)
     try:
         code = run(
             readme=args.readme,
@@ -466,11 +610,12 @@ def main() -> None:
             work_dir=args.work_dir,
             attempt=args.attempt,
             cpu_arn=args.cpu_arn,
-            gpu_arn=args.gpu_arn,
+            gpu_arns=list(args.gpu_arn),
             state_dir=args.state_dir.resolve(),
             admin_email=args.admin_email,
             receipt=args.receipt,
             parent_environment=os.environ,
+            eks_flag=eks_flag,
         )
     except (
         ReadmeProcedureError,

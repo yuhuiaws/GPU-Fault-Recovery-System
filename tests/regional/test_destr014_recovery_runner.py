@@ -22,7 +22,10 @@ class RunnerHarness:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self.host = HostHarness(tmp_path, monkeypatch)
         self.host.scope.update(
-            node=verdicts.SIBLING, node_uid=f"uid-{verdicts.SIBLING}"
+            node=verdicts.SIBLING,
+            node_uid=f"uid-{verdicts.SIBLING}",
+            # HyperPod shape: the Agent env pin equals the Node UID the binding pins.
+            agent_identity=f"uid-{verdicts.SIBLING}",
         )
         host_probe.AGENT_ENV.write_text(
             "\n".join(

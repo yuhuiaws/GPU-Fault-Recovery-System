@@ -34,7 +34,11 @@ START_SECONDS = 45
 PIN_KEYS = {
     "cluster_id": "GPU_FAULT_NODE_CLUSTER_ID",
     "node": "NODE_NAME",
-    "node_uid": "GPU_FAULT_NODE_INSTANCE_ID",
+    # What the provider's installer bound the Agent to: the Kubernetes Node UID
+    # on HyperPod, the EC2 instance id on a plain-EKS node. The controller
+    # resolves it per provider; comparing the env with the binding's Node UID
+    # refused every eks-managed sibling with "pins changed".
+    "agent_identity": "GPU_FAULT_NODE_INSTANCE_ID",
     "artifact_sha256": "GPU_FAULT_NODE_ARTIFACT_SHA256",
     "bundle_sha256": "GPU_FAULT_NODE_INSTALLER_BUNDLE_SHA256",
     "profile_version": "GPU_FAULT_NODE_RUNTIME_PROFILE_VERSION",
@@ -46,16 +50,53 @@ BINDING_KEYS = {
     "release_id",
     "plan_sha256",
     "helper_sha256",
+    "node_uid",
     "boot_id",
     "restore_at",
     "expires_at",
     *PIN_KEYS,
 }
+#: Safe-text form of a refusal: every ``RecoveryError`` message is a constant.
+MESSAGE_PATTERN = re.compile(r"[A-Za-z0-9 ,;:'()./_-]{1,160}")
 TERMINAL = {"RESTORED", "EXPIRED", "CLOSING", "CLOSED"}
 
 
 class RecoveryError(RuntimeError):
     pass
+
+
+def interpreter_check(python: Path, helper: Path) -> dict[str, Any]:
+    """Prove the system interpreter can run the independent helper.
+
+    The timer runs ``PYTHON -I -S -B recovery.py tick`` -- the system Python,
+    isolated from the product's venv on purpose. AL2023 ships ``/usr/bin/python3``
+    as 3.9 while the product itself needs 3.12, so the helper must be proven
+    to compile and import under *that* interpreter before the Agent is
+    disabled: a helper that cannot start would leave the Agent down until the
+    window expires with nothing to restore it.
+    """
+
+    probe = (
+        "import ast, sys; "
+        "import argparse, contextlib, fcntl, hashlib, json, math, os, re, shlex, "
+        "stat, subprocess, tempfile, time; "
+        "ast.parse(open(sys.argv[1], encoding='utf-8').read(), sys.argv[1]); "
+        "print('%d.%d' % sys.version_info[:2])"
+    )
+    try:
+        completed = subprocess.run(
+            [str(python), "-I", "-S", "-B", "-c", probe, str(helper)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise RecoveryError("recovery helper interpreter is unusable") from exc
+    version = completed.stdout.strip()
+    if completed.returncode != 0 or not re.fullmatch(r"[0-9]+\.[0-9]+", version):
+        raise RecoveryError("recovery helper interpreter cannot run the helper")
+    return {"path": str(python), "version": version}
 
 
 def digest(value: Any) -> str:
@@ -599,6 +640,8 @@ class Recovery:
             script = Path(__file__).read_bytes()
             if hashlib.sha256(script).hexdigest() != self.binding["helper_sha256"]:
                 raise RecoveryError("recovery helper source drifted")
+            self.record["interpreter"] = interpreter_check(PYTHON, Path(__file__))
+            self.save()
             self.resource("helper", self.directory / "recovery.py", script)
             self.dropin.parent.mkdir(mode=0o755, exist_ok=True)
             require_system_directory(self.dropin.parent)
@@ -1054,6 +1097,23 @@ def main(argv: list[str] | None = None) -> int:
         report = getattr(recovery, args.command)()
         print(json.dumps(report, sort_keys=True, allow_nan=False))
         return 0
+    except RecoveryError as exc:
+        # Every RecoveryError message is a constant: safe to hand back so the
+        # runner's HostProbeError names the refused condition.
+        message = str(exc)
+        print(
+            json.dumps(
+                {
+                    "error": type(exc).__name__,
+                    "error_kind": "recovery",
+                    "message": (
+                        message if MESSAGE_PATTERN.fullmatch(message) else None
+                    ),
+                    "recovery_required": True,
+                }
+            )
+        )
+        return 1
     except Exception as exc:
         print(json.dumps({"error": type(exc).__name__, "recovery_required": True}))
         return 1

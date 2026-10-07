@@ -613,6 +613,16 @@ class HostProbeFixture:
                     diagnostic += f"; collector-env guard {code}"
                 if site:
                     diagnostic += f" at {site}"
+            message = payload.get("message")
+            if (
+                kind == "recovery"
+                and isinstance(message, str)
+                and re.fullmatch(r"[A-Za-z0-9 ,;:'()./_-]{1,160}", message)
+            ):
+                # The recovery probe's refusals are constant sentences (its
+                # RecoveryError messages); a message in this shape names the
+                # refused condition and carries no path or credential.
+                diagnostic += f"; recovery refused: {message}"
             if kind == "power_identity":
                 # A power restore refused after a reboot (exit 78): the digest
                 # and site as above, plus the *kinds* of files the operation

@@ -3,8 +3,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import stat
 import subprocess
+import sys
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,6 +27,9 @@ def binding() -> dict[str, Any]:
         "cluster_id": "cluster-test",
         "node": "node-test",
         "node_uid": "uid-test",
+        # HyperPod shape: the Agent is bound to the Node UID. The eks test
+        # rewrites the env and binding with an EC2 instance id.
+        "agent_identity": "uid-test",
         "boot_id": "boot-before",
         "artifact_sha256": "b" * 64,
         "bundle_sha256": "c" * 64,
@@ -94,6 +99,9 @@ class HostHarness:
         monkeypatch.setattr(probe.time, "monotonic", lambda: self.now)
         monkeypatch.setattr(probe.time, "sleep", self.sleep)
         monkeypatch.setattr(probe, "systemctl", self.systemctl)
+        # The fake interpreter is a text file; the real check runs it.
+        self.interpreter_checks: list[tuple[Path, Path]] = []
+        monkeypatch.setattr(probe, "interpreter_check", self.interpreter_check)
 
         original_lstat = Path.lstat
         original_is_link = Path.is_symlink
@@ -182,6 +190,10 @@ class HostHarness:
 
     def sleep(self, seconds: float) -> None:
         self.now += seconds
+
+    def interpreter_check(self, python: Path, helper: Path) -> dict[str, Any]:
+        self.interpreter_checks.append((python, helper))
+        return {"path": str(python), "version": "3.9"}
 
     def systemctl(self, *args: str) -> dict[str, str]:
         self.calls.append(args)
@@ -1186,3 +1198,81 @@ def test_prepare_keeps_the_fence_while_a_stale_recovery_still_owns_units(
     assert probe.file_identity(probe.ROOT / "active") == before, (
         "a stale recovery whose units are still installed keeps its claim"
     )
+
+
+EKS_INSTANCE = "i-00000000000000001"
+
+
+def _rewrite_agent_env(host: HostHarness, binding: dict[str, Any]) -> None:
+    probe.AGENT_ENV.write_text(
+        "# installer literals\n\n"
+        + "\n".join(f"{name}={binding[key]}" for key, name in probe.PIN_KEYS.items())
+    )
+
+
+def test_eks_agent_identity_is_pinned_by_the_instance_not_the_node_uid(
+    host: HostHarness,
+) -> None:
+    """Live eks-managed DESTR-014 attempt 13: the Agent env carries the EC2
+    instance id, the probe compared it with the binding's Kubernetes Node UID
+    and refused prepare with "Node Agent target or release pins changed" -- a
+    message the runner never saw. The binding's agent_identity is the pin."""
+    eks = {**binding(), "agent_identity": EKS_INSTANCE}
+    _rewrite_agent_env(host, eks)
+
+    report = probe.Recovery(eks).prepare()
+
+    assert report["phase"] == "INSTALLED"
+    assert host.recovery.binding["node_uid"] == "uid-test", "the fixture binding"
+    assert eks["node_uid"] == "uid-test" and eks["agent_identity"] == EKS_INSTANCE
+    assert host.interpreter_checks and host.interpreter_checks[0][0] == probe.PYTHON, (
+        "prepare proves the system interpreter can run the helper"
+    )
+    record = probe.read_record(probe.ROOT / probe.binding_key(eks) / "state.json")
+    assert record["interpreter"] == {"path": str(probe.PYTHON), "version": "3.9"}
+
+
+def test_a_node_uid_binding_against_an_eks_agent_is_refused_by_name(
+    host: HostHarness,
+) -> None:
+    """The pre-fix shape: the env carries the instance id, the binding pins the
+    Node UID; the probe refuses before installing anything, and the Agent's
+    boot link is untouched."""
+    _rewrite_agent_env(host, {**binding(), "agent_identity": EKS_INSTANCE})
+
+    with pytest.raises(probe.RecoveryError, match="pins changed"):
+        host.recovery.prepare()
+
+    assert host.enable.exists(), "a refused prepare must not disable the Agent"
+
+
+def test_interpreter_check_runs_the_helper_under_the_given_python(
+    tmp_path: Path,
+) -> None:
+    report = probe.interpreter_check(Path(sys.executable), Path(probe.__file__))
+    assert report["path"] == sys.executable
+    assert re.fullmatch(r"3\.[0-9]+", report["version"]), report
+    unusable = tmp_path / "python3"
+    unusable.write_text("not an interpreter")
+    unusable.chmod(0o600)
+    with pytest.raises(probe.RecoveryError, match="interpreter is unusable"):
+        probe.interpreter_check(unusable, Path(probe.__file__))
+    broken = tmp_path / "helper.py"
+    broken.write_text("def (:\n")
+    with pytest.raises(probe.RecoveryError, match="cannot run the helper"):
+        probe.interpreter_check(Path(sys.executable), broken)
+
+
+def test_main_reports_a_refusal_with_its_constant_message(
+    host: HostHarness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    stale = {**binding(), "agent_identity": "uid-other"}
+
+    code = probe.main(["prepare", "--binding", json.dumps(stale)])
+
+    assert code == 1
+    payload = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert payload["error"] == "RecoveryError"
+    assert payload["error_kind"] == "recovery"
+    assert payload["message"] == "Node Agent target or release pins changed"
+    assert payload["recovery_required"] is True

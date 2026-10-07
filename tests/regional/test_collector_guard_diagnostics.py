@@ -140,6 +140,47 @@ def test_host_failure_names_the_sanitized_error_type_only(
 
 
 @pytest.mark.parametrize(
+    ("message", "exposed"),
+    [
+        ("Node Agent target or release pins changed", True),
+        ("recovery helper interpreter cannot run the helper", True),
+        ("token=abc", False),
+        ("two\nlines", False),
+        ("x" * 161, False),
+    ],
+)
+def test_recovery_refusal_message_is_surfaced_only_in_its_constant_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, message: str, exposed: bool
+) -> None:
+    """The DESTR-014 recovery probe's refusals are constant sentences
+    (``error_kind: recovery``); live eks attempt 13 stopped on a bare
+    "error RecoveryError" because the sentence stayed withheld. Only the
+    constant shape passes: anything with '=', a newline or beyond the length
+    bound is still withheld."""
+
+    api = ProbeApi()
+    monkeypatch.setattr(host, "run_fixture_command", api.run)
+    fixture = host_probe(tmp_path)
+    fixture.create()
+    api.probe_returncode = 1
+    api.probe_stdout = json.dumps(
+        {
+            "error": "RecoveryError",
+            "error_kind": "recovery",
+            "message": message,
+            "recovery_required": True,
+        }
+    )
+    with pytest.raises(host.HostProbeError) as caught:
+        fixture.execute("prepare")
+    text = str(caught.value)
+    assert "; error RecoveryError" in text and text.endswith("; output withheld"), text
+    assert (f"; recovery refused: {message}" in text) is exposed, text
+    if not exposed:
+        assert "recovery refused" not in text and message[:5] not in text, text
+
+
+@pytest.mark.parametrize(
     "problem", [None, "class", "code", "site"], ids=["valid", "class", "code", "site"]
 )
 def test_host_failure_surfaces_sanitized_probe_class_code_and_site(

@@ -240,62 +240,71 @@ def _uninstall_cpu_matches(state: Path, cpu_arn: str, eks_arn: object) -> bool:
     return _saved_hyperpod_alias(cpu_arn, eks_arn, initial.get("cpu"))
 
 
-def verify_journal(
-    path: Path,
-    *,
+def _deploy_target_matches(
+    value: dict[str, Any], *, cpu_arn: str, gpu_arns: list[str]
+) -> bool:
+    """The first deploy named this CPU cluster and exactly these GPU clusters."""
+
+    target = (value.get("resources") or {}).get("initial_deploy_target") or {}
+    clusters = target.get("gpu_clusters") or []
+    return (
+        value.get("phase") == "site-ready"
+        and cpu_arn in (target.get("cpu") or {}).values()
+        and len(clusters) == len(gpu_arns)
+        and all(
+            any(gpu_arn in item.values() for item in clusters) for gpu_arn in gpu_arns
+        )
+    )
+
+
+def _cluster_journal_matches(
+    value: dict[str, Any], *, stage: int, gpu_arn: str
+) -> bool:
+    """A COMPLETED remove-cluster (2) or join-cluster (3) journal for ``gpu_arn``."""
+
+    if value.get("phase") != "COMPLETED":
+        return False
+    if stage == 3:
+        return gpu_arn == value.get("gpu_cluster_arn")
+    target = value.get("target") or {}
+    if gpu_arn == target.get("eks_cluster_arn"):
+        return True
+    discovery = (value.get("evidence") or {}).get("DISCOVERED") or {}
+    return _saved_hyperpod_alias(
+        gpu_arn, target.get("eks_cluster_arn"), discovery.get("provider_identity")
+    )
+
+
+def _uninstall_journal_matches(
+    value: dict[str, Any], *, state: Path, cpu_arn: str
+) -> bool:
+    return (
+        value.get("phase") == "COMPLETED"
+        and value.get("cpu_disposition") == "keep"
+        and value.get("reset_database") is True
+        and _uninstall_cpu_matches(
+            state, cpu_arn, (value.get("site_identity") or {}).get("cpu_eks_arn")
+        )
+    )
+
+
+def _current_completion(
     state: Path,
     stage: int,
-    gpu_arn: str,
-    cpu_arn: str,
-    aurora_final_snapshot: str | None = None,
+    baseline: dict[str, Any],
+    matches: Any,
+    *,
+    what: str,
 ) -> dict[str, Any]:
-    if aurora_final_snapshot is not None and (
-        stage != 4 or aurora_final_snapshot not in {"retain", "skip"}
-    ):
-        raise ValueError(
-            "snapshot policy verification requires stage 4 and retain|skip"
-        )
-    record = read(path)
-    baseline = record["stages"][str(stage)]["journal_baseline"]
+    """Exactly one completion journal that matches and is newer than the baseline."""
+
     candidates: list[dict[str, Any]] = []
     for candidate in journal_paths(state, stage):
         if not candidate.exists():
             continue
         value = read(candidate)
-        if stage in {1, 5}:
-            target = (value.get("resources") or {}).get("initial_deploy_target") or {}
-            if (
-                value.get("phase") != "site-ready"
-                or cpu_arn not in (target.get("cpu") or {}).values()
-                or not any(
-                    gpu_arn in item.values() for item in target.get("gpu_clusters", [])
-                )
-            ):
-                continue
-        else:
-            target = value.get("target") or {}
-            if value.get("phase") != "COMPLETED":
-                continue
-            if stage == 2 and gpu_arn != target.get("eks_cluster_arn"):
-                discovery = (value.get("evidence") or {}).get("DISCOVERED") or {}
-                if not _saved_hyperpod_alias(
-                    gpu_arn,
-                    target.get("eks_cluster_arn"),
-                    discovery.get("provider_identity"),
-                ):
-                    continue
-            if stage == 3 and gpu_arn != value.get("gpu_cluster_arn"):
-                continue
-            if stage == 4 and (
-                value.get("cpu_disposition") != "keep"
-                or value.get("reset_database") is not True
-                or not _uninstall_cpu_matches(
-                    state,
-                    cpu_arn,
-                    (value.get("site_identity") or {}).get("cpu_eks_arn"),
-                )
-            ):
-                continue
+        if not matches(value):
+            continue
         identity = str(candidate.relative_to(state))
         old = baseline.get(identity, {})
         attempt = value.get("attempt_id", value.get("attempt"))
@@ -311,9 +320,74 @@ def verify_journal(
         )
     if len(candidates) != 1:
         raise ValueError(
-            "exactly one current, target-bound completion journal is required"
+            "exactly one current, target-bound completion journal is required "
+            f"({what}; found {len(candidates)})"
         )
-    proof = candidates[0]
+    return candidates[0]
+
+
+def verify_journal(
+    path: Path,
+    *,
+    state: Path,
+    stage: int,
+    gpu_arns: list[str],
+    cpu_arn: str,
+    aurora_final_snapshot: str | None = None,
+) -> dict[str, Any]:
+    """The stage's completion proof, bound to the run's clusters.
+
+    Stages 1 and 5 require the first deploy to name exactly the run's GPU
+    clusters; stages 2 and 3 require one current COMPLETED journal per GPU
+    cluster (``journals``, in the run's order: a mixed HyperPod + eks-managed
+    site removes its clusters one by one and re-joins them in one command);
+    stage 4 is the one uninstall journal.
+    """
+
+    if aurora_final_snapshot is not None and (
+        stage != 4 or aurora_final_snapshot not in {"retain", "skip"}
+    ):
+        raise ValueError(
+            "snapshot policy verification requires stage 4 and retain|skip"
+        )
+    if stage != 4 and not gpu_arns:
+        raise ValueError("journal verification requires at least one GPU cluster")
+    record = read(path)
+    baseline = record["stages"][str(stage)]["journal_baseline"]
+    if stage in {1, 5}:
+        proof = _current_completion(
+            state,
+            stage,
+            baseline,
+            lambda value: _deploy_target_matches(
+                value, cpu_arn=cpu_arn, gpu_arns=gpu_arns
+            ),
+            what="first deploy",
+        )
+        proof["gpu_cluster_count"] = len(gpu_arns)
+        return proof
+    if stage in {2, 3}:
+        journals = []
+        for index, gpu_arn in enumerate(gpu_arns):
+            proof = _current_completion(
+                state,
+                stage,
+                baseline,
+                lambda value, arn=gpu_arn: _cluster_journal_matches(
+                    value, stage=stage, gpu_arn=arn
+                ),
+                what=f"GPU cluster {index + 1}/{len(gpu_arns)}",
+            )
+            proof["gpu_arn_sha256"] = digest(gpu_arn.encode())
+            journals.append(proof)
+        return {"phase": "COMPLETED", "journals": journals}
+    proof = _current_completion(
+        state,
+        stage,
+        baseline,
+        lambda value: _uninstall_journal_matches(value, state=state, cpu_arn=cpu_arn),
+        what="uninstall",
+    )
     if aurora_final_snapshot is not None:
         inputs = record.get("inputs")
         if not isinstance(inputs, dict) or inputs.get(
@@ -471,7 +545,17 @@ def main() -> None:
     parser.add_argument("--stage", type=int, choices=range(1, 6), required=True)
     parser.add_argument("--second-state", type=Path)
     parser.add_argument("--cpu-arn", default="")
-    parser.add_argument("--gpu-arn", default="")
+    parser.add_argument(
+        "--gpu-arn",
+        action="append",
+        default=[],
+        help="GPU cluster ARN, once per managed GPU cluster in the run's order",
+    )
+    parser.add_argument(
+        "--eks-flag",
+        default="",
+        help="the plain-EKS selector flag passed through to deploy/join, if any",
+    )
     parser.add_argument("--email", default="")
     parser.add_argument("--repo", type=Path)
     parser.add_argument("--previous-site-id", default="")
@@ -488,7 +572,8 @@ def main() -> None:
                 parser.error("init requires repo and second-state")
             inputs = {
                 "cpu_cluster_arn": args.cpu_arn,
-                "gpu_cluster_arn": args.gpu_arn,
+                "gpu_cluster_arns": "\n".join(args.gpu_arn),
+                "eks_flag": args.eks_flag,
                 "admin_email": args.email,
                 "state_dir": str(args.state.resolve()),
                 "second_state_dir": str(args.second_state.resolve()),
@@ -519,7 +604,7 @@ def main() -> None:
                         args.record,
                         state=args.state,
                         stage=args.stage,
-                        gpu_arn=args.gpu_arn,
+                        gpu_arns=list(args.gpu_arn),
                         cpu_arn=args.cpu_arn,
                         aurora_final_snapshot=args.aurora_final_snapshot,
                     )

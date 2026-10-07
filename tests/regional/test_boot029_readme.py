@@ -25,12 +25,18 @@ ROOT = Path(__file__).resolve().parents[2]
 README_TEXT = (ROOT / "README.md").read_text(encoding="utf-8")
 CPU_ARN = "arn:aws:eks:us-west-2:123456789012:cluster/cpu-fixture"
 GPU_ARN = "arn:aws:eks:us-west-2:123456789012:cluster/gpu-fixture"
+EKS_GPU_ARN = "arn:aws:eks:us-west-2:123456789012:cluster/gpu-eks-fixture"
 ADMIN_EMAIL = "admin@example.com"
 VALUES = {
     "cpu_arn": CPU_ARN,
-    "gpu_arn": GPU_ARN,
+    "gpu_arns": [GPU_ARN],
     "state_dir": "/private/state dir/second",
     "admin_email": ADMIN_EMAIL,
+}
+MIXED_VALUES = {
+    **VALUES,
+    "gpu_arns": [GPU_ARN, EKS_GPU_ARN],
+    "eks_flag": ("--gpu-nodegroup", "gpu-p5en-efa-spot-node-group"),
 }
 
 
@@ -112,6 +118,99 @@ def test_rendering_substitutes_only_the_four_placeholders() -> None:
     assert rendered.count("\n") == procedure.deploy_block.count("\n"), (
         "the command keeps the README's line shape"
     )
+
+
+def test_real_readme_documents_the_repeated_gpu_flag_and_the_eks_selector() -> None:
+    procedure = readme.parse_readme(README_TEXT)
+
+    assert procedure.repeat_gpu_arn_documented is True, (
+        "the README deployment section must say --gpu-cluster-arn repeats per cluster"
+    )
+    assert procedure.documented_eks_flags == frozenset(
+        {"--gpu-nodegroup", "--node-selector"}
+    ), "the README deployment section must document the plain-EKS selector flags"
+
+
+def test_rendering_a_mixed_site_repeats_the_gpu_line_and_adds_the_documented_flag() -> (
+    None
+):
+    """A HyperPod + plain-EKS site: one --gpu-cluster-arn line per cluster, in the
+    operator's order, then the plain-EKS flag the README documents; nothing else."""
+    procedure = readme.parse_readme(README_TEXT)
+
+    rendered = readme.render_deploy_command(procedure.deploy_block, **MIXED_VALUES)
+
+    assert readme.shell_words(rendered) == [
+        "gpu-fault-admin",
+        "deploy",
+        "--cpu-cluster-arn",
+        CPU_ARN,
+        "--gpu-cluster-arn",
+        GPU_ARN,
+        "--gpu-cluster-arn",
+        EKS_GPU_ARN,
+        "--gpu-nodegroup",
+        "gpu-p5en-efa-spot-node-group",
+        "--state-dir",
+        VALUES["state_dir"],
+        "--admin-email",
+        ADMIN_EMAIL,
+    ], "the GPU line is repeated per cluster and the documented flag follows it"
+    assert rendered.count("\n") == procedure.deploy_block.count("\n") + 2, (
+        "two lines were added: the second cluster and the flag"
+    )
+    continued = [line for line in rendered.splitlines()[:-1]]
+    assert all(line.rstrip().endswith("\\") for line in continued), (
+        "every line but the last keeps the README's continuation"
+    )
+    redacted = readme.redacted_deploy_command(procedure.deploy_block, **MIXED_VALUES)
+    for secret in (CPU_ARN, GPU_ARN, EKS_GPU_ARN, "gpu-p5en-efa-spot-node-group"):
+        assert secret not in redacted, f"{secret} appears in clear in the receipt"
+        assert f"sha256:{_sha256(secret)}" in redacted
+    assert readme.shell_words(redacted)[2::2] == readme.shell_words(rendered)[2::2], (
+        "the redacted command keeps the flag sequence of the rendered one"
+    )
+
+
+def test_readme_authority_is_required_for_repetition_and_the_eks_flag() -> None:
+    procedure = readme.parse_readme(README_TEXT)
+    silent = readme.ReadmeProcedure(
+        readme_sha256=procedure.readme_sha256,
+        build_block=procedure.build_block,
+        deploy_block=procedure.deploy_block,
+        executed_lines=procedure.executed_lines,
+        skipped_verification_lines=procedure.skipped_verification_lines,
+    )
+
+    readme.require_readme_authority(procedure, gpu_arns=[GPU_ARN], eks_flag=None)
+    readme.require_readme_authority(
+        procedure, gpu_arns=MIXED_VALUES["gpu_arns"], eks_flag=MIXED_VALUES["eks_flag"]
+    )
+    readme.require_readme_authority(silent, gpu_arns=[GPU_ARN], eks_flag=None)
+    with pytest.raises(readme.ReadmeProcedureError, match="repeated for several"):
+        readme.require_readme_authority(
+            silent, gpu_arns=MIXED_VALUES["gpu_arns"], eks_flag=None
+        )
+    with pytest.raises(readme.ReadmeProcedureError, match="does not document"):
+        readme.require_readme_authority(
+            silent, gpu_arns=[GPU_ARN], eks_flag=("--gpu-nodegroup", "g")
+        )
+    with pytest.raises(readme.ReadmeProcedureError, match="does not document"):
+        readme.require_readme_authority(
+            procedure, gpu_arns=[GPU_ARN], eks_flag=("--gpu-selector", "g")
+        )
+
+
+def test_deploy_section_authority_reads_only_the_deployment_section() -> None:
+    text = README_TEXT.replace(
+        "多个GPU集群重复传`--gpu-cluster-arn`", "多个GPU集群见下文"
+    ).replace("`--gpu-nodegroup <托管节点组名>`", "托管节点组名")
+    section = readme.deploy_section(text)
+    assert readme.repeat_gpu_arn_documented(section) is False
+    assert "--gpu-nodegroup" not in readme.documented_eks_flags(section)
+    assert "--node-selector" in readme.documented_eks_flags(section)
+    with pytest.raises(readme.ReadmeProcedureError, match="lacks the heading"):
+        readme.deploy_section(text.replace(readme.DEPLOY_HEADING, "## 部署"))
 
 
 def _drop_heading(heading: str) -> Callable[[str], str]:
@@ -540,7 +639,7 @@ def test_run_executes_the_readme_procedure_in_a_clean_environment(
         work_dir=tmp_path / "work",
         attempt=1,
         cpu_arn=CPU_ARN,
-        gpu_arn=GPU_ARN,
+        gpu_arns=[GPU_ARN],
         state_dir=tmp_path / "second",
         admin_email=ADMIN_EMAIL,
         receipt=receipt,
@@ -581,6 +680,8 @@ def test_run_executes_the_readme_procedure_in_a_clean_environment(
     assert len(lines) == 1, "one receipt line per attempt, written before the run"
     entry = json.loads(lines[0])["readme"]
     assert entry["attempt"] == 1 and entry["venv_preexisted"] is False
+    assert entry["gpu_cluster_count"] == 1 and entry["eks_flag"] is None
+    assert entry["repeat_gpu_arn_documented"] is True
     assert entry["source_commit"] == _git(repository, "rev-parse", "HEAD")
     script = tmp_path / "work/attempt-1" / readme.SCRIPT_NAME
     assert script.stat().st_mode & 0o777 == 0o700
@@ -604,7 +705,7 @@ def test_run_refuses_before_touching_anything_when_the_readme_is_defective(
             work_dir=tmp_path / "work",
             attempt=1,
             cpu_arn=CPU_ARN,
-            gpu_arn=GPU_ARN,
+            gpu_arns=[GPU_ARN],
             state_dir=tmp_path / "second",
             admin_email=ADMIN_EMAIL,
             receipt=receipt,
@@ -613,3 +714,32 @@ def test_run_refuses_before_touching_anything_when_the_readme_is_defective(
 
     assert not (tmp_path / "work").exists(), "no pristine copy is made"
     assert not receipt.exists() and not (tmp_path / "admin.json").exists()
+
+
+def test_run_refuses_a_mixed_site_the_readme_does_not_describe(tmp_path: Path) -> None:
+    """A README that stops saying the GPU flag repeats, or stops documenting the
+    plain-EKS selector, cannot deploy a mixed site verbatim: the stage refuses
+    before copying anything, naming the missing sentence as the README defect."""
+    repository = _procedure_repository(tmp_path, exit_code=0)
+    (repository / "README.md").write_text(
+        README_TEXT.replace(
+            "多个GPU集群重复传`--gpu-cluster-arn`", "多个GPU集群见下文"
+        ),
+        encoding="utf-8",
+    )
+    receipt = tmp_path / "stage.extra.json"
+
+    with pytest.raises(readme.ReadmeProcedureError, match="repeated for several"):
+        readme.run(
+            readme=repository / "README.md",
+            repository=repository,
+            work_dir=tmp_path / "work",
+            attempt=1,
+            cpu_arn=CPU_ARN,
+            gpu_arns=[GPU_ARN, EKS_GPU_ARN],
+            state_dir=tmp_path / "second",
+            admin_email=ADMIN_EMAIL,
+            receipt=receipt,
+            parent_environment={},
+        )
+    assert not (tmp_path / "work").exists() and not receipt.exists()

@@ -71,10 +71,14 @@ def test_completion_matches_saved_hyperpod_alias_without_discovery(tmp_path, sta
     receipts.start_stage(record, state=state, stage=stage)
     write_json_atomic(journal, value)
     result = receipts.verify_journal(
-        record, state=state, stage=stage, gpu_arn=GPU_HYPERPOD, cpu_arn=CPU_HYPERPOD
+        record, state=state, stage=stage, gpu_arns=[GPU_HYPERPOD], cpu_arn=CPU_HYPERPOD
     )
     assert result["phase"] == "COMPLETED"
-    assert result["journal_sha256"] == receipts.digest(journal.read_bytes())
+    # Cluster stages report one proof per GPU cluster; the uninstall is one proof.
+    proof = result if stage == 4 else result["journals"][0]
+    assert proof["journal_sha256"] == receipts.digest(journal.read_bytes())
+    if stage != 4:
+        assert proof["gpu_arn_sha256"] == receipts.digest(GPU_HYPERPOD.encode())
     assert GPU_HYPERPOD not in str(result) and CPU_HYPERPOD not in str(result)
 
 
@@ -100,7 +104,7 @@ def test_removal_alias_requires_discovery_bound_to_the_same_eks(tmp_path, damage
     write_json_atomic(journal, value)
     with pytest.raises(ValueError, match="exactly one"):
         receipts.verify_journal(
-            record, state=state, stage=2, gpu_arn=GPU_HYPERPOD, cpu_arn=CPU_HYPERPOD
+            record, state=state, stage=2, gpu_arns=[GPU_HYPERPOD], cpu_arn=CPU_HYPERPOD
         )
 
 
@@ -142,7 +146,7 @@ def test_uninstall_alias_requires_the_initial_target_and_same_cpu(tmp_path, dama
     write_json_atomic(journal, value)
     with pytest.raises(ValueError):
         receipts.verify_journal(
-            record, state=state, stage=4, gpu_arn=GPU_HYPERPOD, cpu_arn=CPU_HYPERPOD
+            record, state=state, stage=4, gpu_arns=[GPU_HYPERPOD], cpu_arn=CPU_HYPERPOD
         )
 
 
@@ -155,13 +159,21 @@ def test_alias_match_cannot_reuse_a_preexisting_completed_attempt(tmp_path, stag
     write_json_atomic(journal, value)
     with pytest.raises(ValueError, match="exactly one"):
         receipts.verify_journal(
-            record, state=state, stage=stage, gpu_arn=GPU_HYPERPOD, cpu_arn=CPU_HYPERPOD
+            record,
+            state=state,
+            stage=stage,
+            gpu_arns=[GPU_HYPERPOD],
+            cpu_arn=CPU_HYPERPOD,
         )
     value["attempt" if stage == 3 else "attempt_id"] = 2 if stage == 3 else "b" * 32
     write_json_atomic(journal, value)
     assert (
         receipts.verify_journal(
-            record, state=state, stage=stage, gpu_arn=GPU_HYPERPOD, cpu_arn=CPU_HYPERPOD
+            record,
+            state=state,
+            stage=stage,
+            gpu_arns=[GPU_HYPERPOD],
+            cpu_arn=CPU_HYPERPOD,
         )["phase"]
         == "COMPLETED"
     )
@@ -174,5 +186,5 @@ def test_alias_match_still_requires_a_unique_current_removal_journal(tmp_path):
     write_json_atomic(state / "remove-cluster/other/state.json", value)
     with pytest.raises(ValueError, match="exactly one"):
         receipts.verify_journal(
-            record, state=state, stage=2, gpu_arn=GPU_HYPERPOD, cpu_arn=CPU_HYPERPOD
+            record, state=state, stage=2, gpu_arns=[GPU_HYPERPOD], cpu_arn=CPU_HYPERPOD
         )
