@@ -13,18 +13,32 @@ from gpu_fault.admin import execution, process_supervisor
 from gpu_fault.admin.diagnostics import DriverDiagnostics
 
 
-def wait_for(path: Path, *, timeout: float = 5) -> None:
+def wait_for(path: Path, *, timeout: float = 5) -> int:
+    """Wait for the child's ready file and return the pid it carries.
+
+    The file must exist *and* hold the pid: under 16 parallel shards a reader
+    once saw the file created but still empty and ``int("")`` failed the deploy
+    gate. The child renames the file into place, so an existing file is always
+    complete; the content check is the belt to that suspenders.
+    """
+
     until = time.monotonic() + timeout
-    while not path.exists():
+    while True:
+        if path.exists():
+            text = path.read_text().strip()
+            if text:
+                return int(text)
         assert time.monotonic() < until, f"child did not create {path.name}"
         time.sleep(0.02)
 
 
 def sleeper(ready: Path, marker: Path, *, ignore_term: bool = False) -> str:
+    # Write-then-rename: the ready file never exists without its pid.
     return (
         "import os,signal,time; from pathlib import Path; "
         + ("signal.signal(signal.SIGTERM,signal.SIG_IGN); " if ignore_term else "")
-        + f"Path({str(ready)!r}).write_text(str(os.getpid())); "
+        + f"Path({str(ready) + '.tmp'!r}).write_text(str(os.getpid())); "
+        f"os.replace({str(ready) + '.tmp'!r},{str(ready)!r}); "
         "time.sleep(20); "
         f"Path({str(marker)!r}).touch()"
     )
@@ -123,10 +137,9 @@ def test_supervisor_cleans_up_when_its_owner_is_killed(tmp_path, block_term):
     )
     process = subprocess.Popen([sys.executable, "-c", owner])
     try:
-        wait_for(ready)
+        pid = wait_for(ready)
         process.kill()
         process.wait(timeout=5)
-        pid = int(ready.read_text())
         until = time.monotonic() + 5
         while Path(f"/proc/{pid}").exists():
             assert time.monotonic() < until, "owner death stranded a descendant"
