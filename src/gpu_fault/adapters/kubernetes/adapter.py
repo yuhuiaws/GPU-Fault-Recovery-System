@@ -2,6 +2,10 @@ from __future__ import annotations
 
 from typing import Any
 
+from gpu_fault.adapters.kubernetes.device_plugin_health import (
+    device_plugin_health_gate,
+    with_device_plugin_receipt,
+)
 from gpu_fault.adapters.kubernetes.node_operations import KubernetesNodeOperationsMixin
 from gpu_fault.adapters.kubernetes.primitives import (
     KubernetesPrimitivesMixin,
@@ -109,6 +113,9 @@ class KubernetesWorkflowAdapter(
         self.core = core_api
         self.batch = batch_api
         self.custom = custom_api
+        # The device-plugin gate's receipt per step key, from the preparation
+        # that judged it to the outcome that carries it (keys never collide).
+        self._device_plugin_receipts: dict[str, dict[str, dict[str, Any]]] = {}
 
     def supports(self, step: WorkflowStepSpec) -> bool:
         return step.execution_owner == self.owner and step.operation in self.OPERATIONS
@@ -142,3 +149,29 @@ class KubernetesWorkflowAdapter(
         }:
             return self._restart_device_plugin(context)
         return self._set_workloads(context, suspend=False)
+
+    def _prepare_workload_mutation(
+        self, context: WorkflowStepContext, suspend: bool
+    ) -> Any:
+        """The mixin's preparation, then -- for a restart -- the device-plugin
+        health gate on the workloads it read: the new attempt lands on nodes
+        this workflow just repaired, and waits until kubelet reports their
+        devices healthy again (``device_plugin_health``)."""
+
+        prepared = super()._prepare_workload_mutation(context, suspend)
+        if suspend or isinstance(prepared, WorkflowStepOutcome):
+            return prepared
+        gate = device_plugin_health_gate(self, context, prepared.workloads)
+        if gate.outcome is not None:
+            return gate.outcome
+        if gate.receipt:
+            self._device_plugin_receipts[context.idempotency_key] = gate.receipt
+        return prepared
+
+    def _set_workloads(
+        self, context: WorkflowStepContext, *, suspend: bool
+    ) -> WorkflowStepOutcome:
+        self._device_plugin_receipts.pop(context.idempotency_key, None)
+        outcome = super()._set_workloads(context, suspend=suspend)
+        receipt = self._device_plugin_receipts.pop(context.idempotency_key, None)
+        return with_device_plugin_receipt(outcome, receipt or {})

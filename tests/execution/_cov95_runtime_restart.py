@@ -10,7 +10,8 @@ from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.store import InMemoryStore
 from tests._builders import workflow_step, workflow_step_execution
-from tests.execution.test_restart_safety import UnusedApi, restart_context
+from tests.execution._support import FakeCoreApi
+from tests.execution.test_restart_safety import restart_context
 
 COUNTS = {"job": 4, "pytorchjob": 6, "jobset": 12}
 
@@ -165,8 +166,11 @@ class RestartHarness:
         self.kind = kind
         self.api = WorkloadApi(kind, terminal=terminal)
         self.store = InMemoryStore()
+        # A node the restart pins by name is read by the device-plugin gate;
+        # the fake node reports no GPU capacity, so the gate records it as
+        # not applicable and the restart shapes are judged as before.
         self.adapter = KubernetesWorkflowAdapter(
-            core_api=UnusedApi(),
+            core_api=FakeCoreApi(),
             batch_api=self.api,
             custom_api=self.api,
             store=self.store,

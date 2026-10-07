@@ -1105,7 +1105,21 @@ Semantics and boundaries of `eks-managed`:
   REPLACE_NODE (the `BRANCH_EXHAUSTED` reason reads `the validation could not observe the node`) and the record
   classifies as the `validation_unobserved` stage: the hand-off (`support-after-<workflow>`) plans FREEZE_EVIDENCE
   and ESCALATE_SUPPORT only -- no quarantine, no reboot or replace successor -- and the incident's reasons carry the
-  node's pending reason and its exit (the restore of §9.2). **Every exit of the window removes the taint**: every QUIESCE outcome
+  node's pending reason and its exit (the restore of §9.2).
+  **A workload restart waits for device-plugin health first**: before it creates the new attempt, RESTART_WORKLOAD
+  reads, for every target node (the nodes the Pod templates pin with `nodeName`/`kubernetes.io/hostname`, plus the
+  nodes this workflow repaired, minus `avoid_node_ids`), the `nvidia.com/gpu` `capacity` and `allocatable`, the
+  `app.kubernetes.io/name=nvidia-device-plugin` Pod in `kube-system` with its Ready time, and the node's Ready-condition
+  heartbeat: it proceeds only when `allocatable == capacity` (kubelet reports no unhealthy device), the plugin Pod is
+  Ready and the node status heartbeat is later than the plugin's readiness; otherwise it WAITS
+  (`details.device_plugin_health_pending`, `restart_submitted=false`, no restart budget held) and FAILS with
+  `reason=DEVICE_PLUGIN_UNHEALTHY` past the step parameter `device_plugin_health_timeout_seconds` (default 180 s),
+  submitting no attempt. The SUCCEEDED record then carries `details.device_plugin_health`, a per-node receipt
+  (capacity/allocatable/plugin Pod/heartbeat/ready time); a node without GPU capacity reads `not_applicable`, and a
+  restart that pins nothing and repaired nothing reads no node. (2026-10-07, gpu-eks-cluster DESTR-015: the PyTorchJob
+  Pods restarted one second after RESTORE_SCHEDULING were refused by kubelet with `UnexpectedAdmissionError: Allocate
+  failed due to no healthy devices present` -- upstream nvdp 0.17.1 still reported the just-reset GPUs unhealthy and
+  node allocatable returned to 8/8 only a little later; HyperPod's plugin timing never exposed the window.) **Every exit of the window removes the taint**: every QUIESCE outcome
   (WAITING/FAILED/SUCCEEDED) records `details.quiesce_taint_nodes`; a quiesce the Agent refused or whose window expired
   untaints at once and records `quiesce_taint_removed_nodes`; a QUIESCE that tainted but never completed owes the
   RESTORE_GPU_SERVICES compensation like a completed one (`execution/node_action_uncertainty.unrestored_quiesces` reads

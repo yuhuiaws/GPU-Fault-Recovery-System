@@ -10601,6 +10601,14 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
   (`BranchEscalator.escalate_branch` returns None). In an earlier `eks-managed` run branch A's restore was judged
   `NODE_ACTION_OUTCOME_UNRESOLVED` two seconds before branch B's reset returned, branch A was exhausted and the hand-off
   quarantined a node whose reset had succeeded. Executor-level judgement: `tests/execution/test_two_branch_restore_scope.py`.
+- The join's `RESTART_WORKLOAD` waits, before creating the new attempt, for both nodes' device plugin to be healthy:
+  `nvidia.com/gpu` `allocatable == capacity`, the plugin Pod Ready and the node status heartbeat later than the plugin's
+  readiness (the SUCCEEDED record carries a per-node `details.device_plugin_health` receipt; while not ready it WAITS with
+  `device_plugin_health_pending` and `restart_submitted=false`, and FAILS `DEVICE_PLUGIN_UNHEALTHY` after 180 s by default
+  without submitting an attempt). On `eks-managed` attempt 9 the Pods restarted one second after RESTORE_SCHEDULING were
+  refused by kubelet with `UnexpectedAdmissionError … no healthy devices present` (upstream nvdp 0.17.1 still reported the
+  devices unhealthy across the reset; allocatable returned to 8/8 a little later); the runner's managed-workload verdict
+  FAILs honestly on the actual Pod phase. Executor-level judgement: `tests/execution/test_restart_device_plugin_gate.py`.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr015_parallel_branch_join.py`. By default it only generates the
   plan; before execute it must read `DESTR-012=PASS` (chain: `010 → 001 → 002 → 009 →
