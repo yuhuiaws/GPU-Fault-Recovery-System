@@ -964,7 +964,12 @@ Semantics and boundaries of `eks-managed`:
 - Identity and network: `aws eks describe-cluster` must be `ACTIVE`; the Agent endpoint CIDRs come from the subnets of
   the GPU node groups (`eks describe-nodegroup`: instance types in the GPU inventory, or the one named by
   `--gpu-nodegroup`), not the whole VPC; the NLB NAT EIP whitelist still discovers the NAT Gateways by VPC, as for
-  HyperPod. There is no `NodeRecovery` gate (the field belongs to HyperPod). Node names are FQDNs
+  HyperPod. The counterpart of the `NodeRecovery` gate is that the GPU managed node groups' **EKS node auto repair
+  must be off**: discovery reads `eks describe-nodegroup` for every node group hosting GPU nodes and refuses the
+  join/deploy on `nodeRepairConfig.enabled=true` (unset counts as off and the identity records `node_repair: unset`,
+  an explicit false `disabled`); the `regional_contexts` check shared by the deploy preflight and `status --full`/`verify`
+  (recording `status`/`node_repair`/`gpu` per node group) and the executor's reboot preflight (`EKS node auto repair is enabled on node group ...`) fail closed the same way -- it would race this
+  solution's own reboot/replace recovery, exactly as HyperPod `NodeRecovery=Automatic` would. Node names are FQDNs
   (`ip-10-0-x-y.<region>.compute.internal`); installer Job names are truncated to DNS-1123 with a deterministic hash.
 - Identity variables: the connection Secret keys `hyperpod-cluster-name` / `hyperpod-confirm-cluster-name` carry the
   `cluster_id` (`GPU_FAULT_HYPERPOD_CLUSTER` keeps meaning "the provider cluster scope"), and the new keys
@@ -1485,6 +1490,23 @@ rerun `join-cluster` with the same arguments once fixed. The other prerequisites
 `training` must exist; the NVIDIA and EFA device plugins run; a `nvidia.com/gpu=present:NoSchedule` taint on the GPU
 nodes is fine -- the data-plane Deployments never land there and the exporter/installer Jobs tolerate it) are in the list
 above and in [plain-eks-gpu-cluster](components/plain-eks-gpu-cluster.md).
+
+**EKS node auto repair must be off (a hard constraint of the same standing as HyperPod `NodeRecovery=None`).** With node
+auto repair on, EKS reboots or replaces the nodes it judges unhealthy by itself and races this solution's RESTART_NODE /
+warm-spare REPLACE_NODE. Check and switch it off:
+
+```bash
+aws eks describe-nodegroup --cluster-name <eks cluster> --nodegroup-name <GPU node group> \
+  --query 'nodegroup.nodeRepairConfig' --output json        # only null or {"enabled": false} may be managed
+aws eks update-nodegroup-config --cluster-name <eks cluster> --nodegroup-name <GPU node group> \
+  --node-repair-config enabled=false                       # when on: switch it off, wait for ACTIVE, then join/deploy
+```
+
+`join-cluster`/`deploy` read every node group hosting GPU nodes during discovery and refuse `enabled=true` (the error
+starts with `has node auto repair enabled` and names the node group); the `regional_contexts` check of the deploy preflight
+and `status --full`/`verify` records each node group's `node_repair` (`disabled`/`unset`) and fails on `enabled` for a group
+hosting GPU instance types (or named by `--gpu-nodegroup`). Only the `eks:DescribeNodegroup` read is needed:
+the operator identity and the executor role already hold it; the control-plane role needs nothing.
 
 #### 5.0.2 After a join: kubeconfig current-context, the Agent-set check and `status` attribution
 

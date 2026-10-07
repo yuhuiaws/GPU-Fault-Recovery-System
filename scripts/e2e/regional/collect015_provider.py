@@ -184,6 +184,7 @@ def eks_replacement_guard(
 
     group = nodegroup.get("nodegroup") or {}
     issues = (group.get("health") or {}).get("issues") or []
+    repair = (group.get("nodeRepairConfig") or {}).get("enabled")
     instances = [
         item
         for item in autoscaling.get("AutoScalingInstances") or []
@@ -200,6 +201,11 @@ def eks_replacement_guard(
             "health_issue_codes": sorted(
                 {str(item.get("code")) for item in issues if isinstance(item, dict)}
             ),
+            # EKS node auto repair, plain EKS's NodeRecovery: opt-in, so a
+            # missing field is recorded as None (off), never read as True.
+            "node_repair_config": {
+                "enabled": repair if isinstance(repair, bool) else None
+            },
         },
         "autoscaling_instance": (
             None
@@ -241,6 +247,12 @@ def replacement_guard_errors(guard: dict[str, Any]) -> list[str]:
         errors.append(
             f"managed node group {group.get('name')} reports health issues: "
             f"{group.get('health_issue_codes')}"
+        )
+    if (group.get("node_repair_config") or {}).get("enabled") is True:
+        errors.append(
+            f"EKS node auto repair is enabled on managed node group {group.get('name')}; "
+            "it competes with the product's recovery (the eks-managed counterpart "
+            "of HyperPod NodeRecovery=Automatic)"
         )
     instance = guard.get("autoscaling_instance")
     if instance is None:

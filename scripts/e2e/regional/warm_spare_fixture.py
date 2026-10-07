@@ -661,8 +661,14 @@ class WarmSpareLiveFixture:
                     timeout=180,
                 ).stdout
             )
+            nodegroups = warm_spare_provider.eks_nodegroup_descriptions(
+                lambda argv: self.regional.run(argv, timeout=180).stdout,
+                region=self.regional.settings.region,
+                cluster_name=self.hyperpod_cluster,
+                nodegroups=warm_spare_provider.eks_gpu_nodegroups(self._gpu_nodes()),
+            )
             return warm_spare_provider.eks_cluster_recovery(
-                describe, self.hyperpod_cluster
+                describe, self.hyperpod_cluster, nodegroups=nodegroups
             )
         value = json.loads(
             self.regional.run(

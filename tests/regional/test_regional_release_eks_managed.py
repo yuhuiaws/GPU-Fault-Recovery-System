@@ -352,9 +352,18 @@ def test_product_digest_is_unchanged_for_hyperpod_and_binds_the_eks_selector(
 
 
 class PreflightRunner:
-    def __init__(self, *, status: str = "ACTIVE", nodegroup_status: str = "ACTIVE"):
+    def __init__(
+        self,
+        *,
+        status: str = "ACTIVE",
+        nodegroup_status: str = "ACTIVE",
+        node_repair: dict[str, bool | None] | None = None,
+    ):
         self.status = status
         self.nodegroup_status = nodegroup_status
+        # EKS node auto repair per node group; a None value leaves the opt-in
+        # field out of the description, as EKS does for a group never configured.
+        self.node_repair = node_repair or {}
         self.calls: list[list[str]] = []
 
     def run(self, args: list[str], **_kwargs: Any) -> str:
@@ -365,18 +374,31 @@ class PreflightRunner:
             return json.dumps({"nodegroups": ["cpu-ng", "gpu-ng"]})
         if args[1:3] == ["eks", "describe-nodegroup"]:
             name = args[args.index("--nodegroup-name") + 1]
-            return json.dumps(self.nodegroup_status if name == "gpu-ng" else "ACTIVE")
+            assert args[args.index("--query") + 1] == "nodegroup", args
+            gpu = name == "gpu-ng"
+            group: dict[str, Any] = {
+                "nodegroupName": name,
+                "status": self.nodegroup_status if gpu else "ACTIVE",
+                "instanceTypes": ["p5en.48xlarge"] if gpu else ["m7i-flex.xlarge"],
+            }
+            if self.node_repair.get(name) is not None:
+                group["nodeRepairConfig"] = {"enabled": self.node_repair[name]}
+            return json.dumps(group)
         raise AssertionError(f"unexpected preflight command {args}")
 
 
 def test_eks_managed_preflight_requires_active_cluster_and_nodegroups() -> None:
     runner = PreflightRunner()
-    PREFLIGHT.validate_eks_managed_cluster(
+    facts = PREFLIGHT.validate_eks_managed_cluster(
         runner, region=REGION, expected_eks_arn=EKS_ARN
     )
     assert not any("sagemaker" in call for call in runner.calls), (
         "a plain EKS preflight must not describe a HyperPod cluster"
     )
+    assert facts == {
+        "cpu-ng": {"status": "ACTIVE", "node_repair": "unset", "gpu": False},
+        "gpu-ng": {"status": "ACTIVE", "node_repair": "unset", "gpu": True},
+    }, "every node group's status and node auto repair are recorded"
     with pytest.raises(ReleaseError, match="is not ACTIVE"):
         PREFLIGHT.validate_eks_managed_cluster(
             PreflightRunner(status="UPDATING"), region=REGION, expected_eks_arn=EKS_ARN
@@ -386,6 +408,42 @@ def test_eks_managed_preflight_requires_active_cluster_and_nodegroups() -> None:
             PreflightRunner(nodegroup_status="DEGRADED"),
             region=REGION,
             expected_eks_arn=EKS_ARN,
+        )
+
+
+def test_eks_managed_preflight_refuses_node_auto_repair_on_gpu_node_groups() -> None:
+    """The plain-EKS counterpart of the HyperPod NodeRecovery=None gate, read by
+    the ``regional_contexts`` check of deploy preflight and ``status --full`` /
+    ``verify``: a GPU node group that repairs its own nodes fails closed; the
+    CPU node group of the same cluster hosts no GPU nodes and only records."""
+
+    with pytest.raises(
+        ReleaseError, match="gpu-ng of gpu-eks-cluster has node auto repair enabled"
+    ):
+        PREFLIGHT.validate_eks_managed_cluster(
+            PreflightRunner(node_repair={"gpu-ng": True}),
+            region=REGION,
+            expected_eks_arn=EKS_ARN,
+        )
+    facts = PREFLIGHT.validate_eks_managed_cluster(
+        PreflightRunner(node_repair={"gpu-ng": False, "cpu-ng": True}),
+        region=REGION,
+        expected_eks_arn=EKS_ARN,
+    )
+    assert facts["gpu-ng"]["node_repair"] == "disabled"
+    assert facts["cpu-ng"] == {
+        "status": "ACTIVE",
+        "node_repair": "enabled",
+        "gpu": False,
+    }
+    with pytest.raises(
+        ReleaseError, match="cpu-ng of gpu-eks-cluster has node auto repair enabled"
+    ):
+        PREFLIGHT.validate_eks_managed_cluster(
+            PreflightRunner(node_repair={"cpu-ng": True}),
+            region=REGION,
+            expected_eks_arn=EKS_ARN,
+            gpu_nodegroup="cpu-ng",
         )
 
 

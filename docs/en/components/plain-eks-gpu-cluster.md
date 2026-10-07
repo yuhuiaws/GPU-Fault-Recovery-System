@@ -33,7 +33,9 @@ site yet**; section 5 lists what one join cannot prove. This is the summary of b
 ### 2.2 Discovery and site
 Discovery decides the provider from the ARN (an EKS ARN with no HyperPod orchestrator and an `ACTIVE`
 `describe-cluster` is `eks-managed`); the site entry records `provider` and `nodeSelector` and no
-`hyperpodClusterName`; Agent endpoint CIDRs come from the GPU node group subnets; there is no `NodeRecovery` gate;
+`hyperpodClusterName`; Agent endpoint CIDRs come from the GPU node group subnets; the counterpart of the `NodeRecovery`
+gate is that the GPU managed node groups' EKS node auto repair must be off (discovery reads `describe-nodegroup` for every
+node group hosting GPU nodes, refuses `nodeRepairConfig.enabled=true` and records `node_repair` on the identity);
 node names are FQDNs and installer Job names are DNS-1123 truncated.
 
 ### 2.3 Per-cluster Runtime Profile (mixed sites)
@@ -115,7 +117,8 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
 ## 3. Operator prerequisites (plain EKS cluster)
 
 1. Node group: `AL2023_x86_64_NVIDIA` (or equivalent) AMI; launch template user data installing `python3.12 strace`
-   (administrator-operations §5.0.1); NVIDIA and EFA device plugins running; a GPU taint is fine.
+   (administrator-operations §5.0.1); the node group's EKS node auto repair off (`nodeRepairConfig.enabled=false` or
+   unset, administrator-operations §5.0.1); NVIDIA and EFA device plugins running; a GPU taint is fine.
 2. Namespaces: every workload namespace in `allowedNamespaces` (the site's default list, e.g. `training`) must exist,
    or pass `--allowed-namespace` with namespaces that do.
 3. Network: the GPU VPC's NAT EIP is whitelisted on the NLB, the private Route53 zone associated, Agent CIDRs taken

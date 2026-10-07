@@ -10,6 +10,12 @@ if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease, Runner
 
 from gpu_fault.cluster_scope import is_eks_managed, node_selector
+from gpu_fault.eks_node_repair import (
+    hosts_gpu_instance_types,
+    node_repair_error,
+    node_repair_state,
+    selected_nodegroup,
+)
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
 from gpu_fault_release.regional_observability_rollback import (
@@ -198,12 +204,18 @@ def validate_eks_managed_cluster(
     *,
     region: str,
     expected_eks_arn: str,
-) -> None:
-    """A plain EKS GPU cluster: the cluster and its managed node groups are ACTIVE.
+    gpu_nodegroup: str = "",
+) -> dict[str, dict[str, Any]]:
+    """A plain EKS GPU cluster: the cluster and its managed node groups are ACTIVE
+    and no node group hosting GPU nodes repairs them itself.
 
-    There is no HyperPod to describe and no ``NodeRecovery`` to gate on; what
-    can drift is the cluster itself (deleted and recreated under the same
-    name, or a node group mid-update) and that is what is read here.
+    There is no HyperPod to describe; the counterpart of its ``NodeRecovery``
+    gate is EKS node auto repair (``nodeRepairConfig.enabled``), which would
+    race this solution's recovery. A GPU node group is the one the selector
+    names (``gpu_nodegroup``) or any group running an accelerator instance
+    type. Returns the per-group facts (``status``, ``node_repair``, ``gpu``) so
+    the ``regional_contexts`` check records them; ``unset`` is the opt-in field
+    never written, which EKS treats as off.
     """
 
     eks_name = expected_eks_arn.rsplit("/", 1)[-1]
@@ -249,8 +261,9 @@ def validate_eks_managed_cluster(
         ).get("nodegroups")
         or []
     )
+    facts: dict[str, dict[str, Any]] = {}
     for nodegroup in sorted(str(item) for item in nodegroups):
-        status = json.loads(
+        described = json.loads(
             runner.run(
                 [
                     "aws",
@@ -263,17 +276,27 @@ def validate_eks_managed_cluster(
                     "--nodegroup-name",
                     nodegroup,
                     "--query",
-                    "nodegroup.status",
+                    "nodegroup",
                     "--output",
                     "json",
                 ],
                 capture=True,
             )
         )
+        group = described if isinstance(described, dict) else {}
+        status = group.get("status")
         if status != "ACTIVE":
             raise ReleaseError(
                 f"EKS node group {nodegroup} of {eks_name} is not ACTIVE ({status})"
             )
+        repair = node_repair_state(group)
+        gpu = nodegroup == gpu_nodegroup or hosts_gpu_instance_types(group)
+        facts[nodegroup] = {"status": status, "node_repair": repair, "gpu": gpu}
+        if gpu:
+            reason = node_repair_error(nodegroup, eks_name, repair)
+            if reason is not None:
+                raise ReleaseError(reason)
+    return facts
 
 
 def _validate_hyperpod_cluster(
@@ -359,9 +382,13 @@ def _validate_agent_endpoint_cidrs(
         )
 
 
-def ensure_region_contexts(release: RegionalRelease) -> None:
+def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
+    """Validate every context; return what the ``regional_contexts`` check records
+    (the cluster ids and, per eks-managed cluster, its node groups' facts)."""
+
     config = release.config
     runner = release.runner
+    providers: dict[str, dict[str, Any]] = {}
     cpu_command = release._cpu
     gpu_command = release._gpu
     cpu_eks_arn = _context_eks_arn(runner, cpu_command(), label="CPU")
@@ -390,12 +417,17 @@ def ensure_region_contexts(release: RegionalRelease) -> None:
                 "configured eks_cluster_arn"
             )
         if is_eks_managed(target):
-            validate_eks_managed_cluster(
-                runner,
-                region=target.region,
-                expected_eks_arn=target.eks_cluster_arn,
-            )
+            providers[target.cluster_id] = {
+                "provider": "eks-managed",
+                "node_groups": validate_eks_managed_cluster(
+                    runner,
+                    region=target.region,
+                    expected_eks_arn=target.eks_cluster_arn,
+                    gpu_nodegroup=selected_nodegroup(node_selector(target)),
+                ),
+            }
         else:
+            providers[target.cluster_id] = {"provider": "hyperpod"}
             _validate_hyperpod_cluster(
                 runner,
                 region=target.region,
@@ -414,8 +446,9 @@ def ensure_region_contexts(release: RegionalRelease) -> None:
         release._validate_executor_iam_role(target)
         preflight_retired_collectors(release, target)
 
+    facts = {"clusters": [item.cluster_id for item in config.clusters]}
     if not config.clusters:
-        return
+        return facts
     # The CPU checks above gate everything, so they stay ahead of this; the
     # clusters themselves are independent, and each one is a handful of reads
     # against a different API server plus a whole IAM role expansion. Every
@@ -428,3 +461,4 @@ def ensure_region_contexts(release: RegionalRelease) -> None:
         ]
     for future in futures:
         future.result()
+    return {**facts, "providers": providers}

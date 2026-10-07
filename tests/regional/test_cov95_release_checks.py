@@ -643,3 +643,37 @@ def test_a_cluster_whose_only_agents_are_retired_has_no_coverage(
 
     assert result["status"] == "FAIL"
     assert "no registered Node Agents" in result["summary"]
+
+
+def test_contexts_check_records_what_the_context_validation_returns(
+    release: CheckedRelease,
+) -> None:
+    """The ``regional_contexts`` check's details are the validation's facts --
+    per eks-managed cluster its node groups' status and EKS node auto repair --
+    and fall back to the cluster ids when the validation returns nothing."""
+
+    facts = {
+        "clusters": ["gpu-a"],
+        "providers": {
+            "gpu-a": {
+                "provider": "eks-managed",
+                "node_groups": {
+                    "gpu-group": {
+                        "status": "ACTIVE",
+                        "node_repair": "unset",
+                        "gpu": True,
+                    }
+                },
+            }
+        },
+    }
+    release.context_facts = facts
+    result = finding(
+        checks.build_health_report(release, mode="verify"), "regional_contexts"
+    )
+    assert result["status"] == "PASS" and result["details"] == facts
+    release.context_facts = None
+    result = finding(
+        checks.build_health_report(release, mode="verify"), "regional_contexts"
+    )
+    assert result["details"] == {"clusters": ["gpu-a"]}

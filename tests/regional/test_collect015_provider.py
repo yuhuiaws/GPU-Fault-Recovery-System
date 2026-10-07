@@ -223,15 +223,20 @@ def test_provider_calls_read_the_ec2_source_on_eks() -> None:
     assert evidence["provider_events_provisional"] is True
 
 
-def _nodegroup(status: str = "ACTIVE", issues: list[dict[str, str]] | None = None):
-    return {
-        "nodegroup": {
-            "nodegroupName": "gpu-group",
-            "clusterName": "gpu-eks-cluster",
-            "status": status,
-            "health": {"issues": issues or []},
-        }
+def _nodegroup(
+    status: str = "ACTIVE",
+    issues: list[dict[str, str]] | None = None,
+    repair: bool | None = None,
+):
+    group: dict[str, Any] = {
+        "nodegroupName": "gpu-group",
+        "clusterName": "gpu-eks-cluster",
+        "status": status,
+        "health": {"issues": issues or []},
     }
+    if repair is not None:
+        group["nodeRepairConfig"] = {"enabled": repair}
+    return {"nodegroup": group}
 
 
 def _autoscaling(
@@ -271,6 +276,7 @@ def test_an_active_group_and_an_in_service_instance_pass_the_eks_guard() -> None
             "name": "gpu-group",
             "status": "ACTIVE",
             "health_issue_codes": [],
+            "node_repair_config": {"enabled": None},
         },
         "autoscaling_instance": {
             "group": "eks-gpu-group-synthetic",
@@ -279,12 +285,19 @@ def test_an_active_group_and_an_in_service_instance_pass_the_eks_guard() -> None
         },
     }
     assert collect015.replacement_guard_errors(guard) == []
+    disabled = _guard(nodegroup=_nodegroup(repair=False))
+    assert disabled["nodegroup"]["node_repair_config"] == {"enabled": False}
+    assert collect015.replacement_guard_errors(disabled) == []
 
 
 @pytest.mark.parametrize(
     ("overrides", "fragment"),
     [
         ({"instance_id": ""}, "no EC2 providerID"),
+        (
+            {"nodegroup": _nodegroup(repair=True)},
+            "EKS node auto repair is enabled on managed node group gpu-group",
+        ),
         (
             {"nodegroup_name": "", "nodegroup": {}},
             "carries no eks.amazonaws.com/nodegroup",

@@ -120,6 +120,18 @@ def cluster_recovery_errors(
         if normalized(provider) == HYPERPOD:
             return ["HyperPod cluster is not InService with NodeRecovery=None"]
         return ["EKS cluster is not ACTIVE (plain EKS has no managed node recovery)"]
+    if normalized(provider) == EKS_MANAGED:
+        enabled = sorted(
+            name
+            for name, value in (cluster.get("node_repair_config") or {}).items()
+            if value is True
+        )
+        if enabled:
+            return [
+                "EKS node auto repair is enabled on node group(s) "
+                + ", ".join(enabled)
+                + " (the eks-managed counterpart of HyperPod NodeRecovery=Automatic)"
+            ]
     return []
 
 
@@ -130,15 +142,30 @@ def lifecycle_owner(provider: str | None) -> str:
 
 
 def eks_cluster_recovery(
-    describe: Mapping[str, Any], cluster_name: str
+    describe: Mapping[str, Any],
+    cluster_name: str,
+    *,
+    nodegroups: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """``aws eks describe-cluster`` reduced to the HyperPod-shaped cluster fact."""
+    """``aws eks describe-cluster`` reduced to the HyperPod-shaped cluster fact.
+
+    ``nodegroups`` maps each GPU node group's name to its ``describe-nodegroup``
+    document; the fact then carries ``node_repair_config`` -- EKS node auto
+    repair per group, the plain EKS counterpart of HyperPod ``NodeRecovery``
+    (``None`` when the opt-in field is absent, i.e. off and recorded).
+    """
 
     cluster = describe.get("cluster") or {}
+    repair: dict[str, bool | None] = {}
+    for name, document in sorted((nodegroups or {}).items()):
+        group = document.get("nodegroup") or document
+        enabled = (group.get("nodeRepairConfig") or {}).get("enabled")
+        repair[str(name)] = enabled if isinstance(enabled, bool) else None
     return {
         "cluster_name": cluster.get("name") or cluster_name,
         "status": cluster.get("status"),
         "node_recovery": "not-applicable",
+        "node_repair_config": repair,
         "provider": EKS_MANAGED,
     }
 
@@ -175,6 +202,56 @@ def _eks_gpu_nodes(
             continue
         rows.append(((item.get("metadata") or {}).get("name"), instance_id))
     return rows
+
+
+def eks_gpu_nodegroups(nodes_document: Mapping[str, Any]) -> list[str]:
+    """The managed node groups (``eks.amazonaws.com/nodegroup`` label) of the GPU nodes."""
+
+    groups: set[str] = set()
+    for item in nodes_document.get("items", []) or []:
+        status = item.get("status") or {}
+        if not (
+            (status.get("capacity") or {}).get("nvidia.com/gpu")
+            or (status.get("allocatable") or {}).get("nvidia.com/gpu")
+        ):
+            continue
+        label = ((item.get("metadata") or {}).get("labels") or {}).get(
+            EKS_NODEGROUP_LABEL
+        )
+        if label:
+            groups.add(str(label))
+    return sorted(groups)
+
+
+def eks_nodegroup_descriptions(
+    command: Callable[[list[str]], str],
+    *,
+    region: str,
+    cluster_name: str,
+    nodegroups: list[str],
+) -> dict[str, dict[str, Any]]:
+    """``aws eks describe-nodegroup`` for each named group, keyed by name."""
+
+    return {
+        name: json.loads(
+            command(
+                [
+                    "aws",
+                    "eks",
+                    "describe-nodegroup",
+                    "--region",
+                    region,
+                    "--cluster-name",
+                    cluster_name,
+                    "--nodegroup-name",
+                    name,
+                    "--output",
+                    "json",
+                ]
+            )
+        )
+        for name in nodegroups
+    }
 
 
 def eks_instance_ids(nodes_document: Mapping[str, Any]) -> list[str]:

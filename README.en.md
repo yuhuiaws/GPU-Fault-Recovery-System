@@ -48,7 +48,7 @@ Do not infer additional supported scope from historical code or examples in the 
 
 The following constraints are not tunable defaults:
 
-1. Managed HyperPod GPU clusters must be set to `NodeRecovery=None` (a plain EKS cluster has no such field and is not gated by it).
+1. Managed HyperPod GPU clusters must be set to `NodeRecovery=None`; the plain-EKS counterpart is that every managed node group hosting GPU nodes must have EKS node auto repair off (`nodeRepairConfig.enabled=false`; unset counts as off and is recorded) -- `join-cluster`/`deploy` discovery, `status --full`/`verify` and the executor's reboot preflight read `eks describe-nodegroup` and refuse while it is on, because it would race this solution's own reboot/replace recovery.
 2. This solution never calls `BatchReplaceClusterNodes`; node replacement only uses healthy warm spare nodes that are already managed.
 3. HyperPod Job Auto Restart and EKS auto-resume must be disabled.
 4. Training-job recovery is managed exclusively by this solution's Kubernetes Adapter and restart budget.
@@ -125,7 +125,8 @@ Every production deployment must satisfy these common prerequisites before it st
 
 1. An existing CPU EKS/HyperPod cluster with at least 3 Ready nodes.
 2. At least one existing GPU EKS/HyperPod cluster; a GPU HyperPod cluster must have `NodeRecovery=None`; a plain EKS GPU
-   cluster must have a managed node group with a supported GPU instance type and a schedulable non-GPU node group besides it.
+   cluster must have a managed node group with a supported GPU instance type (its EKS node auto repair off:
+   `nodeRepairConfig.enabled=false` or unset) and a schedulable non-GPU node group besides it.
 3. The GPU VPC already has NAT egress.
 4. The executing identity holds the required AWS, EKS and Kubernetes administrative permissions.
 5. The deploy host has the Python 3.12 project environment plus `aws`, `cosign`, Docker Buildx, `kubectl`, `helm`, `curl`, `jq`, `openssl`, `sha256sum` and `make`; the command only verifies these prerequisites and never installs system tools.

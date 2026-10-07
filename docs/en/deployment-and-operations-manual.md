@@ -62,8 +62,9 @@ examples. The administrator first decides which execution path applies:
 The first deployment is completed by a single ARN command, with these hard prerequisites:
 
 1. A CPU EKS/HyperPod cluster containing 3 Ready CPU nodes has been created.
-2. At least one GPU EKS/HyperPod cluster to be managed has been created, with
-   `NodeRecovery=None`.
+2. At least one GPU EKS/HyperPod cluster to be managed has been created: HyperPod with
+   `NodeRecovery=None`, plain EKS with EKS node auto repair off on the managed node groups hosting GPU nodes
+   (`nodeRepairConfig.enabled=false` or unset).
 3. The GPU cluster VPC already has a usable NAT egress.
 4. The executing identity has AWS infrastructure, target EKS and Kubernetes administration permissions; the state-dir contains the controlled cosign
    signing key, password and public key.
@@ -741,7 +742,7 @@ baseline, written with the Node UID/resourceVersion and read back; an unknown ba
 This document is based on the 0.10.0 code and delivers only the following production runtime forms:
 
 1. A standalone regional CPU control plane manages one or more HyperPod EKS GPU data clusters;
-2. Managed GPU clusters must be HyperPod EKS with `NodeRecovery=None`; job recovery is taken over by this solution;
+2. Managed GPU clusters must be HyperPod EKS with `NodeRecovery=None` (plain EKS GPU clusters: EKS node auto repair off on the GPU managed node groups); job recovery is taken over by this solution;
 3. The GPU node side installs the same Collector/Node Agent set via the Installer/Reconciler or systemd.
 
 The single-cluster all-in-one path of `deploy/hyperpod/deploy.sh` serves only as historical compatibility, a migration starting point and canary;
@@ -866,7 +867,9 @@ The following constraints determine every Runtime Profile, IAM and environment v
 temporarily relaxed during a maintenance window:
 
 1. HyperPod `NodeRecovery` of a managed GPU cluster must be `None`;
-   `NodeRecovery=Automatic` is not within the supported scope.
+   `NodeRecovery=Automatic` is not within the supported scope. The plain-EKS counterpart: a managed node group hosting
+   GPU nodes with `nodeRepairConfig.enabled=true` (EKS node auto repair) is equally unsupported; join/deploy/status read
+   `describe-nodegroup` and refuse it.
 2. Under no circumstances may this solution's code or execution roles call
    `BatchReplaceClusterNodes`. `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` is always
    `false`, and the Executor IAM must not grant that API either. Production recovery uses only managed warm spares;

@@ -52,6 +52,8 @@ class CheckedRelease(ResourceRelease):
         }
         self.config.retention = None
         self.context_checks = 0
+        # What the context validation returns (``None``: nothing recorded).
+        self.context_facts: dict[str, Any] | None = None
         self.prime_calls = 0
         self.tls = {"status": "ok"}
         self.api: Any = {
@@ -273,8 +275,9 @@ class CheckedRelease(ResourceRelease):
                 return json.dumps(self.tls)
         raise AssertionError(f"unconfigured fake read: {arguments[:4]}")
 
-    def _ensure_contexts(self) -> None:
+    def _ensure_contexts(self) -> dict[str, Any] | None:
         self.context_checks += 1
+        return self.context_facts
 
     def _read_snapshot(self):
         return read_snapshot(self)

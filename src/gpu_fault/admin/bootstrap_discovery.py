@@ -20,6 +20,11 @@ from gpu_fault.admin.bootstrap_common import (
     describe_or_absent,
 )
 from gpu_fault.admin.bootstrap_site import hyperpod_inventory
+from gpu_fault.eks_node_repair import (
+    aggregate_node_repair,
+    node_repair_error,
+    node_repair_state,
+)
 from gpu_fault.cluster_scope import (
     DEFAULT_EKS_MANAGED_NODE_SELECTOR,
     EKS_NODEGROUP_LABEL,
@@ -215,6 +220,13 @@ def gpu_nodegroups(
             raise BootstrapError(
                 f"EKS node group {item.get('nodegroupName')} of {eks_name} is not ACTIVE"
             )
+        # The plain EKS counterpart of HyperPod NodeRecovery=None: a node group
+        # that repairs its own nodes would race this solution's recovery.
+        reason = node_repair_error(
+            str(item.get("nodegroupName")), eks_name, node_repair_state(item)
+        )
+        if reason is not None:
+            raise BootstrapError(reason)
     return selected
 
 
@@ -270,10 +282,12 @@ def discover_eks_managed_cluster(
     vpc = eks.get("resourcesVpcConfig") or {}
     subnet_ids = tuple(str(item) for item in vpc.get("subnetIds") or () if item)
     node_subnets: list[str] = []
+    repair_states: list[str] = []
     for nodegroup in gpu_nodegroups(
         runner, region=parsed.region, eks_name=eks_name, node_selector=selector
     ):
         node_subnets.extend(str(item) for item in nodegroup.get("subnets") or ())
+        repair_states.append(node_repair_state(nodegroup))
     cidrs = subnet_cidrs(
         runner,
         region=parsed.region,
@@ -295,4 +309,5 @@ def discover_eks_managed_cluster(
         subnet_cidrs=cidrs,
         provider=ClusterProvider.EKS_MANAGED.value,
         node_selector=selector,
+        node_repair=aggregate_node_repair(repair_states),
     )

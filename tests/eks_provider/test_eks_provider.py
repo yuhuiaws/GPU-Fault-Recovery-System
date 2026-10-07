@@ -176,6 +176,9 @@ def test_preflight_passes_on_an_active_cluster_and_node_group() -> None:
     assert result.cluster_status == "ACTIVE"
     assert result.cluster_name == CLUSTER_ID
     assert result.node_recovery is None, "no HyperPod NodeRecovery gate on plain EKS"
+    assert result.node_repair == "unset", (
+        "the node group's EKS node auto repair is recorded: the opt-in field is absent"
+    )
     assert result.execution_enabled is True
     assert eks.described_clusters == [EKS_CLUSTER], (
         "the EKS cluster is bound from the instances' eks:cluster-name tag"
@@ -193,6 +196,12 @@ def test_preflight_passes_on_an_active_cluster_and_node_group() -> None:
             "node group gpu-p5en-efa-spot-node-group must be ACTIVE",
         ),
         ("no-nodegroup-label", "carry no managed node group label"),
+        (
+            "node-repair-enabled",
+            "EKS node auto repair is enabled on node group "
+            "gpu-p5en-efa-spot-node-group; a direct reboot would create a second "
+            "lifecycle trigger",
+        ),
         ("instance-stopped", "non-actionable EC2 state"),
         ("instance-gone", "non-actionable EC2 state"),
         ("no-isolation", "isolation evidence is missing"),
@@ -212,6 +221,12 @@ def test_preflight_fails_closed_on_each_gate(variant: str, fragment: str) -> Non
         eks = FakeEks(status="UPDATING")
     elif variant == "nodegroup-degraded":
         eks = FakeEks(nodegroups={NODEGROUP: "DEGRADED"})
+    elif variant == "node-repair-enabled":
+        eks = FakeEks(
+            nodegroups={
+                NODEGROUP: {"status": "ACTIVE", "nodeRepairConfig": {"enabled": True}}
+            }
+        )
     elif variant == "no-nodegroup-label":
         nodes[0] = gpu_node(NODE_A, INSTANCE_A, nodegroup=None)
         instances[0] = ec2_instance(INSTANCE_A, nodegroup=None)
@@ -244,6 +259,23 @@ def test_preflight_fails_closed_on_each_gate(variant: str, fragment: str) -> Non
             action, [NODE_A], **{**SUBMIT, "isolation_verified_nodes": isolation}
         )
     assert ec2.reboots == [], "a failed preflight never reaches RebootInstances"
+
+
+def test_preflight_records_an_explicitly_disabled_node_auto_repair() -> None:
+    adapter, _, _, _ = provider(
+        eks=FakeEks(
+            nodegroups={
+                NODEGROUP: {"status": "ACTIVE", "nodeRepairConfig": {"enabled": False}}
+            }
+        )
+    )
+
+    result = adapter.preflight(
+        HyperPodAction.REBOOT, [NODE_A], isolation_verified_nodes=[NODE_A]
+    )
+
+    assert result.safe_to_submit, result.gate_failures
+    assert result.node_repair == "disabled"
 
 
 def test_preflight_binds_the_eks_cluster_from_tags_or_the_configured_name() -> None:

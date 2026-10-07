@@ -35,6 +35,11 @@ from uuid import uuid4
 from pydantic import Field, model_validator
 
 from gpu_fault.env import env_bool
+from gpu_fault.eks_node_repair import (
+    NODE_REPAIR_ENABLED,
+    aggregate_node_repair,
+    node_repair_state,
+)
 from gpu_fault.hyperpod import (
     HyperPodAction,
     HyperPodAdapterError,
@@ -438,7 +443,9 @@ class EksManagedNodeProvider:
             raise EksProviderError(f"DescribeCluster returned no cluster for {name}")
         return cluster
 
-    def _nodegroup_status(self, cluster: str, nodegroup: str) -> str:
+    def _nodegroup_facts(self, cluster: str, nodegroup: str) -> tuple[str, str]:
+        """``(status, node auto repair state)`` of one managed node group."""
+
         response = self.eks.describe_nodegroup(
             clusterName=cluster, nodegroupName=nodegroup
         )
@@ -447,7 +454,7 @@ class EksManagedNodeProvider:
             raise EksProviderError(
                 f"DescribeNodegroup returned no nodegroup for {cluster}/{nodegroup}"
             )
-        return str(group.get("status") or "UNKNOWN")
+        return str(group.get("status") or "UNKNOWN"), node_repair_state(group)
 
     # -- lifecycle ------------------------------------------------------------
 
@@ -471,6 +478,7 @@ class EksManagedNodeProvider:
                 "eks-managed cluster has no provider node replacement"
             )
         cluster_status = "UNKNOWN"
+        repair_states: list[str] = []
         try:
             cluster_name = self._eks_cluster_name(targets)
             cluster_status = str(self._describe_cluster(cluster_name).get("status"))
@@ -493,9 +501,17 @@ class EksManagedNodeProvider:
                     if node.instance_group_name
                 }
             ):
-                status = self._nodegroup_status(cluster_name, group)
+                status, repair = self._nodegroup_facts(cluster_name, group)
+                repair_states.append(repair)
                 if status != "ACTIVE":
                     failures.append(f"node group {group} must be ACTIVE, got {status}")
+                if repair == NODE_REPAIR_ENABLED:
+                    # HyperPod's "automatic node recovery is enabled" gate, for
+                    # the provider that repairs nodes per node group.
+                    failures.append(
+                        f"EKS node auto repair is enabled on node group {group}; "
+                        "a direct reboot would create a second lifecycle trigger"
+                    )
         except EksProviderError as exc:
             failures.append(str(exc))
         if len(targets) > self.config.max_batch_size:
@@ -530,6 +546,7 @@ class EksManagedNodeProvider:
             cluster_name=self.config.cluster_name,
             cluster_status=cluster_status,
             node_recovery=None,
+            node_repair=aggregate_node_repair(repair_states) if repair_states else None,
             targets=targets,
             execution_enabled=self.config.action_enabled(action),
             safe_to_submit=not failures,

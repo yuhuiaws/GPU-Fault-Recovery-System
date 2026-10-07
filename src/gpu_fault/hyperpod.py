@@ -280,6 +280,9 @@ class HyperPodPreflight(StrictModel):
     cluster_name: str
     cluster_status: str
     node_recovery: str | None = None
+    #: eks-managed only: the targets' node groups' EKS node auto repair
+    #: (``disabled`` / ``unset`` / ``enabled``), plain EKS's NodeRecovery.
+    node_repair: str | None = None
     targets: list[HyperPodNode]
     execution_enabled: bool
     safe_to_submit: bool

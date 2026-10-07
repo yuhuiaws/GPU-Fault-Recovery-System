@@ -63,9 +63,18 @@ GPU_INSTANCE = "i-00000000000000001"
 class EksRunner:
     """``aws`` answers for a Region that has no HyperPod cluster at all."""
 
-    def __init__(self, *, status: str = "ACTIVE", nodegroup_status: str = "ACTIVE"):
+    def __init__(
+        self,
+        *,
+        status: str = "ACTIVE",
+        nodegroup_status: str = "ACTIVE",
+        node_repair: bool | None = None,
+    ):
         self.status = status
         self.nodegroup_status = nodegroup_status
+        # EKS node auto repair of the GPU node group: None leaves the opt-in
+        # field out of the description, as EKS does for a group never configured.
+        self.node_repair = node_repair
         self.calls: list[tuple[str, str, tuple[str, ...]]] = []
         self.hyperpods: list[dict] = []
 
@@ -113,6 +122,11 @@ class EksRunner:
                         if gpu
                         else {"node-type": "cpu"}
                     ),
+                    **(
+                        {"nodeRepairConfig": {"enabled": self.node_repair}}
+                        if gpu and self.node_repair is not None
+                        else {}
+                    ),
                 }
             }
         if (service, operation) == ("ec2", "describe-subnets"):
@@ -142,6 +156,10 @@ def test_eks_arn_without_hyperpod_discovers_an_eks_managed_identity() -> None:
         "",
         "",
     ), "no HyperPod facts may be invented for a plain EKS cluster"
+    assert identity.node_repair == "unset", (
+        "a node group without nodeRepairConfig has the opt-in feature off; "
+        "record that it is unset rather than inventing disabled"
+    )
     assert identity.eks_arn == EKS_ARN and identity.eks_name == EKS_NAME, (
         "the EKS identity must be the ARN given"
     )
@@ -215,6 +233,27 @@ def test_eks_managed_discovery_refuses_inactive_cluster_or_nodegroup() -> None:
             role="gpu",
             context="gpu-eks",
         )
+
+
+def test_eks_managed_discovery_refuses_node_auto_repair_like_node_recovery() -> None:
+    """The plain-EKS counterpart of NodeRecovery=None: a GPU node group that
+    repairs its own nodes is refused before anything is recorded; an explicit
+    false is recorded as disabled."""
+
+    with pytest.raises(BootstrapError, match="has node auto repair enabled") as refusal:
+        admin_bootstrap.discover_cluster(
+            EksRunner(node_repair=True),
+            cluster_arn=EKS_ARN,
+            role="gpu",
+            context="gpu-eks",
+        )
+    assert GPU_NODEGROUP in str(refusal.value) and "NodeRecovery=None" in str(
+        refusal.value
+    ), "name the node group and the HyperPod rule it mirrors"
+    identity = admin_bootstrap.discover_cluster(
+        EksRunner(node_repair=False), cluster_arn=EKS_ARN, role="gpu", context="gpu-eks"
+    )
+    assert identity.node_repair == "disabled"
 
 
 def test_eks_managed_discovery_refuses_a_cpu_role_and_bad_selectors() -> None:

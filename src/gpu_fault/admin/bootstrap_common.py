@@ -123,6 +123,11 @@ class ClusterIdentity:
     provider: str = "hyperpod"
     #: GPU node label selector; empty means the HyperPod cluster label.
     node_selector: str = ""
+    #: eks-managed only: the GPU node groups' EKS node auto repair, the plain
+    #: EKS counterpart of ``node_recovery`` -- ``disabled`` / ``unset`` (the
+    #: opt-in feature absent, recorded rather than invented); discovery refuses
+    #: an ``enabled`` group before it is ever recorded. Empty for HyperPod.
+    node_repair: str = ""
 
     @property
     def is_eks_managed(self) -> bool:

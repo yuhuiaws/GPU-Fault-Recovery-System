@@ -43,7 +43,7 @@ English edition: [README.en.md](README.en.md).
 
 以下约束不是可调默认值：
 
-1. 受管 HyperPod GPU 集群必须设置 `NodeRecovery=None`（普通 EKS 集群没有该字段，不受此门禁）。
+1. 受管 HyperPod GPU 集群必须设置 `NodeRecovery=None`；普通 EKS GPU 集群的对应项是承载 GPU 节点的每个托管节点组必须关闭 EKS node auto repair（`nodeRepairConfig.enabled=false`；未设置视为关闭并记录）——`join-cluster`/`deploy` 的发现、`status --full`/`verify` 和 Executor 的 reboot preflight 都读 `eks describe-nodegroup`，开着就拒绝，因为它会与本方案自己的 reboot/replace 恢复竞争。
 2. 本方案永不调用 `BatchReplaceClusterNodes`；节点替换只使用已纳管的健康的 warm spare 节点。
 3. HyperPod Job Auto Restart、EKS auto-resume 必须禁用。
 4. 训练任务恢复由本方案的 Kubernetes Adapter 和 restart budget 独占管理。
@@ -115,7 +115,7 @@ make test-parallel
 所有生产部署开始前必须满足以下共同前提：
 
 1. 一个已有且至少有3个Ready节点的CPU EKS/HyperPod集群。
-2. 至少一个已有GPU EKS/HyperPod集群；GPU HyperPod必须为`NodeRecovery=None`；普通EKS需有受支持GPU实例类型的managed node group和可调度的非GPU节点组，GPU节点镜像带`python3.12`与`strace`（AL2023 NVIDIA AMI默认不带，放进节点组launch template的user data安装），并已创建workload namespace `training`。
+2. 至少一个已有GPU EKS/HyperPod集群；GPU HyperPod必须为`NodeRecovery=None`；普通EKS需有受支持GPU实例类型的managed node group（其 EKS node auto repair 必须关闭：`nodeRepairConfig.enabled=false` 或未设置）和可调度的非GPU节点组，GPU节点镜像带`python3.12`与`strace`（AL2023 NVIDIA AMI默认不带，放进节点组launch template的user data安装），并已创建workload namespace `training`。
 3. GPU VPC已有NAT出口。
 4. 执行身份具有所需AWS、EKS和Kubernetes管理权限。
 5. 部署机已安装Python 3.12项目环境以及`aws`、`cosign`、Docker Buildx、`kubectl`、`helm`、`curl`、`jq`、`openssl`、`sha256sum`和`make`；命令只验证这些前置，不自动安装系统工具。

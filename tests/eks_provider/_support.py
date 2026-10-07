@@ -184,8 +184,14 @@ class FakeEc2:
 
 
 class FakeEks:
+    """``nodegroups`` maps a node group to its status, or to a description
+    fragment (``status`` plus, when configured, ``nodeRepairConfig``)."""
+
     def __init__(
-        self, *, status: str = "ACTIVE", nodegroups: dict[str, str] | None = None
+        self,
+        *,
+        status: str = "ACTIVE",
+        nodegroups: dict[str, str | dict[str, Any]] | None = None,
     ) -> None:
         self.status = status
         self.nodegroups = (
@@ -208,12 +214,9 @@ class FakeEks:
     def describe_nodegroup(self, **kwargs: Any) -> dict[str, Any]:
         key = (kwargs["clusterName"], kwargs["nodegroupName"])
         self.described_nodegroups.append(key)
-        return {
-            "nodegroup": {
-                "nodegroupName": key[1],
-                "status": self.nodegroups.get(key[1], "ACTIVE"),
-            }
-        }
+        value = self.nodegroups.get(key[1], "ACTIVE")
+        fragment = {"status": value} if isinstance(value, str) else dict(value)
+        return {"nodegroup": {"nodegroupName": key[1], **fragment}}
 
 
 def config(**overrides: Any) -> EksProviderConfig:

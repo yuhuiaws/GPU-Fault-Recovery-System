@@ -230,10 +230,10 @@ def _check_aws_identity(release: Any) -> CheckValue:
 
 
 def _check_contexts(release: Any) -> CheckValue:
-    release._ensure_contexts()
+    facts = release._ensure_contexts()
     return CheckValue(
         "CPU/GPU contexts, HyperPod ownership and executor IAM are valid",
-        {"clusters": [item.cluster_id for item in release.config.clusters]},
+        facts or {"clusters": [item.cluster_id for item in release.config.clusters]},
     )
 
 

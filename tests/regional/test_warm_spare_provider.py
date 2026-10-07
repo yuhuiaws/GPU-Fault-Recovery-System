@@ -110,9 +110,44 @@ def test_cluster_facts_are_judged_per_provider() -> None:
         "cluster_name": "gpu-eks-cluster",
         "status": "ACTIVE",
         "node_recovery": "not-applicable",
+        "node_repair_config": {},
         "provider": "eks-managed",
     }
     assert provider.cluster_recovery_errors(eks, "eks-managed") == []
+    repaired = provider.eks_cluster_recovery(
+        {"cluster": {"name": "gpu-eks-cluster", "status": "ACTIVE"}},
+        "gpu-eks-cluster",
+        nodegroups={
+            "gpu": {"nodegroup": {"nodeRepairConfig": {"enabled": True}}},
+            "spare": {"nodegroup": {"nodeRepairConfig": {"enabled": False}}},
+            "legacy": {"nodegroup": {}},
+        },
+    )
+    assert repaired["node_repair_config"] == {
+        "gpu": True,
+        "legacy": None,
+        "spare": False,
+    }
+    assert provider.cluster_recovery_errors(repaired, "eks-managed") == [
+        "EKS node auto repair is enabled on node group(s) gpu (the eks-managed "
+        "counterpart of HyperPod NodeRecovery=Automatic)"
+    ]
+    assert (
+        provider.cluster_recovery_errors(
+            {**repaired, "node_repair_config": {"gpu": False, "legacy": None}},
+            "eks-managed",
+        )
+        == []
+    )
+    assert provider.eks_gpu_nodegroups(
+        {
+            "items": [
+                _eks_node(NODE_A, "i-0a"),
+                _eks_node(NODE_B, "i-0b"),
+                {"metadata": {"labels": {EKS_NODEGROUP: "cpu"}}, "status": {}},
+            ]
+        }
+    ) == ["gpu-p5en-efa-spot-node-group"], "GPU nodes' groups only"
     assert provider.cluster_recovery_errors(
         {**eks, "status": "UPDATING"}, "eks-managed"
     ) == ["EKS cluster is not ACTIVE (plain EKS has no managed node recovery)"]
@@ -252,6 +287,14 @@ class _Regional:
         self.commands.append(list(argv))
         if argv[:3] == ["aws", "eks", "describe-cluster"]:
             return SimpleNamespace(stdout=json.dumps(self.describe))
+        if argv[:3] == ["aws", "eks", "describe-nodegroup"]:
+            name = argv[argv.index("--nodegroup-name") + 1]
+            assert argv[argv.index("--cluster-name") + 1] == "gpu-eks-cluster", argv
+            return SimpleNamespace(
+                stdout=json.dumps(
+                    {"nodegroup": {"nodegroupName": name, "status": "ACTIVE"}}
+                )
+            )
         if argv[:3] == ["aws", "ec2", "describe-instances"]:
             return SimpleNamespace(
                 stdout=json.dumps(_describe_instances(_ec2("i-0a"), _ec2("i-0b")))
@@ -283,8 +326,9 @@ def test_the_fixture_reads_eks_facts_without_sagemaker() -> None:
         "cluster_name": "gpu-eks-cluster",
         "status": "ACTIVE",
         "node_recovery": "not-applicable",
+        "node_repair_config": {"gpu-p5en-efa-spot-node-group": None},
         "provider": "eks-managed",
-    }
+    }, "the GPU nodes' node group is described; its unset node auto repair is recorded"
     inventory = warm.provider_inventory()
     assert inventory["count"] == 2
     assert {row["instance_group"] for row in inventory["nodes"]} == {

@@ -36,7 +36,9 @@ the kubectl context, the historical `hyperpod-v1` or sample values. The acceptan
 - every EKS ARN, ACM certificate and GPU cluster `region` must belong to the top-level
   `aws_region`;
 - HyperPod `Orchestrator.Eks.ClusterArn` must equal the corresponding EKS ARN;
-- `NodeRecovery` of every managed GPU HyperPod must be `None`;
+- `NodeRecovery` of every managed GPU HyperPod must be `None`; every managed node group hosting an `eks-managed`
+  member's GPU nodes must have EKS node auto repair off (`DescribeNodegroup.nodeRepairConfig.enabled != true`; unset
+  counts as off and is recorded);
 - any placeholder, cross-Region ARN, wrong context or managed node-recovery configuration must fail before the first
   Kubernetes apply.
 
@@ -134,7 +136,8 @@ and are scheduled separately in the execution order (see §17).
 
 **System-level hard constraints (not configurable; three items):**
 
-1. HyperPod `NodeRecovery` of a managed GPU cluster must be `None` (automatic node recovery disabled);
+1. HyperPod `NodeRecovery` of a managed GPU cluster must be `None` (automatic node recovery disabled); the plain-EKS
+   counterpart is EKS node auto repair off on the GPU managed node groups (`nodeRepairConfig.enabled=false` or unset);
 2. this system never calls `BatchReplaceClusterNodes` under any circumstances;
 3. **HyperPod's automatic job recovery must be disabled; automatic recovery of training jobs is taken over entirely by this system**
    (managed jobs must not carry `enable-job-auto-resume=true`, Slurm must not carry
@@ -158,6 +161,7 @@ Hence only two forms remain, differing only in **whether there is a warm-spare p
 | | Mode B: with warm spare | Mode C: without warm spare |
 | --- | --- | --- |
 | HyperPod `NodeRecovery` | `None` (mandatory) | `None` (mandatory) |
+| EKS node auto repair (`eks-managed` GPU managed node groups) | off (mandatory) | off (mandatory) |
 | warm spare (`gpu-fault.io/spare=true`) | **required** | none |
 | Role of this system | executor of the recovery | isolation + alerting only; replacement is manual |
 | Does this system call `BatchReplaceClusterNodes` | **no** | **no** |
@@ -165,7 +169,9 @@ Hence only two forms remain, differing only in **whether there is a warm-spare p
 
 **The removed Mode A** (`NodeRecovery=Automatic`, this system as a pure observer)
 is **no longer supported** under this constraint. The onboarding precheck must include
-`DescribeCluster.NodeRecovery == "None"`, otherwise onboarding of that cluster is refused.
+`DescribeCluster.NodeRecovery == "None"`, otherwise onboarding of that cluster is refused; for an `eks-managed`
+cluster it requires `DescribeNodegroup.nodeRepairConfig.enabled != true` on every managed node group hosting GPU
+nodes, otherwise refuses the same way.
 
 This yields several simplified acceptance invariants:
 
@@ -208,6 +214,15 @@ How the code implementation maps to the constraints above:
     `healthy warm-spare replacement requires HyperPod NodeRecovery=None;
     provider replacement is disabled`.
     Note that it **does not cover Mode C** (the whole condition short-circuits when `warm_spare_only` is false).
+  - The `eks-managed` counterparts (EKS node auto repair, `gpu_fault.eks_node_repair`):
+    `src/gpu_fault/admin/bootstrap_discovery.py::gpu_nodegroups` -- join/deploy discovery reads `describe-nodegroup`
+    for every managed node group hosting GPU nodes and refuses `nodeRepairConfig.enabled=true` with
+    `... has node auto repair enabled ...`, recording `node_repair` (`disabled`/`unset`) on the identity;
+    `src/gpu_fault/eks_provider.py::EksManagedNodeProvider.preflight` -- the text
+    `EKS node auto repair is enabled on node group <ng>; a direct reboot would create a second lifecycle trigger`;
+    `gpu_fault_release.regional_release_preflight.validate_eks_managed_cluster` -- the `regional_contexts` check
+    shared by the deploy preflight and `status --full`/`verify` records `status`/`node_repair`/`gpu` per node group and
+    fails on enabled for a GPU-hosting group.
 
   These two are the **backstop of the onboarding precheck**, not a runtime form: the constraint requires the cluster to be
   `NodeRecovery=None` from the start, and a cluster that fails the precheck should not be onboarded.
@@ -4294,7 +4309,9 @@ and does not count towards its sequence.
 6. Baseline (read-only): `aws ecr describe-repositories` shows no `gpu-fault/runtime-*`;
    `docker images` shows no `gpu-fault-runtime*`; `docker buildx du` is empty after cleanup;
    Aurora has no cluster; the target namespace does not exist on any cluster.
-7. `eks-managed` members: the GPU node image carries `python3.12` and `strace`, the workload namespace `training` exists, and the
+7. `eks-managed` members: EKS node auto repair is off on the managed node groups hosting GPU nodes
+   (`nodeRepairConfig.enabled=false` or unset, otherwise S1/S3 discovery refuses), the GPU node image carries `python3.12` and
+   `strace`, the workload namespace `training` exists, and the
    GPU nodes carry `nvidia.com/gpu.present=true` (or the operator gives the driver `--gpu-nodegroup <nodegroup>` /
    `--node-selector <selector>`, passed through as given to S1's `deploy` and S3's `join-cluster`; S5 adds it only when the README's
    deployment section documents that parameter, see S5).
