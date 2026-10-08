@@ -1008,6 +1008,11 @@ Semantics and boundaries of `eks-managed`:
   The deploy preflight judges each cluster's override against that same registration family: the registration
   cluster itself never needs one, and a live base of another family yields the plan back to the registration family
   first, the other members being judged against the new base.
+  The base's version name follows the same family: a policy equal to the family's example template returns to the
+  declared version (`eks-v1`/`hyperpod-v1`) and reuses its immutable snapshot -- the way back from a live base of the
+  other family is planned as `regional-hyperpod-<digest12> -> eks-v1`, never as another derived name -- and a changed
+  policy is named `regional-<provider>-<digest12>`; a template whose `nodeReboot` owner is the other provider's adapter
+  is refused before any plan, because the base must be able to reboot the registration cluster's nodes.
   `join-cluster`/`deploy` also check that the cluster's effective profile names its provider's `nodeReboot` adapter
   (`bootstrap_common.require_profile_matches_provider`) and refuse a mismatch before any AWS mutation.
 

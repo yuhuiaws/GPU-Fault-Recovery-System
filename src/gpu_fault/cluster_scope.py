@@ -33,6 +33,7 @@ __all__ = [
     "PROVIDER_NODE_REBOOT_OWNERS",
     "PROVIDER_PROFILE_SOURCES",
     "PROVIDER_PROFILE_VERSIONS",
+    "PROVIDER_VERSION_PREFIXES",
     "HYPERPOD_CLUSTER_LABEL",
     "NODE_SELECTOR_ENV",
     "PROVIDER_ENV",
@@ -94,6 +95,15 @@ PROVIDER_PROFILE_SOURCES: dict[str, str] = {
 PROVIDER_PROFILE_VERSIONS: dict[str, str] = {
     "hyperpod": "hyperpod-v1",
     "eks-managed": "eks-v1",
+}
+#: Version prefix per provider for a policy the declared version cannot name
+#: any more; the suffix is the first 12 hex digits of the template's policy
+#: digest, so one version never names two policies and one policy one version.
+#: The site base (``release_deploy_profile``) and a cluster's own profile
+#: (``cluster_join_profile``) are named by the same table.
+PROVIDER_VERSION_PREFIXES: dict[str, str] = {
+    "hyperpod": "regional-hyperpod",
+    "eks-managed": "regional-eks",
 }
 #: Failure-domain label priority for an ``eks-managed`` cluster. The managed
 #: node group plays the role the HyperPod instance group plays, so it comes

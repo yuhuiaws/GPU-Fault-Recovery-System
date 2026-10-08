@@ -17,6 +17,7 @@ from typing import Any, Mapping
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.admin.bootstrap_common import BootstrapError, profile_node_reboot_owner
 from gpu_fault.admin.profile_approval import (
     ProfileApprovalError,
     StaleProfileApprovalError,
@@ -31,6 +32,14 @@ from gpu_fault.admin.profile_approval import (
 )
 from gpu_fault.admin.site import load_site
 from gpu_fault.capabilities import compile_runtime_profile
+from gpu_fault.cluster_scope import (
+    PROVIDER_NODE_REBOOT_OWNERS,
+    PROVIDER_PROFILE_SOURCES,
+    PROVIDER_PROFILE_VERSIONS,
+    PROVIDER_VERSION_PREFIXES,
+    ClusterProvider,
+    cluster_provider,
+)
 from gpu_fault.models import CapabilityMode, RuntimeProfile
 
 if __package__:
@@ -234,6 +243,92 @@ def _classify_profile_change(
     return kind, tuple(changes)
 
 
+def _registration_provider(
+    spec: Mapping[str, Any], registration_cluster_id: str
+) -> str:
+    """The provider of the registration cluster: the family the site base follows.
+
+    ``bootstrap_discovery.regional_profile_for`` renders the base from the same
+    ``spec.clusters[]`` entry. A site without GPU cluster entries keeps the
+    HyperPod family it always had; a registration cluster missing from the
+    entries is refused -- the base cannot be named after a cluster this site
+    does not manage.
+    """
+
+    clusters = [item for item in spec.get("clusters") or [] if isinstance(item, dict)]
+    if not clusters:
+        return ClusterProvider.HYPERPOD.value
+    for entry in clusters:
+        if str(entry.get("clusterId") or "") != registration_cluster_id:
+            continue
+        try:
+            return cluster_provider(entry.get("provider")).value
+        except ValueError as exc:
+            raise ReleaseDeployError(
+                f"registration cluster {registration_cluster_id}: {exc}"
+            ) from None
+    raise ReleaseDeployError(
+        f"registration cluster {registration_cluster_id} is not among "
+        "spec.clusters; the site Runtime Profile version cannot be named"
+    )
+
+
+def _base_profile_version(
+    *,
+    template_source: Path,
+    policy_digest: str,
+    provider: str,
+    repository_root: Path,
+    state_dir: Path,
+    cluster_id: str,
+) -> str:
+    """The version the site base registers ``policy_digest`` under.
+
+    The registration cluster's provider names the family, and the template must
+    belong to it: one owning ``nodeReboot`` through the other provider's adapter
+    is refused before any plan -- the base the registration cluster runs under
+    must be able to reboot its nodes, and that re-base is what an eks-first site
+    was once talked into approving. Within the family, the declared version
+    (``eks-v1`` / ``hyperpod-v1``) when the policy is the provider's example
+    template's and the declared snapshot, if present, carries that very policy:
+    a site planned back to its template returns to the template's name and
+    reuses the immutable snapshot (live 2026-10-08: the way back from a
+    HyperPod-family base was offered as ``regional-hyperpod-<digest12>`` for eks
+    content, the prefix hardcoded from before plain EKS support). Otherwise
+    ``regional-<provider>-<digest12>``: a snapshot never names two policies.
+    """
+
+    expected = PROVIDER_NODE_REBOOT_OWNERS[provider]
+    try:
+        owner = profile_node_reboot_owner(template_source)
+    except BootstrapError as exc:
+        raise ReleaseDeployError(str(exc)) from None
+    if owner is not None and owner != expected:
+        raise ReleaseDeployError(
+            f"the site Runtime Profile template {template_source} owns nodeReboot "
+            f"through {owner}, but the registration cluster {cluster_id} "
+            f"({provider}) is rebooted through {expected}; the site base follows "
+            "the registration cluster -- set spec.runtimeProfile.templateSource "
+            f"to {PROVIDER_PROFILE_SOURCES[provider]} and rerun deploy"
+        )
+    declared = PROVIDER_PROFILE_VERSIONS[provider]
+    example = repository_root / PROVIDER_PROFILE_SOURCES[provider]
+    snapshot = state_dir / "profiles" / f"{declared}.yaml"
+
+    def digest_of(path: Path) -> str:
+        return _profile_definition(
+            path, cluster_id=cluster_id, profile_version=declared
+        )[1]
+
+    if (
+        example.is_file()
+        and digest_of(example) == policy_digest
+        and (not snapshot.is_file() or digest_of(snapshot) == policy_digest)
+    ):
+        return declared
+    return f"{PROVIDER_VERSION_PREFIXES[provider]}-{policy_digest[:12]}"
+
+
 def plan_runtime_profile(
     site_file: Path,
     *,
@@ -301,13 +396,22 @@ def plan_runtime_profile(
         desired_version = current_version
         if current_document is not None:
             snapshot_document = current_document
-    elif current is None:
-        change_kind = "UNKNOWN_BASELINE"
-        changes = ("active Profile content is unavailable or differs from live SHA",)
-        desired_version = f"regional-hyperpod-{policy_digest[:12]}"
     else:
-        change_kind, changes = _classify_profile_change(current, candidate)
-        desired_version = f"regional-hyperpod-{policy_digest[:12]}"
+        desired_version = _base_profile_version(
+            template_source=template_source,
+            policy_digest=policy_digest,
+            provider=_registration_provider(spec, registration_cluster_id),
+            repository_root=site.repository_root,
+            state_dir=site_file.parent,
+            cluster_id=registration_cluster_id,
+        )
+        if current is None:
+            change_kind = "UNKNOWN_BASELINE"
+            changes = (
+                "active Profile content is unavailable or differs from live SHA",
+            )
+        else:
+            change_kind, changes = _classify_profile_change(current, candidate)
 
     approval_required = change_kind != "UNCHANGED"
     snapshot_document["profile_version"] = desired_version

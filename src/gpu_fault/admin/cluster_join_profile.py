@@ -59,6 +59,7 @@ from gpu_fault.cluster_scope import (
     PROVIDER_NODE_REBOOT_OWNERS,
     PROVIDER_PROFILE_SOURCES,
     PROVIDER_PROFILE_VERSIONS,
+    PROVIDER_VERSION_PREFIXES,
     cluster_provider,
 )
 from gpu_fault_release.regional_release_profile_model import (
@@ -80,13 +81,6 @@ __all__ = [
 
 CLUSTER_PROFILE_CHANGE_KIND = "CLUSTER_PROFILE_NEW"
 PROFILES_DIR = "profiles"
-#: Version prefix per provider for a policy the declared version cannot name
-#: any more; the suffix is the first 12 hex digits of the template's policy
-#: digest, so one version never names two policies and one policy one version.
-PROVIDER_VERSION_PREFIXES: dict[str, str] = {
-    "hyperpod": "regional-hyperpod",
-    "eks-managed": "regional-eks",
-}
 
 
 class JoinProfileApprovalRequired(BootstrapError):

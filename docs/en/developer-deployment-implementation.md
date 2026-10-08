@@ -394,7 +394,9 @@ Developers edit only the YAML pointed to by `templateSource`; they do not modify
    Subsequent ordinary upgrades remain `gpu-fault-admin deploy --state-dir ...` without the approval parameter.
 7. The script automatically:
    - normalizes claims/observed, ignoring YAML order and `cluster_id/profile_version`;
-   - computes the policy digest and generates the `regional-hyperpod-<digest12>` version;
+   - computes the policy digest and names the version: `regional-<provider>-<digest12>` of the registration cluster's
+     family (`regional-hyperpod-<digest12>` on a HyperPod site), or the declared `eks-v1`/`hyperpod-v1` when the policy
+     is the family's example template's and the declared snapshot carries it;
    - writes the immutable snapshot `<site directory>/profiles/<version>.yaml`;
    - updates the site's `source/version` and the Agent config digest;
    - verifies the CI attestation signature, Manifest SHA and delivery identity, without rebuilding on the deploy host;

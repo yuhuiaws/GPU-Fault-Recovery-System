@@ -778,7 +778,7 @@ Decide the following values before deploying:
 | Variable | Example | Notes |
 |---|---|---|
 | `CLUSTER_ID` | `gpu-prod-01` | Globally stable and unique; must not change with the display name |
-| `RUNTIME_PROFILE_VERSION` | `regional-hyperpod-<digest12>` | Read from the site / approved release; incidents, Agents and the control plane must agree |
+| `RUNTIME_PROFILE_VERSION` | `eks-v1`/`hyperpod-v1` or `regional-<provider>-<digest12>` | Read from the site / approved release; incidents, Agents and the control plane must agree |
 | `CONTROL_PLANE_URL` | `https://<nlb-dns-name>` | Reachable by nodes; production must use TLS |
 | Store | Aurora/PostgreSQL | SQLite is forbidden with multiple replicas |
 | lifecycle owner | HyperPod managed or this system | reboot/replace can have only one writer |

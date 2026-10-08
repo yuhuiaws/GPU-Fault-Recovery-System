@@ -67,6 +67,13 @@ gpu-fault-admin deploy \
 This command first completes the approval on the same state-dir, then continues the original deployment until verify, stability and commit finish.
 There is no step three.
 
+The site profile's version name follows the registration cluster's provider family: when the policy is that family's
+example template's and the declared snapshot, if present (`profiles/eks-v1.yaml` / `profiles/hyperpod-v1.yaml`), carries
+the same policy, the version returns to the declared `eks-v1` / `hyperpod-v1` and reuses the snapshot as is (coming back
+from a live base of the other family, the plan reads `regional-hyperpod-<digest12> -> eks-v1`); otherwise it is
+`regional-<provider>-<digest12>`. A template whose `nodeReboot` owner is the other provider's adapter is refused by
+`deploy` before any plan is written.
+
 ### 1.1 A cluster's own profile on a deployed site
 
 A GPU cluster whose provider the site profile cannot reboot (a plain EKS cluster on a HyperPod site, or

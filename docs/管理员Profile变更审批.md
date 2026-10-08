@@ -63,6 +63,11 @@ gpu-fault-admin deploy \
 该命令先在同一state-dir上完成审批，再继续原部署直到verify、stability和commit结束。
 没有第三步。
 
+站点 Profile 的版本名跟随注册集群 provider 的家族：策略等于该家族示例模板、且已有的声明快照
+（`profiles/eks-v1.yaml` / `profiles/hyperpod-v1.yaml`）携带同一策略时，回到声明版本 `eks-v1` / `hyperpod-v1`
+并原样复用快照（活基线属于另一家族时，计划显示为 `regional-hyperpod-<digest12> -> eks-v1`）；否则为
+`regional-<provider>-<digest12>`。模板的 `nodeReboot` owner 属于另一 provider 的 adapter 时，`deploy` 直接拒绝而不出计划。
+
 ### 1.1 已部署站点上集群自有 Profile 的版本升级
 
 站点 Profile 无法重启其 provider 的 GPU 集群（HyperPod 站点上的纯 EKS 集群，或反之）pin 在自己的 Profile 版本上，
