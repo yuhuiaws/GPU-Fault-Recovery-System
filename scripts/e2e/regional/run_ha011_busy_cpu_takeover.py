@@ -140,6 +140,29 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
     }
 
 
+#: Keys the shared driver records beside the planned details as a verdict on
+#: the state at plan time (``live_driver_guard.details_with_preflight_errors``).
+VERDICT_KEYS = frozenset({"preflight_errors"})
+
+
+def approved_intent(details: object) -> object:
+    """The planned ``details`` without the driver's verdict keys.
+
+    ``--plan`` writes ``preflight_errors`` next to this runner's details so a
+    refused plan is diagnosable from ``plan.json``; the execute-time
+    ``plan_details`` recomputation never emits it, so comparing the raw
+    document failed every ``--execute`` on that key alone (live 2026-10-08:
+    13 s into HA-011, "approved deployment, predecessor, or resource intent
+    drifted" with ``drift.paths == ["preflight_errors"]``). A verdict is not
+    intent: the current preflight's errors are enforced on their own, ahead of
+    the comparison, and everything else in the plan still has to match.
+    """
+
+    if not isinstance(details, dict):
+        return details
+    return {key: value for key, value in details.items() if key not in VERDICT_KEYS}
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -170,7 +193,7 @@ def execute_case(
         require_window(maintenance_window_end, required_seconds=480)
         plan = json.loads((case_dir / "plan.json").read_text(encoding="utf-8"))
         current = read_only_preflight(settings, case_dir)
-        planned = plan.get("details")
+        planned = approved_intent(plan.get("details"))
         details = plan_details(settings, current)
         if current["errors"] or planned != details:
             # The receipt says which recorded fact moved: both documents are
