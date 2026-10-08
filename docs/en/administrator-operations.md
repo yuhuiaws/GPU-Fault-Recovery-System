@@ -1000,6 +1000,11 @@ Semantics and boundaries of `eks-managed`:
   immutable snapshot `profiles/<version>.yaml` is written and the join continues. Later clusters of the same provider
   reuse that snapshot without another review. A first `deploy` still requires its GPU clusters to share one provider
   (an all-plain-EKS first deploy starts from `eks-v1`); the other provider joins afterwards with `join-cluster`.
+  Whenever a later `deploy` re-renders the site, the site profile base follows the **registration cluster's**
+  provider (`spec.runtimeProfile.registrationClusterId`) alone: a site whose registration cluster is plain EKS keeps
+  the `eks-v1` base for good and its HyperPod members join with the `hyperpod-v1` override -- it is never re-based to
+  the HyperPod family because a HyperPod member exists; a registration cluster missing from the managed set refuses
+  the deploy (`bootstrap_discovery.registration_cluster_provider`).
   `join-cluster`/`deploy` also check that the cluster's effective profile names its provider's `nodeReboot` adapter
   (`bootstrap_common.require_profile_matches_provider`) and refuse a mismatch before any AWS mutation.
 

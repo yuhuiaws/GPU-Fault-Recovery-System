@@ -13,8 +13,17 @@ from typing import Any, cast
 from scripts.e2e.regional import run_destr009_workload_restart as workload_case
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
+# ``401``/``403`` only as an HTTP status in context (``HTTP 403``, ``status 401``,
+# ``(401)`` after ``request``): a bare digit run matched the millisecond field
+# of the logging timestamp (``14:59:47,403 INFO ...``, live 2026-10-08) and the
+# digits inside identities, so a chatty executor failed the preflight by itself.
 SUSPICIOUS_LOG_PATTERN = re.compile(
-    r"\b(?:ERROR|Traceback|401|403|CERTIFICATE_VERIFY_FAILED)\b"
+    r"\b(?:ERROR|Traceback|CERTIFICATE_VERIFY_FAILED)\b"
+    r"|(?:\bHTTP\s*|\bstatus(?:_code)?\b\s*[:=]?\s*|\bcode\s*[:=]\s*|request \()"
+    r"(?:401|403)\b"
+)
+LOG_TIMESTAMP_PREFIX = re.compile(
+    r"^\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\s*"
 )
 
 
@@ -156,7 +165,7 @@ def suspicious_log_lines(
 
     hits: list[dict[str, Any]] = []
     for number, line in enumerate(text.splitlines(), start=1):
-        match = SUSPICIOUS_LOG_PATTERN.search(line)
+        match = SUSPICIOUS_LOG_PATTERN.search(LOG_TIMESTAMP_PREFIX.sub("", line, 1))
         if match is None:
             continue
         hits.append({"line": number, "marker": match.group(0), "text": line[:300]})

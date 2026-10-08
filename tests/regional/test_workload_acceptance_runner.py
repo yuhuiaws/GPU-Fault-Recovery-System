@@ -34,8 +34,27 @@ def test_suspicious_log_lines_match_whole_words_and_record_the_line() -> None:
 
     hits = workload.suspicious_log_lines(text)
 
-    assert [item["marker"] for item in hits] == ["403", "ERROR", "Traceback"]
+    assert [item["marker"] for item in hits] == ["HTTP 403", "ERROR", "Traceback"]
     assert hits[0]["line"] == 2 and "HTTP 403" in hits[0]["text"]
+    heartbeat = (
+        "2026-10-08 14:59:47,403 INFO gpu_fault.cluster_executor regional cluster "
+        "executor heartbeat: executor=gpu-eks-cluster/gpu-fault-cluster-executor-"
+        "cb9c4b4bf-gch6b claimed_now=0 claimed_total=0 transport_degraded_cycles=0"
+    )
+    assert workload.suspicious_log_lines(heartbeat) == [], (
+        "the logging timestamp's millisecond field is not an HTTP status"
+    )
+    assert (
+        workload.suspicious_log_lines("2026-10-08 14:59:47,401 INFO lease 403401 ok")
+        == []
+    )
+    rejected = (
+        "2026-10-08 14:59:47,100 WARNING regional control plane rejected request "
+        "(401): token unknown"
+    )
+    assert [item["marker"] for item in workload.suspicious_log_lines(rejected)] == [
+        "request (401"
+    ], "a status in context still trips the marker"
     assert workload.suspicious_log_lines("x" * 10, limit=1) == []
     assert len(workload.suspicious_log_lines("ERROR\nERROR\nERROR", limit=2)) == 2
 

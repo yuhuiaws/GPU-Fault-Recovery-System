@@ -1651,7 +1651,7 @@ def _site_document(
     if cluster_documents:
         first_cluster = cluster_documents[0]["clusterId"]
     profile_source, profile_version = regional_profile_for(
-        request.repository_root, gpu_clusters
+        request.repository_root, gpu_clusters, state_dir=request.state_dir
     )
     return {
         "apiVersion": "gpu-fault.aws/v1alpha1",

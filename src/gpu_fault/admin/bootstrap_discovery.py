@@ -10,6 +10,8 @@ is a managed node group (provider ``eks-managed``).
 from __future__ import annotations
 
 from pathlib import Path
+
+import yaml  # type: ignore[import-untyped,unused-ignore]
 from typing import Any, Callable, Mapping, Sequence
 
 from gpu_fault.admin.bootstrap_common import (
@@ -35,6 +37,7 @@ from gpu_fault.gpu_instance_inventory import GPU_INSTANCE_INVENTORY
 
 __all__ = [
     "cluster_provider_entries",
+    "registration_cluster_provider",
     "discover_eks_managed_cluster",
     "find_hyperpod_for_eks",
     "gpu_nodegroups",
@@ -55,19 +58,72 @@ EKS_MANAGED_PROFILE = (
 )
 
 
-def regional_profile_for(
-    repository_root: Path, gpu_clusters: Sequence[ClusterIdentity]
-) -> tuple[str, str]:
-    """``(profile source path, profile version)`` a fresh site starts from.
+def registration_cluster_provider(
+    state_dir: Path, gpu_clusters: Sequence[ClusterIdentity]
+) -> str | None:
+    """The provider of a managed site's registration cluster, or None for a fresh site.
 
-    The HyperPod profile unless every GPU cluster is plain EKS: the EKS profile
-    owns nodeReboot through the EKS adapter and keeps nodeReplace OBSERVE, and
-    a site with any HyperPod cluster must not register a profile whose owners
-    its HyperPod executors never advertise.
+    Read from ``site.yaml`` (``spec.runtimeProfile.registrationClusterId`` and
+    the matching ``spec.clusters[]`` entry). A registration cluster the deploy
+    no longer manages, or an unreadable site, is refused: the site base profile
+    must not be re-derived from whatever cluster happens to come first.
+    """
+
+    site_file = state_dir / "site.yaml"
+    if not site_file.is_file():
+        return None
+    try:
+        document = yaml.safe_load(site_file.read_text(encoding="utf-8")) or {}
+        spec = document["spec"]
+        registration = str(spec["runtimeProfile"]["registrationClusterId"])
+        entries = {str(item["clusterId"]): item for item in spec.get("clusters") or []}
+    except (OSError, yaml.YAMLError, KeyError, TypeError) as exc:
+        raise BootstrapError("cannot read the site's registration cluster") from exc
+    entry = entries.get(registration)
+    if entry is None:
+        # Zero GPU clusters (remove-cluster) keep the site's own profile: the
+        # anchor is stable and no cluster re-derives it.
+        return None if not entries else _refuse_registration(registration)
+    arn = str(entry.get("eksClusterArn") or "")
+    if not any(cluster.eks_arn == arn for cluster in gpu_clusters):
+        _refuse_registration(registration)
+    return str(entry.get("provider") or ClusterProvider.HYPERPOD.value)
+
+
+def _refuse_registration(registration: str) -> str:
+    raise BootstrapError(
+        f"registration cluster {registration} is not among the managed GPU "
+        "clusters; the site Runtime Profile base cannot be re-derived"
+    )
+
+
+def regional_profile_for(
+    repository_root: Path,
+    gpu_clusters: Sequence[ClusterIdentity],
+    *,
+    state_dir: Path | None = None,
+) -> tuple[str, str]:
+    """``(profile source path, profile version)`` the site profile starts from.
+
+    A fresh site: the HyperPod profile unless every GPU cluster is plain EKS.
+    A managed site (``state_dir`` holds ``site.yaml``): the family of the
+    registration cluster's provider, whatever joined later -- an eks-managed
+    registration cluster keeps ``eks-v1`` with a HyperPod override on the
+    HyperPod member, never an eks -> hyperpod re-base (live 2026-10-08: the
+    upgrade of an eks-first site re-derived a HyperPod base because a HyperPod
+    cluster had joined, and the next deploy then wanted an eks override).
     """
 
     source, version = HYPERPOD_PROFILE
-    if gpu_clusters and all(cluster.is_eks_managed for cluster in gpu_clusters):
+    provider = (
+        registration_cluster_provider(state_dir, gpu_clusters)
+        if state_dir is not None
+        else None
+    )
+    if provider is not None:
+        if provider == ClusterProvider.EKS_MANAGED.value:
+            source, version = EKS_MANAGED_PROFILE
+    elif gpu_clusters and all(cluster.is_eks_managed for cluster in gpu_clusters):
         source, version = EKS_MANAGED_PROFILE
     return str(repository_root / source), version
 
