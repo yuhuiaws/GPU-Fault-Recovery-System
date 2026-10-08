@@ -216,6 +216,13 @@ class ResourceRelease:
         tail = arguments[offset + 2 :]
         name = tail[0] if tail and not tail[0].startswith("-") else ""
         key = plane, kind, name
+        # A ``-l`` read answers from a selector-specific document when one is
+        # registered under ``(plane, kind, "-l <selector>")``; otherwise, as
+        # before, from the list document every read of that kind shares.
+        if "-l" in tail:
+            selected = plane, kind, "-l " + tail[tail.index("-l") + 1]
+            if selected in self.documents:
+                key = selected
         self.reads.append(key)
         value = self.documents[key]
         if isinstance(value, Exception):

@@ -13,6 +13,11 @@ import pytest
 from gpu_fault.admin.capacity_defaults import INGRESS_REPLICAS
 from gpu_fault.admin.config import default_admin_config
 from gpu_fault_release import regional_admin_checks as checks
+from gpu_fault_release.regional_release_namespace import (
+    INGRESS_SELECTOR,
+    READINESS_GATE_CONDITION_PREFIX,
+    READINESS_GATE_LABEL,
+)
 from gpu_fault_release.regional_release_state import read_snapshot
 from tests.regional._cov95_release_support import ResourceRelease, deployment
 
@@ -126,6 +131,20 @@ class CheckedRelease(ResourceRelease):
             "items": [
                 deployment("unrelated"),
                 deployment("aws-load-balancer-controller"),
+            ]
+        }
+        # A healthy site: the Namespace carries the readiness-gate label and
+        # the controller injected a gate into every ingress Pod.
+        self.documents[("cpu", "namespace", self.config.namespace)] = {
+            "metadata": {
+                "name": self.config.namespace,
+                "labels": {READINESS_GATE_LABEL: "enabled"},
+            }
+        }
+        self.documents[("cpu", "pods", "-l " + INGRESS_SELECTOR)] = {
+            "items": [
+                ingress_pod(f"gpu-fault-api-ha-{index}")
+                for index in range(INGRESS_REPLICAS)
             ]
         }
         self.aws = self.build_healthy_aws_responses()
@@ -297,6 +316,25 @@ def install_api_transport(
 
     monkeypatch.setattr(checks, "exec_cpu_ingress", execute)
     return calls
+
+
+def ingress_pod(name: str, *, gated: bool = True) -> dict[str, Any]:
+    """An api-ha Pod as the AWS Load Balancer Controller leaves it: with the
+    NLB readiness gate it injects under the Namespace label, unless ``gated``
+    is off (a Pod created before the label existed)."""
+
+    spec: dict[str, Any] = {"nodeName": "cpu-0"}
+    if gated:
+        spec["readinessGates"] = [
+            {
+                "conditionType": READINESS_GATE_CONDITION_PREFIX
+                + "k8s-gpufault-gpufault-0123456789"
+            }
+        ]
+    return {
+        "metadata": {"name": name, "labels": {"app": "gpu-fault-api-ha"}},
+        "spec": spec,
+    }
 
 
 def finding(report: dict[str, Any], name: str) -> dict[str, Any]:

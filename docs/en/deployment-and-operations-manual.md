@@ -824,8 +824,10 @@ If any of the following items fails, the rolling upgrade must not start:
   Every release reconciles that namespace label with a metadata-only merge patch before the control plane rolls (first
   deploy and upgrade alike; `regional_release_namespace.reconcile_namespace_labels`, the release state records
   `namespace_labels.patched/present`), and the `load_balancer_controller` check of `status --full`/verify reports
-  `ingress readiness gate: injected|partial|missing` (missing is a WARN: Pods created before the label existed carry no
-  gate until api-ha is rolled once). Shutdown side: on SIGTERM uvicorn stops accepting, answers in-flight requests within
+  `ingress readiness gate: injected|partial|missing|unknown` (missing is a WARN: Pods created before the label existed
+  carry no gate until api-ha is rolled once; unknown is a WARN that names why the gate could not be read -- a first
+  deploy's preflight runs before the Namespace exists -- and never fails the controller check). Shutdown side: on
+  SIGTERM uvicorn stops accepting, answers in-flight requests within
   `--timeout-graceful-shutdown 60` (a claim long-poll holds at most 30 s) and only then leaves the lifespan; the NLB
   target group does not enable `deregistration_delay.connection_termination`, so an expired deregistration delay resets
   no existing connection. When the peer closes the connection before a status line (`Remote end closed connection without response`)

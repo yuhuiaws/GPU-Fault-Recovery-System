@@ -8,7 +8,9 @@ therefore missing on every upgraded site (live 2026-10-08: release cc58602a7540
 rolled api-ha surge-first without gates). Every release now reconciles the
 Namespace labels the manifest declares with a metadata-only merge patch before
 the control plane rolls, records what it patched, and ``status --full`` /
-``verify`` report whether the ingress Pods carry the gate.
+``verify`` report whether the ingress Pods carry the gate -- or, when that
+cannot be read (a first deploy's preflight runs before the Namespace exists),
+why not, as a warning on the controller check rather than a failed check.
 """
 
 from __future__ import annotations
@@ -84,23 +86,44 @@ def reconcile_namespace_labels(release: Any) -> dict[str, Any]:
     }
 
 
+def _unknown_gate(reason: str) -> dict[str, Any]:
+    return {
+        "status": "unknown",
+        "reason": reason,
+        "label": None,
+        "pods": 0,
+        "gated_pods": [],
+        "ungated_pods": [],
+    }
+
+
 def ingress_readiness_gate(release: Any) -> dict[str, Any]:
     """Whether the ingress Pods carry the controller's NLB readiness gate.
 
     ``injected``: the Namespace label is set and every api-ha Pod has a
     ``target-health.elbv2.k8s.aws/...`` readiness gate; ``missing``: the label
     is absent or no Pod has the gate (Pods created before the label existed
-    keep running without one until they are rolled); ``partial``: some Pods do.
+    keep running without one until they are rolled); ``partial``: some Pods do;
+    ``unknown``: the gate could not be read and ``reason`` says why -- a first
+    deploy's preflight runs before the prerequisites create the Namespace, a
+    release may carry no configuration, kubectl may fail. The gate is a finding
+    that rides on the ``load_balancer_controller`` check, so a read that fails
+    reports itself instead of failing the controller's verdict.
     """
 
-    namespace = release.config.namespace
-    label = live_namespace_labels(release).get(READINESS_GATE_LABEL)
-    pods = (
-        release._get_json(
-            release._cpu("-n", namespace, "get", "pods", "-l", INGRESS_SELECTOR)
-        ).get("items")
-        or []
-    )
+    namespace = getattr(getattr(release, "config", None), "namespace", None)
+    if not namespace:
+        return _unknown_gate("the release names no control-plane namespace")
+    try:
+        label = live_namespace_labels(release).get(READINESS_GATE_LABEL)
+        pods = (
+            release._get_json(
+                release._cpu("-n", namespace, "get", "pods", "-l", INGRESS_SELECTOR)
+            ).get("items")
+            or []
+        )
+    except Exception as exc:  # noqa: BLE001 -- reported as the reason, never raised
+        return _unknown_gate(f"{type(exc).__name__}: {exc}")
     gated: list[str] = []
     ungated: list[str] = []
     for pod in pods:
@@ -141,14 +164,18 @@ def controller_check_value(
     ``check_value`` is the report's ``CheckValue`` type (passed in, as the
     checks module imports this one). A missing gate is a WARN, not a failure:
     the ingress still serves, but its roll is not NLB-aware until the Pods are
-    rolled under the label.
+    rolled under the label. A gate that could not be read is a WARN naming the
+    reason: the controller was found Ready, and that verdict stands.
     """
 
     if not matches:
         raise ReleaseError("no AWS Load Balancer Controller deployment was found")
     gate = ingress_readiness_gate(release)
+    status = gate["status"]
+    if status == "unknown":
+        status = f"unknown ({gate['reason']})"
     return check_value(
-        f"AWS Load Balancer Controller is Ready; ingress readiness gate: {gate['status']}",
+        f"AWS Load Balancer Controller is Ready; ingress readiness gate: {status}",
         {"controllers": matches, "ingress_readiness_gate": gate},
         status="PASS" if gate["status"] == "injected" else "WARN",
     )

@@ -62,6 +62,14 @@ def test_admin_config_renders_and_targets_only_changed_cpu_role(
     monkeypatch.setattr(release, "_stage_registry", lambda: False)
     monkeypatch.setattr(release, "_validate_release_quick", lambda _plan: None)
     monkeypatch.setattr(MODULE, "ensure_notification_secret", lambda _release: None)
+    # The namespace-label reconcile ahead of every role render issues its own
+    # kubectl patch; it has its own tests (test_regional_release_namespace), and
+    # here only the role commands are under test.
+    monkeypatch.setattr(
+        MODULE,
+        "reconcile_namespace_labels",
+        lambda _release: {"patched": [], "present": []},
+    )
     diff = DIFF_MODULE.ReleaseDiff(
         kind=DIFF_MODULE.ReleaseChangeKind.CONTROL_PLANE_ONLY,
         changed=frozenset({"admin_config_worker"}),

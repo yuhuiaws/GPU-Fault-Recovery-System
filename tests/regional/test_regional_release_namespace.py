@@ -52,6 +52,14 @@ class FakeRelease:
         return ""
 
 
+class UnreadableRelease(FakeRelease):
+    """kubectl cannot read the Namespace: a first deploy's preflight runs
+    before the prerequisites create it."""
+
+    def _get_json(self, argv: list[str]) -> dict[str, Any]:
+        raise ReleaseError('namespaces "gpu-fault-system" not found')
+
+
 def _pod(name: str, *, gated: bool) -> dict[str, Any]:
     spec = {"readinessGates": [{"conditionType": GATE}]} if gated else {}
     return {"metadata": {"name": name}, "spec": spec}
@@ -121,6 +129,47 @@ def test_ingress_readiness_gate_reports_injected_partial_and_missing() -> None:
         FakeRelease(labels={}, pods=[_pod("a", gated=True)])
     )
     assert unlabeled["status"] == "missing" and unlabeled["label"] is None, unlabeled
+
+
+def test_ingress_readiness_gate_reports_unknown_with_the_reason_when_unreadable() -> (
+    None
+):
+    gate = namespace.ingress_readiness_gate(UnreadableRelease(labels={}, pods=[]))
+
+    assert gate["status"] == "unknown", gate
+    assert gate["reason"] == 'ReleaseError: namespaces "gpu-fault-system" not found'
+    assert gate["label"] is None and gate["pods"] == 0, gate
+    assert gate["gated_pods"] == [] and gate["ungated_pods"] == [], gate
+    without_config = namespace.ingress_readiness_gate(SimpleNamespace(state={}))
+    assert without_config["status"] == "unknown", without_config
+    assert "namespace" in without_config["reason"], without_config
+
+
+def test_controller_check_warns_with_the_reason_when_the_gate_cannot_be_read() -> None:
+    """The gate rides on the controller's verdict; a read that fails must not
+    turn a Ready controller into a FAIL that stops the deploy."""
+
+    matches = [{"namespace": "kube-system", "name": "lbc", "ready": 2, "replicas": 2}]
+
+    value = namespace.controller_check_value(
+        UnreadableRelease(labels={}, pods=[]), matches, CheckValue
+    )
+
+    assert value.status == "WARN", value
+    assert value.summary == (
+        "AWS Load Balancer Controller is Ready; ingress readiness gate: unknown "
+        '(ReleaseError: namespaces "gpu-fault-system" not found)'
+    ), value.summary
+    assert value.details["ingress_readiness_gate"]["status"] == "unknown", value
+    assert value.details["controllers"] == matches, value
+
+
+def test_reconcile_does_not_tolerate_an_unreadable_namespace() -> None:
+    """The deploy-side reconcile mutates; a Namespace it cannot read stops the
+    release rather than being skipped."""
+
+    with pytest.raises(ReleaseError, match="not found"):
+        namespace.reconcile_namespace_labels(UnreadableRelease(labels={}, pods=[]))
 
 
 def test_controller_check_value_names_the_gate_and_warns_when_missing() -> None:

@@ -46,6 +46,9 @@ def test_upgrade_cpu_role_apply_forgets_the_memoised_ingress_pod(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(ROLLOUT_MODULE, "apply_failure_domain_map", lambda _release: "")
+    monkeypatch.setattr(
+        ROLLOUT_MODULE, "reconcile_namespace_labels", lambda _release: {}
+    )
     release = release_with_memo()
 
     ROLLOUT_MODULE.render_and_apply_cpu_roles(release, {})

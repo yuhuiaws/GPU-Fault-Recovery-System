@@ -10,6 +10,7 @@ import pytest
 from gpu_fault.admin.capacity_defaults import INGRESS_REPLICAS
 from gpu_fault_release import regional_admin_checks as checks
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_namespace import INGRESS_SELECTOR
 from tests.regional._cov95_release_checks import (
     CheckedRelease,
     finding,
@@ -255,6 +256,48 @@ def test_preflight_checks_controller_discovery_and_readiness(
     assert result["status"] == ("FAIL" if problem else "PASS")
     if problem:
         assert problem in result["summary"]
+
+
+@pytest.mark.parametrize(
+    "fault,gate,problem",
+    [
+        ("unlabeled", "missing", "ingress readiness gate: missing"),
+        ("ungated-pod", "partial", "ingress readiness gate: partial"),
+        (
+            "namespace-read",
+            "unknown",
+            "ingress readiness gate: unknown "
+            '(ReleaseError: namespaces "gpu-fault-system" not found)',
+        ),
+    ],
+)
+def test_preflight_controller_check_reports_the_ingress_gate_as_a_warning(
+    release: CheckedRelease, fault: str, gate: str, problem: str
+) -> None:
+    """The gate rides on the controller check as a finding: a label or gate
+    that is missing, and a read that fails (a first deploy's preflight runs
+    before the prerequisites create the Namespace), WARN with the reason and
+    never turn a Ready controller into a failed deploy."""
+
+    namespace_key = ("cpu", "namespace", release.config.namespace)
+    failures_before = checks.build_preflight_report(release)["summary"]["FAIL"]
+    if fault == "unlabeled":
+        release.documents[namespace_key]["metadata"]["labels"] = {}
+    elif fault == "ungated-pod":
+        pods = release.documents[("cpu", "pods", "-l " + INGRESS_SELECTOR)]["items"]
+        del pods[0]["spec"]["readinessGates"]
+    else:
+        release.documents[namespace_key] = ReleaseError(
+            'namespaces "gpu-fault-system" not found'
+        )
+    report = checks.build_preflight_report(release)
+    result = finding(report, "load_balancer_controller")
+    assert result["status"] == "WARN", result
+    assert problem in result["summary"], result["summary"]
+    assert result["details"]["ingress_readiness_gate"]["status"] == gate, result
+    assert report["summary"]["FAIL"] == failures_before, (
+        "the gate adds no FAIL to the preflight"
+    )
 
 
 @pytest.mark.parametrize(
