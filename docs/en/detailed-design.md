@@ -1884,6 +1884,14 @@ Three rules guarantee that downstream stages cannot erase this distinction:
    `verify_max_attempts` is never reachable, and `REPLACE_NODE` can only wait until
    `execution_deadline` expires -- during which the faulty node stays isolated, the training job stays suspended,
    and the operations side gets no alert at all. A deterministic answer must therefore end the wait where it is produced.
+4. A `VERIFY_NO_GPU_CLIENTS` attempt the agent has accepted but not finished within the executor's poll window
+   comes back as a WAITING with `node_action_state: PENDING`; `complete_remote_command` replaces the step's record
+   with it wholesale, and a compound command replaces its `batched_results` entry the same way. The node action
+   adapter therefore carries the previous verdict's continuation (`gpu_client_quiesce_attempt`, `reason`, the holder
+   evidence, `waiting_node`; `adapters/node_action/verification_continuation.py`) under that PENDING record, the
+   poll's own keys winning: otherwise the next cycle's `_verify_attempt` finds no count and the 60-attempt bound
+   restarts, and a record a preemption freezes mid-poll no longer says the step was parked on live GPU clients
+   (the barrier contract of DESTR-016).
 
 The sentence "can only wait until `execution_deadline` expires" in rule 3 above was once wrong: **that fallback was
 not executable at all at the time**. The only enforcer of `execution_deadline` is the dispatcher's

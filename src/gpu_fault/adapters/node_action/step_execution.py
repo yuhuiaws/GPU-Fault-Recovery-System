@@ -16,6 +16,9 @@ from gpu_fault.adapters.node_action.quiesce_taint import (
     remove_quiesce_taint,
 )
 from gpu_fault.adapters.node_action.reset_outcome import normalize_legacy_reset_failure
+from gpu_fault.adapters.node_action.verification_continuation import (
+    VERIFY_EVIDENCE_KEYS,
+)
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.node_agent.protocol import NodeActionResult, NodeActionStatus
@@ -29,14 +32,6 @@ from gpu_fault.orchestration.escalation import (
 #: The holder evidence a VERIFY_NO_GPU_CLIENTS result carries (node agent
 #: ``GpuClientsActive``), kept on the WAITING record of every attempt and on
 #: the FAILED record that ends the retries.
-VERIFY_EVIDENCE_KEYS = (
-    "gpu_client_kind",
-    "gpu_client_holders",
-    "gpu_client_holders_total",
-    "transient_device_clients",
-)
-
-
 @dataclass
 class NodeActionBatchState:
     readiness: dict[str, int]

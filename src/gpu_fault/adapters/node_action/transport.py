@@ -24,6 +24,9 @@ from gpu_fault.adapters.kubernetes.stop_ownership import (
     refusal as ownership_refusal,
 )
 from gpu_fault.adapters.node_action.lease_guard import lease_hold_reason
+from gpu_fault.adapters.node_action.verification_continuation import (
+    verification_continuation,
+)
 from gpu_fault.adapters.node_action.key_propagation import (
     key_propagation_hold,
 )
@@ -176,9 +179,19 @@ def _pending_outcome(
     *,
     intent_sha256: str | None = None,
 ) -> WorkflowStepOutcome:
+    """The WAITING for an action the agent holds but has not answered.
+
+    The record replaces the step's previous one wholesale, so the last
+    client-verification verdict rides under it (``verification_continuation``):
+    the attempt the 60-attempt bound counts and the reason the step is parked
+    on survive a poll that ended before the agent answered. This poll's own
+    keys win.
+    """
+
     return WorkflowStepOutcome.waiting(
         operation_id=context.idempotency_key,
         details={
+            **verification_continuation(context),
             "node_action_command_id": pending.command_id,
             "node_action_state": "PENDING",
             NODE_ACTION_ACCEPTED_NODES_KEY: [node_id],
