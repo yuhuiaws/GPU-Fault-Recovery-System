@@ -768,6 +768,22 @@ class ClusterActionExecutor:
                 )
                 if (
                     consecutive_failures == 1
+                    and isinstance(exc, ClusterExecutorClaimError)
+                    and exc.status_code is None
+                ):
+                    # No verdict at all (the connection closed or timed out
+                    # before a status): the client defines this as safe to
+                    # retry, and one of them is what a control-plane Pod
+                    # leaving during its rolling restart can cost -- not an
+                    # executor error. Two in a row are reported as before.
+                    LOGGER.warning(
+                        "regional cluster executor claim got no verdict from "
+                        "the control plane: %s; retrying in %.1fs (consecutive=1)",
+                        exc,
+                        delay,
+                    )
+                elif (
+                    consecutive_failures == 1
                     or consecutive_failures & (consecutive_failures - 1) == 0
                 ):
                     LOGGER.exception(

@@ -194,6 +194,7 @@ from gpu_fault_release.regional_release_online_registry import (
 from gpu_fault_release.regional_release_online_registry import (
     drain_registry_cluster as drain_registry_cluster,
 )
+from gpu_fault_release.regional_release_namespace import reconcile_namespace_labels
 from gpu_fault_release.regional_release_orchestration import (
     bootstrap_gpu_clusters,
     rollback_release,
@@ -531,6 +532,8 @@ def render_and_apply_cpu_roles(
     release: Any,
     environment: dict[str, str],
 ) -> None:
+    # Namespace labels first: bootstrap applied the manifest, an upgrade never did.
+    release.state["namespace_labels"] = reconcile_namespace_labels(release)
     with tempfile.TemporaryDirectory(prefix="gpu-fault-role-split-") as directory:
         generated = Path(directory)
         release.runner.run(
@@ -983,10 +986,7 @@ class RegionalRelease(RegistryDrainContext):
         force_restart: bool = False,
         diff: ReleaseDiff | None = None,
     ) -> None:
-        """Apply selected roles with a single final template per role.
-
-        The verifier still checks all tiers and ingress/spool consistency.
-        """
+        """Apply the selected roles, one final template per role."""
 
         # Refuse to apply CPU manifests that no longer match the approved plan.
         self.enforce_manifest_plan_pin()

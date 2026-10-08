@@ -31,6 +31,7 @@ from gpu_fault_release.regional_aurora_credentials import (
 )
 from gpu_fault_release.regional_notifications import check_notification_channel
 from gpu_fault_release.regional_release_aurora_refresh import aurora_refresh_preflight
+from gpu_fault_release.regional_release_namespace import controller_check_value
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_diff import (
     ReleaseComponent,
@@ -416,9 +417,7 @@ def _check_load_balancer_controller(release: Any) -> CheckValue:
                 f"load balancer controller {item['metadata']['name']} "
                 f"has {ready}/{replicas} Ready"
             )
-    if not matches:
-        raise ReleaseError("no AWS Load Balancer Controller deployment was found")
-    return CheckValue("AWS Load Balancer Controller is Ready", matches)
+    return controller_check_value(release, matches, CheckValue)
 
 
 def _aws_json(release: Any, arguments: list[str]) -> dict[str, Any]:

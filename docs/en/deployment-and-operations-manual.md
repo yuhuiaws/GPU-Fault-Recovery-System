@@ -821,6 +821,19 @@ If any of the following items fails, the rolling upgrade must not start:
   balancer cannot reach yet (`terminationGracePeriodSeconds` is 140 accordingly). `rotate-token`'s
   `CONTROL_PLANE_ROLLED` and every release's ingress roll rely on these settings; acceptance AUTH-016 samples claims
   through the whole roll and requires every one to be 200.
+  Every release reconciles that namespace label with a metadata-only merge patch before the control plane rolls (first
+  deploy and upgrade alike; `regional_release_namespace.reconcile_namespace_labels`, the release state records
+  `namespace_labels.patched/present`), and the `load_balancer_controller` check of `status --full`/verify reports
+  `ingress readiness gate: injected|partial|missing` (missing is a WARN: Pods created before the label existed carry no
+  gate until api-ha is rolled once). Shutdown side: on SIGTERM uvicorn stops accepting, answers in-flight requests within
+  `--timeout-graceful-shutdown 60` (a claim long-poll holds at most 30 s) and only then leaves the lifespan; the NLB
+  target group does not enable `deregistration_delay.connection_termination`, so an expired deregistration delay resets
+  no existing connection. When the peer closes the connection before a status line (`Remote end closed connection without response`)
+  the claim client repeats the same claim once after 1 s (`claiming again once`; commands a lost claim leased return
+  to the queue when their lease expires); the Executor retries a claim that still got no answer at all once by the
+  client's own "no verdict is safe to retry" rule and logs only a WARNING (`claim got no verdict`); two in a row are
+  logged as ERROR as before -- so E2E-001's `ERROR|Traceback` preflight marker
+  fires only on a real outage.
 - `gpu-fault-control-worker-pdb` exists with
   `maxUnavailable: 1`; the ADOT PDB is `maxUnavailable: 1`. ADOT has only 1 replica,
   so `minAvailable` cannot be used here: `minAvailable: 1` can never be satisfied for 1 replica,

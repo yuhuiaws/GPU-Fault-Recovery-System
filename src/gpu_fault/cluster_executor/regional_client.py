@@ -16,9 +16,10 @@ from __future__ import annotations
 import json
 import logging
 import socket
+import time
 import ssl
 from datetime import datetime, timezone
-from http.client import HTTPException
+from http.client import HTTPException, RemoteDisconnected
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
@@ -102,6 +103,31 @@ def _validation_summary(exc: ValidationError) -> str:
         parts.append(f"{location}: {str(error.get('msg', ''))[:120]}")
     detail = "; ".join(parts) or "no field-level detail"
     return ("this executor could not parse the claimed command: " + detail)[:500]
+
+
+#: The pause before the one repeat of a claim whose connection the control plane
+#: closed without a response; long enough for the load balancer to route the new
+#: connection elsewhere, short enough to stay inside the executor's claim cadence.
+CLOSED_WITHOUT_RESPONSE_RETRY_SECONDS = 1.0
+_CLOSED_WITHOUT_RESPONSE: tuple[type[BaseException], ...] = (
+    RemoteDisconnected,
+    ConnectionResetError,
+    BrokenPipeError,
+)
+
+
+def closed_without_response(exc: ClusterExecutorError) -> bool:
+    """A transport failure in which the peer closed before any status line."""
+
+    if exc.status_code is not None:
+        return False
+    cause: BaseException | None = exc.__cause__
+    while cause is not None:
+        if isinstance(cause, _CLOSED_WITHOUT_RESPONSE):
+            return True
+        inner = getattr(cause, "reason", None)
+        cause = inner if isinstance(inner, BaseException) else cause.__cause__
+    return False
 
 
 class RegionalExecutorClient:
@@ -245,16 +271,32 @@ class RegionalExecutorClient:
             lease_seconds=lease_seconds,
             wait_seconds=wait_seconds,
         )
-        if wait_seconds > 0:
+        body = (
+            payload.model_dump(mode="json")
+            if wait_seconds > 0
+            else payload.model_dump(mode="json", exclude={"wait_seconds"})
+        )
+        timeout = self.timeout_seconds + wait_seconds if wait_seconds > 0 else None
+        try:
             response = self._post(
-                "/v1/regional/executors/claim",
-                payload.model_dump(mode="json"),
-                timeout_seconds=self.timeout_seconds + wait_seconds,
+                "/v1/regional/executors/claim", body, timeout_seconds=timeout
             )
-        else:
+        except ClusterExecutorError as exc:
+            if not closed_without_response(exc):
+                raise
+            # The control plane closed the connection before any status line:
+            # a Pod leaving during the control plane's rolling restart (live
+            # 2026-10-08, every api-ha roll). No verdict was received, so the
+            # claim is repeated once; commands a lost claim leased return to
+            # the queue when their lease expires, as for any lost claim.
+            LOGGER.warning(
+                "regional control plane closed the claim connection without a "
+                "response (%s); claiming again once",
+                exc,
+            )
+            time.sleep(CLOSED_WITHOUT_RESPONSE_RETRY_SECONDS)
             response = self._post(
-                "/v1/regional/executors/claim",
-                payload.model_dump(mode="json", exclude={"wait_seconds"}),
+                "/v1/regional/executors/claim", body, timeout_seconds=timeout
             )
         return self._claimed_commands(response)
 
