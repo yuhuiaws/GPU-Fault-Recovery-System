@@ -370,3 +370,42 @@ def test_cpu_region_must_match_operator_approval(monkeypatch, tmp_path: Path) ->
     with pytest.raises(contracts.ProofError):
         cpu_node(CpuKubernetes(settings), "cpu-node")
     assert not fake.created, "a different Region must be rejected before placement"
+
+
+def test_drift_names_the_differing_leaves_with_both_values() -> None:
+    planned = {
+        "a": 1,
+        "nested": {"same": "x", "uids": ["u1", "u2"], "gone": True},
+        "list": [1, 2],
+    }
+    current = {
+        "a": 2,
+        "nested": {"same": "x", "uids": ["u1", "u3"], "added": False},
+        "list": [1, 2],
+    }
+
+    value = contracts.drift(planned, current)
+
+    assert value["paths"] == ["a", "nested.added", "nested.gone", "nested.uids"]
+    assert value["planned"] == {
+        "a": 1,
+        "nested.added": contracts.ABSENT,
+        "nested.gone": True,
+        "nested.uids": ["u1", "u2"],
+    }
+    assert value["current"] == {
+        "a": 2,
+        "nested.added": False,
+        "nested.gone": contracts.ABSENT,
+        "nested.uids": ["u1", "u3"],
+    }
+    assert contracts.drift(planned, planned) == {
+        "paths": [],
+        "planned": {},
+        "current": {},
+    }
+    assert contracts.drift({"k": 1}, "scalar") == {
+        "paths": ["<root>"],
+        "planned": {"<root>": {"k": 1}},
+        "current": {"<root>": "scalar"},
+    }

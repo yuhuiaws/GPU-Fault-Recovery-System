@@ -6982,6 +6982,11 @@ execution lease; otherwise orphan cleanup could cancel the commands used for the
   it is not acceptable to call the old callback once only after the replacement process has already completed and treat "does not exist" as fencing proof.
 - At the end, prove that its own processes have stopped, delete the namespace and PriorityClass by their original UIDs, and confirm they are gone.
   Admission drift, a lost ACK, a timeout, leftovers, or an interruption must not continue to use an old PASS.
+- A failed receipt names its cause, not only the exception type: `error` carries the redacted, bounded message;
+  admission drift lists the plan keys that moved with both values (`drift.paths`/`planned`/`current`) and any
+  `preflight_errors`; a probe-source change records both digests (`probe_source`); an incomplete proof lists
+  `evidence_errors`; identity drift after the proof lists `identity_drift.paths`; a window too short to cover the
+  case names the seconds left and required; a failed cleanup adds `cleanup_error` beside `cleanup_error_type`.
 - This case does not test whole-business-Pod failover, whole-machine CPU saturation SLOs, or Aurora failover.
   A local process/PostgreSQL regression is also not evidence that this regional case has passed LIVE.
 

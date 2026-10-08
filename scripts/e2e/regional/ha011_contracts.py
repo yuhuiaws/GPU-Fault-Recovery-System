@@ -241,3 +241,41 @@ def evidence_errors(
         ):
             errors.append(f"{role}: distinct owned process identities are missing")
     return errors
+
+
+ABSENT = "<absent>"
+
+
+def drift(planned: object, current: object) -> dict[str, Any]:
+    """The leaves on which two recorded documents differ, by dotted path.
+
+    ``paths`` names every differing leaf (a list, such as the business Pod
+    UIDs, is one leaf; a key present on one side only reads ``<absent>`` on
+    the other); ``planned`` and ``current`` carry the two values. Both
+    documents are evidence the case already records, so the receipt learns
+    only which recorded fact moved, never a new one.
+    """
+
+    paths: list[str] = []
+    planned_leaves: dict[str, Any] = {}
+    current_leaves: dict[str, Any] = {}
+
+    def record(path: str, before: object, after: object) -> None:
+        paths.append(path)
+        planned_leaves[path] = before
+        current_leaves[path] = after
+
+    def walk(before: object, after: object, prefix: str) -> None:
+        if isinstance(before, dict) and isinstance(after, dict):
+            for key in sorted({*before, *after}, key=str):
+                path = f"{prefix}.{key}" if prefix else str(key)
+                if key in before and key in after:
+                    walk(before[key], after[key], path)
+                else:
+                    record(path, before.get(key, ABSENT), after.get(key, ABSENT))
+            return
+        if before != after:
+            record(prefix or "<root>", before, after)
+
+    walk(planned, current, "")
+    return {"paths": paths, "planned": planned_leaves, "current": current_leaves}

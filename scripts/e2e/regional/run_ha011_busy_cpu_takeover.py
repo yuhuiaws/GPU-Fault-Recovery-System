@@ -18,6 +18,7 @@ if str(ROOT) not in sys.path:
 from gpu_fault.admin.atomic_json import (  # noqa: E402
     write_json_atomic as write_initial_json,
 )
+from gpu_fault.admin.diagnostics import diagnostic_text  # noqa: E402
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
@@ -30,6 +31,7 @@ from scripts.e2e.regional.ha011_contracts import (  # noqa: E402
     ProofError,
     Settings,
     digest,
+    drift,
     evidence_errors,
 )
 from scripts.e2e.regional.ha011_manifests import manifests, source_bundle  # noqa: E402
@@ -168,7 +170,15 @@ def execute_case(
         require_window(maintenance_window_end, required_seconds=480)
         plan = json.loads((case_dir / "plan.json").read_text(encoding="utf-8"))
         current = read_only_preflight(settings, case_dir)
-        if current["errors"] or plan.get("details") != plan_details(settings, current):
+        planned = plan.get("details")
+        details = plan_details(settings, current)
+        if current["errors"] or planned != details:
+            # The receipt says which recorded fact moved: both documents are
+            # evidence the plan already carries, so only their difference is new.
+            if current["errors"]:
+                result["preflight_errors"] = list(current["errors"])
+            if planned != details:
+                result["drift"] = drift(planned, details)
             raise ProofError(
                 "approved deployment, predecessor, or resource intent drifted"
             )
@@ -182,18 +192,20 @@ def execute_case(
             cpu_node_identity=current["identity"]["cpu_node"],
         )
         bundle = source_bundle(Path(__file__).parent)
-        if (
-            digest(
-                manifests(
-                    settings,
-                    runtime_image=current["identity"]["runtime_image"],
-                    bundle=bundle,
-                    password="<generated-private-credential>",
-                    cpu_node=current["identity"]["cpu_node"],
-                )
+        intent = digest(
+            manifests(
+                settings,
+                runtime_image=current["identity"]["runtime_image"],
+                bundle=bundle,
+                password="<generated-private-credential>",
+                cpu_node=current["identity"]["cpu_node"],
             )
-            != current["intent_sha256"]
-        ):
+        )
+        if intent != current["intent_sha256"]:
+            result["probe_source"] = {
+                "preflight_intent_sha256": current["intent_sha256"],
+                "current_intent_sha256": intent,
+            }
             raise ProofError("probe source changed after execution preflight")
         resources.start(
             manifests(
@@ -213,21 +225,29 @@ def execute_case(
             intent_sha256=current["intent_sha256"],
         )
         if errors:
+            result["evidence_errors"] = errors
             raise ProofError(
                 "isolated runtime did not prove the complete busy takeover contract"
             )
-        if kubernetes.identity() != current["identity"]:
+        after = kubernetes.identity()
+        if after != current["identity"]:
+            result["identity_drift"] = drift(current["identity"], after)
             raise ProofError(
                 "business deployment identity drifted during isolated acceptance"
             )
         result["probe"] = proof
         result["verdict"] = "PASS"
-    except ProcessSupervisionLost:
+    except ProcessSupervisionLost as exc:
         supervision_lost = True
         record_supervision_loss(result)
         result["error_type"] = "ProcessSupervisionLost"
+        result["error"] = diagnostic_text(str(exc), limit=1024)
     except Exception as exc:
+        # The type alone left the operator guessing among the refusals above
+        # and those inside identity() (live 2026-10-08: a 13 s FAIL recorded
+        # only "ProofError"); the message is bounded and redacted as AUTH-008's.
         result["error_type"] = type(exc).__name__
+        result["error"] = diagnostic_text(str(exc), limit=1024)
         if resources is not None and resources.failure_details is not None:
             result["probe_failure"] = resources.failure_details
     finally:
@@ -239,6 +259,7 @@ def execute_case(
             except Exception as exc:
                 result["verdict"] = "FAIL"
                 result["cleanup_error_type"] = type(exc).__name__
+                result["cleanup_error"] = diagnostic_text(str(exc), limit=1024)
         elif resources is not None:
             result["cleanup"] = {
                 "remote_cleanup_attempted": False,

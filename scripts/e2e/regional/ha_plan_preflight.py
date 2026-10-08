@@ -8,12 +8,25 @@ from typing import Any
 
 
 def require_window(deadline: datetime, *, required_seconds: int = 0) -> None:
-    if (
-        deadline.tzinfo is None
-        or (deadline - datetime.now(timezone.utc)).total_seconds() <= required_seconds
-    ):
+    """Refuse an HA step the approved maintenance window cannot cover.
+
+    The message names what was measured -- the deadline, the seconds left and
+    the seconds the step needs -- because the case receipt records it as
+    ``error``: an operator reading only the receipt must be able to tell a
+    window that was never set from one that is merely short.
+    """
+
+    if deadline.tzinfo is None:
         raise RuntimeError(
-            "approved maintenance window cannot cover the remaining HA operation"
+            "approved maintenance window cannot cover the remaining HA operation: "
+            f"the deadline {deadline.isoformat()} carries no timezone"
+        )
+    remaining = (deadline - datetime.now(timezone.utc)).total_seconds()
+    if remaining <= required_seconds:
+        raise RuntimeError(
+            "approved maintenance window cannot cover the remaining HA operation: "
+            f"{remaining:.0f}s left before {deadline.isoformat()}, "
+            f"{required_seconds}s required"
         )
 
 
