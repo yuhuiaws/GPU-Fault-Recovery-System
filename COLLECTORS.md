@@ -32,7 +32,7 @@ HTTP 2xx 但 body 不是 JSON object 的响应按**结果未知**处理，走与
 默认HyperPod生产拓扑启用：
 
 - kernel、fabric-manager、dcgm、host节点采集器；
-- kubernetes-node-resources集群采集器；
+- kubernetes-node-resources集群采集器（节点创建或 `Ready=True` 转换后的 `GPU_FAULT_KUBERNETES_NODE_STARTUP_GRACE_SECONDS`（缺省 600 s）内不判定 device plugin 资源缺失，device plugin Pod 要几分钟才注册资源；宽限结束后连续样本计数从零开始）；
 - completion watcher提供attempt/workload observation。
 
 `NodeLogCollector` 当前默认禁用，不进入生产必需集合。安装器只在隔离验证环境显式

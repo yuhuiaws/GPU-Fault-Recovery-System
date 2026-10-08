@@ -32,7 +32,7 @@ so a request that was in fact received is deduplicated on the control-plane side
 The default HyperPod production topology enables:
 
 - the kernel, fabric-manager, dcgm and host node collectors;
-- the kubernetes-node-resources cluster collector;
+- the kubernetes-node-resources cluster collector (no device-plugin resource loss is judged within `GPU_FAULT_KUBERNETES_NODE_STARTUP_GRACE_SECONDS` (default 600 s) of a node's creation or its `Ready=True` transition -- the device-plugin Pods register their resources minutes after a node joins; the consecutive-sample count restarts from zero when the grace ends);
 - the completion watcher providing attempt/workload observations.
 
 `NodeLogCollector` is currently disabled by default and is not part of the production-required set. The installer enables it only when

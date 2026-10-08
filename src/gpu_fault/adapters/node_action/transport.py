@@ -24,6 +24,9 @@ from gpu_fault.adapters.kubernetes.stop_ownership import (
     refusal as ownership_refusal,
 )
 from gpu_fault.adapters.node_action.lease_guard import lease_hold_reason
+from gpu_fault.adapters.node_action.key_propagation import (
+    key_propagation_hold,
+)
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
@@ -768,6 +771,7 @@ class NodeActionTransportMixin:
         hold_reason = lease_hold_reason()
         if hold_reason is not None:
             return _lease_hold_outcome(context, node_id, hold_reason, recorded)
+        record = None
         try:
             maintenance = self._maintenance_generations(context) is not None
             endpoint = self._endpoint(
@@ -788,6 +792,16 @@ class NodeActionTransportMixin:
                 context.incident.cluster_id, node_id, record=record
             )
         except ValueError as exc:
+            clock = getattr(self.registry, "now", None)
+            hold = key_propagation_hold(
+                context,
+                node_id,
+                exc,
+                record,
+                now=clock() if callable(clock) else datetime.now(timezone.utc),
+            )
+            if hold is not None:
+                return hold
             return WorkflowStepOutcome.failed(str(exc))
         if not endpoint:
             return WorkflowStepOutcome.failed(f"no node action endpoint for {node_id}")

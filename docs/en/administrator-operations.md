@@ -1269,13 +1269,33 @@ Semantics and boundaries of `eks-managed`:
 
 **Out of scope** (deliberately not provided for `eks-managed`): provider-side node replacement (`nodeReplace` is OWNed
 only as the warm-spare handover and never calls a provider replacement API; after a Spot interruption the node comes back under a new name and instance id -- retire the old Agent with
-`workflow-reconcile --retire-departed-agents` and let the reconciler install the new node), HyperPod health labels /
+`workflow-reconcile --retire-departed-agents` and let the reconciler install the new node; what to expect during that
+join window is described in the paragraph below), HyperPod health labels /
 HMA signals, `UpdateClusterSoftware` re-imaging, HyperPod advisory notifications and the legacy single-cluster
 `deploy/hyperpod/deploy.sh`; the CPU control-plane cluster must still be HyperPod. When the GPU nodes carry the
 `nvidia.com/gpu=present:NoSchedule` taint, the installer Job and the DCGM exporter DaemonSet already use
 `tolerations: [operator: Exists]`, while the Executor, Watcher and Reconciler Deployments need a schedulable non-GPU
 node group in the cluster. An existing `dcgm-exporter` in the cluster must not bind host ports 9400/5555 over
 hostNetwork (ours binds only `127.0.0.1:9400` and dials the host nv-hostengine).
+
+**The join window of a replacement node (both providers; live 2026-10-07, managed node group roll).** After the old
+node is terminated: `workflow-reconcile --retire-departed-agents` retires the old Agent record; the
+`gpu-fault-node-installer-reconciler` then creates an installer Job per new node (live: about 20 minutes after node
+creation, completing within minutes); at the end of the install the Agent registers and the new node's key appears in
+`gpu-fault-node-action-keys`. Meanwhile:
+- the preflight of `gpu-fault-admin deploy` / `status --full` is **transiently** red (`installer is not Succeeded`,
+  `has no registered Node Agents`) -- a fail-closed true reading; rerun once the installer Job is Complete, never touch
+  the Store for it;
+- the Kubernetes watcher (`kubernetes-node-resources`) judges no device-plugin resource loss on a node whose creation or
+  `Ready=True` transition is younger than `GPU_FAULT_KUBERNETES_NODE_STARTUP_GRACE_SECONDS` (default 600 s) -- the
+  device-plugin Pods register `nvidia.com/gpu` / `vpc.amazonaws.com/efa` minutes after the join. It used to open an EFA
+  incident 19 seconds after node creation and plan `RESTART_GPU_DEVICE_PLUGIN`;
+- a workflow created for the new node inside the window stays `PENDING` until the Agent registers (the fleet preflight
+  does not dispatch it) and is dispatched right after; if the executor does not yet see the node's action key, the node
+  action step waits with `node_action_state=KEY_PENDING` (at most `NODE_ACTION_KEY_PROPAGATION_GRACE`, 10 minutes
+  after the Agent's first registration) and retries instead of failing terminally -- `RESTART_GPU_DEVICE_PLUGIN` used
+  to fail with `node action secret is unavailable for <node>` in the very second the installer Job completed, and a
+  destructive action failing that way would have quarantined a healthy node. Outside the grace it still fails closed.
 
 The join's commit path pays only for the new cluster, and the `evidence` in `state.json` shows the scope of every step:
 
@@ -1481,6 +1501,26 @@ dnf install -y python3.12 strace
 command -v strace
 --==GPU-FAULT==--
 ```
+
+Once the user data is in the node group's launch template, the nodes still have to pick it up:
+
+- **New node group**: pass the launch template at creation -- `aws eks create-nodegroup … --launch-template
+  name=<lt>,version=<N>`; the nodes carry the packages from their first boot and nothing has to be rolled.
+- **Existing node group**: create a new launch-template version with the user data above, then
+  `aws eks update-nodegroup-version --cluster-name <eks cluster> --nodegroup-name <GPU node group> --launch-template
+  name=<lt>,version=<N>` and wait for `aws eks describe-update --cluster-name <eks cluster> --nodegroup-name <GPU node
+  group> --update-id <id> --query update.status` to read `Successful`.
+- **Live caveats (2026-10-07, gpu-eks-cluster)**: the roll launches **one** extra instance first (maxUnavailable 1), so a
+  Spot node group needs Spot capacity for one more p5en.48xlarge in its AZ -- when there is none, EKS fails the update
+  with `NodeCreationFailure` after about 17 minutes and reverts the node group to the previous launch-template version
+  with the nodes untouched (two of three attempts went that way; repeat the update later, failed attempts are harmless).
+  Never start a roll while `gpu-fault-admin config`/`deploy` may run -- the `regional_contexts` preflight fails closed
+  while the node group is UPDATING. After a successful roll follow the replacement-node join window paragraph above
+  (`--retire-departed-agents` → the reconciler installs the new nodes), and confirm the packages on a new node over SSM
+  or `kubectl debug` before relying on it.
+- The shell part lists only the product's prerequisites; acceptance-only tooling (such as DCGM's `dcgmproftester` for
+  COLLECT-002) is documented in the acceptance/fault-simulation manuals and may be appended to the same shell part by a
+  test site.
 
 With a managed node group on the EKS-optimised AMI, EKS injects the `NodeConfig` part, so the launch template's user
 data carries only the MIME envelope and the shell part above; a custom AMI needs both parts. After the nodes have

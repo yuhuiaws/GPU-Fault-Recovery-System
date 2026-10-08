@@ -402,6 +402,8 @@ categories:
         description: "可选：eks-managed 集群的 EKS 集群名；设置后 preflight 要求目标实例的 `eks:cluster-name` 标签与之一致，未设置时从标签读取（不一致或缺失则 fail closed）。"
       - name: GPU_FAULT_EFA_DEVICE_PLUGIN_NAME
         description: "RESTART_EFA_DEVICE_PLUGIN 重启的 DaemonSet `name` 标签；缺省按 provider：HyperPod `hyperpod-dependencies-aws-efa-k8s-device-plugin`，eks-managed `aws-efa-k8s-device-plugin`。"
+      - name: GPU_FAULT_KUBERNETES_NODE_STARTUP_GRACE_SECONDS
+        description: "kubernetes-node-resources 采集器的节点启动宽限（秒，缺省 600，0 关闭）：节点创建或 `Ready=True` 转换之后这段时间内不判定 `nvidia.com/gpu`/`vpc.amazonaws.com/efa` allocatable 缺失——device plugin 的 DaemonSet Pod 要在节点加入几分钟后才注册资源。现场 2026-10-07：替换节点创建 19 秒后被判 EFA allocatable mismatch 并规划了 RESTART_GPU_DEVICE_PLUGIN，一分钟后它已广告全部设备。宽限结束后连续样本计数从零重新开始。"
 
   - title: HyperPod、reboot 与 warm spare
     description: >-

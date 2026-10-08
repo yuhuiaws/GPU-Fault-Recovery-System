@@ -314,6 +314,7 @@ def test_kubernetes_node_resources(
     monkeypatch.setenv("GPU_FAULT_KUBERNETES_EFA_MISMATCH_SAMPLES", "4")
     monkeypatch.setenv("GPU_FAULT_KUBERNETES_EFA_HEALTH_SUMMARY_SECONDS", "60")
     monkeypatch.setenv("GPU_FAULT_KUBERNETES_NODE_LIST_PAGE_SIZE", "50")
+    monkeypatch.setenv("GPU_FAULT_KUBERNETES_NODE_STARTUP_GRACE_SECONDS", "120")
 
     collector = _run_cli(
         monkeypatch,
@@ -328,6 +329,7 @@ def test_kubernetes_node_resources(
     assert collector.required_consecutive_samples == 4
     assert collector.health_summary_seconds == 60
     assert collector.list_page_size == 50
+    assert collector.node_startup_grace_seconds == 120
 
 
 def test_outbox_path_defaults_to_the_command_name(

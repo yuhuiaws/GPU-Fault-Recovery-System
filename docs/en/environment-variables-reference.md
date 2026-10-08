@@ -299,6 +299,7 @@ validates them (integers/numbers must parse, booleans must be `0/1/true/false/ye
 | `GPU_FAULT_KUBERNETES_EFA_INTERVAL_SECONDS` | Core/Other | text | `'15'` | `gpu_fault.collectors_cli` |
 | `GPU_FAULT_KUBERNETES_EFA_MISMATCH_SAMPLES` | Core/Other | integer | `'2'` | `gpu_fault.collectors_cli` |
 | `GPU_FAULT_KUBERNETES_NODE_LIST_PAGE_SIZE` | Core/Other | integer | `'500'` | `gpu_fault.collectors_cli` |
+| `GPU_FAULT_KUBERNETES_NODE_STARTUP_GRACE_SECONDS` | Core/Other | integer | `'600'` | `gpu_fault.collectors_cli` |
 | `GPU_FAULT_KUBERNETES_OWNER` | Core/Other | text | `'gpu-fault-kubernetes-adapter'` | `gpu_fault.app.context`<br>`gpu_fault.cluster_executor.bootstrap` |
 | `GPU_FAULT_KUBERNETES_REQUEST_TIMEOUT_SECONDS` | Core/Other | text | `'30'` | `gpu_fault.adapters.kubernetes.primitives` |
 | `GPU_FAULT_KUBERNETES_RESOURCE_INTERVAL_SECONDS` | Core/Other | number | `os.getenv('GPU_FAULT_KUBERNETES_EFA_INTERVAL_SECONDS', '15')` | `gpu_fault.collectors_cli` |

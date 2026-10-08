@@ -10,6 +10,8 @@ plane climbed the hardware ladder to a reboot.
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any
 from urllib.error import URLError
 
@@ -117,3 +119,79 @@ def test_a_missing_or_refused_agent_record_still_fails_the_step(
     assert "agent key metadata is unavailable for node-a" in (result.error or ""), (
         result.error
     )
+
+
+NOW = datetime(2026, 10, 8, 0, 0, 31, tzinfo=timezone.utc)
+
+
+class FreshRecordRegistry(StubFleetRegistry):
+    """node-a's Agent registered ``age`` ago with a per-node key the executor
+    does not hold yet (key version 2, no fleet secret)."""
+
+    def __init__(self, age: timedelta | None) -> None:
+        super().__init__({"node-a": ENDPOINT}, node_action_key_version=2)
+        self.age = age
+        self.now = lambda: NOW
+
+    def get_agent(self, cluster_id: str, node_id: str) -> Any:
+        record = super().get_agent(cluster_id, node_id)
+        if self.age is None:
+            return record
+        return SimpleNamespace(**vars(record), first_seen_at=NOW - self.age)
+
+
+def run_one_without_the_node_key(registry: StubFleetRegistry) -> RemoteCommandResult:
+    def sender(_endpoint: str, _envelope: Any) -> Any:
+        pytest.fail("nothing may be sent without the node's action key")
+
+    adapter = NodeActionWorkflowAdapter(
+        {},
+        "",
+        node_secrets={"node-other": "o" * 32},
+        node_action_key_version=2,
+        registry=registry,
+        sender=sender,
+    )
+    command = remote_command(
+        "command-a",
+        operation=WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT,
+        execution_owner=adapter.owner,
+    )
+    client = FakeExecutorClient([command])
+    executor = build_executor(client, [adapter])
+    assert executor.run_once() == 1
+    return client.reported("command-a")
+
+
+def test_a_missing_key_for_a_freshly_registered_node_holds_the_step() -> None:
+    """Live 2026-10-08: the first command for a replacement node ran the second
+    its Agent registered, before the node-action-keys Secret reached the
+    executor, and failed terminally. Inside the propagation grace it waits."""
+
+    result = run_one_without_the_node_key(FreshRecordRegistry(timedelta(seconds=40)))
+
+    assert result.status is RemoteCommandStatus.WAITING, result
+    assert result.details["node_action_key_pending"] is True
+    assert result.details["node_action_not_started"] is True
+    assert result.details["node_action_state"] == "KEY_PENDING"
+    assert "registered 40s ago (key propagation grace 600s)" in result.details["reason"]
+    assert (
+        result.details["agent_first_seen_at"]
+        == (NOW - timedelta(seconds=40)).isoformat()
+    )
+
+
+@pytest.mark.parametrize(
+    "registry",
+    [
+        pytest.param(FreshRecordRegistry(timedelta(minutes=11)), id="old-record"),
+        pytest.param(FreshRecordRegistry(None), id="record-without-first-seen"),
+    ],
+)
+def test_a_missing_key_outside_the_propagation_grace_still_fails_closed(
+    registry: StubFleetRegistry,
+) -> None:
+    result = run_one_without_the_node_key(registry)
+
+    assert result.status is RemoteCommandStatus.FAILED, result
+    assert "node action secret is unavailable for node-a" in (result.error or "")

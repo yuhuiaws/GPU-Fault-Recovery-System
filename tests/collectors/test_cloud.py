@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from datetime import datetime
+
 from ._support import (
     NOW,
     Any,
@@ -440,3 +442,137 @@ def test_node_resource_collector_heartbeats_after_every_node(
     assert [payload["node_id"] for _, payload in sink.requests] == ["gpu-worker-a"], (
         "the heartbeat must follow a node that was actually sampled"
     )
+
+
+def _joined_node(
+    name: str,
+    *,
+    created_at: datetime,
+    ready_since: datetime | None = None,
+    efa: str = "0",
+    gpu: str = "0",
+) -> dict:
+    status: dict = {
+        "allocatable": {"vpc.amazonaws.com/efa": efa, "nvidia.com/gpu": gpu}
+    }
+    if ready_since is not None:
+        status["conditions"] = [
+            {
+                "type": "Ready",
+                "status": "True",
+                "lastTransitionTime": ready_since.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            }
+        ]
+    return {
+        "metadata": {
+            "name": name,
+            "creationTimestamp": created_at.strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "labels": {"node.kubernetes.io/instance-type": "p5en.48xlarge"},
+        },
+        "status": status,
+    }
+
+
+class _JoinedNodeCore:
+    def __init__(self, node: dict) -> None:
+        self.node = node
+
+    def list_node(self, **_kwargs):
+        return SimpleNamespace(
+            metadata=SimpleNamespace(_continue=None), items=[self.node]
+        )
+
+    def list_pod_for_all_namespaces(self, **_kwargs):
+        return SimpleNamespace(items=[])
+
+
+def test_a_freshly_joined_node_is_not_judged_inside_the_startup_grace() -> None:
+    """Live 2026-10-07: a replacement node 19 s old advertised no EFA or GPU
+    yet (its device-plugin Pods were still starting) and the watcher opened an
+    incident with a RESTART_GPU_DEVICE_PLUGIN workflow; a minute later it
+    advertised every device. Nothing is counted or reported inside the grace,
+    and the mismatch count restarts from zero when the grace ends."""
+
+    created = NOW - timedelta(seconds=19)
+    core = _JoinedNodeCore(_joined_node("gpu-new", created_at=created))
+    sink = RecordingSink()
+    collector = KubernetesNodeResourceCollector(
+        sink, context(), core_api=core, required_consecutive_samples=2, now=lambda: NOW
+    )
+
+    for offset in (0, 15, 30):
+        collector.now = lambda offset=offset: NOW + timedelta(seconds=offset)
+        stats = collector.collect_once()
+        assert (stats.observed, stats.skipped, stats.delivered) == (1, 1, 0), offset
+    assert sink.requests == [], "no batch, no baseline and no mismatch inside the grace"
+
+    # The grace ends; the node now advertises every device: the first batch is
+    # a healthy baseline, not a recovery and not a mismatch.
+    core.node = _joined_node("gpu-new", created_at=created, efa="16", gpu="8")
+    collector.now = lambda: NOW + timedelta(seconds=601)
+    assert collector.collect_once().delivered == 1
+    _, payload = sink.requests[-1]
+    by_name = {item["name"]: item for item in payload["samples"]}
+    assert by_name["efa_kubernetes_allocatable_mismatch"]["value"] == 0
+    assert by_name["gpu_kubernetes_allocatable_mismatch"]["value"] == 0
+    assert payload["edge_filter_reasons"] == ["baseline:efa", "baseline:gpu"]
+
+
+def test_a_persistent_loss_after_the_grace_still_counts_from_zero() -> None:
+    created = NOW - timedelta(minutes=30)
+    # Rebooted: Ready transitioned 2 minutes ago, so the grace restarted then.
+    node = _joined_node(
+        "gpu-rebooted", created_at=created, ready_since=NOW - timedelta(minutes=2)
+    )
+    core = _JoinedNodeCore(node)
+    sink = RecordingSink()
+    collector = KubernetesNodeResourceCollector(
+        sink, context(), core_api=core, required_consecutive_samples=2, now=lambda: NOW
+    )
+
+    assert collector.collect_once().skipped == 1, "a just-rebooted node is in grace"
+    collector.now = lambda: NOW + timedelta(minutes=9)
+    assert collector.collect_once().delivered == 1, "the grace ended; first sample"
+    _, payload = sink.requests[-1]
+    by_name = {item["name"]: item for item in payload["samples"]}
+    assert by_name["efa_kubernetes_allocatable_mismatch"]["value"] == 0, (
+        "one mismatch sample after the grace is not yet persistent"
+    )
+    assert (
+        by_name["efa_kubernetes_allocatable_mismatch"]["labels"][
+            "consecutive_mismatch_samples"
+        ]
+        == "1"
+    )
+    collector.now = lambda: NOW + timedelta(minutes=9, seconds=15)
+    assert collector.collect_once().delivered == 1
+    _, payload = sink.requests[-1]
+    by_name = {item["name"]: item for item in payload["samples"]}
+    assert by_name["efa_kubernetes_allocatable_mismatch"]["value"] == 1, (
+        "a loss that persists beyond the grace is still reported"
+    )
+
+
+def test_the_startup_grace_is_optional_and_never_negative() -> None:
+    created = NOW - timedelta(seconds=19)
+    core = _JoinedNodeCore(_joined_node("gpu-new", created_at=created))
+    sink = RecordingSink()
+    collector = KubernetesNodeResourceCollector(
+        sink,
+        context(),
+        core_api=core,
+        required_consecutive_samples=1,
+        now=lambda: NOW,
+        node_startup_grace_seconds=0,
+    )
+    assert collector.collect_once().delivered == 1, "a zero grace judges at once"
+    assert (
+        KubernetesNodeResourceCollector.node_ready_since(
+            {"metadata": {"name": "n"}, "status": {}}
+        )
+        is None
+    ), "a node without timestamps is not in grace"
+    with pytest.raises(ValueError, match="startup grace"):
+        KubernetesNodeResourceCollector(
+            sink, context(), core_api=core, node_startup_grace_seconds=-1
+        )

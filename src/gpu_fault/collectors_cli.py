@@ -311,6 +311,9 @@ def build_kubernetes_node_resources(
         list_page_size=int(
             os.getenv("GPU_FAULT_KUBERNETES_NODE_LIST_PAGE_SIZE", "500")
         ),
+        node_startup_grace_seconds=int(
+            os.getenv("GPU_FAULT_KUBERNETES_NODE_STARTUP_GRACE_SECONDS", "600")
+        ),
     )
 
 

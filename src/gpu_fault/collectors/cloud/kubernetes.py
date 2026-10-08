@@ -39,6 +39,12 @@ LOGGER = logging.getLogger(__name__)
 #: deploy/dataplane/kubernetes-node-resource-collector.yaml, which mounts a
 #: writable /tmp because the container's root filesystem is read-only.
 NODE_RESOURCE_HEARTBEAT_PATH = "/tmp/node-resource-collector-alive"  # noqa: S108
+#: How long after a node's creation or its ``Ready=True`` transition its
+#: device-plugin advertisement is not judged: the NVIDIA and EFA device-plugin
+#: DaemonSet Pods register their resources minutes after a node joins, so a
+#: missing ``nvidia.com/gpu`` / ``vpc.amazonaws.com/efa`` inside this window is
+#: start-up, not loss. ``GPU_FAULT_KUBERNETES_NODE_STARTUP_GRACE_SECONDS``.
+NODE_STARTUP_GRACE_SECONDS = 600
 
 
 def _touch_node_resource_heartbeat() -> None:
@@ -95,9 +101,12 @@ class KubernetesNodeResourceCollector:
         resource_names: dict[str, str] | None = None,
         now: Callable[[], datetime] | None = None,
         serializer: Callable[[Any], dict[str, Any]] | None = None,
+        node_startup_grace_seconds: int = NODE_STARTUP_GRACE_SECONDS,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("EFA Kubernetes interval must be positive")
+        if node_startup_grace_seconds < 0:
+            raise ValueError("EFA Kubernetes node startup grace must not be negative")
         if required_consecutive_samples < 1:
             raise ValueError("EFA Kubernetes mismatch samples must be positive")
         if health_summary_seconds <= 0:
@@ -119,10 +128,49 @@ class KubernetesNodeResourceCollector:
         self.serializer = serializer or (
             lambda value: value if isinstance(value, dict) else value.to_dict()
         )
+        self.node_startup_grace_seconds = node_startup_grace_seconds
         self._mismatch_counts: dict[str, int] = {}
         self._last_state: dict[str, bool] = {}
         self._last_delivered_at: dict[str, datetime] = {}
         self._next_summary_at: dict[str, datetime] = {}
+        self._graced_nodes: set[str] = set()
+
+    @staticmethod
+    def _timestamp(value: Any) -> datetime | None:
+        if not isinstance(value, str) or not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+    @classmethod
+    def node_ready_since(cls, node: dict[str, Any]) -> datetime | None:
+        """When the node last (re)started serving: the later of its creation
+        and its ``Ready=True`` transition; ``None`` when neither is readable."""
+
+        candidates = [
+            cls._timestamp((node.get("metadata") or {}).get("creationTimestamp"))
+        ]
+        for condition in (node.get("status") or {}).get("conditions") or []:
+            if (
+                isinstance(condition, dict)
+                and condition.get("type") == "Ready"
+                and condition.get("status") == "True"
+            ):
+                candidates.append(cls._timestamp(condition.get("lastTransitionTime")))
+        known = [item for item in candidates if item is not None]
+        return max(known) if known else None
+
+    def _in_startup_grace(self, node: dict[str, Any], observed_at: datetime) -> bool:
+        if self.node_startup_grace_seconds <= 0:
+            return False
+        since = self.node_ready_since(node)
+        return (
+            since is not None
+            and (observed_at - since).total_seconds() < self.node_startup_grace_seconds
+        )
 
     @staticmethod
     def _instance_type(node: dict[str, Any]) -> str | None:
@@ -257,6 +305,26 @@ class KubernetesNodeResourceCollector:
         expected_counts = INSTANCE_ACCELERATOR_COUNTS.get(instance_type or "")
         if not node_id or expected_counts is None:
             return CollectorStats(observed=1, skipped=1)
+        if self._in_startup_grace(node, observed_at):
+            # A node that joined or became Ready moments ago still has its
+            # device plugins registering. Live 2026-10-07: a replacement node 19
+            # seconds old raised an EFA allocatable mismatch and a
+            # RESTART_GPU_DEVICE_PLUGIN workflow for a node the product was not
+            # even installed on; a minute later it advertised every device.
+            # Nothing is counted or reported inside the grace; the consecutive
+            # mismatch count restarts from zero when it ends.
+            for resource in ("efa", "gpu"):
+                self._mismatch_counts.pop(f"{node_id}/{resource}", None)
+            if node_id not in self._graced_nodes:
+                self._graced_nodes.add(node_id)
+                LOGGER.info(
+                    "node %s is within the %ss startup grace; its device-plugin "
+                    "advertisement is not judged yet",
+                    node_id,
+                    self.node_startup_grace_seconds,
+                )
+            return CollectorStats(observed=1, skipped=1)
+        self._graced_nodes.discard(node_id)
         samples: list[HostMetricSample] = []
         edge_reasons = []
         deliver = False
