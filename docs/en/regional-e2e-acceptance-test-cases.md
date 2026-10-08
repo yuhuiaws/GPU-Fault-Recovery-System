@@ -4250,8 +4250,19 @@ and does not count towards its sequence.
   repeatable.
   (c) The README's deployment steps are themselves usable -- S5 runs only the commands the README writes out, and one
   missing required condition in the README makes S5 fail.
+  (d) A mixed site (HyperPod + `eks-managed`) is installed in the two steps the product requires: a first `deploy`'s
+  GPU clusters must share one provider (`bootstrap_common.require_single_provider`; both providers in one first deploy
+  are refused before anything is created), so a first `deploy` names every cluster of one provider only, and the other
+  provider's clusters join **inside the same stage** with the site-bound `join-cluster`; that join writes its
+  provider's own Runtime Profile plan (`CLUSTER_PROFILE_NEW`) and stops, and the driver approves exactly that plan and
+  reruns the same join. S1 leads with the first ARN's provider and S5 **reverses** the order -- it leads with the
+  provider S1 joined and joins the provider S1 deployed -- so one run proves both first deploys (site profile bases
+  `hyperpod-v1` and `eks-v1`) and both join directions (each with the other provider's cluster override). A
+  single-provider site runs byte for byte as before.
   The driver script `scripts/acceptance/admin-lifecycle-sequence.sh` is responsible for the order, cache cleanup,
-  waiting for every command to exit, the cold-build assertions and private evidence recording; S5's README parsing,
+  waiting for every command to exit, the cold-build assertions and private evidence recording; the provider of every
+  GPU ARN is decided by `scripts/e2e/regional/boot029_providers.py` through the product's own discovery (the
+  orchestrator ARN of `sagemaker list-clusters`/`describe-cluster`, read-only); S5's README parsing,
   pristine source copy, allowlisted environment and `readme` receipt are handled by
   `scripts/e2e/regional/boot029_readme.py`;
   the **checklist** of each stage refers directly to the corresponding case and is not repeated here.
@@ -4267,10 +4278,17 @@ and does not count towards its sequence.
   (per-component selection of each one's own cache inputs and outputs),
   `scripts/release_image.py` (`docker buildx build --cache-from/--cache-to`),
   `src/gpu_fault/admin/aws_cleanup.py` (`ecr delete-repository --force`),
+  `src/gpu_fault/admin/bootstrap_common.py::require_single_provider` (one provider per first deploy),
+  `src/gpu_fault/admin/bootstrap_discovery.py::find_hyperpod_for_eks` (the provider of an EKS ARN),
+  `src/gpu_fault/admin/cluster_join_profile.py` (the `CLUSTER_PROFILE_NEW` plan and `--approve-profile-plan`),
   `scripts/acceptance/admin-lifecycle-sequence.sh`,
+  `scripts/e2e/regional/boot029_providers.py` (provider discovery and grouping),
+  `scripts/e2e/regional/boot029_receipts.py` (`pending`/`profile-plan`/`verify --joined-gpu-arn`),
   `scripts/e2e/regional/boot029_readme.py` (README parsing, `prepare_source_checkout`
-  pristine copy, `clean_environment` allowlist). Offline contracts:
+  pristine copy, `clean_environment` allowlist, `mixed_site_join_documented`). Offline contracts:
   `tests/regional/test_admin_lifecycle_sequence_script.py`,
+  `tests/regional/test_admin_lifecycle_sequence_mixed_site.py` (mixed site, resume shapes),
+  `tests/regional/test_boot029_providers.py`, `tests/regional/test_boot029_receipts_mixed_site.py`,
   `tests/regional/test_boot029_readme.py` (the latter parses the repository's real README).
 
 #### Preconditions and isolation
@@ -4313,8 +4331,9 @@ and does not count towards its sequence.
    (`nodeRepairConfig.enabled=false` or unset, otherwise S1/S3 discovery refuses), the GPU node image carries `python3.12` and
    `strace`, the workload namespace `training` exists, and the
    GPU nodes carry `nvidia.com/gpu.present=true` (or the operator gives the driver `--gpu-nodegroup <nodegroup>` /
-   `--node-selector <selector>`, passed through as given to S1's `deploy` and S3's `join-cluster`; S5 adds it only when the README's
-   deployment section documents that parameter, see S5).
+   `--node-selector <selector>`, which the driver hands to the command that names the `eks-managed` members -- in S1/S5
+   the first `deploy` (all-plain-EKS) or the `join-cluster` that attaches them afterwards; S3's `join-cluster` gets it
+   as given; S5 uses it only when the README's deployment section documents that parameter, see S5).
 
 #### Steps
 
@@ -4339,9 +4358,25 @@ scripts/acceptance/admin-lifecycle-sequence.sh \
 ```
 
 `--gpu-cluster-arn` is given once per GPU cluster in the order they are managed (a single-GPU-cluster site has one line);
-`--gpu-nodegroup`/`--node-selector` is given only when an `eks-managed` member is present, and the driver passes it through as
-given to S1's `deploy` and S3's `join-cluster` (HyperPod members ignore it). The ARN list (with its order) and that flag enter the
-sequence's input digest (`gpu_cluster_arns_sha256`, `eks_flag_sha256`); a resume may not change them.
+`--gpu-nodegroup`/`--node-selector` is given only when an `eks-managed` member is present, and the driver hands it to the
+command that names the `eks-managed` members (S3's `join-cluster` gets it as given; HyperPod members ignore it). The ARN
+list (with its order) and that flag enter the sequence's input digest (`gpu_cluster_arns_sha256`, `eks_flag_sha256`); a
+resume may not change them.
+
+**Provider discovery and mixed sites.** Before S1 and S5 the driver asks the product's own discovery for the provider of
+every GPU ARN (`scripts/e2e/regional/boot029_providers.py`: a SageMaker ARN is `hyperpod`; an EKS ARN is `hyperpod` when
+exactly one HyperPod cluster of the Region names it as orchestrator, `eks-managed` when none does, and refused when more
+than one does -- the same read as `bootstrap_discovery.find_hyperpod_for_eks`, read-only `sagemaker
+list-clusters`/`describe-cluster`); nothing is guessed from names. When every ARN shares one provider, S1/S5 are
+identical to a single-provider site; a mixed site follows the product rule in two steps: the first `deploy` names every
+cluster of the leading provider (in order), then one site-bound `join-cluster` runs per further provider (see S1). S1's
+leading provider is the first ARN's; S5's is the provider S1 joined (with two providers: the reverse order): S1 proves
+the HyperPod-first deploy -- site profile base `hyperpod-v1`, the `eks-managed` cluster carrying its own `eks-v1`
+override after the join (`profile_plan_approved` records `hyperpod-v1 -> eks-v1`); S5 proves the all-plain-EKS first
+deploy -- the site starts from `eks-v1` (`bootstrap_discovery.regional_profile_for`), the HyperPod cluster carrying its
+own `hyperpod-v1` override after the join (`eks-v1 -> hyperpod-v1`). With the HyperPod ARN first that is the order
+above; with the `eks-managed` ARN first, S1 and S5 swap orders and prove the same. The grouping enters the receipt by
+provider name only (`first_deploy_provider`, `joined_providers`); ARNs still appear as sha256 only.
 
 After all five stages PASS, uninstalling the second site and starting again with `--stage 5` is the S5 rerun: the
 receipt keeps the already-passed S5 receipt under `reruns`, S5's attempt numbers keep counting up and mark the rerun
@@ -4360,6 +4395,15 @@ a retry and the original command's exit receipt has been obtained; when a `boots
 `resumed_first_deploy` is recorded and the cold-build checks are re-run.
 Leftover bootstrap files alone do not authorise a resume, and a directory with only `site.yaml` but no bootstrap
 checkpoint may not be treated as empty. An original `RUNNING` without an exit receipt must still be reconciled first.
+Before resuming, the driver reads the state of the first deploy (`boot029_receipts.py pending`): when
+`bootstrap-state.json` is `site-ready` and its `initial_deploy_target` is exactly the first `deploy`'s cluster set, the
+first deploy is **not run again** (a second run is a release whose images are registry reuse, no cold build);
+`first_deploy_already_complete` is recorded and the stage continues with the missing `join-cluster`, the cold-build
+verdict still reading the attempt log that holds the build. When `initial-deploy-request.json` records a GPU cluster
+set other than this first `deploy`'s (the live shape: the product recorded the two-provider request before refusing
+the mixed first deploy), the driver fails before any command with "a first deploy cannot change its request -- start
+the sequence in a new empty state directory": the product refuses to change a recorded first-deploy request, so the
+sequence can only start over in a new empty directory.
 
 Each stage's state files remain after the stage ends; the manual checklists can be completed item by item, between
 stages or after everything has finished, following the references below.
@@ -4376,14 +4420,37 @@ stages or after everything has finished, following the references below.
    gpu-fault-admin deploy \
      --cpu-cluster-arn <CPU_EKS_ARN> \
      --gpu-cluster-arn <GPU_ARN_1> \
-     --gpu-cluster-arn <GPU_ARN_2> \
-     --gpu-nodegroup <EKS_NODEGROUP> \
      --state-dir <STATE_DIR> \
      --admin-email <ADMIN_EMAIL>
    ```
 
-   The driver asserts that `initial_deploy_target.gpu_clusters` in `bootstrap-state.json` lists exactly the GPU clusters given
-   (receipt `gpu_cluster_count`). Check: the `phase` of `<STATE_DIR>/bootstrap-state.json` goes through `new` → `discovered` →
+   The first `deploy` names every cluster of the first ARN's provider only (above: the HyperPod cluster `<GPU_ARN_1>`,
+   without the eks flag; an all-`eks-managed` first deploy carries `--gpu-nodegroup`/`--node-selector`). On a mixed site
+   the stage then runs the site-bound `join-cluster` (`<STATE_DIR>/deployer-venv/bin/gpu-fault-admin`) for the other
+   provider, `eks-managed` members with the eks flag:
+
+   ```bash
+   gpu-fault-admin join-cluster \
+     --state-dir <STATE_DIR> \
+     --gpu-cluster-arn <GPU_ARN_2> \
+     --gpu-nodegroup <EKS_NODEGROUP>
+   # the cluster needs its provider's own Runtime Profile version (eks-v1 / hyperpod-v1): the join writes
+   # <STATE_DIR>/release-deploy/profile-plan.json (change_kind CLUSTER_PROFILE_NEW) and exits non-zero;
+   # the driver checks that plan (plan_sha256 recomputed, approval_required), approves it and reruns the same command:
+   gpu-fault-admin join-cluster \
+     --state-dir <STATE_DIR> \
+     --gpu-cluster-arn <GPU_ARN_2> \
+     --gpu-nodegroup <EKS_NODEGROUP> \
+     --approve-profile-plan <plan_sha256> --reference GF-REGIONAL-BOOT-029/stage-1
+   ```
+
+   A join that exits non-zero without a pending `CLUSTER_PROFILE_NEW` plan fails the stage; the driver approves nothing
+   else. The driver asserts that `initial_deploy_target.gpu_clusters` in `bootstrap-state.json` lists exactly the
+   clusters the first `deploy` was given (receipt `first_deploy_gpu_cluster_count`; `gpu_cluster_count` is the number of
+   clusters the run manages) and, for every joined cluster, that `<STATE_DIR>/join-cluster/<arn_sha256_12>/state.json`
+   ends in `phase=COMPLETED` (receipt `joins`, one entry per ARN; `profile_plan_approved` records the approved plan's
+   `plan_sha256`, versions, provider and reference). Check: the `phase` of `<STATE_DIR>/bootstrap-state.json` goes
+   through `new` → `discovered` →
    `aws-infrastructure-ready` → `platform-prerequisites-ready` → `site-ready`;
    the checks of `BOOT-028` steps 3–6 hold item by item (SNS has exactly one confirmed subscription; the ECR runtime
    repository goes from empty to three release-bound images each with signature and build proof rather than registry
@@ -4483,9 +4550,23 @@ stages or after everything has finished, following the references below.
      patched in the driver; no `--wait-for-email-confirmation` or any other parameter is added. A missing heading, a missing code block, a
      wrong placeholder count, or a build block that lacks the two lines above or has them in reverse order fails the
      stage immediately and names the heading.
+     Mixed site: the README deploy command renders the clusters of S5's leading provider only (`gpu_cluster_count`,
+     `first_provider`) -- the provider S1 joined; on a site given the HyperPod ARN first that is the `eks-managed`
+     cluster, with the README-documented `--gpu-nodegroup`/`--node-selector`, and the site starts from `eks-v1`; the
+     other provider's clusters are attached by the driver after the README command exits, the way the README states it
+     -- the site-bound `<state-dir>/deployer-venv/bin/gpu-fault-admin join-cluster`, as in S1 (plan stop, approval,
+     rerun) -- and only when the README's deployment section states the sentence "a first `deploy`'s GPU clusters must
+     share one provider; the other provider joins afterwards with `join-cluster`" (receipt
+     `mixed_site_join_documented`, `joined_gpu_cluster_count`, `joined_eks_flag`); without it the stage refuses and
+     names the missing sentence. When the README deploy names plain EKS clusters, the README's deployment section must
+     also state the plain-EKS first-deploy prerequisites -- the `eks-v1` start, EKS node auto repair off on the GPU
+     node groups (`nodeRepairConfig.enabled=false`), the GPU node image's `python3.12`/`strace` installed through the
+     node group's launch template user data (receipt `plain_eks_first_deploy_documented`); any missing statement
+     refuses the stage and is named.
      S5 therefore executes exactly and only the README's three steps (the deploy command being the README's own, its GPU
      cluster line expanded by the README's rule): `make deploy-host-setup-online`,
-     `. .venv/bin/activate`, and the four-argument `gpu-fault-admin deploy`.
+     `. .venv/bin/activate`, and the four-argument `gpu-fault-admin deploy` -- plus, on a mixed site, the README-stated
+     site-bound `join-cluster`.
    - **Pristine source copy.** The three steps run in a copy of `<CHECKOUT>` constructed the same way as the deploy
      source snapshot (`scripts/staging_source_snapshot.py::prepare_source_checkout`):
      `git worktree add --detach … HEAD`, apply `git diff --binary HEAD`, copy the untracked
@@ -4527,7 +4608,11 @@ stages or after everything has finished, following the references below.
 ##### Verdict
 
 - The five stages each execute once in the order 1→2→3→4→5, every command is waited to exit, and the driver stops at the
-  first failure and reports a resumable stage number;
+  first failure and reports a resumable stage number; on a mixed site the first `deploy` of S1/S5 names one provider and
+  the other provider is joined inside the same stage, COMPLETED after its `CLUSTER_PROFILE_NEW` plan was approved
+  (receipt `first_deploy_provider`, `joined_providers`, `joins`, `profile_plan_approved`), and S1 and S5 lead with
+  opposite providers (`profile_plan_approved` records `current_version -> desired_version` as `hyperpod-v1 -> eks-v1`
+  in one stage and `eks-v1 -> hyperpod-v1` in the other); a single-provider site has no in-stage join at all;
 - The three images of both S1 and S5 satisfy the cold build: each has no `CACHED`, the base image is pulled, and the
   release-bound descriptor is built rather than reused; before both deployments the local caches/images and the site
   ECR tags do not exist (before S5 the ECR repositories themselves have already disappeared with the uninstall);
@@ -4542,7 +4627,9 @@ stages or after everything has finished, following the references below.
 - Every command text S5 executes comes from the README: in the `readme` receipt, `readme_sha256`,
   `build_block_sha256` and `deploy_block_sha256` match the actual README and its two code blocks,
   `executed_lines` is exactly `make deploy-host-setup-online`, `. .venv/bin/activate`
-  and the placeholder-substituted `gpu-fault-admin deploy`, `skipped_verification_lines` contains only
+  and the placeholder-substituted `gpu-fault-admin deploy` (mixed site: naming the first provider's clusters only,
+  the other provider's `join-cluster` being run by the driver as the README-stated site-bound CLI and recorded under
+  `joins`), `skipped_verification_lines` contains only
   verification lines, `venv_preexisted=false`, the environment variable names are within the allowlist, `PATH` is the
   operator PATH minus the venv directories, and the tool directory containing `gpu-fault-admin` is replaced by a
   stand-in (the receipt records only the kept/removed/stand-in counts and sha256);
@@ -4555,7 +4642,9 @@ stages or after everything has finished, following the references below.
 `cases/GF-REGIONAL-BOOT-029/GF-REGIONAL-BOOT-029.json`: the driver-written
 `<STATE_DIR>/acceptance/admin-lifecycle-sequence.json` (per-stage PASS/FAIL,
 stage log sha256, each component's `cold_build`/descriptor/registry-reuse and base-image
-proof, original journal binding, snapshot policy, unexecuted companions and each terminal `phase`;
+proof, original journal binding, snapshot policy, unexecuted companions and each terminal `phase`; S1/S5 additionally
+carry `first_deploy_provider`/`joined_providers`, `first_deploy_gpu_cluster_count`, the per-ARN `joins` and
+`profile_plan_approved` (mixed site) and `first_deploy_already_complete` (a resume whose first deploy had finished);
 ARNs, e-mail address and directory paths appear in it only as sha256;
 S5 additionally has the `readme` receipt: the sha256 of the README and its two code blocks, `executed_lines` and
 `skipped_verification_lines` -- in which ARNs, e-mail address and directories are replaced by `sha256:<digest>` --

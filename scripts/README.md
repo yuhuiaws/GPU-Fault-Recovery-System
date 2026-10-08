@@ -58,7 +58,10 @@ generic fault-case runner.
   the public `gpu-fault-admin` verbs plus `docker`/`aws`
   (`admin-lifecycle-sequence.sh` runs GF-REGIONAL-BOOT-029: cold first deploy,
   remove-cluster, join-cluster, uninstall keep + reset-database, cold first
-  deploy again, stopping at the first failing stage).
+  deploy again, stopping at the first failing stage; on a mixed HyperPod +
+  plain-EKS site each first deploy names one provider's clusters and joins the
+  other provider inside the stage, approving its Runtime Profile plan -- stage
+  1 leads with the first ARN's provider, stage 5 with the other one).
 - `scripts/e2e/regional/`: regional acceptance drivers, probes, boot guards,
   recovery helpers and test-only Kubernetes inputs.
 - `scripts/e2e/hyperpod/`: focused HyperPod scenario runners.

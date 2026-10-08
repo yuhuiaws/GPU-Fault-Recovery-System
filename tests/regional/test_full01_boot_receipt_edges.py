@@ -390,6 +390,7 @@ def test_bootstrap_completion_requires_the_current_cpu_and_gpu(
             "journal_path_sha256": hashlib.sha256(b"bootstrap-state.json").hexdigest(),
             "journal_sha256": hashlib.sha256(journal.read_bytes()).hexdigest(),
             "attempt_sha256": hashlib.sha256(b"example-deploy-attempt").hexdigest(),
+            "first_deploy_gpu_cluster_count": 1,
             "gpu_cluster_count": 1,
         }
     else:

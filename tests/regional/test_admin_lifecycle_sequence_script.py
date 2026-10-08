@@ -41,12 +41,16 @@ printf 'gpu-fault-admin %s\\n' "$*" >> "$FAKE_TOOL_LOG"
 verb="$1"; shift
 state_dir=""
 snapshot_policy=retain
+approve_plan=""
+reference=""
 request_arns=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --state-dir) state_dir="$2"; shift 2 ;;
     --aurora-final-snapshot) snapshot_policy="$2"; shift 2 ;;
     --gpu-cluster-arn) request_arns+=("$2"); shift 2 ;;
+    --approve-profile-plan) approve_plan="$2"; shift 2 ;;
+    --reference) reference="$2"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -55,6 +59,10 @@ done
 export FAKE_REQUEST_GPU_ARNS="${request_arns[*]:-$FAKE_GPU_ARN}"
 if [[ "$verb" == "${FAKE_ADMIN_FAIL_VERB:-}" ]]; then
   echo "injected failure in $verb" >&2
+  exit 7
+fi
+if [[ "$verb" == join-cluster && "$state_dir" == "${FAKE_ADMIN_FAIL_JOIN_STATE:-}" ]]; then
+  echo "injected failure in $verb for $state_dir" >&2
   exit 7
 fi
 case "$verb" in
@@ -124,12 +132,59 @@ path.write_text(json.dumps({
 PY
     ;;
   join-cluster)
-    python3 - "$state_dir" <<'PY'
+    # A cluster of the other provider than the site's first deploy needs its
+    # own Runtime Profile version: without that version's snapshot the join
+    # writes the CLUSTER_PROFILE_NEW plan and stops; the approved rerun writes
+    # the snapshot (later joins of the provider reuse it) and completes.
+    python3 - "$state_dir" "$approve_plan" "$reference" <<'PY'
 import hashlib, json, os, pathlib, sys
+sys.path.insert(0, os.environ["FAKE_REPO_SRC"])
+from gpu_fault.admin.profile_approval import profile_plan_sha256
+state, approve, reference = pathlib.Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+aliases = {os.environ["FAKE_GPU_ARN"], os.environ.get("FAKE_GPU_EKS_ARN", ""),
+    os.environ.get("FAKE_GPU_HYPERPOD_ARN", "")}
+def provider(arn):
+    return "hyperpod" if arn in aliases else "eks-managed"
+versions = {"hyperpod": "hyperpod-v1", "eks-managed": "eks-v1"}
+target = json.loads((state / "bootstrap-state.json").read_text())["resources"]["initial_deploy_target"]
+site_provider = provider(target["gpu_clusters"][0]["input_arn"])
+plan_path = state / "release-deploy/profile-plan.json"
 for arn in os.environ["FAKE_REQUEST_GPU_ARNS"].split():
-    path = pathlib.Path(sys.argv[1]) / "join-cluster" / hashlib.sha256(arn.encode()).hexdigest()[:12] / "state.json"
+    kind = provider(arn)
+    snapshot = state / "profiles" / (versions[kind] + ".yaml")
+    if kind != site_provider and not snapshot.exists():
+        plan = {"schema_version": 1, "site_identity": {"site_name": "fixture-site",
+            "aws_region": "us-west-2", "cpu_eks_arn": os.environ["FAKE_CPU_ARN"]},
+            "site_identity_sha256": "0" * 64,
+            "registration_cluster_id": "cluster-" + hashlib.sha256(arn.encode()).hexdigest()[:8],
+            "current_version": versions[site_provider], "desired_version": versions[kind],
+            "current_policy_digest": "1" * 64, "policy_digest": "2" * 64,
+            "live_profile_sha256": None, "active_source_sha256": None,
+            "source_sha256": "3" * 64, "snapshot_sha256": "4" * 64,
+            "change_kind": "CLUSTER_PROFILE_NEW",
+            "changes": ["cluster runs its own Runtime Profile " + versions[kind]],
+            "approval_required": True}
+        plan["plan_sha256"] = profile_plan_sha256(plan)
+        if approve != plan["plan_sha256"]:
+            plan_path.parent.mkdir(parents=True, exist_ok=True)
+            plan_path.write_text(json.dumps(plan))
+            print("Runtime Profile policy changed; the join stopped for review.\\n"
+                "  plan_sha256: " + plan["plan_sha256"], file=sys.stderr)
+            sys.exit(2)
+        if not reference:
+            print("--approve-profile-plan requires --reference", file=sys.stderr)
+            sys.exit(2)
+        snapshot.parent.mkdir(parents=True, exist_ok=True)
+        snapshot.write_text("version: " + versions[kind] + "\\n")
+        (state / "release-deploy/profile-approval.json").write_text(
+            json.dumps({"plan_sha256": approve, "reference": reference}))
+        plan_path.unlink(missing_ok=True)
+    # A re-join of a removed cluster starts a new attempt (the product archives
+    # the completed one), so the stage-3 proof is newer than its baseline.
+    path = state / "join-cluster" / hashlib.sha256(arn.encode()).hexdigest()[:12] / "state.json"
+    previous = json.loads(path.read_text())["attempt"] if path.exists() else 0
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps({"phase": "COMPLETED", "attempt": 1, "gpu_cluster_arn": arn}))
+    path.write_text(json.dumps({"phase": "COMPLETED", "attempt": previous + 1, "gpu_cluster_arn": arn}))
 PY
     ;;
   uninstall)
@@ -177,6 +232,20 @@ if operation == "describe-repositories":
         "repositoryArn": "arn:aws:ecr:us-west-2:123456789012:repository/" + name}]}))
 elif operation == "list-tags-for-resource":
     print(json.dumps({"tags": [{"Key": "gpu-fault:site-id", "Value": "fixture-site"}]}))
+elif operation == "list-clusters":
+    # The Region's HyperPod clusters; the fixture cluster orchestrates the
+    # fixture GPU EKS cluster, so that ARN is a HyperPod cluster and every other
+    # EKS ARN is plain EKS. A twin naming the same EKS cluster is the
+    # configuration the product refuses to guess about.
+    names = ["fixture-hyperpod"]
+    if os.getenv("FAKE_HYPERPOD_DUPLICATE"):
+        names.append("fixture-hyperpod-twin")
+    print(json.dumps({"ClusterSummaries": [{"ClusterName": name} for name in names]}))
+elif operation == "describe-cluster":
+    name = argument("--cluster-name")
+    print(json.dumps({"ClusterName": name,
+        "ClusterArn": os.environ.get("FAKE_GPU_HYPERPOD_ARN") or "arn:aws:sagemaker:us-west-2:123456789012:cluster/" + name,
+        "Orchestrator": {"Eks": {"ClusterArn": os.environ.get("FAKE_GPU_EKS_ARN") or os.environ["FAKE_GPU_ARN"]}}}))
 elif operation in {"list-images", "batch-delete-image"}:
     name = argument("--repository-name")
     marker = log.parent / ("removed-" + hashlib.sha256(name.encode()).hexdigest())
@@ -297,6 +366,8 @@ def _install_fakes(tmp_path: Path) -> dict[str, str]:
         "FAKE_TOOL_LOG": str(tmp_path / "tools.log"),
         "FAKE_CPU_ARN": CPU_ARN,
         "FAKE_GPU_ARN": GPU_ARN,
+        # The fake join computes the product's own plan digest from this tree.
+        "FAKE_REPO_SRC": str(tmp_path / "checkout" / "src"),
         # The driver's environment must not reach the README deploy.
         "GPU_FAULT_SENTINEL": "driver",
         "AWS_REGION": "us-west-2",
@@ -858,14 +929,21 @@ def test_failed_initial_deploy_resumes_only_its_bound_checkpoint(
         if line.startswith("gpu-fault-admin deploy ")
     )
     assert not any(
-        line.startswith(("docker ", "aws ")) for line in new_tools[:redeploy]
+        line.startswith(("docker ", "aws ecr ")) for line in new_tools[:redeploy]
     ), "a resumed deployment must not prune its already-started build or ECR tags"
+    assert any(line.startswith("aws sagemaker ") for line in new_tools[:redeploy]), (
+        "the resume still asks the product's discovery for each GPU ARN's provider"
+    )
     assert f"--state-dir {state} " in new_tools[redeploy], (
         "the resume must use the same state directory"
     )
     if stage == 5:
-        assert new_tools[0] == "make deploy-host-setup-online", (
-            "a resumed README deploy repeats the README procedure from its start"
+        readme_tools = [
+            line for line in new_tools if not line.startswith("aws sagemaker ")
+        ]
+        assert readme_tools[0] == "make deploy-host-setup-online", (
+            "a resumed README deploy repeats the README procedure from its start "
+            "(after the read-only provider discovery)"
         )
         readme = current["readme"]
         assert readme["attempt"] == 2 and readme["venv_preexisted"] is False, (
@@ -1081,141 +1159,6 @@ def test_stage_five_refuses_an_installed_site_even_with_a_bootstrap_checkpoint(
 
 def _readme_lines(lines: list[str], prefix: str) -> list[str]:
     return [line[len(prefix) :] for line in lines if line.startswith(prefix)]
-
-
-EKS_GPU_ARN = "arn:aws:eks:us-west-2:123456789012:cluster/gpu-eks-fixture"
-EKS_NODEGROUP = "gpu-p5en-efa-spot-node-group"
-
-
-def test_a_mixed_site_removes_each_cluster_then_joins_both_and_redeploys_both(
-    tmp_path: Path,
-) -> None:
-    """A HyperPod + plain-EKS site: S1 deploys both ARNs with the eks flag, S2
-    removes one cluster at a time (both journals asserted), S3 re-joins both in
-    one command, S5 renders both ARNs and the README-documented flag."""
-    env = _install_fakes(tmp_path)
-
-    result = _run(
-        tmp_path,
-        env,
-        "--gpu-cluster-arn",
-        GPU_ARN,
-        "--gpu-cluster-arn",
-        EKS_GPU_ARN,
-        "--gpu-nodegroup",
-        EKS_NODEGROUP,
-    )
-
-    assert result.returncode == 0, result.stdout + result.stderr
-    lines = _tool_log(env)
-    assert _admin_verbs(lines) == [
-        "deploy",
-        "remove-cluster",
-        "remove-cluster",
-        "join-cluster",
-        "uninstall",
-        "deploy",
-    ], "one remove-cluster per GPU cluster, everything else once"
-    deploys = [line for line in lines if "admin deploy " in line]
-    for deploy in deploys:
-        assert (
-            f"--gpu-cluster-arn {GPU_ARN} --gpu-cluster-arn {EKS_GPU_ARN} "
-            f"--gpu-nodegroup {EKS_NODEGROUP} " in deploy
-        ), deploy
-    removes = [
-        line for line in lines if line.startswith("gpu-fault-admin remove-cluster ")
-    ]
-    assert [line.split("--gpu-cluster-arn ")[1].split()[0] for line in removes] == [
-        GPU_ARN,
-        EKS_GPU_ARN,
-    ], "clusters are removed one at a time, in the operator's order"
-    assert all("--confirm REMOVE_GPU_CLUSTER" in line for line in removes), removes
-    (join,) = [
-        line for line in lines if line.startswith("gpu-fault-admin join-cluster ")
-    ]
-    assert (
-        f"--gpu-cluster-arn {GPU_ARN} --gpu-cluster-arn {EKS_GPU_ARN} "
-        f"--gpu-nodegroup {EKS_NODEGROUP}" in join
-    ), join
-    assert deploys[1].split()[2:] == [
-        "--cpu-cluster-arn",
-        CPU_ARN,
-        "--gpu-cluster-arn",
-        GPU_ARN,
-        "--gpu-cluster-arn",
-        EKS_GPU_ARN,
-        "--gpu-nodegroup",
-        EKS_NODEGROUP,
-        "--state-dir",
-        str(tmp_path / "state-second"),
-        "--admin-email",
-        ADMIN_EMAIL,
-    ], "the README deploy repeats the GPU line per cluster and adds the documented flag"
-
-    record = _record(tmp_path)
-    assert all(stage["status"] == "PASS" for stage in record["stages"].values()), (
-        record["stages"]
-    )
-    for number in ("2", "3"):
-        journals = record["stages"][number]["journals"]
-        assert [item["gpu_arn_sha256"] for item in journals] == [
-            _sha256(GPU_ARN),
-            _sha256(EKS_GPU_ARN),
-        ], (number, "one completion journal per GPU cluster, in the run's order")
-        assert len({item["journal_sha256"] for item in journals}) == 2, number
-    for number in ("1", "5"):
-        assert record["stages"][number]["gpu_cluster_count"] == 2, number
-    assert record["inputs"]["gpu_cluster_arns_sha256"] == _sha256(
-        f"{GPU_ARN}\n{EKS_GPU_ARN}"
-    )
-    assert record["inputs"]["eks_flag_sha256"] == _sha256(
-        f"--gpu-nodegroup={EKS_NODEGROUP}"
-    )
-    receipt = record["stages"]["5"]["readme"]
-    assert (
-        receipt["gpu_cluster_count"] == 2 and receipt["eks_flag"] == "--gpu-nodegroup"
-    )
-    serialized = json.dumps(record)
-    for secret in (GPU_ARN, EKS_GPU_ARN, EKS_NODEGROUP):
-        assert secret not in serialized, f"{secret} leaked into the record"
-
-
-def test_stage_five_refuses_a_mixed_site_the_readme_does_not_document(
-    tmp_path: Path,
-) -> None:
-    env = _install_fakes(tmp_path)
-    readme_path = tmp_path / "checkout/README.md"
-    readme_path.write_text(
-        readme_path.read_text(encoding="utf-8").replace(
-            "`--gpu-nodegroup <托管节点组名>`", "托管节点组名"
-        ),
-        encoding="utf-8",
-    )
-
-    result = _run(
-        tmp_path,
-        env,
-        "--gpu-cluster-arn",
-        GPU_ARN,
-        "--gpu-cluster-arn",
-        EKS_GPU_ARN,
-        "--gpu-nodegroup",
-        EKS_NODEGROUP,
-    )
-
-    assert result.returncode != 0, result.stdout
-    assert "FAILED at stage 5 (cold-redeploy-readme)" in result.stderr, result.stderr
-    assert "does not document --gpu-nodegroup" in result.stderr, result.stderr
-    assert _admin_verbs(_tool_log(env)) == [
-        "deploy",
-        "remove-cluster",
-        "remove-cluster",
-        "join-cluster",
-        "uninstall",
-    ], "the driver's own stages still pass the flag through; only S5 refuses"
-    assert not (tmp_path / "state-second/bootstrap-state.json").exists(), (
-        "no deploy reaches the second state directory"
-    )
 
 
 def test_stage_five_deploys_by_the_readme_procedure_from_a_pristine_copy(

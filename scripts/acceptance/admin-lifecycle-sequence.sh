@@ -3,7 +3,10 @@
 # ordered acceptance sequence on an isolated staging site.
 #
 #   1  cold first deploy (BuildKit caches, local runtime images and the site's
-#      ECR image/buildcache tags are gone before the build)
+#      ECR image/buildcache tags are gone before the build); on a mixed
+#      HyperPod + plain-EKS site the deploy names the clusters of the first
+#      ARN's provider only and the other provider's clusters join right after
+#      it with the site-bound join-cluster (see "mixed sites" below)
 #   2  remove-cluster of every GPU cluster, one ARN at a time in the given
 #      order, ending in the zero-GPU-cluster steady state
 #   3  one join-cluster re-attaching every GPU cluster (a plain-EKS member's
@@ -20,7 +23,31 @@
 #      (scripts/e2e/regional/boot029_readme.py). --email-wait-minutes applies
 #      to stage 1 only: the README command has no wait, so an unconfirmed
 #      SNS subscription ends the first stage-5 attempt with the deploy's own
-#      refusal, and --stage 5 resumes after the mail was confirmed.
+#      refusal, and --stage 5 resumes after the mail was confirmed. A mixed
+#      site renders the README deploy with the clusters of the provider stage
+#      1 joined (the reverse order: an eks-managed-first site starting from
+#      eks-v1) and joins the other provider's clusters afterwards, as in
+#      stage 1, so one run covers both first-deploy providers and both join
+#      directions.
+#
+# Mixed sites. A first deploy's GPU clusters must share one provider: the
+# deploy writes one site Runtime Profile and refuses a HyperPod + eks-managed
+# list before creating anything (bootstrap_common.require_single_provider,
+# live 2026-10-08). Before stage 1 and 5 the driver asks the product's own
+# discovery which provider stands behind every --gpu-cluster-arn (an EKS ARN is
+# a HyperPod cluster when exactly one HyperPod cluster names it as orchestrator;
+# scripts/e2e/regional/boot029_providers.py), deploys the clusters of the first
+# ARN's provider (stage 1; stage 5 leads with the provider stage 1 joined),
+# then runs one site-bound `join-cluster` per further provider.
+# That join stops for review of the provider's own Runtime Profile plan
+# (CLUSTER_PROFILE_NEW); the driver approves exactly that plan with
+# --approve-profile-plan and reruns the join. The plain-EKS selector flag goes
+# with the command that names the eks-managed clusters. A single-provider list
+# runs byte for byte as before. A resumed stage 1/5 whose first deploy already
+# finished (site-ready, naming the first provider's clusters) does not deploy
+# again -- a second deploy is a release, not a cold build -- and continues with
+# the joins; a state directory whose recorded initial-deploy-request.json names
+# another GPU cluster set is refused (start over in a new empty directory).
 #
 # Every admin command runs in the foreground and the next stage starts only
 # after it has exited. The first failing stage stops the run and prints its
@@ -79,6 +106,14 @@ if [[ -n "$EKS_FLAG_NAME" ]]; then
   EKS_ARGS=("$EKS_FLAG_NAME" "$EKS_FLAG_VALUE")
   EKS_FLAG="${EKS_FLAG_NAME}=${EKS_FLAG_VALUE}"
 fi
+# Provider grouping of the GPU clusters (discover_gpu_providers and
+# group_gpu_clusters, stages 1 and 5): the stage's first deploy names every
+# cluster of its leading provider; each further provider joins inside the
+# stage with the site-bound join-cluster. GPU_PROVIDERS is parallel to GPU_ARNS.
+GPU_PROVIDERS=() FIRST_PROVIDER="" FIRST_DEPLOY_STATE=""
+DEPLOY_GPU_ARNS=() DEPLOY_GPU_ARN_ARGS=() DEPLOY_RECEIPT_ARGS=() DEPLOY_EKS_ARGS=()
+JOINED_PROVIDERS=() JOINED_GPU_ARNS=() JOINED_GPU_PROVIDERS=() JOINED_RECEIPT_ARGS=()
+JOIN_EKS_ARGS=() JOIN_EKS_FLAG_NAME=""
 [[ "$START_STAGE" =~ ^[1-5]$ ]] || usage
 [[ "$EMAIL_WAIT" =~ ^[0-9]+$ ]] || usage
 [[ "$AURORA_FINAL_SNAPSHOT" =~ ^(retain|skip)$ ]] || usage
@@ -174,7 +209,13 @@ run_admin() {  # waits for the command to exit; never backgrounds a deploy
   "${command[@]}" 2>&1 | tee -a "$STAGE_LOG" || return "$?"
 }
 
-assert_current_journal() {  # STATE_DIR [GPU_ARN ...]: default every GPU cluster
+assert_first_deploy_journal() {  # STATE_DIR: the first deploy names the first provider's clusters; one COMPLETED join journal per joined cluster
+  python3 -m scripts.e2e.regional.boot029_receipts verify --record "$RECORD" \
+    --state "$1" --stage "$CURRENT_STAGE" --cpu-arn "$CPU_ARN" "${DEPLOY_RECEIPT_ARGS[@]}" \
+    ${JOINED_RECEIPT_ARGS[@]+"${JOINED_RECEIPT_ARGS[@]}"} >>"${STAGE_LOG}.extra.json"
+}
+
+assert_current_journal() {  # STATE_DIR [GPU_ARN ...]: default every GPU cluster (stages 2-4)
   local state="$1" policy=() arns=()
   shift
   if [[ $# -gt 0 ]]; then
@@ -220,13 +261,147 @@ assert_cold_build() {  # the stage log must show a full, uncached image build
     >>"${STAGE_LOG}.extra.json"
 }
 
+# --- providers ---------------------------------------------------------------
+
+contains() {  # WORD LIST...
+  local item
+  for item in "${@:2}"; do [[ "$item" == "$1" ]] && return 0; done
+  return 1
+}
+
+discover_gpu_providers() {  # once per stage: the product's own provider discovery (read-only AWS)
+  [[ ${#GPU_PROVIDERS[@]} -eq 0 ]] || return 0
+  local listing provider arn index=0
+  listing="$(python3 -m scripts.e2e.regional.boot029_providers "${GPU_RECEIPT_ARGS[@]}" 2>>"$STAGE_LOG")" ||
+    fail "GPU cluster provider discovery failed; see the stage log"
+  while IFS=$'\t' read -r provider arn; do
+    [[ "$provider" =~ ^(hyperpod|eks-managed)$ && "$arn" == "${GPU_ARNS[$index]:-}" ]] ||
+      fail "GPU cluster provider discovery returned an unreadable line"
+    GPU_PROVIDERS+=("$provider")
+    index=$((index + 1))
+  done <<<"$listing"
+  (( ${#GPU_PROVIDERS[@]} == ${#GPU_ARNS[@]} )) ||
+    fail "GPU cluster provider discovery did not classify every GPU cluster"
+}
+
+leading_provider() {  # STAGE -> the provider whose clusters the stage's first deploy names
+  # Stage 1 starts from the first ARN's provider. Stage 5 reverses the order
+  # on a mixed list -- its first deploy names the provider stage 1 joined and
+  # joins the provider stage 1 deployed -- so one run proves both first-deploy
+  # providers (hyperpod-v1 and eks-v1 site profiles) and both join directions.
+  # A single-provider list has nothing to reverse.
+  local first="${GPU_PROVIDERS[0]}" provider
+  if [[ "$1" == 5 ]]; then
+    for provider in "${GPU_PROVIDERS[@]}"; do
+      if [[ "$provider" != "$first" ]]; then
+        printf '%s' "$provider"
+        return
+      fi
+    done
+  fi
+  printf '%s' "$first"
+}
+
+group_gpu_clusters() {  # LEADING_PROVIDER: its clusters go to the first deploy; each further provider joins afterwards
+  local index provider arn
+  FIRST_PROVIDER="$1"
+  DEPLOY_GPU_ARNS=() DEPLOY_GPU_ARN_ARGS=() DEPLOY_RECEIPT_ARGS=() DEPLOY_EKS_ARGS=()
+  JOINED_PROVIDERS=() JOINED_GPU_ARNS=() JOINED_GPU_PROVIDERS=() JOINED_RECEIPT_ARGS=()
+  JOIN_EKS_ARGS=() JOIN_EKS_FLAG_NAME=""
+  for index in "${!GPU_ARNS[@]}"; do
+    provider="${GPU_PROVIDERS[$index]}"
+    arn="${GPU_ARNS[$index]}"
+    if [[ "$provider" == "$FIRST_PROVIDER" ]]; then
+      DEPLOY_GPU_ARNS+=("$arn")
+      DEPLOY_GPU_ARN_ARGS+=(--gpu-cluster-arn "$arn")
+      DEPLOY_RECEIPT_ARGS+=(--gpu-arn "$arn")
+    else
+      JOINED_GPU_ARNS+=("$arn")
+      JOINED_GPU_PROVIDERS+=("$provider")
+      JOINED_RECEIPT_ARGS+=(--joined-gpu-arn "$arn")
+      contains "$provider" ${JOINED_PROVIDERS[@]+"${JOINED_PROVIDERS[@]}"} || JOINED_PROVIDERS+=("$provider")
+    fi
+  done
+  [[ ${#DEPLOY_GPU_ARNS[@]} -gt 0 ]] || fail "no GPU cluster of provider ${FIRST_PROVIDER} to deploy"
+  # The plain-EKS selector belongs to the command that names the eks-managed
+  # clusters; a list without any gets it on the deploy, as given (unchanged).
+  if [[ -n "$EKS_FLAG_NAME" ]]; then
+    if [[ "$FIRST_PROVIDER" == eks-managed ]] ||
+      ! contains eks-managed ${JOINED_PROVIDERS[@]+"${JOINED_PROVIDERS[@]}"}; then
+      DEPLOY_EKS_ARGS=("${EKS_ARGS[@]}")
+    else
+      JOIN_EKS_ARGS=("${EKS_ARGS[@]}")
+      JOIN_EKS_FLAG_NAME="$EKS_FLAG_NAME"
+    fi
+  fi
+  log "stage ${CURRENT_STAGE} GPU clusters: ${#DEPLOY_GPU_ARNS[@]} ${FIRST_PROVIDER} in the first deploy," \
+    "${#JOINED_GPU_ARNS[@]} joined afterwards${JOINED_PROVIDERS[*]:+ (${JOINED_PROVIDERS[*]})}"
+}
+
+provider_receipt_line() {  # the grouping, providers only: ARNs stay out of the record
+  local joined="" provider
+  for provider in ${JOINED_PROVIDERS[@]+"${JOINED_PROVIDERS[@]}"}; do
+    joined+="${joined:+, }\"${provider}\""
+  done
+  printf '{"first_deploy_provider": "%s", "joined_providers": [%s]}\n' \
+    "$FIRST_PROVIDER" "$joined" >>"${STAGE_LOG}.extra.json"
+}
+
+first_deploy_state() {  # STATE_DIR -> FIRST_DEPLOY_STATE=pending|complete; a recorded request for another cluster set fails the stage
+  FIRST_DEPLOY_STATE="$(python3 -m scripts.e2e.regional.boot029_receipts pending --record "$RECORD" \
+    --state "$1" --stage "$CURRENT_STAGE" --cpu-arn "$CPU_ARN" "${DEPLOY_RECEIPT_ARGS[@]}")" ||
+    fail "the first-deploy state of $(basename "$1") could not be read"
+  if [[ "$FIRST_DEPLOY_STATE" == conflict ]]; then
+    fail "$(basename "$1") recorded a first deploy request (initial-deploy-request.json) for a different GPU cluster set; a first deploy cannot change its request -- start the sequence in a new empty state directory"
+  fi
+}
+
+run_join_with_profile_approval() {  # STATE_DIR PROVIDER GPU_ARN...: the site-bound join-cluster; the provider's Runtime Profile plan is approved when the join stops for it
+  local state="$1" provider="$2" code plan sha reference
+  shift 2
+  local arguments=(join-cluster --state-dir "$state")
+  for arn in "$@"; do arguments+=(--gpu-cluster-arn "$arn"); done
+  [[ "$provider" != eks-managed ]] || arguments+=(${JOIN_EKS_ARGS[@]+"${JOIN_EKS_ARGS[@]}"})
+  log "joining the ${provider} GPU cluster(s) of the mixed site ($# ARN) with the site-bound CLI"
+  set +e
+  run_admin "${arguments[@]}"
+  code=$?
+  set -e
+  [[ "$code" != 0 ]] || return 0
+  plan="$(python3 -m scripts.e2e.regional.boot029_receipts profile-plan --record "$RECORD" \
+    --state "$state" --stage "$CURRENT_STAGE" 2>>"$STAGE_LOG")" ||
+    fail "join-cluster of the ${provider} GPU cluster(s) exited ${code} with no Runtime Profile plan awaiting approval"
+  sha="$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["plan_sha256"])' "$plan")"
+  reference="${CASE_ID}/stage-${CURRENT_STAGE}"
+  log "the join stopped for review of the ${provider} Runtime Profile plan (CLUSTER_PROFILE_NEW);" \
+    "approving plan ${sha:0:12}... with reference ${reference} and rerunning the join"
+  python3 -c 'import json, sys
+plan = json.loads(sys.argv[1])
+plan.update(provider=sys.argv[2], reference=sys.argv[3])
+print(json.dumps({"profile_plan_approved": plan}))' "$plan" "$provider" "$reference" >>"${STAGE_LOG}.extra.json"
+  run_admin "${arguments[@]}" --approve-profile-plan "$sha" --reference "$reference"
+}
+
+join_remaining_providers() {  # STATE_DIR: one join-cluster per further provider, in order of first appearance
+  local provider index group
+  for provider in ${JOINED_PROVIDERS[@]+"${JOINED_PROVIDERS[@]}"}; do
+    group=()
+    for index in "${!JOINED_GPU_ARNS[@]}"; do
+      if [[ "${JOINED_GPU_PROVIDERS[$index]}" == "$provider" ]]; then
+        group+=("${JOINED_GPU_ARNS[$index]}")
+      fi
+    done
+    run_join_with_profile_approval "$1" "$provider" "${group[@]}"
+  done
+}
+
 # --- stages ----------------------------------------------------------------
 
-run_path_deploy() {  # STATE_DIR: the driver's own four-argument deploy (stage 1)
+run_path_deploy() {  # STATE_DIR: the driver's own four-argument deploy of the first provider's clusters (stage 1)
   local wait=()
   [[ "$EMAIL_WAIT" -gt 0 ]] && wait=(--wait-for-email-confirmation "$EMAIL_WAIT")
-  run_admin deploy --cpu-cluster-arn "$CPU_ARN" "${GPU_ARN_ARGS[@]}" \
-    ${EKS_ARGS[@]+"${EKS_ARGS[@]}"} \
+  run_admin deploy --cpu-cluster-arn "$CPU_ARN" "${DEPLOY_GPU_ARN_ARGS[@]}" \
+    ${DEPLOY_EKS_ARGS[@]+"${DEPLOY_EKS_ARGS[@]}"} \
     --state-dir "$1" --admin-email "$ADMIN_EMAIL" ${wait[@]+"${wait[@]}"}
 }
 
@@ -234,7 +409,11 @@ run_readme_deploy() {  # STATE_DIR: README.md's procedure, verbatim, clean envir
   log "README procedure from $REPO/README.md (waiting for the process to exit)"
   python3 -m scripts.e2e.regional.boot029_readme --readme "$REPO/README.md" \
     --repo "$REPO" --work-dir "$ACCEPT_DIR/stage-5-readme" --attempt "$CURRENT_ATTEMPT" \
-    --cpu-arn "$CPU_ARN" "${GPU_RECEIPT_ARGS[@]}" ${EKS_ARGS[@]+"${EKS_ARGS[@]}"} \
+    --cpu-arn "$CPU_ARN" "${DEPLOY_RECEIPT_ARGS[@]}" \
+    ${JOINED_RECEIPT_ARGS[@]+"${JOINED_RECEIPT_ARGS[@]}"} \
+    ${DEPLOY_EKS_ARGS[@]+"${DEPLOY_EKS_ARGS[@]}"} \
+    ${JOIN_EKS_FLAG_NAME:+"--joined-eks-flag=$JOIN_EKS_FLAG_NAME"} \
+    --first-provider "$FIRST_PROVIDER" \
     --state-dir "$1" \
     --admin-email "$ADMIN_EMAIL" --receipt "${STAGE_LOG}.extra.json" 2>&1 |
     tee -a "$STAGE_LOG" || return "$?"
@@ -242,17 +421,31 @@ run_readme_deploy() {  # STATE_DIR: README.md's procedure, verbatim, clean envir
 
 deploy_fresh() {  # STATE_DIR SITE_ID_FOR_ECR_CHECK DEPLOY_FUNCTION
   require_fresh_state_dir "$1"
-  # Do not destroy caches of an already-started build when resuming its deploy.
-  if [[ ! -f "$1/bootstrap-state.json" ]]; then
-    prune_image_caches
-    clear_site_ecr_tags "$2"
+  first_deploy_state "$1"
+  if [[ "$FIRST_DEPLOY_STATE" == complete ]]; then
+    # A resumed stage whose first deploy finished: deploying again would be a
+    # release (registry reuse, no cold build); only the joins can be missing.
+    log "$(basename "$1") already holds the finished first deploy; continuing with the join of the remaining provider(s)"
+    printf '{"first_deploy_already_complete": true}\n' >>"${STAGE_LOG}.extra.json"
+  else
+    # Do not destroy caches of an already-started build when resuming its deploy.
+    if [[ ! -f "$1/bootstrap-state.json" ]]; then
+      prune_image_caches
+      clear_site_ecr_tags "$2"
+    fi
+    "$3" "$1"
   fi
-  "$3" "$1"
+  join_remaining_providers "$1"
   assert_cold_build "$1"
-  assert_current_journal "$1"
+  assert_first_deploy_journal "$1"
 }
 
-stage_1() { deploy_fresh "$STATE_DIR" "$PREVIOUS_SITE_ID" run_path_deploy; }
+stage_1() {
+  discover_gpu_providers
+  group_gpu_clusters "$(leading_provider 1)"
+  provider_receipt_line
+  deploy_fresh "$STATE_DIR" "$PREVIOUS_SITE_ID" run_path_deploy
+}
 
 stage_2() {  # one ARN at a time; every removed cluster's journal is asserted
   local removed=()
@@ -279,6 +472,9 @@ stage_4() {
 stage_5() {
   local site_id=""
   [[ -f "$STATE_DIR/bootstrap-state.json" ]] && site_id="$(json_field "$STATE_DIR/bootstrap-state.json" site_id)"
+  discover_gpu_providers
+  group_gpu_clusters "$(leading_provider 5)"
+  provider_receipt_line
   deploy_fresh "$SECOND_STATE_DIR" "$site_id" run_readme_deploy
 }
 

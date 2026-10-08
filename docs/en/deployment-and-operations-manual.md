@@ -5222,7 +5222,11 @@ eks-managed`, a new and less validated form; semantics and boundaries in Adminis
 cluster needs its GPU node selector: `--node-selector <selector>` (default `nvidia.com/gpu.present=true`) or
 `--gpu-nodegroup <managed-node-group>` (derives `eks.amazonaws.com/nodegroup=<name>`); `--cluster-id` defaults to the EKS
 cluster name. Both options are ignored for HyperPod clusters, whose selector is always
-`sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before. The Runtime Profile applies per
+`sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before. A mixed site takes two steps: a first
+`deploy`'s GPU clusters must share one provider (both providers in one first `deploy` are refused before anything is
+created), so deploy every cluster of one provider first and attach the other provider's clusters with this section's
+`join-cluster` -- that join writes its provider's own Runtime Profile plan and stops, and continues on the approved
+rerun; the acceptance driver of BOOT-029 runs exactly this order. The Runtime Profile applies per
 cluster: the site profile is the default pin; when its `nodeReboot` owner is not the target provider's adapter (plain
 EKS: `gpu-fault-eks-adapter`, HyperPod: `gpu-fault-hyperpod-adapter`) the join writes the cluster's own
 `spec.clusters[].runtimeProfile` (the provider's example profile under version `eks-v1`/`hyperpod-v1`, with that

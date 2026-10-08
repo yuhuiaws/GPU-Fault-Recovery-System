@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Sequence
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import (
@@ -17,9 +17,18 @@ from gpu_fault.admin.bootstrap_common import (
     assert_site_tag,
     describe_or_absent,
 )
+from gpu_fault.admin.deploy_identity import INITIAL_REQUEST_FILE
+from gpu_fault.admin.profile_approval import (
+    ProfileApprovalError,
+    profile_plan_path,
+    profile_plan_sha256,
+)
 from scripts.release_identity import build_release_identity
 
 CASE_ID = "GF-REGIONAL-BOOT-029"
+#: The Runtime Profile plan a join writes when the joining cluster needs its
+#: provider's own profile version (``cluster_join_profile``).
+CLUSTER_PROFILE_CHANGE_KIND = "CLUSTER_PROFILE_NEW"
 
 
 def clear_site_ecr_images(
@@ -334,14 +343,18 @@ def verify_journal(
     gpu_arns: list[str],
     cpu_arn: str,
     aurora_final_snapshot: str | None = None,
+    joined_arns: Sequence[str] = (),
 ) -> dict[str, Any]:
     """The stage's completion proof, bound to the run's clusters.
 
-    Stages 1 and 5 require the first deploy to name exactly the run's GPU
-    clusters; stages 2 and 3 require one current COMPLETED journal per GPU
-    cluster (``journals``, in the run's order: a mixed HyperPod + eks-managed
-    site removes its clusters one by one and re-joins them in one command);
-    stage 4 is the one uninstall journal.
+    Stages 1 and 5 require the first deploy to name exactly ``gpu_arns`` (the
+    clusters of the first provider) and, on a mixed HyperPod + eks-managed
+    site, one current COMPLETED join-cluster journal per ``joined_arns``
+    cluster (``joins``: the other provider joins inside the stage, right after
+    the first deploy); stages 2 and 3 require one current COMPLETED journal
+    per GPU cluster (``journals``, in the run's order: the site removes its
+    clusters one by one and re-joins them all in one command); stage 4 is the
+    one uninstall journal.
     """
 
     if aurora_final_snapshot is not None and (
@@ -364,7 +377,10 @@ def verify_journal(
             ),
             what="first deploy",
         )
-        proof["gpu_cluster_count"] = len(gpu_arns)
+        proof["first_deploy_gpu_cluster_count"] = len(gpu_arns)
+        proof["gpu_cluster_count"] = len(gpu_arns) + len(joined_arns)
+        if joined_arns:
+            proof["joins"] = _join_proofs(state, list(joined_arns))
         return proof
     if stage in {2, 3}:
         journals = []
@@ -413,6 +429,101 @@ def verify_journal(
                 }
             }
     return proof
+
+
+def _join_proofs(state: Path, joined_arns: list[str]) -> list[dict[str, Any]]:
+    """One current COMPLETED join-cluster journal per cluster joined in-stage.
+
+    A first deploy starts from an empty state directory, so no join journal
+    can predate the stage: the baseline is empty and every matching COMPLETED
+    journal is current.
+    """
+
+    proofs = []
+    for index, gpu_arn in enumerate(joined_arns):
+        proof = _current_completion(
+            state,
+            3,
+            {},
+            lambda value, arn=gpu_arn: _cluster_journal_matches(
+                value, stage=3, gpu_arn=arn
+            ),
+            what=f"joined GPU cluster {index + 1}/{len(joined_arns)}",
+        )
+        proof["gpu_arn_sha256"] = digest(gpu_arn.encode())
+        proofs.append(proof)
+    return proofs
+
+
+def first_deploy_state(state: Path, *, cpu_arn: str, gpu_arns: Sequence[str]) -> str:
+    """``pending``, ``complete`` or ``conflict`` for the first deploy of ``gpu_arns``.
+
+    ``complete`` is a ``site-ready`` checkpoint whose ``initial_deploy_target``
+    names this CPU cluster and exactly these GPU clusters: a resumed stage
+    skips the deploy and continues with the joins that are still missing
+    (re-running a finished deploy is a release, whose images are registry
+    reuse and no longer a cold build). ``conflict`` is a recorded
+    ``initial-deploy-request.json`` for another GPU cluster set: the product
+    refuses to change a first deploy's request, so the sequence has to start
+    over in a new empty state directory -- live 2026-10-08, when a mixed first
+    deploy was refused after the request had been recorded.
+    """
+
+    request = state / INITIAL_REQUEST_FILE
+    if request.is_file() and not request.is_symlink():
+        try:
+            recorded = json.loads(request.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            recorded = None
+        if (
+            isinstance(recorded, dict)
+            and isinstance(recorded.get("gpu_cluster_arns"), list)
+            and recorded["gpu_cluster_arns"] != list(gpu_arns)
+        ):
+            return "conflict"
+    bootstrap = state / "bootstrap-state.json"
+    if not bootstrap.exists():
+        return "pending"
+    if _deploy_target_matches(
+        read(bootstrap), cpu_arn=cpu_arn, gpu_arns=list(gpu_arns)
+    ):
+        return "complete"
+    return "pending"
+
+
+def pending_profile_plan(state: Path) -> dict[str, Any] | None:
+    """The ``CLUSTER_PROFILE_NEW`` plan a join stopped for, or ``None``.
+
+    A join of the site's other provider writes
+    ``release-deploy/profile-plan.json`` and exits before any AWS mutation; the
+    driver approves exactly that plan (``plan_sha256`` recomputed from the
+    document) and reruns the same join. Anything else -- no plan, another
+    change kind, a plan that does not require approval or whose digest does
+    not verify -- is not a stop the driver may answer.
+    """
+
+    path = profile_plan_path(state)
+    if path.is_symlink() or not path.is_file():
+        return None
+    try:
+        plan = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(plan, dict):
+            return None
+        plan_sha256 = profile_plan_sha256(plan)
+    except (OSError, ValueError, ProfileApprovalError):
+        return None
+    if (
+        plan.get("change_kind") != CLUSTER_PROFILE_CHANGE_KIND
+        or plan.get("approval_required") is not True
+        or plan.get("plan_sha256") != plan_sha256
+    ):
+        return None
+    return {
+        "plan_sha256": plan_sha256,
+        "change_kind": CLUSTER_PROFILE_CHANGE_KIND,
+        "current_version": str(plan.get("current_version") or ""),
+        "desired_version": str(plan.get("desired_version") or ""),
+    }
 
 
 def foreign_cached_layers(text: str) -> tuple[int, int]:
@@ -538,7 +649,17 @@ def finish(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "action", choices=("init", "start", "verify", "cold", "finish", "clear-ecr")
+        "action",
+        choices=(
+            "init",
+            "start",
+            "verify",
+            "cold",
+            "finish",
+            "clear-ecr",
+            "pending",
+            "profile-plan",
+        ),
     )
     parser.add_argument("--record", type=Path, required=True)
     parser.add_argument("--state", type=Path, required=True)
@@ -550,6 +671,15 @@ def main() -> None:
         action="append",
         default=[],
         help="GPU cluster ARN, once per managed GPU cluster in the run's order",
+    )
+    parser.add_argument(
+        "--joined-gpu-arn",
+        action="append",
+        default=[],
+        help=(
+            "GPU cluster ARN joined inside a first-deploy stage (the other "
+            "provider of a mixed site), once per cluster in the run's order"
+        ),
     )
     parser.add_argument(
         "--eks-flag",
@@ -607,9 +737,25 @@ def main() -> None:
                         gpu_arns=list(args.gpu_arn),
                         cpu_arn=args.cpu_arn,
                         aurora_final_snapshot=args.aurora_final_snapshot,
+                        joined_arns=list(args.joined_gpu_arn),
                     )
                 )
             )
+        elif args.action == "pending":
+            if args.stage not in {1, 5} or not args.gpu_arn:
+                parser.error("pending requires a first-deploy stage and gpu-arn")
+            print(
+                first_deploy_state(
+                    args.state, cpu_arn=args.cpu_arn, gpu_arns=list(args.gpu_arn)
+                )
+            )
+        elif args.action == "profile-plan":
+            plan = pending_profile_plan(args.state)
+            if plan is None:
+                raise ValueError(
+                    "no CLUSTER_PROFILE_NEW Runtime Profile plan awaits approval"
+                )
+            print(json.dumps(plan))
         elif args.action == "cold":
             if args.log is None:
                 parser.error("cold requires log")

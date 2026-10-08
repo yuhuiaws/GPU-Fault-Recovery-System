@@ -9,12 +9,22 @@ nothing here spells out the commands, so a README that no longer deploys fails
 this stage, and so does a README procedure that only works with something the
 README does not mention.
 
-A site with several GPU clusters (a mixed HyperPod + plain-EKS site) renders
-one ``--gpu-cluster-arn`` line per cluster, and a plain-EKS member's selector
-flag (``--gpu-nodegroup`` / ``--node-selector``) -- each only because, and only
-when, the README's deployment section itself says so. A README that does not
-state the repetition or the flag refuses the stage: that missing sentence is
-the README defect the stage exists to find.
+A site with several GPU clusters renders one ``--gpu-cluster-arn`` line per
+cluster, and a plain-EKS member's selector flag (``--gpu-nodegroup`` /
+``--node-selector``) -- each only because, and only when, the README's
+deployment section itself says so. A mixed HyperPod + plain-EKS site deploys
+the clusters of one provider first and joins the other provider afterwards
+with the site-bound ``join-cluster`` (the product refuses a mixed first
+deploy): the README deploy is rendered with the first provider's clusters, and
+the stage renders it that way only when the README's deployment section states
+the one-provider rule and the join (``joined_arns``). When the README deploy
+names plain-EKS clusters (``first_provider`` ``eks-managed``: the site starts
+from the ``eks-v1`` profile) the deployment section must also state the
+plain-EKS first-deploy prerequisites -- the ``eks-v1`` start, EKS node auto
+repair off, the GPU node image prerequisites in the launch template user data.
+A README that does not state the repetition, the flag, the rule or those
+prerequisites refuses the stage: that missing sentence is the README defect the
+stage exists to find.
 """
 
 from __future__ import annotations
@@ -55,6 +65,26 @@ GPU_FLAG = "--gpu-cluster-arn"
 EKS_FLAGS = ("--gpu-nodegroup", "--node-selector")
 #: Words with which the README's deployment section says the GPU flag repeats.
 REPEAT_WORDS = ("多个", "重复", "repeat", "several", "multiple")
+#: A code span naming ``join-cluster`` (``\`join-cluster\``` or the bound CLI's
+#: full command) on a line that also speaks of the provider rule.
+JOIN_SPAN = re.compile(r"`[^`\n]*\bjoin-cluster\b[^`\n]*`")
+PROVIDER_WORD = "provider"
+#: What the deployment section must state before S5 may run a plain-EKS first
+#: deploy from the README: the site's ``eks-v1`` start, EKS node auto repair
+#: off on the GPU node groups, and the GPU node image prerequisites installed
+#: through the node group's launch template user data.
+PLAIN_EKS_STATEMENTS = (
+    ("the eks-v1 Runtime Profile start of an all-plain-EKS site", r"`eks-v1`"),
+    (
+        "EKS node auto repair off (`nodeRepairConfig.enabled=false`)",
+        r"`nodeRepairConfig\.enabled=false`",
+    ),
+    (
+        "the GPU node image prerequisites (`python3.12`, `strace`) via the launch template user data",
+        r"`python3\.12`[\s\S]*`strace`[\s\S]*(launch template|user data)",
+    ),
+)
+PROVIDERS = ("hyperpod", "eks-managed")
 VENV_COMPONENTS = frozenset({".venv", "deployer-venv", ".deployer-venv.versions"})
 KEPT_NAMES = frozenset(
     {
@@ -91,6 +121,11 @@ class ReadmeProcedure:
     repeat_gpu_arn_documented: bool = False
     #: The plain-EKS selector flags the deployment section documents.
     documented_eks_flags: frozenset[str] = frozenset()
+    #: The deployment section says a mixed-provider site deploys one provider
+    #: first and joins the other with ``join-cluster``.
+    mixed_site_join_documented: bool = False
+    #: The plain-EKS first-deploy statements the deployment section lacks.
+    plain_eks_first_deploy_gaps: tuple[str, ...] = ()
 
 
 def deploy_section(text: str) -> str:
@@ -128,6 +163,27 @@ def repeat_gpu_arn_documented(section: str) -> bool:
 
 def documented_eks_flags(section: str) -> frozenset[str]:
     return frozenset(flag for flag in EKS_FLAGS if _mentions_flag(section, flag))
+
+
+def plain_eks_first_deploy_gaps(section: str) -> tuple[str, ...]:
+    """The plain-EKS first-deploy statements the deployment section does not make."""
+
+    return tuple(
+        name
+        for name, pattern in PLAIN_EKS_STATEMENTS
+        if re.search(pattern, section) is None
+    )
+
+
+def mixed_site_join_documented(section: str) -> bool:
+    """A line of the deployment section states the one-provider first deploy
+    and names ``join-cluster`` (in code font) as the way the other provider's
+    clusters are attached afterwards."""
+
+    return any(
+        PROVIDER_WORD in line and JOIN_SPAN.search(line) is not None
+        for line in section.splitlines()
+    )
 
 
 def fenced_bash_block(text: str, heading: str) -> str:
@@ -226,6 +282,8 @@ def parse_readme(text: str) -> ReadmeProcedure:
         skipped_verification_lines=tuple(skipped),
         repeat_gpu_arn_documented=repeat_gpu_arn_documented(section),
         documented_eks_flags=documented_eks_flags(section),
+        mixed_site_join_documented=mixed_site_join_documented(section),
+        plain_eks_first_deploy_gaps=plain_eks_first_deploy_gaps(section),
     )
 
 
@@ -318,8 +376,21 @@ def require_readme_authority(
     *,
     gpu_arns: Sequence[str],
     eks_flag: tuple[str, str] | None,
+    joined_arns: Sequence[str] = (),
+    joined_eks_flag: str | None = None,
+    first_provider: str | None = None,
 ) -> None:
-    """Refuse to render what the README's deployment section does not state."""
+    """Refuse to render what the README's deployment section does not state.
+
+    ``joined_arns`` are the other provider's clusters the driver joins with the
+    README-documented site-bound ``join-cluster`` right after the README
+    deploy; ``joined_eks_flag`` is the selector flag that join carries;
+    ``first_provider`` is the provider of the clusters the README deploy names
+    (``eks-managed`` requires the plain-EKS first-deploy statements).
+    """
+
+    if first_provider is not None and first_provider not in PROVIDERS:
+        raise ReadmeProcedureError(f"unknown GPU cluster provider {first_provider!r}")
 
     if len(gpu_arns) > 1 and not procedure.repeat_gpu_arn_documented:
         raise ReadmeProcedureError(
@@ -327,11 +398,26 @@ def require_readme_authority(
             "repeated for several GPU clusters; the stage adds nothing the README "
             "does not state"
         )
-    if eks_flag is not None and eks_flag[0] not in procedure.documented_eks_flags:
+    for flag in (eks_flag[0] if eks_flag else None, joined_eks_flag):
+        if flag is not None and flag not in procedure.documented_eks_flags:
+            raise ReadmeProcedureError(
+                f"README's section {DEPLOY_HEADING!r} does not document {flag} "
+                "for a plain EKS GPU cluster; the stage adds nothing the README does "
+                "not state"
+            )
+    if joined_arns and not procedure.mixed_site_join_documented:
         raise ReadmeProcedureError(
-            f"README's section {DEPLOY_HEADING!r} does not document {eks_flag[0]} "
-            "for a plain EKS GPU cluster; the stage adds nothing the README does "
-            "not state"
+            f"README's section {DEPLOY_HEADING!r} does not say that a mixed-provider "
+            "site deploys the clusters of one provider first and joins the other "
+            "provider's clusters afterwards with join-cluster; the stage adds "
+            "nothing the README does not state"
+        )
+    if first_provider == "eks-managed" and procedure.plain_eks_first_deploy_gaps:
+        raise ReadmeProcedureError(
+            f"README's section {DEPLOY_HEADING!r} does not state the plain-EKS "
+            "first-deploy prerequisites: "
+            + "; ".join(procedure.plain_eks_first_deploy_gaps)
+            + "; the stage adds nothing the README does not state"
         )
 
 
@@ -521,9 +607,19 @@ def run(
     receipt: Path,
     parent_environment: Mapping[str, str],
     eks_flag: tuple[str, str] | None = None,
+    joined_arns: Sequence[str] = (),
+    joined_eks_flag: str | None = None,
+    first_provider: str | None = None,
 ) -> int:
     procedure = parse_readme(readme.read_text(encoding="utf-8"))
-    require_readme_authority(procedure, gpu_arns=gpu_arns, eks_flag=eks_flag)
+    require_readme_authority(
+        procedure,
+        gpu_arns=gpu_arns,
+        eks_flag=eks_flag,
+        joined_arns=joined_arns,
+        joined_eks_flag=joined_eks_flag,
+        first_provider=first_provider,
+    )
     attempt_dir = work_dir / f"attempt-{attempt}"
     attempt_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     base_commit = _git(repository, "rev-parse", "HEAD")
@@ -558,9 +654,14 @@ def run(
     )
     entry["readme"].update(
         gpu_cluster_count=len(gpu_arns),
+        joined_gpu_cluster_count=len(joined_arns),
         repeat_gpu_arn_documented=procedure.repeat_gpu_arn_documented,
         documented_eks_flags=sorted(procedure.documented_eks_flags),
+        mixed_site_join_documented=procedure.mixed_site_join_documented,
+        plain_eks_first_deploy_documented=not procedure.plain_eks_first_deploy_gaps,
+        first_provider=first_provider,
         eks_flag=eks_flag[0] if eks_flag else None,
+        joined_eks_flag=joined_eks_flag,
     )
     with receipt.open("a", encoding="utf-8") as stream:
         stream.write(json.dumps(entry, sort_keys=True) + "\n")
@@ -589,9 +690,31 @@ def main() -> None:
         required=True,
         help="GPU cluster ARN, once per managed GPU cluster in the run's order",
     )
+    parser.add_argument(
+        "--joined-gpu-arn",
+        action="append",
+        default=[],
+        help=(
+            "GPU cluster ARN of the other provider, joined by the driver with the "
+            "README-documented site-bound join-cluster after the README deploy"
+        ),
+    )
     selector = parser.add_mutually_exclusive_group()
     selector.add_argument("--gpu-nodegroup", metavar="NODEGROUP")
     selector.add_argument("--node-selector", metavar="SELECTOR")
+    parser.add_argument(
+        "--joined-eks-flag",
+        choices=EKS_FLAGS,
+        help="the plain-EKS selector flag the driver's join of --joined-gpu-arn carries",
+    )
+    parser.add_argument(
+        "--first-provider",
+        choices=PROVIDERS,
+        help=(
+            "provider of the clusters the README deploy names; eks-managed requires "
+            "the README's plain-EKS first-deploy statements"
+        ),
+    )
     parser.add_argument("--state-dir", type=Path, required=True)
     parser.add_argument("--admin-email", required=True)
     parser.add_argument("--receipt", type=Path, required=True)
@@ -616,6 +739,9 @@ def main() -> None:
             receipt=args.receipt,
             parent_environment=os.environ,
             eks_flag=eks_flag,
+            joined_arns=list(args.joined_gpu_arn),
+            joined_eks_flag=args.joined_eks_flag,
+            first_provider=args.first_provider,
         )
     except (
         ReadmeProcedureError,

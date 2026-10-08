@@ -201,6 +201,113 @@ def test_readme_authority_is_required_for_repetition_and_the_eks_flag() -> None:
         )
 
 
+def test_real_readme_states_the_one_provider_first_deploy_and_the_join() -> None:
+    procedure = readme.parse_readme(README_TEXT)
+
+    assert procedure.mixed_site_join_documented is True, (
+        "the README deployment section must say a mixed site deploys one provider "
+        "first and joins the other provider's clusters with join-cluster"
+    )
+    section = readme.deploy_section(README_TEXT)
+    rule = next(
+        line
+        for line in section.splitlines()
+        if "provider" in line and "join-cluster" in line
+    )
+    assert readme.mixed_site_join_documented(section.replace(rule, "")) is False, (
+        "the rule is read from that sentence, not from the join-cluster example block"
+    )
+
+
+def test_readme_authority_is_required_for_the_in_stage_join() -> None:
+    procedure = readme.parse_readme(README_TEXT)
+    silent = readme.ReadmeProcedure(
+        readme_sha256=procedure.readme_sha256,
+        build_block=procedure.build_block,
+        deploy_block=procedure.deploy_block,
+        executed_lines=procedure.executed_lines,
+        skipped_verification_lines=procedure.skipped_verification_lines,
+        repeat_gpu_arn_documented=True,
+        documented_eks_flags=frozenset({"--gpu-nodegroup"}),
+    )
+
+    readme.require_readme_authority(
+        procedure,
+        gpu_arns=[GPU_ARN],
+        eks_flag=None,
+        joined_arns=[EKS_GPU_ARN],
+        joined_eks_flag="--gpu-nodegroup",
+    )
+    with pytest.raises(readme.ReadmeProcedureError, match="one provider first"):
+        readme.require_readme_authority(
+            silent, gpu_arns=[GPU_ARN], eks_flag=None, joined_arns=[EKS_GPU_ARN]
+        )
+    with pytest.raises(readme.ReadmeProcedureError, match="does not document"):
+        readme.require_readme_authority(
+            procedure,
+            gpu_arns=[GPU_ARN],
+            eks_flag=None,
+            joined_arns=[EKS_GPU_ARN],
+            joined_eks_flag="--gpu-selector",
+        )
+
+
+def test_real_readme_states_the_plain_eks_first_deploy_prerequisites() -> None:
+    procedure = readme.parse_readme(README_TEXT)
+
+    assert procedure.plain_eks_first_deploy_gaps == (), (
+        "the README deployment section must state the eks-v1 start, node auto "
+        "repair off and the launch-template node image prerequisites"
+    )
+    section = readme.deploy_section(
+        README_TEXT.replace("`nodeRepairConfig.enabled=false`", "node auto repair off")
+    )
+    assert readme.plain_eks_first_deploy_gaps(section) == (
+        "EKS node auto repair off (`nodeRepairConfig.enabled=false`)",
+    ), "each missing statement is named"
+
+
+def test_readme_authority_for_a_plain_eks_first_deploy_requires_its_statements() -> (
+    None
+):
+    procedure = readme.parse_readme(README_TEXT)
+    lacking = readme.ReadmeProcedure(
+        readme_sha256=procedure.readme_sha256,
+        build_block=procedure.build_block,
+        deploy_block=procedure.deploy_block,
+        executed_lines=procedure.executed_lines,
+        skipped_verification_lines=procedure.skipped_verification_lines,
+        repeat_gpu_arn_documented=True,
+        documented_eks_flags=procedure.documented_eks_flags,
+        mixed_site_join_documented=True,
+        plain_eks_first_deploy_gaps=("the eks-v1 Runtime Profile start",),
+    )
+
+    readme.require_readme_authority(
+        procedure,
+        gpu_arns=[EKS_GPU_ARN],
+        eks_flag=MIXED_VALUES["eks_flag"],
+        joined_arns=[GPU_ARN],
+        first_provider="eks-managed",
+    )
+    readme.require_readme_authority(
+        lacking, gpu_arns=[GPU_ARN], eks_flag=None, first_provider="hyperpod"
+    )
+    with pytest.raises(readme.ReadmeProcedureError, match="eks-v1 Runtime Profile"):
+        readme.require_readme_authority(
+            lacking,
+            gpu_arns=[EKS_GPU_ARN],
+            eks_flag=MIXED_VALUES["eks_flag"],
+            first_provider="eks-managed",
+        )
+    with pytest.raises(
+        readme.ReadmeProcedureError, match="unknown GPU cluster provider"
+    ):
+        readme.require_readme_authority(
+            procedure, gpu_arns=[GPU_ARN], eks_flag=None, first_provider="slurm"
+        )
+
+
 def test_deploy_section_authority_reads_only_the_deployment_section() -> None:
     text = README_TEXT.replace(
         "多个GPU集群重复传`--gpu-cluster-arn`", "多个GPU集群见下文"
@@ -687,6 +794,82 @@ def test_run_executes_the_readme_procedure_in_a_clean_environment(
     assert script.stat().st_mode & 0o777 == 0o700
     assert entry["script_sha256"] == hashlib.sha256(script.read_bytes()).hexdigest()
     assert shlex.quote(str(copy)) in script.read_text(encoding="utf-8")
+
+
+def test_run_renders_the_first_provider_only_and_records_the_in_stage_join(
+    tmp_path: Path,
+) -> None:
+    repository = _procedure_repository(tmp_path, exit_code=0)
+    receipt = tmp_path / "stage.extra.json"
+
+    code = readme.run(
+        readme=repository / "README.md",
+        repository=repository,
+        work_dir=tmp_path / "work",
+        attempt=1,
+        cpu_arn=CPU_ARN,
+        gpu_arns=[GPU_ARN],
+        state_dir=tmp_path / "second",
+        admin_email=ADMIN_EMAIL,
+        receipt=receipt,
+        parent_environment={**os.environ, "HOME": str(tmp_path)},
+        joined_arns=[EKS_GPU_ARN],
+        joined_eks_flag="--gpu-nodegroup",
+        first_provider="hyperpod",
+    )
+
+    assert code == 0, "the README deploy ran"
+    dump = json.loads((tmp_path / "admin.json").read_text(encoding="utf-8"))
+    assert dump["argv"] == [
+        "deploy",
+        "--cpu-cluster-arn",
+        CPU_ARN,
+        "--gpu-cluster-arn",
+        GPU_ARN,
+        "--state-dir",
+        str(tmp_path / "second"),
+        "--admin-email",
+        ADMIN_EMAIL,
+    ], "the README deploy names the first provider's cluster; the join is the driver's"
+    entry = json.loads(receipt.read_text(encoding="utf-8"))["readme"]
+    assert entry["gpu_cluster_count"] == 1, entry
+    assert entry["joined_gpu_cluster_count"] == 1, entry
+    assert entry["mixed_site_join_documented"] is True, entry
+    assert (
+        entry["eks_flag"] is None and entry["joined_eks_flag"] == "--gpu-nodegroup"
+    ), entry
+    assert entry["first_provider"] == "hyperpod", entry
+    assert entry["plain_eks_first_deploy_documented"] is True, entry
+    assert EKS_GPU_ARN not in receipt.read_text(encoding="utf-8"), "ARNs stay private"
+
+
+def test_run_refuses_an_in_stage_join_the_readme_does_not_state(tmp_path: Path) -> None:
+    repository = _procedure_repository(tmp_path, exit_code=0)
+    rule = next(
+        line
+        for line in readme.deploy_section(README_TEXT).splitlines()
+        if "provider" in line and "join-cluster" in line
+    )
+    (repository / "README.md").write_text(
+        README_TEXT.replace(rule + "\n", ""), encoding="utf-8"
+    )
+    receipt = tmp_path / "stage.extra.json"
+
+    with pytest.raises(readme.ReadmeProcedureError, match="one provider first"):
+        readme.run(
+            readme=repository / "README.md",
+            repository=repository,
+            work_dir=tmp_path / "work",
+            attempt=1,
+            cpu_arn=CPU_ARN,
+            gpu_arns=[GPU_ARN],
+            state_dir=tmp_path / "second",
+            admin_email=ADMIN_EMAIL,
+            receipt=receipt,
+            parent_environment={},
+            joined_arns=[EKS_GPU_ARN],
+        )
+    assert not (tmp_path / "work").exists() and not receipt.exists()
 
 
 def test_run_refuses_before_touching_anything_when_the_readme_is_defective(
