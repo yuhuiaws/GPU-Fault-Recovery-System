@@ -812,6 +812,15 @@ If any of the following items fails, the rolling upgrade must not start:
   `GPU_FAULT_LIFESPAN_SHUTDOWN_MAX_SECONDS + 20s`; the worker's
   lifespan budget must additionally cover
   `PROCESSOR_REQUEST_MAX_EXECUTION + PROCESSOR_EXIT_GRACE + 5s`.
+- The ingress rolls behind the NLB without interruption: `maxSurge: 1`, `maxUnavailable: 0` (a new Pod comes up
+  first and no old Pod leaves before a new one is Ready); the preStop `sleep 35` outlasts the NLB target group's
+  `deregistration_delay.timeout_seconds=30`, so an old Pod closes its listener only after the load balancer stopped
+  sending it new connections; the `gpu-fault-system` namespace carries
+  `elbv2.k8s.aws/pod-readiness-gate-inject: enabled`, so the AWS Load Balancer Controller injects a readiness gate into
+  the api-ha Pods and a Pod is not Ready before its NLB target is healthy -- the rollout never counts a Pod the load
+  balancer cannot reach yet (`terminationGracePeriodSeconds` is 140 accordingly). `rotate-token`'s
+  `CONTROL_PLANE_ROLLED` and every release's ingress roll rely on these settings; acceptance AUTH-016 samples claims
+  through the whole roll and requires every one to be 200.
 - `gpu-fault-control-worker-pdb` exists with
   `maxUnavailable: 1`; the ADOT PDB is `maxUnavailable: 1`. ADOT has only 1 replica,
   so `minAvailable` cannot be used here: `minAvailable: 1` can never be satisfied for 1 replica,

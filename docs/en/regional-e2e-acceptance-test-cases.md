@@ -5049,6 +5049,13 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
      through Deployment/ReplicaSet/Pod; write a private intent bound to this run's reference/target/release.
   2. Start real-consumer claim sampling every 2 seconds and call the public `rotate-token`. The three phases
      baseline, overlap and new-consumers must be observed; the probe switching tokens by itself is no substitute for the product taking effect.
+     Every sample records the rotation journal's started-but-unfinished step at that instant (`active_step`); when the
+     probe cannot reach the control plane the sample's `status` is None with
+     `transport_error`/`transport_failure_kind`/`latency_seconds`, the runner records it as a named entry of
+     `sampler_errors` (`claim transport error <type> (<kind>, <seconds>) during <step>`) and keeps sampling; a non-200
+     or a sample with commands likewise enters `claim_failures`. The api-ha roll during `CONTROL_PLANE_ROLLED` must be
+     zero-downtime (surge first, a preStop longer than the NLB deregistration delay, readiness gates -- see the
+     deployment manual); any claim that fails during the roll is a FAIL.
   3. Check the complete order in the native journal: the overlap window, the update of every data-plane Deployment, the full node
      wave, the roll of every CPU control-plane Deployment (api-ha, control-worker, telemetry-spool-worker) after the registry
      Secret rewrite, the revocation of the old slot and the quiescence acceptance all completed; rolling only the Executor is not
@@ -5057,8 +5064,11 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
      and the Watcher must have fresh post-revocation reports, and an independent request with the old token returns exactly 403.
   5. Check that the new token file matches the committed registry digest, the retiring slot has been removed, temporary credentials have been cleaned up,
      sibling registrations are unchanged and the sampling thread has stopped. **Keep the committed new credential; do not restore the original Secret.**
-- Verdict: the real-consumer samples of all three phases are all 200 with zero commands; the complete native transaction, activation of all consumers,
-  post-revocation freshness, the old token's 403 and the quiescence window all have evidence. The report contains only digests and references.
+- Verdict: the real-consumer samples of all three phases are all 200 with zero commands (`claim_failures` empty,
+  `sampler_errors` empty); the complete native transaction, activation of all consumers,
+  post-revocation freshness, the old token's 403 and the quiescence window all have evidence. The report contains only digests and references;
+  `auth016-details.json` also carries `step_timeline` (each step's start/completion time) so a failed sample can be
+  matched to the step active at that moment.
 - Failure recovery: keep the bound production rotation journal and intent; after the `TOKEN_FILE_WRITTEN` intent
   only native fail-forward is allowed. Do not hand-edit the Secret, delete the journal or reuse the old token to "clean up" on your own.
   Do not issue PASS when unreconciled or incompletely cleaned up, and do not treat the end of sampling as completion of the rotation.

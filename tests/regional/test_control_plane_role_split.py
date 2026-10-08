@@ -275,7 +275,17 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
         pod_spec = deployment["spec"]["template"]["spec"]
         assert pod_spec["enableServiceLinks"] is False
     ingress_pod_spec = ingress["spec"]["template"]["spec"]
-    assert ingress_pod_spec["terminationGracePeriodSeconds"] == 120
+    assert ingress_pod_spec["terminationGracePeriodSeconds"] == 140, (
+        "preStop 35 + graceful shutdown 60 + lifespan 20 + 20 s margin"
+    )
+    assert (
+        ingress_pod_spec["containers"][0]["lifecycle"]["preStop"]["exec"]["command"][-1]
+        == "sleep 35"
+    ), "the ingress drains past the NLB deregistration delay"
+    assert ingress["spec"]["strategy"]["rollingUpdate"] == {
+        "maxUnavailable": 0,
+        "maxSurge": 1,
+    }, "the ingress rolls surge-first"
     assert (
         ingress_pod_spec["containers"][0]["livenessProbe"]["httpGet"]["path"]
         == "/healthz"

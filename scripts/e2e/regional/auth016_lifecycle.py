@@ -378,6 +378,79 @@ def wait_consumer_snapshot(
         time.sleep(5)
 
 
+def active_rotation_step(state: dict[str, Any]) -> str | None:
+    """The rotation step started but not yet completed, for a sample's evidence."""
+
+    completed = set(state.get("steps") or {})
+    started = [
+        step for step in (state.get("started_steps") or {}) if step not in completed
+    ]
+    return started[-1] if started else None
+
+
+def step_timeline(state: dict[str, Any]) -> dict[str, dict[str, Any]]:
+    """Per step: when the rotation started and completed it (journal timestamps)."""
+
+    started = state.get("started_steps") or {}
+    steps = state.get("steps") or {}
+    return {
+        step: {
+            "started_at": started.get(step),
+            "completed_at": (steps.get(step) or {}).get("completed_at"),
+        }
+        for step in ROTATION_STEPS
+        if step in started or step in steps
+    }
+
+
+def claim_sample(
+    observed: dict[str, Any], *, phase: str, active_step: str | None
+) -> dict[str, Any]:
+    """One sampler row: the claim's status and the rotation step it met.
+
+    A probe that could not reach the control plane reports ``status`` None
+    together with ``transport_error``/``transport_failure_kind``/``latency``;
+    those fields are kept so the auditor sees the cause and the step active at
+    that instant, never a bare None.
+    """
+
+    sample: dict[str, Any] = {
+        "observed_at": datetime.now(timezone.utc).isoformat(),
+        "phase": phase,
+        "active_step": active_step,
+        "status": observed.get("status"),
+        "command_count": observed.get("command_count"),
+    }
+    if sample["status"] != 200 or sample["command_count"] != 0:
+        for key in (
+            "transport_error",
+            "transport_failure_kind",
+            "latency_seconds",
+            "detail",
+        ):
+            if observed.get(key) is not None:
+                sample[key] = observed[key]
+    return sample
+
+
+def claim_failure_error(sample: dict[str, Any]) -> str | None:
+    """The named sampler error a failed sample is, or None for a good one."""
+
+    status = sample.get("status")
+    if status == 200 and sample.get("command_count") == 0:
+        return None
+    during = sample.get("active_step") or sample.get("phase")
+    latency = sample.get("latency_seconds")
+    took = f", {float(latency):.1f}s" if isinstance(latency, (int, float)) else ""
+    if status is None:
+        return (
+            f"claim transport error {sample.get('transport_error') or 'unknown'} "
+            f"({sample.get('transport_failure_kind') or 'unclassified'}{took}) "
+            f"during {during}"
+        )
+    return f"claim returned {status} with command_count {sample.get('command_count')} during {during}"
+
+
 def finish_sampler(
     stop: threading.Event, thread: threading.Thread, result: dict[str, Any]
 ) -> None:
@@ -388,6 +461,9 @@ def finish_sampler(
     if thread.is_alive():
         errors.append("sampler supervision did not drain")
         result["cleanup_complete"] = False
+    result["claim_failures"] = [
+        item for item in samples if claim_failure_error(item) is not None
+    ]
     result.setdefault("checks", {})["consumer_claim_continuity"] = (
         not errors
         and bool(samples)
@@ -458,12 +534,7 @@ def run_rotation_acceptance(
     stop = threading.Event()
     baseline_sample = claim(site, target)
     samples: list[dict[str, Any]] = [
-        {
-            "observed_at": datetime.now(timezone.utc).isoformat(),
-            "phase": "baseline",
-            "status": baseline_sample.get("status"),
-            "command_count": baseline_sample.get("command_count"),
-        }
+        claim_sample(baseline_sample, phase="baseline", active_step=None)
     ]
     if (
         baseline_sample.get("status") != 200
@@ -484,6 +555,7 @@ def run_rotation_acceptance(
         while not stop.is_set():
             try:
                 state = load_rotation_state(state_path) or {}
+                own = state.get("reference") == reference
                 steps = state.get("steps") or {}
                 phase = (
                     (
@@ -493,18 +565,22 @@ def run_rotation_acceptance(
                         if STEP_OVERLAP_PUBLISHED in steps
                         else "baseline"
                     )
-                    if state.get("reference") == reference
+                    if own
                     else "baseline"
                 )
-                observed = claim(site, target)
-                samples.append(
-                    {
-                        "observed_at": datetime.now(timezone.utc).isoformat(),
-                        "phase": phase,
-                        "status": observed.get("status"),
-                        "command_count": observed.get("command_count"),
-                    }
+                observed = claim_sample(
+                    claim(site, target),
+                    phase=phase,
+                    active_step=active_rotation_step(state) if own else None,
                 )
+                samples.append(observed)
+                # A claim the probe could not complete is a measured failure
+                # (the probe ran), named with its cause and the step active at
+                # that instant; sampling goes on so the outage's extent is
+                # evidence too. The verdict stays fail-closed on any of them.
+                failure = claim_failure_error(observed)
+                if failure is not None and observed.get("status") is None:
+                    sampler_errors.append(failure)
             except Exception as exc:
                 sampler_errors.append(type(exc).__name__)
                 return
@@ -525,6 +601,7 @@ def run_rotation_acceptance(
         if errors:
             raise IdentityAcceptanceError("; ".join(errors))
         result["cleanup_complete"] = True
+        result["step_timeline"] = step_timeline(state)
         new_digest = state["new_token_sha256"]
         token_path = Path(state["token_file"])
         if (

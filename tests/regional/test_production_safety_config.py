@@ -186,9 +186,9 @@ def test_control_plane_roles_and_adot_have_disruption_protection() -> None:
         "limits": {"cpu": "8", "memory": "8Gi"},
     }
     assert ingress["spec"]["strategy"]["rollingUpdate"] == {
-        "maxUnavailable": 1,
+        "maxUnavailable": 0,
         "maxSurge": 1,
-    }
+    }, "the ingress rolls surge-first: no old Pod leaves before a new one is Ready"
     assert ingress_pdb["spec"]["minAvailable"] == 2, "ingress PDB lost quorum"
     assert ingress_pdb["spec"]["selector"]["matchLabels"] == {
         "app": "gpu-fault-api-ha"
@@ -1462,3 +1462,38 @@ def test_remote_execution_owners_cover_every_provider_reboot_owner() -> None:
     ):
         data = load(GENERATED / f"{name}.yaml")["data"]
         assert expected <= owners(data["GPU_FAULT_REMOTE_EXECUTION_OWNERS"]), name
+
+
+def test_ingress_roll_is_zero_downtime_behind_the_nlb() -> None:
+    """Live 2026-10-08: one consumer claim failed during rotate-token's api-ha
+    restart at the instant an old Pod ended its preStop while the NLB could
+    still route new flows to it. The ingress now drains longer than the NLB
+    deregistration delay, never takes an old Pod down before a new one is
+    Ready, and the namespace asks the load balancer controller for readiness
+    gates so Ready includes the NLB target's health."""
+    ingress = load(GENERATED / "gpu-fault-api-ha-ingress.yaml")
+    api = container(ingress)
+    pre_stop = re.fullmatch(
+        r"sleep (\d+)", api["lifecycle"]["preStop"]["exec"]["command"][-1]
+    )
+    assert pre_stop is not None, "the ingress preStop is a plain sleep"
+    nlb = (
+        ROOT / "deploy/control-plane/regional/regional-control-plane-nlb.yaml"
+    ).read_text(encoding="utf-8")
+    delay = re.search(r"deregistration_delay\.timeout_seconds=(\d+)", nlb)
+    assert delay is not None, "the NLB target group declares its deregistration delay"
+    assert int(pre_stop.group(1)) > int(delay.group(1)), (
+        "the preStop drain must outlast the NLB deregistration delay"
+    )
+    assert ingress["spec"]["strategy"]["rollingUpdate"]["maxUnavailable"] == 0
+    assert ingress["spec"]["strategy"]["rollingUpdate"]["maxSurge"] == 1
+    prerequisites = yaml.safe_load_all(
+        (
+            ROOT
+            / "deploy/control-plane/regional/regional-control-plane-prerequisites.yaml"
+        ).read_text(encoding="utf-8")
+    )
+    namespace = next(item for item in prerequisites if item["kind"] == "Namespace")
+    assert namespace["metadata"]["labels"][
+        "elbv2.k8s.aws/pod-readiness-gate-inject"
+    ] == ("enabled"), "the control-plane namespace opts into NLB target readiness gates"

@@ -16,10 +16,10 @@ spec:
     matchLabels:
       app: gpu-fault-api-ha
   strategy:
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 1
     type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
   template:
     metadata:
       annotations:
@@ -208,7 +208,7 @@ spec:
               command:
               - /bin/sh
               - -c
-              - sleep 20
+              - sleep 35
         livenessProbe:
           failureThreshold: 2
           httpGet:
@@ -277,7 +277,7 @@ spec:
             name: gpu-fault-api-ha-config-telemetry
       enableServiceLinks: false
       serviceAccountName: gpu-fault-control-plane
-      terminationGracePeriodSeconds: 120
+      terminationGracePeriodSeconds: 140
       tolerations:
       - effect: NoSchedule
         key: gpu-fault.io/quarantined

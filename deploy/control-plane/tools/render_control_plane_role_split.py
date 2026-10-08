@@ -74,6 +74,17 @@ DEFAULT_ADMIN_CONFIG = default_admin_config()
 # ``replicas x UVICORN_WORKERS_PER_POD`` and the verifier fails the deploy
 # if a tier's command says otherwise.
 UVICORN_WORKERS_PER_POD = 4
+# The ingress tier rolls behind the NLB (IP targets): a Pod must keep serving
+# until the load balancer has stopped sending it new flows, and no old Pod may
+# leave before a new one is Ready. The preStop drain outlasts the target
+# group's deregistration delay (deploy/control-plane/regional/
+# regional-control-plane-nlb.yaml: deregistration_delay.timeout_seconds=30)
+# plus the controller's reconcile; the termination budget is preStop +
+# uvicorn graceful shutdown (60) + lifespan shutdown (20) + 20 s margin.
+# Live 2026-10-08: one consumer claim failed during rotate-token's api-ha
+# restart at the instant an old Pod ended its 20 s preStop.
+INGRESS_PRESTOP_SECONDS = 35
+INGRESS_TERMINATION_GRACE_SECONDS = 140
 SPOOL_UVICORN_WORKERS_PER_POD = 1
 
 
@@ -406,6 +417,33 @@ def consumer_copy(source: dict, role: str) -> dict:
     annotations["gpu-fault.io/cleanup-phase"] = "consumer"
     annotations["gpu-fault.io/cleanup-order"] = str(order)
     return resource
+
+
+def harden_ingress_rollout(
+    deployment: dict[str, Any], pod_spec: dict[str, Any], ingress: dict[str, Any]
+) -> dict[str, Any]:
+    """The ingress Deployment's zero-downtime roll behind the NLB.
+
+    Surge first: with ``maxUnavailable`` 0 the rollout never takes an old Pod
+    down before a new one is Ready -- and Ready includes the NLB target's
+    health once the namespace carries the readiness-gate label
+    (regional-control-plane-prerequisites.yaml). The preStop drain outlasts the
+    NLB deregistration delay so a Pod closes its listener only after the load
+    balancer stopped sending it new connections; the termination budget covers
+    preStop + graceful shutdown + lifespan + margin.
+    """
+
+    ingress["lifecycle"] = {
+        "preStop": {
+            "exec": {"command": ["/bin/sh", "-c", f"sleep {INGRESS_PRESTOP_SECONDS}"]}
+        }
+    }
+    pod_spec["terminationGracePeriodSeconds"] = INGRESS_TERMINATION_GRACE_SECONDS
+    deployment["spec"]["strategy"] = {
+        "type": "RollingUpdate",
+        "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1},
+    }
+    return ingress
 
 
 def pod_disruption_budget(
@@ -961,7 +999,7 @@ def main() -> None:
     # node restarts.
     pod_spec.setdefault("securityContext", {}).pop("sysctls", None)
 
-    pod_spec["containers"] = [ingress]
+    pod_spec["containers"] = [harden_ingress_rollout(deployment, pod_spec, ingress)]
     ingress_pdb = pod_disruption_budget(
         "gpu-fault-api-ha-pdb",
         deployment["metadata"].get("namespace", "gpu-fault-system"),

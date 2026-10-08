@@ -110,3 +110,87 @@ def test_reusing_a_case_intent_does_not_start_another_rotation(monkeypatch, tmp_
     ):
         auth.run_auth016(world.site, world.target, case_dir=tmp_path)
     assert world.events == before
+
+
+def test_claim_transport_failures_are_named_errors_with_the_active_step(
+    monkeypatch, tmp_path
+):
+    """Live 2026-10-08: one claim came back with status None during the
+    control-plane roll and the sampler kept only the None. The probe's cause
+    (transport error, kind, latency) and the rotation step active at that
+    instant are now the evidence, the failure is a named sampler error, and
+    the verdict stays fail-closed."""
+    world = RotationWorld(tmp_path, monkeypatch)
+    original_claim = world.claim
+    original_load = lifecycle.load_rotation_state
+
+    def failing_claim(*args):
+        if world.phase == "new-consumers":
+            return {
+                "status": None,
+                "transport_error": "URLError",
+                "transport_failure_kind": "network",
+                "latency_seconds": 3.25,
+            }
+        return original_claim(*args)
+
+    rolling_reads: list[str] = []
+
+    def rolling_state(path):
+        # Only the sampler's read inside the new-consumers tick sees the
+        # control-plane roll in progress; the runner's own journal read after
+        # the rotation sees the completed journal.
+        state = original_load(path)
+        if state and world.phase == "new-consumers" and not rolling_reads:
+            rolling_reads.append("sampler")
+            state = copy.deepcopy(state)
+            rolled = state["steps"].pop(lifecycle.STEP_CONTROL_PLANE_ROLLED)
+            state["started_steps"] = {
+                lifecycle.STEP_CONTROL_PLANE_ROLLED: rolled["completed_at"]
+            }
+        return state
+
+    monkeypatch.setattr(lifecycle, "claim", failing_claim)
+    monkeypatch.setattr(lifecycle, "load_rotation_state", rolling_state)
+
+    result = auth.run_auth016(world.site, world.target, case_dir=tmp_path)
+
+    assert result["verdict"] == "FAIL", result["checks"]
+    assert result["checks"]["consumer_claim_continuity"] is False
+    assert result["sampler_errors"] == [
+        "claim transport error URLError (network, 3.2s) during CONTROL_PLANE_ROLLED"
+    ], result["sampler_errors"]
+    (failed,) = result["claim_failures"]
+    assert failed["phase"] == "new-consumers" and failed["status"] is None, failed
+    assert failed["active_step"] == lifecycle.STEP_CONTROL_PLANE_ROLLED, failed
+    assert failed["transport_error"] == "URLError", failed
+    assert failed["transport_failure_kind"] == "network", failed
+    assert failed["latency_seconds"] == 3.25, failed
+    good = [item for item in result["samples"] if item["status"] == 200]
+    assert good and all("transport_error" not in item for item in good), (
+        "healthy samples carry no transport fields"
+    )
+    assert all("active_step" in item for item in result["samples"]), (
+        "every sample names the rotation step it met (None outside the rotation)"
+    )
+    assert set(result["step_timeline"]) == set(lifecycle.ROTATION_STEPS), (
+        "the details carry the rotation's step timeline for correlation"
+    )
+
+
+def test_a_non_200_claim_is_a_named_failure_but_not_a_transport_error(
+    monkeypatch, tmp_path
+):
+    world = RotationWorld(tmp_path, monkeypatch, defect="overlap")
+
+    result = auth.run_auth016(world.site, world.target, case_dir=tmp_path)
+
+    assert result["verdict"] == "FAIL"
+    assert result["sampler_errors"] == [], (
+        "an HTTP status is a measured answer, not a sampler transport error"
+    )
+    (failed,) = result["claim_failures"]
+    assert failed["status"] == 403 and failed["phase"] == "overlap", failed
+    assert lifecycle.claim_failure_error(failed) == (
+        "claim returned 403 with command_count 0 during overlap"
+    )
