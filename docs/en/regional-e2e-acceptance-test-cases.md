@@ -3714,7 +3714,12 @@ When the corresponding lifecycle was not performed the companion stays `NOT_RUN`
    several GPU clusters the remaining clusters do not appear in the evidence -- and `config_sha256` is the digest of
    the full materialized release config handed to the cleanup tool, recomputed from the same document by the
    command before it accepts the evidence and reuses it on a resume instead of cleaning up again)
-   and `site.before.yaml`.
+   and `site.before.yaml`; after `COMPLETED`, `evidence.KUBECONFIG_PRUNED` records that the cluster's context entries
+   in the site `gpu.kubeconfig` (both alias schemes: the first deploy's `gpu-fault-gpu-<n>-<eks>` and a join's
+   `gpu-fault-gpu-<eks>-<sha8>`), its cluster entry and its user entry were pruned (entries a remaining cluster still
+   references are kept; the CPU kubeconfig is untouched), with the file's sha256 before and after and the names removed;
+   `current-context` never dangles at a deleted context. Once pruned, a rerun returns the recorded result without
+   reading the cluster again.
    This original journal keeps the RBAC proof for each GPU context and the confirmed deletion progress.
    When `APPLICATION_OBJECTS_DELETED` begins it first confirms drain, Executor and the other required stop stages,
    then deletes the RoleBindings and Roles, and only last cleans up their SA/Deployment/namespace ownership anchors;
@@ -3815,7 +3820,13 @@ node names appear only as sha256 digests; per-step durations are not recorded.
 
 1. `BOOT-024` PASS: site `spec.clusters: []`, registry `[]`, no product
    namespace on the GPU cluster, node annotations empty; the store still holds the agent rows of that cluster's nodes (leases expired) --
-   this is exactly the state the wave safety gate must face; do not clean it up by hand.
+   this is exactly the state the wave safety gate must face; do not clean it up by hand. The site kubeconfig no longer
+   holds the cluster's context (`BOOT-024`'s `KUBECONFIG_PRUNED`). Should a same-named alias remain from a removal by an
+   older version (join → remove → join derives the identical `gpu-fault-gpu-<eks>-<sha8>`), the join takes it over only
+   when the alias's cluster entry has the server/CA of `eks describe-cluster` and the site has released the cluster
+   (`remove-cluster` journal `COMPLETED`, or no registration in the registry), recording
+   `LOCAL_INPUTS_STARTED.kubeconfig_alias_replaced` (endpoint, CA sha256, release proof); otherwise it still enters
+   `BLOCKED_IDENTITY` with `GPU join refuses an existing kubeconfig alias`.
 2. Site `spec.autoRollback` is true (the default).
 3. Read-only record: `VpcConfig.Subnets` from `aws sagemaker describe-cluster` and every
    `InstanceGroups[].OverrideVpcConfig.Subnets`, `resourcesVpcConfig.subnetIds` from `aws eks describe-cluster`,
@@ -3939,7 +3950,8 @@ sha256 digests; per-step durations are not recorded.
 1. Remove once more with exactly the same command as `BOOT-024`. Verify: the state directory gains
    `state.completed-<stamp>.json`, whose content equals the terminal record of `BOOT-024`; the new `state.json`
    walks all audited steps of BOOT-024 again from `STARTED` to `COMPLETED` and must not return the old record directly;
-   the GPU-side and CPU-side checks of `BOOT-024` steps 4 and 5 all hold again.
+   the GPU-side and CPU-side checks of `BOOT-024` steps 4 and 5 all hold again; `KUBECONFIG_PRUNED` prunes the
+   cluster's kubeconfig entries again and the site kubeconfig holds none of its contexts.
 2. Re-attach through the `deploy` entry point:
 
    ```bash
@@ -3953,7 +3965,9 @@ sha256 digests; per-step durations are not recorded.
    - in the join state directory the `COMPLETED` record of `BOOT-025` is archived as
      `state.attempt-NNN.json`, the new record increments `attempt` and rediscovers from `STARTED`; it is neither
      judged `ALREADY_MANAGED` nor refused by
-     `join-cluster source site non-membership fields drifted`;
+     `join-cluster source site non-membership fields drifted`; the re-join writes the same context alias as the previous
+     round (`gpu-fault-gpu-<eks>-<sha8>`) without tripping the alias refusal, because the previous removal pruned it,
+     and `LOCAL_INPUTS_STARTED` has no `kubeconfig_alias_replaced`;
    - the batch result printed by the command has `phase=COMPLETED`, `joined` contains the cluster, `already_managed`
      is empty;
    - the "during attach" and "post-attach" checks of `BOOT-025` steps 3 and 4 hold item by item, including the necessary

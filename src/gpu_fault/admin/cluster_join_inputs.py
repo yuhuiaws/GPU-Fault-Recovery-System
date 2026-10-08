@@ -12,6 +12,10 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
 )
 from gpu_fault.admin.cluster_join_state import complete_step, step_done
+from gpu_fault.admin.cluster_kubeconfig import (
+    KubeconfigAliasRefused,
+    reclaim_released_alias,
+)
 from gpu_fault.admin.site import RenderedSite, effective_environment
 from gpu_fault.admin.cluster_join_context import clear_stale_installer_annotations
 
@@ -53,6 +57,7 @@ def prepare_local_inputs(
             raise join.JoinTargetIdentityError(
                 "existing cluster token has no matching join ownership"
             )
+    alias_replaced: dict[str, Any] | None = None
     if not step_done(state, "LOCAL_INPUTS_STARTED") and gpu_kubeconfig.is_file():
         contexts = runner.run(
             [
@@ -66,9 +71,22 @@ def prepare_local_inputs(
             ]
         )
         if target.context in contexts.splitlines():
-            raise join.JoinTargetIdentityError(
-                "GPU join refuses an existing kubeconfig alias"
-            )
+            # A cluster joined, removed and joined again derives the identical
+            # alias. The alias is taken over only when it provably names this
+            # EKS cluster (endpoint and CA) and the site has released the
+            # cluster; anything else is still the fail-closed refusal.
+            try:
+                alias_replaced = reclaim_released_alias(
+                    runner,
+                    site=request.site,
+                    target=target,
+                    cluster_id=cluster_id,
+                    kubeconfig=gpu_kubeconfig,
+                )
+            except KubeconfigAliasRefused as exc:
+                raise join.JoinTargetIdentityError(
+                    f"GPU join refuses an existing kubeconfig alias: {exc}"
+                ) from exc
     local = dict(
         (state.get("evidence") or {}).get("LOCAL_INPUTS_STARTED")
         or {
@@ -79,6 +97,8 @@ def prepare_local_inputs(
             "nodes": [],
         }
     )
+    if alias_replaced is not None:
+        local["kubeconfig_alias_replaced"] = alias_replaced
     complete_step(state_path, state, "LOCAL_INPUTS_STARTED", local)
     gpu_kubeconfig.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with join._KUBECONFIG_THREAD_LOCK:

@@ -276,3 +276,92 @@ def test_join_keeps_the_primary_cluster_as_the_kubeconfig_current_context(local)
     assert (
         commands[restore[0]][commands[restore[0]].index("use-context") + 1] == "gpu-a"
     ), "the first managed cluster's context stays current"
+
+
+def _alias_kubeconfig(scenario, *, server: str, authority: str) -> None:
+    """gpu.kubeconfig already holding the join's alias of the target cluster."""
+
+    import base64
+
+    import yaml
+
+    arn = target().eks_arn
+    scenario.gpu_kubeconfig.parent.mkdir(parents=True, exist_ok=True)
+    scenario.gpu_kubeconfig.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "current-context": "gpu-a",
+                "contexts": [
+                    {"name": target().context, "context": {"cluster": arn, "user": arn}}
+                ],
+                "clusters": [
+                    {
+                        "name": arn,
+                        "cluster": {
+                            "server": server,
+                            "certificate-authority-data": base64.b64encode(
+                                authority.encode()
+                            ).decode(),
+                        },
+                    }
+                ],
+                "users": [{"name": arn, "user": {}}],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    scenario.gpu_kubeconfig.chmod(0o600)
+    scenario.contexts.add(target().context)
+
+
+def test_join_inputs_reclaim_a_released_alias_of_the_same_cluster(local):
+    """Joined, removed, joined again: the identical alias is taken over when it
+    proves the same endpoint and CA and the control plane holds no registration
+    (the removal released the cluster), and the take-over is recorded."""
+    scenario, _request, _directory, _path, state = local
+    _alias_kubeconfig(
+        scenario, server="https://gpu-b.example.invalid", authority="ca-gpu-b"
+    )
+
+    prepare(local)
+
+    assert "LOCAL_INPUTS_READY" in state["completed_steps"], state["phase"]
+    replaced = state["evidence"]["LOCAL_INPUTS_STARTED"]["kubeconfig_alias_replaced"]
+    assert replaced["context"] == target().context, replaced
+    assert replaced["cluster_entry"] == target().eks_arn, replaced
+    assert replaced["endpoint"] == "https://gpu-b.example.invalid", replaced
+    assert replaced["released_by"] == {"registry": "absent"}, replaced
+    assert "ca-gpu-b" not in str(replaced), "the CA appears as a digest only"
+    assert any("update-kubeconfig" in argv for argv, _ in scenario.commands), (
+        "the alias is rewritten by update-kubeconfig after the proof"
+    )
+    assert "eks/describe-cluster" in scenario.events, "the proof read the live cluster"
+
+
+@pytest.mark.parametrize("shape", ["other-endpoint", "other-ca", "registered"])
+def test_join_inputs_still_refuse_an_alias_without_proof_or_release(local, shape):
+    scenario, _request, _directory, _path, state = local
+    _alias_kubeconfig(
+        scenario,
+        server=(
+            "https://other.example.invalid"
+            if shape == "other-endpoint"
+            else "https://gpu-b.example.invalid"
+        ),
+        authority="ca-other" if shape == "other-ca" else "ca-gpu-b",
+    )
+    if shape == "registered":
+        scenario.cluster_states["hp-gpu-b"] = "ACTIVE"
+    before = scenario.gpu_kubeconfig.read_bytes()
+
+    with pytest.raises(join.JoinTargetIdentityError, match="existing kubeconfig alias"):
+        prepare(local)
+
+    assert scenario.gpu_kubeconfig.read_bytes() == before, "nothing is rewritten"
+    assert not any("update-kubeconfig" in argv for argv, _ in scenario.commands), (
+        "a refused alias is never overwritten"
+    )
+    assert "LOCAL_INPUTS_STARTED" not in state["completed_steps"], state

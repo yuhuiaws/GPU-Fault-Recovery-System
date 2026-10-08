@@ -947,6 +947,12 @@ association into the Aurora registry. After a failed join is rolled back automat
 (`<arn-hash>` is the first 12 characters of the sha256 of the ARN as given, see below)
 is `ROLLED_BACK`, and the `failure` field records the reason (`error`) and the last completed step
 (`after_step`); after the fix, rerunning with the same parameters starts a new attempt.
+When `gpu.kubeconfig` already holds a context alias of the same name (the same cluster joined → removed → joined again
+derives the identical `gpu-fault-gpu-<eks>-<sha8>`, or a removal by an older version left it behind), the join takes
+the alias over only when its cluster entry has the server/CA of `eks describe-cluster` and the site has released the
+cluster (`remove-cluster/<cluster-id>/state.json` is `COMPLETED`, or the registry holds no registration of it),
+recording the endpoint, the CA sha256 and the release proof under `LOCAL_INPUTS_STARTED.kubeconfig_alias_replaced`;
+every other case still enters `BLOCKED_IDENTITY` with `GPU join refuses an existing kubeconfig alias`, nothing is guessed.
 
 ### 5.0 Two GPU cluster forms: `hyperpod` and `eks-managed`
 
@@ -1431,6 +1437,12 @@ pulled into the deletion scope for carrying the same label; unknown ownership mu
 After the Agent/Executor stop, namespace deletion is requested and its disappearance confirmed, and only then are CPU registry/key
 cleanup and IAM/network dependency-wave cleanup run in parallel. Finally the target's absence, the registry, EKS/HyperPod preservation and the remaining
 site's health are verified in parallel. The CPU control plane, the other GPU clusters and the target GPU EKS/HyperPod are all kept.
+After `COMPLETED` the cluster's entries are pruned from the site `gpu.kubeconfig` (`spec.gpuKubeconfig`): all of its
+contexts (the first deploy's `gpu-fault-gpu-<n>-<eks>` alias and a join's `gpu-fault-gpu-<eks>-<sha8>` alias) and the
+cluster/user entries no other context references; entries a remaining cluster still uses are kept, `current-context`
+moves to a remaining cluster or is cleared, and the CPU kubeconfig is untouched. The journal's
+`evidence.KUBECONFIG_PRUNED` records the file's sha256 before and after and the names removed; the result carries
+`gpu_kubeconfig_entries_pruned`.
 Components in the namespace may still use IAM, network or keys while terminating, so the namespace's absence must be confirmed first,
 and these dependencies must not be revoked early to reduce waiting.
 Namespace deletion carries the original UID as a precondition; a same-named rebuild during deletion, a read failure or an invalid response all stop.
@@ -1458,7 +1470,9 @@ State and evidence live in
 `remove-cluster/<cluster-id>/` next to `site.yaml` (cluster-id is the internal id the site records for that ARN), with each attempt
 using a separate evidence directory. After a partial site commit, still rerun with the original full ARN and confirmation parameter; an old v1 journal lacking
 the bindings currently required by v2 needs explicit reconciliation, without deleting the directory. When a removed cluster is later re-joined, a new attempt must be created;
-the old `COMPLETED` cannot be reused to skip cleanup; merely rerunning an old completed record also refuses a new namespace or node identity drift.
+the old `COMPLETED` cannot be reused to skip cleanup; merely rerunning an old completed record re-verifies and refuses a new namespace or node identity drift
+while the site still holds the cluster's kubeconfig entries, and returns the recorded result once `KUBECONFIG_PRUNED`
+is recorded (the site has no credential path left to read the cluster).
 
 #### 5.0.1 Plain EKS node prerequisites: AL2023 launch template user data
 

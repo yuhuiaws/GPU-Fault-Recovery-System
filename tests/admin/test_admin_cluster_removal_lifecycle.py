@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 from pathlib import Path
 
@@ -907,3 +908,114 @@ def test_cleanup_config_digest_is_the_materialized_release_config(
     assert cleanup_config_sha256(site) == with_record, (
         "a site with an installation record verifies its evidence too"
     )
+
+
+def _site_with_gpu_kubeconfig(scenario, tmp_path: Path) -> Path:
+    """The scenario site configuring its own GPU kubeconfig, which holds the
+    target's two aliases (first-deploy scheme and join scheme), an unrelated
+    operator context and the target as current-context."""
+
+    eks_arn = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"
+    other = "arn:aws:eks:us-east-1:123456789012:cluster/elsewhere"
+    kubeconfig = tmp_path / "secure/gpu.kubeconfig"
+    kubeconfig.write_text(
+        yaml.safe_dump(
+            {
+                "apiVersion": "v1",
+                "kind": "Config",
+                "current-context": "gpu-a",
+                "contexts": [
+                    {"name": "gpu-a", "context": {"cluster": eks_arn, "user": eks_arn}},
+                    {
+                        "name": "gpu-fault-gpu-1-gpu-a",
+                        "context": {"cluster": eks_arn, "user": eks_arn},
+                    },
+                    {"name": "elsewhere", "context": {"cluster": other, "user": other}},
+                ],
+                "clusters": [
+                    {
+                        "name": eks_arn,
+                        "cluster": {"server": "https://a.example.invalid"},
+                    },
+                    {"name": other, "cluster": {"server": "https://x.example.invalid"}},
+                ],
+                "users": [{"name": eks_arn, "user": {}}, {"name": other, "user": {}}],
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    kubeconfig.chmod(0o600)
+    document = yaml.safe_load(scenario.path.read_text(encoding="utf-8"))
+    document["spec"]["gpuKubeconfig"] = str(kubeconfig)
+    scenario.path.write_text(
+        yaml.safe_dump(document, sort_keys=False), encoding="utf-8"
+    )
+    return kubeconfig
+
+
+def test_completed_removal_prunes_only_the_removed_clusters_kubeconfig_entries(
+    scenario, tmp_path
+) -> None:
+    """Live 2026-10-08: remove-cluster left the removed cluster's contexts in
+    gpu.kubeconfig, so the cluster's later re-join met its own stale alias. The
+    removal now prunes both alias schemes of the cluster, the cluster and user
+    entries nothing else references, moves current-context off them, records
+    the names and digests in the journal, and leaves foreign entries alone."""
+    kubeconfig = _site_with_gpu_kubeconfig(scenario, tmp_path)
+    before = hashlib.sha256(kubeconfig.read_bytes()).hexdigest()
+
+    result = remove_cluster(scenario.request())
+
+    assert result["phase"] == "COMPLETED", result
+    assert result["gpu_kubeconfig_entries_pruned"] == [
+        "gpu-a",
+        "gpu-fault-gpu-1-gpu-a",
+    ], result
+    document = yaml.safe_load(kubeconfig.read_text(encoding="utf-8"))
+    assert [item["name"] for item in document["contexts"]] == ["elsewhere"], (
+        "the operator's unrelated context is untouched"
+    )
+    assert [item["name"] for item in document["clusters"]] == [
+        "arn:aws:eks:us-east-1:123456789012:cluster/elsewhere"
+    ], "the removed cluster's cluster entry is gone, the other one stays"
+    assert [item["name"] for item in document["users"]] == [
+        "arn:aws:eks:us-east-1:123456789012:cluster/elsewhere"
+    ], document
+    assert "current-context" not in document, (
+        "no remaining site cluster: current-context is dropped, never dangling"
+    )
+    evidence = scenario.state()["evidence"]["KUBECONFIG_PRUNED"]
+    assert evidence["released"] is True, evidence
+    assert evidence["contexts"] == ["gpu-a", "gpu-fault-gpu-1-gpu-a"], evidence
+    assert evidence["before_sha256"] == before, evidence
+    assert (
+        evidence["after_sha256"] == hashlib.sha256(kubeconfig.read_bytes()).hexdigest()
+    )
+    assert evidence["gpu_kubeconfig"] == str(kubeconfig), evidence
+    cpu = Path(load_site(scenario.path).release_config["cpu_kubeconfig"])
+    assert cpu.read_text(encoding="utf-8") == "kubeconfig", (
+        "the CPU kubeconfig is untouched"
+    )
+
+    calls = list(scenario.calls)
+    again = remove_cluster(scenario.request())
+
+    assert again["phase"] == "COMPLETED", again
+    assert again["gpu_kubeconfig_entries_pruned"] == ["gpu-a", "gpu-fault-gpu-1-gpu-a"]
+    assert scenario.calls == calls, (
+        "with its kubeconfig entries released the rerun reads nothing of the cluster"
+    )
+
+
+def test_removal_without_a_site_gpu_kubeconfig_prunes_nothing_and_still_reverifies(
+    scenario,
+) -> None:
+    remove_cluster(scenario.request())
+
+    evidence = scenario.state()["evidence"]["KUBECONFIG_PRUNED"]
+    assert evidence["released"] is False, evidence
+    assert "no GPU kubeconfig" in evidence["reason"], evidence
+    scenario.namespace_uid = "recreated"
+    with pytest.raises(BootstrapError, match="recreated"):
+        remove_cluster(scenario.request())

@@ -23,6 +23,10 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
 )
 from gpu_fault.admin.cluster_join_evidence import membership_runtime_snapshot
+from gpu_fault.admin.cluster_kubeconfig import (
+    kubeconfig_released,
+    prune_result,
+)
 from gpu_fault.admin.cluster_removal_keys import (
     validate_key_binding,
     verify_node_key_ownership,
@@ -1319,6 +1323,11 @@ def _execute_removal(
             raise BootstrapError(
                 "requested GPU ARN conflicts with the removal identity"
             )
+    if state["phase"] == "COMPLETED" and kubeconfig_released(state):
+        # No kubeconfig entry of the cluster is left to read it with again.
+        return _removal_result(
+            request.site, request.cluster_id, state_path, state, remaining
+        ) | prune_result(request.site, target, remaining, state_path, state)
     _validate_token_ownership(request.site, target, remaining)
     active_runner = runner or CommandRunner()
     snapshot, discovery = _discover_removal(
@@ -1337,7 +1346,7 @@ def _execute_removal(
     if state["phase"] == "COMPLETED":
         return _removal_result(
             request.site, request.cluster_id, state_path, state, remaining
-        )
+        ) | prune_result(request.site, target, remaining, state_path, state)
     _quiesce_and_remove_gpu(request, target, nodes, state_dir, state_path, state)
 
     if not _done(state, "CONTROL_REGISTRY_REMOVED"):
@@ -1475,7 +1484,7 @@ def _execute_removal(
     ensure_supervision_safe()
     return _removal_result(
         request.site, request.cluster_id, state_path, state, remaining
-    )
+    ) | prune_result(request.site, target, remaining, state_path, state)
 
 
 # Historical private names, kept for callers that bound to them.

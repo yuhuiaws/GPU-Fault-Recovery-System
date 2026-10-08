@@ -279,6 +279,9 @@ class JoinScenario(CommandRunner):
                     "status": "ACTIVE",
                     "createdAt": "2026-01-01T00:00:00Z",
                     "endpoint": f"https://{name}.example.invalid",
+                    "certificateAuthority": {
+                        "data": base64.b64encode(f"ca-{name}".encode()).decode()
+                    },
                     "resourcesVpcConfig": {"vpcId": "vpc-" + name},
                 }
             }
