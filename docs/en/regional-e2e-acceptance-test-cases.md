@@ -3709,7 +3709,11 @@ When the corresponding lifecycle was not performed the companion stays `NOT_RUN`
    registry, key, IAM and network dependencies are withdrawn;
    the terminal `phase` is `COMPLETED`; `step_completed_at` has one entry per step; the same directory contains
    `installation-resources-before.json`, `installation-resources-after.json`,
-   `kubernetes-cleanup-NNN.json` (`phase=CLEANUP_COMPLETED`, `status=COMPLETED`)
+   `kubernetes-cleanup-NNN.json` (`phase=CLEANUP_COMPLETED`, `status=COMPLETED`; the cleanup runs with
+   `--scope gpu --cluster-id`, so its `targets.clusters` holds the deregistered cluster alone -- on a site with
+   several GPU clusters the remaining clusters do not appear in the evidence -- and `config_sha256` is the digest of
+   the full materialized release config handed to the cleanup tool, recomputed from the same document by the
+   command before it accepts the evidence and reuses it on a resume instead of cleaning up again)
    and `site.before.yaml`.
    This original journal keeps the RBAC proof for each GPU context and the confirmed deletion progress.
    When `APPLICATION_OBJECTS_DELETED` begins it first confirms drain, Executor and the other required stop stages,

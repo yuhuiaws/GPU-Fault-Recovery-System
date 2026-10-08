@@ -52,6 +52,7 @@ from gpu_fault.admin.cluster_removal_resources import (
 from gpu_fault.admin.cluster_removal_state import (
     allowed_registry_lifecycles,
     canonical_digest,
+    cleanup_config_sha256,
     load_removal_state,
     removal_command_ownership,
     removal_result as _removal_result,
@@ -590,27 +591,31 @@ def _cleanup_completed(
     digest = canonical_digest(
         {key: value for key, value in document.items() if key != "content_sha256"}
     )
-    expected_targets = {
-        "namespace": site.release_config["namespace"],
-        "cpu_kubeconfig": site.release_config["cpu_kubeconfig"],
-        "clusters": [
-            {"cluster_id": item["cluster_id"], "context": item["context"]}
-            for item in site.release_config["clusters"]
-        ],
+    # ``--scope gpu --cluster-id <target>``: the tool's targets are the removed
+    # cluster alone; the remaining clusters of a two-cluster site are not its
+    # targets, and expecting them refused correctly scoped evidence (live
+    # 2026-10-08, the first removal from a HyperPod + eks-managed site).
+    expected = {
+        "schema_version": 2,
+        "content_sha256": digest,
+        "config_sha256": cleanup_config_sha256(site),
+        "targets": {
+            "namespace": site.release_config["namespace"],
+            "cpu_kubeconfig": site.release_config["cpu_kubeconfig"],
+            "clusters": [
+                {"cluster_id": target["cluster_id"], "context": target["context"]}
+            ],
+        },
+        "scope": "gpu",
+        "mode": "clean",
+        "node_mode": "uninstall",
     }
-    expected_config = hashlib.sha256(
-        json.dumps(site.release_config, indent=2, sort_keys=True).encode()
-    ).hexdigest()
-    if (
-        document.get("schema_version") != 2
-        or document.get("content_sha256") != digest
-        or document.get("config_sha256") != expected_config
-        or document.get("targets") != expected_targets
-        or document.get("scope") != "gpu"
-        or document.get("mode") != "clean"
-        or document.get("node_mode") != "uninstall"
-    ):
-        raise BootstrapError("GPU cleanup evidence conflicts with the removal attempt")
+    differing = [key for key, value in expected.items() if document.get(key) != value]
+    if differing:
+        raise BootstrapError(
+            "GPU cleanup evidence conflicts with the removal attempt "
+            f"({', '.join(differing)})"
+        )
     if (
         document.get("phase") != "CLEANUP_COMPLETED"
         or document.get("status") != "COMPLETED"

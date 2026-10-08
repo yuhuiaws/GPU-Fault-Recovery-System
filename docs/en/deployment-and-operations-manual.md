@@ -5306,6 +5306,11 @@ namespace to disappear and verifies in parallel the target's absence, the regist
 join and remove share the same site transaction lock. When disassociating Route53 it first waits for ChangeInfo to reach `INSYNC`, then
 confirms the VPC association has disappeared from the hosted zone; it must not disassociate while remaining clusters still reference the same VPC.
 The control plane, the other GPU clusters and the target GPU EKS/HyperPod are all kept.
+The GPU-side Kubernetes cleanup runs with `--scope gpu --cluster-id <cluster_id>`: in its evidence
+`remove-cluster/<cluster_id>/attempts/<attempt>/kubernetes-cleanup-NNN.json`, `targets.clusters` holds the removed
+cluster alone (the remaining clusters are not cleanup targets) and `config_sha256` is the digest of the full
+materialized release config handed to the tool; the command accepts only completed evidence whose digest it recomputes
+from the same document, and a resume reuses that evidence instead of cleaning up again.
 
 Deleting the last registry entry is allowed; regional mode uses the explicit empty list `[]` and the CPU control plane keeps running.
 The Runtime Profile registration anchor is not required to belong to the current GPU set. Removal acceptance includes at least:

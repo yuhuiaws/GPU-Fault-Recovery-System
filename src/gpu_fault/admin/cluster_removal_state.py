@@ -17,6 +17,7 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.cluster_scope import is_eks_managed
 from gpu_fault.admin.bootstrap_common import BootstrapError, safe_name
+from gpu_fault import installation_lifecycle
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost
 from gpu_fault.admin.site import IDENTIFIER_PATTERN, RenderedSite
 
@@ -71,6 +72,32 @@ def allowed_registry_lifecycles(state: dict[str, Any]) -> set[str | None]:
 def canonical_digest(value: object) -> str:
     return hashlib.sha256(
         json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
+def cleanup_config_sha256(site: RenderedSite) -> str:
+    """The digest the GPU cleanup tool records for the config it is handed.
+
+    ``cluster_removal._run_kubernetes_cleanup`` hands ``prepare-clean-redeploy.sh``
+    the materialized release config -- ``site.release_config`` plus the
+    installation lifecycle inputs, exactly the text
+    ``site.materialized_release_config`` writes -- and the tool digests that
+    text (``cleanup_state.initialize_state``). The evidence check recomputes
+    the digest from the same document, so the evidence of a site whose
+    materialized config carries ``installation_id``/``registry_site_id``
+    verifies as well as one without an installation record.
+    """
+
+    try:
+        lifecycle = installation_lifecycle.release_lifecycle_inputs(
+            site.source, site.release_config
+        )
+    except installation_lifecycle.InstallationLifecycleError as exc:
+        raise BootstrapError(str(exc)) from exc
+    return hashlib.sha256(
+        json.dumps(
+            {**site.release_config, **lifecycle}, indent=2, sort_keys=True
+        ).encode()
     ).hexdigest()
 
 

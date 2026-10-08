@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 import yaml
 
+from gpu_fault import installation_lifecycle
 from gpu_fault.admin import cluster_removal as removal
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
@@ -24,9 +25,13 @@ from gpu_fault.admin.cluster_removal import (
     resolve_removal_cluster_id,
 )
 from gpu_fault.admin.cluster_removal_resources import merge_removal_resources
-from gpu_fault.admin.cluster_removal_state import STEP_DEPENDENCIES, canonical_digest
+from gpu_fault.admin.cluster_removal_state import (
+    STEP_DEPENDENCIES,
+    canonical_digest,
+    cleanup_config_sha256,
+)
 from gpu_fault.admin.node_key_proof import NodeKeyProof
-from gpu_fault.admin.site import load_site
+from gpu_fault.admin.site import load_site, materialized_release_config
 from tests.admin._cluster_removal_support import EKS_ARN, HP_ARN, RemovalScenario
 from tests.admin._cluster_removal_support import snapshot as _snapshot
 from tests.admin.test_admin_site import site_file
@@ -681,3 +686,224 @@ def test_registry_merge_refuses_a_recreated_target_resource() -> None:
 
     with pytest.raises(BootstrapError, match="resource identity changed"):
         merge_removal_resources(before, removed, current)
+
+
+def _two_cluster_site(tmp_path: Path) -> Path:
+    """The fixture site managing a second GPU cluster ``gpu-b`` beside ``gpu-a``."""
+
+    path = site_file(tmp_path)
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    first = document["spec"]["clusters"][0]
+    document["spec"]["clusters"].append(
+        {
+            **first,
+            "clusterId": "gpu-b",
+            "context": "gpu-b",
+            "hyperpodClusterName": "hp-gpu-b",
+            "eksClusterArn": "arn:aws:eks:us-east-1:123456789012:cluster/gpu-b",
+        }
+    )
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    return path
+
+
+def _scoped_cleanup_driver(commands: list, handed: list):
+    """A fake prepare-clean-redeploy.sh: digests the config it is handed and
+    writes CLEANUP_COMPLETED evidence scoped the way the tool scopes itself
+    (``--scope gpu --cluster-id``: the removed cluster is its only target)."""
+
+    import hashlib
+
+    def driver(arguments, **_kwargs):
+        commands.append(arguments)
+        config = Path(arguments[arguments.index("--config") + 1])
+        document = json.loads(config.read_text(encoding="utf-8"))
+        handed.append([item["cluster_id"] for item in document["clusters"]])
+        selected = arguments[arguments.index("--cluster-id") + 1]
+        targets = [
+            {"cluster_id": item["cluster_id"], "context": item["context"]}
+            for item in document["clusters"]
+            if item["cluster_id"] == selected
+        ]
+        evidence = {
+            "schema_version": 2,
+            "scope": "gpu",
+            "mode": "clean",
+            "node_mode": "uninstall",
+            "phase": "CLEANUP_COMPLETED",
+            "status": "COMPLETED",
+            "config_sha256": hashlib.sha256(config.read_bytes()).hexdigest(),
+            "targets": {
+                "namespace": document["namespace"],
+                "cpu_kubeconfig": document["cpu_kubeconfig"],
+                "clusters": targets,
+            },
+            "original_resources": [
+                {
+                    "scope": f"gpu:{selected}",
+                    "context": targets[0]["context"],
+                    "kind": "deployment",
+                    "name": "gpu-fault-cluster-executor",
+                    "previous": "1",
+                }
+            ],
+        }
+        evidence["content_sha256"] = canonical_digest(evidence)
+        write_json_atomic(
+            Path(arguments[arguments.index("--state-file") + 1]), evidence
+        )
+        return completed()
+
+    return driver
+
+
+@pytest.mark.parametrize("removed", ["gpu-a", "gpu-b"])
+def test_cleanup_evidence_names_only_the_removed_cluster_of_a_two_cluster_site(
+    tmp_path, monkeypatch, removed
+) -> None:
+    """Live 2026-10-08: the first removal from a HyperPod + eks-managed site
+    ran the GPU cleanup to CLEANUP_COMPLETED and then refused its own evidence,
+    because the check expected every managed cluster in ``targets.clusters``
+    while ``--scope gpu --cluster-id`` names the removed cluster alone."""
+    site = load_site(_two_cluster_site(tmp_path))
+    target = next(
+        item
+        for item in site.release_config["clusters"]
+        if item["cluster_id"] == removed
+    )
+    remaining = [
+        item["cluster_id"]
+        for item in site.release_config["clusters"]
+        if item["cluster_id"] != removed
+    ]
+    commands: list = []
+    handed: list = []
+    monkeypatch.setattr(removal, "run_driver", _scoped_cleanup_driver(commands, handed))
+    request = RemoveClusterRequest(site, removed, "REMOVE_GPU_CLUSTER")
+    directory = tmp_path / "cleanup"
+    directory.mkdir()
+
+    first = _run_kubernetes_cleanup(request, target, directory)
+    resumed = _run_kubernetes_cleanup(request, target, directory)
+
+    assert first == resumed, "the completed, scoped evidence is accepted and reused"
+    assert len(commands) == 1, "a resume does not run the cleanup again"
+    assert commands[0][commands[0].index("--cluster-id") + 1] == removed, commands[0]
+    assert sorted(handed[0]) == ["gpu-a", "gpu-b"], (
+        "the tool is handed the whole site's release config and scopes itself"
+    )
+    evidence = json.loads(first.read_text(encoding="utf-8"))
+    assert evidence["targets"]["clusters"] == [
+        {"cluster_id": removed, "context": target["context"]}
+    ], "the evidence names the removed cluster only"
+    assert remaining and all(
+        item not in json.dumps(evidence["targets"]) for item in remaining
+    ), "the remaining cluster is not a cleanup target"
+
+
+def _completed_evidence(site, *, clusters, resource_scope, resource_context):
+    document = {
+        "schema_version": 2,
+        "scope": "gpu",
+        "mode": "clean",
+        "node_mode": "uninstall",
+        "phase": "CLEANUP_COMPLETED",
+        "status": "COMPLETED",
+        "config_sha256": cleanup_config_sha256(site),
+        "targets": {
+            "namespace": site.release_config["namespace"],
+            "cpu_kubeconfig": site.release_config["cpu_kubeconfig"],
+            "clusters": clusters,
+        },
+        "original_resources": [
+            {
+                "scope": resource_scope,
+                "context": resource_context,
+                "kind": "deployment",
+                "name": "gpu-fault-cluster-executor",
+                "previous": "1",
+            }
+        ],
+    }
+    document["content_sha256"] = canonical_digest(document)
+    return document
+
+
+@pytest.mark.parametrize(
+    "shape,message",
+    [
+        ("every-cluster", "conflicts.*targets"),
+        ("other-cluster", "conflicts.*targets"),
+        ("other-resources", "does not prove"),
+    ],
+)
+def test_cleanup_evidence_for_other_clusters_cannot_satisfy_the_barrier(
+    tmp_path, monkeypatch, shape, message
+) -> None:
+    site = load_site(_two_cluster_site(tmp_path))
+    target = site.release_config["clusters"][0]
+    other = site.release_config["clusters"][1]
+    both = [
+        {"cluster_id": item["cluster_id"], "context": item["context"]}
+        for item in site.release_config["clusters"]
+    ]
+    if shape == "every-cluster":
+        evidence = _completed_evidence(
+            site, clusters=both, resource_scope="gpu:gpu-a", resource_context="gpu-a"
+        )
+    elif shape == "other-cluster":
+        evidence = _completed_evidence(
+            site,
+            clusters=both[1:],
+            resource_scope="gpu:gpu-b",
+            resource_context="gpu-b",
+        )
+    else:
+        evidence = _completed_evidence(
+            site,
+            clusters=both[:1],
+            resource_scope=f"gpu:{other['cluster_id']}",
+            resource_context=other["context"],
+        )
+    directory = tmp_path / "cleanup"
+    directory.mkdir()
+    write_json_atomic(directory / "kubernetes-cleanup-001.json", evidence)
+    monkeypatch.setattr(
+        removal, "run_driver", lambda *_a, **_k: pytest.fail("must not run cleanup")
+    )
+
+    with pytest.raises(BootstrapError, match=message):
+        _run_kubernetes_cleanup(
+            RemoveClusterRequest(site, "gpu-a", "REMOVE_GPU_CLUSTER"), target, directory
+        )
+
+
+def test_cleanup_config_digest_is_the_materialized_release_config(
+    tmp_path, monkeypatch
+) -> None:
+    """Both sides digest the document the tool is handed: the release config
+    plus the installation lifecycle inputs ``materialized_release_config`` merges
+    in (empty without an installation record, two fields with one)."""
+    import hashlib
+
+    site = load_site(site_file(tmp_path))
+    with materialized_release_config(site) as config:
+        without_record = hashlib.sha256(config.read_bytes()).hexdigest()
+    assert cleanup_config_sha256(site) == without_record, (
+        "the expected digest is the digest of the materialized config text"
+    )
+
+    monkeypatch.setattr(
+        installation_lifecycle,
+        "release_lifecycle_inputs",
+        lambda _source, _config: {
+            "installation_id": "inst-1",
+            "registry_site_id": "r-1",
+        },
+    )
+    with materialized_release_config(site) as config:
+        with_record = hashlib.sha256(config.read_bytes()).hexdigest()
+    assert with_record != without_record, "the installation record changes the text"
+    assert cleanup_config_sha256(site) == with_record, (
+        "a site with an installation record verifies its evidence too"
+    )
