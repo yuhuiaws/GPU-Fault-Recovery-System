@@ -1005,6 +1005,9 @@ Semantics and boundaries of `eks-managed`:
   the `eks-v1` base for good and its HyperPod members join with the `hyperpod-v1` override -- it is never re-based to
   the HyperPod family because a HyperPod member exists; a registration cluster missing from the managed set refuses
   the deploy (`bootstrap_discovery.registration_cluster_provider`).
+  The deploy preflight judges each cluster's override against that same registration family: the registration
+  cluster itself never needs one, and a live base of another family yields the plan back to the registration family
+  first, the other members being judged against the new base.
   `join-cluster`/`deploy` also check that the cluster's effective profile names its provider's `nodeReboot` adapter
   (`bootstrap_common.require_profile_matches_provider`) and refuse a mismatch before any AWS mutation.
 

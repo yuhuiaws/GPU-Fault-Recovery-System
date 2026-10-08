@@ -564,14 +564,31 @@ def _cluster_entries(
 
     spec = _mapping(document.get("spec"))
     owner = _site_reboot_owner(document, repository_root=repository_root, strict=strict)
+    # The base a deploy renders follows the registration cluster's provider
+    # (bootstrap_discovery.regional_profile_for): judge overrides against that
+    # planned base, not against a live base of another family that the same
+    # deploy is about to plan back (live 2026-10-08, eks-first site under a
+    # HyperPod-family base). The registration cluster itself is never an
+    # override: its family is the base.
+    registration = str(
+        _mapping(spec.get("runtimeProfile")).get("registrationClusterId") or ""
+    )
+    clusters = [item for item in spec.get("clusters") or [] if isinstance(item, dict)]
+    anchor = next(
+        (item for item in clusters if str(item.get("clusterId")) == registration), None
+    )
+    if anchor is not None:
+        owner = PROVIDER_NODE_REBOOT_OWNERS[
+            cluster_provider(anchor.get("provider")).value
+        ]
     rows: list[tuple[dict[str, Any], str, str]] = []
-    for entry in spec.get("clusters") or []:
-        if not isinstance(entry, dict):
-            continue
+    for entry in clusters:
         provider = cluster_provider(entry.get("provider")).value
         current = entry.get("runtimeProfile")
         if isinstance(current, dict) and current.get("version"):
             rows.append((entry, provider, str(current["version"])))
+        elif entry is anchor:
+            continue
         elif owner is not None and owner != PROVIDER_NODE_REBOOT_OWNERS[provider]:
             template = repository_root / PROVIDER_PROFILE_SOURCES[provider]
             version = (
