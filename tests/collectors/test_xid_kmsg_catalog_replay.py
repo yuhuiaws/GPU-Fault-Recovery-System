@@ -45,7 +45,19 @@ def _expected_official_action(rule: CatalogRule) -> str | None:
     return rule.immediate_action
 
 
-def _nvlink5_record_payload(rule: CatalogRule) -> tuple[str, str]:
+NVLINK5_RULES = [rule for rule in POLICY.catalog_rules if 144 <= rule.xid <= 150]
+
+
+def _nvlink5_record_payload(
+    rule: CatalogRule, *, register_count: int = 7
+) -> tuple[str, str]:
+    """The register group a decodable NVLink5 line carries.
+
+    Seven registers is the Catalog's WORKFLOW_NVLINK5_ERR template; six is what
+    the open-source driver prints for the MSE legacy Xid (intrInfo, errorStatus
+    and four debug words), in its own ``SUBCOMP  Fatal   XC0 i0 Link NN`` shape.
+    """
+
     decode = next(
         item
         for item in POLICY.nvlink5.decode_rules
@@ -57,8 +69,14 @@ def _nvlink5_record_payload(rule: CatalogRule) -> tuple[str, str]:
         if decode.error_status is not None
         else 0
     )
-    registers = [intr_info, error_status, 0, 0, 0, 0, 0]
+    registers = [intr_info, error_status, *([0] * (register_count - 2))]
     payload = " ".join(f"0x{value:08x}" for value in registers)
+    if register_count == 6:
+        component = "MSE_WATCHDOG" if rule.xid == 150 else "NVLINK5"
+        return (
+            f", {component}  Fatal   XC0 i0 Link 03 ({payload})",
+            decode.recovery_action,
+        )
     return (f", NVLink5 nonfatal 0 0 Link 0 ({payload})", decode.recovery_action)
 
 
@@ -82,8 +100,27 @@ def test_xid_kmsg_catalog_replay_b200(rule: CatalogRule) -> None:
     _run_xid_kmsg_catalog_replay(rule, case_id=_b200_case_id(rule), product="B200")
 
 
+@pytest.mark.parametrize(
+    "rule",
+    NVLINK5_RULES,
+    ids=[f"nvlink5-driver-six-registers-{rule.xid}" for rule in NVLINK5_RULES],
+)
+def test_xid_kmsg_catalog_replay_nvlink5_driver_six_registers(
+    rule: CatalogRule,
+) -> None:
+    """The driver's MSE legacy shape -- six registers behind the pid/name
+    prefix -- decodes to the same Catalog action as the seven-value template."""
+
+    _run_xid_kmsg_catalog_replay(
+        rule,
+        case_id=f"nvlink5-driver-six-registers-{rule.xid}",
+        product="B200",
+        nvlink5_register_count=6,
+    )
+
+
 def _run_xid_kmsg_catalog_replay(
-    rule: CatalogRule, *, case_id: str, product: str
+    rule: CatalogRule, *, case_id: str, product: str, nvlink5_register_count: int = 7
 ) -> None:
     boot_id = f"boot-{case_id.lower()}"
     sequence = 10_000 + rule.xid
@@ -105,7 +142,9 @@ def _run_xid_kmsg_catalog_replay(
     nvlink5_payload = ""
     nvlink5_action = None
     if 144 <= rule.xid <= 150:
-        nvlink5_payload, nvlink5_action = _nvlink5_record_payload(rule)
+        nvlink5_payload, nvlink5_action = _nvlink5_record_payload(
+            rule, register_count=nvlink5_register_count
+        )
     record = (
         f"3,{sequence},{monotonic_us},-;"
         f"NVRM: Xid (PCI:{PCI_BDF}): {rule.xid}, "

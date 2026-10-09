@@ -77,13 +77,24 @@ def _unparsed_line_reasons(
 _XID_REGISTER_PATTERN = re.compile(r"\b0x([0-9a-fA-F]+)\b")
 _NVLINK5_XIDS = frozenset(range(144, 151))
 _NVLINK5_REGISTER_TOKEN = r"(?:0[xX][0-9a-fA-F]{1,8}|[0-9a-fA-F]{8})"
+# The parenthesised register group of an NVLink5 (XID 144-150) line. The NVIDIA
+# Xid Catalog's WORKFLOW_NVLINK5_ERR template lists seven values (intrInfo,
+# errorStatus, errorDebugData[0..4]); the open-source driver prints the MSE
+# (XID 150) legacy Xid with six (intrInfo, errorStatus and four debug words,
+# zero-padded ``0x%08x`` separated by spaces) and the ALI link-training Xid
+# with seven unpadded ``0x%x`` values separated by commas and no space before
+# the parenthesis. The Catalog user guide identifies IntrInfo as the first
+# register in the parentheses and Error Status as the second -- the count is
+# not what names the two fields -- so a group of six to eight registers is
+# accepted and anything else (fewer, more, a non-hex token, a value over 32
+# bits, a group after another Xid token) leaves both fields missing.
 _NVLINK5_REGISTER_PAYLOAD_PATTERN = re.compile(
     r"\(\s*"
     rf"(?P<intr_info>{_NVLINK5_REGISTER_TOKEN})"
     r"(?:\s*,\s*|\s+)"
     rf"(?P<error_status>{_NVLINK5_REGISTER_TOKEN})"
-    + "".join(rf"(?:\s*,\s*|\s+){_NVLINK5_REGISTER_TOKEN}" for _ in range(5))
-    + r"\s*\)",
+    rf"(?:(?:\s*,\s*|\s+){_NVLINK5_REGISTER_TOKEN}){{4,6}}"
+    r"\s*\)",
 )
 _SXID_PATTERN = re.compile(
     r"\bSXid\b\s*(?:\(PCI:([0-9a-fA-F:.]+)\))?\s*"

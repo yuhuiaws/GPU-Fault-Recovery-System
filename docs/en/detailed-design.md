@@ -524,11 +524,15 @@ no wrong workflow is created early either; when the window closes, the primary i
 incident, avoiding a double reset/reboot.
 
 The production normalizer for XID 144-150 parses along the kernel message boundaries defined by the NVIDIA Catalog:
-it inspects only the parenthesized payload after the current XID number and before the next XID, and requires the parentheses to contain exactly seven
-32-bit hexadecimal registers. The first register maps to `intr_info`, the second maps to
-`error_status`; the remaining five debug data values are kept in the raw evidence. The parser accepts
-1-8 digit hexadecimal values with `0x`, as well as fixed eight-digit hexadecimal values without a prefix, and fields may be separated by spaces or commas.
-When the payload is short, a value exceeds 32 bits, it sits after another XID or the format is ambiguous, no field is guessed; the policy returns
+it inspects only the parenthesized payload after the current XID number and before the next XID, and requires the parentheses to contain six to eight
+32-bit hexadecimal registers. The Catalog's `WORKFLOW_NVLINK5_ERR` template lists seven values (intrInfo, errorStatus and
+errorDebugData[0..4]), while the open-source driver prints the MSE (XID 150) legacy Xid with six (intrInfo, errorStatus and four
+debug words); the Catalog user guide defines IntrInfo as the first register in the parentheses and Error Status as the second, so the
+register count is not what identifies the two fields. The first register maps to `intr_info`, the second maps to
+`error_status`; the remaining debug data values are kept in the raw evidence. The parser accepts
+1-8 digit hexadecimal values with `0x` (the driver's `0x%x` is not zero-padded), as well as fixed eight-digit hexadecimal values without a prefix;
+fields may be separated by spaces or commas and the parenthesis need not be preceded by a space.
+Fewer than six or more than eight values, any non-hexadecimal token, a value exceeding 32 bits or a group after another XID leave both fields unguessed; the policy returns
 `BLOCKED_MISSING_EVIDENCE` and quarantines. This extraction logic is shared by the Kernel and
 Fabric Manager normalization entry points (three in total).
 

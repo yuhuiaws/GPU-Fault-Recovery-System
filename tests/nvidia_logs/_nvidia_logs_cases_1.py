@@ -736,6 +736,77 @@ def test_kernel_nvlink5_does_not_use_registers_from_another_xid() -> None:
     assert events[146].error_status == 0x1
 
 
+def _nvlink5_registers(record_id: str, message: str) -> tuple[int | None, int | None]:
+    result = NvidiaLogNormalizer().normalize_kernel(
+        NvidiaKernelLogEvent(
+            cluster_id="hp-cluster",
+            node_id="worker-1",
+            record_id=record_id,
+            observed_at=NOW,
+            message=message,
+            product="B200",
+            driver_branch=575,
+            cuda_version="12.9",
+            runtime_profile_version="simulated-v1",
+        )
+    )
+    (event,) = result.xid_events
+    return event.intr_info, event.error_status
+
+
+def test_kernel_nvlink5_accepts_the_drivers_six_register_mse_line() -> None:
+    """The open-source driver prints the MSE (XID 150) legacy Xid with six
+    registers: intrInfo, errorStatus and four debug words."""
+
+    assert _nvlink5_registers(
+        "kmsg-xid150-mse",
+        "NVRM: Xid (PCI:0000:b9:00): 150, pid=1234, name=python, MSE_WATCHDOG  "
+        "Fatal   XC0 i0 Link 03 (0x00000001 0x00000002 0x00000000 0x00000000 "
+        "0x00000000 0x00000000)",
+    ) == (0x1, 0x2)
+
+
+def test_kernel_nvlink5_accepts_the_catalog_seven_value_shape_behind_pid_and_name() -> (
+    None
+):
+    assert _nvlink5_registers(
+        "kmsg-xid149-netir",
+        "NVRM: Xid (PCI:0000:b9:00): 149, pid=1234, name=python, NETIR nonfatal "
+        "0 0 Link 5 (0x00000010 0x00000003 0x00000000 0x00000000 0x00000000 "
+        "0x00000000 0x00000000)",
+    ) == (0x10, 0x3)
+
+
+def test_kernel_nvlink5_accepts_the_drivers_unpadded_comma_form_without_a_space() -> (
+    None
+):
+    """The ALI link-training Xid: seven comma-separated ``0x%x`` values with
+    no space before the parenthesis."""
+
+    assert _nvlink5_registers(
+        "kmsg-xid149-training",
+        "NVRM: Xid (PCI:0000:b9:00): 149, pid=1234, name=python, NVLink: Link "
+        "training failed for link 3(0x1, 0x2, 0x0, 0x0, 0x0, 0x0, 0x0)",
+    ) == (0x1, 0x2)
+
+
+def test_kernel_nvlink5_five_registers_remain_missing() -> None:
+    assert _nvlink5_registers(
+        "kmsg-xid150-five",
+        "NVRM: Xid (PCI:0000:b9:00): 150, MSE_WATCHDOG  Fatal   XC0 i0 Link 03 "
+        "(0x00000001 0x00000002 0x00000000 0x00000000 0x00000000)",
+    ) == (None, None)
+
+
+def test_kernel_nvlink5_nine_registers_remain_missing() -> None:
+    assert _nvlink5_registers(
+        "kmsg-xid145-nine",
+        "NVRM: Xid (PCI:0000:b9:00): 145, RLW nonfatal 0 0 Link 3 (0x00000004 "
+        "0x00000001 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 "
+        "0x00000000 0x00000000)",
+    ) == (None, None)
+
+
 def test_fabric_manager_and_kernel_observations_merge_into_one_incident() -> None:
     context = build_context()
 
