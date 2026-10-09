@@ -265,7 +265,9 @@ def test_postgres_enqueue_notifies_waiting_consumers(store) -> None:
     assert "partition" not in notification
     assert notification["priority"] == 10
     assert notification["path"] == "/v1/gpu-events/xid"
-    assert notification["request_id"]
+    assert "request_id" not in notification, (
+        "a statement-level edge wakes every shard owner; no row id is routed"
+    )
 
 
 def test_postgres_spool_admission_notifies_dedicated_channel(store) -> None:

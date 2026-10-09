@@ -332,7 +332,7 @@ cluster registry records must not be reused to bypass these gates.
   idempotent resume; after successful consumption or replacement by a new plan it must not be replayed. Approval and release must be serialized by the same state-dir file
   lock. For the full administrator commands and exception handling see
   [Runtime Profile Change Approval](administrator-profile-change-approval.md).
-- The PostgreSQL schema is currently v20 (as defined by `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION`); production business Pods run with
+- The PostgreSQL schema is currently v21 (as defined by `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION`); production business Pods run with
   `GPU_FAULT_POSTGRES_AUTO_SCHEMA_INIT=false`, and DDL may only be executed by the ensure Job.
 - The workflow/remote_command dedicated tables stay legacy by default. Data migration is executed explicitly by the audited Store CLI and
   is not switched automatically by deploy; before dedicated, the canonical JSON/missing/difference checks must complete and active commands and

@@ -37,7 +37,7 @@ from gpu_fault.processor.metrics import ProcessorMetricsMixin
 from gpu_fault.processor.models import (
     ProcessorLeadership,
     ProcessorRequest,
-    processor_partition_id,
+    notification_target_shard,
 )
 from gpu_fault.processor.rejected_events import record_replay_completion
 from gpu_fault.processor.replay_completion import (
@@ -496,17 +496,16 @@ class ProcessorCoordinator(
         if not isinstance(notification, dict):
             stream = "*"
         else:
-            request_id = notification.get("request_id")
-            target_shard = processor_partition_id(
-                request_id if isinstance(request_id, str) else payload,
-                self.processor_notification_shard_count,
+            target_shard = notification_target_shard(
+                notification, self.processor_notification_shard_count
             )
-            with self._state_lock:
-                owned_shard = self._notification_shard
-            if owned_shard != target_shard:
+            if target_shard is not None:  # an edge payload wakes every owner
                 with self._state_lock:
-                    self._notifications_filtered_total += 1
-                return
+                    owned_shard = self._notification_shard
+                if owned_shard != target_shard:
+                    with self._state_lock:
+                        self._notifications_filtered_total += 1
+                    return
             path = notification.get("path")
             if notification.get("priority") == 0:
                 stream = "fault"

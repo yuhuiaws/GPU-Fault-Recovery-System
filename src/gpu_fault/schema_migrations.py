@@ -189,6 +189,16 @@ def _apply_processor_counter_ledger_v20(cursor: MigrationCursor) -> None:
     cursor.execute("SELECT 1")
 
 
+def _apply_edge_triggered_wakeups_v21(cursor: MigrationCursor) -> None:
+    # The processor-queue and telemetry-spool NOTIFY triggers become
+    # statement-level and edge-triggered (one pg_notify per distinct key per
+    # statement, only when no PENDING / claimable row for the key existed
+    # outside the statement, one notifier among concurrent first writers).
+    # CREATE OR REPLACE FUNCTION and _ensure_trigger carry the change in the
+    # idempotent DDL; no table changes.
+    cursor.execute("SELECT 1")
+
+
 @dataclass(frozen=True)
 class SchemaMigration:
     version: int
@@ -346,6 +356,12 @@ POSTGRES_SCHEMA_MIGRATIONS = (
         name="processor-counters-per-writer-backend-rows",
         ddl_checksum="63e14b75d505f6185d43e5c7754ebb35f8e18bfbf6feeeb4a7b91271ac99685e",
         apply=_apply_processor_counter_ledger_v20,
+    ),
+    SchemaMigration(
+        version=21,
+        name="edge-triggered-statement-level-wakeups",
+        ddl_checksum="633e975f15f867dfec40793ae6f7bcf4550a831f34b8011ad2206186436b9c75",
+        apply=_apply_edge_triggered_wakeups_v21,
     ),
 )
 

@@ -96,7 +96,7 @@ class ReadOnlyDatabase:
 def test_retained_v17_history_uses_physical_reads_before_candidate_v18_ensure(
     monkeypatch,
 ):
-    assert LATEST_POSTGRES_SCHEMA_VERSION == 20, "this compatibility pair needs review"
+    assert LATEST_POSTGRES_SCHEMA_VERSION == 21, "this compatibility pair needs review"
     monkeypatch.setattr(
         state_table_definitions,
         "validate_state_definitions",

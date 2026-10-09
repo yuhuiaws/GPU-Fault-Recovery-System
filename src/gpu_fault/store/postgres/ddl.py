@@ -823,6 +823,150 @@ def _create_domain_tables_and_indexes(cursor) -> None:
     )
 
 
+def _create_processor_queue_notify(cursor: Any) -> None:
+    # Edge-triggered, statement-level wakeup (schema v21). Every transaction
+    # that issued NOTIFY commits one at a time: PreCommit_Notify takes an
+    # AccessExclusiveLock on the database object and holds it across the WAL
+    # flush so queue entries appear in commit order. With one pg_notify per
+    # PENDING row, every admission flush notified (~570k per perf run, 548k
+    # of them filtered by the listeners) and once v20 had removed the counter
+    # convoy the flushes arrived at COMMIT together and queued on that lock
+    # (2389 waits >= 1 s in a 15-minute window, 70 % of active statements
+    # COMMIT, Aurora CommitLatency 21-29 ms; the reserved 503s were the
+    # expired admission batches). The listeners are hints consumers: a claim
+    # loop that was woken polls until its streams are empty, so a key that
+    # already had PENDING work needs no second wakeup, and a statement carries
+    # at most one per distinct (path, priority). Among concurrent first
+    # writers of an idle key only the one that wins the try-only advisory
+    # xact lock notifies -- nobody waits for it; if that transaction rolls
+    # back, the other writers' rows are picked up by the fallback poll
+    # (processor_notification_fallback_seconds). The payload carries no
+    # request_id: an edge wakes every listening shard owner.
+    cursor.execute(
+        """
+        CREATE OR REPLACE FUNCTION
+        gpu_fault_processor_queue_notify_pending()
+        RETURNS trigger
+        LANGUAGE plpgsql
+        AS $$
+        DECLARE
+            target RECORD;
+        BEGIN
+            IF TG_OP = 'INSERT' THEN
+                FOR target IN
+                    SELECT DISTINCT
+                        n.payload->>'path' AS path,
+                        n.priority
+                    FROM added n
+                    WHERE n.status = 'PENDING'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gpu_fault_processor_queue q
+                          WHERE q.payload->>'path' = n.payload->>'path'
+                            AND q.priority = n.priority
+                            AND q.status = 'PENDING'
+                            AND NOT EXISTS (
+                                SELECT 1 FROM added a
+                                WHERE a.request_id = q.request_id
+                            )
+                      )
+                LOOP
+                    IF pg_try_advisory_xact_lock(
+                        hashtextextended(
+                            'gpu_fault_processor_queue_notify:'
+                            || coalesce(target.path, '')
+                            || ':' || target.priority::text,
+                            0
+                        )
+                    ) THEN
+                        PERFORM pg_notify(
+                            'gpu_fault_processor_queue',
+                            json_build_object(
+                                'priority', target.priority,
+                                'path', target.path
+                            )::text
+                        );
+                    END IF;
+                END LOOP;
+            ELSE
+                FOR target IN
+                    SELECT DISTINCT
+                        n.payload->>'path' AS path,
+                        n.priority
+                    FROM added n
+                    JOIN removed o ON o.request_id = n.request_id
+                    WHERE n.status = 'PENDING'
+                      AND o.status IS DISTINCT FROM 'PENDING'
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gpu_fault_processor_queue q
+                          WHERE q.payload->>'path' = n.payload->>'path'
+                            AND q.priority = n.priority
+                            AND q.status = 'PENDING'
+                            AND NOT EXISTS (
+                                SELECT 1 FROM added a
+                                WHERE a.request_id = q.request_id
+                            )
+                      )
+                LOOP
+                    IF pg_try_advisory_xact_lock(
+                        hashtextextended(
+                            'gpu_fault_processor_queue_notify:'
+                            || coalesce(target.path, '')
+                            || ':' || target.priority::text,
+                            0
+                        )
+                    ) THEN
+                        PERFORM pg_notify(
+                            'gpu_fault_processor_queue',
+                            json_build_object(
+                                'priority', target.priority,
+                                'path', target.path
+                            )::text
+                        );
+                    END IF;
+                END LOOP;
+            END IF;
+            RETURN NULL;
+        END
+        $$
+        """
+    )
+    # Transition tables forbid column lists, so the UPDATE trigger fires on
+    # every update statement and the function keeps the rows that became
+    # PENDING; lease renewals and completions never reach a pg_notify.
+    _ensure_trigger(
+        cursor,
+        "gpu_fault_processor_queue_notify_pending_trigger",
+        "gpu_fault_processor_queue",
+        """
+        CREATE TRIGGER
+        gpu_fault_processor_queue_notify_pending_trigger
+        AFTER INSERT
+        ON gpu_fault_processor_queue
+        REFERENCING NEW TABLE AS added
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION
+        gpu_fault_processor_queue_notify_pending()
+        """,
+    )
+    _ensure_trigger(
+        cursor,
+        "gpu_fault_processor_queue_notify_pending_update_trigger",
+        "gpu_fault_processor_queue",
+        """
+        CREATE TRIGGER
+        gpu_fault_processor_queue_notify_pending_update_trigger
+        AFTER UPDATE
+        ON gpu_fault_processor_queue
+        REFERENCING OLD TABLE AS removed NEW TABLE AS added
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION
+        gpu_fault_processor_queue_notify_pending()
+        """,
+    )
+
+
 def _create_processor_tables(cursor) -> None:
     cursor.execute(
         """
@@ -861,43 +1005,7 @@ def _create_processor_tables(cursor) -> None:
         cursor, "gpu_fault_processor_queue", "response_body_base64", "TEXT"
     )
     ddl_processor_retry.upgrade_processor_retry_schedule(cursor)
-    cursor.execute(
-        """
-        CREATE OR REPLACE FUNCTION
-        gpu_fault_processor_queue_notify_pending()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
-        BEGIN
-            IF NEW.status = 'PENDING' THEN
-                PERFORM pg_notify(
-                    'gpu_fault_processor_queue',
-                    json_build_object(
-                        'priority', NEW.priority,
-                        'path', NEW.payload->>'path',
-                        'request_id', NEW.request_id
-                    )::text
-                );
-            END IF;
-            RETURN NULL;
-        END
-        $$
-        """
-    )
-    _ensure_trigger(
-        cursor,
-        "gpu_fault_processor_queue_notify_pending_trigger",
-        "gpu_fault_processor_queue",
-        """
-        CREATE TRIGGER
-        gpu_fault_processor_queue_notify_pending_trigger
-        AFTER INSERT OR UPDATE OF status
-        ON gpu_fault_processor_queue
-        FOR EACH ROW
-        EXECUTE FUNCTION
-        gpu_fault_processor_queue_notify_pending()
-        """,
-    )
+    _create_processor_queue_notify(cursor)
     cursor.execute(
         """
         CREATE TABLE IF NOT EXISTS gpu_fault_processor_lanes (

@@ -3420,10 +3420,28 @@ Claim uses `FOR UPDATE SKIP LOCKED`; a completion write must verify both the req
 epoch/token. The periodic cleanup task deletes by
 `GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS`, whose production value is 600 seconds.
 
-The `AFTER INSERT OR UPDATE OF status` row trigger
-`gpu_fault_processor_queue_notify_pending_trigger` issues
-`pg_notify('gpu_fault_processor_queue', {priority, path, request_id})` when a row enters `PENDING`, so that workers
-wake on notification when idle instead of spinning on polls; polling is still kept as a fallback.
+Wakeups are edge-triggered and statement-level (schema v21): `gpu_fault_processor_queue_notify_pending_trigger`
+(`AFTER INSERT ... REFERENCING NEW TABLE AS added FOR EACH STATEMENT`) and `..._notify_pending_update_trigger`
+(`AFTER UPDATE ... REFERENCING OLD TABLE AS removed NEW TABLE AS added`; transition tables forbid column lists, so the
+function itself keeps only the rows that became PENDING) issue at most one
+`pg_notify('gpu_fault_processor_queue', {priority, path})` per distinct `(path, priority)` in a statement, and only when
+no PENDING row for that key existed outside the statement (an index-backed `NOT EXISTS` over
+`gpu_fault_processor_queue_path_priority_claim`); among several concurrent first writers of a key only the one that wins a
+try-only advisory xact lock notifies, nobody waits. The reason: every transaction that issued NOTIFY takes
+`PreCommit_Notify`'s `AccessExclusiveLock on object 0 of class 1262` (the database object) at COMMIT and holds it across its
+WAL flush so queue entries appear in commit order -- with one `pg_notify` per row every admission flush notified (~570k per
+r1 run, 548k of them filtered as irrelevant by the listeners), and once v20 had removed the counter-row convoy the flushes
+reached COMMIT together and queued on that lock (2389 waits of 1 s or more in a 15-minute window, 70% of active statements
+COMMIT, Aurora CommitLatency 21-29 ms); the expired admission batches were the reserved 503s. Listeners treat
+notifications as hints: a woken claim loop polls until its streams are empty, so a key that already has PENDING work needs
+no second wakeup. The payload carries no `request_id` any more: one edge wakes every shard-owning listener
+(`notify_work_available` applies no shard filter to a payload without `request_id`; per-row payloads with one are still
+routed). A suppressed or lost edge costs at most one fallback poll: `processor_notification_fallback_seconds` for a
+shard owner (default 5 s, `GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS`), `fault_idle_backoff_max_seconds` 0.5 s /
+`idle_backoff_max_seconds` 2 s for a process without a shard, 0.1 / 0.4 s while busy.
+`tests/store/test_postgres_notify_edges.py` proves that the first PENDING row of a key notifies once, concurrent flushes on
+a busy key produce no notifying transaction, 12 concurrent first flushes of an idle key produce at most one, and the next
+row after the key drains notifies again.
 
 #### 3.1.4 `gpu_fault_processor_lanes`
 
@@ -3520,8 +3538,13 @@ The differences from the main queue are deliberate, not simplifications:
 
 The indexes are `..._available (available_at, spool_key)`,
 `..._path_available (path, available_at, spool_key)` and `..._cluster (cluster_id)`;
-the `AFTER INSERT OR UPDATE OF available_at, revision` row trigger
-`pg_notify('gpu_fault_telemetry_spool', {path})` wakes the spool worker, with polling only as a fallback.
+`gpu_fault_telemetry_spool_notify_available_trigger` / `..._update_trigger` are the same statement-level edge wakeup as
+the processor queue (schema v21): at most one `pg_notify('gpu_fault_telemetry_spool', {path})` per distinct `path` per
+statement, and only when no claimable row of that path (`available_at <= clock_timestamp()`, the consumer's own predicate)
+existed outside the statement; the E-8 row rule stays -- every insert, and every update that makes a row available no
+later than before (coalesce, abandon), is an edge, while a claim or release that pushes the lease into the future stays
+quiet, and the new row's own stamp is never compared with a clock. A lost edge costs at most
+`telemetry_spool_notification_fallback_seconds` (default 5 s).
 
 #### 3.1.7 Index and Trigger Totals
 
@@ -3558,8 +3581,8 @@ Every declaration first checks `to_regclass` via `_declare_index()` and issues n
 |---|---|---|
 | `gpu_fault_processor_queue_count_insert/update/delete` | `FOR EACH STATEMENT` + transition table | Maintains the legacy counts in `gpu_fault_processor_queue_counts` |
 | `gpu_fault_processor_priority_count_insert/update/delete` | `FOR EACH STATEMENT` + transition table | Maintains the priority shard counts |
-| `gpu_fault_processor_queue_notify_pending_trigger` | `FOR EACH ROW` | `pg_notify` wakeup for PENDING rows |
-| `gpu_fault_telemetry_spool_notify_available_trigger` | `FOR EACH ROW` | `pg_notify` wakeup when a spool row becomes available |
+| `gpu_fault_processor_queue_notify_pending_trigger` / `..._update_trigger` | `FOR EACH STATEMENT` + transition table | Edge wakeup: at most one `pg_notify` per `(path, priority)` per statement, only when the key had no PENDING row outside the statement (§3.1.3) |
+| `gpu_fault_telemetry_spool_notify_available_trigger` / `..._update_trigger` | `FOR EACH STATEMENT` + transition table | Edge wakeup: at most one `pg_notify` per `path` per statement, only when the path had no claimable row outside the statement (§3.1.6) |
 | `gpu_fault_objects_notify_wakeup_trigger` | `FOR EACH ROW` (`AFTER INSERT OR UPDATE OF payload`) | In legacy/dual mode, when a workflow enters the dispatchable set (a new row, or a change in an ordering/filter field) or a remote_command changes status, `pg_notify` wakes the dispatcher and executor claim; same-status UPDATEs such as lease renewal and cancel requests stay silent, otherwise the dispatcher would be woken by its own bookkeeping and re-dispatch repeatedly |
 | `gpu_fault_objects_control_state_fence_trigger` / `gpu_fault_objects_control_state_mirror_trigger` | `FOR EACH ROW` | Old-write barrier and AFTER in-transaction mirroring |
 | `gpu_fault_workflows_fence` / `gpu_fault_remote_commands_fence` | `FOR EACH ROW` | Write-mode and identity barrier for the native tables |
@@ -3638,7 +3661,7 @@ The schema has an independent versioned migration registry, `src/gpu_fault/schem
 `POSTGRES_SCHEMA_MIGRATIONS` currently has **18 versions** (v12 `store-review-hot-query-indexes`,
 v13 `control-plane-review-indexes-and-autovacuum`, v14 `objects-wakeup-notify-trigger`,
 v15 `remote-command-state-table-and-cutover-fences`, v16 `workflow-state-table-and-independent-cutover`,
-v17 `control-state-dual-projection-conditional-delete`, v18 `control-state-legacy-copy-reset-without-truncate`, v19 `hot-table-storage-parameters-and-hot-update-indexes`, v20 `processor-counters-per-writer-backend-rows`), and `LATEST_POSTGRES_SCHEMA_VERSION`
+v17 `control-state-dual-projection-conditional-delete`, v18 `control-state-legacy-copy-reset-without-truncate`, v19 `hot-table-storage-parameters-and-hot-update-indexes`, v20 `processor-counters-per-writer-backend-rows`, v21 `edge-triggered-statement-level-wakeups`), and `LATEST_POSTGRES_SCHEMA_VERSION`
 takes the last version number. Three guards are executed by `validate_migration_registry()` **at module import time**,
 not as an optional runtime check:
 

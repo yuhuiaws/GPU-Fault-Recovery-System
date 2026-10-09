@@ -174,7 +174,8 @@ def test_a_drifted_notify_trigger_is_recreated_to_the_declared_definition() -> N
             )
             definition = cursor.fetchone()[0]
 
-    assert "AFTER INSERT OR UPDATE OF status" in definition, definition
+    assert "REFERENCING NEW TABLE AS added" in definition, definition
+    assert "FOR EACH STATEMENT" in definition, definition
 
 
 def test_a_disabled_counter_trigger_is_re_enabled_by_the_bootstrap() -> None:

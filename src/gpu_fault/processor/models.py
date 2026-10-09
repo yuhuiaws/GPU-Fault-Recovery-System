@@ -4,7 +4,7 @@ import base64
 import hashlib
 import json
 import logging
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Any
@@ -85,6 +85,22 @@ class ProcessorLaneLease(StrictModel):
     lease_token: str
     lease_expires_at: datetime
     updated_at: datetime
+
+
+def notification_target_shard(
+    notification: Mapping[str, object], shard_count: int
+) -> int | None:
+    """The listening shard a queue notification is routed to.
+
+    A per-row payload (the pre-v21 trigger) names its ``request_id`` and goes
+    to one shard owner; a statement-level edge payload (schema v21) carries
+    none and wakes every listening shard owner, so it has no target shard.
+    """
+
+    request_id = notification.get("request_id")
+    if isinstance(request_id, str):
+        return processor_partition_id(request_id, shard_count)
+    return None
 
 
 def processor_partition_id(key_value: str | None, partition_count: int) -> int:

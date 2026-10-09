@@ -120,6 +120,32 @@ def test_foreign_shard_notification_is_filtered_before_a_listener_disconnect(
     assert "listener disconnected" in caplog.text
 
 
+def test_an_edge_notification_without_request_id_wakes_every_shard_owner(
+    runtime, monkeypatch
+):
+    """Schema v21's statement-level trigger notifies once per (path,
+    priority) edge and routes nothing by row: every listening owner wakes."""
+
+    processor = runtime.make_processor(
+        lease=ProcessorLeaseSettings(processor_notification_shard_count=2)
+    )
+
+    def listen(stop, owner, shards, notify, state, *, on_progress):
+        state(True, 0)
+        notify(json.dumps({"priority": 50, "path": GPU_METRICS_PATH}))
+        notify(json.dumps({"priority": 0, "path": "/v1/gpu-events/xid"}))
+        raise OSError("listener disconnected")
+
+    monkeypatch.setattr(
+        processor.store, "listen_processor_queue_notifications", listen, raising=False
+    )
+    processor.run_queue_notifications()
+
+    metrics = processor.metrics_snapshot()
+    assert metrics["notifications_filtered_total"] == 0
+    assert metrics["notifications_received_total"] == 2
+
+
 @pytest.mark.parametrize("owner", ["runtime-owner", "another-owner", "unavailable"])
 def test_leadership_cycle_observes_owner_and_read_failures(runtime, owner, caplog):
     calls = []

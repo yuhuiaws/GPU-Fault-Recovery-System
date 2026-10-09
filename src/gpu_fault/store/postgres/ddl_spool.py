@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Any
+
 from gpu_fault.store.postgres.ddl_helpers import _declare_index, _ensure_trigger
 
 
@@ -89,6 +91,24 @@ def _create_telemetry_spool(cursor) -> None:
         ON gpu_fault_telemetry_spool (cluster_id)
         """,
     )
+    _create_spool_notify(cursor)
+
+
+def _create_spool_notify(cursor: Any) -> None:
+    # Edge-triggered, statement-level wakeup (schema v21; the processor queue
+    # trigger in ddl.py explains the COMMIT serialization every notifying
+    # transaction pays). A statement notifies at most once per distinct path,
+    # and only when no other row of that path was already claimable outside
+    # the statement -- the consumer drains a path until its claim comes back
+    # empty, so an existing claimable row means it is awake or about to be.
+    # Rows are kept by the E-8 rule: every insert, and every update that
+    # makes the row available no later than before (coalesce, abandon); a
+    # claim or release that pushes the lease into the future stays quiet.
+    # "Claimable" is the consumer's own predicate (available_at <= now, by
+    # the database clock); the new row's own stamp is never compared with a
+    # clock. Among concurrent first writers of an idle path only the winner
+    # of the try-only advisory xact lock notifies; a lost edge costs at most
+    # telemetry_spool_notification_fallback_seconds.
     cursor.execute(
         """
         CREATE OR REPLACE FUNCTION
@@ -96,24 +116,69 @@ def _create_telemetry_spool(cursor) -> None:
         RETURNS trigger
         LANGUAGE plpgsql
         AS $$
+        DECLARE
+            target RECORD;
         BEGIN
-            -- Notify on every insert and on every update that makes the
-            -- row available no later than before (E-8). The old
-            -- ``NEW.available_at <= clock_timestamp()`` compared the
-            -- ingress clock with the database clock, so whenever the
-            -- application clock led, a brand-new row sent no NOTIFY and
-            -- the consumer fell back to its 2-5 s poll. Coalescing
-            -- (same available_at, new revision) and abandon (earlier
-            -- available_at) notify; a claim or release that pushes the
-            -- lease into the future does not, so the consumer is not
-            -- woken by its own bookkeeping.
-            IF TG_OP = 'INSERT' OR NEW.available_at <= OLD.available_at THEN
-                PERFORM pg_notify(
-                    'gpu_fault_telemetry_spool',
-                    json_build_object(
-                        'path', NEW.path
-                    )::text
-                );
+            IF TG_OP = 'INSERT' THEN
+                FOR target IN
+                    SELECT DISTINCT n.path
+                    FROM added n
+                    WHERE NOT EXISTS (
+                        SELECT 1
+                        FROM gpu_fault_telemetry_spool s
+                        WHERE s.path = n.path
+                          AND s.available_at <= clock_timestamp()
+                          AND NOT EXISTS (
+                              SELECT 1 FROM added a
+                              WHERE a.spool_key = s.spool_key
+                          )
+                    )
+                LOOP
+                    IF pg_try_advisory_xact_lock(
+                        hashtextextended(
+                            'gpu_fault_telemetry_spool_notify:' || target.path,
+                            0
+                        )
+                    ) THEN
+                        PERFORM pg_notify(
+                            'gpu_fault_telemetry_spool',
+                            json_build_object(
+                                'path', target.path
+                            )::text
+                        );
+                    END IF;
+                END LOOP;
+            ELSE
+                FOR target IN
+                    SELECT DISTINCT n.path
+                    FROM added n
+                    JOIN removed o ON o.spool_key = n.spool_key
+                    WHERE n.available_at <= o.available_at
+                      AND NOT EXISTS (
+                          SELECT 1
+                          FROM gpu_fault_telemetry_spool s
+                          WHERE s.path = n.path
+                            AND s.available_at <= clock_timestamp()
+                            AND NOT EXISTS (
+                                SELECT 1 FROM added a
+                                WHERE a.spool_key = s.spool_key
+                            )
+                      )
+                LOOP
+                    IF pg_try_advisory_xact_lock(
+                        hashtextextended(
+                            'gpu_fault_telemetry_spool_notify:' || target.path,
+                            0
+                        )
+                    ) THEN
+                        PERFORM pg_notify(
+                            'gpu_fault_telemetry_spool',
+                            json_build_object(
+                                'path', target.path
+                            )::text
+                        );
+                    END IF;
+                END LOOP;
             END IF;
             RETURN NULL;
         END
@@ -127,9 +192,25 @@ def _create_telemetry_spool(cursor) -> None:
         """
         CREATE TRIGGER
         gpu_fault_telemetry_spool_notify_available_trigger
-        AFTER INSERT OR UPDATE OF available_at, revision
+        AFTER INSERT
         ON gpu_fault_telemetry_spool
-        FOR EACH ROW
+        REFERENCING NEW TABLE AS added
+        FOR EACH STATEMENT
+        EXECUTE FUNCTION
+            gpu_fault_telemetry_spool_notify_available()
+        """,
+    )
+    _ensure_trigger(
+        cursor,
+        "gpu_fault_telemetry_spool_notify_available_update_trigger",
+        "gpu_fault_telemetry_spool",
+        """
+        CREATE TRIGGER
+        gpu_fault_telemetry_spool_notify_available_update_trigger
+        AFTER UPDATE
+        ON gpu_fault_telemetry_spool
+        REFERENCING OLD TABLE AS removed NEW TABLE AS added
+        FOR EACH STATEMENT
         EXECUTE FUNCTION
             gpu_fault_telemetry_spool_notify_available()
         """,
