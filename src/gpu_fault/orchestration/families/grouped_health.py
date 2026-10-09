@@ -13,7 +13,7 @@ from gpu_fault.models import (
     WorkloadState,
     bounded_reasons,
 )
-from gpu_fault.orchestration.disposition import DispositionApplier
+from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 
 
@@ -178,6 +178,7 @@ class GroupedHealthService:
         )
         if stale is not None:
             return stale
+        folded = True
         if existing_incident is None or existing_workflow is None:
             incident, workflow = self._new_workflow(
                 candidate,
@@ -185,7 +186,7 @@ class GroupedHealthService:
                 now,
             )
         else:
-            incident, workflow = self._merge_existing(
+            incident, workflow, folded = self._merge_existing(
                 context,
                 candidate,
                 candidate_workflow,
@@ -199,6 +200,7 @@ class GroupedHealthService:
             workflow,
             existing_workflow,
             now,
+            folded=folded,
         )
 
     def _candidate(
@@ -377,7 +379,20 @@ class GroupedHealthService:
         existing_incident: FaultIncident,
         existing_workflow: WorkflowRequest,
         now: datetime,
-    ) -> tuple[FaultIncident, WorkflowRequest]:
+    ) -> tuple[FaultIncident, WorkflowRequest, bool]:
+        """``(incident, workflow, folded)``: whether the fault joined the plan.
+
+        A record-only absorption schedules nothing for the finding's node --
+        a read-only look at an attempt whose node-mutating step or pending
+        ``RESTART_WORKLOAD`` is already under way -- so the incident keeps its
+        node and GPU scope and the incumbent's pending steps are left alone
+        (``folded`` False); the event is still linked and the reason recorded.
+        Live, eks-first site: a two-node job's RESET_GPU on node A absorbed the
+        peer rank's hung findings after the STOP, report after report, and
+        each one widened the incident to both nodes and the reset's pending
+        VALIDATE_GPU/RESTORE_SCHEDULING onto a node it never isolated.
+        """
+
         gpus = set(context.finding.gpu_uuids)
         disposition = self.callbacks.merge_disposition(
             existing_workflow,
@@ -405,11 +420,19 @@ class GroupedHealthService:
             "diagnostic_reason",
             "node health",
         )
+        recorded_only = Disposition(disposition) is Disposition.ABSORB_RECORD_ONLY
+        scope: dict[str, object] = (
+            {}
+            if recorded_only
+            else {
+                "node_ids": sorted(set(existing_incident.node_ids) | {finding.node_id}),
+                "gpu_uuids": sorted(set(existing_incident.gpu_uuids) | gpus),
+            }
+        )
         incident = existing_incident.model_copy(
             update={
                 "event_type": "GPU_FAULT_GROUP",
-                "node_ids": sorted(set(existing_incident.node_ids) | {finding.node_id}),
-                "gpu_uuids": sorted(set(existing_incident.gpu_uuids) | gpus),
+                **scope,
                 "job_id": context.observation.job_id,
                 "attempt_id": context.observation.attempt_id,
                 "workload_identity_source": ("SOLE_ACTIVE_ATTEMPT_ON_NODE"),
@@ -429,7 +452,7 @@ class GroupedHealthService:
                 "updated_at": now,
             }
         )
-        return incident, workflow
+        return incident, workflow, not recorded_only
 
     def _apply_disposition(
         self,
@@ -462,10 +485,15 @@ class GroupedHealthService:
         workflow: WorkflowRequest,
         existing_workflow: WorkflowRequest | None,
         now: datetime,
+        *,
+        folded: bool = True,
     ) -> tuple[FaultIncident, WorkflowRequest]:
         finding = context.finding
+        # Only a fault the incumbent's plan took on widens its pending steps;
+        # a record-only absorption adds no work for the finding's node.
         if (
-            existing_workflow is not None
+            folded
+            and existing_workflow is not None
             and workflow.request_id == existing_workflow.request_id
             and not workflow.dag_enabled
         ):

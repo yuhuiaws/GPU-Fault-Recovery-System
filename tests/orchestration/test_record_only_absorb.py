@@ -127,6 +127,55 @@ def test_a_read_only_event_outside_the_mutating_scope_still_queues():
     assert same_gpu == "ABSORB_RECORD_ONLY"
 
 
+def test_a_read_only_event_on_the_job_s_other_node_is_covered_by_its_pending_restart():
+    """A two-node job being restarted by the workflow: the peer rank's hung
+    finding is read-only evidence about an attempt that is ending, not a fault
+    to queue behind the reset."""
+
+    merger = _merger()
+    resetting = workflow_request(
+        "wf-reset-job",
+        "inc-a",
+        status=WorkflowStatus.RUNNING,
+        official_steps=[
+            workflow_step(
+                WorkflowOperation.STOP_WORKLOADS, node_ids=["node-a", "node-b"]
+            ),
+            workflow_step(
+                WorkflowOperation.RESET_GPU, node_ids=["node-a"], gpu_uuids=["GPU-1"]
+            ),
+            workflow_step(
+                WorkflowOperation.RESTART_WORKLOAD, node_ids=["node-a", "node-b"]
+            ),
+        ],
+        completed_step_indexes=[0],
+        completed_operations=[WorkflowOperation.STOP_WORKLOADS],
+        aggregation_max_deadline=PAST,
+    )
+
+    peer = merger.disposition(resetting, _read_only("node-b"), "node-b", set())
+    restarted = merger.disposition(
+        resetting.model_copy(
+            update={
+                "completed_step_indexes": [0, 2],
+                "completed_operations": [
+                    WorkflowOperation.STOP_WORKLOADS,
+                    WorkflowOperation.RESTART_WORKLOAD,
+                ],
+            }
+        ),
+        _read_only("node-b"),
+        "node-b",
+        set(),
+    )
+
+    assert peer == "ABSORB_RECORD_ONLY", "the pending restart covers the peer"
+    assert restarted == "ABSORB_RECORD_ONLY", (
+        "a completed restart is history the evidence would describe; only a "
+        "superseded step stops covering"
+    )
+
+
 def test_the_faults_family_applies_record_only_without_touching_the_workflow():
     existing_workflow = _rebooting("node-a")
     existing_incident = fault_incident(

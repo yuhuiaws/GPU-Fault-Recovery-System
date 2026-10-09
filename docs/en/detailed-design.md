@@ -1175,6 +1175,13 @@ as evidence (the event is linked to that incident, and no new incident/workflow 
 a boot id the node has already left (the Agent has already heartbeated with the new boot, and the event's kernel time is earlier than that heartbeat) is only recorded as a `RECOVERED`
 incident and no action is planned. When ownership cannot be decided, the original behavior is kept.
 
+A record-only absorption (`ABSORB_RECORD_ONLY`: after the aggregation window closed, a read-only finding falls inside a
+RUNNING workflow's mutating scope -- a node-mutating step or a pending `RESTART_WORKLOAD` naming the node) only links
+the event to the incident and appends the reason: neither the incident's node/GPU scope nor the workflow's pending steps
+grow (`families/grouped_health.py`). A two-node training job's RESET_GPU once absorbed the peer rank's hung read-only
+findings after the STOP, report after report, widening VALIDATE_GPU/RESTORE_SCHEDULING onto a peer it never isolated
+and the incident to both nodes.
+
 Whole-record hardware recovery escalation is invoked idempotently by the Dispatcher on `FAILED` workflows:
 
 1. `RESET_GPU/RESET_ALL_GPUS_NVSWITCHES` fails: create a `RESTART_NODE` workflow.
