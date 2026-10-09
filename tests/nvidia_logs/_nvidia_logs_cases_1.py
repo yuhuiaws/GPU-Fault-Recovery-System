@@ -687,6 +687,8 @@ def test_kernel_nvlink5_accepts_fixed_width_unprefixed_hex() -> None:
 
 
 def test_kernel_nvlink5_incomplete_payload_remains_missing() -> None:
+    """A single register cannot carry both IntrInfo and Error Status."""
+
     result = NvidiaLogNormalizer().normalize_kernel(
         NvidiaKernelLogEvent(
             cluster_id="hp-cluster",
@@ -694,8 +696,8 @@ def test_kernel_nvlink5_incomplete_payload_remains_missing() -> None:
             record_id="kmsg-xid150-incomplete",
             observed_at=NOW,
             message=(
-                "NVRM: Xid (PCI:0000:b9:00): 150, MSE fatal 0 0 "
-                "Link 2 (0x00000001 0x00000002)"
+                "NVRM: Xid (PCI:0000:b9:00): 150, MSE_WATCHDOG  Fatal   "
+                "XC0 i0 Link 02 (0x00000001)"
             ),
             product="B200",
             driver_branch=575,
@@ -790,12 +792,35 @@ def test_kernel_nvlink5_accepts_the_drivers_unpadded_comma_form_without_a_space(
     ) == (0x1, 0x2)
 
 
-def test_kernel_nvlink5_five_registers_remain_missing() -> None:
+def test_kernel_nvlink5_accepts_the_firmwares_two_register_payload() -> None:
+    """GSP-RM's ``%s %s XC%01u i%01u Link %02d (0x%08x 0x%08x)``: IntrInfo
+    and Error Status alone."""
+
+    assert _nvlink5_registers(
+        "kmsg-xid149-mfde-two",
+        "NVRM: Xid (PCI:0000:b9:00): 149, pid=1234, name=python, "
+        "NETIR_MFDE_EVENT  Fatal   XC0 i0 Link 03 (0x00000014 0x00000001)",
+    ) == (0x14, 0x1)
+
+
+def test_kernel_nvlink5_accepts_the_firmwares_six_register_link_down_line() -> None:
+    """GSP-RM's six-register format: IntrInfo, Error Status and four debug
+    words."""
+
+    assert _nvlink5_registers(
+        "kmsg-xid149-link-down-six",
+        "NVRM: Xid (PCI:0000:b9:00): 149, pid=1234, name=python, "
+        "NETIR_LINK_DOWN  Fatal   XC0 i0 Link 05 (0x00000011 0x00000000 "
+        "0x00000000 0x00000000 0x00000000 0x00000000)",
+    ) == (0x11, 0x0)
+
+
+def test_kernel_nvlink5_five_registers_parse_under_the_two_to_eight_rule() -> None:
     assert _nvlink5_registers(
         "kmsg-xid150-five",
         "NVRM: Xid (PCI:0000:b9:00): 150, MSE_WATCHDOG  Fatal   XC0 i0 Link 03 "
         "(0x00000001 0x00000002 0x00000000 0x00000000 0x00000000)",
-    ) == (None, None)
+    ) == (0x1, 0x2)
 
 
 def test_kernel_nvlink5_nine_registers_remain_missing() -> None:

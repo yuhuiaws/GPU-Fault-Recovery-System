@@ -213,6 +213,51 @@ def test_kernel_xid_uses_boot_fenced_inventory_channel(
     asyncio.run(scenario())
 
 
+def test_kernel_nvlink5_two_register_netir_mfde_event_resets_gpu() -> None:
+    """The firmware's two-register XID 149 line reaches the Catalog action:
+    NETIR_MFDE_EVENT with Error Status 0x1 on a driver past the V2 boundary
+    decodes to RESET_GPU without any debug word."""
+
+    context = build_context()
+
+    async def scenario() -> None:
+        async with asgi_client(context) as client:
+            response = await client.post(
+                "/v1/collector-events/nvidia-kernel",
+                json={
+                    "cluster_id": "hp-cluster",
+                    "node_id": "worker-1",
+                    "record_id": "kmsg-xid149-mfde-worker-1",
+                    "observed_at": NOW.isoformat(),
+                    "message": (
+                        "NVRM: Xid (PCI:0000:b9:00): 149, pid=1234, name=python, "
+                        "NETIR_MFDE_EVENT  Fatal   XC0 i0 Link 03 "
+                        "(0x00000014 0x00000001)"
+                    ),
+                    "product": "B200",
+                    "driver_branch": 580,
+                    "cuda_version": "13.0",
+                    "runtime_profile_version": "simulated-v1",
+                    "workload_state": "IDLE",
+                },
+            )
+
+        assert response.status_code == 200, response.text
+        body = response.json()
+        event = body["normalized"]["xid_events"][0]
+        assert event["xid"] == 149
+        assert event["intr_info"] == 0x14
+        assert event["error_status"] == 0x1
+        decision = body["decisions"][0]
+        assert decision["source"] == "NVIDIA_CATALOG"
+        assert decision["official_action"] == "RESET_GPU"
+        assert decision["matched_decode_rules"] == ["NETIR_MFDE_EVENT"]
+        assert decision["disposition"] == "EXECUTABLE"
+        assert decision["action"] == "RESET_GPU"
+
+    asyncio.run(scenario())
+
+
 def test_kernel_xid74_first_mechanical_event_resets_gpu() -> None:
     context = build_context()
     context.gpu_metrics.ingest(
