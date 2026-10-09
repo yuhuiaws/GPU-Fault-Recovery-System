@@ -212,7 +212,9 @@ class CallerEnvironment:
         if registering and self.fault == "register-ack":
             raise RuntimeError("unit registry publication ACK lost")
 
-    def entries(self, count: int, *, run_id: str, expires_at: datetime) -> list[dict]:
+    def entries(
+        self, count: int, *, run_id: str, expires_at: datetime, **_pins: Any
+    ) -> list[dict]:
         assert count == 1, "these HA cases authorize one synthetic cluster"
         return [
             {

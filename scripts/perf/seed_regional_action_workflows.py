@@ -33,8 +33,10 @@ KUBERNETES_OWNER = "gpu-fault-kubernetes-adapter"
 NODE_OWNER = "gpu-fault-node-agent"
 HYPERPOD_OWNER = "gpu-fault-hyperpod-adapter"
 #: The provider the synthetic ``perf-cap-*`` clusters are registered as
-#: (``regional_capacity_registry.synthetic_cluster_entry`` registers them
-#: without a provider, which the registry reads as ``hyperpod``). The Agent
+#: (``regional_capacity_registry.register`` reads the same variable and
+#: registers them with that provider and the Runtime Profile pins its
+#: production registration carries; ``regional_capacity_pins`` mirrors this
+#: name because this script runs standalone on the api Pod). The Agent
 #: template, and therefore the Runtime Profile every synthetic workflow is
 #: planned against, must come from a cluster of this provider: a mixed site's
 #: most recently seen Agent was an eks-managed node, its profile owned
@@ -243,6 +245,96 @@ def verify_profile_provider(
             f"(or set {SYNTHETIC_PROVIDER_ENV})"
         )
     return {"synthetic_provider": provider, "node_reboot_owner": expected}
+
+
+def registered_pins_facts(
+    context: ApplicationContext,
+    *,
+    clusters: int,
+    runtime_profile_version: str,
+    config_digest: str,
+) -> dict[str, str]:
+    """The pins the synthetic registrations carry, checked against the Agents'.
+
+    ``regional_capacity_registry.register`` copies ``runtime_profile_version``
+    and ``agent_config_digest`` from the production registration of the
+    synthetic clusters' provider, and ``FleetRegistry.cluster_policy`` holds
+    the seeded Agents to them. An Agent template reporting other values would
+    be held before its first destructive step, so the seed refuses here, before
+    any load is sent. Empty pins mean the site policy and are not checked.
+    """
+
+    versions: set[str] = set()
+    digests: set[str] = set()
+    for cluster_index in range(clusters):
+        cluster_id = f"perf-cap-{cluster_index:03d}"
+        try:
+            registration = context.store.get_regional_cluster(cluster_id)
+        except (NotFoundError, KeyError) as exc:
+            raise RuntimeError(
+                f"synthetic cluster {cluster_id} is not registered"
+            ) from exc
+        versions.add(str(registration.runtime_profile_version or ""))
+        digests.add(str(registration.agent_config_digest or ""))
+    if len(versions) != 1 or len(digests) != 1:
+        raise RuntimeError(
+            "the synthetic clusters carry different Runtime Profile pins: "
+            f"versions {sorted(versions)}, digests {sorted(digests)}"
+        )
+    (version,) = versions
+    (digest,) = digests
+    mismatches = []
+    if version and version != runtime_profile_version:
+        mismatches.append(
+            f"runtime_profile_version {version} (registered) vs "
+            f"{runtime_profile_version} (Agent template)"
+        )
+    if digest and digest != config_digest:
+        mismatches.append(
+            f"agent_config_digest {digest} (registered) vs "
+            f"{config_digest} (Agent template)"
+        )
+    if mismatches:
+        raise RuntimeError(
+            "the synthetic registrations pin values the seeded Agents would not "
+            "report, so the fleet compatibility preflight would hold every "
+            "destructive step: " + "; ".join(mismatches)
+        )
+    return {
+        "registered_runtime_profile_version": version,
+        "registered_agent_config_digest": digest,
+    }
+
+
+def provider_and_pin_facts(
+    context: ApplicationContext,
+    *,
+    clusters: int,
+    runtime_profile_version: str,
+    identity: Mapping[str, object] | None,
+    agent_template: AgentRecord | None,
+) -> dict[str, str]:
+    """The seed summary's provider facts plus the registered pins, both
+    checked against the Agent template before any load is sent."""
+
+    facts = verify_profile_provider(
+        context, runtime_profile_version, synthetic_provider()
+    )
+    if identity is not None:
+        config_digest = str(identity["config_digest"])
+    elif agent_template is not None:
+        config_digest = agent_template.config_digest
+    else:
+        config_digest = ""
+    facts.update(
+        registered_pins_facts(
+            context,
+            clusters=clusters,
+            runtime_profile_version=runtime_profile_version,
+            config_digest=config_digest,
+        )
+    )
+    return facts
 
 
 def save_synthetic_agent(
@@ -629,8 +721,12 @@ def main() -> None:
             runtime_profile_version = ""
         if not runtime_profile_version:
             raise RuntimeError("synthetic Agent runtime Profile is missing")
-        provider_facts = verify_profile_provider(
-            context, runtime_profile_version, synthetic_provider()
+        provider_facts = provider_and_pin_facts(
+            context,
+            clusters=clusters,
+            runtime_profile_version=runtime_profile_version,
+            identity=identity,
+            agent_template=agent_template,
         )
         if seed_mode in {"correlated-agents", "integrated-agents"}:
             workflows_per_cluster = int(os.getenv("ACTION_WORKFLOWS_PER_CLUSTER", "2"))

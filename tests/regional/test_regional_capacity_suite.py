@@ -734,7 +734,11 @@ def test_registration_rejects_old_cluster_data_before_any_mutation(
         registry_module, "validate_registry_target", lambda **k: "isolated"
     )
     monkeypatch.setattr(registry_module, "cleanup_registry_residuals", lambda **k: 0)
-    monkeypatch.setattr(registry_module, "load_registry", lambda: [])
+    monkeypatch.setattr(
+        registry_module,
+        "load_registry",
+        lambda: [{"cluster_id": "production", "token": "p" * 32}],
+    )
     monkeypatch.setattr(registry_module, "verify_registry_alignment", lambda **k: {})
     monkeypatch.setattr(registry_module, "capture_secret_baseline", lambda *a: None)
     monkeypatch.setattr(regional_capacity_data, "invoke", lambda *a, **k: {"total": 1})

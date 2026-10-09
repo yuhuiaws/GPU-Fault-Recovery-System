@@ -10,10 +10,16 @@ import subprocess
 import sys
 import time
 from datetime import datetime, timezone
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
 if __package__:
+    from .regional_capacity_pins import (
+        PIN_FIELDS,
+        inherited_pins,
+        synthetic_registration_provider,
+    )
     from .regional_registry_alignment import (
         SECRET_RESTORE_FILE,
         baseline_serialization,
@@ -22,6 +28,11 @@ if __package__:
         verify_alignment,
     )
 else:
+    from regional_capacity_pins import (
+        PIN_FIELDS,
+        inherited_pins,
+        synthetic_registration_provider,
+    )
     from regional_registry_alignment import (
         SECRET_RESTORE_FILE,
         baseline_serialization,
@@ -867,6 +878,8 @@ def synthetic_cluster_entry(
     region: str | None = None,
     allowed_namespaces: list[str] | None = None,
     token: str | None = None,
+    provider: str | None = None,
+    pins: Mapping[str, str] | None = None,
 ) -> dict:
     """One synthetic registration as the registry takes it (plaintext token).
 
@@ -877,10 +890,20 @@ def synthetic_cluster_entry(
     suite mints ``perf-cap-NNN`` ids through it; the AUTH-007/008 runner mints
     its ``auth-logical-`` second logical cluster through the same builder so
     the two never drift apart in what "synthetic" means.
+
+    ``provider`` names the cluster family the registration belongs to and
+    ``pins`` the ``runtime_profile_version`` / ``agent_config_digest`` it
+    carries (``regional_capacity_pins.inherited_pins``: what the production
+    registration of that provider carries); both are omitted when not given,
+    which the registry reads as the default provider on the site pins.
     """
 
+    if pins and set(pins) - set(PIN_FIELDS):
+        raise RuntimeError(
+            "synthetic registration pins are limited to " + ", ".join(PIN_FIELDS)
+        )
     selected_region = region or AWS_REGION
-    return {
+    entry = {
         "cluster_id": cluster_id,
         "region": selected_region,
         "hyperpod_cluster_name": cluster_id,
@@ -898,6 +921,13 @@ def synthetic_cluster_entry(
         ),
         "agent_endpoint_allowed_cidrs": ["127.0.0.1/32"],
     }
+    if provider is not None:
+        entry["provider"] = provider
+    for field in PIN_FIELDS:
+        value = (pins or {}).get(field)
+        if value:
+            entry[field] = value
+    return entry
 
 
 def perf_cluster_entries(
@@ -905,12 +935,16 @@ def perf_cluster_entries(
     *,
     run_id: str,
     expires_at: datetime,
+    provider: str | None = None,
+    pins: Mapping[str, str] | None = None,
 ) -> list[dict]:
     return [
         synthetic_cluster_entry(
             f"{PERF_CLUSTER_PREFIX}{index:03d}",
             run_id=run_id,
             expires_at=expires_at,
+            provider=provider,
+            pins=pins,
         )
         for index in range(count)
     ]
@@ -1252,13 +1286,26 @@ def register(
         json.dumps(redacted_registry_entries(baseline), indent=1) + "\n"
     )
     capture_secret_baseline(artifacts, existing)
+    # The seeded Agents are copies of a live Agent of the synthetic clusters'
+    # provider and report that provider's Runtime Profile and config digest;
+    # the registration carries the same pins (none for the site's base family)
+    # or the fleet compatibility preflight holds every destructive step.
+    inheritance = inherited_pins(baseline, synthetic_registration_provider())
     perf = perf_cluster_entries(
         count,
         run_id=run_id,
         expires_at=expires_at,
+        provider=inheritance["provider"],
+        pins=inheritance["pins"],
     )
     log(
-        f"registering {len(perf)} audit clusters "
+        f"registering {len(perf)} audit clusters as {inheritance['provider']} "
+        "with pins "
+        + (
+            ", ".join(f"{k}={v}" for k, v in inheritance["pins"].items())
+            or "none (site policy)"
+        )
+        + f" inherited from {', '.join(inheritance['source_cluster_ids'])} "
         f"(keeping {len(baseline)} production entries)"
     )
     tokens = [
@@ -1291,6 +1338,9 @@ def register(
                 "cluster_ids": cluster_ids,
                 "synthetic_expires_at": expires_at.isoformat(),
                 "data_empty_before_registration": True,
+                "provider": inheritance["provider"],
+                "inherited_pins": inheritance["pins"],
+                "pins_source_cluster_ids": inheritance["source_cluster_ids"],
             },
             sort_keys=True,
         )

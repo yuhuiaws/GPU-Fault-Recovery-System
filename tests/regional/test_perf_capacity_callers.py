@@ -43,7 +43,7 @@ def test_capacity_main_registers_creates_and_cleans_one_receipted_run(
         "exact cleanup must precede registry revocation"
     )
     assert wire.objects == {}, "the fake complete run must not leave owned resources"
-    assert wire.entries == [], (
+    assert wire.entries == [wire.production], (
         "the fake complete run must not leave synthetic registration"
     )
     assert json.loads((tmp_path / "status.json").read_text())["status"] == "ok", (

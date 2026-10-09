@@ -90,7 +90,13 @@ class CapacityWire:
         self.artifacts = artifacts
         self.amp = AmpWire(monkeypatch)
         self.objects: dict[str, dict[str, Any]] = {}
-        self.entries: list[dict[str, Any]] = []
+        # The site's own registration: a synthetic cluster inherits the Runtime
+        # Profile pins of its provider's production entry (none here).
+        self.production: dict[str, Any] = {
+            "cluster_id": "production",
+            "token": "REPLACE_WITH_TEST_TOKEN",
+        }
+        self.entries: list[dict[str, Any]] = [dict(self.production)]
         self.events: list[str] = []
         self.creations: list[dict[str, Any]] = []
         self.teardowns: list[dict[str, Any]] = []

@@ -120,6 +120,17 @@ release state, the seed checks that the Runtime Profile's `nodeReboot` owner is 
 synthetic workflow was planned against the eks profile, RESTART_NODE/REPLACE_NODE belonged to `gpu-fault-eks-adapter`,
 the simulated executor never claimed them and the unclaimed command held every other workflow of the cluster PENDING.
 The simulated executor now advertises both providers' lifecycle adapter owners.
+The synthetic registrations also copy `runtime_profile_version` and `agent_config_digest` from the **production registration
+of the same provider** (none when that provider is the site's base family and its registration carries no pins; registration
+fails closed when no production registration of that provider exists or same-provider registrations disagree on their pins):
+`FleetRegistry.cluster_policy` holds each cluster's Agents to the pins its own registration carries, else to the site pins,
+and the synthetic Agent template is a real Agent of that provider reporting exactly that provider's Runtime Profile and
+config digest -- without the inheritance the fleet compatibility preflight holds every destructive step with `runtime profile
+mismatch ... PIN_AHEAD_OF_FLEET` (on the eks-base mixed site only the 32 RESTART_NODE workflows of 128 integrated ones
+completed). The inherited pins and their source cluster are recorded in `registry-registration-intent.json` (`provider`,
+`inherited_pins`, `pins_source_cluster_ids`); the seed summary records `registered_runtime_profile_version` /
+`registered_agent_config_digest` and fails closed before any load is sent when the template Agent's values differ. The
+registry baseline/restore and the postflight cleanup still identify the entries by `synthetic`/run id and remove them unchanged.
 
 Only when the formal `gpu-fault-system` control plane is genuinely approved for use may the
 command supply both:
