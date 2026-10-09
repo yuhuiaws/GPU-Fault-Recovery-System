@@ -214,10 +214,10 @@ def test_kernel_xid_uses_boot_fenced_inventory_channel(
 
 
 def _nvlink5_kernel_decision(
-    message: str, *, record_id: str, driver_branch: int
+    message: str, *, record_id: str, driver_branch: int, product: str = "B200"
 ) -> tuple[dict, dict]:
-    """``(normalized xid event, decision)`` for one B200 kernel line posted to
-    the collector endpoint -- the normalizer and the policy engine together."""
+    """``(normalized xid event, decision)`` for one Blackwell kernel line posted
+    to the collector endpoint -- the normalizer and the policy engine together."""
 
     context = build_context()
     result: dict = {}
@@ -232,7 +232,7 @@ def _nvlink5_kernel_decision(
                     "record_id": record_id,
                     "observed_at": NOW.isoformat(),
                     "message": message,
-                    "product": "B200",
+                    "product": product,
                     "driver_branch": driver_branch,
                     "cuda_version": "13.0",
                     "runtime_profile_version": "simulated-v1",
@@ -302,6 +302,28 @@ def test_kernel_nvlink5_captured_b200_link_event_decodes_only_under_its_driver_b
     assert decision["action"] is None
     assert decision["disposition"] == "BLOCKED_MISSING_EVIDENCE"
     assert decision["requires_operator"] is True
+
+
+def test_kernel_nvlink5_r590_secure_two_register_line_resets_gpu_on_b300() -> None:
+    """B300-class products run R580 or newer; the R590+ two-register form
+    carries a SECURE token outside the parentheses. ``NVIDIA B300 SXM6 AC``
+    resolves to the B100 family (prefix B) and the registers decode under V2
+    to NETIR_LINK_EVT/NETIR_LINK_DOWN -> RESET_GPU."""
+
+    event, decision = _nvlink5_kernel_decision(
+        "NVRM: Xid (PCI:0000:b9:00): 149, pid=1234, name=python, "
+        "NETIR_LINK_DOWN SECURE  Fatal   XC0 i0 Link 03 (0x00000011 0x00000000)",
+        record_id="kmsg-xid149-b300-secure",
+        driver_branch=590,
+        product="NVIDIA B300 SXM6 AC",
+    )
+
+    assert event["product"] == "NVIDIA B300 SXM6 AC"
+    assert (event["intr_info"], event["error_status"]) == (0x11, 0x0)
+    assert decision["matched_decode_rules"] == ["NETIR_LINK_EVT/NETIR_LINK_DOWN"]
+    assert decision["official_action"] == "RESET_GPU"
+    assert decision["disposition"] == "EXECUTABLE"
+    assert decision["action"] == "RESET_GPU"
 
 
 def test_kernel_nvlink5_gpud_ber_event_is_ignored_under_v1() -> None:

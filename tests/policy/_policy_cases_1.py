@@ -187,6 +187,35 @@ def test_catalog_product_columns_represent_families(product: str, family: str) -
     assert decision.disposition is ActionDisposition.MONITOR_ONLY
 
 
+def test_rule_149_product_gate_admits_b300_and_gb300_as_blackwell_families() -> None:
+    """B300-class device ids first appear in R580 firmware, so a B300 fleet
+    reports XID 149 under the V2 pattern; ``NVIDIA GB300`` is the GB200 family
+    and ``NVIDIA B300 SXM6 AC`` the B100 family, both in rule 149's columns."""
+
+    from gpu_fault.policy.product_families import catalog_supports_product
+
+    (rule,) = [item for item in load_xid_policy().catalog_rules if item.xid == 149]
+    assert catalog_product_family("NVIDIA GB300") == "GB200"
+    assert catalog_product_family("NVIDIA B300 SXM6 AC") == "B100"
+    assert catalog_supports_product("NVIDIA GB300", rule.products) is True
+    assert catalog_supports_product("NVIDIA B300 SXM6 AC", rule.products) is True
+
+    decision = GpuFaultPolicyEngine().evaluate_xid(
+        xid(
+            149,
+            event_id="xid-149-gb300",
+            product="NVIDIA GB300",
+            driver_branch=590,
+            intr_info=0x11,
+            error_status=0x0,
+        )
+    )
+
+    assert decision.disposition is ActionDisposition.EXECUTABLE
+    assert decision.matched_decode_rules == ["NETIR_LINK_EVT/NETIR_LINK_DOWN"]
+    assert decision.action is RecoveryAction.RESET_GPU
+
+
 def test_catalog_family_matching_preserves_per_rule_scope() -> None:
     h200 = GpuFaultPolicyEngine().evaluate_xid(
         xid(136, event_id="h-family", product="NVIDIA H200 NVL")

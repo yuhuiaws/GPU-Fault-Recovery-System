@@ -803,6 +803,19 @@ def test_kernel_nvlink5_accepts_the_firmwares_two_register_payload() -> None:
     ) == (0x14, 0x1)
 
 
+def test_kernel_nvlink5_accepts_the_r590_secure_two_register_form() -> None:
+    """R590 and newer GSP-RM firmware prints the two-register form as
+    ``%s SECURE %s XC%01u i%01u Link %02d (0x%08x 0x%08x)`` -- a literal
+    SECURE token between the sub-code and the severity. Only the parenthesised
+    group is read."""
+
+    assert _nvlink5_registers(
+        "kmsg-xid149-secure-two",
+        "NVRM: Xid (PCI:0000:b9:00): 149, pid=1234, name=python, "
+        "NETIR_LINK_DOWN SECURE  Fatal   XC0 i0 Link 03 (0x00000011 0x00000000)",
+    ) == (0x11, 0x0)
+
+
 def test_kernel_nvlink5_accepts_the_firmwares_six_register_link_down_line() -> None:
     """GSP-RM's six-register format: IntrInfo, Error Status and four debug
     words."""
@@ -823,12 +836,32 @@ def test_kernel_nvlink5_five_registers_parse_under_the_two_to_eight_rule() -> No
     ) == (0x1, 0x2)
 
 
-def test_kernel_nvlink5_nine_registers_remain_missing() -> None:
+def test_kernel_nvlink5_nine_registers_parse_without_an_upper_bound() -> None:
+    """The fields are positional; the count carries no information, so a
+    longer register dump still decodes its first two values."""
+
     assert _nvlink5_registers(
         "kmsg-xid145-nine",
         "NVRM: Xid (PCI:0000:b9:00): 145, RLW nonfatal 0 0 Link 3 (0x00000004 "
         "0x00000001 0x00000000 0x00000000 0x00000000 0x00000000 0x00000000 "
         "0x00000000 0x00000000)",
+    ) == (0x4, 0x1)
+
+
+def test_kernel_nvlink5_twelve_registers_parse_without_an_upper_bound() -> None:
+    assert _nvlink5_registers(
+        "kmsg-xid149-twelve",
+        "NVRM: Xid (PCI:0000:b9:00): 149, NETIR_INT  Fatal   XC0 i0 Link 03 "
+        "(0x00000018 0x00000000 0x00000001 0x00000002 0x00000003 0x00000004 "
+        "0x00000005 0x00000006 0x00000007 0x00000008 0x00000009 0x0000000a)",
+    ) == (0x18, 0x0)
+
+
+def test_kernel_nvlink5_a_value_over_32_bits_remains_missing() -> None:
+    assert _nvlink5_registers(
+        "kmsg-xid149-wide",
+        "NVRM: Xid (PCI:0000:b9:00): 149, NETIR_INT  Fatal   XC0 i0 Link 03 "
+        "(0x100000000 0x00000000)",
     ) == (None, None)
 
 

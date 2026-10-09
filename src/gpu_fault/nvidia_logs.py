@@ -87,20 +87,25 @@ _NVLINK5_REGISTER_TOKEN = r"(?:0[xX][0-9a-fA-F]{1,8}|[0-9a-fA-F]{8})"
 # ``Nonfatal``). The open-source driver prints the MSE (XID 150) legacy Xid
 # with the same six-register shape and the ALI link-training Xid with seven
 # unpadded ``0x%x`` values separated by commas and no space before the
-# parenthesis. The NVIDIA Xid Catalog's WORKFLOW_NVLINK5_ERR template
-# (intrInfo, errorStatus, errorDebugData[0..4]) is documentation only -- no
-# seven-value format exists in the firmware. The Catalog user guide identifies
-# IntrInfo as the first register in the parentheses and Error Status as the
-# second -- the count never names the two fields -- so a group of two to eight
-# registers is accepted and anything else (a single register, more than eight,
-# a non-hex token, a value over 32 bits, a group after another Xid token)
-# leaves both fields missing.
+# parenthesis; R590 and newer firmware adds a literal SECURE token before the
+# severity, outside the parentheses. The NVIDIA Xid Catalog's
+# WORKFLOW_NVLINK5_ERR template (intrInfo, errorStatus, errorDebugData[0..4]) is
+# documentation only -- no seven-value format exists in the firmware. The
+# Catalog user guide identifies IntrInfo as the first register in the
+# parentheses and Error Status as the second: the fields are positional and the
+# count has already changed across firmware branches, so a group of two or more
+# registers is accepted with no upper bound (a fixed bound would turn a future
+# extra debug word into BLOCKED_MISSING_EVIDENCE for every real event while
+# adding no safety -- a hex-only parenthesised group right after a 144-150 Xid
+# token is the register dump by definition). A single register, a non-hex
+# token, a value over 32 bits or a group after another Xid token leaves both
+# fields missing.
 _NVLINK5_REGISTER_PAYLOAD_PATTERN = re.compile(
     r"\(\s*"
     rf"(?P<intr_info>{_NVLINK5_REGISTER_TOKEN})"
     r"(?:\s*,\s*|\s+)"
     rf"(?P<error_status>{_NVLINK5_REGISTER_TOKEN})"
-    rf"(?:(?:\s*,\s*|\s+){_NVLINK5_REGISTER_TOKEN}){{0,6}}"
+    rf"(?:(?:\s*,\s*|\s+){_NVLINK5_REGISTER_TOKEN})*"
     r"\s*\)",
 )
 _SXID_PATTERN = re.compile(

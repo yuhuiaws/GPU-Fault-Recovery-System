@@ -524,18 +524,23 @@ no wrong workflow is created early either; when the window closes, the primary i
 incident, avoiding a double reset/reboot.
 
 The production normalizer for XID 144-150 parses along the kernel message boundaries defined by the NVIDIA Catalog:
-it inspects only the parenthesized payload after the current XID number and before the next XID, and requires the parentheses to contain two to eight
+it inspects only the parenthesized payload after the current XID number and before the next XID, and requires the parentheses to contain at least two
 32-bit hexadecimal registers. The GSP-RM firmware that formats XID 144-149 before the kernel relays them (`gsp_ga10x.bin`/`gsp_tu10x.bin` of
-driver 580.178.04) carries exactly two register payload formats: `%s %s XC%01u i%01u Link %02d (0x%08x 0x%08x)` (intrInfo, errorStatus) and the
-same prefix followed by six `0x%08x` (intrInfo, errorStatus and four debug words); the open-source driver prints the MSE (XID 150) legacy Xid with
-the same six, and the ALI link-training Xid with seven unpadded comma-separated `0x%x` values. The seven values of the Catalog's
+R580 and newer drivers) carries exactly two register payload formats: `%s %s XC%01u i%01u Link %02d (0x%08x 0x%08x)` (intrInfo, errorStatus) and
+the same prefix followed by six `0x%08x` (intrInfo, errorStatus and four debug words); the open-source driver prints the MSE (XID 150) legacy Xid
+with the same six, and the ALI link-training Xid with seven unpadded comma-separated `0x%x` values. R590 and newer firmware prints the two-register
+form with a literal `SECURE` token between the sub-code and the ` Fatal  `/`Nonfatal` token (`%s SECURE %s XC%01u i%01u Link %02d (0x%08x
+0x%08x)`); the parser reads only the parenthesised group and ignores everything outside it. The seven values of the Catalog's
 `WORKFLOW_NVLINK5_ERR` template (intrInfo, errorStatus and errorDebugData[0..4]) are documentation only -- no seven-value format exists in the
 firmware. The Catalog user guide defines IntrInfo as the first register in the parentheses and Error Status as the second, so the register count
 is not what identifies the two fields: the first register maps to `intr_info`, the second maps to `error_status`, and only these two are decoded;
-the remaining debug data values are kept in the raw evidence. The parser accepts 1-8 digit hexadecimal values with `0x` (the driver's `0x%x` is
+the remaining registers are kept in the raw evidence. The register count has no upper bound: the fields are positional and the count has already
+changed across firmware branches (two/six, the SECURE variant), so a fixed bound would turn a future extra debug word into `BLOCKED_MISSING_EVIDENCE`
+and quarantine for every real event while adding no safety -- a hex-only parenthesised group right after a 144-150 Xid token is the register dump by
+definition. The parser accepts 1-8 digit hexadecimal values with `0x` (the driver's `0x%x` is
 not zero-padded), as well as fixed eight-digit hexadecimal values without a prefix; fields may be separated by spaces or commas and the
-parenthesis need not be preceded by a space. A single value or more than eight values, any non-hexadecimal token, a value exceeding 32 bits or a
-group after another XID leave both fields unguessed; the policy returns
+parenthesis need not be preceded by a space. A single value, any non-hexadecimal token, a value exceeding 32 bits or a group after another XID
+leave both fields unguessed; the policy returns
 `BLOCKED_MISSING_EVIDENCE` and quarantines. This extraction logic is shared by the Kernel and
 Fabric Manager normalization entry points (three in total).
 

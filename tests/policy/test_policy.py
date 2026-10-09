@@ -22,6 +22,7 @@ from ._policy_cases_1 import (
     test_nvlink_decode_rule_rejects_malformed_catalog_values,
     test_policy_is_generated_from_complete_pinned_catalog,
     test_repeated_ignore_xid_does_not_invent_site_escalation,
+    test_rule_149_product_gate_admits_b300_and_gb300_as_blackwell_families,
     test_sxid_20001_fatal_conflict_fails_closed,
     test_sxid_catalog_is_complete_and_pinned,
     test_sxid_is_not_applicable_to_blackwell_products,
