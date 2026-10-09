@@ -165,6 +165,20 @@ def _apply_control_state_legacy_reset_v18(cursor: MigrationCursor) -> None:
     cursor.execute("SELECT 1")
 
 
+def _apply_hot_table_storage_parameters_v19(cursor: MigrationCursor) -> None:
+    # A day of churn left the hot tables' heaps and indexes 100-1000x their
+    # live size: no update was HOT and autovacuum ran at the instance defaults.
+    # The storage parameters (fillfactor, threshold-only autovacuum, the
+    # queue's toast.*) live in the idempotent DDL (ddl_storage_parameters.py,
+    # catalog-checked like v13's autovacuum factors). The two single-column
+    # timestamp indexes whose only reader is a retention sweep go here: they
+    # made every metric upsert (observed_at) and every lane update
+    # (lease_expires_at) a non-HOT update. The sweeps now scan tables the same
+    # retention keeps small.
+    cursor.execute("DROP INDEX IF EXISTS gpu_fault_gpu_metric_latest_observed")
+    cursor.execute("DROP INDEX IF EXISTS gpu_fault_processor_lanes_expiry")
+
+
 @dataclass(frozen=True)
 class SchemaMigration:
     version: int
@@ -310,6 +324,12 @@ POSTGRES_SCHEMA_MIGRATIONS = (
         name="control-state-legacy-copy-reset-without-truncate",
         ddl_checksum="2d18a5af51bc051d72e525cd1508bb2aa0b9f933eeeceaa232529779443e4a80",
         apply=_apply_control_state_legacy_reset_v18,
+    ),
+    SchemaMigration(
+        version=19,
+        name="hot-table-storage-parameters-and-hot-update-indexes",
+        ddl_checksum="e2a44da879b4b6ec0bcb8faa84a4c275eeedc215225c6c966e2550a524a92ad5",
+        apply=_apply_hot_table_storage_parameters_v19,
     ),
 )
 

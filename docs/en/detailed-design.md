@@ -544,6 +544,16 @@ leave both fields unguessed; the policy returns
 `BLOCKED_MISSING_EVIDENCE` and quarantines. This extraction logic is shared by the Kernel and
 Fabric Manager normalization entry points (three in total).
 
+The Catalog's "Action 2" columns (`_workflow_nvlink5`): besides its primary IntrInfo mask, a decode rule may carry an
+Action-2 mask (`action2V1Pattern`/`action2V2Pattern`, V1 or V2 chosen by the driver branch like the primary one). The rule
+also matches when IntrInfo matches its Action-2 mask, but the rule's Error Status must still match exactly; such a
+secondary match adds the rule's Action 2 to the recovery-action set, and the existing priority RESET_GPU > XID_154_EVAL >
+IGNORE lets the promoted action win over the primary bucket. In Catalog 6.10 only the three XID 145 `RLW_RXPIPE` rows
+(Error Status 0x1/0x2/0x4, primary IGNORE, Action 2 RESET_GPU, severity "Non-fatal*") carry an Action 2 and no XID 149 row
+does -- the Catalog guide explains the asterisk as "* is for promoteable errors that could be non-fatal or fatal and
+Action 2 would apply". Covering tests: `test_nvlink5_rxpipe_secondary_pattern_selects_the_pinned_reset_action` and
+`test_secondary_nvlink_pattern_still_requires_an_exact_error_status` in `tests/policy/test_cov95_runtime_nvlink_policy.py`.
+
 Dedicated actions in the Catalog that already have production adapters compile directly into precise workflows:
 
 - `CONTACT_SUPPORT -> ESCALATE_SUPPORT`, with no unauthorized reset or reboot.
@@ -3077,7 +3087,7 @@ authentication, deploy/takeover sync, cluster removal and full-site uninstall re
 ### 2.23 Administrator CLI and deployment assets `src/gpu_fault/admin/`
 
 `gpu-fault-admin` is the site's only change entry point (public verbs `status`, `deploy`, `config`, `workflow-reconcile`,
-`failure-domain-map`, `rotate-token`, `submit-remediation`, `collector-outbox`, `join-cluster`,
+`failure-domain-map`, `rotate-token`, `submit-remediation`, `collector-outbox`, `store-maintenance`, `join-cluster`,
 `remove-cluster`, `uninstall`; `preflight`/`verify` are only internal pass-throughs of the release driver and do not appear in `--help`).
 It drives the site lifecycle and takes no part in fault decisions, but shares the Store model, the authentication boundary
 (the execution-token routes of §4) and the installation resource registry of §2.22 with the control plane. The administrator
@@ -3421,9 +3431,12 @@ One row per `ordering_key`. `owner_id + epoch + lease_token` identify the curren
 owner, and `lease_expires_at` allows another Pod to take over after the owner fails. On request completion or release, the
 fencing fields of both the lane and the request must be verified.
 
-The `gpu_fault_processor_lanes_expiry` index serves expired-lease takeover. expiry is an ownership lease,
-not a data TTL; lane rows are reused and updated by subsequent requests. The lane table only grows and never deletes; its row count is bounded by the number of ordering keys that have
-ever appeared.
+Expired-lease takeover goes through the claim CTE's primary-key path (`ON CONFLICT (ordering_key) ... WHERE
+lease_expires_at <= now`) and needs no index on `lease_expires_at`. expiry is an ownership lease, not a data TTL; lane
+rows are reused and updated in place by subsequent requests -- since v19 `lease_expires_at` is no longer indexed and the
+table's `fillfactor` is 50, so these updates are HOT. Lane rows are deleted by the periodic `cleanup_processor_lanes`:
+lanes whose lease expired with no PENDING/LEASED request on the same ordering key are removed in LIMIT batches, by
+default one hour after expiry, by a sequential scan of the very table that retention keeps small.
 
 #### 3.1.5 admission Counters: Legacy Row and Priority Shards
 
@@ -3504,7 +3517,15 @@ v13 added 9 (`ddl_control_plane_review.py`: `gpu_fault_workflow_updated_all`,
 `gpu_fault_marker_inactive_observed`, `gpu_fault_notification_created_at`,
 `gpu_fault_fleet_deployment_terminal`), and set the
 `autovacuum_vacuum_scale_factor`/`autovacuum_analyze_scale_factor` of the hot table `gpu_fault_objects` to 0.02/0.01 (issuing `ALTER` only when different from the current
-value). v14 added the function `gpu_fault_objects_notify_wakeup()` and the trigger
+value). v19 (`ddl_storage_parameters.py`) uses the same catalog check to set storage parameters on the hot tables
+`gpu_fault_processor_lanes`, `gpu_fault_processor_queue_counts`, `gpu_fault_processor_priority_count_shards`,
+`gpu_fault_processor_queue` (with its TOAST), `gpu_fault_gpu_metric_latest` and `gpu_fault_gpu_metrics_batches` --
+`fillfactor` 50/70 on the tables rewritten in place, `autovacuum_vacuum_scale_factor=0`,
+`autovacuum_vacuum_threshold=50`, the same for analyze and `autovacuum_vacuum_cost_delay=0` on all of them -- and
+retires `gpu_fault_gpu_metric_latest_observed` and `gpu_fault_processor_lanes_expiry` in its migration callback: their
+only readers are the retention sweeps' batched DELETEs, and they kept every metric upsert and lane update from being
+HOT. Existing bloat is reclaimed by `gpu-fault-admin store-maintenance` (`admin/store_maintenance_script.py`).
+v14 added the function `gpu_fault_objects_notify_wakeup()` and the trigger
 `gpu_fault_objects_notify_wakeup_trigger` (`ddl_wakeups.py`).
 Every declaration first checks `to_regclass` via `_declare_index()` and issues no create-index statement when it already exists, so an unchanged
 `--ensure-schema` holds only AccessShareLock and never takes an index-build lock. Functions, triggers and views have their own definition verification:
@@ -3593,7 +3614,7 @@ The schema has an independent versioned migration registry, `src/gpu_fault/schem
 `POSTGRES_SCHEMA_MIGRATIONS` currently has **18 versions** (v12 `store-review-hot-query-indexes`,
 v13 `control-plane-review-indexes-and-autovacuum`, v14 `objects-wakeup-notify-trigger`,
 v15 `remote-command-state-table-and-cutover-fences`, v16 `workflow-state-table-and-independent-cutover`,
-v17 `control-state-dual-projection-conditional-delete`, v18 `control-state-legacy-copy-reset-without-truncate`), and `LATEST_POSTGRES_SCHEMA_VERSION`
+v17 `control-state-dual-projection-conditional-delete`, v18 `control-state-legacy-copy-reset-without-truncate`, v19 `hot-table-storage-parameters-and-hot-update-indexes`), and `LATEST_POSTGRES_SCHEMA_VERSION`
 takes the last version number. Three guards are executed by `validate_migration_registry()` **at module import time**,
 not as an optional runtime check:
 

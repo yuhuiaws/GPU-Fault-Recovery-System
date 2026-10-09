@@ -568,7 +568,7 @@ Reinstallation after a managed `uninstall --cpu-cluster keep` completes takes a 
 `regional_release_retained_database`: the completed uninstall record, the original Aurora incarnation, the site identity
 and the new installation ID form an independent handoff, and the first use also pins a new namespace UID.
 This path stores `retained_database_origin`; it cannot copy the old namespace's empty-database origin, nor does it claim the retained database
-is empty. Every continuation re-reads the current safety state. Only the reviewed v17-to-v18 precheck may validate the full
+is empty. Every continuation re-reads the current safety state. Only a reviewed retained-schema pair (`compatible_retained_schema`, today v17-to-v18 and v18-to-v19) lets the precheck validate the full
 historical prefix and the physical heap/columns without executing old stored functions, after which the normal schema Job ensures up to the candidate version,
 and only then are business Pods allowed; older, future, missing or drifted schemas get no generic compatibility.
 
@@ -1630,6 +1630,7 @@ it continues to verify the GPU clusters and the absence of the original resource
 | Incident close | Select an explicit incident or a limited discovery scope and judge item by item on the CPU; QUARANTINED additionally obtains GPU isolation evidence before a second judgement | Same locked entry point, closed/refused and evidence recorded per item, any refused yields a non-zero exit; the whole batch is not one atomic transaction |
 | `submit-remediation` | `--plan` is read-only; apply re-reads the site and incident/nodes under lock and, by selection, creates the supervised workflow, writes the mechanical check confirmation, or (`confirm-node-action --node`) writes a manual confirmation for a node action with unknown result on a BLOCKED record | The mechanical check annotation carries resourceVersion, incomplete or conflicting node identity fails; multiple nodes are not one Kubernetes atomic transaction, nodes already written must be audited before a resume; the manual confirmation is judged on the command-line side, the in-Pod script uses only existing store primitives to compare the confirmed step's original text, re-check the Agent record and boot id and then writes with `save_workflow(expected=)` |
 | `collector-outbox` | Submit a single-step maintenance workflow, poll the corresponding request ID/known status with bounds, verify the node results of the target action, archive metadata | `stats/list` does not modify the outbox but still writes a control record; each poll reads the shared remaining deadline, a timeout does not cancel the remote workflow. Success only on `SUCCEEDED` with valid node results and no error |
+| `store-maintenance` | Without `--confirm` read-only: the in-Pod script plans (each hot table's live/dead rows, heap pages, index/TOAST bytes, reloptions, action); `--confirm STORE_MAINTENANCE` with a valid `--reference` re-reads the site under the site operation lock, re-plans in the Pod and checks the plan digest, holds the `gpu_fault_schema_bootstrap` advisory lock, runs `VACUUM (FULL, ANALYZE)` on the small tables and per-index `REINDEX INDEX CONCURRENTLY` plus `VACUUM (ANALYZE)` on the large ones, and writes `store-maintenance/<timestamp>-<digest>.json` | The plan digest covers tables and actions, not sizes; a failed table is recorded, the run ends `FAILED` with exit 1 and a rerun finishes it; a lock held by a release/config mutation refuses; `REINDEX CONCURRENTLY` needs PostgreSQL 12+; Aurora capacity is never changed |
 | `deploy --rollback` | Under lock re-read the live state, take only the committed previous, run the rollback under supervision, then align the management site/configuration and sync-state | No independent build, no second lifecycle transaction started in parallel; neither an engine failure nor a management-plane alignment failure may report success, and the old transaction should first resume in its original direction |
 
 The token journal pins the values and types of `keep_window`, `window_minutes`, `quiet_seconds` and
@@ -2089,7 +2090,7 @@ During a release there must be no further build, and no manual editing of Deploy
 4. Fill in resources, probes, termination grace, security context and negative tests.
 5. Run the required generators and review the generated Manifests, cleanup inventory and environment variable reference.
    A PostgreSQL DDL change also appends a consecutive schema migration; the current baseline is
-   `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION` (currently v18), the new migration version number
+   `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION` (currently v19), the new migration version number
    must be consecutive +1 (the next version is v19), and it must pass `make test-postgres-stress` or the CAP-005 runner.
 6. Run the first-step build and sign:
 

@@ -17,6 +17,9 @@ from gpu_fault.store.postgres.ddl_helpers import (
     _recorded_schema_version,
 )
 from gpu_fault.store.postgres.ddl_spool import _create_telemetry_spool
+from gpu_fault.store.postgres.ddl_storage_parameters import (
+    create_storage_parameters_stage,
+)
 from gpu_fault.store.postgres.ddl_wakeups import _create_wakeup_triggers
 
 
@@ -53,6 +56,7 @@ def create_postgres_schema(cursor) -> None:
     _create_priority_counter_triggers(cursor)
     _seed_processor_counters(cursor)
     _create_processor_indexes(cursor)
+    create_storage_parameters_stage(cursor)
     _create_telemetry_spool(cursor)
     _create_wakeup_triggers(cursor)
 
@@ -138,14 +142,6 @@ def _create_base_indexes(cursor: Any) -> None:
             key
         )
         WHERE kind='marker'
-        """,
-    )
-    _declare_index(
-        cursor,
-        """
-        CREATE INDEX IF NOT EXISTS
-        gpu_fault_gpu_metric_latest_observed
-        ON gpu_fault_gpu_metric_latest (observed_at)
         """,
     )
     cursor.execute(
@@ -1601,14 +1597,6 @@ def _seed_processor_counters(cursor) -> None:
             GROUP BY 1, 2, 3
             """
         )
-    _declare_index(
-        cursor,
-        """
-        CREATE INDEX IF NOT EXISTS
-        gpu_fault_processor_lanes_expiry
-        ON gpu_fault_processor_lanes (lease_expires_at)
-        """,
-    )
     _declare_index(
         cursor,
         """

@@ -106,6 +106,7 @@ CI_TOOLING_TESTS = \
 	tests/test_ci_unit_gate.py
 POSTGRES_TESTS = \
 	tests/admin/test_registry_sync_postgres.py \
+	tests/admin/test_store_maintenance_script_postgres.py \
 	tests/admin/test_uninstall_probe_postgres.py \
 	tests/app_services/test_cleanup_unbounded_kinds.py \
 	tests/app_services/test_collector_ingestion_transaction.py \
@@ -192,6 +193,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_spool_notify_trigger.py \
 	tests/store/test_postgres_state_table_lock_order.py \
 	tests/store/test_postgres_state_tables.py \
+	tests/store/test_postgres_storage_parameters.py \
 	tests/store/test_state_table_schema_safety.py \
 	tests/store/test_state_table_migration_safety.py \
 	tests/store/test_fresh_control_state_mode.py \

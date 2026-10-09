@@ -5,6 +5,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gpu_fault.schema_migrations import LATEST_POSTGRES_SCHEMA_VERSION
 from gpu_fault_release import regional_release_diff as diff
 from gpu_fault_release import regional_release_orchestration as orchestration
 from gpu_fault_release import regional_schema_change as schema
@@ -47,7 +48,7 @@ def test_actual_phase_driver_snapshots_before_schema_and_never_rolls_back_after_
     release.config = SimpleNamespace(
         **vars(release.config),
         auto_rollback=True,
-        database_schema_version=18,
+        database_schema_version=LATEST_POSTGRES_SCHEMA_VERSION,
         aws_region="us-east-1",
         namespace="gpu-fault-system",
         health=SimpleNamespace(aurora_cluster_id="isolated-database"),

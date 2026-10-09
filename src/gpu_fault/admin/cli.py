@@ -95,6 +95,10 @@ from gpu_fault.admin.collector_outbox import (
     add_collector_outbox_command,
     run_collector_outbox_command,
 )
+from gpu_fault.admin.store_maintenance import (
+    add_store_maintenance_command,
+    run_store_maintenance_command,
+)
 from gpu_fault.admin.incident_close import run_incident_close
 from gpu_fault.admin.membership_lock import (
     administrator_operation_lock,
@@ -518,6 +522,7 @@ def parser() -> argparse.ArgumentParser:
     add_rotate_token_command(commands, _add_managed_site_arguments)
     add_submit_remediation_command(commands, _add_managed_site_arguments)
     add_collector_outbox_command(commands, _add_managed_site_arguments)
+    add_store_maintenance_command(commands, _add_managed_site_arguments)
     join = commands.add_parser(
         "join-cluster",
         usage=(
@@ -1322,6 +1327,14 @@ def run(arguments: argparse.Namespace) -> int:
             arguments,
             site=load_site(
                 cast(Path, _managed_site_file(arguments, command="collector-outbox")),
+                repository_root=arguments.repo_root,
+            ),
+        )
+    if arguments.command == "store-maintenance":
+        return run_store_maintenance_command(
+            arguments,
+            site=load_site(
+                cast(Path, _managed_site_file(arguments, command="store-maintenance")),
                 repository_root=arguments.repo_root,
             ),
         )

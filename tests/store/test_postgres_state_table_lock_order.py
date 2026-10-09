@@ -304,7 +304,7 @@ def test_v18_schema_upgrade_preserves_modes_checkpoints_and_both_copies(
         "SELECT version,name,checksum FROM gpu_fault_schema_migrations WHERE version<=17 ORDER BY version"
     ).fetchall()
     with connection.transaction():
-        connection.execute("DELETE FROM gpu_fault_schema_migrations WHERE version=18")
+        connection.execute("DELETE FROM gpu_fault_schema_migrations WHERE version>17")
         connection.execute("UPDATE gpu_fault_schema_version SET version=17")
         connection.execute(
             """

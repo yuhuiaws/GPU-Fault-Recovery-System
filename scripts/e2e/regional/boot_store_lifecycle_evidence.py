@@ -19,6 +19,9 @@ from gpu_fault.admin.installation_lifecycle import (
 )
 from gpu_fault.admin.site import load_site
 from gpu_fault.schema_migrations import POSTGRES_SCHEMA_MIGRATIONS
+from gpu_fault_release.regional_release_store_probe import (
+    compatible_retained_schema,
+)
 from scripts.e2e.regional.boot_acceptance_common import SiteFixture
 
 # The baseline CPU release need not contain newly added deploy-host helpers.
@@ -256,7 +259,9 @@ def transition_errors(
             proof.get("safe") is not True
             or not (
                 proof.get("schema_version") == new["schema_version"]
-                or (proof.get("schema_version"), new["schema_version"]) == (17, 18)
+                or compatible_retained_schema(
+                    int(proof.get("schema_version") or 0), int(new["schema_version"])
+                )
                 and proof.get("schema_ensure_required") is True
             )
             or release.get("database_schema_version") != new["schema_version"]
@@ -267,11 +272,13 @@ def transition_errors(
         if new["schema_version"] < old["schema_version"]:
             errors.append("retained schema moved backwards")
         if old["schema_version"] != new["schema_version"] and (
-            (old["schema_version"], new["schema_version"]) != (17, 18)
+            not compatible_retained_schema(
+                int(old["schema_version"]), int(new["schema_version"])
+            )
             or origin.get("schema_ensure_required") is not True
         ):
             errors.append(
-                "retained schema upgrade was not the reviewed v17-to-v18 transition"
+                "retained schema upgrade was not a reviewed retained-schema transition"
             )
     else:
         raise ValueError("unknown lifecycle proof mode")

@@ -9,6 +9,7 @@ from contextlib import closing
 import pytest
 
 from gpu_fault import store_migrate
+from gpu_fault.schema_migrations import LATEST_POSTGRES_SCHEMA_VERSION
 from gpu_fault_release import regional_release_prerequisite_repair as repair
 from gpu_fault_release import rollout
 from gpu_fault_release.regional_release_store_probe import inspect_database
@@ -17,7 +18,7 @@ from tests.regional.test_retained_store_schema_postgres import (
     database as database_fixture,
 )
 from tests.regional.test_retained_store_schema_postgres import (
-    install_v17,
+    install_v18,
     migration_history,
     retained_rows,
     seed_records,
@@ -39,7 +40,7 @@ def test_real_schema_cli_uses_projected_dsn_and_preserves_v17_history(
 ):
     connection = database.connection
     seed_records(connection)
-    install_v17(connection)
+    install_v18(connection)
     before, history = retained_rows(connection), migration_history(connection)
     dsn = tmp_path / "projected-dsn"
     dsn.write_text(connection.info.dsn)
@@ -49,13 +50,18 @@ def test_real_schema_cli_uses_projected_dsn_and_preserves_v17_history(
         "GPU_FAULT_STORE_URL", "postgresql://stale.invalid/not-the-grant"
     )
     monkeypatch.setattr(sys, "argv", ["store-migrate", "--ensure-schema"])
-    assert inspect_database(connection, 18, allow_schema_upgrade=True)[
-        "schema_ensure_required"
-    ]
+    assert inspect_database(
+        connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+    )["schema_ensure_required"]
     store_migrate.main()
     assert migration_history(connection)[:-1] == history
     assert retained_rows(connection) == before
-    assert inspect_database(connection, 18)["schema_ensure_required"] is False
+    assert (
+        inspect_database(connection, LATEST_POSTGRES_SCHEMA_VERSION)[
+            "schema_ensure_required"
+        ]
+        is False
+    )
     monkeypatch.setattr(
         sys,
         "argv",
@@ -69,10 +75,10 @@ def test_same_state_keep_handoff_runs_native_ensure_before_any_business_cpu(
 ):
     connection = database.connection
     seed_records(connection)
-    install_v17(connection)
+    install_v18(connection)
     before = retained_rows(connection)
     _harness, _archive, instance = retained_release(tmp_path, monkeypatch)
-    instance.runner.proof_schema_version = 17
+    instance.runner.proof_schema_version = LATEST_POSTGRES_SCHEMA_VERSION - 1
     events = instance.runner.events
     original = instance.runner.run
 
@@ -88,7 +94,11 @@ def test_same_state_keep_handoff_runs_native_ensure_before_any_business_cpu(
 
                 output = json.loads(instance.runner.outputs[name])
                 output.update(
-                    inspect_database(connection, 18, allow_schema_upgrade=True)
+                    inspect_database(
+                        connection,
+                        LATEST_POSTGRES_SCHEMA_VERSION,
+                        allow_schema_upgrade=True,
+                    )
                 )
                 instance.runner.outputs[name] = json.dumps(output)
         return value
@@ -113,14 +123,17 @@ def test_same_state_keep_handoff_runs_native_ensure_before_any_business_cpu(
     )
 
     def ensure():
-        assert instance.state["bootstrap_store_safety"]["schema_version"] == 17
+        assert (
+            instance.state["bootstrap_store_safety"]["schema_version"]
+            == LATEST_POSTGRES_SCHEMA_VERSION - 1
+        )
         with closing(database.open_store(True)):
             pass
-        instance.runner.proof_schema_version = 18
-        events.append("native-ensure-v18")
+        instance.runner.proof_schema_version = LATEST_POSTGRES_SCHEMA_VERSION
+        events.append("native-ensure-latest")
 
     def cpu(**_kwargs):
-        assert inspect_database(connection, 18)["safe"]
+        assert inspect_database(connection, LATEST_POSTGRES_SCHEMA_VERSION)["safe"]
         assert retained_rows(connection) == before
         events.append("business-cpu")
 
@@ -129,11 +142,17 @@ def test_same_state_keep_handoff_runs_native_ensure_before_any_business_cpu(
     rollout.RegionalRelease.bootstrap(instance)
     assert (
         events.index("store-job")
-        < events.index("native-ensure-v18")
+        < events.index("native-ensure-latest")
         < events.index("business-cpu")
     )
-    assert instance.state["retained_database_origin"]["schema_version"] == 17
-    assert instance.state["bootstrap_store_safety"]["schema_version"] == 17
+    assert (
+        instance.state["retained_database_origin"]["schema_version"]
+        == LATEST_POSTGRES_SCHEMA_VERSION - 1
+    )
+    assert (
+        instance.state["bootstrap_store_safety"]["schema_version"]
+        == LATEST_POSTGRES_SCHEMA_VERSION - 1
+    )
     assert all(
         item["status"] == "REMOVED" and item["uid"] and item["owner_uid"]
         for item in instance.state["bootstrap_store_safety"]["proof_jobs"].values()

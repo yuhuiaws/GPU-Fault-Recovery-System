@@ -34,7 +34,10 @@ from gpu_fault.admin.config_file import (
 from gpu_fault.admin.operation_lock import SITE_OPERATION_LOCK_FD_ENV
 from gpu_fault.admin.site import RenderedSite, load_site
 from gpu_fault.installation_lifecycle import INSTALLATION_FILE
-from gpu_fault.schema_migrations import POSTGRES_SCHEMA_MIGRATIONS
+from gpu_fault.schema_migrations import (
+    LATEST_POSTGRES_SCHEMA_VERSION,
+    POSTGRES_SCHEMA_MIGRATIONS,
+)
 from gpu_fault_release import rollout
 from gpu_fault_release.regional_release_config import ReleaseConfig
 from scripts.e2e.regional import boot020_admin_config as admin_config
@@ -86,7 +89,7 @@ class LifecycleIO(CommandRunner):
     def __init__(self, site: RenderedSite) -> None:
         super().__init__()
         self.site = site
-        self.version = 17
+        self.version = LATEST_POSTGRES_SCHEMA_VERSION - 1
         self.replica = False
         self.rows = [
             ("workflow", "history", {"status": "SUCCEEDED", "steps": ["observed"]}),
@@ -396,7 +399,10 @@ def test_schema_witness_rejects_unbound_observations_and_unapproved_advances(
         release["completed_phases"] = []
     elif damage.startswith("snapshot-"):
         field, value = {
-            "snapshot-schema": ("database_schema_version", 17),
+            "snapshot-schema": (
+                "database_schema_version",
+                LATEST_POSTGRES_SCHEMA_VERSION - 1,
+            ),
             "snapshot-mode": ("mode", "none"),
             "snapshot-unavailable": ("snapshot_status", "creating"),
             "snapshot-id": ("snapshot_id", ""),
@@ -471,8 +477,11 @@ def test_lifecycle_cli_captures_then_verifies_actual_observed_schema_and_history
     output = state / "proof.json"
     lifecycle_cli(monkeypatch, state, before, "capture")
     captured = before.read_bytes()
-    assert json.loads(captured)["store"]["schema_version"] == 17
-    lifecycle_io.version = 18
+    assert (
+        json.loads(captured)["store"]["schema_version"]
+        == LATEST_POSTGRES_SCHEMA_VERSION - 1
+    )
+    lifecycle_io.version = LATEST_POSTGRES_SCHEMA_VERSION
     lifecycle_cli(
         monkeypatch,
         state,
@@ -488,7 +497,9 @@ def test_lifecycle_cli_captures_then_verifies_actual_observed_schema_and_history
     assert report["report_type"] == "boot-store-lifecycle-proof"
     assert report["before_sha256"] == hashlib.sha256(captured).hexdigest()
     assert report["historical_records_checked"] == len(lifecycle_io.rows)
-    assert report["after"]["store"]["schema_version"] == 18
+    assert report["after"]["store"]["schema_version"] == (
+        LATEST_POSTGRES_SCHEMA_VERSION
+    )
     assert (
         report["scope"]
         == "observed lifecycle transition only; not the whole regional case"
@@ -509,7 +520,7 @@ def test_lifecycle_cli_writes_a_failed_proof_and_exits_nonzero_on_history_loss(
     state = lifecycle_io.site.source.parent
     before, output = state / "before.json", state / "proof.json"
     lifecycle_cli(monkeypatch, state, before, "capture")
-    lifecycle_io.version = 18
+    lifecycle_io.version = LATEST_POSTGRES_SCHEMA_VERSION
     lifecycle_io.rows = []
     with pytest.raises(SystemExit) as raised:
         lifecycle_cli(

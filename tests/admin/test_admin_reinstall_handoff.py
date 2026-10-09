@@ -14,6 +14,7 @@ from gpu_fault.admin import uninstall as lifecycle
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.deploy_command import retire_site_after_uninstall
 from gpu_fault.admin.site import SiteConfigError, load_site, materialized_release_config
+from gpu_fault.schema_migrations import LATEST_POSTGRES_SCHEMA_VERSION
 from gpu_fault_release import regional_release_prerequisite_repair as repair
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_retained_database import RETAINED_ORIGIN_KEY
@@ -164,7 +165,7 @@ def test_retained_v17_bootstrap_runs_normal_ensure_before_candidate_cpu(
     from gpu_fault_release import rollout
 
     _harness, _archive, instance = retained_release(tmp_path, monkeypatch)
-    instance.runner.proof_schema_version = 17
+    instance.runner.proof_schema_version = LATEST_POSTGRES_SCHEMA_VERSION - 1
     events = instance.runner.events
     run = instance.runner.run
 
@@ -203,13 +204,16 @@ def test_retained_v17_bootstrap_runs_normal_ensure_before_candidate_cpu(
 
     def ensure_schema():
         proof = instance.state["bootstrap_store_safety"]
-        assert proof["schema_version"] == 17 and proof["schema_ensure_required"]
+        assert (
+            proof["schema_version"] == LATEST_POSTGRES_SCHEMA_VERSION - 1
+            and proof["schema_ensure_required"]
+        )
         assert proof["database_state"] == "initialized"
         events.append("candidate-schema-ensure")
-        instance.runner.proof_schema_version = 18
+        instance.runner.proof_schema_version = LATEST_POSTGRES_SCHEMA_VERSION
 
     def cpu(**_kwargs):
-        assert instance.runner.proof_schema_version == 18
+        assert instance.runner.proof_schema_version == LATEST_POSTGRES_SCHEMA_VERSION
         events.append("candidate-cpu")
 
     monkeypatch.setattr(instance, "_ensure_schema", ensure_schema)
@@ -218,7 +222,10 @@ def test_retained_v17_bootstrap_runs_normal_ensure_before_candidate_cpu(
     assert events.index("store-job") < events.index("candidate-schema-ensure")
     assert events.index("candidate-schema-ensure") < events.index("candidate-cpu")
     assert repair.BOOTSTRAP_ORIGIN_KEY not in instance.state
-    assert instance.state[RETAINED_ORIGIN_KEY]["schema_version"] == 17
+    assert (
+        instance.state[RETAINED_ORIGIN_KEY]["schema_version"]
+        == LATEST_POSTGRES_SCHEMA_VERSION - 1
+    )
 
 
 def test_two_complete_uninstall_cycles_export_fresh_registry_and_namespace_uids(

@@ -100,6 +100,12 @@ does not constitute isolation. That database is still created by the separate sc
 Job, and business Pods must not enable auto schema init. After acceptance ends, first confirm
 that all synthetic rows, Jobs and connections have terminated, then delete the database.
 
+Formal rounds assume a maintained store: one campaign day of writes leaves the hot tables (processor lanes/queue
+counts/priority shards/queue, `gpu_fault_gpu_metric_latest`) with heap and index pages a hundred times their live
+rows, halving ingress throughput, raising `gpu_fault_processor_admission_batch_expired_total` and failing the reserved
+503 share verdict; schema v19's storage parameters stop the growth, and existing bloat is reclaimed before a formal
+round with `gpu-fault-admin store-maintenance --confirm STORE_MAINTENANCE` (Administrator Operations §10.3).
+
 The GPU perf namespace deploys only the connection Secret, the load-test ServiceAccount/RBAC
 and the simulated Jobs; it does not deploy a real Cluster Executor, Watcher, Collector or Node
 Runtime. That namespace and the load ServiceAccount `gpu-fault-completion-watcher` are created

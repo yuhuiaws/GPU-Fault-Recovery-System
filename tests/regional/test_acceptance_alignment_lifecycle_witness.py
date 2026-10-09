@@ -5,7 +5,10 @@ from datetime import UTC, datetime
 
 import pytest
 
-from gpu_fault.schema_migrations import POSTGRES_SCHEMA_MIGRATIONS
+from gpu_fault.schema_migrations import (
+    LATEST_POSTGRES_SCHEMA_VERSION,
+    POSTGRES_SCHEMA_MIGRATIONS,
+)
 from gpu_fault_release.regional_deployment_inventory import CPU_RUNTIME_DEPLOYMENTS
 from scripts.e2e.regional.boot024_epoch_preflight import isolated_epoch_scope
 from scripts.e2e.regional.boot_membership_observation import (
@@ -68,11 +71,11 @@ def documents():
         "database": {"cluster_resource_id": "original"},
         "observed_at": datetime.now(UTC).isoformat(),
         "store": {
-            "schema_version": 17,
+            "schema_version": LATEST_POSTGRES_SCHEMA_VERSION - 1,
             "migrations": [
                 [item.version, item.name, item.checksum]
                 for item in POSTGRES_SCHEMA_MIGRATIONS
-                if item.version <= 17
+                if item.version < LATEST_POSTGRES_SCHEMA_VERSION
             ],
             "records": {"workflow/history": "unchanged"},
         },
@@ -87,12 +90,12 @@ def documents():
         },
         release_state={
             "phase": "complete",
-            "database_schema_version": 18,
+            "database_schema_version": LATEST_POSTGRES_SCHEMA_VERSION,
             "transaction_committed": True,
             "completed_phases": ["schema-ready"],
             "schema_change_acceptance": {
                 "mode": "snapshot",
-                "database_schema_version": 18,
+                "database_schema_version": LATEST_POSTGRES_SCHEMA_VERSION,
                 "snapshot_id": "snapshot-before",
                 "snapshot_status": "available",
             },
@@ -103,7 +106,7 @@ def documents():
                 "retained_database_handoff": {"previous_installation_id": "old"},
             },
             "bootstrap_store_safety": {
-                "schema_version": 17,
+                "schema_version": LATEST_POSTGRES_SCHEMA_VERSION - 1,
                 "safe": True,
                 "schema_ensure_required": True,
             },
@@ -119,7 +122,7 @@ def documents():
             },
         },
     )
-    after["store"]["schema_version"] = 18
+    after["store"]["schema_version"] = LATEST_POSTGRES_SCHEMA_VERSION
     after["store"]["migrations"].append(
         [
             POSTGRES_SCHEMA_MIGRATIONS[-1].version,

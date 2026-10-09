@@ -50,30 +50,23 @@ NOW = datetime(2026, 9, 14, 12, tzinfo=UTC)
 KINDS = ("workflow", "remote_command")
 PHYSICAL_COPIES = {"legacy": (1, 0), "dual": (1, 1), "dedicated": (0, 1)}
 
-# Exact v17 function from the pre-remediation source, also exercised by the
-# v17 upgrade case in test_postgres_state_table_lock_order. v18 changes only
-# this fence, not the physical layouts. Do not just relabel a v18 database.
-V17_NATIVE_FENCE = """
-CREATE OR REPLACE FUNCTION gpu_fault_native_control_state_fence()
-RETURNS trigger LANGUAGE plpgsql AS $$
-DECLARE current_mode TEXT; expected_table TEXT;
-BEGIN
-    SELECT table_name INTO expected_table
-    FROM gpu_fault_control_state_descriptor(TG_ARGV[0]);
-    IF expected_table IS DISTINCT FROM TG_TABLE_NAME THEN
-        RAISE EXCEPTION 'control-state trigger identity differs'
-            USING ERRCODE='55000';
-    END IF;
-    current_mode := gpu_fault_control_state_lock_mode(TG_ARGV[0]);
-    IF current_mode='legacy' OR
-       (current_mode='dual' AND pg_trigger_depth()<2) THEN
-        RAISE EXCEPTION 'dedicated control-state write is not authoritative'
-            USING ERRCODE='55000';
-    END IF;
-    RETURN CASE WHEN TG_OP='DELETE' THEN OLD ELSE NEW END;
-END
-$$
-"""
+# A v18 database is the current one with the two single-column timestamp
+# indexes v19 retires and without v19's storage parameters; v19 changes no
+# record layout, so the retained rows below are exactly what v18 wrote.
+V18_RETIRED_INDEXES = (
+    "CREATE INDEX IF NOT EXISTS gpu_fault_gpu_metric_latest_observed "
+    "ON public.gpu_fault_gpu_metric_latest (observed_at)",
+    "CREATE INDEX IF NOT EXISTS gpu_fault_processor_lanes_expiry "
+    "ON public.gpu_fault_processor_lanes (lease_expires_at)",
+)
+V18_UNSET_STORAGE_PARAMETERS = (
+    "gpu_fault_processor_lanes",
+    "gpu_fault_processor_queue_counts",
+    "gpu_fault_processor_priority_count_shards",
+    "gpu_fault_processor_queue",
+    "gpu_fault_gpu_metric_latest",
+    "gpu_fault_gpu_metrics_batches",
+)
 
 
 @dataclass(frozen=True)
@@ -128,23 +121,31 @@ def migration_history(connection: psycopg.Connection) -> list[tuple]:
     ).fetchall()
 
 
-def install_v17(connection: psycopg.Connection) -> None:
-    assert LATEST_POSTGRES_SCHEMA_VERSION == 18, (
+def install_v18(connection: psycopg.Connection) -> None:
+    assert LATEST_POSTGRES_SCHEMA_VERSION == 19, (
         "a new schema requires review of the historical fixture and compatibility pair"
     )
     with connection.transaction():
-        connection.execute(V17_NATIVE_FENCE)
+        for statement in V18_RETIRED_INDEXES:
+            connection.execute(statement)
+        for table in V18_UNSET_STORAGE_PARAMETERS:
+            connection.execute(
+                f"ALTER TABLE public.{table} RESET (fillfactor, "
+                "autovacuum_vacuum_scale_factor, autovacuum_vacuum_threshold, "
+                "autovacuum_analyze_scale_factor, autovacuum_analyze_threshold, "
+                "autovacuum_vacuum_cost_delay)"
+            )
         connection.execute(
-            "DELETE FROM public.gpu_fault_schema_migrations WHERE version=18"
+            "DELETE FROM public.gpu_fault_schema_migrations WHERE version>18"
         )
         connection.execute(
-            "UPDATE public.gpu_fault_schema_version SET version=17 WHERE singleton"
+            "UPDATE public.gpu_fault_schema_version SET version=18 WHERE singleton"
         )
     assert migration_history(connection) == [
         (item.version, item.name, item.checksum)
         for item in POSTGRES_SCHEMA_MIGRATIONS
-        if item.version <= 17
-    ], "v17 must have the complete, unchanged migration prefix"
+        if item.version <= 18
+    ], "v18 must have the complete, unchanged migration prefix"
 
 
 def configure_mode(
@@ -296,7 +297,7 @@ def test_retained_v17_terminal_rows_are_safe_in_real_storage_modes(
     connection = database.connection
     configure_mode(connection, mode)
     seed_records(connection)
-    install_v17(connection)
+    install_v18(connection)
     before = migration_history(connection)
     for kind in KINDS:
         assert physical_counts(connection, kind) == PHYSICAL_COPIES[mode], (
@@ -314,12 +315,14 @@ def test_retained_v17_terminal_rows_are_safe_in_real_storage_modes(
                 "native status is a column, not a shadow value in its immutable payload"
             )
 
-    proof = inspect_database(connection, 18, allow_schema_upgrade=True)
+    proof = inspect_database(
+        connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+    )
 
     assert proof == {
         "safe": True,
         "database_state": "initialized",
-        "schema_version": 17,
+        "schema_version": 18,
         "schema_ensure_required": True,
         "blockers": {"workflow": 0, "remote_command": 0, "observation": 0},
     }, "terminal retained rows must not be treated as missing-status blockers"
@@ -344,10 +347,12 @@ def test_blockers_count_real_physical_copies_in_independent_modes(
         workflow_status=WorkflowStatus.BLOCKED,
         command_status=RemoteCommandStatus.LEASED,
     )
-    install_v17(connection)
+    install_v18(connection)
     before = retained_rows(connection)
 
-    proof = inspect_database(connection, 18, allow_schema_upgrade=True)
+    proof = inspect_database(
+        connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+    )
 
     assert proof["safe"] is False, "open or blocked work must refuse retained startup"
     assert proof["blockers"] == {
@@ -377,10 +382,12 @@ def test_real_observation_workload_phase_is_checked_in_both_heaps(
 ) -> None:
     connection = database.connection
     seed_observation(connection, storage, phase)
-    install_v17(connection)
+    install_v18(connection)
     before = retained_rows(connection)
 
-    proof = inspect_database(connection, 18, allow_schema_upgrade=True)
+    proof = inspect_database(
+        connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+    )
 
     assert proof["blockers"] == {
         "workflow": 0,
@@ -407,22 +414,24 @@ def test_unknown_legacy_status_is_never_accepted_as_terminal(
         "WHERE kind=%s",
         (json.dumps(status), kind),
     )
-    install_v17(connection)
+    install_v18(connection)
 
-    proof = inspect_database(connection, 18, allow_schema_upgrade=True)
+    proof = inspect_database(
+        connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+    )
 
     assert proof["safe"] is False, "unknown and null statuses cannot prove quiescence"
     assert proof["blockers"][kind] == 1, "the malformed physical row must be counted"
 
 
 @pytest.mark.parametrize("drift", ["missing", "name", "checksum", "extra"])
-def test_only_the_exact_contiguous_v17_migration_prefix_is_accepted(
+def test_only_the_exact_contiguous_v18_migration_prefix_is_accepted(
     database: PrivateDatabase, drift: str
 ) -> None:
     from psycopg import sql
 
     connection = database.connection
-    install_v17(connection)
+    install_v18(connection)
     if drift == "missing":
         connection.execute(
             "DELETE FROM public.gpu_fault_schema_migrations WHERE version=7"
@@ -437,14 +446,16 @@ def test_only_the_exact_contiguous_v17_migration_prefix_is_accepted(
     else:
         connection.execute(
             sql.SQL(
-                "UPDATE public.gpu_fault_schema_migrations SET {}=%s WHERE version=17"
+                "UPDATE public.gpu_fault_schema_migrations SET {}=%s WHERE version=18"
             ).format(sql.Identifier(drift)),
             ("0" * 64 if drift == "checksum" else "unrecognized-migration",),
         )
     before = migration_history(connection)
 
     with pytest.raises(ValueError, match="migration history differs"):
-        inspect_database(connection, 18, allow_schema_upgrade=True)
+        inspect_database(
+            connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+        )
 
     assert migration_history(connection) == before, "the probe must not repair drift"
 
@@ -452,17 +463,17 @@ def test_only_the_exact_contiguous_v17_migration_prefix_is_accepted(
 @pytest.mark.parametrize(
     ("observed", "required", "allowed", "message"),
     [
-        (16, 18, True, "schema version differs"),
-        (19, 18, True, "schema version differs"),
-        (17, 18, False, "schema version differs"),
-        (17, 17, True, "probe image schema identity differs"),
+        (17, 19, True, "schema version differs"),
+        (20, 19, True, "schema version differs"),
+        (18, 19, False, "schema version differs"),
+        (18, 18, True, "probe image schema identity differs"),
     ],
 )
 def test_unreviewed_or_unapproved_schema_markers_fail_closed(
     database: PrivateDatabase, observed: int, required: int, allowed: bool, message: str
 ) -> None:
     connection = database.connection
-    install_v17(connection)
+    install_v18(connection)
     # Invalid marker cases are deliberate corruption, not claimed v16/v19 fixtures.
     connection.execute(
         "UPDATE public.gpu_fault_schema_version SET version=%s WHERE singleton",
@@ -492,7 +503,7 @@ def test_retained_heap_with_row_security_is_refused(
     from psycopg import sql
 
     connection = database.connection
-    install_v17(connection)
+    install_v18(connection)
     connection.execute(
         sql.SQL("ALTER TABLE {} ENABLE ROW LEVEL SECURITY").format(
             sql.Identifier("public", table)
@@ -502,7 +513,9 @@ def test_retained_heap_with_row_security_is_refused(
     with pytest.raises(
         ValueError, match="unrecognized table definition or execution policy"
     ):
-        inspect_database(connection, 18, allow_schema_upgrade=True)
+        inspect_database(
+            connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+        )
 
 
 @pytest.mark.parametrize("drift", ["view", "inheritance", "domain", "generated"])
@@ -510,7 +523,7 @@ def test_retained_proof_requires_plain_builtin_heap_columns(
     database: PrivateDatabase, drift: str
 ) -> None:
     connection = database.connection
-    install_v17(connection)
+    install_v18(connection)
     if drift == "view":
         connection.execute(
             "ALTER TABLE public.gpu_fault_workflows RENAME TO gpu_fault_retained_workflows"
@@ -539,7 +552,9 @@ def test_retained_proof_requires_plain_builtin_heap_columns(
     with pytest.raises(
         ValueError, match="unrecognized table definition or execution policy"
     ):
-        inspect_database(connection, 18, allow_schema_upgrade=True)
+        inspect_database(
+            connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+        )
 
 
 def test_missing_storage_mode_cannot_hide_a_retained_heap(
@@ -548,13 +563,15 @@ def test_missing_storage_mode_cannot_hide_a_retained_heap(
     connection = database.connection
     configure_mode(connection, "dedicated")
     seed_records(connection)
-    install_v17(connection)
+    install_v18(connection)
     connection.execute(
         "DELETE FROM public.gpu_fault_control_state_modes WHERE kind='workflow'"
     )
 
     with pytest.raises(ValueError, match="unknown control-state storage mode"):
-        inspect_database(connection, 18, allow_schema_upgrade=True)
+        inspect_database(
+            connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+        )
 
 
 def test_preensure_probe_never_executes_retained_projection_functions(
@@ -566,7 +583,7 @@ def test_preensure_probe_never_executes_retained_projection_functions(
     connection = database.connection
     configure_mode(connection, "dedicated")
     seed_records(connection)
-    install_v17(connection)
+    install_v18(connection)
     for kind in KINDS:
         layout = STATE_LAYOUTS[kind]
         connection.execute(
@@ -588,7 +605,9 @@ def test_preensure_probe_never_executes_retained_projection_functions(
                 )
             ).fetchall()
 
-    proof = inspect_database(connection, 18, allow_schema_upgrade=True)
+    proof = inspect_database(
+        connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+    )
 
     assert proof["safe"] is True, (
         "pre-ensure inspection must use real heaps, not execute retained projections"
@@ -605,7 +624,7 @@ def test_explicit_v18_ensure_precedes_current_business_proof_and_preserves_rows(
     connection = database.connection
     configure_mode(connection, mode)
     seed_records(connection)
-    install_v17(connection)
+    install_v18(connection)
     before = retained_rows(connection)
     history = migration_history(connection)
 
@@ -615,7 +634,9 @@ def test_explicit_v18_ensure_precedes_current_business_proof_and_preserves_rows(
     assert retained_rows(connection) == before, (
         "refused business startup must not mutate data"
     )
-    preensure = inspect_database(connection, 18, allow_schema_upgrade=True)
+    preensure = inspect_database(
+        connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+    )
     assert preensure["safe"] is True and preensure["schema_ensure_required"] is True, (
         "the retained proof must distinguish safe physical rows from candidate schema readiness"
     )
@@ -628,18 +649,18 @@ def test_explicit_v18_ensure_precedes_current_business_proof_and_preserves_rows(
 
     assert migration_history(connection) == [
         (item.version, item.name, item.checksum) for item in POSTGRES_SCHEMA_MIGRATIONS
-    ], "ensure must append exactly the candidate v18 migration"
+    ], "ensure must append exactly the candidate v19 migration"
     assert migration_history(connection)[:-1] == history, (
-        "v1-v17 history must stay unchanged"
+        "v1-v18 history must stay unchanged"
     )
     assert retained_rows(connection) == before, (
         "ensure must preserve retained data, selected modes and migration checkpoints"
     )
-    proof = inspect_database(connection, 18)
+    proof = inspect_database(connection, LATEST_POSTGRES_SCHEMA_VERSION)
     assert proof == {
         "safe": True,
         "database_state": "initialized",
-        "schema_version": 18,
+        "schema_version": LATEST_POSTGRES_SCHEMA_VERSION,
         "schema_ensure_required": False,
         "blockers": {"workflow": 0, "remote_command": 0, "observation": 0},
     }, "candidate definition validation must succeed only after explicit ensure"
@@ -654,45 +675,64 @@ def test_explicit_v18_ensure_precedes_current_business_proof_and_preserves_rows(
         ), "reinstallation must not clear historical quarantine"
 
 
-def test_fixture_has_real_v17_fence_and_ensure_installs_v18_reset_behavior(
+def _index_present(connection: psycopg.Connection, name: str) -> bool:
+    return (
+        connection.execute(
+            "SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname=%s",
+            (name,),
+        ).fetchone()
+        is not None
+    )
+
+
+def _reloptions(connection: psycopg.Connection, table: str) -> set[str]:
+    (options,) = connection.execute(
+        "SELECT reloptions FROM pg_class WHERE oid=to_regclass(%s)",
+        (f"public.{table}",),
+    ).fetchone()
+    return set(options or [])
+
+
+def test_fixture_has_real_v18_shape_and_ensure_installs_v19_storage_behavior(
     database: PrivateDatabase,
 ) -> None:
-    import psycopg
-
     connection = database.connection
     configure_mode(connection, "dual")
     seed_records(connection)
-    for kind in KINDS:
-        set_state_table_mode(connection, kind, "legacy", expected_mode="dual")
-    install_v17(connection)
+    install_v18(connection)
     before = retained_rows(connection)
-    with pytest.raises(
-        psycopg.errors.ObjectNotInPrerequisiteState, match="not authoritative"
-    ):
-        with connection.transaction():
-            connection.execute("SET LOCAL gpu_fault.control_state_reset='workflow'")
-            connection.execute(
-                "DELETE FROM public.gpu_fault_workflows WHERE request_id='retained-workflow'"
-            )
-    assert retained_rows(connection) == before, (
-        "v17 must really refuse the v18-only native reset exception"
+    assert _index_present(connection, "gpu_fault_gpu_metric_latest_observed"), (
+        "a v18 database still carries the metric timestamp index"
     )
+    assert _index_present(connection, "gpu_fault_processor_lanes_expiry"), (
+        "a v18 database still carries the lane expiry index"
+    )
+    assert "fillfactor=50" not in _reloptions(
+        connection, "gpu_fault_processor_lanes"
+    ), "the fixture must really be a v18 database, not a relabelled v19 one"
 
     with closing(database.open_store(True)):
         pass
 
     assert retained_rows(connection) == before, (
-        "ensure alone must not reset the stale copy"
+        "ensure must preserve retained data, selected modes and migration checkpoints"
     )
-    activated = set_state_table_mode(
-        connection, "workflow", "dual", expected_mode="legacy"
+    assert not _index_present(connection, "gpu_fault_gpu_metric_latest_observed"), (
+        "v19 retires the metric timestamp index"
     )
-    assert activated["dedicated_rows"] == 0, (
-        "v18 must install the reset fence before explicit mode activation can delete the copy"
+    assert not _index_present(connection, "gpu_fault_processor_lanes_expiry"), (
+        "v19 retires the lane expiry index"
     )
-    assert physical_counts(connection, "workflow") == (1, 0), (
-        "the explicit reset must preserve authoritative legacy history"
+    assert {"fillfactor=50", "autovacuum_vacuum_scale_factor=0"} <= _reloptions(
+        connection, "gpu_fault_processor_lanes"
     )
+    assert {"fillfactor=70", "autovacuum_vacuum_threshold=50"} <= _reloptions(
+        connection, "gpu_fault_gpu_metric_latest"
+    )
+    assert migration_history(connection)[-1][0] == LATEST_POSTGRES_SCHEMA_VERSION
+    assert connection.execute(
+        "SELECT version FROM public.gpu_fault_schema_version WHERE singleton"
+    ).fetchone() == (LATEST_POSTGRES_SCHEMA_VERSION,)
 
 
 def test_retained_probe_works_inside_a_read_only_session(
@@ -702,11 +742,13 @@ def test_retained_probe_works_inside_a_read_only_session(
 
     connection = database.connection
     seed_records(connection)
-    install_v17(connection)
+    install_v18(connection)
     before = retained_rows(connection)
     connection.execute("SET default_transaction_read_only=on")
     try:
-        proof = inspect_database(connection, 18, allow_schema_upgrade=True)
+        proof = inspect_database(
+            connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
+        )
         assert proof["safe"] is True, (
             "retained inspection must need no write privileges"
         )

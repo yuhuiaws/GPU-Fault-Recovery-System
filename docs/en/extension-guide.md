@@ -104,8 +104,8 @@ release rather than replacing the file online.
 
 ## 5. Adding a Schema migration
 
-The latest version in the current registry is v18
-`control-state-legacy-copy-reset-without-truncate`. The next migration must append v19:
+The latest version in the current registry is v19
+`hot-table-storage-parameters-and-hot-update-indexes`. The next migration must append v20:
 
 1. Modify the latest idempotent schema in the corresponding `store/postgres/ddl*.py`; the checksum covers all
    `ddl*.py`, not just `ddl.py`.

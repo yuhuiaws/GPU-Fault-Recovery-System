@@ -178,10 +178,14 @@ def test_registered_migration_callbacks_use_the_public_cursor_boundary():
             before = len(recorder.statements)
             migration.apply(recorder)
             statements_by_version[migration.version] = recorder.statements[before:]
-    for version in (4, 5, 6, 9, 10, 13, 14, 15, 16, 17):
+    for version in (4, 5, 6, 9, 10, 13, 14, 15, 16, 17, 18):
         assert statements_by_version[version] == [("SELECT 1", None)], (
             f"migration {version} must retain its published no-op callback"
         )
+    assert statements_by_version[19] == [
+        ("DROP INDEX IF EXISTS gpu_fault_gpu_metric_latest_observed", None),
+        ("DROP INDEX IF EXISTS gpu_fault_processor_lanes_expiry", None),
+    ], "v19 retires the two timestamp indexes that defeated HOT updates"
     assert statements_by_version[11] == [
         ("DROP INDEX IF EXISTS gpu_fault_processor_queue_claim_order", None)
     ]

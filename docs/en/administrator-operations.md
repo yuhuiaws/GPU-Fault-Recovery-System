@@ -28,6 +28,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Explicitly register Node key custody | `gpu-fault-admin node-key-custody configure --state-dir ... --file ... --trust-sha256 ...`; after registration the original `deploy` / `join-cluster` still perform the authorised preparation and resume; Secrets are not rotated directly | [§6.2](#62-node-key-custody) |
 | Submit an explicit remediation after CHECK_MECHANICALS; trigger a validated restore after a QUARANTINED node (or the still-isolated node of an ESCALATED incident whose ladder is exhausted and every workflow ended) is repaired; manually confirm a node action with unknown outcome | `gpu-fault-admin submit-remediation --state-dir ... --incident-id ... --disposition {inspected,reset-gpu,reboot-node,quarantine,restore,confirm-node-action} [--node <node>] [--plan]` (`restore` see §9.2, `confirm-node-action --node` see §9.4) | §9, §9.2, §9.4, REG 8.3 |
 | Remotely view/requeue a node collector's dead-letter outbox | `gpu-fault-admin collector-outbox --state-dir ... --cluster-id C --node N --collector kernel --action stats\|list\|requeue-dead [--path /v1/...] [--yes] --reference CHG-...` (no login to the GPU node; only metadata is returned; `requeue-dead` must carry `--yes`; there is no remote `--force`) | §9.3, §8 `GpuFaultCollectorSilent` |
+| Reclaim PostgreSQL hot-table bloat (after a campaign day, before a formal perf or acceptance round) | `gpu-fault-admin store-maintenance --state-dir ... --reference CHG-... [--confirm STORE_MAINTENANCE]` (without `--confirm` it only prints each hot table's live rows, pages, index bytes and proposed action; with the token it executes under the site operation lock; evidence under `$STATE_DIR/store-maintenance/`) | [§10.3](#103-hot-table-storage-parameters-and-store-maintenance-reclaiming-bloat) |
 | Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | §10 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
 | Converge historical workflows that recovered but stay BLOCKED, never-dispatched PENDING workflows whose node left with a spot replacement, and parked records whose node action the operator confirmed | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
@@ -3743,6 +3744,57 @@ When a manual migration or purge is required, first record the replicas, stop in
 Recovery is in the reverse order: consumers first, ingress last. The state file must not be deleted before all original replicas are
 Ready.
 
+### 10.3 Hot-Table Storage Parameters and store-maintenance (Reclaiming Bloat)
+
+**Symptom.** One campaign day of writes leaves the Store's hot tables with heap and index pages a hundred times
+their live rows: `gpu_fault_gpu_metric_latest` with 1,216 live rows in 23,435 heap pages (192 MB) plus 124 MB of
+indexes, `gpu_fault_processor_lanes` with 40 rows in 1,188 pages, `gpu_fault_processor_queue_counts` with 3-5 rows in
+62 pages read 212k times. Every admission read scans tens to hundreds of pages for a handful of rows, every metric
+upsert walks bloated indexes, ingress throughput halves (1428 -> 663 req/s),
+`gpu_fault_processor_admission_batch_expired_total` rises and the perf verdict fails on the reserved 503 share --
+with Aurora CPU/ACU/IOPS, Pods and configuration unchanged. Two causes: these tables ran on the instance's default
+autovacuum (scale factor 0.1), and none of their updates was HOT (`n_tup_hot_upd` 0) -- each lane renewal rewrote the
+indexed `lease_expires_at`, each metric sample rewrote the indexed `observed_at`, so every update left a dead tuple in
+every index.
+
+**Schema v19 stops the growth** (`store/postgres/ddl_storage_parameters.py`, applied idempotently by `--ensure-schema`,
+no `ALTER` when the catalog already matches): the tables rewritten in place (lanes, queue counts, priority count
+shards, queue, metric latest) get `fillfactor` 50/70 so a HOT update finds room on the same page; every hot table
+moves to threshold-only autovacuum (`autovacuum_vacuum_scale_factor=0`, `autovacuum_vacuum_threshold=50`, the same
+for analyze, `autovacuum_vacuum_cost_delay=0`), the queue's TOAST relation gets the same vacuum thresholds; and the
+two timestamp indexes that only served retention sweeps, `gpu_fault_gpu_metric_latest_observed` and
+`gpu_fault_processor_lanes_expiry`, are retired (their only readers are the LIMIT-batched periodic DELETEs
+`cleanup_hot_state` and `cleanup_processor_lanes`, on tables the same retention keeps small, where a sequential scan
+is enough), which makes the metric upsert and the lane updates HOT.
+
+**Existing bloat is reclaimed by `store-maintenance`** -- storage parameters do not return pages already consumed:
+
+```bash
+# Plan (read-only): every hot table's live/dead rows, heap pages, index/TOAST bytes, reloptions and proposed action
+gpu-fault-admin store-maintenance --state-dir "$STATE_DIR" --reference CHG-...
+
+# Execute: takes the site operation lock (refused while a release/config mutation is in progress), re-plans in the
+# Pod and checks the plan digest, then runs through the control plane's own Store connection;
+# evidence: $STATE_DIR/store-maintenance/<timestamp>-<plan digest>.json
+gpu-fault-admin store-maintenance --state-dir "$STATE_DIR" --reference CHG-... --confirm STORE_MAINTENANCE
+```
+
+The action per table follows what its readers tolerate: the small in-place tables (`gpu_fault_processor_lanes`,
+`gpu_fault_processor_queue_counts`, `gpu_fault_processor_priority_count_shards`) get `VACUUM (FULL, ANALYZE)`, an
+exclusive lock of well under a second at their live size; the large or continuously read tables
+(`gpu_fault_gpu_metric_latest`, `gpu_fault_objects`, `gpu_fault_processor_queue` with its TOAST,
+`gpu_fault_gpu_metrics_batches`) get `REINDEX INDEX CONCURRENTLY` per index and then `VACUUM (ANALYZE)`, with no long
+exclusive lock. The script is exec'd into a Running `gpu-fault-api-ha` Pod and connects with the mounted Store
+credentials (like every other administrator verb; the deploy host needs no network path to Aurora), holds the
+`gpu_fault_schema_bootstrap` advisory lock so it cannot overlap a schema ensure or index build, requires PostgreSQL 12
+or newer for `REINDEX ... CONCURRENTLY` (checked through `server_version_num`), never touches Aurora capacity, and is
+harmless to repeat. Before/after sizes of every table go into the evidence file; a table that fails is recorded, the
+run ends `FAILED` with exit code 1, and a later rerun finishes the work.
+
+**The "maintained store" expectation.** Formal perf and acceptance rounds assume a maintained store: after a campaign
+day and before a formal round, read the plan and, if any hot table's heap pages exceed its live rows by an order of
+magnitude or more, execute the verb once. It is not a scheduled chore -- after v19 the autovacuum thresholds and HOT
+updates keep the page counts near the live size.
 ## 11. Centralised Container Logs (CloudWatch Container Insights)
 
 Not installed by default. Logs stopping at the node is a written-down trade-off ([Detailed Design v2 §10.1](detailed-design-v2.md#101-logging)),
@@ -3872,6 +3924,7 @@ rotate-token         one command completes the cluster token overlap-window rota
 node-key-custody     configure explicitly registers forward-looking custody; authorised delivery is still performed by deploy/join (§6.2)
 submit-remediation   explicit remediation after CHECK_MECHANICALS
 collector-outbox     remotely view/requeue a node collector's dead-letter outbox (§9.3)
+store-maintenance    reclaim PostgreSQL hot-table bloat: without --confirm prints the plan, --confirm STORE_MAINTENANCE executes (§10.3)
 failure-domain-map   read-only debug: prints the failure-domain mapping the product would render
 ```
 
