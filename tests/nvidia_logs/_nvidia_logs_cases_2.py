@@ -213,12 +213,14 @@ def test_kernel_xid_uses_boot_fenced_inventory_channel(
     asyncio.run(scenario())
 
 
-def test_kernel_nvlink5_two_register_netir_mfde_event_resets_gpu() -> None:
-    """The firmware's two-register XID 149 line reaches the Catalog action:
-    NETIR_MFDE_EVENT with Error Status 0x1 on a driver past the V2 boundary
-    decodes to RESET_GPU without any debug word."""
+def _nvlink5_kernel_decision(
+    message: str, *, record_id: str, driver_branch: int
+) -> tuple[dict, dict]:
+    """``(normalized xid event, decision)`` for one B200 kernel line posted to
+    the collector endpoint -- the normalizer and the policy engine together."""
 
     context = build_context()
+    result: dict = {}
 
     async def scenario() -> None:
         async with asgi_client(context) as client:
@@ -227,35 +229,108 @@ def test_kernel_nvlink5_two_register_netir_mfde_event_resets_gpu() -> None:
                 json={
                     "cluster_id": "hp-cluster",
                     "node_id": "worker-1",
-                    "record_id": "kmsg-xid149-mfde-worker-1",
+                    "record_id": record_id,
                     "observed_at": NOW.isoformat(),
-                    "message": (
-                        "NVRM: Xid (PCI:0000:b9:00): 149, pid=1234, name=python, "
-                        "NETIR_MFDE_EVENT  Fatal   XC0 i0 Link 03 "
-                        "(0x00000014 0x00000001)"
-                    ),
+                    "message": message,
                     "product": "B200",
-                    "driver_branch": 580,
+                    "driver_branch": driver_branch,
                     "cuda_version": "13.0",
                     "runtime_profile_version": "simulated-v1",
                     "workload_state": "IDLE",
                 },
             )
-
         assert response.status_code == 200, response.text
-        body = response.json()
-        event = body["normalized"]["xid_events"][0]
-        assert event["xid"] == 149
-        assert event["intr_info"] == 0x14
-        assert event["error_status"] == 0x1
-        decision = body["decisions"][0]
-        assert decision["source"] == "NVIDIA_CATALOG"
-        assert decision["official_action"] == "RESET_GPU"
-        assert decision["matched_decode_rules"] == ["NETIR_MFDE_EVENT"]
-        assert decision["disposition"] == "EXECUTABLE"
-        assert decision["action"] == "RESET_GPU"
+        result.update(response.json())
 
     asyncio.run(scenario())
+    (event,) = result["normalized"]["xid_events"]
+    (decision,) = result["decisions"]
+    assert decision["source"] == "NVIDIA_CATALOG"
+    return event, decision
+
+
+def test_kernel_nvlink5_two_register_netir_mfde_event_resets_gpu() -> None:
+    """The firmware's two-register XID 149 line reaches the Catalog action:
+    NETIR_MFDE_EVENT with Error Status 0x1 on a driver past the V2 boundary
+    decodes to RESET_GPU without any debug word."""
+
+    event, decision = _nvlink5_kernel_decision(
+        "NVRM: Xid (PCI:0000:b9:00): 149, pid=1234, name=python, "
+        "NETIR_MFDE_EVENT  Fatal   XC0 i0 Link 03 (0x00000014 0x00000001)",
+        record_id="kmsg-xid149-mfde-worker-1",
+        driver_branch=580,
+    )
+
+    assert event["xid"] == 149
+    assert event["intr_info"] == 0x14
+    assert event["error_status"] == 0x1
+    assert decision["official_action"] == "RESET_GPU"
+    assert decision["matched_decode_rules"] == ["NETIR_MFDE_EVENT"]
+    assert decision["disposition"] == "EXECUTABLE"
+    assert decision["action"] == "RESET_GPU"
+
+
+# Real-world B-series lines (sources: leptonai/gpud
+# components/accelerator/nvidia/xid/kmsg.go and nvlink_logs_test.go; NVIDIA/nccl
+# issue #2241), decoded through the pinned Catalog table.
+def test_kernel_nvlink5_captured_b200_link_event_decodes_only_under_its_driver_branch() -> (
+    None
+):
+    """gpud's captured pre-R575 line: under the V1 pattern the registers hit
+    exactly one rule (NETIR_LINK_EVT/NETIR_LINK_DOWN, bits[25:20] = 000100);
+    read as V2 the same registers match nothing and the policy fails closed."""
+
+    line = (
+        "NVRM: Xid (PCI:0018:01:00): 149, NETIR_LINK_EVT Fatal XC0 i0 Link 08 "
+        "(0x004505c6 0x00000000)"
+    )
+
+    event, decision = _nvlink5_kernel_decision(
+        line, record_id="kmsg-xid149-gpud-v1", driver_branch=570
+    )
+    assert (event["intr_info"], event["error_status"]) == (0x004505C6, 0x0)
+    assert decision["matched_decode_rules"] == ["NETIR_LINK_EVT/NETIR_LINK_DOWN"]
+    assert decision["official_action"] == "RESET_GPU"
+    assert decision["disposition"] == "EXECUTABLE"
+    assert decision["action"] == "RESET_GPU"
+
+    event, decision = _nvlink5_kernel_decision(
+        line, record_id="kmsg-xid149-gpud-v2", driver_branch=580
+    )
+    assert (event["intr_info"], event["error_status"]) == (0x004505C6, 0x0)
+    assert decision["matched_decode_rules"] == []
+    assert decision["action"] is None
+    assert decision["disposition"] == "BLOCKED_MISSING_EVIDENCE"
+    assert decision["requires_operator"] is True
+
+
+def test_kernel_nvlink5_gpud_ber_event_is_ignored_under_v1() -> None:
+    event, decision = _nvlink5_kernel_decision(
+        "NVRM: Xid (PCI:0018:01:00): 149, NETIR_BER_EVENT Nonfatal XC0 i0 Link 03 "
+        "(0x00086226 0x00000001)",
+        record_id="kmsg-xid149-gpud-ber",
+        driver_branch=570,
+    )
+
+    assert (event["intr_info"], event["error_status"]) == (0x00086226, 0x1)
+    assert decision["matched_decode_rules"] == ["NETIR_BER_EVENT"]
+    assert decision["official_action"] == "IGNORE"
+    assert decision["action"] == "NO_ACTION"
+
+
+def test_kernel_nvlink5_four_register_link_down_fixture_resets_gpu_under_v2() -> None:
+    event, decision = _nvlink5_kernel_decision(
+        "NVRM: Xid (PCI:0000:04:00): 149, NETIR_LINK_EVT/NETIR_LINK_DOWN Fatal "
+        "XC0 i0 Link 00 (0x01000011 0x00000000 0x00000000 0x00000000)",
+        record_id="kmsg-xid149-gpud-four",
+        driver_branch=580,
+    )
+
+    assert (event["intr_info"], event["error_status"]) == (0x01000011, 0x0)
+    assert decision["matched_decode_rules"] == ["NETIR_LINK_EVT/NETIR_LINK_DOWN"]
+    assert decision["official_action"] == "RESET_GPU"
+    assert decision["disposition"] == "EXECUTABLE"
+    assert decision["action"] == "RESET_GPU"
 
 
 def test_kernel_xid74_first_mechanical_event_resets_gpu() -> None:

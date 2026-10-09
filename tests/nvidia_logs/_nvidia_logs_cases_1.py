@@ -832,6 +832,49 @@ def test_kernel_nvlink5_nine_registers_remain_missing() -> None:
     ) == (None, None)
 
 
+# Real-world B-series lines. Sources: the open-source GPU health daemon
+# leptonai/gpud -- components/accelerator/nvidia/xid/kmsg.go quotes a captured
+# pre-R575 XID 149 line, nvlink_logs_test.go carries fixtures in a four-register
+# shape with V2 values -- and NVIDIA/nccl issue #2241, where a B200 line was
+# posted with its registers elided.
+def test_kernel_nvlink5_parses_the_captured_b200_netir_link_event_line() -> None:
+    assert _nvlink5_registers(
+        "kmsg-xid149-gpud-link-evt",
+        "NVRM: Xid (PCI:0018:01:00): 149, NETIR_LINK_EVT Fatal XC0 i0 Link 08 "
+        "(0x004505c6 0x00000000)",
+    ) == (0x004505C6, 0x0)
+
+
+def test_kernel_nvlink5_parses_the_gpud_ber_event_line() -> None:
+    assert _nvlink5_registers(
+        "kmsg-xid149-gpud-ber",
+        "NVRM: Xid (PCI:0018:01:00): 149, NETIR_BER_EVENT Nonfatal XC0 i0 Link 03 "
+        "(0x00086226 0x00000001)",
+    ) == (0x00086226, 0x1)
+
+
+def test_kernel_nvlink5_parses_the_four_register_fixture_shape() -> None:
+    assert _nvlink5_registers(
+        "kmsg-xid149-gpud-four",
+        "NVRM: Xid (PCI:0000:04:00): 149, NETIR_LINK_EVT/NETIR_LINK_DOWN Fatal "
+        "XC0 i0 Link 00 (0x01000011 0x00000000 0x00000000 0x00000000)",
+    ) == (0x01000011, 0x0)
+    assert _nvlink5_registers(
+        "kmsg-xid146-gpud-four",
+        "NVRM: Xid (PCI:0000:04:00): 146, TLW_RX/TLW_RX_PIPE0 Fatal XC0 i0 "
+        "Link 00 (0x0000000a 0x00000004 0x00000000 0x00000000)",
+    ) == (0xA, 0x4)
+
+
+def test_kernel_nvlink5_elided_registers_remain_missing() -> None:
+    """A line pasted with ``(...)`` in place of the registers carries no hex."""
+
+    assert _nvlink5_registers(
+        "kmsg-xid145-elided",
+        "NVRM: Xid (PCI:0000:04:00): 145, RLW_RXPIPE Nonfatal XC0 i0 Link 11 (...)",
+    ) == (None, None)
+
+
 def test_fabric_manager_and_kernel_observations_merge_into_one_incident() -> None:
     context = build_context()
 
