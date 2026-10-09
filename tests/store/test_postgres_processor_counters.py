@@ -46,7 +46,8 @@ def _legacy_counts() -> dict[str, int]:
     ) as conn:
         with conn.cursor() as cursor:
             cursor.execute(
-                "SELECT cluster_id, incomplete_count FROM gpu_fault_processor_queue_counts"
+                "SELECT cluster_id, sum(incomplete_count) "
+                "FROM gpu_fault_processor_queue_counts GROUP BY cluster_id"
             )
             return {row[0]: int(row[1]) for row in cursor.fetchall()}
 

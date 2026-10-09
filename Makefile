@@ -165,6 +165,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_claim_window.py \
 	tests/store/test_postgres_collector_status_concurrency.py \
 	tests/store/test_postgres_core_guards.py \
+	tests/store/test_postgres_counter_ledger_concurrency.py \
 	tests/store/test_postgres_dedicated_hot_state_startup.py \
 	tests/store/test_postgres_ensure_schema_locks.py \
 	tests/store/test_postgres_find_open_remote_command.py \

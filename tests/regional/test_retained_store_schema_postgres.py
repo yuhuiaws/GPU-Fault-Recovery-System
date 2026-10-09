@@ -50,22 +50,26 @@ NOW = datetime(2026, 9, 14, 12, tzinfo=UTC)
 KINDS = ("workflow", "remote_command")
 PHYSICAL_COPIES = {"legacy": (1, 0), "dual": (1, 1), "dedicated": (0, 1)}
 
-# A v18 database is the current one with the two single-column timestamp
-# indexes v19 retires and without v19's storage parameters; v19 changes no
-# record layout, so the retained rows below are exactly what v18 wrote.
-V18_RETIRED_INDEXES = (
-    "CREATE INDEX IF NOT EXISTS gpu_fault_gpu_metric_latest_observed "
-    "ON public.gpu_fault_gpu_metric_latest (observed_at)",
-    "CREATE INDEX IF NOT EXISTS gpu_fault_processor_lanes_expiry "
-    "ON public.gpu_fault_processor_lanes (lease_expires_at)",
-)
-V18_UNSET_STORAGE_PARAMETERS = (
-    "gpu_fault_processor_lanes",
-    "gpu_fault_processor_queue_counts",
-    "gpu_fault_processor_priority_count_shards",
-    "gpu_fault_processor_queue",
-    "gpu_fault_gpu_metric_latest",
-    "gpu_fault_gpu_metrics_batches",
+# A v19 database is the current one with the processor counter tables in their
+# pre-ledger shape: the shard CHECK at 16, the >= 0 checks, and the per-cluster
+# count table keyed by cluster_id alone, without shard_id. v20 changes no record
+# layout of the state tables, so the retained rows below are exactly what v19
+# wrote. The counter trigger functions stay current: the pre-ensure probe never
+# reads them and ensure replaces them regardless.
+V19_COUNTER_SHAPE = (
+    "ALTER TABLE public.gpu_fault_processor_priority_count_shards "
+    "DROP CONSTRAINT gpu_fault_processor_priority_count_shards_shard_id_check",
+    "ALTER TABLE public.gpu_fault_processor_priority_count_shards "
+    "ADD CONSTRAINT gpu_fault_processor_priority_count_shards_shard_id_check "
+    "CHECK (shard_id >= 0 AND shard_id < 16)",
+    "ALTER TABLE public.gpu_fault_processor_priority_count_shards "
+    "ADD CHECK (incomplete_count >= 0)",
+    "ALTER TABLE public.gpu_fault_processor_queue_counts "
+    "DROP CONSTRAINT gpu_fault_processor_queue_counts_pkey",
+    "ALTER TABLE public.gpu_fault_processor_queue_counts DROP COLUMN shard_id",
+    "ALTER TABLE public.gpu_fault_processor_queue_counts ADD PRIMARY KEY (cluster_id)",
+    "ALTER TABLE public.gpu_fault_processor_queue_counts "
+    "ADD CHECK (incomplete_count >= 0)",
 )
 
 
@@ -121,31 +125,24 @@ def migration_history(connection: psycopg.Connection) -> list[tuple]:
     ).fetchall()
 
 
-def install_v18(connection: psycopg.Connection) -> None:
-    assert LATEST_POSTGRES_SCHEMA_VERSION == 19, (
+def install_v19(connection: psycopg.Connection) -> None:
+    assert LATEST_POSTGRES_SCHEMA_VERSION == 20, (
         "a new schema requires review of the historical fixture and compatibility pair"
     )
     with connection.transaction():
-        for statement in V18_RETIRED_INDEXES:
+        for statement in V19_COUNTER_SHAPE:
             connection.execute(statement)
-        for table in V18_UNSET_STORAGE_PARAMETERS:
-            connection.execute(
-                f"ALTER TABLE public.{table} RESET (fillfactor, "
-                "autovacuum_vacuum_scale_factor, autovacuum_vacuum_threshold, "
-                "autovacuum_analyze_scale_factor, autovacuum_analyze_threshold, "
-                "autovacuum_vacuum_cost_delay)"
-            )
         connection.execute(
-            "DELETE FROM public.gpu_fault_schema_migrations WHERE version>18"
+            "DELETE FROM public.gpu_fault_schema_migrations WHERE version>19"
         )
         connection.execute(
-            "UPDATE public.gpu_fault_schema_version SET version=18 WHERE singleton"
+            "UPDATE public.gpu_fault_schema_version SET version=19 WHERE singleton"
         )
     assert migration_history(connection) == [
         (item.version, item.name, item.checksum)
         for item in POSTGRES_SCHEMA_MIGRATIONS
-        if item.version <= 18
-    ], "v18 must have the complete, unchanged migration prefix"
+        if item.version <= 19
+    ], "v19 must have the complete, unchanged migration prefix"
 
 
 def configure_mode(
@@ -297,7 +294,7 @@ def test_retained_v17_terminal_rows_are_safe_in_real_storage_modes(
     connection = database.connection
     configure_mode(connection, mode)
     seed_records(connection)
-    install_v18(connection)
+    install_v19(connection)
     before = migration_history(connection)
     for kind in KINDS:
         assert physical_counts(connection, kind) == PHYSICAL_COPIES[mode], (
@@ -322,7 +319,7 @@ def test_retained_v17_terminal_rows_are_safe_in_real_storage_modes(
     assert proof == {
         "safe": True,
         "database_state": "initialized",
-        "schema_version": 18,
+        "schema_version": 19,
         "schema_ensure_required": True,
         "blockers": {"workflow": 0, "remote_command": 0, "observation": 0},
     }, "terminal retained rows must not be treated as missing-status blockers"
@@ -347,7 +344,7 @@ def test_blockers_count_real_physical_copies_in_independent_modes(
         workflow_status=WorkflowStatus.BLOCKED,
         command_status=RemoteCommandStatus.LEASED,
     )
-    install_v18(connection)
+    install_v19(connection)
     before = retained_rows(connection)
 
     proof = inspect_database(
@@ -382,7 +379,7 @@ def test_real_observation_workload_phase_is_checked_in_both_heaps(
 ) -> None:
     connection = database.connection
     seed_observation(connection, storage, phase)
-    install_v18(connection)
+    install_v19(connection)
     before = retained_rows(connection)
 
     proof = inspect_database(
@@ -414,7 +411,7 @@ def test_unknown_legacy_status_is_never_accepted_as_terminal(
         "WHERE kind=%s",
         (json.dumps(status), kind),
     )
-    install_v18(connection)
+    install_v19(connection)
 
     proof = inspect_database(
         connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
@@ -425,13 +422,13 @@ def test_unknown_legacy_status_is_never_accepted_as_terminal(
 
 
 @pytest.mark.parametrize("drift", ["missing", "name", "checksum", "extra"])
-def test_only_the_exact_contiguous_v18_migration_prefix_is_accepted(
+def test_only_the_exact_contiguous_v19_migration_prefix_is_accepted(
     database: PrivateDatabase, drift: str
 ) -> None:
     from psycopg import sql
 
     connection = database.connection
-    install_v18(connection)
+    install_v19(connection)
     if drift == "missing":
         connection.execute(
             "DELETE FROM public.gpu_fault_schema_migrations WHERE version=7"
@@ -446,7 +443,7 @@ def test_only_the_exact_contiguous_v18_migration_prefix_is_accepted(
     else:
         connection.execute(
             sql.SQL(
-                "UPDATE public.gpu_fault_schema_migrations SET {}=%s WHERE version=18"
+                "UPDATE public.gpu_fault_schema_migrations SET {}=%s WHERE version=19"
             ).format(sql.Identifier(drift)),
             ("0" * 64 if drift == "checksum" else "unrecognized-migration",),
         )
@@ -463,17 +460,17 @@ def test_only_the_exact_contiguous_v18_migration_prefix_is_accepted(
 @pytest.mark.parametrize(
     ("observed", "required", "allowed", "message"),
     [
-        (17, 19, True, "schema version differs"),
-        (20, 19, True, "schema version differs"),
-        (18, 19, False, "schema version differs"),
-        (18, 18, True, "probe image schema identity differs"),
+        (18, 20, True, "schema version differs"),
+        (21, 20, True, "schema version differs"),
+        (19, 20, False, "schema version differs"),
+        (19, 19, True, "probe image schema identity differs"),
     ],
 )
 def test_unreviewed_or_unapproved_schema_markers_fail_closed(
     database: PrivateDatabase, observed: int, required: int, allowed: bool, message: str
 ) -> None:
     connection = database.connection
-    install_v18(connection)
+    install_v19(connection)
     # Invalid marker cases are deliberate corruption, not claimed v16/v19 fixtures.
     connection.execute(
         "UPDATE public.gpu_fault_schema_version SET version=%s WHERE singleton",
@@ -503,7 +500,7 @@ def test_retained_heap_with_row_security_is_refused(
     from psycopg import sql
 
     connection = database.connection
-    install_v18(connection)
+    install_v19(connection)
     connection.execute(
         sql.SQL("ALTER TABLE {} ENABLE ROW LEVEL SECURITY").format(
             sql.Identifier("public", table)
@@ -523,7 +520,7 @@ def test_retained_proof_requires_plain_builtin_heap_columns(
     database: PrivateDatabase, drift: str
 ) -> None:
     connection = database.connection
-    install_v18(connection)
+    install_v19(connection)
     if drift == "view":
         connection.execute(
             "ALTER TABLE public.gpu_fault_workflows RENAME TO gpu_fault_retained_workflows"
@@ -563,7 +560,7 @@ def test_missing_storage_mode_cannot_hide_a_retained_heap(
     connection = database.connection
     configure_mode(connection, "dedicated")
     seed_records(connection)
-    install_v18(connection)
+    install_v19(connection)
     connection.execute(
         "DELETE FROM public.gpu_fault_control_state_modes WHERE kind='workflow'"
     )
@@ -583,7 +580,7 @@ def test_preensure_probe_never_executes_retained_projection_functions(
     connection = database.connection
     configure_mode(connection, "dedicated")
     seed_records(connection)
-    install_v18(connection)
+    install_v19(connection)
     for kind in KINDS:
         layout = STATE_LAYOUTS[kind]
         connection.execute(
@@ -624,7 +621,7 @@ def test_explicit_v18_ensure_precedes_current_business_proof_and_preserves_rows(
     connection = database.connection
     configure_mode(connection, mode)
     seed_records(connection)
-    install_v18(connection)
+    install_v19(connection)
     before = retained_rows(connection)
     history = migration_history(connection)
 
@@ -649,9 +646,9 @@ def test_explicit_v18_ensure_precedes_current_business_proof_and_preserves_rows(
 
     assert migration_history(connection) == [
         (item.version, item.name, item.checksum) for item in POSTGRES_SCHEMA_MIGRATIONS
-    ], "ensure must append exactly the candidate v19 migration"
+    ], "ensure must append exactly the candidate v20 migration"
     assert migration_history(connection)[:-1] == history, (
-        "v1-v18 history must stay unchanged"
+        "v1-v19 history must stay unchanged"
     )
     assert retained_rows(connection) == before, (
         "ensure must preserve retained data, selected modes and migration checkpoints"
@@ -675,41 +672,49 @@ def test_explicit_v18_ensure_precedes_current_business_proof_and_preserves_rows(
         ), "reinstallation must not clear historical quarantine"
 
 
-def _index_present(connection: psycopg.Connection, name: str) -> bool:
+def _constraint_definitions(connection: psycopg.Connection, table: str) -> list[str]:
+    return [
+        str(row[0])
+        for row in connection.execute(
+            "SELECT pg_get_constraintdef(oid) FROM pg_constraint "
+            "WHERE conrelid=to_regclass(%s) ORDER BY conname",
+            (f"public.{table}",),
+        ).fetchall()
+    ]
+
+
+def _column_present(connection: psycopg.Connection, table: str, column: str) -> bool:
     return (
         connection.execute(
-            "SELECT 1 FROM pg_indexes WHERE schemaname='public' AND indexname=%s",
-            (name,),
+            "SELECT 1 FROM information_schema.columns WHERE table_schema='public' "
+            "AND table_name=%s AND column_name=%s",
+            (table, column),
         ).fetchone()
         is not None
     )
 
 
-def _reloptions(connection: psycopg.Connection, table: str) -> set[str]:
-    (options,) = connection.execute(
-        "SELECT reloptions FROM pg_class WHERE oid=to_regclass(%s)",
-        (f"public.{table}",),
-    ).fetchone()
-    return set(options or [])
-
-
-def test_fixture_has_real_v18_shape_and_ensure_installs_v19_storage_behavior(
+def test_fixture_has_real_v19_shape_and_ensure_installs_v20_counter_ledger(
     database: PrivateDatabase,
 ) -> None:
     connection = database.connection
     configure_mode(connection, "dual")
     seed_records(connection)
-    install_v18(connection)
+    install_v19(connection)
     before = retained_rows(connection)
-    assert _index_present(connection, "gpu_fault_gpu_metric_latest_observed"), (
-        "a v18 database still carries the metric timestamp index"
+    shards = "gpu_fault_processor_priority_count_shards"
+    counts = "gpu_fault_processor_queue_counts"
+    assert any(
+        "shard_id < 16)" in d for d in _constraint_definitions(connection, shards)
+    ), "the fixture must really be a v19 database, not a relabelled v20 one"
+    assert "PRIMARY KEY (cluster_id)" in _constraint_definitions(connection, counts)
+    assert any(
+        "incomplete_count >= 0" in d
+        for d in _constraint_definitions(connection, counts)
+    ), "v19 still forbids negative count rows"
+    assert not _column_present(connection, counts, "shard_id"), (
+        "v19 keys the count table by cluster alone"
     )
-    assert _index_present(connection, "gpu_fault_processor_lanes_expiry"), (
-        "a v18 database still carries the lane expiry index"
-    )
-    assert "fillfactor=50" not in _reloptions(
-        connection, "gpu_fault_processor_lanes"
-    ), "the fixture must really be a v18 database, not a relabelled v19 one"
 
     with closing(database.open_store(True)):
         pass
@@ -717,17 +722,14 @@ def test_fixture_has_real_v18_shape_and_ensure_installs_v19_storage_behavior(
     assert retained_rows(connection) == before, (
         "ensure must preserve retained data, selected modes and migration checkpoints"
     )
-    assert not _index_present(connection, "gpu_fault_gpu_metric_latest_observed"), (
-        "v19 retires the metric timestamp index"
-    )
-    assert not _index_present(connection, "gpu_fault_processor_lanes_expiry"), (
-        "v19 retires the lane expiry index"
-    )
-    assert {"fillfactor=50", "autovacuum_vacuum_scale_factor=0"} <= _reloptions(
-        connection, "gpu_fault_processor_lanes"
-    )
-    assert {"fillfactor=70", "autovacuum_vacuum_threshold=50"} <= _reloptions(
-        connection, "gpu_fault_gpu_metric_latest"
+    after_shards = _constraint_definitions(connection, shards)
+    after_counts = _constraint_definitions(connection, counts)
+    assert any("shard_id < 128)" in d for d in after_shards), after_shards
+    assert not any("incomplete_count >= 0" in d for d in after_shards), after_shards
+    assert "PRIMARY KEY (cluster_id, shard_id)" in after_counts, after_counts
+    assert not any("incomplete_count >= 0" in d for d in after_counts), after_counts
+    assert _column_present(connection, counts, "shard_id"), (
+        "v20 keys the count table per writer shard"
     )
     assert migration_history(connection)[-1][0] == LATEST_POSTGRES_SCHEMA_VERSION
     assert connection.execute(
@@ -742,7 +744,7 @@ def test_retained_probe_works_inside_a_read_only_session(
 
     connection = database.connection
     seed_records(connection)
-    install_v18(connection)
+    install_v19(connection)
     before = retained_rows(connection)
     connection.execute("SET default_transaction_read_only=on")
     try:

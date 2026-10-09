@@ -178,7 +178,7 @@ def test_registered_migration_callbacks_use_the_public_cursor_boundary():
             before = len(recorder.statements)
             migration.apply(recorder)
             statements_by_version[migration.version] = recorder.statements[before:]
-    for version in (4, 5, 6, 9, 10, 13, 14, 15, 16, 17, 18):
+    for version in (4, 5, 6, 9, 10, 13, 14, 15, 16, 17, 18, 20):
         assert statements_by_version[version] == [("SELECT 1", None)], (
             f"migration {version} must retain its published no-op callback"
         )

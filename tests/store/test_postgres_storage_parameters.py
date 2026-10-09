@@ -18,6 +18,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from gpu_fault.gpu_metrics import GpuMetricLatest, GpuMetricSample, GpuMetricSource
+from gpu_fault.schema_migrations import LATEST_POSTGRES_SCHEMA_VERSION
 from gpu_fault.store import PostgresStore
 from gpu_fault.store.postgres.ddl import declared_index_names
 from gpu_fault.store.postgres.ddl_storage_parameters import (
@@ -206,7 +207,7 @@ def test_a_v18_database_loses_the_retired_indexes_on_ensure() -> None:
             "CREATE INDEX gpu_fault_processor_lanes_expiry "
             "ON gpu_fault_processor_lanes (lease_expires_at)"
         )
-        cursor.execute("DELETE FROM gpu_fault_schema_migrations WHERE version=19")
+        cursor.execute("DELETE FROM gpu_fault_schema_migrations WHERE version>18")
         cursor.execute("UPDATE gpu_fault_schema_version SET version=18")
     assert POSTGRES_URL is not None
     PostgresStore(POSTGRES_URL).close()
@@ -217,7 +218,7 @@ def test_a_v18_database_loses_the_retired_indexes_on_ensure() -> None:
         )
         assert cursor.fetchall() == []
         cursor.execute("SELECT version FROM gpu_fault_schema_version")
-        assert cursor.fetchone() == (19,)
+        assert cursor.fetchone() == (LATEST_POSTGRES_SCHEMA_VERSION,)
 
 
 def _latest(observed_at: datetime) -> GpuMetricLatest:

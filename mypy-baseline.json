@@ -311,7 +311,7 @@
   "src/gpu_fault/store/postgres/collector_telemetry.py:var-annotated": 1,
   "src/gpu_fault/store/postgres/control_records.py:arg-type": 1,
   "src/gpu_fault/store/postgres/control_records.py:no-untyped-def": 4,
-  "src/gpu_fault/store/postgres/ddl.py:no-untyped-def": 12,
+  "src/gpu_fault/store/postgres/ddl.py:no-untyped-def": 8,
   "src/gpu_fault/store/postgres/ddl_spool.py:no-untyped-def": 1,
   "src/gpu_fault/store/postgres/fleet.py:no-untyped-def": 6,
   "src/gpu_fault/store/postgres/gpu_telemetry.py:arg-type": 2,

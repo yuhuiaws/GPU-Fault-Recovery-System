@@ -23,9 +23,9 @@ from tests._builders import asgi_client, build_store
 
 HELP = (
     "# HELP gpu_fault_processor_counter_mode Processor admission counter mode; "
-    "the 16 priority shards relieve counter-row contention only in partitioned "
-    "mode; finalize requires an empty queue "
-    "(gpu-fault-store-migrate --finalize-processor-counter-shards)"
+    "both counter tables hold per-writer-backend rows (shard = backend pid mod "
+    "128), partitioned reads the priority shards; finalize requires an empty "
+    "queue (gpu-fault-store-migrate --finalize-processor-counter-shards)"
 )
 
 

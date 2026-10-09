@@ -6,13 +6,30 @@ from typing import Any
 from gpu_fault.store.postgres import ddl_processor_retry
 from gpu_fault.store.postgres.ddl_control_plane_review import create_v13_stage
 from gpu_fault.store.postgres.ddl_control_state_stage import create_control_state_stage
+
+# Explicit re-exports: the frozen v8 migration callback and the schema tests
+# reach the counter stages through this module.
+from gpu_fault.store.postgres.ddl_counter_ledger import (
+    _create_priority_counter_function as _create_priority_counter_function,
+)
+from gpu_fault.store.postgres.ddl_counter_ledger import (
+    _create_priority_counter_triggers as _create_priority_counter_triggers,
+)
+from gpu_fault.store.postgres.ddl_counter_ledger import (
+    _create_processor_counter_functions as _create_processor_counter_functions,
+)
+from gpu_fault.store.postgres.ddl_counter_ledger import (
+    _create_processor_triggers as _create_processor_triggers,
+)
+from gpu_fault.store.postgres.ddl_counter_ledger import (
+    create_counter_ledger_tables_stage,
+)
 from gpu_fault.store.postgres.ddl_helpers import (
     _CREATE_INDEX,
     _add_column_if_missing,
     _declare_index,
     _drop_column_if_present,
     _drop_index_if_present,
-    _enable_trigger_if_disabled,
     _ensure_trigger,
     _recorded_schema_version,
 )
@@ -897,10 +914,13 @@ def _create_processor_tables(cursor) -> None:
         """
         CREATE TABLE IF NOT EXISTS
         gpu_fault_processor_queue_counts (
-            cluster_id TEXT PRIMARY KEY,
+            cluster_id TEXT NOT NULL,
+            shard_id SMALLINT NOT NULL DEFAULT 0
+                CONSTRAINT gpu_fault_processor_queue_counts_shard_id_check
+                CHECK (shard_id >= 0 AND shard_id < 128),
             incomplete_count BIGINT NOT NULL DEFAULT 0,
             updated_at TIMESTAMPTZ NOT NULL,
-            CHECK (incomplete_count >= 0)
+            PRIMARY KEY (cluster_id, shard_id)
         )
         """
     )
@@ -936,553 +956,18 @@ def _create_processor_tables(cursor) -> None:
             priority_bucket SMALLINT NOT NULL
                 CHECK (priority_bucket IN (0, 50, 100)),
             shard_id SMALLINT NOT NULL
-                CHECK (shard_id >= 0 AND shard_id < 16),
+                CONSTRAINT
+                gpu_fault_processor_priority_count_shards_shard_id_check
+                CHECK (shard_id >= 0 AND shard_id < 128),
             incomplete_count BIGINT NOT NULL DEFAULT 0,
             updated_at TIMESTAMPTZ NOT NULL,
             PRIMARY KEY (
                 cluster_id, priority_bucket, shard_id
-            ),
-            CHECK (incomplete_count >= 0)
-        )
-        """
-    )
-
-
-def _create_processor_counter_functions(cursor) -> None:
-    # One counter row per cluster, updated once per statement instead
-    # of once per row. The row trigger below it used to run two
-    # upserts against the same counter row for every queue row - a
-    # 1000-row admission batch or cleanup delete meant up to 2000
-    # extra index writes and 2000 chances to serialize behind another
-    # writer on the same counter. Aggregating the delta from the
-    # transition table collapses that to one upsert per cluster per
-    # statement, which is what makes bulk enqueue and bulk cleanup
-    # scale with rows instead of with lock waits.
-    cursor.execute(
-        """
-        CREATE OR REPLACE FUNCTION
-        gpu_fault_processor_queue_count_apply(
-            p_scopes TEXT[],
-            p_deltas BIGINT[]
-        )
-        RETURNS void
-        LANGUAGE plpgsql
-        AS $$
-        BEGIN
-            -- Claim the counter rows in cluster_id order before
-            -- touching them. One statement now carries deltas for
-            -- every cluster it touched, and the UPDATE below joins
-            -- an unordered set, so two transactions whose batches
-            -- span the same two clusters could take those two row
-            -- locks in opposite order. A 32-cluster burst does that
-            -- thousands of times a second: the deadlock aborts the
-            -- completion batch, the requests stay in the queue and
-            -- the whole ingest path stalls behind them. Locking in
-            -- a total order first makes the cycle impossible.
-            PERFORM 1
-            FROM gpu_fault_processor_queue_counts
-            WHERE cluster_id = ANY (p_scopes)
-            ORDER BY cluster_id
-            FOR UPDATE;
-            WITH deltas AS (
-                SELECT scope, delta
-                FROM unnest(p_scopes, p_deltas)
-                    AS pairs(scope, delta)
-                WHERE delta <> 0
-            ),
-            updated AS (
-                UPDATE gpu_fault_processor_queue_counts AS counts
-                SET incomplete_count=greatest(
-                        0, counts.incomplete_count + deltas.delta
-                    ),
-                    updated_at=now()
-                FROM deltas
-                WHERE counts.cluster_id=deltas.scope
-                RETURNING counts.cluster_id
             )
-            INSERT INTO gpu_fault_processor_queue_counts(
-                cluster_id, incomplete_count, updated_at
-            )
-            SELECT deltas.scope, greatest(0, deltas.delta), now()
-            FROM deltas
-            WHERE deltas.scope NOT IN (
-                SELECT cluster_id FROM updated
-            )
-            -- Same reason as the FOR UPDATE above: rows are
-            -- inserted in the order this SELECT produces them, and
-            -- a conflicting row is locked at that point, so the
-            -- order has to be total here too.
-            ORDER BY deltas.scope
-            -- Only reachable if a concurrent transaction created the
-            -- row after the UPDATE above missed it. A scope with no
-            -- row cannot have counted work, so a negative delta
-            -- there is already floored at zero.
-            ON CONFLICT(cluster_id) DO UPDATE SET
-                incomplete_count=greatest(
-                    0,
-                    gpu_fault_processor_queue_counts
-                        .incomplete_count
-                    + excluded.incomplete_count
-                ),
-                updated_at=excluded.updated_at;
-        END
-        $$
-        """
-    )
-    cursor.execute(
-        """
-        CREATE OR REPLACE FUNCTION
-        gpu_fault_processor_queue_count_sync()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
-        DECLARE
-            scopes TEXT[];
-            deltas BIGINT[];
-            include_legacy BOOLEAN;
-        BEGIN
-            SELECT mode='dual'
-            INTO include_legacy
-            FROM gpu_fault_processor_counter_mode
-            WHERE singleton=TRUE;
-            include_legacy := coalesce(include_legacy, TRUE);
-            IF TG_OP = 'INSERT' THEN
-                IF current_setting(
-                    'gpu_fault.skip_processor_queue_count_insert',
-                    true
-                ) = 'on' THEN
-                    RETURN NULL;
-                END IF;
-                SELECT
-                    array_agg(scope), array_agg(delta)
-                INTO scopes, deltas
-                FROM (
-                    SELECT
-                        coalesce(
-                            cluster_id, '__unscoped__'
-                        ) AS scope,
-                        count(*)::bigint AS delta
-                    FROM added
-                    WHERE status IN ('PENDING', 'LEASED')
-                      AND include_legacy
-                    GROUP BY 1
-                ) AS grouped;
-            ELSIF TG_OP = 'DELETE' THEN
-                SELECT
-                    array_agg(scope), array_agg(delta)
-                INTO scopes, deltas
-                FROM (
-                    SELECT
-                        coalesce(
-                            cluster_id, '__unscoped__'
-                        ) AS scope,
-                        -count(*)::bigint AS delta
-                    FROM removed
-                    WHERE status IN ('PENDING', 'LEASED')
-                      AND include_legacy
-                    GROUP BY 1
-                ) AS grouped;
-            ELSE
-                SELECT
-                    array_agg(scope), array_agg(delta)
-                INTO scopes, deltas
-                FROM (
-                    SELECT scope, sum(delta)::bigint AS delta
-                    FROM (
-                        SELECT
-                            coalesce(
-                                cluster_id, '__unscoped__'
-                            ) AS scope,
-                            1 AS delta
-                        FROM added
-                        WHERE status IN ('PENDING', 'LEASED')
-                          AND include_legacy
-                        UNION ALL
-                        SELECT
-                            coalesce(
-                                cluster_id, '__unscoped__'
-                            ),
-                            -1
-                        FROM removed
-                        WHERE status IN ('PENDING', 'LEASED')
-                          AND include_legacy
-                    ) AS signed
-                    GROUP BY scope
-                    HAVING sum(delta) <> 0
-                ) AS grouped;
-            END IF;
-            IF scopes IS NOT NULL THEN
-                PERFORM gpu_fault_processor_queue_count_apply(
-                    scopes, deltas
-                );
-            END IF;
-            RETURN NULL;
-        END
-        $$
-        """
-    )
-
-
-def _create_processor_triggers(cursor) -> None:
-    # The row trigger and its function are replaced, not kept
-    # alongside: running both would double every delta.
-    cursor.execute(
-        """
-        DROP TRIGGER IF EXISTS
-            gpu_fault_processor_queue_count_trigger
-        ON gpu_fault_processor_queue
-        """
-    )
-    cursor.execute(
-        """
-        DROP FUNCTION IF EXISTS
-            gpu_fault_processor_queue_count_adjust()
-        """
-    )
-    # A transition-table trigger may only cover one event, hence
-    # three definitions over the one function.
-    for name, event, referencing in (
-        (
-            "gpu_fault_processor_queue_count_insert",
-            "INSERT",
-            "NEW TABLE AS added",
-        ),
-        (
-            # No column list: Postgres rejects one together with
-            # transition tables. A lease renewal therefore still
-            # fires the trigger, but its rows contribute +1 and -1
-            # to the same scope and the HAVING clause drops the
-            # group, so no counter row is touched.
-            "gpu_fault_processor_queue_count_update",
-            "UPDATE",
-            "OLD TABLE AS removed NEW TABLE AS added",
-        ),
-        (
-            "gpu_fault_processor_queue_count_delete",
-            "DELETE",
-            "OLD TABLE AS removed",
-        ),
-    ):
-        cursor.execute(
-            f"""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_trigger
-                    WHERE tgname='{name}'
-                ) THEN
-                    CREATE TRIGGER {name}
-                    AFTER {event}
-                    ON gpu_fault_processor_queue
-                    REFERENCING {referencing}
-                    FOR EACH STATEMENT
-                    EXECUTE FUNCTION
-                        gpu_fault_processor_queue_count_sync();
-                END IF;
-            END
-            $$
-            """
         )
-    cursor.execute(
-        """
-        CREATE OR REPLACE FUNCTION
-        gpu_fault_processor_priority_count_apply(
-            p_scopes TEXT[],
-            p_priorities SMALLINT[],
-            p_shards SMALLINT[],
-            p_deltas BIGINT[]
-        )
-        RETURNS void
-        LANGUAGE plpgsql
-        AS $$
-        DECLARE
-            target RECORD;
-        BEGIN
-            -- A set-based SELECT ... ORDER BY ... FOR UPDATE did
-            -- not establish a stable lock order under Aurora's
-            -- plan for the composite IN predicate. Admission and
-            -- completion transactions each held a different shard
-            -- tuple and waited for the other, producing 103
-            -- deadlocks in the 32-cluster mixed burst. A procedural
-            -- loop makes the order observable and therefore
-            -- mandatory: every writer reaches each
-            -- (cluster,bucket,shard) key in the same total order.
-            FOR target IN
-                SELECT
-                    scope,
-                    priority_bucket,
-                    shard,
-                    sum(delta)::bigint AS delta
-                FROM unnest(
-                    p_scopes,
-                    p_priorities,
-                    p_shards,
-                    p_deltas
-                ) AS pairs(
-                    scope, priority_bucket, shard, delta
-                )
-                WHERE delta <> 0
-                GROUP BY scope, priority_bucket, shard
-                HAVING sum(delta) <> 0
-                ORDER BY scope, priority_bucket, shard
-            LOOP
-                INSERT INTO
-                    gpu_fault_processor_priority_count_shards(
-                        cluster_id,
-                        priority_bucket,
-                        shard_id,
-                        incomplete_count,
-                        updated_at
-                    )
-                VALUES (
-                    target.scope,
-                    target.priority_bucket,
-                    target.shard,
-                    greatest(0, target.delta),
-                    now()
-                )
-                ON CONFLICT(
-                    cluster_id, priority_bucket, shard_id
-                ) DO UPDATE SET
-                    incomplete_count=greatest(
-                        0,
-                        gpu_fault_processor_priority_count_shards
-                            .incomplete_count
-                        + target.delta
-                    ),
-                    updated_at=excluded.updated_at;
-            END LOOP;
-        END
-        $$
         """
     )
-
-
-def _create_priority_counter_function(cursor) -> None:
-    cursor.execute(
-        """
-        CREATE OR REPLACE FUNCTION
-        gpu_fault_processor_priority_count_sync()
-        RETURNS trigger
-        LANGUAGE plpgsql
-        AS $$
-        DECLARE
-            scopes TEXT[];
-            priorities SMALLINT[];
-            shards SMALLINT[];
-            deltas BIGINT[];
-        BEGIN
-            IF TG_OP = 'INSERT' THEN
-                SELECT
-                    array_agg(
-                        scope ORDER BY
-                            scope, priority_bucket, shard
-                    ),
-                    array_agg(
-                        priority_bucket ORDER BY
-                            scope, priority_bucket, shard
-                    ),
-                    array_agg(
-                        shard ORDER BY
-                            scope, priority_bucket, shard
-                    ),
-                    array_agg(
-                        delta ORDER BY
-                            scope, priority_bucket, shard
-                    )
-                INTO scopes, priorities, shards, deltas
-                FROM (
-                    SELECT
-                        coalesce(
-                            cluster_id, '__unscoped__'
-                        ) AS scope,
-                        (
-                            CASE
-                                WHEN priority <= 10 THEN 0
-                                WHEN priority <= 50 THEN 50
-                                ELSE 100
-                            END
-                        )::smallint AS priority_bucket,
-                        mod(
-                            (
-                                hashtextextended(request_id, 0)
-                                & 9223372036854775807
-                            ),
-                            16
-                        )::smallint AS shard,
-                        count(*)::bigint AS delta
-                    FROM added
-                    WHERE status IN ('PENDING', 'LEASED')
-                    GROUP BY 1, 2, 3
-                ) AS grouped;
-            ELSIF TG_OP = 'DELETE' THEN
-                SELECT
-                    array_agg(
-                        scope ORDER BY
-                            scope, priority_bucket, shard
-                    ),
-                    array_agg(
-                        priority_bucket ORDER BY
-                            scope, priority_bucket, shard
-                    ),
-                    array_agg(
-                        shard ORDER BY
-                            scope, priority_bucket, shard
-                    ),
-                    array_agg(
-                        delta ORDER BY
-                            scope, priority_bucket, shard
-                    )
-                INTO scopes, priorities, shards, deltas
-                FROM (
-                    SELECT
-                        coalesce(
-                            cluster_id, '__unscoped__'
-                        ) AS scope,
-                        (
-                            CASE
-                                WHEN priority <= 10 THEN 0
-                                WHEN priority <= 50 THEN 50
-                                ELSE 100
-                            END
-                        )::smallint AS priority_bucket,
-                        mod(
-                            (
-                                hashtextextended(request_id, 0)
-                                & 9223372036854775807
-                            ),
-                            16
-                        )::smallint AS shard,
-                        -count(*)::bigint AS delta
-                    FROM removed
-                    WHERE status IN ('PENDING', 'LEASED')
-                    GROUP BY 1, 2, 3
-                ) AS grouped;
-            ELSE
-                SELECT
-                    array_agg(
-                        scope ORDER BY
-                            scope, priority_bucket, shard
-                    ),
-                    array_agg(
-                        priority_bucket ORDER BY
-                            scope, priority_bucket, shard
-                    ),
-                    array_agg(
-                        shard ORDER BY
-                            scope, priority_bucket, shard
-                    ),
-                    array_agg(
-                        delta ORDER BY
-                            scope, priority_bucket, shard
-                    )
-                INTO scopes, priorities, shards, deltas
-                FROM (
-                    SELECT
-                        scope,
-                        priority_bucket,
-                        shard,
-                        sum(delta)::bigint AS delta
-                    FROM (
-                        SELECT
-                            coalesce(
-                                cluster_id, '__unscoped__'
-                            ) AS scope,
-                            (
-                                CASE
-                                    WHEN priority <= 10 THEN 0
-                                    WHEN priority <= 50 THEN 50
-                                    ELSE 100
-                                END
-                            )::smallint AS priority_bucket,
-                            mod(
-                                (
-                                    hashtextextended(request_id, 0)
-                                    & 9223372036854775807
-                                ),
-                                16
-                            )::smallint AS shard,
-                            1 AS delta
-                        FROM added
-                        WHERE status IN ('PENDING', 'LEASED')
-                        UNION ALL
-                        SELECT
-                            coalesce(
-                                cluster_id, '__unscoped__'
-                            ),
-                            (
-                                CASE
-                                    WHEN priority <= 10 THEN 0
-                                    WHEN priority <= 50 THEN 50
-                                    ELSE 100
-                                END
-                            )::smallint,
-                            mod(
-                                (
-                                    hashtextextended(request_id, 0)
-                                    & 9223372036854775807
-                                ),
-                                16
-                            )::smallint,
-                            -1
-                        FROM removed
-                        WHERE status IN ('PENDING', 'LEASED')
-                    ) AS signed
-                    GROUP BY scope, priority_bucket, shard
-                    HAVING sum(delta) <> 0
-                ) AS grouped;
-            END IF;
-            IF scopes IS NOT NULL THEN
-                PERFORM gpu_fault_processor_priority_count_apply(
-                    scopes, priorities, shards, deltas
-                );
-            END IF;
-            RETURN NULL;
-        END
-        $$
-        """
-    )
-
-
-def _create_priority_counter_triggers(cursor) -> None:
-    for name, event, referencing in (
-        (
-            "gpu_fault_processor_priority_count_insert",
-            "INSERT",
-            "NEW TABLE AS added",
-        ),
-        (
-            "gpu_fault_processor_priority_count_update",
-            "UPDATE",
-            "OLD TABLE AS removed NEW TABLE AS added",
-        ),
-        (
-            "gpu_fault_processor_priority_count_delete",
-            "DELETE",
-            "OLD TABLE AS removed",
-        ),
-    ):
-        cursor.execute(
-            f"""
-            DO $$
-            BEGIN
-                IF NOT EXISTS (
-                    SELECT 1 FROM pg_trigger
-                    WHERE tgname='{name}'
-                ) THEN
-                    CREATE TRIGGER {name}
-                    AFTER {event}
-                    ON gpu_fault_processor_queue
-                    REFERENCING {referencing}
-                    FOR EACH STATEMENT
-                    EXECUTE FUNCTION
-                        gpu_fault_processor_priority_count_sync();
-                END IF;
-            END
-            $$
-            """
-        )
-        _enable_trigger_if_disabled(cursor, "gpu_fault_processor_queue", name)
+    create_counter_ledger_tables_stage(cursor)
 
 
 def _seed_processor_counters(cursor) -> None:
@@ -1529,10 +1014,11 @@ def _seed_processor_counters(cursor) -> None:
         cursor.execute(
             """
             INSERT INTO gpu_fault_processor_queue_counts(
-                cluster_id, incomplete_count, updated_at
+                cluster_id, shard_id, incomplete_count, updated_at
             )
             SELECT
                 coalesce(cluster_id, '__unscoped__'),
+                0,
                 count(*),
                 now()
             FROM gpu_fault_processor_queue
@@ -1583,18 +1069,14 @@ def _seed_processor_counters(cursor) -> None:
                         ELSE 100
                     END
                 )::smallint,
-                mod(
-                    (
-                        hashtextextended(request_id, 0)
-                        & 9223372036854775807
-                    ),
-                    16
-                )::smallint,
+                -- A seed is one writer: shard 0 carries it, and every
+                -- later delta lands on the writing backend's own shard.
+                0::smallint,
                 count(*),
                 now()
             FROM gpu_fault_processor_queue
             WHERE status IN ('PENDING', 'LEASED')
-            GROUP BY 1, 2, 3
+            GROUP BY 1, 2
             """
         )
     _declare_index(

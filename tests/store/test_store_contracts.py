@@ -568,7 +568,7 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
     historical = {
         migration.version: migration.checksum
         for migration in POSTGRES_SCHEMA_MIGRATIONS
-        if migration.version <= 18
+        if migration.version <= 19
     }
 
     assert historical == {
@@ -590,13 +590,14 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
         16: "5096a0783d4ee74e31e8173d93d73840b5c245f8d76c81ab7a1f1fba6690cdac",
         17: "1f52a13df018c9e017ffa908dd1fa907e03d62c626c334b6301838a48a06e875",
         18: "16792887b78f6b75ef5f4a4983171167ae1355387944724cd5f38114455d8e8b",
+        19: "8b45571ac9f79d6e0d1b676c3d247b8d6e260514d50d904bdc18ebed1ef5a68b",
     }, (
-        "a frozen migration's checksum changed: do not edit v1-v18 (not even "
+        "a frozen migration's checksum changed: do not edit v1-v19 (not even "
         "a comment inside its apply callback); append a new migration instead"
     )
-    # v18 is frozen before implementing v19. The final unpublished migration
+    # v19 is frozen before implementing v20. The final unpublished migration
     # follows the current DDL until this schema release is finalized.
-    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 19
+    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 20
 
 
 def test_completion_cluster_groups_use_bounded_parallelism() -> None:

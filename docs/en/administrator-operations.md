@@ -753,8 +753,10 @@ STOPs the job must precede the moment the node repair's VERIFY gives up, otherwi
 
 Which counter table the per-cluster depth of processor admission reads is decided by the single row
 `gpu_fault_processor_counter_mode`, with only two values: `dual` (the default during greenfield initialisation and rolling upgrades) and `partitioned`.
-`dual` is not "half open": every enqueue still locks that cluster's row in `gpu_fault_processor_queue_counts` until commit,
-and the 16 priority shards are merely an extra copy, relieving row-lock contention not at all; only `partitioned` makes the shards the source of truth.
+`dual` is not "half open": reads still use `gpu_fault_processor_queue_counts` as the source of truth, and only `partitioned` makes the shards
+the source of truth. Since schema v20 both counter tables hold one row set per writer backend (`shard_id = mod(pg_backend_pid(), 128)`, signed
+partial sums summed on read), so concurrent enqueues and completions no longer queue on a shared counter row; the mode only decides which
+table is read (Detailed Design §3.1.5).
 When the production database was inspected on 2026-09-07 it had stayed at `dual` all along, and no metric had exposed that before.
 
 `/metrics` now exports the two series `gpu_fault_processor_counter_mode{mode="dual"}` and

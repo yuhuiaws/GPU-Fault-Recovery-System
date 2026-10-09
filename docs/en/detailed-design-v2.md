@@ -2140,7 +2140,7 @@ otherwise one would follow the proposal and look for non-existent tables such as
 | `gpu_fault_processor_lanes` | lane key | Lane leases (owner / epoch / token / expiry) |
 | `gpu_fault_processor_queue_counts` | `cluster_id` | Queue counts (maintained by trigger) |
 | `gpu_fault_processor_counter_mode` | `singleton` (BOOLEAN, single-row table with `CHECK (singleton)`) | Counting mode `dual` → `partitioned` |
-| `gpu_fault_processor_priority_count_shards` | `(cluster_id, priority_bucket, shard_id)` | Count shards, `priority_bucket ∈ {0,50,100}`, `shard_id ∈ [0,16)` |
+| `gpu_fault_processor_priority_count_shards` | `(cluster_id, priority_bucket, shard_id)` | Count ledger, `priority_bucket ∈ {0,50,100}`, `shard_id ∈ [0,128)` (writer backend pid mod 128) |
 | `gpu_fault_telemetry_spool` | `spool_key` | Telemetry spool, merged with `INSERT ... ON CONFLICT (spool_key)` |
 | `gpu_fault_schema_version` | `singleton` | Single-row version |
 | `gpu_fault_schema_migrations` | `version` | Migration history; `name` is unique, `checksum` must be 64 characters |

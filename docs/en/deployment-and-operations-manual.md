@@ -2850,9 +2850,9 @@ priority and cannot suppress the current fault. This rule does not preempt alrea
 The processor admission counter uses three independent bucket classes:
 
 ```text
-priority 0   × 16 shards
-priority 50  × 16 shards
-priority 100 × 16 shards
+priority 0   × 128 writer shards (mod(pg_backend_pid(), 128))
+priority 50  × 128 writer shards
+priority 100 × 128 writer shards
 ```
 
 Different priorities no longer update the same counter row, so routine/evidence transactions cannot hold

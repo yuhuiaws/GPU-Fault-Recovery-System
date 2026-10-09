@@ -3204,9 +3204,9 @@ flowchart TB
         T10["processor_lanes §3.1.4<br/>lane ownership + fencing"]
     end
     subgraph G5["Processor counters (3)"]
-        T11["queue_counts<br/>legacy single row"]
+        T11["queue_counts<br/>legacy, per-writer rows"]
         T12["counter_mode<br/>dual / partitioned"]
-        T13["priority_count_shards<br/>3 buckets × 16 shards"]
+        T13["priority_count_shards<br/>3 buckets × 128 writer shards"]
     end
     subgraph G6["telemetry spool (1)"]
         T14["telemetry_spool §3.1.6<br/>coalescing bypass queue"]
@@ -3238,9 +3238,9 @@ Figure 3-1 Seven families, 17 tables, grouped by access pattern
 | hot-state dedicated tables | `gpu_fault_training_progress` | `key PRIMARY KEY`; `cluster_id`, `attempt_id`, `rank`, `observed_at`, `payload` | Per-rank training progress, queried by `cluster_id + attempt_id + rank`. |
 | Processor queue | `gpu_fault_processor_queue` | `PRIMARY KEY(request_id)`; status, cluster, ordering key, correlation key, priority, lease/fencing, response replay columns and the full JSONB payload | The Processor's high-frequency persistent queue. Supports admission, serial-per-lane and parallel-across-lane processing, claim, response replay and completed retention. |
 | Processor queue | `gpu_fault_processor_lanes` | `PRIMARY KEY(ordering_key)`; `owner_id`, `epoch`, `lease_token`, `lease_expires_at` | Distributed ownership and fencing state for each ordering lane, preventing multiple processor processes from handling the same serial domain at once. |
-| Processor counters | `gpu_fault_processor_queue_counts` | `cluster_id PRIMARY KEY`; `incomplete_count CHECK(>=0)` | Legacy per-cluster incomplete count, the old source of truth for the admission quota. |
+| Processor counters | `gpu_fault_processor_queue_counts` | `PRIMARY KEY(cluster_id, shard_id)`; `shard_id CHECK 0..127` (writer backend pid mod 128, signed partial sums) | Legacy incomplete count, one row set per writer backend, summed per cluster on read; the admission quota's source of truth in `dual` mode. |
 | Processor counters | `gpu_fault_processor_counter_mode` | single row; `mode CHECK(mode IN ('dual','partitioned'))` | Switch for the counter source of truth; greenfield initialization seeds `dual`, see §3.1.5. |
-| Processor counters | `gpu_fault_processor_priority_count_shards` | `PRIMARY KEY(cluster_id, priority_bucket, shard_id)`; `priority_bucket CHECK IN (0,50,100)`, `shard_id CHECK 0..15`, `incomplete_count CHECK(>=0)` | Incomplete counts sharded by priority bucket × 16 shards, so that different priorities do not contend for the same counter row. |
+| Processor counters | `gpu_fault_processor_priority_count_shards` | `PRIMARY KEY(cluster_id, priority_bucket, shard_id)`; `priority_bucket CHECK IN (0,50,100)`, `shard_id CHECK 0..127` (writer backend pid mod 128, signed partial sums) | Incomplete-count ledger per priority bucket and writer backend; backends never share a counter row, see §3.1.5. |
 | telemetry spool | `gpu_fault_telemetry_spool` | `spool_key PRIMARY KEY`; `path`, `request_id`, `revision`, `attempts`, `lease_owner`, `available_at`, `payload` | Coalescing bypass queue for routine telemetry, see §3.1.6. |
 | control-state dedicated tables | `gpu_fault_control_state_modes` | `kind PRIMARY KEY`; `mode`, `revision`, backfill checkpoints and `legacy_purged` | Per-kind migration source of truth for the two kinds; defaults to legacy and is not switched via process environment variables. |
 | control-state dedicated tables | `gpu_fault_remote_commands` | `command_id PRIMARY KEY`; identity, status, lease columns and `snapshot` | v15: in dedicated-table mode, lease renewal does not rewrite the workflow/incident snapshot; the lease columns and updated_at are not indexed. |
@@ -3438,30 +3438,54 @@ table's `fillfactor` is 50, so these updates are HOT. Lane rows are deleted by t
 lanes whose lease expired with no PENDING/LEASED request on the same ordering key are removed in LIMIT batches, by
 default one hour after expiry, by a sequential scan of the very table that retention keeps small.
 
-#### 3.1.5 admission Counters: Legacy Row and Priority Shards
+#### 3.1.5 admission Counters: A Per-Writer-Backend Ledger
 
 The admission quota needs the "current number of incomplete requests". Originally there was only
 `gpu_fault_processor_queue_counts` with one row per cluster, so the counter transaction of routine telemetry contended for the same row lock with
-priority=0 fault requests. The current implementation shards by priority bucket instead:
+priority=0 fault requests; the next step sharded by priority bucket and a hash of the request id into 16 shards. Hash shards still put every
+concurrent flush and completion of one cluster on the same set of rows: of five perf r1 rounds on one release and one database, two passed
+(1449/1542 req/s) and two failed (663/490 req/s, reserved 503 share 2.75%/21.6%) with neither node nor Aurora CPU saturated; the RDS
+`log_lock_waits` showed 4665/6984 lock waits of a second or more per 14-minute failing window (603/523 in passing ones), the "while inserting
+index tuple" waits landing on `gpu_fault_processor_priority_count_shards` 6990/8907 times (1080/988) and on `gpu_fault_processor_queue_counts`
+196/551 times (0) -- ShareLock on transaction and AccessExclusiveLock on tuple inside the statement-level counter triggers. Every concurrent
+transaction upserted the same (cluster, bucket, shard) rows and the same per-cluster count row, so they queued behind each other for their whole
+duration; the total lock order added earlier to remove 103 deadlocks had turned them into a convoy, and a commit-latency rise from 0.3 to 1.4 ms
+was enough to make a system already 62% waiting on Lock:transactionid expire its admission batches (the 503s).
+
+Since v20 both counter tables are a ledger with one row set per writer backend (`ddl_counter_ledger.py`):
 
 ```text
 gpu_fault_processor_priority_count_shards
   PRIMARY KEY (cluster_id, priority_bucket, shard_id)
   priority_bucket ∈ {0, 50, 100}
-  shard_id        ∈ [0, 16)
+  shard_id        = mod(pg_backend_pid(), 128) ∈ [0, 128)
+gpu_fault_processor_queue_counts
+  PRIMARY KEY (cluster_id, shard_id)
+  shard_id        = mod(pg_backend_pid(), 128)
 ```
+
+A backend only rewrites its own rows, and the rows hold signed partial sums -- when backend B completes a request backend A admitted, B's row goes
+negative while the aggregate stays exact, which is why the `incomplete_count >= 0` checks and the `greatest(0, ...)` clamps are gone (with
+per-writer rows a clamp would make the aggregate drift upward). Every reader (`_processor_counter_depths`, `processor_queue_stats`,
+`processor_queue_count_status`, the global-boundary read) already sums per cluster or per (cluster, bucket). Two live backends share rows only
+when their pids are equal modulo 128; even then both apply their deltas in the same total (scope, bucket, shard) order, so a collision costs a wait,
+never a deadlock. The statement-level triggers and their transition-table aggregation are unchanged; seeding and the mode switch write shard 0,
+and existing hash-sharded rows remain valid partial sums, so nothing is reseeded. Existing bloat is reclaimed by
+`gpu-fault-admin store-maintenance`.
 
 The single row of `gpu_fault_processor_counter_mode` stores the source-of-truth mode:
 
 | mode | Behavior |
 |---|---|
-| `dual` | Triggers maintain both the legacy row and the three-bucket shards; reads still use the legacy row as the source of truth. Greenfield initialization seeds this value, and it is the only safe mode while old and new code run mixed during a rolling upgrade. |
+| `dual` | Triggers maintain both the legacy table and the three-bucket shards; reads still use the legacy table as the source of truth (summed per cluster). Greenfield initialization seeds this value, and it is the only safe mode while old and new code run mixed during a rolling upgrade. |
 | `partitioned` | The shards become the source of truth. Must be switched by `gpu-fault-store-migrate --finalize-processor-counter-shards` only after all replicas have finished rolling and the module digests agree. |
 
 Counts are maintained by the statement-level triggers (`_create_processor_triggers`) and the three insert/update/delete triggers of the priority sync function
 `gpu_fault_processor_priority_count_sync()`,
 with no separate copy computed on the application side. `--restore-legacy-processor-counters` is the rollback direction, and
 `--processor-counter-shard-status` prints the current mode and the counts on both sides for reconciliation.
+`tests/store/test_postgres_counter_ledger_concurrency.py` proves with 12 concurrent writers that the aggregates stay exact, every row belongs to
+its writer's own shard, and no writer waits on another's Lock:transactionid/tuple.
 
 #### 3.1.6 `gpu_fault_telemetry_spool`
 
@@ -3614,7 +3638,7 @@ The schema has an independent versioned migration registry, `src/gpu_fault/schem
 `POSTGRES_SCHEMA_MIGRATIONS` currently has **18 versions** (v12 `store-review-hot-query-indexes`,
 v13 `control-plane-review-indexes-and-autovacuum`, v14 `objects-wakeup-notify-trigger`,
 v15 `remote-command-state-table-and-cutover-fences`, v16 `workflow-state-table-and-independent-cutover`,
-v17 `control-state-dual-projection-conditional-delete`, v18 `control-state-legacy-copy-reset-without-truncate`, v19 `hot-table-storage-parameters-and-hot-update-indexes`), and `LATEST_POSTGRES_SCHEMA_VERSION`
+v17 `control-state-dual-projection-conditional-delete`, v18 `control-state-legacy-copy-reset-without-truncate`, v19 `hot-table-storage-parameters-and-hot-update-indexes`, v20 `processor-counters-per-writer-backend-rows`), and `LATEST_POSTGRES_SCHEMA_VERSION`
 takes the last version number. Three guards are executed by `validate_migration_registry()` **at module import time**,
 not as an optional runtime check:
 

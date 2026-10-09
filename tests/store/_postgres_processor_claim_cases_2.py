@@ -174,11 +174,11 @@ def test_multi_cluster_batches_do_not_deadlock_on_the_counters(store) -> None:
             cursor.execute(
                 """
                 INSERT INTO gpu_fault_processor_queue_counts(
-                    cluster_id, incomplete_count, updated_at
+                    cluster_id, shard_id, incomplete_count, updated_at
                 )
-                SELECT 'filler-' || generated, 0, now()
+                SELECT 'filler-' || generated, 0, 0, now()
                 FROM generate_series(1, 20000) AS generated
-                ON CONFLICT (cluster_id) DO NOTHING
+                ON CONFLICT (cluster_id, shard_id) DO NOTHING
                 """
             )
             cursor.execute("ANALYZE gpu_fault_processor_queue_counts")

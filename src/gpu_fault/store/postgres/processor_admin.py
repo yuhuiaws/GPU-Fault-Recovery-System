@@ -321,10 +321,10 @@ class PostgresProcessorAdminMixin:
     def processor_counter_mode(self) -> str:
         """Which table admission reads the per-cluster depth from.
 
-        ``dual`` (the shipped default) keeps the single-row
-        ``gpu_fault_processor_queue_counts`` authoritative and writes the 16
-        priority shards alongside, so every enqueue still locks one row per
-        cluster and the shards buy no contention relief. Only
+        ``dual`` (the shipped default) keeps ``gpu_fault_processor_queue_counts``
+        authoritative and writes the priority shards alongside; both tables
+        hold per-writer-backend rows (``ddl_counter_ledger``), so neither mode
+        serializes writers on a shared counter row any more. Only
         ``partitioned`` reads the shards. The mode is invisible from
         outside otherwise -- production sat in ``dual`` unnoticed (store
         review 2026-09-07, item I) -- so /metrics exports this. Served from
@@ -449,10 +449,11 @@ class PostgresProcessorAdminMixin:
                 cursor.execute(
                     """
                     INSERT INTO gpu_fault_processor_queue_counts(
-                        cluster_id, incomplete_count, updated_at
+                        cluster_id, shard_id, incomplete_count, updated_at
                     )
                     SELECT
                         coalesce(cluster_id, '__unscoped__'),
+                        0,
                         count(*),
                         now()
                     FROM gpu_fault_processor_queue
@@ -482,18 +483,12 @@ class PostgresProcessorAdminMixin:
                                 ELSE 100
                             END
                         )::smallint,
-                        mod(
-                            (
-                                hashtextextended(request_id, 0)
-                                & 9223372036854775807
-                            ),
-                            16
-                        )::smallint,
+                        0::smallint,
                         count(*),
                         now()
                     FROM gpu_fault_processor_queue
                     WHERE status IN ('PENDING', 'LEASED')
-                    GROUP BY 1, 2, 3
+                    GROUP BY 1, 2
                     """
                 )
         self._processor_counter_mode_cache = mode

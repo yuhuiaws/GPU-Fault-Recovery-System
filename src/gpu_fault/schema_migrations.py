@@ -179,6 +179,16 @@ def _apply_hot_table_storage_parameters_v19(cursor: MigrationCursor) -> None:
     cursor.execute("DROP INDEX IF EXISTS gpu_fault_processor_lanes_expiry")
 
 
+def _apply_processor_counter_ledger_v20(cursor: MigrationCursor) -> None:
+    # Per-writer-backend counter rows (ddl_counter_ledger.py): the shard
+    # CHECK widens to 128 writer shards, gpu_fault_processor_queue_counts
+    # gains shard_id and the key (cluster_id, shard_id), the >= 0 checks go
+    # because rows are signed partial sums, and the trigger functions write
+    # the backend's own rows. All of it is catalog-checked idempotent DDL;
+    # existing hash-sharded rows stay valid partial sums, nothing is reseeded.
+    cursor.execute("SELECT 1")
+
+
 @dataclass(frozen=True)
 class SchemaMigration:
     version: int
@@ -330,6 +340,12 @@ POSTGRES_SCHEMA_MIGRATIONS = (
         name="hot-table-storage-parameters-and-hot-update-indexes",
         ddl_checksum="6e9cac646302c295419a4a64af4f0ad44f8b2b96e506a07056e542101141d17f",
         apply=_apply_hot_table_storage_parameters_v19,
+    ),
+    SchemaMigration(
+        version=20,
+        name="processor-counters-per-writer-backend-rows",
+        ddl_checksum="63e14b75d505f6185d43e5c7754ebb35f8e18bfbf6feeeb4a7b91271ac99685e",
+        apply=_apply_processor_counter_ledger_v20,
     ),
 )
 

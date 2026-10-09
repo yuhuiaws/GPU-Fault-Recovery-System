@@ -568,7 +568,7 @@ Reinstallation after a managed `uninstall --cpu-cluster keep` completes takes a 
 `regional_release_retained_database`: the completed uninstall record, the original Aurora incarnation, the site identity
 and the new installation ID form an independent handoff, and the first use also pins a new namespace UID.
 This path stores `retained_database_origin`; it cannot copy the old namespace's empty-database origin, nor does it claim the retained database
-is empty. Every continuation re-reads the current safety state. Only a reviewed retained-schema pair (`compatible_retained_schema`, today v17-to-v18 and v18-to-v19) lets the precheck validate the full
+is empty. Every continuation re-reads the current safety state. Only a reviewed retained-schema pair (`compatible_retained_schema`, today v17-to-v18, v18-to-v19 and v19-to-v20) lets the precheck validate the full
 historical prefix and the physical heap/columns without executing old stored functions, after which the normal schema Job ensures up to the candidate version,
 and only then are business Pods allowed; older, future, missing or drifted schemas get no generic compatibility.
 
@@ -2090,7 +2090,7 @@ During a release there must be no further build, and no manual editing of Deploy
 4. Fill in resources, probes, termination grace, security context and negative tests.
 5. Run the required generators and review the generated Manifests, cleanup inventory and environment variable reference.
    A PostgreSQL DDL change also appends a consecutive schema migration; the current baseline is
-   `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION` (currently v19), the new migration version number
+   `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION` (currently v20), the new migration version number
    must be consecutive +1 (the next version is v19), and it must pass `make test-postgres-stress` or the CAP-005 runner.
 6. Run the first-step build and sign:
 

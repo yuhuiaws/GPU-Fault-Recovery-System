@@ -104,7 +104,12 @@ Formal rounds assume a maintained store: one campaign day of writes leaves the h
 counts/priority shards/queue, `gpu_fault_gpu_metric_latest`) with heap and index pages a hundred times their live
 rows, halving ingress throughput, raising `gpu_fault_processor_admission_batch_expired_total` and failing the reserved
 503 share verdict; schema v19's storage parameters stop the growth, and existing bloat is reclaimed before a formal
-round with `gpu-fault-admin store-maintenance --confirm STORE_MAINTENANCE` (Administrator Operations §10.3).
+round with `gpu-fault-admin store-maintenance --confirm STORE_MAINTENANCE` (Administrator Operations §10.3). The r1
+collapses were not bloat alone: across five rounds on one release and one database, the failing rounds' RDS
+`log_lock_waits` showed thousands of lock waits of a second or more per window concentrated in the statement-level
+counter triggers of the processor queue -- hash sharding put every concurrent flush and completion of a cluster on the
+same rows and formed a convoy; schema v20 rekeys both counter tables per writer backend (Detailed Design §3.1.5), and
+formal rounds should run on v20 or later.
 
 The GPU perf namespace deploys only the connection Secret, the load-test ServiceAccount/RBAC
 and the simulated Jobs; it does not deploy a real Cluster Executor, Watcher, Collector or Node

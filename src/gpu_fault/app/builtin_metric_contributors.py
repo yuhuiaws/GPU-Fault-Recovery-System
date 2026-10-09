@@ -774,17 +774,17 @@ PROCESSOR_COUNTER_MODES = ("dual", "partitioned")
 
 def _processor_counter_mode_lines(store: object) -> list[str]:
     """Which processor counter table admission reads (store review 2026-09-07,
-    item I). ``dual`` still locks the single per-cluster counter row on every
-    enqueue, so the shards relieve nothing until ``partitioned``; production
-    sat in ``dual`` with nothing exporting it. Only the Postgres store has the
-    accessor; SQLite and memory stores emit no series."""
+    item I). Production sat in ``dual`` with nothing exporting it. Both tables
+    now hold per-writer-backend rows, so the mode no longer decides whether
+    writers convoy on a shared row, only which table is read. Only the
+    Postgres store has the accessor; SQLite and memory stores emit no series."""
 
     read = getattr(store, "processor_counter_mode", None)
     if read is None:
         return []
     active = str(read())
     lines = [
-        "# HELP gpu_fault_processor_counter_mode Processor admission counter mode; the 16 priority shards relieve counter-row contention only in partitioned mode; finalize requires an empty queue (gpu-fault-store-migrate --finalize-processor-counter-shards)",
+        "# HELP gpu_fault_processor_counter_mode Processor admission counter mode; both counter tables hold per-writer-backend rows (shard = backend pid mod 128), partitioned reads the priority shards; finalize requires an empty queue (gpu-fault-store-migrate --finalize-processor-counter-shards)",
         "# TYPE gpu_fault_processor_counter_mode gauge",
     ]
     modes = list(PROCESSOR_COUNTER_MODES)

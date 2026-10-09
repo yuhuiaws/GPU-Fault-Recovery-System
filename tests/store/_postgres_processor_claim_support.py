@@ -181,7 +181,7 @@ def _counter_depth(cluster_id: str) -> int:
         with conn.cursor() as cursor:
             cursor.execute(
                 """
-                SELECT coalesce(incomplete_count, 0)
+                SELECT coalesce(sum(incomplete_count), 0)
                 FROM gpu_fault_processor_queue_counts
                 WHERE cluster_id=%s
                 """,

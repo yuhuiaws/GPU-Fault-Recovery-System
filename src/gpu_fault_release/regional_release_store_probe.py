@@ -53,8 +53,11 @@ def compatible_retained_schema(observed: int, target: int) -> bool:
     # pre-ensure read may accept it. (17, 18): v18 adds a write fence and v17
     # has the same physical record layout. (18, 19): v19 sets the hot tables'
     # storage parameters and drops two single-column timestamp indexes; the
-    # record layout and the statuses this read counts are v18's.
-    return (observed, target) in {(17, 18), (18, 19)}
+    # record layout and the statuses this read counts are v18's. (19, 20):
+    # v20 rekeys the processor counter tables per writer backend and
+    # rewrites their trigger functions; the workflow and remote-command
+    # records this read counts are untouched.
+    return (observed, target) in {(17, 18), (18, 19), (19, 20)}
 
 
 def declared_table_names() -> set[str]:
