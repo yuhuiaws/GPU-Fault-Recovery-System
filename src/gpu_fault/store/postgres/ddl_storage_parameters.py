@@ -113,8 +113,11 @@ def set_storage_parameters_if_different(
     row = cursor.fetchone()
     if row is None:
         return
-    current = _stored_options(row[0])
-    toast_current = _stored_options(row[1])
+    # A DDL test double may answer every catalog read with a one-column row;
+    # a missing TOAST column means "no TOAST options", never an error.
+    values = tuple(row) if isinstance(row, (list, tuple)) else (row,)
+    current = _stored_options(values[0] if values else None)
+    toast_current = _stored_options(values[1] if len(values) > 1 else None)
     pending: dict[str, str] = {}
     for name, value in options.items():
         stored = (

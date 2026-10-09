@@ -328,7 +328,7 @@ POSTGRES_SCHEMA_MIGRATIONS = (
     SchemaMigration(
         version=19,
         name="hot-table-storage-parameters-and-hot-update-indexes",
-        ddl_checksum="e2a44da879b4b6ec0bcb8faa84a4c275eeedc215225c6c966e2550a524a92ad5",
+        ddl_checksum="6e9cac646302c295419a4a64af4f0ad44f8b2b96e506a07056e542101141d17f",
         apply=_apply_hot_table_storage_parameters_v19,
     ),
 )

@@ -108,7 +108,11 @@ The latest version in the current registry is v19
 `hot-table-storage-parameters-and-hot-update-indexes`. The next migration must append v20:
 
 1. Modify the latest idempotent schema in the corresponding `store/postgres/ddl*.py`; the checksum covers all
-   `ddl*.py`, not just `ddl.py`.
+   `ddl*.py`, not just `ddl.py`. Catalog reads inside a stage (`pg_class`/`pg_index`, ...) must tolerate cursor
+   doubles: the release gate replays the whole DDL with a `RecordingCursor` that answers every read with the
+   one-column row `(True,)`, and the migration tests' `MigrationRecorder` answers `(None,)` or `None` -- a
+   multi-column query must not index its second column by position (v19's storage-parameter stage treats a missing
+   TOAST column as "no options", `tests/store/test_ddl_storage_parameters.py`).
 2. Compute the new DDL source SHA-256.
 3. Append a consecutive version to
    `POSTGRES_SCHEMA_MIGRATIONS` in `src/gpu_fault/schema_migrations.py`; historical rows must not be modified.
