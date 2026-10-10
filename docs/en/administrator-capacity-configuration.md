@@ -126,7 +126,13 @@ and, in order:
    to return to `available` on the new window (three consecutive observations); when it did not change, checks
    read-only that the live window equals the pre-change value (`verify_aurora_capacity`), so an apply is never
    recorded `APPLIED` over a window somebody else moved.
-5. Rolls only the affected CPU roles and completes verify/stability/commit.
+5. Rolls only the affected CPU roles and completes verify/stability/commit. A schedulability preflight runs first:
+   per live node, allocatable CPU/memory minus the requests of every scheduled Pod, modelling the roll one role at a
+   time (ingress's surge Pod needs one free 4-core/4Gi slot, the consumer tier's added replicas take headroom for
+   good); a step that cannot fit fails closed before anything in the cluster changes, naming the missing cores and
+   every node's headroom, with the evidence written to `<state-dir>/control-plane-apply/` (Deployment and Operations
+   Manual §2.1). The roles roll one at a time, each waiting for its own rollout: ingress -> control-worker ->
+   spool-worker.
 6. When raising Min ACU, only now waits for the `ServerlessDatabaseCapacity` of both writer and reader to reach the new
    Min. This step and the role rollout are independent; it is placed after the rollout so that the scale-up ramp time does not serially occupy the whole
    command.
@@ -183,7 +189,9 @@ is also refused, naming the file to check.
                                     affected roles, executor, reference, error and Aurora details
 ```
 
-Both `desired.json` and `pending.json` carry digest self-checks; changed content fails closed.
+Both `desired.json` and `pending.json` carry digest self-checks; changed content fails closed. The schedulability
+preflight's evidence (headroom per node, each role's surge/added Pods, the order actually rolled) is
+`<state-dir>/control-plane-apply/schedulability-<release>-<time>.json`, one per CPU role apply.
 
 ### 4.5 Upgrading Legacy Records
 
@@ -227,6 +235,13 @@ Supported presets (multi-cluster topologies count 256 nodes per cluster, see Per
 | `32-enabled` | 5 | 128 | 4 | 4 | enabled, 3 replicas | 256 / 8192 | 82/128 |
 | `50-disabled` | 6 | 200 | 4 | 4 | disabled, 0 replicas | 256 / 12800 | 128/128 |
 | `50-enabled` | 5 | 200 | 4 | 4 | enabled, 3 replicas | 256 / 12800 | 128/128 |
+
+Node sizing: `32-enabled`/`50-enabled` settle at 3 api-ha x 4 cores + 5 control-worker x 3 cores + 3 spool-worker x
+1 core = 30 cores (plus about 3 cores of system Pods, the HyperPod operator and kueue), which 3 x `ml.c5.4xlarge`
+(about 15.9 allocatable cores per node) carry; the tightest step of the roll is ingress's surge Pod, which needs some
+node with `free >= 4 cores and >= 4Gi` (free = allocatable - the requests of every Pod on that node). `config` runs
+the schedulability preflight by the same formula before the apply (§4.2 step 5); when it does not fit, add CPU nodes
+first, then apply.
 
 ### 4.7 PostgreSQL Connection Budget
 
@@ -341,7 +356,13 @@ The configuration digest is independent of the code release ID, image digest and
 - Publishes no cluster registry revision;
 - A remediation budget or worker replica change rolls only the control-worker; a node count change changes the fault reserved depth shared by the three roles,
   and therefore rolls all three CPU roles;
-- Enabling spool rolls the spool-worker first, then ingress;
+- The roles roll one at a time, each waiting for its own rollout, in the order ingress -> control-worker ->
+  spool-worker (ingress's surge Pod needs a free slot on some node, which the consumer tier's added replicas would
+  take); enabling spool follows the same order: the spool is a durable table, requests ingress spools before the
+  spool-worker is ready wait there, and requests beyond the depth cap are returned with 503 Retry-After for the Agent
+  to retry; only when that order cannot fit and a role's replica reduction would free the room does the preflight
+  move the shrinking role to the front, recording the order actually rolled in the evidence; on a rerun (§4.3) a role
+  whose render equals the live template rolls no more, and the preflight asks no slot for it;
 - Disabling spool first turns off ingress admission, waits for spool depth and leased to both be 0, then scales down
   the spool-worker;
 - The release state and Deployment metadata record the global configuration digest, and the Pod template records the role digest, so a

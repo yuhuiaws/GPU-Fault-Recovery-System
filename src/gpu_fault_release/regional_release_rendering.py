@@ -4,6 +4,7 @@ import hashlib
 import json
 import os
 import re
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
@@ -743,6 +744,30 @@ def build_cpu_apply_environment(
         "GPU_FAULT_LEGACY_COMPONENT_PINS": "false",
         "GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS": "false",
         "GPU_FAULT_FORCE_ROLE_RESTART": "false",
+        # A forward roll the nodes cannot fit is refused before anything
+        # changes; the evidence lands under the managed state directory.
+        "GPU_FAULT_CONTROL_PLANE_SCHEDULABILITY": "refuse",
+        **control_plane_apply_evidence_environment(config),
+    }
+
+
+#: Under the managed state directory: one JSON per CPU apply with the live
+#: per-node headroom, each role's surge/added Pods and the order rolled.
+CONTROL_PLANE_APPLY_EVIDENCE_DIR = "control-plane-apply"
+
+
+def control_plane_apply_evidence_environment(config: object) -> dict[str, str]:
+    """Where the apply script keeps its schedulability evidence: under the
+    managed state directory when the administrator CLI materialized the
+    config, nowhere for a hand-written config (the log line remains)."""
+
+    state_dir = getattr(config, "admin_state_dir", None)
+    if state_dir is None:
+        return {}
+    return {
+        "GPU_FAULT_CONTROL_PLANE_EVIDENCE_DIR": str(
+            Path(state_dir) / CONTROL_PLANE_APPLY_EVIDENCE_DIR
+        )
     }
 
 

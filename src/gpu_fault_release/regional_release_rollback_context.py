@@ -20,6 +20,7 @@ from gpu_fault_release.regional_release_profile_model import cluster_runtime_pro
 from gpu_fault_release.regional_release_progress import RollbackCompensationPlan
 from gpu_fault_release.regional_release_rendering import (
     admin_config_renderer_environment,
+    control_plane_apply_evidence_environment,
 )
 from gpu_fault_release.regional_release_state import (
     SENSITIVE_CONFIG_KEY,
@@ -409,6 +410,10 @@ def build_rollback_environment(
         "GPU_FAULT_FORCE_ROLE_RESTART": "true",
         "GPU_FAULT_FINALIZE_AGENT_PIN": "true",
         "GPU_FAULT_FINALIZE_DATA_PLANE_PIN": "true",
+        # A rollback is never refused by the schedulability model: it logs
+        # the shortfall and proceeds to the rollout waits.
+        "GPU_FAULT_CONTROL_PLANE_SCHEDULABILITY": "warn",
+        **control_plane_apply_evidence_environment(rollback_config),
     }
     # Set only from the validated snapshot; never inherited from the caller's
     # shell, so a stray variable cannot turn a forward render into a rollback.

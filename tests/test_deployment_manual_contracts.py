@@ -160,6 +160,7 @@ def test_manual_support_files_exist() -> None:
         "deploy/control-plane/tools/cleanup_state.py",
         "deploy/control-plane/tools/restart-regional-control-plane.sh",
         "deploy/control-plane/tools/apply-control-plane-role-split.sh",
+        "deploy/control-plane/tools/control_plane_schedulability.py",
         "deploy/control-plane/tools/verify_control_plane_role_split.py",
         "deploy/README.md",
         "scripts/verify-regional-alerting.py",

@@ -853,6 +853,24 @@ If any of the following items fails, the rolling upgrade must not start:
   enforced by tests), so which process a scrape lands on no longer affects the reading; the deploy preflight's `cpu_capacity` checks that on each CPU node
   `allocatable.pods` minus non-control-plane Pods leaves free slots >= the number of control-plane Pods + 1 rolling surge per role (HyperPod
   `ml.c5.4xlarge` has 29 slots per node).
+- The control-plane nodes' CPU/memory headroom is checked in the order the roll happens, one Deployment at a time:
+  before anything in the cluster changes, `apply-control-plane-role-split.sh` runs `control_plane_schedulability.py`
+  (reads `kubectl get nodes -o json` and `kubectl get pods -A -o json`; per node, allocatable minus the requests of
+  every scheduled Pod) and models api-ha -> control-worker -> spool-worker step by step: api-ha rolls surge-first
+  (`maxUnavailable: 0`/`maxSurge: 1`), so some node must hold **one free slot of api-ha's size** (4 cores / 4Gi); the
+  consumer tier's added replicas (spool enable: +3 x 1 core / 2Gi) take headroom for good, while a `maxUnavailable: 1`
+  roll needs no extra slot. A step that cannot fit fails closed (`control-plane schedulability: step N (<deployment>
+  roll) cannot schedule ...`, naming the missing cores and every node's headroom) with the cluster untouched; the
+  evidence (headroom per node, each role's surge/added Pods, the order actually rolled) is written to
+  `<state-dir>/control-plane-apply/schedulability-<release>-<time>.json` and kept with the `logs/mutating/` log.
+  Node sizing formula: `32-enabled`/`50-enabled` settle at 3 api-ha x 4 cores + 5 control-worker x 3 cores + 3
+  spool-worker x 1 core = 30 cores (plus about 3 cores of system Pods, the HyperPod operator and kueue), which 3 x
+  `ml.c5.4xlarge` (about 15.9 allocatable cores per node) carry; the tightest step of the roll is api-ha's surge, which
+  needs some node with `free >= 4 cores and >= 4Gi` (free = allocatable - the requests of every Pod on that node). A
+  larger preset or more consumer replicas means adding CPU nodes by the same formula before the apply. Only when that
+  order cannot fit and a role's replica reduction would free the room does the preflight move the shrinking role to
+  the front, recording it in the evidence; a rollback (the engine's automatic rollback and `deploy --rollback`) runs
+  the same preflight in warn mode -- it logs the shortfall and never refuses.
 - Control record retention is enabled by default (30 days; the bucket is created and hardened automatically by the deploy bootstrap task, see Administrator Capacity Configuration §10;
   it is only disabled when site.yaml explicitly sets `spec.retention.controlRecordRetentionDays: 0`), and the deploy preflight's
   `control_record_archive_bucket` checks it; a release with a schema change (such as v13) carries
@@ -2615,8 +2633,12 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" logs job/gpu-fault-po
 ```
 ##### CPU-4c. Deploy and Verify the Three-Tier Role Split
 
-The deployment order cannot be swapped: first let the spool-worker object (0 replicas by default) and the control-worker become ready, and roll
-ingress last. Otherwise ingress can return `202` while the queue has no running consumer.
+The script decides the roll order, one Deployment at a time, each waiting for its own rollout: ingress first (its
+`maxSurge: 1`/`maxUnavailable: 0` surge Pod needs a free slot of api-ha's size on some node, which the consumer tier's
+added replicas would take), then the control-worker, then the spool-worker; the schedulability preflight ahead of the
+roll (`control_plane_schedulability.py`) fails closed when a step cannot fit, see §2.1. The queue and the spool are
+durable tables: what ingress admits with `202` during a consumer roll waits there and is not lost, and a consumer roll
+that fails fails the release and rolls ingress back with it.
 
 ```bash
 KUBECONFIG="${CPU_KUBECONFIG}" \

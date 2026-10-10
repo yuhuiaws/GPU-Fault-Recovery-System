@@ -401,18 +401,19 @@ def test_processor_counter_shard_jobs_are_bounded_and_explicit() -> None:
         )
 
 
-def test_role_split_deploy_waits_for_spool_before_ingress() -> None:
+def test_role_split_deploy_rolls_one_role_at_a_time_behind_the_preflight() -> None:
+    """Nothing rolls in the background any more: the schedulability preflight
+    settles the order, then the roles roll one Deployment at a time (the
+    sequence itself is pinned in tests/deploy/test_role_split_apply_order.py)."""
+
     standalone = (
         ROOT / "deploy/control-plane/tools/apply-control-plane-role-split.sh"
     ).read_text(encoding="utf-8")
-    spool_apply = standalone.index("apply_manifest gpu-fault-telemetry-spool-worker\n")
-    spool_ready = standalone.index("wait_for_rollout gpu-fault-telemetry-spool-worker")
-    ingress_apply = standalone.index("apply_manifest gpu-fault-api-ha-ingress")
-    assert spool_apply < spool_ready < ingress_apply
-    parallel = standalone.index("apply_consumer_roles")
-    ingress_call = standalone.index("apply_ingress_role", parallel)
-    assert "apply_spool_role &" in standalone[parallel:ingress_call]
-    assert "apply_worker_role &" in standalone[parallel:ingress_call]
+    preflight = standalone.index('\n    schedulability_preflight ""\n')
+    ordered = standalone.index('\n    apply_roles_in_order "${SCHEDULABILITY_ORDER}"\n')
+    assert preflight < ordered
+    assert "apply_consumer_roles" not in standalone
+    assert " &\n" not in standalone[standalone.index("apply_spool_role() {") :]
 
     deploy = (ROOT / "deploy/hyperpod/deploy.sh").read_text(encoding="utf-8")
     spool_ready = deploy.index(
@@ -575,7 +576,7 @@ def test_role_split_apply_supports_greenfield_namespace() -> None:
     assert 'python3 "${SCRIPT_DIR}/wait_control_plane_pins.py"' in script
     assert '--expected-sha256 "${PIN_METADATA_SHA256}"' in script
     assert "GPU_FAULT_FLEET_PIN_CONVERGENCE_TIMEOUT_SECONDS" in script
-    applies = script.index("    apply_consumer_roles\n    apply_ingress_role\nfi\n")
+    applies = script.index('    apply_roles_in_order "${SCHEDULABILITY_ORDER}"\nfi\n')
     verify = script.index('python3 "${SCRIPT_DIR}/verify_control_plane_role_split.py"')
     assert applies < script.index("\nwait_for_pin_convergence\n", applies) < verify
     assert "kubectl.kubernetes.io/restartedAt" in script

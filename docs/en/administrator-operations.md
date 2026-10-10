@@ -116,8 +116,13 @@ gpu-fault-admin config --state-dir /secure/gpu-fault --reference CHG-12345
 The command automatically records the executor identity (STS caller ARN), the configuration before and after and the result in
 `<state-dir>/admin-config/history/<start time>-<configuration digest>/`. This path reuses the current signed image and
 wheel, first issues the Aurora capacity change, then rolls only the affected ingress, control-worker or spool-worker,
-and finally waits for the Aurora scaling to land. After an interruption, rerunning the same command resumes. Complete fields, templates, first deployment and rollback
-semantics are in [Administrator Capacity Configuration](administrator-capacity-configuration.md).
+and finally waits for the Aurora scaling to land. The roles roll one at a time (ingress -> control-worker ->
+spool-worker); the schedulability preflight ahead of the roll fails closed when a step cannot fit, leaving the cluster
+untouched (the error names the missing cores and every node's headroom; the evidence is under
+`<state-dir>/control-plane-apply/`; the node sizing formula is in the Deployment and Operations Manual §2.1). After an
+interruption, rerunning the same command resumes, and roles already matching the target roll no more. Complete fields,
+templates, first deployment and rollback semantics are in
+[Administrator Capacity Configuration](administrator-capacity-configuration.md).
 
 ### 2.2 Same-Site Concurrency and Recovery
 

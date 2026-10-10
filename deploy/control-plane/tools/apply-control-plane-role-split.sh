@@ -46,6 +46,14 @@ NOTIFICATION_CONFIG_SHA256="$(
 LEGACY_COMPONENT_PINS="${GPU_FAULT_LEGACY_COMPONENT_PINS:-false}"
 PRESERVE_ROLE_CONFIG_MAPS="${GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS:-false}"
 FORCE_ROLE_RESTART="${GPU_FAULT_FORCE_ROLE_RESTART:-false}"
+# How the schedulability preflight treats a roll the nodes cannot fit:
+# `refuse` (the default) fails closed before anything in the cluster changes;
+# `warn` -- the rollback context -- logs the shortfall and proceeds to the
+# rollout waits, because a rollback is never refused by a model. The evidence
+# (free CPU/memory per node, each role's surge and added Pods, the order
+# chosen) goes to stderr and, when the engine names a directory, is kept there.
+SCHEDULABILITY_MODE="${GPU_FAULT_CONTROL_PLANE_SCHEDULABILITY:-refuse}"
+SCHEDULABILITY_EVIDENCE_DIR="${GPU_FAULT_CONTROL_PLANE_EVIDENCE_DIR:-}"
 # Content digest of the failure-domain ConfigMap the release engine applied
 # just before this script; stamped on the control-worker pod template so the
 # worker rolls exactly when the map it mounts changed. Empty means "not
@@ -120,6 +128,11 @@ trap 'rm -rf "${CONTRACT_DIR}"' EXIT
 [[ "${FORCE_ROLE_RESTART}" == "true" ||
     "${FORCE_ROLE_RESTART}" == "false" ]] || {
     echo "GPU_FAULT_FORCE_ROLE_RESTART must be true or false" >&2
+    exit 2
+}
+[[ "${SCHEDULABILITY_MODE}" == "refuse" ||
+    "${SCHEDULABILITY_MODE}" == "warn" ]] || {
+    echo "GPU_FAULT_CONTROL_PLANE_SCHEDULABILITY must be refuse or warn" >&2
     exit 2
 }
 [[ "${ROLE_TARGETS}" =~ ^(ingress|worker|spool)(,(ingress|worker|spool))*$ ]] || {
@@ -619,54 +632,67 @@ render_manifest_for_apply() {
 # fails its own control_api verification.
 apply_manifest() {
     local manifest="$1"
-    local role_sha=""
-    case "${manifest}" in
-        gpu-fault-api-ha-ingress) role_sha="${ADMIN_CONFIG_INGRESS_SHA256}" ;;
-        gpu-fault-control-worker) role_sha="${ADMIN_CONFIG_WORKER_SHA256}" ;;
-        gpu-fault-telemetry-spool-worker) role_sha="${ADMIN_CONFIG_SPOOL_SHA256}" ;;
-    esac
+    local role_sha
+    role_sha="$(role_deployment_sha "${manifest}")"
     if [[ -z "${role_sha}" ]]; then
-        render_manifest_for_apply "${manifest}"
-    else
         render_manifest_for_apply "${manifest}" |
-            python3 -c 'import json, sys, yaml; json.dump(yaml.safe_load(sys.stdin), sys.stdout)' |
-            jq --arg sha "${WHEEL_SHA256}" --arg release "${RELEASE_ID}" \
-                --arg image "${RUNTIME_IMAGE}" --arg notification "${NOTIFICATION_CONFIG_SHA256}" \
-                --arg role_config "${role_sha}" --arg admin_config "${ADMIN_CONFIG_SHA256}" \
-                --arg pin "${PIN_METADATA_SHA256}" --arg domain "${FAILURE_DOMAIN_MAP_SHA256}" \
-                --arg profile "${RUNTIME_PROFILE_VERSION}" \
-                --arg restart "${ROLE_RESTART_TOKEN}" --slurpfile live "${LIVE_DEPLOYMENTS}" '
-                .metadata.name as $name |
-                .metadata.annotations["gpu-fault.io/admin-config-sha256"] = $admin_config |
-                .metadata.annotations["gpu-fault.io/pin-config-sha256"] = $pin |
-                .spec.template.metadata.annotations += {
-                    "gpu-fault.io/artifact-sha256": $sha,
-                    "gpu-fault.io/control-plane-wheel-sha256": $sha,
-                    "gpu-fault.io/release-wheel-sha256": $sha,
-                    "gpu-fault.io/release-rollout": $release,
-                    "gpu-fault.io/runtime-image": $image,
-                    "gpu-fault.io/notification-config-sha256": $notification,
-                    "gpu-fault.io/role-config-sha256": $role_config,
-                    "gpu-fault.io/runtime-profile-version": $profile
-                } |
-                if $name == "gpu-fault-control-worker" and $domain != "" then
-                    .spec.template.metadata.annotations["gpu-fault.io/failure-domain-map-sha256"] = $domain
-                else . end |
-                (if $restart != "" then $restart else
-                    ([$live[0].items[]? | select(.metadata.name == $name) |
-                      .spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"]][0] // "")
-                 end) as $restart_at |
-                if $restart_at != "" then
-                    .spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"] = $restart_at
-                else . end
-            '
-    fi |
-        if [[ -n "${role_sha}" ]]; then
+            kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" apply -f -
+    else
+        final_deployment_document "${manifest}" "${role_sha}" |
             python3 "${SCRIPT_DIR}/apply_control_plane_deployment.py" \
                 --live "${LIVE_DEPLOYMENTS}" -- kubectl "${kubectl_args[@]}" -n "${NAMESPACE}"
-        else
-            kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" apply -f -
-        fi
+    fi
+}
+
+role_deployment_sha() {
+    case "$1" in
+        gpu-fault-api-ha-ingress) printf '%s' "${ADMIN_CONFIG_INGRESS_SHA256}" ;;
+        gpu-fault-control-worker) printf '%s' "${ADMIN_CONFIG_WORKER_SHA256}" ;;
+        gpu-fault-telemetry-spool-worker) printf '%s' "${ADMIN_CONFIG_SPOOL_SHA256}" ;;
+        *) printf '' ;;
+    esac
+}
+
+# The exact JSON document a role Deployment is applied as: the rendered
+# manifest plus the digests stamped here. The schedulability preflight models
+# this document, so what it measures is what the apply sends; a resume whose
+# document equals the live template (the restart token is inherited, never
+# minted, unless GPU_FAULT_FORCE_ROLE_RESTART asks) rolls nothing.
+final_deployment_document() {
+    local manifest="$1"
+    local role_sha="$2"
+    render_manifest_for_apply "${manifest}" |
+        python3 -c 'import json, sys, yaml; json.dump(yaml.safe_load(sys.stdin), sys.stdout)' |
+        jq --arg sha "${WHEEL_SHA256}" --arg release "${RELEASE_ID}" \
+            --arg image "${RUNTIME_IMAGE}" --arg notification "${NOTIFICATION_CONFIG_SHA256}" \
+            --arg role_config "${role_sha}" --arg admin_config "${ADMIN_CONFIG_SHA256}" \
+            --arg pin "${PIN_METADATA_SHA256}" --arg domain "${FAILURE_DOMAIN_MAP_SHA256}" \
+            --arg profile "${RUNTIME_PROFILE_VERSION}" \
+            --arg restart "${ROLE_RESTART_TOKEN}" --slurpfile live "${LIVE_DEPLOYMENTS}" '
+            .metadata.name as $name |
+            .metadata.annotations["gpu-fault.io/admin-config-sha256"] = $admin_config |
+            .metadata.annotations["gpu-fault.io/pin-config-sha256"] = $pin |
+            .spec.template.metadata.annotations += {
+                "gpu-fault.io/artifact-sha256": $sha,
+                "gpu-fault.io/control-plane-wheel-sha256": $sha,
+                "gpu-fault.io/release-wheel-sha256": $sha,
+                "gpu-fault.io/release-rollout": $release,
+                "gpu-fault.io/runtime-image": $image,
+                "gpu-fault.io/notification-config-sha256": $notification,
+                "gpu-fault.io/role-config-sha256": $role_config,
+                "gpu-fault.io/runtime-profile-version": $profile
+            } |
+            if $name == "gpu-fault-control-worker" and $domain != "" then
+                .spec.template.metadata.annotations["gpu-fault.io/failure-domain-map-sha256"] = $domain
+            else . end |
+            (if $restart != "" then $restart else
+                ([$live[0].items[]? | select(.metadata.name == $name) |
+                  .spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"]][0] // "")
+             end) as $restart_at |
+            if $restart_at != "" then
+                .spec.template.metadata.annotations["kubectl.kubernetes.io/restartedAt"] = $restart_at
+            else . end
+        '
 }
 
 render_manifest() {
@@ -1041,29 +1067,6 @@ apply_worker_role() {
     wait_for_rollout gpu-fault-control-worker
 }
 
-apply_consumer_roles() {
-    local spool_pid=""
-    local worker_pid=""
-    local failed=0
-    if role_selected spool; then
-        apply_spool_role &
-        spool_pid="$!"
-    fi
-    if role_selected worker; then
-        apply_worker_role &
-        worker_pid="$!"
-    fi
-    if [[ -n "${spool_pid}" ]] && ! wait "${spool_pid}"; then
-        echo "telemetry spool worker rollout failed" >&2
-        failed=1
-    fi
-    if [[ -n "${worker_pid}" ]] && ! wait "${worker_pid}"; then
-        echo "control worker rollout failed" >&2
-        failed=1
-    fi
-    return "${failed}"
-}
-
 apply_ingress_role() {
     role_selected ingress || return 0
     apply_manifest gpu-fault-api-ha-pdb
@@ -1071,21 +1074,110 @@ apply_ingress_role() {
     wait_for_rollout gpu-fault-api-ha
 }
 
+apply_role() {
+    case "$1" in
+        ingress) apply_ingress_role ;;
+        worker) apply_worker_role ;;
+        spool) apply_spool_role ;;
+        *)
+            echo "unknown control-plane role: $1" >&2
+            return 2
+            ;;
+    esac
+}
+
+# One Deployment at a time, each behind its own rollout wait, in the order the
+# schedulability preflight settled on: ingress first -- its surge-first roll
+# (maxUnavailable 0 / maxSurge 1) needs one free slot of its own size, which
+# the consumer tier's added replicas would otherwise take (the spool and the
+# worker used to roll in parallel ahead of ingress; on a 3 x 16-core node group
+# the ingress surge Pod then stayed Pending on "Insufficient cpu" for the whole
+# timeout and the preset rolled back) -- then the control worker, then the
+# spool worker. The preflight leaves that order only when it cannot fit and
+# the roles that free room (a replica reduction) have to go first.
+apply_roles_in_order() {
+    local -a roles
+    local role
+    IFS=',' read -r -a roles <<<"$1"
+    for role in "${roles[@]}"; do
+        apply_role "${role}"
+    done
+}
+
+SCHEDULABILITY_EVIDENCE="${CONTRACT_DIR}/schedulability.json"
+SCHEDULABILITY_ORDER=""
+
+# Model the roll before anything in the cluster changes: live allocatable
+# CPU/memory minus every scheduled Pod's requests, against the exact documents
+# the apply sends, one role at a time. Sets SCHEDULABILITY_ORDER; in refuse
+# mode a step that cannot fit ends the script here (exit 2) with the missing
+# cores and the node sizes named, so nothing waits on a Pending surge Pod.
+schedulability_preflight() {
+    local fixed_order="$1"
+    local scratch="${CONTRACT_DIR}/schedulability"
+    local role manifest stamp
+    local -a rendered=()
+    local -a args=()
+    install -d -m 0700 "${scratch}"
+    kubectl "${kubectl_args[@]}" get nodes -o json >"${scratch}/nodes.json"
+    kubectl "${kubectl_args[@]}" get pods -A -o json >"${scratch}/pods.json"
+    for role in ingress worker spool; do
+        role_selected "${role}" || continue
+        case "${role}" in
+            ingress) manifest=gpu-fault-api-ha-ingress ;;
+            worker) manifest=gpu-fault-control-worker ;;
+            spool) manifest=gpu-fault-telemetry-spool-worker ;;
+        esac
+        final_deployment_document "${manifest}" "$(role_deployment_sha "${manifest}")" \
+            >"${scratch}/${role}.json"
+        rendered+=(--rendered "${role}=${scratch}/${role}.json")
+    done
+    if ((${#rendered[@]} == 0)); then
+        SCHEDULABILITY_ORDER=""
+        return 0
+    fi
+    args=(
+        --nodes "${scratch}/nodes.json"
+        --pods "${scratch}/pods.json"
+        --live-deployments "${LIVE_DEPLOYMENTS}"
+        --evidence "${SCHEDULABILITY_EVIDENCE}"
+        --mode "${SCHEDULABILITY_MODE}"
+        "${rendered[@]}"
+    )
+    if [[ -n "${fixed_order}" ]]; then
+        args+=(--fixed-order "${fixed_order}")
+    fi
+    python3 "${SCRIPT_DIR}/control_plane_schedulability.py" "${args[@]}"
+    SCHEDULABILITY_ORDER="$(jq -r '.order | join(",")' "${SCHEDULABILITY_EVIDENCE}")"
+    if [[ -n "${SCHEDULABILITY_EVIDENCE_DIR}" ]]; then
+        stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+        install -d -m 0700 "${SCHEDULABILITY_EVIDENCE_DIR}"
+        install -m 0600 "${SCHEDULABILITY_EVIDENCE}" \
+            "${SCHEDULABILITY_EVIDENCE_DIR}/schedulability-${RELEASE_ID}-${stamp}-$$.json"
+    fi
+}
+
 if [[ "${CURRENT_SPOOL_ADMISSION}" == "true" &&
     "${GPU_FAULT_TELEMETRY_SPOOL:-false}" == "false" ]] &&
     role_selected ingress && role_selected spool; then
     # Stop new admission first, leave the old consumer running until every
-    # queued and leased row has drained, and only then scale it to zero.
+    # queued and leased row has drained, and only then scale it to zero. The
+    # drain fixes this order; the preflight models it as given.
+    schedulability_preflight "ingress,worker,spool"
     apply_ingress_role
     apply_worker_role
     wait_for_spool_drain
     apply_spool_role
 else
-    # Greenfield, steady-state and enable transitions all prove the consumer
-    # tier before ingress can begin writing to the spool.
-    apply_consumer_roles
-    apply_ingress_role
+    # Greenfield, steady-state and enable transitions: ingress first for its
+    # surge slot, then the consumers one at a time. The queue and the spool
+    # are durable tables, so what ingress admits ahead of a consumer roll
+    # waits there instead of being lost, and a consumer roll that fails fails
+    # the release (and rolls ingress back with it).
+    schedulability_preflight ""
+    apply_roles_in_order "${SCHEDULABILITY_ORDER}"
 fi
+
 wait_for_pin_convergence
 stamp_admin_config_metadata
 

@@ -44,6 +44,16 @@ if "get" in args:
             print(json.dumps(state["pins"]))
         else:
             print("false")
+    elif kind == "nodes":
+        # One roomy Ready node: the schedulability preflight's reads.
+        print(json.dumps({"items": [{
+            "metadata": {"name": "node-a", "labels": {"kubernetes.io/hostname": "node-a"}},
+            "spec": {},
+            "status": {"allocatable": {"cpu": "64", "memory": "256Gi"},
+                       "conditions": [{"type": "Ready", "status": "True"}]},
+        }]}))
+    elif kind == "pods" and "-A" in args:
+        print(json.dumps({"items": []}))
     elif kind == "pods":
         deployment = next(arg for arg in args if arg.startswith("app="))[4:]
         print(json.dumps({"items": [{
