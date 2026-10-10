@@ -81,4 +81,7 @@ def pin_hot_path_plans(db: Any) -> None:
 
     with db.cursor() as cursor:
         for statement in hot_path_planner_statements():
-            cursor.execute(statement)
+            # Always two positional arguments: every store cursor and every
+            # cursor double accepts ``(statement, parameters)``, not all accept
+            # a bare statement.
+            cursor.execute(statement, ())

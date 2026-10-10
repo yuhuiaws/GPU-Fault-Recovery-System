@@ -1862,7 +1862,10 @@ touched all 5,000 rows and ran 24.6 ms by default, and so did it under fresh sta
 blocks, touched the 72-row window and ran 3.9 ms. The unfiltered and excluded-path windows already walked the index.
 One state is not covered: a table that has never been analysed at all (no `pg_statistic` rows -- a new database
 before its first autoanalyze) leaves the choice among index paths arbitrary; `enable_bitmapscan = off` would settle
-it but prices the interlock's scope GIN probes out (GIN indexes are bitmap-only), so it is not applied.
+it but prices the interlock's scope GIN probes out (GIN indexes are bitmap-only), so it is not applied. The pin
+statements are plain `SET LOCAL` without placeholders, executed with an explicit empty parameter tuple through the
+same cursor path as the statements they protect, so a test that stands a cursor double in for the database sees them
+as ordinary statements.
 `enable_sort = off` was measured and rejected: it also yields the ordered walk, but the claim
 statement then executes in 1.3-1.7 s on a two-row table and on 5,000 rows alike (the sorts that must remain -- the
 ordered lane insert, the `DISTINCT ON`, the final ordering -- are driven onto pathological alternatives) where the

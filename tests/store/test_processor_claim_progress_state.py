@@ -22,6 +22,10 @@ class Cursor:
         self.rows = []
 
     def execute(self, query, parameters):
+        if query.startswith("SET LOCAL "):
+            # The hot-path planner pin: a settings statement with no result
+            # set, not one of the scripted queries.
+            return
         self.database.parameters.append(dict(parameters))
         self.rows = self.database.results.popleft()
         callback, self.database.callback = self.database.callback, None
