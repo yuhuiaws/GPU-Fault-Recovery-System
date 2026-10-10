@@ -1854,12 +1854,16 @@ fault/observation interlock) and the completion's row locking, and the heap was 
 (`LWLock:BufferContent` took 90% of the INSERT's active time). The window's `ORDER BY (priority, created_at,
 request_id) LIMIT window` is exactly the stored order of `priority_claim`/`path_priority_claim`, so once the heap
 scan is priced out the planner walks the index in claim order and stops at the window; the lane probes walk
-`gpu_fault_processor_queue_lane` and the depth reads the counts primary key. Measured on 5,000 PENDING rows
-(`tests/store/test_postgres_claim_planner_discipline.py`, numbers recorded as test properties): the path-filtered
-sub-window -- the shape 7 of the 8 sub-claims per cycle use -- read 2,323 shared blocks, touched all 5,000 rows and
-ran 24 ms by default, under stale and fresh statistics alike; with the setting it read 769 blocks, touched the 72-row
-window and ran 4 ms. The unfiltered and excluded-path windows already walked the index (772 -> 769 blocks, 4.5 -> 4.0
-ms), and a two-row table went from 3.9 to 1.0 ms. `enable_sort = off` was measured and rejected: it also yields the ordered walk, but the claim
+`gpu_fault_processor_queue_lane` and the depth reads the counts primary key. Measured on 5,000 PENDING rows with
+the planner's statistics fixed by the test (`tests/store/test_postgres_claim_planner_discipline.py`, numbers recorded
+as test properties): with the burst's statistics -- 138 rows analysed, then 4,862 more the planner knows nothing
+about -- the path-filtered sub-window (the shape 7 of the 8 sub-claims per cycle use) read 2,316 shared blocks,
+touched all 5,000 rows and ran 24.6 ms by default, and so did it under fresh statistics; with the setting it read 765
+blocks, touched the 72-row window and ran 3.9 ms. The unfiltered and excluded-path windows already walked the index.
+One state is not covered: a table that has never been analysed at all (no `pg_statistic` rows -- a new database
+before its first autoanalyze) leaves the choice among index paths arbitrary; `enable_bitmapscan = off` would settle
+it but prices the interlock's scope GIN probes out (GIN indexes are bitmap-only), so it is not applied.
+`enable_sort = off` was measured and rejected: it also yields the ordered walk, but the claim
 statement then executes in 1.3-1.7 s on a two-row table and on 5,000 rows alike (the sorts that must remain -- the
 ordered lane insert, the `DISTINCT ON`, the final ordering -- are driven onto pathological alternatives) where the
 default takes a few milliseconds. The setting is a cost penalty, not a prohibition: a statement no index can serve
