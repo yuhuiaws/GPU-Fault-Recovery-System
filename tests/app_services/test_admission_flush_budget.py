@@ -1,12 +1,14 @@
-"""The ingress admission batchers take their in-flight flush slots from a
-site-wide cap divided among the ingress processes, and stretch their
-coalescing window while the store is contended.
+"""The ingress admission batchers take a floor and a ceiling of in-flight
+flush slots from site-wide values divided among the ingress processes, move
+their live limit between the two on the flush-latency EWMA and their backlog,
+and stretch their coalescing window while the store is contended.
 
 Before, every process carried its own literal (16 routine + 8 fault + 4
 evidence); on 3 api-ha Pods x 4 uvicorn workers that was up to 336 concurrent
 admission INSERT transactions on one table, the perf suite's load-start
-convoy. The fault tier keeps a cap of its own so a telemetry burst never takes
-a fault slot.
+convoy. A fixed site-wide cap of 24 then shed telemetry instead (4,601
+requests expired in the queue while every process sat at 2 slots). The fault
+tier keeps a range of its own so a telemetry burst never takes a fault slot.
 """
 
 from __future__ import annotations
@@ -24,11 +26,14 @@ from gpu_fault.async_store import AsyncStoreExecutor
 from tests._builders import build_context
 from tests.app_services._cov95_runtime_admission import BATCHERS, POOLS, item
 
-SITE_CAPS = {
+SITE_RANGES = {
     "GPU_FAULT_INGRESS_WRITER_PROCESSES": "12",
-    "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY": "24",
-    "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY": "24",
-    "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY": "12",
+    "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY": "192",
+    "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "48",
+    "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY": "96",
+    "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "24",
+    "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY": "24",
+    "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "12",
 }
 
 
@@ -47,12 +52,22 @@ def _runtime(monkeypatch: pytest.MonkeyPatch, environment: dict[str, str]):
     return AdmissionRuntimeFactory(build_context(), None).build()
 
 
-def _slots(runtime) -> dict[str, int]:
-    return {
-        "routine": runtime.admission_batcher.max_in_flight_flushes,
-        "fault": runtime.fault_batcher.max_in_flight_flushes,
-        "evidence": runtime.evidence_batcher.max_in_flight_flushes,
-    }
+def _ranges(runtime) -> dict[str, tuple[int, int, int]]:
+    """(floor, live limit, ceiling) per tier."""
+
+    result = {}
+    for tier, name in (
+        ("routine", "admission_batcher"),
+        ("fault", "fault_batcher"),
+        ("evidence", "evidence_batcher"),
+    ):
+        batcher = getattr(runtime, name)
+        result[tier] = (
+            batcher.concurrency.floor,
+            batcher.max_in_flight_flushes,
+            batcher.concurrency.ceiling,
+        )
+    return result
 
 
 async def _close(runtime) -> None:
@@ -62,44 +77,105 @@ async def _close(runtime) -> None:
         getattr(runtime, name).close()
 
 
-def test_each_process_takes_its_share_of_the_site_wide_caps(monkeypatch) -> None:
-    runtime = _runtime(monkeypatch, SITE_CAPS)
+def test_each_process_takes_its_share_of_the_site_wide_ranges(monkeypatch) -> None:
+    runtime = _runtime(monkeypatch, SITE_RANGES)
     try:
-        assert _slots(runtime) == {"routine": 2, "fault": 2, "evidence": 1}
+        assert _ranges(runtime) == {
+            "routine": (4, 4, 16),
+            "fault": (2, 2, 8),
+            "evidence": (1, 1, 2),
+        }, "every process starts at the floor; 16 routine is the pre-cap value"
         assert runtime.admission_batcher.flush_delay_max_seconds == 0.05
         assert runtime.fault_batcher.flush_delay_max_seconds == 0.05
+        for name in ("admission_batcher", "fault_batcher", "evidence_batcher"):
+            controller = getattr(runtime, name).concurrency
+            assert controller.open_below_seconds == 1.0
+            assert controller.close_above_seconds == 2.0
     finally:
         asyncio.run(_close(runtime))
 
 
-def test_a_cap_that_does_not_divide_rounds_the_fleet_total_up(monkeypatch) -> None:
+def test_a_value_that_does_not_divide_rounds_the_fleet_total_up(monkeypatch) -> None:
     runtime = _runtime(
         monkeypatch,
         {
-            **SITE_CAPS,
+            **SITE_RANGES,
             "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY": "30",
+            "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "13",
             "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY": "1",
+            "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "1",
         },
     )
     try:
-        assert _slots(runtime) == {"routine": 3, "fault": 1, "evidence": 1}
+        assert _ranges(runtime) == {
+            "routine": (2, 2, 3),
+            "fault": (1, 1, 1),
+            "evidence": (1, 1, 2),
+        }
+        assert runtime.fault_batcher.concurrency.adaptive is False
     finally:
         asyncio.run(_close(runtime))
 
 
-def test_an_explicit_per_process_value_wins_over_the_site_wide_cap(monkeypatch) -> None:
+def test_a_ceiling_without_a_floor_is_a_fixed_limit(monkeypatch) -> None:
+    """A ConfigMap rendered before the floor existed keeps its fixed cap."""
+
     runtime = _runtime(
         monkeypatch,
         {
-            **SITE_CAPS,
+            "GPU_FAULT_INGRESS_WRITER_PROCESSES": "12",
+            "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY": "24",
+            "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY": "24",
+            "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY": "12",
+        },
+    )
+    try:
+        assert _ranges(runtime) == {
+            "routine": (2, 2, 2),
+            "fault": (2, 2, 2),
+            "evidence": (1, 1, 1),
+        }
+        assert runtime.admission_batcher.concurrency.adaptive is False
+    finally:
+        asyncio.run(_close(runtime))
+
+
+def test_an_explicit_per_process_value_pins_both_ends(monkeypatch) -> None:
+    runtime = _runtime(
+        monkeypatch,
+        {
+            **SITE_RANGES,
             "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_GROUPS": "5",
             "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_BATCH_GROUPS": "3",
             "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_MAX_SECONDS": "0.2",
         },
     )
     try:
-        assert _slots(runtime) == {"routine": 5, "fault": 2, "evidence": 3}
+        assert _ranges(runtime) == {
+            "routine": (5, 5, 5),
+            "fault": (2, 2, 8),
+            "evidence": (3, 3, 3),
+        }
         assert runtime.admission_batcher.flush_delay_max_seconds == 0.2
+    finally:
+        asyncio.run(_close(runtime))
+
+
+def test_the_thresholds_are_read_per_tier(monkeypatch) -> None:
+    runtime = _runtime(
+        monkeypatch,
+        {
+            **SITE_RANGES,
+            "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_OPEN_SECONDS": "0.4",
+            "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_CLOSE_SECONDS": "0.9",
+            "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY_CLOSE_SECONDS": "3",
+        },
+    )
+    try:
+        routine = runtime.admission_batcher.concurrency
+        assert (routine.open_below_seconds, routine.close_above_seconds) == (0.4, 0.9)
+        fault = runtime.fault_batcher.concurrency
+        assert (fault.open_below_seconds, fault.close_above_seconds) == (1.0, 3.0)
     finally:
         asyncio.run(_close(runtime))
 
@@ -122,13 +198,17 @@ def test_a_base_delay_above_the_cap_leaves_the_window_fixed(monkeypatch) -> None
         asyncio.run(_close(runtime))
 
 
-def test_without_a_cap_a_bare_process_keeps_the_historical_defaults(
+def test_without_site_values_a_bare_process_keeps_the_historical_defaults(
     monkeypatch,
 ) -> None:
     runtime = _runtime(monkeypatch, {})
     try:
         # Fault groups default to the fault store I/O worker count (1 here).
-        assert _slots(runtime) == {"routine": 16, "fault": 1, "evidence": 4}
+        assert _ranges(runtime) == {
+            "routine": (16, 16, 16),
+            "fault": (1, 1, 1),
+            "evidence": (4, 4, 4),
+        }
     finally:
         asyncio.run(_close(runtime))
 
@@ -137,12 +217,38 @@ def test_without_a_cap_a_bare_process_keeps_the_historical_defaults(
     ("environment", "message"),
     [
         (
-            {**SITE_CAPS, "GPU_FAULT_INGRESS_WRITER_PROCESSES": "0"},
+            {**SITE_RANGES, "GPU_FAULT_INGRESS_WRITER_PROCESSES": "0"},
             "writer process count must be positive",
         ),
         (
-            {**SITE_CAPS, "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY": "0"},
+            {
+                **SITE_RANGES,
+                "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY": "0",
+                "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "0",
+            },
             "flush concurrency must be positive",
+        ),
+        (
+            {
+                **SITE_RANGES,
+                "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "193",
+            },
+            "FLUSH_CONCURRENCY_FLOOR cannot exceed",
+        ),
+        (
+            {
+                "GPU_FAULT_INGRESS_WRITER_PROCESSES": "12",
+                "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "12",
+            },
+            "FLUSH_CONCURRENCY_FLOOR requires",
+        ),
+        (
+            {
+                **SITE_RANGES,
+                "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_OPEN_SECONDS": "2",
+                "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_CLOSE_SECONDS": "1",
+            },
+            "close threshold cannot be below the open threshold",
         ),
     ],
 )
@@ -215,6 +321,10 @@ def test_the_window_bounds_are_validated() -> None:
             )
         with pytest.raises(ValueError, match="contention threshold must be positive"):
             _batcher(SimpleNamespace(), executor, contention_flush_seconds=0)
+        with pytest.raises(ValueError, match="ceiling cannot be below the floor"):
+            _batcher(
+                SimpleNamespace(), executor, max_flush_groups=2, min_flush_groups=3
+            )
     finally:
         executor.close()
 

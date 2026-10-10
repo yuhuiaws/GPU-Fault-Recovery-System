@@ -270,25 +270,51 @@ class ProcessorConfig(_Section):
     # delay leaves the window fixed (the runtime takes the larger of the two,
     # so raising the base alone stays a valid configuration).
     admission_batch_delay_max_seconds: float = 0.05
-    # Site-wide caps on concurrent admission flush transactions against
-    # gpu_fault_processor_queue, one per service tier, shared by the ingress
-    # processes (``ingress_writer_processes()``). The caps used to be per
-    # process - 16 routine + 8 fault + 4 evidence on each of 12 processes, up
-    # to 336 concurrent INSERT transactions on one table - and the perf
-    # suite's r1 load start turned that into a 30-65 s LWLock:BufferContent
-    # convoy (134-182 concurrent queue INSERTs; fault requests reached their
-    # 30 s deadline inside the INSERT). Fault flushes keep a cap of their own
-    # so a telemetry burst never takes a fault slot.
-    admission_flush_concurrency: int = 24
-    fault_admission_flush_concurrency: int = 24
-    evidence_admission_flush_concurrency: int = 12
+    # Site-wide range of concurrent admission flush transactions against
+    # gpu_fault_processor_queue, one range per service tier, shared by the
+    # ingress processes (``ingress_writer_processes()``): ``*_concurrency`` is
+    # the CEILING and ``*_concurrency_floor`` the floor every process starts
+    # at; each process moves its own limit between its shares of the two on
+    # the flush-latency EWMA and its backlog (app/admission_concurrency.py).
+    # The caps used to be per process - 16 routine + 8 fault + 4 evidence on
+    # each of 12 processes, up to 336 concurrent INSERT transactions on one
+    # table - and the perf suite's r1 load start turned that into a 30-65 s
+    # LWLock:BufferContent convoy (134-182 concurrent queue INSERTs; fault
+    # requests reached their 30 s deadline inside the INSERT). A fixed cap of
+    # 24 (2 per process) then shed telemetry instead: every process sat at
+    # its cap for the whole load start, ~800 entries queued per process,
+    # 4,601 requests expired in the queue (18.7 % reserved 503s against a 2 %
+    # budget), 517 req/s, 0.59 s per 16-item flush. The same site at 96/48
+    # (8/4 per process): 1,051 req/s, no expiry, 81 ms per flush, 60-69
+    # entries queued per process at the peak, the store's BufferContent waits
+    # 1 % (30 %) with a 5 s peak of 113 active statements (147) - and the
+    # ceiling still binding (in_flight_max 8 on every process, 2.5 items per
+    # flush, the store nearly idle), 1,051 req/s against the 1,428-1,542 req/s
+    # this site did with 16 slots per process before any site-wide cap
+    # existed. Schema v22 removed the reason 192 concurrent flushes convoyed,
+    # so the ceiling goes back to 192 (16 per process) and the controller
+    # closes slots only when flush latency actually climbs; the fault tier,
+    # whose own flushes slowed under the drained telemetry load, gets 96.
+    # The floor is where a process starts and what moderate load runs at;
+    # the controller reaches the ceiling within a few hundred milliseconds of
+    # saturation. Fault flushes keep a range of their own so a telemetry
+    # burst never takes a fault slot.
+    admission_flush_concurrency: int = 192
+    admission_flush_concurrency_floor: int = 48
+    fault_admission_flush_concurrency: int = 96
+    fault_admission_flush_concurrency_floor: int = 24
+    evidence_admission_flush_concurrency: int = 24
+    evidence_admission_flush_concurrency_floor: int = 12
     OMIT_WHEN_DEFAULT = frozenset(
         {
             "admission_batch_delay_seconds",
             "admission_batch_delay_max_seconds",
             "admission_flush_concurrency",
+            "admission_flush_concurrency_floor",
             "fault_admission_flush_concurrency",
+            "fault_admission_flush_concurrency_floor",
             "evidence_admission_flush_concurrency",
+            "evidence_admission_flush_concurrency_floor",
         }
     )
 
@@ -303,13 +329,28 @@ class ProcessorConfig(_Section):
             )
         bounds = {
             "admissionFlushConcurrency": (self.admission_flush_concurrency, 1, 1024),
+            "admissionFlushConcurrencyFloor": (
+                self.admission_flush_concurrency_floor,
+                1,
+                1024,
+            ),
             "faultAdmissionFlushConcurrency": (
                 self.fault_admission_flush_concurrency,
                 1,
                 1024,
             ),
+            "faultAdmissionFlushConcurrencyFloor": (
+                self.fault_admission_flush_concurrency_floor,
+                1,
+                1024,
+            ),
             "evidenceAdmissionFlushConcurrency": (
                 self.evidence_admission_flush_concurrency,
+                1,
+                1024,
+            ),
+            "evidenceAdmissionFlushConcurrencyFloor": (
+                self.evidence_admission_flush_concurrency_floor,
                 1,
                 1024,
             ),
@@ -343,6 +384,12 @@ class ProcessorConfig(_Section):
                 )
         if self.max_cluster_queue_depth > self.max_queue_depth:
             raise AdminConfigError("maxClusterQueueDepth must not exceed maxQueueDepth")
+        for spelling, (floor, ceiling) in self.admission_flush_ranges().items():
+            if floor > ceiling:
+                raise AdminConfigError(
+                    f"spec.processor.{spelling}FlushConcurrencyFloor must not "
+                    f"exceed {spelling}FlushConcurrency"
+                )
         if self.retry_backoff_max_seconds < self.retry_backoff_seconds:
             raise AdminConfigError(
                 "retryBackoffMaxSeconds must not be less than retryBackoffSeconds"
@@ -355,25 +402,40 @@ class ProcessorConfig(_Section):
                 "completedRetentionSeconds must cover retryable response age"
             )
 
-    def admission_flush_slots_per_process(self) -> dict[str, int]:
-        """The in-flight flushes one ingress process takes from each cap.
+    def admission_flush_ranges(self) -> dict[str, tuple[int, int]]:
+        """Site-wide (floor, ceiling) per tier, keyed by the YAML spelling stem."""
 
-        ``ceil(cap / ingress_writer_processes())``, at least one: the number
-        ``gpu_fault.app.admission_runtime`` derives from the rendered
-        environment, so the plan can show it next to the site-wide value.
+        return {
+            "admission": (
+                self.admission_flush_concurrency_floor,
+                self.admission_flush_concurrency,
+            ),
+            "faultAdmission": (
+                self.fault_admission_flush_concurrency_floor,
+                self.fault_admission_flush_concurrency,
+            ),
+            "evidenceAdmission": (
+                self.evidence_admission_flush_concurrency_floor,
+                self.evidence_admission_flush_concurrency,
+            ),
+        }
+
+    def admission_flush_slots_per_process(self) -> dict[str, tuple[int, int]]:
+        """The (floor, ceiling) of in-flight flushes one ingress process runs.
+
+        ``ceil(value / ingress_writer_processes())`` each, at least one: the
+        numbers ``gpu_fault.app.admission_runtime`` derives from the rendered
+        environment, so the plan can show them next to the site-wide values.
         """
 
         processes = ingress_writer_processes()
+        tiers = {"admission": "routine", "faultAdmission": "fault"}
         return {
-            "routine": flush_slots_per_process(
-                self.admission_flush_concurrency, processes
-            ),
-            "fault": flush_slots_per_process(
-                self.fault_admission_flush_concurrency, processes
-            ),
-            "evidence": flush_slots_per_process(
-                self.evidence_admission_flush_concurrency, processes
-            ),
+            tiers.get(spelling, "evidence"): (
+                flush_slots_per_process(floor, processes),
+                flush_slots_per_process(ceiling, processes),
+            )
+            for spelling, (floor, ceiling) in self.admission_flush_ranges().items()
         }
 
 

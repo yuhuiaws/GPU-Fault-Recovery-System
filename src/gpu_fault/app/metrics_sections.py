@@ -323,9 +323,6 @@ def render_processor_metrics_3(
             "# HELP gpu_fault_processor_admission_batch_in_flight_max High-water mark of concurrent admission flushes.",
             "# TYPE gpu_fault_processor_admission_batch_in_flight_max gauge",
             f"gpu_fault_processor_admission_batch_in_flight_max {processor_admission_batcher.in_flight_max}",
-            "# HELP gpu_fault_processor_admission_batch_in_flight_limit Configured cap on concurrent admission flushes in this process (the site-wide cap divided among the ingress processes).",
-            "# TYPE gpu_fault_processor_admission_batch_in_flight_limit gauge",
-            f"gpu_fault_processor_admission_batch_in_flight_limit {processor_admission_batcher.max_in_flight_flushes}",
             "# HELP gpu_fault_processor_admission_batch_delay_seconds Coalescing window the last dispatch pass waited: the base delay, stretched toward the configured maximum while flushes are slow.",
             "# TYPE gpu_fault_processor_admission_batch_delay_seconds gauge",
             f"gpu_fault_processor_admission_batch_delay_seconds {processor_admission_batcher.flush_delay_current_seconds:.6f}",
@@ -351,6 +348,42 @@ def render_processor_metrics_3(
             "# TYPE gpu_fault_processor_admission_batch_scope_wait_seconds gauge",
             "# HELP gpu_fault_processor_requests_processed_total Processor requests completed by outcome.",
             "# TYPE gpu_fault_processor_requests_processed_total counter",
+        ]
+    )
+    render_flush_limit_metrics(
+        lines, "gpu_fault_processor_admission_batch", processor_admission_batcher
+    )
+
+
+def render_flush_limit_metrics(lines: list[str], family: str, batcher: Any) -> None:
+    """The adaptive in-flight flush limit of one admission tier.
+
+    The gauge is the limit this process runs at now - it moves between the
+    floor and the ceiling the admin config renders (``admission_concurrency``)
+    - and the counters say how often the controller opened and closed slots.
+    """
+
+    lines.extend(
+        [
+            f"# HELP {family}_in_flight_limit Current cap on concurrent "
+            "admission flushes in this process: adaptive between the floor and "
+            "the ceiling the site-wide admission flush concurrency renders, "
+            "divided among the ingress processes.",
+            f"# TYPE {family}_in_flight_limit gauge",
+            f"{family}_in_flight_limit {batcher.max_in_flight_flushes}",
+            f"# HELP {family}_in_flight_limit_raised_total Dispatch passes that "
+            "opened one more concurrent flush because every slot was busy with "
+            "work still queued and the flush latency stayed below the open "
+            "threshold.",
+            f"# TYPE {family}_in_flight_limit_raised_total counter",
+            f"{family}_in_flight_limit_raised_total "
+            f"{batcher.in_flight_limit_raised_total}",
+            f"# HELP {family}_in_flight_limit_lowered_total Dispatch passes that "
+            "closed concurrent flushes because the flush latency passed the close "
+            "threshold or the limit was no longer binding.",
+            f"# TYPE {family}_in_flight_limit_lowered_total counter",
+            f"{family}_in_flight_limit_lowered_total "
+            f"{batcher.in_flight_limit_lowered_total}",
         ]
     )
 
@@ -418,6 +451,9 @@ def render_admission_metrics(
             f"{fault_admission_batcher.expired_total}",
         ]
     )
+    render_flush_limit_metrics(
+        lines, "gpu_fault_processor_fault_admission_batch", fault_admission_batcher
+    )
     lines.extend(
         [
             "# HELP "
@@ -479,6 +515,11 @@ def render_admission_metrics(
             "gpu_fault_processor_evidence_admission_batch_expired_total "
             f"{evidence_admission_batcher.expired_total}",
         ]
+    )
+    render_flush_limit_metrics(
+        lines,
+        "gpu_fault_processor_evidence_admission_batch",
+        evidence_admission_batcher,
     )
 
 

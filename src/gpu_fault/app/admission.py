@@ -6,6 +6,7 @@ import time
 from dataclasses import dataclass
 from typing import Callable
 
+from gpu_fault.app.admission_concurrency import FlushConcurrencyController
 from gpu_fault.async_store import (
     REQUEST_DEADLINE,
     AsyncStoreExecutor,
@@ -73,6 +74,9 @@ class _ProcessorAdmissionBatcher:
         global_admission_guard: int,
         max_batch_size: int = 64,
         max_flush_groups: int = 16,
+        min_flush_groups: int | None = None,
+        flush_open_below_seconds: float = 1.0,
+        flush_close_above_seconds: float = 2.0,
         flush_delay_seconds: float = 0.002,
         flush_delay_max_seconds: float | None = None,
         contention_flush_seconds: float = 0.1,
@@ -107,7 +111,18 @@ class _ProcessorAdmissionBatcher:
         self.reserved_cluster_fault_depth = reserved_cluster_fault_depth
         self.global_admission_guard = global_admission_guard
         self.max_batch_size = max_batch_size
+        # ``max_flush_groups`` is the ceiling on concurrent flushes in this
+        # process and ``min_flush_groups`` the floor the process starts at
+        # (the ceiling when omitted, i.e. a fixed limit). The controller
+        # moves the live limit between them on the flush-latency EWMA and
+        # the dispatcher's own saturation signal; see admission_concurrency.
         self.max_flush_groups = max_flush_groups
+        self.concurrency = FlushConcurrencyController(
+            floor=max_flush_groups if min_flush_groups is None else min_flush_groups,
+            ceiling=max_flush_groups,
+            open_below_seconds=flush_open_below_seconds,
+            close_above_seconds=flush_close_above_seconds,
+        )
         self.flush_delay_seconds = flush_delay_seconds
         # The coalescing window is adaptive: ``flush_delay_seconds`` while
         # the store answers quickly, stretched toward
@@ -156,6 +171,9 @@ class _ProcessorAdmissionBatcher:
         # extra synchronisation beyond ``_lock``.
         self._in_flight_scopes: dict[str, float] = {}
         self._flush_tasks: dict[asyncio.Task, str] = {}
+        # Whether the last dispatch pass left work queued with every slot
+        # busy - the demand signal the concurrency controller opens on.
+        self._saturated = False
         # A dispatcher parked on the in-flight flushes has to be woken by
         # an arrival too, or a new cluster waits for an unrelated one to
         # finish - the barrier this change removes, rebuilt by accident.
@@ -202,24 +220,30 @@ class _ProcessorAdmissionBatcher:
 
     @property
     def max_in_flight_flushes(self) -> int:
-        """How many per-scope flushes may run at once in this process.
+        """How many per-scope flushes may run at once in this process, now.
 
-        Same knob as before the barrier came out, and deliberately so:
-        under ``asyncio.gather`` the width of a round already was the
-        concurrency against the store, so an A/B on this value still
-        varies exactly one thing - how many admission transactions the
-        database sees at once - and the earlier measurement that 64
-        concurrent flushes cost more in counter-row contention than they
-        win in batching still applies to it.
-
-        What the database sees is this times the number of ingress
-        processes, which is why the regional runtime derives the value from
-        a site-wide cap (``postgres_capacity.flush_slots_per_process``)
-        instead of carrying a per-process literal: 16 per process on 12
-        processes was 192 concurrent admission INSERTs on one table.
+        Under ``asyncio.gather`` the width of a round already was the
+        concurrency against the store, so this still varies exactly one
+        thing - how many admission transactions the database sees from
+        this process at once. What the database sees is this times the
+        number of ingress processes, which is why the regional runtime
+        derives floor and ceiling from site-wide values
+        (``postgres_capacity.flush_slots_per_process``) instead of carrying
+        a per-process literal: 16 per process on 12 processes was 192
+        concurrent admission INSERTs on one table, and 2 per process was a
+        storm that expired 4,601 requests in the queue. The value moves
+        between the floor and ``max_flush_groups`` (``self.concurrency``).
         """
 
-        return self.max_flush_groups
+        return self.concurrency.limit
+
+    @property
+    def in_flight_limit_raised_total(self) -> int:
+        return self.concurrency.raised_total
+
+    @property
+    def in_flight_limit_lowered_total(self) -> int:
+        return self.concurrency.lowered_total
 
     def effective_flush_delay_seconds(self) -> float:
         """The coalescing window the next dispatch pass waits for.
@@ -249,38 +273,47 @@ class _ProcessorAdmissionBatcher:
     def scopes_pending(self) -> int:
         return len(self._pending_by_scope)
 
-    @property
-    def round_capacity(self) -> int:
-        return self.max_flush_groups * self.max_batch_size
+    def projection_in_flight_limit(self) -> int:
+        """The flush concurrency the deadline projection divides the queue by.
 
-    def _projected_wait_seconds(self, ahead: int) -> float:
-        """How long a request joining behind ``ahead`` others will wait.
+        The limit the controller is heading for, not the one it is at: while
+        the store answers below the open threshold a saturated batcher keeps
+        opening slots, so a backlog that arrives mid-ramp is served at the
+        ceiling - counting it against the floor would shed requests for
+        capacity that is about to open. Once the store is contended the
+        ramp has stopped and the live limit is the honest figure.
+        """
+
+        if self.concurrency.may_open(self.round_seconds_ewma):
+            return self.concurrency.ceiling
+        return self.concurrency.limit
+
+    def _projected_scope_wait_seconds(self, ahead: int, scopes_ahead: int) -> float:
+        """How long a request joining its scope behind ``ahead`` others waits.
 
         A burst offers far more than the batcher can admit, and a request
         that cannot be served inside its budget is going to get a 503
         either way. Doing it on arrival instead of fifteen seconds later
         is what stops the queue from being full of work nobody is waiting
         for any more - and it is measured, not assumed: the estimate uses
-        the observed round time, so it disappears when the batcher is
+        the observed flush time, so it disappears when the batcher is
         keeping up.
 
-        With the flushes pipelined, ``round_seconds_ewma`` tracks how
-        long one flush takes rather than how long a barrier round took.
-        For this estimate that is the same quantity - a saturated
-        batcher retires ``round_capacity`` items per flush time - and it
-        no longer carries an unrelated cluster's stall, which used to
-        make the projection shed requests for a queue that was moving.
+        Two waits add up. The scope's own: one flush per ``max_batch_size``
+        entries already queued for it, since a scope runs one flush at a
+        time. And the wait for a slot: the ``scopes_ahead`` other scopes
+        with queued entries are dispatched before this one in rounds of
+        ``projection_in_flight_limit`` flushes. The live storm had the
+        second term and the projection did not: 32 scopes on 2 slots per
+        process, every entry waited 10-15 s for a slot while the projection
+        said one flush, and 4,601 requests expired in the queue instead of
+        being answered on arrival. Dividing by the limit the controller is
+        heading for keeps the term from shedding for capacity that opens.
         """
         if self.round_seconds_ewma <= 0:
             return 0.0
-        rounds_ahead = 1 + ahead // self.round_capacity
-        return rounds_ahead * self.round_seconds_ewma * self.projection_margin
-
-    def _projected_scope_wait_seconds(self, ahead: int) -> float:
-        """Rounds this scope still needs before a new entry is flushed."""
-        if self.round_seconds_ewma <= 0:
-            return 0.0
         rounds_ahead = 1 + ahead // self.max_batch_size
+        rounds_ahead += scopes_ahead // self.projection_in_flight_limit()
         return rounds_ahead * self.round_seconds_ewma * self.projection_margin
 
     async def submit(self, item):
@@ -290,11 +323,15 @@ class _ProcessorAdmissionBatcher:
         if deadline is not None and self.projection_margin > 0:
             # Queues are per scope and one flush is in flight per scope, so
             # the wait this request faces is its own scope's backlog over
-            # ``max_batch_size`` -- not the process-wide backlog over the
-            # fleet-wide capacity, which let one stalled cluster shed a
-            # healthy cluster's requests (F-E2).
-            ahead = len(self._pending_by_scope.get(scope, ()))
-            projected = self._projected_scope_wait_seconds(ahead)
+            # ``max_batch_size`` plus the slot wait behind the other scopes
+            # -- not the process-wide item backlog over the fleet-wide
+            # capacity, which let one stalled cluster shed a healthy
+            # cluster's requests (F-E2): a stalled scope holds one slot and
+            # counts once here, the same as any other scope ahead.
+            queue = self._pending_by_scope.get(scope)
+            ahead = len(queue) if queue else 0
+            scopes_ahead = len(self._pending_by_scope) - (1 if queue else 0)
+            projected = self._projected_scope_wait_seconds(ahead, scopes_ahead)
             if projected > deadline - time.monotonic():
                 self.shed_total += 1
                 # The request's own budget is what cannot be met, so it is
@@ -391,13 +428,18 @@ class _ProcessorAdmissionBatcher:
         the slowest cluster in a round, which is the whole point of the
         change - the cap now bounds concurrency against the pool, it no
         longer couples unrelated clusters to each other.
+
+        The cap itself moves: the controller is asked first, with the
+        previous pass's saturation and the flush EWMA, and this pass
+        dispatches up to the limit it answers with - a slot opened on
+        saturation is filled in the same pass, not on the next wake-up.
         """
         dispatched: list[tuple[str, list[_AdmissionEntry]]] = []
         busy_defers = 0
-        capacity = max(
-            0,
-            self.max_in_flight_flushes - len(self._in_flight_scopes),
+        limit = self.concurrency.observe(
+            saturated=self._saturated, flush_ewma=self.round_seconds_ewma
         )
+        capacity = max(0, limit - len(self._in_flight_scopes))
         for scope in list(self._pending_by_scope):
             queue = self._pending_by_scope[scope]
             if scope in self._in_flight_scopes:
@@ -425,10 +467,10 @@ class _ProcessorAdmissionBatcher:
         self.pending_depth = self._pending_count
         self.scope_busy_defers_total += busy_defers
         self.in_flight_max = max(self.in_flight_max, len(self._in_flight_scopes))
-        if (
-            self._pending_count
-            and len(self._in_flight_scopes) >= self.max_in_flight_flushes
-        ):
+        self._saturated = bool(self._pending_count) and (
+            len(self._in_flight_scopes) >= limit
+        )
+        if self._saturated:
             self.cap_waits_total += 1
         if dispatched:
             self.rounds_total += 1
@@ -493,6 +535,7 @@ class _ProcessorAdmissionBatcher:
                 if self.round_seconds_ewma <= 0
                 else 0.7 * self.round_seconds_ewma + 0.3 * elapsed
             )
+            self.concurrency.record_flush()
         if error is not None:
             LOGGER.error(
                 "%s batch failed cluster_id=%s size=%s paths=%s",

@@ -21,6 +21,16 @@ from gpu_fault_release.regional_release_config import ReleaseError
 
 __all__ = ["captured_admin_config"]
 
+# ProcessorConfig field -> the literal every role ConfigMap carries for it
+# (the renderer's PROCESSOR_FLUSH_CAPS, read back here).
+ADMISSION_FLUSH_LITERALS = {
+    f"{tier}admission_flush_concurrency{suffix}": (
+        f"GPU_FAULT_PROCESSOR_{tier.upper()}ADMISSION_FLUSH_CONCURRENCY{suffix.upper()}"
+    )
+    for tier in ("", "fault_", "evidence_")
+    for suffix in ("", "_floor")
+}
+
 
 def _captured_node_counts(worker_core: dict[str, str]) -> dict[str, int]:
     """Node counts exactly as the live worker ConfigMap declares them.
@@ -144,27 +154,13 @@ def _captured_processor(
                 processor.admission_batch_delay_max_seconds,
             )
         ),
-        # The site-wide caps travel as their own literals, so the capture
-        # reads the configured value exactly instead of inverting the
-        # per-process share the runtime derives from them.
-        "admission_flush_concurrency": int(
-            ingress_processor.get(
-                "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY",
-                processor.admission_flush_concurrency,
-            )
-        ),
-        "fault_admission_flush_concurrency": int(
-            ingress_processor.get(
-                "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY",
-                processor.fault_admission_flush_concurrency,
-            )
-        ),
-        "evidence_admission_flush_concurrency": int(
-            ingress_processor.get(
-                "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY",
-                processor.evidence_admission_flush_concurrency,
-            )
-        ),
+        # The site-wide flush ceilings and floors travel as their own
+        # literals, so the capture reads the configured values exactly
+        # instead of inverting the per-process shares the runtime derives.
+        **{
+            field: int(ingress_processor.get(literal, getattr(processor, field)))
+            for field, literal in ADMISSION_FLUSH_LITERALS.items()
+        },
     }
 
 

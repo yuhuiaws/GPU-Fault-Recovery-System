@@ -16,6 +16,19 @@ from gpu_fault.app import ApplicationContext, create_app
 from tests._builders import asgi_client, build_context, build_store
 
 ROOT = Path(__file__).resolve().parents[2]
+# The admission flush ranges (ceiling and floor per tier) are site-wide and
+# divided among the ingress processes (3 replicas x 4 workers); no per-process
+# group literal remains. 192 is the pre-cap 16 per process that schema v22 made
+# safe again; the live fixed cap of 24 expired 4,601 requests in the queue.
+FLUSH_RANGE_LITERALS = {
+    "GPU_FAULT_INGRESS_WRITER_PROCESSES": "12",
+    "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY": "192",
+    "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "48",
+    "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY": "96",
+    "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "24",
+    "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY": "24",
+    "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "12",
+}
 
 
 def _effective_env(items: dict[str, dict], deployment: dict) -> dict[str, str | None]:
@@ -161,14 +174,8 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     assert ingress_env["GPU_FAULT_PROCESSOR_FAULT_ADMISSION_BATCH_SIZE"] == "64"
     assert ingress_env["GPU_FAULT_PROCESSOR_FAULT_ADMISSION_PROJECTION_MARGIN"] == "0"
     assert ingress_env["GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_BATCH_SIZE"] == "32"
-    # The admission flush caps are site-wide and divided among the ingress
-    # processes (3 replicas x 4 workers); no per-process group literal remains.
-    assert ingress_env["GPU_FAULT_INGRESS_WRITER_PROCESSES"] == "12"
-    assert ingress_env["GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY"] == "24"
-    assert ingress_env["GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY"] == "24"
-    assert (
-        ingress_env["GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY"] == "12"
-    )
+    for name, value in FLUSH_RANGE_LITERALS.items():
+        assert ingress_env[name] == value, name
     assert (
         ingress_env["GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_MAX_SECONDS"] == "0.05"
     )

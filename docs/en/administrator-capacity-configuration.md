@@ -26,11 +26,13 @@ Administrators can currently configure:
 - Processor total queue, single-cluster queue, client backoff, persistent retry, completed record retention and the
   ingress's routine admission batch delay (`admissionBatchDelaySeconds`, 0..0.5 s, default 0.002; the default is
   omitted from records and YAML so live digests do not move, see §4.6);
-- The site-wide caps on concurrent ingress admission flushes (`admissionFlushConcurrency` /
-  `faultAdmissionFlushConcurrency` / `evidenceAdmissionFlushConcurrency`, 1..1024 each, defaults 24/24/12, shared by
-  the 3 api-ha replicas x 4 processes so each process takes ceil(cap/12) in-flight flushes) and the adaptive cap of the
-  batch delay (`admissionBatchDelayMaxSeconds`, 0..0.5 s, default 0.05); the defaults of all four are likewise omitted
-  from records and YAML, see §4.6;
+- The site-wide range of concurrent ingress admission flushes: the ceilings `admissionFlushConcurrency` /
+  `faultAdmissionFlushConcurrency` / `evidenceAdmissionFlushConcurrency` (1..1024 each, defaults 192/96/24) and the
+  floors `admissionFlushConcurrencyFloor` / `faultAdmissionFlushConcurrencyFloor` /
+  `evidenceAdmissionFlushConcurrencyFloor` (1..1024 each, defaults 48/24/12, each at most its ceiling), shared by the
+  3 api-ha replicas x 4 processes so each process takes ceil(value/12) of both and moves its in-flight flush count
+  between them on flush latency; and the adaptive cap of the batch delay (`admissionBatchDelayMaxSeconds`, 0..0.5 s,
+  default 0.05); the defaults of all seven are likewise omitted from records and YAML, see §4.6;
 - Workflow scan period and dispatcher thread count;
 - Notification batch size and maximum attempts;
 - Raw evidence retention hours and per-node record cap.
@@ -269,26 +271,54 @@ the default, so the default is not changed silently. With the ingress's routine 
 field rolls the three roles (the processor section is part of every role digest) through the same audit and rollback
 path as any other field.
 
-Admission flush concurrency caps: `processor.admissionFlushConcurrency` (routine telemetry, default 24),
-`faultAdmissionFlushConcurrency` (the P0 fault tier, default 24) and `evidenceAdmissionFlushConcurrency` (the evidence
-tier, default 12) are **site-wide** caps -- how many admission INSERT transactions all api-ha processes together may run
-against `gpu_fault_processor_queue` at once. The renderer ships the caps together with the divisor
-(`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_FLUSH_CONCURRENCY` and the ingress's
-`GPU_FAULT_INGRESS_WRITER_PROCESSES` = 3 replicas x 4 processes = 12); each process takes `ceil(cap / 12)` in-flight
-flush slots (2/2/1 by default; a cap that does not divide takes effect as the rounded-up fleet total), and no
-per-process `*_ADMISSION_BATCH_GROUPS` literal is rendered any more. The caps used to be per-process literals (16 + 8 + 4):
-up to 336 concurrent INSERT transactions from 12 processes on one table, and the perf suite's integrated-32 r1 turned
-the first 30-65 s of its load phase into a convoy of 134-182 concurrent queue INSERTs with 85% of active statements
-waiting on `LWLock:BufferContent`, inside which a P0 request's own INSERT reached its 30 s deadline (503). The fault tier
-has its own cap, and its own batcher and Store I/O threads inside each process, so a telemetry burst never takes a
-fault slot; the depth reserve (`GPU_FAULT_PROCESSOR_FAULT_RESERVED_*`) keeps its semantics. The recommended site values
-are the defaults. The adaptive cap of the batch delay, `admissionBatchDelayMaxSeconds` (default 0.05, 0..0.5): once
+Admission flush concurrency range: `processor.admissionFlushConcurrency` (routine telemetry, default 192),
+`faultAdmissionFlushConcurrency` (the P0 fault tier, default 96) and `evidenceAdmissionFlushConcurrency` (the evidence
+tier, default 24) are **site-wide ceilings** -- the most admission INSERT transactions all api-ha processes together may
+run against `gpu_fault_processor_queue` at once; `admissionFlushConcurrencyFloor` / `faultAdmissionFlushConcurrencyFloor`
+/ `evidenceAdmissionFlushConcurrencyFloor` (defaults 48/24/12, validated to be at most their ceilings) are the **floors**
+every process starts at and runs at under moderate load. The renderer ships both ends together with the divisor
+(`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_FLUSH_CONCURRENCY{,_FLOOR}` and the ingress's
+`GPU_FAULT_INGRESS_WRITER_PROCESSES` = 3 replicas x 4 processes = 12); each process takes `ceil(value / 12)` of each
+(floors 4/2/1 and ceilings 16/8/2 by default; a value that does not divide takes effect as the rounded-up fleet total),
+and no per-process `*_ADMISSION_BATCH_GROUPS` literal is rendered any more (an explicit GROUPS value still pins both
+ends per process). A controller inside each process (`app/admission_concurrency.py`) decides on every dispatch pass:
+while the batcher is saturated (every slot busy, work still queued) and the flush-duration EWMA is below the open
+threshold (`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_FLUSH_CONCURRENCY_OPEN_SECONDS`, default 1.0 s) it opens
+one more slot per completed flush, so a process climbs from the floor to the ceiling within a few hundred milliseconds;
+once the EWMA passes the close threshold (`..._CLOSE_SECONDS`, default 2.0 s) and a generation of flushes has completed
+at the current level it halves the headroom above the floor (additive increase, multiplicative decrease); between the
+thresholds it holds; and when the limit stops binding (slots idle) it gives back one slot per generation, so a burst
+that has passed leaves the process at the floor and an idle site never holds more concurrency than the floor. The
+arrival-time deadline projection counts the slot wait in rounds of the concurrency the controller is **about to open**
+(the ceiling while the EWMA is below the open threshold, the live limit otherwise), so capacity that is opening is not
+counted as missing. `/metrics` exports `gpu_fault_processor_{,fault_,evidence_}admission_batch_in_flight_limit` (the
+live value) and `..._in_flight_limit_raised_total` / `..._lowered_total`.
+
+Where the numbers come from (this site's integrated-32 perf suite, undated): the caps used to be per-process literals
+(16 + 8 + 4), up to 336 concurrent INSERT transactions from 12 processes on one table, and the first 30-65 s of the load
+phase became a convoy of 134-182 concurrent queue INSERTs with 85% of active statements waiting on
+`LWLock:BufferContent`, inside which a P0 request's own INSERT reached its 30 s deadline (503) -- the amplifier was the
+v21 wakeup probe's cached plan, fixed by schema v22. A fixed site-wide cap of 24 (2 per process) then traded the convoy
+for shed telemetry: every process sat at its cap for the whole load phase, 762-801 entries queued per process, 4,601
+requests expired in the queue (18.7% reserved 503s for routine telemetry against a 2% budget), 517 req/s, 0.59 s per
+16-item flush. The same site calibrated at 96/48 (8/4 per process): 1,051 req/s, zero reserved 503s, zero P0 503s, 81 ms
+per flush, 60-69 entries queued per process at the peak, 1% `BufferContent` waits (30% before), a peak of 113 active
+statements for about 5 s (147 before) -- so the 0.59 s was queueing, not the store -- yet `in_flight_max` still equalled
+the limit of 8 on every process at 2.5 items per flush, while this site reached 1,428-1,542 req/s before any site-wide
+cap existed (16 slots per process = 192). Hence the default ceiling returns to 192 (16 per process; v22 removed the reason
+192 concurrent flushes convoyed), the fault tier gets 96 (its flushes slowed under the drained telemetry load), and the
+controller closes slots only when flush latency actually climbs: the thresholds are ~12x and ~25x the uncontended 81 ms,
+above the under-capacity regime that must open (0.59 s) and at the convoy regime that must close (2.2-3.6 s before
+v22). The fault tier has its own range, and its own batcher and Store I/O threads inside each process, so a telemetry
+burst never takes a fault slot; the depth reserve (`GPU_FAULT_PROCESSOR_FAULT_RESERVED_*`) keeps its semantics. The
+recommended site values are the defaults; the acceptance target for the default configuration is this site's historical
+1,400+ req/s with zero reserved 503s and zero P0 503s. The adaptive cap of the batch delay, `admissionBatchDelayMaxSeconds` (default 0.05, 0..0.5): once
 the flush-duration EWMA passes 100 ms the batcher raises the coalescing window linearly from `admissionBatchDelaySeconds`
 toward this cap (fully at an EWMA of 200 ms) and lets it fall back as the store recovers; a cap at or below the base
 delay switches the adaptation off (the runtime takes the larger of the two, so raising the base alone stays valid). The
 convoy's amplifier -- the v21 wakeup trigger's `NOT EXISTS` anti-join, whose plan a backend cached while the queue was
 empty as a hash over the whole backlog (a 10-row INSERT read 49k pages in 250-320 ms until autoanalyze replaced the
-plan) -- is fixed by schema v22 (Detailed Design §3.1.3). The defaults of all four fields are omitted from records and
+plan) -- is fixed by schema v22 (Detailed Design §3.1.3). The defaults of all seven fields are omitted from records and
 YAML (live digests do not move); a change rolls the three roles as well.
 
 ### 4.7 PostgreSQL Connection Budget
@@ -340,9 +370,12 @@ spec:
     completedRetentionSeconds: 600
     admissionBatchDelaySeconds: 0.002
     admissionBatchDelayMaxSeconds: 0.05
-    admissionFlushConcurrency: 24
-    faultAdmissionFlushConcurrency: 24
-    evidenceAdmissionFlushConcurrency: 12
+    admissionFlushConcurrency: 192
+    admissionFlushConcurrencyFloor: 48
+    faultAdmissionFlushConcurrency: 96
+    faultAdmissionFlushConcurrencyFloor: 24
+    evidenceAdmissionFlushConcurrency: 24
+    evidenceAdmissionFlushConcurrencyFloor: 12
   workflow:
     pollIntervalSeconds: 5
     dispatcherWorkers: 8

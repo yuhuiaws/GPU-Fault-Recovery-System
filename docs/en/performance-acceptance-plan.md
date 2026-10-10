@@ -1296,9 +1296,23 @@ small and cannot explain second-level latency.
    transactions 3-5x at the cost of at most the delay in added acceptance latency. The window is
    adaptive now: once the flush-duration EWMA passes 100 ms it rises to
    `spec.processor.admissionBatchDelayMaxSeconds` (default 0.05) and falls back as the store
-   recovers, so an A/B only compares the base delay; the site-wide caps on concurrent admission
-   flushes (`admissionFlushConcurrency` and friends, defaults 24/24/12 shared by the 12 ingress
-   processes) are in Administrator Capacity Configuration §4.6.
+   recovers, so an A/B only compares the base delay. The site-wide range of concurrent admission
+   flushes (ceilings `admissionFlushConcurrency` and friends, defaults 192/96/24; floors
+   `admissionFlushConcurrencyFloor` and friends, defaults 48/24/12; shared by the 12 ingress
+   processes, each of which opens one slot per completed flush while saturated with a flush EWMA
+   below 1.0 s and halves its headroom above 2.0 s) is in Administrator Capacity Configuration
+   §4.6. Calibration on this site: a fixed cap of 24 (2 per process) ran integrated-32 at 517 req/s
+   with an 18.7% reserved-503 share for routine telemetry (4,601 requests expired in the queue,
+   762-801 queued per process, 0.59 s per flush); 96/48 gave 1,051 req/s, zero reserved 503s and
+   zero P0 503s, 81 ms per flush and 1% `BufferContent`, but `in_flight_max` still equalled the
+   limit of 8 on every process, while this site reached 1,428-1,542 req/s before any site-wide cap
+   existed (16 slots per process). The acceptance target for the default configuration is therefore
+   1,400+ req/s with zero reserved 503s and zero P0 503s; when reviewing a run read
+   `gpu_fault_processor_admission_batch_in_flight_limit` (below the per-process ceiling of 16,
+   otherwise the ceiling is still the bottleneck), `..._in_flight_limit_raised_total` /
+   `..._lowered_total` and `..._expired_total` (must be 0), plus the peak active statement count and
+   the `BufferContent` share in the `pg_stat_activity` samples (the controller's only legitimate
+   reason to close slots is flush latency actually climbing).
 7. **Distinguish cold and warm connection SLOs.** Cold results include TCP/TLS setup, warm results
    measure steady-state service capability; both must be saved, and warm results must not replace
    the public/NLB first-request threshold.

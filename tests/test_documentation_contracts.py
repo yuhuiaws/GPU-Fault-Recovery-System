@@ -714,6 +714,72 @@ def test_overview_deployment_snapshot_uses_local_native_svg() -> None:
     } <= identifiers, "diagram omits a core deployment boundary or component"
 
 
+CURRENT_SCHEMA_MARKERS = ("当前", "目前", "现行", "currently", "current", "Current")
+SCHEMA_ANCHORS = ("PostgreSQL schema", "LATEST_POSTGRES_SCHEMA_VERSION")
+VERSION_TOKEN = re.compile(r"\bv(\d{1,2})\b")
+
+
+def _current_postgres_schema_statements() -> list[tuple[str, int, int]]:
+    """Every doc line that states which PostgreSQL schema version is current.
+
+    A line qualifies when it names the PostgreSQL schema (or the constant that
+    defines its version) and says it is the current one; the version it
+    claims is the first ``v<N>`` after the later of the two phrases, so a
+    following range such as ``v12-v14`` is not mistaken for the claim. Other
+    schemas (the release manifest, the cleanup journal) are not matched.
+    """
+
+    statements: list[tuple[str, int, int]] = []
+    for path in sorted(DOCS.rglob("*.md")):
+        relative = path.relative_to(ROOT).as_posix()
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            anchors = [line.find(anchor) for anchor in SCHEMA_ANCHORS]
+            markers = [line.find(marker) for marker in CURRENT_SCHEMA_MARKERS]
+            if max(anchors) < 0 or max(markers) < 0:
+                continue
+            start = max(
+                min(index for index in anchors if index >= 0),
+                min(index for index in markers if index >= 0),
+            )
+            match = VERSION_TOKEN.search(line, start)
+            if match is None:
+                continue
+            statements.append((relative, number, int(match.group(1))))
+    return statements
+
+
+def test_docs_name_the_current_postgres_schema_version_correctly() -> None:
+    """The ops guides said the schema baseline was v14 eight versions later.
+
+    Any sentence that calls a PostgreSQL schema version the current one must
+    agree with ``schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION``; the two
+    administrator operations guides and the two parameter references are
+    required to carry such a statement so the guard cannot silently stop
+    guarding.
+    """
+
+    from gpu_fault.schema_migrations import LATEST_POSTGRES_SCHEMA_VERSION
+
+    statements = _current_postgres_schema_statements()
+    stale = [
+        f"{path}:{line} says v{version}"
+        for path, line, version in statements
+        if version != LATEST_POSTGRES_SCHEMA_VERSION
+    ]
+    assert not stale, (
+        f"documents disagree with LATEST_POSTGRES_SCHEMA_VERSION="
+        f"{LATEST_POSTGRES_SCHEMA_VERSION}: {stale}"
+    )
+    covered = {path for path, _, _ in statements}
+    for required in (
+        "docs/管理员日常运维.md",
+        "docs/en/administrator-operations.md",
+        "docs/安全与参数参考.md",
+        "docs/en/security-and-parameters-reference.md",
+    ):
+        assert required in covered, f"{required} no longer states the current version"
+
+
 def test_html_build_uses_the_current_authoritative_document_set() -> None:
     builder = (ROOT / "build-html.sh").read_text(encoding="utf-8")
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")

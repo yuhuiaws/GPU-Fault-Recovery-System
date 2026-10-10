@@ -68,17 +68,16 @@ PROCESSOR_POOL_ENV = (
 
 SENSITIVE_ENV = re.compile(r"(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY)")
 DEFAULT_ADMIN_CONFIG = default_admin_config()
-# Site-wide admission flush caps (spec.processor.*AdmissionFlushConcurrency):
-# admin config field -> the literal every role carries and the ingress divides
-# by GPU_FAULT_INGRESS_WRITER_PROCESSES; renderer_admin_config reads them back.
+# Site-wide admission flush ranges (spec.processor.*AdmissionFlushConcurrency
+# is the ceiling, *AdmissionFlushConcurrencyFloor the floor): admin config
+# field -> the literal every role carries and the ingress divides by
+# GPU_FAULT_INGRESS_WRITER_PROCESSES; renderer_admin_config reads them back.
 PROCESSOR_FLUSH_CAPS = {
-    "admission_flush_concurrency": "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY",
-    "fault_admission_flush_concurrency": (
-        "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY"
-    ),
-    "evidence_admission_flush_concurrency": (
-        "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY"
-    ),
+    f"{tier}admission_flush_concurrency{suffix}": (
+        f"GPU_FAULT_PROCESSOR_{tier.upper()}ADMISSION_FLUSH_CONCURRENCY{suffix.upper()}"
+    )
+    for tier in ("", "fault_", "evidence_")
+    for suffix in ("", "_floor")
 }
 
 # Four uvicorn processes per Pod on the ingress and control-worker tiers

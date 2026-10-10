@@ -641,22 +641,7 @@ class AdmissionRuntimeFactory:
         label="processor admission",
     ):
         base = "GPU_FAULT_PROCESSOR_"
-        # In-flight flushes for this process: the explicit per-process value
-        # when set, else this process's share of the site-wide cap the admin
-        # config renders (``flush_slots_per_process``), else the historical
-        # per-process default. The site-wide form is what the regional
-        # ingress runs: a per-process literal on 12 processes was 192
-        # concurrent routine admission INSERTs on one table.
-        explicit_groups = os.getenv(f"{base}{prefix}ADMISSION_BATCH_GROUPS")
-        site_flush_cap = os.getenv(f"{base}{prefix}ADMISSION_FLUSH_CONCURRENCY")
-        if explicit_groups is not None:
-            flush_groups = int(explicit_groups)
-        elif site_flush_cap is not None:
-            flush_groups = flush_slots_per_process(
-                int(site_flush_cap), writer_processes
-            )
-        else:
-            flush_groups = int(groups)
+        floor, ceiling = self._flush_slot_range(prefix, groups, writer_processes)
         delay = float(
             os.getenv(f"{base}{prefix}ADMISSION_BATCH_DELAY_SECONDS", "0.002")
         )
@@ -670,7 +655,24 @@ class AdmissionRuntimeFactory:
             executor,
             **common,
             max_batch_size=int(os.getenv(f"{base}{prefix}ADMISSION_BATCH_SIZE", size)),
-            max_flush_groups=flush_groups,
+            max_flush_groups=ceiling,
+            min_flush_groups=floor,
+            # The flush-latency EWMA band the controller moves the limit in:
+            # it opens slots below the first value and closes them above the
+            # second. Sized from the live site: 81 ms per flush uncontended,
+            # 0.59 s when a fixed cap of 2 per process queued 16-item batches
+            # (under-capacity, which must open), 2.2-3.6 s inside the
+            # pre-v22 convoy (contention, which must close).
+            flush_open_below_seconds=float(
+                os.getenv(
+                    f"{base}{prefix}ADMISSION_FLUSH_CONCURRENCY_OPEN_SECONDS", "1.0"
+                )
+            ),
+            flush_close_above_seconds=float(
+                os.getenv(
+                    f"{base}{prefix}ADMISSION_FLUSH_CONCURRENCY_CLOSE_SECONDS", "2.0"
+                )
+            ),
             flush_delay_seconds=delay,
             flush_delay_max_seconds=max(delay, delay_cap),
             projection_margin=float(
@@ -681,6 +683,45 @@ class AdmissionRuntimeFactory:
             ),
             label=label,
         )
+
+    @staticmethod
+    def _flush_slot_range(
+        prefix: str, groups: str, writer_processes: int
+    ) -> tuple[int, int]:
+        """This process's floor and ceiling on concurrent admission flushes.
+
+        An explicit per-process ``*_ADMISSION_BATCH_GROUPS`` pins both (a
+        fixed limit, the pre-batch-48 contract); otherwise the admin config's
+        site-wide ceiling ``*_ADMISSION_FLUSH_CONCURRENCY`` and floor
+        ``*_ADMISSION_FLUSH_CONCURRENCY_FLOOR`` are each divided among the
+        ingress processes (``flush_slots_per_process``), and a ceiling
+        rendered without a floor is a fixed limit too; a bare process keeps
+        the historical per-process default. The regional ingress runs the
+        site-wide form: a per-process literal on 12 processes was 192
+        concurrent routine admission INSERTs on one table, and a fixed 2 per
+        process was a load start that expired 4,601 requests in the queue.
+        """
+
+        base = f"GPU_FAULT_PROCESSOR_{prefix}ADMISSION_"
+        explicit_groups = os.getenv(f"{base}BATCH_GROUPS")
+        site_ceiling = os.getenv(f"{base}FLUSH_CONCURRENCY")
+        site_floor = os.getenv(f"{base}FLUSH_CONCURRENCY_FLOOR")
+        if explicit_groups is not None:
+            return int(explicit_groups), int(explicit_groups)
+        if site_ceiling is None:
+            if site_floor is not None:
+                raise RuntimeError(
+                    f"{base}FLUSH_CONCURRENCY_FLOOR requires {base}FLUSH_CONCURRENCY"
+                )
+            return int(groups), int(groups)
+        ceiling = flush_slots_per_process(int(site_ceiling), writer_processes)
+        if site_floor is None:
+            return ceiling, ceiling
+        if int(site_floor) > int(site_ceiling):
+            raise RuntimeError(
+                f"{base}FLUSH_CONCURRENCY_FLOOR cannot exceed {base}FLUSH_CONCURRENCY"
+            )
+        return flush_slots_per_process(int(site_floor), writer_processes), ceiling
 
     @staticmethod
     def _decode_json_body(max_bytes: int):

@@ -1941,13 +1941,31 @@ Completion is still one transaction per cluster; different clusters can run in p
 admission batch delay `GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_SECONDS` comes from the AdminConfig field
 `spec.processor.admissionBatchDelaySeconds` (default 0.002, omitted from records while at the default; the fault and
 evidence batch delays keep their own 2 ms literals; see Administrator Capacity Configuration §1 and §4.6). Concurrent
-admission flushes are capped site-wide by `spec.processor.admissionFlushConcurrency` /
-`faultAdmissionFlushConcurrency` / `evidenceAdmissionFlushConcurrency` (defaults 24/24/12), rendered as
-`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_FLUSH_CONCURRENCY`; the ingress divides them by
-`GPU_FAULT_INGRESS_WRITER_PROCESSES` (3 replicas x 4 processes = 12) into `ceil(cap/12)` in-flight flushes per process
-(an explicit `*_ADMISSION_BATCH_GROUPS` still overrides per process); the coalescing window rises to
+admission flushes run in a site-wide range: the ceilings `spec.processor.admissionFlushConcurrency` /
+`faultAdmissionFlushConcurrency` / `evidenceAdmissionFlushConcurrency` (defaults 192/96/24) and the floors
+`admissionFlushConcurrencyFloor` / `faultAdmissionFlushConcurrencyFloor` / `evidenceAdmissionFlushConcurrencyFloor`
+(defaults 48/24/12, validated floor <= ceiling), rendered as
+`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_FLUSH_CONCURRENCY{,_FLOOR}`; the ingress divides each by
+`GPU_FAULT_INGRESS_WRITER_PROCESSES` (3 replicas x 4 processes = 12) into `ceil(value/12)` per process (an explicit
+`*_ADMISSION_BATCH_GROUPS` still pins both ends per process). Inside each process
+`app/admission_concurrency.py::FlushConcurrencyController` is asked by the dispatcher on every pass: saturated (every
+slot busy, work still queued) with a flush-duration EWMA below `..._ADMISSION_FLUSH_CONCURRENCY_OPEN_SECONDS` (default
+1.0) opens one slot per completed flush (floor to ceiling within a few hundred milliseconds); an EWMA above
+`..._CLOSE_SECONDS` (default 2.0) after a generation of flushes at the current level (`max(3, limit)`) halves the
+headroom above the floor; between the thresholds it holds; a limit that stops binding gives back one slot per
+generation down to the floor. The arrival-time deadline projection counts the slot wait in rounds of the concurrency
+the controller is about to open (the ceiling while the EWMA is below the open threshold, the live limit otherwise), so
+capacity that is opening is not counted as missing. `/metrics`:
+`gpu_fault_processor_{,fault_,evidence_}admission_batch_in_flight_limit` (live value, summed over a Pod's processes)
+and `..._in_flight_limit_raised_total` / `..._lowered_total` (per process). The coalescing window rises to
 `admissionBatchDelayMaxSeconds` (`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_BATCH_DELAY_MAX_SECONDS`, default
-0.05) once the flush EWMA passes 100 ms.
+0.05) once the flush EWMA passes 100 ms: the window widens first (0.1-0.2 s), the concurrency keeps opening below
+1.0 s, and only above 2.0 s are slots closed. The defaults come from this site's integrated-32 calibration: a fixed cap
+of 24 (2 per process) gave 517 req/s with 4,601 requests expired in the queue (18.7% reserved 503s) at 0.59 s per flush;
+96/48 gave 1,051 req/s, zero 503s, 81 ms per flush and 1% `BufferContent`, yet `in_flight_max` still sat at the ceiling
+of 8 on every process, while the site reached 1,428-1,542 req/s before any site-wide cap existed (16 slots per
+process) -- schema v22 removed the reason 192 concurrent flushes convoyed, so the ceiling returns to 192 and the
+controller closes slots only when flush latency actually climbs.
 
 **⑩ Logs/metrics/alerts**: `processor_request_id`, `path`, `priority`, `cluster_id`,
 `lane`, `lease_owner`, `leader_epoch`, `attempt`, `response_status`,
