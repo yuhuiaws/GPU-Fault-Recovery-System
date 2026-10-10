@@ -426,12 +426,14 @@ def role_snapshot() -> dict:
             "json",
         )
     )
+
+    def _http_port(item: dict[str, Any]) -> int:
+        ports = item["spec"]["template"]["spec"]["containers"][0]["ports"]
+        named = [port for port in ports if port.get("name") == "http"]
+        return int((named[0] if named else ports[0])["containerPort"])
+
     ports = {
-        item["metadata"]["name"]: int(
-            item["spec"]["template"]["spec"]["containers"][0]["ports"][0][
-                "containerPort"
-            ]
-        )
+        item["metadata"]["name"]: _http_port(item)
         for item in deployments.get("items", [])
     }
     script = """

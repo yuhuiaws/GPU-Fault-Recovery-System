@@ -148,7 +148,11 @@ def api_replica_registry_health(
             continue
         containers = (item.get("spec") or {}).get("containers") or [{}]
         ports = containers[0].get("ports") or [{}]
-        port = int(ports[0].get("containerPort") or 8080)
+        # The request socket is the containerPort named ``http``; since the
+        # ingress also exposes its dedicated liveness listener (``livez``,
+        # listed first), the first port is no longer the service port.
+        named = [p for p in ports if p.get("name") == "http"]
+        port = int((named[0] if named else ports[0]).get("containerPort") or 8080)
         output = control(
             "exec", "-i", name, "--", "python3", "-c", HEALTHZ_CLIENT, str(port)
         )

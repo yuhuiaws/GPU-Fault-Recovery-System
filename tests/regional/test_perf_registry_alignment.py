@@ -105,7 +105,17 @@ class ControlPlane:
                                 },
                                 "status": {"phase": "Running"},
                                 "spec": {
-                                    "containers": [{"ports": [{"containerPort": 8080}]}]
+                                    "containers": [
+                                        {
+                                            "ports": [
+                                                {
+                                                    "name": "livez",
+                                                    "containerPort": 8090,
+                                                },
+                                                {"name": "http", "containerPort": 8080},
+                                            ]
+                                        }
+                                    ]
                                 },
                             }
                             for name in sorted(self.drift)
