@@ -209,15 +209,17 @@ spec:
               - -c
               - sleep 20
         livenessProbe:
-          failureThreshold: 2
+          failureThreshold: 3
           httpGet:
             path: /livez
-            port: 8081
+            port: 8091
           initialDelaySeconds: 10
-          periodSeconds: 5
-          timeoutSeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 10
         name: control-worker
         ports:
+        - containerPort: 8091
+          name: livez
         - containerPort: 8081
           name: http
         readinessProbe:

@@ -195,6 +195,13 @@ _MAX = (
     "gpu_fault_regional_registry_refresh_error",
     "gpu_fault_regional_registry_secret_drift",
     "gpu_fault_spare_reservations_active",
+    # Process health (process_health.py): the longest GC pause anywhere in the
+    # Pod; the accept queue of the listening socket every uvicorn worker in
+    # the Pod shares, so a sum would count the same connections four times;
+    # the namespace's somaxconn, one value per Pod.
+    "gpu_fault_gc_collection_seconds_max",
+    "gpu_fault_listen_accept_queue_connections",
+    "gpu_fault_listen_somaxconn",
 )
 
 # "Healthy/running/connected" flags: any unhealthy process makes the Pod
@@ -226,6 +233,12 @@ _PER_PROCESS = (
     "gpu_fault_control_record_archive_errors_total",
     "gpu_fault_control_record_archive_withheld_total",
     "gpu_fault_event_loop_lag_seconds",
+    # Per process: a Pod's memory is the sum of its processes in PromQL, and
+    # one bloated process must stay visible; GC counters are reset domains.
+    "gpu_fault_gc_collection_seconds_total",
+    "gpu_fault_gc_collections_total",
+    "gpu_fault_gc_frozen_objects",
+    "gpu_fault_process_resident_memory_bytes",
     "gpu_fault_gpu_findings_without_incident_total",
     "gpu_fault_hardware_escalation_chain_terminated_total",
     "gpu_fault_hardware_escalation_containment_refused_total",

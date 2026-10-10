@@ -17,6 +17,7 @@ from gpu_fault.app.lifespan_workers import (
     start_regional_registry_worker,
     start_spool_threads,
 )
+from gpu_fault.app.process_health import apply_startup_gc_policy
 from gpu_fault.app.runtime import EventLoopLag
 from gpu_fault.lifecycle import ShutdownCoordinator
 
@@ -54,6 +55,31 @@ class LifespanDependencies:
     # publisher; takes the FastAPI app because the runtime is attached to
     # ``app.state`` after the lifespan is built.
     process_metrics_render: Callable[[Any], list[str]] | None = None
+    # ``liveness.LivenessListener`` when GPU_FAULT_LIVENESS_PORT is set: the
+    # kubelet's probe gets a listener the main port's accept queue cannot
+    # delay. Started last, so a probe that is answered means the process is
+    # fully up; closed first on shutdown.
+    liveness_listener: Any | None = None
+
+
+async def _complete_startup(dependencies: LifespanDependencies) -> None:
+    """The last two start-up steps, once every long-lived object exists.
+
+    The liveness listener opens last, so an answered probe means the process
+    is fully up; then the start-up heap is frozen out of the collector's way
+    (``GPU_FAULT_GC_FREEZE_AFTER_STARTUP``, see ``process_health``).
+    """
+
+    if dependencies.liveness_listener is not None:
+        await dependencies.liveness_listener.start()
+    apply_startup_gc_policy()
+
+
+async def _close_liveness(dependencies: LifespanDependencies) -> None:
+    """Stop answering probes first; the kubelet has already decided."""
+
+    if dependencies.liveness_listener is not None:
+        await dependencies.liveness_listener.close()
 
 
 def create_lifespan(dependencies: LifespanDependencies):
@@ -194,11 +220,13 @@ def create_lifespan(dependencies: LifespanDependencies):
                 os.getpid(),
                 thread_dump_signal,
             )
+        await _complete_startup(dependencies)
         try:
             yield
         finally:
             shutdown = ShutdownCoordinator(lifespan_shutdown_max_seconds)
 
+            await _close_liveness(dependencies)
             event_loop_lag_task.cancel()
             try:
                 await event_loop_lag_task

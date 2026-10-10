@@ -74,6 +74,11 @@ Supported entry points:
 - `capture_processor_inflight.py`: optional in-flight sampling attached to a
   suite artifact directory.
 - `control_plane_capacity_probe.py`: control-plane capacity probe helper.
+- `ingress_event_loop_burst.py`: local-only reproduction of the ingress liveness
+  kill under a cold-connect burst - the real application in the rendered ingress
+  environment under uvicorn's production flags, a CPU-burning flush stub, a
+  kubelet-like `/livez` prober and per-process samplers (event-loop lag, GIL
+  wait, GC pauses, RSS, accept queue). It touches no cluster and no database.
 
 `payload-templates.json` and the three benchmark modules selected by
 `regional_capacity_suite.py` are implementation inputs, not standalone entry

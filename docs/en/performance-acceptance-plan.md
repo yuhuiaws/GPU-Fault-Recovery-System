@@ -381,6 +381,9 @@ same concurrency topology.
 - No destructive step is executed twice after an Aurora writer failover.
 - Old and new replicas are protocol-compatible during a rolling upgrade, and a failure before finalize can roll back.
 - Module digest drift on any replica invalidates the round's results.
+- A cold-connect burst (a new connection per request, thousands concurrent per Pod) that is accepted in full (all 202)
+  must not get any api-ha replica restarted by liveness: the probe answers on the dedicated `livez` port, and
+  `gpu_fault_listen_accept_queue_connections` may reach thousands while the probe latency stays at GC-pause scale.
 
 ## 7. Required Metrics
 
@@ -1332,3 +1335,20 @@ small and cannot explain second-level latency.
     layer of dispatcher, Store and Executor bottlenecks. If the business genuinely requires
     repairing more than 2 same-resource-class workflows per cluster at once, that must be approved
     jointly on multi-round capacity evidence, failure-domain risk and recovery time objectives.
+12. **A cold-connect burst exposes the accept queue, not the event loop.** The 50-cluster integrated suite (50 load
+    Pods x 256 blocking workers, cold-connect, ~1,066 concurrent connections per api-ha process) was accepted in full
+    (0 non-2xx), yet all three api-ha Pods were restarted by liveness (5 s x 2) in the middle of the burst. The local
+    reproduction (`scripts/perf/ingress_event_loop_burst.py`: the real application with the rendered ingress
+    environment, four uvicorn processes pinned to 8 cores, 50 clusters x 85 cold-connect workers, a flush stub of 0.5 ms
+    CPU + 60 ms I/O) gives the mechanism: 3,600-3,900 of the 4,250 connections sat in the kernel accept queue of the
+    service listening socket for the whole burst (550-740 inside each process), the probe connection queued in that
+    FIFO, and its latency was queue depth over accept rate (3.6 s at 1,090 req/s; 0.1 s in-app; ~11 s at the live
+    scale of 4,266 connections per Pod and 390 req/s per Pod). Hypotheses rejected: GIL starvation (32 vs 8 decode
+    threads identical; an idle thread's longest GIL wait 0.17-0.27 s, equal to the GC pause), flush slots (16 vs 8
+    identical; 2 slots cut the probe median to 94 ms because requests queued inside the process, at the price of 1,074
+    503s), GC (gen-2 pauses of 0.15-0.6 s are the longest single stall, far from 5 s). The fix: the dedicated `livez`
+    port (probe median 10 ms, max 0.61 s under the same burst), 10 s x 3 probe parameters, `gc.freeze()` (-26% GC
+    time, +7% throughput). During acceptance read `gpu_fault_listen_accept_queue_connections`, the
+    `gpu_fault_event_loop_lag_seconds` histogram and `gpu_fault_gc_collection_seconds_max`. Setting the flush stub to
+    8 ms of CPU per item (i.e. assuming the 81 ms flush is all CPU) gives 583 req/s and 43% 503s, inconsistent with the
+    live 1,175 req/s and 0 non-2xx -- the live flush's 81 ms is mostly Aurora round-trip wait.

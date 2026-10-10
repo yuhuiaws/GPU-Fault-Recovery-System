@@ -1377,3 +1377,46 @@ def test_role_split_refuses_an_unreadable_previous_container_env(tmp_path) -> No
     assert result.returncode != 0
     assert "cannot read" in result.stderr
     assert result.stdout == ""
+
+
+def test_role_split_gives_every_role_a_liveness_listener_port() -> None:
+    """Service port + 10 per role, declared as the ``livez`` containerPort,
+    probed by the liveness probe and handed to the processes as
+    ``GPU_FAULT_LIVENESS_PORT``; the start-up heap is frozen in every role.
+    The probe's timing is the regional patch's and is checked from the
+    generated manifests (tests/deploy/test_control_plane_liveness_probe.py)."""
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / "deploy/control-plane/tools/render_control_plane_role_split.py"),
+            "--json",
+        ],
+        input=json.dumps(_deployment()),
+        text=True,
+        capture_output=True,
+        check=True,
+        env={
+            "PATH": "/usr/bin:/bin",
+            "PYTHONPATH": os.environ.get("PYTHONPATH", ""),
+            "GPU_FAULT_CONTROL_WORKER_REPLICAS": "6",
+        },
+    )
+    items = {
+        item["metadata"]["name"]: item for item in json.loads(result.stdout)["items"]
+    }
+    expected = {
+        "gpu-fault-api-ha": (8080, 8090),
+        "gpu-fault-control-worker": (8081, 8091),
+        "gpu-fault-telemetry-spool-worker": (8082, 8092),
+    }
+    for name, (service_port, liveness_port) in expected.items():
+        deployment = items[name]
+        container = deployment["spec"]["template"]["spec"]["containers"][0]
+        ports = {item["name"]: item["containerPort"] for item in container["ports"]}
+        assert ports["livez"] == liveness_port, name
+        assert container["livenessProbe"]["httpGet"]["port"] == liveness_port, name
+        assert container["readinessProbe"]["httpGet"]["port"] == service_port, name
+        env = _effective_env(items, deployment)
+        assert env["GPU_FAULT_LIVENESS_PORT"] == str(liveness_port), name
+        assert env["GPU_FAULT_GC_FREEZE_AFTER_STARTUP"] == "true", name

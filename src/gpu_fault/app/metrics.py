@@ -43,6 +43,7 @@ from gpu_fault.app.metrics_sections import (
     render_spool_metrics_one,
     render_spool_metrics_two,
 )
+from gpu_fault.app.process_health import render_process_health_metrics
 from gpu_fault.app.runtime import AppRuntime
 from gpu_fault.store.contracts import ProcessorQueueStats
 
@@ -100,6 +101,34 @@ def _processor_cluster_queue_lines(queue: ProcessorQueueStats) -> list[str]:
     return lines
 
 
+def _event_loop_lag_lines(
+    app_runtime: AppRuntime, count: int, total: float, maximum: float
+) -> list[str]:
+    """The lag histogram (``_max`` kept) and the process-health families."""
+
+    lines = [
+        "# HELP gpu_fault_event_loop_lag_seconds Observed event-loop scheduling "
+        "lag (0.5 s monitor; a gen-2 GC pause is 0.15-0.6 s, a liveness probe "
+        "dies at its timeoutSeconds).",
+        "# TYPE gpu_fault_event_loop_lag_seconds histogram",
+    ]
+    histogram = app_runtime.event_loop_lag_histogram
+    for bound, cumulative in histogram() if histogram is not None else []:
+        lines.append(
+            f'gpu_fault_event_loop_lag_seconds_bucket{{le="{bound:g}"}} {cumulative}'
+        )
+    lines.extend(
+        [
+            f'gpu_fault_event_loop_lag_seconds_bucket{{le="+Inf"}} {count}',
+            f"gpu_fault_event_loop_lag_seconds_sum {total:.6f}",
+            f"gpu_fault_event_loop_lag_seconds_count {count}",
+            f"gpu_fault_event_loop_lag_seconds_max {maximum:.6f}",
+        ]
+    )
+    render_process_health_metrics(lines)
+    return lines
+
+
 def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
     """Render this replica's own /metrics families, then the contributors.
 
@@ -150,11 +179,9 @@ def render_prometheus_metrics(app_runtime: AppRuntime) -> list[str]:
         "# HELP gpu_fault_processor_queue_depth Incomplete processor requests.",
         "# TYPE gpu_fault_processor_queue_depth gauge",
         f"gpu_fault_processor_queue_depth {queue['depth']}",
-        "# HELP gpu_fault_event_loop_lag_seconds Observed event-loop scheduling lag.",
-        "# TYPE gpu_fault_event_loop_lag_seconds summary",
-        f"gpu_fault_event_loop_lag_seconds_sum {event_loop_lag_sum:.6f}",
-        f"gpu_fault_event_loop_lag_seconds_count {event_loop_lag_count}",
-        f"gpu_fault_event_loop_lag_seconds_max {event_loop_lag_max:.6f}",
+        *_event_loop_lag_lines(
+            app_runtime, event_loop_lag_count, event_loop_lag_sum, event_loop_lag_max
+        ),
         "# HELP gpu_fault_processor_queue_oldest_age_seconds "
         "Age of the oldest incomplete processor request.",
         "# TYPE gpu_fault_processor_queue_oldest_age_seconds gauge",

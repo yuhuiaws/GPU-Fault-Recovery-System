@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
@@ -42,6 +43,11 @@ from gpu_fault.app.ingest import (
 from gpu_fault.app.lifespan import (
     LifespanDependencies,
     create_lifespan,
+)
+from gpu_fault.app.liveness import (
+    LivenessListener,
+    liveness_port_from_environment,
+    liveness_report,
 )
 from gpu_fault.app.metric_scan_cache import MetricScanCache
 from gpu_fault.app.metrics import (
@@ -384,6 +390,7 @@ def _configure_service_runtime(
         owner_id=(_pod_process_owner() or f"collector-metrics:{os.getpid()}"),
         enabled=service_role in {"all", "ingress"},
     )
+    liveness_listener = _liveness_listener(service_role, processor)
     lifespan = create_lifespan(
         LifespanDependencies(
             context=ctx,
@@ -412,6 +419,7 @@ def _configure_service_runtime(
             collector_metrics_snapshot=collector_metrics_snapshot,
             regional_registry_runtime=regional_auth_registry,
             process_metrics_render=process_local_metric_lines,
+            liveness_listener=liveness_listener,
         )
     )
     # Long-poll claim wakeups (``remote_command_wakeups.py``): one lazily
@@ -434,6 +442,26 @@ def _configure_service_runtime(
         lifespan,
         local_processor_diagnostics,
         remote_command_wakeups,
+        liveness_listener,
+    )
+
+
+def _liveness_listener(service_role: str, processor: Any) -> LivenessListener | None:
+    """The kubelet's liveness probe gets a per-process listener of its own.
+
+    Bound with SO_REUSEPORT across the Pod's uvicorn workers so a cold-connect
+    storm queued on the main socket cannot delay the probe; same verdict as
+    ``/livez`` (``gpu_fault.app.liveness``). ``None`` when the port is unset.
+    """
+
+    port = liveness_port_from_environment()
+    if not port:
+        return None
+    return LivenessListener(
+        port=port,
+        report=lambda: liveness_report(
+            service_role=service_role, processor=processor, environment=os.environ
+        ),
     )
 
 
@@ -642,6 +670,7 @@ def _install_core_routes(
         collector_metrics_snapshot=collector_metrics_snapshot,
         metric_scan_cache=MetricScanCache(ctx.store),
         decode_rejections=admission.decode_rejections,
+        event_loop_lag_histogram=event_loop_lag.histogram,
     )
     app.dependency_overrides[get_app_runtime] = lambda: app_runtime
     app.include_router(metrics_router)
@@ -856,6 +885,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
         lifespan,
         local_processor_diagnostics,
         remote_command_wakeups,
+        liveness_listener,
     ) = _configure_service_runtime(
         ctx,
         processor,
@@ -901,6 +931,7 @@ def create_app(context: ApplicationContext | None = None) -> FastAPI:
     app.state.evidence_admission_batcher = evidence_admission_batcher
     app.state.telemetry_spool_batcher = telemetry_spool_batcher
     app.state.regional_registry_runtime = regional_auth_registry
+    app.state.liveness_listener = liveness_listener
     processor_paths = (
         "/v1/runtime-profiles",
         "/v1/installation-resources",

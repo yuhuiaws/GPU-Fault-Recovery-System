@@ -321,6 +321,20 @@ empty as a hash over the whole backlog (a 10-row INSERT read 49k pages in 250-32
 plan) -- is fixed by schema v22 (Detailed Design §3.1.3). The defaults of all seven fields are omitted from records and
 YAML (live digests do not move); a change rolls the three roles as well.
 
+Per-process thread counts are not the lever for liveness under a burst. In the local reproduction of the same
+50-cluster cold-connect burst (`scripts/perf/ingress_event_loop_burst.py`), 32 vs 8 decode threads and 16 vs 8 flush
+slots gave identical probe and event-loop latencies (longest stall 0.25-0.6 s, always one gen-2 GC); the mechanism of
+the kill is the service listening socket's accept queue (see the liveness section of the deployment manual). This
+configuration therefore introduces no "per-process CPU-thread budget" field and does not let the concurrency controller
+close slots on event-loop lag -- closing slots only moves the queue from inside the process to the kernel's accept queue
+(at 2 slots the probe median was 94 ms but 1,074 requests got 503), trading 503s for no shorter stall. The three related
+runtime variables are set by the renderer and are not AdminConfig fields: `GPU_FAULT_LIVENESS_PORT` (service port + 10
+per role, the dedicated liveness listener), `GPU_FAULT_GC_FREEZE_AFTER_STARTUP=true` (`gc.freeze()` at the end of
+lifespan start-up: 9.0 s -> 6.6 s of GC time per process under the same burst, +7% throughput, longest pause unchanged)
+and `GPU_FAULT_GC_GEN2_THRESHOLD` (CPython's 10 by default; raising it to 100 cut gen-2 collections from 45 to 4-5 and
+total GC time by another 30% but stretched each pause to 0.45-0.59 s -- a worse trade for an event loop, so set it only
+for an A/B).
+
 ### 4.7 PostgreSQL Connection Budget
 
 The runtime, the administrator validation and the capacity runner share

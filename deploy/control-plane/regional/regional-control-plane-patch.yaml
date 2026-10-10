@@ -18,6 +18,13 @@ spec:
               app: gpu-fault-api-ha
       containers:
         - name: api
+          ports:
+            # The liveness probe's own listener (gpu_fault.app.liveness),
+            # bound by every uvicorn worker with SO_REUSEPORT; the renderer
+            # numbers it per role (service port + 10) and sets
+            # GPU_FAULT_LIVENESS_PORT to match.
+            - name: livez
+              containerPort: 8090
           # Bounded so a queue burst cannot expand the API into the
           # node's memory and take the co-scheduled worker with it.
           resources:
@@ -200,11 +207,25 @@ spec:
           # registry, so a writer failover makes Pods NotReady (readiness stays
           # on /healthz) without restarting them into a start-up that needs
           # Aurora again.
+          #
+          # It is probed on the dedicated livez port, not the service port: a
+          # cold-connect burst the ingress was absorbing in full (0 non-2xx)
+          # kept ~3,900 of 4,250 connections waiting in the service socket's
+          # accept queue, and a probe connection in that FIFO took 3.6 s
+          # locally (in-app time 0.1 s) and past 5 s live, so 5 s x 2 killed
+          # all three Pods at once while every request was answered.
+          #
+          # 10 s x 3: the loop's longest measured stall under that burst is a
+          # gen-2 garbage collection of 0.15-0.6 s, so a 10 s timeout is an
+          # order of magnitude above a busy-but-alive process, and three
+          # misses in a row (30 s) means the event loop has not run for
+          # longer than the burst itself - a real hang, not load. Readiness
+          # keeps 5 s x 3 on the service port, where queueing is the point.
           livenessProbe:
             httpGet:
               path: /livez
-              port: http
+              port: livez
             initialDelaySeconds: 10
-            periodSeconds: 5
-            timeoutSeconds: 5
-            failureThreshold: 2
+            periodSeconds: 10
+            timeoutSeconds: 10
+            failureThreshold: 3

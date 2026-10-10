@@ -89,6 +89,15 @@ PROCESSOR_FLUSH_CAPS = {
 # ``replicas x UVICORN_WORKERS_PER_POD`` and the verifier fails the deploy
 # if a tier's command says otherwise.
 UVICORN_WORKERS_PER_POD = 4
+# The kubelet's liveness probe gets a per-process listener of its own
+# (``gpu_fault.app.liveness``), ten above the role's service port: the main
+# socket's accept queue is shared with the request storm, and a cold-connect
+# burst the ingress was absorbing in full (0 non-2xx) held ~3,900 of 4,250
+# connections in that queue, so ``/livez`` on the service port answered in
+# 3.6 s locally and past the 5 s timeout live - all three Pods restarted
+# while healthy. The probe timing itself lives in the regional patch.
+LIVENESS_PORT_OFFSET = 10
+LIVENESS_PORT_NAME = "livez"
 # The ingress tier rolls behind the NLB (IP targets): a Pod must keep serving
 # until the load balancer has stopped sending it new flows, and no old Pod may
 # leave before a new one is Ready. The preStop drain outlasts the target
@@ -388,6 +397,30 @@ def set_probe_port(container: dict, port: int) -> None:
             probe["httpGet"]["port"] = port
         if probe and "tcpSocket" in probe:
             probe["tcpSocket"]["port"] = port
+
+
+def set_liveness_port(container: dict[str, Any], port: int) -> None:
+    """Give the liveness probe the role's dedicated per-process listener.
+
+    Adds (or renumbers) the ``livez`` containerPort, points the liveness
+    probe at it and tells every uvicorn worker which port to bind
+    (``GPU_FAULT_LIVENESS_PORT``, SO_REUSEPORT across the Pod's processes).
+    Readiness and startup keep the service port: a Pod that cannot accept
+    a request promptly is exactly what readiness should report.
+    """
+
+    ports = container.setdefault("ports", [])
+    declared = next(
+        (item for item in ports if item.get("name") == LIVENESS_PORT_NAME), None
+    )
+    if declared is None:
+        ports.append({"name": LIVENESS_PORT_NAME, "containerPort": port})
+    else:
+        declared["containerPort"] = port
+    probe = container.get("livenessProbe")
+    if probe and "httpGet" in probe:
+        probe["httpGet"]["port"] = port
+    set_env(container, "GPU_FAULT_LIVENESS_PORT", str(port))
 
 
 def read_source(as_json: bool) -> dict:
@@ -856,6 +889,12 @@ def configure_base(container: dict, config: AdminConfig) -> None:
     configure_processor_retry(container)
     configure_admin_tuning(container, config)
     configure_notification_channel(container)
+    # Freeze the start-up heap out of the collector's way in every role: the
+    # 50-cluster burst reproduction measured gen-2 collections as the
+    # longest single event-loop stalls (0.15-0.6 s) and gc.freeze() took 26 %
+    # off the GC time per process without lengthening a pause
+    # (``gpu_fault.app.process_health``).
+    set_env(container, "GPU_FAULT_GC_FREEZE_AFTER_STARTUP", "true")
 
 
 def parse_options() -> tuple[argparse.Namespace, AdminConfig]:
@@ -1022,6 +1061,7 @@ def main() -> None:
         ingress=True,
     )
     set_probe_port(ingress, 8080)
+    set_liveness_port(ingress, 8080 + LIVENESS_PORT_OFFSET)
     # The control-plane EKS nodes do not allow these as pod-level unsafe
     # sysctls. deploy/control-plane/regional/control-plane-sysctl.yaml
     # applies the host values and re-applies them whenever a control-plane
@@ -1181,6 +1221,7 @@ def main() -> None:
         ingress=False,
     )
     set_probe_port(worker, 8081)
+    set_liveness_port(worker, 8081 + LIVENESS_PORT_OFFSET)
     worker["resources"] = {
         "requests": {"cpu": "3", "memory": "4Gi"},
         "limits": {"cpu": "4", "memory": "6Gi"},
@@ -1353,6 +1394,7 @@ def main() -> None:
         ingress=False,
     )
     set_probe_port(spool_worker, 8082)
+    set_liveness_port(spool_worker, 8082 + LIVENESS_PORT_OFFSET)
     spool_worker["resources"] = {
         "requests": {"cpu": "1", "memory": "2Gi"},
         "limits": {"cpu": "4", "memory": "4Gi"},

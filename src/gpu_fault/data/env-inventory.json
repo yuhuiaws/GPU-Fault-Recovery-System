@@ -31,6 +31,9 @@
     "GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS": {
       "minimum": 1
     },
+    "GPU_FAULT_GC_GEN2_THRESHOLD": {
+      "minimum": 0
+    },
     "GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS": {
       "minimum": 1
     },
@@ -63,6 +66,10 @@
     },
     "GPU_FAULT_INGRESS_WRITER_PROCESSES": {
       "minimum": 1
+    },
+    "GPU_FAULT_LIVENESS_PORT": {
+      "maximum": 65535,
+      "minimum": 0
     },
     "GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS": {
       "minimum": 0
@@ -576,6 +583,18 @@
     "GPU_FAULT_FIELD_DIAGNOSTIC_TIMEOUT_SECONDS": {
       "kind": "integer"
     },
+    "GPU_FAULT_GC_FREEZE_AFTER_STARTUP": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "on",
+        "true",
+        "yes"
+      ]
+    },
+    "GPU_FAULT_GC_GEN2_THRESHOLD": {
+      "kind": "integer"
+    },
     "GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS": {
       "kind": "integer"
     },
@@ -719,6 +738,9 @@
     },
     "GPU_FAULT_LIFESPAN_SHUTDOWN_MAX_SECONDS": {
       "kind": "number"
+    },
+    "GPU_FAULT_LIVENESS_PORT": {
+      "kind": "integer"
     },
     "GPU_FAULT_LOCAL_FILESYSTEM_DURATION_SECONDS": {
       "kind": "number"
@@ -1765,6 +1787,8 @@
     "GPU_FAULT_FLEET_PIN_CONFIGMAP",
     "GPU_FAULT_FLEET_PIN_POLL_SECONDS",
     "GPU_FAULT_FLEET_SECRET",
+    "GPU_FAULT_GC_FREEZE_AFTER_STARTUP",
+    "GPU_FAULT_GC_GEN2_THRESHOLD",
     "GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS",
     "GPU_FAULT_GPU_FINDING_HISTORY_RETENTION_SECONDS",
     "GPU_FAULT_GPU_HEALTH_SNAPSHOT_REQUEST_PATH",
@@ -1850,6 +1874,7 @@
     "GPU_FAULT_LEGACY_GPU_METRICS_INVENTORY_MAX_AGE_SECONDS",
     "GPU_FAULT_LEGACY_REGISTRY_API",
     "GPU_FAULT_LIFESPAN_SHUTDOWN_MAX_SECONDS",
+    "GPU_FAULT_LIVENESS_PORT",
     "GPU_FAULT_LOCAL_FILESYSTEM_DURATION_SECONDS",
     "GPU_FAULT_LOCAL_FILESYSTEM_WARNING_PERCENT",
     "GPU_FAULT_LOG_INTERVAL_SECONDS",

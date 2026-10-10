@@ -209,15 +209,17 @@ spec:
               - -c
               - sleep 20
         livenessProbe:
-          failureThreshold: 2
+          failureThreshold: 3
           httpGet:
             path: /livez
-            port: 8082
+            port: 8092
           initialDelaySeconds: 10
-          periodSeconds: 5
-          timeoutSeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 10
         name: telemetry-spool-worker
         ports:
+        - containerPort: 8092
+          name: livez
         - containerPort: 8082
           name: http
         readinessProbe:

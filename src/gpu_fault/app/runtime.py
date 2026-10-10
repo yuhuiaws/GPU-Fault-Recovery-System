@@ -1,7 +1,26 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable
+
+# Upper bounds of the lag histogram. The monitor samples twice a second, so
+# the buckets have to resolve a few milliseconds of ordinary scheduling, the
+# 0.15-0.6 s of a gen-2 garbage collection, and the multi-second stall a
+# liveness probe would die on (timeoutSeconds 10): a running max alone cannot
+# tell "one GC pause an hour ago" from "the loop is stalling every second".
+EVENT_LOOP_LAG_BUCKETS: tuple[float, ...] = (
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+)
 
 
 @dataclass
@@ -9,11 +28,18 @@ class EventLoopLag:
     count: int = 0
     total_seconds: float = 0.0
     max_seconds: float = 0.0
+    bucket_counts: list[int] = field(
+        default_factory=lambda: [0] * len(EVENT_LOOP_LAG_BUCKETS)
+    )
 
     def observe(self, lag_seconds: float) -> None:
         self.count += 1
         self.total_seconds += lag_seconds
         self.max_seconds = max(self.max_seconds, lag_seconds)
+        for index, bound in enumerate(EVENT_LOOP_LAG_BUCKETS):
+            if lag_seconds <= bound:
+                self.bucket_counts[index] += 1
+                break
 
     def snapshot(self) -> tuple[int, float, float]:
         return (
@@ -21,6 +47,18 @@ class EventLoopLag:
             self.total_seconds,
             self.max_seconds,
         )
+
+    def histogram(self) -> list[tuple[float, int]]:
+        """Cumulative ``(le, count)`` pairs, ``+Inf`` excluded (it is ``count``)."""
+
+        cumulative = 0
+        rows: list[tuple[float, int]] = []
+        for bound, observed in zip(
+            EVENT_LOOP_LAG_BUCKETS, self.bucket_counts, strict=True
+        ):
+            cumulative += observed
+            rows.append((bound, cumulative))
+        return rows
 
 
 @dataclass
@@ -66,3 +104,6 @@ class AppRuntime:
     # ``{"nul": n}`` from AdmissionRuntime (E-3); rendered as
     # gpu_fault_ingress_decode_rejections_total{reason}.
     decode_rejections: Any = None
+    # ``EventLoopLag.histogram``; optional so a runtime built without it (a
+    # plugin test, an older assembly) still renders the summary fields.
+    event_loop_lag_histogram: Callable[[], list[tuple[float, int]]] | None = None

@@ -10133,6 +10133,30 @@ but is not restarted into a process that again needs Aurora to start; at startup
 `GPU_FAULT_STARTUP_STORE_RETRY_SECONDS` (default 120 s) budget.
 Although the synchronous Store calls of business endpoints have been isolated from the event loop,
 Store I/O saturation or downstream timeouts should not cause several NLB targets to be killed by liveness at the same time.
+
+Liveness is not probed on the service port (ingress 8080 / control-worker 8081 / spool-worker 8082) but on each
+role's dedicated `livez` container port (service port + 10: 8090 / 8091 / 8092). Every uvicorn worker process binds
+that port with `SO_REUSEPORT` at the end of lifespan start-up (`GPU_FAULT_LIVENESS_PORT`, set by the renderer, 0 turns
+it off) and accepts and answers `GET /livez` on its own event loop, with exactly the verdict of `/livez` on the service
+port (`gpu_fault.app.liveness`). The reason is a kill reproduced locally: a cold-connect burst (a new TCP connection per
+request, ~1,000 concurrent connections per api-ha process) parks most of its connections in the kernel's accept queue of
+the service listening socket -- with four processes and 4,250 connections the queue held a median of 3,874 and a
+maximum of 3,943 while the processes held only 550-740 each -- and the kubelet's probe connection joins that FIFO, so
+its wait is queue depth over accept rate (3.6 s locally at 1,090 req/s while the request itself took 0.1 s in-app;
+~11 s at the live scale of 4,266 connections per Pod and ~390 req/s per Pod). A 5 s x 2 probe therefore restarted every
+replica at once while every request was being answered 202 (0 non-2xx). Under the same burst the event loop's longest
+single stall was one gen-2 garbage collection (0.15-0.6 s); GIL contention was not the mechanism (32 vs 8 decode
+threads and 16 vs 8 flush slots gave identical results). On the dedicated port the probe under the same burst had a
+median of 10 ms and a maximum of 0.61 s (that GC pause). The probe parameters are accordingly `periodSeconds: 10`,
+`timeoutSeconds: 10`, `failureThreshold: 3`: 10 s is an order of magnitude above the worst stall of a busy-but-alive
+process, and three unanswered probes in a row (30 s) mean the event loop has not run for longer than the whole burst --
+a real hang. Readiness keeps `/healthz` on the service port at 5 s x 3: a Pod that cannot accept a request promptly is
+exactly what readiness should report. When diagnosing, read `gpu_fault_listen_accept_queue_connections{port}` (accept
+queue depth of the listening socket; the Pod's processes share it, so take the maximum), `gpu_fault_listen_somaxconn`
+(the Pod network namespace's accept-queue cap: a Pod's own namespace gets the kernel default 4096, the 65535 the node
+DaemonSet writes does not reach the Pod, `--backlog 8192` is clamped to 4096, and once the queue is full new SYNs are
+dropped and clients retransmit after 1 s), the `gpu_fault_event_loop_lag_seconds` histogram,
+`gpu_fault_gc_collection_seconds_max{generation}` and `gpu_fault_process_resident_memory_bytes`.
 Because the container needs to install dependencies from the wheel at startup, a TCP `startupProbe` must also be configured (currently waiting up to
 10 minutes); before startup succeeds Kubernetes runs no readiness/liveness, avoiding repeatedly restarting a container still
 installing dependencies.
