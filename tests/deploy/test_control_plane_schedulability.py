@@ -527,3 +527,263 @@ def test_cli_fixed_order_must_name_every_rendered_role(tmp_path: Path) -> None:
         MODULE.main([*arguments, "--rendered", "bogus=x.json"])
     with pytest.raises(SystemExit):
         MODULE.main(arguments[:-6])
+
+
+# ---------------------------------------------------------------------------
+# The surge-first roll's deletion order (batch 49).
+#
+# Live control plane, three CPU nodes, before a `config` roll: free CPU
+# 6.02 / 3.67 / 3.62 cores -- exactly one node with the 4-core api-ha slot. The
+# surge Pod lands there; the ReplicaSet controller then deletes the old Pod
+# sharing that node first (more related Pods on the node), whose cores sit on
+# the one node the per-template hostname spread forbids for the next new Pod,
+# while the other two nodes keep their 4-core old Pods: the roll stalls until
+# the rollout timeout and the release rolls back.
+# ---------------------------------------------------------------------------
+LIVE_NODES = ("hyperpod-cpu-a", "hyperpod-cpu-b", "hyperpod-cpu-c")
+OLD_HASH = "7c9d5b8f4"
+OLD_API_PODS = {
+    LIVE_NODES[0]: f"gpu-fault-api-ha-{OLD_HASH}-llr52",
+    LIVE_NODES[1]: f"gpu-fault-api-ha-{OLD_HASH}-876dt",
+    LIVE_NODES[2]: f"gpu-fault-api-ha-{OLD_HASH}-ss92d",
+}
+
+
+def _named_pod(
+    name: str, node: str, cpu: str, memory: str, app: str, template_hash: str = ""
+) -> dict[str, Any]:
+    pod = _pod(node, cpu, memory, app)
+    pod["metadata"]["name"] = name
+    if template_hash:
+        pod["metadata"]["labels"]["pod-template-hash"] = template_hash
+    return pod
+
+
+def _live_node_group() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any]]:
+    """api-ha 3 x 4 cores (one per node), control-worker 1/2/2 x 3 cores,
+    spool-worker 1 core per node and the system share: free 6.02 / 3.67 / 3.62
+    cores, 14.9 / 12.2 / 12.5Gi."""
+
+    nodes = {"items": [_node(name) for name in LIVE_NODES]}
+    pods: list[dict[str, Any]] = [
+        _named_pod(OLD_API_PODS[node], node, "4", "4Gi", "gpu-fault-api-ha", OLD_HASH)
+        for node in LIVE_NODES
+    ]
+    for node, workers, system in (
+        (LIVE_NODES[0], 1, ("1870m", "4Gi")),
+        (LIVE_NODES[1], 2, ("1220m", "4Gi")),
+        (LIVE_NODES[2], 2, ("1270m", "4Gi")),
+    ):
+        for index in range(workers):
+            pods.append(
+                _named_pod(
+                    f"gpu-fault-control-worker-{node[-6:]}-{index}",
+                    node,
+                    "3",
+                    "4Gi",
+                    "gpu-fault-control-worker",
+                )
+            )
+        pods.append(
+            _named_pod(
+                f"gpu-fault-telemetry-spool-worker-{node[-6:]}",
+                node,
+                "1",
+                "2Gi",
+                "gpu-fault-telemetry-spool-worker",
+            )
+        )
+        pods.append(_named_pod(f"system-{node[-6:]}", node, *system, "system"))
+    live = {
+        "items": [
+            _deployment(
+                "gpu-fault-api-ha", 3, "4", "4Gi", max_unavailable=0, stamp="old"
+            ),
+            _deployment(
+                "gpu-fault-control-worker",
+                5,
+                "3",
+                "4Gi",
+                max_unavailable=1,
+                stamp="old",
+            ),
+            _deployment(
+                "gpu-fault-telemetry-spool-worker",
+                3,
+                "1",
+                "2Gi",
+                max_unavailable=1,
+                stamp="old",
+            ),
+        ]
+    }
+    return nodes, {"items": pods}, live
+
+
+def test_the_live_node_group_has_exactly_one_api_ha_slot() -> None:
+    nodes, pods, _ = _live_node_group()
+    free = {
+        node["name"]: node["free_cpu_millicores"]
+        for node in MODULE.eligible_nodes(nodes, pods, {})
+    }
+    assert free == dict(zip(LIVE_NODES, (6020, 3670, 3620), strict=True))
+
+
+def test_the_controller_s_own_order_stalls_and_the_steered_order_progresses() -> None:
+    """The canonical deadlock: surge on the 6.02 node, the co-located old Pod
+    deleted first, new Pod 2 of 3 without a node. Steered, the two old Pods on
+    the other nodes go first and the co-located one last; the end state equals
+    the start (the roll moves no request between nodes)."""
+
+    nodes, pods, live = _live_node_group()
+    evidence = MODULE.plan_roll(
+        nodes=nodes, pods=pods, live_deployments=live, rendered=_rendered(workers=5)
+    )
+    assert evidence["verdict"] == "fits"
+    ingress = evidence["steps"][0]
+    steering = ingress["steering"]
+    assert ingress["surge_placements"] == [LIVE_NODES[0]]
+    assert steering["nodes_with_a_free_slot"] == [LIVE_NODES[0]], (
+        "exactly one free slot: the case that needs steering, not a refusal"
+    )
+    assert steering["surge_nodes"] == [LIVE_NODES[0]]
+    assert steering["progress_guaranteed"] is True
+    assert [entry["pod"] for entry in steering["deletion_order"]] == [
+        OLD_API_PODS[LIVE_NODES[2]],
+        OLD_API_PODS[LIVE_NODES[1]],
+        OLD_API_PODS[LIVE_NODES[0]],
+    ], "the old Pods on the other nodes go first, the co-located one last"
+    assert [entry["cost"] for entry in steering["deletion_order"]] == [100, 200, 300]
+    assert [entry.get("frees_node_for") for entry in steering["deletion_order"]] == [
+        LIVE_NODES[2],
+        LIVE_NODES[1],
+        None,
+    ], "each early deletion frees the node the next new Pod lands on"
+    unsteered = steering["without_steering"]
+    assert unsteered["progress_guaranteed"] is False
+    assert unsteered["stalling_order"] == [OLD_API_PODS[LIVE_NODES[0]]], (
+        "the controller deletes the old Pod co-located with the surge Pod first"
+    )
+    assert "new Pod 2 of 3 has no node" in unsteered["stall"]
+    assert (
+        f"{LIVE_NODES[0]} already hosts 1 new Pod(s) and the hostname spread "
+        "(maxSkew 1) forbids another" in unsteered["stall"]
+    )
+    assert f"{LIVE_NODES[1]} has 3.7 cores" in unsteered["stall"]
+    assert "0.33 more cores would fit it" in unsteered["stall"]
+    before = {
+        node["name"]: node["free_cpu_millicores"] for node in evidence["nodes_before"]
+    }
+    assert evidence["steps"][1]["free_cpu_millicores_before"] == before, (
+        "a request-neutral roll leaves every node's headroom as it was"
+    )
+
+
+def test_the_surge_pod_on_an_unexpected_node_resteers_the_order() -> None:
+    """The scheduler is not bound to the model's prediction: told where the
+    surge Pod actually landed, the model puts that node's old Pod last."""
+
+    nodes, pods, _ = _live_node_group()
+    node_states = MODULE.eligible_nodes(nodes, pods, {})
+    old_pods = MODULE.deployment_pods(pods, "gpu-fault-api-ha", set(LIVE_NODES))
+    roll = MODULE.simulate_surge_roll(
+        node_states=node_states,
+        old_pods=old_pods,
+        cpu=4000,
+        memory=4 * GI,
+        replicas=3,
+        max_surge=1,
+        max_skew=1,
+        surge_nodes=[LIVE_NODES[1]],
+    )
+    assert roll["progress_guaranteed"] is True
+    assert [entry["pod"] for entry in roll["deletion_order"]][-1] == (
+        OLD_API_PODS[LIVE_NODES[1]]
+    )
+    assert roll["deletion_order"][-1]["cost"] == 300
+
+
+def test_a_steered_roll_that_cannot_progress_is_refused_naming_the_node() -> None:
+    """Two old Pods on one node, one on another, none on the third: new Pod 3
+    of 3 can only go to the empty node, which is one core short. No deletion
+    order helps; the refusal names the node, the cores and what to do."""
+
+    nodes = {"items": [_node(name) for name in ("node-a", "node-b", "node-c")]}
+    pods = {
+        "items": [
+            _named_pod("api-a1", "node-a", "4", "4Gi", "gpu-fault-api-ha", OLD_HASH),
+            _named_pod("api-a2", "node-a", "4", "4Gi", "gpu-fault-api-ha", OLD_HASH),
+            _named_pod("api-b", "node-b", "4", "4Gi", "gpu-fault-api-ha", OLD_HASH),
+            _pod("node-a", "3390m", "1Gi", "filler"),
+            _pod("node-b", "10890m", "1Gi", "filler"),
+            _pod("node-c", "12890m", "1Gi", "filler"),
+        ]
+    }
+    live = {
+        "items": [
+            _deployment(
+                "gpu-fault-api-ha", 3, "4", "4Gi", max_unavailable=0, stamp="old"
+            )
+        ]
+    }
+    rendered = {"ingress": _rendered()["ingress"]}
+    with pytest.raises(MODULE.SchedulabilityRefused) as info:
+        MODULE.plan_roll(
+            nodes=nodes, pods=pods, live_deployments=live, rendered=rendered
+        )
+    message = str(info.value)
+    assert (
+        "step 1 (gpu-fault-api-ha roll) cannot complete its surge-first roll" in message
+    )
+    assert "even with the deletion order steered" in message
+    assert "new Pod 3 of 3 (4 cores / 4Gi) has no node whichever old Pod" in message
+    assert "node-c has 3.0 cores" in message and "1 more core would fit it" in message
+    assert "node-a already hosts 1 new Pod(s)" in message
+    assert "free one 4-core / 4Gi slot on a second node" in message
+    assert "or add a CPU node before applying" in message
+
+    warned = MODULE.plan_roll(
+        nodes=nodes, pods=pods, live_deployments=live, rendered=rendered, mode="warn"
+    )
+    assert warned["verdict"] == "warning"
+    assert "even with the deletion order steered" in warned["warning"]
+
+
+def test_only_surge_first_rolls_carry_a_steering_plan() -> None:
+    nodes, pods, live = _live_node_group()
+    evidence = MODULE.plan_roll(
+        nodes=nodes, pods=pods, live_deployments=live, rendered=_rendered(workers=5)
+    )
+    steps = {step["role"]: step for step in evidence["steps"]}
+    assert "steering" in steps["ingress"]
+    assert "steering" not in steps["worker"], (
+        "maxUnavailable 1 frees a slot before the surge Pod needs one"
+    )
+    assert "steering" not in steps["spool"]
+
+
+def test_a_missing_surge_slot_keeps_the_shortfall_wording() -> None:
+    nodes, pods, live = _live_node_group()
+    for name in LIVE_NODES:
+        pods["items"].append(_pod(name, "3", "1Gi", "filler"))
+    with pytest.raises(MODULE.SchedulabilityRefused) as info:
+        MODULE.plan_roll(
+            nodes=nodes, pods=pods, live_deployments=live, rendered=_rendered(workers=5)
+        )
+    message = str(info.value)
+    assert "cannot schedule one surge Pod (maxUnavailable 0, maxSurge 1)" in message
+    assert "Pod 1 of 1 needs 4 cores / 4Gi; no node has room" in message
+    assert "0.98 more free cores on one node would fit it" in message
+
+
+def test_cli_evidence_records_the_steering_plan(tmp_path: Path) -> None:
+    nodes, pods, live = _live_node_group()
+    arguments = _write_inputs(tmp_path, nodes, pods, live, _rendered(workers=5))
+    assert MODULE.main(arguments) == 0
+    evidence = json.loads((tmp_path / "evidence.json").read_text())
+    steering = evidence["steps"][0]["steering"]
+    assert steering["surge_nodes"] == [LIVE_NODES[0]]
+    assert steering["progress_guaranteed"] is True
+    assert steering["without_steering"]["progress_guaranteed"] is False
+    assert [entry["cost"] for entry in steering["deletion_order"]] == [100, 200, 300]
+    assert "free_after" not in steering, "the evidence carries placements, not scratch"

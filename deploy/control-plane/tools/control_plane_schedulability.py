@@ -22,6 +22,32 @@ rollback context runs the preflight in ``warn`` mode: a roll that still cannot
 fit is logged with its shortfall and left to the rollout waits; a rollback is
 never refused by a model.
 
+A free surge slot is necessary, not sufficient. The surge-first roll replaces
+the old Pods one at a time: the controller deletes an old Pod once the new one
+is Ready and creates the next new Pod, which must land on a node that both has
+the room and hosts no new Pod yet (the hostname spread with ``maxSkew`` 1 is
+counted per ``pod-template-hash``). Which old Pod goes is deterministic. The
+ReplicaSet controller ranks them: unassigned, Pending, not Ready, lower
+``pod-deletion-cost``, MORE RELATED PODS ON THE SAME NODE (related = Pods of
+any ReplicaSet of the Deployment, so the surge Pod counts), ready for less
+time, more restarts, newer -- after the surge Pod lands, the old Pod sharing
+its node is always deleted first. On a 3-node group where exactly one node had
+the 4-core slot (every enabled -> disabled preset change rolls api-ha while the
+spool workers still occupy CPU; the enable that succeeded rolled it with the
+spool at 0 and two free slots) that freed the cores on the one node the spread
+forbids, while the other two nodes kept their 4-core old Pods: the next new
+Pod stayed Pending (``1 node(s) didn't match pod topology spread constraints,
+2 Insufficient cpu``) until the rollout timeout and the release rolled back,
+three times out of three. ``simulate_surge_roll`` replays that sequence: the
+steered order (an old Pod whose node the next new Pod may use first, the Pods
+co-located with new Pods last) and the controller's own order, every other
+kill order searched as well. The plan records both, names the nodes with a
+free slot, and fits only when the steered order is guaranteed to progress --
+exactly one free slot is the steered case, not a refusal. The apply writes
+the order onto the old Pods as ``controller.kubernetes.io/pod-deletion-cost``
+(ranked ahead of the node rule) before the new template is applied and
+re-steers from where the new Pods actually land while the roll runs.
+
 Pure functions over three JSON documents (``kubectl get nodes -o json``,
 ``kubectl get pods -A -o json`` and the live Deployments) plus the final
 rendered Deployment of every selected role; the apply script fetches the
@@ -68,6 +94,16 @@ _MEMORY_SUFFIXES = {
 # under these names; a resume whose rendered template already carries the live
 # values rolls nothing and needs no surge slot.
 _ROLL_ANNOTATION_PREFIXES = ("gpu-fault.io/", "kubectl.kubernetes.io/restartedAt")
+#: The ReplicaSet controller deletes the Pods with the lowest value of this
+#: annotation first (rule 4 of its ranking, ahead of "more related Pods on the
+#: node first" and readiness age); beta and on by default since Kubernetes 1.22.
+DELETION_COST_ANNOTATION = "controller.kubernetes.io/pod-deletion-cost"
+DELETION_COST_STEP = 100
+#: Beyond this many old Pods the kill orders are not searched exhaustively;
+#: only the controller's own preference is replayed. The surge-first tier has
+#: 3 replicas (6 orders), the bound keeps a misconfigured tier from taking
+#: minutes in a preflight.
+EXHAUSTIVE_KILL_ORDER_PODS = 7
 
 
 class SchedulabilityRefused(RuntimeError):
@@ -331,9 +367,7 @@ def _node_sizes(nodes: list[dict[str, Any]]) -> str:
     )
 
 
-def _step_demand(
-    desired: dict[str, Any], live: dict[str, Any] | None
-) -> dict[str, Any]:
+def step_demand(desired: dict[str, Any], live: dict[str, Any] | None) -> dict[str, Any]:
     """What one role's roll asks of the nodes: a transient surge slot when the
     template rolls surge-first, and the replicas the change adds for good."""
 
@@ -360,6 +394,304 @@ def _step_demand(
         "removed_replicas": max(0, live_replicas - desired_replicas),
         "max_skew": _spread_constraint(spec),
     }
+
+
+def deployment_pods(
+    pods: dict[str, Any], name: str, node_names: set[str]
+) -> list[dict[str, Any]]:
+    """The Deployment's Pods that hold room on one of ``node_names``: active,
+    not already terminating, bound to a node -- with their own requests (what
+    their deletion gives back) and the template hash that tells old from new."""
+
+    result: list[dict[str, Any]] = []
+    for pod in pods.get("items", []):
+        metadata = pod.get("metadata") or {}
+        labels = metadata.get("labels") or {}
+        spec = pod.get("spec") or {}
+        node = spec.get("nodeName")
+        if (
+            labels.get("app") != name
+            or metadata.get("deletionTimestamp")
+            or (pod.get("status") or {}).get("phase") in ("Succeeded", "Failed")
+            or node not in node_names
+        ):
+            continue
+        cpu, memory = pod_requests(spec)
+        result.append(
+            {
+                "name": metadata.get("name", ""),
+                "node": node,
+                "cpu_millicores": cpu,
+                "memory_bytes": memory,
+                "template_hash": labels.get("pod-template-hash", ""),
+            }
+        )
+    return sorted(result, key=lambda pod: (pod["node"], pod["name"]))
+
+
+def _node_for_new_pod(
+    free: dict[str, list[int]],
+    new_counts: dict[str, int],
+    cpu: int,
+    memory: int,
+    max_skew: int | None,
+) -> str | None:
+    """Where the scheduler can put the next new Pod: room for it and, under
+    the hostname spread, no more new Pods than the emptiest node plus the
+    skew; the emptiest-of-this-template, roomiest node when several qualify."""
+
+    lowest = min(new_counts.values(), default=0)
+    candidates = [
+        node
+        for node, (free_cpu, free_memory) in free.items()
+        if free_cpu >= cpu
+        and free_memory >= memory
+        and (max_skew is None or new_counts[node] - lowest < max_skew)
+    ]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda node: (new_counts[node], -free[node][0], node))
+
+
+def _no_node_reason(
+    free: dict[str, list[int]],
+    new_counts: dict[str, int],
+    cpu: int,
+    memory: int,
+    max_skew: int | None,
+) -> str:
+    lowest = min(new_counts.values(), default=0)
+    parts = []
+    for node in sorted(free):
+        free_cpu, free_memory = free[node]
+        if max_skew is not None and new_counts[node] - lowest >= max_skew:
+            parts.append(
+                f"{node} already hosts {new_counts[node]} new Pod(s) and the "
+                f"hostname spread (maxSkew {max_skew}) forbids another"
+            )
+            continue
+        short = []
+        if free_cpu < cpu:
+            missing = (cpu - free_cpu) / MILLI
+            short.append(f"{missing:g} more {'core' if missing == 1 else 'cores'}")
+        if free_memory < memory:
+            short.append(f"{(memory - free_memory) / GIBI:g}Gi more memory")
+        parts.append(
+            f"{node} has {free_cpu / MILLI:.1f} cores / {free_memory / GIBI:.1f}Gi "
+            f"free ({' and '.join(short)} would fit it)"
+        )
+    return "; ".join(parts)
+
+
+def _released(free: dict[str, list[int]], pod: dict[str, Any]) -> dict[str, list[int]]:
+    result = {node: list(values) for node, values in free.items()}
+    result[pod["node"]][0] += pod["cpu_millicores"]
+    result[pod["node"]][1] += pod["memory_bytes"]
+    return result
+
+
+def _occupy(
+    free: dict[str, list[int]],
+    new_counts: dict[str, int],
+    node: str,
+    cpu: int,
+    memory: int,
+) -> None:
+    free.setdefault(node, [0, 0])
+    free[node][0] -= cpu
+    free[node][1] -= memory
+    new_counts[node] = new_counts.get(node, 0) + 1
+
+
+def _every_kill_order_progresses(
+    free: dict[str, list[int]],
+    new_counts: dict[str, int],
+    remaining: list[dict[str, Any]],
+    *,
+    to_place: int,
+    placed: int,
+    replicas: int,
+    cpu: int,
+    memory: int,
+    max_skew: int | None,
+) -> tuple[list[str], str | None]:
+    """Replay the kill orders of the unsteered controller: its own
+    deterministic choice first (the Pod on the node with the most related
+    Pods, the new Pods counted), then every other order. Returns the first
+    stalling order -- the controller's own when that one stalls -- and why;
+    ([], None) when every order completes."""
+
+    if to_place == 0 or not remaining:
+        return [], None
+    related = {node: count for node, count in new_counts.items()}
+    for pod in remaining:
+        related[pod["node"]] = related.get(pod["node"], 0) + 1
+    ranked = sorted(remaining, key=lambda pod: (-related[pod["node"]], pod["name"]))
+    if len(remaining) > EXHAUSTIVE_KILL_ORDER_PODS:
+        ranked = ranked[:1]
+    for pod in ranked:
+        trial_free = _released(free, pod)
+        node = _node_for_new_pod(trial_free, new_counts, cpu, memory, max_skew)
+        if node is None:
+            return [pod["name"]], (
+                f"after {pod['name']} on {pod['node']} is deleted, new Pod "
+                f"{placed + 1} of {replicas} has no node: "
+                + _no_node_reason(trial_free, new_counts, cpu, memory, max_skew)
+            )
+        trial_counts = dict(new_counts)
+        _occupy(trial_free, trial_counts, node, cpu, memory)
+        order, stall = _every_kill_order_progresses(
+            trial_free,
+            trial_counts,
+            [other for other in remaining if other is not pod],
+            to_place=to_place - 1,
+            placed=placed + 1,
+            replicas=replicas,
+            cpu=cpu,
+            memory=memory,
+            max_skew=max_skew,
+        )
+        if stall is not None:
+            return [pod["name"], *order], stall
+    return [], None
+
+
+def simulate_surge_roll(
+    *,
+    node_states: list[dict[str, Any]],
+    old_pods: list[dict[str, Any]],
+    cpu: int,
+    memory: int,
+    replicas: int,
+    max_surge: int,
+    max_skew: int | None,
+    surge_nodes: list[str] | None = None,
+) -> dict[str, Any]:
+    """Replay a surge-first roll (``maxUnavailable`` 0) old Pod by old Pod.
+
+    The surge Pods go where the scheduler would put them (or onto
+    ``surge_nodes`` when the live placement is known); then, while new Pods
+    are still owed, each deletion must let the next new Pod land somewhere:
+    the steered order tries the old Pods on nodes without a new Pod first, the
+    tightest post-release fit among them, and leaves the Pods co-located with
+    new Pods for last. ``deletion_order`` carries the deletion costs to write
+    on the old Pods (lowest first); ``nodes_with_a_free_slot`` the nodes that
+    could take the surge Pod (exactly one is the case that needs steering);
+    ``without_steering`` whether the controller's own order stalls and which
+    order that is.
+    """
+
+    free = {
+        node["name"]: [node["free_cpu_millicores"], node["free_memory_bytes"]]
+        for node in node_states
+    }
+    new_counts = {name: 0 for name in free}
+    placements: list[dict[str, Any]] = []
+    result: dict[str, Any] = {
+        "nodes_with_a_free_slot": sorted(
+            node
+            for node, (free_cpu, free_memory) in free.items()
+            if free_cpu >= cpu and free_memory >= memory
+        ),
+        "surge_nodes": [],
+        "deletion_order": [],
+        "placements": placements,
+        "progress_guaranteed": False,
+        "stall": None,
+        "free_after": {},
+        "without_steering": {"progress_guaranteed": True, "stalling_order": []},
+    }
+    if surge_nodes is None:
+        surge_nodes = []
+        for index in range(min(max(max_surge, 0), replicas)):
+            node = _node_for_new_pod(free, new_counts, cpu, memory, max_skew)
+            if node is None:
+                result["stall"] = (
+                    f"surge Pod {index + 1} has no node: "
+                    + _no_node_reason(free, new_counts, cpu, memory, max_skew)
+                )
+                return result
+            surge_nodes.append(node)
+            _occupy(free, new_counts, node, cpu, memory)
+            placements.append({"new_pod": index + 1, "node": node, "after": None})
+    else:
+        for index, node in enumerate(surge_nodes, start=1):
+            _occupy(free, new_counts, node, cpu, memory)
+            placements.append({"new_pod": index, "node": node, "after": None})
+    result["surge_nodes"] = list(surge_nodes)
+    to_place = max(0, replicas - len(surge_nodes))
+    stalling_order, stall = _every_kill_order_progresses(
+        free,
+        new_counts,
+        list(old_pods),
+        to_place=to_place,
+        placed=len(surge_nodes),
+        replicas=replicas,
+        cpu=cpu,
+        memory=memory,
+        max_skew=max_skew,
+    )
+    result["without_steering"] = {
+        "progress_guaranteed": stall is None,
+        "stalling_order": stalling_order,
+        **({"stall": stall} if stall is not None else {}),
+    }
+    remaining = list(old_pods)
+    order: list[dict[str, Any]] = []
+    while remaining:
+        if to_place == 0:
+            # The last deletions owe no new Pod; the Pods sharing a node with
+            # a new Pod still go last, so a kill the model did not foresee
+            # never lands next to one.
+            remaining.sort(
+                key=lambda pod: (new_counts[pod["node"]], pod["node"], pod["name"])
+            )
+            for pod in remaining:
+                free = _released(free, pod)
+                order.append({"pod": pod["name"], "node": pod["node"]})
+            break
+        choice = None
+        first_failure = None
+        for pod in sorted(
+            remaining,
+            key=lambda pod: (
+                new_counts[pod["node"]],
+                free[pod["node"]][0] + pod["cpu_millicores"],
+                pod["name"],
+            ),
+        ):
+            trial_free = _released(free, pod)
+            node = _node_for_new_pod(trial_free, new_counts, cpu, memory, max_skew)
+            if node is not None:
+                choice = (pod, trial_free, node)
+                break
+            if first_failure is None:
+                first_failure = (pod, trial_free)
+        if choice is None:
+            assert first_failure is not None
+            pod, trial_free = first_failure
+            result["stall"] = (
+                f"new Pod {len(placements) + 1} of {replicas} ({cpu / MILLI:g} cores "
+                f"/ {memory / GIBI:g}Gi) has no node whichever old Pod is deleted "
+                f"first (deleting {pod['name']} on {pod['node']}): "
+                + _no_node_reason(trial_free, new_counts, cpu, memory, max_skew)
+            )
+            result["deletion_order"] = order
+            return result
+        pod, free, node = choice
+        remaining.remove(pod)
+        _occupy(free, new_counts, node, cpu, memory)
+        placements.append(
+            {"new_pod": len(placements) + 1, "node": node, "after": pod["name"]}
+        )
+        order.append({"pod": pod["name"], "node": pod["node"], "frees_node_for": node})
+        to_place -= 1
+    for index, entry in enumerate(order, start=1):
+        entry["cost"] = DELETION_COST_STEP * index
+    result["deletion_order"] = order
+    result["progress_guaranteed"] = True
+    result["free_after"] = {node: list(values) for node, values in free.items()}
+    return result
 
 
 def plan_steps(
@@ -391,7 +723,7 @@ def plan_steps(
     for index, role in enumerate(order, start=1):
         name = ROLE_DEPLOYMENTS[role]
         desired = rendered[role]
-        demand = _step_demand(desired, live_by_name.get(name))
+        demand = step_demand(desired, live_by_name.get(name))
         cpu = demand["pod_request"]["cpu_millicores"]
         memory = demand["pod_request"]["memory_bytes"]
         step: dict[str, Any] = {
@@ -404,33 +736,83 @@ def plan_steps(
             },
         }
         sizes = _node_sizes(node_states)
+        old_pods = deployment_pods(pods, name, {node["name"] for node in node_states})
         # A replica reduction frees its room before anything else is placed:
         # the controller scales the old ReplicaSet down first.
         if demand["removed_replicas"]:
-            _release_replicas(demand, node_states, pods, name)
-        # The surge slot is transient (the old Pod goes once the new one is
-        # Ready), the added replicas keep their room.
-        surge_placed, reason = _place(
-            demand["surge_pods_needing_a_free_slot"],
-            cpu,
-            memory,
-            node_states,
-            max_skew=demand["max_skew"],
-            permanent=False,
+            old_pods = _release_replicas(demand, node_states, old_pods)
+        surge_first = (
+            demand["template_rolls"]
+            and demand["max_unavailable"] == 0
+            and demand["max_surge"] > 0
         )
         added_placed: list[str] = []
-        if reason is None:
-            added_placed, reason = _place(
-                demand["added_replicas"],
+        sequence_stall: str | None = None
+        if surge_first:
+            # Old Pod by old Pod: every deletion must leave the next new Pod a
+            # node. The simulated end state is what the following steps see.
+            steering = simulate_surge_roll(
+                node_states=node_states,
+                old_pods=old_pods,
+                cpu=cpu,
+                memory=memory,
+                replicas=demand["desired_replicas"],
+                max_surge=demand["max_surge"],
+                max_skew=demand["max_skew"],
+            )
+            step["steering"] = {
+                key: value for key, value in steering.items() if key != "free_after"
+            }
+            surge_placed = list(steering["surge_nodes"])
+            reason = None
+            surge = min(demand["max_surge"], demand["desired_replicas"])
+            if steering["progress_guaranteed"]:
+                for node in node_states:
+                    node["free_cpu_millicores"], node["free_memory_bytes"] = steering[
+                        "free_after"
+                    ][node["name"]]
+                added_placed = [
+                    placement["node"]
+                    for placement in steering["placements"][len(old_pods) :]
+                ]
+            elif len(surge_placed) < surge:
+                reason = _shortfall(surge, len(surge_placed), cpu, memory, node_states)
+            else:
+                sequence_stall = steering["stall"]
+        else:
+            # The surge slot is transient (the old Pod goes once the new one is
+            # Ready), the added replicas keep their room.
+            surge_placed, reason = _place(
+                demand["surge_pods_needing_a_free_slot"],
                 cpu,
                 memory,
                 node_states,
                 max_skew=demand["max_skew"],
-                permanent=True,
+                permanent=False,
             )
+            if reason is None:
+                added_placed, reason = _place(
+                    demand["added_replicas"],
+                    cpu,
+                    memory,
+                    node_states,
+                    max_skew=demand["max_skew"],
+                    permanent=True,
+                )
         step["surge_placements"] = surge_placed
         step["added_placements"] = added_placed
         evidence["steps"].append(step)
+        if sequence_stall is not None:
+            step["refused"] = sequence_stall
+            raise SchedulabilityRefused(
+                f"control-plane schedulability: step {index} ({name} roll) cannot "
+                f"complete its surge-first roll (maxUnavailable "
+                f"{demand['max_unavailable']}, maxSurge {demand['max_surge']}) even "
+                f"with the deletion order steered: {sequence_stall}; free one "
+                f"{cpu / MILLI:g}-core / {memory / GIBI:g}Gi slot on a second node "
+                f"(one that will host no new Pod) or add a CPU node before applying; "
+                f"nodes before this step: {sizes}."
+            )
         if reason is not None:
             step["refused"] = reason
             surge = demand["surge_pods_needing_a_free_slot"]
@@ -452,28 +834,21 @@ def plan_steps(
 def _release_replicas(
     demand: dict[str, Any],
     node_states: list[dict[str, Any]],
-    pods: dict[str, Any],
-    name: str,
-) -> None:
+    old_pods: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     """Give the room of the replicas a reduction removes back to their nodes
-    (the live Pods of the Deployment, most-loaded nodes first)."""
+    (the live Pods of the Deployment, most-loaded nodes first); returns the
+    Pods a template roll still has to replace."""
 
-    cpu = demand["pod_request"]["cpu_millicores"]
-    memory = demand["pod_request"]["memory_bytes"]
     by_name = {node["name"]: node for node in node_states}
-    on_nodes = sorted(
-        (
-            (pod.get("spec") or {}).get("nodeName")
-            for pod in pods.get("items", [])
-            if ((pod.get("metadata") or {}).get("labels") or {}).get("app") == name
-            and (pod.get("spec") or {}).get("nodeName") in by_name
-            and (pod.get("status") or {}).get("phase") not in ("Succeeded", "Failed")
-        ),
-        key=lambda node_name: by_name[node_name]["free_cpu_millicores"],
-    )
-    for node_name in on_nodes[: demand["removed_replicas"]]:
-        by_name[node_name]["free_cpu_millicores"] += cpu
-        by_name[node_name]["free_memory_bytes"] += memory
+    removed = sorted(
+        old_pods,
+        key=lambda pod: (by_name[pod["node"]]["free_cpu_millicores"], pod["name"]),
+    )[: demand["removed_replicas"]]
+    for pod in removed:
+        by_name[pod["node"]]["free_cpu_millicores"] += pod["cpu_millicores"]
+        by_name[pod["node"]]["free_memory_bytes"] += pod["memory_bytes"]
+    return [pod for pod in old_pods if pod not in removed]
 
 
 def candidate_orders(
@@ -494,7 +869,7 @@ def candidate_orders(
     }
     frees_room = []
     for role in canonical:
-        demand = _step_demand(rendered[role], live_by_name.get(ROLE_DEPLOYMENTS[role]))
+        demand = step_demand(rendered[role], live_by_name.get(ROLE_DEPLOYMENTS[role]))
         if demand["removed_replicas"]:
             frees_room.append(role)
     shrinkers_first = frees_room + [

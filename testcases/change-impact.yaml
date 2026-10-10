@@ -238,6 +238,7 @@ rules:
       - tests/deploy/test_verify_control_plane_role_split_optional.py
       - tests/deploy/test_verify_control_plane_role_split_snapshot.py
       - tests/deploy/test_control_plane_schedulability.py
+      - tests/deploy/test_control_plane_surge_steering.py
       - tests/deploy/test_role_split_apply_order.py
       - tests/deploy/test_cpu_template_apply.py
       - tests/regional/test_release_cpu_apply_evidence_environment.py

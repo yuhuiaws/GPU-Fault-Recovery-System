@@ -138,7 +138,14 @@ and, in order:
    time (ingress's surge Pod needs one free 4-core/4Gi slot, the consumer tier's added replicas take headroom for
    good); a step that cannot fit fails closed before anything in the cluster changes, naming the missing cores and
    every node's headroom, with the evidence written to `<state-dir>/control-plane-apply/` (Deployment and Operations
-   Manual §2.1). The roles roll one at a time, each waiting for its own rollout: ingress -> control-worker ->
+   Manual §2.1). The ingress's surge-first roll is also replayed old Pod by old Pod: with exactly one free slot (a
+   change disabling the spool rolls api-ha first, while the spool-workers still occupy CPU) the apply writes the
+   deletion order onto the old Pods as `controller.kubernetes.io/pod-deletion-cost` annotations before the new
+   template (the old Pod sharing the surge node last -- otherwise the controller always deletes it first and the next
+   new Pod has nowhere to go), recomputed from where the new Pods actually land during the rollout wait; only when
+   even the steered order cannot progress is the change refused, naming the node short of cores and by how much
+   ("free one 4-core / 4Gi slot on a second node or add a CPU node"). The roles roll one at a time, each waiting for
+   its own rollout: ingress -> control-worker ->
    spool-worker.
 6. When raising Min ACU, only now waits for the `ServerlessDatabaseCapacity` of both writer and reader to reach the new
    Min. This step and the role rollout are independent; it is placed after the rollout so that the scale-up ramp time does not serially occupy the whole
@@ -197,7 +204,9 @@ is also refused, naming the file to check.
 ```
 
 Both `desired.json` and `pending.json` carry digest self-checks; changed content fails closed. The schedulability
-preflight's evidence (headroom per node, each role's surge/added Pods, the order actually rolled) is
+preflight's evidence (headroom per node, each role's surge/added Pods, the order actually rolled, and the ingress
+step's `steering`: `nodes_with_a_free_slot`, the predicted `surge_nodes`, the `deletion_order` with its `cost`s,
+`progress_guaranteed`, the unsteered `without_steering.stalling_order`) is
 `<state-dir>/control-plane-apply/schedulability-<release>-<time>.json`, one per CPU role apply.
 
 ### 4.5 Upgrading Legacy Records
@@ -247,8 +256,9 @@ Node sizing: `32-enabled`/`50-enabled` settle at 3 api-ha x 4 cores + 5 control-
 1 core = 30 cores (plus about 3 cores of system Pods, the HyperPod operator and kueue), which 3 x `ml.c5.4xlarge`
 (about 15.9 allocatable cores per node) carry; the tightest step of the roll is ingress's surge Pod, which needs some
 node with `free >= 4 cores and >= 4Gi` (free = allocatable - the requests of every Pod on that node). `config` runs
-the schedulability preflight by the same formula before the apply (§4.2 step 5); when it does not fit, add CPU nodes
-first, then apply.
+the schedulability preflight by the same formula before the apply (§4.2 step 5): exactly one free slot rolls (the old
+Pods' deletion order is steered); no free slot at all, or a new Pod with nowhere to go even steered, is refused naming
+the node and the missing cores -- add CPU nodes first, then apply.
 
 Admission batch delay: the presets leave `processor.admissionBatchDelaySeconds` at the release default 0.002 (2 ms).
 The tuned group of Performance Acceptance Plan §13.3 improved completion p99 by about 14% at 0.05 with unchanged
@@ -401,7 +411,8 @@ The configuration digest is independent of the code release ID, image digest and
   and therefore rolls all three CPU roles;
 - The roles roll one at a time, each waiting for its own rollout, in the order ingress -> control-worker ->
   spool-worker (ingress's surge Pod needs a free slot on some node, which the consumer tier's added replicas would
-  take); enabling spool follows the same order: the spool is a durable table, requests ingress spools before the
+  take; the preflight decides the deletion order of ingress's old Pods and writes it as `pod-deletion-cost`, and an
+  expired rollout wait prints the stall diagnosis first); enabling spool follows the same order: the spool is a durable table, requests ingress spools before the
   spool-worker is ready wait there, and requests beyond the depth cap are returned with 503 Retry-After for the Agent
   to retry; only when that order cannot fit and a role's replica reduction would free the room does the preflight
   move the shrinking role to the front, recording the order actually rolled in the evidence; on a rerun (§4.3) a role

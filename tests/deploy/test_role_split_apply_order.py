@@ -3,8 +3,11 @@ schedulability preflight that refuses before anything changes.
 
 The functions are lifted out of the script and run in a bash harness against
 the checked-in generated manifests: the sequence and its stop-on-failure, the
-preflight's wiring (live reads, evidence, the planned order, refuse/warn) and
-the stability of the final Deployment document across a resume.
+preflight's wiring (live reads, evidence, the planned order, refuse/warn), the
+surge steering around the ingress apply (old Pods annotated with their
+deletion cost before the template is applied, re-steered from the rollout
+wait, the stall explained when the wait expires) and the stability of the
+final Deployment document across a resume.
 """
 
 from __future__ import annotations
@@ -16,6 +19,8 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import Any
+
+import yaml
 
 from tests._script_loader import lazy_script_module
 
@@ -36,13 +41,28 @@ FUNCTIONS = (
     "role_deployment_sha",
     "final_deployment_document",
     "schedulability_preflight",
+    "wait_for_rollout",
+    "steer_surge_roll",
+    "diagnose_rollout_stall",
 )
 FAKE_KUBECTL = r"""#!/usr/bin/env bash
-# Records every invocation; serves the preflight's two live reads from files.
+# Records every invocation; serves the preflight's and the steering's live
+# reads from files; records Pod annotations in the harness log so their place
+# in the apply sequence is visible.
 printf '%s\n' "$*" >>"${FAKE_KUBECTL_LOG}"
 case "$*" in
   *"get nodes -o json"*) cat "${FAKE_NODES}" ;;
   *"get pods -A -o json"*) cat "${FAKE_PODS}" ;;
+  *"get pods -l app="*) cat "${FAKE_DEPLOYMENT_PODS}" ;;
+  *"get replicasets -l app="*) cat "${FAKE_REPLICASETS}" ;;
+  *"annotate pod "*)
+    [[ "$*" =~ annotate\ pod\ ([^ ]+)\ controller\.kubernetes\.io/pod-deletion-cost=([0-9]+) ]]
+    printf 'annotate %s %s\n' "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" >>"${HARNESS_LOG}"
+    ;;
+  *"rollout status "*)
+    sleep 0.2
+    exit "${FAKE_ROLLOUT_STATUS}"
+    ;;
   *)
     echo "unexpected kubectl call: $*" >&2
     exit 9
@@ -52,7 +72,15 @@ esac
 STUBS = """
 apply_manifest() { printf 'apply %s\\n' "$1" >>"${HARNESS_LOG}"; }
 wait_for_rollout() { printf 'wait %s\\n' "$1" >>"${HARNESS_LOG}"; }
+steer_surge_roll() { printf 'steer %s %s\\n' "$1" "$2" >>"${HARNESS_LOG}"; }
 """
+# Steering stubbed out, the rest real: the steering's own kubectl traffic.
+APPLY_STUBS = """
+apply_manifest() { printf 'apply %s\\n' "$1" >>"${HARNESS_LOG}"; }
+wait_for_rollout() { printf 'wait %s\\n' "$1" >>"${HARNESS_LOG}"; }
+"""
+GI = 1024**3
+OLD_HASH, NEW_HASH = "7c9d5b8f4", "55767f6fbd"
 
 
 def _extract_function(name: str) -> str:
@@ -73,6 +101,92 @@ def _node(name: str, cpu: str) -> dict[str, Any]:
     }
 
 
+def _pod(
+    name: str,
+    node: str | None,
+    cpu: str,
+    app: str = "filler",
+    *,
+    template_hash: str = "",
+    conditions: list[dict[str, str]] | None = None,
+) -> dict[str, Any]:
+    labels = {"app": app}
+    if template_hash:
+        labels["pod-template-hash"] = template_hash
+    spec: dict[str, Any] = {
+        "containers": [
+            {"name": "api", "resources": {"requests": {"cpu": cpu, "memory": "4Gi"}}}
+        ]
+    }
+    if node is not None:
+        spec["nodeName"] = node
+    status: dict[str, Any] = {"phase": "Running" if node else "Pending"}
+    if conditions is not None:
+        status["conditions"] = conditions
+    return {
+        "metadata": {"name": name, "labels": labels},
+        "spec": spec,
+        "status": status,
+    }
+
+
+def _one_slot_cluster() -> tuple[dict[str, Any], dict[str, Any]]:
+    """Three nodes, one old api-ha Pod each; only node-0 has a free 4-core
+    slot (6.02 cores free; node-1 3.67, node-2 3.62)."""
+
+    pods = [
+        _pod(
+            f"gpu-fault-api-ha-{OLD_HASH}-old{index}",
+            f"node-{index}",
+            "4",
+            "gpu-fault-api-ha",
+            template_hash=OLD_HASH,
+        )
+        for index in range(3)
+    ]
+    for index, used in enumerate(("5870m", "8220m", "8270m")):
+        pods.append(_pod(f"filler-{index}", f"node-{index}", used))
+    live = {
+        "items": [
+            {
+                "metadata": {"name": "gpu-fault-api-ha"},
+                "spec": {
+                    "replicas": 3,
+                    "template": {
+                        "metadata": {
+                            "annotations": {"gpu-fault.io/release-wheel-sha256": "old"}
+                        },
+                        "spec": {"containers": [{"name": "api", "image": "old"}]},
+                    },
+                },
+            }
+        ]
+    }
+    return {"items": pods}, live
+
+
+def _replicasets() -> dict[str, Any]:
+    template = yaml.safe_load(
+        (GENERATED / "gpu-fault-api-ha-ingress.yaml").read_text(encoding="utf-8")
+    )["spec"]["template"]
+    return {
+        "items": [
+            {
+                "metadata": {
+                    "name": f"gpu-fault-api-ha-{template_hash}",
+                    "labels": {
+                        "app": "gpu-fault-api-ha",
+                        "pod-template-hash": template_hash,
+                    },
+                    "annotations": {"deployment.kubernetes.io/revision": revision},
+                },
+                "spec": {"template": template},
+            }
+            for template_hash, revision in ((OLD_HASH, "7"), (NEW_HASH, "8"))
+        ]
+    }
+
+
 def _run(
     tmp_path: Path,
     body: str,
@@ -84,6 +198,10 @@ def _run(
     evidence_dir: Path | None = None,
     node_cores: str = "15890m",
     extra: str = "",
+    pods: dict[str, Any] | None = None,
+    deployment_pods: dict[str, Any] | None = None,
+    replicasets: dict[str, Any] | None = None,
+    rollout_status: int = 0,
 ) -> tuple[subprocess.CompletedProcess[str], list[str], list[str]]:
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
@@ -101,7 +219,15 @@ def _run(
         )
     )
     pods_path = tmp_path / "pods.json"
-    pods_path.write_text(json.dumps({"items": []}))
+    pods_path.write_text(json.dumps(pods if pods is not None else {"items": []}))
+    deployment_pods_path = tmp_path / "deployment-pods.json"
+    deployment_pods_path.write_text(
+        json.dumps(deployment_pods if deployment_pods is not None else {"items": []})
+    )
+    replicasets_path = tmp_path / "replicasets.json"
+    replicasets_path.write_text(
+        json.dumps(replicasets if replicasets is not None else {"items": []})
+    )
     harness_log = tmp_path / "harness.log"
     kubectl_log = tmp_path / "kubectl.log"
     preamble = "\n".join(
@@ -138,6 +264,8 @@ def _run(
             f'SCHEDULABILITY_EVIDENCE_DIR="{evidence_dir or ""}"',
             f"SCHEDULABILITY_EVIDENCE={contract}/schedulability.json",
             'SCHEDULABILITY_ORDER=""',
+            f"STEERING_DIR={contract}/steering",
+            "FAST_ROLLOUT_TIMEOUT_SECONDS=1",
             *(_extract_function(name) for name in FUNCTIONS),
             extra,
             body,
@@ -151,6 +279,9 @@ def _run(
         "FAKE_KUBECTL_LOG": str(kubectl_log),
         "FAKE_NODES": str(nodes_path),
         "FAKE_PODS": str(pods_path),
+        "FAKE_DEPLOYMENT_PODS": str(deployment_pods_path),
+        "FAKE_REPLICASETS": str(replicasets_path),
+        "FAKE_ROLLOUT_STATUS": str(rollout_status),
     }
     result = subprocess.run(
         ["bash", "-c", preamble], check=False, text=True, capture_output=True, env=env
@@ -177,15 +308,21 @@ def test_roles_roll_one_at_a_time_in_the_planned_order(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert events == [
         "apply gpu-fault-api-ha-pdb",
+        "steer gpu-fault-api-ha plan",
         "apply gpu-fault-api-ha-ingress",
         "wait gpu-fault-api-ha",
         "apply gpu-fault-control-worker-pdb",
+        "steer gpu-fault-control-worker plan",
         "apply gpu-fault-control-worker",
         "wait gpu-fault-control-worker",
         "apply gpu-fault-telemetry-spool-worker-pdb",
+        "steer gpu-fault-telemetry-spool-worker plan",
         "apply gpu-fault-telemetry-spool-worker",
         "wait gpu-fault-telemetry-spool-worker",
-    ], "each Deployment waits for its own rollout before the next one is applied"
+    ], (
+        "each Deployment is steered before its template is applied and waits "
+        "for its own rollout before the next one is applied"
+    )
 
 
 def test_a_planned_order_that_frees_room_first_is_followed_as_given(
@@ -214,6 +351,7 @@ def test_unselected_roles_are_skipped_in_the_sequence(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert events == [
         "apply gpu-fault-control-worker-pdb",
+        "steer gpu-fault-control-worker plan",
         "apply gpu-fault-control-worker",
         "wait gpu-fault-control-worker",
     ]
@@ -235,6 +373,7 @@ def test_a_failed_rollout_wait_stops_the_sequence_before_the_next_role(
     assert result.returncode != 0
     assert events == [
         "apply gpu-fault-api-ha-pdb",
+        "steer gpu-fault-api-ha plan",
         "apply gpu-fault-api-ha-ingress",
         "wait gpu-fault-api-ha",
     ], "the consumer tier is not touched once the ingress roll failed"
@@ -381,3 +520,178 @@ def test_final_document_is_stable_across_a_resume_and_rolls_only_on_a_restart_to
         == "2000-01-02T00:00:00.000000000Z"
     )
     assert SCHEDULABILITY.template_rolls(forced, live_item) is True
+
+
+def _pending_new_pod() -> dict[str, Any]:
+    return _pod(
+        f"gpu-fault-api-ha-{NEW_HASH}-8t4p5",
+        None,
+        "4",
+        "gpu-fault-api-ha",
+        template_hash=NEW_HASH,
+        conditions=[
+            {
+                "type": "PodScheduled",
+                "status": "False",
+                "reason": "Unschedulable",
+                "message": "0/3 nodes are available: 1 node(s) didn't match pod "
+                "topology spread constraints, 2 Insufficient cpu.",
+            }
+        ],
+    )
+
+
+def test_the_steering_annotates_the_old_pods_before_the_ingress_template_is_applied(
+    tmp_path: Path,
+) -> None:
+    """The live deadlock's shape: one node with the free slot. The plan runs
+    after the preflight, writes the deletion costs onto the three old Pods --
+    the one sharing the predicted surge node last -- and only then is the new
+    template applied."""
+
+    pods, live = _one_slot_cluster()
+    result, events, calls = _run(
+        tmp_path,
+        'schedulability_preflight ""\napply_ingress_role',
+        role_targets="ingress",
+        live=live,
+        pods=pods,
+        extra=APPLY_STUBS,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert events == [
+        "apply gpu-fault-api-ha-pdb",
+        f"annotate gpu-fault-api-ha-{OLD_HASH}-old2 100",
+        f"annotate gpu-fault-api-ha-{OLD_HASH}-old1 200",
+        f"annotate gpu-fault-api-ha-{OLD_HASH}-old0 300",
+        "apply gpu-fault-api-ha-ingress",
+        "wait gpu-fault-api-ha",
+    ], "the old Pods carry their deletion cost before the template changes"
+    assert all("--overwrite" in call for call in calls if "annotate" in call), calls
+    assert (
+        "surge steering: gpu-fault-api-ha: surge Pod expected on node-0"
+        in result.stderr
+    )
+    assert "old0 on node-0 (cost 300, co-located with a new Pod, last)" in result.stderr
+    state = json.loads(
+        (tmp_path / "contract/steering/gpu-fault-api-ha.json").read_text()
+    )
+    assert state["active"] is True and state["progress_guaranteed"] is True
+    evidence = json.loads((tmp_path / "contract/schedulability.json").read_text())
+    steering = evidence["steps"][0]["steering"]
+    assert steering["without_steering"]["progress_guaranteed"] is False
+    assert steering["without_steering"]["stalling_order"] == [
+        f"gpu-fault-api-ha-{OLD_HASH}-old0"
+    ], "unsteered, the controller deletes the Pod co-located with the surge Pod first"
+
+
+def test_a_tier_rolling_with_max_unavailable_one_is_not_steered(tmp_path: Path) -> None:
+    # Warn mode: the one-slot cluster cannot take six fresh workers, and the
+    # preflight's verdict is not what is under test here -- the plan's is.
+    pods, live = _one_slot_cluster()
+    result, events, calls = _run(
+        tmp_path,
+        'schedulability_preflight ""\napply_worker_role',
+        role_targets="worker",
+        live=live,
+        pods=pods,
+        mode="warn",
+        extra=APPLY_STUBS,
+    )
+
+    assert result.returncode == 0, result.stderr
+    assert events == [
+        "apply gpu-fault-control-worker-pdb",
+        "apply gpu-fault-control-worker",
+        "wait gpu-fault-control-worker",
+    ]
+    assert not any("annotate" in call for call in calls), calls
+    assert "surge steering: gpu-fault-control-worker: nothing to steer" in result.stderr
+
+
+def test_the_rollout_wait_resteers_from_the_actual_surge_node_and_explains_a_stall(
+    tmp_path: Path,
+) -> None:
+    """The surge Pod landed on node-1, not the predicted node-0: the reconcile
+    inside the rollout wait rewrites the costs so node-1's old Pod goes last.
+    The wait still expires (the fake rollout never finishes) and the stall is
+    explained -- the pending Pod's scheduler verdict, every node's room -- before
+    the wait fails as before."""
+
+    pods, live = _one_slot_cluster()
+    surge = _pod(
+        f"gpu-fault-api-ha-{NEW_HASH}-sf7g8",
+        "node-1",
+        "4",
+        "gpu-fault-api-ha",
+        template_hash=NEW_HASH,
+    )
+    deployment_pods = {
+        "items": [
+            *(
+                pod
+                for pod in pods["items"]
+                if pod["metadata"]["labels"]["app"] == "gpu-fault-api-ha"
+            ),
+            surge,
+            _pending_new_pod(),
+        ]
+    }
+    result, events, calls = _run(
+        tmp_path,
+        "\n".join(
+            [
+                "startup_failure_reason() { return 1; }",
+                'schedulability_preflight ""',
+                "steer_surge_roll gpu-fault-api-ha plan",
+                "wait_for_rollout gpu-fault-api-ha",
+                "echo unreachable",
+            ]
+        ),
+        role_targets="ingress",
+        live=live,
+        pods=pods,
+        deployment_pods=deployment_pods,
+        replicasets=_replicasets(),
+        rollout_status=1,
+    )
+
+    assert result.returncode != 0, "an expired rollout wait still fails the apply"
+    assert "unreachable" not in result.stdout
+    assert events[:3] == [
+        f"annotate gpu-fault-api-ha-{OLD_HASH}-old2 100",
+        f"annotate gpu-fault-api-ha-{OLD_HASH}-old1 200",
+        f"annotate gpu-fault-api-ha-{OLD_HASH}-old0 300",
+    ], "the plan steers for the predicted surge node"
+    assert events[3:5] == [
+        f"annotate gpu-fault-api-ha-{OLD_HASH}-old0 200",
+        f"annotate gpu-fault-api-ha-{OLD_HASH}-old1 300",
+    ], (
+        "the reconcile moves node-1's old Pod to the end once the surge Pod is seen there"
+    )
+    assert len(events) == 5, (
+        f"a settled order is not rewritten on later polls: {events}"
+    )
+    assert (
+        "surge steering: gpu-fault-api-ha: new Pod(s) on node-1 instead of the planned "
+        "node-0; deletion order now" in result.stderr
+    )
+    assert (
+        f"rollout stalled: gpu-fault-api-ha: new Pod gpu-fault-api-ha-{NEW_HASH}-8t4p5 is "
+        "Pending (Unschedulable): 0/3 nodes are available: 1 node(s) didn't match pod "
+        "topology spread constraints, 2 Insufficient cpu." in result.stderr
+    )
+    assert (
+        "rollout stalled: gpu-fault-api-ha: node node-0: 6.0 cores / " in result.stderr
+    )
+    assert (
+        "0 new Pod(s) []; 1 old Pod(s) [gpu-fault-api-ha-7c9d5b8f4-old0 (deletion cost None)]"
+        in result.stderr
+    ), "the fake API does not persist annotations; the diagnosis reports what it reads"
+    assert (
+        "a new Pod needs 4 cores / 4Gi on a node that hosts no new Pod of this template "
+        "(hostname spread maxSkew 1); free such a slot on a second node or add a CPU node"
+        in result.stderr
+    )
+    assert [call for call in calls if "rollout status" in call], calls

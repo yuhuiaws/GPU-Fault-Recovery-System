@@ -78,6 +78,9 @@ ADMIN_CONFIG_SPOOL_SHA256="$(
 )"
 CONTRACT_DIR="$(mktemp -d)"
 trap 'rm -rf "${CONTRACT_DIR}"' EXIT
+# Per-Deployment state of the surge steering between its plan (before the
+# template is applied) and the reconciles of the rollout wait.
+STEERING_DIR="${CONTRACT_DIR}/steering"
 
 [[ "${AWS_REGION}" =~ ^[a-z0-9]+(-[a-z0-9]+)+-[0-9]+$ ]] || {
     echo "GPU_FAULT_AWS_REGION is not a valid AWS Region: ${AWS_REGION}" >&2
@@ -822,6 +825,10 @@ startup_failure_reason() {
     return 1
 }
 
+# Polls the rollout; between polls the surge steering re-derives the deletion
+# order from where the new Pods actually landed. An expired wait is explained
+# (the pending new Pod's scheduler verdict, every node's room and Pods) before
+# it fails, as fail-closed as before.
 wait_for_rollout() {
     local deployment="$1"
     local deadline=$((SECONDS + FAST_ROLLOUT_TIMEOUT_SECONDS))
@@ -835,9 +842,78 @@ wait_for_rollout() {
             echo "deployment ${deployment} failed fast: ${reason}" >&2
             return 1
         fi
+        steer_surge_roll "${deployment}" reconcile
     done
+    diagnose_rollout_stall "${deployment}"
     kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" rollout status \
         "deployment/${deployment}" --timeout=1s
+}
+
+# The surge-first roll's deletion order. The ReplicaSet controller deletes the
+# old Pod sharing the surge Pod's node first ("more related Pods on the node
+# first" ranks ahead of readiness age), which on a node group with exactly one
+# free api-ha slot frees the cores on the one node the per-template hostname
+# spread forbids for the next new Pod while the other nodes keep their 4-core
+# old Pods: the roll deadlocked until the rollout timeout and rolled back. The
+# controller.kubernetes.io/pod-deletion-cost annotation ranks ahead of that
+# rule, so the plan (before the template is applied) writes the schedulability
+# model's order onto the old Pods -- the Pod co-located with the predicted
+# surge node last -- and the reconcile (every poll of the rollout wait)
+# re-derives it from where the new Pods actually landed. Tiers rolling with
+# maxUnavailable 1 need no steering: the plan records that and the reconcile
+# is a no-op for them. In refuse mode a plan that cannot be made refuses the
+# apply; a rollback (warn mode) proceeds unsteered, as it did before.
+steer_surge_roll() {
+    local deployment="$1"
+    local phase="$2"
+    local scratch="${CONTRACT_DIR}/schedulability"
+    local state="${STEERING_DIR}/${deployment}.json"
+    local role
+    case "${deployment}" in
+        gpu-fault-api-ha) role=ingress ;;
+        gpu-fault-control-worker) role=worker ;;
+        gpu-fault-telemetry-spool-worker) role=spool ;;
+        *) return 0 ;;
+    esac
+    case "${phase}" in
+        plan)
+            [[ -f "${scratch}/nodes.json" && -f "${scratch}/pods.json" &&
+                -f "${scratch}/${role}.json" ]] || return 0
+            install -d -m 0700 "${STEERING_DIR}"
+            if ! PYTHONDONTWRITEBYTECODE=1 python3 "${SCRIPT_DIR}/control_plane_surge_steering.py" plan \
+                --nodes "${scratch}/nodes.json" \
+                --pods "${scratch}/pods.json" \
+                --live-deployments "${LIVE_DEPLOYMENTS}" \
+                --deployment-document "${scratch}/${role}.json" \
+                --state "${state}" \
+                -- kubectl "${kubectl_args[@]}" -n "${NAMESPACE}"; then
+                if [[ "${SCHEDULABILITY_MODE}" == "refuse" ]]; then
+                    echo "surge steering: ${deployment}: planning failed; refusing to apply an unsteered surge-first roll" >&2
+                    return 1
+                fi
+                echo "surge steering: ${deployment}: planning failed; the rollback applies unsteered" >&2
+            fi
+            ;;
+        reconcile)
+            [[ -f "${state}" ]] || return 0
+            PYTHONDONTWRITEBYTECODE=1 python3 "${SCRIPT_DIR}/control_plane_surge_steering.py" reconcile \
+                --state "${state}" \
+                -- kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" ||
+                echo "surge steering: ${deployment}: reconcile failed; the rollout wait continues" >&2
+            ;;
+    esac
+}
+
+# What an expired rollout wait leaves in the log: the pending new Pod's
+# scheduler verdict ("1 node(s) didn't match pod topology spread constraints,
+# 2 Insufficient cpu") and every node's free CPU/memory with the old and new
+# Pods of the Deployment it hosts, deletion costs included.
+diagnose_rollout_stall() {
+    local deployment="$1"
+    PYTHONDONTWRITEBYTECODE=1 python3 "${SCRIPT_DIR}/control_plane_surge_steering.py" diagnose \
+        --deployment "${deployment}" \
+        -- kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" ||
+        echo "rollout stalled: ${deployment}: diagnosis unavailable" >&2
 }
 
 # Fallback when the Pod spec carries no named http port; matches the
@@ -1053,9 +1129,12 @@ path.write_text(
     rm -f "${ROLE_CONFIG_STREAM}"
 fi
 
+# Each role: PDB, the surge steering plan (annotates the old Pods; a no-op for
+# a tier that does not roll surge-first), the Deployment, its rollout wait.
 apply_spool_role() {
     role_selected spool || return 0
     apply_manifest gpu-fault-telemetry-spool-worker-pdb
+    steer_surge_roll gpu-fault-telemetry-spool-worker plan
     apply_manifest gpu-fault-telemetry-spool-worker
     wait_for_rollout gpu-fault-telemetry-spool-worker
 }
@@ -1063,6 +1142,7 @@ apply_spool_role() {
 apply_worker_role() {
     role_selected worker || return 0
     apply_manifest gpu-fault-control-worker-pdb
+    steer_surge_roll gpu-fault-control-worker plan
     apply_manifest gpu-fault-control-worker
     wait_for_rollout gpu-fault-control-worker
 }
@@ -1070,6 +1150,7 @@ apply_worker_role() {
 apply_ingress_role() {
     role_selected ingress || return 0
     apply_manifest gpu-fault-api-ha-pdb
+    steer_surge_roll gpu-fault-api-ha plan
     apply_manifest gpu-fault-api-ha-ingress
     wait_for_rollout gpu-fault-api-ha
 }

@@ -119,7 +119,10 @@ wheel, first issues the Aurora capacity change, then rolls only the affected ing
 and finally waits for the Aurora scaling to land. The roles roll one at a time (ingress -> control-worker ->
 spool-worker); the schedulability preflight ahead of the roll fails closed when a step cannot fit, leaving the cluster
 untouched (the error names the missing cores and every node's headroom; the evidence is under
-`<state-dir>/control-plane-apply/`; the node sizing formula is in the Deployment and Operations Manual §2.1). After an
+`<state-dir>/control-plane-apply/`; the node sizing formula is in the Deployment and Operations Manual §2.1); api-ha's
+surge-first roll is steered by the deletion order the preflight chose (`controller.kubernetes.io/pod-deletion-cost`
+annotations, the old Pod sharing the surge node last) and an expired rollout wait prints the stall diagnosis first (the
+pending new Pod's scheduler verdict and every node's headroom). After an
 interruption, rerunning the same command resumes, and roles already matching the target roll no more. Complete fields,
 templates, first deployment and rollback semantics are in
 [Administrator Capacity Configuration](administrator-capacity-configuration.md).

@@ -863,6 +863,32 @@ If any of the following items fails, the rolling upgrade must not start:
   roll) cannot schedule ...`, naming the missing cores and every node's headroom) with the cluster untouched; the
   evidence (headroom per node, each role's surge/added Pods, the order actually rolled) is written to
   `<state-dir>/control-plane-apply/schedulability-<release>-<time>.json` and kept with the `logs/mutating/` log.
+  A free slot is necessary, not sufficient: once api-ha's surge Pod is Ready the ReplicaSet controller picks the old
+  Pod to delete by a fixed ranking (unassigned, Pending, not Ready, lower `controller.kubernetes.io/pod-deletion-cost`,
+  **more related Pods on the same node** -- related = Pods of any ReplicaSet of the Deployment, the surge Pod included
+  --, ready for less time, more restarts, newer), so the old Pod sharing the surge Pod's node is always deleted first;
+  on a node group with exactly one free 4-core slot left (every enabled -> disabled preset change rolls api-ha while
+  the spool-workers still occupy CPU; the enable that succeeded rolled it with the spool at 0 and two free slots) the
+  freed cores sit on the one node the hostname spread counted per `pod-template-hash` (`maxSkew: 1`) forbids for a
+  second new Pod while the other two nodes keep their 4-core old Pods, and the next new Pod stays `FailedScheduling`
+  (`1 node(s) didn't match pod topology spread constraints, 2 Insufficient cpu`) until the 5-minute rollout timeout and
+  the rollback. The preflight therefore replays a surge-first roll old Pod by old Pod: that step's `steering` in the
+  evidence records `nodes_with_a_free_slot`, `surge_nodes` (the predicted surge node), `deletion_order` (every old Pod's
+  deletion position, the node it frees in `frees_node_for` and its `cost`, the one sharing the surge node last),
+  `progress_guaranteed` and `without_steering` (whether the controller's own choice stalls and its `stalling_order`);
+  only a steered order guaranteed to progress is `fits` -- exactly one free slot is the steered case, not a refusal --
+  and only when even the steered order cannot progress does it fail closed, naming the new Pod that has no node, the
+  node short of cores and by how much, and what to do (`cannot complete its surge-first roll ... even with the
+  deletion order steered: new Pod 3 of 3 ... has no node ...; free one 4-core / 4Gi slot on a second node (one that
+  will host no new Pod) or add a CPU node before applying`). The apply side (`control_plane_surge_steering.py`) writes
+  that order onto the old Pods as `pod-deletion-cost` annotations after the PDB and before the new template (the rule
+  ranks ahead of "more related Pods on the node", so it overrides it; the `surge steering: ... plan` line is in the
+  log), every poll of the rollout wait reads where the new Pods actually landed, recomputes and rewrites only the
+  annotations that changed (`reconcile`; the scheduler is not bound to the model's prediction -- a surge Pod on another
+  node makes that node's old Pod the last one), and an expired wait prints the diagnosis first (`rollout stalled:`
+  lines: the pending new Pod's scheduler verdict, every node's headroom with its old/new Pods and their deletion costs,
+  what to free) and then fails as before (`diagnose`). Consumer tiers rolling with `maxUnavailable: 1` need no
+  steering; the plan records `nothing to steer`. A rollback (warn mode) is steered the same way and never refused.
   Node sizing formula: `32-enabled`/`50-enabled` settle at 3 api-ha x 4 cores + 5 control-worker x 3 cores + 3
   spool-worker x 1 core = 30 cores (plus about 3 cores of system Pods, the HyperPod operator and kueue), which 3 x
   `ml.c5.4xlarge` (about 15.9 allocatable cores per node) carry; the tightest step of the roll is api-ha's surge, which
@@ -2636,9 +2662,13 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" logs job/gpu-fault-po
 The script decides the roll order, one Deployment at a time, each waiting for its own rollout: ingress first (its
 `maxSurge: 1`/`maxUnavailable: 0` surge Pod needs a free slot of api-ha's size on some node, which the consumer tier's
 added replicas would take), then the control-worker, then the spool-worker; the schedulability preflight ahead of the
-roll (`control_plane_schedulability.py`) fails closed when a step cannot fit, see §2.1. The queue and the spool are
-durable tables: what ingress admits with `202` during a consumer roll waits there and is not lost, and a consumer roll
-that fails fails the release and rolls ingress back with it.
+roll (`control_plane_schedulability.py`) fails closed when a step cannot fit, see §2.1. The ingress's surge-first roll
+is steered by the deletion order the preflight chose (after the PDB and before the new template the order is written
+onto the old Pods as `controller.kubernetes.io/pod-deletion-cost` annotations, the old Pod sharing the surge node last;
+recomputed from where the new Pods actually land during the rollout wait), and an expired rollout wait explains the
+stall first (the pending new Pod's scheduler verdict and every node's headroom). The queue and the spool are durable
+tables: what ingress admits with `202` during a consumer roll waits there and is not lost, and a consumer roll that
+fails fails the release and rolls ingress back with it.
 
 ```bash
 KUBECONFIG="${CPU_KUBECONFIG}" \
