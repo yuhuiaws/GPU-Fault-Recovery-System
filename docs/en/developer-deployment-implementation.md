@@ -1342,6 +1342,10 @@ other diagnostics keep the whole JSON and multi-line credential context and are 
 Real-time pipe/terminal output uses an independent non-blocking descriptor and does not change the blocking state of other writers; a closed or full
 console cannot make the supervisor exit or block reaping. Regular file diagnostics are deferred to output at command end, and the diagnostics reader's finishing
 also has its own cap; machine-readable stdout is neither dropped nor mixed with progress information.
+In capture mode the supervisors and the command share one stderr pipe: when the result is assembled, lines that are exactly the wait heartbeat are split off
+and forwarded through `write_diagnostic` to the parent's (operator's) stderr, so `CompletedProcess.stderr` holds only the command's own output and a heartbeat
+never enters a result a caller parses; `aws_commands` likewise drops heartbeat and blank lines before its strict full match decides that a resource is absent.
+The heartbeat shape is defined once in `process_supervisor` and `DriverDiagnostics` reuses that definition.
 Credential rotation, operation locks, approval, stability windows and node safety barriers are not omitted because of this.
 Positive proof caches are reused only within the same process and within a bounded validity: tools 60 seconds, artifact extraction verification 60 seconds, CPU credential
 structure verification 30 seconds. The key binds scope, content and validator identity; resource proofs additionally bind the freshly read UID and

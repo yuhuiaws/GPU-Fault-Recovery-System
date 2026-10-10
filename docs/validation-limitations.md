@@ -237,6 +237,11 @@ refusal after all completion proofs are lost, absolute command deadlines, and
 whole-operation cleanup across repeated SIGINT. Cancellation targets supervised
 child trees; it does not hard-preempt arbitrary Python work in parent threads or
 make uninterruptible kernel waits safe. Site-lock release still waits for cleanup.
+A captured command's stderr is proven to hold only the command's own output: the
+regression runs a real command past a shortened heartbeat interval and checks
+that the heartbeat reached the operator channel instead, and the AWS absence
+matcher is exercised with the live stderr shape (heartbeat, blank line, exact
+NoSuchEntity error) together with its prose and other-code controls.
 API reservation cleanup distinguishes a procfs file disappearing during its read
 from an unreadable or malformed process identity. Explicit disappearance can prove
 exit; unknown reads keep capacity charged. PID/start-time and ancestor checks,

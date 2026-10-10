@@ -12,6 +12,7 @@ from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.deadlines import deadline_scope
 from gpu_fault.admin.diagnostics import diagnostic_command, diagnostic_text
 from gpu_fault.admin.execution import run_command as bounded_command
+from gpu_fault.admin.process_supervisor import split_progress_lines
 
 FinalSnapshotPolicy = Literal["retain", "skip"]
 # AWS CLI 2.35 prefixes every error line with ``aws: [ERROR]: `` (live
@@ -50,13 +51,26 @@ def run_command(arguments: list[str]) -> CommandResult:
     )
 
 
+def command_error_text(stderr: str) -> str:
+    """The command's own error text: wait heartbeats and blank lines removed.
+
+    The supervisor already keeps its heartbeat out of a captured result (a live
+    uninstall once read ``deployment-wait command=aws ...`` ahead of an exact
+    NoSuchEntity error and aborted a wait for a role that was gone). Absence
+    detection stays strict either way: after this normalisation the whole text
+    must still be exactly one AWS error.
+    """
+    own, _heartbeats = split_progress_lines(stderr)
+    return "\n".join(line for line in own.splitlines() if line.strip()).strip()
+
+
 def matches_not_found(
     result: CommandResult,
     patterns: Iterable[str],
 ) -> bool:
     if result.returncode not in {254, 255}:
         return False
-    message = result.stderr.strip()
+    message = command_error_text(result.stderr)
     match = _AWS_ERROR.fullmatch(message)
     # A bare code remains supported for command adapters; arbitrary prose and
     # stdout are never evidence of absence.
@@ -67,7 +81,7 @@ def matches_not_found(
 def helm_release_absent(result: CommandResult) -> bool:
     return (
         result.returncode == 1
-        and result.stderr.strip().lower() == "error: release: not found"
+        and command_error_text(result.stderr).lower() == "error: release: not found"
     )
 
 

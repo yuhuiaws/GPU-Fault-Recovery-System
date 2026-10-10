@@ -6,7 +6,7 @@ import json
 import re
 from collections.abc import Sequence
 
-from gpu_fault.admin.process_supervisor import write_diagnostic
+from gpu_fault.admin.process_supervisor import PROGRESS_LINE, write_diagnostic
 
 _PRIVATE_KEY = re.compile(
     r"-----BEGIN [^-]*PRIVATE KEY-----.*?(?:-----END [^-]*PRIVATE KEY-----|$)",
@@ -142,17 +142,19 @@ def diagnostic_command(arguments: Sequence[str], *, sensitive: bool = False) -> 
     return " ".join(result)
 
 
+# The wait heartbeat is the supervisor's own line; its definition lives there.
 _PROGRESS = re.compile(
-    r"(?:"
-    r"release-(?:begin|end|phase) [0-9TZ:-]+ "
-    r"[a-zA-Z0-9_=/.-]+(?: (?:mode|dry_run|exit_code|total|elapsed|lifecycle|clusters)="
-    r"[a-zA-Z0-9_./-]+)*"
-    r"|bootstrap task=[a-zA-Z0-9_:./-]+ (?:start|cache-hit|"
-    r"failure_type=[a-zA-Z_][a-zA-Z0-9_]*|"
-    r"[a-z+]+ status=[a-z]+ duration=[0-9.]+s runner_commands=[0-9]+)"
-    r"|deployment-wait command=[a-z0-9_.-]+ state=(?:running|cleanup) "
-    r"elapsed=[0-9]+s remaining=[0-9]+s"
-    r")"
+    "|".join(
+        (
+            r"release-(?:begin|end|phase) [0-9TZ:-]+ [a-zA-Z0-9_=/.-]+"
+            r"(?: (?:mode|dry_run|exit_code|total|elapsed|lifecycle|clusters)="
+            r"[a-zA-Z0-9_./-]+)*",
+            r"bootstrap task=[a-zA-Z0-9_:./-]+ (?:start|cache-hit|"
+            r"failure_type=[a-zA-Z_][a-zA-Z0-9_]*|"
+            r"[a-z+]+ status=[a-z]+ duration=[0-9.]+s runner_commands=[0-9]+)",
+            PROGRESS_LINE.pattern,
+        )
+    )
 )
 
 

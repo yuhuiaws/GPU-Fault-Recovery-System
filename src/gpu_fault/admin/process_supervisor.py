@@ -17,6 +17,7 @@ import json
 import math
 import os
 from pathlib import Path
+import re
 import signal
 import stat
 import subprocess
@@ -35,6 +36,14 @@ TERMINATION_GRACE_SECONDS = 10.0
 POLL_SECONDS = 0.02
 DIAGNOSTIC_JOIN_SECONDS = 2.0
 REPORT_MAX_BYTES = 4096
+REPORT_INTERVAL_SECONDS = 30.0
+# The supervisors' own wait heartbeat. ``DriverDiagnostics`` streams it and the
+# capture path splits it back out of a command's stderr; both must agree on the
+# exact shape, so this is the only definition.
+PROGRESS_LINE = re.compile(
+    r"deployment-wait command=[a-z0-9_.-]+ state=(?:running|cleanup) "
+    r"elapsed=[0-9]+s remaining=[0-9]+s"
+)
 _SUPERVISION_LOST = threading.Event()
 _INTERRUPTED = threading.Event()
 _GUARDIANS_LOCK = threading.RLock()
@@ -268,6 +277,24 @@ def write_diagnostic(
                 pass
 
 
+def split_progress_lines(text: str) -> tuple[str, list[str]]:
+    """Separate the supervisors' wait heartbeats from a command's captured stderr.
+
+    In capture mode the supervisors and the command share one stderr pipe, so a
+    command slower than the report interval would otherwise hand its caller the
+    heartbeat as part of its own output. Only a line that is exactly a heartbeat
+    is taken out; every other byte is returned verbatim and in order.
+    """
+    own: list[str] = []
+    progress: list[str] = []
+    for line in text.splitlines(keepends=True):
+        if PROGRESS_LINE.fullmatch(line.removesuffix("\n")):
+            progress.append(line)
+        else:
+            own.append(line)
+    return "".join(own), progress
+
+
 def _configure_subreaper(owner: int) -> None:
     if sys.platform != "linux" or not hasattr(signal, "pidfd_send_signal"):
         raise OSError(errno.ENOSYS, "deployment supervision requires Linux pidfds")
@@ -349,6 +376,7 @@ def _fork_owner(
     expires: float,
     pass_fds: Sequence[int],
     grace: float,
+    report_interval: float,
     report_fd: int,
     guardian_report_fd: int,
 ) -> _WaitableChild:
@@ -377,6 +405,7 @@ def _fork_owner(
                 expires=expires,
                 pass_fds=pass_fds,
                 grace=grace,
+                report_interval=report_interval,
                 restore_signal_mask=old_mask,
             )
         except OSError as exc:
@@ -393,12 +422,15 @@ def supervise(
     expires: float,
     pass_fds: Sequence[int],
     grace: float = TERMINATION_GRACE_SECONDS,
+    report_interval: float = REPORT_INTERVAL_SECONDS,
     command_report_fd: int | None = None,
     guardian_report_fd: int | None = None,
     restore_signal_mask: set[int | signal.Signals] | None = None,
 ) -> dict[str, object]:
     if not math.isfinite(expires) or not 0 < grace <= 10:
         raise ValueError("invalid command deadline")
+    if not math.isfinite(report_interval) or report_interval <= 0:
+        raise ValueError("invalid progress report interval")
     stopped = False
 
     def stop(_signum: int, _frame: object) -> None:
@@ -423,6 +455,7 @@ def supervise(
             expires=expires,
             pass_fds=pass_fds,
             grace=grace,
+            report_interval=report_interval,
             report_fd=command_report_fd,
             guardian_report_fd=guardian_report_fd,
         )
@@ -430,7 +463,7 @@ def supervise(
     stopping_at: float | None = None
     signalled: set[tuple[int, str, signal.Signals]] = set()
     started = time.monotonic()
-    next_report = started + 30
+    next_report = started + report_interval
     while True:
         children = _reap(primary)
         now = time.monotonic()
@@ -465,7 +498,7 @@ def supervise(
                     f"elapsed={int(now - started)}s "
                     f"remaining={max(0, int(expires - now))}s\n",
                 )
-            next_report = now + 30
+            next_report = now + report_interval
         if stopping_at is not None:
             signum = signal.SIGKILL if now - stopping_at >= grace else signal.SIGTERM
             try:
@@ -504,6 +537,7 @@ def _supervisor_arguments(
     report_fd: int,
     pass_fds: Sequence[int],
     grace: float,
+    report_interval: float,
     command_report_fd: int | None = None,
 ) -> list[str]:
     return [
@@ -520,6 +554,8 @@ def _supervisor_arguments(
         str(report_fd),
         "--grace",
         str(grace),
+        "--report-interval",
+        str(report_interval),
         "--pass-fds",
         ",".join(str(item) for item in pass_fds),
         *(
@@ -714,6 +750,7 @@ def _run_owned_command(
             command_report_fd=descriptors[3],
             pass_fds=pass_fds,
             grace=TERMINATION_GRACE_SECONDS,
+            report_interval=REPORT_INTERVAL_SECONDS,
         )
         with contextlib.ExitStack() as inputs:
             stdin = None
@@ -764,6 +801,13 @@ def _run_owned_command(
         stdout, stderr = _communicate_owned(
             process, reports, allow_interrupted=allow_interrupted
         )
+        if stderr is not None:
+            # Capture mode shares the stderr pipe with both supervisors. Their
+            # heartbeats belong to the operator, not to the result a caller
+            # parses; they are forwarded here instead, without changing shape.
+            stderr, progress = split_progress_lines(stderr)
+            for line in progress:
+                write_diagnostic(line)
         return _command_result(
             arguments,
             reports=reports,
@@ -805,6 +849,9 @@ def main() -> None:
     parser.add_argument("--report-fd", type=int, required=True)
     parser.add_argument("--command-report-fd", type=int)
     parser.add_argument("--grace", type=float, default=TERMINATION_GRACE_SECONDS)
+    parser.add_argument(
+        "--report-interval", type=float, default=REPORT_INTERVAL_SECONDS
+    )
     parser.add_argument("--pass-fds", default="")
     parser.add_argument("command", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -817,6 +864,7 @@ def main() -> None:
             expires=args.expires,
             pass_fds=pass_fds,
             grace=args.grace,
+            report_interval=args.report_interval,
             command_report_fd=args.command_report_fd,
             guardian_report_fd=args.report_fd,
         )
