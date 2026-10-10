@@ -6,7 +6,6 @@ import hashlib
 import json
 import threading
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -29,6 +28,7 @@ from gpu_fault.store import InMemoryStore
 from scripts.e2e.regional import capacity_queued_lease as proof
 from scripts.e2e.regional.probes import cap004_commands as commands
 from tests._builders import asgi_client, build_context
+from tests.regional._cap004_lease_time import compress_claim_leases
 from tests.regional._regional_support import registration
 
 RUN_ID = "cap004queueack"
@@ -65,19 +65,14 @@ def local_api(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
         after=lambda _path, _payload, status, body: (status, body),
     )
 
-    class FastRenewalEvent(threading.Event):
-        def wait(self, timeout: float | None = None) -> bool:
-            return super().wait(None if timeout is None else timeout * TIME_SCALE)
-
-    def lease_deadline(seconds: int) -> datetime:
-        return datetime.now(timezone.utc) + timedelta(seconds=seconds * TIME_SCALE)
-
-    monkeypatch.setattr("gpu_fault.cluster_executor.lease.Event", FastRenewalEvent)
-    monkeypatch.setattr(
-        "gpu_fault.store.memory.remote_commands.lease_deadline", lease_deadline
-    )
-    monkeypatch.setattr(
-        "gpu_fault.store.shared.remote_commands.lease_deadline", lease_deadline
+    compress_claim_leases(
+        monkeypatch,
+        scale=TIME_SCALE,
+        store_class=InMemoryStore,
+        deadline_modules=(
+            "gpu_fault.store.memory.remote_commands",
+            "gpu_fault.store.shared.remote_commands",
+        ),
     )
     with start_blocking_portal() as portal:
 

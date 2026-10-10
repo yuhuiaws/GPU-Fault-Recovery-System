@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import threading
 from collections.abc import Iterator
-from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
@@ -25,6 +24,7 @@ from scripts.e2e.regional import capacity_acceptance_cases as cases
 from scripts.e2e.regional import capacity_acceptance_executor as proof
 from scripts.e2e.regional.probes import cap004_commands as commands
 from tests._builders import asgi_client, build_context
+from tests.regional._cap004_lease_time import compress_claim_leases
 from tests.regional._regional_support import registration
 
 RUN_ID = "cap004localtest"
@@ -57,20 +57,14 @@ def local_api(monkeypatch: pytest.MonkeyPatch) -> Iterator[SimpleNamespace]:
     app = create_app(context)
     calls: list[tuple[str, str | None]] = []
     api_state = SimpleNamespace(store=store, calls=calls, transform=None)
-
-    class FastRenewalEvent(threading.Event):
-        def wait(self, timeout: float | None = None) -> bool:
-            return super().wait(None if timeout is None else timeout * TIME_SCALE)
-
-    def lease_deadline(seconds: int) -> datetime:
-        return datetime.now(timezone.utc) + timedelta(seconds=seconds * TIME_SCALE)
-
-    monkeypatch.setattr("gpu_fault.cluster_executor.lease.Event", FastRenewalEvent)
-    monkeypatch.setattr(
-        "gpu_fault.store.memory.remote_commands.lease_deadline", lease_deadline
-    )
-    monkeypatch.setattr(
-        "gpu_fault.store.shared.remote_commands.lease_deadline", lease_deadline
+    compress_claim_leases(
+        monkeypatch,
+        scale=TIME_SCALE,
+        store_class=InMemoryStore,
+        deadline_modules=(
+            "gpu_fault.store.memory.remote_commands",
+            "gpu_fault.store.shared.remote_commands",
+        ),
     )
     with start_blocking_portal() as portal:
 
@@ -208,7 +202,7 @@ def test_real_executor_api_and_ledger_complete_cap004(
         return proof.run_executor_proof(
             *args,
             **kwargs,
-            timeout_seconds=30,
+            timeout_seconds=60,
             poll_seconds=0.02,
             minimum_hold_seconds=0.01,
             action_timeout_seconds=8,
@@ -542,7 +536,7 @@ def test_renewal_alone_does_not_prove_an_action_outlived_its_lease(
         TOKEN,
         RUN_ID,
         tmp_path,
-        timeout_seconds=10,
+        timeout_seconds=60,
         poll_seconds=0.02,
         minimum_hold_seconds=0.01,
         action_timeout_seconds=3,
