@@ -7,8 +7,13 @@ Before, every process carried its own literal (16 routine + 8 fault + 4
 evidence); on 3 api-ha Pods x 4 uvicorn workers that was up to 336 concurrent
 admission INSERT transactions on one table, the perf suite's load-start
 convoy. A fixed site-wide cap of 24 then shed telemetry instead (4,601
-requests expired in the queue while every process sat at 2 slots). The fault
-tier keeps a range of its own so a telemetry burst never takes a fault slot.
+requests expired in the queue while every process sat at 2 slots), a fixed 96
+passed (1,051 req/s, no 503s, 81 ms per flush), and an adaptive 48..192 with
+1.0 / 2.0 s thresholds brought the convoy back (~250 concurrent flushes, 1.08 s
+per flush, never closing). The release defaults are therefore the proven fixed
+caps with the floors equal to them (evidence keeps 12..24), and the thresholds
+sit at ~2x and ~4x the uncontended flush. The fault tier keeps a range of its
+own so a telemetry burst never takes a fault slot.
 """
 
 from __future__ import annotations
@@ -28,10 +33,10 @@ from tests.app_services._cov95_runtime_admission import BATCHERS, POOLS, item
 
 SITE_RANGES = {
     "GPU_FAULT_INGRESS_WRITER_PROCESSES": "12",
-    "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY": "192",
-    "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "48",
-    "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY": "96",
-    "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "24",
+    "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY": "96",
+    "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "96",
+    "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY": "48",
+    "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "48",
     "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY": "24",
     "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "12",
 }
@@ -81,16 +86,19 @@ def test_each_process_takes_its_share_of_the_site_wide_ranges(monkeypatch) -> No
     runtime = _runtime(monkeypatch, SITE_RANGES)
     try:
         assert _ranges(runtime) == {
-            "routine": (4, 4, 16),
-            "fault": (2, 2, 8),
+            "routine": (8, 8, 8),
+            "fault": (4, 4, 4),
             "evidence": (1, 1, 2),
-        }, "every process starts at the floor; 16 routine is the pre-cap value"
+        }, "routine and fault are the proven fixed caps; evidence keeps a range"
+        assert runtime.admission_batcher.concurrency.adaptive is False
+        assert runtime.fault_batcher.concurrency.adaptive is False
+        assert runtime.evidence_batcher.concurrency.adaptive is True
         assert runtime.admission_batcher.flush_delay_max_seconds == 0.05
         assert runtime.fault_batcher.flush_delay_max_seconds == 0.05
         for name in ("admission_batcher", "fault_batcher", "evidence_batcher"):
             controller = getattr(runtime, name).concurrency
-            assert controller.open_below_seconds == 1.0
-            assert controller.close_above_seconds == 2.0
+            assert controller.open_below_seconds == 0.15
+            assert controller.close_above_seconds == 0.3
     finally:
         asyncio.run(_close(runtime))
 
@@ -153,7 +161,7 @@ def test_an_explicit_per_process_value_pins_both_ends(monkeypatch) -> None:
     try:
         assert _ranges(runtime) == {
             "routine": (5, 5, 5),
-            "fault": (2, 2, 8),
+            "fault": (4, 4, 4),
             "evidence": (3, 3, 3),
         }
         assert runtime.admission_batcher.flush_delay_max_seconds == 0.2
@@ -175,7 +183,7 @@ def test_the_thresholds_are_read_per_tier(monkeypatch) -> None:
         routine = runtime.admission_batcher.concurrency
         assert (routine.open_below_seconds, routine.close_above_seconds) == (0.4, 0.9)
         fault = runtime.fault_batcher.concurrency
-        assert (fault.open_below_seconds, fault.close_above_seconds) == (1.0, 3.0)
+        assert (fault.open_below_seconds, fault.close_above_seconds) == (0.15, 3.0)
     finally:
         asyncio.run(_close(runtime))
 
@@ -231,7 +239,7 @@ def test_without_site_values_a_bare_process_keeps_the_historical_defaults(
         (
             {
                 **SITE_RANGES,
-                "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "193",
+                "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY_FLOOR": "97",
             },
             "FLUSH_CONCURRENCY_FLOOR cannot exceed",
         ),

@@ -25,17 +25,20 @@ from gpu_fault_release.regional_release_rendering import (
     admin_config_renderer_environment,
 )
 
-# Live calibration on the 32-cluster integrated suite: a fixed cap of 24 (2 per
-# process) ran at its cap for the whole load start and expired 4,601 requests
-# (18.7 % reserved 503s, 517 req/s, 0.59 s per flush); 96/48 admitted the same
-# burst at 1,051 req/s with no expiry and 81 ms per flush but was still binding
-# (in_flight_max 8 everywhere) against the 1,428-1,542 req/s the site did with
-# 16 slots per process before any cap existed, which schema v22 made safe again.
+# Live calibration on the 32-cluster integrated suite (schema v22, 12 ingress
+# processes): a fixed cap of 24 (2 per process) ran at its cap for the whole
+# load start and expired 4,601 requests (18.7 % reserved 503s, 517 req/s,
+# 0.59 s per flush); a fixed 96/48 (8/4 per process) admitted the same burst at
+# 1,051 req/s with no 503s, 81 ms per flush and BufferContent waits at 1 %; an
+# adaptive 48..192 (4..16 per process) let the site reach ~250 concurrent
+# flushes and the convoy returned (1.08 s per flush, 35.8 % of telemetry shed).
+# The store tolerates ~100 concurrent flushes on this schema, so the ceilings
+# are the proven fixed caps and the routine and fault floors equal them.
 DEFAULTS = {
-    "admission_flush_concurrency": 192,
-    "admission_flush_concurrency_floor": 48,
-    "fault_admission_flush_concurrency": 96,
-    "fault_admission_flush_concurrency_floor": 24,
+    "admission_flush_concurrency": 96,
+    "admission_flush_concurrency_floor": 96,
+    "fault_admission_flush_concurrency": 48,
+    "fault_admission_flush_concurrency_floor": 48,
     "evidence_admission_flush_concurrency": 24,
     "evidence_admission_flush_concurrency_floor": 12,
     "admission_batch_delay_max_seconds": 0.05,
@@ -115,16 +118,16 @@ def test_the_fleet_share_is_each_value_divided_among_the_ingress_processes() -> 
     assert ingress_writer_processes() == 12, "3 api-ha replicas x uvicorn --workers 4"
     processor = default_admin_config().processor
     assert processor.admission_flush_ranges() == {
-        "admission": (48, 192),
-        "faultAdmission": (24, 96),
+        "admission": (96, 96),
+        "faultAdmission": (48, 48),
         "evidenceAdmission": (12, 24),
     }
     assert processor.admission_flush_slots_per_process() == {
-        "routine": (4, 16),
-        "fault": (2, 8),
+        "routine": (8, 8),
+        "fault": (4, 4),
         "evidence": (1, 2),
-    }, "floor and ceiling per process; 16 routine is the pre-cap value v22 made safe"
-    assert flush_slots_per_process(192, 12) == 16
+    }, "floor and ceiling per process; 8/4 is the fixed cap that passed live"
+    assert flush_slots_per_process(96, 12) == 8
     assert flush_slots_per_process(30, 12) == 3, "a cap that does not divide rounds up"
     assert flush_slots_per_process(1, 12) == 1, "every process keeps one slot"
     assert flush_slots_per_process(16, 1) == 16, "a bare process is a fleet of one"

@@ -75,8 +75,8 @@ class _ProcessorAdmissionBatcher:
         max_batch_size: int = 64,
         max_flush_groups: int = 16,
         min_flush_groups: int | None = None,
-        flush_open_below_seconds: float = 1.0,
-        flush_close_above_seconds: float = 2.0,
+        flush_open_below_seconds: float = 0.15,
+        flush_close_above_seconds: float = 0.3,
         flush_delay_seconds: float = 0.002,
         flush_delay_max_seconds: float | None = None,
         contention_flush_seconds: float = 0.1,
@@ -252,10 +252,23 @@ class _ProcessorAdmissionBatcher:
         ``contention_flush_seconds`` the store is the bottleneck, and a
         longer window is pure gain: the same requests leave in fewer, wider
         transactions, and statements are exactly what a contended table
-        needs fewer of (at ~1,000 req/s a 20-50 ms window cuts them 3-5x).
-        The delay ramps linearly from the base at the threshold to
-        ``flush_delay_max_seconds`` at twice the threshold and follows the
-        EWMA back down, so an uncontended store never pays it.
+        needs fewer of. The delay ramps linearly from the base at the
+        threshold to ``flush_delay_max_seconds`` at twice the threshold and
+        follows the EWMA back down, so an uncontended store never pays it.
+
+        The window is not a lever on items per flush while the store is
+        quick, and widening it there costs throughput: a flush is one
+        transaction per cluster scope, so what a flush carries is the number
+        of requests of that cluster inside this process at the time, not
+        what arrived during the window. A closed-loop simulation of one
+        process (32 clusters, 8 slots, an 81 ms store round trip) carried
+        1.0 / 3.0 / 12.5 items per flush with 16 / 96 / 400 requests in
+        flight whatever the window did, while a 20 ms base cost 17 % of the
+        throughput and a 50 ms window held under saturation cost 35 %: the
+        sleep before a pass idles the slot a completed flush just freed. The
+        live 2.5 items per flush at 8 slots were ~65 requests pending per
+        process over 32 clusters; more items per flush means more of the
+        burst inside the process at once, which no window provides.
         """
 
         base, cap = self.flush_delay_seconds, self.flush_delay_max_seconds

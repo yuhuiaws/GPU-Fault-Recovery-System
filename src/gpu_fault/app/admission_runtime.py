@@ -659,18 +659,18 @@ class AdmissionRuntimeFactory:
             min_flush_groups=floor,
             # The flush-latency EWMA band the controller moves the limit in:
             # it opens slots below the first value and closes them above the
-            # second. Sized from the live site: 81 ms per flush uncontended,
-            # 0.59 s when a fixed cap of 2 per process queued 16-item batches
-            # (under-capacity, which must open), 2.2-3.6 s inside the
-            # pre-v22 convoy (contention, which must close).
+            # second. Multiples of the live site's uncontended 81 ms flush
+            # (~2x and ~4x): the range that failed live averaged 1.08 s per
+            # flush under a 2.0 s close threshold and never closed, while
+            # the proven fixed cap ran at 81 ms (admission_concurrency).
             flush_open_below_seconds=float(
                 os.getenv(
-                    f"{base}{prefix}ADMISSION_FLUSH_CONCURRENCY_OPEN_SECONDS", "1.0"
+                    f"{base}{prefix}ADMISSION_FLUSH_CONCURRENCY_OPEN_SECONDS", "0.15"
                 )
             ),
             flush_close_above_seconds=float(
                 os.getenv(
-                    f"{base}{prefix}ADMISSION_FLUSH_CONCURRENCY_CLOSE_SECONDS", "2.0"
+                    f"{base}{prefix}ADMISSION_FLUSH_CONCURRENCY_CLOSE_SECONDS", "0.3"
                 )
             ),
             flush_delay_seconds=delay,

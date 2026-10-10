@@ -1300,22 +1300,32 @@ small and cannot explain second-level latency.
    adaptive now: once the flush-duration EWMA passes 100 ms it rises to
    `spec.processor.admissionBatchDelayMaxSeconds` (default 0.05) and falls back as the store
    recovers, so an A/B only compares the base delay. The site-wide range of concurrent admission
-   flushes (ceilings `admissionFlushConcurrency` and friends, defaults 192/96/24; floors
-   `admissionFlushConcurrencyFloor` and friends, defaults 48/24/12; shared by the 12 ingress
-   processes, each of which opens one slot per completed flush while saturated with a flush EWMA
-   below 1.0 s and halves its headroom above 2.0 s) is in Administrator Capacity Configuration
-   §4.6. Calibration on this site: a fixed cap of 24 (2 per process) ran integrated-32 at 517 req/s
-   with an 18.7% reserved-503 share for routine telemetry (4,601 requests expired in the queue,
-   762-801 queued per process, 0.59 s per flush); 96/48 gave 1,051 req/s, zero reserved 503s and
-   zero P0 503s, 81 ms per flush and 1% `BufferContent`, but `in_flight_max` still equalled the
-   limit of 8 on every process, while this site reached 1,428-1,542 req/s before any site-wide cap
-   existed (16 slots per process). The acceptance target for the default configuration is therefore
-   1,400+ req/s with zero reserved 503s and zero P0 503s; when reviewing a run read
-   `gpu_fault_processor_admission_batch_in_flight_limit` (below the per-process ceiling of 16,
-   otherwise the ceiling is still the bottleneck), `..._in_flight_limit_raised_total` /
-   `..._lowered_total` and `..._expired_total` (must be 0), plus the peak active statement count and
-   the `BufferContent` share in the `pg_stat_activity` samples (the controller's only legitimate
-   reason to close slots is flush latency actually climbing).
+   flushes (ceilings `admissionFlushConcurrency` and friends, defaults 96/48/24; floors
+   `admissionFlushConcurrencyFloor` and friends, defaults 96/48/12 -- the routine and fault floors equal their
+   ceilings, i.e. the fixed caps that passed; shared by the 12 ingress processes, whose controller acts only where
+   a range is open: one slot opened while saturated with a flush EWMA below 0.15 s, the headroom halved above
+   0.30 s, every change after a settled generation of flushes at the current level) is in Administrator Capacity
+   Configuration §4.6. Three calibration points on this site (the same schema v22, the same 32-cluster burst, 12
+   processes): a **fixed 24** (2 per process) ran integrated-32 at 517 req/s with an 18.7% reserved-503 share for
+   routine telemetry (4,601 requests expired in the queue, 762-801 queued per process, 0.59 s per flush); a
+   **fixed 96/48** (8/4 per process) gave 1,051 req/s, zero reserved 503s and zero P0 503s, 81 ms per flush, 1%
+   `BufferContent` and a peak of 113 active statements for about 5 s; an **adaptive 48..192** (4..16 per
+   process, thresholds 1.0/2.0 s) gave 543 req/s, a 35.8% reserved-503 share (8,796), P0 503s, fault p50/p99 of
+   0.35/28.4 s, per-process limits settling at 20-23 while flapping (81 raises, 51 lowers), 615-831 pending at
+   the peak, 1.08 s per flush on average and a 69 s storm in the database (142 active statements at the peak,
+   `BufferContent` 36%, CPU 31%, `XactSync` 23%) -- ~250 concurrent flushes site-wide brought the page-lock
+   convoy on the queue table back, and 1.08 s is below the 2.0 s close threshold, so the slots were never given
+   back. Conclusion: the store tolerates about 100 concurrent admission flushes on this schema; this site's
+   historical 1,400+ req/s (192 slots) predates the v20 per-writer ledger and is not reachable by concurrency
+   alone, and items per flush are not a lever the coalescing window can pull either (see the closed-loop
+   simulation in Administrator Capacity Configuration §4.6). The acceptance target for the default configuration
+   is therefore 1,000+ req/s with zero reserved 503s and zero P0 503s; when reviewing a run read
+   `gpu_fault_processor_admission_batch_in_flight_limit` (constant at 8/4 on the routine/fault tiers with
+   `..._in_flight_limit_raised_total` / `..._lowered_total` at 0; the evidence tier may move within 1..2),
+   `..._expired_total` (must be 0), the average flush duration (`gpu_fault_processor_admission_batch_flush_seconds_sum / _count`, close to
+   81 ms), plus the peak active statement count (~113) and the `BufferContent` share (~1%) in the
+   `pg_stat_activity` samples; where an administrator opens a range, the controller's only legitimate reason to
+   close slots is still flush latency actually climbing.
 7. **Distinguish cold and warm connection SLOs.** Cold results include TCP/TLS setup, warm results
    measure steady-state service capability; both must be saved, and warm results must not replace
    the public/NLB first-request threshold.

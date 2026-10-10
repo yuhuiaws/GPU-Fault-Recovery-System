@@ -1942,30 +1942,39 @@ admission batch delay `GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_SECONDS` comes 
 `spec.processor.admissionBatchDelaySeconds` (default 0.002, omitted from records while at the default; the fault and
 evidence batch delays keep their own 2 ms literals; see Administrator Capacity Configuration §1 and §4.6). Concurrent
 admission flushes run in a site-wide range: the ceilings `spec.processor.admissionFlushConcurrency` /
-`faultAdmissionFlushConcurrency` / `evidenceAdmissionFlushConcurrency` (defaults 192/96/24) and the floors
+`faultAdmissionFlushConcurrency` / `evidenceAdmissionFlushConcurrency` (defaults 96/48/24) and the floors
 `admissionFlushConcurrencyFloor` / `faultAdmissionFlushConcurrencyFloor` / `evidenceAdmissionFlushConcurrencyFloor`
-(defaults 48/24/12, validated floor <= ceiling), rendered as
-`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_FLUSH_CONCURRENCY{,_FLOOR}`; the ingress divides each by
-`GPU_FAULT_INGRESS_WRITER_PROCESSES` (3 replicas x 4 processes = 12) into `ceil(value/12)` per process (an explicit
-`*_ADMISSION_BATCH_GROUPS` still pins both ends per process). Inside each process
-`app/admission_concurrency.py::FlushConcurrencyController` is asked by the dispatcher on every pass: saturated (every
-slot busy, work still queued) with a flush-duration EWMA below `..._ADMISSION_FLUSH_CONCURRENCY_OPEN_SECONDS` (default
-1.0) opens one slot per completed flush (floor to ceiling within a few hundred milliseconds); an EWMA above
-`..._CLOSE_SECONDS` (default 2.0) after a generation of flushes at the current level (`max(3, limit)`) halves the
-headroom above the floor; between the thresholds it holds; a limit that stops binding gives back one slot per
-generation down to the floor. The arrival-time deadline projection counts the slot wait in rounds of the concurrency
-the controller is about to open (the ceiling while the EWMA is below the open threshold, the live limit otherwise), so
-capacity that is opening is not counted as missing. `/metrics`:
+(defaults 96/48/12, validated floor <= ceiling; the routine and fault floors equal their ceilings, so their controller
+is a constant), rendered as `GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_FLUSH_CONCURRENCY{,_FLOOR}`; the ingress
+divides each by `GPU_FAULT_INGRESS_WRITER_PROCESSES` (3 replicas x 4 processes = 12) into `ceil(value/12)` per process
+(8/4 per process and 1..2 for evidence by default; an explicit `*_ADMISSION_BATCH_GROUPS` still pins both ends per
+process). Where a range is open, `app/admission_concurrency.py::FlushConcurrencyController` inside each process is
+asked by the dispatcher on every pass: saturated (every slot busy, work still queued) with a flush-duration EWMA below
+`..._ADMISSION_FLUSH_CONCURRENCY_OPEN_SECONDS` (default 0.15) opens one slot; an EWMA above `..._CLOSE_SECONDS`
+(default 0.30) halves the headroom above the floor; between the thresholds it holds; a limit that stops binding gives
+back one slot down to the floor. Every change waits for a generation of flushes at the current level (`max(3, limit)`),
+a raise included -- a raise used to need one completed flush, and the live limit flapped 81 raises and 51 lowers in 14
+minutes. The arrival-time deadline projection counts the slot wait in rounds of the concurrency the controller is
+about to open (the ceiling while the EWMA is below the open threshold, the live limit otherwise), so capacity that is
+opening is not counted as missing. `/metrics`:
 `gpu_fault_processor_{,fault_,evidence_}admission_batch_in_flight_limit` (live value, summed over a Pod's processes)
 and `..._in_flight_limit_raised_total` / `..._lowered_total` (per process). The coalescing window rises to
 `admissionBatchDelayMaxSeconds` (`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_BATCH_DELAY_MAX_SECONDS`, default
-0.05) once the flush EWMA passes 100 ms: the window widens first (0.1-0.2 s), the concurrency keeps opening below
-1.0 s, and only above 2.0 s are slots closed. The defaults come from this site's integrated-32 calibration: a fixed cap
-of 24 (2 per process) gave 517 req/s with 4,601 requests expired in the queue (18.7% reserved 503s) at 0.59 s per flush;
-96/48 gave 1,051 req/s, zero 503s, 81 ms per flush and 1% `BufferContent`, yet `in_flight_max` still sat at the ceiling
-of 8 on every process, while the site reached 1,428-1,542 req/s before any site-wide cap existed (16 slots per
-process) -- schema v22 removed the reason 192 concurrent flushes convoyed, so the ceiling returns to 192 and the
-controller closes slots only when flush latency actually climbs.
+0.05) once the flush EWMA passes 100 ms: the window widens first (0.1-0.2 s), the concurrency may still open below
+0.15 s, holds between 0.15 and 0.30 s, and closes above 0.30 s. The window is not a lever on items per flush: a flush is
+one transaction for one cluster, and it carries that cluster's requests in flight inside the process at dispatch (a
+closed-loop simulation of one process gave 1.0 / 3.0 / 12.5 items per flush for 16 / 96 / 400 requests in flight
+whatever the window did), while a wider window only idles the slot a flush just freed (a 20 ms base window cost 17% of
+the throughput, a 50 ms window held under saturation 35%). The defaults come from three calibration points of this
+site's integrated-32 suite (the same schema v22, 12 processes): a fixed 24 (2 per process) gave 517 req/s with 4,601
+requests expired in the queue (18.7% reserved 503s) at 0.59 s per flush; a fixed 96/48 gave 1,051 req/s, zero 503s,
+81 ms per flush and 1% `BufferContent`; an adaptive 48..192 (thresholds 1.0/2.0 s) let the site reach ~250 concurrent
+flushes and the page-lock convoy on `gpu_fault_processor_queue` returned (a 69 s storm, 142 active statements at the
+peak, `BufferContent` 36%, 1.08 s per flush, 35.8% reserved 503s, P0 503s) while 1.08 s stayed below the 2.0 s close
+threshold and no slot was ever given back -- the store tolerates about 100 concurrent admission flushes on this schema,
+the historical 1,400+ req/s at 192 slots predates the v20 per-writer ledger and is not reachable by concurrency alone,
+so the ceilings are the fixed caps that passed and the controller serves ranges an administrator opens and the
+evidence tier.
 
 Process liveness and the GC policy (`app/liveness.py`, `app/process_health.py`): at the end of lifespan start-up every
 uvicorn worker binds `GPU_FAULT_LIVENESS_PORT` with `SO_REUSEPORT` (the renderer sets service port + 10; 0 turns it
