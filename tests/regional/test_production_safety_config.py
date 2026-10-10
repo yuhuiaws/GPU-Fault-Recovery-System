@@ -148,11 +148,16 @@ def test_processor_replay_secret_is_separate_and_liveness_is_http() -> None:
     assert replay["key"] == "processor-replay-secret"
     assert execution["key"] != replay["key"]
     # ARCH-H1: liveness is process-local (/livez) so an Aurora failover does
-    # not restart every Pod; readiness keeps the store-backed /healthz.
-    assert container(ingress)["livenessProbe"]["httpGet"] == {
-        "path": "/livez",
-        "port": 8080,
-    }, "liveness must not depend on the store"
+    # not restart every Pod; readiness keeps the store-backed /healthz. The
+    # probe uses the per-worker liveness listener (service port + 10), never
+    # the shared request socket, so a cold-connect burst queued in that
+    # socket's accept queue cannot starve the kubelet's probe connection.
+    liveness = container(ingress)["livenessProbe"]["httpGet"]
+    assert liveness["path"] == "/livez", "liveness must not depend on the store"
+    assert liveness["port"] == 8090, "liveness must use the dedicated listener port"
+    assert liveness["port"] != container(ingress)["readinessProbe"]["httpGet"]["port"], (
+        "liveness must not share the request socket with readiness/traffic"
+    )
     assert container(ingress)["readinessProbe"]["httpGet"]["path"] == "/healthz", (
         "readiness must keep failing closed on the store"
     )
