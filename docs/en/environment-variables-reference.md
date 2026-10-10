@@ -445,6 +445,7 @@ validates them (integers/numbers must parse, booleans must be `0/1/true/false/ye
 | `GPU_FAULT_PROCESSOR_ADMISSION_BATCH_SIZE` | Processor | text | `<dynamic>` | `gpu_fault.app.admission_runtime` |
 | `GPU_FAULT_PROCESSOR_ADMISSION_PROJECTION_MARGIN` | Processor | text | `<dynamic>` | `gpu_fault.app.admission_runtime` |
 | `GPU_FAULT_PROCESSOR_BUSY_BACKOFF_MAX_SECONDS` | Processor | number | `'0.4'` | `gpu_fault.processor.settings` |
+| `GPU_FAULT_PROCESSOR_BUSY_EMPTY_ROUNDS_BEFORE_IDLE` | Processor | integer | `'8'` | `gpu_fault.processor.settings` |
 | `GPU_FAULT_PROCESSOR_CLAIM_WINDOW_MULTIPLIER` | Processor | integer | `'8'` | `gpu_fault.store.postgres.store` |
 | `GPU_FAULT_PROCESSOR_CLEANUP_BATCH_SIZE` | Processor | text | `'1000'` | `gpu_fault.app.periodic_services` |
 | `GPU_FAULT_PROCESSOR_CLEANUP_BUDGET_SECONDS` | Processor | text | `'20'` | `gpu_fault.app.periodic_services` |

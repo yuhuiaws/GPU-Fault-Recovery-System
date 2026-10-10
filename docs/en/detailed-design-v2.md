@@ -1845,6 +1845,38 @@ so the cost of one claim is bounded by **window × number of include paths**, in
 literals, not parameters. Window size = target batch × `GPU_FAULT_PROCESSOR_CLAIM_WINDOW_MULTIPLIER`
 (default 8); the headroom covers same-lane folding and rows discarded because of interlock faults.
 
+**Planner discipline** (`store/postgres/planner_discipline.py`): the claim, lease renewal/release/reclaim,
+completion and admission transactions start with `SET LOCAL enable_seqscan = off`, scoped to that transaction. A
+burst grew `gpu_fault_processor_queue` from 45 to 5,800 pages inside a minute while `pg_class` still said 138 rows
+(autoanalyze is asynchronous); on that estimate the planner chose "scan every candidate, sort, take the window" for
+the claim window and sequential scans for the correlated `EXISTS` probes (retry barrier, STRICT predecessor,
+fault/observation interlock) and the completion's row locking, and the heap was scanned 300-600 times a second
+(`LWLock:BufferContent` took 90% of the INSERT's active time). The window's `ORDER BY (priority, created_at,
+request_id) LIMIT window` is exactly the stored order of `priority_claim`/`path_priority_claim`, so once the heap
+scan is priced out the planner walks the index in claim order and stops at the window; the lane probes walk
+`gpu_fault_processor_queue_lane` and the depth reads the counts primary key. Measured on 5,000 PENDING rows
+(`tests/store/test_postgres_claim_planner_discipline.py`, numbers recorded as test properties): the path-filtered
+sub-window -- the shape 7 of the 8 sub-claims per cycle use -- read 2,323 shared blocks, touched all 5,000 rows and
+ran 24 ms by default, under stale and fresh statistics alike; with the setting it read 769 blocks, touched the 72-row
+window and ran 4 ms. The unfiltered and excluded-path windows already walked the index (772 -> 769 blocks, 4.5 -> 4.0
+ms), and a two-row table went from 3.9 to 1.0 ms. `enable_sort = off` was measured and rejected: it also yields the ordered walk, but the claim
+statement then executes in 1.3-1.7 s on a two-row table and on 5,000 rows alike (the sorts that must remain -- the
+ordered lane insert, the `DISTINCT ON`, the final ordering -- are driven onto pathological alternatives) where the
+default takes a few milliseconds. The setting is a cost penalty, not a prohibition: a statement no index can serve
+still scans and nothing fails. `plan_cache_mode = force_custom_plan` was evaluated and not adopted (psycopg prepares
+after the fifth execution; a generic plan built under `enable_seqscan = off` cannot regress to a heap scan, the only
+varying parameters are time bounds, limits and the owner, and forcing custom plans would re-plan the multi-CTE claim
+on every one of several hundred rounds a second).
+
+**Lane lifecycle**: the lane table holds one row per ordering key; a key claimed again is updated in place by
+`INSERT ... ON CONFLICT DO UPDATE` (epoch +1), completion/release only move `lease_expires_at`, and the retention
+sweep (`GPU_FAULT_PROCESSOR_LANE_RETENTION_SECONDS`, default 3600) deletes the row an hour after the lease ended --
+the row is only needed while a stale fencing token could still be presented, and deleting it resets the epoch safely
+because every fencing predicate also matches the random `lease_token`. The lane heap's growth during a burst equals
+the burst's distinct ordering keys (one per node or attempt) and is inherent; the sweep hands the space back and the
+schema v19 autovacuum thresholds (fillfactor 50) let the next burst reuse those pages instead of growing
+(`tests/store/test_postgres_lane_footprint.py`: three bursts of 200 keys, equal heap size after each).
+
 **④ Thread/coroutine model**: per process: 1 inbox thread + pooled workers
 (`PROCESSOR_WORKERS=24` in total; `FAULT_WORKERS=4`, `GPU_TELEMETRY_WORKERS=4`,
 `HOST_TELEMETRY_WORKERS=4`, `OBSERVATION_WORKERS=2`,
@@ -1862,7 +1894,12 @@ requests already started run to completion or are taken over via lease/fencing.
 **⑦ Timeouts/retries/circuit breakers**: request lease 150s / renewal 10s / maximum execution 120s / response timeout 115s;
 maximum age of a retryable response 300s. 408/425/429/5xx write back
 `not_before = now + min(30s, 1s × 2^min(previous_retry_count,16))` instead of re-queuing
-immediately; idle backoff at most 2s (FAULT pool 0.5s), busy backoff 0.4s (FAULT pool 0.1s); overload returns
+immediately; idle backoff at most 2s (FAULT pool 0.5s), busy backoff 0.4s (FAULT pool 0.1s); after
+`GPU_FAULT_PROCESSOR_BUSY_EMPTY_ROUNDS_BEFORE_IDLE` (default 8) consecutive empty claim rounds on one stream, "this
+replica's pools are busy" no longer holds that stream at the busy ceiling and it backs off to the idle one (the v21
+edge notifications wake it when a row arrives; 92% of a perf run's claim rounds were empty while the busy ceiling held
+them at 0.4s); a backlog the store reports as lane-blocked keeps the busy ceiling, because rows already PENDING raise
+no notification edge and only polling drains that tail at the rate lanes free up; overload returns
 429 + `Retry-After: 2`.
 
 **⑧ Idempotency and concurrency control**: the four-tuple `lease_owner` + `leader_epoch` + random `lease_token` +
@@ -1883,7 +1920,10 @@ Completion is still one transaction per cluster; different clusters can run in p
 **⑨ Configuration parameters**: besides ④⑤⑦ in this section, retries use
 `GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS=1` /
 `_MAX_SECONDS=30`, completion uses
-`GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY=1`; cleanup is described in §2.3.1.
+`GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY=1`; cleanup is described in §2.3.1. The ingress's routine
+admission batch delay `GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_SECONDS` comes from the AdminConfig field
+`spec.processor.admissionBatchDelaySeconds` (default 0.002, omitted from records while at the default; the fault and
+evidence batch delays keep their own 2 ms literals; see Administrator Capacity Configuration §1 and §4.6).
 
 **⑩ Logs/metrics/alerts**: `processor_request_id`, `path`, `priority`, `cluster_id`,
 `lane`, `lease_owner`, `leader_epoch`, `attempt`, `response_status`,

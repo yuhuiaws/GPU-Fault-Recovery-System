@@ -592,6 +592,12 @@ def renderer_admin_config() -> AdminConfig:
                     str(processor.completed_retention_seconds),
                 )
             ),
+            "admission_batch_delay_seconds": float(
+                os.getenv(
+                    "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_SECONDS",
+                    str(processor.admission_batch_delay_seconds),
+                )
+            ),
         },
         "workflow": {
             "poll_interval_seconds": float(
@@ -776,6 +782,9 @@ def configure_admin_tuning(container: dict, config: AdminConfig) -> None:
         "GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS": (
             processor.completed_retention_seconds
         ),
+        "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_SECONDS": (
+            processor.admission_batch_delay_seconds
+        ),
         "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS": (workflow.poll_interval_seconds),
         "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS": (workflow.dispatcher_workers),
         "GPU_FAULT_NOTIFICATION_BATCH_SIZE": notification.batch_size,
@@ -883,10 +892,13 @@ def main() -> None:
         "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_SIZE",
         "64",
     )
+    # The routine admission batch delay is an AdminConfig knob
+    # (spec.processor.admissionBatchDelaySeconds); the fault and evidence
+    # batchers keep their 2 ms so a fault never waits on a routine flush.
     set_env(
         ingress,
         "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_SECONDS",
-        "0.002",
+        environment_text(admin_config.processor.admission_batch_delay_seconds),
     )
     set_env(
         ingress,

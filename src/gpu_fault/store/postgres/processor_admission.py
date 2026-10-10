@@ -5,6 +5,7 @@ from typing import Any, Callable
 
 from gpu_fault.processor import ProcessorRequestStatus
 from gpu_fault.processor.models import ROUTINE_PRIORITY
+from gpu_fault.store.postgres.planner_discipline import pin_hot_path_plans
 from gpu_fault.store.shared.processor_helpers import (
     PartialEnqueueError,
     coalesce_routine_sample,
@@ -47,6 +48,7 @@ class PostgresProcessorAdmissionMixin:
         global_admission_guard: int = 256,
     ):
         with self._db.transaction():
+            pin_hot_path_plans(self._db)
             with self._db.cursor() as cursor:
                 cursor.execute(
                     f"""
@@ -594,6 +596,7 @@ class PostgresProcessorAdmissionMixin:
                 global_admission_guard=global_admission_guard,
             )
         with self._db.transaction():
+            pin_hot_path_plans(self._db)
             existing, pending = self._load_processor_admission_rows(requests)
             plan = self._plan_processor_admission(requests, existing, pending)
             depths, global_depth = self._lock_processor_admission_capacity(

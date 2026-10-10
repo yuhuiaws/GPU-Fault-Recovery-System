@@ -34,6 +34,7 @@ from gpu_fault.processor.batching import (
 )
 from gpu_fault.processor.lane_runtime import ProcessorLaneRuntimeMixin
 from gpu_fault.processor.metrics import ProcessorMetricsMixin
+from gpu_fault.processor.claim_backoff import BackoffCeilings, empty_round_ceiling
 from gpu_fault.processor.models import (
     ProcessorLeadership,
     ProcessorRequest,
@@ -177,6 +178,7 @@ class ProcessorCoordinator(
                 lease.fault_idle_backoff_max_seconds,
             ),
         )
+        self.busy_empty_rounds_before_idle = lease.busy_empty_rounds_before_idle
         self.processor_notification_fallback_seconds = max(
             poll_seconds, lease.processor_notification_fallback_seconds
         )
@@ -185,6 +187,9 @@ class ProcessorCoordinator(
         )
         self._stream_idle_until: dict[str, float] = {}
         self._stream_idle_interval: dict[str, float] = {}
+        # Consecutive empty claim rounds per stream; cleared by a non-empty
+        # claim or a notification for the stream.
+        self._stream_empty_rounds: dict[str, int] = {}
         self._next_evidence_path: dict[str, str] = {}
         self._initialize_claim_metrics()
         self.worker_counts = pools.worker_counts()
@@ -218,6 +223,16 @@ class ProcessorCoordinator(
         self._initialize_spool_metrics()
         self._initialize_runtime_state(on_unhealthy)
 
+    def _backoff_ceilings(self) -> BackoffCeilings:
+        return BackoffCeilings(
+            idle=self.idle_backoff_max_seconds,
+            busy=self.busy_backoff_max_seconds,
+            fault_idle=self.fault_idle_backoff_max_seconds,
+            fault_busy=self.fault_busy_backoff_max_seconds,
+            notification_fallback=self.processor_notification_fallback_seconds,
+            notifications_enabled=self._notifications_enabled,
+        )
+
     def _initialize_claim_metrics(self) -> None:
         # Set while at least one worker pool has an unfinished future.
         self._pools_busy = False
@@ -228,6 +243,9 @@ class ProcessorCoordinator(
         self.claim_rows_by_stream: dict[str, int] = {}
         self.claim_empty_by_stream: dict[str, int] = {}
         self.claim_backoff_skips_total = 0
+        # Empty rounds that reached busy_empty_rounds_before_idle and let the
+        # stream back off past the busy ceiling.
+        self.claim_settled_empty_total = 0
         self.claim_probes_total = 0
         self.claim_lane_blocked_total = 0
         self.claim_seconds_sum = 0.0
@@ -693,10 +711,12 @@ class ProcessorCoordinator(
         if "*" in notification_streams:
             self._stream_idle_until.clear()
             self._stream_idle_interval.clear()
+            self._stream_empty_rounds.clear()
         else:
             for stream in notification_streams:
                 self._stream_idle_until.pop(stream, None)
                 self._stream_idle_interval.pop(stream, None)
+                self._stream_empty_rounds.pop(stream, None)
         self._check_execution_deadlines()
         for name, pool_futures in futures.items():
             completed = {future for future in pool_futures if future.done()}
@@ -910,39 +930,28 @@ class ProcessorCoordinator(
                 if rows:
                     self._stream_idle_until.pop(stream, None)
                     self._stream_idle_interval.pop(stream, None)
+                    self._stream_empty_rounds.pop(stream, None)
                 else:
+                    empty_rounds = self._stream_empty_rounds.get(stream, 0) + 1
+                    self._stream_empty_rounds[stream] = empty_rounds
+                    settled_empty = empty_rounds >= self.busy_empty_rounds_before_idle
+                    if settled_empty:
+                        self.claim_settled_empty_total += 1
                     next_interval = (
                         self._stream_idle_interval.get(stream, self.poll_seconds) * 2
                     )
-                    ceiling = (
-                        (
-                            self.processor_notification_fallback_seconds
-                            if self._notifications_enabled
-                            else self.fault_idle_backoff_max_seconds
-                        )
-                        if stream == "fault"
-                        else (
-                            self.processor_notification_fallback_seconds
-                            if self._notifications_enabled
-                            else self.idle_backoff_max_seconds
-                        )
+                    ceiling = empty_round_ceiling(
+                        self._backoff_ceilings(),
+                        stream=stream,
+                        next_interval=next_interval,
+                        settled_empty=settled_empty,
+                        pools_busy=self._pools_busy,
+                        lane_blocked=lambda: self._backlog_is_lane_blocked(
+                            now=now,
+                            include_paths=include_paths,
+                            exclude_paths=exclude_paths,
+                        ),
                     )
-                    if stream == "fault":
-                        if self._pools_busy or self._backlog_is_lane_blocked(
-                            now=now,
-                            include_paths=include_paths,
-                            exclude_paths=exclude_paths,
-                        ):
-                            ceiling = self.fault_busy_backoff_max_seconds
-                    elif next_interval > self.busy_backoff_max_seconds and (
-                        self._pools_busy
-                        or self._backlog_is_lane_blocked(
-                            now=now,
-                            include_paths=include_paths,
-                            exclude_paths=exclude_paths,
-                        )
-                    ):
-                        ceiling = self.busy_backoff_max_seconds
                     interval = min(ceiling, next_interval)
                     self._stream_idle_interval[stream] = interval
                     self._stream_idle_until[stream] = monotonic + interval

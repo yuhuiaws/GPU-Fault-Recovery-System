@@ -60,6 +60,7 @@ def test_lease_defaults_match_the_former_constructor_defaults() -> None:
         "busy_backoff_max_seconds": 0.4,
         "fault_idle_backoff_max_seconds": 0.5,
         "fault_busy_backoff_max_seconds": 0.1,
+        "busy_empty_rounds_before_idle": 8,
         "processor_notification_fallback_seconds": 5.0,
         "processor_notification_shard_count": 8,
     }

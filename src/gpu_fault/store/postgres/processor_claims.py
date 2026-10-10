@@ -16,6 +16,7 @@ from gpu_fault.processor.models import (
     ROUTINE_PRIORITY,
     STARVED_ROUTINE_PRIORITY,
 )
+from gpu_fault.store.postgres.planner_discipline import pin_hot_path_plans
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
@@ -489,6 +490,7 @@ class PostgresProcessorClaimsMixin:
         )
 
         with self._db.transaction():
+            pin_hot_path_plans(self._db)
             leadership = self.get_processor_leadership()
             if (
                 leadership is None
@@ -713,6 +715,7 @@ class PostgresProcessorClaimsMixin:
             routine_starvation_seconds=routine_starvation_seconds,
         )
         with self._db.transaction():
+            pin_hot_path_plans(self._db)
             with self._db.cursor() as cursor:
                 cursor.execute(sql, parameters)
                 rows = cursor.fetchall()

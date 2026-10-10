@@ -244,8 +244,22 @@ class ProcessorConfig(_Section):
     retry_backoff_seconds: int = 1
     retry_backoff_max_seconds: int = 30
     completed_retention_seconds: int = 600
+    # How long the ingress holds an admission batch open for more items before
+    # it flushes one INSERT transaction (GPU_FAULT_PROCESSOR_ADMISSION_BATCH_
+    # DELAY_SECONDS). 0.002 is the release default: at ~1,000 req/s a flush
+    # carried 9.7 items on average (2,553 transactions for 25k items); the
+    # 性能压测验收方案 §13.3 tuned run at 0.05 improved completion p99 by ~14% at
+    # unchanged throughput but raised xact_rollback from 4 to 59, so the
+    # default stays until that is explained (§15 item 6). Omitted from records
+    # and YAML while at its default so every live desired.json keeps its digest.
+    admission_batch_delay_seconds: float = 0.002
+    OMIT_WHEN_DEFAULT = frozenset({"admission_batch_delay_seconds"})
 
     def validate(self) -> None:
+        if not 0 <= self.admission_batch_delay_seconds <= 0.5:
+            raise AdminConfigError(
+                "spec.processor.admissionBatchDelaySeconds must be within 0..0.5"
+            )
         bounds = {
             "maxQueueDepth": (self.max_queue_depth, 1024, 1_000_000),
             "maxClusterQueueDepth": (

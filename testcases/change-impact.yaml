@@ -167,6 +167,8 @@ rules:
     pytest:
       - tests/store/test_store_contracts.py
       - tests/store/test_postgres_processor_claim.py
+      - tests/store/test_postgres_claim_planner_discipline.py
+      - tests/store/test_postgres_lane_footprint.py
       - tests/store/test_postgres_reconnect.py
     regional_cases:
       - GF-REGIONAL-BOOT-030..031

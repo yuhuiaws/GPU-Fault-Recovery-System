@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from gpu_fault.store.postgres.planner_discipline import pin_hot_path_plans
 from gpu_fault.store.shared.cleanup_log import log_cleanup
 
 
@@ -80,6 +81,7 @@ class PostgresProcessorLeaseMixin:
         lease_duration: timedelta,
     ) -> bool:
         with self._state_transaction(f"processor_request/{request_id}"):
+            pin_hot_path_plans(self._db)
             self._lock_processor_queue_row(request_id)
             current = self.get_processor_request(request_id)
             now = datetime.now(timezone.utc)
@@ -152,6 +154,7 @@ class PostgresProcessorLeaseMixin:
         )
 
         with self._state_transaction(f"processor_request/{request_id}"):
+            pin_hot_path_plans(self._db)
             self._lock_processor_queue_row(request_id)
             current = self.get_processor_request(request_id)
             now = datetime.now(timezone.utc)
@@ -276,6 +279,7 @@ class PostgresProcessorLeaseMixin:
         )
 
         with self._state_transaction("processor_request/reclaim-expired"):
+            pin_hot_path_plans(self._db)
             with self._db.cursor() as cursor:
                 cursor.execute(
                     f"""
@@ -323,10 +327,12 @@ class PostgresProcessorLeaseMixin:
     ) -> int:
         """Bounded retention delete for the lane table.
 
-        The outer scan is served by ``gpu_fault_processor_lanes_expiry``
-        and the guard by ``gpu_fault_processor_queue_lane``, so no new
-        index is required. Resetting a lane epoch by deleting the row is
-        safe because every fencing predicate also matches ``lease_token``.
+        The outer scan reads the lane table (small: one row per ordering
+        key leased within the retention window; the ``_expiry`` index was
+        dropped in schema v19 as it only cost writes) and the guard is served
+        by ``gpu_fault_processor_queue_lane``. Resetting a lane epoch by
+        deleting the row is safe because every fencing predicate also
+        matches ``lease_token``.
         """
 
         with self._state_transaction("processor_lane/cleanup"):

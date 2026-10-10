@@ -23,7 +23,9 @@ Administrators can currently configure:
   the default 1024 corresponds to the preset 256-node cluster model);
 - The Region, cluster and resource class caps of the remediation budget;
 - Aurora Serverless v2 Min/Max ACU;
-- Processor total queue, single-cluster queue, client backoff, persistent retry and completed record retention;
+- Processor total queue, single-cluster queue, client backoff, persistent retry, completed record retention and the
+  ingress's routine admission batch delay (`admissionBatchDelaySeconds`, 0..0.5 s, default 0.002; the default is
+  omitted from records and YAML so live digests do not move, see §4.6);
 - Workflow scan period and dispatcher thread count;
 - Notification batch size and maximum attempts;
 - Raw evidence retention hours and per-node record cap.
@@ -243,6 +245,15 @@ node with `free >= 4 cores and >= 4Gi` (free = allocatable - the requests of eve
 the schedulability preflight by the same formula before the apply (§4.2 step 5); when it does not fit, add CPU nodes
 first, then apply.
 
+Admission batch delay: the presets leave `processor.admissionBatchDelaySeconds` at the release default 0.002 (2 ms).
+The tuned group of Performance Acceptance Plan §13.3 improved completion p99 by about 14% at 0.05 with unchanged
+throughput, but PostgreSQL `xact_rollback` rose from 4 to 59 and §15 item 6 requires repeated rounds before it becomes
+the default, so the default is not changed silently. With the ingress's routine admission batch cap of 64, a delay of
+20-50 ms at about 1,000 req/s raises the average flush from 9.7 items (25k items took 2,553 transactions) to about
+29-48, cutting admission transactions 3-5x at the cost of at most the delay in added acceptance latency; changing the
+field rolls the three roles (the processor section is part of every role digest) through the same audit and rollback
+path as any other field.
+
 ### 4.7 PostgreSQL Connection Budget
 
 The runtime, the administrator validation and the capacity runner share
@@ -290,6 +301,7 @@ spec:
     retryBackoffSeconds: 1
     retryBackoffMaxSeconds: 30
     completedRetentionSeconds: 600
+    admissionBatchDelaySeconds: 0.002
   workflow:
     pollIntervalSeconds: 5
     dispatcherWorkers: 8

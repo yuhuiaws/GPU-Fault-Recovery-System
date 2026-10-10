@@ -40,6 +40,12 @@ class ProcessorLeaseSettings:
     busy_backoff_max_seconds: float = 0.4
     fault_idle_backoff_max_seconds: float = 0.5
     fault_busy_backoff_max_seconds: float = 0.1
+    # Consecutive empty claim rounds on one stream after which a busy replica
+    # stops holding that stream at the busy ceiling and lets it back off to
+    # the idle one: with edge-triggered notifications an idle stream wakes on
+    # the next admitted row, so polling it hundreds of times a second only
+    # scans the queue for nothing (92% of claim rounds were empty).
+    busy_empty_rounds_before_idle: int = 8
     processor_notification_fallback_seconds: float = 5.0
     processor_notification_shard_count: int = 8
 
@@ -68,6 +74,10 @@ class ProcessorLeaseSettings:
             )
         if self.processor_notification_fallback_seconds <= 0:
             raise ValueError("processor notification fallback must be positive")
+        if self.busy_empty_rounds_before_idle < 1:
+            raise ValueError(
+                "processor busy empty rounds before idle must be at least 1"
+            )
         if self.processor_notification_shard_count <= 0:
             raise ValueError("processor notification shard count must be positive")
 
@@ -139,6 +149,9 @@ class ProcessorLeaseSettings:
                     "GPU_FAULT_PROCESSOR_FAULT_BUSY_BACKOFF_MAX_SECONDS",
                     "0.1",
                 )
+            ),
+            busy_empty_rounds_before_idle=int(
+                os.getenv("GPU_FAULT_PROCESSOR_BUSY_EMPTY_ROUNDS_BEFORE_IDLE", "8")
             ),
             processor_notification_fallback_seconds=float(
                 os.getenv(

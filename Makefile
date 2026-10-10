@@ -160,6 +160,7 @@ POSTGRES_TESTS = \
 	tests/store/test_orphan_workflow_inspection.py \
 	tests/store/test_postgres_activation_inhibition.py \
 	tests/store/test_postgres_admission_vs_claim.py \
+	tests/store/test_postgres_claim_planner_discipline.py \
 	tests/store/test_postgres_claim_progress.py \
 	tests/store/test_postgres_claim_scope_indexes.py \
 	tests/store/test_postgres_claim_window.py \
@@ -176,6 +177,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_incident_audit_plans.py \
 	tests/store/test_postgres_incident_audit_scripts.py \
 	tests/store/test_postgres_lane_claim_guard.py \
+	tests/store/test_postgres_lane_footprint.py \
 	tests/store/test_postgres_merge_vs_executor.py \
 	tests/store/test_postgres_notification_delivery_lock.py \
 	tests/store/test_postgres_notify_edges.py \

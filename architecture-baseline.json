@@ -12,7 +12,7 @@
     "src/gpu_fault/notification_service.py:AdvisoryNotificationService": 1030,
     "src/gpu_fault/orchestration/coordinator.py:IncidentOrchestrator": 1817,
     "src/gpu_fault/policy/engine.py:GpuFaultPolicyEngine": 1412,
-    "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator": 1738,
+    "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator": 1746,
     "src/gpu_fault/store/memory/workflows.py:MemoryWorkflowMixin": 911,
     "src/gpu_fault/store/postgres/control_records.py:PostgresControlRecordMixin": 1038,
     "src/gpu_fault/store/postgres/workflows.py:PostgresWorkflowMixin": 865
@@ -38,14 +38,14 @@
     "src/gpu_fault/execution/executor.py": 2536,
     "src/gpu_fault/orchestration/coordinator.py": 1963,
     "src/gpu_fault/policy/engine.py": 1520,
-    "src/gpu_fault/processor/coordinator.py": 1807,
+    "src/gpu_fault/processor/coordinator.py": 1816,
     "src/gpu_fault_release/regional_admin_checks.py": 1681,
     "src/gpu_fault_release/regional_release_orchestration.py": 1869,
     "tests/processor/test_telemetry_spool.py": 1657,
     "tests/regional/test_regional_admin_checks.py": 1592
   },
   "functions": {
-    "deploy/control-plane/tools/render_control_plane_role_split.py:main": 662,
+    "deploy/control-plane/tools/render_control_plane_role_split.py:main": 665,
     "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 254,
     "deploy/hyperpod/deploy.sh:build_artifacts": 270,
     "deploy/hyperpod/deploy.sh:deploy_control_plane": 366,

@@ -679,6 +679,10 @@ def test_idle_streams_back_off_with_a_short_fault_ceiling() -> None:
     assert processor._stream_idle_interval["fault"] == pytest.approx(0.5)
     processor._pools_busy = True
     processor._stream_idle_until.clear()
+    # The busy ceiling holds a stream that has not yet settled empty; the
+    # eight empty rounds above would have settled it (see
+    # test_claim_backoff_adaptive), so start its count over.
+    processor._stream_empty_rounds.clear()
     processor._claim_active_by_pool(available, lease_duration=timedelta(seconds=30))
     assert processor._stream_idle_interval["fault"] == pytest.approx(0.1)
 

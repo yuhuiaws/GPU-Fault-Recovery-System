@@ -90,6 +90,57 @@ def _captured_spool(
     }
 
 
+def _captured_processor(
+    ingress_processor: Mapping[str, str], processor: Any
+) -> dict[str, object]:
+    """The processor section as the live ingress ConfigMap carries it."""
+
+    return {
+        "max_queue_depth": int(
+            ingress_processor.get(
+                "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH",
+                processor.max_queue_depth,
+            )
+        ),
+        "max_cluster_queue_depth": int(
+            ingress_processor.get(
+                "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH",
+                processor.max_cluster_queue_depth,
+            )
+        ),
+        "retry_after_seconds": int(
+            ingress_processor.get(
+                "GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS",
+                processor.retry_after_seconds,
+            )
+        ),
+        "retry_backoff_seconds": int(
+            ingress_processor.get(
+                "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS",
+                processor.retry_backoff_seconds,
+            )
+        ),
+        "retry_backoff_max_seconds": int(
+            ingress_processor.get(
+                "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS",
+                processor.retry_backoff_max_seconds,
+            )
+        ),
+        "completed_retention_seconds": int(
+            ingress_processor.get(
+                ("GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS"),
+                processor.completed_retention_seconds,
+            )
+        ),
+        "admission_batch_delay_seconds": float(
+            ingress_processor.get(
+                "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_SECONDS",
+                processor.admission_batch_delay_seconds,
+            )
+        ),
+    }
+
+
 def captured_admin_config(
     release: Any,
     snapshots: dict[str, dict[str, str]],
@@ -204,44 +255,7 @@ def captured_admin_config(
                     },
                     **_captured_node_counts(worker_core),
                 },
-                "processor": {
-                    "max_queue_depth": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH",
-                            processor.max_queue_depth,
-                        )
-                    ),
-                    "max_cluster_queue_depth": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_PROCESSOR_MAX_CLUSTER_QUEUE_DEPTH",
-                            processor.max_cluster_queue_depth,
-                        )
-                    ),
-                    "retry_after_seconds": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS",
-                            processor.retry_after_seconds,
-                        )
-                    ),
-                    "retry_backoff_seconds": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS",
-                            processor.retry_backoff_seconds,
-                        )
-                    ),
-                    "retry_backoff_max_seconds": int(
-                        ingress_processor.get(
-                            "GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS",
-                            processor.retry_backoff_max_seconds,
-                        )
-                    ),
-                    "completed_retention_seconds": int(
-                        ingress_processor.get(
-                            ("GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS"),
-                            processor.completed_retention_seconds,
-                        )
-                    ),
-                },
+                "processor": _captured_processor(ingress_processor, processor),
                 "workflow": {
                     "poll_interval_seconds": float(
                         ingress_recovery.get(
