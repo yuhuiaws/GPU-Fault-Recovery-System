@@ -3425,9 +3425,20 @@ Wakeups are edge-triggered and statement-level (schema v21): `gpu_fault_processo
 (`AFTER UPDATE ... REFERENCING OLD TABLE AS removed NEW TABLE AS added`; transition tables forbid column lists, so the
 function itself keeps only the rows that became PENDING) issue at most one
 `pg_notify('gpu_fault_processor_queue', {priority, path})` per distinct `(path, priority)` in a statement, and only when
-no PENDING row for that key existed outside the statement (an index-backed `NOT EXISTS` over
-`gpu_fault_processor_queue_path_priority_claim`); among several concurrent first writers of a key only the one that wins a
-try-only advisory xact lock notifies, nobody waits. The reason: every transaction that issued NOTIFY takes
+no PENDING row for that key existed outside the statement: since schema v22 one parameterised `EXISTS` probe per distinct
+key (function-level `SET enable_seqscan / enable_bitmapscan / enable_hashjoin / enable_mergejoin = off`, so whatever the
+statistics say it walks `gpu_fault_processor_queue_path_priority_claim` in index order and stops at the first PENDING row
+that is not the statement's own); a writer of an idle key takes the try-only advisory xact lock and probes once more
+under it (the previous holder's commit is visible to new snapshots before the lock is released), so exactly one of the
+concurrent first writers notifies, and writers of a busy key neither touch the lock nor wait. v21 wrote the probe as one
+`NOT EXISTS` anti-join over the transition table: plpgsql caches that statement's plan per backend, a pooled ingress
+backend first ran it while the queue was empty, the planner hashed the queue side (estimated at one row) and probed it
+with the transition rows, and kept that plan until autoanalyze invalidated it -- on the grown backlog a 10-row admission
+INSERT read 49k shared buffers in 250-320 ms (the whole PENDING backlog hashed once per inserted row), and 190 such
+statements at once were the perf suite's 30-65 s `LWLock:BufferContent` convoy at load start, bimodal from run to run
+because it depended on when autoanalyze happened to land (`tests/store/test_postgres_notify_probe_cost.py` lays the same
+trap -- plan while the table is empty, grow it by 5,000 rows without ANALYZE -- and proves the pages a 10-row INSERT
+reads do not grow with the backlog). The reason: every transaction that issued NOTIFY takes
 `PreCommit_Notify`'s `AccessExclusiveLock on object 0 of class 1262` (the database object) at COMMIT and holds it across its
 WAL flush so queue entries appear in commit order -- with one `pg_notify` per row every admission flush notified (~570k per
 r1 run, 548k of them filtered as irrelevant by the listeners), and once v20 had removed the counter-row convoy the flushes
@@ -3541,7 +3552,9 @@ The indexes are `..._available (available_at, spool_key)`,
 `gpu_fault_telemetry_spool_notify_available_trigger` / `..._update_trigger` are the same statement-level edge wakeup as
 the processor queue (schema v21): at most one `pg_notify('gpu_fault_telemetry_spool', {path})` per distinct `path` per
 statement, and only when no claimable row of that path (`available_at <= clock_timestamp()`, the consumer's own predicate)
-existed outside the statement; the E-8 row rule stays -- every insert, and every update that makes a row available no
+existed outside the statement -- since schema v22 probed per path with a parameterised `EXISTS`, once more under the
+try-only advisory xact lock, under the same function-level planner pins, along the `..._path_available` index; the E-8
+row rule stays -- every insert, and every update that makes a row available no
 later than before (coalesce, abandon), is an edge, while a claim or release that pushes the lease into the future stays
 quiet, and the new row's own stamp is never compared with a clock. A lost edge costs at most
 `telemetry_spool_notification_fallback_seconds` (default 5 s).
@@ -3658,10 +3671,10 @@ in automated backups or manual snapshots.
 
 The schema has an independent versioned migration registry, `src/gpu_fault/schema_migrations.py`. Each entry is a
 `SchemaMigration(version, name, ddl_checksum, apply, legacy_checksum)`;
-`POSTGRES_SCHEMA_MIGRATIONS` currently has **18 versions** (v12 `store-review-hot-query-indexes`,
+`POSTGRES_SCHEMA_MIGRATIONS` currently has **19 versions** (v12 `store-review-hot-query-indexes`,
 v13 `control-plane-review-indexes-and-autovacuum`, v14 `objects-wakeup-notify-trigger`,
 v15 `remote-command-state-table-and-cutover-fences`, v16 `workflow-state-table-and-independent-cutover`,
-v17 `control-state-dual-projection-conditional-delete`, v18 `control-state-legacy-copy-reset-without-truncate`, v19 `hot-table-storage-parameters-and-hot-update-indexes`, v20 `processor-counters-per-writer-backend-rows`, v21 `edge-triggered-statement-level-wakeups`), and `LATEST_POSTGRES_SCHEMA_VERSION`
+v17 `control-state-dual-projection-conditional-delete`, v18 `control-state-legacy-copy-reset-without-truncate`, v19 `hot-table-storage-parameters-and-hot-update-indexes`, v20 `processor-counters-per-writer-backend-rows`, v21 `edge-triggered-statement-level-wakeups`, v22 `per-key-planner-pinned-wakeup-probes`), and `LATEST_POSTGRES_SCHEMA_VERSION`
 takes the last version number. Three guards are executed by `validate_migration_registry()` **at module import time**,
 not as an optional runtime check:
 

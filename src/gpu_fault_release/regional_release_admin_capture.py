@@ -138,6 +138,33 @@ def _captured_processor(
                 processor.admission_batch_delay_seconds,
             )
         ),
+        "admission_batch_delay_max_seconds": float(
+            ingress_processor.get(
+                "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_MAX_SECONDS",
+                processor.admission_batch_delay_max_seconds,
+            )
+        ),
+        # The site-wide caps travel as their own literals, so the capture
+        # reads the configured value exactly instead of inverting the
+        # per-process share the runtime derives from them.
+        "admission_flush_concurrency": int(
+            ingress_processor.get(
+                "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY",
+                processor.admission_flush_concurrency,
+            )
+        ),
+        "fault_admission_flush_concurrency": int(
+            ingress_processor.get(
+                "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY",
+                processor.fault_admission_flush_concurrency,
+            )
+        ),
+        "evidence_admission_flush_concurrency": int(
+            ingress_processor.get(
+                "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY",
+                processor.evidence_admission_flush_concurrency,
+            )
+        ),
     }
 
 

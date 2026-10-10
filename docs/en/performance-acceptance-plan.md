@@ -1293,7 +1293,12 @@ small and cannot explain second-level latency.
    0.002, unchanged by the presets), so A/B rounds change the value per site without a code
    change; the candidate range is 20-50 ms: with the ingress's routine admission batch cap of 64,
    at about 1,000 req/s the average flush grows from 9.7 items to about 29-48, cutting admission
-   transactions 3-5x at the cost of at most the delay in added acceptance latency.
+   transactions 3-5x at the cost of at most the delay in added acceptance latency. The window is
+   adaptive now: once the flush-duration EWMA passes 100 ms it rises to
+   `spec.processor.admissionBatchDelayMaxSeconds` (default 0.05) and falls back as the store
+   recovers, so an A/B only compares the base delay; the site-wide caps on concurrent admission
+   flushes (`admissionFlushConcurrency` and friends, defaults 24/24/12 shared by the 12 ingress
+   processes) are in Administrator Capacity Configuration §4.6.
 7. **Distinguish cold and warm connection SLOs.** Cold results include TCP/TLS setup, warm results
    measure steady-state service capability; both must be saved, and warm results must not replace
    the public/NLB first-request threshold.

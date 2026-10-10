@@ -24,6 +24,7 @@ from gpu_fault.async_store import (
 from gpu_fault.channel_registry import CHANNEL_REGISTRY
 from gpu_fault.env import env_bool
 from gpu_fault.postgres_capacity import PostgresPoolCapacity as PostgresPoolCapacity
+from gpu_fault.postgres_capacity import flush_slots_per_process
 from gpu_fault.processor import ProcessorCoordinator
 from gpu_fault.processor.settings import ProcessorPoolSettings
 from gpu_fault.processor_diagnostics import report_processor_replay_phase
@@ -547,8 +548,14 @@ class AdmissionRuntimeFactory:
             "reserved_cluster_fault_depth": (limits["fault_reserved_cluster_depth"]),
             "global_admission_guard": limits["global_admission_guard"],
         }
+        # How many ingress processes share the site-wide flush caps (the
+        # renderer carries replicas x uvicorn workers); a bare process is a
+        # fleet of one and takes each whole cap itself.
+        writer_processes = int(os.getenv("GPU_FAULT_INGRESS_WRITER_PROCESSES", "1"))
+        if writer_processes < 1:
+            raise RuntimeError("ingress writer process count must be positive")
         admission = self._queue_batcher(
-            executors["store_io"], common, "", "64", "16", "1.0"
+            executors["store_io"], common, "", "64", "16", "1.0", writer_processes
         )
         fault = self._queue_batcher(
             executors["fault_store_io"],
@@ -557,6 +564,7 @@ class AdmissionRuntimeFactory:
             "64",
             str(int(os.getenv("GPU_FAULT_FAULT_STORE_IO_WORKERS", "8"))),
             "0",
+            writer_processes,
             label="fault admission",
         )
         evidence = self._queue_batcher(
@@ -566,6 +574,7 @@ class AdmissionRuntimeFactory:
             "32",
             "4",
             "0",
+            writer_processes,
             label="evidence admission",
         )
         size = int(os.getenv("GPU_FAULT_TELEMETRY_SPOOL_BATCH_SIZE", "64"))
@@ -627,24 +636,43 @@ class AdmissionRuntimeFactory:
         size,
         groups,
         margin,
+        writer_processes=1,
         *,
         label="processor admission",
     ):
         base = "GPU_FAULT_PROCESSOR_"
+        # In-flight flushes for this process: the explicit per-process value
+        # when set, else this process's share of the site-wide cap the admin
+        # config renders (``flush_slots_per_process``), else the historical
+        # per-process default. The site-wide form is what the regional
+        # ingress runs: a per-process literal on 12 processes was 192
+        # concurrent routine admission INSERTs on one table.
+        explicit_groups = os.getenv(f"{base}{prefix}ADMISSION_BATCH_GROUPS")
+        site_flush_cap = os.getenv(f"{base}{prefix}ADMISSION_FLUSH_CONCURRENCY")
+        if explicit_groups is not None:
+            flush_groups = int(explicit_groups)
+        elif site_flush_cap is not None:
+            flush_groups = flush_slots_per_process(
+                int(site_flush_cap), writer_processes
+            )
+        else:
+            flush_groups = int(groups)
+        delay = float(
+            os.getenv(f"{base}{prefix}ADMISSION_BATCH_DELAY_SECONDS", "0.002")
+        )
+        # A cap at or below the base delay leaves the window fixed: raising
+        # the base alone must stay valid, so the larger of the two is the cap.
+        delay_cap = float(
+            os.getenv(f"{base}{prefix}ADMISSION_BATCH_DELAY_MAX_SECONDS", "0.05")
+        )
         return _ProcessorAdmissionBatcher(
             self.context.store,
             executor,
             **common,
             max_batch_size=int(os.getenv(f"{base}{prefix}ADMISSION_BATCH_SIZE", size)),
-            max_flush_groups=int(
-                os.getenv(f"{base}{prefix}ADMISSION_BATCH_GROUPS", groups)
-            ),
-            flush_delay_seconds=float(
-                os.getenv(
-                    f"{base}{prefix}ADMISSION_BATCH_DELAY_SECONDS",
-                    "0.002",
-                )
-            ),
+            max_flush_groups=flush_groups,
+            flush_delay_seconds=delay,
+            flush_delay_max_seconds=max(delay, delay_cap),
             projection_margin=float(
                 os.getenv(
                     f"{base}{prefix}ADMISSION_PROJECTION_MARGIN",

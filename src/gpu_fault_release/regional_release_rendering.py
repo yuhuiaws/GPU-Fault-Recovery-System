@@ -365,6 +365,18 @@ def admin_config_renderer_environment(
         "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_SECONDS": _number_text(
             processor.admission_batch_delay_seconds
         ),
+        "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_MAX_SECONDS": _number_text(
+            processor.admission_batch_delay_max_seconds
+        ),
+        "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY": str(
+            processor.admission_flush_concurrency
+        ),
+        "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY": str(
+            processor.fault_admission_flush_concurrency
+        ),
+        "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY": str(
+            processor.evidence_admission_flush_concurrency
+        ),
         "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS": _number_text(
             workflow.poll_interval_seconds
         ),

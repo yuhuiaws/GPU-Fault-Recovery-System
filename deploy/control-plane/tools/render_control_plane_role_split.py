@@ -34,7 +34,11 @@ REPO_ROOT = Path(__file__).resolve().parents[3]
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from gpu_fault.admin.config import AdminConfig, default_admin_config  # noqa: E402
+from gpu_fault.admin.config import (  # noqa: E402
+    AdminConfig,
+    default_admin_config,
+    ingress_writer_processes,
+)
 from gpu_fault.container_env_snapshot import (  # noqa: E402
     ContainerEnvSnapshotError,
     load_container_env_snapshot,
@@ -64,6 +68,18 @@ PROCESSOR_POOL_ENV = (
 
 SENSITIVE_ENV = re.compile(r"(?:SECRET|TOKEN|PASSWORD|CREDENTIAL|PRIVATE_KEY)")
 DEFAULT_ADMIN_CONFIG = default_admin_config()
+# Site-wide admission flush caps (spec.processor.*AdmissionFlushConcurrency):
+# admin config field -> the literal every role carries and the ingress divides
+# by GPU_FAULT_INGRESS_WRITER_PROCESSES; renderer_admin_config reads them back.
+PROCESSOR_FLUSH_CAPS = {
+    "admission_flush_concurrency": "GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY",
+    "fault_admission_flush_concurrency": (
+        "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY"
+    ),
+    "evidence_admission_flush_concurrency": (
+        "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY"
+    ),
+}
 
 # Four uvicorn processes per Pod on the ingress and control-worker tiers
 # (the telemetry spool runs one). ADOT scrapes a Pod, not a process, so
@@ -598,6 +614,16 @@ def renderer_admin_config() -> AdminConfig:
                     str(processor.admission_batch_delay_seconds),
                 )
             ),
+            "admission_batch_delay_max_seconds": float(
+                os.getenv(
+                    "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_MAX_SECONDS",
+                    str(processor.admission_batch_delay_max_seconds),
+                )
+            ),
+            **{
+                name: int(os.getenv(variable, str(getattr(processor, name))))
+                for name, variable in PROCESSOR_FLUSH_CAPS.items()
+            },
         },
         "workflow": {
             "poll_interval_seconds": float(
@@ -676,6 +702,30 @@ def configure_ingress_capacity(container: dict, config: AdminConfig) -> None:
         "GPU_FAULT_POSTGRES_FLEET_CONNECTION_BUDGET",
         str(config.capacity.postgres_fleet_connection_budget()),
     )
+
+
+def configure_ingress_admission_flushes(container: dict[str, Any]) -> None:
+    """The fault and evidence batchers' literals, and the fleet divisor.
+
+    The site-wide flush caps (``GPU_FAULT_PROCESSOR_*_ADMISSION_FLUSH_CONCURRENCY``)
+    come from ``configure_base``; the ingress divides them by
+    ``GPU_FAULT_INGRESS_WRITER_PROCESSES`` (replicas times uvicorn workers), so
+    no per-process ``*_ADMISSION_BATCH_GROUPS`` literal is rendered any more:
+    16 + 8 + 4 per process on 12 processes was up to 336 concurrent admission
+    INSERT transactions on one table. The fault and evidence batch delays keep
+    their 2 ms base so a fault never waits on a routine coalescing window.
+    """
+
+    for name, value in (
+        ("GPU_FAULT_PROCESSOR_FAULT_ADMISSION_BATCH_SIZE", "64"),
+        ("GPU_FAULT_PROCESSOR_FAULT_ADMISSION_BATCH_DELAY_SECONDS", "0.002"),
+        ("GPU_FAULT_PROCESSOR_FAULT_ADMISSION_PROJECTION_MARGIN", "0"),
+        ("GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_BATCH_SIZE", "32"),
+        ("GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_BATCH_DELAY_SECONDS", "0.002"),
+        ("GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_PROJECTION_MARGIN", "0"),
+        ("GPU_FAULT_INGRESS_WRITER_PROCESSES", str(ingress_writer_processes())),
+    ):
+        set_env(container, name, value)
 
 
 def configure_request_budgets(container: dict) -> None:
@@ -785,6 +835,13 @@ def configure_admin_tuning(container: dict, config: AdminConfig) -> None:
         "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_SECONDS": (
             processor.admission_batch_delay_seconds
         ),
+        "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_MAX_SECONDS": (
+            processor.admission_batch_delay_max_seconds
+        ),
+        **{
+            variable: getattr(processor, name)
+            for name, variable in PROCESSOR_FLUSH_CAPS.items()
+        },
         "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS": (workflow.poll_interval_seconds),
         "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS": (workflow.dispatcher_workers),
         "GPU_FAULT_NOTIFICATION_BATCH_SIZE": notification.batch_size,
@@ -900,46 +957,7 @@ def main() -> None:
         "GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_SECONDS",
         environment_text(admin_config.processor.admission_batch_delay_seconds),
     )
-    set_env(
-        ingress,
-        "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_BATCH_SIZE",
-        "64",
-    )
-    set_env(
-        ingress,
-        "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_BATCH_GROUPS",
-        "8",
-    )
-    set_env(
-        ingress,
-        "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_BATCH_DELAY_SECONDS",
-        "0.002",
-    )
-    set_env(
-        ingress,
-        "GPU_FAULT_PROCESSOR_FAULT_ADMISSION_PROJECTION_MARGIN",
-        "0",
-    )
-    set_env(
-        ingress,
-        "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_BATCH_SIZE",
-        "32",
-    )
-    set_env(
-        ingress,
-        "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_BATCH_GROUPS",
-        "4",
-    )
-    set_env(
-        ingress,
-        "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_BATCH_DELAY_SECONDS",
-        "0.002",
-    )
-    set_env(
-        ingress,
-        "GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_PROJECTION_MARGIN",
-        "0",
-    )
+    configure_ingress_admission_flushes(ingress)
     configure_request_budgets(ingress)
     configure_ingress_capacity(ingress, admin_config)
     set_env(

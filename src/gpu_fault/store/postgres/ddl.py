@@ -838,19 +838,37 @@ def _create_processor_queue_notify(cursor: Any) -> None:
     # already had PENDING work needs no second wakeup, and a statement carries
     # at most one per distinct (path, priority). Among concurrent first
     # writers of an idle key only the one that wins the try-only advisory
-    # xact lock notifies -- nobody waits for it; if that transaction rolls
+    # xact lock notifies -- nobody waits; if that transaction rolls
     # back, the other writers' rows are picked up by the fallback poll
     # (processor_notification_fallback_seconds). The payload carries no
     # request_id: an edge wakes every listening shard owner.
+    #
+    # The "was the key idle" probe is one parameterised EXISTS per distinct
+    # key under function-level planner pins (schema v22). v21 wrote it as a
+    # NOT EXISTS anti-join over the transition table; plpgsql caches that
+    # plan per backend at first use - for a pooled ingress backend while the
+    # queue is empty - so the planner hashed the queue side (estimated one
+    # row), probed it with the transition rows, and kept the plan until
+    # autoanalyze: on the grown backlog a 10-row admission INSERT read 49k
+    # shared buffers in 250-320 ms, and 190 such statements at once were the
+    # perf suite's 30-65 s LWLock:BufferContent convoy at load start. EXISTS
+    # stops at the first PENDING row that is not ours; the pins make that an
+    # index-order walk whatever the statistics say and leave the transition
+    # tables alone (a tuplestore scan is not a sequential scan).
     cursor.execute(
         """
         CREATE OR REPLACE FUNCTION
         gpu_fault_processor_queue_notify_pending()
         RETURNS trigger
         LANGUAGE plpgsql
+        SET enable_seqscan = off
+        SET enable_bitmapscan = off
+        SET enable_hashjoin = off
+        SET enable_mergejoin = off
         AS $$
         DECLARE
             target RECORD;
+            busy BOOLEAN;
         BEGIN
             IF TG_OP = 'INSERT' THEN
                 FOR target IN
@@ -859,18 +877,26 @@ def _create_processor_queue_notify(cursor: Any) -> None:
                         n.priority
                     FROM added n
                     WHERE n.status = 'PENDING'
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM gpu_fault_processor_queue q
-                          WHERE q.payload->>'path' = n.payload->>'path'
-                            AND q.priority = n.priority
-                            AND q.status = 'PENDING'
-                            AND NOT EXISTS (
-                                SELECT 1 FROM added a
-                                WHERE a.request_id = q.request_id
-                            )
-                      )
                 LOOP
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM gpu_fault_processor_queue q
+                        WHERE q.payload->>'path' = target.path
+                          AND q.priority = target.priority
+                          AND q.status = 'PENDING'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM added a
+                              WHERE a.request_id = q.request_id
+                          )
+                    ) INTO busy;
+                    -- Idle before this statement, so this writer may be the
+                    -- edge: take the key's try-only lock and look once more
+                    -- under it. A concurrent first writer that held the lock
+                    -- has committed by the time it is free, and a snapshot
+                    -- taken after the acquisition sees its rows - so exactly
+                    -- one of the concurrent first writers notifies. Writers of
+                    -- a busy key never touch the lock.
+                    CONTINUE WHEN busy;
                     IF pg_try_advisory_xact_lock(
                         hashtextextended(
                             'gpu_fault_processor_queue_notify:'
@@ -879,13 +905,26 @@ def _create_processor_queue_notify(cursor: Any) -> None:
                             0
                         )
                     ) THEN
-                        PERFORM pg_notify(
-                            'gpu_fault_processor_queue',
-                            json_build_object(
-                                'priority', target.priority,
-                                'path', target.path
-                            )::text
-                        );
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM gpu_fault_processor_queue q
+                            WHERE q.payload->>'path' = target.path
+                              AND q.priority = target.priority
+                              AND q.status = 'PENDING'
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM added a
+                                  WHERE a.request_id = q.request_id
+                              )
+                        ) INTO busy;
+                        IF NOT busy THEN
+                            PERFORM pg_notify(
+                                'gpu_fault_processor_queue',
+                                json_build_object(
+                                    'priority', target.priority,
+                                    'path', target.path
+                                )::text
+                            );
+                        END IF;
                     END IF;
                 END LOOP;
             ELSE
@@ -897,18 +936,20 @@ def _create_processor_queue_notify(cursor: Any) -> None:
                     JOIN removed o ON o.request_id = n.request_id
                     WHERE n.status = 'PENDING'
                       AND o.status IS DISTINCT FROM 'PENDING'
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM gpu_fault_processor_queue q
-                          WHERE q.payload->>'path' = n.payload->>'path'
-                            AND q.priority = n.priority
-                            AND q.status = 'PENDING'
-                            AND NOT EXISTS (
-                                SELECT 1 FROM added a
-                                WHERE a.request_id = q.request_id
-                            )
-                      )
                 LOOP
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM gpu_fault_processor_queue q
+                        WHERE q.payload->>'path' = target.path
+                          AND q.priority = target.priority
+                          AND q.status = 'PENDING'
+                          AND NOT EXISTS (
+                              SELECT 1 FROM added a
+                              WHERE a.request_id = q.request_id
+                          )
+                    ) INTO busy;
+                    -- Same lock-then-recheck discipline as the INSERT branch.
+                    CONTINUE WHEN busy;
                     IF pg_try_advisory_xact_lock(
                         hashtextextended(
                             'gpu_fault_processor_queue_notify:'
@@ -917,13 +958,26 @@ def _create_processor_queue_notify(cursor: Any) -> None:
                             0
                         )
                     ) THEN
-                        PERFORM pg_notify(
-                            'gpu_fault_processor_queue',
-                            json_build_object(
-                                'priority', target.priority,
-                                'path', target.path
-                            )::text
-                        );
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM gpu_fault_processor_queue q
+                            WHERE q.payload->>'path' = target.path
+                              AND q.priority = target.priority
+                              AND q.status = 'PENDING'
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM added a
+                                  WHERE a.request_id = q.request_id
+                              )
+                        ) INTO busy;
+                        IF NOT busy THEN
+                            PERFORM pg_notify(
+                                'gpu_fault_processor_queue',
+                                json_build_object(
+                                    'priority', target.priority,
+                                    'path', target.path
+                                )::text
+                            );
+                        END IF;
                     END IF;
                 END LOOP;
             END IF;

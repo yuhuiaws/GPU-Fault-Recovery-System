@@ -45,7 +45,7 @@
     "tests/regional/test_regional_admin_checks.py": 1592
   },
   "functions": {
-    "deploy/control-plane/tools/render_control_plane_role_split.py:main": 665,
+    "deploy/control-plane/tools/render_control_plane_role_split.py:main": 626,
     "deploy/control-plane/tools/verify_control_plane_role_split.py:main": 254,
     "deploy/hyperpod/deploy.sh:build_artifacts": 270,
     "deploy/hyperpod/deploy.sh:deploy_control_plane": 366,

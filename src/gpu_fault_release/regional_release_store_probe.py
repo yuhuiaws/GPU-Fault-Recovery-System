@@ -58,8 +58,10 @@ def compatible_retained_schema(observed: int, target: int) -> bool:
     # rewrites their trigger functions; the workflow and remote-command
     # records this read counts are untouched. (20, 21): v21 only replaces the
     # processor-queue and spool NOTIFY trigger functions and their triggers
-    # (statement-level, edge-triggered); no table changes at all.
-    return (observed, target) in {(17, 18), (18, 19), (19, 20), (20, 21)}
+    # (statement-level, edge-triggered); no table changes at all. (21, 22):
+    # v22 only replaces the bodies of those two trigger functions (one
+    # planner-pinned probe per key); triggers and tables are untouched.
+    return (observed, target) in {(17, 18), (18, 19), (19, 20), (20, 21), (21, 22)}
 
 
 def declared_table_names() -> set[str]:

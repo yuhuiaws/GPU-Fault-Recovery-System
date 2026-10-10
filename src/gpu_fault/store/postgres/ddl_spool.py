@@ -109,43 +109,73 @@ def _create_spool_notify(cursor: Any) -> None:
     # clock. Among concurrent first writers of an idle path only the winner
     # of the try-only advisory xact lock notifies; a lost edge costs at most
     # telemetry_spool_notification_fallback_seconds.
+    #
+    # The probe is one parameterised EXISTS per distinct path under the
+    # same function-level planner pins as the processor queue's (schema
+    # v22, see ddl.py): the v21 anti-join over the transition table could
+    # be cached as a hash over the whole spool and kept until autoanalyze.
     cursor.execute(
         """
         CREATE OR REPLACE FUNCTION
         gpu_fault_telemetry_spool_notify_available()
         RETURNS trigger
         LANGUAGE plpgsql
+        SET enable_seqscan = off
+        SET enable_bitmapscan = off
+        SET enable_hashjoin = off
+        SET enable_mergejoin = off
         AS $$
         DECLARE
             target RECORD;
+            busy BOOLEAN;
         BEGIN
             IF TG_OP = 'INSERT' THEN
                 FOR target IN
                     SELECT DISTINCT n.path
                     FROM added n
-                    WHERE NOT EXISTS (
+                LOOP
+                    SELECT EXISTS (
                         SELECT 1
                         FROM gpu_fault_telemetry_spool s
-                        WHERE s.path = n.path
+                        WHERE s.path = target.path
                           AND s.available_at <= clock_timestamp()
                           AND NOT EXISTS (
                               SELECT 1 FROM added a
                               WHERE a.spool_key = s.spool_key
                           )
-                    )
-                LOOP
+                    ) INTO busy;
+                    -- Idle before this statement, so this writer may be the
+                    -- edge: take the key's try-only lock and look once more
+                    -- under it. A concurrent first writer that held the lock
+                    -- has committed by the time it is free, and a snapshot
+                    -- taken after the acquisition sees its rows - so exactly
+                    -- one of the concurrent first writers notifies. Writers of
+                    -- a busy key never touch the lock.
+                    CONTINUE WHEN busy;
                     IF pg_try_advisory_xact_lock(
                         hashtextextended(
                             'gpu_fault_telemetry_spool_notify:' || target.path,
                             0
                         )
                     ) THEN
-                        PERFORM pg_notify(
-                            'gpu_fault_telemetry_spool',
-                            json_build_object(
-                                'path', target.path
-                            )::text
-                        );
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM gpu_fault_telemetry_spool s
+                            WHERE s.path = target.path
+                              AND s.available_at <= clock_timestamp()
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM added a
+                                  WHERE a.spool_key = s.spool_key
+                              )
+                        ) INTO busy;
+                        IF NOT busy THEN
+                            PERFORM pg_notify(
+                                'gpu_fault_telemetry_spool',
+                                json_build_object(
+                                    'path', target.path
+                                )::text
+                            );
+                        END IF;
                     END IF;
                 END LOOP;
             ELSE
@@ -154,29 +184,43 @@ def _create_spool_notify(cursor: Any) -> None:
                     FROM added n
                     JOIN removed o ON o.spool_key = n.spool_key
                     WHERE n.available_at <= o.available_at
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM gpu_fault_telemetry_spool s
-                          WHERE s.path = n.path
-                            AND s.available_at <= clock_timestamp()
-                            AND NOT EXISTS (
-                                SELECT 1 FROM added a
-                                WHERE a.spool_key = s.spool_key
-                            )
-                      )
                 LOOP
+                    SELECT EXISTS (
+                        SELECT 1
+                        FROM gpu_fault_telemetry_spool s
+                        WHERE s.path = target.path
+                          AND s.available_at <= clock_timestamp()
+                          AND NOT EXISTS (
+                              SELECT 1 FROM added a
+                              WHERE a.spool_key = s.spool_key
+                          )
+                    ) INTO busy;
+                    -- Same lock-then-recheck discipline as the INSERT branch.
+                    CONTINUE WHEN busy;
                     IF pg_try_advisory_xact_lock(
                         hashtextextended(
                             'gpu_fault_telemetry_spool_notify:' || target.path,
                             0
                         )
                     ) THEN
-                        PERFORM pg_notify(
-                            'gpu_fault_telemetry_spool',
-                            json_build_object(
-                                'path', target.path
-                            )::text
-                        );
+                        SELECT EXISTS (
+                            SELECT 1
+                            FROM gpu_fault_telemetry_spool s
+                            WHERE s.path = target.path
+                              AND s.available_at <= clock_timestamp()
+                              AND NOT EXISTS (
+                                  SELECT 1 FROM added a
+                                  WHERE a.spool_key = s.spool_key
+                              )
+                        ) INTO busy;
+                        IF NOT busy THEN
+                            PERFORM pg_notify(
+                                'gpu_fault_telemetry_spool',
+                                json_build_object(
+                                    'path', target.path
+                                )::text
+                            );
+                        END IF;
                     END IF;
                 END LOOP;
             END IF;

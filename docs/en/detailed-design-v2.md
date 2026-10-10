@@ -1940,7 +1940,14 @@ Completion is still one transaction per cluster; different clusters can run in p
 `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY=1`; cleanup is described in §2.3.1. The ingress's routine
 admission batch delay `GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_SECONDS` comes from the AdminConfig field
 `spec.processor.admissionBatchDelaySeconds` (default 0.002, omitted from records while at the default; the fault and
-evidence batch delays keep their own 2 ms literals; see Administrator Capacity Configuration §1 and §4.6).
+evidence batch delays keep their own 2 ms literals; see Administrator Capacity Configuration §1 and §4.6). Concurrent
+admission flushes are capped site-wide by `spec.processor.admissionFlushConcurrency` /
+`faultAdmissionFlushConcurrency` / `evidenceAdmissionFlushConcurrency` (defaults 24/24/12), rendered as
+`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_FLUSH_CONCURRENCY`; the ingress divides them by
+`GPU_FAULT_INGRESS_WRITER_PROCESSES` (3 replicas x 4 processes = 12) into `ceil(cap/12)` in-flight flushes per process
+(an explicit `*_ADMISSION_BATCH_GROUPS` still overrides per process); the coalescing window rises to
+`admissionBatchDelayMaxSeconds` (`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_BATCH_DELAY_MAX_SECONDS`, default
+0.05) once the flush EWMA passes 100 ms.
 
 **⑩ Logs/metrics/alerts**: `processor_request_id`, `path`, `priority`, `cluster_id`,
 `lane`, `lease_owner`, `leader_epoch`, `attempt`, `response_status`,

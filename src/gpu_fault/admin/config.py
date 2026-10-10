@@ -48,7 +48,7 @@ from gpu_fault.admin.config_parser import (
 )
 from gpu_fault.admin.operation_lock import SiteOperationBusy, site_operation_lock
 from gpu_fault.digests import SHA256_PATTERN
-from gpu_fault.postgres_capacity import PostgresPoolCapacity
+from gpu_fault.postgres_capacity import PostgresPoolCapacity, flush_slots_per_process
 
 __all__ = ["AdminConfigError", "aurora_min_acu_floor"]
 
@@ -61,6 +61,14 @@ ADMIN_CONFIG_HISTORY = ADMIN_CONFIG_ROOT / "history"
 APPROVAL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
 HISTORY_ID_PATTERN = re.compile(r"^[0-9]{8}T[0-9]{6}Z-[0-9a-f]{64}$")
 ADMIN_CONFIG_ROLES = ("ingress", "worker", "spool")
+# The ingress tier as the regional manifests ship it: three api-ha replicas,
+# each running ``uvicorn --workers 4``. The site-wide admission flush caps of
+# ``ProcessorConfig`` are shared by these processes (each takes
+# ceil(cap / processes) in-flight flushes), so the product is rendered into the
+# ingress environment as GPU_FAULT_INGRESS_WRITER_PROCESSES, and the same two
+# numbers size the ingress connection ceiling.
+INGRESS_REPLICAS = 3
+INGRESS_PROCESSES_PER_POD = 4
 # Safety constants, not administrator inputs: one remediation per node and per
 # failure domain at a time. Old YAML that still spells them is accepted only at
 # this value; the persisted record and every renderer keep reading them.
@@ -203,7 +211,7 @@ class CapacityConfig(_Section):
                 regional=True,
             )
             for role, pool, processes, replicas in (
-                ("ingress", ingress_pool, 4, 3),
+                ("ingress", ingress_pool, INGRESS_PROCESSES_PER_POD, INGRESS_REPLICAS),
                 ("worker", 24, 4, self.control_worker_replicas),
                 ("spool-worker", 12, 1, self.telemetry_spool.replicas),
             )
@@ -253,14 +261,58 @@ class ProcessorConfig(_Section):
     # default stays until that is explained (§15 item 6). Omitted from records
     # and YAML while at its default so every live desired.json keeps its digest.
     admission_batch_delay_seconds: float = 0.002
-    OMIT_WHEN_DEFAULT = frozenset({"admission_batch_delay_seconds"})
+    # How far the ingress may stretch that window while its flushes are slow
+    # (GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_MAX_SECONDS): once the flush
+    # EWMA passes 100 ms the store is the bottleneck, and the batcher raises
+    # the delay from the base value toward this cap - fewer, wider admission
+    # statements - and lets it fall back as the store recovers. The
+    # uncontended case keeps the base delay; a cap at or below the base
+    # delay leaves the window fixed (the runtime takes the larger of the two,
+    # so raising the base alone stays a valid configuration).
+    admission_batch_delay_max_seconds: float = 0.05
+    # Site-wide caps on concurrent admission flush transactions against
+    # gpu_fault_processor_queue, one per service tier, shared by the ingress
+    # processes (``ingress_writer_processes()``). The caps used to be per
+    # process - 16 routine + 8 fault + 4 evidence on each of 12 processes, up
+    # to 336 concurrent INSERT transactions on one table - and the perf
+    # suite's r1 load start turned that into a 30-65 s LWLock:BufferContent
+    # convoy (134-182 concurrent queue INSERTs; fault requests reached their
+    # 30 s deadline inside the INSERT). Fault flushes keep a cap of their own
+    # so a telemetry burst never takes a fault slot.
+    admission_flush_concurrency: int = 24
+    fault_admission_flush_concurrency: int = 24
+    evidence_admission_flush_concurrency: int = 12
+    OMIT_WHEN_DEFAULT = frozenset(
+        {
+            "admission_batch_delay_seconds",
+            "admission_batch_delay_max_seconds",
+            "admission_flush_concurrency",
+            "fault_admission_flush_concurrency",
+            "evidence_admission_flush_concurrency",
+        }
+    )
 
     def validate(self) -> None:
         if not 0 <= self.admission_batch_delay_seconds <= 0.5:
             raise AdminConfigError(
                 "spec.processor.admissionBatchDelaySeconds must be within 0..0.5"
             )
+        if not 0 <= self.admission_batch_delay_max_seconds <= 0.5:
+            raise AdminConfigError(
+                "spec.processor.admissionBatchDelayMaxSeconds must be within 0..0.5"
+            )
         bounds = {
+            "admissionFlushConcurrency": (self.admission_flush_concurrency, 1, 1024),
+            "faultAdmissionFlushConcurrency": (
+                self.fault_admission_flush_concurrency,
+                1,
+                1024,
+            ),
+            "evidenceAdmissionFlushConcurrency": (
+                self.evidence_admission_flush_concurrency,
+                1,
+                1024,
+            ),
             "maxQueueDepth": (self.max_queue_depth, 1024, 1_000_000),
             "maxClusterQueueDepth": (
                 self.max_cluster_queue_depth,
@@ -302,6 +354,27 @@ class ProcessorConfig(_Section):
             raise AdminConfigError(
                 "completedRetentionSeconds must cover retryable response age"
             )
+
+    def admission_flush_slots_per_process(self) -> dict[str, int]:
+        """The in-flight flushes one ingress process takes from each cap.
+
+        ``ceil(cap / ingress_writer_processes())``, at least one: the number
+        ``gpu_fault.app.admission_runtime`` derives from the rendered
+        environment, so the plan can show it next to the site-wide value.
+        """
+
+        processes = ingress_writer_processes()
+        return {
+            "routine": flush_slots_per_process(
+                self.admission_flush_concurrency, processes
+            ),
+            "fault": flush_slots_per_process(
+                self.fault_admission_flush_concurrency, processes
+            ),
+            "evidence": flush_slots_per_process(
+                self.evidence_admission_flush_concurrency, processes
+            ),
+        }
 
 
 @dataclass(frozen=True)
@@ -531,6 +604,12 @@ def canonical_sha256(value: object) -> str:
 
 def default_admin_config() -> AdminConfig:
     return AdminConfig()
+
+
+def ingress_writer_processes() -> int:
+    """How many ingress processes share the site-wide admission flush caps."""
+
+    return INGRESS_REPLICAS * INGRESS_PROCESSES_PER_POD
 
 
 # ---------------------------------------------------------------------------

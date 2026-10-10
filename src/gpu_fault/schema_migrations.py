@@ -199,6 +199,21 @@ def _apply_edge_triggered_wakeups_v21(cursor: MigrationCursor) -> None:
     cursor.execute("SELECT 1")
 
 
+def _apply_per_key_wakeup_probes_v22(cursor: MigrationCursor) -> None:
+    # The processor-queue and telemetry-spool NOTIFY trigger functions ask
+    # "was this key idle before the statement" once per distinct key, with a
+    # parameterised EXISTS under function-level planner pins, instead of a
+    # NOT EXISTS anti-join over the transition table. The anti-join's plan
+    # was cached per pooled backend at first use - while the queue was empty
+    # - and kept until autoanalyze: a 10-row admission INSERT then hashed the
+    # backlog once per inserted row (49k shared buffers, 250-320 ms), and 190
+    # such statements at once were the perf suite's 30-65 s
+    # LWLock:BufferContent convoy. Same precedent as v14 and v21: CREATE OR
+    # REPLACE FUNCTION in the idempotent DDL installs the new bodies; no
+    # table or trigger definition changes.
+    cursor.execute("SELECT 1")
+
+
 @dataclass(frozen=True)
 class SchemaMigration:
     version: int
@@ -362,6 +377,12 @@ POSTGRES_SCHEMA_MIGRATIONS = (
         name="edge-triggered-statement-level-wakeups",
         ddl_checksum="633e975f15f867dfec40793ae6f7bcf4550a831f34b8011ad2206186436b9c75",
         apply=_apply_edge_triggered_wakeups_v21,
+    ),
+    SchemaMigration(
+        version=22,
+        name="per-key-planner-pinned-wakeup-probes",
+        ddl_checksum="ba7f7c8e157fe1e7f563374421425299a1333b80bfb5ce0f1bcf9cea6f19961c",
+        apply=_apply_per_key_wakeup_probes_v22,
     ),
 )
 

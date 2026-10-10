@@ -74,6 +74,8 @@ class _ProcessorAdmissionBatcher:
         max_batch_size: int = 64,
         max_flush_groups: int = 16,
         flush_delay_seconds: float = 0.002,
+        flush_delay_max_seconds: float | None = None,
+        contention_flush_seconds: float = 0.1,
         projection_margin: float = 1.0,
         admit_batch=None,
         label: str = "processor admission",
@@ -85,6 +87,16 @@ class _ProcessorAdmissionBatcher:
             raise ValueError("processor admission flush groups must be positive")
         if flush_delay_seconds < 0:
             raise ValueError("processor admission batch delay cannot be negative")
+        if flush_delay_max_seconds is None:
+            flush_delay_max_seconds = flush_delay_seconds
+        if flush_delay_max_seconds < flush_delay_seconds:
+            raise ValueError(
+                "processor admission batch delay cap cannot be below the base delay"
+            )
+        if contention_flush_seconds <= 0:
+            raise ValueError(
+                "processor admission contention threshold must be positive"
+            )
         if projection_margin < 0:
             raise ValueError("processor admission projection margin cannot be negative")
         self.store = store
@@ -97,6 +109,13 @@ class _ProcessorAdmissionBatcher:
         self.max_batch_size = max_batch_size
         self.max_flush_groups = max_flush_groups
         self.flush_delay_seconds = flush_delay_seconds
+        # The coalescing window is adaptive: ``flush_delay_seconds`` while
+        # the store answers quickly, stretched toward
+        # ``flush_delay_max_seconds`` once the flush EWMA passes
+        # ``contention_flush_seconds`` (see ``effective_flush_delay_seconds``).
+        # Equal values switch the adaptation off.
+        self.flush_delay_max_seconds = flush_delay_max_seconds
+        self.contention_flush_seconds = contention_flush_seconds
         self.projection_margin = projection_margin
         # What one batch does to the store. The default admits into the
         # processor queue; the telemetry spool passes its own, because it
@@ -166,6 +185,8 @@ class _ProcessorAdmissionBatcher:
         self.scope_busy_defers_total = 0
         self.scope_flush_max_seconds = 0.0
         self.scope_flush_max_scope = ""
+        self.flush_delay_current_seconds = flush_delay_seconds
+        self.delay_stretched_rounds_total = 0
 
     def _admit_queue_batch(self, items):
         """Runs on a store I/O thread, like every other store call here."""
@@ -181,7 +202,7 @@ class _ProcessorAdmissionBatcher:
 
     @property
     def max_in_flight_flushes(self) -> int:
-        """How many per-scope flushes may run at once.
+        """How many per-scope flushes may run at once in this process.
 
         Same knob as before the barrier came out, and deliberately so:
         under ``asyncio.gather`` the width of a round already was the
@@ -190,9 +211,35 @@ class _ProcessorAdmissionBatcher:
         database sees at once - and the earlier measurement that 64
         concurrent flushes cost more in counter-row contention than they
         win in batching still applies to it.
+
+        What the database sees is this times the number of ingress
+        processes, which is why the regional runtime derives the value from
+        a site-wide cap (``postgres_capacity.flush_slots_per_process``)
+        instead of carrying a per-process literal: 16 per process on 12
+        processes was 192 concurrent admission INSERTs on one table.
         """
 
         return self.max_flush_groups
+
+    def effective_flush_delay_seconds(self) -> float:
+        """The coalescing window the next dispatch pass waits for.
+
+        The base delay while flushes are quick. Once the flush EWMA passes
+        ``contention_flush_seconds`` the store is the bottleneck, and a
+        longer window is pure gain: the same requests leave in fewer, wider
+        transactions, and statements are exactly what a contended table
+        needs fewer of (at ~1,000 req/s a 20-50 ms window cuts them 3-5x).
+        The delay ramps linearly from the base at the threshold to
+        ``flush_delay_max_seconds`` at twice the threshold and follows the
+        EWMA back down, so an uncontended store never pays it.
+        """
+
+        base, cap = self.flush_delay_seconds, self.flush_delay_max_seconds
+        threshold = self.contention_flush_seconds
+        if cap <= base or self.round_seconds_ewma <= threshold:
+            return base
+        ratio = min(1.0, (self.round_seconds_ewma - threshold) / threshold)
+        return base + (cap - base) * ratio
 
     @property
     def in_flight(self) -> int:
@@ -505,7 +552,11 @@ class _ProcessorAdmissionBatcher:
             # arrival wakes the loop immediately, and without a window
             # a burst would be admitted roughly one item per
             # transaction - the opposite of what a batcher is for.
-            await asyncio.sleep(self.flush_delay_seconds)
+            delay = self.effective_flush_delay_seconds()
+            self.flush_delay_current_seconds = delay
+            if delay > self.flush_delay_seconds:
+                self.delay_stretched_rounds_total += 1
+            await asyncio.sleep(delay)
             async with self._lock:
                 now = time.monotonic()
                 # Cleared under the lock ``submit`` sets it under, so an

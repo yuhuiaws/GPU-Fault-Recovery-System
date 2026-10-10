@@ -91,3 +91,22 @@ class PostgresPoolCapacity:
             regional=regional,
         )
         return replicas * processes_per_pod * (pool_max + sum(listeners.values()))
+
+
+def flush_slots_per_process(site_cap: int, writer_processes: int) -> int:
+    """One process's share of a site-wide cap on concurrent admission flushes.
+
+    ``ceil(site_cap / writer_processes)``, never below one: the database sees
+    the per-process value times the process count, so a cap that does not
+    divide evenly rounds the fleet total up (24 over 12 processes is 2 each;
+    30 is 3 each, 36 in total). The regional ingress renders both numbers
+    (``GPU_FAULT_PROCESSOR_*_ADMISSION_FLUSH_CONCURRENCY`` and
+    ``GPU_FAULT_INGRESS_WRITER_PROCESSES``) and ``admission_runtime`` divides
+    them here; a bare process is a fleet of one and takes the whole cap.
+    """
+
+    if site_cap < 1:
+        raise ValueError("site-wide admission flush concurrency must be positive")
+    if writer_processes < 1:
+        raise ValueError("ingress writer process count must be positive")
+    return max(1, -(-site_cap // writer_processes))

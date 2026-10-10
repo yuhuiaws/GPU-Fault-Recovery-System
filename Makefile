@@ -181,6 +181,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_merge_vs_executor.py \
 	tests/store/test_postgres_notification_delivery_lock.py \
 	tests/store/test_postgres_notify_edges.py \
+	tests/store/test_postgres_notify_probe_cost.py \
 	tests/store/test_postgres_observation_sweep.py \
 	tests/store/test_postgres_processor_claim.py \
 	tests/store/test_postgres_processor_counters.py \

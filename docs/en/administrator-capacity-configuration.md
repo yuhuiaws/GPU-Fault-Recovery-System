@@ -26,6 +26,11 @@ Administrators can currently configure:
 - Processor total queue, single-cluster queue, client backoff, persistent retry, completed record retention and the
   ingress's routine admission batch delay (`admissionBatchDelaySeconds`, 0..0.5 s, default 0.002; the default is
   omitted from records and YAML so live digests do not move, see §4.6);
+- The site-wide caps on concurrent ingress admission flushes (`admissionFlushConcurrency` /
+  `faultAdmissionFlushConcurrency` / `evidenceAdmissionFlushConcurrency`, 1..1024 each, defaults 24/24/12, shared by
+  the 3 api-ha replicas x 4 processes so each process takes ceil(cap/12) in-flight flushes) and the adaptive cap of the
+  batch delay (`admissionBatchDelayMaxSeconds`, 0..0.5 s, default 0.05); the defaults of all four are likewise omitted
+  from records and YAML, see §4.6;
 - Workflow scan period and dispatcher thread count;
 - Notification batch size and maximum attempts;
 - Raw evidence retention hours and per-node record cap.
@@ -254,6 +259,28 @@ the default, so the default is not changed silently. With the ingress's routine 
 field rolls the three roles (the processor section is part of every role digest) through the same audit and rollback
 path as any other field.
 
+Admission flush concurrency caps: `processor.admissionFlushConcurrency` (routine telemetry, default 24),
+`faultAdmissionFlushConcurrency` (the P0 fault tier, default 24) and `evidenceAdmissionFlushConcurrency` (the evidence
+tier, default 12) are **site-wide** caps -- how many admission INSERT transactions all api-ha processes together may run
+against `gpu_fault_processor_queue` at once. The renderer ships the caps together with the divisor
+(`GPU_FAULT_PROCESSOR_{,FAULT_,EVIDENCE_}ADMISSION_FLUSH_CONCURRENCY` and the ingress's
+`GPU_FAULT_INGRESS_WRITER_PROCESSES` = 3 replicas x 4 processes = 12); each process takes `ceil(cap / 12)` in-flight
+flush slots (2/2/1 by default; a cap that does not divide takes effect as the rounded-up fleet total), and no
+per-process `*_ADMISSION_BATCH_GROUPS` literal is rendered any more. The caps used to be per-process literals (16 + 8 + 4):
+up to 336 concurrent INSERT transactions from 12 processes on one table, and the perf suite's integrated-32 r1 turned
+the first 30-65 s of its load phase into a convoy of 134-182 concurrent queue INSERTs with 85% of active statements
+waiting on `LWLock:BufferContent`, inside which a P0 request's own INSERT reached its 30 s deadline (503). The fault tier
+has its own cap, and its own batcher and Store I/O threads inside each process, so a telemetry burst never takes a
+fault slot; the depth reserve (`GPU_FAULT_PROCESSOR_FAULT_RESERVED_*`) keeps its semantics. The recommended site values
+are the defaults. The adaptive cap of the batch delay, `admissionBatchDelayMaxSeconds` (default 0.05, 0..0.5): once
+the flush-duration EWMA passes 100 ms the batcher raises the coalescing window linearly from `admissionBatchDelaySeconds`
+toward this cap (fully at an EWMA of 200 ms) and lets it fall back as the store recovers; a cap at or below the base
+delay switches the adaptation off (the runtime takes the larger of the two, so raising the base alone stays valid). The
+convoy's amplifier -- the v21 wakeup trigger's `NOT EXISTS` anti-join, whose plan a backend cached while the queue was
+empty as a hash over the whole backlog (a 10-row INSERT read 49k pages in 250-320 ms until autoanalyze replaced the
+plan) -- is fixed by schema v22 (Detailed Design §3.1.3). The defaults of all four fields are omitted from records and
+YAML (live digests do not move); a change rolls the three roles as well.
+
 ### 4.7 PostgreSQL Connection Budget
 
 The runtime, the administrator validation and the capacity runner share
@@ -302,6 +329,10 @@ spec:
     retryBackoffMaxSeconds: 30
     completedRetentionSeconds: 600
     admissionBatchDelaySeconds: 0.002
+    admissionBatchDelayMaxSeconds: 0.05
+    admissionFlushConcurrency: 24
+    faultAdmissionFlushConcurrency: 24
+    evidenceAdmissionFlushConcurrency: 12
   workflow:
     pollIntervalSeconds: 5
     dispatcherWorkers: 8

@@ -159,10 +159,21 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
     )
     assert ingress_env["GPU_FAULT_LIFESPAN_SHUTDOWN_MAX_SECONDS"] == "20"
     assert ingress_env["GPU_FAULT_PROCESSOR_FAULT_ADMISSION_BATCH_SIZE"] == "64"
-    assert ingress_env["GPU_FAULT_PROCESSOR_FAULT_ADMISSION_BATCH_GROUPS"] == "8"
     assert ingress_env["GPU_FAULT_PROCESSOR_FAULT_ADMISSION_PROJECTION_MARGIN"] == "0"
     assert ingress_env["GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_BATCH_SIZE"] == "32"
-    assert ingress_env["GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_BATCH_GROUPS"] == "4"
+    # The admission flush caps are site-wide and divided among the ingress
+    # processes (3 replicas x 4 workers); no per-process group literal remains.
+    assert ingress_env["GPU_FAULT_INGRESS_WRITER_PROCESSES"] == "12"
+    assert ingress_env["GPU_FAULT_PROCESSOR_ADMISSION_FLUSH_CONCURRENCY"] == "24"
+    assert ingress_env["GPU_FAULT_PROCESSOR_FAULT_ADMISSION_FLUSH_CONCURRENCY"] == "24"
+    assert (
+        ingress_env["GPU_FAULT_PROCESSOR_EVIDENCE_ADMISSION_FLUSH_CONCURRENCY"] == "12"
+    )
+    assert (
+        ingress_env["GPU_FAULT_PROCESSOR_ADMISSION_BATCH_DELAY_MAX_SECONDS"] == "0.05"
+    )
+    for tier in ("", "FAULT_", "EVIDENCE_"):
+        assert f"GPU_FAULT_PROCESSOR_{tier}ADMISSION_BATCH_GROUPS" not in ingress_env
     assert ingress_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_SECONDS"] == "1"
     assert ingress_env["GPU_FAULT_PROCESSOR_RETRY_BACKOFF_MAX_SECONDS"] == "30"
     assert ingress_env["GPU_FAULT_TELEMETRY_REQUEST_BUDGET_SECONDS"] == "30"

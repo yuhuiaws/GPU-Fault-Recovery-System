@@ -58,6 +58,8 @@ DYNAMIC_VARIABLES = tuple(
         "BATCH_SIZE",
         "BATCH_GROUPS",
         "BATCH_DELAY_SECONDS",
+        "BATCH_DELAY_MAX_SECONDS",
+        "FLUSH_CONCURRENCY",
         "PROJECTION_MARGIN",
     )
 )

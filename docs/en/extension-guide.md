@@ -104,8 +104,8 @@ release rather than replacing the file online.
 
 ## 5. Adding a Schema migration
 
-The latest version in the current registry is v21
-`edge-triggered-statement-level-wakeups`. The next migration must append v22:
+The latest version in the current registry is v22
+`per-key-planner-pinned-wakeup-probes`. The next migration must append v23:
 
 1. Modify the latest idempotent schema in the corresponding `store/postgres/ddl*.py`; the checksum covers all
    `ddl*.py`, not just `ddl.py`. Catalog reads inside a stage (`pg_class`/`pg_index`, ...) must tolerate cursor
