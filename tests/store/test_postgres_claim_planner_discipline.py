@@ -1,18 +1,19 @@
-"""The processor's hot transactions do not depend on fresh statistics.
+"""The claim transactions do not depend on fresh statistics.
 
 A burst grows ``gpu_fault_processor_queue`` from 45 to 5,800 pages inside a
 minute while ``pg_class`` still says 138 rows: autoanalyze is asynchronous, so
 the planner keeps choosing plans that read the whole backlog for the claim
-window, its correlated ``EXISTS`` probes and the completion's row locking, and
-the heap is read hundreds of times a second (``LWLock:BufferContent``). The
-hot transactions now start with ``SET LOCAL enable_seqscan = off``. This proves
-the claim touches only its window under exactly those statistics -- 138 rows
-analysed, then 4,862 more the planner knows nothing about -- and under fresh
-ones, returns the same rows in the same order, and that the depth reads walk
-the counts primary key. Both statistics states are produced inside the test
-(explicit ``ANALYZE`` with autovacuum disabled on the table) and verified from
-``pg_class`` before anything is measured; buffer and row counts are recorded as
-test properties, never compared as absolutes.
+window and its correlated ``EXISTS`` probes, and the heap is read hundreds of
+times a second (``LWLock:BufferContent``). The claim transactions -- and only
+those; the admission and completion transactions fire statement-level
+triggers over unindexed transition tables that the same setting would degrade
+-- now start with ``SET LOCAL enable_seqscan = off``. This proves the claim
+touches only its window under exactly those statistics (138 rows analysed,
+then 4,862 more the planner knows nothing about) and under fresh ones, and
+returns the same rows in the same order. Both statistics states are produced
+inside the test (explicit ``ANALYZE`` with autovacuum disabled on the table)
+and verified from ``pg_class`` before anything is measured; buffer and row
+counts are recorded as test properties, never compared as absolutes.
 """
 
 from __future__ import annotations
@@ -37,7 +38,6 @@ pytestmark = pytest.mark.skipif(
     not POSTGRES_URL, reason="GPU_FAULT_TEST_POSTGRES_URL is not configured"
 )
 QUEUE = "gpu_fault_processor_queue"
-COUNTS = "gpu_fault_processor_queue_counts"
 HOST_TELEMETRY = "/v1/collector-events/host-telemetry"
 GPU_TELEMETRY = "/v1/collector-events/gpu-telemetry"
 BACKLOG = 5000
@@ -295,62 +295,3 @@ def test_claim_touches_only_its_window_and_keeps_its_answer(
     assert default_rows == [
         f"processor-bulk-{n}" for n in range(BACKLOG, BACKLOG - LIMIT, -1)
     ], "the eight oldest routine rows, oldest first"
-
-
-COUNTS_SOURCE = f"SELECT cluster_id, incomplete_count FROM {COUNTS}"
-PER_SCOPE_DEPTHS = f"""
-    WITH counts AS ({COUNTS_SOURCE})
-    SELECT cluster_id, coalesce(sum(incomplete_count), 0)
-    FROM counts
-    WHERE cluster_id=ANY(%s)
-    GROUP BY cluster_id
-"""
-GLOBAL_DEPTH = f"""
-    WITH counts AS ({COUNTS_SOURCE})
-    SELECT coalesce(sum(incomplete_count), 0)
-    FROM counts
-"""
-
-
-def test_depth_reads_walk_the_counts_primary_key(
-    store: PostgresStore, connection: Any
-) -> None:
-    """The admission's per-cluster depth reads (``_processor_counter_depths``,
-    issued inside the pinned admission transaction) walk the counts primary
-    key instead of summing the table sequentially ~300 times a second."""
-
-    for index in range(3):
-        store.enqueue_processor_request(
-            processor_request(
-                HOST_TELEMETRY,
-                body=json.dumps({"node_id": f"node-{index}"}).encode(),
-                cluster_id=f"cluster-{index % 2}",
-            )
-        )
-    connection.execute(f"ANALYZE {COUNTS}")
-    scopes = ["cluster-0", "cluster-1", "cluster-9"]
-    pinned = hot_path_planner_statements()
-    plan = _explain(
-        connection, PER_SCOPE_DEPTHS, (scopes,), settings=pinned, analyze=False
-    )
-    scans = _scans(plan, COUNTS)
-    assert scans and all(kind != "Seq Scan" for kind, _ in scans), scans
-    assert {name for _, name in scans} == {"gpu_fault_processor_queue_counts_pkey"}, (
-        scans
-    )
-
-    def depths(conn: Any) -> tuple[dict[str, int], int]:
-        per_scope = {scope: 0 for scope in scopes}
-        per_scope.update(
-            {
-                cluster_id: int(count)
-                for cluster_id, count in conn.execute(
-                    PER_SCOPE_DEPTHS, (scopes,)
-                ).fetchall()
-            }
-        )
-        return per_scope, int(conn.execute(GLOBAL_DEPTH).fetchone()[0])
-
-    expected = ({"cluster-0": 2, "cluster-1": 1, "cluster-9": 0}, 3)
-    assert _in_transaction(connection, pinned, depths) == expected
-    assert _in_transaction(connection, (), depths) == expected

@@ -3,7 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
-from gpu_fault.store.postgres.planner_discipline import pin_hot_path_plans
 from gpu_fault.store.shared.cleanup_log import log_cleanup
 
 
@@ -81,7 +80,6 @@ class PostgresProcessorLeaseMixin:
         lease_duration: timedelta,
     ) -> bool:
         with self._state_transaction(f"processor_request/{request_id}"):
-            pin_hot_path_plans(self._db)
             self._lock_processor_queue_row(request_id)
             current = self.get_processor_request(request_id)
             now = datetime.now(timezone.utc)
@@ -154,7 +152,6 @@ class PostgresProcessorLeaseMixin:
         )
 
         with self._state_transaction(f"processor_request/{request_id}"):
-            pin_hot_path_plans(self._db)
             self._lock_processor_queue_row(request_id)
             current = self.get_processor_request(request_id)
             now = datetime.now(timezone.utc)
@@ -279,7 +276,6 @@ class PostgresProcessorLeaseMixin:
         )
 
         with self._state_transaction("processor_request/reclaim-expired"):
-            pin_hot_path_plans(self._db)
             with self._db.cursor() as cursor:
                 cursor.execute(
                     f"""

@@ -8,7 +8,6 @@ from typing import Any, Callable, TypedDict
 from gpu_fault.store.postgres.processor_completion_runtime import (
     complete_cluster_groups,
 )
-from gpu_fault.store.postgres.planner_discipline import pin_hot_path_plans
 from gpu_fault.store.shared.errors import StaleFencingTokenError
 from gpu_fault.store.shared.group_commit import submit_group_commit
 from gpu_fault.store.shared.time import (
@@ -201,7 +200,6 @@ class PostgresProcessorCompletionMixin:
             """
             payload_parameters = (_utc_text(now),)
         with self._db.transaction():
-            pin_hot_path_plans(self._db)
             with self._db.cursor() as cursor:
                 cursor.execute(
                     f"""
@@ -376,7 +374,6 @@ class PostgresProcessorCompletionMixin:
         )
 
         with self._state_transaction(f"processor_request/{request_id}"):
-            pin_hot_path_plans(self._db)
             self._lock_processor_queue_row(request_id)
             current = self.get_processor_request(request_id)
             now = datetime.now(timezone.utc)
