@@ -216,9 +216,52 @@ def test_claims_completions_and_coalescing_rewrites_are_hot_updates(store) -> No
     )
 
 
+@pytest.mark.parametrize("store", ["inline"], indirect=True)
+def test_the_inline_layout_keeps_completions_in_the_queue(store) -> None:
+    """The layout an upgraded database keeps until the switch: bodies stay in
+    the queue row, a completion stays a queue row and no replay bucket exists
+    to receive it, and the row-by-row sweep is what retires it."""
+
+    assert store.hot_layout_mode() == "inline"
+    requests = [_telemetry(f"node-{n}", request_id=f"in-{n}") for n in range(4)]
+    store.try_enqueue_processor_requests_batch(
+        requests, max_depth=100, max_cluster_depth=100
+    )
+    with _connect() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM gpu_fault_processor_payloads"
+        ).fetchone() == (0,), "inline bodies stay in the queue row"
+        assert connection.execute(
+            "SELECT count(*) FROM gpu_fault_processor_queue "
+            "WHERE payload ? 'body_base64'"
+        ).fetchone() == (4,)
+    claimed = store.claim_active_processor_requests(
+        "owner", now=datetime.now(timezone.utc), lease_duration=REQUEST_LEASE, limit=4
+    )
+    _complete(store, claimed)
+    with _connect() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM gpu_fault_processor_queue WHERE status='COMPLETED'"
+        ).fetchone() == (4,), "an inline completion stays in the queue"
+        assert connection.execute(
+            "SELECT count(*) FROM gpu_fault_processor_replays"
+        ).fetchone() == (0,), "no replay row is written inline"
+    replay = store.get_processor_request("in-0")
+    assert replay.status.value == "COMPLETED"
+    assert replay.response_body_base64 == RESPONSE
+    removed = store.cleanup_completed_processor_requests(
+        older_than=datetime.now(timezone.utc) + timedelta(seconds=600), limit=100
+    )
+    assert removed == 4, "the inline sweep retires completed rows one by one"
+    with _connect() as connection:
+        assert connection.execute(
+            "SELECT count(*) FROM gpu_fault_processor_queue"
+        ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize("store", ["detached"], indirect=True)
 def test_the_detached_layout_moves_completions_to_a_replay_bucket(store) -> None:
-    if store.hot_layout_mode() != "detached":
-        pytest.skip("inline keeps completed rows in the queue")
+    assert store.hot_layout_mode() == "detached"
     requests = [_telemetry(f"node-{n}", request_id=f"mv-{n}") for n in range(4)]
     store.try_enqueue_processor_requests_batch(
         requests, max_depth=100, max_cluster_depth=100
@@ -272,9 +315,9 @@ def test_the_detached_layout_moves_completions_to_a_replay_bucket(store) -> None
         store.get_processor_request("mv-0")
 
 
+@pytest.mark.parametrize("store", ["inline"], indirect=True)
 def test_inline_rows_are_still_swept_by_row_after_the_switch(store) -> None:
-    if store.hot_layout_mode() != "inline":
-        pytest.skip("starts inline")
+    assert store.hot_layout_mode() == "inline", "the switch test starts inline"
     requests = [_telemetry(f"node-{n}", request_id=f"sw-{n}") for n in range(2)]
     store.try_enqueue_processor_requests_batch(
         requests, max_depth=100, max_cluster_depth=100
