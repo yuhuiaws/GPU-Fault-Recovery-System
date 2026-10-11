@@ -1483,6 +1483,20 @@ The following order comes from `src/gpu_fault/admin/cluster_join.py` and
 | Commit and activate | First site/bootstrap, release state, Aurora resource registration, then `ACTIVATION_STARTED` and `ACTIVE`, finally re-verify | The batch commits cluster by cluster serially; the expected revision change of an already committed sibling may advance the remaining proofs but may not hide drift of other members or of the release |
 | Failure compensation or fail-forward | When not activated and `autoRollback=true`, compensate this attempt; after the activation intent only move forward | Wait for started parallel tasks to finish before compensating; do not undo already successful siblings, and do not start the next attempt in parallel with the old compensation |
 
+Node ownership convention (`gpu_fault.cluster_scope`: `OWNERSHIP_LABEL`, `NodeSelectorSource`, `ownership_node_selector`,
+`node_selector_source`, connection Secret key `node-selector-source`): the site id comes from
+`bootstrap_site.site_identifier` and is printed before the first deploy by `gpu-fault-admin site-id`
+(`admin/site_identity_command.py`); `deploy`/`join-cluster` accept no node selector flag, and
+`discover_cluster(..., site_id, existing_clusters)` resolves a joining cluster from the node groups labelled
+`gpu-fault.io/control-plane=<site id>` (`bootstrap_ownership.resolve_node_scope`: no label, another site's label or an
+instance type outside the GPU inventory refuses) while an already-managed cluster keeps its entry's `nodeSelector`
+(`preserve_existing_site_contract` copies only the previous entry's `nodeSelector`/`nodeSelectorSource` and writes no
+derived value). `gpu-fault-admin node-scope` (`admin/node_scope_command.py`) compares, read-only, the node sets the
+recorded and the label-derived selectors select; `--converge --reference` rewrites the entry only when they are equal and
+appends `<state-dir>/node-scope/<cluster_id>/journal.json`, after which `deploy` rolls it out. On the release side
+`ClusterTarget.node_selector_source` and `regional_admin_checks_coverage.selected_nodes`/`node_scope_details` make Agent
+coverage and `status --full` read the same selected set.
+
 A custody wait for authorization or an evidence block does not take the ordinary failure compensation in the table; the prepared namespace/UID and the
 original inputs must be kept; the next probe must not be made to pass by deleting resources, automatic recreation or repeated key writes.
 

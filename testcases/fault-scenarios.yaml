@@ -7499,6 +7499,62 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-032
   related_pytest: tests/regional/test_cov95_boot032_lifecycle.py::test_checked_native_uninstall_pauses_resumes_and_replays_read_only
+- id: GF-REGIONAL-BOOT-033
+  title: 按归属标签接入 GPU 集群：site-id、标签发现与来源审计
+  category: regional-deployability
+  level: staging
+  risk: live-non-destructive
+  problem: deploy/join-cluster 只接受 ARN 之后，没有用例证明站点 ID 的确定性、按节点组归属标签的发现、记录的来源与 status --full 审计一致，且 Agent 覆盖与 collector 就绪只看同一选中集合。
+  injection: >-
+    在隔离站点上只读核对 BOOT-025 的重接：gpu-fault-admin site-id 两次输出、
+    describe-nodegroup/describe-cluster 的归属标签、DISCOVERED 片段、node-scope 与 status --full 的 node_scope。
+  expected:
+  - site-id 两次一致且等于 site.yaml 的 metadata.name
+  - DISCOVERED.target、site.yaml 条目、连接 Secret、node-scope、status --full 五处的选择器与来源一致且来源为 label-convention
+  - Agent 覆盖以同一节点集为 expected_node_ids，无 drift
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-033
+  related_pytest: tests/admin/test_admin_eks_managed_join.py::test_eks_arn_without_hyperpod_discovers_an_eks_managed_identity
+- id: GF-REGIONAL-BOOT-034
+  title: 归属标签缺失、指向他站点或非 GPU 实例类型时 join-cluster 在任何变更前拒绝
+  category: regional-deployability
+  level: staging
+  risk: live-non-destructive
+  problem: 三条拒绝只在单测里出现过，没有真机证据表明 join-cluster 在创建任何资源前停止并点名节点组、实例类型、标签值与站点 ID。
+  injection: >-
+    在隔离站点已注销的 GPU 集群上依次摘掉归属标签、打上另一站点 ID、给非 GPU 节点组打本站点标签，
+    每次执行 join-cluster 并核对站点、IAM、Route53、token 与 join journal 均无变化，最后复原标签基线。
+  expected:
+  - 无标签时拒绝消息含精确标签、站点 ID、site-id 动词、每个节点组的证据行与施加标签的 provider 命令
+  - 他站点标签以 name another site 拒绝并点名节点组与两个 ID
+  - 非 GPU 实例类型以 outside the GPU instance inventory 拒绝并点名节点组与类型
+  - 每次尝试后 site.yaml/bootstrap-state.json 摘要不变，无新增 IAM/Route53/token，join journal 未推进
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-034
+  related_pytest: tests/admin/test_admin_eks_managed_join.py::test_a_cluster_without_a_labelled_node_group_is_refused_with_the_evidence
+- id: GF-REGIONAL-BOOT-035
+  title: HyperPod 混合实例组：只有带标签的 GPU 实例组被接入，wave、Agent 覆盖、collector 就绪与 DCGM 共用同一选中集
+  category: regional-deployability
+  level: staging
+  risk: live-service-action
+  problem: 此前整个 HyperPod 集群按 cluster-name 标签被选中，非 GPU 实例组的节点被安装器判 unsupported、wave 永不收敛、verify 报 Agent 覆盖 drift；没有用例证明按归属标签接入后非 GPU 节点在每个消费者里都不在集合内。
+  injection: >-
+    在隔离站点接入一个同时含带标签 GPU 实例组与不带标签非 GPU 实例组（CurrentCount>=1）的 HyperPod 集群，
+    核对安装器 Job、fleet wave、status --full 的 node_scope 与 Agent 覆盖、collector 就绪、DCGM DaemonSet 调度与 failure-domain-map。
+  expected:
+  - DISCOVERED.target.node_selector 为归属标签加 cluster-name 标签的两项选择器，来源 label-convention
+  - 非 GPU 节点没有安装器注解与 Agent，unsupported 计数为 0，wave 节点集等于 GPU 节点集
+  - status --full 的 cluster_nodes_outside_selector 恰好列出非 GPU 节点，Agent 覆盖无 drift
+  - DCGM exporter 只调度到 GPU 节点，failure-domain-map 只含 GPU 节点，接入 VERIFIED 并激活
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-035
+  related_pytest: tests/admin/test_admin_eks_managed_join.py::test_hyperpod_discovery_selects_the_labelled_instance_groups
 - id: GF-REGIONAL-HA-011
   title: 隔离部署运行时的繁忙processor与spool进程接管
   category: regional-high-availability

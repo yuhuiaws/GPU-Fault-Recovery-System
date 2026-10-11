@@ -3627,6 +3627,127 @@ When the corresponding lifecycle was not performed the companion stays `NOT_RUN`
   no rollback that rebuilds the site is promised, and "resuming" by deleting the journal or changing the target is not allowed.
 - The local fake-transport regression covers these control flows; it does not mean an AWS/EKS/Aurora uninstall was executed.
 
+### GF-REGIONAL-BOOT-033
+
+**Joining GPU clusters through the ownership label: `site-id`, label discovery and source audit**
+
+- Level: `live-non-destructive`. A read-only check of the re-join `BOOT-025` completed under the convention: nothing is
+  joined, removed or relabelled.
+- Purpose: `deploy`/`join-cluster` take ARNs only; the GPU nodes are declared by the ownership label
+  `gpu-fault.io/control-plane=<site id>` on the node groups (Administrator Operations §5.0.0). This case proves that the
+  site id is deterministic, that discovery followed the label, that the recorded source and the `status --full` audit agree,
+  and that Agent coverage, collector readiness and the waves all read the same selected set.
+- Prerequisite: `BOOT-025` PASS (the node groups / instance groups of the re-joined GPU cluster carried this site's
+  ownership label before the join).
+
+#### Steps
+
+1. `gpu-fault-admin site-id --cpu-cluster-arn <CPU ARN> --state-dir <STATE_DIR>`: the printed `site_id` equals
+   `metadata.name` of `site.yaml` (`recorded_site.matches=true`) and `ownership_label.value` is the same; run it again
+   without `--state-dir` and get the same id (determinism).
+2. `aws eks describe-nodegroup` (plain EKS) / `aws sagemaker describe-cluster` (HyperPod,
+   `InstanceGroups[].KubernetesConfig.CurrentLabels`) show the label on the node groups / instance groups hosting GPU nodes
+   and not on the CPU node group.
+3. `DISCOVERED.target` in `BOOT-025`'s `join-cluster/<arn_sha256_12>/state.json`: `node_selector` is
+   `gpu-fault.io/control-plane=<site id>` (HyperPod adds `,sagemaker.amazonaws.com/cluster-name=<name>`),
+   `node_selector_source=label-convention`; the cluster's `site.yaml` entry (`nodeSelector`/`nodeSelectorSource`) agrees;
+   the `node-selector`/`node-selector-source` keys of its `gpu-fault-regional-connection` Secret are the same.
+4. `gpu-fault-admin node-scope --state-dir <STATE_DIR>`: the cluster shows `source=label-convention`,
+   `convergence=converged`, `nodes.current == nodes.label`, empty `would_join`/`would_leave`.
+5. `gpu-fault-admin status --full`: the cluster check's `node_scope.selector`/`node_scope.source` are the same,
+   `selected_nodes` equals the count of `kubectl get nodes -l <selector>`; the `control_api` check's Agent coverage uses that
+   node set as `expected_node_ids` and reports no `Agent coverage drift`.
+6. Evidence goes to `cases/GF-REGIONAL-BOOT-033/GF-REGIONAL-BOOT-033.json`: both `site-id` outputs, the node-group /
+   instance-group label evidence, the DISCOVERED excerpt, the `node-scope` report and the `status --full` `node_scope`;
+   ARNs as digests.
+
+#### Verdict
+
+- The site id is identical twice and equals the site name; selector and source agree in all five places (journal,
+  `site.yaml`, Secret, `node-scope`, `status --full`); any disagreement, a source other than `label-convention`, or a
+  coverage drift is FAIL.
+- Local regression: `tests/admin/test_admin_eks_managed_join.py`, `tests/admin/test_admin_ownership_label_discovery.py`,
+  `tests/admin/test_admin_site_id_verb.py`, `tests/regional/test_regional_admin_checks_node_scope.py`.
+
+### GF-REGIONAL-BOOT-034
+
+**A missing ownership label, another site's label or a non-GPU instance type makes `join-cluster` refuse before any change**
+
+- Level: `live-non-destructive`. Only the node-group labels of an **already removed** cluster of the isolated site are
+  changed and restored; every `join-cluster` attempt is refused before anything is created, so the site, Aurora, IAM, the
+  network and the nodes do not change.
+- Purpose: the three refusals (Administrator Operations §5.0.0) name the facts on a real cluster: no node group labelled
+  for this site, a label naming another site, a labelled node group whose instance type is outside the GPU inventory.
+- Prerequisite: `BOOT-024` PASS (the GPU cluster is removed; the site is in its zero-cluster steady state or holds only
+  other clusters).
+
+#### Steps
+
+1. Record the site id (`site-id --state-dir`), the label baseline of the target cluster's node groups / instance groups,
+   the sha256 of `site.yaml` and `bootstrap-state.json`, and the IAM role and Route53 association inventories.
+2. Remove the ownership label from the GPU node group / instance group (EKS: `update-nodegroup-config --labels
+   removeLabels=gpu-fault.io/control-plane`; HyperPod: `update-cluster` without the key in `KubernetesConfig.Labels`), wait
+   until `describe-*` no longer shows it; run `join-cluster --state-dir <STATE_DIR> --gpu-cluster-arn <ARN>`: non-zero
+   exit, the message contains `has no managed node group labelled gpu-fault.io/control-plane=<site id>` (HyperPod:
+   `has no instance group labelled …`), `gpu-fault-admin site-id`, one evidence line per node group
+   `<name> instanceTypes=<types> gpu-fault.io/control-plane=absent`, and the provider command that applies the label.
+3. Label the GPU node group with another site id (for example `<site id>-other`): `join-cluster` refuses with
+   `name another site`, naming the node group and both ids.
+4. Restore the GPU node group's label and label the CPU node group (or a non-GPU HyperPod instance group such as
+   `ml.g6.12xlarge`) for this site: `join-cluster` refuses with `outside the GPU instance inventory`, naming the node group
+   and its instance type; remove that label.
+5. After every attempt: the sha256 of `site.yaml`/`bootstrap-state.json` is unchanged,
+   `join-cluster/<arn_sha256_12>/state.json` has no step beyond `PRECHECKED`/`DISCOVERED` or does not exist, no IAM role,
+   Route53 association or token file was added, and the target cluster has no product namespace.
+6. `BOOT-025` may re-join only after the label baseline is restored; the attempt logs and the three refusals go to
+   `cases/GF-REGIONAL-BOOT-034/GF-REGIONAL-BOOT-034.json`.
+
+#### Verdict
+
+- Each of the three refusals appears once and names the facts; an attempt that created a resource or advanced the join
+  journal is FAIL; the label baseline must be restored.
+- Local regression: `tests/admin/test_admin_eks_managed_join.py` (`…refused_with_the_evidence`, `…another_site…`,
+  `…outside_the_gpu_inventory…`), `tests/admin/test_admin_ownership_label_discovery.py`.
+
+### GF-REGIONAL-BOOT-035
+
+**Mixed HyperPod instance groups: only the labelled GPU instance group is joined; waves, Agent coverage, collector readiness and DCGM share one selected set**
+
+- Level: `live-service-action`. Joins, on the isolated site, a HyperPod cluster that holds a GPU instance group (labelled
+  for this site) and a non-GPU instance group (for example `ml.g6.12xlarge`, unlabelled, `CurrentCount>=1`); no node is
+  rebooted or replaced.
+- Purpose: before the convention the whole HyperPod cluster was selected on `sagemaker.amazonaws.com/cluster-name`; the
+  nodes of a non-GPU instance group were marked unsupported by the installer, the waves never converged and verify
+  reported Agent coverage drift. The selector is now
+  `gpu-fault.io/control-plane=<site id>,sagemaker.amazonaws.com/cluster-name=<name>`, and the non-GPU nodes are outside
+  the set.
+- Prerequisite: `BOOT-033` PASS; the HyperPod cluster has `NodeRecovery=None`; the GPU instance group's
+  `KubernetesConfig.CurrentLabels` carry this site's label.
+
+#### Steps
+
+1. `describe-cluster` records both instance groups (name, `InstanceType`, `CurrentCount`, `CurrentLabels`);
+   `kubectl get nodes --show-labels` records every node's `sagemaker.amazonaws.com/instance-group-name` and ownership label.
+2. `join-cluster --state-dir <STATE_DIR> --gpu-cluster-arn <HyperPod/EKS ARN>` completes (with the profile approval rerun
+   of `BOOT-025` where needed); `DISCOVERED.target.node_selector` is the two-term selector above and
+   `node_selector_source=label-convention`.
+3. The installer creates Jobs for the GPU instance group's nodes only: the non-GPU nodes carry no `gpu-fault.io/installer-*`
+   annotation and no Agent, the `unsupported` count of `gpu-fault-node-installer` is 0, and the fleet waves converge (the
+   node set of the `waves` equals the GPU node set).
+4. `status --full`: `node_scope.selected_nodes` equals the GPU node count and `cluster_nodes_outside_selector` lists exactly
+   the non-GPU nodes; the `control_api` Agent coverage has no drift and collector readiness counts GPU nodes only; the DCGM
+   exporter DaemonSet schedules on GPU nodes only (instance-type affinity); `failure-domain-map` holds GPU nodes only.
+5. Regression evidence: repeat the consistency checks of `BOOT-033` steps 3–5 for this cluster; evidence goes to
+   `cases/GF-REGIONAL-BOOT-035/GF-REGIONAL-BOOT-035.json`.
+
+#### Verdict
+
+- The non-GPU nodes appear in none of the selector, the waves, Agent coverage, collector readiness, DCGM scheduling or the
+  failure-domain map; the join reaches VERIFIED and activates; counting a non-GPU node anywhere or a reported drift is FAIL.
+- Local regression: `tests/admin/test_admin_eks_managed_join.py`
+  (`test_hyperpod_discovery_selects_the_labelled_instance_groups`), `tests/test_cluster_scope.py`
+  (`…matches_only_this_sites_nodes`), `tests/regional/test_regional_admin_checks_node_scope.py`.
+
 ### GF-REGIONAL-BOOT-024
 
 **`remove-cluster` deregisters the site's only GPU cluster: full state machine, label-owned RBAC cleanup, second annotation clear and CPU-only steady state**
@@ -3784,8 +3905,9 @@ node names appear only as sha256 digests; per-step durations are not recorded.
 **`join-cluster --gpu-cluster-arn` re-attach after removal: node subnet CIDRs, DNS gate retry, collector events during PENDING, executor ready before the first claim, wave safety looks only at live Agents, rollback after a forced failure and rediscovery on retry**
 
 > Both providers: an `eks-managed` cluster is re-attached with the same `join-cluster`, and one command may carry several
-> `--gpu-cluster-arn`; a plain-EKS member adds `--gpu-nodegroup <managed node group>` (or `--node-selector`, default
-> `nvidia.com/gpu.present=true`), its node image must carry `python3.12`/`strace`, and the managed workload namespaces (`training`
+> `--gpu-cluster-arn`; the command takes ARNs only: the GPU node groups / instance groups of both providers must carry the
+> ownership label `gpu-fault.io/control-plane=<site id>` beforehand (`BOOT-033`), a plain-EKS member's node image must carry
+> `python3.12`/`strace`, and the managed workload namespaces (`training`
 > by default) must already exist; every ARN has its own `join-cluster/<arn_sha256_12>/state.json`. `BOOT-029` S3 re-attaches every
 > GPU cluster in one command.
 
@@ -4345,13 +4467,14 @@ and does not count towards its sequence.
 6. Baseline (read-only): `aws ecr describe-repositories` shows no `gpu-fault/runtime-*`;
    `docker images` shows no `gpu-fault-runtime*`; `docker buildx du` is empty after cleanup;
    Aurora has no cluster; the target namespace does not exist on any cluster.
-7. `eks-managed` members: EKS node auto repair is off on the managed node groups hosting GPU nodes
-   (`nodeRepairConfig.enabled=false` or unset, otherwise S1/S3 discovery refuses), the GPU node image carries `python3.12` and
-   `strace`, the workload namespace `training` exists, and the
-   GPU nodes carry `nvidia.com/gpu.present=true` (or the operator gives the driver `--gpu-nodegroup <nodegroup>` /
-   `--node-selector <selector>`, which the driver hands to the command that names the `eks-managed` members -- in S1/S5
-   the first `deploy` (all-plain-EKS) or the `join-cluster` that attaches them afterwards; S3's `join-cluster` gets it
-   as given; S5 uses it only when the README's deployment section documents that parameter, see S5).
+7. Ownership label (both providers): in every GPU cluster the managed node groups / HyperPod instance groups hosting GPU
+   nodes carry `gpu-fault.io/control-plane=<site id>` (the site id is printed by
+   `gpu-fault-admin site-id --cpu-cluster-arn <CPU_EKS_ARN>`; Administrator Operations §5.0.0); before S1, S3 and S5 act,
+   the driver checks that precondition with the product's own read-only reads
+   (`scripts/e2e/regional/boot029_node_scope.py`: the site id and every cluster's labelled node groups) and stops the stage
+   with the product's refusal before any cold build or mutation when it does not hold. `eks-managed` members also need: EKS
+   node auto repair off on the managed node groups hosting GPU nodes (`nodeRepairConfig.enabled=false` or unset, otherwise
+   S1/S3 discovery refuses), the GPU node image with `python3.12` and `strace`, and the workload namespace `training`.
 
 #### Steps
 
@@ -4369,17 +4492,16 @@ scripts/acceptance/admin-lifecycle-sequence.sh \
   --cpu-cluster-arn <CPU_EKS_ARN> \
   --gpu-cluster-arn <GPU_ARN_1> \
   --gpu-cluster-arn <GPU_ARN_2> \
-  --gpu-nodegroup <EKS_NODEGROUP> \
   --admin-email <ADMIN_EMAIL> \
   --repo <CHECKOUT> \
   --confirm-isolated-build-host
 ```
 
 `--gpu-cluster-arn` is given once per GPU cluster in the order they are managed (a single-GPU-cluster site has one line);
-`--gpu-nodegroup`/`--node-selector` is given only when an `eks-managed` member is present, and the driver hands it to the
-command that names the `eks-managed` members (S3's `join-cluster` gets it as given; HyperPod members ignore it). The ARN
-list (with its order) and that flag enter the sequence's input digest (`gpu_cluster_arns_sha256`, `eks_flag_sha256`); a
-resume may not change them.
+the driver accepts no node selector flag (the retired `--gpu-nodegroup`/`--node-selector` are refused and point at the
+ownership label), because the node scope is declared on the node groups (prerequisite 7). The ARN list (with its order)
+enters the sequence's input digest (`gpu_cluster_arns_sha256`); a resume may not change it; every acting stage's receipt
+records `node_scope_precondition` (site id and node group names as digests).
 
 **Provider discovery and mixed sites.** Before S1 and S5 the driver asks the product's own discovery for the provider of
 every GPU ARN (`scripts/e2e/regional/boot029_providers.py`: a SageMaker ARN is `hyperpod`; an EKS ARN is `hyperpod` when
@@ -4442,23 +4564,21 @@ stages or after everything has finished, following the references below.
      --admin-email <ADMIN_EMAIL>
    ```
 
-   The first `deploy` names every cluster of the first ARN's provider only (above: the HyperPod cluster `<GPU_ARN_1>`,
-   without the eks flag; an all-`eks-managed` first deploy carries `--gpu-nodegroup`/`--node-selector`). On a mixed site
+   The first `deploy` names every cluster of the first ARN's provider only (above: the HyperPod cluster `<GPU_ARN_1>`);
+   the command takes ARNs only, the GPU nodes are declared by the ownership label of prerequisite 7. On a mixed site
    the stage then runs the site-bound `join-cluster` (`<STATE_DIR>/deployer-venv/bin/gpu-fault-admin`) for the other
-   provider, `eks-managed` members with the eks flag:
+   provider:
 
    ```bash
    gpu-fault-admin join-cluster \
      --state-dir <STATE_DIR> \
-     --gpu-cluster-arn <GPU_ARN_2> \
-     --gpu-nodegroup <EKS_NODEGROUP>
+     --gpu-cluster-arn <GPU_ARN_2>
    # the cluster needs its provider's own Runtime Profile version (eks-v1 / hyperpod-v1): the join writes
    # <STATE_DIR>/release-deploy/profile-plan.json (change_kind CLUSTER_PROFILE_NEW) and exits non-zero;
    # the driver checks that plan (plan_sha256 recomputed, approval_required), approves it and reruns the same command:
    gpu-fault-admin join-cluster \
      --state-dir <STATE_DIR> \
      --gpu-cluster-arn <GPU_ARN_2> \
-     --gpu-nodegroup <EKS_NODEGROUP> \
      --approve-profile-plan <plan_sha256> --reference GF-REGIONAL-BOOT-029/stage-1
    ```
 
@@ -4503,13 +4623,12 @@ stages or after everything has finished, following the references below.
    gpu-fault-admin join-cluster \
      --state-dir <STATE_DIR> \
      --gpu-cluster-arn <GPU_ARN_1> \
-     --gpu-cluster-arn <GPU_ARN_2> \
-     --gpu-nodegroup <EKS_NODEGROUP>
+     --gpu-cluster-arn <GPU_ARN_2>
    ```
 
    For every ARN the driver asserts that `<STATE_DIR>/join-cluster/<arn_sha256_12>/state.json` ends in
-   `phase=COMPLETED` (the receipt's `journals` records one proof per ARN); `--gpu-nodegroup`/`--node-selector` only applies to
-   `eks-managed` members. The checklist is the step sequence of `BOOT-025` step 2 (`PRECHECKED` →
+   `phase=COMPLETED` (the receipt's `journals` records one proof per ARN); the command takes ARNs only, and the driver
+   checks the ownership-label precondition before S3 acts. The checklist is the step sequence of `BOOT-025` step 2 (`PRECHECKED` →
    `DISCOVERED` → `LOCAL_INPUTS_READY` → `PREREQUISITES_READY` → `CANDIDATE_READY` →
    `RELEASE_STARTED` → `JOINED` → `COLLECTORS_READY` → `VERIFIED` → `SITE_UPDATED` →
    `RELEASE_STATE_UPDATED` → `REGISTRY_UPDATED` → `ACTIVATION_STARTED` → `ACTIVATED` →
@@ -4562,20 +4681,20 @@ stages or after everything has finished, following the references below.
      `<CPU_EKS_ARN>`, each GPU cluster ARN, `<STATE_DIR_SECOND>` and `<ADMIN_EMAIL>` respectively: with more than one GPU
      cluster the `--gpu-cluster-arn` line holding the placeholder is expanded into one line per ARN (indentation and
      continuation kept) exactly as the README's own deployment-section sentence "repeat `--gpu-cluster-arn` for several GPU
-     clusters" authorises, and is refused when the README no longer says so; the `--gpu-nodegroup`/`--node-selector` the
-     operator gave the driver is appended as one line only when the README's deployment section documents that parameter,
-     and is refused -- naming the missing sentence -- when it does not: that is the README defect S5 exists to find, never
-     patched in the driver; no `--wait-for-email-confirmation` or any other parameter is added. A missing heading, a missing code block, a
+     clusters" authorises, and is refused when the README no longer says so; the README's deployment section must also
+     state the ownership-label precondition (`gpu-fault.io/control-plane` and `gpu-fault-admin site-id …` in code font),
+     and the stage is refused -- naming the missing statement -- when it does not: that is the README defect S5 exists to
+     find, never patched in the driver; no node selector flag, `--wait-for-email-confirmation` or any other parameter is added. A missing heading, a missing code block, a
      wrong placeholder count, or a build block that lacks the two lines above or has them in reverse order fails the
      stage immediately and names the heading.
      Mixed site: the README deploy command renders the clusters of S5's leading provider only (`gpu_cluster_count`,
      `first_provider`) -- the provider S1 joined; on a site given the HyperPod ARN first that is the `eks-managed`
-     cluster, with the README-documented `--gpu-nodegroup`/`--node-selector`, and the site starts from `eks-v1`; the
+     cluster, and the site starts from `eks-v1`; the
      other provider's clusters are attached by the driver after the README command exits, the way the README states it
      -- the site-bound `<state-dir>/deployer-venv/bin/gpu-fault-admin join-cluster`, as in S1 (plan stop, approval,
      rerun) -- and only when the README's deployment section states the sentence "a first `deploy`'s GPU clusters must
      share one provider; the other provider joins afterwards with `join-cluster`" (receipt
-     `mixed_site_join_documented`, `joined_gpu_cluster_count`, `joined_eks_flag`); without it the stage refuses and
+     `mixed_site_join_documented`, `joined_gpu_cluster_count`, `ownership_label_documented`); without it the stage refuses and
      names the missing sentence. When the README deploy names plain EKS clusters, the README's deployment section must
      also state the plain-EKS first-deploy prerequisites -- the `eks-v1` start, EKS node auto repair off on the GPU
      node groups (`nodeRepairConfig.enabled=false`), the GPU node image's `python3.12`/`strace` installed through the
@@ -15390,7 +15509,7 @@ conclusions of the layers above are not trustworthy:
 
 | Phase | Strict execution order | Maintenance window needed | Notes |
 |---|---|---|---|
-| 0 Deployability | `BOOT-016` → `011..015` → `017..023` → `030` → `031` → `024..029`, exact predecessors in the YAML | graded | create the continuous site first; `019` uses a separate uninstallable site, `020` returns to the continuous site; `030/031` read-only check of the split tables; `024..029` only on an isolated site |
+| 0 Deployability | `BOOT-016` → `011..015` → `017..023` → `030` → `031` → `024` → `034` → `025` → `033` → `035` → `026..029`, exact predecessors in the YAML | graded | create the continuous site first; `019` uses a separate uninstallable site, `020` returns to the continuous site; `030/031` read-only check of the split tables; `024..029` and the ownership-label cases `033..035` only on an isolated site (`034` relabels between the removal and the re-join, `033` is a read-only check of the re-join, `035` joins a HyperPod cluster with a non-GPU instance group) |
 | 1 Start-up configuration guards | `BOOT-001` → ... → `BOOT-010` | no (one-shot probes) | not executed early in numeric order |
 | 2 Identity boundary | `AUTH-001` → ... → `AUTH-015` | graded | token rotation needs a maintenance window |
 | 3 Training workload baseline | `WORKLOAD-001` → `WORKLOAD-002` | **yes** | must precede any real job restart |

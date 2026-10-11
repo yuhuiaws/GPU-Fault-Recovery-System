@@ -811,6 +811,30 @@ requirements:
       - nodeid: tests/regional/test_cov95_boot032_retry.py::test_completed_pass_is_invalidated_before_new_readback_failure
       - nodeid: tests/regional/test_cov95_boot032_entry.py::test_actual_local_process_incarnations_differ_after_restart
     level: regional
+  - id: GF-REQ-LIFECYCLE-NODE-OWNERSHIP
+    family: lifecycle
+    title: Node ownership declared on node groups, site-id and journaled convergence
+    source: [src/gpu_fault/cluster_scope.py, src/gpu_fault/admin/bootstrap_ownership.py, src/gpu_fault/admin/node_scope_command.py, src/gpu_fault/admin/site_identity_command.py]
+    covers: [lifecycle:join, lifecycle:node-ownership]
+    conditions: [normal, failure, safety]
+    assertions:
+      - A GPU cluster joins only through node groups labelled gpu-fault.io/control-plane=<site id>; an unlabelled, foreign-labelled or non-GPU labelled group refuses before any mutation and names the facts.
+      - An already-managed cluster keeps its recorded selector; convergence to the label is journaled and refuses when the node set would change.
+      - The site id is deterministic from the CPU cluster and the recorded selector source is auditable in the site entry, the Secret and status.
+    cases: [GF-REGIONAL-BOOT-033, GF-REGIONAL-BOOT-034, GF-REGIONAL-BOOT-035]
+    checks:
+      - nodeid: tests/admin/test_admin_eks_managed_join.py::test_eks_arn_without_hyperpod_discovers_an_eks_managed_identity
+      - nodeid: tests/admin/test_admin_eks_managed_join.py::test_a_cluster_without_a_labelled_node_group_is_refused_with_the_evidence
+      - nodeid: tests/admin/test_admin_eks_managed_join.py::test_a_node_group_labelled_for_another_site_is_refused
+      - nodeid: tests/admin/test_admin_eks_managed_join.py::test_a_labelled_node_group_outside_the_gpu_inventory_is_refused
+      - nodeid: tests/admin/test_admin_eks_managed_join.py::test_hyperpod_discovery_selects_the_labelled_instance_groups
+      - nodeid: tests/admin/test_admin_eks_managed_join.py::test_an_already_managed_cluster_keeps_its_recorded_selector
+      - nodeid: tests/admin/test_admin_node_scope_verb.py::test_converge_records_the_label_selector_and_journals_it
+      - nodeid: tests/admin/test_admin_node_scope_verb.py::test_converge_refuses_when_a_current_node_lacks_the_label
+      - nodeid: tests/admin/test_admin_site_id_verb.py::test_site_id_prints_the_deterministic_id_and_the_label
+      - nodeid: tests/regional/test_regional_admin_checks_node_scope.py::test_full_status_shows_the_selector_source_and_the_nodes_left_out
+    gap: BOOT-033..035 are manual isolated-site cases without a dedicated runner; the lifecycle driver checks the ownership-label precondition before it acts (scripts/e2e/regional/boot029_node_scope.py) but no runner drives the three cases or records their verdicts.
+    level: regional
   - id: GF-REQ-LIFECYCLE-REMOTE-TABLE
     family: lifecycle
     title: Remote-command migration, old-writer fencing and HOT lease renewal

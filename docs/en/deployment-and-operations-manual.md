@@ -5294,11 +5294,13 @@ the habit of adding it reflexively. The low-level `resume` gives the same hint o
 The formal entry point is to give `deploy` all managed GPU ARNs plus the new cluster (a superset of the managed set);
 `join-cluster` is kept as an alias, accepting one or several repeated new GPU EKS/HyperPod ARNs. A GPU ARN may name a
 HyperPod cluster (`provider: hyperpod`) or a **plain EKS cluster without a HyperPod orchestrator** (`provider:
-eks-managed`, a new and less validated form; semantics and boundaries in Administrator Operations §5.0). A plain EKS
-cluster needs its GPU node selector: `--node-selector <selector>` (default `nvidia.com/gpu.present=true`) or
-`--gpu-nodegroup <managed-node-group>` (derives `eks.amazonaws.com/nodegroup=<name>`); `--cluster-id` defaults to the EKS
-cluster name. Both options are ignored for HyperPod clusters, whose selector is always
-`sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before. A mixed site takes two steps: a first
+eks-managed`, a new and less validated form; semantics and boundaries in Administrator Operations §5.0). For both
+providers the GPU nodes are declared by the ownership label `gpu-fault.io/control-plane=<site id>` on the node groups
+(Administrator Operations §5.0.0): label the GPU managed node groups / HyperPod instance groups before the join,
+`join-cluster` takes ARNs only, and a cluster without a labelled node group is refused; `--cluster-id` defaults to the EKS
+cluster name for plain EKS. A cluster joined before the convention keeps its recorded selector (HyperPod:
+`sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before) until
+`gpu-fault-admin node-scope --converge`. A mixed site takes two steps: a first
 `deploy`'s GPU clusters must share one provider (both providers in one first `deploy` are refused before anything is
 created), so deploy every cluster of one provider first and attach the other provider's clusters with this section's
 `join-cluster` -- that join writes its provider's own Runtime Profile plan and stops, and continues on the approved
@@ -5324,11 +5326,14 @@ gpu-fault-admin join-cluster \
   --gpu-cluster-arn \
     arn:aws:eks:us-west-2:123456789012:cluster/gpu-prod-c
 
-# A plain EKS GPU cluster (no HyperPod): name the GPU node group or selector explicitly
+# A plain EKS GPU cluster (no HyperPod): label the GPU managed node group for this site first, then pass the ARN only
+gpu-fault-admin site-id --cpu-cluster-arn <CPU ARN> --state-dir /secure/gpu-fault
+aws eks update-nodegroup-config --cluster-name gpu-eks-cluster \
+  --nodegroup-name gpu-p5en-efa-spot-node-group \
+  --labels addOrUpdateLabels={gpu-fault.io/control-plane=<site id>}
 gpu-fault-admin join-cluster \
   --state-dir /secure/gpu-fault \
-  --gpu-cluster-arn arn:aws:eks:us-west-2:123456789012:cluster/gpu-eks-cluster \
-  --gpu-nodegroup gpu-p5en-efa-spot-node-group
+  --gpu-cluster-arn arn:aws:eks:us-west-2:123456789012:cluster/gpu-eks-cluster
 ```
 
 The command does not rebuild Aurora, the CPU control plane, the NLB or the GPU clusters. When the first deploy is given several GPU ARNs at once,

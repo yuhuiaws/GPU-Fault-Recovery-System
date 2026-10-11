@@ -29,8 +29,14 @@ phases:
         predecessor: GF-REGIONAL-BOOT-030
       - case: GF-REGIONAL-BOOT-024
         predecessor: GF-REGIONAL-BOOT-023
+      - case: GF-REGIONAL-BOOT-034
+        predecessor: GF-REGIONAL-BOOT-024
       - case: GF-REGIONAL-BOOT-025
         predecessor: GF-REGIONAL-BOOT-024
+      - case: GF-REGIONAL-BOOT-033
+        predecessor: GF-REGIONAL-BOOT-025
+      - case: GF-REGIONAL-BOOT-035
+        predecessor: GF-REGIONAL-BOOT-033
       - case: GF-REGIONAL-BOOT-026
         predecessor: GF-REGIONAL-BOOT-025
       - case: GF-REGIONAL-BOOT-027
@@ -51,6 +57,10 @@ phases:
         deploy 批量 join → uninstall keep + reset-database → 空集群全新 deploy 与续跑的顺序，
         每条以前一条 PASS 为证据前置（BOOT-024 读 BOOT-023）；只在隔离站点执行——该站点的每个
         GPU 集群（HyperPod 与 eks-managed 成员）会被逐个注销、一次重接并整体卸载，在共享验收站点上记 BLOCKED_PREREQUISITE。
+      - 归属标签用例 BOOT-033..035 嵌在生命周期链里、只在隔离站点执行：BOOT-034 在 BOOT-024 注销之后、BOOT-025 重接之前
+        改动并复原该集群节点组的归属标签以证明三条拒绝（不创建任何资源，BOOT-025 的证据前置仍是 BOOT-024）；
+        BOOT-033 以 BOOT-025 PASS 为证据前置，只读核对按标签的重接；BOOT-035 以 BOOT-033 为前置，接入一个含非 GPU
+        实例组的 HyperPod 集群（live-service-action），不 reboot/replace 节点。共享验收站点上三条均记 BLOCKED_PREREQUISITE。
       - BOOT-029 把冷构建首次 deploy → remove-cluster → join-cluster → uninstall keep +
         reset-database → 再次冷构建首次 deploy 作为一条序列由驱动一次跑完；它以 BOOT-028 PASS
         为证据前置，并要求先把 BOOT-028 装出的站点卸载成一对空集群。

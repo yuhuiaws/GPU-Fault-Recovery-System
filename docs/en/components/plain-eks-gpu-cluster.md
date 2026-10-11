@@ -25,15 +25,23 @@ site yet**; section 5 lists what one join cannot prove. This is the summary of b
 ### 2.1 Shared contract `gpu_fault.cluster_scope`
 `ClusterProvider` (`hyperpod`|`eks-managed`), `GPU_FAULT_CLUSTER_PROVIDER`/`GPU_FAULT_NODE_SELECTOR`/
 `GPU_FAULT_EKS_CLUSTER_NAME`, connection Secret keys `cluster-provider`/`node-selector`/`eks-cluster-name`,
-`node_selector(target)` (HyperPod `sagemaker.amazonaws.com/cluster-name=<name>`; EKS `nvidia.com/gpu.present=true` or
-`eks.amazonaws.com/nodegroup=<name>` from `--gpu-nodegroup`), `selector_matches`, `PROVIDER_NODE_REBOOT_OWNERS`
+`node_selector(target)` (the entry's recorded selector; a HyperPod entry from before the convention defaults to
+`sagemaker.amazonaws.com/cluster-name=<name>`), the ownership label convention `OWNERSHIP_LABEL=gpu-fault.io/control-plane`,
+`ownership_node_selector` (EKS `gpu-fault.io/control-plane=<site id>`; HyperPod adds the cluster-name label as a
+cross-check), `NodeSelectorSource` (`label-convention`/`provider-default-legacy`/`flag-legacy`) with the Secret key
+`node-selector-source`, `selector_matches`, `PROVIDER_NODE_REBOOT_OWNERS`
 (`gpu-fault-hyperpod-adapter` / `gpu-fault-eks-adapter`), `PROVIDER_PROFILE_SOURCES`/`_VERSIONS`
 (`config/runtime-profile.regional-eks-safe.example.yaml` / `eks-v1`).
 
 ### 2.2 Discovery and site
 Discovery decides the provider from the ARN (an EKS ARN with no HyperPod orchestrator and an `ACTIVE`
-`describe-cluster` is `eks-managed`); the site entry records `provider` and `nodeSelector` and no
-`hyperpodClusterName`; Agent endpoint CIDRs come from the GPU node group subnets; the counterpart of the `NodeRecovery`
+`describe-cluster` is `eks-managed`); the node scope is resolved from the ownership label on the node groups
+(`admin/bootstrap_ownership.py`: the managed node groups / HyperPod instance groups whose `KubernetesConfig.CurrentLabels`
+carry `gpu-fault.io/control-plane=<site id>`; no label, another site's label or an instance type outside the GPU
+inventory refuses with the evidence; an already-managed cluster keeps its recorded selector and
+`gpu-fault-admin node-scope --converge` is the journaled convergence step); the site entry records `provider`,
+`nodeSelector` and `nodeSelectorSource` and no `hyperpodClusterName`; Agent endpoint CIDRs come from the GPU node group
+subnets; the counterpart of the `NodeRecovery`
 gate is that the GPU managed node groups' EKS node auto repair must be off (discovery reads `describe-nodegroup` for every
 node group hosting GPU nodes, refuses `nodeRepairConfig.enabled=true` and records `node_repair` on the identity);
 node names are FQDNs and installer Job names are DNS-1123 truncated.
@@ -125,7 +133,10 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
    from the node group subnets -- done by the join, which needs the corresponding AWS permissions.
 4. Approval: the first plain EKS cluster joining a HyperPod site needs `--approve-profile-plan <sha> --reference <CHG>`
    (eks-v1).
-5. Command: `gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn> --gpu-nodegroup <ng>`.
+5. Ownership label: `gpu-fault-admin site-id --cpu-cluster-arn <CPU ARN>` prints the site id;
+   `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels addOrUpdateLabels={gpu-fault.io/control-plane=<site id>}`
+   labels the GPU node group (HyperPod: `update-cluster` with `KubernetesConfig.Labels`; Karpenter: NodePool template
+   labels). Command: `gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn>` (ARNs only).
 6. Third-party GPU client DaemonSets (the customer's own dcgm-exporter, GPU feature discovery, monitoring agents)
    **must not tolerate** `gpu-fault.io/quiesce` (no key-less `operator: Exists` wildcard toleration; list the keys such
    as `nvidia.com/gpu` instead) and must tolerate being stopped/evicted inside a quiesce window; the default NVIDIA

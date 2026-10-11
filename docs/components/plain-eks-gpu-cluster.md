@@ -20,14 +20,19 @@ AL2023_x86_64_NVIDIA AMI，加入一个已有 `hyperpod-v1` HyperPod 站点）�
 ### 2.1 共享契约 `gpu_fault.cluster_scope`
 `ClusterProvider`（`hyperpod`|`eks-managed`）、`GPU_FAULT_CLUSTER_PROVIDER`/`GPU_FAULT_NODE_SELECTOR`/
 `GPU_FAULT_EKS_CLUSTER_NAME`、连接 Secret 键 `cluster-provider`/`node-selector`/`eks-cluster-name`、
-`node_selector(target)`（HyperPod：`sagemaker.amazonaws.com/cluster-name=<name>`；EKS：`nvidia.com/gpu.present=true`
-或 `--gpu-nodegroup` 派生的 `eks.amazonaws.com/nodegroup=<name>`）、`selector_matches`、
+`node_selector(target)`（条目记录的选择器；本约定前的 HyperPod 条目缺省 `sagemaker.amazonaws.com/cluster-name=<name>`）、
+归属标签约定 `OWNERSHIP_LABEL=gpu-fault.io/control-plane`、`ownership_node_selector`（EKS：`gpu-fault.io/control-plane=<站点ID>`；
+HyperPod 另加集群名标签交叉核对）、`NodeSelectorSource`（`label-convention`/`provider-default-legacy`/`flag-legacy`）与
+Secret 键 `node-selector-source`、`selector_matches`、
 `PROVIDER_NODE_REBOOT_OWNERS`（`gpu-fault-hyperpod-adapter` / `gpu-fault-eks-adapter`）、
 `PROVIDER_PROFILE_SOURCES`/`_VERSIONS`（`config/runtime-profile.regional-eks-safe.example.yaml` / `eks-v1`）。
 
 ### 2.2 发现与站点
 `join-cluster`/`deploy` 按 ARN 判定 provider：EKS ARN 无 HyperPod 编排器且 `describe-cluster` 为 `ACTIVE` →
-`eks-managed`；`site.yaml` 集群条目记录 `provider`、`nodeSelector`，不记录 `hyperpodClusterName`；
+`eks-managed`；节点范围由节点组归属标签解析（`admin/bootstrap_ownership.py`：带 `gpu-fault.io/control-plane=<站点ID>` 的
+托管节点组 / HyperPod 实例组 `KubernetesConfig.CurrentLabels`；无标签、他站点标签或非 GPU 清单实例类型即拒绝并列出证据；
+已纳管集群沿用条目记录的选择器，`gpu-fault-admin node-scope --converge` 是带 journal 的收敛步骤）；`site.yaml` 集群条目记录
+`provider`、`nodeSelector`、`nodeSelectorSource`，不记录 `hyperpodClusterName`；
 Agent endpoint CIDR 取 GPU 节点组子网；`NodeRecovery` 门禁的对应项是 GPU 托管节点组的 EKS node auto repair 必须关闭
 （发现对每个承载 GPU 节点的节点组读 `describe-nodegroup`，`nodeRepairConfig.enabled=true` 拒绝，身份记 `node_repair`）；
 节点名是 FQDN，安装 Job 名 DNS-1123 截断。
@@ -104,7 +109,10 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 3. 网络：GPU VPC 的 NAT EIP 加入 NLB 白名单、Route53 私有区关联、Agent CIDR 来自节点组子网——join 自动完成，
    需要相应 AWS 权限。
 4. 审批：首个普通 EKS 集群加入 HyperPod 站点需 `--approve-profile-plan <sha> --reference <CHG>`（eks-v1）。
-5. 命令：`gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn> --gpu-nodegroup <ng>`。
+5. 归属标签：`gpu-fault-admin site-id --cpu-cluster-arn <CPU ARN>` 打印站点 ID，
+   `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels addOrUpdateLabels={gpu-fault.io/control-plane=<站点ID>}`
+   给 GPU 节点组加标签（HyperPod：`update-cluster` 的 `KubernetesConfig.Labels`；Karpenter：NodePool 模板标签）；
+   命令：`gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn>`（只需要 ARN）。
 6. 第三方 GPU 客户端 DaemonSet（客户自己的 dcgm-exporter、GPU feature discovery、监控 agent 等）**不得容忍**
    `gpu-fault.io/quiesce`（不要用无 key 的 `operator: Exists` 通配容忍；按 key 列出 `nvidia.com/gpu` 等即可），并须容忍在
    quiesce 窗口内被停止/驱逐；NVIDIA device plugin 与 GFD 的默认清单只容忍 `nvidia.com/gpu`，无需改动。

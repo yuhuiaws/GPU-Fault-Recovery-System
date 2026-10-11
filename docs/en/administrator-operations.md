@@ -1020,14 +1020,40 @@ to the cluster's `provider` field in `site.yaml` (`gpu_fault.cluster_scope.Clust
 
 | provider | decided by | identity | GPU node selector | maturity |
 |---|---|---|---|---|
-| `hyperpod` (default) | the EKS ARN is orchestrated by exactly one HyperPod cluster, or a HyperPod ARN is given | `hyperpodClusterName` required; `cluster_id` defaults to the HyperPod name | `sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before | fully validated form |
-| `eks-managed` | the EKS ARN has no HyperPod orchestrator (`eks describe-cluster` is `ACTIVE`) | no `hyperpodClusterName`; `cluster_id` defaults to the EKS cluster name, `--cluster-id` overrides | `nodeSelector` required: `--node-selector <selector>` (default `nvidia.com/gpu.present=true`) or `--gpu-nodegroup <name>` (derives `eks.amazonaws.com/nodegroup=<name>`); must never match the CPU node group | **new, less validated** form |
+| `hyperpod` (default) | the EKS ARN is orchestrated by exactly one HyperPod cluster, or a HyperPod ARN is given | `hyperpodClusterName` required; `cluster_id` defaults to the HyperPod name | resolved at join from the labelled instance groups: `gpu-fault.io/control-plane=<site id>,sagemaker.amazonaws.com/cluster-name=<HyperPod name>` (§5.0.0); a cluster joined before the convention keeps `sagemaker.amazonaws.com/cluster-name=<HyperPod name>` (source `provider-default-legacy`), byte for byte as before, until `node-scope --converge` | fully validated form |
+| `eks-managed` | the EKS ARN has no HyperPod orchestrator (`eks describe-cluster` is `ACTIVE`) | no `hyperpodClusterName`; `cluster_id` defaults to the EKS cluster name, `--cluster-id` overrides | `nodeSelector` written by discovery: `gpu-fault.io/control-plane=<site id>` (the labelled managed node groups, §5.0.0); a cluster joined before the convention keeps its recorded selector (source `flag-legacy`); must never match the CPU node group | **new, less validated** form |
+
+#### 5.0.0 The node ownership label convention (both providers)
+
+Which nodes a site manages is declared by an **ownership label on the node groups**, never inferred from command flags or a provider default:
+
+| item | convention |
+|---|---|
+| label key | `gpu-fault.io/control-plane` (`gpu_fault.cluster_scope.OWNERSHIP_LABEL`) |
+| label value | the site id: determined by the CPU control plane's identity (Region, HyperPod name and the first 8 hex digits of the HyperPod ARN digest; `metadata.name` of `site.yaml`). Print it before the first deploy with `gpu-fault-admin site-id --cpu-cluster-arn <CPU EKS/HyperPod ARN>`; add `--state-dir` on a managed site to cross-check the recorded site name |
+| where it is applied | **node-group level**, so replacement nodes are born labelled: EKS managed node group `labels` (`aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels addOrUpdateLabels={gpu-fault.io/control-plane=<site id>}`; visible as `nodegroup.labels` in `describe-nodegroup`, reaching the nodes through the kubelet); HyperPod instance group `KubernetesConfig.Labels` (`aws sagemaker update-cluster --cluster-name <hp> --instance-groups '<the full definition of the instance group>'` plus `KubernetesConfig={Labels={gpu-fault.io/control-plane=<site id>}}`; `create-cluster`/`update-cluster` expose `InstanceGroups[].KubernetesConfig.Labels/Taints`, `describe-cluster` shows `CurrentLabels`/`DesiredLabels`, and the service reconciles the nodes of the group to the declared labels); Karpenter `NodePool`: `spec.template.metadata.labels` |
+| node selector | `eks-managed`: `gpu-fault.io/control-plane=<site id>`; `hyperpod`: `gpu-fault.io/control-plane=<site id>,sagemaker.amazonaws.com/cluster-name=<HyperPod name>` (the cluster-name label is the cross-check). `deploy`/`join-cluster` take ARNs only; there is no node selector flag |
+| GPU inventory | stays a validation: every instance type of a labelled node group / instance group must be in `GPU_INSTANCE_INVENTORY` (`ml.` prefix ignored), otherwise the group and its types are named and the cluster refused |
+
+**Precedence** (`gpu_fault.admin.bootstrap_ownership`): the `nodeSelector` recorded in an already-managed cluster's site entry is the runtime truth (a `deploy` that rediscovers the cluster never re-derives its membership) > a joining cluster resolves through the ownership label. There is no provider-default tier.
+
+**Refusals** (before anything is created; each prints the node-group evidence seen as `name instanceTypes=… gpu-fault.io/control-plane=<value|absent>`):
+(1) no node group / instance group carries `gpu-fault.io/control-plane=<this site id>` -- the message names the exact label, the site id, the `site-id` verb and the provider command that applies the label; a HyperPod instance group whose `DesiredLabels` carry it but whose `CurrentLabels` do not yet is reported as "desired …, not applied yet";
+(2) a node group's label value names another site (one GPU cluster belongs to one site);
+(3) a node group labelled for this site runs an instance type outside the GPU inventory (for example `ml.g6.12xlarge`, `m7i-flex.xlarge`).
+
+**Lifecycle**: removing the label from a node group = the planned departure of its nodes -- they leave the selected set at once, their Agent records follow the departed-node paths (`workflow-reconcile --retire-departed-agents`, §10.2), and the next release's waves, Agent coverage, collector readiness and failure-domain mapping all read the one selected set (single source of truth `cluster_scope.node_selector`); labelling a new node group = its nodes join the managed set automatically. Removing the label from every node group of a cluster leaves it without managed nodes: use `remove-cluster` instead.
+
+**Clusters joined before the convention** keep the selector their site entry records as the runtime truth, with the source `provider-default-legacy` (HyperPod: `sagemaker.amazonaws.com/cluster-name=<name>`, the whole HyperPod cluster) or `flag-legacy` (plain EKS: the selector recorded by the retired `--gpu-nodegroup`/`--node-selector` flags or their `nvidia.com/gpu.present=true` default). The convergence path is a journaled administrator step:
+(1) label the cluster's GPU node groups / instance groups; (2) `gpu-fault-admin node-scope --state-dir <dir>` shows, read-only, each cluster's recorded selector and source, the label-derived selector, and the two node sets with their differences; (3) `gpu-fault-admin node-scope --state-dir <dir> --gpu-cluster-arn <ARN> --converge --reference <change request>` (first with `--dry-run`) rewrites the `site.yaml` entry (`nodeSelector`, `nodeSelectorSource: label-convention`) only when the label selects **exactly** the current node set, keeping a backup of the previous `site.yaml` and appending `node-scope/<cluster_id>/journal.json`; any difference refuses and names the nodes: current nodes of a labelled instance group that do not carry the label yet (HyperPod applies `KubernetesConfig` labels through its own reconciliation and may reach only nodes created afterwards -- wait, or label the existing nodes with `kubectl label nodes -l sagemaker.amazonaws.com/instance-group-name=<group> gpu-fault.io/control-plane=<site id>` and retry), current nodes the label does not select (label their group, or `remove-cluster` and `join-cluster` again), nodes the label newly selects; (4) `gpu-fault-admin deploy --state-dir <dir>` rolls the converged selector into the connection Secret and the data-plane manifests.
+
+**Audit**: the site entry (`nodeSelector`/`nodeSelectorSource`), the connection Secret (`node-selector`, `node-selector-source`) and the `node_scope` details of every GPU cluster check in `status --full` (`selector`, `source`, `selected_nodes`, plus `cluster_nodes_outside_selector` for HyperPod) show the effective selector and where it came from.
 
 Semantics and boundaries of `eks-managed`:
 
 - Identity and network: `aws eks describe-cluster` must be `ACTIVE`; the Agent endpoint CIDRs come from the subnets of
-  the GPU node groups (`eks describe-nodegroup`: instance types in the GPU inventory, or the one named by
-  `--gpu-nodegroup`), not the whole VPC; the NLB NAT EIP whitelist still discovers the NAT Gateways by VPC, as for
+  the GPU node groups (`eks describe-nodegroup`: the node groups carrying this site's ownership label; a cluster
+  joined before the convention follows its recorded selector), not the whole VPC; the NLB NAT EIP whitelist still discovers the NAT Gateways by VPC, as for
   HyperPod. The counterpart of the `NodeRecovery` gate is that the GPU managed node groups' **EKS node auto repair
   must be off**: discovery reads `eks describe-nodegroup` for every node group hosting GPU nodes and refuses the
   join/deploy on `nodeRepairConfig.enabled=true` (unset counts as off and the identity records `node_repair: unset`,
@@ -1079,7 +1105,7 @@ Semantics and boundaries of `eks-managed`:
   `created_at`/`updated_at` byte for byte (what acceptance AUTH-016's `sibling_registrations_unchanged` checks); only
   changed entries are stamped with that publish.
   A later `deploy` over the whole site (CPU + every GPU ARN) keeps each managed cluster's join-time decisions:
-  `provider`, `nodeSelector` (the `--gpu-nodegroup` choice) and `runtimeProfile` are carried over and only the
+  `provider`, `nodeSelector`/`nodeSelectorSource` (what discovery resolved from the ownership label at join time, or the selector recorded before the convention) and `runtimeProfile` are carried over and only the
   override's `agentConfigDigest` is recomputed for this release; an entry that lost its override is restored from the
   approved snapshot `profiles/<version>.yaml`, and without an approved snapshot the deploy refuses and points to
   `join-cluster --approve-profile-plan`. The release-diff's `clusters` digests membership only (ids, names, ARNs,
@@ -1092,16 +1118,20 @@ Semantics and boundaries of `eks-managed`:
   **Mixed-site join walkthrough** (an existing `hyperpod-v1` site joining the plain EKS cluster `gpu-eks-cluster`):
 
   ```bash
-  # 1. discovered as eks-managed, needs eks-v1 -> writes profile-plan.json and stops (no AWS mutation)
+  # 0. label the GPU managed node group for this site (check the site id with site-id); wait until describe-nodegroup shows it
+  gpu-fault-admin site-id --cpu-cluster-arn <CPU ARN> --state-dir /secure/gpu-fault
+  aws eks update-nodegroup-config --cluster-name gpu-eks-cluster \
+    --nodegroup-name gpu-p5en-efa-spot-node-group \
+    --labels addOrUpdateLabels={gpu-fault.io/control-plane=<site id>}
+  # 1. discovered as eks-managed (ARNs only; refused here without a labelled GPU node group), needs eks-v1 ->
+  #    writes profile-plan.json and stops (no AWS mutation)
   gpu-fault-admin join-cluster --state-dir /secure/gpu-fault \
-    --gpu-cluster-arn arn:aws:eks:us-west-2:<account>:cluster/gpu-eks-cluster \
-    --gpu-nodegroup gpu-p5en-efa-spot-node-group
+    --gpu-cluster-arn arn:aws:eks:us-west-2:<account>:cluster/gpu-eks-cluster
   # 2. review /secure/gpu-fault/release-deploy/profile-plan.json, record plan_sha256 on the change request
   # 3. rerun the same command with the approval: token, Executor IAM (ec2 Describe/Reboot + eks Describe),
   #    NAT EIP whitelist, Route53 association, Node Action keys, eks-v1 registration, data plane, activation
   gpu-fault-admin join-cluster --state-dir /secure/gpu-fault \
     --gpu-cluster-arn arn:aws:eks:us-west-2:<account>:cluster/gpu-eks-cluster \
-    --gpu-nodegroup gpu-p5en-efa-spot-node-group \
     --approve-profile-plan <plan_sha256> --reference CHG-<id>
   ```
 - Compile-time owner of node lifecycle steps: the control plane compiles `RESTART_NODE`/`REPLACE_NODE` against the
@@ -1630,7 +1660,8 @@ aws eks update-nodegroup-config --cluster-name <eks cluster> --nodegroup-name <G
 `join-cluster`/`deploy` read every node group hosting GPU nodes during discovery and refuse `enabled=true` (the error
 starts with `has node auto repair enabled` and names the node group); the `regional_contexts` check of the deploy preflight
 and `status --full`/`verify` records each node group's `node_repair` (`disabled`/`unset`) and fails on `enabled` for a group
-hosting GPU instance types (or named by `--gpu-nodegroup`). Only the `eks:DescribeNodegroup` read is needed:
+the cluster's recorded selector covers (the groups the ownership label selects, the group a legacy selector names, or
+the groups hosting GPU instance types). Only the `eks:DescribeNodegroup` read is needed:
 the operator identity and the executor role already hold it; the control-plane role needs nothing.
 
 #### 5.0.2 After a join: kubeconfig current-context, the Agent-set check and `status` attribution
@@ -1663,8 +1694,8 @@ the operator identity and the executor role already hold it; the control-plane r
   diff moved no profile component, logging `rollback-cluster-profiles source=candidate-config`; otherwise it
   refuses and names the clusters whose previous pins cannot be derived.
 - Converging a site that stopped in `rollback-failed` (`status` shows `next deploy: resume rollback`):
-  1. Rerun the **same** `deploy` with the fixed build (same `--state-dir`/`--cpu-cluster-arn`/`--gpu-cluster-arn`/
-     `--gpu-nodegroup`); the engine finds the pending rollback, rolls the site back to the last committed release
+  1. Rerun the **same** `deploy` with the fixed build (same `--state-dir`/`--cpu-cluster-arn`/`--gpu-cluster-arn`);
+     the engine finds the pending rollback, rolls the site back to the last committed release
      and ends with `rollback recovery completed; rerun deploy to start a new transaction` (exit code 2 is expected).
   2. `gpu-fault-admin status --state-dir <dir>`: expect `phase=rolled-back`, every Agent ACTIVE on the previous pins.
   3. Rerun the same `deploy` once more: a new transaction opens from the committed baseline.

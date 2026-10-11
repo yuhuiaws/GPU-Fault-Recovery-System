@@ -32,7 +32,7 @@ gpu-fault-admin deploy \
   --admin-email <operations-email>
 gpu-fault-admin deploy --state-dir /secure/gpu-fault   # resume / upgrade
 ```
-For several GPU clusters repeat `--gpu-cluster-arn`; after the first GPU cluster completes the baseline deployment and verification, the remaining clusters automatically enter
+The command needs nothing but ARNs: the GPU node groups / instance groups must carry the ownership label `gpu-fault.io/control-plane=<site id>` beforehand (the site id is printed by `gpu-fault-admin site-id --cpu-cluster-arn <cpu-eks-or-hyperpod-arn>`); a cluster without a labelled node group, with a label naming another site, or with an instance type outside the GPU inventory is refused before anything is created (Administrator Operations §5.0.0). For several GPU clusters repeat `--gpu-cluster-arn`; after the first GPU cluster completes the baseline deployment and verification, the remaining clusters automatically enter
 a separate batch join, rolling at the site cluster parallelism `spec.release.upgradeMaxParallelClusters` (default 1, cap 8); a single failure does not undo the successful clusters of the same batch.
 ARNs passed again on an existing site must be the managed set or a superset of it: extra GPU ARNs are joined automatically after the release (join only, no rollout, when the release is unchanged); giving fewer clusters or changing the CPU is
 refused with a hint to use `remove-cluster`. The same command with `--rollback` goes back one step, with `--approve-profile-plan <sha>

@@ -25,12 +25,18 @@ the ones labelled `sagemaker.amazonaws.com/cluster-name=<name>`) or `eks-managed
 (a plain EKS cluster with managed node groups and no HyperPod orchestrator; a
 newer, less validated form in which provider-side node replacement is
 observe-only). An `eks-managed` entry omits `hyperpodClusterName` and must carry
-`nodeSelector`, the label selector of its GPU nodes (`gpu-fault-admin
-join-cluster --node-selector`, default `nvidia.com/gpu.present=true`;
-`--gpu-nodegroup <name>` derives `eks.amazonaws.com/nodegroup=<name>`). One
-helper, `gpu_fault.cluster_scope.node_selector`, turns the entry into the
-selector every component uses, so a HyperPod entry still renders the historical
-label text byte for byte. `spec.failureDomainLabels` left unset follows the
+`nodeSelector`, the label selector of its GPU nodes. Discovery writes it from the
+ownership label convention -- the node groups carrying
+`gpu-fault.io/control-plane=<site id>` (`gpu-fault-admin site-id`) -- as
+`gpu-fault.io/control-plane=<site id>`; a HyperPod entry joined under the
+convention records `gpu-fault.io/control-plane=<site id>,sagemaker.amazonaws.com/cluster-name=<name>`.
+`nodeSelectorSource` records where the selector came from (`label-convention`,
+or `provider-default-legacy` / `flag-legacy` for entries written before the
+convention, derived when absent); `gpu-fault-admin node-scope --converge` is the
+journaled step that moves a legacy entry to the label. One helper,
+`gpu_fault.cluster_scope.node_selector`, turns the entry into the selector every
+component uses, so a HyperPod entry without a recorded selector still renders the
+historical label text byte for byte. `spec.failureDomainLabels` left unset follows the
 providers: HyperPod-only sites keep the instance-group/zone priority, a site with
 an `eks-managed` cluster also reads `eks.amazonaws.com/nodegroup`. The site runtime
 profile (`spec.runtimeProfile`) is the default pin for every GPU cluster; a cluster whose

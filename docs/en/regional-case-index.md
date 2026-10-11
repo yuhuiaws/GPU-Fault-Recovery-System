@@ -50,6 +50,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 > - BOOT-023 takes a BOOT-020 PASS as its evidence predecessor; BOOT-021/022 contain no release history for it to read.
 > - BOOT-030/031 verify the two kinds of dedicated tables read-only on the continuous acceptance site, reading the evidence of BOOT-023/030 in turn. They do not change BOOT-024's BOOT-023 predecessor, nor do they authorize using the continuous acceptance site for lifecycle uninstalls.
 > - BOOT-024..029 form the administrator lifecycle chain in the order remove-cluster → join-cluster re-attach → second remove and deploy bulk join → uninstall keep + reset-database → fresh deploy on empty clusters and resume; each takes the previous case's PASS as its evidence predecessor (BOOT-024 reads BOOT-023). They run only on an isolated site — that site's only GPU cluster is removed, re-attached and uninstalled as a whole; on the shared acceptance site they are recorded as BLOCKED_PREREQUISITE.
+> - The ownership-label cases BOOT-033..035 sit inside the lifecycle chain and run only on the isolated site: BOOT-034 changes and restores the ownership label of the removed cluster's node groups between BOOT-024's removal and BOOT-025's re-join to prove the three refusals (nothing is created; BOOT-025's evidence predecessor stays BOOT-024); BOOT-033 takes a BOOT-025 PASS as its evidence predecessor and checks the label-based re-join read-only; BOOT-035 takes BOOT-033 as its predecessor and joins a HyperPod cluster with a non-GPU instance group (live-service-action) without rebooting or replacing a node. On the shared acceptance site all three are recorded BLOCKED_PREREQUISITE.
 > - BOOT-029 runs cold-build first deploy → remove-cluster → join-cluster → uninstall keep + reset-database → cold-build first deploy again as one sequence driven in a single pass; it takes a BOOT-028 PASS as its evidence predecessor and requires the site installed by BOOT-028 to be uninstalled back to a pair of empty clusters first.
 
 | # | Case | Title | Level | Tier | Automation | Body |
@@ -70,25 +71,28 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 | 14 | `BOOT-030` | Post-deploy remote_command dedicated-table mode and dual-write consistency | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-030) |
 | 15 | `BOOT-031` | Post-deploy workflow dedicated-table mode and dual-write consistency | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-031) |
 | 16 | `BOOT-024` | remove-cluster removes the site's only GPU cluster: the full state machine, label-ownership RBAC cleanup, second-pass annotation removal and the CPU-only steady state | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-024) |
-| 17 | `BOOT-025` | join-cluster re-attaches after removal: node subnet CIDRs, DNS gate retries, collector events during PENDING, executor ready before the first claim, wave safety counting only live Agents, rollback after a forced failure and rediscovery on retry | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-025) |
-| 18 | `BOOT-026` | A second remove-cluster archives the old record and runs from scratch; deploy --gpu-cluster-arn re-attaches in bulk as the second join entry point | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-026) |
-| 19 | `BOOT-027` | uninstall --cpu-cluster keep --reset-database: node uninstall after consumers stop, resume from an interrupted schema-v2 original journal, and the final Aurora snapshot | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-027) |
-| 20 | `BOOT-028` | Fresh deploy bootstrap on empty clusters and resume with deploy --state-dir after an interruption | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-028) |
-| 21 | `BOOT-029` | Administrator deployment lifecycle sequence: cold-build first deploy → remove-cluster → join-cluster → uninstall keep + reset-database → cold-build first deploy again | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-029) |
+| 17 | `BOOT-034` | A missing ownership label, another site's label or a non-GPU instance type makes join-cluster refuse before any change | `live-non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-034) |
+| 18 | `BOOT-025` | join-cluster re-attaches after removal: node subnet CIDRs, DNS gate retries, collector events during PENDING, executor ready before the first claim, wave safety counting only live Agents, rollback after a forced failure and rediscovery on retry | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-025) |
+| 19 | `BOOT-033` | Joining GPU clusters through the ownership label: site-id, label discovery and source audit | `live-non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-033) |
+| 20 | `BOOT-035` | Mixed HyperPod instance groups: only the labelled GPU instance group is joined; waves, Agent coverage, collector readiness and DCGM share one selected set | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-035) |
+| 21 | `BOOT-026` | A second remove-cluster archives the old record and runs from scratch; deploy --gpu-cluster-arn re-attaches in bulk as the second join entry point | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-026) |
+| 22 | `BOOT-027` | uninstall --cpu-cluster keep --reset-database: node uninstall after consumers stop, resume from an interrupted schema-v2 original journal, and the final Aurora snapshot | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-027) |
+| 23 | `BOOT-028` | Fresh deploy bootstrap on empty clusters and resume with deploy --state-dir after an interruption | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-028) |
+| 24 | `BOOT-029` | Administrator deployment lifecycle sequence: cold-build first deploy → remove-cluster → join-cluster → uninstall keep + reset-database → cold-build first deploy again | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-029) |
 
 ## Phase 1 — Boot configuration guards
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 22 | `BOOT-001` | Regional mode without a cluster registry must fail to start | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-001) |
-| 23 | `BOOT-002` | An invalid registry must fail while an explicit empty list stays healthy | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-002) |
-| 24 | `BOOT-003` | Regional mode and single-cluster variables are mutually exclusive | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-003) |
-| 25 | `BOOT-004` | Regional mode forbids the in-cluster Kubernetes adapter | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-004) |
-| 26 | `BOOT-005` | Regional mode forbids the central HyperPod mutation adapter | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-005) |
-| 27 | `BOOT-007` | The cluster token length lower bound is exactly 32 characters | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-007) |
-| 28 | `BOOT-008` | Registry field completeness and enabled=false semantics | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-008) |
-| 29 | `BOOT-009` | Dependency gate of the managed recovery observer | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-009) |
-| 30 | `BOOT-010` | The three production replicas started correctly in regional mode | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-010) |
+| 25 | `BOOT-001` | Regional mode without a cluster registry must fail to start | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-001) |
+| 26 | `BOOT-002` | An invalid registry must fail while an explicit empty list stays healthy | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-002) |
+| 27 | `BOOT-003` | Regional mode and single-cluster variables are mutually exclusive | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-003) |
+| 28 | `BOOT-004` | Regional mode forbids the in-cluster Kubernetes adapter | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-004) |
+| 29 | `BOOT-005` | Regional mode forbids the central HyperPod mutation adapter | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-005) |
+| 30 | `BOOT-007` | The cluster token length lower bound is exactly 32 characters | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-007) |
+| 31 | `BOOT-008` | Registry field completeness and enabled=false semantics | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-008) |
+| 32 | `BOOT-009` | Dependency gate of the managed recovery observer | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-009) |
+| 33 | `BOOT-010` | The three production replicas started correctly in regional mode | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-010) |
 
 ## Phase 2 — Identity boundaries
 
@@ -96,20 +100,20 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 31 | `AUTH-001` | Missing cluster header returns 401 | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-001) |
-| 32 | `AUTH-002` | Missing or malformed Bearer token: the exact 401 versus 403 boundary | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-002) |
-| 33 | `AUTH-003` | Unregistered cluster ID returns 403 | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-003) |
-| 34 | `AUTH-004` | Wrong token returns 403 without leaking the difference | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-004) |
-| 35 | `AUTH-005` | Mismatched cluster_id between header and payload returns 403 | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-005) |
-| 36 | `AUTH-006` | cluster_id inside a nested heartbeat is validated as well | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-006) |
-| 37 | `AUTH-007` | A disabled cluster immediately loses the ability to authenticate | `live-service-action` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-007) |
-| 38 | `AUTH-008` | Cluster A's credentials cannot claim cluster B's actions | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-008) |
-| 39 | `AUTH-009` | Cluster A's credentials cannot submit cluster B's events | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-009) |
-| 40 | `AUTH-011` | Health and metrics endpoints need no cluster credentials but do not leak the cluster inventory | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-011) |
-| 41 | `AUTH-013` | Private CA and hostname verification cannot be bypassed | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-013) |
-| 42 | `AUTH-014` | Complete inventory of endpoint authorization on the internet-reachable NLB | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-014) |
-| 43 | `AUTH-015` | The fleet master never enters a GPU node | `non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-015) |
-| 44 | `AUTH-016` | Zero-interruption cluster token rotation through an overlap window | `live-service-action` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-016) |
+| 34 | `AUTH-001` | Missing cluster header returns 401 | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-001) |
+| 35 | `AUTH-002` | Missing or malformed Bearer token: the exact 401 versus 403 boundary | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-002) |
+| 36 | `AUTH-003` | Unregistered cluster ID returns 403 | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-003) |
+| 37 | `AUTH-004` | Wrong token returns 403 without leaking the difference | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-004) |
+| 38 | `AUTH-005` | Mismatched cluster_id between header and payload returns 403 | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-005) |
+| 39 | `AUTH-006` | cluster_id inside a nested heartbeat is validated as well | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-006) |
+| 40 | `AUTH-007` | A disabled cluster immediately loses the ability to authenticate | `live-service-action` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-007) |
+| 41 | `AUTH-008` | Cluster A's credentials cannot claim cluster B's actions | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-008) |
+| 42 | `AUTH-009` | Cluster A's credentials cannot submit cluster B's events | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-009) |
+| 43 | `AUTH-011` | Health and metrics endpoints need no cluster credentials but do not leak the cluster inventory | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-011) |
+| 44 | `AUTH-013` | Private CA and hostname verification cannot be bypassed | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-013) |
+| 45 | `AUTH-014` | Complete inventory of endpoint authorization on the internet-reachable NLB | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-014) |
+| 46 | `AUTH-015` | The fleet master never enters a GPU node | `non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-015) |
+| 47 | `AUTH-016` | Zero-interruption cluster token rotation through an overlap window | `live-service-action` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-auth-016) |
 
 ## Phase 3 — Training workload baseline
 
@@ -117,8 +121,8 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 45 | `WORKLOAD-001` | Submit a three-node managed PyTorchJob with gpu-training-submit | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-workload-001) |
-| 46 | `WORKLOAD-002` | kubectl apply after gpu-fault-workload-annotate is equivalent to direct submission | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-workload-002) |
+| 48 | `WORKLOAD-001` | Submit a three-node managed PyTorchJob with gpu-training-submit | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-workload-001) |
+| 49 | `WORKLOAD-002` | kubectl apply after gpu-fault-workload-annotate is equivalent to direct submission | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-workload-002) |
 
 ## Phase 4 — Single-cluster state isolation
 
@@ -126,11 +130,11 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 47 | `ISO-001` | State is fully isolated when two clusters use the same node name, job ID and attempt ID | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-001) |
-| 48 | `ISO-002` | The executor refuses to execute a command that does not belong to its cluster | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-002) |
-| 49 | `ISO-003` | The Fleet proxy refuses cross-cluster reads and state transitions | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-003) |
-| 50 | `ISO-004` | The spare health endpoint refuses cross-cluster queries | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-004) |
-| 51 | `ISO-005` | The namespace allowlist is enforced independently on both the control-plane and data-plane sides | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-005) |
+| 50 | `ISO-001` | State is fully isolated when two clusters use the same node name, job ID and attempt ID | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-001) |
+| 51 | `ISO-002` | The executor refuses to execute a command that does not belong to its cluster | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-002) |
+| 52 | `ISO-003` | The Fleet proxy refuses cross-cluster reads and state transitions | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-003) |
+| 53 | `ISO-004` | The spare health endpoint refuses cross-cluster queries | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-004) |
+| 54 | `ISO-005` | The namespace allowlist is enforced independently on both the control-plane and data-plane sides | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-005) |
 
 ## Phase 5 — Remote command protocol
 
@@ -143,24 +147,24 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 52 | `CMD-001` | Boundary values of claim max_commands | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-001) |
-| 53 | `CMD-002` | Boundary values of claim lease_seconds | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-002) |
-| 54 | `CMD-003` | execution_owners validation and fail-closed fallback for an empty list | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-003) |
-| 55 | `CMD-004` | Only commands with a matching owner are claimed | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-004) |
-| 56 | `CMD-005` | Claim order is FIFO | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-005) |
-| 57 | `CMD-006` | An expired lease can be re-claimed and only the new holder can write the result | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-006) |
-| 58 | `CMD-007` | Re-submitting a terminal result is idempotent and cannot overwrite | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-007) |
-| 59 | `CMD-008` | Value constraints of RemoteCommandResult | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-008) |
-| 60 | `CMD-009` | Nonexistent and cross-cluster command_id both return 404 | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-009) |
-| 61 | `CMD-010` | A command with a stale fencing token cannot be claimed, its result is voided and it is judged FAILED | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-010) |
-| 62 | `CMD-011` | The executor locally verifies three-way fencing token agreement | `non-destructive` | live | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-011) |
-| 63 | `CMD-012` | Command identity idempotency and conflict rejection | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-012) |
-| 64 | `CMD-013` | WAITING can be re-claimed and carries the previous round's result | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-013) |
-| 65 | `CMD-014` | During delegation the control plane explicitly declares that it committed no change | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-014) |
-| 66 | `CMD-015` | The restart budget is reserved before delegation and no command is issued when it is exhausted | `read-only-signal-replay` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-015) |
-| 67 | `CMD-016` | reserve/get/outcome protocol boundary of the HyperPod submission idempotency record | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-016) |
-| 68 | `CMD-017` | A multi-node barrier command is held fail-closed at the regional executor's claim boundary, counted, and never reaches the adapter | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-017) |
-| 69 | `CMD-018` | While an open sibling command of the same workflow step is in flight, a re-dispatch with rewritten parameters is held as WAITING and counted, and the node executes only once | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-018) |
+| 55 | `CMD-001` | Boundary values of claim max_commands | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-001) |
+| 56 | `CMD-002` | Boundary values of claim lease_seconds | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-002) |
+| 57 | `CMD-003` | execution_owners validation and fail-closed fallback for an empty list | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-003) |
+| 58 | `CMD-004` | Only commands with a matching owner are claimed | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-004) |
+| 59 | `CMD-005` | Claim order is FIFO | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-005) |
+| 60 | `CMD-006` | An expired lease can be re-claimed and only the new holder can write the result | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-006) |
+| 61 | `CMD-007` | Re-submitting a terminal result is idempotent and cannot overwrite | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-007) |
+| 62 | `CMD-008` | Value constraints of RemoteCommandResult | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-008) |
+| 63 | `CMD-009` | Nonexistent and cross-cluster command_id both return 404 | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-009) |
+| 64 | `CMD-010` | A command with a stale fencing token cannot be claimed, its result is voided and it is judged FAILED | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-010) |
+| 65 | `CMD-011` | The executor locally verifies three-way fencing token agreement | `non-destructive` | live | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-011) |
+| 66 | `CMD-012` | Command identity idempotency and conflict rejection | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-012) |
+| 67 | `CMD-013` | WAITING can be re-claimed and carries the previous round's result | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-013) |
+| 68 | `CMD-014` | During delegation the control plane explicitly declares that it committed no change | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-014) |
+| 69 | `CMD-015` | The restart budget is reserved before delegation and no command is issued when it is exhausted | `read-only-signal-replay` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-015) |
+| 70 | `CMD-016` | reserve/get/outcome protocol boundary of the HyperPod submission idempotency record | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-016) |
+| 71 | `CMD-017` | A multi-node barrier command is held fail-closed at the regional executor's claim boundary, counted, and never reaches the adapter | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-017) |
+| 72 | `CMD-018` | While an open sibling command of the same workflow step is in flight, a re-dispatch with rewritten parameters is held as WAITING and counted, and the node executes only once | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cmd-018) |
 
 ## Phase 6 — Workflow preemption and DAG
 
@@ -171,41 +175,41 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 70 | `PREEMPT-001` | Original serial semantics are preserved when the preemption switch is off | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-001-feature-disabled) |
-| 71 | `PREEMPT-002` | Same-attempt clean-boundary preemption and step inheritance | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-002-same-attempt-clean-boundary) |
-| 72 | `PREEMPT-003` | Same-node preemption without a job and cross-node isolation | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-003-same-node-without-a-job) |
-| 73 | `PREEMPT-004` | The recovery rank gate allows only strictly higher-rank preemption | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-004-rank-gate) |
-| 74 | `PREEMPT-005` | An unclaimed remote command is atomically cancelled before preemption | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-005-cancelling-a-remote-pending-command) |
-| 75 | `PREEMPT-006` | A committed reset preempted by a reboot executes only once | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-006-submitted-reset--reboot) |
-| 76 | `PREEMPT-007` | A committed reboot preempted by a replace does not call the provider concurrently | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-007-submitted-reboot--replace) |
-| 77 | `PREEMPT-008` | Preemption after QUIESCE compensates with RESTORE first, then skips the lower-rank reset | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-008-skipping-the-low-rank-reset-after-quiesce) |
-| 78 | `PREEMPT-009` | Preemptibility classification of the four kinds of WAITING | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-009-waiting-classification) |
-| 79 | `PREEMPT-010` | Writing back the predecessor's terminal state must not overwrite the incident's successor pointer | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-010-incident-pointer) |
-| 80 | `PREEMPT-011` | Preemption uniqueness under multi-replica contention, leases and Aurora failover | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-011-multiple-replicas-leases-and-aurora-failover) |
-| 81 | `PREEMPT-012` | Real-hardware preemption acceptance at both clean and dirty boundaries | `destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-012-live-acceptance) |
-| 82 | `PREEMPT-014` | A five-level preemption chain is equivalent under both arrival orders | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-014-five-level-chained-preemption) |
-| 83 | `PREEMPT-015` | A lower-rank event arriving after a higher-rank workflow is running is absorbed without downgrading | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-015-low-rank-event-arriving-after-the-high-rank-workflow-is-running) |
-| 84 | `PREEMPT-016` | Different nodes and a concurrent warm spare must not preempt each other | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-016-different-nodes-and-warm-spare-concurrency) |
-| 85 | `PREEMPT-017` | Same-job two-node parallel branches and a single join | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-017-same-job-two-node-parallel-branches) |
-| 86 | `PREEMPT-018` | Dynamically appended branches for 3 and 5 nodes | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-018-dynamic-append-to-3-and-5-nodes) |
-| 87 | `PREEMPT-019` | The join gate must not release recovery when a branch fails | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-019-branch-failure-and-join-gate) |
-| 88 | `PREEMPT-020` | A node arriving late after finalization starts opens its own workflow | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-020-late-arriving-node-after-finalization-starts) |
-| 89 | `PREEMPT-021` | Same node, same rank, different GPUs merge into one reset step | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-021-same-node-same-rank-different-gpus) |
-| 90 | `PREEMPT-022` | Arbitration must be branch-local and not polluted by other nodes | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-022-same-node-branch-local-rank) |
-| 91 | `PREEMPT-024` | Boundary between continuous collection and on-demand diagnostics | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-024-continuous-collection-vs-on-demand-diagnostics-boundary) |
-| 92 | `PREEMPT-025` | After this solution actively terminates a job, the Watcher terminal state takes the causal-ack fast path | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-025-completionwatcher-causal-ack) |
-| 93 | `PREEMPT-026` | QUARANTINE terminates the shared restart without fabricating a cancellation | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-026-quarantine-terminates-the-shared-restart) |
-| 94 | `PREEMPT-027` | Cross-group arrival orders merge symmetrically into the same DAG | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-027-cross-group-arrival-order-symmetry) |
-| 95 | `PREEMPT-028` | Independence of different attempts and the node-exclusivity invariant | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-028-different-attempt-independence-and-node-exclusivity-invariant) |
-| 96 | `PREEMPT-029` | Fixed mail and deduplication for a successful warm-spare replacement | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-029-warm-spare-replacement-success-notification) |
-| 97 | `PREEMPT-030` | Actively trigger a health snapshot after reboot before releasing validation | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-030-proactive-health-snapshot-after-reboot) |
-| 98 | `PREEMPT-031` | A critical host quarantine merges into the same node's active workflow | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-031-critical-host-quarantine-merge) |
-| 99 | `PREEMPT-032` | Workflow lifetime hard deadline: fail at the deadline, cancel in-flight commands, escalate to humans only, and only record later events | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-032-workflow-lifetime-hard-deadline) |
-| 100 | `PREEMPT-033` | Workflow close-out after the job is stopped externally: in-flight actions run to completion, cordoned nodes return to scheduling, and the job is not restarted | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-033-workflow-wrap-up-after-the-job-is-stopped-externally) |
-| 101 | `PREEMPT-035` | A new job is observed landing on a node under repair: a placement hold is opened, it dissolves as soon as the node is released within the window, and on timeout only STOP_WORKLOADS executes with FAILED/ESCALATED | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-035-placement-hold-for-a-new-job-observed-on-a-node-under-repair) |
-| 102 | `PREEMPT-036` | Stuck workflows are closed automatically by the dispatcher: the compile-blocked, orphaned-commands and retired-generation shapes each converge in every sweep, the twin live records stay field-for-field untouched, and a second sweep is idempotent | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-036-stuck-workflows-closed-automatically-by-the-dispatcher) |
-| 103 | `PREEMPT-037` | Dispatch loop liveness: after the workflow dispatcher is turned off the last-cycle timestamp ages, the GpuFaultWorkflowDispatcherStalled expression holds within its for window, and it returns to zero after recovery | `live-service-action` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-037-dispatch-loop-liveness) |
-| 104 | `PREEMPT-038` | Raw evidence is pinned to the incident lifecycle: expired rows are not cleaned while an open incident in the same cluster names their node, are deleted only after RECOVERED, and every cleanup records the deleted keys | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-038-evidence-pinned-to-the-incident-lifecycle) |
+| 73 | `PREEMPT-001` | Original serial semantics are preserved when the preemption switch is off | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-001-feature-disabled) |
+| 74 | `PREEMPT-002` | Same-attempt clean-boundary preemption and step inheritance | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-002-same-attempt-clean-boundary) |
+| 75 | `PREEMPT-003` | Same-node preemption without a job and cross-node isolation | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-003-same-node-without-a-job) |
+| 76 | `PREEMPT-004` | The recovery rank gate allows only strictly higher-rank preemption | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-004-rank-gate) |
+| 77 | `PREEMPT-005` | An unclaimed remote command is atomically cancelled before preemption | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-005-cancelling-a-remote-pending-command) |
+| 78 | `PREEMPT-006` | A committed reset preempted by a reboot executes only once | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-006-submitted-reset--reboot) |
+| 79 | `PREEMPT-007` | A committed reboot preempted by a replace does not call the provider concurrently | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-007-submitted-reboot--replace) |
+| 80 | `PREEMPT-008` | Preemption after QUIESCE compensates with RESTORE first, then skips the lower-rank reset | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-008-skipping-the-low-rank-reset-after-quiesce) |
+| 81 | `PREEMPT-009` | Preemptibility classification of the four kinds of WAITING | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-009-waiting-classification) |
+| 82 | `PREEMPT-010` | Writing back the predecessor's terminal state must not overwrite the incident's successor pointer | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-010-incident-pointer) |
+| 83 | `PREEMPT-011` | Preemption uniqueness under multi-replica contention, leases and Aurora failover | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-011-multiple-replicas-leases-and-aurora-failover) |
+| 84 | `PREEMPT-012` | Real-hardware preemption acceptance at both clean and dirty boundaries | `destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-012-live-acceptance) |
+| 85 | `PREEMPT-014` | A five-level preemption chain is equivalent under both arrival orders | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-014-five-level-chained-preemption) |
+| 86 | `PREEMPT-015` | A lower-rank event arriving after a higher-rank workflow is running is absorbed without downgrading | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-015-low-rank-event-arriving-after-the-high-rank-workflow-is-running) |
+| 87 | `PREEMPT-016` | Different nodes and a concurrent warm spare must not preempt each other | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-016-different-nodes-and-warm-spare-concurrency) |
+| 88 | `PREEMPT-017` | Same-job two-node parallel branches and a single join | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-017-same-job-two-node-parallel-branches) |
+| 89 | `PREEMPT-018` | Dynamically appended branches for 3 and 5 nodes | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-018-dynamic-append-to-3-and-5-nodes) |
+| 90 | `PREEMPT-019` | The join gate must not release recovery when a branch fails | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-019-branch-failure-and-join-gate) |
+| 91 | `PREEMPT-020` | A node arriving late after finalization starts opens its own workflow | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-020-late-arriving-node-after-finalization-starts) |
+| 92 | `PREEMPT-021` | Same node, same rank, different GPUs merge into one reset step | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-021-same-node-same-rank-different-gpus) |
+| 93 | `PREEMPT-022` | Arbitration must be branch-local and not polluted by other nodes | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-022-same-node-branch-local-rank) |
+| 94 | `PREEMPT-024` | Boundary between continuous collection and on-demand diagnostics | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-024-continuous-collection-vs-on-demand-diagnostics-boundary) |
+| 95 | `PREEMPT-025` | After this solution actively terminates a job, the Watcher terminal state takes the causal-ack fast path | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-025-completionwatcher-causal-ack) |
+| 96 | `PREEMPT-026` | QUARANTINE terminates the shared restart without fabricating a cancellation | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-026-quarantine-terminates-the-shared-restart) |
+| 97 | `PREEMPT-027` | Cross-group arrival orders merge symmetrically into the same DAG | `non-destructive` | integration | pytest | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-027-cross-group-arrival-order-symmetry) |
+| 98 | `PREEMPT-028` | Independence of different attempts and the node-exclusivity invariant | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-028-different-attempt-independence-and-node-exclusivity-invariant) |
+| 99 | `PREEMPT-029` | Fixed mail and deduplication for a successful warm-spare replacement | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-029-warm-spare-replacement-success-notification) |
+| 100 | `PREEMPT-030` | Actively trigger a health snapshot after reboot before releasing validation | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-030-proactive-health-snapshot-after-reboot) |
+| 101 | `PREEMPT-031` | A critical host quarantine merges into the same node's active workflow | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-031-critical-host-quarantine-merge) |
+| 102 | `PREEMPT-032` | Workflow lifetime hard deadline: fail at the deadline, cancel in-flight commands, escalate to humans only, and only record later events | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-032-workflow-lifetime-hard-deadline) |
+| 103 | `PREEMPT-033` | Workflow close-out after the job is stopped externally: in-flight actions run to completion, cordoned nodes return to scheduling, and the job is not restarted | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-033-workflow-wrap-up-after-the-job-is-stopped-externally) |
+| 104 | `PREEMPT-035` | A new job is observed landing on a node under repair: a placement hold is opened, it dissolves as soon as the node is released within the window, and on timeout only STOP_WORKLOADS executes with FAILED/ESCALATED | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-035-placement-hold-for-a-new-job-observed-on-a-node-under-repair) |
+| 105 | `PREEMPT-036` | Stuck workflows are closed automatically by the dispatcher: the compile-blocked, orphaned-commands and retired-generation shapes each converge in every sweep, the twin live records stay field-for-field untouched, and a second sweep is idempotent | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-036-stuck-workflows-closed-automatically-by-the-dispatcher) |
+| 106 | `PREEMPT-037` | Dispatch loop liveness: after the workflow dispatcher is turned off the last-cycle timestamp ages, the GpuFaultWorkflowDispatcherStalled expression holds within its for window, and it returns to zero after recovery | `live-service-action` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-037-dispatch-loop-liveness) |
+| 107 | `PREEMPT-038` | Raw evidence is pinned to the incident lifecycle: expired rows are not cleaned while an open incident in the same cluster names their node, are deleted only after RECOVERED, and every cleanup records the deleted keys | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-preempt-038-evidence-pinned-to-the-incident-lifecycle) |
 
 ## Phase 7 — Single-cluster closed loop
 
@@ -213,7 +217,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 105 | `E2E-001` | Single-cluster full chain from Collector to control plane to local executor | `live-workload-restart` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-e2e-001) |
+| 108 | `E2E-001` | Single-cluster full chain from Collector to control plane to local executor | `live-workload-restart` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-e2e-001) |
 
 ## Phase 8 — Blast radius
 
@@ -221,9 +225,9 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 106 | `BLAST-002` | The control plane holds no write credentials for any GPU cluster | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-blast-002) |
-| 107 | `BLAST-003` | GPU executor permissions are minimized and exclude SES | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-blast-003) |
-| 108 | `BLAST-004` | Separation of the execution token from the cluster token | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-blast-004) |
+| 109 | `BLAST-002` | The control plane holds no write credentials for any GPU cluster | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-blast-002) |
+| 110 | `BLAST-003` | GPU executor permissions are minimized and exclude SES | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-blast-003) |
+| 111 | `BLAST-004` | Separation of the execution token from the cluster token | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-blast-004) |
 
 ## Phase 9 — Notifications
 
@@ -234,23 +238,23 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 109 | `NOTIFY-001` | Each critical action has one SENT notification with a non-empty provider MessageId | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-001) |
-| 110 | `NOTIFY-003` | Enabling the dispatcher for the first time does not flush the historical backlog | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-003) |
-| 111 | `NOTIFY-004` | The GPU executor has no SES permission | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-004) |
-| 112 | `NOTIFY-005` | Low-utilization mails are aggregated per node or per job | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-005) |
-| 113 | `NOTIFY-006` | Notification dispatcher service-role assembly and restart takeover | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-006) |
-| 114 | `NOTIFY-007` | Notification delivery state: a transient failure is RETRY rather than FAILED; only exhausted retries are DEAD and terminal FAILED | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-007) |
-| 115 | `NOTIFY-008` | Process-loss window between provider acceptance and database commit of a notification | `live-non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-008) |
+| 112 | `NOTIFY-001` | Each critical action has one SENT notification with a non-empty provider MessageId | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-001) |
+| 113 | `NOTIFY-003` | Enabling the dispatcher for the first time does not flush the historical backlog | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-003) |
+| 114 | `NOTIFY-004` | The GPU executor has no SES permission | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-004) |
+| 115 | `NOTIFY-005` | Low-utilization mails are aggregated per node or per job | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-005) |
+| 116 | `NOTIFY-006` | Notification dispatcher service-role assembly and restart takeover | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-006) |
+| 117 | `NOTIFY-007` | Notification delivery state: a transient failure is RETRY rather than FAILED; only exhausted retries are DEAD and terminal FAILED | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-007) |
+| 118 | `NOTIFY-008` | Process-loss window between provider acceptance and database commit of a notification | `live-non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-notify-008) |
 
 ## Phase 10 — Capacity
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 116 | `CAP-001` | A full single-cluster queue returns 429 without affecting other clusters | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cap-001) |
-| 117 | `CAP-002` | Store I/O saturation returns 503 and the alert chain fires end to end | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cap-002) |
-| 118 | `CAP-003` | Claim amplification baseline at N-cluster scale | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cap-003) |
-| 119 | `CAP-004` | Large-batch concurrent command execution, lease renewal and throughput | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cap-004) |
-| 120 | `CAP-005` | Zero-skip gate for production PostgreSQL tests | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cap-005) |
+| 119 | `CAP-001` | A full single-cluster queue returns 429 without affecting other clusters | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cap-001) |
+| 120 | `CAP-002` | Store I/O saturation returns 503 and the alert chain fires end to end | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cap-002) |
+| 121 | `CAP-003` | Claim amplification baseline at N-cluster scale | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cap-003) |
+| 122 | `CAP-004` | Large-batch concurrent command execution, lease renewal and throughput | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cap-004) |
+| 123 | `CAP-005` | Zero-skip gate for production PostgreSQL tests | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-cap-005) |
 
 ## Phase 11 — Network outage and re-submission
 
@@ -258,14 +262,14 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 121 | `NET-001` | The Collector persists its cache during a network outage and re-submits by idempotency key after recovery | `live-kernel-log-injection` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-001) |
-| 122 | `NET-002` | Commands claimed during the outage are safely reclaimed | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-002) |
-| 123 | `NET-003` | A retry after an outage during result submission is idempotent | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-003) |
-| 124 | `NET-004` | Cross-VPC one-way dependency, authorization boundary and timeout configuration | `read-only-signal-replay` | live | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-004) |
-| 125 | `NET-005` | Collector bounded outbox capacity, dead-letter and live-event priority | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-005) |
-| 126 | `NET-006` | Command lease lost during action execution: the executor does not submit a result under the lost lease and counts it, and after a re-claim the idempotent ledger closes out | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-006) |
-| 127 | `NET-007` | When the node isolation step hits a transient Kubernetes API failure the step retries as WAITING rather than FAILED, and the workflow closes out normally once the failure clears | `live-node-mutation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-007) |
-| 128 | `NET-008` | Dead-letter semantics of the Collector outbox: 403 stays replayable and is delivered after the token recovers, replayed 4xx is dead-lettered and can be requeued, and /dev/kmsg is not reopened during the outage | `live-kernel-log-injection` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-008) |
+| 124 | `NET-001` | The Collector persists its cache during a network outage and re-submits by idempotency key after recovery | `live-kernel-log-injection` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-001) |
+| 125 | `NET-002` | Commands claimed during the outage are safely reclaimed | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-002) |
+| 126 | `NET-003` | A retry after an outage during result submission is idempotent | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-003) |
+| 127 | `NET-004` | Cross-VPC one-way dependency, authorization boundary and timeout configuration | `read-only-signal-replay` | live | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-004) |
+| 128 | `NET-005` | Collector bounded outbox capacity, dead-letter and live-event priority | `non-destructive` | integration | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-005) |
+| 129 | `NET-006` | Command lease lost during action execution: the executor does not submit a result under the lost lease and counts it, and after a re-claim the idempotent ledger closes out | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-006) |
+| 130 | `NET-007` | When the node isolation step hits a transient Kubernetes API failure the step retries as WAITING rather than FAILED, and the workflow closes out normally once the failure clears | `live-node-mutation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-007) |
+| 131 | `NET-008` | Dead-letter semantics of the Collector outbox: 403 stays replayable and is delivered after the token recovers, replayed 4xx is dead-lettered and can be requeued, and /dev/kmsg is not reopened during the outage | `live-kernel-log-injection` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-net-008) |
 
 ## Phase 12 — Non-destructive HA
 
@@ -277,15 +281,15 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 129 | `HA-001` | API and dispatcher keep working after an active-active control-plane replica is deleted | `live-service-action` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-001) |
-| 130 | `HA-002` | PDB and topology constraints of the three-tier roles hold during CPU node maintenance | `live-service-action` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-002) |
-| 131 | `HA-005` | The data plane observes only retryable errors during a control-plane rolling upgrade | `live-service-action` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-005) |
-| 132 | `HA-006` | After an executor Pod is force-killed the action is taken over, not lost | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-006) |
-| 133 | `HA-007` | control-worker rolls out with a legitimate long request in flight | `non-destructive` | staging | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-007) |
-| 134 | `HA-008` | processor deadline fatal-exit and lease release | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-008) |
-| 135 | `HA-009` | Zero rollouts during Aurora credential rotation, projected credentials and new-connection verification for every role | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-009) |
-| 136 | `HA-010` | An Aurora writer failover only makes the control plane NotReady without restarting any Pod, and startup backoff is bounded | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-010) |
-| 137 | `HA-011` | Busy processor and spool process takeover in an isolated deployed runtime | `live-non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-011) |
+| 132 | `HA-001` | API and dispatcher keep working after an active-active control-plane replica is deleted | `live-service-action` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-001) |
+| 133 | `HA-002` | PDB and topology constraints of the three-tier roles hold during CPU node maintenance | `live-service-action` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-002) |
+| 134 | `HA-005` | The data plane observes only retryable errors during a control-plane rolling upgrade | `live-service-action` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-005) |
+| 135 | `HA-006` | After an executor Pod is force-killed the action is taken over, not lost | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-006) |
+| 136 | `HA-007` | control-worker rolls out with a legitimate long request in flight | `non-destructive` | staging | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-007) |
+| 137 | `HA-008` | processor deadline fatal-exit and lease release | `non-destructive` | integration | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-008) |
+| 138 | `HA-009` | Zero rollouts during Aurora credential rotation, projected credentials and new-connection verification for every role | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-009) |
+| 139 | `HA-010` | An Aurora writer failover only makes the control plane NotReady without restarting any Pod, and startup backoff is bounded | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-010) |
+| 140 | `HA-011` | Busy processor and spool process takeover in an isolated deployed runtime | `live-non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-011) |
 
 ## Phase 13 — Destructive capability acceptance (including non-destructive fail-closed negative cases)
 
@@ -308,25 +312,25 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 138 | `DESTR-005` | A warm spare step routed to the managed or provider adapter must fail | `live-non-destructive` | staging | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-005) |
-| 139 | `DESTR-006` | Warm spare requires HyperPod NodeRecovery=None | `live-non-destructive` | staging | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-006) |
-| 140 | `DESTR-007` | Warm spare requires both the spare coordinator and remote state to be enabled | `live-non-destructive` | staging | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-007) |
-| 141 | `DESTR-010` | Fabric Manager restart and GPU service quiesce through the Node Agent | `live-service-action` | staging | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-010) |
-| 142 | `DESTR-001` | Real GPU reset through the executor and Node Agent | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-001) |
-| 143 | `BLAST-001` | The control-plane EKS is never tainted, cordoned or drained by a GPU fault workflow | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-blast-001) |
-| 144 | `DESTR-002` | Real node reboot through the provider | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-002) |
-| 145 | `DESTR-009` | Workload stop and restart execute locally through the executor | `live-workload-restart` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-009) |
-| 146 | `DESTR-012` | Job auto-recovery is owned exclusively by this solution and HyperPod auto-resume must be disabled | `live-workload-restart` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-012) |
-| 147 | `DESTR-015` | Two nodes of the same job fault in the same window: two branches reset GPUs in parallel and a single join restarts the job | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-015) |
-| 148 | `DESTR-016` | A second fault on the same node arrives during a physical step: the same-rank XID is absorbed, the higher-rank XID 79 preempts the reset workflow, takes over the quiesce and completes a real reboot | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-016) |
-| 149 | `DESTR-017` | Generation fence after an out-of-band reboot: the node is rebooted outside the system while RESET_GPU waits, in-flight commands of the old generation are rejected, and no reset executes on the new boot | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-017) |
-| 150 | `DESTR-018` | Real-hardware acceptance of the workflow lifetime hard deadline: RESET_GPU stays WAITING until the lifetime expires, the whole record is FAILED, in-flight commands get workflow-timeout, escalation is to humans only, and the node-side ledger adds no RESET rows after cancellation | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-018) |
-| 151 | `DESTR-019` | After an idle Node Agent restart: same-generation return, writable and counted /healthz, in-place ledger migration, and the next real command leaves a complete audit trail | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-019) |
-| 152 | `DESTR-020` | Isolation is observed, not remembered: an alias node unknown to Kubernetes makes MARK_UNSCHEDULABLE fail closed and no node is cordoned | `live-non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-020) |
-| 153 | `DESTR-021` | EFA layered recovery under adversarial node metadata: a stale foreign plugin-restart annotation is taken over, RESTORE_SCHEDULING still converges under concurrent 409s, and isolation/restore carry before/after snapshots | `live-node-mutation` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-021) |
-| 154 | `DESTR-023` | Autonomous reset on a truly idle cluster: with no managed job and all observation streams expired, the watcher coverage heartbeat keeps the node IDLE and XID 46 completes the eight-step RESET_GPU without being blocked by UNKNOWN | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-023) |
-| 155 | `DESTR-024` | Fail-closed while the watcher is down: after the coverage heartbeat expires the node is UNKNOWN, XID 46 only isolates and goes BLOCKED with no quiesce and no reset; once the watcher recovers the heartbeat returns and isolation is lifted through validated restore | `live-isolation` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-024) |
-| 156 | `DESTR-025` | After a known single-node RESET_GPU failure, the same workflow record escalates to a real RESTART_NODE and closes out without producing a reboot-after successor | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-025) |
+| 141 | `DESTR-005` | A warm spare step routed to the managed or provider adapter must fail | `live-non-destructive` | staging | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-005) |
+| 142 | `DESTR-006` | Warm spare requires HyperPod NodeRecovery=None | `live-non-destructive` | staging | command | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-006) |
+| 143 | `DESTR-007` | Warm spare requires both the spare coordinator and remote state to be enabled | `live-non-destructive` | staging | command + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-007) |
+| 144 | `DESTR-010` | Fabric Manager restart and GPU service quiesce through the Node Agent | `live-service-action` | staging | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-010) |
+| 145 | `DESTR-001` | Real GPU reset through the executor and Node Agent | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-001) |
+| 146 | `BLAST-001` | The control-plane EKS is never tainted, cordoned or drained by a GPU fault workflow | `live-non-destructive` | live | manual | [§](regional-e2e-acceptance-test-cases.md#gf-regional-blast-001) |
+| 147 | `DESTR-002` | Real node reboot through the provider | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-002) |
+| 148 | `DESTR-009` | Workload stop and restart execute locally through the executor | `live-workload-restart` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-009) |
+| 149 | `DESTR-012` | Job auto-recovery is owned exclusively by this solution and HyperPod auto-resume must be disabled | `live-workload-restart` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-012) |
+| 150 | `DESTR-015` | Two nodes of the same job fault in the same window: two branches reset GPUs in parallel and a single join restarts the job | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-015) |
+| 151 | `DESTR-016` | A second fault on the same node arrives during a physical step: the same-rank XID is absorbed, the higher-rank XID 79 preempts the reset workflow, takes over the quiesce and completes a real reboot | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-016) |
+| 152 | `DESTR-017` | Generation fence after an out-of-band reboot: the node is rebooted outside the system while RESET_GPU waits, in-flight commands of the old generation are rejected, and no reset executes on the new boot | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-017) |
+| 153 | `DESTR-018` | Real-hardware acceptance of the workflow lifetime hard deadline: RESET_GPU stays WAITING until the lifetime expires, the whole record is FAILED, in-flight commands get workflow-timeout, escalation is to humans only, and the node-side ledger adds no RESET rows after cancellation | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-018) |
+| 154 | `DESTR-019` | After an idle Node Agent restart: same-generation return, writable and counted /healthz, in-place ledger migration, and the next real command leaves a complete audit trail | `live-service-action` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-019) |
+| 155 | `DESTR-020` | Isolation is observed, not remembered: an alias node unknown to Kubernetes makes MARK_UNSCHEDULABLE fail closed and no node is cordoned | `live-non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-020) |
+| 156 | `DESTR-021` | EFA layered recovery under adversarial node metadata: a stale foreign plugin-restart annotation is taken over, RESTORE_SCHEDULING still converges under concurrent 409s, and isolation/restore carry before/after snapshots | `live-node-mutation` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-021) |
+| 157 | `DESTR-023` | Autonomous reset on a truly idle cluster: with no managed job and all observation streams expired, the watcher coverage heartbeat keeps the node IDLE and XID 46 completes the eight-step RESET_GPU without being blocked by UNKNOWN | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-023) |
+| 158 | `DESTR-024` | Fail-closed while the watcher is down: after the coverage heartbeat expires the node is UNKNOWN, XID 46 only isolates and goes BLOCKED with no quiesce and no reset; once the watcher recovers the heartbeat returns and isolation is lifted through validated restore | `live-isolation` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-024) |
+| 159 | `DESTR-025` | After a known single-node RESET_GPU failure, the same workflow record escalates to a real RESTART_NODE and closes out without producing a reboot-after successor | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-025) |
 
 ## Phase 14 — Warm spare
 
@@ -339,10 +343,10 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 157 | `DESTR-003` | Warm-spare node replacement uses only customer-provisioned hot-spare GPU nodes | `destructive-warm-spare` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-003) |
-| 158 | `DESTR-008` | An insufficient hot-spare pool fails and alerts, never degrading to provider replace | `destructive-warm-spare` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-008) |
-| 159 | `DESTR-022` | The deployed executor's spare reservation sweep reclaims stale reservations by TTL while the hot spare stays cordoned throughout | `live-node-mutation` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-022) |
-| 160 | `DESTR-014` | Two nodes of the same job repaired: a known failure may escalate, an unknown reboot outcome keeps the manual safeguard and does not restart the job | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-014) |
+| 160 | `DESTR-003` | Warm-spare node replacement uses only customer-provisioned hot-spare GPU nodes | `destructive-warm-spare` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-003) |
+| 161 | `DESTR-008` | An insufficient hot-spare pool fails and alerts, never degrading to provider replace | `destructive-warm-spare` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-008) |
+| 162 | `DESTR-022` | The deployed executor's spare reservation sweep reclaims stale reservations by TTL while the hot spare stays cordoned throughout | `live-node-mutation` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-022) |
+| 163 | `DESTR-014` | Two nodes of the same job repaired: a known failure may escalate, an unknown reboot outcome keeps the manual safeguard and does not restart the job | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-014) |
 
 ## Phase 15 — Failover and constraint refutation
 
@@ -353,9 +357,9 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 161 | `HA-003` | No destructive step executes twice during an Aurora failover | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-003) |
-| 162 | `HA-004` | Two executor replicas re-claiming a WAITING command produce no duplicate physical action | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-004) |
-| 163 | `DESTR-013` | Hard-constraint refutation: NodeRecovery is always None and no BatchReplaceClusterNodes occurs throughout | `non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-013) |
+| 164 | `HA-003` | No destructive step executes twice during an Aurora failover | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-003) |
+| 165 | `HA-004` | Two executor replicas re-claiming a WAITING command produce no duplicate physical action | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-004) |
+| 166 | `DESTR-013` | Hard-constraint refutation: NodeRecovery is always None and no BatchReplaceClusterNodes occurs throughout | `non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-013) |
 
 ## Phase 16 — Multiple physical clusters
 
@@ -368,9 +372,9 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 164 | `ISO-006` | One GPU cluster going fully offline does not block other clusters | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-006) |
-| 165 | `E2E-002` | Concurrent faults of the same kind in two clusters do not interfere | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-e2e-002) |
-| 166 | `ISO-007` | Cluster B still completes recovery independently when cluster A's recovery is denied by the budget | `live-workload-restart` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-007) |
+| 167 | `ISO-006` | One GPU cluster going fully offline does not block other clusters | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-006) |
+| 168 | `E2E-002` | Concurrent faults of the same kind in two clusters do not interfere | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-e2e-002) |
+| 169 | `ISO-007` | Cluster B still completes recovery independently when cluster A's recovery is denied by the budget | `live-workload-restart` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-007) |
 
 ## Phase 17 — Collection and decision coverage
 
@@ -385,28 +389,28 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 167 | `COLLECT-001` | Steady-state suppression ratio proving the edge filter really takes effect on real hardware | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-001) |
-| 168 | `COLLECT-002` | An edge-filter abnormal edge must be delivered within the confirmation sample count plus one collection period | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-002) |
-| 169 | `COLLECT-003` | EXPECTED_GPU_COUNT and EXPECTED_EFA_DEVICE_COUNT verified on real hardware | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-003) |
-| 170 | `COLLECT-004` | Real-hardware validation of the inventory mismatch debounce threshold | `destructive-provider-reboot` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-004) |
-| 171 | `COLLECT-005` | Collection layer and cursor persistence of the fabric-manager collector | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-005) |
-| 172 | `COLLECT-022` | Post-deploy FM collector recovery from private cursor loss, corruption and log rotation | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-022) |
-| 173 | `COLLECT-006` | Table-driven full coverage of the 95 NVLink5 decode-table rules | `non-destructive` | component | command | — |
-| 174 | `COLLECT-007` | Full coverage of the 172 XID catalog rules times 4 product-family decision layers | `non-destructive` | component | command | — |
-| 175 | `COLLECT-009` | CHECK_MECHANICALS wait and manual confirmation loop runs end to end on real hardware | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-009) |
-| 176 | `COLLECT-010` | UPDATE_SWFW must fail closed when no firmware target version is configured | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-010) |
-| 177 | `COLLECT-011` | SXID SCOPE_DEPENDENT_RESET fails closed in both directions | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-011) |
-| 178 | `COLLECT-012` | XID RESTART_APP switched from API replay to real kmsg injection | `live-kernel-log-injection` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-012) |
-| 179 | `COLLECT-008` | WORKFLOW_XID_48 real dual kmsg injection drives DRAIN_AND_RESET | `destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-008) |
-| 180 | `COLLECT-013` | XID RESET_GPU real kmsg injection that really executes a single-GPU reset | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-013) |
-| 181 | `COLLECT-014` | Dual evidence gate and positive path of the SXID whole-node GPU and NVSwitch reset | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-014) |
-| 182 | `COLLECT-016` | RESTART_APP and RESET_GPU execution segments under real distributed training | `destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-016) |
-| 183 | `COLLECT-021` | Pod dies first, RESTART_APP XID arrives later: the idle verdict is MONITOR_ONLY and the passive path still restarts | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-021) |
-| 184 | `COLLECT-017` | EFA layered recovery and Kubernetes accelerator allocatable | `live-node-mutation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-017) |
-| 185 | `COLLECT-018` | Fault-tier events rejected after a 202 are counted, alerted and land in the node collector status; an unnumbered Xid line becomes an operator-review finding instead of being silently dropped | `live-kernel-log-injection` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-018) |
-| 186 | `COLLECT-019` | When nvidia-smi hangs past the timeout for several rounds, the host collector does not restart, keeps delivering error batches with the circuit-breaker reason, and the control plane reports erroring rather than silent | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-019) |
-| 187 | `COLLECT-020` | Without a configured expected GPU count it is derived from the instance type; one inventory query missing one UUID is a CRITICAL identity finding, diagnosed rather than rebooted, and the marker carries the retirement fields after restore | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-020) |
-| 188 | `COLLECT-015` | SXID ALWAYS_FATAL real whole-node reboot through the provider | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-015) |
+| 170 | `COLLECT-001` | Steady-state suppression ratio proving the edge filter really takes effect on real hardware | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-001) |
+| 171 | `COLLECT-002` | An edge-filter abnormal edge must be delivered within the confirmation sample count plus one collection period | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-002) |
+| 172 | `COLLECT-003` | EXPECTED_GPU_COUNT and EXPECTED_EFA_DEVICE_COUNT verified on real hardware | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-003) |
+| 173 | `COLLECT-004` | Real-hardware validation of the inventory mismatch debounce threshold | `destructive-provider-reboot` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-004) |
+| 174 | `COLLECT-005` | Collection layer and cursor persistence of the fabric-manager collector | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-005) |
+| 175 | `COLLECT-022` | Post-deploy FM collector recovery from private cursor loss, corruption and log rotation | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-022) |
+| 176 | `COLLECT-006` | Table-driven full coverage of the 95 NVLink5 decode-table rules | `non-destructive` | component | command | — |
+| 177 | `COLLECT-007` | Full coverage of the 172 XID catalog rules times 4 product-family decision layers | `non-destructive` | component | command | — |
+| 178 | `COLLECT-009` | CHECK_MECHANICALS wait and manual confirmation loop runs end to end on real hardware | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-009) |
+| 179 | `COLLECT-010` | UPDATE_SWFW must fail closed when no firmware target version is configured | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-010) |
+| 180 | `COLLECT-011` | SXID SCOPE_DEPENDENT_RESET fails closed in both directions | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-011) |
+| 181 | `COLLECT-012` | XID RESTART_APP switched from API replay to real kmsg injection | `live-kernel-log-injection` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-012) |
+| 182 | `COLLECT-008` | WORKFLOW_XID_48 real dual kmsg injection drives DRAIN_AND_RESET | `destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-008) |
+| 183 | `COLLECT-013` | XID RESET_GPU real kmsg injection that really executes a single-GPU reset | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-013) |
+| 184 | `COLLECT-014` | Dual evidence gate and positive path of the SXID whole-node GPU and NVSwitch reset | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-014) |
+| 185 | `COLLECT-016` | RESTART_APP and RESET_GPU execution segments under real distributed training | `destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-016) |
+| 186 | `COLLECT-021` | Pod dies first, RESTART_APP XID arrives later: the idle verdict is MONITOR_ONLY and the passive path still restarts | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-021) |
+| 187 | `COLLECT-017` | EFA layered recovery and Kubernetes accelerator allocatable | `live-node-mutation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-017) |
+| 188 | `COLLECT-018` | Fault-tier events rejected after a 202 are counted, alerted and land in the node collector status; an unnumbered Xid line becomes an operator-review finding instead of being silently dropped | `live-kernel-log-injection` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-018) |
+| 189 | `COLLECT-019` | When nvidia-smi hangs past the timeout for several rounds, the host collector does not restart, keeps delivering error batches with the circuit-breaker reason, and the control plane reports erroring rather than silent | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-019) |
+| 190 | `COLLECT-020` | Without a configured expected GPU count it is derived from the instance type; one inventory query missing one UUID is a CRITICAL identity finding, diagnosed rather than rebooted, and the marker carries the retirement fields after restore | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-020) |
+| 191 | `COLLECT-015` | SXID ALWAYS_FATAL real whole-node reboot through the provider | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-015) |
 
 ## Phase 18 — Full uninstall of an isolated site
 
@@ -418,7 +422,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 189 | `BOOT-032` | Full uninstall of an isolated acceptance site, resume after interruption and shared-resource protection | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-032) |
+| 192 | `BOOT-032` | Full uninstall of an isolated acceptance site, resume after interruption and shared-resource protection | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-032) |
 
 ## DO_NOT_RUN (historical ids retained only)
 
