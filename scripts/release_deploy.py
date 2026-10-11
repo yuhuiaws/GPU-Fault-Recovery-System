@@ -24,6 +24,7 @@ from gpu_fault.admin.profile_approval import (
     profile_approval_lock,
     profile_plan_sha256 as profile_plan_sha256,
 )
+from gpu_fault.admin.rollback_baseline import record_rollback_baseline
 from gpu_fault.admin.site import (
     effective_environment,
     load_site,
@@ -173,7 +174,15 @@ def prepare_site_release(
     *,
     profile_plan: ProfilePlan,
     digest_runner: CommandRunner | None = None,
+    live_state: Mapping[str, Any] | None = None,
 ) -> PreparedRelease:
+    """Prepare one release attempt; ``live_state`` decides the rollback baseline.
+
+    ``live_state`` is the engine's live release state (``{}`` for a site with
+    none yet); ``None`` means the caller did not read it, which keeps whatever
+    baseline the release directory already records.
+    """
+
     rendered = load_site(site_file)
     if rendered.repository_root != ROOT:
         raise ReleaseDeployError(
@@ -201,10 +210,15 @@ def prepare_site_release(
     state_dir = site_file.parent / "release-deploy" / release_id
     state_dir.mkdir(parents=True, exist_ok=True)
     state_dir.chmod(0o700)
-    backup = state_dir / "site.before.yaml"
-    if not backup.exists():
-        backup.write_bytes(site_file.read_bytes())
-        backup.chmod(0o600)
+    # This attempt's rollback baseline: the committed site, recorded before the
+    # attempt rewrites it. Refreshed at every attempt start whose previous
+    # attempt is committed or fully rolled back (a `config` re-roll reuses the
+    # live release's directory, and a cluster may have been joined or removed
+    # since the directory was first written); kept while a transaction is
+    # still being resumed.
+    rollback_baseline = record_rollback_baseline(
+        state_dir, site_file, live_state=live_state
+    )
 
     previous = {
         "manifest": release.get("manifest"),
@@ -260,6 +274,7 @@ def prepare_site_release(
         "release_id": release_id,
         "site_file": str(site_file),
         "site_changed": changed,
+        "rollback_baseline": rollback_baseline,
         "previous": previous,
         "desired": {
             "manifest": release["manifest"],
@@ -801,6 +816,7 @@ def _execute_release_locked(
     prepared = prepare_site_release(
         site_file,
         profile_plan=profile_plan,
+        live_state=current_state,
     )
     deployment_succeeded = False
     commit_started = False

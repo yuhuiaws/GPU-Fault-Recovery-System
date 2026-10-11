@@ -6,6 +6,7 @@ import os
 import re
 import tempfile
 from contextlib import contextmanager
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
@@ -16,6 +17,11 @@ from gpu_fault.admin.config import (
     AdminConfig,
     load_desired_admin_config,
     persist_desired_admin_config,
+)
+from gpu_fault.admin.rollback_baseline import (
+    MEMBERSHIP_EVIDENCE_FILE,
+    load_rollback_baseline,
+    require_baseline_membership,
 )
 from gpu_fault.admin.site import SiteConfigError
 from gpu_fault_release import containing_repository_root
@@ -298,15 +304,19 @@ def rollback_management_document(
     previous = live_state.get("previous")
     if not isinstance(previous, dict):
         raise SiteConfigError("rolled-back release has no previous baseline")
-    source = (
-        site_before if site_before is not None and site_before.is_file() else site_file
-    )
-    try:
-        document = yaml.safe_load(source.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
-        raise SiteConfigError("cannot read the rollback management site") from exc
-    if not isinstance(document, dict) or not isinstance(document.get("spec"), dict):
-        raise SiteConfigError("rollback management site is invalid")
+    if site_before is not None:
+        # The attempt's own baseline, or a refusal that names it: a missing or
+        # unreadable baseline never falls back to the current site, which
+        # carries the failed attempt's release fields.
+        document = load_rollback_baseline(site_before)
+    else:
+        # The read-only status baseline judges the site as it stands.
+        try:
+            document = yaml.safe_load(site_file.read_text(encoding="utf-8"))
+        except (OSError, yaml.YAMLError) as exc:
+            raise SiteConfigError("cannot read the rollback management site") from exc
+        if not isinstance(document, dict) or not isinstance(document.get("spec"), dict):
+            raise SiteConfigError("rollback management site is invalid")
     source_manifest = find_previous_release_manifest(site_file.parent, previous)
     repository_root = management_repository_root or manifest_repository_root(
         source_manifest
@@ -490,9 +500,24 @@ def reconcile_rollback_management(
         raise SiteConfigError(
             f"rolled-back previous release_id is malformed: {release_id!r}"
         )
-    management_manifest = (
-        site_file.parent / "rollback-management" / release_id / "release.status.json"
+    management_dir = site_file.parent / "rollback-management" / release_id
+    management_manifest = management_dir / "release.status.json"
+    # Membership guard, before anything is written: the baseline's cluster set
+    # must be the membership the engine committed. A stale baseline (written
+    # before a later join or remove) is refused here by name instead of being
+    # committed by the sync-state that follows (live incident: a one-cluster
+    # baseline de-registered a joined cluster).
+    baseline_path = site_before if site_before is not None else site_file
+    baseline_document = (
+        load_rollback_baseline(site_before) if site_before is not None else current
     )
+    membership = require_baseline_membership(
+        baseline_document,
+        live_state,
+        baseline_path=baseline_path,
+        site_file=site_file,
+    )
+    baseline_sha256 = hashlib.sha256(baseline_path.read_bytes()).hexdigest()
     document, admin_config, repository_root = rollback_management_document(
         site_file,
         live_state,
@@ -505,6 +530,17 @@ def reconcile_rollback_management(
         site_file.parent,
         config=admin_config,
         source=source,
+    )
+    write_json_atomic(
+        management_dir / MEMBERSHIP_EVIDENCE_FILE,
+        {
+            **membership,
+            "baseline": str(baseline_path),
+            "baseline_sha256": baseline_sha256,
+            "site_file": str(site_file),
+            "source": source,
+            "recorded_at": datetime.now(UTC).isoformat(),
+        },
     )
     return repository_root
 

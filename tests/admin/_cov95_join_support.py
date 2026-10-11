@@ -118,6 +118,12 @@ class JoinScenario(CommandRunner):
         self.discovery_error = None
         self.namespace_read_override = None
         self.missing_namespaces: set[str] = set()
+        # Secret documents the reclaim proof reads (``kubectl get secret -o
+        # json``): ``connection_secrets[context]`` is the GPU cluster's
+        # ``gpu-fault-regional-connection``; ``registry_secret`` is the CPU
+        # cluster's ``gpu-fault-regional-clusters``. Absent by default.
+        self.connection_secrets: dict[str, dict] = {}
+        self.registry_secret: dict | None = None
         self.lock = RLock()
         self.registry = JoinRegistry(self)
         self.map_kubectl = FakeKubectl()
@@ -234,6 +240,20 @@ class JoinScenario(CommandRunner):
                     "CPU credential read lost private capture"
                 )
                 return base64.b64encode(b"f" * 64).decode()
+            if "gpu-fault-regional-connection" in arguments:
+                # The data-plane connection Secret of one GPU cluster, as the
+                # reclaim proof reads it: a Secret document per context, or
+                # nothing where the data plane is not installed.
+                assert options.get("sensitive"), (
+                    "data-plane credential read lost private capture"
+                )
+                document = self.connection_secrets.get(context)
+                return json.dumps(document) if document else ""
+            if "gpu-fault-regional-clusters" in arguments:
+                assert options.get("sensitive"), (
+                    "regional registry read lost private capture"
+                )
+                return json.dumps(self.registry_secret) if self.registry_secret else ""
             return ""
         if "get" in arguments and "nodes" in arguments:
             suffix = context.rsplit("-", 1)[-1]

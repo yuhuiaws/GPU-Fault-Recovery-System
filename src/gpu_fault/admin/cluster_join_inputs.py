@@ -46,17 +46,17 @@ def prepare_local_inputs(
     site_secure = request.site.source.parent / "secure"
     site_secure.mkdir(mode=0o700, parents=True, exist_ok=True)
     token_file = site_secure / f"{cluster_id}.token"
-    if token_file.exists() and not step_done(state, "LOCAL_INPUTS_STARTED"):
-        expected_token = {
-            "path": str(token_file),
-            "cluster_id": cluster_id,
-            "eks_arn": target.eks_arn,
-            "hyperpod_arn": target.hyperpod_arn,
-        }
-        if state.get("retained_cluster_token") != expected_token:
-            raise join.JoinTargetIdentityError(
-                "existing cluster token has no matching join ownership"
-            )
+    reclaimed = _bind_existing_token(
+        request,
+        runner=runner,
+        target=target,
+        cluster_id=cluster_id,
+        token_file=token_file,
+        gpu_kubeconfig=gpu_kubeconfig,
+        state_dir=state_dir,
+        state_path=state_path,
+        state=state,
+    )
     alias_replaced: dict[str, Any] | None = None
     if not step_done(state, "LOCAL_INPUTS_STARTED") and gpu_kubeconfig.is_file():
         contexts = runner.run(
@@ -99,6 +99,11 @@ def prepare_local_inputs(
     )
     if alias_replaced is not None:
         local["kubeconfig_alias_replaced"] = alias_replaced
+    if reclaimed is not None and reclaimed.get("namespace_uid"):
+        # The committed join created the namespace that still exists on the
+        # cluster; the probe below accepts it only under the recorded UID.
+        local.setdefault("namespace_uid", str(reclaimed["namespace_uid"]))
+        local["reclaimed_cluster_token"] = True
     complete_step(state_path, state, "LOCAL_INPUTS_STARTED", local)
     gpu_kubeconfig.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
     with join._KUBECONFIG_THREAD_LOCK:
@@ -194,6 +199,69 @@ def prepare_local_inputs(
             "nodes": nodes,
             "node_uids": node_uids,
         },
+    )
+
+
+def _bind_existing_token(
+    request: JoinClusterRequest,
+    *,
+    runner: CommandRunner,
+    target: ClusterIdentity,
+    cluster_id: str,
+    token_file: Path,
+    gpu_kubeconfig: Path,
+    state_dir: Path,
+    state_path: Path,
+    state: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Refuse an orphaned cluster token, or reclaim it on explicit consent.
+
+    A token file the journal does not own is refused as before. With
+    ``--reclaim-cluster-token`` the token is adopted only on proof -- the
+    committed join journal, the cluster's data plane and the control plane
+    (``cluster_join_reclaim``) -- and the proof record is returned so the
+    caller seeds its local inputs with the committed namespace UID; any missing
+    proof refuses exactly like the ownership check. ``None`` when nothing was
+    reclaimed.
+    """
+
+    if step_done(state, "LOCAL_INPUTS_STARTED"):
+        return None
+    reclaim = bool(getattr(request, "reclaim_cluster_token", False))
+    expected_token = {
+        "path": str(token_file),
+        "cluster_id": cluster_id,
+        "eks_arn": target.eks_arn,
+        "hyperpod_arn": target.hyperpod_arn,
+    }
+    if not token_file.exists():
+        if reclaim:
+            raise join.JoinTargetIdentityError(
+                f"--reclaim-cluster-token: there is no cluster token to reclaim at "
+                f"{token_file}; run join-cluster without the flag"
+            )
+        return None
+    if state.get("retained_cluster_token") == expected_token:
+        return None
+    if not reclaim:
+        raise join.JoinTargetIdentityError(
+            "existing cluster token has no matching join ownership; a cluster "
+            "whose site membership was lost is re-attached with join-cluster "
+            "--reclaim-cluster-token, which adopts the token only on proof"
+        )
+    from gpu_fault.admin.cluster_join_reclaim import reclaim_cluster_token
+
+    return reclaim_cluster_token(
+        request,
+        runner=runner,
+        target=target,
+        cluster_id=cluster_id,
+        token_file=token_file,
+        gpu_kubeconfig=gpu_kubeconfig,
+        binding=expected_token,
+        state_dir=state_dir,
+        state_path=state_path,
+        state=state,
     )
 
 

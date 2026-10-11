@@ -43,6 +43,10 @@ class JoinClusterRequest:
     #: Alternative to ``node_selector``: the EKS managed node group whose
     #: nodes are the GPU nodes (``eks.amazonaws.com/nodegroup=<name>``).
     gpu_nodegroup: str | None = None
+    #: ``--reclaim-cluster-token``: re-attach a cluster whose site membership
+    #: was lost by adopting its existing token file, on proof
+    #: (``cluster_join_reclaim``). Without it an orphaned token is refused.
+    reclaim_cluster_token: bool = False
 
     @property
     def requested_node_selector(self) -> str | None:

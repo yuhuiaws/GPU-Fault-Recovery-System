@@ -481,6 +481,17 @@ to equal HEAD with a clean working tree, otherwise the build regenerates and ove
 Secret backups needed for rollback are kept at commit until the next transaction commits, so the rollback of a committed release can
 find its own backups. After the engine finishes, the command aligns the management side like an automatic rollback (changing `site.yaml` back
 and `sync-state`), and `gpu-fault-admin status` then judges health by the rolled-back online version.
+The alignment restores the release-level fields (manifest, Agent config digest, Runtime Profile, images) from the
+attempt's **rollback baseline** `release-deploy/<release-id>/site.before.yaml`, which every attempt records from the
+committed `site.yaml` when it starts (a `config` re-roll of the live release included). The cluster membership that
+baseline carries (`spec.clusters`, per-cluster Runtime Profile pins included) is compared with the membership the engine
+committed (`cluster_ids` of the live release state) before anything is written: a difference refuses the rewrite and
+names the clusters it would drop or add (`rollback refused: the rollback baseline ... lists clusters [...] but the
+committed release state ... lists [...]`), and so does a missing or unreadable baseline -- the engine stays rolled back,
+`site.yaml` keeps its membership, and rerunning the same `deploy`/`config` command records a fresh baseline before it
+starts. A rollback therefore never de-registers a cluster that was joined after the release was first deployed; the
+agreeing sets are kept as `rollback-management/<release-id>/membership-baseline.json`. A cluster that an earlier
+rollback did drop is re-attached as described in §5.0.3.
 
 Running only `kubectl rollout undo` does not restore the release metadata, installer bundle or node
 artefacts and does not constitute a regional rollback.
@@ -1643,6 +1654,43 @@ the operator identity and the executor role already hold it; the control-plane r
   `clusters[].runtimeProfile` in the site file), or the site profile without one; an override whose digest is not yet
   computed refuses the binding until the profile approval completes. Acceptance cases BOOT-018 / AUTH-015 compare
   Agents against the same per-cluster pin.
+
+#### 5.0.3 Re-attaching a cluster after a rollback or operator error removed it from the site
+
+Symptom: one GPU cluster's Executors get HTTP 403 `regional cluster is not registered`, its collectors buffer to
+their outbox, `status` reports its collector readiness false, and `site.yaml` no longer lists the cluster although
+its data plane, node Agents, IAM roles, kubeconfig context and the token file
+`<state-dir>/secure/<cluster-id>.token` all still exist (a rollback rebuilt the site from a stale baseline before the
+guard above existed, or the site was edited). `join-cluster` for that cluster then exits 2 with
+`existing cluster token has no matching join ownership` and leaves its journal in `BLOCKED_IDENTITY`;
+`remove-cluster` needs the cluster in the site. Do not edit `site.yaml`, the journals or the token file by hand.
+
+```bash
+gpu-fault-admin join-cluster --state-dir <state-dir> \
+  --gpu-cluster-arn <EKS cluster ARN of the lost cluster> \
+  --reclaim-cluster-token
+```
+
+`--reclaim-cluster-token` re-attaches exactly one cluster (one `--gpu-cluster-arn`) and adopts the existing token
+only on three proofs, all read before anything is written:
+
+1. identity -- a committed join journal of this site (`join-cluster/<id>/state.json` or an archived
+   `state.attempt-NNN.json` next to it) records this token file for this cluster id with the same EKS and HyperPod
+   ARNs;
+2. data plane -- the `gpu-fault-regional-connection` Secret on the cluster, the one the Executor and node Agents read,
+   carries the same token (compared by SHA-256, never printed or journaled) and the same cluster id;
+3. control plane -- the regional registry Secret `gpu-fault-regional-clusters` (current or previous payload) or the
+   Aurora installation registry still records the cluster id; a registry row naming another EKS cluster or another
+   token refuses.
+
+Any missing proof exits 2 with `join-cluster --reclaim-cluster-token refused for <cluster-id>: <reason>` and leaves
+the journal as it was. When all three hold, the journal records `retained_cluster_token` (the binding an ordinary
+retry honours) and `reclaimed_cluster_token` (digests, sources, timestamps, the committed namespace UID), and the
+ordinary join continues: the token file is kept as it is, the data plane is released again for the cluster, the
+registry and `site.yaml` take the cluster back, `sync-state` commits it. Expect `"phase": "COMPLETED"`; the cluster's
+collectors replay their outbox and `status` reports them ready again. Without the flag the refusal stays; the flag with
+no orphaned token file is refused too; a rerun after a successful reclaim may carry the flag again (the journal already
+owns the token).
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 

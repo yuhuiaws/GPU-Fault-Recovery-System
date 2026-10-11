@@ -35,7 +35,11 @@ from gpu_fault.admin.bootstrap_common import (
 )
 from gpu_fault.admin.cluster_batch_join import join_clusters
 from gpu_fault.admin.cluster_join import join_cluster
-from gpu_fault.admin.cli_join import add_eks_managed_arguments, run_join_cluster
+from gpu_fault.admin.cli_join import (
+    add_eks_managed_arguments,
+    add_join_recovery_arguments,
+    run_join_cluster,
+)
 from gpu_fault.admin.cluster_removal import (
     CONFIRMATION as REMOVE_CLUSTER_CONFIRMATION,
     RemoveClusterRequest,
@@ -547,6 +551,7 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     add_eks_managed_arguments(join)
+    add_join_recovery_arguments(join)
     join.add_argument(
         "--allowed-namespace",
         action="append",

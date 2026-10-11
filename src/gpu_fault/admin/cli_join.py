@@ -18,7 +18,28 @@ from gpu_fault.admin.cluster_join_types import site_allowed_namespaces
 from gpu_fault.admin.profile_approval import approve_profile_plan_inline
 from gpu_fault.admin.site import RenderedSite, SiteConfigError
 
-__all__ = ["add_eks_managed_arguments", "run_join_cluster"]
+__all__ = [
+    "add_eks_managed_arguments",
+    "add_join_recovery_arguments",
+    "run_join_cluster",
+]
+
+
+def add_join_recovery_arguments(parser: argparse.ArgumentParser) -> None:
+    """Flags that re-attach a cluster the site lost; ``join-cluster`` only."""
+
+    parser.add_argument(
+        "--reclaim-cluster-token",
+        action="store_true",
+        help=(
+            "re-attach one cluster whose site membership was lost (a rollback "
+            "rebuilt the site from a stale baseline, or the site was edited) by "
+            "adopting its existing token file; refused unless a committed join "
+            "journal records the token for this cluster, the cluster's data plane "
+            "holds the same token and the control plane still records the cluster "
+            "id. Takes a single --gpu-cluster-arn"
+        ),
+    )
 
 
 def add_eks_managed_arguments(parser: argparse.ArgumentParser) -> None:
@@ -103,6 +124,12 @@ def run_join_cluster(
         raise SiteConfigError(
             "join-cluster --cluster-id cannot be shared by multiple GPU clusters"
         )
+    reclaim_cluster_token = bool(getattr(arguments, "reclaim_cluster_token", False))
+    if reclaim_cluster_token and len(cluster_arns) > 1:
+        raise SiteConfigError(
+            "--reclaim-cluster-token re-attaches one cluster; pass a single "
+            "--gpu-cluster-arn"
+        )
     allowed_namespaces = tuple(arguments.allowed_namespace) or site_allowed_namespaces(
         site
     )
@@ -114,6 +141,7 @@ def run_join_cluster(
             allowed_namespaces=allowed_namespaces,
             node_selector=getattr(arguments, "node_selector", None),
             gpu_nodegroup=getattr(arguments, "gpu_nodegroup", None),
+            reclaim_cluster_token=reclaim_cluster_token,
         )
         for cluster_arn in cluster_arns
     )

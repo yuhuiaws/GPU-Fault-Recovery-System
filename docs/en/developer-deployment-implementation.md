@@ -684,6 +684,28 @@ previous release's manifest path; a later rollback follows `management_baseline.
 the immutable manifest that built the artifacts (falling back to the copy's absolute wheel path to infer
 the repository root only when the source is gone) and never treats the copy itself as the source.
 
+The document the alignment restores is the attempt's **rollback baseline**,
+`release-deploy/<release-id>/site.before.yaml` (`gpu_fault.admin.rollback_baseline`). `prepare_site_release`
+records the committed `site.yaml` there at the start of every attempt whose previous attempt is committed or fully
+rolled back; a `config` re-roll reuses the live release's directory, so a baseline written once at the first deploy
+went stale as clusters were joined or removed afterwards (live incident: a one-cluster baseline de-registered a
+cluster joined later). An attempt that resumes a transaction still in flight, or that follows a rollback whose
+management alignment did not run through (`rollback.status` FAILED / ALIGNMENT_FAILED / CLEANUP_PENDING in the
+previous record), keeps the baseline it started from; a replaced baseline is kept as
+`site.before.superseded-NNN.yaml`. The plan and the state record the decision under `rollback_baseline` (`action`:
+`written` / `refreshed` / `kept`, with the reason). Membership keeps one source of truth -- `site.yaml` as committed
+by `join-cluster` / `remove-cluster`, mirrored into the engine state's `cluster_ids` by `sync-state` -- so neither
+command writes into the release directory. Instead `reconcile_rollback_management` compares the baseline's
+`spec.clusters` with the committed `cluster_ids` (falling back to the previous snapshot's `clusters`) before it writes
+anything, refuses a difference naming the clusters it would drop or add, refuses a missing or unreadable baseline
+instead of falling back to the current site (which carries the failed attempt's release fields), and records the
+agreeing sets with both sides' per-cluster Runtime Profile pins in
+`rollback-management/<release-id>/membership-baseline.json`. The pins are recorded, not judged: a deploy repairs a
+cluster's lost override before its release runs, and the engine restores the committed pins through the registry.
+Only the read-only status baseline (`materialized_rollback_status_site`) reads the current site. The
+`site.before.yaml` of `remove-cluster` lives in that attempt's own directory (`remove-cluster/attempts/<attempt-id>/`)
+and is written before the attempt rewrites the site; it is audit evidence, never a rollback source.
+
 When rolling back to a single-wheel release of **release manifest schema v1** (not PostgreSQL
 schema v1), the old Agent compatibility digest is equivalent to the old artifact SHA; the old process's environment
 variable allowlist does not recognize component pins, so
@@ -1469,6 +1491,13 @@ stops, and new objects may not be cleaned up with old evidence. Network mutation
 landed, cleanup may not be marked successful. `ROLLBACK_STARTED/ROLLBACK_FAILED` must first continue the original compensation;
 when the remote compensation is complete but the local credential cleanup is not, only the local finishing continues. A cluster token still referenced by the rolled-back registry
 is kept at a controlled path bound to the cluster/EKS/HyperPod identity; it may not be deleted and a new token auto-generated to reuse the old registration;
+when the site lost the cluster's membership while its token, data plane and registrations survived,
+`join-cluster --reclaim-cluster-token` (`cluster_join_reclaim`) adopts the token only on three proofs -- a committed
+join journal binding the token file to the cluster/EKS/HyperPod identity, the cluster's `gpu-fault-regional-connection`
+Secret holding the same token (SHA-256) and cluster id, and the regional registry Secret or installation registry still
+recording the cluster id -- journals them as `reclaimed_cluster_token` together with `retained_cluster_token`, seeds the
+committed namespace UID, and then runs the unchanged join; any missing proof refuses and the flag is refused where there is
+no orphaned token;
 the temporary fleet master is not
 kept as ordinary evidence. `SUPERVISION_LOST` forbids automatic retry or compensation; commands not proven stopped must be explicitly reconciled first.
 A resume after `ACTIVATION_STARTED` allows the old verify to exceed 15 minutes, but still checks the original bindings and completes the ACTIVE terminal

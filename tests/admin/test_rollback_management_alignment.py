@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import replace
 from pathlib import Path
@@ -84,6 +85,9 @@ def _fixture(tmp_path: Path):
                         "dcgmExporter": "candidate-dcgm",
                         "adot": "candidate-adot",
                     },
+                    # The committed membership: the one cluster the engine's
+                    # previous snapshot captured below.
+                    "clusters": [{"clusterId": "gpu-a"}],
                 },
             },
             sort_keys=False,
@@ -94,6 +98,7 @@ def _fixture(tmp_path: Path):
     live_state = {
         "phase": "rolled-back",
         "rollback_result": {"status": "PASSED"},
+        "cluster_ids": ["gpu-a"],
         "previous": {
             "release_id": "old-release",
             "release_delivery_sha256": "d" * 64,
@@ -678,3 +683,174 @@ def test_a_recorded_management_manifest_resolves_to_its_immutable_source(
     assert document["spec"]["release"]["manifest"] == str(destination), (
         "the site must point at the rewritten management copy"
     )
+
+
+# --- the rollback keeps the committed cluster membership ----------------------
+
+
+def _baseline_with_clusters(tmp_path: Path, site: Path, cluster_ids: list[str]) -> Path:
+    """An attempt's site.before.yaml: the site document with another membership."""
+
+    document = yaml.safe_load(site.read_text(encoding="utf-8"))
+    document["spec"]["clusters"] = [{"clusterId": item} for item in cluster_ids]
+    baseline = tmp_path / "release-deploy" / "release-x" / "site.before.yaml"
+    baseline.parent.mkdir(parents=True)
+    baseline.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    return baseline
+
+
+def test_rollback_refuses_a_baseline_that_would_drop_a_committed_cluster(
+    tmp_path: Path,
+) -> None:
+    """The live incident: a one-cluster baseline written at the first deploy,
+    a cluster joined afterwards, a failed re-roll of the same release. The
+    engine committed two clusters; restoring the stale baseline must refuse
+    by name instead of de-registering the joined cluster."""
+
+    site, _manifest, live_state, _admin_config = _fixture(tmp_path)
+    live_state["cluster_ids"] = ["gpu-a", "hp-cluster-b"]
+    live_state["previous"]["clusters"] = {}
+    baseline = _baseline_with_clusters(tmp_path, site, ["gpu-a"])
+    before = site.read_bytes()
+
+    with pytest.raises(SiteConfigError, match="rollback refused") as failure:
+        reconcile_rollback_management(
+            site, live_state, site_before=baseline, source="rollback:test"
+        )
+
+    message = str(failure.value)
+    assert "drop hp-cluster-b" in message, message
+    assert str(baseline) in message and "cluster_ids" in message, (
+        "the refusal names the baseline and where the committed set was read"
+    )
+    assert site.read_bytes() == before, "a refused rollback rewrites nothing"
+    assert not (tmp_path / "rollback-management").exists(), (
+        "no management manifest or evidence is written on refusal"
+    )
+
+
+def test_rollback_refuses_a_baseline_that_would_add_an_unknown_cluster(
+    tmp_path: Path,
+) -> None:
+    site, _manifest, live_state, _admin_config = _fixture(tmp_path)
+    live_state["cluster_ids"] = ["gpu-a"]
+    baseline = _baseline_with_clusters(tmp_path, site, ["gpu-a", "ghost"])
+
+    with pytest.raises(SiteConfigError, match="add ghost"):
+        reconcile_rollback_management(
+            site, live_state, site_before=baseline, source="rollback:test"
+        )
+
+
+def test_rollback_refuses_without_committed_membership_evidence(tmp_path: Path) -> None:
+    site, _manifest, live_state, _admin_config = _fixture(tmp_path)
+    live_state.pop("cluster_ids")
+    live_state["previous"].pop("clusters")
+    baseline = _baseline_with_clusters(tmp_path, site, ["gpu-a"])
+
+    with pytest.raises(SiteConfigError, match="records no cluster membership"):
+        reconcile_rollback_management(
+            site, live_state, site_before=baseline, source="rollback:test"
+        )
+
+
+def test_rollback_falls_back_to_the_previous_snapshot_membership(
+    tmp_path: Path,
+) -> None:
+    """A state written before ``cluster_ids`` existed still proves membership
+    through the previous snapshot's cluster captures."""
+
+    site, _manifest, live_state, _admin_config = _fixture(tmp_path)
+    live_state.pop("cluster_ids")
+    baseline = _baseline_with_clusters(tmp_path, site, ["gpu-a", "hp-cluster-b"])
+
+    with pytest.raises(SiteConfigError, match="previous.clusters.*add hp-cluster-b"):
+        reconcile_rollback_management(
+            site, live_state, site_before=baseline, source="rollback:test"
+        )
+
+
+@pytest.mark.parametrize("problem", ["missing", "unparseable", "not-a-site"])
+def test_rollback_refuses_a_missing_or_unreadable_baseline_instead_of_falling_back(
+    tmp_path: Path, problem: str
+) -> None:
+    site, _manifest, live_state, _admin_config = _fixture(tmp_path)
+    baseline = _baseline_with_clusters(tmp_path, site, ["gpu-a"])
+    if problem == "missing":
+        baseline.unlink()
+        expected = "does not exist"
+    elif problem == "unparseable":
+        baseline.write_text("spec: [unterminated", encoding="utf-8")
+        expected = "cannot read the rollback baseline"
+    else:
+        baseline.write_text("- not\n- a site\n", encoding="utf-8")
+        expected = "not a RegionalSite document"
+    before = site.read_bytes()
+
+    with pytest.raises(SiteConfigError, match=expected) as failure:
+        reconcile_rollback_management(
+            site, live_state, site_before=baseline, source="rollback:test"
+        )
+
+    assert str(baseline) in str(failure.value), "the refusal names the baseline"
+    assert site.read_bytes() == before
+    with pytest.raises(SiteConfigError, match=expected):
+        rollback_management_document(site, live_state, site_before=baseline)
+
+
+def test_rollback_restores_a_baseline_whose_membership_is_the_committed_one(
+    tmp_path: Path,
+) -> None:
+    site, _manifest, live_state, _admin_config = _fixture(tmp_path)
+    live_state["cluster_ids"] = ["gpu-a", "hp-cluster-b"]
+    live_state["cluster_runtime_profiles"] = {
+        "hp-cluster-b": {"version": "hyperpod-v1", "agent_config_digest": "e" * 64}
+    }
+    baseline = _baseline_with_clusters(tmp_path, site, ["gpu-a", "hp-cluster-b"])
+    document = yaml.safe_load(baseline.read_text(encoding="utf-8"))
+    document["spec"]["clusters"][1]["runtimeProfile"] = {"version": "hyperpod-v1"}
+    baseline.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+
+    reconcile_rollback_management(
+        site, live_state, site_before=baseline, source="rollback:test"
+    )
+
+    restored = yaml.safe_load(site.read_text(encoding="utf-8"))
+    assert [item["clusterId"] for item in restored["spec"]["clusters"]] == [
+        "gpu-a",
+        "hp-cluster-b",
+    ], "the baseline's membership is restored, both clusters included"
+    assert restored["spec"]["release"]["manifest"].endswith("release.status.json"), (
+        "the release fields still come from the previous release"
+    )
+    evidence = json.loads(
+        (
+            tmp_path
+            / "rollback-management"
+            / "old-release"
+            / "membership-baseline.json"
+        ).read_text(encoding="utf-8")
+    )
+    assert evidence["baseline_cluster_ids"] == ["gpu-a", "hp-cluster-b"]
+    assert evidence["committed_cluster_ids"] == ["gpu-a", "hp-cluster-b"]
+    assert evidence["committed_source"] == "cluster_ids"
+    assert evidence["baseline_cluster_profile_pins"] == {"hp-cluster-b": "hyperpod-v1"}
+    assert evidence["live_cluster_profile_pins"] == {"hp-cluster-b": "hyperpod-v1"}
+    assert evidence["baseline"] == str(baseline)
+    assert (
+        evidence["baseline_sha256"] == hashlib.sha256(baseline.read_bytes()).hexdigest()
+    )
+    assert evidence["source"] == "rollback:test"
+
+
+def test_status_baseline_without_a_recorded_baseline_still_reads_the_site(
+    tmp_path: Path,
+) -> None:
+    """``status`` materializes a read-only baseline from the site as it stands;
+    only the writing rollback demands the attempt's recorded baseline."""
+
+    site, _manifest, live_state, _admin_config = _fixture(tmp_path)
+
+    document, _config, _root = rollback_management_document(site, live_state)
+
+    assert [item["clusterId"] for item in document["spec"]["clusters"]] == ["gpu-a"]
