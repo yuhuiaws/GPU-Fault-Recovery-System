@@ -33,11 +33,7 @@ VALUES = {
     "state_dir": "/private/state dir/second",
     "admin_email": ADMIN_EMAIL,
 }
-MIXED_VALUES = {
-    **VALUES,
-    "gpu_arns": [GPU_ARN, EKS_GPU_ARN],
-    "eks_flag": ("--gpu-nodegroup", "gpu-p5en-efa-spot-node-group"),
-}
+MIXED_VALUES = {**VALUES, "gpu_arns": [GPU_ARN, EKS_GPU_ARN]}
 
 
 def _sha256(value: str) -> str:
@@ -120,22 +116,24 @@ def test_rendering_substitutes_only_the_four_placeholders() -> None:
     )
 
 
-def test_real_readme_documents_the_repeated_gpu_flag_and_the_eks_selector() -> None:
+def test_real_readme_documents_the_repeated_gpu_flag_and_the_ownership_label() -> None:
     procedure = readme.parse_readme(README_TEXT)
 
     assert procedure.repeat_gpu_arn_documented is True, (
         "the README deployment section must say --gpu-cluster-arn repeats per cluster"
     )
-    assert procedure.documented_eks_flags == frozenset(
-        {"--gpu-nodegroup", "--node-selector"}
-    ), "the README deployment section must document the plain-EKS selector flags"
+    assert procedure.ownership_label_documented is True, (
+        "the README deployment section must state the ownership label and site-id verb"
+    )
+    section = readme.deploy_section(README_TEXT)
+    assert "--gpu-nodegroup" not in section and "--node-selector" not in section, (
+        "the retired selector flags must not be documented any more"
+    )
 
 
-def test_rendering_a_mixed_site_repeats_the_gpu_line_and_adds_the_documented_flag() -> (
-    None
-):
+def test_rendering_a_mixed_site_repeats_the_gpu_line_and_adds_nothing_else() -> None:
     """A HyperPod + plain-EKS site: one --gpu-cluster-arn line per cluster, in the
-    operator's order, then the plain-EKS flag the README documents; nothing else."""
+    operator's order; the node scope is on the node groups, not on the command."""
     procedure = readme.parse_readme(README_TEXT)
 
     rendered = readme.render_deploy_command(procedure.deploy_block, **MIXED_VALUES)
@@ -149,22 +147,20 @@ def test_rendering_a_mixed_site_repeats_the_gpu_line_and_adds_the_documented_fla
         GPU_ARN,
         "--gpu-cluster-arn",
         EKS_GPU_ARN,
-        "--gpu-nodegroup",
-        "gpu-p5en-efa-spot-node-group",
         "--state-dir",
         VALUES["state_dir"],
         "--admin-email",
         ADMIN_EMAIL,
-    ], "the GPU line is repeated per cluster and the documented flag follows it"
-    assert rendered.count("\n") == procedure.deploy_block.count("\n") + 2, (
-        "two lines were added: the second cluster and the flag"
+    ], "the GPU line is repeated per cluster and nothing else is added"
+    assert rendered.count("\n") == procedure.deploy_block.count("\n") + 1, (
+        "one line was added: the second cluster"
     )
     continued = [line for line in rendered.splitlines()[:-1]]
     assert all(line.rstrip().endswith("\\") for line in continued), (
         "every line but the last keeps the README's continuation"
     )
     redacted = readme.redacted_deploy_command(procedure.deploy_block, **MIXED_VALUES)
-    for secret in (CPU_ARN, GPU_ARN, EKS_GPU_ARN, "gpu-p5en-efa-spot-node-group"):
+    for secret in (CPU_ARN, GPU_ARN, EKS_GPU_ARN):
         assert secret not in redacted, f"{secret} appears in clear in the receipt"
         assert f"sha256:{_sha256(secret)}" in redacted
     assert readme.shell_words(redacted)[2::2] == readme.shell_words(rendered)[2::2], (
@@ -172,7 +168,7 @@ def test_rendering_a_mixed_site_repeats_the_gpu_line_and_adds_the_documented_fla
     )
 
 
-def test_readme_authority_is_required_for_repetition_and_the_eks_flag() -> None:
+def test_readme_authority_is_required_for_repetition_and_the_ownership_label() -> None:
     procedure = readme.parse_readme(README_TEXT)
     silent = readme.ReadmeProcedure(
         readme_sha256=procedure.readme_sha256,
@@ -180,25 +176,26 @@ def test_readme_authority_is_required_for_repetition_and_the_eks_flag() -> None:
         deploy_block=procedure.deploy_block,
         executed_lines=procedure.executed_lines,
         skipped_verification_lines=procedure.skipped_verification_lines,
+        ownership_label_documented=True,
+    )
+    unlabelled = readme.ReadmeProcedure(
+        readme_sha256=procedure.readme_sha256,
+        build_block=procedure.build_block,
+        deploy_block=procedure.deploy_block,
+        executed_lines=procedure.executed_lines,
+        skipped_verification_lines=procedure.skipped_verification_lines,
+        repeat_gpu_arn_documented=True,
     )
 
-    readme.require_readme_authority(procedure, gpu_arns=[GPU_ARN], eks_flag=None)
-    readme.require_readme_authority(
-        procedure, gpu_arns=MIXED_VALUES["gpu_arns"], eks_flag=MIXED_VALUES["eks_flag"]
-    )
-    readme.require_readme_authority(silent, gpu_arns=[GPU_ARN], eks_flag=None)
+    readme.require_readme_authority(procedure, gpu_arns=[GPU_ARN])
+    readme.require_readme_authority(procedure, gpu_arns=MIXED_VALUES["gpu_arns"])
+    readme.require_readme_authority(silent, gpu_arns=[GPU_ARN])
     with pytest.raises(readme.ReadmeProcedureError, match="repeated for several"):
-        readme.require_readme_authority(
-            silent, gpu_arns=MIXED_VALUES["gpu_arns"], eks_flag=None
-        )
-    with pytest.raises(readme.ReadmeProcedureError, match="does not document"):
-        readme.require_readme_authority(
-            silent, gpu_arns=[GPU_ARN], eks_flag=("--gpu-nodegroup", "g")
-        )
-    with pytest.raises(readme.ReadmeProcedureError, match="does not document"):
-        readme.require_readme_authority(
-            procedure, gpu_arns=[GPU_ARN], eks_flag=("--gpu-selector", "g")
-        )
+        readme.require_readme_authority(silent, gpu_arns=MIXED_VALUES["gpu_arns"])
+    with pytest.raises(
+        readme.ReadmeProcedureError, match="does not state that the GPU"
+    ):
+        readme.require_readme_authority(unlabelled, gpu_arns=[GPU_ARN])
 
 
 def test_real_readme_states_the_one_provider_first_deploy_and_the_join() -> None:
@@ -228,27 +225,15 @@ def test_readme_authority_is_required_for_the_in_stage_join() -> None:
         executed_lines=procedure.executed_lines,
         skipped_verification_lines=procedure.skipped_verification_lines,
         repeat_gpu_arn_documented=True,
-        documented_eks_flags=frozenset({"--gpu-nodegroup"}),
+        ownership_label_documented=True,
     )
 
     readme.require_readme_authority(
-        procedure,
-        gpu_arns=[GPU_ARN],
-        eks_flag=None,
-        joined_arns=[EKS_GPU_ARN],
-        joined_eks_flag="--gpu-nodegroup",
+        procedure, gpu_arns=[GPU_ARN], joined_arns=[EKS_GPU_ARN]
     )
     with pytest.raises(readme.ReadmeProcedureError, match="one provider first"):
         readme.require_readme_authority(
-            silent, gpu_arns=[GPU_ARN], eks_flag=None, joined_arns=[EKS_GPU_ARN]
-        )
-    with pytest.raises(readme.ReadmeProcedureError, match="does not document"):
-        readme.require_readme_authority(
-            procedure,
-            gpu_arns=[GPU_ARN],
-            eks_flag=None,
-            joined_arns=[EKS_GPU_ARN],
-            joined_eks_flag="--gpu-selector",
+            silent, gpu_arns=[GPU_ARN], joined_arns=[EKS_GPU_ARN]
         )
 
 
@@ -278,7 +263,7 @@ def test_readme_authority_for_a_plain_eks_first_deploy_requires_its_statements()
         executed_lines=procedure.executed_lines,
         skipped_verification_lines=procedure.skipped_verification_lines,
         repeat_gpu_arn_documented=True,
-        documented_eks_flags=procedure.documented_eks_flags,
+        ownership_label_documented=True,
         mixed_site_join_documented=True,
         plain_eks_first_deploy_gaps=("the eks-v1 Runtime Profile start",),
     )
@@ -286,36 +271,37 @@ def test_readme_authority_for_a_plain_eks_first_deploy_requires_its_statements()
     readme.require_readme_authority(
         procedure,
         gpu_arns=[EKS_GPU_ARN],
-        eks_flag=MIXED_VALUES["eks_flag"],
         joined_arns=[GPU_ARN],
         first_provider="eks-managed",
     )
     readme.require_readme_authority(
-        lacking, gpu_arns=[GPU_ARN], eks_flag=None, first_provider="hyperpod"
+        lacking, gpu_arns=[GPU_ARN], first_provider="hyperpod"
     )
     with pytest.raises(readme.ReadmeProcedureError, match="eks-v1 Runtime Profile"):
         readme.require_readme_authority(
-            lacking,
-            gpu_arns=[EKS_GPU_ARN],
-            eks_flag=MIXED_VALUES["eks_flag"],
-            first_provider="eks-managed",
+            lacking, gpu_arns=[EKS_GPU_ARN], first_provider="eks-managed"
         )
     with pytest.raises(
         readme.ReadmeProcedureError, match="unknown GPU cluster provider"
     ):
         readme.require_readme_authority(
-            procedure, gpu_arns=[GPU_ARN], eks_flag=None, first_provider="slurm"
+            procedure, gpu_arns=[GPU_ARN], first_provider="slurm"
         )
 
 
 def test_deploy_section_authority_reads_only_the_deployment_section() -> None:
     text = README_TEXT.replace(
         "多个GPU集群重复传`--gpu-cluster-arn`", "多个GPU集群见下文"
-    ).replace("`--gpu-nodegroup <托管节点组名>`", "托管节点组名")
+    ).replace(
+        "`gpu-fault-admin site-id --cpu-cluster-arn <cpu-eks-or-hyperpod-arn>`",
+        "the site-id verb",
+    )
     section = readme.deploy_section(text)
     assert readme.repeat_gpu_arn_documented(section) is False
-    assert "--gpu-nodegroup" not in readme.documented_eks_flags(section)
-    assert "--node-selector" in readme.documented_eks_flags(section)
+    assert readme.ownership_label_documented(section) is False, (
+        "the statement needs both the label and the site-id verb in code font"
+    )
+    assert readme.ownership_label_documented(readme.deploy_section(README_TEXT)) is True
     with pytest.raises(readme.ReadmeProcedureError, match="lacks the heading"):
         readme.deploy_section(text.replace(readme.DEPLOY_HEADING, "## 部署"))
 
@@ -787,7 +773,8 @@ def test_run_executes_the_readme_procedure_in_a_clean_environment(
     assert len(lines) == 1, "one receipt line per attempt, written before the run"
     entry = json.loads(lines[0])["readme"]
     assert entry["attempt"] == 1 and entry["venv_preexisted"] is False
-    assert entry["gpu_cluster_count"] == 1 and entry["eks_flag"] is None
+    assert entry["gpu_cluster_count"] == 1 and "eks_flag" not in entry
+    assert entry["ownership_label_documented"] is True
     assert entry["repeat_gpu_arn_documented"] is True
     assert entry["source_commit"] == _git(repository, "rev-parse", "HEAD")
     script = tmp_path / "work/attempt-1" / readme.SCRIPT_NAME
@@ -814,7 +801,6 @@ def test_run_renders_the_first_provider_only_and_records_the_in_stage_join(
         receipt=receipt,
         parent_environment={**os.environ, "HOME": str(tmp_path)},
         joined_arns=[EKS_GPU_ARN],
-        joined_eks_flag="--gpu-nodegroup",
         first_provider="hyperpod",
     )
 
@@ -835,9 +821,8 @@ def test_run_renders_the_first_provider_only_and_records_the_in_stage_join(
     assert entry["gpu_cluster_count"] == 1, entry
     assert entry["joined_gpu_cluster_count"] == 1, entry
     assert entry["mixed_site_join_documented"] is True, entry
-    assert (
-        entry["eks_flag"] is None and entry["joined_eks_flag"] == "--gpu-nodegroup"
-    ), entry
+    assert entry["ownership_label_documented"] is True, entry
+    assert "eks_flag" not in entry and "joined_eks_flag" not in entry, entry
     assert entry["first_provider"] == "hyperpod", entry
     assert entry["plain_eks_first_deploy_documented"] is True, entry
     assert EKS_GPU_ARN not in receipt.read_text(encoding="utf-8"), "ARNs stay private"

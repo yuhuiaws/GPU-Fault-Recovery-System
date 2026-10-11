@@ -9,8 +9,7 @@
 #      it with the site-bound join-cluster (see "mixed sites" below)
 #   2  remove-cluster of every GPU cluster, one ARN at a time in the given
 #      order, ending in the zero-GPU-cluster steady state
-#   3  one join-cluster re-attaching every GPU cluster (a plain-EKS member's
-#      --gpu-nodegroup / --node-selector passed through as given)
+#   3  one join-cluster re-attaching every GPU cluster
 #   4  uninstall --cpu-cluster keep --reset-database
 #      (--aurora-final-snapshot retain|skip, default retain)
 #   5  cold first deploy again, into a second empty state directory, strictly
@@ -41,13 +40,22 @@
 # then runs one site-bound `join-cluster` per further provider.
 # That join stops for review of the provider's own Runtime Profile plan
 # (CLUSTER_PROFILE_NEW); the driver approves exactly that plan with
-# --approve-profile-plan and reruns the join. The plain-EKS selector flag goes
-# with the command that names the eks-managed clusters. A single-provider list
+# --approve-profile-plan and reruns the join. A single-provider list
 # runs byte for byte as before. A resumed stage 1/5 whose first deploy already
 # finished (site-ready, naming the first provider's clusters) does not deploy
 # again -- a second deploy is a release, not a cold build -- and continues with
 # the joins; a state directory whose recorded initial-deploy-request.json names
 # another GPU cluster set is refused (start over in a new empty directory).
+#
+# Node ownership. A GPU cluster's nodes are the node groups labelled
+# gpu-fault.io/control-plane=<site id> (EKS managed node group labels, HyperPod
+# instance group KubernetesConfig labels); deploy and join-cluster take no
+# selector flag and refuse a cluster without the label. Before stage 1, 3 and 5
+# act, the driver runs the product's own read of that precondition
+# (scripts/e2e/regional/boot029_node_scope.py): the site id the CPU cluster
+# derives and, per GPU cluster, the labelled node groups -- and stops the stage
+# with the product's refusal and the describe evidence when a cluster would be
+# refused, before any cold build or mutation.
 #
 # Every admin command runs in the foreground and the next stage starts only
 # after it has exited. The first failing stage stops the run and prints its
@@ -61,7 +69,6 @@ usage() {
   cat >&2 <<'USAGE'
 usage: admin-lifecycle-sequence.sh --state-dir DIR --cpu-cluster-arn ARN
          --gpu-cluster-arn ARN [--gpu-cluster-arn ARN ...]
-         [--gpu-nodegroup NODEGROUP | --node-selector SELECTOR  (plain-EKS members)]
          --admin-email EMAIL --repo CHECKOUT
          [--stage N] [--second-state-dir DIR] [--email-wait-minutes M  (stage 1 only)]
          [--previous-site-id ID] [--aurora-final-snapshot retain|skip]
@@ -71,7 +78,7 @@ USAGE
 }
 
 STATE_DIR="" CPU_ARN="" ADMIN_EMAIL="" REPO="" START_STAGE=1
-GPU_ARNS=() EKS_FLAG_NAME="" EKS_FLAG_VALUE=""
+GPU_ARNS=()
 SECOND_STATE_DIR="" EMAIL_WAIT=0 PREVIOUS_SITE_ID="" ISOLATED_BUILD_HOST=false
 AURORA_FINAL_SNAPSHOT=retain
 while [[ $# -gt 0 ]]; do
@@ -80,8 +87,8 @@ while [[ $# -gt 0 ]]; do
     --cpu-cluster-arn) CPU_ARN="$2"; shift 2 ;;
     --gpu-cluster-arn) [[ $# -ge 2 ]] || usage; GPU_ARNS+=("$2"); shift 2 ;;
     --gpu-nodegroup|--node-selector)
-      [[ $# -ge 2 && -z "$EKS_FLAG_NAME" ]] || usage
-      EKS_FLAG_NAME="$1"; EKS_FLAG_VALUE="$2"; shift 2 ;;
+      echo "$1 was retired: label the GPU node groups gpu-fault.io/control-plane=<site id> instead (gpu-fault-admin site-id)" >&2
+      usage ;;
     --admin-email) ADMIN_EMAIL="$2"; shift 2 ;;
     --repo) REPO="$2"; shift 2 ;;
     --stage) START_STAGE="$2"; shift 2 ;;
@@ -94,26 +101,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 [[ -n "$STATE_DIR" && -n "$CPU_ARN" && ${#GPU_ARNS[@]} -ge 1 && -n "$ADMIN_EMAIL" && -n "$REPO" ]] || usage
-[[ -z "$EKS_FLAG_NAME" || -n "$EKS_FLAG_VALUE" ]] || usage
-# The repeated flag for deploy/join-cluster, the per-ARN receipt arguments and
-# the plain-EKS selector pass-through, in the operator's order.
-GPU_ARN_ARGS=() GPU_RECEIPT_ARGS=() EKS_ARGS=() EKS_FLAG=""
+# The repeated flag for deploy/join-cluster and the per-ARN receipt arguments,
+# in the operator's order.
+GPU_ARN_ARGS=() GPU_RECEIPT_ARGS=()
 for arn in "${GPU_ARNS[@]}"; do
   GPU_ARN_ARGS+=(--gpu-cluster-arn "$arn")
   GPU_RECEIPT_ARGS+=(--gpu-arn "$arn")
 done
-if [[ -n "$EKS_FLAG_NAME" ]]; then
-  EKS_ARGS=("$EKS_FLAG_NAME" "$EKS_FLAG_VALUE")
-  EKS_FLAG="${EKS_FLAG_NAME}=${EKS_FLAG_VALUE}"
-fi
 # Provider grouping of the GPU clusters (discover_gpu_providers and
 # group_gpu_clusters, stages 1 and 5): the stage's first deploy names every
 # cluster of its leading provider; each further provider joins inside the
 # stage with the site-bound join-cluster. GPU_PROVIDERS is parallel to GPU_ARNS.
 GPU_PROVIDERS=() FIRST_PROVIDER="" FIRST_DEPLOY_STATE=""
-DEPLOY_GPU_ARNS=() DEPLOY_GPU_ARN_ARGS=() DEPLOY_RECEIPT_ARGS=() DEPLOY_EKS_ARGS=()
+DEPLOY_GPU_ARNS=() DEPLOY_GPU_ARN_ARGS=() DEPLOY_RECEIPT_ARGS=()
 JOINED_PROVIDERS=() JOINED_GPU_ARNS=() JOINED_GPU_PROVIDERS=() JOINED_RECEIPT_ARGS=()
-JOIN_EKS_ARGS=() JOIN_EKS_FLAG_NAME=""
 [[ "$START_STAGE" =~ ^[1-5]$ ]] || usage
 [[ "$EMAIL_WAIT" =~ ^[0-9]+$ ]] || usage
 [[ "$AURORA_FINAL_SNAPSHOT" =~ ^(retain|skip)$ ]] || usage
@@ -159,7 +160,7 @@ init_record() {
   install -d -m 0700 "$ACCEPT_DIR"
   python3 -m scripts.e2e.regional.boot029_receipts init --record "$RECORD" \
     --state "$STATE_DIR" --second-state "$SECOND_STATE_DIR" --stage "$START_STAGE" \
-    --cpu-arn "$CPU_ARN" "${GPU_RECEIPT_ARGS[@]}" "--eks-flag=$EKS_FLAG" \
+    --cpu-arn "$CPU_ARN" "${GPU_RECEIPT_ARGS[@]}" \
     --email "$ADMIN_EMAIL" \
     --repo "$REPO" --previous-site-id "$PREVIOUS_SITE_ID" --email-wait "$EMAIL_WAIT" \
     --aurora-final-snapshot "$AURORA_FINAL_SNAPSHOT"
@@ -269,6 +270,14 @@ contains() {  # WORD LIST...
   return 1
 }
 
+assert_ownership_labels() {  # before a stage acts: the product's own read of the ownership-label precondition (read-only AWS)
+  local report
+  report="$(python3 -m scripts.e2e.regional.boot029_node_scope --cpu-arn "$CPU_ARN" "${GPU_RECEIPT_ARGS[@]}" 2>>"$STAGE_LOG")" ||
+    fail "a GPU cluster would be refused by deploy/join-cluster: its node groups do not carry gpu-fault.io/control-plane=<site id> for this CPU cluster; see the stage log"
+  printf '%s\n' "$report" >>"${STAGE_LOG}.extra.json"
+  log "ownership labels present on every GPU cluster's node groups: $(printf '%s' "$report" | python3 -c 'import json,sys; r=json.load(sys.stdin)["node_scope_precondition"]; print(r["ownership_label"], "on", sum(len(c.get("owned_groups_sha256", [])) for c in r["clusters"]), "node group(s)")')"
+}
+
 discover_gpu_providers() {  # once per stage: the product's own provider discovery (read-only AWS)
   [[ ${#GPU_PROVIDERS[@]} -eq 0 ]] || return 0
   local listing provider arn index=0
@@ -305,9 +314,8 @@ leading_provider() {  # STAGE -> the provider whose clusters the stage's first d
 group_gpu_clusters() {  # LEADING_PROVIDER: its clusters go to the first deploy; each further provider joins afterwards
   local index provider arn
   FIRST_PROVIDER="$1"
-  DEPLOY_GPU_ARNS=() DEPLOY_GPU_ARN_ARGS=() DEPLOY_RECEIPT_ARGS=() DEPLOY_EKS_ARGS=()
+  DEPLOY_GPU_ARNS=() DEPLOY_GPU_ARN_ARGS=() DEPLOY_RECEIPT_ARGS=()
   JOINED_PROVIDERS=() JOINED_GPU_ARNS=() JOINED_GPU_PROVIDERS=() JOINED_RECEIPT_ARGS=()
-  JOIN_EKS_ARGS=() JOIN_EKS_FLAG_NAME=""
   for index in "${!GPU_ARNS[@]}"; do
     provider="${GPU_PROVIDERS[$index]}"
     arn="${GPU_ARNS[$index]}"
@@ -323,17 +331,6 @@ group_gpu_clusters() {  # LEADING_PROVIDER: its clusters go to the first deploy;
     fi
   done
   [[ ${#DEPLOY_GPU_ARNS[@]} -gt 0 ]] || fail "no GPU cluster of provider ${FIRST_PROVIDER} to deploy"
-  # The plain-EKS selector belongs to the command that names the eks-managed
-  # clusters; a list without any gets it on the deploy, as given (unchanged).
-  if [[ -n "$EKS_FLAG_NAME" ]]; then
-    if [[ "$FIRST_PROVIDER" == eks-managed ]] ||
-      ! contains eks-managed ${JOINED_PROVIDERS[@]+"${JOINED_PROVIDERS[@]}"}; then
-      DEPLOY_EKS_ARGS=("${EKS_ARGS[@]}")
-    else
-      JOIN_EKS_ARGS=("${EKS_ARGS[@]}")
-      JOIN_EKS_FLAG_NAME="$EKS_FLAG_NAME"
-    fi
-  fi
   log "stage ${CURRENT_STAGE} GPU clusters: ${#DEPLOY_GPU_ARNS[@]} ${FIRST_PROVIDER} in the first deploy," \
     "${#JOINED_GPU_ARNS[@]} joined afterwards${JOINED_PROVIDERS[*]:+ (${JOINED_PROVIDERS[*]})}"
 }
@@ -361,7 +358,6 @@ run_join_with_profile_approval() {  # STATE_DIR PROVIDER GPU_ARN...: the site-bo
   shift 2
   local arguments=(join-cluster --state-dir "$state")
   for arn in "$@"; do arguments+=(--gpu-cluster-arn "$arn"); done
-  [[ "$provider" != eks-managed ]] || arguments+=(${JOIN_EKS_ARGS[@]+"${JOIN_EKS_ARGS[@]}"})
   log "joining the ${provider} GPU cluster(s) of the mixed site ($# ARN) with the site-bound CLI"
   set +e
   run_admin "${arguments[@]}"
@@ -401,7 +397,6 @@ run_path_deploy() {  # STATE_DIR: the driver's own four-argument deploy of the f
   local wait=()
   [[ "$EMAIL_WAIT" -gt 0 ]] && wait=(--wait-for-email-confirmation "$EMAIL_WAIT")
   run_admin deploy --cpu-cluster-arn "$CPU_ARN" "${DEPLOY_GPU_ARN_ARGS[@]}" \
-    ${DEPLOY_EKS_ARGS[@]+"${DEPLOY_EKS_ARGS[@]}"} \
     --state-dir "$1" --admin-email "$ADMIN_EMAIL" ${wait[@]+"${wait[@]}"}
 }
 
@@ -411,8 +406,6 @@ run_readme_deploy() {  # STATE_DIR: README.md's procedure, verbatim, clean envir
     --repo "$REPO" --work-dir "$ACCEPT_DIR/stage-5-readme" --attempt "$CURRENT_ATTEMPT" \
     --cpu-arn "$CPU_ARN" "${DEPLOY_RECEIPT_ARGS[@]}" \
     ${JOINED_RECEIPT_ARGS[@]+"${JOINED_RECEIPT_ARGS[@]}"} \
-    ${DEPLOY_EKS_ARGS[@]+"${DEPLOY_EKS_ARGS[@]}"} \
-    ${JOIN_EKS_FLAG_NAME:+"--joined-eks-flag=$JOIN_EKS_FLAG_NAME"} \
     --first-provider "$FIRST_PROVIDER" \
     --state-dir "$1" \
     --admin-email "$ADMIN_EMAIL" --receipt "${STAGE_LOG}.extra.json" 2>&1 |
@@ -442,6 +435,7 @@ deploy_fresh() {  # STATE_DIR SITE_ID_FOR_ECR_CHECK DEPLOY_FUNCTION
 
 stage_1() {
   discover_gpu_providers
+  assert_ownership_labels
   group_gpu_clusters "$(leading_provider 1)"
   provider_receipt_line
   deploy_fresh "$STATE_DIR" "$PREVIOUS_SITE_ID" run_path_deploy
@@ -458,8 +452,8 @@ stage_2() {  # one ARN at a time; every removed cluster's journal is asserted
 }
 
 stage_3() {  # one join-cluster for every GPU cluster; one journal per ARN
-  run_admin join-cluster --state-dir "$STATE_DIR" "${GPU_ARN_ARGS[@]}" \
-    ${EKS_ARGS[@]+"${EKS_ARGS[@]}"}
+  assert_ownership_labels
+  run_admin join-cluster --state-dir "$STATE_DIR" "${GPU_ARN_ARGS[@]}"
   assert_current_journal "$STATE_DIR"
 }
 
@@ -473,6 +467,7 @@ stage_5() {
   local site_id=""
   [[ -f "$STATE_DIR/bootstrap-state.json" ]] && site_id="$(json_field "$STATE_DIR/bootstrap-state.json" site_id)"
   discover_gpu_providers
+  assert_ownership_labels
   group_gpu_clusters "$(leading_provider 5)"
   provider_receipt_line
   deploy_fresh "$SECOND_STATE_DIR" "$site_id" run_readme_deploy

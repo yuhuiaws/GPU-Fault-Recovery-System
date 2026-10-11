@@ -17,8 +17,8 @@ Regional CPU EKS control plane + Aurora PostgreSQL + NLB
 ```
 
 A GPU data cluster is a SageMaker HyperPod EKS cluster by default; a **plain EKS cluster without a HyperPod
-orchestrator** (`provider: eks-managed`) can be joined as well. The latter is a new, less validated form: node
-enumeration uses the cluster's own GPU node selector (default `nvidia.com/gpu.present=true`), the Executor holds only
+orchestrator** (`provider: eks-managed`) can be joined as well. The latter is a new, less validated form: GPU nodes
+are enumerated through the ownership label on the node groups, the Executor holds only
 EC2 Describe/Reboot, and provider-side node replacement is observe-only; see
 [Administrator Operations §5.0](docs/en/administrator-operations.md).
 Do not infer additional supported scope from historical code or examples in the repository:
@@ -140,9 +140,9 @@ gpu-fault-admin deploy \
   --admin-email <operations-email>
 ```
 
-Repeat `--gpu-cluster-arn` for multiple GPU clusters. The command decides by itself whether this is a first or a subsequent deployment, manages
+Repeat `--gpu-cluster-arn` for multiple GPU clusters. The command needs nothing but ARNs: in every GPU cluster the node groups this site manages (an EKS managed node group's `labels`, a HyperPod instance group's `KubernetesConfig.Labels`) must carry the ownership label `gpu-fault.io/control-plane=<site id>` beforehand, where the site id is printed before the first deploy by `gpu-fault-admin site-id --cpu-cluster-arn <cpu-eks-or-hyperpod-arn>`; a GPU cluster without a labelled node group is refused before anything is created, with the node-group evidence seen, and so is a labelled node group whose instance type is outside the GPU inventory or whose label names another site. The command decides by itself whether this is a first or a subsequent deployment, manages
 the release, signing, bundle, venv and site internally, and completes preflight, deploy/upgrade, verify and stability.
-A mixed site (HyperPod and plain EKS clusters managed together) takes two steps: a first `deploy`'s GPU clusters must share one provider (a first `deploy` given the ARNs of both providers is refused before anything is created), so pass only the clusters of one provider first (an all-plain-EKS site starts from the `eks-v1` profile); once the first deployment is complete, attach the other provider's clusters with the site-bound CLI: `<state-dir>/deployer-venv/bin/gpu-fault-admin join-cluster --state-dir <state-dir> --gpu-cluster-arn <GPU ARN of the other provider>` (a plain EKS cluster takes the same node group or node selector flag as above). That join first writes the provider's own Runtime Profile plan (`release-deploy/profile-plan.json`, `CLUSTER_PROFILE_NEW`) and stops; after review, rerun the same command with `--approve-profile-plan <plan_sha256> --reference <change request>` to complete the join; see the mixed-site join walkthrough in [Administrator Operations](docs/en/administrator-operations.md).
+A mixed site (HyperPod and plain EKS clusters managed together) takes two steps: a first `deploy`'s GPU clusters must share one provider (a first `deploy` given the ARNs of both providers is refused before anything is created), so pass only the clusters of one provider first (an all-plain-EKS site starts from the `eks-v1` profile); once the first deployment is complete, attach the other provider's clusters with the site-bound CLI: `<state-dir>/deployer-venv/bin/gpu-fault-admin join-cluster --state-dir <state-dir> --gpu-cluster-arn <GPU ARN of the other provider>` (again ARNs only: the joined cluster's GPU node groups must already carry this site's ownership label). That join first writes the provider's own Runtime Profile plan (`release-deploy/profile-plan.json`, `CLUSTER_PROFILE_NEW`) and stops; after review, rerun the same command with `--approve-profile-plan <plan_sha256> --reference <change request>` to complete the join; see the mixed-site join walkthrough in [Administrator Operations](docs/en/administrator-operations.md).
 A first deployment first sends an SNS confirmation e-mail to `--admin-email`; while unconfirmed, the command exits within the first minute (nothing was deployed). Click the link and rerun with the same arguments, or add `--wait-for-email-confirmation <minutes>` to wait in place.
 Day-to-day changes after the first deployment use `<state-dir>/deployer-venv/bin/gpu-fault-admin`.
 A development checkout that is not bound to a site cannot replace that CLI for changes to an existing site; ordinary source deploys and truly

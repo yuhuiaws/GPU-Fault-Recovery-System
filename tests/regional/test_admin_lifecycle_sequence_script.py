@@ -230,22 +230,54 @@ if operation == "describe-repositories":
     name = argument("--repository-names")
     print(json.dumps({"repositories": [{"repositoryName": name, "registryId": "123456789012",
         "repositoryArn": "arn:aws:ecr:us-west-2:123456789012:repository/" + name}]}))
+    sys.exit(0)
 elif operation == "list-tags-for-resource":
     print(json.dumps({"tags": [{"Key": "gpu-fault:site-id", "Value": "fixture-site"}]}))
-elif operation == "list-clusters":
-    # The Region's HyperPod clusters; the fixture cluster orchestrates the
-    # fixture GPU EKS cluster, so that ARN is a HyperPod cluster and every other
-    # EKS ARN is plain EKS. A twin naming the same EKS cluster is the
-    # configuration the product refuses to guess about.
-    names = ["fixture-hyperpod"]
+    sys.exit(0)
+# The CPU control plane's HyperPod identity, as the product derives the site id
+# from it (Region, HyperPod name, first 8 hex digits of the ARN digest): a
+# SageMaker CPU ARN names it directly, an EKS CPU ARN is orchestrated by the
+# fixture CPU HyperPod cluster.
+cpu_env = os.environ["FAKE_CPU_ARN"]
+if cpu_env.startswith("arn:aws:sagemaker:"):
+    cpu_name, cpu_hyperpod_arn, cpu_eks_arn = cpu_env.rsplit("/", 1)[-1], cpu_env, "arn:aws:eks:us-west-2:123456789012:cluster/cpu-fixture-eks"
+else:
+    cpu_name, cpu_hyperpod_arn, cpu_eks_arn = "fixture-cpu-hyperpod", "arn:aws:sagemaker:us-west-2:123456789012:cluster/fixture-cpu-hyperpod", cpu_env
+site_id = "us-west-2-" + cpu_name + "-" + hashlib.sha256(cpu_hyperpod_arn.encode()).hexdigest()[:8]
+ownership = {} if os.getenv("FAKE_UNLABELLED_GPU") else {"gpu-fault.io/control-plane": site_id}
+if operation == "list-clusters":
+    # The Region's HyperPod clusters: the CPU control plane's own HyperPod
+    # cluster (the site id derives from it) and the fixture cluster that
+    # orchestrates the fixture GPU EKS cluster, so that ARN is a HyperPod
+    # cluster and every other EKS ARN is plain EKS. A twin naming the same EKS
+    # cluster is the configuration the product refuses to guess about.
+    names = [cpu_name, "fixture-hyperpod"]
     if os.getenv("FAKE_HYPERPOD_DUPLICATE"):
         names.append("fixture-hyperpod-twin")
     print(json.dumps({"ClusterSummaries": [{"ClusterName": name} for name in names]}))
 elif operation == "describe-cluster":
     name = argument("--cluster-name")
-    print(json.dumps({"ClusterName": name,
-        "ClusterArn": os.environ.get("FAKE_GPU_HYPERPOD_ARN") or "arn:aws:sagemaker:us-west-2:123456789012:cluster/" + name,
-        "Orchestrator": {"Eks": {"ClusterArn": os.environ.get("FAKE_GPU_EKS_ARN") or os.environ["FAKE_GPU_ARN"]}}}))
+    name = name.rsplit("/", 1)[-1] if name.startswith("arn:") else name
+    labels = ownership
+    if name == cpu_name:
+        print(json.dumps({"ClusterName": name, "ClusterArn": cpu_hyperpod_arn,
+            "Orchestrator": {"Eks": {"ClusterArn": cpu_eks_arn}},
+            "InstanceGroups": [{"InstanceGroupName": "cpu-group", "InstanceType": "ml.m5.2xlarge"}]}))
+    else:
+        print(json.dumps({"ClusterName": name,
+            "ClusterArn": os.environ.get("FAKE_GPU_HYPERPOD_ARN") or "arn:aws:sagemaker:us-west-2:123456789012:cluster/" + name,
+            "Orchestrator": {"Eks": {"ClusterArn": os.environ.get("FAKE_GPU_EKS_ARN") or os.environ["FAKE_GPU_ARN"]}},
+            "InstanceGroups": [{"InstanceGroupName": "spot-p5en", "InstanceType": "ml.p5en.48xlarge",
+                "KubernetesConfig": {"CurrentLabels": labels}},
+                {"InstanceGroupName": "accelerated-g6", "InstanceType": "ml.g6.12xlarge"}]}))
+elif operation == "list-nodegroups":
+    print(json.dumps({"nodegroups": ["cpu-ng", "gpu-p5en-efa-spot-node-group"]}))
+elif operation == "describe-nodegroup":
+    name = argument("--nodegroup-name")
+    gpu = name != "cpu-ng"
+    labels = ownership if gpu else {}
+    print(json.dumps({"nodegroup": {"nodegroupName": name, "status": "ACTIVE",
+        "instanceTypes": ["p5en.48xlarge"] if gpu else ["m7i-flex.xlarge"], "labels": labels}}))
 elif operation in {"list-images", "batch-delete-image"}:
     name = argument("--repository-name")
     marker = log.parent / ("removed-" + hashlib.sha256(name.encode()).hexdigest())
@@ -521,7 +553,6 @@ def test_runs_the_five_stages_in_order_and_prunes_before_each_cold_deploy(
     expected_inputs = {
         "cpu_cluster_arn_sha256": _sha256(CPU_ARN),
         "gpu_cluster_arns_sha256": _sha256(GPU_ARN),
-        "eks_flag_sha256": _sha256(""),
         "admin_email_sha256": _sha256(ADMIN_EMAIL),
         "state_dir_sha256": _sha256(str(tmp_path / "state")),
         "second_state_dir_sha256": _sha256(str(tmp_path / "state-second")),

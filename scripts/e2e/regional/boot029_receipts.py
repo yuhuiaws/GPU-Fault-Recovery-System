@@ -681,11 +681,6 @@ def main() -> None:
             "provider of a mixed site), once per cluster in the run's order"
         ),
     )
-    parser.add_argument(
-        "--eks-flag",
-        default="",
-        help="the plain-EKS selector flag passed through to deploy/join, if any",
-    )
     parser.add_argument("--email", default="")
     parser.add_argument("--repo", type=Path)
     parser.add_argument("--previous-site-id", default="")
@@ -703,7 +698,6 @@ def main() -> None:
             inputs = {
                 "cpu_cluster_arn": args.cpu_arn,
                 "gpu_cluster_arns": "\n".join(args.gpu_arn),
-                "eks_flag": args.eks_flag,
                 "admin_email": args.email,
                 "state_dir": str(args.state.resolve()),
                 "second_state_dir": str(args.second_state.resolve()),

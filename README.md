@@ -19,7 +19,7 @@ English edition: [README.en.md](README.en.md).
 不应从仓库中的历史代码或示例推断额外支持范围：
 
 - HyperPod 单集群一体化只用于迁移、Canary 和历史环境维护。
-- 通用 Kubernetes 部署当前未实现为生产交付能力；无 HyperPod 的普通 EKS 集群（`provider: eks-managed`）是新增、验证较少的形态：按 GPU 节点选择器枚举、Executor 只持 EC2 Describe/Reboot、节点替换只观察，见[管理员日常运维 §5.0](docs/管理员日常运维.md)。
+- 通用 Kubernetes 部署当前未实现为生产交付能力；无 HyperPod 的普通 EKS 集群（`provider: eks-managed`）是新增、验证较少的形态：按节点组上的归属标签枚举 GPU 节点、Executor 只持 EC2 Describe/Reboot、节点替换只观察，见[管理员日常运维 §5.0](docs/管理员日常运维.md)。
 - HyperPod Slurm 编排当前不支持。
 - GPU 节点上的 systemd Agent 属于区域数据面，不是独立部署架构。
 
@@ -129,8 +129,8 @@ gpu-fault-admin deploy \
   --admin-email <operations-email>
 ```
 
-多个GPU集群重复传`--gpu-cluster-arn`。普通EKS（无HyperPod编排）的GPU集群另加`--gpu-nodegroup <托管节点组名>`（或`--node-selector <标签选择器>`；两者都不传时按`nvidia.com/gpu.present=true`选GPU节点；HyperPod集群忽略这两个参数）。命令自动判断首次或后续部署，内部管理release、签名、bundle、venv和site，并完成preflight、deploy/upgrade、verify与stability。
-混合站点（同时纳管 HyperPod 与普通 EKS 集群）分两步：首次`deploy`的 GPU 集群必须同一 provider（两个 provider 的 ARN 一起传给首次`deploy`会在创建任何资源前被拒绝），先只传其中一个 provider 的全部集群（全为普通 EKS 时站点以`eks-v1` profile 起步）；首次部署完成后，用站点绑定的 CLI 接入另一 provider 的集群：`<state-dir>/deployer-venv/bin/gpu-fault-admin join-cluster --state-dir <state-dir> --gpu-cluster-arn <另一 provider 的 GPU ARN>`（普通 EKS 集群同样要给出上述托管节点组或节点选择器参数）。该 join 先写出这个 provider 自己的 Runtime Profile 计划（`release-deploy/profile-plan.json`，`CLUSTER_PROFILE_NEW`）并停止，审阅后带`--approve-profile-plan <plan_sha256> --reference <变更单>`重跑同一条命令即完成接入；见[管理员日常运维](docs/管理员日常运维.md)的混合站点接入示例。
+多个GPU集群重复传`--gpu-cluster-arn`。命令只需要ARN：每个GPU集群中由本站点纳管的节点组（EKS托管节点组的`labels`、HyperPod实例组的`KubernetesConfig.Labels`）必须事先带上归属标签`gpu-fault.io/control-plane=<站点ID>`，站点ID在首次部署前用`gpu-fault-admin site-id --cpu-cluster-arn <cpu-eks-or-hyperpod-arn>`打印；没有带标签节点组的GPU集群在创建任何资源前被拒绝并列出看到的节点组证据，带标签但实例类型不在GPU清单内、或标签指向另一站点的节点组同样拒绝。命令自动判断首次或后续部署，内部管理release、签名、bundle、venv和site，并完成preflight、deploy/upgrade、verify与stability。
+混合站点（同时纳管 HyperPod 与普通 EKS 集群）分两步：首次`deploy`的 GPU 集群必须同一 provider（两个 provider 的 ARN 一起传给首次`deploy`会在创建任何资源前被拒绝），先只传其中一个 provider 的全部集群（全为普通 EKS 时站点以`eks-v1` profile 起步）；首次部署完成后，用站点绑定的 CLI 接入另一 provider 的集群：`<state-dir>/deployer-venv/bin/gpu-fault-admin join-cluster --state-dir <state-dir> --gpu-cluster-arn <另一 provider 的 GPU ARN>`（同样只需要 ARN：被接入集群的 GPU 节点组须已带本站点的归属标签）。该 join 先写出这个 provider 自己的 Runtime Profile 计划（`release-deploy/profile-plan.json`，`CLUSTER_PROFILE_NEW`）并停止，审阅后带`--approve-profile-plan <plan_sha256> --reference <变更单>`重跑同一条命令即完成接入；见[管理员日常运维](docs/管理员日常运维.md)的混合站点接入示例。
 首次部署先为`--admin-email`发一封SNS确认邮件；未确认时命令在第一分钟退出（nothing was deployed），点击链接后用同一参数重跑即可，或加`--wait-for-email-confirmation <分钟>`原地等待。
 首次部署后的日常变更使用`<state-dir>/deployer-venv/bin/gpu-fault-admin`。
 未绑定站点的开发checkout不能替代该CLI执行已有站点的变更；普通源码deploy和真正只读的查询按各自入口校验，rollback不享有普通源码deploy的豁免。见[管理员日常运维](docs/管理员日常运维.md)的管理员入口说明。

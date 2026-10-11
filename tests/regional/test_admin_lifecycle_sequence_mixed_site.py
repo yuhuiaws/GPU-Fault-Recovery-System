@@ -34,6 +34,7 @@ from tests.regional.test_admin_lifecycle_sequence_script import (
 
 EKS_GPU_ARN = "arn:aws:eks:us-west-2:123456789012:cluster/gpu-eks-fixture"
 EKS_NODEGROUP = "gpu-p5en-efa-spot-node-group"
+OWNERSHIP_LABEL = "gpu-fault.io/control-plane"
 SHA256 = re.compile(r"[0-9a-f]{64}")
 
 
@@ -61,29 +62,40 @@ def _mixed(tmp_path: Path, env: dict[str, str], *extra: str):
         GPU_ARN,
         "--gpu-cluster-arn",
         EKS_GPU_ARN,
-        "--gpu-nodegroup",
-        EKS_NODEGROUP,
         *extra,
     )
 
 
-def _assert_eks_join(join: str) -> None:
-    assert f"--gpu-cluster-arn {EKS_GPU_ARN} --gpu-nodegroup {EKS_NODEGROUP}" in join, (
-        join,
-        "the in-stage join names the eks cluster and carries the flag",
+def _assert_no_selector_flags(line: str) -> None:
+    assert "--gpu-nodegroup" not in line and "--node-selector" not in line, (
+        line,
+        "the node scope is declared on the node groups, never passed as a flag",
     )
+
+
+def _assert_eks_join(join: str) -> None:
+    assert f"--gpu-cluster-arn {EKS_GPU_ARN}" in join, (
+        join,
+        "the in-stage join names the eks cluster",
+    )
+    _assert_no_selector_flags(join)
     assert GPU_ARN not in join, (join, "the HyperPod cluster is not in the eks join")
 
 
 def _assert_hyperpod_join(join: str) -> None:
-    assert f"--gpu-cluster-arn {GPU_ARN}" in join and "--gpu-nodegroup" not in join, (
+    assert f"--gpu-cluster-arn {GPU_ARN}" in join, (
         join,
-        "the in-stage join names the HyperPod cluster; the eks flag is not its",
+        "the in-stage join names the HyperPod cluster",
     )
+    _assert_no_selector_flags(join)
     assert EKS_GPU_ARN not in join, (
         join,
         "the eks cluster is not in the HyperPod join",
     )
+
+
+def _precondition_lines(record: dict, stage: str) -> dict:
+    return record["stages"][stage]["node_scope_precondition"]
 
 
 def _assert_approved_rerun(stopped: str, approved: str, stage: int) -> None:
@@ -97,12 +109,13 @@ def _assert_approved_rerun(stopped: str, approved: str, stage: int) -> None:
 def test_a_mixed_site_leads_s1_with_the_first_arn_and_s5_with_the_other_provider(
     tmp_path: Path,
 ) -> None:
-    """HyperPod ARN first: S1 deploys the HyperPod cluster (no eks flag) and joins
-    the eks-managed cluster (hyperpod-v1 site, eks-v1 override approved); S2
+    """HyperPod ARN first: S1 deploys the HyperPod cluster and joins the
+    eks-managed cluster (hyperpod-v1 site, eks-v1 override approved); S2
     removes one cluster at a time; S3 re-joins both in one command (the eks
     snapshot exists, no plan stop); S5 reverses the order -- the README deploy
-    names the eks cluster with its flag (eks-v1 site) and the HyperPod cluster
-    joins with its hyperpod-v1 override approved."""
+    names the eks cluster (eks-v1 site) and the HyperPod cluster joins with
+    its hyperpod-v1 override approved. No command carries a selector flag: the
+    driver checked the ownership labels before every acting stage."""
     env = _install_fakes(tmp_path)
 
     result = _mixed(tmp_path, env)
@@ -123,16 +136,15 @@ def test_a_mixed_site_leads_s1_with_the_first_arn_and_s5_with_the_other_provider
     ], "S1/S5 deploy one provider and join the other (plan stop, approved rerun)"
     deploys = _deploys(lines)
     assert f"--gpu-cluster-arn {GPU_ARN} --state-dir" in deploys[0], deploys[0]
-    assert EKS_GPU_ARN not in deploys[0] and "--gpu-nodegroup" not in deploys[0], (
-        "S1's first deploy names the HyperPod cluster only, without the eks flag"
+    assert EKS_GPU_ARN not in deploys[0], (
+        "S1's first deploy names the HyperPod cluster only"
     )
+    _assert_no_selector_flags(deploys[0])
     assert deploys[1].split()[2:] == [
         "--cpu-cluster-arn",
         CPU_ARN,
         "--gpu-cluster-arn",
         EKS_GPU_ARN,
-        "--gpu-nodegroup",
-        EKS_NODEGROUP,
         "--state-dir",
         str(tmp_path / "state-second"),
         "--admin-email",
@@ -143,10 +155,11 @@ def test_a_mixed_site_leads_s1_with_the_first_arn_and_s5_with_the_other_provider
     _assert_eks_join(joins[0])
     _assert_eks_join(joins[1])
     _assert_approved_rerun(joins[0], joins[1], 1)
-    assert (
-        f"--gpu-cluster-arn {GPU_ARN} --gpu-cluster-arn {EKS_GPU_ARN} "
-        f"--gpu-nodegroup {EKS_NODEGROUP}" in joins[2]
-    ), (joins[2], "S3 re-joins every cluster in one command, flag as given")
+    assert f"--gpu-cluster-arn {GPU_ARN} --gpu-cluster-arn {EKS_GPU_ARN}" in joins[2], (
+        joins[2],
+        "S3 re-joins every cluster in one command",
+    )
+    _assert_no_selector_flags(joins[2])
     _assert_hyperpod_join(joins[3])
     _assert_hyperpod_join(joins[4])
     _assert_approved_rerun(joins[3], joins[4], 5)
@@ -201,18 +214,41 @@ def test_a_mixed_site_leads_s1_with_the_first_arn_and_s5_with_the_other_provider
     assert record["inputs"]["gpu_cluster_arns_sha256"] == _sha256(
         f"{GPU_ARN}\n{EKS_GPU_ARN}"
     ), "the input identity is the operator's ARN list, unchanged"
-    assert record["inputs"]["eks_flag_sha256"] == _sha256(
-        f"--gpu-nodegroup={EKS_NODEGROUP}"
-    ), "the eks flag stays in the input identity as given"
+    assert "eks_flag_sha256" not in record["inputs"], (
+        "no selector flag is part of the input identity any more"
+    )
+    for stage in ("1", "3", "5"):
+        precondition = _precondition_lines(record, stage)
+        assert precondition["ownership_label"] == OWNERSHIP_LABEL, (
+            stage,
+            "every acting stage records the ownership-label precondition it checked",
+        )
+        assert SHA256.fullmatch(
+            precondition["site_id_sha256"].removeprefix("sha256:")
+        ), "the site id enters the record as a digest only"
+        assert all(
+            item["owned_groups_sha256"] == [f"sha256:{_sha256(name)}"]
+            for item, name in zip(
+                precondition["clusters"], ("spot-p5en", EKS_NODEGROUP), strict=True
+            )
+        ), (stage, "node group names enter the record as digests only")
+        assert [item["status"] for item in precondition["clusters"]] == [
+            "labelled",
+            "labelled",
+        ], (stage, precondition)
+        assert sorted(item["provider"] for item in precondition["clusters"]) == [
+            "eks-managed",
+            "hyperpod",
+        ], (stage, precondition)
     receipt = record["stages"]["5"]["readme"]
     assert receipt["gpu_cluster_count"] == 1, receipt
     assert receipt["joined_gpu_cluster_count"] == 1, receipt
     assert receipt["first_provider"] == "eks-managed", receipt
-    assert receipt["eks_flag"] == "--gpu-nodegroup", (
+    assert receipt["ownership_label_documented"] is True, (
         receipt,
-        "the README deploy of the eks cluster carries the documented flag",
+        "the README deploy relies on the ownership-label precondition the README states",
     )
-    assert receipt["joined_eks_flag"] is None, (receipt, "the HyperPod join has none")
+    assert "eks_flag" not in receipt and "joined_eks_flag" not in receipt, receipt
     assert receipt["mixed_site_join_documented"] is True, receipt
     assert receipt["plain_eks_first_deploy_documented"] is True, receipt
     serialized = json.dumps(record)
@@ -229,7 +265,7 @@ def test_a_single_provider_list_runs_unchanged_and_joins_nothing_in_s1_or_s5(
 ) -> None:
     env = _install_fakes(tmp_path)
 
-    result = _run(tmp_path, env, "--gpu-nodegroup", EKS_NODEGROUP)
+    result = _run(tmp_path, env)
 
     assert result.returncode == 0, result.stdout + result.stderr
     lines = _tool_log(env)
@@ -241,12 +277,8 @@ def test_a_single_provider_list_runs_unchanged_and_joins_nothing_in_s1_or_s5(
         "deploy",
     ], "one provider: no join inside the first-deploy stages, nothing to reverse"
     for deploy in _deploys(lines):
-        assert (
-            f"--gpu-cluster-arn {GPU_ARN} --gpu-nodegroup {EKS_NODEGROUP} " in deploy
-        ), (
-            deploy,
-            "without an eks-managed cluster the flag reaches the deploy as given",
-        )
+        assert f"--gpu-cluster-arn {GPU_ARN} " in deploy, deploy
+        _assert_no_selector_flags(deploy)
     record = _record(tmp_path)
     for number in ("1", "5"):
         stage = record["stages"][number]
@@ -269,34 +301,24 @@ def test_an_eks_first_list_leads_s1_with_eks_and_s5_with_hyperpod(
     env = _install_fakes(tmp_path)
 
     result = _run(
-        tmp_path,
-        env,
-        "--gpu-cluster-arn",
-        EKS_GPU_ARN,
-        "--gpu-cluster-arn",
-        GPU_ARN,
-        "--gpu-nodegroup",
-        EKS_NODEGROUP,
+        tmp_path, env, "--gpu-cluster-arn", EKS_GPU_ARN, "--gpu-cluster-arn", GPU_ARN
     )
 
     assert result.returncode == 0, result.stdout + result.stderr
     lines = _tool_log(env)
     deploys = _deploys(lines)
-    assert (
-        f"--gpu-cluster-arn {EKS_GPU_ARN} --gpu-nodegroup {EKS_NODEGROUP} "
-        in deploys[0]
-    ), (
+    assert f"--gpu-cluster-arn {EKS_GPU_ARN} " in deploys[0], (
         deploys[0],
-        "S1: an all-plain-EKS first deploy names the eks cluster with its flag",
+        "S1: an all-plain-EKS first deploy names the eks cluster",
     )
+    _assert_no_selector_flags(deploys[0])
     assert GPU_ARN not in deploys[0], deploys[0]
     assert f"--gpu-cluster-arn {GPU_ARN} --state-dir" in deploys[1], (
         deploys[1],
         "S5 reverses: the README deploy names the HyperPod cluster",
     )
-    assert EKS_GPU_ARN not in deploys[1] and "--gpu-nodegroup" not in deploys[1], (
-        deploys[1]
-    )
+    assert EKS_GPU_ARN not in deploys[1], deploys[1]
+    _assert_no_selector_flags(deploys[1])
     joins = _joins(lines)
     _assert_hyperpod_join(joins[0])
     _assert_hyperpod_join(joins[1])
@@ -315,12 +337,7 @@ def test_an_eks_first_list_leads_s1_with_eks_and_s5_with_hyperpod(
     assert five["profile_plan_approved"]["desired_version"] == "eks-v1", five
     receipt = five["readme"]
     assert receipt["first_provider"] == "hyperpod", receipt
-    assert (
-        receipt["eks_flag"] is None and receipt["joined_eks_flag"] == "--gpu-nodegroup"
-    ), (
-        receipt,
-        "the README deploy of the HyperPod cluster carries no flag; the eks join does",
-    )
+    assert receipt["ownership_label_documented"] is True, receipt
 
 
 def test_stage_one_resumes_after_a_finished_first_deploy_with_the_join_only(
@@ -492,14 +509,15 @@ def test_provider_discovery_refusal_fails_stage_one_before_any_deploy(
     )
 
 
-def test_stage_five_refuses_a_mixed_site_the_readme_does_not_document(
+def test_stage_five_refuses_a_readme_that_no_longer_states_the_ownership_label(
     tmp_path: Path,
 ) -> None:
     env = _install_fakes(tmp_path)
     readme_path = tmp_path / "checkout/README.md"
     readme_path.write_text(
         readme_path.read_text(encoding="utf-8").replace(
-            "`--gpu-nodegroup <托管节点组名>`", "托管节点组名"
+            "`gpu-fault-admin site-id --cpu-cluster-arn <cpu-eks-or-hyperpod-arn>`",
+            "the site-id verb",
         ),
         encoding="utf-8",
     )
@@ -508,7 +526,9 @@ def test_stage_five_refuses_a_mixed_site_the_readme_does_not_document(
 
     assert result.returncode != 0, result.stdout
     assert "FAILED at stage 5 (cold-redeploy-readme)" in result.stderr, result.stderr
-    assert "does not document --gpu-nodegroup" in result.stderr, result.stderr
+    assert "does not state that the GPU node groups carry" in result.stderr, (
+        result.stderr
+    )
     assert _admin_verbs(_tool_log(env)) == [
         "deploy",
         "join-cluster",
@@ -575,3 +595,34 @@ def test_stage_five_refuses_a_readme_without_the_plain_eks_first_deploy_prerequi
     assert not (tmp_path / "state-second/bootstrap-state.json").exists(), (
         "no deploy reaches the second state directory"
     )
+
+
+def test_an_unlabelled_gpu_cluster_stops_stage_one_before_any_build_or_deploy(
+    tmp_path: Path,
+) -> None:
+    """The precondition the driver checks first: a GPU cluster whose node groups
+    do not carry the site's ownership label would be refused by deploy, so the
+    stage stops with the product's refusal and the describe evidence in the
+    log, and no cache is pruned, no image built, no admin command run."""
+    env = {**_install_fakes(tmp_path), "FAKE_UNLABELLED_GPU": "1"}
+
+    result = _mixed(tmp_path, env)
+
+    assert result.returncode != 0, result.stdout
+    assert "FAILED at stage 1 (cold-first-deploy)" in result.stderr, result.stderr
+    assert "would be refused by deploy/join-cluster" in result.stderr, result.stderr
+    lines = _tool_log(env)
+    assert _admin_verbs(lines) == [], "nothing was deployed or joined"
+    assert not any(line.startswith("docker ") for line in lines), (
+        "no cache was pruned and no image built"
+    )
+    log = next((tmp_path / "state/acceptance").glob("stage-1-*.log")).read_text(
+        encoding="utf-8"
+    )
+    assert f"{OWNERSHIP_LABEL}=us-west-2-fixture-cpu-hyperpod-" in log, (
+        "the refusal names the exact label and site id"
+    )
+    assert "spot-p5en instanceTypes=ml.p5en.48xlarge" in log, (
+        "the describe-cluster evidence is in the stage log"
+    )
+    assert "gpu-fault-admin site-id" in log, "the verb that prints the id is named"
