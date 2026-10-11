@@ -159,6 +159,10 @@ def is_readonly_command(
         return getattr(arguments, "confirm", None) is None
     if command == "failure-domain-map":
         return getattr(arguments, "output", None) is None
+    if command == "node-scope":
+        return not getattr(arguments, "converge", False) or bool(
+            getattr(arguments, "dry_run", False)
+        )
     return command in readonly_commands
 
 

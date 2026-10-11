@@ -40,6 +40,14 @@ from gpu_fault.admin.cli_join import (
     add_join_recovery_arguments,
     run_join_cluster,
 )
+from gpu_fault.admin.node_scope_command import (
+    add_node_scope_command,
+    run_node_scope_command,
+)
+from gpu_fault.admin.site_identity_command import (
+    add_site_id_command,
+    run_site_id_command,
+)
 from gpu_fault.admin.cluster_removal import (
     CONFIRMATION as REMOVE_CLUSTER_CONFIRMATION,
     RemoveClusterRequest,
@@ -180,6 +188,9 @@ COMMANDS = {
 # so the verb is `status`: five readable lines on stderr, the cheap checks by
 # default, `--full` for the whole report acceptance evidence records.
 PUBLIC_READONLY_COMMANDS = ("status",)
+# Read-only node-scope verbs: `site-id` (the ownership label value before the
+# first deploy) and `node-scope` (`--converge` is its one mutation).
+NODE_SCOPE_COMMANDS = ("site-id", "node-scope")
 # Driver-only engine passthroughs: ``scripts/release_deploy.py`` runs `verify`
 # beside the stability window and ``scripts/staging_deploy.py`` runs
 # `preflight` for a deploy-host-only change. They are not advertised, not in
@@ -188,7 +199,9 @@ PUBLIC_READONLY_COMMANDS = ("status",)
 INTERNAL_READONLY_COMMANDS = ("preflight", "verify")
 # The managed commands that write nothing; their console logs rotate under
 # ``logs/readonly/`` so they cannot age out a failed deploy's log (I3).
-READONLY_COMMANDS = frozenset(PUBLIC_READONLY_COMMANDS + INTERNAL_READONLY_COMMANDS)
+READONLY_COMMANDS = frozenset(
+    PUBLIC_READONLY_COMMANDS + INTERNAL_READONLY_COMMANDS + NODE_SCOPE_COMMANDS
+)
 
 
 RELEASE_HISTORY_DIR_ENV = "GPU_FAULT_RELEASE_HISTORY_DIR"
@@ -520,6 +533,8 @@ def parser() -> argparse.ArgumentParser:
             ),
         )
     add_deploy_command(commands)
+    add_site_id_command(commands)
+    add_node_scope_command(commands, _add_managed_site_arguments)
     _add_admin_config_command(commands)
     _add_workflow_reconcile_command(commands)
     add_failure_domain_map_command(commands, _add_managed_site_arguments)
@@ -1293,6 +1308,16 @@ def _run_deploy(arguments: argparse.Namespace) -> int:
 def run(arguments: argparse.Namespace) -> int:
     if arguments.command == "node-key-custody":
         return run_custody_command(arguments)
+    if arguments.command == "site-id":
+        return run_site_id_command(arguments)
+    if arguments.command == "node-scope":
+        return run_node_scope_command(
+            arguments,
+            site=load_site(
+                cast(Path, _managed_site_file(arguments, command="node-scope")),
+                repository_root=arguments.repo_root,
+            ),
+        )
     if arguments.command == "config":
         return _run_admin_config(arguments)
     if arguments.command == "join-cluster":
