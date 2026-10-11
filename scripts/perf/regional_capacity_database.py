@@ -170,22 +170,55 @@ with psycopg.connect(store_dsn(), autocommit=True) as conn:
                 'dead_tuples': row[2],
             }
     out['hot_tables'] = {}
+    # Schema v23 layout facts: the write-layout mode and the partition
+    # inventories a formal round must record (performance acceptance plan
+    # §3.3). An older control plane lacks the tables and records none.
+    cur.execute("SELECT to_regclass('gpu_fault_hot_layout_mode')")
+    if cur.fetchone()[0] is not None:
+        cur.execute("SELECT mode FROM gpu_fault_hot_layout_mode WHERE singleton")
+        row = cur.fetchone()
+        layout = {'mode': row[0] if row else None, 'partitions': {}}
+        for parent in ('gpu_fault_gpu_metric_latest_clusters', 'gpu_fault_processor_replays'):
+            cur.execute(
+                "SELECT count(*), COALESCE(sum(c.relpages), 0), COALESCE(sum(s.n_live_tup), 0) "
+                "FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid "
+                "LEFT JOIN pg_stat_user_tables s ON s.relid=c.oid "
+                "WHERE i.inhparent=to_regclass(%s)",
+                (parent,),
+            )
+            count, pages, live = cur.fetchone()
+            layout['partitions'][parent] = {
+                'count': int(count), 'pages': int(pages), 'live_rows': int(live)
+            }
+        out['hot_layout'] = layout
     for table in hot_tables:
+        # A partitioned parent (schema v23) owns no pages: sum its partitions,
+        # and size each of its partitioned indexes over the attached ones.
         cur.execute(
-            "SELECT COALESCE(s.n_live_tup, 0), pg_relation_size(c.oid), "
-            "pg_indexes_size(c.oid), "
-            "COALESCE(pg_total_relation_size(c.reltoastrelid), 0) "
-            "FROM pg_class c LEFT JOIN pg_stat_user_tables s ON s.relid=c.oid "
-            "WHERE c.oid=to_regclass(%s)",
-            (table,),
+            "WITH members AS ("
+            " SELECT c.oid FROM pg_class c WHERE c.oid=to_regclass(%s) AND c.relkind<>'p'"
+            " UNION ALL SELECT i.inhrelid FROM pg_inherits i WHERE i.inhparent=to_regclass(%s))"
+            " SELECT COALESCE(sum(s.n_live_tup), 0), COALESCE(sum(pg_relation_size(c.oid)), 0),"
+            " COALESCE(sum(pg_indexes_size(c.oid)), 0),"
+            " COALESCE(sum(pg_total_relation_size(c.reltoastrelid)), 0)"
+            " FROM members m JOIN pg_class c ON c.oid=m.oid"
+            " LEFT JOIN pg_stat_user_tables s ON s.relid=c.oid"
+            " HAVING to_regclass(%s) IS NOT NULL",
+            (table, table, table),
         )
         row = cur.fetchone()
         if row is None:
             continue
         cur.execute(
-            "SELECT c.relname, pg_relation_size(c.oid), c.reltuples "
-            "FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid "
-            "WHERE i.indrelid=to_regclass(%s) ORDER BY c.relname",
+            "SELECT c.relname,"
+            " CASE WHEN c.relkind='I' THEN (SELECT COALESCE(sum(pg_relation_size(ci.oid)), 0)"
+            "  FROM pg_inherits ih JOIN pg_class ci ON ci.oid=ih.inhrelid WHERE ih.inhparent=c.oid)"
+            " ELSE pg_relation_size(c.oid) END,"
+            " CASE WHEN c.relkind='I' THEN (SELECT COALESCE(sum(ci.reltuples), 0)"
+            "  FROM pg_inherits ih JOIN pg_class ci ON ci.oid=ih.inhrelid WHERE ih.inhparent=c.oid)"
+            " ELSE c.reltuples END"
+            " FROM pg_index i JOIN pg_class c ON c.oid=i.indexrelid"
+            " WHERE i.indrelid=to_regclass(%s) ORDER BY c.relname",
             (table,),
         )
         out['hot_tables'][table] = {
@@ -234,6 +267,26 @@ def hot_table_bloat_ratios(snapshot: dict) -> dict:
             "index_min_entries_per_page": min(densities) if densities else None,
         }
     return ratios
+
+
+def store_layout_section(before: dict, after: dict) -> dict:
+    """The ``store_layout`` block of a round's summary (schema v23): the write
+    layout the round ran on and the partition inventory before and after, so
+    a round in ``inline`` mode or one whose teardown left partitions behind is
+    visible in the record rather than only in a later catalog read."""
+
+    def layout(snapshot: dict) -> dict | None:
+        value = snapshot.get("hot_layout") if isinstance(snapshot, dict) else None
+        return value if isinstance(value, dict) else None
+
+    before_layout = layout(before)
+    after_layout = layout(after)
+    return {
+        "mode": (before_layout or {}).get("mode"),
+        "before": before_layout,
+        "after": after_layout,
+        "recorded": before_layout is not None,
+    }
 
 
 def store_bloat_section(before: dict, after: dict) -> dict:

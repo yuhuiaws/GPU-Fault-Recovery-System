@@ -21,10 +21,17 @@ TABLE_SCOPES = {
     "gpu_fault_processor_lanes": "split_part(ordering_key, ':', 1)",
     "gpu_fault_processor_queue_counts": "cluster_id",
     "gpu_fault_gpu_metric_latest": "cluster_id",
+    "gpu_fault_gpu_metric_latest_clusters": "cluster_id",
     "gpu_fault_gpu_metrics_batches": "cluster_id",
     "gpu_fault_attempt_observations": "cluster_id",
     "gpu_fault_training_progress": "cluster_id",
 }
+# Schema v23: the synthetic clusters' latest-metric rows live in one LIST
+# partition each; the teardown drops those partitions (pages return whole)
+# before the row deletes below sweep whatever a DEFAULT partition caught.
+# Completed-request replays are retention-bound (dropped by bucket) and carry
+# no run-owned state, so they are not counted here.
+PARTITIONED_SCOPES = ("gpu_fault_gpu_metric_latest_clusters",)
 REFERENCE_FIELDS = (
     "event_id",
     "incident_id",
@@ -202,11 +209,23 @@ def record_identifiers(records: dict[tuple[str, str], dict[str, Any]]) -> list[s
     )
 
 
+def present_table_scopes(cursor: Any) -> dict[str, str]:
+    """``TABLE_SCOPES`` restricted to the tables this database has (an older
+    schema lacks the v23 partitioned twin)."""
+
+    present: dict[str, str] = {}
+    for table, expression in TABLE_SCOPES.items():
+        cursor.execute("SELECT to_regclass(%s)", (table,))
+        if cursor.fetchone()[0] is not None:
+            present[table] = expression
+    return present
+
+
 def table_counts(cursor: Any, cluster_ids: list[str]) -> dict[str, int]:
     from psycopg import sql
 
     counts = {}
-    for table, expression in TABLE_SCOPES.items():
+    for table, expression in present_table_scopes(cursor).items():
         cursor.execute(
             sql.SQL("SELECT count(*) FROM {} WHERE {}=ANY(%s)").format(
                 sql.Identifier(table), sql.SQL(expression)
@@ -215,6 +234,28 @@ def table_counts(cursor: Any, cluster_ids: list[str]) -> dict[str, int]:
         )
         counts[table] = int(cursor.fetchone()[0])
     return counts
+
+
+def drop_cluster_partitions(cursor: Any, cluster_ids: list[str]) -> list[str]:
+    """Drop the synthetic clusters' latest-metric partitions (schema v23).
+
+    The product's own helper does the DDL; on a control plane older than v23
+    the import fails and the row deletes below do the work alone.
+    """
+
+    try:
+        from gpu_fault.store.postgres.hot_layout import drop_cluster_partition
+    except ImportError:  # pragma: no cover - a pre-v23 control plane
+        return []
+    cursor.execute("SELECT to_regclass(%s)", (PARTITIONED_SCOPES[0],))
+    if cursor.fetchone()[0] is None:
+        return []
+    dropped = []
+    for cluster_id in cluster_ids:
+        name = drop_cluster_partition(cursor, cluster_id)
+        if name is not None:
+            dropped.append(name)
+    return dropped
 
 
 def require_registry_scope(cursor: Any, run_id: str, cluster_ids: list[str]) -> bool:
@@ -375,7 +416,8 @@ def inspect_or_cleanup(
                     "DELETE FROM gpu_fault_objects WHERE kind=%s AND key=ANY(%s)",
                     (kind, keys),
                 )
-            for table, expression in TABLE_SCOPES.items():
+            dropped_partitions = drop_cluster_partitions(cursor, cluster_ids)
+            for table, expression in present_table_scopes(cursor).items():
                 cursor.execute(
                     sql.SQL("DELETE FROM {} WHERE {}=ANY(%s)").format(
                         sql.Identifier(table), sql.SQL(expression)
@@ -394,6 +436,7 @@ def inspect_or_cleanup(
         "deleted_records": len(records),
         "deleted_links": links,
         "forced_nonterminal": len(stuck),
+        "dropped_partitions": dropped_partitions,
     }
 
 

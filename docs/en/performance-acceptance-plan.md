@@ -968,7 +968,10 @@ pages, `heap_pages_per_live_row`, `index_pages_per_live_row` and `index_min_entr
 the round started on, and `recorded=false` means the in-Pod snapshot failed -- so a round run on a
 bloated store is visible in the acceptance record instead of being reconstructed after a failure. A
 fresh or just-compacted store reads far below 1 on both ratios; a store left uncompacted after the
-previous round's teardown reads in the tens (§3.2). The
+previous round's teardown reads in the tens (§3.2). From schema v23 `summary.json` must also carry
+`store_layout` (§3.3): the `mode` (`inline`/`detached`) and, in the `before`/`after` snapshots, the partition
+counts, pages and live rows of `gpu_fault_gpu_metric_latest_clusters` and `gpu_fault_processor_replays`;
+`recorded=false` means a control plane older than v23. The
 integrated runner must also record `control_plane_pod_lifecycle`, containing at least the total
 restart delta, the Pods that restarted, Pods that appeared/disappeared during the run, counter
 regressions and Pods not Ready at the end. If any item is non-empty or non-zero it cannot count

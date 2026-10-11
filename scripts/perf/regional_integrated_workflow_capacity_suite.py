@@ -57,6 +57,7 @@ if __package__:
         ingress_process_model_preflight,
         postgres_counters,
         store_bloat_section,
+        store_layout_section,
         prepare_start_gate,
         processor_priority_latency,
         publish_fixtures,
@@ -109,6 +110,7 @@ else:
         ingress_process_model_preflight,
         postgres_counters,
         store_bloat_section,
+        store_layout_section,
         prepare_start_gate,
         processor_priority_latency,
         publish_fixtures,
@@ -1184,6 +1186,7 @@ def execute_integrated_jobs(
         "executor": executor,
         "queue_drain": drain,
         "store_bloat": store_bloat_section(postgres_before, postgres_after),
+        "store_layout": store_layout_section(postgres_before, postgres_after),
         "aurora_preflight": aurora_preflight,
         "aurora": aurora_window(
             start_epoch,
