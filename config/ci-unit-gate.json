@@ -79,10 +79,11 @@
       },
       {
         "id": "regional-deployment-support",
-        "description": "The remaining modules of src/gpu_fault_release: admin checks, DNS, GPU bootstrap, endpoint and observability rollback, schema change, notifications, kubeconfig token cache. Listed by name so a new module lands outside every floor visibly rather than inheriting this one. Floors from the 2026-09-07 measurement (group 73.3%, lowest file regional_monitoring_safety.py 57.1%).",
+        "description": "The remaining modules of src/gpu_fault_release: admin checks, DNS, GPU bootstrap, endpoint and observability rollback, schema change, notifications, kubeconfig token cache. Listed by name so a new module lands outside every floor visibly rather than inheriting this one. Floors from the 2026-09-07 measurement (group 73.3%, lowest file regional_monitoring_safety.py 57.1%). regional_admin_checks_readiness.py (the collector readiness re-poll of the verify) joined the group measuring 92.2% (113/120 lines, 40/46 branches) on tests/regional/test_regional_admin_checks_readiness.py; both floors unchanged.",
         "globs": [
           "src/gpu_fault_release/regional_admin_checks.py",
           "src/gpu_fault_release/regional_admin_checks_coverage.py",
+          "src/gpu_fault_release/regional_admin_checks_readiness.py",
           "src/gpu_fault_release/regional_admin_commands.py",
           "src/gpu_fault_release/regional_adot_self_metrics.py",
           "src/gpu_fault_release/regional_aurora_credentials.py",
