@@ -12,7 +12,13 @@ from __future__ import annotations
 from collections.abc import Iterable, Mapping
 from typing import Any
 
-from gpu_fault.cluster_scope import EKS_NODEGROUP_LABEL
+from gpu_fault.cluster_scope import (
+    EKS_NODEGROUP_LABEL,
+    OWNERSHIP_LABEL,
+    selector_matches,
+    selector_ownership_value,
+    selector_requirements,
+)
 from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
 
 NODE_REPAIR_DISABLED = "disabled"
@@ -59,11 +65,35 @@ def node_repair_error(nodegroup_name: str, eks_name: str, state: str) -> str | N
 def selected_nodegroup(selector: str) -> str:
     """The node group an ``eks.amazonaws.com/nodegroup=<name>`` selector names."""
 
-    for term in (selector or "").split(","):
-        key, separator, value = term.strip().partition("=")
-        if separator and key.strip().rstrip("=") == EKS_NODEGROUP_LABEL:
-            return value.strip()
+    for key, operator, values in selector_requirements(selector or ""):
+        if key == EKS_NODEGROUP_LABEL and operator == "in" and len(values) == 1:
+            return next(iter(values))
     return ""
+
+
+def nodegroup_hosts_gpu_nodes(nodegroup: Mapping[str, Any], selector: str) -> bool:
+    """Whether ``selector`` (a cluster's recorded GPU selector) covers this
+    DescribeNodegroup ``nodegroup``.
+
+    A selector naming the ownership label covers the groups whose ``labels``
+    carry that value; one naming a node group covers that group; any other
+    (legacy) selector covers the groups running an accelerator instance type,
+    which is what the retired ``nvidia.com/gpu.present=true`` default meant.
+    """
+
+    name = str(nodegroup.get("nodegroupName") or "")
+    labels = {
+        str(key): str(value) for key, value in (nodegroup.get("labels") or {}).items()
+    }
+    labels[EKS_NODEGROUP_LABEL] = name
+    if selector_ownership_value(selector) is not None:
+        return labels.get(OWNERSHIP_LABEL) == selector_ownership_value(
+            selector
+        ) and selector_matches(labels, selector)
+    named = selected_nodegroup(selector)
+    if named:
+        return name == named
+    return hosts_gpu_instance_types(nodegroup)
 
 
 def hosts_gpu_instance_types(nodegroup: Mapping[str, Any]) -> bool:

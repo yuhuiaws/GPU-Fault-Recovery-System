@@ -9,6 +9,16 @@ module is the one place that turns a cluster's provider and configuration into
 that label selector, so the administrator CLI, the release engine, the deploy
 scripts and the data-plane runtime all select the same node set.
 
+Which nodes a site manages is declared on the node groups, not discovered by
+heuristics: a node group (EKS managed node group ``labels``, HyperPod instance
+group ``KubernetesConfig.Labels``, Karpenter NodePool template labels) whose
+nodes this site manages carries ``OWNERSHIP_LABEL`` with the site id as its
+value, so the label reaches every replacement node the group creates. A
+cluster joined under that convention selects on the label (HyperPod adds the
+cluster-name label as a cross-check); a cluster joined before it existed keeps
+the selector it recorded (``NodeSelectorSource``) until the administrator
+converges it (``gpu-fault-admin node-scope --converge``).
+
 The module is pure and import-light on purpose: both ``gpu_fault.admin`` and
 the data-plane runtime import it, and the two must agree byte for byte on the
 environment variable names, the connection Secret keys and the selector text.
@@ -25,11 +35,14 @@ from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 __all__ = [
     "CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY",
     "CONNECTION_SECRET_NODE_SELECTOR_KEY",
+    "CONNECTION_SECRET_NODE_SELECTOR_SOURCE_KEY",
     "CONNECTION_SECRET_PROVIDER_KEY",
-    "DEFAULT_EKS_MANAGED_NODE_SELECTOR",
     "EKS_MANAGED_FAILURE_DOMAIN_LABELS",
     "EKS_CLUSTER_NAME_ENV",
     "EKS_NODEGROUP_LABEL",
+    "HYPERPOD_INSTANCE_GROUP_LABEL",
+    "INSTANCE_TYPE_LABEL",
+    "OWNERSHIP_LABEL",
     "PROVIDER_NODE_REBOOT_OWNERS",
     "PROVIDER_PROFILE_SOURCES",
     "PROVIDER_PROFILE_VERSIONS",
@@ -38,15 +51,21 @@ __all__ = [
     "NODE_SELECTOR_ENV",
     "PROVIDER_ENV",
     "ClusterProvider",
+    "NodeSelectorSource",
     "cluster_provider",
     "default_failure_domain_labels",
     "ec2_instance_id_from_provider_id",
     "is_eks_managed",
     "node_selector",
+    "node_selector_source",
     "nodegroup_node_selector",
+    "ownership_node_selector",
     "provider_cluster_name",
     "selector_matches",
+    "selector_ownership_value",
+    "selector_requirements",
     "validate_node_selector",
+    "validate_ownership_value",
 ]
 
 #: Environment variable that tells a data-plane component which provider the
@@ -61,6 +80,9 @@ NODE_SELECTOR_ENV = "GPU_FAULT_NODE_SELECTOR"
 #: site renders exactly as it did before the keys existed.
 CONNECTION_SECRET_PROVIDER_KEY = "cluster-provider"
 CONNECTION_SECRET_NODE_SELECTOR_KEY = "node-selector"
+#: Where the recorded selector came from (``NodeSelectorSource``), written next
+#: to it for audit; the data plane never reads it.
+CONNECTION_SECRET_NODE_SELECTOR_SOURCE_KEY = "node-selector-source"
 #: The EKS cluster name of an ``eks-managed`` cluster (empty for HyperPod);
 #: feeds the optional ``GPU_FAULT_EKS_CLUSTER_NAME`` the EKS provider matches
 #: against the ``eks:cluster-name`` instance tag.
@@ -71,11 +93,15 @@ EKS_CLUSTER_NAME_ENV = "GPU_FAULT_EKS_CLUSTER_NAME"
 HYPERPOD_CLUSTER_LABEL = "sagemaker.amazonaws.com/cluster-name"
 #: The label EKS stamps on every node of a managed node group.
 EKS_NODEGROUP_LABEL = "eks.amazonaws.com/nodegroup"
-#: The GPU node selector a plain EKS join uses unless told otherwise: the
-#: label NVIDIA GPU feature discovery (and the EKS NVIDIA AMI device plugin
-#: bundle) sets on nodes that actually expose GPUs. CPU node groups never
-#: carry it.
-DEFAULT_EKS_MANAGED_NODE_SELECTOR = "nvidia.com/gpu.present=true"
+#: The label HyperPod stamps with the node's instance group name.
+HYPERPOD_INSTANCE_GROUP_LABEL = "sagemaker.amazonaws.com/instance-group-name"
+#: The well-known instance type label (``ml.<type>`` on HyperPod nodes).
+INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"
+#: The ownership label. A node group whose nodes this site manages carries it
+#: with the site id (``bootstrap_site.site_identifier``, printed by
+#: ``gpu-fault-admin site-id``) as the value; ``deploy`` and ``join-cluster``
+#: select a GPU cluster's nodes through it and refuse a cluster without it.
+OWNERSHIP_LABEL = "gpu-fault.io/control-plane"
 #: The ``nodeReboot`` owner each provider's executor advertises: the lifecycle
 #: adapter it constructs (``adapters/hyperpod/lifecycle.py`` default owner and
 #: ``eks_provider.EKS_ADAPTER_OWNER``). A Runtime Profile whose ``nodeReboot``
@@ -159,6 +185,25 @@ class ClusterProvider(StrEnum):
     EKS_MANAGED = "eks-managed"
 
 
+class NodeSelectorSource(StrEnum):
+    """Where a cluster's recorded GPU node selector came from.
+
+    * ``label-convention``: derived from the node groups that carry
+      ``OWNERSHIP_LABEL=<site id>`` -- the only way a cluster joins now.
+    * ``provider-default-legacy``: a HyperPod cluster joined before the
+      convention; it recorded no selector and keeps selecting every node of
+      the HyperPod cluster (the cluster-name label) until converged.
+    * ``flag-legacy``: a plain EKS cluster joined before the convention; its
+      selector came from the retired ``--gpu-nodegroup`` / ``--node-selector``
+      flags or their ``nvidia.com/gpu.present=true`` default and stays the
+      runtime truth until converged.
+    """
+
+    LABEL_CONVENTION = "label-convention"
+    PROVIDER_DEFAULT_LEGACY = "provider-default-legacy"
+    FLAG_LEGACY = "flag-legacy"
+
+
 def cluster_provider(value: object) -> ClusterProvider:
     """Parse a provider name; empty or absent means ``hyperpod``.
 
@@ -238,10 +283,12 @@ def node_selector(
     site cluster entry or a rendered release-config entry. Keyword arguments
     override what ``target`` carries.
 
-    * ``hyperpod``: an explicit ``node_selector`` wins; otherwise the HyperPod
-      label ``sagemaker.amazonaws.com/cluster-name=<name>``. Every site that
-      existed before plain EKS support therefore selects exactly as before.
-    * ``eks-managed``: the configured ``node_selector`` is required. There is
+    * ``hyperpod``: the recorded ``node_selector`` wins (a cluster joined
+      under the ownership convention records the label selector); otherwise
+      the HyperPod label ``sagemaker.amazonaws.com/cluster-name=<name>``, the
+      runtime truth of every HyperPod cluster joined before the convention
+      (``NodeSelectorSource.PROVIDER_DEFAULT_LEGACY``).
+    * ``eks-managed``: the recorded ``node_selector`` is required. There is
       no HyperPod label to fall back on, and a selector that matched every
       node would hand the CPU node group to the GPU data plane.
     """
@@ -265,7 +312,100 @@ def node_selector(
         if not name:
             raise ValueError("a HyperPod cluster needs its HyperPod cluster name")
         return f"{HYPERPOD_CLUSTER_LABEL}={name}"
-    raise ValueError("an eks-managed cluster requires an explicit node selector")
+    raise ValueError(
+        "an eks-managed cluster has no recorded node selector; join-cluster "
+        f"records it from the node groups labelled {OWNERSHIP_LABEL}=<site id>"
+    )
+
+
+def validate_ownership_value(site_id: str) -> str:
+    """``site_id`` as a label value, or ``ValueError``.
+
+    The site id is a ``safe_name`` of at most 48 characters, so it always fits
+    a label value; the check exists for a hand-typed value.
+    """
+
+    value = str(site_id or "").strip()
+    if not value or not _LABEL_VALUE.fullmatch(value):
+        raise ValueError(f"invalid ownership label value: {site_id!r}")
+    return value
+
+
+def ownership_node_selector(
+    site_id: str,
+    *,
+    provider: object = None,
+    hyperpod_cluster_name: str = "",
+) -> str:
+    """The selector a cluster joined under the ownership convention records.
+
+    ``OWNERSHIP_LABEL=<site id>`` names the nodes; a HyperPod cluster adds
+    its cluster-name label as a cross-check, so a label copied onto a node of
+    another HyperPod cluster behind the same EKS API server selects nothing.
+    """
+
+    value = validate_ownership_value(site_id)
+    term = f"{OWNERSHIP_LABEL}={value}"
+    if cluster_provider(provider) is ClusterProvider.HYPERPOD:
+        name = hyperpod_cluster_name.strip()
+        if not name:
+            raise ValueError("a HyperPod cluster needs its HyperPod cluster name")
+        return f"{term},{HYPERPOD_CLUSTER_LABEL}={name}"
+    return term
+
+
+def selector_ownership_value(selector: str) -> str | None:
+    """The site id an ``OWNERSHIP_LABEL=<id>`` requirement names, else ``None``."""
+
+    for key, operator, values in selector_requirements(selector):
+        if key == OWNERSHIP_LABEL and operator == "in" and len(values) == 1:
+            return next(iter(values))
+    return None
+
+
+def node_selector_source(
+    target: object,
+    *,
+    provider: object = None,
+    selector: str | None = None,
+    source: str | None = None,
+) -> NodeSelectorSource:
+    """Where ``target``'s selector came from: recorded, or derived for a
+    cluster recorded before the source was.
+
+    A recorded value wins. Without one, a selector naming ``OWNERSHIP_LABEL``
+    is the convention; an empty HyperPod selector is the legacy cluster-name
+    default; any other recorded selector could only have come from the
+    retired flags (or their ``nvidia.com/gpu.present=true`` default).
+    """
+
+    recorded = (
+        source
+        if source is not None
+        else str(_field(target, "node_selector_source", "nodeSelectorSource") or "")
+    ).strip()
+    if recorded:
+        try:
+            return NodeSelectorSource(recorded)
+        except ValueError:
+            raise ValueError(
+                "node selector source must be one of "
+                + ", ".join(item.value for item in NodeSelectorSource)
+                + f", got {recorded!r}"
+            ) from None
+    configured = (
+        selector
+        if selector is not None
+        else str(_field(target, "node_selector", "nodeSelector") or "")
+    ).strip()
+    if configured and selector_ownership_value(configured) is not None:
+        return NodeSelectorSource.LABEL_CONVENTION
+    kind = cluster_provider(
+        provider if provider is not None else _field(target, "provider")
+    )
+    if kind is ClusterProvider.HYPERPOD and not configured:
+        return NodeSelectorSource.PROVIDER_DEFAULT_LEGACY
+    return NodeSelectorSource.FLAG_LEGACY
 
 
 def _terms(selector: str) -> list[str]:
@@ -332,6 +472,19 @@ def _requirements(selector: str) -> list[tuple[str, str, frozenset[str]]]:
             raise ValueError(f"invalid label value in node selector: {term}")
         requirements.append((key, operator, values))
     return requirements
+
+
+def selector_requirements(
+    selector: str,
+) -> tuple[tuple[str, str, frozenset[str]], ...]:
+    """``(key, operator, values)`` per requirement of ``selector``.
+
+    ``operator`` is ``in`` / ``notin`` / ``exists`` / ``absent``; a term's
+    commas inside ``(a,b)`` are not requirement separators. The one parser
+    every reader of a selector's text uses, so none splits on ``,`` itself.
+    """
+
+    return tuple(_requirements(selector.strip()))
 
 
 def validate_node_selector(selector: str) -> str:

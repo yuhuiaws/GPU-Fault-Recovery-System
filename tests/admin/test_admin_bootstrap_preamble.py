@@ -288,6 +288,7 @@ def test_a_persisted_hint_replaces_the_region_inventory_with_one_describe(
         role="gpu",
         context="gpu-a",
         hyperpod_hints=admin_bootstrap.load_hyperpod_hints(state_dir),
+        resolve_node_scope=False,
     )
 
     assert discovered.hyperpod_name == "gpu-a"
@@ -316,6 +317,7 @@ def test_a_stale_hint_falls_back_to_the_inventory(monkeypatch) -> None:
         role="gpu",
         context="gpu-a",
         hyperpod_hints={eks_a: region.clusters[list(region.clusters)[1]]["ClusterArn"]},
+        resolve_node_scope=False,
     )
     assert rewired.hyperpod_name == "gpu-a"
     assert "sagemaker list-clusters" in region.calls, "a stale hint was trusted"
@@ -329,6 +331,7 @@ def test_a_stale_hint_falls_back_to_the_inventory(monkeypatch) -> None:
         role="gpu",
         context="gpu-a",
         hyperpod_hints={eks_a: "arn:aws:sagemaker:us-east-1:123456789012:cluster/old"},
+        resolve_node_scope=False,
     )
     assert gone.hyperpod_name == "gpu-a"
     assert admin_bootstrap.load_hyperpod_hints(Path("/nonexistent")) == {}

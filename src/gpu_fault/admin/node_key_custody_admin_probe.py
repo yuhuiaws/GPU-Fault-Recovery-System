@@ -11,6 +11,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.cluster_scope import node_selector, selector_matches
 from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
     CommandRunner,
@@ -124,6 +125,7 @@ def custody_verifier(
 def live_node_uids(
     runner: CommandRunner, context: AdminNodeKeyContext
 ) -> dict[str, str]:
+    selector = node_selector(context.cluster)
     document = private_json(
         runner,
         [
@@ -131,7 +133,7 @@ def live_node_uids(
             "get",
             "nodes",
             "-l",
-            "sagemaker.amazonaws.com/cluster-name=" + context.cluster.hyperpod_name,
+            selector,
             "-o",
             "json",
         ],
@@ -154,10 +156,7 @@ def live_node_uids(
                 item.get("apiVersion") != "v1"
                 or item.get("kind") != "Node"
                 or metadata.get("deletionTimestamp")
-                or metadata.get("labels", {}).get(
-                    "sagemaker.amazonaws.com/cluster-name"
-                )
-                != context.cluster.hyperpod_name
+                or not selector_matches(metadata.get("labels", {}), selector)
                 or not isinstance(name, str)
                 or not name
                 or not isinstance(uid, str)

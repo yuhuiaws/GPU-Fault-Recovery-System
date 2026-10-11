@@ -14,7 +14,7 @@ from gpu_fault.eks_node_repair import (
     hosts_gpu_instance_types,
     node_repair_error,
     node_repair_state,
-    selected_nodegroup,
+    nodegroup_hosts_gpu_nodes,
 )
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
@@ -204,18 +204,19 @@ def validate_eks_managed_cluster(
     *,
     region: str,
     expected_eks_arn: str,
-    gpu_nodegroup: str = "",
+    node_selector: str = "",
 ) -> dict[str, dict[str, Any]]:
     """A plain EKS GPU cluster: the cluster and its managed node groups are ACTIVE
     and no node group hosting GPU nodes repairs them itself.
 
     There is no HyperPod to describe; the counterpart of its ``NodeRecovery``
     gate is EKS node auto repair (``nodeRepairConfig.enabled``), which would
-    race this solution's recovery. A GPU node group is the one the selector
-    names (``gpu_nodegroup``) or any group running an accelerator instance
-    type. Returns the per-group facts (``status``, ``node_repair``, ``gpu``) so
-    the ``regional_contexts`` check records them; ``unset`` is the opt-in field
-    never written, which EKS treats as off.
+    race this solution's recovery. A GPU node group is one the cluster's
+    recorded ``node_selector`` covers (``eks_node_repair.nodegroup_hosts_gpu_nodes``:
+    the ownership label, a named node group, or -- for a legacy selector --
+    an accelerator instance type). Returns the per-group facts (``status``,
+    ``node_repair``, ``gpu``) so the ``regional_contexts`` check records them;
+    ``unset`` is the opt-in field never written, which EKS treats as off.
     """
 
     eks_name = expected_eks_arn.rsplit("/", 1)[-1]
@@ -290,7 +291,11 @@ def validate_eks_managed_cluster(
                 f"EKS node group {nodegroup} of {eks_name} is not ACTIVE ({status})"
             )
         repair = node_repair_state(group)
-        gpu = nodegroup == gpu_nodegroup or hosts_gpu_instance_types(group)
+        gpu = (
+            nodegroup_hosts_gpu_nodes(group, node_selector)
+            if node_selector
+            else hosts_gpu_instance_types(group)
+        )
         facts[nodegroup] = {"status": status, "node_repair": repair, "gpu": gpu}
         if gpu:
             reason = node_repair_error(nodegroup, eks_name, repair)
@@ -423,7 +428,7 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
                     runner,
                     region=target.region,
                     expected_eks_arn=target.eks_cluster_arn,
-                    gpu_nodegroup=selected_nodegroup(node_selector(target)),
+                    node_selector=node_selector(target),
                 ),
             }
         else:

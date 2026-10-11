@@ -72,11 +72,15 @@ def assert_site_custody_current(site: RenderedSite, runner: CommandRunner) -> No
     for entry in site.release_config["clusters"]:
         if entry["eks_cluster_arn"] not in registration.selection.clusters:
             continue
+        # The site entry's recorded node scope is the runtime truth; the
+        # rediscovery only confirms the cluster's identity.
         cluster = discover_cluster(
             readonly,
             cluster_arn=entry["eks_cluster_arn"],
             role="gpu",
             context=entry["context"],
+            site_id=str(site.release_config["site_name"]),
+            existing_clusters=tuple(site.release_config["clusters"]),
         )
         context = site_custody_context(site, cluster, str(entry["cluster_id"]))
         try:

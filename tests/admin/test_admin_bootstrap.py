@@ -154,7 +154,11 @@ def test_hyperpod_discovery_uses_the_complete_input_arn(monkeypatch) -> None:
     )
 
     discovered = admin_bootstrap.discover_cluster(
-        Runner(), cluster_arn=hyperpod_arn, role="gpu", context="gpu-a"
+        Runner(),
+        cluster_arn=hyperpod_arn,
+        role="gpu",
+        context="gpu-a",
+        resolve_node_scope=False,
     )
 
     assert discovered.hyperpod_name == "gpu-a"
@@ -215,7 +219,11 @@ def test_agent_cidrs_come_from_the_hyperpod_node_subnets_too(monkeypatch) -> Non
             }
 
     discovered = admin_bootstrap.discover_cluster(
-        Runner(), cluster_arn=hyperpod_arn, role="gpu", context="gpu-a"
+        Runner(),
+        cluster_arn=hyperpod_arn,
+        role="gpu",
+        context="gpu-a",
+        resolve_node_scope=False,
     )
 
     assert described == [
@@ -276,7 +284,11 @@ def test_eks_hyperpod_inventory_is_loaded_once_per_runner(monkeypatch) -> None:
 
     for name, eks_arn in eks_arns.items():
         discovered = admin_bootstrap.discover_cluster(
-            runner, cluster_arn=eks_arn, role="gpu", context=name
+            runner,
+            cluster_arn=eks_arn,
+            role="gpu",
+            context=name,
+            resolve_node_scope=False,
         )
         assert discovered.hyperpod_name == name
 

@@ -831,11 +831,10 @@ def test_executor_verifier_is_pinned_to_the_executor_wheel() -> None:
 def test_gpu_cluster_check_is_pinned_to_the_node_wheel(monkeypatch) -> None:
     """Node installer drift is measured against the node runtime wheel.
 
-    The installer annotates each node with the artifact digest it installed. It
-    installs the node-runtime wheel, so comparing that annotation with the
-    control-plane wheel digest would report drift on every healthy node -- and
-    comparing it with nothing at all would hide a node still running the
-    previous release.
+    The installer annotates each node with the artifact digest it installed
+    (the node-runtime wheel): comparing it with the control-plane wheel digest
+    would report drift on every healthy node, and comparing it with nothing
+    would hide a node still running the previous release.
     """
 
     module = _checks_module()
@@ -848,6 +847,7 @@ def test_gpu_cluster_check_is_pinned_to_the_node_wheel(monkeypatch) -> None:
                 {
                     "metadata": {
                         "name": "node-a",
+                        "labels": {"sagemaker.amazonaws.com/cluster-name": "hp-a"},
                         "annotations": {
                             "gpu-fault.io/installer-state": "Succeeded",
                             "gpu-fault.io/installer-artifact-sha256": installed,

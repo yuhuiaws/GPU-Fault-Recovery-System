@@ -60,8 +60,18 @@ GPU_NODE = "ip-10-0-33-205.us-west-2.compute.internal"
 GPU_INSTANCE = "i-00000000000000001"
 
 
+SITE_ID = "us-east-1-control-985fd370"
+OWNERSHIP = "gpu-fault.io/control-plane"
+EKS_OWNERSHIP_SELECTOR = f"{OWNERSHIP}={SITE_ID}"
+
+
 class EksRunner:
-    """``aws`` answers for a Region that has no HyperPod cluster at all."""
+    """``aws`` answers for a Region that has no HyperPod cluster at all.
+
+    The GPU node group carries the ownership label for ``SITE_ID`` unless a
+    test says otherwise (``ownership``); the CPU node group never does unless a
+    test labels it (``cpu_ownership``) to model an operator mistake.
+    """
 
     def __init__(
         self,
@@ -69,14 +79,29 @@ class EksRunner:
         status: str = "ACTIVE",
         nodegroup_status: str = "ACTIVE",
         node_repair: bool | None = None,
+        ownership: str | None = SITE_ID,
+        cpu_ownership: str | None = None,
     ):
         self.status = status
         self.nodegroup_status = nodegroup_status
         # EKS node auto repair of the GPU node group: None leaves the opt-in
         # field out of the description, as EKS does for a group never configured.
         self.node_repair = node_repair
+        self.ownership = ownership
+        self.cpu_ownership = cpu_ownership
         self.calls: list[tuple[str, str, tuple[str, ...]]] = []
         self.hyperpods: list[dict] = []
+
+    def nodegroup_labels(self, gpu: bool) -> dict[str, str]:
+        if gpu:
+            labels = {"node-type": "gpu", "nvidia.com/gpu.present": "true"}
+            if self.ownership is not None:
+                labels[OWNERSHIP] = self.ownership
+            return labels
+        labels = {"node-type": "cpu"}
+        if self.cpu_ownership is not None:
+            labels[OWNERSHIP] = self.cpu_ownership
+        return labels
 
     def aws_json(self, region, service, operation, *arguments, **_options):
         self.calls.append((service, operation, tuple(arguments)))
@@ -117,11 +142,7 @@ class EksRunner:
                     "capacityType": "SPOT" if gpu else "ON_DEMAND",
                     "instanceTypes": ["p5en.48xlarge"] if gpu else ["m7i-flex.xlarge"],
                     "subnets": list(GPU_SUBNETS if gpu else CPU_SUBNETS),
-                    "labels": (
-                        {"node-type": "gpu", "nvidia.com/gpu.present": "true"}
-                        if gpu
-                        else {"node-type": "cpu"}
-                    ),
+                    "labels": self.nodegroup_labels(gpu),
                     **(
                         {"nodeRepairConfig": {"enabled": self.node_repair}}
                         if gpu and self.node_repair is not None
@@ -139,17 +160,26 @@ class EksRunner:
         raise AssertionError(f"unexpected discovery call {service}/{operation}")
 
 
+def _discover(runner, **overrides):
+    arguments = dict(
+        cluster_arn=EKS_ARN, role="gpu", context="gpu-eks", site_id=SITE_ID
+    )
+    arguments.update(overrides)
+    return admin_bootstrap.discover_cluster(runner, **arguments)
+
+
 def test_eks_arn_without_hyperpod_discovers_an_eks_managed_identity() -> None:
     runner = EksRunner()
 
-    identity = admin_bootstrap.discover_cluster(
-        runner, cluster_arn=EKS_ARN, role="gpu", context="gpu-eks"
-    )
+    identity = _discover(runner)
 
     assert identity.provider == "eks-managed", "a HyperPod-less EKS ARN is eks-managed"
     assert identity.is_eks_managed, "the identity must report itself as plain EKS"
-    assert identity.node_selector == "nvidia.com/gpu.present=true", (
-        "the default eks-managed selector must be recorded on the identity"
+    assert identity.node_selector == EKS_OWNERSHIP_SELECTOR, (
+        "the ownership label selector must be recorded on the identity"
+    )
+    assert identity.node_selector_source == "label-convention", (
+        "a cluster joining now records where its selector came from"
     )
     assert (identity.hyperpod_arn, identity.hyperpod_name, identity.node_recovery) == (
         "",
@@ -167,72 +197,143 @@ def test_eks_arn_without_hyperpod_discovers_an_eks_managed_identity() -> None:
         "subnet_ids stays the EKS set that places Aurora and the NLB"
     )
     assert identity.subnet_cidrs == ("10.0.0.0/20", "10.0.16.0/20"), (
-        "Agent endpoint CIDRs must come from the GPU node group subnets only"
+        "Agent endpoint CIDRs must come from the labelled node group subnets only"
     )
     assert default_cluster_id(identity) == EKS_NAME, (
         "the default cluster_id of a plain EKS cluster is its EKS name"
     )
-    assert node_selector(identity) == "nvidia.com/gpu.present=true", (
+    assert node_selector(identity) == EKS_OWNERSHIP_SELECTOR, (
         "the selector helper must return the recorded eks-managed selector"
-    )
-    assert all(
-        operation.startswith(("describe", "list")) for _s, operation, _a in runner.calls
-    ), "discovery performed a mutation"
-
-
-def test_gpu_nodegroup_flag_selects_that_node_group_and_its_subnets() -> None:
-    runner = EksRunner()
-
-    identity = admin_bootstrap.discover_cluster(
-        runner,
-        cluster_arn=EKS_ARN,
-        role="gpu",
-        context="gpu-eks",
-        node_selector=f"eks.amazonaws.com/nodegroup={GPU_NODEGROUP}",
-    )
-
-    assert identity.node_selector == f"eks.amazonaws.com/nodegroup={GPU_NODEGROUP}", (
-        "an explicit node group selector must be recorded verbatim"
     )
     described = [
         arguments[arguments.index("--nodegroup-name") + 1]
         for service, operation, arguments in runner.calls
         if (service, operation) == ("eks", "describe-nodegroup")
     ]
-    assert described == [GPU_NODEGROUP], (
-        "only the named node group is described when the selector names one"
+    assert described == [CPU_NODEGROUP, GPU_NODEGROUP], (
+        "every node group is described: the label is compared on all of them"
+    )
+    assert all(
+        operation.startswith(("describe", "list")) for _s, operation, _a in runner.calls
+    ), "discovery performed a mutation"
+
+
+def test_a_cluster_without_a_labelled_node_group_is_refused_with_the_evidence() -> None:
+    runner = EksRunner(ownership=None)
+
+    with pytest.raises(BootstrapError) as refusal:
+        _discover(runner)
+
+    message = str(refusal.value)
+    assert f"{OWNERSHIP}={SITE_ID}" in message, "the exact label and site id are named"
+    assert "gpu-fault-admin site-id" in message, "the verb that prints the id is named"
+    assert (
+        f"{GPU_NODEGROUP} instanceTypes=p5en.48xlarge {OWNERSHIP}=absent" in message
+    ), "the describe-nodegroup evidence of every group is printed"
+    assert (
+        f"{CPU_NODEGROUP} instanceTypes=m7i-flex.xlarge {OWNERSHIP}=absent" in message
+    )
+    assert (
+        f"aws eks update-nodegroup-config --cluster-name {EKS_NAME} "
+        f"--nodegroup-name {GPU_NODEGROUP} --labels addOrUpdateLabels={{{OWNERSHIP}={SITE_ID}}}"
+    ) in message, "the remedy names the GPU node group"
+    assert not any(
+        operation.startswith(("create", "update", "put", "tag"))
+        for _s, operation, _a in runner.calls
+    ), "a refusal happens before any mutation"
+
+
+def test_a_node_group_labelled_for_another_site_is_refused() -> None:
+    with pytest.raises(BootstrapError, match="name another site") as refusal:
+        _discover(EksRunner(ownership="us-east-1-other-site-00000000"))
+    message = str(refusal.value)
+    assert (
+        f"{GPU_NODEGROUP} carries {OWNERSHIP}=us-east-1-other-site-00000000" in message
+    )
+    assert f"this site is {OWNERSHIP}={SITE_ID}" in message
+
+
+def test_a_labelled_node_group_outside_the_gpu_inventory_is_refused() -> None:
+    with pytest.raises(
+        BootstrapError, match="outside the GPU instance inventory"
+    ) as refusal:
+        _discover(EksRunner(cpu_ownership=SITE_ID))
+    message = str(refusal.value)
+    assert f"{CPU_NODEGROUP} runs m7i-flex.xlarge" in message, (
+        "the node group and its instance types are named"
+    )
+    assert "p5en.48xlarge" in message, "the inventory is listed"
+
+
+def test_the_label_is_not_consulted_without_a_site_id() -> None:
+    with pytest.raises(BootstrapError, match="needs the site id"):
+        _discover(EksRunner(), site_id=None)
+
+
+def test_an_already_managed_cluster_keeps_its_recorded_selector() -> None:
+    """A legacy entry (the retired --gpu-nodegroup flag) is the runtime truth:
+    discovery of a managed cluster never re-derives membership, even when the
+    node groups are labelled now -- that is node-scope --converge."""
+
+    runner = EksRunner()
+    recorded = f"eks.amazonaws.com/nodegroup={GPU_NODEGROUP}"
+    entries = (
+        {
+            "clusterId": EKS_NAME,
+            "provider": "eks-managed",
+            "eksClusterArn": EKS_ARN,
+            "nodeSelector": recorded,
+        },
+    )
+
+    identity = _discover(runner, existing_clusters=entries)
+
+    assert identity.node_selector == recorded, "the recorded selector is kept verbatim"
+    assert identity.node_selector_source == "flag-legacy", (
+        "a selector recorded by the retired flags says so until converged"
     )
     assert identity.subnet_cidrs == ("10.0.0.0/20", "10.0.16.0/20"), (
-        "CIDRs follow the named node group"
+        "CIDRs follow the node group the recorded selector names"
+    )
+    unlabelled = _discover(
+        EksRunner(ownership=None),
+        existing_clusters=(
+            {
+                "cluster_id": EKS_NAME,
+                "provider": "eks-managed",
+                "eks_cluster_arn": EKS_ARN,
+                "node_selector": "nvidia.com/gpu.present=true",
+            },
+        ),
+    )
+    assert unlabelled.node_selector == "nvidia.com/gpu.present=true", (
+        "a legacy site without any label keeps deploying with its recorded default"
+    )
+    assert unlabelled.subnet_cidrs == ("10.0.0.0/20", "10.0.16.0/20"), (
+        "the retired default meant the GPU inventory node groups"
     )
 
 
-def test_unknown_nodegroup_in_selector_fails_closed() -> None:
-    with pytest.raises(BootstrapError, match="no managed node group named"):
-        admin_bootstrap.discover_cluster(
+def test_a_recorded_selector_covering_no_node_group_fails_closed() -> None:
+    with pytest.raises(BootstrapError, match="covers none of its managed node groups"):
+        _discover(
             EksRunner(),
-            cluster_arn=EKS_ARN,
-            role="gpu",
-            context="gpu-eks",
-            node_selector="eks.amazonaws.com/nodegroup=missing",
+            existing_clusters=(
+                {
+                    "clusterId": EKS_NAME,
+                    "provider": "eks-managed",
+                    "eksClusterArn": EKS_ARN,
+                    "nodeSelector": "eks.amazonaws.com/nodegroup=missing",
+                },
+            ),
         )
 
 
 def test_eks_managed_discovery_refuses_inactive_cluster_or_nodegroup() -> None:
     with pytest.raises(BootstrapError, match="not ACTIVE"):
-        admin_bootstrap.discover_cluster(
-            EksRunner(status="UPDATING"),
-            cluster_arn=EKS_ARN,
-            role="gpu",
-            context="gpu-eks",
-        )
+        _discover(EksRunner(status="UPDATING"))
     with pytest.raises(BootstrapError, match="is not ACTIVE"):
-        admin_bootstrap.discover_cluster(
-            EksRunner(nodegroup_status="DEGRADED"),
-            cluster_arn=EKS_ARN,
-            role="gpu",
-            context="gpu-eks",
-        )
+        _discover(EksRunner(nodegroup_status="DEGRADED"))
 
 
 def test_eks_managed_discovery_refuses_node_auto_repair_like_node_recovery() -> None:
@@ -241,52 +342,38 @@ def test_eks_managed_discovery_refuses_node_auto_repair_like_node_recovery() -> 
     false is recorded as disabled."""
 
     with pytest.raises(BootstrapError, match="has node auto repair enabled") as refusal:
-        admin_bootstrap.discover_cluster(
-            EksRunner(node_repair=True),
-            cluster_arn=EKS_ARN,
-            role="gpu",
-            context="gpu-eks",
-        )
+        _discover(EksRunner(node_repair=True))
     assert GPU_NODEGROUP in str(refusal.value) and "NodeRecovery=None" in str(
         refusal.value
     ), "name the node group and the HyperPod rule it mirrors"
-    identity = admin_bootstrap.discover_cluster(
-        EksRunner(node_repair=False), cluster_arn=EKS_ARN, role="gpu", context="gpu-eks"
-    )
+    identity = _discover(EksRunner(node_repair=False))
     assert identity.node_repair == "disabled"
 
 
-def test_eks_managed_discovery_refuses_a_cpu_role_and_bad_selectors() -> None:
+def test_eks_managed_discovery_refuses_a_cpu_role() -> None:
     with pytest.raises(BootstrapError, match="CPU control plane must be a HyperPod"):
         admin_bootstrap.discover_cluster(
             EksRunner(), cluster_arn=EKS_ARN, role="cpu", context="cpu"
         )
-    with pytest.raises(BootstrapError, match="invalid --node-selector"):
-        admin_bootstrap.discover_cluster(
-            EksRunner(),
-            cluster_arn=EKS_ARN,
-            role="gpu",
-            context="gpu-eks",
-            node_selector="bad key=1",
-        )
 
 
-def test_cluster_with_no_gpu_nodegroup_names_the_remedy() -> None:
-    class CpuOnly(EksRunner):
-        def aws_json(self, region, service, operation, *arguments, **options):
-            if (service, operation) == ("eks", "list-nodegroups"):
-                self.calls.append((service, operation, tuple(arguments)))
-                return {"nodegroups": [CPU_NODEGROUP]}
-            return super().aws_json(region, service, operation, *arguments, **options)
+def test_identity_only_discovery_needs_no_site_id_and_resolves_no_scope() -> None:
+    """remove-cluster and rotate-token only need the ARNs and names."""
 
-    with pytest.raises(BootstrapError, match="--gpu-nodegroup"):
-        admin_bootstrap.discover_cluster(
-            CpuOnly(), cluster_arn=EKS_ARN, role="gpu", context="gpu-eks"
-        )
+    identity = admin_bootstrap.discover_cluster(
+        EksRunner(ownership=None),
+        cluster_arn=EKS_ARN,
+        role="gpu",
+        context="gpu-eks",
+        resolve_node_scope=False,
+    )
+    assert identity.eks_arn == EKS_ARN and identity.is_eks_managed
+    assert (identity.node_selector, identity.node_selector_source) == ("", ""), (
+        "an identity-only read records no node scope"
+    )
 
 
-def test_hyperpod_discovery_is_unchanged_when_the_eks_arn_has_an_orchestrator() -> None:
-    runner = EksRunner()
+def _orchestrated_hyperpod(runner, *, groups):
     hyperpod_arn = f"arn:aws:sagemaker:{REGION}:{ACCOUNT}:cluster/hp-gpu-eks"
     runner.hyperpods.append(
         {
@@ -294,38 +381,132 @@ def test_hyperpod_discovery_is_unchanged_when_the_eks_arn_has_an_orchestrator() 
             "ClusterName": "hp-gpu-eks",
             "NodeRecovery": "None",
             "Orchestrator": {"Eks": {"ClusterArn": EKS_ARN}},
+            "InstanceGroups": groups,
         }
     )
 
-    identity = admin_bootstrap.discover_cluster(
-        runner, cluster_arn=EKS_ARN, role="gpu", context="gpu-eks"
+
+def _instance_group(name, instance_type, labels=None, desired=None):
+    group = {"InstanceGroupName": name, "InstanceType": instance_type}
+    kubernetes = {}
+    if labels is not None:
+        kubernetes["CurrentLabels"] = labels
+    if desired is not None:
+        kubernetes["DesiredLabels"] = desired
+    if kubernetes:
+        group["KubernetesConfig"] = kubernetes
+    return group
+
+
+def test_hyperpod_discovery_selects_the_labelled_instance_groups() -> None:
+    runner = EksRunner()
+    _orchestrated_hyperpod(
+        runner,
+        groups=[
+            _instance_group("spot-p5en", "ml.p5en.48xlarge", {OWNERSHIP: SITE_ID}),
+            _instance_group("accelerated-g6", "ml.g6.12xlarge"),
+        ],
     )
+
+    identity = _discover(runner)
 
     assert identity.provider == "hyperpod", "an orchestrated EKS ARN stays HyperPod"
     assert identity.hyperpod_name == "hp-gpu-eks", "the HyperPod name is recorded"
-    assert node_selector(identity) == (
-        "sagemaker.amazonaws.com/cluster-name=hp-gpu-eks"
-    ), "the HyperPod selector text is byte-identical to the historical label"
+    assert identity.node_selector == (
+        f"{OWNERSHIP}={SITE_ID},sagemaker.amazonaws.com/cluster-name=hp-gpu-eks"
+    ), "the selector is the ownership label cross-checked with the cluster label"
+    assert identity.node_selector_source == "label-convention"
     assert not any(
         operation in {"list-nodegroups", "describe-nodegroup"}
         for _s, operation, _a in runner.calls
     ), "HyperPod discovery must not read EKS node groups"
 
 
-def test_bootstrap_request_derives_the_nodegroup_selector_and_refuses_both() -> None:
+def test_hyperpod_cluster_without_a_labelled_instance_group_is_refused() -> None:
+    runner = EksRunner()
+    _orchestrated_hyperpod(
+        runner,
+        groups=[
+            _instance_group(
+                "spot-p5en", "ml.p5en.48xlarge", labels={}, desired={OWNERSHIP: SITE_ID}
+            ),
+            _instance_group("accelerated-g6", "ml.g6.12xlarge"),
+        ],
+    )
+
+    with pytest.raises(BootstrapError) as refusal:
+        _discover(runner)
+
+    message = str(refusal.value)
+    assert (
+        f"HyperPod cluster hp-gpu-eks has no instance group labelled {OWNERSHIP}={SITE_ID}"
+        in message
+    )
+    assert (
+        f"spot-p5en instanceTypes=ml.p5en.48xlarge {OWNERSHIP}=absent "
+        f"(desired {SITE_ID}, not applied yet)"
+    ) in message, "a label update-cluster is still applying is reported as pending"
+    assert f"accelerated-g6 instanceTypes=ml.g6.12xlarge {OWNERSHIP}=absent" in message
+    assert "aws sagemaker update-cluster --cluster-name hp-gpu-eks" in message
+    assert "KubernetesConfig" in message
+
+
+def test_hyperpod_instance_group_refusals_name_the_group() -> None:
+    foreign = EksRunner()
+    _orchestrated_hyperpod(
+        foreign,
+        groups=[
+            _instance_group("spot-p5en", "ml.p5en.48xlarge", {OWNERSHIP: "elsewhere"})
+        ],
+    )
+    with pytest.raises(BootstrapError, match="spot-p5en carries .*=elsewhere"):
+        _discover(foreign)
+    non_gpu = EksRunner()
+    _orchestrated_hyperpod(
+        non_gpu,
+        groups=[
+            _instance_group("spot-p5en", "ml.p5en.48xlarge", {OWNERSHIP: SITE_ID}),
+            _instance_group("accelerated-g6", "ml.g6.12xlarge", {OWNERSHIP: SITE_ID}),
+        ],
+    )
+    with pytest.raises(BootstrapError, match="accelerated-g6 runs ml.g6.12xlarge"):
+        _discover(non_gpu)
+
+
+def test_a_managed_hyperpod_cluster_keeps_the_historical_selector() -> None:
+    """The HyperPod path of every site deployed before the convention: the
+    entry records no selector, the cluster-name label stays the runtime truth
+    whatever the instance groups are labelled today."""
+
+    runner = EksRunner()
+    _orchestrated_hyperpod(
+        runner,
+        groups=[_instance_group("spot-p5en", "ml.p5en.48xlarge", {OWNERSHIP: SITE_ID})],
+    )
+    entries = ({"clusterId": "hp-gpu-eks", "hyperpodClusterName": "hp-gpu-eks"},)
+
+    identity = _discover(runner, existing_clusters=entries)
+
+    assert identity.node_selector == "", "no selector is recorded for a legacy entry"
+    assert identity.node_selector_source == "provider-default-legacy"
+    assert node_selector(identity) == (
+        "sagemaker.amazonaws.com/cluster-name=hp-gpu-eks"
+    ), "the HyperPod selector text is byte-identical to the historical label"
+
+
+def test_bootstrap_request_carries_no_selector_inputs() -> None:
     request = BootstrapRequest(
         cpu_cluster_arn="arn:aws:eks:us-east-1:123456789012:cluster/control",
         gpu_cluster_arns=(EKS_ARN,),
         repository_root=__import__("pathlib").Path("/repo"),
         state_dir=__import__("pathlib").Path("/state"),
-        gpu_nodegroup=GPU_NODEGROUP,
     )
-    assert request.requested_node_selector == (
-        f"eks.amazonaws.com/nodegroup={GPU_NODEGROUP}"
-    ), "--gpu-nodegroup must derive the node group selector"
-    both = replace(request, node_selector="a=b")
-    with pytest.raises(BootstrapError, match="exclusive"):
-        both.requested_node_selector
+    assert not hasattr(request, "node_selector") and not hasattr(
+        request, "gpu_nodegroup"
+    ), "the node scope is declared on the node groups, not passed to deploy"
+    assert not hasattr(JoinClusterRequest, "requested_node_selector"), (
+        "join-cluster takes no selector either"
+    )
 
 
 def test_regional_profile_follows_the_gpu_providers(tmp_path) -> None:

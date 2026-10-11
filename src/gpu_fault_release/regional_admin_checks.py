@@ -16,8 +16,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import urlsplit
 
-from gpu_fault.cluster_scope import node_selector
 from gpu_fault_release import regional_admin_checks_coverage as agent_coverage
+from gpu_fault_release.regional_admin_checks_coverage import node_scope_details
+from gpu_fault_release.regional_admin_checks_coverage import selected_nodes
 from gpu_fault_release import regional_admin_checks_readiness as readiness
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
@@ -228,15 +229,14 @@ def _check_contexts(release: Any) -> CheckValue:
 
 
 def _ready_nodes(document: dict[str, Any]) -> list[dict[str, Any]]:
-    result = []
-    for item in document.get("items", []):
-        ready = any(
+    return [
+        item
+        for item in document.get("items", [])
+        if any(
             condition.get("type") == "Ready" and condition.get("status") == "True"
             for condition in item.get("status", {}).get("conditions", [])
         )
-        if ready:
-            result.append(item)
-    return result
+    ]
 
 
 CONTROL_PLANE_ROLE_APPS = frozenset(
@@ -979,11 +979,10 @@ def check_control_record_archive_bucket(release: Any) -> CheckValue:
 
     Retention is on: every control-worker reads
     ``GPU_FAULT_CONTROL_RECORD_ARCHIVE_S3_URI`` (site.yaml ``spec.retention``)
-    and the archiver soft-fails
-    (keeps live rows, counts errors) when the bucket is missing. That failure
-    used to be discovered from an alert hours later; this check refuses the
-    release instead. Read-only: ``get-bucket-location`` is enough to prove the
-    bucket exists and sits in the site Region.
+    and the archiver soft-fails (keeps live rows, counts errors) when the
+    bucket is missing -- a failure once discovered from an alert hours later;
+    this check refuses the release instead. Read-only: ``get-bucket-location``
+    proves the bucket exists and sits in the site Region.
     """
 
     retention = getattr(release.config, "retention", None)
@@ -1223,9 +1222,7 @@ def _control_api_report(release: Any) -> dict[str, Any]:
     expected_nodes = {}
     kubernetes_nodes = {}
     for target in release.config.clusters:
-        nodes = release._get_json(
-            release._gpu(target, "get", "nodes", "-l", node_selector(target))
-        )
+        _selector, nodes = selected_nodes(release, target)
         kubernetes_nodes[target.cluster_id] = sorted(
             item["metadata"]["name"] for item in nodes.get("items", [])
         )
@@ -1423,9 +1420,8 @@ def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
             )
         )
         details["deployments"][deployment] = _deployment_readiness(item, deployment)
-    nodes = release._get_json(
-        release._gpu(target, "get", "nodes", "-l", node_selector(target))
-    )
+    selector, nodes = selected_nodes(release, target)
+    details["node_scope"] = node_scope_details(release, target, selector, nodes)
     expected_nodes = _ready_nodes(nodes)
     if not expected_nodes:
         raise ReleaseError(f"{target.cluster_id} has no Ready HyperPod nodes")

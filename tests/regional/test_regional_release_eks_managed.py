@@ -18,6 +18,7 @@ import yaml
 from gpu_fault.cluster_scope import (
     CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY,
     CONNECTION_SECRET_NODE_SELECTOR_KEY,
+    CONNECTION_SECRET_NODE_SELECTOR_SOURCE_KEY,
     CONNECTION_SECRET_PROVIDER_KEY,
     NODE_SELECTOR_ENV,
     PROVIDER_ENV,
@@ -160,11 +161,44 @@ def test_hyperpod_connection_secret_keeps_its_keys_and_gains_the_provider_pair(
         "hyperpod-confirm-cluster-name",
         CONNECTION_SECRET_PROVIDER_KEY,
         CONNECTION_SECRET_NODE_SELECTOR_KEY,
+        CONNECTION_SECRET_NODE_SELECTOR_SOURCE_KEY,
         CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY,
     }, "the Secret key set must be the historical keys plus the provider keys"
     assert files[CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY] == "", (
         "a HyperPod Secret carries no EKS cluster name for the EKS provider"
     )
+    assert files[CONNECTION_SECRET_NODE_SELECTOR_SOURCE_KEY] == (
+        "provider-default-legacy"
+    ), "a HyperPod cluster without a recorded selector records the legacy source"
+
+
+def test_connection_secret_records_the_selector_source_for_audit(
+    tmp_path: Path,
+) -> None:
+    labelled = _eks_cluster(tmp_path)
+    labelled.update(
+        cluster_id="gpu-eks-converged",
+        context="gpu-eks-converged-context",
+        eks_cluster_arn=f"arn:aws:eks:{REGION}:{ACCOUNT}:cluster/gpu-eks-converged",
+        node_selector="gpu-fault.io/control-plane=us-east-1-site-985fd370",
+        node_selector_source="label-convention",
+    )
+    config = MODULE.ReleaseConfig.load(
+        config_file(tmp_path, clusters=[_eks_cluster(tmp_path), labelled])
+    )
+    legacy_release = MODULE.RegionalRelease(config, RecordingRunner())
+    legacy, converged = legacy_release.config.clusters
+    assert (
+        _secret_files(legacy_release, legacy)[
+            CONNECTION_SECRET_NODE_SELECTOR_SOURCE_KEY
+        ]
+        == "flag-legacy"
+    ), "a plain EKS selector without a recorded source is flag-legacy"
+    files = _secret_files(legacy_release, converged)
+    assert files[CONNECTION_SECRET_NODE_SELECTOR_SOURCE_KEY] == "label-convention"
+    assert files[CONNECTION_SECRET_NODE_SELECTOR_KEY] == (
+        "gpu-fault.io/control-plane=us-east-1-site-985fd370"
+    ), "the recorded label selector is what the data plane selects on"
 
 
 def test_eks_managed_connection_secret_is_created_with_the_cluster_id_scope(
@@ -358,9 +392,12 @@ class PreflightRunner:
         status: str = "ACTIVE",
         nodegroup_status: str = "ACTIVE",
         node_repair: dict[str, bool | None] | None = None,
+        labels: dict[str, dict[str, str]] | None = None,
     ):
         self.status = status
         self.nodegroup_status = nodegroup_status
+        # The node group labels EKS reports (and stamps on the nodes).
+        self.labels = labels or {}
         # EKS node auto repair per node group; a None value leaves the opt-in
         # field out of the description, as EKS does for a group never configured.
         self.node_repair = node_repair or {}
@@ -380,6 +417,7 @@ class PreflightRunner:
                 "nodegroupName": name,
                 "status": self.nodegroup_status if gpu else "ACTIVE",
                 "instanceTypes": ["p5en.48xlarge"] if gpu else ["m7i-flex.xlarge"],
+                "labels": self.labels.get(name, {}),
             }
             if self.node_repair.get(name) is not None:
                 group["nodeRepairConfig"] = {"enabled": self.node_repair[name]}
@@ -443,7 +481,38 @@ def test_eks_managed_preflight_refuses_node_auto_repair_on_gpu_node_groups() -> 
             PreflightRunner(node_repair={"cpu-ng": True}),
             region=REGION,
             expected_eks_arn=EKS_ARN,
-            gpu_nodegroup="cpu-ng",
+            node_selector="eks.amazonaws.com/nodegroup=cpu-ng",
+        )
+
+
+def test_eks_managed_preflight_follows_the_ownership_label() -> None:
+    """A converged cluster's GPU node groups are the ones labelled for the site,
+    whatever instance type they run; the inventory fallback is for legacy
+    selectors only."""
+
+    site = "us-east-1-site-985fd370"
+    runner = PreflightRunner(
+        node_repair={"gpu-ng": False, "cpu-ng": True},
+        labels={"gpu-ng": {"gpu-fault.io/control-plane": site}},
+    )
+    facts = PREFLIGHT.validate_eks_managed_cluster(
+        runner,
+        region=REGION,
+        expected_eks_arn=EKS_ARN,
+        node_selector=f"gpu-fault.io/control-plane={site}",
+    )
+    assert facts["gpu-ng"]["gpu"] is True and facts["cpu-ng"]["gpu"] is False, (
+        "only the labelled group counts as a GPU node group under the convention"
+    )
+    with pytest.raises(ReleaseError, match="cpu-ng of gpu-eks-cluster has node auto"):
+        PREFLIGHT.validate_eks_managed_cluster(
+            PreflightRunner(
+                node_repair={"cpu-ng": True},
+                labels={"cpu-ng": {"gpu-fault.io/control-plane": site}},
+            ),
+            region=REGION,
+            expected_eks_arn=EKS_ARN,
+            node_selector=f"gpu-fault.io/control-plane={site}",
         )
 
 

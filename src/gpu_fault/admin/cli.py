@@ -36,7 +36,7 @@ from gpu_fault.admin.bootstrap_common import (
 from gpu_fault.admin.cluster_batch_join import join_clusters
 from gpu_fault.admin.cluster_join import join_cluster
 from gpu_fault.admin.cli_join import (
-    add_eks_managed_arguments,
+    add_profile_plan_arguments,
     add_join_recovery_arguments,
     run_join_cluster,
 )
@@ -175,10 +175,10 @@ COMMANDS = {
     "verify": "verify",
     "status": "status",
 }
-# The one read-only verb an administrator is given. ``status`` and ``verify``
-# had become the same 44-second report with `healthy` on line 1150, so the
-# verb is `status`: five readable lines on stderr, the cheap checks by default,
-# `--full` for the whole report acceptance evidence records.
+# The one read-only health verb an administrator is given. ``status`` and
+# ``verify`` had become the same 44-second report with `healthy` on line 1150,
+# so the verb is `status`: five readable lines on stderr, the cheap checks by
+# default, `--full` for the whole report acceptance evidence records.
 PUBLIC_READONLY_COMMANDS = ("status",)
 # Driver-only engine passthroughs: ``scripts/release_deploy.py`` runs `verify`
 # beside the stability window and ``scripts/staging_deploy.py`` runs
@@ -547,10 +547,11 @@ def parser() -> argparse.ArgumentParser:
         "--cluster-id",
         help=(
             "stable cluster id; defaults to the HyperPod name, or to the EKS "
-            "cluster name for a plain EKS (eks-managed) cluster"
+            "cluster name for a plain EKS (eks-managed) cluster. The GPU nodes are "
+            "the node groups labelled gpu-fault.io/control-plane=<site id>"
         ),
     )
-    add_eks_managed_arguments(join)
+    add_profile_plan_arguments(join)
     add_join_recovery_arguments(join)
     join.add_argument(
         "--allowed-namespace",
@@ -657,6 +658,7 @@ def _run_remove_cluster(arguments: argparse.Namespace) -> int:
             cluster_arn=cluster_arn,
             role="gpu",
             context="gpu-fault-admin-remove",
+            resolve_node_scope=False,
         )
         return identity.eks_arn, identity.hyperpod_name
 

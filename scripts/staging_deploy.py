@@ -809,8 +809,6 @@ def run_admin_deploy(
     staging_only_release: bool,
     impact_base: str,
     lock_fd: int,
-    node_selector: str = "",
-    gpu_nodegroup: str = "",
 ) -> None:
     command = [
         str(venv / "bin/gpu-fault-admin"),
@@ -820,10 +818,6 @@ def run_admin_deploy(
     ]
     for arn in gpu_cluster_arns:
         command.extend(("--gpu-cluster-arn", arn))
-    if node_selector:
-        command.extend(("--node-selector", node_selector))
-    if gpu_nodegroup:
-        command.extend(("--gpu-nodegroup", gpu_nodegroup))
     command.extend(
         (
             "--state-dir",
@@ -963,8 +957,6 @@ def apply_source_deploy(
             staging_only_release=source.snapshot,
             impact_base=arguments.base.strip(),
             lock_fd=lock_fd,
-            node_selector=str(getattr(arguments, "node_selector", "") or ""),
-            gpu_nodegroup=str(getattr(arguments, "gpu_nodegroup", "") or ""),
         )
     # UNCHANGED deployed nothing, so the evidence read before the apply still
     # describes the site. An APPLICATION_RELEASE just wrote the summary the
@@ -1298,9 +1290,6 @@ def parser() -> argparse.ArgumentParser:
     # ``--state-dir`` alone); a first deploy must give all three.
     value.add_argument("--cpu-cluster-arn")
     value.add_argument("--gpu-cluster-arn", action="append", default=[])
-    # Plain EKS (eks-managed) GPU clusters only; forwarded to gpu-fault-admin.
-    value.add_argument("--node-selector", default="")
-    value.add_argument("--gpu-nodegroup", default="")
     value.add_argument("--state-dir", required=True, type=Path)
     value.add_argument("--admin-email")
     value.add_argument(

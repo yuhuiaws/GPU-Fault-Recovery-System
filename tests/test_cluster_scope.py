@@ -7,13 +7,18 @@ import pytest
 from gpu_fault import cluster_scope
 from gpu_fault.cluster_scope import (
     ClusterProvider,
+    NodeSelectorSource,
     cluster_provider,
     default_failure_domain_labels,
     ec2_instance_id_from_provider_id,
     node_selector,
+    node_selector_source,
     nodegroup_node_selector,
+    ownership_node_selector,
     provider_cluster_name,
     selector_matches,
+    selector_ownership_value,
+    selector_requirements,
     validate_node_selector,
 )
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
@@ -39,9 +44,20 @@ def test_contract_names_are_the_ones_the_runtime_agent_imports() -> None:
     assert [item.value for item in ClusterProvider] == ["hyperpod", "eks-managed"], (
         "provider enum values differ from the design brief"
     )
-    assert cluster_scope.DEFAULT_EKS_MANAGED_NODE_SELECTOR == (
-        "nvidia.com/gpu.present=true"
-    ), "the default eks-managed selector differs from the design brief"
+    assert cluster_scope.OWNERSHIP_LABEL == "gpu-fault.io/control-plane", (
+        "the ownership label key is the convention operators label node groups with"
+    )
+    assert cluster_scope.CONNECTION_SECRET_NODE_SELECTOR_SOURCE_KEY == (
+        "node-selector-source"
+    ), "the selector-source Secret key differs from the design brief"
+    assert [item.value for item in NodeSelectorSource] == [
+        "label-convention",
+        "provider-default-legacy",
+        "flag-legacy",
+    ], "selector source values differ from the design brief"
+    assert not hasattr(cluster_scope, "DEFAULT_EKS_MANAGED_NODE_SELECTOR"), (
+        "nvidia.com/gpu.present=true is no discovery input any more"
+    )
 
 
 def test_absent_or_empty_provider_means_hyperpod_and_unknown_fails_closed() -> None:
@@ -83,7 +99,7 @@ def test_hyperpod_without_a_name_fails_closed() -> None:
 def test_eks_managed_requires_an_explicit_selector() -> None:
     """A selector that matched every node would hand the CPU node group over."""
 
-    with pytest.raises(ValueError, match="requires an explicit node selector"):
+    with pytest.raises(ValueError, match="has no recorded node selector"):
         node_selector({"provider": "eks-managed", "cluster_id": "gpu-eks"})
     assert (
         node_selector(
@@ -228,3 +244,103 @@ def test_failure_domain_defaults_follow_the_providers() -> None:
     assert default_failure_domain_labels(["eks-managed"]) == mixed, (
         "an eks-managed-only site uses the same merged priority"
     )
+
+
+# --- the ownership label convention ---------------------------------------------
+
+SITE_ID = "us-west-2-control-plane-gpu-fault-solut-985fd370"
+
+
+def test_ownership_selector_names_the_site_and_cross_checks_hyperpod() -> None:
+    eks = ownership_node_selector(SITE_ID, provider="eks-managed")
+    assert eks == f"gpu-fault.io/control-plane={SITE_ID}", (
+        "a plain EKS cluster selects on the ownership label alone"
+    )
+    hyperpod = ownership_node_selector(
+        SITE_ID, provider="hyperpod", hyperpod_cluster_name="hp-gpu-a"
+    )
+    assert hyperpod == (
+        f"gpu-fault.io/control-plane={SITE_ID},sagemaker.amazonaws.com/cluster-name=hp-gpu-a"
+    ), "a HyperPod cluster adds its cluster-name label as the cross-check"
+    assert validate_node_selector(hyperpod) == hyperpod, (
+        "the ownership selector must be a selector every reader accepts"
+    )
+    with pytest.raises(ValueError, match="needs its HyperPod cluster name"):
+        ownership_node_selector(SITE_ID, provider="hyperpod")
+    with pytest.raises(ValueError, match="invalid ownership label value"):
+        ownership_node_selector("not a label value", provider="eks-managed")
+
+
+def test_ownership_selector_matches_only_this_sites_nodes() -> None:
+    selector = ownership_node_selector(
+        SITE_ID, provider="hyperpod", hyperpod_cluster_name="hp-gpu-a"
+    )
+    owned = {
+        "gpu-fault.io/control-plane": SITE_ID,
+        "sagemaker.amazonaws.com/cluster-name": "hp-gpu-a",
+        "node.kubernetes.io/instance-type": "ml.p5en.48xlarge",
+    }
+    assert selector_matches(owned, selector), (
+        "a labelled node of the cluster is selected"
+    )
+    assert not selector_matches(
+        {**owned, "gpu-fault.io/control-plane": "other"}, selector
+    ), "a node labelled for another site is never selected"
+    assert not selector_matches(
+        {**owned, "sagemaker.amazonaws.com/cluster-name": "hp-gpu-b"}, selector
+    ), "a label copied onto another HyperPod cluster's node selects nothing"
+    unlabelled = dict(owned)
+    del unlabelled["gpu-fault.io/control-plane"]
+    assert not selector_matches(unlabelled, selector), (
+        "an unlabelled node of the cluster (a non-GPU instance group) is left out"
+    )
+
+
+def test_selector_ownership_value_reads_the_site_id_from_a_selector() -> None:
+    assert selector_ownership_value(f"gpu-fault.io/control-plane={SITE_ID},a=b") == (
+        SITE_ID
+    ), "the ownership requirement's value is the site id"
+    assert selector_ownership_value(HYPERPOD_SELECTOR) is None, (
+        "a selector without the ownership label names no site"
+    )
+    assert selector_ownership_value("gpu-fault.io/control-plane in (a,b)") is None, (
+        "a set requirement with two values names no single site"
+    )
+
+
+def test_selector_requirements_is_the_one_public_parser() -> None:
+    assert selector_requirements("a=b, c in (d,e),!f,g") == (
+        ("a", "in", frozenset({"b"})),
+        ("c", "in", frozenset({"d", "e"})),
+        ("f", "absent", frozenset()),
+        ("g", "exists", frozenset()),
+    ), "requirements must be split on the commas between terms, not inside sets"
+
+
+def test_node_selector_source_is_recorded_or_derived() -> None:
+    assert node_selector_source({"node_selector_source": "flag-legacy"}) is (
+        NodeSelectorSource.FLAG_LEGACY
+    ), "a recorded source wins"
+    assert node_selector_source({"nodeSelectorSource": "label-convention"}) is (
+        NodeSelectorSource.LABEL_CONVENTION
+    ), "the site-document spelling is read too"
+    assert node_selector_source({"provider": "hyperpod"}) is (
+        NodeSelectorSource.PROVIDER_DEFAULT_LEGACY
+    ), "a HyperPod entry without a selector is the legacy cluster-name default"
+    assert (
+        node_selector_source(
+            {"provider": "eks-managed", "node_selector": "nvidia.com/gpu.present=true"}
+        )
+        is NodeSelectorSource.FLAG_LEGACY
+    ), "a plain EKS selector recorded before the source field came from the flags"
+    assert (
+        node_selector_source(
+            {
+                "provider": "hyperpod",
+                "node_selector": f"gpu-fault.io/control-plane={SITE_ID}",
+            }
+        )
+        is NodeSelectorSource.LABEL_CONVENTION
+    ), "a selector naming the ownership label is the convention"
+    with pytest.raises(ValueError, match="node selector source must be one of"):
+        node_selector_source({"node_selector_source": "guessed"})

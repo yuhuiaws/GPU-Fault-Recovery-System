@@ -217,16 +217,13 @@ def _discover_join_target(
     runner: CommandRunner,
 ) -> tuple[ClusterIdentity, str, dict[str, Any] | None]:
     context = _join_context(request.gpu_cluster_arn)
-    try:
-        requested_selector = request.requested_node_selector
-    except ValueError as exc:
-        raise BootstrapError(str(exc)) from None
     target = discover_cluster(
         runner,
         cluster_arn=request.gpu_cluster_arn,
         role="gpu",
         context=context,
-        node_selector=requested_selector,
+        site_id=str(request.site.release_config["site_name"]),
+        existing_clusters=tuple(request.site.release_config["clusters"]),
     )
     cluster_id = (
         safe_name(request.cluster_id)
@@ -313,6 +310,10 @@ def validate_saved_join_target(
         raise JoinTargetIdentityError(
             "cannot confirm the recorded GPU join target"
         ) from exc
+    if "node_selector_source" not in discovery["target"]:
+        # Recorded before the source field existed: the selector itself is
+        # still compared, the derived source is not news.
+        current = replace(current, node_selector_source="")
     if current != recorded or cluster_id != discovery.get("cluster_id"):
         raise JoinTargetIdentityError(
             "GPU join target identity changed since discovery"

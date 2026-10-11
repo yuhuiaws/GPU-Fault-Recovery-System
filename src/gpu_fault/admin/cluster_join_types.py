@@ -37,26 +37,10 @@ class JoinClusterRequest:
     cluster_id: str | None = None
     allowed_namespaces: tuple[str, ...] = DEFAULT_ALLOWED_NAMESPACES
     state_dir: Path | None = None
-    #: GPU node label selector for a plain EKS (``eks-managed``) cluster;
-    #: ``None`` means the ``cluster_scope`` default. Ignored for HyperPod.
-    node_selector: str | None = None
-    #: Alternative to ``node_selector``: the EKS managed node group whose
-    #: nodes are the GPU nodes (``eks.amazonaws.com/nodegroup=<name>``).
-    gpu_nodegroup: str | None = None
     #: ``--reclaim-cluster-token``: re-attach a cluster whose site membership
     #: was lost by adopting its existing token file, on proof
     #: (``cluster_join_reclaim``). Without it an orphaned token is refused.
     reclaim_cluster_token: bool = False
-
-    @property
-    def requested_node_selector(self) -> str | None:
-        if self.node_selector and self.gpu_nodegroup:
-            raise ValueError("--node-selector and --gpu-nodegroup are exclusive")
-        if self.gpu_nodegroup:
-            from gpu_fault.cluster_scope import nodegroup_node_selector
-
-            return nodegroup_node_selector(self.gpu_nodegroup)
-        return self.node_selector or None
 
 
 @dataclass(frozen=True)

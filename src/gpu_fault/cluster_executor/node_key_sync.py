@@ -34,6 +34,7 @@ from gpu_fault.cluster_executor.regional_client import (
     ClusterExecutorError,
     RegionalExecutorClient,
 )
+from gpu_fault.cluster_scope import node_selector as scope_node_selector
 from gpu_fault.node_provider import HYPERPOD_CLUSTER_LABEL as HYPERPOD_CLUSTER_LABEL
 
 # The pre-split module's name: operators filter on ``gpu_fault.cluster_executor``.
@@ -91,8 +92,14 @@ class NodeActionKeySync:
         self.client = client
         self.core = core
         self.hyperpod_cluster = hyperpod_cluster.strip()
-        self._node_selector = (
-            selector or f"{HYPERPOD_CLUSTER_LABEL}={self.hyperpod_cluster}"
+        # The one selector reading every component shares
+        # (``gpu_fault.cluster_scope.node_selector``): the explicit selector, or
+        # the legacy HyperPod cluster-name label.
+        self._node_selector = scope_node_selector(
+            None,
+            provider="hyperpod",
+            hyperpod_cluster_name=self.hyperpod_cluster,
+            selector=selector,
         )
         self.namespace = namespace.strip()
         self.secret_name = secret_name.strip()

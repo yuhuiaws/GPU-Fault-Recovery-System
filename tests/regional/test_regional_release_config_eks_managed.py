@@ -363,3 +363,52 @@ def test_membership_digest_ignores_the_profile_pins_but_legacy_still_matches(
     ) != REGISTRY.registry_config_digest(without_pins), (
         "a real membership attribute change still changes the digest"
     )
+
+
+# --- node_selector_source ---------------------------------------------------------
+
+
+def test_target_node_selector_source_is_recorded_or_derived() -> None:
+    legacy = ClusterTarget.from_mapping(_eks_target(), expected_region=REGION)
+    assert legacy.node_selector_source == "", "nothing is invented into the target"
+    assert legacy.gpu_node_selector_source == "flag-legacy", (
+        "a plain EKS selector without a recorded source came from the retired flags"
+    )
+    hyperpod = ClusterTarget.from_mapping(_hyperpod_target(), expected_region=REGION)
+    assert hyperpod.gpu_node_selector_source == "provider-default-legacy", (
+        "a HyperPod target without a selector is the legacy cluster-name default"
+    )
+    converged = ClusterTarget.from_mapping(
+        _eks_target(
+            node_selector="gpu-fault.io/control-plane=us-east-1-site-985fd370",
+            node_selector_source="label-convention",
+        ),
+        expected_region=REGION,
+    )
+    assert converged.node_selector_source == "label-convention"
+    assert converged.gpu_node_selector_source == "label-convention"
+
+
+def test_unknown_node_selector_source_is_refused() -> None:
+    with pytest.raises(ReleaseError, match="node_selector_source.*must be one of"):
+        ClusterTarget.from_mapping(
+            _eks_target(node_selector_source="guessed"), expected_region=REGION
+        )
+
+
+def test_node_selector_source_stays_out_of_the_membership_digest() -> None:
+    """Converging a cluster is an audit fact, not a membership change."""
+
+    before = ClusterTarget.from_mapping(_eks_target(), expected_region=REGION)
+    after = ClusterTarget.from_mapping(
+        _eks_target(
+            node_selector="gpu-fault.io/control-plane=us-east-1-site-985fd370",
+            node_selector_source="label-convention",
+        ),
+        expected_region=REGION,
+    )
+    assert REGISTRY.registry_config_digest(
+        (before,)
+    ) == REGISTRY.registry_config_digest((after,)), (
+        "the clusters digest must not change when a cluster converges"
+    )

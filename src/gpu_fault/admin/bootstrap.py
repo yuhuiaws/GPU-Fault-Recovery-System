@@ -70,6 +70,11 @@ from gpu_fault.admin.bootstrap_common import safe_name as _safe_name
 from gpu_fault.admin.bootstrap_common import write_secret as _write_secret
 from gpu_fault.admin.bootstrap_common import write_yaml as _write_yaml
 from gpu_fault.admin.bootstrap_dependencies import validate_bootstrap_dependencies
+from gpu_fault.admin.bootstrap_ownership import (
+    RecordedNodeScope,
+    hyperpod_node_scope,
+    recorded_node_scope,
+)
 from gpu_fault.admin.bootstrap_discovery import (
     cluster_provider_entries,
     discover_eks_managed_cluster,
@@ -83,6 +88,8 @@ from gpu_fault.admin.bootstrap_network import private_subnets as _private_subnet
 from gpu_fault.admin.bootstrap_site import (
     bind_initial_deploy_target as bootstrap_gpu_scope,
 )
+from gpu_fault.admin.bootstrap_site import require_same_scope as _require_same_scope
+from gpu_fault.admin.bootstrap_site import update_kubeconfig as _update_kubeconfig
 from gpu_fault.admin.bootstrap_site import cluster_alias as _cluster_alias
 from gpu_fault.admin.cluster_join_profile import reconcile_cluster_runtime_profiles
 from gpu_fault.admin.bootstrap_site import (
@@ -190,14 +197,19 @@ def discover_cluster(
     role: str,
     context: str,
     hyperpod_hints: Mapping[str, str] | None = None,
-    node_selector: str | None = None,
+    site_id: str | None = None,
+    existing_clusters: Sequence[Mapping[str, Any]] = (),
+    resolve_node_scope: bool = True,
 ) -> ClusterIdentity:
     """The identity behind a cluster ARN.
 
     A HyperPod ARN, or an EKS ARN orchestrated by exactly one HyperPod cluster,
     is a ``hyperpod`` identity as before; an EKS ARN no HyperPod cluster
     orchestrates is plain EKS (``eks-managed``, see ``bootstrap_discovery``).
-    ``node_selector`` is that cluster's GPU selector, ignored for HyperPod.
+    A GPU cluster's node scope comes from the ownership label
+    (``bootstrap_ownership``) unless one of ``existing_clusters`` (site
+    entries, either spelling) records it already; ``resolve_node_scope=False``
+    is for identity-only callers (remove-cluster, rotate-token).
     """
 
     arn = Arn.parse(cluster_arn)
@@ -223,7 +235,12 @@ def discover_cluster(
                 cluster_arn=cluster_arn,
                 role=role,
                 context=context,
-                node_selector=node_selector,
+                site_id=site_id,
+                recorded=(
+                    recorded_node_scope(existing_clusters, eks_arn=cluster_arn)
+                    if resolve_node_scope
+                    else RecordedNodeScope("", "")
+                ),
                 subnet_cidrs=lambda *args, **kwargs: discover_subnet_cidrs(
                     *args, **kwargs
                 ),
@@ -261,6 +278,15 @@ def discover_cluster(
         raise BootstrapError(
             f"GPU HyperPod cluster {hyperpod_name} must set NodeRecovery=None"
         )
+    scope_selector, scope_source = "", ""
+    if role == "gpu" and resolve_node_scope:
+        scope_selector, scope_source = hyperpod_node_scope(
+            hyperpod,
+            site_id=site_id,
+            recorded=recorded_node_scope(
+                existing_clusters, eks_arn=eks_arn, hyperpod_name=hyperpod_name
+            ),
+        )
     return ClusterIdentity(
         input_arn=cluster_arn,
         role=role,
@@ -275,42 +301,9 @@ def discover_cluster(
         node_recovery=node_recovery,
         context=context,
         subnet_cidrs=subnet_cidrs,
+        node_selector=scope_selector,
+        node_selector_source=scope_source,
     )
-
-
-def _require_same_scope(
-    cpu: ClusterIdentity,
-    gpu_clusters: Sequence[ClusterIdentity],
-) -> None:
-    for cluster in gpu_clusters:
-        if cluster.region != cpu.region or cluster.account_id != cpu.account_id:
-            raise BootstrapError(
-                "CPU and GPU clusters must belong to the same AWS account and Region"
-            )
-
-
-def _update_kubeconfig(
-    runner: CommandRunner, *, cluster: ClusterIdentity, path: Path
-) -> None:
-    runner.run(
-        [
-            "aws",
-            "eks",
-            "update-kubeconfig",
-            "--region",
-            cluster.region,
-            "--name",
-            cluster.eks_name,
-            "--kubeconfig",
-            str(path),
-            "--alias",
-            cluster.context,
-        ],
-        mutate=True,
-        capture=False,
-    )
-    if path.exists():
-        path.chmod(0o600)
 
 
 def _ensure_base_secrets(
@@ -1754,7 +1747,6 @@ def bootstrap_from_arns(
         discover=partial(
             discover_cluster,
             hyperpod_hints=load_hyperpod_hints(request.state_dir),
-            node_selector=request.requested_node_selector,
         ),
         alias=_cluster_alias,
     )

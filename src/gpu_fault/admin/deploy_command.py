@@ -80,24 +80,9 @@ def add_deploy_command(commands: Any) -> None:
             "On a managed site the set must be the managed clusters or a superset "
             "of them: the extra clusters are joined after the release. An EKS "
             "ARN with no HyperPod orchestrator is a plain EKS (eks-managed) "
-            "cluster; see --node-selector / --gpu-nodegroup"
-        ),
-    )
-    selector = deploy.add_mutually_exclusive_group()
-    selector.add_argument(
-        "--node-selector",
-        metavar="SELECTOR",
-        help=(
-            "GPU node label selector for plain EKS (eks-managed) clusters being "
-            "joined; default nvidia.com/gpu.present=true; ignored for HyperPod"
-        ),
-    )
-    selector.add_argument(
-        "--gpu-nodegroup",
-        metavar="NODEGROUP",
-        help=(
-            "EKS managed node group holding the GPU nodes of plain EKS clusters "
-            "being joined (selects eks.amazonaws.com/nodegroup=NODEGROUP)"
+            "cluster. The GPU nodes of every cluster are its node groups "
+            "labelled gpu-fault.io/control-plane=<site id> (see "
+            "gpu-fault-admin site-id); a cluster without one is refused"
         ),
     )
     deploy.add_argument("--repo-root", type=Path, help=argparse.SUPPRESS)
@@ -402,18 +387,11 @@ def join_gpu_clusters(
     *,
     repository_root: Path | None,
     hooks: DeployHooks,
-    node_selector: str | None = None,
-    gpu_nodegroup: str | None = None,
 ) -> None:
     site = hooks.load_site(site_file, repository_root=repository_root)
     result = hooks.join_clusters(
         tuple(
-            JoinClusterRequest(
-                site=site,
-                gpu_cluster_arn=gpu_cluster_arn,
-                node_selector=node_selector,
-                gpu_nodegroup=gpu_nodegroup,
-            )
+            JoinClusterRequest(site=site, gpu_cluster_arn=gpu_cluster_arn)
             for gpu_cluster_arn in gpu_cluster_arns
         )
     )
@@ -453,7 +431,6 @@ def run_public_deploy(
             wait_for_email_confirmation=int(
                 getattr(arguments, "wait_for_email_confirmation", 0) or 0
             ),
-            **eks_managed_join_options(arguments),
         )
     )
     if status or not delta or source_deploy_applied_release(state_dir):
@@ -463,24 +440,8 @@ def run_public_deploy(
         delta,
         repository_root=None,
         hooks=hooks,
-        **eks_managed_join_options(arguments),
     )
     return 0
-
-
-def eks_managed_join_options(arguments: argparse.Namespace) -> dict[str, str]:
-    """``--node-selector`` / ``--gpu-nodegroup`` as given, or nothing.
-
-    Only the flags the operator set are forwarded, so every hop that did not
-    learn the two options (older fakes, the source-deploy re-entry) keeps its
-    signature and a HyperPod deploy is byte for byte the command it was.
-    """
-
-    return {
-        name: str(value)
-        for name in ("node_selector", "gpu_nodegroup")
-        if (value := getattr(arguments, name, None))
-    }
 
 
 def run_prepared_deploy(
@@ -505,8 +466,6 @@ def run_prepared_deploy(
                 alert_email=admin_email,
                 staging_only_release=staging_only,
                 impact_base=getattr(arguments, "impact_base", "origin/main"),
-                node_selector=getattr(arguments, "node_selector", None),
-                gpu_nodegroup=getattr(arguments, "gpu_nodegroup", None),
                 **hooks.grafana_request_fields(arguments),
             )
         )
@@ -526,7 +485,6 @@ def run_prepared_deploy(
             bootstrap_result.pending_gpu_cluster_arns,
             repository_root=repository_root,
             hooks=hooks,
-            **eks_managed_join_options(arguments),
         )
     return 0
 

@@ -88,9 +88,15 @@ def test_public_scope_discovery_preserves_existing_contexts_and_input_order(
     identities = {identity.input_arn: identity for identity in (cpu, *members)}
     calls = []
 
-    def discover(_runner, *, cluster_arn, role, context):
+    scope_arguments = []
+
+    def discover(_runner, *, cluster_arn, role, context, **scope):
         calls.append(cluster_arn)
         assert identities[cluster_arn].role == role
+        if role == "gpu":
+            scope_arguments.append(scope)
+        else:
+            assert not scope, "the CPU discovery takes no node-scope arguments"
         return replace(identities[cluster_arn], context=context)
 
     request = BootstrapRequest(
@@ -111,3 +117,16 @@ def test_public_scope_discovery_preserves_existing_contexts_and_input_order(
         "gpu-b" if existing else sites.cluster_alias(members[0].eks_arn, "gpu", 1)
     )
     assert len(calls) == 3
+    # The GPU discoveries compare the ownership label with this site's id and
+    # keep an already-managed cluster's recorded node scope.
+    site_id = sites.site_identifier(cpu, [])
+    assert [item["site_id"] for item in scope_arguments] == [site_id, site_id]
+    recorded = [item["existing_clusters"] for item in scope_arguments]
+    if existing:
+        assert all(
+            [entry["clusterId"] for entry in clusters]
+            == [entry["clusterId"] for entry in document()["spec"]["clusters"]]
+            for clusters in recorded
+        ), "the existing site's cluster entries are handed to the GPU discovery"
+    else:
+        assert recorded == [(), ()], "a fresh site has no recorded cluster scope"

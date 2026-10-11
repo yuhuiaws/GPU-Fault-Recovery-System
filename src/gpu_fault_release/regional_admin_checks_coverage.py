@@ -19,6 +19,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from gpu_fault.cluster_scope import (
+    HYPERPOD_CLUSTER_LABEL,
+    is_eks_managed,
+    node_selector,
+    node_selector_source,
+    selector_matches,
+)
 from gpu_fault_release.regional_release_config import ReleaseError
 
 RETIRE_DEPARTED_AGENTS_HINT = (
@@ -27,6 +34,69 @@ RETIRE_DEPARTED_AGENTS_HINT = (
     "<state-dir> --retire-departed-agents --dry-run, then without --dry-run and "
     "with --reference"
 )
+
+
+def selected_node_items(nodes: dict[str, Any], selector: str) -> dict[str, Any]:
+    """``nodes`` with only the items that satisfy ``selector``.
+
+    The API server filtered on the selector; the local re-check keeps a proxy
+    or cache that answered with the wrong set out of the coverage comparison,
+    as every other node read of a cluster does.
+    """
+
+    return {
+        **nodes,
+        "items": [
+            item
+            for item in nodes.get("items", [])
+            if selector_matches(item.get("metadata", {}).get("labels"), selector)
+        ],
+    }
+
+
+def selected_nodes(release: Any, target: Any) -> tuple[str, dict[str, Any]]:
+    """``(selector, nodes)``: the cluster's nodes under its recorded selector,
+    read through the release's kubectl and re-checked locally."""
+
+    selector = node_selector(target)
+    nodes = release._get_json(release._gpu(target, "get", "nodes", "-l", selector))
+    return selector, selected_node_items(nodes, selector)
+
+
+def node_scope_details(
+    release: Any, target: Any, selector: str, nodes: dict[str, Any]
+) -> dict[str, Any]:
+    """The selector, its source and the nodes it leaves out, for ``status --full``.
+
+    The ownership convention makes membership a declaration on the node
+    groups, so the report shows what that declaration selects today: the
+    recorded selector and where it came from, how many nodes it selects, and
+    -- for a HyperPod cluster -- which nodes of the HyperPod cluster it does
+    not select (the non-GPU or unlabelled instance groups a converged cluster
+    leaves to the provider).
+    """
+
+    selected = sorted(
+        str(item.get("metadata", {}).get("name") or "")
+        for item in nodes.get("items", [])
+    )
+    details: dict[str, Any] = {
+        "selector": selector,
+        "source": node_selector_source(target).value,
+        "selected_nodes": len(selected),
+    }
+    if not is_eks_managed(target) and target.hyperpod_cluster_name:
+        cluster_label = f"{HYPERPOD_CLUSTER_LABEL}={target.hyperpod_cluster_name}"
+        if cluster_label != selector:
+            cluster_nodes = release._get_json(
+                release._gpu(target, "get", "nodes", "-l", cluster_label)
+            )
+            details["cluster_nodes_outside_selector"] = sorted(
+                str(item.get("metadata", {}).get("name") or "")
+                for item in cluster_nodes.get("items", [])
+                if str(item.get("metadata", {}).get("name") or "") not in selected
+            )
+    return details
 
 
 def annotate_kubernetes_nodes(

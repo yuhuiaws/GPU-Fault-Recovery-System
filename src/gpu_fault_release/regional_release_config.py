@@ -17,6 +17,7 @@ from gpu_fault.cluster_scope import (
     ClusterProvider,
     cluster_provider,
     node_selector,
+    node_selector_source,
 )
 from gpu_fault_release import containing_repository_root, repository_root
 from gpu_fault_release.regional_release_profile_model import (
@@ -241,6 +242,9 @@ class ClusterTarget:
     provider: str = ClusterProvider.HYPERPOD.value
     #: GPU node label selector; empty means the HyperPod cluster label.
     node_selector: str = ""
+    #: Where the selector came from (``cluster_scope.NodeSelectorSource``);
+    #: empty on configs rendered before the field existed, derived on read.
+    node_selector_source: str = ""
     #: This cluster's own Runtime Profile; empty fields inherit the site's.
     #: ``ReleaseConfig.load`` fills them from the site profile, so every
     #: reader sees one effective value per cluster.
@@ -260,6 +264,12 @@ class ClusterTarget:
         """The one selector every node read of this cluster uses."""
 
         return node_selector(self)
+
+    @property
+    def gpu_node_selector_source(self) -> str:
+        """The recorded or derived origin of ``gpu_node_selector`` (audit)."""
+
+        return node_selector_source(self).value
 
     def runtime_profile_spec(self) -> RuntimeProfileSpec:
         """This cluster's own profile (see ``overrides_runtime_profile``)."""
@@ -368,6 +378,13 @@ class ClusterTarget:
             )
         except ValueError as exc:
             raise ReleaseError(f"cluster target node_selector: {exc}") from None
+        selector_source = str(value.get("node_selector_source") or "").strip()
+        try:
+            node_selector_source(
+                None, provider=provider, selector=selector, source=selector_source
+            )
+        except ValueError as exc:
+            raise ReleaseError(f"cluster target node_selector_source: {exc}") from None
         region = validate_aws_region(value["region"], "cluster target region")
         if region != expected_region:
             raise ReleaseError(
@@ -423,6 +440,7 @@ class ClusterTarget:
             fleet_master_file=value.get("fleet_master_file"),
             provider=provider.value,
             node_selector=selector,
+            node_selector_source=selector_source,
             runtime_profile_source=profile_fields[0],
             runtime_profile_template_source=profile_fields[1],
             runtime_profile_version=profile_fields[2],

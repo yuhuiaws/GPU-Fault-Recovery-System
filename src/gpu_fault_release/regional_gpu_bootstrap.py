@@ -9,12 +9,17 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
-from gpu_fault.cluster_scope import cluster_provider, node_selector
+from gpu_fault.cluster_scope import (
+    cluster_provider,
+    node_selector,
+    node_selector_source,
+)
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
 from gpu_fault.cluster_scope import (
     CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY,
     CONNECTION_SECRET_NODE_SELECTOR_KEY,
+    CONNECTION_SECRET_NODE_SELECTOR_SOURCE_KEY,
     CONNECTION_SECRET_PROVIDER_KEY,
     provider_cluster_name,
 )
@@ -404,6 +409,11 @@ def ensure_connection_secret(release: Any, target: ClusterTarget) -> None:
                 getattr(target, "provider", None)
             ).value.encode(),
             CONNECTION_SECRET_NODE_SELECTOR_KEY: node_selector(target).encode(),
+            # Audit only: where the selector came from (the data plane never
+            # reads it). A legacy cluster says so until it is converged.
+            CONNECTION_SECRET_NODE_SELECTOR_SOURCE_KEY: node_selector_source(
+                target
+            ).value.encode(),
             # The EKS cluster name the eks-managed provider matches against
             # the eks:cluster-name instance tag; empty for HyperPod.
             CONNECTION_SECRET_EKS_CLUSTER_NAME_KEY: (

@@ -586,20 +586,32 @@ def preserve_existing_site_contract(
         # ``adotIrsaRoleArn``: a role the operator declared (hand-made before
         # bootstrap created one) wins over the created role; a cluster that
         # never declared one takes the generated value.
-        # ``provider``/``nodeSelector`` (the join's --gpu-nodegroup choice) and
-        # ``runtimeProfile`` (the reviewed per-cluster profile) are join-time
-        # decisions too: live 2026-10-04 a `deploy` over the mixed site
-        # regenerated the plain EKS entry from discovery, dropped both, and
-        # the release-diff refused on a `clusters` change.
+        # ``provider``/``nodeSelector`` and ``runtimeProfile`` (the reviewed
+        # per-cluster profile) are join-time decisions too: live 2026-10-04 a
+        # `deploy` over the mixed site regenerated the plain EKS entry from
+        # discovery, dropped both, and the release-diff refused on a
+        # `clusters` change.
         if previous.get("provider", "hyperpod") != item.get("provider", "hyperpod"):
             raise BootstrapError(
                 f"{item.get('clusterId')}: provider changed from "
                 f"{previous.get('provider', 'hyperpod')} to "
                 f"{item.get('provider', 'hyperpod')}; remove and re-join the cluster"
             )
+        # A managed cluster's node scope is the one its entry records, whatever
+        # the node groups are labelled today: an entry without a selector is a
+        # HyperPod cluster joined before the ownership convention and keeps
+        # selecting on its cluster-name label (its source is derived on read,
+        # nothing is written into a legacy entry). Membership changes only
+        # through the journaled `node-scope --converge` step, never through a
+        # deploy, so the regenerated scope keys are dropped and the previous
+        # ones copied below.
+        for key in ("nodeSelector", "nodeSelectorSource"):
+            if key not in previous:
+                item.pop(key, None)
         for key in (
             "context",
             "nodeSelector",
+            "nodeSelectorSource",
             "runtimeProfile",
             "allowedNamespaces",
             "agentEndpointAllowedCidrs",
@@ -674,6 +686,41 @@ def validate_existing_cluster_identity(
     ]
 
 
+def require_same_scope(
+    cpu: ClusterIdentity,
+    gpu_clusters: Sequence[ClusterIdentity],
+) -> None:
+    for cluster in gpu_clusters:
+        if cluster.region != cpu.region or cluster.account_id != cpu.account_id:
+            raise BootstrapError(
+                "CPU and GPU clusters must belong to the same AWS account and Region"
+            )
+
+
+def update_kubeconfig(
+    runner: CommandRunner, *, cluster: ClusterIdentity, path: Path
+) -> None:
+    runner.run(
+        [
+            "aws",
+            "eks",
+            "update-kubeconfig",
+            "--region",
+            cluster.region,
+            "--name",
+            cluster.eks_name,
+            "--kubeconfig",
+            str(path),
+            "--alias",
+            cluster.context,
+        ],
+        mutate=True,
+        capture=False,
+    )
+    if path.exists():
+        path.chmod(0o600)
+
+
 def discover_bootstrap_scope(
     *,
     request: BootstrapRequest,
@@ -692,6 +739,20 @@ def discover_bootstrap_scope(
         context=alias(request.cpu_cluster_arn, "cpu", 0),
     )
     cpu = replace(cpu, context=alias(cpu.eks_arn, "cpu", 0))
+    # The GPU discovery compares the node groups' ownership label with this
+    # site's id, which the CPU identity determines; a cluster the site already
+    # manages keeps the node scope its entry records.
+    site_id = site_identifier(cpu, [])
+    existing_spec = (existing or {}).get("spec") if existing else None
+    existing_clusters = tuple(
+        item
+        for item in (
+            (existing_spec or {}).get("clusters") or []
+            if isinstance(existing_spec, Mapping)
+            else []
+        )
+        if isinstance(item, Mapping)
+    )
     # A site with no GPU cluster (after remove-cluster) still deploys its
     # control plane; a zero-worker pool is a ValueError, not an empty fan-out.
     workers = max(1, min(8, len(request.gpu_cluster_arns)))
@@ -703,6 +764,8 @@ def discover_bootstrap_scope(
                 cluster_arn=value,
                 role="gpu",
                 context=alias(value, "gpu", index),
+                site_id=site_id,
+                existing_clusters=existing_clusters,
             )
             for index, value in enumerate(request.gpu_cluster_arns, 1)
         ]

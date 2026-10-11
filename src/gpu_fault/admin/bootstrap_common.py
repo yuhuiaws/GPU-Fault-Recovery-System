@@ -123,6 +123,9 @@ class ClusterIdentity:
     provider: str = "hyperpod"
     #: GPU node label selector; empty means the HyperPod cluster label.
     node_selector: str = ""
+    #: Where the selector came from (``cluster_scope.NodeSelectorSource``);
+    #: empty on identities recorded before the source was, derived on read.
+    node_selector_source: str = ""
     #: eks-managed only: the GPU node groups' EKS node auto repair, the plain
     #: EKS counterpart of ``node_recovery`` -- ``disabled`` / ``unset`` (the
     #: opt-in feature absent, recorded rather than invented); discovery refuses
@@ -239,24 +242,6 @@ class BootstrapRequest:
     # explicit workspace id is operator input; ``grafana_viewer`` is the IAM
     # Identity Center user granted VIEWER on the workspace after the import.
     grafana_workspace_id: str | None = None
-    #: GPU node selector / node group for plain EKS (``eks-managed``) GPU
-    #: clusters on a first deploy; ignored for HyperPod clusters.
-    node_selector: str | None = None
-    gpu_nodegroup: str | None = None
-
-    @property
-    def requested_node_selector(self) -> str | None:
-        if self.node_selector and self.gpu_nodegroup:
-            raise BootstrapError("--node-selector and --gpu-nodegroup are exclusive")
-        if self.gpu_nodegroup:
-            from gpu_fault.cluster_scope import nodegroup_node_selector
-
-            try:
-                return nodegroup_node_selector(self.gpu_nodegroup)
-            except ValueError as exc:
-                raise BootstrapError(str(exc)) from None
-        return self.node_selector or None
-
     grafana_viewer: str | None = None
 
 

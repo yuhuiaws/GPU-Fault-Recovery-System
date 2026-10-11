@@ -1099,3 +1099,86 @@ def test_finalize_bootstrap_site_reconciles_profiles_on_the_merged_document(
     assert written[0]["spec"]["clusters"][0]["runtimeProfile"]["agentConfigDigest"] == (
         "0" * 64
     ), "the reconciled document is what gets written"
+
+
+# --- a managed cluster's node scope changes only through node-scope --converge ----
+
+
+def test_existing_cluster_node_scope_is_never_rederived_by_a_deploy() -> None:
+    """Discovery may find the ownership label on a legacy cluster's node groups;
+    the entry keeps what it records (or its absence) until the journaled
+    convergence step, so a deploy never changes membership on its own."""
+
+    generated = {
+        "spec": {
+            "clusters": [
+                {
+                    "clusterId": "hp-legacy",
+                    "hyperpodClusterName": "hp-legacy",
+                    "nodeSelector": "gpu-fault.io/control-plane=site,"
+                    "sagemaker.amazonaws.com/cluster-name=hp-legacy",
+                    "nodeSelectorSource": "label-convention",
+                },
+                {
+                    "clusterId": "eks-legacy",
+                    "provider": "eks-managed",
+                    "nodeSelector": "gpu-fault.io/control-plane=site",
+                    "nodeSelectorSource": "label-convention",
+                },
+                {
+                    "clusterId": "hp-converged",
+                    "hyperpodClusterName": "hp-converged",
+                    "nodeSelector": "gpu-fault.io/control-plane=site,"
+                    "sagemaker.amazonaws.com/cluster-name=hp-converged",
+                    "nodeSelectorSource": "label-convention",
+                },
+                {
+                    "clusterId": "hp-new",
+                    "hyperpodClusterName": "hp-new",
+                    "nodeSelector": "gpu-fault.io/control-plane=site,"
+                    "sagemaker.amazonaws.com/cluster-name=hp-new",
+                    "nodeSelectorSource": "label-convention",
+                },
+            ]
+        }
+    }
+    existing = {
+        "spec": {
+            "clusters": [
+                {"clusterId": "hp-legacy", "hyperpodClusterName": "hp-legacy"},
+                {
+                    "clusterId": "eks-legacy",
+                    "provider": "eks-managed",
+                    "nodeSelector": "eks.amazonaws.com/nodegroup=gpu-ng",
+                },
+                {
+                    "clusterId": "hp-converged",
+                    "hyperpodClusterName": "hp-converged",
+                    "nodeSelector": "gpu-fault.io/control-plane=site,"
+                    "sagemaker.amazonaws.com/cluster-name=hp-converged",
+                    "nodeSelectorSource": "label-convention",
+                },
+            ]
+        }
+    }
+
+    result = preserve_existing_site_contract(deepcopy(generated), existing)
+
+    clusters = {item["clusterId"]: item for item in result["spec"]["clusters"]}
+    assert "nodeSelector" not in clusters["hp-legacy"], (
+        "a legacy HyperPod entry keeps selecting on its cluster-name label"
+    )
+    assert "nodeSelectorSource" not in clusters["hp-legacy"], (
+        "nothing is written into a legacy entry; its source is derived on read"
+    )
+    assert (
+        clusters["eks-legacy"]["nodeSelector"] == "eks.amazonaws.com/nodegroup=gpu-ng"
+    )
+    assert "nodeSelectorSource" not in clusters["eks-legacy"], (
+        "a regenerated entry can never relabel a legacy selector as the convention"
+    )
+    assert clusters["hp-converged"]["nodeSelectorSource"] == "label-convention"
+    assert clusters["hp-new"]["nodeSelector"].startswith(
+        "gpu-fault.io/control-plane="
+    ), "a cluster joining now records the label selector discovery resolved"
+    assert clusters["hp-new"]["nodeSelectorSource"] == "label-convention"

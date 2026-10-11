@@ -32,6 +32,7 @@ from gpu_fault.cluster_scope import (
     cluster_provider,
     default_failure_domain_labels,
     node_selector,
+    node_selector_source,
 )
 from gpu_fault.digests import SHA256_PATTERN
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
@@ -888,6 +889,9 @@ class GpuClusterSiteConfig:
     #: GPU node label selector. Required for ``eks-managed``; for ``hyperpod``
     #: an empty value means the HyperPod cluster label, exactly as before.
     node_selector: str = ""
+    #: Where the selector came from (``cluster_scope.NodeSelectorSource``);
+    #: empty on entries written before the field existed, derived on read.
+    node_selector_source: str = ""
     #: This cluster's own Runtime Profile; ``None`` inherits the site profile.
     runtime_profile: ClusterRuntimeProfileSiteConfig | None = None
 
@@ -896,6 +900,12 @@ class GpuClusterSiteConfig:
         """The selector that enumerates this cluster's GPU nodes."""
 
         return node_selector(self)
+
+    @property
+    def gpu_node_selector_source(self) -> str:
+        """The recorded or derived origin of ``gpu_node_selector``."""
+
+        return node_selector_source(self).value
 
     @classmethod
     def from_value(cls, value: object, index: int) -> GpuClusterSiteConfig:
@@ -909,6 +919,7 @@ class GpuClusterSiteConfig:
                 "region",
                 "provider",
                 "nodeSelector",
+                "nodeSelectorSource",
                 "runtimeProfile",
                 "hyperpodClusterName",
                 "eksClusterArn",
@@ -957,6 +968,15 @@ class GpuClusterSiteConfig:
             )
         except ValueError as exc:
             raise SiteConfigError(f"{path}.nodeSelector: {exc}") from None
+        source = _optional_text(
+            data.get("nodeSelectorSource"), f"{path}.nodeSelectorSource"
+        )
+        try:
+            node_selector_source(
+                None, provider=provider, selector=selector or "", source=source or ""
+            )
+        except ValueError as exc:
+            raise SiteConfigError(f"{path}.nodeSelectorSource: {exc}") from None
         return cls(
             cluster_id=cluster_id,
             context=_required_text(data.get("context"), f"{path}.context"),
@@ -964,6 +984,7 @@ class GpuClusterSiteConfig:
             hyperpod_cluster_name=hyperpod_cluster_name,
             provider=provider.value,
             node_selector=selector or "",
+            node_selector_source=source or "",
             runtime_profile=(
                 ClusterRuntimeProfileSiteConfig.from_value(
                     data["runtimeProfile"], f"{path}.runtimeProfile"
@@ -1270,6 +1291,8 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             entry["provider"] = cluster.provider
         if cluster.node_selector:
             entry["node_selector"] = cluster.node_selector
+        if cluster.node_selector_source:
+            entry["node_selector_source"] = cluster.node_selector_source
         # A cluster's own Runtime Profile; absent means the site profile, so
         # a single-profile site renders exactly as before.
         if cluster.runtime_profile is not None:

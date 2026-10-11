@@ -116,8 +116,6 @@ def run_source_deploy(
     current_directory: Path,
     extra_environment: Mapping[str, str] | None = None,
     wait_for_email_confirmation: int = 0,
-    node_selector: str | None = None,
-    gpu_nodegroup: str | None = None,
 ) -> int:
     repository_root = resolve_source_repository(
         state_dir,
@@ -132,10 +130,6 @@ def run_source_deploy(
     ]
     for arn in gpu_cluster_arns:
         command.extend(("--gpu-cluster-arn", arn))
-    if node_selector:
-        command.extend(("--node-selector", node_selector))
-    if gpu_nodegroup:
-        command.extend(("--gpu-nodegroup", gpu_nodegroup))
     command.extend(
         (
             "--state-dir",

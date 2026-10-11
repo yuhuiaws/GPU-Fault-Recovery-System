@@ -1,8 +1,10 @@
 """``join-cluster`` command surface: the parser flags and the runner.
 
-Split out of ``cli.py`` so the plain EKS (``eks-managed``) flags have a home
+Split out of ``cli.py`` so the Runtime Profile approval flags have a home
 that both ``join-cluster`` and ``deploy`` share without the entry module
-growing past its size budget.
+growing past its size budget. A GPU cluster's node scope is no command
+input any more: it is declared on the node groups with the ownership label
+(``gpu_fault.cluster_scope.OWNERSHIP_LABEL``) and discovered from them.
 """
 
 from __future__ import annotations
@@ -19,8 +21,8 @@ from gpu_fault.admin.profile_approval import approve_profile_plan_inline
 from gpu_fault.admin.site import RenderedSite, SiteConfigError
 
 __all__ = [
-    "add_eks_managed_arguments",
     "add_join_recovery_arguments",
+    "add_profile_plan_arguments",
     "run_join_cluster",
 ]
 
@@ -42,27 +44,9 @@ def add_join_recovery_arguments(parser: argparse.ArgumentParser) -> None:
     )
 
 
-def add_eks_managed_arguments(parser: argparse.ArgumentParser) -> None:
-    """Flags that only a plain EKS (``eks-managed``) GPU cluster reads."""
+def add_profile_plan_arguments(parser: argparse.ArgumentParser) -> None:
+    """The Runtime Profile plan approval flags ``join-cluster`` and ``deploy`` share."""
 
-    group = parser.add_mutually_exclusive_group()
-    group.add_argument(
-        "--node-selector",
-        metavar="SELECTOR",
-        help=(
-            "GPU node label selector of a plain EKS cluster (no HyperPod "
-            "orchestrator); default nvidia.com/gpu.present=true; ignored for "
-            "HyperPod clusters, whose selector is the HyperPod cluster label"
-        ),
-    )
-    group.add_argument(
-        "--gpu-nodegroup",
-        metavar="NODEGROUP",
-        help=(
-            "EKS managed node group whose nodes are the GPU nodes of a plain EKS "
-            "cluster (selects eks.amazonaws.com/nodegroup=NODEGROUP)"
-        ),
-    )
     parser.add_argument(
         "--approve-profile-plan",
         metavar="PLAN_SHA256",
@@ -139,8 +123,6 @@ def run_join_cluster(
             gpu_cluster_arn=cluster_arn,
             cluster_id=arguments.cluster_id,
             allowed_namespaces=allowed_namespaces,
-            node_selector=getattr(arguments, "node_selector", None),
-            gpu_nodegroup=getattr(arguments, "gpu_nodegroup", None),
             reclaim_cluster_token=reclaim_cluster_token,
         )
         for cluster_arn in cluster_arns

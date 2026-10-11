@@ -1472,6 +1472,7 @@ def _discover(cluster_arn: str) -> tuple[str, str]:
         cluster_arn=cluster_arn,
         role="gpu",
         context="gpu-fault-admin-rotate-token",
+        resolve_node_scope=False,
     )
     return identity.eks_arn, identity.hyperpod_name
 

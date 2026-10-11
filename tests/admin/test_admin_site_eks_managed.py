@@ -8,7 +8,12 @@ import pytest
 import yaml
 
 from gpu_fault.admin.site import SiteConfigError, load_site
-from gpu_fault.cluster_scope import EKS_MANAGED_FAILURE_DOMAIN_LABELS, node_selector
+from gpu_fault.cluster_scope import (
+    EKS_MANAGED_FAILURE_DOMAIN_LABELS,
+    NodeSelectorSource,
+    node_selector,
+    node_selector_source,
+)
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
 from tests.admin.test_admin_site import site_file
 
@@ -92,7 +97,9 @@ def test_eks_managed_cluster_requires_a_node_selector(tmp_path: Path) -> None:
     document["spec"]["clusters"].append(cluster)
     _write(path, document)
 
-    with pytest.raises(SiteConfigError, match=r"nodeSelector.*explicit node selector"):
+    with pytest.raises(
+        SiteConfigError, match=r"nodeSelector.*no recorded node selector"
+    ):
         load_site(path)
 
 
@@ -233,4 +240,63 @@ def test_invalid_cluster_runtime_profile_is_refused(
     _write(path, document)
 
     with pytest.raises(SiteConfigError, match=message):
+        load_site(path)
+
+
+# --- nodeSelectorSource: where a recorded selector came from --------------------
+
+SITE_ID = "us-east-1-control-985fd370"
+
+
+def test_node_selector_source_is_rendered_and_derived(tmp_path: Path) -> None:
+    path = site_file(tmp_path)
+    document = _document(path)
+    labelled = _eks_cluster(
+        document,
+        nodeSelector=f"gpu-fault.io/control-plane={SITE_ID}",
+        nodeSelectorSource="label-convention",
+    )
+    document["spec"]["clusters"].append(labelled)
+    _write(path, document)
+
+    site = load_site(path)
+
+    hyperpod, eks = site.release_config["clusters"]
+    assert eks["node_selector_source"] == "label-convention", (
+        "a recorded source is rendered into the release config for audit"
+    )
+    assert "node_selector_source" not in hyperpod, (
+        "a legacy HyperPod entry renders byte for byte as before"
+    )
+    assert (
+        node_selector_source(hyperpod) is NodeSelectorSource.PROVIDER_DEFAULT_LEGACY
+    ), "a legacy HyperPod entry derives the legacy default source on read"
+    assert node_selector_source(eks) is NodeSelectorSource.LABEL_CONVENTION
+
+
+def test_legacy_eks_entry_without_a_source_derives_flag_legacy(tmp_path: Path) -> None:
+    path = site_file(tmp_path)
+    document = _document(path)
+    document["spec"]["clusters"].append(
+        _eks_cluster(document, nodeSelector="eks.amazonaws.com/nodegroup=gpu-ng")
+    )
+    _write(path, document)
+
+    _hyperpod, eks = load_site(path).release_config["clusters"]
+
+    assert "node_selector_source" not in eks, "nothing is invented into the entry"
+    assert node_selector_source(eks) is NodeSelectorSource.FLAG_LEGACY, (
+        "a selector recorded by the retired flags reads as flag-legacy"
+    )
+
+
+def test_unknown_node_selector_source_is_refused(tmp_path: Path) -> None:
+    path = site_file(tmp_path)
+    document = _document(path)
+    document["spec"]["clusters"].append(
+        _eks_cluster(document, nodeSelectorSource="guessed")
+    )
+    _write(path, document)
+
+    with pytest.raises(SiteConfigError, match=r"nodeSelectorSource.*must be one of"):
         load_site(path)
