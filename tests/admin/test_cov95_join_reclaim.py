@@ -551,3 +551,41 @@ def test_the_parser_knows_the_flag_and_defaults_it_off():
         ]
     )
     assert flagged.reclaim_cluster_token is True
+
+
+def test_proof_one_ignores_an_archived_refused_attempt_that_came_later(orphan):
+    """The live sequence: attempt 2 committed the join, attempt 3 was refused on
+    the orphaned token and later superseded. The committed attempt still
+    proves the identity; the refused archive carries no binding."""
+
+    from gpu_fault.admin.cluster_join_reclaim import committed_join_evidence
+
+    refused = {
+        "schema_version": 1,
+        "attempt": 3,
+        "phase": "BLOCKED_IDENTITY",
+        "completed_steps": ["DISCOVERED", "PRECHECKED"],
+        "evidence": {
+            "DISCOVERED": {"cluster_id": CLUSTER_ID, "target": asdict(target())}
+        },
+        "superseded_by_attempt": 4,
+        "superseded_reason": "the site's non-membership fields changed",
+    }
+    (orphan.directory / "state.attempt-003.json").write_text(
+        json.dumps(refused), encoding="utf-8"
+    )
+
+    identity = committed_join_evidence(
+        orphan.directory,
+        cluster_id=CLUSTER_ID,
+        target=target(),
+        token_file=orphan.token_file,
+    )
+
+    assert identity["journal"] == str(orphan.journal)
+    assert identity["attempt"] == 1
+    assert identity["committed_at"] == "2000-01-01T00:00:10+00:00"
+
+    orphan.prepare()
+    record = orphan.journaled()["reclaimed_cluster_token"]
+    assert record["identity"]["attempt"] == 1, "the reclaim used the committed attempt"

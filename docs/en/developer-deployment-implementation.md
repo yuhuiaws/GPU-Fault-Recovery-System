@@ -1500,6 +1500,15 @@ committed namespace UID, and then runs the unchanged join; any missing proof ref
 no orphaned token;
 the temporary fleet master is not
 kept as ordinary evidence. `SUPERVISION_LOST` forbids automatic retry or compensation; commands not proven stopped must be explicitly reconciled first.
+A journal whose attempt stopped before its first mutation -- phase `STARTED`, `BLOCKED_IDENTITY`, `FAILED` or one of the
+pre-mutation steps, with completed steps and evidence within `PRE_MUTATION_STEPS` (`PRECHECKED`, `DISCOVERED`; the set is
+derived from the constants the driver records those steps with) -- does not bind the site: when the site's non-membership
+fields changed afterwards (a deploy moved `spec.repositoryRoot`), `load_join_state` archives it as `state.attempt-NNN.json`
+with `superseded_by_attempt`, records it under the fresh journal's `superseded_attempts`, carries `retained_cluster_token` /
+`reclaimed_cluster_token` forward (they were proven against the cluster, not the site fields) and binds the new attempt to the
+current site (`cluster_join_state.supersede_unmutated_attempt`). An attempt that reached a mutating step, an in-flight step
+phase or `SUPERVISION_LOST` keeps refusing with `join-cluster source site non-membership fields drifted`; the recoverable
+phases keep `_require_recovery_scope`. A refused join followed by the deploy that fixes it therefore retries without hand edits.
 A resume after `ACTIVATION_STARTED` allows the old verify to exceed 15 minutes, but still checks the original bindings and completes the ACTIVE terminal
 re-verification; it may not require the target to go back to `PENDING` or take the withdrawal path again.
 A member that is complete and still in the local site may return idempotently, which does not mean a real-time verify was re-executed; current health is still checked independently by

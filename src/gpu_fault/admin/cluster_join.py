@@ -62,19 +62,13 @@ from gpu_fault.admin.cluster_join_nodes import (
     verify_join_node_names,
 )
 from gpu_fault.admin.cluster_join_state import (
+    DISCOVERED_STEP,
+    PRECHECKED_STEP,
     complete_step as _complete,
-    note_join_failure,
-)
-from gpu_fault.admin.cluster_join_state import (
     completed_state_is_current as _completed_state_is_current,
-)
-from gpu_fault.admin.cluster_join_state import (
     load_join_state as _state,
-)
-from gpu_fault.admin.cluster_join_state import (
+    note_join_failure,
     reset_completed_state as _reset_completed_state,
-)
-from gpu_fault.admin.cluster_join_state import (
     step_done as _done,
 )
 from gpu_fault.admin.cluster_join_types import (
@@ -892,12 +886,12 @@ def _prepare_execution(
     local_inputs_only: bool = False,
     node_claims: NodeClaims | None = None,
 ) -> JoinInputs | JoinExecution | dict[str, Any]:
-    if not _done(state, "PRECHECKED"):
+    if not _done(state, PRECHECKED_STEP):
         # The candidate verify after the rollout covers every cluster in the
         # site, the existing ones included; a baseline verify of the site first
         # was a second full verify that could only repeat that answer.
-        _complete(state_path, state, "PRECHECKED")
-    if _done(state, "DISCOVERED"):
+        _complete(state_path, state, PRECHECKED_STEP)
+    if _done(state, DISCOVERED_STEP):
         validate_saved_join_target(request, state["evidence"]["DISCOVERED"], runner)
     else:
         target, cluster_id, existing = _discover_join_target(request, runner)
@@ -905,7 +899,7 @@ def _prepare_execution(
             _complete(
                 state_path,
                 state,
-                "DISCOVERED",
+                DISCOVERED_STEP,
                 {
                     "target": asdict(target),
                     "cluster_id": str(existing["cluster_id"]),
@@ -929,7 +923,7 @@ def _prepare_execution(
         _complete(
             state_path,
             state,
-            "DISCOVERED",
+            DISCOVERED_STEP,
             {
                 "target": asdict(target),
                 "cluster_id": cluster_id,

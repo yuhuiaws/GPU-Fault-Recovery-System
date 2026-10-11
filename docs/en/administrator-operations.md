@@ -1692,6 +1692,13 @@ collectors replay their outbox and `status` reports them ready again. Without th
 no orphaned token file is refused too; a rerun after a successful reclaim may carry the flag again (the journal already
 owns the token).
 
+A `join-cluster` attempt that was refused before it changed anything (this ownership refusal, a blocked identity) does
+not pin the site: when a `deploy` or `config` has since moved `spec.repositoryRoot` or another non-membership field, the next
+`join-cluster` archives the refused attempt (`join-cluster/<id>/state.attempt-NNN.json` with `superseded_by_attempt`), records
+it under `superseded_attempts` and starts a fresh attempt against the current site instead of exiting with `join-cluster
+source site non-membership fields drifted`. An attempt that had already started mutating (local inputs, node keys, a
+release) still refuses on drift and is resumed or compensated as before.
+
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 
 The remediation concurrency budget `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN` (fixed at 1 in production)

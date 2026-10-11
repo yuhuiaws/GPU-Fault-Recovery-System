@@ -34,6 +34,22 @@ RECOVERABLE_ATTEMPT_PHASES = frozenset(
     {"ROLLED_BACK", "ROLLBACK_STARTED", "ROLLBACK_FAILED", "COMPLETED"}
 )
 JOIN_RELEASE_STEPS = ("JOIN_STARTED", "RELEASE_STARTED", "JOINED")
+# The two steps a join records before it mutates anything: the baseline
+# precheck and the discovery of the target (reads of AWS and the site). The
+# driver records them through these names, so the set below is derived from
+# the recorder rather than spelled a second time. Every later step -- local
+# inputs, node keys, prerequisites, the release -- changes something.
+PRECHECKED_STEP = "PRECHECKED"
+DISCOVERED_STEP = "DISCOVERED"
+PRE_MUTATION_STEPS = frozenset({PRECHECKED_STEP, DISCOVERED_STEP})
+# The phases a journal can show after stopping before its first mutation: the
+# fresh journal, a refusal, a plain failure, or one of the pre-mutation steps
+# itself. Any other phase -- an in-flight step, the rollback machinery's
+# phases, or ``SUPERVISION_LOST`` (an attempt that cannot be proven stopped) --
+# is never superseded automatically, whatever its steps say.
+UNMUTATED_ATTEMPT_PHASES = (
+    frozenset({"STARTED", "BLOCKED_IDENTITY", "FAILED"}) | PRE_MUTATION_STEPS
+)
 
 
 def join_release_started(state: dict[str, Any]) -> bool:
@@ -117,6 +133,19 @@ def load_join_state(
             recorded_non_membership
             and recorded_non_membership != current_non_membership
         ):
+            if attempt_never_mutated(value):
+                # A refusal that changed nothing (an orphaned token, a blocked
+                # identity) must not pin the site's release fields: the deploy
+                # that fixes the refusal moves them, and the retry would be
+                # refused forever. The attempt is archived and a fresh one
+                # binds to the site as it stands now.
+                return (
+                    state_dir,
+                    path,
+                    supersede_unmutated_attempt(
+                        request, state_dir=state_dir, state_path=path, state=value
+                    ),
+                )
             if value.get("phase") not in RECOVERABLE_ATTEMPT_PHASES:
                 raise BootstrapError(
                     "join-cluster source site non-membership fields drifted"
@@ -126,10 +155,21 @@ def load_join_state(
             value["source_site_non_membership_sha256"] = current_non_membership
             write_json_atomic(path, value)
         return state_dir, path, value
-    value = {
+    value = _fresh_attempt_state(request, attempt=1)
+    write_json_atomic(path, value)
+    return state_dir, path, value
+
+
+def _fresh_attempt_state(request: JoinStateRequest, *, attempt: int) -> dict[str, Any]:
+    """A new attempt's journal, bound to the site as it stands now."""
+
+    return {
         "schema_version": 1,
-        **expected,
-        "attempt": 1,
+        "site_id": request.site.release_config["site_name"],
+        "gpu_cluster_arn": request.gpu_cluster_arn,
+        "requested_cluster_id": request.cluster_id or "",
+        "allowed_namespaces": sorted(request.allowed_namespaces),
+        "attempt": attempt,
         "source_site_sha256": request.site.source_sha256,
         "source_site_recovery_sha256": recovery_scope_sha256(request.site),
         "source_site_non_membership_sha256": site_non_membership_sha256(
@@ -140,8 +180,96 @@ def load_join_state(
         "evidence": {},
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
-    write_json_atomic(path, value)
-    return state_dir, path, value
+
+
+def attempt_never_mutated(state: dict[str, Any]) -> bool:
+    """Whether the recorded attempt stopped before it changed anything.
+
+    True for a refusal or failure whose phase is one of
+    ``UNMUTATED_ATTEMPT_PHASES`` and whose completed steps and evidence lie
+    within ``PRE_MUTATION_STEPS`` (the precheck and the target discovery). The
+    phase is judged as well as the steps: an in-flight step phase, a phase the
+    rollback machinery owns (``RECOVERABLE_ATTEMPT_PHASES``) or an attempt whose
+    command cannot be proven stopped (``SUPERVISION_LOST``) is never treated as
+    unmutated, whatever its steps say.
+    """
+
+    phase = str(state.get("phase") or "")
+    if phase not in UNMUTATED_ATTEMPT_PHASES:
+        return False
+    completed = {str(step) for step in state.get("completed_steps") or []}
+    evidence = state.get("evidence") or {}
+    recorded = {str(key) for key in evidence} if isinstance(evidence, dict) else set()
+    return completed <= PRE_MUTATION_STEPS and recorded <= PRE_MUTATION_STEPS
+
+
+def supersede_unmutated_attempt(
+    request: JoinStateRequest,
+    *,
+    state_dir: Path,
+    state_path: Path,
+    state: dict[str, Any],
+) -> dict[str, Any]:
+    """Archive a refused, never-mutated attempt and start one bound to the current site.
+
+    The archive keeps the existing ``state.attempt-NNN.json`` naming and the
+    attempt's own phase, plus ``superseded_by_attempt``; the fresh journal
+    records the supersession under ``superseded_attempts`` and carries a
+    retained or reclaimed token binding forward, since the binding was proven
+    against the cluster, not against the site's release fields.
+    """
+
+    if not attempt_never_mutated(state):
+        raise BootstrapError(
+            "join-cluster attempt mutated the site and cannot be superseded"
+        )
+    previous_attempt = int(state.get("attempt") or 1)
+    next_attempt = previous_attempt + 1
+    archive = state_dir / f"state.attempt-{previous_attempt:03d}.json"
+    if archive.exists():
+        raise BootstrapError(f"join-cluster attempt archive already exists: {archive}")
+    now = datetime.now(timezone.utc).isoformat()
+    reason = (
+        "the site's non-membership fields changed after an attempt that was "
+        "refused before it mutated anything"
+    )
+    write_json_atomic(
+        archive,
+        {
+            **state,
+            "superseded_by_attempt": next_attempt,
+            "superseded_at": now,
+            "superseded_reason": reason,
+        },
+    )
+    supersessions = [
+        dict(item)
+        for item in state.get("superseded_attempts") or []
+        if isinstance(item, dict)
+    ]
+    supersessions.append(
+        {
+            "attempt": previous_attempt,
+            "phase": str(state.get("phase") or ""),
+            "completed_steps": sorted(
+                str(step) for step in state.get("completed_steps") or []
+            ),
+            "archive": str(archive),
+            "reason": reason,
+            "superseded_at": now,
+        }
+    )
+    carried = {
+        key: dict(state[key])
+        for key in ("retained_cluster_token", "reclaimed_cluster_token")
+        if isinstance(state.get(key), dict)
+    }
+    state.clear()
+    state.update(_fresh_attempt_state(request, attempt=next_attempt))
+    state["superseded_attempts"] = supersessions
+    state.update(carried)
+    write_json_atomic(state_path, state)
+    return state
 
 
 def step_done(state: dict[str, Any], step: str) -> bool:
@@ -200,25 +328,7 @@ def reset_completed_state(
     if not archive.exists():
         write_json_atomic(archive, dict(state))
     state.clear()
-    state.update(
-        {
-            "schema_version": 1,
-            "site_id": request.site.release_config["site_name"],
-            "gpu_cluster_arn": request.gpu_cluster_arn,
-            "requested_cluster_id": request.cluster_id or "",
-            "allowed_namespaces": sorted(request.allowed_namespaces),
-            "attempt": previous_attempt + 1,
-            "source_site_sha256": request.site.source_sha256,
-            "source_site_recovery_sha256": recovery_scope_sha256(request.site),
-            "source_site_non_membership_sha256": site_non_membership_sha256(
-                request.site.source
-            ),
-            "phase": "STARTED",
-            "completed_steps": [],
-            "evidence": {},
-            "updated_at": datetime.now(timezone.utc).isoformat(),
-        }
-    )
+    state.update(_fresh_attempt_state(request, attempt=previous_attempt + 1))
     if isinstance(retained_token, dict):
         state["retained_cluster_token"] = dict(retained_token)
     write_json_atomic(state_path, state)
