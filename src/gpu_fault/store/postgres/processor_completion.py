@@ -5,6 +5,11 @@ from datetime import datetime, timezone
 from threading import Event as ThreadEvent
 from typing import Any, Callable, TypedDict
 
+from gpu_fault.store.postgres.ddl_processor_layout import (
+    LAYOUT_DETACHED,
+    PAYLOADS_TABLE,
+    REPLAYS_TABLE,
+)
 from gpu_fault.store.postgres.processor_completion_runtime import (
     complete_cluster_groups,
 )
@@ -38,6 +43,10 @@ class PostgresProcessorCompletionMixin:
     # so a stand-in host without the attribute starts leaderless.
     _processor_completion_leader_active: bool = False
     _processor_queue_effective_payload: Callable[..., Any]
+    _processor_replay_effective_payload: Callable[..., Any]
+    _processor_queue_state_json: Callable[..., Any]
+    _processor_payloads_join: Callable[..., Any]
+    _hot_layout_mode_for_write: Callable[..., Any]
     _state_transaction: Callable[..., Any]
     get_processor_leadership: Callable[..., Any]
     processor_queue_state_mode: Any
@@ -201,6 +210,9 @@ class PostgresProcessorCompletionMixin:
             payload_parameters = (_utc_text(now),)
         with self._db.transaction():
             with self._db.cursor() as cursor:
+                completed_tail, tail_parameters = self._completion_tail(
+                    cursor, now, payload_update, payload_parameters
+                )
                 cursor.execute(
                     f"""
                     WITH input AS (
@@ -281,41 +293,7 @@ class PostgresProcessorCompletionMixin:
                         WHERE lane.ordering_key=valid.ordering_key
                         RETURNING lane.ordering_key
                     ),
-                    completed AS (
-                        UPDATE gpu_fault_processor_queue AS queue
-                        SET
-                            status='COMPLETED',
-                            lease_expires_at=NULL,
-                            response_status=valid.response_status,
-                            response_content_type=valid.content_type,
-                            response_body_base64=valid.response_body,
-                            updated_at=%s
-                            {payload_update}
-                        FROM valid
-                        JOIN released
-                          ON released.ordering_key=
-                             valid.ordering_key
-                        WHERE queue.request_id=valid.request_id
-                        RETURNING
-                            queue.request_id,
-                            queue.payload,
-                            queue.status,
-                            queue.lease_owner,
-                            queue.leader_epoch,
-                            queue.lease_token,
-                            queue.lease_expires_at,
-                            queue.response_status,
-                            queue.response_content_type,
-                            queue.response_body_base64,
-                            queue.not_before,
-                            queue.retry_count,
-                            queue.lane_policy,
-                            queue.updated_at
-                    )
-                    SELECT
-                        completed.request_id,
-                        {self._processor_queue_effective_payload("completed")}
-                    FROM completed
+                    {completed_tail}
                     """,
                     (
                         request_ids,
@@ -328,15 +306,118 @@ class PostgresProcessorCompletionMixin:
                         now,
                         now,
                         now,
-                        now,
                     )
-                    + payload_parameters,
+                    + tail_parameters,
                 )
                 rows = cursor.fetchall()
         return {
             request_id: self._decode("processor_request", payload)
             for request_id, payload in rows
         }
+
+    def _completion_tail(
+        self,
+        cursor: Any,
+        now: datetime,
+        payload_update: str,
+        payload_parameters: tuple[object, ...],
+    ) -> tuple[str, tuple[object, ...]]:
+        """The layout-dependent end of the completion statement: inline keeps
+        the row and rewrites it (v22), detached deletes it and writes the
+        replay row (schema v23)."""
+
+        detached = self._hot_layout_mode_for_write(cursor) == LAYOUT_DETACHED
+        if detached:
+            # Schema v23: a completion leaves the queue (DELETE, which
+            # the statement-level count trigger books like the sweep's)
+            # and lands in the replay partition of its completion time
+            # with the envelope, the request body and the response;
+            # the queue keeps only in-flight rows.
+            completed_tail = f"""
+            completed AS (
+                DELETE FROM gpu_fault_processor_queue AS queue
+                USING valid
+                JOIN released
+                  ON released.ordering_key=
+                     valid.ordering_key
+                WHERE queue.request_id=valid.request_id
+                RETURNING
+                    queue.*,
+                    valid.response_status AS valid_response_status,
+                    valid.content_type AS valid_content_type,
+                    valid.response_body AS valid_response_body
+            ),
+            bodies AS (
+                DELETE FROM {PAYLOADS_TABLE} AS stored
+                USING completed
+                WHERE stored.request_id=completed.request_id
+                RETURNING stored.request_id, stored.body
+            ),
+            replayed AS (
+                INSERT INTO {REPLAYS_TABLE} (
+                    request_id, cluster_id, completed_at, envelope, body,
+                    response_status, response_content_type, response_body
+                )
+                SELECT
+                    completed.request_id,
+                    completed.cluster_id,
+                    %s,
+                    (
+                        completed.payload
+                        || {self._processor_queue_state_json("completed")}
+                        || jsonb_build_object(
+                            'status', 'COMPLETED'::text,
+                            'lease_expires_at', NULL,
+                            'updated_at', to_jsonb(%s::timestamptz)
+                        )
+                    ) - 'body_base64' - 'response_body_base64',
+                    coalesce(
+                        bodies.body,
+                        decode(completed.payload->>'body_base64', 'base64')
+                    ),
+                    completed.valid_response_status,
+                    completed.valid_content_type,
+                    decode(completed.valid_response_body, 'base64')
+                FROM completed
+                LEFT JOIN bodies
+                  ON bodies.request_id=completed.request_id
+                RETURNING
+                    request_id, envelope, body, response_status,
+                    response_content_type, response_body
+            )
+            SELECT
+                replayed.request_id,
+                {self._processor_replay_effective_payload("replayed")}
+            FROM replayed
+            """
+            tail_parameters: tuple[object, ...] = (now, now)
+        else:
+            completed_tail = f"""
+            completed AS (
+                UPDATE gpu_fault_processor_queue AS queue
+                SET
+                    status='COMPLETED',
+                    lease_expires_at=NULL,
+                    response_status=valid.response_status,
+                    response_content_type=valid.content_type,
+                    response_body_base64=valid.response_body,
+                    updated_at=%s
+                    {payload_update}
+                FROM valid
+                JOIN released
+                  ON released.ordering_key=
+                     valid.ordering_key
+                WHERE queue.request_id=valid.request_id
+                RETURNING queue.*
+            )
+            SELECT
+                completed.request_id,
+                {self._processor_queue_effective_payload("completed", "payloads")}
+            FROM completed
+            {self._processor_payloads_join("completed", "payloads")}
+            """
+            tail_parameters = (now,) + payload_parameters
+        return completed_tail, tail_parameters
 
     def complete_active_processor_requests_batch(self, completions):
         batch = [

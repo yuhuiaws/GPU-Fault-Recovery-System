@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 from typing import Any, Callable
 
 from gpu_fault.gpu_metric_models import GpuFindingState
+from gpu_fault.store.postgres.hot_layout import metric_latest_table
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
@@ -17,7 +18,21 @@ class PostgresGpuTelemetryMixin:
     _put: Callable[..., Any]
     _state_key: Callable[..., Any]
     _state_transaction: Callable[..., Any]
+    _hot_layout_mode: Callable[..., Any]
+    _hot_layout_mode_for_write: Callable[..., Any]
     hot_state_mode: Any
+
+    def _metric_latest_table(self, cursor: Any = None, *, write: bool = False) -> str:
+        """The latest-metric table of the current layout: the flat v22 table
+        (``inline``) or the LIST-by-cluster partitioned twin (``detached``,
+        schema v23). Writers read the mode under the shared lock."""
+
+        mode = (
+            self._hot_layout_mode_for_write(cursor)
+            if write and cursor is not None
+            else self._hot_layout_mode(cursor)
+        )
+        return str(metric_latest_table(mode))
 
     def observe_gpu_inventory_snapshots(self, snapshots):
         if not snapshots:
@@ -141,13 +156,18 @@ class PostgresGpuTelemetryMixin:
         storage_keys = [self._state_key(key) for key, _ in items]
         with self._state_transaction(f"gpu_metric_latest/batch/{cluster_id}/{node_id}"):
             with self._db.cursor() as cursor:
+                table = self._metric_latest_table(cursor, write=True)
+                partitioned = table != "gpu_fault_gpu_metric_latest"
+                # The batch is one cluster's, so the partitioned twin prunes to
+                # that cluster's partition on both the read and the upsert.
                 cursor.execute(
-                    """
+                    f"""
                     SELECT key, payload
-                    FROM gpu_fault_gpu_metric_latest
+                    FROM {table}
                     WHERE key=ANY(%s)
+                      AND (%s OR cluster_id=%s)
                     """,
-                    (storage_keys,),
+                    (storage_keys, not partitioned, cluster_id),
                 )
                 previous_by_key = {
                     key: self._decode("gpu_metric_latest", payload)
@@ -190,10 +210,11 @@ class PostgresGpuTelemetryMixin:
             if final_by_key:
                 keys = list(final_by_key)
                 payloads = [final_by_key[key].model_dump_json() for key in keys]
+                conflict = "(cluster_id, key)" if partitioned else "(key)"
                 with self._db.cursor() as cursor:
                     cursor.execute(
-                        """
-                        INSERT INTO gpu_fault_gpu_metric_latest(
+                        f"""
+                        INSERT INTO {table}(
                             key, cluster_id, node_id,
                             observed_at, payload
                         )
@@ -208,7 +229,7 @@ class PostgresGpuTelemetryMixin:
                             %s::text[],
                             %s::text[]
                         ) AS batch(key, observed_at, payload)
-                        ON CONFLICT(key) DO UPDATE SET
+                        ON CONFLICT{conflict} DO UPDATE SET
                             cluster_id=excluded.cluster_id,
                             node_id=excluded.node_id,
                             observed_at=excluded.observed_at,
@@ -378,9 +399,9 @@ class PostgresGpuTelemetryMixin:
             return super().list_gpu_metrics_latest(cluster_id, node_id)
         with self._db.cursor() as cursor:
             cursor.execute(
-                """
+                f"""
                 SELECT key, payload
-                FROM gpu_fault_gpu_metric_latest
+                FROM {self._metric_latest_table(cursor)}
                 WHERE cluster_id=%s
                   AND node_id=%s
                 ORDER BY key

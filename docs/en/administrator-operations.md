@@ -927,6 +927,41 @@ a rerun on an existing database takes no table lock. The version number still ex
 is still that one `--accept-schema-change` parameter (and still takes a snapshot). The new wheel validates at startup that the trigger exists, refusing to start when missing
 (`PostgreSQL objects wakeup trigger is missing; run gpu-fault-store-migrate --ensure-schema`).
 
+**v23 Note (slim queue rows, replay partitions, metric latest partitioned by cluster; detailed design v2 §4.4.2).**
+v23 (`processor-queue-detached-payloads-replays-and-cluster-partitions`) adds the columns `path`/`scope_keys` to
+`gpu_fault_processor_queue` (filled from the payload by the BEFORE INSERT trigger
+`gpu_fault_processor_queue_fill_columns_trigger` when a previous-release writer leaves them NULL), creates
+`gpu_fault_processor_payloads`, `gpu_fault_processor_replays` (RANGE-partitioned on `completed_at`),
+`gpu_fault_gpu_metric_latest_clusters` (LIST-partitioned on `cluster_id`) and the one-row fact source
+`gpu_fault_hot_layout_mode`, and replaces v22's eight partial queue indexes with five that carry neither `status`, the
+lease columns nor `updated_at` (`..._claim_window`, `..._path_claim_window`, `..._lane_rows`, `..._cluster_rows`,
+`..._scope_keys`; the migration callback `DROP`s the old set). The release is still one `deploy --accept-schema-change`;
+the index-build Job defers the indexes that key the new columns to ensure (`awaiting_table` in its report), ensure adds
+the columns, tables and indexes and records an upgraded database's layout as `inline` -- **every write during the roll
+is still the v22 layout**, so every row an old or new Pod reads is complete; an old Pod that restarts during the roll
+refuses to start on missing declared indexes (as under v19; the staged roll replaces it). **One extra step after the
+roll**:
+
+```bash
+# After the control-plane roll has completed (gpu-fault-admin status healthy, release committed), once, inside a Running api-ha Pod
+kubectl -n gpu-fault-system exec deploy/gpu-fault-api-ha -- gpu-fault-store-migrate --set-hot-layout detached
+# Check: mode detached, one metric-latest partition per registered cluster (+ default), replay buckets covering the next 15 minutes
+kubectl -n gpu-fault-system exec deploy/gpu-fault-api-ha -- gpu-fault-store-migrate --hot-layout-status
+```
+
+The switch holds the exclusive advisory lock on `gpu_fault_hot_layout_mode` and the `gpu_fault_schema_bootstrap`
+maintenance lock and, in one transaction, creates a partition for every registered cluster or cluster with rows, copies
+the existing rows of `gpu_fault_gpu_metric_latest` into the partitioned table, creates the replay buckets and flips the
+mode; one-way and idempotent (an already detached database only reports its status). From then on request bodies go to
+the payloads table, completed requests leave the queue for a replay bucket (`processor-cleanup` creates the next 15
+minutes of buckets every pass and `DROP`s whole buckets past `GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS`), and
+metric latest rows go to their cluster's partition (created at registration, `DROP`ped by `remove-cluster` and by the
+perf teardown). A fresh database is recorded `detached` by ensure and needs no step. A site that never switches keeps
+running, but its queue still carries bodies and completed rows and metric latest still writes the flat table -- only the
+index set's HOT gain applies; a formal perf round requires `store_layout.mode` `detached` in `summary.json` (performance
+acceptance plan §3.3). `store-compaction` and `store-maintenance` measure a partitioned parent as the sum of its
+partitions and rebuild indexes per partition (§10.3).
+
 ### 4.8 Two Automatic Checks Around a Release: the Archive Bucket and the ADOT Self-Monitoring Metric Names
 
 These two used to live only in release records and human memory; both are now check items in the `gpu-fault-admin deploy` report, and either failing stops:
@@ -3907,6 +3942,8 @@ table, when the job is switched off with `GPU_FAULT_STORE_COMPACTION_INTERVAL_SE
 `gpu_fault_store_compaction_actions_total{status="FAILED"}` keeps growing (for example `REINDEX ... CONCURRENTLY`
 repeatedly hitting its `lock_timeout`); before a formal perf or acceptance round read `store_bloat` in `summary.json`
 (Performance Acceptance Plan §11).
+**v23 removes three sources of the bloat.** The queue's claims, completions and coalescing rewrites are HOT updates (the index set carries neither `status`, the lease columns nor `updated_at`); once switched to the `detached` layout, completed rows and request bodies no longer live in the queue heap and TOAST (§4.7, v23 note), replays return their pages per partition, and the metric latest rows of synthetic clusters and of real clusters leaving the fleet go with their partition's `DROP`. The periodic job and this verb measure `gpu_fault_gpu_metric_latest_clusters` and `gpu_fault_processor_payloads` as the sum of their partitions and `REINDEX INDEX CONCURRENTLY` per partition; `gpu_fault_processor_replays` is measured, never rebuilt. The rules for lanes / queue counts / priority shards are unchanged.
+
 ## 11. Centralised Container Logs (CloudWatch Container Insights)
 
 Not installed by default. Logs stopping at the node is a written-down trade-off ([Detailed Design v2 §10.1](detailed-design-v2.md#101-logging)),

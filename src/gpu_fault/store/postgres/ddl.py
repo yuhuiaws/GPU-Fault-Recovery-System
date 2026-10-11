@@ -33,6 +33,11 @@ from gpu_fault.store.postgres.ddl_helpers import (
     _ensure_trigger,
     _recorded_schema_version,
 )
+from gpu_fault.store.postgres.ddl_processor_layout import (
+    create_detached_layout_tables,
+    create_processor_queue_columns,
+    create_processor_queue_indexes,
+)
 from gpu_fault.store.postgres.ddl_spool import _create_telemetry_spool
 from gpu_fault.store.postgres.ddl_storage_parameters import (
     create_storage_parameters_stage,
@@ -873,7 +878,7 @@ def _create_processor_queue_notify(cursor: Any) -> None:
             IF TG_OP = 'INSERT' THEN
                 FOR target IN
                     SELECT DISTINCT
-                        n.payload->>'path' AS path,
+                        n.path AS path,
                         n.priority
                     FROM added n
                     WHERE n.status = 'PENDING'
@@ -881,7 +886,7 @@ def _create_processor_queue_notify(cursor: Any) -> None:
                     SELECT EXISTS (
                         SELECT 1
                         FROM gpu_fault_processor_queue q
-                        WHERE q.payload->>'path' = target.path
+                        WHERE q.path = target.path
                           AND q.priority = target.priority
                           AND q.status = 'PENDING'
                           AND NOT EXISTS (
@@ -908,7 +913,7 @@ def _create_processor_queue_notify(cursor: Any) -> None:
                         SELECT EXISTS (
                             SELECT 1
                             FROM gpu_fault_processor_queue q
-                            WHERE q.payload->>'path' = target.path
+                            WHERE q.path = target.path
                               AND q.priority = target.priority
                               AND q.status = 'PENDING'
                               AND NOT EXISTS (
@@ -930,7 +935,7 @@ def _create_processor_queue_notify(cursor: Any) -> None:
             ELSE
                 FOR target IN
                     SELECT DISTINCT
-                        n.payload->>'path' AS path,
+                        n.path AS path,
                         n.priority
                     FROM added n
                     JOIN removed o ON o.request_id = n.request_id
@@ -940,7 +945,7 @@ def _create_processor_queue_notify(cursor: Any) -> None:
                     SELECT EXISTS (
                         SELECT 1
                         FROM gpu_fault_processor_queue q
-                        WHERE q.payload->>'path' = target.path
+                        WHERE q.path = target.path
                           AND q.priority = target.priority
                           AND q.status = 'PENDING'
                           AND NOT EXISTS (
@@ -961,7 +966,7 @@ def _create_processor_queue_notify(cursor: Any) -> None:
                         SELECT EXISTS (
                             SELECT 1
                             FROM gpu_fault_processor_queue q
-                            WHERE q.payload->>'path' = target.path
+                            WHERE q.path = target.path
                               AND q.priority = target.priority
                               AND q.status = 'PENDING'
                               AND NOT EXISTS (
@@ -1059,6 +1064,10 @@ def _create_processor_tables(cursor) -> None:
         cursor, "gpu_fault_processor_queue", "response_body_base64", "TEXT"
     )
     ddl_processor_retry.upgrade_processor_retry_schedule(cursor)
+    # Schema v23: the path / scope_keys columns the notify function and the
+    # index set read, the payloads/replays/partition tables, the layout row.
+    create_processor_queue_columns(cursor)
+    create_detached_layout_tables(cursor)
     _create_processor_queue_notify(cursor)
     cursor.execute(
         """
@@ -1241,25 +1250,6 @@ def _seed_processor_counters(cursor) -> None:
             GROUP BY 1, 2
             """
         )
-    _declare_index(
-        cursor,
-        """
-        CREATE INDEX IF NOT EXISTS
-        gpu_fault_processor_queue_incomplete_cluster
-        ON gpu_fault_processor_queue (cluster_id, priority)
-        WHERE status IN ('PENDING', 'LEASED')
-        """,
-    )
-    _declare_index(
-        cursor,
-        """
-        CREATE INDEX IF NOT EXISTS
-        gpu_fault_processor_queue_correlation_scopes
-        ON gpu_fault_processor_queue
-        USING GIN ((payload->'correlation_scope_keys'))
-        WHERE status IN ('PENDING', 'LEASED')
-        """,
-    )
     _add_column_if_missing(
         cursor, "gpu_fault_processor_queue", "correlation_key", "TEXT"
     )
@@ -1293,80 +1283,16 @@ def _seed_processor_counters(cursor) -> None:
 
 
 def _create_processor_indexes(cursor) -> None:
-    # The claim window orders by (priority, created_at, request_id)
-    # with no partition or path predicate. This is the index the two ordered
-    # walks of the claim window (F-D2) rely on: partial on the two claimable
-    # statuses so COMPLETED history never enters it. F-D2 briefly declared an
-    # identical twin (``..._claim_order``); the planner picked either at
-    # random, so v11 drops the twin and this one stays the only declaration.
-    _declare_index(
-        cursor,
-        """
-        CREATE INDEX IF NOT EXISTS
-        gpu_fault_processor_queue_priority_claim
-        ON gpu_fault_processor_queue (
-            priority,
-            created_at,
-            request_id
-        )
-        WHERE status IN ('PENDING', 'LEASED')
-        """,
-    )
-    _declare_index(
-        cursor,
-        """
-        CREATE INDEX IF NOT EXISTS
-        gpu_fault_processor_queue_cluster
-        ON gpu_fault_processor_queue (
-            cluster_id,
-            status,
-            created_at
-        )
-        WHERE status IN ('PENDING', 'LEASED')
-        """,
-    )
-    # Per-pool claims filter on one path and then take the oldest
-    # window in (priority, created_at) order. ordering_key sat
-    # between the two in the previous shape, which forced a sort over
-    # the whole path backlog; lane lookups use
-    # gpu_fault_processor_queue_lane instead.
+    # Schema v23 (ddl_processor_layout.py): the claim window orders by
+    # (priority, created_at, request_id), the per-path pools by (path, ...),
+    # with no status predicate and no lease column anywhere, so claims and
+    # completions are HOT updates. The v22 set (``_priority_claim``,
+    # ``_path_priority_claim``, ``_lane``, ``_cluster``, ``_incomplete_cluster``,
+    # ``_available``, ``_completed``, ``_correlation_scopes``) is dropped by the
+    # v23 migration callback; the F-D2 twin ``_claim_order`` went in v11 and the
+    # pre-F-D2 ``_path_claim`` here.
     _drop_index_if_present(cursor, "gpu_fault_processor_queue_path_claim")
-    _declare_index(
-        cursor,
-        """
-        CREATE INDEX IF NOT EXISTS
-        gpu_fault_processor_queue_path_priority_claim
-        ON gpu_fault_processor_queue (
-            (payload->>'path'),
-            priority,
-            created_at,
-            request_id
-        )
-        WHERE status IN ('PENDING', 'LEASED')
-        """,
-    )
-    _declare_index(
-        cursor,
-        """
-        CREATE INDEX IF NOT EXISTS
-        gpu_fault_processor_queue_lane
-        ON gpu_fault_processor_queue (
-            ordering_key,
-            status,
-            lease_expires_at
-        )
-        WHERE status IN ('PENDING', 'LEASED')
-        """,
-    )
-    _declare_index(
-        cursor,
-        """
-        CREATE INDEX IF NOT EXISTS
-        gpu_fault_processor_queue_completed
-        ON gpu_fault_processor_queue (updated_at)
-        WHERE status='COMPLETED'
-        """,
-    )
+    create_processor_queue_indexes(cursor)
 
 
 def declared_index_names() -> frozenset[str]:

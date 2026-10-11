@@ -3,13 +3,18 @@ from __future__ import annotations
 import hashlib
 import time
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from threading import Event as ThreadEvent
 from typing import Any, Callable
 
+import logging
+
 from gpu_fault.store.contracts import ProcessorQueueCountStatus
+from gpu_fault.store.postgres.hot_layout import maintain_replay_partitions
 from gpu_fault.store.postgres.pool import _reject_reader
 from gpu_fault.store.shared.cleanup_log import log_cleanup
+
+LOGGER = logging.getLogger(__name__)
 
 
 class PostgresProcessorAdminMixin:
@@ -516,6 +521,41 @@ class PostgresProcessorAdminMixin:
         *,
         older_than: datetime,
         limit: int,
+    ) -> int:
+        """Retention of completed requests in both layouts.
+
+        Inline rows (status COMPLETED in the queue, written before the switch
+        or by a previous-release Pod) are deleted row by row as before. In the
+        detached layout a completion already left the queue for a replay
+        bucket; here the buckets ahead of the clock are created, the buckets
+        past retention are dropped whole and the DEFAULT catch-all is swept,
+        so no replay row is ever deleted one at a time and no dead index entry
+        is left behind (schema v23).
+        """
+
+        deleted = self._cleanup_inline_completed_rows(
+            older_than=older_than, limit=limit
+        )
+        if getattr(self._db, "pool", None) is None:
+            return deleted
+        with self._db.pool.connection() as connection:
+            now = datetime.now(timezone.utc)
+            result = maintain_replay_partitions(
+                connection, now=now, older_than=older_than, limit=limit
+            )
+        if result["dropped"] or result["created"]:
+            LOGGER.info(
+                "processor replay partitions: created %s, dropped %s (%s rows), "
+                "default swept %s",
+                result["created"],
+                result["dropped"],
+                result["dropped_rows"],
+                result["default_swept"],
+            )
+        return deleted + int(result["dropped_rows"]) + int(result["default_swept"])
+
+    def _cleanup_inline_completed_rows(
+        self, *, older_than: datetime, limit: int
     ) -> int:
         with self._state_transaction("processor_request/cleanup"):
             with self._db.cursor() as cursor:

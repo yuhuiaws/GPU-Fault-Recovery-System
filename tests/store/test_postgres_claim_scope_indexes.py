@@ -1,4 +1,10 @@
-"""Native scope-index plans and nullable counterpart membership semantics."""
+"""Native scope-index plans and nullable counterpart membership semantics.
+
+Schema v23 keeps the correlation scope keys in the ``scope_keys`` column (a
+BEFORE INSERT trigger fills it from the payload for a previous-release writer)
+and the GIN over that column is partial on ``cardinality(scope_keys) > 0``;
+the interlock probes spell the same predicate and compare with ``&&``.
+"""
 
 from __future__ import annotations
 
@@ -13,7 +19,7 @@ from tests.store._postgres_processor_claim_support import POSTGRES_URL, REQUEST_
 from tests.store.test_postgres_claim_progress import claim
 from tests.store.test_postgres_claim_progress import request as queue_request
 
-SCOPE_INDEX = "gpu_fault_processor_queue_correlation_scopes"
+SCOPE_INDEX = "gpu_fault_processor_queue_scope_keys"
 store = progress.store
 pytestmark = pytest.mark.skipif(
     not POSTGRES_URL, reason="requires the parent-allocated PostgreSQL"
@@ -135,15 +141,19 @@ def test_wrapped_membership_cannot_use_the_existing_scope_expression(store, conn
     scope = json.dumps(["scope-backlog", "node", "node-3000"], separators=(",", ":"))
     query = (
         "SELECT request_id FROM gpu_fault_processor_queue "
-        "WHERE status IN ('PENDING', 'LEASED') AND {} ? %s"
+        "WHERE status IN ('PENDING', 'LEASED') AND {}"
     )
+    # A wrapped column defeats the index; the partial GIN also needs its own
+    # predicate spelled out, which is what the store's interlock probes do.
     wrapped = explain(
         connection,
-        query.format("coalesce(payload->'correlation_scope_keys', '[]'::jsonb)"),
+        query.format("coalesce(scope_keys, ARRAY[]::text[]) && ARRAY[%s]"),
         (scope,),
     )
     aligned = explain(
-        connection, query.format("payload->'correlation_scope_keys'"), (scope,)
+        connection,
+        query.format("cardinality(scope_keys) > 0 AND scope_keys && ARRAY[%s]"),
+        (scope,),
     )
 
     assert SCOPE_INDEX not in index_names(wrapped), (
@@ -155,18 +165,22 @@ def test_wrapped_membership_cannot_use_the_existing_scope_expression(store, conn
 
 
 def replace_scopes(connection, request_id, value):
+    # The column is what the probes read; the payload is kept in step the way
+    # a previous-release writer's row would look after the fill trigger.
     if value == "missing":
         connection.execute(
             "UPDATE gpu_fault_processor_queue "
-            "SET payload=payload-'correlation_scope_keys' WHERE request_id=%s",
+            "SET payload=payload-'correlation_scope_keys', scope_keys=ARRAY[]::text[] "
+            "WHERE request_id=%s",
             (request_id,),
         )
     else:
         connection.execute(
             "UPDATE gpu_fault_processor_queue SET payload="
-            "jsonb_set(payload, '{correlation_scope_keys}', %s::jsonb) "
+            "jsonb_set(payload, '{correlation_scope_keys}', %s::jsonb), "
+            "scope_keys=%s::text[] "
             "WHERE request_id=%s",
-            (json.dumps(value), request_id),
+            (json.dumps(value), list(value or []), request_id),
         )
 
 

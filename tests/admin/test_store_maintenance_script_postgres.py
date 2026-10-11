@@ -130,7 +130,9 @@ def test_execute_reclaims_reports_before_after_and_is_idempotent() -> None:
                 """
                 SELECT c.relname, i.indisvalid
                 FROM pg_class c JOIN pg_index i ON i.indexrelid=c.oid
+                JOIN pg_class t ON t.oid=i.indrelid
                 WHERE c.relname LIKE 'gpu\\_fault%'
+                  AND NOT t.relispartition
                   AND NOT EXISTS (SELECT 1 FROM pg_constraint k WHERE k.conindid=c.oid)
                 """
             )

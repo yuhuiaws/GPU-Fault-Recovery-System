@@ -7,7 +7,7 @@ deeper than the window kept a starved routine row out of it forever. And the
 window's ORDER BY had no index whose leading columns were free: the
 ``available`` index leads with ``status, not_before``, both consumed by OR
 predicates, so every claim sorted the eligible backlog. The three-step method
-of F-J3 applies: operators build ``gpu_fault_processor_queue_priority_claim``
+of F-J3 applies: operators build ``gpu_fault_processor_queue_claim_window``
 CONCURRENTLY, the DDL declares it IF NOT EXISTS, the schema check fails closed
 without it, and only then does the query rely on it.
 """
@@ -159,7 +159,7 @@ def test_claim_window_walks_the_claim_order_index_in_claim_order(store):
     plan = _plan(store, sql, params)
 
     assert (
-        "Index Scan using gpu_fault_processor_queue_priority_claim "
+        "Index Scan using gpu_fault_processor_queue_claim_window "
         "on gpu_fault_processor_queue candidate"
     ) in plan, plan
     assert "Sort Key: candidate.priority" not in plan, plan
@@ -169,15 +169,15 @@ def test_claim_window_walks_the_claim_order_index_in_claim_order(store):
 def test_claim_window_index_is_built_and_valid(store):
     """F-J3 step two: the declared index really exists on the schema the store
     booted, is not left INVALID by an aborted CONCURRENTLY build, and covers
-    exactly the window's ORDER BY under the window's status predicate. This
-    holds on any planner configuration."""
+    exactly the window's ORDER BY. This holds on any planner configuration."""
 
-    valid, definition = _index_state(store, "gpu_fault_processor_queue_priority_claim")
+    valid, definition = _index_state(store, "gpu_fault_processor_queue_claim_window")
 
     assert valid, definition or "index is missing"
     assert "(priority, created_at, request_id)" in definition, definition
-    assert "WHERE" in definition and "'PENDING'" in definition, definition
-    assert "'LEASED'" in definition, definition
+    # Schema v23: no status predicate, so a claim (PENDING -> LEASED) and a
+    # completion stay HOT updates; only in-flight rows live in the queue.
+    assert "WHERE" not in definition, definition
 
 
 def test_claim_window_uses_the_claim_order_index_even_when_small(store):
@@ -192,13 +192,21 @@ def test_claim_window_uses_the_claim_order_index_even_when_small(store):
 
     plan = _plan(store, sql, params)
 
-    assert "gpu_fault_processor_queue_priority_claim" in plan, plan
+    assert "gpu_fault_processor_queue_claim_window" in plan, plan
     assert "Seq Scan on gpu_fault_processor_queue candidate" not in plan, plan
 
 
 def test_declared_indexes_include_the_claim_window_index():
-    assert "gpu_fault_processor_queue_priority_claim" in declared_index_names()
-    assert "gpu_fault_processor_queue_available" in declared_index_names()
+    assert "gpu_fault_processor_queue_claim_window" in declared_index_names()
+    assert "gpu_fault_processor_queue_path_claim_window" in declared_index_names()
+    # Schema v23 retired the status-predicated set; none of it is declared.
+    for retired in (
+        "gpu_fault_processor_queue_priority_claim",
+        "gpu_fault_processor_queue_path_priority_claim",
+        "gpu_fault_processor_queue_available",
+        "gpu_fault_processor_queue_completed",
+    ):
+        assert retired not in declared_index_names(), retired
     # The F-D2 twin of ``priority_claim`` is gone: two identical indexes let
     # the planner pick either, which is what made the plan assertions flap.
     assert "gpu_fault_processor_queue_claim_order" not in declared_index_names()
@@ -255,10 +263,15 @@ def test_claim_window_with_include_paths_walks_the_path_index_in_order(
     store, include_paths
 ):
     """Every dedicated pool claims with ``include_paths`` (7 of the 8
-    sub-claims per cycle). Their window must be an ordered walk of
-    ``gpu_fault_processor_queue_path_priority_claim`` per path that stops at
-    the LIMIT - not a Bitmap scan of the whole path backlog followed by a
-    top-N sort, whose cost grows with depth (B-3 / G-3)."""
+    sub-claims per cycle). Their window must be an ordered index walk that
+    stops at the LIMIT - not a Bitmap scan of the whole path backlog followed
+    by a top-N sort, whose cost grows with depth (B-3 / G-3). Since schema v23
+    ``path`` is a plain column, so the planner may price the global
+    ``gpu_fault_processor_queue_claim_window`` walk with a path filter below
+    the per-path ``gpu_fault_processor_queue_path_claim_window`` when the
+    backlog's paths are interleaved in heap order (``created_at`` correlation
+    ~1); both are the same ordered walk bounded by the LIMIT, and the path
+    index wins as soon as the path is a minority of the backlog."""
 
     _seed_bulk_pending_paths(store, 2000)
     sql, params = store.claim_active_processor_query(
@@ -278,7 +291,10 @@ def test_claim_window_with_include_paths_walks_the_path_index_in_order(
     assert "Sort Key: candidate.created_at" not in window_plan, plan
     assert "Bitmap Index Scan" not in window_plan, plan
     assert (
-        "Index Scan using gpu_fault_processor_queue_path_priority_claim "
+        "Index Scan using gpu_fault_processor_queue_path_claim_window "
+        "on gpu_fault_processor_queue candidate"
+    ) in window_plan or (
+        "Index Scan using gpu_fault_processor_queue_claim_window "
         "on gpu_fault_processor_queue candidate"
     ) in window_plan, plan
     assert "Seq Scan on gpu_fault_processor_queue candidate" not in window_plan, plan
@@ -286,7 +302,7 @@ def test_claim_window_with_include_paths_walks_the_path_index_in_order(
         "the path filter must be an equality per sub-window, not = ANY(array)"
     )
     for path in include_paths:
-        assert f"(payload ->> 'path'::text) = '{path}'::text" in window_plan, plan
+        assert f"(path = '{path}'::text)" in window_plan, plan
 
 
 def test_claim_with_include_paths_still_returns_the_oldest_rows_first(store):
@@ -333,7 +349,7 @@ def test_claim_with_exclude_paths_keeps_the_priority_index_walk(store):
     plan = _plan(store, sql, params)
 
     assert (
-        "Index Scan using gpu_fault_processor_queue_priority_claim "
+        "Index Scan using gpu_fault_processor_queue_claim_window "
         "on gpu_fault_processor_queue candidate"
     ) in plan, plan
     assert "Sort Key: candidate.priority" not in plan, plan

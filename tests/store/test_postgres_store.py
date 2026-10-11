@@ -215,13 +215,17 @@ def test_postgres_processor_retry_schedule_schema_is_present() -> None:
                 """
                 SELECT to_regclass(
                     'gpu_fault_processor_queue_available'
-                )
+                ),
+                to_regclass('gpu_fault_processor_queue_claim_window')
                 """
             )
-            available_index = cursor.fetchone()[0]
+            available_index, claim_index = cursor.fetchone()
 
     assert columns == ["lane_policy", "not_before", "retry_count"]
-    assert available_index == "gpu_fault_processor_queue_available"
+    # Schema v23 retired the status-led ``_available`` index (it blocked HOT
+    # updates); the claim window index without a status predicate replaces it.
+    assert available_index is None
+    assert claim_index == "gpu_fault_processor_queue_claim_window"
 
 
 def test_postgres_schema_migration_apply_callback_runs() -> None:

@@ -50,23 +50,47 @@ NOW = datetime(2026, 9, 14, 12, tzinfo=UTC)
 KINDS = ("workflow", "remote_command")
 PHYSICAL_COPIES = {"legacy": (1, 0), "dual": (1, 1), "dedicated": (0, 1)}
 
-# A v21 database differs from the current one only in the processor-queue and
-# telemetry-spool NOTIFY trigger functions: v22 probes the idle key once per
-# key under function-level planner pins, v21 carried no pins (and an anti-join
-# body). v22 changes no table and no trigger definition, so the retained rows
-# below are exactly what v21 wrote. The fixture strips the pins so the catalog
-# really is v21's; the pre-ensure probe never reads the functions, ensure
-# replaces them regardless, and the fixture never writes these tables.
-WAKEUP_FUNCTIONS = (
-    "gpu_fault_processor_queue_notify_pending",
-    "gpu_fault_telemetry_spool_notify_available",
+# A v22 database differs from the current one in the processor queue's layout
+# only: schema v23 adds the ``path`` / ``scope_keys`` columns with their BEFORE
+# INSERT fill trigger, the payloads / replays / cluster-partitioned metric-latest
+# tables and the layout mode row, and replaces the queue's eight
+# status-predicated indexes with five that reference neither ``status`` nor the
+# lease columns. The workflow / remote-command records this proof counts, their
+# tables and their modes are untouched, so the retained rows below are exactly
+# what v22 wrote. The fixture rebuilds the v22 queue catalog (indexes, no new
+# columns, no new tables); the pre-ensure probe never reads the queue's notify
+# function, whose v23 body is the one remnant the fixture leaves in place.
+V22_QUEUE_INDEXES = (
+    "CREATE INDEX gpu_fault_processor_queue_priority_claim ON gpu_fault_processor_queue "
+    "(priority, created_at, request_id) WHERE status IN ('PENDING', 'LEASED')",
+    "CREATE INDEX gpu_fault_processor_queue_cluster ON gpu_fault_processor_queue "
+    "(cluster_id, status, created_at) WHERE status IN ('PENDING', 'LEASED')",
+    "CREATE INDEX gpu_fault_processor_queue_path_priority_claim ON gpu_fault_processor_queue "
+    "((payload->>'path'), priority, created_at, request_id) WHERE status IN ('PENDING', 'LEASED')",
+    "CREATE INDEX gpu_fault_processor_queue_lane ON gpu_fault_processor_queue "
+    "(ordering_key, status, lease_expires_at) WHERE status IN ('PENDING', 'LEASED')",
+    "CREATE INDEX gpu_fault_processor_queue_completed ON gpu_fault_processor_queue "
+    "(updated_at) WHERE status='COMPLETED'",
+    "CREATE INDEX gpu_fault_processor_queue_incomplete_cluster ON gpu_fault_processor_queue "
+    "(cluster_id, priority) WHERE status IN ('PENDING', 'LEASED')",
+    "CREATE INDEX gpu_fault_processor_queue_correlation_scopes ON gpu_fault_processor_queue "
+    "USING GIN ((payload->'correlation_scope_keys')) WHERE status IN ('PENDING', 'LEASED')",
+    "CREATE INDEX gpu_fault_processor_queue_available ON gpu_fault_processor_queue "
+    "(status, not_before, priority, created_at, request_id)",
 )
-V22_PLANNER_PINS = {
-    "enable_seqscan=off",
-    "enable_bitmapscan=off",
-    "enable_hashjoin=off",
-    "enable_mergejoin=off",
-}
+V23_QUEUE_INDEXES = (
+    "gpu_fault_processor_queue_claim_window",
+    "gpu_fault_processor_queue_path_claim_window",
+    "gpu_fault_processor_queue_lane_rows",
+    "gpu_fault_processor_queue_cluster_rows",
+    "gpu_fault_processor_queue_scope_keys",
+)
+V23_TABLES = (
+    "gpu_fault_processor_payloads",
+    "gpu_fault_processor_replays",
+    "gpu_fault_gpu_metric_latest_clusters",
+    "gpu_fault_hot_layout_mode",
+)
 
 
 @dataclass(frozen=True)
@@ -121,24 +145,39 @@ def migration_history(connection: psycopg.Connection) -> list[tuple]:
     ).fetchall()
 
 
-def install_v21(connection: psycopg.Connection) -> None:
-    assert LATEST_POSTGRES_SCHEMA_VERSION == 22, (
+def install_v22(connection: psycopg.Connection) -> None:
+    assert LATEST_POSTGRES_SCHEMA_VERSION == 23, (
         "a new schema requires review of the historical fixture and compatibility pair"
     )
     with connection.transaction():
-        for function in WAKEUP_FUNCTIONS:
-            connection.execute(f"ALTER FUNCTION public.{function}() RESET ALL")
+        for name in V23_QUEUE_INDEXES:
+            connection.execute(f"DROP INDEX IF EXISTS public.{name}")
         connection.execute(
-            "DELETE FROM public.gpu_fault_schema_migrations WHERE version>21"
+            "DROP TRIGGER IF EXISTS gpu_fault_processor_queue_fill_columns_trigger "
+            "ON public.gpu_fault_processor_queue"
         )
         connection.execute(
-            "UPDATE public.gpu_fault_schema_version SET version=21 WHERE singleton"
+            "DROP FUNCTION IF EXISTS public.gpu_fault_processor_queue_fill_columns()"
+        )
+        connection.execute(
+            "ALTER TABLE public.gpu_fault_processor_queue DROP COLUMN IF EXISTS path, "
+            "DROP COLUMN IF EXISTS scope_keys"
+        )
+        for table in V23_TABLES:
+            connection.execute(f"DROP TABLE IF EXISTS public.{table} CASCADE")
+        for statement in V22_QUEUE_INDEXES:
+            connection.execute(statement)
+        connection.execute(
+            "DELETE FROM public.gpu_fault_schema_migrations WHERE version>22"
+        )
+        connection.execute(
+            "UPDATE public.gpu_fault_schema_version SET version=22 WHERE singleton"
         )
     assert migration_history(connection) == [
         (item.version, item.name, item.checksum)
         for item in POSTGRES_SCHEMA_MIGRATIONS
-        if item.version <= 21
-    ], "v21 must have the complete, unchanged migration prefix"
+        if item.version <= 22
+    ], "v22 must have the complete, unchanged migration prefix"
 
 
 def configure_mode(
@@ -290,7 +329,7 @@ def test_retained_v17_terminal_rows_are_safe_in_real_storage_modes(
     connection = database.connection
     configure_mode(connection, mode)
     seed_records(connection)
-    install_v21(connection)
+    install_v22(connection)
     before = migration_history(connection)
     for kind in KINDS:
         assert physical_counts(connection, kind) == PHYSICAL_COPIES[mode], (
@@ -315,7 +354,7 @@ def test_retained_v17_terminal_rows_are_safe_in_real_storage_modes(
     assert proof == {
         "safe": True,
         "database_state": "initialized",
-        "schema_version": 21,
+        "schema_version": 22,
         "schema_ensure_required": True,
         "blockers": {"workflow": 0, "remote_command": 0, "observation": 0},
     }, "terminal retained rows must not be treated as missing-status blockers"
@@ -340,7 +379,7 @@ def test_blockers_count_real_physical_copies_in_independent_modes(
         workflow_status=WorkflowStatus.BLOCKED,
         command_status=RemoteCommandStatus.LEASED,
     )
-    install_v21(connection)
+    install_v22(connection)
     before = retained_rows(connection)
 
     proof = inspect_database(
@@ -375,7 +414,7 @@ def test_real_observation_workload_phase_is_checked_in_both_heaps(
 ) -> None:
     connection = database.connection
     seed_observation(connection, storage, phase)
-    install_v21(connection)
+    install_v22(connection)
     before = retained_rows(connection)
 
     proof = inspect_database(
@@ -407,7 +446,7 @@ def test_unknown_legacy_status_is_never_accepted_as_terminal(
         "WHERE kind=%s",
         (json.dumps(status), kind),
     )
-    install_v21(connection)
+    install_v22(connection)
 
     proof = inspect_database(
         connection, LATEST_POSTGRES_SCHEMA_VERSION, allow_schema_upgrade=True
@@ -418,13 +457,13 @@ def test_unknown_legacy_status_is_never_accepted_as_terminal(
 
 
 @pytest.mark.parametrize("drift", ["missing", "name", "checksum", "extra"])
-def test_only_the_exact_contiguous_v21_migration_prefix_is_accepted(
+def test_only_the_exact_contiguous_v22_migration_prefix_is_accepted(
     database: PrivateDatabase, drift: str
 ) -> None:
     from psycopg import sql
 
     connection = database.connection
-    install_v21(connection)
+    install_v22(connection)
     if drift == "missing":
         connection.execute(
             "DELETE FROM public.gpu_fault_schema_migrations WHERE version=7"
@@ -439,7 +478,7 @@ def test_only_the_exact_contiguous_v21_migration_prefix_is_accepted(
     else:
         connection.execute(
             sql.SQL(
-                "UPDATE public.gpu_fault_schema_migrations SET {}=%s WHERE version=21"
+                "UPDATE public.gpu_fault_schema_migrations SET {}=%s WHERE version=22"
             ).format(sql.Identifier(drift)),
             ("0" * 64 if drift == "checksum" else "unrecognized-migration",),
         )
@@ -456,17 +495,17 @@ def test_only_the_exact_contiguous_v21_migration_prefix_is_accepted(
 @pytest.mark.parametrize(
     ("observed", "required", "allowed", "message"),
     [
-        (20, 22, True, "schema version differs"),
-        (23, 22, True, "schema version differs"),
-        (21, 22, False, "schema version differs"),
-        (21, 21, True, "probe image schema identity differs"),
+        (21, 23, True, "schema version differs"),
+        (24, 23, True, "schema version differs"),
+        (22, 23, False, "schema version differs"),
+        (22, 22, True, "probe image schema identity differs"),
     ],
 )
 def test_unreviewed_or_unapproved_schema_markers_fail_closed(
     database: PrivateDatabase, observed: int, required: int, allowed: bool, message: str
 ) -> None:
     connection = database.connection
-    install_v21(connection)
+    install_v22(connection)
     # Invalid marker cases are deliberate corruption, not claimed v16/v19 fixtures.
     connection.execute(
         "UPDATE public.gpu_fault_schema_version SET version=%s WHERE singleton",
@@ -496,7 +535,7 @@ def test_retained_heap_with_row_security_is_refused(
     from psycopg import sql
 
     connection = database.connection
-    install_v21(connection)
+    install_v22(connection)
     connection.execute(
         sql.SQL("ALTER TABLE {} ENABLE ROW LEVEL SECURITY").format(
             sql.Identifier("public", table)
@@ -516,7 +555,7 @@ def test_retained_proof_requires_plain_builtin_heap_columns(
     database: PrivateDatabase, drift: str
 ) -> None:
     connection = database.connection
-    install_v21(connection)
+    install_v22(connection)
     if drift == "view":
         connection.execute(
             "ALTER TABLE public.gpu_fault_workflows RENAME TO gpu_fault_retained_workflows"
@@ -556,7 +595,7 @@ def test_missing_storage_mode_cannot_hide_a_retained_heap(
     connection = database.connection
     configure_mode(connection, "dedicated")
     seed_records(connection)
-    install_v21(connection)
+    install_v22(connection)
     connection.execute(
         "DELETE FROM public.gpu_fault_control_state_modes WHERE kind='workflow'"
     )
@@ -576,7 +615,7 @@ def test_preensure_probe_never_executes_retained_projection_functions(
     connection = database.connection
     configure_mode(connection, "dedicated")
     seed_records(connection)
-    install_v21(connection)
+    install_v22(connection)
     for kind in KINDS:
         layout = STATE_LAYOUTS[kind]
         connection.execute(
@@ -611,19 +650,24 @@ def test_preensure_probe_never_executes_retained_projection_functions(
 
 
 @pytest.mark.parametrize("mode", ["legacy", "dual", "dedicated"])
-def test_explicit_v18_ensure_precedes_current_business_proof_and_preserves_rows(
+def test_explicit_v23_ensure_precedes_current_business_proof_and_preserves_rows(
     database: PrivateDatabase, mode: str
 ) -> None:
     connection = database.connection
     configure_mode(connection, mode)
     seed_records(connection)
-    install_v21(connection)
+    install_v22(connection)
     before = retained_rows(connection)
     history = migration_history(connection)
 
-    with pytest.raises(RuntimeError, match="schema migration history mismatch"):
+    # v23 declares queue indexes a v22 catalog lacks, so the fail-closed
+    # startup check now stops on the missing indexes before it reaches the
+    # migration history; either refusal keeps a business Pod off retained v22.
+    with pytest.raises(
+        RuntimeError, match="indexes are missing|schema migration history mismatch"
+    ):
         with closing(database.open_store(False)):
-            pytest.fail("a business Store must not start on retained v17")
+            pytest.fail("a business Store must not start on retained v22")
     assert retained_rows(connection) == before, (
         "refused business startup must not mutate data"
     )
@@ -644,7 +688,7 @@ def test_explicit_v18_ensure_precedes_current_business_proof_and_preserves_rows(
         (item.version, item.name, item.checksum) for item in POSTGRES_SCHEMA_MIGRATIONS
     ], "ensure must append exactly the candidate v22 migration"
     assert migration_history(connection)[:-1] == history, (
-        "v1-v21 history must stay unchanged"
+        "v1-v22 history must stay unchanged"
     )
     assert retained_rows(connection) == before, (
         "ensure must preserve retained data, selected modes and migration checkpoints"
@@ -668,41 +712,45 @@ def test_explicit_v18_ensure_precedes_current_business_proof_and_preserves_rows(
         ), "reinstallation must not clear historical quarantine"
 
 
-def _trigger_definition(connection: psycopg.Connection, name: str) -> str | None:
-    row = connection.execute(
-        "SELECT pg_get_triggerdef(oid) FROM pg_trigger WHERE tgname=%s", (name,)
-    ).fetchone()
-    return None if row is None else str(row[0])
+def _queue_indexes(connection: psycopg.Connection) -> set[str]:
+    return {
+        row[0]
+        for row in connection.execute(
+            "SELECT indexname FROM pg_indexes WHERE tablename='gpu_fault_processor_queue'"
+        ).fetchall()
+    }
 
 
-def _function_settings(connection: psycopg.Connection, name: str) -> set[str]:
-    row = connection.execute(
-        "SELECT proconfig FROM pg_proc WHERE proname=%s", (name,)
-    ).fetchone()
-    assert row is not None, name
-    return set(row[0] or ())
+def _queue_columns(connection: psycopg.Connection) -> set[str]:
+    return {
+        row[0]
+        for row in connection.execute(
+            "SELECT column_name FROM information_schema.columns "
+            "WHERE table_name='gpu_fault_processor_queue'"
+        ).fetchall()
+    }
 
 
-def test_fixture_has_real_v21_functions_and_ensure_installs_v22_pinned_probes(
+def test_fixture_has_the_real_v22_queue_catalog_and_ensure_installs_the_v23_layout(
     database: PrivateDatabase,
 ) -> None:
     connection = database.connection
     configure_mode(connection, "dual")
     seed_records(connection)
-    install_v21(connection)
+    install_v22(connection)
     before = retained_rows(connection)
-    for function in WAKEUP_FUNCTIONS:
-        assert _function_settings(connection, function) == set(), (
-            "the fixture must really be a v21 database (no planner pins on the "
-            "wakeup functions), not a relabelled v22 one"
-        )
-    # v22 changes no trigger: the v21 statement-level definitions are current.
-    for name in (
-        "gpu_fault_processor_queue_notify_pending_trigger",
-        "gpu_fault_telemetry_spool_notify_available_trigger",
-    ):
-        definition = _trigger_definition(connection, name)
-        assert definition is not None and "FOR EACH STATEMENT" in definition, name
+    assert {"path", "scope_keys"}.isdisjoint(_queue_columns(connection)), (
+        "the fixture must really be a v22 database (no v23 queue columns)"
+    )
+    v22_names = {statement.split()[2] for statement in V22_QUEUE_INDEXES}
+    assert v22_names <= _queue_indexes(connection), "the v22 index set is present"
+    assert set(V23_QUEUE_INDEXES).isdisjoint(_queue_indexes(connection)), (
+        "a v22 catalog carries none of the v23 queue indexes"
+    )
+    for table in V23_TABLES:
+        assert connection.execute("SELECT to_regclass(%s)", (table,)).fetchone() == (
+            None,
+        ), table
 
     with closing(database.open_store(True)):
         pass
@@ -710,16 +758,24 @@ def test_fixture_has_real_v21_functions_and_ensure_installs_v22_pinned_probes(
     assert retained_rows(connection) == before, (
         "ensure must preserve retained data, selected modes and migration checkpoints"
     )
-    for function in WAKEUP_FUNCTIONS:
-        assert _function_settings(connection, function) == V22_PLANNER_PINS, function
-    for name in (
-        "gpu_fault_processor_queue_notify_pending_update_trigger",
-        "gpu_fault_telemetry_spool_notify_available_update_trigger",
-    ):
-        definition = _trigger_definition(connection, name)
-        assert definition is not None and "REFERENCING OLD TABLE AS removed" in (
-            definition
-        ), name
+    assert {"path", "scope_keys"} <= _queue_columns(connection)
+    assert set(V23_QUEUE_INDEXES) <= _queue_indexes(connection)
+    assert v22_names.isdisjoint(_queue_indexes(connection)), (
+        "the v23 migration callback retires the status-predicated set"
+    )
+    for table in V23_TABLES:
+        assert connection.execute("SELECT to_regclass(%s)", (table,)).fetchone() != (
+            None,
+        ), table
+    assert connection.execute(
+        "SELECT mode FROM public.gpu_fault_hot_layout_mode WHERE singleton"
+    ).fetchone() == ("inline",), (
+        "an upgraded database keeps the inline layout until the operator's switch"
+    )
+    assert connection.execute(
+        "SELECT count(*) FROM pg_trigger "
+        "WHERE tgname='gpu_fault_processor_queue_fill_columns_trigger'"
+    ).fetchone() == (1,)
     assert migration_history(connection)[-1][0] == LATEST_POSTGRES_SCHEMA_VERSION
     assert connection.execute(
         "SELECT version FROM public.gpu_fault_schema_version WHERE singleton"
@@ -733,7 +789,7 @@ def test_retained_probe_works_inside_a_read_only_session(
 
     connection = database.connection
     seed_records(connection)
-    install_v21(connection)
+    install_v22(connection)
     before = retained_rows(connection)
     connection.execute("SET default_transaction_read_only=on")
     try:

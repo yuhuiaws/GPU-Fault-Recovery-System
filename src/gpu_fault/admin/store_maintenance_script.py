@@ -48,8 +48,10 @@ COMPACT_TABLES = (
 #: index, then ``VACUUM (ANALYZE)``.
 REINDEX_TABLES = (
     "gpu_fault_gpu_metric_latest",
+    "gpu_fault_gpu_metric_latest_clusters",
     "gpu_fault_objects",
     "gpu_fault_processor_queue",
+    "gpu_fault_processor_payloads",
     "gpu_fault_gpu_metrics_batches",
 )
 COMPACT_ACTION = "VACUUM (FULL, ANALYZE)"
@@ -115,37 +117,65 @@ def server_facts(cursor: Any) -> dict[str, Any]:
 def table_facts(cursor: Any, table: str) -> dict[str, Any] | None:
     """Live rows, pages and bytes of one table, or ``None`` when absent."""
 
+    # A partitioned parent (schema v23's metric-latest twin) owns no pages:
+    # its facts are summed over its partitions and its indexes are theirs.
     cursor.execute(
         """
+        WITH members AS (
+            SELECT c.oid FROM pg_class c
+            WHERE c.oid = to_regclass(%s) AND c.relkind <> 'p'
+            UNION ALL
+            SELECT i.inhrelid FROM pg_inherits i WHERE i.inhparent = to_regclass(%s)
+        )
         SELECT
-            c.oid::regclass::text,
-            c.relpages,
-            pg_relation_size(c.oid),
-            pg_indexes_size(c.oid),
-            COALESCE(pg_total_relation_size(c.reltoastrelid), 0),
-            pg_total_relation_size(c.oid),
-            c.reloptions,
-            COALESCE(t.reloptions, ARRAY[]::text[]),
-            COALESCE(s.n_live_tup, 0),
-            COALESCE(s.n_dead_tup, 0),
-            COALESCE(s.n_tup_upd, 0),
-            COALESCE(s.n_tup_hot_upd, 0),
-            COALESCE(s.seq_scan, 0),
-            s.last_vacuum,
-            s.last_autovacuum
-        FROM pg_class c
-        LEFT JOIN pg_class t ON t.oid = c.reltoastrelid
+            %s,
+            COALESCE(sum(c.relpages), 0),
+            COALESCE(sum(pg_relation_size(c.oid)), 0),
+            COALESCE(sum(pg_indexes_size(c.oid)), 0),
+            COALESCE(sum(pg_total_relation_size(c.reltoastrelid)), 0),
+            COALESCE(sum(pg_total_relation_size(c.oid)), 0),
+            COALESCE(
+                (SELECT p.reloptions FROM pg_class p WHERE p.oid = to_regclass(%s)),
+                (SELECT ch.reloptions FROM pg_inherits ih
+                 JOIN pg_class ch ON ch.oid = ih.inhrelid
+                 WHERE ih.inhparent = to_regclass(%s)
+                 ORDER BY ch.relname LIMIT 1)
+            ),
+            COALESCE(
+                (SELECT t.reloptions FROM pg_class p
+                 JOIN pg_class t ON t.oid = p.reltoastrelid
+                 WHERE p.oid = to_regclass(%s)),
+                ARRAY[]::text[]
+            ),
+            COALESCE(sum(s.n_live_tup), 0),
+            COALESCE(sum(s.n_dead_tup), 0),
+            COALESCE(sum(s.n_tup_upd), 0),
+            COALESCE(sum(s.n_tup_hot_upd), 0),
+            COALESCE(sum(s.seq_scan), 0),
+            max(s.last_vacuum),
+            max(s.last_autovacuum)
+        FROM members m
+        JOIN pg_class c ON c.oid = m.oid
         LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
-        WHERE c.oid = to_regclass(%s)
+        HAVING to_regclass(%s) IS NOT NULL
         """,
-        (table,),
+        (table, table, table, table, table, table, table),
     )
     row = cursor.fetchone()
     if row is None:
         return None
+    # The table's own indexes; a partitioned index (relkind I) is sized over
+    # the partition indexes attached to it and REINDEX of its name rebuilds
+    # every partition in turn.
     cursor.execute(
         """
-        SELECT c.relname, pg_relation_size(c.oid), i.indisvalid
+        SELECT c.relname,
+               CASE WHEN c.relkind = 'I' THEN (
+                   SELECT COALESCE(sum(pg_relation_size(ci.oid)), 0)
+                   FROM pg_inherits ih JOIN pg_class ci ON ci.oid = ih.inhrelid
+                   WHERE ih.inhparent = c.oid
+               ) ELSE pg_relation_size(c.oid) END,
+               i.indisvalid
         FROM pg_index i
         JOIN pg_class c ON c.oid = i.indexrelid
         WHERE i.indrelid = to_regclass(%s)

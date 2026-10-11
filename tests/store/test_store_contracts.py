@@ -201,7 +201,6 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "complete_remote_command",
         "complete_xid_correlation",
         "create_incident_workflow_if_absent",
-        "delete_regional_cluster",
         "efa_traffic_state_key",
         "enqueue_notification_delivery",
         "ensure_remote_command",
@@ -263,7 +262,6 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "save_incident_and_workflow",
         "save_notification_result",
         "save_profile",
-        "save_regional_cluster",
         "save_regional_registry_member",
         "save_workload_coverage_heartbeat",
         "save_xid_policy_decision",
@@ -349,6 +347,7 @@ POSTGRES_PROCESSOR_PUBLIC = {
             "get_processor_request",
             "has_incomplete_processor_requests",
             "has_incomplete_processor_requests_for_scopes",
+            "hot_layout_mode",
             "processor_fault_backlog_depth",
             "processor_queue_stats",
         }
@@ -568,7 +567,7 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
     historical = {
         migration.version: migration.checksum
         for migration in POSTGRES_SCHEMA_MIGRATIONS
-        if migration.version <= 21
+        if migration.version <= 22
     }
 
     assert historical == {
@@ -593,13 +592,14 @@ def test_applied_postgres_migration_checksums_are_immutable() -> None:
         19: "8b45571ac9f79d6e0d1b676c3d247b8d6e260514d50d904bdc18ebed1ef5a68b",
         20: "a20842379a4cd68a0dfbe44465d1b90b58c0534bad668c3998995d792d357754",
         21: "572dcd68640d86ae13a625abbb7dffb9bc0681fbbd6f70ac3c19686b5c74ab55",
+        22: "fc04df1dc0fa231c26adcd2fb2012f6745b9f9154951aa1a7e9a310cc3f01455",
     }, (
-        "a frozen migration's checksum changed: do not edit v1-v21 (not even "
+        "a frozen migration's checksum changed: do not edit v1-v22 (not even "
         "a comment inside its apply callback); append a new migration instead"
     )
-    # v21 is frozen before implementing v22. The final unpublished migration
+    # v22 is frozen before implementing v23. The final unpublished migration
     # follows the current DDL until this schema release is finalized.
-    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 22
+    assert POSTGRES_SCHEMA_MIGRATIONS[-1].version == 23
 
 
 def test_completion_cluster_groups_use_bounded_parallelism() -> None:
@@ -1037,6 +1037,7 @@ POSTGRES_ONLY_PUBLIC_METHODS: dict[str, str | None] = {
     "claim_active_processor_query": "tests/store/test_postgres_claim_window.py",
     "compact_hot_tables": "tests/store/test_postgres_hot_table_compaction.py",
     "finalize_processor_counter_shards": "tests/store/test_postgres_processor_counters.py",
+    "hot_layout_mode": "tests/store/test_postgres_hot_layout.py",
     "hot_table_bloat": "tests/store/test_postgres_hot_table_compaction.py",
     "hot_state_backfill_gaps": "tests/store/test_postgres_dedicated_hot_state_startup.py",
     "hot_state_migration_status": "tests/store/test_postgres_dedicated_hot_state_startup.py",

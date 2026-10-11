@@ -334,7 +334,7 @@
   "src/gpu_fault/store/postgres/processor_storage.py:arg-type": 1,
   "src/gpu_fault/store/postgres/processor_storage.py:has-type": 2,
   "src/gpu_fault/store/postgres/processor_storage.py:no-any-return": 4,
-  "src/gpu_fault/store/postgres/processor_storage.py:no-untyped-def": 9,
+  "src/gpu_fault/store/postgres/processor_storage.py:no-untyped-def": 8,
   "src/gpu_fault/store/postgres/processor_storage.py:return-value": 1,
   "src/gpu_fault/store/postgres/remote_commands.py:no-untyped-def": 2,
   "src/gpu_fault/store/postgres/remote_commands.py:type-arg": 2,

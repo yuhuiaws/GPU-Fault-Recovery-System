@@ -13,6 +13,7 @@ from gpu_fault.store.postgres.fresh_control_state import (
     database_is_fresh,
     seed_fresh_control_state_modes,
 )
+from gpu_fault.store.postgres.hot_layout import seed_fresh_hot_layout
 from gpu_fault.store.postgres.ddl import (
     create_postgres_schema,
 )
@@ -190,6 +191,10 @@ class PostgresSchemaMixin:
                     seed_fresh_control_state_modes(
                         cursor, self.fresh_control_state_mode
                     )
+                    # Schema v23: a database that never carried the inline
+                    # layout starts detached; an upgraded one waits for the
+                    # operator's switch after the control-plane roll.
+                    seed_fresh_hot_layout(cursor)
 
     def _validate_existing_schema(self) -> None:
         with self._db.cursor() as cursor:

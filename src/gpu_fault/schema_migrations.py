@@ -8,6 +8,9 @@ from pathlib import Path
 from typing import Protocol
 
 from gpu_fault.store.postgres.ddl import _create_priority_counter_function
+from gpu_fault.store.postgres.ddl_processor_layout import (
+    RETIRED_QUEUE_INDEXES,
+)
 from gpu_fault.store.postgres.ddl_processor_retry import (
     upgrade_processor_retry_schedule,
 )
@@ -214,6 +217,33 @@ def _apply_per_key_wakeup_probes_v22(cursor: MigrationCursor) -> None:
     cursor.execute("SELECT 1")
 
 
+def _apply_detached_hot_layout_v23(cursor: MigrationCursor) -> None:
+    # The queue's eight status-predicated indexes made every claim and
+    # completion a non-HOT update (ddl_processor_layout.py); the v23 index set
+    # the idempotent DDL has just declared references neither status nor the
+    # lease columns, so the old set goes here, once, the way v11/v12/v19
+    # dropped theirs. Rows written before the fill trigger existed get their
+    # path / scope_keys columns from the payload they still carry; the layout
+    # row the DDL seeded stays ``inline`` until the operator's switch.
+    for name in RETIRED_QUEUE_INDEXES:
+        cursor.execute(f"DROP INDEX IF EXISTS {name}")
+    cursor.execute(
+        """
+        UPDATE gpu_fault_processor_queue
+        SET path = coalesce(path, payload->>'path'),
+            scope_keys = coalesce(
+                scope_keys,
+                ARRAY(
+                    SELECT jsonb_array_elements_text(
+                        coalesce(payload->'correlation_scope_keys', '[]'::jsonb)
+                    )
+                )
+            )
+        WHERE path IS NULL OR scope_keys IS NULL
+        """
+    )
+
+
 @dataclass(frozen=True)
 class SchemaMigration:
     version: int
@@ -383,6 +413,12 @@ POSTGRES_SCHEMA_MIGRATIONS = (
         name="per-key-planner-pinned-wakeup-probes",
         ddl_checksum="ba7f7c8e157fe1e7f563374421425299a1333b80bfb5ce0f1bcf9cea6f19961c",
         apply=_apply_per_key_wakeup_probes_v22,
+    ),
+    SchemaMigration(
+        version=23,
+        name="processor-queue-detached-payloads-replays-and-cluster-partitions",
+        ddl_checksum="b9d55565b4e7501bfdc08594a42c2376b072c0ed25699b1fa975ae2580516f3b",
+        apply=_apply_detached_hot_layout_v23,
     ),
 )
 

@@ -110,6 +110,10 @@ def test_fillfactor_only_where_rows_are_rewritten_in_place() -> None:
             assert "fillfactor=50" in _reloptions(cursor, table)[0], table
         for table in ("gpu_fault_processor_queue", "gpu_fault_gpu_metric_latest"):
             assert "fillfactor=70" in _reloptions(cursor, table)[0], table
+        payloads, _ = _reloptions(cursor, "gpu_fault_processor_payloads")
+        assert {"fillfactor=80", "toast_tuple_target=8160"} <= payloads, sorted(
+            payloads
+        )
         batches, _ = _reloptions(cursor, "gpu_fault_gpu_metrics_batches")
         assert not any(item.startswith("fillfactor=") for item in batches), (
             "insert-only idempotency records gain nothing from page slack"

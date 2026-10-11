@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import TYPE_CHECKING, Any, Callable
 
+from gpu_fault.store.postgres.hot_layout import (
+    SCHEMA_LOCK_NAME,
+    drop_cluster_partition,
+    ensure_cluster_partition,
+)
 from gpu_fault.store.shared.cleanup_log import log_cleanup
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
@@ -10,9 +16,69 @@ from gpu_fault.store.shared.time import (
 
 if TYPE_CHECKING:
     from gpu_fault.fleet_deployment import FleetDeployment
+    from gpu_fault.regional import RegionalClusterRegistration
+
+LOGGER = logging.getLogger(__name__)
 
 
 class PostgresFleetMixin:
+    def save_regional_cluster(
+        self, registration: RegionalClusterRegistration
+    ) -> RegionalClusterRegistration:
+        """The shared write plus the cluster's latest-metric partition (schema
+        v23): created on registration so its rows never start in the DEFAULT
+        catch-all, dropped again by ``delete_regional_cluster``."""
+
+        result: RegionalClusterRegistration = super().save_regional_cluster(  # type: ignore[misc]
+            registration
+        )
+        self._cluster_partition_ddl("ensure", registration.cluster_id)
+        return result
+
+    def delete_regional_cluster(self, cluster_id: str) -> None:
+        super().delete_regional_cluster(cluster_id)  # type: ignore[misc]
+        self._cluster_partition_ddl("drop", cluster_id)
+
+    def _cluster_partition_ddl(self, action: str, cluster_id: str) -> str | None:
+        """Partition DDL on its own autocommit transaction under the schema
+        maintenance lock (try, never wait); a refusal is logged, never raised:
+        the DEFAULT partition carries the rows until the next pass."""
+
+        try:
+            with self._db.pool.connection() as connection:
+                with connection.cursor() as cursor:
+                    cursor.execute(
+                        "SELECT pg_try_advisory_lock(hashtextextended(%s, 0))",
+                        (SCHEMA_LOCK_NAME,),
+                    )
+                    if not cursor.fetchone()[0]:
+                        LOGGER.info(
+                            "cluster partition %s for %s deferred: maintenance lock held",
+                            action,
+                            cluster_id,
+                        )
+                        return None
+                try:
+                    with connection.transaction():
+                        with connection.cursor() as cursor:
+                            if action == "ensure":
+                                return ensure_cluster_partition(cursor, cluster_id)
+                            return drop_cluster_partition(cursor, cluster_id)
+                finally:
+                    with connection.cursor() as cursor:
+                        cursor.execute(
+                            "SELECT pg_advisory_unlock(hashtextextended(%s, 0))",
+                            (SCHEMA_LOCK_NAME,),
+                        )
+        except Exception as exc:  # noqa: BLE001 - the registration itself stands
+            LOGGER.warning(
+                "cluster partition %s for %s failed: %s",
+                action,
+                cluster_id,
+                type(exc).__name__,
+            )
+            return None
+
     # Attributes supplied by the composed concrete implementation.
     _agent_key: Callable[..., Any]
     _db: Any

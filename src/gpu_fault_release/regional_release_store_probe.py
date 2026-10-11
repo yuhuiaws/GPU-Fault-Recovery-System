@@ -60,8 +60,21 @@ def compatible_retained_schema(observed: int, target: int) -> bool:
     # processor-queue and spool NOTIFY trigger functions and their triggers
     # (statement-level, edge-triggered); no table changes at all. (21, 22):
     # v22 only replaces the bodies of those two trigger functions (one
-    # planner-pinned probe per key); triggers and tables are untouched.
-    return (observed, target) in {(17, 18), (18, 19), (19, 20), (20, 21), (21, 22)}
+    # planner-pinned probe per key); triggers and tables are untouched. (22,
+    # 23): v23 adds two nullable queue columns filled by a BEFORE INSERT
+    # trigger, new empty tables (payloads, replays, the cluster-partitioned
+    # metric latest twin, the layout mode row) and replaces the queue index
+    # set; the workflow / remote-command records this read counts and their
+    # tables are untouched, and an upgraded database keeps the inline layout
+    # until the operator's switch.
+    return (observed, target) in {
+        (17, 18),
+        (18, 19),
+        (19, 20),
+        (20, 21),
+        (21, 22),
+        (22, 23),
+    }
 
 
 def declared_table_names() -> set[str]:
@@ -119,16 +132,24 @@ def prove_partial_empty(cursor: Any, relations: list[Any]) -> dict[str, Any]:
     from psycopg import sql
 
     declared = declared_table_names()
-    if any(kind != "r" or name not in declared for _schema, name, kind in relations):
+    if any(
+        kind not in {"r", "p"} or name not in declared
+        for _schema, name, kind in relations
+    ):
         raise ValueError("uninitialized schema has unrecognized views or tables")
-    for _schema, name, _kind in relations:
-        validate_heap_table(cursor, name, partial=True)
-    for schema, name, _kind in relations:
-        cursor.execute(
-            sql.SQL("SELECT EXISTS (SELECT 1 FROM ONLY {} LIMIT 1)").format(
-                sql.Identifier(schema, name)
-            )
+    for _schema, name, kind in relations:
+        if kind == "r":
+            validate_heap_table(cursor, name, partial=True)
+    for schema, name, kind in relations:
+        # A partitioned parent (relkind p) holds its rows in partitions, which
+        # the listing hides; ``ONLY`` would prove an empty parent of full
+        # partitions, so the parent is read through.
+        template = (
+            "SELECT EXISTS (SELECT 1 FROM {} LIMIT 1)"
+            if kind == "p"
+            else "SELECT EXISTS (SELECT 1 FROM ONLY {} LIMIT 1)"
         )
+        cursor.execute(sql.SQL(template).format(sql.Identifier(schema, name)))
         if cursor.fetchone() != (False,):
             raise ValueError("incomplete schema contains rows")
     return {
@@ -168,6 +189,7 @@ def inspect_database(
             FROM pg_catalog.pg_class c
             JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace
             WHERE c.relkind IN ('r','p','v','m','f')
+              AND NOT c.relispartition
               AND n.nspname NOT IN ('pg_catalog','information_schema')
               AND n.nspname NOT LIKE 'pg_toast%'
               AND n.nspname NOT LIKE 'pg_temp_%'

@@ -271,7 +271,7 @@ def test_claim_touches_only_its_window_and_keeps_its_answer(
         f"every queue read is an index read: {pinned_scans}"
     )
     if shape == "include_path":
-        assert "gpu_fault_processor_queue_path_priority_claim" in {
+        assert "gpu_fault_processor_queue_path_claim_window" in {
             name for _, name in pinned_scans
         }, pinned_scans
     assert _widest_queue_read(pinned_plan) <= WINDOW, (

@@ -34,7 +34,7 @@ POSTGRES_URL = os.getenv("GPU_FAULT_TEST_POSTGRES_URL")
 pytestmark = pytest.mark.skipif(
     not POSTGRES_URL, reason="GPU_FAULT_TEST_POSTGRES_URL is not configured"
 )
-PROBE_INDEX = "gpu_fault_processor_queue_priority_claim"
+PROBE_INDEX = "gpu_fault_processor_queue_claim_window"
 
 
 @pytest.fixture
@@ -225,3 +225,34 @@ def test_the_diagnostic_warnings_say_what_each_gap_costs():
         )
         == []
     )
+
+
+def test_partitioned_parents_and_missing_columns_are_recognised(connection):
+    """Schema v23: a partitioned parent refuses CONCURRENTLY and gets a plain
+    build; an index keying a column the ensure Job has not added yet is
+    deferred to ensure like an index on a missing table."""
+
+    from gpu_fault.store.postgres.index_builder import (
+        _index_columns_exist,
+        _index_table_is_partitioned,
+    )
+
+    statements = declared_index_statements()
+    with connection.cursor() as cursor:
+        assert _index_table_is_partitioned(
+            cursor, statements["gpu_fault_gpu_metric_latest_clusters_node"]
+        ), "the metric-latest twin is a partitioned parent"
+        assert not _index_table_is_partitioned(cursor, statements[PROBE_INDEX]), (
+            "the queue is a plain table"
+        )
+        assert _index_columns_exist(cursor, statements[PROBE_INDEX]), (
+            "the claim window keys existing columns"
+        )
+        assert _index_columns_exist(
+            cursor, statements["gpu_fault_processor_queue_scope_keys"]
+        ), "a WITH (...) storage clause is not a column"
+        assert not _index_columns_exist(
+            cursor,
+            "CREATE INDEX IF NOT EXISTS gf_probe ON gpu_fault_processor_queue "
+            "(not_a_column, priority)",
+        ), "an index keying a missing column is deferred to ensure"

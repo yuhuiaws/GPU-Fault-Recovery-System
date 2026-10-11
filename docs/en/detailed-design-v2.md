@@ -2444,12 +2444,17 @@ heap versions per request, not more frequent tidying.
    peak) and has no "high-water mark of the previous round"; replay rows are never deleted row by row, never vacuumed,
    and return their pages with the partition.
 3. **Make the claim a HOT update.** Once only in-flight rows live in the queue, `status` no longer needs to be a
-   partial-index predicate. v23 replaces the eight B-tree/GIN indexes with 5+1 whose keys contain neither `status`, the
-   lease columns nor `updated_at`: `gpu_fault_processor_queue_claim_order_v23 (priority, created_at, request_id)`,
-   `..._path_claim_order_v23 ((payload->>'path'), priority, created_at, request_id)`, `..._lane_v23 (ordering_key)`,
-   `..._cluster_v23 (cluster_id, created_at)`, the primary key, and `..._scoped_v23 GIN ((payload->'correlation_scope_
-   keys')) WHERE jsonb_array_length(...) > 0`, which covers only rows that carry scope keys (routine telemetry has none
-   and stops paying the GIN pending-list metapage lock on every row; the readers spell the same predicate). Retired:
+   partial-index predicate. v23 replaces the eight B-tree/GIN indexes with five whose keys contain neither `status`, the
+   lease columns nor `updated_at`, plus the primary key: `gpu_fault_processor_queue_claim_window (priority, created_at,
+   request_id)`, `..._path_claim_window (path, priority, created_at, request_id)`, `..._lane_rows (ordering_key)`,
+   `..._cluster_rows (cluster_id, created_at)` and `..._scope_keys GIN (scope_keys) WHERE cardinality(scope_keys) > 0`.
+   `path` and `scope_keys` are new v23 columns (a BEFORE INSERT trigger fills them from the payload when a
+   previous-release writer leaves them NULL), so **no index references `payload` any more** -- which is what lets even a
+   coalescing whole-row rewrite be HOT. The GIN's readers are the claim's fault/observation interlock and the
+   dispatcher's scope probe (`has_incomplete_processor_requests_for_scopes`), which spell `cardinality(scope_keys) > 0`
+   themselves; incident-scoped telemetry channels carry one node key, so the GIN still covers most rows -- the gain is a
+   `text[]` column instead of a JSONB expression and `fastupdate=off`, so concurrent writers no longer queue on the
+   pending list's metapage lock. Retired:
    `_priority_claim`, `_path_priority_claim`, `_lane`, `_cluster`, `_incomplete_cluster` (a prefix twin of `_cluster`),
    `_available` (its only reader is the expired-lease reclaim, for which a sequential scan of an in-flight-only queue
    suffices), `_completed` (completed rows are no longer in the queue), `_correlation_scopes`. **Gain**: index entries

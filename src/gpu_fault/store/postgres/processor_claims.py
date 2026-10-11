@@ -46,11 +46,18 @@ def _fault_path_list_sql(indent: int) -> str:
 
 
 def _scope_array_sql(alias: str) -> str:
-    return f"""ARRAY(
-        SELECT jsonb_array_elements_text(
-            coalesce({alias}.payload->'correlation_scope_keys', '[]'::jsonb)
-        )
-    )"""
+    # Schema v23: the scope keys are a column (filled from the payload for a
+    # previous-release writer), so the interlock probes compare arrays and the
+    # partial GIN over rows with keys serves them.
+    return f"coalesce({alias}.scope_keys, ARRAY[]::text[])"
+
+
+def _scoped_overlap_sql(alias: str, keys: str) -> str:
+    """``alias`` carries scope keys that overlap ``keys``; the cardinality test
+    is the GIN's partial predicate, spelled so the planner can prove it."""
+
+    return f"""cardinality({alias}.scope_keys) > 0
+                    AND {alias}.scope_keys && {keys}"""
 
 
 _CLAIM_WINDOW_COLUMNS_SQL = f"""\
@@ -65,15 +72,16 @@ _CLAIM_WINDOW_COLUMNS_SQL = f"""\
             ELSE candidate.priority
         END AS priority,
         candidate.created_at,
-        candidate.payload->>'path' AS path,
+        candidate.path AS path,
         {_scope_array_sql("candidate")} AS scope_keys,
         {{window_id}} AS window_id
 """
 
-# Shared by both sub-windows. Every predicate here is either implied by the
-# partial index predicate of gpu_fault_processor_queue_priority_claim
-# (status IN ('PENDING','LEASED')) or a cheap residual filter on the rows
-# that index yields in claim order.
+# Shared by both sub-windows. The window walks
+# gpu_fault_processor_queue_claim_window (priority, created_at, request_id)
+# in claim order; every predicate here is a cheap residual filter on the rows
+# that index yields (schema v23 keeps status out of every index so claims
+# are HOT updates).
 _CLAIM_ELIGIBLE_SQL = """\
     FROM gpu_fault_processor_queue AS candidate
     LEFT JOIN gpu_fault_processor_lanes AS lane
@@ -106,19 +114,19 @@ _CLAIM_ELIGIBLE_SQL = """\
 # The path filter of a sub-window. A dedicated pool's claim names its path
 # (7 of the 8 sub-claims per cycle do), and that path is rendered as one
 # equality literal per sub-window so the planner walks
-# gpu_fault_processor_queue_path_priority_claim ((payload->>'path'),
-# priority, created_at, request_id) in claim order and stops at the LIMIT.
+# gpu_fault_processor_queue_path_claim_window (path, priority, created_at,
+# request_id) in claim order and stops at the LIMIT.
 # ``= ANY(array)`` on the leading column gave a Bitmap scan of the whole path
 # backlog and a top-N sort instead, so the claim's cost grew with the path's
 # depth - the shape F-D2 removed for the unfiltered window (B-3 / G-3). The
 # fault stream excludes the dedicated paths; that stays a residual filter on
 # the priority_claim walk, which is still an ordered index walk.
 _PATH_EQUALS_SQL = """\
-      AND candidate.payload->>'path'={path_literal}
+      AND candidate.path={path_literal}
 """
 _PATH_EXCLUDES_SQL = """\
       AND NOT (
-          candidate.payload->>'path'=ANY(%(excluded)s)
+          candidate.path=ANY(%(excluded)s)
       )
 """
 
@@ -228,11 +236,10 @@ candidate_ids AS MATERIALIZED (
                   SELECT 1
                   FROM gpu_fault_processor_queue AS fault
                   WHERE fault.status='PENDING'
-                    AND fault.payload->>'path' IN (
+                    AND fault.path IN (
 {_fault_path_list_sql(24)}
                   )
-                    AND fault.payload->'correlation_scope_keys'
-                        ?| claim_window.scope_keys
+                    AND {_scoped_overlap_sql("fault", "claim_window.scope_keys")}
               )
             THEN -1
             ELSE claim_window.priority
@@ -253,10 +260,9 @@ candidate_ids AS MATERIALIZED (
                           AND observation.lease_expires_at > %(now)s
                       )
                   )
-              AND observation.payload->>'path'
+              AND observation.path
                   = '/v1/workload-observations'
-              AND observation.payload->'correlation_scope_keys'
-                  ?| claim_window.scope_keys
+              AND {_scoped_overlap_sql("observation", "claim_window.scope_keys")}
         )
     )
 {{strict_predecessor}}
@@ -354,6 +360,9 @@ updated AS (
         queue.request_id,
         queue.payload,
         queue.status,
+        queue.cluster_id,
+        queue.correlation_key,
+        queue.priority,
         queue.lease_owner,
         queue.leader_epoch,
         queue.lease_token,
@@ -364,7 +373,10 @@ updated AS (
         queue.not_before,
         queue.retry_count,
         queue.lane_policy,
-        queue.updated_at
+        queue.created_at,
+        queue.updated_at,
+        queue.path,
+        queue.scope_keys
 ),
 scan_after AS MATERIALIZED (
     SELECT raw_priority, created_at, request_id
@@ -396,6 +408,8 @@ FROM scan_progress
 LEFT JOIN updated ON TRUE
 LEFT JOIN selected
   ON selected.request_id=updated.request_id
+LEFT JOIN gpu_fault_processor_payloads AS payloads
+  ON payloads.request_id=updated.request_id
 ORDER BY
     selected.effective_priority,
     selected.created_at,
@@ -409,6 +423,7 @@ class PostgresProcessorClaimsMixin:
     _decode: Callable[..., Any]
     _persist_processor_state: Callable[..., Any]
     _processor_queue_effective_payload: Callable[..., Any]
+    _hot_layout_mode_for_write: Callable[..., Any]
     claim_window_multiplier: int
     get_processor_leadership: Callable[..., Any]
     processor_queue_state_mode: Any
@@ -452,13 +467,13 @@ class PostgresProcessorClaimsMixin:
                 FROM gpu_fault_processor_queue AS fault
                 WHERE fault.status='PENDING'
                   AND (fault.not_before IS NULL OR fault.not_before <= %s)
-                  AND fault.payload->>'path' IN (
+                  AND fault.path IN (
 {_fault_path_list_sql(20)}
                   )
                   AND EXISTS (
                       SELECT 1
                       FROM gpu_fault_processor_queue AS observation
-                      WHERE observation.payload->>'path'
+                      WHERE observation.path
                             = '/v1/workload-observations'
                         AND (
                             observation.status='PENDING'
@@ -467,8 +482,7 @@ class PostgresProcessorClaimsMixin:
                                 AND observation.lease_expires_at > %s
                             )
                         )
-                        AND observation.payload->'correlation_scope_keys'
-                            ?| {_scope_array_sql("fault")}
+                        AND {_scoped_overlap_sql("observation", _scope_array_sql("fault"))}
                   )
                 """,
                 (now, now),
@@ -502,23 +516,28 @@ class PostgresProcessorClaimsMixin:
             with self._db.cursor() as cursor:
                 cursor.execute(
                     f"""
-                    SELECT queue.payload
+                    SELECT {
+                        self._processor_queue_effective_payload("queue", "payloads")
+                    }
                     FROM gpu_fault_processor_queue AS queue
+                    LEFT JOIN gpu_fault_processor_payloads AS payloads
+                      ON payloads.request_id=queue.request_id
                     JOIN (
                         SELECT DISTINCT ON (candidate.ordering_key)
                             candidate.request_id,
                             CASE
-                                WHEN candidate.payload->>'path'
+                                WHEN candidate.path
                                      = '/v1/workload-observations'
                                   AND EXISTS (
                                       SELECT 1
                                       FROM gpu_fault_processor_queue AS fault
                                       WHERE fault.status='PENDING'
-                                        AND fault.payload->>'path' IN (
+                                        AND fault.path IN (
 {_fault_path_list_sql(44)}
                                       )
-                                        AND fault.payload->'correlation_scope_keys'
-                                            ?| {_scope_array_sql("candidate")}
+                                        AND {
+                        _scoped_overlap_sql("fault", _scope_array_sql("candidate"))
+                    }
                                   )
                                 THEN -1
                                 ELSE candidate.priority
@@ -547,7 +566,7 @@ class PostgresProcessorClaimsMixin:
                                 AND retry_barrier.not_before > %s
                           )
                           AND NOT (
-                              candidate.payload->>'path' IN (
+                              candidate.path IN (
 {_fault_path_list_sql(34)}
                               )
                               AND EXISTS (
@@ -560,10 +579,13 @@ class PostgresProcessorClaimsMixin:
                                                 AND observation.lease_expires_at > %s
                                             )
                                         )
-                                    AND observation.payload->>'path'
+                                    AND observation.path
                                         = '/v1/workload-observations'
-                                    AND observation.payload->'correlation_scope_keys'
-                                        ?| {_scope_array_sql("candidate")}
+                                    AND {
+                        _scoped_overlap_sql(
+                            "observation", _scope_array_sql("candidate")
+                        )
+                    }
                               )
                           )
                           AND NOT EXISTS (
@@ -661,9 +683,9 @@ class PostgresProcessorClaimsMixin:
             # A STRICT retry can become ready behind the cursor. It must still
             # precede a later same-lane request found by the advancing window.
             path_filter = (
-                "          AND earlier.payload->>'path'=ANY(%(included)s)"
+                "          AND earlier.path=ANY(%(included)s)"
                 if included
-                else "          AND NOT (earlier.payload->>'path'=ANY(%(excluded)s))"
+                else "          AND NOT (earlier.path=ANY(%(excluded)s))"
                 if excluded
                 else ""
             )
@@ -673,7 +695,9 @@ class PostgresProcessorClaimsMixin:
             claim_window=claim_window,
             strict_predecessor=strict_predecessor,
             payload_update=payload_update,
-            effective_payload=self._processor_queue_effective_payload("updated"),
+            effective_payload=self._processor_queue_effective_payload(
+                "updated", "payloads"
+            ),
         )
         parameters: dict[str, object] = {
             "now": now,
@@ -717,6 +741,7 @@ class PostgresProcessorClaimsMixin:
         with self._db.transaction():
             pin_hot_path_plans(self._db)
             with self._db.cursor() as cursor:
+                self._hot_layout_mode_for_write(cursor)
                 cursor.execute(sql, parameters)
                 rows = cursor.fetchall()
             claimed = [
@@ -794,12 +819,12 @@ class PostgresProcessorClaimsMixin:
                       )
                       AND (
                           %s
-                          OR candidate.payload->>'path'=ANY(%s)
+                          OR candidate.path=ANY(%s)
                       )
                       AND (
                           %s
                           OR NOT (
-                              candidate.payload->>'path'=ANY(%s)
+                              candidate.path=ANY(%s)
                           )
                       )
                       AND lane.lease_expires_at > %s

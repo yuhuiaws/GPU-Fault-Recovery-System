@@ -335,6 +335,14 @@ def _argument_parser() -> argparse.ArgumentParser:
         action="store_true",
     )
     source.add_argument("--purge-legacy-hot-state", action="store_true")
+    source.add_argument(
+        "--set-hot-layout",
+        choices=("detached",),
+        help="schema v23: switch writers to the detached hot-table layout once "
+        "the control-plane roll is complete (one-way; copies the latest-metric "
+        "rows into the cluster partitions and creates the replay buckets)",
+    )
+    source.add_argument("--hot-layout-status", action="store_true")
     _state_table_arguments(source, parser)
     parser.add_argument(
         "--postgres-url",
@@ -430,6 +438,25 @@ def main() -> None:
             return
     if arguments.ensure_diagnostics:
         raise SystemExit(ensure_diagnostics(arguments.postgres_url))
+    if arguments.set_hot_layout or arguments.hot_layout_status:
+        # Not a PostgresStore: the switch is maintenance on an autocommit
+        # session (a session advisory lock held across the copy), and the
+        # status must read a database whose layout is mid-switch.
+        import psycopg
+
+        from gpu_fault.store.postgres.hot_layout import (
+            layout_status,
+            switch_to_detached,
+        )
+
+        with psycopg.connect(arguments.postgres_url, autocommit=True) as connection:
+            if arguments.set_hot_layout:
+                report = switch_to_detached(connection)
+            else:
+                with connection.cursor() as cursor:
+                    report = layout_status(cursor)
+        print(json.dumps(report, indent=2, sort_keys=True, default=str))
+        return
     if arguments.backfill_hot_state:
         store = PostgresStore(
             arguments.postgres_url, hot_state_mode="dual", initialize_schema=False

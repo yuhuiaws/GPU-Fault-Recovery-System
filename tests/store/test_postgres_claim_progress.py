@@ -351,7 +351,7 @@ def test_seek_plan_bounds_interlock_input_and_uses_the_tuple_index(
         "head, seek and aging are the entire bounded interlock input"
     )
     assert any(
-        node.get("Index Name") == "gpu_fault_processor_queue_priority_claim"
+        node.get("Index Name") == "gpu_fault_processor_queue_claim_window"
         and "ROW(priority, created_at, request_id) > ROW(" in node.get("Index Cond", "")
         for node in nodes
     ), "continuation must seek the tuple index, not discard a growing OFFSET"

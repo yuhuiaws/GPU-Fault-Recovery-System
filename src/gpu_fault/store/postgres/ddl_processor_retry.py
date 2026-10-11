@@ -4,7 +4,6 @@ from typing import Protocol
 
 from gpu_fault.store.postgres.ddl_helpers import (
     _add_column_if_missing,
-    _declare_index,
 )
 
 
@@ -32,16 +31,7 @@ def upgrade_processor_retry_schedule(cursor: MigrationCursor) -> None:
         "lane_policy",
         "TEXT NOT NULL DEFAULT 'STRICT' CHECK (lane_policy IN ('STRICT', 'REORDERABLE'))",
     )
-    _declare_index(
-        cursor,
-        """
-        CREATE INDEX IF NOT EXISTS gpu_fault_processor_queue_available
-        ON gpu_fault_processor_queue (
-            status,
-            not_before,
-            priority,
-            created_at,
-            request_id
-        )
-        """,
-    )
+    # ``gpu_fault_processor_queue_available`` (status, not_before, priority,
+    # created_at, request_id) was declared here from v7 to v22; it led with
+    # ``status`` and so blocked every HOT update. Schema v23 drops it: the
+    # expired-lease reclaim it served reads an in-flight-only queue now.

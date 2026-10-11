@@ -14,6 +14,8 @@ class PostgresProcessorLeaseMixin:
     _decode: Callable[..., Any]
     _persist_processor_state: Callable[..., Any]
     _processor_queue_effective_payload: Callable[..., Any]
+    _processor_payloads_join: Callable[..., Any]
+    _hot_layout_mode_for_write: Callable[..., Any]
     _state_transaction: Callable[..., Any]
 
     def validate_processor_lane(
@@ -267,8 +269,8 @@ class PostgresProcessorLeaseMixin:
         (renewal moves both in one transaction) and the next claim's
         ``leased_lanes`` upsert takes it over, so this keeps the queue-row
         -> lane lock order documented on ``_lock_processor_queue_row``.
-        ``gpu_fault_processor_queue_available`` leads with ``status``, so
-        the scan is bounded by the LEASED set, not the history.
+        Schema v23 keeps only in-flight rows in the queue, so the scan is
+        bounded by the LEASED set without an index on ``status``.
         """
 
         from gpu_fault.processor import (
@@ -277,19 +279,26 @@ class PostgresProcessorLeaseMixin:
 
         with self._state_transaction("processor_request/reclaim-expired"):
             with self._db.cursor() as cursor:
+                self._hot_layout_mode_for_write(cursor)
                 cursor.execute(
                     f"""
                     SELECT {
                         self._processor_queue_effective_payload(
-                            "gpu_fault_processor_queue"
+                            "gpu_fault_processor_queue", "payloads"
                         )
                     }
                     FROM gpu_fault_processor_queue
-                    WHERE status='LEASED'
-                      AND lease_expires_at <= %s
-                    ORDER BY lease_expires_at, request_id
+                    {
+                        self._processor_payloads_join(
+                            "gpu_fault_processor_queue", "payloads"
+                        )
+                    }
+                    WHERE gpu_fault_processor_queue.status='LEASED'
+                      AND gpu_fault_processor_queue.lease_expires_at <= %s
+                    ORDER BY gpu_fault_processor_queue.lease_expires_at,
+                             gpu_fault_processor_queue.request_id
                     LIMIT %s
-                    FOR UPDATE SKIP LOCKED
+                    FOR UPDATE OF gpu_fault_processor_queue SKIP LOCKED
                     """,
                     (now, limit),
                 )
@@ -326,7 +335,7 @@ class PostgresProcessorLeaseMixin:
         The outer scan reads the lane table (small: one row per ordering
         key leased within the retention window; the ``_expiry`` index was
         dropped in schema v19 as it only cost writes) and the guard is served
-        by ``gpu_fault_processor_queue_lane``. Resetting a lane epoch by
+        by ``gpu_fault_processor_queue_lane_rows``. Resetting a lane epoch by
         deleting the row is safe because every fencing predicate also
         matches ``lease_token``.
         """

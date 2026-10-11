@@ -72,6 +72,16 @@ HOT_TABLE_STORAGE_PARAMETERS: dict[str, dict[str, str]] = {
         **_THRESHOLD_ONLY_AUTOVACUUM,
     },
     "gpu_fault_gpu_metrics_batches": {**_THRESHOLD_ONLY_AUTOVACUUM},
+    # Schema v23: request bodies live here, rewritten only when a routine
+    # sample coalesces into its pending row. ``toast_tuple_target`` at the
+    # page size keeps a compressed body inline, so the table has no TOAST
+    # traffic; the partitioned parents of the detached layout carry their
+    # options per partition (hot_layout.py) because a parent accepts none.
+    "gpu_fault_processor_payloads": {
+        "fillfactor": "80",
+        "toast_tuple_target": "8160",
+        **_THRESHOLD_ONLY_AUTOVACUUM,
+    },
 }
 
 _OPTION_NAME = re.compile(r"^(?:toast\.)?[a-z_]+$")

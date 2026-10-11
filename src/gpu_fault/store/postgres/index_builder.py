@@ -94,8 +94,10 @@ def index_health(connection: Any) -> list[dict[str, Any]]:
 
 
 _INDEX_TABLE = re.compile(r"\bON\s+(\w+)", re.IGNORECASE)
+# ``pg_get_indexdef`` says ``ON ONLY <parent>`` for a partitioned index; the
+# probe's temp clone is a plain table, so the keyword is part of the header.
 _INDEX_HEADER = re.compile(
-    r"^CREATE\s+(UNIQUE\s+)?INDEX\s+\S+\s+ON\s+\S+\s+", re.IGNORECASE
+    r"^CREATE\s+(UNIQUE\s+)?INDEX\s+\S+\s+ON\s+(?:ONLY\s+)?\S+\s+", re.IGNORECASE
 )
 
 
@@ -216,9 +218,20 @@ def _build_missing_indexes_concurrently(connection: Any) -> dict[str, Any]:
                 # empty table has no writers to protect from a plain CREATE INDEX.
                 awaiting_table.append(name)
                 continue
-            statement = statements[name].replace(
-                "INDEX IF NOT EXISTS", "INDEX CONCURRENTLY IF NOT EXISTS", 1
-            )
+            elif not _index_columns_exist(cursor, statements[name]):
+                # The index keys a column the ensure Job has not added yet
+                # (schema v23's path / scope_keys): the DDL declares column and
+                # index together, and the queue is small enough for its plain
+                # CREATE INDEX.
+                awaiting_table.append(name)
+                continue
+            statement = statements[name]
+            if not _index_table_is_partitioned(cursor, statement):
+                # CONCURRENTLY is refused on a partitioned parent; its
+                # partitions are small and a plain build locks them briefly.
+                statement = statement.replace(
+                    "INDEX IF NOT EXISTS", "INDEX CONCURRENTLY IF NOT EXISTS", 1
+                )
             cursor.execute(statement)
             built.append(name)
     after = index_health(connection)
@@ -246,6 +259,83 @@ def _index_table_exists(cursor: Any, statement: str) -> bool:
     cursor.execute("SELECT to_regclass(%s)", (match.group(1),))
     row = cursor.fetchone()
     return bool(row and row[0] is not None)
+
+
+def _index_table_is_partitioned(cursor: Any, statement: str) -> bool:
+    match = _INDEX_TABLE.search(statement)
+    if match is None:  # pragma: no cover - declared statements always name a table
+        return False
+    cursor.execute(
+        "SELECT relkind FROM pg_class WHERE oid = to_regclass(%s)", (match.group(1),)
+    )
+    row = cursor.fetchone()
+    return bool(row and row[0] == "p")
+
+
+_INDEX_COLUMNS = re.compile(r"\b([a-z_][a-z0-9_]*)\b")
+_SQL_WORDS = frozenset(
+    {
+        "create",
+        "unique",
+        "index",
+        "if",
+        "not",
+        "exists",
+        "on",
+        "using",
+        "gin",
+        "btree",
+        "where",
+        "and",
+        "or",
+        "in",
+        "is",
+        "null",
+        "desc",
+        "asc",
+        "true",
+        "false",
+        "payload",
+        "greatest",
+        "cardinality",
+        "jsonb_array_length",
+        "coalesce",
+    }
+)
+
+
+def _index_columns_exist(cursor: Any, statement: str) -> bool:
+    """Every plain column the statement names exists on its table.
+
+    Identifiers that are SQL words, functions or the JSONB ``payload`` paths
+    (whose keys are string literals, never identifiers) are skipped; what is
+    left are the column names of the key list and the predicate.
+    """
+
+    match = _INDEX_TABLE.search(statement)
+    if match is None:  # pragma: no cover - declared statements always name a table
+        return True
+    table = match.group(1)
+    body = statement[match.end() :]
+    body = re.sub(r"'[^']*'", "", body)
+    body = re.sub(r"\bWITH\s*\([^)]*\)", " ", body, flags=re.IGNORECASE)
+    body = re.sub(r"->>?", " ", body)
+    candidates = {
+        word.lower()
+        for word in _INDEX_COLUMNS.findall(body)
+        if word.lower() not in _SQL_WORDS and not word.isdigit()
+    }
+    if not candidates:
+        return True
+    cursor.execute(
+        """
+        SELECT column_name FROM information_schema.columns
+        WHERE table_schema=current_schema() AND table_name=%s
+        """,
+        (table,),
+    )
+    present = {str(row[0]) for row in cursor.fetchall()}
+    return candidates <= present
 
 
 def schema_preflight(connection: Any) -> dict[str, Any]:

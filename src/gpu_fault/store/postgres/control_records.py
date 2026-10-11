@@ -54,6 +54,18 @@ _HOT_STATE_MAPPINGS: dict[str, tuple[str, str | None, str | None]] = {
 }
 
 
+def _hot_state_mappings(
+    metric_latest_table: str,
+) -> dict[str, tuple[str, str | None, str | None]]:
+    """``_HOT_STATE_MAPPINGS`` with the latest-metric table of the current
+    layout (schema v23: the cluster-partitioned twin once detached)."""
+
+    mappings = dict(_HOT_STATE_MAPPINGS)
+    table, timestamp, legacy = mappings["gpu_metric_latest"]
+    mappings["gpu_metric_latest"] = (metric_latest_table, timestamp, legacy)
+    return mappings
+
+
 def _hot_state_mismatch(
     dedicated_timestamp: str | None, legacy_timestamp: str | None
 ) -> str:
@@ -76,6 +88,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
     hot_state_mode: Any
     _get_optional: Callable[..., Any]
     _count_by_field: Callable[..., dict[str, int]]
+    _metric_latest_table: Callable[..., str]
 
     def list_markers(self) -> list[NodeMarker]:
         with self._db.cursor() as cursor:
@@ -508,9 +521,15 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
         counts = {}
         with self._state_transaction("hot_state/backfill"):
             with self._db.cursor() as cursor:
+                table = self._metric_latest_table(cursor, write=True)
+                conflict = (
+                    "(key)"
+                    if table == "gpu_fault_gpu_metric_latest"
+                    else "(cluster_id, key)"
+                )
                 cursor.execute(
-                    """
-                    INSERT INTO gpu_fault_gpu_metric_latest(
+                    f"""
+                    INSERT INTO {table}(
                         key, cluster_id, node_id,
                         observed_at, payload
                     )
@@ -522,13 +541,13 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                         payload
                     FROM gpu_fault_objects
                     WHERE kind='gpu_metric_latest'
-                    ON CONFLICT(key) DO UPDATE SET
+                    ON CONFLICT{conflict} DO UPDATE SET
                         cluster_id=excluded.cluster_id,
                         node_id=excluded.node_id,
                         observed_at=excluded.observed_at,
                         payload=excluded.payload
                     WHERE excluded.observed_at >=
-                          gpu_fault_gpu_metric_latest.observed_at
+                          {table}.observed_at
                     """
                 )
                 counts["gpu_metric_latest"] = cursor.rowcount
@@ -620,7 +639,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                 table,
                 dedicated_timestamp,
                 legacy_timestamp,
-            ) in _HOT_STATE_MAPPINGS.items():
+            ) in _hot_state_mappings(self._metric_latest_table(cursor)).items():
                 mismatch_condition = _hot_state_mismatch(
                     dedicated_timestamp, legacy_timestamp
                 )
@@ -657,15 +676,8 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
 
     def hot_state_backfill_gaps(self) -> dict[str, bool]:
         """Per hot-state kind: does any legacy row lack an up-to-date twin?
-
-        The dedicated-mode startup check used to call
-        ``hot_state_migration_status`` -- a full LEFT JOIN with three
-        aggregates per kind plus ``count(*)`` of each dedicated table -- and
-        uvicorn ``--limit-max-requests`` makes process start routine (store
-        review 2026-09-07, item J). Startup only needs a yes/no per kind, so
-        this stops at the first gap and never counts the dedicated tables;
-        the CLI keeps the counting form.
-        """
+        A yes/no that stops at the first gap (process start is routine under
+        ``--limit-max-requests``, item J); the CLI keeps the counting form."""
 
         gaps: dict[str, bool] = {}
         with self._db.cursor() as cursor:
@@ -673,7 +685,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                 table,
                 dedicated_timestamp,
                 legacy_timestamp,
-            ) in _HOT_STATE_MAPPINGS.items():
+            ) in _hot_state_mappings(self._metric_latest_table(cursor)).items():
                 cursor.execute(
                     f"""
                     SELECT EXISTS (
@@ -736,9 +748,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
         limit: int = 1000,
     ) -> dict[str, int]:
         observed = now or datetime.now(timezone.utc)
-        # No global lock around the sweep: it takes each observation row's own
-        # ``attempt_observation/<key>`` advisory lock, the one every other
-        # writer of that row holds (F-G7 / P1-44L).
+        # No global lock: each observation row's own advisory lock (F-G7).
         terminalized = reconcile_terminal_attempt_observations(self, limit)
         deleted = {"attempt_observation_terminalized": terminalized}
         with self._state_transaction("hot_state/cleanup"):
@@ -796,7 +806,7 @@ class PostgresControlRecordMixin(AttemptObservationTerminalSupport):
                 None,
             ),
             "gpu_metric_latest": (
-                "gpu_fault_gpu_metric_latest",
+                self._metric_latest_table(),
                 "observed_at",
                 observed - latest_retention,
                 None,

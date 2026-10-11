@@ -64,11 +64,16 @@ COMPACT_TABLES: tuple[str, ...] = (
     "gpu_fault_processor_queue_counts",
     "gpu_fault_processor_priority_count_shards",
 )
-#: Large or continuously read tables: only their indexes are rebuilt.
+#: Large or continuously read tables: only their indexes are rebuilt. The two
+#: partitioned parents of schema v23 are measured as the sum of their
+#: partitions and reindexed per partition index; the replay partitions are
+#: dropped whole by retention and never rebuilt.
 REINDEX_TABLES: tuple[str, ...] = (
     "gpu_fault_gpu_metric_latest",
+    "gpu_fault_gpu_metric_latest_clusters",
     "gpu_fault_objects",
     "gpu_fault_processor_queue",
+    "gpu_fault_processor_payloads",
     "gpu_fault_gpu_metrics_batches",
 )
 HOT_TABLES: tuple[str, ...] = COMPACT_TABLES + REINDEX_TABLES
@@ -89,20 +94,43 @@ LOCK_TIMEOUT = "5s"
 STATEMENT_TIMEOUT = "600s"
 PAGE_BYTES = 8192
 
+# A partitioned parent (relkind p) owns no pages: its facts are the sum over
+# its partitions, and each of its partitioned indexes (relkind I) is sized over
+# the partition indexes attached to it -- so REINDEX INDEX CONCURRENTLY of the
+# declared name rebuilds every partition in turn.
 _TABLE_FACTS_SQL = """
+WITH members AS (
+    SELECT c.oid FROM pg_class c WHERE c.oid = to_regclass(%s) AND c.relkind <> 'p'
+    UNION ALL
+    SELECT i.inhrelid FROM pg_inherits i WHERE i.inhparent = to_regclass(%s)
+)
 SELECT
-    c.oid::regclass::text,
-    COALESCE(s.n_live_tup, 0),
-    COALESCE(s.n_dead_tup, 0),
-    pg_relation_size(c.oid),
-    pg_indexes_size(c.oid),
-    COALESCE(pg_total_relation_size(c.reltoastrelid), 0)
-FROM pg_class c
+    %s,
+    COALESCE(sum(s.n_live_tup), 0),
+    COALESCE(sum(s.n_dead_tup), 0),
+    COALESCE(sum(pg_relation_size(c.oid)), 0),
+    COALESCE(sum(pg_indexes_size(c.oid)), 0),
+    COALESCE(sum(pg_total_relation_size(c.reltoastrelid)), 0)
+FROM members m
+JOIN pg_class c ON c.oid = m.oid
 LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
-WHERE c.oid = to_regclass(%s)
+HAVING to_regclass(%s) IS NOT NULL
 """
 _INDEX_FACTS_SQL = """
-SELECT c.relname, pg_relation_size(c.oid), c.reltuples, i.indisvalid, am.amname
+SELECT
+    c.relname,
+    CASE WHEN c.relkind = 'I' THEN (
+        SELECT COALESCE(sum(pg_relation_size(ci.oid)), 0)
+        FROM pg_inherits ih JOIN pg_class ci ON ci.oid = ih.inhrelid
+        WHERE ih.inhparent = c.oid
+    ) ELSE pg_relation_size(c.oid) END,
+    CASE WHEN c.relkind = 'I' THEN (
+        SELECT COALESCE(sum(ci.reltuples), 0)
+        FROM pg_inherits ih JOIN pg_class ci ON ci.oid = ih.inhrelid
+        WHERE ih.inhparent = c.oid
+    ) ELSE c.reltuples END,
+    i.indisvalid,
+    am.amname
 FROM pg_index i
 JOIN pg_class c ON c.oid = i.indexrelid
 JOIN pg_am am ON am.oid = c.relam
@@ -134,7 +162,7 @@ def small_heap_is_bloated(pages: int, live_rows: int) -> bool:
 def table_facts(cursor: Any, table: str) -> dict[str, Any] | None:
     """Physical facts of one hot table from the catalog, or ``None`` if absent."""
 
-    cursor.execute(_TABLE_FACTS_SQL, (table,))
+    cursor.execute(_TABLE_FACTS_SQL, (table, table, table, table))
     row = cursor.fetchone()
     if row is None:
         return None

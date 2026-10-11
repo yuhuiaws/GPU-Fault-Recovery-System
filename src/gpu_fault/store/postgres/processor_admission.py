@@ -3,8 +3,16 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable
 
+import base64
+
 from gpu_fault.processor import ProcessorRequestStatus
 from gpu_fault.processor.models import ROUTINE_PRIORITY
+from gpu_fault.store.postgres.ddl_processor_layout import (
+    LAYOUT_DETACHED,
+    PAYLOADS_TABLE,
+    REPLAYS_TABLE,
+)
+from gpu_fault.store.postgres.processor_storage import detached_payload_json
 from gpu_fault.store.shared.processor_helpers import (
     PartialEnqueueError,
     coalesce_routine_sample,
@@ -34,6 +42,9 @@ class PostgresProcessorAdmissionMixin:
     _processor_counter_mode: Callable[..., Any]
     _processor_counter_source: Callable[..., Any]
     _processor_queue_effective_payload: Callable[..., Any]
+    _processor_payloads_join: Callable[..., Any]
+    _processor_replay_effective_payload: Callable[..., Any]
+    _hot_layout_mode_for_write: Callable[..., Any]
     _put_processor_queue_many: Callable[..., Any]
 
     def try_enqueue_processor_request(
@@ -48,20 +59,39 @@ class PostgresProcessorAdmissionMixin:
     ):
         with self._db.transaction():
             with self._db.cursor() as cursor:
+                # The layout mode first, before any row lock (hot_layout.py).
+                self._hot_layout_mode_for_write(cursor)
                 cursor.execute(
                     f"""
                     SELECT {
                         self._processor_queue_effective_payload(
-                            "gpu_fault_processor_queue"
+                            "gpu_fault_processor_queue", "payloads"
                         )
                     }
                     FROM gpu_fault_processor_queue
-                    WHERE request_id=%s
-                    FOR UPDATE
+                    {
+                        self._processor_payloads_join(
+                            "gpu_fault_processor_queue", "payloads"
+                        )
+                    }
+                    WHERE gpu_fault_processor_queue.request_id=%s
+                    FOR UPDATE OF gpu_fault_processor_queue
                     """,
                     (request.request_id,),
                 )
                 existing = cursor.fetchone()
+                if existing is None:
+                    cursor.execute(
+                        f"""
+                        SELECT {self._processor_replay_effective_payload()}
+                        FROM {REPLAYS_TABLE}
+                        WHERE request_id=%s
+                        ORDER BY completed_at DESC
+                        LIMIT 1
+                        """,
+                        (request.request_id,),
+                    )
+                    existing = cursor.fetchone()
             if existing is not None:
                 return (
                     self._decode("processor_request", existing[0]),
@@ -76,17 +106,23 @@ class PostgresProcessorAdmissionMixin:
                         f"""
                         SELECT {
                             self._processor_queue_effective_payload(
-                                "gpu_fault_processor_queue"
+                                "gpu_fault_processor_queue", "payloads"
                             )
                         }
                         FROM gpu_fault_processor_queue
-                        WHERE status='PENDING'
-                          AND ordering_key=%s
-                          AND priority=%s
-                          AND payload->>'path'=%s
-                        ORDER BY created_at, request_id
+                        {
+                            self._processor_payloads_join(
+                                "gpu_fault_processor_queue", "payloads"
+                            )
+                        }
+                        WHERE gpu_fault_processor_queue.status='PENDING'
+                          AND gpu_fault_processor_queue.ordering_key=%s
+                          AND gpu_fault_processor_queue.priority=%s
+                          AND gpu_fault_processor_queue.path=%s
+                        ORDER BY gpu_fault_processor_queue.created_at,
+                                 gpu_fault_processor_queue.request_id
                         LIMIT 1
-                        FOR UPDATE
+                        FOR UPDATE OF gpu_fault_processor_queue
                         """,
                         (request.ordering_key(), ROUTINE_PRIORITY, request.path),
                     )
@@ -225,6 +261,8 @@ class PostgresProcessorAdmissionMixin:
     def _load_processor_admission_rows(self, requests):
         request_ids = sorted({request.request_id for request in requests})
         with self._db.cursor() as cursor:
+            # The layout mode first, before any lock (hot_layout.py).
+            self._hot_layout_mode_for_write(cursor)
             cursor.execute(
                 """
                 SELECT pg_advisory_xact_lock(
@@ -244,13 +282,16 @@ class PostgresProcessorAdmissionMixin:
             # deadlock face.
             cursor.execute(
                 f"""
-                SELECT request_id, {
-                    self._processor_queue_effective_payload("gpu_fault_processor_queue")
+                SELECT gpu_fault_processor_queue.request_id, {
+                    self._processor_queue_effective_payload(
+                        "gpu_fault_processor_queue", "payloads"
+                    )
                 }
                 FROM gpu_fault_processor_queue
-                WHERE request_id=ANY(%s)
-                ORDER BY request_id
-                FOR UPDATE
+                {self._processor_payloads_join("gpu_fault_processor_queue", "payloads")}
+                WHERE gpu_fault_processor_queue.request_id=ANY(%s)
+                ORDER BY gpu_fault_processor_queue.request_id
+                FOR UPDATE OF gpu_fault_processor_queue
                 """,
                 (request_ids,),
             )
@@ -258,6 +299,26 @@ class PostgresProcessorAdmissionMixin:
                 request_id: self._decode("processor_request", payload)
                 for request_id, payload in cursor.fetchall()
             }
+            # A completed request of the detached layout answers its retry
+            # from the replay row (same id, same response) within retention.
+            missing = [item for item in request_ids if item not in existing_by_id]
+            if missing:
+                cursor.execute(
+                    f"""
+                    SELECT DISTINCT ON (request_id)
+                        request_id, {self._processor_replay_effective_payload()}
+                    FROM {REPLAYS_TABLE}
+                    WHERE request_id=ANY(%s)
+                    ORDER BY request_id, completed_at DESC
+                    """,
+                    (missing,),
+                )
+                existing_by_id.update(
+                    {
+                        request_id: self._decode("processor_request", payload)
+                        for request_id, payload in cursor.fetchall()
+                    }
+                )
         ordering_keys = sorted(
             {request.ordering_key() for request in requests if request.coalescable()}
         )
@@ -271,7 +332,7 @@ class PostgresProcessorAdmissionMixin:
             cursor.execute(
                 f"""
                 WITH candidates AS MATERIALIZED (
-                    SELECT DISTINCT ON (ordering_key, payload->>'path')
+                    SELECT DISTINCT ON (ordering_key, path)
                         request_id
                     FROM gpu_fault_processor_queue
                     WHERE status='PENDING'
@@ -279,7 +340,7 @@ class PostgresProcessorAdmissionMixin:
                       AND ordering_key=ANY(%s)
                     ORDER BY
                         ordering_key,
-                        payload->>'path',
+                        path,
                         created_at,
                         request_id
                 ),
@@ -291,9 +352,12 @@ class PostgresProcessorAdmissionMixin:
                     ORDER BY queue.request_id
                     FOR UPDATE OF queue
                 )
-                SELECT ordering_key, {self._processor_queue_effective_payload("locked")}
+                SELECT locked.ordering_key, {
+                    self._processor_queue_effective_payload("locked", "payloads")
+                }
                 FROM locked
-                ORDER BY ordering_key
+                {self._processor_payloads_join("locked", "payloads")}
+                ORDER BY locked.ordering_key
                 """,
                 (ROUTINE_PRIORITY, ordering_keys),
             )
@@ -318,8 +382,8 @@ class PostgresProcessorAdmissionMixin:
         """
 
         with self._db.cursor() as cursor:
-            cursor.execute(
-                """
+            detached = self._hot_layout_mode_for_write(cursor) == LAYOUT_DETACHED
+            update = """
                 UPDATE gpu_fault_processor_queue
                 SET
                     cluster_id=%s,
@@ -330,22 +394,52 @@ class PostgresProcessorAdmissionMixin:
                     retry_count=%s,
                     lane_policy=%s,
                     updated_at=%s,
-                    payload=%s::jsonb
+                    payload=%s::jsonb,
+                    path=%s,
+                    scope_keys=%s::text[]
                 WHERE request_id=%s
                   AND status='PENDING'
-                """,
+            """
+            parameters: list[object] = [
+                coalesced.cluster_id,
+                coalesced.correlation_key,
+                coalesced.ordering_key(),
+                coalesced.queue_priority(),
+                coalesced.not_before,
+                coalesced.retry_count,
+                coalesced.lane_policy.value,
+                coalesced.updated_at,
                 (
-                    coalesced.cluster_id,
-                    coalesced.correlation_key,
-                    coalesced.ordering_key(),
-                    coalesced.queue_priority(),
-                    coalesced.not_before,
-                    coalesced.retry_count,
-                    coalesced.lane_policy.value,
-                    coalesced.updated_at,
-                    coalesced.model_dump_json(),
-                    coalesced.request_id,
+                    detached_payload_json(coalesced)
+                    if detached
+                    else coalesced.model_dump_json()
                 ),
+                coalesced.path,
+                list(coalesced.correlation_scope_keys),
+                coalesced.request_id,
+            ]
+            if not detached:
+                cursor.execute(update, parameters)
+                return bool(cursor.rowcount == 1)
+            # The merged body replaces the payloads row in the same statement;
+            # none of the indexed columns change value, so the queue UPDATE is
+            # a HOT update.
+            cursor.execute(
+                f"""
+                WITH merged AS (
+                    {update}
+                    RETURNING request_id
+                )
+                INSERT INTO {PAYLOADS_TABLE} (request_id, body)
+                SELECT request_id, %s::bytea FROM merged
+                ON CONFLICT(request_id) DO UPDATE SET body=excluded.body
+                """,
+                [
+                    *parameters,
+                    base64.b64decode(coalesced.body_base64)
+                    if coalesced.body_base64
+                    else b"",
+                ],
             )
             return bool(cursor.rowcount == 1)
 

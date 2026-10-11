@@ -10946,6 +10946,8 @@ kubectl -n gpu-fault-system set env \
 gpu-fault-store-migrate --purge-legacy-hot-state
 ```
 
+The schema v23 hot-table layout switch is a separate pair of verbs (administrator operations §4.7, v23 note): `--set-hot-layout detached` (run once after the control-plane roll completes, one-way) and `--hot-layout-status` (the mode, the metric-latest cluster partitions and replay buckets, the queue/payloads page counts).
+
 The state check uses timestamp monotonicity for latest/attempt/training: the dedicated table may be newer than the old table but not
 older; immutable GPU metrics batches require identical payloads. Any missing key or dedicated-table timestamp
 lagging behind refuses the purge.
