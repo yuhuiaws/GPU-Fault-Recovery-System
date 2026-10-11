@@ -24,8 +24,6 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from psycopg import sql
-
 from gpu_fault.store.postgres.ddl_processor_layout import (
     LAYOUT_DETACHED,
     LAYOUT_INLINE,
@@ -206,7 +204,12 @@ def ensure_cluster_partition(cursor: Any, cluster_id: str) -> str | None:
             f"INSERT INTO {name} SELECT * FROM moved",
             (cluster_id,),
         )
-        # DDL takes no bind parameters: the bound is a quoted literal.
+        # DDL takes no bind parameters: the bound is a quoted literal. The
+        # driver is imported here, not at module level: the store package must
+        # import without the optional PostgreSQL driver (tests, in-memory and
+        # SQLite deployments), and only a live cursor ever reaches this DDL.
+        from psycopg import sql
+
         cursor.execute(
             sql.SQL(
                 f"ALTER TABLE {METRIC_LATEST_CLUSTERS_TABLE} ATTACH PARTITION {name} "
@@ -214,6 +217,8 @@ def ensure_cluster_partition(cursor: Any, cluster_id: str) -> str | None:
             ).format(sql.Literal(cluster_id))
         )
         return name
+    from psycopg import sql
+
     cursor.execute(
         sql.SQL(
             f"CREATE TABLE IF NOT EXISTS {name} PARTITION OF "

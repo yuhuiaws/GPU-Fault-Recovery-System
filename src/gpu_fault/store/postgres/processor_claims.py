@@ -17,6 +17,9 @@ from gpu_fault.processor.models import (
     STARVED_ROUTINE_PRIORITY,
 )
 from gpu_fault.store.postgres.planner_discipline import pin_hot_path_plans
+from gpu_fault.store.postgres.processor_storage import (
+    processor_queue_effective_payload_sql,
+)
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
@@ -516,9 +519,7 @@ class PostgresProcessorClaimsMixin:
             with self._db.cursor() as cursor:
                 cursor.execute(
                     f"""
-                    SELECT {
-                        self._processor_queue_effective_payload("queue", "payloads")
-                    }
+                    SELECT {processor_queue_effective_payload_sql("queue", "payloads")}
                     FROM gpu_fault_processor_queue AS queue
                     LEFT JOIN gpu_fault_processor_payloads AS payloads
                       ON payloads.request_id=queue.request_id

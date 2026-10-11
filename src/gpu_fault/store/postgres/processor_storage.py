@@ -48,6 +48,87 @@ def detached_payload_json(request: Any) -> str:
 _BODY_B64_SQL = "replace(encode({alias}.body, 'base64'), E'\\n', '')"
 
 
+def processor_queue_state_json_sql(alias: str) -> str:
+    """The column-authoritative fields merged over the stored payload.
+
+    A module-level function (the mixin's ``_processor_queue_state_json``
+    delegates here) so that every SQL template that renders it can be
+    evaluated from module scope: the registry contract test renders each
+    queue statement to check its fault-path list, and a template bound to an
+    instance (``self``) is one it cannot read.
+    """
+
+    prefix = f"{alias}."
+    return f"""jsonb_build_object(
+                'status', {prefix}status,
+                'cluster_id', to_jsonb({prefix}cluster_id),
+                'correlation_key', to_jsonb({prefix}correlation_key),
+                'lease_owner', to_jsonb({prefix}lease_owner),
+                'leader_epoch', to_jsonb({prefix}leader_epoch),
+                'lease_token', to_jsonb({prefix}lease_token),
+                'lease_expires_at',
+                    to_jsonb({prefix}lease_expires_at),
+                'response_status',
+                    coalesce(
+                        to_jsonb({prefix}response_status),
+                        {prefix}payload->'response_status',
+                        'null'::jsonb
+                    ),
+                'response_content_type',
+                    coalesce(
+                        to_jsonb({prefix}response_content_type),
+                        {prefix}payload->'response_content_type',
+                        'null'::jsonb
+                    ),
+                'response_body_base64',
+                    coalesce(
+                        to_jsonb({prefix}response_body_base64),
+                        {prefix}payload->'response_body_base64',
+                        'null'::jsonb
+                    ),
+                'not_before', to_jsonb({prefix}not_before),
+                'retry_count', to_jsonb({prefix}retry_count),
+                'lane_policy', to_jsonb({prefix}lane_policy),
+                'created_at', to_jsonb({prefix}created_at),
+                'updated_at', to_jsonb({prefix}updated_at),
+                'path', coalesce(to_jsonb({prefix}path), {prefix}payload->'path'),
+                'correlation_scope_keys',
+                    coalesce(
+                        to_jsonb({prefix}scope_keys),
+                        {prefix}payload->'correlation_scope_keys',
+                        '[]'::jsonb
+                    )
+            )"""
+
+
+def processor_queue_effective_payload_sql(
+    alias: str = "gpu_fault_processor_queue",
+    payload_alias: str | None = "gpu_fault_processor_payloads",
+) -> str:
+    """The JSON a ``ProcessorRequest`` is decoded from: stored payload,
+    column-authoritative state, and the body from the payloads row (detached
+    layout) or from the payload itself (inline layout).
+
+    Every statement that renders this must ``LEFT JOIN
+    gpu_fault_processor_payloads`` under ``payload_alias`` on the row's
+    request id; ``None`` is for statements over rows that provably carry
+    their body inline. Module-level for the same reason as
+    ``processor_queue_state_json_sql``.
+    """
+
+    prefix = f"{alias}."
+    body = f"{prefix}payload->'body_base64'"
+    if payload_alias is not None:
+        encoded = _BODY_B64_SQL.format(alias=payload_alias)
+        body = f"coalesce(to_jsonb({encoded}), {body})"
+    return f"""
+            {prefix}payload || {processor_queue_state_json_sql(alias)}
+            || jsonb_build_object(
+                'body_base64', coalesce({body}, '""'::jsonb)
+            )
+        """
+
+
 def _b64_bytes(value: str | None) -> bytes:
     return base64.b64decode(value) if value else b""
 
@@ -258,49 +339,9 @@ class PostgresProcessorStorageMixin:
 
     @staticmethod
     def _processor_queue_state_json(alias: str) -> str:
-        """The column-authoritative fields merged over the stored payload."""
+        """See ``processor_queue_state_json_sql``."""
 
-        prefix = f"{alias}."
-        return f"""jsonb_build_object(
-                'status', {prefix}status,
-                'cluster_id', to_jsonb({prefix}cluster_id),
-                'correlation_key', to_jsonb({prefix}correlation_key),
-                'lease_owner', to_jsonb({prefix}lease_owner),
-                'leader_epoch', to_jsonb({prefix}leader_epoch),
-                'lease_token', to_jsonb({prefix}lease_token),
-                'lease_expires_at',
-                    to_jsonb({prefix}lease_expires_at),
-                'response_status',
-                    coalesce(
-                        to_jsonb({prefix}response_status),
-                        {prefix}payload->'response_status',
-                        'null'::jsonb
-                    ),
-                'response_content_type',
-                    coalesce(
-                        to_jsonb({prefix}response_content_type),
-                        {prefix}payload->'response_content_type',
-                        'null'::jsonb
-                    ),
-                'response_body_base64',
-                    coalesce(
-                        to_jsonb({prefix}response_body_base64),
-                        {prefix}payload->'response_body_base64',
-                        'null'::jsonb
-                    ),
-                'not_before', to_jsonb({prefix}not_before),
-                'retry_count', to_jsonb({prefix}retry_count),
-                'lane_policy', to_jsonb({prefix}lane_policy),
-                'created_at', to_jsonb({prefix}created_at),
-                'updated_at', to_jsonb({prefix}updated_at),
-                'path', coalesce(to_jsonb({prefix}path), {prefix}payload->'path'),
-                'correlation_scope_keys',
-                    coalesce(
-                        to_jsonb({prefix}scope_keys),
-                        {prefix}payload->'correlation_scope_keys',
-                        '[]'::jsonb
-                    )
-            )"""
+        return processor_queue_state_json_sql(alias)
 
     @classmethod
     def _processor_queue_effective_payload(
@@ -308,27 +349,9 @@ class PostgresProcessorStorageMixin:
         alias: str = "gpu_fault_processor_queue",
         payload_alias: str | None = "gpu_fault_processor_payloads",
     ) -> str:
-        """The JSON a ``ProcessorRequest`` is decoded from: stored payload,
-        column-authoritative state, and the body from the payloads row (detached
-        layout) or from the payload itself (inline layout).
+        """See ``processor_queue_effective_payload_sql``."""
 
-        Every statement that renders this must ``LEFT JOIN
-        gpu_fault_processor_payloads`` under ``payload_alias`` on the row's
-        request id; ``None`` is for statements over rows that provably carry
-        their body inline.
-        """
-
-        prefix = f"{alias}."
-        body = f"{prefix}payload->'body_base64'"
-        if payload_alias is not None:
-            encoded = _BODY_B64_SQL.format(alias=payload_alias)
-            body = f"coalesce(to_jsonb({encoded}), {body})"
-        return f"""
-            {prefix}payload || {cls._processor_queue_state_json(alias)}
-            || jsonb_build_object(
-                'body_base64', coalesce({body}, '""'::jsonb)
-            )
-        """
+        return processor_queue_effective_payload_sql(alias, payload_alias)
 
     @staticmethod
     def _processor_replay_effective_payload(
