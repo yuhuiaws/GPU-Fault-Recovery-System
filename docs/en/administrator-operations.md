@@ -369,7 +369,7 @@ Within the first minute the command checks that the SNS subscription is confirme
 `failed/partial-convergence` with a different release as candidate, or the candidate crosses a schema version, it refuses with the engine's own words as soon as the release build finishes
 and names the parameter to add (`--supersede-failed-transaction` / `--accept-schema-change`);
 command-line parameters take precedence over leftover environment variables.
-The current PostgreSQL schema baseline is whatever `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION` defines (currently v22, `per-key-planner-pinned-wakeup-probes`; what v12-v14 each changed is in the special note of §4.7, every version from v15 on is in the version list of Detailed Design §3.3); a schema change must be classified `FULL` and can only be released fail-forward: add `--accept-schema-change` on the deploy command (§4.7); do not change `site.yaml`. The schema phase of `deploy`
+The current PostgreSQL schema baseline is whatever `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION` defines (currently v23, `processor-queue-detached-payloads-replays-and-cluster-partitions`; what v12-v14 each changed is in the special note of §4.7, every version from v15 on is in the version list of Detailed Design §3.3); a schema change must be classified `FULL` and can only be released fail-forward: add `--accept-schema-change` on the deploy command (§4.7); do not change `site.yaml`. The schema phase of `deploy`
 (`deploy/control-plane/tools/ensure-postgres-schema.sh`; the single-cluster `deploy.sh` of Appendix A uses the same order) runs three one-shot Jobs in order before rolling
 the business processes, stopping on any failure without rolling:
 

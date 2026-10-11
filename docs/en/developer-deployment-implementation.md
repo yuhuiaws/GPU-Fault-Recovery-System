@@ -2142,7 +2142,7 @@ During a release there must be no further build, and no manual editing of Deploy
 4. Fill in resources, probes, termination grace, security context and negative tests.
 5. Run the required generators and review the generated Manifests, cleanup inventory and environment variable reference.
    A PostgreSQL DDL change also appends a consecutive schema migration; the current baseline is
-   `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION` (currently v22), the new migration version number
+   `schema_migrations.LATEST_POSTGRES_SCHEMA_VERSION` (currently v23), the new migration version number
    must be consecutive +1 (the next version is v19), and it must pass `make test-postgres-stress` or the CAP-005 runner.
 6. Run the first-step build and sign:
 
