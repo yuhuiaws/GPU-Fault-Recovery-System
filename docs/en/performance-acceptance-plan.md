@@ -113,9 +113,7 @@ next round runs on. Three points on one release with identical admission default
 bloated indexes and heaps 538 req/s FAIL (normal-telemetry reserved 503 share 29.4 %, 49 % of the active statements
 waiting on `LWLock:BufferContent` -- the queue INSERT in 84 % of its samples, the completion CTE 78 %, the claim CTE
 48 %); indexes rebuilt and the three small tables `VACUUM FULL`ed with the large heaps and the TOAST left as they were
-1,141 req/s PASS with zero BufferContent samples. The sequential scans of the queue and of objects (91k / 64k) are the
-read statements under stale statistics, 4 % of the active samples: victims, not drivers; heap bloat costs the remaining
-quarter. The control-worker periodic job `store-compaction` (`GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS`, default
+1,141 req/s PASS with zero BufferContent samples. Heap bloat is **not** a throughput variable (on the same release the aged r1 ran 1,601 req/s on 582 MB of metric latest; see §3.3 and detailed design v2 §4.4.2). The control-worker periodic job `store-compaction` (`GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS`, default
 300 s) acts on catalog facts -- heap pages per live row, index pages per live row, the least dense index's entries per
 page -- and rebuilds an index past the threshold with `REINDEX INDEX CONCURRENTLY` and a thinned small table with
 `VACUUM (FULL, ANALYZE)`, so no manual `store-maintenance` is needed between a formal round and the next; large heaps
@@ -197,37 +195,47 @@ configuration digest must equal the durable head's configuration digest, and eve
 drift is not attributed to this round); misalignment after teardown fails this round's cleanup
 and lists the differences and drifted replicas field by field.
 
-### 3.3 Store-State Prerequisite: Steady State, Optimistic Bound and Layout Record
+### 3.3 Store-State Prerequisite: Steady State Defined by Store Metrics, Optimistic Bound and Layout Record
 
 A formal round judges "the real CPU control plane's capacity under a burst of simultaneous reports from many GPU
-data-plane clusters", not a freshly tidied store. The three points on one release with identical admission defaults --
-fresh store 1,572 req/s PASS, after one round's teardown 538 req/s FAIL, indexes rebuilt 1,141 req/s PASS -- show that
-the first round after a cold deploy or a `store-maintenance` is only the **optimistic bound** and cannot stand as the
-formal record. From schema v23 onwards (detailed design v2 §4.4.2: bodies and completed rows leave the queue, the queue
-indexes carry neither `status` nor lease columns, `gpu_fault_gpu_metric_latest` is partitioned by cluster and returns
-its pages wholesale) the formal record requires **steady state**:
+data-plane clusters", not a freshly tidied store. Four points on one release with identical admission defaults
+(detailed design v2 §4.4.2): fresh store 1,572 req/s PASS; after one round's teardown 538 req/s FAIL (52.6 % of the
+active statements on `LWLock:BufferContent`, 148 concurrent admission INSERTs); indexes rebuilt 1,141 req/s PASS (no
+BufferContent; commit I/O, advisory-lock waits and the small tables `VACUUM FULL` had just shrunk re-extending in the
+storm); after another full 16-step suite, with heaps larger than at the failure (metric latest 582 MB, queue 194 MB),
+the "aged" r1 1,601 req/s PASS. Conclusion: **heap/TOAST size, time since the cold deploy and "after the previous
+round" do not decide whether a round counts as a formal record** -- the state of the index entries does, and the catalog
+proxy for it is the `store_bloat.before` batch 58 writes into every `summary.json` (per hot table
+`index_pages_per_live_row`, `index_min_entries_per_page`, `heap_pages_per_live_row`) together with schema v23's
+`store_layout`. A round's label is therefore decided by **the store metrics at its start**, not by the clock or the
+deployment history:
 
-- the store has already carried at least one round's working set of the same scale (same cluster count, node count and
-  traffic model) and was **not** compacted by `store-maintenance` before this round; the `store-compaction` job runs as
-  usual -- it only handles lanes / queue counts / priority shards and residual indexes;
-- `summary.json` must record `store_bloat.before` at start (`recorded=true`) and gains `store_layout`: the mode of
-  `gpu_fault_hot_layout_mode` (`inline`/`detached`), the partition counts of `gpu_fault_processor_replays` and
-  `gpu_fault_gpu_metric_latest_clusters`, and the live rows and pages of the queue and payloads tables. A round in
-  `inline` mode may only be labelled a comparison inside the upgrade window, never a formal result of the v23 layout;
-- one release must produce at least two rounds: one right after the cold deploy (labelled `optimistic_bound`) and one in
-  steady state (labelled `steady_state`); the verdict is the steady-state round's, and nothing may be compacted by hand
-  between the two;
-- after every round the runner records how it tore down and which pages came back: `store_layout.after` gives the
-  page counts of the queue, the payloads table, the replay partitions and the metric latest partitions after teardown; a
-  formal result requires the queue's heap pages back at the order of the in-flight set (no "6.7k pages left by the
-  previous round") and the synthetic clusters' metric latest partitions `DROP`ped.
+- **`optimistic_bound`**: `store_bloat.before.gpu_fault_processor_queue.index_pages_per_live_row < 1` and its
+  `index_min_entries_per_page` null or >= 64 -- compact queue indexes (a cold deploy, a recent `REINDEX` /
+  `store-maintenance` / compaction, or indexes that never carried a round's working set). Such a round gives the upper
+  bound only and is never the formal record, however long the site has been up.
+- **`steady_state`**: `store_bloat.before.gpu_fault_processor_queue.index_pages_per_live_row >= 8` (the queue indexes
+  still at the high-water mark of at least one round's working set: about 19 in the 10:30 failing state, about 25 in
+  the aged passing state), `store_layout.mode == detached`, and **no** manual `store-maintenance` before the round (the
+  `store-compaction` job runs as usual). The runner derives the label from these two fields and writes it into
+  `summary.json`; nobody fills it in by hand. A round in `inline` mode may only be labelled a comparison inside the
+  upgrade window, never a formal result of the v23 layout.
+- At least one round per label; the verdict is the `steady_state` round's; nothing may be compacted by hand between
+  the two; a round without `store_bloat.before` (`recorded=false`) cannot be the record for either label.
+- Every round's `store_layout.after` gives the page counts of the queue, the payloads table, the replay partitions and
+  the metric latest partitions after teardown; a formal result requires the queue's heap pages back at the order of the
+  in-flight set and the synthetic clusters' metric latest partitions `DROP`ped.
+- The proxy does not see leaf fill or dead-entry density (the live store has no `pgstattuple`; installing it is a
+  write), so what **judges** a round is only the `steady_state` round's own throughput, p99 and reserved-503 share
+  (§6); `index_pages_per_live_row` only separates "an optimistic bound on compact indexes" from "steady state on indexes
+  that have carried a working set".
 
-Verdict rule: the steady-state round's throughput, p99 and reserved-503 share are judged by §6; a steady-state round
-more than 10 % below the cold-deploy round in throughput, or crossing the reserved-503 threshold, is a FAIL filed as a
-write-path defect and may not be replaced by a rerun after manual compaction. The local PostgreSQL reproduction (the
-bloat harness under `scripts/perf`: the same burst against a fresh store, a store after one round plus teardown, and a
-store after compaction, comparing each hot statement's shared buffers and `LWLock:BufferContent` share) is the
-developer gate before a commit; it does not replace the live steady-state round.
+Verdict rule: the `steady_state` round is judged by §6; a `steady_state` round more than 10 % below the
+`optimistic_bound` round in throughput, or crossing the reserved-503 threshold, is a FAIL filed as a write-path defect
+and may not be replaced by a rerun after manual compaction. The local PostgreSQL reproduction (the bloat harness under
+`scripts/perf`: the same burst against a fresh store, a store after one round plus teardown, and a store after
+compaction, comparing each hot statement's shared buffers, `LWLock:BufferContent` share and the queue updates' HOT
+share) is the developer gate before a commit; it does not replace the live steady-state round.
 
 ## 4. Traffic Model
 
@@ -971,7 +979,12 @@ fresh or just-compacted store reads far below 1 on both ratios; a store left unc
 previous round's teardown reads in the tens (§3.2). From schema v23 `summary.json` must also carry
 `store_layout` (§3.3): the `mode` (`inline`/`detached`) and, in the `before`/`after` snapshots, the partition
 counts, pages and live rows of `gpu_fault_gpu_metric_latest_clusters` and `gpu_fault_processor_replays`;
-`recorded=false` means a control plane older than v23. The
+`recorded=false` means a control plane older than v23. A formal record must also state the round's label
+(`optimistic_bound`/`steady_state`, §3.3) with the two values it is derived from --
+`store_bloat.before.gpu_fault_processor_queue.index_pages_per_live_row` and `store_layout.mode` -- and the
+`pg_stat_activity` sampler summary of the first two storm minutes (active statement samples, `LWLock:BufferContent`
+share, peak concurrent admission INSERTs, autovacuum share; the four data points of §3.3 were told apart by exactly
+these readings): a PASS without them cannot say which store it ran on. The
 integrated runner must also record `control_plane_pod_lifecycle`, containing at least the total
 restart delta, the Pods that restarted, Pods that appeared/disappeared during the run, counter
 regressions and Pods not Ready at the end. If any item is non-empty or non-zero it cannot count

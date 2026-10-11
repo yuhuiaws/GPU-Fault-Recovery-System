@@ -3936,7 +3936,10 @@ failed action in `gpu_fault_periodic_job_errors_total{periodic_job="store_compac
 **When `store-maintenance` is still needed.** The large tables' heaps and TOAST (`gpu_fault_gpu_metric_latest`,
 `gpu_fault_objects`, the TOAST of `gpu_fault_processor_queue`) are measured by the job but never rewritten -- returning
 their pages takes `VACUUM FULL`'s exclusive lock, an operator decision for a maintenance window rather than a
-background job -- and they cost roughly a quarter of ingress throughput (1,572 against 1,141 req/s). Run the verb
+background job -- and they are a storage cost, not a throughput variable: on the same release the aged r1 ran 1,601 req/s on 582 MB of metric
+latest and 194 MB of queue (72 MB of it TOAST) (the fourth data point of detailed design v2 §4.4.2 refutes the earlier "about a quarter" claim;
+the 1,141 run's gap came from commit I/O, advisory-lock waits and the small tables `VACUUM FULL` had just shrunk to 3-5 pages re-extending
+during the storm). Run the verb
 through the plan/execute flow above when `gpu_fault_store_hot_table_heap_pages_per_live_row` stays above ten on a large
 table, when the job is switched off with `GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS=0`, or when
 `gpu_fault_store_compaction_actions_total{status="FAILED"}` keeps growing (for example `REINDEX ... CONCURRENTLY`

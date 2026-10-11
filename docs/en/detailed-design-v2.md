@@ -2397,6 +2397,50 @@ clusters no longer depends on a freshly tidied store. The design rests on read-o
 | Zero-scan indexes on objects | all of them workflow / remote_command kinds (both live in the v15/v16 state tables on this site and those indexes are already retired per mode); nothing can be dropped site-independently |
 | The two most bloated objects indexes | `gpu_fault_telemetry_metric_scope` 15.3 MB for 270 rows; `gpu_fault_collector_status_scope` 6.9 MB for 31 rows |
 
+**A fourth data point on the same release, and what it refutes.** Same runtime release, v22 layout, after the 10:51
+index rebuild and another full 16-step formal suite (its rounds still deleting their working sets row by row), the
+store was **more** bloated than at the 10:30 failure (`gpu_fault_gpu_metric_latest` 582 MB for 1,292 live rows,
+`gpu_fault_processor_queue` 194 MB for 146 rows, `gpu_fault_objects` 133 MB for 864 rows, lanes 19 MB for 58 rows) --
+and the "aged r1" **passed at 1,601 req/s**, the best r1 of the day (fault p50 3.4 s / p99 8.7 s, wall 17 s, 128/128, 0
+rejections), with `LWLock:BufferContent` 0.2 % of the active samples, peak 18 concurrent admission INSERTs and
+autovacuum in 4 % of the samples. The sampler readings of the first two minutes of the three storms side by side:
+
+| First two storm minutes (0.5 s samples) | 10:34 FAIL 538 | 10:57 PASS 1,141 (6 min after the 10:51 rebuild) | 14:21 PASS 1,601 (aged) |
+|---|---|---|---|
+| Active statement samples / peak concurrency | 10,989 / 288 | 1,762 / 91 | 1,862 / 71 |
+| `LWLock:BufferContent` share | **52.6 %** (69 % in the first minute) | 0 | 0.3 % |
+| Admission INSERT samples (of which on BufferContent) | 4,587 (**84 %**) | 81 (0) | 61 (5 %) |
+| Peak concurrent admission INSERTs | **148** | 9 | 9 |
+| `IO:XactSync` / `Lock:advisory` / `Lock:extend` | 20 % / 1.6 % / 2.1 % | **47 %** / 11 % (27 % in the next two minutes) / 0 | 37 % / 9 % / 0 |
+| Peak queue dead tuples in the storm / autovacuum samples (on the queue) | 5,043 / 117 (49) | 3,388 / 46 (TOAST 19) | **7,262** / 37 (9) |
+| Queue indexes / metric latest heap+indexes before the run | ~36 MB / 242+113 MB | ~0.1 MB (just rebuilt) / 243+0.3 MB | ~41 MB / **403+179 MB** |
+| Small-table extension during the storm | lanes 5 -> 1,021 pages, queue 34 -> 3,582 | lanes 3 -> 1,409, counts 5 -> 226, queue 40 -> 6,697 | lanes none (1,969 pages kept), queue 40 -> 7,004 |
+
+Refuted: **"residual heap/TOAST bloat costs about a quarter of the throughput (1,572 against 1,141)"**. 14:21 ran the
+fastest r1 of the day on 582 MB of metric latest heap+indexes, 194 MB of queue (72 MB of it TOAST) and 133 MB of
+objects; heap size is not the variable. The 1,141 vs 1,572/1,601 spread has another source: in the 10:57 storm 47 % of
+the active samples sat in `IO:XactSync` (commit I/O) and 11 % -> 27 % in `Lock:advisory` over the following three
+minutes, and six minutes earlier `store-maintenance` had `VACUUM FULL`ed lanes / queue counts / priority shards down
+to 3-5 pages, so the storm had to re-extend them (lanes 3 -> 1,409 pages, counts 5 -> 226); the 14:21 run kept its
+1,969 lane pages and extended nothing. That is an I/O-and-lock profile, not the 10:34 BufferContent convoy and not
+heap size.
+
+Also ruled out: dead-tuple counts (the 14:21 storm peaked at 7,262 dead queue tuples, above the failing run's 5,043),
+autovacuum overlapping the storm (all three had it; 10:57 and 14:21 had the same amount) and index **file** size (the
+41 MB of queue indexes before 14:21 are not smaller than the 36 MB before 10:34). The **one** variable the three storms
+do not share is the internal state of the queue's index entries and pages: the 10:34 indexes had grown since the 03:59
+cold deploy through 6.5 hours of mixed writes (one round, the replay after a 4-hour HyperPod outage, two spool on/off
+rolls) and had never been rebuilt; the 10:57 and 14:21 indexes were the 10:51 rebuild regrown only by identical formal
+rounds, each round's VACUUM recycling the previous round's pages for the next. pg_stat exposes neither leaf fill nor
+LP_DEAD density nor deleted-but-unrecycled pages -- the live store has no `pgstattuple`, and installing it is a write --
+so the leaf-level micro-mechanism remains **unproven**; what the facts pin down is the lever: the v22 layout leaves 3
+heap versions and about 18 index entries per request, with `status`, the lease columns and `updated_at` in the indexes
+so every claim and completion manufactures dead entries and splits at the rightmost leaf, and 150 concurrent admission
+statements queue on exactly those pages. **What v23 prevents is index-entry churn under concurrency (dead entries,
+sparse pages, splits at the right edge), not heap size**: one heap version and 5-6 index entries per request, HOT
+claims / completions / coalescing rewrites, completed rows and bodies out of the queue indexes. The acceptance method
+changes accordingly: steady state is defined by store metrics (performance acceptance plan §3.3).
+
 **Why no queue update is HOT.** PostgreSQL makes an update HOT only when no updated column appears in any index's
 keys, expressions **or partial-index predicate**. All eight partial queue indexes carry `status IN ('PENDING','LEASED')`
 in their predicate, `gpu_fault_processor_queue_lane` keys `lease_expires_at`, `gpu_fault_processor_queue_completed`
@@ -2421,7 +2465,7 @@ across the compact / bloated / rebuilt states (10-row INSERT 346/266/275 blocks,
 makes 190 concurrent writers queue on sparse leaf pages full of dead entries -- so the remedy is fewer index entries and
 heap versions per request, not more frequent tidying.
 
-**The five changes of v23 and their expected gain.**
+**The five changes of v23 and their expected gain** (aimed at the lever pinned down above -- index-entry churn under concurrency -- not at heap size).
 
 1. **Request and response bodies leave the queue row** (new table `gpu_fault_processor_payloads(request_id PK, body
    BYTEA)` with `toast_tuple_target=8160` so a compressed body stays inline; `ddl_processor_layout.py` under
