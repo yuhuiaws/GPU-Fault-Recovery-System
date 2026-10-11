@@ -18,7 +18,7 @@ from tests.regional.test_retained_store_schema_postgres import (
     database as database_fixture,
 )
 from tests.regional.test_retained_store_schema_postgres import (
-    install_v21,
+    install_v22,
     migration_history,
     retained_rows,
     seed_records,
@@ -40,7 +40,7 @@ def test_real_schema_cli_uses_projected_dsn_and_preserves_v17_history(
 ):
     connection = database.connection
     seed_records(connection)
-    install_v21(connection)
+    install_v22(connection)
     before, history = retained_rows(connection), migration_history(connection)
     dsn = tmp_path / "projected-dsn"
     dsn.write_text(connection.info.dsn)
@@ -75,7 +75,7 @@ def test_same_state_keep_handoff_runs_native_ensure_before_any_business_cpu(
 ):
     connection = database.connection
     seed_records(connection)
-    install_v21(connection)
+    install_v22(connection)
     before = retained_rows(connection)
     _harness, _archive, instance = retained_release(tmp_path, monkeypatch)
     instance.runner.proof_schema_version = LATEST_POSTGRES_SCHEMA_VERSION - 1
