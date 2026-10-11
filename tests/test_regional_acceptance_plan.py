@@ -72,8 +72,8 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
         "GF-REGIONAL-PREEMPT-023",
         "GF-REGIONAL-PREEMPT-034",
     )
-    assert len(plan.execution_order) == 189
-    assert len(plan.cases) == 198
+    assert len(plan.execution_order) == 192
+    assert len(plan.cases) == 201
     assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-016", "GF-REGIONAL-BOOT-011")
     assert plan.execution_order[-1] == "GF-REGIONAL-BOOT-032"
     assert plan.do_not_run_case_ids == retired
@@ -266,11 +266,15 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
         if case.executor in {ExecutorKind.PYTEST, ExecutorKind.COMMAND}
         and not case.blocked
     ]
-    # HA-011 and NOTIFY-008 add local regression proxies; BOOT-032 stays destructive.
-    assert len(automated) == 110, "local proxy eligibility changed unexpectedly"
+    # HA-011 and NOTIFY-008 add local regression proxies; BOOT-032 stays
+    # destructive; the ownership-label cases BOOT-033/034 (live-non-destructive
+    # with a related pytest) are proxied, BOOT-035 (a live join) is not.
+    assert len(automated) == 112, "local proxy eligibility changed unexpectedly"
     for case_id in (
         "GF-REGIONAL-BOOT-030",
         "GF-REGIONAL-BOOT-031",
+        "GF-REGIONAL-BOOT-033",
+        "GF-REGIONAL-BOOT-034",
         "GF-REGIONAL-COLLECT-022",
         "GF-REGIONAL-HA-011",
         "GF-REGIONAL-NOTIFY-008",
@@ -280,6 +284,7 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
         "GF-REGIONAL-ISO-007",
         "GF-REGIONAL-HA-005",
         "GF-REGIONAL-BOOT-032",
+        "GF-REGIONAL-BOOT-035",
         *(f"GF-REGIONAL-BOOT-{number:03d}" for number in range(24, 30)),
     ):
         assert plan.case(case_id).executor is ExecutorKind.HUMAN, case_id

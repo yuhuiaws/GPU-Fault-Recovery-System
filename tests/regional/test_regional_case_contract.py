@@ -120,6 +120,12 @@ def test_explicit_predecessors_are_the_documented_anchor_cases() -> None:
         # The whole-lifecycle sequence starts from the empty clusters the
         # uninstalled BOOT-028 site leaves behind.
         "GF-REGIONAL-BOOT-029": "GF-REGIONAL-BOOT-028",
+        # The ownership-label cases sit inside the lifecycle chain: 034 proves
+        # the refusals on the cluster BOOT-024 removed, 033 reads BOOT-025's
+        # label-based re-join, 035 joins the mixed HyperPod cluster after it.
+        "GF-REGIONAL-BOOT-034": "GF-REGIONAL-BOOT-024",
+        "GF-REGIONAL-BOOT-033": "GF-REGIONAL-BOOT-025",
+        "GF-REGIONAL-BOOT-035": "GF-REGIONAL-BOOT-033",
         "GF-REGIONAL-HA-010": "GF-REGIONAL-HA-001",
         "GF-REGIONAL-HA-011": "GF-REGIONAL-HA-010",
         "GF-REGIONAL-NOTIFY-008": "GF-REGIONAL-NOTIFY-007",

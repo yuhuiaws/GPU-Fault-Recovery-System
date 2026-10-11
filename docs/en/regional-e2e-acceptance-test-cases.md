@@ -3661,7 +3661,7 @@ When the corresponding lifecycle was not performed the companion stays `NOT_RUN`
    instance-group label evidence, the DISCOVERED excerpt, the `node-scope` report and the `status --full` `node_scope`;
    ARNs as digests.
 
-#### Verdict
+##### Verdict
 
 - The site id is identical twice and equals the site name; selector and source agree in all five places (journal,
   `site.yaml`, Secret, `node-scope`, `status --full`); any disagreement, a source other than `label-convention`, or a
@@ -3702,7 +3702,7 @@ When the corresponding lifecycle was not performed the companion stays `NOT_RUN`
 6. `BOOT-025` may re-join only after the label baseline is restored; the attempt logs and the three refusals go to
    `cases/GF-REGIONAL-BOOT-034/GF-REGIONAL-BOOT-034.json`.
 
-#### Verdict
+##### Verdict
 
 - Each of the three refusals appears once and names the facts; an attempt that created a resource or advanced the join
   journal is FAIL; the label baseline must be restored.
@@ -3740,7 +3740,7 @@ When the corresponding lifecycle was not performed the companion stays `NOT_RUN`
 5. Regression evidence: repeat the consistency checks of `BOOT-033` steps 3–5 for this cluster; evidence goes to
    `cases/GF-REGIONAL-BOOT-035/GF-REGIONAL-BOOT-035.json`.
 
-#### Verdict
+##### Verdict
 
 - The non-GPU nodes appear in none of the selector, the waves, Agent coverage, collector readiness, DCGM scheduling or the
   failure-domain map; the join reaches VERIFIED and activates; counting a non-GPU node anywhere or a reported drift is FAIL.
