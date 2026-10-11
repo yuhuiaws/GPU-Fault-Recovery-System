@@ -2376,6 +2376,132 @@ provide a consistent read point for the Store, archiving, cross-backend export a
 `gpu_fault_objects` label; deletion locates the real table via database routing and does not execute DELETE against the read-only views.
 SQL cleanup first materialises the qualified target set, then calls the routing functions that have side effects.
 
+### 4.4.2 Hot-Table Physical Layout v23: Slim Queue Rows, Replay Partitions and metric latest Partitioned by Cluster
+
+**The shape of the problem.** The formal perf suite produced three points on one release with identical admission
+defaults: a fresh store 1,572 req/s PASS; after one 32-cluster round and its teardown 538 req/s FAIL (normal-telemetry
+reserved-503 share 29.4 %, 49 % of the active statements waiting on `LWLock:BufferContent` -- the queue INSERT in 84 %
+of its samples, the completion CTE 78 %, the claim CTE 48 %); indexes rebuilt and the three small tables `VACUUM FULL`ed
+with heaps and TOAST left bloated 1,141 req/s PASS. The `store-compaction` job of §10.3 is after-the-fact compaction;
+this section changes the write path and the data model so that ingress capacity under a start-burst from many GPU
+clusters no longer depends on a freshly tidied store. The design rests on read-only catalog readings of the live store
+(about nine hours after a cold deploy, covering a full perf day) cross-referenced with the hot statements' source:
+
+| Fact (live, read-only) | Value |
+|---|---|
+| `gpu_fault_processor_queue`: inserts / updates / deletes / HOT updates | 123,895 / 248,350 / 165,789 / **0** |
+| Bytes of the queue's 9 indexes vs live rows | 40.8 MiB vs 30 rows; every index has scans (fewest: `_completed` 229, the GIN 10,650) |
+| Queue payload (JSONB) | live average 1,046 B (request body 359 B); perf rounds average 2.3 KiB compressed, 65 % toasted; 13 column values duplicated in the payload |
+| `gpu_fault_gpu_metric_latest`: live rows / heap pages / indexes | 1,216 / 51,545 pages (422 MB) / 188 MB; 1.79M inserts, 2.20M deletes, 237k updates (73 % HOT) |
+| `gpu_fault_objects`: live rows / heap pages / indexes / HOT | 812 / 10,658 pages / 51 MB / 2.3 % of 285k updates HOT; all 48 non-primary indexes reference `payload` |
+| Zero-scan indexes on objects | all of them workflow / remote_command kinds (both live in the v15/v16 state tables on this site and those indexes are already retired per mode); nothing can be dropped site-independently |
+| The two most bloated objects indexes | `gpu_fault_telemetry_metric_scope` 15.3 MB for 270 rows; `gpu_fault_collector_status_scope` 6.9 MB for 31 rows |
+
+**Why no queue update is HOT.** PostgreSQL makes an update HOT only when no updated column appears in any index's
+keys, expressions **or partial-index predicate**. All eight partial queue indexes carry `status IN ('PENDING','LEASED')`
+in their predicate, `gpu_fault_processor_queue_lane` keys `lease_expires_at`, `gpu_fault_processor_queue_completed`
+keys `updated_at`, `gpu_fault_processor_queue_available` leads with `status` -- a claim changes `status`, the lease
+columns and `updated_at`, a completion changes `status`, the response columns and `updated_at`, so every request leaves
+three tuple versions in the heap and about 18 index entries (8 at INSERT: the primary key, `_priority_claim`, `_cluster`,
+`_path_priority_claim`, `_lane`, `_incomplete_cluster`, `_available`, the GIN; 8 more after the claim; the primary key
+and `_completed` after completion), all deleted row by row by the retention sweep 600 s later. Two thirds of the index
+entries are born dead; that is where the B-trees' high-water mark after a teardown comes from, and why the next
+round's INSERTs queue on sparse leaf pages. TOAST comes from the request body and the response body written back on
+completion (65 % of a perf round's rows cross the 2 KiB threshold); its index grows monotonically by chunk_id, so every
+concurrent writer lands on the same rightmost leaf.
+
+**Two facts added by the local reproduction (vanilla PostgreSQL 16, real schema and statements).** One round of 27k
+queue rows (two thirds completed) and 260k metric latest rows was admitted through the real admission/claim/completion
+paths and then torn down like the perf suite does (everything deleted, about 1,200 rows kept, two VACUUMs): the queue
+shows `n_tup_upd` 496,752 and `n_tup_hot_upd` **0** (the coalescing whole-row rewrites included); after the teardown the
+queue's indexes hold 24.8 MiB and 0.7 MiB after `REINDEX`; metric latest's indexes go 92.9 MB -> 0.27 MB while its 22,338
+heap pages stay. Yet under a single-session `EXPLAIN (ANALYZE, BUFFERS)` the pages each hot statement touches barely move
+across the compact / bloated / rebuilt states (10-row INSERT 346/266/275 blocks, metrics-path claim 2,205/1,328/2,005,
+8-row completion 307/32/32, 32-key metric upsert 341/362/264): bloat does not make one statement read more pages, it
+makes 190 concurrent writers queue on sparse leaf pages full of dead entries -- so the remedy is fewer index entries and
+heap versions per request, not more frequent tidying.
+
+**The five changes of v23 and their expected gain.**
+
+1. **Request and response bodies leave the queue row** (new table `gpu_fault_processor_payloads(request_id PK, body
+   BYTEA)` with `toast_tuple_target=8160` so a compressed body stays inline; `ddl_processor_layout.py` under
+   `store/postgres` is the source of truth). The queue row keeps only what the hot statements read and write: identity,
+   status, `cluster_id`/`correlation_key`/`ordering_key`, priority, the four lease columns, response status and content
+   type, `not_before`/`retry_count`/`lane_policy`, the two timestamps, and a **slim `payload`** -- the `ProcessorRequest`
+   JSON without `body_base64` and `response_body_base64` (300-700 B, never toasted) that still carries `path` and
+   `correlation_scope_keys`, so the `(payload->>'path')` expression index, the scope-key GIN and the NOTIFY trigger read
+   exactly as before. The claim's final SELECT and `get_processor_request` fetch the body with a primary-key LEFT JOIN;
+   coalescing a routine sample rewrites the payloads row in the same transaction. **Gain**: the queue heap and TOAST no
+   longer carry bodies (one TOAST heap write and one TOAST index insert less per INSERT, no 2.3 KiB detoast in the
+   claim's and completion's RETURNING), a queue row goes from about 2 KiB to about 0.5 KiB.
+2. **Completed requests leave the queue** (new table `gpu_fault_processor_replays`, RANGE-partitioned on
+   `completed_at` in 300 s buckets; the processor-cleanup job creates the next 15 minutes of buckets ahead and `DROP`s
+   whole buckets once past retention (`GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS`); `gpu_fault_processor_replays_
+   default` catches gaps and is swept by row). The completion CTE DELETEs the queue row and writes the envelope JSON,
+   the request body and the response body into the replay partition; `get_processor_request` and the admission's
+   idempotent replay look in the queue first and then in the replays, so the same `request_id` still gets the same
+   response within retention. **Gain**: the queue heap holds only in-flight requests (a few thousand rows at a perf
+   peak) and has no "high-water mark of the previous round"; replay rows are never deleted row by row, never vacuumed,
+   and return their pages with the partition.
+3. **Make the claim a HOT update.** Once only in-flight rows live in the queue, `status` no longer needs to be a
+   partial-index predicate. v23 replaces the eight B-tree/GIN indexes with 5+1 whose keys contain neither `status`, the
+   lease columns nor `updated_at`: `gpu_fault_processor_queue_claim_order_v23 (priority, created_at, request_id)`,
+   `..._path_claim_order_v23 ((payload->>'path'), priority, created_at, request_id)`, `..._lane_v23 (ordering_key)`,
+   `..._cluster_v23 (cluster_id, created_at)`, the primary key, and `..._scoped_v23 GIN ((payload->'correlation_scope_
+   keys')) WHERE jsonb_array_length(...) > 0`, which covers only rows that carry scope keys (routine telemetry has none
+   and stops paying the GIN pending-list metapage lock on every row; the readers spell the same predicate). Retired:
+   `_priority_claim`, `_path_priority_claim`, `_lane`, `_cluster`, `_incomplete_cluster` (a prefix twin of `_cluster`),
+   `_available` (its only reader is the expired-lease reclaim, for which a sequential scan of an in-flight-only queue
+   suffices), `_completed` (completed rows are no longer in the queue), `_correlation_scopes`. **Gain**: index entries
+   per request 18 -> 5 (6 with scope keys), heap versions 3 -> 1 plus an in-page HOT chain; the claim window still walks
+   the same key order (the planner discipline's `enable_seqscan=off` is unchanged).
+4. **`gpu_fault_gpu_metric_latest` LIST-partitioned by `cluster_id`** (new table `gpu_fault_gpu_metric_latest_clusters`,
+   primary key `(cluster_id, key)`, the `(cluster_id, node_id, key)` index's equivalent `(node_id, key)` inside each
+   partition; `..._default` as the catch-all). A partition is created at cluster registration (`save_regional_cluster`)
+   and `DROP`ped by `delete_regional_cluster` and by the perf teardown, both under the `gpu_fault_schema_bootstrap`
+   advisory lock, idempotent, with a `lock_timeout`; the AccessExclusiveLock on the parent lasts milliseconds and happens
+   on administrative events, never on the data-plane hot path. **Trade-off**: HASH partitioning needs no runtime DDL but
+   a cluster's removal stays a row DELETE that returns no pages -- rejected; RANGE on `observed_at` moves latest-wins
+   rows across partitions on update (DELETE+INSERT, which destroys HOT) -- rejected; the in-flight queue stays
+   unpartitioned -- the claim takes its window in region-wide priority order and a per-cluster partitioning turns every
+   claim into a Merge Append over N partition indexes whose cost grows with the cluster count, so only the append-only,
+   time-expired replay table is RANGE-partitioned. **Gain**: a round's 260k rows, or every latest row of a real cluster
+   leaving the fleet, return their pages with the partition (previously 51,545 heap pages and 188 MB of indexes carried
+   1,216 rows); `list_gpu_metrics_latest` and the upsert prune to one partition by `cluster_id`.
+5. **`store-compaction` stays as the safety net** (§10.3): lanes / queue counts / priority shards are still rewritten
+   in place and keep their rules; a partitioned parent is measured by aggregating its partitions and reindexed per
+   partition with `REINDEX INDEX CONCURRENTLY`; replay partitions are measured, never rebuilt.
+
+**What about objects.** All 48 indexes of `gpu_fault_objects` reference `payload`, so no update of any kind can ever be
+HOT -- a structural fact of the JSONB document table, not a redundant index: the zero-scan indexes are already retired
+by the v15/v16 state-table modes and every index with scans has a reading statement. The 87k objects rows a perf round
+leaves behind are the three per-node hot-updated kinds `telemetry_metric_latest`, `collector_status` and
+`gpu_inventory_snapshot`; like workflow/remote_command in §4.4.1 and the GPU hot state they belong in dedicated tables
+(columnised index keys, `fillfactor=70`, partitioned by cluster). v23 leaves the objects index set alone and records
+that step here as the committed scope of v24, with the two index sizes above as its evidence.
+
+**Compatibility and cutover (expand/contract).** The release order is unchanged: index-build Job -> ensure (v23) ->
+preflight -> staged control-plane roll -> data-plane executors. The v23 ensure creates the empty new tables and indexes
+and drops the retired indexes (the same precedent as v11/v12/v19: running old Pods keep working -- the old claim is still
+an index scan in the same key order on the new non-partial indexes, the old reclaim and cleanup degrade to a sequential
+scan of one small table; an old Pod that **restarts** during the roll refuses to start on missing declared indexes,
+exactly as under v19, and the staged roll replaces it). The write layout is decided by a one-row fact source in the
+database, `gpu_fault_hot_layout_mode`: `inline` (the v22 layout) or `detached` (this section's). An upgraded database
+is seeded `inline` by ensure, a fresh one `detached`; the new code's **read path reads both layouts** (body from
+payloads first, then from payload; completed rows from the queue first, then from the replays; metric latest from the
+table the mode names) and its write paths read the mode once per transaction under a shared advisory lock on
+`gpu_fault_hot_layout_mode`. After the control-plane roll the operator runs `gpu-fault-store-migrate --set-hot-layout
+detached` once (exclusive advisory lock, copies the existing metric latest rows into the partitioned table, switches
+the mode, one-way); until then, while old and new Pods coexist, every write is in the v22 layout and every row an old
+Pod reads is complete. `--hot-layout-status` prints the mode and the partition inventory. The release itself is still
+one `deploy --accept-schema-change` (§2.10).
+
+**The performance acceptance method changes with it** (performance acceptance plan §3.3): a formal round no longer
+requires a freshly compacted store; every round's `summary.json` records the `store_bloat` and `store_layout` (mode,
+partition counts) it started on; the first round after a cold deploy is only the optimistic bound, and the formal
+record requires the steady-state condition -- a store that has already carried at least one round's working set of the
+same scale and was not compacted by hand.
+
 ### 4.5 Retention and Archiving
 
 | Data | Retention | Mechanism |
@@ -2542,7 +2668,7 @@ A refresh failure also creates a Kubernetes Warning Event, which is the earliest
 
 - The registry lives in `src/gpu_fault/schema_migrations.py`; each entry is a
   `SchemaMigration(version, name, ddl_checksum, apply, legacy_checksum)`, currently
-  **18 versions**; v7 is `processor-retry-schedule-and-lane-policy`, v12 is
+  **23 versions**; v7 is `processor-retry-schedule-and-lane-policy`, v12 is
   `store-review-hot-query-indexes` (6 hot-query/metrics indexes, drops `gpu_fault_remote_command_workflow`),
   v13 is `control-plane-review-indexes-and-autovacuum` (the indexes and autovacuum parameters from the
   control-plane review of 2026-09-08), v14 is `objects-wakeup-notify-trigger` (adds only the `gpu_fault_objects_notify_wakeup()`
@@ -2550,7 +2676,7 @@ A refresh failure also creates a Kubernetes Warning Event, which is the earliest
   two-phase dedicated tables described above (`remote-command-state-table-and-cutover-fences`,
   `workflow-state-table-and-independent-cutover`), v17/v18 correct the dedicated-table migrations' dual-projection conditional delete
   and legacy-copy reset (`control-state-dual-projection-conditional-delete`,
-  `control-state-legacy-copy-reset-without-truncate`).
+  `control-state-legacy-copy-reset-without-truncate`), v19 is `hot-table-storage-parameters-and-hot-update-indexes` (hot-table storage parameters, two retention-only timestamp indexes retired), v20 is `processor-counters-per-writer-backend-rows` (counter rows per writer backend), v21/v22 are the statement-level edge-triggered wakeups and the per-key planner-pinned probes (`edge-triggered-statement-level-wakeups`, `per-key-planner-pinned-wakeup-probes`), v23 is `processor-queue-detached-payloads-replays-and-cluster-partitions` (§4.4.2: the payloads/replays tables, metric latest partitioned by cluster, the queue index set without `status`/lease columns, the `gpu_fault_hot_layout_mode` fact source).
 - Large indexes are built online with `gpu-fault-store-migrate --build-indexes-concurrently` (`CREATE INDEX
   CONCURRENTLY`, which does not lock hot tables). The read-only check at replica startup now compares more than the version number: **missing, INVALID
   (left behind by an interrupted concurrent index build), or definition-drifted indexes all make the replica refuse to start**; preflight reports

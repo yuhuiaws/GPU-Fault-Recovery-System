@@ -197,6 +197,38 @@ configuration digest must equal the durable head's configuration digest, and eve
 drift is not attributed to this round); misalignment after teardown fails this round's cleanup
 and lists the differences and drifted replicas field by field.
 
+### 3.3 Store-State Prerequisite: Steady State, Optimistic Bound and Layout Record
+
+A formal round judges "the real CPU control plane's capacity under a burst of simultaneous reports from many GPU
+data-plane clusters", not a freshly tidied store. The three points on one release with identical admission defaults --
+fresh store 1,572 req/s PASS, after one round's teardown 538 req/s FAIL, indexes rebuilt 1,141 req/s PASS -- show that
+the first round after a cold deploy or a `store-maintenance` is only the **optimistic bound** and cannot stand as the
+formal record. From schema v23 onwards (detailed design v2 §4.4.2: bodies and completed rows leave the queue, the queue
+indexes carry neither `status` nor lease columns, `gpu_fault_gpu_metric_latest` is partitioned by cluster and returns
+its pages wholesale) the formal record requires **steady state**:
+
+- the store has already carried at least one round's working set of the same scale (same cluster count, node count and
+  traffic model) and was **not** compacted by `store-maintenance` before this round; the `store-compaction` job runs as
+  usual -- it only handles lanes / queue counts / priority shards and residual indexes;
+- `summary.json` must record `store_bloat.before` at start (`recorded=true`) and gains `store_layout`: the mode of
+  `gpu_fault_hot_layout_mode` (`inline`/`detached`), the partition counts of `gpu_fault_processor_replays` and
+  `gpu_fault_gpu_metric_latest_clusters`, and the live rows and pages of the queue and payloads tables. A round in
+  `inline` mode may only be labelled a comparison inside the upgrade window, never a formal result of the v23 layout;
+- one release must produce at least two rounds: one right after the cold deploy (labelled `optimistic_bound`) and one in
+  steady state (labelled `steady_state`); the verdict is the steady-state round's, and nothing may be compacted by hand
+  between the two;
+- after every round the runner records how it tore down and which pages came back: `store_layout.after` gives the
+  page counts of the queue, the payloads table, the replay partitions and the metric latest partitions after teardown; a
+  formal result requires the queue's heap pages back at the order of the in-flight set (no "6.7k pages left by the
+  previous round") and the synthetic clusters' metric latest partitions `DROP`ped.
+
+Verdict rule: the steady-state round's throughput, p99 and reserved-503 share are judged by §6; a steady-state round
+more than 10 % below the cold-deploy round in throughput, or crossing the reserved-503 threshold, is a FAIL filed as a
+write-path defect and may not be replaced by a rerun after manual compaction. The local PostgreSQL reproduction (the
+bloat harness under `scripts/perf`: the same burst against a fresh store, a store after one round plus teardown, and a
+store after compaction, comparing each hot statement's shared buffers and `LWLock:BufferContent` share) is the
+developer gate before a commit; it does not replace the live steady-state round.
+
 ## 4. Traffic Model
 
 ### 4.1 Three-Priority Mixed Traffic
