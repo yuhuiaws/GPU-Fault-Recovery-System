@@ -26,11 +26,20 @@ class Cursor:
             # The hot-path planner pin: a settings statement with no result
             # set, not one of the scripted queries.
             return
+        if "gpu_fault_hot_layout_mode" in query:
+            # Schema v23: a writer reads the hot-layout mode under a shared
+            # advisory lock before its own statement (positional lock-name
+            # parameter, one row). Not a scripted query either.
+            self.rows = [("inline",)]
+            return
         self.database.parameters.append(dict(parameters))
         self.rows = self.database.results.popleft()
         callback, self.database.callback = self.database.callback, None
         if callback is not None:
             callback()
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
 
     def fetchall(self):
         return self.rows

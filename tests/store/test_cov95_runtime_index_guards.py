@@ -55,6 +55,19 @@ class IndexCursor:
                 table == "gpu_fault_workflows" and self.connection.native_table
             )
             self.rows = [(table if exists else None,)]
+        elif sql == "SELECT relkind FROM pg_class WHERE oid = to_regclass(%s)":
+            # Schema v23: CONCURRENTLY is refused on a partitioned parent, so
+            # the builder asks for the relation kind first; both fixture
+            # tables are plain heaps.
+            table = parameters[0]
+            exists = table == "gpu_fault_objects" or (
+                table == "gpu_fault_workflows" and self.connection.native_table
+            )
+            self.rows = [("r",)] if exists else []
+        elif "information_schema.columns" in sql:
+            # Schema v23: an index whose key column the ensure Job has not
+            # added yet is deferred; the fixture tables carry every column.
+            self.rows = [("kind",), ("key",), ("request_id",)]
         elif "SELECT c.relname, i.indisvalid" in sql:
             self.rows = [
                 (name, valid)

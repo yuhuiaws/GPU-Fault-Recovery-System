@@ -29,6 +29,9 @@ class RecordingCursor:
         # the CREATE TRIGGER is recorded (item J made the DDL ask first).
         if self.statements and "pg_get_triggerdef" in self.statements[-1]:
             return None
+        if self.statements and "gpu_fault_hot_layout_mode" in self.statements[-1]:
+            # Schema v23: the queue writer reads the hot-layout mode first.
+            return ("inline",)
         if self.statements and self.statements[-1].startswith(
             "SELECT to_regclass('gpu_fault_control_state_modes'),"
         ):
@@ -125,11 +128,18 @@ def test_processor_queue_writes_carry_no_partition_state() -> None:
     )
     Queue(cursor)._put_processor_queue(request)
 
-    (statement,) = cursor.statements
+    # Schema v23: the writer reads the hot-layout mode first; the INSERT is the
+    # one statement that names the queue table.
+    writes = [
+        (statement, parameters)
+        for statement, parameters in zip(cursor.statements, cursor.parameters)
+        if "INSERT INTO gpu_fault_processor_queue" in statement
+    ]
+    ((statement, parameters),) = writes
     assert "partition" not in statement, statement
     payloads = [
         parameter
-        for parameter in cursor.parameters[0]
+        for parameter in parameters
         if isinstance(parameter, str) and parameter.startswith("{")
     ]
     assert payloads, "the queue row carried no JSON payload"

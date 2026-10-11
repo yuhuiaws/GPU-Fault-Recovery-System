@@ -15,6 +15,17 @@ from types import SimpleNamespace
 
 from gpu_fault.store.postgres import index_builder as MODULE
 
+#: Every identifier the declared index statements name: the fixture answers
+#: the schema-v23 column probe (``information_schema.columns``) with all of
+#: them, so an existing table is never mistaken for one awaiting its schema.
+_ALL_COLUMNS = sorted(
+    {
+        word.lower()
+        for statement in MODULE.declared_index_statements().values()
+        for word in re.findall(r"\b([a-z_][a-z0-9_]*)\b", statement.lower())
+    }
+)
+
 
 class _Cursor:
     def __init__(self, tables: set[str]) -> None:
@@ -37,6 +48,12 @@ class _Cursor:
         elif statement.startswith("SELECT to_regclass"):
             table = parameters[0]
             self._result = [(table if table in self.tables else None,)]
+        elif statement.startswith("SELECT relkind FROM pg_class"):
+            # Schema v23: a plain heap, never a partitioned parent, so the
+            # builder keeps CONCURRENTLY for every fixture table.
+            self._result = [("r",)] if parameters[0] in self.tables else []
+        elif "information_schema.columns" in statement:
+            self._result = [(column,) for column in _ALL_COLUMNS]
         elif "pg_index" in statement:
             self._result = []  # no declared index exists
         else:

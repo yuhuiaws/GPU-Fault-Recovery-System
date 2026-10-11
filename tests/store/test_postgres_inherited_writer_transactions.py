@@ -54,6 +54,12 @@ TRANSACTION_CONTEXTS = frozenset({"_state_transaction", "transaction"})
 
 # The inherited writers as reviewed for item D2. A new inherited writer has to
 # be added here on purpose, after checking its statement count on Postgres.
+# ``save_regional_cluster`` / ``delete_regional_cluster`` left the set with
+# schema v23: ``PostgresFleetMixin`` overrides them -- the shared single-
+# statement write, then the cluster's metric partition DDL on its own
+# autocommit connection under the schema maintenance lock (deferred, never
+# raised, when the lock is held) -- so they are Postgres methods, reviewed
+# there, not inherited ones.
 REVIEWED_INHERITED_WRITERS = frozenset(
     {
         "acquire_periodic_task_lease",
@@ -67,7 +73,6 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "complete_remote_command",
         "complete_xid_correlation",
         "create_incident_workflow_if_absent",
-        "delete_regional_cluster",
         "enqueue_notification_delivery",
         "ensure_remote_command",
         "establish_notification_watermark",
@@ -94,7 +99,6 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "save_incident_and_workflow",
         "save_notification_result",
         "save_profile",
-        "save_regional_cluster",
         "save_regional_registry_member",
         "save_workload_coverage_heartbeat",
         "save_xid_policy_decision",

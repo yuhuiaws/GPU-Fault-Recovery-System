@@ -662,9 +662,15 @@ def test_coverage_drift_from_a_not_ready_node_carries_no_retire_hint(
     """A NotReady node is still a node: its Agent is not departed and the
     refusal must not suggest retiring it."""
 
-    release.documents[("gpu-a", "nodes", "")]["items"].append(
+    nodes = release.documents[("gpu-a", "nodes", "")]["items"]
+    # Every node read is re-checked against the cluster's selector, so the
+    # NotReady node carries the same labels the API server filtered on.
+    nodes.append(
         {
-            "metadata": {"name": "node-b"},
+            "metadata": {
+                "name": "node-b",
+                "labels": dict(nodes[0]["metadata"]["labels"]),
+            },
             "status": {"conditions": [{"type": "Ready", "status": "False"}]},
         }
     )
