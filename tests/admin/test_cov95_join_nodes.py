@@ -26,6 +26,8 @@ class Inventory:
         self.agents = "{}"
         self.pod = "cpu-fixture"
         self.secret = ""
+        # The control plane's node-key Secret (read without ``--context``).
+        self.cpu_secret = ""
         self.target = {
             "items": [
                 {
@@ -48,11 +50,9 @@ class Inventory:
                 else json.dumps(self.target)
             )
         if "get" in arguments and "secret" in arguments:
-            return (
-                self.keys
-                if any(item.startswith("go-template=") for item in arguments)
-                else self.secret
-            )
+            if any(item.startswith("go-template=") for item in arguments):
+                return self.keys
+            return self.secret if "--context" in arguments else self.cpu_secret
         if "get" in arguments and "pod" in arguments:
             return self.pod
         if "exec" in arguments:
@@ -295,3 +295,142 @@ def test_bound_key_runner_forwards_only_the_verified_mapping(context):
     assert environment[nodes.EXPECTED_NODES_ENV] == "untrusted"
     assert options["capture"] is False and options["sensitive"] and options["mutate"]
     assert options["timeout_seconds"] == 9
+
+
+# --- a re-attach adopts the node keys its committed join provisioned -----------
+
+
+RECLAIM = {"cluster_id": "gpu-b", "token_sha256": "e" * 64}
+
+
+def _reclaiming(context):
+    context[4]["reclaimed_cluster_token"] = dict(RECLAIM)
+    return context
+
+
+def _held(owner="gpu-b"):
+    return nodes.NodeClaims(
+        cpu_key_names=frozenset({"node-b"}),
+        agent_owners={"node-b": owner} if owner else {},
+    )
+
+
+def test_reclaim_adopts_a_held_node_key_on_owner_and_digest_proof(context):
+    _reclaiming(context)
+    runner, path, state = context[2:]
+    runner.secret = key_document(b"b" * 64)
+    runner.cpu_secret = key_document(b"b" * 64)
+
+    verify(context, claims=_held())
+
+    proof = state["evidence"]["NODE_NAMES_VERIFIED"]
+    digest = hashlib.sha256(b"b" * 64).hexdigest()
+    assert proof["expected_key_sha256"] == {"node-b": digest}, (
+        "the adopted key is reused, not re-derived"
+    )
+    adopted = proof["adopted_node_keys"]["node-b"]
+    assert adopted["agent_owner"] == "gpu-b"
+    assert adopted["key_sha256"] == digest
+    assert adopted["cpu_secret_uid"] == "keys-uid"
+    assert adopted["gpu_secret_uid"] == "keys-uid"
+    assert "T" in adopted["adopted_at"]
+    assert json.loads(path.read_text())["evidence"]["NODE_NAMES_VERIFIED"] == proof
+    secret_reads = [
+        arguments for arguments, _options in runner.calls if "secret" in arguments
+    ]
+    assert len(secret_reads) == 3, "CPU proof, GPU proof, then the GPU key read"
+    assert all(
+        options.get("sensitive")
+        for arguments, options in runner.calls
+        if "secret" in arguments
+    ), "node-key proofs exposed private capture"
+
+
+def test_without_a_reclaim_record_a_held_name_is_still_foreign(context):
+    runner = context[2]
+    runner.secret = key_document(b"b" * 64)
+    runner.cpu_secret = key_document(b"b" * 64)
+
+    with pytest.raises(BootstrapError, match="conflict") as failure:
+        verify(context, claims=_held())
+
+    assert "re-attach refused" not in str(failure.value)
+    assert runner.calls == [], "an ordinary join reads no key before refusing"
+    assert not context[3].exists(), "a refusal recorded ownership evidence"
+
+
+@pytest.mark.parametrize(
+    ("owner", "cpu", "gpu", "expected"),
+    [
+        (None, b"b" * 64, b"b" * 64, "no fleet Agent owns the node"),
+        ("gpu-b", None, b"b" * 64, "CPU node-key Secret is unreadable"),
+        (
+            "gpu-b",
+            b"b" * 64,
+            None,
+            "has no gpu-fault-system/gpu-fault-node-action-keys",
+        ),
+        ("gpu-b", b"b" * 64, b"c" * 64, "key digests differ"),
+        ("gpu-b", b"b" * 64, "other-node", "holds no node-secret for it"),
+    ],
+)
+def test_reclaim_refuses_each_missing_node_key_proof(
+    context, owner, cpu, gpu, expected
+):
+    _reclaiming(context)
+    runner, path, state = context[2:]
+    runner.cpu_secret = key_document(cpu) if cpu else ""
+    if gpu == "other-node":
+        runner.secret = key_document(b"b" * 64).replace('"node-b"', '"node-z"')
+    else:
+        runner.secret = key_document(gpu) if gpu else ""
+
+    with pytest.raises(BootstrapError, match="conflict.*re-attach refused") as failure:
+        verify(context, claims=_held(owner))
+
+    message = str(failure.value)
+    assert expected in message, message
+    assert "node-b" in message or "Secret" in message
+    assert not path.exists(), "a refused adoption records no ownership evidence"
+    assert "NODE_NAMES_VERIFIED" not in state["evidence"]
+
+
+def test_reclaim_without_held_names_records_no_adoption(context):
+    _reclaiming(context)
+    context[2].secret = key_document(b"b" * 64)
+
+    verify(context)
+
+    proof = context[4]["evidence"]["NODE_NAMES_VERIFIED"]
+    assert proof["adopted_node_keys"] == {}
+    assert proof["expected_key_sha256"] == {
+        "node-b": hashlib.sha256(b"b" * 64).hexdigest()
+    }
+
+
+def test_a_foreign_cluster_claim_still_refuses_a_reclaim_before_any_read(context):
+    _reclaiming(context)
+    claims = nodes.NodeClaims(
+        nodes_by_cluster={"foreign": frozenset({"node-b"})},
+        cpu_key_names=frozenset({"node-b"}),
+        agent_owners={"node-b": "gpu-b"},
+    )
+    with pytest.raises(BootstrapError, match="conflict"):
+        verify(context, claims=claims)
+    assert context[2].calls == []
+
+
+def test_a_node_whose_agent_belongs_elsewhere_is_foreign_before_adoption(context):
+    """The Agent-ownership rule runs first and reads nothing; a re-attach never
+    reaches the key proof for a node another cluster's Agent serves."""
+
+    _reclaiming(context)
+    runner = context[2]
+    runner.secret = key_document(b"b" * 64)
+    runner.cpu_secret = key_document(b"b" * 64)
+
+    with pytest.raises(BootstrapError, match="conflict") as failure:
+        verify(context, claims=_held("gpu-z"))
+
+    assert "re-attach refused" not in str(failure.value)
+    assert runner.calls == []

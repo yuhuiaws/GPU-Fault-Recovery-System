@@ -1692,12 +1692,30 @@ collectors replay their outbox and `status` reports them ready again. Without th
 no orphaned token file is refused too; a rerun after a successful reclaim may carry the flag again (the journal already
 owns the token).
 
+Every step after the token proof then runs over the data plane the committed join installed. Each one adopts what it
+finds only with proof, journals the adoption, and refuses with the missing proof named; the rollback of a re-attach
+attempt undoes only what that attempt created and finishes as `ROLLED_BACK`:
+
+| Step | Adopted when | Proof recorded in the journal | Refused when |
+|---|---|---|---|
+| Namespace `gpu-fault-system` | it already exists on the cluster | `LOCAL_INPUTS_READY.namespace_uid` = the UID the committed join recorded (`namespace_creation_started: false`) | the live UID differs (`refuses an existing or replaced namespace`); the rollback never deletes an adopted namespace |
+| Node Action keys (CPU Secret entries and the cluster's node-secrets) | the node's fleet Agent is ACTIVE under this cluster id and the key digest in the CPU `gpu-fault-node-action-keys` Secret equals the cluster's node-secret digest | `NODE_NAMES_VERIFIED.adopted_node_keys[<node>]` (owner, `key_sha256`, both Secret UIDs); provisioning reuses the keys, it mints none | no Agent owns the node, another cluster's Agent owns it, either Secret lacks the node, or the digests differ (`re-attach refused for <node>: ...`); adopted keys are never withdrawn by the rollback |
+| Executor / ADOT writer IAM roles and the OIDC provider | the role exists (site-tagged); trust and policy are converged, not recreated | `PREREQUISITES_READY.<role>.pre_existing: true` | an IAM read or convergence fails; a pre-existing role is never deleted by the rollback and its registry rows stay ACTIVE |
+| Route53 association and NLB NAT allowlist | already associated / the rule already exists | `network.association_adopted`, `network.adopted_ingress_eips` (versus `association_created`, `created_ingress_eips`) | only rules and associations this attempt created are revoked on rollback |
+| Cluster token file and `gpu-fault-regional-connection` Secret | same SHA-256 on both sides (proof 2 above) | `reclaimed_cluster_token.data_plane` | a different token or cluster id (refused before anything is written); the rollback keeps the token file and the kubeconfig context |
+| Registry registration | absent (the rollback that lost the cluster removed it) | the ordinary `PENDING` -> `ACTIVE` transitions | the engine's own refusals; a failed attempt's registration is rolled back (`fail-cluster` / `rollback-cluster`), the data plane is not purged |
+| Data-plane release and node Agent wave | the installed Deployments and Agents are rolled to the current required pins through the normal `join-cluster` release; Agents already at the pin converge without a reinstall | `JOINED`, `COLLECTORS_READY`, `VERIFIED` as for any join | the normal release gates |
+
 A `join-cluster` attempt that was refused before it changed anything (this ownership refusal, a blocked identity) does
 not pin the site: when a `deploy` or `config` has since moved `spec.repositoryRoot` or another non-membership field, the next
 `join-cluster` archives the refused attempt (`join-cluster/<id>/state.attempt-NNN.json` with `superseded_by_attempt`), records
 it under `superseded_attempts` and starts a fresh attempt against the current site instead of exiting with `join-cluster
 source site non-membership fields drifted`. An attempt that had already started mutating (local inputs, node keys, a
-release) still refuses on drift and is resumed or compensated as before.
+release) still refuses on drift and is resumed or compensated as before. Local inputs count as a mutation: the step writes
+the kubeconfig alias, may create the namespace and clears stale installer annotations, so a re-attach that stopped there
+(journal `ROLLBACK_STARTED`) is finished by the next `join-cluster`: its rollback verifies the adopted namespace, keeps the
+token file and the kubeconfig context, ends `ROLLED_BACK`, and the same run continues as the next attempt with the token
+binding and the reclaim proof carried forward.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 

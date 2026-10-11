@@ -373,6 +373,25 @@ def _remove_joined_cluster_from_site(
     return load_site(source, repository_root=request.site.repository_root)
 
 
+def _pre_existing_role_keys(execution: JoinExecution) -> set[str]:
+    """Registry keys of the IAM roles the attempt found rather than created."""
+
+    cluster_id = execution.cluster_id
+    keys: set[str] = set()
+    executor = execution.prerequisites.get("executor_role")
+    if isinstance(executor, dict) and executor.get("pre_existing") is True:
+        keys.update(
+            {
+                f"aws/iam/executor/{cluster_id}/role",
+                f"aws/iam/executor/{cluster_id}/oidc-provider",
+            }
+        )
+    adot_writer = execution.prerequisites.get("adot_writer_role")
+    if isinstance(adot_writer, dict) and adot_writer.get("pre_existing") is True:
+        keys.add(f"aws/iam/adot-writer/{cluster_id}/role")
+    return keys
+
+
 def _remove_joined_resources(
     site: RenderedSite,
     *,
@@ -391,6 +410,11 @@ def _remove_joined_resources(
             else item
         ]
     }
+    # Rows of a role that was there before the attempt (a re-attach over an
+    # installed data plane) describe a resource the attempt did not create and
+    # the rollback leaves standing; their registry status stays as it was.
+    for key in _pre_existing_role_keys(execution):
+        expected.pop(key, None)
     resources = []
     now = datetime.now(timezone.utc)
     for resource in live.resources:

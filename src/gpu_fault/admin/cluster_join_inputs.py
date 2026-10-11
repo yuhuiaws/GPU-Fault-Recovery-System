@@ -11,7 +11,11 @@ from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
     CommandRunner,
 )
-from gpu_fault.admin.cluster_join_state import complete_step, step_done
+from gpu_fault.admin.cluster_join_state import (
+    complete_step,
+    reclaimed_cluster_token,
+    step_done,
+)
 from gpu_fault.admin.cluster_kubeconfig import (
     KubeconfigAliasRefused,
     reclaim_released_alias,
@@ -242,6 +246,12 @@ def _bind_existing_token(
             )
         return None
     if state.get("retained_cluster_token") == expected_token:
+        # Ownership already proven. A reclaim record carried from a superseded
+        # or rolled-back attempt still names the committed namespace the
+        # caller must accept under its recorded UID.
+        reclaimed = reclaimed_cluster_token(state)
+        if reclaimed is not None and reclaimed.get("cluster_id") == cluster_id:
+            return reclaimed
         return None
     if not reclaim:
         raise join.JoinTargetIdentityError(

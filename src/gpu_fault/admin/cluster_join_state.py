@@ -4,7 +4,7 @@ import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Protocol, cast
+from typing import Any, Mapping, Protocol, cast
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
@@ -54,6 +54,21 @@ UNMUTATED_ATTEMPT_PHASES = (
 
 def join_release_started(state: dict[str, Any]) -> bool:
     return any(step_done(state, step) for step in JOIN_RELEASE_STEPS)
+
+
+def reclaimed_cluster_token(state: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The ``reclaimed_cluster_token`` record of a re-attach attempt, or ``None``.
+
+    A journal carrying it joins a cluster whose data plane, node keys, IAM
+    roles, namespace and token already exist from a committed join the site
+    lost. Every later step adopts those on proof instead of creating them, and
+    the attempt's rollback leaves what it adopted in place.
+    """
+
+    record = state.get("reclaimed_cluster_token")
+    if not isinstance(record, dict) or not str(record.get("cluster_id") or ""):
+        return None
+    return record
 
 
 def recovery_scope_sha256(site: RenderedSite) -> str:
@@ -324,6 +339,9 @@ def reset_completed_state(
 ) -> None:
     previous_attempt = int(state.get("attempt") or 1)
     retained_token = state.get("retained_cluster_token")
+    # A reclaim proof travels with its token binding: the next attempt still
+    # adopts the committed namespace, node keys and roles it was proven for.
+    reclaimed = reclaimed_cluster_token(state)
     archive = state_dir / f"state.attempt-{previous_attempt:03d}.json"
     if not archive.exists():
         write_json_atomic(archive, dict(state))
@@ -331,6 +349,8 @@ def reset_completed_state(
     state.update(_fresh_attempt_state(request, attempt=previous_attempt + 1))
     if isinstance(retained_token, dict):
         state["retained_cluster_token"] = dict(retained_token)
+    if reclaimed is not None:
+        state["reclaimed_cluster_token"] = dict(reclaimed)
     write_json_atomic(state_path, state)
 
 

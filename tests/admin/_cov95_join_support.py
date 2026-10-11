@@ -11,6 +11,7 @@ import yaml
 from gpu_fault.admin import cluster_batch_join as batch
 from gpu_fault.admin import cluster_join as join
 from gpu_fault.admin import cluster_join_evidence as evidence
+from gpu_fault.admin import cluster_join_nodes as nodes_module
 from gpu_fault.admin import cluster_readiness as readiness
 from gpu_fault.admin import cluster_removal as removal
 from gpu_fault.admin import failure_domain_map as maps
@@ -124,6 +125,14 @@ class JoinScenario(CommandRunner):
         # cluster's ``gpu-fault-regional-clusters``. Absent by default.
         self.connection_secrets: dict[str, dict] = {}
         self.registry_secret: dict | None = None
+        # Node Action keys per plane for the re-attach proof: ``"cpu"`` is the
+        # control plane's ``gpu-fault-node-action-keys``, a GPU context its
+        # node-secret; values are node -> base64 key. ``agent_owners`` answers
+        # the fleet Agent inventory (node -> cluster id); ``existing_roles``
+        # names EKS clusters whose IAM roles were there before the attempt.
+        self.node_key_secrets: dict[str, dict[str, str]] = {}
+        self.agent_owners: dict[str, str] = {}
+        self.existing_roles: set[str] = set()
         self.lock = RLock()
         self.registry = JoinRegistry(self)
         self.map_kubectl = FakeKubectl()
@@ -254,6 +263,28 @@ class JoinScenario(CommandRunner):
                     "regional registry read lost private capture"
                 )
                 return json.dumps(self.registry_secret) if self.registry_secret else ""
+            if "gpu-fault-node-action-keys" in arguments:
+                assert options.get("sensitive"), "node-key read lost private capture"
+                plane = context if "--context" in arguments else "cpu"
+                data = self.node_key_secrets.get(plane)
+                if data is None:
+                    return ""
+                if any(str(item).startswith("go-template=") for item in arguments):
+                    return json.dumps(sorted(data))
+                return json.dumps(
+                    {
+                        "apiVersion": "v1",
+                        "kind": "Secret",
+                        "type": "Opaque",
+                        "metadata": {
+                            "name": "gpu-fault-node-action-keys",
+                            "namespace": "gpu-fault-system",
+                            "uid": f"keys-{plane}",
+                            "resourceVersion": "1",
+                        },
+                        "data": dict(data),
+                    }
+                )
             return ""
         if "get" in arguments and "nodes" in arguments:
             suffix = context.rsplit("-", 1)[-1]
@@ -283,6 +314,8 @@ class JoinScenario(CommandRunner):
         if "get" in arguments and "pod" in arguments:
             return "cpu-fixture"
         if "exec" in arguments:
+            if any(item == nodes_module.AGENT_OWNERS_SCRIPT for item in arguments):
+                return json.dumps(self.agent_owners)
             return "{}"
         raise AssertionError("unexpected fake join runner operation")
 
@@ -335,6 +368,7 @@ class JoinScenario(CommandRunner):
             "oidc_provider_arn": f"arn:aws:iam::{ACCOUNT}:oidc-provider/{cluster.eks_name}.invalid",
             "oidc_provider_ownership": "CREATED",
             "cluster_name": cluster.eks_name,
+            "pre_existing": cluster.eks_name in self.existing_roles,
         }
 
     def map_command(self, arguments, **options):
@@ -358,6 +392,7 @@ class JoinScenario(CommandRunner):
             "role_arn": f"arn:aws:iam::{ACCOUNT}:role/{cluster.eks_name}-adot",
             "ownership": "CREATED",
             "inline_policy_name": "GPUFaultDataplaneAmpWriter",
+            "pre_existing": cluster.eks_name in self.existing_roles,
         }
 
     def node_keys(self, runner, *, cluster, cluster_id, **_options):

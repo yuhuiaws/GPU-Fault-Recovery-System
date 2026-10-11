@@ -25,6 +25,7 @@ import yaml
 from gpu_fault.admin import cli_join
 from gpu_fault.admin import cluster_join as join
 from gpu_fault.admin import cluster_join_inputs as inputs
+from gpu_fault.admin import cluster_join_rollback as rollback_module
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.cluster_join_inputs import prepare_local_inputs
 from gpu_fault.admin.cluster_join_reclaim import ClusterTokenReclaimRefused
@@ -589,3 +590,147 @@ def test_proof_one_ignores_an_archived_refused_attempt_that_came_later(orphan):
     orphan.prepare()
     record = orphan.journaled()["reclaimed_cluster_token"]
     assert record["identity"]["attempt"] == 1, "the reclaim used the committed attempt"
+
+
+# --- the whole re-attach over an installed data plane -----------------------------
+
+
+def _installed_data_plane(scenario, token_file):
+    """What the committed join left behind on both planes: node keys held by
+    the control plane and the cluster alike, ACTIVE Agents under the cluster
+    id, IAM roles, the hosted-zone association, the NLB rule, the connection
+    Secret -- and a registry that forgot the cluster."""
+
+    key = base64.b64encode(b"k" * 64).decode()
+    scenario.node_key_secrets["cpu"] = {"node-b": key, "node-a": key}
+    scenario.node_key_secrets[target().context] = {"node-b": key}
+    scenario.agent_owners = {"node-b": CLUSTER_ID, "node-a": "gpu-a"}
+    scenario.existing_roles.add(target().eks_name)
+    scenario.connection_secrets[target().context] = _connection_secret(
+        token=token_file.read_text().strip()
+    )
+    scenario.cluster_states.pop(CLUSTER_ID, None)
+
+
+def _lose_membership(scenario):
+    document = yaml.safe_load(scenario.path.read_text())
+    document["spec"]["clusters"] = [
+        item for item in document["spec"]["clusters"] if item["clusterId"] != CLUSTER_ID
+    ]
+    scenario.path.write_text(yaml.safe_dump(document))
+
+
+def test_re_attach_adopts_every_pre_existing_piece_of_the_data_plane(
+    tmp_path, monkeypatch
+):
+    scenario = JoinScenario(tmp_path, monkeypatch, suffixes=("b",))
+    assert scenario.join()["phase"] == "COMPLETED"
+    token_file = scenario.path.parent / "secure" / f"{CLUSTER_ID}.token"
+    _lose_membership(scenario)
+    _installed_data_plane(scenario, token_file)
+    monkeypatch.setattr(
+        inputs,
+        "reclaim_released_alias",
+        lambda *_args, **_kwargs: {"released_by": {"registry": "absent"}},
+    )
+    token_before = token_file.read_bytes()
+
+    result = join.join_cluster(
+        scenario.request(reclaim_cluster_token=True), runner=scenario
+    )
+
+    assert result["phase"] == "COMPLETED"
+    assert token_file.read_bytes() == token_before, "the token was re-minted"
+    state = scenario.state()
+    evidence = state["evidence"]
+    adopted = evidence["NODE_NAMES_VERIFIED"]["adopted_node_keys"]
+    assert set(adopted) == {"node-b"}
+    assert adopted["node-b"]["agent_owner"] == CLUSTER_ID
+    assert adopted["node-b"]["key_sha256"] == hashlib.sha256(b"k" * 64).hexdigest()
+    assert (
+        evidence["NODE_NAMES_VERIFIED"]["expected_key_sha256"]["node-b"]
+        == (adopted["node-b"]["key_sha256"])
+    ), "node keys are reused, not derived anew"
+    prerequisites = evidence["PREREQUISITES_READY"]
+    assert prerequisites["executor_role"]["pre_existing"] is True
+    assert prerequisites["adot_writer_role"]["pre_existing"] is True
+    network = prerequisites["network"]
+    assert network["association_created"] is False
+    assert network["association_adopted"] is True
+    assert network["created_ingress_eips"] == []
+    assert network["adopted_ingress_eips"] == network["nat_eips"]
+    assert evidence["LOCAL_INPUTS_READY"]["namespace_creation_started"] is False
+    assert (
+        evidence["LOCAL_INPUTS_READY"]["namespace_uid"]
+        == "namespace-" + target().context
+    )
+    restored = yaml.safe_load(scenario.path.read_text())
+    assert [item["clusterId"] for item in restored["spec"]["clusters"]] == [
+        "gpu-a",
+        CLUSTER_ID,
+    ]
+    assert scenario.cluster_states[CLUSTER_ID] == "ACTIVE", (
+        "the registry registration was created and activated"
+    )
+
+
+def test_a_failed_re_attach_rolls_back_without_touching_the_adopted_data_plane(
+    tmp_path, monkeypatch
+):
+    scenario = JoinScenario(tmp_path, monkeypatch, suffixes=("b",), rollback=True)
+    assert scenario.join()["phase"] == "COMPLETED"
+    token_file = scenario.path.parent / "secure" / f"{CLUSTER_ID}.token"
+    _lose_membership(scenario)
+    _installed_data_plane(scenario, token_file)
+    monkeypatch.setattr(
+        inputs,
+        "reclaim_released_alias",
+        lambda *_args, **_kwargs: {"released_by": {"registry": "absent"}},
+    )
+    removed = []
+    monkeypatch.setattr(
+        join,
+        "_remove_node_action_keys",
+        lambda *_args, **_kwargs: removed.append(_args),
+    )
+    # The rollback probes the adopted namespace with a runner of its own; the
+    # scenario answers for it with the UID the committed join recorded.
+    monkeypatch.setattr(rollback_module, "CommandRunner", lambda: scenario)
+    registry_before = {
+        item.resource_key: item.status.value
+        for item in scenario.registry.live.resources
+    }
+    scenario.failure = f"join-cluster:{CLUSTER_ID}"
+
+    with pytest.raises(BootstrapError, match="modeled join boundary failure"):
+        join.join_cluster(scenario.request(reclaim_cluster_token=True), runner=scenario)
+
+    state = scenario.state()
+    assert state["phase"] == "ROLLED_BACK", state.get("rollback_errors")
+    assert token_file.is_file(), "the live token file was deleted by the rollback"
+    assert state["retained_cluster_token"]["path"] == str(token_file)
+    assert state["reclaimed_cluster_token"]["cluster_id"] == CLUSTER_ID
+    assert target().context in scenario.contexts, "the kubeconfig context was removed"
+    assert removed == [], "adopted node keys were withdrawn"
+    assert not any(
+        "delete-context" in arguments for arguments, _options in scenario.commands
+    ), "the pre-existing kubeconfig context was removed"
+    executor_key = f"aws/iam/executor/{CLUSTER_ID}/role"
+    after = {
+        item.resource_key: item.status.value
+        for item in scenario.registry.live.resources
+    }
+    assert after[executor_key] == registry_before[executor_key] == "ACTIVE", (
+        "the pre-existing role's registry row was marked gone"
+    )
+    assert "namespace:" + target().context not in scenario.events[-5:], (
+        "the adopted namespace was recreated or deleted"
+    )
+
+    # The next run picks the journal up and finishes the re-attach.
+    scenario.failure = None
+    result = join.join_cluster(
+        scenario.request(reclaim_cluster_token=True), runner=scenario
+    )
+    assert result["phase"] == "COMPLETED"
+    assert scenario.state()["attempt"] == 3

@@ -21,6 +21,7 @@ from gpu_fault.admin.cluster_join_state import (
     JOIN_RELEASE_STEPS,
     complete_step,
     join_release_started,
+    reclaimed_cluster_token,
     step_done,
 )
 from gpu_fault.admin import cluster_removal_kubernetes as kubernetes_cleanup
@@ -151,6 +152,11 @@ def _command(arguments: list[str], *, not_found: tuple[str, ...]) -> None:
 def _iam_role(role: object, *, label: str, errors: list[str]) -> None:
     if not isinstance(role, dict) or not role.get("role_arn"):
         return
+    if role.get("pre_existing") is True:
+        # The role was there before the attempt converged it (a re-attach over
+        # an installed data plane): the site still owns it through the
+        # registry, and the attempt that only found it has nothing to undo.
+        return
     role_name = str(role["role_arn"]).rsplit("/", 1)[-1]
     policy = str(role.get("inline_policy_name") or "")
     if policy:
@@ -238,6 +244,22 @@ def _owned_namespace(
                 "GPU join namespace changed before rollback"
             )
         return observed_uid is not None
+    if context and reclaimed_cluster_token(state) is not None:
+        # A re-attach adopted the namespace the committed join created; it is
+        # verified under the recorded UID and never the attempt's to delete.
+        recorded_uid = str(local.get("namespace_uid") or "")
+        if not recorded_uid:
+            raise join.JoinTargetIdentityError(
+                "GPU join reclaim has no recorded namespace identity"
+            )
+        observed_uid = join.probe_join_namespace(
+            CommandRunner(), site=request.site, kubeconfig=kubeconfig, context=context
+        )
+        if observed_uid is not None and observed_uid != recorded_uid:
+            raise join.JoinTargetIdentityError(
+                "GPU join namespace changed before rollback"
+            )
+        return False
     if context and step_done(state, "LOCAL_INPUTS_READY"):
         raise join.JoinTargetIdentityError(
             "GPU join has no recorded namespace ownership"
@@ -395,21 +417,33 @@ def rollback(
             request, state, target=target, local=local, kubectl=kubectl
         )
     nodes = list(local.get("nodes") or [])
-    if join_release_started(state):
+    # Node keys a re-attach adopted (NODE_NAMES_VERIFIED.adopted_node_keys)
+    # belong to the committed join and its ACTIVE Agents: the attempt neither
+    # minted them nor annotated their nodes first, so it undoes neither.
+    adopted = (evidence.get("NODE_NAMES_VERIFIED") or {}).get("adopted_node_keys")
+    adopted_nodes = set(adopted) if isinstance(adopted, dict) else set()
+    created_nodes = [node for node in nodes if node not in adopted_nodes]
+    if join_release_started(state) and created_nodes:
         join._clear_installer_annotations(
             request.site,
             {
                 **target,
-                "expected_node_uids": dict(local.get("node_uids") or {}),
+                "expected_node_uids": {
+                    node: uid
+                    for node, uid in (local.get("node_uids") or {}).items()
+                    if node in created_nodes
+                },
                 "hyperpod_cluster_name": str(target.get("hyperpod_name") or ""),
                 "node_selector": node_selector(target),
             },
-            nodes,
+            created_nodes,
         )
-    if key_digests:
+    if key_digests and created_nodes:
         try:
             join._remove_node_action_keys(
-                request.site, nodes, expected_key_sha256=key_digests
+                request.site,
+                created_nodes,
+                expected_key_sha256={node: key_digests[node] for node in created_nodes},
             )
         except Exception as exc:
             errors.append("node key rollback: " + diagnostic_text(str(exc)))
@@ -565,7 +599,13 @@ def _finish(
                 "join rollback credential paths are outside its ownership"
             )
         retained_token: Path | None = None
-        if (evidence.get("REMOTE_ROLLBACK_COMPLETED") or {}).get("registry_present"):
+        reclaimed = reclaimed_cluster_token(state)
+        if reclaimed is not None or (
+            evidence.get("REMOTE_ROLLBACK_COMPLETED") or {}
+        ).get("registry_present"):
+            # A registered cluster keeps its token for the retry; so does a
+            # re-attach, whose token is the credential the installed data
+            # plane still runs with.
             retained_token = _retain_token(
                 request,
                 target=target,
@@ -574,7 +614,9 @@ def _finish(
                 state_path=state_path,
                 state=state,
             )
-        if context:
+        if context and reclaimed is None:
+            # The alias of a re-attach existed before the attempt and still
+            # names the live data plane; only an alias the attempt wrote goes.
             _remove_context(request, local, context)
         for path in {
             token_file,

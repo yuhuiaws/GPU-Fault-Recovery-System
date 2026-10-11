@@ -492,6 +492,9 @@ def _ensure_network(
         "vpc_region": target.region,
         "nat_eips": eips,
         "created_ingress_eips": [],
+        # Already in place before the attempt (a re-attach); never rolled back.
+        "adopted_ingress_eips": [],
+        "association_adopted": (target.region, target.vpc_id) in associated,
         "existing_vpc_ids": sorted({str(item["vpc_id"]) for item in baseline}),
         "hosted_zone_id": hosted_zone_id,
         "association_created": False,
@@ -504,6 +507,7 @@ def _ensure_network(
         if checkpoint is not None:
             checkpoint(dict(progress))
 
+    adopted_eips: set[str] = set()
     for eip in eips:
         record(f"ingress:{eip}")
         created = _ensure_nlb_ingress(
@@ -514,6 +518,8 @@ def _ensure_network(
         progress["created_ingress_eips"] = sorted(
             {*progress["created_ingress_eips"], *(set(created) - existing_eips)}
         )
+        adopted_eips.update({eip} - set(created))
+        progress["adopted_ingress_eips"] = sorted(adopted_eips)
         record(None)
     if (target.region, target.vpc_id) not in associated:
         record("vpc-association")

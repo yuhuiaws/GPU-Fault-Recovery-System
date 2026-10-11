@@ -1497,7 +1497,17 @@ join journal binding the token file to the cluster/EKS/HyperPod identity, the cl
 Secret holding the same token (SHA-256) and cluster id, and the regional registry Secret or installation registry still
 recording the cluster id -- journals them as `reclaimed_cluster_token` together with `retained_cluster_token`, seeds the
 committed namespace UID, and then runs the unchanged join; any missing proof refuses and the flag is refused where there is
-no orphaned token;
+no orphaned token; every later step of such an attempt adopts on proof what the committed join installed --
+`verify_join_node_names` adopts a node whose name the CPU key Secret already holds when its fleet Agent is owned by this
+cluster id and the CPU and node-secret key digests agree (`NODE_NAMES_VERIFIED.adopted_node_keys`), `_ensure_role`
+records `pre_existing`, `_ensure_network` records `association_adopted` / `adopted_ingress_eips`, the committed
+namespace is accepted under its recorded UID -- and the attempt's rollback (`cluster_join_rollback`) undoes only what the
+attempt created: adopted node keys are not withdrawn and their nodes not re-annotated, pre-existing roles are not deleted
+and their registry rows (`_remove_joined_resources`) stay as they were, the adopted namespace is verified but never
+deleted (so the GPU clean never runs), the token file is retained and the pre-existing kubeconfig context kept, and the
+attempt ends `ROLLED_BACK`; `reset_completed_state` carries `reclaimed_cluster_token` with the token binding. Local
+inputs are a mutating step (kubeconfig alias, namespace creation, installer annotations), so a re-attach stopped there
+is finished by that rollback rather than superseded;
 the temporary fleet master is not
 kept as ordinary evidence. `SUPERVISION_LOST` forbids automatic retry or compensation; commands not proven stopped must be explicitly reconciled first.
 A journal whose attempt stopped before its first mutation -- phase `STARTED`, `BLOCKED_IDENTITY`, `FAILED` or one of the

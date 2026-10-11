@@ -14,7 +14,11 @@ from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
     CommandRunner,
 )
-from gpu_fault.admin.cluster_join_state import complete_step, step_done
+from gpu_fault.admin.cluster_join_state import (
+    complete_step,
+    reclaimed_cluster_token,
+    step_done,
+)
 from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault.admin.node_key_proof import read_node_key_proof
 from gpu_fault.admin.site import RenderedSite, effective_environment
@@ -308,11 +312,33 @@ def verify_join_node_names(
     already_claimed = step_done(state, "NODE_KEYS_STARTED") and all(
         previous.get(key) == value for key, value in scope.items()
     )
-    if not already_claimed:
-        foreign.update(nodes & claims.cpu_key_names)
     if foreign:
         raise BootstrapError(
             "join NodeNames conflict with existing cluster, Agent, or CPU key ownership"
+        )
+    held = nodes & claims.cpu_key_names if not already_claimed else set()
+    gpu_kubectl = [
+        "kubectl",
+        "--kubeconfig",
+        str(inputs.local["gpu_kubeconfig"]),
+        "--context",
+        inputs.target.context,
+    ]
+    namespace = str(request.site.release_config["namespace"])
+    adopted: dict[str, dict[str, Any]] = {}
+    if held and reclaimed_cluster_token(state) is None:
+        raise BootstrapError(
+            "join NodeNames conflict with existing cluster, Agent, or CPU key ownership"
+        )
+    if held:
+        adopted = adopt_held_node_keys(
+            request,
+            inputs,
+            claims=claims,
+            held=held,
+            gpu_kubectl=gpu_kubectl,
+            namespace=namespace,
+            runner=runner,
         )
     master = (
         Path(str(inputs.local["fleet_master_file"])).read_text(encoding="utf-8").strip()
@@ -323,17 +349,7 @@ def verify_join_node_names(
         ).hexdigest()
         for node in sorted(nodes)
     }
-    gpu_keys = read_node_key_proof(
-        runner,
-        [
-            "kubectl",
-            "--kubeconfig",
-            str(inputs.local["gpu_kubeconfig"]),
-            "--context",
-            inputs.target.context,
-        ],
-        str(request.site.release_config["namespace"]),
-    )
+    gpu_keys = read_node_key_proof(runner, gpu_kubectl, namespace)
     if already_claimed:
         expected = previous.get("expected_key_sha256")
         if (
@@ -357,12 +373,98 @@ def verify_join_node_names(
         digests.update(
             {node: gpu_keys.digests[node] for node in nodes & gpu_keys.digests.keys()}
         )
+    for node, proof in adopted.items():
+        digests[node] = str(proof["key_sha256"])
     complete_step(
         state_path,
         state,
         "NODE_NAMES_VERIFIED",
-        {**scope, "observed_at": claims.observed_at, "expected_key_sha256": digests},
+        {
+            **scope,
+            "observed_at": claims.observed_at,
+            "expected_key_sha256": digests,
+            "adopted_node_keys": adopted,
+        },
     )
+
+
+def adopt_held_node_keys(
+    request: JoinClusterRequest,
+    inputs: JoinInputs,
+    *,
+    claims: NodeClaims,
+    held: set[str],
+    gpu_kubectl: Sequence[str],
+    namespace: str,
+    runner: CommandRunner,
+) -> dict[str, dict[str, Any]]:
+    """Adopt node keys the CPU Secret already holds for a re-attached cluster.
+
+    A committed join of this cluster provisioned the keys and its Agents are
+    still serving under this cluster id; the re-attach reuses them instead of
+    treating the names as foreign. Proof per node: the fleet Agent on the node
+    is owned by this cluster id, and the key digest in the CPU Secret equals
+    the digest of the cluster's own node-secret (``gpu-fault-node-action-keys``
+    on both sides, compared by SHA-256 of the key bytes, never by value). Any
+    node without that proof refuses, named with the proof it lacks.
+    """
+
+    failures: list[str] = []
+    for node in sorted(held):
+        owner = claims.agent_owners.get(node)
+        if owner is None:
+            failures.append(f"{node}: no fleet Agent owns the node")
+        elif owner != inputs.cluster_id:
+            failures.append(f"{node}: its fleet Agent is owned by cluster {owner}")
+    if failures:
+        raise BootstrapError(
+            "join NodeNames conflict with existing cluster, Agent, or CPU key "
+            "ownership; re-attach refused for " + "; ".join(failures)
+        )
+    cpu_keys = read_node_key_proof(
+        runner,
+        ["kubectl", "--kubeconfig", str(request.site.release_config["cpu_kubeconfig"])],
+        namespace,
+    )
+    gpu_keys = read_node_key_proof(runner, gpu_kubectl, namespace)
+    if cpu_keys is None:
+        raise BootstrapError(
+            "join NodeNames conflict with existing cluster, Agent, or CPU key "
+            "ownership; re-attach refused: the CPU node-key Secret is unreadable"
+        )
+    if gpu_keys is None:
+        raise BootstrapError(
+            "join NodeNames conflict with existing cluster, Agent, or CPU key "
+            f"ownership; re-attach refused: the cluster has no {namespace}/"
+            "gpu-fault-node-action-keys Secret to prove the keys against"
+        )
+    adopted: dict[str, dict[str, Any]] = {}
+    for node in sorted(held):
+        cpu_digest = cpu_keys.digests.get(node)
+        gpu_digest = gpu_keys.digests.get(node)
+        if cpu_digest is None:
+            failures.append(f"{node}: the CPU Secret names it without key material")
+        elif gpu_digest is None:
+            failures.append(f"{node}: the cluster holds no node-secret for it")
+        elif cpu_digest != gpu_digest:
+            failures.append(
+                f"{node}: key digests differ between the CPU Secret and the "
+                "cluster's node-secret"
+            )
+        else:
+            adopted[node] = {
+                "agent_owner": inputs.cluster_id,
+                "key_sha256": cpu_digest,
+                "cpu_secret_uid": cpu_keys.uid,
+                "gpu_secret_uid": gpu_keys.uid,
+                "adopted_at": datetime.now(timezone.utc).isoformat(),
+            }
+    if failures:
+        raise BootstrapError(
+            "join NodeNames conflict with existing cluster, Agent, or CPU key "
+            "ownership; re-attach refused for " + "; ".join(failures)
+        )
+    return adopted
 
 
 class BoundNodeKeyRunner(CommandRunner):

@@ -333,7 +333,7 @@ def _ensure_role(
     policy_name: str | None,
     policy: dict[str, Any] | None,
     site_id: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     trust_text = json.dumps(trust, separators=(",", ":"))
     # One read decides both whether the role exists and whether it has drifted;
     # the silent existence probe that used to run first asked IAM for the same
@@ -418,13 +418,17 @@ def _ensure_role(
         "role_arn": f"arn:aws:iam::{account_id}:role/{role_name}",
         "ownership": "CREATED",
         "inline_policy_name": policy_name or "",
+        # Whether the role was there before this call converged it. The site
+        # owns it either way (registry and uninstall delete it); the attempt
+        # that found it must not undo it in its own rollback.
+        "pre_existing": role is not None,
     }
 
 
 def probe_iam_role(
     runner: CommandRunner,
     **kwargs: Any,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     return _ensure_role(ReadOnlyProbeRunner(runner), **kwargs)
 
 
@@ -671,7 +675,7 @@ def ensure_executor_role(
     cluster: ClusterIdentity,
     namespace: str,
     site_id: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     provider_arn, issuer, provider_ownership = _ensure_oidc_provider(
         runner,
         cluster,
@@ -773,7 +777,7 @@ def ensure_adot_writer_role(
     namespace: str,
     site_id: str,
     amp_workspace_id: str,
-) -> dict[str, str]:
+) -> dict[str, Any]:
     """The IRSA role one GPU cluster's data-plane ADOT collector writes AMP with.
 
     Same shape as the executor role -- trust on the cluster's OIDC provider for
