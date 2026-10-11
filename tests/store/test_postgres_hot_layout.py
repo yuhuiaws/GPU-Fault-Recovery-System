@@ -333,11 +333,7 @@ def test_metric_latest_follows_the_layout_and_cluster_partitions_come_and_go(
         assert connection.execute(
             "SELECT to_regclass(%s)", (partition,)
         ).fetchone() != (None,), "registration creates the cluster's metric partition"
-    from gpu_fault.gpu_metrics import (
-        GpuMetricLatest,
-        GpuMetricSample,
-        GpuMetricSource,
-    )
+    from gpu_fault.gpu_metrics import GpuMetricLatest, GpuMetricSample, GpuMetricSource
 
     key = ("layout-cluster", "node-1", "gpu_temperature_c", "GPU-0")
     observed = datetime.now(timezone.utc)
