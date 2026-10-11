@@ -38,9 +38,10 @@ sixth one cannot appear by accident:
 - `registry_client.py` takes `method path` in argv, because its stdin is the
   request body being sent to the registry API and the method and path cannot
   travel inside it.
-- `control_api_inspect.py` and `executor_tls_healthz.py` take their inputs from
-  the **environment**, via `env NAME=value` in front of the interpreter and via
-  variables the Pod already carries. Nothing is read from stdin.
+- `control_api_inspect.py`, `collector_readiness_inspect.py` and
+  `executor_tls_healthz.py` take their inputs from the **environment**, via
+  `env NAME=value` in front of the interpreter and via variables the Pod already
+  carries. Nothing is read from stdin.
 - `critical_amp_alerts.py` runs on the **deploy host** rather than in a Pod: it
   SigV4-signs a query to the AMP workspace with the deploy host's credentials,
   which the Pods deliberately do not have. It is here for the same reasons as

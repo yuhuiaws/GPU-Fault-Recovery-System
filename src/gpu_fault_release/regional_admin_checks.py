@@ -18,6 +18,7 @@ from urllib.parse import urlsplit
 
 from gpu_fault.cluster_scope import node_selector
 from gpu_fault_release import regional_admin_checks_coverage as agent_coverage
+from gpu_fault_release import regional_admin_checks_readiness as readiness
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_monitoring_safety as monitoring_safety
 from gpu_fault_release import regional_release_token_rotation_safety as rotation_safety
@@ -32,7 +33,7 @@ from gpu_fault_release.regional_aurora_credentials import (
 from gpu_fault_release.regional_notifications import check_notification_channel
 from gpu_fault_release.regional_release_aurora_refresh import aurora_refresh_preflight
 from gpu_fault_release.regional_release_namespace import controller_check_value
-from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_config import CheckFailure, ReleaseError
 from gpu_fault_release.regional_release_diff import (
     ReleaseComponent,
     ReleaseExecutionPlan,
@@ -85,28 +86,16 @@ def _check(
     *,
     skipped_is_failure: bool = True,
 ) -> dict[str, Any]:
+    details: Any = None
     try:
         value = function()
-        return {
-            "name": name,
-            "status": value.status,
-            "summary": value.summary,
-            "details": value.details,
-        }
+        status, summary, details = value.status, value.summary, value.details
     except CheckSkipped as exc:
-        return {
-            "name": name,
-            "status": "FAIL" if skipped_is_failure else "SKIP",
-            "summary": str(exc),
-            "details": None,
-        }
+        status, summary = ("FAIL" if skipped_is_failure else "SKIP"), str(exc)
     except Exception as exc:
-        return {
-            "name": name,
-            "status": "FAIL",
-            "summary": str(exc),
-            "details": None,
-        }
+        # A ``CheckFailure`` keeps the evidence it was refused on in the record.
+        status, summary, details = "FAIL", str(exc), CheckFailure.details_of(exc)
+    return {"name": name, "status": status, "summary": summary, "details": details}
 
 
 def _report(mode: str, release: Any, checks: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1270,7 +1259,20 @@ def _control_api_report(release: Any) -> dict[str, Any]:
     return result
 
 
-def _check_control_api(release: Any) -> CheckValue:
+def _control_api_pass(release: Any, report: dict[str, Any], verify: bool) -> CheckValue:
+    """The PASS verdict, once the collectors are ready too.
+
+    Judged last because it is the one judgement that may wait (a verify's
+    post-roll grace, see the sibling module); findings already made come first.
+    """
+
+    report["collector_readiness"] = readiness.judge_collector_readiness(
+        release, report, grace_seconds=readiness.grace_seconds(verify)
+    )
+    return CheckValue("control-plane API, fleet and collectors are healthy", report)
+
+
+def _check_control_api(release: Any, *, verify: bool = False) -> CheckValue:
     report = _control_api_report(release)
     if report.get("healthz", {}).get("status") != "ok":
         raise ReleaseError("control-plane /healthz is not ok")
@@ -1355,8 +1357,6 @@ def _check_control_api(release: Any) -> CheckValue:
             raise ReleaseError(f"{cluster_id} Agent Runtime Profile drift")
         if not (cluster.get("fleet_readiness") or {}).get("ready"):
             raise ReleaseError(f"{cluster_id} fleet readiness failed")
-        if not (cluster.get("collector_readiness") or {}).get("ready"):
-            raise ReleaseError(f"{cluster_id} collector readiness failed")
     remote = report.get("remote_commands") or {}
     oldest = float(remote.get("oldest_unclaimed_age_seconds", 0) or 0)
     if oldest > release.config.health.remote_command_max_unclaimed_seconds:
@@ -1389,7 +1389,7 @@ def _check_control_api(release: Any) -> CheckValue:
                 "executor internal remote-command error observed during release: "
                 f"{baseline_timestamp:.6f}->{current_timestamp:.6f}"
             )
-        return CheckValue("control-plane API, fleet and collectors are healthy", report)
+        return _control_api_pass(release, report, verify)
     raw_baseline = (
         previous.get("executor_internal_error_total", 0)
         if isinstance(previous, dict)
@@ -1406,7 +1406,7 @@ def _check_control_api(release: Any) -> CheckValue:
             "executor internal remote-command errors increased during release: "
             f"{baseline_internal_errors}->{current_internal_errors}"
         )
-    return CheckValue("control-plane API, fleet and collectors are healthy", report)
+    return _control_api_pass(release, report, verify)
 
 
 def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
@@ -1646,7 +1646,7 @@ def build_health_report(release: Any, *, mode: str) -> dict[str, Any]:
             "runtime_component_identity",
             runtime_component_identity,
         ),
-        ("control_api", lambda: _check_control_api(release)),
+        ("control_api", lambda: _check_control_api(release, verify=mode == "verify")),
     ]
     specifications.extend(
         (

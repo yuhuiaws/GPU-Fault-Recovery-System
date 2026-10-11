@@ -57,6 +57,27 @@ class PartialClusterRolloutError(ReleaseError):
     pass
 
 
+class CheckFailure(ReleaseError):
+    """A refused check that keeps the evidence it was refused on.
+
+    A plain ``ReleaseError`` is recorded as a summary with no details, which is
+    right for a refusal whose message is the whole finding. A judgement made
+    over a snapshot -- which node, which collector, how stale -- carries the
+    snapshot here, so the FAIL record shows what was seen and not only what was
+    concluded.
+    """
+
+    def __init__(self, message: str, details: Any) -> None:
+        super().__init__(message)
+        self.details = details
+
+    @staticmethod
+    def details_of(error: BaseException) -> Any:
+        """The evidence a failed check carries; ``None`` for every other error."""
+
+        return error.details if isinstance(error, CheckFailure) else None
+
+
 def admin_state_dir_sidecar(config_path: Path) -> Path | None:
     """The managed state directory bound to ``config_path``, if the CLI wrote one."""
 

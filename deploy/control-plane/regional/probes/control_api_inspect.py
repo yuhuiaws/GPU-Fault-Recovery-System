@@ -5,7 +5,9 @@ cluster and the answer has to name the clusters it asked about --
 ``ADMIN_CLUSTER_IDS_JSON`` (a JSON list of cluster ids) and
 ``ADMIN_EXPECTED_NODES_JSON`` (a JSON object of cluster id to node id list).
 Response: one JSON object on stdout with ``healthz``, ``version``, ``registry``,
-``remote_commands`` and a ``clusters`` entry per cluster id.
+``remote_commands``, ``collector_thresholds`` (the silence threshold in seconds
+the control plane applies to each collector kind) and a ``clusters`` entry per
+cluster id.
 
 Six endpoints in one exec rather than six execs: every call is a loopback
 request inside the Pod, so the expensive part is the ``kubectl exec`` around
@@ -51,6 +53,17 @@ def post(path: str, body: dict[str, Any]) -> Any:
         return json.load(response)
 
 
+def collector_thresholds() -> dict[str, float]:
+    try:
+        from gpu_fault.collector_kinds import collector_silent_thresholds
+    except ImportError:
+        # A control plane older than the engine, as a rollback's probe may find.
+        return {}
+    return {
+        kind.value: seconds for kind, seconds in collector_silent_thresholds().items()
+    }
+
+
 def main() -> None:
     clusters = json.loads(os.environ["ADMIN_CLUSTER_IDS_JSON"])
     expected_nodes = json.loads(os.environ["ADMIN_EXPECTED_NODES_JSON"])
@@ -58,6 +71,7 @@ def main() -> None:
         "healthz": get("/healthz"),
         "version": get("/v1/version"),
         "registry": get("/v1/regional/clusters"),
+        "collector_thresholds": collector_thresholds(),
         "clusters": {},
         "remote_commands": (
             ApplicationContext.from_environment().store.remote_command_stats()
