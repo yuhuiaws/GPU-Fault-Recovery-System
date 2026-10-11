@@ -10,6 +10,7 @@ from gpu_fault.app.closed_loop_metrics import (
 )
 from gpu_fault.app.metric_scan_cache import MetricScanCache, metric_scan_cache
 from gpu_fault.app.runtime import AppRuntime
+from gpu_fault.app.store_bloat_metrics import store_bloat_metric_lines
 from gpu_fault.collector_requirements import agent_is_current
 from gpu_fault.execution import ProductionExecutorConfig
 from gpu_fault.fleet_deployment import DeploymentStatus
@@ -470,6 +471,7 @@ def control_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     snapshot = periodic.metrics_snapshot() if periodic is not None else {}
     lines.extend(_control_loop_review_lines(dispatcher, archiver))
     lines.extend(_periodic_reconciliation_lines(snapshot))
+    lines.extend(store_bloat_metric_lines(snapshot))
     lines.extend(_processor_counter_mode_lines(store))
     lines.extend(
         [

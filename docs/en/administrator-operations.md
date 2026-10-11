@@ -750,6 +750,7 @@ The complete list is in `管理员环境变量参考.md` (Administrator Environm
 | `GPU_FAULT_JOB_WORKFLOW_NODE_BUSY_WAIT_SECONDS` | 240 | The single window of rule A: when a training job's node is occupied by another repair, the job waits only this long. If the repair finishes within the window the job continues (the queued job workflow is dispatched; the `after_incident` restart restarts the job); beyond the window the job is not restarted -- a still-running job is stopped with a STOP_WORKLOADS carrying the control-plane initiator marker, a dead job's restart plan fails, the workflow is FAILED, the incident ESCALATED, and a job the system itself stopped is never restarted by anyone. The dispatcher (job workflows not yet started) and the executor (the precondition of a restart already running) read the same variable | Raise when single-node repairs often exceed 4 minutes; unequal values at the two read sites refuse startup |
 | `GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS` | 30 | How often the periodic task scans the processor queue to return requests still LEASED with an expired lease to PENDING; each reclamation counts in `gpu_fault_processor_expired_leases_reclaimed_total` | Usually untouched; may be relaxed in step when the request lease itself (`GPU_FAULT_PROCESSOR_REQUEST_LEASE_SECONDS`, default 120) is lengthened |
 | `GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS` | 60 | How often the periodic task compares the processor queue shard counters with the real PENDING/LEASED row counts, refreshing `gpu_fault_processor_counter_drift_abs` and `gpu_fault_processor_counter_mismatched_clusters` (not computed in the scrape) | Lengthen when the queue table is very large and this COUNT visibly slows Aurora; the alert window is 5 minutes, do not approach it |
+| `GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS` | 300 | How often the periodic task reads the hot tables' physical layout from the catalog (heap/index pages per live row, the least dense index's entries per page, exported as `gpu_fault_store_hot_table_*`) and rebuilds an index past the threshold with `REINDEX INDEX CONCURRENTLY` or rewrites one of the three small tables with `VACUUM (FULL, ANALYZE)` (§10.3); `0` disables | Usually untouched; a scan without actions is a few milliseconds of catalog reads. Set `0` to leave compaction entirely to `store-maintenance` in a maintenance window |
 | `GPU_FAULT_WORKFLOW_INVARIANT_CHECKS` | log | After every lease-bearing write the executor checks the workflow record's state-machine invariants (indexes ordered and unique, DAG join markers, no owner/lease in terminal states, `events` bounded and ordered, etc.); `off` skips, `log` records an error log and continues, `raise` fails that write | Keep `log` in production; use `raise` in staging and acceptance drills to expose malformed records on the spot |
 
 **Ordering relationships between timing parameters.** The wait-class parameters in the table above and elsewhere in §4 are not independent of each other; the code has an implicit ordering,
@@ -3874,10 +3875,38 @@ or newer for `REINDEX ... CONCURRENTLY` (checked through `server_version_num`), 
 harmless to repeat. Before/after sizes of every table go into the evidence file; a table that fails is recorded, the
 run ends `FAILED` with exit code 1, and a later rerun finishes the work.
 
-**The "maintained store" expectation.** Formal perf and acceptance rounds assume a maintained store: after a campaign
-day and before a formal round, read the plan and, if any hot table's heap pages exceed its live rows by an order of
-magnitude or more, execute the verb once. It is not a scheduled chore -- after v19 the autovacuum thresholds and HOT
-updates keep the page counts near the live size.
+**The product compacts indexes and small tables itself (the `store-compaction` periodic job).** The bloat comes from
+mass deletes: one formal 32-cluster round writes about 264k synthetic metric-latest rows, 87k objects and 27k queue
+rows, the teardown deletes them, and the heap and index files stay at their high-water mark (metric latest: 1,233 live
+rows in 31,023 pages plus 118 MiB of indexes; the queue: 246 rows with 36 MiB of indexes and 52 MiB of TOAST; queue
+counts: 280 rows in 127 pages) -- a real cluster leaving the fleet has the same shape. On one release with identical
+admission defaults: a fresh store 1,572 req/s PASS; bloated indexes and heaps 538 req/s FAIL (49 % of the active
+statements waiting on `LWLock:BufferContent`: the queue INSERT 84 %, the completion CTE 78 %, the claim CTE 48 %);
+indexes rebuilt and the three small tables `VACUUM FULL`ed with the large heaps and the TOAST untouched 1,141 req/s PASS
+with zero BufferContent samples. The control worker therefore reads the catalog facts every
+`GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS` (default 300 s, `0` disables) under a periodic-task lease
+(`store/postgres/hot_table_bloat.py`): each hot table's live rows, heap pages, index pages, heap pages per live row,
+index pages per live row and the least dense index's entries per page, exported as
+`gpu_fault_store_hot_table_*{table=...}` with `gpu_fault_store_bloat_scan_timestamp_seconds`. An index of at least 64
+pages holding fewer than 8 live entries per page is rebuilt with `REINDEX INDEX CONCURRENTLY` (an invalid `_ccnew`
+twin left by an interrupted rebuild is dropped first); the three small tables lanes/queue counts/priority shards are
+rewritten with `VACUUM (FULL, ANALYZE)` when they span at least 16 pages with fewer than 4 live rows per page (an
+exclusive lock of well under a second at their live size). The thresholds sit an order of magnitude below any compact
+layout -- even 500-byte index entries pack 16 to a page -- so a queue carrying its working set is never touched. The
+actions run through the Store's own pool under the `gpu_fault_schema_bootstrap` advisory lock, mutually exclusive with
+a schema ensure and with `store-maintenance`; a held lock skips the round. Outcomes count in
+`gpu_fault_store_compaction_actions_total{action,status}` and `gpu_fault_store_compaction_last_timestamp_seconds`, and a
+failed action in `gpu_fault_periodic_job_errors_total{periodic_job="store_compaction"}`.
+
+**When `store-maintenance` is still needed.** The large tables' heaps and TOAST (`gpu_fault_gpu_metric_latest`,
+`gpu_fault_objects`, the TOAST of `gpu_fault_processor_queue`) are measured by the job but never rewritten -- returning
+their pages takes `VACUUM FULL`'s exclusive lock, an operator decision for a maintenance window rather than a
+background job -- and they cost roughly a quarter of ingress throughput (1,572 against 1,141 req/s). Run the verb
+through the plan/execute flow above when `gpu_fault_store_hot_table_heap_pages_per_live_row` stays above ten on a large
+table, when the job is switched off with `GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS=0`, or when
+`gpu_fault_store_compaction_actions_total{status="FAILED"}` keeps growing (for example `REINDEX ... CONCURRENTLY`
+repeatedly hitting its `lock_timeout`); before a formal perf or acceptance round read `store_bloat` in `summary.json`
+(Performance Acceptance Plan §11).
 ## 11. Centralised Container Logs (CloudWatch Container Insights)
 
 Not installed by default. Logs stopping at the node is a written-down trade-off ([Detailed Design v2 §10.1](detailed-design-v2.md#101-logging)),

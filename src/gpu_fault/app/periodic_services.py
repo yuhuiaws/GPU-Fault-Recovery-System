@@ -49,6 +49,11 @@ class PeriodicServiceConfig:
     # F-D10 (P1-75F): how often the processor counter table is compared with
     # the queue rows it summarises. A full-table count, so never per scrape.
     counter_drift_interval: float = 60.0
+    # How often the hot tables' physical layout is read from the catalog and
+    # a bloated index or small table is rebuilt (store.postgres.hot_table_
+    # bloat). Catalog reads only until something crosses a threshold; ``0``
+    # switches the job off, which leaves ``store-maintenance`` as the remedy.
+    store_compaction_interval: float = 300.0
     # Control-plane review 2026-09-08, F-8: incidents one archive round may
     # take, and retention for the kinds that had no cleanup path at all --
     # inactive markers, terminal notifications (with their delivery, result
@@ -76,6 +81,10 @@ class PeriodicServiceConfig:
         if self.counter_drift_interval <= 0:
             raise ValueError(
                 "GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS must be positive"
+            )
+        if self.store_compaction_interval < 0:
+            raise ValueError(
+                "GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS must be zero or positive"
             )
         if self.archive_batch_size <= 0:
             raise ValueError(
@@ -186,6 +195,9 @@ class PeriodicServiceConfig:
             counter_drift_interval=float(
                 os.getenv("GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS", "60")
             ),
+            store_compaction_interval=float(
+                os.getenv("GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS", "300")
+            ),
             archive_batch_size=int(
                 os.getenv("GPU_FAULT_CONTROL_RECORD_ARCHIVE_BATCH_SIZE", "200")
             ),
@@ -246,6 +258,13 @@ class PeriodicServiceRunner:
         self.processor_counter_mismatched_clusters: int = 0
         self.processor_counter_drift_scan_timestamp_seconds = 0.0
         self._counter_drift_lock = Lock()
+        # Hot-table bloat: the last catalog scan per table (pages, live rows,
+        # the ratios the compaction policy acts on) and what the job rebuilt.
+        # Written by the store-compaction job, read by a scrape.
+        self.store_bloat_tables: dict[str, dict[str, object]] = {}
+        self.store_bloat_scan_timestamp_seconds = 0.0
+        self.store_compaction_last_timestamp_seconds = 0.0
+        self.store_compaction_actions_total: dict[tuple[str, str], int] = {}
         # ARCH-E E3: the runner's own heartbeat, and each job's last run. The
         # counters above are written by the loop, so a dead thread leaves
         # every one of them at a healthy-looking value.
@@ -273,6 +292,7 @@ class PeriodicServiceRunner:
         "silence",
         "lease_reclaim",
         "counter_drift",
+        "store_compaction",
     )
 
     def run_all_due(self, now: float) -> None:
@@ -315,6 +335,12 @@ class PeriodicServiceRunner:
             drift = self.processor_counter_drift_abs
             mismatched = self.processor_counter_mismatched_clusters
             scanned_at = self.processor_counter_drift_scan_timestamp_seconds
+            bloat_tables = {
+                table: dict(facts) for table, facts in self.store_bloat_tables.items()
+            }
+            bloat_scanned_at = self.store_bloat_scan_timestamp_seconds
+            compacted_at = self.store_compaction_last_timestamp_seconds
+            compaction_actions = dict(self.store_compaction_actions_total)
         return {
             "periodic_lease_errors_total": self.periodic_lease_errors_total,
             "periodic_job_errors_total": dict(self.periodic_job_errors_total),
@@ -327,6 +353,10 @@ class PeriodicServiceRunner:
             "processor_counter_drift_abs": drift,
             "processor_counter_mismatched_clusters": mismatched,
             "processor_counter_drift_scan_timestamp_seconds": scanned_at,
+            "store_bloat_tables": bloat_tables,
+            "store_bloat_scan_timestamp_seconds": bloat_scanned_at,
+            "store_compaction_last_timestamp_seconds": compacted_at,
+            "store_compaction_actions_total": compaction_actions,
             "processor_counter_drift_scan_max_age_seconds": max(
                 120.0, 3 * self.config.counter_drift_interval
             ),
@@ -827,4 +857,80 @@ class PeriodicServiceRunner:
             self.config.counter_drift_interval,
             measure,
             "processor counter drift scan failed",
+        )
+
+    #: Facts of a table the bloat gauges export (``app.store_bloat_metrics``).
+    STORE_BLOAT_GAUGE_KEYS = (
+        "live_rows",
+        "heap_pages",
+        "index_pages",
+        "heap_pages_per_live_row",
+        "index_pages_per_live_row",
+        "index_min_entries_per_page",
+    )
+
+    def _run_store_compaction(self, now: float) -> bool:
+        """Measure the hot tables' physical layout; rebuild what crossed the
+        thresholds (``store.postgres.hot_table_bloat``).
+
+        A round on a store that had just lost a 32-cluster synthetic fleet ran
+        at a third of the fresh store's ingress throughput with half of its
+        statements waiting on page content locks; rebuilding the indexes and
+        the small tables restored it. Only the Postgres store has the two
+        methods; the scan is a handful of catalog reads, and the rebuild runs
+        under the schema advisory lock so it never overlaps a schema ensure
+        or the operator's ``store-maintenance``.
+        """
+
+        interval = self.config.store_compaction_interval
+        store = self.context.store
+        if interval <= 0 or not callable(getattr(store, "hot_table_bloat", None)):
+            return False
+
+        def compact() -> None:
+            assessment = store.hot_table_bloat()
+            tables = {
+                str(item["table"]): {
+                    key: item.get(key) for key in self.STORE_BLOAT_GAUGE_KEYS
+                }
+                for item in assessment.get("tables", [])
+            }
+            with self._counter_drift_lock:
+                self.store_bloat_tables = tables
+                self.store_bloat_scan_timestamp_seconds = time.time()
+            actions = assessment.get("actions") or []
+            if not actions:
+                return
+            LOGGER.warning(
+                "store compaction due: %s",
+                "; ".join(f"{a['action']} {a['target']}" for a in actions),
+            )
+            result = store.compact_hot_tables(assessment)
+            with self._counter_drift_lock:
+                for item in result.get("actions", []):
+                    key = (str(item["action"]), str(item["status"]))
+                    self.store_compaction_actions_total[key] = (
+                        self.store_compaction_actions_total.get(key, 0) + 1
+                    )
+                if result.get("status") in {"SUCCEEDED", "FAILED"}:
+                    self.store_compaction_last_timestamp_seconds = time.time()
+            for item in result.get("actions", []):
+                LOGGER.warning(
+                    "store compaction %s %s %s in %ss",
+                    item["action"],
+                    item["target"],
+                    item["status"],
+                    item.get("seconds", "?"),
+                )
+            if result.get("status") == "SKIPPED":
+                LOGGER.info("store compaction skipped: %s", result.get("reason"))
+            if result.get("status") == "FAILED":
+                raise RuntimeError("store compaction left a failed action")
+
+        return self._run_scheduled(
+            "store-compaction",
+            now,
+            interval,
+            compact,
+            "store compaction failed",
         )

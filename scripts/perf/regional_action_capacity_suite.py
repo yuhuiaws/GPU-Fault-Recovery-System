@@ -35,6 +35,7 @@ if TYPE_CHECKING or __package__:
         control,
         dataplane,
         postgres_counters,
+        store_bloat_section,
         purge_audit_rows,
         register,
         release_identity,
@@ -68,6 +69,7 @@ else:
         control,
         dataplane,
         postgres_counters,
+        store_bloat_section,
         purge_audit_rows,
         register,
         release_identity,
@@ -1133,6 +1135,7 @@ def execute_capacity_run(
         ),
         "workflow_statuses": final.get("workflows", {}),
         "command_statuses": final.get("commands", {}),
+        "store_bloat": store_bloat_section(before_postgres, after_postgres),
         "postgres_deltas": {
             key: (after_postgres.get(key) or 0) - (before_postgres.get(key) or 0)
             for key in ("deadlocks", "xact_commit", "xact_rollback")

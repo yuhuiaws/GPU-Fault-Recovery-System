@@ -1035,7 +1035,9 @@ POSTGRES_ONLY_PUBLIC_METHODS: dict[str, str | None] = {
     "backfill_hot_state_tables": "tests/store/test_store_migrate.py",
     "backfill_processor_queue_state_columns": None,  # legacy backfill; no Postgres test
     "claim_active_processor_query": "tests/store/test_postgres_claim_window.py",
+    "compact_hot_tables": "tests/store/test_postgres_hot_table_compaction.py",
     "finalize_processor_counter_shards": "tests/store/test_postgres_processor_counters.py",
+    "hot_table_bloat": "tests/store/test_postgres_hot_table_compaction.py",
     "hot_state_backfill_gaps": "tests/store/test_postgres_dedicated_hot_state_startup.py",
     "hot_state_migration_status": "tests/store/test_postgres_dedicated_hot_state_startup.py",
     "listen_processor_queue_notifications": "tests/store/test_postgres_processor_claim.py",

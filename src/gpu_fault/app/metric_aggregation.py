@@ -228,6 +228,18 @@ _PER_PROCESS = (
     "gpu_fault_processor_counter_mismatched_clusters",
     "gpu_fault_processor_counter_drift_scan_timestamp_seconds",
     "gpu_fault_processor_counter_drift_scan_max_age_seconds",
+    # The hot-table bloat scan and the compaction job: measured by the task
+    # lease holder, so the other processes publish nothing or an older scan;
+    # like the drift scan, the pair (value, scan clock) must stay together.
+    "gpu_fault_store_hot_table_live_rows",
+    "gpu_fault_store_hot_table_heap_pages",
+    "gpu_fault_store_hot_table_index_pages",
+    "gpu_fault_store_hot_table_heap_pages_per_live_row",
+    "gpu_fault_store_hot_table_index_pages_per_live_row",
+    "gpu_fault_store_hot_table_index_min_entries_per_page",
+    "gpu_fault_store_bloat_scan_timestamp_seconds",
+    "gpu_fault_store_compaction_last_timestamp_seconds",
+    "gpu_fault_store_compaction_actions_total",
     "gpu_fault_ambiguous_attempt_ownership_total",
     "gpu_fault_control_record_archive_archived_total",
     "gpu_fault_control_record_archive_errors_total",

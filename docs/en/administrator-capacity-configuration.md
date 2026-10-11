@@ -376,6 +376,24 @@ This is the connection cap of this solution's processes, not measured concurrenc
 query tools or other applications. The 6-worker enabled results of historical stress tests remain a historical configuration
 and do not represent the current presets or authorise raising the 1200/1240 budgets.
 
+### 4.8 Hot-Table Physical Layout and Background Compaction
+
+The capacity presets assume compact hot-table indexes and small tables in the Store. One mass delete (the teardown of a
+formal 32-cluster perf round, a cluster leaving the fleet) leaves the 9 indexes of `gpu_fault_processor_queue`, the 2
+indexes of `gpu_fault_gpu_metric_latest` and the three small tables lanes/queue counts/priority shards at their
+high-water mark: on one release with identical admission defaults, ingress throughput fell from 1,572 req/s on a fresh
+store to 538 req/s (49 % of the active statements waiting on `LWLock:BufferContent`) and returned to 1,141 req/s once
+only the indexes were rebuilt and the three small tables `VACUUM FULL`ed. The control worker's periodic job
+`store-compaction` (`GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS`, default 300 s, `0` disables) does exactly that from
+catalog facts and exports `gpu_fault_store_hot_table_heap_pages_per_live_row{table}`,
+`gpu_fault_store_hot_table_index_pages_per_live_row{table}` and
+`gpu_fault_store_hot_table_index_min_entries_per_page{table}`; the values depend on no planner statistics target or cost
+model, and the perf runners write them into every round's `summary.json` as `store_bloat`. The thresholds (an index of
+at least 64 pages below 8 live entries per page; a small table of at least 16 pages below 4 live rows per page) are not
+capacity parameters and do not vary with the preset; the large tables' heaps and TOAST are reclaimed only by
+`gpu-fault-admin store-maintenance` in a maintenance window (Administrator Operations §10.3) and cost roughly a quarter
+of throughput. The variable is a ConfigMap environment variable, not a capacity-preset field of `admin-config.yaml`.
+
 ## 5. Configuration File Format
 
 The current template content is:

@@ -172,6 +172,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_find_open_remote_command.py \
 	tests/store/test_postgres_health_signal_claim_isolation.py \
 	tests/store/test_postgres_health_signal_semantics.py \
+	tests/store/test_postgres_hot_table_compaction.py \
 	tests/store/test_postgres_index_builder.py \
 	tests/store/test_postgres_incident_audit_contents.py \
 	tests/store/test_postgres_incident_audit_plans.py \

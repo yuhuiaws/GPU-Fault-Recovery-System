@@ -104,7 +104,22 @@ Formal rounds assume a maintained store: one campaign day of writes leaves the h
 counts/priority shards/queue, `gpu_fault_gpu_metric_latest`) with heap and index pages a hundred times their live
 rows, halving ingress throughput, raising `gpu_fault_processor_admission_batch_expired_total` and failing the reserved
 503 share verdict; schema v19's storage parameters stop the growth, and existing bloat is reclaimed before a formal
-round with `gpu-fault-admin store-maintenance --confirm STORE_MAINTENANCE` (Administrator Operations §10.3). The r1
+round with `gpu-fault-admin store-maintenance --confirm STORE_MAINTENANCE` (Administrator Operations §10.3). The bloat
+is what one formal 32-cluster round itself leaves behind: a round inserts about 264k synthetic
+`gpu_fault_gpu_metric_latest` rows, 87k objects and 27k queue rows, the teardown deletes them, and the heap and index
+files stay at their high-water mark (metric latest: 1,233 live rows in 31,023 pages plus 118 MiB of indexes; the queue:
+246 rows with 36 MiB of indexes and 52 MiB of TOAST; queue counts: 280 rows in 127 pages), which is the layout the
+next round runs on. Three points on one release with identical admission defaults: a fresh store 1,572 req/s PASS;
+bloated indexes and heaps 538 req/s FAIL (normal-telemetry reserved 503 share 29.4 %, 49 % of the active statements
+waiting on `LWLock:BufferContent` -- the queue INSERT in 84 % of its samples, the completion CTE 78 %, the claim CTE
+48 %); indexes rebuilt and the three small tables `VACUUM FULL`ed with the large heaps and the TOAST left as they were
+1,141 req/s PASS with zero BufferContent samples. The sequential scans of the queue and of objects (91k / 64k) are the
+read statements under stale statistics, 4 % of the active samples: victims, not drivers; heap bloat costs the remaining
+quarter. The control-worker periodic job `store-compaction` (`GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS`, default
+300 s) acts on catalog facts -- heap pages per live row, index pages per live row, the least dense index's entries per
+page -- and rebuilds an index past the threshold with `REINDEX INDEX CONCURRENTLY` and a thinned small table with
+`VACUUM (FULL, ANALYZE)`, so no manual `store-maintenance` is needed between a formal round and the next; large heaps
+and the TOAST relation are still reclaimed only by that verb. The r1
 collapses were not bloat alone: across five rounds on one release and one database, the failing rounds' RDS
 `log_lock_waits` showed thousands of lock waits of a second or more per window concentrated in the statement-level
 counter triggers of the processor queue -- hash sharding put every concurrent flush and completion of a cluster on the
@@ -403,6 +418,10 @@ gpu_fault_event_loop_lag_seconds
 gpu_fault_remediation_budget_active_claims
 gpu_fault_remediation_budget_wait_total
 gpu_fault_remediation_budget_waiting_workflows
+gpu_fault_store_hot_table_heap_pages_per_live_row
+gpu_fault_store_hot_table_index_pages_per_live_row
+gpu_fault_store_hot_table_index_min_entries_per_page
+gpu_fault_store_bloat_scan_timestamp_seconds
 ```
 
 Also collect:
@@ -909,7 +928,15 @@ executors/
 ```
 
 Every ingress path in `summary.json` must include classified `transport_retries` counts; the
-executor must include `claim_error_counts` and bounded, redacted `claim_error_samples`. The
+executor must include `claim_error_counts` and bounded, redacted `claim_error_samples`. All three
+runners' `summary.json` must also carry `store_bloat`: `before`/`after` derive, from the `hot_tables`
+section of `postgres-before.json`/`postgres-after.json`, each hot table's live rows, heap pages, index
+pages, `heap_pages_per_live_row`, `index_pages_per_live_row` and `index_min_entries_per_page`;
+`preflight_max_heap_pages_per_live_row`/`preflight_max_index_pages_per_live_row` are the worst values
+the round started on, and `recorded=false` means the in-Pod snapshot failed -- so a round run on a
+bloated store is visible in the acceptance record instead of being reconstructed after a failure. A
+fresh or just-compacted store reads far below 1 on both ratios; a store left uncompacted after the
+previous round's teardown reads in the tens (§3.2). The
 integrated runner must also record `control_plane_pod_lifecycle`, containing at least the total
 restart delta, the Pods that restarted, Pods that appeared/disappeared during the run, counter
 regressions and Pods not Ready at the end. If any item is non-empty or non-zero it cannot count

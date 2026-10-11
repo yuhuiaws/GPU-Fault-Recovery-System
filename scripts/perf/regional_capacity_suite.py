@@ -94,6 +94,7 @@ move_to_aborted = capacity_results.move_to_aborted
 write_status = capacity_results.write_status
 _aurora_window = capacity_database.aurora_window
 _postgres_counters = capacity_database.postgres_counters
+store_bloat_section = capacity_database.store_bloat_section
 _processor_priority_latency = capacity_database.processor_priority_latency
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -927,6 +928,7 @@ def execute_case(
             "release_id": release_id(),
             "window_start_epoch": window_start,
             "window_end_epoch": window_end,
+            "store_bloat": capacity_database.store_bloat_section(pg_before, pg_after),
             "queue_drain_seconds": drain.get("drain_seconds"),
             "queue_drain_sample_interval_seconds": drain.get("sample_interval_seconds"),
             "queue_depth_at_load_stop": drain.get("depth_at_load_stop"),
