@@ -14,7 +14,6 @@ clock before the first action.
 from __future__ import annotations
 
 import logging
-import threading
 import time
 from dataclasses import replace
 from threading import Event
@@ -284,6 +283,9 @@ def test_the_worker_processor_threads_host_the_job_with_the_shipped_default(
         assert isinstance(runner, PeriodicServiceRunner), runner
         assert runner.config.store_compaction_interval == 300.0
         assert "gpu-fault-periodic-services" in {thread.name for thread in threads}
+        # Daemons, so a runner this test could not stop cannot hold the
+        # interpreter open.
+        assert [t.name for t in (diagnostics, *threads) if not t.daemon] == []
         deadline = time.monotonic() + WAIT
         while store.scans == 0 and time.monotonic() < deadline:
             time.sleep(0.01)
@@ -649,15 +651,3 @@ def test_every_bloat_family_aggregates_per_process_like_the_drift_scan() -> None
     ]
     for family in families:
         assert STRATEGIES[family] is Strategy.PER_PROCESS, family
-
-
-def test_the_hosting_threads_are_daemons() -> None:
-    """Guards the hosting test above: every processor thread is a daemon, so
-    a runner the test could not stop cannot hold the interpreter open."""
-
-    non_daemons = [
-        thread.name
-        for thread in threading.enumerate()
-        if thread.name.startswith("gpu-fault-") and not thread.daemon
-    ]
-    assert non_daemons == []
