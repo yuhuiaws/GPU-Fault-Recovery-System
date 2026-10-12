@@ -258,6 +258,15 @@ class World:
             )
             uid = self.uids.get(key)
             return "" if uid is None else "uid=" + uid
+        if arguments[:3] == ["aws", "sagemaker", "describe-cluster"]:
+            # The uninstall's OWNERSHIP RELEASE phase reads every GPU cluster's
+            # instance groups through the uninstall's own runner; the fixture
+            # clusters declare no instance group, so the phase writes nothing.
+            document = self.cloud[arguments[arguments.index("--cluster-name") + 1]][
+                "hp"
+            ]
+            assert document is not None, "a deleted HyperPod cluster is never described"
+            return json.dumps(document)
         if len(arguments) > 1 and arguments[1].endswith(
             "/collect_installed_resource_registry.py"
         ):

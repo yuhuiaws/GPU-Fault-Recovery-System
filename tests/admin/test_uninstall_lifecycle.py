@@ -116,7 +116,10 @@ class Harness(CommandRunner):
     def release_ownership(
         self, request: UninstallRequest, runner: CommandRunner
     ) -> dict[str, Any]:
-        assert runner is self, "the release uses the uninstall's own runner"
+        assert isinstance(runner, CommandRunner), (
+            "the release uses the uninstall's command runner (the harness, or the "
+            "BOOT-032 proof-pause runner that wraps it)"
+        )
         assert not self.no_mutations, (
             "completed uninstall replay must not release the label again"
         )
