@@ -313,7 +313,17 @@ does not trigger a `FULL` rollout; the raw source/template SHA is used only for 
 The regional bootstrap's `bootstrap-cleaned` is a hard recovery boundary: automatic cleanup scales the CPU/GPU
 Deployments to 0 and clears the completed-cluster progress. When the same deploy command is run again, it must not reuse the old
 `resume_phase` or treat a 0-replica Deployment as CPU-ready; it must redeploy the CPU control plane,
-then continue from the NLB, DNS/TLS and GPU data-plane gates.
+then continue from the NLB, DNS/TLS and GPU data-plane gates. The boundary holds across later attempts too: each attempt's first
+checkpoint resets `resume_phase` to `bootstrap-started`, `resume_phase` counts only in the `bootstrap-failed` state its own failure
+save wrote, and only `bootstrap-started`, `bootstrap-cpu-ready`, `bootstrap-endpoint-ready`, `bootstrap-data-plane-progress` and
+`bootstrap-failed` lend completed clusters or a CPU checkpoint (a cleanup phase or `complete` never does), so an attempt that fails or
+is killed before its own CPU apply never resumes from a checkpoint an attempt before cleanup recorded. The live readiness check that
+lets an attempt with no CPU checkpoint skip the schema ensure and the CPU apply needs `bootstrap_cpu_release_id` naming this
+candidate (written once this candidate's own attempt has ensured its schema and starts its CPU apply; cleanup keeps it with the
+schema, a takeover drops it), and it must prove the live control plane is this candidate's and up: the release metadata pins match,
+every role Deployment runs exactly the replicas the site's admin config demands (the ingress and the control worker never 0) with
+this candidate's admin config, wheel, runtime image and role, notification and Runtime Profile digests, and every CPU Deployment has
+finished rolling out. Any doubt is "not current" and costs one re-apply.
 
 Another candidate's `bootstrap-*` state (including `bootstrap-cleaned`) that no longer carries an Aurora prerequisite repair journal
 is not the new candidate's resume plan: M-23 pins the persisted `approved_manifest_sha256` only for an unfinished bootstrap of the
@@ -325,6 +335,18 @@ phase and cleanup steps (the new candidate finishes the cleanup the old attempt 
 `bootstrap-started`. The database origin proof stays, and the replaced state's identity goes into the journal and, after adoption, into
 `bootstrap_prerequisite_predecessor`. Until the journal is adopted, a taken-over state lends no CPU checkpoint or completed clusters
 and gets no live readiness check of a 0-replica CPU.
+
+A `complete` state with no previous release whose control plane is gone (no ingress) is taken over the same way by any candidate,
+its own included: its plan finished, so M-23 pins nothing and the state lends nothing. A journal that a deploy preflight recorded
+over such a `complete` state without taking it over is retired only by its own candidate: a deploy of that candidate re-records it
+as a takeover journal that keeps its refresher snapshot, and that candidate's rollback restores the refresher. Another candidate is
+refused with an error naming both exits. A takeover journal (one with `predecessor`) that its candidate never adopted is taken over
+in turn by the next candidate: the successor keeps the projection the takeover wrote, its owed cleanup phase and steps, the database
+origin and safety proof and the original `predecessor`, and any other progress (a CPU checkpoint, a `resume_phase` other than
+`bootstrap-started`, changed completed clusters) is still refused. The kept database origin proof binds the database identity,
+schema version included, so a candidate on another schema version is refused before adoption with
+`bootstrap database origin proof is missing or unbound`; its exits are a candidate on the recorded schema version, or uninstall and
+reinstall.
 
 Regional upgrade writes `preflight`, artifact upload, schema, registry, CPU, data plane and verify
 progress into the release state. When the high-level deploy sees the same uncommitted release in `failed` or at any persisted

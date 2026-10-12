@@ -14,7 +14,12 @@ that state over when it records its own journal (``foreign_bootstrap_baseline``)
 the journal hashes its baseline and every later bootstrap checkpoint stamps
 the new candidate's identity, so a baseline still naming the old candidate
 would drift before adoption, and the old candidate's approved digest is never
-the new candidate's plan (M-23).
+the new candidate's plan (M-23). A ``complete`` state with no previous release
+whose control plane is gone is taken over the same way, by any candidate.
+
+A takeover journal (``predecessor``) that was never adopted is handed off in
+turn: its baseline is the projection the takeover wrote, so it keeps the
+cleanup and the database origin and safety proof of the state it replaced.
 """
 
 from __future__ import annotations
@@ -38,6 +43,7 @@ from gpu_fault_release.regional_release_prerequisite_baseline import (
     _valid_bootstrap_progress,
     validated_prerequisite_baseline,
 )
+from gpu_fault_release.regional_release_progress import BOOTSTRAP_CPU_KEY
 from gpu_fault_release.regional_release_state import _write_state
 
 if TYPE_CHECKING:
@@ -63,6 +69,9 @@ _CLEANUP_STEPS = {
     "gpu-scaled-down",
     "cpu-scaled-down",
 }
+# Where an unadopted takeover journal's state can be: the projection itself, or
+# its candidate's bootstrap stopped before adoption and maybe cleaned up.
+_TAKEOVER_PHASES = _OWED_CLEANUP_PHASES | {"bootstrap-started"}
 _ADOPTION_FIELDS = {
     "bootstrap_store_safety",
     "bootstrap_database_origin",
@@ -70,6 +79,19 @@ _ADOPTION_FIELDS = {
     "component_progress",
     "schema_change_acceptance",
 }
+# What a projected ``bootstrap-started`` checkpoint never carries: the fields a
+# finished or committed release wrote, and the CPU marker of the attempt that
+# applied the replaced state's control plane.
+_PROJECTION_DROPPED_FIELDS = (
+    BOOTSTRAP_CPU_KEY,
+    "adopted_live_runtime_image",
+    "release_lifecycle",
+    "commit_cleanup_completed",
+    "completed_phases",
+    "release_diff",
+    "execution_plan",
+    "cluster_attempts",
+)
 _BINDING_FIELDS = {
     "release_id",
     "manifest_sha256",
@@ -114,7 +136,23 @@ def validate_bootstrap_repair_handoff(
     ):
         raise ReleaseError("bootstrap prerequisite handoff binding is invalid")
     baseline = validated_prerequisite_baseline(state, record)
-    if (
+    # A takeover journal's baseline is the projection the takeover wrote: the
+    # cleanup the replaced state owed and that state's database origin and
+    # safety proof belong to it, and its own candidate never got past them
+    # without adopting the journal. The successor keeps them the same way.
+    taken_over = isinstance(record.get("predecessor"), dict)
+    if taken_over:
+        if (
+            state.get("phase") not in _TAKEOVER_PHASES
+            or baseline.get("phase") not in _TAKEOVER_PHASES
+            or not _valid_bootstrap_progress(baseline)
+            or state.get("resume_phase") != "bootstrap-started"
+            or release.config.retained_database_handoff is not None
+        ):
+            raise ReleaseError(
+                "bootstrap prerequisite takeover handoff progress is invalid"
+            )
+    elif (
         state.get("phase") != "bootstrap-cleaned"
         or baseline.get("phase") not in {"bootstrap-started", "bootstrap-cleaned"}
         or state.get("bootstrap_cleanup_completed_steps") != sorted(_CLEANUP_STEPS)
@@ -135,7 +173,7 @@ def validate_bootstrap_repair_handoff(
                 and value["registry_staged"] is not False
             )
             or value.get("release_lifecycle") is not None
-            or _ADOPTION_FIELDS.intersection(value)
+            or (not taken_over and _ADOPTION_FIELDS.intersection(value))
         ):
             raise ReleaseError(
                 "bootstrap prerequisite repair was adopted or progressed"
@@ -210,7 +248,8 @@ def _project_bootstrap_state(
     projected.runner = copy.copy(release.runner)
     projected.runner.dry_run = True
     projected.state = copy.deepcopy(state)
-    projected.state.pop(AURORA_PREREQUISITE_REPAIR_KEY, None)
+    for key in (AURORA_PREREQUISITE_REPAIR_KEY, *_PROJECTION_DROPPED_FIELDS):
+        projected.state.pop(key, None)
     # Reuse the actual identity serializer, not a second list of release fields.
     # previous=None keeps this dry-run projection independent of snapshot I/O.
     _write_state(
@@ -241,13 +280,15 @@ def candidate_bootstrap_baseline(
 def foreign_bootstrap_baseline(
     release: RegionalRelease, state: dict[str, Any]
 ) -> dict[str, Any]:
-    """Take over another candidate's journal-less bootstrap state.
+    """Take over a journal-less bootstrap state that is not this plan's.
 
-    The result is what this candidate's own first checkpoint would write: its
-    identity and approved digest, no completed clusters and a fresh resume
-    phase. Cleanup the old attempt still owes keeps its phase and steps, and
-    the database origin and safety proof stay, so the empty-database proof the
-    first bootstrap recorded still authorizes this one.
+    That is another candidate's bootstrap state, or a ``complete`` state with
+    no previous release whose control plane is gone (any candidate's: its plan
+    finished). The result is what this candidate's own first checkpoint would
+    write: its identity and approved digest, no completed clusters and a fresh
+    resume phase. Cleanup the old attempt still owes keeps its phase and steps,
+    and the database origin and safety proof stay, so the empty-database proof
+    the first bootstrap recorded still authorizes this one.
     """
     owed = state.get("phase") in _OWED_CLEANUP_PHASES
     projected = _project_bootstrap_state(

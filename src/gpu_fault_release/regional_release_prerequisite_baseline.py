@@ -116,8 +116,15 @@ def _legacy_initial_baseline(
 
 
 def validated_prerequisite_baseline(
-    state: dict[str, Any], record: dict[str, Any]
+    state: dict[str, Any], record: dict[str, Any], *, lost_bootstrap: bool = False
 ) -> dict[str, Any]:
+    """The state the journal was recorded over, proven by its full hash.
+
+    ``lost_bootstrap`` admits one more bootstrap shape: this candidate's journal
+    recorded over its own ``complete`` state with no previous release, which a
+    preflight wrote before bootstrap took such a state over. Only retiring that
+    journal may ask for it; it proves nothing progressed since.
+    """
     try:
         if not isinstance(record["binding"], dict):
             raise ReleaseError("prerequisite baseline binding is invalid")
@@ -140,7 +147,18 @@ def validated_prerequisite_baseline(
         fields = {*SNAPSHOT_FIELDS, *(BOOTSTRAP_PROGRESS_FIELDS if bootstrap else ())}
         _restore_fields(baseline, record["snapshot_representation"], fields)
         if bootstrap:
-            if not _valid_bootstrap_progress(state):
+            if state.get("phase") == "complete" and baseline.get("phase") == "complete":
+                if not lost_bootstrap:
+                    raise ReleaseError(
+                        "prerequisite bootstrap journal is over a complete release; "
+                        "a deploy of its candidate "
+                        f"{record['binding'].get('release_id')} retires it when the "
+                        "control plane is gone, and that candidate's rollback "
+                        "restores its refresher"
+                    )
+                if "previous" not in state or state["previous"] is not None:
+                    raise ReleaseError("prerequisite bootstrap progress is invalid")
+            elif not _valid_bootstrap_progress(state):
                 raise ReleaseError("prerequisite bootstrap progress is invalid")
             original_clusters = baseline.get("completed_cluster_ids", [])
             if state.get("completed_cluster_ids", []) not in (original_clusters, []):

@@ -211,7 +211,10 @@ from gpu_fault_release.regional_release_prerequisite_repair import (
 )
 from gpu_fault_release.regional_release_probes import command_label
 from gpu_fault_release.regional_release_profile_model import target_agent_config_digest
-from gpu_fault_release.regional_release_progress import bootstrap_completion_state
+from gpu_fault_release.regional_release_progress import (
+    BOOTSTRAP_CPU_KEY,
+    bootstrap_completion_state,
+)
 from gpu_fault_release.regional_release_registry import (
     commit_registry_update,
     desired_registry,
@@ -1132,6 +1135,7 @@ class RegionalRelease(RegistryDrainContext):
         if not cpu_checkpoint and check_live_cpu:
             cpu_checkpoint = self._bootstrap_cpu_is_current()
         checkpoint = "bootstrap-started"
+        cpu_owned = False
         self._save_state(
             checkpoint,
             previous=None,
@@ -1141,6 +1145,8 @@ class RegionalRelease(RegistryDrainContext):
             # attempt can create new Jobs and workloads that need fresh cleanup.
             bootstrap_cleanup_completed_steps=[],
             bootstrap_cleanup_failure=None,
+            # This attempt starts from here; a failure records its own point.
+            resume_phase=checkpoint,
         )
         try:
             self._require_cpu_secrets(include_registry=False)
@@ -1153,6 +1159,9 @@ class RegionalRelease(RegistryDrainContext):
             self._prepare_bootstrap_workflows()
             if not cpu_checkpoint:
                 self._ensure_schema()
+                # Only now may a resume let the live CPU check stand in for
+                # this candidate's schema ensure and CPU apply.
+                cpu_owned = True
                 self._apply_cpu(finalize=True)
             ensure_runtime_profile(self)
             checkpoint = "bootstrap-cpu-ready"
@@ -1160,6 +1169,7 @@ class RegionalRelease(RegistryDrainContext):
                 checkpoint,
                 previous=None,
                 completed_cluster_ids=sorted(completed_cluster_ids),
+                **{BOOTSTRAP_CPU_KEY: self.release_id},
             )
             self._wait_nlb()
             checkpoint = "bootstrap-endpoint-ready"
@@ -1185,6 +1195,7 @@ class RegionalRelease(RegistryDrainContext):
                 previous=None,
                 resume_phase=checkpoint,
                 completed_cluster_ids=sorted(completed_cluster_ids),
+                **({BOOTSTRAP_CPU_KEY: self.release_id} if cpu_owned else {}),
             )
             if self.config.auto_rollback:
                 self._cleanup_bootstrap()

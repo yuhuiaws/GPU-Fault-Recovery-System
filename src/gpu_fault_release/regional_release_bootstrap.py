@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING, Any
 from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_release_diff import AURORA_PREREQUISITE_REPAIR_KEY
+from gpu_fault_release.regional_release_progress import BOOTSTRAP_CPU_KEY
 from gpu_fault_release.regional_release_rendering import DATAPLANE_ADOT_DEPLOYMENT
 
 if TYPE_CHECKING:
@@ -24,6 +25,24 @@ CLEANUP_PHASES = frozenset(
         "bootstrap-cleaned",
     }
 )
+# The phases one bootstrap attempt writes itself. Cleanup and ``complete`` are
+# not among them: neither proves a CPU this attempt could reuse.
+_ATTEMPT_PHASES = frozenset(
+    {
+        "bootstrap-started",
+        "bootstrap-cpu-ready",
+        "bootstrap-endpoint-ready",
+        "bootstrap-data-plane-progress",
+        "bootstrap-failed",
+    }
+)
+_CPU_CHECKPOINTS = frozenset(
+    {
+        "bootstrap-cpu-ready",
+        "bootstrap-endpoint-ready",
+        "bootstrap-data-plane-progress",
+    }
+)
 
 
 def bootstrap_resume_context(
@@ -32,11 +51,21 @@ def bootstrap_resume_context(
 ) -> tuple[set[str], bool, bool]:
     """The completed clusters and CPU checkpoint an earlier attempt may lend.
 
-    Only this candidate's own attempt counts, and never across cleanup: its
-    0-replica Deployments would pass the live CPU check. A repair journal
-    that took over another candidate's bootstrap (``supersedes`` from a
-    handoff, ``predecessor`` from a takeover) already names this candidate,
-    but until adoption removes it nothing in the state is this candidate's.
+    Only this candidate's own attempt counts, and never across cleanup or a
+    ``complete`` state: cleanup leaves 0-replica Deployments, and a
+    ``complete`` state bootstrap re-enters has lost its control plane. A
+    repair journal that took over another candidate's bootstrap
+    (``supersedes`` from a handoff, ``predecessor`` from a takeover) already
+    names this candidate, but until adoption removes it nothing in the state
+    is this candidate's.
+
+    The phase is the checkpoint an attempt reached; ``resume_phase`` counts
+    only in ``bootstrap-failed``, where the failure save recorded it, so a
+    killed attempt never resumes from an older attempt's checkpoint. The live
+    CPU check may stand in for the schema ensure and CPU apply only after this
+    candidate's own attempt ensured its schema here (``BOOTSTRAP_CPU_KEY``),
+    and it refuses the 0-replica Deployments cleanup leaves; anything else
+    re-applies.
     """
     journal = state.get(AURORA_PREREQUISITE_REPAIR_KEY)
     taken_over = isinstance(journal, dict) and not {
@@ -44,26 +73,27 @@ def bootstrap_resume_context(
         "predecessor",
     }.isdisjoint(journal)
     loaded_phase = str(state.get("phase") or "")
-    resume_phase = str(state.get("resume_phase") or loaded_phase)
+    resume_phase = (
+        str(state.get("resume_phase") or loaded_phase)
+        if loaded_phase == "bootstrap-failed"
+        else loaded_phase
+    )
     reusable = (
         state.get("release_id") in {None, release_id}
         and not taken_over
-        and loaded_phase not in CLEANUP_PHASES
+        and loaded_phase in _ATTEMPT_PHASES
     )
     completed_cluster_ids = (
         {str(value) for value in state.get("completed_cluster_ids", []) if value}
         if reusable
         else set()
     )
-    cpu_checkpoint = reusable and resume_phase in {
-        "bootstrap-cpu-ready",
-        "bootstrap-endpoint-ready",
-        "bootstrap-data-plane-progress",
-    }
-    check_live_cpu = reusable and resume_phase in {
-        "bootstrap-started",
-        "bootstrap-failed",
-    }
+    cpu_checkpoint = reusable and resume_phase in _CPU_CHECKPOINTS
+    check_live_cpu = (
+        reusable
+        and resume_phase in {"bootstrap-started", "bootstrap-failed"}
+        and state.get(BOOTSTRAP_CPU_KEY) == release_id
+    )
     return completed_cluster_ids, cpu_checkpoint, check_live_cpu
 
 

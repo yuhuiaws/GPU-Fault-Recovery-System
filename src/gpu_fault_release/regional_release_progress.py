@@ -33,6 +33,11 @@ BOOTSTRAP_PHASES = frozenset(
         "bootstrap-cleaned",
     }
 )
+# The release id of the candidate whose own bootstrap attempt ensured its
+# schema and began its CPU apply on this site. Bootstrap cleanup keeps it, as
+# it keeps the schema; a takeover drops it, because another candidate's schema
+# and CPU are never this candidate's.
+BOOTSTRAP_CPU_KEY = "bootstrap_cpu_release_id"
 
 
 def take_phase_checkpoint(

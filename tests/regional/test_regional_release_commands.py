@@ -29,6 +29,7 @@ from gpu_fault_release import (
     regional_release_rollback_context as ROLLBACK_CONTEXT_MODULE,
 )
 from gpu_fault_release import regional_release_state as STATE_MODULE
+from gpu_fault_release.regional_notifications import notification_digest
 from tests.regional._release_orchestrator_support import (
     CPU_EKS_ARN,
     GPU_EKS_ARN,
@@ -540,9 +541,14 @@ def test_saved_state_stickily_records_the_approved_manifest_digest(
     assert release.rendered_manifest_digest != "original-plan-digest"
 
 
-def test_bootstrap_live_checkpoint_recognizes_current_cpu_release(
-    tmp_path: Path, monkeypatch
-) -> None:
+def _live_cpu_release(tmp_path: Path, monkeypatch) -> tuple[object, dict]:
+    """A release whose live control plane is this candidate's, rolled out.
+
+    Each role Deployment carries what this candidate's CPU apply stamps -- its
+    admin config, wheel, runtime image and role, notification and Runtime
+    Profile digests -- at the replicas this site's admin config demands.
+    """
+
     config = MODULE.ReleaseConfig.load(config_file(tmp_path))
     release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=True))
     monkeypatch.setattr(
@@ -561,58 +567,143 @@ def test_bootstrap_live_checkpoint_recognizes_current_cpu_release(
             "required-runtime-profile-version": config.runtime_profile_version,
         },
     )
-    monkeypatch.setattr(
-        release, "_deployment_wheel", lambda _kubectl, _deployment: release.wheel_cm
-    )
-    monkeypatch.setattr(
-        release,
-        "_get_json",
-        lambda _arguments: {
-            "metadata": {"generation": 7},
-            "spec": {"replicas": 3},
+    capacity = config.admin_config.capacity
+    roles = {
+        "gpu-fault-api-ha": ("ingress", 3),
+        "gpu-fault-control-worker": ("worker", capacity.control_worker_replicas),
+        "gpu-fault-telemetry-spool-worker": (
+            "spool",
+            capacity.telemetry_spool.replicas,
+        ),
+    }
+    documents: dict = {}
+    for name in ADMIN_COMMANDS_MODULE.inventory.CPU_DEPLOYMENTS:
+        role, replicas = roles.get(name, (None, 1))
+        stamped: dict = {}
+        template: dict = {
+            "metadata": {},
+            "spec": {"containers": [{"name": "collector", "image": "adot"}]},
+        }
+        if role is not None:
+            stamped = {"gpu-fault.io/admin-config-sha256": release.admin_config_digest}
+            template = {
+                "metadata": {
+                    "annotations": {
+                        "gpu-fault.io/artifact-sha256": release.wheel_sha,
+                        "gpu-fault.io/runtime-image": release.runtime_image,
+                        "gpu-fault.io/role-config-sha256": (
+                            release.admin_config_role_digests[role]
+                        ),
+                        "gpu-fault.io/notification-config-sha256": (
+                            notification_digest(config.notifications)
+                        ),
+                        "gpu-fault.io/runtime-profile-version": (
+                            config.runtime_profile_version
+                        ),
+                    }
+                },
+                "spec": {
+                    "initContainers": [
+                        {"name": "install", "image": release.runtime_image}
+                    ],
+                    "containers": [{"name": "server", "image": release.runtime_image}],
+                    "volumes": [
+                        {"name": "artifact", "configMap": {"name": release.wheel_cm}}
+                    ],
+                },
+            }
+        documents[name] = {
+            "metadata": {"name": name, "generation": 7, "annotations": stamped},
+            "spec": {"replicas": replicas, "template": template},
             "status": {
                 "observedGeneration": 7,
-                "readyReplicas": 3,
-                "updatedReplicas": 3,
-                "availableReplicas": 3,
+                "replicas": replicas,
+                "readyReplicas": replicas,
+                "updatedReplicas": replicas,
+                "availableReplicas": replicas,
             },
-        },
+        }
+    # Every Deployment read names the Deployment last.
+    monkeypatch.setattr(
+        release, "_get_json", lambda arguments: documents[arguments[-1]]
     )
+    return release, documents
+
+
+def test_bootstrap_live_checkpoint_recognizes_current_cpu_release(
+    tmp_path: Path, monkeypatch
+) -> None:
+    release, _documents = _live_cpu_release(tmp_path, monkeypatch)
 
     assert release._bootstrap_cpu_is_current() is True
 
 
-def test_bootstrap_live_checkpoint_rejects_partial_cpu_rollout(
-    tmp_path: Path, monkeypatch
+@pytest.mark.parametrize(
+    "fault",
+    [
+        "partial",
+        "cleaned",
+        "demand",
+        "status-replicas",
+        "image",
+        "init-image",
+        "worker-wheel",
+        "role-config",
+        "admin-config",
+    ],
+)
+def test_bootstrap_live_checkpoint_rejects_cpu_release_it_cannot_prove(
+    tmp_path: Path, monkeypatch, fault: str
 ) -> None:
-    config = MODULE.ReleaseConfig.load(config_file(tmp_path))
-    release = MODULE.RegionalRelease(config, MODULE.Runner(dry_run=True))
-    monkeypatch.setattr(
-        release,
-        "_config_map_data",
-        lambda _name: {
-            "required-agent-artifact-sha256": release.wheel_sha,
-            "required-agent-config-digest": config.agent_config_digest,
-            "required-runtime-profile-version": config.runtime_profile_version,
-        },
-    )
-    monkeypatch.setattr(
-        release, "_deployment_wheel", lambda _kubectl, _deployment: release.wheel_cm
-    )
-    monkeypatch.setattr(
-        release,
-        "_get_json",
-        lambda _arguments: {
-            "metadata": {"generation": 7},
-            "spec": {"replicas": 3},
-            "status": {
-                "observedGeneration": 7,
-                "readyReplicas": 2,
-                "updatedReplicas": 3,
-                "availableReplicas": 2,
-            },
-        },
-    )
+    # A bootstrap attempt with no CPU checkpoint of its own skips its schema
+    # ensure and CPU apply on this proof alone, so whatever it cannot prove is
+    # this candidate's, applied at this site's demand and rolled out is "not
+    # current" -- above all the 0-replica control plane bootstrap cleanup
+    # leaves, which reads as a finished rollout (0 of 0 ready).
+    release, documents = _live_cpu_release(tmp_path, monkeypatch)
+    ingress = documents["gpu-fault-api-ha"]
+    worker = documents["gpu-fault-control-worker"]
+    spool = documents["gpu-fault-telemetry-spool-worker"]
+    if fault == "partial":
+        ingress["status"].update(readyReplicas=2, availableReplicas=2)
+    elif fault == "cleaned":
+        for document in documents.values():
+            document["spec"]["replicas"] = 0
+            document["status"].update(
+                replicas=0, readyReplicas=0, updatedReplicas=0, availableReplicas=0
+            )
+    elif fault == "demand":
+        replicas = spool["spec"]["replicas"] + 1
+        spool["spec"]["replicas"] = replicas
+        spool["status"].update(
+            replicas=replicas,
+            readyReplicas=replicas,
+            updatedReplicas=replicas,
+            availableReplicas=replicas,
+        )
+    elif fault == "status-replicas":
+        # An old ReplicaSet's Pod is still there: the roll has not finished.
+        ingress["status"]["replicas"] += 1
+    elif fault == "image":
+        # Another candidate's control plane on the same wheel.
+        other = "registry.example/gpu-fault-runtime@sha256:" + "9" * 64
+        ingress["spec"]["template"]["metadata"]["annotations"][
+            "gpu-fault.io/runtime-image"
+        ] = other
+        for container in ingress["spec"]["template"]["spec"]["containers"]:
+            container["image"] = other
+    elif fault == "init-image":
+        worker["spec"]["template"]["spec"]["initContainers"][0]["image"] = "other"
+    elif fault == "worker-wheel":
+        worker["spec"]["template"]["spec"]["volumes"][0]["configMap"]["name"] = (
+            "other-wheel"
+        )
+    elif fault == "role-config":
+        worker["spec"]["template"]["metadata"]["annotations"][
+            "gpu-fault.io/role-config-sha256"
+        ] = "f" * 64
+    elif fault == "admin-config":
+        spool["metadata"]["annotations"]["gpu-fault.io/admin-config-sha256"] = "f" * 64
 
     assert release._bootstrap_cpu_is_current() is False
 

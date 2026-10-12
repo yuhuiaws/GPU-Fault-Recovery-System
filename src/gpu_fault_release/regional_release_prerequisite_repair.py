@@ -79,11 +79,15 @@ def has_prerequisite_repair(state: dict[str, Any]) -> bool:
     return REPAIR_KEY in state
 
 
-def _baseline(state: dict[str, Any], record: dict[str, Any]) -> dict[str, Any]:
-    return validated_prerequisite_baseline(state, record)
+def _baseline(
+    state: dict[str, Any], record: dict[str, Any], *, lost_bootstrap: bool = False
+) -> dict[str, Any]:
+    return validated_prerequisite_baseline(state, record, lost_bootstrap=lost_bootstrap)
 
 
-def _validate_record(release: RegionalRelease, state: dict[str, Any]) -> dict[str, Any]:
+def _validate_record(
+    release: RegionalRelease, state: dict[str, Any], *, lost_bootstrap: bool = False
+) -> dict[str, Any]:
     record = state.get(REPAIR_KEY)
     if not isinstance(record, dict) or record.get("schema_version") != 1:
         raise ReleaseError("Aurora prerequisite repair context is invalid")
@@ -105,7 +109,7 @@ def _validate_record(release: RegionalRelease, state: dict[str, Any]) -> dict[st
             "Aurora prerequisite repair candidate or snapshot binding differs"
         )
     try:
-        baseline = _baseline(state, record)
+        baseline = _baseline(state, record, lost_bootstrap=lost_bootstrap)
     except KeyError as exc:
         raise ReleaseError("Aurora prerequisite repair baseline is incomplete") from exc
     if canonical_sha256(baseline) != record.get("baseline_sha256"):
@@ -233,7 +237,14 @@ def _advance_bootstrap_repair(
     if database_identity(release) != identity:
         raise ReleaseError("bootstrap prerequisite identity changed during restoration")
     original_state = release.state
-    baseline = candidate_bootstrap_baseline(release, original_state)
+    # A takeover journal hands on the state its takeover projected, owed cleanup
+    # and database origin included, and the audit of the state it replaced.
+    taken_over = record.get("predecessor")
+    baseline = (
+        foreign_bootstrap_baseline(release, original_state)
+        if isinstance(taken_over, dict)
+        else candidate_bootstrap_baseline(release, original_state)
+    )
     successor = _new_record(
         release,
         baseline=baseline,
@@ -243,8 +254,66 @@ def _advance_bootstrap_repair(
         commit_live=False,
     )
     successor["supersedes"] = bootstrap_handoff_audit(record)
+    if isinstance(taken_over, dict):
+        successor["predecessor"] = copy.deepcopy(taken_over)
     # One checkpoint replaces the journal and all candidate identity fields.
     # Before it, a retry still owns the original snapshot and repeats restoration.
+    release.state = {**baseline, REPAIR_KEY: successor}
+    try:
+        _persist(release, successor)
+    except BaseException:
+        release.state = original_state
+        raise
+    return successor
+
+
+def lost_bootstrap_journal(state: dict[str, Any]) -> bool:
+    """This candidate's journal over a ``complete`` state bootstrap re-enters."""
+    record = state.get(REPAIR_KEY)
+    binding = record.get("binding") if isinstance(record, dict) else None
+    return (
+        isinstance(binding, dict)
+        and binding.get("bootstrap") is True
+        and state.get("phase") == "complete"
+    )
+
+
+def _advance_lost_bootstrap_repair(
+    release: RegionalRelease, *, identity: dict[str, Any]
+) -> dict[str, Any]:
+    """Re-record this candidate's journal over its lost ``complete`` state.
+
+    Before a bootstrap took such a state over, the deploy preflight journaled
+    the ``complete`` state as it found it and the bootstrap entry refused that
+    baseline, and so did every later preflight and rollback. The journal is
+    still this candidate's, its full hash still proves the state it was
+    recorded over, and its snapshot still holds the refresher this candidate
+    first repaired over: the successor keeps that snapshot and takes the state
+    over as the preflight does now. Nothing is restored, because the repaired
+    refresher is this candidate's own.
+    """
+    original_state = release.state
+    record = _validate_record(release, original_state, lost_bootstrap=True)
+    if record["binding"]["database"] != identity:
+        raise ReleaseError("Aurora prerequisite database identity drifted")
+    replaced = validated_prerequisite_baseline(
+        original_state, record, lost_bootstrap=True
+    )
+    _cleanup_jobs(release, record)
+    ensure_supervision_safe()
+    baseline = foreign_bootstrap_baseline(release, original_state)
+    successor = _new_record(
+        release,
+        baseline=baseline,
+        snapshot=record["previous_refresher"],
+        identity=identity,
+        bootstrap=True,
+        commit_live=False,
+    )
+    successor["supersedes"] = bootstrap_handoff_audit(record)
+    successor["predecessor"] = predecessor_audit(replaced)
+    # One checkpoint replaces the journal and takes the state over; before it,
+    # a retry finds the original journal and repeats this.
     release.state = {**baseline, REPAIR_KEY: successor}
     try:
         _persist(release, successor)
@@ -407,10 +476,12 @@ def prepare_prerequisite_repair(
             )
     # M-23: only this candidate's own unfinished bootstrap or transaction pins
     # the digest it was planned against. Another candidate's failed or cleaned
-    # bootstrap recorded the tree that candidate rendered, never this plan.
+    # bootstrap recorded the tree that candidate rendered, never this plan, and
+    # the plan of a ``complete`` state bootstrap re-enters finished.
     resumed_plan = release.state.get("release_id") == release.release_id and (
-        (bootstrap and handoff is None)
-        or release.state.get("transaction_committed") is False
+        (handoff is None and release.state.get("phase") != "complete")
+        if bootstrap
+        else release.state.get("transaction_committed") is False
     )
     release.pin_approved_manifest_plan(
         release.approved_manifest_digest
@@ -424,6 +495,8 @@ def prepare_prerequisite_repair(
         record = _advance_bootstrap_repair(release, handoff, identity=identity)
     elif orphan is not None:
         record = _advance_upgrade_repair(release, orphan, identity=identity)
+    elif bootstrap and lost_bootstrap_journal(release.state):
+        record = _advance_lost_bootstrap_repair(release, identity=identity)
     elif has_prerequisite_repair(release.state):
         # This candidate's own journal from an earlier attempt. The deploy
         # driver pinned the state digest with that journal in it; the re-proof
@@ -473,7 +546,13 @@ def prepare_prerequisite_repair(
             )
         original_state = release.state
         baseline = original_state
-        if bootstrap and original_state.get("release_id") != release.release_id:
+        if bootstrap and (
+            original_state.get("release_id") != release.release_id
+            or original_state.get("phase") == "complete"
+        ):
+            # Not this plan's state: another candidate's bootstrap, or a
+            # ``complete`` state whose control plane is gone (the deploy only
+            # bootstraps over one with no previous release and no ingress).
             baseline = foreign_bootstrap_baseline(release, original_state)
         record = _new_record(
             release,
@@ -484,8 +563,8 @@ def prepare_prerequisite_repair(
             commit_live=commit_live,
         )
         if baseline is not original_state:
-            # Another candidate's adopted bootstrap: one checkpoint takes the
-            # state over with the journal, as the handoff successor does.
+            # A state this plan does not own: one checkpoint takes it over with
+            # the journal, as the handoff successor does.
             record["predecessor"] = predecessor_audit(original_state)
             release.state = {**baseline, REPAIR_KEY: record}
         try:
@@ -538,7 +617,9 @@ def restore_prerequisite_repair(release: RegionalRelease) -> None:
         )
         _retire_orphaned_repair(release, record, identity=identity)
     else:
-        record = _validate_record(release, release.state)
+        # Also this candidate's journal over a ``complete`` state an older
+        # preflight recorded: restoring its refresher is that journal's exit.
+        record = _validate_record(release, release.state, lost_bootstrap=True)
         _cleanup_jobs(release, record)
         restore_aurora_refresh_snapshot(release, record["previous_refresher"])
     release.state.pop(REPAIR_KEY)
@@ -556,7 +637,7 @@ def prepare_bootstrap_prerequisite_entry(release: RegionalRelease) -> None:
         isinstance(predecessor, str)
         and predecessor
         and predecessor != release.release_id
-    ):
+    ) or lost_bootstrap_journal(release.state):
         diff = diff_from_changed({"aurora_refresh_manifests"})
         prepare_prerequisite_repair(
             release, diff=diff, plan=build_execution_plan(diff), bootstrap=True

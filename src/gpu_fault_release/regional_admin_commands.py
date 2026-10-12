@@ -10,6 +10,7 @@ from gpu_fault_release import repository_root
 from gpu_fault_release.regional_admin_checks import (
     CheckValue,
     _check,
+    _control_plane_pod_demand,
     _report,
     # The same tolerant wrapper the checks use: a release object that predates
     # the read cache, or a test double standing in for one, has no
@@ -36,6 +37,7 @@ from gpu_fault_release.regional_release_diff import (
     diff_from_changed,
 )
 from gpu_fault_release.regional_release_narration import narrate_step
+from gpu_fault_release.regional_notifications import notification_digest
 from gpu_fault_release.regional_release_orchestration import (
     SUPERSEDABLE_PHASES,
     _validate_upgrade_transaction,
@@ -524,7 +526,67 @@ def apply_release_metadata_rbac(release: Any) -> None:
     )
 
 
+# The role-config digest each role-split Deployment's Pod template carries.
+# ADOT is not here: the observability installer, not the CPU apply, owns it.
+_CPU_ROLE_CONFIG_KEYS = {
+    "gpu-fault-api-ha": "ingress",
+    "gpu-fault-control-worker": "worker",
+    "gpu-fault-telemetry-spool-worker": "spool",
+}
+
+
+def _bootstrap_role_is_current(
+    release: Any, value: dict[str, Any], role: str, replicas: int
+) -> bool:
+    """One role Deployment carries this candidate's template at the demand."""
+
+    stamped = (value.get("metadata") or {}).get("annotations") or {}
+    spec = value.get("spec") or {}
+    template = spec.get("template") or {}
+    annotations = (template.get("metadata") or {}).get("annotations") or {}
+    pod = template.get("spec") or {}
+    containers = [*(pod.get("initContainers") or []), *(pod.get("containers") or [])]
+    expected = {
+        "gpu-fault.io/artifact-sha256": release.wheel_sha,
+        "gpu-fault.io/runtime-image": release.runtime_image,
+        "gpu-fault.io/role-config-sha256": release.admin_config_role_digests[role],
+        "gpu-fault.io/notification-config-sha256": notification_digest(
+            release.config.notifications
+        ),
+        "gpu-fault.io/runtime-profile-version": (
+            release.config.runtime_profile_version
+        ),
+    }
+    return (
+        stamped.get("gpu-fault.io/admin-config-sha256") == release.admin_config_digest
+        and type(spec.get("replicas")) is int
+        and spec["replicas"] == replicas
+        and bool(containers)
+        and all(item.get("image") == release.runtime_image for item in containers)
+        and [
+            (volume.get("configMap") or {}).get("name")
+            for volume in pod.get("volumes") or []
+            if volume.get("name") == "artifact"
+        ]
+        == [release.wheel_cm]
+        and all(annotations.get(key) == digest for key, digest in expected.items())
+    )
+
+
 def bootstrap_cpu_is_current(release: Any) -> bool:
+    """Whether a bootstrap attempt may skip the schema ensure and CPU apply.
+
+    Only for an attempt with no CPU checkpoint of its own, so it proves the
+    live control plane is this candidate's, applied and up, and fails closed:
+    the release metadata pins are this candidate's, every role Deployment runs
+    exactly the replicas this site demands -- the ingress and the control
+    worker never 0, which is what bootstrap cleanup leaves behind -- with this
+    candidate's wheel, runtime image and role, notification and Runtime Profile
+    digests in its Pod template, and every CPU Deployment finished rolling out.
+    Any doubt (a read, shape or value error) is "not current" and costs one
+    re-apply.
+    """
+
     try:
         metadata = release._config_map_data("gpu-fault-release-metadata")
         expected = {
@@ -542,12 +604,12 @@ def bootstrap_cpu_is_current(release: Any) -> bool:
         }
         if any(metadata.get(key) != value for key, value in expected.items()):
             return False
+        demand = _control_plane_pod_demand(release)
         if (
-            release._deployment_wheel(
-                release._cpu(),
-                inventory.CPU_INGRESS_DEPLOYMENT,
-            )
-            != release.wheel_cm
+            set(demand) != set(_CPU_ROLE_CONFIG_KEYS)
+            or set(inventory.CPU_RUNTIME_DEPLOYMENTS) != set(_CPU_ROLE_CONFIG_KEYS)
+            or demand[inventory.CPU_INGRESS_DEPLOYMENT] < 1
+            or demand["gpu-fault-control-worker"] < 1
         ):
             return False
         for deployment in inventory.CPU_DEPLOYMENTS:
@@ -560,6 +622,10 @@ def bootstrap_cpu_is_current(release: Any) -> bool:
                     deployment,
                 )
             )
+            if deployment in _CPU_ROLE_CONFIG_KEYS and not _bootstrap_role_is_current(
+                release, value, _CPU_ROLE_CONFIG_KEYS[deployment], demand[deployment]
+            ):
+                return False
             desired = int((value.get("spec") or {}).get("replicas") or 0)
             status = value.get("status") or {}
             metadata_value = value.get("metadata") or {}
@@ -570,6 +636,7 @@ def bootstrap_cpu_is_current(release: Any) -> bool:
             if any(
                 int(status.get(field) or 0) != desired
                 for field in (
+                    "replicas",
                     "readyReplicas",
                     "updatedReplicas",
                     "availableReplicas",
@@ -577,7 +644,14 @@ def bootstrap_cpu_is_current(release: Any) -> bool:
             ):
                 return False
         return True
-    except (ReleaseError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    except (
+        ReleaseError,
+        AttributeError,
+        KeyError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
         return False
 
 
@@ -614,8 +688,13 @@ def run_deploy(release: Any) -> None:
         # is the fixed tree the operator reruns with, there is no baseline to
         # protect, and bootstrap re-plans and re-applies everything (live
         # 2026-09-12: the pin refused the fix and the refusal tore the partial
-        # site down).
-        if state is not None and not _foreign_candidate(release, state):
+        # site down). A ``complete`` state whose control plane is gone pins
+        # nothing either: its plan finished, and bootstrap takes it over.
+        if (
+            state is not None
+            and not _foreign_candidate(release, state)
+            and str(state.get("phase") or "") != "complete"
+        ):
             release.pin_approved_manifest_plan(state.get("approved_manifest_sha256"))
         release.bootstrap()
         return
