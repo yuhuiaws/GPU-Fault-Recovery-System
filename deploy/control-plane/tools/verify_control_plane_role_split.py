@@ -290,6 +290,10 @@ def env_names(item: dict) -> set[str]:
 
 UVICORN_WORKERS_PER_POD = 4
 SPOOL_UVICORN_WORKERS_PER_POD = 1
+# The launcher that gives every worker its own SO_REUSEPORT service socket
+# (gpu_fault.app.serve); plain ``uvicorn --workers`` shares one accept queue
+# between the workers, which is the FIFO a cold-connect burst queues in.
+LAUNCHER_MODULE = "gpu_fault.app.serve"
 
 
 def require_uvicorn_workers(
@@ -298,14 +302,19 @@ def require_uvicorn_workers(
     command: str,
     expected: int,
 ) -> None:
-    """The tier's process count is the capacity model.
+    """The tier's process count is the capacity model, its launcher the socket model.
 
     Pools, consumer processes and notification shards are computed as
     replicas x uvicorn workers by the renderer, so a command that says a
     different ``--workers`` (a ``kubectl edit`` is how that happens) breaks
     the shard cover or the connection budget silently. /metrics is
     aggregated over the Pod's processes by the application, so the count
-    is not a scrape concern.
+    is not a scrape concern. The processes must be launched through
+    ``gpu_fault.app.serve``: an edit back to ``-m uvicorn`` keeps serving
+    with one accept queue shared by the workers - the shape whose probe
+    latency under a cold-connect burst is queue depth over accept rate - and
+    nothing in pod status says so; only the per-worker listen metrics go
+    absent.
     """
 
     if (
@@ -315,6 +324,11 @@ def require_uvicorn_workers(
         problems.append(
             f"{deployment_name} must run exactly {expected} uvicorn "
             f"process{'es' if expected != 1 else ''} per Pod"
+        )
+    if f"-m {LAUNCHER_MODULE}" not in command:
+        problems.append(
+            f"{deployment_name} must launch through python -m {LAUNCHER_MODULE} "
+            "(one SO_REUSEPORT service socket per worker), not plain uvicorn"
         )
 
 

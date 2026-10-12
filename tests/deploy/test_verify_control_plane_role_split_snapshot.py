@@ -48,7 +48,7 @@ VERIFIER = TOOLS / "verify_control_plane_role_split.py"
 APPLY_SCRIPT = TOOLS / "apply-control-plane-role-split.sh"
 VARIABLE = "GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE"
 IMAGE = "123456789012.dkr.ecr.us-west-2.amazonaws.com/gpu-fault:previous"
-UVICORN = "exec python -m uvicorn gpu_fault.app:app --no-proxy-headers "
+UVICORN = "exec python -m gpu_fault.app.serve gpu_fault.app:app --no-proxy-headers "
 
 
 def _deployment(

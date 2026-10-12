@@ -67,13 +67,22 @@ spec:
             preStop:
               exec:
                 command: ["/bin/sh", "-c", "sleep 20"]
+          # gpu_fault.app.serve is uvicorn with one SO_REUSEPORT service
+          # socket per worker process instead of one socket shared by all
+          # of them: the kernel spreads incoming connections over the
+          # workers' own accept queues, so a cold-connect burst no longer
+          # waits in a single FIFO drained at the slowest worker's pace,
+          # and the Pod holds --workers x somaxconn completed connections
+          # before SYNs are dropped. The flags are uvicorn's; the renderer
+          # (render_control_plane_role_split.py) rewrites everything after
+          # the application reference per role.
           command: ["/bin/sh", "-c"]
           args:
             - |-
               if [ -x /opt/gpu-fault/control-plane/bin/python ]; then
-                set -- /opt/gpu-fault/control-plane/bin/python -m uvicorn
+                set -- /opt/gpu-fault/control-plane/bin/python -m gpu_fault.app.serve
               else
-                set -- uvicorn
+                set -- python3 -m gpu_fault.app.serve
               fi
               exec "$@" gpu_fault.app:create_app --factory
               --host 0.0.0.0 --port 8080

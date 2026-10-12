@@ -201,7 +201,9 @@ def validate_role(
     role = values.get("GPU_FAULT_SERVICE_ROLE")
     errors = []
     command = " ".join(container(deployment).get("args") or [])
-    if "uvicorn " in command:
+    # ``gpu_fault.app.serve`` is uvicorn with one SO_REUSEPORT socket per
+    # worker and takes uvicorn's flags, so it is held to the same rules.
+    if "uvicorn " in command or "gpu_fault.app.serve " in command:
         if "--no-proxy-headers" not in command:
             errors.append(f"{name}: uvicorn must explicitly disable proxy headers")
         if (

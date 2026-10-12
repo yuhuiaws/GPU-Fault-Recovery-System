@@ -7,12 +7,18 @@ per-process counters it did have died with the processes. The local
 reproduction (``scripts/perf/ingress_event_loop_burst.py``) found the three
 facts that would have named the mechanism on the spot, so they are exported:
 
-* the **accept queue** of the listening socket the Pod's uvicorn processes
-  share. 4,250 cold connections against four processes held 3,600-3,900
-  connections in the kernel's accept queue for the whole burst while the
-  processes themselves held 550-740 each; the kubelet's probe connection
-  joins that FIFO, so its latency was the queue depth over the accept rate
-  (3.6 s at 1,090 req/s) while the request itself took under 0.11 s in-app;
+* the **accept queue** of this process's listening socket. Under the plain
+  ``uvicorn --workers`` command the Pod's processes shared one socket: 4,250
+  cold connections against four processes held 3,600-3,900 connections in
+  that one kernel accept queue for the whole burst while the processes
+  themselves held 550-740 each; the kubelet's probe connection joined that
+  FIFO, so its latency was the queue depth over the accept rate (3.6 s at
+  1,090 req/s) while the request itself took under 0.11 s in-app. With
+  ``gpu_fault.app.serve`` every worker owns an ``SO_REUSEPORT`` socket, so
+  the gauge is per worker and the Pod's queue is the sum; the launcher also
+  registers how many connections the worker accepted and holds open
+  (``gpu_fault.app.listener``), which is where a long-lived connection
+  imbalance between workers shows;
 * **garbage-collection pauses**. Every gen-2 collection stops the event loop
   for 0.15-0.6 s and was the longest single loop stall in every run (42-47
   of them in a 38 s burst, 8-9 s of GC time per process). ``gc.freeze()``
@@ -41,6 +47,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
+from gpu_fault.app.listener import service_listener
 from gpu_fault.env import env_bool
 
 LOGGER = logging.getLogger(__name__)
@@ -145,13 +152,14 @@ def _socket_inodes() -> set[str]:
 def listen_accept_queues() -> dict[int, int]:
     """Port -> completed connections waiting in the accept queue.
 
-    Only the listening sockets this process holds are reported - under
-    uvicorn ``--workers`` that is the socket every worker in the Pod shares,
-    so the Pod-level value is the maximum over processes, not the sum.
-    ``/proc/net/tcp`` reports a LISTEN socket's ``rx_queue`` as
-    ``sk_ack_backlog``: the connections the kernel finished the handshake
-    for that no process has accept()ed yet. That is the queue a kubelet probe
-    joins behind a cold-connect storm.
+    Only the listening sockets this process holds are reported. Under
+    ``gpu_fault.app.serve`` that is the worker's own ``SO_REUSEPORT`` socket
+    (plus its liveness listener), so the value is this worker's queue and the
+    Pod's is the sum over processes; under a plain ``uvicorn --workers``
+    command every worker reports the one shared socket. ``/proc/net/tcp``
+    reports a LISTEN socket's ``rx_queue`` as ``sk_ack_backlog``: the
+    connections the kernel finished the handshake for that no process has
+    accept()ed yet - the queue a cold-connect storm fills.
     """
 
     inodes = _socket_inodes()
@@ -297,8 +305,9 @@ def render_process_health_metrics(lines: list[str]) -> None:
             "# TYPE gpu_fault_gc_frozen_objects gauge",
             f"gpu_fault_gc_frozen_objects {gc.get_freeze_count()}",
             "# HELP gpu_fault_listen_accept_queue_connections Completed connections "
-            "waiting to be accepted on a listening port of this process; the "
-            "Pod's uvicorn processes share the socket, so read the maximum.",
+            "waiting to be accepted on a listening socket of this process; one "
+            "SO_REUSEPORT socket per worker, so the Pod's queue is the sum over "
+            "its processes.",
             "# TYPE gpu_fault_listen_accept_queue_connections gauge",
         ]
     )
@@ -306,6 +315,7 @@ def render_process_health_metrics(lines: list[str]) -> None:
         lines.append(
             f'gpu_fault_listen_accept_queue_connections{{port="{port}"}} {depth}'
         )
+    render_service_listener_metrics(lines)
     cap = somaxconn()
     if cap is not None:
         lines.extend(
@@ -316,3 +326,44 @@ def render_process_health_metrics(lines: list[str]) -> None:
                 f"gpu_fault_listen_somaxconn {cap}",
             ]
         )
+
+
+def render_service_listener_metrics(lines: list[str]) -> None:
+    """The worker's own service socket: accepted, open, and whether it is its own.
+
+    Rendered only when ``gpu_fault.app.serve`` registered the socket; a
+    process behind the plain uvicorn supervisor shares the accept queue with
+    its siblings and cannot attribute an accept to itself. ``accepted`` is a
+    per-process counter (rate it before summing), ``open`` is the connections
+    pinned to this worker right now (a Pod sums them), and ``reuse_port`` is
+    the same on every worker of a Pod.
+    """
+
+    listener = service_listener()
+    if listener is None:
+        return
+    facts = listener.snapshot()
+    port = facts["port"]
+    lines.extend(
+        [
+            "# HELP gpu_fault_listen_reuse_port 1 when this process serves the "
+            "service port on an SO_REUSEPORT socket of its own (gpu_fault.app.serve), "
+            "0 when it shares the supervisor's socket.",
+            "# TYPE gpu_fault_listen_reuse_port gauge",
+            f"gpu_fault_listen_reuse_port {1 if facts['reuse_port'] else 0}",
+            "# HELP gpu_fault_listen_accepted_connections_total Connections this "
+            "process accepted on its service socket; the kernel's 4-tuple hash "
+            "decides which worker gets a connection, so the spread across "
+            "processes is the balance.",
+            "# TYPE gpu_fault_listen_accepted_connections_total counter",
+            f'gpu_fault_listen_accepted_connections_total{{port="{port}"}} '
+            f"{facts['accepted_total']}",
+            "# HELP gpu_fault_listen_open_connections Connections this process "
+            "holds open on its service socket right now, idle keep-alive "
+            "connections included - a client stays pinned to the worker that "
+            "accepted it until it reconnects.",
+            "# TYPE gpu_fault_listen_open_connections gauge",
+            f'gpu_fault_listen_open_connections{{port="{port}"}} '
+            f"{facts['open_connections']}",
+        ]
+    )

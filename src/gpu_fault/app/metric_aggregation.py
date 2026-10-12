@@ -82,6 +82,9 @@ _ANY = (
     "gpu_fault_postgres_pool_oversubscription_ratio",
     "gpu_fault_postgres_pool_headroom_connections",
     "gpu_fault_postgres_unpooled_connections",
+    # whether the workers serve on SO_REUSEPORT sockets of their own
+    # (gpu_fault.app.serve): the same answer on every worker of a Pod
+    "gpu_fault_listen_reuse_port",
     # processor queue view (store)
     "gpu_fault_processor_queue_depth",
     "gpu_fault_processor_queue_oldest_age_seconds",
@@ -196,11 +199,8 @@ _MAX = (
     "gpu_fault_regional_registry_secret_drift",
     "gpu_fault_spare_reservations_active",
     # Process health (process_health.py): the longest GC pause anywhere in the
-    # Pod; the accept queue of the listening socket every uvicorn worker in
-    # the Pod shares, so a sum would count the same connections four times;
-    # the namespace's somaxconn, one value per Pod.
+    # Pod; the namespace's somaxconn, one value per Pod.
     "gpu_fault_gc_collection_seconds_max",
-    "gpu_fault_listen_accept_queue_connections",
     "gpu_fault_listen_somaxconn",
 )
 
@@ -255,6 +255,12 @@ _PER_PROCESS = (
     "gpu_fault_gc_collections_total",
     "gpu_fault_gc_frozen_objects",
     "gpu_fault_process_resident_memory_bytes",
+    # Per worker (gpu_fault.app.serve): each worker owns an SO_REUSEPORT
+    # service socket, so its accept queue and its accepted-connection counter
+    # are its own; the Pod's queue is the sum in PromQL and the spread across
+    # the slots is the kernel's 4-tuple balance.
+    "gpu_fault_listen_accept_queue_connections",
+    "gpu_fault_listen_accepted_connections_total",
     "gpu_fault_gpu_findings_without_incident_total",
     "gpu_fault_hardware_escalation_chain_terminated_total",
     "gpu_fault_hardware_escalation_containment_refused_total",
@@ -411,6 +417,9 @@ _PER_PROCESS = (
 _SUM = (
     "gpu_fault_ingress_lane_in_flight",
     "gpu_fault_ingress_lane_workers",
+    # Connections each worker holds open on its own service socket; the Pod
+    # holds the sum (gpu_fault.app.serve, one SO_REUSEPORT socket per worker).
+    "gpu_fault_listen_open_connections",
     "gpu_fault_postgres_pool_size",
     "gpu_fault_postgres_pool_available",
     "gpu_fault_postgres_pool_requests_waiting",

@@ -80,15 +80,16 @@ PROCESSOR_FLUSH_CAPS = {
     for suffix in ("", "_floor")
 }
 
-# Four uvicorn processes per Pod on the ingress and control-worker tiers
-# (the telemetry spool runs one). ADOT scrapes a Pod, not a process, so
-# the application aggregates /metrics over the Pod's live processes
-# through a shared /dev/shm directory (``gpu_fault.app.process_metrics``,
-# strategies in ``gpu_fault.app.metric_aggregation``); a scrape answered
-# by any process reads the whole Pod. The consumer-process invariant is
-# ``replicas x UVICORN_WORKERS_PER_POD`` and the verifier fails the deploy
-# if a tier's command says otherwise.
+# Four uvicorn processes per Pod on the ingress and control-worker tiers (the
+# spool runs one), launched by ``gpu_fault.app.serve``: uvicorn's flags and
+# Server with one SO_REUSEPORT service socket per worker, so the kernel spreads
+# a cold-connect burst over the workers' own accept queues instead of the one
+# socket ``uvicorn --workers`` shares. ADOT scrapes a Pod; the app aggregates
+# /metrics over its processes. Consumers = ``replicas x UVICORN_WORKERS_PER_POD``.
 UVICORN_WORKERS_PER_POD = 4
+LAUNCHER_MODULE = "gpu_fault.app.serve"
+# Idle keep-alive timeout of the service sockets (uvicorn --timeout-keep-alive).
+KEEP_ALIVE_TIMEOUT_SECONDS = 5
 # The kubelet's liveness probe gets a per-process listener of its own
 # (``gpu_fault.app.liveness``), ten above the role's service port: the main
 # socket's accept queue is shared with the request storm, and a cold-connect
@@ -364,18 +365,15 @@ def replace_uvicorn_args(
         raise ValueError("API container must use one shell args entry")
     command = args[0]
     marker = 'exec "$@" gpu_fault.app:create_app --factory'
-    if marker not in command:
-        raise ValueError("API container does not launch gpu_fault.app:create_app")
-    prefix = command.split(marker, 1)[0].replace(
-        "[collectors,postgres]",
-        "[collectors,postgres,performance]",
-    )
+    prefix = command.split(marker, 1)[0]
+    if marker not in command or f"-m {LAUNCHER_MODULE}" not in prefix:
+        raise ValueError(f"API container must run -m {LAUNCHER_MODULE} {marker[9:]}")
+    prefix = prefix.replace("postgres]", "postgres,performance]")
     flags = (
         f"{marker} --host 0.0.0.0 --port {port} "
         f"--workers {workers} --loop uvloop --http httptools "
-        f"--backlog {backlog} --timeout-keep-alive 5 "
-        "--no-proxy-headers "
-        "--timeout-graceful-shutdown 60 "
+        f"--backlog {backlog} --timeout-keep-alive {KEEP_ALIVE_TIMEOUT_SECONDS} "
+        "--no-proxy-headers --timeout-graceful-shutdown 60 "
         "--timeout-worker-healthcheck 20 --no-access-log"
     )
     if ingress:

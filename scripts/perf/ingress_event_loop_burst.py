@@ -30,7 +30,11 @@ Nothing here touches a cluster or a database. Example::
         --flush-slots 8 --decode-workers 32 --flush-cpu-ms-per-item 8
 
 ``run`` prints one table per experiment and writes the raw samples under
-``--out``; ``summarize <run-dir>`` re-prints a finished run.
+``--out``; ``summarize <run-dir>`` re-prints a finished run. ``--launcher
+uvicorn|serve`` compares uvicorn's shared listening socket with
+``gpu_fault.app.serve``'s SO_REUSEPORT socket per worker (per-socket accept
+queues and per-worker request shares are reported); ``--keep-alive`` makes
+the load clients hold one connection per worker like a pooled collector.
 """
 
 from __future__ import annotations
@@ -233,23 +237,27 @@ def _thread_states() -> tuple[int, int]:
     for tid in os.listdir("/proc/self/task"):
         try:
             state = _proc_stat_state(f"/proc/self/task/{tid}/stat")
-        except OSError:
+        except (OSError, IndexError, ValueError):
+            # A thread that exited between the listing and the read.
             continue
         total += 1
         running += state == "R"
     return total, running
 
 
-def listen_queue(port: int) -> tuple[int, int]:
-    """(accept-queue depth of the listeners on ``port``, established peers).
+def listen_queues(port: int) -> tuple[list[int], int]:
+    """(accept-queue depth of each listener on ``port``, established peers).
 
     ``/proc/net/tcp{,6}`` reports a LISTEN socket's rx_queue as the number
     of completed connections nobody has accept()ed yet - the queue the
-    kubelet's probe connection joins behind a cold-connect storm.
+    kubelet's probe connection joins behind a cold-connect storm. Under
+    ``uvicorn --workers`` there is one socket; under ``gpu_fault.app.serve``
+    one per worker, so the list is the per-worker split of the storm.
     """
 
     suffix = f":{port:04X}"
-    queued = established = 0
+    queues: list[int] = []
+    established = 0
     for path in ("/proc/net/tcp", "/proc/net/tcp6"):
         try:
             with open(path, encoding="ascii") as handle:
@@ -259,12 +267,19 @@ def listen_queue(port: int) -> tuple[int, int]:
                     if not fields[1].endswith(suffix):
                         continue
                     if fields[3] == "0A":
-                        queued += int(fields[4].split(":")[1], 16)
+                        queues.append(int(fields[4].split(":")[1], 16))
                     elif fields[3] == "01":
                         established += 1
         except OSError:
             continue
-    return queued, established
+    return queues, established
+
+
+def listen_queue(port: int) -> tuple[int, int]:
+    """(total accept-queue depth on ``port``, established peers)."""
+
+    queues, established = listen_queues(port)
+    return sum(queues), established
 
 
 def _rss_mb() -> float:
@@ -366,13 +381,23 @@ class ProcessSampler:
                 )
                 + "\n"
             )
+            errors = 0
             while not self.stop.wait(interval):
                 now = time.monotonic()
-                proc = _proc_stat_cpu("/proc/self/stat")
-                main = _proc_stat_cpu(f"/proc/self/task/{self._main_tid}/stat")
+                try:
+                    proc = _proc_stat_cpu("/proc/self/stat")
+                    main = _proc_stat_cpu(f"/proc/self/task/{self._main_tid}/stat")
+                    threads, running = _thread_states()
+                    batcher_fields = self._batcher_fields()
+                except Exception as exc:  # noqa: BLE001 - a sampler must outlive a bad read
+                    errors += 1
+                    if errors <= 3:
+                        print(
+                            f"sampler pid={pid} skipped a window: {exc!r}", flush=True
+                        )
+                    continue
                 served = self.served
                 wall = max(1e-6, now - last_wall)
-                threads, running = _thread_states()
                 sample = {
                     "t": time.time(),
                     "pid": pid,
@@ -388,8 +413,9 @@ class ProcessSampler:
                     "livez_app_max_ms": self.livez_app.drain() * 1000,
                     "livez_count": self.livez_count,
                     "gc_counts_now": list(gc.get_count()),
+                    "sampler_errors": errors,
                     **self.gc_timer.drain(),
-                    **self._batcher_fields(),
+                    **batcher_fields,
                 }
                 handle.write(json.dumps(sample) + "\n")
                 handle.flush()
@@ -573,7 +599,13 @@ def cluster_events(
 
 
 def _request_bytes(
-    path: str, body: bytes, *, host: str, cluster_id: str, token: str
+    path: str,
+    body: bytes,
+    *,
+    host: str,
+    cluster_id: str,
+    token: str,
+    keep_alive: bool = False,
 ) -> bytes:
     head = (
         f"POST {path} HTTP/1.1\r\n"
@@ -582,9 +614,31 @@ def _request_bytes(
         f"X-GPU-Fault-Cluster-ID: {cluster_id}\r\n"
         "Content-Type: application/json\r\n"
         f"Content-Length: {len(body)}\r\n"
-        "Connection: close\r\n\r\n"
+        f"Connection: {'keep-alive' if keep_alive else 'close'}\r\n\r\n"
     )
     return head.encode() + body
+
+
+async def _send_and_read(
+    reader: asyncio.StreamReader,
+    writer: asyncio.StreamWriter,
+    request: bytes,
+    timeout: float,
+) -> int:
+    """One request on an open connection; returns the status code."""
+
+    writer.write(request)
+    await asyncio.wait_for(writer.drain(), timeout)
+    head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout)
+    status = int(head.split(b" ", 2)[1])
+    length = 0
+    for line in head.split(b"\r\n")[1:]:
+        name, _, value = line.partition(b":")
+        if name.strip().lower() == b"content-length":
+            length = int(value.strip())
+    if length:
+        await asyncio.wait_for(reader.readexactly(length), timeout)
+    return status
 
 
 async def _http_exchange(
@@ -597,18 +651,7 @@ async def _http_exchange(
         timeout,
     )
     try:
-        writer.write(request)
-        await asyncio.wait_for(writer.drain(), timeout)
-        head = await asyncio.wait_for(reader.readuntil(b"\r\n\r\n"), timeout)
-        status = int(head.split(b" ", 2)[1])
-        length = 0
-        for line in head.split(b"\r\n")[1:]:
-            name, _, value = line.partition(b":")
-            if name.strip().lower() == b"content-length":
-                length = int(value.strip())
-        if length:
-            await asyncio.wait_for(reader.readexactly(length), timeout)
-        return status
+        return await _send_and_read(reader, writer, request, timeout)
     finally:
         writer.close()
 
@@ -620,6 +663,9 @@ class LoadStats:
     latencies_ms: list[float] = field(default_factory=list)
     started: float = 0.0
     finished: float = 0.0
+    #: Connections opened; in keep-alive mode one per worker plus reconnects.
+    connections: int = 0
+    reconnects: int = 0
 
 
 async def _cluster_workers(
@@ -633,16 +679,26 @@ async def _cluster_workers(
     workers: int,
     timeout: float,
     stats: LoadStats,
+    keep_alive: bool = False,
 ) -> None:
     queue: asyncio.Queue[bytes] = asyncio.Queue()
     for path, body in events:
         queue.put_nowait(
             _request_bytes(
-                path, body, host=f"{host}:{port}", cluster_id=cluster_id, token=token
+                path,
+                body,
+                host=f"{host}:{port}",
+                cluster_id=cluster_id,
+                token=token,
+                keep_alive=keep_alive,
             )
         )
 
-    async def worker() -> None:
+    def record(key: str, begin: float) -> None:
+        stats.latencies_ms.append((time.perf_counter() - begin) * 1000)
+        stats.statuses[key] = stats.statuses.get(key, 0) + 1
+
+    async def cold_worker() -> None:
         while True:
             try:
                 request = queue.get_nowait()
@@ -650,6 +706,7 @@ async def _cluster_workers(
                 return
             begin = time.perf_counter()
             try:
+                stats.connections += 1
                 status = await _http_exchange(
                     host, port, request, bind=bind, timeout=timeout
                 )
@@ -657,9 +714,47 @@ async def _cluster_workers(
             except Exception as exc:  # noqa: BLE001 - every failure is a sample
                 key = type(exc).__name__
                 stats.errors[key] = stats.errors.get(key, 0) + 1
-            stats.latencies_ms.append((time.perf_counter() - begin) * 1000)
-            stats.statuses[key] = stats.statuses.get(key, 0) + 1
+            record(key, begin)
 
+    async def keep_alive_worker() -> None:
+        """One connection for the worker's whole run, reopened on a failure.
+
+        What a collector process with a persistent pooled connection does:
+        the handshake is paid once, every later request is a write and a
+        read on the same socket pinned to the uvicorn worker that accepted
+        it.
+        """
+
+        stream: tuple[asyncio.StreamReader, asyncio.StreamWriter] | None = None
+        while True:
+            try:
+                request = queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            begin = time.perf_counter()
+            try:
+                if stream is None:
+                    stats.connections += 1
+                    stream = await asyncio.wait_for(
+                        asyncio.open_connection(
+                            host, port, local_addr=(bind, 0) if bind else None
+                        ),
+                        timeout,
+                    )
+                status = await _send_and_read(stream[0], stream[1], request, timeout)
+                key = str(status)
+            except Exception as exc:  # noqa: BLE001 - every failure is a sample
+                key = type(exc).__name__
+                stats.errors[key] = stats.errors.get(key, 0) + 1
+                if stream is not None:
+                    stream[1].close()
+                    stream = None
+                    stats.reconnects += 1
+            record(key, begin)
+        if stream is not None:
+            stream[1].close()
+
+    worker = keep_alive_worker if keep_alive else cold_worker
     await asyncio.gather(*(worker() for _ in range(min(workers, len(events)))))
 
 
@@ -699,6 +794,7 @@ async def _load_main(args: argparse.Namespace) -> dict[str, Any]:
                 workers=args.workers_per_cluster,
                 timeout=args.timeout,
                 stats=stats,
+                keep_alive=args.keep_alive,
             )
             for cluster_id, events in plans.items()
         )
@@ -719,6 +815,9 @@ async def _load_main(args: argparse.Namespace) -> dict[str, Any]:
         "started": stats.started,
         "finished": stats.finished,
         "wall_seconds": wall,
+        "connection_mode": "keep-alive" if args.keep_alive else "cold-connect",
+        "connections": stats.connections,
+        "reconnects": stats.reconnects,
         "requests_per_second": len(ordered) / wall,
         "p50_ms": pct(0.5) if ordered else 0.0,
         "p95_ms": pct(0.95) if ordered else 0.0,
@@ -751,7 +850,8 @@ async def _probe_main(args: argparse.Namespace) -> None:
     ).encode()
     with Path(args.out).open("w", encoding="utf-8") as handle:
         while not stop.is_set():
-            queued, established = listen_queue(args.queue_port or args.port)
+            queues, established = listen_queues(args.queue_port or args.port)
+            queued = sum(queues)
             begin = time.perf_counter()
             stamp = time.time()
             try:
@@ -768,6 +868,7 @@ async def _probe_main(args: argparse.Namespace) -> None:
                         "status": status,
                         "ms": elapsed * 1000,
                         "accept_queue": queued,
+                        "accept_queues": queues,
                         "established": established,
                     }
                 )
@@ -907,6 +1008,48 @@ def _taskset(cpus: str) -> list[str]:
     return ["taskset", "-c", cpus] if cpus else []
 
 
+def _server_command(args: argparse.Namespace) -> list[str]:
+    """The production flags, launched by uvicorn (one shared socket) or by
+    ``gpu_fault.app.serve`` (one SO_REUSEPORT socket per worker)."""
+
+    launcher = "uvicorn" if args.launcher == "uvicorn" else "gpu_fault.app.serve"
+    flags = (
+        f"--host {args.host} --port {args.port} --workers {args.uvicorn_workers} "
+        "--loop uvloop --http httptools --backlog 8192 "
+        f"--timeout-keep-alive {args.timeout_keep_alive} --no-proxy-headers "
+        "--timeout-graceful-shutdown 60 --timeout-worker-healthcheck 20 "
+        "--no-access-log --limit-concurrency 4096"
+    )
+    return [
+        *_taskset(args.server_cpus),
+        sys.executable,
+        "-m",
+        launcher,
+        "ingress_event_loop_burst:create_app",
+        "--factory",
+        *flags.split(),
+    ]
+
+
+def _probe_command(args: argparse.Namespace, *, port: int, out: Path) -> list[str]:
+    flags = (
+        f"--host {args.host} --port {port} --queue-port {args.port} "
+        f"--interval {args.probe_interval} --timeout {args.probe_timeout}"
+    )
+    prefix = [*_taskset(args.probe_cpus), sys.executable, __file__, "probe"]
+    return [*prefix, *flags.split(), "--out", str(out)]
+
+
+def _stop_process(process: subprocess.Popen[bytes], timeout: float) -> None:
+    if process.poll() is not None:
+        return
+    process.send_signal(signal.SIGTERM)
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+
+
 def run_experiment(args: argparse.Namespace) -> int:
     label = args.label or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     run_dir = Path(args.out) / label
@@ -945,70 +1088,56 @@ def run_experiment(args: argparse.Namespace) -> int:
         ),
         encoding="utf-8",
     )
+    # Four workers building the app at once race for the sqlite schema
+    # ("database is locked" stops the launcher); create it once up front.
+    subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            "from gpu_fault.app import ApplicationContext; "
+            "ApplicationContext.from_environment()",
+        ],
+        env=env,
+        cwd=str(REPO),
+        check=True,
+        timeout=120,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
     server_log = (run_dir / "server.log").open("w", encoding="utf-8")
     server = subprocess.Popen(
-        [
-            *_taskset(args.server_cpus),
-            sys.executable,
-            "-m",
-            "uvicorn",
-            "ingress_event_loop_burst:create_app",
-            "--factory",
-            "--host",
-            args.host,
-            "--port",
-            str(args.port),
-            "--workers",
-            str(args.uvicorn_workers),
-            "--loop",
-            "uvloop",
-            "--http",
-            "httptools",
-            "--backlog",
-            "8192",
-            "--timeout-keep-alive",
-            "5",
-            "--no-proxy-headers",
-            "--timeout-graceful-shutdown",
-            "60",
-            "--timeout-worker-healthcheck",
-            "20",
-            "--no-access-log",
-            "--limit-concurrency",
-            "4096",
-        ],
+        _server_command(args),
         env=env,
         stdout=server_log,
         stderr=subprocess.STDOUT,
         cwd=str(REPO),
     )
-    probe: subprocess.Popen[bytes] | None = None
+    probes: list[subprocess.Popen[bytes]] = []
     loads: list[subprocess.Popen[bytes]] = []
     try:
         if not _wait_ready(args.host, args.port, args.startup_timeout):
             print("server did not become ready; see", run_dir / "server.log")
             return 2
         time.sleep(args.warmup)
-        probe = subprocess.Popen(
-            [
-                *_taskset(args.probe_cpus),
-                sys.executable,
-                __file__,
-                "probe",
-                "--host",
-                args.host,
-                "--port",
-                str(args.probe_port or args.port),
-                "--queue-port",
-                str(args.port),
-                "--interval",
-                str(args.probe_interval),
-                "--timeout",
-                str(args.probe_timeout),
-                "--out",
-                str(run_dir / "probe.jsonl"),
-            ]
+        probes.append(
+            subprocess.Popen(
+                _probe_command(
+                    args,
+                    port=args.probe_port or args.port,
+                    out=run_dir / "probe.jsonl",
+                )
+            )
         )
+        if args.probe_port and args.probe_port != args.port:
+            # The service port's first-byte latency is the accept-queue wait
+            # a client sees; the dedicated port is what the kubelet sees.
+            probes.append(
+                subprocess.Popen(
+                    _probe_command(
+                        args, port=args.port, out=run_dir / "probe-service.jsonl"
+                    )
+                )
+            )
         start_at = time.time() + 5.0
         shards: list[list[str]] = [[] for _ in range(args.load_processes)]
         for index, cluster_id in enumerate(cluster_ids):
@@ -1049,6 +1178,7 @@ def run_experiment(args: argparse.Namespace) -> int:
                         str(start_at),
                         "--out",
                         str(run_dir / f"load-{index}.json"),
+                        *(["--keep-alive"] if args.keep_alive else []),
                     ]
                 )
             )
@@ -1061,18 +1191,9 @@ def run_experiment(args: argparse.Namespace) -> int:
                 process.kill()
         time.sleep(args.cooldown)
     finally:
-        if probe is not None and probe.poll() is None:
-            probe.send_signal(signal.SIGTERM)
-            try:
-                probe.wait(timeout=15)
-            except subprocess.TimeoutExpired:
-                probe.kill()
-        if server.poll() is None:
-            server.send_signal(signal.SIGTERM)
-            try:
-                server.wait(timeout=90)
-            except subprocess.TimeoutExpired:
-                server.kill()
+        for probe in probes:
+            _stop_process(probe, 15)
+        _stop_process(server, 90)
         server_log.close()
     print(summarize(run_dir))
     return 0
@@ -1112,6 +1233,9 @@ def summarize(run_dir: Path) -> str:
     lines = [
         f"== {run_dir.name}: clusters={config['clusters']} "
         f"workers/cluster={config['workers_per_cluster']} "
+        f"launcher={config.get('launcher', 'uvicorn')} "
+        f"clients={'keep-alive' if config.get('keep_alive') else 'cold-connect'} "
+        f"server-keep-alive={config.get('timeout_keep_alive', 5)} s "
         f"uvicorn-workers={config['uvicorn_workers']} "
         f"flush-slots={config['flush_slots']} "
         f"(floor {config['flush_floor'] or config['flush_slots']}) "
@@ -1137,36 +1261,64 @@ def summarize(run_dir: Path) -> str:
     if loads:
         p99 = max(load["p99_ms"] for load in loads)
         maximum = max(load["max_ms"] for load in loads)
+        p50 = statistics.median(load["p50_ms"] for load in loads)
+        connections = sum(load.get("connections", 0) for load in loads)
+        reconnects = sum(load.get("reconnects", 0) for load in loads)
         lines.append(
             f"load: {requests} requests in {wall:.1f} s = {requests / wall:.0f} req/s; "
             f"statuses {json.dumps(statuses, sort_keys=True)}; "
-            f"client p99 {p99 / 1000:.2f} s max {maximum / 1000:.2f} s"
+            f"client p50 {p50:.0f} ms p99 {p99 / 1000:.2f} s max {maximum / 1000:.2f} s; "
+            f"connections {connections} (reconnects {reconnects})"
         )
-    probe_path = run_dir / "probe.jsonl"
-    if probe_path.exists():
+    for name, label in (
+        ("probe.jsonl", "livez probe"),
+        ("probe-service.jsonl", "service-port probe (accept-queue wait)"),
+    ):
+        probe_path = run_dir / name
+        if not probe_path.exists():
+            continue
         probes = _load_jsonl(probe_path)
         during = [probe for probe in probes if started <= probe["t"] <= finished + 5]
-        if during:
-            timeout_ms = config["probe_timeout"] * 1000
-            slow = [probe for probe in during if probe["ms"] >= timeout_ms]
-            failed = [probe for probe in during if not isinstance(probe["status"], int)]
-            stall = _longest_stall(during, timeout_ms)
+        if not during:
+            continue
+        timeout_ms = config["probe_timeout"] * 1000
+        slow = [probe for probe in during if probe["ms"] >= timeout_ms]
+        failed = [probe for probe in during if not isinstance(probe["status"], int)]
+        stall = _longest_stall(during, timeout_ms)
+        latencies = sorted(p["ms"] for p in during)
+        p99_index = min(len(latencies) - 1, int((len(latencies) - 1) * 0.99))
+        lines.append(
+            f"{label} (1/s, {config['probe_timeout']} s timeout"
+            f"{', dedicated port' if name == 'probe.jsonl' and config.get('probe_port') else ''}): "
+            f"{len(during)} probes, max {latencies[-1] / 1000:.2f} s, "
+            f"p99 {latencies[p99_index] / 1000:.2f} s, "
+            f"p50 {statistics.median(latencies):.0f} ms, "
+            f"{len(slow)} slower than the timeout, {len(failed)} errors, "
+            f"longest stall {stall:.1f} s -> kubelet 5s/5s/2: "
+            f"{'KILL' if stall >= 10 else 'survives'}; "
+            f"10s/10s/3: {'KILL' if stall >= 30 else 'survives'}"
+        )
+        if name == "probe.jsonl":
             queue = [probe.get("accept_queue", 0) for probe in during]
-            lines.append(
-                f"livez probe (1/s, {config['probe_timeout']} s timeout"
-                f"{', dedicated port' if config.get('probe_port') else ''}): "
-                f"{len(during)} probes, max {max(p['ms'] for p in during) / 1000:.2f} s, "
-                f"p50 {statistics.median(p['ms'] for p in during):.0f} ms, "
-                f"{len(slow)} slower than the timeout, {len(failed)} errors, "
-                f"longest stall {stall:.1f} s -> kubelet 5s/5s/2: "
-                f"{'KILL' if stall >= 10 else 'survives'}; "
-                f"10s/5s/3: {'KILL' if stall >= 25 else 'survives'}"
-            )
+            per_socket = [
+                probe["accept_queues"]
+                for probe in during
+                if probe.get("accept_queues") and probe.get("accept_queue", 0) > 0
+            ]
             lines.append(
                 f"storm listener accept queue: max {max(queue)} / "
                 f"median {statistics.median(queue):.0f} connections waiting "
-                f"(established max {max(p.get('established', 0) for p in during)})"
+                f"(established max {max(p.get('established', 0) for p in during)}); "
+                f"{len(per_socket[0]) if per_socket else 1} listening socket(s)"
             )
+            if per_socket and len(per_socket[0]) > 1:
+                busiest = statistics.mean(max(q) for q in per_socket)
+                quietest = statistics.mean(min(q) for q in per_socket)
+                lines.append(
+                    "per-socket accept queue while queued: mean busiest "
+                    f"{busiest:.0f} / mean quietest {quietest:.0f} connections "
+                    f"(ratio {busiest / max(quietest, 1):.2f})"
+                )
     lines.append(
         "per process: lag=max event-loop lag (10 ms sampler) | gil=max GIL wait of an "
         "idle thread | gen2=max gen-2 GC pause / count | gc=total GC time | "
@@ -1174,6 +1326,7 @@ def summarize(run_dir: Path) -> str:
         "share) | pend=max admission backlog | limit=max flush limit | ewma=max flush | "
         "fds=max open fds (accepted connections) | livez-app=max in-app /livez time"
     )
+    served_by_pid: dict[str, int] = {}
     for path in sorted((run_dir / "samples").glob("proc-*.jsonl")):
         rows = _load_jsonl(path)
         start = next((row for row in rows if row.get("kind") == "start"), {})
@@ -1191,6 +1344,7 @@ def summarize(run_dir: Path) -> str:
         gen2_max = max(row["gc_max_ms"][2] for row in samples)
         gen2_count = sum(row["gc_count"][2] for row in samples)
         gc_total = sum(sum(row["gc_sum_ms"]) for row in samples)
+        served_by_pid[path.stem.split("-")[1]] = sum(row["served"] for row in samples)
         lines.append(
             f"  pid {path.stem.split('-')[1]:>7}: "
             f"lag {max(row['loop_lag_max_ms'] for row in samples) / 1000:6.2f} s | "
@@ -1208,6 +1362,14 @@ def summarize(run_dir: Path) -> str:
             f"fds {max(row.get('fds', 0) for row in samples):4d} | "
             f"livez-app {max(row.get('livez_app_max_ms', 0) for row in samples):5.0f} ms | "
             f"units {start.get('row_units')} | objects {end.get('tracked_objects')}"
+        )
+    if len(served_by_pid) > 1 and sum(served_by_pid.values()):
+        total = sum(served_by_pid.values())
+        shares = sorted(served_by_pid.values(), reverse=True)
+        lines.append(
+            "per-worker share of requests served: "
+            + ", ".join(f"{count / total * 100:.1f}%" for count in shares)
+            + f" (busiest/quietest {shares[0] / max(shares[-1], 1):.2f})"
         )
     return "\n".join(lines)
 
@@ -1227,6 +1389,18 @@ def _parser() -> argparse.ArgumentParser:
     run.add_argument("--host", default="127.0.0.1")
     run.add_argument("--port", type=int, default=18080)
     run.add_argument("--uvicorn-workers", type=int, default=4)
+    run.add_argument(
+        "--launcher",
+        choices=("uvicorn", "serve"),
+        default="serve",
+        help="uvicorn: one shared listening socket; serve: one SO_REUSEPORT socket per worker",
+    )
+    run.add_argument("--timeout-keep-alive", type=int, default=5)
+    run.add_argument(
+        "--keep-alive",
+        action="store_true",
+        help="load clients hold one connection per worker",
+    )
     run.add_argument("--clusters", type=int, default=50)
     run.add_argument("--workers-per-cluster", type=int, default=85)
     run.add_argument("--nodes-per-cluster", type=int, default=256)
@@ -1291,6 +1465,7 @@ def _parser() -> argparse.ArgumentParser:
     load.add_argument("--timeout", type=float, default=60.0)
     load.add_argument("--payload-scale", type=int, default=1)
     load.add_argument("--start-at", type=float, default=0.0)
+    load.add_argument("--keep-alive", action="store_true")
     load.add_argument("--out", required=True)
     load.set_defaults(func=run_load)
 

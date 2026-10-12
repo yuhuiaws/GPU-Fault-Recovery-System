@@ -24,7 +24,7 @@
     ]
   ],
   "files": {
-    "deploy/control-plane/tools/render_control_plane_role_split.py": 1539,
+    "deploy/control-plane/tools/render_control_plane_role_split.py": 1537,
     "deploy/hyperpod/deploy.sh": 3323,
     "deploy/node/install-gpu-fault-collector.sh": 1827,
     "scripts/e2e/regional/audit_regional_command_protocol_live.py": 2192,

@@ -94,3 +94,20 @@ def test_every_generated_role_tells_its_processes_the_port_and_the_gc_policy():
         assert "GPU_FAULT_GC_GEN2_THRESHOLD" not in core, (
             "CPython's gen-2 threshold stays: raising it lengthened every pause"
         )
+
+
+def test_every_generated_role_launches_one_reuseport_socket_per_worker():
+    """``gpu_fault.app.serve`` binds a SO_REUSEPORT service socket in every
+    worker; plain ``uvicorn --workers`` would share one accept queue between
+    them, the FIFO a cold-connect burst queues in."""
+
+    for filename in ROLES:
+        command = _api_container(GENERATED / filename)["args"][0]
+        assert "-m gpu_fault.app.serve" in command, filename
+        assert "-m uvicorn" not in command, filename
+        assert "gpu_fault.app:create_app --factory" in command, filename
+    base = _api_container(BASE)["args"][0]
+    assert (
+        "set -- /opt/gpu-fault/control-plane/bin/python -m gpu_fault.app.serve" in base
+    )
+    assert "set -- python3 -m gpu_fault.app.serve" in base

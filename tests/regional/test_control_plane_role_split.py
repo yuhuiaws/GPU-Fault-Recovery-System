@@ -82,9 +82,9 @@ def _deployment() -> dict:
                                 "if [ -x /opt/gpu-fault/control-plane/bin/python ]; "
                                 "then\n"
                                 "  set -- /opt/gpu-fault/control-plane/bin/python "
-                                "-m uvicorn\n"
+                                "-m gpu_fault.app.serve\n"
                                 "else\n"
-                                "  set -- uvicorn\n"
+                                "  set -- python3 -m gpu_fault.app.serve\n"
                                 "fi\n"
                                 'exec "$@" '
                                 "gpu_fault.app:create_app --factory "
@@ -206,13 +206,17 @@ def test_role_split_renders_ingress_and_scalable_workers() -> None:
         not in ingress["spec"]["template"]["spec"]["containers"][0]["args"][0]
     )
     assert (
-        "set -- /opt/gpu-fault/control-plane/bin/python -m uvicorn"
+        "set -- /opt/gpu-fault/control-plane/bin/python -m gpu_fault.app.serve"
+        in ingress["spec"]["template"]["spec"]["containers"][0]["args"][0]
+    ), "every worker must bind its own SO_REUSEPORT service socket"
+    assert (
+        "set -- python3 -m gpu_fault.app.serve"
         in ingress["spec"]["template"]["spec"]["containers"][0]["args"][0]
     )
     assert (
-        "set -- uvicorn"
-        in ingress["spec"]["template"]["spec"]["containers"][0]["args"][0]
-    )
+        "-m uvicorn"
+        not in ingress["spec"]["template"]["spec"]["containers"][0]["args"][0]
+    ), "plain uvicorn shares one accept queue between the workers"
     assert (
         ingress["spec"]["template"]["spec"].get("securityContext", {}).get("sysctls")
         is None
@@ -878,7 +882,9 @@ def _verifier_stub(tmp_path, *, ingress_workers: int, worker_workers: int) -> Pa
                     "containers": [
                         {
                             "name": "api",
-                            "args": [f"--port 8080 --workers {ingress_workers} --x"],
+                            "args": [
+                                f"exec python -m gpu_fault.app.serve gpu_fault.app:create_app --port 8080 --workers {ingress_workers} --x"
+                            ],
                             "env": [
                                 {"name": "GPU_FAULT_SERVICE_ROLE", "value": "ingress"},
                                 {"name": "GPU_FAULT_TELEMETRY_SPOOL", "value": "false"},
@@ -919,7 +925,9 @@ def _verifier_stub(tmp_path, *, ingress_workers: int, worker_workers: int) -> Pa
                     "containers": [
                         {
                             "name": "control-worker",
-                            "args": [f"--port 8081 --workers {worker_workers} --x"],
+                            "args": [
+                                f"exec python -m gpu_fault.app.serve gpu_fault.app:create_app --port 8081 --workers {worker_workers} --x"
+                            ],
                             "env": [
                                 {"name": "GPU_FAULT_SERVICE_ROLE", "value": "worker"},
                                 {"name": "GPU_FAULT_PROCESSOR_WORKERS", "value": "24"},
@@ -940,7 +948,9 @@ def _verifier_stub(tmp_path, *, ingress_workers: int, worker_workers: int) -> Pa
                     "containers": [
                         {
                             "name": "telemetry-spool-worker",
-                            "args": ["--port 8082 --workers 1 --x"],
+                            "args": [
+                                "exec python -m gpu_fault.app.serve gpu_fault.app:create_app --port 8082 --workers 1 --x"
+                            ],
                             "env": [
                                 {
                                     "name": "GPU_FAULT_SERVICE_ROLE",
