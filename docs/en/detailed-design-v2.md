@@ -117,7 +117,7 @@ orchestrator judges the blast radius by component `module_digest`, so control-pl
 
 | Layer | Workload | Kind | Replicas | Entry point | Port | ServiceAccount |
 |---|---|---|---|---|---|---|
-| Control plane | `gpu-fault-api-ha` | Deployment | 3 | `uvicorn gpu_fault.app:create_app --factory --workers 4` | 8080 | `gpu-fault-control-plane` |
+| Control plane | `gpu-fault-api-ha` | Deployment | 3 | `python -m gpu_fault.app.serve gpu_fault.app:create_app --factory --workers 4` | 8080 | `gpu-fault-control-plane` |
 | Control plane | `gpu-fault-control-worker` | Deployment | 6 | Same as above, `--workers 4` | 8081 | `gpu-fault-control-plane` |
 | Control plane | `gpu-fault-telemetry-spool-worker` | Deployment | **0** | Same as above, `--workers 1` | 8082 | `gpu-fault-control-plane` |
 | Data plane | `gpu-fault-cluster-executor` | Deployment | 2 | `gpu-fault-cluster-executor` | **9111**; `/metrics` and `/healthz` (family `gpu_fault_cluster_executor_*`; the port is given by `GPU_FAULT_CLUSTER_EXECUTOR_METRICS_PORT`, must equal the manifest's `metrics` containerPort, 0 disables; `/healthz` and the exec liveness read the same loop-alive file) | `gpu-fault-cluster-executor` |
@@ -1989,8 +1989,39 @@ defaults to 10. `/metrics`: `gpu_fault_event_loop_lag_seconds` changes from a su
 5 ms-10 s, `_max` kept); new families `gpu_fault_process_resident_memory_bytes`,
 `gpu_fault_gc_collections_total{generation}`, `gpu_fault_gc_collection_seconds_total{generation}`,
 `gpu_fault_gc_collection_seconds_max{generation}` (maximum over a Pod's processes), `gpu_fault_gc_frozen_objects`,
-`gpu_fault_listen_accept_queue_connections{port}` (the Pod's processes share the socket; maximum) and
+`gpu_fault_listen_accept_queue_connections{port}` (each worker's own socket; exported per process, summed over the Pod) and
 `gpu_fault_listen_somaxconn`.
+
+Per-worker `SO_REUSEPORT` service sockets (`app/serve.py`, `app/listener.py`): `python -m gpu_fault.app.serve` replaces
+`python -m uvicorn` as the launcher of the three roles -- the same uvicorn flags and `uvicorn.Server`, but the parent binds
+no shared socket: it spawns each worker, the worker binds with `SO_REUSEADDR+SO_REUSEPORT` and `listen(backlog)` itself,
+wraps `uvicorn.Config.load` so the application loads on the worker's event loop and then swaps `http_protocol_class` for a
+counting subclass (`connection_made` increments `accepted_total`), and registers a `ServiceListener` in
+`gpu_fault.app.listener` (port, worker index, accepted, `open_connections` reading `server_state.connections`). The
+supervisor keeps uvicorn's semantics (SIGTERM/SIGINT stop every worker gracefully, SIGHUP replaces them one at a time, a
+worker that does not answer the health pipe within `--timeout-worker-healthcheck` or dies is replaced, exit code 3 =
+`STARTUP_FAILURE` -- bind, import, a raising factory, a failed lifespan -- stops the parent with 3 so the Pod restarts and
+backs off); `--workers 1` runs in-process, still on its own socket. Measured (local reproduction, 4 workers, 50 clusters):
+at 4,250 concurrent cold connections within noise of the shared socket (throughput -3%, tail +3-11%, per-worker share
+24.7-25.2%); at 5,500 (above the Pod namespace's `somaxconn` 4096) the shared socket gives 961 req/s, 73 503s and client
+p99 27.9 s, the per-worker sockets 1,117 req/s, 0 non-2xx and p99 5.35 s. New `/metrics` families
+`gpu_fault_listen_reuse_port` (ANY), `gpu_fault_listen_accepted_connections_total{port}` (PER_PROCESS),
+`gpu_fault_listen_open_connections{port}` (SUM); `gpu_fault_listen_accept_queue_connections` moves from MAX to PER_PROCESS.
+The renderer makes `-m gpu_fault.app.serve` a prefix contract (`LAUNCHER_MODULE`) and sets `--timeout-keep-alive 100`
+(`KEEP_ALIVE_TIMEOUT_SECONDS`); the verifier and `config_cli validate` both check the launcher.
+
+Node-side long connections and jitter (`transport/http_client.py`, `collectors/cadence.py`): the pool records
+`_PooledConnection(opened_at, last_used_at, expires_at)` under `ConnectionPolicy.from_environment` (90 s idle < the NLB's
+350 s, 1800 s +-10% lifetime, TCP keepalive 60 s / 15 s x 4; out-of-range values fail closed); before reuse an idle or
+aged connection is closed (`idle_expired_total` / `age_expired_total`), a connection the peer closed is retried once only
+for an idempotent request (`stale_connection_retries_total` vs `stale_connection_failures_total`), `stats()` /
+`transport_stats()` expose the counters and a log line summarises them every 300 s; the Agent heartbeat uses the pool with
+an `X-GPU-Fault-Request-ID` and `/healthz` gains `transport`. `CadenceJitter` (ratio 0.1, start-up 20 s) and
+`jittered_next_phase` (the stable phase +- ratio x interval, never before the observation) are wired into
+`GpuInventoryCadence`, the DCGM/host/kernel/Fabric Manager/node-log/Kubernetes health summaries and the heartbeat wait;
+`collector_kinds.PostingCadence` puts each kind's posting interval next to its silence threshold and
+`silent_threshold_shortfalls(worst_case_silence)` is held by `tests/collectors/test_cadence_jitter.py` at
+cadence x 1.1 + 15 + 20 + 47 s against every default threshold.
 
 **⑩ Logs/metrics/alerts**: `processor_request_id`, `path`, `priority`, `cluster_id`,
 `lane`, `lease_owner`, `leader_epoch`, `attempt`, `response_status`,

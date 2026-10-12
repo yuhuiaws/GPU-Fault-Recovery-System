@@ -743,6 +743,16 @@ contract) does it fall back to redeploying wave by wave.
 
 ## 5. Kubernetes Lifecycle Contract
 
+The container command of the three CPU roles is a contract: the base manifest picks the interpreter and launches
+`python -m gpu_fault.app.serve gpu_fault.app:create_app --factory ...` (`gpu_fault.app.serve` reuses uvicorn's `Server`
+and every flag, but lets each worker process bind the service port itself with `SO_REUSEPORT` instead of inheriting the
+one shared socket `uvicorn --workers` binds in the parent); the renderer rewrites only the flags after the application
+reference (`--port/--workers/--backlog`, `--timeout-keep-alive {KEEP_ALIVE_TIMEOUT_SECONDS}`, `--limit-concurrency`) and
+refuses any other launcher; `verify_control_plane_role_split.py` after the deploy and `gpu_fault.config_cli validate` at
+render time both check that the command carries `-m gpu_fault.app.serve` and `--no-proxy-headers`. A command edited back
+to plain `uvicorn` still serves, but the Pod's four processes share one accept queue again; the mechanism is in the
+liveness section of the deployment manual.
+
 Runtime Deployments, DaemonSets and CronJobs must declare at the top level:
 
 | annotation | Legal values and purpose |

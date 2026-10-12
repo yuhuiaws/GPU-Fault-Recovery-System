@@ -7539,6 +7539,8 @@ baseline and NVIDIA support advice; the defaults must not be described as offici
 | `GPU_FAULT_PROCESSOR_TRAINING_PROGRESS_STALE_SECONDS` | 120 | Evicts old Training Progress only when a newer rank heartbeat already exists |
 | `GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS` | 900 | Fault events are kept for audit, but over-age/previous-boot events must not automatically execute destructive actions |
 | `GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS` | 15 | Maximum stagger window for the first collection of ordinary Collectors; `TRIGGER_HEALTH_SNAPSHOT` bypasses this phase via the request file |
+| `GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS` | 20 | Random start-up offset added on top of the stagger window; the first health summary and the first heartbeat are not delayed |
+| `GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO` | 0.1 | +-ratio jitter per round of the inventory/health-summary/heartbeat cadences; the silence thresholds are checked against cadence x (1+ratio) + stagger + retry ladder |
 | `GPU_FAULT_PROCESSOR_EXIT_ON_DEADLINE` | true | Exit the process after a deadline fires and let Kubernetes recreate it |
 | `GPU_FAULT_PROCESSOR_EXIT_GRACE_SECONDS` | 5 | Wrap-up seconds before an unhealthy process hard-exits |
 | `GPU_FAULT_PROCESSOR_MAX_QUEUE_DEPTH` | Regional manifest 65536; bare application default 10000 | Regional processor queue admission cap |
@@ -10157,11 +10159,57 @@ median of 10 ms and a maximum of 0.61 s (that GC pause). The probe parameters ar
 process, and three unanswered probes in a row (30 s) mean the event loop has not run for longer than the whole burst --
 a real hang. Readiness keeps `/healthz` on the service port at 5 s x 3: a Pod that cannot accept a request promptly is
 exactly what readiness should report. When diagnosing, read `gpu_fault_listen_accept_queue_connections{port}` (accept
-queue depth of the listening socket; the Pod's processes share it, so take the maximum), `gpu_fault_listen_somaxconn`
+queue depth of this process's listening socket; one `SO_REUSEPORT` socket per worker, so sum over the Pod's processes), `gpu_fault_listen_somaxconn`
 (the Pod network namespace's accept-queue cap: a Pod's own namespace gets the kernel default 4096, the 65535 the node
 DaemonSet writes does not reach the Pod, `--backlog 8192` is clamped to 4096, and once the queue is full new SYNs are
 dropped and clients retransmit after 1 s), the `gpu_fault_event_loop_lag_seconds` histogram,
 `gpu_fault_gc_collection_seconds_max{generation}` and `gpu_fault_process_resident_memory_bytes`.
+
+The service port itself is no longer one shared accept queue either: the three roles' container command launches
+`python -m gpu_fault.app.serve` (`gpu_fault.app.serve` reuses uvicorn's `Server` and every flag, but each worker process
+binds the service port itself with `SO_REUSEPORT`, so the kernel hashes each new connection's 4-tuple to one worker's own
+accept queue; the `--workers 1` spool-worker uses the same launcher). The local reproduction (the same
+`scripts/perf/ingress_event_loop_burst.py`, `--launcher uvicorn|serve`, idle host, load average 2.5-4.3): at 50 clusters x
+85 cold-connect workers (4,250 concurrent connections) the two launchers are within noise -- 1,141/1,135 vs 1,110/1,097
+req/s, client p50 3.66/3.68 vs 3.73/3.74 s and p99 4.18/4.03 vs 4.32/4.51 s, service-port first byte p50 3.3/3.2 vs
+3.3/3.0 s; the kernel spreads arrivals evenly (each worker serves 24.7-25.2%), the four queues' busiest/quietest depth
+ratio is 1.13-1.30, total depth median 3,900 vs 3,750. The difference appears once the connections exceed the Pod
+namespace's `somaxconn` (4096) -- which the live 50-cluster burst did, at 4,266 per Pod: at 50 x 110 workers (5,500
+connections) the shared socket's queue pins at 4,097, new SYNs are dropped and retransmitted after 1/3/7/15 s, 961 req/s,
+73 503s, client p99 27.9 s, max 31.6 s; four per-worker sockets hold 5,089 queued connections (1,051-1,186 each, far
+below 4096), 1,117 req/s, 0 non-2xx, p99 5.35 s, max 5.44 s. The costs are the hash itself: a connection is pinned to the
+worker that accepted it for its lifetime (long-lived connections do not rebalance across workers until they expire), the
+per-worker share has a random assignment's variance, and a connection still in a worker's accept queue when that worker
+closes its socket (a crash, or the stop at the end of a roll) is reset rather than handed to a sibling (a Pod namespace
+cannot set `net.ipv4.tcp_migrate_req`) -- covered by the clients' idempotent retry; there is no cross-worker work stealing
+at the tail of a burst (+3-11% tail latency at 4,250 connections). Read `gpu_fault_listen_reuse_port` (1 = this process
+serves on its own socket), `gpu_fault_listen_accepted_connections_total{port}` (per process; the spread across slots is
+the hash's imbalance) and `gpu_fault_listen_open_connections{port}` (connections this worker holds, idle keep-alive
+included; summed over the Pod).
+
+The node side (collectors and the Agent) moves to long-lived connections with jitter: the pool in
+`gpu_fault.transport.http_client` keeps one HTTP/1.1 connection per (scheme, host, port) per thread under a
+`ConnectionPolicy` -- a connection idle longer than `GPU_FAULT_HTTP_CONNECTION_IDLE_SECONDS` (90 s, which must stay below
+the NLB's fixed 350 s idle timeout) is closed and replaced before reuse instead of wasting an attempt on a dead flow,
+`GPU_FAULT_HTTP_TCP_KEEPALIVE_SECONDS` (60 s, probes 15 s x 4) keeps the NLB's idle clock from expiring, and a connection
+older than `GPU_FAULT_HTTP_CONNECTION_MAX_AGE_SECONDS` (1800 s, +-10% jitter) is replaced so clients re-spread over Pods
+and workers; a keep-alive connection the peer closed meanwhile still fails closed -- only an idempotent request (GET, or a
+POST carrying `Idempotency-Key`/`X-GPU-Fault-Request-ID`; the Agent heartbeat now carries the latter) is retried once on
+a fresh connection. The server-side `--timeout-keep-alive` rises from 5 s to 100 s (above the client's 90 s idle cut), so
+the 30 s heartbeat and the 60 s inventory each keep one connection per process while the 300 s health summaries still
+reconnect. Capacity arithmetic: uvicorn's `--limit-concurrency 4096` counts idle keep-alive connections, and the design
+scale (12,800 nodes x two sub-90 s channels = 25,600 long-lived connections / 12 ingress processes ~ 2,133 per process)
+takes about half of that budget, which is why the 300 s channels stay on the reconnect side. In the reproduction 4,250
+keep-alive client connections cut 41,500 connection set-ups to 4,250 (no accept queue, median 0) but every closed-loop
+client's request went straight into the in-process admission queue (890 vs 1,100-1,140 req/s, p99 10-12.6 s) -- a real
+collector posts once per 30-300 s on its connection and is never in flight all at once. Jitter:
+`GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO` (0.1) moves every round of the inventory, the health summaries and the Agent
+heartbeat by +-10% (still anchored to the cluster/node/channel stable phase); `GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS`
+(20) adds a random `[0, 20)` s start-up offset on top of the deterministic 15 s stagger (the kernel collector's first
+summary and the Agent's first heartbeat, its registration, are not delayed); the silence thresholds are checked against
+cadence x 1.1 + 15 + 20 + 47 s (the sink's full retry ladder): inventory 148 s <= 180 s, the 300 s channels 412 s <= 420 s
+/ 900 s (`tests/collectors/test_cadence_jitter.py`). On a node read the Agent's `/healthz` `transport` section
+(opened/reused/stale/idle-expired counters) or each collector's `transport pool:` log line every 300 s.
 Because the container needs to install dependencies from the wheel at startup, a TCP `startupProbe` must also be configured (currently waiting up to
 10 minutes); before startup succeeds Kubernetes runs no readiness/liveness, avoiding repeatedly restarting a container still
 installing dependencies.
@@ -10867,6 +10915,11 @@ Parameter description:
 | `GPU_FAULT_PROCESSOR_RECEIPT_POLL_SECONDS` | `0.25` | Initial receipt polling interval; the client backs off exponentially up to 2 seconds |
 | `GPU_FAULT_WATCHER_RECONCILE_DEBOUNCE_SECONDS` | `0.5` | Debounce window merging Pod watch events per attempt, avoiding O(N²) full Observation resends for large jobs |
 | `GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS` | `15` | Stable stagger window for the first GPU/Host collection after an ordinary Collector starts/restarts; the phase is determined by a cluster/node/channel hash |
+| `GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS` | `20` | Random `[0, N)` start-up offset added on top of the stagger window; 0 disables it |
+| `GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO` | `0.1` | Random +-ratio x interval move of every periodic post (inventory, the health summaries, the Agent heartbeat), at most 0.5; 0 disables it |
+| `GPU_FAULT_HTTP_CONNECTION_IDLE_SECONDS` | `90` | Idle ceiling of the node-side connection pool, below the NLB's 350 s; an idler connection is closed and replaced before reuse |
+| `GPU_FAULT_HTTP_CONNECTION_MAX_AGE_SECONDS` | `1800` | Longest life of a node-side connection (+-10% jitter); replaced at expiry so clients re-spread over Pods and workers; 0 unbounded |
+| `GPU_FAULT_HTTP_TCP_KEEPALIVE_SECONDS` | `60` | TCP keepalive idle time of node-side connections (probes every 15 s, 4 probes); 0 disables it |
 | `GPU_FAULT_STORE_IO_WORKERS` | `8` | Bounded number of threads per API process executing synchronous Aurora/store transactions |
 | `GPU_FAULT_STORE_IO_MAX_IN_FLIGHT` | `64` | Total store calls allowed executing and waiting per API process |
 | `GPU_FAULT_STORE_IO_ADMISSION_TIMEOUT_SECONDS` | `2` | Time to wait for a slot when store I/O is saturated; on timeout returns 503 with `Retry-After` |

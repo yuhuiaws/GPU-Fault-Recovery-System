@@ -439,6 +439,12 @@ same concurrency topology.
 - A cold-connect burst (a new connection per request, thousands concurrent per Pod) that is accepted in full (all 202)
   must not get any api-ha replica restarted by liveness: the probe answers on the dedicated `livez` port, and
   `gpu_fault_listen_accept_queue_connections` may reach thousands while the probe latency stays at GC-pause scale.
+- More concurrent connections per Pod than the Pod namespace's `somaxconn` (4096) must not produce the seconds-long
+  retransmit tail of dropped SYNs: the service port is bound per worker with `SO_REUSEPORT` by `gpu_fault.app.serve`,
+  `gpu_fault_listen_accept_queue_connections` is exported per process and stays below 4096 each, and the per-process
+  shares of `gpu_fault_listen_accepted_connections_total` stay within a random assignment's variance; the load clients'
+  `connection_modes` cover both cold-connect and warm-keepalive (`--prewarm-connections`), and the start-burst verdict
+  is taken on cold-connect.
 
 ## 7. Required Metrics
 
@@ -1443,3 +1449,15 @@ small and cannot explain second-level latency.
     `gpu_fault_event_loop_lag_seconds` histogram and `gpu_fault_gc_collection_seconds_max`. Setting the flush stub to
     8 ms of CPU per item (i.e. assuming the 81 ms flush is all CPU) gives 583 req/s and 43% 503s, inconsistent with the
     live 1,175 req/s and 0 non-2xx -- the live flush's 81 ms is mostly Aurora round-trip wait.
+    Follow-up (the same reproduction plus `--launcher uvicorn|serve`, `--keep-alive`, per-socket accept queues and
+    per-worker shares): per-worker `SO_REUSEPORT` service sockets are within noise of the shared socket at 4,250
+    concurrent cold connections (1,141/1,135 vs 1,110/1,097 req/s, client p99 4.18/4.03 vs 4.32/4.51 s, per-worker shares
+    24.7-25.2%, busiest/quietest queue 1.13-1.30) and decisive at 5,500 (above `somaxconn` 4096): the shared socket's
+    queue pins at 4,097 and dropped SYNs retransmit after 1/3/7/15 s -- 961 req/s, 73 503s, client p99 27.9 s, max
+    31.6 s; four sockets hold 5,089 queued connections (1,051-1,186 each) -- 1,117 req/s, 0 non-2xx, p99 5.35 s, max
+    5.44 s. Keep-alive closed-loop clients (4,250 long-lived connections, server `--timeout-keep-alive 100`) cut
+    connection set-ups from 41,500 to 4,250 with an accept-queue median of 0, but every request goes straight into the
+    in-process admission queue (890 vs 1,100-1,140 req/s, p99 10-12.6 s) -- the shape of a closed loop without think
+    time; a real collector posts once per 30-300 s. Conclusion: SO_REUSEPORT is a capacity lever (x4 queued connections
+    per Pod), not a throughput lever; long-lived connections save handshakes, not admission waits; neither changes
+    liveness (dedicated-port probe p50 8-39 ms).

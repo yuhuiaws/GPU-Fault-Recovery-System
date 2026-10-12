@@ -359,6 +359,23 @@ and `GPU_FAULT_GC_GEN2_THRESHOLD` (CPython's 10 by default; raising it to 100 cu
 total GC time by another 30% but stretched each pause to 0.45-0.59 s -- a worse trade for an event loop, so set it only
 for an A/B).
 
+The service port's accept queue is split per worker as well: the three roles launch through `python -m gpu_fault.app.serve`,
+each worker binds the service port itself with `SO_REUSEPORT`, and the completed connections a Pod can queue grow from
+`somaxconn` (4096) to `--workers x 4096`. This is not a throughput lever (in the same reproduction, at 4,250 concurrent
+cold connections, throughput and median latency are within noise and the tail is +3-11%) but a capacity lever: past 4096
+connections the shared socket drops SYNs (5,500 concurrent: 961 req/s, 73 503s, client p99 27.9 s) while the per-worker
+sockets do not (1,117 req/s, 0 non-2xx, p99 5.35 s); the 50-cluster preset's ~4,266 cold connections per Pod sit exactly
+across that line. With it, `--timeout-keep-alive 5 -> 100` (renderer constant `KEEP_ALIVE_TIMEOUT_SECONDS`, above the
+node-side pool's 90 s idle ceiling): the node Agent heartbeat (30 s) and the GPU inventory (60 s) each keep one long-lived
+connection per process, the 300 s health summaries still reconnect. The capacity arithmetic must remember that uvicorn's
+`--limit-concurrency 4096` counts idle keep-alive connections: the design scale, 12,800 nodes x 2 channels = 25,600
+long-lived connections / 12 ingress processes ~ 2,133 per process, leaves ~1,960 for bursts; making the 300 s channels
+long-lived too would add 4 per node (~4,267 per process) and exceed the limit, which is why the client's idle ceiling
+stays at 90 s by default. The node-side jitter (`GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO` 0.1,
+`GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS` 20) spreads the first posts after a fleet-wide restart from a 15 s window to
+35 s and requires every silence threshold >= cadence x 1.1 + 35 + 47 s (all defaults satisfy it; held by
+`tests/collectors/test_cadence_jitter.py`).
+
 ### 4.7 PostgreSQL Connection Budget
 
 The runtime, the administrator validation and the capacity runner share
