@@ -18,6 +18,7 @@ from gpu_fault_release.regional_release_images import (
     previous_node_template_environment,
 )
 from gpu_fault_release.regional_release_legacy import validate_rollback_agent_identity
+from gpu_fault_release.regional_release_node_scope import served_node_scope
 from gpu_fault_release.regional_release_rollback_context import (
     previous_cluster_runtime_profiles,
 )
@@ -109,7 +110,11 @@ def rollback_target(
         config_digest = str(old_profile["agent_config_digest"])
     if components & {ReleaseComponent.AGENT, ReleaseComponent.RECONCILER}:
         validate_rollback_node_template(self, target, previous=previous)
-    if ReleaseComponent.ENDPOINT in components:
+    # The node scope the consumers are re-rendered for: what the restored
+    # Secret serves when this rollback restores it, else the site's (the Secret
+    # the failed release left in place is the one the site records).
+    node_scope: dict[str, str] | None = None
+    if components & {ReleaseComponent.ENDPOINT, ReleaseComponent.CONNECTION}:
         secret = ((previous.get("secret_backups") or {}).get("clusters") or {}).get(
             target.cluster_id
         ) or {}
@@ -117,11 +122,13 @@ def rollback_target(
             raise ReleaseError(
                 f"{target.cluster_id} rollback connection Secret backup is missing"
             )
-        self._restore_secret(
+        restored = self._restore_secret(
             self._gpu(target),
             source=str(secret["source"]),
             backup=str(secret["backup"]),
         )
+        if restored:
+            node_scope = served_node_scope(restored, target)
     wheel = old.get("wheel")
     if ReleaseComponent.ENDPOINT in components:
         self._verify_gpu_control_plane_endpoint(target)
@@ -167,6 +174,7 @@ def rollback_target(
             pin_metadata=(
                 dict(previous_metadata) if isinstance(previous_metadata, dict) else None
             ),
+            node_scope=node_scope,
         )
     if ReleaseComponent.AGENT in components:
         missing = [name for name in ("reconciler_wheel", "bundle") if not old.get(name)]
@@ -230,4 +238,5 @@ def rollback_target(
             runtime_image=runtime_image,
             node_installer_image=node_installer_image,
             node_dependency_target=NodeDependencyTarget.PREVIOUS,
+            node_scope=node_scope,
         )

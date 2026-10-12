@@ -112,6 +112,23 @@ class CheckedRelease(ResourceRelease):
         }
         for item in self.documents[("gpu-a", "nodes", "")]["items"]:
             item["status"] = {"conditions": [{"type": "Ready", "status": "True"}]}
+        # Each cluster's connection Secret serves the scope the site records
+        # (a HyperPod cluster joined before the ownership convention).
+        for target in self.config.clusters:
+            self.documents[
+                (target.context, "secret", "gpu-fault-regional-connection")
+            ] = {
+                "data": {
+                    key: base64.b64encode(value.encode()).decode()
+                    for key, value in {
+                        "node-selector": (
+                            "sagemaker.amazonaws.com/cluster-name="
+                            + target.hyperpod_cluster_name
+                        ),
+                        "node-selector-source": "provider-default-legacy",
+                    }.items()
+                }
+            }
         self.documents[("cpu", "nodes", "")] = {
             "items": [
                 {

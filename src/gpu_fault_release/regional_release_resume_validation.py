@@ -31,6 +31,7 @@ from gpu_fault_release.regional_release_validation import validate_gpu_rollback_
 GPU_COMPONENTS = frozenset(
     {
         ReleaseComponent.ENDPOINT,
+        ReleaseComponent.CONNECTION,
         ReleaseComponent.DCGM,
         ReleaseComponent.EXECUTOR,
         ReleaseComponent.WATCHER,

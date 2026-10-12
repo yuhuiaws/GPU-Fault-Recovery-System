@@ -7,7 +7,7 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from contextvars import ContextVar
-from typing import Any
+from typing import Any, Mapping
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -710,6 +710,7 @@ def _gpu_deployment_manifests(
     executor_compatibility_digest: str | None = None,
     require_live_pin: bool,
     pin_metadata: dict[str, Any] | None = None,
+    node_scope: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     artifact_sha = executor_artifact_sha or release.executor_wheel_sha
     compatibility_digest = (
@@ -735,6 +736,7 @@ def _gpu_deployment_manifests(
             executor_wheel_filename=executor_wheel_filename,
             executor_artifact_sha=artifact_sha,
             executor_compatibility_digest=compatibility_digest,
+            node_scope=node_scope,
         )
     )
     if inventory.GPU_WATCHER_DEPLOYMENT in manifests:
@@ -794,6 +796,7 @@ def apply_gpu_deployments(
     executor_artifact_sha: str | None = None,
     executor_compatibility_digest: str | None = None,
     pin_metadata: dict[str, Any] | None = None,
+    node_scope: Mapping[str, str] | None = None,
 ) -> None:
     preflight_allowed_namespace_coverage(release, target)
     manifests = _gpu_deployment_manifests(
@@ -808,6 +811,7 @@ def apply_gpu_deployments(
         executor_compatibility_digest=executor_compatibility_digest,
         require_live_pin=True,
         pin_metadata=pin_metadata,
+        node_scope=node_scope,
     )
     # One wave. The three Deployments each talk to the control plane and none
     # of them to another, and the endpoint gate they all depend on has already
@@ -891,16 +895,34 @@ def upgrade_gpu_target(
     # Deployments below are applied only after every step has returned, which
     # is the ordering the gate exists for (regional_release_gpu_stage).
     stage: list[GpuStageStep] = []
+    # The endpoint gate renders the connection Secret on its way to the probe,
+    # so it covers a CONNECTION change in the same step; CONNECTION alone
+    # re-renders the Secret (a changed node scope) without the gate.
+    secret_components = tuple(
+        component
+        for component in (ReleaseComponent.ENDPOINT, ReleaseComponent.CONNECTION)
+        if active_plan.has(component)
+    )
     if active_plan.has(ReleaseComponent.ENDPOINT):
         stage.append(
             GpuStageStep(
                 "GPU DNS/TLS gate",
                 lambda: run_component(
-                    (ReleaseComponent.ENDPOINT,),
+                    secret_components,
                     lambda: (
                         release._ensure_connection_secret(target),
                         release._verify_gpu_control_plane_endpoint(target),
                     ),
+                ),
+            )
+        )
+    elif active_plan.has(ReleaseComponent.CONNECTION):
+        stage.append(
+            GpuStageStep(
+                "connection Secret",
+                lambda: run_component(
+                    secret_components,
+                    lambda: release._ensure_connection_secret(target),
                 ),
             )
         )

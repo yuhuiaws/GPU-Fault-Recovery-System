@@ -9,14 +9,18 @@ quietly changed node set is exactly what the convention exists to prevent.
 
 This verb is the explicit, journaled path from the recorded selector to the
 label. Read-only by default, it shows per cluster what the site records,
-what the node groups declare today and the two node sets side by side.
-``--converge`` rewrites one cluster's site entry to the label selector only
-when the label-derived node set is the current node set to the name: a
-group the administrator forgot to label, a current node the provider has
-not labelled yet (HyperPod applies ``KubernetesConfig`` labels through its
-own reconciliation) or a labelled group that would bring new nodes each
-refuse, naming the nodes. The next ``deploy`` rolls the converged selector
-into the connection Secret and the data-plane manifests.
+what the node groups declare today, the two node sets side by side and what
+the cluster's connection Secret -- the selector the data plane actually runs
+-- serves (``data_plane``). ``--converge`` rewrites one cluster's site entry
+to the label selector only when the label-derived node set is the current
+node set to the name: a group the administrator forgot to label, a current
+node the provider has not labelled yet (HyperPod applies ``KubernetesConfig``
+labels through its own reconciliation) or a labelled group that would bring
+new nodes each refuse, naming the nodes. The recorded scope is a release
+input (``regional_release_node_scope``): the next ``deploy`` classifies the
+change ``DATA_PLANE_COMPATIBLE``, re-renders the connection Secret and
+restarts the executor, Completion Watcher and node installer reconciler that
+read it, and its verify refuses a cluster whose Secret still disagrees.
 """
 
 from __future__ import annotations
@@ -55,6 +59,10 @@ from gpu_fault.cluster_scope import (
     node_selector_source,
     selector_matches,
 )
+from gpu_fault_release.regional_release_node_scope import (
+    CONNECTION_SECRET,
+    served_node_scope,
+)
 
 __all__ = [
     "COMMAND",
@@ -68,6 +76,11 @@ JOURNAL_DIR = "node-scope"
 CONVERGED = "converged"
 READY = "ready"
 BLOCKED = "blocked"
+#: ``data_plane.state``: the connection Secret serves the recorded scope, the
+#: cluster has no Secret yet (not bootstrapped), or ``deploy`` must still roll.
+DATA_PLANE_CONVERGED = "converged"
+DATA_PLANE_ABSENT = "absent"
+DATA_PLANE_PENDING = "pending deploy"
 
 
 def add_node_scope_command(
@@ -167,6 +180,64 @@ def _node_group_facts(
     return facts, hyperpod_name
 
 
+def _kubectl(
+    site: RenderedSite, entry: Mapping[str, Any], *arguments: str
+) -> list[str]:
+    command = ["kubectl"]
+    kubeconfig = site.release_config.get("gpu_kubeconfig") or site.environment.get(
+        "KUBECONFIG"
+    )
+    if kubeconfig:
+        command.extend(["--kubeconfig", str(kubeconfig)])
+    command.extend(["--context", str(entry["context"]), *arguments])
+    return command
+
+
+def _data_plane_scope(
+    runner: CommandRunner, *, site: RenderedSite, entry: Mapping[str, Any]
+) -> dict[str, Any]:
+    """What the cluster's connection Secret serves, against the recorded scope.
+
+    The Secret is read as a sensitive command (its token is never printed) and
+    only the two selector keys are decoded.
+    """
+
+    raw = runner.run(
+        _kubectl(
+            site,
+            entry,
+            "-n",
+            str(site.release_config["namespace"]),
+            "get",
+            "secret",
+            CONNECTION_SECRET,
+            "--ignore-not-found",
+            "-o",
+            "json",
+        ),
+        capture=True,
+        sensitive=True,
+        timeout_seconds=60,
+    )
+    if not raw.strip():
+        return {"selector": None, "source": None, "state": DATA_PLANE_ABSENT}
+    try:
+        data = json.loads(raw).get("data")
+    except (json.JSONDecodeError, AttributeError) as exc:
+        raise BootstrapError(
+            f"{entry['cluster_id']}: the connection Secret is unreadable"
+        ) from exc
+    served = served_node_scope(data if isinstance(data, dict) else {}, entry)
+    recorded = {
+        "selector": node_selector(entry),
+        "source": node_selector_source(entry).value,
+    }
+    return {
+        **served,
+        "state": DATA_PLANE_CONVERGED if served == recorded else DATA_PLANE_PENDING,
+    }
+
+
 def _nodes(
     runner: CommandRunner,
     *,
@@ -176,24 +247,7 @@ def _nodes(
 ) -> dict[str, dict[str, str]]:
     """``{node name: labels}`` the API server returns for ``selector``, re-checked."""
 
-    command = ["kubectl"]
-    kubeconfig = site.release_config.get("gpu_kubeconfig") or site.environment.get(
-        "KUBECONFIG"
-    )
-    if kubeconfig:
-        command.extend(["--kubeconfig", str(kubeconfig)])
-    command.extend(
-        [
-            "--context",
-            str(entry["context"]),
-            "get",
-            "nodes",
-            "-l",
-            selector,
-            "-o",
-            "json",
-        ]
-    )
+    command = _kubectl(site, entry, "get", "nodes", "-l", selector, "-o", "json")
     try:
         document = json.loads(runner.run(command, capture=True, timeout_seconds=60))
         items = document["items"]
@@ -233,6 +287,7 @@ def assess_cluster(
         "node_groups": [item.describe() for item in facts],
         "label": {"selector": None, "owned_groups": [], "refusal": None},
         "nodes": {},
+        "data_plane": _data_plane_scope(runner, site=site, entry=entry),
     }
     try:
         scope: NodeScope | None = resolve_node_scope(
@@ -467,14 +522,17 @@ def run_node_scope_command(
                     site, report, reference=str(reference), now=now
                 )
             result["next_step"] = (
-                f"gpu-fault-admin deploy --state-dir {site.source.parent} rolls the "
-                "selector into the connection Secret and the data-plane manifests"
+                f"gpu-fault-admin deploy --state-dir {site.source.parent} classifies "
+                "the change DATA_PLANE_COMPATIBLE, re-renders the connection Secret "
+                "and restarts the executor, Completion Watcher and node installer "
+                "reconciler that read it"
             )
     print(json.dumps(result, indent=2, sort_keys=True))
     print(
         f"gpu-fault-admin {COMMAND}: "
         + "; ".join(
-            f"{item['cluster_id']} {item['source']} -> {item['convergence']}"
+            f"{item['cluster_id']} {item['source']} -> {item['convergence']}; "
+            f"data plane {item['data_plane']['state']}"
             for item in reports
         ),
         file=sys.stderr,

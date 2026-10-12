@@ -232,3 +232,36 @@ def test_pin_only_rollback_replays_no_manifests() -> None:
     assert plan.replayed_manifests == frozenset(), (
         "a pin-only release was reported as carrying template drift"
     )
+
+
+def test_connection_progress_compensates_the_started_cluster_without_the_endpoint() -> (
+    None
+):
+    """A node-scope release that stopped after re-rendering one cluster's Secret
+    restores that Secret (the ENDPOINT backup) and nothing on the CPU or the
+    NLB; the clusters it never reached keep what they serve."""
+
+    state = _state(
+        DIFF.ReleaseComponent.CONNECTION,
+        DIFF.ReleaseComponent.EXECUTOR,
+        DIFF.ReleaseComponent.WATCHER,
+        DIFF.ReleaseComponent.RECONCILER,
+        DIFF.ReleaseComponent.VERIFY,
+        completed_phases=("uploaded",),
+    )
+    state["component_progress"] = PROGRESS.update_component_progress(
+        state,
+        DIFF.ReleaseComponent.CONNECTION,
+        PROGRESS.PROGRESS_STARTED,
+        cluster_id="gpu-b",
+        observed_at_epoch=10.0,
+    )
+
+    plan = PROGRESS.build_rollback_compensation_plan(state, ["gpu-a", "gpu-b"])
+
+    assert plan.for_cluster("gpu-a") == frozenset()
+    assert plan.for_cluster("gpu-b") == frozenset({DIFF.ReleaseComponent.CONNECTION})
+    assert plan.restores_data_plane is True
+    assert plan.restores_endpoint is False, "the Route53 record is not touched"
+    assert plan.restores_cpu is False
+    assert plan.needs_controller is False

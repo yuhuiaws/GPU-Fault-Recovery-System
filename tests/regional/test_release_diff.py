@@ -6,6 +6,7 @@ import pytest
 from gpu_fault.admin.config import default_admin_config
 from gpu_fault_release import regional_release_config as CONFIG
 from gpu_fault_release import regional_release_diff as DIFF
+from gpu_fault_release import regional_release_node_scope as SCOPE
 from scripts import component_wheels
 from scripts.component_wheels import (
     COMPONENTS,
@@ -579,4 +580,99 @@ def test_a_state_recorded_with_the_pin_folded_membership_digest_is_unchanged(
     state["cluster_registry_digest"] = "other-" + "6" * 58
     assert "clusters" in DIFF.classify_release(release, state).changed, (
         "a genuinely different membership stays a clusters change"
+    )
+
+
+def _consumer_plan() -> tuple[DIFF.ReleaseComponent, ...]:
+    return (
+        DIFF.ReleaseComponent.CONNECTION,
+        DIFF.ReleaseComponent.EXECUTOR,
+        DIFF.ReleaseComponent.WATCHER,
+        DIFF.ReleaseComponent.RECONCILER,
+        DIFF.ReleaseComponent.VERIFY,
+    )
+
+
+def test_a_recorded_node_scope_change_rolls_the_secret_and_its_consumers() -> None:
+    """``node-scope --converge`` rewrote a cluster's selector in site.yaml; the
+    release state still carries the digest of the scopes the last release
+    rolled, so the deploy that follows is a data-plane release, not a NOOP."""
+
+    release = _release()
+    state = _state()
+    state[SCOPE.RECORDED_SCOPES_DIGEST_STATE_KEY] = "0" * 64
+
+    diff = DIFF.classify_release(release, state)
+
+    assert diff.changed == {SCOPE.RECORDED_SCOPES_INPUT}, diff
+    assert diff.kind is DIFF.ReleaseChangeKind.DATA_PLANE_COMPATIBLE
+    plan = DIFF.build_execution_plan(diff)
+    assert plan.nodes == _consumer_plan(), (
+        "the Secret is re-rendered and exactly the Deployments reading it roll"
+    )
+    assert not plan.has(
+        DIFF.ReleaseComponent.ENDPOINT,
+        DIFF.ReleaseComponent.COLLECTOR,
+        DIFF.ReleaseComponent.AGENT,
+        DIFF.ReleaseComponent.CPU_STAGE,
+        DIFF.ReleaseComponent.CPU_FINALIZE,
+        DIFF.ReleaseComponent.REGISTRY,
+    ), "no NLB/DNS apply, no collector or node Agent wave, no CPU roll"
+
+
+def test_a_state_recorded_before_node_scopes_were_an_input_is_not_a_change() -> None:
+    release = _release()
+    state = _state()
+    assert SCOPE.RECORDED_SCOPES_DIGEST_STATE_KEY not in state, (
+        "the fixture predates it"
+    )
+    assert DIFF.classify_release(release, state).kind is DIFF.ReleaseChangeKind.NOOP, (
+        "an older state says nothing about what it rolled; the served-scope "
+        "probe decides for it"
+    )
+    state[SCOPE.RECORDED_SCOPES_DIGEST_STATE_KEY] = SCOPE.cluster_node_scopes_digest(
+        release.config
+    )
+    assert (
+        SCOPE.RECORDED_SCOPES_INPUT not in DIFF.classify_release(release, state).changed
+    )
+
+
+def test_a_secret_serving_another_scope_is_drift_the_plan_repairs(monkeypatch) -> None:
+    """Live: both converged clusters' Secrets still served the join-time
+    selector while the recorded digest was unknown to the state."""
+
+    release = _release()
+    monkeypatch.setattr(
+        DIFF,
+        "node_scope_drift",
+        lambda _release: {
+            "gpu-a": {
+                "recorded": {
+                    "selector": "gpu-fault.io/control-plane=site",
+                    "source": "label-convention",
+                },
+                "served": {
+                    "selector": "eks.amazonaws.com/nodegroup=gpu",
+                    "source": "flag-legacy",
+                },
+            }
+        },
+    )
+
+    diff = DIFF.classify_release(release, _state())
+
+    assert diff.changed == {SCOPE.SERVED_SCOPE_DRIFT_INPUT}, diff
+    assert diff.kind is DIFF.ReleaseChangeKind.DATA_PLANE_COMPATIBLE
+    assert DIFF.build_execution_plan(diff).nodes == _consumer_plan()
+
+
+def test_the_served_scope_is_not_probed_without_a_committed_state(monkeypatch) -> None:
+    def probe(_release):
+        raise AssertionError("a bootstrap has no Secret to compare against")
+
+    monkeypatch.setattr(DIFF, "node_scope_drift", probe)
+    assert (
+        SCOPE.SERVED_SCOPE_DRIFT_INPUT
+        not in DIFF.classify_release(_release(), {}).changed
     )

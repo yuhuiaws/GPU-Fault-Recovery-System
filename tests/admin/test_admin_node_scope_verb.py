@@ -10,6 +10,7 @@ selector only when the label-derived node set is the current node set.
 
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 
@@ -30,6 +31,11 @@ EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-eks-cluster"
 HP_SELECTOR = "sagemaker.amazonaws.com/cluster-name=hp-gpu-a"
 HP_LABEL_SELECTOR = f"{OWNERSHIP_LABEL}={SITE_ID},{HP_SELECTOR}"
 EKS_LABEL_SELECTOR = f"{OWNERSHIP_LABEL}={SITE_ID}"
+#: What a HyperPod cluster's connection Secret serves before any convergence.
+LEGACY_HP_SECRET = {
+    "node-selector": HP_SELECTOR,
+    "node-selector-source": "provider-default-legacy",
+}
 
 
 def _node(name: str, labels: dict[str, str]) -> dict:
@@ -45,11 +51,15 @@ class ScopeRunner:
         hyperpod_groups: list[dict] | None = None,
         nodegroups: dict[str, dict] | None = None,
         nodes: dict[str, list[dict]] | None = None,
+        secrets: dict[str, dict[str, str]] | None = None,
     ):
         self.hyperpod_groups = hyperpod_groups or []
         self.nodegroups = nodegroups or {}
         # Per kube context: every node of the cluster, with its labels.
         self.nodes = nodes or {}
+        # Per kube context: the decoded selector keys the connection Secret
+        # serves; a context without an entry has no Secret (not bootstrapped).
+        self.secrets = secrets or {}
         self.commands: list[list[str]] = []
 
     def aws_json(self, region, service, operation, *arguments, **_options):
@@ -63,10 +73,23 @@ class ScopeRunner:
             return {"nodegroup": {"nodegroupName": name, **self.nodegroups[name]}}
         raise AssertionError(f"unexpected aws call {service} {operation}")
 
-    def run(self, arguments, **_options):
+    def run(self, arguments, **options):
         self.commands.append(list(arguments))
-        assert arguments[0] == "kubectl" and "get" in arguments and "nodes" in arguments
+        assert arguments[0] == "kubectl" and "get" in arguments
         context = arguments[arguments.index("--context") + 1]
+        if "secret" in arguments:
+            assert options.get("sensitive") is True, "the Secret read never prints"
+            if context not in self.secrets:
+                return ""
+            return json.dumps(
+                {
+                    "data": {
+                        key: base64.b64encode(value.encode()).decode()
+                        for key, value in self.secrets[context].items()
+                    }
+                }
+            )
+        assert "nodes" in arguments
         selector = arguments[arguments.index("-l") + 1]
         from gpu_fault.cluster_scope import selector_matches
 
@@ -158,6 +181,7 @@ def test_show_reports_a_legacy_hyperpod_cluster_ready_to_converge(
                 _hp_node("hyperpod-i-2", "spot-p5en", labelled=True),
             ]
         },
+        secrets={"gpu-a": LEGACY_HP_SECRET},
     )
     site = load_site(site_file(tmp_path))
 
@@ -166,7 +190,8 @@ def test_show_reports_a_legacy_hyperpod_cluster_ready_to_converge(
     )
 
     assert code == 0
-    report = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
     assert report["ownership_label"] == OWNERSHIP_LABEL
     (cluster,) = report["clusters"]
     assert cluster["cluster_id"] == "gpu-a" and cluster["provider"] == "hyperpod"
@@ -182,6 +207,16 @@ def test_show_reports_a_legacy_hyperpod_cluster_ready_to_converge(
         "owned_group_nodes_without_label": [],
     }
     assert cluster["convergence"] == "ready"
+    assert cluster["data_plane"] == {
+        "selector": HP_SELECTOR,
+        "source": "provider-default-legacy",
+        "state": "converged",
+    }, "the Secret serves what the legacy entry records: the data plane agrees"
+    assert "data plane converged" in captured.err
+    secret_reads = [command for command in runner.commands if "secret" in command]
+    assert len(secret_reads) == 1 and "--ignore-not-found" in secret_reads[0], (
+        "one read of the connection Secret, tolerant of a cluster without one"
+    )
     assert any("describe-cluster" in command for command in runner.commands), (
         "the instance groups are read from the provider API"
     )
@@ -197,6 +232,7 @@ def test_converge_records_the_label_selector_and_journals_it(
     runner = ScopeRunner(
         hyperpod_groups=[_hp_group("spot-p5en", "ml.p5en.48xlarge", labelled=True)],
         nodes={"gpu-a": [_hp_node("hyperpod-i-1", "spot-p5en", labelled=True)]},
+        secrets={"gpu-a": LEGACY_HP_SECRET},
     )
     path = site_file(tmp_path)
     site = load_site(path)
@@ -240,6 +276,9 @@ def test_converge_records_the_label_selector_and_journals_it(
     report = json.loads(capsys.readouterr().out)
     assert report["status"] == "CONVERGED"
     assert "deploy --state-dir" in report["next_step"], "the deploy rolls the selector"
+    assert "DATA_PLANE_COMPATIBLE" in report["next_step"], (
+        "and the verb says how the deploy classifies the change"
+    )
     entry = yaml.safe_load(path.read_text())["spec"]["clusters"][0]
     assert entry["nodeSelector"] == HP_LABEL_SELECTOR
     assert entry["nodeSelectorSource"] == "label-convention"
@@ -280,9 +319,13 @@ def test_converge_records_the_label_selector_and_journals_it(
         runner=runner,
     )
     assert again == 0
-    assert json.loads(capsys.readouterr().out)["status"] == "NOOP", (
-        "a converged cluster converges to itself"
-    )
+    again_report = json.loads(capsys.readouterr().out)
+    assert again_report["status"] == "NOOP", "a converged cluster converges to itself"
+    assert again_report["clusters"][0]["data_plane"] == {
+        "selector": HP_SELECTOR,
+        "source": "provider-default-legacy",
+        "state": "pending deploy",
+    }, "the Secret still serves the legacy selector until the deploy rolls it"
 
 
 def test_converge_refuses_when_a_current_node_lacks_the_label(
@@ -482,3 +525,24 @@ def test_converge_argument_rules(tmp_path: Path) -> None:
             site=site,
             runner=ScopeRunner(),
         )
+
+
+def test_show_reports_a_cluster_without_a_connection_secret_as_absent(
+    tmp_path: Path, capsys
+) -> None:
+    runner = ScopeRunner(
+        hyperpod_groups=[_hp_group("spot-p5en", "ml.p5en.48xlarge", labelled=True)],
+        nodes={"gpu-a": [_hp_node("hyperpod-i-1", "spot-p5en", labelled=True)]},
+    )
+    code = verb.run_node_scope_command(
+        _arguments(state_dir=tmp_path),
+        site=load_site(site_file(tmp_path)),
+        runner=runner,
+    )
+    assert code == 0
+    (cluster,) = json.loads(capsys.readouterr().out)["clusters"]
+    assert cluster["data_plane"] == {
+        "selector": None,
+        "source": None,
+        "state": "absent",
+    }, "a cluster the bootstrap has not reached yet has nothing to compare"

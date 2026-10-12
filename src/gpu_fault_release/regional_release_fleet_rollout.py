@@ -9,7 +9,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from math import ceil
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 
@@ -44,6 +44,10 @@ from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_interfaces import AgentNodeSet
 from gpu_fault_release.regional_release_narration import narrate_step
+from gpu_fault_release.regional_release_node_scope import (
+    recorded_node_scope,
+    stamp_reconciler_node_scope,
+)
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_profile_model import target_agent_config_digest
 from gpu_fault_release.regional_release_rendering import (
@@ -168,7 +172,9 @@ def restore_secret(
     *,
     source: str,
     backup: str,
-) -> None:
+) -> dict[str, str]:
+    """Put the backup's data back under ``source``; return that data."""
+
     value = release._get_json(
         kubectl
         + [
@@ -181,6 +187,7 @@ def restore_secret(
     )
     if not value.get("data"):
         raise ReleaseError(f"release Secret backup is missing: {backup}")
+    data = {str(key): str(item) for key, item in (value.get("data") or {}).items()}
     document = {
         "apiVersion": "v1",
         "kind": "Secret",
@@ -189,13 +196,14 @@ def restore_secret(
             "namespace": release.config.namespace,
         },
         "type": value.get("type") or "Opaque",
-        "data": dict(value.get("data") or {}),
+        "data": data,
     }
     release.runner.run(
         kubectl + ["apply", "-f", "-"],
         input_text=json.dumps(document),
         sensitive=True,
     )
+    return data
 
 
 def backup_release_secrets(release: Any) -> dict[str, Any]:
@@ -1398,6 +1406,7 @@ def deploy_reconciler(
     runtime_image: str | None = None,
     node_installer_image: str | None = None,
     node_dependency_target: NodeDependencyTarget = NodeDependencyTarget.CANDIDATE,
+    node_scope: Mapping[str, str] | None = None,
 ) -> tuple[str, str]:
     # The Reconciler's own knob is a count of nodes it may install on at once,
     # so it can never be the "auto" sentinel: a caller that does not hand a
@@ -1424,6 +1433,7 @@ def deploy_reconciler(
         runtime_image=runtime_image,
         node_installer_image=node_installer_image,
         node_dependency_target=node_dependency_target,
+        node_scope=node_scope,
     )
     release._settle_installer_jobs(target)
     environment["GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT"] = "false"
@@ -1454,6 +1464,12 @@ def deploy_reconciler(
     finally:
         if products_dir is not None:
             shutil.rmtree(products_dir, ignore_errors=True)
+    # The script rendered the Deployment; the stamp of the node scope its Pods
+    # read from the connection Secret is the engine's, as for the executor and
+    # the watcher. Applied before the wait so one rollout covers both.
+    stamp_reconciler_node_scope(
+        release, target, node_scope or recorded_node_scope(target)
+    )
     wait_deployment_rollout(
         release,
         target,

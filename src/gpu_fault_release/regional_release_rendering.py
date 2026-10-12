@@ -5,7 +5,7 @@ import json
 import os
 import re
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Mapping
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
@@ -32,6 +32,11 @@ from gpu_fault_release.regional_release_images import (
     node_dependency_environment,
     previous_node_dependency_environment,
     previous_node_template_environment,
+)
+from gpu_fault_release.regional_release_node_scope import (
+    NODE_SCOPE_CONSUMERS,
+    recorded_node_scope,
+    stamp_node_scope_annotation,
 )
 
 from gpu_fault.dcgm_exporter_cadence import (
@@ -654,7 +659,17 @@ def stamp_gpu_deployments(
     executor_artifact_sha: str | None = None,
     executor_compatibility_digest: str | None = None,
     runtime_image: str | None = None,
+    node_scope: Mapping[str, str] | None = None,
 ) -> str:
+    """Stamp the release identity on every Deployment's Pod template.
+
+    ``node_scope`` additionally stamps the digest of the node scope the
+    Deployment reads from the connection Secret (``NODE_SCOPE_ANNOTATION``),
+    for the consumers of ``GPU_FAULT_NODE_SELECTOR`` only: a changed scope
+    then changes their template, and Kubernetes restarts the Pods that would
+    otherwise keep the selector they started with.
+    """
+
     artifact_sha = executor_artifact_sha or release.executor_wheel_sha
     compatibility_digest = (
         executor_compatibility_digest
@@ -682,6 +697,11 @@ def stamp_gpu_deployments(
                 "gpu-fault.io/runtime-image": (runtime_image or release.executor_image),
             }
         )
+        if (
+            node_scope is not None
+            and (document.get("metadata") or {}).get("name") in NODE_SCOPE_CONSUMERS
+        ):
+            stamp_node_scope_annotation(document, node_scope)
     result = yaml.safe_dump_all(
         documents,
         sort_keys=False,
@@ -816,11 +836,20 @@ def render_gpu_rollout_manifests(
     executor_wheel_filename: str | None = None,
     executor_artifact_sha: str | None = None,
     executor_compatibility_digest: str | None = None,
+    node_scope: Mapping[str, str] | None = None,
 ) -> list[tuple[str, str]]:
+    """Render the GPU rollout Deployments for ``target``.
+
+    ``node_scope`` is the scope the connection Secret serves after this
+    release: the site's recorded scope by default, or the restored one when a
+    rollback hands back what it put into the Secret.
+    """
+
     config = release.config
     profile_version = runtime_profile_version or target_runtime_profile_version(
         config, target
     )
+    scope = dict(node_scope) if node_scope is not None else recorded_node_scope(target)
     artifact_sha = executor_artifact_sha or release.executor_wheel_sha
     compatibility_digest = (
         executor_compatibility_digest
@@ -867,6 +896,7 @@ def render_gpu_rollout_manifests(
                     executor_artifact_sha=artifact_sha,
                     executor_compatibility_digest=compatibility_digest,
                     runtime_image=runtime_image,
+                    node_scope=scope,
                 ),
             )
         )
@@ -894,6 +924,7 @@ def build_reconciler_environment(
     runtime_image: str | None = None,
     node_installer_image: str | None = None,
     node_dependency_target: NodeDependencyTarget = NodeDependencyTarget.CANDIDATE,
+    node_scope: Mapping[str, str] | None = None,
 ) -> dict[str, str]:
     config = release.config
     environment = {
@@ -911,7 +942,10 @@ def build_reconciler_environment(
         # plain EKS cluster; the selector is what the scripts enumerate on.
         "GPU_FAULT_HYPERPOD_CLUSTER": provider_cluster_name(target),
         PROVIDER_ENV: cluster_provider(getattr(target, "provider", None)).value,
-        NODE_SELECTOR_ENV: node_selector(target),
+        # The scope the Secret serves: the site's, or a rollback's restored one.
+        NODE_SELECTOR_ENV: (
+            str(node_scope["selector"]) if node_scope else node_selector(target)
+        ),
         "GPU_FAULT_INSTALLER_CONFIG_MAP": bundle_cm,
         "GPU_FAULT_INSTALLER_CONFIG_DIGEST": config_digest,
         "GPU_FAULT_INSTALLER_ARTIFACT_SHA256": artifact_sha,

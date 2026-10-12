@@ -107,8 +107,14 @@ def node_release(monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
         "status": {"conditions": [{"type": "Ready", "status": "True"}]},
     }
 
-    def run(arguments, *, env, **kwargs):
+    def run(arguments, *, env=None, **kwargs):
+        if "patch" in arguments:
+            # The node-scope stamp the engine patches onto the Deployment the
+            # script applied (regional_release_node_scope); not a script run.
+            assert arguments[arguments.index("patch") + 1] == "deployment"
+            return ""
         assert Path(arguments[0]).name == "deploy-node-installer-reconciler.sh"
+        assert env is not None
         environments.append(dict(env))
         return (
             json.dumps({"status": "PASSED", "node_count": 1})

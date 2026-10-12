@@ -6,6 +6,13 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Iterable
 
+from gpu_fault_release.regional_release_node_scope import (
+    RECORDED_SCOPES_DIGEST_STATE_KEY,
+    RECORDED_SCOPES_INPUT,
+    SERVED_SCOPE_DRIFT_INPUT,
+    cluster_node_scopes_digest,
+    node_scope_drift,
+)
 from gpu_fault_release.regional_release_profile_model import cluster_profiles_digest
 from gpu_fault_release.regional_release_registry import legacy_registry_config_digest
 
@@ -27,6 +34,10 @@ class ReleaseComponent(StrEnum):
     CPU_STAGE = "cpu-stage"
     RUNTIME_PROFILE = "runtime-profile"
     ENDPOINT = "endpoint"
+    #: One GPU cluster's connection Secret re-rendered from the site: the
+    #: recorded node scope (``cluster_node_scopes`` / ``cluster_node_scope_drift``)
+    #: changed. ENDPOINT renders the same Secret and covers it when both run.
+    CONNECTION = "connection"
     OBSERVABILITY = "observability"
     DCGM = "dcgm"
     EXECUTOR = "executor"
@@ -113,6 +124,7 @@ def control_plane_role_targets(diff: ReleaseDiff) -> tuple[str, ...]:
 #: an observability-only release still visits the clusters.
 GPU_CLUSTER_COMPONENTS = (
     ReleaseComponent.ENDPOINT,
+    ReleaseComponent.CONNECTION,
     ReleaseComponent.DCGM,
     ReleaseComponent.OBSERVABILITY,
     ReleaseComponent.EXECUTOR,
@@ -148,6 +160,9 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "clusters",
         }
     )
+    # A cluster's recorded node scope changed, or its Secret serves another
+    # one: re-render the Secret and restart the Deployments that read it.
+    node_scope = bool(changed & {RECORDED_SCOPES_INPUT, SERVED_SCOPE_DRIFT_INPUT})
     observability = bool(
         changed
         & {
@@ -159,7 +174,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
         }
     )
     dcgm = bool(changed & {"dcgm", "dcgm_manifests", "dcgm_image"})
-    executor = bool(
+    executor = node_scope or bool(
         changed
         & {
             "executor_wheel",
@@ -169,7 +184,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "clusters",
         }
     )
-    watcher = bool(
+    watcher = node_scope or bool(
         changed
         & {
             "executor_wheel",
@@ -205,7 +220,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "cluster_runtime_profiles",
         }
     )
-    reconciler = bool(
+    reconciler = node_scope or bool(
         changed
         & {
             "executor_wheel",
@@ -266,6 +281,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
         (cpu_stage, ReleaseComponent.CPU_STAGE),
         (profile, ReleaseComponent.RUNTIME_PROFILE),
         (endpoint, ReleaseComponent.ENDPOINT),
+        (node_scope, ReleaseComponent.CONNECTION),
         (observability, ReleaseComponent.OBSERVABILITY),
         (dcgm, ReleaseComponent.DCGM),
         (executor, ReleaseComponent.EXECUTOR),
@@ -388,6 +404,7 @@ def cpu_pod_profile_drift(release: RegionalRelease) -> bool:
 
 
 def classify_release(release: RegionalRelease, state: dict[str, Any]) -> ReleaseDiff:
+    recorded_scopes = cluster_node_scopes_digest(release.config)
     desired = {
         "control_plane_wheel": release.wheel_sha,
         "executor_wheel": release.executor_wheel_sha,
@@ -400,6 +417,7 @@ def classify_release(release: RegionalRelease, state: dict[str, Any]) -> Release
         "runtime_profile": release.runtime_profile_policy_sha,
         "runtime_profile_version": release.config.runtime_profile_version,
         "cluster_runtime_profiles": cluster_profiles_digest(release.config),
+        RECORDED_SCOPES_INPUT: recorded_scopes,
         "endpoint": release.endpoint_digest,
         "dcgm": release.dcgm_digest,
         "notifications": release.notification_digest,
@@ -460,6 +478,11 @@ def classify_release(release: RegionalRelease, state: dict[str, Any]) -> Release
         "runtime_profile": _current_profile_digest(release, state),
         "runtime_profile_version": state.get("runtime_profile_version"),
         "cluster_runtime_profiles": state.get("cluster_runtime_profiles_sha256"),
+        # A state recorded before the scopes were an input says nothing about
+        # what it rolled; the served-scope probe below decides for it.
+        RECORDED_SCOPES_INPUT: (
+            state.get(RECORDED_SCOPES_DIGEST_STATE_KEY) or recorded_scopes
+        ),
         "endpoint": state.get("endpoint_digest"),
         "dcgm": state.get("dcgm_digest"),
         "notifications": state.get("notification_digest"),
@@ -517,6 +540,8 @@ def classify_release(release: RegionalRelease, state: dict[str, Any]) -> Release
         changed.add("aurora_refresh_drift")
     if state and cpu_pod_profile_drift(release):
         changed.add(CPU_POD_PROFILE_DRIFT)
+    if state and node_scope_drift(release):
+        changed.add(SERVED_SCOPE_DRIFT_INPUT)
     if AURORA_PREREQUISITE_REPAIR_KEY in state and not (
         state.get("transaction_committed") is False
         and isinstance(state.get("previous"), dict)

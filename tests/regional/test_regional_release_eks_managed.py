@@ -26,6 +26,7 @@ from gpu_fault.cluster_scope import (
 from gpu_fault_release import regional_gpu_bootstrap as GPU_BOOTSTRAP
 from gpu_fault_release import regional_release_gpu_rollout as GPU_ROLLOUT
 from gpu_fault_release import regional_release_iam as IAM
+from gpu_fault_release import regional_release_node_scope as SCOPE
 from gpu_fault_release import regional_release_preflight as PREFLIGHT
 from gpu_fault_release import regional_release_rendering as RENDERING
 from gpu_fault_release import rollout as MODULE
@@ -379,6 +380,109 @@ def test_product_digest_is_unchanged_for_hyperpod_and_binds_the_eks_selector(
         eks_env
     ) != RENDERING.installer_product_inputs_digest(moved), (
         "changing a plain EKS selector must invalidate the recorded products"
+    )
+
+
+# --- node scope: release input, consumer stamps ---------------------------------------
+
+
+def _converged_eks(tmp_path: Path) -> dict[str, Any]:
+    converged = _eks_cluster(tmp_path)
+    converged.update(
+        node_selector="gpu-fault.io/control-plane=us-east-1-site-985fd370",
+        node_selector_source="label-convention",
+    )
+    return converged
+
+
+def test_the_recorded_scopes_are_a_release_input_the_state_carries(
+    tmp_path: Path, release
+) -> None:
+    """The live gap: both entries converged in site.yaml, ``deploy`` NOOP. The
+    recorded scopes digest is what the state records and what the diff reads."""
+
+    from gpu_fault_release import regional_release_diff as DIFF
+
+    assert SCOPE.cluster_node_scopes(release.config) == {
+        "gpu-a": {"selector": HYPERPOD_SELECTOR, "source": "provider-default-legacy"},
+        "gpu-eks-cluster": {"selector": EKS_SELECTOR, "source": "flag-legacy"},
+    }, "what the site records per cluster, as joined before the convention"
+    rolled = {
+        SCOPE.RECORDED_SCOPES_DIGEST_STATE_KEY: SCOPE.cluster_node_scopes_digest(
+            release.config
+        )
+    }
+    assert (
+        SCOPE.RECORDED_SCOPES_INPUT
+        not in DIFF.classify_release(release, rolled).changed
+    )
+    converged = MODULE.RegionalRelease(
+        MODULE.ReleaseConfig.load(
+            config_file(
+                tmp_path,
+                clusters=[_hyperpod_cluster(tmp_path), _converged_eks(tmp_path)],
+            )
+        ),
+        RecordingRunner(),
+    )
+    assert SCOPE.cluster_node_scopes(converged.config)["gpu-eks-cluster"] == {
+        "selector": "gpu-fault.io/control-plane=us-east-1-site-985fd370",
+        "source": "label-convention",
+    }
+    assert (
+        SCOPE.RECORDED_SCOPES_INPUT in DIFF.classify_release(converged, rolled).changed
+    ), "converging one entry is a release input for the next deploy"
+    assert (
+        SCOPE.SERVED_SCOPE_DRIFT_INPUT
+        not in DIFF.classify_release(converged, rolled).changed
+    ), "a dry-run release never probes the Secrets"
+
+
+def test_consumer_manifests_carry_the_scope_they_read_from_the_secret(
+    tmp_path: Path, release
+) -> None:
+    hyperpod, eks = _targets(release)
+    for target in (hyperpod, eks):
+        documents = _deployments(release, target)
+        digest = SCOPE.node_scope_digest(SCOPE.recorded_node_scope(target))
+        for name in ("gpu-fault-cluster-executor", "gpu-fault-completion-watcher"):
+            annotations = documents[name]["spec"]["template"]["metadata"]["annotations"]
+            assert annotations[SCOPE.NODE_SCOPE_ANNOTATION] == digest, (
+                f"{target.cluster_id}/{name}: the Pod template names the scope its "
+                "Pods read, so a changed scope restarts them"
+            )
+        collector = documents["gpu-fault-kubernetes-node-resource-collector"]
+        assert (
+            SCOPE.NODE_SCOPE_ANNOTATION
+            not in (collector["spec"]["template"]["metadata"]["annotations"])
+        ), "the collector does not read the selector and is not restarted for it"
+    restored = {"selector": HYPERPOD_SELECTOR, "source": "provider-default-legacy"}
+    rendered = dict(
+        RENDERING.render_gpu_rollout_manifests(
+            release, eks, release.wheel_cm, node_scope=restored
+        )
+    )
+    executor = next(
+        item
+        for item in yaml.safe_load_all(rendered["gpu-fault-cluster-executor"])
+        if isinstance(item, dict) and item.get("kind") == "Deployment"
+    )
+    assert executor["spec"]["template"]["metadata"]["annotations"][
+        SCOPE.NODE_SCOPE_ANNOTATION
+    ] == SCOPE.node_scope_digest(restored), (
+        "a rollback renders the consumers for the scope the restored Secret serves"
+    )
+    environment = RENDERING.build_reconciler_environment(
+        release,
+        eks,
+        wheel_cm="wheel-cm",
+        bundle_cm="bundle-cm",
+        artifact_sha="a" * 64,
+        config_digest="b" * 64,
+        node_scope=restored,
+    )
+    assert environment[NODE_SELECTOR_ENV] == HYPERPOD_SELECTOR, (
+        "and the reconciler script enumerates on that scope"
     )
 
 

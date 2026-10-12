@@ -718,8 +718,9 @@ This parameter does not skip release validation, nor does it allow a non-NOOP di
 
 `NOOP/CONTROL_PLANE_ONLY/DATA_PLANE_COMPATIBLE/FULL` remain administrator summary classifications; the actual execution
 is decided by the component DAG. A pure Watcher or Collector Manifest change rolls only the corresponding Deployment; Node bundle,
-template or Agent pin changes enter the Reconciler/Agent nodes; schema, CPU, endpoint, observability
-and DCGM are each independent. New fields must register their dependency nodes; `FULL` cannot be equated with redoing everything.
+template or Agent pin changes enter the Reconciler/Agent nodes; schema, CPU, endpoint, connection (a cluster's connection
+Secret, for a changed node scope), observability and DCGM are each independent. New fields must register their dependency
+nodes; `FULL` cannot be equated with redoing everything.
 A single rollout of a CPU role or a GPU Executor/Watcher/Collector is capped at 5 minutes; the Node Installer
 Job has an active deadline and a host `flock`, and the Reconciler handles only the Fleet's current wave. A deterministic pin,
 protocol or compatibility mismatch must fail before apply and cannot consume the full rollout window.
@@ -1492,10 +1493,25 @@ Node ownership convention (`gpu_fault.cluster_scope`: `OWNERSHIP_LABEL`, `NodeSe
 instance type outside the GPU inventory refuses) while an already-managed cluster keeps its entry's `nodeSelector`
 (`preserve_existing_site_contract` copies only the previous entry's `nodeSelector`/`nodeSelectorSource` and writes no
 derived value). `gpu-fault-admin node-scope` (`admin/node_scope_command.py`) compares, read-only, the node sets the
-recorded and the label-derived selectors select; `--converge --reference` rewrites the entry only when they are equal and
-appends `<state-dir>/node-scope/<cluster_id>/journal.json`, after which `deploy` rolls it out. On the release side
+recorded and the label-derived selectors select, plus what each cluster's connection Secret serves (`data_plane`);
+`--converge --reference` rewrites the entry only when they are equal and appends
+`<state-dir>/node-scope/<cluster_id>/journal.json`, after which `deploy` rolls it out. On the release side
 `ClusterTarget.node_selector_source` and `regional_admin_checks_coverage.selected_nodes`/`node_scope_details` make Agent
-coverage and `status --full` read the same selected set.
+coverage and `status --full` read the same selected set. The recorded scope reaches the data plane through
+`regional_release_node_scope.py`: `cluster_node_scopes_digest` is a `classify_release` input (`cluster_node_scopes`;
+`save_state` records `cluster_node_scopes`/`cluster_node_scopes_sha256`, and a state written before the key existed reads as
+unchanged), `node_scope_drift` is a classification-time probe of every cluster's Secret (`cluster_node_scope_drift`; skipped on
+a dry run, without a delivered control plane or on a bare double), both classify `DATA_PLANE_COMPATIBLE` and select the
+per-cluster `ReleaseComponent.CONNECTION` (`regional_gpu_bootstrap.ensure_connection_secret`, covered by the ENDPOINT step
+when both are planned) plus EXECUTOR, WATCHER and RECONCILER -- the Deployments that read `GPU_FAULT_NODE_SELECTOR` from the
+Secret (`NODE_SCOPE_CONSUMERS`). `stamp_gpu_deployments` writes `gpu-fault.io/node-scope-sha256` (`node_scope_digest`) on the
+consumers' Pod templates and `deploy_reconciler` merge-patches it onto the script-rendered reconciler, so a changed scope moves
+the template and Kubernetes restarts the Pods; `rollback_target` restores the Secret backup for CONNECTION as for ENDPOINT and
+re-renders the consumers for the scope the restored Secret serves (`served_node_scope`). `node_scope_report`
+(`check_node_scope_agreement`) adds `connection_secret` and `consumers` to the `gpu_cluster:<id>` check and refuses a Secret or
+a stamped consumer that disagrees with the site, naming the cluster and both values. The membership digest `clusters`
+(`regional_release_registry.registry_config_digest`) still excludes the selector on purpose: a scope change is transactional
+and rolls back, a membership change is not.
 
 A custody wait for authorization or an evidence block does not take the ordinary failure compensation in the table; the prepared namespace/UID and the
 original inputs must be kept; the next probe must not be made to pass by deleting resources, automatic recreation or repeated key writes.
@@ -1938,6 +1954,7 @@ The deployment phases are:
    | Only the Control Plane closure changed | `CONTROL_PLANE_ONLY` | Roll only the CPU ingress/worker/spool |
    | Wheel licence or packaging metadata changed, code digest unchanged | `DATA_PLANE_COMPATIBLE` | Upload the changed artifacts by physical SHA, establish the compatible window, then a minimal rollout |
    | Compatible Executor or Node Runtime change | `DATA_PLANE_COMPATIBLE` | Roll only the affected GPU data plane or node Agent |
+   | A cluster's recorded node scope changed (`node-scope --converge`), or its connection Secret serves another selector | `DATA_PLANE_COMPATIBLE` | Re-render that cluster's connection Secret (`connection`) and restart the executor, Completion Watcher and node installer reconciler that read it |
    | Schema, protocol, Agent configuration, Profile or cluster set change | `FULL` | Digest classification; the DAG executes only dependent nodes and keeps the two-phase pin |
 
 5. Each phase and cluster writes a checkpoint; a shared release advances GPU clusters serially in site order by default, and

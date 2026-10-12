@@ -49,6 +49,12 @@ from gpu_fault_release.regional_release_diff import (
 from gpu_fault_release.regional_release_history import record_release_history
 from gpu_fault_release.regional_release_legacy import AGENT_IDENTITY_FIELDS
 from gpu_fault_release.regional_release_narration import narrate_phase
+from gpu_fault_release.regional_release_node_scope import (
+    RECORDED_SCOPES_DIGEST_STATE_KEY,
+    RECORDED_SCOPES_STATE_KEY,
+    cluster_node_scopes,
+    cluster_node_scopes_digest,
+)
 from gpu_fault_release.regional_release_node_snapshot import capture_installer_snapshot
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_profile_model import (
@@ -305,6 +311,7 @@ def read_snapshot(release: Any):
 def _plan_captures_gpu(plan: ReleaseExecutionPlan | None) -> bool:
     return plan is None or plan.has(
         ReleaseComponent.ENDPOINT,
+        ReleaseComponent.CONNECTION,
         ReleaseComponent.DCGM,
         ReleaseComponent.EXECUTOR,
         ReleaseComponent.WATCHER,
@@ -1358,6 +1365,10 @@ def _write_state(release: Any, phase: str, **updates: Any) -> str:
             ),
             "cluster_runtime_profiles": cluster_runtime_profiles(release.config),
             "cluster_runtime_profiles_sha256": cluster_profiles_digest(release.config),
+            RECORDED_SCOPES_STATE_KEY: cluster_node_scopes(release.config),
+            RECORDED_SCOPES_DIGEST_STATE_KEY: cluster_node_scopes_digest(
+                release.config
+            ),
             "agent_config_digest": release.config.agent_config_digest,
             "endpoint_digest": release.endpoint_digest,
             "dcgm_digest": release.dcgm_digest,

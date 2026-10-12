@@ -152,6 +152,7 @@ def cluster_attempts_with(
 GPU_COMPONENTS = frozenset(
     {
         ReleaseComponent.ENDPOINT,
+        ReleaseComponent.CONNECTION,
         ReleaseComponent.DCGM,
         ReleaseComponent.EXECUTOR,
         ReleaseComponent.WATCHER,

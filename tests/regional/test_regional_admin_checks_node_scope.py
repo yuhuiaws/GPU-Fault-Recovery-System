@@ -10,10 +10,16 @@ provider.
 
 from __future__ import annotations
 
+import base64
 from types import SimpleNamespace
 
+import pytest
+
 from gpu_fault_release import regional_admin_checks_coverage as agent_coverage
+from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release import regional_release_node_scope as SCOPE
 from gpu_fault_release.regional_admin_checks_coverage import check_agent_coverage
+from gpu_fault_release.regional_release_config import ReleaseError
 
 SITE_ID = "us-west-2-site-985fd370"
 HP_SELECTOR = "sagemaker.amazonaws.com/cluster-name=hp-gpu-a"
@@ -167,3 +173,114 @@ def test_full_status_shows_the_selector_source_and_the_nodes_left_out() -> None:
         "source": "flag-legacy",
         "selected_nodes": 0,
     }
+
+
+class ReportedRelease(Release):
+    """Answers the node reads, the connection Secret and the consumer Deployments."""
+
+    def __init__(self, target, nodes, *, secret: dict[str, str] | None, stamps=None):
+        super().__init__(target, nodes)
+        self.secret = secret
+        self.stamps = stamps or {}
+
+    def _get_json(self, command):
+        self.commands.append(command)
+        if "secret" in command:
+            if self.secret is None:
+                return {}
+            return {
+                "data": {
+                    key: base64.b64encode(value.encode()).decode()
+                    for key, value in self.secret.items()
+                }
+            }
+        if "deployment" in command:
+            name = command[command.index("deployment") + 1]
+            template = {"spec": {"containers": []}}
+            if self.stamps.get(name):
+                template["metadata"] = {
+                    "annotations": {SCOPE.NODE_SCOPE_ANNOTATION: self.stamps[name]}
+                }
+            return {"kind": "Deployment", "spec": {"template": template}}
+        return {"items": list(self.nodes)}
+
+
+def test_the_gpu_cluster_check_reports_the_scope_the_secret_serves() -> None:
+    target = _target(
+        node_selector=HP_LABEL_SELECTOR, node_selector_source="label-convention"
+    )
+    nodes = [_node("hyperpod-i-1", _hp_labels(True))]
+    converged = {"selector": HP_LABEL_SELECTOR, "source": "label-convention"}
+    digest = SCOPE.node_scope_digest(converged)
+    release = ReportedRelease(
+        target,
+        nodes,
+        secret={
+            "node-selector": HP_LABEL_SELECTOR,
+            "node-selector-source": "label-convention",
+        },
+        stamps={inventory.GPU_EXECUTOR_DEPLOYMENT: digest},
+    )
+
+    details = agent_coverage.node_scope_report(
+        release, target, HP_LABEL_SELECTOR, {"items": nodes}
+    )
+
+    assert details == {
+        "selector": HP_LABEL_SELECTOR,
+        "source": "label-convention",
+        "selected_nodes": 1,
+        "cluster_nodes_outside_selector": [],
+        "connection_secret": {**converged, "selector_recorded": True},
+        "consumers": {
+            inventory.GPU_EXECUTOR_DEPLOYMENT: digest,
+            inventory.GPU_WATCHER_DEPLOYMENT: None,
+            inventory.GPU_RECONCILER_DEPLOYMENT: None,
+        },
+    }, "status --full shows the site's scope, the Secret's and the consumers' stamps"
+
+
+def test_the_gpu_cluster_check_refuses_a_secret_that_disagrees_with_the_site() -> None:
+    """The live shape: the entry converged, the Secret still serves the join-time
+    selector; verify names the cluster and both values."""
+
+    target = _target(
+        node_selector=HP_LABEL_SELECTOR, node_selector_source="label-convention"
+    )
+    release = ReportedRelease(
+        target,
+        [_node("hyperpod-i-1", _hp_labels(True))],
+        secret={
+            "node-selector": HP_SELECTOR,
+            "node-selector-source": "provider-default-legacy",
+        },
+    )
+
+    with pytest.raises(ReleaseError) as refusal:
+        agent_coverage.node_scope_report(
+            release, target, HP_LABEL_SELECTOR, {"items": release.nodes}
+        )
+
+    message = str(refusal.value)
+    assert message.startswith("gpu-a node scope disagreement"), message
+    assert (
+        f"records selector {HP_LABEL_SELECTOR!r} (source label-convention)" in message
+    )
+    assert (
+        f"serves selector {HP_SELECTOR!r} (source provider-default-legacy)" in message
+    )
+
+
+def test_the_gpu_cluster_check_accepts_a_legacy_cluster_with_a_legacy_secret() -> None:
+    legacy = _target()
+    release = ReportedRelease(
+        legacy, [_node("hyperpod-i-1", _hp_labels(False))], secret={}
+    )
+    details = agent_coverage.node_scope_report(
+        release, legacy, HP_SELECTOR, {"items": release.nodes}
+    )
+    assert details["connection_secret"] == {
+        "selector": HP_SELECTOR,
+        "source": "provider-default-legacy",
+        "selector_recorded": False,
+    }, "a Secret predating the keys serves the defaults a legacy entry records"

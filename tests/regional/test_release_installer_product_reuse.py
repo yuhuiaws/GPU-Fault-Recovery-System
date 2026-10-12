@@ -66,6 +66,9 @@ def _release(
             self.dry_run = dry_run
 
         def run(self, arguments: list[str], *, env=None, **_keywords: Any) -> str:
+            if arguments[0] == "kubectl":
+                # The node-scope stamp patched after the script's apply.
+                return ""
             environments.append(dict(env or {}))
             path = (env or {}).get(RENDERING.INSTALLER_PRODUCTS_FILE_ENV)
             if path and products is not None:
@@ -79,7 +82,8 @@ def _release(
         release_id=release_id,
         bundle_sha=BUNDLE,
         node_template_sha=TEMPLATE,
-        config=SimpleNamespace(upgrade_max_unavailable=0),
+        config=SimpleNamespace(upgrade_max_unavailable=0, namespace="gpu-fault-system"),
+        _gpu=lambda _target, *arguments: ["kubectl", *arguments],
         _settle_installer_jobs=lambda _target: None,
     )
     return release, environments

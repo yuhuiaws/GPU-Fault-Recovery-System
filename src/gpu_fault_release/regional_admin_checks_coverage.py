@@ -27,6 +27,7 @@ from gpu_fault.cluster_scope import (
     selector_matches,
 )
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_node_scope import check_node_scope_agreement
 
 RETIRE_DEPARTED_AGENTS_HINT = (
     "these Agents have no Kubernetes Node; if HyperPod no longer lists their "
@@ -96,6 +97,30 @@ def node_scope_details(
                 for item in cluster_nodes.get("items", [])
                 if str(item.get("metadata", {}).get("name") or "") not in selected
             )
+    return details
+
+
+def node_scope_report(
+    release: Any, target: Any, selector: str, nodes: dict[str, Any]
+) -> dict[str, Any]:
+    """``node_scope_details`` plus what the data plane serves; refuses disagreement.
+
+    The ``gpu_cluster:<id>`` check's ``node_scope``: the recorded selector and
+    source, the nodes it selects, what the cluster's connection Secret serves
+    (``connection_secret``) and the scope each consumer Deployment's Pods were
+    rendered for (``consumers``). A Secret or a stamped consumer that
+    disagrees with the site fails the check, naming the cluster and both
+    values; ``deploy`` rolls the recorded scope.
+    """
+
+    details = node_scope_details(release, target, selector, nodes)
+    details.update(
+        check_node_scope_agreement(
+            release,
+            target,
+            recorded={"selector": selector, "source": str(details["source"])},
+        )
+    )
     return details
 
 

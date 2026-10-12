@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING, Any, Callable, cast
 from urllib.parse import urlsplit
 
 from gpu_fault_release import regional_admin_checks_coverage as agent_coverage
-from gpu_fault_release.regional_admin_checks_coverage import node_scope_details
+from gpu_fault_release.regional_admin_checks_coverage import node_scope_report
 from gpu_fault_release.regional_admin_checks_coverage import selected_nodes
 from gpu_fault_release import regional_admin_checks_readiness as readiness
 from gpu_fault_release import regional_deployment_inventory as inventory
@@ -1421,7 +1421,7 @@ def _check_gpu_cluster(release: Any, target: Any) -> CheckValue:
         )
         details["deployments"][deployment] = _deployment_readiness(item, deployment)
     selector, nodes = selected_nodes(release, target)
-    details["node_scope"] = node_scope_details(release, target, selector, nodes)
+    details["node_scope"] = node_scope_report(release, target, selector, nodes)
     expected_nodes = _ready_nodes(nodes)
     if not expected_nodes:
         raise ReleaseError(f"{target.cluster_id} has no Ready HyperPod nodes")
