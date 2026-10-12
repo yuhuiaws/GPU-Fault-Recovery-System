@@ -25,6 +25,10 @@ from gpu_fault.admin.deadlines import DeploymentDeadlineExceeded, HttpResponseTo
 from gpu_fault.admin.process_supervisor import run_owned_command
 from gpu_fault_release import regional_adot_self_metrics as adot
 from gpu_fault_release.regional_release_config import ReleaseError
+from tests.admin._owned_worker_support import (
+    BLOCKED_WORKER_BUDGET_SECONDS,
+    CLEANUP_SLACK_SECONDS,
+)
 
 PRIVATE_MARKER = "fixture-private-http-value"
 
@@ -102,13 +106,16 @@ def server_fixture(mode: str) -> Iterator[tuple[str, list[dict[str, Any]]]]:
 def test_supervised_http_stops_inside_framing_reads(mode: str) -> None:
     with api_budget.deployment_api_budget(), server_fixture(mode) as (url, requests):
         started = time.monotonic()
-        with execution.deadline_scope("isolated framing", 0.6):
+        with execution.deadline_scope(
+            "isolated framing", BLOCKED_WORKER_BUDGET_SECONDS
+        ):
             with pytest.raises(DeploymentDeadlineExceeded, match="deadline"):
                 grafana.urllib_transport("GET", url, {}, None)
         assert requests, "loopback fixture never entered the blocking HTTP parser"
-        assert time.monotonic() - started < 2, (
-            "HTTP framing outlived the task and supervised cleanup budget"
-        )
+        assert (
+            time.monotonic() - started
+            < BLOCKED_WORKER_BUDGET_SECONDS + CLEANUP_SLACK_SECONDS
+        ), "HTTP framing outlived the task and supervised cleanup budget"
 
 
 def test_request_headers_and_body_travel_only_over_private_stdin(
@@ -282,7 +289,8 @@ def credential_provider(
         "from pathlib import Path\n"
         "record, mode = sys.argv[1:]\n"
         "start = Path(f'/proc/{os.getpid()}/stat').read_text().rsplit(')', 1)[1].split()[19]\n"
-        "Path(record).write_text(json.dumps({'pid': os.getpid(), 'start': start}))\n"
+        "Path(record).write_text(json.dumps(\n"
+        "    {'pid': os.getpid(), 'start': start, 'monotonic': time.monotonic()}))\n"
         "if mode == 'hang':\n"
         "    time.sleep(60)\n"
         "elif mode == 'noisy':\n"
@@ -364,20 +372,27 @@ def test_hung_credential_process_is_reaped_before_http_can_start(
     )
     with api_budget.deployment_api_budget():
         started = time.monotonic()
-        with execution.deadline_scope("hung credential process", 1):
+        with execution.deadline_scope(
+            "hung credential process", BLOCKED_WORKER_BUDGET_SECONDS
+        ) as deadline:
             with pytest.raises(DeploymentDeadlineExceeded, match="deadline"):
                 amp_query()
         assert record.is_file(), "the owned credential process never started"
         identity = json.loads(record.read_text())
+        assert identity["monotonic"] < deadline.expires, (
+            "the provider started only after the deadline had expired: the "
+            "budget is below this host's owned chain start, so nothing was hung"
+        )
         stat = Path(f"/proc/{identity['pid']}/stat")
         if stat.exists():
             actual = stat.read_text().rsplit(")", 1)[1].split()
             assert actual[19] != identity["start"], (
                 "supervised credential resolution left its provider alive"
             )
-        assert time.monotonic() - started < 3, (
-            "credential resolution ignored its deadline"
-        )
+        assert (
+            time.monotonic() - started
+            < BLOCKED_WORKER_BUDGET_SECONDS + CLEANUP_SLACK_SECONDS
+        ), "credential resolution ignored its deadline"
         assert requests == [], "AMP started HTTP after credential resolution timed out"
 
 

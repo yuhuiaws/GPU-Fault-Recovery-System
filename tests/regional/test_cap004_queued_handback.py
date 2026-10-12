@@ -479,7 +479,9 @@ def test_queue_proof_rejects_missing_or_unexplained_lease_losses(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    first_id = commands.commands_for_run(RUN_ID)[0].command_id
     executors: list[ClusterActionExecutor] = []
+    organic_rejections: list[str] = []
 
     class ChangedLossCountExecutor(ClusterActionExecutor):
         def run_once(self) -> int:
@@ -492,11 +494,29 @@ def test_queue_proof_rejects_missing_or_unexplained_lease_losses(
         executors.append(value)
         return value
 
+    def after(
+        path: str, _payload: dict[str, Any], status: int, body: bytes
+    ) -> tuple[int, bytes]:
+        # The incidental loss the ``race == "none"`` case above also records: a
+        # renewer tick that lands after the WAITING handback released the lease
+        # is a real 409 and one more raw loss (the deploy gate of 2026-10-12 saw
+        # exactly one under load). The injected delta is judged against the
+        # losses that really happened, never against a pinned count.
+        if path.endswith(f"/{first_id}/renew") and status == 409:
+            organic_rejections.append(path)
+        return status, body
+
+    local_api.after = after
     monkeypatch.setattr(proof, "ClusterActionExecutor", executor)
     with pytest.raises(proof.Cap004Error, match="queued lease authority proof failed"):
         proof.run_queued_lease_proof(URL, TOKEN, RUN_ID, tmp_path, timeout_seconds=10)
     counters = executors[0].metrics_snapshot()
-    assert counters["lease_lost_total"] == 1 + loss_delta, (
+    organic = len(organic_rejections)
+    assert counters["lease_renewal_failures"] == organic, (
+        "every renewal failure inside the Executor must be an observed 409 of the "
+        "executed command's released lease"
+    )
+    assert counters["lease_lost_total"] == 1 + organic + loss_delta, (
         "the proof must not rewrite raw counts to fit its expectation"
     )
     assert counters["results_withheld_total"] == 1, (

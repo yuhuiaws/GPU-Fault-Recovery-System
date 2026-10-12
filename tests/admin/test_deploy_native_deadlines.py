@@ -30,6 +30,10 @@ from gpu_fault.admin import (
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost
 from gpu_fault_release import regional_adot_self_metrics as adot
+from tests.admin._owned_worker_support import (
+    BLOCKED_WORKER_BUDGET_SECONDS,
+    CLEANUP_SLACK_SECONDS,
+)
 
 
 class Response(io.BytesIO):
@@ -501,7 +505,9 @@ def test_real_urllib_drip_response_cannot_extend_task_until_eof() -> None:
         thread.start()
         started = time.monotonic()
         try:
-            with execution.deadline_scope("local streaming fixture", 0.3):
+            with execution.deadline_scope(
+                "local streaming fixture", BLOCKED_WORKER_BUDGET_SECONDS
+            ):
                 with pytest.raises(
                     execution.DeploymentDeadlineExceeded,
                     match="^deployment deadline exceeded: local streaming fixture$",
@@ -512,9 +518,10 @@ def test_real_urllib_drip_response_cannot_extend_task_until_eof() -> None:
                         {},
                         None,
                     )
-            assert time.monotonic() - started < 1, (
-                "urllib waited for a streaming body's EOF beyond the task deadline"
-            )
+            assert (
+                time.monotonic() - started
+                < BLOCKED_WORKER_BUDGET_SECONDS + CLEANUP_SLACK_SECONDS
+            ), "urllib waited for a streaming body's EOF beyond the task deadline"
             assert chunks[0] > 1, "local fixture did not exercise streaming reads"
         finally:
             stopped.set()
