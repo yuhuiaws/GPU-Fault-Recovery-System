@@ -82,8 +82,14 @@ def _instance_group(
         "ThreadsPerCore": 1,
         "InstanceStorageConfigs": [{"EbsVolumeConfig": {"VolumeSizeInGB": 500}}],
         "OnStartDeepHealthChecks": ["InstanceStress"],
-        "CurrentImageId": "ami-current",
-        "DesiredImageId": "ami-current",
+        "CurrentImageId": "default",
+        "DesiredImageId": "default",
+        "CurrentImageReleaseVersion": "2.0.4",
+        "DesiredImageReleaseVersion": "2.0.4",
+        "ImageVersionStatus": "UpToDate",
+        "SoftwareUpdateStatus": "Succeeded",
+        "ActiveOperations": {},
+        "TargetStateCount": 2,
         "KubernetesConfig": {
             "CurrentLabels": dict(labels),
             "DesiredLabels": dict(labels if desired is None else desired),
@@ -426,12 +432,14 @@ def test_hyperpod_release_sends_the_full_definition_minus_the_label() -> None:
             "ThreadsPerCore": 1,
             "InstanceStorageConfigs": [{"EbsVolumeConfig": {"VolumeSizeInGB": 500}}],
             "OnStartDeepHealthChecks": ["InstanceStress"],
-            "ImageId": "ami-current",
+            "ImageId": "default",
+            "ImageReleaseVersion": "2.0.4",
             "KubernetesConfig": {"Labels": {"team": "research"}, "Taints": TAINTS},
         }
     ], (
         "the owned group alone, with its full current definition, InstanceCount "
-        "equal to TargetCount and only the ownership key removed from the labels"
+        "equal to TargetCount, the running image named (ImageId and "
+        "ImageReleaseVersion) and only the ownership key removed from the labels"
     )
     group = world.hyperpod["InstanceGroups"][0]
     assert group["KubernetesConfig"]["CurrentLabels"] == {"team": "research"}
@@ -439,6 +447,9 @@ def test_hyperpod_release_sends_the_full_definition_minus_the_label() -> None:
     assert evidence["outcome"] == release.RELEASED
     by_name = {item["name"]: item for item in evidence["groups"]}
     assert by_name["spot-p5en"]["outcome"] == release.RELEASED
+    assert by_name["spot-p5en"]["target_state_count"] == 2, (
+        "TargetStateCount is informational and recorded, never a refusal"
+    )
     assert by_name["controller"]["outcome"] == release.UNLABELLED
     assert evidence["operator_action"] == "sagemaker:UpdateCluster"
     assert world.sleeps, "HyperPod applies the labels asynchronously; the step waited"
@@ -474,6 +485,61 @@ def test_hyperpod_release_sends_the_full_definition_minus_the_label() -> None:
             "FutureField",
         ),
         (lambda doc: doc["InstanceGroups"][0].pop("ExecutionRole"), "ExecutionRole"),
+        (
+            lambda doc: doc["InstanceGroups"][0].update(
+                ActiveOperations={"Scaling": 1}
+            ),
+            'ActiveOperations {"Scaling": 1}',
+        ),
+        (
+            lambda doc: doc["InstanceGroups"][0].update(SoftwareUpdateStatus="Pending"),
+            "software update is Pending",
+        ),
+        (
+            lambda doc: doc["InstanceGroups"][0].update(
+                SoftwareUpdateStatus="InProgress"
+            ),
+            "software update is InProgress",
+        ),
+        (
+            lambda doc: doc["InstanceGroups"][0].update(
+                SoftwareUpdateStatus="RollbackInProgress"
+            ),
+            "software update is RollbackInProgress",
+        ),
+        (
+            lambda doc: doc["InstanceGroups"][0].update(SoftwareUpdateStatus="Failed"),
+            "software update is Failed (its rollback did not complete",
+        ),
+        (
+            lambda doc: doc["InstanceGroups"][0].update(
+                DesiredImageReleaseVersion="2.1.0"
+            ),
+            "DesiredImageReleaseVersion 2.1.0 differs from CurrentImageReleaseVersion",
+        ),
+        (
+            lambda doc: doc["InstanceGroups"][0].update(ImageVersionStatus="EndOfLife"),
+            "image release 2.0.4 is EndOfLife",
+        ),
+        (
+            lambda doc: doc["InstanceGroups"][0].update(
+                InstanceRequirements={
+                    "CurrentInstanceTypes": ["ml.p5en.48xlarge"],
+                    "DesiredInstanceTypes": ["ml.p5.48xlarge"],
+                }
+            ),
+            "InstanceRequirements.DesiredInstanceTypes differs",
+        ),
+        (
+            lambda doc: doc["InstanceGroups"][0].update(
+                AutoPatchConfig={
+                    "PatchingStrategy": "WhenIdle",
+                    "CurrentPatchSchedule": {"NextPatchDate": "2025-01-05T00:00:00Z"},
+                    "DesiredPatchSchedule": {"NextPatchDate": "2025-01-12T00:00:00Z"},
+                }
+            ),
+            "AutoPatchConfig.DesiredPatchSchedule differs",
+        ),
     ],
     ids=[
         "cluster-updating",
@@ -484,6 +550,15 @@ def test_hyperpod_release_sends_the_full_definition_minus_the_label() -> None:
         "image-pending",
         "unknown-field",
         "missing-required-field",
+        "operation-in-flight",
+        "software-update-pending",
+        "software-update-in-progress",
+        "software-rollback-in-progress",
+        "software-update-failed",
+        "release-version-pending",
+        "image-end-of-life",
+        "instance-types-pending",
+        "patch-schedule-pending",
     ],
 )
 def test_hyperpod_release_refuses_to_write_when_update_cluster_could_do_more(
@@ -500,6 +575,41 @@ def test_hyperpod_release_refuses_to_write_when_update_cluster_could_do_more(
         str(failure.value)
     ), "the refusal names the manual command"
     assert _updates(world) == [], "fail closed: UpdateCluster can scale or re-image"
+
+
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("ImageVersionStatus", "UpdateAvailable"),
+        ("ImageVersionStatus", "SecurityUpdateRequired"),
+        ("SoftwareUpdateStatus", "RollbackComplete"),
+    ],
+    ids=["update-available", "security-update-required", "rollback-complete"],
+)
+def test_hyperpod_release_names_the_running_image_when_a_newer_release_exists(
+    field: str, value: str
+) -> None:
+    """A newer release on offer is not an update in flight.
+
+    ``UpdateAvailable`` and ``SecurityUpdateRequired`` grade the running
+    release against the catalogue, and ``RollbackComplete`` is a settled
+    software update; the write goes through and names the running
+    ``ImageId``/``ImageReleaseVersion``, so ``UpdateCluster`` cannot move the
+    group to the newer release (an omitted release version would mean "the
+    latest available").
+    """
+
+    world = _hyperpod_world()
+    hyperpod = world.hyperpod
+    assert hyperpod is not None
+    hyperpod["InstanceGroups"][0][field] = value
+
+    evidence = _release(world, HP_TARGET)
+
+    (specs,) = world.update_specs
+    assert specs[0]["ImageId"] == "default"
+    assert specs[0]["ImageReleaseVersion"] == "2.0.4"
+    assert evidence["groups"][0]["outcome"] == release.RELEASED
 
 
 def test_hyperpod_in_flight_release_only_waits() -> None:

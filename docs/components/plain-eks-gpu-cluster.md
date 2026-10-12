@@ -115,8 +115,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    命令：`gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn>`（只需要 ARN）。
    注销即释放：`remove-cluster`/`uninstall` 的最后一步 `OWNERSHIP_RELEASED` 用
    `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels removeLabels=gpu-fault.io/control-plane`
-   从站点选中的节点组摘掉该键（HyperPod：`update-cluster` 带实例组完整定义去键，更新中即拒绝；Karpenter NodePool 不改写、记
-   `manual`），有界等待 `describe-nodegroup` 显示已消失；操作者身份另需 `eks:UpdateNodegroupConfig`/`sagemaker:UpdateCluster`
+   从站点选中的节点组摘掉该键（HyperPod：`update-cluster` 带实例组完整定义去键并写明当前镜像，有更新/操作进行中或变更待应用即拒绝；Karpenter
+   NodePool 不改写、记 `manual`），有界等待 `describe-nodegroup` 显示已消失；操作者身份另需 `eks:UpdateNodegroupConfig`/`sagemaker:UpdateCluster`
    （运行时角色仍只读）；`--keep-ownership-label` 保留并记 `retained`。已注销集群的节点组仍带标签即过期声明，`status`/`node-scope`
    报 finding；重新接入前按 `site-id` 打印的命令重新加标签（管理员日常运维 §5.0.0 "释放"行）。
 6. 第三方 GPU 客户端 DaemonSet（客户自己的 dcgm-exporter、GPU feature discovery、监控 agent 等）**不得容忍**

@@ -140,8 +140,9 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
    De-registration releases it: the last step of `remove-cluster`/`uninstall`, `OWNERSHIP_RELEASED`, removes the key
    from the node groups the site selected with
    `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels removeLabels=gpu-fault.io/control-plane`
-   (HyperPod: `update-cluster` with the instance group's full definition minus the key, refused mid-update; a Karpenter
-   NodePool is never edited and recorded `manual`) and waits, bounded, until `describe-nodegroup` shows it gone; the
+   (HyperPod: `update-cluster` with the instance group's full definition minus the key and the running image named,
+   refused while an update or operation is in flight or a change is pending; a Karpenter NodePool is never edited and
+   recorded `manual`) and waits, bounded, until `describe-nodegroup` shows it gone; the
    operator identity additionally needs `eks:UpdateNodegroupConfig`/`sagemaker:UpdateCluster` (the runtime roles stay
    read-only); `--keep-ownership-label` keeps it and records `retained`. A de-registered cluster whose node groups still
    carry the label is a stale claim `status`/`node-scope` report as a finding; re-label with the commands `site-id`

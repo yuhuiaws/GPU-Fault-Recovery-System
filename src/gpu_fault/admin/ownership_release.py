@@ -20,12 +20,17 @@ the groups carrying this site's id:
   change to the group's existing nodes);
 * a HyperPod instance group through ``aws sagemaker update-cluster`` with the
   group's *full* current definition and ``KubernetesConfig.Labels`` minus the
-  key -- ``InstanceCount`` is the current ``TargetCount``, and the step refuses
-  to write (nothing is sent) while the cluster or the group has an update in
-  progress, ``CurrentCount`` differs from ``TargetCount``, another label,
-  taint or image change is pending, or the group carries a field this module
-  does not know how to carry over, because ``UpdateCluster`` can scale and
-  re-image a group;
+  key -- ``InstanceCount`` is the current ``TargetCount``, ``ImageId`` and
+  ``ImageReleaseVersion`` the image the group runs now (the service documents
+  an omitted release version as "the latest available", i.e. a re-image), and
+  the step refuses to write (nothing is sent) while the cluster or the group
+  is not ``InService``, an operation (``ActiveOperations``) or a software
+  update (``SoftwareUpdateStatus``) is in flight or ended ``Failed``,
+  ``CurrentCount`` differs from ``TargetCount``, another label, taint, image,
+  image release version, instance type or patch schedule change is pending
+  (``Desired*`` differing from ``Current*``), the running image release is
+  ``EndOfLife``, or the group carries a field this module does not know how to
+  carry over, because ``UpdateCluster`` can scale and re-image a group;
 * a Karpenter ``NodePool`` whose template labels carry the id is a customer
   provisioning CRD: it is never edited, the step completes with the outcome
   ``manual`` and records the exact ``kubectl patch``.
@@ -73,6 +78,12 @@ from gpu_fault.cluster_scope import OWNERSHIP_LABEL, ClusterProvider, cluster_pr
 __all__ = [
     "FOREIGN",
     "add_keep_label_flag",
+    "HYPERPOD_DERIVED_FIELDS",
+    "HYPERPOD_IMAGE_END_OF_LIFE",
+    "HYPERPOD_REQUIRED_FIELDS",
+    "HYPERPOD_SETTLED_SOFTWARE_UPDATES",
+    "HYPERPOD_SPEC_FIELDS",
+    "HYPERPOD_STATUS_FIELDS",
     "KARPENTER_NODEPOOL_RESOURCE",
     "KEEP_FLAG",
     "MANUAL",
@@ -116,11 +127,14 @@ KARPENTER_NODEPOOL_RESOURCE = "nodepools.karpenter.sh"
 #: the bound, not the expectation.
 CONVERGENCE_TIMEOUT_SECONDS = 600.0
 CONVERGENCE_INTERVAL_SECONDS = 10.0
-#: ``ClusterInstanceGroupDetails`` fields that ``ClusterInstanceGroupSpecification``
-#: takes verbatim; ``InstanceCount`` comes from ``TargetCount``, ``ImageId``
-#: from ``CurrentImageId`` and ``KubernetesConfig`` from the current labels and
-#: taints. A details field outside these two tables refuses the write: this
-#: module carries a definition it understands or none at all.
+#: Every ``ClusterInstanceGroupDetails`` member, classified against the
+#: installed botocore service model (``ClusterInstanceGroupDetails`` against
+#: ``ClusterInstanceGroupSpecification``; ``tests/admin/
+#: test_admin_ownership_release_fields.py`` pins the three tables to it). A
+#: details field in none of them refuses the write: this module carries a
+#: definition it understands or none at all.
+#:
+#: Carried verbatim -- the same name and the same shape in both structures.
 HYPERPOD_SPEC_FIELDS: tuple[str, ...] = (
     "InstanceGroupName",
     "InstanceType",
@@ -132,23 +146,61 @@ HYPERPOD_SPEC_FIELDS: tuple[str, ...] = (
     "TrainingPlanArn",
     "OverrideVpcConfig",
     "ScheduledUpdateConfig",
-    "EnvironmentConfig",
+    "CapacityRequirements",
+    "SlurmConfig",
+    "NetworkInterface",
 )
+#: Derived -- the details field (key) yields the specification field (value)
+#: from the group's *current* state: ``InstanceCount`` is ``TargetCount``,
+#: ``ImageId``/``ImageReleaseVersion`` the image the group runs now (the
+#: service documents an omitted ``ImageReleaseVersion`` as "the latest
+#: available", i.e. a re-image, so the running one is always named), and
+#: ``KubernetesConfig``/``InstanceRequirements``/``AutoPatchConfig`` take their
+#: ``Current*`` members. A ``Desired*`` member differing from its ``Current*``
+#: refuses the write first (``require_hyperpod_writable``).
+HYPERPOD_DERIVED_FIELDS: dict[str, str] = {
+    "TargetCount": "InstanceCount",
+    "MinCount": "MinInstanceCount",
+    "CurrentImageId": "ImageId",
+    "CurrentImageReleaseVersion": "ImageReleaseVersion",
+    "KubernetesConfig": "KubernetesConfig",
+    "InstanceRequirements": "InstanceRequirements",
+    "AutoPatchConfig": "AutoPatchConfig",
+}
+#: Read only -- the group's state, never part of the specification.
+HYPERPOD_STATUS_FIELDS: tuple[str, ...] = (
+    "CurrentCount",
+    "Status",
+    "ActiveOperations",
+    "TargetStateCount",
+    "SoftwareUpdateStatus",
+    "ActiveSoftwareUpdateConfig",
+    "ImageVersionStatus",
+    "DesiredImageId",
+    "DesiredImageReleaseVersion",
+    "InstanceTypeDetails",
+    "TrainingPlanStatus",
+)
+#: Besides these, a group needs ``InstanceType`` or ``InstanceRequirements``
+#: and an integer ``TargetCount``.
 HYPERPOD_REQUIRED_FIELDS: tuple[str, ...] = (
     "InstanceGroupName",
-    "InstanceType",
     "LifeCycleConfig",
     "ExecutionRole",
 )
-HYPERPOD_STATUS_FIELDS: tuple[str, ...] = (
-    "CurrentCount",
-    "TargetCount",
-    "Status",
-    "TrainingPlanStatus",
-    "CurrentImageId",
-    "DesiredImageId",
-    "KubernetesConfig",
+#: ``SoftwareUpdateStatus`` values after which the last software update has
+#: settled. ``Pending``, ``InProgress`` and ``RollbackInProgress`` are in
+#: flight; ``Failed`` is a rollback that did not complete, after which the
+#: nodes may run mixed images -- both refuse the write.
+HYPERPOD_SETTLED_SOFTWARE_UPDATES: frozenset[str] = frozenset(
+    {"Succeeded", "RollbackComplete"}
 )
+#: The ``ImageVersionStatus`` that refuses the write: the service may no longer
+#: accept the running release as ``ImageReleaseVersion`` and could substitute
+#: the latest one (a re-image). ``UpdateAvailable`` and
+#: ``SecurityUpdateRequired`` only say a newer release exists; naming the
+#: running release keeps the group where it is, so they do not refuse.
+HYPERPOD_IMAGE_END_OF_LIFE = "EndOfLife"
 _NODEPOOL_LABEL_POINTER = "/spec/template/metadata/labels/" + OWNERSHIP_LABEL.replace(
     "~", "~0"
 ).replace("/", "~1")
@@ -299,16 +351,26 @@ def hyperpod_instance_group_specification(
 ) -> dict[str, Any]:
     """The ``ClusterInstanceGroupSpecification`` that keeps ``details`` as it is.
 
-    ``InstanceCount`` is the current ``TargetCount`` (never the live
-    ``CurrentCount``: a group mid-scale would be pinned at the wrong size),
-    ``ImageId`` the current image, ``KubernetesConfig.Taints`` the current
-    taints and ``KubernetesConfig.Labels`` exactly ``labels``. A missing
-    required field or a field outside the known tables raises: a definition
-    this module cannot carry over in full must not be sent at all.
+    ``HYPERPOD_SPEC_FIELDS`` are copied verbatim. ``InstanceCount`` is the
+    current ``TargetCount`` (never the live ``CurrentCount``: a group mid-scale
+    would be pinned at the wrong size) and ``MinInstanceCount`` the
+    ``MinCount``. ``ImageId`` and ``ImageReleaseVersion`` are the image the
+    group runs now -- ``CurrentImageId`` (``default`` stays ``default``, an AMI
+    id stays that AMI) and ``CurrentImageReleaseVersion`` -- whenever the
+    description reports them: the service documents an omitted release version
+    as "the latest available", which is a re-image, so the running one is
+    named explicitly. ``InstanceRequirements`` takes the
+    ``CurrentInstanceTypes``, ``AutoPatchConfig`` the ``CurrentPatchSchedule``,
+    ``KubernetesConfig.Taints`` the current taints and
+    ``KubernetesConfig.Labels`` exactly ``labels``. A missing required field or
+    a field outside the known tables raises: a definition this module cannot
+    carry over in full must not be sent at all.
     """
 
     name = str(details.get("InstanceGroupName") or "<instance group>")
     missing = [key for key in HYPERPOD_REQUIRED_FIELDS if not details.get(key)]
+    if not details.get("InstanceType") and not details.get("InstanceRequirements"):
+        missing.append("InstanceType (or InstanceRequirements)")
     if missing:
         raise BootstrapError(
             f"instance group {name} lacks {', '.join(missing)}; update-cluster "
@@ -317,7 +379,9 @@ def hyperpod_instance_group_specification(
     unknown = sorted(
         key
         for key in details
-        if key not in HYPERPOD_SPEC_FIELDS and key not in HYPERPOD_STATUS_FIELDS
+        if key not in HYPERPOD_SPEC_FIELDS
+        and key not in HYPERPOD_DERIVED_FIELDS
+        and key not in HYPERPOD_STATUS_FIELDS
     )
     if unknown:
         raise BootstrapError(
@@ -327,19 +391,48 @@ def hyperpod_instance_group_specification(
     target_count = details.get("TargetCount")
     if type(target_count) is not int or target_count < 0:
         raise BootstrapError(f"instance group {name} has no integer TargetCount")
-    specification: dict[str, Any] = {}
-    for key in HYPERPOD_SPEC_FIELDS:
-        if key in details and details[key] is not None:
-            specification[key] = details[key]
-        if key == "InstanceType":
-            specification["InstanceCount"] = target_count
-    if details.get("CurrentImageId"):
-        specification["ImageId"] = details["CurrentImageId"]
+    specification: dict[str, Any] = {
+        key: details[key]
+        for key in HYPERPOD_SPEC_FIELDS
+        if details.get(key) is not None
+    }
+    specification["InstanceCount"] = target_count
+    if details.get("MinCount") is not None:
+        specification["MinInstanceCount"] = details["MinCount"]
+    for source, field in (
+        ("CurrentImageId", "ImageId"),
+        ("CurrentImageReleaseVersion", "ImageReleaseVersion"),
+    ):
+        if details.get(source):
+            specification[field] = details[source]
+    requirements = details.get("InstanceRequirements")
+    if isinstance(requirements, Mapping) and (
+        requirements.get("CurrentInstanceTypes") is not None
+    ):
+        specification["InstanceRequirements"] = {
+            "InstanceTypes": requirements["CurrentInstanceTypes"]
+        }
+    patching = details.get("AutoPatchConfig")
+    if isinstance(patching, Mapping):
+        specification["AutoPatchConfig"] = _auto_patch_specification(patching)
     kubernetes: dict[str, Any] = {"Labels": dict(labels)}
     current = details.get("KubernetesConfig")
     if isinstance(current, Mapping) and current.get("CurrentTaints") is not None:
         kubernetes["Taints"] = current["CurrentTaints"]
     specification["KubernetesConfig"] = kubernetes
+    return specification
+
+
+def _auto_patch_specification(details: Mapping[str, Any]) -> dict[str, Any]:
+    """``ClusterAutoPatchConfig`` from its details: the *current* schedule."""
+
+    specification = {
+        key: details[key]
+        for key in ("PatchingStrategy", "DeploymentConfig")
+        if details.get(key) is not None
+    }
+    if details.get("CurrentPatchSchedule") is not None:
+        specification["PatchSchedule"] = details["CurrentPatchSchedule"]
     return specification
 
 
@@ -371,7 +464,16 @@ def _refuse(groups: ClusterGroups, group: str, reason: str) -> BootstrapError:
 
 
 def require_hyperpod_writable(groups: ClusterGroups, names: Sequence[str]) -> None:
-    """Refuse while UpdateCluster could do more than drop one label."""
+    """Refuse while UpdateCluster could do more than drop one label.
+
+    The cluster and the group must be ``InService`` with nothing in flight
+    (``ActiveOperations`` empty, the last software update settled) and nothing
+    pending (``CurrentCount`` equal to ``TargetCount``, every ``Desired*`` equal
+    to its ``Current*``: labels, taints, image, image release version,
+    instance types, patch schedule), and the running image release must not be
+    ``EndOfLife``. ``TargetStateCount`` (the nodes on the desired image) is
+    informational: recorded per group in the evidence, never a refusal.
+    """
 
     if groups.cluster_status != "InService":
         raise _refuse(
@@ -382,42 +484,99 @@ def require_hyperpod_writable(groups: ClusterGroups, names: Sequence[str]) -> No
         )
     for name in names:
         details = groups.documents.get(name) or {}
-        status = str(details.get("Status") or "InService")
-        if status != "InService":
-            raise _refuse(groups, name, f"the instance group is {status}")
-        current_count, target_count = (
-            details.get("CurrentCount"),
-            details.get("TargetCount"),
+        reason = _hyperpod_unsettled(details) or _hyperpod_change_pending(details)
+        if reason is not None:
+            raise _refuse(groups, name, reason)
+
+
+def _hyperpod_unsettled(details: Mapping[str, Any]) -> str | None:
+    """Why the group has an update or operation in flight, or ``None``."""
+
+    status = str(details.get("Status") or "InService")
+    if status != "InService":
+        return f"the instance group is {status}"
+    operations = details.get("ActiveOperations")
+    if operations:
+        return (
+            f"ActiveOperations {json.dumps(operations, sort_keys=True)} (an "
+            "operation is in flight)"
         )
-        if current_count != target_count:
-            raise _refuse(
-                groups,
-                name,
-                f"CurrentCount {current_count} differs from TargetCount {target_count} "
-                "(the group is scaling)",
+    software = details.get("SoftwareUpdateStatus")
+    if software and software not in HYPERPOD_SETTLED_SOFTWARE_UPDATES:
+        why = (
+            "its rollback did not complete; the nodes may run mixed images"
+            if software == "Failed"
+            else "a software update is in flight"
+        )
+        return f"the last software update is {software} ({why})"
+    current_count, target_count = (
+        details.get("CurrentCount"),
+        details.get("TargetCount"),
+    )
+    if current_count != target_count:
+        return (
+            f"CurrentCount {current_count} differs from TargetCount {target_count} "
+            "(the group is scaling)"
+        )
+    return None
+
+
+def _hyperpod_change_pending(details: Mapping[str, Any]) -> str | None:
+    """Why a change other than this release is pending, or ``None``.
+
+    Every ``Desired*`` the description carries must equal its ``Current*``
+    (the release's own pending label change excepted), and the running image
+    release must be one the service still offers, or ``UpdateCluster`` could
+    apply more than the label.
+    """
+
+    current, desired = _hyperpod_labels(details)
+    if desired is not None and desired != current:
+        pending_release = dict(current)
+        pending_release.pop(OWNERSHIP_LABEL, None)
+        if desired != pending_release:
+            return (
+                f"DesiredLabels {json.dumps(desired, sort_keys=True)} differ from "
+                f"CurrentLabels {json.dumps(current, sort_keys=True)} (a label "
+                "change is still being applied)"
             )
-        current, desired = _hyperpod_labels(details)
-        if desired is not None and desired != current:
-            pending_release = dict(current)
-            pending_release.pop(OWNERSHIP_LABEL, None)
-            if desired != pending_release:
-                raise _refuse(
-                    groups,
-                    name,
-                    f"DesiredLabels {json.dumps(desired, sort_keys=True)} differ from "
-                    f"CurrentLabels {json.dumps(current, sort_keys=True)} (a label "
-                    "change is still being applied)",
-                )
-        kubernetes = details.get("KubernetesConfig")
-        kubernetes = kubernetes if isinstance(kubernetes, Mapping) else {}
-        if "DesiredTaints" in kubernetes and kubernetes.get("DesiredTaints") != (
-            kubernetes.get("CurrentTaints")
+    kubernetes = details.get("KubernetesConfig")
+    kubernetes = kubernetes if isinstance(kubernetes, Mapping) else {}
+    if "DesiredTaints" in kubernetes and kubernetes.get("DesiredTaints") != (
+        kubernetes.get("CurrentTaints")
+    ):
+        return "DesiredTaints differ from CurrentTaints"
+    if details.get("DesiredImageId") and details.get("DesiredImageId") != (
+        details.get("CurrentImageId")
+    ):
+        return "a group image change is pending"
+    desired_release = details.get("DesiredImageReleaseVersion")
+    running_release = details.get("CurrentImageReleaseVersion")
+    if desired_release and desired_release != running_release:
+        return (
+            f"DesiredImageReleaseVersion {desired_release} differs from "
+            f"CurrentImageReleaseVersion {running_release} (an image release "
+            "change is pending)"
+        )
+    if details.get("ImageVersionStatus") == HYPERPOD_IMAGE_END_OF_LIFE:
+        return (
+            f"the running image release {running_release} is "
+            f"{HYPERPOD_IMAGE_END_OF_LIFE} (the service may not accept it as "
+            "ImageReleaseVersion and could substitute the latest release, a "
+            "re-image); update the cluster software first"
+        )
+    for field, current_key, desired_key in (
+        ("InstanceRequirements", "CurrentInstanceTypes", "DesiredInstanceTypes"),
+        ("AutoPatchConfig", "CurrentPatchSchedule", "DesiredPatchSchedule"),
+    ):
+        value = details.get(field)
+        if (
+            isinstance(value, Mapping)
+            and desired_key in value
+            and (value.get(desired_key) != value.get(current_key))
         ):
-            raise _refuse(groups, name, "DesiredTaints differ from CurrentTaints")
-        if details.get("DesiredImageId") and details.get("DesiredImageId") != (
-            details.get("CurrentImageId")
-        ):
-            raise _refuse(groups, name, "a group image change is pending")
+            return f"{field}.{desired_key} differs from {current_key}"
+    return None
 
 
 def _hyperpod_release_specifications(
@@ -558,13 +717,19 @@ def _group_record(
         outcome = UNLABELLED
     else:
         outcome = FOREIGN
-    return {
+    record: dict[str, Any] = {
         "name": item.name,
         "kind": groups.group_kind,
         "before": item.ownership,
         "after": item.ownership,
         "outcome": outcome,
     }
+    details = groups.documents.get(item.name) or {}
+    if "TargetStateCount" in details:
+        # Informational: the nodes running the desired image (HyperPod); the
+        # operator reads it from the evidence, the step never refuses on it.
+        record["target_state_count"] = details["TargetStateCount"]
+    return record
 
 
 def release_cluster_ownership(
