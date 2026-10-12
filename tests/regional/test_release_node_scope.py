@@ -119,7 +119,9 @@ def test_served_scope_reads_the_secret_and_defaults_as_the_data_plane_does() -> 
     # legacy source, which a legacy cluster agrees with.
     served = SCOPE.served_node_scope({}, target)
     assert served == LEGACY_HP
-    assert not SCOPE.scopes_disagree(LEGACY_HP, served, {})
+    assert not SCOPE.scopes_disagree(LEGACY_HP, served, {}), (
+        "a legacy entry agrees with a Secret that predates the keys"
+    )
     # The selector key alone (rendered between the two keys appearing) derives
     # the source the way the data plane reads the selector.
     assert (
@@ -136,7 +138,9 @@ def test_served_scope_reads_the_secret_and_defaults_as_the_data_plane_does() -> 
     # empty selector, which never agrees.
     eks = SCOPE.served_node_scope({}, _eks_target())
     assert eks["selector"] == ""
-    assert SCOPE.scopes_disagree(LEGACY_EKS, eks, {})
+    assert SCOPE.scopes_disagree(LEGACY_EKS, eks, {}), (
+        "an eks-managed Secret without the key never agrees"
+    )
 
 
 def test_the_live_finding_is_a_disagreement_on_both_clusters() -> None:
@@ -150,13 +154,17 @@ def test_the_live_finding_is_a_disagreement_on_both_clusters() -> None:
         eks_data, _converged(_eks_target(), EKS_LABEL_SELECTOR)
     )
     assert eks_served == LEGACY_EKS
-    assert SCOPE.scopes_disagree(CONVERGED_EKS, eks_served, eks_data)
+    assert SCOPE.scopes_disagree(CONVERGED_EKS, eks_served, eks_data), (
+        "the plain EKS Secret still serves the node-group selector"
+    )
     hp_data = _data(**LEGACY_HP_KEYS)
     hp_served = SCOPE.served_node_scope(
         hp_data, _converged(_target(), HP_LABEL_SELECTOR)
     )
     assert hp_served == LEGACY_HP
-    assert SCOPE.scopes_disagree(CONVERGED_HP, hp_served, hp_data)
+    assert SCOPE.scopes_disagree(CONVERGED_HP, hp_served, hp_data), (
+        "the HyperPod Secret still serves the cluster-name selector"
+    )
 
 
 def test_the_source_is_judged_only_when_the_secret_records_it() -> None:
