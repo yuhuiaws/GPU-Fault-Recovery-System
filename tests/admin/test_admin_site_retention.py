@@ -268,6 +268,10 @@ def _source_deployment() -> dict[str, Any]:
                         {
                             "name": "api",
                             "args": [
+                                "if [ -x /opt/gpu-fault/control-plane/bin/python ]; then\n"
+                                "  set -- /opt/gpu-fault/control-plane/bin/python "
+                                "-m gpu_fault.app.serve\nelse\n"
+                                "  set -- python3 -m gpu_fault.app.serve\nfi\n"
                                 'exec "$@" gpu_fault.app:create_app --factory '
                                 "--host 0.0.0.0 --port 8080"
                             ],
