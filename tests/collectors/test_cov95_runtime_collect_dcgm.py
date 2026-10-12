@@ -192,11 +192,7 @@ def test_startup_spread_precedes_a_real_scrape_when_no_force_request_exists(
     )
     with pytest.raises(support.StopLoop):
         reader.run()
-    assert (
-        0
-        < waits[0]
-        <= reader.startup_spread_seconds + (reader._cadence_jitter.startup_seconds)
-    ), "the deterministic spread plus the random start-up offset"
+    assert 0 < waits[0] <= reader.startup_spread_seconds
     assert waits[1] == reader.interval_seconds
     assert sink.requests[-1][1]["samples"], (
         "spread must be followed by actual parsed metrics"

@@ -25,6 +25,13 @@ from gpu_fault.transport.http_client import (
     _PooledConnection,
     enable_tcp_keepalive,
 )
+from tests.regional._cov95_runtime_http import (  # noqa: F401 - the http_wire fixture
+    Wire,
+    http_wire_fixture,
+)
+
+KEY = ("http", "example.test", 80)
+URL = "http://example.test/events"
 
 
 class FakeConnection:
@@ -36,15 +43,18 @@ class FakeConnection:
         self.closed = True
 
 
-def _pool(**policy: float) -> _KeepAliveConnectionPool:
-    pool = _KeepAliveConnectionPool(ConnectionPolicy(**policy))
-    pool._proxies = {}
-    return pool
+def _pool(
+    monkeypatch, *, now: float = 1000.0, **policy: float
+) -> _KeepAliveConnectionPool:
+    """A pool at a frozen clock with no proxies; ``now`` is ``time.monotonic``."""
+
+    monkeypatch.setattr(http_client.time, "monotonic", lambda: now)
+    monkeypatch.setattr(http_client, "getproxies", lambda: {})
+    return _KeepAliveConnectionPool(ConnectionPolicy(**policy))
 
 
 def _cached(
     pool: _KeepAliveConnectionPool,
-    key: tuple,
     connection: FakeConnection,
     *,
     now: float = 1000.0,
@@ -57,91 +67,74 @@ def _cached(
         last_used_at=now - idle_for,
         expires_at=expires_at,
     )
-    pool._cache()[key] = record
+    pool._cache()[KEY] = record
     return record
 
 
-KEY = ("http", "example.test", 80)
-
-
-def test_reused_post_without_idempotency_key_is_not_retried(monkeypatch) -> None:
-    pool = _pool()
-    reused = FakeConnection()
-    _cached(pool, KEY, reused)
-    monkeypatch.setattr(http_client.time, "monotonic", lambda: 1000.0)
-    calls = []
-
-    def exchange(*_args, **_kwargs):
-        calls.append(1)
-        raise OSError("response connection closed")
-
-    monkeypatch.setattr(pool, "_exchange", exchange)
-    with pytest.raises(OSError):
-        pool.send(Request("http://example.test/events", data=b"{}", method="POST"))
-    assert len(calls) == 1
-    assert reused.closed
-    assert pool.stats()["stale_connection_failures_total"] == 1
-    assert pool.stats()["stale_connection_retries_total"] == 0
-
-
-def test_reused_idempotent_post_may_retry_once(monkeypatch) -> None:
-    pool = _pool()
-    reused = FakeConnection()
-    replacement = FakeConnection()
-    _cached(pool, KEY, reused)
-    monkeypatch.setattr(http_client.time, "monotonic", lambda: 1000.0)
-    monkeypatch.setattr(pool, "_connect", lambda *_args: replacement)
-    calls = []
-
+def _exchange_recorder(pool, seen: list[Any], *, fail_on: FakeConnection | None = None):
     def exchange(record, *_args, **_kwargs):
-        calls.append(record.connection)
-        if record.connection is reused:
+        seen.append(record.connection)
+        if record.connection is fail_on:
             raise OSError("stale keep-alive")
         return "ok"
 
-    monkeypatch.setattr(pool, "_exchange", exchange)
-    result = pool.send(
-        Request(
-            "http://example.test/events",
-            data=b"{}",
-            headers={"Idempotency-Key": "event-1"},
-            method="POST",
-        )
+    return exchange
+
+
+def test_reused_post_without_idempotency_key_is_not_retried(monkeypatch) -> None:
+    pool = _pool(monkeypatch)
+    reused = FakeConnection()
+    _cached(pool, reused)
+    seen: list[Any] = []
+    monkeypatch.setattr(
+        pool, "_exchange", _exchange_recorder(pool, seen, fail_on=reused)
     )
+    with pytest.raises(OSError):
+        pool.send(Request(URL, data=b"{}", method="POST"))
+    assert seen == [reused]
+    assert reused.closed
+    stats = pool.stats()
+    assert stats["stale_connection_failures_total"] == 1
+    assert stats["stale_connection_retries_total"] == 0
+
+
+@pytest.mark.parametrize(
+    "header",
+    [{"Idempotency-Key": "event-1"}, {"X-GPU-Fault-Request-ID": "heartbeat-1"}],
+    ids=["idempotency-key", "request-id"],
+)
+def test_reused_idempotent_post_may_retry_once(
+    monkeypatch, header: dict[str, str]
+) -> None:
+    """``X-GPU-Fault-Request-ID`` is what the node Agent's heartbeat carries."""
+
+    pool = _pool(monkeypatch)
+    reused = FakeConnection()
+    replacement = FakeConnection()
+    _cached(pool, reused)
+    monkeypatch.setattr(pool, "_connect", lambda *_args: replacement)
+    seen: list[Any] = []
+    monkeypatch.setattr(
+        pool, "_exchange", _exchange_recorder(pool, seen, fail_on=reused)
+    )
+    result = pool.send(Request(URL, data=b"{}", headers=header, method="POST"))
     assert result == "ok"
-    assert calls == [reused, replacement]
+    assert seen == [reused, replacement]
     stats = pool.stats()
     assert stats["stale_connection_retries_total"] == 1
     assert stats["connections_opened_total"] == 1
     assert stats["requests_reused_total"] == 0, "the stale attempt was not a reuse"
 
 
-def test_a_request_id_header_makes_a_post_retryable() -> None:
-    """The node Agent's heartbeat carries ``X-GPU-Fault-Request-ID`` for this."""
-
-    request = Request("http://example.test/heartbeat", data=b"{}", method="POST")
-    assert not _KeepAliveConnectionPool._retryable_request(request, {})
-    assert _KeepAliveConnectionPool._retryable_request(
-        request, {"X-GPU-Fault-Request-ID": "abc"}
-    )
-
-
 def test_an_idle_connection_is_closed_before_the_nlb_would_drop_it(monkeypatch) -> None:
-    pool = _pool(max_idle_seconds=90.0)
+    pool = _pool(monkeypatch, max_idle_seconds=90.0)
     idle = FakeConnection()
     fresh = FakeConnection()
-    _cached(pool, KEY, idle, now=1000.0, idle_for=91.0)
-    monkeypatch.setattr(http_client.time, "monotonic", lambda: 1000.0)
+    _cached(pool, idle, idle_for=91.0)
     monkeypatch.setattr(pool, "_connect", lambda *_args: fresh)
-    seen = []
-    monkeypatch.setattr(
-        pool,
-        "_exchange",
-        lambda record, *_a, **_k: seen.append(record.connection) or "ok",
-    )
-    assert (
-        pool.send(Request("http://example.test/x", data=b"{}", method="POST")) == "ok"
-    )
+    seen: list[Any] = []
+    monkeypatch.setattr(pool, "_exchange", _exchange_recorder(pool, seen))
+    assert pool.send(Request(URL, data=b"{}", method="POST")) == "ok"
     assert idle.closed, "closed here, cleanly, not discovered dead by the request"
     assert seen == [fresh]
     stats = pool.stats()
@@ -150,48 +143,62 @@ def test_an_idle_connection_is_closed_before_the_nlb_would_drop_it(monkeypatch) 
 
 
 def test_a_connection_within_its_idle_budget_is_reused(monkeypatch) -> None:
-    pool = _pool(max_idle_seconds=90.0)
+    pool = _pool(monkeypatch, max_idle_seconds=90.0)
     warm = FakeConnection()
-    _cached(pool, KEY, warm, now=1000.0, idle_for=60.0)
-    monkeypatch.setattr(http_client.time, "monotonic", lambda: 1000.0)
-    seen = []
-    monkeypatch.setattr(
-        pool,
-        "_exchange",
-        lambda record, *_a, **_k: seen.append(record.connection) or "ok",
-    )
-    assert pool.send("http://example.test/x") == "ok"
+    _cached(pool, warm, idle_for=60.0)
+    seen: list[Any] = []
+    monkeypatch.setattr(pool, "_exchange", _exchange_recorder(pool, seen))
+    assert pool.send(URL) == "ok"
     assert seen == [warm] and not warm.closed
     assert pool.stats()["requests_reused_total"] == 1
 
 
 def test_an_aged_connection_is_replaced_so_the_fleet_respreads(monkeypatch) -> None:
-    pool = _pool(max_age_seconds=1800.0)
+    pool = _pool(monkeypatch, max_age_seconds=1800.0)
     aged = FakeConnection()
     fresh = FakeConnection()
-    _cached(pool, KEY, aged, now=1000.0, idle_for=5.0, expires_at=999.0)
-    monkeypatch.setattr(http_client.time, "monotonic", lambda: 1000.0)
+    _cached(pool, aged, idle_for=5.0, expires_at=999.0)
     monkeypatch.setattr(pool, "_connect", lambda *_args: fresh)
-    seen = []
-    monkeypatch.setattr(
-        pool,
-        "_exchange",
-        lambda record, *_a, **_k: seen.append(record.connection) or "ok",
-    )
-    pool.send("http://example.test/x")
+    seen: list[Any] = []
+    monkeypatch.setattr(pool, "_exchange", _exchange_recorder(pool, seen))
+    pool.send(URL)
     assert aged.closed and seen == [fresh]
     assert pool.stats()["age_expired_total"] == 1
 
 
-def test_connection_lifetimes_are_jittered_and_zero_disables_them() -> None:
-    pool = _pool(max_age_seconds=1800.0)
-    pool._jitter = lambda low, high: high
-    assert pool._expiry(0.0) == pytest.approx(1800.0 * 1.1)
-    pool._jitter = lambda low, high: low
-    assert pool._expiry(0.0) == pytest.approx(1800.0 * 0.9)
-    assert _pool(max_age_seconds=0.0)._expiry(0.0) is None, (
-        "0 keeps connections for ever"
+def test_connection_lifetimes_are_jittered_and_zero_disables_them(
+    monkeypatch, http_wire: Wire
+) -> None:
+    """A fresh connection's lifetime is the policy's age +-10 %, drawn per
+    connection and honoured on the next reuse; 0 means unbounded."""
+
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(http_client.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(http_client, "getproxies", lambda: {})
+    # An idle ceiling far above the lifetime, so only the age can end it here.
+    pool = _KeepAliveConnectionPool(
+        ConnectionPolicy(max_age_seconds=1800.0, max_idle_seconds=10**6)
     )
+    pool.jitter = lambda low, high: low  # the shortest lifetime: 1800 x 0.9
+    pool.send(URL)
+    clock["now"] += 1800.0 * 0.9 - 1.0
+    pool.send(URL)
+    assert len(http_wire.connections) == 1, "reused before its lifetime ends"
+    clock["now"] += 2.0
+    pool.send(URL)
+    assert len(http_wire.connections) == 2, "replaced at 0.9 x age"
+    assert http_wire.connections[0].closed
+    assert pool.stats()["age_expired_total"] == 1
+    assert pool.stats()["connections_opened_total"] == 2
+
+    unbounded = _KeepAliveConnectionPool(
+        ConnectionPolicy(max_age_seconds=0.0, max_idle_seconds=10**9)
+    )
+    unbounded.send(URL)
+    clock["now"] += 10 * 24 * 3600.0
+    unbounded.send(URL)
+    assert len(http_wire.connections) == 3, "0 keeps the connection for ever"
+    assert unbounded.stats()["requests_reused_total"] == 1
 
 
 def test_the_policy_fails_closed_on_values_the_nlb_cannot_honour() -> None:
@@ -238,13 +245,15 @@ def test_tcp_keepalive_is_armed_on_a_real_socket_and_skipped_where_impossible() 
     assert not enable_tcp_keepalive(None, 60.0)
 
 
-def test_stats_name_every_counter_and_the_policy_and_reset() -> None:
-    pool = _pool()
+def test_stats_name_every_counter_and_the_policy_and_reset(monkeypatch) -> None:
+    pool = _pool(monkeypatch)
     stats = pool.stats()
     assert set(http_client.STAT_NAMES) <= set(stats)
     assert all(stats[name] == 0 for name in http_client.STAT_NAMES)
     assert stats["max_idle_seconds"] == 90.0
-    pool._count("connections_opened_total")
+    monkeypatch.setattr(pool, "_connect", lambda *_args: FakeConnection())
+    monkeypatch.setattr(pool, "_exchange", _exchange_recorder(pool, []))
+    pool.send(URL)
     assert pool.stats()["connections_opened_total"] == 1
     pool.reset_stats()
     assert pool.stats()["connections_opened_total"] == 0
@@ -252,15 +261,22 @@ def test_stats_name_every_counter_and_the_policy_and_reset() -> None:
 
 
 def test_the_periodic_summary_is_logged_once_per_interval(monkeypatch, caplog) -> None:
-    pool = _pool()
-    pool._last_log = 0.0
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(http_client.time, "monotonic", lambda: clock["now"])
+    monkeypatch.setattr(http_client, "getproxies", lambda: {})
+    pool = _KeepAliveConnectionPool(ConnectionPolicy())
+    monkeypatch.setattr(pool, "_connect", lambda *_args: FakeConnection())
+    monkeypatch.setattr(pool, "_exchange", _exchange_recorder(pool, []))
     with caplog.at_level("INFO", logger="gpu_fault.transport.http_client"):
-        pool._maybe_log(http_client.STATS_LOG_INTERVAL_SECONDS + 1.0)
-        pool._maybe_log(http_client.STATS_LOG_INTERVAL_SECONDS + 2.0)
+        pool.send(URL)
+        clock["now"] += http_client.STATS_LOG_INTERVAL_SECONDS + 1.0
+        pool.send(URL)
+        clock["now"] += 1.0
+        pool.send(URL)
     lines = [
         record.message
         for record in caplog.records
         if "transport pool" in record.message
     ]
-    assert len(lines) == 1
+    assert len(lines) == 1, "one summary per interval, not per request"
     assert "idle max 90 s" in lines[0] and "tcp keepalive 60 s" in lines[0]

@@ -40,7 +40,7 @@ import socket
 import ssl
 import time
 from collections import OrderedDict
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from http.client import (
     HTTPConnection,
@@ -184,7 +184,8 @@ class _KeepAliveConnectionPool:
         self._stats_lock = Lock()
         self._counters: dict[str, int] = dict.fromkeys(STAT_NAMES, 0)
         self._last_log = time.monotonic()
-        self._jitter = random.uniform
+        #: Draw for the per-connection lifetime spread; a test seam.
+        self.jitter: Callable[[float, float], float] = random.uniform
 
     def context(self) -> ssl.SSLContext:
         if self._ssl_context is None:
@@ -248,7 +249,7 @@ class _KeepAliveConnectionPool:
         if self.policy.max_age_seconds <= 0:
             return None
         spread = self.policy.max_age_seconds * AGE_JITTER_RATIO
-        return now + self.policy.max_age_seconds + self._jitter(-spread, spread)
+        return now + self.policy.max_age_seconds + self.jitter(-spread, spread)
 
     def _expired(self, record: _PooledConnection, now: float) -> str | None:
         """Why a cached connection must not be reused, or ``None``."""
