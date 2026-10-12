@@ -92,7 +92,7 @@ def test_reused_post_without_idempotency_key_is_not_retried(monkeypatch) -> None
     with pytest.raises(OSError):
         pool.send(Request(URL, data=b"{}", method="POST"))
     assert seen == [reused]
-    assert reused.closed
+    assert reused.closed, "a connection that failed mid-request is closed"
     stats = pool.stats()
     assert stats["stale_connection_failures_total"] == 1
     assert stats["stale_connection_retries_total"] == 0
@@ -187,7 +187,7 @@ def test_connection_lifetimes_are_jittered_and_zero_disables_them(
     clock["now"] += 2.0
     pool.send(URL)
     assert len(http_wire.connections) == 2, "replaced at 0.9 x age"
-    assert http_wire.connections[0].closed
+    assert http_wire.connections[0].closed, "the aged connection is closed, not leaked"
     assert pool.stats()["age_expired_total"] == 1
     assert pool.stats()["connections_opened_total"] == 2
 
@@ -235,21 +235,23 @@ def test_the_policy_fails_closed_on_values_the_nlb_cannot_honour() -> None:
 
 def test_tcp_keepalive_is_armed_on_a_real_socket_and_skipped_where_impossible() -> None:
     with socket.socket() as sock:
-        assert enable_tcp_keepalive(sock, 60.0)
+        assert enable_tcp_keepalive(sock, 60.0), "a real socket takes TCP keepalive"
         assert sock.getsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE) == 1
         assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE) == 60
         assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL) == 15
         assert sock.getsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT) == 4
         assert not enable_tcp_keepalive(sock, 0.0), "0 leaves the socket alone"
     assert not enable_tcp_keepalive(object(), 60.0), "a fake socket is tolerated"
-    assert not enable_tcp_keepalive(None, 60.0)
+    assert not enable_tcp_keepalive(None, 60.0), "no socket, nothing to arm"
 
 
 def test_stats_name_every_counter_and_the_policy_and_reset(monkeypatch) -> None:
     pool = _pool(monkeypatch)
     stats = pool.stats()
     assert set(http_client.STAT_NAMES) <= set(stats)
-    assert all(stats[name] == 0 for name in http_client.STAT_NAMES)
+    assert all(stats[name] == 0 for name in http_client.STAT_NAMES), (
+        "fresh pool counts nothing"
+    )
     assert stats["max_idle_seconds"] == 90.0
     monkeypatch.setattr(pool, "_connect", lambda *_args: FakeConnection())
     monkeypatch.setattr(pool, "_exchange", _exchange_recorder(pool, []))

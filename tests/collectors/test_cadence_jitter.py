@@ -163,7 +163,7 @@ def test_every_silence_threshold_covers_the_jittered_cadence() -> None:
             CollectorKind.NVIDIA_KERNEL,
             CollectorKind.FABRIC_MANAGER_LOG,
         )
-    )
+    ), "the health summaries post every 300 s by default"
     assert set(cadences) == set(collector_silent_thresholds()), (
         "every scheduled kind declares its cadence next to its threshold"
     )

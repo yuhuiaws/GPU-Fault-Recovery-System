@@ -210,7 +210,7 @@ def test_a_worker_that_never_serves_stops_the_parent_with_startup_failure(
     output = _stop(process)
     assert "cannot build the application" in output
     assert "failed to start; stopping the parent" in output
-    assert not _listening_inodes(port)
+    assert not _listening_inodes(port), "no worker socket may outlive the parent"
 
 
 def test_the_command_line_is_uvicorns_subset_and_is_validated() -> None:
