@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from threading import Event, Lock
 from typing import Any, Callable
 
+from gpu_fault.app.store_bloat_metrics import describe_scan, scan_gauge_tables
 from gpu_fault.collector_requirements import (
     collector_silent_thresholds,
 )
@@ -259,12 +260,17 @@ class PeriodicServiceRunner:
         self.processor_counter_drift_scan_timestamp_seconds = 0.0
         self._counter_drift_lock = Lock()
         # Hot-table bloat: the last catalog scan per table (pages, live rows,
-        # the ratios the compaction policy acts on) and what the job rebuilt.
-        # Written by the store-compaction job, read by a scrape.
+        # the ratios the compaction policy acts on, its verdict) and what the
+        # job rebuilt. Written by the store-compaction job, read by a scrape.
+        # Every completed round moves ``last``; only a rebuild moves
+        # ``last_action``; rounds are counted by outcome so a holder that is
+        # replaced by a roll still leaves its history in Prometheus.
         self.store_bloat_tables: dict[str, dict[str, object]] = {}
         self.store_bloat_scan_timestamp_seconds = 0.0
         self.store_compaction_last_timestamp_seconds = 0.0
-        self.store_compaction_actions_total: dict[tuple[str, str], int] = {}
+        self.store_compaction_last_action_timestamp_seconds = 0.0
+        self.store_compaction_rounds_total: dict[str, int] = {}
+        self.store_compaction_actions_total: dict[tuple[str, str, str], int] = {}
         # ARCH-E E3: the runner's own heartbeat, and each job's last run. The
         # counters above are written by the loop, so a dead thread leaves
         # every one of them at a healthy-looking value.
@@ -340,6 +346,8 @@ class PeriodicServiceRunner:
             }
             bloat_scanned_at = self.store_bloat_scan_timestamp_seconds
             compacted_at = self.store_compaction_last_timestamp_seconds
+            acted_at = self.store_compaction_last_action_timestamp_seconds
+            compaction_rounds = dict(self.store_compaction_rounds_total)
             compaction_actions = dict(self.store_compaction_actions_total)
         return {
             "periodic_lease_errors_total": self.periodic_lease_errors_total,
@@ -356,6 +364,8 @@ class PeriodicServiceRunner:
             "store_bloat_tables": bloat_tables,
             "store_bloat_scan_timestamp_seconds": bloat_scanned_at,
             "store_compaction_last_timestamp_seconds": compacted_at,
+            "store_compaction_last_action_timestamp_seconds": acted_at,
+            "store_compaction_rounds_total": compaction_rounds,
             "store_compaction_actions_total": compaction_actions,
             "processor_counter_drift_scan_max_age_seconds": max(
                 120.0, 3 * self.config.counter_drift_interval
@@ -859,15 +869,18 @@ class PeriodicServiceRunner:
             "processor counter drift scan failed",
         )
 
-    #: Facts of a table the bloat gauges export (``app.store_bloat_metrics``).
-    STORE_BLOAT_GAUGE_KEYS = (
-        "live_rows",
-        "heap_pages",
-        "index_pages",
-        "heap_pages_per_live_row",
-        "index_pages_per_live_row",
-        "index_min_entries_per_page",
-    )
+    def _record_compaction_round(self, outcome: str, *, acted: bool) -> None:
+        """One round ended: count it, stamp it, and stamp the rebuild clock
+        when it rebuilt something."""
+
+        now = time.time()
+        with self._counter_drift_lock:
+            self.store_compaction_rounds_total[outcome] = (
+                self.store_compaction_rounds_total.get(outcome, 0) + 1
+            )
+            self.store_compaction_last_timestamp_seconds = now
+            if acted:
+                self.store_compaction_last_action_timestamp_seconds = now
 
     def _run_store_compaction(self, now: float) -> bool:
         """Measure the hot tables' physical layout; rebuild what crossed the
@@ -880,6 +893,14 @@ class PeriodicServiceRunner:
         methods; the scan is a handful of catalog reads, and the rebuild runs
         under the schema advisory lock so it never overlaps a schema ensure
         or the operator's ``store-maintenance``.
+
+        The job runs on whichever worker process holds its task lease, so its
+        gauges and counters live on one process of one Pod at a time. Every
+        round therefore logs its verdict with the ratios it was made on and
+        stamps the round clock, whether or not anything was due: a round that
+        rebuilt nothing used to leave no line and move no clock, and a perf
+        suite read the other Pods' zeros as "never ran" while the holder had
+        rebuilt the queue's indexes four times.
         """
 
         interval = self.config.store_compaction_interval
@@ -889,43 +910,44 @@ class PeriodicServiceRunner:
 
         def compact() -> None:
             assessment = store.hot_table_bloat()
-            tables = {
-                str(item["table"]): {
-                    key: item.get(key) for key in self.STORE_BLOAT_GAUGE_KEYS
-                }
-                for item in assessment.get("tables", [])
-            }
+            tables = scan_gauge_tables(assessment)
             with self._counter_drift_lock:
                 self.store_bloat_tables = tables
                 self.store_bloat_scan_timestamp_seconds = time.time()
+            LOGGER.info("store-compaction scan: %s", describe_scan(assessment))
             actions = assessment.get("actions") or []
             if not actions:
+                self._record_compaction_round("noop", acted=False)
                 return
-            LOGGER.warning(
-                "store compaction due: %s",
-                "; ".join(f"{a['action']} {a['target']}" for a in actions),
-            )
             result = store.compact_hot_tables(assessment)
+            status = str(result.get("status", ""))
             with self._counter_drift_lock:
                 for item in result.get("actions", []):
-                    key = (str(item["action"]), str(item["status"]))
+                    key = (str(item["table"]), str(item["action"]), str(item["status"]))
                     self.store_compaction_actions_total[key] = (
                         self.store_compaction_actions_total.get(key, 0) + 1
                     )
-                if result.get("status") in {"SUCCEEDED", "FAILED"}:
-                    self.store_compaction_last_timestamp_seconds = time.time()
             for item in result.get("actions", []):
-                LOGGER.warning(
-                    "store compaction %s %s %s in %ss",
+                succeeded = item["status"] == "SUCCEEDED"
+                (LOGGER.info if succeeded else LOGGER.warning)(
+                    "store-compaction %s %s (%s) %s in %ss",
                     item["action"],
                     item["target"],
+                    item["table"],
                     item["status"],
                     item.get("seconds", "?"),
                 )
-            if result.get("status") == "SKIPPED":
-                LOGGER.info("store compaction skipped: %s", result.get("reason"))
-            if result.get("status") == "FAILED":
+            if status == "SKIPPED":
+                LOGGER.info("store-compaction skipped: %s", result.get("reason"))
+                self._record_compaction_round("skipped", acted=False)
+                return
+            if status == "FAILED":
+                self._record_compaction_round("failed", acted=True)
                 raise RuntimeError("store compaction left a failed action")
+            self._record_compaction_round(
+                "compacted" if status == "SUCCEEDED" else "noop",
+                acted=status == "SUCCEEDED",
+            )
 
         return self._run_scheduled(
             "store-compaction",

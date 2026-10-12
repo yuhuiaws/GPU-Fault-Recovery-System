@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+from gpu_fault.store.postgres import hot_table_bloat as policy
 from gpu_fault.store.postgres.hot_table_bloat import HOT_TABLES
 from tests._script_loader import lazy_script_module
 
@@ -38,6 +39,14 @@ def test_the_in_pod_script_compiles_with_its_placeholders_substituted() -> None:
 
 def test_the_hot_table_list_is_the_products_own() -> None:
     assert tuple(capacity_database.HOT_TABLES) == HOT_TABLES
+
+
+def test_the_index_rule_constants_are_the_products_own() -> None:
+    assert capacity_database.INDEX_MIN_PAGES == policy.INDEX_MIN_PAGES
+    assert (
+        capacity_database.INDEX_MIN_ENTRIES_PER_PAGE
+        == policy.INDEX_MIN_ENTRIES_PER_PAGE
+    )
 
 
 def test_postgres_counters_exec_substitutes_the_template(monkeypatch) -> None:
@@ -97,10 +106,76 @@ def test_ratios_are_physical_pages_per_live_row_and_a_density_floor() -> None:
         "heap_pages_per_live_row": 4.244,
         "index_pages_per_live_row": 18.943,
         "index_min_entries_per_page": 0.227,
+        "index_max_pages": 1082,
+        "bloated_indexes": 1,
     }
     # Zero live rows divide by one: the pages themselves are the signal.
     assert ratios["gpu_fault_processor_lanes"]["index_pages_per_live_row"] == 300
     assert ratios["gpu_fault_processor_lanes"]["index_min_entries_per_page"] is None
+    assert ratios["gpu_fault_processor_lanes"]["index_max_pages"] == 0
+    assert ratios["gpu_fault_processor_lanes"]["bloated_indexes"] == 0
+
+
+def _queue_snapshot(live_rows: int, pages_and_entries: dict[str, tuple[int, float]]):
+    return {
+        "hot_tables": {
+            "gpu_fault_processor_queue": {
+                "live_rows": live_rows,
+                "heap_bytes": 5 * 8192,
+                "index_bytes": sum(p for p, _e in pages_and_entries.values()) * 8192,
+                "toast_bytes": 0,
+                "indexes": {
+                    name: {"bytes": pages * 8192, "entries": entries}
+                    for name, (pages, entries) in pages_and_entries.items()
+                },
+            }
+        }
+    }
+
+
+def test_pages_per_live_row_is_not_the_verdict_the_floor_and_density_are() -> None:
+    """The two queue layouts a formal suite recorded: two live rows under 149
+    index pages read 74.5 pages per live row while every index sat below the
+    64-page floor (nothing due, and the job correctly did nothing); one live
+    row under three indexes of 99/158/82 pages is three rebuilds due, which
+    the job then ran -- the next preflight found exactly those three at two
+    pages and the three below the floor untouched."""
+
+    idle = capacity_database.hot_table_bloat_ratios(
+        _queue_snapshot(
+            2,
+            {
+                "claim_window": (2, 3.0),
+                "cluster_rows": (55, 3.0),
+                "lane_rows": (55, 3.0),
+                "path_claim_window": (2, 3.0),
+                "pkey": (2, 3.0),
+                "scope_keys": (27, 0.0),
+            },
+        )
+    )["gpu_fault_processor_queue"]
+    assert idle["index_pages"] == 143
+    assert idle["index_pages_per_live_row"] == 71.5
+    assert idle["index_min_entries_per_page"] is None
+    assert idle["index_max_pages"] == 55
+    assert idle["bloated_indexes"] == 0
+
+    bloated = capacity_database.hot_table_bloat_ratios(
+        _queue_snapshot(
+            1,
+            {
+                "claim_window": (99, 1.0),
+                "cluster_rows": (55, 1.0),
+                "lane_rows": (55, 1.0),
+                "path_claim_window": (158, 1.0),
+                "pkey": (82, 1.0),
+                "scope_keys": (27, 0.0),
+            },
+        )
+    )["gpu_fault_processor_queue"]
+    assert bloated["index_max_pages"] == 158
+    assert bloated["index_min_entries_per_page"] == 0.006
+    assert bloated["bloated_indexes"] == 3
 
 
 def test_the_summary_section_records_the_preflight_worst_case_or_its_absence() -> None:
@@ -126,6 +201,8 @@ def test_the_summary_section_records_the_preflight_worst_case_or_its_absence() -
     assert section["recorded"] is True
     assert section["preflight_max_heap_pages_per_live_row"] == 25.161
     assert section["preflight_max_index_pages_per_live_row"] == 11.727
+    assert section["preflight_bloated_indexes"] == 0
+    assert section["after_bloated_indexes"] is None
     assert section["after"] == {}
 
     absent = capacity_database.store_bloat_section({}, {})
@@ -134,5 +211,7 @@ def test_the_summary_section_records_the_preflight_worst_case_or_its_absence() -
         "after": {},
         "preflight_max_heap_pages_per_live_row": None,
         "preflight_max_index_pages_per_live_row": None,
+        "preflight_bloated_indexes": None,
+        "after_bloated_indexes": None,
         "recorded": False,
     }

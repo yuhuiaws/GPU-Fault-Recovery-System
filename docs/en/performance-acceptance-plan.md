@@ -461,7 +461,10 @@ gpu_fault_remediation_budget_waiting_workflows
 gpu_fault_store_hot_table_heap_pages_per_live_row
 gpu_fault_store_hot_table_index_pages_per_live_row
 gpu_fault_store_hot_table_index_min_entries_per_page
+gpu_fault_store_hot_table_index_max_pages
+gpu_fault_store_hot_table_due_actions
 gpu_fault_store_bloat_scan_timestamp_seconds
+gpu_fault_store_compaction_rounds_total
 ```
 
 Also collect:
@@ -971,9 +974,12 @@ Every ingress path in `summary.json` must include classified `transport_retries`
 executor must include `claim_error_counts` and bounded, redacted `claim_error_samples`. All three
 runners' `summary.json` must also carry `store_bloat`: `before`/`after` derive, from the `hot_tables`
 section of `postgres-before.json`/`postgres-after.json`, each hot table's live rows, heap pages, index
-pages, `heap_pages_per_live_row`, `index_pages_per_live_row` and `index_min_entries_per_page`;
+pages, `heap_pages_per_live_row`, `index_pages_per_live_row`, `index_min_entries_per_page`, `index_max_pages` (the
+largest index against the 64-page floor) and `bloated_indexes` (how many indexes the compaction rule flags);
 `preflight_max_heap_pages_per_live_row`/`preflight_max_index_pages_per_live_row` are the worst values
-the round started on, and `recorded=false` means the in-Pod snapshot failed -- so a round run on a
+the round started on, `preflight_bloated_indexes`/`after_bloated_indexes` the rule's verdict at either end (the
+pages-per-live-row ratios are reporting values a near-empty queue drives into the tens; only the verdict says whether
+the control worker's `store-compaction` job had anything to do), and `recorded=false` means the in-Pod snapshot failed -- so a round run on a
 bloated store is visible in the acceptance record instead of being reconstructed after a failure. A
 fresh or just-compacted store reads far below 1 on both ratios; a store left uncompacted after the
 previous round's teardown reads in the tens (§3.2). From schema v23 `summary.json` must also carry

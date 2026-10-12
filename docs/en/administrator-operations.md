@@ -3952,17 +3952,43 @@ indexes rebuilt and the three small tables `VACUUM FULL`ed with the large heaps 
 with zero BufferContent samples. The control worker therefore reads the catalog facts every
 `GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS` (default 300 s, `0` disables) under a periodic-task lease
 (`store/postgres/hot_table_bloat.py`): each hot table's live rows, heap pages, index pages, heap pages per live row,
-index pages per live row and the least dense index's entries per page, exported as
-`gpu_fault_store_hot_table_*{table=...}` with `gpu_fault_store_bloat_scan_timestamp_seconds`. An index of at least 64
+index pages per live row, the least dense index's entries per page, the largest index's pages and the number of
+actions this scan derived, exported as `gpu_fault_store_hot_table_*{table=...}` (`..._index_max_pages` and
+`..._due_actions` are the rule's input and its verdict) with `gpu_fault_store_bloat_scan_timestamp_seconds`. An index of at least 64
 pages holding fewer than 8 live entries per page is rebuilt with `REINDEX INDEX CONCURRENTLY` (an invalid `_ccnew`
 twin left by an interrupted rebuild is dropped first); the three small tables lanes/queue counts/priority shards are
 rewritten with `VACUUM (FULL, ANALYZE)` when they span at least 16 pages with fewer than 4 live rows per page (an
 exclusive lock of well under a second at their live size). The thresholds sit an order of magnitude below any compact
 layout -- even 500-byte index entries pack 16 to a page -- so a queue carrying its working set is never touched. The
 actions run through the Store's own pool under the `gpu_fault_schema_bootstrap` advisory lock, mutually exclusive with
-a schema ensure and with `store-maintenance`; a held lock skips the round. Outcomes count in
-`gpu_fault_store_compaction_actions_total{action,status}` and `gpu_fault_store_compaction_last_timestamp_seconds`, and a
-failed action in `gpu_fault_periodic_job_errors_total{periodic_job="store_compaction"}`.
+a schema ensure and with `store-maintenance`; a held lock skips the round. **Every round -- including one with nothing
+to do -- leaves three traces**: one INFO line `store-compaction scan: <verdict>; <per table live/heap/index(max)/
+index_pages/live_row/min_entries/page/due>`, `gpu_fault_store_compaction_last_timestamp_seconds` moves (the moment this
+process last completed a round, action or not), and `gpu_fault_store_compaction_rounds_total{outcome=noop|compacted|
+skipped|failed}` counts it; the moment something was actually rebuilt is
+`gpu_fault_store_compaction_last_action_timestamp_seconds`, each action counts in
+`gpu_fault_store_compaction_actions_total{table,action,status}`, and a failed action in
+`gpu_fault_periodic_job_errors_total{periodic_job="store_compaction"}`.
+
+**The ratio the verdict is made on, and how to read the numbers.** What triggers a rebuild is **each index's own
+density** (`reltuples` over its pages, judged only on indexes of at least 64 pages), not
+`gpu_fault_store_hot_table_index_pages_per_live_row`: that gauge divides a table's total index pages by its live rows,
+so a queue left with 2 live rows between two perf rounds reads 74.5 "index pages per live row" for 149 index pages
+spread over six indexes of 2/55/55/2/2/27 pages -- none of which reaches the 64-page floor -- and the verdict is,
+correctly, nothing to do (`index_max_pages=55`, no `index_min_entries_per_page` sample, `due_actions=0`). In the same
+suite three indexes reached 99/158/82 pages with a single entry each: three rebuilds were due, and at the next round's
+preflight exactly those three were back at 2 pages while the three below the floor were untouched. A table with a few
+rows therefore never thrashes: a rebuilt index holds 1-2 pages, below the floor, and the rule no longer applies. The
+job runs on **the one worker process that holds its periodic-task lease** (six control-worker Pods with four uvicorn
+processes each; one process holds it), so the gauges and counters above appear on that Pod only, and every
+control-plane roll replaces the holder and zeroes its in-process counters: verify with
+`max by (table) (gpu_fault_store_hot_table_due_actions)`, `sum(increase(gpu_fault_store_compaction_rounds_total[1h]))`
+and `max(gpu_fault_periodic_job_last_run_timestamp_seconds{periodic_job="store_compaction"})` (Prometheus keeps the
+replaced processes' series), and read the logs with
+`kubectl logs -l app=gpu-fault-control-worker --since=1h | grep 'store-compaction'`. A
+`..._last_timestamp_seconds 0.000` with no `hot_table_*` samples on the other Pods means "not the holder", not "never
+ran". The job needs no `GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS` in a ConfigMap -- the rendered control-plane
+manifests carry none -- the code default of 300 s applies.
 
 **When `store-maintenance` is still needed.** The large tables' heaps and TOAST (`gpu_fault_gpu_metric_latest`,
 `gpu_fault_objects`, the TOAST of `gpu_fault_processor_queue`) are measured by the job but never rewritten -- returning

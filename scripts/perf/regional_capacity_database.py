@@ -235,8 +235,25 @@ print(json.dumps(out))
 """
 
 
+#: The compaction policy's index rule (``store.postgres.hot_table_bloat``):
+#: an index of at least this many pages holding fewer than this many entries
+#: per page is rebuilt. Repeated here so a summary can state the verdict the
+#: product reached on the same snapshot; ``tests/regional/
+#: test_perf_store_bloat_snapshot.py`` pins both to the product's constants.
+INDEX_MIN_PAGES = 64
+INDEX_MIN_ENTRIES_PER_PAGE = 8.0
+
+
 def hot_table_bloat_ratios(snapshot: dict) -> dict:
-    """Per hot table: pages, live rows and the planner-independent ratios.
+    """Per hot table: pages, live rows, the planner-independent ratios and
+    the index rule's verdict.
+
+    ``index_pages_per_live_row`` is a reporting ratio: with two live rows
+    under 149 index pages it reads 74.5 while every one of those indexes is
+    below the 64-page floor and nothing is due. ``index_max_pages`` says
+    whether the floor was reached at all and ``bloated_indexes`` how many
+    indexes the rule flags, so a round's record answers "should the job have
+    acted" without the control plane's gauges.
 
     ``snapshot`` is a ``postgres_counters`` answer; a snapshot without the
     ``hot_tables`` section (an older control plane, an exec failure) yields
@@ -252,11 +269,17 @@ def hot_table_bloat_ratios(snapshot: dict) -> dict:
         heap_pages = int(facts.get("heap_bytes", 0)) // PAGE_BYTES
         index_pages = int(facts.get("index_bytes", 0)) // PAGE_BYTES
         densities = []
+        max_pages = 0
+        bloated = 0
         for index in (facts.get("indexes") or {}).values():
             pages = int(index.get("bytes", 0)) // PAGE_BYTES
             entries = float(index.get("entries", -1))
-            if pages >= 64 and entries >= 0:
-                densities.append(round(entries / pages, 3))
+            max_pages = max(max_pages, pages)
+            if pages >= INDEX_MIN_PAGES and entries >= 0:
+                density = round(entries / pages, 3)
+                densities.append(density)
+                if entries / pages < INDEX_MIN_ENTRIES_PER_PAGE:
+                    bloated += 1
         ratios[table] = {
             "live_rows": live_rows,
             "heap_pages": heap_pages,
@@ -265,6 +288,8 @@ def hot_table_bloat_ratios(snapshot: dict) -> dict:
             "heap_pages_per_live_row": round(heap_pages / max(live_rows, 1), 3),
             "index_pages_per_live_row": round(index_pages / max(live_rows, 1), 3),
             "index_min_entries_per_page": min(densities) if densities else None,
+            "index_max_pages": max_pages,
+            "bloated_indexes": bloated,
         }
     return ratios
 
@@ -291,7 +316,8 @@ def store_layout_section(before: dict, after: dict) -> dict:
 
 def store_bloat_section(before: dict, after: dict) -> dict:
     """The ``store_bloat`` block of a round's summary: the preflight layout
-    the round ran on, the layout it left behind, and the worst ratios."""
+    the round ran on, the layout it left behind, the worst ratios, and how
+    many indexes the compaction rule flagged at either end."""
 
     before_ratios = hot_table_bloat_ratios(before)
     after_ratios = hot_table_bloat_ratios(after)
@@ -304,6 +330,11 @@ def store_bloat_section(before: dict, after: dict) -> dict:
         ]
         return max(values) if values else None
 
+    def flagged(ratios: dict) -> int | None:
+        if not ratios:
+            return None
+        return sum(int(item.get("bloated_indexes", 0)) for item in ratios.values())
+
     return {
         "before": before_ratios,
         "after": after_ratios,
@@ -313,6 +344,8 @@ def store_bloat_section(before: dict, after: dict) -> dict:
         "preflight_max_index_pages_per_live_row": worst(
             before_ratios, "index_pages_per_live_row"
         ),
+        "preflight_bloated_indexes": flagged(before_ratios),
+        "after_bloated_indexes": flagged(after_ratios),
         "recorded": bool(before_ratios),
     }
 

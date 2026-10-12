@@ -387,8 +387,12 @@ only the indexes were rebuilt and the three small tables `VACUUM FULL`ed. The co
 `store-compaction` (`GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS`, default 300 s, `0` disables) does exactly that from
 catalog facts and exports `gpu_fault_store_hot_table_heap_pages_per_live_row{table}`,
 `gpu_fault_store_hot_table_index_pages_per_live_row{table}` and
-`gpu_fault_store_hot_table_index_min_entries_per_page{table}`; the values depend on no planner statistics target or cost
-model, and the perf runners write them into every round's `summary.json` as `store_bloat`. The thresholds (an index of
+`gpu_fault_store_hot_table_index_min_entries_per_page{table}`, `gpu_fault_store_hot_table_index_max_pages{table}` and
+`gpu_fault_store_hot_table_due_actions{table}`; the values depend on no planner statistics target or cost
+model, and the perf runners write them into every round's `summary.json` as `store_bloat`. The verdict is made on each
+index's own density among indexes of at least 64 pages, never on index pages per live row -- a queue left with two live
+rows reads 74.5 index pages per live row for 149 pages while no index reaches the floor, and `due_actions` of 0 is the
+conclusion (Administrator Operations §10.3). The thresholds (an index of
 at least 64 pages below 8 live entries per page; a small table of at least 16 pages below 4 live rows per page) are not
 capacity parameters and do not vary with the preset; the large tables' heaps and TOAST are reclaimed only by
 `gpu-fault-admin store-maintenance` in a maintenance window (Administrator Operations §10.3) and cost roughly a quarter
