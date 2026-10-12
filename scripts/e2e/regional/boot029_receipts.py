@@ -8,7 +8,7 @@ import hashlib
 import json
 import re
 from pathlib import Path
-from typing import Any, Sequence
+from typing import Any, Callable, Sequence
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import (
@@ -297,6 +297,54 @@ def _uninstall_journal_matches(
     )
 
 
+def _ownership_release_summary(evidence: object) -> dict[str, Any]:
+    """Counts per outcome of one release evidence (a removal step or one
+    uninstall cluster): group names stay out of the record."""
+
+    if not isinstance(evidence, dict):
+        return {}
+    counts: dict[str, int] = {}
+    for item in [*(evidence.get("groups") or []), *(evidence.get("nodepools") or [])]:
+        if isinstance(item, dict) and item.get("outcome") in {
+            "released",
+            "retained",
+            "manual",
+        }:
+            counts[str(item["outcome"])] = counts.get(str(item["outcome"]), 0) + 1
+    return {
+        "ownership_release": {
+            "outcome": evidence.get("outcome"),
+            "released_groups": counts.get("released", 0),
+            "retained_groups": counts.get("retained", 0),
+            "manual": counts.get("manual", 0),
+        }
+    }
+
+
+def _removal_ownership_summary(value: dict[str, Any]) -> dict[str, Any]:
+    return _ownership_release_summary(
+        (value.get("evidence") or {}).get("OWNERSHIP_RELEASED")
+    )
+
+
+def _uninstall_ownership_summary(value: dict[str, Any]) -> dict[str, Any]:
+    release = value.get("ownership_release")
+    if not isinstance(release, dict):
+        return {}
+    clusters = [
+        item for item in release.get("clusters") or [] if isinstance(item, dict)
+    ]
+    return {
+        "ownership_release": {
+            "outcome": release.get("outcome"),
+            "clusters": [
+                _ownership_release_summary(item)["ownership_release"]
+                for item in clusters
+            ],
+        }
+    }
+
+
 def _current_completion(
     state: Path,
     stage: int,
@@ -304,8 +352,13 @@ def _current_completion(
     matches: Any,
     *,
     what: str,
+    summary: Callable[[dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
-    """Exactly one completion journal that matches and is newer than the baseline."""
+    """Exactly one completion journal that matches and is newer than the baseline.
+
+    ``summary`` adds what the journal recorded beyond its identity (the
+    ownership release of a removal or an uninstall), digests and counts only.
+    """
 
     candidates: list[dict[str, Any]] = []
     for candidate in journal_paths(state, stage):
@@ -325,6 +378,7 @@ def _current_completion(
                 "journal_path_sha256": digest(identity.encode()),
                 "journal_sha256": digest(candidate.read_bytes()),
                 "attempt_sha256": digest(str(attempt).encode()),
+                **(summary(value) if summary is not None else {}),
             }
         )
     if len(candidates) != 1:
@@ -393,6 +447,7 @@ def verify_journal(
                     value, stage=stage, gpu_arn=arn
                 ),
                 what=f"GPU cluster {index + 1}/{len(gpu_arns)}",
+                summary=_removal_ownership_summary if stage == 2 else None,
             )
             proof["gpu_arn_sha256"] = digest(gpu_arn.encode())
             journals.append(proof)
@@ -403,6 +458,7 @@ def verify_journal(
         baseline,
         lambda value: _uninstall_journal_matches(value, state=state, cpu_arn=cpu_arn),
         what="uninstall",
+        summary=_uninstall_ownership_summary,
     )
     if aurora_final_snapshot is not None:
         inputs = record.get("inputs")

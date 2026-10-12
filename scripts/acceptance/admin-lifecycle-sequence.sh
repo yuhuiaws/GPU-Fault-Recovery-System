@@ -57,6 +57,20 @@
 # with the product's refusal and the describe evidence when a cluster would be
 # refused, before any cold build or mutation.
 #
+# De-registration releases the label: remove-cluster (stage 2) and uninstall
+# (stage 4) end with the product's OWNERSHIP RELEASE step, so after each
+# removal and after the uninstall the driver asserts, with the product's own
+# describe reads, that no node group of the de-registered cluster carries the
+# label any more (scripts/e2e/regional/boot029_ownership.py released) -- a
+# cluster still claiming the site fails the stage. Before stage 3 re-joins and
+# before stage 5 re-deploys, the driver puts the label back on exactly the
+# groups the previous stage's journal recorded as released, with the
+# operator's credentials and the commands `gpu-fault-admin site-id` prints,
+# and waits for the provider to apply it (boot029_ownership.py reapply); the
+# existing precondition read then sees what an administrator's first deploy
+# sees. Both go into the stage receipts (ownership_label_released,
+# ownership_label_reapplied; stage 2/4 journals add ownership_release).
+#
 # Every admin command runs in the foreground and the next stage starts only
 # after it has exited. The first failing stage stops the run and prints its
 # number so `--stage N` can resume. Wall time and the sha256 of each stage's log
@@ -278,6 +292,24 @@ assert_ownership_labels() {  # before a stage acts: the product's own read of th
   log "ownership labels present on every GPU cluster's node groups: $(printf '%s' "$report" | python3 -c 'import json,sys; r=json.load(sys.stdin)["node_scope_precondition"]; print(r["ownership_label"], "on", sum(len(c.get("owned_groups_sha256", [])) for c in r["clusters"]), "node group(s)")')"
 }
 
+assert_ownership_released() {  # GPU_ARN...: after a de-registration, no node group of these clusters carries the label (read-only AWS)
+  local report arns=() arn
+  for arn in "$@"; do arns+=(--gpu-arn "$arn"); done
+  report="$(python3 -m scripts.e2e.regional.boot029_ownership released --cpu-arn "$CPU_ARN" "${arns[@]}" 2>>"$STAGE_LOG")" ||
+    fail "a de-registered GPU cluster's node groups still carry gpu-fault.io/control-plane=<site id>: the command did not release the ownership label; see the stage log"
+  printf '%s\n' "$report" >>"${STAGE_LOG}.extra.json"
+  log "ownership label released on every de-registered GPU cluster ($# cluster(s))"
+}
+
+reapply_ownership_labels() {  # STATE_DIR: before a re-join/re-deploy, the label goes back on the groups the previous stage's journal released (operator credentials, site-id commands)
+  local report
+  report="$(python3 -m scripts.e2e.regional.boot029_ownership reapply --cpu-arn "$CPU_ARN" "${GPU_RECEIPT_ARGS[@]}" \
+    --state "$1" --stage "$CURRENT_STAGE" 2>>"$STAGE_LOG")" ||
+    fail "re-applying gpu-fault.io/control-plane=<site id> to the released node groups failed; see the stage log"
+  printf '%s\n' "$report" >>"${STAGE_LOG}.extra.json"
+  log "ownership label re-applied to the node groups the previous stage released"
+}
+
 discover_gpu_providers() {  # once per stage: the product's own provider discovery (read-only AWS)
   [[ ${#GPU_PROVIDERS[@]} -eq 0 ]] || return 0
   local listing provider arn index=0
@@ -441,17 +473,19 @@ stage_1() {
   deploy_fresh "$STATE_DIR" "$PREVIOUS_SITE_ID" run_path_deploy
 }
 
-stage_2() {  # one ARN at a time; every removed cluster's journal is asserted
+stage_2() {  # one ARN at a time; every removed cluster's journal is asserted and its label gone
   local removed=()
   for arn in "${GPU_ARNS[@]}"; do
     run_admin remove-cluster --state-dir "$STATE_DIR" --gpu-cluster-arn "$arn" \
       --confirm REMOVE_GPU_CLUSTER
     removed+=("$arn")
     assert_current_journal "$STATE_DIR" "${removed[@]}"
+    assert_ownership_released "$arn"
   done
 }
 
 stage_3() {  # one join-cluster for every GPU cluster; one journal per ARN
+  reapply_ownership_labels "$STATE_DIR"
   assert_ownership_labels
   run_admin join-cluster --state-dir "$STATE_DIR" "${GPU_ARN_ARGS[@]}"
   assert_current_journal "$STATE_DIR"
@@ -461,12 +495,14 @@ stage_4() {
   run_admin uninstall --state-dir "$STATE_DIR" --cpu-cluster keep --reset-database \
     --aurora-final-snapshot "$AURORA_FINAL_SNAPSHOT" --confirm UNINSTALL_GPU_FAULT
   assert_current_journal "$STATE_DIR"
+  assert_ownership_released "${GPU_ARNS[@]}"
 }
 
 stage_5() {
   local site_id=""
   [[ -f "$STATE_DIR/bootstrap-state.json" ]] && site_id="$(json_field "$STATE_DIR/bootstrap-state.json" site_id)"
   discover_gpu_providers
+  reapply_ownership_labels "$STATE_DIR"
   assert_ownership_labels
   group_gpu_clusters "$(leading_provider 5)"
   provider_receipt_line

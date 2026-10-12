@@ -120,15 +120,36 @@ arn = os.environ["FAKE_REQUEST_GPU_ARNS"].split()[0]
 if arn == os.environ["FAKE_GPU_ARN"]:
     name, eks = "cluster-a", os.environ.get("FAKE_GPU_EKS_ARN", arn)
     hyperpod = os.environ.get("FAKE_GPU_HYPERPOD_ARN", "")
+    provider = "hyperpod"
+    cluster = hyperpod.rsplit("/", 1)[-1] if hyperpod else "fixture-hyperpod"
+    groups = [("spot-p5en", "instance group")]
 else:
     name, eks, hyperpod = "cluster-" + hashlib.sha256(arn.encode()).hexdigest()[:8], arn, ""
+    provider, cluster = "eks-managed", arn.rsplit("/", 1)[-1]
+    groups = [("gpu-p5en-efa-spot-node-group", "managed node group")]
+# The product's OWNERSHIP RELEASE step: the label leaves the node groups the
+# site selected (the fake aws reads the marker), unless the operator kept it.
+keep = bool(os.getenv("FAKE_ADMIN_KEEP_LABEL"))
+outcome = "retained" if keep else "released"
+marker = pathlib.Path(os.environ["FAKE_TOOL_LOG"]).parent / "ownership-released"
+if not keep:
+    marker.touch()
 path = pathlib.Path(sys.argv[1]) / "remove-cluster" / name / "state.json"
 path.parent.mkdir(parents=True, exist_ok=True)
 path.write_text(json.dumps({
     "phase": "COMPLETED", "attempt_id": "a" * 32,
-    "target": {"eks_cluster_arn": eks},
+    "completed_steps": ["AURORA_UPDATED", "AWS_DETACHED", "CONTROL_REGISTRY_DRAINING",
+        "CONTROL_REGISTRY_REMOVED", "DISCOVERED", "KUBERNETES_QUIESCED", "KUBERNETES_REMOVED",
+        "OWNERSHIP_RELEASED", "RELEASE_STATE_UPDATED", "SITE_COMMIT_STARTED", "SITE_UPDATED",
+        "VERIFIED"],
+    "target": {"eks_cluster_arn": eks, "provider": provider,
+        "hyperpod_cluster_name": cluster if provider == "hyperpod" else ""},
     "evidence": {"DISCOVERED": {"provider_identity": {
-        "eks_arn": eks, "hyperpod_arn": hyperpod}}}}))
+        "eks_arn": eks, "hyperpod_arn": hyperpod}},
+        "OWNERSHIP_RELEASED": {"label": "gpu-fault.io/control-plane", "outcome": outcome,
+            "provider": provider, "cluster": cluster, "nodepools": [],
+            "groups": [{"name": group, "kind": kind, "before": "site", "outcome": outcome,
+                "after": "site" if keep else None} for group, kind in groups]}}}))
 PY
     ;;
   join-cluster)
@@ -199,6 +220,30 @@ value = {
 }
 if os.getenv("FAKE_OMIT_UNINSTALL_SNAPSHOT_POLICY"):
     value.pop("final_snapshot_policy")
+# The product's OWNERSHIP RELEASE phase, per GPU cluster the site lists (the
+# clusters stage 3 re-joined); the fake aws reads the marker.
+keep = bool(os.getenv("FAKE_ADMIN_KEEP_LABEL"))
+outcome = "retained" if keep else "released"
+aliases = {os.environ["FAKE_GPU_ARN"], os.environ.get("FAKE_GPU_EKS_ARN", ""),
+    os.environ.get("FAKE_GPU_HYPERPOD_ARN", "")}
+clusters = []
+for path in sorted((state / "join-cluster").glob("*/state.json")):
+    arn = json.loads(path.read_text())["gpu_cluster_arn"]
+    if arn in aliases:
+        hyperpod = os.environ.get("FAKE_GPU_HYPERPOD_ARN", "")
+        eks = os.environ.get("FAKE_GPU_EKS_ARN") or os.environ["FAKE_GPU_ARN"]
+        cluster = hyperpod.rsplit("/", 1)[-1] if hyperpod else "fixture-hyperpod"
+        provider, groups = "hyperpod", ["spot-p5en"]
+    else:
+        eks, cluster, provider, groups = arn, arn.rsplit("/", 1)[-1], "eks-managed", ["gpu-p5en-efa-spot-node-group"]
+    clusters.append({"cluster_id": cluster, "eks_cluster_arn": eks,
+        "hyperpod_cluster_name": cluster if provider == "hyperpod" else "",
+        "provider": provider, "cluster": cluster, "outcome": outcome, "nodepools": [],
+        "groups": [{"name": group, "outcome": outcome} for group in groups]})
+value["ownership_release"] = {"label": "gpu-fault.io/control-plane", "outcome": outcome,
+    "clusters": clusters}
+if not keep:
+    (pathlib.Path(os.environ["FAKE_TOOL_LOG"]).parent / "ownership-released").touch()
 (state / "uninstall/state.json").write_text(json.dumps(value))
 PY
     ;;
@@ -244,7 +289,10 @@ if cpu_env.startswith("arn:aws:sagemaker:"):
 else:
     cpu_name, cpu_hyperpod_arn, cpu_eks_arn = "fixture-cpu-hyperpod", "arn:aws:sagemaker:us-west-2:123456789012:cluster/fixture-cpu-hyperpod", cpu_env
 site_id = "us-west-2-" + cpu_name + "-" + hashlib.sha256(cpu_hyperpod_arn.encode()).hexdigest()[:8]
-ownership = {} if os.getenv("FAKE_UNLABELLED_GPU") else {"gpu-fault.io/control-plane": site_id}
+# The label is on the GPU node groups until a de-registration releases it (the
+# fake admin leaves the marker); the operator's update calls put it back.
+marker = log.parent / "ownership-released"
+ownership = {} if os.getenv("FAKE_UNLABELLED_GPU") or marker.exists() else {"gpu-fault.io/control-plane": site_id}
 if operation == "list-clusters":
     # The Region's HyperPod clusters: the CPU control plane's own HyperPod
     # cluster (the site id derives from it) and the fixture cluster that
@@ -264,12 +312,29 @@ elif operation == "describe-cluster":
             "Orchestrator": {"Eks": {"ClusterArn": cpu_eks_arn}},
             "InstanceGroups": [{"InstanceGroupName": "cpu-group", "InstanceType": "ml.m5.2xlarge"}]}))
     else:
-        print(json.dumps({"ClusterName": name,
+        print(json.dumps({"ClusterName": name, "ClusterStatus": "InService",
             "ClusterArn": os.environ.get("FAKE_GPU_HYPERPOD_ARN") or "arn:aws:sagemaker:us-west-2:123456789012:cluster/" + name,
             "Orchestrator": {"Eks": {"ClusterArn": os.environ.get("FAKE_GPU_EKS_ARN") or os.environ["FAKE_GPU_ARN"]}},
             "InstanceGroups": [{"InstanceGroupName": "spot-p5en", "InstanceType": "ml.p5en.48xlarge",
-                "KubernetesConfig": {"CurrentLabels": labels}},
+                "CurrentCount": 2, "TargetCount": 2, "Status": "InService",
+                "LifeCycleConfig": {"SourceS3Uri": "s3://fixture/", "OnCreate": "on_create.sh"},
+                "ExecutionRole": "arn:aws:iam::123456789012:role/fixture-hyperpod",
+                "KubernetesConfig": {"CurrentLabels": labels, "DesiredLabels": labels}},
                 {"InstanceGroupName": "accelerated-g6", "InstanceType": "ml.g6.12xlarge"}]}))
+elif operation == "update-nodegroup-config":
+    # The operator's own re-label, exactly as `gpu-fault-admin site-id` prints it.
+    labels = argument("--labels")
+    if labels != "addOrUpdateLabels={gpu-fault.io/control-plane=" + site_id + "}":
+        raise RuntimeError("unexpected node group label update: " + labels)
+    marker.unlink(missing_ok=True)
+    print(json.dumps({"update": {"id": "fixture-update", "status": "InProgress"}}))
+elif operation == "update-cluster":
+    specs = json.loads(argument("--instance-groups"))
+    if not all(spec["KubernetesConfig"]["Labels"].get("gpu-fault.io/control-plane") == site_id
+            and spec["InstanceCount"] == 2 and spec["ExecutionRole"] for spec in specs):
+        raise RuntimeError("unexpected instance group update: " + json.dumps(specs))
+    marker.unlink(missing_ok=True)
+    print(json.dumps({"ClusterArn": "arn:aws:sagemaker:us-west-2:123456789012:cluster/fixture-hyperpod"}))
 elif operation == "list-nodegroups":
     print(json.dumps({"nodegroups": ["cpu-ng", "gpu-p5en-efa-spot-node-group"]}))
 elif operation == "describe-nodegroup":
