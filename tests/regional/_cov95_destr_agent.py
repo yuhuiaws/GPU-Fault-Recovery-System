@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from copy import deepcopy
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -305,7 +305,14 @@ class AgentProbe:
         if action == "migration-drill":
             if self.h.migration_override is not None:
                 return deepcopy(self.h.migration_override)
-            return migration_drill_report(self.h.tmp_path / "scratch.db", now=NOW)
+            # The node dates its scratch rows at its own (real) clock, not the
+            # runner's fake one: the shipped ledger purges rows older than its
+            # 30-day retention at open, against the real clock, and the drill
+            # refuses a clock that old, so rows dated at NOW stopped migrating
+            # once NOW was 30 days in the past.
+            return migration_drill_report(
+                self.h.tmp_path / "scratch.db", now=datetime.now(timezone.utc)
+            )
         if action == "restart-agent":
             self.h.restarted = True
             return deepcopy(self.h.restart_report)
