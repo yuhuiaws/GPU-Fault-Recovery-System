@@ -150,8 +150,37 @@ def baseline() -> dict[str, Any]:
     }
 
 
+def _site_namespace(
+    tmp_path: Path, regional: Any, cluster_profile: str | None
+) -> SimpleNamespace:
+    """The site as the runner sees it: base profile ``profile-test``; the target
+    cluster pinned to ``cluster_profile`` when given (the submitted job then
+    carries that version unless the harness' ``stamped_profile`` says otherwise).
+    ``readme_requests`` records what the runner asked the fixture builder."""
+
+    cluster_entry: dict[str, Any] = {"cluster_id": "cluster-a"}
+    if cluster_profile:
+        cluster_entry["runtime_profile"] = {"version": cluster_profile}
+    return SimpleNamespace(
+        regional=lambda target: regional,
+        namespace="gpu-system",
+        site_file=tmp_path / "site.yaml",
+        config={
+            "runtime_profile": {"version": "profile-test"},
+            "clusters": [cluster_entry],
+        },
+        readme_requests=[],
+    )
+
+
 def baseline_harness(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *, defect: str = "", nodes: int = 3
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    defect: str = "",
+    nodes: int = 3,
+    cluster_profile: str | None = None,
+    stamped_profile: str | None = None,
 ) -> tuple[Any, Any, list[str]]:
     """A cluster of ``nodes`` schedulable GPU nodes running the fixture job.
 
@@ -159,9 +188,11 @@ def baseline_harness(
     (the collective marker stays, so the waiter passes and the checks judge);
     ``native-ranks`` renders the manifest for the fixtures' three nodes
     whatever ``nodes`` says, so its expected-critical-ranks disagree.
+    ``cluster_profile``/``stamped_profile``: see ``_site_namespace``.
     """
 
     events: list[str] = []
+    effective_profile = cluster_profile or "profile-test"
     logs = training_logs(nodes)
     if defect == "missing-rank":
         last = f"pod-{nodes - 1}"
@@ -179,7 +210,7 @@ def baseline_harness(
         manifest,
         job_id="job-test",
         attempt_id="attempt-test",
-        runtime_profile="profile-test",
+        runtime_profile=stamped_profile or effective_profile,
         restart_budget=1,
     )
     if defect == "metadata":
@@ -314,12 +345,7 @@ def baseline_harness(
         kubectl=kubectl,
         run=run,
     )
-    site = SimpleNamespace(
-        regional=lambda target: regional,
-        namespace="gpu-system",
-        site_file=tmp_path / "site.yaml",
-        config={"runtime_profile": {"version": "profile-test"}},
-    )
+    site = _site_namespace(tmp_path, regional, cluster_profile)
 
     def store(*args: Any, **kwargs: Any) -> dict[str, Any]:
         if not workload.submitted:
@@ -329,7 +355,11 @@ def baseline_harness(
             return value
         return copy.deepcopy(after if workload.deleted else terminal)
 
-    monkeypatch.setattr(runner, "readme_fixture", lambda *args, **kwargs: workload)
+    monkeypatch.setattr(
+        runner,
+        "readme_fixture",
+        lambda *args, **kwargs: site.readme_requests.append(kwargs) or workload,
+    )
     monkeypatch.setattr(runner, "training_cli", lambda name: name)
     monkeypatch.setattr(
         runner, "ImagePrewarmFixture", lambda *args, **kwargs: Prewarm()
@@ -544,3 +574,81 @@ def test_empty_node_and_blast_snapshots_do_not_prove_cleanup() -> None:
     assert runner.identity_baseline_errors({}) == [
         "control-plane identity baseline is incomplete"
     ]
+
+
+# -- mixed-provider site: the job carries the target cluster's own profile ---------
+
+
+def _baseline(site: Any, target: Any, tmp_path: Path) -> dict[str, Any]:
+    return runner.run_workload_baseline(
+        case_id="GF-REGIONAL-WORKLOAD-001",
+        site=site,
+        target=target,
+        case_dir=tmp_path,
+        job_id="job-test",
+        attempt_id="attempt-test",
+        state_dir=tmp_path,
+        attempt=1,
+    )
+
+
+def test_a_cluster_pinned_to_its_own_profile_is_stamped_and_judged_by_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Live (round 8, HyperPod lane of the mixed S5 site): WORKLOAD-001 read the
+    site base (eks-v1) as "the" profile, so the job on the hyperpod-v1 cluster
+    was stamped eks-v1, its terminal observation carried eks-v1, and the check
+    agreed with itself. The runner now stamps and judges by the version the
+    target cluster runs and records both versions."""
+
+    site, target, _events = baseline_harness(
+        monkeypatch, tmp_path, cluster_profile="hyperpod-v1"
+    )
+
+    result = _baseline(site, target, tmp_path)
+
+    assert result["verdict"] == "PASS", result
+    (request,) = site.readme_requests
+    assert request["runtime_profile_version"] == "hyperpod-v1", (
+        "gpu-training-submit must be told the cluster's version explicitly"
+    )
+    assert request["topology"].node_count == 3
+    assert result["metadata_errors"] == []
+    assert result["runtime_profile"] == {
+        "cluster_id": "cluster-a",
+        "site_version": "profile-test",
+        "effective_version": "hyperpod-v1",
+        "source": "cluster",
+    }
+
+
+def test_a_cluster_on_the_site_profile_is_stamped_with_the_site_base(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    site, target, _events = baseline_harness(monkeypatch, tmp_path)
+
+    result = _baseline(site, target, tmp_path)
+
+    assert result["verdict"] == "PASS", result
+    assert site.readme_requests[0]["runtime_profile_version"] == "profile-test"
+    assert result["runtime_profile"]["effective_version"] == "profile-test"
+    assert result["runtime_profile"]["source"] == "site"
+
+
+def test_a_job_stamped_with_the_site_base_on_a_pinned_cluster_fails_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    site, target, _events = baseline_harness(
+        monkeypatch,
+        tmp_path,
+        cluster_profile="hyperpod-v1",
+        stamped_profile="profile-test",
+    )
+
+    result = _baseline(site, target, tmp_path)
+
+    assert result["verdict"] == "FAIL"
+    assert result["metadata_errors"] == [
+        "Master runtime profile differs",
+        "Worker runtime profile differs",
+    ], "the live r8 shape -- a HyperPod job carrying the plain-EKS version -- fails"

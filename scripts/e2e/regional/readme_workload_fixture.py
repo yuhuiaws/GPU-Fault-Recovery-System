@@ -10,6 +10,7 @@ from typing import Any
 
 import yaml  # type: ignore[import-untyped]
 
+from scripts.e2e.regional import training_topology
 from scripts.e2e.regional.fixture_ownership import creation_document
 from scripts.e2e.regional.managed_workload_fixture import (
     OWNER_LABEL,
@@ -101,6 +102,13 @@ class ReadmeWorkloadFixture(ManagedWorkloadFixture):
         ]
         if self.settings.attempt_id != f"{self.settings.job_id}-a001":
             arguments.extend(("--attempt-id", self.settings.attempt_id))
+        if self.settings.runtime_profile_version:
+            # The target cluster's effective Runtime Profile version. Without
+            # it both public CLIs stamp the site base, which on a mixed site is
+            # another cluster's profile (a HyperPod job carried eks-v1).
+            arguments.extend(
+                ("--runtime-profile-version", self.settings.runtime_profile_version)
+            )
         return arguments
 
     def require_empty(self) -> None:
@@ -235,3 +243,35 @@ class ReadmeWorkloadFixture(ManagedWorkloadFixture):
             "kubectl_verb": "apply",
             "create_only_identity": True,
         }
+
+
+def readme_fixture(
+    regional: RegionalLiveFixture,
+    *,
+    manifest: Path,
+    site_file: Path,
+    job_id: str,
+    attempt_id: str,
+    case_dir: Path,
+    topology: training_topology.TrainingTopology,
+    runtime_profile_version: str | None = None,
+) -> ReadmeWorkloadFixture:
+    """The README submission fixture for ``topology``, stamped with the target
+    cluster's effective Runtime Profile version when the runner resolved one;
+    ``None`` leaves the stamp to the CLI, which writes the site base."""
+
+    return ReadmeWorkloadFixture(
+        regional,
+        ManagedWorkloadSettings(
+            manifest=training_topology.render_topology_manifest(manifest, topology),
+            site_file=site_file,
+            job_id=job_id,
+            attempt_id=attempt_id,
+            restart_budget=1,
+            expected_pods=topology.node_count,
+            expected_gpu_count=topology.world_size,
+            runtime_profile_version=runtime_profile_version,
+        ),
+        case_dir=case_dir,
+        training_container="pytorch",
+    )

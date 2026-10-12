@@ -2798,6 +2798,15 @@ only claim "the configuration is safe at startup time".
     `gpu-fault-support-escalation` are control-plane-local adapters
     (`src/gpu_fault/app/`) that are never in the executor's owner set;
     under the original criterion every correct configuration would be misjudged `FAIL`.
+  - Read the profile at the **target cluster's effective** Runtime Profile version: the
+    cluster entry's `spec.clusters[].runtimeProfile.version` when present, otherwise the
+    site's `spec.runtimeProfile.version` (the release engine's own rule,
+    `src/gpu_fault_release/regional_release_profile_model.py::runtime_profile_version_for`).
+    On a mixed-provider site, comparing a pinned cluster's executor against the site base
+    misjudges every remote owner of that cluster as an orphan (a HyperPod cluster's
+    `hyperpod-v1` against a site base of `eks-v1`). The automated runner
+    (`boot_acceptance_runtime.py::run_boot015`) records the site base, the effective
+    version and its source under `runtime_profile` in the evidence.
   - The two replicas in step 2 must give the **same** owner set.
   - The authenticated readiness in step 4 must immediately turn not-ready, and at the same time the `PENDING` count and
     `oldest_unclaimed_seconds{cluster_id=...} > 600` must both be visible.
@@ -8894,6 +8903,13 @@ function. `WORKLOAD-002` likewise launches the real
 `gpu-fault-workload-annotate`, then runs native `kubectl apply --dry-run=server` and
 `kubectl apply`, without rewriting apply into create. The owner label used for cleanup
 identification is added to the input manifest up front; the annotate output is not rewritten.
+Both entry points are given `--runtime-profile-version <the target cluster's effective
+Runtime Profile version>` explicitly (the cluster entry's
+`spec.clusters[].runtimeProfile.version` when present, otherwise the site's
+`spec.runtimeProfile.version`): the CLI default writes the site base, which on a
+mixed-provider site is another cluster's profile; step 4's `runtime-profile-version`
+annotation is checked against that effective version, and the evidence records the site
+base beside the effective version under `runtime_profile`.
 The plan also binds the CPU/GPU kubeconfig contents, the site file digest and the live release
 ID; these bindings are recomputed before execution, and the runner refuses before submitting
 the training job when the configuration or the release identity has changed.

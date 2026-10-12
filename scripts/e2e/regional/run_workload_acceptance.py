@@ -26,6 +26,7 @@ from scripts.e2e.regional import (  # noqa: E402
     training_topology,
 )
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
+    runtime_profile_resolution,
     write_json_atomic,
 )
 from scripts.e2e.regional.collector_kernel_evidence import (  # noqa: E402
@@ -73,6 +74,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
 from scripts.e2e.regional.readme_workload_fixture import (  # noqa: E402
     ReadmeWorkloadFixture,
+    readme_fixture,
     training_cli,
 )
 from scripts.e2e.regional.workload_acceptance_checks import (  # noqa: E402
@@ -292,32 +294,6 @@ def managed_fixture(
             expected_pods=topology.node_count,
             expected_gpu_count=topology.world_size,
         ),
-    )
-
-
-def readme_fixture(
-    regional: RegionalLiveFixture,
-    *,
-    manifest: Path,
-    site_file: Path,
-    job_id: str,
-    attempt_id: str,
-    case_dir: Path,
-) -> ReadmeWorkloadFixture:
-    topology = topology_for(regional)
-    return ReadmeWorkloadFixture(
-        regional,
-        ManagedWorkloadSettings(
-            manifest=training_topology.render_topology_manifest(manifest, topology),
-            site_file=site_file,
-            job_id=job_id,
-            attempt_id=attempt_id,
-            restart_budget=1,
-            expected_pods=topology.node_count,
-            expected_gpu_count=topology.world_size,
-        ),
-        case_dir=case_dir,
-        training_container="pytorch",
     )
 
 
@@ -664,7 +640,6 @@ def run_workload_baseline(
         case_id=case_id,
         run_id=f"{case_id.lower()}-{attempt}",
     )
-    source_manifest = BASELINE_MANIFEST
     rendered_manifest = case_dir / "managed-workload.yaml"
     fixture: ReadmeWorkloadFixture | None = None
     result: dict[str, Any] = {"verdict": "FAIL"}
@@ -675,13 +650,17 @@ def run_workload_baseline(
         not_applicable: dict[str, str] = {}
         submission: dict[str, Any]
         render_equivalence: bool | None = None
+        topology = topology_for(regional)
+        profile = runtime_profile_resolution(site.config, target.cluster_id)
         fixture = readme_fixture(
             regional,
-            manifest=source_manifest,
+            manifest=BASELINE_MANIFEST,
             site_file=site.site_file,
             job_id=job_id,
             attempt_id=attempt_id,
             case_dir=case_dir,
+            topology=topology,
+            runtime_profile_version=profile["effective_version"],
         )
         if case_id == "GF-REGIONAL-WORKLOAD-001":
             # `submit` raises on a non-zero exit: reaching here is returncode 0.
@@ -718,25 +697,22 @@ def run_workload_baseline(
             )
             if not render_equivalence:
                 raise RegionalFixtureError("annotate and submit dry-run differ")
-            created = fixture.apply_rendered(rendered_manifest)
             submission = {
-                **created,
+                **fixture.apply_rendered(rendered_manifest),
                 "preexisting_resource_refused": True,
                 "annotate_returncode": annotate.returncode,
                 "dry_run_returncode": dry_run.returncode,
             }
-        topology = topology_for(regional)
         finite = wait_finite_workload(fixture, topology)
         training_logs = pod_logs(regional, finite["pods"])
         losses = loss_errors(training_logs, world_size=topology.world_size)
         collectives = collective_errors(training_logs, world_size=topology.world_size)
         workload = fixture.workload()
-        profile_version = str(site.config["runtime_profile"]["version"])
         metadata = metadata_errors(
             workload,
             job_id=job_id,
             attempt_id=attempt_id,
-            profile_version=profile_version,
+            profile_version=profile["effective_version"],
             expected_critical_ranks=topology.node_count,
         )
         terminal = wait_terminal_observation(
@@ -748,7 +724,6 @@ def run_workload_baseline(
         rank_errors = observation_rank_errors(
             terminal_observation, expected_ranks=topology.ranks
         )
-        decision = terminal.get("decision") or {}
         terminal_event_key = f"{target.cluster_id}/{attempt_id}/TrainingAttemptTerminal"
         fixture.delete()
         if workload_residuals(regional, fixture, job_id):
@@ -778,7 +753,7 @@ def run_workload_baseline(
             ),
             "observation_ranks_are_0_1_2": not rank_errors,
             "terminal_event_key_deterministic": (
-                decision.get("event_key") == terminal_event_key
+                (terminal.get("decision") or {}).get("event_key") == terminal_event_key
             ),
             "deletion_does_not_regress_observation": (
                 len(observations) == 1
@@ -808,6 +783,7 @@ def run_workload_baseline(
                 if key not in {"stdout", "stderr"}
             },
             "metadata_errors": metadata,
+            "runtime_profile": profile,
             "loss_errors": losses,
             "collective_errors": collectives,
             "observation_rank_errors": rank_errors,

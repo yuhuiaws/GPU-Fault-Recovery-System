@@ -10,7 +10,11 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.admin.site_cluster_profile import cluster_runtime_profile_version
 from scripts.e2e.regional import boot_acceptance_runtime as runtime
+from scripts.e2e.regional.acceptance_runner_common import runtime_profile_resolution
+from tests.regional._cov95_boot_owner import OwnerFixture
+from tests.regional._cov95_cap_cases import Clock
 
 
 def _completed(
@@ -369,3 +373,176 @@ def test_empty_ca_rejection_accepts_both_openssl_refusals() -> None:
     assert not runtime.empty_ca_rejection("Traceback ... ConnectionRefusedError"), (
         "an unrelated failure must not pass for a CA rejection"
     )
+
+
+# -- mixed-provider site: BOOT-015 probes the target cluster's effective profile ----
+
+# The round-8 S5 site: the plain-EKS cluster was deployed first, so the site base
+# is eks-v1 and the HyperPod cluster carries its own spec.clusters[].runtimeProfile.
+MIXED_SITE: dict[str, Any] = {
+    "runtime_profile": {"version": "eks-v1"},
+    "clusters": [
+        {"cluster_id": "hp-cluster", "runtime_profile": {"version": "hyperpod-v1"}},
+        {"cluster_id": "gpu-eks-cluster"},
+    ],
+}
+
+
+def test_runtime_profile_resolution_prefers_the_clusters_own_pin_over_the_site() -> (
+    None
+):
+    pinned = runtime_profile_resolution(MIXED_SITE, "hp-cluster")
+    assert pinned == {
+        "cluster_id": "hp-cluster",
+        "site_version": "eks-v1",
+        "effective_version": "hyperpod-v1",
+        "source": "cluster",
+    }
+    base = runtime_profile_resolution(MIXED_SITE, "gpu-eks-cluster")
+    assert base == {
+        "cluster_id": "gpu-eks-cluster",
+        "site_version": "eks-v1",
+        "effective_version": "eks-v1",
+        "source": "site",
+    }
+    assert runtime_profile_resolution(MIXED_SITE, "unknown")["source"] == "site", (
+        "a cluster the site does not list follows the site, as the product does"
+    )
+    for cluster_id in ("hp-cluster", "gpu-eks-cluster", "unknown"):
+        assert runtime_profile_resolution(MIXED_SITE, cluster_id)[
+            "effective_version"
+        ] == cluster_runtime_profile_version(MIXED_SITE, cluster_id), (
+            "the runner must resolve exactly as the product's own rule does"
+        )
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"clusters": []},
+        {"runtime_profile": {"version": ""}},
+        {"runtime_profile": {"version": 1}},
+        {
+            "runtime_profile": {"version": "eks-v1"},
+            "clusters": [
+                {"cluster_id": "hp-cluster", "runtime_profile": {"version": ""}}
+            ],
+        },
+        {
+            "runtime_profile": {"version": "eks-v1"},
+            "clusters": [
+                {"cluster_id": "hp-cluster", "runtime_profile": {"version": 2}}
+            ],
+        },
+    ],
+)
+def test_runtime_profile_resolution_requires_exact_versions(
+    config: dict[str, Any],
+) -> None:
+    with pytest.raises(ValueError, match="exact Runtime Profile version"):
+        runtime_profile_resolution(config, "hp-cluster")
+
+
+class _MixedSiteOwnerFixture(OwnerFixture):
+    """The cov95 PASS harness on the mixed site; the profile probe echoes the
+    version it was asked for and records it."""
+
+    def __init__(
+        self, clock: Clock, cluster_id: str, *, orphans: list[str] | None = None
+    ) -> None:
+        super().__init__(clock)
+        self.cluster_id = cluster_id
+        self.config.update(copy.deepcopy(MIXED_SITE))
+        self.orphans = orphans or []
+        self.profile_requests: list[str] = []
+
+    def cpu_python(self, script: str, *args: str, **kwargs: Any) -> dict[str, Any]:
+        if script == runtime.PROFILE_OWNER_PROBE:
+            self.profile_requests.append(args[0])
+            return {
+                "profiles": [
+                    {"profile_version": args[0], "orphan_owners": self.orphans}
+                ]
+            }
+        return super().cpu_python(script, *args, **kwargs)
+
+
+def _pass_harness(monkeypatch: pytest.MonkeyPatch, fixture: OwnerFixture) -> None:
+    monkeypatch.setattr(runtime, "time", fixture.clock)
+    monkeypatch.setattr(runtime, "amp_request", fixture.amp_request)
+    monkeypatch.setattr(runtime, "run", lambda args, **_k: _completed(0))
+
+
+@pytest.mark.parametrize(
+    ("cluster_id", "effective", "source"),
+    [("hp-cluster", "hyperpod-v1", "cluster"), ("gpu-eks-cluster", "eks-v1", "site")],
+)
+def test_boot015_probes_the_target_clusters_effective_profile_and_records_both(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    cluster_id: str,
+    effective: str,
+    source: str,
+) -> None:
+    """Live: the round-8 two-provider run passed BOOT-015 on the plain-EKS
+    cluster and failed it in 22 s on the HyperPod cluster with "Runtime Profile
+    remote owner coverage is incomplete" -- the check probed the site base
+    (eks-v1) for a cluster pinned to hyperpod-v1, so every HyperPod owner was an
+    orphan of a profile the cluster does not run."""
+
+    fixture = _MixedSiteOwnerFixture(Clock(), cluster_id)
+    _pass_harness(monkeypatch, fixture)
+
+    result = runtime.run_boot015(fixture, case_dir=tmp_path, attempt=1)
+
+    assert fixture.profile_requests == [effective], (
+        "the owner probe must read the profile the target cluster runs"
+    )
+    assert result["verdict"] == "PASS", result["checks"]
+    expected = {
+        "cluster_id": cluster_id,
+        "site_version": "eks-v1",
+        "effective_version": effective,
+        "source": source,
+    }
+    assert result["runtime_profile"] == expected
+    details = json.loads((tmp_path / "boot015-details.json").read_text("utf-8"))
+    assert details["runtime_profile"] == expected, (
+        "the evidence names the site base beside the version actually judged"
+    )
+
+
+def test_boot015_coverage_failure_names_the_judged_and_site_versions(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fixture = _MixedSiteOwnerFixture(
+        Clock(), "hp-cluster", orphans=["gpu-fault-hyperpod-adapter"]
+    )
+    _pass_harness(monkeypatch, fixture)
+
+    with pytest.raises(
+        runtime.BootAcceptanceError,
+        match=(
+            r"coverage is incomplete for hyperpod-v1 \(the cluster profile of "
+            r"hp-cluster; site base eks-v1\)"
+        ),
+    ):
+        runtime.run_boot015(fixture, case_dir=tmp_path, attempt=1)
+    assert fixture.profile_requests == ["hyperpod-v1"]
+    assert "insert" not in fixture.probes, "a failed precondition injects nothing"
+    assert not (tmp_path / "boot015-details.json").exists(), (
+        "a rejected precondition leaves no mutation evidence"
+    )
+
+
+@pytest.mark.parametrize("pin", ["", 3])
+def test_boot015_refuses_an_inexact_cluster_profile_pin_before_injection(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pin: Any
+) -> None:
+    fixture = _MixedSiteOwnerFixture(Clock(), "hp-cluster")
+    fixture.config["clusters"][0]["runtime_profile"]["version"] = pin
+    _pass_harness(monkeypatch, fixture)
+
+    with pytest.raises(runtime.BootAcceptanceError, match="exact Runtime Profile"):
+        runtime.run_boot015(fixture, case_dir=tmp_path, attempt=1)
+    assert fixture.profile_requests == [] and "insert" not in fixture.probes

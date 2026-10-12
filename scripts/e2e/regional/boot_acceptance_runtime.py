@@ -18,7 +18,10 @@ from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
 
 from gpu_fault.admin.site import load_site
-from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
+from scripts.e2e.regional.acceptance_runner_common import (
+    runtime_profile_resolution,
+    write_json_atomic,
+)
 from scripts.e2e.regional.boot_acceptance_common import (
     parse_probe_json,
     ROOT,
@@ -1277,11 +1280,16 @@ def run_boot015(
         owner_sets.append(value["owners"])
     if not owner_sets:
         raise BootAcceptanceError("no Ready executor Pods")
-    profile_version = fixture.config.get("runtime_profile", {}).get("version")
-    if not isinstance(profile_version, str) or not profile_version:
-        raise BootAcceptanceError(
-            "the site must name the exact Runtime Profile version"
-        )
+    # The owners the control plane dispatches to this cluster come from the
+    # profile its executor runs: the cluster's own pin on a mixed site, else the
+    # site base. Probing the site base judged a HyperPod cluster (hyperpod-v1)
+    # on a plain-EKS site (eks-v1) by the wrong profile: every HyperPod owner
+    # was an orphan of eks-v1 and a correctly configured cluster failed.
+    try:
+        resolution = runtime_profile_resolution(fixture.config, fixture.cluster_id)
+    except ValueError as exc:
+        raise BootAcceptanceError(str(exc)) from exc
+    profile_version = str(resolution["effective_version"])
     profile = fixture.regional.cpu_python(
         PROFILE_OWNER_PROBE,
         profile_version,
@@ -1294,7 +1302,11 @@ def run_boot015(
         or profiles[0].get("profile_version") != profile_version
         or profiles[0].get("orphan_owners") != []
     ):
-        raise BootAcceptanceError("Runtime Profile remote owner coverage is incomplete")
+        raise BootAcceptanceError(
+            "Runtime Profile remote owner coverage is incomplete for "
+            f"{profile_version} (the {resolution['source']} profile of "
+            f"{fixture.cluster_id}; site base {resolution['site_version']})"
+        )
     if any(item != owner_sets[0] for item in owner_sets):
         raise BootAcceptanceError("Executor owner sets differ between replicas")
     static_alert = run(
@@ -1308,6 +1320,7 @@ def run_boot015(
     result: dict[str, Any] = {
         "verdict": "FAIL",
         "remote_count_before": baseline["count"],
+        "runtime_profile": resolution,
     }
     injected = False
     try:

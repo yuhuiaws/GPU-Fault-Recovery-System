@@ -14,6 +14,7 @@ import yaml
 
 from gpu_fault.training_submit_cli import parser, render_workload
 from scripts.e2e.regional import readme_workload_fixture as module
+from scripts.e2e.regional import training_topology
 from scripts.e2e.regional.managed_workload_fixture import (
     OWNER_LABEL,
     ManagedWorkloadSettings,
@@ -316,3 +317,86 @@ def test_public_entrypoint_must_come_from_the_current_python_environment(
     assert module.training_cli("gpu-training-submit") == str(executable)
     with pytest.raises(ValueError, match="unsupported"):
         module.training_cli("other-command")
+
+
+# -- the target cluster's effective Runtime Profile version ------------------------
+
+MANIFEST = module.ROOT / "examples/hyperpod/three-node-pytorchjob.yaml"
+
+
+def _pinned_fixture(
+    base: module.ReadmeWorkloadFixture, case_dir: Path, version: str | None
+) -> module.ReadmeWorkloadFixture:
+    return module.ReadmeWorkloadFixture(
+        base.regional,
+        ManagedWorkloadSettings(
+            manifest=MANIFEST,
+            site_file=base.settings.site_file,
+            job_id="readme-pinned",
+            attempt_id="readme-pinned-a001",
+            restart_budget=1,
+            expected_pods=3,
+            expected_gpu_count=24,
+            runtime_profile_version=version,
+        ),
+        case_dir=case_dir,
+        training_container="pytorch",
+    )
+
+
+def test_submission_arguments_name_the_clusters_version_only_when_resolved(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Both public CLIs default the stamp to the site base; on a mixed site that
+    is another cluster's profile (live round 8: a HyperPod job carried eks-v1).
+    The fixture passes the cluster's effective version to annotate and submit
+    alike so the rendered manifests stay equivalent and correctly stamped."""
+
+    base, api, _events = harness(tmp_path, monkeypatch)
+    assert "--runtime-profile-version" not in base.submission_arguments(), (
+        "a fixture without a resolved version leaves the CLI default alone"
+    )
+
+    pinned = _pinned_fixture(base, tmp_path / "pinned", "hyperpod-v1")
+    arguments = pinned.submission_arguments()
+    assert arguments[arguments.index("--runtime-profile-version") + 1] == (
+        "hyperpod-v1"
+    )
+    assert parser().parse_args(arguments).runtime_profile_version == "hyperpod-v1"
+
+    pinned.submit()
+    command = api.public_commands[-1]
+    assert command[0] == "gpu-training-submit"
+    assert command[command.index("--runtime-profile-version") + 1] == "hyperpod-v1"
+
+
+def test_readme_fixture_builder_stamps_the_resolved_version_and_topology(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    base, _api, _events = harness(tmp_path, monkeypatch)
+
+    built = module.readme_fixture(
+        base.regional,
+        manifest=MANIFEST,
+        site_file=base.settings.site_file,
+        job_id="readme-built",
+        attempt_id="readme-built-a001",
+        case_dir=tmp_path / "built",
+        topology=training_topology.NATIVE_TOPOLOGY,
+        runtime_profile_version="hyperpod-v1",
+    )
+
+    assert built.settings.runtime_profile_version == "hyperpod-v1"
+    assert built.settings.manifest == MANIFEST, "native topology keeps the source"
+    assert (built.settings.expected_pods, built.settings.expected_gpu_count) == (3, 24)
+    assert built.training_container == "pytorch"
+    unpinned = module.readme_fixture(
+        base.regional,
+        manifest=MANIFEST,
+        site_file=base.settings.site_file,
+        job_id="readme-unpinned",
+        attempt_id="readme-unpinned-a001",
+        case_dir=tmp_path / "unpinned",
+        topology=training_topology.NATIVE_TOPOLOGY,
+    )
+    assert unpinned.settings.runtime_profile_version is None

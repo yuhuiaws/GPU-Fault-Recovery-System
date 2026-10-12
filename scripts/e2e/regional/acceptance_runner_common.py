@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from gpu_fault.admin.atomic_json import write_json_atomic as _write_document
+from gpu_fault.admin.site_cluster_profile import cluster_runtime_profile_version
 
 if __package__:
     from .acceptance_scope import scoped_case_evidence
@@ -29,6 +31,54 @@ def write_json_atomic(path: Path, value: dict[str, Any]) -> None:
     """
 
     _write_document(path, scoped_case_evidence(value))
+
+
+def runtime_profile_resolution(
+    config: Mapping[str, Any], cluster_id: str
+) -> dict[str, Any]:
+    """The Runtime Profile version the target cluster actually runs, beside the
+    site base it may override, as the case evidence records it.
+
+    A mixed site pins some GPU clusters to their own profile
+    (``spec.clusters[].runtimeProfile``): a HyperPod cluster joined to a site
+    whose base is the plain-EKS profile keeps ``hyperpod-v1`` while
+    ``spec.runtimeProfile.version`` says ``eks-v1``. The control plane plans,
+    the executor claims and the Agents heartbeat by the cluster's effective
+    version -- the release engine's ``runtime_profile_version_for`` rule, read
+    here from the rendered release config through the product's own
+    ``cluster_runtime_profile_version`` -- so a case that probes "the Runtime
+    Profile" must probe that one; the site base turned every HyperPod owner into
+    an orphan of ``eks-v1`` (BOOT-015) and stamped a HyperPod workload with the
+    plain-EKS version (WORKLOAD-001).
+
+    ``source`` is ``cluster`` when the cluster's own pin is in force and
+    ``site`` otherwise. Raises ``ValueError`` when either version is not an
+    exact non-empty string.
+    """
+
+    site_version = (config.get("runtime_profile") or {}).get("version")
+    if not isinstance(site_version, str) or not site_version:
+        raise ValueError("the site must name the exact Runtime Profile version")
+    entry: Mapping[str, Any] = next(
+        (
+            item
+            for item in config.get("clusters") or ()
+            if isinstance(item, Mapping)
+            and str(item.get("cluster_id") or "") == cluster_id
+        ),
+        {},
+    )
+    override = (entry.get("runtime_profile") or {}).get("version")
+    if override is not None and (not isinstance(override, str) or not override):
+        raise ValueError(
+            f"{cluster_id} must name the exact Runtime Profile version it pins"
+        )
+    return {
+        "cluster_id": cluster_id,
+        "site_version": site_version,
+        "effective_version": cluster_runtime_profile_version(config, cluster_id),
+        "source": "cluster" if override else "site",
+    }
 
 
 class EvidenceRecorder:
