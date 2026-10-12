@@ -26,7 +26,7 @@ from gpu_fault.collectors.logs.fabric_manager import (
 )
 from gpu_fault.collectors.identity_refresh import GpuIdentityRefresher
 from gpu_fault.collectors.models import CollectorContext, CollectorStats
-from gpu_fault.collectors.scheduling import next_stable_phase
+from gpu_fault.collectors.cadence import CadenceJitter, jittered_next_phase
 from gpu_fault.collectors.sinks import CollectorError, EventSink, deliver_event
 from gpu_fault.telemetry import CollectorKind
 
@@ -235,12 +235,11 @@ class KernelLogCollector:
         self.health_summary_seconds = int(
             os.getenv("GPU_FAULT_KERNEL_HEALTH_SUMMARY_SECONDS", "300")
         )
-        # The first summary goes out on the first collection: a freshly
-        # installed (or restarted) collector proves itself alive within
-        # seconds instead of one period later (live 2026-09-12: a bootstrap's
-        # first verify ran before the 300 s summary and read the node as
-        # silent). Later summaries keep their stable phase.
+        # The first summary goes out on the first collection, so a freshly
+        # (re)started collector proves itself alive within seconds rather than
+        # one period later; later summaries keep their jittered stable phase.
         self._next_health_summary = self.now()
+        self._cadence_jitter = CadenceJitter.from_environment()
         self._last_read_at: datetime | None = None
         self.delivery_queue_size = delivery_queue_size
         # (record_id, path, payload): the health summary goes to its own
@@ -265,8 +264,8 @@ class KernelLogCollector:
         """Read kmsg records and hand the NVIDIA ones on for delivery.
 
         The counters are plain integers and the model is built once at the end:
-        over 99 % of kmsg lines are not NVIDIA events, and each of them used to
-        allocate two ``CollectorStats`` copies on the hot read path.
+        over 99 % of kmsg lines are not NVIDIA events (two ``CollectorStats``
+        copies per line was the hot read path's cost).
 
         ``delivered`` counts only what this call saw accepted. With a delivery
         thread running (``start_delivery``) the outcome is not known yet, so
@@ -790,12 +789,13 @@ class KernelLogCollector:
     def _maybe_health_summary(self, observed_at: datetime) -> None:
         if observed_at < self._next_health_summary:
             return
-        self._next_health_summary = next_stable_phase(
+        self._next_health_summary = jittered_next_phase(
             observed_at,
             cluster_id=self.context.cluster_id,
             node_id=self.node_id,
             channel=CollectorKind.NVIDIA_KERNEL.value,
             interval_seconds=self.health_summary_seconds,
+            jitter=self._cadence_jitter,
         )
         self._send_health_summary(observed_at)
 

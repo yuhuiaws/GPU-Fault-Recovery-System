@@ -88,7 +88,7 @@ spec:
               --host 0.0.0.0 --port 8080
               --workers 4 --loop uvloop --http httptools
               --backlog 8192 --limit-concurrency 4096
-              --timeout-keep-alive 5 --no-proxy-headers
+              --timeout-keep-alive 100 --no-proxy-headers
               --timeout-graceful-shutdown 60
               --timeout-worker-healthcheck 20
               --no-access-log

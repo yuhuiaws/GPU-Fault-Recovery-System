@@ -54,6 +54,24 @@ def silent_threshold(name: str, default: str) -> SilentThreshold:
 
 
 @dataclass(frozen=True)
+class PostingCadence:
+    """The node-side interval a kind posts on, as the environment the node reads.
+
+    The silence threshold above is the control plane's; the cadence is the
+    collector's, and the two have to agree: the threshold must cover one
+    jittered interval at its longest plus the start-up spread and the sink's
+    retry ladder (``gpu_fault.collectors.cadence.worst_case_silence_seconds``).
+    """
+
+    env: str
+    default: float
+
+
+def posting_cadence(name: str, default: str) -> PostingCadence:
+    return PostingCadence(env=name, default=float(default))
+
+
+@dataclass(frozen=True)
 class CollectorKindSpec:
     kind: CollectorKind
     producer: str
@@ -62,6 +80,9 @@ class CollectorKindSpec:
     # ``None`` for kinds the control plane does not expect on a schedule.
     silent_threshold: SilentThreshold | None
     retired: bool = False
+    # The interval of the kind's routine post (inventory, health summary);
+    # ``None`` for kinds without one.
+    cadence: PostingCadence | None = None
 
 
 COLLECTOR_KINDS: dict[CollectorKind, CollectorKindSpec] = {
@@ -72,6 +93,7 @@ COLLECTOR_KINDS: dict[CollectorKind, CollectorKindSpec] = {
         silent_threshold=silent_threshold(
             "GPU_FAULT_GPU_INVENTORY_SILENT_AFTER_SECONDS", "180"
         ),
+        cadence=posting_cadence("GPU_FAULT_GPU_INVENTORY_INTERVAL_SECONDS", "60"),
     ),
     CollectorKind.GPU_METRICS: CollectorKindSpec(
         kind=CollectorKind.GPU_METRICS,
@@ -80,6 +102,7 @@ COLLECTOR_KINDS: dict[CollectorKind, CollectorKindSpec] = {
         silent_threshold=silent_threshold(
             "GPU_FAULT_GPU_METRICS_SILENT_AFTER_SECONDS", "420"
         ),
+        cadence=posting_cadence("GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS", "300"),
     ),
     CollectorKind.HOST_TELEMETRY: CollectorKindSpec(
         kind=CollectorKind.HOST_TELEMETRY,
@@ -88,6 +111,7 @@ COLLECTOR_KINDS: dict[CollectorKind, CollectorKindSpec] = {
         silent_threshold=silent_threshold(
             "GPU_FAULT_HOST_TELEMETRY_SILENT_AFTER_SECONDS", "420"
         ),
+        cadence=posting_cadence("GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS", "300"),
     ),
     CollectorKind.NODE_LOGS: CollectorKindSpec(
         kind=CollectorKind.NODE_LOGS,
@@ -96,6 +120,7 @@ COLLECTOR_KINDS: dict[CollectorKind, CollectorKindSpec] = {
         silent_threshold=silent_threshold(
             "GPU_FAULT_NODE_LOG_SILENT_AFTER_SECONDS", "900"
         ),
+        cadence=posting_cadence("GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS", "300"),
     ),
     CollectorKind.NVIDIA_KERNEL: CollectorKindSpec(
         kind=CollectorKind.NVIDIA_KERNEL,
@@ -104,6 +129,7 @@ COLLECTOR_KINDS: dict[CollectorKind, CollectorKindSpec] = {
         silent_threshold=silent_threshold(
             "GPU_FAULT_KERNEL_SILENT_AFTER_SECONDS", "900"
         ),
+        cadence=posting_cadence("GPU_FAULT_KERNEL_HEALTH_SUMMARY_SECONDS", "300"),
     ),
     CollectorKind.FABRIC_MANAGER_LOG: CollectorKindSpec(
         kind=CollectorKind.FABRIC_MANAGER_LOG,
@@ -111,6 +137,9 @@ COLLECTOR_KINDS: dict[CollectorKind, CollectorKindSpec] = {
         systemd_unit="gpu-fault-fabric-manager-collector",
         silent_threshold=silent_threshold(
             "GPU_FAULT_FABRIC_MANAGER_SILENT_AFTER_SECONDS", "900"
+        ),
+        cadence=posting_cadence(
+            "GPU_FAULT_FABRIC_MANAGER_HEALTH_SUMMARY_SECONDS", "300"
         ),
     ),
     CollectorKind.HMA_NODE: CollectorKindSpec(
@@ -148,3 +177,37 @@ def collector_silent_thresholds() -> dict[CollectorKind, float]:
         for kind, spec in COLLECTOR_KINDS.items()
         if spec.silent_threshold is not None
     }
+
+
+def collector_posting_cadences() -> dict[CollectorKind, float]:
+    """Each scheduled kind's routine posting interval, by the node's environment defaults."""
+
+    return {
+        kind: spec.cadence.default
+        for kind, spec in COLLECTOR_KINDS.items()
+        if spec.cadence is not None
+    }
+
+
+def silent_threshold_shortfalls(
+    worst_case_silence: Callable[[float], float],
+    thresholds: dict[CollectorKind, float] | None = None,
+) -> dict[CollectorKind, tuple[float, float]]:
+    """Kinds whose silence threshold is below the longest healthy gap.
+
+    ``worst_case_silence`` maps a posting cadence to the longest a healthy node
+    can stay silent on it (see ``gpu_fault.collectors.cadence``); the result
+    maps each kind that would alert on a merely late node to
+    ``(threshold, worst_case)``.
+    """
+
+    limits = collector_silent_thresholds() if thresholds is None else thresholds
+    shortfalls: dict[CollectorKind, tuple[float, float]] = {}
+    for kind, cadence in collector_posting_cadences().items():
+        threshold = limits.get(kind)
+        if threshold is None:
+            continue
+        worst = worst_case_silence(cadence)
+        if threshold < worst:
+            shortfalls[kind] = (threshold, worst)
+    return shortfalls

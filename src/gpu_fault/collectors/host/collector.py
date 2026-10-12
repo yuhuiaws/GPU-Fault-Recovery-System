@@ -22,6 +22,7 @@ from gpu_fault.collectors.host.system_metrics import (
 )
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.process import BoundedProcessRunner
+from gpu_fault.collectors.cadence import CadenceJitter, jittered_next_phase
 from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import (
     CollectorError,
@@ -250,6 +251,7 @@ class HostTelemetryCollector(
                 )
             )
         )
+        self._cadence_jitter = CadenceJitter.from_environment()
         self.force_snapshot_path = Path(
             force_snapshot_path
             or os.getenv(
@@ -570,12 +572,13 @@ class HostTelemetryCollector(
                 self._next_health_summary_at is None
                 or observed_at >= self._next_health_summary_at
             ):
-                self._next_health_summary_at = next_stable_phase(
+                self._next_health_summary_at = jittered_next_phase(
                     observed_at,
                     cluster_id=self.context.cluster_id,
                     node_id=self.node_id,
                     channel="host-telemetry",
                     interval_seconds=self.health_summary_seconds,
+                    jitter=self._cadence_jitter,
                 )
         self._active_edge_reasons = reasons
         return batch
@@ -686,7 +689,7 @@ class HostTelemetryCollector(
                     interval_seconds=self.startup_spread_seconds,
                 )
                 - startup_time
-            ).total_seconds()
+            ).total_seconds() + self._cadence_jitter.startup_offset()
             if delay > 0:
                 time.sleep(delay)
         while True:

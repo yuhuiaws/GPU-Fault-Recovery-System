@@ -88,8 +88,10 @@ PROCESSOR_FLUSH_CAPS = {
 # /metrics over its processes. Consumers = ``replicas x UVICORN_WORKERS_PER_POD``.
 UVICORN_WORKERS_PER_POD = 4
 LAUNCHER_MODULE = "gpu_fault.app.serve"
-# Idle keep-alive timeout of the service sockets (uvicorn --timeout-keep-alive).
-KEEP_ALIVE_TIMEOUT_SECONDS = 5
+# Service-socket idle keep-alive: above the pooled node client's own 90 s idle
+# cut (transport/http_client.py), so 30 s heartbeats and 60 s inventory posts
+# keep one connection per process.
+KEEP_ALIVE_TIMEOUT_SECONDS = 100
 # The kubelet's liveness probe gets a per-process listener of its own
 # (``gpu_fault.app.liveness``), ten above the role's service port: the main
 # socket's accept queue is shared with the request storm, and a cold-connect

@@ -12,7 +12,7 @@ from gpu_fault.collectors.gpu.discovery import (
     INSTANCE_ACCELERATOR_COUNTS,
 )
 from gpu_fault.collectors.models import CollectorContext, CollectorStats
-from gpu_fault.collectors.scheduling import next_stable_phase
+from gpu_fault.collectors.cadence import CadenceJitter, jittered_next_phase
 from gpu_fault.collectors.sinks import (
     CollectorError,
     EventSink,
@@ -133,6 +133,7 @@ class KubernetesNodeResourceCollector:
         self._last_state: dict[str, bool] = {}
         self._last_delivered_at: dict[str, datetime] = {}
         self._next_summary_at: dict[str, datetime] = {}
+        self._cadence_jitter = CadenceJitter.from_environment()
         self._graced_nodes: set[str] = set()
 
     @staticmethod
@@ -468,12 +469,13 @@ class KubernetesNodeResourceCollector:
         for state_key in delivered_state_keys:
             self._last_delivered_at[state_key] = observed_at
             resource = state_key.rsplit("/", 1)[-1]
-            self._next_summary_at[state_key] = next_stable_phase(
+            self._next_summary_at[state_key] = jittered_next_phase(
                 observed_at,
                 cluster_id=self.context.cluster_id,
                 node_id=node_id,
                 channel=f"kubernetes-{resource}",
                 interval_seconds=self.health_summary_seconds,
+                jitter=self._cadence_jitter,
             )
         if result.buffered:
             return CollectorStats(observed=1, buffered=1)

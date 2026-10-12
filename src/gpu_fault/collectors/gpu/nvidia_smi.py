@@ -20,6 +20,7 @@ from gpu_fault.collectors.gpu.inventory_cadence import (
 from gpu_fault.collectors.identity_refresh import GpuIdentityRefresher
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.process import BoundedProcessRunner
+from gpu_fault.collectors.cadence import CadenceJitter
 from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import (
     CollectorError,
@@ -157,8 +158,11 @@ class NvidiaSmiMetricsCollector:
         # GPU_FAULT_EXPECTED_GPU_COUNT made every round raise and the node never
         # emitted one real GPU_METRICS sample in fallback mode; the limits probe
         # re-ran on every round on a vGPU/MIG device with no threshold tags.
+        self._cadence_jitter = CadenceJitter.from_environment()
         self._inventory = GpuInventoryCadence(
-            interval_seconds=self.inventory_interval_seconds, logger=LOGGER
+            interval_seconds=self.inventory_interval_seconds,
+            logger=LOGGER,
+            jitter=self._cadence_jitter,
         )
         self._temperature_limits = TemperatureLimitProbe(
             retry_interval_seconds=self.inventory_interval_seconds, logger=LOGGER
@@ -227,7 +231,7 @@ class NvidiaSmiMetricsCollector:
                     interval_seconds=self.startup_spread_seconds,
                 )
                 - startup_time
-            ).total_seconds()
+            ).total_seconds() + self._cadence_jitter.startup_offset()
             if delay > 0:
                 time.sleep(delay)
         while True:

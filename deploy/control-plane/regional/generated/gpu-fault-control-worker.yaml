@@ -45,7 +45,7 @@ spec:
           \ -- /opt/gpu-fault/control-plane/bin/python -m gpu_fault.app.serve\n\
           else\n  set -- python3 -m gpu_fault.app.serve\nfi\nexec \"$@\" gpu_fault.app:create_app\
           \ --factory --host 0.0.0.0 --port 8081 --workers 4 --loop uvloop\
-          \ --http httptools --backlog 1024 --timeout-keep-alive 5 --no-proxy-headers\
+          \ --http httptools --backlog 1024 --timeout-keep-alive 100 --no-proxy-headers\
           \ --timeout-graceful-shutdown 60 --timeout-worker-healthcheck 20\
           \ --no-access-log"
         command:

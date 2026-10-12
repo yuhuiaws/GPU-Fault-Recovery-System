@@ -21,6 +21,7 @@ from gpu_fault.node_agent.executor import (
     UNPERSISTED_RESULT_ERROR,
     NodeActionExecutor,
 )
+from gpu_fault.transport.http_client import transport_stats
 from gpu_fault.node_agent.heartbeat import (
     AgentHeartbeatReporter,
     heartbeat_reporter_from_environment,
@@ -468,9 +469,8 @@ def create_node_agent_app(
     async def healthz() -> JSONResponse:
         """Local health: 503 only when the ledger cannot be written.
 
-        Heartbeat staleness and the command counters are informational --
-        the control plane already fences a stale agent -- but they give an
-        operator on the node a view without reaching the control plane.
+        Heartbeat staleness, the command counters and the pooled transport's
+        reuse counters are informational: a view for an operator on the node.
         """
 
         payload: dict[str, Any] = {"status": "ok"}
@@ -497,6 +497,7 @@ def create_node_agent_app(
         )
         counters = getattr(agent, "counters_snapshot", None)
         payload["counters"] = counters() if callable(counters) else {}
+        payload["transport"] = transport_stats()
         return JSONResponse(status_code=status_code, content=payload)
 
     @app.post(

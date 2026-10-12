@@ -287,6 +287,16 @@ categories:
         description: "每轮用于补交积压的时间预算，实时事件优先。"
       - name: GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS
         description: "节点启动后首次采样错峰窗口，避免全队同时打控制面。"
+      - name: GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS
+        description: "叠加在错峰窗口之上的随机启动偏移上限（默认 20 s）：整队同时重启时首次上报不再挤进同一窗口；0 关闭。"
+      - name: GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO
+        description: "周期上报（inventory、健康摘要、Agent 心跳）每轮 ±比例抖动（默认 0.1，上限 0.5）；静默阈值须覆盖 cadence×(1+ratio)。"
+      - name: GPU_FAULT_HTTP_CONNECTION_IDLE_SECONDS
+        description: "节点侧连接池空闲上限（默认 90 s，必须低于 NLB 的 350 s）：超过即在复用前主动关闭重连，而不是在死连接上浪费一次尝试。"
+      - name: GPU_FAULT_HTTP_CONNECTION_MAX_AGE_SECONDS
+        description: "节点侧长连接最长寿命（默认 1800 s，±10% 抖动；0 不限）：到期换连接，让队列在 Pod/worker 间重新散布。"
+      - name: GPU_FAULT_HTTP_TCP_KEEPALIVE_SECONDS
+        description: "节点侧长连接 TCP keepalive 空闲秒数（默认 60，探测 15 s×4；0 关闭）：维持 NLB 流的空闲计时并探测消失的对端。"
       - name: GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR
         production: false（当前生产保持禁用）
         description: "启用通用 journal/训练日志 Collector；需独立容量和隐私验收。"

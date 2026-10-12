@@ -162,6 +162,11 @@ def test_nonforced_host_startup_reports_readiness_and_progress_through_fake_noti
     with pytest.raises(common.StopLoop):
         collector.run()
     assert messages == ["READY=1", "WATCHDOG=1", "WATCHDOG=1"]
-    assert 0 < waits[0] <= collector.startup_spread_seconds
+    assert (
+        0
+        < waits[0]
+        <= collector.startup_spread_seconds
+        + (collector._cadence_jitter.startup_seconds)
+    ), "the deterministic spread plus the random start-up offset"
     assert waits[1] == collector.interval_seconds
     assert len(host_case.sink.requests) == 1

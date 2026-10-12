@@ -25,7 +25,7 @@ from gpu_fault.collectors.gpu.discovery import (
     query_nvidia_temperature_limits,
 )
 from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.scheduling import next_stable_phase
+from gpu_fault.collectors.cadence import CadenceJitter, jittered_next_phase
 from gpu_fault.collectors.sinks import CollectorError, EventSink
 
 # Consecutive inventory failures after which the delivery drops to the inventory
@@ -62,11 +62,13 @@ class GpuInventoryCadence:
         interval_seconds: int,
         logger: logging.Logger,
         failure_backoff_threshold: int = INVENTORY_FAILURE_BACKOFF_THRESHOLD,
+        jitter: CadenceJitter | None = None,
     ) -> None:
         if interval_seconds <= 0:
             raise ValueError("GPU inventory interval must be positive")
         self.interval_seconds = interval_seconds
         self.logger = logger
+        self.jitter = jitter if jitter is not None else CadenceJitter.from_environment()
         self.failure_backoff_threshold = failure_backoff_threshold
         self.last_delivered_at: datetime | None = None
         self.next_at: datetime | None = None
@@ -114,12 +116,13 @@ class GpuInventoryCadence:
         self.last_delivered_at = observed_at
         self.failures = 0
         self.next_attempt_at = None
-        self.next_at = next_stable_phase(
+        self.next_at = jittered_next_phase(
             observed_at,
             cluster_id=context.cluster_id,
             node_id=node_id,
             channel="gpu-inventory",
             interval_seconds=self.interval_seconds,
+            jitter=self.jitter,
         )
         self.logger.info(
             "delivered GPU inventory %s with %d devices",

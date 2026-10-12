@@ -402,7 +402,7 @@ def test_heartbeat_rejection_carries_the_control_plane_detail() -> None:
     def urlopen(_request, timeout=None):
         raise Refused()
 
-    with mock.patch("gpu_fault.node_agent.heartbeat.urllib_request.urlopen", urlopen):
+    with mock.patch("gpu_fault.node_agent.heartbeat.urlopen", urlopen):
         with pytest.raises(AgentHeartbeatRejected) as excinfo:
             AgentHeartbeatReporter._send(
                 "https://control.example",

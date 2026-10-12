@@ -151,6 +151,13 @@ def test_healthz_reports_the_ledger_counters_and_heartbeat(tmp_path) -> None:
         "failed": 0,
         "rejected": 0,
     }
+    transport = before.json()["transport"]
+    assert {
+        "connections_opened_total",
+        "requests_reused_total",
+        "idle_expired_total",
+    } <= set(transport), "the pooled client's reuse counters are published on the node"
+    assert transport["max_idle_seconds"] == 90.0
     assert executed.status_code == 200, executed.text
     assert after.json()["counters"] == {
         "accepted": 1,

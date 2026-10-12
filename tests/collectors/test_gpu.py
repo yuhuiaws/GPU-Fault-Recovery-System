@@ -40,13 +40,17 @@ def test_dcgm_summary_uses_stable_channel_phase() -> None:
 
     collector.collect_text(text)
 
-    assert collector._next_health_summary_at == next_stable_phase(
+    anchor = next_stable_phase(
         NOW,
         cluster_id=collector.context.cluster_id,
         node_id="worker-1",
         channel="gpu-metrics",
         interval_seconds=300,
     )
+    # The stable phase, moved by the cadence jitter (+-10 % of the interval).
+    moved = (collector._next_health_summary_at - anchor).total_seconds()
+    assert abs(moved) <= 300 * collector._cadence_jitter.ratio
+    assert collector._next_health_summary_at >= NOW
 
 
 def test_dcgm_reports_missing_required_fields() -> None:

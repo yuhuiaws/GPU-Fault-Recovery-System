@@ -26,7 +26,7 @@ from gpu_fault.collectors.logs.fabric_manager_receipts import (
     RoundReceipt,
     identity_sha256,
 )
-from gpu_fault.collectors.scheduling import next_stable_phase
+from gpu_fault.collectors.cadence import CadenceJitter, jittered_next_phase
 from gpu_fault.collectors.sinks import CollectorError, EventSink, deliver_event
 from gpu_fault.env import env_bool
 from gpu_fault.telemetry import CollectorKind
@@ -167,6 +167,7 @@ class FabricManagerLogCollector:
         )
         if self.health_summary_seconds <= 0:
             raise ValueError("Fabric Manager health summary interval must be positive")
+        self._cadence_jitter = CadenceJitter.from_environment()
         self._collection_lock = RLock()
         self._receipt_round_failed = False
         self._receipts = FabricManagerReceiptLog(
@@ -298,12 +299,13 @@ class FabricManagerLogCollector:
     def _maybe_health_summary(self, observed_at: datetime) -> None:
         if observed_at < self._next_health_summary:
             return
-        self._next_health_summary = next_stable_phase(
+        self._next_health_summary = jittered_next_phase(
             observed_at,
             cluster_id=self.context.cluster_id,
             node_id=self.node_id,
             channel=CollectorKind.FABRIC_MANAGER_LOG.value,
             interval_seconds=self.health_summary_seconds,
+            jitter=self._cadence_jitter,
         )
         result = deliver_event(
             self.sink,

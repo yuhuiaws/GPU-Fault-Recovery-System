@@ -195,6 +195,10 @@ def processor_replay_secret(monkeypatch) -> None:
     # the machine's /dev/shm and merge with other live test processes; a test
     # that wants the sharing points the variable at its own tmp_path.
     monkeypatch.setenv("GPU_FAULT_PROCESS_METRICS_DIR", "off")
+    # Deterministic posting cadences: the collectors' schedules are asserted
+    # against exact stable phases; the jitter has its own tests.
+    monkeypatch.setenv("GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO", "0")
+    monkeypatch.setenv("GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS", "0")
     monkeypatch.setenv(
         "GPU_FAULT_PROCESSOR_REPLAY_SECRET", "test-processor-replay-secret-" + "r" * 32
     )

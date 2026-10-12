@@ -25,7 +25,7 @@ from gpu_fault.collectors.logs.node_sources import (
     _TrainingLogs,
 )
 from gpu_fault.collectors.models import CollectorContext
-from gpu_fault.collectors.scheduling import next_stable_phase
+from gpu_fault.collectors.cadence import CadenceJitter, jittered_next_phase
 from gpu_fault.collectors.sinks import EventSink, deliver_event
 from gpu_fault.host_health import NodeLogBatch, NodeLogEntry
 from gpu_fault.log_rules import log_signal_priority, matching_log_rules
@@ -458,8 +458,9 @@ class NodeLogCollector:
         self.health_summary_seconds = int(
             os.getenv("GPU_FAULT_NODE_LOG_HEALTH_SUMMARY_SECONDS", "300")
         )
+        self._cadence_jitter = CadenceJitter.from_environment()
         # First summary on the first collection (see kernel.py); later ones
-        # keep their stable phase.
+        # keep their stable phase, moved by the cadence jitter.
         self._next_health_summary = self.now()
 
     def collect_once(self) -> NodeLogBatch:
@@ -555,12 +556,13 @@ class NodeLogCollector:
                         result.error,
                     )
             if periodic_due:
-                self._next_health_summary = next_stable_phase(
+                self._next_health_summary = jittered_next_phase(
                     collected_at,
                     cluster_id=self.context.cluster_id,
                     node_id=self.node_id,
                     channel="NODE_LOGS",
                     interval_seconds=self.health_summary_seconds,
+                    jitter=self._cadence_jitter,
                 )
             if journal.consumed_until is not None:
                 self._journal_since = journal.consumed_until

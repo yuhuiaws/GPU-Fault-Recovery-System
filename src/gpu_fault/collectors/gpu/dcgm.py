@@ -19,6 +19,7 @@ from gpu_fault.collectors.gpu.inventory_cadence import (
 from gpu_fault.collectors.identity_refresh import GpuIdentityRefresher
 from gpu_fault.collectors.models import CollectorContext
 from gpu_fault.collectors.process import BoundedProcessRunner
+from gpu_fault.collectors.cadence import CadenceJitter, jittered_next_phase
 from gpu_fault.collectors.scheduling import next_stable_phase
 from gpu_fault.collectors.sinks import (
     CollectorError,
@@ -447,8 +448,11 @@ class DcgmMetricsCollector:
         self._implausible_duty_cycle_keys: OrderedDict[str, datetime] = OrderedDict()
         self._last_delivered_at: datetime | None = None
         self._next_health_summary_at: datetime | None = None
+        self._cadence_jitter = CadenceJitter.from_environment()
         self._inventory = GpuInventoryCadence(
-            interval_seconds=self.inventory_interval_seconds, logger=LOGGER
+            interval_seconds=self.inventory_interval_seconds,
+            logger=LOGGER,
+            jitter=self._cadence_jitter,
         )
         self._temperature_limits = TemperatureLimitProbe(
             retry_interval_seconds=self.inventory_interval_seconds, logger=LOGGER
@@ -569,12 +573,13 @@ class DcgmMetricsCollector:
                 self._next_health_summary_at is None
                 or timestamp >= self._next_health_summary_at
             ):
-                self._next_health_summary_at = next_stable_phase(
+                self._next_health_summary_at = jittered_next_phase(
                     timestamp,
                     cluster_id=self.context.cluster_id,
                     node_id=self.node_id,
                     channel="gpu-metrics",
                     interval_seconds=self.health_summary_seconds,
+                    jitter=self._cadence_jitter,
                 )
             LOGGER.info(
                 "delivered DCGM batch %s: %s",
@@ -1023,7 +1028,7 @@ class DcgmMetricsCollector:
                     interval_seconds=self.startup_spread_seconds,
                 )
                 - startup_time
-            ).total_seconds()
+            ).total_seconds() + self._cadence_jitter.startup_offset()
             if delay > 0:
                 time.sleep(delay)
         started_at = self.now()

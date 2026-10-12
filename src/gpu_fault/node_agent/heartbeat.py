@@ -12,8 +12,10 @@ from threading import Event
 from typing import Any, Callable
 from urllib import request as urllib_request
 from urllib.error import HTTPError
+from uuid import uuid4
 
 from gpu_fault import __version__
+from gpu_fault.collectors.cadence import CadenceJitter
 from gpu_fault.collector_requirements import (
     COLLECTOR_SYSTEMD_UNITS,
     CollectorServiceState,
@@ -33,6 +35,7 @@ from gpu_fault.models import WorkflowOperation
 from gpu_fault.node_agent.config import agent_config_digest
 from gpu_fault.node_agent.executor import NodeActionExecutor
 from gpu_fault.policy import load_xid_policy
+from gpu_fault.transport.http_client import urlopen
 
 LOGGER = logging.getLogger(__name__)
 
@@ -336,6 +339,10 @@ class AgentHeartbeatReporter:
         self.agent_incarnation_id = agent_incarnation_id
         self.generation_sink = generation_sink
         self.interval_seconds = interval_seconds
+        # The wait between heartbeats moves by +-ratio of the interval so a
+        # fleet restarted together does not beat in step; the first heartbeat
+        # (the registration) is never delayed.
+        self.cadence_jitter = CadenceJitter.from_environment()
         self.bearer_token = bearer_token
         self.sender = sender or (
             lambda url, envelope: self._send(
@@ -470,7 +477,7 @@ class AgentHeartbeatReporter:
             except Exception:
                 self.consecutive_failures += 1
                 LOGGER.exception("node agent heartbeat failed")
-            stop.wait(self.interval_seconds)
+            stop.wait(self.cadence_jitter.interval(self.interval_seconds))
 
     @staticmethod
     def _send(
@@ -483,6 +490,11 @@ class AgentHeartbeatReporter:
         headers = {
             "Content-Type": "application/json",
             "X-GPU-Fault-Cluster-ID": cluster_id,
+            # Lets the pooled transport repeat the heartbeat once on a
+            # keep-alive connection the control plane closed meanwhile: a
+            # heartbeat is idempotent (the same signed envelope reports the
+            # same state) and the control plane reads nothing from the id.
+            "X-GPU-Fault-Request-ID": uuid4().hex,
         }
         if bearer_token:
             headers["Authorization"] = f"Bearer {bearer_token}"
@@ -493,7 +505,10 @@ class AgentHeartbeatReporter:
             method="POST",
         )
         try:
-            with urllib_request.urlopen(request, timeout=10) as response:
+            # The pooled keep-alive client (gpu_fault.transport.http_client):
+            # one connection per Agent process across heartbeats instead of a
+            # TCP+TLS handshake through the NLB every interval.
+            with urlopen(request, timeout=10) as response:
                 body = response.read()
                 return json.loads(body) if body else {}
         except HTTPError as exc:
