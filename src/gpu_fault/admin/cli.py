@@ -157,6 +157,7 @@ from gpu_fault.admin.site import (
     materialized_release_config,
 )
 from gpu_fault.admin.source_deploy import run_source_deploy
+from gpu_fault.admin.ownership_release import add_keep_label_flag
 from gpu_fault.admin.status_report import (
     print_status_report as print_status_report,
     status_document as status_document,
@@ -604,6 +605,7 @@ def parser() -> argparse.ArgumentParser:
         choices=(REMOVE_CLUSTER_CONFIRMATION,),
         help="must be REMOVE_GPU_CLUSTER",
     )
+    add_keep_label_flag(detach, scope="the node groups the site selected")
     remove = commands.add_parser(
         "uninstall",
         usage=(
@@ -656,16 +658,14 @@ def parser() -> argparse.ArgumentParser:
             "tree and its digest are recorded in the uninstall journal"
         ),
     )
+    add_keep_label_flag(remove, scope="every GPU cluster's node groups")
     return result
 
 
 def _run_remove_cluster(arguments: argparse.Namespace) -> int:
     site_file = _managed_site_file(arguments, command="remove-cluster")
     assert site_file is not None
-    site = load_site(
-        site_file,
-        repository_root=arguments.repo_root,
-    )
+    site = load_site(site_file, repository_root=arguments.repo_root)
 
     def discover(cluster_arn: str) -> tuple[str, str]:
         identity = discover_cluster(
@@ -685,6 +685,7 @@ def _run_remove_cluster(arguments: argparse.Namespace) -> int:
             ),
             confirmation=arguments.confirm,
             gpu_cluster_arn=arguments.gpu_cluster_arn,
+            keep_ownership_label=bool(arguments.keep_ownership_label),
         )
     )
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -696,16 +697,7 @@ def _run_uninstall(arguments: argparse.Namespace) -> int:
     assert site_file is not None
     site = load_site(site_file, repository_root=arguments.repo_root)
     try:
-        request = UninstallRequest(
-            site=site,
-            cpu_disposition=arguments.cpu_cluster,
-            confirmation=arguments.confirm,
-            final_snapshot_policy=arguments.aurora_final_snapshot,
-            reset_database=bool(arguments.reset_database),
-            repository_root_override=bool(
-                getattr(arguments, "accept_repository_root_override", False)
-            ),
-        )
+        request = UninstallRequest.from_arguments(site, arguments)
     except BootstrapError as exc:
         raise SiteConfigError(str(exc)) from exc
     uninstall_result = uninstall(request)
@@ -921,7 +913,7 @@ def _run_readonly_managed_command(
                 text=is_status,
             )
         if is_status:
-            print_status_report(completed.stdout)
+            print_status_report(completed.stdout, site=site)
         return completed.returncode
 
 

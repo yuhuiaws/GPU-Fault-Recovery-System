@@ -47,6 +47,7 @@ from gpu_fault.admin.bootstrap_ownership import (
     resolve_node_scope,
 )
 from gpu_fault.admin.membership_lock import administrator_operation_lock
+from gpu_fault.admin.ownership_release import stale_claim_lines, stale_ownership_claims
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.cluster_scope import (
     EKS_NODEGROUP_LABEL,
@@ -495,10 +496,15 @@ def run_node_scope_command(
     active = runner or CommandRunner()
     entries = _selected_entries(site, gpu_cluster_arn, active)
     reports = [assess_cluster(active, site=site, entry=entry) for entry in entries]
+    # A cluster the site de-registered whose node groups still carry this
+    # site's id: the next deploy of this id would re-adopt them without a new
+    # declaration, and another site is refused until the label is released.
+    stale_claims = stale_ownership_claims(site, active)
     result: dict[str, Any] = {
         "site_id": site.release_config["site_name"],
         "ownership_label": OWNERSHIP_LABEL,
         "clusters": reports,
+        "stale_ownership_claims": stale_claims,
     }
     if converge:
         (report,) = reports
@@ -538,4 +544,8 @@ def run_node_scope_command(
         file=sys.stderr,
         flush=True,
     )
+    for line in stale_claim_lines(stale_claims):
+        print(
+            f"gpu-fault-admin {COMMAND}: finding: {line}", file=sys.stderr, flush=True
+        )
     return 0

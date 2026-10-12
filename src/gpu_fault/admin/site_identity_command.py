@@ -28,6 +28,12 @@ from gpu_fault.admin.bootstrap_common import (
 )
 from gpu_fault.admin.bootstrap_ownership import label_remedy
 from gpu_fault.admin.bootstrap_site import load_existing_site, site_identifier
+from gpu_fault.admin.ownership_release import (
+    KEEP_FLAG,
+    OPERATOR_ACTIONS,
+    nodepool_release_edit,
+    release_command,
+)
 from gpu_fault.cluster_scope import (
     HYPERPOD_CLUSTER_LABEL,
     OWNERSHIP_LABEL,
@@ -109,6 +115,29 @@ def site_id_document(
                 f"spec.template.metadata.labels: {{{OWNERSHIP_LABEL}: {site_id}}}"
             ),
         },
+        "release": {
+            "semantics": (
+                "remove-cluster and uninstall end with an OWNERSHIP RELEASE step "
+                f"that removes exactly {OWNERSHIP_LABEL} from the node groups the "
+                f"site selected for the cluster; {KEEP_FLAG} records it as retained "
+                "instead (for a cluster that re-joins soon). A de-registered "
+                "cluster whose groups still carry the label is a stale claim that "
+                "status and node-scope report; re-label before joining it again"
+            ),
+            "eks_managed_node_group": release_command(
+                ClusterProvider.EKS_MANAGED,
+                cluster="<EKS cluster>",
+                group="<node group>",
+            ),
+            "hyperpod_instance_group": release_command(
+                ClusterProvider.HYPERPOD,
+                cluster="<HyperPod cluster>",
+                group=hyperpod_group,
+            ),
+            "karpenter_nodepool": nodepool_release_edit(["kubectl"], "<NodePool>")
+            + " (never edited by the product: outcome manual)",
+            "operator_actions": sorted(OPERATOR_ACTIONS.values()),
+        },
         "cpu_cluster": {
             "input_arn": cpu.input_arn,
             "hyperpod_arn": cpu.hyperpod_arn,
@@ -151,7 +180,8 @@ def run_site_id_command(
     state_dir = getattr(arguments, "state_dir", None)
     document = site_id_document(cpu, site_id=site_id, state_dir=state_dir)
     print(
-        f"gpu-fault-admin {COMMAND}: {site_id} (label {OWNERSHIP_LABEL}={site_id})",
+        f"gpu-fault-admin {COMMAND}: {site_id} (label {OWNERSHIP_LABEL}={site_id}; "
+        f"remove-cluster and uninstall release it unless {KEEP_FLAG})",
         file=sys.stderr,
         flush=True,
     )
