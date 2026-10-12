@@ -10,6 +10,7 @@ import pytest
 
 from gpu_fault_release import regional_release_fleet_rollout as FLEET_ROLLOUT
 from gpu_fault_release import regional_release_gpu_rollout as GPU_ROLLOUT
+from gpu_fault_release import regional_release_node_scope as NODE_SCOPE
 from gpu_fault_release import regional_release_rollout_wait as WAIT
 from tests.regional._release_orchestrator_support import ingress_pod_list_json
 
@@ -226,11 +227,14 @@ def test_reconciler_deploy_uses_progress_aware_wait(
 
     ``kubectl rollout status`` inside the script gives up on a fixed deadline
     and cannot tell a slow image pull from a crash loop, so the deploy hands
-    the waiting back to ``wait_deployment_rollout``.
+    the waiting back to ``wait_deployment_rollout``. The node-scope stamp the
+    engine patches onto the applied Deployment sits between the two, so the
+    one wait covers the script's apply and the stamp's rollout together.
     """
 
     sequence: list[str] = []
     environments: list[dict[str, str]] = []
+    patches: list[list[str]] = []
     waited: list[tuple[str, int]] = []
     rendered_identity = {
         "GPU_FAULT_INSTALLER_BUNDLE_SHA256": "e" * 64,
@@ -242,14 +246,18 @@ def test_reconciler_deploy_uses_progress_aware_wait(
 
         def run(self, arguments, *, env=None, **_kwargs):
             sequence.append(f"run:{Path(arguments[0]).name}")
-            environments.append(dict(env or {}))
+            if env is not None:
+                environments.append(dict(env))
+            if "patch" in arguments:
+                patches.append(list(arguments))
             return ""
 
     release = SimpleNamespace(
         runner=Runner(),
         bundle_sha="b" * 64,
         node_template_sha="d" * 64,
-        config=SimpleNamespace(upgrade_max_unavailable=0),
+        config=SimpleNamespace(upgrade_max_unavailable=0, namespace="gpu-fault-system"),
+        _gpu=lambda _target, *arguments: ["kubectl", *arguments],
         _settle_installer_jobs=lambda _target: sequence.append("settle"),
     )
     monkeypatch.setattr(
@@ -265,19 +273,36 @@ def test_reconciler_deploy_uses_progress_aware_wait(
 
     monkeypatch.setattr(FLEET_ROLLOUT, "wait_deployment_rollout", wait)
 
+    target = SimpleNamespace(
+        cluster_id="gpu-a", hyperpod_cluster_name="hp-gpu-a", fleet_master_file=None
+    )
     identity = FLEET_ROLLOUT.deploy_reconciler(
         release,
-        SimpleNamespace(cluster_id="gpu-a", fleet_master_file=None),
+        target,
         wheel_cm="wheel",
         bundle_cm="bundle",
         artifact_sha="a" * 64,
         config_digest="c" * 64,
     )
 
-    assert sequence == ["settle", "run:deploy-node-installer-reconciler.sh", "wait"]
+    assert sequence == [
+        "settle",
+        "run:deploy-node-installer-reconciler.sh",
+        "run:kubectl",
+        "wait",
+    ], "script, node-scope stamp, then the one progress-aware wait"
     assert environments == [
         {**rendered_identity, "GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT": "false"}
     ]
+    (patch,) = patches
+    assert (
+        patch[1:5] == ["-n", "gpu-fault-system", "patch", "deployment"]
+        and patch[5] == FLEET_ROLLOUT.inventory.GPU_RECONCILER_DEPLOYMENT
+    ), patch
+    assert (
+        NODE_SCOPE.node_scope_digest(NODE_SCOPE.recorded_node_scope(target))
+        in (patch[-1])
+    ), "the stamp carries the digest of the scope the reconciler reads"
     assert waited == [(FLEET_ROLLOUT.inventory.GPU_RECONCILER_DEPLOYMENT, 600)]
     assert identity == ("e" * 64, "f" * 64)
 
