@@ -208,7 +208,9 @@ Other lifecycle operations still use the validated administrator subcommands:
 gpu-fault-admin join-cluster --state-dir /secure/gpu-fault \
   --gpu-cluster-arn <gpu-arn>
 
-# Deregister a GPU cluster; keeps that GPU EKS/HyperPod cluster and the other clusters
+# Deregister a GPU cluster; keeps that GPU EKS/HyperPod cluster and the other clusters and, as its
+# last step, releases the ownership label gpu-fault.io/control-plane from the cluster's node groups
+# (add --keep-ownership-label when it re-joins soon)
 gpu-fault-admin remove-cluster --state-dir /secure/gpu-fault \
   --gpu-cluster-arn <gpu-arn> --confirm REMOVE_GPU_CLUSTER
 
@@ -227,7 +229,10 @@ gpu-fault-admin uninstall --state-dir /secure/gpu-fault \
 ```
 
 GPU EKS/HyperPod clusters are always kept. After a `deploy` failure or automatic rollback, rerun the same four-argument command;
-`join-cluster` and `remove-cluster` also resume idempotently through persistent state.
+`join-cluster` and `remove-cluster` also resume idempotently through persistent state. `remove-cluster` and `uninstall` release the
+ownership label `gpu-fault.io/control-plane` from the node groups as their last step (`--keep-ownership-label` keeps it); re-label with the
+commands `gpu-fault-admin site-id` prints before the next `join-cluster`/`deploy`, and `status`/`node-scope` report a de-registered cluster
+that still carries it as a stale claim.
 Detailed upgrade, troubleshooting and decommissioning rules are in
 [Administrator Operations](docs/en/administrator-operations.md); object-by-object audit and break-glass are in
 [Deployment and Operations Manual](docs/en/deployment-and-operations-manual.md).

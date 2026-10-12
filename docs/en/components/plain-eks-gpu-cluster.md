@@ -137,6 +137,15 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
    `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels addOrUpdateLabels={gpu-fault.io/control-plane=<site id>}`
    labels the GPU node group (HyperPod: `update-cluster` with `KubernetesConfig.Labels`; Karpenter: NodePool template
    labels). Command: `gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn>` (ARNs only).
+   De-registration releases it: the last step of `remove-cluster`/`uninstall`, `OWNERSHIP_RELEASED`, removes the key
+   from the node groups the site selected with
+   `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels removeLabels=gpu-fault.io/control-plane`
+   (HyperPod: `update-cluster` with the instance group's full definition minus the key, refused mid-update; a Karpenter
+   NodePool is never edited and recorded `manual`) and waits, bounded, until `describe-nodegroup` shows it gone; the
+   operator identity additionally needs `eks:UpdateNodegroupConfig`/`sagemaker:UpdateCluster` (the runtime roles stay
+   read-only); `--keep-ownership-label` keeps it and records `retained`. A de-registered cluster whose node groups still
+   carry the label is a stale claim `status`/`node-scope` report as a finding; re-label with the commands `site-id`
+   prints before joining it again (administrator-operations §5.0.0, the "release" row).
 6. Third-party GPU client DaemonSets (the customer's own dcgm-exporter, GPU feature discovery, monitoring agents)
    **must not tolerate** `gpu-fault.io/quiesce` (no key-less `operator: Exists` wildcard toleration; list the keys such
    as `nvidia.com/gpu` instead) and must tolerate being stopped/evicted inside a quiesce window; the default NVIDIA

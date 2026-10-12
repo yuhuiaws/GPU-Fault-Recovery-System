@@ -3835,7 +3835,9 @@ When the corresponding lifecycle was not performed the companion stays `NOT_RUN`
    accumulates in the order `DISCOVERED` → `CONTROL_REGISTRY_DRAINING` → `KUBERNETES_QUIESCED` →
    `KUBERNETES_REMOVED` → `CONTROL_REGISTRY_REMOVED` and `AWS_DETACHED` (parallel) →
    `AURORA_UPDATED` → `SITE_COMMIT_STARTED` → `SITE_UPDATED` →
-   `RELEASE_STATE_UPDATED` → `VERIFIED`. The namespace must be confirmed deleted before the
+   `RELEASE_STATE_UPDATED` → `VERIFIED` → `OWNERSHIP_RELEASED` (the last step releases `gpu-fault.io/control-plane` from the
+   cluster's node groups; `evidence.OWNERSHIP_RELEASED` records every group's value before and after and
+   `released|retained|manual`). The namespace must be confirmed deleted before the
    registry, key, IAM and network dependencies are withdrawn;
    the terminal `phase` is `COMPLETED`; `step_completed_at` has one entry per step; the same directory contains
    `installation-resources-before.json`, `installation-resources-after.json`,
@@ -3861,7 +3863,9 @@ When the corresponding lifecycle was not performed the companion stays `NOT_RUN`
    and must not redo steps already in `completed_steps`.
 4. After the removal completes, verify the GPU cluster: the system namespace does not exist; the count of RBAC with proven ownership is 0; the unlabelled Role from precondition
    4 still exists; no node carries a Node Installer annotation any more -- read twice with an interval after the
-   namespace is gone, both empty, and no node was written as Retrying;
+   namespace is gone, both empty, and no node was written as Retrying; the cluster's node groups / instance groups
+   no longer carry `gpu-fault.io/control-plane=<site id>` (`describe-nodegroup` `labels` / HyperPod `CurrentLabels`;
+   the command output has `ownership_label.outcome=released`, every other label unchanged);
    the GPU EKS and HyperPod clusters themselves still exist (`PRESERVED` in
    `installation-resources-after.json`).
 5. Verify the CPU control plane: the registry Secret's `clusters.json` is an explicit `[]`; every CPU Pod
@@ -4217,7 +4221,8 @@ recorded.
    indiscriminately.
 5. `state.json` goes `STARTED` → `REGISTRY_EXPORTED` → `KUBERNETES_VERIFIED` →
    `NON_AURORA_DELETE_IN_PROGRESS` → `NON_AURORA_VERIFIED` → `CPU_VERIFIED` →
-   `READY_TO_DELETE_AURORA` → `AURORA_DELETE_IN_PROGRESS` → `COMPLETED`.
+   `READY_TO_DELETE_AURORA` → `AURORA_DELETE_IN_PROGRESS` → `OWNERSHIP_RELEASED` → `COMPLETED` (the last phase releases
+   `gpu-fault.io/control-plane` from every GPU cluster's node groups; `ownership_release` records the outcome per cluster).
    Audited pre-Aurora cleanup proof must exist before the database is deleted. By the current actual roles, delete the
    reader first and confirm it is gone, then delete the writer and confirm it is gone, and finally delete the cluster;
    this may not run in parallel with the preceding resource verification.
@@ -4484,6 +4489,13 @@ and does not count towards its sequence.
    with the product's refusal before any cold build or mutation when it does not hold. `eks-managed` members also need: EKS
    node auto repair off on the managed node groups hosting GPU nodes (`nodeRepairConfig.enabled=false` or unset, otherwise
    S1/S3 discovery refuses), the GPU node image with `python3.12` and `strace`, and the workload namespace `training`.
+   De-registration releases the label: every S2 `remove-cluster` and the S4 `uninstall` end with the product's
+   `OWNERSHIP_RELEASED` step, after which the driver asserts with the product's own describe reads that no node group of
+   the de-registered cluster carries the label any more (`scripts/e2e/regional/boot029_ownership.py released`; a group
+   still carrying it fails the stage); before S3 and S5 act, the driver puts the label back -- with the operator's
+   credentials and the commands `site-id` prints -- on exactly the groups the previous stage's journal recorded as
+   `released` and waits for the provider to apply it (`boot029_ownership.py reapply`), then runs the precondition
+   check above. The operator identity therefore needs `eks:UpdateNodegroupConfig` / `sagemaker:UpdateCluster`.
 
 #### Steps
 
@@ -4617,13 +4629,16 @@ stages or after everything has finished, following the references below.
    ```
 
    After each removal the driver asserts that this cluster's `<STATE_DIR>/remove-cluster/<cluster_id>/state.json` ends in
-   `phase=COMPLETED` (the receipt's `journals` records one proof per ARN, in order); after the last removal the site is in the
+   `phase=COMPLETED` (the receipt's `journals` records one proof per ARN, in order, with the journal's own outcome counts
+   under `journals[].ownership_release`) and, through `describe-nodegroup`/`describe-cluster`, that its node groups no
+   longer carry `gpu-fault.io/control-plane=<site id>` (receipt `ownership_label_released`; a group still carrying it
+   fails the stage); after the last removal the site is in the
    zero-GPU-cluster CPU-only steady state (`BOOT-024` step 6). An `eks-managed` member goes through the same command (see the
    provider note of `BOOT-024`). The checklist is `BOOT-024` step 2 (all `completed_steps`:
    `DISCOVERED` → `CONTROL_REGISTRY_DRAINING` → `KUBERNETES_QUIESCED` →
    `KUBERNETES_REMOVED` → `CONTROL_REGISTRY_REMOVED`/`AWS_DETACHED` →
    `AURORA_UPDATED` → `SITE_COMMIT_STARTED` → `SITE_UPDATED` →
-   `RELEASE_STATE_UPDATED` → `VERIFIED`),
+   `RELEASE_STATE_UPDATED` → `VERIFIED` → `OWNERSHIP_RELEASED`),
    step 4 (GPU side) and step 5 (CPU side). The SIGINT resume of `BOOT-024` step 3 and the zero-cluster `deploy` and
    idempotent rerun of steps 6–7 are not executed in this stage (optional; doing them does not affect later stages).
 3. **S3: one `join-cluster` re-attaches every GPU cluster.**
@@ -4636,8 +4651,12 @@ stages or after everything has finished, following the references below.
    ```
 
    For every ARN the driver asserts that `<STATE_DIR>/join-cluster/<arn_sha256_12>/state.json` ends in
-   `phase=COMPLETED` (the receipt's `journals` records one proof per ARN); the command takes ARNs only, and the driver
-   checks the ownership-label precondition before S3 acts. The checklist is the step sequence of `BOOT-025` step 2 (`PRECHECKED` →
+   `phase=COMPLETED` (the receipt's `journals` records one proof per ARN); the command takes ARNs only. Before S3 acts
+   the driver puts the label S2 released back (`boot029_ownership.py reapply` reads the `OWNERSHIP_RELEASED` evidence of
+   every `remove-cluster/<cluster_id>/state.json` and labels exactly the groups recorded `released` with the commands
+   `site-id` prints -- EKS `addOrUpdateLabels`, HyperPod `update-cluster` with the full definition plus the key -- waiting
+   for the provider to apply it; receipt `ownership_label_reapplied`; a cluster without release evidence is refused
+   rather than guessed), then checks the ownership-label precondition. The checklist is the step sequence of `BOOT-025` step 2 (`PRECHECKED` →
    `DISCOVERED` → `LOCAL_INPUTS_READY` → `PREREQUISITES_READY` → `CANDIDATE_READY` →
    `RELEASE_STARTED` → `JOINED` → `COLLECTORS_READY` → `VERIFIED` → `SITE_UPDATED` →
    `RELEASE_STATE_UPDATED` → `REGISTRY_UPDATED` → `ACTIVATION_STARTED` → `ACTIVATED` →
@@ -4656,11 +4675,13 @@ stages or after everything has finished, following the references below.
      --confirm UNINSTALL_GPU_FAULT
    ```
 
-   The driver asserts that `<STATE_DIR>/uninstall/state.json` ends in `phase=COMPLETED`. The checklist
+   The driver asserts that `<STATE_DIR>/uninstall/state.json` ends in `phase=COMPLETED` and that no node group of any GPU
+   cluster carries `gpu-fault.io/control-plane=<site id>` any more (receipt `ownership_label_released`; the journal's
+   `ownership_release` records every cluster). The checklist
    is `BOOT-027` step 3 (exact phase_order, DRAINING before the producers stop, ingress and the consumers kept until the
    strict drain completes, node components uninstalled within `NODE_RUNTIMES_STOPPED`), step 5 (`state.json`
    `STARTED` → `REGISTRY_EXPORTED` → `KUBERNETES_VERIFIED` →
-   `NON_AURORA_DELETE_IN_PROGRESS` → `READY_TO_DELETE_AURORA` → `COMPLETED`, Aurora
+   `NON_AURORA_DELETE_IN_PROGRESS` → `READY_TO_DELETE_AURORA` → `OWNERSHIP_RELEASED` → `COMPLETED`, Aurora
    reader first then writer, the `retain` branch leaving exactly one final snapshot), step 6 (command output fields) and
    step 7 (state directory and underlying clusters retained, product namespace gone). The SIGINT resume of `BOOT-027`
    steps 1–2 is an independent interrupted-resume sub-scenario; do not manufacture orphan leases. An explicit `skip`
@@ -4669,7 +4690,10 @@ stages or after everything has finished, following the references below.
    `gpu-fault/runtime-<digest>` and `gpu-fault/runtime-cache-<digest>` ECR repositories no longer exist
    (`aws ecr describe-repositories` reports `RepositoryNotFoundException`) -- this is the source of S5's
    "site ECR images and buildcache tags do not exist".
-5. **S5: cold-build first deployment again.** The driver repeats S1's cache cleanup; this time it reads the `site_id`
+5. **S5: cold-build first deployment again.** The driver first puts the label S4 released back
+   (`boot029_ownership.py reapply` reads `ownership_release` of `<STATE_DIR>/uninstall/state.json`, labels with the
+   `site-id` commands and waits for convergence; receipt `ownership_label_reapplied`) and checks the ownership-label
+   precondition, then repeats S1's cache cleanup; this time it reads the `site_id`
    from `<STATE_DIR>/bootstrap-state.json` (retained by the uninstall) and resolves the two ECR
    repositories from it: normally the repositories have already been deleted by the uninstall and only "absent" is
    recorded; if a repository still exists (product defect or manual residue) it must first pass strict ownership
@@ -4765,6 +4789,11 @@ stages or after everything has finished, following the references below.
 - The `state.json` of S2, S3 and S4 ends in `COMPLETED`, and the referenced `BOOT-024`/`025`/`027`
   checklists hold item by item under the originally approved policy; `skip` does not prove BOOT-027's final-snapshot
   retention;
+- After every S2 removal and after the S4 uninstall, no node group of the de-registered cluster carries
+  `gpu-fault.io/control-plane=<site id>` (every cluster of the receipt's `ownership_label_released` is `released`, and
+  the outcome of `journals[].ownership_release`/`ownership_release` is `released`); before S3 and S5 the driver puts the
+  label back on the groups the previous stage's journal released, with the `site-id` commands, and waits until the
+  provider applies it (receipt `ownership_label_reapplied`); a cluster without release evidence is refused, not guessed;
 - Every administrator command's non-zero exit must propagate as a stage failure, and an old `COMPLETED` journal may not
   override the exit code; the schema-2 stage receipts bind this run's target, attempt and original journal baseline,
   and success is not guessed from the latest mtime. One run's private sequence lock may not be reused concurrently;
@@ -4791,6 +4820,8 @@ stage log sha256, each component's `cold_build`/descriptor/registry-reuse and ba
 proof, original journal binding, snapshot policy, unexecuted companions and each terminal `phase`; S1/S5 additionally
 carry `first_deploy_provider`/`joined_providers`, `first_deploy_gpu_cluster_count`, the per-ARN `joins` and
 `profile_plan_approved` (mixed site) and `first_deploy_already_complete` (a resume whose first deploy had finished);
+S2/S4 additionally carry `ownership_label_released` and the journals' `ownership_release`, S3/S5
+`ownership_label_reapplied` (node group names and journal paths appear only as sha256);
 ARNs, e-mail address and directory paths appear in it only as sha256;
 S5 additionally has the `readme` receipt: the sha256 of the README and its two code blocks, `executed_lines` and
 `skipped_verification_lines` -- in which ARNs, e-mail address and directories are replaced by `sha256:<digest>` --

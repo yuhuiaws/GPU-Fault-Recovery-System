@@ -113,6 +113,12 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels addOrUpdateLabels={gpu-fault.io/control-plane=<站点ID>}`
    给 GPU 节点组加标签（HyperPod：`update-cluster` 的 `KubernetesConfig.Labels`；Karpenter：NodePool 模板标签）；
    命令：`gpu-fault-admin join-cluster --state-dir <dir> --gpu-cluster-arn <eks arn>`（只需要 ARN）。
+   注销即释放：`remove-cluster`/`uninstall` 的最后一步 `OWNERSHIP_RELEASED` 用
+   `aws eks update-nodegroup-config --cluster-name <eks> --nodegroup-name <ng> --labels removeLabels=gpu-fault.io/control-plane`
+   从站点选中的节点组摘掉该键（HyperPod：`update-cluster` 带实例组完整定义去键，更新中即拒绝；Karpenter NodePool 不改写、记
+   `manual`），有界等待 `describe-nodegroup` 显示已消失；操作者身份另需 `eks:UpdateNodegroupConfig`/`sagemaker:UpdateCluster`
+   （运行时角色仍只读）；`--keep-ownership-label` 保留并记 `retained`。已注销集群的节点组仍带标签即过期声明，`status`/`node-scope`
+   报 finding；重新接入前按 `site-id` 打印的命令重新加标签（管理员日常运维 §5.0.0 "释放"行）。
 6. 第三方 GPU 客户端 DaemonSet（客户自己的 dcgm-exporter、GPU feature discovery、监控 agent 等）**不得容忍**
    `gpu-fault.io/quiesce`（不要用无 key 的 `operator: Exists` 通配容忍；按 key 列出 `nvidia.com/gpu` 等即可），并须容忍在
    quiesce 窗口内被停止/驱逐；NVIDIA device plugin 与 GFD 的默认清单只容忍 `nvidia.com/gpu`，无需改动。

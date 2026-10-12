@@ -194,7 +194,7 @@ gpu-fault-admin deploy \
 gpu-fault-admin join-cluster --state-dir /secure/gpu-fault \
   --gpu-cluster-arn <gpu-arn>
 
-# 注销一个GPU集群；保留该GPU EKS/HyperPod和其他集群
+# 注销一个GPU集群；保留该GPU EKS/HyperPod和其他集群，最后一步释放其节点组上的归属标签（--keep-ownership-label 保留）
 gpu-fault-admin remove-cluster --state-dir /secure/gpu-fault \
   --gpu-cluster-arn <gpu-arn> --confirm REMOVE_GPU_CLUSTER
 
@@ -213,7 +213,8 @@ gpu-fault-admin uninstall --state-dir /secure/gpu-fault \
 ```
 
 GPU EKS/HyperPod始终保留。`deploy`失败或自动回滚后使用相同四参数命令重跑；
-`join-cluster`和`remove-cluster`也通过持久状态幂等续跑。
+`join-cluster`和`remove-cluster`也通过持久状态幂等续跑。`remove-cluster`与`uninstall`在最后一步从节点组释放归属标签`gpu-fault.io/control-plane`
+（`--keep-ownership-label`保留）；再次`join-cluster`/`deploy`前按`site-id`动词打印的命令重新加标签，已注销集群仍带标签时`status`/`node-scope`报出过期声明。
 详细升级、排障和退役规则见
 [管理员日常运维](docs/管理员日常运维.md)，逐对象审计和break-glass见
 [部署和运维详细参考](docs/部署和运维手册.md)。

@@ -66,7 +66,10 @@ incarnation/boot_id. Only the provider call differs:
 
 The eks-managed executor IAM needs only `ec2:DescribeInstances`, `ec2:RebootInstances`
 (conditioned on `aws:ResourceTag/eks:cluster-name`), `eks:DescribeCluster` and `eks:DescribeNodegroup`,
-and no `sagemaker:*`. The node scope is `GPU_FAULT_NODE_SELECTOR`; the CPU node group must never match.
+and no `sagemaker:*`. The node scope is `GPU_FAULT_NODE_SELECTOR`; the CPU node group must never match. The
+`eks:UpdateNodegroupConfig` / `sagemaker:UpdateCluster` that release the ownership label `gpu-fault.io/control-plane`
+(the last step of `remove-cluster`/`uninstall`) belong to the operator identity running the command alone and are
+granted to no runtime role.
 
 ### 2.1 Regional Acceptance Fixture Boundaries
 

@@ -1787,7 +1787,8 @@ The AgentRecord and the installation resource registry in Aurora serve only as t
 for Aurora's own destruction procedure. All progress of `uninstall` (`src/gpu_fault/admin/uninstall.py`) is written to external
 files in the state-dir: `uninstall/state.json` records the phase
 `STARTED → REGISTRY_EXPORTED → KUBERNETES_VERIFIED → NON_AURORA_DELETE_IN_PROGRESS →
-READY_TO_DELETE_AURORA → COMPLETED`; before stopping the writer, the registry snapshot is exported as `installation-resources-before.json` with a `.sha256` sidecar,
+READY_TO_DELETE_AURORA → OWNERSHIP_RELEASED → COMPLETED` (the last phase releases the ownership label from every GPU cluster's node
+groups, evidence `ownership_release`); before stopping the writer, the registry snapshot is exported as `installation-resources-before.json` with a `.sha256` sidecar,
 followed in order by `installation-resources-delete-plan.json`,
 `installation-resources-pre-aurora-delete.json` and `installation-resources-final.json`;
 Kubernetes-side cleanup writes a separate `kubernetes-cleanup.json`, whose phase must reach `CLEANUP_COMPLETED`
@@ -3143,7 +3144,9 @@ and the phase enters `ROLLED_BACK`/`ROLLBACK_FAILED`; an in-progress attempt ref
 `remove-cluster` (`src/gpu_fault/admin/cluster_removal.py`) advances in
 `<state-dir>/remove-cluster/<cluster_id>/state.json` through `DISCOVERED → CONTROL_REGISTRY_DRAINING →
 KUBERNETES_QUIESCED → KUBERNETES_REMOVED → CONTROL_REGISTRY_REMOVED → AWS_DETACHED →
-AURORA_UPDATED → SITE_UPDATED → RELEASE_STATE_UPDATED → VERIFIED → COMPLETED`, with the registry side corresponding to
+AURORA_UPDATED → SITE_UPDATED → RELEASE_STATE_UPDATED → VERIFIED → OWNERSHIP_RELEASED → COMPLETED` (the last step releases the
+ownership label `gpu-fault.io/control-plane` from the node groups the site selected for the cluster, `admin/ownership_release.py`;
+`--keep-ownership-label` records `retained`), with the registry side corresponding to
 `DRAINING → REVOKED` of §2.15.1. The options of `uninstall` (state machine in §2.13),
 `--cpu-cluster keep|delete`, `--reset-database` and `--aurora-final-snapshot retain|skip`, are constrained by
 `UninstallRequest.__post_init__` (`admin/uninstall_types.py`): `skip` is legal only under `delete` or
