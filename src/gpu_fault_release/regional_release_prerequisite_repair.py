@@ -57,8 +57,11 @@ from gpu_fault_release.regional_release_prerequisite_baseline import (
 )
 from gpu_fault_release.regional_release_prerequisite_handoff import (
     HANDOFF_AUDIT_KEY,
+    PREDECESSOR_AUDIT_KEY,
     bootstrap_handoff_audit,
     candidate_bootstrap_baseline,
+    foreign_bootstrap_baseline,
+    predecessor_audit,
     upgrade_handoff_audit,
     validate_bootstrap_repair_handoff,
     validate_upgrade_repair_handoff,
@@ -402,17 +405,16 @@ def prepare_prerequisite_repair(
             orphan = validate_upgrade_repair_handoff(
                 release, release.state, identity=identity
             )
+    # M-23: only this candidate's own unfinished bootstrap or transaction pins
+    # the digest it was planned against. Another candidate's failed or cleaned
+    # bootstrap recorded the tree that candidate rendered, never this plan.
+    resumed_plan = release.state.get("release_id") == release.release_id and (
+        (bootstrap and handoff is None)
+        or release.state.get("transaction_committed") is False
+    )
     release.pin_approved_manifest_plan(
         release.approved_manifest_digest
-        or (
-            release.state.get("approved_manifest_sha256")
-            if (bootstrap and handoff is None)
-            or (
-                release.state.get("transaction_committed") is False
-                and release.state.get("release_id") == release.release_id
-            )
-            else None
-        )
+        or (release.state.get("approved_manifest_sha256") if resumed_plan else None)
         or release.rendered_manifest_digest
     )
     release.enforce_manifest_plan_pin()
@@ -469,15 +471,28 @@ def prepare_prerequisite_repair(
             release._save_state(
                 "bootstrap-started", previous=None, transaction_committed=False
             )
+        original_state = release.state
+        baseline = original_state
+        if bootstrap and original_state.get("release_id") != release.release_id:
+            baseline = foreign_bootstrap_baseline(release, original_state)
         record = _new_record(
             release,
-            baseline=release.state,
+            baseline=baseline,
             snapshot=snapshot,
             identity=identity,
             bootstrap=bootstrap,
             commit_live=commit_live,
         )
-        _persist(release, record)
+        if baseline is not original_state:
+            # Another candidate's adopted bootstrap: one checkpoint takes the
+            # state over with the journal, as the handoff successor does.
+            record["predecessor"] = predecessor_audit(original_state)
+            release.state = {**baseline, REPAIR_KEY: record}
+        try:
+            _persist(release, record)
+        except BaseException:
+            release.state = original_state
+            raise
     _cleanup_jobs(release, record)
     try:
         record["status"] = "APPLYING"
@@ -586,12 +601,14 @@ def prepare_bootstrap_workflows(release: RegionalRelease) -> None:
         for name, job in release.state[REPAIR_KEY]["jobs"].items()
     }
     superseded = release.state[REPAIR_KEY].get("supersedes")
+    predecessor = release.state[REPAIR_KEY].get("predecessor")
     release.state.pop(REPAIR_KEY)
     release._save_state(
         "bootstrap-started",
         bootstrap_store_safety={**proof, "proof_jobs": completed_jobs},
         **{origin_key: origin},
         **({HANDOFF_AUDIT_KEY: copy.deepcopy(superseded)} if superseded else {}),
+        **({PREDECESSOR_AUDIT_KEY: copy.deepcopy(predecessor)} if predecessor else {}),
     )
 
 

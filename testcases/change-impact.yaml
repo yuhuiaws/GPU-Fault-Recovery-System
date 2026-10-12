@@ -249,6 +249,7 @@ rules:
       - tests/regional/test_release_trust_security.py
       - tests/regional/test_allowed_namespace_preflight.py
       - tests/regional/test_release_supersede_failed_transaction.py
+      - tests/regional/test_release_bootstrap_foreign_takeover.py
       - tests/deploy/test_rds_ca_bundle_wiring.py
       - tests/admin/test_admin_rollback_command.py
       - tests/deploy/test_verify_control_plane_role_split_optional.py

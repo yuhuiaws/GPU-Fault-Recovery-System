@@ -10,10 +10,61 @@ from typing import TYPE_CHECKING, Any
 
 from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault_release import regional_deployment_inventory as inventory
+from gpu_fault_release.regional_release_diff import AURORA_PREREQUISITE_REPAIR_KEY
 from gpu_fault_release.regional_release_rendering import DATAPLANE_ADOT_DEPLOYMENT
 
 if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease
+
+CLEANUP_PHASES = frozenset(
+    {
+        "bootstrap-cleanup-started",
+        "bootstrap-cleanup-progress",
+        "bootstrap-cleanup-failed",
+        "bootstrap-cleaned",
+    }
+)
+
+
+def bootstrap_resume_context(
+    state: dict[str, Any],
+    release_id: str,
+) -> tuple[set[str], bool, bool]:
+    """The completed clusters and CPU checkpoint an earlier attempt may lend.
+
+    Only this candidate's own attempt counts, and never across cleanup: its
+    0-replica Deployments would pass the live CPU check. A repair journal
+    that took over another candidate's bootstrap (``supersedes`` from a
+    handoff, ``predecessor`` from a takeover) already names this candidate,
+    but until adoption removes it nothing in the state is this candidate's.
+    """
+    journal = state.get(AURORA_PREREQUISITE_REPAIR_KEY)
+    taken_over = isinstance(journal, dict) and not {
+        "supersedes",
+        "predecessor",
+    }.isdisjoint(journal)
+    loaded_phase = str(state.get("phase") or "")
+    resume_phase = str(state.get("resume_phase") or loaded_phase)
+    reusable = (
+        state.get("release_id") in {None, release_id}
+        and not taken_over
+        and loaded_phase not in CLEANUP_PHASES
+    )
+    completed_cluster_ids = (
+        {str(value) for value in state.get("completed_cluster_ids", []) if value}
+        if reusable
+        else set()
+    )
+    cpu_checkpoint = reusable and resume_phase in {
+        "bootstrap-cpu-ready",
+        "bootstrap-endpoint-ready",
+        "bootstrap-data-plane-progress",
+    }
+    check_live_cpu = reusable and resume_phase in {
+        "bootstrap-started",
+        "bootstrap-failed",
+    }
+    return completed_cluster_ids, cpu_checkpoint, check_live_cpu
 
 
 @contextmanager

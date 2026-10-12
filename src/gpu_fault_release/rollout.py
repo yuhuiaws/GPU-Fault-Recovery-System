@@ -105,6 +105,7 @@ from gpu_fault_release.regional_release_aurora_refresh import (
 )
 from gpu_fault_release.regional_release_bootstrap import (
     bootstrap_observability,
+    bootstrap_resume_context,
     cleanup_bootstrap,
 )
 from gpu_fault_release.regional_release_config import (
@@ -568,42 +569,6 @@ def render_and_apply_cpu_roles(
     # point never re-resolve on their own (live 2026-09-13: the rollback after a
     # failed apply exec'd into a replaced Pod and stopped at rollback-failed).
     forget_cpu_ingress_pod(release)
-
-
-def bootstrap_resume_context(
-    state: dict[str, Any],
-    release_id: str,
-) -> tuple[set[str], bool, bool]:
-    loaded_phase = str(state.get("phase") or "")
-    resume_phase = str(state.get("resume_phase") or loaded_phase)
-    same_release = state.get("release_id") in {None, release_id}
-    cleaned = loaded_phase in {
-        "bootstrap-cleanup-started",
-        "bootstrap-cleanup-progress",
-        "bootstrap-cleanup-failed",
-        "bootstrap-cleaned",
-    }
-    completed_cluster_ids = (
-        {str(value) for value in state.get("completed_cluster_ids", []) if value}
-        if same_release and not cleaned
-        else set()
-    )
-    cpu_checkpoint = (
-        same_release
-        and not cleaned
-        and resume_phase
-        in {
-            "bootstrap-cpu-ready",
-            "bootstrap-endpoint-ready",
-            "bootstrap-data-plane-progress",
-        }
-    )
-    check_live_cpu = (
-        same_release
-        and not cleaned
-        and resume_phase in {"bootstrap-started", "bootstrap-failed"}
-    )
-    return completed_cluster_ids, cpu_checkpoint, check_live_cpu
 
 
 class RegistryDrainContext:

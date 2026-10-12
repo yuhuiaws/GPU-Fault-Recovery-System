@@ -315,6 +315,17 @@ Deployments to 0 and clears the completed-cluster progress. When the same deploy
 `resume_phase` or treat a 0-replica Deployment as CPU-ready; it must redeploy the CPU control plane,
 then continue from the NLB, DNS/TLS and GPU data-plane gates.
 
+Another candidate's `bootstrap-*` state (including `bootstrap-cleaned`) that no longer carries an Aurora prerequisite repair journal
+is not the new candidate's resume plan: M-23 pins the persisted `approved_manifest_sha256` only for an unfinished bootstrap of the
+same `release_id`, and a new candidate pins the digest it renders itself; a same-candidate resume whose working tree changed is still
+refused with `changed between plan and apply`. The new candidate takes the state over with one checkpoint when it records its
+prerequisite repair journal: the checkpoint writes the new candidate's identity and approved/rendered digests, clears the completed
+clusters and resets `resume_phase` to `bootstrap-started`; `bootstrap-failed`, `bootstrap-cleanup-*` and `bootstrap-cleaned` keep their
+phase and cleanup steps (the new candidate finishes the cleanup the old attempt still owes), and every other phase restarts from
+`bootstrap-started`. The database origin proof stays, and the replaced state's identity goes into the journal and, after adoption, into
+`bootstrap_prerequisite_predecessor`. Until the journal is adopted, a taken-over state lends no CPU checkpoint or completed clusters
+and gets no live readiness check of a 0-replica CPU.
+
 Regional upgrade writes `preflight`, artifact upload, schema, registry, CPU, data plane and verify
 progress into the release state. When the high-level deploy sees the same uncommitted release in `failed` or at any persisted
 upgrade checkpoint, it must enter resume rather than reclassify as NOOP based on the current partial objects. An explicit

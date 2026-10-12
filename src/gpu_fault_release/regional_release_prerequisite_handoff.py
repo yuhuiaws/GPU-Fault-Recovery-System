@@ -7,6 +7,14 @@ an orphan over a committed release; that candidate never returns, because a
 release id is a digest of the tree, so the next candidate retires the orphan
 (``validate_upgrade_repair_handoff``). Both restore the original refresher
 from the journal's snapshot before anything of the new candidate is applied.
+
+A bootstrap that adopted its repair leaves no journal to hand off, only the
+state of its failed, interrupted or cleaned attempt. The next candidate takes
+that state over when it records its own journal (``foreign_bootstrap_baseline``):
+the journal hashes its baseline and every later bootstrap checkpoint stamps
+the new candidate's identity, so a baseline still naming the old candidate
+would drift before adoption, and the old candidate's approved digest is never
+the new candidate's plan (M-23).
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from gpu_fault_release.regional_release_diff import (
 )
 from gpu_fault_release.regional_release_images import require_digest_pinned_image
 from gpu_fault_release.regional_release_prerequisite_baseline import (
+    _valid_bootstrap_progress,
     validated_prerequisite_baseline,
 )
 from gpu_fault_release.regional_release_state import _write_state
@@ -35,6 +44,20 @@ if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease
 
 HANDOFF_AUDIT_KEY = "bootstrap_prerequisite_handoff"
+PREDECESSOR_AUDIT_KEY = "bootstrap_prerequisite_predecessor"
+# Phases whose cleanup the bootstrap entry still owes (a cleanup in progress,
+# or a failure that auto-rollback cleans): a takeover keeps them and their
+# steps so that cleanup still runs. Every other phase is projected to the
+# ``bootstrap-started`` checkpoint the new candidate would write first.
+_OWED_CLEANUP_PHASES = frozenset(
+    {
+        "bootstrap-failed",
+        "bootstrap-cleanup-started",
+        "bootstrap-cleanup-progress",
+        "bootstrap-cleanup-failed",
+        "bootstrap-cleaned",
+    }
+)
 _CLEANUP_STEPS = {
     "installer-jobs-cancelled",
     "gpu-scaled-down",
@@ -175,12 +198,14 @@ def validate_bootstrap_repair_handoff(
     return record
 
 
-def candidate_bootstrap_baseline(
-    release: RegionalRelease, state: dict[str, Any]
+def _project_bootstrap_state(
+    release: RegionalRelease, state: dict[str, Any], phase: str, **progress: Any
 ) -> dict[str, Any]:
     """Project the existing state writer without a live checkpoint or narration."""
     if "previous" not in state or state["previous"] is not None:
-        raise ReleaseError("bootstrap prerequisite handoff has a previous application")
+        raise ReleaseError(
+            "bootstrap prerequisite predecessor has a previous application"
+        )
     projected = copy.copy(release)
     projected.runner = copy.copy(release.runner)
     projected.runner.dry_run = True
@@ -190,15 +215,70 @@ def candidate_bootstrap_baseline(
     # previous=None keeps this dry-run projection independent of snapshot I/O.
     _write_state(
         projected,
-        "bootstrap-started",
+        phase,
         previous=None,
         transaction_committed=False,
         completed_cluster_ids=[],
-        bootstrap_cleanup_completed_steps=[],
-        bootstrap_cleanup_failure=None,
         resume_phase="bootstrap-started",
+        **progress,
     )
     return projected.state
+
+
+def candidate_bootstrap_baseline(
+    release: RegionalRelease, state: dict[str, Any]
+) -> dict[str, Any]:
+    """The handoff successor's baseline: a fresh start under this candidate."""
+    return _project_bootstrap_state(
+        release,
+        state,
+        "bootstrap-started",
+        bootstrap_cleanup_completed_steps=[],
+        bootstrap_cleanup_failure=None,
+    )
+
+
+def foreign_bootstrap_baseline(
+    release: RegionalRelease, state: dict[str, Any]
+) -> dict[str, Any]:
+    """Take over another candidate's journal-less bootstrap state.
+
+    The result is what this candidate's own first checkpoint would write: its
+    identity and approved digest, no completed clusters and a fresh resume
+    phase. Cleanup the old attempt still owes keeps its phase and steps, and
+    the database origin and safety proof stay, so the empty-database proof the
+    first bootstrap recorded still authorizes this one.
+    """
+    owed = state.get("phase") in _OWED_CLEANUP_PHASES
+    projected = _project_bootstrap_state(
+        release,
+        state,
+        str(state["phase"]) if owed else "bootstrap-started",
+        bootstrap_cleanup_completed_steps=(
+            copy.deepcopy(state.get("bootstrap_cleanup_completed_steps", []))
+            if owed
+            else []
+        ),
+        bootstrap_cleanup_failure=(
+            state.get("bootstrap_cleanup_failure") if owed else None
+        ),
+    )
+    if not _valid_bootstrap_progress(projected):
+        raise ReleaseError("foreign bootstrap predecessor progress is invalid")
+    return projected
+
+
+def predecessor_audit(state: dict[str, Any]) -> dict[str, Any]:
+    """What a takeover replaced; the journal and then the adopted state keep it."""
+    return {
+        "release_id": state.get("release_id"),
+        "phase": state.get("phase"),
+        "resume_phase": state.get("resume_phase"),
+        "approved_manifest_sha256": state.get("approved_manifest_sha256"),
+        "rendered_manifest_sha256": state.get("rendered_manifest_sha256"),
+        "state_sha256": canonical_sha256(state),
+        "taken_over_at": datetime.now(UTC).isoformat(),
+    }
 
 
 def bootstrap_handoff_audit(record: dict[str, Any]) -> dict[str, Any]:
