@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from gpu_fault.admin.aws_commands import FinalSnapshotPolicy
 from gpu_fault.admin.bootstrap_common import BootstrapError
@@ -20,6 +20,10 @@ UNINSTALL_PHASES = (
     "CPU_VERIFIED",
     "READY_TO_DELETE_AURORA",
     "AURORA_DELETE_IN_PROGRESS",
+    # Last: the ownership label (``cluster_scope.OWNERSHIP_LABEL``) leaves the
+    # node groups of every GPU cluster the site listed (``ownership_release``),
+    # after everything that still selected nodes by the live label.
+    "OWNERSHIP_RELEASED",
     "COMPLETED",
 )
 
@@ -43,10 +47,38 @@ class UninstallRequest:
     final_snapshot_policy: FinalSnapshotPolicy = "retain"
     reset_database: bool = False
     repository_root_override: bool = False
+    #: ``--keep-ownership-label``: the last phase records the label as
+    #: ``retained`` on every GPU cluster instead of releasing it. Not part of
+    #: the journal identity: a resume stuck at that phase may add it.
+    keep_ownership_label: bool = False
+
+    @classmethod
+    def from_arguments(cls, site: RenderedSite, arguments: Any) -> UninstallRequest:
+        """The request the parsed ``gpu-fault-admin uninstall`` arguments describe.
+
+        Flags an older namespace lacks default to their off state, so a driver
+        built against the previous argument set still constructs a request.
+        """
+
+        return cls(
+            site=site,
+            cpu_disposition=arguments.cpu_cluster,
+            confirmation=arguments.confirm,
+            final_snapshot_policy=arguments.aurora_final_snapshot,
+            reset_database=bool(arguments.reset_database),
+            repository_root_override=bool(
+                getattr(arguments, "accept_repository_root_override", False)
+            ),
+            keep_ownership_label=bool(
+                getattr(arguments, "keep_ownership_label", False)
+            ),
+        )
 
     def __post_init__(self) -> None:
         if not isinstance(self.repository_root_override, bool):
             raise BootstrapError("repository_root_override must be a boolean")
+        if not isinstance(self.keep_ownership_label, bool):
+            raise BootstrapError("keep_ownership_label must be a boolean")
         if self.cpu_disposition not in {"keep", "delete"}:
             raise BootstrapError("invalid CPU cluster disposition")
         if self.final_snapshot_policy not in {"retain", "skip"}:

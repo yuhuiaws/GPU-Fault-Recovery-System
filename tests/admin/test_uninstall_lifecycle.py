@@ -90,23 +90,60 @@ class Harness(CommandRunner):
         self.fail_cpu = False
         self.fail_aurora = False
         self.fail_cleanup: BaseException | None = None
+        self.fail_ownership_release = False
         self.no_mutations = False
         self.database_resource_id = "cluster-resource"
         self.namespace_uid = "namespace-old"
         monkeypatch.setattr(lifecycle, "ResourceCleaner", lambda _site: self)
+        monkeypatch.setattr(lifecycle, "release_site_ownership", self.release_ownership)
         monkeypatch.setattr(
             lifecycle, "fetch_installation_resource_registry", self.export
         )
         monkeypatch.setattr(lifecycle, "sync_installation_resource_snapshot", self.sync)
         monkeypatch.setattr(lifecycle, "bounded_command", self.kubectl)
 
-    def request(self, *, delete: bool = False, reset: bool = False) -> UninstallRequest:
+    def request(
+        self, *, delete: bool = False, reset: bool = False, keep_label: bool = False
+    ) -> UninstallRequest:
         return UninstallRequest(
             self.site,
             "delete" if delete else "keep",
             "DELETE_CPU_CONTROL_PLANE" if delete else "UNINSTALL_GPU_FAULT",
             reset_database=reset,
+            keep_ownership_label=keep_label,
         )
+
+    def release_ownership(
+        self, request: UninstallRequest, runner: CommandRunner
+    ) -> dict[str, Any]:
+        assert runner is self, "the release uses the uninstall's own runner"
+        assert not self.no_mutations, (
+            "completed uninstall replay must not release the label again"
+        )
+        assert self.state()["phase"] == "AURORA_DELETE_IN_PROGRESS", (
+            "the ownership label is released last, after the Aurora phase"
+        )
+        self.events.append("ownership-release")
+        if self.fail_ownership_release:
+            self.fail_ownership_release = False
+            raise BootstrapError("injected ownership release failure")
+        outcome = "retained" if request.keep_ownership_label else "released"
+        return {
+            "label": "gpu-fault.io/control-plane",
+            "outcome": outcome,
+            "clusters": [
+                {
+                    "cluster_id": "gpu-a",
+                    "eks_cluster_arn": "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a",
+                    "hyperpod_cluster_name": "hp-gpu-a",
+                    "provider": "hyperpod",
+                    "cluster": "hp-gpu-a",
+                    "outcome": outcome,
+                    "groups": [{"name": "spot-p5en", "outcome": outcome}],
+                    "nodepools": [],
+                }
+            ],
+        }
 
     def state(self) -> dict[str, Any]:
         state = json.loads(

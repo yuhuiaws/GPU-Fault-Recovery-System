@@ -42,6 +42,10 @@ from gpu_fault.admin.resource_registry import (
     write_installation_resource_snapshot,
 )
 from gpu_fault.admin.site import RenderedSite, materialized_release_config
+from gpu_fault.admin.uninstall_ownership import (
+    ownership_summary as _ownership_summary,
+    release_site_ownership,
+)
 from gpu_fault.admin.uninstall_spares import release_declared_spares
 from gpu_fault.admin.uninstall_override import (
     cleanup_shell_environment,
@@ -1128,6 +1132,7 @@ def _finish_uninstall(
     *,
     kubernetes_result: dict[str, int],
     gpu_records: int,
+    runner: CommandRunner,
 ) -> dict[str, Any]:
     aurora_cluster = next(
         resource
@@ -1139,10 +1144,9 @@ def _finish_uninstall(
         cpu_disposition=request.cpu_disposition,
         reset_database=request.reset_database,
     )
-    if state["phase"] == "COMPLETED":
-        final = load_installation_resource_snapshot(
-            state_path.parent / "installation-resources-final.json"
-        )
+    final_path = state_path.parent / "installation-resources-final.json"
+    if _reached(state, "OWNERSHIP_RELEASED"):
+        final = load_installation_resource_snapshot(final_path)
         if final.digest() != state.get("final_registry_sha256"):
             raise BootstrapError("completed uninstall snapshot changed")
         final_snapshot = next(
@@ -1187,7 +1191,6 @@ def _finish_uninstall(
     ):
         raise BootstrapError("retained final snapshot is missing from uninstall state")
     final = _sealed_snapshot(snapshot.site_id, verified)
-    final_path = state_path.parent / "installation-resources-final.json"
     residuals = [
         resource.resource_key
         for resource in verified
@@ -1211,17 +1214,24 @@ def _finish_uninstall(
     preserved = sum(
         resource.status is InstallationResourceStatus.PRESERVED for resource in verified
     )
-    if state["phase"] != "COMPLETED":
+    if not _reached(state, "OWNERSHIP_RELEASED"):
         write_installation_resource_snapshot(request.site, final, path=final_path)
+        # Last: every phase before still selected nodes by the live label. A
+        # refused write leaves the phase at AURORA_DELETE_IN_PROGRESS; the
+        # rerun re-verifies the (idempotent) Aurora deletion and lands here.
+        released = release_site_ownership(request, runner)
         _transition(
             state_path,
             state,
-            "COMPLETED",
+            "OWNERSHIP_RELEASED",
             final_registry=str(final_path),
             final_registry_sha256=final.digest(),
-            delete_policy_residuals=0,
+            ownership_release=released,
         )
+    if state["phase"] != "COMPLETED":
+        _transition(state_path, state, "COMPLETED", delete_policy_residuals=0)
     return {
+        "ownership_label": _ownership_summary(state.get("ownership_release")),
         "cpu_cluster": request.cpu_disposition,
         "gpu_clusters": "preserved",
         "gpu_cluster_records_verified": gpu_records,
@@ -1419,6 +1429,7 @@ def _uninstall_locked(
         state,
         kubernetes_result=kubernetes_result,
         gpu_records=gpu_records,
+        runner=active_runner,
     )
 
 
