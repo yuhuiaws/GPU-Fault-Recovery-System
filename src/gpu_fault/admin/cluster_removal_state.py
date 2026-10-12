@@ -22,6 +22,11 @@ from gpu_fault.admin.process_supervisor import ProcessSupervisionLost
 from gpu_fault.admin.site import IDENTIFIER_PATTERN, RenderedSite
 
 SCHEMA_VERSION = 2
+#: The last step: the ownership label (``cluster_scope.OWNERSHIP_LABEL``)
+#: leaves the node groups the site selected for the cluster
+#: (``ownership_release``). It runs after every step that still selects
+#: nodes by the live label, so a resume that lands here never re-lists them.
+OWNERSHIP_RELEASE_STEP = "OWNERSHIP_RELEASED"
 STEP_DEPENDENCIES = {
     "DISCOVERED": (),
     "CONTROL_REGISTRY_DRAINING": ("DISCOVERED",),
@@ -34,7 +39,12 @@ STEP_DEPENDENCIES = {
     "SITE_UPDATED": ("SITE_COMMIT_STARTED",),
     "RELEASE_STATE_UPDATED": ("SITE_UPDATED",),
     "VERIFIED": ("RELEASE_STATE_UPDATED",),
+    OWNERSHIP_RELEASE_STEP: ("VERIFIED",),
 }
+#: A journal COMPLETED before the release step existed: the label was never
+#: released (``ownership_release.stale_ownership_claims`` reports it), and the
+#: journal stays readable as the tombstone it is.
+LEGACY_COMPLETED_STEPS = frozenset(STEP_DEPENDENCIES) - {OWNERSHIP_RELEASE_STEP}
 
 
 @contextmanager
@@ -166,7 +176,7 @@ def read_removal_state(path: Path) -> dict[str, Any]:
         or phase in STEP_DEPENDENCIES
         and phase not in completed
         or phase == "COMPLETED"
-        and set(completed) != STEP_DEPENDENCIES.keys()
+        and set(completed) not in (STEP_DEPENDENCIES.keys(), LEGACY_COMPLETED_STEPS)
     ):
         raise BootstrapError("remove-cluster state has an invalid phase")
     if "DISCOVERED" in completed:
@@ -321,6 +331,34 @@ def resolve_saved_removal(site: RenderedSite, gpu_cluster_arn: str) -> str | Non
     return matches[0] if matches else None
 
 
+def ownership_release_summary(state: dict[str, Any]) -> dict[str, Any]:
+    """What the release step recorded: outcome and the groups per outcome.
+
+    A journal without the step (COMPLETED before it existed) reports the
+    outcome ``unreleased``: the label is still on the groups the site
+    selected, which ``status`` and ``node-scope`` show as a stale claim.
+    """
+
+    evidence = (state.get("evidence") or {}).get(OWNERSHIP_RELEASE_STEP)
+    if not isinstance(evidence, dict):
+        return {"outcome": "unreleased", "label": "gpu-fault.io/control-plane"}
+    by_outcome: dict[str, list[str]] = {}
+    for item in [*evidence.get("groups", []), *evidence.get("nodepools", [])]:
+        if isinstance(item, dict) and item.get("outcome") in {
+            "released",
+            "retained",
+            "manual",
+        }:
+            by_outcome.setdefault(str(item["outcome"]), []).append(str(item["name"]))
+    return {
+        "outcome": evidence.get("outcome"),
+        "label": evidence.get("label"),
+        "released_groups": by_outcome.get("released", []),
+        "retained_groups": by_outcome.get("retained", []),
+        "manual": by_outcome.get("manual", []),
+    }
+
+
 def removal_result(
     site: RenderedSite,
     cluster_id: str,
@@ -336,4 +374,5 @@ def removal_result(
         "state_file": str(state_path),
         "cpu_control_plane": "PRESERVED",
         "gpu_cluster": "PRESERVED",
+        "ownership_label": ownership_release_summary(state),
     }

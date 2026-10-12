@@ -35,6 +35,10 @@ from gpu_fault.admin.cluster_removal_preserved import (
     verify_preserved_gpu_eks,
     verify_preserved_hyperpod,
 )
+from gpu_fault.admin.cluster_removal_ownership import (
+    gpu_kubectl as _gpu_kubectl,
+    release_ownership as _release_ownership,
+)
 from gpu_fault.admin.cluster_removal_network import (
     cluster_network as _cluster_network,
     detach_network as _detach_network,
@@ -54,6 +58,7 @@ from gpu_fault.admin.cluster_removal_resources import (
     target_resource_plan,
 )
 from gpu_fault.admin.cluster_removal_state import (
+    OWNERSHIP_RELEASE_STEP,
     allowed_registry_lifecycles,
     canonical_digest,
     cleanup_config_sha256,
@@ -119,6 +124,9 @@ class RemoveClusterRequest:
     cluster_id: str
     confirmation: str
     gpu_cluster_arn: str | None = None
+    #: ``--keep-ownership-label``: record the label as ``retained`` in the last
+    #: step; not journal identity, so a resume stuck at that step may add it.
+    keep_ownership_label: bool = False
 
 
 def _target(
@@ -210,17 +218,6 @@ def _state(
     request: RemoveClusterRequest,
 ) -> tuple[Path, Path, dict[str, Any]]:
     return load_removal_state(request.site, request.cluster_id)
-
-
-def _gpu_kubectl(site: RenderedSite, target: dict[str, Any]) -> list[str]:
-    command = ["kubectl"]
-    kubeconfig = site.release_config.get("gpu_kubeconfig") or site.environment.get(
-        "KUBECONFIG"
-    )
-    if kubeconfig:
-        command.extend(["--kubeconfig", str(kubeconfig)])
-    command.extend(["--context", str(target["context"])])
-    return command
 
 
 def _cpu_kubectl(site: RenderedSite) -> list[str]:
@@ -1153,7 +1150,12 @@ def _discover_removal(
     )
     ResourceCleaner(request.site).validate_supported(planned_resources)
     node_uids: dict[str, str] = {}
-    nodes = _target_nodes(request.site, target, identities=node_uids)
+    # Past VERIFIED only the ownership release is left, and the release itself
+    # takes the nodes out of the live selector: the saved node set stands.
+    if saved and _done(state, "VERIFIED"):
+        nodes, node_uids = list(saved["nodes"]), dict(saved["node_uids"])
+    else:
+        nodes = _target_nodes(request.site, target, identities=node_uids)
     token = Path(str(target["token_file"]))
     try:
         token_sha256 = hashlib.sha256(token.read_bytes()).hexdigest()
@@ -1477,6 +1479,11 @@ def _execute_removal(
                 "gpu_cluster_preserved": True,
             },
         )
+    if not _done(state, OWNERSHIP_RELEASE_STEP):
+        # Last: everything before selected nodes by the live label; a refused
+        # write leaves the phase at VERIFIED and the rerun lands here again.
+        released = _release_ownership(request, target, active_runner)
+        _complete(state_path, state, OWNERSHIP_RELEASE_STEP, released)
 
     state["phase"] = "COMPLETED"
     state["updated_at"] = datetime.now(timezone.utc).isoformat()

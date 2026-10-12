@@ -1,0 +1,736 @@
+"""Releasing ``gpu-fault.io/control-plane`` when a GPU cluster is de-registered.
+
+The world modelled: site ``test-site`` owns the GPU node group ``gpu-ng`` of
+the plain EKS cluster ``gpu-eks`` (the CPU group ``cpu-ng`` was never
+labelled) and the instance group ``spot-p5en`` of the HyperPod cluster
+``hp-gpu`` (the ``controller`` group was never labelled). ``remove-cluster``
+and ``uninstall`` end with the release step this module pins: exactly the
+ownership label leaves exactly the groups the site selected, nothing is
+written when the provider is mid-update, and a refused write names the manual
+command.
+"""
+
+from __future__ import annotations
+
+import copy
+import json
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from gpu_fault.admin import ownership_release as release
+from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.cluster_removal_state import SCHEMA_VERSION
+from gpu_fault.admin.site import load_site
+from gpu_fault.cluster_scope import OWNERSHIP_LABEL
+from tests.admin.test_admin_site import site_file
+
+SITE_ID = "test-site"
+REGION = "us-east-1"
+EKS_TARGET = {
+    "cluster_id": "gpu-e",
+    "provider": "eks-managed",
+    "eks_cluster_arn": f"arn:aws:eks:{REGION}:123456789012:cluster/gpu-eks",
+    "hyperpod_cluster_name": "",
+    "context": "gpu-eks-context",
+}
+HP_TARGET = {
+    "cluster_id": "gpu-a",
+    "provider": "hyperpod",
+    "eks_cluster_arn": f"arn:aws:eks:{REGION}:123456789012:cluster/gpu-a",
+    "hyperpod_cluster_name": "hp-gpu",
+    "context": "gpu-a-context",
+}
+KUBECTL = [
+    "kubectl",
+    "--kubeconfig",
+    "/secure/gpu.kubeconfig",
+    "--context",
+    "gpu-eks-context",
+]
+LIFECYCLE = {"SourceS3Uri": "s3://lifecycle/", "OnCreate": "on_create.sh"}
+ROLE = "arn:aws:iam::123456789012:role/hyperpod-execution"
+TAINTS = [{"Key": "nvidia.com/gpu", "Value": "true", "Effect": "NoSchedule"}]
+NODEPOOL_PATCH = '[{"op":"remove","path":"/spec/template/metadata/labels/gpu-fault.io~1control-plane"}]'
+
+
+def _nodegroup(labels: dict[str, str], *, status: str = "ACTIVE") -> dict[str, Any]:
+    return {
+        "status": status,
+        "instanceTypes": ["p5en.48xlarge"],
+        "labels": dict(labels),
+    }
+
+
+def _instance_group(
+    name: str,
+    labels: dict[str, str],
+    *,
+    desired: dict[str, str] | None = None,
+    instance_type: str = "ml.p5en.48xlarge",
+    **overrides: Any,
+) -> dict[str, Any]:
+    group: dict[str, Any] = {
+        "InstanceGroupName": name,
+        "InstanceType": instance_type,
+        "CurrentCount": 2,
+        "TargetCount": 2,
+        "Status": "InService",
+        "LifeCycleConfig": dict(LIFECYCLE),
+        "ExecutionRole": ROLE,
+        "ThreadsPerCore": 1,
+        "InstanceStorageConfigs": [{"EbsVolumeConfig": {"VolumeSizeInGB": 500}}],
+        "OnStartDeepHealthChecks": ["InstanceStress"],
+        "CurrentImageId": "ami-current",
+        "DesiredImageId": "ami-current",
+        "KubernetesConfig": {
+            "CurrentLabels": dict(labels),
+            "DesiredLabels": dict(labels if desired is None else desired),
+            "CurrentTaints": copy.deepcopy(TAINTS),
+            "DesiredTaints": copy.deepcopy(TAINTS),
+        },
+    }
+    group.update(overrides)
+    return group
+
+
+class FakeAws:
+    """``aws`` and ``kubectl`` answers whose label state the update calls change.
+
+    An EKS release converges after ``converge_after`` describes (the node group
+    reports ``UPDATING`` in between); a HyperPod release first shows up in
+    ``DesiredLabels`` and reaches ``CurrentLabels`` after ``converge_after``
+    describes, as the service applies it asynchronously.
+    """
+
+    def __init__(
+        self,
+        *,
+        nodegroups: dict[str, dict[str, Any]] | None = None,
+        hyperpod: dict[str, Any] | None = None,
+        nodepools: list[dict[str, Any]] | None = None,
+        no_karpenter: bool = False,
+        converge_after: int = 2,
+        deny: frozenset[str] = frozenset(),
+        never_converge: bool = False,
+    ) -> None:
+        self.calls: list[list[str]] = []
+        self.nodegroups = copy.deepcopy(nodegroups or {})
+        self.hyperpod = copy.deepcopy(hyperpod)
+        self.nodepools = nodepools or []
+        self.no_karpenter = no_karpenter
+        self.converge_after = converge_after
+        self.deny = deny
+        self.never_converge = never_converge
+        self.pending: dict[str, int] = {}
+        self.sleeps: list[float] = []
+        self.update_specs: list[list[dict[str, Any]]] = []
+
+    def sleep(self, seconds: float) -> None:
+        self.sleeps.append(seconds)
+
+    # --- aws ---------------------------------------------------------------
+
+    def aws_json(
+        self, region: str, *arguments: str, mutate: bool = False, **_options: Any
+    ) -> dict[str, Any]:
+        self.calls.append(["aws", *arguments, "--region", region])
+        service, operation = arguments[0], arguments[1]
+        if operation in self.deny:
+            raise BootstrapError(
+                f"aws {service} {operation} failed (exit 254): An error occurred "
+                f"(AccessDeniedException) when calling the operation: not authorized"
+            )
+        if (service, operation) == ("eks", "list-nodegroups"):
+            return {"nodegroups": sorted(self.nodegroups)}
+        if (service, operation) == ("eks", "describe-nodegroup"):
+            name = arguments[arguments.index("--nodegroup-name") + 1]
+            document = copy.deepcopy(self.nodegroups[name])
+            self._tick(name, document["labels"])
+            if name in self.pending:
+                document["status"] = "UPDATING"
+            return {"nodegroup": {"nodegroupName": name, **document}}
+        if (service, operation) == ("eks", "update-nodegroup-config"):
+            assert mutate, "a label write is a mutation"
+            name = arguments[arguments.index("--nodegroup-name") + 1]
+            labels = arguments[arguments.index("--labels") + 1]
+            assert labels == f"removeLabels={OWNERSHIP_LABEL}", labels
+            self.pending[name] = self.converge_after
+            return {"update": {"id": "u-1", "status": "InProgress"}}
+        if (service, operation) == ("sagemaker", "describe-cluster"):
+            assert self.hyperpod is not None, "no HyperPod cluster in this world"
+            document = copy.deepcopy(self.hyperpod)
+            for group in document["InstanceGroups"]:
+                kubernetes = group.get("KubernetesConfig") or {}
+                self._tick(group["InstanceGroupName"], kubernetes.get("CurrentLabels"))
+            return document
+        if (service, operation) == ("sagemaker", "update-cluster"):
+            assert mutate, "a label write is a mutation"
+            assert self.hyperpod is not None, "no HyperPod cluster in this world"
+            specs = json.loads(arguments[arguments.index("--instance-groups") + 1])
+            self.update_specs.append(specs)
+            for spec in specs:
+                group = next(
+                    item
+                    for item in self.hyperpod["InstanceGroups"]
+                    if item["InstanceGroupName"] == spec["InstanceGroupName"]
+                )
+                group["KubernetesConfig"]["DesiredLabels"] = dict(
+                    spec["KubernetesConfig"]["Labels"]
+                )
+                self.pending[spec["InstanceGroupName"]] = self.converge_after
+            return {"ClusterArn": self.hyperpod["ClusterArn"]}
+        raise AssertionError(f"unexpected aws call {service} {operation}")
+
+    def _tick(self, name: str, labels: dict[str, str] | None) -> None:
+        """Advance a pending release of ``name`` by one describe."""
+
+        if name not in self.pending or self.never_converge:
+            return
+        self.pending[name] -= 1
+        if self.pending[name] <= 0:
+            del self.pending[name]
+            if name in self.nodegroups:
+                self.nodegroups[name]["labels"].pop(OWNERSHIP_LABEL, None)
+            if self.hyperpod is not None:
+                for group in self.hyperpod["InstanceGroups"]:
+                    if group["InstanceGroupName"] == name:
+                        group["KubernetesConfig"]["CurrentLabels"].pop(
+                            OWNERSHIP_LABEL, None
+                        )
+        if labels is not None and name not in self.pending:
+            labels.pop(OWNERSHIP_LABEL, None)
+
+    # --- kubectl -----------------------------------------------------------
+
+    def run(self, arguments: list[str], **_options: Any) -> str:
+        self.calls.append(list(arguments))
+        assert arguments[0] == "kubectl" and "get" in arguments, arguments
+        assert release.KARPENTER_NODEPOOL_RESOURCE in arguments, arguments
+        if self.no_karpenter:
+            raise BootstrapError(
+                "kubectl failed (exit 1): error: the server doesn't have a resource "
+                'type "nodepools"'
+            )
+        return json.dumps({"items": self.nodepools})
+
+
+def _eks_world(**kwargs: Any) -> FakeAws:
+    return FakeAws(
+        nodegroups={
+            "gpu-ng": _nodegroup({OWNERSHIP_LABEL: SITE_ID, "node-type": "gpu"}),
+            "cpu-ng": _nodegroup({"node-type": "cpu"}),
+        },
+        no_karpenter=True,
+        **kwargs,
+    )
+
+
+def _hyperpod_world(**kwargs: Any) -> FakeAws:
+    return FakeAws(
+        hyperpod={
+            "ClusterName": "hp-gpu",
+            "ClusterArn": f"arn:aws:sagemaker:{REGION}:123456789012:cluster/hpgpu01",
+            "ClusterStatus": "InService",
+            "InstanceGroups": [
+                _instance_group(
+                    "spot-p5en", {OWNERSHIP_LABEL: SITE_ID, "team": "research"}
+                ),
+                _instance_group(
+                    "controller", {}, instance_type="ml.m5.2xlarge", TargetCount=1
+                ),
+            ],
+        },
+        **kwargs,
+    )
+
+
+def _release(world: FakeAws, target: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
+    kubectl = kwargs.pop("kubectl", KUBECTL if target is EKS_TARGET else None)
+    return release.release_cluster_ownership(
+        world,  # type: ignore[arg-type]
+        region=REGION,
+        site_id=SITE_ID,
+        target=target,
+        kubectl=kubectl,
+        sleep=world.sleep,
+        **kwargs,
+    )
+
+
+def _updates(world: FakeAws) -> list[list[str]]:
+    return [
+        call
+        for call in world.calls
+        if call[0] == "aws" and call[2] in {"update-nodegroup-config", "update-cluster"}
+    ]
+
+
+# --- EKS managed node groups ---------------------------------------------------
+
+
+def test_eks_release_removes_only_the_ownership_label_and_waits_for_it() -> None:
+    world = _eks_world()
+
+    evidence = _release(world, EKS_TARGET)
+
+    assert _updates(world) == [
+        [
+            "aws",
+            "eks",
+            "update-nodegroup-config",
+            "--cluster-name",
+            "gpu-eks",
+            "--nodegroup-name",
+            "gpu-ng",
+            "--labels",
+            f"removeLabels={OWNERSHIP_LABEL}",
+            "--region",
+            REGION,
+        ]
+    ], "exactly the labelled GPU group is written, with the exact removeLabels call"
+    assert world.nodegroups["gpu-ng"]["labels"] == {"node-type": "gpu"}, (
+        "every other label of the group stays"
+    )
+    assert world.nodegroups["cpu-ng"]["labels"] == {"node-type": "cpu"}
+    assert evidence["outcome"] == release.RELEASED
+    assert evidence["provider"] == "eks-managed" and evidence["cluster"] == "gpu-eks"
+    by_name = {item["name"]: item for item in evidence["groups"]}
+    assert by_name["gpu-ng"]["before"] == SITE_ID
+    assert by_name["gpu-ng"]["after"] is None
+    assert by_name["gpu-ng"]["outcome"] == release.RELEASED
+    assert by_name["gpu-ng"]["command"] == release.release_command(
+        "eks-managed", cluster="gpu-eks", group="gpu-ng"
+    )
+    assert by_name["cpu-ng"]["outcome"] == release.UNLABELLED
+    assert evidence["nodepools"] == [], "no Karpenter CRD on this cluster"
+    assert world.sleeps, "the step waited for describe-nodegroup to drop the key"
+    assert evidence["converged_after_seconds"] >= 0
+    assert evidence["operator_action"] == "eks:UpdateNodegroupConfig"
+
+
+def test_eks_release_is_idempotent_once_the_label_is_gone() -> None:
+    world = FakeAws(
+        nodegroups={"gpu-ng": _nodegroup({"node-type": "gpu"})}, no_karpenter=True
+    )
+
+    evidence = _release(world, EKS_TARGET)
+
+    assert _updates(world) == [], "nothing to release, nothing written"
+    assert evidence["outcome"] == release.RELEASED
+    assert evidence["groups"][0]["outcome"] == release.UNLABELLED
+    assert world.sleeps == [], "no wait without a write"
+
+
+def test_eks_release_leaves_another_sites_label_alone() -> None:
+    world = FakeAws(
+        nodegroups={"gpu-ng": _nodegroup({OWNERSHIP_LABEL: "other-site"})},
+        no_karpenter=True,
+    )
+
+    evidence = _release(world, EKS_TARGET)
+
+    assert _updates(world) == [], "a label naming another site is not ours to remove"
+    assert evidence["groups"][0]["outcome"] == release.FOREIGN
+    assert evidence["groups"][0]["before"] == "other-site"
+    assert evidence["outcome"] == release.RELEASED
+
+
+def test_eks_release_refuses_a_node_group_that_is_mid_update() -> None:
+    world = FakeAws(
+        nodegroups={
+            "gpu-ng": _nodegroup({OWNERSHIP_LABEL: SITE_ID}, status="UPDATING")
+        },
+        no_karpenter=True,
+    )
+
+    with pytest.raises(BootstrapError, match="UPDATING"):
+        _release(world, EKS_TARGET)
+
+    assert _updates(world) == [], "fail closed: nothing is written mid-update"
+
+
+def test_eks_release_denied_fails_closed_with_the_manual_command() -> None:
+    world = _eks_world(deny=frozenset({"update-nodegroup-config"}))
+
+    with pytest.raises(BootstrapError) as failure:
+        _release(world, EKS_TARGET)
+
+    message = str(failure.value)
+    assert "AccessDeniedException" in message
+    assert "eks:UpdateNodegroupConfig" in message, "names the missing operator action"
+    assert release.release_command(
+        "eks-managed", cluster="gpu-eks", group="gpu-ng"
+    ) in (message), "the exact manual command is in the refusal"
+    assert release.KEEP_FLAG in message, "the opt-out is the other way out"
+    assert world.nodegroups["gpu-ng"]["labels"][OWNERSHIP_LABEL] == SITE_ID
+
+
+def test_keep_ownership_label_records_retained_and_writes_nothing() -> None:
+    world = _eks_world()
+
+    evidence = _release(world, EKS_TARGET, keep=True)
+
+    assert _updates(world) == []
+    assert evidence["outcome"] == release.RETAINED
+    assert release.KEEP_FLAG in evidence["reason"]
+    by_name = {item["name"]: item for item in evidence["groups"]}
+    assert by_name["gpu-ng"]["outcome"] == release.RETAINED
+    assert by_name["gpu-ng"]["after"] == SITE_ID
+    assert by_name["cpu-ng"]["outcome"] == release.UNLABELLED
+    assert world.sleeps == []
+
+
+def test_release_convergence_is_bounded() -> None:
+    world = _eks_world(never_converge=True)
+    clock = iter(float(value) for value in range(0, 10_000, 100))
+
+    with pytest.raises(BootstrapError, match="did not converge"):
+        _release(
+            world,
+            EKS_TARGET,
+            timeout_seconds=300,
+            interval_seconds=100,
+            clock=lambda: next(clock),
+        )
+
+    assert len(_updates(world)) == 1, "the write happened once; the wait gave up"
+
+
+# --- HyperPod instance groups --------------------------------------------------
+
+
+def test_hyperpod_release_sends_the_full_definition_minus_the_label() -> None:
+    world = _hyperpod_world()
+
+    evidence = _release(world, HP_TARGET)
+
+    (update,) = _updates(world)
+    assert update[:5] == [
+        "aws",
+        "sagemaker",
+        "update-cluster",
+        "--cluster-name",
+        "hp-gpu",
+    ]
+    assert update[5] == "--instance-groups"
+    (specs,) = world.update_specs
+    assert specs == [
+        {
+            "InstanceGroupName": "spot-p5en",
+            "InstanceType": "ml.p5en.48xlarge",
+            "InstanceCount": 2,
+            "LifeCycleConfig": LIFECYCLE,
+            "ExecutionRole": ROLE,
+            "ThreadsPerCore": 1,
+            "InstanceStorageConfigs": [{"EbsVolumeConfig": {"VolumeSizeInGB": 500}}],
+            "OnStartDeepHealthChecks": ["InstanceStress"],
+            "ImageId": "ami-current",
+            "KubernetesConfig": {"Labels": {"team": "research"}, "Taints": TAINTS},
+        }
+    ], (
+        "the owned group alone, with its full current definition, InstanceCount "
+        "equal to TargetCount and only the ownership key removed from the labels"
+    )
+    group = world.hyperpod["InstanceGroups"][0]
+    assert group["KubernetesConfig"]["CurrentLabels"] == {"team": "research"}
+    assert group["KubernetesConfig"]["CurrentTaints"] == TAINTS
+    assert evidence["outcome"] == release.RELEASED
+    by_name = {item["name"]: item for item in evidence["groups"]}
+    assert by_name["spot-p5en"]["outcome"] == release.RELEASED
+    assert by_name["controller"]["outcome"] == release.UNLABELLED
+    assert evidence["operator_action"] == "sagemaker:UpdateCluster"
+    assert world.sleeps, "HyperPod applies the labels asynchronously; the step waited"
+    assert not any(call[0] == "kubectl" for call in world.calls), (
+        "HyperPod instance groups are the node groups; no Karpenter probe"
+    )
+
+
+@pytest.mark.parametrize(
+    "mutate, reason",
+    [
+        (lambda doc: doc.update(ClusterStatus="Updating"), "Updating"),
+        (lambda doc: doc["InstanceGroups"][0].update(Status="Updating"), "Updating"),
+        (lambda doc: doc["InstanceGroups"][0].update(CurrentCount=1), "CurrentCount"),
+        (
+            lambda doc: doc["InstanceGroups"][0]["KubernetesConfig"][
+                "DesiredLabels"
+            ].update(team="platform"),
+            "DesiredLabels",
+        ),
+        (
+            lambda doc: doc["InstanceGroups"][0]["KubernetesConfig"].update(
+                DesiredTaints=[]
+            ),
+            "DesiredTaints",
+        ),
+        (
+            lambda doc: doc["InstanceGroups"][0].update(DesiredImageId="ami-new"),
+            "image",
+        ),
+        (
+            lambda doc: doc["InstanceGroups"][0].update(FutureField={"x": 1}),
+            "FutureField",
+        ),
+        (lambda doc: doc["InstanceGroups"][0].pop("ExecutionRole"), "ExecutionRole"),
+    ],
+    ids=[
+        "cluster-updating",
+        "group-updating",
+        "counts-differ",
+        "other-label-pending",
+        "taints-pending",
+        "image-pending",
+        "unknown-field",
+        "missing-required-field",
+    ],
+)
+def test_hyperpod_release_refuses_to_write_when_update_cluster_could_do_more(
+    mutate: Any, reason: str
+) -> None:
+    world = _hyperpod_world()
+    mutate(world.hyperpod)
+
+    with pytest.raises(BootstrapError) as failure:
+        _release(world, HP_TARGET)
+
+    assert reason in str(failure.value), str(failure.value)
+    assert release.release_command("hyperpod", cluster="hp-gpu", group="spot-p5en") in (
+        str(failure.value)
+    ), "the refusal names the manual command"
+    assert _updates(world) == [], "fail closed: UpdateCluster can scale or re-image"
+
+
+def test_hyperpod_in_flight_release_only_waits() -> None:
+    world = _hyperpod_world(converge_after=1)
+    group = world.hyperpod["InstanceGroups"][0]
+    group["KubernetesConfig"]["DesiredLabels"] = {"team": "research"}
+    world.pending["spot-p5en"] = 2
+
+    evidence = _release(world, HP_TARGET)
+
+    assert _updates(world) == [], (
+        "DesiredLabels already lack the key: the previous attempt's release is "
+        "converging, so the step waits instead of writing again"
+    )
+    assert evidence["groups"][0]["outcome"] == release.RELEASED
+    assert group["KubernetesConfig"]["CurrentLabels"] == {"team": "research"}
+
+
+def test_hyperpod_release_denied_fails_closed_with_the_manual_command() -> None:
+    world = _hyperpod_world(deny=frozenset({"update-cluster"}))
+
+    with pytest.raises(BootstrapError) as failure:
+        _release(world, HP_TARGET)
+
+    message = str(failure.value)
+    assert "sagemaker:UpdateCluster" in message
+    assert release.release_command("hyperpod", cluster="hp-gpu", group="spot-p5en") in (
+        message
+    )
+    assert release.KEEP_FLAG in message
+
+
+# --- Karpenter NodePools -------------------------------------------------------
+
+
+def _nodepool(name: str, labels: dict[str, str]) -> dict[str, Any]:
+    return {
+        "metadata": {"name": name},
+        "spec": {"template": {"metadata": {"labels": labels}}},
+    }
+
+
+def test_karpenter_nodepool_labels_are_reported_manual_never_edited() -> None:
+    world = FakeAws(
+        nodegroups={"gpu-ng": _nodegroup({OWNERSHIP_LABEL: SITE_ID})},
+        nodepools=[
+            _nodepool("gpu-pool", {OWNERSHIP_LABEL: SITE_ID, "tier": "gpu"}),
+            _nodepool("cpu-pool", {"tier": "cpu"}),
+            _nodepool("other-pool", {OWNERSHIP_LABEL: "another-site"}),
+        ],
+    )
+
+    evidence = _release(world, EKS_TARGET)
+
+    assert len(_updates(world)) == 1, "the managed node group is still released"
+    assert evidence["outcome"] == release.MANUAL
+    assert evidence["nodepools"] == [
+        {
+            "name": "gpu-pool",
+            "before": SITE_ID,
+            "outcome": release.MANUAL,
+            "edit": (
+                "kubectl --kubeconfig /secure/gpu.kubeconfig --context gpu-eks-context "
+                f"patch nodepool gpu-pool --type=json -p '{NODEPOOL_PATCH}'"
+            ),
+        }
+    ], "only the NodePool carrying this site's label, with the exact edit"
+    assert not any("patch" in call for call in world.calls), (
+        "customer provisioning CRDs are never edited"
+    )
+
+
+def test_karpenter_nodepools_are_retained_too_under_the_keep_flag() -> None:
+    world = FakeAws(
+        nodegroups={"gpu-ng": _nodegroup({OWNERSHIP_LABEL: SITE_ID})},
+        nodepools=[_nodepool("gpu-pool", {OWNERSHIP_LABEL: SITE_ID})],
+    )
+
+    evidence = _release(world, EKS_TARGET, keep=True)
+
+    assert evidence["outcome"] == release.RETAINED
+    assert evidence["nodepools"][0]["outcome"] == release.RETAINED
+    assert _updates(world) == []
+
+
+def test_a_kubectl_failure_other_than_a_missing_crd_fails_closed() -> None:
+    class Broken(FakeAws):
+        def run(self, arguments: list[str], **_options: Any) -> str:
+            raise BootstrapError(
+                "kubectl failed (exit 1): Unable to connect to the server"
+            )
+
+    world = Broken(nodegroups={"gpu-ng": _nodegroup({OWNERSHIP_LABEL: SITE_ID})})
+
+    with pytest.raises(BootstrapError, match="Unable to connect"):
+        _release(world, EKS_TARGET)
+
+    assert _updates(world) == [], "the NodePool read comes before any write"
+
+
+# --- manual commands -----------------------------------------------------------
+
+
+def test_release_commands_are_the_exact_provider_calls() -> None:
+    assert release.release_command(
+        "eks-managed", cluster="gpu-eks", group="gpu-ng"
+    ) == (
+        "aws eks update-nodegroup-config --cluster-name gpu-eks --nodegroup-name "
+        f"gpu-ng --labels removeLabels={OWNERSHIP_LABEL}"
+    )
+    assert release.release_command("hyperpod", cluster="hp-gpu", group="spot-p5en") == (
+        "aws sagemaker update-cluster --cluster-name hp-gpu --instance-groups "
+        "'<the full current definition of spot-p5en with "
+        f"KubernetesConfig.Labels minus {OWNERSHIP_LABEL}>'"
+    )
+    assert release.nodepool_release_edit(["kubectl", "--context", "c"], "pool") == (
+        f"kubectl --context c patch nodepool pool --type=json -p '{NODEPOOL_PATCH}'"
+    )
+    assert release.OPERATOR_ACTIONS == {
+        "eks-managed": "eks:UpdateNodegroupConfig",
+        "hyperpod": "sagemaker:UpdateCluster",
+    }
+
+
+# --- stale claims --------------------------------------------------------------
+
+
+def _tombstone(state_dir: Path, *, released: bool, legacy: bool = False) -> None:
+    from gpu_fault.admin.cluster_removal_state import STEP_DEPENDENCIES
+
+    site = load_site(state_dir / "site.yaml")
+    (target,) = [dict(item) for item in site.release_config["clusters"]]
+    steps = sorted(STEP_DEPENDENCIES)
+    if legacy:
+        steps = [step for step in steps if step != release.STEP]
+    evidence: dict[str, Any] = {
+        "DISCOVERED": {
+            "target": target,
+            "provider_identity": {
+                "eks_arn": target["eks_cluster_arn"],
+                "hyperpod_arn": f"arn:aws:sagemaker:{REGION}:123456789012:cluster/hp",
+            },
+            "namespace_uid": "ns-uid",
+            "registry_digest": "d" * 64,
+            "token_sha256": "t" * 64,
+        }
+    }
+    if not legacy:
+        evidence[release.STEP] = {
+            "outcome": release.RELEASED if released else release.RETAINED,
+            "groups": [],
+        }
+    path = state_dir / "remove-cluster" / target["cluster_id"] / "state.json"
+    path.parent.mkdir(parents=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "site_id": SITE_ID,
+                "cluster_id": target["cluster_id"],
+                "site_identity": {
+                    key: str(site.release_config[key])
+                    for key in ("site_name", "aws_region", "cpu_eks_arn", "namespace")
+                },
+                "target": target,
+                "attempt_id": "a" * 32,
+                "phase": "COMPLETED",
+                "completed_steps": steps,
+                "evidence": evidence,
+                "updated_at": "now",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+
+@pytest.mark.parametrize("legacy", [False, True], ids=["released", "legacy-journal"])
+def test_stale_claims_name_the_removed_clusters_groups_still_carrying_the_label(
+    tmp_path: Path, legacy: bool
+) -> None:
+    path = site_file(tmp_path)
+    _tombstone(path.parent, released=True, legacy=legacy)
+    world = FakeAws(
+        hyperpod={
+            "ClusterName": "hp-gpu-a",
+            "ClusterArn": f"arn:aws:sagemaker:{REGION}:123456789012:cluster/hp",
+            "ClusterStatus": "InService",
+            "InstanceGroups": [
+                _instance_group("spot-p5en", {OWNERSHIP_LABEL: SITE_ID}),
+                _instance_group("controller", {}, instance_type="ml.m5.2xlarge"),
+            ],
+        }
+    )
+
+    findings = release.stale_ownership_claims(load_site(path), world)  # type: ignore[arg-type]
+
+    assert len(findings) == 1
+    finding = findings[0]
+    assert finding["cluster_id"] == "gpu-a"
+    assert finding["deregistered_by"] == "remove-cluster"
+    assert finding["groups"] == ["spot-p5en"], "only the group still claiming this site"
+    assert finding["release_commands"] == [
+        release.release_command("hyperpod", cluster="hp-gpu-a", group="spot-p5en")
+    ]
+    assert finding["recorded_outcome"] == (None if legacy else release.RELEASED)
+    lines = release.stale_claim_lines(findings)
+    assert len(lines) == 1 and "stale ownership claim" in lines[0]
+    assert "gpu-a" in lines[0] and "spot-p5en" in lines[0]
+    assert release.stale_claim_lines([]) == []
+
+
+def test_no_stale_claim_when_the_removed_clusters_groups_are_clean(
+    tmp_path: Path,
+) -> None:
+    path = site_file(tmp_path)
+    _tombstone(path.parent, released=True)
+    world = FakeAws(
+        hyperpod={
+            "ClusterName": "hp-gpu-a",
+            "ClusterArn": f"arn:aws:sagemaker:{REGION}:123456789012:cluster/hp",
+            "ClusterStatus": "InService",
+            "InstanceGroups": [_instance_group("spot-p5en", {"team": "research"})],
+        }
+    )
+
+    assert release.stale_ownership_claims(load_site(path), world) == []  # type: ignore[arg-type]
+
+
+def test_no_tombstone_means_no_aws_read(tmp_path: Path) -> None:
+    path = site_file(tmp_path)
+    world = FakeAws()
+
+    assert release.stale_ownership_claims(load_site(path), world) == []  # type: ignore[arg-type]
+    assert world.calls == [], "a site that de-registered nothing reads nothing"

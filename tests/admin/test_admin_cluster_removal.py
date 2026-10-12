@@ -449,6 +449,12 @@ def _install_removal_harness(monkeypatch, calls: list) -> None:
         "_run_control_plane_unregister",
         lambda *_args: calls.append("registry-secret"),
     )
+
+    def release_ownership(_request, _target, _runner):
+        calls.append("ownership-release")
+        return {"outcome": "released", "groups": [], "nodepools": []}
+
+    monkeypatch.setattr(admin_cluster_removal, "_release_ownership", release_ownership)
     monkeypatch.setattr(
         admin_cluster_removal,
         "_detach_network",

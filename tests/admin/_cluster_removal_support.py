@@ -161,6 +161,27 @@ class RemovalScenario:
             self.event("keys")
             return 1
 
+        def release_ownership(request, _target, _runner):
+            self.event("ownership-release")
+            outcome = "retained" if request.keep_ownership_label else "released"
+            return {
+                "label": "gpu-fault.io/control-plane",
+                "site_id": "test-site",
+                "provider": "hyperpod",
+                "cluster": "hp-gpu-a",
+                "outcome": outcome,
+                "groups": [
+                    {
+                        "name": "spot-p5en",
+                        "kind": "instance group",
+                        "before": "test-site",
+                        "after": "test-site" if request.keep_ownership_label else None,
+                        "outcome": outcome,
+                    }
+                ],
+                "nodepools": [],
+            }
+
         scenario = self
 
         class Cleaner:
@@ -208,6 +229,7 @@ class RemovalScenario:
             ("_request_target_namespace_deletion", delete_namespace),
             ("_detach_network", detach),
             ("_remove_node_action_keys", keys),
+            ("_release_ownership", release_ownership),
         ):
             monkeypatch.setattr(removal, name, function)
         for name, event in (
@@ -240,12 +262,15 @@ class RemovalScenario:
         elif name == "unregister":
             self.lifecycle = None
 
-    def request(self, arn: str = EKS_ARN) -> RemoveClusterRequest:
+    def request(
+        self, arn: str = EKS_ARN, *, keep_ownership_label: bool = False
+    ) -> RemoveClusterRequest:
         return RemoveClusterRequest(
             site=load_site(self.path),
             cluster_id="gpu-a",
             confirmation="REMOVE_GPU_CLUSTER",
             gpu_cluster_arn=arn,
+            keep_ownership_label=keep_ownership_label,
         )
 
     def state(self) -> dict[str, Any]:

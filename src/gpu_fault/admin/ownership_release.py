@@ -1,0 +1,886 @@
+"""Releasing the ownership label when a GPU cluster is de-registered.
+
+A site selects a GPU cluster's nodes through the node groups that carry
+``cluster_scope.OWNERSHIP_LABEL=<site id>`` (``bootstrap_ownership``). The
+label is declared once, up front, by the administrator -- and until this
+module existed nothing ever took it back: ``remove-cluster`` and ``uninstall``
+cleaned the cluster's Kubernetes objects and node annotations and left the
+node groups claiming a control plane that had disowned them. A later deploy
+of the same site id silently re-adopted them without a fresh declaration, and
+another site was refused ("one GPU cluster belongs to one site") until an
+administrator edited the label by hand.
+
+Both commands now end with an OWNERSHIP RELEASE step, journaled like every
+other step (``cluster_removal_state.OWNERSHIP_RELEASE_STEP``; the uninstall
+phase of the same name), that removes exactly ``OWNERSHIP_LABEL`` from exactly
+the groups carrying this site's id:
+
+* an EKS managed node group through ``aws eks update-nodegroup-config
+  --labels removeLabels=gpu-fault.io/control-plane`` (EKS propagates the
+  change to the group's existing nodes);
+* a HyperPod instance group through ``aws sagemaker update-cluster`` with the
+  group's *full* current definition and ``KubernetesConfig.Labels`` minus the
+  key -- ``InstanceCount`` is the current ``TargetCount``, and the step refuses
+  to write (nothing is sent) while the cluster or the group has an update in
+  progress, ``CurrentCount`` differs from ``TargetCount``, another label,
+  taint or image change is pending, or the group carries a field this module
+  does not know how to carry over, because ``UpdateCluster`` can scale and
+  re-image a group;
+* a Karpenter ``NodePool`` whose template labels carry the id is a customer
+  provisioning CRD: it is never edited, the step completes with the outcome
+  ``manual`` and records the exact ``kubectl patch``.
+
+Every other label is left alone (never ``sagemaker.amazonaws.com/cluster-name``,
+never the ``gpu-fault.io/*`` node labels the Kubernetes cleanup strips); a
+group labelled for another site is not ours and is only reported. The step
+waits, bounded, until the provider shows the key gone (``describe-nodegroup``
+labels; HyperPod ``DesiredLabels`` then ``CurrentLabels``, applied
+asynchronously) and records before/after evidence per group. A refused write
+-- most often an operator identity without ``eks:UpdateNodegroupConfig`` /
+``sagemaker:UpdateCluster`` -- fails closed with the manual commands; the
+journal resumes at this step. ``--keep-ownership-label`` records the outcome
+``retained`` instead, for an administrator who intends to re-join soon.
+
+``stale_ownership_claims`` is the read side: the groups of a de-registered
+cluster (a COMPLETED ``remove-cluster`` tombstone, a COMPLETED uninstall) that
+still carry this site's id, which ``status`` and ``node-scope`` report as a
+finding.
+"""
+
+from __future__ import annotations
+
+import json
+import time
+from collections.abc import Callable, Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from gpu_fault.admin.bootstrap_common import BootstrapError, CommandRunner
+from gpu_fault.admin.bootstrap_ownership import (
+    GROUP_KINDS,
+    NodeGroupFacts,
+    eks_nodegroup_facts,
+    hyperpod_instance_group_facts,
+)
+from gpu_fault.admin.cluster_removal_state import (
+    OWNERSHIP_RELEASE_STEP,
+    read_removal_state,
+)
+from gpu_fault.admin.process_supervisor import ensure_supervision_safe
+from gpu_fault.admin.site import RenderedSite
+from gpu_fault.cluster_scope import OWNERSHIP_LABEL, ClusterProvider, cluster_provider
+
+__all__ = [
+    "FOREIGN",
+    "add_keep_label_flag",
+    "KARPENTER_NODEPOOL_RESOURCE",
+    "KEEP_FLAG",
+    "MANUAL",
+    "OPERATOR_ACTIONS",
+    "RELEASED",
+    "RETAINED",
+    "STEP",
+    "UNLABELLED",
+    "ClusterGroups",
+    "deregistered_clusters",
+    "describe_cluster_groups",
+    "hyperpod_instance_group_specification",
+    "nodepool_release_edit",
+    "release_cluster_ownership",
+    "release_command",
+    "require_hyperpod_writable",
+    "stale_claim_lines",
+    "stale_ownership_claims",
+    "status_findings",
+    "wait_for_label",
+]
+
+STEP = OWNERSHIP_RELEASE_STEP
+#: Outcomes of the step (``outcome`` of the evidence and of each group).
+RELEASED = "released"
+RETAINED = "retained"
+MANUAL = "manual"
+#: Per-group outcomes for groups the step had nothing to release from.
+UNLABELLED = "unlabelled"
+FOREIGN = "foreign"
+KEEP_FLAG = "--keep-ownership-label"
+#: The write action the operator's AWS identity needs per provider; the
+#: runtime roles (``bootstrap_iam_policies``) stay Describe-only.
+OPERATOR_ACTIONS: dict[str, str] = {
+    ClusterProvider.EKS_MANAGED.value: "eks:UpdateNodegroupConfig",
+    ClusterProvider.HYPERPOD.value: "sagemaker:UpdateCluster",
+}
+KARPENTER_NODEPOOL_RESOURCE = "nodepools.karpenter.sh"
+#: HyperPod applies ``KubernetesConfig`` labels asynchronously (about a minute
+#: observed); an EKS node group update takes a similar time. Ten minutes is
+#: the bound, not the expectation.
+CONVERGENCE_TIMEOUT_SECONDS = 600.0
+CONVERGENCE_INTERVAL_SECONDS = 10.0
+#: ``ClusterInstanceGroupDetails`` fields that ``ClusterInstanceGroupSpecification``
+#: takes verbatim; ``InstanceCount`` comes from ``TargetCount``, ``ImageId``
+#: from ``CurrentImageId`` and ``KubernetesConfig`` from the current labels and
+#: taints. A details field outside these two tables refuses the write: this
+#: module carries a definition it understands or none at all.
+HYPERPOD_SPEC_FIELDS: tuple[str, ...] = (
+    "InstanceGroupName",
+    "InstanceType",
+    "LifeCycleConfig",
+    "ExecutionRole",
+    "ThreadsPerCore",
+    "InstanceStorageConfigs",
+    "OnStartDeepHealthChecks",
+    "TrainingPlanArn",
+    "OverrideVpcConfig",
+    "ScheduledUpdateConfig",
+    "EnvironmentConfig",
+)
+HYPERPOD_REQUIRED_FIELDS: tuple[str, ...] = (
+    "InstanceGroupName",
+    "InstanceType",
+    "LifeCycleConfig",
+    "ExecutionRole",
+)
+HYPERPOD_STATUS_FIELDS: tuple[str, ...] = (
+    "CurrentCount",
+    "TargetCount",
+    "Status",
+    "TrainingPlanStatus",
+    "CurrentImageId",
+    "DesiredImageId",
+    "KubernetesConfig",
+)
+_NODEPOOL_LABEL_POINTER = "/spec/template/metadata/labels/" + OWNERSHIP_LABEL.replace(
+    "~", "~0"
+).replace("/", "~1")
+
+
+@dataclass(frozen=True)
+class ClusterGroups:
+    """One GPU cluster's node groups as the provider describes them now."""
+
+    provider: ClusterProvider
+    #: The provider's bare cluster name: EKS cluster name or HyperPod name.
+    cluster: str
+    facts: tuple[NodeGroupFacts, ...]
+    #: The raw provider document per group name (the HyperPod full definition).
+    documents: Mapping[str, Mapping[str, Any]]
+    #: HyperPod ``ClusterStatus``; empty for EKS.
+    cluster_status: str = ""
+
+    @property
+    def display(self) -> str:
+        kind = "HyperPod" if self.provider is ClusterProvider.HYPERPOD else "EKS"
+        return f"{kind} cluster {self.cluster}"
+
+    @property
+    def group_kind(self) -> str:
+        return GROUP_KINDS[self.provider.value]
+
+    def owned_by(self, site_id: str) -> list[NodeGroupFacts]:
+        return [item for item in self.facts if item.ownership == site_id]
+
+
+def _text_map(value: object) -> dict[str, str]:
+    if not isinstance(value, Mapping):
+        return {}
+    return {str(key): str(item) for key, item in value.items()}
+
+
+def describe_cluster_groups(
+    runner: CommandRunner, *, region: str, target: Mapping[str, Any]
+) -> ClusterGroups:
+    """The node groups of ``target`` (a site cluster entry) as described now."""
+
+    provider = cluster_provider(target.get("provider"))
+    if provider is ClusterProvider.EKS_MANAGED:
+        eks_name = str(target["eks_cluster_arn"]).rsplit("/", 1)[-1]
+        names = sorted(
+            str(item)
+            for item in runner.aws_json(
+                region, "eks", "list-nodegroups", "--cluster-name", eks_name
+            ).get("nodegroups", [])
+            if item
+        )
+        documents: dict[str, Mapping[str, Any]] = {}
+        for name in names:
+            described = runner.aws_json(
+                region,
+                "eks",
+                "describe-nodegroup",
+                "--cluster-name",
+                eks_name,
+                "--nodegroup-name",
+                name,
+            ).get("nodegroup")
+            documents[name] = described if isinstance(described, Mapping) else {}
+        return ClusterGroups(
+            provider=provider,
+            cluster=eks_name,
+            facts=tuple(eks_nodegroup_facts(documents[name]) for name in names),
+            documents=documents,
+        )
+    hyperpod_name = str(target.get("hyperpod_cluster_name") or "")
+    described = runner.aws_json(
+        region, "sagemaker", "describe-cluster", "--cluster-name", hyperpod_name
+    )
+    groups = [
+        group
+        for group in described.get("InstanceGroups") or ()
+        if isinstance(group, Mapping)
+    ]
+    return ClusterGroups(
+        provider=provider,
+        cluster=hyperpod_name,
+        facts=tuple(
+            hyperpod_instance_group_facts(group, cluster_name=hyperpod_name)
+            for group in groups
+        ),
+        documents={
+            str(group.get("InstanceGroupName") or ""): group for group in groups
+        },
+        cluster_status=str(described.get("ClusterStatus") or ""),
+    )
+
+
+def add_keep_label_flag(parser: Any, *, scope: str) -> None:
+    """``--keep-ownership-label`` on ``remove-cluster`` and ``uninstall``.
+
+    ``scope`` names what the command would release: the node groups of the
+    removed cluster, or every GPU cluster's node groups for an uninstall.
+    """
+
+    parser.add_argument(
+        KEEP_FLAG,
+        action="store_true",
+        help=(
+            f"keep {OWNERSHIP_LABEL}=<site id> on {scope} (recorded as retained) "
+            "instead of releasing it in the last step; for a re-join soon. May be "
+            "added on a resume stuck at the release step"
+        ),
+    )
+
+
+# --- the manual commands ----------------------------------------------------------
+
+
+def release_command(
+    provider: ClusterProvider | str, *, cluster: str, group: str
+) -> str:
+    """The provider command that removes exactly the ownership label from ``group``."""
+
+    if cluster_provider(provider) is ClusterProvider.HYPERPOD:
+        return (
+            f"aws sagemaker update-cluster --cluster-name {cluster} "
+            f"--instance-groups '<the full current definition of {group} with "
+            f"KubernetesConfig.Labels minus {OWNERSHIP_LABEL}>'"
+        )
+    return (
+        f"aws eks update-nodegroup-config --cluster-name {cluster} "
+        f"--nodegroup-name {group} --labels removeLabels={OWNERSHIP_LABEL}"
+    )
+
+
+def nodepool_release_edit(kubectl: Sequence[str], name: str) -> str:
+    """The ``kubectl patch`` that drops the label from a Karpenter NodePool template."""
+
+    patch = json.dumps(
+        [{"op": "remove", "path": _NODEPOOL_LABEL_POINTER}], separators=(",", ":")
+    )
+    return " ".join(
+        [*kubectl, "patch", "nodepool", name, "--type=json", "-p", f"'{patch}'"]
+    )
+
+
+# --- HyperPod full definitions ----------------------------------------------------
+
+
+def hyperpod_instance_group_specification(
+    details: Mapping[str, Any], *, labels: Mapping[str, str]
+) -> dict[str, Any]:
+    """The ``ClusterInstanceGroupSpecification`` that keeps ``details`` as it is.
+
+    ``InstanceCount`` is the current ``TargetCount`` (never the live
+    ``CurrentCount``: a group mid-scale would be pinned at the wrong size),
+    ``ImageId`` the current image, ``KubernetesConfig.Taints`` the current
+    taints and ``KubernetesConfig.Labels`` exactly ``labels``. A missing
+    required field or a field outside the known tables raises: a definition
+    this module cannot carry over in full must not be sent at all.
+    """
+
+    name = str(details.get("InstanceGroupName") or "<instance group>")
+    missing = [key for key in HYPERPOD_REQUIRED_FIELDS if not details.get(key)]
+    if missing:
+        raise BootstrapError(
+            f"instance group {name} lacks {', '.join(missing)}; update-cluster "
+            "needs the full definition"
+        )
+    unknown = sorted(
+        key
+        for key in details
+        if key not in HYPERPOD_SPEC_FIELDS and key not in HYPERPOD_STATUS_FIELDS
+    )
+    if unknown:
+        raise BootstrapError(
+            f"instance group {name} carries {', '.join(unknown)}, which this "
+            "release does not know how to carry into update-cluster"
+        )
+    target_count = details.get("TargetCount")
+    if type(target_count) is not int or target_count < 0:
+        raise BootstrapError(f"instance group {name} has no integer TargetCount")
+    specification: dict[str, Any] = {}
+    for key in HYPERPOD_SPEC_FIELDS:
+        if key in details and details[key] is not None:
+            specification[key] = details[key]
+        if key == "InstanceType":
+            specification["InstanceCount"] = target_count
+    if details.get("CurrentImageId"):
+        specification["ImageId"] = details["CurrentImageId"]
+    kubernetes: dict[str, Any] = {"Labels": dict(labels)}
+    current = details.get("KubernetesConfig")
+    if isinstance(current, Mapping) and current.get("CurrentTaints") is not None:
+        kubernetes["Taints"] = current["CurrentTaints"]
+    specification["KubernetesConfig"] = kubernetes
+    return specification
+
+
+def _hyperpod_labels(
+    details: Mapping[str, Any],
+) -> tuple[dict[str, str], dict[str, str] | None]:
+    """``(CurrentLabels, DesiredLabels or None)`` of one instance group."""
+
+    kubernetes = details.get("KubernetesConfig")
+    kubernetes = kubernetes if isinstance(kubernetes, Mapping) else {}
+    current = _text_map(kubernetes.get("CurrentLabels"))
+    if not current and "CurrentLabels" not in kubernetes:
+        current = _text_map(kubernetes.get("Labels"))
+    desired = (
+        _text_map(kubernetes.get("DesiredLabels"))
+        if "DesiredLabels" in kubernetes
+        else None
+    )
+    return current, desired
+
+
+def _refuse(groups: ClusterGroups, group: str, reason: str) -> BootstrapError:
+    return BootstrapError(
+        f"cannot release {OWNERSHIP_LABEL} from {groups.group_kind} {group} of "
+        f"{groups.display}: {reason}; nothing was written. Release it by hand with "
+        + release_command(groups.provider, cluster=groups.cluster, group=group)
+        + f" once the update has finished, or rerun with {KEEP_FLAG}"
+    )
+
+
+def require_hyperpod_writable(groups: ClusterGroups, names: Sequence[str]) -> None:
+    """Refuse while UpdateCluster could do more than drop one label."""
+
+    if groups.cluster_status != "InService":
+        raise _refuse(
+            groups,
+            names[0],
+            f"the cluster is {groups.cluster_status or 'in an unknown state'} (an "
+            "update is in progress; UpdateCluster can scale or re-image a group)",
+        )
+    for name in names:
+        details = groups.documents.get(name) or {}
+        status = str(details.get("Status") or "InService")
+        if status != "InService":
+            raise _refuse(groups, name, f"the instance group is {status}")
+        current_count, target_count = (
+            details.get("CurrentCount"),
+            details.get("TargetCount"),
+        )
+        if current_count != target_count:
+            raise _refuse(
+                groups,
+                name,
+                f"CurrentCount {current_count} differs from TargetCount {target_count} "
+                "(the group is scaling)",
+            )
+        current, desired = _hyperpod_labels(details)
+        if desired is not None and desired != current:
+            pending_release = dict(current)
+            pending_release.pop(OWNERSHIP_LABEL, None)
+            if desired != pending_release:
+                raise _refuse(
+                    groups,
+                    name,
+                    f"DesiredLabels {json.dumps(desired, sort_keys=True)} differ from "
+                    f"CurrentLabels {json.dumps(current, sort_keys=True)} (a label "
+                    "change is still being applied)",
+                )
+        kubernetes = details.get("KubernetesConfig")
+        kubernetes = kubernetes if isinstance(kubernetes, Mapping) else {}
+        if "DesiredTaints" in kubernetes and kubernetes.get("DesiredTaints") != (
+            kubernetes.get("CurrentTaints")
+        ):
+            raise _refuse(groups, name, "DesiredTaints differ from CurrentTaints")
+        if details.get("DesiredImageId") and details.get("DesiredImageId") != (
+            details.get("CurrentImageId")
+        ):
+            raise _refuse(groups, name, "a group image change is pending")
+
+
+def _hyperpod_release_specifications(
+    groups: ClusterGroups, names: Sequence[str]
+) -> list[dict[str, Any]]:
+    specifications = []
+    for name in names:
+        details = groups.documents.get(name) or {}
+        current, _desired = _hyperpod_labels(details)
+        labels = {
+            key: value for key, value in current.items() if key != OWNERSHIP_LABEL
+        }
+        try:
+            specifications.append(
+                hyperpod_instance_group_specification(details, labels=labels)
+            )
+        except BootstrapError as exc:
+            raise _refuse(groups, name, str(exc)) from exc
+    return specifications
+
+
+# --- Karpenter NodePools ----------------------------------------------------------
+
+
+def _labelled_nodepools(
+    runner: CommandRunner, kubectl: Sequence[str], *, site_id: str
+) -> list[dict[str, Any]]:
+    """Karpenter NodePools whose template labels carry this site's id.
+
+    A cluster without the Karpenter CRD answers "the server doesn't have a
+    resource type"; anything else is an error of the read and fails closed.
+    """
+
+    try:
+        raw = runner.run(
+            [*kubectl, "get", KARPENTER_NODEPOOL_RESOURCE, "-o", "json"],
+            capture=True,
+            timeout_seconds=60,
+        )
+    except BootstrapError as exc:
+        if "doesn't have a resource type" in str(exc):
+            return []
+        raise
+    try:
+        items = json.loads(raw).get("items") if raw.strip() else []
+    except (json.JSONDecodeError, AttributeError) as exc:
+        raise BootstrapError("the Karpenter NodePool list is unreadable") from exc
+    found = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, Mapping):
+            continue
+        name = str(((item.get("metadata") or {}).get("name")) or "")
+        template = ((item.get("spec") or {}).get("template") or {}).get(
+            "metadata"
+        ) or {}
+        labels = _text_map(template.get("labels"))
+        if name and labels.get(OWNERSHIP_LABEL) == site_id:
+            found.append(
+                {
+                    "name": name,
+                    "before": site_id,
+                    "outcome": MANUAL,
+                    "edit": nodepool_release_edit(kubectl, name),
+                }
+            )
+    return found
+
+
+# --- convergence ----------------------------------------------------------------
+
+
+def wait_for_label(
+    runner: CommandRunner,
+    *,
+    region: str,
+    target: Mapping[str, Any],
+    names: Sequence[str],
+    value: str | None,
+    description: str,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    timeout_seconds: float = CONVERGENCE_TIMEOUT_SECONDS,
+    interval_seconds: float = CONVERGENCE_INTERVAL_SECONDS,
+) -> tuple[float, ClusterGroups]:
+    """Wait, bounded, until every group in ``names`` shows the label as ``value``.
+
+    ``None`` means absent. An EKS group converges when ``describe-nodegroup``
+    shows the labels and the group is ``ACTIVE`` again; a HyperPod group when
+    both ``DesiredLabels`` and ``CurrentLabels`` agree. Returns the seconds
+    waited and the last description.
+    """
+
+    started = clock()
+    while True:
+        ensure_supervision_safe()
+        groups = describe_cluster_groups(runner, region=region, target=target)
+        if all(_label_converged(groups, name, value) for name in names):
+            return clock() - started, groups
+        elapsed = clock() - started
+        if elapsed >= timeout_seconds:
+            pending = [
+                name for name in names if not _label_converged(groups, name, value)
+            ]
+            raise BootstrapError(
+                f"{description} did not converge within {timeout_seconds:.0f}s on "
+                f"{groups.group_kind}(s) {', '.join(pending)} of {groups.display}; "
+                "the provider is still applying it -- rerun the command, the "
+                "journal resumes at this step"
+            )
+        sleep(min(interval_seconds, max(timeout_seconds - elapsed, 0.0)))
+
+
+def _label_converged(groups: ClusterGroups, name: str, value: str | None) -> bool:
+    details = groups.documents.get(name)
+    if details is None:
+        # A group that disappeared carries no label any more.
+        return value is None
+    if groups.provider is ClusterProvider.EKS_MANAGED:
+        labels = _text_map(details.get("labels"))
+        return labels.get(OWNERSHIP_LABEL) == value and (
+            str(details.get("status") or "ACTIVE") == "ACTIVE"
+        )
+    current, desired = _hyperpod_labels(details)
+    return current.get(OWNERSHIP_LABEL) == value and (
+        desired is None or desired.get(OWNERSHIP_LABEL) == value
+    )
+
+
+# --- the step -------------------------------------------------------------------
+
+
+def _group_record(
+    groups: ClusterGroups, item: NodeGroupFacts, site_id: str
+) -> dict[str, Any]:
+    if item.ownership == site_id:
+        outcome = RELEASED
+    elif item.ownership is None:
+        outcome = UNLABELLED
+    else:
+        outcome = FOREIGN
+    return {
+        "name": item.name,
+        "kind": groups.group_kind,
+        "before": item.ownership,
+        "after": item.ownership,
+        "outcome": outcome,
+    }
+
+
+def release_cluster_ownership(
+    runner: CommandRunner,
+    *,
+    region: str,
+    site_id: str,
+    target: Mapping[str, Any],
+    keep: bool = False,
+    kubectl: Sequence[str] | None = None,
+    sleep: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    timeout_seconds: float = CONVERGENCE_TIMEOUT_SECONDS,
+    interval_seconds: float = CONVERGENCE_INTERVAL_SECONDS,
+) -> dict[str, Any]:
+    """Run the OWNERSHIP RELEASE step for one cluster; return its evidence.
+
+    Idempotent: a group that no longer carries the label needs no write, a
+    HyperPod group whose ``DesiredLabels`` already lack the key (a previous
+    attempt's release still converging) is only waited for. ``kubectl`` is
+    the cluster's own context prefix, used for the Karpenter NodePool read of
+    a plain EKS cluster; a HyperPod cluster's node groups are its instance
+    groups and no NodePool can carry its selector's cross-check label.
+    """
+
+    groups = describe_cluster_groups(runner, region=region, target=target)
+    owned = groups.owned_by(site_id)
+    nodepools: list[dict[str, Any]] = []
+    if kubectl is not None and groups.provider is ClusterProvider.EKS_MANAGED:
+        nodepools = _labelled_nodepools(runner, kubectl, site_id=site_id)
+    records = {item.name: _group_record(groups, item, site_id) for item in groups.facts}
+    evidence: dict[str, Any] = {
+        "label": OWNERSHIP_LABEL,
+        "site_id": site_id,
+        "provider": groups.provider.value,
+        "cluster": groups.cluster,
+        "operator_action": OPERATOR_ACTIONS[groups.provider.value],
+        "groups": list(records.values()),
+        "nodepools": nodepools,
+    }
+    if keep:
+        for item in owned:
+            records[item.name]["outcome"] = RETAINED
+        for pool in nodepools:
+            pool["outcome"] = RETAINED
+            pool.pop("edit", None)
+        evidence["outcome"] = RETAINED if owned or nodepools else RELEASED
+        evidence["reason"] = (
+            f"{KEEP_FLAG}: the administrator keeps the label for a re-join"
+            if owned or nodepools
+            else "no node group carried the label"
+        )
+        return evidence
+    names = [item.name for item in owned]
+    if names:
+        for name in names:
+            records[name]["command"] = release_command(
+                groups.provider, cluster=groups.cluster, group=name
+            )
+        to_write = _write_release(runner, groups, names, region=region)
+        waited, _after = wait_for_label(
+            runner,
+            region=region,
+            target=target,
+            names=names,
+            value=None,
+            description=f"the release of {OWNERSHIP_LABEL}",
+            sleep=sleep,
+            clock=clock,
+            timeout_seconds=timeout_seconds,
+            interval_seconds=interval_seconds,
+        )
+        for name in names:
+            records[name]["after"] = None
+            records[name]["written"] = name in to_write
+        evidence["converged_after_seconds"] = round(waited, 3)
+    evidence["outcome"] = MANUAL if nodepools else RELEASED
+    return evidence
+
+
+def _write_release(
+    runner: CommandRunner, groups: ClusterGroups, names: Sequence[str], *, region: str
+) -> list[str]:
+    """Send the provider writes for ``names``; return the groups actually written."""
+
+    action = OPERATOR_ACTIONS[groups.provider.value]
+    if groups.provider is ClusterProvider.EKS_MANAGED:
+        for name in names:
+            status = str((groups.documents.get(name) or {}).get("status") or "ACTIVE")
+            if status != "ACTIVE":
+                raise _refuse(groups, name, f"the node group is {status}")
+        written = []
+        for name in names:
+            _aws_write(
+                runner,
+                groups,
+                name,
+                region=region,
+                action=action,
+                arguments=(
+                    "eks",
+                    "update-nodegroup-config",
+                    "--cluster-name",
+                    groups.cluster,
+                    "--nodegroup-name",
+                    name,
+                    "--labels",
+                    f"removeLabels={OWNERSHIP_LABEL}",
+                ),
+            )
+            written.append(name)
+        return written
+    require_hyperpod_writable(groups, names)
+    pending = []
+    for name in names:
+        _current, desired = _hyperpod_labels(groups.documents.get(name) or {})
+        if desired is None or OWNERSHIP_LABEL in desired:
+            pending.append(name)
+    if not pending:
+        return []
+    specifications = _hyperpod_release_specifications(groups, pending)
+    _aws_write(
+        runner,
+        groups,
+        ", ".join(pending),
+        region=region,
+        action=action,
+        arguments=(
+            "sagemaker",
+            "update-cluster",
+            "--cluster-name",
+            groups.cluster,
+            "--instance-groups",
+            json.dumps(specifications, separators=(",", ":")),
+        ),
+    )
+    return pending
+
+
+def _aws_write(
+    runner: CommandRunner,
+    groups: ClusterGroups,
+    group: str,
+    *,
+    region: str,
+    action: str,
+    arguments: Sequence[str],
+) -> None:
+    try:
+        runner.aws_json(region, *arguments, mutate=True)
+    except BootstrapError as exc:
+        commands = "; ".join(
+            release_command(groups.provider, cluster=groups.cluster, group=name)
+            for name in group.split(", ")
+        )
+        raise BootstrapError(
+            f"could not release {OWNERSHIP_LABEL} from {groups.group_kind} {group} of "
+            f"{groups.display}: {exc}. The operator's AWS identity needs {action} on "
+            f"the cluster; release the label by hand with {commands} and rerun, or "
+            f"rerun with {KEEP_FLAG} to record it as retained"
+        ) from exc
+
+
+# --- stale claims -----------------------------------------------------------------
+
+
+def _cluster_entry(target: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "cluster_id": str(target.get("cluster_id") or ""),
+        "provider": cluster_provider(target.get("provider")).value,
+        "eks_cluster_arn": str(target.get("eks_cluster_arn") or ""),
+        "hyperpod_cluster_name": str(target.get("hyperpod_cluster_name") or ""),
+        "target": dict(target),
+    }
+
+
+def deregistered_clusters(site: RenderedSite) -> list[dict[str, Any]]:
+    """The clusters this site de-registered and what their journals recorded.
+
+    COMPLETED ``remove-cluster`` tombstones (one per cluster id) and, after a
+    COMPLETED uninstall, every cluster the site still lists. A journal that
+    cannot be read is reported with its error rather than skipped.
+    """
+
+    root = site.source.parent
+    items: list[dict[str, Any]] = []
+    for path in sorted((root / "remove-cluster").glob("*/state.json")):
+        try:
+            state = read_removal_state(path)
+        except BootstrapError as exc:
+            items.append(
+                {
+                    "cluster_id": path.parent.name,
+                    "deregistered_by": "remove-cluster",
+                    "error": str(exc),
+                }
+            )
+            continue
+        if state.get("phase") != "COMPLETED":
+            continue
+        recorded = (state.get("evidence") or {}).get(STEP)
+        items.append(
+            {
+                **_cluster_entry(state["target"]),
+                "deregistered_by": "remove-cluster",
+                "recorded_outcome": (
+                    recorded.get("outcome") if isinstance(recorded, Mapping) else None
+                ),
+            }
+        )
+    uninstall = root / "uninstall" / "state.json"
+    if uninstall.is_file():
+        try:
+            value = json.loads(uninstall.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            return [*items, {"deregistered_by": "uninstall", "error": str(exc)}]
+        if isinstance(value, dict) and value.get("phase") == "COMPLETED":
+            recorded = value.get("ownership_release")
+            per_cluster = {
+                str(item.get("cluster_id") or ""): item.get("outcome")
+                for item in (
+                    recorded.get("clusters") if isinstance(recorded, Mapping) else []
+                )
+                or []
+                if isinstance(item, Mapping)
+            }
+            for target in site.release_config["clusters"]:
+                entry = _cluster_entry(target)
+                items.append(
+                    {
+                        **entry,
+                        "deregistered_by": "uninstall",
+                        "recorded_outcome": per_cluster.get(entry["cluster_id"]),
+                    }
+                )
+    return items
+
+
+def stale_ownership_claims(
+    site: RenderedSite, runner: CommandRunner
+) -> list[dict[str, Any]]:
+    """De-registered clusters whose node groups still carry this site's id."""
+
+    site_id = str(site.release_config["site_name"])
+    region = str(site.release_config["aws_region"])
+    findings: list[dict[str, Any]] = []
+    for item in deregistered_clusters(site):
+        if "error" in item:
+            findings.append(
+                {**item, "site_id": site_id, "groups": [], "release_commands": []}
+            )
+            continue
+        try:
+            groups = describe_cluster_groups(
+                runner, region=region, target=item["target"]
+            )
+        except BootstrapError as exc:
+            findings.append(
+                {
+                    **{key: value for key, value in item.items() if key != "target"},
+                    "site_id": site_id,
+                    "error": str(exc),
+                    "groups": [],
+                    "release_commands": [],
+                }
+            )
+            continue
+        stale = [facts.name for facts in groups.owned_by(site_id)]
+        if not stale:
+            continue
+        findings.append(
+            {
+                **{key: value for key, value in item.items() if key != "target"},
+                "site_id": site_id,
+                "cluster": groups.cluster,
+                "group_kind": groups.group_kind,
+                "groups": stale,
+                "release_commands": [
+                    release_command(groups.provider, cluster=groups.cluster, group=name)
+                    for name in stale
+                ],
+            }
+        )
+    return findings
+
+
+def stale_claim_lines(findings: Sequence[Mapping[str, Any]]) -> list[str]:
+    """One readable line per finding, for ``status`` and ``node-scope``."""
+
+    lines = []
+    for finding in findings:
+        if finding.get("error"):
+            lines.append(
+                "stale ownership claim check: "
+                f"{finding.get('cluster_id') or finding.get('deregistered_by')} could "
+                f"not be read: {finding['error']}"
+            )
+            continue
+        lines.append(
+            f"stale ownership claim: {finding['deregistered_by']} de-registered "
+            f"{finding['cluster_id']} ({finding['provider']} {finding['cluster']}) but "
+            f"{finding['group_kind']}(s) {', '.join(finding['groups'])} still carry "
+            f"{OWNERSHIP_LABEL}={finding['site_id']}; release with "
+            + "; ".join(finding["release_commands"])
+        )
+    return lines
+
+
+def status_findings(
+    site: RenderedSite, runner: CommandRunner | None = None
+) -> list[str]:
+    """The stale-claim lines for ``status``; a failed read is itself a line."""
+
+    try:
+        return stale_claim_lines(
+            stale_ownership_claims(site, runner or CommandRunner())
+        )
+    except (BootstrapError, OSError, ValueError) as exc:
+        return [f"stale ownership claim check failed: {exc}"]
