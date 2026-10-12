@@ -12,6 +12,7 @@ running process directly comparable, and /v1/version publishes it.
 
 from __future__ import annotations
 
+import configparser
 import hashlib
 import json
 import os
@@ -25,7 +26,12 @@ from pathlib import Path
 import pytest
 
 from gpu_fault import module_digest
-from scripts.component_wheels import component_source_digest
+from scripts.component_wheels import MODULES, component_source_digest
+from scripts.manifest_entrypoints import (
+    MODULE_KINDS,
+    component_entrypoint_failures,
+    manifest_entrypoints,
+)
 from scripts.release_identity import canonical_sha256
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -300,3 +306,88 @@ def test_release_manifest_is_complete_and_no_sdist_exists() -> None:
     assert sorted(path.name for path in (ROOT / "dist").iterdir() if path.is_dir()) == [
         manifest["release_id"]
     ]
+
+
+def _wheel_modules(archive: zipfile.ZipFile) -> set[str]:
+    modules: set[str] = set()
+    for name in archive.namelist():
+        if not name.endswith(".py") or ".dist-info/" in name:
+            continue
+        parts = name[: -len(".py")].split("/")
+        if parts[-1] == "__init__":
+            parts = parts[:-1]
+        modules.add(".".join(parts))
+    return modules
+
+
+def _wheel_console_scripts(archive: zipfile.ZipFile) -> set[str]:
+    entry_points = next(
+        (name for name in archive.namelist() if name.endswith("/entry_points.txt")),
+        None,
+    )
+    if entry_points is None:
+        return set()
+    parser = configparser.ConfigParser()
+    parser.read_string(archive.read(entry_points).decode("utf-8"))
+    if not parser.has_section("console_scripts"):
+        return set()
+    return set(parser["console_scripts"])
+
+
+def test_built_wheels_resolve_every_name_their_manifests_launch(tmp_path: Path) -> None:
+    """The release whose api-ha Pods crash-looped on ``ModuleNotFoundError: No
+    module named 'gpu_fault.app.serve'`` had passed this file: the tests above
+    compare the source closure with itself, and the ``python -m`` launcher the
+    manifests run was in neither. A Pod installs the wheel, so the wheel's own
+    listing is what the manifests are checked against, and every module they
+    name is then imported from that wheel alone."""
+    manifest = release_manifest()
+    for component, entries in manifest_entrypoints(ROOT).items():
+        wheel = ROOT / manifest["components"][component]["wheel"]
+        with zipfile.ZipFile(wheel) as archive:
+            modules = _wheel_modules(archive)
+            scripts = _wheel_console_scripts(archive)
+        failures = component_entrypoint_failures(
+            component, modules=modules, scripts=scripts, module_paths=MODULES
+        )
+        assert failures == [], "\n".join(failures)
+        named = sorted(
+            {
+                entry.target
+                for entry in entries
+                if entry.kind in MODULE_KINDS and entry.target in MODULES
+            }
+        )
+        if not named:
+            continue
+        installed = tmp_path / f"{component}-installed"
+        subprocess.run(
+            [
+                sys.executable,
+                "-m",
+                "pip",
+                "install",
+                "--no-deps",
+                "--target",
+                str(installed),
+                str(wheel),
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        probe = (
+            "import importlib, importlib.util, sys\n"
+            "installed, names = sys.argv[1], sys.argv[2:]\n"
+            "for name in names:\n"
+            "    spec = importlib.util.find_spec(name)\n"
+            "    assert spec is not None and spec.origin, (name, 'not found')\n"
+            "    assert spec.origin.startswith(installed), (name, spec.origin)\n"
+            "    importlib.import_module(name)\n"
+        )
+        subprocess.run(
+            [sys.executable, "-c", probe, str(installed), *named],
+            env={**os.environ, "PYTHONPATH": str(installed)},
+            cwd=tmp_path,
+            check=True,
+        )

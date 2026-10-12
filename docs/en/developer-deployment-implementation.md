@@ -1922,6 +1922,21 @@ inventory rebuild only the deploy-host bundle and do not force a new Runtime Ima
 Application Python behaviour continues to be bound by the three component wheel SHAs and `module_digest`; removing the broad
 `src/**/*.py` from `runtime_image_inputs` does not bypass source verification.
 
+A component wheel's content is the import closure of that component's explicit `roots`, the modules its console
+scripts and entry points name, and its `include_globs` in `scripts/component_wheels.py`; the closure follows only
+`import` statements and the `"module:attr"` strings a registry holds. An entry point a manifest reaches by name
+alone, which no module imports, is invisible to it: `python -m <module>`, `python -c "import ..."`, the ASGI
+factory `module:attr` and console scripts in container commands. Such an entry point must be listed as an explicit
+root of its component (the launcher of the three control-plane roles, `gpu_fault.app.serve`, is a root of the
+control-plane wheel; `workflow_reconcile.py` goes through `include_globs`), otherwise the source checkout runs while
+the installed wheel lacks the module and the Pods restart on ModuleNotFoundError with the release gate green.
+`scripts/manifest_entrypoints.py` reads the container commands, exec probes and lifecycle hooks of the base and
+generated control-plane Deployments, the migration Jobs, the aurora refresh and the data-plane workloads, attributed
+to the component their PATH points at: `build_component` refuses to produce a wheel for a component with a missing
+entry point, `tests/test_component_wheel_closures.py` checks the source closure, and
+`tests/test_artifact_consistency.py` (`make artifact-check`) checks the built wheel's file listing and console script
+table once more and imports every named module from that wheel alone.
+
 `gpu_fault.admin.cli` and its dependency closure belong to the independent `gpu-fault-deploy-host` distribution.
 The `gpu-fault-control-plane` wheel and the Runtime Image must not contain the `gpu-fault-admin` entry point,
 `admin_cli.py` or `deploy-host-tools.json`. Therefore administrator CLI, bootstrap and source deploy

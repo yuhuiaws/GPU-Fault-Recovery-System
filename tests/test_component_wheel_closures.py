@@ -9,6 +9,7 @@ ModuleNotFoundError. The closure has to follow those references.
 
 from __future__ import annotations
 
+import dataclasses
 import sys
 from pathlib import Path
 
@@ -19,6 +20,7 @@ if str(ROOT / "scripts") not in sys.path:
     sys.path.insert(0, str(ROOT / "scripts"))
 
 import component_wheels  # noqa: E402
+import manifest_entrypoints  # noqa: E402
 
 REGISTRY_FACTORY_MODULES = (
     "gpu_fault.collectors.gpu.dcgm",
@@ -190,3 +192,232 @@ def test_node_runtime_does_not_ship_the_control_plane_orchestration_families() -
     ):
         assert module not in node_runtime, f"{module} is control-plane code"
         assert module in control_plane, f"the coordinator still composes {module}"
+
+
+ROLE_MANIFESTS = (
+    "deploy/control-plane/base/control-plane-deployment.yaml",
+    "deploy/control-plane/regional/generated/gpu-fault-api-ha-ingress.yaml",
+    "deploy/control-plane/regional/generated/gpu-fault-control-worker.yaml",
+    "deploy/control-plane/regional/generated/gpu-fault-telemetry-spool-worker.yaml",
+)
+LAUNCHER = "gpu_fault.app.serve"
+
+
+def test_the_control_plane_wheel_carries_the_role_launcher_module() -> None:
+    """The three control-plane roles start with ``python -m gpu_fault.app.serve``.
+    Nothing imports a ``-m`` launcher, so the closure walked from
+    ``gpu_fault.app`` never reached it: the first release carrying that
+    command shipped a control-plane wheel without ``serve.py``, every api-ha
+    Pod crash-looped on ModuleNotFoundError, and the gate had passed because
+    it only compared source closures with themselves."""
+    modules = component_wheels.component_modules("control_plane")
+    assert LAUNCHER in modules, "the -m launcher is an explicit control-plane root"
+    assert "gpu_fault.app.listener" in modules, "what the launcher imports ships too"
+
+
+@pytest.mark.parametrize("component", sorted(manifest_entrypoints.MANIFEST_COMPONENTS))
+def test_every_name_a_manifest_launches_resolves_inside_its_component_wheel(
+    component: str,
+) -> None:
+    """``python -m``, ``python -c "import ..."``, ``module:attr`` factories and
+    console scripts in the shipped manifests' container commands, probes and
+    hooks are all in the wheel the manifest's PATH installs from, and exist in
+    the source tree."""
+    definition = component_wheels.component_definition(component)
+    failures = component_wheels.manifest_entrypoint_failures(
+        component, component_wheels.component_modules(component), definition.scripts
+    )
+    assert failures == [], "\n".join(failures)
+
+
+def test_the_manifest_scan_sees_every_role_launcher_and_console_script() -> None:
+    """The scan has to find what the manifests run, or the check above passes
+    on nothing."""
+    found = manifest_entrypoints.manifest_entrypoints(ROOT)
+    control_plane = found["control_plane"]
+    launchers = {
+        entry.manifest
+        for entry in control_plane
+        if entry.kind == "module" and entry.target == LAUNCHER
+    }
+    assert launchers == set(ROLE_MANIFESTS), sorted(launchers)
+    factories = {
+        entry.manifest
+        for entry in control_plane
+        if entry.kind == "factory" and entry.target == "gpu_fault.app"
+    }
+    assert factories == set(ROLE_MANIFESTS), sorted(factories)
+    assert {
+        entry.target for entry in control_plane if entry.kind == "console_script"
+    } == {"gpu-fault-aurora-credential-refresh", "gpu-fault-store-migrate"}
+    executor = found["executor"]
+    assert {entry.target for entry in executor if entry.kind == "console_script"} == {
+        "gpu-fault-cluster-executor",
+        "gpu-fault-cluster-executor-readiness",
+        "gpu-fault-collector",
+        "gpu-fault-completion-watcher",
+        "gpu-fault-node-installer-reconciler",
+    }
+    named = [
+        entry for entry in executor if entry.kind in manifest_entrypoints.MODULE_KINDS
+    ]
+    assert named == [], "no data-plane container names a gpu_fault module directly"
+
+
+def test_the_scan_would_have_failed_the_release_whose_launcher_was_not_a_root() -> None:
+    """Replaying the live defect: with ``gpu_fault.app.serve`` removed from the
+    roots, the control-plane closure lacks the launcher and the check names
+    every role manifest that runs it, with the remedy."""
+    definition = component_wheels.component_definition("control_plane")
+    without = dataclasses.replace(
+        definition, roots=tuple(root for root in definition.roots if root != LAUNCHER)
+    )
+    modules = component_wheels.dependency_closure(
+        {
+            *without.roots,
+            *component_wheels.entrypoint_modules(without),
+            *component_wheels.extra_modules(without),
+        }
+    )
+    assert LAUNCHER not in modules, "the launcher is reached only through its root"
+    failures = component_wheels.manifest_entrypoint_failures(
+        "control_plane", modules, without.scripts
+    )
+    assert {line.split(" [", 1)[0] for line in failures} == set(ROLE_MANIFESTS), (
+        failures
+    )
+    assert all(LAUNCHER in line and "roots" in line for line in failures), failures
+
+
+SYNTHETIC_MANIFEST = """\
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: demo
+spec:
+  template:
+    spec:
+      initContainers:
+        - name: migrate
+          command: ["gpu-fault-store-migrate", "--schema-preflight"]
+      containers:
+        - name: api
+          command: ["/bin/sh", "-c"]
+          args:
+            - |-
+              if [ -x /opt/gpu-fault/control-plane/bin/python ]; then
+                set -- /opt/gpu-fault/control-plane/bin/python -m gpu_fault.app.serve
+              else
+                set -- python3 -m gpu_fault.app.serve
+              fi
+              exec "$@" gpu_fault.app:create_app --factory --port 8080
+          readinessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - import os, sys; from gpu_fault.app import liveness; sys.exit(0)
+          lifecycle:
+            preStop:
+              exec:
+                command: ["/bin/sh", "-c", "sleep 1 && gpu-fault-config drain"]
+        - name: worker
+          command: ["python3.12", "-I", "-X", "utf8", "-Wignore", "-m", "gpu_fault.jobs"]
+        - name: vendor
+          command: ["python", "-m", "uvicorn", "demo:app"]
+        - name: script
+          command: ["python", "/opt/tool.py", "-m", "gpu_fault.not_a_launcher"]
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: demo-config
+data:
+  note: python -m gpu_fault.not_in_a_container
+"""
+
+
+def _synthetic_manifest(tmp_path: Path) -> dict[str, tuple[str, ...]]:
+    (tmp_path / "workloads").mkdir()
+    (tmp_path / "workloads/demo.yaml").write_text(SYNTHETIC_MANIFEST, encoding="utf-8")
+    return {"demo": ("workloads/*.yaml",)}
+
+
+def test_the_scan_reads_shell_wrapped_direct_probe_and_hook_commands(
+    tmp_path: Path,
+) -> None:
+    found = manifest_entrypoints.manifest_entrypoints(
+        tmp_path, _synthetic_manifest(tmp_path)
+    )
+    entries = {(entry.container, entry.kind, entry.target) for entry in found["demo"]}
+    assert entries == {
+        ("migrate", "console_script", "gpu-fault-store-migrate"),
+        ("api", "module", "gpu_fault.app.serve"),
+        ("api", "factory", "gpu_fault.app"),
+        ("api/readinessProbe", "import", "gpu_fault.app"),
+        ("api/readinessProbe", "import_name", "gpu_fault.app.liveness"),
+        ("api/lifecycle.preStop", "console_script", "gpu-fault-config"),
+        ("worker", "module", "gpu_fault.jobs"),
+    }, sorted(entries)
+    assert {entry.manifest for entry in found["demo"]} == {"workloads/demo.yaml"}
+
+
+def test_entrypoint_failures_name_the_manifest_the_container_and_the_remedy(
+    tmp_path: Path,
+) -> None:
+    components = _synthetic_manifest(tmp_path)
+    module_paths = {
+        "gpu_fault.app": Path("src/gpu_fault/app/__init__.py"),
+        "gpu_fault.app.liveness": Path("src/gpu_fault/app/liveness.py"),
+        "gpu_fault.app.serve": Path("src/gpu_fault/app/serve.py"),
+        "gpu_fault.jobs": Path("src/gpu_fault/jobs/__init__.py"),
+    }
+    failures = manifest_entrypoints.component_entrypoint_failures(
+        "demo",
+        modules={"gpu_fault.app", "gpu_fault.app.liveness"},
+        scripts={"gpu-fault-store-migrate"},
+        module_paths=module_paths,
+        root=tmp_path,
+        components=components,
+    )
+    assert len(failures) == 4, failures
+    by_container = {line.split("]: ", 1)[0]: line for line in failures}
+    assert (
+        "module gpu_fault.app.serve is outside the demo wheel"
+        in by_container["workloads/demo.yaml [api"]
+    ), failures
+    assert "scripts/component_wheels.py" in by_container["workloads/demo.yaml [api"]
+    assert (
+        "console script gpu-fault-config is not a [project.scripts]"
+        in (by_container["workloads/demo.yaml [api/lifecycle.preStop"])
+    ), failures
+    worker = [line for line in failures if "[worker]" in line]
+    assert any("gpu_fault.jobs is outside" in line for line in worker), failures
+    assert any("gpu_fault.jobs.__main__ does not exist" in line for line in worker), (
+        "a package launched with -m needs its __main__ shipped too"
+    )
+    complete = manifest_entrypoints.component_entrypoint_failures(
+        "demo",
+        modules={*module_paths, "gpu_fault.jobs.__main__"},
+        scripts={"gpu-fault-store-migrate", "gpu-fault-config"},
+        module_paths={**module_paths, "gpu_fault.jobs.__main__": Path("x/__main__.py")},
+        root=tmp_path,
+        components=components,
+    )
+    assert complete == [], complete
+    assert (
+        manifest_entrypoints.component_entrypoint_failures(
+            "unmapped", modules=set(), scripts=set(), module_paths={}, root=tmp_path
+        )
+        == []
+    ), "a component without manifests has nothing to resolve"
+
+
+def test_the_scan_refuses_a_manifest_pattern_that_matches_nothing(
+    tmp_path: Path,
+) -> None:
+    """An unmatched glob would make the check pass on an empty set."""
+    with pytest.raises(FileNotFoundError, match="no manifest matches"):
+        manifest_entrypoints.manifest_entrypoints(
+            tmp_path, {"demo": ("missing/*.yaml",)}
+        )

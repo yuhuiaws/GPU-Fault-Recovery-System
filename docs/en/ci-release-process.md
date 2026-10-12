@@ -514,7 +514,12 @@ The deploy-host wheel is rooted at `gpu_fault.admin.cli` and installs the admini
 private stdio HTTP worker, the SNS policy helper, the prerequisite refresh transaction, the Store proof and the Job cleanup modules.
 The workload RBAC check and cleanup modules imported by the standalone deploy scripts are listed explicitly as deploy-host build roots
 rather than relying only on the administrator CLI's Python import closure; otherwise a source checkout would run while the offline installation lacked modules.
-These helpers do not enter the Control Plane, Executor or Node Runtime business wheels.
+These helpers do not enter the Control Plane, Executor or Node Runtime business wheels. Conversely, a business wheel
+must contain every entry point its manifests launch by name: `python -m`, `python -c "import ..."`, `module:attr`
+factories and console scripts in container commands, exec probes and lifecycle hooks are invisible to the import
+closure and must be listed as component roots (the control-plane launcher `gpu_fault.app.serve` is one);
+`scripts/manifest_entrypoints.py` checks them against the manifests, `build_component` refuses to package a wheel
+with a missing entry point, and the `artifact` gate's `tests/test_artifact_consistency.py` re-checks the built wheel.
 Non-Python deploy inputs are still resolved from the trusted checkout: the shared
 `deploy/observability/amp-sns-publish-policy.json` enters the Manifest inputs and the observability component
 identity, and `deploy/migrations/postgres-schema-preflight-job.yaml`, reused by the database proof, also enters the

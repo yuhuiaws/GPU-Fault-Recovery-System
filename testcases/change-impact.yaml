@@ -146,6 +146,7 @@ rules:
       - scripts/component_artifacts.py
       - scripts/component_artifact_cache.py
       - scripts/component_wheels.py
+      - scripts/manifest_entrypoints.py
       - scripts/release-artifact-path.py
       - scripts/build-release-runtime-image.py
       - scripts/build-release-artifacts.py
@@ -158,6 +159,7 @@ rules:
       - tests/test_release_attestation.py
       - tests/test_release_gates.py
       - tests/test_artifact_consistency.py
+      - tests/test_component_wheel_closures.py
     regional_cases:
       - GF-REGIONAL-BOOT-018..023
       - GF-REGIONAL-HA-007..010

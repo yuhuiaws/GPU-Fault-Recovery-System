@@ -512,7 +512,12 @@ deploy-host wheel以`gpu_fault.admin.cli`为根，安装管理员部署CLI及其
 私有stdio HTTP worker、SNS policy helper、前置刷新事务、Store proof和Job清理模块。
 由独立部署脚本导入的workload RBAC检查与清理模块显式列为deploy-host构建根，
 不能只依赖管理员CLI的Python导入闭包，否则源码checkout能运行而离线安装缺少模块。
-这些helper不进入Control Plane、Executor或Node Runtime业务wheel。
+这些helper不进入Control Plane、Executor或Node Runtime业务wheel。反过来，业务wheel必须
+包含其manifest按名字启动的每个入口：容器命令、exec探针和生命周期hook里的`python -m`、
+`python -c "import …"`、`module:attr`工厂与console script对导入闭包不可见，须显式列为
+组件根（控制面启动器`gpu_fault.app.serve`即是）；`scripts/manifest_entrypoints.py`据
+manifest核对，`build_component`拒绝打包缺失入口的wheel，`artifact` gate的
+`tests/test_artifact_consistency.py`再对已构建wheel复核。
 非Python部署输入仍从受信checkout解析：共享
 `deploy/observability/amp-sns-publish-policy.json`进入Manifest输入与observability组件
 身份，数据库proof复用的`deploy/migrations/postgres-schema-preflight-job.yaml`也进入

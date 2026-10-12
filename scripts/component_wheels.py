@@ -45,6 +45,16 @@ COMPONENTS = {
         roots=(
             "gpu_fault.api",
             "gpu_fault.app",
+            # The three control-plane roles start with ``python -m
+            # gpu_fault.app.serve`` (deploy/control-plane/base and the rendered
+            # role-split Deployments). Nothing imports a ``-m`` launcher, so
+            # the walk from ``gpu_fault.app`` never reached it: the wheel the
+            # first release with that command installed had no ``serve.py``
+            # and every api-ha Pod crash-looped with ModuleNotFoundError while
+            # the gate had passed. A module a manifest names is a root here;
+            # ``scripts/manifest_entrypoints.py`` reads the manifests and
+            # ``build_component`` refuses a wheel that cannot start its Pods.
+            "gpu_fault.app.serve",
             "gpu_fault.aurora_credential_refresh",
             "gpu_fault.config_cli",
             "gpu_fault.fleet_cli",
@@ -427,6 +437,25 @@ def component_modules(name: str) -> set[str]:
     )
 
 
+def manifest_entrypoint_failures(
+    name: str, modules: Iterable[str], scripts: Iterable[str]
+) -> list[str]:
+    """Every ``python -m``, ``python -c "import ..."``, ``module:attr`` factory
+    and console script the component's manifests run that ``modules`` (its
+    module set) and ``scripts`` (its console script names) cannot resolve.
+
+    Empty for a component without manifests (node runtime, deploy host).
+    """
+
+    if __package__:
+        from scripts.manifest_entrypoints import component_entrypoint_failures
+    else:
+        from manifest_entrypoints import component_entrypoint_failures
+    return component_entrypoint_failures(
+        name, modules=set(modules), scripts=set(scripts), module_paths=MODULES
+    )
+
+
 def component_data_files(name: str) -> tuple[Path, ...]:
     component = component_definition(name)
     data = SOURCE / "data"
@@ -601,6 +630,12 @@ def build_component(
     python = validated_build_python(python)
     component = component_definition(name)
     selected = component_modules(name)
+    unresolved = manifest_entrypoint_failures(name, selected, component.scripts)
+    if unresolved:
+        raise RuntimeError(
+            f"{name} wheel would not start the containers its manifests describe:\n"
+            + "\n".join(unresolved)
+        )
     project = build_root / name
     shutil.rmtree(project, ignore_errors=True)
     project.mkdir(parents=True)
