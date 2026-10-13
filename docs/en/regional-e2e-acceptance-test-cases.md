@@ -3640,6 +3640,13 @@ release_id and the remedy: run `gpu-fault-admin deploy` of the site's own releas
   `<run-dir>/cases/GF-REGIONAL-BOOT-032/sacrificial/site.yaml`.
   The physical cluster names and AWS ownership tags must follow this case's rules; the runner does not auto-create the site, does not backfill tags,
   and does not turn the continuous acceptance site into a destroyable site. The deploy-host interpreter must satisfy the native state-dir binding policy.
+- The independent site's last installation registry sync on the deploy host must be a recorded success
+  (`release-deploy/installation-registry-sync.json`, Administrator Operations §3 and §4): while it failed, is not recorded
+  (the site's last deploy predates recording it) or is unreadable, native `uninstall` refuses to start a new attempt.
+  The runner never passes `--accept-unsynchronized-registry`: the read-only `--plan` preflight writes that refusal with its
+  time, reason and remedy into `preflight_errors` (`gpu-fault-admin deploy` of the independent site -- a NOOP deploy retries
+  the sync too -- or a `config` re-roll, then `--plan` again), and `--execute` judges it again before the case journal
+  exists. A native attempt that already started resumes on the verdict it started with.
 - The approval pins both sites, all contexts, physical cluster identities, live registry, resource registry and the node
   UID/instance/installed-unit lists. The two sets of resources must not overlap; global IAM ARNs are not split into different identities by site Region,
   and external references and PRESERVE resources must not be deleted by mistake.

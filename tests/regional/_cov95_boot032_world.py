@@ -15,6 +15,7 @@ from scripts.e2e.regional import boot032_lifecycle as lifecycle
 from scripts.e2e.regional import boot032_native as adapter
 from scripts.e2e.regional import boot032_observe as observe
 from scripts.e2e.regional import live_driver_guard as guard
+from tests.admin._registry_sync_support import record_registry_sync
 from tests.regional._cov95_boot032_support import (
     ACCOUNT,
     CA,
@@ -56,6 +57,14 @@ class World:
         self.agents = {}
         for site in (self.target, self.protected):
             self.add_site(site)
+        # The sacrificial site as its last deploy left it: native uninstall
+        # refuses to start without that deploy's recorded registry sync.
+        record_registry_sync(
+            self.target.source.parent,
+            release_id=self.runtime[self.target.metadata_name]["release_state"][
+                "release_id"
+            ],
+        )
         self.harness = None
         monkeypatch.setattr(
             deploy_host_binding,

@@ -27,6 +27,7 @@ from scripts.e2e.regional.boot032_native import (
     NativeBackend,
     RestartRequired,
     checked_locks,
+    registry_sync_refusal,
 )
 from scripts.e2e.regional.live_driver_guard import (
     authorize_execution,
@@ -86,6 +87,9 @@ def predecessor(settings: Settings, binding: dict[str, Any]) -> dict[str, Any]:
 
 
 def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
+    # Reported on its own, with its remedy, whatever else the preflight finds.
+    refusal = registry_sync_refusal(settings)
+    errors = [] if refusal is None else [refusal]
     try:
         with deployment_deadline(
             "BOOT-032 read-only preflight", 900, recovery_seconds=0
@@ -118,10 +122,10 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
                 binding["predecessor"].get("valid") is True,
                 "formal predecessor is not PASS",
             )
-            return {"errors": [], "binding": binding}
+            return {"errors": errors, "binding": None if errors else binding}
     except Exception as error:
         return {
-            "errors": [f"uninstall preflight refused: {type(error).__name__}"],
+            "errors": [f"uninstall preflight refused: {type(error).__name__}", *errors],
             "binding": None,
         }
 
@@ -147,6 +151,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         ],
         "stop_conditions": [
             "missing sacrificial provisioning provenance or fixture-purpose tags",
+            "sacrificial installation registry sync not a recorded success",
             "site, source, context, ownership or protected-site drift",
             "unknown resource read or unproved process supervision",
             "missing native checkpoint, original incarnation or final readback",
@@ -237,6 +242,10 @@ def execute_case(
             and binding["predecessor"].get("valid") is True,
             "formal predecessor evidence changed",
         )
+        # Before the case journal: the remedy rewrites the registry it binds.
+        refusal = registry_sync_refusal(settings)
+        if refusal is not None:
+            raise UninstallCaseError(refusal)
         journal = read_case(path)
         if journal is None:
             require(
