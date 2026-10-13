@@ -44,6 +44,7 @@ __all__ = [
     "gpu_nodegroups",
     "orchestrator_eks_arn",
     "regional_profile_for",
+    "same_cluster_entry",
 ]
 
 SubnetCidrs = Callable[..., tuple[str, ...]]
@@ -149,6 +150,24 @@ def cluster_provider_entries(cluster: ClusterIdentity) -> dict[str, str]:
     if cluster.node_selector_source:
         entries["nodeSelectorSource"] = cluster.node_selector_source
     return entries
+
+
+def same_cluster_entry(item: Mapping[str, Any], target: Mapping[str, Any]) -> bool:
+    """Whether two ``spec.clusters[]`` entries claim one cluster identity.
+
+    A shared ``clusterId``, EKS ARN or kubeconfig context is one cluster; so is
+    a shared HyperPod name, but only a name that is there: plain EKS entries
+    carry none (``cluster_provider_entries``), and two of them must not read as
+    one cluster because both lack it.
+    """
+
+    hyperpod = target.get("hyperpodClusterName")
+    return bool(
+        item.get("clusterId") == target.get("clusterId")
+        or item.get("eksClusterArn") == target.get("eksClusterArn")
+        or (hyperpod and item.get("hyperpodClusterName") == hyperpod)
+        or item.get("context") == target.get("context")
+    )
 
 
 def orchestrator_eks_arn(hyperpod: Mapping[str, Any]) -> str:

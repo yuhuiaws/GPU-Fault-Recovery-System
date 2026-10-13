@@ -31,7 +31,10 @@ from gpu_fault.admin.bootstrap_common import (
     safe_name,
     write_secret as write_secret,
 )
-from gpu_fault.admin.bootstrap_discovery import cluster_provider_entries
+from gpu_fault.admin.bootstrap_discovery import (
+    cluster_provider_entries,
+    same_cluster_entry,
+)
 from gpu_fault.admin.cluster_join_profile import (
     cluster_profile_override,
     cluster_runtime_profile,
@@ -1093,14 +1096,7 @@ def _write_batch_candidate_site(
                 f"candidate site has no unique cluster {execution.cluster_id}"
             )
         target = matches[0]
-        conflicts = [
-            item
-            for item in clusters
-            if item.get("clusterId") == target.get("clusterId")
-            or item.get("eksClusterArn") == target.get("eksClusterArn")
-            or item.get("hyperpodClusterName") == target.get("hyperpodClusterName")
-            or item.get("context") == target.get("context")
-        ]
+        conflicts = [item for item in clusters if same_cluster_entry(item, target)]
         if conflicts:
             if len(conflicts) != 1 or conflicts[0] != target:
                 raise BootstrapError(

@@ -10,6 +10,7 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin import cluster_join as join
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.bootstrap_discovery import same_cluster_entry
 from gpu_fault.cluster_scope import is_eks_managed
 from gpu_fault.admin.cluster_join_evidence import (
     final_membership_identity,
@@ -312,17 +313,7 @@ def _commit_site(
         )
     target = target_clusters[0]
     clusters = [dict(item) for item in current_document["spec"].get("clusters", [])]
-    existing = [
-        item
-        for item in clusters
-        if item.get("clusterId") == cluster_id
-        or item.get("eksClusterArn") == target.get("eksClusterArn")
-        or (
-            target.get("hyperpodClusterName")
-            and item.get("hyperpodClusterName") == target.get("hyperpodClusterName")
-        )
-        or item.get("context") == target.get("context")
-    ]
+    existing = [item for item in clusters if same_cluster_entry(item, target)]
     if existing:
         if len(existing) != 1 or existing[0] != target:
             raise BootstrapError("site.yaml contains a conflicting GPU cluster")
