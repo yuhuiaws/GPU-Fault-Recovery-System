@@ -14,7 +14,10 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.admin.resource_registry import build_installation_snapshot
 from gpu_fault.admin.resource_registry_scripts import DIRECT_SYNC_SCRIPT
+from gpu_fault.admin.site import load_site
+from tests.admin.test_admin_site import site_file
 from tests.admin.test_registry_transport import snapshot
 
 POSTGRES_URL = os.environ.get("GPU_FAULT_TEST_POSTGRES_URL", "")
@@ -230,6 +233,52 @@ def test_direct_sync_rejects_immutable_drift_atomically(
         "registry database synchronization failed: ValueError"
     )
     assert rows(database) == [original], "identity refusal committed a partial batch"
+
+
+def test_direct_sync_accepts_the_deploy_rebuild_of_a_joined_hyperpod_row(
+    database: str, tmp_path: Path
+) -> None:
+    """Batch 79: ``join-cluster`` recorded ``cluster/<id>/hyperpod`` with the
+    HyperPod ARN, the deploy rebuild sent ``resource_arn=None`` and this
+    fallback rolled the whole batch back with "ValueError" on every deploy and
+    ``config``. A rebuild against the recorded registry keeps the ARN."""
+
+    site = load_site(site_file(tmp_path))
+    deployed = build_installation_snapshot(site, {"resources": {}}, {})
+    arn = "arn:aws:sagemaker:us-east-1:123456789012:cluster/hpgpua0001"
+    joined = deployed.model_copy(
+        update={
+            "resources": [
+                item.model_copy(update={"resource_arn": arn})
+                if item.resource_key == "cluster/gpu-a/hyperpod"
+                else item
+                for item in deployed.resources
+            ]
+        }
+    )
+    joined = joined.model_copy(update={"source_sha256": joined.digest()})
+    recorded = [item.model_dump(mode="json") for item in joined.resources]
+    assert run_sync(database, recorded).returncode == 0
+
+    stale = run_sync(
+        database, [item.model_dump(mode="json") for item in deployed.resources]
+    )
+    assert (stale.returncode, stale.stderr.strip()) == (
+        1,
+        "registry database synchronization failed: ValueError",
+    ), "the pre-fix rebuild no longer reproduces the live refusal"
+
+    rebuilt = build_installation_snapshot(site, {"resources": {}}, {}, existing=joined)
+    result = run_sync(
+        database, [item.model_dump(mode="json") for item in rebuilt.resources]
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(len(rebuilt.resources))
+    stored = {row["resource_key"]: row for row in rows(database)}
+    assert stored["cluster/gpu-a/hyperpod"]["resource_arn"] == arn
+    assert {key: row["resource_id"] for key, row in stored.items()} == {
+        item.resource_key: item.resource_id for item in joined.resources
+    }
 
 
 def test_concurrent_registration_cannot_replace_an_existing_identity(

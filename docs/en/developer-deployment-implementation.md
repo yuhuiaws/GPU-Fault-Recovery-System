@@ -1138,6 +1138,14 @@ After deploying or taking over legacy resources of the same site, `gpu_fault.adm
 synchronizes to Aurora
 `gpu_fault_objects(kind=installation_resource)`. Administrators do not hand-write these
 fields in `site.yaml`, and must not add a second AWS inventory file.
+The completion step of deploy and `config` first reads the rows Aurora already records, then rebuilds the snapshot from the bootstrap state:
+numbered rows without a natural key (the CPU public subnets with their route tables and route-table associations, the NLB listeners and target
+groups) keep the number already registered for their physical resource ID, and a resource the registry does not hold takes the lowest free number,
+so a different AWS response order cannot swap the resource IDs of two rows and a replaced resource is recorded under a new number instead of
+overwriting the old row. A nullable ARN only one side knows keeps the recorded value (for example the ARN `join-cluster` records for a HyperPod
+cluster, for which the deploy side has no identity source); two different non-null ARNs are still different resources. A rebuild that would
+still change any recorded immutable identity is refused before any write with an error naming the keys and fields, and the release records a
+completion warning.
 
 A new AWS foundation resource must be hooked into the ARN bootstrap and emit the same site contract. Every application-owned AWS resource must
 also be hooked into:

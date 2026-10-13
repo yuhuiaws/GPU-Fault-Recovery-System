@@ -27,6 +27,7 @@ from gpu_fault.admin.resource_records import (
     release_repository_resources as _release_repository_resources,
 )
 from gpu_fault.admin.resource_registry_dns import vpc_association_resources
+from gpu_fault.admin.resource_registry_network import network_resources
 from gpu_fault.admin.resource_registry_scripts import (
     DIRECT_SYNC_SCRIPT,
     FETCH_SCRIPT,
@@ -117,188 +118,6 @@ def external_cluster_resources(
                     )
                 ),
             ]
-        )
-    return resources
-
-
-def _network_resources(
-    *,
-    site_id: str,
-    region: str,
-    account_id: str,
-    config: Mapping[str, Any],
-    state: Mapping[str, Any],
-    runtime: Mapping[str, Any],
-) -> list[InstallationResource]:
-    resources: list[InstallationResource] = []
-    nlb = state.get("nlb_network") or {}
-    subnet_keys = []
-    for index, subnet in enumerate(nlb.get("subnet_resources") or (), 1):
-        ownership = _foundation_ownership(subnet.get("ownership"))
-        subnet_key = f"aws/network/public-subnet/{index}"
-        subnet_keys.append(subnet_key)
-        resources.append(
-            _record(
-                site_id=site_id,
-                resource_key=subnet_key,
-                resource_type="ec2_subnet",
-                resource_id=str(subnet["subnet_id"]),
-                region=region,
-                account_id=account_id,
-                ownership=ownership,
-                delete_policy=_policy(ownership),
-                attributes={
-                    "vpc_id": subnet.get("vpc_id"),
-                    "availability_zone": subnet.get("availability_zone"),
-                },
-            )
-        )
-        route_table = subnet.get("route_table_id")
-        association = subnet.get("route_table_association_id")
-        if route_table:
-            route_key = f"aws/network/public-route-table/{index}"
-            resources.append(
-                _record(
-                    site_id=site_id,
-                    resource_key=route_key,
-                    resource_type="ec2_route_table",
-                    resource_id=str(route_table),
-                    region=region,
-                    account_id=account_id,
-                    ownership=ownership,
-                    delete_policy=_policy(ownership),
-                    attributes={"vpc_id": subnet.get("vpc_id")},
-                )
-            )
-            if association:
-                resources.append(
-                    _record(
-                        site_id=site_id,
-                        resource_key=(f"aws/network/public-route-association/{index}"),
-                        resource_type="ec2_route_table_association",
-                        resource_id=str(association),
-                        region=region,
-                        account_id=account_id,
-                        ownership=ownership,
-                        delete_policy=_policy(
-                            ownership,
-                            created=InstallationResourceDeletePolicy.DETACH,
-                        ),
-                        dependencies=[subnet_key, route_key],
-                    )
-                )
-    if not subnet_keys:
-        raw_subnets = nlb.get("public_subnets")
-        if not raw_subnets:
-            raw_subnets = str(config["nlb"].get("public_subnets") or "").split(",")
-        for index, subnet_id in enumerate(raw_subnets, 1):
-            if not subnet_id:
-                continue
-            subnet_key = f"aws/network/public-subnet/{index}"
-            subnet_keys.append(subnet_key)
-            resources.append(
-                _record(
-                    site_id=site_id,
-                    resource_key=subnet_key,
-                    resource_type="ec2_subnet",
-                    resource_id=str(subnet_id),
-                    region=region,
-                    account_id=account_id,
-                    ownership=InstallationResourceOwnership.EXTERNAL,
-                    delete_policy=InstallationResourceDeletePolicy.PRESERVE,
-                )
-            )
-    gateway = nlb.get("internet_gateway") or {}
-    if gateway.get("internet_gateway_id"):
-        ownership = _foundation_ownership(gateway.get("ownership"))
-        resources.append(
-            _record(
-                site_id=site_id,
-                resource_key="aws/network/internet-gateway",
-                resource_type="internet_gateway",
-                resource_id=str(gateway["internet_gateway_id"]),
-                region=region,
-                account_id=account_id,
-                ownership=ownership,
-                delete_policy=_policy(ownership),
-                attributes={"vpc_id": gateway.get("vpc_id")},
-            )
-        )
-    security_group_id = nlb.get("security_group") or config["nlb"].get("security_group")
-    if security_group_id:
-        ownership = _ownership(
-            nlb.get("security_group_ownership"),
-            default=(
-                InstallationResourceOwnership.CREATED
-                if nlb
-                else InstallationResourceOwnership.EXTERNAL
-            ),
-        )
-        resources.append(
-            _record(
-                site_id=site_id,
-                resource_key="aws/nlb/security-group",
-                resource_type="security_group",
-                resource_id=str(security_group_id),
-                region=region,
-                account_id=account_id,
-                ownership=ownership,
-                delete_policy=_policy(ownership),
-                attributes={"vpc_id": nlb.get("vpc_id")},
-            )
-        )
-    nlb_details = runtime.get("nlb") or {}
-    nlb_dependencies = [
-        *subnet_keys,
-        *(["aws/nlb/security-group"] if security_group_id else []),
-    ]
-    resources.append(
-        _record(
-            site_id=site_id,
-            resource_key="aws/nlb",
-            resource_type="nlb",
-            resource_id=str(config["nlb"]["name"]),
-            resource_arn=nlb_details.get("arn"),
-            region=region,
-            account_id=account_id,
-            ownership=InstallationResourceOwnership.CREATED,
-            delete_policy=InstallationResourceDeletePolicy.DELETE,
-            dependencies=nlb_dependencies,
-            attributes={"dns_name": nlb_details.get("dns_name")},
-        )
-    )
-    for index, listener in enumerate(nlb_details.get("listeners") or (), 1):
-        resources.append(
-            _record(
-                site_id=site_id,
-                resource_key=f"aws/nlb/listener/{index}",
-                resource_type="nlb_listener",
-                resource_id=str(listener),
-                resource_arn=str(listener),
-                region=region,
-                account_id=account_id,
-                ownership=InstallationResourceOwnership.CREATED,
-                delete_policy=InstallationResourceDeletePolicy.DELETE,
-                dependencies=["aws/nlb"],
-            )
-        )
-    for index, target_group in enumerate(
-        nlb_details.get("target_groups") or (),
-        1,
-    ):
-        resources.append(
-            _record(
-                site_id=site_id,
-                resource_key=f"aws/nlb/target-group/{index}",
-                resource_type="nlb_target_group",
-                resource_id=str(target_group),
-                resource_arn=str(target_group),
-                region=region,
-                account_id=account_id,
-                ownership=InstallationResourceOwnership.CREATED,
-                delete_policy=InstallationResourceDeletePolicy.DELETE,
-                dependencies=["aws/nlb"],
-            )
         )
     return resources
 
@@ -888,6 +707,85 @@ def _aurora_resources(
     return resources
 
 
+# Named for the refusal message; ``InstallationResource.immutable_identity``
+# compares them (with the site and key) as one tuple.
+_IDENTITY_FIELDS = (
+    "provider",
+    "resource_type",
+    "resource_id",
+    "resource_arn",
+    "region",
+    "account_id",
+    "ownership",
+    "delete_policy",
+    "dependencies",
+)
+
+
+def _keep_recorded_arns(
+    resources: list[InstallationResource],
+    existing: InstallationResourceSnapshot,
+) -> list[InstallationResource]:
+    """Keep the ARN the registry recorded where only one side knows it.
+
+    ``resource_arn`` is immutable identity, but the writers do not all know the
+    same ARN: ``join-cluster`` records the HyperPod ARN it described under
+    ``cluster/<id>/hyperpod``, while this builder has none (the bootstrap's
+    ``hyperpod_by_eks`` map is a hint, not an identity) and rebuilt the row with
+    ``None`` -- refused by every deploy and ``config`` sync once a HyperPod
+    cluster had been joined rather than deployed (batch 79). A legacy row may
+    equally lack an ARN this builder knows. The stored value wins, as in
+    ``cluster_join_commit.registry_delta``; two different ARNs stay a conflict.
+    """
+
+    recorded = {item.resource_key: item for item in existing.resources}
+    kept = []
+    for item in resources:
+        previous = recorded.get(item.resource_key)
+        if previous is not None and None in (previous.resource_arn, item.resource_arn):
+            bound = item.model_copy(update={"resource_arn": previous.resource_arn})
+            if bound.immutable_identity() == previous.immutable_identity():
+                item = bound
+        kept.append(item)
+    return kept
+
+
+def _require_recorded_identities(
+    snapshot: InstallationResourceSnapshot,
+    existing: InstallationResourceSnapshot,
+) -> None:
+    """Refuse a rebuild that would change a recorded identity, before any write.
+
+    The store refuses it as well, but only row by row inside the queued
+    ``/sync`` request, which the processor replays until its retry horizon
+    after rewriting every row ahead of the conflict, and the direct fallback
+    reports only the exception class. Naming the keys and fields here makes the
+    completion warning actionable. A replaced resource needs an explicit
+    registry transition, never an overwrite.
+    """
+
+    recorded = {item.resource_key: item for item in existing.resources}
+    changes = [
+        item.resource_key
+        + " ("
+        + ", ".join(
+            name
+            for name in _IDENTITY_FIELDS
+            if getattr(item, name) != getattr(recorded[item.resource_key], name)
+        )
+        + ")"
+        for item in snapshot.resources
+        if item.resource_key in recorded
+        and item.immutable_identity()
+        != recorded[item.resource_key].immutable_identity()
+    ]
+    if changes:
+        raise BootstrapError(
+            "installation registry rebuild would change recorded identities: "
+            + "; ".join(changes)
+        )
+
+
 def build_installation_snapshot(
     site: RenderedSite,
     bootstrap: Mapping[str, Any] | None,
@@ -928,13 +826,14 @@ def build_installation_snapshot(
         )
     )
     resources.extend(
-        _network_resources(
+        network_resources(
             site_id=site_id,
             region=region,
             account_id=account_id,
             config=config,
             state=state,
             runtime=runtime_resources,
+            existing=existing.resources if existing is not None else (),
         )
     )
     resources.extend(
@@ -981,6 +880,8 @@ def build_installation_snapshot(
             state=state,
         )
     )
+    if existing is not None:
+        resources = _keep_recorded_arns(resources, existing)
     snapshot = InstallationResourceSnapshot(site_id=site_id, resources=resources)
     return snapshot.model_copy(update={"source_sha256": snapshot.digest()})
 
@@ -1418,17 +1319,16 @@ def sync_installation_resource_snapshot_direct(
 
 def sync_installation_resource_registry(site: RenderedSite) -> Path:
     bootstrap = find_bootstrap_state(site)
-    existing = None
-    if (((bootstrap or {}).get("resources") or {}).get("pki") or {}).get(
-        "vpc_associations"
-    ):
-        existing = fetch_installation_resource_registry(site, allow_empty=True)
+    # Always read what the registry records first: the rebuild keeps its
+    # numbered keys and recorded ARNs and must not change a recorded identity.
+    existing = fetch_installation_resource_registry(site, allow_empty=True)
     snapshot = build_installation_snapshot(
         site,
         bootstrap,
         discover_runtime_resources(site),
         existing=existing,
     )
+    _require_recorded_identities(snapshot, existing)
     sync_installation_resource_snapshot(site, snapshot)
     return write_installation_resource_snapshot(site, snapshot)
 
