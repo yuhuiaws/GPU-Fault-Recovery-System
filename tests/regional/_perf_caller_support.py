@@ -14,6 +14,15 @@ from scripts.perf import regional_capacity_data as data
 from scripts.perf import regional_capacity_registry as registry
 from scripts.perf import regional_capacity_suite as capacity
 
+# How the callers' shared teardown ends: the exact data proof, the registry
+# revocation, then the run's token Secret (the alignment gate leaves no event).
+TEARDOWN_TAIL = [
+    "data-cleanup",
+    "revoke",
+    f"delete:secret/{registry.TOKEN_SECRET}",
+    "teardown",
+]
+
 
 class AmpWire:
     """Read-only AMP responses; the notification preflight remains real."""
@@ -99,11 +108,17 @@ class CapacityWire:
         self.entries: list[dict[str, Any]] = [dict(self.production)]
         self.events: list[str] = []
         self.creations: list[dict[str, Any]] = []
+        # Completed shared teardowns (their kwargs), and the waits between the
+        # attempts of the real bounded teardown the callers go through.
         self.teardowns: list[dict[str, Any]] = []
+        self.sleeps: list[float] = []
         self.fail_create = ""
         self.fail_delete = ""
         self.fail_publish = False
         self.fail_data = False
+        # Purges that meet a writer still touching the run's rows: the probe
+        # transaction refuses and deletes nothing (live 2026-10-13).
+        self.cleanup_races = 0
         self.remaining: object = 0
         self.fail_wait = False
         self.identity = {
@@ -133,6 +148,8 @@ class CapacityWire:
         )
         monkeypatch.setattr(registry, "capture_secret_baseline", lambda *_args: None)
         monkeypatch.setattr(data, "invoke", self.data)
+        self.shared_teardown = capacity.teardown
+        monkeypatch.setattr(capacity.time, "sleep", self.sleeps.append)
         for module in (capacity, action):
             monkeypatch.setattr(module, "release_identity", lambda: dict(self.identity))
             monkeypatch.setattr(module, "teardown", self.teardown)
@@ -191,10 +208,17 @@ class CapacityWire:
         return "api"
 
     def publish(self, entries: list[dict[str, Any]], **_kwargs: Any) -> None:
+        revoked = self.registered() and not any(
+            item.get("synthetic_run_id") == "run-a" for item in entries
+        )
         self.entries = copy.deepcopy(entries)
-        self.events.append("publish")
+        self.events.append("revoke" if revoked else "publish")
         if self.fail_publish:
+            self.fail_publish = False
             raise TimeoutError("registration ACK lost")
+
+    def registered(self) -> bool:
+        return any(item.get("synthetic_run_id") == "run-a" for item in self.entries)
 
     def data(
         self,
@@ -216,27 +240,21 @@ class CapacityWire:
             )
             if self.fail_data:
                 raise RuntimeError("data cleanup unavailable")
+            if self.cleanup_races:
+                self.cleanup_races -= 1
+                raise RuntimeError("capacity cleanup left run-owned data")
         return {"run_id": run_id, "cluster_ids": cluster_ids, "total": self.remaining}
 
     def teardown(self, **kwargs: Any) -> None:
+        """The callers' real bounded teardown: resources, data proof, registry,
+        token, each attempt behind its own ownership checks."""
         assert kwargs["artifacts"] == self.artifacts, (
             "teardown must reuse the registration directory"
         )
         assert kwargs["run_id"] == "run-a", "teardown must retain the run identity"
-        assert self.events[-1] in {"data-cleanup", "data-inspect"}, (
-            "exact data proof must immediately precede shared teardown"
-        )
-        proof = json.loads((self.artifacts / "registry-token-proof.json").read_text())
-        token = self.objects[f"secret/{registry.TOKEN_SECRET}"]["metadata"]
-        assert proof["uid"] == token["uid"], (
-            "the original token UID must reach shared teardown"
-        )
+        self.shared_teardown(**kwargs)
         self.events.append("teardown")
         self.teardowns.append(kwargs)
-        self.entries = [
-            item for item in self.entries if item.get("synthetic_run_id") != "run-a"
-        ]
-        del self.objects[f"secret/{registry.TOKEN_SECRET}"]
 
     def dataplane(self, *args: str, **kwargs: Any) -> str:
         if args[0] == "get":

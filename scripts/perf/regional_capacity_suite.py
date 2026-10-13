@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING or __package__:
     from . import regional_capacity_data as capacity_data
     from . import regional_capacity_database as capacity_database
+    from . import regional_capacity_recovery as capacity_recovery
     from . import regional_capacity_registry as capacity_registry
     from . import regional_capacity_results as capacity_results
     from .regional_capacity_cleanup import (
@@ -57,6 +58,7 @@ if TYPE_CHECKING or __package__:
 else:
     import regional_capacity_data as capacity_data
     import regional_capacity_database as capacity_database
+    import regional_capacity_recovery as capacity_recovery
     import regional_capacity_registry as capacity_registry
     import regional_capacity_results as capacity_results
     from regional_capacity_cleanup import (
@@ -1068,6 +1070,16 @@ def _teardown_once(
             raise RuntimeError("capacity token ownership or UID changed")
     if purge:
         purge_audit_rows(run_id=run_id, artifacts=artifacts)
+    else:
+        # --no-purge: the data must already be gone; prove it read-only first.
+        remaining = capacity_data.invoke(
+            control,
+            run_id=run_id,
+            cluster_ids=registered_cluster_ids(artifacts, run_id),
+            cleanup=False,
+        )
+        if type(remaining.get("total")) is not int or remaining["total"] != 0:
+            raise RuntimeError("capacity exact run-owned cleanup is incomplete")
     if deregister_clusters:
         # Registry, token Secret, then the gate (a failed gate must not strand the Secret).
         deregister(scope=scope, artifacts=artifacts, run_id=run_id, verify=False)
@@ -1093,31 +1105,23 @@ def teardown(
     live_registry_confirmation: str | None = None,
     artifacts: Path | None = None,
     run_id: str | None = None,
-    attempts: int = 3,
+    attempts: int = len(capacity_recovery.TEARDOWN_RETRY_DELAYS_SECONDS) + 1,
 ) -> None:
+    """Retried ``_teardown_once``; every attempt repeats every ownership check."""
     scope = validate_registry_target(
         allow_live_registry=allow_live_registry,
         confirmation=live_registry_confirmation,
     )
-    last_error: Exception | None = None
-    for attempt in range(1, attempts + 1):
-        try:
-            _teardown_once(
-                purge=purge,
-                deregister_clusters=deregister_clusters,
-                scope=scope,
-                artifacts=artifacts,
-                run_id=run_id,
-            )
-            return
-        except Exception as exc:
-            last_error = exc
-            if attempt < attempts:
-                log(f"teardown attempt {attempt} failed; retrying")
-                time.sleep(attempt)
-    raise RuntimeError(
-        f"capacity teardown failed after {attempts} attempts: {last_error}"
-    ) from last_error
+    capacity_recovery.retry_teardown(
+        lambda: _teardown_once(
+            purge=purge,
+            deregister_clusters=deregister_clusters,
+            scope=scope,
+            artifacts=artifacts,
+            run_id=run_id,
+        ),
+        attempts=attempts,
+    )
 
 
 def validate_registered_resources(artifacts: Path, run_id: str, count: int) -> None:
@@ -1162,6 +1166,7 @@ def execute_capacity_command(
     sxid_total: int,
 ) -> int:
     failure: BaseException | None = None
+    cleanup_error: Exception | None = None
     result = 0
     aborted_reason: str | None = None
     resources = RunResources(artifacts, suite_id, NAMESPACE, dataplane)
@@ -1231,42 +1236,33 @@ def execute_capacity_command(
             and (artifacts / "registry-registration-intent.json").exists()
         ):
             try:
-                cluster_ids = registered_cluster_ids(artifacts, suite_id)
-                resources.delete_all()
-                if args.command == "purge" or not args.no_purge:
-                    remaining = purge_audit_rows(run_id=suite_id, artifacts=artifacts)
-                else:
-                    remaining = capacity_data.invoke(
-                        control,
-                        run_id=suite_id,
-                        cluster_ids=cluster_ids,
-                        cleanup=False,
-                    )
-                if type(remaining.get("total")) is not int or remaining["total"] != 0:
-                    raise RuntimeError("capacity exact run-owned cleanup is incomplete")
-                if args.command != "purge" and (
-                    not args.keep_registration
-                    or (failure is not None and args.command == "register")
-                ):
-                    teardown(
-                        purge=not args.no_purge,
-                        deregister_clusters=True,
-                        allow_live_registry=args.allow_live_registry,
-                        live_registry_confirmation=args.confirm_live_registry,
-                        artifacts=artifacts,
-                        run_id=suite_id,
-                    )
-            except Exception as cleanup_error:
+                registered_cluster_ids(artifacts, suite_id)
+                teardown(
+                    purge=args.command == "purge" or not args.no_purge,
+                    deregister_clusters=args.command != "purge"
+                    and (
+                        not args.keep_registration
+                        or (failure is not None and args.command == "register")
+                    ),
+                    allow_live_registry=args.allow_live_registry,
+                    live_registry_confirmation=args.confirm_live_registry,
+                    artifacts=artifacts,
+                    run_id=suite_id,
+                )
+            except Exception as exc:
+                cleanup_error = exc
                 if failure is not None:
-                    failure.add_note(f"capacity teardown also failed: {cleanup_error}")
+                    failure.add_note(f"capacity teardown also failed: {exc}")
                 else:
-                    failure = cleanup_error
+                    failure = exc
 
     if failure is not None:
-        write_status(
+        capacity_recovery.write_aborted_status(
             artifacts,
-            status="aborted",
-            reason=f"{type(failure).__name__}: {failure}",
+            failure,
+            cleanup_error=cleanup_error,
+            run_id=suite_id,
+            scope=scope,
         )
         log(f"aborted artifacts: {artifacts}")
         raise failure.with_traceback(failure.__traceback__)
@@ -1359,15 +1355,9 @@ def resume_capacity_command(args: argparse.Namespace, scope: str) -> int:
     artifacts = args.run_dir
     cluster_ids = registered_cluster_ids(artifacts, args.suite_id)
     previous = json.loads((artifacts / "run.json").read_text())
-    expected = {
-        "suite_id": args.suite_id,
-        "registry_scope": scope,
-        "control_namespace": CONTROL_NAMESPACE,
-        "dataplane_namespace": NAMESPACE,
-        "registry_secret": REGISTRY_SECRET,
-        "connection_secret": CONNECTION_SECRET,
-        **release_identity(),
-    }
+    expected = capacity_recovery.resume_identity(
+        suite_id=args.suite_id, scope=scope, identity=release_identity()
+    )
     if not isinstance(previous, dict) or any(
         previous.get(key) != value for key, value in expected.items()
     ):

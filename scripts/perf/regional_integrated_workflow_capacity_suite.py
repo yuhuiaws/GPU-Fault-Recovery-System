@@ -27,6 +27,7 @@ if __package__:
         executor_job,
     )
     from .regional_capacity_data import invoke
+    from .regional_capacity_recovery import resume_identity, write_aborted_status
     from .regional_capacity_registry import (
         AWS_REGION,
         CONNECTION_SECRET,
@@ -80,6 +81,7 @@ else:
         executor_job,
     )
     from regional_capacity_data import invoke
+    from regional_capacity_recovery import resume_identity, write_aborted_status
     from regional_capacity_registry import (
         AWS_REGION,
         CONNECTION_SECRET,
@@ -1263,7 +1265,6 @@ def run(args: argparse.Namespace) -> int:
         json.dumps(
             {
                 "run_id": run_id,
-                "registry_scope": registry_scope,
                 "spool_mode": spool,
                 "clusters": args.clusters,
                 "nodes_per_cluster": FORMAL_NODES_PER_CLUSTER,
@@ -1290,7 +1291,11 @@ def run(args: argparse.Namespace) -> int:
                 "required_aurora_min_acu": FORMAL_AURORA_MIN_ACU,
                 "required_aurora_max_acu": FORMAL_AURORA_MAX_ACU,
                 "started_at": datetime.now(timezone.utc).isoformat(),
-                **identity,
+                # The resume fields let the logged recovery command finish this
+                # run's teardown from its receipts.
+                **resume_identity(
+                    suite_id=run_id, scope=registry_scope, identity=identity
+                ),
             },
             indent=2,
             sort_keys=True,
@@ -1300,6 +1305,7 @@ def run(args: argparse.Namespace) -> int:
     write_status(artifacts, status="running")
     expected_workflows = args.clusters * args.workflows_per_cluster
     failure: BaseException | None = None
+    cleanup_error: Exception | None = None
     result = 1
     try:
         connection_preflight = sync_dataplane_connection_secret()
@@ -1406,20 +1412,20 @@ def run(args: argparse.Namespace) -> int:
                         raise RuntimeError(
                             "integrated workflow cleanup left residual rows"
                         )
-            except Exception as cleanup_error:
+            except Exception as exc:
+                cleanup_error = exc
                 if failure is None:
-                    failure = cleanup_error
+                    failure = exc
                 else:
-                    failure.add_note(
-                        f"integrated teardown also failed: {cleanup_error}"
-                    )
+                    failure.add_note(f"integrated teardown also failed: {exc}")
     if failure is not None:
-        write_status(
-            artifacts,
-            status="aborted",
-            reason=f"{type(failure).__name__}: {failure}",
+        write_aborted_status(
+            move_to_aborted(args.artifact_root, artifacts),
+            failure,
+            cleanup_error=cleanup_error,
+            run_id=run_id,
+            scope=registry_scope,
         )
-        move_to_aborted(args.artifact_root, artifacts)
         raise failure.with_traceback(failure.__traceback__)
     write_status(
         artifacts,

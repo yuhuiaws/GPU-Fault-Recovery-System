@@ -7,7 +7,11 @@ import pytest
 
 from scripts.perf import regional_capacity_registry as registry
 from scripts.perf import regional_capacity_suite as capacity
-from tests.regional._perf_caller_support import CapacityWire, capacity_args
+from tests.regional._perf_caller_support import (
+    TEARDOWN_TAIL,
+    CapacityWire,
+    capacity_args,
+)
 
 
 def test_capacity_main_registers_creates_and_cleans_one_receipted_run(
@@ -39,7 +43,7 @@ def test_capacity_main_registers_creates_and_cleans_one_receipted_run(
         f"rolebinding/{capacity.START_GATE_ROLE_BINDING}",
         f"job/{capacity.CASES['burst']['job']}",
     }, "every real main resource must be in the run receipt"
-    assert wire.events[-2:] == ["data-cleanup", "teardown"], (
+    assert wire.events[-4:] == TEARDOWN_TAIL, (
         "exact cleanup must precede registry revocation"
     )
     assert wire.objects == {}, "the fake complete run must not leave owned resources"
@@ -109,7 +113,7 @@ def test_capacity_lost_create_ack_keeps_uid_and_cleans_without_replay(
     assert f"delete:{key}" in wire.events, (
         "the created resource must be stopped by its receipt"
     )
-    assert wire.events[-2:] == ["data-cleanup", "teardown"], (
+    assert wire.events[-4:] == TEARDOWN_TAIL, (
         "failed creation still needs exact cleanup"
     )
     assert wire.objects == {}, "lost ACK cleanup must leave no owned resource"
@@ -124,7 +128,7 @@ def test_capacity_register_failure_unwinds_even_when_keep_registration_was_reque
     with pytest.raises(TimeoutError, match="registration ACK lost"):
         capacity.main(capacity_args("register", tmp_path, "--keep-registration"))
 
-    assert wire.events[-2:] == ["data-cleanup", "teardown"], (
+    assert wire.events[-4:] == TEARDOWN_TAIL, (
         "partial registration cannot be intentionally kept"
     )
     assert wire.objects == {}, (
@@ -151,8 +155,11 @@ def test_capacity_register_run_teardown_reuse_original_receipts(
     assert capacity.main(capacity_args("run", tmp_path, "--keep-registration")) == 0, (
         "the registered run should execute"
     )
-    assert wire.teardowns == [], (
+    assert [call["deregister_clusters"] for call in wire.teardowns] == [False], (
         "keeping registration must retain the token and registry"
+    )
+    assert wire.registered() and "revoke" not in wire.events, (
+        "a kept registration survives the run's purge"
     )
     assert set(wire.objects) == {f"secret/{registry.TOKEN_SECRET}"}, (
         "kept registration must not keep load producers"
@@ -169,9 +176,10 @@ def test_capacity_register_run_teardown_reuse_original_receipts(
     assert (tmp_path / "run.json").read_bytes() == original_run, (
         "resume must preserve registration target provenance"
     )
-    assert len(wire.teardowns) == 1, (
+    assert [call["deregister_clusters"] for call in wire.teardowns] == [False, True], (
         "only the explicit teardown should revoke this kept registration"
     )
+    assert not wire.registered(), "the explicit teardown deregisters the run"
 
 
 @pytest.mark.parametrize("command", ["run", "purge", "teardown"])
@@ -326,10 +334,13 @@ def test_capacity_purge_uses_original_scope_without_revoking_registration(
     assert capacity.main(capacity_args("purge", tmp_path)) == 0, (
         "exact purge should finish"
     )
-    assert wire.events[-1] == "data-cleanup", (
+    assert wire.events[-2:] == ["data-cleanup", "teardown"], (
         "purge must delegate only the exact owned data scope"
     )
-    assert wire.teardowns == [], "purge is not an authorization to revoke registration"
+    assert [call["deregister_clusters"] for call in wire.teardowns] == [False], (
+        "purge is not an authorization to revoke registration"
+    )
+    assert wire.registered(), "purge keeps the run registered"
     assert set(wire.objects) == {f"secret/{registry.TOKEN_SECRET}"}, (
         "purge must preserve the original token"
     )

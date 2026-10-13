@@ -12,6 +12,7 @@ if __package__:
         release_agent_identity,
         run_agent_heartbeat_refresher,
     )
+    from .regional_capacity_recovery import resume_identity, write_aborted_status
     from .regional_capacity_registry import (
         CONNECTION_SECRET,
         NAMESPACE,
@@ -45,6 +46,7 @@ else:
         release_agent_identity,
         run_agent_heartbeat_refresher,
     )
+    from regional_capacity_recovery import resume_identity, write_aborted_status
     from regional_capacity_registry import (
         CONNECTION_SECRET,
         NAMESPACE,
@@ -859,6 +861,53 @@ def purge_scenario_rows(run_id: str, *, artifacts: Path) -> None:
     purge_audit_rows(run_id=run_id, artifacts=artifacts)
 
 
+def write_run_record(
+    artifacts: Path,
+    args: argparse.Namespace,
+    run_id: str,
+    scope: str,
+    identity: dict[str, str],
+) -> None:
+    """``run.json``: the scenario and the resume fields that let the logged
+    recovery command finish this run's teardown from its receipts."""
+
+    (artifacts / "run.json").write_text(
+        json.dumps(
+            {
+                "run_id": run_id,
+                "clusters": args.clusters,
+                "scenario_max_seconds": args.scenario_max_seconds,
+                "terminal_drain_seconds": args.terminal_drain_seconds,
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                **resume_identity(suite_id=run_id, scope=scope, identity=identity),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+
+
+def scenario_teardown(
+    args: argparse.Namespace, artifacts: Path, run_id: str
+) -> Exception | None:
+    """The run's bounded, retried teardown; the error when it gave up."""
+
+    try:
+        if (artifacts / "registry-registration-intent.json").exists():
+            teardown(
+                purge=True,
+                deregister_clusters=True,
+                allow_live_registry=args.allow_live_registry,
+                live_registry_confirmation=args.confirm_live_registry,
+                artifacts=artifacts,
+                run_id=run_id,
+            )
+    except Exception as exc:
+        return exc
+    return None
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--clusters", type=int, required=True)
@@ -901,6 +950,7 @@ def main() -> int:
         label,
         identity["release_id"] or "unknown-release",
     )
+    write_run_record(artifacts, args, run_id, registry_scope, identity)
     write_status(artifacts, status="running")
     failure: BaseException | None = None
     result = 1
@@ -1029,28 +1079,20 @@ def main() -> int:
     except BaseException as exc:
         failure = exc
     finally:
-        try:
-            if (artifacts / "registry-registration-intent.json").exists():
-                teardown(
-                    purge=True,
-                    deregister_clusters=True,
-                    allow_live_registry=args.allow_live_registry,
-                    live_registry_confirmation=args.confirm_live_registry,
-                    artifacts=artifacts,
-                    run_id=run_id,
-                )
-        except Exception as cleanup_error:
+        cleanup_error = scenario_teardown(args, artifacts, run_id)
+        if cleanup_error is not None:
             if failure is None:
                 failure = cleanup_error
             else:
                 failure.add_note(f"scenario teardown also failed: {cleanup_error}")
     if failure is not None:
-        write_status(
-            artifacts,
-            status="aborted",
-            reason=f"{type(failure).__name__}: {failure}",
+        write_aborted_status(
+            move_to_aborted(args.artifact_root, artifacts),
+            failure,
+            cleanup_error=cleanup_error,
+            run_id=run_id,
+            scope=registry_scope,
         )
-        move_to_aborted(args.artifact_root, artifacts)
         raise failure.with_traceback(failure.__traceback__)
     write_status(
         artifacts,

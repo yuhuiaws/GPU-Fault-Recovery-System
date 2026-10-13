@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import json
+import shlex
 from collections.abc import Callable
 from datetime import datetime, timezone
 from functools import partial
@@ -12,6 +13,7 @@ from typing import Any
 
 import pytest
 
+from scripts.perf import regional_capacity_recovery as recovery
 from scripts.perf import regional_capacity_registry as registry
 from scripts.perf import regional_capacity_suite as base
 from scripts.perf import regional_correlated_action_suite as correlated
@@ -604,6 +606,51 @@ def test_successful_case_cannot_hide_cleanup_transport_failure(
     assert set(caller.api.objects) == {f"secret/{registry.TOKEN_SECRET}"}
     assert "revoke" not in caller.events
     assert caller.report("status.json")["status"] == "aborted"
+
+
+def test_failed_teardown_keeps_the_moved_receipts_and_logs_their_recovery(
+    caller: CallerHarness, capsys: pytest.CaptureFixture[str]
+) -> None:
+    caller.data_error = OSError("cleanup transport failed")
+
+    with pytest.raises(RuntimeError, match="cleanup transport failed"):
+        caller.run()
+
+    aborted = caller.root / "_aborted" / "run"
+    status = caller.report("status.json")
+    assert status["status"] == "aborted", "a failed teardown aborts the run"
+    assert "cleanup transport failed" in status["cleanup_error"], (
+        "status.json names the cleanup error"
+    )
+    command = status["recovery_command"]
+    assert f"recovery command: {command}\n" in capsys.readouterr().out, (
+        "the one-line recovery command is logged"
+    )
+    words = shlex.split(command)
+    assert words[words.index("teardown") :] == [
+        "teardown",
+        "--suite-id",
+        "run-a",
+        "--run-dir",
+        str(aborted),
+        "--allow-live-registry",
+        "--confirm-live-registry",
+        registry.LIVE_REGISTRY_CONFIRMATION,
+    ], "the recovery names the moved receipts and the live-registry consent"
+    for name in (
+        "registry-registration-intent.json",
+        "registry-token-proof.json",
+        "capacity-resources.json",
+    ):
+        assert (aborted / name).is_file(), f"{name} must stay for the recovery"
+    assert "revoke" not in caller.events, "the registration stays for the recovery"
+    expected = recovery.resume_identity(
+        suite_id="run-a", scope="live", identity={"release_id": "test-release"}
+    )
+    run = caller.report("run.json")
+    assert {key: run.get(key) for key in expected} == expected, (
+        "the teardown resume must accept this suite's run record"
+    )
 
 
 @pytest.mark.parametrize("report", [{"total": 1}, {"total": "0"}, {"total": False}, {}])

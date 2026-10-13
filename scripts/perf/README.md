@@ -38,10 +38,18 @@ Mutating the production `gpu-fault-system` registry requires both
 `--confirm-live-registry ALLOW_PERF_CAPACITY_LIVE_REGISTRY`.
 
 Synthetic registrations carry a run ID and expiration. `all`, `run`, and the
-action-capacity suite always execute idempotent teardown in `finally`; registry
-updates publish one CAS revision and wait for all CPU process ACKs without
-restarting CPU Deployments. Cleanup is retried and verified against both the
-bootstrap Secret and runtime registry. A standalone
+action, integrated and correlated suites always execute the same idempotent
+teardown in `finally`; registry updates publish one CAS revision and wait for
+all CPU process ACKs without restarting CPU Deployments. The purge and the
+deregistration both run inside that teardown, which is retried up to three
+times (after 15, 45 and 90 seconds) and verified against both the bootstrap
+Secret and runtime registry; no attempt deregisters while the run's data is
+still present. When the retries are spent the run keeps its receipts,
+`status.json` is `aborted` with `cleanup_error` and `recovery_command`, and the
+log prints `recovery command: ...`, one line that runs
+`regional_capacity_suite.py teardown` with the run's `--suite-id` and `--run-dir`
+(integrated and correlated runs: the directory under `_aborted/`). Every suite's
+`run.json` carries the resume fields that command checks. A standalone
 `register` command requires `--keep-registration`, a shared `--suite-id`, and
 must be followed by `run` or `teardown`. Separate `run`, `purge`, and `teardown`
 commands require both the original `--suite-id` and `--run-dir`; the directory

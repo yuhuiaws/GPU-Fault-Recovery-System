@@ -240,6 +240,8 @@ def write_status(
     *,
     status: str,
     reason: str | None = None,
+    cleanup_error: str | None = None,
+    recovery_command: str | None = None,
 ) -> None:
     document = {
         "status": status,
@@ -247,6 +249,10 @@ def write_status(
     }
     if reason:
         document["reason"] = reason[:2000]
+    if cleanup_error:
+        document["cleanup_error"] = cleanup_error[:2000]
+    if recovery_command:
+        document["recovery_command"] = recovery_command
     (artifacts / "status.json").write_text(
         json.dumps(document, indent=1, sort_keys=True) + "\n",
         encoding="utf-8",

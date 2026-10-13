@@ -8,7 +8,7 @@ import pytest
 from scripts.e2e.regional.regional_live_fixture import component_python
 from scripts.perf import regional_action_capacity_suite as action
 from scripts.perf import regional_capacity_registry as registry
-from tests.regional._perf_caller_support import CapacityWire, action_args
+from tests.regional._perf_caller_support import TEARDOWN_TAIL, CapacityWire, action_args
 
 
 def test_action_main_uses_real_registration_and_receipted_resources(
@@ -35,7 +35,7 @@ def test_action_main_uses_real_registration_and_receipted_resources(
     assert wire.events.index(f"delete:job/{action.JOB_NAME}") < wire.events.index(
         "data-cleanup"
     ), "simulated executors must stop before exact data cleanup"
-    assert wire.events[-2:] == ["data-cleanup", "teardown"], (
+    assert wire.events[-4:] == TEARDOWN_TAIL, (
         "action cleanup must precede registry/token teardown"
     )
     assert wire.objects == {}, "the fake action run must not leave resources"
@@ -92,7 +92,7 @@ def test_action_lost_create_ack_is_tracked_before_finally(
     assert wire.objects == {}, (
         "final cleanup must stop the resource created before the lost ACK"
     )
-    assert wire.events[-2:] == ["data-cleanup", "teardown"], (
+    assert wire.events[-4:] == TEARDOWN_TAIL, (
         "lost ACK cannot bypass exact data cleanup"
     )
 
@@ -109,7 +109,7 @@ def test_action_lost_delete_ack_uses_checked_absence(
     assert wire.events.count(f"delete:job/{action.JOB_NAME}") == 1, (
         "delete ACK loss must not replay deletion"
     )
-    assert wire.events[-2:] == ["data-cleanup", "teardown"], (
+    assert wire.events[-4:] == TEARDOWN_TAIL, (
         "checked resource absence must allow exact cleanup"
     )
 
@@ -129,6 +129,9 @@ def test_action_refuses_unknown_or_nonempty_cleanup(
         action.main(action_args(tmp_path))
 
     assert wire.teardowns == [], "failed data proof must keep registry and token intact"
+    assert wire.registered() and "revoke" not in wire.events, (
+        "no teardown attempt may deregister after a refused data proof"
+    )
     assert set(wire.objects) == {f"secret/{registry.TOKEN_SECRET}"}, (
         "producer cleanup still precedes data refusal"
     )
@@ -147,6 +150,7 @@ def test_action_cleanup_transport_failure_is_not_suppressed(
         action.main(action_args(tmp_path))
 
     assert wire.teardowns == [], "transport failure cannot revoke ownership proof"
+    assert wire.registered(), "transport failure keeps the registration recoverable"
     assert (tmp_path / "registry-registration-intent.json").is_file(), (
         "retry must retain registration intent"
     )
@@ -167,7 +171,7 @@ def test_action_registration_ack_failure_keeps_intent_and_token_proof_for_cleanu
     assert len(wire.creations) == 1, (
         "failed registration must not start executor resources"
     )
-    assert wire.events[-2:] == ["data-cleanup", "teardown"], (
+    assert wire.events[-4:] == TEARDOWN_TAIL, (
         "partial registration must still unwind its exact scope"
     )
     assert wire.objects == {}, (
@@ -231,6 +235,7 @@ def test_action_replaced_job_blocks_deletion_and_data_cleanup(
         action.main(action_args(tmp_path))
 
     assert wire.teardowns == [], "replacement detection must block shared teardown"
+    assert wire.registered(), "a replaced Job keeps the registration recoverable"
     assert "data-cleanup" not in wire.events, (
         "data cleanup requires the original producer to have stopped"
     )

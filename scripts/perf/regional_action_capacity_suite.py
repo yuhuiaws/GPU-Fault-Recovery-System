@@ -14,6 +14,7 @@ from scripts.e2e.regional.regional_live_fixture import component_python
 from scripts.e2e.regional.release_phase_gate import release_phase_error
 
 if TYPE_CHECKING or __package__:
+    from .regional_capacity_recovery import write_aborted_status
     from .regional_capacity_registry import (
         STORE_DSN_SNIPPET,
         dataplane_identity,
@@ -38,7 +39,6 @@ if TYPE_CHECKING or __package__:
         postgres_counters,
         store_bloat_section,
         store_layout_section,
-        purge_audit_rows,
         register,
         release_identity,
         scrape_cgroup,
@@ -49,6 +49,7 @@ if TYPE_CHECKING or __package__:
         write_status,
     )
 else:
+    from regional_capacity_recovery import write_aborted_status
     from regional_capacity_registry import (
         STORE_DSN_SNIPPET,
         dataplane_identity,
@@ -73,7 +74,6 @@ else:
         postgres_counters,
         store_bloat_section,
         store_layout_section,
-        purge_audit_rows,
         register,
         release_identity,
         scrape_cgroup,
@@ -1251,6 +1251,7 @@ def main(argv: list[str] | None = None) -> int:
     write_status(artifacts, status="running")
     started = time.time()
     failure: BaseException | None = None
+    cleanup_error: Exception | None = None
     result = 1
     resources = RunResources(artifacts, run_id, NAMESPACE, dataplane)
     registration_pending = True
@@ -1286,8 +1287,9 @@ def main(argv: list[str] | None = None) -> int:
             artifacts / "registry-registration-intent.json"
         ).exists():
             try:
-                resources.delete_all()
-                purge_audit_rows(run_id=run_id, artifacts=artifacts)
+                # Executors, data, then registry: all inside the retried teardown
+                # (live 2026-10-13: a single purge before it raised once and left
+                # perf-cap-000..031 in the live registry).
                 teardown(
                     purge=True,
                     deregister_clusters=True,
@@ -1296,19 +1298,20 @@ def main(argv: list[str] | None = None) -> int:
                     artifacts=artifacts,
                     run_id=run_id,
                 )
-            except Exception as cleanup_error:
+            except Exception as exc:
+                cleanup_error = exc
                 if failure is not None:
-                    failure.add_note(
-                        f"action capacity teardown also failed: {cleanup_error}"
-                    )
+                    failure.add_note(f"action capacity teardown also failed: {exc}")
                 else:
-                    failure = cleanup_error
+                    failure = exc
 
     if failure is not None:
-        write_status(
+        write_aborted_status(
             artifacts,
-            status="aborted",
-            reason=f"{type(failure).__name__}: {failure}",
+            failure,
+            cleanup_error=cleanup_error,
+            run_id=run_id,
+            scope=registry_scope,
         )
         log(f"aborted artifacts: {artifacts}")
         raise failure.with_traceback(failure.__traceback__)

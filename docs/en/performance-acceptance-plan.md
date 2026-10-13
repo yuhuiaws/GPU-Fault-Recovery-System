@@ -512,10 +512,17 @@ scripts/perf/regional_capacity_suite.py all \
   --artifact-root artifacts/perf
 ```
 
-`all` and `run` must execute an idempotent teardown in `finally` regardless of success,
-non-Complete, exception or interruption. Teardown deletes the Job/ConfigMap/Secret, purges
-database records as needed, deregisters this round's synthetic registry, and retries at most
-3 times on failure. The exception path must not merely write `aborted` and skip registry cleanup.
+`all`, `run` and the action, integrated and correlated suites must execute the same idempotent
+teardown in `finally` regardless of success, non-Complete, exception or interruption. Teardown
+deletes the Job/ConfigMap/Secret, purges database records as needed and deregisters this round's
+synthetic registry; the purge and the deregistration both run inside it, it retries at most 3
+times on failure (after 15, 45 and 90 seconds), every attempt repeats all ownership checks, and it
+never deregisters while this round's data is still present. The exception path must not merely
+write `aborted` and skip registry cleanup. When the retries are spent the round keeps its receipt
+directory, `status.json` is marked `aborted` with `cleanup_error` and `recovery_command`, and the
+log prints one `recovery command: ...` line: `regional_capacity_suite.py teardown` with the
+original `--suite-id` and `--run-dir` (for integrated and correlated runs the directory moved
+under `_aborted/`), which finishes the cleanup once the cause is gone.
 
 Staged execution is only for controlled debugging:
 
