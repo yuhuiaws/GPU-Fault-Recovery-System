@@ -2117,6 +2117,14 @@ This section is three-line triage cards, not the seven-item runbooks of §2: eac
 is needed, jump to the formal runbook the card references. No alert may be cleared by raising a threshold, deleting Store records or
 silencing the rule.
 
+Alert mails go out through the site SNS topic, and the `subject` template of the `gpu-fault-sns` receiver in
+`deploy/observability/amp-alertmanager.yaml` builds their subject:
+`[FIRING:N] <cluster_id> <gpu_node> <alert name without the GpuFault prefix> <severity>`, starting with `[RESOLVED]` on
+recovery; a label the alert group lacks is left out. An SNS subject holds at most 100 characters and the rest is cut off:
+cluster and node always fit, a long alert name and the `severity` may keep only a prefix. The full alert name, every label
+(including the site constants `control_plane_cluster` and `region`) and the annotations (including `runbook_url`) are in
+the mail body.
+
 ### 8.0 Dashboards
 
 `deploy/observability/dashboards/*.json` are 8 Grafana dashboards: 1 overview plus 1 for each of the 7 alert groups of
@@ -2565,10 +2573,16 @@ a reading of 0 means that release declared none. Every metric family on the dash
 
 ### GpuFaultExclusiveNodeOwnershipInvariantViolation
 
-- **Meaning**: the same GPU node is claimed by several "fresh" active attempts at the same time, and node changes have
-  failed closed. Stale observations do not count towards ownership and have their own alert.
-- **First check**: the `cluster_id` and `gpu_node` in the alert labels, whether the training Pods of these attempts
-  all really exist, whether Completion Watcher delivery is duplicated.
+- **Meaning**: the same GPU node is claimed by several "fresh" active attempts at the same time, node changes have
+  failed closed, and fault events on that node are attributed to no job meanwhile. Stale observations do not count towards
+  ownership and have their own alert. A product-driven stop and restart (`STOP_WORKLOADS` -> `RESTART_WORKLOAD`) does not
+  fire it: as soon as the source attempt's Pods are gone, the Completion Watcher publishes the initiator-qualified `STOPPED`
+  for a workload object the product suspended instead of re-sending it as `RUNNING` for the 300-second missing grace. When
+  it fires, the node really has two owners.
+- **First check**: the `cluster_id` and `gpu_node` in the alert labels (the first two fields of the mail subject), whether
+  the training Pods of these attempts all really exist, whether Completion Watcher delivery is duplicated. A job the user or
+  Kueue suspended keeps the 300-second grace (an un-suspend brings it back), so another job landing on the same node within
+  that grace fires it as well.
 - **Boundary**: critical. Do not hand-craft or delete attempts/allocations to resolve the ambiguity; handling must reference
   real workload observations. See §9.
 

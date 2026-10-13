@@ -33,4 +33,10 @@ alertmanager_config: |
         - topic_arn: REPLACE_WITH_SNS_TOPIC_ARN
           sigv4:
             region: REPLACE_WITH_AWS_REGION
+          # The default subject lists every group label value sorted by label
+          # name and SNS keeps only its first 100 characters, so the node never
+          # showed. Cluster and node lead here; the site constants
+          # control_plane_cluster and region stay in the default message body,
+          # which lists every label and annotation of every alert.
+          subject: '[{{ .Status | toUpper }}{{ if eq .Status "firing" }}:{{ .Alerts.Firing | len }}{{ end }}]{{ with .GroupLabels.cluster_id }} {{ . }}{{ end }}{{ with .GroupLabels.gpu_node }} {{ . }}{{ end }}{{ with .GroupLabels.alertname }} {{ reReplaceAll "^GpuFault" "" . }}{{ end }}{{ with .GroupLabels.severity }} {{ . }}{{ end }}'
           send_resolved: true

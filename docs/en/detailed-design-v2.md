@@ -4298,6 +4298,12 @@ the alert is for locating the training Pod, the Completion Watcher and the deliv
 Alertmanager uses a 5-second `group_wait` only for
 `GpuFaultExclusiveNodeOwnershipInvariantViolation`;
 other alerts keep the 30-second aggregation window.
+The SNS receiver `gpu-fault-sns` carries a `subject` template: `[FIRING:N]`, `cluster_id`, `gpu_node`, the alert name
+without the `GpuFault` prefix, `severity`, leaving no gap for a label the group lacks. An SNS subject holds at most 100
+characters, and the default subject, which lists every group label sorted by label name, never reached the node; the site
+constants `control_plane_cluster` and `region` stay in the default body only.
+`tests/metrics/test_alertmanager_sns_subject.py` computes the worst-case length from the longest cluster id, node name and
+alert name and pins cluster and node inside the first 100 characters.
 
 **Visualization (Amazon Managed Grafana).** Dashboards are not an alert path, but they share the same source of truth with the alerts:
 `scripts/build-grafana-dashboards.py` parses each alert's threshold from `amp-rules.yaml` and generates

@@ -3014,6 +3014,11 @@ scrape `/metrics` of `gpu-fault-api-ha` -> remote-write to AMP -> AMP evaluates 
   (`src/gpu_fault/notifications/` -> `AdvisoryNotificationService`
   -> `SnsNotifier` or `SesEmailNotifier` chosen by `GPU_FAULT_NOTIFICATION_CHANNEL`),
   without going through the collector, AMP or Alertmanager; an SNS site merely shares the same topic with the metric alerts.
+- The subject of metric alert mails comes from the `subject` template of `gpu-fault-sns` in
+  `deploy/observability/amp-alertmanager.yaml`: `[FIRING:N]`, `cluster_id`, `gpu_node`, the alert name without the
+  `GpuFault` prefix, `severity`; a label the alert group lacks is left out. An SNS subject holds at most 100 characters and
+  cluster and node always fit; the default subject lists every group label sorted by label name and loses the node. The
+  site constants `control_plane_cluster` and `region` and every label and annotation stay in the default body.
 - `deploy/observability/adot-control-plane.yaml` defaults to `replicas: 1`,
   and the installation script waits for it to be Ready by default.
 **The scrape path for the data plane's own metrics (`gpu-fault-adot-dataplane`, one per GPU cluster).** The control-plane collector only scrapes
