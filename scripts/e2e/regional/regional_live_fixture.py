@@ -7,7 +7,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Collection, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -34,6 +34,7 @@ from scripts.e2e.regional.regional_commands import (  # noqa: E402
 )
 from scripts.e2e.regional.regional_pod_exec import exec_pod_script  # noqa: E402
 from scripts.e2e.regional import regional_pod_inventory  # noqa: E402
+from scripts.e2e.regional import release_phase_gate  # noqa: E402
 from scripts.e2e.regional.release_pins import (  # noqa: E402
     RELEASE_METADATA_CONFIGMAP,
     release_pins_from_metadata,
@@ -119,10 +120,8 @@ def runtime_identity_errors(value: dict[str, Any]) -> list[str]:
     release_state = value.get("release_state")
     if not isinstance(release_state, dict):
         errors.append("regional release identity is unavailable")
-    else:
-        phase = str(release_state.get("phase") or "").strip().lower()
-        if phase.startswith("rollback-") or phase == "rolling-back":
-            errors.append(f"regional release rollback is active at phase {phase}")
+    elif problem := release_phase_gate.release_phase_error(release_state):
+        errors.append(problem)
     deployments = value.get("deployments")
     if not isinstance(deployments, dict):
         errors.append("runtime deployment identity is unavailable")
@@ -917,7 +916,9 @@ class RegionalLiveFixture:
             result["release_id"] = self.release_id()
         return result
 
-    def evidence_identity(self) -> dict[str, str]:
+    def evidence_identity(
+        self, *, allow_phases: Collection[str] = ()
+    ) -> dict[str, str]:
         """The release and cluster a case's evidence must be bound to.
 
         Written into every case result (``result.update(...)``) so the next case
@@ -926,11 +927,12 @@ class RegionalLiveFixture:
         """
 
         return {
-            "release_id": self.release_id(),
+            "release_id": self.release_id(allow_phases=allow_phases),
             "cluster_id": self.settings.cluster_id,
         }
 
-    def release_id(self) -> str:
+    def release_id(self, *, allow_phases: Collection[str] = ()) -> str:
+        """The committed release; any other phase refuses (``release_phase_gate``)."""
         value = json.loads(
             self.kubectl(
                 "cpu",
@@ -942,7 +944,9 @@ class RegionalLiveFixture:
             )
         )
         state = json.loads(value["data"]["state.json"])
-        return str(state.get("release_id") or "")
+        return release_phase_gate.committed_release_id(
+            state, allowed_phases=allow_phases
+        )
 
     def release_pins(self) -> dict[str, str]:
         """The required release pins, keyed by the env name a CPU Pod exports.

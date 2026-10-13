@@ -125,7 +125,17 @@ def test_auth_audit_main_sandwiches_requests_between_store_snapshots(
     def run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
         if "configmap" in command:
             calls.append(("release", len(bridge.requests)))
-            value = {"data": {"state.json": '{"release_id":"unit-release"}'}}
+            value = {
+                "data": {
+                    "state.json": json.dumps(
+                        {
+                            "release_id": "unit-release",
+                            "phase": "complete",
+                            "transaction_committed": True,
+                        }
+                    )
+                }
+            }
         elif "exec" in command:
             calls.append(("store", len(bridge.requests)))
             value = probe(kwargs["input_text"], *command[command.index("-") + 1 :])

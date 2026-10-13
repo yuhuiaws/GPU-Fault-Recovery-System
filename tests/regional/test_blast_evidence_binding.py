@@ -262,7 +262,17 @@ def test_blast_release_drift_still_fails_with_unchanged_input_hashes(
     monkeypatch.setattr(
         runner,
         "cpu_json",
-        lambda *args: {"data": {"state.json": '{"release_id":"changed-release"}'}},
+        lambda *args: {
+            "data": {
+                "state.json": json.dumps(
+                    {
+                        "release_id": "changed-release",
+                        "phase": "complete",
+                        "transaction_committed": True,
+                    }
+                )
+            }
+        },
     )
     with pytest.raises(base.CheckError, match="lost its deployment identity"):
         runner.record_case(runner.case_id, "PASS", checks={"permission": True})

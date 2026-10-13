@@ -83,6 +83,10 @@ def _runtime_identity(*, phase: str = "complete") -> dict[str, Any]:
             for name in names
         }
     return {
-        "release_state": {"release_id": "release-a", "phase": phase},
+        "release_state": {
+            "release_id": "release-a",
+            "phase": phase,
+            "transaction_committed": phase == "complete",
+        },
         "deployments": deployments,
     }

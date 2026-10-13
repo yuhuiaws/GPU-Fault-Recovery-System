@@ -195,6 +195,7 @@ def safe_identity():
         "release_state": {
             "phase": "complete",
             "release_id": "release-a",
+            "transaction_committed": True,
             "updated_at_epoch": 1,
         },
         "deployments": {

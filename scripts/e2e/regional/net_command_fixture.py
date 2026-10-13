@@ -50,6 +50,9 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     component_python,
     predecessor_evidence,
 )
+from scripts.e2e.regional.release_phase_gate import (  # noqa: E402
+    committed_release_id,
+)
 from scripts.perf.regional_capacity_registry import (  # noqa: E402
     STORE_DSN_SNIPPET,
 )
@@ -299,24 +302,24 @@ def purge_seed(seed: dict[str, Any]) -> dict[str, Any]:
 # Identity and predecessor
 # --------------------------------------------------------------------------- #
 def release_id() -> str:
-    """The release the CPU control plane runs, from its release-state ConfigMap.
+    """The committed release the CPU control plane runs, from its release state.
 
-    The same document ``RegionalLiveFixture.release_id`` reads; the network
-    runners have no ``RegionalLiveFixture`` (their kubectl wrappers come from
-    the perf suite), so they read it here and record it in the case result.
+    The same document and the same phase gate as ``RegionalLiveFixture.release_id``;
+    the network runners have no ``RegionalLiveFixture`` (their kubectl wrappers
+    come from the perf suite), so they read it here and record it in the case
+    result. Any phase but a committed ``complete`` refuses.
     """
 
     value = json.loads(
         control("get", "configmap", RELEASE_STATE_CONFIGMAP, "-o", "json")
     )
-    state = json.loads(value["data"]["state.json"])
-    return str(state.get("release_id") or "")
+    return committed_release_id(json.loads(value["data"]["state.json"]))
 
 
 def evidence_identity(cluster_id: str | None) -> dict[str, str | None]:
     """What a case result must carry for ``predecessor_evidence`` to bind to it."""
 
-    return {"release_id": release_id() or None, "cluster_id": cluster_id or None}
+    return {"release_id": release_id(), "cluster_id": cluster_id or None}
 
 
 def predecessor_gate(

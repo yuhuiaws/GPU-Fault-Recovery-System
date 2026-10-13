@@ -212,7 +212,15 @@ def replay_runner(tmp_path: Path, monkeypatch: Any) -> Any:
             kind = argv[index + 1]
             if kind == "configmap" and not is_gpu:
                 result = {
-                    "data": {"state.json": json.dumps({"release_id": host.release_id})}
+                    "data": {
+                        "state.json": json.dumps(
+                            {
+                                "release_id": host.release_id,
+                                "phase": "complete",
+                                "transaction_committed": True,
+                            }
+                        )
+                    }
                 }
             elif "-A" in argv:
                 business = host.problem == "workload" or (

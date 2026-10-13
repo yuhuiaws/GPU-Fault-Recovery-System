@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import destr014_release as release
+from scripts.e2e.regional import release_phase_gate as gate
 from scripts.e2e.regional import run_destr014_branch_exhaustion as destr014
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 
@@ -313,6 +314,26 @@ def test_rebooted_nodes_and_identity_read_the_plan(tmp_path: Path) -> None:
     assert release.identity_errors(regional, plan_settings, IDENTITY) == [
         "fault node UID changed: plan uid-fault live uid-replacement"
     ]
+
+
+ROLLED_BACK = {"phase": "rolled-back", "release_id": "release-a"}
+
+
+class RolledBack(Regional):
+    """The live state after a rollback: it still names the plan's release id,
+    the candidate that failed, while the site runs its previous release."""
+
+    def release_id(self) -> str:
+        return gate.committed_release_id(ROLLED_BACK)
+
+
+def test_a_release_that_is_not_committed_is_an_identity_error(tmp_path: Path) -> None:
+    """The id matches the plan's, yet binds nothing: the gate's refusal is the
+    identity error, recorded in the release report instead of aborting it."""
+
+    errors = release.identity_errors(RolledBack(), settings(tmp_path), IDENTITY)
+    assert errors == [gate.release_phase_error(ROLLED_BACK)], errors
+    assert "phase 'rolled-back'" in errors[0], errors
 
 
 def test_run_admin_reports_the_verb_and_its_exit(

@@ -76,7 +76,17 @@ def make_runner(
         if "namespaces" in args
         else {"items": []}
         if cases.RBAC_INVENTORY in args
-        else {"data": {"state.json": json.dumps({"release_id": "release-test"})}},
+        else {
+            "data": {
+                "state.json": json.dumps(
+                    {
+                        "release_id": "release-test",
+                        "phase": "complete",
+                        "transaction_committed": True,
+                    }
+                )
+            }
+        },
     )
     monkeypatch.setattr(runner, "preflight", lambda: None)
     return runner
@@ -119,7 +129,15 @@ def test_blast_cache_requires_the_complete_current_scope(
             runner,
             "cpu_json",
             lambda *args: {
-                "data": {"state.json": json.dumps({"release_id": "changed"})}
+                "data": {
+                    "state.json": json.dumps(
+                        {
+                            "release_id": "changed",
+                            "phase": "complete",
+                            "transaction_committed": True,
+                        }
+                    )
+                }
             },
         )
         with pytest.raises(base.CheckError, match="identity changed"):

@@ -207,12 +207,17 @@ def dataplane(
 
 
 def release_state_release_id() -> str:
-    """The release ID from ``gpu-fault-regional-release-state``, or "".
+    """The committed release ID from ``gpu-fault-regional-release-state``, or "".
 
     The CPU role environment never renders ``GPU_FAULT_RELEASE_ID`` into the
     api-ha Deployment, so the release's own state record is the only source
-    once no artifact volume names it.
+    once no artifact volume names it. "" means the state records no release;
+    a recorded one at any phase but a committed ``complete`` names a release
+    the site does not run (after a rollback: the failed candidate), so it
+    refuses instead of labelling the run with it.
     """
+
+    from scripts.e2e.regional.release_phase_gate import committed_release_id
 
     state_document = control(
         "get",
@@ -226,7 +231,9 @@ def release_state_release_id() -> str:
         state = json.loads(state_document) if state_document else {}
     except ValueError:
         return ""
-    return str(state.get("release_id") or "") if isinstance(state, dict) else ""
+    if not isinstance(state, dict) or not state.get("release_id"):
+        return ""
+    return committed_release_id(state)
 
 
 def dataplane_identity(

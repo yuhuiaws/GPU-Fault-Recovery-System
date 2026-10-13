@@ -24,7 +24,11 @@ def test_target_binding_reads_complete_replica_population_before_identity(
     # Live shape (2026-09-20): the release id is bound from the regional release
     # state ConfigMap's state.json, the same source every case's evidence uses;
     # the release-metadata ConfigMap carries no release-id key.
-    release_state = {"phase": "complete", "release_id": "fixture-release"}
+    release_state = {
+        "phase": "complete",
+        "release_id": "fixture-release",
+        "transaction_committed": True,
+    }
     deployment = {
         "metadata": {"uid": "fixture-deployment", "generation": 2},
         "spec": {"replicas": 3},

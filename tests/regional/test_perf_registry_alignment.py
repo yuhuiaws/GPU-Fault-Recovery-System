@@ -18,6 +18,7 @@ from gpu_fault.regional import (
     RegionalClusterRegistration,
     regional_registry_content_sha256,
 )
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from scripts.perf import regional_capacity_registry as registry
 from scripts.perf import regional_capacity_suite as suite
 from scripts.perf import regional_registry_alignment as alignment
@@ -489,7 +490,16 @@ def test_register_and_deregister_run_the_alignment_gate(
 @pytest.mark.parametrize(
     ("state_document", "expected"),
     [
-        (json.dumps({"release_id": "release-a", "phase": "complete"}), "release-a"),
+        (
+            json.dumps(
+                {
+                    "release_id": "release-a",
+                    "phase": "complete",
+                    "transaction_committed": True,
+                }
+            ),
+            "release-a",
+        ),
         ("", ""),
         ("not-json", ""),
         (json.dumps({"phase": "complete"}), ""),
@@ -515,6 +525,32 @@ def test_release_state_release_id_reads_the_release_state_configmap(
     )
 
 
+@pytest.mark.parametrize(
+    "state",
+    [
+        {"release_id": "release-failed", "phase": "rolled-back"},
+        {"release_id": "release-a", "phase": "complete"},
+        {"release_id": "release-a", "phase": "rollback-cpu-restoring"},
+        {"release_id": "release-a", "phase": "partial-convergence"},
+    ],
+    ids=["rolled-back", "uncommitted", "rolling-back", "stopped"],
+)
+def test_release_state_release_id_refuses_a_release_the_site_does_not_run(
+    monkeypatch: pytest.MonkeyPatch, state: dict[str, Any]
+) -> None:
+    """A recorded release at any phase but a committed ``complete`` is the
+    candidate, not the release served: the run must not be labelled with it."""
+
+    monkeypatch.setattr(registry, "control", lambda *_a, **_k: json.dumps(state))
+
+    with pytest.raises(RegionalFixtureError) as refused:
+        registry.release_state_release_id()
+    message = str(refused.value)
+    assert f"phase {state['phase']!r}" in message, message
+    assert repr(state["release_id"]) in message, message
+    assert "gpu-fault-admin deploy" in message, message
+
+
 @pytest.mark.parametrize("artifact_volume", [True, False])
 def test_capacity_release_id_prefers_the_artifact_volume_then_the_release_state(
     monkeypatch: pytest.MonkeyPatch, artifact_volume: bool
@@ -525,7 +561,16 @@ def test_capacity_release_id_prefers_the_artifact_volume_then_the_release_state(
         calls.append(args)
         if args[1] == "deploy":
             return "gpu-fault-control-plane-wheel-0100\n" if artifact_volume else "\n"
-        return json.dumps({"release_id": "release-a"}) + "\n"
+        return (
+            json.dumps(
+                {
+                    "release_id": "release-a",
+                    "phase": "complete",
+                    "transaction_committed": True,
+                }
+            )
+            + "\n"
+        )
 
     # The suite binds the registry's ``control`` at import; patch both names.
     monkeypatch.setattr(suite, "control", control)

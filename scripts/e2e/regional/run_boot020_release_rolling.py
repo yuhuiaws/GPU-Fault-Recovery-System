@@ -1172,6 +1172,7 @@ class LiveReleaseRollingBackend:
         return {
             "phase": state.get("phase"),
             "release_id": state.get("release_id"),
+            "transaction_committed": state.get("transaction_committed") is True,
             "live": captured,
             "cpu_generations": cpu_generations,
             "cpu_identities": cpu_identities,

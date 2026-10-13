@@ -1259,7 +1259,11 @@ def _identity(*, generation: int, template: str = "sha-1") -> dict[str, Any]:
     """
 
     return {
-        "release_state": {"release_id": "rel-1", "phase": "committed"},
+        "release_state": {
+            "release_id": "rel-1",
+            "phase": "complete",
+            "transaction_committed": True,
+        },
         "deployments": {
             plane: {
                 name: (

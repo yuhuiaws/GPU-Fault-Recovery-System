@@ -275,7 +275,7 @@ def test_evidence_identity_names_the_release_and_the_cluster(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     regional = _regional(tmp_path)
-    monkeypatch.setattr(regional, "release_id", lambda: "release-a")
+    monkeypatch.setattr(regional, "release_id", lambda **_kwargs: "release-a")
 
     assert regional.evidence_identity() == {
         "release_id": "release-a",

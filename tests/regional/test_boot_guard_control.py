@@ -199,7 +199,13 @@ def test_target_identity_reads_the_release_id_every_other_case_binds_to(
     monkeypatch.setattr(
         control,
         "run",
-        _identity_kubectl({"phase": "complete", "release_id": "0e813e5eaf80"}),
+        _identity_kubectl(
+            {
+                "phase": "complete",
+                "release_id": "0e813e5eaf80",
+                "transaction_committed": True,
+            }
+        ),
     )
     identity = control.target_identity(environment)
     assert identity["release_id"] == "0e813e5eaf80"

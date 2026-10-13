@@ -49,6 +49,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     predecessor_evidence,
 )
+from scripts.e2e.regional.release_phase_gate import committed_release_id  # noqa: E402
 
 CASE_ID = "GF-REGIONAL-BOOT-019"
 CONFIRMATION = "RUN_BOOT019_ADMIN_LIFECYCLE"
@@ -459,7 +460,9 @@ class LiveAdminLifecycleBackend:
         desired = int(deployment["spec"].get("replicas") or 0)
         ready = int(deployment.get("status", {}).get("readyReplicas") or 0)
         return {
-            "release_id": state.get("release_id"),
+            # Join/remove re-sync a committed state; any other phase names a
+            # release the site does not run, so the snapshot refuses it.
+            "release_id": committed_release_id(state),
             "site_cluster_ids": site_ids,
             "registry_secret_cluster_ids": secret_ids,
             "release_state_cluster_ids": sorted(state.get("cluster_ids") or []),

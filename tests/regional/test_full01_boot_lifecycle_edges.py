@@ -10,8 +10,8 @@ import os
 import runpy
 import subprocess
 import sys
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager, redirect_stdout
+from collections.abc import Callable, Collection, Iterator
+from contextlib import contextmanager, redirect_stdout, suppress
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -107,6 +107,8 @@ class LifecycleIO(CommandRunner):
         self.connection_options: list[dict[str, Any]] = []
         self.aws_reads: list[tuple[str, ...]] = []
         self.fixture_targets: list[tuple[Path, str]] = []
+        # The non-committed phases each identity read was told to accept.
+        self.allowed_phases: list[frozenset[str]] = []
 
     @contextmanager
     def connect(self, dsn: str, **options: Any) -> Iterator[LifecycleIO]:
@@ -146,7 +148,10 @@ class LifecycleIO(CommandRunner):
             return ProbeRows(copy.deepcopy(self.rows))
         pytest.fail(f"unexpected store probe statement: {statement}")
 
-    def evidence_identity(self) -> dict[str, str]:
+    def evidence_identity(
+        self, *, allow_phases: Collection[str] = ()
+    ) -> dict[str, str]:
+        self.allowed_phases.append(frozenset(allow_phases))
         return dict(self.identity)
 
     def cpu_python(self, script: str) -> dict[str, Any]:
@@ -510,6 +515,45 @@ def test_lifecycle_cli_captures_then_verifies_actual_observed_schema_and_history
         ["command", "history"],
     ), "verification must request exactly the captured record keys"
     assert output.stat().st_mode & 0o777 == 0o600
+
+
+@pytest.mark.parametrize(
+    ("mode", "stopped"),
+    [
+        ("schema", frozenset()),
+        ("fail-forward", frozenset({"failed", "partial-convergence"})),
+    ],
+)
+def test_only_a_fail_forward_verify_binds_to_its_stopped_transaction(
+    lifecycle_io: LifecycleIO,
+    monkeypatch: pytest.MonkeyPatch,
+    mode: str,
+    stopped: frozenset[str],
+) -> None:
+    """The capture and a schema verify bind only to a committed release; a
+    fail-forward verify names the two stopped phases it witnesses, nothing more."""
+
+    state = lifecycle_io.site.source.parent
+    before, output = state / "before.json", state / "proof.json"
+    lifecycle_cli(monkeypatch, state, before, "capture")
+    lifecycle_io.version = LATEST_POSTGRES_SCHEMA_VERSION
+    with suppress(SystemExit):
+        lifecycle_cli(
+            monkeypatch,
+            state,
+            output,
+            "verify",
+            "--before",
+            str(before),
+            "--mode",
+            mode,
+        )
+    assert lifecycle_io.allowed_phases == [frozenset(), stopped], (
+        "only the fail-forward verify may accept a stopped transaction"
+    )
+    assert stopped <= lifecycle.FAIL_FORWARD_STOPPED_PHASES, (
+        "the witness accepts exactly the gate's fail-forward stopped phases"
+    )
 
 
 def test_lifecycle_cli_writes_a_failed_proof_and_exits_nonzero_on_history_loss(

@@ -35,6 +35,7 @@ from scripts.e2e.regional.regional_commands import (  # noqa: E402
     run_fixture_command,
 )
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
+from scripts.e2e.regional.release_phase_gate import release_phase_error  # noqa: E402
 
 EXECUTION_TOKEN_NAME = re.compile(r"execution[_.-]?token", re.IGNORECASE)
 GPU_FAULT_PREFIX = "gpu-fault.io/"
@@ -642,12 +643,10 @@ class BlastRunnerBase:
             state = json.loads(document["data"]["state.json"])
         except (KeyError, TypeError, json.JSONDecodeError) as exc:
             raise CheckError("regional release state is not valid JSON") from exc
-        if (
-            not isinstance(state, dict)
-            or not isinstance(state.get("release_id"), str)
-            or not state["release_id"]
-        ):
+        if not isinstance(state, dict):
             raise CheckError("regional release identity is missing")
+        if problem := release_phase_error(state):
+            raise CheckError(problem)
         current = {
             "release_id": state["release_id"],
             "cluster_id": self.targets[0].cluster_id

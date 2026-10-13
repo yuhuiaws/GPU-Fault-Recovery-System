@@ -413,7 +413,18 @@ def boot019_snapshot(
                 "json",
             ],
             300,
-            {"data": {"state.json": '{"cluster_ids":["cluster-a"]}'}},
+            {
+                "data": {
+                    "state.json": json.dumps(
+                        {
+                            "cluster_ids": ["cluster-a"],
+                            "release_id": "rel-a",
+                            "phase": "complete",
+                            "transaction_committed": True,
+                        }
+                    )
+                }
+            },
         ),
         (
             [*cpu, "get", "deployment", "gpu-fault-api-ha", "-o", "json"],

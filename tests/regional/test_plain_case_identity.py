@@ -131,7 +131,11 @@ class IdentityProbe:
         }
         self.executor = {"cluster_id": settings.cluster_id}
         self.runtime: dict[str, Any] = {
-            "release_state": {"release_id": "release-unit", "phase": "COMMITTED"},
+            "release_state": {
+                "release_id": "release-unit",
+                "phase": "complete",
+                "transaction_committed": True,
+            },
             "deployments": {
                 plane: {
                     name: {

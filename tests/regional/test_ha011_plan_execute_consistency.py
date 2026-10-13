@@ -128,7 +128,12 @@ def test_a_real_change_after_the_drivers_plan_still_drifts(
     _drive_plan(monkeypatch, settings, tmp_path, capsys)
     state = fake.object("ConfigMap", "gpu-fault-regional-release-state", business=True)
     state["data"]["state.json"] = json.dumps(
-        {"release_id": "release-fixture", "verified_at": "later"}
+        {
+            "release_id": "release-fixture",
+            "phase": "complete",
+            "transaction_committed": True,
+            "verified_at": "later",
+        }
     )
 
     assert runner.execute_case(settings, tmp_path, 1, deadline()) == 1, (

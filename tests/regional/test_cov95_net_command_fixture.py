@@ -143,7 +143,17 @@ def test_seed_cleanup_and_identity_calls_forward_exact_scope(
         fixture,
         "control",
         lambda *a: json.dumps(
-            {"data": {"state.json": json.dumps({"release_id": "release-a"})}}
+            {
+                "data": {
+                    "state.json": json.dumps(
+                        {
+                            "release_id": "release-a",
+                            "phase": "complete",
+                            "transaction_committed": True,
+                        }
+                    )
+                }
+            }
         ),
     )
     assert fixture.evidence_identity("cluster-a") == {

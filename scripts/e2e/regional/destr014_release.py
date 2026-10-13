@@ -281,11 +281,18 @@ def identity_errors(
     """Release id and both Node UIDs must be the plan's; boot ids may differ."""
 
     errors: list[str] = []
-    live_release = regional.release_id()
-    if live_release != identity.get("release_id"):
-        errors.append(
-            f"release id changed: plan {identity.get('release_id')} live {live_release}"
-        )
+    try:
+        live_release = regional.release_id()
+    except RegionalFixtureError as exc:
+        # A release that is not committed binds nothing; the refusal is the
+        # reason, recorded in the release report instead of aborting it.
+        errors.append(str(exc))
+    else:
+        if live_release != identity.get("release_id"):
+            errors.append(
+                f"release id changed: plan {identity.get('release_id')} "
+                f"live {live_release}"
+            )
     for label, node, key in (
         ("fault", settings.fault_node, "fault_node_uid"),
         ("sibling", settings.sibling_node, "sibling_node_uid"),

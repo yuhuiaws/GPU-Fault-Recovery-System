@@ -111,6 +111,7 @@ class FakeBackend:
         return {
             "phase": "complete",
             "release_id": scenario,
+            "transaction_committed": True,
             "live": copy.deepcopy(self.live),
             "cpu_generations": dict(self.cpu_generations),
             "cpu_identities": copy.deepcopy(self.cpu_identities),

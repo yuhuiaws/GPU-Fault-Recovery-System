@@ -108,7 +108,11 @@ class Kubernetes:
                 }
             ],
         }
-        self.release = {"release_id": "release-a", "phase": "complete"}
+        self.release = {
+            "release_id": "release-a",
+            "phase": "complete",
+            "transaction_committed": True,
+        }
 
     def __call__(self, kubeconfig, context, *arguments, **options):
         self.calls.append((kubeconfig, context, arguments, options))

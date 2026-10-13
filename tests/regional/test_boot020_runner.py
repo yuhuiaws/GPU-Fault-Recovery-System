@@ -122,6 +122,7 @@ class FakeReleaseRollingBackend:
         return {
             "phase": "complete",
             "release_id": scenario,
+            "transaction_committed": True,
             "live": copy.deepcopy(self.live),
             "cpu_generations": dict(self.cpu_generations),
             "cpu_identities": copy.deepcopy(self.cpu_identities),
@@ -594,7 +595,12 @@ def test_boot020_live_snapshot_reads_once_per_context_inside_one_snapshot(
             (*inventory.DEPLOYMENTS, inventory.GPU_RECONCILER_DEPLOYMENT)
         )
     ]
-    state = {"phase": "complete", "release_id": "rel-1", "previous": {}}
+    state = {
+        "phase": "complete",
+        "release_id": "rel-1",
+        "transaction_committed": True,
+        "previous": {},
+    }
     release = FakeRelease(
         {"/cpu.kubeconfig": cpu_items, "ctx-a": gpu_items, "ctx-b": gpu_items},
         load_state=lambda: state,
@@ -621,6 +627,8 @@ def test_boot020_live_snapshot_reads_once_per_context_inside_one_snapshot(
     assert snapshot == {
         "phase": "complete",
         "release_id": "rel-1",
+        # The restore stage binds the case's identity only to a committed one.
+        "transaction_committed": True,
         "live": {"release_id": "rel-1", "clusters": {"cluster-a": {}, "cluster-b": {}}},
         "cpu_generations": {
             name: index + 1

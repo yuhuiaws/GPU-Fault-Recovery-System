@@ -195,7 +195,14 @@ def test_action_capacity_seed_rejects_unknown_release_identity_fields() -> None:
         )
 
 
+# Only a committed release's pins are the ones the product serves.
+COMMITTED_RELEASE = {
+    "release_id": "release-a",
+    "phase": "complete",
+    "transaction_committed": True,
+}
 EXECUTOR_STATE = {
+    **COMMITTED_RELEASE,
     "executor_protocol_version": 2,
     "executor_wheel_sha256": "a" * 64,
     "component_digests": {"executor": "b" * 64},
@@ -206,6 +213,7 @@ EXECUTOR_PINS = {
     "required-regional-executor-compatibility-digest": "b" * 64,
 }
 AGENT_STATE = {
+    **COMMITTED_RELEASE,
     "agent_protocol_version": 3,
     "node_wheel_sha256": "a" * 64,
     "bundle_sha256": "c" * 64,

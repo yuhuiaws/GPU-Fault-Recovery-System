@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+from collections.abc import Collection
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -23,6 +24,7 @@ from gpu_fault_release.regional_release_store_probe import (
     compatible_retained_schema,
 )
 from scripts.e2e.regional.boot_acceptance_common import SiteFixture
+from scripts.e2e.regional.release_phase_gate import FAIL_FORWARD_STOPPED_PHASES
 
 # The baseline CPU release need not contain newly added deploy-host helpers.
 STORE_PROBE = r"""
@@ -66,13 +68,21 @@ print(json.dumps({"schema_version": version, "migrations": history, "records": h
 """
 
 
-def observe(state_dir: Path, *, keys: list[str] | None = None) -> dict[str, Any]:
+def observe(
+    state_dir: Path,
+    *,
+    keys: list[str] | None = None,
+    allow_phases: Collection[str] = (),
+) -> dict[str, Any]:
+    """One observation; its identity is the committed release unless the caller
+    names the stopped phases it witnesses (``allow_phases``)."""
+
     site = load_site(state_dir / "site.yaml")
     clusters = site.release_config["clusters"]
     if not clusters:
         raise ValueError("lifecycle witness needs an installed baseline GPU")
     fixture = SiteFixture(site.source, clusters[0]["cluster_id"])
-    identity = fixture.regional.evidence_identity()
+    identity = fixture.regional.evidence_identity(allow_phases=allow_phases)
     script = "INPUT = " + repr(json.dumps({"keys": keys or []})) + "\n" + STORE_PROBE
     store = fixture.regional.cpu_python(script)
     state_map = json.loads(
@@ -320,6 +330,11 @@ def main() -> None:
     after = observe(
         args.state_dir,
         keys=[key.split("/", 1)[1] for key in before["store"]["records"]],
+        # A fail-forward witness observes the stopped transaction it proves; the
+        # capture and every other mode bind only to a committed release.
+        allow_phases=(
+            FAIL_FORWARD_STOPPED_PHASES if args.mode == "fail-forward" else ()
+        ),
     )
     uninstall = None
     if args.mode == "reinstall":

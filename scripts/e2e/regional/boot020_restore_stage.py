@@ -14,7 +14,11 @@ state:
 * afterwards it classifies ``NOOP`` again -- the site is back where the chain
   started;
 * every Running CPU Pod's effective ``GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION``
-  equals its ``-config-core`` ConfigMap: no start-up-env drift is left behind.
+  equals its ``-config-core`` ConfigMap: no start-up-env drift is left behind;
+* its last observation names a committed ``complete`` release: that is the
+  case's evidence identity, and evidence binds to nothing else
+  (``release_phase_gate``). The stages before it observe ``rolled-back`` and
+  ``failed`` on purpose; those observations are the proof, not an identity.
 """
 
 from __future__ import annotations
@@ -22,6 +26,8 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 from typing import Any
+
+from scripts.e2e.regional.release_phase_gate import release_phase_error
 
 STAGE = "restore"
 # The site's own release config: it classified NOOP before the chain began.
@@ -58,6 +64,8 @@ def stage_restore(
     )
     after = chain.after(backend, recorder, STAGE)
     require(after["live"] != before["live"], "restore changed nothing", (before, after))
+    problem = release_phase_error(after)
+    require(problem is None, f"restore end state: {problem}")
     alignment = recorder.stage(
         f"{STAGE}_cpu_env_alignment",
         lambda: backend.cpu_env_alignment(RESTORE_SCENARIO),

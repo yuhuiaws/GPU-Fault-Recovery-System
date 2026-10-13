@@ -140,7 +140,15 @@ class Kubernetes:
                     "namespace": namespace,
                     "uid": "release-cm",
                 },
-                "data": {"state.json": json.dumps({"release_id": "release-fixture"})},
+                "data": {
+                    "state.json": json.dumps(
+                        {
+                            "release_id": "release-fixture",
+                            "phase": "complete",
+                            "transaction_committed": True,
+                        }
+                    )
+                },
             }
         )
         self.put(

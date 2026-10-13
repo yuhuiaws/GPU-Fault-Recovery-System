@@ -344,7 +344,17 @@ class FakeSite:
             if arguments[1] == "gpu-fault-release-metadata":
                 return json.dumps({"data": dict(RELEASE_METADATA_DATA)})
             return json.dumps(
-                {"data": {"state.json": json.dumps({"release_id": RELEASE_ID})}}
+                {
+                    "data": {
+                        "state.json": json.dumps(
+                            {
+                                "release_id": RELEASE_ID,
+                                "phase": "complete",
+                                "transaction_committed": True,
+                            }
+                        )
+                    }
+                }
             )
         if (
             kind == "secret"

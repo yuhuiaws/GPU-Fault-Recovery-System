@@ -515,6 +515,15 @@ Except for the two kinds of purely local/read-only entry points, every runner wr
 and the top-level `release_id`/`cluster_id` of that evidence must equal the identity this runner reads from the release-state and
 the target cluster (`RegionalLiveFixture.evidence_identity`): a PASS left over from before a release change or
 cluster change is not a predecessor (`evidence_valid=false`) and cannot release execute.
+`evidence_identity` binds only to a committed release: the release-state must be `complete` with
+`transaction_committed=true` (`scripts/e2e/regional/release_phase_gate.py`). Every checkpoint of the release-state
+stamps the candidate's `release_id`, so `rolled-back` (it records the candidate that failed while the site runs its
+previous release), a `rollback-*` phase, a `bootstrap-*` phase, a forward phase in flight or stopped, `data-plane-paused`,
+and an uncommitted `complete` (its verify/stability gate has not passed, so it can still roll back) all refuse to bind;
+the error names the phase, the recorded release_id and the remedy: run `gpu-fault-admin deploy` of the site's own release.
+A legitimate non-complete phase must be declared explicitly by its caller; the only one is the BOOT store-lifecycle
+companion's `verify --mode fail-forward` (`failed`/`partial-convergence`). BOOT-020/023 observe the rollback and
+failure phases through the release engine; those observations are the proof itself, not an evidence identity.
 
 The runner supports two explicit execution scopes:
 
@@ -3357,7 +3366,9 @@ uninstall target be guessed. Save the original bootstrap task terminal states an
     the next classification must be `NOOP` (`restore_next_classification`), and inside the Running Pod of every CPU
     Deployment `GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION`
     must match its `-config-core` ConfigMap (`restore_cpu_env_alignment`) --
-    candidate D's start-time environment must not linger on any replica. Any failed assertion is FAIL, and the operator handles the site
+    candidate D's start-time environment must not linger on any replica. The release state read back after the apply must be a committed
+    `complete` (`restore end state`): it is this case's evidence identity; the earlier stages observe `rolled-back`/`failed` on purpose,
+    and those observations are the proof itself, not an identity. Any failed assertion is FAIL, and the operator handles the site
     according to the rollback record. At the end of the case the site is back on its own committed release; subsequent cases need no additional deploy.
   - Output `boot023-noop.json` under this case's directory (i.e. the site config used for the restore); its digest is written to
     `final_noop_handoff`; the subsequent BOOT-023 uses this config to judge the restored live as `NOOP`.
@@ -3602,6 +3613,12 @@ explicit cleanup proof. A reinstall must additionally prove the retained handoff
 If the selected historical records are zero, record zero; do not claim to have proven that non-existent data was retained. A normal FULL Profile
 change, or a deploy into a new directory after BOOT-029 deleted the database, cannot satisfy this retained-database reinstall obligation.
 When the corresponding lifecycle was not performed the companion stays `NOT_RUN`, and its standalone result is not a PASS for the whole case.
+
+`capture` and `verify` bind evidence only to a committed release (the release-state is `complete` with
+`transaction_committed=true`); the only explicit exception is `verify --mode fail-forward`, whose subject is a transaction
+stopped in `failed`/`partial-convergence`, so it accepts exactly those two phases. Every other mode and phase (including
+`rolled-back` after a rollback and an uncommitted `complete`) is refused; the error names the phase, the recorded
+release_id and the remedy: run `gpu-fault-admin deploy` of the site's own release.
 
 ### GF-REGIONAL-BOOT-032
 

@@ -32,6 +32,7 @@ from scripts.e2e.regional.regional_case_contract import (  # noqa: E402
 )
 from scripts.e2e.regional.regional_live_fixture import predecessor_evidence  # noqa: E402
 from scripts.e2e.regional.regional_pod_inventory import ready_pod_records  # noqa: E402
+from scripts.e2e.regional.release_phase_gate import release_phase_error  # noqa: E402
 
 CONFIRMATION = "BOOT_GUARD_EXECUTE"
 CASE_NUMBERS = (1, 2, 3, 4, 5, 7, 8, 9, 10)
@@ -138,6 +139,8 @@ def target_identity(environment: dict[str, str]) -> dict[str, Any]:
         or generation < 1
     ):
         raise RuntimeError("BOOT guard CPU target identity is incomplete")
+    if problem := release_phase_error(release_state):
+        raise RuntimeError(f"BOOT guard CPU target: {problem}")
     return {
         "release_id": release_id,
         "cpu_deployment_uid": uid,

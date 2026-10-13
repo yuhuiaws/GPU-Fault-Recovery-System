@@ -45,6 +45,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     component_python,
     predecessor_evidence,
 )
+from scripts.e2e.regional.release_phase_gate import release_phase_error  # noqa: E402
 from scripts.e2e.regional.warm_node_evidence import project_gpu_nodes  # noqa: E402
 from tools.pytest_result_identity import PytestReceipt  # noqa: E402
 
@@ -356,12 +357,10 @@ def audit_identity() -> dict[str, str]:
     )
     state = json.loads(document["data"]["state.json"])
     release_id = state.get("release_id")
-    if (
-        not isinstance(release_id, str)
-        or not release_id.strip()
-        or state.get("phase") != "complete"
-    ):
+    if not isinstance(release_id, str) or not release_id.strip():
         raise RuntimeError("guard audit requires a complete bound release")
+    if problem := release_phase_error(state):
+        raise RuntimeError(f"guard audit requires a complete bound release: {problem}")
     global MANAGED_PROVIDER
     MANAGED_PROVIDER = str(registration.get("provider") or "hyperpod")
     return {

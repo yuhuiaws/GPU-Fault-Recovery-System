@@ -79,6 +79,11 @@ Every formal load-test round must record:
 
 Control plane and data plane must use the same release. When the version or digest differs,
 the round's results are invalid.
+A release the perf tooling reads from the release state (the run label, the Action runner's pins) must be a
+committed `complete`: after a rollback `rolled-back` records the candidate that failed, and a state in flight, stopped or
+uncommitted does not name the release the site runs either, so all of them fail closed; the error names the phase, the
+recorded release_id and the remedy (run `gpu-fault-admin deploy` of the site's own release). A release ID taken from the
+artifact volume reflects what the live api-ha Deployment runs and is not gated.
 
 ### 3.2 Registry and Control-Plane Isolation
 

@@ -167,7 +167,11 @@ class HA010Harness:
 
     def runtime_identity(self) -> dict[str, Any]:
         return {
-            "release_state": {"phase": "complete"},
+            "release_state": {
+                "release_id": "unit-release",
+                "phase": "complete",
+                "transaction_committed": True,
+            },
             "deployments": {
                 plane: {
                     name: {

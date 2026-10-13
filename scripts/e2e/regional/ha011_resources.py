@@ -34,6 +34,7 @@ from scripts.e2e.regional.ha011_manifests import (
 )
 from scripts.e2e.regional.ha_plan_preflight import require_window
 from scripts.e2e.regional.regional_commands import run_fixture_command
+from scripts.e2e.regional.release_phase_gate import release_phase_error
 
 INTENT = "gpu-fault.nvidia.com/ha011-intent"
 
@@ -171,6 +172,8 @@ class CpuKubernetes:
             raise ProofError(
                 "deployed release or runtime container identity is ambiguous"
             )
+        if problem := release_phase_error(state):
+            raise ProofError(problem)
         image = containers[0]["image"]
         if not IMAGE.fullmatch(image):
             raise ProofError(

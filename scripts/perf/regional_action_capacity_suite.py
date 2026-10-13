@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 from gpu_fault.fleet_pins import CONFIG_MAP_KEY_ENVIRONMENT, DEFAULT_CONFIG_MAP
 from gpu_fault.models import WorkflowOperation
 from scripts.e2e.regional.regional_live_fixture import component_python
+from scripts.e2e.regional.release_phase_gate import release_phase_error
 
 if TYPE_CHECKING or __package__:
     from .regional_capacity_registry import (
@@ -414,6 +415,9 @@ def _release_state() -> dict[str, object]:
     )
     if not isinstance(state, dict):
         raise RuntimeError("regional release state is not a JSON object")
+    # Its pins are the candidate's: only a committed release is the one served.
+    if problem := release_phase_error(state):
+        raise RuntimeError(problem)
     return state
 
 

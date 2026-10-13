@@ -39,6 +39,7 @@ from scripts.e2e.regional.regional_workload_inventory import (  # noqa: E402
     business_workload_details,
     business_workload_items,
 )
+from scripts.e2e.regional.release_phase_gate import release_phase_error  # noqa: E402
 from scripts.perf.regional_capacity_registry import (  # noqa: E402
     STORE_DSN_SNIPPET,
 )
@@ -678,7 +679,7 @@ finally:
         return result
 
     def read_release_id(self) -> str:
-        """The release the CPU control plane runs, for binding this evidence."""
+        """The committed release the CPU control plane runs, binding this evidence."""
 
         value = json.loads(
             self.cpu(
@@ -692,10 +693,10 @@ finally:
             ).stdout
         )
         state = json.loads(value["data"]["state.json"])
-        release = str(state.get("release_id") or "")
-        if not release:
-            raise CaseError("release state carries no release_id")
-        return release
+        problem = release_phase_error(state)
+        if problem:
+            raise CaseError(problem)
+        return str(state["release_id"])
 
     def snapshot(self, tag: str | None = None) -> dict[str, Any]:
         args = ["snapshot"]

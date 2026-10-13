@@ -183,7 +183,17 @@ def test_ha009_default_invocation_is_plan_only(
             returncode=0,
             stderr="",
             stdout=json.dumps(
-                {"data": {"state.json": json.dumps({"release_id": "unit-release"})}}
+                {
+                    "data": {
+                        "state.json": json.dumps(
+                            {
+                                "release_id": "unit-release",
+                                "phase": "complete",
+                                "transaction_committed": True,
+                            }
+                        )
+                    }
+                }
             ),
         )
 

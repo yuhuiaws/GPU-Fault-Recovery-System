@@ -49,7 +49,11 @@ WITNESS_STATE_ROOT = "/var/lib/gpu-fault-acceptance/destr015"
 
 def ready_runtime() -> dict[str, Any]:
     return {
-        "release_state": {"phase": "COMMITTED"},
+        "release_state": {
+            "release_id": "release-test",
+            "phase": "complete",
+            "transaction_committed": True,
+        },
         "deployments": {
             plane: {
                 name: {

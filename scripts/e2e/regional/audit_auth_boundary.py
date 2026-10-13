@@ -27,6 +27,7 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 )
 from scripts.e2e.regional.regional_commands import run_fixture_command  # noqa: E402
 from scripts.e2e.regional.regional_live_fixture import component_python  # noqa: E402
+from scripts.e2e.regional.release_phase_gate import committed_release_id  # noqa: E402
 
 # Same value as identity_acceptance_common.ACCEPTANCE_PROBE_OWNER (asserted by
 # a unit test). The store filters claim candidates by step.execution_owner, so
@@ -667,8 +668,11 @@ def release_id(kubeconfig: Path, namespace: str) -> str:
         check=True,
         timeout=120,
     )
-    state = json.loads(json.loads(completed.stdout)["data"]["state.json"])
-    return str(state.get("release_id") or "")
+    # The committed release only: any other phase names a release the site
+    # does not run (or not everywhere), so the audit refuses to bind to it.
+    return committed_release_id(
+        json.loads(json.loads(completed.stdout)["data"]["state.json"])
+    )
 
 
 def run_matrix(arguments: argparse.Namespace) -> dict[str, Any]:

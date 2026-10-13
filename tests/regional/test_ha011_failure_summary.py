@@ -69,7 +69,12 @@ def test_plan_drift_names_the_moved_fact_with_both_values(
     planned = plan(settings, tmp_path)
     state = fake.object("ConfigMap", "gpu-fault-regional-release-state", business=True)
     state["data"]["state.json"] = json.dumps(
-        {"release_id": "release-fixture", "verified_at": "later"}
+        {
+            "release_id": "release-fixture",
+            "phase": "complete",
+            "transaction_committed": True,
+            "verified_at": "later",
+        }
     )
 
     result = _execute(settings, tmp_path, capsys)
