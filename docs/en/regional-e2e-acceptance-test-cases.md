@@ -11050,6 +11050,20 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
   the injection verdict prints each event's `disposition`/`reasons`/`product`/`gpu_identity_source` when "the two events did not land in
   one workflow", and every `timeline.json` entry carries `decision_reasons`. Judgement: `tests/regional/test_gpu_identity_preflight.py`,
   `tests/app_services/test_xid_product_from_inventory.py`, `tests/collectors/test_gpu_identity_refresh.py`.
+- Two nodes whose quiesce windows run in different persistence regimes give no physical overlap: on HyperPod attempt 2 the
+  workflow itself completed (parallel dispatch, one join restart) and the verdict FAILED on `physical_overlap_errors` alone,
+  the two applied `nvidia-smi --gpu-reset` calls starting about 58 s apart. HyperPod starts `nvidia-persistenced` by hand from
+  a login session after boot (there is no systemd unit) and `gpu-fault-gpu-persistence` races it: one node relied on the
+  daemon alone, the other also had the legacy flag. The quiesce's device sweep TERMed the daemon, whose exit closes every
+  device; on the daemon-only node every `nvidia-smi`/NVML call of the window re-initialised all 8 GPUs (VERIFY 23.5 s against
+  6.5 s, `pre_permit_seconds` 15.5 s against 2.0 s), and the daemon did not come back after the restore. On `eks-managed` the
+  quiesce stopped the systemd unit, so every node was slowed alike and the case passed there. The quiesce now releases
+  persistence on the target GPUs only (see the GPU service quiesce paragraph of the detailed design): in both regimes the
+  targets end with no holder while the other GPUs stay persistent, the daemon's systemd unit keeps running when every target
+  was released through it, and the sweep is only the fallback; the QUIESCE result's
+  `persistence_mode`/`persistence_release`/`persistence_daemon`, the RESTORE result's `persistence_mode.after_restore` and
+  `persistence_daemon_restored`, and the RESET receipt's `physical_calls[].target_persistence` make the window's
+  state readable from the evidence. Judgement: `tests/node_agent/test_quiesce_persistence_release.py`.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr015_parallel_branch_join.py`. By default it only generates the
   plan; before execute it must read `DESTR-012=PASS` (chain: `010 → 001 → 002 → 009 →

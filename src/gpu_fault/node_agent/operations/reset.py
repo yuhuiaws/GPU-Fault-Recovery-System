@@ -87,6 +87,7 @@ class ResetOperationsMixin:
     _gpu_inventory: Callable[..., Any]
     _run_checked: Callable[..., Any]
     _verify_no_clients: Callable[..., Any]
+    _target_persistence_states: Callable[..., dict[str, Any]]
     _compute_clients: Callable[[], list[dict[str, str]]]
     _gpu_device_paths: Callable[[], dict[str, str]]
     proc_root: Path
@@ -207,7 +208,11 @@ class ResetOperationsMixin:
         ``physical_ownership_checks[i]`` is answered by ``physical_calls[i]``
         (live the journal showed two granted checkpoints and a refusal and
         nothing said the first had spawned a reset the driver refused busy and
-        the second an ``rmmod``).
+        the second an ``rmmod``). Each reset record also carries the targets'
+        persistence mode as its checkpoint's device-map read reported it: two
+        nodes of one parallel reset whose quiesce windows ran in different
+        persistence regimes reset tens of seconds apart (live, HyperPod,
+        GF-REGIONAL-DESTR-015), and this is where that shows.
         """
 
         released = [] if released is None else released
@@ -225,6 +230,8 @@ class ResetOperationsMixin:
                 refused.action_details["gpu_reset_attempts_spawned"] = attempt - 1
                 record["outcome"] = f"refused: {refused.action_details['reason']}"
                 raise
+            finally:
+                record.update(self._target_persistence_states(gpu_uuids))
             try:
                 self._run_checked(command, timeout=timeout)
                 record["outcome"] = "reset"

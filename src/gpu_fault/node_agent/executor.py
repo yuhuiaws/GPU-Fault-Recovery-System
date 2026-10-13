@@ -656,11 +656,18 @@ class NodeActionExecutor(
         if quiesce_manager is None:
             raise RuntimeError("GPU service quiesce manager is unavailable")
         target_device_paths, workload_cgroup_paths = self._quiesce_scope(command)
+        # Read right after the scope: the bus ids come from the very report its
+        # device nodes were resolved from (an empty target list is every GPU).
+        whole_node = not command.gpu_uuids
         return quiesce_manager.quiesce(
             incident_id=command.incident_id,
             workflow_request_id=command.workflow_request_id,
             target_device_paths=target_device_paths,
             workload_cgroup_paths=workload_cgroup_paths,
+            target_pci_bus_ids=(
+                None if whole_node else self._target_pci_bus_ids(command.gpu_uuids)
+            ),
+            whole_node=whole_node,
         )
 
     def _execute_verify_no_clients(self, command: NodeActionCommand) -> dict[str, Any]:

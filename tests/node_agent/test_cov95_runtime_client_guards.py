@@ -113,6 +113,10 @@ def test_quiesce_scope_uses_only_the_target_node_and_normalized_cgroups(
             if whole_node
             else {"/unit/nvidia0"},
             "workload_cgroup_paths": expected,
+            # An injected finder parses no driver report: no bus ids to
+            # release by, so the quiesce leaves the targets to the sweep.
+            "target_pci_bus_ids": None,
+            "whole_node": whole_node,
         }
     ]
 

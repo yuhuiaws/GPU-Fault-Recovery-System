@@ -8,11 +8,18 @@ PROCESS_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_.-]{1,15}$")
 
 NVIDIA_GPU_DEVICE_PATTERN = re.compile(r"^/dev/nvidia\d+$")
 
+# The persistence daemon's unit, and its ``comm`` (cut at 15 characters).
+PERSISTENCE_DAEMON_UNIT = "nvidia-persistenced"
+PERSISTENCE_DAEMON_PROCESS = "nvidia-persiste"
+# Our oneshot ``nvidia-smi -pm 1``: the restore re-enables what the quiesce
+# released through it, in whichever regime (daemon or legacy) the node runs.
+PERSISTENCE_RESTORE_UNIT = "gpu-fault-gpu-persistence"
+
 DEFAULT_QUIESCE_SERVICES = (
     "nvidia-fabricmanager",
     "nvidia-dcgm",
-    "nvidia-persistenced",
-    "gpu-fault-gpu-persistence",
+    PERSISTENCE_DAEMON_UNIT,
+    PERSISTENCE_RESTORE_UNIT,
     "gpu-fault-metrics-collector",
     "gpu-fault-host-collector",
     "kubelet",
@@ -21,7 +28,7 @@ DEFAULT_QUIESCE_SERVICES = (
 DEFAULT_QUIESCE_PROCESSES: tuple[str, ...] = ()
 
 DEFAULT_DEVICE_SWEEP_PROCESSES = (
-    "nvidia-persiste",
+    PERSISTENCE_DAEMON_PROCESS,
     "nv-hostengine",
 )
 

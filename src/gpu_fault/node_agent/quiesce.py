@@ -12,9 +12,17 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
-from gpu_fault.node_agent.operations.holders import kubernetes_attribution
+from gpu_fault.node_agent.operations.holders import (
+    kubernetes_attribution,
+    process_cgroup_paths,
+)
+from gpu_fault.node_agent.quiesce_persistence import (
+    TargetPersistence,
+    restored_daemon,
+    restored_modes,
+)
 from gpu_fault.node_agent.common import (
     DEFAULT_DEVICE_SWEEP_PROCESSES,
     DEFAULT_QUIESCE_CONTAINERS,
@@ -120,6 +128,20 @@ def _service_inventory(
             continue
         (active if manager._service_active(service) else inactive).append(service)
     return active, inactive
+
+
+def _cgroup_matches(holder_paths: list[str], workload_cgroup_paths: set[str]) -> bool:
+    for holder_path in holder_paths:
+        normalized_holder = holder_path.rstrip("/")
+        for workload_path in workload_cgroup_paths:
+            normalized_workload = workload_path.rstrip("/")
+            if not normalized_workload or normalized_workload == "/":
+                continue
+            if normalized_holder == normalized_workload or normalized_holder.startswith(
+                normalized_workload + "/"
+            ):
+                return True
+    return False
 
 
 class GpuServiceQuiesceManager:
@@ -428,22 +450,6 @@ class GpuServiceQuiesceManager:
             except FileNotFoundError:
                 pass
 
-    @staticmethod
-    def _process_cgroup_paths(process: Path) -> list[str]:
-        try:
-            rows = (process / "cgroup").read_text(encoding="utf-8").splitlines()
-        except (OSError, UnicodeError):
-            return []
-        paths = []
-        for row in rows:
-            parts = row.split(":", 2)
-            if len(parts) != 3:
-                continue
-            path = parts[2].strip()
-            if path and path != "/":
-                paths.append(path.rstrip("/"))
-        return sorted(set(paths))
-
     def _device_holders(
         self,
         target_device_paths: set[str] | None = None,
@@ -486,27 +492,9 @@ class GpuServiceQuiesceManager:
                 "pid": entry.name,
                 "process_name": name,
                 "devices": ",".join(sorted(devices)),
-                "cgroup_paths": self._process_cgroup_paths(entry),
+                "cgroup_paths": process_cgroup_paths(entry),
             }
         return [holders[pid] for pid in sorted(holders, key=int)]
-
-    @staticmethod
-    def _cgroup_matches(
-        holder_paths: list[str],
-        workload_cgroup_paths: set[str],
-    ) -> bool:
-        for holder_path in holder_paths:
-            normalized_holder = holder_path.rstrip("/")
-            for workload_path in workload_cgroup_paths:
-                normalized_workload = workload_path.rstrip("/")
-                if not normalized_workload or normalized_workload == "/":
-                    continue
-                if (
-                    normalized_holder == normalized_workload
-                    or normalized_holder.startswith(normalized_workload + "/")
-                ):
-                    return True
-        return False
 
     def _sweep_device_holders(
         self,
@@ -532,7 +520,7 @@ class GpuServiceQuiesceManager:
         signalled: dict[str, dict[str, Any]] = {}
         for holder in self._device_holders(target_device_paths):
             process_allowed = holder["process_name"] in self.device_sweep_processes
-            cgroup_allowed = self._cgroup_matches(
+            cgroup_allowed = _cgroup_matches(
                 holder.get("cgroup_paths", []),
                 workload_cgroup_paths,
             )
@@ -562,17 +550,17 @@ class GpuServiceQuiesceManager:
             swept.append(record)
         if not signalled:
             return swept, skipped
+        # Until each signalled process holds no GPU at all, not only the
+        # target: nvidia-persistenced closes the target first and tears the
+        # other devices down for seconds more, into VERIFY (live, HyperPod).
         deadline = time.monotonic() + self.device_sweep_timeout_seconds
         while time.monotonic() < deadline:
-            remaining = {
-                holder["pid"] for holder in self._device_holders(target_device_paths)
-            } & set(signalled)
-            if not remaining:
+            remaining = {holder["pid"] for holder in self._device_holders()}
+            if not remaining & set(signalled):
                 return swept, skipped
             self.sleeper(0.5)
         for pid in sorted(
-            {holder["pid"] for holder in self._device_holders(target_device_paths)}
-            & set(signalled),
+            {holder["pid"] for holder in self._device_holders()} & set(signalled),
             key=int,
         ):
             signalled[pid]["signal"] = "KILL"
@@ -622,7 +610,20 @@ class GpuServiceQuiesceManager:
         workflow_request_id: str,
         target_device_paths: set[str] | None = None,
         workload_cgroup_paths: set[str] | None = None,
+        target_pci_bus_ids: Sequence[str] | None = None,
+        whole_node: bool = False,
     ) -> dict[str, Any]:
+        """Open one incident's quiesce window: stop, release, sweep, record.
+
+        ``target_pci_bus_ids`` are the targets' bus ids from the Agent's own
+        device map (``None`` when it has none) and ``whole_node`` names every
+        GPU. Persistence ends on the targets alone, so the node's other GPUs
+        stay initialised and no ``nvidia-smi`` of the window re-initialises
+        them; the device sweep stays the fallback for a holder still there
+        afterwards. A QUIESCED window is answered as it is; a failed one is
+        restored first and quiesced again.
+        """
+
         workload_cgroup_paths = {
             path.rstrip("/")
             for path in (workload_cgroup_paths or set())
@@ -682,13 +683,19 @@ class GpuServiceQuiesceManager:
                 raise
             state["phase"] = "QUIESCING"
             self._write_state(state_path, state)
+            persistence = TargetPersistence(
+                run=self._run,
+                holders=lambda: self._device_holders(target_device_paths),
+                proc_root=self.proc_root,
+            )
             try:
-                for service in reversed(active_services):
-                    self._run(
-                        ["systemctl", "stop", service],
-                        check=True,
-                        timeout=120,
-                    )
+                # Each service, last configured first, around the targets'
+                # persistence release; a daemon unit that took it keeps running.
+                persistence.stop_services(
+                    active_services=active_services,
+                    pci_bus_ids=target_pci_bus_ids,
+                    whole_node=whole_node,
+                )
                 self._stop_containers(container_targets)
                 for process in self.processes:
                     self._run(
@@ -704,10 +711,14 @@ class GpuServiceQuiesceManager:
                     target_device_paths=target_device_paths,
                     workload_cgroup_paths=workload_cgroup_paths,
                 )
+                window = persistence.finish(swept_device_holders)
             except Exception:
                 state["phase"] = "QUIESCE_FAILED"
                 self._write_state(state_path, state)
                 raise
+            state["kept_services"] = window["kept_services"]
+            if "persistence_daemon_swept" in window:
+                state["persistence_daemon_swept"] = window["persistence_daemon_swept"]
             state["phase"] = "QUIESCED"
             self._write_state(state_path, state)
             return {
@@ -722,6 +733,7 @@ class GpuServiceQuiesceManager:
                 "timer_unit": timer_unit + ".timer",
                 "failsafe_seconds": self.failsafe_seconds,
                 "state_path": str(state_path),
+                **window,
             }
 
     def assert_quiesced(
@@ -808,6 +820,7 @@ class GpuServiceQuiesceManager:
                 restored = self.restore_state_file(
                     state_path,
                     runner=self.runner,
+                    proc_root=str(self.proc_root),
                     container_restore_timeout_seconds=(
                         self.container_restore_timeout_seconds
                     ),
@@ -831,13 +844,19 @@ class GpuServiceQuiesceManager:
         return report
 
     def restore(self, *, incident_id: str) -> dict[str, Any]:
+        """Close the window; record each GPU's persistence mode after the settle."""
+
         result = self.restore_state_file(
             self._state_path(incident_id),
             runner=self.runner,
+            proc_root=str(self.proc_root),
             container_restore_timeout_seconds=(self.container_restore_timeout_seconds),
         )
-        if not result.get("already_restored") and self.restore_settle_seconds:
-            self.sleeper(self.restore_settle_seconds)
+        if not result.get("already_restored"):
+            if self.restore_settle_seconds:
+                self.sleeper(self.restore_settle_seconds)
+            # By now the restore unit's ``nvidia-smi -pm 1`` has run.
+            result["persistence_mode"] = restored_modes(self._run)
         result["restore_settle_seconds"] = self.restore_settle_seconds
         return result
 
@@ -847,12 +866,14 @@ class GpuServiceQuiesceManager:
         state_path: Path,
         *,
         runner: Callable[..., subprocess.CompletedProcess] = subprocess.run,
+        proc_root: str = "/proc",
         container_restore_timeout_seconds: int = 180,
         wait_for_containers: bool = True,
     ) -> dict[str, Any]:
         manager = cls(
             state_dir=str(state_path.parent),
             runner=runner,
+            proc_root=proc_root,
             container_restore_timeout_seconds=(container_restore_timeout_seconds),
         )
         with manager._locked(state_path):
@@ -959,6 +980,7 @@ class GpuServiceQuiesceManager:
             "restored_services": services,
             "timer_cancelled": timer_unit + ".timer",
             "state_path": str(state_path),
+            **restored_daemon(state, self.proc_root),
         }
         if not wait_for_containers and container_targets:
             result["container_restore_wait_skipped"] = sorted(

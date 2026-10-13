@@ -1165,6 +1165,29 @@ restore fails midway, the state file and the timer are kept and retried periodic
 verifies each one is active, then cancels the timer and deletes the state. Service names and process names use a strict allowlist
 format, and all commands are executed through argument arrays.
 
+The quiesce ends persistence on the target GPUs only. A node gets persistence from one of two mechanisms:
+`nvidia-persistenced` holding every GPU device node open, or the legacy flag that `gpu-fault-gpu-persistence`
+sets without any process (`nvidia-smi -pm 1`); HyperPod starts the daemon by hand after boot, racing that oneshot, so two
+nodes of one job can boot into different regimes. The daemon's exit closes every device it holds, after which every
+`nvidia-smi` of the window re-initialises all of the node's GPUs. So when the oneshot was active before the quiesce, the
+Agent stops it first (from then on the restore of this step, of a failed window's retry or of the recovery timer runs its
+`-pm 1` again) and, before any other service stops, runs `nvidia-smi -i <bus id> -pm 0` without a shell for every target
+GPU, by the PCI bus id from the same `nvidia-smi -q -x` report the device map came from (a whole-node quiesce runs one
+`nvidia-smi -pm 0`; 30 s per call, 60 s for the phase, and no further call after one timed out): with the daemon running
+it goes over the daemon's RPC and the daemon closes only that device; without it, it clears that GPU's legacy flag; every
+other GPU keeps what it had. When every target was released through the daemon, the systemd `nvidia-persistenced` unit is
+not stopped and `kept_services` records why; `active_services` (`stopped_services` in the step details) still lists it,
+and the restore's start of it is a no-op. A release that fails, times out, has no bus id, or leaves the daemon holding a
+target device falls back to the previous behaviour: the unit is stopped and the device holders are swept (TERM, then
+KILL); the sweep waits until each signalled process has exited or holds no `/dev/nvidia*` node, and records the swept
+daemon's pid, executable, start time and whether a systemd unit owns it. The restore never relaunches a daemon the product
+does not own; after the sweep signalled one it reports `persistence_daemon_restored` (whether a daemon runs again) with the
+reason. The QUIESCE result records each GPU's `persistence_mode` before and after the release, `persistence_release` and
+`persistence_daemon`; the RESTORE result records `persistence_mode` after the restore and `persistence_daemon`; in the
+RESET receipt each reset call's record in `physical_calls` (paired in order with `physical_ownership_checks`) carries the
+targets' `target_persistence` and the other GPUs' `non_target_persistence_modes` as its final permit checkpoint read them.
+Every record is bounded in count and length.
+
 The H200 code-specific SXIDs `10003/19084` use a dedicated
 `RESET_ALL_GPUS_NVSWITCHES` operation. The control plane generates the complete UUID
 inventory from recent GPU metrics of the same node and pins the fabric partition to that node's local NVSwitch domain. The Node Agent

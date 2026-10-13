@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import threading
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, Sequence
 from xml.etree import ElementTree as ET
 
 from gpu_fault.node_agent.operations.holders import (
@@ -18,6 +19,10 @@ from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
 from gpu_fault.node_agent.query_clients import query_only_device_client
+
+PCI_BUS_ID_PATTERN = re.compile(
+    r"^[0-9A-Fa-f]{4,8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$"
+)
 
 
 class GpuClientsActive(RuntimeError):
@@ -88,8 +93,9 @@ class ClientOperationsMixin:
 
         The window lives in thread-local state and restores whatever it found,
         so the four action-pool workers neither share a table nor need a lock,
-        and nothing survives the block: across commands a driver reload really
-        can renumber the devices.
+        and no table survives the block: across commands a driver reload really
+        can renumber the devices. The report's per-GPU attributes are evidence,
+        not a table: the block starts without them and leaves its own read's.
         """
 
         state = self._device_path_state
@@ -101,6 +107,7 @@ class ClientOperationsMixin:
         # explain this command's unresolvable target with the previous driver
         # report, which is worse than saying nothing.
         state.reasons = None
+        state.attributes = None
         state.caching = True
         try:
             yield
@@ -108,6 +115,9 @@ class ClientOperationsMixin:
             state.entry = outer_entry
             state.caching = outer_caching
             state.reasons = outer_reasons
+            # Not the attributes: the reset reads the targets' persistence right
+            # after the final ownership window, as that window's own report
+            # gave it -- none if it read none, never an older report.
 
     def _gpu_device_paths(self) -> dict[str, str]:
         state = self._device_path_state
@@ -117,7 +127,7 @@ class ClientOperationsMixin:
         if entry is not None and entry[0] == id(self):
             cached: dict[str, str] = entry[1]
             return cached
-        paths, reasons = self._minor_number_device_map()
+        paths, reasons, attributes = self._minor_number_device_map()
         if paths is None:
             paths = self._index_device_paths()
             # The index map resolves by position and leaves nobody out, so a
@@ -128,6 +138,7 @@ class ClientOperationsMixin:
         # none. Written whether or not a window is caching: the reader is the
         # very next call after this one.
         state.reasons = (id(self), reasons)
+        state.attributes = (id(self), attributes)
         if getattr(state, "caching", False):
             state.entry = (id(self), paths)
         return paths
@@ -146,9 +157,67 @@ class ClientOperationsMixin:
         reasons: dict[str, str] = entry[1]
         return reasons
 
+    def _gpu_attributes(self) -> dict[str, dict[str, str]]:
+        """uuid -> PCI bus id and persistence mode, from the last report parsed.
+
+        Only the executor's own resolver parses that report: with an injected
+        finder (tests) there is none, and a table some earlier command left
+        behind on this thread must not answer for this one.
+        """
+
+        entry = getattr(self._device_path_state, "attributes", None)
+        if entry is None or entry[0] != id(self):
+            return {}
+        if self.gpu_device_path_finder != self._gpu_device_paths:
+            return {}
+        attributes: dict[str, dict[str, str]] = entry[1]
+        return attributes
+
+    def _target_pci_bus_ids(self, gpu_uuids: Sequence[str]) -> list[str] | None:
+        """The targets' PCI bus ids, for the quiesce's per-GPU persistence release.
+
+        From the same ``nvidia-smi -q -x`` report the device nodes were just
+        resolved from -- never an index or a minor number, which need not match
+        the bus order. ``None`` unless every target has one: the release then
+        leaves the targets to the device sweep instead of guessing.
+        """
+
+        attributes = self._gpu_attributes()
+        bus_ids = [attributes.get(uuid, {}).get("pci_bus_id", "") for uuid in gpu_uuids]
+        if not bus_ids or not all(bus_ids):
+            return None
+        return bus_ids
+
+    def _target_persistence_states(self, gpu_uuids: Sequence[str]) -> dict[str, Any]:
+        """Each target's persistence mode and a count of the others', by mode.
+
+        Read from the report the device map came from, so it costs nothing:
+        the reset records it for each physical call as the final ownership
+        window read it. The other GPUs say which regime the window runs in:
+        with persistence off on them every ``nvidia-smi`` re-initialises them
+        all, and one node of a parallel reset falls behind the other.
+        """
+
+        attributes = self._gpu_attributes()
+        if not attributes:
+            return {}
+        targets = list(gpu_uuids) or sorted(attributes)
+        others: dict[str, int] = {}
+        for uuid in sorted(set(attributes) - set(targets)):
+            mode = attributes[uuid].get("persistence_mode", "")
+            others[mode] = others.get(mode, 0) + 1
+        return {
+            "target_persistence": [
+                {"gpu_uuid": uuid, **attributes[uuid]}
+                for uuid in targets
+                if uuid in attributes
+            ][:GPU_CLIENT_HOLDER_LIMIT],
+            "non_target_persistence_modes": others,
+        }
+
     def _minor_number_device_map(
         self,
-    ) -> tuple[dict[str, str] | None, dict[str, str]]:
+    ) -> tuple[dict[str, str] | None, dict[str, str], dict[str, dict[str, str]]]:
         """uuid -> ``/dev/nvidia<minor>`` from the driver's own minor numbers.
 
         ``--query-gpu=index`` is ordered by PCI bus id; the device node's minor
@@ -172,18 +241,23 @@ class ClientOperationsMixin:
         one device node" are the same symptom (an unresolvable target) with
         different operator actions behind them, and the refusal is the only
         place either is ever seen.
+
+        The third answer is each GPU's PCI bus id and persistence mode, from
+        the same report: what the quiesce releases persistence by, and what the
+        reset receipt records about the window.
         """
 
         try:
             completed = self._run_checked(["nvidia-smi", "-q", "-x"], timeout=15)
         except (OSError, RuntimeError, subprocess.SubprocessError):
-            return None, {}
+            return None, {}, {}
         try:
             root = ET.fromstring(completed.stdout or "")
         except ET.ParseError:
-            return None, {}
+            return None, {}, {}
         paths: dict[str, str] = {}
         reasons: dict[str, str] = {}
+        attributes: dict[str, dict[str, str]] = {}
         claimed: set[str] = set()
         duplicated: set[str] = set()
         for gpu in root.findall(".//gpu"):
@@ -191,6 +265,10 @@ class ClientOperationsMixin:
             minor = (gpu.findtext("minor_number") or "").strip()
             if not gpu_uuid:
                 continue
+            bus_id = (gpu.findtext("pci/pci_bus_id") or gpu.get("id") or "").strip()
+            if PCI_BUS_ID_PATTERN.fullmatch(bus_id):
+                mode = (gpu.findtext("persistence_mode") or "").strip()[:32]
+                attributes[gpu_uuid] = {"pci_bus_id": bus_id, "persistence_mode": mode}
             if not minor.isdigit():
                 reasons[gpu_uuid] = (
                     "the driver reports no minor number for it, so it has no "
@@ -205,7 +283,7 @@ class ClientOperationsMixin:
         if not paths:
             # No GPU reported a usable minor number: this driver does not give
             # them, so the index map is all there is.
-            return None, {}
+            return None, {}, attributes
         # Two UUIDs on one device node is a report that cannot be trusted for
         # either of them, so neither is resolved and both fail closed. The
         # answer stays a (possibly empty) map, never ``None``: minor numbers
@@ -219,7 +297,7 @@ class ClientOperationsMixin:
                 "than one GPU"
             )
             del paths[gpu_uuid]
-        return paths, reasons
+        return paths, reasons, attributes
 
     def _index_device_paths(self) -> dict[str, str]:
         """The pre-minor-number mapping, kept for drivers that omit it."""
