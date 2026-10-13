@@ -5,16 +5,19 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
 import time
 from collections.abc import Mapping, Sequence
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path[:0] = [str(ROOT / "src"), str(ROOT)]
@@ -32,6 +35,7 @@ from gpu_fault.admin.postgres_grant import (  # noqa: E402
     CONTAINER_ID,
     LOCAL_DOCKER_HOST,
     private_directory,
+    private_write,
 )
 from gpu_fault.admin.process_supervisor import (  # noqa: E402
     ProcessSupervisionLost,
@@ -42,8 +46,12 @@ from gpu_fault.admin.release_postgres import IMAGE_ID, POSTGRES_IMAGE  # noqa: E
 from scripts.postgres_shard_receipts import (  # noqa: E402
     PostgresShardError,
     ShardReceipt,
+    describe_failure,
+    exception_chain,
     read_failure,
     read_private_json,
+    read_worker_failure,
+    redact_output,
     validate_partition_union,
     validate_shard_receipt,
     validate_targets,
@@ -52,8 +60,10 @@ from scripts.postgres_shard_worker import (  # noqa: E402
     ALLOCATION_FILE,
     CANCEL_FILE,
     FAILURE_FILE,
+    READY_FILE,
     RECEIPT_FILE,
     WORK_SECONDS,
+    WORKER_FAILURE_FILE,
     cancellation_scope,
     reconcile_allocation,
     worker_environment,
@@ -63,6 +73,13 @@ STRESS_ENV = (
     "GPU_FAULT_POSTGRES_LOCK_STRESS_WORKERS",
     "GPU_FAULT_POSTGRES_LOCK_STRESS_ROUNDS",
 )
+# A failed worker's verdict is followed by its last lines, the shape
+# run_release_gates uses for a failing gate (GATE_TAIL_LINES); every byte
+# passes the supervised-command redaction and the whole output stays private.
+WORKER_TAIL_LINES = 20
+WORKER_TAIL_CHARACTERS = 400
+WORKER_LOG = "worker.log"
+WORKER_LOG_CHARACTERS = 4 * 1024 * 1024
 
 
 @dataclass(frozen=True)
@@ -88,6 +105,114 @@ def checked_identity(python: str, environment: Mapping[str, str]) -> str:
     return identity
 
 
+def failure_detail(evidence: Mapping[str, Any]) -> str:
+    return (
+        f"nodeid={evidence['nodeid'] or '<process>'} "
+        f"phase={evidence['phase']} outcome={evidence['outcome']}"
+    )
+
+
+def exit_status(returncode: int) -> str:
+    if returncode < 0:
+        try:
+            return f"was killed by {signal.Signals(-returncode).name}"
+        except ValueError:
+            pass
+    return f"exited with status {returncode}"
+
+
+def exit_phase(state: Path) -> str:
+    """Where a worker stood when it exited, from the files its pytest leaves."""
+    if not (state / READY_FILE).is_file():
+        return "before pytest started"
+    try:
+        session = read_private_json(state / RECEIPT_FILE).get("session")
+    except PostgresShardError:
+        session = None
+    if (
+        isinstance(session, dict)
+        and type(session.get("exitstatus")) is int
+        and session["exitstatus"] == 0
+    ):
+        return "after pytest passed (post-test: allocation exit or cleanup)"
+    return "after pytest started, without a passing pytest receipt"
+
+
+def recorded_cause(state: Path) -> str:
+    path = state / WORKER_FAILURE_FILE
+    if not path.exists() and not path.is_symlink():
+        return "the worker recorded no cause"
+    try:
+        record = read_worker_failure(path)
+    except PostgresShardError:
+        return "the worker's failure record is invalid"
+    return f"worker phase {record['phase']}: {describe_failure(record['errors'])}"
+
+
+def keep_worker_output(
+    job: ShardJob, result: subprocess.CompletedProcess[str]
+) -> tuple[Path | None, str]:
+    """Redact a failed worker's stdout and stderr; keep all of it privately."""
+    output = "".join(
+        text if text.endswith("\n") else text + "\n"
+        for text in (result.stdout, result.stderr)
+        if text
+    )
+    redacted = redact_output(output, limit=WORKER_LOG_CHARACTERS)
+    path = job.state / WORKER_LOG
+    try:
+        # Exclusive: a log written with the first failure is never replaced.
+        private_write(path, redacted + "\n" if redacted else "")
+    except (OSError, ValueError):
+        return None, redacted
+    return path, redacted
+
+
+def worker_exit_failure(
+    job: ShardJob, result: subprocess.CompletedProcess[str]
+) -> PostgresShardError:
+    """The worker's phase, its own recorded cause and its last redacted lines."""
+    log, redacted = keep_worker_output(job, result)
+    failure = job.state / FAILURE_FILE
+    if failure.exists() or failure.is_symlink():
+        # A pytest failure is named exactly as the running check names it.
+        detail = failure_detail(read_failure(failure))
+        summary = f"PostgreSQL shard {job.index} failed: {detail}"
+    else:
+        detail = f"{exit_status(result.returncode)} {exit_phase(job.state)}"
+        summary = f"PostgreSQL shard {job.index} {detail}: {recorded_cause(job.state)}"
+    write_diagnostic(
+        f"postgres-shards: first failure shard={job.index} {detail}\n", final=True
+    )
+    kept = f"full output: {log}" if log is not None else "full output not kept"
+    tail = [
+        line
+        if len(line) <= WORKER_TAIL_CHARACTERS
+        else line[: WORKER_TAIL_CHARACTERS - 3] + "..."
+        for line in redacted.splitlines()[-WORKER_TAIL_LINES:]
+    ]
+    if not tail:
+        return PostgresShardError(f"{summary}\nshard {job.index} printed nothing")
+    return PostgresShardError(
+        "\n".join(
+            [
+                summary,
+                f"last {len(tail)} lines of shard {job.index}, redacted ({kept}):",
+                *(f"[shard-{job.index}] {line}" for line in tail),
+            ]
+        )
+    )
+
+
+def keep_failed_outputs(submitted: Mapping[Future[Any], ShardJob]) -> None:
+    """After the drain, keep the output of every worker that exited unsuccessfully."""
+    for future, job in submitted.items():
+        if future.done() and not future.cancelled() and future.exception() is None:
+            result = future.result()
+            if result.returncode:
+                keep_worker_output(job, result)
+
+
 def run_jobs(
     jobs: Sequence[ShardJob],
     *,
@@ -104,8 +229,9 @@ def run_jobs(
     pool = ThreadPoolExecutor(max_workers=len(jobs))
     started = time.monotonic()
     next_progress = started + 30
+    submitted: dict[Future[Any], ShardJob] = {}
     try:
-        pending = {
+        submitted = {
             pool.submit(
                 copy_context().run,
                 run_driver,
@@ -116,6 +242,7 @@ def run_jobs(
             ): job
             for job in jobs
         }
+        pending = dict(submitted)
         while pending:
             ensure_supervision_safe()
             if interrupted is not None and interrupted.is_set():
@@ -134,10 +261,7 @@ def run_jobs(
                     # -x finishes a failed test naturally; pytest does not stop on skips.
                     if evidence["outcome"] == "failed":
                         first_failure = job.index
-                    detail = (
-                        f"nodeid={evidence['nodeid'] or '<process>'} "
-                        f"phase={evidence['phase']} outcome={evidence['outcome']}"
-                    )
+                    detail = failure_detail(evidence)
                     write_diagnostic(
                         f"postgres-shards: first failure shard={job.index} {detail}\n",
                         final=True,
@@ -148,10 +272,9 @@ def run_jobs(
             finished, _running = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
             for future in finished:
                 job = pending.pop(future)
-                if future.result().returncode:
-                    raise PostgresShardError(
-                        f"PostgreSQL shard {job.index} exited unsuccessfully"
-                    )
+                result = future.result()
+                if result.returncode:
+                    raise worker_exit_failure(job, result)
                 receipt = validate_shard_receipt(
                     job.state / RECEIPT_FILE,
                     root=ROOT,
@@ -178,6 +301,7 @@ def run_jobs(
         raise
     finally:
         pool.shutdown(wait=True, cancel_futures=True)
+        keep_failed_outputs(submitted)
     return receipts
 
 
@@ -349,6 +473,18 @@ def run_postgres_shards(
             raise
 
 
+def report_shard_failures(error: BaseException) -> None:
+    """Print each shard failure in ``error``'s chain, the earliest first.
+
+    Group cleanup runs in a ``finally``: when it fails too, its error replaces
+    the worker's report, which stays the first cause and is printed first.
+    """
+    for failure in reversed(exception_chain(error, limit=8)):
+        if isinstance(failure, PostgresShardError):
+            for line in str(failure).splitlines() or [""]:
+                print(f"postgres-shards: {line}", file=sys.stderr)
+
+
 def main(arguments: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--python", default=sys.executable)
@@ -369,9 +505,10 @@ def main(arguments: Sequence[str] | None = None) -> int:
         )
         return 130
     except PostgresShardError as error:
-        print(f"postgres-shards: {error}", file=sys.stderr)
+        report_shard_failures(error)
         return 2
-    except (Exception, ProcessSupervisionLost):
+    except (Exception, ProcessSupervisionLost) as error:
+        report_shard_failures(error)
         print(
             "postgres-shards: failed; no test output or credentials are emitted",
             file=sys.stderr,

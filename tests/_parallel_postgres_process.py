@@ -154,6 +154,50 @@ def lifecycle_gate(mode: str, state: Path) -> int:
     return 0
 
 
+def exit_worker(mode: str, state: Path) -> int:
+    """The real worker entry point over fake Docker and a fake pytest child."""
+    docker = FakePostgresDocker()
+    docker.ready, docker.ready_code = mode != "allocation", 3
+    docker.keep_after_remove = mode == "cleanup"
+    status = int(mode == "test-failure")
+
+    def pytest_child(
+        command: Sequence[str], **_options: Any
+    ) -> subprocess.CompletedProcess[str]:
+        write_json_atomic(state / worker.READY_FILE, {"pid": os.getpid()})
+        if status:
+            worker.record_failure(
+                state / worker.FAILURE_FILE,
+                nodeid=f"{CASES}::test_variant[0]",
+                phase="call",
+            )
+        write_json_atomic(
+            state / worker.RECEIPT_FILE, {"session": {"exitstatus": status}}
+        )
+        return subprocess.CompletedProcess(list(command), status, "", "")
+
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(worker, "CommandRunner", lambda: docker)
+        patch.setattr(worker, "source_identity", lambda _root: "a" * 64)
+        patch.setattr(worker, "run_owned_command", pytest_child)
+        return worker.main(
+            [
+                "--state",
+                str(state),
+                "--identity",
+                "a" * 64,
+                "--workers",
+                "1",
+                "--index",
+                "0",
+                "--durations",
+                "0",
+                "--tests",
+                CASES,
+            ]
+        )
+
+
 def wait_for(path: Path) -> None:
     until = time.monotonic() + 10
     while not path.exists():
@@ -243,6 +287,8 @@ def main() -> int:
         return lifecycle_worker(mode, state)
     if operation == "lifecycle-gate":
         return lifecycle_gate(mode, state)
+    if operation == "exit-worker":
+        return exit_worker(mode, state)
     if operation == "lifecycle-wrapper":
         result = run_command(
             [

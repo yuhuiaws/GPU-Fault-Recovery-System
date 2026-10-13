@@ -9,7 +9,8 @@ import signal
 import sys
 import threading
 from collections.abc import Iterator, Mapping, Sequence
-from contextlib import ExitStack, contextmanager
+from contextlib import ExitStack, contextmanager, suppress
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -43,7 +44,10 @@ from gpu_fault.admin.release_postgres import (
     isolated_postgres_allocation,
 )
 from scripts.postgres_shard_receipts import (
+    WORKER_PHASES,
     PostgresShardError,
+    describe_failure,
+    failure_chain,
     read_private_json,
     safe_failure_nodeid,
     validate_targets,
@@ -64,6 +68,8 @@ FAILURE_FILE = "failure.json"
 ALLOCATION_FILE = "allocation.json"
 CANCEL_FILE = "cancel.json"
 READY_FILE = "pytest-ready.json"
+# Written by the worker itself when it fails outside a test (see main()).
+WORKER_FAILURE_FILE = "worker-failure.json"
 WORK_SECONDS = 7200
 TEST_CONTROL_ENV = frozenset(
     {
@@ -371,6 +377,13 @@ def serial_test_command(
     ]
 
 
+@dataclass
+class WorkerProgress:
+    """How far a worker got; ``request`` means its state is not yet proven private."""
+
+    phase: str = "request"
+
+
 def run_worker(
     *,
     state: Path,
@@ -379,8 +392,11 @@ def run_worker(
     index: int,
     durations: int,
     identity: str,
+    progress: WorkerProgress | None = None,
 ) -> int:
+    progress = WorkerProgress() if progress is None else progress
     private_directory(state)
+    progress.phase = "preparation"
     if cancellation_requested(state):
         raise KeyboardInterrupt
     if (
@@ -392,6 +408,7 @@ def run_worker(
     if source_identity(ROOT) != identity:
         raise PostgresShardError("PostgreSQL source changed before worker allocation")
     runner = CommandRunner()
+    progress.phase = "allocation"
     with isolated_postgres_allocation(
         runner, repository_root=ROOT, state_dir=state
     ) as allocation:
@@ -416,6 +433,7 @@ def run_worker(
             allocation.directory / "ownership.json", maximum=MAX_GRANT_BYTES
         )
         write_json_atomic(state / ALLOCATION_FILE, ownership)
+        progress.phase = "pytest"
         with cancel_pytest_scope(state):
             result = run_owned_command(
                 serial_test_command(
@@ -425,6 +443,8 @@ def run_worker(
                 environment=environment,
                 cwd=ROOT,
             )
+        # What fails from here on is the allocation's exit: removal and cleanup.
+        progress.phase = "post-test"
         if result.returncode:
             record_failure(state / FAILURE_FILE)
         return int(result.returncode)
@@ -441,6 +461,7 @@ def main(arguments: Sequence[str] | None = None) -> int:
     parser.add_argument("--tests", nargs="+")
     options = parser.parse_args(arguments)
     os.umask(0o077)
+    progress = WorkerProgress()
     try:
         with cancellation_scope():
             if options.identity_only:
@@ -461,13 +482,27 @@ def main(arguments: Sequence[str] | None = None) -> int:
                 index=options.index,
                 durations=options.durations,
                 identity=options.identity,
+                progress=progress,
             )
     except KeyboardInterrupt:
-        return 130
-    except (Exception, ProcessSupervisionLost):
-        # No exception message, captured output, environment or URL is public output.
         print(
-            "postgres-shards: worker failed; retained private state requires validation",
+            f"postgres-shards: worker stopped during {progress.phase}", file=sys.stderr
+        )
+        return 130
+    except (Exception, ProcessSupervisionLost) as error:
+        # Only the redacted exception chain leaves the worker, never its
+        # environment, PGPASSFILE content or a URL's credentials. The runner
+        # reports the record; the line below ends the output it shows.
+        errors = failure_chain(error)
+        if options.state is not None and progress.phase in WORKER_PHASES:
+            with suppress(Exception):
+                write_json_atomic(
+                    options.state / WORKER_FAILURE_FILE,
+                    {"phase": progress.phase, "errors": errors},
+                )
+        print(
+            f"postgres-shards: worker failed during {progress.phase}: "
+            f"{describe_failure(errors)}; retained private state requires validation",
             file=sys.stderr,
         )
         return 2

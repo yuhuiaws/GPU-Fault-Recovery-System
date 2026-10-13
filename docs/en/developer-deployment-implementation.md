@@ -1861,6 +1861,11 @@ The full collected list, the actually selected duplicate-free union, a successfu
 one shard succeeding or a seemingly identical total does not replace complete proof. This local report is not a CI shard receipt.
 An allocation that already exists in the outer layer is still kept by the original deployment scope; shards must not take it over or clean it up;
 the shards' own identity, stop and cleanup keep following the managed PostgreSQL lifecycle and do no global Docker cleanup.
+When a shard worker exits non-zero, the runner's error names the phase (before pytest started; after pytest finished with exit status 0, that is the
+allocation exit or cleanup; a test failure is still reported from its failure record), the non-test failure the worker recorded itself in a private
+`worker-failure.json` (phase, exception types and messages along the chain) and the last 20 lines of the worker's output; those lines and the complete
+`worker.log` (0600) in the shard's private directory pass the same redaction as supervised command output and carry no password, PGPASSFILE content
+or URL with credentials. The first failure still cancels the other shards.
 Manual external connections, the CI coverage path and explicit custom impact test commands do not change how they execute.
 When a staging impact plan requires the full gates and PostgreSQL, the path with a valid local authorization and the default stress command
 reuses `run_release_gates` directly: static first, then ordinary pytest, PostgreSQL shards and the source-only

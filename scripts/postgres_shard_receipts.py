@@ -5,13 +5,16 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import stat
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from gpu_fault.admin.command_log import _LONG_TOKEN
+from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault.admin.postgres_grant import private_directory
 from tools.pytest_result_identity import (
     parse_pytest_receipt,
@@ -19,10 +22,100 @@ from tools.pytest_result_identity import (
 )
 
 MAX_RECEIPT_BYTES = 32 * 1024 * 1024
+# A worker's own non-test failure: how far it got and the exception chain.
+WORKER_PHASES = frozenset({"preparation", "allocation", "pytest", "post-test"})
+FAILURE_CHAIN_LIMIT = 4
+FAILURE_MESSAGE_CHARACTERS = 500
+_EXCEPTION_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,127}")
 
 
 class PostgresShardError(RuntimeError):
     """Only controlled, credential-free messages may cross the runner boundary."""
+
+
+def redact_output(text: str, *, limit: int) -> str:
+    """``text`` as an operator may read a supervised command's output.
+
+    ``diagnostic_text`` masks URL credentials, secret assignments, bearer
+    tokens, private keys, access key IDs and control characters. The long-token
+    mask is the one ``CommandRunner`` applies to a sensitive command's stderr;
+    it also covers a generated database password inside PGPASSFILE content.
+    """
+    return _LONG_TOKEN.sub("<redacted>", diagnostic_text(text, limit=limit))
+
+
+def failure_message(text: str) -> str:
+    """One printable, redacted line of at most ``FAILURE_MESSAGE_CHARACTERS``."""
+    line = "".join(
+        character
+        for character in " ".join(redact_output(text, limit=64 * 1024).split())
+        if character.isprintable()
+    )
+    if len(line) <= FAILURE_MESSAGE_CHARACTERS:
+        return line
+    half = FAILURE_MESSAGE_CHARACTERS // 2 - 3
+    return f"{line[:half]} ... {line[-half:]}"
+
+
+def exception_chain(error: BaseException, *, limit: int) -> list[BaseException]:
+    """``error`` and what it was raised from, outermost first.
+
+    The links traceback follows: an explicit cause, else an unsuppressed context.
+    """
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    while current is not None and len(chain) < limit:
+        chain.append(current)
+        if current.__cause__ is not None:
+            current = current.__cause__
+        elif current.__suppress_context__:
+            current = None
+        else:
+            current = current.__context__
+    return chain
+
+
+def failure_chain(error: BaseException) -> list[dict[str, str]]:
+    """What a worker records of ``error``: each link's type and redacted message."""
+    chain: list[dict[str, str]] = []
+    for link in exception_chain(error, limit=FAILURE_CHAIN_LIMIT):
+        notes = getattr(link, "__notes__", ())
+        text = "; ".join(part for part in (str(link), *notes) if part)
+        chain.append({"type": type(link).__name__, "message": failure_message(text)})
+    return chain
+
+
+def describe_failure(errors: Sequence[Mapping[str, str]]) -> str:
+    return "; caused by ".join(
+        f"{item['type']}: {failure_message(item['message'])}"
+        if item["message"]
+        else item["type"]
+        for item in errors
+    )
+
+
+def read_worker_failure(path: Path) -> dict[str, Any]:
+    value = read_private_json(path, maximum=64 * 1024)
+    errors = value.get("errors")
+    if (
+        set(value) != {"phase", "errors"}
+        or not isinstance(value["phase"], str)
+        or value["phase"] not in WORKER_PHASES
+        or not isinstance(errors, list)
+        or not 0 < len(errors) <= FAILURE_CHAIN_LIMIT
+        or not all(
+            isinstance(item, dict)
+            and set(item) == {"type", "message"}
+            and isinstance(item["type"], str)
+            and _EXCEPTION_NAME.fullmatch(item["type"]) is not None
+            and isinstance(item["message"], str)
+            and len(item["message"]) <= FAILURE_MESSAGE_CHARACTERS
+            and item["message"].isprintable()
+            for item in errors
+        )
+    ):
+        raise PostgresShardError("PostgreSQL worker failure record is invalid")
+    return value
 
 
 def safe_failure_nodeid(nodeid: object) -> bool:
