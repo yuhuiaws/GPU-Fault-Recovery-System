@@ -137,22 +137,36 @@ def test_ceiling_rule_covers_every_branch() -> None:
     free = lambda: False  # noqa: E731
     blocked = lambda: True  # noqa: E731
 
+    def unasked() -> bool:
+        raise AssertionError("a poller never asks for the fault backlog")
+
     assert quiet.idle_ceiling("fault") == 0.5 and quiet.idle_ceiling("host") == 2.0
-    # The fault stream never stretches to the fallback: the queue trigger
-    # announces only idle->busy edges.
+    # The fault stream's idle ceiling stays at fault idle: the queue trigger
+    # announces only idle->busy edges. It stretches to the fallback only once
+    # settled with no fault backlog (test_fault_stream_wake.py).
     assert noisy.idle_ceiling("fault") == 0.5 and noisy.idle_ceiling("host") == 5.0
     for stream, busy_ceiling in (("fault", 0.1), ("host", 0.4)):
         kwargs = {"stream": stream, "next_interval": 0.8}
         idle = quiet.idle_ceiling(stream)
         assert (
             empty_round_ceiling(
-                quiet, settled_empty=False, pools_busy=True, lane_blocked=free, **kwargs
+                quiet,
+                settled_empty=False,
+                pools_busy=True,
+                lane_blocked=free,
+                fault_backlog_empty=unasked,
+                **kwargs,
             )
             == busy_ceiling
         ), "busy pools hold the busy ceiling until the stream settles empty"
         assert (
             empty_round_ceiling(
-                quiet, settled_empty=True, pools_busy=True, lane_blocked=free, **kwargs
+                quiet,
+                settled_empty=True,
+                pools_busy=True,
+                lane_blocked=free,
+                fault_backlog_empty=unasked,
+                **kwargs,
             )
             == idle
         ), "settled empty: busy pools no longer hold it"
@@ -162,6 +176,7 @@ def test_ceiling_rule_covers_every_branch() -> None:
                 settled_empty=True,
                 pools_busy=True,
                 lane_blocked=blocked,
+                fault_backlog_empty=unasked,
                 **kwargs,
             )
             == busy_ceiling
@@ -174,6 +189,7 @@ def test_ceiling_rule_covers_every_branch() -> None:
                 settled_empty=False,
                 pools_busy=False,
                 lane_blocked=free,
+                fault_backlog_empty=unasked,
                 **kwargs,
             )
             == idle
@@ -186,6 +202,7 @@ def test_ceiling_rule_covers_every_branch() -> None:
             settled_empty=False,
             pools_busy=True,
             lane_blocked=blocked,
+            fault_backlog_empty=unasked,
         )
         == 2.0
     ), "an interval still under the busy ceiling is not capped by it"

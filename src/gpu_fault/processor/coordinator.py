@@ -157,8 +157,7 @@ class ProcessorCoordinator(
         # in flight it is demonstrably not idle: those requests release
         # their lanes within seconds, so the backoff is capped until the
         # pools go quiet. A replica whose own pools are empty because a
-        # sibling holds every lane asks the store instead
-        # (_backlog_is_lane_blocked).
+        # sibling holds every lane asks the store instead (_backlog_is_lane_blocked).
         self.busy_backoff_max_seconds = max(
             poll_seconds,
             min(lease.busy_backoff_max_seconds, lease.idle_backoff_max_seconds),
@@ -951,6 +950,7 @@ class ProcessorCoordinator(
                             include_paths=include_paths,
                             exclude_paths=exclude_paths,
                         ),
+                        fault_backlog_empty=self._fault_backlog_is_empty,
                     )
                     interval = min(ceiling, next_interval)
                     self._stream_idle_interval[stream] = interval

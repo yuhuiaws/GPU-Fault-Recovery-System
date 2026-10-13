@@ -1933,7 +1933,10 @@ immediately; idle backoff at most 2s (FAULT pool 0.5s), busy backoff 0.4s (FAULT
 replica's pools are busy" no longer holds that stream at the busy ceiling and it backs off to the idle one (the v21
 edge notifications wake it when a row arrives; 92% of a perf run's claim rounds were empty while the busy ceiling held
 them at 0.4s); a backlog the store reports as lane-blocked keeps the busy ceiling, because rows already PENDING raise
-no notification edge and only polling drains that tail at the rate lanes free up; overload returns
+no notification edge and only polling drains that tail at the rate lanes free up; with notifications on, a settled
+FAULT stream keeps 0.5s only while a fault-tier row is PENDING or LEASED (a row can only be silent behind such a row)
+and otherwise waits on the 5s notification fallback, reading the fault backlog depth in place of the lane probe and
+reusing a non-zero depth for 5s; overload returns
 429 + `Retry-After: 2`.
 
 **⑧ Idempotency and concurrency control**: the four-tuple `lease_owner` + `leader_epoch` + random `lease_token` +

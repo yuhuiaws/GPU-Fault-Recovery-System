@@ -73,7 +73,7 @@ def render_processor_metrics_1(
             "# HELP gpu_fault_processor_claim_backoff_skips_total Claim rounds skipped by the idle backoff.",
             "# TYPE gpu_fault_processor_claim_backoff_skips_total counter",
             f"gpu_fault_processor_claim_backoff_skips_total {claim.get('backoff_skips', 0)}",
-            "# HELP gpu_fault_processor_claim_probes_total Lane-block probes issued before backing off.",
+            "# HELP gpu_fault_processor_claim_probes_total Lane-block and fault-backlog probes issued before backing off.",
             "# TYPE gpu_fault_processor_claim_probes_total counter",
             f"gpu_fault_processor_claim_probes_total {claim.get('probes', 0)}",
             "# HELP gpu_fault_processor_claim_lane_blocked_total Empty claims explained by lanes leased elsewhere.",

@@ -6,10 +6,12 @@ with fewer shards than consumer processes the losers get nothing. Their
 listener still reported ``on_state(True, None)``, which the coordinator took
 as "notifications enabled": the idle ceilings stretched to the 5 s
 notification fallback on a process that would never be woken, and
-``/metrics`` said notifications were on. The fault stream no longer stretches
-on any process (the queue trigger announces only idle->busy edges, so a
-priority-0 row queued behind a pending one is never announced); a shard owner
-still stretches the routine streams.
+``/metrics`` said notifications were on. A process without a shard never
+stretches the fault stream, and a shard owner only once it has settled empty
+with no fault-tier row PENDING or LEASED (the queue trigger announces only
+idle->busy edges, so a priority-0 row queued behind a pending one is never
+announced; see test_fault_stream_wake.py); a shard owner still stretches the
+routine streams.
 """
 
 from __future__ import annotations

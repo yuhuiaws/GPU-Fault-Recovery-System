@@ -78,6 +78,13 @@ class TelemetrySpoolCoordinatorMixin:
         "rank",
     )
 
+    # A settled empty fault round asks whether any fault-tier row is PENDING
+    # or LEASED (claim_backoff.py). "Yes" only keeps the fault stream on its
+    # 0.5 s cadence, so it is believed this long instead of re-read every
+    # round; "no" lets the stream stretch and is never reused.
+    _FAULT_BACKLOG_HOLD_SECONDS = 5.0
+    _fault_backlog_held_until = 0.0
+
     def run_telemetry_spool(self) -> None:
         """Drain telemetry through the dedicated spool path."""
 
@@ -541,3 +548,33 @@ class TelemetrySpoolCoordinatorMixin:
         if blocked:
             self.claim_lane_blocked_total += 1
         return blocked
+
+    def _fault_backlog_is_empty(self) -> bool:
+        """Is no fault-tier row PENDING or LEASED anywhere?
+
+        Asked only by a settled empty fault round with notifications on, in
+        place of the lane probe, and read after the claim that came back
+        empty. An empty answer is never reused; a non-empty one is believed
+        for ``_FAULT_BACKLOG_HOLD_SECONDS``, so a fault backlog adds at most
+        one query per hold per replica. A store that cannot count -- or a
+        count that fails -- keeps the stream on its cadence.
+        """
+
+        probe = getattr(self.store, "processor_fault_backlog_depth", None)
+        if probe is None:
+            return False
+        monotonic = time.monotonic()
+        if monotonic < self._fault_backlog_held_until:
+            return False
+        self.claim_probes_total += 1
+        try:
+            depth = int(probe())
+        except Exception:
+            LOGGER.exception("processor fault backlog probe failed")
+            return False
+        if depth > 0:
+            self._fault_backlog_held_until = (
+                monotonic + self._FAULT_BACKLOG_HOLD_SECONDS
+            )
+            return False
+        return True
