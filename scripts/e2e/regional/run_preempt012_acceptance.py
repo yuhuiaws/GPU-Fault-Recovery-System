@@ -205,13 +205,18 @@ class AuditAdapter:
 
     def __init__(self):
         self.calls = []
+        # Workflows whose RESTART_NODE is let finish (the group's reboot ends).
+        self.finished = set()
 
     def supports(self, step):
         return step.execution_owner == self.owner
 
     def execute(self, context):
         self.calls.append(context.step.operation.value)
-        if context.step.operation is WorkflowOperation.RESTART_NODE:
+        if (
+            context.step.operation is WorkflowOperation.RESTART_NODE
+            and context.workflow.request_id not in self.finished
+        ):
             return WorkflowStepOutcome.waiting(
                 operation_id=f"audit/{context.step.operation.value}"
             )
@@ -418,6 +423,14 @@ try:
             }
         ),
     }
+    # A group ends with no active mutation workflow (the case's verdict), and
+    # the per-node remediation budget enforces it: the clean successor holds the
+    # node's slot until it ends, so its reboot finishes before the dirty group
+    # starts on the same node.
+    adapter.finished.add(clean_successor.request_id)
+    result["clean"]["successor_final_status"] = executor.execute(
+        clean_successor.request_id, request()
+    ).status.value
 
     _incident, dirty, dirty_successor = save_pair(
         "dirty", 3, inherit_containment=False
