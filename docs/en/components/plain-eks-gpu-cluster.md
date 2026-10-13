@@ -145,7 +145,8 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
    recorded `manual`) and waits, bounded, until `describe-nodegroup` shows it gone; the
    operator identity additionally needs `eks:UpdateNodegroupConfig`/`sagemaker:UpdateCluster` (the runtime roles stay
    read-only); `--keep-ownership-label` keeps it and records `retained`. A de-registered cluster whose node groups still
-   carry the label is a stale claim `status`/`node-scope` report as a finding; re-label with the commands `site-id`
+   carry the label is a stale claim `status`/`node-scope` report as a finding (the same cluster joined again is a
+   member and is not reported); re-label with the commands `site-id`
    prints before joining it again (administrator-operations §5.0.0, the "release" row).
 6. Third-party GPU client DaemonSets (the customer's own dcgm-exporter, GPU feature discovery, monitoring agents)
    **must not tolerate** `gpu-fault.io/quiesce` (no key-less `operator: Exists` wildcard toleration; list the keys such

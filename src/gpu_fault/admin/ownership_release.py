@@ -49,7 +49,7 @@ journal resumes at this step. ``--keep-ownership-label`` records the outcome
 ``stale_ownership_claims`` is the read side: the groups of a de-registered
 cluster (a COMPLETED ``remove-cluster`` tombstone, a COMPLETED uninstall) that
 still carry this site's id, which ``status`` and ``node-scope`` report as a
-finding.
+finding. A cluster that joined the site again is a member, not a stale claim.
 """
 
 from __future__ import annotations
@@ -906,15 +906,37 @@ def _cluster_entry(target: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def _identity(entry: Mapping[str, Any]) -> tuple[str, str, str, str]:
+    """What makes two ``_cluster_entry`` records the same cluster of the site."""
+
+    return (
+        str(entry["cluster_id"]),
+        str(entry["provider"]),
+        str(entry["eks_cluster_arn"]),
+        str(entry["hyperpod_cluster_name"]),
+    )
+
+
 def deregistered_clusters(site: RenderedSite) -> list[dict[str, Any]]:
     """The clusters this site de-registered and what their journals recorded.
 
     COMPLETED ``remove-cluster`` tombstones (one per cluster id) and, after a
-    COMPLETED uninstall, every cluster the site still lists. A journal that
-    cannot be read is reported with its error rather than skipped.
+    COMPLETED uninstall, every cluster the site still lists. A tombstone of a
+    cluster the site lists again -- the same cluster id, provider, EKS ARN and
+    HyperPod name, compared normalized (a HyperPod entry carries no
+    ``provider``, a journal may record ``None``) -- is superseded by the
+    re-join: its groups carry the label because the site manages them. The
+    same cluster id on another provider cluster stays reported. The next
+    ``deploy`` archives a COMPLETED uninstall together with ``site.yaml`` and
+    the tombstones (``deploy_command.RETIRED_AFTER_UNINSTALL``), so the
+    uninstall branch never reads a re-deployed site. A journal that cannot be
+    read is reported with its error rather than skipped.
     """
 
     root = site.source.parent
+    members = {
+        _identity(_cluster_entry(item)) for item in site.release_config["clusters"]
+    }
     items: list[dict[str, Any]] = []
     for path in sorted((root / "remove-cluster").glob("*/state.json")):
         try:
@@ -930,10 +952,13 @@ def deregistered_clusters(site: RenderedSite) -> list[dict[str, Any]]:
             continue
         if state.get("phase") != "COMPLETED":
             continue
+        entry = _cluster_entry(state["target"])
+        if _identity(entry) in members:
+            continue
         recorded = (state.get("evidence") or {}).get(STEP)
         items.append(
             {
-                **_cluster_entry(state["target"]),
+                **entry,
                 "deregistered_by": "remove-cluster",
                 "recorded_outcome": (
                     recorded.get("outcome") if isinstance(recorded, Mapping) else None

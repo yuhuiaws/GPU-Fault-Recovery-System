@@ -18,12 +18,14 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+import yaml
 
+from gpu_fault.admin import deploy_command
 from gpu_fault.admin import ownership_release as release
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.cluster_removal_state import SCHEMA_VERSION
 from gpu_fault.admin.site import load_site
-from gpu_fault.cluster_scope import OWNERSHIP_LABEL
+from gpu_fault.cluster_scope import OWNERSHIP_LABEL, is_eks_managed
 from tests.admin.test_admin_site import site_file
 
 SITE_ID = "test-site"
@@ -736,22 +738,105 @@ def test_release_commands_are_the_exact_provider_calls() -> None:
 
 # --- stale claims --------------------------------------------------------------
 
+#: The plain EKS cluster of a mixed site as ``site.yaml`` lists it: an explicit
+#: provider, no HyperPod name, the selector join-cluster recorded from the
+#: labelled node groups. ``EKS_TARGET`` is the same cluster's rendered entry.
+EKS_MEMBER = {
+    "clusterId": "gpu-e",
+    "context": "gpu-eks-context",
+    "provider": "eks-managed",
+    "eksClusterArn": EKS_TARGET["eks_cluster_arn"],
+    "nodeSelector": f"{OWNERSHIP_LABEL}={SITE_ID}",
+    "nodeSelectorSource": "label-convention",
+}
+OTHER_EKS_ARN = f"arn:aws:eks:{REGION}:123456789012:cluster/gpu-eks-old"
 
-def _tombstone(state_dir: Path, *, released: bool, legacy: bool = False) -> None:
+
+def _site_document(path: Path) -> dict[str, Any]:
+    document = yaml.safe_load(path.read_text(encoding="utf-8"))
+    assert isinstance(document, dict), path
+    return document
+
+
+def _write_site_document(path: Path, document: dict[str, Any]) -> None:
+    path.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    path.chmod(0o600)
+
+
+def _mixed_site(tmp_path: Path) -> Path:
+    """``site_file``'s HyperPod cluster ``gpu-a`` (no ``provider`` key, as every
+    HyperPod entry is written) plus the plain EKS cluster ``gpu-e``."""
+
+    path = site_file(tmp_path)
+    document = _site_document(path)
+    (hyperpod,) = document["spec"]["clusters"]
+    shared = {
+        key: value for key, value in hyperpod.items() if key != "hyperpodClusterName"
+    }
+    document["spec"]["clusters"].append({**shared, **EKS_MEMBER})
+    _write_site_document(path, document)
+    return path
+
+
+def _claim_world() -> FakeAws:
+    """The mixed site's GPU clusters, each GPU group still carrying the site id."""
+
+    return FakeAws(
+        nodegroups={
+            "gpu-ng": _nodegroup({OWNERSHIP_LABEL: SITE_ID, "node-type": "gpu"}),
+            "cpu-ng": _nodegroup({"node-type": "cpu"}),
+        },
+        hyperpod={
+            "ClusterName": "hp-gpu-a",
+            "ClusterArn": f"arn:aws:sagemaker:{REGION}:123456789012:cluster/hp",
+            "ClusterStatus": "InService",
+            "InstanceGroups": [
+                _instance_group("spot-p5en", {OWNERSHIP_LABEL: SITE_ID}),
+                _instance_group("controller", {}, instance_type="ml.m5.2xlarge"),
+            ],
+        },
+        no_karpenter=True,
+    )
+
+
+def _tombstone(
+    state_dir: Path,
+    *,
+    released: bool = True,
+    legacy: bool = False,
+    cluster_id: str = "gpu-a",
+    rejoined: bool = False,
+    **recorded: Any,
+) -> None:
+    """The COMPLETED ``remove-cluster`` journal of the site's ``cluster_id``.
+
+    The removal's site commit drops the cluster from ``site.yaml``;
+    ``rejoined`` lists it again, as the site reads once the same cluster
+    joined again. ``recorded`` overrides fields of the journal's target (what
+    the removal recorded differs from today's member: another EKS ARN or
+    HyperPod name, another spelling of the provider).
+    """
+
     from gpu_fault.admin.cluster_removal_state import STEP_DEPENDENCIES
 
     site = load_site(state_dir / "site.yaml")
-    (target,) = [dict(item) for item in site.release_config["clusters"]]
+    (target,) = [
+        {**item, **recorded}
+        for item in site.release_config["clusters"]
+        if item["cluster_id"] == cluster_id
+    ]
     steps = sorted(STEP_DEPENDENCIES)
     if legacy:
         steps = [step for step in steps if step != release.STEP]
+    provider_identity = {"eks_arn": target["eks_cluster_arn"]}
+    if not is_eks_managed(target):
+        provider_identity["hyperpod_arn"] = (
+            f"arn:aws:sagemaker:{REGION}:123456789012:cluster/hp"
+        )
     evidence: dict[str, Any] = {
         "DISCOVERED": {
             "target": target,
-            "provider_identity": {
-                "eks_arn": target["eks_cluster_arn"],
-                "hyperpod_arn": f"arn:aws:sagemaker:{REGION}:123456789012:cluster/hp",
-            },
+            "provider_identity": provider_identity,
             "namespace_uid": "ns-uid",
             "registry_digest": "d" * 64,
             "token_sha256": "t" * 64,
@@ -762,14 +847,14 @@ def _tombstone(state_dir: Path, *, released: bool, legacy: bool = False) -> None
             "outcome": release.RELEASED if released else release.RETAINED,
             "groups": [],
         }
-    path = state_dir / "remove-cluster" / target["cluster_id"] / "state.json"
+    path = state_dir / "remove-cluster" / cluster_id / "state.json"
     path.parent.mkdir(parents=True)
     path.write_text(
         json.dumps(
             {
                 "schema_version": SCHEMA_VERSION,
                 "site_id": SITE_ID,
-                "cluster_id": target["cluster_id"],
+                "cluster_id": cluster_id,
                 "site_identity": {
                     key: str(site.release_config[key])
                     for key in ("site_name", "aws_region", "cpu_eks_arn", "namespace")
@@ -780,6 +865,39 @@ def _tombstone(state_dir: Path, *, released: bool, legacy: bool = False) -> None
                 "completed_steps": steps,
                 "evidence": evidence,
                 "updated_at": "now",
+            }
+        ),
+        encoding="utf-8",
+    )
+    if not rejoined:
+        document = _site_document(state_dir / "site.yaml")
+        document["spec"]["clusters"] = [
+            item
+            for item in document["spec"]["clusters"]
+            if item["clusterId"] != cluster_id
+        ]
+        _write_site_document(state_dir / "site.yaml", document)
+
+
+def _completed_uninstall(state_dir: Path, *, outcome: str) -> None:
+    """``uninstall/state.json`` COMPLETED with its per-cluster release outcome."""
+
+    site = load_site(state_dir / "site.yaml")
+    path = state_dir / "uninstall" / "state.json"
+    path.parent.mkdir()
+    path.write_text(
+        json.dumps(
+            {
+                "phase": "COMPLETED",
+                "cpu_disposition": "delete",
+                "ownership_release": {
+                    "label": OWNERSHIP_LABEL,
+                    "outcome": outcome,
+                    "clusters": [
+                        {"cluster_id": item["cluster_id"], "outcome": outcome}
+                        for item in site.release_config["clusters"]
+                    ],
+                },
             }
         ),
         encoding="utf-8",
@@ -844,3 +962,191 @@ def test_no_tombstone_means_no_aws_read(tmp_path: Path) -> None:
 
     assert release.stale_ownership_claims(load_site(path), world) == []  # type: ignore[arg-type]
     assert world.calls == [], "a site that de-registered nothing reads nothing"
+
+
+# --- stale claims: a cluster that joined the site again ------------------------
+
+
+@pytest.mark.parametrize(
+    "cluster_id", ["gpu-a", "gpu-e"], ids=["hyperpod", "eks-managed"]
+)
+def test_a_cluster_that_joined_again_is_no_stale_claim(
+    tmp_path: Path, cluster_id: str
+) -> None:
+    """Live S5: remove-cluster COMPLETED, then the same cluster joined again.
+
+    Its groups carry the label because the site manages them again; the
+    finding told the operator to strip it from a registered cluster, after
+    which discovery no longer selects those nodes.
+    """
+
+    path = _mixed_site(tmp_path)
+    _tombstone(path.parent, cluster_id=cluster_id, rejoined=True)
+    site = load_site(path)
+    world = _claim_world()
+
+    assert release.deregistered_clusters(site) == [], (
+        "the re-join supersedes the tombstone of the same cluster"
+    )
+    assert release.stale_ownership_claims(site, world) == []  # type: ignore[arg-type]
+    assert release.status_findings(site, world) == []  # type: ignore[arg-type]
+    assert world.calls == [], "a member's node groups are never read as a claim"
+    assert (path.parent / "remove-cluster" / cluster_id / "state.json").is_file(), (
+        "the tombstone itself stays for the readers that need it"
+    )
+
+
+def test_a_removed_plain_eks_clusters_labelled_group_is_a_stale_claim(
+    tmp_path: Path,
+) -> None:
+    path = _mixed_site(tmp_path)
+    _tombstone(path.parent, cluster_id="gpu-e")
+    world = _claim_world()
+
+    findings = release.stale_ownership_claims(load_site(path), world)  # type: ignore[arg-type]
+
+    (finding,) = findings
+    assert finding["cluster_id"] == "gpu-e"
+    assert finding["deregistered_by"] == "remove-cluster"
+    assert finding["provider"] == "eks-managed" and finding["cluster"] == "gpu-eks"
+    assert finding["group_kind"] == "managed node group"
+    assert finding["groups"] == ["gpu-ng"], "the unlabelled cpu-ng claims nothing"
+    command = (
+        "aws eks update-nodegroup-config --cluster-name gpu-eks --nodegroup-name "
+        f"gpu-ng --labels removeLabels={OWNERSHIP_LABEL}"
+    )
+    assert finding["release_commands"] == [command]
+    assert release.stale_claim_lines(findings) == [
+        "stale ownership claim: remove-cluster de-registered gpu-e (eks-managed "
+        "gpu-eks) but managed node group(s) gpu-ng still carry "
+        f"{OWNERSHIP_LABEL}={SITE_ID}; release with {command}"
+    ]
+    assert not any("describe-cluster" in call for call in world.calls), (
+        "the HyperPod member gpu-a is not read as a claim"
+    )
+
+
+@pytest.mark.parametrize(
+    ("cluster_id", "recorded", "described"),
+    [
+        ("gpu-e", {"eks_cluster_arn": OTHER_EKS_ARN}, "gpu-eks-old"),
+        ("gpu-a", {"hyperpod_cluster_name": "hp-gpu-old"}, "hp-gpu-old"),
+    ],
+    ids=["eks-managed-arn", "hyperpod-name"],
+)
+def test_a_member_reusing_the_cluster_id_for_another_cluster_keeps_the_claim(
+    tmp_path: Path, cluster_id: str, recorded: dict[str, str], described: str
+) -> None:
+    """The id alone never supersedes a tombstone: the removed cluster is another
+    provider cluster than today's member, its groups are still a stale claim."""
+
+    path = _mixed_site(tmp_path)
+    _tombstone(path.parent, cluster_id=cluster_id, rejoined=True, **recorded)
+    world = _claim_world()
+
+    (finding,) = release.stale_ownership_claims(load_site(path), world)  # type: ignore[arg-type]
+
+    assert finding["cluster_id"] == cluster_id
+    assert finding["deregistered_by"] == "remove-cluster"
+    assert finding["cluster"] == described, "the removed cluster is the one read"
+    assert finding["groups"] in (["gpu-ng"], ["spot-p5en"])
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [{}, {"provider": None}, {"provider": ""}, {"provider": "hyperpod"}],
+    ids=["absent", "none", "empty", "explicit"],
+)
+def test_a_hyperpod_journal_matches_its_member_whatever_the_provider_spelling(
+    tmp_path: Path, recorded: dict[str, Any]
+) -> None:
+    """``site.yaml`` writes no ``provider`` for HyperPod (absent means hyperpod)
+    and the live tombstone recorded ``provider: None``: both sides compare
+    normalized, never as raw fields."""
+
+    path = _mixed_site(tmp_path)
+    _tombstone(path.parent, rejoined=True, **recorded)
+    site = load_site(path)
+    (member,) = [
+        item
+        for item in site.release_config["clusters"]
+        if item["cluster_id"] == "gpu-a"
+    ]
+    journal = json.loads(
+        (path.parent / "remove-cluster/gpu-a/state.json").read_text(encoding="utf-8")
+    )
+    world = _claim_world()
+
+    assert "provider" not in member, "the HyperPod member carries no provider key"
+    assert journal["target"].get("provider", "absent") == (
+        recorded.get("provider", "absent")
+    )
+    assert release.stale_ownership_claims(site, world) == []  # type: ignore[arg-type]
+    assert world.calls == [], "the HyperPod member is not read as a claim"
+
+
+def test_an_unreadable_journal_is_reported_even_when_its_cluster_is_a_member(
+    tmp_path: Path,
+) -> None:
+    path = _mixed_site(tmp_path)
+    journal = path.parent / "remove-cluster" / "gpu-a" / "state.json"
+    journal.parent.mkdir(parents=True)
+    journal.write_text("{not json", encoding="utf-8")
+    world = _claim_world()
+
+    findings = release.stale_ownership_claims(load_site(path), world)  # type: ignore[arg-type]
+
+    assert release.stale_claim_lines(findings) == [
+        "stale ownership claim check: gpu-a could not be read: cannot read "
+        "remove-cluster state"
+    ], "a journal nobody can read is not vouched for by the member list"
+    assert world.calls == []
+
+
+def test_a_completed_uninstall_reports_every_cluster_the_site_listed(
+    tmp_path: Path,
+) -> None:
+    path = _mixed_site(tmp_path)
+    _completed_uninstall(path.parent, outcome=release.RETAINED)
+    world = _claim_world()
+
+    findings = release.stale_ownership_claims(load_site(path), world)  # type: ignore[arg-type]
+
+    assert [
+        (item["cluster_id"], item["deregistered_by"], item["recorded_outcome"])
+        for item in findings
+    ] == [("gpu-a", "uninstall", "retained"), ("gpu-e", "uninstall", "retained")]
+    assert [item["groups"] for item in findings] == [["spot-p5en"], ["gpu-ng"]]
+
+
+def test_the_deploy_after_an_uninstall_retires_it_so_a_redeployed_site_has_no_claim(
+    tmp_path: Path,
+) -> None:
+    """The next deploy's first step archives ``uninstall/`` together with
+    ``site.yaml`` and the ``remove-cluster`` journals, so a site deployed again
+    into the same state directory reads neither as a de-registration."""
+
+    path = _mixed_site(tmp_path)
+    redeployed = _site_document(path)
+    _tombstone(path.parent, cluster_id="gpu-e")
+    _completed_uninstall(path.parent, outcome=release.RETAINED)
+    before = release.deregistered_clusters(load_site(path))
+    assert [(item["cluster_id"], item["deregistered_by"]) for item in before] == [
+        ("gpu-e", "remove-cluster"),
+        ("gpu-a", "uninstall"),
+    ]
+
+    archive = deploy_command.retire_site_after_uninstall(path.parent)
+    _write_site_document(path, redeployed)
+    world = _claim_world()
+
+    assert archive is not None and (archive / "uninstall/state.json").is_file(), (
+        "the completed uninstall is archived, not lost"
+    )
+    assert (archive / "remove-cluster/gpu-e/state.json").is_file(), (
+        "the earlier tombstone travels with it"
+    )
+    site = load_site(path)
+    assert release.deregistered_clusters(site) == []
+    assert release.stale_ownership_claims(site, world) == []  # type: ignore[arg-type]
+    assert world.calls == [], "the re-deployed members are not read as claims"

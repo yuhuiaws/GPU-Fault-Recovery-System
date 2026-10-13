@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from typing import Any
 
 import pytest
+import yaml
 
 from gpu_fault.admin import cli as admin_cli
 from gpu_fault.admin import cluster_removal as removal
@@ -35,7 +36,12 @@ from gpu_fault.admin.uninstall import UninstallRequest
 from gpu_fault.admin.uninstall_types import UNINSTALL_PHASES
 from gpu_fault.cluster_scope import OWNERSHIP_LABEL
 from tests.admin._cluster_removal_support import EKS_ARN, RemovalScenario
-from tests.admin.test_admin_node_scope_verb import ScopeRunner, _hp_group
+from tests.admin.test_admin_node_scope_verb import (
+    LEGACY_HP_SECRET,
+    ScopeRunner,
+    _hp_group,
+    _hp_node,
+)
 from tests.admin.test_admin_site import site_file
 from tests.admin.test_uninstall_lifecycle import Harness
 
@@ -369,6 +375,51 @@ def test_node_scope_reports_a_stale_claim_of_a_removed_cluster(
     ]
     assert "finding: stale ownership claim: remove-cluster de-registered gpu-a" in (
         captured.err
+    )
+
+
+def test_node_scope_reports_no_stale_claim_for_a_cluster_that_joined_again(
+    scenario, capsys
+) -> None:
+    listed = yaml.safe_load(scenario.path.read_text(encoding="utf-8"))["spec"][
+        "clusters"
+    ]
+    remove_cluster(scenario.request())  # the COMPLETED tombstone of gpu-a
+    document = yaml.safe_load(scenario.path.read_text(encoding="utf-8"))
+    assert document["spec"]["clusters"] == [], "the removal de-registered gpu-a"
+    # join-cluster lists the same cluster again (same id, EKS ARN, HyperPod name)
+    document["spec"]["clusters"] = listed
+    scenario.path.write_text(
+        yaml.safe_dump(document, sort_keys=False), encoding="utf-8"
+    )
+    site = load_site(scenario.path)
+    runner = ScopeRunner(
+        hyperpod_groups=[
+            _hp_group("spot-p5en", "ml.p5en.48xlarge", labelled=True),
+            _hp_group("controller", "ml.m5.2xlarge", labelled=False),
+        ],
+        nodes={"gpu-a": [_hp_node("hyperpod-i-1", "spot-p5en", labelled=True)]},
+        secrets={"gpu-a": LEGACY_HP_SECRET},
+    )
+    arguments = admin_cli.parser().parse_args(
+        ["node-scope", "--state-dir", str(scenario.path.parent)]
+    )
+
+    assert node_scope.run_node_scope_command(arguments, site=site, runner=runner) == 0
+
+    captured = capsys.readouterr()
+    result = json.loads(captured.out)
+    (cluster,) = result["clusters"]
+    assert cluster["cluster_id"] == "gpu-a"
+    assert cluster["label"]["owned_groups"] == ["spot-p5en"], (
+        "the label on spot-p5en is the member's own declaration"
+    )
+    assert result["stale_ownership_claims"] == [], (
+        "a re-joined cluster's tombstone is superseded, never a stale claim"
+    )
+    assert "stale ownership claim" not in captured.err
+    assert (scenario.path.parent / "remove-cluster/gpu-a/state.json").is_file(), (
+        "the tombstone stays for the next remove-cluster and the re-join readers"
     )
 
 
