@@ -862,7 +862,8 @@ If any of the following items fails, the rolling upgrade must not start:
   roll needs no extra slot. A step that cannot fit fails closed (`control-plane schedulability: step N (<deployment>
   roll) cannot schedule ...`, naming the missing cores and every node's headroom) with the cluster untouched; the
   evidence (headroom per node, each role's surge/added Pods, the order actually rolled) is written to
-  `<state-dir>/control-plane-apply/schedulability-<release>-<time>.json` and kept with the `logs/mutating/` log.
+  `<state-dir>/control-plane-apply/schedulability-<release>-<time>-<pid>-<n>.json` (a rollback's fallback restart
+  runs the preflight again and writes a second one) and kept with the `logs/mutating/` log.
   A free slot is necessary, not sufficient: once api-ha's surge Pod is Ready the ReplicaSet controller picks the old
   Pod to delete by a fixed ranking (unassigned, Pending, not Ready, lower `controller.kubernetes.io/pod-deletion-cost`,
   **more related Pods on the same node** -- related = Pods of any ReplicaSet of the Deployment, the surge Pod included
@@ -4644,10 +4645,39 @@ The script records the digest of `.data` (`jq -cjS`, byte-for-byte identical to 
 `deploy/control-plane/tools/wait_control_plane_pins.py` waits until every Pod of the selected roles reports the same digest in
 `fleet_pins.content_sha256` of `/healthz` (timeout
 `GPU_FAULT_FLEET_PIN_CONVERGENCE_TIMEOUT_SECONDS`, default 180 seconds, values below 30 seconds refused); a timeout means
-the apply fails and the transaction rolls back as usual. A verbatim rollback (with `GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE` set) forces
-a restart of all roles, and the Pods start directly from the ConfigMap snapshot, so that wait is skipped. The `fleet_pins` field of `/v1/version` and
+the apply fails and the transaction rolls back as usual. A rollback restarts only the tiers whose start-up inputs it changes and
+proves every other tier on this wait (next paragraph). Run by hand without `GPU_FAULT_FORCE_ROLE_RESTART_ROLES`, a verbatim restore
+(with `GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE` set) still restarts every role and skips the wait, because the Pods start directly
+from the ConfigMap snapshot. The `fleet_pins` field of `/v1/version` and
 `/healthz` gives the source, digest, generation and most recent
 read error of the pin snapshot the process currently serves; pin read failures are only recorded there and do not affect the readiness decision.
+
+Both CPU stages of a rollback (`controller_stage`, which re-stages the control plane on the previous pin window, and
+`cpu_restore`) decide per tier which Pods restart. They hand the apply `GPU_FAULT_FORCE_ROLE_RESTART_ROLES` (`spool`, `worker`,
+`ingress`, comma-separated, possibly empty) and `GPU_FAULT_ROLE_RESTART_REPORT`; the script refuses (exit 2) a tier the role
+targets do not select, a `GPU_FAULT_FORCE_ROLE_RESTART` that disagrees with whether the list is empty, and a report path without
+the list. Only the named tiers get a new restart token; every other tier inherits the live `restartedAt` and the live
+`gpu-fault.io/failure-domain-map-sha256` stamp, which a rollback does not render, so its template does not change.
+`RollbackRestartPlan` (`src/gpu_fault_release/regional_release_rollback_restart.py`) names a tier from proof, and an incomplete
+proof restarts it. `registry-restored` (the cluster registry backup was restored) and `secret-changed` (the restored
+`gpu-fault-email` data differs from the live data) restart every tier, because the Pods read both as `secretKeyRef` environment
+at start-up. `config-core-changed` restarts the tier whose `<deployment>-config-core` the Agent staging changed;
+`config-maps-changed` and `no-config-map-snapshot` the tier whose role ConfigMaps (read through `envFrom`) the restore changed or
+cannot compare. The previous snapshot records `cpu_restart_baseline` (the digest of each role Deployment's `.spec` and the capture
+time), and a tier also restarts on `spec-changed`, `deployment-missing`, `no-baseline`, `pod-selector-unsupported`,
+`pod-started-after-capture` (60-second margin), `container-restarted-after-capture` or `container-not-running`. A read the proof
+needs that fails restarts every tier with `<what>-unreadable` (narrated as `rollback-cpu-restart-proof`); the decision is narrated
+as `rollback-cpu-restart forced=... reasons=...`. A tier that is not restarted must prove the restored pins on `/healthz`:
+`wait_control_plane_pins.py --report` records one verdict per Deployment (`converged`, `unconverged`, `unsupported` for a wheel
+that predates `fleet_pins`, `empty` for no Pod), and `--unsupported-fails-fast` settles an `unsupported` Deployment at once instead
+of polling it to the deadline. A tier that is neither `converged` nor `empty` falls back to the restart after all the applies,
+through the same schedulability preflight (a second `schedulability-*.json`) and the one-Deployment-at-a-time roll, and outside a
+verbatim restore is waited for again; a restarted tier that neither converges nor answers `unsupported` fails the apply. The
+evidence is `rollback_timing.phases.{controller_stage,cpu_restore}.details.cpu_restart`: `restarted` (tier to reasons,
+`pin-proof-failed` for a fallback), `kept`, and the verdicts of each wait in `pin_wait` and `restart_wait`, or `report: missing`
+when the apply wrote none. An Executor-only rollback therefore restarts no CPU tier. A tier the controller staging restarted
+is restarted again by the CPU restore, because its Pods are newer than the capture. A forward apply never inherits these
+variables: `render_and_apply_cpu_roles` removes them from its environment.
 
 The workflow executor and the GPU Cluster Executor also check the Fleet readiness of the NodeAction targets later in the workflow
 before the first destructive step. On pin drift the workflow stays retryable, and

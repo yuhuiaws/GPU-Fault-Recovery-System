@@ -210,7 +210,9 @@ Both `desired.json` and `pending.json` carry digest self-checks; changed content
 preflight's evidence (headroom per node, each role's surge/added Pods, the order actually rolled, and the ingress
 step's `steering`: `nodes_with_a_free_slot`, the predicted `surge_nodes`, the `deletion_order` with its `cost`s,
 `progress_guaranteed`, the unsteered `without_steering.stalling_order`) is
-`<state-dir>/control-plane-apply/schedulability-<release>-<time>.json`, one per CPU role apply.
+`<state-dir>/control-plane-apply/schedulability-<release>-<time>-<pid>-<n>.json`, one per preflight (`<n>` numbers
+them within one apply): one per CPU role apply, plus one when a rollback restarts the tiers that could not prove the
+pins on `/healthz` (the fallback restart runs the preflight again).
 
 ### 4.5 Upgrading Legacy Records
 

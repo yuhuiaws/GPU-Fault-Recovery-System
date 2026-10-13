@@ -24,6 +24,17 @@ are terminating or already finished are left out; a Pod that is not Running
 yet blocks until it is. A Deployment with no Pods (the spool tier scaled to
 zero) has nothing to converge: the rollout gate just before this wait already
 proved the replica counts.
+
+A rollback keeps the Pods of a tier whose start-up inputs it did not change
+and restarts it only when this wait cannot prove the restored pins, so it asks
+for two more things. ``--report PATH`` writes the verdict of every Deployment
+(``converged``, ``unconverged``, ``unsupported`` or ``empty``) as JSON on exit
+0 or 1. ``--unsupported-fails-fast`` settles a Deployment as ``unsupported``
+the first time one of its Pods answers ``/healthz`` with a JSON object that
+has no ``fleet_pins``: the app factory always binds the pin runtime, so that
+body is a wheel older than pin hot reload and no poll can change it. Such a
+Deployment is not polled again, the others are, and the exit is 1. A refused
+connection or an unparseable body is never taken for an old wheel.
 """
 
 from __future__ import annotations
@@ -70,6 +81,10 @@ class PinReadError(Exception):
     """One Pod list or Pod could not be read this poll; retried until the deadline."""
 
 
+class PinsUnsupported(PinReadError):
+    """The Pod answered with a JSON object that has no ``fleet_pins``."""
+
+
 @dataclass(frozen=True)
 class Options:
     namespace: str
@@ -79,6 +94,8 @@ class Options:
     poll_seconds: float
     kubeconfig: str | None
     kubectl: str
+    report: str | None = None
+    unsupported_fails_fast: bool = False
 
 
 @dataclass(frozen=True)
@@ -89,6 +106,7 @@ class PodReading:
     pod: str | None
     digest: str | None
     error: str | None
+    unsupported: bool = False
 
     def converged(self, expected: str) -> bool:
         return self.digest == expected
@@ -170,6 +188,16 @@ def parse_arguments(argv: Sequence[str] | None) -> Options:
         default="kubectl",
         help="kubectl binary to run (default: kubectl from PATH)",
     )
+    parser.add_argument(
+        "--report",
+        default=None,
+        help="write every Deployment's verdict to this JSON file on exit 0 or 1",
+    )
+    parser.add_argument(
+        "--unsupported-fails-fast",
+        action="store_true",
+        help="settle a Deployment whose Pod serves no fleet_pins at once",
+    )
     arguments = parser.parse_args(argv)
     return Options(
         namespace=str(arguments.namespace),
@@ -179,6 +207,8 @@ def parse_arguments(argv: Sequence[str] | None) -> Options:
         poll_seconds=float(arguments.poll_seconds),
         kubeconfig=str(arguments.kubeconfig) if arguments.kubeconfig else None,
         kubectl=str(arguments.kubectl),
+        report=str(arguments.report) if arguments.report else None,
+        unsupported_fails_fast=bool(arguments.unsupported_fails_fast),
     )
 
 
@@ -248,24 +278,28 @@ def read_served_digest(prefix: list[str], pod: str, port: int) -> str:
     except ValueError:
         raise PinReadError("/healthz returned invalid JSON") from None
     pins = payload.get("fleet_pins") if isinstance(payload, dict) else None
-    digest = pins.get("content_sha256") if isinstance(pins, dict) else None
-    if not isinstance(digest, str) or not SHA256.match(digest):
-        raise PinReadError(
+    if isinstance(payload, dict) and not isinstance(pins, dict):
+        raise PinsUnsupported(
             "/healthz reports no fleet_pins.content_sha256 "
             "(a control plane that predates fleet pin hot reload?)"
         )
+    digest = pins.get("content_sha256") if isinstance(pins, dict) else None
+    if not isinstance(digest, str) or not SHA256.match(digest):
+        raise PinReadError("/healthz reports no valid fleet_pins.content_sha256")
     return digest
 
 
 def poll_once(
-    options: Options, environ: Mapping[str, str]
+    options: Options,
+    environ: Mapping[str, str],
+    deployments: Sequence[str] | None = None,
 ) -> tuple[list[PodReading], list[str]]:
     """Read every live Pod once; also name the Deployments with nothing to read."""
 
     prefix = kubectl_prefix(options)
     readings: list[PodReading] = []
     empty: list[str] = []
-    for deployment in options.deployments:
+    for deployment in options.deployments if deployments is None else deployments:
         try:
             pods = list_pods(prefix, deployment)
         except PinReadError as error:
@@ -289,12 +323,57 @@ def poll_once(
                     prefix, name, http_port(pod, deployment, environ)
                 )
             except PinReadError as error:
-                readings.append(PodReading(deployment, name, None, str(error)))
+                readings.append(
+                    PodReading(
+                        deployment,
+                        name,
+                        None,
+                        str(error),
+                        unsupported=isinstance(error, PinsUnsupported),
+                    )
+                )
             else:
                 readings.append(PodReading(deployment, name, digest, None))
         if not live:
-            empty.append(f"{deployment}: no Pods; nothing to converge")
+            empty.append(deployment)
     return readings, empty
+
+
+def deployment_verdicts(
+    expected: str,
+    deployments: Sequence[str],
+    readings: Sequence[PodReading],
+    empty: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """``{deployment: {verdict, pods}}`` for the Deployments read this poll."""
+
+    verdicts: dict[str, dict[str, Any]] = {}
+    for deployment in deployments:
+        mine = [reading for reading in readings if reading.deployment == deployment]
+        pods = sum(1 for reading in mine if reading.pod is not None)
+        if deployment in empty and not mine:
+            verdict = "empty"
+        elif any(reading.unsupported for reading in mine):
+            verdict = "unsupported"
+        elif all(reading.converged(expected) for reading in mine):
+            verdict = "converged"
+        else:
+            verdict = "unconverged"
+        verdicts[deployment] = {"verdict": verdict, "pods": pods}
+    return verdicts
+
+
+def write_report(path: str | None, verdicts: Mapping[str, dict[str, Any]]) -> None:
+    if path is None:
+        return
+    document = {
+        "converged": all(
+            entry["verdict"] in {"converged", "empty"} for entry in verdicts.values()
+        ),
+        "deployments": dict(verdicts),
+    }
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(document, handle, sort_keys=True)
 
 
 def wait_for_convergence(
@@ -308,16 +387,39 @@ def wait_for_convergence(
 ) -> int:
     deadline = monotonic() + options.timeout_seconds
     first = True
+    # Deployments settled as unsupported: their verdict is final, so they are
+    # left out of every later poll (fast-fail only).
+    settled: list[str] = []
+    verdicts: dict[str, dict[str, Any]] = {}
     while True:
-        readings, empty = poll_once(options, environ)
+        polled = [name for name in options.deployments if name not in settled]
+        readings, empty = poll_once(options, environ, polled)
         if first:
-            for note in empty:
-                print(note, file=err)
+            for deployment in empty:
+                print(f"{deployment}: no Pods; nothing to converge", file=err)
             first = False
+        verdicts.update(deployment_verdicts(options.expected, polled, readings, empty))
+        if options.unsupported_fails_fast:
+            for reading in readings:
+                if reading.unsupported and reading.deployment not in settled:
+                    print(reading.line(), file=err)
+                    settled.append(reading.deployment)
         pending = [
-            reading for reading in readings if not reading.converged(options.expected)
+            reading
+            for reading in readings
+            if not reading.converged(options.expected)
+            and reading.deployment not in settled
         ]
         if not pending:
+            write_report(options.report, verdicts)
+            if settled:
+                print(
+                    "control-plane pins: no fleet_pins on /healthz of "
+                    + ", ".join(settled)
+                    + " (a wheel that predates fleet pin hot reload)",
+                    file=err,
+                )
+                return 1
             print(
                 f"control-plane pins converged: {len(readings)} Pods serve "
                 f"{options.expected}",
@@ -333,6 +435,7 @@ def wait_for_convergence(
                 f"within {options.timeout_seconds}s",
                 file=err,
             )
+            write_report(options.report, verdicts)
             return 1
         print(
             f"control-plane pins: {len(readings) - len(pending)}/{len(readings)} Pods "

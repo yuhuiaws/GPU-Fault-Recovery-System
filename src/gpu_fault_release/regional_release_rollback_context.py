@@ -4,6 +4,7 @@ import copy
 import json
 import os
 import tempfile
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -21,6 +22,11 @@ from gpu_fault_release.regional_release_progress import RollbackCompensationPlan
 from gpu_fault_release.regional_release_rendering import (
     admin_config_renderer_environment,
     control_plane_apply_evidence_environment,
+)
+from gpu_fault_release.regional_release_rollback_restart import (
+    FORCE_ROLES_VARIABLE,
+    REPORT_VARIABLE,
+    ROLE_RESTART_VARIABLES,
 )
 from gpu_fault_release.regional_release_state import (
     SENSITIVE_CONFIG_KEY,
@@ -337,7 +343,17 @@ def build_rollback_environment(
     runtime_image: str,
     preserve_role_config_maps: bool = False,
     previous_container_env_file: str | None = None,
+    force_restart_roles: Sequence[str] | None = None,
+    role_restart_report: str | None = None,
 ) -> dict[str, str]:
+    """The apply environment of one rollback stage.
+
+    ``force_restart_roles`` is the stage's per-tier decision (see
+    ``RollbackRestartPlan``): only those tiers get a restart token and every
+    other one proves the restored pins on ``/healthz``. ``None`` keeps the
+    all-tier forced restart.
+    """
+
     legacy_component_pins = not any(
         metadata.get(name)
         for name in (
@@ -420,4 +436,13 @@ def build_rollback_environment(
     environment.pop(CONTAINER_ENV_FILE_VARIABLE, None)
     if previous_container_env_file:
         environment[CONTAINER_ENV_FILE_VARIABLE] = previous_container_env_file
+    for name in ROLE_RESTART_VARIABLES:
+        environment.pop(name, None)
+    if force_restart_roles is not None:
+        environment["GPU_FAULT_FORCE_ROLE_RESTART"] = str(
+            bool(force_restart_roles)
+        ).lower()
+        environment[FORCE_ROLES_VARIABLE] = ",".join(force_restart_roles)
+        if role_restart_report:
+            environment[REPORT_VARIABLE] = role_restart_report
     return environment

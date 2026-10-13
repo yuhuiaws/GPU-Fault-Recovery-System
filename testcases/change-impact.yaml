@@ -246,6 +246,7 @@ rules:
       - tests/regional/test_release_diff.py
       - tests/regional/test_release_rollback_state.py
       - tests/regional/test_release_rollback_container_env.py
+      - tests/regional/test_release_rollback_restart.py
       - tests/regional/test_release_trust_security.py
       - tests/regional/test_allowed_namespace_preflight.py
       - tests/regional/test_release_supersede_failed_transaction.py
@@ -259,6 +260,7 @@ rules:
       - tests/deploy/test_control_plane_surge_steering.py
       - tests/deploy/test_role_split_apply_order.py
       - tests/deploy/test_cpu_template_apply.py
+      - tests/deploy/test_wait_control_plane_pins.py
       - tests/regional/test_release_cpu_apply_evidence_environment.py
       - tests/regional/test_release_aurora_refresh_preflight.py
       - tests/test_artifact_consistency.py

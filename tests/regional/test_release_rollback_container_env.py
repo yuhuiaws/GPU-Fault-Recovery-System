@@ -21,6 +21,7 @@ from __future__ import annotations
 import copy
 import json
 import os
+import time
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -31,6 +32,7 @@ from gpu_fault.admin.config import default_admin_config
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_release_rollback_context as ROLLBACK_CONTEXT
+from gpu_fault_release import regional_release_rollback_restart as RESTART
 from gpu_fault_release import regional_release_state as STATE
 from gpu_fault_release.regional_release_config import ReleaseError
 from tests.regional.test_release_rollback_state import _rollback_previous
@@ -240,9 +242,19 @@ def test_capture_previous_records_the_container_env_beside_the_config_maps() -> 
         nodes=(STATE.ReleaseComponent.CPU_FINALIZE, STATE.ReleaseComponent.VERIFY)
     )
 
+    started = time.time()
     previous = STATE.capture_previous(release, plan)
+    finished = time.time()
 
     assert previous["cpu_role_container_env"] == _expected_snapshot()
+    # What a rollback proves an untouched tier against: the specs this capture
+    # read, and when it began reading.
+    baseline = previous["cpu_restart_baseline"]
+    assert started <= baseline["captured_at"] <= finished
+    assert baseline["spec_sha256"] == {
+        name: RESTART.deployment_spec_sha256(documents[name])
+        for name in inventory.CPU_RUNTIME_DEPLOYMENTS
+    }
     assert previous["runtime_profile_version"] == "profile-v1", "the ConfigMap"
     assert previous["effective_runtime_profile_version"] == "profile-v0", (
         "what the Running replicas loaded is recorded beside the ConfigMap value"
@@ -583,7 +595,9 @@ def test_restore_rollback_cpu_hands_the_captured_env_to_the_renderer(
         "the previous image, never the candidate's, is what the renderer gets"
     )
     assert applied[0]["file_exists"] == "True", "file must outlive the apply step"
-    assert _cpu_restore_details(saved) == {"cpu_container_env": "snapshot"}
+    details = _cpu_restore_details(saved)
+    assert details["cpu_container_env"] == "snapshot"
+    assert "cpu_restart" in details, "the restore records which tiers it restarted"
     assert mutations == ["secret", "registry", "config-maps"]
 
 

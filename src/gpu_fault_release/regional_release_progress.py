@@ -249,14 +249,15 @@ class RollbackCompensationPlan:
     def needs_controller(self) -> bool:
         """Whether the control plane must be staged for the previous pins first.
 
-        The control plane admits agents and executors by the pin window its
-        Pods were started with (``gpu-fault-release-metadata`` through env), so
-        a previous agent *or* a previous executor rolled back onto a control
-        plane still pinned to the candidate is refused until the controller is
-        re-staged with the previous window. Live 2026-09-18: an executor-only
-        rollback skipped the staging and its Pod stayed unready on
-        ``regional executor artifact mismatch`` (503) until the rollout timed
-        out.
+        The control plane admits agents and executors by the pin window in
+        ``gpu-fault-release-metadata``, so a previous agent *or* a previous
+        executor rolled back onto a control plane still pinned to the candidate
+        is refused until the controller is re-staged with the previous window.
+        Live 2026-09-18: an executor-only rollback skipped the staging and its
+        Pod stayed unready on ``regional executor artifact mismatch`` (503)
+        until the rollout timed out. The Pods hot-load that window
+        (``FleetPinRuntime``), so the staging restarts only a tier whose
+        start-up inputs it changes (``RollbackRestartPlan``).
         """
 
         return any(

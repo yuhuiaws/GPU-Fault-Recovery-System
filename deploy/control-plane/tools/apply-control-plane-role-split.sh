@@ -46,6 +46,18 @@ NOTIFICATION_CONFIG_SHA256="$(
 LEGACY_COMPONENT_PINS="${GPU_FAULT_LEGACY_COMPONENT_PINS:-false}"
 PRESERVE_ROLE_CONFIG_MAPS="${GPU_FAULT_PRESERVE_ROLE_CONFIG_MAPS:-false}"
 FORCE_ROLE_RESTART="${GPU_FAULT_FORCE_ROLE_RESTART:-false}"
+# A rollback decides per tier instead: GPU_FAULT_FORCE_ROLE_RESTART_ROLES, when
+# set (possibly empty), names the tiers whose start-up inputs it changed; only
+# those get a restart token, every other tier proves the restored pins on
+# /healthz or falls back to the restart (prove_roles_or_restart). The decision
+# and every wait verdict go to GPU_FAULT_ROLE_RESTART_REPORT.
+PER_ROLE_RESTART="false"
+if [[ -n "${GPU_FAULT_FORCE_ROLE_RESTART_ROLES+set}" ]]; then
+    PER_ROLE_RESTART="true"
+fi
+FORCED_ROLES="${GPU_FAULT_FORCE_ROLE_RESTART_ROLES:-}"
+REQUESTED_FORCED_ROLES="${FORCED_ROLES}"
+ROLE_RESTART_REPORT="${GPU_FAULT_ROLE_RESTART_REPORT:-}"
 # How the schedulability preflight treats a roll the nodes cannot fit:
 # `refuse` (the default) fails closed before anything in the cluster changes;
 # `warn` -- the rollback context -- logs the shortfall and proceeds to the
@@ -57,7 +69,9 @@ SCHEDULABILITY_EVIDENCE_DIR="${GPU_FAULT_CONTROL_PLANE_EVIDENCE_DIR:-}"
 # Content digest of the failure-domain ConfigMap the release engine applied
 # just before this script; stamped on the control-worker pod template so the
 # worker rolls exactly when the map it mounts changed. Empty means "not
-# rendered" (dry run) and leaves the existing stamp alone.
+# rendered" (a dry run, a rollback) and leaves the existing stamp alone: the
+# live template's value is carried into the final document, which a
+# client-side apply would otherwise strip, rolling the worker for nothing.
 FAILURE_DOMAIN_MAP_SHA256="${GPU_FAULT_FAILURE_DOMAIN_MAP_SHA256:-}"
 ROLE_TARGETS="$(
     printf '%s' \
@@ -142,6 +156,27 @@ STEERING_DIR="${CONTRACT_DIR}/steering"
     echo "GPU_FAULT_CONTROL_PLANE_ROLE_TARGETS is invalid" >&2
     exit 2
 }
+[[ -z "${FORCED_ROLES}" ||
+    "${FORCED_ROLES}" =~ ^(ingress|worker|spool)(,(ingress|worker|spool))*$ ]] || {
+    echo "GPU_FAULT_FORCE_ROLE_RESTART_ROLES is invalid" >&2
+    exit 2
+}
+if [[ "${PER_ROLE_RESTART}" == "true" ]]; then
+    [[ "${FORCE_ROLE_RESTART}" == "$([[ -n "${FORCED_ROLES}" ]] && echo true || echo false)" ]] || {
+        echo "GPU_FAULT_FORCE_ROLE_RESTART must be true exactly when GPU_FAULT_FORCE_ROLE_RESTART_ROLES names a tier" >&2
+        exit 2
+    }
+    IFS=',' read -r -a forced_role_list <<<"${FORCED_ROLES}"
+    for forced_role in "${forced_role_list[@]}"; do
+        [[ ",${ROLE_TARGETS}," == *",${forced_role},"* ]] || {
+            echo "GPU_FAULT_FORCE_ROLE_RESTART_ROLES names ${forced_role}, which the role targets do not select" >&2
+            exit 2
+        }
+    done
+elif [[ -n "${ROLE_RESTART_REPORT}" ]]; then
+    echo "GPU_FAULT_ROLE_RESTART_REPORT needs GPU_FAULT_FORCE_ROLE_RESTART_ROLES" >&2
+    exit 2
+fi
 if [[ "${ALLOW_EMAIL}" != "true" &&
     "${ACKNOWLEDGE_NO_ALERT_CHANNEL}" != "true" ]]; then
     echo "email must be enabled or the external alert channel acknowledged" >&2
@@ -236,6 +271,41 @@ manifest_role() {
         gpu-fault-api-ha-*) printf 'ingress' ;;
         gpu-fault-control-worker-*) printf 'worker' ;;
         gpu-fault-telemetry-spool-worker-*) printf 'spool' ;;
+        *) return 1 ;;
+    esac
+}
+
+# Whether a role's final template carries this run's restart token: every
+# selected role under the all-or-nothing switch, only the named tiers (and the
+# fallback ones, added after the proof) under GPU_FAULT_FORCE_ROLE_RESTART_ROLES.
+role_forced() {
+    local role="$1"
+    if [[ "${PER_ROLE_RESTART}" == "true" ]]; then
+        [[ ",${FORCED_ROLES}," == *",${role},"* ]]
+    else
+        [[ -n "${ROLE_RESTART_TOKEN}" ]]
+    fi
+}
+
+# The restart token a role Deployment manifest is applied with; empty means the
+# live template's restartedAt is inherited and the tier does not roll for it.
+role_restart_token() {
+    local role
+    case "$1" in
+        gpu-fault-api-ha-ingress) role=ingress ;;
+        gpu-fault-control-worker) role=worker ;;
+        gpu-fault-telemetry-spool-worker) role=spool ;;
+        *) return 0 ;;
+    esac
+    role_forced "${role}" || return 0
+    printf '%s' "${ROLE_RESTART_TOKEN}"
+}
+
+role_deployment() {
+    case "$1" in
+        ingress) printf 'gpu-fault-api-ha' ;;
+        worker) printf 'gpu-fault-control-worker' ;;
+        spool) printf 'gpu-fault-telemetry-spool-worker' ;;
         *) return 1 ;;
     esac
 }
@@ -594,6 +664,10 @@ if [[ "${FORCE_ROLE_RESTART}" == "true" ]]; then
 fi
 printf 'control-plane pin metadata changed=%s force-restart=%s\n' \
     "${RELOAD_RELEASE_METADATA}" "${FORCE_ROLE_RESTART}" >&2
+if [[ "${PER_ROLE_RESTART}" == "true" ]]; then
+    printf 'control-plane restart: forced=%s (every other selected tier proves the restored pins on /healthz)\n' \
+        "${FORCED_ROLES:-none}" >&2
+fi
 LIVE_DEPLOYMENTS="${CONTRACT_DIR}/deployments.json"
 install -m 0600 /dev/null "${LIVE_DEPLOYMENTS}"
 kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployments -o json >"${LIVE_DEPLOYMENTS}"
@@ -659,8 +733,10 @@ role_deployment_sha() {
 # The exact JSON document a role Deployment is applied as: the rendered
 # manifest plus the digests stamped here. The schedulability preflight models
 # this document, so what it measures is what the apply sends; a resume whose
-# document equals the live template (the restart token is inherited, never
-# minted, unless GPU_FAULT_FORCE_ROLE_RESTART asks) rolls nothing.
+# document equals the live template (the restart token and an unrendered
+# failure-domain stamp are inherited; a token is minted only when
+# GPU_FAULT_FORCE_ROLE_RESTART asks, for every tier or the named ones) rolls
+# nothing.
 final_deployment_document() {
     local manifest="$1"
     local role_sha="$2"
@@ -671,7 +747,8 @@ final_deployment_document() {
             --arg role_config "${role_sha}" --arg admin_config "${ADMIN_CONFIG_SHA256}" \
             --arg pin "${PIN_METADATA_SHA256}" --arg domain "${FAILURE_DOMAIN_MAP_SHA256}" \
             --arg profile "${RUNTIME_PROFILE_VERSION}" \
-            --arg restart "${ROLE_RESTART_TOKEN}" --slurpfile live "${LIVE_DEPLOYMENTS}" '
+            --arg restart "$(role_restart_token "${manifest}")" \
+            --slurpfile live "${LIVE_DEPLOYMENTS}" '
             .metadata.name as $name |
             .metadata.annotations["gpu-fault.io/admin-config-sha256"] = $admin_config |
             .metadata.annotations["gpu-fault.io/pin-config-sha256"] = $pin |
@@ -685,8 +762,12 @@ final_deployment_document() {
                 "gpu-fault.io/role-config-sha256": $role_config,
                 "gpu-fault.io/runtime-profile-version": $profile
             } |
-            if $name == "gpu-fault-control-worker" and $domain != "" then
-                .spec.template.metadata.annotations["gpu-fault.io/failure-domain-map-sha256"] = $domain
+            (if $domain != "" then $domain else
+                ([$live[0].items[]? | select(.metadata.name == $name) |
+                  .spec.template.metadata.annotations["gpu-fault.io/failure-domain-map-sha256"]][0] // "")
+             end) as $domain_stamp |
+            if $name == "gpu-fault-control-worker" and $domain_stamp != "" then
+                .spec.template.metadata.annotations["gpu-fault.io/failure-domain-map-sha256"] = $domain_stamp
             else . end |
             (if $restart != "" then $restart else
                 ([$live[0].items[]? | select(.metadata.name == $name) |
@@ -1018,8 +1099,10 @@ with psycopg.connect(dsn, connect_timeout=10) as connection:
 # up during the apply serves its start-up snapshot until its first read.
 wait_for_pin_convergence() {
     local timeout="${GPU_FAULT_FLEET_PIN_CONVERGENCE_TIMEOUT_SECONDS:-180}"
-    local deployments=()
-    local wait_args
+    if [[ "${PER_ROLE_RESTART}" == "true" ]]; then
+        prove_roles_or_restart "${timeout}"
+        return
+    fi
     if [[ -n "${GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE:-}" ]]; then
         # A verbatim rollback force-restarts every tier, so the restored Pods
         # start from the ConfigMap's env snapshot; the previous release's
@@ -1028,13 +1111,25 @@ wait_for_pin_convergence() {
         echo "verbatim rollback: restored Pods start from the pin ConfigMap; skipping the /healthz convergence wait" >&2
         return 0
     fi
-    if role_selected spool; then
+    run_pin_wait "${timeout}" "${ROLE_TARGETS}" ""
+}
+
+# One /healthz convergence wait over the named roles. With a report path the
+# tool records every Deployment's verdict there and settles a Deployment whose
+# wheel predates fleet_pins at once instead of polling it to the deadline.
+run_pin_wait() {
+    local timeout="$1"
+    local roles="$2"
+    local report="$3"
+    local deployments=()
+    local wait_args
+    if [[ ",${roles}," == *",spool,"* ]]; then
         deployments+=(gpu-fault-telemetry-spool-worker)
     fi
-    if role_selected worker; then
+    if [[ ",${roles}," == *",worker,"* ]]; then
         deployments+=(gpu-fault-control-worker)
     fi
-    if role_selected ingress; then
+    if [[ ",${roles}," == *",ingress,"* ]]; then
         deployments+=(gpu-fault-api-ha)
     fi
     ((${#deployments[@]} > 0)) || return 0
@@ -1047,10 +1142,112 @@ wait_for_pin_convergence() {
             printf '%s' "${deployments[*]}"
         )"
     )
+    if [[ -n "${report}" ]]; then
+        wait_args+=(--report "${report}" --unsupported-fails-fast)
+    fi
     if [[ -n "${KUBECONFIG_PATH}" ]]; then
         wait_args+=(--kubeconfig "${KUBECONFIG_PATH}")
     fi
     python3 "${SCRIPT_DIR}/wait_control_plane_pins.py" "${wait_args[@]}"
+}
+
+# A rollback's per-tier proof. A tier restarted after the pin ConfigMap write
+# starts from it: in a verbatim restore it is not waited for (its wheel may
+# predate fleet_pins), otherwise it must prove the pins or answer without
+# fleet_pins. Every other selected tier kept its Pods and must prove them; one
+# that cannot is restarted after all the applies and, outside a verbatim
+# restore, proven again. Usage errors and unproven restarted tiers fail.
+prove_roles_or_restart() {
+    local timeout="$1"
+    local waited="" fallback="" role
+    for role in spool worker ingress; do
+        if role_selected "${role}" &&
+            { [[ -z "${GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE:-}" ]] || ! role_forced "${role}"; }; then
+            waited="$(append_csv_value "${waited}" "${role}")"
+        fi
+    done
+    pin_proof "${timeout}" "${waited}" "${CONTRACT_DIR}/pin-wait.json" || return
+    fallback="${UNPROVEN_ROLES}"
+    if [[ -n "${fallback}" ]]; then
+        echo "control-plane restart: ${fallback} did not prove the restored pins on /healthz; restarting them (fallback)" >&2
+        restart_roles_after_all "${fallback}"
+        if [[ -z "${GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE:-}" ]]; then
+            pin_proof "${timeout}" "${fallback}" "${CONTRACT_DIR}/pin-wait-restarted.json" || return
+        fi
+    fi
+    write_role_restart_report "${fallback}" ||
+        echo "control-plane restart: report not written" >&2
+}
+
+# One wait over the roles, then each verdict (unknown when the wait wrote no
+# report). Sets UNPROVEN_ROLES to the unforced roles to restart; a forced (or
+# already restarted) role must converge or answer without fleet_pins.
+pin_proof() {
+    local timeout="$1" roles="$2" report="$3"
+    local role verdict kind status=0
+    UNPROVEN_ROLES=""
+    run_pin_wait "${timeout}" "${roles}" "${report}" || status=$?
+    ((status <= 1)) || return "${status}"
+    for role in spool worker ingress; do
+        [[ ",${roles}," == *",${role},"* ]] || continue
+        verdict="$(jq -r --arg deployment "$(role_deployment "${role}")" \
+            '.deployments[$deployment].verdict? // "unknown"' "${report}" 2>/dev/null)" || verdict=""
+        if ! role_forced "${role}"; then
+            if [[ "${verdict}" != "converged" && "${verdict}" != "empty" ]]; then
+                UNPROVEN_ROLES="$(append_csv_value "${UNPROVEN_ROLES}" "${role}")"
+            fi
+        elif [[ ! "${verdict}" =~ ^(converged|empty|unsupported)$ ]]; then
+            kind="fallback"
+            if [[ ",${REQUESTED_FORCED_ROLES}," == *",${role},"* ]]; then
+                kind="forced"
+            fi
+            echo "control-plane restart: $(role_deployment "${role}") did not converge on pins ${PIN_METADATA_SHA256} after its ${kind} restart (verdict ${verdict:-unknown})" >&2
+            return 1
+        fi
+    done
+}
+
+# The fallback restart, after every apply, through the same preflight and
+# one-Deployment-at-a-time roll. The forced tiers' token is reused (minted only
+# when there is none), so their documents equal the live templates and only
+# these roles roll.
+restart_roles_after_all() {
+    local roles="$1"
+    local order="" role
+    local -a planned
+    if [[ -z "${ROLE_RESTART_TOKEN}" ]]; then
+        ROLE_RESTART_TOKEN="$(date -u +%FT%T.%NZ)"
+    fi
+    IFS=',' read -r -a planned <<<"${roles}"
+    for role in "${planned[@]}"; do
+        FORCED_ROLES="$(append_csv_value "${FORCED_ROLES}" "${role}")"
+    done
+    kubectl "${kubectl_args[@]}" -n "${NAMESPACE}" get deployments -o json >"${LIVE_DEPLOYMENTS}"
+    schedulability_preflight ""
+    IFS=',' read -r -a planned <<<"${SCHEDULABILITY_ORDER},${roles}"
+    for role in "${planned[@]}"; do
+        if [[ ",${roles}," == *",${role},"* ]]; then
+            order="$(append_csv_value "${order}" "${role}")"
+        fi
+    done
+    apply_roles_in_order "${order}"
+}
+
+# The evidence: the tiers the engine forced, the ones that fell back to the
+# restart, and each wait's verdicts ({} for a wait that did not run or report).
+write_role_restart_report() {
+    local proof="${CONTRACT_DIR}/pin-wait.json"
+    local restarted="${CONTRACT_DIR}/pin-wait-restarted.json"
+    [[ -n "${ROLE_RESTART_REPORT}" ]] || return 0
+    touch "${proof}" "${restarted}"
+    jq -n --arg forced "${REQUESTED_FORCED_ROLES}" --arg fallback "$1" \
+        --rawfile proof "${proof}" --rawfile restarted "${restarted}" '
+        def roles: if . == "" then [] else split(",") end;
+        def verdicts: (try fromjson catch {}) | (.deployments? // {}) |
+            if type == "object" then with_entries(.value |= (.verdict? // "unknown")) else {} end;
+        {forced: ($forced | roles), fallback: ($fallback | roles),
+         pin_wait: ($proof | verdicts), restart_wait: ($restarted | verdicts)}
+    ' >"${ROLE_RESTART_REPORT}"
 }
 
 CURRENT_INGRESS_POD="$(
@@ -1187,6 +1384,9 @@ apply_roles_in_order() {
 
 SCHEDULABILITY_EVIDENCE="${CONTRACT_DIR}/schedulability.json"
 SCHEDULABILITY_ORDER=""
+# Numbers the evidence files: a fallback restart runs the preflight again,
+# possibly within the same second.
+SCHEDULABILITY_RUNS=0
 
 # Model the roll before anything in the cluster changes: live allocatable
 # CPU/memory minus every scheduled Pod's requests, against the exact documents
@@ -1232,9 +1432,10 @@ schedulability_preflight() {
     SCHEDULABILITY_ORDER="$(jq -r '.order | join(",")' "${SCHEDULABILITY_EVIDENCE}")"
     if [[ -n "${SCHEDULABILITY_EVIDENCE_DIR}" ]]; then
         stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+        SCHEDULABILITY_RUNS=$((SCHEDULABILITY_RUNS + 1))
         install -d -m 0700 "${SCHEDULABILITY_EVIDENCE_DIR}"
         install -m 0600 "${SCHEDULABILITY_EVIDENCE}" \
-            "${SCHEDULABILITY_EVIDENCE_DIR}/schedulability-${RELEASE_ID}-${stamp}-$$.json"
+            "${SCHEDULABILITY_EVIDENCE_DIR}/schedulability-${RELEASE_ID}-${stamp}-$$-${SCHEDULABILITY_RUNS}.json"
     fi
 }
 

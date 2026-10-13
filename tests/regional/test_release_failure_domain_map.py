@@ -239,12 +239,16 @@ def test_cpu_apply_step_ships_the_map_and_hands_its_digest_to_the_role_split(
 
 def test_role_split_stamps_the_digest_on_the_worker_pod_template_only() -> None:
     """The stamp is a pod-template annotation, so Kubernetes rolls the worker
-    exactly when the digest changes; no `rollout restart` is involved."""
+    exactly when the digest changes; an unrendered map (a rollback, a dry run)
+    carries the live template's stamp over. No `rollout restart` is involved."""
 
     text = APPLY_SCRIPT.read_text(encoding="utf-8")
 
     assert f'"${{{FD.FAILURE_DOMAIN_MAP_SHA256_ENV}:-}}"' in text
     stamp = text[text.index("apply_manifest() {") : text.index("render_manifest() {")]
-    assert f'annotations["{FAILURE_DOMAIN_MAP_ANNOTATION}"] = $domain' in stamp
-    assert 'if $name == "gpu-fault-control-worker" and $domain != ""' in stamp
+    assert '(if $domain != "" then $domain else' in stamp, (
+        "an unrendered map must inherit the live stamp, not strip it"
+    )
+    assert f'annotations["{FAILURE_DOMAIN_MAP_ANNOTATION}"] = $domain_stamp' in stamp
+    assert 'if $name == "gpu-fault-control-worker" and $domain_stamp != ""' in stamp
     assert "rollout restart" not in stamp

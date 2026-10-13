@@ -11,17 +11,14 @@ from gpu_fault_release.regional_release_images import previous_executor_image
 from gpu_fault.admin.execution import recovery_deadline
 
 import json
-import tempfile
 import threading
 import time
 import uuid
 from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
-from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, ParamSpec, TypeVar
 
 from gpu_fault.admin.config import AdminConfig
-from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_aurora_credentials import read_aurora_refresh_cronjob
 from gpu_fault_release.regional_dataplane_observability import (
@@ -116,6 +113,7 @@ from gpu_fault_release.regional_release_rollback_context import (
 from gpu_fault_release.regional_release_rollback_context import (
     rollback_target_arguments as _rollback_target_arguments,
 )
+from gpu_fault_release.regional_release_rollback_restart import RollbackRestartPlan
 from gpu_fault_release.regional_release_rollout_cleanup import (
     # Re-exported for the same reason, and bound as module globals rather than
     # called through the source module so a test that patches
@@ -1257,26 +1255,18 @@ def _restore_rollback_cpu(
     else:
         details = {"cpu_container_env": "snapshot"}
     previous_admin_config = AdminConfig.from_mapping(previous.get("admin_config") or {})
-    cpu_secret = (previous.get("secret_backups") or {}).get("cpu") or {}
-    if cpu_secret.get("backup"):
-        self._restore_secret(
-            self._cpu(),
-            source=str(cpu_secret["source"]),
-            backup=str(cpu_secret["backup"]),
+    with RollbackRestartPlan(self, previous) as restart:
+        restart.restore_secret_and_registry()
+        preserve_role_config_maps = restart.restore_role_config_maps(
+            previous.get("cpu_role_config_maps")
         )
-    if self._restore_registry_backup():
-        self._publish_restored_registry()
-    preserve_role_config_maps = self._restore_cpu_role_config_maps(
-        previous.get("cpu_role_config_maps")
-    )
-    cpu_sha = self._config_map_sha(
-        self._cpu(),
-        cpu_wheel,
-        self.config.wheel.name,
-    )
-    with tempfile.TemporaryDirectory(prefix="gpu-fault-rollback-inputs-") as inputs:
+        cpu_sha = self._config_map_sha(
+            self._cpu(),
+            cpu_wheel,
+            self.config.wheel.name,
+        )
         container_env_file = (
-            write_rollback_container_env(container_env, Path(inputs))
+            write_rollback_container_env(container_env, restart.directory)
             if container_env is not None
             else None
         )
@@ -1294,9 +1284,10 @@ def _restore_rollback_cpu(
             runtime_image=runtime_image,
             preserve_role_config_maps=preserve_role_config_maps,
             previous_container_env_file=container_env_file,
+            **restart.environment_arguments(),
         )
         _apply_rollback_cpu_environment(self, environment)
-    return details
+        return {**details, **restart.details()}
 
 
 def _stage_rollback_controller(
@@ -1309,57 +1300,42 @@ def _stage_rollback_controller(
     config_digest: str,
     runtime_profile_version: str,
     stage_agents: bool = True,
-) -> None:
-    """Stage the CPU for the previous pins; ``stage_agents`` adds Agent identities."""
+) -> dict[str, Any]:
+    """Stage the CPU for the previous pins; ``stage_agents`` adds Agent identities.
+
+    Returns which tiers restarted and why (see ``RollbackRestartPlan``): the
+    pins are hot-loaded, so only a changed start-up input restarts a tier.
+    """
 
     previous_admin_config = AdminConfig.from_mapping(previous.get("admin_config") or {})
-    cpu_secret = (previous.get("secret_backups") or {}).get("cpu") or {}
-    if cpu_secret.get("backup"):
-        self._restore_secret(
-            self._cpu(),
-            source=str(cpu_secret["source"]),
-            backup=str(cpu_secret["backup"]),
-        )
-    if self._restore_registry_backup():
-        self._publish_restored_registry()
-    if stage_agents:
-        controller_config = rollback_controller_config_for(
-            self, previous, runtime_profile_version
-        )
-        patch = json.dumps({"data": controller_config}, sort_keys=True)
-        for deployment in inventory.CPU_RUNTIME_DEPLOYMENTS:
-            self.runner.run(
-                self._cpu(
-                    "-n",
-                    self.config.namespace,
-                    "patch",
-                    "configmap",
-                    f"{deployment}-config-core",
-                    "--type=merge",
-                    "-p",
-                    patch,
-                )
+    with RollbackRestartPlan(self, previous) as restart:
+        restart.restore_secret_and_registry()
+        if stage_agents:
+            restart.patch_controller_config(
+                rollback_controller_config_for(self, previous, runtime_profile_version)
             )
-    cpu_sha = self._config_map_sha(
-        self._cpu(),
-        cpu_wheel,
-        self.config.wheel.name,
-    )
-    environment = build_rollback_environment(
-        rollback_config=self.config.for_rollback(
-            config_digest,
-            admin_config=previous_admin_config,
-        ),
-        metadata=metadata,
-        cpu_wheel=cpu_wheel,
-        cpu_sha=cpu_sha,
-        artifact=artifact,
-        config_digest=config_digest,
-        runtime_profile_version=runtime_profile_version,
-        runtime_image=self.runtime_image,
-        preserve_role_config_maps=True,
-    )
-    _apply_rollback_cpu_environment(self, environment)
+        cpu_sha = self._config_map_sha(
+            self._cpu(),
+            cpu_wheel,
+            self.config.wheel.name,
+        )
+        environment = build_rollback_environment(
+            rollback_config=self.config.for_rollback(
+                config_digest,
+                admin_config=previous_admin_config,
+            ),
+            metadata=metadata,
+            cpu_wheel=cpu_wheel,
+            cpu_sha=cpu_sha,
+            artifact=artifact,
+            config_digest=config_digest,
+            runtime_profile_version=runtime_profile_version,
+            runtime_image=self.runtime_image,
+            preserve_role_config_maps=True,
+            **restart.environment_arguments(),
+        )
+        _apply_rollback_cpu_environment(self, environment)
+        return restart.details()
 
 
 def _rollback_gpu_clusters(

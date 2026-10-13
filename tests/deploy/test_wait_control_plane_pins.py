@@ -145,6 +145,7 @@ class Harness:
         timeout: int = 30,
         poll: str = "2",
         kubeconfig: str | None = None,
+        extra: tuple[str, ...] = (),
     ) -> list[str]:
         self.state.write_text(json.dumps({"pods": pods}), encoding="utf-8")
         argv = [
@@ -163,6 +164,7 @@ class Harness:
         ]
         if kubeconfig is not None:
             argv.extend(["--kubeconfig", kubeconfig])
+        argv.extend(extra)
         return argv
 
     def run(self, pods: dict[str, list[dict[str, Any]]], **options: Any) -> int:
@@ -398,6 +400,135 @@ def test_kubeconfig_reaches_every_kubectl_call(
     assert all(call[:2] == ["--kubeconfig", str(tmp_path / "cpu")] for call in calls), (
         calls
     )
+
+
+def _report(path: Path) -> dict[str, Any]:
+    document: dict[str, Any] = json.loads(path.read_text(encoding="utf-8"))
+    return document
+
+
+def test_report_names_the_verdict_of_every_deployment(
+    harness: Harness, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The rollback restarts only the tiers that did not prove the pins, so
+    the verdict has to be per Deployment, not one exit code for all of them."""
+
+    converged = harness.serve((200, healthz(EXPECTED)))
+    stale = harness.serve((200, healthz(STALE)))
+    report = tmp_path / "pins.json"
+    code = harness.run(
+        {
+            INGRESS: [pod("api-0", INGRESS, port=converged.port)],
+            WORKER: [pod("worker-0", WORKER, port=stale.port)],
+            SPOOL: [],
+        },
+        poll="10",
+        extra=("--report", str(report)),
+    )
+
+    assert code == 1, capsys.readouterr().err
+    assert _report(report) == {
+        "converged": False,
+        "deployments": {
+            INGRESS: {"verdict": "converged", "pods": 1},
+            WORKER: {"verdict": "unconverged", "pods": 1},
+            SPOOL: {"verdict": "empty", "pods": 0},
+        },
+    }
+
+
+def test_report_records_a_converged_wait(
+    harness: Harness, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    server = harness.serve((200, healthz(EXPECTED)))
+    report = tmp_path / "pins.json"
+    code = harness.run(
+        {INGRESS: [pod("api-0", INGRESS, port=server.port)]},
+        extra=("--report", str(report)),
+    )
+
+    assert code == 0, capsys.readouterr().err
+    assert _report(report) == {
+        "converged": True,
+        "deployments": {INGRESS: {"verdict": "converged", "pods": 1}},
+    }
+
+
+def test_a_wheel_without_fleet_pins_fails_fast_when_asked(
+    harness: Harness, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A /healthz body without ``fleet_pins`` is a wheel that predates pin hot
+    reload (the factory always binds the runtime): no poll can change that, so
+    the rollback asks for the verdict at once and restarts the tier instead of
+    sitting out the whole window."""
+
+    converged = harness.serve((200, healthz(EXPECTED)))
+    old_wheel = harness.serve((200, {"status": "ok"}))
+    report = tmp_path / "pins.json"
+    code = harness.run(
+        {
+            INGRESS: [pod("api-0", INGRESS, port=converged.port)],
+            WORKER: [pod("worker-0", WORKER, port=old_wheel.port)],
+        },
+        extra=("--report", str(report), "--unsupported-fails-fast"),
+    )
+
+    assert code == 1
+    assert harness.sleeps == [], "an unsupported tier must not wait out the window"
+    assert _report(report)["deployments"] == {
+        INGRESS: {"verdict": "converged", "pods": 1},
+        WORKER: {"verdict": "unsupported", "pods": 1},
+    }
+    err = capsys.readouterr().err
+    assert f"{WORKER}/worker-0: error: " in err and "fleet_pins" in err, err
+
+
+def test_an_unsupported_tier_is_settled_while_the_others_keep_converging(
+    harness: Harness, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    lagging = harness.serve(
+        (200, healthz(STALE)), (200, healthz(STALE)), (200, healthz(EXPECTED))
+    )
+    old_wheel = harness.serve((200, {"status": "ok"}))
+    report = tmp_path / "pins.json"
+    code = harness.run(
+        {
+            INGRESS: [pod("api-0", INGRESS, port=lagging.port)],
+            WORKER: [pod("worker-0", WORKER, port=old_wheel.port)],
+        },
+        extra=("--report", str(report), "--unsupported-fails-fast"),
+    )
+
+    assert code == 1, capsys.readouterr().err
+    assert harness.sleeps == [2.0, 2.0]
+    assert old_wheel.requests == 1, "a settled tier was probed again"
+    assert _report(report)["deployments"] == {
+        INGRESS: {"verdict": "converged", "pods": 1},
+        WORKER: {"verdict": "unsupported", "pods": 1},
+    }
+
+
+def test_a_refused_or_garbled_answer_is_never_taken_for_an_old_wheel(
+    harness: Harness, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Only a JSON object without ``fleet_pins`` is definitive; a Pod that is
+    still starting refuses the connection and is waited for as before."""
+
+    refused = harness.serve((200, healthz(EXPECTED)))
+    refused.close()
+    report = tmp_path / "pins.json"
+    code = harness.run(
+        {INGRESS: [pod("api-0", INGRESS, port=refused.port)]},
+        poll="10",
+        extra=("--report", str(report), "--unsupported-fails-fast"),
+    )
+
+    assert code == 1
+    assert harness.clock >= 30, "a refused connection ended the wait early"
+    assert _report(report)["deployments"] == {
+        INGRESS: {"verdict": "unconverged", "pods": 1}
+    }
+    assert "refused" in capsys.readouterr().err.lower()
 
 
 @pytest.mark.parametrize(

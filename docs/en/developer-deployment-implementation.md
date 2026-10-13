@@ -2109,6 +2109,11 @@ Failure behaviour:
   Agent FleetDeployment are cancelled only within the corresponding cluster/component scope, and the old/new A/B slots and immutable
   artifacts are kept until the rollback window ends. `rollback_timing` records failure detected, controller,
   per-cluster/per-wave, restore, verify and `T_safe/T_full`;
+- the rollback's controller staging and CPU restore restart only the CPU tiers whose start-up inputs they change
+  (`RollbackRestartPlan`, `regional_release_rollback_restart.py`); every other tier inherits the live restart timestamp
+  and proves the pins on `/healthz`, falling back to the restart when it cannot. A registry restore, a Secret restore
+  that changes the data, or an incomplete proof still restarts every tier. Which tiers restarted and why is in both phases' `details.cpu_restart`;
+  an Executor-only rollback restarts no CPU tier.
 - before the first migration from a legacy release that installs wheels at start-up to an immutable runtime image, `sync-state`
   must record both the live real old image and the scanned rollback-compatible image with the old release CLI preinstalled. If at the start of the upgrade
   the real old image has drifted or the compatible image is not an immutable digest, it must fail before mutation;

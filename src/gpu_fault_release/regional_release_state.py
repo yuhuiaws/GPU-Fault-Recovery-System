@@ -61,6 +61,7 @@ from gpu_fault_release.regional_release_profile_model import (
     cluster_profiles_digest,
     cluster_runtime_profiles,
 )
+from gpu_fault_release.regional_release_rollback_restart import cpu_restart_baseline
 from gpu_fault_release.regional_release_runtime_identity import exec_cpu_ingress_probe
 from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
@@ -887,6 +888,7 @@ def _capture_previous(
     release: Any,
     plan: ReleaseExecutionPlan | None = None,
 ) -> dict[str, Any]:
+    captured_at = time.time()
     capture_gpu = _plan_captures_gpu(plan)
     capture_cpu = plan is None or plan.has(
         ReleaseComponent.CPU_STAGE,
@@ -1020,6 +1022,7 @@ def _capture_previous(
         "cpu_wheel_sha256": cpu_wheel_sha256,
         "cpu_role_config_maps": role_config_maps,
         "cpu_role_container_env": role_container_env,
+        "cpu_restart_baseline": cpu_restart_baseline(role_deployments, captured_at),
         "admin_config": admin_config.as_dict(),
         "executor_internal_error_total": int(
             remote.get("executor_internal_error_total", 0) or 0

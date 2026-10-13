@@ -6,6 +6,7 @@ import os
 import subprocess
 import sys
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -65,7 +66,13 @@ if "get" in args:
     elif kind != "pod":
         raise SystemExit("unexpected get")
 elif "exec" in args:
-    # A Pod polls the ConfigMap itself and reports the digest it serves.
+    # A Pod polls the ConfigMap itself and reports the digest it serves --
+    # unless POD_PINS says its tier runs a wheel older than fleet pins.
+    pod = args[args.index("exec") + 1]
+    pins = json.loads(os.environ.get("POD_PINS") or "{}")
+    if pins.get(pod.rsplit("-", 1)[0]) == "unsupported":
+        print(json.dumps({"status": "ok"}))
+        raise SystemExit(0)
     with open(pins_file) as handle:
         data = json.load(handle)
     digest = hashlib.sha256(json.dumps(
@@ -95,6 +102,30 @@ elif "rollout" in args and "status" in args:
 else:
     raise SystemExit("unexpected mutation: " + " ".join(args))
 """
+
+
+# Stands in for wait_control_plane_pins.py when a test needs an outcome the fake
+# API cannot produce quickly (a tier still serving the old digest at the
+# deadline): pops the next {exit, report} from PIN_WAIT_OUTCOMES and writes the
+# report where --report asks for it.
+PIN_WAIT_STUB = """import json, os, sys
+args = sys.argv[1:]
+path = os.environ["PIN_WAIT_OUTCOMES"]
+with open(path) as handle:
+    outcomes = json.load(handle)
+outcome = outcomes.pop(0)
+with open(path, "w") as handle:
+    json.dump(outcomes, handle)
+if "--report" in args and outcome.get("report") is not None:
+    with open(args[args.index("--report") + 1], "w") as handle:
+        json.dump(outcome["report"], handle)
+sys.exit(outcome["exit"])
+"""
+ROLE_DEPLOYMENTS = {
+    "ingress": "gpu-fault-api-ha",
+    "worker": "gpu-fault-control-worker",
+    "spool": "gpu-fault-telemetry-spool-worker",
+}
 
 
 def pin_content_sha256(data: dict[str, str]) -> str:
@@ -144,14 +175,17 @@ def test_script_pin_digest_matches_the_shared_vector_without_jqs_newline() -> No
     assert pin_content_sha256(PIN_VECTOR) == PIN_VECTOR_SHA256
 
 
-def apply_roles(
+def run_apply(
     tmp_path: Path,
     *,
     targets: str,
     force: bool,
     namespace: str = "gpu-fault-system",
     environment: dict[str, str] | None = None,
-) -> tuple[list[dict], list[list[str]], list[list[str]]]:
+    live_annotations: dict[str, dict[str, str]] | None = None,
+    pod_pins: dict[str, str] | None = None,
+    pin_wait_outcomes: list[dict[str, Any]] | None = None,
+) -> subprocess.CompletedProcess[str]:
     binary = tmp_path / "kubectl"
     binary.write_text(FAKE_API, encoding="utf-8")
     binary.chmod(0o755)
@@ -161,14 +195,24 @@ def apply_roles(
         'printf \'%s\\n\' "$*" >>"$PYTHON_CALLS"\n'
         'case "$*" in\n'
         "  *gpu_fault.config_cli*|*verify_control_plane_role_split.py*) exit 0 ;;\n"
+        "  *wait_control_plane_pins.py*)\n"
+        '    if [ -n "${PIN_WAIT_STUB:-}" ]; then exec "$REAL_PYTHON" "$PIN_WAIT_STUB" "$@"; fi\n'
+        '    exec "$REAL_PYTHON" "$@" ;;\n'
         '  *) exec "$REAL_PYTHON" "$@" ;;\n'
         "esac\n",
         encoding="utf-8",
     )
     python.chmod(0o755)
-    calls = tmp_path / "calls.jsonl"
-    applies = tmp_path / "applies.jsonl"
-    python_calls = tmp_path / "python-calls.txt"
+    stub: dict[str, str] = {}
+    if pin_wait_outcomes is not None:
+        (tmp_path / "pin-wait-stub.py").write_text(PIN_WAIT_STUB, encoding="utf-8")
+        (tmp_path / "pin-wait-outcomes.json").write_text(
+            json.dumps(pin_wait_outcomes), encoding="utf-8"
+        )
+        stub = {
+            "PIN_WAIT_STUB": str(tmp_path / "pin-wait-stub.py"),
+            "PIN_WAIT_OUTCOMES": str(tmp_path / "pin-wait-outcomes.json"),
+        }
     state = {
         "pins": {
             "data": {
@@ -186,7 +230,8 @@ def apply_roles(
                         "template": {
                             "metadata": {
                                 "annotations": {
-                                    "kubectl.kubernetes.io/restartedAt": RESTARTED_AT
+                                    "kubectl.kubernetes.io/restartedAt": RESTARTED_AT,
+                                    **(live_annotations or {}).get(name, {}),
                                 }
                             },
                             "spec": {"containers": [{"name": "api", "env": []}]},
@@ -197,7 +242,7 @@ def apply_roles(
             ]
         },
     }
-    completed = subprocess.run(
+    return subprocess.run(
         ["bash", str(SCRIPT)],
         env={
             "PATH": str(tmp_path)
@@ -207,9 +252,10 @@ def apply_roles(
             "PYTHONPATH": str(ROOT / "src"),
             "REAL_PYTHON": sys.executable,
             "LIVE_STATE": json.dumps(state),
-            "CALLS": str(calls),
-            "APPLIES": str(applies),
-            "PYTHON_CALLS": str(python_calls),
+            "POD_PINS": json.dumps(pod_pins or {}),
+            "CALLS": str(tmp_path / "calls.jsonl"),
+            "APPLIES": str(tmp_path / "applies.jsonl"),
+            "PYTHON_CALLS": str(tmp_path / "python-calls.txt"),
             "KUBECONFIG": str(tmp_path / "cpu"),
             "GPU_FAULT_AWS_REGION": "us-east-1",
             "GPU_FAULT_NAMESPACE": namespace,
@@ -224,6 +270,7 @@ def apply_roles(
             "GPU_FAULT_RUNTIME_IMAGE": "registry.invalid/runtime@sha256:" + "d" * 64,
             "GPU_FAULT_FAILURE_DOMAIN_MAP_SHA256": "e" * 64,
             "GPU_FAULT_SYNC_INSTALLED_RESOURCE_REGISTRY": "false",
+            **stub,
             **(environment or {}),
         },
         capture_output=True,
@@ -231,15 +278,41 @@ def apply_roles(
         check=False,
         timeout=60,
     )
-    assert completed.returncode == 0, completed.stderr
+
+
+def outputs(tmp_path: Path) -> tuple[list[dict], list[list[str]], list[list[str]]]:
+    """(applied documents, kubectl calls, python3 calls) of the last run."""
+
+    def lines(name: str) -> list[str]:
+        path = tmp_path / name
+        return path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+
     return (
-        [json.loads(line) for line in applies.read_text(encoding="utf-8").splitlines()],
-        [json.loads(line) for line in calls.read_text(encoding="utf-8").splitlines()],
-        [
-            line.split()
-            for line in python_calls.read_text(encoding="utf-8").splitlines()
-        ],
+        [json.loads(line) for line in lines("applies.jsonl")],
+        [json.loads(line) for line in lines("calls.jsonl")],
+        [line.split() for line in lines("python-calls.txt")],
     )
+
+
+def apply_roles(
+    tmp_path: Path,
+    *,
+    targets: str,
+    force: bool,
+    namespace: str = "gpu-fault-system",
+    environment: dict[str, str] | None = None,
+    **harness: Any,
+) -> tuple[list[dict], list[list[str]], list[list[str]]]:
+    completed = run_apply(
+        tmp_path,
+        targets=targets,
+        force=force,
+        namespace=namespace,
+        environment=environment,
+        **harness,
+    )
+    assert completed.returncode == 0, completed.stderr
+    return outputs(tmp_path)
 
 
 def applied_pin_digest(documents: list[dict]) -> str:
@@ -393,3 +466,361 @@ def test_final_cpu_templates_and_commands_keep_the_requested_namespace(
             assert call[call.index("-n") + 1] == "isolated-cpu"
     wait = pin_wait_call(python_calls)
     assert wait[wait.index("--namespace") + 1] == "isolated-cpu"
+
+
+# --- Per-tier restart decision (a rollback names the tiers it must restart) ---
+
+
+def per_role(
+    tmp_path: Path, roles: str, *, verbatim: bool, **extra: str
+) -> dict[str, str]:
+    """The rollback's environment: the forced tiers, the report path and, for
+    the verbatim CPU restore, the previous release's container env."""
+
+    environment = {
+        "GPU_FAULT_FORCE_ROLE_RESTART_ROLES": roles,
+        "GPU_FAULT_ROLE_RESTART_REPORT": str(tmp_path / "restart-report.json"),
+        **extra,
+    }
+    if verbatim:
+        snapshot = tmp_path / "container-env.json"
+        snapshot.write_text("{}", encoding="utf-8")
+        environment["GPU_FAULT_ROLE_SPLIT_CONTAINER_ENV_FILE"] = str(snapshot)
+    return environment
+
+
+def restart_report(tmp_path: Path) -> dict[str, Any]:
+    report: dict[str, Any] = json.loads(
+        (tmp_path / "restart-report.json").read_text(encoding="utf-8")
+    )
+    return report
+
+
+def restarted_roles(documents: list[dict]) -> list[str]:
+    """Roles whose applied template carries a fresh restart token, in apply order."""
+
+    roles = {deployment: role for role, deployment in ROLE_DEPLOYMENTS.items()}
+    return [
+        roles[item["metadata"]["name"]]
+        for item in documents
+        if item["kind"] == "Deployment"
+        and item["spec"]["template"]["metadata"]["annotations"][
+            "kubectl.kubernetes.io/restartedAt"
+        ]
+        != RESTARTED_AT
+    ]
+
+
+def pin_waits(python_calls: list[list[str]]) -> list[list[str]]:
+    return [
+        call
+        for call in python_calls
+        if any(argument.endswith("/wait_control_plane_pins.py") for argument in call)
+    ]
+
+
+def waited(call: list[str]) -> list[str]:
+    return sorted(call[call.index("--deployments") + 1].split(","))
+
+
+def verdicts(**deployments: str) -> dict[str, Any]:
+    """A wait report: role -> verdict, keyed by Deployment like the tool's."""
+
+    return {
+        "converged": all(verdict == "converged" for verdict in deployments.values()),
+        "deployments": {
+            ROLE_DEPLOYMENTS[role]: {"verdict": verdict, "pods": 1}
+            for role, verdict in deployments.items()
+        },
+    }
+
+
+def test_rollback_forces_only_the_named_tier_and_proves_the_others_on_healthz(
+    tmp_path: Path,
+) -> None:
+    completed = run_apply(
+        tmp_path,
+        targets="spool,worker,ingress",
+        force=True,
+        environment=per_role(tmp_path, "worker", verbatim=False),
+    )
+    assert completed.returncode == 0, completed.stderr
+    documents, calls, python_calls = outputs(tmp_path)
+
+    assert len([item for item in documents if item["kind"] == "Deployment"]) == 3
+    assert restarted_roles(documents) == ["worker"], (
+        "only the tier whose start-up inputs changed may receive a restart token"
+    )
+    wait = pin_wait_call(python_calls)
+    assert waited(wait) == sorted(DEPLOYMENTS), (
+        "the controller stage proves the restored pins on every selected tier"
+    )
+    assert "--unsupported-fails-fast" in wait, wait
+    assert wait[wait.index("--expected-sha256") + 1] == applied_pin_digest(documents)
+    assert restart_report(tmp_path) == {
+        "forced": ["worker"],
+        "fallback": [],
+        "pin_wait": {name: "converged" for name in DEPLOYMENTS},
+        "restart_wait": {},
+    }
+    assert "control-plane restart: forced=worker" in completed.stderr
+
+
+def test_verbatim_restore_without_forced_tiers_proves_every_tier_instead_of_rolling(
+    tmp_path: Path,
+) -> None:
+    documents, calls, python_calls = apply_roles(
+        tmp_path,
+        targets="spool,worker,ingress",
+        force=False,
+        environment=per_role(tmp_path, "", verbatim=True),
+    )
+
+    assert restarted_roles(documents) == [], "an untouched tier was rolled"
+    wait = pin_wait_call(python_calls)
+    assert waited(wait) == sorted(DEPLOYMENTS)
+    probes = [call[call.index("exec") + 1] for call in calls if "exec" in call]
+    assert sorted(probes) == sorted(f"{name}-0" for name in DEPLOYMENTS)
+    report = restart_report(tmp_path)
+    assert (report["forced"], report["fallback"]) == ([], [])
+    assert report["pin_wait"] == {name: "converged" for name in DEPLOYMENTS}
+
+
+def test_verbatim_restore_does_not_wait_on_the_tier_it_restarts(tmp_path: Path) -> None:
+    documents, _, python_calls = apply_roles(
+        tmp_path,
+        targets="spool,worker,ingress",
+        force=True,
+        environment=per_role(tmp_path, "ingress", verbatim=True),
+    )
+
+    assert restarted_roles(documents) == ["ingress"]
+    assert waited(pin_wait_call(python_calls)) == sorted(
+        [ROLE_DEPLOYMENTS["spool"], ROLE_DEPLOYMENTS["worker"]]
+    ), "a restarted verbatim tier starts from the pin ConfigMap; only the rest wait"
+    report = restart_report(tmp_path)
+    assert report["forced"] == ["ingress"]
+    assert sorted(report["pin_wait"]) == sorted(
+        [ROLE_DEPLOYMENTS["spool"], ROLE_DEPLOYMENTS["worker"]]
+    )
+
+
+@pytest.mark.parametrize("verbatim", [True, False])
+def test_a_tier_without_fleet_pins_on_healthz_falls_back_to_the_forced_restart(
+    tmp_path: Path, verbatim: bool
+) -> None:
+    documents, calls, python_calls = apply_roles(
+        tmp_path,
+        targets="spool,worker,ingress",
+        force=False,
+        environment=per_role(tmp_path, "", verbatim=verbatim),
+        pod_pins={ROLE_DEPLOYMENTS["worker"]: "unsupported"},
+    )
+
+    workers = [
+        item
+        for item in documents
+        if item["kind"] == "Deployment"
+        and item["metadata"]["name"] == ROLE_DEPLOYMENTS["worker"]
+    ]
+    assert len(workers) == 2, "the unproven tier is applied again with a restart token"
+    assert restarted_roles(documents) == ["worker"]
+    applies = [index for index, call in enumerate(calls) if "apply" in call]
+    probes = [index for index, call in enumerate(calls) if "exec" in call]
+    assert max(applies) > min(probes), "the fallback restart must follow the proof"
+    waits = pin_waits(python_calls)
+    if verbatim:
+        assert len(waits) == 1, "a restarted verbatim tier starts from the ConfigMap"
+    else:
+        assert len(waits) == 2, waits
+        assert waited(waits[1]) == [ROLE_DEPLOYMENTS["worker"]]
+    report = restart_report(tmp_path)
+    assert report["forced"] == []
+    assert report["fallback"] == ["worker"]
+    assert report["pin_wait"][ROLE_DEPLOYMENTS["worker"]] == "unsupported"
+    assert report["restart_wait"] == (
+        {} if verbatim else {ROLE_DEPLOYMENTS["worker"]: "unsupported"}
+    )
+
+
+def test_an_unconverged_tier_is_restarted_and_proven_again(tmp_path: Path) -> None:
+    documents, _, python_calls = apply_roles(
+        tmp_path,
+        targets="spool,worker,ingress",
+        force=False,
+        environment=per_role(tmp_path, "", verbatim=False),
+        pin_wait_outcomes=[
+            {
+                "exit": 1,
+                "report": verdicts(
+                    spool="converged", worker="unconverged", ingress="converged"
+                ),
+            },
+            {"exit": 0, "report": verdicts(worker="converged")},
+        ],
+    )
+
+    assert restarted_roles(documents) == ["worker"]
+    waits = pin_waits(python_calls)
+    assert len(waits) == 2, waits
+    assert waited(waits[1]) == [ROLE_DEPLOYMENTS["worker"]]
+    report = restart_report(tmp_path)
+    assert report["fallback"] == ["worker"]
+    assert report["restart_wait"] == {ROLE_DEPLOYMENTS["worker"]: "converged"}
+
+
+def test_a_tier_unproven_after_its_fallback_restart_fails_the_apply(
+    tmp_path: Path,
+) -> None:
+    completed = run_apply(
+        tmp_path,
+        targets="spool,worker,ingress",
+        force=False,
+        environment=per_role(tmp_path, "", verbatim=False),
+        pin_wait_outcomes=[
+            {"exit": 1, "report": verdicts(spool="converged", worker="unconverged")},
+            {"exit": 1, "report": verdicts(worker="unconverged")},
+        ],
+    )
+
+    assert completed.returncode == 1, completed.stderr
+    assert "gpu-fault-control-worker did not converge" in completed.stderr
+    assert "after its fallback restart" in completed.stderr
+    _, _, python_calls = outputs(tmp_path)
+    assert not any(
+        any(
+            argument.endswith("/verify_control_plane_role_split.py")
+            for argument in call
+        )
+        for call in python_calls
+    ), "a failed proof must stop the apply before the verifier"
+
+
+def test_a_forced_tier_that_does_not_converge_fails_without_a_second_restart(
+    tmp_path: Path,
+) -> None:
+    completed = run_apply(
+        tmp_path,
+        targets="spool,worker,ingress",
+        force=True,
+        environment=per_role(tmp_path, "worker", verbatim=False),
+        pin_wait_outcomes=[
+            {
+                "exit": 1,
+                "report": verdicts(
+                    spool="converged", worker="unconverged", ingress="converged"
+                ),
+            }
+        ],
+    )
+
+    assert completed.returncode == 1, completed.stderr
+    assert "forced restart" in completed.stderr
+    documents, _, python_calls = outputs(tmp_path)
+    assert restarted_roles(documents) == ["worker"], "a forced tier is not re-rolled"
+    assert len(pin_waits(python_calls)) == 1
+
+
+def test_a_pin_wait_usage_error_fails_the_apply(tmp_path: Path) -> None:
+    completed = run_apply(
+        tmp_path,
+        targets="spool,worker,ingress",
+        force=False,
+        environment=per_role(tmp_path, "", verbatim=False),
+        pin_wait_outcomes=[{"exit": 2, "report": None}],
+    )
+
+    assert completed.returncode == 2, completed.stderr
+    documents, _, _ = outputs(tmp_path)
+    assert restarted_roles(documents) == [], "a usage error is not a proof failure"
+
+
+def test_a_wait_without_a_report_restarts_every_waited_tier(tmp_path: Path) -> None:
+    documents, _, python_calls = apply_roles(
+        tmp_path,
+        targets="spool,worker,ingress",
+        force=False,
+        environment=per_role(tmp_path, "", verbatim=False),
+        pin_wait_outcomes=[
+            {"exit": 1, "report": None},
+            {
+                "exit": 0,
+                "report": verdicts(
+                    spool="converged", worker="converged", ingress="converged"
+                ),
+            },
+        ],
+    )
+
+    assert sorted(restarted_roles(documents)) == sorted(ROLE_DEPLOYMENTS)
+    waits = pin_waits(python_calls)
+    assert len(waits) == 2, waits
+    assert waited(waits[1]) == sorted(DEPLOYMENTS)
+    report = restart_report(tmp_path)
+    assert report["fallback"] == ["spool", "worker", "ingress"]
+    assert report["pin_wait"] == {}
+
+
+@pytest.mark.parametrize(
+    ("targets", "force", "environment"),
+    [
+        (
+            "spool,worker,ingress",
+            False,
+            {"GPU_FAULT_FORCE_ROLE_RESTART_ROLES": "worker"},
+        ),
+        ("spool,worker,ingress", True, {"GPU_FAULT_FORCE_ROLE_RESTART_ROLES": ""}),
+        ("ingress", True, {"GPU_FAULT_FORCE_ROLE_RESTART_ROLES": "worker"}),
+        ("spool,worker,ingress", True, {"GPU_FAULT_FORCE_ROLE_RESTART_ROLES": "bogus"}),
+        (
+            "spool,worker,ingress",
+            False,
+            {"GPU_FAULT_ROLE_RESTART_REPORT": "/tmp/r.json"},
+        ),
+    ],
+    ids=[
+        "roles-without-force",
+        "force-without-roles",
+        "role-not-targeted",
+        "unknown-role",
+        "report-without-roles",
+    ],
+)
+def test_inconsistent_restart_requests_are_refused_before_anything_changes(
+    tmp_path: Path, targets: str, force: bool, environment: dict[str, str]
+) -> None:
+    completed = run_apply(
+        tmp_path, targets=targets, force=force, environment=environment
+    )
+
+    assert completed.returncode == 2, completed.stderr
+    documents, calls, _ = outputs(tmp_path)
+    assert (documents, calls) == ([], []), "a refused request reached the cluster"
+
+
+@pytest.mark.parametrize(
+    ("requested", "live", "expected"),
+    [("", "f" * 64, "f" * 64), ("", None, None), ("e" * 64, "f" * 64, "e" * 64)],
+    ids=["empty-inherits-live", "empty-without-live", "rendered-wins"],
+)
+def test_an_unrendered_failure_domain_map_leaves_the_live_stamp_alone(
+    tmp_path: Path, requested: str, live: str | None, expected: str | None
+) -> None:
+    """A rollback does not re-render the failure-domain map; dropping the live
+    stamp from the worker template would roll the worker for nothing."""
+
+    annotation = "gpu-fault.io/failure-domain-map-sha256"
+    documents, _, _ = apply_roles(
+        tmp_path,
+        targets="worker",
+        force=False,
+        environment={"GPU_FAULT_FAILURE_DOMAIN_MAP_SHA256": requested},
+        live_annotations=(
+            {ROLE_DEPLOYMENTS["worker"]: {annotation: live}} if live else None
+        ),
+    )
+
+    worker = next(item for item in documents if item["kind"] == "Deployment")
+    assert worker["spec"]["template"]["metadata"]["annotations"].get(annotation) == (
+        expected
+    )

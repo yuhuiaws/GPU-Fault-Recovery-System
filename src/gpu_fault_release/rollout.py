@@ -238,6 +238,7 @@ from gpu_fault_release.regional_release_rendering import (
     stamp_gpu_deployments,
 )
 from gpu_fault_release.regional_release_reporting import build_release_plan
+from gpu_fault_release.regional_release_rollback_restart import ROLE_RESTART_VARIABLES
 from gpu_fault_release.regional_release_resume_validation import (
     validate_resume_checkpoint,
 )
@@ -536,6 +537,10 @@ def render_and_apply_cpu_roles(
     release: Any,
     environment: dict[str, str],
 ) -> None:
+    # A per-tier restart decision is a rollback stage's alone; a forward apply
+    # restarts what its templates change and never takes one from the shell.
+    for name in ROLE_RESTART_VARIABLES:
+        environment.pop(name, None)
     # Namespace labels first: bootstrap applied the manifest, an upgrade never did.
     release.state["namespace_labels"] = reconcile_namespace_labels(release)
     with tempfile.TemporaryDirectory(prefix="gpu-fault-role-split-") as directory:
