@@ -7,9 +7,11 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.release_state_snapshot import encode_previous_snapshot
 from gpu_fault_release import regional_release_fleet_rollout as FLEET
-from gpu_fault_release import regional_release_transaction
-from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release import regional_release_state as STATE
+from gpu_fault_release import regional_release_transaction, rollout
+from gpu_fault_release.regional_release_config import ReleaseError, canonical_sha256
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -102,6 +104,229 @@ def test_rollback_cleanup_failure_is_retryable_after_rollback_is_persisted() -> 
     transaction_module().finalize_rollback(release, **arguments)
 
     assert release.loaded["rollback_cleanup_completed"] is True
+
+
+# --- previous-snapshot retention after a rollback ------------------------------
+#
+# Every forward transaction captures a new snapshot of the live release, and
+# only a commit pruned them, so rollbacks with no commit in between piled them
+# up: BOOT-023 found 4 groups after BOOT-020's rollbacks, above the 3 retained.
+# The rollback's cleanup now prunes as a commit does, keeping the snapshot of
+# the release the rollback restored (the state's ``previous``).
+
+
+def _rollback_arguments(previous: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "previous": previous,
+        "completed_phases": {"rollback-verified"},
+        "completed_clusters": set(),
+        "rollback_plan": {"components": ["gpu-executor"]},
+        "rollback_timing": {"t_full_seconds": 1.0},
+        "original_failure": "upgrade failed",
+        "rollback_result": {"status": "PASSED"},
+    }
+
+
+class SnapshotRollback(Release):
+    """A rollback over the engine's snapshot bookkeeping: every save references
+    the snapshot of the ``previous`` it writes, as ``render_persisted_state``
+    does, and ``release.state`` is what the last save left."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.loaded = {"phase": "rollback-verifying"}
+        self.state: dict[str, Any] = {}
+        self.fail_prune = False
+
+    def _save_state(self, phase, **updates):
+        self.events.append(("save", updates.get("rollback_cleanup_completed")))
+        self.loaded.update({"phase": phase, **updates})
+        self.state = dict(self.loaded)
+        previous = updates.get("previous")
+        if isinstance(previous, dict):
+            self.state["previous_snapshot"] = encode_previous_snapshot(previous)[0]
+
+    def _cleanup_previous_snapshots(self) -> None:
+        reference = self.state.get("previous_snapshot") or {}
+        self.events.append(("prune", reference.get("sha256")))
+        if self.fail_prune:
+            raise RuntimeError("prune failed")
+
+
+def test_rollback_cleanup_prunes_the_previous_snapshots_before_completing() -> None:
+    previous = {"release_id": "live", "secret_backups": {}}
+    release = SnapshotRollback()
+
+    transaction_module().finalize_rollback(release, **_rollback_arguments(previous))
+
+    assert release.events == [
+        ("save", False),
+        ("cleanup", previous),
+        ("prune", canonical_sha256(previous)),
+        ("save", True),
+    ], "the prune is rollback cleanup: after the rolled-back state, before its end"
+    assert release.loaded["rollback_cleanup_completed"] is True
+
+
+def test_rollback_snapshot_prune_failure_is_retryable() -> None:
+    previous = {"release_id": "live", "secret_backups": {}}
+    release = SnapshotRollback()
+    release.fail_prune = True
+
+    with pytest.raises(RuntimeError, match="prune failed"):
+        transaction_module().finalize_rollback(release, **_rollback_arguments(previous))
+
+    assert release.loaded["phase"] == "rolled-back"
+    assert release.loaded["rollback_cleanup_completed"] is False, (
+        "a failed prune leaves the rollback cleanup pending"
+    )
+
+    release.fail_prune = False
+    release.events.clear()
+    transaction_module().finalize_rollback(release, **_rollback_arguments(previous))
+
+    assert [event[0] for event in release.events] == ["cleanup", "prune", "save"], (
+        "the retry repeats the cleanup without rewriting the rolled-back state first"
+    )
+    assert release.loaded["rollback_cleanup_completed"] is True
+
+
+@pytest.mark.parametrize(
+    "reference,reason",
+    [
+        (None, "no-reference"),
+        (
+            {"sha256": canonical_sha256({"release_id": "another"})},
+            "reference-is-not-the-restored-release",
+        ),
+    ],
+    ids=["no-reference", "another-snapshot"],
+)
+def test_rollback_keeps_every_snapshot_unless_the_state_references_its_previous(
+    reference: dict[str, Any] | None, reason: str, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The prune keeps the group the state references. A state that does not
+    reference the snapshot of the release the rollback restored cannot say
+    which group that is, so nothing is deleted on a guess."""
+
+    previous = {"release_id": "live", "secret_backups": {}}
+    release = SnapshotRollback()
+    release.state = {
+        "phase": "rolled-back",
+        "rollback_cleanup_completed": False,
+        "previous": previous,
+    }
+    if reference is not None:
+        release.state["previous_snapshot"] = reference
+
+    transaction_module().finalize_rollback(release, **_rollback_arguments(previous))
+
+    assert [event[0] for event in release.events] == ["cleanup", "save"], (
+        "no prune without the reference to the restored release's snapshot"
+    )
+    assert release.loaded["rollback_cleanup_completed"] is True, (
+        "retention is housekeeping: the rollback still completes"
+    )
+    narrated = capsys.readouterr().err
+    assert "rollback-snapshot-prune " in narrated, narrated
+    assert f"result=kept-all reason={reason} " in narrated, narrated
+
+
+def test_the_engine_prunes_with_the_commit_s_retention() -> None:
+    assert (
+        rollout.RegionalRelease._cleanup_previous_snapshots
+        is STATE.cleanup_previous_snapshots
+    ), "a rollback and a commit share one retention rule"
+
+
+class SnapshotSite:
+    """The labelled previous-snapshot ConfigMaps, as BOOT-023 lists them."""
+
+    def __init__(self) -> None:
+        self.items: dict[str, dict[str, Any]] = {}
+        self.deletes: list[list[str]] = []
+
+    def add(self, previous: dict[str, Any], created: str) -> list[str]:
+        reference = encode_previous_snapshot(previous)[0]
+        names = [str(chunk["config_map"]) for chunk in reference["chunks"]]
+        for name in names:
+            self.items[name] = {
+                "metadata": {
+                    "name": name,
+                    "creationTimestamp": created,
+                    "labels": {STATE.PREVIOUS_SNAPSHOT_LABEL: "true"},
+                    "annotations": {
+                        STATE.PREVIOUS_SNAPSHOT_DIGEST_ANNOTATION: reference["sha256"]
+                    },
+                }
+            }
+        return names
+
+    def groups(self) -> set[str]:
+        """The snapshots left, one digest per group of chunks."""
+
+        return {
+            item["metadata"]["annotations"][STATE.PREVIOUS_SNAPSHOT_DIGEST_ANNOTATION]
+            for item in self.items.values()
+        }
+
+    def get_json(self, arguments: list[str]) -> dict[str, Any]:
+        assert arguments[-2:] == ["-l", f"{STATE.PREVIOUS_SNAPSHOT_LABEL}=true"], (
+            arguments
+        )
+        return {"items": [self.items[name] for name in sorted(self.items)]}
+
+    def run(self, arguments: list[str], **_kwargs: Any) -> str:
+        assert "delete" in arguments, arguments
+        self.deletes.append(list(arguments))
+        for name in arguments[arguments.index("configmap") + 1 :]:
+            self.items.pop(name, None)
+        return ""
+
+
+class SiteRollback(SnapshotRollback):
+    """The rollback over a site's ConfigMaps with the engine's own prune."""
+
+    _cleanup_previous_snapshots = STATE.cleanup_previous_snapshots
+
+    def __init__(self, site: SnapshotSite) -> None:
+        super().__init__()
+        self.runner = SimpleNamespace(run=site.run, dry_run=False)
+        self.config = SimpleNamespace(namespace="gpu-fault-system")
+        self._get_json = site.get_json
+
+    def _cpu(self, *arguments: str) -> list[str]:
+        return list(arguments)
+
+
+def test_rollbacks_without_a_commit_stay_within_the_retention_bound() -> None:
+    """BOOT-023 after BOOT-020: three earlier rollbacks of the same live
+    release each left the snapshot their forward transaction captured, and a
+    fourth rollback restores the release from the newest one."""
+
+    site = SnapshotSite()
+    for index, created in enumerate(
+        ("2026-01-01T01:00:00Z", "2026-01-01T02:00:00Z", "2026-01-01T03:00:00Z")
+    ):
+        site.add({"release_id": "live", "captured": index}, created)
+    previous = {"release_id": "live", "captured": 3, "secret_backups": {}}
+    restored = site.add(previous, "2026-01-01T04:00:00Z")
+    assert len(site.groups()) == 4, "the four groups BOOT-023 found"
+
+    transaction_module().finalize_rollback(
+        SiteRollback(site), **_rollback_arguments(previous)
+    )
+
+    groups = site.groups()
+    assert len(groups) == STATE.PREVIOUS_SNAPSHOTS_RETAINED, groups
+    assert canonical_sha256(previous) in groups, groups
+    assert set(restored) <= set(site.items), (
+        "the snapshot of the release the rollback restored is what it needs"
+    )
+    oldest = encode_previous_snapshot({"release_id": "live", "captured": 0})[0]
+    assert [command[-1] for command in site.deletes] == [
+        oldest["chunks"][0]["config_map"]
+    ], "only the oldest group beyond the retained ones goes"
 
 
 # --- Secret backup lifecycle -------------------------------------------------

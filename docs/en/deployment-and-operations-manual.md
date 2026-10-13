@@ -5247,6 +5247,7 @@ the digest and chunk references; the non-sensitive role ConfigMap data actually 
 resume, rollback, status and management-plane alignment all transparently hydrate and verify chunk by chunk, stopping immediately on a missing chunk or digest mismatch.
 Rollback restores these configurations first and then starts the old wheel; tokens still exist only in Secrets and never enter ordinary ConfigMaps, logs
 or release state. A successful release deletes the temporary Secret backups and cleans up old snapshot chunks no longer referenced by the current state.
+A completed rollback prunes the snapshot chunks by the same rule and keeps the snapshot of the release it restored.
 When the control plane synchronises the registry at startup it first reads the raw list of cluster IDs, deletes old IDs no longer declared, then checks and overwrites the old payload of the same ID by the Region
 field, and only then reads with the new model. Therefore, when adding required fields, old
 payloads must not be required to pass the new model first; the declared configuration must provide the complete new fields, and the final object after migration still fails closed.

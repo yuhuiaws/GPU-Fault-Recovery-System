@@ -6,12 +6,13 @@ from typing import Any
 from gpu_fault_release.regional_release_config import (
     PartialClusterRolloutError,
     ReleaseError,
+    canonical_sha256,
 )
 from gpu_fault_release.regional_release_fleet_rollout import (
     delete_stale_release_secret_backups,
 )
 from gpu_fault_release.regional_release_history import record_release_history
-from gpu_fault_release.regional_release_narration import narrate_phase
+from gpu_fault_release.regional_release_narration import narrate_phase, narrate_step
 from gpu_fault_release.regional_release_state import (
     persist_state,
     state_transaction,
@@ -151,11 +152,45 @@ def finalize_rollback(
     if loaded.get("rollback_cleanup_completed") is True:
         return
     release._delete_release_secret_backups(previous)
+    _prune_previous_snapshots(release, previous)
     release._save_state(
         "rolled-back",
         **common,
         rollback_cleanup_completed=True,
     )
+
+
+def _prune_previous_snapshots(release: Any, previous: dict[str, Any]) -> None:
+    """Bound the previous-snapshot ConfigMaps a rollback leaves behind.
+
+    Every forward transaction captures a new snapshot of the live release, and
+    only a commit used to prune them, so rollbacks with no commit in between
+    piled them up: BOOT-023 found 4 groups after BOOT-020's rollbacks, above
+    the ``PREVIOUS_SNAPSHOTS_RETAINED`` of 3. After a rollback the live release
+    is the state's ``previous``, so the commit's rule applies unchanged: keep
+    the group the state references and the newest others up to the bound. That
+    holds only while the state references the snapshot of this ``previous``.
+    Otherwise the group the live release needs is unknown, so every group is
+    kept and the next commit or rollback prunes.
+    """
+
+    cleanup = getattr(release, "_cleanup_previous_snapshots", None)
+    if cleanup is None:
+        return
+    reference = (getattr(release, "state", None) or {}).get("previous_snapshot")
+    if not isinstance(reference, dict):
+        narrate_step(
+            "rollback-snapshot-prune", result="kept-all", reason="no-reference"
+        )
+        return
+    if reference.get("sha256") != canonical_sha256(previous):
+        narrate_step(
+            "rollback-snapshot-prune",
+            result="kept-all",
+            reason="reference-is-not-the-restored-release",
+        )
+        return
+    cleanup()
 
 
 def raise_automatic_rollback_failure(

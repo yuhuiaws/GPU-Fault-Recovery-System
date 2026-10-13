@@ -2090,7 +2090,11 @@ Failure behaviour:
   ConfigMaps; the main `gpu-fault-regional-release-state` keeps only the digest and chunk references, avoiding the
   ConfigMap 1 MiB limit; any missing chunk, non-canonical content or digest drift fails closed. The old embedded state
   stays compatible, and a later successful commit keeps only the snapshot referenced by the current state plus the 2 most recent old snapshots
-  (`PREVIOUS_SNAPSHOTS_RETAINED=3`), deleting only older ones;
+  (`PREVIOUS_SNAPSHOTS_RETAINED=3`), deleting only older ones. A rollback's cleanup prunes by the same rule after it deletes the
+  Secret backups `previous` references and before it records `rollback_cleanup_completed=true`, keeping the snapshot of the release it restored
+  (the state's `previous`), so rollbacks with no commit in between no longer pile snapshots up. A state that does not reference that
+  snapshot keeps every group (`rollback-snapshot-prune result=kept-all`), and a failed prune leaves the cleanup pending until the next
+  `deploy` finishes it;
 - every `save_state` also appends an audit record to the append-only `gpu-fault-release-history` ConfigMap
   (`history.ndjson`, keeping the most recent 200 entries): release ID, phase, sha256 of the state and
   execution plan, UTC timestamp, operator identity (the ARN from `aws sts get-caller-identity`,

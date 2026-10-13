@@ -683,6 +683,14 @@ Now `gpu-fault-admin deploy --accept-schema-change` completes it within **a sing
   `classify_release` new transaction, with the live release becoming that transaction's `previous`; `next_deploy` reports
   `commits_live_release_id`. The same candidate still resumes into commit as before. Tests:
   `tests/regional/test_release_transaction.py`, `tests/regional/test_regional_admin_commands.py`.
+- **A rollback prunes the previous snapshots as a commit does** (BOOT-023 after BOOT-020 found 4 groups, above the bound of 3):
+  every forward transaction captures a new snapshot of the live release and only the commit pruned, so rollbacks with no commit
+  in between piled them up. `finalize_rollback` now runs `cleanup_previous_snapshots` after deleting the Secret backups `previous`
+  references and before writing `rollback_cleanup_completed=true`. It keeps the group the state references, which after a
+  rollback is the snapshot of the restored release (`previous`), plus the newest others up to `PREVIOUS_SNAPSHOTS_RETAINED`. A
+  state that does not reference the snapshot of that `previous` keeps every group and narrates
+  `rollback-snapshot-prune result=kept-all`; a failed prune leaves the cleanup pending until the next `deploy` finishes it.
+  Tests: `tests/regional/test_release_transaction.py`.
 
 Tests: `tests/regional/test_release_schema_change_acceptance.py` (gate, resume, snapshot create/reuse/
 timeout/permission error, cluster id derivation, no rollback on failure, rollback hint, driver mirror), `tests/admin/test_admin_site.py`
