@@ -565,7 +565,18 @@ class WorkflowStore(Protocol):
         now: datetime | None = None,
         lease_duration: timedelta = timedelta(minutes=3),
         remediation_budget_claims: dict[str, int] | None = None,
-    ) -> WorkflowRequest: ...
+        remediation_budget_hold: bool = False,
+    ) -> WorkflowRequest:
+        """Lease the workflow; with budget claims also take its budget.
+
+        ``remediation_budget_claims`` (not ``None``) admits the workflow and
+        makes it RUNNING, or records the refusing scope and raises
+        ``RemediationBudgetError``. With ``remediation_budget_hold`` it is the
+        claim of a workflow whose budgeted work has begun: the scopes it holds
+        are kept, ``remediation_budget_claims`` is added, and it is never
+        refused (``gpu_fault.store.shared.remediation_budgets``).
+        """
+        ...
 
     def extend_remediation_budget(
         self,
@@ -575,6 +586,12 @@ class WorkflowStore(Protocol):
         *,
         now: datetime | None = None,
     ) -> WorkflowRequest: ...
+
+    def remediation_budget_occupancy(self) -> dict[str, int]:
+        """Holders per budget scope, as admission counts them: RUNNING rows
+        listing the scope (any lease) and holds reserved for a preempting
+        successor that has not claimed yet. Read-only; one aggregate."""
+        ...
 
     def renew_workflow_lease(
         self,

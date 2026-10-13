@@ -11,7 +11,10 @@ from gpu_fault.execution.config import (
     OPERATOR_ACKNOWLEDGEMENT_OPERATIONS,
 )
 from gpu_fault.execution.models import WorkflowStepOutcome
-from gpu_fault.execution.remediation_budget import remediation_budget_claims
+from gpu_fault.execution.remediation_budget import (
+    budget_work_begun,
+    remediation_budget_claims,
+)
 from gpu_fault.models import (
     FaultIncident,
     IncidentState,
@@ -448,6 +451,7 @@ def prepare_claimed_workflow(
             incident,
             steps,
         ),
+        remediation_budget_hold=budget_work_begun(workflow, steps),
     )
     deadlines = claim_deadlines(
         workflow,

@@ -121,6 +121,28 @@ def test_concurrent_budget_claims_admit_only_one_workflow(store) -> None:
     assert refused.remediation_budget_wait_count == 1
     assert refused.remediation_budget_last_blocked_scope == "cluster:cluster-a"
 
+    # A lapsed lease releases nothing: the holder's remediation is still in
+    # flight. Its end does.
+    with pytest.raises(RemediationBudgetError):
+        store.claim_workflow(
+            refused.request_id,
+            "executor-after-expiry",
+            refused.fencing_token,
+            now=now + timedelta(seconds=31),
+            remediation_budget_claims=claims,
+        )
+    store.save_workflow_if_leased(
+        admitted.model_copy(
+            update={
+                "status": WorkflowStatus.SUCCEEDED,
+                "execution_owner_id": None,
+                "execution_lease_expires_at": None,
+            }
+        ),
+        admitted.execution_owner_id or "",
+        admitted.execution_epoch,
+        now=now,
+    )
     acquired = store.claim_workflow(
         refused.request_id,
         "executor-after-expiry",
@@ -130,7 +152,7 @@ def test_concurrent_budget_claims_admit_only_one_workflow(store) -> None:
     )
     assert acquired.remediation_budget_claims == sorted(claims)
     assert acquired.remediation_budget_last_blocked_scope is None, (
-        "an expired competing lease kept the budget blocked"
+        "an ended competing holder kept the budget blocked"
     )
 
 

@@ -132,6 +132,7 @@ _ANY = (
     "gpu_fault_remediation_budget_active_claims",
     "gpu_fault_remediation_budget_cluster_active_claims",
     "gpu_fault_remediation_budget_cluster_limit",
+    "gpu_fault_remediation_budget_region_limit",
     "gpu_fault_remediation_budget_cluster_waiting_workflows",
     "gpu_fault_remediation_budget_wait_total",
     "gpu_fault_remediation_budget_waiting_workflows",

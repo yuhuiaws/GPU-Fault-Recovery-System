@@ -4,6 +4,7 @@ from datetime import timedelta
 
 import pytest
 
+from gpu_fault.models import WorkflowStatus
 from gpu_fault.store import RemediationBudgetError, WorkflowLeaseError
 from gpu_fault.store.shared.errors import StaleFencingTokenError
 from tests.store._cov95_compat_support import NOW
@@ -96,7 +97,7 @@ def test_budget_extension_refusal_preserves_held_scopes_until_capacity_is_availa
         lease_duration=timedelta(minutes=5),
         remediation_budget_claims={"region": 2, "node:local": 1},
     )
-    compat_store.claim_workflow(
+    holder = compat_store.claim_workflow(
         peer.request_id,
         "peer-owner",
         peer.fencing_token,
@@ -112,6 +113,26 @@ def test_budget_extension_refusal_preserves_held_scopes_until_capacity_is_availa
     assert raised.value.scope == "rack", "the refusal must name the saturated new scope"
     assert compat_store.get_workflow(target.request_id) == claimed, (
         "a failed extension must not release existing scopes or advance the lease epoch"
+    )
+    with pytest.raises(RemediationBudgetError):
+        compat_store.extend_remediation_budget(
+            target.request_id,
+            "target-owner",
+            {"rack": 1},
+            now=NOW + timedelta(seconds=30),
+        )
+    # The peer's lapsed lease released nothing; its end releases the rack.
+    compat_store.save_workflow_if_leased(
+        holder.model_copy(
+            update={
+                "status": WorkflowStatus.SUCCEEDED,
+                "execution_owner_id": None,
+                "execution_lease_expires_at": None,
+            }
+        ),
+        "peer-owner",
+        holder.execution_epoch,
+        now=NOW,
     )
 
     extended = compat_store.extend_remediation_budget(

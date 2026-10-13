@@ -562,7 +562,7 @@ validates them (integers/numbers must parse, booleans must be `0/1/true/false/ye
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN` | Core/Other | integer | `'1'` | `gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE` | Core/Other | integer | `'1'` | `gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS` | Core/Other | integer | `'2'` | `gpu_fault.execution.remediation_budget` |
-| `GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION` | Core/Other | integer | `'20'` | `gpu_fault.execution.remediation_budget` |
+| `GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION` | Core/Other | integer | `'20'` | `gpu_fault.app.builtin_metric_contributors`<br>`gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS` | Core/Other | text | `'900'` | `gpu_fault.app.builtin_metric_contributors`<br>`gpu_fault.app.periodic_services` |
 | `GPU_FAULT_REMOTE_COMMAND_RETENTION_SECONDS` | Core/Other | text | `'86400'` | `gpu_fault.app.periodic_services` |
 | `GPU_FAULT_REMOTE_COMMAND_STALE_FENCE_GRACE_SECONDS` | Core/Other | number | `'600'` | `gpu_fault.app.periodic_services` |

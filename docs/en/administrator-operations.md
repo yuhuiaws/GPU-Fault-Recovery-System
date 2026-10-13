@@ -2928,10 +2928,13 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
 
 - **Meaning**: a workflow has waited for remediation budget for more than 30 minutes. The budget limits the number of nodes changed simultaneously;
   a short wait is correct overload protection, a long wait means quota is not being released.
-- **First check**: `gpu_fault_remediation_budget_active_claims` by scope type against the configured cap;
-  confirm whether the workflows holding claims are still progressing and whether their execution leases have expired.
-- **Boundary**: do not raise the budget directly to clear the alert; first confirm there is no "claim holder dead but lease not expired"
-  situation. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md).
+- **First check**: `gpu_fault_remediation_budget_active_claims` by scope type against the configured cap
+  (`gpu_fault_remediation_budget_region_limit` for the Region cap); confirm whether the workflows holding claims are still
+  progressing. A claim is held until its workflow ends and a lapsed lease does not release it (a reset or reboot on the node
+  does not stop with its executor's lease); a `RUNNING` holder that stopped progressing is failed by the deadline watchdog at
+  its execution deadline.
+- **Boundary**: do not raise the budget directly to clear the alert; first confirm there is no "claim holder no longer
+  progressing but still `RUNNING`" situation. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md).
 
 ### GpuFaultRemediationBudgetClusterSaturated
 
@@ -2947,7 +2950,7 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   region/node/domain scope; estimate the drain time with the mean of `gpu_fault_workflow_duration_seconds`;
   `gpu_fault_workflow_pending_age_seconds_max` finds the oldest waiting workflow; read its
   `remediation_budget_last_blocked_reason` / `remediation_budget_last_blocked_scope`.
-  If a claim-holding workflow no longer progresses (lease never expiring), handle as `GpuFaultRemediationBudgetStarved` instead.
+  If a claim-holding workflow no longer progresses, handle as `GpuFaultRemediationBudgetStarved` instead.
 - **Boundary**: the single-cluster cap is the safety cap on nodes changed simultaneously; do not raise it to clear the alert; when the waiting count falls
   at the expected rate, just wait and tell the business side the drain time. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md) and needs
   a change record and a rollback plan.

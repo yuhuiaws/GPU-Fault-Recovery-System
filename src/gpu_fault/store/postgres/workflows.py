@@ -13,6 +13,10 @@ from gpu_fault.models import (
 )
 from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
 from gpu_fault.store.postgres.core import take_advisory_xact_locks
+from gpu_fault.store.postgres.remediation_budget_holders import (
+    budget_candidates,
+    occupancy_counts,
+)
 from gpu_fault.store.postgres.state_table_storage import (
     get_state_payload,
     put_state_fields,
@@ -618,6 +622,7 @@ class PostgresWorkflowMixin:
         now: datetime | None = None,
         lease_duration: timedelta = timedelta(minutes=3),
         remediation_budget_claims: dict[str, int] | None = None,
+        remediation_budget_hold: bool = False,
     ) -> WorkflowRequest:
         budget_error: RemediationBudgetError | None = None
         scopes = sorted(remediation_budget_claims or {})
@@ -646,36 +651,19 @@ class PostgresWorkflowMixin:
             ):
                 raise WorkflowLeaseError("workflow is leased by another executor")
             if remediation_budget_claims is not None:
-                if scopes:
+                active: list[WorkflowRequest] = []
+                if scopes and not remediation_budget_hold:
                     with self._db.cursor() as cursor:
-                        cursor.execute(
-                            """
-                            SELECT payload
-                            FROM gpu_fault_workflow_records
-                            WHERE kind='workflow'
-                              AND key<>%s
-                              AND status='RUNNING'
-                              AND execution_lease_expires_at
-                                  ::timestamptz > %s
-                              AND coalesce(
-                                  payload->'remediation_budget_claims',
-                                  '[]'::jsonb
-                              ) ?| %s
-                            """,
-                            (request_id, claimed_at, scopes),
-                        )
                         active = [
-                            self._decode("workflow", row[0])
-                            for row in cursor.fetchall()
+                            self._decode("workflow", payload)
+                            for payload in budget_candidates(cursor, request_id, scopes)
                         ]
-                else:
-                    active = []
                 try:
                     workflow = apply_remediation_budget(
                         workflow,
                         active,
                         remediation_budget_claims,
-                        now=claimed_at,
+                        hold=remediation_budget_hold,
                     )
                 except RemediationBudgetError as exc:
                     # The refusing scope is recorded too, so the per-cluster
@@ -737,28 +725,17 @@ class PostgresWorkflowMixin:
             active: list[WorkflowRequest] = []
             if scopes:
                 with self._db.cursor() as cursor:
-                    cursor.execute(
-                        """
-                        SELECT payload
-                        FROM gpu_fault_workflow_records
-                        WHERE kind='workflow'
-                          AND key<>%s
-                          AND status='RUNNING'
-                          AND execution_lease_expires_at
-                              ::timestamptz > %s
-                          AND coalesce(
-                              payload->'remediation_budget_claims',
-                              '[]'::jsonb
-                          ) ?| %s
-                        """,
-                        (request_id, at, scopes),
-                    )
                     active = [
-                        self._decode("workflow", row[0]) for row in cursor.fetchall()
+                        self._decode("workflow", payload)
+                        for payload in budget_candidates(cursor, request_id, scopes)
                     ]
-            workflow = extend_remediation_budget(workflow, active, claims, now=at)
+            workflow = extend_remediation_budget(workflow, active, claims)
             self._put("workflow", request_id, workflow)
             return workflow
+
+    def remediation_budget_occupancy(self) -> dict[str, int]:
+        with self._db.cursor() as cursor:
+            return occupancy_counts(cursor)
 
     def renew_workflow_lease(
         self,

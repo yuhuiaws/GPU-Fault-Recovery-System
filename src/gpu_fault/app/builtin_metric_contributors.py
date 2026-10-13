@@ -24,6 +24,7 @@ from gpu_fault.models import (
     WorkflowStepStatus,
 )
 from gpu_fault.store.contracts import ControlPlaneStore
+from gpu_fault.store.shared.remediation_budgets import budget_holds
 
 # Upper bound on the rows either orphan inspection decodes per scrape; the
 # gauges saturate there rather than let a pathological table grow the render.
@@ -1081,9 +1082,9 @@ def _remediation_budget_lines(
         )
     lines.extend(
         [
-            "# HELP gpu_fault_remediation_budget_cluster_active_claims RUNNING "
-            "workflows with a live execution lease that hold this cluster's "
-            "remediation budget claim.",
+            "# HELP gpu_fault_remediation_budget_cluster_active_claims Workflows "
+            "holding this cluster's remediation budget claim: RUNNING (any lease) "
+            "or reserved for a preempting successor that has not claimed yet.",
             "# TYPE gpu_fault_remediation_budget_cluster_active_claims gauge",
         ]
     )
@@ -1102,6 +1103,13 @@ def _remediation_budget_lines(
                 "# TYPE gpu_fault_remediation_budget_cluster_limit gauge",
                 "gpu_fault_remediation_budget_cluster_limit "
                 f"{config.remediation_budget.cluster_limit}",
+                "# HELP gpu_fault_remediation_budget_region_limit Configured "
+                "region-wide remediation concurrency limit "
+                "(GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION); compare with "
+                'gpu_fault_remediation_budget_active_claims{scope_type="region"}.',
+                "# TYPE gpu_fault_remediation_budget_region_limit gauge",
+                "gpu_fault_remediation_budget_region_limit "
+                f"{config.remediation_budget.region_limit}",
             ]
         )
     lines.extend(
@@ -1202,6 +1210,7 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
     budget_cluster_waiting: Counter[str] = Counter()
     budget_waiting_scope_types: Counter[str] = Counter()
     budget_wait_total = budget_waiting = 0
+    holding = {holder.request_id for holder, _ in budget_holds(workflows)}
     now = datetime.now(timezone.utc)
     terminal = {
         WorkflowStatus.SUCCEEDED,
@@ -1239,11 +1248,7 @@ def closed_loop_metric_lines(runtime: AppRuntime) -> list[str]:
                     (execution.updated_at - workflow.created_at).total_seconds(),
                 )
             )
-        if (
-            workflow.status is WorkflowStatus.RUNNING
-            and workflow.execution_lease_expires_at is not None
-            and workflow.execution_lease_expires_at > now
-        ):
+        if workflow.request_id in holding:
             for scope in workflow.remediation_budget_claims:
                 budget_scope_types[scope.split(":", 1)[0]] += 1
                 if scope.startswith("cluster:"):

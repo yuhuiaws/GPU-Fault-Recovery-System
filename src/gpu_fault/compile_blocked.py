@@ -303,9 +303,9 @@ def settled_incident_blocked_reasons(
     ):
         reasons.append("workflow has an unknown provider action")
     # ``remediation_budget_claims`` left on a BLOCKED record are not live:
-    # budget occupancy counts RUNNING rows with a live lease only, so they hold
-    # nothing and are released with the close (3 SAFETY_SETTLED records of
-    # 2026-09-06 sat refused on them for five days).
+    # budget occupancy counts RUNNING rows (and handoff reservations) only, so
+    # they hold nothing and are released with the close (3 SAFETY_SETTLED
+    # records of 2026-09-06 sat refused on them for five days).
     if workflow.source_plan_id:
         # Plan-driven: the restore reconcile owns it and carries its audit.
         reasons.append(

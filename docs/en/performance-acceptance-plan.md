@@ -317,6 +317,17 @@ workflows active simultaneously, and 32/50 clusters × 4 workflows are also exec
 under the Region cap of 20. This is the budget taking effect, not dispatcher throughput
 regression.
 
+Every workflow holds its claim from admission until it ends, through the waits of its reset and
+reboot (detailed design §9.5), so these limits hold for the whole remediation. The scheduling
+model (a model, not a measurement) puts the production-budget tier 32×4 at a workflow duration
+p50/p99 of about 675/1301 s and a first-action p95 of about 1042 s (budget waits included), about
+23 minutes for the whole batch, and never more than 20 resets/reboots in flight. With the earlier
+implementation, which held a claim only until the first budgeted step completed, the same model
+gives 390/644 s, 307 s and about 12 minutes, and RUNNING climbed to the dispatcher's selection of
+100 rows per tick in measurement; numbers of the two implementations are not comparable. These
+production-budget figures are the throttle's result: the verdict stays §6.3 (correct throttling,
+no starvation, final convergence), not a regression threshold.
+
 The current seeded synthetic steps set no `failure_domain`, `fabric_partition` or
 `availability_zone`, so they cannot prove that the failure-domain budget takes effect. Formal
 budget acceptance must give synthetic workflows deterministic domains covering both directions:
@@ -647,8 +658,8 @@ run as `raw-capacity`, `production-budget` or `unbounded` per the table above an
 progress (1), and each executor's concurrency peak `max_concurrent_commands` is recorded as
 evidence rather than a pass condition — the per-node and failure-domain limits deliberately
 serialize same-cluster workflows. The executor wall clock and the Job `activeDeadlineSeconds`
-follow `--timeout-seconds`; the production-budget tier 32×4 model takes about 16 minutes and
-should be given `--timeout-seconds 2400` explicitly.
+follow `--timeout-seconds`; the production-budget tier 32×4 takes about 23 minutes by the §4.3
+model and should be given `--timeout-seconds 2400` explicitly.
 
 Every entry point must name the target kubeconfig/context explicitly. Production registry tokens
 and Secrets must not be written into artifacts; the registry baseline may keep only cluster IDs

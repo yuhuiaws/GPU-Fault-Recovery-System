@@ -10,6 +10,7 @@ from gpu_fault.models import (
     WorkflowOperation,
     WorkflowRequest,
     WorkflowStepSpec,
+    resolved_step_indexes,
 )
 from gpu_fault.operation_registry import (
     NODE_MUTATING_OPERATIONS,
@@ -112,27 +113,76 @@ class RemediationBudgetPolicy:
         return policy
 
 
+def budget_work_begun(
+    workflow: WorkflowRequest, steps: Sequence[WorkflowStepSpec]
+) -> bool:
+    """Whether the workflow's own budgeted work has begun: its claim is a hold.
+
+    Begun means a parked failure owes its compensation, or one of its own
+    budgeted steps completed or has an execution record of any status (an
+    attempted reset or reboot may still be running). Containment a preempting
+    successor inherited is its predecessor's work: the successor is admitted,
+    taking over the hold its predecessor reserved for it.
+    """
+
+    if workflow.pending_failure_step_index is not None:
+        return True
+    inherited = set(workflow.inherited_step_indexes)
+    completed = set(workflow.completed_step_indexes) - inherited
+    if any(
+        index in completed and _budgeted(step.operation)
+        for index, step in enumerate(steps)
+    ):
+        return True
+    return any(
+        execution.step_index not in inherited and _budgeted(execution.operation)
+        for execution in workflow.step_executions
+    )
+
+
 def remediation_budget_claims(
     policy: RemediationBudgetPolicy,
     workflow: WorkflowRequest,
     incident: FaultIncident,
     steps: Sequence[WorkflowStepSpec],
 ) -> dict[str, int]:
-    completed = set(workflow.completed_step_indexes)
-    pending = [
+    """The scopes the workflow's next claim carries (design §9.5).
+
+    Until its budgeted work begins: the budgeted steps still to run, which the
+    store admits or refuses. From then on (``budget_work_begun``): the scopes
+    of its own budgeted plan, which the store adds to what it already holds
+    and never refuses, so a reset, reboot or compensation in flight is never
+    stranded and a record whose claims an older release dropped counts again.
+    The hold ends when the workflow does.
+    """
+
+    if budget_work_begun(workflow, steps):
+        skipped = set(workflow.superseded_step_indexes) | set(
+            workflow.inherited_step_indexes
+        )
+    else:
+        skipped = set(resolved_step_indexes(workflow))
+    budgeted = [
         step
         for index, step in enumerate(steps)
-        if index not in completed and _budgeted(step.operation)
+        if index not in skipped and _budgeted(step.operation)
     ]
-    if not pending or workflow.pending_failure_step_index is not None:
+    if not budgeted:
         return {}
-    if any(
-        index in completed and _budgeted(step.operation)
-        for index, step in enumerate(steps)
-    ):
-        return {}
+    return _scopes_for_steps(policy, incident.cluster_id, budgeted)
 
-    return _scopes_for_steps(policy, incident.cluster_id, pending)
+
+def scope_limit(policy: RemediationBudgetPolicy, scope: str) -> int | None:
+    """The configured limit of one claimed scope, ``None`` for an unknown kind."""
+
+    kind = scope.split(":", 1)[0]
+    return {
+        "region": policy.region_limit,
+        "cluster": policy.cluster_limit,
+        "node": policy.node_limit,
+        "domain": policy.failure_domain_limit,
+        "class": policy.resource_class_limit,
+    }.get(kind)
 
 
 def escalation_budget_claims(

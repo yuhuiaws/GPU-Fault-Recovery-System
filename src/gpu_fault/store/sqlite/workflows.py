@@ -24,6 +24,7 @@ from gpu_fault.store.shared.record_guards import (
 from gpu_fault.store.shared.remediation_budgets import (
     apply_remediation_budget,
     blocked_by_remediation_budget,
+    budget_occupancy,
     extend_remediation_budget,
 )
 from gpu_fault.store.shared.time import utc_text as _utc_text
@@ -539,6 +540,7 @@ class SqliteWorkflowMixin:
         now: datetime | None = None,
         lease_duration: timedelta = timedelta(minutes=3),
         remediation_budget_claims: dict[str, int] | None = None,
+        remediation_budget_hold: bool = False,
     ) -> WorkflowRequest:
         with self._lock:
             # A budget refusal is a committed write (the workflow goes BLOCKED)
@@ -566,7 +568,7 @@ class SqliteWorkflowMixin:
                             workflow,
                             self._list("workflow"),
                             remediation_budget_claims,
-                            now=claimed_at,
+                            hold=remediation_budget_hold,
                         )
                     except RemediationBudgetError as exc:
                         workflow = blocked_by_remediation_budget(
@@ -620,10 +622,13 @@ class SqliteWorkflowMixin:
             ):
                 raise WorkflowLeaseError("workflow execution lease is stale")
             workflow = extend_remediation_budget(
-                workflow, self._list("workflow"), claims, now=at
+                workflow, self._list("workflow"), claims
             )
             self._put("workflow", request_id, workflow)
             return workflow
+
+    def remediation_budget_occupancy(self) -> dict[str, int]:
+        return dict(budget_occupancy(self._list("workflow")))
 
     def renew_workflow_lease(
         self,

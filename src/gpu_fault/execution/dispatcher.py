@@ -13,6 +13,7 @@ from pydantic import ValidationError
 from gpu_fault.compile_blocked import close_compile_blocked_workflows
 from gpu_fault.execution.receipt_settled_resume import resume_receipt_settled_workflows
 from gpu_fault.execution import dispatcher_wakeups, restart_budget_preflight
+from gpu_fault.execution.budget_guard import SKIP_REASON, BudgetGuard
 from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.executor import (
     DISPATCHER_ACTOR,
@@ -76,10 +77,9 @@ _T = TypeVar("_T")
 
 DISPATCHER_PLACEMENT_HOLD_ACTOR = "dispatcher-placement-hold"
 
-# D-7: the lease a WAITING row keeps between two dispatches. Three polls so
-# one missed tick does not lose it, floored because the remediation budget
-# counts only RUNNING rows with a live lease -- a lease that lapsed before the
-# next dispatch would let another workflow take the same scope.
+# D-7: the lease a WAITING row keeps between two dispatches: three polls and
+# at least 30 s, so one missed tick does not hand it to another replica. The
+# remediation budget hold no longer rides on it (it lasts until the row ends).
 WAITING_LEASE_FLOOR_SECONDS = 30.0
 HOLD_REASON_PLACEMENT_HOLD_DISSOLVED_TEXT = "placement hold dissolved: nodes freed"
 
@@ -377,13 +377,14 @@ class WorkflowDispatcher:
         = max(``created_at``, ``not_before``), which no merge rewrites (F-A2a)
         -- and the scan walks that order page by page, handing the last row of
         a page back as the cursor (F-A2c), until a full batch is found, the
-        rows run out, or ``MAX_SCAN_ROWS`` have been walked in total. Rows that
-        can never pass (an open predecessor, a fresh ``not_before``) therefore
-        cannot hide the dispatchable rows behind them (P0-79B), and a page is
-        never re-read. The batch is cut in the same order; ``filtered`` is the
-        tick's answer to "why did nothing dispatch?".
+        rows run out, or ``MAX_SCAN_ROWS`` have been walked. Rows that cannot
+        pass (open predecessor, fresh ``not_before``, a budget scope still full:
+        ``BudgetGuard``) so cannot hide the dispatchable ones (P0-79B), and no
+        page is re-read. The batch is cut in the same order; ``filtered`` is
+        the tick's answer to "why did nothing dispatch?".
         """
 
+        guard = BudgetGuard(self.store, lambda: self.executor.config.remediation_budget)
         page_size = max(self.config.batch_size * 20, 100)
         candidates: list[WorkflowRequest] = []
         filtered: dict[str, int] = {}
@@ -404,7 +405,7 @@ class WorkflowDispatcher:
             if first_page is None:
                 first_page = rows
             scanned += len(rows)
-            page_candidates, page_filtered = self._eligible(rows, now, retired)
+            page_candidates, page_filtered = self._eligible(rows, now, retired, guard)
             candidates.extend(page_candidates)
             for reason, count in page_filtered.items():
                 filtered[reason] = filtered.get(reason, 0) + count
@@ -490,7 +491,11 @@ class WorkflowDispatcher:
             )
 
     def _eligible(
-        self, rows: list[WorkflowRequest], now: datetime, retired: set[str]
+        self,
+        rows: list[WorkflowRequest],
+        now: datetime,
+        retired: set[str],
+        guard: BudgetGuard,
     ) -> tuple[list[WorkflowRequest], dict[str, int]]:
         filtered: dict[str, int] = {}
 
@@ -568,6 +573,9 @@ class WorkflowDispatcher:
                     default=None,
                 )
                 held("node_busy_timeout")
+                continue
+            if guard.passes_over(workflow):
+                held(SKIP_REASON)
                 continue
             candidates.append(workflow)
         return candidates, filtered
@@ -1244,20 +1252,13 @@ class WorkflowDispatcher:
         except NotFoundError:
             return False
         scope_keys = {
-            json.dumps(
-                [incident.cluster_id, "node", node_id],
-                separators=(",", ":"),
-            )
+            json.dumps([incident.cluster_id, "node", node_id], separators=(",", ":"))
             for node_id in incident.node_ids
         }
         if incident.job_id and incident.attempt_id:
             scope_keys.add(
                 json.dumps(
-                    [
-                        incident.cluster_id,
-                        incident.job_id,
-                        incident.attempt_id,
-                    ],
+                    [incident.cluster_id, incident.job_id, incident.attempt_id],
                     separators=(",", ":"),
                 )
             )
@@ -1522,9 +1523,8 @@ class WorkflowDispatcher:
             reference=None,
             reconciled_at=now,
         )
-        # Terminalizing releases the remediation budget claims on its own -- they
-        # are only counted for a RUNNING workflow holding a live lease -- but a
-        # restart reservation is a durable row and is not.
+        # Terminalizing releases the remediation budget claims on its own (only a
+        # RUNNING row holds them); a restart reservation is a durable row.
         restart_budget_preflight.release_unattempted_restart_reservations(
             self.store,
             revoked,

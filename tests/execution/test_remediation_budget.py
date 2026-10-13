@@ -7,6 +7,7 @@ import pytest
 
 from gpu_fault.execution.remediation_budget import (
     RemediationBudgetPolicy,
+    budget_work_begun,
     remediation_budget_claims,
 )
 from gpu_fault.models import (
@@ -48,15 +49,18 @@ def _workflow(store, suffix: str, *, node_id: str = "node-a"):
 
 
 @pytest.mark.parametrize("durable", [False, True])
-def test_remediation_budget_is_durable_and_released_by_lease_expiry(
+def test_remediation_budget_is_durable_and_released_when_the_holder_ends(
     tmp_path, durable: bool
 ) -> None:
+    """A lapsed lease releases nothing (a reboot outlives its executor's lease);
+    the holder's terminal write does."""
+
     store = SqliteStore(str(tmp_path / "budget.db")) if durable else InMemoryStore()
     _, first = _workflow(store, "first", node_id="node-a")
     _, second = _workflow(store, "second", node_id="node-b")
     claims = {"region": 1, "cluster:cluster-a": 1}
 
-    store.claim_workflow(
+    holder = store.claim_workflow(
         first.request_id,
         "executor-a",
         first.fencing_token,
@@ -84,6 +88,27 @@ def test_remediation_budget_is_durable_and_released_by_lease_expiry(
     assert "cluster:cluster-a" in (blocked.remediation_budget_last_blocked_reason or "")
     assert blocked.remediation_budget_last_blocked_scope == "cluster:cluster-a"
 
+    with pytest.raises(RemediationBudgetError, match="scope=cluster:cluster-a"):
+        store.claim_workflow(
+            second.request_id,
+            "executor-b",
+            second.fencing_token,
+            now=NOW + timedelta(seconds=31),
+            lease_duration=timedelta(seconds=30),
+            remediation_budget_claims=claims,
+        )
+    store.save_workflow_if_leased(
+        holder.model_copy(
+            update={
+                "status": WorkflowStatus.SUCCEEDED,
+                "execution_owner_id": None,
+                "execution_lease_expires_at": None,
+            }
+        ),
+        "executor-a",
+        holder.execution_epoch,
+        now=NOW + timedelta(seconds=1),
+    )
     claimed = store.claim_workflow(
         second.request_id,
         "executor-b",
@@ -243,6 +268,8 @@ def test_restore_compensation_never_waits_for_a_remediation_budget() -> None:
         }
     )
 
+    # Compensation is a hold (never refused) and asks for nothing new.
+    assert budget_work_begun(workflow, workflow.official_steps) is True
     assert (
         remediation_budget_claims(
             RemediationBudgetPolicy(), workflow, incident, workflow.official_steps

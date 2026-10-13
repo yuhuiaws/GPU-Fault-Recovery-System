@@ -3903,10 +3903,34 @@ The three hard rules of `RESTORE_SCHEDULING`:
 
 ### 9.5 Concurrency and Blast Radius
 
-The implementation uses a persistent remediation budget claim on the workflow lease. Before the first entry into any node/
-workload change, it simultaneously claims the Region, cluster, node, failure domain, and resource class
-scopes; if any scope is full, the workflow stays retryable and does not call the adapter. Lease expiry releases the claim naturally,
-and a `RESTORE_GPU_SERVICES` that has already entered recovery compensation is not blocked by the budget.
+The implementation uses a persistent remediation budget claim, taken in the same transaction as the workflow lease. Until the
+workflow's budgeted steps (node/workload changes) begin, every claim asks for the Region, cluster, node, failure domain and
+resource class scopes of its budgeted steps still to run; if any scope is full, the workflow stays retryable (with the refusing
+scope recorded) and does not call the adapter.
+
+Once admitted, the claim is held until the workflow is terminal (`SUCCEEDED`, `FAILED`, `SUPERSEDED` or `BLOCKED`): WAITING
+steps, long commands, the re-dispatch of every tick, lease renewal and an executor hand-over release nothing. Occupancy counts
+`RUNNING` status, not the lease: a lease is execution ownership, and a dispatcher hand-over, a row past the batch cut or an
+internal-error release lets it lapse while the reset or reboot on the node goes on; the deadline watchdog bounds how long a row
+stays `RUNNING`. Once the workflow's own budgeted work has begun (completed, attempted, or a parked compensation), every later
+claim is a hold: it keeps the scopes held, adds its own plan's scopes and is never refused, so a reset, a reboot and the
+`RESTORE_GPU_SERVICES` compensation in flight are never blocked by the budget, and a record whose claims an older release dropped
+counts again. `BLOCKED` holds no budget: it no longer acts, the node it occupies stays fenced by the predecessor and node-busy
+gates, and an operator resume goes through a claim again.
+
+Preemption handoff: when a predecessor gives way to a stronger successor at a step boundary and becomes `SUPERSEDED`, its claim
+is reserved for that successor until the successor claims or ends -- no other workflow takes the slot, the successor is not refused
+for it (its own reservation is left out of its count), and exactly one hold exists through the handoff. Containment the successor
+inherited is not its own work; it is admitted for its budgeted steps still to run.
+
+Starvation guard: a refused workflow stays `PENDING` among the oldest `GPU_FAULT_WORKFLOW_BATCH_SIZE` (default 100) rows the
+dispatcher selects each tick. The dispatcher reads one occupancy aggregate per tick at most and passes over `PENDING` /
+`SAFETY_PENDING` rows whose recorded refusing scope is still full
+(`gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}`); once the scope has room its waiters are candidates
+again in their queue order -- the guard only skips and never reorders, so FIFO within a scope is unchanged. There is no quota of
+free slots: the first waiter may still not claim (a fleet-rollout fence holds it, for one), and a quota spent on it would starve
+the waiters behind it. A fault storm in one cluster therefore cannot starve the others; a row never refused is still tried once.
+`RUNNING` rows are never passed over.
 
 `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY` is not a counterexample: it only controls
 the number of commit threads for different cluster transactions within a PostgreSQL completion batch; it does not limit how many nodes

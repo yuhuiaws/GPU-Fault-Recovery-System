@@ -33,6 +33,7 @@ from gpu_fault.store.shared.record_guards import (
 from gpu_fault.store.shared.remediation_budgets import (
     apply_remediation_budget,
     blocked_by_remediation_budget,
+    budget_occupancy,
     extend_remediation_budget,
 )
 from gpu_fault.store.shared.transactional_workflows import (
@@ -95,11 +96,9 @@ class MemoryWorkflowMixin:
         """The pair an already-ingested event resolves to, or None to rebuild.
 
         The memory copy of ``TransactionalWorkflowMixin._duplicate_event_records``
-        (C-05): ``tests/store/test_merge_duplicate_event_contract.py`` pins the
-        three backends to the same answer. The three fast paths here used to
-        raise (``RuntimeError`` / ``NotFoundError``) on a dangling pointer, so
-        every family test on the in-memory store -- and the ``--dry-run``
-        adapter path -- saw a poison message where PostgreSQL rebuilt.
+        (C-05), pinned to the same answer by test_merge_duplicate_event_contract.
+        The fast paths used to raise on a dangling pointer, so every family test
+        on this store -- and ``--dry-run`` -- saw a poison message.
         """
 
         incident_id = self._incident_by_event.get(event_id)
@@ -832,6 +831,7 @@ class MemoryWorkflowMixin:
         now: datetime | None = None,
         lease_duration: timedelta = timedelta(minutes=3),
         remediation_budget_claims: dict[str, int] | None = None,
+        remediation_budget_hold: bool = False,
     ) -> WorkflowRequest:
         with self._lock:
             workflow = self.get_workflow(request_id)
@@ -854,14 +854,11 @@ class MemoryWorkflowMixin:
                         workflow,
                         list(self._workflows.values()),
                         remediation_budget_claims,
-                        now=claimed_at,
+                        hold=remediation_budget_hold,
                     )
                 except RemediationBudgetError as exc:
                     self._workflows[request_id] = blocked_by_remediation_budget(
-                        workflow,
-                        str(exc),
-                        scope=exc.scope,
-                        now=claimed_at,
+                        workflow, str(exc), scope=exc.scope, now=claimed_at
                     )
                     raise
             new_epoch = workflow.execution_owner_id != executor_id or not lease_active
@@ -902,10 +899,14 @@ class MemoryWorkflowMixin:
             ):
                 raise WorkflowLeaseError("workflow execution lease is stale")
             workflow = extend_remediation_budget(
-                workflow, list(self._workflows.values()), claims, now=at
+                workflow, list(self._workflows.values()), claims
             )
             self._workflows[request_id] = workflow
             return workflow
+
+    def remediation_budget_occupancy(self) -> dict[str, int]:
+        with self._lock:
+            return dict(budget_occupancy(list(self._workflows.values())))
 
     def renew_workflow_lease(
         self,

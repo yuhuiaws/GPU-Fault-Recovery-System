@@ -194,6 +194,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_raw_evidence_refresh.py \
 	tests/store/test_postgres_reconnect.py \
 	tests/store/test_postgres_regional_protocol.py \
+	tests/store/test_postgres_remediation_budget_hold.py \
 	tests/store/test_postgres_remote_claim_cancellation.py \
 	tests/store/test_postgres_remote_command_lock_key.py \
 	tests/store/test_postgres_remote_runtime.py \

@@ -318,6 +318,7 @@ def test_closed_loop_metrics_cover_outcomes_budgets_and_notifications() -> None:
         'gpu_fault_remediation_budget_cluster_active_claims{cluster_id="cluster-a"} 1'
     ) in lines
     assert "gpu_fault_remediation_budget_cluster_limit 5" in lines
+    assert "gpu_fault_remediation_budget_region_limit 20" in lines
     assert (
         "gpu_fault_remediation_budget_cluster_waiting_workflows"
         '{cluster_id="cluster-a"} 1'
@@ -347,9 +348,57 @@ def test_remediation_budget_cluster_limit_is_omitted_without_executor_config() -
     assert not [
         line
         for line in lines
-        if line.startswith("gpu_fault_remediation_budget_cluster_limit ")
+        if line.startswith(
+            (
+                "gpu_fault_remediation_budget_cluster_limit ",
+                "gpu_fault_remediation_budget_region_limit ",
+            )
+        )
     ]
     assert "gpu_fault_remediation_budget_waiting_workflows 0" in lines
+
+
+def test_budget_occupancy_gauges_count_a_holder_whose_lease_lapsed() -> None:
+    """The gauges read occupancy the way admission does: a RUNNING holder
+    counts until it ends, a lapsed lease (dispatcher hand-over) included, and
+    a superseded predecessor counts while its preempting successor waits."""
+
+    store = build_store()
+    lapsed = workflow_request(
+        "workflow-lapsed",
+        "incident-lapsed",
+        WorkflowStatus.RUNNING,
+        execution_owner_id="executor-gone",
+        execution_lease_expires_at=datetime.now(timezone.utc) - timedelta(hours=1),
+        remediation_budget_claims=["cluster:cluster-a", "region"],
+    )
+    predecessor = workflow_request(
+        "workflow-predecessor",
+        "incident-handoff",
+        WorkflowStatus.SUPERSEDED,
+        preempted_by_workflow_id="workflow-successor",
+        remediation_budget_claims=["cluster:cluster-b", "region"],
+    )
+    successor = workflow_request(
+        "workflow-successor",
+        "incident-handoff",
+        WorkflowStatus.PENDING,
+        predecessor_workflow_id=predecessor.request_id,
+        preempt_predecessor=True,
+    )
+    for workflow in (lapsed, predecessor, successor):
+        store.save_workflow(workflow)
+
+    lines = closed_loop_metric_lines(
+        SimpleNamespace(context=ApplicationContext(store=store))
+    )
+
+    assert 'gpu_fault_remediation_budget_active_claims{scope_type="region"} 2' in lines
+    for cluster_id in ("cluster-a", "cluster-b"):
+        assert (
+            "gpu_fault_remediation_budget_cluster_active_claims"
+            f'{{cluster_id="{cluster_id}"}} 1'
+        ) in lines, cluster_id
 
 
 def test_closed_loop_metrics_use_aggregate_notification_counts(monkeypatch) -> None:
