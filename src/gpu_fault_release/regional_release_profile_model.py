@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -60,8 +60,9 @@ class RuntimeProfileSpec:
 
     ``registration_cluster_id`` is the registration anchor the control plane
     stores with the profile (``runtime_profile.registration_cluster_id`` for
-    the site profile, the cluster itself for an override). ``version`` is the
-    pin the cluster's Agents, Executor and installer carry.
+    the site profile, a cluster running the override for an override; see
+    ``runtime_profiles``). ``version`` is the pin the cluster's Agents,
+    Executor and installer carry.
     """
 
     #: ``None`` only for a config that declares no profile file at all.
@@ -131,16 +132,30 @@ def target_runtime_profile(config: Any, target: Any) -> RuntimeProfileSpec:
     )
 
 
-def runtime_profiles(config: Any) -> tuple[RuntimeProfileSpec, ...]:
+def runtime_profiles(
+    config: Any, *, anchor: str | None = None
+) -> tuple[RuntimeProfileSpec, ...]:
     """Every distinct profile version in use: the site's first, then each
-    cluster override once, in cluster order."""
+    cluster override once, in cluster order.
 
-    profiles = [site_runtime_profile(config)]
+    A cluster version is anchored on its first member in cluster order, or on
+    ``anchor`` when that cluster runs it: a ``join-cluster`` release registers
+    under the cluster it joins, the one member it has just put into the
+    registry (a batch sibling listed first may not be there yet). The anchor
+    is a label, not policy -- join, batch join, deploy and remove-cluster all
+    reorder the members -- so drift is judged without it (``profile_policy``).
+    """
+
+    site = site_runtime_profile(config)
+    profiles = {site.version: site}
     for target in _overrides(config):
         spec = target_runtime_profile(config, target)
-        if all(item.version != spec.version for item in profiles):
-            profiles.append(spec)
-    return tuple(profiles)
+        profiles.setdefault(spec.version, spec)
+        if target.cluster_id == anchor and spec.version != site.version:
+            profiles[spec.version] = replace(
+                profiles[spec.version], registration_cluster_id=anchor
+            )
+    return tuple(profiles.values())
 
 
 def runtime_profile_version_for(config: Any, cluster_id: str) -> str:

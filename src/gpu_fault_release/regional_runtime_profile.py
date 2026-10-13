@@ -23,6 +23,20 @@ from gpu_fault_release.regional_release_runtime_identity import (
 )
 
 
+#: The payload field naming the member a version is registered under. Which
+#: member that is follows cluster order and membership, never policy, and the
+#: Store keeps the one it was first registered under (``runtime_profiles``).
+REGISTRATION_ANCHOR_FIELD = "cluster_id"
+
+
+def profile_policy(profile: dict[str, Any]) -> dict[str, Any]:
+    """A compiled profile without its registration anchor: what drift means."""
+
+    return {
+        key: value for key, value in profile.items() if key != REGISTRATION_ANCHOR_FIELD
+    }
+
+
 def render_runtime_profile_payload(
     config: ReleaseConfig, spec: RuntimeProfileSpec | None = None
 ) -> dict[str, Any]:
@@ -96,7 +110,7 @@ def verify_runtime_profile(release: Any) -> None:
         desired, existing = _validated_inspection(release, spec if index else None)
         if existing is None:
             raise ReleaseError(f"Runtime Profile {spec.version} is not registered")
-        if existing != desired:
+        if profile_policy(existing) != profile_policy(desired):
             raise ReleaseError(
                 f"Runtime Profile {spec.version} differs from the declared policy"
             )
@@ -115,18 +129,23 @@ def verify_runtime_profile_check(release: Any) -> tuple[str, dict[str, Any]]:
     )
 
 
-def ensure_runtime_profile(release: Any) -> None:
-    """Register every profile version in use: the site's, then each cluster's own."""
+def ensure_runtime_profile(release: Any, *, anchor: str | None = None) -> None:
+    """Register every profile version in use: the site's, then each cluster's own.
+
+    ``anchor`` is the cluster a ``join-cluster`` release joins; a version it
+    runs is registered under it (``runtime_profiles``). A registered version
+    is compared by policy, whichever member it was registered under.
+    """
 
     runner = release.runner
     config = release.config
     if runner.dry_run:
         return
-    for index, spec in enumerate(runtime_profiles(config)):
+    for index, spec in enumerate(runtime_profiles(config, anchor=anchor)):
         own = spec if index else None
         desired, existing = _validated_inspection(release, own)
         if existing is not None:
-            if existing != desired:
+            if profile_policy(existing) != profile_policy(desired):
                 raise ReleaseError(
                     "Runtime Profile "
                     f"{spec.version} already exists "
@@ -160,7 +179,9 @@ def _register_profile(
     for attempt in range(2):
         if attempt:
             _desired, existing = _validated_inspection(release, own)
-            if existing == desired:
+            if existing is not None and profile_policy(existing) == profile_policy(
+                desired
+            ):
                 return
             if existing is not None:
                 raise ReleaseError(

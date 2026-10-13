@@ -1250,7 +1250,7 @@ class RegionalRelease(RegistryDrainContext):
         self._ensure_contexts()
         self._update_registry(target, remove=False)
         prepare_join_registry(self, cluster_id)
-        ensure_runtime_profile(self)
+        ensure_runtime_profile(self, anchor=cluster_id)
         self._ensure_gpu_namespace(target)
         self._ensure_connection_secret(target)
         self._quiesce_gpu_executor(target)
