@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from contextlib import AbstractContextManager, contextmanager, nullcontext
-from typing import Any, Iterator, cast
+from typing import Any, Iterable, Iterator, cast
 
 from pydantic import BaseModel
 
@@ -17,6 +17,31 @@ from gpu_fault.store.shared.errors import (
     StaleWriteError,
     TransactionRequiredError,
 )
+
+# Lock order rule (F-B2): a transaction that takes several advisory locks of
+# one family takes them in Python ``sorted()`` order, the order of the per-key
+# loops older pods still run mid-rollout. ``COLLATE "C"`` is that order (byte
+# order); the database default collation is not ("C/1" sorts after "b/1" in
+# en_US). The ORDER BY also keeps the subquery from being flattened, so the
+# locks are taken row by row in that order.
+_ORDERED_ADVISORY_XACT_LOCKS = """
+    SELECT pg_advisory_xact_lock(hashtextextended(value, 0))
+    FROM (
+        SELECT value FROM unnest(%s::text[]) AS value
+        ORDER BY value COLLATE "C"
+    ) AS ordered
+"""
+
+
+def take_advisory_xact_locks(cursor: Any, lock_keys: Iterable[str]) -> None:
+    """Take the transaction advisory locks on ``lock_keys`` in one round trip.
+
+    The key text is hashed exactly as ``_state_transaction`` hashes its key,
+    so a batch and a single-key writer of the same record exclude each other.
+    """
+    keys = sorted(set(lock_keys))
+    if keys:
+        cursor.execute(_ORDERED_ADVISORY_XACT_LOCKS, (keys,))
 
 
 class PostgresCoreMixin:

@@ -2682,7 +2682,10 @@ The bottleneck where accepted stalled at 11k-13k in the load test is in this lay
 The control plane uses `HealthSignalState` in the Aurora/SQLite/in-memory Store to keep
 `active_since/notified`. A finding is created only when the abnormality persists for the configured duration; a persistent abnormality notifies only once,
 and after returning to normal the active state is cleared and the signal is re-armed. Aurora uses an advisory transaction lock to prevent
-the three API replicas from sending duplicate emails.
+the three API replicas from sending duplicate emails. A batch claim (and the remediation-budget scopes of a workflow claim) takes
+the locks of all its keys in one statement ordered `COLLATE "C"` (byte order: the order of Python `sorted()` and of older
+pods' per-key loops), so two batches with overlapping keys cannot deadlock and no key costs its own database round trip
+(`tests/store/test_postgres_advisory_lock_batches.py`).
 
 Low CPU/GPU utilization is timed only when the control plane can resolve exactly one real managed attempt for that node (PENDING/RUNNING in the attempt
 observation, and still having non-terminated containers on this node); the collector's

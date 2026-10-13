@@ -8,6 +8,7 @@ from gpu_fault.policy import (
     XidCorrelationRecord,
     XidEvent,
 )
+from gpu_fault.store.postgres.core import take_advisory_xact_locks
 from gpu_fault.store.shared.health_signals import (
     latched_health_signal_state,
     sample_disposition,
@@ -274,18 +275,13 @@ class PostgresXidMixin:
         # emitted, or the slower one overwrote the fresher state. The advisory
         # locks are the ones ``mark_health_signal_notified`` takes through
         # ``_state_transaction`` (same key text), taken in sorted order so two
-        # batches sharing keys cannot deadlock.
+        # batches sharing keys cannot deadlock - all of them in one statement,
+        # not one round trip per key inside the batch transaction.
         with self._db.transaction():
             with self._db.cursor() as cursor:
-                for signal_key in sorted(unique_keys):
-                    cursor.execute(
-                        """
-                        SELECT pg_advisory_xact_lock(
-                            hashtextextended(%s, 0)
-                        )
-                        """,
-                        (f"health_signal_state/{signal_key}",),
-                    )
+                take_advisory_xact_locks(
+                    cursor, (f"health_signal_state/{key}" for key in unique_keys)
+                )
                 cursor.execute(
                     """
                     SELECT key, payload

@@ -12,6 +12,7 @@ from gpu_fault.models import (
     datetime_json_text,
 )
 from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
+from gpu_fault.store.postgres.core import take_advisory_xact_locks
 from gpu_fault.store.postgres.state_table_storage import (
     get_state_payload,
     put_state_fields,
@@ -627,15 +628,9 @@ class PostgresWorkflowMixin:
                 # then the workflow row; taking the row first here made the
                 # two families a deadlock pair.
                 with self._db.cursor() as cursor:
-                    for scope in scopes:
-                        cursor.execute(
-                            """
-                            SELECT pg_advisory_xact_lock(
-                                hashtextextended(%s, 0)
-                            )
-                            """,
-                            (f"remediation_budget/{scope}",),
-                        )
+                    take_advisory_xact_locks(
+                        cursor, (f"remediation_budget/{scope}" for scope in scopes)
+                    )
             workflow = self._get_for_update("workflow", request_id)
             if workflow.fencing_token != fencing_token:
                 raise StaleFencingTokenError("stale workflow fencing token")
@@ -728,11 +723,9 @@ class PostgresWorkflowMixin:
         with self._db.transaction():
             # Lock order rule (F-B2): advisory locks first, sorted, then rows.
             with self._db.cursor() as cursor:
-                for scope in scopes:
-                    cursor.execute(
-                        "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
-                        (f"remediation_budget/{scope}",),
-                    )
+                take_advisory_xact_locks(
+                    cursor, (f"remediation_budget/{scope}" for scope in scopes)
+                )
             workflow = self._get_for_update("workflow", request_id)
             at = now or datetime.now(timezone.utc)
             if (

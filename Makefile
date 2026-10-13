@@ -161,6 +161,7 @@ POSTGRES_TESTS = \
 	tests/store/test_orphan_workflow_inspection.py \
 	tests/store/test_postgres_activation_inhibition.py \
 	tests/store/test_postgres_admission_vs_claim.py \
+	tests/store/test_postgres_advisory_lock_batches.py \
 	tests/store/test_postgres_claim_planner_discipline.py \
 	tests/store/test_postgres_claim_progress.py \
 	tests/store/test_postgres_claim_scope_indexes.py \
