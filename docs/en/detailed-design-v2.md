@@ -514,11 +514,19 @@ A few points that must be remembered:
   (default 300 s, `GPU_FAULT_COMPLETION_ATTEMPT_MISSING_GRACE_SECONDS`, unrelated to
   `cleanup_timeout_seconds`), refreshing only
   `observed_at` — during the gap in which the controller recreates Pods the control plane still attributes the attempt to that node — and publishes the `STOPPED` tombstone
-  when the grace period expires. But every round with missing Pods reads the owner object once
+  when the grace period expires. But the first round with missing Pods reads the owner objects once
   (Job/PyTorchJob/JobSet, the read has an upper time bound, and the same snapshot also serves tombstone attribution):
   when all return 404/410 the tombstone is published immediately without waiting for the grace period, because a deleted job will not recreate Pods,
   and continuing to re-send would only let a subsequent host fault compile the already-dead attempt into `STOP_WORKLOADS`; the ownership guard, on reading
-  404, refuses with `STOP_OWNERSHIP_IDENTITY_UNKNOWN` and escalates the node isolation; an owner read failure that is
+  404, refuses with `STOP_OWNERSHIP_IDENTITY_UNKNOWN` and escalates the node isolation. When all are still present, suspended
+  (Job/JobSet `spec.suspend`, PyTorchJob `spec.runPolicy.suspend`), carry `gpu-fault.io/termination-initiator-incident-id` and still
+  carry the `STOP_WORKLOADS` step key in `gpu-fault.io/operation-id`, the tombstone is likewise published in that round, with its
+  initiator, and logged once at INFO: this is the product's own stop and a suspended object recreates no Pods; re-sending would make the
+  stopped source attempt and the successor that `RESTART_WORKLOAD` starts on the same node both count as fresh owners, every
+  product-driven restart would fire `GpuFaultExclusiveNodeOwnershipInvariantViolation`, and fault events on that node would be
+  attributed to no job. A suspend without the product's annotation (user/Kueue), a successor whose `operation-id` the restart
+  rewrote (the restart copies the initiator annotation into the successor), and a partially unreadable or partially deleted object
+  set all keep the grace period; Pods recreated by a later un-suspend still withdraw the tombstone (F2). An owner read failure that is
   not 404/410 (RBAC, timeout, no client) is still handled by the grace period, fail-closed. The tombstone does not forge a
   container exit code; the terminal event continues to use the allocation the Watcher has accumulated.
   A non-zero exit while the Pod carries `metadata.deletionTimestamp` is likewise read as STOPPED (`deletion_requested`):

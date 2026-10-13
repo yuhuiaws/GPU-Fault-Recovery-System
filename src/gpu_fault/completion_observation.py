@@ -6,10 +6,17 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, cast
 
+from gpu_fault.models import WorkflowOperation
 from gpu_fault.watcher import AttemptObservation, ContainerObservation, WorkloadPhase
 
 LOGGER = logging.getLogger(__name__)
 TERMINATION_INCIDENT_ANNOTATION = "gpu-fault.io/termination-initiator-incident-id"
+# STOP_WORKLOADS stamps its step key ``<workflow>/<index>/STOP_WORKLOADS`` here
+# in the same patch as the suspend and the initiator annotation. A restart
+# overwrites the key but copies the initiator annotation into the successor,
+# so only the key tells our standing stop from a later suspend by anyone else.
+OPERATION_ANNOTATION = "gpu-fault.io/operation-id"
+_STOP_OPERATION_SUFFIX = f"/{WorkflowOperation.STOP_WORKLOADS.value}"
 _CUSTOM_WORKLOADS: dict[str, tuple[str, str, str]] = {
     "pytorchjob": ("kubeflow.org", "v1", "pytorchjobs"),
     "jobset": ("jobset.x-k8s.io", "v1alpha2", "jobsets"),
@@ -95,6 +102,48 @@ def workload_objects_initiator(objects: list[dict[str, Any]]) -> str | None:
         if initiator:
             return str(initiator)
     return None
+
+
+def _workload_suspended(data: dict[str, Any]) -> bool:
+    """``spec.suspend`` (Job, JobSet) or ``spec.runPolicy.suspend`` (PyTorchJob)."""
+
+    spec = data.get("spec")
+    if not isinstance(spec, dict):
+        return False
+    run_policy = spec.get("runPolicy") or spec.get("run_policy")
+    return spec.get("suspend") is True or (
+        isinstance(run_policy, dict) and run_policy.get("suspend") is True
+    )
+
+
+def workload_objects_stopped_by_us(
+    objects: list[dict[str, Any]], workload_ids: list[str]
+) -> str | None:
+    """The initiator incident when our own stop still holds every workload object.
+
+    STOP_WORKLOADS writes the initiator annotation, its step key and the
+    suspend in one patch and deletes the Pods only afterwards, and nothing
+    recreates the Pods of a suspended object, so the missing-Pod grace has
+    nothing to wait for. That holds only for the whole attempt: every object
+    read (a partial set may still own Pods), suspended, annotated, and last
+    written by a STOP_WORKLOADS step. A suspend without our annotation is a
+    user or Kueue suspend that comes back by itself (F2); so is a suspend of a
+    restarted object, which inherits the annotation but carries the restart's
+    key. Anything else is ``None`` and keeps the grace.
+    """
+
+    if not workload_ids or len(objects) != len(workload_ids):
+        return None
+    for data in objects:
+        annotations = (data.get("metadata") or {}).get("annotations") or {}
+        operation = str(annotations.get(OPERATION_ANNOTATION) or "")
+        if (
+            not annotations.get(TERMINATION_INCIDENT_ANNOTATION)
+            or not operation.endswith(_STOP_OPERATION_SUFFIX)
+            or not _workload_suspended(data)
+        ):
+            return None
+    return workload_objects_initiator(objects)
 
 
 def read_workload_object(controller: Any, workload_id: str) -> dict[str, Any] | None:
@@ -543,17 +592,22 @@ def reconcile_attempt_observation(
             previous.model_copy(update={"observed_at": observed_at}),
         )
     # The first pass that finds the Pods gone reads the workload objects once
-    # (bounded): owners the API server reports gone (404/410) end the grace on
-    # this very pass -- see ``tombstone_now``. Later passes inside the grace do
-    # not read again; the tombstone resolution at the end of the grace takes its
-    # own fresh read, so its two questions still come from one snapshot (C1).
+    # (bounded) and ends the grace on this very pass when nothing can recreate
+    # the Pods: owners the API server reports gone (404/410) -- see
+    # ``tombstone_now`` -- or owners our own stop suspended, see
+    # ``workload_objects_stopped_by_us``. Later passes inside the grace do not
+    # read again; the tombstone resolution at the end of the grace takes its own
+    # fresh read, so its two questions still come from one snapshot (C1).
     objects: list[dict[str, Any]] | None = None
     absent = False
+    stopped_by: str | None = None
     if attempt_id not in controller._missing_attempts.since:
         objects, absent = read_workload_objects_or_absence(
             controller, previous.workload_ids
         )
+        stopped_by = workload_objects_stopped_by_us(objects, previous.workload_ids)
         controller.note_progress()
+    early = absent or stopped_by is not None
     if absent:
         LOGGER.info(
             "attempt %s has no Pods left and its workload object(s) %s are "
@@ -561,6 +615,16 @@ def reconcile_attempt_observation(
             attempt_id,
             previous.workload_ids,
         )
+    elif stopped_by is not None:
+        LOGGER.info(
+            "attempt %s has no Pods left and our own stop (incident %s) "
+            "suspended its workload object(s) %s; recording the stop now "
+            "instead of after the missing grace",
+            attempt_id,
+            stopped_by,
+            previous.workload_ids,
+        )
+    if early:
         result = cast(
             AttemptObservation,
             controller._missing_attempts.tombstone_now(
@@ -585,7 +649,7 @@ def reconcile_attempt_observation(
         result,
         observed_at,
         # Only the read of this pass may be reused; a grace-old one may not.
-        objects=objects if absent else None,
+        objects=objects if early else None,
     )
 
 
