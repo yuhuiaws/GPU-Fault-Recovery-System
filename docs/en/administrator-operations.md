@@ -164,6 +164,15 @@ nor does it change `NodeRecovery=None` or the provider replace prohibition.
 - New training submissions have stopped, and active workflows, remote commands and node isolation states satisfy the cleanup gates;
 - The internal site in the `state-dir` contains all currently managed GPU clusters;
 - The executing identity can still reach the CPU/GPU Kubernetes APIs and the AWS resources in the registry.
+- The deploy host's record of the last installation registry sync (`release-deploy/installation-registry-sync.json`, see §4)
+  is a success. The uninstall deletes only what the registry records, so whatever a failed sync left unrecorded would be left
+  behind; when the sync failed, or there is no record, or the record is unreadable, a new uninstall therefore refuses before it
+  writes `uninstall/state.json`, naming the time, the reason and the remedy: `gpu-fault-admin deploy --state-dir ...` (a NOOP
+  deploy too retries the sync while the record is not a success) or the next `config` re-roll, then rerun. When deleting only
+  what the registry records is really intended, add `--accept-unsynchronized-registry`: the flag and the recorded sync outcome
+  (with its failure) are written into `installation_registry_sync` of `uninstall/state.json` and the field of the same name in
+  the command output. A refusal leaves no journal, so `deploy` is not blocked by "uninstall in progress"; a resume of an
+  uninstall already started keeps the verdict it started on and is not judged again.
 
 **Scope of impact**
 
@@ -408,6 +417,25 @@ Synchronisation of the installation resource registry is also no longer on the c
 it is performed by the release driver after the release commit, and a failure is recorded only as
 `installation_registry.status=UNAVAILABLE` in `state.json` and one `completion_warnings` entry; the release itself is still
 `COMPLETED`.
+Every sync outcome is also kept durably on the deploy host in `<state-dir>/release-deploy/installation-registry-sync.json`
+(the same content as `installation_registry` in that attempt's `release-deploy/<release_id>/state.json`, plus `release_id`): a
+success records `status=SYNCED`, the snapshot path and its `sha256`, and `synced_at`; a failure records `status=UNAVAILABLE`,
+`error` and `synced_at`. Only a sync that actually ran rewrites it. The NOOP fast path skips the sync and keeps the record while
+it is a success of the live release the attempt started from (or of this release); when it staged a new release id it only
+appends that id to `noop_release_ids`. A missing, unreadable or failed record, or a success of an older release, is retried
+instead, so "deploy again" is always a remedy. A record that cannot be written is removed (it then reads as missing) and a
+completion warning says so.
+
+`gpu-fault-admin status` outputs the record as the JSON field `installation_registry_sync` (`status`, `release_id`,
+`synced_at`, `error`, `live_release_id`, `deletion_verbs_refused`, `finding`), leaving every engine field unchanged; when it is
+not a success of the release the site runs (`configured_release`, after a rollback the release rolled back to; `live_release`
+when absent), the header gains one more `finding:` line with the time, the reason and the remedy (the next `deploy` or `config`
+re-roll synchronises again). It is a finding, not a failing check: `healthy` and the exit code are unchanged. `healthy` is the
+release's runtime verdict, and the deploy reads `status` as its first step to prove a NOOP or supersede a failed transaction;
+judging "the description of what was installed is stale" unhealthy would make the very deploy that repairs it refuse, and an
+ordinary NOOP deploy look unhealthy. The risk lies only with the two deletion verbs, which fail closed on their own (§3
+uninstall, §5 `remove-cluster`): `deletion_verbs_refused=true` when the record is `UNAVAILABLE`, missing or unreadable; a success
+that is only of an older release (for example an interrupted completion step) is reported as a finding without a refusal.
 
 If the command stops because of a Runtime Profile policy change, the stop message has already printed
 the review fields of `<state-dir>/release-deploy/profile-plan.json`, the real `plan_sha256` and the resume
@@ -1525,6 +1553,19 @@ gpu-fault-admin remove-cluster \
 ARN); the command maps it to the internal cluster id in the site itself, and the administrator need not know that id. When the ARN
 is not a current member, only a persistent record exactly matching the same removal attempt whose site commit has started allows resume;
 other cases refuse, without guessing the target by name or ARN suffix.
+
+`remove-cluster` shares the registry sync gate of `uninstall` (§4): a new removal attempt checks the deploy host's record before it
+creates the `remove-cluster/<cluster-id>/` journal, and refuses with the time, the reason and the remedy when the sync failed, there
+is no record or the record is unreadable, or proceeds with `--accept-unsynchronized-registry` (the verdict, the flag and the
+recorded outcome go into the journal and the command output's `installation_registry_sync`). It has its own gate because its
+deletion list can be stale: the list comes from the removed cluster's rows in the Aurora registry exported at the start
+(`aws/iam/executor/<id>/…`, `aws/iam/adot-writer/<id>/…`, `cluster/<id>/…` and the VPC association), and the resources the
+bootstrap tasks of `deploy` create per cluster (the ADOT writer role, for example) reach the registry only through the full
+rebuild of the release completion step; its own Aurora update only merges this removal's statuses onto freshly read rows and never
+adds a missing one; and the removal commit drops the cluster's roles from `bootstrap-state.json`. A resource a failed sync left
+unrecorded is therefore neither deleted nor findable afterwards. The verdict is taken before the journal exists because the
+journal binds the site digest and the remedial `deploy` rewrites the site; a resume of an attempt already started keeps the
+verdict it started on, and removing a re-joined cluster is a new attempt, judged again.
 
 The command completes the stop of the target GPU cluster's data sources, the queue drain and the node systemd uninstall via the state machine.
 join/remove use the same site transaction lock. Disassociating an exclusive Route53 VPC association saves the ChangeInfo, waits for

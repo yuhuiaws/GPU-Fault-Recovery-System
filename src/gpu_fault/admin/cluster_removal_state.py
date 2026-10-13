@@ -19,6 +19,7 @@ from gpu_fault.cluster_scope import is_eks_managed
 from gpu_fault.admin.bootstrap_common import BootstrapError, safe_name
 from gpu_fault import installation_lifecycle
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost
+from gpu_fault.admin.resource_registry_outcome import FIELD, deletion_gate
 from gpu_fault.admin.site import IDENTIFIER_PATTERN, RenderedSite
 
 SCHEMA_VERSION = 2
@@ -250,7 +251,19 @@ def validate_saved_site(
 def load_removal_state(
     site: RenderedSite,
     cluster_id: str,
+    *,
+    accept: bool = False,
 ) -> tuple[Path, Path, dict[str, Any]]:
+    """Resume the cluster's removal attempt, or start a new one.
+
+    A new attempt is judged on the last installation registry sync first
+    (``resource_registry_outcome.deletion_gate``; ``accept`` is
+    ``--accept-unsynchronized-registry``): its registry export fixes the
+    deletion list, and once its journal exists a ``deploy`` -- the remedy --
+    would rewrite the site the journal binds. The verdict is journaled with the
+    attempt; a resume keeps it.
+    """
+
     if not IDENTIFIER_PATTERN.fullmatch(cluster_id):
         raise BootstrapError("remove-cluster cluster identity is invalid")
     root = site.source.parent / "remove-cluster" / safe_name(cluster_id)
@@ -278,6 +291,7 @@ def load_removal_state(
             write_json_atomic(archive, value)
     if len(matches) != 1:
         raise BootstrapError(f"unknown cluster_id: {cluster_id}")
+    gate = deletion_gate(site.source.parent, verb="remove-cluster", accept=accept)
     before, after = site_documents(site, cluster_id)
     release_before, release_after = release_documents(site, cluster_id)
     value = {
@@ -294,6 +308,7 @@ def load_removal_state(
         "phase": "STARTED",
         "completed_steps": [],
         "evidence": {},
+        FIELD: gate,
         "updated_at": datetime.now(timezone.utc).isoformat(),
     }
     directory = root / "attempts" / value["attempt_id"]
@@ -375,4 +390,5 @@ def removal_result(
         "cpu_control_plane": "PRESERVED",
         "gpu_cluster": "PRESERVED",
         "ownership_label": ownership_release_summary(state),
+        FIELD: state.get(FIELD),
     }

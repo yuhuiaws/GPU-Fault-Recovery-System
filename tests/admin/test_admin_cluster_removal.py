@@ -37,6 +37,7 @@ from gpu_fault.installation_resources import (
 from tests.admin._cluster_removal_support import RemovalScenario
 from tests.admin._cluster_removal_support import resource as _resource
 from tests.admin._cluster_removal_support import snapshot as _base_snapshot
+from tests.admin._registry_sync_support import record_registry_sync
 from tests.admin.test_admin_site import site_file
 
 
@@ -507,6 +508,7 @@ def _install_removal_harness(monkeypatch, calls: list) -> None:
 
 def test_remove_cluster_is_resumable_after_site_update(tmp_path, monkeypatch) -> None:
     path = site_file(tmp_path)
+    record_registry_sync(tmp_path)
     site = load_site(path)
     calls = []
     _install_removal_harness(monkeypatch, calls)
@@ -844,6 +846,7 @@ def test_a_completed_removal_does_not_shadow_a_cluster_that_joined_again(
     cluster the site manages again is history; the removal starts over."""
 
     path = site_file(tmp_path)
+    record_registry_sync(tmp_path)
     original = path.read_bytes()
     calls = []
     _install_removal_harness(monkeypatch, calls)

@@ -2189,6 +2189,13 @@ Failure behaviour:
   baseline changes, the old approval is archived and invalidated;
 - release summary failure: keep `COMPLETED` and the verify evidence already checked in, and also write
   `release_summary.status=UNAVAILABLE` and `completion_warnings`;
+- installation registry sync failure: likewise keep `COMPLETED`, write `installation_registry.status=UNAVAILABLE` and
+  `completion_warnings`, and keep every sync outcome durably in `release-deploy/installation-registry-sync.json` (a success with
+  the snapshot `sha256`, a failure with its reason, both with time and `release_id`; an outcome that cannot be written removes
+  the older record). The NOOP fast path skips the sync only while that record is a success of the live release it started from,
+  and retries it otherwise; `status` reports anything but a success as a finding (`healthy` unchanged), and
+  `uninstall`/`remove-cluster` refuse a new attempt before its journal exists unless `--accept-unsynchronized-registry`
+  is given, which is journaled (`admin/resource_registry_outcome.py`);
 - after the fix, rerun the same `make release-deploy`. A transaction that is `failed` or interrupted at an upgrade checkpoint
   may only be resumed by the same release from the persisted checkpoint; `rolled-back` is a verified terminal state, and later candidates reuse
   the conservative diff set but open a new transaction from the current live baseline, not treating the old release ID as a resume target.

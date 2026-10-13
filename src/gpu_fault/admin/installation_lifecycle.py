@@ -81,7 +81,18 @@ def installation_for_uninstall(site: RenderedSite) -> str:
     return _require_installation(value)
 
 
-def uninstall_state(request: UninstallRequest, path: Path) -> dict[str, Any]:
+def uninstall_state(
+    request: UninstallRequest,
+    path: Path,
+    *,
+    initial: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    """The uninstall journal: resumed when it exists, else created.
+
+    ``initial`` joins a new journal in the same write (the registry sync
+    verdict the attempt started on); a resumed journal keeps what it has.
+    """
+
     from gpu_fault.admin.bootstrap_common import safe_name
 
     if not path.exists() and path.parent.exists() and any(path.parent.iterdir()):
@@ -120,6 +131,7 @@ def uninstall_state(request: UninstallRequest, path: Path) -> dict[str, Any]:
         ),
         "phase": "STARTED",
         "updated_at": datetime.now(UTC).isoformat(),
+        **(initial or {}),
     }
     write_record(path, value)
     return value

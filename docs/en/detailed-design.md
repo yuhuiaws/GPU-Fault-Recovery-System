@@ -3136,7 +3136,10 @@ bootstrap state, the live NLB/network objects and the
 ownership tags and syncs it to Aurora. The rebuild defers to the rows Aurora already records: numbered rows (public subnets,
 route tables and their associations, NLB listeners/target groups) keep their number by physical resource ID, a nullable ARN only
 one side knows keeps the recorded value, and a rebuild that would still change a recorded identity is refused before any write,
-naming the keys and fields. Before an uninstall begins, pending items are first set to
+naming the keys and fields. The outcome of every rebuild (a success with the snapshot digest, a failure with its reason, both
+timed) is kept durably on the deploy host in `release-deploy/installation-registry-sync.json`: `status` reports anything but a
+success as a finding, and `uninstall` and `remove-cluster` refuse to start a new attempt while it is not a success (an explicit
+`--accept-unsynchronized-registry` proceeds and is journaled). Before an uninstall begins, pending items are first set to
 `DELETE_PENDING` and an external snapshot with SHA-256 is exported; Aurora may be deleted only after verification of the
 non-Aurora resources has finished, and the final snapshot may contain only `DELETED/DETACHED/PRESERVED`. Resource
 dependencies determine the deletion order, and it fails closed whenever ownership is unclear, the live state conflicts
@@ -3146,7 +3149,8 @@ Unit and integration tests cover model validation, identity immutability, the th
 authentication, deploy/takeover sync, cluster removal and full-site uninstall resumption, mainly in
 `tests/store/test_installation_resources.py`, `tests/regional/test_api.py` and
 `tests/admin/test_admin_*` (the convergence of a deploy rebuild with the recorded rows is in
-`tests/admin/test_admin_resource_registry_rebuild.py`).
+`tests/admin/test_admin_resource_registry_rebuild.py`, the sync outcome record and the deletion-verb gate in
+`tests/admin/test_resource_registry_outcome.py` and `tests/admin/test_deletion_verbs_registry_sync_gate.py`).
 
 ### 2.23 Administrator CLI and deployment assets `src/gpu_fault/admin/`
 

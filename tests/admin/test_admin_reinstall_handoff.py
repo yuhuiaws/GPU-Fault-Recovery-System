@@ -18,6 +18,7 @@ from gpu_fault.schema_migrations import LATEST_POSTGRES_SCHEMA_VERSION
 from gpu_fault_release import regional_release_prerequisite_repair as repair
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_retained_database import RETAINED_ORIGIN_KEY
+from tests.admin._registry_sync_support import record_registry_sync
 from tests.admin.test_uninstall_lifecycle import STATE, Harness, registry
 from tests.regional._prerequisite_repair_support import repair_release
 
@@ -254,6 +255,9 @@ def test_two_complete_uninstall_cycles_export_fresh_registry_and_namespace_uids(
     harness.snapshot = fresh.model_copy(update={"source_sha256": fresh.digest()})
     harness.existing = {item.resource_key for item in harness.snapshot.resources}
     harness.namespace_uid = "namespace-second"
+    # The retirement took release-deploy/ along; the reinstall's deploy records
+    # its registry sync again.
+    record_registry_sync(tmp_path)
     lifecycle.uninstall(harness.request(), runner=harness)
     second = harness.state()
     second_cleanup = STATE.read_state(tmp_path / "uninstall/kubernetes-cleanup.json")

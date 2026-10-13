@@ -112,7 +112,9 @@ def test_two_cycles_with_recreated_aws_ids_preserve_prior_generation_rows(
     assert harness.site.metadata_name == legacy_scope
     assert ":installation:" in second_scope
     # This is the real post-commit builder/sync entry point, not a warning stub.
-    release_record, warning = installation_resource_registry_record(harness.site)
+    release_record, warning = installation_resource_registry_record(
+        harness.site, release_id="release-a"
+    )
     assert release_record["status"] == "SYNCED" and warning is None
     built = registry.fetch_installation_resource_registry(harness.site)
     nlb = next(item for item in built.resources if item.resource_type == "nlb")
@@ -171,7 +173,9 @@ def test_two_cycles_with_recreated_aws_ids_preserve_prior_generation_rows(
     assert third_scope not in {legacy_scope, second_scope}
     runtime["nlb"]["arn"] = runtime["nlb"]["arn"].removesuffix("/old") + "/new"
     runtime["nlb"]["dns_name"] = "new.elb.example"
-    release_record, warning = installation_resource_registry_record(harness.site)
+    release_record, warning = installation_resource_registry_record(
+        harness.site, release_id="release-a"
+    )
     assert release_record["status"] == "SYNCED" and warning is None
     assert store.list_installation_resources(legacy_scope) == first_rows
     assert store.list_installation_resources(second_scope) == second_rows

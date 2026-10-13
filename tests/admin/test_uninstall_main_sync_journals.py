@@ -15,6 +15,7 @@ from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.deploy_command import retire_site_after_uninstall
 from gpu_fault.admin.site import load_site
 from gpu_fault.admin.uninstall import uninstall
+from tests.admin._registry_sync_support import record_registry_sync
 from tests.admin.test_uninstall_lifecycle import STATE, Harness, registry
 
 
@@ -95,6 +96,9 @@ def test_reset_reinstall_retires_the_whole_journal_before_fresh_cleanup(
     harness.existing = {item.resource_key for item in harness.snapshot.resources}
     harness.namespace_uid = "namespace-new-installation"
     request = replace(harness.request(reset=True), final_snapshot_policy=policy)
+    # The retirement took release-deploy/ along; the reinstall's deploy records
+    # its registry sync again.
+    record_registry_sync(tmp_path)
 
     result = uninstall(request, runner=harness)
 

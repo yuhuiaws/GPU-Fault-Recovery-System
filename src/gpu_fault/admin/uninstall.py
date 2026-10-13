@@ -41,6 +41,7 @@ from gpu_fault.admin.resource_registry import (
     sync_installation_resource_snapshot_direct,
     write_installation_resource_snapshot,
 )
+from gpu_fault.admin.resource_registry_outcome import FIELD, deletion_gate
 from gpu_fault.admin.site import RenderedSite, materialized_release_config
 from gpu_fault.admin.uninstall_ownership import (
     ownership_summary as _ownership_summary,
@@ -1252,6 +1253,7 @@ def _finish_uninstall(
         "registry_entries_preserved": preserved,
         "delete_policy_residuals": 0,
         "final_registry": str(final_path),
+        FIELD: state.get(FIELD),
         **kubernetes_result,
     }
 
@@ -1359,10 +1361,20 @@ def _uninstall_locked(
         raise BootstrapError(f"uninstall requires --confirm {required}")
     active_runner = runner or CommandRunner()
     state_dir = request.site.source.parent / "uninstall"
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     state_path = state_dir / "state.json"
     resumed = state_path.is_file()
-    state = _uninstall_state(request, state_path)
+    # A new attempt is judged before its journal exists: an open journal makes
+    # the remedy (`deploy`) refuse. A resume keeps the verdict it started on.
+    gate = None
+    if not resumed:
+        gate = deletion_gate(
+            request.site.source.parent,
+            verb="uninstall",
+            accept=request.accept_unsynchronized_registry,
+        )
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    initial = None if gate is None else {FIELD: gate}
+    state = _uninstall_state(request, state_path, initial=initial)
     record_repository_root_override(request, state_path, state, resumed=resumed)
     if _reached(state, "REGISTRY_EXPORTED") and not all(
         (state_dir / name).is_file()

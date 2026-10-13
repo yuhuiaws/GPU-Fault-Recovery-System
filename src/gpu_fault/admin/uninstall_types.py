@@ -51,6 +51,10 @@ class UninstallRequest:
     #: ``retained`` on every GPU cluster instead of releasing it. Not part of
     #: the journal identity: a resume stuck at that phase may add it.
     keep_ownership_label: bool = False
+    #: ``--accept-unsynchronized-registry``: a new uninstall may start although
+    #: the last installation registry sync is not a recorded success
+    #: (``resource_registry_outcome.deletion_gate``); journaled, not identity.
+    accept_unsynchronized_registry: bool = False
 
     @classmethod
     def from_arguments(cls, site: RenderedSite, arguments: Any) -> UninstallRequest:
@@ -72,6 +76,9 @@ class UninstallRequest:
             keep_ownership_label=bool(
                 getattr(arguments, "keep_ownership_label", False)
             ),
+            accept_unsynchronized_registry=bool(
+                getattr(arguments, "accept_unsynchronized_registry", False)
+            ),
         )
 
     def __post_init__(self) -> None:
@@ -79,6 +86,8 @@ class UninstallRequest:
             raise BootstrapError("repository_root_override must be a boolean")
         if not isinstance(self.keep_ownership_label, bool):
             raise BootstrapError("keep_ownership_label must be a boolean")
+        if not isinstance(self.accept_unsynchronized_registry, bool):
+            raise BootstrapError("accept_unsynchronized_registry must be a boolean")
         if self.cpu_disposition not in {"keep", "delete"}:
             raise BootstrapError("invalid CPU cluster disposition")
         if self.final_snapshot_policy not in {"retain", "skip"}:

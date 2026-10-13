@@ -17,11 +17,7 @@ from gpu_fault.admin import cluster_removal_kubernetes as kubernetes_cleanup
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.aws_cleanup import ResourceCleaner
 from gpu_fault.cluster_scope import is_eks_managed, node_selector, selector_matches
-from gpu_fault.admin.bootstrap_common import (
-    Arn,
-    BootstrapError,
-    CommandRunner,
-)
+from gpu_fault.admin.bootstrap_common import Arn, BootstrapError, CommandRunner
 from gpu_fault.admin.cluster_join_evidence import membership_runtime_snapshot
 from gpu_fault.admin.cluster_kubeconfig import (
     kubeconfig_released,
@@ -127,6 +123,9 @@ class RemoveClusterRequest:
     #: ``--keep-ownership-label``: record the label as ``retained`` in the last
     #: step; not journal identity, so a resume stuck at that step may add it.
     keep_ownership_label: bool = False
+    #: ``--accept-unsynchronized-registry``: a new attempt may start although the
+    #: last registry sync is no recorded success; journaled, not identity.
+    accept_unsynchronized_registry: bool = False
 
 
 def _target(
@@ -214,10 +213,10 @@ def resolve_removal_cluster_id(
         return saved
 
 
-def _state(
-    request: RemoveClusterRequest,
-) -> tuple[Path, Path, dict[str, Any]]:
-    return load_removal_state(request.site, request.cluster_id)
+def _state(request: RemoveClusterRequest) -> tuple[Path, Path, dict[str, Any]]:
+    return load_removal_state(
+        request.site, request.cluster_id, accept=request.accept_unsynchronized_registry
+    )
 
 
 def _cpu_kubectl(site: RenderedSite) -> list[str]:

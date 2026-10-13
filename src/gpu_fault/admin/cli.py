@@ -158,6 +158,7 @@ from gpu_fault.admin.site import (
 )
 from gpu_fault.admin.source_deploy import run_source_deploy
 from gpu_fault.admin.ownership_release import add_keep_label_flag
+from gpu_fault.admin.resource_registry_outcome import add_accept_flag
 from gpu_fault.admin.status_report import (
     print_status_report as print_status_report,
     status_document as status_document,
@@ -606,6 +607,7 @@ def parser() -> argparse.ArgumentParser:
         help="must be REMOVE_GPU_CLUSTER",
     )
     add_keep_label_flag(detach, scope="the node groups the site selected")
+    add_accept_flag(detach, verb="remove-cluster")
     remove = commands.add_parser(
         "uninstall",
         usage=(
@@ -659,6 +661,7 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     add_keep_label_flag(remove, scope="every GPU cluster's node groups")
+    add_accept_flag(remove, verb="uninstall")
     return result
 
 
@@ -686,6 +689,9 @@ def _run_remove_cluster(arguments: argparse.Namespace) -> int:
             confirmation=arguments.confirm,
             gpu_cluster_arn=arguments.gpu_cluster_arn,
             keep_ownership_label=bool(arguments.keep_ownership_label),
+            accept_unsynchronized_registry=bool(
+                arguments.accept_unsynchronized_registry
+            ),
         )
     )
     print(json.dumps(result, indent=2, sort_keys=True))
@@ -913,7 +919,7 @@ def _run_readonly_managed_command(
                 text=is_status,
             )
         if is_status:
-            print_status_report(completed.stdout, site=site)
+            print_status_report(completed.stdout, site=site, site_file=site_file)
         return completed.returncode
 
 

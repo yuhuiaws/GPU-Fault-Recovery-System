@@ -20,6 +20,7 @@ from gpu_fault.installation_resources import (
     InstallationResourceOwnership,
     InstallationResourceSnapshot,
 )
+from tests.admin._registry_sync_support import record_registry_sync
 from tests.admin.test_admin_site import site_file
 
 EKS_ARN = "arn:aws:eks:us-east-1:123456789012:cluster/gpu-a"
@@ -106,6 +107,7 @@ def snapshot() -> InstallationResourceSnapshot:
 class RemovalScenario:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         self.path = site_file(tmp_path)
+        record_registry_sync(self.path.parent)
         self.original = self.path.read_bytes()
         self.calls: list[str] = []
         self.failure: str | None = None

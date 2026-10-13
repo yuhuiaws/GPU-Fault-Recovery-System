@@ -563,7 +563,10 @@ def test_status_reports_when_previous_rollback_baseline_is_unlocatable(
     )
     output = capsys.readouterr()
     assert "could not materialise the rolled-back baseline" in output.err
-    assert json.loads(output.out) == report
+    document = json.loads(output.out)
+    # The deploy host's registry sync record rides along; no deploy left one here.
+    assert document.pop("installation_registry_sync")["status"] == "MISSING"
+    assert document == report
 
 
 def test_console_script_is_published() -> None:

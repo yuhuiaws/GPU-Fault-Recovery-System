@@ -17,6 +17,8 @@ from pathlib import Path
 import pytest
 
 from gpu_fault.admin import cli as admin_cli
+from gpu_fault.admin.resource_registry_outcome import status_view
+from tests.admin._registry_sync_support import record_registry_sync
 from tests.admin.test_admin_site import site_file
 
 
@@ -89,6 +91,7 @@ def test_status_prints_a_header_on_stderr_and_the_json_unchanged_on_stdout(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys
 ) -> None:
     site_file(tmp_path)
+    record_registry_sync(tmp_path, release_id="release-a")
     document = json.dumps(_status_report(), indent=2, sort_keys=True) + "\n"
     calls: list[list[str]] = []
 
@@ -112,7 +115,14 @@ def test_status_prints_a_header_on_stderr_and_the_json_unchanged_on_stdout(
     assert admin_cli.run(arguments) == 0
 
     captured = capsys.readouterr()
-    assert captured.out == document, "consumers parse stdout byte for byte"
+    # Every engine field keeps its bytes; the deploy host adds its registry sync
+    # record as one more top-level field (a success here: no finding line).
+    expected = {
+        **_status_report(),
+        "installation_registry_sync": status_view(tmp_path, release_id="release-a"),
+    }
+    assert captured.out == json.dumps(expected, indent=2, sort_keys=True) + "\n"
+    assert expected["installation_registry_sync"]["finding"] is None
     header = [
         line for line in captured.err.splitlines() if "gpu-fault-admin status:" in line
     ]

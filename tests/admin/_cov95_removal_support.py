@@ -17,6 +17,7 @@ from gpu_fault.installation_resources import InstallationResourceDeletePolicy as
 from gpu_fault.installation_resources import InstallationResourceOwnership as Ownership
 from gpu_fault.installation_resources import InstallationResourceSnapshot
 from tests.admin._aws_cleanup_support import ACCOUNT, REGION, TAGS, resource
+from tests.admin._registry_sync_support import record_registry_sync
 from tests.admin.test_admin_site import site_file
 
 
@@ -27,6 +28,7 @@ class RemovalTransport(CommandRunner):
         super().__init__()
         self.directory = directory
         self.path = site_file(directory)
+        record_registry_sync(self.path.parent)
         self.site = load_site(self.path)
         self.gpu = self.site.release_config["clusters"][0]
         self.hyperpod = f"arn:aws:sagemaker:{REGION}:{ACCOUNT}:cluster/hp-gpu-a"

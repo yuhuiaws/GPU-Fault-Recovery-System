@@ -10,12 +10,14 @@ from gpu_fault.admin import cluster_removal_state as state_api
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost
 from gpu_fault.admin.site import load_site
+from tests.admin._registry_sync_support import record_registry_sync
 from tests.admin.test_admin_site import site_file
 
 
 @pytest.fixture
 def context(tmp_path):
     site = load_site(site_file(tmp_path))
+    record_registry_sync(tmp_path)
     directory, path, state = state_api.load_removal_state(site, "gpu-a")
     return site, directory, path, state
 

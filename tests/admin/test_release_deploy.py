@@ -195,11 +195,16 @@ def _site(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     )
     # The completion step records the installed resources; that discovery talks
     # to AWS and the control plane, so every test here starts with it stubbed to
-    # a success and `test_release_deploy_registry_sync.py` re-patches it.
+    # a success (a snapshot whose digest the outcome records) and
+    # `test_release_deploy_registry_sync.py` re-patches it.
+    snapshot = tmp_path / "installation-resources.json"
+
+    def synchronized(_site: object) -> Path:
+        snapshot.write_text('{"resources": []}\n', encoding="utf-8")
+        return snapshot
+
     monkeypatch.setattr(
-        release_deploy_evidence,
-        "sync_installation_resource_registry",
-        lambda _site: tmp_path / "installation-resources.json",
+        release_deploy_evidence, "sync_installation_resource_registry", synchronized
     )
     return site
 

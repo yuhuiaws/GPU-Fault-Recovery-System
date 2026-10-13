@@ -29,6 +29,7 @@ from gpu_fault.installation_resources import InstallationResourceDeletePolicy as
 from gpu_fault.installation_resources import InstallationResourceOwnership as Ownership
 from tests._script_loader import lazy_script_module
 from tests.admin._aws_cleanup_support import Aws, absent
+from tests.admin._registry_sync_support import record_registry_sync
 from tests.admin.test_admin_aws_cleanup_clusters import CpuAws
 from tests.admin.test_admin_site import site_file
 
@@ -81,6 +82,8 @@ class Harness(CommandRunner):
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         super().__init__()
         self.site = load_site(site_file(tmp_path))
+        # The deletion gate wants the record the site's last deploy leaves.
+        record_registry_sync(self.site.source.parent)
         self.snapshot = registry(self.site)
         self.existing = {item.resource_key for item in self.snapshot.resources}
         self.events: list[str] = []

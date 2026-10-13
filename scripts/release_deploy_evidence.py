@@ -16,6 +16,7 @@ unchanged.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import re
@@ -28,6 +29,11 @@ from typing import Any
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.resource_registry import sync_installation_resource_registry
+from gpu_fault.admin.resource_registry_outcome import (
+    RegistrySyncRecordError,
+    record_path,
+    write_outcome,
+)
 from gpu_fault.admin.site import RenderedSite
 
 RELEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -47,6 +53,9 @@ class PreparedRelease:
     profile_approval: str | None
     state_dir: Path
     site_changed: bool
+    #: The live release this attempt started from; the NOOP fast path keeps a
+    #: registry sync record only while it describes this release (or the new one).
+    live_release_id: str | None = None
 
 
 def sha256_file(path: Path) -> str:
@@ -196,9 +205,9 @@ def is_pending_commit_diff(report: dict[str, Any], release_id: str) -> bool:
 
 
 def installation_resource_registry_record(
-    site: RenderedSite,
+    site: RenderedSite, *, release_id: str
 ) -> tuple[dict[str, Any], str | None]:
-    """Synchronize the installed-resource registry and describe the outcome.
+    """Synchronize the installed-resource registry, record and describe the outcome.
 
     For the driver's completion step, whose transaction is already committed:
     the registry is a description of what was installed, so a failure to write it
@@ -206,20 +215,44 @@ def installation_resource_registry_record(
     warning on the release record, not a failed release. The bootstrap path in
     `cluster_join` keeps calling `sync_installation_resource_registry` directly
     and fail-closed, because there the registry is the source the join reads.
-    Returns ``(record, warning)``; ``warning`` is ``None`` on success.
+
+    The warning alone went unread for nine days, so every outcome -- a success
+    with the snapshot digest, or the failure with its reason, both timed -- is
+    also the deploy host's durable record
+    (``<state-dir>/release-deploy/installation-registry-sync.json``, see
+    ``gpu_fault.admin.resource_registry_outcome``): ``status`` reports it, and
+    ``uninstall`` and ``remove-cluster`` refuse to start while it is not a
+    success. A record that cannot be written is removed rather than left to
+    vouch for an older success. Returns ``(record, warning)``; ``warning`` is
+    ``None`` on success.
     """
 
+    warning: str | None = None
     try:
         path = sync_installation_resource_registry(site)
+        record: dict[str, Any] = {
+            "status": "SYNCED",
+            "path": str(path),
+            "sha256": sha256_file(path),
+            "synced_at": utc_now(),
+        }
     except Exception as exc:
         warning = (
             "installation resource registry not synchronized: "
             f"{type(exc).__name__}: {exc}"
         )
-        return {"status": "UNAVAILABLE", "synced_at": utc_now(), "error": warning}, (
-            warning
+        record = {"status": "UNAVAILABLE", "synced_at": utc_now(), "error": warning}
+    try:
+        write_outcome(site.source.parent, release_id=release_id, outcome=record)
+    except (OSError, RegistrySyncRecordError) as exc:
+        with contextlib.suppress(OSError):
+            record_path(site.source.parent).unlink(missing_ok=True)
+        unrecorded = (
+            "installation registry sync outcome not recorded: "
+            f"{type(exc).__name__}: {exc}"
         )
-    return {"status": "SYNCED", "path": str(path), "synced_at": utc_now()}, None
+        warning = unrecorded if warning is None else f"{warning}; {unrecorded}"
+    return record, warning
 
 
 def finalize_quick_validation_evidence(

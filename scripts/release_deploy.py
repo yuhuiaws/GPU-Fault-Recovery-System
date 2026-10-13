@@ -24,6 +24,7 @@ from gpu_fault.admin.profile_approval import (
     profile_approval_lock,
     profile_plan_sha256 as profile_plan_sha256,
 )
+from gpu_fault.admin.resource_registry_outcome import noop_kept_record
 from gpu_fault.admin.rollback_baseline import record_rollback_baseline
 from gpu_fault.admin.site import (
     effective_environment,
@@ -311,6 +312,7 @@ def prepare_site_release(
         profile_approval=profile_plan.approval,
         state_dir=state_dir,
         site_changed=changed,
+        live_release_id=str((live_state or {}).get("release_id") or "") or None,
     )
 
 
@@ -490,7 +492,7 @@ def _complete_release(
 ) -> None:
     completion_warnings: list[str] = []
     installation_registry = _record_installation_registry(
-        site_file,
+        prepared,
         root=root,
         enabled=registry_sync,
         warnings=completion_warnings,
@@ -536,7 +538,7 @@ def _complete_release(
 
 
 def _record_installation_registry(
-    site_file: Path,
+    prepared: PreparedRelease,
     *,
     root: Path,
     enabled: bool,
@@ -546,16 +548,35 @@ def _record_installation_registry(
 
     This used to run inside the admin command's deploy branch, where a failure
     exited 2 and this driver marked a fully applied release FAILED.
+
+    The verified NOOP fast path (``enabled`` false) installed nothing new, so it
+    skips the sync while the deploy host's record is a success for the release
+    it started from, and leaves that record standing. Any other record -- none,
+    unreadable, a failure, a success of an older release -- is retried here:
+    the refusals of ``uninstall``/``remove-cluster`` name the next deploy as the
+    remedy, and a deploy of an unchanged release is a NOOP.
     """
 
     if not enabled:
-        return {
-            "status": "SKIPPED",
-            "reason": "verified NOOP fast path installed nothing new to record",
-        }
+        kept = noop_kept_record(
+            prepared.site_file.parent,
+            release_id=prepared.release_id,
+            live_release_id=prepared.live_release_id,
+        )
+        if kept is not None:
+            return {
+                "status": "SKIPPED",
+                "reason": "verified NOOP fast path installed nothing new to record",
+                "last_sync": {
+                    key: kept[key] for key in ("status", "release_id", "synced_at")
+                },
+            }
     record, warning = installation_resource_registry_record(
-        load_site(site_file, repository_root=root)
+        load_site(prepared.site_file, repository_root=root),
+        release_id=prepared.release_id,
     )
+    if not enabled:
+        record = {**record, "noop_retry": True}
     if warning is not None:
         warnings.append(warning)
         print(f"release-deploy: warning: {warning}", file=sys.stderr)
