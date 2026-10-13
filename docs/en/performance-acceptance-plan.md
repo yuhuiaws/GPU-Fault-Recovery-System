@@ -496,6 +496,7 @@ Also collect:
 export GPU_FAULT_CONTROL_KUBECONFIG='<cpu-control-plane-kubeconfig>'
 export GPU_FAULT_DATAPLANE_CONTEXT='<gpu-data-plane-context>'
 export GPU_FAULT_PERF_AWS_REGION='<aws-region>'
+export GPU_FAULT_AURORA_CLUSTER_ID='<aurora-cluster-id>'
 export GPU_FAULT_PERF_CONTROL_NAMESPACE=gpu-fault-perf-system
 export GPU_FAULT_PERF_DATAPLANE_NAMESPACE=gpu-fault-perf-system
 
@@ -511,6 +512,22 @@ scripts/perf/regional_capacity_suite.py all \
   --duration-seconds 60 \
   --artifact-root artifacts/perf
 ```
+
+`all`/`run` require `GPU_FAULT_AURORA_CLUSTER_ID` and refuse with a usage error, before any synthetic
+cluster is registered, when it is missing. Before registering, the runner resolves the current writer
+instance from that Aurora cluster (the single writer in `DBClusterMembers`) and every member's
+Availability Zone, and `aurora.json` reads only that writer's instance metrics and that cluster's cluster
+metrics -- without `GPU_FAULT_AURORA_INSTANCE` the runner used to read a default instance name that is not
+the site's writer, and guessed the cluster ID for the cluster metrics from that name. The writer instance,
+the writer's Availability Zone and the Availability Zones of the control-plane Pods' nodes (node label
+`topology.kubernetes.io/zone`, read-only, `recorded=false` when unreadable) are written to
+`run.json.placement` before the load and read again into `summary.json.placement`
+(`start`/`end`/`aurora_writer_changed`) afterwards: every statement crosses from a control-plane node's
+Availability Zone to the writer's, and the writer moves on every failover, so rounds without both are not
+comparable; after a failover inside a round its Aurora evidence describes only the writer the round
+started on. The §8.4 integrated runner records the same from `--aurora-cluster-id`; the §8.2 action
+runner reads no Aurora metrics, records the placement too when `GPU_FAULT_AURORA_CLUSTER_ID` is set, and
+otherwise runs as before with `recorded=false` in `summary.json.placement`.
 
 `all`, `run` and the action, integrated and correlated suites must execute the same idempotent
 teardown in `finally` regardless of success, non-Complete, exception or interruption. Teardown
@@ -809,18 +826,50 @@ current live policy are `10/10/9/12`; the 9-step reboot branch includes post-reb
 workload restart at once.
 The attempt/workload and synthetic Agent context is pre-seeded before the start gate and is not
 counted in the matrix.
-The runner uses the same cold-connect model as the formal four-round baseline; before the start
-gate and every 30 seconds during execution it refreshes the synthetic Agent heartbeat, healthy
-GPU/NVLink/RDMA metrics, `load1_per_cpu`, `memory_used_percent`, `filesystem_used_percent` and
-all collector success statuses that Agent actually requires. All samples use the current
-refresh time and must be later than the completed reset/reboot barrier, ensuring post-action
-validation verifies genuinely fresh data. The refresh only updates existing synthetic nodes and
-does not change identity, workflow or production node data.
+The runner uses the same cold-connect model as the formal four-round baseline. A synthetic node
+publishes no telemetry of its own, while post-action validation accepts only samples later than the
+reset/reboot barrier -- the moment the control plane records the step `SUCCEEDED` (the step record the
+dispatcher writes when it sees the remote command succeed), not the moment the simulated executor reports
+its result -- so validation waits for the runner to publish telemetry on the node's behalf. Both paths
+only update this round's existing synthetic nodes and change no identity, workflow or production node
+data:
+
+- **Event-driven publish**: for the whole workflow phase one watch session runs in an api-ha Pod (the
+  seeding script's `integrated-validation-watch` mode over `kubectl exec -i`; the program arrives
+  length-prefixed on stdin and the rest of stdin is the stop signal, closed by the runner's wrap-up and by
+  a runner process that exits). Every second the session reads the workflows saved since its previous
+  poll and, as soon as a node's reset/reboot step is recorded, publishes that node's healthy GPU/NVLink
+  metrics, host metrics and all collector successes stamped with the actual publish time, once per
+  barrier. An executor result without the step record publishes nothing, and a stamp that is not later
+  than the barrier (clock skew between the two Pods) is published again on the next poll until it is
+  strictly later. The session ends when every workflow of the round is terminal, when stdin closes or at its
+  deadline, and is restarted at most 3 times after an unexpected loss; `summary.json.validation_telemetry`
+  records the sessions, restarts, publishes and the p50/p95/p99/max barrier-to-publish delay.
+- **Periodic refresh (fallback)**: before the start gate and every 30 seconds during execution it
+  refreshes the synthetic Agent heartbeat, healthy GPU/NVLink/RDMA metrics, `load1_per_cpu`,
+  `memory_used_percent`, `filesystem_used_percent` and all collector success statuses that Agent actually
+  requires. Every node carries its own write time: the whole refresh used to share the refresh script's
+  start time, so a barrier that fell during a refresh left the later nodes' samples older than the barrier
+  until the next refresh.
 
 The simulated executor must claim real remote commands, maintain lease/fencing, wait an
 approximation of the action duration and return `SUCCEEDED`. Defaults are `RESET_GPU=8s` and
 `RESTART_NODE=120s`, all results carry `simulated=true`; calling a real Node Agent, Kubernetes
-mutation or provider API is forbidden. The report uniformly records ingress/processor,
+mutation or provider API is forbidden. Every claimed command reports its result when its own simulated
+duration elapses and the worker slot it frees is claimed again at once (concurrency is still bounded by
+`--executor-workers`, a claim asks for at most the free slots, and each Pod reports
+`completion_mode: per-command`); the executor used to wait for its whole claimed batch before claiming
+again, so one 120 s `RESTART_NODE` held the next step of the cluster's other workflows and the integrated
+workflow percentiles moved in the harness's batch steps. Claims, lease renewals, fencing tokens and
+result contents are unchanged, and §8.2 uses the same simulated executor.
+
+The integrated workflow p50/p95/p99 therefore measure the control plane -- ingress/processor, the
+dispatcher's polls and wake-ups, validation and the remote command protocol -- plus the configured
+simulated action durations. They exclude the node's own collection interval (production GPU and host
+collectors report every 15 seconds by default, so a real post-reboot validation waits up to one more
+interval) and the product cluster executor's claim pattern. `simulated_command_completion: per-command`
+and `validation_telemetry: event-driven+periodic-30s` in `run.json` mark this method; rounds measured
+another way must be compared separately. The report uniformly records ingress/processor,
 workflow/command p50/p95/p99, duplicate, fencing, budget wait, Aurora, queue drain and
 cleanup. A load generator retry that succeeds after a first connection error must also be
 counted in each path's `transport_retries`, not only the final HTTP success; the simulated
@@ -989,7 +1038,11 @@ executors/
 ```
 
 Every ingress path in `summary.json` must include classified `transport_retries` counts; the
-executor must include `claim_error_counts` and bounded, redacted `claim_error_samples`. All three
+executor must include `claim_error_counts` and bounded, redacted `claim_error_samples`. The burst,
+integrated and action runners' `run.json` and `summary.json` must also include `placement` (the Aurora
+writer instance, its Availability Zone and the control-plane node Availability Zones, §8.1; `recorded=false`
+for an action round that names no Aurora cluster), and the integrated runner's `summary.json` must also
+include `validation_telemetry` (§8.4). All three
 runners' `summary.json` must also carry `store_bloat`: `before`/`after` derive, from the `hot_tables`
 section of `postgres-before.json`/`postgres-after.json`, each hot table's live rows, heap pages, index
 pages, `heap_pages_per_live_row`, `index_pages_per_live_row`, `index_min_entries_per_page`, `index_max_pages` (the

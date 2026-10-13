@@ -56,6 +56,7 @@ if __package__:
         control_pods,
         drain_targets,
         ingress_process_model_preflight,
+        placement_section,
         postgres_counters,
         store_bloat_section,
         store_layout_section,
@@ -68,11 +69,13 @@ if __package__:
         release_start_gate,
         scrape_cgroup,
         scrape_metrics,
+        start_placement,
         teardown,
         upsert_configmap,
         wait_for_job,
         wait_for_load_pods,
     )
+    from .regional_validation_telemetry import start_validation_telemetry
 else:
     from regional_action_capacity_suite import (
         aggregate_executor_documents,
@@ -110,6 +113,7 @@ else:
         control_pods,
         drain_targets,
         ingress_process_model_preflight,
+        placement_section,
         postgres_counters,
         store_bloat_section,
         store_layout_section,
@@ -122,11 +126,13 @@ else:
         release_start_gate,
         scrape_cgroup,
         scrape_metrics,
+        start_placement,
         teardown,
         upsert_configmap,
         wait_for_job,
         wait_for_load_pods,
     )
+    from regional_validation_telemetry import start_validation_telemetry
 
 
 PERF_DIR = Path(__file__).resolve().parent
@@ -164,6 +170,15 @@ FORMAL_MODELS = {
         "total": 41524,
     },
 }
+
+
+def fixed_matrix(clusters: int) -> dict:
+    model = FORMAL_MODELS[clusters]
+    return {
+        **model,
+        "p0": model["xid"] + model["sxid"],
+        "p50": model["gpu_evidence"] + model["host_evidence"],
+    }
 
 
 @contextmanager
@@ -1080,6 +1095,7 @@ def execute_integrated_jobs(
     heartbeat_refresh: Callable[[], None],
 ) -> int:
     resources = RunResources(artifacts, run_id, NAMESPACE, dataplane)
+    placement = start_placement(args.aurora_cluster_id, artifacts)
     publish_fixtures("burst", resources=resources)
     upsert_configmap(
         EXECUTOR_CONFIGMAP,
@@ -1129,18 +1145,24 @@ def execute_integrated_jobs(
     wait_for_executor_pods(args.clusters)
     wait_for_load_pods(LOAD_JOB, args.clusters, timeout_seconds=600)
     heartbeat_refresh()
-    start_epoch = time.time() + args.lead_seconds
-    release_start_gate(start_epoch, resources=resources)
-    ingress_status = wait_for_job(
-        LOAD_JOB,
-        args.timeout_seconds + args.lead_seconds,
-    )
-    audit, history = wait_for_workflows(
-        run_id,
-        expected_workflows=expected_workflows,
-        timeout_seconds=args.timeout_seconds,
-        heartbeat_refresh=heartbeat_refresh,
-    )
+    with start_validation_telemetry(
+        run_id=run_id,
+        clusters=args.clusters,
+        workflows_per_cluster=args.workflows_per_cluster,
+        deadline_seconds=args.timeout_seconds + args.lead_seconds + 300,
+    ) as validation:
+        start_epoch = time.time() + args.lead_seconds
+        release_start_gate(start_epoch, resources=resources)
+        ingress_status = wait_for_job(
+            LOAD_JOB,
+            args.timeout_seconds + args.lead_seconds,
+        )
+        audit, history = wait_for_workflows(
+            run_id,
+            expected_workflows=expected_workflows,
+            timeout_seconds=args.timeout_seconds,
+            heartbeat_refresh=heartbeat_refresh,
+        )
     executor_status = wait_for_job(
         EXECUTOR_JOB,
         args.executor_idle_seconds + 180,
@@ -1174,31 +1196,19 @@ def execute_integrated_jobs(
         "registry_scope": registry_scope,
         "spool_mode": spool,
         "clusters": args.clusters,
-        "fixed_matrix": {
-            **FORMAL_MODELS[args.clusters],
-            "p0": FORMAL_MODELS[args.clusters]["xid"]
-            + FORMAL_MODELS[args.clusters]["sxid"],
-            "p50": FORMAL_MODELS[args.clusters]["gpu_evidence"]
-            + FORMAL_MODELS[args.clusters]["host_evidence"],
-        },
+        "fixed_matrix": fixed_matrix(args.clusters),
         "expected_workflows": expected_workflows,
         "seeded": seeded,
         "ingress": ingress,
         "workflow": audit,
+        "validation_telemetry": validation.summary,
         "executor": executor,
         "queue_drain": drain,
         "store_bloat": store_bloat_section(postgres_before, postgres_after),
         "store_layout": store_layout_section(postgres_before, postgres_after),
         "aurora_preflight": aurora_preflight,
-        "aurora": aurora_window(
-            start_epoch,
-            window_end,
-            aurora_instance=next(
-                instance_id
-                for instance_id, item in aurora_preflight["instances"].items()
-                if item["writer"]
-            ),
-        ),
+        "placement": placement_section(placement, args.aurora_cluster_id),
+        "aurora": aurora_window(start_epoch, window_end, writer=placement["aurora"]),
         "cpu_throttling": {
             pod: {
                 key: int(after[key]) - int(cgroup_before.get(pod, {}).get(key, 0))
@@ -1270,13 +1280,7 @@ def run(args: argparse.Namespace) -> int:
                 "nodes_per_cluster": FORMAL_NODES_PER_CLUSTER,
                 "workflows_per_cluster": args.workflows_per_cluster,
                 "expected_workflows": (args.clusters * args.workflows_per_cluster),
-                "fixed_matrix": {
-                    **FORMAL_MODELS[args.clusters],
-                    "p0": FORMAL_MODELS[args.clusters]["xid"]
-                    + FORMAL_MODELS[args.clusters]["sxid"],
-                    "p50": FORMAL_MODELS[args.clusters]["gpu_evidence"]
-                    + FORMAL_MODELS[args.clusters]["host_evidence"],
-                },
+                "fixed_matrix": fixed_matrix(args.clusters),
                 "action_mix_per_cluster": [
                     "XID48_RESET_GPU",
                     "XID48_RESET_GPU",
@@ -1285,6 +1289,9 @@ def run(args: argparse.Namespace) -> int:
                 ],
                 "simulated_reset_seconds": 8,
                 "simulated_reboot_seconds": 120,
+                # How the workflow latencies are measured (性能压测验收方案 §8.4).
+                "simulated_command_completion": "per-command",
+                "validation_telemetry": "event-driven+periodic-30s",
                 "timeout_seconds": args.timeout_seconds,
                 "executor_idle_seconds": args.executor_idle_seconds,
                 "aurora_cluster_id": args.aurora_cluster_id,

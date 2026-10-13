@@ -5,10 +5,11 @@ import copy
 import json
 import shlex
 from collections.abc import Callable
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
-from types import ModuleType
+from types import ModuleType, SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,7 +20,7 @@ from scripts.perf import regional_capacity_suite as base
 from scripts.perf import regional_correlated_action_suite as correlated
 from scripts.perf import regional_integrated_workflow_capacity_suite as integrated
 from scripts.perf.regional_capacity_resources import RunResources
-from tests.regional._perf_caller_support import AmpWire
+from tests.regional._perf_caller_support import PLACEMENT, AmpWire
 
 
 class FakeDataplane:
@@ -354,6 +355,13 @@ def caller(
             lambda **_kwargs: lambda: None,
         )
         monkeypatch.setattr(module, "control_pods", lambda: [])
+        monkeypatch.setattr(module, "start_placement", lambda *_args: PLACEMENT)
+        # The validation watch session runs in a CPU Pod; its own tests fake it.
+        monkeypatch.setattr(
+            module,
+            "start_validation_telemetry",
+            lambda **_kwargs: nullcontext(SimpleNamespace(summary={})),
+        )
         # The post-teardown late-residue sweep probes the CPU Pod through the data
         # helper and paces its attempts; the unit harness answers "clean" at once.
         monkeypatch.setattr(module, "invoke", lambda *_args, **_kwargs: {"total": 0})
@@ -379,6 +387,7 @@ def caller(
             "aggregate_executor_documents",
             "queue_drain",
             "aurora_window",
+            "placement_section",
             "control_pod_lifecycle",
             "processor_priority_latency",
             "workflow_audit",
@@ -707,3 +716,61 @@ def test_retained_purge_stops_resources_before_exact_data_cleanup(
         }
     ]
     assert "revoke" not in caller.events
+
+
+class WatchSession:
+    """The validation watch session's lifecycle as caller events."""
+
+    def __init__(self, events: list[str], **options: Any) -> None:
+        self.events = events
+        self.options = options
+        self.summary: dict[str, Any] = {}
+
+    def __enter__(self) -> WatchSession:
+        self.events.append("watch-start")
+        return self
+
+    def __exit__(self, *_exc_info: object) -> None:
+        self.events.append("watch-stop")
+        self.summary = {"mode": "event-driven", "publishes": 3}
+
+
+@pytest.mark.parametrize("caller", [integrated], indirect=True, ids=["integrated"])
+def test_integrated_run_records_how_its_workflow_latencies_were_measured(
+    caller: CallerHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    sessions: list[WatchSession] = []
+
+    def start(**options: Any) -> WatchSession:
+        sessions.append(WatchSession(caller.events, **options))
+        return sessions[-1]
+
+    monkeypatch.setattr(integrated, "start_validation_telemetry", start)
+    monkeypatch.setattr(
+        integrated,
+        "placement_section",
+        lambda start, cluster: {"start": start, "cluster": cluster},
+    )
+
+    assert caller.run() == 0
+
+    (session,) = sessions
+    assert session.options == {
+        "run_id": "run-a",
+        "clusters": 32,
+        "workflows_per_cluster": 4,
+        "deadline_seconds": 481,
+    }, "the session covers the run's workflow timeout"
+    gate = f"patch:configmap/{base.START_GATE_CONFIGMAP}"
+    assert caller.events.index("watch-start") < caller.events.index(gate), (
+        "the watcher must be running before the load starts"
+    )
+    assert caller.events.index("watch-stop") < caller.events.index("teardown"), (
+        "the watcher must end before the run's data is purged"
+    )
+    summary = caller.report("summary.json")
+    assert summary["validation_telemetry"] == {"mode": "event-driven", "publishes": 3}
+    assert summary["placement"] == {"start": PLACEMENT, "cluster": "test-aurora"}
+    run = caller.report("run.json")
+    assert run["simulated_command_completion"] == "per-command"
+    assert run["validation_telemetry"] == "event-driven+periodic-30s"

@@ -35,11 +35,14 @@ def aurora_window(
     run_command: Callable,
     *,
     aurora_instance: str,
+    aurora_cluster_id: str,
     aws_region: str,
     start: float,
     end: float,
 ) -> dict:
-    cluster_id = aurora_instance.removesuffix("-writer")
+    # The cluster-level metrics use the cluster the run named: the writer's
+    # instance name is not "<cluster>-writer" on a managed site.
+    cluster_id = aurora_cluster_id
     metrics = {}
     for name in (
         "ServerlessDatabaseCapacity",

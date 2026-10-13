@@ -5,11 +5,21 @@ The supported regional capacity entry point is:
 ```bash
 export GPU_FAULT_PERF_CONTROL_NAMESPACE=gpu-fault-perf-system
 export GPU_FAULT_PERF_DATAPLANE_NAMESPACE=gpu-fault-perf-system
+export GPU_FAULT_AURORA_CLUSTER_ID=<aurora-cluster-id>
 
 scripts/perf/regional_capacity_suite.py all \
   --case burst \
   --clusters 32
 ```
+
+`all` and `run` refuse to start without `GPU_FAULT_AURORA_CLUSTER_ID`: the run
+resolves the Aurora writer from that cluster before it registers anything,
+reads `aurora.json` for that writer, and records the writer instance, its
+Availability Zone and the control-plane Pods' node zones in
+`run.json.placement` and `summary.json.placement`
+(`regional_capacity_placement.py`). The integrated runner records the same
+from `--aurora-cluster-id`; the action suite records it when the variable is
+set and otherwise marks it `recorded: false`.
 
 The default target is an isolated control-plane/data-plane namespace. The
 isolated control plane must mount its own regional registry Secret and the
@@ -127,6 +137,9 @@ scripts/perf/regional_integrated_workflow_capacity_suite.py \
 It targets the live CPU ingress/worker/Aurora path. Synthetic cluster identity,
 Agent records and the executor isolate GPU mutations; reset and reboot commands
 sleep for configured representative durations and return simulated results.
+Each claimed command reports when its own duration elapses and its worker slot
+is claimed again at once, so a 120 s reboot no longer holds the next commands
+of the cluster's other workflows (`completion_mode: per-command`).
 Before registration it first records the current Aurora scaling range, sets
 `Min=124, Max=128` when needed, then requires two available `db.serverless`
 instances with observed capacity at least 124 ACU and exact live remediation
@@ -145,12 +158,19 @@ AdminConfig preset before each run: set `spec.capacity.preset` in
 <state-dir>` (there are no capacity flags; the YAML is the only input). The
 current command totals are 30 per cluster: 960 for 32 clusters and 1500 for 50.
 
-Before the start gate and every 30 seconds during workflow drain, the integrated
-runner refreshes synthetic Agent leases, required collector success, healthy
-GPU/NVLink/RDMA samples, and fresh `load1_per_cpu`,
-`memory_used_percent`, and `filesystem_used_percent` host samples. Host sample
-timestamps must cross the completed reboot barrier so `VALIDATE_HOST` cannot
-pass on stale telemetry.
+For the whole workflow phase `regional_validation_telemetry.py` keeps one
+`kubectl exec -i` session of the seeding script's `integrated-validation-watch`
+mode in an api-ha Pod: as soon as the control plane records a node's
+reset/reboot step it publishes that node's healthy telemetry, stamped with the
+actual publish time (post-action validation accepts only samples newer than
+that record). The program arrives length-prefixed on stdin and closing stdin
+stops the session; `summary.json.validation_telemetry` holds its evidence.
+As the fallback, before the start gate and every 30 seconds during workflow
+drain, the runner refreshes synthetic Agent leases, required collector success,
+healthy GPU/NVLink/RDMA samples, and fresh `load1_per_cpu`,
+`memory_used_percent`, and `filesystem_used_percent` host samples, each node
+stamped with its own write time. Host sample timestamps must cross the
+completed reboot barrier so `VALIDATE_HOST` cannot pass on stale telemetry.
 
 Integrated cleanup ignores subsequent `SIGINT`, `SIGTERM`, and `SIGHUP` while
 its bounded `finally` block deletes both Jobs and their Pods, purges database
@@ -192,6 +212,10 @@ is split by responsibility:
 
 - `regional_capacity_job.py`: Indexed Job and start-gate manifest construction.
 - `regional_capacity_database.py`: Aurora and PostgreSQL observations.
+- `regional_capacity_placement.py`: the run's Aurora writer, its Availability
+  Zone and the control-plane node zones.
+- `regional_validation_telemetry.py`: the integrated runner's event-driven
+  validation telemetry session.
 - `regional_capacity_registry.py`: isolated/live target selection, synthetic
   registry metadata, residual detection and verified cleanup.
 - `regional_capacity_results.py`: metric parsing, aggregation and artifact

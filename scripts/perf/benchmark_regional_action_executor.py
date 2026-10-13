@@ -5,7 +5,8 @@ import os
 import ssl
 import statistics
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections.abc import Callable
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock, Thread
@@ -39,6 +40,13 @@ DELAYS = {
     "RESTORE_SCHEDULING": 0.5,
 }
 CLAIM_ERROR_SAMPLE_LIMIT = 20
+# How the claim loop paces itself: an empty claim waits as long as it always
+# did, a failed claim waits its old backoff, and a loop whose every worker slot
+# is busy waits for the first command to finish (bounded so the wall-clock
+# limit is still checked).
+IDLE_POLL_SECONDS = 0.05
+CLAIM_ERROR_BACKOFF_SECONDS = 0.1
+BUSY_WAIT_SECONDS = 1.0
 
 
 def claim_payload(executor_id: str, max_commands: int) -> dict:
@@ -112,6 +120,8 @@ class SimulationState:
     lease_seconds: int
     renewal_interval: float
     inject_renew_failure_pending: bool
+    # The simulated action duration; a test substitutes a virtual clock.
+    sleep: Callable[[float], None] = time.sleep
     counters_lock: Lock = field(default_factory=Lock)
     renewals: int = 0
     renewal_errors: int = 0
@@ -169,7 +179,7 @@ class SimulationState:
         renewal_thread.start()
         begin = time.monotonic()
         try:
-            time.sleep(delay)
+            self.sleep(delay)
             self.client.post(
                 f"/v1/regional/executors/{command_id}/result",
                 {
@@ -212,6 +222,123 @@ def operation_delays() -> dict[str, float]:
     }
 
 
+@dataclass
+class ClaimTally:
+    """What one executor's claim loop observed, for its summary document."""
+
+    completed_ids: set[str] = field(default_factory=set)
+    duplicate_claims: int = 0
+    claim_errors: int = 0
+    claim_error_counts: dict[str, int] = field(default_factory=dict)
+    claim_error_samples: list[dict[str, str | float]] = field(default_factory=list)
+    result_errors: int = 0
+    latencies: list[float] = field(default_factory=list)
+    by_operation: dict[str, list[float]] = field(default_factory=dict)
+    wall_seconds: float = 0.0
+
+    def claim_failed(self, exc: BaseException, *, elapsed: float) -> None:
+        self.claim_errors += 1
+        category = request_error_category(exc)
+        self.claim_error_counts[category] = self.claim_error_counts.get(category, 0) + 1
+        if len(self.claim_error_samples) < CLAIM_ERROR_SAMPLE_LIMIT:
+            self.claim_error_samples.append(
+                {"category": category, "elapsed_seconds": round(elapsed, 6)}
+            )
+
+    def finished(self, outcome: tuple[str, str, float, str | None]) -> None:
+        command_id, operation, elapsed, failure = outcome
+        self.latencies.append(elapsed)
+        self.by_operation.setdefault(operation, []).append(elapsed)
+        if failure is None:
+            self.completed_ids.add(command_id)
+        else:
+            self.result_errors += 1
+
+
+def run_claim_loop(
+    state: SimulationState,
+    *,
+    workers: int,
+    expected: int,
+    max_seconds: float,
+    idle_exit_seconds: float,
+) -> ClaimTally:
+    """Claim into free worker slots; every command reports on its own clock.
+
+    Each claimed command runs on its own worker and posts its result when its
+    own simulated duration elapses, and the slot it frees is claimed again at
+    once. The loop used to wait for its whole claimed batch, so one 120 s
+    RESTART_NODE parked the cluster's other workflows behind it and the
+    integrated workflow percentiles moved in harness-made steps (batch 80).
+    In flight never exceeds ``workers``: a claim asks for the free slots only
+    (and the old cap of 25). Claims, renewals and results are unchanged.
+    """
+
+    tally = ClaimTally()
+    in_flight: dict[Future[tuple[str, str, float, str | None]], str] = {}
+    started = time.monotonic()
+    last_activity = started
+
+    def settle(timeout: float) -> None:
+        """Record every finished command, waiting up to ``timeout`` for one."""
+
+        nonlocal last_activity
+        if not in_flight:
+            time.sleep(timeout)
+            return
+        done, _ = wait(list(in_flight), timeout=timeout, return_when=FIRST_COMPLETED)
+        for future in done:
+            del in_flight[future]
+            tally.finished(future.result())
+            last_activity = time.monotonic()
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        while (
+            expected <= 0 or len(tally.completed_ids) < expected
+        ) and time.monotonic() - started < max_seconds:
+            free = workers - len(in_flight)
+            if free <= 0:
+                settle(BUSY_WAIT_SECONDS)
+                continue
+            try:
+                claim = state.client.post(
+                    "/v1/regional/executors/claim",
+                    claim_payload(state.executor_id, min(25, free)),
+                )
+                commands = claim.get("commands") or []
+            except (error.HTTPError, error.URLError, OSError) as exc:
+                tally.claim_failed(exc, elapsed=time.monotonic() - started)
+                settle(CLAIM_ERROR_BACKOFF_SECONDS)
+                continue
+            if not commands:
+                if (
+                    expected <= 0
+                    and tally.completed_ids
+                    and not in_flight
+                    and idle_exit_seconds > 0
+                    and time.monotonic() - last_activity >= idle_exit_seconds
+                ):
+                    break
+                settle(IDLE_POLL_SECONDS)
+                continue
+            last_activity = time.monotonic()
+            for command in commands:
+                command_id = command["command_id"]
+                if (
+                    command_id in tally.completed_ids
+                    or command_id in in_flight.values()
+                ):
+                    tally.duplicate_claims += 1
+                in_flight[pool.submit(state.execute, command)] = command_id
+            settle(0)
+        # A command claimed before the wall-clock limit still reports, exactly
+        # as the last batch of the old loop did.
+        while in_flight:
+            settle(BUSY_WAIT_SECONDS)
+    tally.wall_seconds = time.monotonic() - started
+    return tally
+
+
 def main() -> None:
     registrations = json.loads(Path(os.environ["CLUSTERS_FILE"]).read_text())
     offset = int(os.environ["CLUSTER_OFFSET"])
@@ -249,12 +376,6 @@ def main() -> None:
         token=registration["token"],
         ca_file=os.environ["SSL_CERT_FILE"],
     )
-    completed_ids: set[str] = set()
-    duplicate_claims = 0
-    claim_errors = 0
-    claim_error_counts: dict[str, int] = {}
-    claim_error_samples: list[dict[str, str | float]] = []
-    result_errors = 0
     state = SimulationState(
         client=client,
         executor_id=executor_id,
@@ -264,70 +385,27 @@ def main() -> None:
         renewal_interval=renewal_interval,
         inject_renew_failure_pending=inject_renew_failure,
     )
-    latencies: list[float] = []
-    by_operation: dict[str, list[float]] = {}
-    started = time.monotonic()
-    last_activity = started
-
-    while (
-        expected <= 0 or len(completed_ids) < expected
-    ) and time.monotonic() - started < max_seconds:
-        try:
-            claim = client.post(
-                "/v1/regional/executors/claim",
-                claim_payload(executor_id, min(25, workers)),
-            )
-            commands = claim.get("commands") or []
-        except (error.HTTPError, error.URLError, OSError) as exc:
-            claim_errors += 1
-            category = request_error_category(exc)
-            claim_error_counts[category] = claim_error_counts.get(category, 0) + 1
-            if len(claim_error_samples) < CLAIM_ERROR_SAMPLE_LIMIT:
-                claim_error_samples.append(
-                    {
-                        "category": category,
-                        "elapsed_seconds": round(time.monotonic() - started, 6),
-                    }
-                )
-            time.sleep(0.1)
-            continue
-        if not commands:
-            if (
-                expected <= 0
-                and completed_ids
-                and idle_exit_seconds > 0
-                and time.monotonic() - last_activity >= idle_exit_seconds
-            ):
-                break
-            time.sleep(0.05)
-            continue
-        last_activity = time.monotonic()
-        for command in commands:
-            if command["command_id"] in completed_ids:
-                duplicate_claims += 1
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futures = [pool.submit(state.execute, item) for item in commands]
-            for future in as_completed(futures):
-                command_id, operation, elapsed, failure = future.result()
-                latencies.append(elapsed)
-                by_operation.setdefault(operation, []).append(elapsed)
-                if failure is None:
-                    completed_ids.add(command_id)
-                else:
-                    result_errors += 1
-
-    wall = time.monotonic() - started
+    tally = run_claim_loop(
+        state,
+        workers=workers,
+        expected=expected,
+        max_seconds=max_seconds,
+        idle_exit_seconds=idle_exit_seconds,
+    )
+    completed_ids = tally.completed_ids
+    latencies = tally.latencies
     output = {
         "cluster_id": cluster_id,
         "executor_id": executor_id,
         "expected_commands": expected,
         "idle_exit_seconds": idle_exit_seconds,
+        "completion_mode": "per-command",
         "completed_commands": len(completed_ids),
-        "duplicate_claims": duplicate_claims,
-        "claim_errors": claim_errors,
-        "claim_error_counts": dict(sorted(claim_error_counts.items())),
-        "claim_error_samples": claim_error_samples,
-        "result_errors": result_errors,
+        "duplicate_claims": tally.duplicate_claims,
+        "claim_errors": tally.claim_errors,
+        "claim_error_counts": dict(sorted(tally.claim_error_counts.items())),
+        "claim_error_samples": tally.claim_error_samples,
+        "result_errors": tally.result_errors,
         "lease_seconds": lease_seconds,
         "renewal_interval_seconds": renewal_interval,
         "renewals": state.renewals,
@@ -336,7 +414,7 @@ def main() -> None:
         "long_commands": state.long_commands,
         "max_concurrent_commands": state.max_active_commands,
         "min_concurrent_commands": min_concurrent_commands,
-        "wall_seconds": wall,
+        "wall_seconds": tally.wall_seconds,
         "command_p50_ms": statistics.median(latencies) * 1000 if latencies else 0.0,
         "command_p95_ms": percentile(latencies, 0.95) * 1000,
         "command_p99_ms": percentile(latencies, 0.99) * 1000,
@@ -345,15 +423,15 @@ def main() -> None:
                 "count": len(values),
                 "p95_ms": percentile(values, 0.95) * 1000,
             }
-            for operation, values in sorted(by_operation.items())
+            for operation, values in sorted(tally.by_operation.items())
         },
     }
     print(json.dumps(output, indent=2, sort_keys=True), flush=True)
     if (
         (expected > 0 and len(completed_ids) != expected)
         or (expected <= 0 and not completed_ids)
-        or duplicate_claims
-        or result_errors
+        or tally.duplicate_claims
+        or tally.result_errors
         or state.max_active_commands < min_concurrent_commands
         or (state.long_commands and state.renewals == 0)
         or (

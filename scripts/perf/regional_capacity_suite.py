@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING or __package__:
     from . import regional_capacity_data as capacity_data
     from . import regional_capacity_database as capacity_database
+    from . import regional_capacity_placement as capacity_placement
     from . import regional_capacity_recovery as capacity_recovery
     from . import regional_capacity_registry as capacity_registry
     from . import regional_capacity_results as capacity_results
@@ -58,6 +59,7 @@ if TYPE_CHECKING or __package__:
 else:
     import regional_capacity_data as capacity_data
     import regional_capacity_database as capacity_database
+    import regional_capacity_placement as capacity_placement
     import regional_capacity_recovery as capacity_recovery
     import regional_capacity_registry as capacity_registry
     import regional_capacity_results as capacity_results
@@ -99,21 +101,20 @@ _postgres_counters = capacity_database.postgres_counters
 store_bloat_section = capacity_database.store_bloat_section
 store_layout_section = capacity_database.store_layout_section
 _processor_priority_latency = capacity_database.processor_priority_latency
+CONTROL_POD_PREFIXES = capacity_placement.CONTROL_POD_PREFIXES
+start_placement = capacity_placement.start_placement
+placement_section = capacity_placement.placement_section
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PERF_DIR = REPO_ROOT / "scripts" / "perf"
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "artifacts" / "perf"
-CONTROL_POD_PREFIXES = (
-    "gpu-fault-api-ha-",
-    "gpu-fault-control-worker-",
-    "gpu-fault-telemetry-spool-worker-",
-)
 INGRESS_REQUEST_RECYCLE_FLAGS = (
     "--limit-max-requests",
     "--limit-max-requests-jitter",
 )
 
-AURORA_INSTANCE = os.getenv("GPU_FAULT_AURORA_INSTANCE", "gpu-fault-aurora-writer")
+# The run's writer is resolved from this cluster (``regional_capacity_placement``).
+AURORA_CLUSTER_ID = os.getenv("GPU_FAULT_AURORA_CLUSTER_ID", "")
 SCRIPT_CONFIGMAP = "gpu-fault-perf-suite-scripts"
 TEMPLATE_CONFIGMAP = "gpu-fault-perf-suite-templates"
 START_GATE_CONFIGMAP = "gpu-fault-perf-start-gate"
@@ -588,15 +589,11 @@ class TopSampler(threading.Thread):
         self._done.set()
 
 
-def aurora_window(
-    start: float,
-    end: float,
-    *,
-    aurora_instance: str | None = None,
-) -> dict:
+def aurora_window(start: float, end: float, *, writer: dict) -> dict:
     return _aurora_window(
         run,
-        aurora_instance=aurora_instance or AURORA_INSTANCE,
+        aurora_instance=writer["writer_instance_id"],
+        aurora_cluster_id=writer["cluster_id"],
         aws_region=AWS_REGION,
         start=start,
         end=end,
@@ -818,6 +815,7 @@ def execute_case(
     include_telemetry: bool,
     prewarm_connections: bool,
     resources: RunResources,
+    placement: dict,
 ) -> dict:
     spec = CASES[case]
     job = spec["job"]
@@ -911,7 +909,7 @@ def execute_case(
     (artifacts / "processor-priority-latency.json").write_text(
         json.dumps(priority_latency, indent=1) + "\n"
     )
-    aurora = aurora_window(window_start, window_end)
+    aurora = aurora_window(window_start, window_end, writer=placement["aurora"])
     (artifacts / "aurora.json").write_text(
         json.dumps(aurora, indent=1, default=str) + "\n"
     )
@@ -964,6 +962,7 @@ def execute_case(
                 "gpu_fault_processor_queue"
             ),
             "processor_priority_latency": priority_latency,
+            "placement": placement_section(placement, AURORA_CLUSTER_ID),
             "aurora_capacity_max": max(
                 (
                     point.get("maximum") or 0
@@ -1173,6 +1172,9 @@ def execute_capacity_command(
     registration_pending = False
     run_validated = False
     try:
+        # Before any registration: a wrong cluster fails without registry work.
+        if args.command in {"all", "run"}:
+            placement = start_placement(AURORA_CLUSTER_ID, artifacts)
         if args.command in {"register", "all"}:
             registration_pending = True
             register(
@@ -1220,6 +1222,7 @@ def execute_capacity_command(
                 include_telemetry=not args.fault_only,
                 prewarm_connections=args.prewarm_connections,
                 resources=resources,
+                placement=placement,
             )
             print(json.dumps(summary, indent=1, sort_keys=True))
             if summary.get("job_status") != "Complete":
@@ -1389,6 +1392,11 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     if not DATAPLANE_CONTEXT:
         parser.error("GPU_FAULT_DATAPLANE_CONTEXT is required")
+    if args.command in {"all", "run"} and not AURORA_CLUSTER_ID:
+        parser.error(
+            "GPU_FAULT_AURORA_CLUSTER_ID is required: the run resolves its Aurora "
+            "writer, and that writer's Availability Zone, from that cluster"
+        )
     if args.synthetic_ttl_seconds < 300:
         parser.error("--synthetic-ttl-seconds must be at least 300")
     if args.command == "register" and not args.keep_registration:

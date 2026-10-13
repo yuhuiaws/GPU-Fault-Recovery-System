@@ -139,8 +139,8 @@ def test_integrated_agent_heartbeat_refresh_preserves_identity() -> None:
         run_id="run-a",
         clusters=1,
         workflows_per_cluster=1,
-        now=refreshed_at,
         lease_seconds=600,
+        clock=lambda: refreshed_at,
     )
     refreshed = context.store.list_agents("perf-cap-000")[0]
 

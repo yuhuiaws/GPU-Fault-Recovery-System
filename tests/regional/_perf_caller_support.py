@@ -24,6 +24,9 @@ TEARDOWN_TAIL = [
 ]
 
 
+PLACEMENT = {"aurora": {"cluster_id": "test-aurora", "writer_instance_id": "test-w"}}
+
+
 class AmpWire:
     """Read-only AMP responses; the notification preflight remains real."""
 
@@ -163,7 +166,12 @@ class CapacityWire:
         monkeypatch.setattr(capacity, "collect_logs", lambda *_args: [])
         monkeypatch.setattr(capacity, "queue_drain", lambda *_args, **_kwargs: {})
         monkeypatch.setattr(capacity, "processor_priority_latency", lambda: {})
-        monkeypatch.setattr(capacity, "aurora_window", lambda *_args: {})
+        monkeypatch.setattr(capacity, "aurora_window", lambda *_args, **_kwargs: {})
+        # The run's Aurora writer and node zones (tests/regional/test_perf_run_placement).
+        monkeypatch.setattr(capacity, "AURORA_CLUSTER_ID", "test-aurora")
+        monkeypatch.delenv("GPU_FAULT_AURORA_CLUSTER_ID", raising=False)
+        monkeypatch.setattr(capacity, "start_placement", lambda *_args: PLACEMENT)
+        monkeypatch.setattr(capacity, "placement_section", lambda *_args: {})
         monkeypatch.setattr(capacity, "TopSampler", lambda *_args: self)
         monkeypatch.setattr(
             action,

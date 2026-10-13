@@ -14,6 +14,10 @@ from scripts.e2e.regional.regional_live_fixture import component_python
 from scripts.e2e.regional.release_phase_gate import release_phase_error
 
 if TYPE_CHECKING or __package__:
+    from .regional_capacity_placement import (
+        optional_placement_section,
+        optional_start_placement,
+    )
     from .regional_capacity_recovery import write_aborted_status
     from .regional_capacity_registry import (
         STORE_DSN_SNIPPET,
@@ -49,6 +53,10 @@ if TYPE_CHECKING or __package__:
         write_status,
     )
 else:
+    from regional_capacity_placement import (
+        optional_placement_section,
+        optional_start_placement,
+    )
     from regional_capacity_recovery import write_aborted_status
     from regional_capacity_registry import (
         STORE_DSN_SNIPPET,
@@ -989,6 +997,7 @@ def execute_capacity_run(
     registry_scope: str,
     resources: RunResources,
     min_concurrent_commands: int | None = None,
+    placement: dict | None = None,
 ) -> int:
     if min_concurrent_commands is None:
         min_concurrent_commands = args.executor_workers
@@ -1143,6 +1152,7 @@ def execute_capacity_run(
         "command_statuses": final.get("commands", {}),
         "store_bloat": store_bloat_section(before_postgres, after_postgres),
         "store_layout": store_layout_section(before_postgres, after_postgres),
+        "placement": optional_placement_section(placement),
         "postgres_deltas": {
             key: (after_postgres.get(key) or 0) - (before_postgres.get(key) or 0)
             for key in ("deadlocks", "xact_commit", "xact_rollback")
@@ -1257,6 +1267,8 @@ def main(argv: list[str] | None = None) -> int:
     registration_pending = True
     run_validated = False
     try:
+        # The Aurora writer and node zones, when the round names its cluster.
+        placement = optional_start_placement(artifacts)
         register(
             args.clusters,
             artifacts,
@@ -1279,6 +1291,7 @@ def main(argv: list[str] | None = None) -> int:
             registry_scope=registry_scope,
             resources=resources,
             min_concurrent_commands=tier["min_concurrent_commands"],
+            placement=placement,
         )
     except BaseException as exc:
         failure = exc

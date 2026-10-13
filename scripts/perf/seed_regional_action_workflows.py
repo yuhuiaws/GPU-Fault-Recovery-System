@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import os
 import re
-from collections.abc import Mapping
+import sys
+import threading
+import time
+from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app import ApplicationContext
@@ -24,6 +27,7 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepSpec,
+    WorkflowStepStatus,
 )
 from gpu_fault.store import NotFoundError
 from gpu_fault.telemetry import CollectorKind, CollectorStatus
@@ -76,6 +80,41 @@ HEALTHY_GPU_METRICS = (
 HEARTBEAT_TELEMETRY_ENV = "ACTION_HEARTBEAT_TELEMETRY"
 NODE_RETURN_TELEMETRY = "node-return"
 CORRELATED_NODE_OFFSET = re.compile(r"^corr-node-.*-c(\d{3})-[a-z]+$")
+#: The integrated suite's event-driven validation telemetry (§8.4).
+VALIDATION_WATCH_MODE = "integrated-validation-watch"
+#: Completing any of these is a telemetry barrier: post-action validation
+#: accepts only samples observed after the latest one
+#: (``telemetry_readiness_operations`` in ``adapters/gpu_validation.py``).
+TELEMETRY_BARRIER_OPERATIONS = frozenset(
+    {
+        WorkflowOperation.RESET_GPU,
+        WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
+        WorkflowOperation.RESTART_FABRIC_MANAGER,
+        WorkflowOperation.REMEDIATE_DRIVER,
+        WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
+        WorkflowOperation.REMEDIATE_EFA_DRIVER,
+        WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN,
+        WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
+        WorkflowOperation.RESTART_NODE,
+        WorkflowOperation.REPLACE_NODE,
+    }
+)
+TERMINAL_WORKFLOW_STATUSES = frozenset(
+    {
+        WorkflowStatus.SUCCEEDED,
+        WorkflowStatus.FAILED,
+        WorkflowStatus.BLOCKED,
+        WorkflowStatus.SUPERSEDED,
+    }
+)
+#: Each poll reads the workflows saved since the previous one began, with this
+#: much overlap for a save whose transaction committed after the poll started.
+WATCH_FEED_OVERLAP = timedelta(seconds=2)
+WATCH_FEED_LIMIT = 2000
+
+
+def utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 def synthetic_agent(
@@ -526,15 +565,49 @@ def publish_healthy_node_telemetry(
     )
 
 
+def publish_integrated_node_telemetry(
+    context: ApplicationContext,
+    *,
+    record: AgentRecord,
+    run_id: str,
+    cluster_index: int,
+    workflow_index: int,
+    now: datetime,
+) -> None:
+    """One integrated node's healthy package, under its action identity's GPU."""
+
+    publish_healthy_node_telemetry(
+        context,
+        record=record,
+        cluster_id=f"perf-cap-{cluster_index:03d}",
+        now=now,
+        gpu_uuid=f"GPU-integrated-{cluster_index:03d}-{workflow_index:02d}",
+        gpu_index=str(workflow_index),
+        batch_id=(
+            f"integrated-validation-{run_id}-{cluster_index:03d}-"
+            f"{workflow_index:02d}-{int(now.timestamp() * 1_000_000)}"
+        ),
+    )
+
+
 def refresh_integrated_agent_heartbeats(
     context: ApplicationContext,
     *,
     run_id: str,
     clusters: int,
     workflows_per_cluster: int,
-    now: datetime,
     lease_seconds: int,
+    clock: Callable[[], datetime] = utc_now,
 ) -> int:
+    """The periodic refresh: every node's heartbeat and healthy telemetry.
+
+    Each node is stamped with its own write time (``clock`` per node), not the
+    refresh's start: a 200-node refresh takes seconds, and a reset barrier that
+    fell inside it used to leave the later nodes' samples older than the
+    barrier until the next refresh. It is the fallback behind the
+    event-driven ``watch_validation_barriers``.
+    """
+
     refreshed = 0
     for cluster_index in range(clusters):
         cluster_id = f"perf-cap-{cluster_index:03d}"
@@ -551,28 +624,192 @@ def refresh_integrated_agent_heartbeats(
                     f"synthetic Agent heartbeat target is not ACTIVE: "
                     f"{cluster_id}/{node_id}"
                 )
+            written_at = clock()
             context.store.save_agent(
                 record.model_copy(
                     update={
-                        "last_seen_at": now,
-                        "lease_expires_at": now + timedelta(seconds=lease_seconds),
+                        "last_seen_at": written_at,
+                        "lease_expires_at": written_at
+                        + timedelta(seconds=lease_seconds),
                     }
                 )
             )
-            publish_healthy_node_telemetry(
+            publish_integrated_node_telemetry(
                 context,
                 record=record,
-                cluster_id=cluster_id,
-                now=now,
-                gpu_uuid=f"GPU-integrated-{cluster_index:03d}-{workflow_index:02d}",
-                gpu_index=str(workflow_index),
-                batch_id=(
-                    f"integrated-validation-{run_id}-{cluster_index:03d}-"
-                    f"{workflow_index:02d}-{int(now.timestamp() * 1_000_000)}"
-                ),
+                run_id=run_id,
+                cluster_index=cluster_index,
+                workflow_index=workflow_index,
+                now=written_at,
             )
             refreshed += 1
     return refreshed
+
+
+def integrated_run_agents(
+    context: ApplicationContext,
+    *,
+    run_id: str,
+    clusters: int,
+    workflows_per_cluster: int,
+) -> dict[str, tuple[int, int, AgentRecord]]:
+    """The run's seeded nodes: ``node_id -> (cluster, workflow, Agent)``."""
+
+    nodes: dict[str, tuple[int, int, AgentRecord]] = {}
+    for cluster_index in range(clusters):
+        agents = {
+            item.node_id: item
+            for item in context.store.list_agents(f"perf-cap-{cluster_index:03d}")
+        }
+        for workflow_index in range(workflows_per_cluster):
+            node_id = integrated_node_id(run_id, cluster_index, workflow_index)
+            if node_id in agents:
+                nodes[node_id] = (cluster_index, workflow_index, agents[node_id])
+    return nodes
+
+
+def readiness_barrier(workflow: WorkflowRequest) -> datetime | None:
+    """When ``workflow`` last completed a reset or reboot, as recorded.
+
+    The step record's ``updated_at`` is written when the dispatcher sees the
+    remote command succeed; post-action validation accepts only telemetry
+    observed after it, so a publish at the executor's own completion would
+    still be too early.
+    """
+
+    return max(
+        (
+            execution.updated_at
+            for execution in workflow.step_executions
+            if execution.status is WorkflowStepStatus.SUCCEEDED
+            and execution.operation in TELEMETRY_BARRIER_OPERATIONS
+        ),
+        default=None,
+    )
+
+
+def watch_validation_barriers(
+    context: ApplicationContext,
+    *,
+    run_id: str,
+    clusters: int,
+    workflows_per_cluster: int,
+    stopped: Callable[[], bool],
+    poll_seconds: float = 1.0,
+    deadline_seconds: float = 3600.0,
+    clock: Callable[[], datetime] = utc_now,
+    sleep: Callable[[float], None] = time.sleep,
+    progress: Callable[[dict[str, object]], None] | None = None,
+    progress_seconds: float = 15.0,
+) -> dict[str, object]:
+    """Publish a node's healthy telemetry right after its reset/reboot barrier.
+
+    Every poll reads the workflows saved since the previous one, takes each run
+    node's latest barrier (``readiness_barrier``) and publishes the node's
+    package once per new barrier, stamped with the actual publish time. A node
+    whose publish is not yet newer than its barrier (another Pod's clock ran
+    ahead) is published again on the next poll. Ends when ``stopped`` says so,
+    when every run workflow is terminal, or at ``deadline_seconds``.
+    """
+
+    nodes = integrated_run_agents(
+        context,
+        run_id=run_id,
+        clusters=clusters,
+        workflows_per_cluster=workflows_per_cluster,
+    )
+    expected = clusters * workflows_per_cluster
+    barriers: dict[str, datetime] = {}
+    published: dict[str, datetime] = {}
+    terminal: set[str] = set()
+    delays: list[float] = []
+    polls = truncated = 0
+    ended_by = "deadline"
+    since = clock() - WATCH_FEED_OVERLAP
+    end = time.monotonic() + deadline_seconds
+    next_progress = time.monotonic() + progress_seconds
+    while time.monotonic() < end:
+        if stopped():
+            ended_by = "stopped"
+            break
+        poll_started = clock()
+        rows = context.store.list_recent_workflows(
+            set(), updated_since=since, limit=WATCH_FEED_LIMIT
+        )
+        truncated += len(rows) >= WATCH_FEED_LIMIT
+        since = poll_started - WATCH_FEED_OVERLAP
+        for workflow in rows:
+            owned = {
+                node
+                for step in (*workflow.official_steps, *workflow.safety_steps)
+                for node in step.node_ids
+                if node in nodes
+            }
+            if not owned:
+                continue
+            if workflow.status in TERMINAL_WORKFLOW_STATUSES:
+                terminal.add(workflow.request_id)
+            barrier = readiness_barrier(workflow)
+            if barrier is None:
+                continue
+            for node in owned:
+                barriers[node] = max(barrier, barriers.get(node, barrier))
+        for node, barrier in sorted(barriers.items()):
+            if node in published and published[node] > barrier:
+                continue
+            cluster_index, workflow_index, record = nodes[node]
+            written_at = clock()
+            publish_integrated_node_telemetry(
+                context,
+                record=record,
+                run_id=run_id,
+                cluster_index=cluster_index,
+                workflow_index=workflow_index,
+                now=written_at,
+            )
+            published[node] = written_at
+            delays.append((written_at - barrier).total_seconds())
+        polls += 1
+        if len(terminal) >= expected:
+            ended_by = "all-terminal"
+            break
+        if progress is not None and time.monotonic() >= next_progress:
+            progress({"polls": polls, "publishes": len(delays)})
+            next_progress = time.monotonic() + progress_seconds
+        sleep(poll_seconds)
+    return {
+        "mode": VALIDATION_WATCH_MODE,
+        "run_id": run_id,
+        "ended_by": ended_by,
+        "polls": polls,
+        "publishes": len(delays),
+        "nodes_watched": len(nodes),
+        "nodes_published": len(published),
+        "terminal_workflows": len(terminal),
+        "feed_truncated_polls": truncated,
+        "barrier_to_publish_seconds": delays,
+    }
+
+
+def stdin_closed() -> threading.Event:
+    """Set once stdin ends: the driver's stop signal for a watch session.
+
+    The session's program arrives length-prefixed on stdin, so the rest of
+    stdin stays open; ``kubectl exec -i`` forwards its close, including the
+    one a dying driver leaves behind.
+    """
+
+    closed = threading.Event()
+
+    def wait_for_eof() -> None:
+        try:
+            while sys.stdin.buffer.read(65536):
+                pass
+        finally:
+            closed.set()
+
+    threading.Thread(target=wait_for_eof, name="stdin-eof", daemon=True).start()
+    return closed
 
 
 def workflow_steps(
@@ -656,6 +893,61 @@ def workflow_steps(
     ]
 
 
+def refresh_document(
+    context: ApplicationContext,
+    seed_mode: str,
+    *,
+    run_id: str,
+    clusters: int,
+    now: datetime,
+) -> dict[str, object] | None:
+    """Run a refresh or watch mode and return its summary; ``None`` otherwise."""
+
+    lease_seconds = int(os.getenv("ACTION_AGENT_LEASE_SECONDS", "1800"))
+    workflows_per_cluster = int(os.getenv("ACTION_WORKFLOWS_PER_CLUSTER", "4"))
+    if seed_mode == "run-heartbeats":
+        telemetry = os.getenv(HEARTBEAT_TELEMETRY_ENV, "")
+        if telemetry not in {"", NODE_RETURN_TELEMETRY}:
+            raise RuntimeError(f"unsupported heartbeat telemetry: {telemetry}")
+        refreshed = refresh_run_agent_heartbeats(
+            context,
+            run_id=run_id,
+            clusters=clusters,
+            now=now,
+            lease_seconds=lease_seconds,
+            publish_telemetry=telemetry == NODE_RETURN_TELEMETRY,
+        )
+        return {
+            "run_id": run_id,
+            "clusters": clusters,
+            "agents_refreshed": refreshed,
+            "telemetry": telemetry or None,
+        }
+    if seed_mode == "integrated-heartbeats":
+        refreshed = refresh_integrated_agent_heartbeats(
+            context,
+            run_id=run_id,
+            clusters=clusters,
+            workflows_per_cluster=workflows_per_cluster,
+            lease_seconds=lease_seconds,
+        )
+        return {"run_id": run_id, "clusters": clusters, "agents_refreshed": refreshed}
+    if seed_mode == VALIDATION_WATCH_MODE:
+        return watch_validation_barriers(
+            context,
+            run_id=run_id,
+            clusters=clusters,
+            workflows_per_cluster=workflows_per_cluster,
+            stopped=stdin_closed().is_set,
+            poll_seconds=float(os.getenv("ACTION_WATCH_POLL_SECONDS", "1")),
+            deadline_seconds=float(os.getenv("ACTION_WATCH_DEADLINE_SECONDS", "3600")),
+            progress=lambda status: print(
+                json.dumps({"progress": status}, sort_keys=True), flush=True
+            ),
+        )
+    return None
+
+
 def main() -> None:
     run_id = os.environ["ACTION_RUN_ID"]
     clusters = int(os.environ["ACTION_CLUSTERS"])
@@ -665,52 +957,11 @@ def main() -> None:
     agents_created = 0
     now = datetime.now(timezone.utc)
     try:
-        if seed_mode == "run-heartbeats":
-            lease_seconds = int(os.getenv("ACTION_AGENT_LEASE_SECONDS", "1800"))
-            telemetry = os.getenv(HEARTBEAT_TELEMETRY_ENV, "")
-            if telemetry not in {"", NODE_RETURN_TELEMETRY}:
-                raise RuntimeError(f"unsupported heartbeat telemetry: {telemetry}")
-            refreshed = refresh_run_agent_heartbeats(
-                context,
-                run_id=run_id,
-                clusters=clusters,
-                now=now,
-                lease_seconds=lease_seconds,
-                publish_telemetry=telemetry == NODE_RETURN_TELEMETRY,
-            )
-            print(
-                json.dumps(
-                    {
-                        "run_id": run_id,
-                        "clusters": clusters,
-                        "agents_refreshed": refreshed,
-                        "telemetry": telemetry or None,
-                    },
-                    sort_keys=True,
-                )
-            )
-            return
-        if seed_mode == "integrated-heartbeats":
-            workflows_per_cluster = int(os.getenv("ACTION_WORKFLOWS_PER_CLUSTER", "4"))
-            lease_seconds = int(os.getenv("ACTION_AGENT_LEASE_SECONDS", "1800"))
-            refreshed = refresh_integrated_agent_heartbeats(
-                context,
-                run_id=run_id,
-                clusters=clusters,
-                workflows_per_cluster=workflows_per_cluster,
-                now=now,
-                lease_seconds=lease_seconds,
-            )
-            print(
-                json.dumps(
-                    {
-                        "run_id": run_id,
-                        "clusters": clusters,
-                        "agents_refreshed": refreshed,
-                    },
-                    sort_keys=True,
-                )
-            )
+        document = refresh_document(
+            context, seed_mode, run_id=run_id, clusters=clusters, now=now
+        )
+        if document is not None:
+            print(json.dumps(document, sort_keys=True))
             return
         agent_template, identity, identity_source = agent_source(context, now)
         if identity is not None:
@@ -835,7 +1086,10 @@ def main() -> None:
                 context.store.save_incident_and_workflow(incident, workflow)
                 created += 1
     finally:
-        context.store.close()
+        # A local session's in-memory store (tests) has nothing to close.
+        close = getattr(context.store, "close", None)
+        if close is not None:
+            close()
     print(
         json.dumps(
             {
