@@ -152,7 +152,12 @@ def main() -> int:
         patch = protect_guard_probe()
         arguments.append("--noconftest")
     else:
-        arguments.append("--collect-only")
+        # Assertion rewriting re-parses and re-compiles every test module in
+        # this fresh, bytecode-less process: 112 of the 148 profiled seconds of
+        # a whole-tree probe. It only rewrites `assert` statements, so which
+        # modules import what, every parametrization and the collected node
+        # ids are the same with plain asserts.
+        arguments.extend(("--collect-only", "--assert=plain"))
     try:
         return int(pytest.main([*arguments, *options.targets], plugins=[inventory]))
     finally:

@@ -10,6 +10,13 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+# A whole-tree probe collects ~47.7k tests in a fresh, bytecode-less process:
+# ~24 s alone on the 64-core gate host, ~28 s next to a pytest -n 16 run. The
+# assertion-rewriting probe before it took ~80 s alone and over 180 s at the
+# deploy gate's load (pytest -n 16 beside 16 PG shards and the artifact
+# build), a slowdown of 2.25x or more; even 3x keeps this probe at a quarter
+# of the limit.
+PROBE_TIMEOUT_SECONDS = 300
 GUARDS = (
     ("tests.hyperpod._cov95_provider_extra_safety", "provider-extra"),
     ("tests.orchestration._cov95_closure_extra_safety", "closure-extra"),
@@ -55,7 +62,7 @@ def run_probe(tmp_path, *, blocked, targets, guard=None, run_tests=False):
         },
         capture_output=True,
         text=True,
-        timeout=180,
+        timeout=PROBE_TIMEOUT_SECONDS,
         check=False,
     )
     assert output.is_file(), completed.stdout + completed.stderr
