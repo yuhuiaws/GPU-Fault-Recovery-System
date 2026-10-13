@@ -16,6 +16,19 @@ empty while the busy ceiling held them at 0.4 s). A backlog the store reports
 as lane-blocked keeps the busy ceiling regardless: its rows are already
 PENDING, so no notification edge announces the lane freeing up, and polling
 is the only way to drain that tail at the rate lanes free up.
+
+The fault stream never stretches to the notification fallback. The queue
+trigger notifies only an idle->busy (path, priority) edge, on the assumption
+that a woken claim loop polls until its streams are empty; a priority-0 row
+admitted while another one of its path is PENDING (lane-blocked, deferred,
+held by the observation interlock) is never announced. With every
+control-worker backed off to the 5 s fallback such rows waited in 5 s steps.
+The invariant the coordinator keeps instead: while a fault worker is free the
+fault stream is claimed at least every ``fault_idle`` (rounded up to the
+poll), one poll after a claim that returned rows without filling its limit,
+and at once when a fault worker finishes (``FaultSlotWake``). A silent
+priority-0 row therefore waits at most about ``fault_idle``; the routine
+streams keep the fallback, their documented polling contract.
 """
 
 from __future__ import annotations
@@ -36,9 +49,12 @@ class BackoffCeilings:
     notifications_enabled: bool
 
     def idle_ceiling(self, stream: str) -> float:
-        if self.notifications_enabled:
-            return self.notification_fallback
-        return self.fault_idle if stream == "fault" else self.idle
+        if stream == "fault":
+            # Notifications never announce a row behind a PENDING one.
+            if self.notifications_enabled:
+                return min(self.fault_idle, self.notification_fallback)
+            return self.fault_idle
+        return self.notification_fallback if self.notifications_enabled else self.idle
 
 
 def empty_round_ceiling(

@@ -73,7 +73,7 @@ from ._processor_leadership_cases_3 import (
     test_processor_completes_expired_inventory_as_stale,
     test_processor_discards_result_after_hard_deadline,
     test_processor_expires_context_only_after_newer_state_exists,
-    test_processor_notifications_wake_claims_and_extend_fallback,
+    test_processor_notifications_wake_claims_and_keep_fault_idle,
     test_processor_only_expires_healthy_telemetry_summaries,
     test_processor_releases_after_completion_retries_fail,
     test_processor_replay_rejects_nlb_source_and_execution_token,

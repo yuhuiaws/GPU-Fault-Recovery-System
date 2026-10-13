@@ -121,6 +121,7 @@ POSTGRES_TESTS = \
 	tests/orchestration/test_provider_correlation_postgres.py \
 	tests/processor/test_cov95_busy_takeover_postgres.py \
 	tests/processor/test_observation_interlock_liveness.py \
+	tests/processor/test_postgres_fault_stream_wake.py \
 	tests/processor/test_queue_priority_tiers.py \
 	tests/processor/test_routine_coalescing_boundaries.py \
 	tests/processor/test_telemetry_spool.py \

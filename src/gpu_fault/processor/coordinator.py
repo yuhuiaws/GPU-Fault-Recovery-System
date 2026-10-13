@@ -32,7 +32,7 @@ from gpu_fault.processor.batching import (
     HOST_TELEMETRY_BATCH_SIZE,
     telemetry_batch_size,
 )
-from gpu_fault.processor.lane_runtime import ProcessorLaneRuntimeMixin
+from gpu_fault.processor.lane_runtime import FaultSlotWake, ProcessorLaneRuntimeMixin
 from gpu_fault.processor.metrics import ProcessorMetricsMixin
 from gpu_fault.processor.claim_backoff import BackoffCeilings, empty_round_ceiling
 from gpu_fault.processor.models import (
@@ -141,15 +141,10 @@ class ProcessorCoordinator(
         self.training_progress_stale_seconds = stale.training_progress_stale_seconds
         poll_seconds = lease.poll_seconds
         self.poll_seconds = poll_seconds
-        # Each claim is its own transaction. Six worker replicas
-        # polling seven streams every 100ms cost about 500 commits a
-        # second with an empty queue, which measured out at more than
-        # half of what the Aurora writer can commit at 16 ACU: the
-        # idle control plane was consuming the capacity the burst
-        # needed. Streams that come back empty are therefore skipped
-        # for a doubling interval, capped here. The fault stream is
-        # exempt (see _claim_active_by_pool) so escalation latency is
-        # unchanged.
+        # Each claim is its own transaction: six worker replicas polling seven
+        # streams every 100ms cost ~500 commits/s on an empty queue, over half of
+        # what the Aurora writer commits at 16 ACU. Streams that come back empty
+        # are skipped for a doubling interval capped here (claim_backoff.py).
         self.idle_backoff_max_seconds = max(
             poll_seconds, lease.idle_backoff_max_seconds
         )
@@ -298,6 +293,7 @@ class ProcessorCoordinator(
         self._leadership: ProcessorLeadership | None = None
         self._stop = Event()
         self._work_available = Event()
+        self._fault_slot_wake = FaultSlotWake(self._work_available)
         self._notifications_enabled = False
         self._notification_listener_connected = False
         self._notification_shardless_episodes_total = 0
@@ -434,9 +430,9 @@ class ProcessorCoordinator(
         # A listener that is connected but owns no shard relays nothing: the
         # store forwards only the payloads of the shard it advisory-locked
         # (F-D11). With fewer shards than consumer processes the losers must
-        # stay pollers - the fault stream keeps its idle ceiling instead of
-        # stretching to the notification fallback - and must not report
-        # notifications enabled.
+        # stay pollers - their routine streams keep the polling ceilings
+        # instead of stretching to the notification fallback - and must not
+        # report notifications enabled.
         owns_shard = enabled and shard is not None
         shardless_started = False
         with self._state_lock:
@@ -717,6 +713,8 @@ class ProcessorCoordinator(
                 self._stream_idle_until.pop(stream, None)
                 self._stream_idle_interval.pop(stream, None)
                 self._stream_empty_rounds.pop(stream, None)
+        if self._fault_slot_wake.take():
+            self._stream_idle_until.pop("fault", None)
         self._check_execution_deadlines()
         for name, pool_futures in futures.items():
             completed = {future for future in pool_futures if future.done()}
@@ -790,7 +788,10 @@ class ProcessorCoordinator(
                 if available[pool_name] <= 0:
                     self._release(item)
                     continue
-                futures[pool_name].add(pools[pool_name].submit(self._process, item))
+                future = pools[pool_name].submit(self._process, item)
+                if pool_name == "fault":
+                    future.add_done_callback(self._fault_slot_wake.worker_finished)
+                futures[pool_name].add(future)
                 available[pool_name] -= 1
             while observation_requests:
                 batch = observation_requests[: self._OBSERVATION_BATCH_SIZE]
@@ -840,12 +841,9 @@ class ProcessorCoordinator(
                     else None,
                 )
             if not requests or not self._claim_saturated:
-                # Nothing claimed, or no claim filled its limit:
-                # either way the next round would re-run the
-                # claim query against the same drained or
-                # lane-blocked backlog. Sleep one poll interval
-                # so the query rate stays bounded; a consumer
-                # that is keeping up never gets here.
+                # Nothing claimed, or no claim filled its limit: the next round would
+                # re-run the claim against the same drained or lane-blocked backlog,
+                # so sleep to the next stream deadline (a wake cuts it short).
                 self._wait_for_work(self._next_claim_wait_seconds())
         except Exception:
             LOGGER.exception("processor request cycle failed")
@@ -931,6 +929,8 @@ class ProcessorCoordinator(
                     self._stream_idle_until.pop(stream, None)
                     self._stream_idle_interval.pop(stream, None)
                     self._stream_empty_rounds.pop(stream, None)
+                    if stream == "fault" and len(rows) < limit:
+                        self._stream_idle_until[stream] = monotonic + self.poll_seconds
                 else:
                     empty_rounds = self._stream_empty_rounds.get(stream, 0) + 1
                     self._stream_empty_rounds[stream] = empty_rounds
@@ -955,12 +955,12 @@ class ProcessorCoordinator(
                     interval = min(ceiling, next_interval)
                     self._stream_idle_interval[stream] = interval
                     self._stream_idle_until[stream] = monotonic + interval
-            # A sub-claim that filled its limit means there is more
-            # behind it, so the caller should come straight back. One
-            # that did not is either drained or lane-blocked, and the
-            # claim query is the most expensive statement in the
-            # system - re-issuing it with no wait burns a core and an
-            # Aurora connection for the same handful of rows.
+            # A sub-claim that filled its limit means there is more behind it, so
+            # the caller should come straight back. One that did not is drained or
+            # lane-blocked, and the claim query is the most expensive statement in
+            # the system: re-issuing it with no wait burns a core and an Aurora
+            # connection for the same rows. A short fault claim is re-polled after
+            # one poll: nothing announces a row queued behind a PENDING one.
             if len(rows) >= limit:
                 self._claim_saturated = True
             return rows

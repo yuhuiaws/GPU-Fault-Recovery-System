@@ -4,8 +4,9 @@ import base64
 import json
 import logging
 import time
+from concurrent.futures import Future
 from datetime import datetime, timedelta, timezone
-from threading import RLock
+from threading import Event, Lock, RLock
 from typing import Any, Protocol
 
 from gpu_fault.channel_registry import (
@@ -16,6 +17,36 @@ from gpu_fault.processor.completion_signals import ProcessorCompletionSignals
 from gpu_fault.processor.models import ProcessorRequest
 
 LOGGER = logging.getLogger(__name__)
+
+
+class FaultSlotWake:
+    """Turns finished fault workers into one claim-loop wake.
+
+    A fault worker that finishes frees a slot and, under the STRICT lane
+    policy, usually the lane of the next row too, and nothing announces that
+    row: the queue trigger notified (if at all) when it was admitted, while
+    its lane was still leased. ``worker_finished`` is the fault futures' done
+    callback: it runs on the worker thread (or inline for a future that is
+    already done), so it only raises a flag and sets the loop's event. Any
+    number of finishes between two cycles is one flag and one wake; the loop
+    thread ``take``s the flag before it reaps futures and claims the fault
+    stream at once.
+    """
+
+    def __init__(self, work_available: Event) -> None:
+        self._work_available = work_available
+        self._lock = Lock()
+        self._freed = False
+
+    def worker_finished(self, _future: Future[Any]) -> None:
+        with self._lock:
+            self._freed = True
+        self._work_available.set()
+
+    def take(self) -> bool:
+        with self._lock:
+            freed, self._freed = self._freed, False
+        return freed
 
 
 class ProcessorCoordinatorStore(Protocol):

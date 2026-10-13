@@ -687,7 +687,7 @@ def test_idle_streams_back_off_with_a_short_fault_ceiling() -> None:
     assert processor._stream_idle_interval["fault"] == pytest.approx(0.1)
 
 
-def test_processor_notifications_wake_claims_and_extend_fallback(monkeypatch) -> None:
+def test_processor_notifications_wake_claims_and_keep_fault_idle(monkeypatch) -> None:
     store = build_store()
     ready = Event()
     request_id = "request-notification-test"
@@ -729,7 +729,7 @@ def test_processor_notifications_wake_claims_and_extend_fallback(monkeypatch) ->
         available = {"fault": 1, "observation": 0, "gpu": 0, "host": 0}
         processor._stream_idle_interval["fault"] = 4.0
         processor._claim_active_by_pool(available, lease_duration=timedelta(seconds=30))
-        assert processor._stream_idle_interval["fault"] == pytest.approx(5.0)
+        assert processor._stream_idle_interval["fault"] == pytest.approx(0.5)
         processor.notify_work_available(
             '{"partition":0,"priority":0,'
             '"path":"/v1/gpu-events/xid",'

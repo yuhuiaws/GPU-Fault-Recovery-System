@@ -3480,12 +3480,21 @@ WAL flush so queue entries appear in commit order -- with one `pg_notify` per ro
 r1 run, 548k of them filtered as irrelevant by the listeners), and once v20 had removed the counter-row convoy the flushes
 reached COMMIT together and queued on that lock (2389 waits of 1 s or more in a 15-minute window, 70% of active statements
 COMMIT, Aurora CommitLatency 21-29 ms); the expired admission batches were the reserved 503s. Listeners treat
-notifications as hints: a woken claim loop polls until its streams are empty, so a key that already has PENDING work needs
-no second wakeup. The payload carries no `request_id` any more: one edge wakes every shard-owning listener
+notifications as hints: the trigger assumes a woken claim loop polls until its streams are empty, so a key that already has
+PENDING work gets no second wakeup. The empty-round backoff does not keep that assumption: a priority-0 row admitted while
+another row of its path is PENDING (lane leased, `not_before` deferred, held by the observation interlock) raises no
+notification, and with every control-worker's fault stream backed off to the 5 s fallback such rows waited in 5 s steps.
+The fault stream therefore does not rely on notifications: while a fault worker is free it is claimed at least every
+`fault_idle_backoff_max_seconds` (0.5 s, never below the poll, and the smaller of it and the fallback), a claim that
+returned rows without filling its limit is repeated after one poll, and a finishing fault worker wakes the claim loop at
+once (any number of finishes coalesce into one wake), so such a row waits at most about 0.5 s
+(`tests/processor/test_postgres_fault_stream_wake.py`: two shard-owning coordinators, no notification, claimed within
+0.6 s). The payload carries no `request_id` any more: one edge wakes every shard-owning listener
 (`notify_work_available` applies no shard filter to a payload without `request_id`; per-row payloads with one are still
-routed). A suppressed or lost edge costs at most one fallback poll: `processor_notification_fallback_seconds` for a
-shard owner (default 5 s, `GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS`), `fault_idle_backoff_max_seconds` 0.5 s /
-`idle_backoff_max_seconds` 2 s for a process without a shard, 0.1 / 0.4 s while busy.
+routed). A suppressed or lost edge on a routine stream costs at most one fallback poll:
+`processor_notification_fallback_seconds` for a shard owner (default 5 s,
+`GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS`), `idle_backoff_max_seconds` 2 s for a process without a shard, 0.4 s
+while busy; the fault stream stays at 0.5 s on every process, 0.1 s while busy.
 `tests/store/test_postgres_notify_edges.py` proves that the first PENDING row of a key notifies once, concurrent flushes on
 a busy key produce no notifying transaction, 12 concurrent first flushes of an idle key produce at most one, and the next
 row after the key drains notifies again.

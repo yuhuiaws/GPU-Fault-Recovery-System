@@ -138,7 +138,9 @@ def test_ceiling_rule_covers_every_branch() -> None:
     blocked = lambda: True  # noqa: E731
 
     assert quiet.idle_ceiling("fault") == 0.5 and quiet.idle_ceiling("host") == 2.0
-    assert noisy.idle_ceiling("fault") == noisy.idle_ceiling("host") == 5.0
+    # The fault stream never stretches to the fallback: the queue trigger
+    # announces only idle->busy edges.
+    assert noisy.idle_ceiling("fault") == 0.5 and noisy.idle_ceiling("host") == 5.0
     for stream, busy_ceiling in (("fault", 0.1), ("host", 0.4)):
         kwargs = {"stream": stream, "next_interval": 0.8}
         idle = quiet.idle_ceiling(stream)

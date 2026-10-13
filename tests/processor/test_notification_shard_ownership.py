@@ -4,9 +4,12 @@ FINAL-建议汇总 F-D11 (P1-14A, P1-75A, P2-75K, P3-75L, P1-28C, P0-38B). The
 store's listener only relays payloads for the advisory-locked shard it owns;
 with fewer shards than consumer processes the losers get nothing. Their
 listener still reported ``on_state(True, None)``, which the coordinator took
-as "notifications enabled": the fault stream's idle ceiling stretched from
-0.5 s to the 5 s notification fallback on a process that would never be
-woken, and ``/metrics`` said notifications were on.
+as "notifications enabled": the idle ceilings stretched to the 5 s
+notification fallback on a process that would never be woken, and
+``/metrics`` said notifications were on. The fault stream no longer stretches
+on any process (the queue trigger announces only idle->busy edges, so a
+priority-0 row queued behind a pending one is never announced); a shard owner
+still stretches the routine streams.
 """
 
 from __future__ import annotations
@@ -75,14 +78,14 @@ def test_a_shardless_process_keeps_the_polling_fault_backoff() -> None:
     assert processor._stream_idle_interval["fault"] == pytest.approx(0.5)
 
 
-def test_a_shard_owner_stretches_the_fault_backoff_to_the_fallback() -> None:
+def test_a_shard_owner_keeps_the_fault_backoff_at_fault_idle() -> None:
     processor = _processor(build_store())
     processor._set_notification_state(True, 0)
 
     processor._stream_idle_interval["fault"] = 4.0
     processor._claim_active_by_pool(AVAILABLE, lease_duration=timedelta(seconds=30))
 
-    assert processor._stream_idle_interval["fault"] == pytest.approx(5.0)
+    assert processor._stream_idle_interval["fault"] == pytest.approx(0.5)
 
 
 def test_shardless_transitions_are_counted_once_per_episode() -> None:
