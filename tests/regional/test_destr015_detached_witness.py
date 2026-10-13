@@ -1,15 +1,18 @@
 """Controller, verdict and runner-flow contracts of the detached DESTR-015 witnesses.
 
-The controller talks to the host through one-shot ``kubectl exec`` requests
-(faked at the ``regional.kubectl`` boundary), the verdict functions read only
-the durable records, and the runner flow is driven end to end through the
-branch harness, whose probes and witnesses refuse exactly where a NotReady node
-would refuse a real exec.
+The controller talks to the host through one interactive exec session per arm
+and collect (faked at the session opener: the request, its response, the clock
+pings and the end message) and one-shot ``kubectl exec`` requests for disarm
+and status (faked at the ``regional.kubectl`` boundary). The verdict functions
+read only the durable records, and the runner flow is driven end to end through
+the branch harness, whose probes and witnesses refuse exactly where a NotReady
+node would refuse a real exec.
 """
 
 from __future__ import annotations
 
 import json
+import time
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -317,6 +320,10 @@ def test_clock_binding_documents_the_offset_bound_the_arithmetic_uses() -> None:
     assert (
         verdicts.clock_binding([{"kind": "status", **exchanges[0]}])["bounded"] is False
     )
+    pinged = [exchanges[0], {**exchanges[0], "kind": "arm-ping"}, exchanges[1]]
+    assert verdicts.clock_binding(pinged)["exchanges"] == 3, "pings are clock samples"
+    foreign = [*exchanges, {**exchanges[1], "kind": "status-ping"}]
+    assert verdicts.clock_binding(foreign)["exchanges"] == 2, "only owned kinds count"
 
 
 # --------------------------------------------------------------------------- #
@@ -351,26 +358,149 @@ def response(kind: str, scope: Any, payload: dict[str, Any]) -> str:
     )
 
 
+class FakeStream:
+    """The interactive exec at the boundary, answering as the probe would.
+
+    The first line is the request: ``owner.answers`` gives the response line
+    (``None`` stays silent) and, as the probe does, the process stays for pings
+    only after an ``armed`` or ``collected`` response. Each ping is answered by
+    ``owner.pong`` (``None`` stays silent) on a host clock that moves on from
+    the response's; ``owner.end`` handles the end message.
+    """
+
+    def __init__(self, owner: SimpleNamespace, program: str) -> None:
+        self.owner = owner
+        self.program = program
+        self.written: list[dict[str, Any]] = []
+        self.stdout = ""
+        self.stderr = ""
+        self.open = True
+        self.closed = False
+        self.code: Any = 0
+        self.host_ns = 0
+
+    def write_stdin(self, data: str) -> None:
+        assert self.open, "nothing is written once the probe has exited"
+        assert data.endswith("\n") and data.count("\n") == 1, "one line per message"
+        message = json.loads(data)
+        self.written.append(message)
+        if len(self.written) == 1:
+            self._respond(message)
+        elif message["kind"] == "ping":
+            line = self.owner.pong(self, message)
+            if line is not None:
+                self.stdout += line + "\n"
+        else:
+            assert message["kind"] == "end" and message["payload"] == {}, message
+            self.owner.end(self)
+
+    def _respond(self, request: dict[str, Any]) -> None:
+        self.stderr += self.owner.stderr
+        text = self.owner.answers[request["kind"]](request)
+        if text is None:
+            return
+        self.stdout += text + "\n"
+        try:
+            reply = json.loads(text)
+            self.host_ns = reply["payload"]["host_clock"]["monotonic_ns"]
+        except (ValueError, KeyError, TypeError):
+            reply = {}
+        if not self.owner.answers_pings or reply.get("kind") not in {
+            "armed",
+            "collected",
+        }:
+            self.open = False
+
+    def read_stdout(self, timeout: float | None = None) -> str:
+        assert timeout == 0, "the controller never blocks on a read"
+        value, self.stdout = self.stdout, ""
+        return value
+
+    def read_stderr(self, timeout: float | None = None) -> str:
+        assert timeout == 0, "the controller never blocks on a read"
+        value, self.stderr = self.stderr, ""
+        return value
+
+    def is_open(self) -> bool:
+        return self.open
+
+    def update(self, timeout: float = 0) -> None:
+        assert 0 <= timeout <= 1, "every wait is bounded"
+        time.sleep(min(timeout, 0.001))
+
+    @property
+    def returncode(self) -> Any:
+        if self.open:
+            return None
+        if isinstance(self.code, Exception):
+            raise self.code
+        return self.code
+
+    def close(self) -> None:
+        self.open = False
+        self.closed = True
+
+
 @pytest.fixture
 def owned() -> SimpleNamespace:
     records = witness_records()
-    checks: list[str] = []
-    probe = SimpleNamespace(pod="probe-pod", _check_target=lambda: checks.append("uid"))
-    answers: dict[str, Any] = {}
+    wall = records.capture["end"]["wall_minus_monotonic_min_ns"]
+    owned = SimpleNamespace(
+        records=records,
+        checks=[],
+        answers={},
+        sessions=[],
+        stderr="",
+        answers_pings=True,
+    )
+    probe: Any = SimpleNamespace(
+        pod="probe-pod", _check_target=lambda: owned.checks.append("uid")
+    )
 
     def respond(request: dict[str, Any]) -> str:
-        return answers[request["kind"]](request)
+        return str(owned.answers[request["kind"]](request))
 
-    regional = FakeRegional(respond)
-    witness = controller.DetachedResetWitness(
-        regional, probe, records.scope, lifetime_seconds=3600
+    def opener(program: str) -> FakeStream:
+        stream = FakeStream(owned, program)
+        owned.sessions.append(stream)
+        return stream
+
+    def pong_message(stream: FakeStream, message: dict[str, Any]) -> dict[str, Any]:
+        stream.host_ns += 1_000_000
+        return {
+            "kind": "pong",
+            "scope_sha256": message["scope_sha256"],
+            "payload": {
+                "sequence": message["payload"]["sequence"],
+                "host_clock": {
+                    "monotonic_ns": stream.host_ns,
+                    "realtime_ns": wall + stream.host_ns,
+                },
+            },
+        }
+
+    def end(stream: FakeStream) -> None:
+        stream.open = False
+
+    owned.regional = FakeRegional(respond)
+    owned.witness = controller.DetachedResetWitness(
+        owned.regional,
+        probe,
+        records.scope,
+        lifetime_seconds=3600,
+        session_opener=opener,
     )
-    records.receipt["program_sha256"] = witness.bundle_sha256
-    answers["arm"] = lambda request: response("armed", records.scope, records.receipt)
-    answers["collect"] = lambda request: response(
+    owned.pong_message = pong_message
+    owned.pong = lambda stream, message: json.dumps(pong_message(stream, message))
+    owned.end = end
+    records.receipt["program_sha256"] = owned.witness.bundle_sha256
+    owned.answers["arm"] = lambda request: response(
+        "armed", records.scope, records.receipt
+    )
+    owned.answers["collect"] = lambda request: response(
         "collected", records.scope, records.collection
     )
-    answers["disarm"] = lambda request: response(
+    owned.answers["disarm"] = lambda request: response(
         "disarmed",
         records.scope,
         {
@@ -378,7 +508,7 @@ def owned() -> SimpleNamespace:
             "host_clock": records.collection["host_clock"],
         },
     )
-    answers["status"] = lambda request: response(
+    owned.answers["status"] = lambda request: response(
         "status",
         records.scope,
         {
@@ -386,16 +516,21 @@ def owned() -> SimpleNamespace:
             "host_clock": records.collection["host_clock"],
         },
     )
-    return SimpleNamespace(
-        witness=witness,
-        regional=regional,
-        records=records,
-        checks=checks,
-        answers=answers,
-    )
+    return owned
 
 
-def test_arm_delivers_the_pinned_bundle_and_binds_the_receipt(
+EXCHANGE_KEYS = {
+    "kind",
+    "sent_ns",
+    "received_ns",
+    "monotonic_ns",
+    "realtime_ns",
+    "runner_sent_realtime_ns",
+    "runner_received_realtime_ns",
+}
+
+
+def test_arm_runs_one_session_with_clock_pings_and_binds_the_receipt(
     owned: SimpleNamespace,
 ) -> None:
     receipt = owned.witness.arm()
@@ -403,39 +538,124 @@ def test_arm_delivers_the_pinned_bundle_and_binds_the_receipt(
     assert owned.witness.receipt is receipt and owned.witness.armed_at is not None
     program, digest = probe_program(controller.ROLE)
     assert owned.witness.bundle_sha256 == digest
-    plane, args, timeout = owned.regional.calls[0]
-    assert plane == "gpu" and timeout == controller.REQUEST_TIMEOUT_SECONDS
-    assert args == (
-        "exec",
-        "-i",
-        "probe-pod",
-        "-c",
-        "probe",
-        "--",
-        "chroot",
-        "/host",
-        controller.HOST_PYTHON,
-        "-I",
-        "-u",
-        "-c",
-        stdin_loader(program),
-    )
-    request = owned.regional.requests[0]
-    assert request["kind"] == "arm"
-    assert request["scope_sha256"] == owned.records.scope.digest()
+    assert owned.regional.calls == [], "arm never takes the one-shot exec"
+    (session,) = owned.sessions
+    assert session.program == program and session.closed is True
+    scope = owned.records.scope.digest()
+    request, *pings, end = session.written
+    assert request["kind"] == "arm" and request["scope_sha256"] == scope
     assert request["payload"]["scope"] == owned.records.scope.model_dump(mode="json")
     assert request["payload"]["lifetime_seconds"] == 3600
     assert type(request["payload"]["runner_clock"]["monotonic_ns"]) is int
+    assert pings == [
+        {"kind": "ping", "scope_sha256": scope, "payload": {"sequence": index}}
+        for index in range(controller.PING_COUNT)
+    ]
+    assert end == {"kind": "end", "scope_sha256": scope, "payload": {}}
     assert owned.checks == ["uid", "uid"], "identity is pinned before and after"
-    (exchange,) = owned.witness.exchanges
-    assert exchange["kind"] == "arm"
-    assert exchange["sent_ns"] <= exchange["received_ns"]
+    exchange, *samples = owned.witness.exchanges
+    assert set(exchange) == EXCHANGE_KEYS and exchange["kind"] == "arm"
     assert (
         exchange["monotonic_ns"] == owned.records.receipt["host_clock"]["monotonic_ns"]
     )
     assert exchange["realtime_ns"] == owned.records.receipt["host_clock"]["realtime_ns"]
+    assert [item["kind"] for item in samples] == ["arm-ping"] * controller.PING_COUNT
+    assert [item["sequence"] for item in samples] == list(range(controller.PING_COUNT))
+    assert all(set(item) == EXCHANGE_KEYS | {"sequence"} for item in samples), samples
+    stamps = [(item["sent_ns"], item["received_ns"]) for item in [exchange, *samples]]
+    assert all(sent <= received for sent, received in stamps), stamps
+    assert all(
+        later[0] >= earlier[1]
+        for earlier, later in zip(stamps, stamps[1:], strict=False)
+    ), "every sample's round trip starts after the previous one ended"
+    hosts = [item["monotonic_ns"] for item in [exchange, *samples]]
+    assert hosts == sorted(set(hosts)), "the host clock only moves forward"
+    assert owned.witness.clock_sessions == [
+        {
+            "kind": "arm",
+            "pings": controller.PING_COUNT,
+            "stopped": "complete",
+            "returncode": 0,
+        }
+    ]
     with pytest.raises(BoundaryDenied, match="armed twice"):
         owned.witness.arm()
+    assert len(owned.sessions) == 1, "a second arm opens no session"
+
+
+def test_disarm_and_status_stay_one_shot_execs_of_the_pinned_bundle(
+    owned: SimpleNamespace,
+) -> None:
+    owned.witness.arm()
+    owned.witness.disarm()
+    assert owned.witness.status()["run_id"] == owned.records.scope.run_id
+    program, _ = probe_program(controller.ROLE)
+    assert len(owned.sessions) == 1, "only arm and collect open a session"
+    assert [item["kind"] for item in owned.regional.requests] == ["disarm", "status"]
+    for plane, args, timeout in owned.regional.calls:
+        assert plane == "gpu" and timeout == controller.REQUEST_TIMEOUT_SECONDS
+        assert args == (
+            "exec",
+            "-i",
+            "probe-pod",
+            "-c",
+            "probe",
+            "--",
+            "chroot",
+            "/host",
+            controller.HOST_PYTHON,
+            "-I",
+            "-u",
+            "-c",
+            stdin_loader(program),
+        )
+    assert owned.checks == ["uid"] * 6, "identity is pinned around every request"
+    assert len(owned.witness.exchanges) == controller.PING_COUNT + 1
+    assert len(owned.witness.clock_sessions) == 1, "a one-shot exec is no sample"
+    owned.answers["status"] = lambda request: "\n"
+    with pytest.raises(BoundaryDenied, match="status returned no response"):
+        owned.witness.status()
+
+
+def test_the_default_session_is_a_verified_exec_of_the_pinned_bundle(
+    owned: SimpleNamespace, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    opened: list[dict[str, Any]] = []
+
+    def open_executor_stream(**kwargs: Any) -> FakeStream:
+        opened.append(kwargs)
+        stream = FakeStream(owned, kwargs["program"])
+        owned.sessions.append(stream)
+        return stream
+
+    monkeypatch.setattr(controller, "open_executor_stream", open_executor_stream)
+    settings = SimpleNamespace(
+        kubeconfig=Path("gpu-kubeconfig"),
+        context="gpu-context",
+        namespace="gpu-fault-acceptance",
+    )
+    probe: Any = SimpleNamespace(
+        pod="probe-pod", settings=settings, _check_target=lambda: None
+    )
+    witness = controller.DetachedResetWitness(
+        owned.regional, probe, owned.records.scope, lifetime_seconds=3600
+    )
+    assert witness.arm() == owned.records.receipt
+    program, _ = probe_program(controller.ROLE)
+    assert opened == [
+        {
+            "kubeconfig": "gpu-kubeconfig",
+            "context": "gpu-context",
+            "namespace": "gpu-fault-acceptance",
+            "pod": "probe-pod",
+            "container": "probe",
+            "chroot": "/host",
+            "python": controller.HOST_PYTHON,
+            "program": program,
+        }
+    ]
+    assert owned.regional.calls == [], "the session replaces the one-shot exec"
+    assert witness.clock_sessions[0]["stopped"] == "complete"
 
 
 @pytest.mark.parametrize(
@@ -491,26 +711,222 @@ def test_arm_refuses_refused_unbound_or_foreign_responses(
     with pytest.raises(BoundaryDenied, match=expected):
         owned.witness.arm()
     assert owned.witness.receipt is None and owned.witness.armed_at is None
+    (session,) = owned.sessions
+    assert session.closed is True, "the session is closed on every refusal"
     if defect in {"refused", "scope", "kind", "clock", "garbage", "empty", "shape"}:
         assert owned.witness.exchanges == [], "a refused arm records no clock exchange"
+        assert owned.witness.clock_sessions == [], "nor its session"
+        assert [item["kind"] for item in session.written] == ["arm"], (
+            "a refused or unbound response is never pinged"
+        )
+
+
+@pytest.mark.parametrize(
+    ("defect", "expected"),
+    [
+        ("silent", "arm returned no response"),
+        ("oversized", "arm output exceeds its bound"),
+        ("diagnostics", "arm output exceeds its bound"),
+        ("exit", "arm session exited with status 1"),
+        ("target", "probe Pod was replaced"),
+    ],
+)
+def test_a_session_that_is_not_bound_end_to_end_records_nothing(
+    owned: SimpleNamespace, monkeypatch: pytest.MonkeyPatch, defect: str, expected: str
+) -> None:
+    if defect == "silent":
+        monkeypatch.setattr(controller, "REQUEST_TIMEOUT_SECONDS", 0.05)
+        owned.answers["arm"] = lambda request: None
+    elif defect == "oversized":
+        owned.answers["arm"] = lambda request: "x" * (controller.MAX_MESSAGE_BYTES + 1)
+    elif defect == "diagnostics":
+        owned.stderr = "e" * (controller.MAX_MESSAGE_BYTES + 1)
+    elif defect == "exit":
+
+        def failed(stream: FakeStream) -> None:
+            stream.open, stream.code = False, 1
+
+        owned.end = failed
+    else:
+        checks: list[str] = []
+
+        def replaced() -> None:
+            checks.append("uid")
+            if len(checks) > 1:
+                raise BoundaryDenied("probe Pod was replaced during the request")
+
+        owned.witness.probe = SimpleNamespace(pod="probe-pod", _check_target=replaced)
+    with pytest.raises(BoundaryDenied, match=expected):
+        owned.witness.arm()
+    assert owned.witness.receipt is None and owned.witness.exchanges == []
+    assert owned.witness.clock_sessions == [], "nothing of the session is recorded"
+    (session,) = owned.sessions
+    assert session.closed is True, "the session is closed on every refusal"
+
+
+@pytest.mark.parametrize(
+    ("defect", "expected"),
+    [
+        ("refused", "ping refused: witness ping is unbound or out of sequence"),
+        ("scope", "ping is unbound"),
+        ("sequence", "ping is unbound"),
+        ("bool-sequence", "ping is unbound"),
+        ("kind", "ping is unbound"),
+        ("shape", "ping is unbound"),
+        ("clock", "ping is unbound"),
+        ("zero-clock", "ping is unbound"),
+        ("garbage", "ping is unbound"),
+        ("oversized", "output exceeds its bound"),
+        ("unordered", "ping is unordered"),
+    ],
+)
+def test_an_unbound_or_unordered_ping_refuses_the_whole_exchange(
+    owned: SimpleNamespace, defect: str, expected: str
+) -> None:
+    def pong(stream: FakeStream, message: dict[str, Any]) -> str:
+        reply = owned.pong_message(stream, message)
+        payload = reply["payload"]
+        if payload["sequence"] != 1:
+            return json.dumps(reply)
+        if defect == "refused":
+            reply = {
+                "kind": "refused",
+                "scope_sha256": reply["scope_sha256"],
+                "payload": {"reason": "witness ping is unbound or out of sequence"},
+            }
+        elif defect == "scope":
+            reply["scope_sha256"] = "0" * 64
+        elif defect == "sequence":
+            payload["sequence"] = 2
+        elif defect == "bool-sequence":
+            payload["sequence"] = True
+        elif defect == "kind":
+            reply["kind"] = "armed"
+        elif defect == "shape":
+            payload["extra"] = None
+        elif defect == "clock":
+            payload["host_clock"] = {"monotonic_ns": 1.5, "realtime_ns": 1}
+        elif defect == "zero-clock":
+            payload["host_clock"]["monotonic_ns"] = 0
+        elif defect == "garbage":
+            return "not json at all"
+        elif defect == "oversized":
+            return "x" * (controller.MAX_MESSAGE_BYTES + 1)
+        else:
+            payload["host_clock"]["monotonic_ns"] -= 2 * SECOND
+        return json.dumps(reply)
+
+    owned.pong = pong
+    with pytest.raises(BoundaryDenied, match=expected):
+        owned.witness.arm()
+    assert owned.witness.receipt is None and owned.witness.exchanges == [], (
+        "one unbound ping refuses the response and every sample with it"
+    )
+    assert owned.witness.clock_sessions == []
+    (session,) = owned.sessions
+    assert session.closed is True, "the session is closed on every refusal"
+    assert [item["kind"] for item in session.written] == ["arm", "ping", "ping"], (
+        "no ping follows an unbound pong"
+    )
+
+
+@pytest.mark.parametrize(
+    ("behaviour", "pings", "stopped", "returncode"),
+    [
+        ("silent", 0, "budget", 0),
+        ("no-budget", 0, "budget", 0),
+        ("exits", 3, "closed", 0),
+        ("vanishes", 1, "closed", 0),
+        ("lost", 1, "closed", None),
+        ("old-probe", 0, "closed", 0),
+        ("no-exit", controller.PING_COUNT, "complete", None),
+        ("no-status", controller.PING_COUNT, "complete", None),
+    ],
+)
+def test_a_short_or_missing_ping_series_keeps_the_bound_exchange(
+    owned: SimpleNamespace,
+    monkeypatch: pytest.MonkeyPatch,
+    behaviour: str,
+    pings: int,
+    stopped: str,
+    returncode: int | None,
+) -> None:
+    def lost(stream: FakeStream) -> None:
+        raise ConnectionResetError("exec stream lost")
+
+    def pong(stream: FakeStream, message: dict[str, Any]) -> str | None:
+        sequence = message["payload"]["sequence"]
+        if behaviour == "vanishes" and sequence == 1:
+            stream.open = False
+            return None
+        if behaviour == "lost" and sequence == 1:
+            owned.end = lost
+            lost(stream)
+        line = json.dumps(owned.pong_message(stream, message))
+        if behaviour == "exits" and sequence == 2:
+            stream.open = False
+        return line
+
+    def no_status(stream: FakeStream) -> None:
+        stream.open, stream.code = False, ValueError("no status on the error channel")
+
+    owned.pong = pong
+    if behaviour == "silent":
+        monkeypatch.setattr(controller, "PING_BUDGET_SECONDS", 0.05)
+        owned.pong = lambda stream, message: None
+    elif behaviour == "no-budget":
+        monkeypatch.setattr(controller, "PING_BUDGET_SECONDS", 0)
+    elif behaviour == "old-probe":
+        owned.answers_pings = False
+    elif behaviour == "no-exit":
+        monkeypatch.setattr(controller, "SESSION_CLOSE_SECONDS", 0.05)
+        owned.end = lambda stream: None
+    elif behaviour == "no-status":
+        owned.end = no_status
+    assert owned.witness.arm() == owned.records.receipt, "the exchange stays bound"
+    assert [item["kind"] for item in owned.witness.exchanges] == [
+        "arm",
+        *["arm-ping"] * pings,
+    ]
+    assert owned.witness.clock_sessions == [
+        {"kind": "arm", "pings": pings, "stopped": stopped, "returncode": returncode}
+    ]
+    (session,) = owned.sessions
+    assert session.closed is True, "the session is always closed"
 
 
 def test_collect_binds_the_records_to_the_arm_scope(owned: SimpleNamespace) -> None:
     with pytest.raises(BoundaryDenied, match="never armed"):
         owned.witness.collect()
+    assert owned.sessions == [], "an unarmed witness is never execd"
     owned.witness.arm()
     collection = owned.witness.collect()
     assert collection == owned.records.collection
     assert owned.witness.collection is collection
-    assert [item["kind"] for item in owned.witness.exchanges] == ["arm", "collect"]
-    assert owned.regional.requests[-1] == {
+    count = controller.PING_COUNT
+    assert [item["kind"] for item in owned.witness.exchanges] == [
+        "arm",
+        *["arm-ping"] * count,
+        "collect",
+        *["collect-ping"] * count,
+    ]
+    assert owned.sessions[-1].written[0] == {
         "kind": "collect",
         "scope_sha256": owned.records.scope.digest(),
         "payload": {"run_id": owned.records.scope.run_id},
     }
+    host_clock = owned.records.collection["host_clock"]
+    assert (
+        owned.witness.exchanges[count + 1]["monotonic_ns"]
+        == (host_clock["monotonic_ns"])
+    )
+    assert owned.witness.clock_sessions == [
+        {"kind": kind, "pings": count, "stopped": "complete", "returncode": 0}
+        for kind in ("arm", "collect")
+    ]
     owned.witness.disarm()
     owned.witness.status()
-    assert [item["kind"] for item in owned.witness.exchanges] == ["arm", "collect"], (
+    assert len(owned.witness.exchanges) == 2 * (count + 1), (
         "disarm and status never extend the clock calibration"
     )
     evidence = owned.witness.evidence()
@@ -518,6 +934,8 @@ def test_collect_binds_the_records_to_the_arm_scope(owned: SimpleNamespace) -> N
     assert evidence["collection"] == owned.records.collection
     assert evidence["lifetime_seconds"] == 3600
     assert evidence["bundle_sha256"] == owned.witness.bundle_sha256
+    assert evidence["exchanges"] == owned.witness.exchanges
+    assert evidence["clock_sessions"] == owned.witness.clock_sessions
 
 
 @pytest.mark.parametrize(
@@ -569,6 +987,7 @@ def test_source_drift_between_requests_is_refused(
     with pytest.raises(BoundaryDenied, match="source changed"):
         owned.witness.arm()
     assert owned.regional.calls == [], "changed source must not be dispatched"
+    assert owned.sessions == [], "nor opened as a session"
 
 
 def test_witness_lifetime_is_bounded_by_the_window_and_the_case_budgets() -> None:
@@ -704,9 +1123,27 @@ def test_witnesses_are_armed_before_the_injection_and_collected_after_both_retur
             "arm",
             "collect",
         ]
+        calibration = intervals[node]["clock_calibration"]
+        assert calibration == verdicts.clock_calibration(intervals[node]["exchanges"])
+        assert calibration["samples"] == 2 and calibration["min_round_trip_ms"] > 0
+    assert report["clock_calibration"] == {
+        node: intervals[node]["clock_calibration"] for node in NODES
+    }, "the verdict JSON itself carries each node's calibration summary"
     returned = json.loads((case_dir / "hosts-return.json").read_text())
     assert all(returned[node]["exec_allowed"] is True for node in NODES), returned
     assert report["cleanup"][f"witness_disarm:{NODES[0]}"]["state_present"] is True
+
+
+def test_the_verdict_keeps_only_each_nodes_calibration_summary() -> None:
+    summary = {"samples": 18, "min_round_trip_ms": 20.0, "offset_uncertainty_ms": 70.5}
+    intervals = {
+        NODES[0]: {"exchanges": [{"kind": "arm"}], "clock_calibration": summary},
+        NODES[1]: {"exchanges": []},
+    }
+    assert controller.verdict_clock_calibration(intervals) == {
+        NODES[0]: summary,
+        NODES[1]: None,
+    }, "the exchanges stay in physical-reset-intervals.json"
 
 
 def test_a_witness_that_cannot_be_placed_refuses_before_the_injection(

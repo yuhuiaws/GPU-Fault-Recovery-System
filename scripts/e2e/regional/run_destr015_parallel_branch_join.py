@@ -61,6 +61,7 @@ from scripts.e2e.regional.destr015_detached_witness import (  # noqa: E402
     await_hosts_return,
     collect_witness_intervals,
     node_answers_for_cleanup,
+    verdict_clock_calibration,
     witness_lifetime_seconds,
 )
 from scripts.e2e.regional.destr015_physical_evidence import (  # noqa: E402
@@ -1257,6 +1258,9 @@ def execute_case(
                 "injected_at": run.injected_at,
                 "event_observed_at": observed,
                 "provider_events": hosts.get("provider_events"),
+                "clock_calibration": verdict_clock_calibration(
+                    hosts.get("physical_reset_intervals") or {}
+                ),
                 "restart_budget": state.get("restart_budget"),
                 "case_digest": case_digest(components),
                 "components": components,

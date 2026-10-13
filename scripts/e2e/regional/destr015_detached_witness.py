@@ -6,24 +6,30 @@ DESTR-015 quiesces both nodes in parallel. The witness therefore runs detached
 on the host (``probes/destr015_witness_probe.py`` as a ``systemd-run`` unit)
 and this controller talks to it only while kubelet answers: ``arm`` before the
 injection, ``collect`` after the node is Ready again, ``disarm``/``status`` for
-cleanup. Each request is one bounded ``kubectl exec -i`` that delivers the
-pinned bundle and a single JSON line; the runner's monotonic clock is sampled
-around the arm and collect requests and paired with the host clock the probe
-returns, which is what lets the verdict align the host's interval records to
-the runner's clock with a bounded uncertainty.
+cleanup. Every request delivers the pinned bundle and a single JSON line. The
+runner's monotonic clock is sampled around the arm and collect requests and
+paired with the host clock the probe returns, which is what lets the verdict
+align the host's interval records to the runner's clock with a bounded
+uncertainty. Those requests pay the exec setup, the interpreter start and the
+handler's work inside their round trip, so each runs as one interactive exec
+session that stays open after the response for a short series of clock pings,
+whose much shorter round trips bound the offset; ``disarm`` and ``status`` stay
+one-shot ``kubectl exec -i`` calls.
 """
 
 from __future__ import annotations
 
 import json
 import time
+from collections.abc import Callable
 from datetime import datetime
-from typing import Any
+from typing import Any, Final
 
 from scripts.e2e.regional.acceptance_runner_common import write_json_atomic
 from scripts.e2e.regional.destr015_physical_evidence import ResetIntervalScope
 from scripts.e2e.regional.destr015_verdicts import (
     clock_binding,
+    clock_calibration,
     physical_witness_errors,
 )
 from scripts.e2e.regional.destr_barrier_authorization import host_reachability
@@ -33,9 +39,10 @@ from scripts.e2e.regional.late_ownership_probe_bundle import (
     probe_program,
     stdin_loader,
 )
+from scripts.e2e.regional.late_ownership_stream import open_executor_stream
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 
-ROLE = "reset-interval-detached"
+ROLE: Final = "reset-interval-detached"
 HOST_PYTHON = "/opt/gpu-fault/current/venv/bin/python"
 STATE_ROOT = "/var/lib/gpu-fault-acceptance/destr015"
 UNIT_PREFIX = "gpu-fault-destr015-witness-"
@@ -57,6 +64,16 @@ RESPONSES = {
     "status": "status",
 }
 EXCHANGE_KINDS = frozenset({"arm", "collect"})
+# Inside each arm and collect session, after the response: up to PING_COUNT
+# clock pings within PING_BUDGET_SECONDS. A ping's round trip is one line each
+# way over the open exec, so the shortest one bounds the clock offset; a short
+# or missing series only leaves the bound at what the request itself proved.
+PING_COUNT = 8
+PING_BUDGET_SECONDS = 2.0
+# How long the runner waits for the probe to exit after its end message.
+SESSION_CLOSE_SECONDS = 10
+# The probe bounds every line it prints; its diagnostics share the bound.
+MAX_MESSAGE_BYTES = 65536
 
 
 def witness_lifetime_seconds(*, now: datetime, maintenance_end: datetime) -> int:
@@ -87,6 +104,26 @@ def _clock(value: Any) -> dict[str, int] | None:
     ):
         return None
     return {"monotonic_ns": value["monotonic_ns"], "realtime_ns": value["realtime_ns"]}
+
+
+def _sample(
+    sent: tuple[int, int], received: tuple[int, int], clock: dict[str, int]
+) -> dict[str, int]:
+    """One clock exchange: the runner's (monotonic, realtime) stamps around the
+    host clock the probe sampled in between."""
+
+    return {
+        "sent_ns": sent[0],
+        "received_ns": received[0],
+        "monotonic_ns": clock["monotonic_ns"],
+        "realtime_ns": clock["realtime_ns"],
+        "runner_sent_realtime_ns": sent[1],
+        "runner_received_realtime_ns": received[1],
+    }
+
+
+def _stamp() -> tuple[int, int]:
+    return time.monotonic_ns(), time.time_ns()
 
 
 def arm_receipt_errors(
@@ -180,8 +217,144 @@ def collection_binding_errors(
     return errors
 
 
+class WitnessSession:
+    """One interactive exec of the pinned bundle: the request, its response,
+    the clock pings and the end message share one open stdin and stdout."""
+
+    def __init__(self, stream: Any, *, kind: str, scope_sha256: str) -> None:
+        self.stream = stream
+        self.kind = kind
+        self.scope_sha256 = scope_sha256
+        self.buffer = ""
+        self.diagnostic_bytes = 0
+
+    def send(self, kind: str, payload: dict[str, Any]) -> None:
+        message = {"kind": kind, "scope_sha256": self.scope_sha256, "payload": payload}
+        self.stream.write_stdin(
+            json.dumps(message, separators=(",", ":"), allow_nan=False) + "\n"
+        )
+
+    def line(self, deadline: float) -> str | None:
+        """The next non-empty stdout line; None once the stream closed or the
+        monotonic ``deadline`` passed without one."""
+
+        while True:
+            self.buffer += self.stream.read_stdout(timeout=0)
+            self.diagnostic_bytes += len(self.stream.read_stderr(timeout=0).encode())
+            head, newline, rest = self.buffer.partition("\n")
+            if (
+                len(head.encode()) > MAX_MESSAGE_BYTES
+                or self.diagnostic_bytes > MAX_MESSAGE_BYTES
+            ):
+                raise BoundaryDenied(
+                    f"physical witness {self.kind} output exceeds its bound"
+                )
+            if newline:
+                self.buffer = rest
+                if head.strip():
+                    return head
+                continue
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not self.stream.is_open():
+                return None
+            self.stream.update(timeout=min(1.0, remaining))
+
+    def _pong(self, line: str, sequence: int) -> dict[str, int]:
+        try:
+            message = json.loads(line)
+        except ValueError:
+            message = None
+        if (
+            not isinstance(message, dict)
+            or set(message) != {"kind", "scope_sha256", "payload"}
+            or not isinstance(message["payload"], dict)
+        ):
+            raise BoundaryDenied(f"physical witness {self.kind} ping is unbound")
+        payload = message["payload"]
+        if message["kind"] == "refused":
+            raise BoundaryDenied(
+                f"physical witness {self.kind} ping refused: {payload.get('reason')}"
+            )
+        clock = _clock(payload.get("host_clock"))
+        if (
+            message["kind"] != "pong"
+            or message["scope_sha256"] != self.scope_sha256
+            or set(payload) != {"sequence", "host_clock"}
+            or type(payload["sequence"]) is not int
+            or payload["sequence"] != sequence
+            or clock is None
+            or clock["monotonic_ns"] <= 0
+        ):
+            raise BoundaryDenied(f"physical witness {self.kind} ping is unbound")
+        return clock
+
+    def pings(self, *, after: int) -> tuple[list[dict[str, Any]], str]:
+        """Up to ``PING_COUNT`` pings within ``PING_BUDGET_SECONDS``.
+
+        A ping the probe does not answer within the budget, or a lost channel,
+        ends the series and keeps what was answered (``stopped`` names why). A
+        pong that is unbound, out of sequence or earlier on the host clock than
+        the sample before it (``after``) refuses the whole exchange.
+        """
+
+        entries: list[dict[str, Any]] = []
+        deadline = time.monotonic() + PING_BUDGET_SECONDS
+        for sequence in range(PING_COUNT):
+            if time.monotonic() >= deadline:
+                return entries, "budget"
+            if not self.stream.is_open():
+                return entries, "closed"
+            sent = _stamp()
+            try:
+                self.send("ping", {"sequence": sequence})
+                line = self.line(deadline)
+            except BoundaryDenied:
+                raise
+            except Exception:  # noqa: BLE001 - a lost channel only shortens the series
+                return entries, "closed"
+            received = _stamp()
+            if line is None:
+                return entries, "budget" if self.stream.is_open() else "closed"
+            clock = self._pong(line, sequence)
+            if clock["monotonic_ns"] < after:
+                raise BoundaryDenied(f"physical witness {self.kind} ping is unordered")
+            after = clock["monotonic_ns"]
+            entries.append(
+                {
+                    "kind": f"{self.kind}-ping",
+                    "sequence": sequence,
+                    **_sample(sent, received, clock),
+                }
+            )
+        return entries, "complete"
+
+    def end(self) -> int | None:
+        """Send the end message and wait, bounded, for the probe's exit status.
+
+        Anything printed after the end message (a pong that missed the budget)
+        is discarded; ``None`` when the status stays unknown.
+        """
+
+        deadline = time.monotonic() + SESSION_CLOSE_SECONDS
+        try:
+            if self.stream.is_open():
+                self.send("end", {})
+            while self.stream.is_open() and time.monotonic() < deadline:
+                self.stream.update(timeout=min(1.0, deadline - time.monotonic()))
+                self.stream.read_stdout(timeout=0)
+                self.stream.read_stderr(timeout=0)
+            code = self.stream.returncode
+        except Exception:  # noqa: BLE001 - an unreadable exit status stays unknown
+            return None
+        return code if type(code) is int else None
+
+    def close(self) -> None:
+        self.stream.close()
+
+
 class DetachedResetWitness:
-    """One node's detached witness, driven through bounded one-shot execs."""
+    """One node's detached witness: arm and collect run as interactive exec
+    sessions with clock pings, disarm and status as bounded one-shot execs."""
 
     def __init__(
         self,
@@ -190,54 +363,43 @@ class DetachedResetWitness:
         scope: ResetIntervalScope,
         *,
         lifetime_seconds: int,
+        session_opener: Callable[[str], Any] | None = None,
     ) -> None:
         self.regional = regional
         self.probe = probe
         self.scope = scope
         self.lifetime_seconds = int(lifetime_seconds)
+        self.session_opener = session_opener or self._open_session
         self.program, self.bundle_sha256 = probe_program(ROLE)
         self.receipt: dict[str, Any] | None = None
         self.collection: dict[str, Any] | None = None
         self.last_status: dict[str, Any] | None = None
         self.exchanges: list[dict[str, Any]] = []
+        self.clock_sessions: list[dict[str, Any]] = []
         self.armed_at: datetime | None = None
 
-    def _request(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
-        program, digest = probe_program(ROLE)
-        if digest != self.bundle_sha256:
-            raise BoundaryDenied("physical witness source changed during the case")
-        self.probe._check_target()
-        request = json.dumps(
-            {"kind": kind, "scope_sha256": self.scope.digest(), "payload": payload},
-            separators=(",", ":"),
-            allow_nan=False,
+    def _open_session(self, program: str) -> Any:
+        settings = self.probe.settings
+        return open_executor_stream(
+            kubeconfig=str(settings.kubeconfig),
+            context=settings.context,
+            namespace=settings.namespace,
+            pod=self.probe.pod,
+            container="probe",
+            chroot="/host",
+            python=HOST_PYTHON,
+            program=program,
         )
-        sent, sent_wall = time.monotonic_ns(), time.time_ns()
-        output = self.regional.kubectl(
-            "gpu",
-            "exec",
-            "-i",
-            self.probe.pod,
-            "-c",
-            "probe",
-            "--",
-            "chroot",
-            "/host",
-            HOST_PYTHON,
-            "-I",
-            "-u",
-            "-c",
-            stdin_loader(program),
-            input_text=program + request + "\n",
-            timeout=REQUEST_TIMEOUT_SECONDS,
-        )
-        received, received_wall = time.monotonic_ns(), time.time_ns()
-        self.probe._check_target()
-        lines = [line for line in str(output).splitlines() if line.strip()]
-        if not lines:
+
+    def _result(
+        self, kind: str, line: str | None
+    ) -> tuple[dict[str, Any], dict[str, int]]:
+        """The payload and host clock of one bound response line."""
+
+        if line is None:
             raise BoundaryDenied(f"physical witness {kind} returned no response")
         try:
-            response = json.loads(lines[-1])
+            response = json.loads(line)
         except ValueError:
             raise BoundaryDenied(
                 f"physical witness {kind} response is not a protocol message"
@@ -261,19 +423,84 @@ class DetachedResetWitness:
         host_clock = _clock(result.get("host_clock"))
         if host_clock is None:
             raise BoundaryDenied(f"physical witness {kind} returned no clock binding")
-        if kind in EXCHANGE_KINDS:
-            self.exchanges.append(
-                {
-                    "kind": kind,
-                    "sent_ns": sent,
-                    "received_ns": received,
-                    "monotonic_ns": host_clock["monotonic_ns"],
-                    "realtime_ns": host_clock["realtime_ns"],
-                    "runner_sent_realtime_ns": sent_wall,
-                    "runner_received_realtime_ns": received_wall,
-                }
+        return result, host_clock
+
+    def _calibrated(
+        self, kind: str, program: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        """One interactive exec: the request and its response, then the pings.
+
+        A refused or unbound response sends no ping, the session is always
+        closed, and nothing is recorded unless the whole session was bound, the
+        probe did not report a failed exit and the target is still the pinned
+        one.
+        """
+
+        deadline = time.monotonic() + REQUEST_TIMEOUT_SECONDS
+        session = WitnessSession(
+            self.session_opener(program), kind=kind, scope_sha256=self.scope.digest()
+        )
+        try:
+            # The host samples its clock only after it read this request.
+            sent = _stamp()
+            session.send(kind, payload)
+            line = session.line(deadline)
+            received = _stamp()
+            result, host_clock = self._result(kind, line)
+            exchange = {"kind": kind, **_sample(sent, received, host_clock)}
+            pings, stopped = session.pings(after=host_clock["monotonic_ns"])
+            returncode = session.end()
+        finally:
+            session.close()
+        if returncode not in (0, None):
+            raise BoundaryDenied(
+                f"physical witness {kind} session exited with status {returncode}"
             )
+        self.probe._check_target()
+        self.exchanges.extend([exchange, *pings])
+        self.clock_sessions.append(
+            {
+                "kind": kind,
+                "pings": len(pings),
+                "stopped": stopped,
+                "returncode": returncode,
+            }
+        )
         return result
+
+    def _request(self, kind: str, payload: dict[str, Any]) -> dict[str, Any]:
+        program, digest = probe_program(ROLE)
+        if digest != self.bundle_sha256:
+            raise BoundaryDenied("physical witness source changed during the case")
+        self.probe._check_target()
+        if kind in EXCHANGE_KINDS:
+            return self._calibrated(kind, program, payload)
+        request = json.dumps(
+            {"kind": kind, "scope_sha256": self.scope.digest(), "payload": payload},
+            separators=(",", ":"),
+            allow_nan=False,
+        )
+        output = self.regional.kubectl(
+            "gpu",
+            "exec",
+            "-i",
+            self.probe.pod,
+            "-c",
+            "probe",
+            "--",
+            "chroot",
+            "/host",
+            HOST_PYTHON,
+            "-I",
+            "-u",
+            "-c",
+            stdin_loader(program),
+            input_text=program + request + "\n",
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        self.probe._check_target()
+        lines = [line for line in str(output).splitlines() if line.strip()]
+        return self._result(kind, lines[-1] if lines else None)[0]
 
     def arm(self) -> dict[str, Any]:
         if self.receipt is not None:
@@ -332,6 +559,7 @@ class DetachedResetWitness:
             "receipt": self.receipt,
             "collection": self.collection,
             "exchanges": list(self.exchanges),
+            "clock_sessions": list(self.clock_sessions),
         }
 
 
@@ -415,7 +643,11 @@ def collect_witness_intervals(
             "exchanges": witness.exchanges,
         }
     intervals = {
-        node: {**witness.evidence(), "clock_binding": clock_binding(witness.exchanges)}
+        node: {
+            **witness.evidence(),
+            "clock_binding": clock_binding(witness.exchanges),
+            "clock_calibration": clock_calibration(witness.exchanges),
+        }
         for node, witness in run.physical_witnesses.items()
     }
     write_json_atomic(run.case_dir / "physical-reset-intervals.json", intervals)
@@ -425,6 +657,20 @@ def collect_witness_intervals(
         )
     )
     return errors, intervals
+
+
+def verdict_clock_calibration(intervals: dict[str, Any]) -> dict[str, Any]:
+    """Each node's ``clock_calibration`` for the verdict JSON itself.
+
+    ``physical-reset-intervals.json`` keeps every exchange; the verdict keeps
+    the summary, so a failed overlap shows there whether it was lost to skew
+    or to calibration. A node without a summary maps to ``None``.
+    """
+
+    return {
+        node: item.get("clock_calibration") if isinstance(item, dict) else None
+        for node, item in intervals.items()
+    }
 
 
 def node_answers_for_cleanup(run: Any, node: str, result: dict[str, Any]) -> bool:

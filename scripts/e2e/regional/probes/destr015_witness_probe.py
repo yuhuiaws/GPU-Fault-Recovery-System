@@ -13,15 +13,18 @@ while kubelet is up: one ``arm`` exec before the injection, one ``collect``
 exec after the node is Ready again, and ``disarm``/``status`` for cleanup.
 
 Requests arrive as one JSON line on stdin (the pinned bundle loader delivers
-the program itself); the unit is started with ``witness --run-id`` and runs the
-same program from the durable copy ``arm`` made. Every record carries the
-host's monotonic and realtime clocks and its boot id, so the verdict can bind
-the records to the arm..collect window on one boot and align them to the
-runner's clock through the two bounded exchanges. The witness never signals,
-stops or restarts the Node Agent; it attaches a read-only exec trace to it,
-exactly as the streaming probe did, and stops itself at its deadline. Nothing
-outside the run's own state directory and transient unit is ever touched, and
-no record carries raw argv.
+the program itself); after an ``armed`` or ``collected`` response the probe
+stays on the same stdin and answers the runner's clock pings, each with the
+host clock sampled on arrival, until the runner's end message. The unit is
+started with ``witness --run-id`` and runs the same program from the durable
+copy ``arm`` made. Every record carries the host's monotonic and realtime
+clocks and its boot id, so the verdict can bind the records to the
+arm..collect window on one boot and align them to the runner's clock through
+the bounded arm and collect exchanges and their pings. The witness never
+signals, stops or restarts the Node Agent; it attaches a read-only exec trace
+to it, exactly as the streaming probe did, and stops itself at its deadline.
+Nothing outside the run's own state directory and transient unit is ever
+touched, and no record carries raw argv.
 """
 
 from __future__ import annotations
@@ -30,12 +33,14 @@ import argparse
 import hashlib
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
 import sqlite3
 import subprocess
 import sys
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -97,6 +102,13 @@ UNIT_SLACK_SECONDS = 120
 ARM_WAIT_SECONDS = 45
 FINISH_WAIT_SECONDS = 45
 POLL_SECONDS = 0.2
+# After an armed or collected response the runner pings the host clock over
+# the same stdin. Each wait, the series and its total time are bounded, so a
+# silent runner never keeps the exec alive.
+PING_WAIT_SECONDS = 10
+MAX_PINGS = 16
+PING_TOTAL_SECONDS = 30
+CALIBRATED_RESPONSES = frozenset({"armed", "collected"})
 START_KEYS = (
     "scope_sha256",
     "witness_id",
@@ -618,15 +630,96 @@ def handle_request(request: Any, *, state_root: Path | None = None) -> dict[str,
     return {"kind": RESPONSES[kind], "scope_sha256": scope_sha256, "payload": payload}
 
 
-def emit(response: dict[str, Any]) -> None:
+def emit(response: dict[str, Any]) -> str:
+    """Print one bounded response line; returns the kind actually printed."""
+
     text = json.dumps(response, sort_keys=True, separators=(",", ":"), allow_nan=False)
+    kind = str(response.get("kind"))
     if len(text.encode()) > MAX_MESSAGE_BYTES:
+        kind = "refused"
         text = json.dumps(
             refused(response.get("scope_sha256"), "witness response is oversized"),
             sort_keys=True,
             separators=(",", ":"),
         )
     print(text, flush=True)
+    return kind
+
+
+def _ping_sequence(line: str, scope_sha256: str) -> int | str | None:
+    """A bound ping's sequence, ``"end"`` for the end message, else None."""
+
+    if len(line.encode()) > MAX_MESSAGE_BYTES:
+        return None
+    try:
+        message = json.loads(line)
+    except ValueError:
+        return None
+    if (
+        not isinstance(message, dict)
+        or set(message) != {"kind", "scope_sha256", "payload"}
+        or message["scope_sha256"] != scope_sha256
+        or not isinstance(message["payload"], dict)
+    ):
+        return None
+    payload = message["payload"]
+    if message["kind"] == "end" and payload == {}:
+        return "end"
+    if (
+        message["kind"] != "ping"
+        or set(payload) != {"sequence"}
+        or type(payload["sequence"]) is not int
+    ):
+        return None
+    sequence: int = payload["sequence"]
+    return sequence
+
+
+def answer_pings(scope_sha256: str) -> None:
+    """Answer the runner's clock pings on stdin until its end message.
+
+    Each pong carries the host clock sampled when its ping arrived, so the
+    runner bounds the clock offset by that round trip rather than by the exec
+    setup and the handler's work. EOF, the end message or a wait or series
+    bound ends the session; an unbound ping is refused and ends it too. The
+    lines come through a reader thread so every wait stays bounded: the
+    descriptor itself is never polled, because ``sys.stdin`` may already hold
+    buffered input.
+    """
+
+    lines: queue.Queue[str | None] = queue.Queue()
+
+    def read() -> None:
+        for _ in range(MAX_PINGS + 1):
+            line = sys.stdin.readline(MAX_MESSAGE_BYTES + 1)
+            lines.put(line or None)
+            if not line:
+                return
+
+    threading.Thread(target=read, name="destr015-ping-reader", daemon=True).start()
+    deadline = time.monotonic() + PING_TOTAL_SECONDS
+    for expected in range(MAX_PINGS + 1):
+        wait = min(PING_WAIT_SECONDS, deadline - time.monotonic())
+        try:
+            line = lines.get(timeout=max(0.0, wait))
+        except queue.Empty:
+            return
+        clock = host_clock()
+        if line is None:
+            return
+        sequence = _ping_sequence(line, scope_sha256)
+        if sequence == "end":
+            return
+        if sequence != expected or expected == MAX_PINGS:
+            emit(refused(scope_sha256, "witness ping is unbound or out of sequence"))
+            return
+        emit(
+            {
+                "kind": "pong",
+                "scope_sha256": scope_sha256,
+                "payload": {"sequence": expected, "host_clock": clock},
+            }
+        )
 
 
 # --------------------------------------------------------------------------- #
@@ -860,7 +953,9 @@ def main(argv: list[str] | None = None) -> int:
         emit(refused(None, "witness request exceeds its bound"))
         return 1
     request = json.loads(line)
-    emit(handle_request(request))
+    response = handle_request(request)
+    if emit(response) in CALIBRATED_RESPONSES:
+        answer_pings(response["scope_sha256"])
     return 0
 
 

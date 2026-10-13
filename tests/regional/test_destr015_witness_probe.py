@@ -3,14 +3,18 @@
 Every host interaction is faked at the boundary the probe itself draws
 (``run``, ``boot_id``, ``agent_tracee``, ``resolve_executable``,
 ``gpu_present``, ``AttachedExecWitness``); the state directory is a temporary
-tree. Nothing here starts a process or touches a device.
+tree and the runner's clock pings arrive on a faked stdin. Nothing here starts
+a process or touches a device.
 """
 
 from __future__ import annotations
 
 import io
 import json
+import os
 import subprocess
+import sys
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -513,12 +517,183 @@ def test_unexpected_failures_leave_only_their_type(
 def test_oversized_responses_are_replaced_by_a_refusal(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    probe.emit(
-        {"kind": "status", "scope_sha256": "a" * 64, "payload": {"blob": "x" * 70000}}
-    )
+    assert (
+        probe.emit(
+            {
+                "kind": "status",
+                "scope_sha256": "a" * 64,
+                "payload": {"blob": "x" * 70000},
+            }
+        )
+        == "refused"
+    ), "the kind actually printed is returned"
     printed = json.loads(capsys.readouterr().out.strip())
     assert printed["kind"] == "refused"
     assert "oversized" in printed["payload"]["reason"]
+    assert probe.emit({"kind": "status", "scope_sha256": "a" * 64}) == "status"
+
+
+# --------------------------------------------------------------------------- #
+# Clock pings
+# --------------------------------------------------------------------------- #
+SCOPE_SHA = "c" * 64
+UNBOUND = "witness ping is unbound or out of sequence"
+
+
+def message_line(kind: str, payload: Any, scope_sha256: str = SCOPE_SHA) -> str:
+    return (
+        json.dumps({"kind": kind, "scope_sha256": scope_sha256, "payload": payload})
+        + "\n"
+    )
+
+
+def ping(sequence: Any, scope_sha256: str = SCOPE_SHA) -> str:
+    return message_line("ping", {"sequence": sequence}, scope_sha256)
+
+
+END = message_line("end", {})
+
+
+def pong(sequence: int, clock: dict[str, int]) -> dict[str, Any]:
+    return {
+        "kind": "pong",
+        "scope_sha256": SCOPE_SHA,
+        "payload": {"sequence": sequence, "host_clock": clock},
+    }
+
+
+REFUSED = {"kind": "refused", "scope_sha256": SCOPE_SHA, "payload": {"reason": UNBOUND}}
+
+
+@pytest.fixture
+def clocks(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, int]]:
+    """``host_clock`` as a counter: every sample it handed out, in order."""
+
+    samples: list[dict[str, int]] = []
+
+    def host_clock() -> dict[str, int]:
+        tick = len(samples) + 1
+        samples.append({"monotonic_ns": tick, "realtime_ns": 1000 + tick})
+        return samples[-1]
+
+    monkeypatch.setattr(probe, "host_clock", host_clock)
+    return samples
+
+
+def printed(capsys: pytest.CaptureFixture[str]) -> list[dict[str, Any]]:
+    out = capsys.readouterr().out
+    return [json.loads(line) for line in out.splitlines() if line.strip()]
+
+
+def join_readers() -> None:
+    for thread in threading.enumerate():
+        if thread.name == "destr015-ping-reader":
+            thread.join(timeout=5)
+            assert not thread.is_alive(), "the reader ends with its stdin"
+
+
+def test_each_pong_carries_the_host_clock_sampled_on_its_ping(
+    clocks: list[dict[str, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stdin = io.StringIO(ping(0) + ping(1) + ping(2) + END + ping(3))
+    monkeypatch.setattr(sys, "stdin", stdin)
+    probe.answer_pings(SCOPE_SHA)
+    join_readers()
+    assert printed(capsys) == [pong(index, clocks[index]) for index in range(3)], (
+        "nothing is answered after the end message"
+    )
+    monkeypatch.setattr(sys, "stdin", io.StringIO(ping(0)))
+    probe.answer_pings(SCOPE_SHA)
+    join_readers()
+    assert printed(capsys) == [pong(0, clocks[-2])], "EOF ends the series"
+
+
+@pytest.mark.parametrize(
+    "line",
+    [
+        ping(2),
+        ping(0),
+        ping(1, "d" * 64),
+        ping(True),
+        ping("1"),
+        message_line("pong", {"sequence": 1}),
+        message_line("ping", {"sequence": 1, "extra": 0}),
+        message_line("ping", [1]),
+        message_line("end", {"now": 1}),
+        json.dumps({"kind": "ping", "scope_sha256": SCOPE_SHA}) + "\n",
+        json.dumps([SCOPE_SHA]) + "\n",
+        "not json\n",
+        "x" * 70000 + "\n",
+        "\n",
+    ],
+    ids=[
+        "out-of-sequence",
+        "repeated",
+        "scope",
+        "bool",
+        "string",
+        "kind",
+        "extra",
+        "payload-list",
+        "end-payload",
+        "no-payload",
+        "array",
+        "garbage",
+        "oversized",
+        "blank",
+    ],
+)
+def test_an_unbound_ping_is_refused_and_ends_the_series(
+    line: str,
+    clocks: list[dict[str, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    stdin = io.StringIO(ping(0) + line + ping(1) + END)
+    monkeypatch.setattr(sys, "stdin", stdin)
+    probe.answer_pings(SCOPE_SHA)
+    join_readers()
+    assert printed(capsys) == [pong(0, clocks[0]), REFUSED]
+
+
+def test_the_ping_series_is_bounded(
+    clocks: list[dict[str, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    pings = "".join(ping(index) for index in range(probe.MAX_PINGS + 1))
+    monkeypatch.setattr(sys, "stdin", io.StringIO(pings))
+    probe.answer_pings(SCOPE_SHA)
+    join_readers()
+    assert printed(capsys) == [
+        *[pong(index, clocks[index]) for index in range(probe.MAX_PINGS)],
+        REFUSED,
+    ]
+
+
+@pytest.mark.parametrize("bound", ["PING_WAIT_SECONDS", "PING_TOTAL_SECONDS"])
+def test_a_silent_runner_never_keeps_the_exec_alive(
+    bound: str,
+    clocks: list[dict[str, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(probe, bound, 0.05)
+    read_fd, write_fd = os.pipe()
+    stdin = os.fdopen(read_fd, "r")
+    try:
+        monkeypatch.setattr(sys, "stdin", stdin)
+        started = time.monotonic()
+        probe.answer_pings(SCOPE_SHA)
+        elapsed = time.monotonic() - started
+    finally:
+        os.close(write_fd)
+        join_readers()
+        stdin.close()
+    assert elapsed < 5, "the wait is bounded while stdin stays open"
+    assert printed(capsys) == []
 
 
 # --------------------------------------------------------------------------- #
@@ -727,3 +902,39 @@ def test_main_runs_the_unit_or_answers_one_request(
         printed["kind"] == "refused"
         and "exceeds its bound" in printed["payload"]["reason"]
     )
+
+
+@pytest.mark.parametrize(
+    ("kind", "blob", "expected"),
+    [
+        ("arm", "", ["armed", "pong"]),
+        ("collect", "", ["collected", "pong"]),
+        ("status", "", ["status"]),
+        ("disarm", "", ["disarmed"]),
+        ("arm", "x" * 70000, ["refused"]),
+    ],
+)
+def test_main_answers_pings_only_after_an_armed_or_collected_response(
+    kind: str,
+    blob: str,
+    expected: list[str],
+    clocks: list[dict[str, int]],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    def handle_request(request: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "kind": probe.RESPONSES[request["kind"]],
+            "scope_sha256": request["scope_sha256"],
+            "payload": {"blob": blob},
+        }
+
+    monkeypatch.setattr(probe, "handle_request", handle_request)
+    stdin = io.StringIO(message_line(kind, {}) + ping(0) + END)
+    monkeypatch.setattr(sys, "stdin", stdin)
+    assert probe.main([]) == 0
+    join_readers()
+    output = printed(capsys)
+    assert [item["kind"] for item in output] == expected
+    if "pong" in expected:
+        assert output[-1] == pong(0, clocks[0]), "bound to the response's scope"

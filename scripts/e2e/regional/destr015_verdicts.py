@@ -546,19 +546,23 @@ WITNESS_END_KEYS = (
 )
 WITNESS_END_REASONS = frozenset({"finish-request", "deadline"})
 EXCHANGE_KINDS = frozenset({"arm", "collect"})
+# The clock pings the runner sends inside the arm and collect exec sessions.
+PING_KINDS = frozenset({"arm-ping", "collect-ping"})
+CLOCK_KINDS = EXCHANGE_KINDS | PING_KINDS
 
 
 def _exchanges(exchanges: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [item for item in exchanges if item.get("kind") in EXCHANGE_KINDS]
+    return [item for item in exchanges if item.get("kind") in CLOCK_KINDS]
 
 
 def clock_binding(exchanges: list[dict[str, Any]]) -> dict[str, Any]:
     """The documented bound on ``runner_monotonic - host_monotonic``.
 
-    Derived from the arm and collect exchanges alone: each bounds the offset
-    between the runner's send and receive stamps around the host's sample, and
-    the host may drift at most ``MAX_CLOCK_DRIFT_PPM`` over the span plus the
-    fixed margin. This is evidence, never a substitute for the interval
+    Derived from the arm and collect exchanges and the clock pings inside their
+    exec sessions: each bounds the offset between the runner's send and receive
+    stamps around the host's sample, so the shortest round trip sets the bound,
+    and the host may drift at most ``MAX_CLOCK_DRIFT_PPM`` over the span plus
+    the fixed margin. This is evidence, never a substitute for the interval
     arithmetic, which recomputes the same bound and refuses when it is empty.
     """
 
@@ -591,6 +595,31 @@ def clock_binding(exchanges: list[dict[str, Any]]) -> dict[str, Any]:
         "uncertainty_ns": upper - lower,
         "max_clock_drift_ppm": MAX_CLOCK_DRIFT_PPM,
         "margin_ns": CLOCK_MARGIN_NS,
+    }
+
+
+def clock_calibration(exchanges: list[dict[str, Any]]) -> dict[str, Any]:
+    """The per-node calibration summary the verdict carries.
+
+    How many exchanges and pings bound the clock offset, the shortest round
+    trip among them and the width of the offset bound the interval arithmetic
+    charges (``None`` when unbounded). An overlap lost under a wide bound was
+    lost to calibration; one lost under a narrow bound was lost to skew.
+    """
+
+    clocks = _exchanges(exchanges)
+    trips = [
+        item["received_ns"] - item["sent_ns"]
+        for item in clocks
+        if type(item.get("sent_ns")) is int and type(item.get("received_ns")) is int
+    ]
+    binding = clock_binding(exchanges)
+    return {
+        "samples": len(clocks),
+        "min_round_trip_ms": round(min(trips) / 1e6, 3) if trips else None,
+        "offset_uncertainty_ms": (
+            round(binding["uncertainty_ns"] / 1e6, 3) if binding["bounded"] else None
+        ),
     }
 
 
@@ -699,7 +728,8 @@ def witness_capture(
 ) -> dict[str, Any]:
     """Fold the durable records into the capture shape the interval arithmetic
     reads: the armed record's ``start``, the final record's closure, and the
-    arm/collect exchanges as the bounded clock calibration."""
+    arm/collect exchanges with their pings, in recorded order, as the bounded
+    clock calibration."""
 
     start = dict(receipt["armed"]["start"])
     final = collection["final"]

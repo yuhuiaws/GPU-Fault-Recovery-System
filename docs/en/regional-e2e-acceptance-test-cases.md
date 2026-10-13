@@ -11064,6 +11064,23 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
   `persistence_mode`/`persistence_release`/`persistence_daemon`, the RESTORE result's `persistence_mode.after_restore` and
   `persistence_daemon_restored`, and the RESET receipt's `physical_calls[].target_persistence` make the window's
   state readable from the evidence. Judgement: `tests/node_agent/test_quiesce_persistence_release.py`.
+- The physical overlap proof is limited by its clock calibration: on HyperPod attempt 3 the workflow completed and the two
+  applied resets did overlap (raw overlap 0.41 s), yet the verdict FAILED on `physical_overlap_errors`. Each node had only the
+  arm and collect clock exchanges, each a one-shot `kubectl exec` whose round trip (exec setup, interpreter start and the
+  arm/collect work itself) is 2.2–2.5 s on HyperPod, so the offset bound widened until no raw overlap below about 2.4–2.7 s
+  could ever be proven by the conservative inner intervals. The arm and collect requests now each run as one interactive exec
+  session: after the bound response the runner sends up to 8 clock pings within a budget of about 2 s on the same stdin, and
+  the probe answers each at once with a pong carrying its host monotonic and realtime clock, bound to the same `scope_sha256`
+  and sequence. Every response and every pong is one clock exchange that bounds the runner-minus-host offset by its own round
+  trip, so the intersected offset uncertainty is at most the minimum round trip plus the drift allowance, no longer set by the
+  exec setup and the handler's work. The drift allowance is unchanged (200 ppm of the arm..collect span plus 50 ms, charged on
+  each side), and so is the inner-interval rule: each reset interval is shrunk by the full offset uncertainty before the
+  overlap is judged. A missing or short ping series leaves the proof on the samples it has (at worst the wide bound of the two
+  request round trips) and never fabricates one; an unbound pong (scope, kind, sequence or clock), a pong that goes back on
+  the host clock, or unordered runner stamps are refused. The verdict JSON carries each node's `clock_calibration`
+  (`samples`, `min_round_trip_ms`, `offset_uncertainty_ms`), so a failed overlap shows whether it was lost to skew or to
+  calibration. Judgement: `tests/regional/test_destr015_clock_calibration.py`,
+  `tests/regional/test_destr015_detached_witness.py`, `tests/regional/test_destr015_witness_probe.py`.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr015_parallel_branch_join.py`. By default it only generates the
   plan; before execute it must read `DESTR-012=PASS` (chain: `010 → 001 → 002 → 009 →
@@ -11177,7 +11194,7 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
      it to write `armed.json` (host monotonic/realtime stamps, tracee/producer identity, executable
      digest), and then returns the arm receipt together with host clock samples; the runner records
      its own monotonic stamps before and after the request, forming the first bounded clock
-     exchange. Injection is allowed only after both `arm`s succeed.
+     exchange, followed by clock pings in the same session. Injection is allowed only after both `arm`s succeed.
   4. The two probes execute `write-xid46` **concurrently** (same marker, drill id with a per-node
      suffix) and record their respective write timestamps; the difference between the two must be
      smaller than the aggregation window, otherwise the round is recorded
@@ -11198,20 +11215,21 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
      refused), writes `finish.request` to the unit and waits for it to write `final.json` (trace
      digest and byte count, calibration count, reset process exec/exit
      interval, the realtime−monotonic envelope from continuous sampling, host clock stamps, exit
-     reason), and returns it with the current host clock, forming the second bounded clock exchange.
+     reason), and returns it with the current host clock, forming the second bounded clock exchange,
+     again followed by clock pings.
      Verdict requirements: each node's `armed`/`final` records are bound to the scope, the unit and
      the same witness id; the boot id of the scope, the arm receipt, both records and the collect
      receipt are all identical; the recorded host monotonic stamps fall inside the
      [arm request, collect response] window (arm, unit and collect share one monotonic clock on the
      same boot, so the comparison is exact); the witness is bound to its own new successful ledger
-     row, workflow/incident/fencing/GPU, and via the offset bound of the two exchanges (200 ppm plus a
+     row, workflow/incident/fencing/GPU, and via the offset bound of all clock exchanges (200 ppm plus a
      50 ms margin) the conservative inner intervals of the two reset processes' exec/exit are derived,
      and the two inner intervals must overlap; a `nvidia-smi --gpu-reset` invocation the driver refused busy
      (routine for the first attempt on p5en; the Agent unloads the display modules and its attempt 2 resets) is
      not a physical reset: the proof counts the applied invocations (exit 0, exactly one) and requires the refused
      ones to match the Agent receipt's `physical_calls` `busy` attempts and to end before the applied one began
      (the `eks-managed` attempt-11 shape, judged in `tests/regional/test_acceptance_physical_interval_alignment.py`);
-     the offset uncertainty is written into the evidence.
+     the offset uncertainty is written into the evidence and each node's `clock_calibration` into the verdict JSON.
      `RESTART_WORKLOAD` executed exactly once, SUCCEEDED, with `started_at` no earlier than the
      completion time of both `RESTORE_SCHEDULING`, and details source/target GPU counts both 16;
      workflow SUCCEEDED, incident RECOVERED;
@@ -11279,8 +11297,8 @@ not the GPU chip's internal execution time; the raw argv does not enter ordinary
     repaired independently, concurrently with the job restart" has no case yet and no explicit
     expectation defined, and is not included in this case.
   - The process intervals are converted conservatively from the continuous clock samples inside the
-    unit, the two bounded arm/collect exchanges and the 200ppm plus 50ms margin; there is no
-    intermediate calibration between the two exchanges (the node is unreachable), the offset
+    unit, the two bounded arm/collect exchanges with their in-session clock pings and the 200ppm plus 50ms margin; there
+    is no intermediate calibration between the two sessions (the node is unreachable), the offset
     uncertainty grows with the interval at 200ppm and is written into the evidence truthfully; a
     clock jump, an incomplete trace, identity drift or an unbounded error can never PASS.
     No promise is made to detect arbitrary external clock tampering, nor are the process intervals
