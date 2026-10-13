@@ -879,6 +879,25 @@ def _tombstone(
         _write_site_document(state_dir / "site.yaml", document)
 
 
+def _listed(path: Path, cluster_id: str) -> dict[str, Any]:
+    """The ``site.yaml`` entry of ``cluster_id`` as the site lists it now."""
+
+    (entry,) = [
+        item
+        for item in _site_document(path)["spec"]["clusters"]
+        if item["clusterId"] == cluster_id
+    ]
+    return dict(entry)
+
+
+def _join(path: Path, entry: dict[str, Any]) -> None:
+    """``site.yaml`` lists ``entry`` again, as a join-cluster commit leaves it."""
+
+    document = _site_document(path)
+    document["spec"]["clusters"].append(entry)
+    _write_site_document(path, document)
+
+
 def _completed_uninstall(state_dir: Path, *, outcome: str) -> None:
     """``uninstall/state.json`` COMPLETED with its per-cluster release outcome."""
 
@@ -1050,6 +1069,61 @@ def test_a_member_reusing_the_cluster_id_for_another_cluster_keeps_the_claim(
     assert finding["deregistered_by"] == "remove-cluster"
     assert finding["cluster"] == described, "the removed cluster is the one read"
     assert finding["groups"] in (["gpu-ng"], ["spot-p5en"])
+
+
+@pytest.mark.parametrize(
+    "cluster_id", ["gpu-a", "gpu-e"], ids=["hyperpod", "eks-managed"]
+)
+def test_a_cluster_that_joined_again_under_another_cluster_id_is_no_stale_claim(
+    tmp_path: Path, cluster_id: str
+) -> None:
+    """``join-cluster --cluster-id`` named it differently; the claim check would
+    read the same provider cluster, whose groups carry the member's label."""
+
+    path = _mixed_site(tmp_path)
+    entry = _listed(path, cluster_id)
+    _tombstone(path.parent, cluster_id=cluster_id)
+    _join(path, {**entry, "clusterId": f"{cluster_id}-again"})
+    site = load_site(path)
+    world = _claim_world()
+
+    assert f"{cluster_id}-again" in {
+        item["cluster_id"] for item in site.release_config["clusters"]
+    }
+    assert release.deregistered_clusters(site) == [], (
+        "the member reads the tombstone's node groups: superseded"
+    )
+    assert release.stale_ownership_claims(site, world) == []  # type: ignore[arg-type]
+    assert world.calls == [], "a member's node groups are never read as a claim"
+
+
+@pytest.mark.parametrize(
+    "joined_as", ["gpu-a", "gpu-a-again"], ids=["same-cluster-id", "other-cluster-id"]
+)
+def test_a_hyperpod_cluster_recreated_under_its_name_on_another_eks_is_no_claim(
+    tmp_path: Path, joined_as: str
+) -> None:
+    """``describe-cluster`` reads a HyperPod cluster by its name: the removed
+    cluster (orchestrated by another EKS cluster) and the member are one
+    describe target, and its instance groups carry the member's label."""
+
+    path = _mixed_site(tmp_path)
+    entry = _listed(path, "gpu-a")
+    _tombstone(path.parent, cluster_id="gpu-a", eks_cluster_arn=OTHER_EKS_ARN)
+    _join(path, {**entry, "clusterId": joined_as})
+    site = load_site(path)
+    world = _claim_world()
+
+    (member,) = [
+        item
+        for item in site.release_config["clusters"]
+        if item["cluster_id"] == joined_as
+    ]
+    assert member["eks_cluster_arn"] != OTHER_EKS_ARN
+    assert member["hyperpod_cluster_name"] == "hp-gpu-a"
+    assert release.deregistered_clusters(site) == []
+    assert release.stale_ownership_claims(site, world) == []  # type: ignore[arg-type]
+    assert world.calls == [], "the member's instance groups are not read as a claim"
 
 
 @pytest.mark.parametrize(

@@ -8,9 +8,10 @@ default out of its digests and an absent ``GPU_FAULT_CLUSTER_PROVIDER`` means
 ``hyperpod``. ``cluster_provider()`` is the one parser: absent or empty means
 ``hyperpod``, an unknown spelling fails closed. Two records' raw values can
 therefore disagree about one cluster -- absent, ``None`` and ``"hyperpod"``
-compare unequal -- which is how ``status`` reported a re-joined HyperPod
-cluster as a stale ownership claim (``ownership_release.deregistered_clusters``
-compares normalized identities since).
+compare unequal -- so the check that keeps ``status`` from reporting a
+re-joined cluster as a stale ownership claim
+(``ownership_release.deregistered_clusters``) compares normalized describe
+targets.
 
 This AST walk over ``src/`` flags, in ``==``, ``!=``, ``in`` and ``not in``:
 
