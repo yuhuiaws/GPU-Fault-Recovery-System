@@ -48,6 +48,18 @@ raise SystemExit(3)
 """
 
 
+@pytest.fixture(autouse=True)
+def no_inherited_database(monkeypatch: pytest.MonkeyPatch) -> None:
+    # make test-parallel-release sets GPU_FAULT_TEST_POSTGRES_URL to the empty
+    # string; an in-process worker refuses any inherited database variable.
+    for name in tuple(os.environ):
+        if name.startswith(("PG", "POSTGRES_")) or name in (
+            POSTGRES_URL_ENV,
+            ALLOCATION_ENV,
+        ):
+            monkeypatch.delenv(name)
+
+
 def environment() -> dict[str, str]:
     parent = {
         name: value
