@@ -15,6 +15,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.admin import release_postgres
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.execution import deployment_deadline, recovery_active, run_command
 from gpu_fault.admin.process_supervisor import (
@@ -180,6 +181,8 @@ def exit_worker(mode: str, state: Path) -> int:
         patch.setattr(worker, "CommandRunner", lambda: docker)
         patch.setattr(worker, "source_identity", lambda _root: "a" * 64)
         patch.setattr(worker, "run_owned_command", pytest_child)
+        # A short confirmation window: the cleanup mode never removes it.
+        patch.setattr(release_postgres, "REMOVAL_CONFIRM_SECONDS", 0.1)
         return worker.main(
             [
                 "--state",

@@ -1876,6 +1876,9 @@ PostgreSQL branch and the impact tests' PostgreSQL subprocess; the HOME of ordin
 artifact, ECR/Docker and signing tools is unchanged. The native tests still verify the CID, ownership, port and
 server version independently, and do not skip verification because the parent process has created a database.
 On exit, the container and volume are deleted by exact CID, and the private directory is deleted only after confirming that neither the CID nor the name exists.
+A forced delete that exceeds its own command budget or fails does not count as done: under load a SIGKILLed server can take tens of seconds to exit,
+and Docker still completes the removal after the client has gone, so absence is re-read at short intervals until the cleanup deadline; a failed read,
+or a container still present when the deadline expires, leaves the cleanup unconfirmed.
 When the creation result is unknown, cleanup is unconfirmed or supervision is lost, the whole build fails and the ownership evidence is kept; subsequent builds or artifact
 reuse also refuse an unresolved `release-postgres` directory. First confirm process and resource ownership by the original operational recovery procedure,
 then reconcile under control; the refusal must not be bypassed by simply deleting a same-named container or wiping the directory. An explicit external test connection is still the caller's

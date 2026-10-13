@@ -20,7 +20,12 @@ from uuid import uuid4
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError, CommandRunner
 from gpu_fault.admin.command_log import FAILURE_EXIT_CODE_ATTRIBUTE
-from gpu_fault.admin.execution import cleanup_deadline, deadline_scope
+from gpu_fault.admin.execution import (
+    DeploymentDeadlineExceeded,
+    cleanup_deadline,
+    deadline_scope,
+    remaining_timeout,
+)
 from gpu_fault.admin.postgres_grant import (
     CONTAINER_ID,
     LOCAL_DOCKER_HOST,
@@ -46,6 +51,13 @@ IDENTITY_FORMAT = (
     '"running":{{json .State.Running}},"ports":{{json .NetworkSettings.Ports}},'
     '"bindings":{{json .HostConfig.PortBindings}}}'
 )
+# A forced removal can outlive its own command budget: on a loaded gate host a
+# SIGKILLed server exited 27 s after the kill, and Docker finished the removal
+# after the client had gone. Absence is re-read after these pauses until the
+# cleanup deadline; REMOVAL_CONFIRM_SECONDS bounds a caller that has none.
+REMOVAL_FIRST_POLL_SECONDS = 0.5
+REMOVAL_POLL_SECONDS = 2.0
+REMOVAL_CONFIRM_SECONDS = 90.0
 
 
 class PostgresCleanupError(BootstrapError):
@@ -122,6 +134,23 @@ def _image(runner: CommandRunner) -> str:
     if observed != values[0]:
         raise BootstrapError("local PostgreSQL image identity changed")
     return values[0]
+
+
+def removal_pauses(seconds: float) -> Iterator[float]:
+    """Pauses between absence reads: short at first, adding up to ``seconds``."""
+    pause, spent = REMOVAL_FIRST_POLL_SECONDS, 0.0
+    while spent + pause <= seconds:
+        yield pause
+        spent += pause
+        pause = min(pause * 2, REMOVAL_POLL_SECONDS)
+
+
+def time_remains(seconds: float) -> bool:
+    """Whether the current deadline still leaves ``seconds``."""
+    try:
+        return remaining_timeout(seconds) >= seconds
+    except DeploymentDeadlineExceeded:
+        return False
 
 
 @dataclass
@@ -394,11 +423,23 @@ class OwnedPostgres:
                     mutate=True,
                 )
             except (BootstrapError, OSError, subprocess.TimeoutExpired, TimeoutError):
-                # Only fresh, successful absence reads can resolve a lost delete ACK.
+                # A failed or timed-out delete settles nothing: Docker may still be
+                # removing the container. Only fresh absence reads can decide.
                 pass
-        if self.listed(f"id={identifier}") or self.listed(f"name=^/{self.name}$"):
-            raise BootstrapError("local PostgreSQL removal is unconfirmed")
+        self.confirm_removed(identifier)
         self.record("REMOVED")
+
+    def confirm_removed(self, identifier: str) -> None:
+        """Re-read until neither the CID nor the name is listed, within the deadline.
+
+        A read that fails is never absence: it ends the cleanup unconfirmed.
+        """
+        pauses = removal_pauses(remaining_timeout(REMOVAL_CONFIRM_SECONDS))
+        while self.listed(f"id={identifier}") or self.listed(f"name=^/{self.name}$"):
+            pause = next(pauses, None)
+            if pause is None or not time_remains(pause):
+                raise BootstrapError("local PostgreSQL removal is unconfirmed")
+            time.sleep(pause)
 
     def remove_directory(self) -> None:
         info = private_directory(self.directory)

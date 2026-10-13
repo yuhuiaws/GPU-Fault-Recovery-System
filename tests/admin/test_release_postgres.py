@@ -5,7 +5,10 @@ import json
 import shutil
 import subprocess
 import tempfile
+import time
 from pathlib import Path
+from typing import Any
+from uuid import uuid4
 
 import pytest
 
@@ -31,6 +34,9 @@ from tests.admin._release_postgres_support import (
     IMAGE,
     FakePostgresDocker,
 )
+
+# Captured before the docker fixture replaces time.sleep for the readiness loop.
+REAL_SLEEP = time.sleep
 
 
 @pytest.fixture
@@ -322,6 +328,115 @@ def test_confirmed_external_removal_does_not_issue_a_delete(
     assert docker.directory is not None and not docker.directory.exists(), (
         "confirmed absence left the private grant behind"
     )
+
+
+def removal_reads(docker: FakePostgresDocker, *, gone_at: int | None) -> list[str]:
+    """Inventory reads after the delete; the container is gone from read ``gone_at``."""
+    reads: list[str] = []
+
+    def listing(_item: dict[str, Any]) -> None:
+        if docker.removal_attempts:
+            reads.append("read")
+            if len(reads) == gone_at:
+                docker.containers.pop(CID, None)
+
+    docker.hooks["list"] = listing
+    return reads
+
+
+def owned_allocation(
+    docker: FakePostgresDocker, root: Path
+) -> release_postgres.OwnedPostgres:
+    directory = root / "allocation"
+    directory.mkdir(mode=0o700)
+    info = directory.stat()
+    owned = release_postgres.OwnedPostgres(
+        docker, directory, IMAGE, uuid4().hex, (info.st_dev, info.st_ino)
+    )
+    owned.record("PREPARED")
+    owned.start()
+    return owned
+
+
+@pytest.mark.parametrize("removal", ["acknowledged", "timed-out", "refused"])
+def test_slow_forced_removal_is_confirmed_by_repeated_absence_reads(
+    docker: FakePostgresDocker, monkeypatch: pytest.MonkeyPatch, removal: str
+) -> None:
+    # Gate bench: a SIGKILLed server exited 27 s after the kill, so the delete
+    # outlived its 20-s budget and Docker removed the container 10 s later.
+    pauses: list[float] = []
+    monkeypatch.setattr(time, "sleep", pauses.append)
+    docker.keep_after_remove = True
+    if removal == "timed-out":
+        docker.failures["before-remove"] = BootstrapError(
+            "deployment command exceeded its time budget: docker"
+        )
+    elif removal == "refused":
+        docker.failures["before-remove"] = BootstrapError("command failed (1): docker")
+    reads = removal_reads(docker, gone_at=4)
+    with isolated_postgres_allocation(docker):
+        pass
+    assert pauses == [0.5, 1.0, 2.0], "absence was not re-read after short pauses"
+    assert len(reads) == 5, "the CID read that saw it gone must be followed by the name"
+    assert docker.removal_attempts == [CID], "a pending removal was requested twice"
+    assert docker.containers == {}
+    assert docker.directory is not None and not docker.directory.exists(), (
+        "confirmed removal left the private grant behind"
+    )
+
+
+def test_removal_that_never_completes_fails_closed_at_the_cleanup_deadline(
+    docker: FakePostgresDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pauses: list[float] = []
+    monkeypatch.setattr(time, "sleep", pauses.append)
+    docker.keep_after_remove = True
+    with pytest.raises(PostgresCleanupError, match="cleanup unconfirmed") as caught:
+        with isolated_postgres_allocation(docker):
+            pass
+    assert str(caught.value.__cause__) == "local PostgreSQL removal is unconfirmed"
+    # The pauses fill the 90-s cleanup scope without ever reaching past it.
+    assert 85 < sum(pauses) <= 90, sum(pauses)
+    assert set(pauses[2:]) == {2.0}, "the steady pause must stay short and bounded"
+    assert metadata(docker)["phase"] == "UNCONFIRMED"
+    assert CID in docker.containers, "the test lost its never-removed container"
+
+
+def test_confirmation_ends_at_the_real_cleanup_deadline(
+    docker: FakePostgresDocker, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setattr(time, "sleep", REAL_SLEEP)
+    monkeypatch.setattr(release_postgres, "REMOVAL_FIRST_POLL_SECONDS", 0.02)
+    monkeypatch.setattr(release_postgres, "REMOVAL_POLL_SECONDS", 0.05)
+    owned = owned_allocation(docker, tmp_path)
+    docker.keep_after_remove = True
+    started = time.monotonic()
+    with pytest.raises(BootstrapError, match="removal is unconfirmed"):
+        with execution.cleanup_deadline("example cleanup", 1):
+            owned.cleanup()
+    assert 0.8 < time.monotonic() - started < 5, "confirmation ignored its deadline"
+    assert docker.removal_attempts == [CID]
+
+
+def test_failed_absence_read_after_removal_fails_closed_at_once(
+    docker: FakePostgresDocker, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pauses: list[float] = []
+    monkeypatch.setattr(time, "sleep", pauses.append)
+    docker.keep_after_remove = True
+
+    def listing(_item: dict[str, Any]) -> None:
+        if docker.removal_attempts:
+            raise BootstrapError("daemon unavailable")
+
+    docker.hooks["list"] = listing
+    with pytest.raises(PostgresCleanupError) as caught:
+        with isolated_postgres_allocation(docker):
+            pass
+    assert str(caught.value.__cause__) == "daemon unavailable"
+    assert pauses == [], "an unreadable inventory must not be polled as if absent"
+    assert metadata(docker)["phase"] == "UNCONFIRMED"
+    assert CID in docker.containers, "the test lost its unreadable container"
 
 
 @pytest.mark.parametrize("during_cleanup", [False, True])

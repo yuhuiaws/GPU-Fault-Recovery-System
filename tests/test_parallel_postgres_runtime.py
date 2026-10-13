@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import pytest
 
+from gpu_fault.admin import release_postgres
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.postgres_grant import (
     ALLOCATION_ENV,
@@ -390,7 +391,11 @@ def test_replaced_allocation_directory_is_not_removed(tmp_path: Path) -> None:
     assert moved.exists() and owned.directory.exists()
 
 
-def test_uncertain_cleanup_retains_ownership_and_credentials(tmp_path: Path) -> None:
+def test_uncertain_cleanup_retains_ownership_and_credentials(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A short confirmation window: the removal never completes here.
+    monkeypatch.setattr(release_postgres, "REMOVAL_CONFIRM_SECONDS", 0.1)
     state, docker, owned = allocation(tmp_path)
     docker.keep_after_remove = True
     with pytest.raises(PostgresShardError, match="unconfirmed"):

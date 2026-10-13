@@ -14,6 +14,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.admin import release_postgres
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.postgres_grant import ALLOCATION_ENV, POSTGRES_URL_ENV
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost
@@ -213,6 +214,8 @@ def test_worker_records_its_own_non_test_failure(
     docker = FakePostgresDocker()
     docker.ready, docker.ready_code = phase != "allocation", 3
     docker.keep_after_remove = phase == "post-test"
+    # A short confirmation window: the removal never completes here.
+    monkeypatch.setattr(release_postgres, "REMOVAL_CONFIRM_SECONDS", 0.1)
 
     def identify(_root: Path) -> str:
         if phase == "preparation":
@@ -278,16 +281,16 @@ def test_recorded_chain_is_bounded_redacted_and_accepted_by_the_runner(
         tmp_path / "record.json", {"phase": "post-test", "errors": errors}
     )
     record = read_worker_failure(tmp_path / "record.json")
-    outer, cause = record["errors"]
+    outer, inner = record["errors"]
     assert outer == {
         "type": "RuntimeError",
         "message": "cleanup of postgresql://<redacted>@h/db",
     }
-    assert cause["type"] == "OSError"
+    assert inner["type"] == "OSError"
     # Shortened in the middle: the start names the failure, the end its notes.
-    assert cause["message"].startswith("removal timed out word word"), cause
-    assert cause["message"].endswith("word word; retained for reconciliation"), cause
-    assert len(cause["message"]) <= FAILURE_MESSAGE_CHARACTERS
+    assert inner["message"].startswith("removal timed out word word"), inner
+    assert inner["message"].endswith("word word; retained for reconciliation"), inner
+    assert len(inner["message"]) <= FAILURE_MESSAGE_CHARACTERS
     assert canary not in (tmp_path / "record.json").read_text()
 
 
