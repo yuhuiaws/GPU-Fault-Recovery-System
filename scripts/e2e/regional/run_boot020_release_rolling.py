@@ -22,6 +22,7 @@ from gpu_fault_release import regional_release_diff  # noqa: E402
 from gpu_fault_release import rollout as rollout_regional_release  # noqa: E402
 from gpu_fault.admin.atomic_json import write_json_atomic  # noqa: E402
 from gpu_fault.admin.config import AdminConfig  # noqa: E402
+from scripts.e2e.regional import boot020_live_capture as captures  # noqa: E402
 from scripts.e2e.regional import boot020_restore_stage as restore_stage  # noqa: E402
 from scripts.e2e.regional import boot020_release_prerequisites as prerequisites  # noqa: E402
 from scripts.e2e.regional.boot020_admin_config import (  # noqa: E402
@@ -142,7 +143,7 @@ def _assert_kind(scenario: str, diff: dict[str, Any]) -> None:
 
 def _assert_noop(before: dict[str, Any], after: dict[str, Any]) -> None:
     _require(
-        before["live"] == after["live"], "NOOP changed live state", (before, after)
+        captures.same_live(before, after), "NOOP changed live state", (before, after)
     )
     _require(
         before["cpu_generations"] == after["cpu_generations"],
@@ -356,17 +357,6 @@ def _assert_resume_rto(scenario: str, result: dict[str, Any]) -> None:
         duration <= RTO_LIMITS[scenario]["resume"],
         "resume over limit",
         (scenario, result),
-    )
-
-
-def _assert_rollback_snapshot(
-    before: dict[str, Any],
-    rolled_back: dict[str, Any],
-) -> None:
-    _require(
-        rolled_back["live"] == before["live"],
-        "rollback did not restore live state",
-        (before, rolled_back),
     )
 
 
@@ -586,7 +576,7 @@ def _stage_control_plane(
         "control_plane_rollback_snapshot",
         lambda: backend.snapshot("control_plane"),
     )
-    _assert_rollback_snapshot(control_before, control_rolled_back)
+    captures.assert_restored(control_before, control_rolled_back, control_failed)
     control_apply = recorder.stage(
         "control_plane_apply",
         lambda: backend.deploy("control_plane", diff=control_diff),
@@ -638,7 +628,9 @@ def _stage_executor(
         "executor_rollback_snapshot",
         lambda: backend.snapshot("executor"),
     )
-    _assert_rollback_snapshot(executor_before, executor_rollback_snapshot)
+    captures.assert_restored(
+        executor_before, executor_rollback_snapshot, executor_rolled_back
+    )
     executor_failed = recorder.stage(
         "executor_interrupted_failure",
         lambda: backend.deploy(
@@ -727,7 +719,7 @@ def _stage_agent(
         "agent_rollback_snapshot",
         lambda: backend.snapshot("agent"),
     )
-    _assert_rollback_snapshot(agent_before, agent_rolled_back)
+    captures.assert_restored(agent_before, agent_rolled_back, agent_failed)
     agent_apply = recorder.stage(
         "agent_apply_after_rollback",
         lambda: backend.deploy("agent", diff=agent_diff),
@@ -770,7 +762,7 @@ def _stage_full(
         "full_rollback_snapshot",
         lambda: backend.snapshot("full"),
     )
-    _assert_rollback_snapshot(full_before, full_rolled_back)
+    captures.assert_restored(full_before, full_rolled_back, full_failed)
     full_apply = recorder.stage(
         "full_apply_after_rollback",
         lambda: backend.deploy("full", diff=full_diff),
@@ -778,7 +770,7 @@ def _stage_full(
     _require(full_apply["phase"] == "complete", "FULL apply phase", full_apply)
     full_after = chain.after(backend, recorder, "full")
     _require(
-        full_after["live"] != full_before["live"],
+        not captures.same_live(full_before, full_after),
         "FULL changed nothing",
         (full_before, full_after),
     )

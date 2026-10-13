@@ -12,10 +12,11 @@ from __future__ import annotations
 import copy
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Callable
 
 import pytest
 
+from gpu_fault_release.regional_release_rollback_restart import ROLE_DEPLOYMENTS
 from scripts.e2e.regional import run_boot020_release_rolling as boot020
 from scripts.e2e.regional.acceptance_runner_common import EvidenceRecorder
 
@@ -80,6 +81,19 @@ class FakeBackend:
         self.initial_live = copy.deepcopy(self.live)
         self.restored = False
         self.cpu_env_drift = False
+        # Every snapshot is a fresh ``_capture_previous()``: its
+        # ``cpu_restart_baseline`` carries the role Deployments' spec digests
+        # and a ``captured_at`` that moves with every capture.
+        self.captured_at = 1791900788.36
+        self.specs = {name: f"{name}-spec-v1" for name in self.cpu_generations}
+        # The control-plane rollback restarts the worker (the forward apply
+        # changed its spec), which gives its Pod template a new restartedAt,
+        # and reports the tiers it restarted in ``rollback_timing``.
+        self.rollback_restarts = ["worker"]
+        self.rollback_reports = ["worker"]
+        # A test's replacement for what a step changes in the live release
+        # ("noop", "full" or "restore").
+        self.live_changes: dict[str, Callable[[], None]] = {}
 
     def cpu_env_alignment(self, scenario: str) -> dict[str, Any]:
         self.calls.append(("cpu_env_alignment", scenario))
@@ -108,11 +122,17 @@ class FakeBackend:
         return {"kind": kind, "changed": changed}
 
     def snapshot(self, scenario: str, *, live: bool = True) -> dict[str, Any]:
+        self.captured_at += 132.62
+        capture = copy.deepcopy(self.live)
+        capture["cpu_restart_baseline"] = {
+            "captured_at": self.captured_at,
+            "spec_sha256": dict(self.specs),
+        }
         return {
             "phase": "complete",
             "release_id": scenario,
             "transaction_committed": True,
-            "live": copy.deepcopy(self.live),
+            "live": capture,
             "cpu_generations": dict(self.cpu_generations),
             "cpu_identities": copy.deepcopy(self.cpu_identities),
             "gpu_generations": copy.deepcopy(self.gpu_generations),
@@ -176,12 +196,23 @@ class FakeBackend:
             },
         }
         if fault_phase and auto_rollback:
+            timing: dict[str, Any] = {"t_safe_seconds": 30.0, "t_full_seconds": 45.0}
+            if scenario == "control_plane":
+                for role in self.rollback_restarts:
+                    name = ROLE_DEPLOYMENTS[role]
+                    self.specs[name] = f"{name}-spec-restarted-{self.captured_at}"
+                restarted = {role: ["spec-changed"] for role in self.rollback_reports}
+                timing["phases"] = {
+                    "cpu_restore": {
+                        "details": {"cpu_restart": {"restarted": restarted}}
+                    }
+                }
             return self._with_pins(
                 {
                     "phase": "rolled-back",
                     "injected_failure": fault_phase,
                     "rollback_plan": self.plan_overrides.get(scenario, plans[scenario]),
-                    "rollback_timing": {"t_safe_seconds": 30.0, "t_full_seconds": 45.0},
+                    "rollback_timing": timing,
                     "operation_duration_seconds": 45.0,
                 },
                 "rolled-back",
@@ -195,13 +226,20 @@ class FakeBackend:
                 },
                 "staged",
             )
-        if scenario == "control_plane":
+        step = (
+            "restore" if scenario == "noop" and "full" in self.completed else scenario
+        )
+        change = self.live_changes.get(step)
+        if change is not None:
+            change()
+        elif scenario == "control_plane":
             self.live["cpu_wheel"] = "cpu-v2"
             self.cpu_generations["gpu-fault-control-worker"] = 2
             self.cpu_identities["gpu-fault-control-worker"] = {
                 "replicas": 2,
                 "template_sha256": "gpu-fault-control-worker-template-v2",
             }
+            self.specs["gpu-fault-control-worker"] = "gpu-fault-control-worker-spec-v2"
         elif scenario == "executor":
             self.live["clusters"]["cluster-a"]["wheel"] = "executor-v2"
             self.gpu_generations["cluster-a"][EXECUTOR] = 2
@@ -251,10 +289,68 @@ def _recorder(tmp_path: Path) -> EvidenceRecorder:
 
 
 def test_live_shaped_backend_completes_all_stages(tmp_path: Path) -> None:
+    """Every snapshot's capture time differs and the control-plane rollback
+    restarts the worker; neither is a change the stages may report (live
+    2026-10-13: "NOOP changed live state" on ``captured_at`` alone)."""
+
     result = boot020.run_release_rolling(FakeBackend(), _recorder(tmp_path))
 
     assert result["status"] == "COMPLETED"
     assert "executor_interrupted_snapshot" in result["stages"]
+    stages = result["stages"]
+    assert (
+        stages["noop_before"]["live"]["cpu_restart_baseline"]["captured_at"]
+        != stages["noop_after"]["live"]["cpu_restart_baseline"]["captured_at"]
+    ), "the evidence keeps each capture as observed"
+
+
+@pytest.mark.parametrize(
+    ("change", "message"),
+    [
+        pytest.param(
+            lambda backend: backend.live_changes.update(
+                noop=lambda: backend.specs.update({"gpu-fault-api-ha": "moved"})
+            ),
+            "NOOP changed live state",
+            id="noop-moves-a-spec-digest",
+        ),
+        pytest.param(
+            lambda backend: backend.live_changes.update(
+                noop=lambda: backend.live.update(cpu_wheel="cpu-v9")
+            ),
+            "NOOP changed live state",
+            id="noop-changes-another-field",
+        ),
+        pytest.param(
+            lambda backend: backend.rollback_reports.clear(),
+            "rollback did not restore live state",
+            id="rollback-restart-it-does-not-report",
+        ),
+        pytest.param(
+            lambda backend: backend.rollback_restarts.append("spool"),
+            "rollback did not restore live state",
+            id="rollback-moves-a-tier-it-kept",
+        ),
+        pytest.param(
+            lambda backend: backend.live_changes.update(full=lambda: None),
+            "FULL changed nothing",
+            id="full-moves-only-the-capture-time",
+        ),
+        pytest.param(
+            lambda backend: backend.live_changes.update(restore=lambda: None),
+            "restore changed nothing",
+            id="restore-moves-only-the-capture-time",
+        ),
+    ],
+)
+def test_a_stage_still_sees_every_live_change_but_the_capture_time(
+    tmp_path: Path, change: Callable[[FakeBackend], object], message: str
+) -> None:
+    backend = FakeBackend()
+    change(backend)
+
+    with pytest.raises(boot020.AcceptanceCheckError, match=message):
+        boot020.run_release_rolling(backend, _recorder(tmp_path))
 
 
 def test_executor_stage_rejects_a_resume_that_rolls_the_cpu_again(

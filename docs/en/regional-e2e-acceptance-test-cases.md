@@ -3331,6 +3331,10 @@ uninstall target be guessed. Save the original bootstrap task terminal states an
   in this process for the previous stage is recorded directly as the `*_before` of the next stage (with a `reused_from` marker,
   and `next_deploy` replaced by that stage's own classification result); `noop_before`, the first stage of `--resume` /
   `--start-stage`, and everything after a `*_after` replayed from evidence are observed afresh.
+  Two `live` captures are compared without the capture time `cpu_restart_baseline.captured_at`, which differs in every
+  capture; every other field, each CPU role Deployment's `spec_sha256` included, counts. After a rollback the comparison
+  also leaves out the `spec_sha256` of the CPU tiers that rollback reports as restarted (`cpu_restart.restarted` in
+  `rollback_timing`; the restart writes a new `restartedAt` into the Pod template); a tier it kept must keep its digest.
   The `executor_interrupted_snapshot` after the Executor interruption records only the phase and Deployment generations, without the engine's
   previous capture: in the interrupted state the CPU layer already runs the candidate image while the GPU layer is still on the previous release, so `_capture_previous` would refuse because the runtime images
   are inconsistent, and that snapshot is used only to prove that resume did not redo cpu-staged: from the interruption to the end of the stage each CPU Deployment's generation

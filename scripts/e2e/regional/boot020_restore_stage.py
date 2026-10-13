@@ -27,6 +27,7 @@ import json
 from collections.abc import Callable
 from typing import Any
 
+from scripts.e2e.regional import boot020_live_capture as captures
 from scripts.e2e.regional.release_phase_gate import release_phase_error
 
 STAGE = "restore"
@@ -63,7 +64,11 @@ def stage_restore(
         applied,
     )
     after = chain.after(backend, recorder, STAGE)
-    require(after["live"] != before["live"], "restore changed nothing", (before, after))
+    require(
+        not captures.same_live(before, after),
+        "restore changed nothing",
+        (before, after),
+    )
     problem = release_phase_error(after)
     require(problem is None, f"restore end state: {problem}")
     alignment = recorder.stage(
