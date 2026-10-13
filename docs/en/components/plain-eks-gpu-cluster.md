@@ -168,6 +168,16 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
 - The quiesce taint evicts only Pods that do not tolerate it: DaemonSets with a wildcard toleration, static Pods and
   non-Kubernetes processes are untouched, and a reset may still answer `In use by another client` because of them (the
   step's `details.gpu_client_holders` names the holders).
+- Multi-cluster sites (Administrator Operations §5.0.4): node names must be unique across the site, and plain EKS node
+  names derive from the private IPv4 address, so two plain EKS clusters in overlapping VPC CIDRs can collide (HyperPod
+  node names cannot); a HyperPod cluster and a plain EKS cluster must not share a name (cluster id and IAM role names
+  derive from it, and `--cluster-id` is not kept by the next `deploy`); with many clusters a release has one canary, the
+  rollback is serial per cluster, and both share the fixed 6-hour deadline and 2-hour recovery reserve; a HyperPod
+  cluster joined online enters the background node identity refresh only after the CPU Pods restart (the fix ships with
+  the next control-plane release).
+- When `remove-cluster` removes the registration cluster (`spec.runtimeProfile.registrationClusterId`) while other
+  members remain, a remaining member of the same provider becomes the registration cluster; without one the removal is
+  refused, so a removal never changes the base family.
 
 ## 5. Validation status (honest)
 
@@ -180,7 +190,8 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
   and others; HyperPod neutrality is pinned by digest constants and byte-identical render assertions.
 - **Not validated**: the quiesce taint (§2.7) and the restore exit for a RECOVERED incident have unit tests only; the third live DESTR-001 round is still to run; the acceptance campaign on a mixed site (fault injection, real `nodeReboot` execution and
   confirmation, departed nodes, token rotation, the live `remove-cluster`/`uninstall` paths for eks-managed, Agent
-  upgrade/rollback, long-run stability); more than one plain EKS cluster; non-AL2023 AMIs; workload namespaces other
+  upgrade/rollback, long-run stability); more than one plain EKS cluster (a batch join of several plain EKS clusters has
+  unit tests only); non-AL2023 AMIs; workload namespaces other
   than `training`; clusters without the NVIDIA runtime as default.
 
 ## 6. Commits (base 0d151512 -> 3dedcd07, excerpt)

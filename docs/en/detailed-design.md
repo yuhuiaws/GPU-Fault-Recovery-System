@@ -3214,7 +3214,19 @@ KUBERNETES_QUIESCED → KUBERNETES_REMOVED → CONTROL_REGISTRY_REMOVED → AWS_
 AURORA_UPDATED → SITE_UPDATED → RELEASE_STATE_UPDATED → VERIFIED → OWNERSHIP_RELEASED → COMPLETED` (the last step releases the
 ownership label `gpu-fault.io/control-plane` from the node groups the site selected for the cluster, `admin/ownership_release.py`;
 `--keep-ownership-label` records `retained`), with the registry side corresponding to
-`DRAINING → REVOKED` of §2.15.1. The options of `uninstall` (state machine in §2.13),
+`DRAINING → REVOKED` of §2.15.1. When the removed cluster is the site's registration cluster
+(`spec.runtimeProfile.registrationClusterId`) and the site has other members, the moment the journal is created
+`src/gpu_fault/admin/cluster_removal_state.py::registration_reanchor` picks a remaining member of the same provider (one
+following the site profile first, then by cluster id) and records it as `registration_reanchor`; the remaining-site and
+remaining-release-config digests the journal binds include that change, and `SITE_UPDATED` writes the site with the same
+`remaining_site_document`, so resumes and tombstone resolution validate as before. Without such a member the removal is
+refused before any journal is written: the base family follows the registration cluster's provider and must not change
+with a removal. A registered version's `cluster_id` is the label of its first registration: the registration check and
+verify of `gpu_fault_release.regional_runtime_profile` compare the policy only, not that label, and the
+immutable snapshot of `scripts/release_deploy_profile.py` keeps the anchor it records. The batch candidate site of
+`join-cluster` (`cluster_join._write_batch_candidate_site`) and the single-cluster commit
+(`cluster_join_commit._commit_site`) judge whether two entries are one cluster with the same
+`bootstrap_discovery.same_cluster_entry`: a HyperPod name is identity only when both entries carry one. The options of `uninstall` (state machine in §2.13),
 `--cpu-cluster keep|delete`, `--reset-database` and `--aurora-final-snapshot retain|skip`, are constrained by
 `UninstallRequest.__post_init__` (`admin/uninstall_types.py`): `skip` is legal only under `delete` or
 `--reset-database` (an ordinary reinstall keeps Aurora, so there is nothing to snapshot), and `--reset-database` combines only with `keep`.

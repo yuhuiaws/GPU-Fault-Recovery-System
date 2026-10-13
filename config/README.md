@@ -71,8 +71,13 @@ GPU cluster using that version. The payload `cluster_id` is an explicit
 registration anchor and must name one cluster present when a new profile is
 first registered; it does not make a second copy for that cluster. After
 registration the immutable profile can outlive that cluster and is not
-recomputed when GPU clusters join or leave. To change capability content, use
-a new profile version instead of overwriting a live version.
+recomputed when GPU clusters join or leave. A site registers new versions
+under its registration cluster (`spec.runtimeProfile.registrationClusterId`);
+when `remove-cluster` removes that cluster while other members remain, the
+site moves it to a remaining member of the same provider, and the release
+compares a registered version by its policy, not by the anchor it was first
+registered under. To change capability content, use a new profile version
+instead of overwriting a live version.
 
 The regional release orchestrator treats `runtime_profile.version` as the
 single source for the CPU fleet pin, data-plane Resource Collector, and

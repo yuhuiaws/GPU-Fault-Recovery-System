@@ -161,7 +161,7 @@ release 把新版本注册在正在加入的集群名下。已存的 Profile 原
 | `site_identity.aws_region` | 必须是批准的Region |
 | `site_identity.cpu_eks_arn` | 必须是该站点稳定CPU控制面 |
 | `site_identity_sha256` | 由程序重新计算，防止可读身份与摘要不一致 |
-| `registration_cluster_id` | Profile稳定注册锚点；不要求仍属于当前GPU集合 |
+| `registration_cluster_id` | 站点当前的注册集群（`spec.runtimeProfile.registrationClusterId`），新版本以它注册；`remove-cluster` 移除它时会改为剩余的同 provider 成员。已注册版本与其不可变快照保留首次注册时的锚点，不要求仍属于当前GPU集合 |
 | `current_version` / `desired_version` | 必须符合变更单描述的版本迁移 |
 | `change_kind` | 必须与风险和维护窗口一致 |
 | `changes[]` | 每项capability、mode、owner、adapter变化均须解释 |

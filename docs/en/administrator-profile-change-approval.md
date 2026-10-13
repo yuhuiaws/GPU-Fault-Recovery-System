@@ -180,7 +180,7 @@ The stop message has already printed the fields the administrator must review; f
 | `site_identity.aws_region` | Must be the approved Region |
 | `site_identity.cpu_eks_arn` | Must be the site's stable CPU control plane |
 | `site_identity_sha256` | Recomputed by the program to prevent the readable identity and digest disagreeing |
-| `registration_cluster_id` | The Profile's stable registration anchor; not required to still belong to the current GPU set |
+| `registration_cluster_id` | The site's current registration cluster (`spec.runtimeProfile.registrationClusterId`), which new versions register under; `remove-cluster` moves it to a remaining member of the same provider when it removes that cluster. Registered versions and their immutable snapshots keep the anchor of their first registration, not required to still belong to the current GPU set |
 | `current_version` / `desired_version` | Must match the version migration described in the change ticket |
 | `change_kind` | Must be consistent with the risk and maintenance window |
 | `changes[]` | Every capability, mode, owner and adapter change must be explained |

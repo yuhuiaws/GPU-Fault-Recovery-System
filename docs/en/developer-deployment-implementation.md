@@ -432,7 +432,12 @@ For the administrator operation contract see [Runtime Profile Change Approval](a
 The regional release diff compares the normalized policy digest, not the Profile file path or the raw YAML SHA.
 When `source` switches from the template to the immutable snapshot, the field order changes or the registration anchor is replaced, as long as the normalized policy and
 version are unchanged it is classified as `NOOP`. The raw source/template SHAs are still written into the release state, for audit
-and old-state migration only.
+and old-state migration only. After the registration anchor is replaced (`remove-cluster` moves `registrationClusterId` to a
+remaining member of the same provider when it removes the registration cluster), the CPU-stage registration check and `verify`
+compare the policy only as well: the control plane's `cluster_id` for the version is the anchor of its first registration, and a
+registered version that differs in that label only is neither drift nor registered again; the plan keeps the anchor an existing
+immutable snapshot `profiles/<version>.yaml` records, so the snapshot bytes stay the same, and a different policy is still refused
+with `immutable Runtime Profile snapshot differs`.
 If the site's `source` path has drifted but
 the byte SHA of `<state-dir>/profiles/<current-version>.yaml` exactly matches the live release state,
 the release planner may use that local immutable snapshot to restore a trusted baseline and atomically correct the site; when the snapshot is missing or the SHA mismatches

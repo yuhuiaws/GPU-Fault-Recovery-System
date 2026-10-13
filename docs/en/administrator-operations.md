@@ -1121,7 +1121,9 @@ Semantics and boundaries of `eks-managed`:
   provider (`spec.runtimeProfile.registrationClusterId`) alone: a site whose registration cluster is plain EKS keeps
   the `eks-v1` base for good and its HyperPod members join with the `hyperpod-v1` override -- it is never re-based to
   the HyperPod family because a HyperPod member exists; a registration cluster missing from the managed set refuses
-  the deploy (`bootstrap_discovery.registration_cluster_provider`).
+  the deploy (`bootstrap_discovery.registration_cluster_provider`). When `remove-cluster` removes the registration
+  cluster while other members remain, it first makes a remaining member of the same provider the registration cluster,
+  and refuses before changing anything when no member of that provider remains (§5.0.4).
   The deploy preflight judges each cluster's override against that same registration family: the registration
   cluster itself never needs one, and a live base of another family yields the plan back to the registration family
   first, the other members being judged against the new base.
@@ -1845,6 +1847,70 @@ the kubeconfig alias, may create the namespace and clears stale installer annota
 (journal `ROLLBACK_STARTED`) is finished by the next `join-cluster`: its rollback verifies the adopted namespace, keeps the
 token file and the kubeconfig context, ends `ROLLED_BACK`, and the same run continues as the next attempt with the token
 binding and the reclaim proof carried forward.
+
+#### 5.0.4 Multi-cluster sites: removing the registration cluster, and known limits
+
+**Removing the registration cluster.** `spec.runtimeProfile.registrationClusterId` (the registration cluster) decides two
+things: which provider family the site Runtime Profile base follows (§5.0), and which cluster a new profile version is
+registered under (the control plane accepts only a registered cluster). When `remove-cluster` removes the registration
+cluster itself while the site still has other GPU clusters:
+
+- A remaining member has the same provider: the registration cluster becomes one of them with this removal -- a member
+  that still follows the site profile (no `spec.clusters[].runtimeProfile` of its own) first, then the first by cluster
+  id. The decision is made when the journal is created, recorded as `registration_reanchor` in
+  `remove-cluster/<cluster-id>/state.json` and committed in the same step as the site rewrite (`SITE_UPDATED`); the
+  command result carries the same field and a resume keeps the journaled decision.
+- Every remaining cluster has the other provider: the base family would change, so the command refuses before changing
+  anything (no journal is written) and exits with `cannot remove <cluster-id>: it is the site Runtime Profile
+  registration cluster ... Join another <provider> cluster first, then remove <cluster-id>: the anchor moves to that
+  cluster. Nothing was changed`. Join a cluster of the same provider first, then remove the registration cluster.
+- Removing another cluster, or the last one, keeps the registration cluster (an empty site has no member to name).
+
+A version already registered keeps the anchor of its first registration: the control plane stores one copy per
+`profile_version`, labelled with the registration cluster of that time as its `cluster_id`, and the immutable snapshot
+`profiles/<version>.yaml` stays as written. The release's registration check and `status --full`/`verify` compare the
+policy content, not that `cluster_id`, so after the registration cluster changes the same version is neither drift nor
+registered again; later versions register under the new registration cluster. An earlier `remove-cluster` kept a removed
+cluster as the registration cluster, and every later `deploy` then refused with `registration cluster <cluster-id> is not
+among the managed GPU clusters`; while that cluster still exists, such a site joins it back with `join-cluster` (same
+cluster id) and removes it once more with the current `remove-cluster`.
+
+**Several plain EKS clusters in one batch.** The ARNs a `deploy` adds (including the remaining ARNs after a first deploy)
+and a `join-cluster` with several ARNs go through the batch join, and one batch may hold several plain EKS clusters: two
+`spec.clusters[]` entries are the same cluster only when their cluster id, EKS ARN or kube context match, or when both
+carry the same HyperPod name (`bootstrap_discovery.same_cluster_entry`; the single-cluster join commit uses the same
+judgement).
+
+**Known limits:**
+
+1. **Node names must be unique across the site.** A plain EKS node name derives from the private IPv4 address
+   (`ip-10-0-33-205.<region>.compute.internal`), so two plain EKS GPU clusters in overlapping VPC CIDRs can produce the
+   same node name; HyperPod node names (`hyperpod-i-<instance id>`) cannot collide. A join that meets a node name already
+   in use is refused (`join NodeNames conflict with existing cluster, Agent, or CPU key ownership`); a node that appears
+   with a used name after the join (scale-out, Spot replacement) gets no Node Action key -- the CPU-side
+   `gpu-fault-node-action-keys` is keyed by node name, site-wide (`CPU NodeName key conflict; exclusive cluster ownership
+   requires reconciliation`) -- and no Agent is installed on it. Give the plain EKS GPU clusters of one site
+   non-overlapping VPC CIDRs.
+2. **A HyperPod cluster and a plain EKS cluster must not share a name.** The default cluster id is the HyperPod name
+   (HyperPod) or the EKS cluster name (plain EKS), and the Executor and ADOT writer IAM role names
+   (`gpu-fault-<site id>-<name>-executor`, `-adot-writer`) derive from that name as well; the second cluster of a name is
+   refused at join with `cluster_id already exists: <name>`. `--cluster-id` is no way around it: it leaves the IAM role
+   names unchanged, and the next `deploy` regenerates cluster ids from the provider name rather than keeping it. Give the
+   clusters different names when creating them.
+3. **Release time with many clusters.** A release rolls the GPU clusters in site order: one at a time while
+   `spec.release.upgradeMaxParallelClusters` (default 1, at most 8) is 1; above 1 the first cluster still rolls alone as
+   the canary before the others roll in bounded parallel. An automatic rollback always rolls back one cluster at a time
+   (the most recently changed first). A whole `deploy` has a fixed 6-hour deadline, and the rollback of a failed attempt
+   runs in a fixed 2-hour recovery reserve after it (`OVERALL_DEPLOY_SECONDS` and `RECOVERY_SECONDS` in
+   `src/gpu_fault/admin/deadlines.py`, not configurable); at the deadline the running step fails with `deployment
+   deadline exceeded`. For a release that rolls node runtimes on every cluster, estimate from the number of clusters
+   whether both budgets suffice.
+4. **A HyperPod cluster joined online gets background node identity refresh only after the CPU control-plane Pods
+   restart.** The control-worker sets up the background refresh of HyperPod node identities from the registry as it
+   stands at start-up; for a HyperPod cluster joined online by `join-cluster` (or by a `deploy` that releases nothing),
+   node identities are refreshed only on demand while managed recovery observes it, until the next CPU Pod restart (the
+   next application release restarts them) adds it to the background refresh. The fix ships with the next control-plane
+   release.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 

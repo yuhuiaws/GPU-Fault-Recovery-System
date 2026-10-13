@@ -134,6 +134,12 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   `runtimeClassName`（本次集群不需要）。
 - quiesce 污点只驱逐不容忍它的 Pod：带通配容忍的 DaemonSet、静态 Pod 与非 Kubernetes 进程不受影响，reset 对它们仍可能
   `In use by another client`（步骤 `details.gpu_client_holders` 点名持有者）。
+- 多集群站点（管理员日常运维 §5.0.4）：节点名必须全站唯一，普通 EKS 节点名由私有 IPv4 派生，VPC CIDR 重叠的两个普通
+  EKS 集群可能同名（HyperPod 节点名不会）；HyperPod 集群与普通 EKS 集群不得同名（cluster id 与 IAM 角色名由该名字派生，
+  `--cluster-id` 不在下一次 `deploy` 中保留）；集群多时发布只有一个 canary、回滚逐集群串行，且共用固定的 6 小时期限与
+  2 小时恢复预留；在线接入的 HyperPod 集群要等 CPU Pod 重启后才进入后台节点身份刷新（修复随下一个控制面 release）。
+- 注册集群（`spec.runtimeProfile.registrationClusterId`）被 `remove-cluster` 移除且站点还有其他成员时，改为剩余的同
+  provider 成员；没有同 provider 成员时拒绝移除，基线家族不会随移除改变。
 
 ## 5. 验证状态（诚实版）
 
@@ -144,7 +150,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   `tests/eks_provider/test_mixed_site_owner_resolution.py`、`tests/deploy/test_node_preflight_host_prerequisites.py`
   等；HyperPod 中立性以摘要固定值与逐字节渲染断言保证。
 - **未验证**：quiesce 污点（§2.7）与 RECOVERED 事件的 restore 出口只有单元测试，真机 DESTR-001 第三轮待跑；混合站点上的验收 campaign（故障注入、nodeReboot 实际执行与确认、离场节点、token 轮换、
-  remove-cluster/uninstall 对 eks-managed 的真机路径、Agent 升级/回滚、长期稳定性）；多于一个普通 EKS 集群；
+  remove-cluster/uninstall 对 eks-managed 的真机路径、Agent 升级/回滚、长期稳定性）；多于一个普通 EKS 集群（一批 join 多个
+  普通 EKS 集群只有单元测试）；
   非 AL2023 AMI；`training` 以外的工作负载命名空间；非默认 NVIDIA runtime 的集群。
 
 ## 6. 提交（基线 0d151512 → 3dedcd07，摘录）
