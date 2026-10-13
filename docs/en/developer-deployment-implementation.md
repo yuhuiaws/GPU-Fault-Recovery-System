@@ -465,6 +465,13 @@ if it should, change the read site at the same time, not just the documentation 
 an idle control plane. That semantics cannot be used for the first bootstrap: the regional deployment state machine requires at least one GPU cluster when there is no release state or it is still in a
 `bootstrap-*` recovery phase, and fails closed before the first Kubernetes apply.
 
+A cluster entry carries no `provider` for HyperPod (absent means `hyperpod`, so a site deployed before plain EKS
+support renders byte for byte as before; the rendered release config, the control-plane registry and
+`GPU_FAULT_CLUSTER_PROVIDER` follow the same rule) and `cluster_scope.cluster_provider()` is its one parser (absent or
+empty means `hyperpod`, an unknown spelling fails closed): compare two records' providers only through
+`cluster_provider()`, never as raw fields, where absent, `None` and `"hyperpod"` compare unequal
+(`tests/test_cluster_provider_comparisons.py` guards `src/` by AST).
+
 Aurora credential refresh is cross-role configuration: `preflight/verify` must parse both the CronJob's
 `GPU_FAULT_AURORA_RESTART_DEPLOYMENTS` and the live Role's Deployment
 `resourceNames`, and fail closed when the two sets are not exactly equal. Allowing only ingress while missing worker

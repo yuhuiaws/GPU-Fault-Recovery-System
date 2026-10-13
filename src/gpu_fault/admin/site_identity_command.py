@@ -38,6 +38,7 @@ from gpu_fault.cluster_scope import (
     HYPERPOD_CLUSTER_LABEL,
     OWNERSHIP_LABEL,
     ClusterProvider,
+    cluster_provider,
     ownership_node_selector,
 )
 
@@ -171,7 +172,7 @@ def run_site_id_command(
         role="cpu",
         context="gpu-fault-admin-site-id",
     )
-    if cpu.provider != ClusterProvider.HYPERPOD.value:
+    if cluster_provider(cpu.provider) is not ClusterProvider.HYPERPOD:
         raise BootstrapError(
             "the CPU control plane must be a HyperPod EKS cluster; "
             f"{arguments.cpu_cluster_arn} has no HyperPod orchestrator"
