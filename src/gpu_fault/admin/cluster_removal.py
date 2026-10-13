@@ -11,8 +11,6 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, cast
 
-import yaml  # type: ignore[import-untyped,unused-ignore]
-
 from gpu_fault.admin import cluster_removal_kubernetes as kubernetes_cleanup
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.aws_cleanup import ResourceCleaner
@@ -55,6 +53,7 @@ from gpu_fault.admin.cluster_removal_resources import (
 )
 from gpu_fault.admin.cluster_removal_state import (
     OWNERSHIP_RELEASE_STEP,
+    REGISTRATION_REANCHOR,
     allowed_registry_lifecycles,
     canonical_digest,
     cleanup_config_sha256,
@@ -63,6 +62,7 @@ from gpu_fault.admin.cluster_removal_state import (
     removal_result as _removal_result,
     resolve_saved_removal,
     validate_saved_site,
+    write_remaining_site,
 )
 from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault.admin.execution import (
@@ -840,25 +840,11 @@ def _remove_target_aws_resources(
 def _write_site_without_cluster(
     request: RemoveClusterRequest,
     state_dir: Path,
+    registration_cluster_id: str | None = None,
 ) -> None:
-    source = request.site.source
-    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    backup = state_dir / "site.before.yaml"
-    if not backup.exists():
-        backup.write_bytes(source.read_bytes())
-        backup.chmod(0o600)
-    document = yaml.safe_load(source.read_text(encoding="utf-8"))
-    clusters = document["spec"]["clusters"]
-    document["spec"]["clusters"] = [
-        item for item in clusters if item.get("clusterId") != request.cluster_id
-    ]
-    temporary = source.with_suffix(source.suffix + ".tmp")
-    temporary.write_text(
-        yaml.safe_dump(document, sort_keys=False),
-        encoding="utf-8",
+    write_remaining_site(
+        request.site.source, state_dir, request.cluster_id, registration_cluster_id
     )
-    temporary.chmod(0o600)
-    temporary.replace(source)
 
 
 def _update_bootstrap_state(
@@ -1436,7 +1422,9 @@ def _execute_removal(
         validate_saved_site(request.site, request.cluster_id, state)
         if not _done(state, "SITE_COMMIT_STARTED"):
             _complete(state_path, state, "SITE_COMMIT_STARTED")
-        _write_site_without_cluster(request, state_dir)
+        _write_site_without_cluster(
+            request, state_dir, state.get(REGISTRATION_REANCHOR)
+        )
         _update_bootstrap_state(
             request,
             target_network=target_network,

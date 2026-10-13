@@ -4647,7 +4647,10 @@ stages or after everything has finished, following the references below.
    the BuildKit output in the deployment log (the driver sets `BUILDKIT_PROGRESS=plain`) and binds the
    `control_plane`, `executor` and `node_dependencies` descriptors separately:
    `registry_reused=false`, each with no `CACHED` layer and with a base-image pull record.
-2. **S2: deregister every GPU cluster, one at a time.** Once per GPU cluster, in the order given (one ARN per call):
+2. **S2: deregister every GPU cluster, one at a time.** Once per GPU cluster (one ARN per call): first the clusters whose
+   provider differs from the registration cluster's (the cluster S1's first deploy created, so the first ARN's provider),
+   that provider's clusters last, each group in the order given -- `remove-cluster` refuses to deregister the registration
+   cluster while only clusters of another provider would remain (the site base family follows its provider):
 
    ```bash
    gpu-fault-admin remove-cluster \

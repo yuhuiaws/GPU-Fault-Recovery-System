@@ -98,6 +98,16 @@ def _precondition_lines(record: dict, stage: str) -> dict:
     return record["stages"][stage]["node_scope_precondition"]
 
 
+def _removed_arns(lines: list[str]) -> list[str]:
+    """The ARN of every S2 ``remove-cluster``, in the order the driver ran them."""
+
+    return [
+        line.split("--gpu-cluster-arn ")[1].split()[0]
+        for line in lines
+        if line.startswith("gpu-fault-admin remove-cluster ")
+    ]
+
+
 def _assert_approved_rerun(stopped: str, approved: str, stage: int) -> None:
     assert "--approve-profile-plan" not in stopped, stopped
     assert (
@@ -111,7 +121,9 @@ def test_a_mixed_site_leads_s1_with_the_first_arn_and_s5_with_the_other_provider
 ) -> None:
     """HyperPod ARN first: S1 deploys the HyperPod cluster and joins the
     eks-managed cluster (hyperpod-v1 site, eks-v1 override approved); S2
-    removes one cluster at a time; S3 re-joins both in one command (the eks
+    removes one cluster at a time, the eks cluster first (remove-cluster refuses
+    the HyperPod registration cluster while only the eks cluster would remain);
+    S3 re-joins both in one command (the eks
     snapshot exists, no plan stop); S5 reverses the order -- the README deploy
     names the eks cluster (eks-v1 site) and the HyperPod cluster joins with
     its hyperpod-v1 override approved. No command carries a selector flag: the
@@ -163,13 +175,10 @@ def test_a_mixed_site_leads_s1_with_the_first_arn_and_s5_with_the_other_provider
     _assert_hyperpod_join(joins[3])
     _assert_hyperpod_join(joins[4])
     _assert_approved_rerun(joins[3], joins[4], 5)
-    removes = [
-        line for line in lines if line.startswith("gpu-fault-admin remove-cluster ")
-    ]
-    assert [line.split("--gpu-cluster-arn ")[1].split()[0] for line in removes] == [
-        GPU_ARN,
-        EKS_GPU_ARN,
-    ], "clusters are removed one at a time, in the operator's order"
+    assert _removed_arns(lines) == [EKS_GPU_ARN, GPU_ARN], (
+        "clusters are removed one at a time, the registration cluster's provider "
+        "(the first ARN's) last"
+    )
     inventory = next(line for line in lines if "sagemaker list-clusters" in line)
     assert lines.index(inventory) < lines.index(deploys[0]), (
         "the provider of every GPU ARN comes from the HyperPod inventory, before S1"
@@ -179,12 +188,11 @@ def test_a_mixed_site_leads_s1_with_the_first_arn_and_s5_with_the_other_provider
     assert all(stage["status"] == "PASS" for stage in record["stages"].values()), (
         record["stages"]
     )
-    for number in ("2", "3"):
+    for number, order in (("2", (EKS_GPU_ARN, GPU_ARN)), ("3", (GPU_ARN, EKS_GPU_ARN))):
         journals = record["stages"][number]["journals"]
         assert [item["gpu_arn_sha256"] for item in journals] == [
-            _sha256(GPU_ARN),
-            _sha256(EKS_GPU_ARN),
-        ], (number, "one completion journal per GPU cluster, in the run's order")
+            _sha256(arn) for arn in order
+        ], (number, "one completion journal per GPU cluster, in the stage's order")
         assert len({item["journal_sha256"] for item in journals}) == 2, number
     expected = {
         "1": ("hyperpod", "eks-managed", EKS_GPU_ARN, "hyperpod-v1", "eks-v1"),
@@ -319,6 +327,9 @@ def test_an_eks_first_list_leads_s1_with_eks_and_s5_with_hyperpod(
     )
     assert EKS_GPU_ARN not in deploys[1], deploys[1]
     _assert_no_selector_flags(deploys[1])
+    assert _removed_arns(lines) == [GPU_ARN, EKS_GPU_ARN], (
+        "the eks registration cluster's provider goes last on an eks-first site"
+    )
     joins = _joins(lines)
     _assert_hyperpod_join(joins[0])
     _assert_hyperpod_join(joins[1])

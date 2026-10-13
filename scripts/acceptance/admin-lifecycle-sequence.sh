@@ -7,8 +7,12 @@
 #      HyperPod + plain-EKS site the deploy names the clusters of the first
 #      ARN's provider only and the other provider's clusters join right after
 #      it with the site-bound join-cluster (see "mixed sites" below)
-#   2  remove-cluster of every GPU cluster, one ARN at a time in the given
-#      order, ending in the zero-GPU-cluster steady state
+#   2  remove-cluster of every GPU cluster, one ARN at a time, ending in the
+#      zero-GPU-cluster steady state: the clusters of providers other than
+#      the registration cluster's (stage 1's first-deploy provider) first,
+#      that provider's clusters last, each group in the given order
+#      (remove-cluster refuses the registration cluster while only clusters
+#      of another provider would remain)
 #   3  one join-cluster re-attaching every GPU cluster
 #   4  uninstall --cpu-cluster keep --reset-database
 #      (--aurora-final-snapshot retain|skip, default retain)
@@ -126,7 +130,7 @@ done
 # group_gpu_clusters, stages 1 and 5): the stage's first deploy names every
 # cluster of its leading provider; each further provider joins inside the
 # stage with the site-bound join-cluster. GPU_PROVIDERS is parallel to GPU_ARNS.
-GPU_PROVIDERS=() FIRST_PROVIDER="" FIRST_DEPLOY_STATE=""
+GPU_PROVIDERS=() FIRST_PROVIDER="" FIRST_DEPLOY_STATE="" REMOVAL_ARNS=()
 DEPLOY_GPU_ARNS=() DEPLOY_GPU_ARN_ARGS=() DEPLOY_RECEIPT_ARGS=()
 JOINED_PROVIDERS=() JOINED_GPU_ARNS=() JOINED_GPU_PROVIDERS=() JOINED_RECEIPT_ARGS=()
 [[ "$START_STAGE" =~ ^[1-5]$ ]] || usage
@@ -473,9 +477,27 @@ stage_1() {
   deploy_fresh "$STATE_DIR" "$PREVIOUS_SITE_ID" run_path_deploy
 }
 
-stage_2() {  # one ARN at a time; every removed cluster's journal is asserted and its label gone
+removal_order() {  # REMOVAL_ARNS: every other provider's clusters first, the registration cluster's provider last
+  # The registration cluster is stage 1's first deployed cluster, so its
+  # provider is the first ARN's. remove-cluster moves the site's registration
+  # anchor to a remaining cluster of that provider, and refuses to remove the
+  # registration cluster while only another provider's clusters would remain
+  # (the site base profile family follows the registration cluster).
+  local index registration="${GPU_PROVIDERS[0]}"
+  REMOVAL_ARNS=()
+  for index in "${!GPU_ARNS[@]}"; do
+    [[ "${GPU_PROVIDERS[$index]}" == "$registration" ]] || REMOVAL_ARNS+=("${GPU_ARNS[$index]}")
+  done
+  for index in "${!GPU_ARNS[@]}"; do
+    [[ "${GPU_PROVIDERS[$index]}" != "$registration" ]] || REMOVAL_ARNS+=("${GPU_ARNS[$index]}")
+  done
+}
+
+stage_2() {  # one ARN at a time in removal_order; every removed cluster's journal is asserted and its label gone
   local removed=()
-  for arn in "${GPU_ARNS[@]}"; do
+  discover_gpu_providers
+  removal_order
+  for arn in "${REMOVAL_ARNS[@]}"; do
     run_admin remove-cluster --state-dir "$STATE_DIR" --gpu-cluster-arn "$arn" \
       --confirm REMOVE_GPU_CLUSTER
     removed+=("$arn")

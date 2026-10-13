@@ -329,6 +329,24 @@ def _base_profile_version(
     return f"{PROVIDER_VERSION_PREFIXES[provider]}-{policy_digest[:12]}"
 
 
+def _recorded_anchor(snapshot_file: Path) -> str | None:
+    """The ``cluster_id`` an existing immutable snapshot was written with.
+
+    It is the anchor the version was registered under, and it stays when
+    remove-cluster moves ``registrationClusterId`` to another member: the
+    snapshot is history and is never rewritten under the new anchor. A missing
+    or unreadable snapshot has none; ``_write_profile_snapshot`` still refuses
+    any snapshot whose content differs.
+    """
+
+    try:
+        document = yaml.safe_load(snapshot_file.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError):
+        return None
+    anchor = document.get("cluster_id") if isinstance(document, dict) else None
+    return anchor if isinstance(anchor, str) and anchor else None
+
+
 def plan_runtime_profile(
     site_file: Path,
     *,
@@ -414,8 +432,11 @@ def plan_runtime_profile(
             change_kind, changes = _classify_profile_change(current, candidate)
 
     approval_required = change_kind != "UNCHANGED"
+    snapshot_file = site_file.parent / "profiles" / f"{desired_version}.yaml"
     snapshot_document["profile_version"] = desired_version
-    snapshot_document["cluster_id"] = registration_cluster_id
+    snapshot_document["cluster_id"] = (
+        _recorded_anchor(snapshot_file) or registration_cluster_id
+    )
     snapshot_sha = hashlib.sha256(
         yaml.safe_dump(snapshot_document, sort_keys=False).encode()
     ).hexdigest()
@@ -446,7 +467,7 @@ def plan_runtime_profile(
         approval_plan_sha256=None,
         approval_relation=None,
         approval_required=approval_required,
-        snapshot_file=site_file.parent / "profiles" / f"{desired_version}.yaml",
+        snapshot_file=snapshot_file,
         snapshot_document=snapshot_document,
     )
 

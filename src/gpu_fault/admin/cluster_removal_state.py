@@ -15,7 +15,7 @@ from uuid import uuid4
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.atomic_json import write_json_atomic
-from gpu_fault.cluster_scope import is_eks_managed
+from gpu_fault.cluster_scope import cluster_provider, is_eks_managed
 from gpu_fault.admin.bootstrap_common import BootstrapError, safe_name
 from gpu_fault import installation_lifecycle
 from gpu_fault.admin.process_supervisor import ProcessSupervisionLost
@@ -46,6 +46,10 @@ STEP_DEPENDENCIES = {
 #: released (``ownership_release.stale_ownership_claims`` reports it), and the
 #: journal stays readable as the tombstone it is.
 LEGACY_COMPLETED_STEPS = frozenset(STEP_DEPENDENCIES) - {OWNERSHIP_RELEASE_STEP}
+#: Journal key: the cluster ``spec.runtimeProfile.registrationClusterId`` moves
+#: to with this removal (``registration_reanchor``), None when it stays. A
+#: journal written before the rule has no key and keeps the anchor it bound.
+REGISTRATION_REANCHOR = "registration_reanchor"
 
 
 @contextmanager
@@ -119,21 +123,104 @@ def site_identity(site: RenderedSite) -> dict[str, str]:
     }
 
 
-def site_documents(site: RenderedSite, cluster_id: str) -> tuple[str, str]:
+def registration_reanchor(site: RenderedSite, cluster_id: str) -> str | None:
+    """Where the site Runtime Profile anchor moves when ``cluster_id`` leaves.
+
+    ``spec.runtimeProfile.registrationClusterId`` names the cluster whose
+    provider the site base profile family follows
+    (``bootstrap_discovery.regional_profile_for``) and the anchor a new profile
+    version registers under, which the control plane accepts only for a
+    registered cluster. Removing another cluster, or the last one, keeps it
+    (None). Removing the anchor while members remain moves it to a remaining
+    member of its provider -- one on the site profile before one pinned to its
+    own, then by cluster id -- and is refused before anything changes when no
+    member of that provider remains: the base family would change. Versions
+    registered earlier keep the anchor they were registered under.
+    """
+
+    registration = site.release_config["runtime_profile"]["registration_cluster_id"]
+    clusters = [dict(item) for item in site.release_config["clusters"]]
+    target = next((item for item in clusters if item["cluster_id"] == cluster_id), None)
+    remaining = [item for item in clusters if item is not target]
+    if registration != cluster_id or target is None or not remaining:
+        return None
+    provider = cluster_provider(target.get("provider"))
+    members = sorted(
+        (
+            item
+            for item in remaining
+            if cluster_provider(item.get("provider")) is provider
+        ),
+        key=lambda item: ("runtime_profile" in item, str(item["cluster_id"])),
+    )
+    if members:
+        return str(members[0]["cluster_id"])
+    raise BootstrapError(
+        f"cannot remove {cluster_id}: it is the site Runtime Profile registration "
+        "cluster (spec.runtimeProfile.registrationClusterId), the site base profile "
+        f"family follows its provider ({provider.value}), and no other "
+        f"{provider.value} cluster remains to take over the anchor (remaining: "
+        + ", ".join(sorted(str(item["cluster_id"]) for item in remaining))
+        + "); removing it would change the base family. Join another "
+        f"{provider.value} cluster first, then remove {cluster_id}: the anchor "
+        "moves to that cluster. Nothing was changed"
+    )
+
+
+def remaining_site_document(
+    document: dict[str, Any], cluster_id: str, registration_cluster_id: str | None
+) -> dict[str, Any]:
+    """``site.yaml`` without ``cluster_id``: the document a removal binds and
+    commits; ``registration_cluster_id`` is the journaled re-anchor, if any."""
+
+    without = copy.deepcopy(document)
+    without["spec"]["clusters"] = [
+        item for item in without["spec"]["clusters"] if item["clusterId"] != cluster_id
+    ]
+    if registration_cluster_id is not None:
+        profile = without["spec"]["runtimeProfile"]
+        profile["registrationClusterId"] = registration_cluster_id
+    return without
+
+
+def write_remaining_site(
+    site_file: Path,
+    state_dir: Path,
+    cluster_id: str,
+    registration_cluster_id: str | None,
+) -> None:
+    """Back ``site_file`` up once, then commit ``remaining_site_document``."""
+
+    state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    backup = state_dir / "site.before.yaml"
+    if not backup.exists():
+        backup.write_bytes(site_file.read_bytes())
+        backup.chmod(0o600)
+    document = remaining_site_document(
+        yaml.safe_load(site_file.read_text(encoding="utf-8")),
+        cluster_id,
+        registration_cluster_id,
+    )
+    temporary = site_file.with_suffix(site_file.suffix + ".tmp")
+    temporary.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(site_file)
+
+
+def site_documents(
+    site: RenderedSite, cluster_id: str, registration_cluster_id: str | None = None
+) -> tuple[str, str]:
     try:
         document = yaml.safe_load(site.source.read_text(encoding="utf-8"))
-        without = copy.deepcopy(document)
-        without["spec"]["clusters"] = [
-            item
-            for item in without["spec"]["clusters"]
-            if item["clusterId"] != cluster_id
-        ]
+        without = remaining_site_document(document, cluster_id, registration_cluster_id)
     except (OSError, ValueError, TypeError, KeyError, yaml.YAMLError) as exc:
         raise BootstrapError("cannot bind remove-cluster site document") from exc
     return canonical_digest(document), canonical_digest(without)
 
 
-def release_documents(site: RenderedSite, cluster_id: str) -> tuple[str, str]:
+def release_documents(
+    site: RenderedSite, cluster_id: str, registration_cluster_id: str | None = None
+) -> tuple[str, str]:
     without = {
         **site.release_config,
         "clusters": [
@@ -142,6 +229,11 @@ def release_documents(site: RenderedSite, cluster_id: str) -> tuple[str, str]:
             if item["cluster_id"] != cluster_id
         ],
     }
+    if registration_cluster_id is not None:
+        without["runtime_profile"] = {
+            **site.release_config["runtime_profile"],
+            "registration_cluster_id": registration_cluster_id,
+        }
     return canonical_digest(site.release_config), canonical_digest(without)
 
 
@@ -203,6 +295,11 @@ def read_removal_state(path: Path) -> dict[str, Any]:
         or any(character not in "0123456789abcdef" for character in attempt)
     ):
         raise BootstrapError("remove-cluster state has an invalid attempt identity")
+    anchor = value.get(REGISTRATION_REANCHOR)
+    if anchor is not None and (
+        not isinstance(anchor, str) or not IDENTIFIER_PATTERN.fullmatch(anchor)
+    ):
+        raise BootstrapError("remove-cluster state has an invalid registration anchor")
     return value
 
 
@@ -291,9 +388,12 @@ def load_removal_state(
             write_json_atomic(archive, value)
     if len(matches) != 1:
         raise BootstrapError(f"unknown cluster_id: {cluster_id}")
+    # A removal that would change the site base family is refused here, before
+    # the registry gate and before any journal exists.
+    reanchor = registration_reanchor(site, cluster_id)
     gate = deletion_gate(site.source.parent, verb="remove-cluster", accept=accept)
-    before, after = site_documents(site, cluster_id)
-    release_before, release_after = release_documents(site, cluster_id)
+    before, after = site_documents(site, cluster_id, reanchor)
+    release_before, release_after = release_documents(site, cluster_id, reanchor)
     value = {
         "schema_version": SCHEMA_VERSION,
         "site_id": site.release_config["site_name"],
@@ -304,6 +404,7 @@ def load_removal_state(
         "source_release_sha256": release_before,
         "remaining_release_sha256": release_after,
         "target": matches[0],
+        REGISTRATION_REANCHOR: reanchor,
         "attempt_id": uuid4().hex,
         "phase": "STARTED",
         "completed_steps": [],
@@ -391,4 +492,9 @@ def removal_result(
         "gpu_cluster": "PRESERVED",
         "ownership_label": ownership_release_summary(state),
         FIELD: state.get(FIELD),
+        **(
+            {REGISTRATION_REANCHOR: state[REGISTRATION_REANCHOR]}
+            if state.get(REGISTRATION_REANCHOR)
+            else {}
+        ),
     }
