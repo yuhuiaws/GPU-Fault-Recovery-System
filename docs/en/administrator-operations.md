@@ -1140,8 +1140,10 @@ Semantics and boundaries of `eks-managed`:
   A later `deploy` over the whole site (CPU + every GPU ARN) keeps each managed cluster's join-time decisions:
   `provider`, `nodeSelector`/`nodeSelectorSource` (what discovery resolved from the ownership label at join time, or the selector recorded before the convention) and `runtimeProfile` are carried over and only the
   override's `agentConfigDigest` is recomputed for this release; an entry that lost its override is restored from the
-  approved snapshot `profiles/<version>.yaml`, and without an approved snapshot the deploy refuses and points to
-  `join-cluster --approve-profile-plan`. The release-diff's `clusters` digests membership only (ids, names, ARNs,
+  approved snapshot `profiles/<version>.yaml`; a member without an approved snapshot (for example a plain EKS cluster
+  batch-joined before batch joins planned cluster profiles) gets a `CLUSTER_PROFILE_NEW` plan from the deploy, which
+  stops for review (one plan covers every member needing that version, see Profile change approval §1.2), and a pinned
+  version whose snapshot is missing is refused. The release-diff's `clusters` digests membership only (ids, names, ARNs,
   namespaces, CIDRs, provider), not the profile pins -- pin changes ride the rollbackable `cluster_runtime_profiles`
   (a state recorded with the earlier pin-folded digest still reads as the same membership). After a join,
   `status --full` reporting `next deploy: CONTROL_PLANE_ONLY / observability_drift` means the control-plane ADOT/alert

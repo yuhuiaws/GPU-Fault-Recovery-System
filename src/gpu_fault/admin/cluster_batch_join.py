@@ -29,6 +29,10 @@ from gpu_fault.admin.cluster_join_nodes import (
     read_node_claims,
     verify_join_node_names,
 )
+from gpu_fault.admin.cluster_join_profile import (
+    JoinProfileApprovalRequired,
+    cluster_runtime_profiles,
+)
 from gpu_fault.admin.cluster_join_evidence import (
     JoinVerificationExpired,
     advance_batch_verification,
@@ -231,6 +235,49 @@ def _registry_snapshot_for(attempt: JoinAttempt, exported: Path | None) -> Path:
     return target
 
 
+def _discovered_runtime_profiles(
+    context: BatchJoinContext,
+    attempts: list[JoinAttempt],
+    discoveries: dict[str, tuple[ClusterIdentity, str, dict[str, Any] | None]],
+) -> dict[str, dict[str, str]]:
+    """``{cluster_id: runtimeProfile}`` of the newly discovered clusters that
+    need their own profile, planned as a single join plans it.
+
+    Serial and before any cluster records its discovery: the plan is one
+    site-wide file, so one plan per version names every cluster of the batch
+    that needs it. A plan awaiting review stops the batch before it mutates
+    anything; the clusters the plan covers record the stop as a single join
+    does, the others are left as they were, and the printed rerun repeats the
+    batch with ``--approve-profile-plan``.
+    """
+
+    pending = [
+        (attempt, discoveries[attempt.request.gpu_cluster_arn])
+        for attempt in attempts
+        if attempt.request.gpu_cluster_arn not in context.failures
+        and not step_done(attempt.state, "DISCOVERED")
+        and discoveries[attempt.request.gpu_cluster_arn][2] is None
+    ]
+    if not pending:
+        return {}
+    rerun = f"gpu-fault-admin join-cluster --state-dir {context.site.source.parent}"
+    rerun += "".join(
+        f" --gpu-cluster-arn {attempt.request.gpu_cluster_arn}" for attempt in attempts
+    )
+    try:
+        return cluster_runtime_profiles(
+            context.site,
+            context.runner_factory(),
+            [(target, cluster_id) for _attempt, (target, cluster_id, _) in pending],
+            rerun_command=rerun,
+        )
+    except JoinProfileApprovalRequired as stop:
+        for attempt, (_target, cluster_id, _existing) in pending:
+            if cluster_id in stop.cluster_ids:
+                _record_failure(context, attempt, None, stop)
+        raise
+
+
 def _checkpoint_readonly_results(
     context: BatchJoinContext,
     attempts: list[JoinAttempt],
@@ -239,6 +286,7 @@ def _checkpoint_readonly_results(
 ) -> list[JoinAttempt]:
     active = []
     identities: list[tuple[str, str, str, str, str]] = []
+    profiles = _discovered_runtime_profiles(context, attempts, discoveries)
     for attempt in attempts:
         arn = attempt.request.gpu_cluster_arn
         if arn in context.failures:
@@ -279,6 +327,7 @@ def _checkpoint_readonly_results(
                     }
                 )
                 continue
+            profile = profiles.get(cluster_id)
             complete_step(
                 attempt.state_path,
                 attempt.state,
@@ -289,6 +338,7 @@ def _checkpoint_readonly_results(
                     "registry_snapshot": str(
                         _registry_snapshot_for(attempt, registry_path)
                     ),
+                    **({"runtime_profile": profile} if profile else {}),
                 },
             )
         discovery = attempt.state["evidence"]["DISCOVERED"]

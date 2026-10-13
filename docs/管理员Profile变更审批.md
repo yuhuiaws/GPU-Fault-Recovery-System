@@ -15,6 +15,7 @@ profile** 的 GPU 集群使用；一个集群也可以拥有自己的 profile（
 `release-deploy/profile-plan.json`（`change_kind: CLUSTER_PROFILE_NEW`，`registration_cluster_id` 为该集群），
 用 `join-cluster --approve-profile-plan <plan_sha256> --reference <CHG>`（或 `deploy` 的同名参数）
 审批后继续；审批消费后写入不可变快照 `profiles/<version>.yaml`，后续同 provider 的集群复用。
+多个集群需要同一版本时只出一份计划，一次审批覆盖全部（见 1.2）。
 
 ## 1. 最短操作路径
 
@@ -97,6 +98,24 @@ Record plan_sha256 on the change request; once it is approved, rerun:
 templateSource、本次发布的 `agentConfigDigest`），随发布注册该版本并继续；节点 wave 随后重新 pin 该集群的 Agent。
 `eks-v1` 的快照原样保留。变化之后再加入的集群会推导出同一后继版本并复用其已审批快照。不要为了"腾出"版本名而删除
 已 pin 的快照：快照就是该版本下被批准策略的证据。
+
+### 1.2 多个集群需要同一版本
+
+计划文件全站点只有一份，所以集群自有 Profile 的计划按**版本**出：一份 `CLUSTER_PROFILE_NEW` 计划列出本次操作中需要该版本的
+全部集群——一次 `join-cluster` 的多个 `--gpu-cluster-arn`、`deploy --gpu-cluster-arn` 新增的 GPU 集群（两者都走批量 join），
+或 `deploy` 要迁到同一后继版本的全部成员。`registration_cluster_id` 与快照锚点取其中 cluster id 最小者，无论哪条命令、按什么
+顺序列出这些集群，算出的都是同一份计划，deploy 的早期 preflight 与站点收尾也算出同一份，一次审批覆盖全部。此时停止信息打印
+`clusters: <id>, <id>` 与 `(these clusters only)`，`changes` 每个集群一行，末行说明该版本是这些集群共用的一次审批与一个不可变快照。
+
+批量 join 与单集群 join 审核方式完全一致：在任何变更之前停止，计划覆盖的集群在各自 join 记录里记下这次停止，同批其余集群保持原状；
+按打印的续跑命令（同一批 `--gpu-cluster-arn`，加 `--approve-profile-plan <plan_sha256> --reference <CHG>`）继续。已纳管却没有自有
+Profile、也没有已审批快照的集群（批量 join 计算集群 Profile 之前完成接入的普通 EKS 集群）由 `deploy` 以同样方式为其首个自有版本出计划
+（对照站点 Profile 审核），审批后写入快照并 pin 条目；已 pin 版本的快照缺失仍然拒绝。
+
+审批只覆盖它所审的那份计划：计划在被消费前变化（例如需要该版本的集群集合变了），旧审批归档为 `SUPERSEDED`，写出新计划并停止，打印新摘要。
+控制面按版本只保存一份 Profile，记录首次注册它的集群（`cluster_id`）；release 比较已注册的 Profile 时不比较这个注册锚点，所以 join 追加、
+批量 join 与提交按 cluster id 排序、`deploy` 按 EKS ARN 重排、`remove-cluster` 移走锚点集群，都不会被当成策略漂移；`join-cluster` 的
+release 把新版本注册在正在加入的集群名下。已存的 Profile 原样读取，不会被改写。
 
 ## 2. 状态流转
 

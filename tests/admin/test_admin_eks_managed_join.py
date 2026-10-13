@@ -1319,10 +1319,51 @@ def test_deploy_keeps_an_existing_override_and_refreshes_its_digest(
     )
 
 
-def test_deploy_fails_closed_when_the_needed_profile_was_never_approved(
-    tmp_path,
-) -> None:
+def test_deploy_reviews_a_needed_profile_that_was_never_approved(tmp_path) -> None:
+    """A member without its own profile and without an approved snapshot (a
+    batch join completed before batches planned profiles) is planned by the
+    deploy for explicit review -- nothing is pinned or written before the
+    approval -- instead of a refusal naming a join that has nothing to join."""
+
     repo, document = _deploy_document(tmp_path, eks_profile=None)
+    document["metadata"] = {"name": "staging"}
+    document["spec"]["awsRegion"] = "us-west-2"
+    document["spec"]["cpu"] = {
+        "eksArn": "arn:aws:eks:us-west-2:123456789012:cluster/control-plane"
+    }
+    document["spec"]["runtimeProfile"]["version"] = "hyperpod-v1"
+    state_dir = tmp_path / "state"
+    with pytest.raises(
+        cluster_join_profile.JoinProfileApprovalRequired,
+        match="the deploy stopped for review",
+    ):
+        cluster_join_profile.reconcile_cluster_runtime_profiles(
+            object(), document, repository_root=repo, state_dir=state_dir
+        )
+    plan = json.loads(profile_approval.profile_plan_path(state_dir).read_text())
+    assert (plan["registration_cluster_id"], plan["desired_version"]) == (
+        "gpu-eks-cluster",
+        "eks-v1",
+    ), plan
+    assert plan["current_version"] == "hyperpod-v1", "reviewed against the site"
+    assert "runtimeProfile" not in document["spec"]["clusters"][1], (
+        "nothing is pinned before the approval"
+    )
+    assert not (state_dir / "profiles" / "eks-v1.yaml").exists(), (
+        "no snapshot before the approval"
+    )
+
+
+def test_deploy_fails_closed_when_a_pinned_version_lost_its_snapshot(tmp_path) -> None:
+    repo, document = _deploy_document(
+        tmp_path,
+        eks_profile={
+            "source": "/elsewhere/eks-v1.yaml",
+            "templateSource": "config/runtime-profile.regional-eks-safe.example.yaml",
+            "version": "eks-v1",
+            "agentConfigDigest": "1" * 64,
+        },
+    )
     with pytest.raises(BootstrapError, match="needs Runtime Profile eks-v1.*approve"):
         cluster_join_profile.reconcile_cluster_runtime_profiles(
             object(), document, repository_root=repo, state_dir=tmp_path / "state"

@@ -51,7 +51,10 @@ The site profile is the default pin. When its `nodeReboot` owner cannot serve th
 `spec.clusters[].runtimeProfile` (`source`/`templateSource`/`version`/`agentConfigDigest`); the new version is
 reviewed through `release-deploy/profile-plan.json` (`change_kind: CLUSTER_PROFILE_NEW`) and approved with
 `join-cluster --approve-profile-plan <sha> --reference <CHG>`; the consumed approval writes the immutable snapshot
-`profiles/<version>.yaml`, reused by later clusters of that provider. The release registers every version in use and
+`profiles/<version>.yaml`, reused by later clusters of that provider. A batch join (several `--gpu-cluster-arn`,
+`deploy --gpu-cluster-arn`) is reviewed like a single join; a version is one plan naming every cluster that needs it,
+and the release compares a registered version without its registration anchor (`cluster_id`), see
+[Runtime Profile Change Approval](../administrator-profile-change-approval.md) §1.2. The release registers every version in use and
 renders each cluster's Executor/Watcher/Reconciler/installer pins and Agent config digest from its own version; the
 registry entry carries `runtime_profile_version`/`agent_config_digest` (digest-excluded while equal to the site
 default); `FleetRegistry.cluster_policy` checks Agents per cluster while `GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION`

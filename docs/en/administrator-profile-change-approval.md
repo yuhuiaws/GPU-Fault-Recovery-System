@@ -19,6 +19,7 @@ same `release-deploy/profile-plan.json` (`change_kind: CLUSTER_PROFILE_NEW`, `re
 cluster), continues after `join-cluster --approve-profile-plan <plan_sha256> --reference <CHG>` (or the same flags on
 `deploy`), and once the approval is consumed the immutable snapshot `profiles/<version>.yaml` is written and reused by
 later clusters of the same provider.
+When several clusters need the same version, one plan covers them all and one approval approves it (see 1.2).
 
 ## 1. Shortest Operating Path
 
@@ -108,6 +109,32 @@ release and continues; the node wave re-pins the cluster's Agents. `eks-v1` keep
 A cluster joining after the change derives the same successor version and reuses its approved snapshot.
 Do not delete the pinned snapshot to "free" the version name: the snapshot is the proof of the policy that
 was approved under it.
+
+### 1.2 Several clusters needing one version
+
+The site has one plan file, so a cluster's own profile is planned per **version**: one `CLUSTER_PROFILE_NEW` plan names
+every cluster of the operation that needs the version -- the several `--gpu-cluster-arn` of one `join-cluster`, the new
+GPU clusters of `deploy --gpu-cluster-arn` (both run the batch join), or every member a `deploy` moves to the same
+successor. `registration_cluster_id` and the snapshot anchor are the smallest cluster id among them, so whichever command
+lists the clusters, in whatever order, computes the same plan -- the deploy's early preflight and the site finalization
+included -- and one approval covers all of them. The stop then prints `clusters: <id>, <id>` and `(these clusters only)`,
+`changes` carries one line per cluster, and the last line states that the version is one approval and one immutable
+snapshot shared by these clusters.
+
+A batch join reviews exactly like a single join: it stops before it mutates anything, the clusters the plan covers record
+the stop in their join journals, the other clusters of the batch are left as they were, and the printed rerun (the same
+`--gpu-cluster-arn` list plus `--approve-profile-plan <plan_sha256> --reference <CHG>`) continues. A managed cluster that
+has no profile of its own and no approved snapshot (a plain EKS cluster a batch join completed before batch joins planned
+cluster profiles) gets its first own version planned the same way by `deploy` (reviewed against the site profile); the
+approval writes the snapshot and pins the entry. A pinned version whose snapshot is missing is still refused.
+
+An approval covers exactly the plan it was given for: when the plan changes before it is consumed (for example the set of
+clusters needing the version changed), the old approval is archived as `SUPERSEDED`, the new plan is written and the
+command stops and prints the new digest. The control plane stores a version once, under the cluster that first registered
+it (`cluster_id`); the release compares a registered profile without that registration anchor, so a join appending a
+cluster, a batch join or commit sorting by cluster id, a `deploy` ordering by EKS ARN or a `remove-cluster` taking the
+anchor away never reads as policy drift, and a `join-cluster` release registers a new version under the joining cluster.
+Stored profiles are read as they are and never rewritten.
 
 ## 2. State Transitions
 

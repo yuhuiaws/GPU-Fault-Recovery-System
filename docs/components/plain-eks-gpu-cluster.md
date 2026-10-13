@@ -42,6 +42,7 @@ Agent endpoint CIDR 取 GPU 节点组子网；`NodeRecovery` 门禁的对应项�
 `spec.clusters[].runtimeProfile`（`source`/`templateSource`/`version`/`agentConfigDigest`），新版本经
 `release-deploy/profile-plan.json`（`change_kind: CLUSTER_PROFILE_NEW`）审批：`join-cluster --approve-profile-plan
 <sha> --reference <CHG>`；审批消费后写入不可变快照 `profiles/<version>.yaml`，同 provider 的后续集群复用。
+批量 join（多个 `--gpu-cluster-arn`、`deploy --gpu-cluster-arn`）与单集群 join 同样审核；同一版本只出一份计划，列出需要它的全部集群，release 比较已注册版本时不比较注册锚点（`cluster_id`），见 [Runtime Profile 变更审批](../管理员Profile变更审批.md) §1.2。
 release 注册每个在用版本，按集群渲染 Executor/Watcher/Reconciler/安装器的版本 pin 与 Agent 配置摘要；
 注册表条目携带 `runtime_profile_version`/`agent_config_digest`（等于站点缺省时不进入摘要）；控制面
 `FleetRegistry.cluster_policy` 按集群核对 Agent，`GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION` 仍是站点缺省；

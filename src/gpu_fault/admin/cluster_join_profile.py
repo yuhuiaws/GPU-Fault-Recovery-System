@@ -15,23 +15,35 @@ digest on the change request and reruns with ``--approve-profile-plan SHA
 ``profiles/<version>.yaml`` is written and the join proceeds. A later join of
 another cluster needing the same version finds the snapshot and asks nothing.
 
+The plan file is one per site, so a plan is one per *version*: it names every
+cluster of the operation that needs the version (a batch join, or the members
+a deploy moves), anchored on the first by cluster id, so it is the same plan
+whichever order lists the clusters -- the deploy preflight and the site
+finalization compute it alike, and one approval covers all of them. A batch
+join plans exactly as a single join does and stops before it mutates
+anything. An approval covers exactly the plan it was given for: when the plan
+changed before it was consumed, the approval is archived ``SUPERSEDED`` and
+the new plan is written for review.
+
 A snapshot never changes under its version. When the provider's example
 profile changes policy after a cluster was pinned (live 2026-10-05: the
 plain-EKS profile took ownership of ``nodeReplace`` while ``gpu-eks-cluster``
 was pinned to ``eks-v1``), the cluster's profile gets a *new* version,
 ``regional-<provider>-<digest12>`` of the template policy. ``deploy`` plans it
-the same way (``CLUSTER_PROFILE_NEW`` anchored on the cluster), stops before
-the release work, and ``deploy --approve-profile-plan SHA --reference REF``
-writes the new snapshot, re-pins the cluster entry (version, source,
-templateSource, Agent config digest) and continues; the node wave then
-re-pins the cluster's Agents. ``join-cluster`` derives the same version for a
-cluster joining after the change.
+the same way (``CLUSTER_PROFILE_NEW``), stops before the release work, and
+``deploy --approve-profile-plan SHA --reference REF`` writes the new snapshot,
+re-pins the cluster entries (version, source, templateSource, Agent config
+digest) and continues; the node wave then re-pins the clusters' Agents.
+``join-cluster`` derives the same version for a cluster joining after the
+change. A member that never got its own version (a batch join before the
+batch planned it) is planned by ``deploy`` the same way.
 """
 
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from collections.abc import Sequence
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -46,11 +58,13 @@ from gpu_fault.admin.bootstrap_common import (
 )
 from gpu_fault.admin.profile_approval import (
     ProfileApprovalError,
+    StaleProfileApprovalError,
     consume_profile_approval,
     profile_plan_path,
     profile_plan_sha256,
     profile_site_identity_sha256,
     resolve_profile_approval,
+    supersede_profile_approval,
     write_profile_plan,
 )
 from gpu_fault.admin.cluster_join_types import JoinClusterRequest
@@ -73,7 +87,9 @@ __all__ = [
     "cluster_profile_document",
     "cluster_profile_override",
     "cluster_runtime_profile",
+    "cluster_runtime_profiles",
     "ensure_cluster_profile_approved",
+    "ensure_cluster_profiles_approved",
     "preflight_cluster_profile_plans",
     "provider_profile_version",
     "reconcile_cluster_runtime_profiles",
@@ -85,6 +101,11 @@ PROFILES_DIR = "profiles"
 
 class JoinProfileApprovalRequired(BootstrapError):
     """The join stopped for Runtime Profile review; the message says how to go on."""
+
+    def __init__(self, message: str, *, cluster_ids: Sequence[str] = ()) -> None:
+        super().__init__(message)
+        #: The clusters the pending plan moves to its version.
+        self.cluster_ids = tuple(cluster_ids)
 
 
 @dataclass(frozen=True)
@@ -221,18 +242,61 @@ def _snapshot_text(override: ClusterProfileOverride) -> str:
     return str(yaml.safe_dump(_snapshot_document(override), sort_keys=False))
 
 
+@dataclass(frozen=True)
+class _PlannedMember:
+    """One cluster a plan moves to the plan's version."""
+
+    cluster_id: str
+    provider: str
+    #: The cluster's own pinned version and its snapshot's policy when it moves
+    #: from that version; ``None`` for its first own version (it runs the site
+    #: profile until then).
+    current_version: str | None = None
+    current_policy_digest: str | None = None
+
+
+def _change_line(
+    facts: SiteFacts,
+    override: ClusterProfileOverride,
+    member: _PlannedMember,
+    *,
+    alone: bool,
+) -> str:
+    before = member.current_version
+    if before is not None:
+        line = (
+            f"cluster {member.cluster_id} ({member.provider}) moves from its own "
+            f"Runtime Profile {before} to {override.version}: the policy of "
+            f"{override.template_reference} changed; {before} keeps its immutable "
+            "snapshot"
+        )
+        return line + " and no other cluster is touched" if alone else line
+    line = (
+        f"cluster {member.cluster_id} ({member.provider}) runs its own Runtime "
+        f"Profile {override.version}: nodeReboot owned by {override.owner}, "
+        "nodeReplace OBSERVE"
+    )
+    if alone:
+        line += (
+            f"; the site profile {facts.profile_version} stays on every other cluster"
+        )
+    return line
+
+
 def _plan_document(
     facts: SiteFacts,
     override: ClusterProfileOverride,
-    *,
-    current_version: str | None = None,
-    current_policy_digest: str | None = None,
+    members: Sequence[_PlannedMember],
 ) -> dict[str, Any]:
-    """The review document, in the shape ``profile_approval`` validates.
+    """The review document of one version, in the shape ``profile_approval``
+    validates.
 
-    ``current_version`` is the site profile for a cluster's first own version
-    and the cluster's pinned version for a bump (``current_policy_digest`` is
-    then the pinned snapshot's policy).
+    ``members`` are every cluster the operation moves to ``override.version``,
+    sorted by cluster id; ``override`` is anchored on the first. A first own
+    version is reviewed against the site profile, a move from a pinned
+    version against that version (``current_policy_digest`` is then the
+    pinned snapshot's policy). A plan for one cluster reads exactly as it did
+    before plans covered several.
     """
 
     site_identity = {
@@ -240,8 +304,19 @@ def _plan_document(
         "aws_region": facts.aws_region,
         "cpu_eks_arn": facts.cpu_eks_arn,
     }
-    before = current_version or facts.profile_version
-    bump = current_version is not None
+    befores = sorted(
+        {member.current_version or facts.profile_version for member in members}
+    )
+    digests = {member.current_policy_digest for member in members}
+    alone = len(members) == 1
+    changes = [_change_line(facts, override, member, alone=alone) for member in members]
+    if not alone:
+        changes.append(
+            f"{override.version} is one approval and one immutable snapshot for "
+            f"these {len(members)} clusters; the site profile "
+            f"{facts.profile_version} and every cluster this plan does not name "
+            "stay as they are"
+        )
     snapshot = _snapshot_text(override)
     payload: dict[str, Any] = {
         "schema_version": 1,
@@ -251,9 +326,9 @@ def _plan_document(
         "template_source": str(override.template_source),
         "active_source": facts.profile_source,
         "snapshot_file": str(override.snapshot_file),
-        "current_version": before,
+        "current_version": ", ".join(befores),
         "desired_version": override.version,
-        "current_policy_digest": current_policy_digest,
+        "current_policy_digest": digests.pop() if len(digests) == 1 else None,
         "policy_digest": override.policy_digest,
         "live_profile_sha256": None,
         "active_source_sha256": None,
@@ -262,41 +337,43 @@ def _plan_document(
         ).hexdigest(),
         "snapshot_sha256": hashlib.sha256(snapshot.encode()).hexdigest(),
         "change_kind": CLUSTER_PROFILE_CHANGE_KIND,
-        "changes": [
-            (
-                f"cluster {override.cluster_id} ({override.provider}) moves from its "
-                f"own Runtime Profile {before} to {override.version}: the policy of "
-                f"{override.template_reference} changed; {before} keeps its "
-                "immutable snapshot and no other cluster is touched"
-            )
-            if bump
-            else (
-                f"cluster {override.cluster_id} ({override.provider}) runs its own "
-                f"Runtime Profile {override.version}: nodeReboot owned by "
-                f"{override.owner}, nodeReplace OBSERVE; the site profile "
-                f"{before} stays on every other cluster"
-            ),
-        ],
+        "changes": changes,
         "approval_required": True,
     }
     payload["plan_sha256"] = profile_plan_sha256(payload)
     return payload
 
 
-def _stop_message(state_dir: Path, plan: dict[str, Any], *, rerun: str) -> str:
+def _stop_message(
+    state_dir: Path,
+    plan: dict[str, Any],
+    *,
+    rerun: str,
+    clusters: Sequence[str],
+    superseded: bool = False,
+) -> str:
     identity = plan["site_identity"]
     verb = "deploy" if rerun.split()[1:2] == ["deploy"] else "join"
+    alone = len(clusters) <= 1
+    reason = (
+        f"Runtime Profile plan changed after its approval; the {verb} stopped for "
+        "review and the previous approval was archived as SUPERSEDED."
+        if superseded
+        else f"Runtime Profile policy changed; the {verb} stopped for review."
+    )
     return "\n".join(
         [
-            f"Runtime Profile policy changed; the {verb} stopped for review.",
+            reason,
             f"Review {profile_plan_path(state_dir)}:",
             "  site_identity:",
             f"    site_name: {identity['site_name']}",
             f"    aws_region: {identity['aws_region']}",
             f"    cpu_eks_arn: {identity['cpu_eks_arn']}",
-            f"  cluster: {plan['registration_cluster_id']}",
+            f"  cluster: {plan['registration_cluster_id']}"
+            if alone
+            else f"  clusters: {', '.join(clusters)}",
             f"  version: {plan['current_version']} -> {plan['desired_version']}"
-            " (this cluster only)",
+            + (" (this cluster only)" if alone else " (these clusters only)"),
             f"  change_kind: {plan['change_kind']}",
             "  changes:",
             *(f"    - {item}" for item in plan["changes"]),
@@ -340,7 +417,42 @@ def ensure_cluster_profile_approved(
     returned.
     """
 
-    state_dir = site.source.parent
+    return ensure_cluster_profiles_approved(
+        site, [override], rerun_command=rerun_command
+    )
+
+
+def ensure_cluster_profiles_approved(
+    site: RenderedSite,
+    overrides: Sequence[ClusterProfileOverride],
+    *,
+    rerun_command: str,
+) -> Path:
+    """The approved snapshot of one version several joining clusters need.
+
+    ``ensure_cluster_profile_approved`` for every cluster of a batch that
+    needs the version at once: one plan names them all, anchored on the first
+    by cluster id, so the plan is the same whichever order the batch lists
+    them in and one approval covers all of them.
+    """
+
+    group = sorted(overrides, key=lambda item: item.cluster_id)
+    if not group:
+        raise BootstrapError("a Runtime Profile plan needs at least one cluster")
+    override = group[0]
+    shared = (
+        override.version,
+        override.provider,
+        override.policy_digest,
+        override.snapshot_file,
+    )
+    if any(
+        (item.version, item.provider, item.policy_digest, item.snapshot_file) != shared
+        for item in group
+    ):
+        raise BootstrapError(
+            "clusters planned together must need the same Runtime Profile version"
+        )
     snapshot = override.snapshot_file
     if snapshot.is_file():
         if runtime_profile_policy_sha256(snapshot) != override.policy_digest:
@@ -350,13 +462,18 @@ def ensure_cluster_profile_approved(
                 "or remove the stale snapshot after review"
             )
         return snapshot
-    plan = _plan_document(SiteFacts.from_rendered(site), override)
+    plan = _plan_document(
+        SiteFacts.from_rendered(site),
+        override,
+        [_PlannedMember(item.cluster_id, item.provider) for item in group],
+    )
     _approve_or_stop(
-        state_dir,
+        site.source.parent,
         override,
         plan,
         rerun_command=rerun_command,
         release_id=f"join-{override.cluster_id}",
+        clusters=[item.cluster_id for item in group],
     )
     return snapshot
 
@@ -368,23 +485,48 @@ def _approve_or_stop(
     *,
     rerun_command: str,
     release_id: str,
+    clusters: Sequence[str],
     write: bool = True,
 ) -> None:
     """Consume a matching approval (writing the snapshot) or stop for review.
 
     ``write=False`` is the read-only preflight: a matching approval returns
     without consuming it (the step that writes the snapshot consumes it); no
-    approval writes the plan and stops, exactly as the writing path would.
+    approval writes the plan and stops, exactly as the writing path would. An
+    approval of another plan -- the clusters needing the version changed, or
+    a different plan was approved meanwhile -- covers nothing here: it is
+    archived ``SUPERSEDED``, this plan is written and the command stops for a
+    new review, as a site profile plan does.
     """
 
     try:
         approval = resolve_profile_approval(state_dir, current_plan=plan)
+    except StaleProfileApprovalError as exc:
+        try:
+            supersede_profile_approval(
+                state_dir, replacement_plan=plan, reason=str(exc)
+            )
+        except ProfileApprovalError as error:
+            raise BootstrapError(
+                f"Runtime Profile approval is unusable: {error}"
+            ) from error
+        raise JoinProfileApprovalRequired(
+            _stop_message(
+                state_dir,
+                plan,
+                rerun=rerun_command,
+                clusters=clusters,
+                superseded=True,
+            ),
+            cluster_ids=clusters,
+        ) from exc
     except ProfileApprovalError as exc:
         raise BootstrapError(f"Runtime Profile approval is unusable: {exc}") from exc
     if approval is None:
         write_profile_plan(state_dir, plan)
         raise JoinProfileApprovalRequired(
-            _stop_message(state_dir, plan, rerun=rerun_command)
+            _stop_message(state_dir, plan, rerun=rerun_command, clusters=clusters),
+            cluster_ids=clusters,
         )
     if not write:
         return
@@ -409,17 +551,45 @@ def cluster_runtime_profile(
     its new version is a reviewed policy change (see the module docstring).
     """
 
-    override = cluster_profile_override(request.site, target, cluster_id)
-    if override is None:
-        return None
     rerun = (
         f"gpu-fault-admin join-cluster --state-dir {request.site.source.parent} "
         f"--gpu-cluster-arn {request.gpu_cluster_arn}"
     )
-    snapshot = ensure_cluster_profile_approved(
-        request.site, override, rerun_command=rerun
-    )
-    return cluster_profile_document(runner, request.site, override, snapshot)
+    return cluster_runtime_profiles(
+        request.site, runner, [(target, cluster_id)], rerun_command=rerun
+    ).get(cluster_id)
+
+
+def cluster_runtime_profiles(
+    site: RenderedSite,
+    runner: CommandRunner,
+    clusters: Sequence[tuple[ClusterIdentity, str]],
+    *,
+    rerun_command: str,
+) -> dict[str, dict[str, str]]:
+    """``{cluster_id: runtimeProfile entry}`` of the joining clusters that need
+    their own profile; a cluster the site profile serves is absent.
+
+    ``cluster_runtime_profile`` for the clusters of one batch: a version is
+    one plan naming every cluster of the batch that needs it (see
+    ``ensure_cluster_profiles_approved``); a pending review raises
+    ``JoinProfileApprovalRequired`` naming the clusters its plan covers.
+    """
+
+    versions: dict[str, list[ClusterProfileOverride]] = {}
+    for target, cluster_id in clusters:
+        override = cluster_profile_override(site, target, cluster_id)
+        if override is not None:
+            versions.setdefault(override.version, []).append(override)
+    entries: dict[str, dict[str, str]] = {}
+    for version in sorted(versions):
+        group = versions[version]
+        snapshot = ensure_cluster_profiles_approved(
+            site, group, rerun_command=rerun_command
+        )
+        document = cluster_profile_document(runner, site, group[0], snapshot)
+        entries.update({item.cluster_id: dict(document) for item in group})
+    return entries
 
 
 def cluster_profile_document(
@@ -447,79 +617,155 @@ def _deploy_rerun(state_dir: Path) -> str:
     return f"gpu-fault-admin deploy --state-dir {state_dir}"
 
 
-def _cluster_profile_snapshot(
+@dataclass(frozen=True)
+class _EntryPin:
+    """The profile one cluster entry pins once this deploy finalizes the site."""
+
+    entry: dict[str, Any]
+    provider: str
+    #: The version the entry pins today, or derives when it pins none.
+    declared: str
+    version: str
+    snapshot: Path
+    template: Path
+    reference: str
+    #: Set while ``version`` has no approved snapshot: the plan's member.
+    planned: _PlannedMember | None = None
+
+
+def _entry_pin(
     entry: dict[str, Any],
     *,
-    document: dict[str, Any],
     provider: str,
     version: str,
     repository_root: Path,
     state_dir: Path,
-    write: bool,
-) -> tuple[str, Path, str]:
-    """``(version, snapshot, template_reference)`` the cluster entry pins.
-
-    The pinned version's approved snapshot when its policy is the template's;
-    the digest-named successor when the template policy changed -- reused
-    when its snapshot is already approved, otherwise planned as
-    ``CLUSTER_PROFILE_NEW`` anchored on this cluster and stopped for review
-    (``_approve_or_stop``); a never-approved version is refused with the join
-    command that reviews it.
+) -> _EntryPin:
+    """What ``entry`` pins: the pinned version's approved snapshot while its
+    policy is the template's; the digest-named successor when the template
+    policy changed -- reused when its snapshot is approved, otherwise planned
+    (``_PlannedMember`` moving from the pinned version). An entry that pins
+    nothing yet (a cluster a batch join completed before the batch planned
+    profiles) gets its first own version planned the way a join plans it. A
+    pinned version without its snapshot, or a version without a template, is
+    refused.
     """
 
     reference = PROVIDER_PROFILE_SOURCES[provider]
     template = repository_root / reference
     snapshot = state_dir / PROFILES_DIR / f"{version}.yaml"
     cluster_id = str(entry.get("clusterId") or "")
+    pin = _EntryPin(entry, provider, version, version, snapshot, template, reference)
+    current = entry.get("runtimeProfile")
+    pinned = isinstance(current, dict) and bool(current.get("version"))
     if not snapshot.is_file():
-        raise BootstrapError(
-            f"{cluster_id} ({provider}) needs Runtime Profile {version}, which "
-            f"has no approved snapshot at {snapshot}; approve it with "
-            f"gpu-fault-admin join-cluster --state-dir {state_dir} "
-            f"--gpu-cluster-arn {entry.get('eksClusterArn')} "
-            "--approve-profile-plan <sha> --reference <CHG>"
-        )
+        if pinned or not template.is_file():
+            raise BootstrapError(
+                f"{cluster_id} ({provider}) needs Runtime Profile {version}, which "
+                f"has no approved snapshot at {snapshot}; approve it with "
+                f"gpu-fault-admin join-cluster --state-dir {state_dir} "
+                f"--gpu-cluster-arn {entry.get('eksClusterArn')} "
+                "--approve-profile-plan <sha> --reference <CHG>"
+            )
+        return replace(pin, planned=_PlannedMember(cluster_id, provider))
     if not template.is_file():
-        return version, snapshot, reference
+        return pin
     pinned_digest = runtime_profile_policy_sha256(snapshot)
     policy_digest = runtime_profile_policy_sha256(template)
     if pinned_digest == policy_digest:
-        return version, snapshot, reference
+        return pin
     # The template policy moved on under a pinned, immutable snapshot: the
     # cluster gets the digest-named version (live 2026-10-05, gpu-eks-cluster
     # pinned to eks-v1 while the plain-EKS profile took over nodeReplace).
     successor = provider_profile_version(provider, policy_digest, state_dir=state_dir)
-    override = ClusterProfileOverride(
-        cluster_id=cluster_id,
-        provider=provider,
-        version=successor,
-        template_reference=reference,
-        template_source=template,
-        policy_digest=policy_digest,
-        snapshot_file=state_dir / PROFILES_DIR / f"{successor}.yaml",
+    pin = replace(
+        pin, version=successor, snapshot=state_dir / PROFILES_DIR / f"{successor}.yaml"
     )
-    if override.snapshot_file.is_file():
-        if runtime_profile_policy_sha256(override.snapshot_file) != policy_digest:
+    if pin.snapshot.is_file():
+        if runtime_profile_policy_sha256(pin.snapshot) != policy_digest:
             raise BootstrapError(
-                f"Runtime Profile snapshot {override.snapshot_file} does not carry "
+                f"Runtime Profile snapshot {pin.snapshot} does not carry "
                 f"the policy its version names; review it before it is reused"
             )
-        return successor, override.snapshot_file, reference
-    plan = _plan_document(
-        SiteFacts.from_document(document),
-        override,
-        current_version=version,
-        current_policy_digest=pinned_digest,
+        return pin
+    return replace(
+        pin,
+        planned=_PlannedMember(
+            cluster_id,
+            provider,
+            current_version=version,
+            current_policy_digest=pinned_digest,
+        ),
     )
-    _approve_or_stop(
-        state_dir,
-        override,
-        plan,
-        rerun_command=_deploy_rerun(state_dir),
-        release_id=f"deploy-{cluster_id}",
-        write=write,
-    )
-    return successor, override.snapshot_file, reference
+
+
+def _approve_planned_versions(
+    pins: Sequence[_EntryPin],
+    *,
+    document: dict[str, Any],
+    state_dir: Path,
+    write: bool,
+) -> None:
+    """One ``CLUSTER_PROFILE_NEW`` plan per version without an approved
+    snapshot, naming every entry that needs it, anchored on the first by
+    cluster id -- the plan the preflight and the finalization compute alike,
+    whichever order the document lists the clusters in. Approved, it is
+    consumed and the snapshot written (``write``); otherwise the deploy stops
+    for review (``_approve_or_stop``)."""
+
+    versions: dict[str, list[_EntryPin]] = {}
+    for pin in pins:
+        if pin.planned is not None:
+            versions.setdefault(pin.version, []).append(pin)
+    for version in sorted(versions):
+        group = sorted(
+            versions[version], key=lambda item: str(item.entry.get("clusterId") or "")
+        )
+        members = [pin.planned for pin in group if pin.planned is not None]
+        first = group[0]
+        override = ClusterProfileOverride(
+            cluster_id=members[0].cluster_id,
+            provider=first.provider,
+            version=version,
+            template_reference=first.reference,
+            template_source=first.template,
+            policy_digest=runtime_profile_policy_sha256(first.template),
+            snapshot_file=first.snapshot,
+        )
+        plan = _plan_document(SiteFacts.from_document(document), override, members)
+        _approve_or_stop(
+            state_dir,
+            override,
+            plan,
+            rerun_command=_deploy_rerun(state_dir),
+            release_id=f"deploy-{override.cluster_id}",
+            clusters=[member.cluster_id for member in members],
+            write=write,
+        )
+
+
+def _entry_pins(
+    document: dict[str, Any],
+    *,
+    repository_root: Path,
+    state_dir: Path,
+    strict: bool = True,
+) -> list[_EntryPin]:
+    return [
+        _entry_pin(
+            entry,
+            provider=provider,
+            version=version,
+            repository_root=repository_root,
+            state_dir=state_dir,
+        )
+        for entry, provider, version in _cluster_entries(
+            document,
+            repository_root=repository_root,
+            state_dir=state_dir,
+            strict=strict,
+        )
+    ]
 
 
 def _site_reboot_owner(
@@ -612,38 +858,37 @@ def reconcile_cluster_runtime_profiles(
     recompute ``agentConfigDigest`` for this release's repository, as the site
     level ``release.agentConfigDigest`` is on every deploy; restore an override
     that went missing from its approved snapshot (live 2026-10-04: a deploy
-    regenerated the plain EKS entry without it); refuse when no approved
-    snapshot exists -- the review belongs to ``join-cluster``. A pinned version
-    whose template policy changed is re-pinned to the approved digest-named
-    successor, or planned and stopped for review (``_cluster_profile_snapshot``).
+    regenerated the plain EKS entry without it). A pinned version whose
+    template policy changed is re-pinned to the approved digest-named
+    successor; a version without an approved snapshot -- that successor, or
+    the first own version of a member that never got one -- is planned once
+    for every entry needing it and consumed when approved, or the deploy
+    stops for review (``_approve_planned_versions``). No entry is rewritten by
+    a stopped deploy.
     """
 
-    for entry, provider, version in _cluster_entries(
-        document, repository_root=repository_root, state_dir=state_dir
-    ):
-        current = entry.get("runtimeProfile")
-        pinned, snapshot, reference = _cluster_profile_snapshot(
-            entry,
-            document=document,
-            provider=provider,
-            version=version,
-            repository_root=repository_root,
-            state_dir=state_dir,
-            write=True,
-        )
-        entry["runtimeProfile"] = {
-            "source": str(snapshot),
+    pins = _entry_pins(document, repository_root=repository_root, state_dir=state_dir)
+    _approve_planned_versions(pins, document=document, state_dir=state_dir, write=True)
+    digests: dict[str, str] = {}
+    for pin in pins:
+        current = pin.entry.get("runtimeProfile")
+        if pin.version not in digests:
+            digests[pin.version] = compute_agent_config_digest(
+                runner,
+                repository_root=repository_root,
+                runtime_profile_version=pin.version,
+            )
+        pin.entry["runtimeProfile"] = {
+            "source": str(pin.snapshot),
             "templateSource": (
                 str(current.get("templateSource"))
                 if isinstance(current, dict)
                 and current.get("templateSource")
-                and pinned == version
-                else reference
+                and pin.version == pin.declared
+                else pin.reference
             ),
-            "version": pinned,
-            "agentConfigDigest": compute_agent_config_digest(
-                runner, repository_root=repository_root, runtime_profile_version=pinned
-            ),
+            "version": pin.version,
+            "agentConfigDigest": digests[pin.version],
         }
 
 
@@ -651,12 +896,14 @@ def preflight_cluster_profile_plans(state_dir: Path, *, repository_root: Path) -
     """Stop a deploy for cluster-profile review before any release work.
 
     Reads the deployed ``site.yaml`` (nothing else) and judges every cluster
-    entry as the site finalization will: a pinned version whose template
-    policy changed writes the ``CLUSTER_PROFILE_NEW`` plan and stops here --
+    entry as the site finalization will: a version without an approved
+    snapshot writes its ``CLUSTER_PROFILE_NEW`` plan and stops here --
     minutes in, not after the release bundle and its gates (live
     2026-10-05) -- and a matching approval is left for the finalization to
-    consume. A state dir without a site, or a site without such clusters,
-    passes silently.
+    consume. The plan is the finalization's own (one per version, every entry
+    needing it named), so an approval the preflight accepts is the one the
+    finalization consumes. A state dir without a site, or a site without such
+    clusters, passes silently.
     """
 
     site_file = state_dir / "site.yaml"
@@ -668,15 +915,7 @@ def preflight_cluster_profile_plans(state_dir: Path, *, repository_root: Path) -
         return
     if not isinstance(document, dict):
         return
-    for entry, provider, version in _cluster_entries(
+    pins = _entry_pins(
         document, repository_root=repository_root, state_dir=state_dir, strict=False
-    ):
-        _cluster_profile_snapshot(
-            entry,
-            document=document,
-            provider=provider,
-            version=version,
-            repository_root=repository_root,
-            state_dir=state_dir,
-            write=False,
-        )
+    )
+    _approve_planned_versions(pins, document=document, state_dir=state_dir, write=False)
