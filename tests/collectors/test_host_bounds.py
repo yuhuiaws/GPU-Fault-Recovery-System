@@ -12,8 +12,10 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import socket
 import subprocess
+import tempfile
 import threading
 import time
 from collections.abc import Iterator
@@ -96,6 +98,16 @@ class _WedgedChildFactory:
         )
         self.children.append(child)
         return child
+
+
+@pytest.fixture
+def notify_path() -> Iterator[Path]:
+    """The sd_notify socket, outside tmp_path: sun_path holds only 107 bytes."""
+    directory = Path(tempfile.mkdtemp(prefix="hb-", dir="/tmp"))
+    try:
+        yield directory / "notify.sock"
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 @pytest.fixture
@@ -563,7 +575,7 @@ def test_a_good_progress_file_after_a_bad_one_clears_the_error(tmp_path) -> None
 
 
 def test_run_tells_systemd_it_is_ready_and_pings_the_watchdog_each_tick(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
+    monkeypatch: pytest.MonkeyPatch, tmp_path, notify_path: Path
 ) -> None:
     """``Type=notify`` plus ``WatchdogSec`` is what turns a wedge into a restart.
 
@@ -573,7 +585,6 @@ def test_run_tells_systemd_it_is_ready_and_pings_the_watchdog_each_tick(
     """
 
     monkeypatch.setattr(HostTelemetryCollector, "CONTRIBUTORS", ())
-    notify_path = tmp_path / "notify.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     listener.bind(str(notify_path))
     listener.settimeout(0.5)
@@ -875,7 +886,7 @@ def test_a_bounded_runner_kills_a_child_that_outlives_its_timeout() -> None:
 
 
 def test_a_slow_but_progressing_tick_pings_the_watchdog_between_contributors(
-    monkeypatch: pytest.MonkeyPatch, tmp_path
+    monkeypatch: pytest.MonkeyPatch, tmp_path, notify_path: Path
 ) -> None:
     """A single ping at the end of the tick cannot outlast ``WatchdogSec``.
 
@@ -887,7 +898,6 @@ def test_a_slow_but_progressing_tick_pings_the_watchdog_between_contributors(
     The tick must therefore report progress as it goes.
     """
 
-    notify_path = tmp_path / "notify.sock"
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
     listener.bind(str(notify_path))
     listener.settimeout(0.5)

@@ -22,6 +22,7 @@ from tests.regional.test_late_ownership_node_probe import WireReceipt
 
 daemon = shared.daemon
 stale_mailbox = shared.stale_mailbox
+socket_root = shared.socket_root
 
 
 @dataclass
@@ -401,12 +402,12 @@ def test_scope_source_release_and_command_epoch_are_bound(
 
 
 @pytest.fixture
-def startup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
+def startup(socket_root: Path, monkeypatch: pytest.MonkeyPatch) -> Any:
     binding = scope()
     identity = process_identity(os.getpid())
     node = binding.nodes[0].model_copy(update={"boot_id": identity.boot_id})
     binding = binding.model_copy(update={"nodes": (node, binding.nodes[1])})
-    directory = tmp_path / "mailboxes" / "node"
+    directory = socket_root / "mailboxes" / "node"
     calls: list[str] = []
     values = SimpleNamespace(
         executable="/usr/bin/true", pid=str(os.getpid()), failure=None

@@ -2,7 +2,12 @@
 
 from __future__ import annotations
 
+import shutil
+import tempfile
+from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
 from scripts.e2e.regional.late_ownership_contract import (
     AcceptanceEvidence,
@@ -24,6 +29,21 @@ from scripts.e2e.regional.late_ownership_contract import (
 )
 
 DIGEST = "a" * 64
+
+
+@contextmanager
+def short_socket_directory() -> Iterator[Path]:
+    """A private directory in /tmp for mailboxes that bind AF_UNIX sockets.
+
+    sun_path holds 107 bytes. tmp_path grows with the pytest temp root, the
+    session number and the xdist worker id: under /tmp/pt78 with two-digit
+    workers the mailbox socket needed 108 bytes and the daemon never bound.
+    """
+    directory = Path(tempfile.mkdtemp(prefix="lo-", dir="/tmp"))
+    try:
+        yield directory
+    finally:
+        shutil.rmtree(directory, ignore_errors=True)
 
 
 def scope(scenario: Scenario = "ownership-drift") -> AcceptanceScope:

@@ -14,7 +14,11 @@ import pytest
 
 from scripts.e2e.regional.late_ownership_barrier import BoundaryDenied, process_identity
 from scripts.e2e.regional.probes import late_ownership_node_probe as probe
-from tests.regional._late_ownership_support import evidence, scope
+from tests.regional._late_ownership_support import (
+    evidence,
+    scope,
+    short_socket_directory,
+)
 
 
 @pytest.mark.parametrize(
@@ -115,12 +119,19 @@ class WireReceipt:
 
 
 @pytest.fixture
-def daemon(tmp_path, monkeypatch):
+def socket_root():
+    # The mailbox socket's path must not depend on the temp root or worker id.
+    with short_socket_directory() as directory:
+        yield directory
+
+
+@pytest.fixture
+def daemon(socket_root, monkeypatch):
     proof = evidence()
     owner = process_identity(os.getpid())
     node = proof.scope.nodes[0].model_copy(update={"boot_id": owner.boot_id})
     binding = proof.scope.model_copy(update={"nodes": (node, proof.scope.nodes[1])})
-    directory = tmp_path / "mailboxes" / "node-a"
+    directory = socket_root / "mailboxes" / "node-a"
     monkeypatch.setattr(probe, "mailbox_path", lambda *a: directory)
     monkeypatch.setenv("LATE_OWNERSHIP_WITNESS_POD_UID", "owned-witness-pod")
     monkeypatch.setattr(probe.shutil, "which", lambda name: "/usr/bin/true")
@@ -291,9 +302,9 @@ def test_daemon_has_no_host_mutation_without_downward_api_identity(
 
 
 @pytest.fixture
-def stale_mailbox(tmp_path, monkeypatch):
+def stale_mailbox(socket_root, monkeypatch):
     binding = scope()
-    directory = tmp_path / "mailboxes" / "node-a"
+    directory = socket_root / "mailboxes" / "node-a"
     directory.mkdir(mode=0o700, parents=True)
     directory.parent.chmod(0o700)
     monkeypatch.setattr(probe, "mailbox_path", lambda *a: directory)
