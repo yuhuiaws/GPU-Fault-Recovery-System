@@ -51,7 +51,11 @@ def test_the_sections_read_every_reported_metric_and_skip_absent_ones() -> None:
         fault_p99_ms=900.0,
         processor_timeseries={"consumers": {"mean_in_flight_while_backlog": 12.5}},
     )
-    second = summary(240.0, aurora_capacity_max=True)
+    second = summary(
+        240.0,
+        aurora_capacity_max=True,
+        aurora_measurement={"serverless_capacity_acu": {"at_window_start": 8.0}},
+    )
 
     metrics, paths = repeat.metric_sections([first, second])
 
@@ -60,6 +64,9 @@ def test_the_sections_read_every_reported_metric_and_skip_absent_ones() -> None:
     assert metrics["mean_in_flight_while_backlog"]["median"] == 12.5
     assert "aurora_capacity_max" not in metrics, "a flag is not a measurement"
     assert "aurora_cpu_max" not in metrics, "no run reported it"
+    assert metrics["aurora_capacity_at_window_start"]["values"] == [8.0], (
+        "the capacity a run's load started on"
+    )
     assert paths["NVIDIA_KERNEL"]["throughput_req_s"]["values"] == [10.0, 10.0], (
         "a path's throughput is its count over the run's wall time"
     )

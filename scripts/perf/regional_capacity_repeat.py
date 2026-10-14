@@ -38,6 +38,18 @@ SCALAR_METRICS: dict[str, tuple[str, ...]] = {
     "queue_depth_at_load_stop": ("queue_depth_at_load_stop",),
     "aurora_capacity_max": ("aurora_capacity_max",),
     "aurora_cpu_max": ("aurora_cpu_max",),
+    # The capacity each run started on: a run that began at the floor ACU
+    # pays the scale-up inside its window.
+    "aurora_capacity_at_step_start": (
+        "aurora_measurement",
+        "serverless_capacity_acu",
+        "at_step_start",
+    ),
+    "aurora_capacity_at_window_start": (
+        "aurora_measurement",
+        "serverless_capacity_acu",
+        "at_window_start",
+    ),
     "mean_in_flight_while_backlog": (
         "processor_timeseries",
         "consumers",

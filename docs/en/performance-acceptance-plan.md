@@ -285,7 +285,8 @@ group's directory holds `run-1` ... `run-N`, each a complete run directory, and
 `repeat-summary.json`: every run's artifacts, run id, release, exit code and job status, and for
 each headline metric (throughput, fault p50/p99, per ingress path count, throughput and
 p50/p95/p99/max latency, queue drain seconds and depth at load stop, Aurora max ACU and CPU, the
-processor's mean in-flight while a backlog lasted) the per-run values, median, min, max and relative
+Aurora capacity at the step and window start (§8.1 `aurora_measurement`), the processor's mean
+in-flight while a backlog lasted) the per-run values, median, min, max and relative
 spread `(max - min) / median`. The group stops at the first failed run and exits with its code;
 medians cover the runs that completed, and `same_release=false` means the release changed between
 runs, so the medians do not describe one build.
