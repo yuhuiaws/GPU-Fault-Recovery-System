@@ -1017,8 +1017,9 @@ its same-zone value.
 **How bootstrap places it.** Before creating the database, bootstrap reads the CPU nodes' zone labels and puts the zone with the most nodes
 that also has a private subnet first: the first instance is the initial writer, `--promotion-tier 0`; the reader goes to another
 private-subnet zone, `--promotion-tier 1` (`bootstrap_aurora.ensure_serverless_instances`, `writer_first_zones`). `aurora_ready` checks once
-more after both instances are available and runs `failover-db-cluster` when the writer is outside the control-plane zone and a member there is
-available (`ensure_writer_zone_affinity`). Tiers are set only when an instance is created; existing instances keep theirs. When RDS picks the
+more after both instances are available, by the same rule (`preferred_writer_zone`: the first zone instance creation already computed by CPU
+node count; no control-plane Pod exists yet), and runs `failover-db-cluster` when the writer is elsewhere and a member there is available
+(`ensure_writer_zone_affinity`) -- on a CPU cluster spread over zones, a writer in a minority zone is failed back too. Tiers are set only when an instance is created; existing instances keep theirs. When RDS picks the
 promotion target itself it prefers tier 0, the instance in the control-plane zone; in a two-member cluster every failover has exactly one
 target, the other member. Serverless v2 readers in tiers 0 and 1 both scale with the writer, so either one has its capacity in place when it
 is promoted.

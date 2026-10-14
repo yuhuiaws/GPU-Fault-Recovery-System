@@ -15,10 +15,11 @@ burst admission p99 tripled until an operator failed back by hand.
 back. Both read the placement here: the zone labels of the nodes the Running
 gpu-fault-api-ha and gpu-fault-control-worker Pods are scheduled on (the
 processes that talk to the writer) and every cluster member's zone, status and
-promotion tier. One definition serves both, bootstrap's own: the writer belongs
-in the first zone of ``writer_first_zones`` -- the zone with the most of those
-Pods that holds an Aurora member -- and the member to fail back to is the
-available one there, lowest promotion tier first. ``status`` also flags
+promotion tier. One definition serves both and bootstrap's ``aurora_ready``,
+``bootstrap_aurora.preferred_writer_zone``: the writer belongs in the first zone
+of ``writer_first_zones`` -- here the zone with the most of those Pods that
+holds an Aurora member -- and the member to fail back to is the available one
+there, lowest promotion tier first. ``status`` also flags
 promotion tiers that do not prefer that member (tier 0 for it, never tier 0 for
 another): tiers are set only when an instance is created, nothing re-tiers one.
 Reads only, each bounded by ``READ_TIMEOUT_SECONDS``.
@@ -32,7 +33,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from gpu_fault.admin.bootstrap_aurora import NODE_ZONE_LABELS, writer_first_zones
+from gpu_fault.admin.bootstrap_aurora import NODE_ZONE_LABELS, preferred_writer_zone
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     CommandRunner,
@@ -92,16 +93,14 @@ class WriterPlacement:
 
     @property
     def preferred_zone(self) -> str | None:
-        """Bootstrap's writer zone: the first of ``writer_first_zones`` over the
-        members' zones, weighted by Pod; ``None`` when no member is in a zone
-        that runs a control-plane Pod."""
+        """Bootstrap's writer zone (``preferred_writer_zone``) over the members'
+        zones, weighted by Pod; ``None`` when no member is in a zone that runs
+        a control-plane Pod."""
 
-        member_zones = sorted(
-            {member.availability_zone for member in self.members} - {""}
+        return preferred_writer_zone(
+            sorted({member.availability_zone for member in self.members} - {""}),
+            list(self.control_plane_pods.values()),
         )
-        pod_zones = list(self.control_plane_pods.values())
-        ordered = writer_first_zones(member_zones, pod_zones)
-        return ordered[0] if ordered and ordered[0] in set(pod_zones) else None
 
     @property
     def writer(self) -> AuroraMember | None:

@@ -237,8 +237,10 @@ instances that the window has taken effect.
 **The writer shares the CPU control plane's availability zone.** Before creating the Aurora instances, bootstrap reads the
 `topology.kubernetes.io/zone` labels of the CPU HyperPod nodes and puts the zone with the most nodes first: the first instance is the
 initial writer (promotion tier 0) and the reader lands in the other private-subnet zone (tier 1). `aurora_ready` checks again once
-both instances are available; when the writer sits outside the control-plane zone and an available member sits inside it, it issues
-`failover-db-cluster` and waits for RDS to report the new writer, recording the outcome under `writer_zone_affinity`. A cross-zone
+both instances are available, by the same rule (`preferred_writer_zone`: the first zone instance creation recorded, the one ordered by CPU
+node count; an old checkpoint, or a creation that had no control-plane zone to choose, re-reads the CPU nodes there and then); when the
+writer sits outside that zone and an available member sits inside it, it issues `failover-db-cluster` and waits for RDS to report the new
+writer, recording the outcome under `writer_zone_affinity`. A cross-zone
 writer adds a hop to every database round-trip of the API Pods; under the §8.4 50-cluster load the reserved 503 share of normal
 telemetry measured about three times higher. Tiers are set only by `create-db-instance`; existing instances are not re-tiered. After
 bootstrap any failover leaves the writer on the member RDS chose: `status` compares, read-only, the writer's zone with the first zone of

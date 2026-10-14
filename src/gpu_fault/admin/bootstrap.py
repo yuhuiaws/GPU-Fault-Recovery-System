@@ -1552,13 +1552,13 @@ def _aurora_ready(
         cluster_id=cluster_id,
         instance_ids=instance_ids,
     )
-    # Both members are available: keep the writer in the control-plane zone.
+    # Both members are available: keep the writer in creation's preferred zone.
     affinity = reconcile_writer_zone(
         runner,
         aws_region=cpu.region,
         cluster_id=cluster_id,
         instance_ids=instance_ids,
-        control_plane_zones=aurora.get("control_plane_zones") or (),
+        recorded=aurora,
         kubeconfig=cpu_kubeconfig,
         hyperpod_name=cpu.hyperpod_name,
     )

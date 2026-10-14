@@ -584,15 +584,27 @@ def reconcile_writer_zone(
     aws_region: str,
     cluster_id: str,
     instance_ids: Sequence[str],
-    control_plane_zones: Sequence[str],
+    recorded: Mapping[str, Any],
     kubeconfig: Path,
     hyperpod_name: str,
+    sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
-    """``ensure_writer_zone_affinity`` for ``aurora_ready``: a checkpoint written
-    before the zones were recorded reads them from the CPU nodes now."""
+    """``ensure_writer_zone_affinity`` for ``aurora_ready``, by CPU node count: no
+    control-plane Pod exists yet at bootstrap.
 
-    zones = [str(item) for item in control_plane_zones]
-    if not zones:
+    Instance creation already evaluated ``preferred_writer_zone`` over the same
+    nodes: the first zone it placed, ``recorded["availability_zones"][0]``, is
+    the answer when it is a control-plane zone. Otherwise -- no zone of the CPU
+    nodes had a private subnet, or a checkpoint written before the zones were
+    recorded -- the CPU nodes are read now, one zone per node: the recorded
+    ``control_plane_zones`` are de-duplicated and cannot be counted.
+    """
+
+    placed = [str(item) for item in recorded.get("availability_zones") or ()]
+    control = {str(item) for item in recorded.get("control_plane_zones") or ()}
+    if placed and placed[0] in control:
+        zones = [placed[0]]
+    else:
         zones = control_plane_node_zones(
             cpu_nodes_document(
                 runner, kubeconfig=kubeconfig, hyperpod_name=hyperpod_name
@@ -604,6 +616,7 @@ def reconcile_writer_zone(
         cluster_id=cluster_id,
         instance_ids=instance_ids,
         control_plane_zones=zones,
+        sleep=sleep,
     )
 
 
@@ -633,6 +646,23 @@ def writer_first_zones(
     return ordered
 
 
+def preferred_writer_zone(
+    candidate_zones: Sequence[str], control_plane_zones: Sequence[str]
+) -> str | None:
+    """The one writer-placement rule: the first zone of ``writer_first_zones``
+    when it runs the control plane, else ``None``.
+
+    ``control_plane_zones`` holds one entry per CPU node (bootstrap: no
+    control-plane Pod exists yet) or per Running api-ha/control-worker Pod
+    (``aurora_placement``: status and aurora-failback), so a control plane
+    spread over zones counts its majority, not every zone it touches. Instance
+    creation puts the writer exactly there.
+    """
+
+    ordered = writer_first_zones(candidate_zones, control_plane_zones)
+    return ordered[0] if ordered and ordered[0] in set(control_plane_zones) else None
+
+
 def ensure_writer_zone_affinity(
     runner: CommandRunner,
     *,
@@ -643,42 +673,54 @@ def ensure_writer_zone_affinity(
     timeout_seconds: float = WRITER_ZONE_FAILOVER_TIMEOUT_SECONDS,
     sleep: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
-    """Fail the cluster over when its writer runs outside the control-plane zone.
+    """Fail the cluster over when its writer runs outside the preferred zone.
 
     Creation order places the writer (``writer_first_zones``), but an RDS
     failover, a resumed bootstrap or a site created before this rule can leave
-    the writer elsewhere. When another available member sits in a control-plane
-    zone, ``failover-db-cluster`` targets it and the call waits for the cluster
-    to report that member as the writer. With no such member nothing is done
-    and the report says why.
+    the writer elsewhere. The preferred zone is ``preferred_writer_zone`` over
+    the members' zones and ``control_plane_zones`` (one entry per CPU node or
+    control-plane Pod). When an available member of ``instance_ids`` sits there,
+    ``failover-db-cluster`` targets it and the call waits for the cluster to
+    report that member as the writer. With no such member nothing is done and
+    the report says why.
     """
 
-    wanted = set(control_plane_zones)
-    if not wanted or not instance_ids:
+    if not control_plane_zones or not instance_ids:
         return {"action": "none", "reason": "control-plane zones unknown"}
     statuses = _instance_placements(
         runner, aws_region=aws_region, cluster_id=cluster_id
     )
     writer_id = _cluster_writer(runner, aws_region=aws_region, cluster_id=cluster_id)
     writer_zone = (statuses.get(writer_id) or {}).get("availability_zone")
+    preferred = preferred_writer_zone(
+        sorted({item["availability_zone"] for item in statuses.values()} - {""}),
+        control_plane_zones,
+    )
     report = {
         "writer": writer_id,
         "writer_zone": writer_zone,
-        "control_plane_zones": sorted(wanted),
+        "control_plane_zones": sorted(set(control_plane_zones)),
+        "preferred_zone": preferred,
     }
-    if writer_zone in wanted:
+    if preferred is None:
+        return {
+            "action": "none",
+            "reason": "no Aurora member in a control-plane zone",
+            **report,
+        }
+    if writer_zone == preferred:
         return {"action": "none", **report}
     candidates = [
         instance_id
         for instance_id in instance_ids
         if instance_id != writer_id
-        and (statuses.get(instance_id) or {}).get("availability_zone") in wanted
+        and (statuses.get(instance_id) or {}).get("availability_zone") == preferred
         and (statuses.get(instance_id) or {}).get("status") == "available"
     ]
     if not candidates:
         return {
             "action": "none",
-            "reason": "no available member in a control-plane zone",
+            "reason": "no available member in the preferred zone",
             **report,
         }
     target = candidates[0]

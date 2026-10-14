@@ -9,6 +9,7 @@ the writer with the control plane at creation).
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any, Sequence
 
 import pytest
@@ -161,6 +162,7 @@ def test_a_writer_outside_the_control_plane_zone_is_failed_over_to_the_member_in
         "writer": "aurora-a-writer",
         "writer_zone": "us-east-1b",
         "control_plane_zones": ["us-east-1a"],
+        "preferred_zone": "us-east-1a",
     }
     assert [argv[2] for argv in cluster.mutations] == ["failover-db-cluster"]
     assert cluster.writer == "aurora-a-reader", (
@@ -218,3 +220,123 @@ def test_the_writer_is_promotion_tier_0_and_the_reader_tier_1() -> None:
         if "--promotion-tier" in arguments
     ]
     assert tiers == [("aurora-a-writer", "0"), ("aurora-a-reader", "1")], tiers
+
+
+def test_the_preferred_zone_is_the_majority_control_plane_zone_with_a_member() -> None:
+    """One rule for creation, aurora_ready, status and aurora-failback."""
+
+    zones = ["us-east-1a", "us-east-1b"]
+    assert aurora.preferred_writer_zone(zones, ["us-east-1b"] * 2 + ["us-east-1a"]) == (
+        "us-east-1b"
+    )
+    assert aurora.preferred_writer_zone(zones, ["us-east-1a", "us-east-1b"]) == (
+        "us-east-1a"
+    ), "a tie goes to the zone name, as writer_first_zones orders it"
+    assert aurora.preferred_writer_zone(zones, ["us-east-1c"] * 3 + ["us-east-1b"]) == (
+        "us-east-1b"
+    ), "a majority zone without a member falls to the next one"
+    assert aurora.preferred_writer_zone(zones, ["us-east-1c"]) is None
+    assert aurora.preferred_writer_zone(zones, []) is None
+
+
+def test_a_multi_zone_cpu_site_with_the_writer_in_a_non_first_zone_is_failed_over() -> (
+    None
+):
+    """The writer in a zone with a minority of the CPU nodes is not placed: the
+    old any-control-plane-zone rule left it there."""
+
+    cluster = _Cluster(
+        "aurora-a-writer",
+        {"aurora-a-writer": "us-east-1b", "aurora-a-reader": "us-east-1a"},
+    )
+
+    report = _affinity(cluster, ["us-east-1a", "us-east-1a", "us-east-1b"])
+
+    assert report["action"] == "failover" and report["target"] == "aurora-a-reader"
+    assert report["preferred_zone"] == "us-east-1a"
+    assert report["control_plane_zones"] == ["us-east-1a", "us-east-1b"]
+    assert cluster.writer == "aurora-a-reader"
+
+
+class _NodesCluster(_Cluster):
+    """The cluster plus the CPU nodes ``aurora_ready`` may list."""
+
+    def __init__(self, *args: Any, node_zones: Sequence[str], **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.node_zones = node_zones
+
+    def run(self, arguments: Sequence[str], **kwargs: Any) -> str:
+        if str(arguments[0]) != "kubectl":
+            return super().run(arguments, **kwargs)
+        self.calls.append([str(item) for item in arguments])
+        return json.dumps(
+            {
+                "items": [
+                    {
+                        "metadata": {
+                            "name": f"cpu-{index}",
+                            "labels": {"topology.kubernetes.io/zone": zone},
+                        }
+                    }
+                    for index, zone in enumerate(self.node_zones)
+                ]
+            }
+        )
+
+
+def _ready_affinity(cluster: _NodesCluster, recorded: dict[str, Any]) -> dict:
+    return aurora.reconcile_writer_zone(
+        cluster,  # type: ignore[arg-type]
+        aws_region="us-east-1",
+        cluster_id="aurora-a",
+        instance_ids=["aurora-a-writer", "aurora-a-reader"],
+        recorded=recorded,
+        kubeconfig=Path("/unit/cpu.kubeconfig"),
+        hyperpod_name="cpu-hyperpod",
+        sleep=lambda _seconds: None,
+    )
+
+
+def test_aurora_ready_judges_by_the_zone_creation_placed_first() -> None:
+    """Creation recorded its own answer (the first zone it placed), so
+    aurora_ready reads no node and fails a writer elsewhere back to it."""
+
+    cluster = _NodesCluster(
+        "aurora-a-reader",
+        {"aurora-a-writer": "us-east-1a", "aurora-a-reader": "us-east-1b"},
+        node_zones=(),
+    )
+
+    report = _ready_affinity(
+        cluster,
+        {
+            "availability_zones": ["us-east-1a", "us-east-1b"],
+            "control_plane_zones": ["us-east-1a", "us-east-1b"],
+        },
+    )
+
+    assert report["action"] == "failover" and report["target"] == "aurora-a-writer"
+    assert not any(call[0] == "kubectl" for call in cluster.calls), (
+        "the recorded first zone is creation's evaluation of the rule"
+    )
+
+
+@pytest.mark.parametrize(
+    "recorded",
+    [{}, {"availability_zones": ["us-east-1c"], "control_plane_zones": ["us-east-1a"]}],
+    ids=["old-checkpoint", "creation-had-no-control-plane-zone"],
+)
+def test_aurora_ready_counts_the_cpu_nodes_when_creation_left_no_answer(
+    recorded: dict[str, Any],
+) -> None:
+    cluster = _NodesCluster(
+        "aurora-a-writer",
+        {"aurora-a-writer": "us-east-1b", "aurora-a-reader": "us-east-1a"},
+        node_zones=["us-east-1a", "us-east-1a", "us-east-1b"],
+    )
+
+    report = _ready_affinity(cluster, recorded)
+
+    assert report["action"] == "failover" and report["target"] == "aurora-a-reader"
+    assert report["preferred_zone"] == "us-east-1a", "two of the three nodes"
+    assert sum(call[0] == "kubectl" for call in cluster.calls) == 1

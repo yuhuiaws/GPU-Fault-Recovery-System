@@ -718,9 +718,16 @@ observability configuration is also its responsibility rather than a manual oper
   `shared_preload_libraries` is a static parameter; the cluster shows `pending-reboot` until the operations reboot window.
 - The database creation path directly carries `--db-cluster-parameter-group-name` and `--enable-cloudwatch-logs-exports postgresql`;
   existing clusters are reconciled on every deploy together with the ACU capacity.
+- Writer placement has one rule, `preferred_writer_zone`: the first zone `writer_first_zones` orders, provided it runs the control plane.
+  Instance creation counts CPU nodes (no control-plane Pod exists yet): the first instance is the writer (promotion tier 0), the reader goes
+  to another private-subnet zone (tier 1); `aurora_ready` re-checks against the first zone creation recorded (an old checkpoint re-reads the
+  CPU nodes) and runs `failover-db-cluster` when the writer is elsewhere and a member there is available. The `status` placement finding and
+  `aurora-failback` use the same function, counting the Running api-ha/control-worker Pods (`src/gpu_fault/admin/aurora_placement.py`).
 
 Tests: `tests/admin/test_admin_bootstrap_aurora.py` (group and family creation, no modification when aligned, only deviating parameters changed,
-one online modify attaching the group and enabling export at once, never reboots).
+one online modify attaching the group and enabling export at once, never reboots); `tests/admin/test_admin_bootstrap_aurora_writer_zone.py`
+(the rule itself, a writer in a minority zone of a multi-zone CPU cluster failed back, `aurora_ready` reusing the first zone or re-reading the
+nodes, tiers 0/1).
 
 ## 3. Detailed Module Design
 
