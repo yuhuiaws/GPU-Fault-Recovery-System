@@ -269,3 +269,143 @@ def test_registry_sync_requires_complete_success_proof(
     )
     with pytest.raises(BootstrapError, match="registry"):
         registry.sync_installation_resource_snapshot(site, snapshot())
+
+
+def _replaced(value: InstallationResourceSnapshot) -> InstallationResourceSnapshot:
+    changed = value.model_copy(
+        update={
+            "resources": [
+                item.model_copy(update={"resource_id": "replaced-resource"})
+                for item in value.resources
+            ]
+        }
+    )
+    return changed.model_copy(update={"source_sha256": changed.digest()})
+
+
+def test_a_registry_api_conflict_names_key_and_field_and_never_falls_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Batch 91: the sync API answers an identity conflict with 409; the admin
+    side names the key and field from its body, writes nothing and does not
+    retry or fall back to the direct path (the refusal is deterministic)."""
+
+    from tests.admin._registry_pod_support import PodRegistry
+
+    site = load_site(site_file(tmp_path))
+    pod = PodRegistry(monkeypatch)
+    original = snapshot()
+    registry.sync_installation_resource_snapshot(site, original)
+    monkeypatch.setattr(
+        registry,
+        "sync_installation_resource_snapshot_direct",
+        lambda *_args: pytest.fail("a deterministic conflict reached the fallback"),
+    )
+
+    with pytest.raises(registry.InstallationRegistryConflict) as refused:
+        registry.sync_installation_resource_snapshot(site, _replaced(original))
+
+    assert refused.value.conflicts == [("aws/test/resource", ["resource_id"])]
+    assert isinstance(refused.value, BootstrapError), "every caller fails closed"
+    assert (
+        "installation resource identity cannot change: aws/test/resource "
+        "(resource_id)" in str(refused.value)
+    )
+    assert pod.scripts == [scripts.SYNC_SCRIPT, scripts.SYNC_SCRIPT], (
+        "the conflicting sync was retried"
+    )
+    assert pod.store.list_installation_resources("test-site") == original.resources
+
+
+def _conflict_error(body: bytes) -> urllib.error.HTTPError:
+    return urllib.error.HTTPError(
+        "https://example.invalid/private", 409, "Conflict", Message(), io.BytesIO(body)
+    )
+
+
+def test_sync_script_reports_a_registry_conflict_on_machine_stdout(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    body = {
+        "detail": "private-body-sentinel",
+        "reason": "installation resource identity cannot change",
+        "conflicts": [{"resource_key": "aws/nlb", "fields": ["dependencies"]}],
+    }
+
+    def respond(request: object, **_kwargs: object) -> io.BytesIO:
+        if isinstance(request, str):
+            return io.BytesIO(b'{"paths":{"/v1/installation-resources/sync":{}}}')
+        raise _conflict_error(json.dumps(body).encode())
+
+    monkeypatch.setattr(urllib.request, "urlopen", respond)
+    monkeypatch.setenv("GPU_FAULT_EXECUTION_TOKEN", "test-execution-credential")
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"{}")))
+    with pytest.raises(SystemExit) as stopped:
+        exec(scripts.SYNC_SCRIPT, {})
+    captured = capsys.readouterr()
+    assert stopped.value.code == scripts.CONFLICT_EXIT
+    assert "private-body-sentinel" not in captured.out + captured.err
+    assert scripts.conflict_report(stopped.value.code, captured.out) == (
+        "installation resource identity cannot change",
+        [("aws/nlb", ["dependencies"])],
+    )
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"detail": "private-body-sentinel"}',
+        b"private-body-sentinel",
+        b'{"reason": "private-body-sentinel", "conflicts": '
+        b'[{"resource_key": "aws/nlb", "fields": ["resource_id"]}]}',
+        b'{"reason": "installation resource identity cannot change", "conflicts": '
+        b'[{"resource_key": "private body sentinel", "fields": ["resource_id"]}]}',
+        b'{"reason": "installation resource identity cannot change", "conflicts": '
+        b'[{"resource_key": "aws/nlb", "fields": ["private-body-sentinel"]}]}',
+        b'{"reason": "installation resource identity cannot change", "conflicts": []}',
+    ],
+)
+def test_sync_script_keeps_an_unrecognized_409_body_private(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], body: bytes
+) -> None:
+    def respond(request: object, **_kwargs: object) -> io.BytesIO:
+        if isinstance(request, str):
+            return io.BytesIO(b'{"paths":{"/v1/installation-resources/sync":{}}}')
+        raise _conflict_error(body)
+
+    monkeypatch.setattr(urllib.request, "urlopen", respond)
+    monkeypatch.setenv("GPU_FAULT_EXECUTION_TOKEN", "test-execution-credential")
+    monkeypatch.setattr(sys, "stdin", io.TextIOWrapper(io.BytesIO(b"{}")))
+    with pytest.raises(SystemExit) as stopped:
+        exec(scripts.SYNC_SCRIPT, {})
+    captured = capsys.readouterr()
+    assert stopped.value.code == 1
+    assert captured.out == ""
+    assert captured.err.strip() == "registry HTTP request failed: 409"
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout"),
+    [
+        (1, scripts.CONFLICT_REGISTRY_MARKER + ' {"reason": "x", "conflicts": []}'),
+        (scripts.CONFLICT_EXIT, "GPU_FAULT_OTHER_MARKER {}"),
+        (scripts.CONFLICT_EXIT, scripts.CONFLICT_REGISTRY_MARKER + " not-json"),
+        (
+            scripts.CONFLICT_EXIT,
+            scripts.CONFLICT_REGISTRY_MARKER
+            + ' {"reason": "installation resource identity cannot change",'
+            + ' "conflicts": [{"resource_key": "aws/a", "fields": []}]}',
+        ),
+        (
+            scripts.CONFLICT_EXIT,
+            "extra line\n"
+            + scripts.CONFLICT_REGISTRY_MARKER
+            + ' {"reason": "installation resource identity cannot change",'
+            + ' "conflicts": [{"resource_key": "aws/a", "fields": ["region"]}]}',
+        ),
+    ],
+)
+def test_only_the_exact_conflict_protocol_is_a_conflict(
+    returncode: int, stdout: str
+) -> None:
+    assert scripts.conflict_report(returncode, stdout) is None

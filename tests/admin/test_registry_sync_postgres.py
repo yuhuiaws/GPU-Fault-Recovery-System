@@ -230,8 +230,9 @@ def test_direct_sync_rejects_immutable_drift_atomically(
     result = run_sync(database, [preceding, {**original, field: changed}])
     assert result.returncode == 1
     assert result.stderr.strip() == (
-        "registry database synchronization failed: ValueError"
-    )
+        "registry database synchronization failed: installation resource identity "
+        f"cannot change: aws/test/resource ({field})"
+    ), "the direct path must name the refused key and field (batch 91)"
     assert rows(database) == [original], "identity refusal committed a partial batch"
 
 
@@ -265,7 +266,8 @@ def test_direct_sync_accepts_the_deploy_rebuild_of_a_joined_hyperpod_row(
     )
     assert (stale.returncode, stale.stderr.strip()) == (
         1,
-        "registry database synchronization failed: ValueError",
+        "registry database synchronization failed: installation resource identity "
+        "cannot change: cluster/gpu-a/hyperpod (resource_arn)",
     ), "the pre-fix rebuild no longer reproduces the live refusal"
 
     rebuilt = build_installation_snapshot(site, {"resources": {}}, {}, existing=joined)

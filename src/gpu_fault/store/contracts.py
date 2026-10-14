@@ -249,6 +249,17 @@ class InstallationResourceStore(Protocol):
         resource: InstallationResource,
     ) -> InstallationResource: ...
 
+    def save_installation_resources(
+        self,
+        resources: Sequence[InstallationResource],
+    ) -> list[InstallationResource]:
+        """All rows in one transaction, or none.
+
+        Raises ``InstallationResourceConflict`` naming every row that would
+        change the identity recorded under its key, before any write.
+        """
+        ...
+
     def get_installation_resource(
         self,
         site_id: str,

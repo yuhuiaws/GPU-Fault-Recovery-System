@@ -50,7 +50,9 @@ GUARD_EXCEPTIONS = frozenset({"ValueError", "TypeError", "Exception"})
 DYNAMIC_PREFIXES = ("GPU_FAULT_NOTIFICATION_TTL_SECONDS_",)
 NON_RUNTIME_PREFIXES = ("GPU_FAULT_TEST_", "GPU_FAULT_PERF_")
 # Wire tags do not authorize environment settings just because the prefix matches.
-NON_CONFIGURATION_NAMES = frozenset({"GPU_FAULT_FM_RECEIPT_V1"})
+NON_CONFIGURATION_NAMES = frozenset(
+    {"GPU_FAULT_FM_RECEIPT_V1", "GPU_FAULT_REGISTRY_CONFLICT"}
+)
 DYNAMIC_VARIABLES = tuple(
     f"GPU_FAULT_PROCESSOR_{prefix}ADMISSION_{suffix}"
     for prefix in ("", "FAULT_", "EVIDENCE_")

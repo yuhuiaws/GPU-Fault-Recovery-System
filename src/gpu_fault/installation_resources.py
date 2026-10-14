@@ -5,7 +5,7 @@ import json
 import re
 from datetime import datetime, timezone
 from enum import StrEnum
-from typing import Any, Self
+from typing import Any, Iterable, Mapping, Self, Sequence
 
 from pydantic import Field, field_validator, model_validator
 
@@ -17,6 +17,52 @@ SENSITIVE_KEY_PATTERN = re.compile(
     r"secret|token|password|private.?key|credential",
     re.IGNORECASE,
 )
+#: The ``immutable_identity`` fields two rows of one key can differ in (the
+#: site and the key make the key); every refusal names the ones that do.
+IDENTITY_FIELDS = (
+    "provider",
+    "resource_type",
+    "resource_id",
+    "resource_arn",
+    "region",
+    "account_id",
+    "ownership",
+    "delete_policy",
+    "dependencies",
+)
+IDENTITY_CONFLICT = "installation resource identity cannot change"
+
+
+class InstallationResourceConflict(ValueError):
+    """A registry write the recorded rows refuse, naming each key and field.
+
+    A deterministic refusal: the API answers it with 409 and ``conflicts``
+    (``response_content``), which the processor completes at once instead of
+    replaying it as a retryable 500 until its retry horizon.
+    """
+
+    def __init__(
+        self, reason: str, conflicts: Iterable[tuple[str, Iterable[str]]]
+    ) -> None:
+        self.reason = reason
+        self.conflicts = tuple((key, tuple(fields)) for key, fields in conflicts)
+        super().__init__(
+            reason
+            + ": "
+            + "; ".join(
+                f"{key} ({', '.join(fields)})" for key, fields in self.conflicts
+            )
+        )
+
+    def response_content(self) -> dict[str, Any]:
+        return {
+            "detail": str(self),
+            "reason": self.reason,
+            "conflicts": [
+                {"resource_key": key, "fields": list(fields)}
+                for key, fields in self.conflicts
+            ],
+        }
 
 
 class InstallationResourceOwnership(StrEnum):
@@ -133,6 +179,43 @@ class InstallationResource(StrictModel):
             self.delete_policy,
             tuple(self.dependencies),
         )
+
+    def identity_changes(self, other: InstallationResource) -> tuple[str, ...]:
+        """The ``immutable_identity`` fields in which ``other`` differs."""
+
+        return tuple(
+            name
+            for name in ("site_id", "resource_key", *IDENTITY_FIELDS)
+            if getattr(self, name) != getattr(other, name)
+        )
+
+
+def batch_keys(resources: Sequence[InstallationResource]) -> list[str]:
+    """The store key (``<site_id>/<resource_key>``) of every row of one write."""
+
+    keys = [f"{item.site_id}/{item.resource_key}" for item in resources]
+    if len(keys) != len(set(keys)):
+        raise ValueError("installation resource keys must be unique")
+    return keys
+
+
+def refuse_identity_changes(
+    recorded: Mapping[str, InstallationResource],
+    resources: Sequence[InstallationResource],
+) -> None:
+    """Refuse a write, before any row of it lands, that would change an identity.
+
+    ``recorded`` maps store keys to the rows already saved under them. One
+    :class:`InstallationResourceConflict` names every refused key and field.
+    """
+
+    conflicts = [
+        (item.resource_key, changes)
+        for key, item in zip(batch_keys(resources), resources)
+        if key in recorded and (changes := recorded[key].identity_changes(item))
+    ]
+    if conflicts:
+        raise InstallationResourceConflict(IDENTITY_CONFLICT, conflicts)
 
 
 class InstallationResourceSnapshot(StrictModel):

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import AbstractContextManager, contextmanager
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-from gpu_fault.installation_resources import InstallationResource
+from gpu_fault.installation_resources import (
+    InstallationResource,
+    batch_keys,
+    refuse_identity_changes,
+)
 from gpu_fault.models import (
     CompletionDecision,
     DecisionStatus,
@@ -512,16 +516,17 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
         self,
         resource: InstallationResource,
     ) -> InstallationResource:
-        key = f"{resource.site_id}/{resource.resource_key}"
+        return self.save_installation_resources([resource])[0]
+
+    def save_installation_resources(
+        self,
+        resources: Sequence[InstallationResource],
+    ) -> list[InstallationResource]:
+        keys = batch_keys(resources)
         with self._lock:
-            existing = self._installation_resources.get(key)
-            if (
-                existing is not None
-                and existing.immutable_identity() != resource.immutable_identity()
-            ):
-                raise ValueError("installation resource identity cannot change")
-            self._installation_resources[key] = resource
-            return resource
+            refuse_identity_changes(self._installation_resources, resources)
+            self._installation_resources.update(zip(keys, resources))
+            return list(resources)
 
     def get_installation_resource(
         self,

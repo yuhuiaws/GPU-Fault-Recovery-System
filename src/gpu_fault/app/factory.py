@@ -169,6 +169,7 @@ from gpu_fault.execution import (
     WorkflowExecutionError,
 )
 from gpu_fault.fleet_pins import FleetPinRuntime
+from gpu_fault.installation_resources import InstallationResourceConflict
 from gpu_fault.lifecycle import (
     required_processor_shutdown_seconds,
     validate_lifespan_shutdown_budget,
@@ -545,6 +546,14 @@ def _install_regional_auth(
         return JSONResponse(
             status_code=404, content={"detail": f"resource not found: {exc.args[0]}"}
         )
+
+    @app.exception_handler(InstallationResourceConflict)  # type: ignore[untyped-decorator]
+    async def installation_conflict_handler(
+        _: Request, exc: InstallationResourceConflict
+    ) -> JSONResponse:
+        # Deterministic, so a 409 the processor completes at once; a 500 was
+        # replayed as retryable until the retry horizon.
+        return JSONResponse(status_code=409, content=exc.response_content())
 
     @app.exception_handler(ProfileValidationError)
     @app.exception_handler(UnsupportedPlanError)

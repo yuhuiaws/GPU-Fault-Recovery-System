@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import threading
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from gpu_fault.installation_resources import (
     InstallationResource,
+    InstallationResourceConflict,
     InstallationResourceDeletePolicy,
     InstallationResourceOwnership,
     InstallationResourceStatus,
@@ -78,6 +80,65 @@ def test_installation_resources_preserve_identity_and_allow_status_updates(store
     assert store.list_installation_resources(first.site_id) == [changed]
     assert store.list_installation_resources("absent-site") == []
     assert store.list_installation_resources() == [other, changed]
+
+
+def test_an_installation_resource_batch_is_one_transaction(store):
+    """Batch 91: a sync is all rows or none, and the refusal names every
+    conflicting key and field before any row is written."""
+
+    first, second = resource(key="resource-a"), resource(key="resource-b")
+    assert store.save_installation_resources([first, second]) == [first, second]
+    pending = first.model_copy(
+        update={"status": InstallationResourceStatus.DELETE_PENDING}
+    )
+    with pytest.raises(InstallationResourceConflict) as refused:
+        store.save_installation_resources(
+            [
+                pending,
+                second.model_copy(update={"resource_id": "owned/other"}),
+                resource(key="resource-c"),
+            ]
+        )
+    assert refused.value.conflicts == (("resource-b", ("resource_id",)),)
+    assert store.list_installation_resources() == [first, second], (
+        "a refused batch committed some of its rows"
+    )
+
+
+def test_an_installation_resource_batch_takes_the_single_row_writer_locks(store):
+    """The batch locks each row under the key text the single-row writer of
+    every earlier release used, so an older Pod mid-rollout and a batch exclude
+    each other: nothing of the batch lands while one of its rows is locked."""
+
+    import psycopg
+
+    first, second = resource(key="resource-a"), resource(key="resource-b")
+    finished = threading.Event()
+    failures: list[BaseException] = []
+
+    def save() -> None:
+        try:
+            store.save_installation_resources([first, second])
+        except BaseException as exc:  # pragma: no cover - reported below
+            failures.append(exc)
+        finally:
+            finished.set()
+
+    with psycopg.connect(postgres.validated_url()) as holder:
+        holder.execute(
+            "SELECT pg_advisory_xact_lock(hashtextextended(%s, 0))",
+            (f"installation_resource/{second.site_id}/{second.resource_key}",),
+        )
+        worker = threading.Thread(target=save, daemon=True)
+        worker.start()
+        assert not finished.wait(1.0), "the batch ignored a held row lock"
+        assert store.list_installation_resources() == [], (
+            "a blocked batch made a row visible"
+        )
+    assert finished.wait(30), "the batch did not resume after the lock was released"
+    worker.join(30)
+    assert failures == []
+    assert store.list_installation_resources() == [first, second]
 
 
 def test_node_identity_lists_are_scoped_ordered_and_preserve_newer_generations(store):

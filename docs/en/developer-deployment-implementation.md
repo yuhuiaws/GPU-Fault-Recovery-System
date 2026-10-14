@@ -1149,7 +1149,10 @@ After deploying or taking over legacy resources of the same site, `gpu_fault.adm
 `sync_installation_resource_snapshot` (kubectl exec into the CPU Pod to call
 `/v1/installation-resources/sync`; it falls back to a direct write only when the controlled script above reports the exact old-API or retryable-503 protocol)
 synchronizes to Aurora
-`gpu_fault_objects(kind=installation_resource)`. Administrators do not hand-write these
+`gpu_fault_objects(kind=installation_resource)`. The API writes the whole snapshot in one transaction; when it would change a
+recorded identity it answers 409, and the script hands only the validated reason, keys and fields to `InstallationRegistryConflict`
+through the `GPU_FAULT_REGISTRY_CONFLICT` protocol (exit 65), which neither retries nor falls back to the direct write; the direct
+path names key and fields as well when it refuses. Administrators do not hand-write these
 fields in `site.yaml`, and must not add a second AWS inventory file.
 The completion step of deploy and `config` first reads the rows Aurora already records, then rebuilds the snapshot from the bootstrap state:
 numbered rows without a natural key (the CPU public subnets with their route tables and route-table associations, the NLB listeners and target

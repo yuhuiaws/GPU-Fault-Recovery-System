@@ -3132,16 +3132,29 @@ resource list sorted by key, so an exported file that has been modified fails on
 
 Three Store backends implement the same contract. PostgreSQL stores it as
 `gpu_fault_objects(kind='installation_resource', key='<site>/<resource>')`
-and protects the identity check and update with `_state_transaction("installation_resource/<key>")`;
-the SQLite and in-memory backends keep the same immutable identity semantics.
+(`store/postgres/installation_resources.py`). One write (`save_installation_resources`: the whole snapshot of the sync API;
+saving one row is a batch of one) takes, in one transaction and in key order, the `installation_resource/<key>` advisory lock of
+every row (the lock key every earlier single-row writer used, so old and new Pods exclude each other during a rolling upgrade),
+reads the recorded rows and refuses the whole batch before any write when one row would change a recorded identity -- all or
+nothing; SQLite keeps the same semantics inside one `BEGIN IMMEDIATE`, the in-memory backend under its process lock. The refusal
+is `InstallationResourceConflict` (a `ValueError`), naming every key and field.
 
 The regional APIs all belong to the `execution-token` bucket:
 
 | Method | Path | Semantics |
 |---|---|---|
-| POST | `/v1/installation-resources/sync` | Bulk-write one digest-verified site snapshot |
+| POST | `/v1/installation-resources/sync` | Write one digest-verified site snapshot in one transaction (all or nothing); returns 409 when it would change a recorded identity, the body's `reason` and `conflicts` (each a `resource_key` with its `fields`) naming every refused key and field |
 | GET | `/v1/installation-resources?site_id=...` | Query all resources or a single site's resources, stably sorted by site and key |
-| PUT | `/v1/installation-resources/{site_id}/{resource_key:path}` | Advance a single record's status; returns 409 when the path identity disagrees with the body |
+| PUT | `/v1/installation-resources/{site_id}/{resource_key:path}` | Advance a single record's status; returns 409 when the path identity disagrees with the body, and a 409 with `conflicts` when it would change a recorded identity |
+
+An identity conflict is a deterministic refusal, hence a 409 and not a 500: the processor completes a 4xx at once as the
+request's final answer, while a 500 is replayed as retryable for its retry horizon (300 s) -- and with row-by-row saving every
+replay rewrote the rows ahead of the conflict (it happened live). The admin side
+(`resource_registry.sync_installation_resource_snapshot`) turns the 409 into `InstallationRegistryConflict`, naming key and
+fields (a `BootstrapError`, so the deploy/config completion step, join, the join rollback, remove-cluster and uninstall all fail
+closed on it), and neither retries nor falls back to the direct Aurora path; the in-Pod script passes on only the validated
+`reason`, keys and fields (exit 65, marker `GPU_FAULT_REGISTRY_CONFLICT`), never the response text. The direct fallback itself
+also writes in one transaction and names key and fields when it refuses.
 
 After a successful deployment or takeover of a legacy environment, `gpu-fault-admin` generates a snapshot from the
 bootstrap state, the live NLB/network objects and the
@@ -3162,7 +3175,9 @@ authentication, deploy/takeover sync, cluster removal and full-site uninstall re
 `tests/store/test_installation_resources.py`, `tests/regional/test_api.py` and
 `tests/admin/test_admin_*` (the convergence of a deploy rebuild with the recorded rows is in
 `tests/admin/test_admin_resource_registry_rebuild.py`, the sync outcome record and the deletion-verb gate in
-`tests/admin/test_resource_registry_outcome.py` and `tests/admin/test_deletion_verbs_registry_sync_gate.py`).
+`tests/admin/test_resource_registry_outcome.py` and `tests/admin/test_deletion_verbs_registry_sync_gate.py`, the 409 and the
+single transaction in `tests/app_services/test_installation_registry_conflicts.py`, `tests/admin/test_registry_transport.py` and
+`tests/admin/test_registry_sync_callers.py`).
 
 ### 2.23 Administrator CLI and deployment assets `src/gpu_fault/admin/`
 

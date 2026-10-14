@@ -34,6 +34,7 @@ from gpu_fault.admin.resource_registry_scripts import (
     LEGACY_REGISTRY_MARKER,
     SYNC_SCRIPT,
     UNAVAILABLE_REGISTRY_MARKER,
+    conflict_report,
 )
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.installation_resources import (
@@ -46,6 +47,24 @@ from gpu_fault.installation_resources import (
 
 class LegacyInstallationRegistryMissing(BootstrapError):
     pass
+
+
+class InstallationRegistryConflict(BootstrapError):
+    """The registry API refused a write with 409, naming each key and field.
+
+    Nothing of the write landed (the API saves it in one transaction), and
+    nothing falls back to the direct path: the refusal is deterministic.
+    """
+
+    def __init__(self, reason: str, conflicts: list[tuple[str, list[str]]]) -> None:
+        self.reason = reason
+        self.conflicts = conflicts
+        super().__init__(
+            f"installation registry refused the write: {reason}: "
+            + "; ".join(f"{key} ({', '.join(fields)})" for key, fields in conflicts)
+            + "; nothing was written -- a recorded identity changes only through "
+            "an explicit transition for a resource that was really replaced"
+        )
 
 
 def external_cluster_resources(
@@ -707,21 +726,6 @@ def _aurora_resources(
     return resources
 
 
-# Named for the refusal message; ``InstallationResource.immutable_identity``
-# compares them (with the site and key) as one tuple.
-_IDENTITY_FIELDS = (
-    "provider",
-    "resource_type",
-    "resource_id",
-    "resource_arn",
-    "region",
-    "account_id",
-    "ownership",
-    "delete_policy",
-    "dependencies",
-)
-
-
 def _keep_recorded_arns(
     resources: list[InstallationResource],
     existing: InstallationResourceSnapshot,
@@ -766,18 +770,10 @@ def _require_recorded_identities(
 
     recorded = {item.resource_key: item for item in existing.resources}
     changes = [
-        item.resource_key
-        + " ("
-        + ", ".join(
-            name
-            for name in _IDENTITY_FIELDS
-            if getattr(item, name) != getattr(recorded[item.resource_key], name)
-        )
-        + ")"
+        f"{item.resource_key} ({', '.join(fields)})"
         for item in snapshot.resources
         if item.resource_key in recorded
-        and item.immutable_identity()
-        != recorded[item.resource_key].immutable_identity()
+        and (fields := recorded[item.resource_key].identity_changes(item))
     ]
     if changes:
         raise BootstrapError(
@@ -1267,6 +1263,9 @@ def sync_installation_resource_snapshot(
             raise LegacyInstallationRegistryMissing(
                 "control plane predates the installation resource registry API"
             )
+        report = conflict_report(result.returncode, result.stdout)
+        if report is not None:
+            raise InstallationRegistryConflict(*report)
         if (
             result.returncode != 75
             or result.stdout.strip() != UNAVAILABLE_REGISTRY_MARKER

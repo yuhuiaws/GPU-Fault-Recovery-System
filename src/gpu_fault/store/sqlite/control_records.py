@@ -2,9 +2,13 @@ from __future__ import annotations
 
 from contextlib import AbstractContextManager
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, cast
+from typing import Any, Callable, Sequence, cast
 
-from gpu_fault.installation_resources import InstallationResource
+from gpu_fault.installation_resources import (
+    InstallationResource,
+    batch_keys,
+    refuse_identity_changes,
+)
 from gpu_fault.models import (
     DecisionStatus,
     FaultIncident,
@@ -424,16 +428,26 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
         self,
         resource: InstallationResource,
     ) -> InstallationResource:
-        key = f"{resource.site_id}/{resource.resource_key}"
-        with self._state_transaction(f"installation_resource/{key}"):
-            existing = self._get_optional("installation_resource", key)
-            if (
-                existing is not None
-                and existing.immutable_identity() != resource.immutable_identity()
-            ):
-                raise ValueError("installation resource identity cannot change")
-            self._put("installation_resource", key, resource)
-        return resource
+        return self.save_installation_resources([resource])[0]
+
+    def save_installation_resources(
+        self,
+        resources: Sequence[InstallationResource],
+    ) -> list[InstallationResource]:
+        # One BEGIN IMMEDIATE under the process lock: the batch is atomic and no
+        # other writer runs between the identity check and the writes.
+        keys = batch_keys(resources)
+        with self._state_transaction("installation_resource"):
+            recorded = {
+                key: existing
+                for key in keys
+                if (existing := self._get_optional("installation_resource", key))
+                is not None
+            }
+            refuse_identity_changes(recorded, resources)
+            for key, resource in zip(keys, resources):
+                self._put("installation_resource", key, resource)
+        return list(resources)
 
     def get_installation_resource(
         self,

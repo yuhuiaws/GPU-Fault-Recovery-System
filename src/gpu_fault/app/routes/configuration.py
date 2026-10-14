@@ -110,19 +110,16 @@ async def sync_installation_resources(
         get_configuration_dependencies
     ),
 ) -> list[InstallationResource]:
-    saved: list[InstallationResource] = []
-    for resource in snapshot.resources:
-        saved.append(
-            cast(
-                InstallationResource,
-                await _store_call(
-                    dependencies,
-                    dependencies.context.store.save_installation_resource,
-                    resource,
-                ),
-            )
-        )
-    return saved
+    # One store call, one transaction: a recorded identity the snapshot would
+    # change refuses every row (409, see ``InstallationResourceConflict``).
+    return cast(
+        list[InstallationResource],
+        await _store_call(
+            dependencies,
+            dependencies.context.store.save_installation_resources,
+            snapshot.resources,
+        ),
+    )
 
 
 @router.get(  # type: ignore[untyped-decorator]

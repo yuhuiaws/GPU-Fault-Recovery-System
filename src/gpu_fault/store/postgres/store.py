@@ -14,6 +14,9 @@ from gpu_fault.store.postgres.collector_telemetry import PostgresCollectorTeleme
 from gpu_fault.store.postgres.control_records import PostgresControlRecordMixin
 from gpu_fault.store.postgres.core import PostgresCoreMixin
 from gpu_fault.store.postgres.fleet import PostgresFleetMixin
+from gpu_fault.store.postgres.installation_resources import (
+    PostgresInstallationResourceMixin,
+)
 from gpu_fault.store.postgres.gpu_telemetry import PostgresGpuTelemetryMixin
 from gpu_fault.store.postgres.hot_table_bloat import PostgresHotTableBloatMixin
 from gpu_fault.store.postgres.notifications import PostgresNotificationMixin
@@ -70,6 +73,7 @@ class PostgresStore(
     PostgresCoreMixin,
     PostgresSchemaMixin,
     PostgresControlRecordMixin,
+    PostgresInstallationResourceMixin,
     PostgresFleetMixin,
     PostgresNotificationMixin,
     PostgresRemoteCommandMixin,
