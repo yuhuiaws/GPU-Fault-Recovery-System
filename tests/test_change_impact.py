@@ -87,6 +87,33 @@ def test_workflow_reconcile_change_selects_its_own_domain_not_full() -> None:
         assert plan.approval_cases == (), (path, plan.approval_cases)
 
 
+def test_departed_node_cleanup_selects_its_own_domain_not_full() -> None:
+    """The departed-node modules are new top-level files: without a rule of
+    their own they fell through to the fail-closed fallback and a one-line
+    change to the cleanup scheduled the whole acceptance run."""
+
+    for path in (
+        "src/gpu_fault/departed_nodes.py",
+        "src/gpu_fault/departed_node_cleanup.py",
+        "src/gpu_fault/departed_node_cleanup_actions.py",
+        "src/gpu_fault/departed_node_provider.py",
+        "src/gpu_fault/kubernetes_node_inventory.py",
+    ):
+        plan = MODULE.build_plan([path], settings())
+
+        assert plan.full is False, (path, plan.reasons)
+        assert plan.domains == ("departed-node-cleanup",), (path, plan.domains)
+        assert "tests/departed_nodes" in plan.pytest_targets, path
+        assert "tests/admin/test_admin_workflow_reconcile_departed_agents.py" in (
+            plan.pytest_targets
+        ), path
+        # The PostgreSQL end-to-end cases run in the Postgres shard.
+        assert plan.postgres is True, path
+        # A spot reclaim cannot be produced on demand: no live case.
+        assert plan.safe_cases == (), (path, plan.safe_cases)
+        assert plan.approval_cases == (), (path, plan.approval_cases)
+
+
 def test_unmatched_file_escalates_to_full_acceptance() -> None:
     plan = MODULE.build_plan(["unknown/new-surface.xyz"], settings())
     ordered, do_not_run = MODULE.ordered_regional_cases()
