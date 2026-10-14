@@ -207,6 +207,19 @@ def _is_hyperpod_registration(registration: Any) -> bool:
     )
 
 
+def is_placeholder_registration(registration: Any) -> bool:
+    """A ``synthetic`` registration stands for no real cluster.
+
+    Perf suites (``perf-cap-NNN``) and AUTH-007/008 (``auth-logical-``)
+    register them online: the HyperPod name does not exist and the seeded
+    Agents' nodes report nothing by construction. The background scans -- the
+    identity refresh here, the collector-silence scan -- skip them through
+    this one test.
+    """
+
+    return bool(getattr(registration, "synthetic", False))
+
+
 class _ClusterIdentityRefresh:
     """One registered cluster in a background identity refresh pass.
 
@@ -235,9 +248,9 @@ class _RegisteredIdentityRegistries:
     recovery observation until every CPU Pod restarted, and a cluster removed
     online stayed in the refresh. A call walks the runtime's current snapshot
     and returns entries, not observers, so the periodic runner's per-tick check
-    stays cheap. Only HyperPod registrations that are not synthetic count: a
-    perf or acceptance placeholder names a HyperPod cluster that does not
-    exist. An unavailable snapshot serves nothing, like the endpoint allow-list.
+    stays cheap. Only HyperPod registrations count, and no placeholder
+    (``is_placeholder_registration``): its HyperPod cluster does not exist.
+    An unavailable snapshot serves nothing, like the endpoint allow-list.
     """
 
     def __init__(
@@ -254,7 +267,8 @@ class _RegisteredIdentityRegistries:
         return [
             _ClusterIdentityRefresh(registration.cluster_id, self.observers)
             for registration in registrations
-            if _is_hyperpod_registration(registration) and not registration.synthetic
+            if _is_hyperpod_registration(registration)
+            and not is_placeholder_registration(registration)
         ]
 
 

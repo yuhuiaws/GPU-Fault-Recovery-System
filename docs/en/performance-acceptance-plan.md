@@ -1553,7 +1553,8 @@ small and cannot explain second-level latency.
    placeholder HyperPod name, so refreshing it only produces `ResourceNotFound` logs. The background
    identity refresh skips these entries by the registration's `synthetic` marker (it reads the
    registry's current snapshot on every pass, so clusters a suite registers online are no exception),
-   keeping them out of the logs and off control-plane resources.
+   keeping them out of the logs and off control-plane resources; the collector-silence scan skips them by
+   the same test, so placeholder nodes raise no drill notifications.
 10. **Before raising ACU further, check whether the bottleneck is still the database.** When
     Aurora CPU is already below about 70%–80% while lane wait is still at the second level, adding
     ACU has limited benefit; turn to transaction, lane and completion parallelism optimization.

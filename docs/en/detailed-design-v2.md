@@ -320,6 +320,11 @@ then `required_collectors_for_agent` selects the required channels, excluding se
 A notification is generated when `last_success_at` is missing or the time since it exceeds the threshold of that channel; when the success record is missing,
 this scan does not first wait a full threshold window. The thresholds come from `src/gpu_fault/collector_registry.py`:
 GPU inventory defaults to 180s, GPU metrics/host telemetry 420s, log channels 900s.
+`synthetic` registrations (perf/acceptance placeholders whose nodes report nothing by construction) are not scanned, by the
+same `is_placeholder_registration` test the background identity refresh uses. Right before each notification is written the scan
+re-reads the cluster and the Agent: a cluster no longer registered ACTIVE, or an Agent whose record is gone or no longer current,
+gets none, so a purge that commits after the scan read the Agents (remove-cluster, a perf suite's teardown) is no longer followed
+by notifications with their delivery/result records and dedup links.
 Notifications are deduplicated by cluster, node, channel and the `GPU_FAULT_COLLECTOR_SILENT_ALERT_SECONDS` time bucket,
 with a default bucket width of 3600s. This path only generates and delivers an `AdvisoryNotification`; it does not create a recovery workflow,
 nor does it write a unified `UNKNOWN` node state. Agent heartbeat loss and the health decisions of the Executor and Watcher
