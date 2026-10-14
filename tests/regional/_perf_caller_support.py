@@ -27,6 +27,19 @@ TEARDOWN_TAIL = [
 PLACEMENT = {"aurora": {"cluster_id": "test-aurora", "writer_instance_id": "test-w"}}
 
 
+class SeriesStub:
+    """A processor time series that sampled nothing."""
+
+    def stop(self) -> None:
+        return None
+
+    def document(self) -> dict[str, Any]:
+        return {"pods": {}}
+
+    def summary(self) -> dict[str, Any]:
+        return {"pods": {}}
+
+
 class AmpWire:
     """Read-only AMP responses; the notification preflight remains real."""
 
@@ -173,6 +186,11 @@ class CapacityWire:
         monkeypatch.setattr(capacity, "start_placement", lambda *_args: PLACEMENT)
         monkeypatch.setattr(capacity, "placement_section", lambda *_args: {})
         monkeypatch.setattr(capacity, "TopSampler", lambda *_args: self)
+        # The per-Pod processor series is its own module's contract
+        # (tests/regional/test_perf_processor_timeseries.py).
+        monkeypatch.setattr(
+            capacity, "start_processor_timeseries", lambda _pods: SeriesStub()
+        )
         monkeypatch.setattr(
             action,
             "executor_identity",

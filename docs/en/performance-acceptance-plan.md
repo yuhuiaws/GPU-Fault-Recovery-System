@@ -506,6 +506,7 @@ Also collect:
 - HTTP status, client latency and Server-Timing;
 - load generator DNS mode, pre-resolution duration/attempt count, address count and in-process cache hits;
 - processor priority completion p50/p95/p99/max;
+- per control-plane Pod and second during the load and the drain: processor in-flight, worker capacity, queue depth and consumer cycles (`processor-timeseries.json`);
 - per-cluster p99 minimum, maximum and mean;
 - Aurora ACU, CPU, DBLoad, connection count and commit/rollback;
 - PostgreSQL table sizes, live/dead tuples and deadlocks;
@@ -551,6 +552,21 @@ comparable; after a failover inside a round its Aurora evidence describes only t
 started on. The §8.4 integrated runner records the same from `--aurora-cluster-id`; the §8.2 action
 runner reads no Aurora metrics, records the placement too when `GPU_FAULT_AURORA_CLUSTER_ID` is set, and
 otherwise runs as before with `recorded=false` in `summary.json.placement`.
+
+During the load and the drain the runner keeps one sampling session in every control-plane Pod
+(`regional_capacity_timeseries.py`: one `kubectl exec -i` session whose program arrives length-prefixed
+on stdin, the rest of stdin being its stop channel, reading the Pod's own `/metrics` once per second). It
+records `gpu_fault_processor_in_flight`, `gpu_fault_processor_workers`, `gpu_fault_processor_queue_depth`,
+the per-process `gpu_fault_processor_consumer_cycles_total`, `gpu_fault_processor_claimed_not_started` and
+`gpu_fault_telemetry_spool_depth` into `processor-timeseries.json` (at most 3600 samples per Pod), and
+`summary.json.processor_timeseries` gives per Pod the mean and maximum in-flight while the backlog was above
+zero, the worker capacity, the utilization and the consumer cycle rate. `metrics-before.json` and
+`metrics-after.json` also keep the `processor_consumer`, `request_processing` and `fault_pressure` families.
+The drain probe starts the moment the load Job completes, beside the after-load collection, so
+`queue_drain_seconds` and `queue_depth_at_load_stop` count from the load stop; the probe used to start only
+once the metrics, cgroup, PostgreSQL and log collection had finished (about 45 s later), and the readings at
+that point are kept as `queue_drain_seconds_after_collection` and `queue_depth_after_collection` for
+comparisons with older rounds.
 
 `all`, `run` and the action, integrated and correlated suites must execute the same idempotent
 teardown in `finally` regardless of success, non-Complete, exception or interruption. Teardown
@@ -1098,6 +1114,7 @@ ingress-process-model-preflight.json
 postgres-before.json
 postgres-after.json
 queue-drain.json
+processor-timeseries.json
 processor-priority-latency.json
 aurora.json
 pods/

@@ -228,6 +228,10 @@ is split by responsibility:
 
 - `regional_capacity_job.py`: Indexed Job and start-gate manifest construction.
 - `regional_capacity_database.py`: Aurora and PostgreSQL observations.
+- `regional_capacity_timeseries.py`: one sampling session per control-plane Pod
+  through the load and the drain (processor in-flight, workers, queue depth and
+  consumer cycles once per second), and the drain probe that starts at the
+  load stop.
 - `regional_capacity_placement.py`: the run's Aurora writer, its Availability
   Zone and the control-plane node zones.
 - `regional_validation_telemetry.py`: the integrated and correlated runners'

@@ -48,6 +48,7 @@ if TYPE_CHECKING or __package__:
     from . import regional_capacity_registry as capacity_registry
     from . import regional_capacity_results as capacity_results
     from . import regional_capacity_settle as capacity_settle
+    from . import regional_capacity_timeseries as capacity_timeseries
     from .regional_capacity_cleanup import (
         AUDIT_PURGE_STATEMENTS as AUDIT_PURGE_STATEMENTS,
     )
@@ -65,6 +66,7 @@ else:
     import regional_capacity_registry as capacity_registry
     import regional_capacity_results as capacity_results
     import regional_capacity_settle as capacity_settle
+    import regional_capacity_timeseries as capacity_timeseries
     from regional_capacity_cleanup import (
         AUDIT_PURGE_STATEMENTS as AUDIT_PURGE_STATEMENTS,
     )
@@ -363,7 +365,8 @@ METRIC_PATTERN = re.compile(
     r"queue_oldest|processor_requests|lane_rows|"
     r"admission_batch|ingress_lane|request_decode|ingress_backpressure|"
     r"rejections_total|in_flight|processor_claim|store_io_|"
-    r"telemetry_spool|queue_bypass|processor_notification"
+    r"telemetry_spool|queue_bypass|processor_notification|"
+    r"processor_consumer|request_processing|fault_pressure"
 )
 
 
@@ -482,13 +485,7 @@ def ingress_process_model_preflight() -> dict[str, object]:
 def scrape_metrics(pods: list[str]) -> dict[str, str]:
     snapshot = {}
     for pod in pods:
-        port = (
-            "8082"
-            if "telemetry-spool-worker" in pod
-            else "8081"
-            if "control-worker" in pod
-            else "8080"
-        )
+        port = capacity_timeseries.metrics_port(pod)
         try:
             body = control(
                 "exec",
@@ -656,67 +653,41 @@ def wait_for_job(job: str, deadline_seconds: int) -> str:
     return "Timeout"
 
 
-def queue_drain(
-    pods: list[str],
-    timeout_seconds: int = 900,
-    interval_seconds: float = 1.0,
-    target_queue_depth: float = 1.0,
-    target_spool_depth: float = 1.0,
-) -> dict:
-    """Wait for the processor queue to return to the steady state.
+def queue_drain(pods: list[str], **options: Any) -> dict:
+    """``regional_capacity_timeseries.queue_drain`` over this suite's scrape."""
+    return capacity_timeseries.queue_drain(pods, scrape=scrape_metrics, **options)
 
-    The acceptance gate is "back to steady state within 60s of the burst",
-    so the sampling resolution has to be small compared to 60s. One
-    ``/metrics`` scrape costs about 2s (kubectl exec), and the loop stops at
-    the first empty sample, which means ``drain_seconds`` is an upper bound
-    with roughly ``interval_seconds + 2s`` of granularity. Keep the interval
-    at 1s: a 15s interval reported every fast drain as "about 2s" and every
-    slow one as a multiple of 17s, which is not comparable across runs.
-    """
-    started = time.time()
-    history = []
-    probe = pods[0] if pods else None
-    if probe is None:
-        return {"samples": history}
-    while time.time() - started < timeout_seconds:
-        snapshot = scrape_metrics([probe]).get(probe, "")
-        depth = None
-        spool_depth = None
-        oldest = None
-        for line in snapshot.splitlines():
-            if line.startswith("gpu_fault_processor_queue_depth "):
-                depth = float(line.split()[-1])
-            if line.startswith("gpu_fault_telemetry_spool_depth "):
-                spool_depth = float(line.split()[-1])
-            if line.startswith("gpu_fault_processor_queue_oldest_age_seconds "):
-                oldest = float(line.split()[-1])
-        history.append(
-            {
-                "epoch": time.time(),
-                "elapsed_seconds": time.time() - started,
-                "queue_depth": depth,
-                "telemetry_spool_depth": spool_depth,
-                "oldest_age_seconds": oldest,
-            }
-        )
-        if (
-            depth is not None
-            and depth <= target_queue_depth
-            and (spool_depth is None or spool_depth <= target_spool_depth)
-        ):
-            break
-        time.sleep(interval_seconds)
-    return {
-        "drain_seconds": history[-1]["elapsed_seconds"] if history else None,
-        "sample_interval_seconds": interval_seconds,
-        "depth_at_load_stop": history[0]["queue_depth"] if history else None,
-        "telemetry_spool_depth_at_load_stop": (
-            history[0]["telemetry_spool_depth"] if history else None
-        ),
-        "target_queue_depth": target_queue_depth,
-        "target_spool_depth": target_spool_depth,
-        "samples": history,
-    }
+
+def start_processor_timeseries(pods: list[str]) -> Any:
+    return capacity_timeseries.ProcessorTimeseries(pods).start()
+
+
+def collect_after_load(
+    pods: list[str], artifacts: Path, job: str, *, targets: tuple[float, float]
+) -> tuple[dict, dict, list[dict], dict]:
+    """The drain probe from the load stop, beside the after-load collection."""
+    drain = capacity_timeseries.Background(
+        queue_drain,
+        pods,
+        target_queue_depth=targets[0],
+        target_spool_depth=targets[1],
+    )
+    drain.start()
+    (artifacts / "metrics-after.json").write_text(
+        json.dumps(scrape_metrics(pods), indent=1) + "\n"
+    )
+    cgroup_after = scrape_cgroup(pods)
+    (artifacts / "cgroup-after.json").write_text(
+        json.dumps(cgroup_after, indent=1) + "\n"
+    )
+    pg_after = postgres_counters()
+    (artifacts / "postgres-after.json").write_text(
+        json.dumps(pg_after, indent=1) + "\n"
+    )
+    documents = collect_logs(job, artifacts / "pods")
+    collected_at = time.time()
+    reference = capacity_timeseries.drain_reference(drain.result(), collected_at)
+    return cgroup_after, pg_after, documents, reference
 
 
 def release_id() -> str:
@@ -865,6 +836,8 @@ def execute_case(
     resources.create(manifest)
     sampler = TopSampler(artifacts / "control-plane-top.jsonl")
     sampler.start()
+    # Per Pod, once a second, through the load and the drain.
+    series = start_processor_timeseries(pods)
     try:
         if gated_start:
             wait_for_load_pods(
@@ -886,27 +859,17 @@ def execute_case(
         status = wait_for_job(job, spec["deadline"] + lead_seconds + 120)
         window_end = time.time()
         log(f"job status: {status}")
-        (artifacts / "metrics-after.json").write_text(
-            json.dumps(scrape_metrics(pods), indent=1) + "\n"
-        )
-        cgroup_after = scrape_cgroup(pods)
-        (artifacts / "cgroup-after.json").write_text(
-            json.dumps(cgroup_after, indent=1) + "\n"
-        )
-        pg_after = postgres_counters()
-        (artifacts / "postgres-after.json").write_text(
-            json.dumps(pg_after, indent=1) + "\n"
-        )
-        documents = collect_logs(job, artifacts / "pods")
-        drain = queue_drain(
-            pods,
-            target_queue_depth=target_queue_depth,
-            target_spool_depth=target_spool_depth,
+        cgroup_after, pg_after, documents, drain = collect_after_load(
+            pods, artifacts, job, targets=(target_queue_depth, target_spool_depth)
         )
         priority_latency = processor_priority_latency()
     finally:
+        series.stop()
         sampler.stop()
         sampler.join(timeout=30)
+    (artifacts / "processor-timeseries.json").write_text(
+        json.dumps(series.document()) + "\n"
+    )
     (artifacts / "queue-drain.json").write_text(json.dumps(drain, indent=1) + "\n")
     (artifacts / "processor-priority-latency.json").write_text(
         json.dumps(priority_latency, indent=1) + "\n"
@@ -933,12 +896,19 @@ def execute_case(
             "window_end_epoch": window_end,
             "store_bloat": capacity_database.store_bloat_section(pg_before, pg_after),
             "store_layout": capacity_database.store_layout_section(pg_before, pg_after),
+            # From the load stop; the *_after_collection pair is where the probe
+            # used to start (after the collection), for older runs.
             "queue_drain_seconds": drain.get("drain_seconds"),
             "queue_drain_sample_interval_seconds": drain.get("sample_interval_seconds"),
             "queue_depth_at_load_stop": drain.get("depth_at_load_stop"),
             "telemetry_spool_depth_at_load_stop": drain.get(
                 "telemetry_spool_depth_at_load_stop"
             ),
+            "queue_drain_seconds_after_collection": drain.get(
+                "drain_seconds_after_collection"
+            ),
+            "queue_depth_after_collection": drain.get("depth_after_collection"),
+            "processor_timeseries": series.summary(),
             "cpu_throttling": {
                 pod: {
                     key: int(after[key]) - int(cgroup_before.get(pod, {}).get(key, 0))
