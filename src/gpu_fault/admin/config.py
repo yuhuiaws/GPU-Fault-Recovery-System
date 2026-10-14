@@ -444,6 +444,14 @@ class ProcessorConfig(_Section):
 class WorkflowConfig(_Section):
     poll_interval_seconds: float = 5.0
     dispatcher_workers: int = 8
+    # Whether the control plane ends what a provably departed GPU node left
+    # behind by itself (GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED,
+    # ``gpu_fault.departed_node_cleanup``): the Agent retired, the never-changed
+    # workflows closed, the ESCALATED incidents closed. Off leaves them to
+    # ``workflow-reconcile``. Omitted from records and YAML while at its
+    # default so every live desired.json keeps its digest.
+    departed_node_cleanup: bool = True
+    OMIT_WHEN_DEFAULT = frozenset({"departed_node_cleanup"})
 
     def validate(self) -> None:
         if not 0.5 <= self.poll_interval_seconds <= 60:

@@ -115,8 +115,12 @@ LEDGER_REFRESH = timedelta(minutes=10)
 def cleanup_enabled(environ: Mapping[str, str] | None = None) -> bool:
     """The admin-config switch as the control-plane Pods read it."""
 
+    # The name stays literal here: the env reference infers the variable's
+    # kind (boolean) from this read site.
     return env_bool(
-        ENABLED_ENVIRONMENT, True, environ=os.environ if environ is None else environ
+        "GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED",
+        True,
+        environ=os.environ if environ is None else environ,
     )
 
 

@@ -228,6 +228,9 @@ categories:
         description: "每轮扫描选取的最老 workflow 行数；一般不设置，由 Region 预算推导，使选取不会卡住预算且一个 tick 留在派发租约内；启动时拒绝超过它的 Region 预算。Region 预算超过 400 的站点须做有意的变更：经评审的发布模板显式设置不小于预算的值，并同时放开 maxActiveRegion 的上界，事先核对一个 tick 仍在 15 s 派发租约内。"
       - name: GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS
         description: "每个 worker 进程的 workflow 执行线程数。"
+      - name: GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED
+        production: 由 admin config 的 spec.workflow.departedNodeCleanup 渲染（默认 true）
+        description: "控制面自动收尾已证实离场（spot 回收、缩容、provider 替换）的 GPU 节点：退役 Agent、关闭从未改动节点的 workflow、关闭 ESCALATED incident；false 时只能用 workflow-reconcile 手工收尾。"
       - name: GPU_FAULT_DEFAULT_RESTART_BUDGET
         description: "任务未声明时的默认自动重启预算；按 cluster/job 持久化。"
       - name: GPU_FAULT_REMOTE_STEP_BATCHING

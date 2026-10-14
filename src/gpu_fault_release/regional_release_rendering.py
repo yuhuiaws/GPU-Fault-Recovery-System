@@ -395,6 +395,9 @@ def admin_config_renderer_environment(
             workflow.poll_interval_seconds
         ),
         "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS": str(workflow.dispatcher_workers),
+        "GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED": str(
+            workflow.departed_node_cleanup
+        ).lower(),
         "GPU_FAULT_NOTIFICATION_BATCH_SIZE": str(notification.batch_size),
         "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS": str(notification.max_attempts),
         "GPU_FAULT_EVIDENCE_RETENTION_HOURS": str(evidence.retention_hours),

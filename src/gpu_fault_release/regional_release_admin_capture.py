@@ -164,6 +164,16 @@ def _captured_processor(
     }
 
 
+def _captured_switch(data: Mapping[str, Any], name: str, default: bool) -> bool:
+    """A boolean admin knob as a role ConfigMap carries it; absent is the
+    default (a release from before the knob rendered none)."""
+
+    value = str(data.get(name, str(default).lower())).strip().lower()
+    if value not in {"true", "false"}:
+        raise AdminConfigError(f"live {name} value is invalid")
+    return value == "true"
+
+
 def captured_admin_config(
     release: Any,
     snapshots: dict[str, dict[str, str]],
@@ -291,6 +301,11 @@ def captured_admin_config(
                             "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS",
                             workflow.dispatcher_workers,
                         )
+                    ),
+                    "departed_node_cleanup": _captured_switch(
+                        worker_core,
+                        "GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED",
+                        workflow.departed_node_cleanup,
                     ),
                 },
                 "notification_delivery": {

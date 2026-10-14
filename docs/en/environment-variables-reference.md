@@ -129,6 +129,7 @@ validates them (integers/numbers must parse, booleans must be `0/1/true/false/ye
 | `GPU_FAULT_DCGM_STATE_MAX_KEYS` | Telemetry | integer | `'4096'` | `gpu_fault.collectors.gpu.dcgm` |
 | `GPU_FAULT_DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD` | Telemetry | number | `'0.05'` | `deploy/node/install-gpu-fault-collector.sh`<br>`gpu_fault.collectors.gpu.dcgm` |
 | `GPU_FAULT_DEFAULT_RESTART_BUDGET` | Core/Other | integer | `'1'` | `gpu_fault.completion_pod_parsing`<br>`gpu_fault.orchestration.workflow_builder` |
+| `GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED` | Core/Other | boolean | `True` | `gpu_fault.departed_node_cleanup` |
 | `GPU_FAULT_DEPLOYMENT_MODE` | Core/Other | text | `'', 'single-cluster'` | `gpu_fault.app.admission_runtime`<br>`gpu_fault.settings` |
 | `GPU_FAULT_DEPLOY_API_BUDGET_DIR` | Core/Other | text | `<implicit>` | `gpu_fault.admin.api_budget` |
 | `GPU_FAULT_DEPLOY_API_PARENT` | Core/Other | text | `<implicit>` | `gpu_fault.admin.api_budget` |

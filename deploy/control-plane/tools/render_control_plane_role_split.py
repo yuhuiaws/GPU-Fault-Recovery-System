@@ -339,16 +339,8 @@ def configure_worker_queue_coordination(
     # workers per Pod; the runtime refuses a shard count below the process
     # count (a consumer without a shard never hears a notification).
     set_env(worker, "GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS", "5")
-    set_env(
-        worker,
-        "GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES",
-        str(consumer_processes),
-    )
-    set_env(
-        worker,
-        "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS",
-        str(consumer_processes),
-    )
+    set_env(worker, "GPU_FAULT_PROCESSOR_CONSUMER_PROCESSES", str(consumer_processes))
+    set_env(worker, "GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS", str(consumer_processes))
     set_env(worker, "GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY", "1")
     set_env(worker, "GPU_FAULT_PROCESSOR_ROUTINE_STARVATION_SECONDS", "30")
     set_env(worker, "GPU_FAULT_PROCESSOR_FAULT_PRESSURE_EVIDENCE_WORKERS", "1")
@@ -670,6 +662,11 @@ def renderer_admin_config() -> AdminConfig:
                     str(workflow.dispatcher_workers),
                 )
             ),
+            "departed_node_cleanup": boolean_environment(
+                "GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED",
+                str(workflow.departed_node_cleanup).lower(),
+            )
+            == "true",
         },
         "notification_delivery": {
             "batch_size": int(
@@ -876,6 +873,9 @@ def configure_admin_tuning(container: dict, config: AdminConfig) -> None:
         },
         "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS": (workflow.poll_interval_seconds),
         "GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS": (workflow.dispatcher_workers),
+        "GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED": str(
+            workflow.departed_node_cleanup
+        ).lower(),
         "GPU_FAULT_NOTIFICATION_BATCH_SIZE": notification.batch_size,
         "GPU_FAULT_NOTIFICATION_MAX_ATTEMPTS": notification.max_attempts,
         "GPU_FAULT_EVIDENCE_RETENTION_HOURS": evidence.retention_hours,

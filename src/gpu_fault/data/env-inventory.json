@@ -371,6 +371,15 @@
     "GPU_FAULT_DEFAULT_RESTART_BUDGET": {
       "kind": "integer"
     },
+    "GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "on",
+        "true",
+        "yes"
+      ]
+    },
     "GPU_FAULT_DEVICE_CLIENT_SAMPLES": {
       "kind": "integer"
     },
@@ -1724,6 +1733,7 @@
     "GPU_FAULT_DCGM_STATE_MAX_KEYS",
     "GPU_FAULT_DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD",
     "GPU_FAULT_DEFAULT_RESTART_BUDGET",
+    "GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED",
     "GPU_FAULT_DEPLOYMENT_MODE",
     "GPU_FAULT_DEPLOY_API_BUDGET_DIR",
     "GPU_FAULT_DEPLOY_API_PARENT",
