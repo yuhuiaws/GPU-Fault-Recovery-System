@@ -2,7 +2,7 @@
 
 The counting rule lives in ``gpu_fault.store.shared.remediation_budgets``:
 RUNNING workflows listing a scope, whatever their lease, a BLOCKED record that
-still occupies its node with an unresolved node action, plus a SUPERSEDED
+still occupies its node with a node action that may still be running, plus a SUPERSEDED
 predecessor whose preempting successor has not claimed yet (its hold is
 reserved for that successor). Both reads apply it in two parts: the RUNNING
 holders are counted in SQL -- decoding every holder for every admission made a
@@ -43,8 +43,8 @@ _HANDOFFS = """
 """
 _CLAIMS = "coalesce({row}.payload->'remediation_budget_claims', '[]'::jsonb)"
 # BLOCKED rows that still occupy their node (``workflow_is_open``; mirrors
-# ``_OPEN_PREDECESSOR_SQL``). Which of them hold is the shared rule's call: an
-# unresolved node action cannot be judged from a column.
+# ``_OPEN_PREDECESSOR_SQL``). Which of them hold is the shared rule's call:
+# whether a node action may still be running cannot be judged from a column.
 _OCCUPYING_BLOCKED = (
     "w.status='BLOCKED' AND w.blocked_kind IN ('NEEDS_OPERATOR', 'INTERNAL_ERROR')"
 )

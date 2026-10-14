@@ -3954,12 +3954,21 @@ occupancy read and the `/metrics` gauges:
   hold for the compensation it owes. A `NEEDS_OPERATOR` record whose action is answered holds its node only as paperwork and no
   budget; one blocked at compile time never claimed any.
 - `INTERNAL_ERROR`: the dispatcher proved the record cannot be executed and nothing drives it; the terminal funnel already parks
-  any unresolved node action as `NEEDS_OPERATOR`, so it holds nothing (the shared rule would still keep one with an unresolved
-  action, a shape only an older writer leaves).
+  any unresolved node action as `NEEDS_OPERATOR`. It still fails closed: a provider or agent action left `WAITING` on it (a
+  HyperPod reboot carries no outcome flag, and nothing polls it any more) holds the slot, as would an unresolved action an older
+  writer left; otherwise it holds nothing.
 - `SAFETY_SETTLED`: the safety plan ran to its end, nothing is in flight -- released. A legacy `BLOCKED` without a kind no longer
   occupies its node -- released.
 
 The node of a record that holds no budget stays fenced by the predecessor and node-busy gates while its kind occupies it.
+A parked hold lasts only as long as its action can live. The longest a node action can live is the node workflow lifetime every
+step ceiling stays inside (3600 s), plus the cluster executor's execution cap (`DEFAULT_MAX_EXECUTION_SECONDS`, 1800 s) and one
+command lease (120 s) for a command an executor already held: `NODE_ACTION_LONGEST_LIFE_SECONDS` = 5520 s from the newest such
+action's start, and never before the record's own `lifetime_deadline_at` plus 1920 s. Past it, the dispatcher's sweep (once a
+minute) releases the claims in one compare-and-set write carrying an `OPERATOR_RECONCILED` / `PARKED_BUDGET_RELEASED` event with
+the action's age and bound, counts it (`gpu_fault_remediation_budget_parked_holds_released_total`) and logs it once; the record
+stays `BLOCKED` for the operator. The bound assumes the shipped executor cap: a GPU cluster that raises
+`GPU_FAULT_CLUSTER_EXECUTOR_MAX_EXECUTION_SECONDS` runs commands longer than the control plane can see.
 PostgreSQL applies the rule in two parts: it counts the `RUNNING` holders of the requested scopes in SQL and decodes only the
 node-occupying `BLOCKED` rows and the preemption handoffs the rule has to judge. Decoding every holder for every admission made
 a burst of N admissions N²/2 decodes under the Region scope's lock (measured: 18.8 s for 350 admissions in one tick, over the

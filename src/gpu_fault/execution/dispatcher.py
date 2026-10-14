@@ -132,8 +132,7 @@ class WorkflowDispatcher:
             seconds=max(3 * config.poll_interval_seconds, WAITING_LEASE_FLOOR_SECONDS)
         )
         self.failure_handling_abandoned_total = 0
-        # Incident clusters and over-limit budget scopes across ticks (§9.5).
-        self.budget_watch = budget_guard.BudgetWatch()
+        self.budget_watch = budget_guard.BudgetWatch()  # §9.5, across ticks
         self.plan_sync_misses_total = 0
         self.node_busy_timeouts_total = 0
         # Placement holds ended because the nodes they waited on were freed
@@ -1267,14 +1266,15 @@ class WorkflowDispatcher:
         )
 
     def sweep_stuck_records(self, now: datetime) -> set[str]:
-        """Close the records nothing else will -- by Store predicate, never age:
-        abandoned/retired generations, compile-time BLOCKED no-ops, receipt-settled
-        parked records, orphaned commands. Returns the retired generations withheld."""
+        """Close what nothing else will by Store predicate (abandoned/retired
+        generations, compile-time BLOCKED no-ops, receipt-settled records, orphaned
+        commands), free lapsed parked holds; return retired generations withheld."""
 
         self._supersede_abandoned_generations(now)
         retired = self._revoke_retired_generations(now)
         close_compile_blocked_workflows(self.store, now=now)
         resume_receipt_settled_workflows(self.store, now=now)
+        budget_guard.release_lapsed_parked_holds(self.store, self.budget_watch, now=now)
         cancel_orphaned_commands(self.store, now=now)
         return retired
 

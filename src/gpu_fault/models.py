@@ -847,9 +847,10 @@ class WorkflowEventCode(StrEnum):
     # Placement hold (orchestrator opens, dispatcher dissolves)
     PLACEMENT_HOLD_OPENED = "PLACEMENT_HOLD_OPENED"
     PLACEMENT_HOLD_DISSOLVED = "PLACEMENT_HOLD_DISSOLVED"
-    # Operator reconciliation (``record_operator_event`` via the Store)
+    # Operator reconciliation (``record_operator_event`` via the Store, dispatcher sweeps)
     OPERATOR_RECONCILED = "OPERATOR_RECONCILED"
     OPERATOR_RETIRED_GENERATION = "OPERATOR_RETIRED_GENERATION"
+    PARKED_BUDGET_RELEASED = "PARKED_BUDGET_RELEASED"
     # An operator confirmed, on fleet and Kubernetes evidence, the outcome of
     # a node action the executor could not observe (``submit-remediation
     # --disposition confirm-node-action``); kind OPERATOR_RECONCILED. The
@@ -957,10 +958,9 @@ class WorkflowRequest(StrictModel):
     remediation_budget_limits: dict[str, int] = Field(default_factory=dict)
     remediation_budget_wait_count: int = Field(default=0, ge=0)
     remediation_budget_last_blocked_reason: str | None = None
-    # The budget scope that last refused this workflow's claim
-    # (``cluster:<id>`` and friends), kept alongside the human-readable reason
-    # so the per-cluster saturation gauge reads it structurally. None on rows
-    # written before the field existed.
+    # The budget scope that last refused this workflow's claim (``cluster:<id>`` and
+    # friends; the store's refusal, or the dispatcher's for a never-refused waiter), so
+    # the per-cluster saturation gauge reads it structurally. None on older rows.
     remediation_budget_last_blocked_scope: str | None = None
     not_before: datetime | None = None
     aggregation_max_deadline: datetime | None = None

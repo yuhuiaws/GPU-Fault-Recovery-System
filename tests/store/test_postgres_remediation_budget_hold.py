@@ -17,6 +17,7 @@ from threading import Barrier
 
 import pytest
 
+from gpu_fault.execution.budget_guard import BudgetWatch, release_lapsed_parked_holds
 from gpu_fault.execution.remediation_budget import (
     RemediationBudgetPolicy,
     remediation_budget_claims,
@@ -30,7 +31,10 @@ from gpu_fault.models import (
 from gpu_fault.store import PostgresStore
 from gpu_fault.store.postgres.remediation_budget_holders import claim_occupancy
 from gpu_fault.store.shared.errors import RemediationBudgetError
-from gpu_fault.store.shared.remediation_budgets import budget_occupancy
+from gpu_fault.store.shared.remediation_budgets import (
+    budget_occupancy,
+    parked_hold_expires_at,
+)
 from tests._builders import (
     copy_model,
     execute_workflow,
@@ -280,8 +284,12 @@ def test_the_handoff_reservation_keeps_exactly_one_hold(store):
     assert CLUSTER in admitted.remediation_budget_claims
 
 
-def _blocked_shape(kind: BlockedKind, details: dict[str, bool]) -> dict[str, object]:
-    """A BLOCKED row of ``kind`` whose reboot failed with ``details``."""
+def _blocked_shape(
+    kind: BlockedKind,
+    details: dict[str, object],
+    status: WorkflowStepStatus = WorkflowStepStatus.FAILED,
+) -> dict[str, object]:
+    """A BLOCKED row of ``kind`` whose reboot ended (or still waits) with ``details``."""
 
     return {
         "status": WorkflowStatus.BLOCKED,
@@ -289,11 +297,13 @@ def _blocked_shape(kind: BlockedKind, details: dict[str, bool]) -> dict[str, obj
         "completed_step_indexes": [0],
         "step_executions": [
             workflow_step_execution(0, STOP),
-            workflow_step_execution(
-                1, REBOOT, WorkflowStepStatus.FAILED, details=dict(details)
-            ),
+            workflow_step_execution(1, REBOOT, status, details=dict(details)),
         ],
     }
+
+
+# A HyperPod reboot the lifecycle adapter submitted and still polls: no flag.
+PROVIDER_WAITING = {"submitted_nodes": ["node-x"], "activated_spare_nodes": []}
 
 
 def _seed_every_holder_shape(store) -> None:
@@ -309,6 +319,9 @@ def _seed_every_holder_shape(store) -> None:
         "blocked-answered": _blocked_shape(BlockedKind.NEEDS_OPERATOR, {}),
         "blocked-settled": _blocked_shape(BlockedKind.SAFETY_SETTLED, UNKNOWN_OUTCOME),
         "blocked-internal": _blocked_shape(BlockedKind.INTERNAL_ERROR, {}),
+        "blocked-waiting": _blocked_shape(
+            BlockedKind.INTERNAL_ERROR, PROVIDER_WAITING, WorkflowStepStatus.WAITING
+        ),
         "failed": {"status": WorkflowStatus.FAILED},
         "pending-stale": {"status": WorkflowStatus.PENDING},
         "superseded-alone": {"status": WorkflowStatus.SUPERSEDED},
@@ -351,11 +364,12 @@ def test_occupancy_matches_the_shared_rule_on_every_row_shape(store):
 
     assert occupancy == dict(budget_occupancy(store.list_workflows(None, limit=1000)))
     assert occupancy == {
-        CLUSTER: 4,
-        "region": 3,
+        CLUSTER: 5,
+        "region": 4,
         "node:running": 1,
         "node:lapsed": 1,
         "node:blocked-parked": 1,
+        "node:blocked-waiting": 1,
         "node:pred": 1,
     }
 
@@ -481,3 +495,52 @@ def test_never_refused_waiters_are_recorded_by_compare_and_set_in_every_mode(sto
     assert {item.remediation_budget_last_blocked_scope for item in waiting} == {CLUSTER}
     assert {item.remediation_budget_wait_count for item in waiting} == {1}
     assert sum(item.request_id in adapter.started() for item in waiting) == 0
+
+
+def test_a_lapsed_parked_hold_is_released_by_compare_and_set_in_every_mode(store):
+    """Past the longest its reboot can live, the parked record's claims are
+    released (its audit event in the same write) and it stays BLOCKED."""
+
+    parked = seed(store, "a", created_at=NOW)
+    waiter = seed(store, "b", created_at=NOW + timedelta(seconds=1))
+    adapter = UnknownOutcomeAdapter(REBOOT_PLAN, {parked.request_id})
+    executor = budget_executor(store, adapter, ONE_PER_CLUSTER)
+    execute_workflow(executor, parked.request_id)
+    expires = parked_hold_expires_at(store.get_workflow(parked.request_id))
+    assert expires is not None
+    assert store.remediation_budget_occupancy().get(CLUSTER) == 1
+
+    released = release_lapsed_parked_holds(
+        store, BudgetWatch(), now=expires + timedelta(minutes=1)
+    )
+
+    assert released == [parked.request_id]
+    row = store.get_workflow(parked.request_id)
+    assert row.status is WorkflowStatus.BLOCKED and row.remediation_budget_claims == []
+    assert [event.code for event in row.events][-1] == "PARKED_BUDGET_RELEASED"
+    assert store.remediation_budget_occupancy().get(CLUSTER, 0) == 0
+    assert execute_workflow(executor, waiter.request_id).status is (
+        WorkflowStatus.RUNNING
+    )
+
+
+def test_a_waiting_provider_reboot_holds_an_internal_error_record_in_every_mode(store):
+    holder = seed(store, "a", created_at=NOW)
+    store.save_workflow(
+        copy_model(
+            holder,
+            remediation_budget_claims=[CLUSTER, "region", "node:cluster-a:node-a"],
+            **_blocked_shape(
+                BlockedKind.INTERNAL_ERROR, PROVIDER_WAITING, WorkflowStepStatus.WAITING
+            ),
+        )
+    )
+    waiter = seed(store, "b", created_at=NOW + timedelta(seconds=1))
+    executor = budget_executor(
+        store, UnknownOutcomeAdapter(REBOOT_PLAN, set()), ONE_PER_CLUSTER
+    )
+
+    assert store.remediation_budget_occupancy().get(CLUSTER) == 1
+    with pytest.raises(RemediationBudgetError) as refused:
+        execute_workflow(executor, waiter.request_id)
+    assert refused.value.scope == CLUSTER

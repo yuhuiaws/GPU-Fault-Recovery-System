@@ -3081,12 +3081,15 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   a node workflow by default, at most the 1-hour lifetime for a job workflow); a `CHECK_MECHANICALS` waiting for an
   operator's acknowledgement holds no slot. A `BLOCKED` / `NEEDS_OPERATOR` record parked with
   `NODE_ACTION_OUTCOME_UNRESOLVED` also holds its claims, because its reset or reboot may still be running: answer it with
-  `submit-remediation --disposition confirm-node-action` (or end it with `workflow-reconcile`) and its slot frees. A rising
-  `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}` is the starvation guard passing over the waiters
-  of a full scope -- throttling, not a stall; a holder still `RUNNING` past its execution deadline is handled as
-  `GpuFaultWorkflowDeadlineNotEnforced`. `gpu_fault_remediation_budget_over_limit_scopes` above 0 means a scope holds more
-  than its limit (holds re-taken after an upgrade, an older dispatcher still in the roll, or a lowered limit; the dispatcher
-  log names the scope); nothing new enters it until it drains below the limit.
+  `submit-remediation --disposition confirm-node-action` (or end it with `workflow-reconcile`) and its slot frees; so does an
+  `INTERNAL_ERROR` record with a provider reboot still `WAITING`. Unanswered, the dispatcher releases such a slot by itself
+  once the action is older than the longest a node action can live (5520 s;
+  `gpu_fault_remediation_budget_parked_holds_released_total`, event `PARKED_BUDGET_RELEASED`); the record stays `BLOCKED`
+  and still needs the operator. A rising `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}` is the
+  starvation guard passing over the waiters of a full scope -- throttling, not a stall; a holder still `RUNNING` past its
+  execution deadline is handled as `GpuFaultWorkflowDeadlineNotEnforced`. `gpu_fault_remediation_budget_over_limit_scopes`
+  above 0 means a scope holds more than its limit (holds re-taken after an upgrade, an older dispatcher still in the roll, or
+  a lowered limit; the dispatcher log names the scope); nothing new enters it until it drains below the limit.
 - **Boundary**: do not raise the budget directly to clear the alert; first confirm there is no "claim holder no longer
   progressing but still `RUNNING`" or "parked record waiting for its confirmation" situation. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md).
 

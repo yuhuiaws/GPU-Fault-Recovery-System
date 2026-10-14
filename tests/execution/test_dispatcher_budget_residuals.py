@@ -21,12 +21,14 @@ from datetime import datetime, timedelta, timezone
 
 from gpu_fault.execution.remediation_budget import RemediationBudgetPolicy
 from gpu_fault.models import WorkflowStatus
+from gpu_fault.store.shared.remediation_budgets import NODE_ACTION_LONGEST_LIFE_SECONDS
 from tests._builders import build_store, copy_model, workflow_step_execution
 from tests.execution._budget_hold_support import (
     REBOOT,
     REBOOT_PLAN,
     STOP,
     ScriptedAdapter,
+    UnknownOutcomeAdapter,
     all_workflows,
     budget_dispatcher,
     holders,
@@ -278,3 +280,44 @@ def test_an_older_dispatcher_in_the_roll_window_cannot_make_this_one_admit():
     for request_id in queued[2:]:
         assert store.get_workflow(request_id).status is WorkflowStatus.PENDING
         assert request_id not in adapter.started(), adapter.calls
+
+
+def test_the_dispatcher_releases_a_lapsed_parked_hold_in_the_tick_that_admits():
+    """A parked record whose reboot can no longer be running stops holding the
+    cluster's only slot on the dispatcher's own sweep; the waiter behind it is
+    admitted in that very tick and the record stays BLOCKED for the operator."""
+
+    store = build_store()
+    a = seed(store, "a", created_at=NOW)
+    b = seed(store, "b", created_at=NOW + timedelta(seconds=1))
+    adapter = UnknownOutcomeAdapter(REBOOT_PLAN, {a.request_id})
+    dispatcher = budget_dispatcher(store, adapter, ONE_PER_CLUSTER, max_workers=1)
+
+    dispatcher.run_once()
+    assert store.get_workflow(a.request_id).status is WorkflowStatus.BLOCKED
+    assert store.get_workflow(b.request_id).status is WorkflowStatus.PENDING
+
+    parked = store.get_workflow(a.request_id)
+    past = datetime.now(timezone.utc) - timedelta(
+        seconds=NODE_ACTION_LONGEST_LIFE_SECONDS + 60
+    )
+    store.save_workflow(
+        copy_model(
+            parked,
+            lifetime_deadline_at=past,
+            step_executions=[
+                item.model_copy(update={"started_at": past})
+                for item in parked.step_executions
+            ],
+        ),
+        expected=parked,
+    )
+    # The sweep looks once a minute; this tick is the next look.
+    dispatcher.budget_watch.next_parked_sweep_at = past
+    dispatcher.run_once()
+
+    row = store.get_workflow(a.request_id)
+    assert row.status is WorkflowStatus.BLOCKED and row.remediation_budget_claims == []
+    assert dispatcher.budget_watch.parked_holds_released_total == 1
+    assert store.get_workflow(b.request_id).status is WorkflowStatus.RUNNING
+    assert b.request_id in adapter.started(), adapter.calls

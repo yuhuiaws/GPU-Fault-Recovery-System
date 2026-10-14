@@ -135,6 +135,31 @@ def test_budget_scopes_over_their_limit_reach_the_metrics_endpoint(monkeypatch) 
     )
 
 
+def test_released_parked_holds_reach_the_metrics_endpoint(monkeypatch) -> None:
+    context = _context(monkeypatch, "f")
+    app = create_app(context)
+    assert_sample(
+        _scrape(app),
+        "gpu_fault_remediation_budget_parked_holds_released_total",
+        0,
+        process="0",
+    )
+
+    watch = context.dispatcher.budget_watch
+    watch.parked_holds_released_total = 3
+    watch.parked_hold_release_last_seen_timestamp_seconds = 1_790_000_000.5
+    text = _scrape(app)
+
+    assert_samples(
+        text,
+        (
+            'gpu_fault_remediation_budget_parked_holds_released_total{process="0"} 3',
+            "gpu_fault_remediation_budget_parked_hold_release_last_seen_timestamp_seconds"
+            " 1790000000.500",
+        ),
+    )
+
+
 def test_completion_decision_and_incident_state_gauges_are_zero_filled(
     monkeypatch,
 ) -> None:

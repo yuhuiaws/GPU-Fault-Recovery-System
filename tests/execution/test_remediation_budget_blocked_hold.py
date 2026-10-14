@@ -12,14 +12,25 @@ or its receipts settle it; every other BLOCKED kind releases at once.
 
 from __future__ import annotations
 
+import inspect
+import logging
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from gpu_fault.cluster_executor.executor import ClusterActionExecutor
+from gpu_fault.cluster_executor.lease import DEFAULT_MAX_EXECUTION_SECONDS
+from gpu_fault.execution.budget_guard import BudgetWatch, release_lapsed_parked_holds
+from gpu_fault.execution.config import ProductionExecutorConfig
 from gpu_fault.execution.remediation_budget import RemediationBudgetPolicy
 from gpu_fault.models import BlockedKind, WorkflowStatus, WorkflowStepStatus
 from gpu_fault.store import InMemoryStore, RemediationBudgetError, SqliteStore
-from gpu_fault.store.shared.remediation_budgets import budget_occupancy
+from gpu_fault.store.shared.remediation_budgets import (
+    NODE_ACTION_LONGEST_LIFE_SECONDS,
+    NODE_ACTION_SETTLE_SECONDS,
+    budget_occupancy,
+    parked_hold_expires_at,
+)
 from tests._builders import (
     copy_model,
     execute_workflow,
@@ -116,14 +127,26 @@ def test_a_reconcile_that_ends_the_parked_record_releases_its_budget(store):
     assert execute_workflow(executor, b.request_id).status is WorkflowStatus.RUNNING
 
 
-def _blocked(name: str, kind: BlockedKind | None, *, unresolved: bool):
+# A provider reboot still WAITING carries no outcome flag: the HyperPod
+# lifecycle adapter's record of a submitted reboot it is still polling.
+PROVIDER_WAITING = {"submitted_nodes": ["node"], "activated_spare_nodes": []}
+
+
+def _blocked(
+    name: str, kind: BlockedKind | None, *, unresolved: bool, waiting: bool = False
+):
     reboot = workflow_step_execution(
         1,
         REBOOT,
-        WorkflowStepStatus.FAILED,
+        WorkflowStepStatus.WAITING if waiting else WorkflowStepStatus.FAILED,
         details=(
-            dict(UNKNOWN_OUTCOME) if unresolved else {"node_action_outcome_known": True}
+            dict(PROVIDER_WAITING)
+            if waiting
+            else dict(UNKNOWN_OUTCOME)
+            if unresolved
+            else {"node_action_outcome_known": True}
         ),
+        started_at=NOW,
     )
     return workflow_request(
         f"workflow-{name}",
@@ -148,9 +171,11 @@ def test_each_blocked_kind_holds_only_while_its_node_may_still_be_mid_action():
     unresolved, its node holds only paperwork: released. INTERNAL_ERROR also
     occupies its node and the shared predicate keeps one with an unresolved
     action (the terminal funnel parks such a record NEEDS_OPERATOR, so only an
-    older writer leaves one); without one it holds nothing. SAFETY_SETTLED ran
-    its safety plan to the end and a legacy BLOCKED without a kind no longer
-    occupies its node: released whatever the action says.
+    older writer leaves one) and, failing closed, one whose provider reboot is
+    still WAITING (no outcome flag, nothing polls it any more); without either
+    it holds nothing. SAFETY_SETTLED ran its safety plan to the end and a
+    legacy BLOCKED without a kind no longer occupies its node: released
+    whatever the action says.
     """
 
     parked = _blocked("parked", BlockedKind.NEEDS_OPERATOR, unresolved=True)
@@ -164,14 +189,134 @@ def test_each_blocked_kind_holds_only_while_its_node_may_still_be_mid_action():
         _blocked("answered", BlockedKind.NEEDS_OPERATOR, unresolved=False),
         _blocked("internal-unknown", BlockedKind.INTERNAL_ERROR, unresolved=True),
         _blocked("internal", BlockedKind.INTERNAL_ERROR, unresolved=False),
+        _blocked(
+            "internal-waiting",
+            BlockedKind.INTERNAL_ERROR,
+            unresolved=False,
+            waiting=True,
+        ),
         _blocked("settled", BlockedKind.SAFETY_SETTLED, unresolved=True),
         _blocked("legacy", None, unresolved=True),
     ]
 
     assert budget_occupancy(rows) == {
-        CLUSTER: 2,
-        "region": 2,
+        CLUSTER: 3,
+        "region": 3,
         "node:cluster-a:node-parked": 1,
         "node:cluster-a:node-internal-unknown": 1,
+        "node:cluster-a:node-internal-waiting": 1,
     }
-    assert budget_occupancy(rows, claimant=parked.request_id)[CLUSTER] == 1
+    assert budget_occupancy(rows, claimant=parked.request_id)[CLUSTER] == 2
+
+
+# ------------------------------------------------- the longest an action lives
+
+
+def test_a_parked_hold_lasts_the_longest_a_node_action_can_live():
+    """The bound is derived from the limits the code already enforces: the node
+    workflow lifetime every step ceiling stays inside, the cluster executor's
+    execution cap and one command lease -- and never ends before the record's
+    own lifetime plus what a held command can still run past it."""
+
+    lease = inspect.signature(ClusterActionExecutor).parameters["lease_seconds"]
+    assert NODE_ACTION_SETTLE_SECONDS == DEFAULT_MAX_EXECUTION_SECONDS + lease.default
+    lifetime = ProductionExecutorConfig.from_mapping({}).node_workflow_lifetime_seconds
+    assert NODE_ACTION_LONGEST_LIFE_SECONDS == lifetime + NODE_ACTION_SETTLE_SECONDS
+
+    parked = _blocked("parked", BlockedKind.NEEDS_OPERATOR, unresolved=True)
+    longest = timedelta(seconds=NODE_ACTION_LONGEST_LIFE_SECONDS)
+    assert parked_hold_expires_at(parked) == NOW + longest
+    floored = copy_model(parked, lifetime_deadline_at=NOW + timedelta(days=1))
+    assert parked_hold_expires_at(floored) == NOW + timedelta(
+        days=1, seconds=NODE_ACTION_SETTLE_SECONDS
+    ), "an acknowledgement-floored lifetime keeps the hold to its own end"
+    assert (
+        parked_hold_expires_at(
+            _blocked("answered", BlockedKind.NEEDS_OPERATOR, unresolved=False)
+        )
+        is None
+    )
+
+
+def _released_events(row):
+    return [event for event in row.events if event.code == "PARKED_BUDGET_RELEASED"]
+
+
+def test_a_lapsed_parked_hold_is_released_once_and_the_record_stays_blocked(
+    store, caplog
+):
+    a, b, _, executor = _park_a(store)
+    parked = store.get_workflow(a.request_id)
+    expires = parked_hold_expires_at(parked)
+    assert expires is not None
+    watch = BudgetWatch()
+
+    assert (
+        release_lapsed_parked_holds(store, watch, now=expires - timedelta(seconds=1))
+        == []
+    )
+    assert store.remediation_budget_occupancy().get(CLUSTER) == 1, (
+        "a hold released before its action can have ended"
+    )
+
+    caplog.set_level(logging.WARNING, logger="gpu_fault.execution.budget_guard")
+    later = expires + timedelta(minutes=5)
+    assert release_lapsed_parked_holds(store, watch, now=later) == [a.request_id]
+
+    row = store.get_workflow(a.request_id)
+    assert row.status is WorkflowStatus.BLOCKED
+    assert row.blocked_kind is BlockedKind.NEEDS_OPERATOR
+    assert row.remediation_budget_claims == []
+    (event,) = _released_events(row)
+    assert event.actor == "dispatcher"
+    assert event.details["released_budget_claims"] == sorted(
+        parked.remediation_budget_claims
+    )
+    assert event.details["action_bound_seconds"] == NODE_ACTION_LONGEST_LIFE_SECONDS
+    assert event.details["action_age_seconds"] >= NODE_ACTION_LONGEST_LIFE_SECONDS
+    assert watch.parked_holds_released_total == 1
+    assert watch.parked_hold_release_last_seen_timestamp_seconds > 0
+    assert store.remediation_budget_occupancy().get(CLUSTER, 0) == 0
+    assert execute_workflow(executor, b.request_id).status is WorkflowStatus.RUNNING
+
+    # Logged and audited once: the record holds nothing for a later look.
+    assert (
+        release_lapsed_parked_holds(store, watch, now=later + timedelta(hours=1)) == []
+    )
+    assert len(_released_events(store.get_workflow(a.request_id))) == 1
+    released_logs = [
+        record for record in caplog.records if a.request_id in record.getMessage()
+    ]
+    assert len(released_logs) == 1, [record.getMessage() for record in released_logs]
+
+
+def test_an_internal_error_record_with_a_waiting_provider_reboot_holds_until_the_bound(
+    store,
+):
+    """Fail closed: the dispatcher blocked the record while a HyperPod reboot
+    was still WAITING; nothing polls it any more, so its slot stays taken until
+    the reboot can no longer be running."""
+
+    holder = copy_model(
+        _blocked("a", BlockedKind.INTERNAL_ERROR, unresolved=False, waiting=True),
+        incident_id="incident-a",
+        execution_epoch=1,
+    )
+    store.save_workflow(holder)
+    waiter = seed(store, "b", created_at=NOW + timedelta(seconds=1))
+    executor = budget_executor(
+        store, UnknownOutcomeAdapter(REBOOT_PLAN, set()), ONE_PER_CLUSTER
+    )
+
+    with pytest.raises(RemediationBudgetError) as refused:
+        execute_workflow(executor, waiter.request_id)
+    assert refused.value.scope == CLUSTER
+
+    expires = parked_hold_expires_at(store.get_workflow(holder.request_id))
+    assert expires == NOW + timedelta(seconds=NODE_ACTION_LONGEST_LIFE_SECONDS)
+    watch = BudgetWatch()
+    assert release_lapsed_parked_holds(store, watch, now=expires) == [holder.request_id]
+    assert store.get_workflow(holder.request_id).status is WorkflowStatus.BLOCKED
+    assert execute_workflow(executor, waiter.request_id).status is (
+        WorkflowStatus.RUNNING
+    )

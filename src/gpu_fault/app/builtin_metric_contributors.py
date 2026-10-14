@@ -670,15 +670,15 @@ def _dispatch_pending_state_lines(ctx: object, dispatcher: object) -> list[str]:
             "gpu_fault_workflow_dispatch_filtered_total"
             f'{{reason="{_escape_label(reason)}"}} {count}'
         )
-    return lines + _budget_over_limit_lines(getattr(dispatcher, "budget_watch", None))
+    return lines + _budget_watch_lines(getattr(dispatcher, "budget_watch", None))
 
 
-def _budget_over_limit_lines(watch: BudgetWatch | None) -> list[str]:
-    """Budget scopes the dispatcher found above their limit (§9.5). Only the
-    process holding the dispatch lease reads them; the others report zero."""
+def _budget_watch_lines(watch: BudgetWatch | None) -> list[str]:
+    """Budget scopes the dispatcher found above their limit and the parked
+    holds it released (§9.5). Only the dispatch-lease holder moves them."""
 
-    over = watch.over_limit_by_scope_type() if watch is not None else {}
-    seen = watch.over_limit_last_seen_timestamp_seconds if watch is not None else 0.0
+    watch = watch if watch is not None else BudgetWatch()
+    over = watch.over_limit_by_scope_type()
     return [
         "# HELP gpu_fault_remediation_budget_over_limit_scopes Remediation budget scopes whose holders exceed the configured limit at this process's last dispatch cycle, by scope type: holds re-taken after an upgrade from a release that dropped them, an older dispatcher still in the roll, or a lowered limit. Nothing new is admitted into such a scope until it drains below its limit.",
         "# TYPE gpu_fault_remediation_budget_over_limit_scopes gauge",
@@ -688,7 +688,13 @@ def _budget_over_limit_lines(watch: BudgetWatch | None) -> list[str]:
         ),
         "# HELP gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds Unix time this process's dispatcher last found a remediation budget scope above its limit; 0 if never (ARCH-E E4).",
         "# TYPE gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds gauge",
-        f"gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds {seen:.3f}",
+        f"gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds {watch.over_limit_last_seen_timestamp_seconds:.3f}",
+        "# HELP gpu_fault_remediation_budget_parked_holds_released_total Parked BLOCKED records whose remediation budget this process's dispatcher released because their node action was older than the longest a node action can live; each record stays BLOCKED for the operator.",
+        "# TYPE gpu_fault_remediation_budget_parked_holds_released_total counter",
+        f"gpu_fault_remediation_budget_parked_holds_released_total {watch.parked_holds_released_total}",
+        "# HELP gpu_fault_remediation_budget_parked_hold_release_last_seen_timestamp_seconds Unix time this process's dispatcher last released a parked record's remediation budget; 0 if never (ARCH-E E4).",
+        "# TYPE gpu_fault_remediation_budget_parked_hold_release_last_seen_timestamp_seconds gauge",
+        f"gpu_fault_remediation_budget_parked_hold_release_last_seen_timestamp_seconds {watch.parked_hold_release_last_seen_timestamp_seconds:.3f}",
     ]
 
 

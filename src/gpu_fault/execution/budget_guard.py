@@ -41,6 +41,13 @@ per tick; ``BudgetWatch`` keeps the scopes above their limit for /metrics and
 logs every change. Nothing new is admitted into a full or over-limit scope --
 the store refuses it, the guard passes it over -- until it drains below its
 limit.
+
+Parked holds. A BLOCKED record whose node action may still be running keeps
+its claims (``store.shared.remediation_budgets.held_while_blocked``) -- but
+only for as long as that action can live: ``release_lapsed_parked_holds``
+releases them once ``parked_hold_expires_at`` has passed, in one
+compare-and-set write with its audit event, counted and logged once. The
+record itself stays BLOCKED for the operator.
 """
 
 from __future__ import annotations
@@ -48,7 +55,7 @@ from __future__ import annotations
 import logging
 import time
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from gpu_fault.execution.config import ProductionExecutorConfig
 from gpu_fault.execution.remediation_budget import (
@@ -70,6 +77,9 @@ from gpu_fault.store.shared.errors import StaleWriteError
 from gpu_fault.store.shared.remediation_budgets import (
     blocked_by_remediation_budget,
     budget_full_reason,
+    held_while_blocked,
+    parked_hold_expires_at,
+    released_parked_hold,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -83,6 +93,12 @@ FRESH_WAITER_STORE_CALLS = 1000
 CLUSTER_CACHE_LIMIT = 50_000
 # Every scope kind ``scope_limit`` knows, exported at zero when not over.
 SCOPE_TYPES = ("class", "cluster", "domain", "node", "region")
+# The parked-hold sweep: the bound it applies is over an hour, so a minute
+# between looks costs nothing; the newest BLOCKED rows, as the sibling
+# BLOCKED sweeps read them.
+PARKED_SWEEP_INTERVAL = timedelta(seconds=60)
+PARKED_SWEEP_LIMIT = 1000
+DISPATCHER_ACTOR = "dispatcher"
 
 
 class BudgetWatch:
@@ -94,6 +110,9 @@ class BudgetWatch:
         # scope -> (holders, configured limit), from the last tick's read.
         self.over_limit: dict[str, tuple[int, int]] = {}
         self.over_limit_last_seen_timestamp_seconds = 0.0
+        self.parked_holds_released_total = 0
+        self.parked_hold_release_last_seen_timestamp_seconds = 0.0
+        self.next_parked_sweep_at = datetime.min.replace(tzinfo=timezone.utc)
 
     def guard(
         self, store: ControlPlaneStore, config: ProductionExecutorConfig
@@ -275,3 +294,55 @@ def released_status(
     if scanned.status in EXECUTABLE_WORKFLOW_STATUSES:
         return scanned.status
     return current.status
+
+
+def release_lapsed_parked_holds(
+    store: ControlPlaneStore, watch: BudgetWatch, *, now: datetime
+) -> list[str]:
+    """Release the claims of parked records past the longest their node
+    action can live (§9.5); returns the ids released. At most one look per
+    ``PARKED_SWEEP_INTERVAL``; one isolated compare-and-set write per record."""
+
+    if now < watch.next_parked_sweep_at:
+        return []
+    watch.next_parked_sweep_at = now + PARKED_SWEEP_INTERVAL
+    released: list[str] = []
+    for workflow in store.list_workflows(
+        {WorkflowStatus.BLOCKED}, limit=PARKED_SWEEP_LIMIT, newest_first=True
+    ):
+        expires = parked_hold_expires_at(workflow)
+        if (
+            not workflow.remediation_budget_claims
+            or not held_while_blocked(workflow)
+            or expires is None
+            or now < expires
+        ):
+            continue
+        try:
+            record = released_parked_hold(workflow, now=now, actor=DISPATCHER_ACTOR)
+            store.save_workflow(record, expected=workflow)
+        except (StaleWriteError, NotFoundError):
+            continue  # the row moved since the read: the next look decides
+        except Exception as exc:  # noqa: BLE001 - one row, not the sweep (D-4)
+            if transient_store_error(exc):
+                raise
+            LOGGER.exception(
+                "parked hold of %s could not be released; left for the next look",
+                workflow.request_id,
+            )
+            continue
+        watch.parked_holds_released_total += 1
+        watch.parked_hold_release_last_seen_timestamp_seconds = time.time()
+        released.append(workflow.request_id)
+        details = record.events[-1].details
+        LOGGER.warning(
+            "parked workflow %s (%s): remediation budget released, its node "
+            "action started %ss ago and can live at most %ss; released claims "
+            "%s; the record stays BLOCKED for the operator",
+            workflow.request_id,
+            workflow.blocked_kind.value if workflow.blocked_kind else None,
+            details["action_age_seconds"],
+            details["action_bound_seconds"],
+            details["released_budget_claims"],
+        )
+    return released

@@ -15,10 +15,13 @@ therefore counts:
   from the successor's own count), and the reservation ends with the
   successor's claim or its end -- exactly one hold through the handoff;
 * a BLOCKED workflow that still occupies its node (``workflow_is_open``:
-  NEEDS_OPERATOR, INTERNAL_ERROR) with a node action whose outcome is still
-  unresolved: the reset or reboot may still be running, so the slot stays
-  taken until an operator answers it (``confirm-node-action``), a reconcile
-  ends the record, or the receipt-settled sweep re-opens it to claim again.
+  NEEDS_OPERATOR, INTERNAL_ERROR) with a node action that may still be
+  running -- an unresolved outcome, or a provider or agent action still
+  WAITING: the slot stays taken until an operator answers it
+  (``confirm-node-action``), a reconcile ends the record, the receipt-settled
+  sweep re-opens it to claim again, or the action is older than the longest
+  a node action can live (``parked_hold_expires_at``), when the dispatcher
+  releases the claims and leaves the record BLOCKED for the operator.
 
 Every other BLOCKED record holds nothing: a settled safety plan ran to its
 end, a legacy record without a kind no longer occupies its node, and a parked
@@ -30,13 +33,40 @@ from __future__ import annotations
 
 from collections import Counter
 from collections.abc import Iterable, Mapping
-from datetime import datetime
+from datetime import datetime, timedelta
 
-from gpu_fault.execution.node_action_uncertainty import has_unresolved_node_action
-from gpu_fault.models import WorkflowRequest, WorkflowStatus, workflow_is_open
+from gpu_fault.execution.node_action_uncertainty import (
+    latest_node_action_executions,
+    operator_confirmation,
+    unresolved_node_action,
+)
+from gpu_fault.models import (
+    WorkflowEventCode,
+    WorkflowEventKind,
+    WorkflowRequest,
+    WorkflowStatus,
+    WorkflowStepExecution,
+    WorkflowStepStatus,
+    record_workflow_event,
+    workflow_is_open,
+)
 from gpu_fault.store.shared.errors import RemediationBudgetError
 
 _SUCCESSOR_WAITING = frozenset({WorkflowStatus.PENDING, WorkflowStatus.SAFETY_PENDING})
+# The longest a node action can live, and so how long a parked record's hold
+# can matter (§9.5). The action's step waits at most its ceiling, and every
+# ceiling stays inside the node workflow lifetime
+# (``execution.config.validate_timing_relationships``;
+# GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS, 3600 s by default). A step that
+# gives up cancels its remote commands and the dispatcher cancels what a
+# terminal record left open (``orphaned_commands``), so nothing of it starts
+# afterwards; a command an executor already holds runs at most the cluster
+# executor's execution cap (``cluster_executor.lease.
+# DEFAULT_MAX_EXECUTION_SECONDS``, 1800 s, "longer than the slowest legitimate
+# action") plus one command lease (``ClusterActionExecutor``'s default, 120 s)
+# before its verdict lands or the lease lapses.
+NODE_ACTION_SETTLE_SECONDS = 1800 + 120
+NODE_ACTION_LONGEST_LIFE_SECONDS = 3600 + NODE_ACTION_SETTLE_SECONDS
 
 
 def reserved_for(
@@ -54,6 +84,22 @@ def reserved_for(
     )
 
 
+def parked_node_actions(workflow: WorkflowRequest) -> list[WorkflowStepExecution]:
+    """The record's own node actions that may still be running: an unresolved
+    outcome, or a provider or agent action still WAITING that no operator
+    answered (the newest record of each step answers)."""
+
+    return [
+        execution
+        for execution in latest_node_action_executions(workflow)
+        if unresolved_node_action(execution)
+        or (
+            execution.status is WorkflowStepStatus.WAITING
+            and operator_confirmation(execution.details) is None
+        )
+    ]
+
+
 def held_while_blocked(workflow: WorkflowRequest) -> bool:
     """Whether a BLOCKED record still holds its claims: it occupies its node
     and a node action of its own may still be running."""
@@ -61,7 +107,71 @@ def held_while_blocked(workflow: WorkflowRequest) -> bool:
     return (
         workflow.status is WorkflowStatus.BLOCKED
         and workflow_is_open(workflow.status, workflow.blocked_kind)
-        and has_unresolved_node_action(workflow)
+        and bool(parked_node_actions(workflow))
+    )
+
+
+def parked_hold_expires_at(workflow: WorkflowRequest) -> datetime | None:
+    """When none of a parked record's node actions can still be running.
+
+    The newest action's start plus the longest a node action can live, and
+    never before the record's own hard lifetime (``lifetime_deadline_at``,
+    which a configured lifetime or an operator-acknowledgement floor moves)
+    plus what a held command can still run past it. ``None`` without one.
+    """
+
+    actions = parked_node_actions(workflow)
+    if not actions:
+        return None
+    expires = max(item.started_at for item in actions) + timedelta(
+        seconds=NODE_ACTION_LONGEST_LIFE_SECONDS
+    )
+    if workflow.lifetime_deadline_at is not None:
+        expires = max(
+            expires,
+            workflow.lifetime_deadline_at
+            + timedelta(seconds=NODE_ACTION_SETTLE_SECONDS),
+        )
+    return expires
+
+
+def released_parked_hold(
+    workflow: WorkflowRequest, *, now: datetime, actor: str
+) -> WorkflowRequest:
+    """``workflow`` with its claims released and the audit event appended
+    (the action's age and the bound it passed); the record stays BLOCKED."""
+
+    expires = parked_hold_expires_at(workflow)
+    if expires is None or now < expires:
+        raise ValueError(f"{workflow.request_id} still holds a node action in flight")
+    actions = parked_node_actions(workflow)
+    started = max(item.started_at for item in actions)
+    age = int((now - started).total_seconds())
+    bound = int((expires - started).total_seconds())
+    released = workflow.model_copy(
+        update={"remediation_budget_claims": [], "updated_at": now}
+    )
+    return record_workflow_event(
+        released,
+        WorkflowEventKind.OPERATOR_RECONCILED,
+        code=WorkflowEventCode.PARKED_BUDGET_RELEASED.value,
+        actor=actor,
+        status=workflow.status.value,
+        reason=(
+            f"remediation budget released: the node action started {age}s ago, "
+            f"past the {bound}s it can live; the record stays BLOCKED"
+        ),
+        details={
+            "released_budget_claims": sorted(workflow.remediation_budget_claims),
+            "node_actions": [
+                f"{item.step_index}/{item.operation.value}" for item in actions
+            ],
+            "action_started_at": started.isoformat(),
+            "action_age_seconds": age,
+            "action_bound_seconds": bound,
+            "hold_expired_at": expires.isoformat(),
+        },
+        at=now,
     )
 
 
