@@ -1968,7 +1968,8 @@ stream the lane probe does not hold keeps 0.5s only while a fault-tier row is PE
 row can only be silent behind a PENDING one; a row under a live lease silences nothing) and otherwise waits on the 5s
 notification fallback, asking for that backlog once the fallback would lengthen its interval, settled or not, and
 reusing a backlog answer for one fallback interval; a lane the probe reports held keeps the FAULT stream at 0.1s while a
-fault-tier row waits and at the 0.4s busy backoff otherwise; overload returns
+fault-tier row waits and at the 0.4s busy backoff otherwise; a finished worker of any pool wakes the claim loop at once,
+so a freed slot is refilled without waiting for a stream deadline; overload returns
 429 + `Retry-After: 2`.
 
 **⑧ Idempotency and concurrency control**: the four-tuple `lease_owner` + `leader_epoch` + random `lease_token` +

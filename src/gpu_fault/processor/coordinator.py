@@ -32,7 +32,7 @@ from gpu_fault.processor.batching import (
     HOST_TELEMETRY_BATCH_SIZE,
     telemetry_batch_size,
 )
-from gpu_fault.processor.lane_runtime import FaultSlotWake, ProcessorLaneRuntimeMixin
+from gpu_fault.processor.lane_runtime import ProcessorLaneRuntimeMixin, SlotWake
 from gpu_fault.processor.metrics import ProcessorMetricsMixin
 from gpu_fault.processor.claim_backoff import BackoffCeilings, empty_round_ceiling
 from gpu_fault.processor.models import (
@@ -292,7 +292,7 @@ class ProcessorCoordinator(
         self._leadership: ProcessorLeadership | None = None
         self._stop = Event()
         self._work_available = Event()
-        self._fault_slot_wake = FaultSlotWake(self._work_available)
+        self._slot_wake = SlotWake(self._work_available)
         self._notifications_enabled = False
         self._notification_listener_connected = False
         self._notification_shardless_episodes_total = 0
@@ -667,7 +667,10 @@ class ProcessorCoordinator(
             for name, count in self.worker_counts.items()
             if count > 0
         }
-        futures: dict[str, set[Future]] = {name: set() for name in pools}
+        # Every future added here wakes the claim loop as it finishes (SlotWake).
+        futures: dict[str, set[Future]] = {
+            name: self._slot_wake.futures(name) for name in pools
+        }
         with self._state_lock:
             self._processor_consumer_running = True
             self._consumer_last_cycle_monotonic = time.monotonic()
@@ -712,7 +715,7 @@ class ProcessorCoordinator(
                 self._stream_idle_until.pop(stream, None)
                 self._stream_idle_interval.pop(stream, None)
                 self._stream_empty_rounds.pop(stream, None)
-        if self._fault_slot_wake.take():
+        if "fault" in self._slot_wake.take():
             self._stream_idle_until.pop("fault", None)
         self._check_execution_deadlines()
         for name, pool_futures in futures.items():
@@ -787,10 +790,7 @@ class ProcessorCoordinator(
                 if available[pool_name] <= 0:
                     self._release(item)
                     continue
-                future = pools[pool_name].submit(self._process, item)
-                if pool_name == "fault":
-                    future.add_done_callback(self._fault_slot_wake.worker_finished)
-                futures[pool_name].add(future)
+                futures[pool_name].add(pools[pool_name].submit(self._process, item))
                 available[pool_name] -= 1
             while observation_requests:
                 batch = observation_requests[: self._OBSERVATION_BATCH_SIZE]
@@ -840,9 +840,9 @@ class ProcessorCoordinator(
                     else None,
                 )
             if not requests or not self._claim_saturated:
-                # Nothing claimed, or no claim filled its limit: the next round would
-                # re-run the claim against the same drained or lane-blocked backlog,
-                # so sleep to the next stream deadline (a wake cuts it short).
+                # Nothing claimed, or no claim filled its limit: re-running the claim
+                # now would find the same drained or lane-blocked backlog, so sleep to
+                # the next stream deadline; an edge or a finished worker cuts it short.
                 self._wait_for_work(self._next_claim_wait_seconds())
         except Exception:
             LOGGER.exception("processor request cycle failed")

@@ -27,7 +27,7 @@ waited in 5 s steps. The invariant the coordinator keeps instead: while a
 fault worker is free the fault stream is claimed at least every
 ``fault_idle`` (rounded up to the poll), one poll after a claim that returned
 rows without filling its limit, and at once when a fault worker finishes
-(``FaultSlotWake``). A silent priority-0 row therefore waits at most about
+(``SlotWake``). A silent priority-0 row therefore waits at most about
 ``fault_idle``; the routine streams keep the fallback, their documented
 polling contract.
 
@@ -54,11 +54,11 @@ lease that lapses after the read; each waits for the stream's next poll, at
 most the fallback (the lease-reclaim sweep hands a lapsed row back to PENDING,
 which the trigger announces too). The lane probe comes first, as on every
 stream: a lane-blocked backlog keeps the stream polling, because no edge
-announces a freed lane and ``FaultSlotWake`` covers only this process's fault
-pool (collector health, admin and fleet rows also queue behind holders in
-other pools and processes) -- at the fault busy ceiling while a fault-tier row
-waits, and at the routine busy ceiling, the one those rows get on a routine
-stream, while none does.
+announces a freed lane and only a fault worker finishing in this process
+claims the fault stream at once (``SlotWake``; collector health, admin and
+fleet rows also queue behind holders in other pools and processes) -- at the
+fault busy ceiling while a fault-tier row waits, and at the routine busy
+ceiling, the one those rows get on a routine stream, while none does.
 """
 
 from __future__ import annotations

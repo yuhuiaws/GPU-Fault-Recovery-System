@@ -19,6 +19,11 @@ none waits on the edge notification (the 5 s fallback). A backlog keeps the
 0.5 s cadence and is believed for one fallback interval; a row under a live
 lease is no backlog. A lane-blocked backlog keeps 0.1 s while a fault-tier row
 waits and the routine busy ceiling, 0.4 s, while none does.
+
+With the fault stream out at the fallback, its 0.5 s polls were no longer the
+claim loop's timer, and a standing telemetry backlog raises no edge: freed gpu
+and host slots waited for the next stream deadline. A finished worker of any
+pool now wakes the loop, so its slot is refilled at once.
 """
 
 from __future__ import annotations
@@ -26,7 +31,7 @@ from __future__ import annotations
 import json
 import logging
 import time
-from concurrent.futures import Future
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Event, Lock, Thread
 from types import SimpleNamespace
@@ -34,6 +39,7 @@ from typing import Any, Callable
 
 import pytest
 
+from gpu_fault.channel_registry import GPU_METRICS_PATH, HOST_TELEMETRY_PATH
 from gpu_fault.processor import (
     ProcessorCoordinator,
     ProcessorLeaseSettings,
@@ -42,7 +48,7 @@ from gpu_fault.processor import (
     telemetry_spool,
 )
 from gpu_fault.processor.claim_backoff import BackoffCeilings, empty_round_ceiling
-from gpu_fault.processor.lane_runtime import FaultSlotWake
+from gpu_fault.processor.lane_runtime import SlotWake
 from gpu_fault.store import SqliteStore
 from tests._builders import build_store, processor_request
 
@@ -635,29 +641,169 @@ def test_a_backlog_the_store_cannot_count_keeps_the_fault_stream_polling(
     ] == ["processor fault backlog probe failed"] * 10
 
 
-def test_finished_fault_workers_coalesce_into_one_wake() -> None:
+def test_finished_workers_of_every_pool_coalesce_into_one_wake() -> None:
     work_available = Event()
-    slots = FaultSlotWake(work_available)
-    assert slots.take() is False
-    futures: list[Future[None]] = [Future() for _ in range(16)]
-    for future in futures:
-        future.add_done_callback(slots.worker_finished)
-    threads = [Thread(target=future.set_result, args=(None,)) for future in futures]
-    for thread in threads:
-        thread.start()
-    for thread in threads:
-        thread.join(timeout=5)
+    slots = SlotWake(work_available)
+    assert slots.take() == frozenset()
+    release = Event()
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {name: slots.futures(name) for name in ("fault", "gpu")}
+        for name in ("fault", "gpu") * 4:
+            futures[name].add(pool.submit(release.wait, 5))
+        assert not work_available.is_set(), "a running worker wakes nobody"
+        release.set()
+    assert all(
+        future.done() for pool_futures in futures.values() for future in pool_futures
+    ), "every worker finished"
 
-    assert work_available.is_set(), "a finished fault worker wakes the claim loop"
-    assert slots.take() is True
-    assert slots.take() is False, "sixteen finished workers are one wake"
+    assert work_available.is_set(), "a finished worker wakes the claim loop"
+    assert slots.take() == {"fault", "gpu"}
+    assert slots.take() == frozenset(), "eight finished workers are one wake"
 
     work_available.clear()
-    finished: Future[None] = Future()
-    finished.set_result(None)
-    finished.add_done_callback(slots.worker_finished)
+    done: Future[None] = Future()
+    done.set_result(None)
+    slots.futures("host").add(done)
     assert work_available.is_set(), "a future that is already done wakes at once"
-    assert slots.take() is True
+    assert slots.take() == {"host"}
+
+
+class _SlowClaims:
+    """A store whose claims each take ``seconds``, like a loaded database."""
+
+    def __init__(self, store: Any, seconds: float) -> None:
+        self._store = store
+        self._seconds = seconds
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+    def claim_active_processor_requests(self, *args: Any, **kwargs: Any) -> Any:
+        time.sleep(self._seconds)
+        return self._store.claim_active_processor_requests(*args, **kwargs)
+
+
+class _BatchResponse(_Response):
+    def __init__(self, request_ids: list[str]) -> None:
+        self._body = json.dumps(
+            {
+                "results": [
+                    {"request_id": request_id, "status": 200, "body": {}}
+                    for request_id in request_ids
+                ]
+            }
+        ).encode()
+
+    def read(self) -> bytes:
+        return self._body
+
+
+class _TelemetryReplay:
+    """The local telemetry batch replay: every batch takes ``seconds``, and the
+    replay counts how many batches run at once."""
+
+    def __init__(self, seconds: float) -> None:
+        self.seconds = seconds
+        self.running = 0
+        self._lock = Lock()
+
+    def __call__(self, request: Any, **_kwargs: Any) -> _BatchResponse:
+        items = json.loads(request.data)["items"]
+        with self._lock:
+            self.running += 1
+        try:
+            time.sleep(self.seconds)
+        finally:
+            with self._lock:
+                self.running -= 1
+        return _BatchResponse([item["request_id"] for item in items])
+
+
+def _routine_telemetry(path: str, index: int) -> Any:
+    # One node per row, so no two rows share a lane or coalesce.
+    return processor_request(
+        path,
+        body=json.dumps(
+            {"node_id": f"node-{index}", "edge_filter_reasons": ["health-summary"]}
+        ).encode(),
+    )
+
+
+def _telemetry_backlog_coordinator(store: Any) -> ProcessorCoordinator:
+    # A 4 s poll clamps every backoff ceiling to 4 s: only a wake claims sooner.
+    return ProcessorCoordinator(
+        store,
+        owner_id="pod-a:1",
+        internal_token="token-" + "x" * 32,
+        local_url="http://127.0.0.1:1",
+        pools=ProcessorPoolSettings(
+            fault_worker_count=1,
+            observation_worker_count=1,
+            gpu_telemetry_worker_count=4,
+            host_telemetry_worker_count=4,
+        ),
+        lease=ProcessorLeaseSettings(poll_seconds=4.0),
+        active_consumers=True,
+    )
+
+
+def test_a_freed_telemetry_slot_is_refilled_at_once(
+    monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest
+) -> None:
+    """A standing telemetry backlog raises no notification edge, and with no
+    fault-tier row the fault stream sleeps out to the fallback, so only a
+    finished worker can tell the claim loop that a slot is free. In a burst
+    whose fault rows came last, freed gpu and host slots stayed empty until
+    the next stream deadline (761 rows in flight instead of 1,152)."""
+
+    store = build_store()
+    for index in range(200):
+        store.enqueue_processor_request(_routine_telemetry(GPU_METRICS_PATH, index))
+        store.enqueue_processor_request(_routine_telemetry(HOST_TELEMETRY_PATH, index))
+    replay = _TelemetryReplay(1.0)
+    monkeypatch.setattr("gpu_fault.processor.coordinator.urlopen", replay)
+    processor = _telemetry_backlog_coordinator(_SlowClaims(store, 0.01))
+    thread = Thread(target=processor.run_processor, daemon=True)
+    thread.start()
+    try:
+        assert _wait_until(lambda: replay.running == 8, 5), "the pools never filled"
+        samples = []
+        # Three batch generations, all before the first 4 s stream deadline.
+        window_end = time.monotonic() + 3.0
+        while time.monotonic() < window_end:
+            samples.append(replay.running)
+            time.sleep(0.01)
+        claim = processor.metrics_snapshot()["claim"]
+    finally:
+        processor.stop()
+        thread.join(timeout=10)
+    assert not thread.is_alive(), "the claim loop did not stop"
+
+    occupancy = sum(samples) / (8 * len(samples))
+    request.node.user_properties.append(("slot_occupancy", round(occupancy, 3)))
+    assert occupancy >= 0.9, (
+        f"the eight gpu and host slots were busy {occupancy:.0%} of the window"
+    )
+    assert claim["rounds_by_stream"]["fault"] == 1, (
+        "a finished telemetry worker does not re-poll the idle fault stream"
+    )
+
+
+def test_an_idle_claim_loop_sleeps_to_its_stream_deadlines() -> None:
+    """No worker runs, so nothing wakes the loop before its next deadline."""
+
+    processor = _telemetry_backlog_coordinator(build_store())
+    thread = Thread(target=processor.run_processor, daemon=True)
+    thread.start()
+    try:
+        time.sleep(1.5)  # the first cycle ran; every stream is 4 s out
+        snapshot = processor.metrics_snapshot()
+    finally:
+        processor.stop()
+        thread.join(timeout=10)
+    assert not thread.is_alive(), "the claim loop did not stop"
+    assert snapshot["consumer"]["cycles"] == 1, snapshot["consumer"]
+    assert snapshot["claim"]["rounds_by_stream"]["fault"] == 1
 
 
 def _second_claim_delay(

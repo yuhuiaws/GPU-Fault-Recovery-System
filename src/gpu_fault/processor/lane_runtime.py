@@ -19,34 +19,58 @@ from gpu_fault.processor.models import ProcessorRequest
 LOGGER = logging.getLogger(__name__)
 
 
-class FaultSlotWake:
-    """Turns finished fault workers into one claim-loop wake.
+class SlotWake:
+    """Turns finished workers of every pool into one claim-loop wake.
 
-    A fault worker that finishes frees a slot and, under the STRICT lane
-    policy, usually the lane of the next row too, and nothing announces that
-    row: the queue trigger notified (if at all) when it was admitted, while
-    its lane was still leased. ``worker_finished`` is the fault futures' done
-    callback: it runs on the worker thread (or inline for a future that is
-    already done), so it only raises a flag and sets the loop's event. Any
-    number of finishes between two cycles is one flag and one wake; the loop
-    thread ``take``s the flag before it reaps futures and claims the fault
-    stream at once.
+    A finished worker frees a slot, and nothing else announces it: the queue
+    trigger notifies only an idle->busy edge, so a standing backlog raises
+    none, and otherwise the claim loop sleeps to its nearest stream deadline,
+    the notification fallback once the fault stream has backed off with no
+    fault-tier row. Each pool's futures live in a set made by ``futures``;
+    every future added to it gets a done callback, which runs on the worker
+    thread (or inline for a future that is already done), so it only records
+    the pool and sets the loop's event: any number of finishes between two
+    cycles is one wake. The loop thread ``take``s the pools before it reaps
+    futures. A freed fault slot also claims the fault stream at once: under
+    the STRICT lane policy it usually frees the lane of the next row too,
+    which the trigger notified (if at all) while that lane was still leased.
+    Other pools only wake the loop: a stream that filled its claim has no
+    backoff to clear, and one that came back empty keeps it.
     """
 
     def __init__(self, work_available: Event) -> None:
         self._work_available = work_available
         self._lock = Lock()
-        self._freed = False
+        self._freed: set[str] = set()
 
-    def worker_finished(self, _future: Future[Any]) -> None:
+    def futures(self, pool: str) -> set[Future[Any]]:
+        """An empty set for ``pool``'s futures, each of which wakes the loop."""
+
+        return _WakingFutures(self, pool)
+
+    def worker_finished(self, pool: str) -> None:
         with self._lock:
-            self._freed = True
+            self._freed.add(pool)
         self._work_available.set()
 
-    def take(self) -> bool:
+    def take(self) -> frozenset[str]:
         with self._lock:
-            freed, self._freed = self._freed, False
-        return freed
+            freed, self._freed = self._freed, set()
+        return frozenset(freed)
+
+
+class _WakingFutures(set[Future[Any]]):
+    def __init__(self, wake: SlotWake, pool: str) -> None:
+        super().__init__()
+        self._wake = wake
+        self._pool = pool
+
+    def add(self, future: Future[Any]) -> None:
+        future.add_done_callback(self._finished)
+        super().add(future)
+
+    def _finished(self, _future: Future[Any]) -> None:
+        self._wake.worker_finished(self._pool)
 
 
 class ProcessorCoordinatorStore(Protocol):
