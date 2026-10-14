@@ -52,6 +52,7 @@ if TYPE_CHECKING or __package__:
         validate_registered_resources,
         write_status,
     )
+    from .regional_remediation_budget import write_remediation_budget
 else:
     from regional_capacity_placement import (
         optional_placement_section,
@@ -91,6 +92,7 @@ else:
         validate_registered_resources,
         write_status,
     )
+    from regional_remediation_budget import write_remediation_budget
 
 
 LOAD_SERVICE_ACCOUNT = "gpu-fault-completion-watcher"
@@ -933,14 +935,19 @@ with psycopg.connect(store_dsn()) as conn:
     first_commands = dict(cur.fetchall())
 durations = []
 first_actions = []
+refusals = []
+waited_first_actions = []
 cluster_finished = {{}}
 for key, payload in workflows:
     created = stamp(payload['created_at'])
     updated = stamp(payload['updated_at'])
     durations.append((updated - created).total_seconds())
     first = first_commands.get(key)
+    refusals.append(int(payload.get('remediation_budget_wait_count') or 0))
     if first is not None:
         first_actions.append((first - created).total_seconds())
+        if refusals[-1]:
+            waited_first_actions.append(first_actions[-1])
     match = re.search(r'-c(\\d{{3}})-w\\d{{3}}$', key)
     if match:
         cluster = match.group(1)
@@ -961,6 +968,24 @@ out = {{
     'cluster_completion_skew_seconds': (
         max(finish_values) - min(finish_values)
     ).total_seconds() if finish_values else None,
+    # remediation-budget.json (性能压测验收方案 §11): the product's refused
+    # claim counts; the longest wait is creation to first command of a
+    # workflow the budget refused at least once.
+    'remediation_budget_waits': {{
+        'recorded': any(
+            'remediation_budget_wait_count' in item for _, item in workflows
+        ),
+        'claims_recorded': any(
+            'remediation_budget_claims' in item for _, item in workflows
+        ),
+        'refused_claims': sum(refusals),
+        'waited_workflows': sum(1 for value in refusals if value),
+        'longest_wait_seconds': max(waited_first_actions)
+            if waited_first_actions else None,
+        'never_executed_workflows': sum(
+            1 for key, _ in workflows if key not in first_commands
+        ),
+    }},
 }}
 print(json.dumps(out))
 """
@@ -1238,6 +1263,7 @@ def execute_capacity_run(
         (artifacts / name).write_text(
             json.dumps(value, indent=2, sort_keys=True) + "\n"
         )
+    write_remediation_budget(artifacts, run_id, remediation_budget, occupancy, details)
     print(json.dumps(summary, indent=2, sort_keys=True))
     if summary["job_status"] != "Complete":
         return 1

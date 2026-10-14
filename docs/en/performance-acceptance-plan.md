@@ -1123,8 +1123,20 @@ as a formal PASS.
 An Action load test with a remediation budget must also save `remediation-budget.json`,
 containing at least the five-tier configuration, peak active claims per scope, wait counts,
 longest wait, the number of workflows that never got to execute and the number of lease-expiry
-releases. When an old release does not export these fields, write `unsupported` explicitly; an
-all-zero file must not be substituted.
+releases. The action runner writes it next to `summary.json`
+(`scripts/perf/regional_remediation_budget.py`), all from data the round already has: `tier` and
+`limits` are the tier and five-tier configuration of `run.json.remediation_budget`;
+`peak_active_claims` is, per scope kind, the most `RUNNING` workflows holding one scope of that
+kind in any `history.json` sample (the §8.2 occupancy verdict; a kind no workflow claimed is
+absent); `waits.refused_claims` is the sum of the round's refused claim attempts (the
+`remediation_budget_wait_count` the product records on each workflow), `waits.waited_workflows`
+the workflows refused at least once and `waits.longest_wait_seconds` the longest time from creation
+to first remote command among them (the budget wait plus the dispatcher's pickup);
+`never_executed_workflows` counts the workflows without any remote command at the end; and since a
+claim is held until its workflow is terminal and is not released when a lease lapses (detailed
+design v2 §9.5), `lease_expiry_releases` is `not-applicable`. When an old release's workflow
+records lack a field, that field is `unsupported` explicitly; an all-zero file must not be
+substituted.
 
 Raw logs and site identifiers are kept only in CI artifacts or private object storage. The
 public repository may publish reviewed summary conclusions but must remove account numbers,

@@ -88,7 +88,12 @@ Supported entry points:
 - `regional_action_capacity_suite.py`: regional action execution capacity; it
   records the five remediation budget limits in `run.json` and fails a run
   (exit 3) when any `history.json` sample holds the region, a cluster or a
-  resource class with more RUNNING workflows than its limit.
+  resource class with more RUNNING workflows than its limit. Every run writes
+  `remediation-budget.json` (`regional_remediation_budget.py`): the five
+  tiers, the per-scope peaks of that verdict, the refused claims, waited and
+  never-executed workflows and the longest wait from the run's workflow rows,
+  and `lease_expiry_releases: not-applicable` (claims are held until a
+  workflow ends).
 - `regional_correlated_action_suite.py`: live synthetic event-to-action
   same-rank aggregation, preemption and failure-escalation chains, including
   budget-wave-aware scenario timeouts, a separate terminal-drain phase, exact
