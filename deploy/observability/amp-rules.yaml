@@ -1845,9 +1845,11 @@ groups:
             control-worker log for the deadline and watchdog lines. Do not edit
             execution_deadline or delete the record to clear this.
       # The remediation budget caps how many nodes the system mutates at once.
-      # Workflows waiting on it are correct behaviour under load and a stall
-      # when the budget is never released — for instance because a claim holder
-      # died without its lease expiring.
+      # Workflows waiting on it are correct behaviour under load. A claim is
+      # held until its workflow is terminal -- a lapsed lease does not release
+      # it -- and the holder's execution deadline bounds that hold: at that
+      # deadline the watchdog fails the holder, and a holder still RUNNING past
+      # it is GpuFaultWorkflowDeadlineNotEnforced.
       - alert: GpuFaultRemediationBudgetStarved
         expr: >-
           max by (control_plane_cluster, region)
@@ -1862,7 +1864,10 @@ groups:
             {{ $value | printf "%.0f" }} workflows are held by a remediation budget. Compare
             gpu_fault_remediation_budget_active_claims against the configured
             scope limits and check whether an active claim belongs to a
-            workflow that is no longer making progress.
+            workflow that is no longer making progress. A claim is held until
+            its workflow is terminal and at most until the holder's execution
+            deadline, at which the deadline watchdog fails it; a holder still
+            RUNNING past its deadline is GpuFaultWorkflowDeadlineNotEnforced.
       # S1: the per-cluster remediation budget is a safety limit (five
       # concurrent remediations per cluster as shipped). A correlated
       # whole-cluster fault -- one AZ, 500+ nodes -- therefore drains five at a
@@ -1903,9 +1908,10 @@ groups:
             to clear this alert. Check
             gpu_fault_remediation_budget_cluster_active_claims against the
             limit for this cluster, confirm the active claims belong to
-            workflows that are still progressing (a claim holder whose lease
-            never expires is GpuFaultRemediationBudgetStarved territory), and
-            read the oldest waiting workflow via
+            workflows that are still progressing (a claim is held until its
+            workflow is terminal, bounded by the holder's execution deadline;
+            a holder that stopped progressing is GpuFaultRemediationBudgetStarved
+            territory), and read the oldest waiting workflow via
             gpu_fault_workflow_pending_age_seconds_max and its
             remediation_budget_last_blocked_reason.
       # A completion event with no decision row at all. Every persisted event
