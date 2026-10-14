@@ -195,7 +195,7 @@ def test_the_burst_suite_reads_from_its_start_and_fails_the_measurement_not_the_
     reads: list[tuple[float, float]] = []
     monkeypatch.setattr(capacity, "aurora_window", idle_cluster(reads))
 
-    assert capacity.main(capacity_args("all", tmp_path)) == 4
+    assert capacity.main(capacity_args("all", tmp_path, "--lead-seconds", "0")) == 4
 
     summary = json.loads((tmp_path / "summary.json").read_text())
     status = json.loads((tmp_path / "status.json").read_text())
@@ -209,6 +209,21 @@ def test_the_burst_suite_reads_from_its_start_and_fails_the_measurement_not_the_
     ((read_from, _read_to),) = reads
     assert read_from <= resolved_at + 1, "aurora.json reads from the step start"
     assert wire.teardowns, "the run still tears down"
+
+
+def test_a_window_that_ends_before_it_starts_reads_its_first_minute() -> None:
+    later = {
+        **METRICS,
+        "DatabaseConnections": series((1_000_320, 0.0, 0.0), (1_000_380, 5.0, 5.0)),
+    }
+
+    measurement = database.aurora_measurement(
+        later, placement=PLACEMENT, window_start=1_000_350.0, window_end=1_000_330.0
+    )
+
+    assert measurement["database_connections_max_during_window"] == 0.0, (
+        "only the minute holding the window start"
+    )
 
 
 def test_a_step_read_starts_at_most_the_lookback_before_its_window(

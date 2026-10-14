@@ -185,11 +185,14 @@ def _reading_at(
 def _peak_during(
     points: list[tuple[float, Datapoint]], start: float, end: float
 ) -> float | None:
+    """The largest maximum of the datapoints overlapping ``[start, end]``: the
+    minute holding ``start`` and every minute that begins inside the window
+    (a window that ends before it starts is its first minute alone)."""
+
     values = [
         float(maximum if maximum is not None else average)
         for at, (average, maximum) in points
-        if at < end
-        and at + PERIOD_SECONDS > start
+        if (at <= start < at + PERIOD_SECONDS or start < at < end)
         and (maximum if maximum is not None else average) is not None
     ]
     return max(values) if values else None
