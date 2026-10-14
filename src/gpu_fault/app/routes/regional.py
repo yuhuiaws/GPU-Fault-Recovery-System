@@ -846,9 +846,12 @@ async def regional_node_action_keys(
                 ),
             )
         for node_id in unknown:
-            attestation = attested[node_id]
             refused = _attested_node_refusal(
-                store, registration, registry.node_secrets, fleet_secret, attestation
+                store,
+                registration,
+                registry.node_secrets,
+                fleet_secret,
+                attested[node_id],
             )
             if refused is not None:
                 LOGGER.warning(
@@ -858,8 +861,11 @@ async def regional_node_action_keys(
                     refused[1],
                 )
                 raise HTTPException(status_code=refused[0], detail=refused[1])
-            # The audit line of an admission by statement: which instance,
-            # node group and Node UID the executor vouched for.
+        for node_id in unknown:
+            # The audit line of an admission by statement, once every node of
+            # the request passed: the instance, node group and Node UID the
+            # executor vouched for.
+            attestation = attested[node_id]
             LOGGER.info(
                 "admitted node %s of cluster %s by its EC2 identity: uid=%s "
                 "instance=%s nodegroup=%s address=%s",

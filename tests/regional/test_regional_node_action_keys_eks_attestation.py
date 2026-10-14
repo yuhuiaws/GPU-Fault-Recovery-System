@@ -320,9 +320,31 @@ def test_a_known_node_and_an_attested_one_are_keyed_together() -> None:
     assert set(response.json()["keys"]) == {KNOWN, NODE}
 
 
-def test_one_refused_attestation_withholds_every_key_of_the_request() -> None:
+def test_one_refused_attestation_withholds_every_key_of_the_request(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     context = _context()
     context.store.save_gpu_inventory_snapshot(_inventory(EKS, KNOWN))
+    second = "ip-10-0-36-30.us-west-2.compute.internal"
+    payload = _payload(
+        _attestation(),
+        _attestation(
+            node_id=second,
+            private_dns_name=second,
+            private_ip="10.0.36.30",
+            instance_state="terminated",
+        ),
+        node_ids=[KNOWN, NODE, second],
+    )
+
+    with caplog.at_level(logging.INFO, logger="gpu_fault.app.routes.regional"):
+        refused = _post(context, payload)
+
+    assert refused.status_code == 403, refused.text
+    assert "keys" not in refused.json()
+    assert not [
+        record for record in caplog.records if "EC2 identity" in record.getMessage()
+    ], "no admission is audited for a request that issued nothing"
 
     response = _post(
         context,
