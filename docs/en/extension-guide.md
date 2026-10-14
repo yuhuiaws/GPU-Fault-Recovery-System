@@ -163,7 +163,7 @@ The only allowed buckets are `public`, `metrics`, `cluster-token`,
 `dual-credential` and `execution-token`. Directory prefixes do not inherit permissions;
 a missing declaration fails at application startup.
 
-`create_app()` currently mounts 92 application routes; after adding or removing routes you must re-assemble the real app to recount the total and the five-bucket
+`create_app()` currently mounts 93 application routes; after adding or removing routes you must re-assemble the real app to recount the total and the five-bucket
 distribution, and update the two high-level designs, the two detailed designs and this guide (CN and EN);
 `tests/test_documentation_contracts.py::test_docs_state_the_assembled_apps_route_count_and_buckets` holds those numbers to the
 really assembled app and fails until they are updated. The non-regional local mode also mounts these routers,

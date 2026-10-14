@@ -3904,7 +3904,7 @@ A SQLite-to-PostgreSQL or PostgreSQL-to-PostgreSQL migration must stop all write
 
 ## 4. API Design
 
-`create_app()` currently always mounts **92 application routes**; regional mode
+`create_app()` currently always mounts **93 application routes**; regional mode
 (`GPU_FAULT_DEPLOYMENT_MODE=regional`) additionally installs the five-bucket default-deny authorization middleware. Routes are distributed by
 implementation module:
 
@@ -3920,11 +3920,11 @@ implementation module:
 | `src/gpu_fault/app/routes/incidents.py` | 8 |
 | `src/gpu_fault/app/routes/workflows.py` | 4 |
 | `src/gpu_fault/app/routes/admin.py` | 4 |
-| `src/gpu_fault/app/routes/configuration.py` | 5 |
+| `src/gpu_fault/app/routes/configuration.py` | 6 |
 | `src/gpu_fault/app/routes/processor.py` | 2 |
 | `src/gpu_fault/app/metrics.py` | 2 |
 
-Authorization bucket distribution: `execution-token` 45, `cluster-token` 37, `dual-credential` 7,
+Authorization bucket distribution: `execution-token` 46, `cluster-token` 37, `dual-credential` 7,
 `metrics` 1, `public` 2 (model in §4.5). Counting routes must use the really assembled app (
 iterate `iter_api_routes(app.routes)` after `create_app()`), not count decorators: `/metrics`
 and the documentation routes do not live under the `routes/` directory.

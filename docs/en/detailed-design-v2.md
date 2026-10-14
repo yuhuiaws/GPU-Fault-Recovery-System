@@ -3692,7 +3692,7 @@ PostgreSQL, every refusal, the single writer, the resumed restart), `tests/execu
 ## 8. Interface Design
 
 The route table in this chapter was obtained by **enumerating the routes one by one after assembling the real app**, not by copying them from the code
-(see §0.3 for the counting method). `create_app()` always mounts **92 application routes**
+(see §0.3 for the counting method). `create_app()` always mounts **93 application routes**
 (plus 4 FastAPI built-ins: `/docs`, `/redoc`, `/openapi.json`,
 `/docs/oauth2-redirect`); regional production mode installs the five-bucket default-deny middleware on top of them.
 `/v1/regional/*` is also mounted in local mode, but that mode is not a supported production authorization boundary.
@@ -3704,7 +3704,7 @@ The route table in this chapter was obtained by **enumerating the routes one by 
 | Bucket | Count | Credential | Who calls it |
 |---|---:|---|---|
 | `cluster-token` | 37 | `Authorization: Bearer <cluster token>` + `X-GPU-Fault-Cluster-ID` | Data plane (collector, cluster executor) |
-| `execution-token` | 45 | `X-GPU-Fault-Execution-Token` | Operations and the control plane itself |
+| `execution-token` | 46 | `X-GPU-Fault-Execution-Token` | Operations and the control plane itself |
 | `dual-credential` | 7 | Either one, chosen by the credential the request carries: with an execution token header, use the execution token; with only a cluster bearer + cluster header, use the cluster token; with neither, reject as execution token | Interfaces that may be called by either the data plane or operations (fleet queries, drain/revoke, GPU metrics reads) |
 | `metrics` | 1 | Loopback is exempt from authentication; non-loopback requires an execution token | `GET /metrics` |
 | `public` | 2 | None | `GET /healthz` (readiness, including registry freshness), `GET /livez` (liveness, looks only at process-local state, never touches Aurora) |
@@ -3778,12 +3778,12 @@ from which the control plane decides whether to send new fields. Compatibility o
 | `src/gpu_fault/app/routes/admin.py` | 4 | `/healthz`, `/livez`, `/v1/version`, `/v1/capabilities/operations` |
 | `src/gpu_fault/app/metrics.py` | 2 | `/metrics`, `/v1/internal/metrics/collector-silence` |
 | `src/gpu_fault/app/routes/processor.py` | 2 | Queue request receipt query, queue status |
-| `src/gpu_fault/app/routes/configuration.py` | 5 | marker, runtime profile, and installation-resource batch sync, query and status update |
+| `src/gpu_fault/app/routes/configuration.py` | 6 | marker, runtime profile, and installation-resource batch sync, query, status update and replacement transition |
 
-All 3 installation-resource routes belong to `execution-token`:
-`POST /v1/installation-resources/sync`, `GET /v1/installation-resources`,
-`PUT /v1/installation-resources/{site_id}/{resource_key:path}`. The 13 modules in the table above total 92 routes,
-equal to the sum of the five buckets in §8.1 (37 + 45 + 7 + 1 + 2); the route total and bucket distribution are governed by this real-assembly count,
+All 4 installation-resource routes belong to `execution-token`:
+`POST /v1/installation-resources/sync`, `POST /v1/installation-resources/replacements`, `GET /v1/installation-resources`,
+`PUT /v1/installation-resources/{site_id}/{resource_key:path}`. The 13 modules in the table above total 93 routes,
+equal to the sum of the five buckets in §8.1 (37 + 46 + 7 + 1 + 2); the route total and bucket distribution are governed by this real-assembly count,
 and authorization audits must use the `ExplicitAuthorizationRegistry.inventory` of the assembled real app, not
 historical incremental estimates or old inventories. After the removal of the four HMA routes, the old addresses return 404;
 the response models of the Kernel/FM entry points moved to `gpu_fault.nvidia_logs`, with fields and event identity unchanged.

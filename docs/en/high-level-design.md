@@ -1070,7 +1070,7 @@ The terminal event, the `attempt_event` link, and the completion decision curren
 
 ### 6.3 Route Groups
 
-`create_app()` currently always mounts 92 application routes; the regional production form installs the five-bucket default-deny
+`create_app()` currently always mounts 93 application routes; the regional production form installs the five-bucket default-deny
 middleware on top of them. Grouped by function:
 
 - `/v1/gpu-events/*`: XID, distributed XID, SXID, and correlation progress lookup.
@@ -1087,7 +1087,7 @@ middleware on top of them. Grouped by function:
 - `/v1/evidence/*`, `/v1/collector-status/*`, `/v1/collector-readiness/*`,
   `/v1/gpu-health-findings/*`, `/v1/gpu-metrics/*`: evidence, collection health, and hot-state queries.
 - `/v1/advisory-notifications/*`: notification preview, dispatch, and re-send.
-- `/v1/installation-resources*`: bulk sync, per-site query, and status update of the AWS installation resource registry.
+- `/v1/installation-resources*`: bulk sync, per-site query, status update and the replacement transition (`replace-resource`) of the AWS installation resource registry.
 - `/v1/processor/*`, `/v1/internal/*`, `/v1/capabilities/*`, `/v1/admin/*`:
   queue status, enqueue receipts, internal telemetry batch submission, and operations injection.
 - `/v1/regional/*`: cluster registration query, remote command claim/renew/progress/result, HyperPod submission idempotency,

@@ -701,10 +701,10 @@ and the training submission CLI), but that is a capability of the operations too
 
 ### 8.1 API Surface
 
-`create_app()` always mounts **92 application routes**; the regional production form enables on this set of routes
+`create_app()` always mounts **93 application routes**; the regional production form enables on this set of routes
 the default-deny model of "every route explicitly declares its bucket". The five buckets
 `public` / `metrics` / `cluster-token` / `dual-credential` /
-`execution-token` are currently distributed 2 / 1 / 37 / 7 / 45 (`public` is `/healthz` and
+`execution-token` are currently distributed 2 / 1 / 37 / 7 / 46 (`public` is `/healthz` and
 `/livez`; the numbers are authoritative as enumerated in-process by `create_app()` + `ExplicitAuthorizationRegistry.load()`).
 A new route without a declared bucket
 fails startup at application assembly; at runtime, failing to resolve a bucket always yields 403, but **a path that matches no route answers 404**
@@ -718,7 +718,7 @@ All three API classes the proposal cares about exist, and the production deploym
 | Fault event reporting | `/v1/gpu-events/*`, `/v1/collector-events/*` (7 collection channels); the four HMA provider entry points have been removed |
 | Health status query | `/v1/collector-status/*`, `/v1/collector-readiness/{cluster_id}`, `/v1/gpu-health-findings/*`, `/v1/gpu-metrics/*`, `/v1/fleet/agents*` |
 | Manual isolate/recover/terminate | See §8.2 |
-| AWS installation resource lifecycle | `/v1/installation-resources`, `/sync`, `/{site_id}/{resource_key:path}`, all execution-token |
+| AWS installation resource lifecycle | `/v1/installation-resources`, `/sync`, `/replacements`, `/{site_id}/{resource_key:path}`, all execution-token |
 
 ### 8.2 Manual Intervention Surface (Real Inventory)
 
@@ -735,9 +735,9 @@ All three API classes the proposal cares about exist, and the production deploym
 | Notification resend / immediate dispatch | `POST /v1/advisory-notifications/{id}/send`, `POST /v1/advisory-notifications/dispatch` |
 | Confirm EFA traffic false positive / accept new baseline | `POST /v1/efa-traffic/admin-actions` (`ACKNOWLEDGE_TRANSIENT` / `ACCEPT_NEW_BASELINE`) |
 | Query restart budget | `GET /v1/restart-budgets/{cluster_id}/{job_id}` |
-| Query/sync/advance AWS installation resource state | `GET /v1/installation-resources`, `POST /sync`, `PUT /{site_id}/{resource_key:path}` |
+| Query/sync/advance AWS installation resource state, transition a really replaced resource | `GET /v1/installation-resources`, `POST /sync`, `PUT /{site_id}/{resource_key:path}`, `POST /replacements` (`gpu-fault-admin replace-resource`) |
 | Approve a GPU count change | Node annotation (exact value), not an API |
-| Regional operations (claim/renew/receipt/progress, spare health, evidence and notification write-back, cluster registry) | `/v1/regional/*`, 21 endpoints in total (`executors` 15, `registry` 4, `clusters` 1, `node-action-keys` 1) |
+| Regional operations (claim/renew/receipt/progress, spare health, evidence and notification write-back, cluster registry) | `/v1/regional/*`, 23 endpoints in total (`executors` 17, `registry` 4, `clusters` 1, `node-action-keys` 1) |
 
 **Gap: there is still no first-class entry point for "isolate an arbitrary node" or "terminate a RUNNING workflow"**. Manual isolation currently relies on
 creating/advancing a workflow or cordon+taint directly in the cluster (the latter bypasses the state store and is not recommended);
