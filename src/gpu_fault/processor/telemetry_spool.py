@@ -78,11 +78,10 @@ class TelemetrySpoolCoordinatorMixin:
         "rank",
     )
 
-    # A settled empty fault round asks whether any fault-tier row is PENDING
-    # or LEASED (claim_backoff.py). "Yes" only keeps the fault stream on its
-    # 0.5 s cadence, so it is believed this long instead of re-read every
-    # round; "no" lets the stream stretch and is never reused.
-    _FAULT_BACKLOG_HOLD_SECONDS = 5.0
+    # An empty fault round asks whether a fault-tier row waits to be claimed
+    # (claim_backoff.py). "Yes" only keeps the fault stream on its 0.5 s
+    # cadence, so it is believed for the hold the caller passes instead of
+    # re-read every round; "no" lets the stream stretch and is never reused.
     _fault_backlog_held_until = 0.0
 
     def run_telemetry_spool(self) -> None:
@@ -549,18 +548,20 @@ class TelemetrySpoolCoordinatorMixin:
             self.claim_lane_blocked_total += 1
         return blocked
 
-    def _fault_backlog_is_empty(self) -> bool:
-        """Is no fault-tier row PENDING or LEASED anywhere?
+    def _fault_backlog_is_empty(self, hold_seconds: float) -> bool:
+        """Is no fault-tier row PENDING, or LEASED with a lapsed lease?
 
-        Asked only by a settled empty fault round with notifications on, in
-        place of the lane probe, and read after the claim that came back
-        empty. An empty answer is never reused; a non-empty one is believed
-        for ``_FAULT_BACKLOG_HOLD_SECONDS``, so a fault backlog adds at most
-        one query per hold per replica. A store that cannot count -- or a
-        count that fails -- keeps the stream on its cadence.
+        Asked by an empty fault round with notifications on that nothing
+        holds (claim_backoff.py), and read after the claim that came back
+        empty. A row under a live lease is not a backlog: it silences no
+        edge. An empty answer is never reused; a non-empty one is believed
+        for ``hold_seconds`` -- the notification fallback -- so a fault
+        backlog adds at most one query per fallback interval per replica. A
+        store that cannot answer -- or a query that fails -- keeps the
+        stream on its cadence.
         """
 
-        probe = getattr(self.store, "processor_fault_backlog_depth", None)
+        probe = getattr(self.store, "has_unleased_fault_backlog", None)
         if probe is None:
             return False
         monotonic = time.monotonic()
@@ -568,13 +569,11 @@ class TelemetrySpoolCoordinatorMixin:
             return False
         self.claim_probes_total += 1
         try:
-            depth = int(probe())
+            backlog = bool(probe(now=datetime.now(timezone.utc)))
         except Exception:
             LOGGER.exception("processor fault backlog probe failed")
             return False
-        if depth > 0:
-            self._fault_backlog_held_until = (
-                monotonic + self._FAULT_BACKLOG_HOLD_SECONDS
-            )
+        if backlog:
+            self._fault_backlog_held_until = monotonic + hold_seconds
             return False
         return True

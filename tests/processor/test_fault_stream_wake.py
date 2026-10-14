@@ -12,10 +12,12 @@ without filling its limit is re-polled one poll interval later.
 
 That 0.5 s cadence then made 97% of a perf run's fault claim rounds empty
 polls of an idle queue. A row can only be silent behind a PENDING fault-tier
-row, so a settled fault stream with notifications on asks the store for its
-fault backlog instead of the lane probe and, with none, waits on the edge
-notification (the 5 s fallback); any fault-tier row PENDING or LEASED keeps
-the 0.5 s cadence, and the depth query is bounded.
+row, so a fault stream with notifications on that the lane probe does not hold
+asks the store for its fault backlog -- PENDING, or LEASED with a lapsed lease
+-- as soon as the answer can lengthen its interval, settled or not, and with
+none waits on the edge notification (the 5 s fallback). A backlog keeps the
+0.5 s cadence and is believed for one fallback interval; a row under a live
+lease is no backlog, and a lane-blocked backlog of any tier keeps 0.1 s.
 """
 
 from __future__ import annotations
@@ -35,10 +37,12 @@ from gpu_fault.processor import (
     ProcessorCoordinator,
     ProcessorLeaseSettings,
     ProcessorPoolSettings,
+    ProcessorRequestStatus,
     telemetry_spool,
 )
 from gpu_fault.processor.claim_backoff import BackoffCeilings, empty_round_ceiling
 from gpu_fault.processor.lane_runtime import FaultSlotWake
+from gpu_fault.store import SqliteStore
 from tests._builders import build_store, processor_request
 
 ROUTINE_STREAMS = (
@@ -57,7 +61,12 @@ def _terminal(attempt_id: str):
 
 
 def _coordinator(
-    store, *, fault_workers: int, host_workers: int, poll_seconds: float
+    store,
+    *,
+    fault_workers: int,
+    host_workers: int,
+    poll_seconds: float,
+    fallback: float = 5.0,
 ) -> ProcessorCoordinator:
     return ProcessorCoordinator(
         store,
@@ -70,7 +79,9 @@ def _coordinator(
             gpu_telemetry_worker_count=0,
             host_telemetry_worker_count=host_workers,
         ),
-        lease=ProcessorLeaseSettings(poll_seconds=poll_seconds),
+        lease=ProcessorLeaseSettings(
+            poll_seconds=poll_seconds, processor_notification_fallback_seconds=fallback
+        ),
         active_consumers=True,
     )
 
@@ -148,8 +159,8 @@ def test_a_fault_backlog_keeps_the_fault_stream_off_the_notification_fallback(
         "next_interval": 8.0,
         "settled_empty": True,
         "pools_busy": True,
-        # A fault-tier row is PENDING or LEASED somewhere.
-        "fault_backlog_empty": lambda: False,
+        # A fault-tier row waits to be claimed somewhere.
+        "fault_backlog_empty": lambda _hold: False,
     }
     assert empty_round_ceiling(ceilings, lane_blocked=lambda: False, **settled) == fault
     assert empty_round_ceiling(ceilings, lane_blocked=lambda: True, **settled) == 0.1
@@ -160,6 +171,7 @@ class _Probes:
 
     def __init__(self, *, lane_blocked: bool, fault_backlog_empty: bool) -> None:
         self.asked: list[str] = []
+        self.holds: list[float] = []
         self._lane_blocked = lane_blocked
         self._fault_backlog_empty = fault_backlog_empty
 
@@ -167,8 +179,9 @@ class _Probes:
         self.asked.append("lane")
         return self._lane_blocked
 
-    def fault_backlog_empty(self) -> bool:
+    def fault_backlog_empty(self, hold: float) -> bool:
         self.asked.append("fault-backlog")
+        self.holds.append(hold)
         return self._fault_backlog_empty
 
 
@@ -177,6 +190,7 @@ class _Probes:
         "notified",
         "settled",
         "pools_busy",
+        "next_interval",
         "backlog_empty",
         "lane_blocked",
         "ceiling",
@@ -184,44 +198,89 @@ class _Probes:
     ),
     [
         pytest.param(
-            True, True, False, True, True, 5.0, ["fault-backlog"], id="idle-queue"
+            True,
+            True,
+            False,
+            1.0,
+            True,
+            False,
+            5.0,
+            ["lane", "fault-backlog"],
+            id="idle-queue",
         ),
         pytest.param(
-            True, True, True, True, True, 5.0, ["fault-backlog"], id="idle-busy-pools"
+            True,
+            True,
+            True,
+            1.0,
+            True,
+            False,
+            5.0,
+            ["lane", "fault-backlog"],
+            id="idle-busy-pools",
+        ),
+        pytest.param(
+            True,
+            False,
+            False,
+            1.0,
+            True,
+            False,
+            5.0,
+            ["lane", "fault-backlog"],
+            id="unsettled-idle-pools",
+        ),
+        pytest.param(
+            True,
+            False,
+            False,
+            0.4,
+            True,
+            False,
+            0.5,
+            ["lane"],
+            id="interval-below-fault-idle",
         ),
         pytest.param(
             True,
             True,
             False,
+            1.0,
             False,
             False,
             0.5,
-            ["fault-backlog", "lane"],
+            ["lane", "fault-backlog"],
             id="backlog",
         ),
         pytest.param(
             True,
             True,
             False,
+            1.0,
             False,
             True,
             0.1,
-            ["fault-backlog", "lane"],
+            ["lane"],
             id="lane-blocked-backlog",
         ),
-        pytest.param(True, False, True, True, False, 0.1, [], id="busy-path"),
-        pytest.param(True, False, False, True, False, 0.5, ["lane"], id="unsettled"),
-        pytest.param(False, True, False, True, False, 0.5, ["lane"], id="poller"),
         pytest.param(
-            False, True, False, True, True, 0.1, ["lane"], id="poller-lane-blocked"
+            True, True, False, 1.0, True, True, 0.1, ["lane"], id="lane-blocked-routine"
         ),
-        pytest.param(False, False, True, True, False, 0.1, [], id="poller-busy-path"),
+        pytest.param(True, False, True, 1.0, True, False, 0.1, [], id="busy-path"),
+        pytest.param(False, True, False, 1.0, True, False, 0.5, ["lane"], id="poller"),
+        pytest.param(
+            False, True, False, 1.0, True, True, 0.1, ["lane"], id="poller-lane-blocked"
+        ),
+        pytest.param(
+            False, False, True, 1.0, True, False, 0.1, [], id="poller-busy-path"
+        ),
     ],
 )
-def test_only_a_settled_notified_fault_stream_asks_for_the_fault_backlog(
+def test_a_notified_fault_stream_asks_the_lane_then_the_fault_backlog(
     notified: bool,
     settled: bool,
     pools_busy: bool,
+    next_interval: float,
     backlog_empty: bool,
     lane_blocked: bool,
     ceiling: float,
@@ -240,7 +299,7 @@ def test_only_a_settled_notified_fault_stream_asks_for_the_fault_backlog(
     result = empty_round_ceiling(
         ceilings,
         stream="fault",
-        next_interval=1.0,
+        next_interval=next_interval,
         settled_empty=settled,
         pools_busy=pools_busy,
         lane_blocked=probes.lane_blocked,
@@ -249,6 +308,9 @@ def test_only_a_settled_notified_fault_stream_asks_for_the_fault_backlog(
 
     assert result == ceiling
     assert probes.asked == asked
+    assert probes.holds == [5.0] * asked.count("fault-backlog"), (
+        "a backlog is believed for one notification fallback"
+    )
 
 
 @pytest.mark.parametrize("stream", ROUTINE_STREAMS)
@@ -282,20 +344,32 @@ def test_the_routine_streams_never_ask_for_the_fault_backlog(stream: str) -> Non
 EMPTY_FAULT_ROUND = {"fault": 1, "observation": 0, "gpu": 0, "host": 0}
 
 
+@pytest.fixture
+def sqlite_store(tmp_path):
+    """A store that answers the fault backlog query. The in-memory store has
+    no notifications and no such query: it keeps the fault stream polling."""
+
+    store = SqliteStore(str(tmp_path / "fault-stream.db"))
+    try:
+        yield store
+    finally:
+        store.close()
+
+
 class _CountingStore:
-    """The in-memory store, counting the probes the empty fault rounds ask."""
+    """A store, counting the probes the empty fault rounds ask."""
 
     def __init__(self, store: Any) -> None:
         self._store = store
-        self.depth_reads = 0
+        self.backlog_reads = 0
         self.lane_probes = 0
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._store, name)
 
-    def processor_fault_backlog_depth(self) -> int:
-        self.depth_reads += 1
-        return int(self._store.processor_fault_backlog_depth())
+    def has_unleased_fault_backlog(self, *, now: datetime) -> bool:
+        self.backlog_reads += 1
+        return bool(self._store.has_unleased_fault_backlog(now=now))
 
     def active_backlog_is_lane_blocked(self, **kwargs: Any) -> bool:
         self.lane_probes += 1
@@ -303,21 +377,25 @@ class _CountingStore:
 
 
 class _UncountedStore:
-    """A store that predates ``processor_fault_backlog_depth``."""
+    """A store that predates ``has_unleased_fault_backlog``."""
 
     def __init__(self, store: Any) -> None:
         self._store = store
 
     def __getattr__(self, name: str) -> Any:
-        if name == "processor_fault_backlog_depth":
+        if name == "has_unleased_fault_backlog":
             raise AttributeError(name)
         return getattr(self._store, name)
 
 
-def _notified_coordinator(store: Any, *, shard: int | None) -> ProcessorCoordinator:
+def _notified_coordinator(
+    store: Any, *, shard: int | None, fallback: float = 5.0
+) -> ProcessorCoordinator:
     """One fault worker and no dedicated pools: only the fault stream claims."""
 
-    processor = _coordinator(store, fault_workers=1, host_workers=0, poll_seconds=0.1)
+    processor = _coordinator(
+        store, fault_workers=1, host_workers=0, poll_seconds=0.1, fallback=fallback
+    )
     processor._set_notification_state(True, shard)
     return processor
 
@@ -335,24 +413,31 @@ def _empty_fault_rounds(processor: ProcessorCoordinator, count: int) -> list[flo
     return intervals
 
 
-# The production cadence (0.1 s poll, 0.5 s fault idle, 8 rounds to settle):
-# the seven rounds before the stream settles empty double up to fault idle.
+# The production cadence (0.1 s poll, 0.5 s fault idle): the interval doubles
+# from the poll and is capped at fault idle while a row can be silent.
 UNSETTLED_INTERVALS = [0.2, 0.4, 0.5, 0.5, 0.5, 0.5, 0.5]
+# With no fault-tier row waiting it doubles straight out to the 5 s fallback:
+# no longer eight rounds at 0.5 s first.
+EDGE_INTERVALS = [0.2, 0.4, 0.8, 1.6, 3.2, 5.0, 5.0]
 
 
-def test_an_idle_shard_owner_waits_on_notifications_instead_of_polling() -> None:
-    store = _CountingStore(build_store())
+def test_an_idle_shard_owner_waits_on_notifications_instead_of_polling(
+    sqlite_store: SqliteStore,
+) -> None:
+    store = _CountingStore(sqlite_store)
     processor = _notified_coordinator(store, shard=0)
 
     intervals = _empty_fault_rounds(processor, 12)
 
-    assert intervals[:7] == pytest.approx(UNSETTLED_INTERVALS)
-    assert intervals[7:] == pytest.approx([1.0, 2.0, 4.0, 5.0, 5.0]), (
-        "with no fault-tier row the settled stream doubles out to the fallback"
+    assert intervals == pytest.approx(EDGE_INTERVALS + [5.0] * 5), (
+        "with no fault-tier row the stream doubles out to the fallback at once"
     )
-    assert store.lane_probes == 7, "the settled rounds skip the lane probe"
-    assert store.depth_reads == 5, "an empty fault backlog is read fresh every round"
-    assert processor.metrics_snapshot()["claim"]["probes"] == 12
+    assert store.lane_probes == 12, "the lane probe decides every round first"
+    assert store.backlog_reads == 10, (
+        "the backlog is read once the fallback can lengthen the interval, "
+        "and an empty answer is read fresh every round"
+    )
+    assert processor.metrics_snapshot()["claim"]["probes"] == 22
 
 
 def test_a_shardless_process_keeps_polling_the_fault_stream() -> None:
@@ -364,7 +449,7 @@ def test_a_shardless_process_keeps_polling_the_fault_stream() -> None:
     assert intervals == pytest.approx(UNSETTLED_INTERVALS + [0.5] * 5), (
         "a process that is never woken keeps the fault idle ceiling"
     )
-    assert store.depth_reads == 0
+    assert store.backlog_reads == 0
     assert store.lane_probes == 12
 
 
@@ -374,59 +459,135 @@ def _deferred_terminal(attempt_id: str) -> Any:
     )
 
 
-def test_a_fault_backlog_keeps_the_cadence_and_is_read_once_per_hold(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("fallback", [5.0, 2.0])
+def test_a_fault_backlog_keeps_the_cadence_and_is_read_once_per_fallback(
+    monkeypatch: pytest.MonkeyPatch, sqlite_store: SqliteStore, fallback: float
 ) -> None:
     clock = SimpleNamespace(now=1000.0)
     monkeypatch.setattr(
         telemetry_spool, "time", SimpleNamespace(monotonic=lambda: clock.now)
     )
-    store = _CountingStore(build_store())
+    store = _CountingStore(sqlite_store)
     # PENDING, never claimable: a row queued behind it would raise no edge.
     store.enqueue_processor_request(_deferred_terminal("attempt-deferred"))
-    processor = _notified_coordinator(store, shard=0)
+    processor = _notified_coordinator(store, shard=0, fallback=fallback)
 
     intervals = _empty_fault_rounds(processor, 12)
 
     assert intervals == pytest.approx(UNSETTLED_INTERVALS + [0.5] * 5), (
-        "a PENDING fault-tier row keeps the settled stream on the 0.5 s cadence"
+        "a PENDING fault-tier row keeps the stream on the 0.5 s cadence"
     )
-    assert store.depth_reads == 1, "a non-empty backlog is believed for the hold"
+    assert store.backlog_reads == 1, "a non-empty backlog is believed for the hold"
     assert store.lane_probes == 12, "behind a backlog the lane probe still decides"
-    clock.now += 4.9
+    clock.now += fallback - 0.1
     _empty_fault_rounds(processor, 3)
-    assert store.depth_reads == 1
+    assert store.backlog_reads == 1, (
+        "GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS is the hold"
+    )
     clock.now += 0.2
     assert _empty_fault_rounds(processor, 1) == pytest.approx([0.5])
-    assert store.depth_reads == 2, "the hold has expired: the backlog is read again"
+    assert store.backlog_reads == 2, "the hold has expired: the backlog is read again"
+
+
+def _claim_elsewhere(store: Any, item: Any, *, lease: timedelta) -> Any:
+    """Another process's worker takes ``item`` and holds it for ``lease``."""
+
+    store.enqueue_processor_request(item)
+    (claimed,) = store.claim_active_processor_requests(
+        "pod-z:1",
+        now=datetime.now(timezone.utc),
+        lease_duration=lease,
+        limit=1,
+        include_paths={item.path},
+    )
+    assert claimed.request_id == item.request_id
+    return claimed
+
+
+def test_a_fault_row_under_a_live_lease_is_no_backlog(
+    sqlite_store: SqliteStore,
+) -> None:
+    store = _CountingStore(sqlite_store)
+    # A long fault handler on another process: it silences no edge.
+    _claim_elsewhere(store, _terminal("attempt-running"), lease=timedelta(minutes=2))
+    processor = _notified_coordinator(store, shard=0)
+
+    assert store.processor_fault_backlog_depth() == 1, "the depth still counts it"
+    assert _empty_fault_rounds(processor, 7) == pytest.approx(EDGE_INTERVALS), (
+        "a fault row a worker holds no longer keeps every process at 0.5 s"
+    )
+    assert store.backlog_reads == 5
+
+
+def test_a_lane_blocked_routine_row_keeps_the_fault_stream_polling(
+    sqlite_store: SqliteStore,
+) -> None:
+    """Admin, fleet and collector-health rows ride the fault stream. Behind a
+    lane held in another pool or process nothing announces the lane freeing
+    up, so the lane probe holds the stream at the fault busy ceiling."""
+
+    store = _CountingStore(sqlite_store)
+    marker = processor_request(
+        "/v1/markers", body=b'{"node_id":"node-a"}', cluster_id="cluster-a"
+    )
+    holder = _claim_elsewhere(store, marker, lease=timedelta(minutes=2))
+    queued = processor_request(
+        "/v1/markers", body=b'{"node_id":"node-b"}', cluster_id="cluster-a"
+    )
+    store.enqueue_processor_request(queued)
+    assert holder.ordering_key() == queued.ordering_key() == "cluster-a"
+    processor = _notified_coordinator(store, shard=0)
+
+    assert _empty_fault_rounds(processor, 12) == pytest.approx([0.1] * 12)
+    assert store.backlog_reads == 0, "the lane probe settles the round first"
+
+    assert holder.leader_epoch is not None and holder.lease_token is not None
+    store.complete_active_processor_request(
+        holder.request_id,
+        "pod-z:1",
+        holder.leader_epoch,
+        holder.lease_token,
+        response_status=200,
+        response_content_type="application/json",
+        response_body_base64="e30=",
+    )
+    _empty_fault_rounds(processor, 1)
+    taken = store.get_processor_request(queued.request_id)
+    assert (taken.status, taken.lease_owner) == (
+        ProcessorRequestStatus.LEASED,
+        "pod-a:1",
+    ), "the next fault round claims the row once its lane is free"
 
 
 def test_a_backlog_the_store_cannot_count_keeps_the_fault_stream_polling(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    sqlite_store: SqliteStore,
 ) -> None:
-    uncounted = _notified_coordinator(_UncountedStore(build_store()), shard=0)
-    assert _empty_fault_rounds(uncounted, 12) == pytest.approx(
-        UNSETTLED_INTERVALS + [0.5] * 5
-    ), "a store without the depth query keeps the fault idle ceiling"
+    for store_without_query in (_UncountedStore(sqlite_store), build_store()):
+        uncounted = _notified_coordinator(store_without_query, shard=0)
+        assert _empty_fault_rounds(uncounted, 12) == pytest.approx(
+            UNSETTLED_INTERVALS + [0.5] * 5
+        ), "a store without the backlog query keeps the fault idle ceiling"
 
-    store = build_store()
+    store = sqlite_store
 
-    def broken() -> int:
+    def broken(*, now: datetime) -> bool:
         raise RuntimeError("statement timeout")
 
-    monkeypatch.setattr(store, "processor_fault_backlog_depth", broken)
+    monkeypatch.setattr(store, "has_unleased_fault_backlog", broken)
     failing = _notified_coordinator(store, shard=0)
     with caplog.at_level(logging.ERROR, logger=telemetry_spool.LOGGER.name):
         intervals = _empty_fault_rounds(failing, 12)
 
     assert intervals == pytest.approx(UNSETTLED_INTERVALS + [0.5] * 5), (
-        "a failed depth read keeps the fault idle ceiling"
+        "a failed backlog read keeps the fault idle ceiling"
     )
     assert [
         record.getMessage()
         for record in caplog.records
         if record.name == telemetry_spool.LOGGER.name
-    ] == ["processor fault backlog probe failed"] * 5
+    ] == ["processor fault backlog probe failed"] * 10
 
 
 def test_finished_fault_workers_coalesce_into_one_wake() -> None:

@@ -13,6 +13,7 @@ reserved depth and still routed to the fault pool.
 from __future__ import annotations
 
 import os
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -214,6 +215,61 @@ def test_fault_backlog_depth_counts_both_reserved_tiers(processor_store) -> None
     assert accepted is not None, reason
 
     assert processor_store.processor_fault_backlog_depth() == 2
+
+
+@pytest.mark.parametrize("processor_store", ["sqlite", "postgres"], indirect=True)
+def test_only_an_unleased_fault_row_is_a_fault_backlog(processor_store) -> None:
+    """The fault stream's backlog probe (claim_backoff.py): a row of either
+    reserved tier that is PENDING, deferred or not, or LEASED once its lease
+    has lapsed -- never one under a live lease, which silences no edge, and
+    never another tier. The in-memory store has no notifications and does not
+    answer it."""
+
+    limits = {"max_depth": 10, "max_cluster_depth": 10}
+    now = datetime.now(timezone.utc)
+    assert processor_store.has_unleased_fault_backlog(now=now) is False
+    accepted, reason = processor_store.try_enqueue_processor_request(
+        _routine("node-b"), **limits
+    )
+    assert accepted is not None, reason
+    assert processor_store.has_unleased_fault_backlog(now=now) is False
+
+    device_event = processor_request(
+        "/v1/gpu-events/xid", body=b'{"node_id":"node-a"}', cluster_id="cluster-tiers"
+    )
+    accepted, reason = processor_store.try_enqueue_processor_request(
+        device_event, **limits
+    )
+    assert accepted is not None, reason
+    assert processor_store.has_unleased_fault_backlog(now=now) is True
+    claimed = processor_store.claim_active_processor_requests(
+        "pod-z:1",
+        now=now,
+        lease_duration=timedelta(seconds=30),
+        limit=1,
+        include_paths={"/v1/gpu-events/xid"},
+    )
+    assert [item.request_id for item in claimed] == [device_event.request_id]
+    assert processor_store.processor_fault_backlog_depth() == 1
+    assert (
+        processor_store.has_unleased_fault_backlog(now=now + timedelta(seconds=29))
+        is False
+    ), "a live lease is no backlog"
+    assert (
+        processor_store.has_unleased_fault_backlog(now=now + timedelta(seconds=30))
+        is True
+    ), "a lapsed lease is claimable again"
+
+    processor_store.enqueue_processor_request(
+        processor_request(
+            "/v1/workflows/wf-1/steps/s1/complete",
+            body=b'{"node_id":"node-c"}',
+            cluster_id="cluster-tiers",
+        ).model_copy(update={"not_before": now + timedelta(hours=1)})
+    )
+    assert processor_store.has_unleased_fault_backlog(now=now) is True, (
+        "a deferred PENDING row silences the next row of its key"
+    )
 
 
 def test_device_events_are_routed_to_the_fault_pool() -> None:

@@ -14,6 +14,11 @@ returns the same rows in the same order. Both statistics states are produced
 inside the test (explicit ``ANALYZE`` with autovacuum disabled on the table)
 and verified from ``pg_class`` before anything is measured; buffer and row
 counts are recorded as test properties, never compared as absolutes.
+
+The fault stream's backlog probe runs outside any claim transaction and takes
+no setting: it is written as the claim window's ordered walk, which stays an
+index walk under the generic plan the plan cache may keep once psycopg has
+prepared the statement (after five executions).
 """
 
 from __future__ import annotations
@@ -25,11 +30,13 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.processor.models import RESERVED_TIER_MAX_PRIORITY
 from gpu_fault.store import PostgresStore
 from gpu_fault.store.postgres.planner_discipline import (
     hot_path_planner_statements,
     pin_hot_path_plans,
 )
+from gpu_fault.store.postgres.processor_storage import UNLEASED_FAULT_BACKLOG_SQL
 from tests._builders import processor_request
 from tests.store._postgres_processor_claim_support import REQUEST_LEASE, _truncate
 
@@ -295,3 +302,65 @@ def test_claim_touches_only_its_window_and_keeps_its_answer(
     assert default_rows == [
         f"processor-bulk-{n}" for n in range(BACKLOG, BACKLOG - LIMIT, -1)
     ], "the eight oldest routine rows, oldest first"
+
+
+def _generic_plan(connection: Any, sql: str, *, now: datetime) -> dict:
+    """EXPLAIN ANALYZE of ``sql`` (``%(max_priority)s``, ``%(now)s``) as the
+    plan cache's generic plan, in a rolled-back transaction."""
+
+    from psycopg import sql as pgsql
+
+    prepared = sql.replace("%(max_priority)s", "$1").replace("%(now)s", "$2")
+
+    def body(conn: Any) -> dict:
+        conn.execute("SET LOCAL plan_cache_mode = force_generic_plan")
+        conn.execute(f"PREPARE backlog_probe(integer, timestamptz) AS {prepared}")
+        try:
+            row = conn.execute(
+                pgsql.SQL(
+                    "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) "
+                    "EXECUTE backlog_probe({}, {})"
+                ).format(pgsql.Literal(RESERVED_TIER_MAX_PRIORITY), pgsql.Literal(now))
+            ).fetchone()
+        finally:
+            conn.execute("DEALLOCATE backlog_probe")
+        plan: dict = row[0][0]
+        return plan
+
+    return _in_transaction(connection, (), body)
+
+
+@pytest.mark.parametrize("statistics", ["stale", "fresh"])
+def test_the_fault_backlog_probe_walks_the_claim_window_under_a_generic_plan(
+    connection: Any, statistics: str, request
+) -> None:
+    # Five thousand routine rows and no fault row: the probe's worst case,
+    # where a heap scan reads the whole queue to answer "no".
+    _seed_backlog(connection, statistics=statistics)
+    now = datetime.now(timezone.utc)
+    plan = _generic_plan(connection, UNLEASED_FAULT_BACKLOG_SQL, now=now)
+    scans = _scans(plan, QUEUE)
+    # The same predicate as an EXISTS, which the generic plan priced as a heap
+    # scan that stops early: recorded as evidence, not asserted.
+    exists = _generic_plan(
+        connection,
+        "SELECT EXISTS (SELECT 1 FROM gpu_fault_processor_queue "
+        "WHERE priority <= %(max_priority)s AND (status='PENDING' OR "
+        "(status='LEASED' AND lease_expires_at <= %(now)s)))",
+        now=now,
+    )
+    request.node.user_properties.extend(
+        [
+            ("probe_shared_blocks", _shared_blocks(plan)),
+            ("probe_execution_ms", round(plan.get("Execution Time", 0), 2)),
+            ("probe_queue_scans", json.dumps(sorted(map(str, scans)))),
+            ("exists_shared_blocks", _shared_blocks(exists)),
+            ("exists_execution_ms", round(exists.get("Execution Time", 0), 2)),
+            ("exists_queue_scans", json.dumps(sorted(map(str, _scans(exists, QUEUE))))),
+        ]
+    )
+
+    assert scans == {("Index Scan", "gpu_fault_processor_queue_claim_window")}, (
+        f"the probe walks the claim window, not the heap: {scans}"
+    )
+    assert _widest_queue_read(plan) == 0, "no fault row waits, and none was read"

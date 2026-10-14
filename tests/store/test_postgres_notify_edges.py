@@ -132,6 +132,27 @@ def test_another_key_and_a_row_returning_to_pending_are_their_own_edges() -> Non
         assert _notifications(listener) == [{"priority": PRIORITY, "path": PATH}]
 
 
+def test_a_leased_row_does_not_silence_the_next_row_of_its_key() -> None:
+    """The fault stream's backlog probe skips rows under a live lease
+    (claim_backoff.py) because the busy probe reads PENDING rows only: the
+    next row of a key whose only other row is LEASED is its own edge."""
+
+    xid = {"path": "/v1/gpu-events/xid", "priority": 10}
+    with _connect() as listener, _connect() as writer:
+        listener.execute("LISTEN gpu_fault_processor_queue")
+        ids = _enqueue(writer, **xid)
+        assert _notifications(listener) == [xid]
+        writer.execute(
+            "UPDATE gpu_fault_processor_queue SET status='LEASED', "
+            "lease_expires_at=now() + interval '2 minutes' "
+            "WHERE request_id=ANY(%s)",
+            (ids,),
+        )
+        assert _notifications(listener, timeout=0.5) == [], "a lease is not an edge"
+        _enqueue(writer, **xid)
+        assert _notifications(listener) == [xid], "a LEASED row silences no edge"
+
+
 def _flush_concurrently(rows_each: int) -> None:
     ready = threading.Barrier(WRITERS)
     errors: list[BaseException] = []

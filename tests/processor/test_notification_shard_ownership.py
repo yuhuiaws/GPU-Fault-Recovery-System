@@ -7,8 +7,8 @@ listener still reported ``on_state(True, None)``, which the coordinator took
 as "notifications enabled": the idle ceilings stretched to the 5 s
 notification fallback on a process that would never be woken, and
 ``/metrics`` said notifications were on. A process without a shard never
-stretches the fault stream, and a shard owner only once it has settled empty
-with no fault-tier row PENDING or LEASED (the queue trigger announces only
+stretches the fault stream, and a shard owner only while no fault-tier row is
+PENDING or LEASED with a lapsed lease (the queue trigger announces only
 idle->busy edges, so a priority-0 row queued behind a pending one is never
 announced; see test_fault_stream_wake.py); a shard owner still stretches the
 routine streams.
@@ -16,7 +16,7 @@ routine streams.
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -25,7 +25,8 @@ from gpu_fault.processor import (
     ProcessorLeaseSettings,
     ProcessorPoolSettings,
 )
-from tests._builders import build_store
+from gpu_fault.store import SqliteStore
+from tests._builders import build_store, processor_request
 
 AVAILABLE = {"fault": 1, "observation": 0, "gpu": 0, "host": 0}
 
@@ -80,14 +81,34 @@ def test_a_shardless_process_keeps_the_polling_fault_backoff() -> None:
     assert processor._stream_idle_interval["fault"] == pytest.approx(0.5)
 
 
-def test_a_shard_owner_keeps_the_fault_backoff_at_fault_idle() -> None:
-    processor = _processor(build_store())
+@pytest.mark.parametrize(
+    ("fault_backlog", "interval"),
+    [pytest.param(True, 0.5, id="backlog"), pytest.param(False, 5.0, id="idle")],
+)
+def test_a_shard_owner_keeps_fault_idle_only_behind_a_fault_backlog(
+    tmp_path, fault_backlog: bool, interval: float
+) -> None:
+    # A store that answers the fault backlog query (the in-memory one does not).
+    store = SqliteStore(str(tmp_path / "shard-owner.db"))
+    if fault_backlog:
+        # PENDING and deferred: a fault row admitted behind it raises no edge.
+        store.enqueue_processor_request(
+            processor_request(
+                "/v1/attempts/terminal", body=b'{"attempt_id":"attempt-deferred"}'
+            ).model_copy(
+                update={"not_before": datetime.now(timezone.utc) + timedelta(hours=1)}
+            )
+        )
+    processor = _processor(store)
     processor._set_notification_state(True, 0)
 
     processor._stream_idle_interval["fault"] = 4.0
-    processor._claim_active_by_pool(AVAILABLE, lease_duration=timedelta(seconds=30))
+    try:
+        processor._claim_active_by_pool(AVAILABLE, lease_duration=timedelta(seconds=30))
+    finally:
+        store.close()
 
-    assert processor._stream_idle_interval["fault"] == pytest.approx(0.5)
+    assert processor._stream_idle_interval["fault"] == pytest.approx(interval)
 
 
 def test_shardless_transitions_are_counted_once_per_episode() -> None:

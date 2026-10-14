@@ -133,6 +133,25 @@ def _b64_bytes(value: str | None) -> bytes:
     return base64.b64decode(value) if value else b""
 
 
+# The fault stream's backlog probe (``has_unleased_fault_backlog``). It walks
+# ``gpu_fault_processor_queue_claim_window`` in claim order and stops at the
+# first row. Written as ``EXISTS`` it got a generic plan once psycopg had
+# prepared it -- a heap scan priced as if it would stop early, which it never
+# does when no fault row waits: 1.1 ms instead of 0.2 ms a call on 5,200 rows
+# (tests/store/test_postgres_claim_planner_discipline.py pins the walk).
+UNLEASED_FAULT_BACKLOG_SQL = """
+SELECT 1
+FROM gpu_fault_processor_queue
+WHERE priority <= %(max_priority)s
+  AND (
+      status='PENDING'
+      OR (status='LEASED' AND lease_expires_at <= %(now)s)
+  )
+ORDER BY priority, created_at, request_id
+LIMIT 1
+"""
+
+
 class PostgresProcessorStorageMixin:
     # Attributes supplied by the composed concrete implementation.
     processor_queue_state_mode: Any
@@ -574,6 +593,22 @@ class PostgresProcessorStorageMixin:
                 (RESERVED_TIER_MAX_PRIORITY,),
             )
             return cursor.fetchone()[0]
+
+    def has_unleased_fault_backlog(self, *, now: datetime) -> bool:
+        """A fault-tier row PENDING, or LEASED with a lease that lapsed by ``now``.
+
+        Unlike ``processor_fault_backlog_depth`` a row under a live lease does
+        not count: the queue trigger's "is the key busy" probe reads PENDING
+        rows only, so a leased row never silences the next row's edge, and it
+        is claimable again only once its lease lapses.
+        """
+
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                UNLEASED_FAULT_BACKLOG_SQL,
+                {"max_priority": RESERVED_TIER_MAX_PRIORITY, "now": now},
+            )
+            return cursor.fetchone() is not None
 
     def get_processor_request(self, request_id: str):
         """The queue row first, then the replay row a detached-layout

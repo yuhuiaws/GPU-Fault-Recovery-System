@@ -158,6 +158,23 @@ class SqliteProcessorQueueMixin:
             for item in self._list("processor_request")
         )
 
+    def has_unleased_fault_backlog(self, *, now: datetime) -> bool:
+        """A fault-tier row PENDING, or LEASED with a lease that lapsed by
+        ``now`` (``PostgresStore.has_unleased_fault_backlog``). The in-memory
+        store has no notifications and no such query."""
+
+        return any(
+            item.is_reserved_tier()
+            and (
+                item.status is ProcessorRequestStatus.PENDING
+                or (
+                    item.status is ProcessorRequestStatus.LEASED
+                    and (item.lease_expires_at is None or item.lease_expires_at <= now)
+                )
+            )
+            for item in self._list("processor_request")
+        )
+
     def get_processor_request(self, request_id: str):
         return self._get("processor_request", request_id)
 

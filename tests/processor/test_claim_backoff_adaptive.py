@@ -137,13 +137,13 @@ def test_ceiling_rule_covers_every_branch() -> None:
     free = lambda: False  # noqa: E731
     blocked = lambda: True  # noqa: E731
 
-    def unasked() -> bool:
+    def unasked(_hold: float) -> bool:
         raise AssertionError("a poller never asks for the fault backlog")
 
     assert quiet.idle_ceiling("fault") == 0.5 and quiet.idle_ceiling("host") == 2.0
     # The fault stream's idle ceiling stays at fault idle: the queue trigger
-    # announces only idle->busy edges. It stretches to the fallback only once
-    # settled with no fault backlog (test_fault_stream_wake.py).
+    # announces only idle->busy edges. It stretches to the fallback only while
+    # no fault-tier row waits to be claimed (test_fault_stream_wake.py).
     assert noisy.idle_ceiling("fault") == 0.5 and noisy.idle_ceiling("host") == 5.0
     for stream, busy_ceiling in (("fault", 0.1), ("host", 0.4)):
         kwargs = {"stream": stream, "next_interval": 0.8}
