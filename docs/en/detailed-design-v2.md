@@ -1381,8 +1381,13 @@ keeps the same-action aggregation optimization, and does not let a new event's a
 
 **④ Thread/coroutine model**: 1 scan thread + 2 wakeup listener threads +
 `GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS=8` execution threads, each scan taking a batch of
-`GPU_FAULT_WORKFLOW_BATCH_SIZE=100`. 6 replicas × 4 processes × 8 = 192 execution threads;
-mutual exclusion relies entirely on leases. The cadence of scanning is the wakeup; the `GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS=5` second poll is only
+`GPU_FAULT_WORKFLOW_BATCH_SIZE=100`. Every control-worker process starts a dispatcher (6 replicas × 4 processes by default),
+but only one process dispatches at a time: each `run_once` first takes the fleet-wide periodic lease `workflow-dispatch`
+(`GPU_FAULT_WORKFLOW_DISPATCH_LEASE_SECONDS`, default `max(15, 3 × poll interval)` = 15 seconds, renewed by its holder every tick;
+the lease owner is the per-process executor id) and returns `lease_held_by_other` without scanning when another process holds it (F-A1). The
+threads that execute workflows are the 8 of the lease holder, not 6 × 4 × 8 = 192; the other processes' pools stay idle, and when the
+holder stops renewing, the next process to take the expired lease (≤15 seconds) carries on, with `claim_workflow`'s execution lease
+keeping a single executor per workflow while two holders overlap at the handover. The cadence of scanning is the wakeup; the `GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS=5` second poll is only
 the fallback for lost wakeups (do not lengthen the interval): the two listener threads
 `gpu-fault-workflow-dispatch-wakeups-workflow` / `-remote-command` (`lifespan_workers.py`
 `dispatcher_wakeup_threads`) each call the Store's
