@@ -9321,6 +9321,16 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   single-GPU reset proof is unavailable), and the other checks and the probe cleanup in `finally` still run. A node still
   isolated at the end is recorded in `post_case_isolation`, naming the incident and taint that hold it. The verdict stays
   **FAIL**.
+- The product gaps plain EKS attempt 2 exposed are closed (detailed design, GPU service quiesce paragraph): (1) the
+  `nvidia-persistenced` the quiesce keeps holds only the other GPUs and `/dev/nvidiactl` and no longer stops the reset's
+  unload of the idle display stack when it is busy (read as a holder it made the reset fail busy three times and escalate
+  to RESTART_NODE); assert `released_kernel_modules` and `display_release_bystanders` after the busy refusal. (2) Another
+  incident's Agent GPU work (RUN_DCGM_DIAGNOSTIC, the diagnostic bundle, the field diagnostic, TRIGGER_HEALTH_SNAPSHOT
+  and the like) is refused at admission while the window is open (HTTP 409 `GPU_MAINTENANCE_WINDOW_OPEN`, resubmitted
+  after the window closed); work already running holds VERIFY with `gpu_client_kind=agent` and its result is voided and
+  rerun; the `dcgm_field_completeness` the quiesce taint causes is absorbed by the RUNNING reset chain, so no
+  RUN_DCGM_DIAGNOSTIC and no `drain-after-<workflow>` successor follows. A `dcgmi`/`nvvs` holder inside the window, or a
+  node another incident still isolates when the case ends, is a **FAIL**.
 - DESTR/COLLECT preflights on a mixed-provider site: the "pre-existing taints" verdict counts only **isolating** taints.
   Any taint blocks a `hyperpod` node (as before); an `eks-managed` node (EKS node group label, no HyperPod label) carries
   its managed node group's `nvidia.com/gpu=present:NoSchedule` by construction, recorded in the snapshot's
