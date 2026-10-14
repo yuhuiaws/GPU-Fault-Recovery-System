@@ -69,7 +69,12 @@ def await_site_aurora(
     requested: dict[str, Any],
     wait: AuroraCall,
 ) -> dict[str, Any]:
-    """Finish a scale-up once the roles rolled: both instances at the new floor."""
+    """Finish a scale-up once the roles rolled: both instances at the new floor.
+
+    ``requested`` is what a completed ``request`` returned: its settle loop
+    already proved this window change with consecutive observations, so the
+    floor needs one fresh observation, not that rule again (``window_settled``).
+    """
 
     if not requested["scale_up"]:
         return requested
@@ -79,6 +84,7 @@ def await_site_aurora(
         cluster_id=cluster_id,
         desired=desired,
         modified=bool(requested["modified"]),
+        window_settled=True,
     )
     return {**requested, "after": after}
 

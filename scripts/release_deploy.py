@@ -17,7 +17,7 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
     compute_agent_config_digest,
 )
-from gpu_fault.admin.command_log import child_failure, report_failure
+from gpu_fault.admin.command_log import admin_phase, child_failure, report_failure
 from gpu_fault.admin.operation_lock import inherited_lock_pass_fds
 from gpu_fault.admin.profile_approval import (
     ProfileApprovalError,
@@ -817,16 +817,18 @@ def _execute_release_locked(
     if live_state is not None:
         current_state = live_state
     else:
-        try:
-            current_state = read_live_release_state(site_file)
-        except ReleaseStateNotFound:
-            current_state = {}
-    profile_plan = plan_runtime_profile(
-        site_file,
-        live_profile_sha256=str(current_state.get("runtime_profile_sha256") or "")
-        or None,
-    )
-    approval = _resolve_profile_approval_state(site_file, profile_plan)
+        with admin_phase("release-deploy", "live-state"):
+            try:
+                current_state = read_live_release_state(site_file)
+            except ReleaseStateNotFound:
+                current_state = {}
+    with admin_phase("release-deploy", "profile-plan"):
+        profile_plan = plan_runtime_profile(
+            site_file,
+            live_profile_sha256=str(current_state.get("runtime_profile_sha256") or "")
+            or None,
+        )
+        approval = _resolve_profile_approval_state(site_file, profile_plan)
     profile_plan = approval.profile_plan
     if run_checks:
         _run(
@@ -834,11 +836,12 @@ def _execute_release_locked(
             cwd=root,
             environment=environment,
         )
-    prepared = prepare_site_release(
-        site_file,
-        profile_plan=profile_plan,
-        live_state=current_state,
-    )
+    with admin_phase("release-deploy", "prepare"):
+        prepared = prepare_site_release(
+            site_file,
+            profile_plan=profile_plan,
+            live_state=current_state,
+        )
     deployment_succeeded = False
     commit_started = False
     deployment: dict[str, Any] = {}
@@ -1044,29 +1047,30 @@ def main(argv: Sequence[str] | None = None) -> int:
             raise ReleaseDeployError(
                 "release-deploy requires a signed prebuilt attestation"
             )
-        attestation = verify_attestation(
-            ROOT,
-            arguments.prebuilt_attestation.resolve(),
-            signature=(
-                arguments.prebuilt_signature.resolve()
-                if arguments.prebuilt_signature is not None
-                else None
-            ),
-            bundle=(
-                arguments.prebuilt_bundle.resolve()
-                if arguments.prebuilt_bundle is not None
-                else None
-            ),
-            cosign_key=arguments.cosign_key,
-            certificate=(
-                arguments.prebuilt_certificate.resolve()
-                if arguments.prebuilt_certificate is not None
-                else None
-            ),
-            certificate_identity=arguments.certificate_identity,
-            certificate_oidc_issuer=(arguments.certificate_oidc_issuer),
-            allow_staging=arguments.allow_staging_release,
-        )
+        with admin_phase("release-deploy", "attestation"):
+            attestation = verify_attestation(
+                ROOT,
+                arguments.prebuilt_attestation.resolve(),
+                signature=(
+                    arguments.prebuilt_signature.resolve()
+                    if arguments.prebuilt_signature is not None
+                    else None
+                ),
+                bundle=(
+                    arguments.prebuilt_bundle.resolve()
+                    if arguments.prebuilt_bundle is not None
+                    else None
+                ),
+                cosign_key=arguments.cosign_key,
+                certificate=(
+                    arguments.prebuilt_certificate.resolve()
+                    if arguments.prebuilt_certificate is not None
+                    else None
+                ),
+                certificate_identity=arguments.certificate_identity,
+                certificate_oidc_issuer=(arguments.certificate_oidc_issuer),
+                allow_staging=arguments.allow_staging_release,
+            )
         _manifest, current_release_id = release_manifest(ROOT)
         subject = dict(attestation.get("subject") or {})
         current_manifest = ROOT / "dist/current-release.json"

@@ -4,6 +4,7 @@ import os
 import re
 import sys
 import threading
+import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -118,6 +119,54 @@ def announce(message: str) -> None:
     """
 
     os.write(2, (message + "\n").encode("utf-8"))
+
+
+ADMIN_PHASE_BEGIN = "admin-phase-begin"
+ADMIN_PHASE_END = "admin-phase-end"
+
+
+class AdminPhase:
+    """One open phase; ``exit_code`` marks a child that failed without raising."""
+
+    def __init__(self) -> None:
+        self.exit_code: int | None = None
+
+
+@contextmanager
+def admin_phase(command: str, phase: str) -> Iterator[AdminPhase]:
+    """Bracket one named step of an administrator command with timed log lines.
+
+    Most of these steps run in-process or through commands that print no line
+    of their own -- the Aurora settle loop's RDS reads, the STS identity, the
+    live-state reads -- so the log of a slow run showed four command lines and
+    then the release fourteen minutes later (live 2026-10-14: the 13.4-minute
+    stretch was RDS raising the Aurora floor from 8 to 124 ACU, first taken
+    for a once-per-release cost). Each phase prints a begin line, so a hang
+    names the step it is in, and an end line with its own monotonic seconds.
+    """
+
+    record = AdminPhase()
+    started = time.monotonic()
+    _phase_line(f"{ADMIN_PHASE_BEGIN} {_stamp()} command={command} phase={phase}")
+    failed = True
+    try:
+        yield record
+        failed = bool(record.exit_code)
+    finally:
+        _phase_line(
+            f"{ADMIN_PHASE_END} {_stamp()} command={command} phase={phase} "
+            f"status={'failed' if failed else 'ok'}"
+            + (f" exit_code={record.exit_code}" if record.exit_code else "")
+            + f" elapsed={time.monotonic() - started:.1f}s"
+        )
+
+
+def _stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _phase_line(text: str) -> None:
+    print(text, file=sys.stderr, flush=True)
 
 
 # A deploy is a chain of wrappers -- outer CLI, staging driver, nested CLI,

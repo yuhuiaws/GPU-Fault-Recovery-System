@@ -553,9 +553,10 @@ def test_request_settles_the_window_and_leaves_the_acu_ramp_to_await() -> None:
     """The administrator command rolls the roles between the two halves.
 
     ``request`` must hand back a cluster the release preflight accepts --
-    ``available`` on the new window -- without spending the scale-up's slow
-    part, the ``ServerlessDatabaseCapacity`` ramp; that metric is read only by
-    ``await``, after the roles have rolled.
+    ``available`` on the new window -- without reading the
+    ``ServerlessDatabaseCapacity`` metric; that is read only by ``await``, after
+    the roles have rolled. (On RDS the ramp still elapses inside ``request``:
+    RDS reads ``modifying`` until the instances reach the new floor.)
     """
 
     rds = FakeRds(0.5, 8.0)

@@ -55,6 +55,7 @@ from gpu_fault.admin.command_log import (
     ADMIN_LOG_ENVIRONMENT as ADMIN_LOG_ENVIRONMENT,
     ADMIN_LOG_KIND_MUTATING,
     ADMIN_LOG_KIND_READONLY,
+    admin_phase,
     announce,
     command_log,
     report_failure,
@@ -1119,31 +1120,35 @@ def _roll_admin_config(
     try:
         if apply.aurora_changed:
             aurora_touched = True
-            aurora = request_site_aurora(
-                site,
-                expected=apply.before.aurora,
-                desired=apply.desired.aurora,
-                request=request_aurora_capacity,
-            )
+            with admin_phase("config", "aurora-request"):
+                aurora = request_site_aurora(
+                    site,
+                    expected=apply.before.aurora,
+                    desired=apply.desired.aurora,
+                    request=request_aurora_capacity,
+                )
         else:
-            aurora = verify_site_aurora(
-                site, expected=apply.before.aurora, verify=verify_aurora_capacity
+            with admin_phase("config", "aurora-verify"):
+                aurora = verify_site_aurora(
+                    site, expected=apply.before.aurora, verify=verify_aurora_capacity
+                )
+        with admin_phase("config", "release-deploy") as phase:
+            returncode = phase.exit_code = _run_automatic_release(
+                repository_root=site.repository_root,
+                site_file=site_file,
+                state_dir=arguments.state_dir,
+                staging_only_release=staging_only,
+                lock_fd=lock_fd,
             )
-        returncode = _run_automatic_release(
-            repository_root=site.repository_root,
-            site_file=site_file,
-            state_dir=arguments.state_dir,
-            staging_only_release=staging_only,
-            lock_fd=lock_fd,
-        )
         rolled = returncode == 0
-        if rolled and aurora is not None:
-            aurora = await_site_aurora(
-                site,
-                desired=apply.desired.aurora,
-                requested=aurora,
-                wait=await_aurora_capacity,
-            )
+        if rolled and aurora is not None and aurora["scale_up"]:
+            with admin_phase("config", "aurora-await"):
+                aurora = await_site_aurora(
+                    site,
+                    desired=apply.desired.aurora,
+                    requested=aurora,
+                    wait=await_aurora_capacity,
+                )
     except AuroraCapacityDriftError as exc:
         # Somebody else moved the window and nothing was modified here: there is
         # no Aurora rollback to make and no reason to retain the target (live
@@ -1183,40 +1188,44 @@ def _apply_admin_config(
     """The locked apply: verify, record, roll, complete, then normalise the YAML."""
 
     state_dir = arguments.state_dir
-    release_identity = _current_release_metadata(site.repository_root)
-    site_identity = _admin_config_site_identity(site)
-    current = load_desired_admin_config(state_dir, migrate_legacy=True)
-    desired, source = _admin_config_candidate(arguments, current)
+    with admin_phase("config", "release-identity"):
+        release_identity = _current_release_metadata(site.repository_root)
+        site_identity = _admin_config_site_identity(site)
+        current = load_desired_admin_config(state_dir, migrate_legacy=True)
+        desired, source = _admin_config_candidate(arguments, current)
     staging_only = bool(release_identity["staging_only"])
-    verify_prebuilt_release(
-        CommandRunner(),
-        repository_root=site.repository_root,
-        state_dir=state_dir,
-        staging_only=staging_only,
-    )
-    pending = matching_pending_admin_config_apply(
-        state_dir,
-        site_identity=site_identity,
-        release_identity=release_identity,
-        desired=desired,
-    )
-    baseline = _validate_live_release_identity(
-        site,
-        release_identity,
-        state_dir=state_dir,
-        uncommitted_target_sha256=(
-            str(pending["desired_config_sha256"]) if pending is not None else None
-        ),
-    )
-    apply = begin_admin_config_apply(
-        state_dir,
-        site_identity=site_identity,
-        release_identity=release_identity,
-        desired=desired,
-        source=source,
-        approver_identity=_approver_identity(),
-        reference=arguments.reference,
-    )
+    with admin_phase("config", "attestation"):
+        verify_prebuilt_release(
+            CommandRunner(),
+            repository_root=site.repository_root,
+            state_dir=state_dir,
+            staging_only=staging_only,
+        )
+    with admin_phase("config", "live-release"):
+        pending = matching_pending_admin_config_apply(
+            state_dir,
+            site_identity=site_identity,
+            release_identity=release_identity,
+            desired=desired,
+        )
+        baseline = _validate_live_release_identity(
+            site,
+            release_identity,
+            state_dir=state_dir,
+            uncommitted_target_sha256=(
+                str(pending["desired_config_sha256"]) if pending is not None else None
+            ),
+        )
+    with admin_phase("config", "apply-record"):
+        apply = begin_admin_config_apply(
+            state_dir,
+            site_identity=site_identity,
+            release_identity=release_identity,
+            desired=desired,
+            source=source,
+            approver_identity=_approver_identity(),
+            reference=arguments.reference,
+        )
     release_id = str(release_identity["release_id"])
     audit = {
         "config_sha256": apply.config_sha256,
@@ -1238,13 +1247,14 @@ def _apply_admin_config(
     )
     if returncode:
         return returncode
-    result = complete_admin_config_apply(
-        state_dir,
-        config_sha256=apply.config_sha256,
-        release_id=release_id,
-        success=True,
-        details={"aurora": aurora} if aurora is not None else None,
-    )
+    with admin_phase("config", "apply-complete"):
+        result = complete_admin_config_apply(
+            state_dir,
+            config_sha256=apply.config_sha256,
+            release_id=release_id,
+            success=True,
+            details={"aurora": aurora} if aurora is not None else None,
+        )
     # The administrator's file is normalised only now, when desired.json and
     # the live site agree with it; a failed apply leaves their edit untouched.
     write_admin_config_file(admin_config_file_path(state_dir), desired, overwrite=True)

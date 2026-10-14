@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import subprocess
+import sys
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -1422,3 +1423,43 @@ def test_profile_drift_after_inline_approval_stops_with_the_new_digest(
     superseded = json.loads((stale / "superseded.json").read_text())
     assert superseded["status"] == "SUPERSEDED"
     assert superseded["replacement_plan_sha256"] == replacement["plan_sha256"]
+
+
+def test_the_steps_before_the_release_diff_print_timed_phases(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ``config`` log names every step up to the release-diff with its
+    seconds, including this driver's own (live state, Profile plan, prepare)."""
+
+    site = _site(tmp_path, monkeypatch)
+    profile = tmp_path / "repo/config/profile.yaml"
+    live = {"runtime_profile_sha256": hashlib.sha256(profile.read_bytes()).hexdigest()}
+    monkeypatch.setattr(release_deploy, "read_live_release_state", lambda _site: live)
+    monkeypatch.setattr(release_deploy, "_run", lambda *_args, **_kwargs: None)
+
+    def run_json(arguments, **_kwargs):
+        if "release-diff" in arguments:
+            print("release-diff-started", file=sys.stderr)
+            return _release_diff("NOOP", ["release_delivery"])
+        return _verification_report() if "verify" in arguments else _release_summary()
+
+    monkeypatch.setattr(release_deploy, "_run_json", run_json)
+
+    release_deploy.execute_release(site, run_checks=False)
+
+    before_diff = capsys.readouterr().err.split("release-diff-started")[0]
+    ends = [
+        line.split(" phase=")[1]
+        for line in before_diff.splitlines()
+        if line.startswith("admin-phase-end ")
+    ]
+    assert [item.split()[:2] for item in ends] == [
+        ["live-state", "status=ok"],
+        ["profile-plan", "status=ok"],
+        ["prepare", "status=ok"],
+    ]
+    assert all(
+        " command=release-deploy " in line
+        for line in before_diff.splitlines()
+        if line.startswith("admin-phase-")
+    ), "a release-deploy phase line names another command"

@@ -720,6 +720,22 @@ meant subtracting two timestamps by hand, while the duration of a single command
 | `release-phase <stamp> <phase> ... elapsed=<seconds>s total=<seconds>s` | `elapsed` is the cost from the previous checkpoint to this checkpoint, `total` is the cumulative time of this invocation |
 | `command-elapsed <seconds>s <command>` | Duration of a single command. Printed only above 15 seconds, otherwise thousands of sub-second kubectl calls would drown the command trace; `probe`-class read-only checks, which normally do not echo the command, also use this line |
 
+The steps of `gpu-fault-admin config` before and after the release are timed by the administrator command itself.
+Most of them run in-process or through commands that do not echo (the Aurora RDS reads, the STS identity, the live
+state reads), so the log used to show a few command lines and a gap of up to a quarter of an hour that nothing
+accounted for:
+
+| Line | Meaning |
+|---|---|
+| `admin-phase-begin <stamp> command=<command> phase=<step>` | A named step of an administrator command starts. For `config` the steps are, in order, `release-identity`, `attestation`, `live-release`, `apply-record`, `aurora-request` or `aurora-verify`, `release-deploy`, `aurora-await` (only when raising Min) and `apply-complete`; the release driver it runs prints `attestation`, `live-state`, `profile-plan` and `prepare` with `command=release-deploy` before the release-diff. A begin without an end means the process is still inside that step |
+| `admin-phase-end <stamp> command=<command> phase=<step> status=ok\|failed [exit_code=<n>] elapsed=<seconds>s` | The step ends, with its own duration. An exception and a child's non-zero exit are both `failed`; the latter carries `exit_code` |
+| `aurora-capacity-wait <stamp> cluster=<id> proof=window\|floor target=<min>/<max> status=<cluster status> window=<min>/<max> instances=<role>:<status>,... [acu=<role>:<ACU>@<sample age>s,...] stable=<n>/<required> elapsed=<seconds>s` | The wait of an Aurora capacity change. `proof=window` waits after `modify-db-cluster` for the cluster and both instances to be `available` on the new window (`stable` consecutive times); `proof=floor` proves after the rollout that both instances' actual ACU reached the new Min (a sample older than 3 minutes does not count). Printed whenever the state changes, otherwise repeated every 30 seconds |
+
+When Aurora Min is raised, `aurora-request` takes nearly all of the time, and that is RDS ramping, not the command's own
+overhead: until the instances reach the new Min RDS keeps reporting `modifying` (see the `status` and `instances` fields; raising Min from 8 to 124 ACU takes
+about 13 minutes, about 10 ACU a minute), the release preflight requires `available`, so the roles can only roll afterwards
+([Administrator Capacity Configuration](administrator-capacity-configuration.md) §4.2 step 4).
+
 A phase is the interval between checkpoints, and the longest stretch of an upgrade falls inside **one** phase:
 `data-plane-progress` checkpoints only once per cluster, so a four-wave cluster prints two phase lines seven and a half minutes apart,
 with nothing but `get nodes`/`get jobs` polling in between. That stretch now has its own lines, all with `total`

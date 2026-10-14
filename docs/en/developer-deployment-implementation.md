@@ -231,6 +231,12 @@ RDS to be in place" and "wait for the instances to actually run on the new ACU",
 `CommandRunner.aws_json`; `config --dry-run` only prints the plan and does not call RDS). The legacy `deploy.sh` and the operations manual
 call the same module through `python -m gpu_fault.admin.aurora_capacity create|reconcile`;
 `tests/admin/test_admin_aurora_capacity.py` scans the whole repository to guarantee that this RDS parameter appears only in this module.
+The split does not let a raised Min ramp overlap the role rollout: RDS keeps reporting `modifying` until the instances
+have climbed to the new Min, and the release preflight (`_check_aurora`) requires the cluster and the instances to be
+`available`, so the ramp falls into the first half (8 -> 124 ACU measured at 742-822 seconds); the second half therefore
+makes one fresh ACU observation (`window_settled`) instead of repeating the three-consecutive settle rule. The polls of both
+halves print `aurora-capacity-wait` progress lines (when the state changes, otherwise every 30 seconds), and every step of
+`config` has its own `admin-phase-begin/end` timing lines (Administrator Daily Operations §4.1).
 bootstrap's capacity reconciliation for an existing cluster is placed after the writer/reader are in place, because the shared reconciler must prove on both
 instances that the window has taken effect.
 

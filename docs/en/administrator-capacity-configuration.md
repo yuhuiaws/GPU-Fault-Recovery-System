@@ -146,6 +146,13 @@ and, in order:
    to return to `available` on the new window (three consecutive observations); when it did not change, checks
    read-only that the live window equals the pre-change value (`verify_aurora_capacity`), so an apply is never
    recorded `APPLIED` over a window somebody else moved.
+   RDS keeps reporting `modifying` until the instances have climbed to the new Min, and the release preflight
+   requires the cluster and both instances to be `available`, so raising Min puts the ramp inside this step: raising
+   Min from 8 to 124 ACU was measured waiting here 742-822 seconds (five runs, `ServerlessDatabaseCapacity` rising
+   about 10 ACU a minute), 124/128 -> 128/128 and 128/128 -> 8/32 about two minutes, while an apply that leaves
+   Aurora alone spends a dozen seconds on the whole stretch. While it waits, one `aurora-capacity-wait` line is
+   printed whenever the state changes and every 30 seconds otherwise (cluster and instance states, window, consecutive
+   stable count; see [Administrator Daily Operations](administrator-operations.md) §4.1).
 5. Rolls only the affected CPU roles and completes verify/stability/commit. A schedulability preflight runs first:
    per live node, allocatable CPU/memory minus the requests of every scheduled Pod, modelling the roll one role at a
    time (ingress's surge Pod needs one free 4-core/4Gi slot, the consumer tier's added replicas take headroom for
@@ -160,11 +167,20 @@ and, in order:
    ("free one 4-core / 4Gi slot on a second node or add a CPU node"). The roles roll one at a time, each waiting for
    its own rollout: ingress -> control-worker ->
    spool-worker.
-6. When raising Min ACU, only now waits for the `ServerlessDatabaseCapacity` of both writer and reader to reach the new
-   Min. This step and the role rollout are independent; it is placed after the rollout so that the scale-up ramp time does not serially occupy the whole
-   command.
+6. When raising Min ACU, proves after the role rollout that the `ServerlessDatabaseCapacity` of both writer and reader
+   reached the new Min (samples at most 3 minutes old). Step 4 already confirmed with three consecutive observations that
+   this change started and finished, so one fresh observation is the proof here and the three-poll rule is not repeated
+   (three polls were measured at about 38 seconds, one takes about 6); a stale sample still keeps the step waiting. The
+   ramp itself already happened in step 4, so this step normally ends after one read.
 7. Writes `history/<...>/after.json` and `result.json` (`APPLIED`), deletes `pending.json`,
    and writes the normalised complete 22 items back to `<state-dir>/admin-config.yaml`.
+
+The log prints `admin-phase-begin <time> command=config phase=<step>` and
+`admin-phase-end ... status=ok|failed elapsed=<seconds>s` per step: steps 1-3 are `release-identity`,
+`attestation`, `live-release` and `apply-record`, step 4 is `aurora-request` or `aurora-verify`, step 5 is
+`release-deploy` (inside it the release driver prints `attestation`, `live-state`, `profile-plan` and `prepare` with
+`command=release-deploy` before the release-diff), step 6 is `aurora-await` (only when raising Min), and step 7 is
+`apply-complete`. The slow step is the one with the large `elapsed`.
 
 When steps 4 to 6 fail, the CLI re-reads the live release state; Aurora cannot be restored on the exit code of the release subprocess alone.
 Only when it is proven that the roles are still on the originally committed configuration, that a matching configuration release has not yet started role changes, or that a matching
@@ -529,7 +545,9 @@ The configuration digest is independent of the code release ID, image digest and
 
 - Uploads or rebuilds no code artefact;
 - On Aurora field changes first calls the RDS API and waits for the cluster, writer and reader to be available on the new window, then rolls
-  the roles; when raising Min, waits after the role rollout for both instances' actual ACU to land;
+  the roles (RDS reports `modifying` until the instances reach the new Min, so a raised Min ramps before the roles roll,
+  8 -> 124 ACU in about 13 minutes); when raising Min, proves after the role rollout with one fresh observation that both
+  instances' actual ACU landed;
 - Runs no schema, GPU data-plane, Node Runtime or Runtime Profile phase;
 - Publishes no cluster registry revision;
 - A remediation budget or worker replica change rolls only the control-worker; a node count change changes the fault reserved depth shared by the three roles,

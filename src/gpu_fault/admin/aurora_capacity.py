@@ -431,6 +431,60 @@ def _ready(
     return True
 
 
+AURORA_WAIT_NARRATION_SECONDS = 30.0
+"""How often an unchanged settle loop repeats its ``aurora-capacity-wait`` line.
+
+The loop's RDS and CloudWatch reads print nothing of their own, and raising
+the floor keeps RDS ``modifying`` for the whole ACU ramp: live
+2026-10-14 an 8/32 -> 124/128 apply sat in this loop for 801 s with not one
+line in its log, and the stretch was first taken for a once-per-release cost.
+The line is printed when what RDS reports changes and on this heartbeat
+otherwise -- the rule of the release's ``installer-wait`` -- so a long ramp
+reads as a ramp, not as a hang.
+"""
+
+
+def _sample_age(observed_at: object) -> str:
+    try:
+        sampled = datetime.fromisoformat(str(observed_at)).astimezone(UTC)
+    except (TypeError, ValueError):
+        return ""
+    return f"@{int((datetime.now(UTC) - sampled).total_seconds())}s"
+
+
+def _narrated_state(state: dict[str, Any], *, observed: bool) -> tuple[str, str]:
+    """``(what is compared, what is printed)``: a floor proof also prints each
+    sample's age (a sample older than three minutes does not count), but an
+    age that grows between polls is not a change worth a line of its own."""
+
+    try:
+        window = _window_text(_configured_capacity(state))
+    except AdminConfigError:
+        window = "unknown"
+    raw_instances = state.get("instances")
+    instances = [
+        item
+        for item in (raw_instances if isinstance(raw_instances, list) else [])
+        if isinstance(item, dict)
+    ]
+    fields = [
+        f"status={state.get('cluster_status')}",
+        f"window={window}",
+        "instances="
+        + ",".join(f"{item.get('role')}:{item.get('status')}" for item in instances),
+    ]
+    if not observed:
+        return " ".join(fields), " ".join(fields)
+    acu = [f"{item.get('role')}:{item.get('actual_acu')}" for item in instances]
+    aged = [
+        value + _sample_age(item.get("actual_acu_observed_at"))
+        for value, item in zip(acu, instances, strict=True)
+    ]
+    return " ".join([*fields, "acu=" + ",".join(acu)]), " ".join(
+        [*fields, "acu=" + ",".join(aged)]
+    )
+
+
 def _await_ready(
     caller: AwsJsonCaller,
     *,
@@ -442,9 +496,12 @@ def _await_ready(
     timeout_seconds: int,
     poll_seconds: float,
 ) -> dict[str, Any]:
-    deadline = time.monotonic() + timeout_seconds
+    started = time.monotonic()
+    deadline = started + timeout_seconds
     last: dict[str, Any] = {}
     stable = 0
+    narrated: tuple[str, int] | None = None
+    narrated_at = started
     while time.monotonic() < deadline:
         last = observe_aurora_capacity(
             aws_region=aws_region,
@@ -463,6 +520,22 @@ def _await_ready(
             )
             else 0
         )
+        now = time.monotonic()
+        compared, shown = _narrated_state(last, observed=require_observed_capacity)
+        if (compared, stable) != narrated or (
+            now - narrated_at >= AURORA_WAIT_NARRATION_SECONDS
+        ):
+            print(
+                f"aurora-capacity-wait {datetime.now(UTC):%Y-%m-%dT%H:%M:%SZ} "
+                f"cluster={cluster_id} "
+                f"proof={'floor' if require_observed_capacity else 'window'} "
+                f"target={_window_text((desired.min_acu, desired.max_acu))} "
+                f"{shown} stable={stable}/{required_stable} "
+                f"elapsed={now - started:.1f}s",
+                file=sys.stderr,
+                flush=True,
+            )
+            narrated, narrated_at = (compared, stable), now
         if stable >= required_stable:
             return last
         time.sleep(poll_seconds)
@@ -571,14 +644,16 @@ def request_aurora_capacity(
     The first half of a capacity change for a caller with work to do in
     between: the ``modify-db-cluster`` and the wait for the cluster and both
     instances to be ``available`` with the new window
-    (``CAPACITY_SETTLE_STABLE_POLLS`` times after a modify). It does not wait
-    for a scale-up's instances to actually run at the new floor; that is
-    ``await_aurora_capacity``, which the administrator command runs after the
-    control-plane roles have rolled, because the two are independent and the
-    ACU ramp is the slow part. The structural wait has to happen here, though:
-    the release's own preflight refuses an Aurora cluster that is not
-    ``available``. The result's ``scale_up`` says whether
-    ``await_aurora_capacity`` still has work to do.
+    (``CAPACITY_SETTLE_STABLE_POLLS`` times after a modify). It reads no ACU
+    metric; ``await_aurora_capacity`` proves the floor after the control-plane
+    roles have rolled. That does not take a scale-up's ramp off the critical
+    path, though: RDS keeps the change ``modifying`` until the instances
+    reach the new floor (live 2026-10-14, 8/32 -> 124/128: 801 s in this wait
+    while ``ServerlessDatabaseCapacity`` climbed about 10 ACU a minute; the
+    smaller 124/128 -> 128/128 and 128/128 -> 8/32 moves took two minutes),
+    and the release's own preflight refuses a cluster or instance that is not
+    ``available``, so the roles cannot roll any earlier. The result's
+    ``scale_up`` says whether ``await_aurora_capacity`` still has work to do.
     """
 
     caller = _caller(aws_json)
@@ -615,6 +690,7 @@ def await_aurora_capacity(
     cluster_id: str,
     desired: AuroraCapacityConfig,
     modified: bool,
+    window_settled: bool = False,
     timeout_seconds: int = 1800,
     poll_seconds: float = 10.0,
     aws_json: AwsJsonCaller | None = None,
@@ -625,7 +701,15 @@ def await_aurora_capacity(
     cluster already reads ``available`` on the new window, this proves the
     ``ServerlessDatabaseCapacity`` metric reached the floor on the writer and
     the reader. ``modified`` says whether this apply issued the change, in
-    which case the same consecutive-poll rule applies.
+    which case the same consecutive-poll rule applies -- unless
+    ``window_settled`` says the request half already applied it to this very
+    change. Those polls exist because the first observation after a modify can
+    precede RDS's flip to ``modifying``; a change that has already settled
+    cannot flip first, so one fresh observation of the floor (cluster and both
+    instances ``available`` on the window, each instance's sample at least
+    the floor and at most three minutes old) is the whole proof. Live
+    2026-10-14 the three polls took 38 s after a twelve-minute release; one
+    takes about 6 s.
     """
 
     desired.validate()
@@ -635,7 +719,9 @@ def await_aurora_capacity(
         cluster_id=cluster_id,
         desired=desired,
         require_observed_capacity=True,
-        required_stable=CAPACITY_SETTLE_STABLE_POLLS if modified else 1,
+        required_stable=(
+            CAPACITY_SETTLE_STABLE_POLLS if modified and not window_settled else 1
+        ),
         timeout_seconds=timeout_seconds,
         poll_seconds=poll_seconds,
     )
