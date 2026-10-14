@@ -3,9 +3,10 @@
 The verb covers five things with one parser: the first bootstrap (all four
 inputs), the upgrade (``--state-dir`` alone), adding a GPU cluster (the managed
 ARNs plus the new one), rolling back one step (``--rollback``) and approving a
-pending Runtime Profile plan and continuing (``--approve-profile-plan``). The
-CLI module assembles the parser and dispatch; deploy arguments and decisions
-live here.
+pending Runtime Profile plan and continuing (``--approve-profile-plan``); a
+site whose registration cluster left moves that anchor first
+(``--registration-cluster``). The CLI module assembles the parser and
+dispatch; deploy arguments and decisions live here.
 
 Every collaborator the command shells out to or that touches AWS arrives in
 :class:`DeployHooks`, looked up by the CLI at call time, so the CLI module
@@ -36,6 +37,10 @@ from gpu_fault.admin.grafana import add_grafana_arguments
 from gpu_fault.admin.installation_lifecycle import retire_completed_site
 from gpu_fault.admin.membership_lock import administrator_operation_lock
 from gpu_fault.admin.notification_precheck import WAIT_FLAG
+from gpu_fault.admin.registration_anchor import (
+    reanchor_registration,
+    require_registration_anchor,
+)
 from gpu_fault.admin.release_consent import add_release_consent_arguments
 from gpu_fault.admin.site import SiteConfigError
 
@@ -51,7 +56,8 @@ def add_deploy_command(commands: Any) -> None:
             "gpu-fault-admin deploy --state-dir STATE_DIR "
             "[--cpu-cluster-arn CPU_ARN --gpu-cluster-arn GPU_ARN ... "
             "--admin-email EMAIL] [--rollback] "
-            "[--approve-profile-plan PLAN_SHA256 --reference REFERENCE]"
+            "[--approve-profile-plan PLAN_SHA256 --reference REFERENCE] "
+            "[--registration-cluster CLUSTER_ID --reference REFERENCE]"
         ),
         description=(
             "Bootstrap a new site (all four inputs), upgrade the site recorded "
@@ -149,9 +155,22 @@ def add_deploy_action_arguments(deploy: argparse.ArgumentParser) -> None:
         ),
     )
     deploy.add_argument(
+        "--registration-cluster",
+        metavar="CLUSTER_ID",
+        help=(
+            "when the site's Runtime Profile registration cluster has left the "
+            "site (its completed remove-cluster journal proves it) and GPU "
+            "clusters remain, move that anchor to this remaining cluster of the "
+            "same provider, journaled with --reference, and continue the deploy"
+        ),
+    )
+    deploy.add_argument(
         "--reference",
         metavar="REFERENCE",
-        help="approved change or maintenance-window reference for the approval",
+        help=(
+            "approved change or maintenance-window reference for "
+            "--approve-profile-plan or --registration-cluster"
+        ),
     )
     deploy.add_argument(
         WAIT_FLAG,
@@ -300,6 +319,10 @@ def refuse_rollback_options(arguments: argparse.Namespace) -> None:
                 getattr(arguments, "approve_profile_plan", None),
             ),
             (
+                "--registration-cluster",
+                getattr(arguments, "registration_cluster", None),
+            ),
+            (
                 "--accept-schema-change",
                 getattr(arguments, "accept_schema_change", False),
             ),
@@ -350,9 +373,10 @@ def approve_pending_profile_plan(
     plan_sha256 = getattr(arguments, "approve_profile_plan", None)
     reference = getattr(arguments, "reference", None)
     if not plan_sha256:
-        if reference:
+        if reference and not getattr(arguments, "registration_cluster", None):
             raise SiteConfigError(
-                "--reference is only used with --approve-profile-plan"
+                "--reference is only used with --approve-profile-plan or "
+                "--registration-cluster"
             )
         return
     if not reference:
@@ -364,6 +388,34 @@ def approve_pending_profile_plan(
         f"gpu-fault-admin: Runtime Profile plan {record['plan_sha256']} approved at "
         f"{record['approved_at']} by {record['approver_identity']} "
         f"(reference {record['reference']}); continuing the deploy",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def move_departed_registration(arguments: argparse.Namespace, state_dir: Path) -> None:
+    """``--registration-cluster ID --reference REF``: move the anchor, deploy on.
+
+    The exit for a site an older ``remove-cluster`` left naming its removed
+    registration cluster while others remained: every deploy refuses it
+    (``require_registration_anchor``) and names this flag. The move is
+    proof-checked and journaled by ``registration_anchor.reanchor_registration``.
+    """
+
+    cluster_id = getattr(arguments, "registration_cluster", None)
+    if not cluster_id:
+        return
+    reference = getattr(arguments, "reference", None)
+    if not reference:
+        raise SiteConfigError("--registration-cluster requires --reference")
+    with administrator_operation_lock(state_dir):
+        entry = reanchor_registration(
+            state_dir, cluster_id=str(cluster_id), reference=str(reference)
+        )
+    print(
+        "gpu-fault-admin: Runtime Profile registration cluster moved from "
+        f"{entry['previous']} to {entry['registration_cluster_id']} (reference "
+        f"{entry['reference']}, proof {entry['proof']}); continuing the deploy",
         file=sys.stderr,
         flush=True,
     )
@@ -574,6 +626,10 @@ def run_deploy(arguments: argparse.Namespace, *, hooks: DeployHooks) -> int:
     if getattr(arguments, "rollback", False):
         return run_deploy_rollback(arguments, state_dir, hooks=hooks)
     approve_pending_profile_plan(arguments, state_dir, hooks=hooks)
+    move_departed_registration(arguments, state_dir)
+    # A registration cluster that left while members remain names no family
+    # for the site base: refused here, minutes before the release gates.
+    require_registration_anchor(state_dir)
     # A deployed cluster whose own Runtime Profile template changed policy
     # stops for review here, before the release bundle and its gates; the
     # approval a rerun carries is consumed when the site is finalized.

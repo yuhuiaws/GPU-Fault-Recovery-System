@@ -340,9 +340,11 @@ def test_a_template_of_the_other_family_is_refused_not_named(
 def test_the_family_comes_from_the_registration_cluster_entry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """A registration cluster missing from spec.clusters cannot name the base;
-    a site without GPU cluster entries keeps the HyperPod family (a profile
-    owning no nodeReboot is of no family and is never refused)."""
+    """A registration cluster missing from spec.clusters cannot name the base,
+    and a site without GPU cluster entries has none to register a new version
+    under: it was planned as HyperPod family and then refused by the control
+    plane (the anchor names a cluster it removed), so it is refused here until
+    a cluster joins and takes the anchor over."""
 
     site = _site(tmp_path, monkeypatch)
     profile = tmp_path / "repo/config/profile.yaml"
@@ -367,7 +369,12 @@ def test_the_family_comes_from_the_registration_cluster_entry(
     document["spec"]["clusters"] = []
     _write(site, document)
 
-    plan = release_deploy.plan_runtime_profile(site, live_profile_sha256=live_sha)
+    with pytest.raises(release_deploy.ReleaseDeployError, match="has no GPU cluster"):
+        release_deploy.plan_runtime_profile(site, live_profile_sha256=live_sha)
 
-    assert plan.desired_version == f"regional-hyperpod-{plan.policy_digest[:12]}"
-    assert plan.change_kind == "EXPANSIVE", plan
+    value["claims"] = []
+    profile.write_text(yaml.safe_dump(value, sort_keys=False), encoding="utf-8")
+    unchanged = release_deploy.plan_runtime_profile(site, live_profile_sha256=live_sha)
+    assert unchanged.change_kind == "UNCHANGED", (
+        "an emptied site whose profile stays as it is deploys as before"
+    )

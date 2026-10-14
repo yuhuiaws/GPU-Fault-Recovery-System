@@ -92,6 +92,7 @@ from gpu_fault.admin.cluster_removal_network import (
     wait_vpc_association_absent,
 )
 from gpu_fault.admin.failure_domain_map import apply_failure_domain_map
+from gpu_fault.admin.registration_anchor import fill_departed_anchor
 from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault.admin.execution import (
     recovery_deadline,
@@ -1493,4 +1494,5 @@ def join_cluster(
 ) -> dict[str, Any]:
     with membership_operation_lock(request.site), interruption_scope(wait_all=True):
         current = reload_site_for_mutation(request.site)
-        return _join_cluster_locked(replace(request, site=current), runner=runner)
+        result = _join_cluster_locked(replace(request, site=current), runner=runner)
+        return {**result, **fill_departed_anchor(current.source)}

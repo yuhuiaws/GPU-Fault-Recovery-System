@@ -69,6 +69,7 @@ from gpu_fault.admin.profile_approval import (
     write_profile_plan,
 )
 from gpu_fault.admin.cluster_join_types import JoinClusterRequest
+from gpu_fault.admin.registration_anchor import require_anchor_family
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.cluster_scope import (
     PROVIDER_NODE_REBOOT_OWNERS,
@@ -549,8 +550,11 @@ def cluster_runtime_profile(
 
     Needed only when the site profile cannot reboot the cluster's provider;
     its new version is a reviewed policy change (see the module docstring).
+    The first cluster to join an emptied site must be of the provider the
+    site base follows (``registration_anchor.require_anchor_family``).
     """
 
+    require_anchor_family(request.site.source, [target.provider])
     rerun = (
         f"gpu-fault-admin join-cluster --state-dir {request.site.source.parent} "
         f"--gpu-cluster-arn {request.gpu_cluster_arn}"

@@ -456,6 +456,15 @@ def recover_verified_site_contract(
         value = verified_spec.get(key)
         if isinstance(value, dict):
             recovered_spec[key] = deepcopy(value)
+    # The registration anchor follows membership, not the release:
+    # remove-cluster, a join into an emptied site and deploy
+    # --registration-cluster move it between releases. Restored from the
+    # verified contract it named the removed cluster again after the next
+    # deploy, and the deploy after that refused.
+    profile = existing_spec.get("runtimeProfile")
+    anchor = profile.get("registrationClusterId") if isinstance(profile, dict) else None
+    if anchor and isinstance(recovered_spec.get("runtimeProfile"), dict):
+        recovered_spec["runtimeProfile"]["registrationClusterId"] = anchor
     verified_clusters = {
         item.get("eksClusterArn"): item
         for item in verified_spec.get("clusters", [])

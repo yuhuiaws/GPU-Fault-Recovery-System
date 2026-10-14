@@ -59,6 +59,10 @@ from gpu_fault.admin.process_supervisor import (
     ProcessSupervisionLost,
     interruption_scope,
 )
+from gpu_fault.admin.registration_anchor import (
+    fill_departed_anchor,
+    require_anchor_family,
+)
 from gpu_fault.admin.site import RenderedSite, load_site
 
 # Read-only discovery and the per-cluster prerequisite work (IAM role, network
@@ -278,6 +282,27 @@ def _discovered_runtime_profiles(
         raise
 
 
+def _joining_providers(
+    context: BatchJoinContext,
+    attempts: list[JoinAttempt],
+    discoveries: dict[str, tuple[ClusterIdentity, str, dict[str, Any] | None]],
+) -> list[str]:
+    """The providers of every cluster the batch still joins, discovered now
+    or by an earlier run."""
+
+    providers = []
+    for attempt in attempts:
+        arn = attempt.request.gpu_cluster_arn
+        if arn in context.failures:
+            continue
+        if step_done(attempt.state, "DISCOVERED"):
+            target = join._identity(attempt.state["evidence"]["DISCOVERED"]["target"])
+        else:
+            target = discoveries[arn][0]
+        providers.append(target.provider)
+    return providers
+
+
 def _checkpoint_readonly_results(
     context: BatchJoinContext,
     attempts: list[JoinAttempt],
@@ -286,6 +311,17 @@ def _checkpoint_readonly_results(
 ) -> list[JoinAttempt]:
     active = []
     identities: list[tuple[str, str, str, str, str]] = []
+    # Before any review or mutation: the first batch into an emptied site
+    # must bring a cluster of the family its base follows.
+    try:
+        require_anchor_family(
+            context.site.source, _joining_providers(context, attempts, discoveries)
+        )
+    except BootstrapError as exc:
+        if not context.failures:
+            raise
+        failed = ", ".join(sorted(context.failures))
+        raise BootstrapError(f"{exc} (discovery failed for {failed})") from exc
     profiles = _discovered_runtime_profiles(context, attempts, discoveries)
     for attempt in attempts:
         arn = attempt.request.gpu_cluster_arn
@@ -688,7 +724,10 @@ def _commit_clusters(
 
 
 def _finish(context: BatchJoinContext) -> dict[str, Any]:
+    # The joined clusters are members now: a departed registration anchor
+    # moves to one of its provider (``registration_anchor``).
     summary = {
+        **fill_departed_anchor(context.site.source),
         "schema_version": 2,
         "phase": "PARTIAL" if context.failures else "COMPLETED",
         "batch_id": context.batch_id,
@@ -814,6 +853,7 @@ def join_clusters(
                 "already_managed": [
                     item for item in results if item.get("phase") == "ALREADY_MANAGED"
                 ],
+                **fill_departed_anchor(current.source),
             }
         return _join_clusters_locked(
             tuple(replace(request, site=current) for request in requests),

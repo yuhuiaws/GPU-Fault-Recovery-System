@@ -29,6 +29,7 @@ from gpu_fault.admin.bootstrap_ownership import (
     resolve_node_scope,
 )
 from gpu_fault.admin.bootstrap_site import hyperpod_inventory
+from gpu_fault.admin.registration_anchor import departed_anchor, departed_anchor_refusal
 from gpu_fault.eks_node_repair import (
     aggregate_node_repair,
     node_repair_error,
@@ -68,7 +69,9 @@ def registration_cluster_provider(
     Read from ``site.yaml`` (``spec.runtimeProfile.registrationClusterId`` and
     the matching ``spec.clusters[]`` entry). A registration cluster the deploy
     no longer manages, or an unreadable site, is refused: the site base profile
-    must not be re-derived from whatever cluster happens to come first.
+    must not be re-derived from whatever cluster happens to come first. A site
+    whose last cluster left keeps the family of the cluster it was anchored on,
+    which that cluster's removal journal records (``registration_anchor``).
     """
 
     site_file = state_dir / "site.yaml"
@@ -83,9 +86,14 @@ def registration_cluster_provider(
         raise BootstrapError("cannot read the site's registration cluster") from exc
     entry = entries.get(registration)
     if entry is None:
-        # Zero GPU clusters (remove-cluster) keep the site's own profile: the
-        # anchor is stable and no cluster re-derives it.
-        return None if not entries else _refuse_registration(registration)
+        departed = departed_anchor(document, state_dir)
+        if departed is None:
+            return None if not entries else _refuse_registration(registration)
+        if entries:
+            raise BootstrapError(departed_anchor_refusal(document, departed, state_dir))
+        # Zero GPU clusters keep the site's own profile; without the removal
+        # journal the fresh-site rule names the family, as it always did.
+        return departed.provider
     arn = str(entry.get("eksClusterArn") or "")
     if not any(cluster.eks_arn == arn for cluster in gpu_clusters):
         _refuse_registration(registration)

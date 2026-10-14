@@ -38,7 +38,6 @@ from gpu_fault.cluster_scope import (
     PROVIDER_PROFILE_SOURCES,
     PROVIDER_PROFILE_VERSIONS,
     PROVIDER_VERSION_PREFIXES,
-    ClusterProvider,
     cluster_provider,
 )
 from gpu_fault.models import CapabilityMode, RuntimeProfile
@@ -250,15 +249,23 @@ def _registration_provider(
     """The provider of the registration cluster: the family the site base follows.
 
     ``bootstrap_discovery.regional_profile_for`` renders the base from the same
-    ``spec.clusters[]`` entry. A site without GPU cluster entries keeps the
-    HyperPod family it always had; a registration cluster missing from the
-    entries is refused -- the base cannot be named after a cluster this site
-    does not manage.
+    ``spec.clusters[]`` entry. A registration cluster missing from the entries
+    is refused -- the base cannot be named after a cluster this site does not
+    manage, and the control plane registers a new version only under a
+    registered cluster. A site without GPU cluster entries has no such
+    cluster: its last cluster left with the anchor, and a new version is
+    refused until a cluster joins and takes the anchor over (it used to be
+    planned as HyperPod family and then refused at registration).
     """
 
     clusters = [item for item in spec.get("clusters") or [] if isinstance(item, dict)]
     if not clusters:
-        return ClusterProvider.HYPERPOD.value
+        raise ReleaseDeployError(
+            "the site has no GPU cluster to register a new site Runtime Profile "
+            f"version under (its registration cluster {registration_cluster_id} "
+            "left the site); join a cluster of the site base family first -- it "
+            "takes over the anchor -- then deploy"
+        )
     for entry in clusters:
         if str(entry.get("clusterId") or "") != registration_cluster_id:
             continue
