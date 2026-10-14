@@ -108,9 +108,15 @@ def _child(
     shutdown_requested = Event()
     lock = Lock()
     completions = 0
+    requested = False
 
     def handle_signal(_signum, _frame) -> None:
-        shutdown_requested.set()
+        # A second SIGTERM runs this handler again inside the first one's
+        # shutdown_requested.set(), whose lock is not reentrant: set it once.
+        nonlocal requested
+        if not requested:
+            requested = True
+            shutdown_requested.set()
 
     def process_request() -> None:
         nonlocal completions

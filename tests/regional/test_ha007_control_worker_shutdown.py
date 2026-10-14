@@ -329,3 +329,96 @@ def test_child_signal_dispatch_preserves_the_deadline_without_condition_wait(
         assert result["completed"] == 0, (
             "the pending request must not be marked complete"
         )
+
+
+def test_a_second_sigterm_inside_the_child_handler_cannot_deadlock_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """CPython runs a Python handler inside another one, between two bytecodes.
+    A second SIGTERM that lands while the first handler is inside
+    ``Event.set()`` runs the handler again where the Event's lock is held -- the
+    patched ``notify_all`` runs only then -- and a handler that sets the Event
+    again blocks on that non-reentrant lock for ever."""
+
+    now = 0.0
+    handlers: list = []
+    reentered: list[bool] = []
+
+    class SecondSignalInsideSet(threading.Condition):
+        def notify_all(self) -> None:
+            if not reentered:
+                reentered.append(True)
+                handlers[0](signal.SIGTERM, None)
+            super().notify_all()
+
+    with monkeypatch.context() as patch:
+        patch.setattr(threading, "Condition", SecondSignalInsideSet)
+        event = threading.Event()
+
+    def sleep(seconds: float) -> None:
+        nonlocal now
+        now += seconds
+        handlers[0](signal.SIGTERM, None)
+
+    class FinishedRequest:
+        def __init__(self, *, target, name: str, daemon: bool) -> None:
+            self.name = name
+
+        def start(self) -> None:
+            pass
+
+        def join(self, *, timeout: float) -> None:
+            pass
+
+        def is_alive(self) -> bool:
+            return False
+
+    monkeypatch.setattr(ha007, "Event", lambda: event)
+    monkeypatch.setattr(ha007, "Thread", FinishedRequest)
+    monkeypatch.setattr(
+        ha007,
+        "signal",
+        SimpleNamespace(
+            SIGTERM=signal.SIGTERM, signal=lambda _sig, fn: handlers.append(fn)
+        ),
+    )
+    monkeypatch.setattr(
+        ha007, "time", SimpleNamespace(monotonic=lambda: now, sleep=sleep)
+    )
+    monkeypatch.setattr(
+        ha007,
+        "ShutdownCoordinator",
+        lambda budget: ShutdownCoordinator(budget, now=lambda: now),
+    )
+    result_path = tmp_path / "result.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "ha007-nested-signal",
+            "--child",
+            "--duration",
+            "2",
+            "--started-file",
+            str(tmp_path / "started"),
+            "--result-file",
+            str(result_path),
+            "--lifespan-budget-seconds",
+            "1",
+            "--signal-timeout-seconds",
+            "0.055",
+        ],
+    )
+    exits: list[int] = []
+    child = threading.Thread(target=lambda: exits.append(ha007.main()), daemon=True)
+    child.start()
+    child.join(timeout=10)
+
+    assert not child.is_alive(), (
+        "a second SIGTERM inside the handler's Event.set() deadlocked the child"
+    )
+    assert reentered == [True], "the second signal never landed inside Event.set()"
+    assert exits == [1], "the finished request was not reported as incomplete"
+    assert json.loads(result_path.read_text())["signal_timed_out"] is False, (
+        "the observed signal must reach the coordinator"
+    )

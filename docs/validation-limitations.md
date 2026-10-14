@@ -46,7 +46,9 @@ the production business Store remains PostgreSQL.
 
 NOTIFY-007 records invalid metric-role evidence as a failed preflight plan;
 execution still requires a valid plan and strict role/family evidence.
-HA-007's local signal handoff polls the event flag under the same deadline.
+HA-007's local signal handoff polls the event flag under the same deadline, and its
+handler sets the flag only once, so a second SIGTERM that lands inside the first
+handler's `Event.set()` cannot deadlock the child.
 A deterministic condition-timeout test demonstrates that `Event.wait()` may
 return false even when a signal callback has set the flag. That does not prove
 the exact scheduling history of the failed full run or a live Kubelet shutdown;
