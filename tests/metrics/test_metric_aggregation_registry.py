@@ -16,6 +16,7 @@ import re
 from pathlib import Path
 
 import pytest
+import yaml
 
 from gpu_fault.app import (
     ApplicationContext,
@@ -28,6 +29,12 @@ from tests._builders import asgi_client, build_store
 
 ROLES = ("ingress", "worker", "spool-worker")
 APP_SOURCES = Path(__file__).resolve().parents[2] / "src" / "gpu_fault" / "app"
+ADOT_CONTROL_PLANE = (
+    Path(__file__).resolve().parents[2] / "deploy/observability/adot-control-plane.yaml"
+)
+#: ``gpu_fault_store_`` families the control plane renders that the ADOT keep
+#: list deliberately does not ship to AMP, each with the reason.
+DROPPED_STORE_FAMILIES: dict[str, str] = {}
 
 
 def _scrape(monkeypatch, role: str) -> str:
@@ -55,8 +62,8 @@ def _scrape(monkeypatch, role: str) -> str:
 
 
 @pytest.fixture(scope="module")
-def rendered_families(request) -> dict[str, set[str]]:
-    """Family name -> roles that rendered it, from a real scrape per role."""
+def rendered_scrapes(request) -> dict[str, process_metrics.Rendered]:
+    """A real scrape per role, parsed."""
 
     monkeypatch = pytest.MonkeyPatch()
     request.addfinalizer(monkeypatch.undo)
@@ -64,9 +71,18 @@ def rendered_families(request) -> dict[str, set[str]]:
     monkeypatch.setenv(
         "GPU_FAULT_PROCESSOR_REPLAY_SECRET", "test-processor-replay-secret-" + "r" * 32
     )
+    return {
+        role: process_metrics.parse_lines(_scrape(monkeypatch, role).splitlines())
+        for role in ROLES
+    }
+
+
+@pytest.fixture(scope="module")
+def rendered_families(rendered_scrapes) -> dict[str, set[str]]:
+    """Family name -> roles that rendered it, from a real scrape per role."""
+
     families: dict[str, set[str]] = {}
-    for role in ROLES:
-        parsed = process_metrics.parse_lines(_scrape(monkeypatch, role).splitlines())
+    for role, parsed in rendered_scrapes.items():
         for family in parsed.families:
             families.setdefault(family, set()).add(role)
     return families
@@ -164,3 +180,66 @@ def test_alert_rules_agree_with_the_pod_level_strategy() -> None:
             assert strategy is not Strategy.SUM, (
                 f"{family} must not collapse independent counter resets"
             )
+
+
+def _adot_keep_filter() -> str:
+    documents = yaml.safe_load_all(ADOT_CONTROL_PLANE.read_text(encoding="utf-8"))
+    config = next(document for document in documents if document["kind"] == "ConfigMap")
+    scrape = yaml.safe_load(config["data"]["collector.yaml"])["receivers"][
+        "prometheus"
+    ]["config"]["scrape_configs"][0]
+    return next(
+        item["regex"]
+        for item in scrape["metric_relabel_configs"]
+        if item["action"] == "keep" and item["source_labels"] == ["__name__"]
+    )
+
+
+def test_every_store_family_reaches_amp_or_is_dropped_with_a_reason(
+    rendered_scrapes,
+) -> None:
+    """The control-plane ADOT keep list is the only way into AMP. It kept
+    ``gpu_fault_store_io_.+`` and dropped the hot-table bloat gauges and the
+    store-compaction counters and clocks, so after a control-plane Pod restart
+    AMP had no record of when the compaction job last rebuilt the queue's
+    indexes. Every ``gpu_fault_store_`` family the registry knows or a scrape
+    renders -- and every sample name it renders, summary suffixes included --
+    must pass the keep filter unless it is listed as dropped with a reason."""
+
+    keep = _adot_keep_filter()
+    series: dict[str, set[str]] = {
+        family: {family}
+        for family in STRATEGIES
+        if family.startswith("gpu_fault_store_")
+    }
+    for parsed in rendered_scrapes.values():
+        for family, samples in parsed.samples.items():
+            if family.startswith("gpu_fault_store_"):
+                series.setdefault(family, {family}).update(
+                    sample.name for sample in samples
+                )
+    dropped = sorted(
+        name
+        for family, names in series.items()
+        if family not in DROPPED_STORE_FAMILIES
+        for name in names
+        if not re.fullmatch(keep, name)
+    )
+
+    assert dropped == [], (
+        "the ADOT keep list drops store series the control plane renders; keep "
+        "them in deploy/observability/adot-control-plane.yaml or list their "
+        f"family in DROPPED_STORE_FAMILIES with a reason: {dropped}"
+    )
+    assert {
+        "gpu_fault_store_hot_table_index_pages",
+        "gpu_fault_store_compaction_actions_total",
+        "gpu_fault_store_compaction_last_action_timestamp_seconds",
+        "gpu_fault_store_bloat_scan_timestamp_seconds",
+    } <= set(series), f"the store compaction families are no longer rendered: {series}"
+    stale = sorted(set(DROPPED_STORE_FAMILIES) - set(series))
+    assert stale == [], f"dropped store families nothing renders any more: {stale}"
+    reasonless = sorted(
+        family for family, reason in DROPPED_STORE_FAMILIES.items() if not reason
+    )
+    assert reasonless == [], f"dropped store families need a reason: {reasonless}"

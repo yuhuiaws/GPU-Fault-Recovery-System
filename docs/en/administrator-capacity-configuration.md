@@ -413,7 +413,10 @@ only the indexes were rebuilt and the three small tables `VACUUM FULL`ed. The co
 catalog facts and exports `gpu_fault_store_hot_table_heap_pages_per_live_row{table}`,
 `gpu_fault_store_hot_table_index_pages_per_live_row{table}` and
 `gpu_fault_store_hot_table_index_min_entries_per_page{table}`, `gpu_fault_store_hot_table_index_max_pages{table}` and
-`gpu_fault_store_hot_table_due_actions{table}`; the values depend on no planner statistics target or cost
+`gpu_fault_store_hot_table_due_actions{table}`; the control-plane ADOT keep list ships these families, the
+`gpu_fault_store_compaction_*` counters and clocks and `gpu_fault_store_bloat_scan_timestamp_seconds` to AMP, so
+when the job last ran and last rebuilt stays readable in AMP after the control-plane Pods are replaced; the values
+depend on no planner statistics target or cost
 model, and the perf runners write them into every round's `summary.json` as `store_bloat`. The verdict is made on each
 index's own density among indexes of at least 64 pages, never on index pages per live row -- a queue left with two live
 rows reads 74.5 index pages per live row for 149 pages while no index reaches the floor, and `due_actions` of 0 is the

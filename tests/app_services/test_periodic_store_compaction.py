@@ -28,7 +28,17 @@ from gpu_fault.app.lifespan_workers import start_processor_threads
 from gpu_fault.app.metric_aggregation import STRATEGIES, Strategy
 from gpu_fault.app.periodic_services import PeriodicServiceConfig, PeriodicServiceRunner
 from gpu_fault.app.process_metrics import parse_lines
-from gpu_fault.app.store_bloat_metrics import ROUND_OUTCOMES, TABLE_GAUGES
+from gpu_fault.app.store_bloat_metrics import (
+    ROUND_OUTCOMES,
+    TABLE_GAUGE_KEYS,
+    TABLE_GAUGES,
+    store_bloat_metric_lines,
+)
+from gpu_fault.store.postgres.hot_table_bloat import (
+    ACTION_REINDEX,
+    ACTION_VACUUM_FULL,
+    HOT_TABLES,
+)
 from gpu_fault.telemetry import CollectorKind
 from tests._builders import build_store
 
@@ -651,3 +661,49 @@ def test_every_bloat_family_aggregates_per_process_like_the_drift_scan() -> None
     ]
     for family in families:
         assert STRATEGIES[family] is Strategy.PER_PROCESS, family
+
+
+def test_the_bloat_series_amp_receives_are_bounded_by_the_policy() -> None:
+    """The control-plane ADOT keep list ships every bloat and compaction family
+    to AMP, so their series must not grow with the fleet: one sample of each
+    gauge per hot table, the round counter per outcome, the action counter per
+    table, action and status -- never per index, which the job only logs."""
+
+    actions = {
+        (table, action, status): 1
+        for table in HOT_TABLES
+        for action in (ACTION_REINDEX, ACTION_VACUUM_FULL)
+        for status in ("SUCCEEDED", "FAILED")
+    }
+    snapshot = {
+        "store_bloat_tables": {
+            table: dict.fromkeys(TABLE_GAUGE_KEYS, 1.0) for table in HOT_TABLES
+        },
+        "store_bloat_scan_timestamp_seconds": 1.0,
+        "store_compaction_last_timestamp_seconds": 1.0,
+        "store_compaction_last_action_timestamp_seconds": 1.0,
+        "store_compaction_rounds_total": dict.fromkeys(ROUND_OUTCOMES, 1),
+        "store_compaction_actions_total": actions,
+    }
+
+    parsed = parse_lines(store_bloat_metric_lines(snapshot))
+
+    keys = {
+        family: {tuple(sorted(dict(sample.labels))) for sample in samples}
+        for family, samples in parsed.samples.items()
+    }
+    for family, _key, _help in TABLE_GAUGES:
+        assert keys[family] == {("table",)}, family
+    for family in (
+        "gpu_fault_store_bloat_scan_timestamp_seconds",
+        "gpu_fault_store_compaction_last_timestamp_seconds",
+        "gpu_fault_store_compaction_last_action_timestamp_seconds",
+    ):
+        assert keys[family] == {()}, family
+    assert keys["gpu_fault_store_compaction_rounds_total"] == {("outcome",)}
+    assert keys["gpu_fault_store_compaction_actions_total"] == {
+        ("action", "status", "table")
+    }
+    assert sum(len(samples) for samples in parsed.samples.values()) == (
+        len(TABLE_GAUGES) * len(HOT_TABLES) + 3 + len(ROUND_OUTCOMES) + len(actions)
+    ), "a bloat family renders more than one series per bounded label set"

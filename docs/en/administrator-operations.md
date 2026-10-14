@@ -4314,7 +4314,9 @@ processes each; one process holds it), so the gauges and counters above appear o
 control-plane roll replaces the holder and zeroes its in-process counters: verify with
 `max by (table) (gpu_fault_store_hot_table_due_actions)`, `sum(increase(gpu_fault_store_compaction_rounds_total[1h]))`
 and `max(gpu_fault_periodic_job_last_run_timestamp_seconds{periodic_job="store_compaction"})` (Prometheus keeps the
-replaced processes' series), and read the logs with
+replaced processes' series; the control-plane ADOT keep list ships `gpu_fault_store_hot_table_*`,
+`gpu_fault_store_compaction_*` and `gpu_fault_store_bloat_scan_timestamp_seconds` to AMP, so these queries hold in AMP
+too), and read the logs with
 `kubectl logs -l app=gpu-fault-control-worker --since=1h | grep 'store-compaction'`. A
 `..._last_timestamp_seconds 0.000` with no `hot_table_*` samples on the other Pods means "not the holder", not "never
 ran". The job needs no `GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS` in a ConfigMap -- the rendered control-plane
