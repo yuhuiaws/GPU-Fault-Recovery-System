@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Any
 
 from gpu_fault.adapters.node_action.barriers import NodeActionBarrierMixin
+from gpu_fault.adapters.node_action.key_propagation import PropagatingNodeSecrets
 from gpu_fault.adapters.node_action.notifications import NodeActionNotificationMixin
 from gpu_fault.adapters.node_action.step_execution import NodeActionExecutionService
 from gpu_fault.adapters.node_action.transport import NodeActionTransportMixin
@@ -67,7 +68,13 @@ class NodeActionWorkflowAdapter(
         node_action_retry_limit: int = 3,
         quiesce_taint_core: Any | None = None,
     ) -> None:
-        node_secrets = dict(node_secrets or {})
+        # A ``PropagatingNodeSecrets`` (``from_environment``) is kept as it is:
+        # copying it into a plain dict would freeze the keys at start again.
+        node_secrets = (
+            node_secrets
+            if isinstance(node_secrets, PropagatingNodeSecrets)
+            else dict(node_secrets or {})
+        )
         if secret and len(secret) < 32:
             raise ValueError("node action shared secret must be at least 32 characters")
         if any(
@@ -151,7 +158,12 @@ class NodeActionWorkflowAdapter(
             for key, value in endpoints.items()
         ):
             raise ValueError("GPU_FAULT_NODE_AGENT_ENDPOINTS must map node IDs to URLs")
-        node_secrets = node_action_secrets_from_environment()
+        # Re-read on a miss: a node keyed after this process started (the
+        # node-key sync, between deploys) is signed for without a restart.
+        node_secrets = PropagatingNodeSecrets(
+            node_action_secrets_from_environment(),
+            load=node_action_secrets_from_environment,
+        )
         return cls(
             endpoints,
             os.getenv("GPU_FAULT_NODE_ACTION_SECRET", ""),
