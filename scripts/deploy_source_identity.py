@@ -23,6 +23,8 @@ else:
 
 
 ROOT = Path(__file__).resolve().parents[1]
+# A repository module that an identity input imports is an identity input too
+# (tests/test_deploy_identity_import_closure.py).
 DEPLOY_HOST_ORCHESTRATION_INPUTS = (
     "src/gpu_fault/admin/node_key_custody*.py",
     "src/gpu_fault/admin/node_key_proof.py",
@@ -37,7 +39,13 @@ DEPLOY_HOST_ORCHESTRATION_INPUTS = (
     "scripts/ci_gate.py",
     "scripts/ci_gate_artifacts.py",
     "scripts/ci_candidate_receipt.py",
+    "scripts/ci_coverage_config.py",
+    "scripts/ci_coverage_floors.py",
+    "scripts/ci_coverage_gate.py",
+    "scripts/ci_pytest_evidence.py",
+    "scripts/ci_unit_gate.py",
     "scripts/deploy_source_identity.py",
+    "scripts/release_attestation.py",
     "scripts/release_deploy.py",
     "scripts/release_deploy_evidence.py",
     "scripts/release_deploy_profile.py",
@@ -49,9 +57,13 @@ DEPLOY_HOST_ORCHESTRATION_INPUTS = (
     "scripts/setup-deploy-host.sh",
     "scripts/setup_deploy_host.py",
     "scripts/staging_deploy.py",
+    "scripts/staging_deploy_inputs.py",
     "scripts/staging_gate_caches.py",
     "scripts/staging_live_evidence.py",
+    "scripts/staging_source_snapshot.py",
     "scripts/staging_state_hygiene.py",
+    "tools/coverage_objectives.py",
+    "tools/pytest_result_identity.py",
 )
 APPLICATION_IDENTITY_PROTOCOL_INPUTS = (
     "config/release-identity.yaml",
@@ -59,6 +71,7 @@ APPLICATION_IDENTITY_PROTOCOL_INPUTS = (
     "scripts/component_artifacts.py",
     "scripts/component_wheels.py",
     "scripts/deploy_source_identity.py",
+    "scripts/manifest_entrypoints.py",
     "scripts/release_identity.py",
 )
 

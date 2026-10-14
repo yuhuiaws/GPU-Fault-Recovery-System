@@ -2399,7 +2399,11 @@ snapshot. The data-plane observability install scripts and manifests are also re
 `DEPLOY_HOST_ORCHESTRATION_INPUTS`, whose inputs cover `src/gpu_fault_release/*.py`,
 `deploy/control-plane/regional/*.sh` and `probes/*.py`, `deploy/control-plane/tools/*`,
 the start-up scripts and bounded Job waiter (including the prerequisite repair, database proof and dynamic Job management helpers), and the release driver
-scripts (`scripts/release_deploy*.py`, `run_*_gates.py`, `ci_gate*.py`, `staging_*.py` and so on);
+scripts (`scripts/release_deploy*.py`, `run_*_gates.py`, `ci_gate*.py`, `staging_*.py` and so on) with the repository modules they import,
+such as `scripts/release_attestation.py` and the unit and coverage gate modules behind `scripts/ci_gate.py` with their
+`tools/coverage_objectives.py` and `tools/pytest_result_identity.py`; `tests/test_deploy_identity_import_closure.py` requires every
+repository module an identity input imports to be an identity input itself (`scripts/manifest_entrypoints.py`, which
+`scripts/component_wheels.py` imports, is an application identity protocol input);
 therefore a probe-only change is also classified as `DEPLOY_HOST_ONLY`. `native_http`, process supervision and the SNS policy helper are also in the
 deploy-host closure and do not enter the three business component wheels. The shared `amp-sns-publish-policy.json` is included by
 `config/release-identity.yaml` in both the Manifest inputs and the observability component identity, and
