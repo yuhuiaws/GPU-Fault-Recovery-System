@@ -34,8 +34,10 @@ class SlotWake:
     futures. A freed fault slot also claims the fault stream at once: under
     the STRICT lane policy it usually frees the lane of the next row too,
     which the trigger notified (if at all) while that lane was still leased.
-    Other pools only wake the loop: a stream that filled its claim has no
-    backoff to clear, and one that came back empty keeps it.
+    Other pools only wake the loop -- a stream that filled its claim has no
+    backoff to clear, and one that came back empty keeps it -- unless
+    fault-tier work may be due (``_fault_rows_waiting``): then the fault stream
+    is claimed first too.
     """
 
     def __init__(self, work_available: Event) -> None:

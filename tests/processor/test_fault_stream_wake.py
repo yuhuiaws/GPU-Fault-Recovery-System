@@ -52,6 +52,7 @@ from gpu_fault.processor import (
     ProcessorRequestStatus,
     telemetry_spool,
 )
+from gpu_fault.processor.batching import GPU_METRICS_BATCH_SIZE
 from gpu_fault.processor.claim_backoff import BackoffCeilings, empty_round_ceiling
 from gpu_fault.processor.lane_runtime import SlotWake
 from gpu_fault.store import SqliteStore
@@ -681,6 +682,113 @@ def test_a_freed_evidence_lane_goes_to_the_fault_row_waiting_on_it(
         fm.request_id,
         host_ev.request_id,
     ]
+
+
+@pytest.mark.parametrize(
+    ("backlog", "first"),
+    [
+        pytest.param("behind-a-leased-lane", True, id="due-fault-row"),
+        pytest.param("deferred", False, id="deferred-only"),
+    ],
+)
+def test_a_freed_slot_claims_the_fault_stream_first_while_fault_rows_wait(
+    sqlite_store: SqliteStore, backlog: str, first: bool
+) -> None:
+    """While a fault-tier row is due behind a leased lane, a freed slot of any
+    pool claims the fault stream first and fault pressure holds the evidence
+    pools back, whichever process runs the faults. A backlog that is only
+    deferred (a retry's not_before) is no reason to do either."""
+
+    store = _CountingStore(sqlite_store)
+    if backlog == "deferred":
+        store.enqueue_processor_request(_deferred_terminal("attempt-deferred"))
+    else:
+        _claim_elsewhere(
+            store,
+            _node_lane_row(GPU_METRICS_PATH, edge_filter_reasons=["threshold"]),
+            lease=timedelta(minutes=2),
+        )
+        store.enqueue_processor_request(_node_lane_row(NVIDIA_KERNEL_PATH, xid=79))
+    processor = _notified_coordinator(store, shard=0)
+    _empty_fault_rounds(processor, 3)
+    assert store.backlog_reads >= 1, "the fault stream read its backlog and holds it"
+    rounds = processor.metrics_snapshot()["claim"]["rounds_by_stream"]["fault"]
+
+    processor._stream_idle_until["fault"] = time.monotonic() + 5.0
+    processor._slot_wake.worker_finished("gpu")  # a telemetry worker freed its slot
+    processor._run_processor_cycle({}, {"fault": set()})
+
+    snapshot = processor.metrics_snapshot()
+    assert snapshot["claim"]["rounds_by_stream"]["fault"] == rounds + int(first), (
+        "a freed slot of any pool claims the fault stream first"
+        if first
+        else "a deferred backlog leaves the fault stream backed off"
+    )
+    assert snapshot["fault_pressure"]["active"] == int(first), (
+        "fault rows due behind a lane hold the evidence pools back"
+    )
+
+
+class _HeldPool:
+    """An executor whose jobs never start: a slot stays taken until the test
+    finishes its future."""
+
+    def submit(self, fn: Callable[..., Any], *args: Any) -> Future[Any]:
+        return Future()
+
+
+def test_the_busy_rounds_after_a_fault_claim_leave_telemetry_its_slots(
+    sqlite_store: SqliteStore,
+) -> None:
+    """A burst's fault row runs and finishes while telemetry keeps the gpu
+    pool busy, and busy pools hold the fault stream at its 0.1 s ceiling for
+    empty rounds that ask the store nothing. Those rounds still claim the
+    fault stream first, but they know of no fault backlog: a freed telemetry
+    slot is refilled at once. Fault pressure used to hold the pool at one
+    worker until the fault stream settled -- 8 to 10 points of occupancy in
+    a burst-50-shaped drain."""
+
+    sqlite_store.enqueue_processor_request(_node_lane_row(NVIDIA_KERNEL_PATH, xid=79))
+    for node in range(3 * GPU_METRICS_BATCH_SIZE):
+        sqlite_store.enqueue_processor_request(
+            processor_request(
+                GPU_METRICS_PATH,
+                body=json.dumps(
+                    {"node_id": f"t{node}", "edge_filter_reasons": ["health-summary"]}
+                ).encode(),
+                cluster_id="c1",
+            )
+        )
+    processor = _coordinator(
+        sqlite_store, fault_workers=1, gpu_workers=2, host_workers=0, poll_seconds=0.1
+    )
+    pools: dict[str, Any] = {"fault": _HeldPool(), "gpu": _HeldPool()}
+    futures: dict[str, set[Future[Any]]] = {"fault": set(), "gpu": set()}
+    processor._run_processor_cycle(pools, futures)
+    assert (len(futures["fault"]), len(futures["gpu"])) == (1, 1), (
+        "while the fault row runs, fault pressure keeps one gpu worker"
+    )
+    next(iter(futures["fault"])).set_result(None)
+
+    rounds = []
+    for _ in range(2):
+        processor._stream_idle_until.clear()  # the fault stream polls each cycle
+        processor._run_processor_cycle(pools, futures)
+        snapshot = processor.metrics_snapshot()
+        rounds.append(
+            (
+                len(futures["gpu"]),
+                snapshot["fault_pressure"]["active"],
+                processor._fault_rows_waiting(),
+            )
+        )
+        next(iter(futures["gpu"])).set_result(None)  # a telemetry batch is done
+    assert rounds == [(2, 0, True), (2, 0, True)], (
+        "the fault row is done: the gpu pool refills both slots"
+    )
+    assert processor._stream_idle_interval["fault"] == pytest.approx(0.1), (
+        "busy pools hold the fault stream at its busy ceiling"
+    )
 
 
 def test_a_backlog_the_store_cannot_count_keeps_the_fault_stream_polling(

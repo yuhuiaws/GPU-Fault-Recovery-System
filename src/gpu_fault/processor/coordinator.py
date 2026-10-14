@@ -682,11 +682,10 @@ class ProcessorCoordinator(
                 try:
                     self._run_processor_cycle(pools, futures)
                 except Exception:
-                    # The claim half of the cycle has its own handler below;
-                    # this one covers the bookkeeping half (deadline sweep,
-                    # future reaping, notification streams), which used to
-                    # run outside any ``try`` and took the thread with it on
-                    # the first exception (B-6).
+                    # The claim half of the cycle has its own handler below; this
+                    # one covers the bookkeeping half (deadline sweep, future
+                    # reaping, notification streams), which used to run outside
+                    # any ``try`` and took the thread with it on the first error (B-6).
                     with self._state_lock:
                         self._consumer_cycle_errors_total += 1
                     LOGGER.exception("processor consumer cycle failed")
@@ -715,7 +714,9 @@ class ProcessorCoordinator(
                 self._stream_idle_until.pop(stream, None)
                 self._stream_idle_interval.pop(stream, None)
                 self._stream_empty_rounds.pop(stream, None)
-        if "fault" in self._slot_wake.take():
+        # Faults first: a fault slot freed, or any slot while fault work may be due.
+        freed, waiting = self._slot_wake.take(), self._fault_rows_waiting()
+        if "fault" in freed or (freed and waiting):
             self._stream_idle_until.pop("fault", None)
         self._check_execution_deadlines()
         for name, pool_futures in futures.items():
@@ -729,7 +730,7 @@ class ProcessorCoordinator(
                         name,
                     )
             pool_futures.difference_update(completed)
-        self._set_processor_fault_pressure(bool(futures.get("fault")))
+        self._set_processor_fault_pressure(self._fault_pressure_due(futures))
         if not self.is_healthy():
             self._stop.wait(self.poll_seconds)
             return
@@ -742,9 +743,8 @@ class ProcessorCoordinator(
             for name, pool_futures in futures.items()
         }
         total_available = sum(available.values())
-        # An empty claim while workers are still executing earlier
-        # rows means "every eligible lane is leased", not "the queue
-        # is idle" - so the idle backoff must not grow to seconds.
+        # An empty claim while workers still run earlier rows means "every eligible
+        # lane is leased", not "the queue is idle": the backoff must not grow.
         self._pools_busy = any(pool_futures for pool_futures in futures.values())
         if total_available <= 0:
             self._stop.wait(self.poll_seconds)

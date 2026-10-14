@@ -3601,10 +3601,18 @@ finishing fault worker claims the fault stream at once, so such a row waits at m
 0.6 s). A finishing worker of any pool wakes the claim loop at once (`SlotWake`; any number of finishes coalesce into
 one wake): a standing backlog raises no edge, and otherwise the loop sleeps to its nearest stream deadline -- the
 fallback once the fault stream has backed off with no fault-tier row -- so in a burst whose fault rows came last the
-freed gpu and host slots waited for that deadline (761 instead of 1,152 rows in flight). On local Postgres (six
-coordinators with the production pool split, 4,704 burst rows, 1 s per replay) the wake raises the drain from 186-214 to
-307-318 rows/s and the occupancy of the telemetry slots from 63-68% to 90-93%, while the idle rounds stay at one fault
-round per 5 s per coordinator and the first fault row is still claimed within 10 ms of its edge
+freed gpu and host slots waited for that deadline (761 instead of 1,152 rows in flight). While fault-tier work may be
+due -- the fault stream polls below its idle ceiling because it takes rows, because busy pools hold it after a fault
+claim, or because the lane probe holds it behind a leased lane -- such a wake claims the fault stream first: the rounds
+its cadence would run anyway, only sooner. Fault pressure asks for more: it holds the evidence pools back while the
+process runs a fault worker, and while the lane probe of its latest fault round found fault-tier rows behind leased
+lanes (the backlog probe's yes still held), so in every process that sees such rows, not only in one that runs a fault
+worker. The busy rounds after a fault claim ask the store nothing and press nothing: while they counted, a burst whose
+faults were done kept its telemetry pools at one worker until the fault stream settled (82-85% occupancy in the burst
+below instead of 91-92%). A backlog that is only deferred or held by the observation interlock triggers neither. On
+local Postgres (six coordinators with the production pool split, 4,704 burst rows, 1 s per replay) the wake raises the
+drain from 186-214 to 307-318 rows/s and the occupancy of the telemetry slots from 63-68% to 90-93%, while the idle
+rounds stay at one fault round per 5 s per coordinator and the first fault row is still claimed within 10 ms of its edge
 (`tests/processor/test_fault_stream_wake.py` pins the refill: at least 90% occupancy, 33% before). The fault stream's
 0.5 s cadence is only needed while a row can be silent, and on an idle queue it made 97% of a perf run's fault claim
 rounds empty (23-26k per integrated run instead of 5-6k). The trigger's "is the key busy" probe reads PENDING rows only,

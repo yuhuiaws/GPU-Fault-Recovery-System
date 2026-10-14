@@ -30,8 +30,11 @@ class TelemetrySpoolCoordinatorMixin:
     _spool_work_available: Any
     _state_lock: Any
     _stop: Any
+    _stream_idle_interval: dict[str, float]
     claim_lane_blocked_total: Any
+    claim_rounds_by_stream: dict[str, int]
     claim_probes_total: Any
+    fault_idle_backoff_max_seconds: float
     internal_token: Any
     is_healthy: Callable[..., Any]
     local_url: Any
@@ -83,6 +86,9 @@ class TelemetrySpoolCoordinatorMixin:
     # cadence, so it is believed for the hold the caller passes instead of
     # re-read every round; "no" lets the stream stretch and is never reused.
     _fault_backlog_held_until = 0.0
+    # The fault round (``claim_rounds_by_stream["fault"]``) whose lane probe
+    # found its backlog behind leased lanes; any later round supersedes it.
+    _fault_lane_held_round = -1
 
     def run_telemetry_spool(self) -> None:
         """Drain telemetry through the dedicated spool path."""
@@ -546,7 +552,46 @@ class TelemetrySpoolCoordinatorMixin:
             return False
         if blocked:
             self.claim_lane_blocked_total += 1
+        if include_paths is None:  # the fault stream, the one claiming by exclusion
+            rounds = self.claim_rounds_by_stream.get("fault", 0)
+            self._fault_lane_held_round = rounds if blocked else -1
         return blocked
+
+    def _fault_rows_waiting(self) -> bool:
+        """May fault-tier work be due -- does the fault stream poll below its
+        idle ceiling? It does while it takes rows, while busy pools hold it
+        at the busy ceiling after a fault claim, and while the lane probe
+        holds it behind a leased lane. A backlog that is only deferred or
+        held by the observation interlock leaves it on its idle ceiling, an
+        idle one at the fallback. The claim loop then claims the fault
+        stream first whenever a slot of any pool frees: the same rounds the
+        cadence would run, only sooner. Read on every cycle, so no store
+        round trip.
+        """
+
+        return (
+            self._stream_idle_interval.get("fault", 0.0)
+            < self.fault_idle_backoff_max_seconds
+        )
+
+    def _fault_pressure_due(self, futures: dict[str, Any]) -> bool:
+        """Does fault pressure hold the evidence pools back? While this
+        process runs a fault worker, and while fault-tier rows are known to
+        wait behind leased lanes: the lane probe of the latest fault round
+        found them, and the backlog probe still holds its "yes". That is the
+        backlog another pool or process holds the lanes for, so the pressure
+        follows it into every process that sees it, not only into one that
+        runs a fault worker. The busy rounds after a fault claim are not:
+        they ask the store nothing, and a burst whose faults have drained
+        must not keep its telemetry pools at one worker until the fault
+        stream settles. Nor is a backlog that is only deferred: its rows
+        hold no lane.
+        """
+
+        return bool(futures.get("fault")) or (
+            self._fault_lane_held_round == self.claim_rounds_by_stream.get("fault")
+            and time.monotonic() < self._fault_backlog_held_until
+        )
 
     def _fault_backlog_is_empty(self, hold_seconds: float) -> bool:
         """Is no fault-tier row PENDING, or LEASED with a lapsed lease?
