@@ -250,6 +250,9 @@ is split by responsibility:
   creation/cleanup.
 - `regional_capacity_data.py`: run-scoped database census and terminal cleanup
   using current projected credentials.
+- `regional_capacity_repeat.py`: `all --repeat N` runs the case N times in
+  sequence, each a complete run in its own directory of the repeat group, and
+  writes `repeat-summary.json` (median, min, max and spread per headline metric).
 
 Additional focused utilities:
 

@@ -46,6 +46,7 @@ if TYPE_CHECKING or __package__:
     from . import regional_capacity_placement as capacity_placement
     from . import regional_capacity_recovery as capacity_recovery
     from . import regional_capacity_registry as capacity_registry
+    from . import regional_capacity_repeat as capacity_repeat
     from . import regional_capacity_results as capacity_results
     from . import regional_capacity_settle as capacity_settle
     from . import regional_capacity_timeseries as capacity_timeseries
@@ -64,6 +65,7 @@ else:
     import regional_capacity_placement as capacity_placement
     import regional_capacity_recovery as capacity_recovery
     import regional_capacity_registry as capacity_registry
+    import regional_capacity_repeat as capacity_repeat
     import regional_capacity_results as capacity_results
     import regional_capacity_settle as capacity_settle
     import regional_capacity_timeseries as capacity_timeseries
@@ -1318,6 +1320,9 @@ def capacity_parser() -> argparse.ArgumentParser:
         type=Path,
         help="original registration artifact directory for run, purge or teardown",
     )
+    parser.add_argument(
+        "--repeat", type=int, default=1, help="all: N runs, then repeat-summary.json"
+    )
     return parser
 
 
@@ -1375,6 +1380,8 @@ def main(argv: list[str] | None = None) -> int:
             )
     elif args.run_dir is not None:
         parser.error("--run-dir is only valid for run, purge or teardown")
+    if problem := capacity_repeat.refusal(args):
+        parser.error(problem)
     try:
         scope = validate_registry_target(
             allow_live_registry=args.allow_live_registry,
@@ -1384,6 +1391,21 @@ def main(argv: list[str] | None = None) -> int:
         parser.error(str(exc))
     if args.command in {"run", "purge", "teardown"}:
         return resume_capacity_command(args, scope)
+    if args.repeat > 1:
+        label = capacity_repeat.run_label(args)
+        release = release_identity()["release_id"] or "unknown-release"
+        group = artifact_dir(args.artifact_root, label, release)
+        return capacity_repeat.run_repeated(
+            args.repeat, group, lambda run: start_capacity_run(args, scope, run), log
+        )
+    return start_capacity_run(args, scope)
+
+
+def start_capacity_run(
+    args: argparse.Namespace, scope: str, artifacts: Path | None = None
+) -> int:
+    """One register or all run: run.json, then the command (``--repeat`` passes
+    each run's directory inside its repeat group)."""
 
     # 32 clusters carry 500 XID and 500 SXID; every other scale keeps the
     # same per-cluster fault rate so request totals stay linear.
@@ -1397,11 +1419,11 @@ def main(argv: list[str] | None = None) -> int:
         if args.sxid_total is not None
         else round(500 * args.clusters / 32)
     )
-    label = args.label or f"{args.case}-{args.clusters}c"
+    label = capacity_repeat.run_label(args)
 
     identity = release_identity()
     suite_id = args.suite_id or secrets.token_hex(8)
-    artifacts = artifact_dir(
+    artifacts = artifacts or artifact_dir(
         args.artifact_root,
         label,
         identity["release_id"] or "unknown-release",
