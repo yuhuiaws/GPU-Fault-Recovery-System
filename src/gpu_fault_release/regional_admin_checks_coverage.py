@@ -12,11 +12,18 @@ A retired Agent is not coverage: ``REVOKED`` records are left out before the
 comparison. Coverage drift stays a hard failure -- a node that is NotReady is
 still a node that must be covered -- but when every extra Agent has no
 Kubernetes Node at all the refusal names the remedy, so the operator reads
-the next command instead of a bare set difference.
+the next command instead of a bare set difference, and what the control
+plane's departed-node cleanup says about each of those nodes (it retires such
+an Agent by itself once the node is proven gone).
+
+The same ledger is what ``status`` prints as its departed-node finding
+(``departed_node_lines``): every departed node the cleanup knows, cleaned or
+pending, with the blocker and the manual command where one is needed.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from gpu_fault.cluster_scope import (
@@ -35,6 +42,78 @@ RETIRE_DEPARTED_AGENTS_HINT = (
     "<state-dir> --retire-departed-agents --dry-run, then without --dry-run and "
     "with --reference"
 )
+
+
+# Pending/refused nodes named one per line in the ``status`` header.
+DEPARTED_NODE_LINE_LIMIT = 5
+
+
+def _departed_records(cluster: Mapping[str, Any]) -> dict[str, dict[str, Any]]:
+    records = cluster.get("departed_node_cleanup")
+    return {
+        str(item.get("node_id")): item
+        for item in (records if isinstance(records, list) else [])
+        if isinstance(item, dict)
+    }
+
+
+def _cleanup_state(record: Mapping[str, Any] | None) -> str:
+    if record is None:
+        return "not judged yet"
+    blockers = [str(item) for item in record.get("blockers") or []]
+    state = str(record.get("status") or "UNKNOWN")
+    return f"{state} ({blockers[0]})" if blockers else state
+
+
+def departed_node_lines(report: Mapping[str, Any]) -> list[str]:
+    """The ``status`` finding of the control plane's departed-node ledger.
+
+    ``report`` is the ``control_api`` probe report. One summary line, then one
+    line per node still pending or left to the operator (the first blocker
+    and, when the operator is needed, the manual command); nothing at all for
+    a control plane without the ledger or with nothing in it.
+    """
+
+    clusters = report.get("clusters")
+    lines: list[str] = []
+    if report.get("departed_node_cleanup_enabled") is False:
+        lines.append(
+            "departed-node cleanup is off (spec.workflow.departedNodeCleanup); a "
+            "departed node's records are left to gpu-fault-admin workflow-reconcile"
+        )
+    entries = [
+        (str(cluster_id), record)
+        for cluster_id, cluster in sorted(
+            (clusters if isinstance(clusters, dict) else {}).items()
+        )
+        if isinstance(cluster, dict)
+        for record in _departed_records(cluster).values()
+    ]
+    if not entries:
+        return lines
+    counts = {
+        status: sum(record.get("status") == status for _, record in entries)
+        for status in ("CLEANED", "PENDING", "REFUSED")
+    }
+    lines.append(
+        f"departed nodes: {counts['CLEANED']} cleaned, {counts['PENDING']} pending, "
+        f"{counts['REFUSED']} left to the operator"
+    )
+    open_entries = [item for item in entries if item[1].get("status") != "CLEANED"]
+    for cluster_id, record in open_entries[:DEPARTED_NODE_LINE_LIMIT]:
+        line = f"departed node {cluster_id}/{record.get('node_id')}: " + _cleanup_state(
+            record
+        )
+        commands = [str(item) for item in record.get("admin_commands") or []]
+        if record.get("status") == "REFUSED" and commands:
+            line += f"; manual: {commands[0]}"
+        lines.append(line)
+    if len(open_entries) > DEPARTED_NODE_LINE_LIMIT:
+        lines.append(
+            f"departed nodes: {len(open_entries) - DEPARTED_NODE_LINE_LIMIT} more in "
+            "health.checks[control_api].details.clusters[*].departed_node_cleanup"
+        )
+    return lines
 
 
 def selected_node_items(nodes: dict[str, Any], selector: str) -> dict[str, Any]:
@@ -179,9 +258,15 @@ def check_agent_coverage(
             and isinstance(kubernetes_nodes, list)
             and not (extra & {str(item) for item in kubernetes_nodes})
         ):
+            records = _departed_records(cluster)
             message += (
                 f"; Agents without a Kubernetes Node: {sorted(extra)}; "
                 + RETIRE_DEPARTED_AGENTS_HINT
+                + "; automatic departed-node cleanup: "
+                + ", ".join(
+                    f"{node} {_cleanup_state(records.get(node))}"
+                    for node in sorted(extra)
+                )
             )
         raise ReleaseError(message)
     if any(item.get("lifecycle_state") != "ACTIVE" for item in agents):

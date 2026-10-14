@@ -22,6 +22,7 @@ from gpu_fault_release.regional_admin_checks import (
     build_preflight_report,
     build_quick_health_report,
 )
+from gpu_fault_release.regional_admin_checks_coverage import departed_node_lines
 from gpu_fault_release.regional_release_aurora_refresh import (
     validate_aurora_refresh_snapshot,
 )
@@ -1159,8 +1160,20 @@ def status_header_lines(report: dict[str, Any], *, json_destination: str) -> lis
         f"next deploy: {next_kind}",
         *partial,
         "failing checks: " + (", ".join(failing) if failing else "none"),
+        *_departed_node_findings(health),
         f"full JSON report: {json_destination}",
     ]
+
+
+def _departed_node_findings(health: object) -> list[str]:
+    """The departed-node ledger lines, from the ``control_api`` check's report."""
+
+    checks = health.get("checks") if isinstance(health, dict) else None
+    for check in checks if isinstance(checks, list) else []:
+        details = check.get("details") if isinstance(check, dict) else None
+        if check.get("name") == "control_api" and isinstance(details, dict):
+            return departed_node_lines(details)
+    return []
 
 
 FULL_REPORT_ENV = "GPU_FAULT_FULL_REPORT"

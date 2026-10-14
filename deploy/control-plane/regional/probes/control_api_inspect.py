@@ -6,8 +6,11 @@ cluster and the answer has to name the clusters it asked about --
 ``ADMIN_EXPECTED_NODES_JSON`` (a JSON object of cluster id to node id list).
 Response: one JSON object on stdout with ``healthz``, ``version``, ``registry``,
 ``remote_commands``, ``collector_thresholds`` (the silence threshold in seconds
-the control plane applies to each collector kind) and a ``clusters`` entry per
-cluster id.
+the control plane applies to each collector kind), ``departed_node_cleanup_
+enabled`` and a ``clusters`` entry per cluster id, which carries the cluster's
+departed-node ledger (``departed_node_cleanup``: one line per departed node,
+CLEANED / PENDING / REFUSED with its blockers and the manual commands; None
+from a control plane older than the cleanup).
 
 Six endpoints in one exec rather than six execs: every call is a loopback
 request inside the Pod, so the expensive part is the ``kubectl exec`` around
@@ -64,18 +67,55 @@ def collector_thresholds() -> dict[str, float]:
     }
 
 
+# The ledger fields ``status`` reads; the evidence stays in the store.
+DEPARTED_NODE_FIELDS = {
+    "node_id",
+    "provider",
+    "status",
+    "reference",
+    "instance_id",
+    "absent_since",
+    "blockers",
+    "blocker_classes",
+    "admin_commands",
+    "actions",
+    "first_seen_at",
+    "updated_at",
+    "cleaned_at",
+}
+
+
+def departed_node_cleanup(store: Any, cluster_id: str) -> list[Any] | None:
+    reader = getattr(store, "list_departed_node_cleanups", None)
+    if reader is None:
+        # A control plane older than the engine, as a rollback's probe may find.
+        return None
+    return [
+        record.model_dump(mode="json", include=DEPARTED_NODE_FIELDS)
+        for record in reader(cluster_id)
+    ]
+
+
+def departed_node_cleanup_enabled() -> bool | None:
+    try:
+        from gpu_fault.departed_node_cleanup import cleanup_enabled
+    except ImportError:
+        return None
+    return cleanup_enabled()
+
+
 def main() -> None:
     clusters = json.loads(os.environ["ADMIN_CLUSTER_IDS_JSON"])
     expected_nodes = json.loads(os.environ["ADMIN_EXPECTED_NODES_JSON"])
+    store = ApplicationContext.from_environment().store
     result: dict[str, Any] = {
         "healthz": get("/healthz"),
         "version": get("/v1/version"),
         "registry": get("/v1/regional/clusters"),
         "collector_thresholds": collector_thresholds(),
         "clusters": {},
-        "remote_commands": (
-            ApplicationContext.from_environment().store.remote_command_stats()
-        ),
+        "remote_commands": store.remote_command_stats(),
+        "departed_node_cleanup_enabled": departed_node_cleanup_enabled(),
     }
     for cluster_id in clusters:
         agents = get("/v1/fleet/agents?cluster_id=" + cluster_id)
@@ -95,6 +135,7 @@ def main() -> None:
                 else None
             ),
             "collector_readiness": get("/v1/collector-readiness/" + cluster_id),
+            "departed_node_cleanup": departed_node_cleanup(store, cluster_id),
         }
     print(json.dumps(result, separators=(",", ":")))
 
