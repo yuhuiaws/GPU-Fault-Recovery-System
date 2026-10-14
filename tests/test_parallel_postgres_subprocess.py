@@ -213,6 +213,37 @@ def test_repeated_parent_cancellation_drains_every_owned_child(
     }
 
 
+@pytest.mark.parametrize(
+    ("mode", "outcome"), [("request", "completed"), ("worker", "KeyboardInterrupt")]
+)
+def test_a_signal_inside_the_cancellation_handler_cannot_deadlock_it(
+    tmp_path: Path, mode: str, outcome: str
+) -> None:
+    """Two back-to-back signals deadlocked the shard runner (batch 90's gate).
+
+    The second handler ran inside the first one's ``Event.set()`` and blocked on
+    the Event's own lock; the gate never wrote a cancel file, its workers ran
+    their tests until the gate's deadline, and nothing ended the gate itself.
+    """
+    tmp_path.chmod(0o700)
+    try:
+        result = run_owned_command(
+            [sys.executable, "-B", "-m", HELPER, "nested-signal", mode, str(tmp_path)],
+            environment=environment(),
+            cwd=ROOT,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("a second signal inside the cancellation handler deadlocked it")
+    assert result.returncode == 0, "nested signal fixture failed"
+    assert read_private_json(tmp_path / "result.json") == {
+        "handled": 2,
+        "nested": True,
+        "interrupted": True,
+        "outcome": outcome,
+    }
+
+
 def test_worker_dying_inside_real_allocation_context_is_reconciled_by_owner_record(
     tmp_path: Path,
 ) -> None:
@@ -284,6 +315,12 @@ def test_eight_nested_workers_can_run_owned_cleanup_after_first_pytest_failure(
     )
 
 
+def cancelled_workers(state: Path) -> int:
+    return sum(
+        worker.cancellation_requested(state / f"shard-{index}") for index in range(8)
+    )
+
+
 @pytest.mark.parametrize("signum", [signal.SIGINT, signal.SIGTERM])
 def test_eight_nested_workers_finish_owned_cleanup_after_repeated_signals(
     tmp_path: Path, signum: signal.Signals
@@ -319,13 +356,17 @@ def test_eight_nested_workers_finish_owned_cleanup_after_repeated_signals(
         try:
             signal.pidfd_send_signal(descriptor, signum)
             signal.pidfd_send_signal(descriptor, signum)
+            # Cleanup starts about 0.3 s after the signals even with another full
+            # suite running. A gate that never asks its workers to cancel lets
+            # them run until its 35-s deadline, so say which side is missing.
             until = time.monotonic() + 15
             while not all(
                 (tmp_path / f"shard-{index}/cleanup-started.json").exists()
                 for index in range(8)
             ):
                 assert time.monotonic() < until, (
-                    "owned allocation cleanup did not start"
+                    "owned allocation cleanup did not start; the gate asked "
+                    f"{cancelled_workers(tmp_path)} of 8 workers to cancel"
                 )
                 assert not future.done(), "nested fixture exited before cleanup"
                 time.sleep(0.02)

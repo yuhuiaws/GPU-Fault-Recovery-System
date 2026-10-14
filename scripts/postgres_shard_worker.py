@@ -89,9 +89,15 @@ def cancellation_scope(*, request_only: bool = False) -> Iterator[threading.Even
         interrupted = threading.Event()
         signals = (signal.SIGINT, signal.SIGTERM) if request_only else (signal.SIGTERM,)
         previous = {signum: signal.getsignal(signum) for signum in signals}
+        requested = False
 
         def receive(_number: int, _frame: object) -> None:
-            interrupted.set()
+            # A second signal runs this handler again inside the first one's
+            # interrupted.set(), whose lock is not reentrant: set it only once.
+            nonlocal requested
+            if not requested:
+                requested = True
+                interrupted.set()
             if not request_only:
                 signal.raise_signal(signal.SIGINT)
 

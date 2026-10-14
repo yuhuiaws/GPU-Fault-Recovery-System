@@ -7,6 +7,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 from collections.abc import Sequence
 from datetime import datetime, timezone
@@ -273,6 +274,63 @@ def group(mode: str, state: Path) -> int:
     return 0 if stopped and status != "unexpected-success" else 1
 
 
+def nested_signal(mode: str, state: Path) -> int:
+    """Deliver a second SIGTERM inside the first handler's ``Event.set()``.
+
+    CPython runs a Python signal handler between two bytecodes of the main
+    thread, inside another handler too. Two back-to-back signals therefore run
+    the second handler while the first one may hold the Event's lock, which is
+    not reentrant. The trace hook sends the second signal at exactly that
+    point: from ``Condition.notify_all``, which runs only with the lock held.
+    """
+    signum = signal.SIGTERM
+    handled: list[int] = []
+    fired = False
+
+    def second_signal(frame: Any, event: str, _arg: object) -> None:
+        nonlocal fired
+        code = frame.f_code
+        if (
+            not fired
+            and event == "call"
+            and code.co_name == "notify_all"
+            and code.co_filename == threading.__file__
+        ):
+            fired = True
+            os.kill(os.getpid(), signum)
+
+    outcome = "completed"
+    interrupted = False
+    try:
+        with worker.cancellation_scope(request_only=mode == "request") as requested:
+            receive = signal.getsignal(signum)
+            assert callable(receive), "the cancellation scope installed no handler"
+
+            def counted(number: int, frame: Any) -> None:
+                handled.append(number)
+                receive(number, frame)
+
+            signal.signal(signum, counted)
+            sys.settrace(second_signal)
+            try:
+                os.kill(os.getpid(), signum)
+            finally:
+                sys.settrace(None)
+            interrupted = requested.is_set()
+    except KeyboardInterrupt:
+        outcome = "KeyboardInterrupt"
+    write_json_atomic(
+        state / "result.json",
+        {
+            "handled": len(handled),
+            "nested": fired,
+            "interrupted": interrupted,
+            "outcome": outcome,
+        },
+    )
+    return 0
+
+
 def main() -> int:
     os.umask(0o077)
     operation, mode, path = sys.argv[1:4]
@@ -292,6 +350,8 @@ def main() -> int:
         return lifecycle_gate(mode, state)
     if operation == "exit-worker":
         return exit_worker(mode, state)
+    if operation == "nested-signal":
+        return nested_signal(mode, state)
     if operation == "lifecycle-wrapper":
         result = run_command(
             [
