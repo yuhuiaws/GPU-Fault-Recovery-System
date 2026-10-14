@@ -7254,6 +7254,8 @@ and the reconciler retries with the existing exponential backoff; an unreadable 
 The kernel collector's shutdown drain has its own upper bound: each record refused by the outbox gets one bounded delivery,
 12 s plus one HTTP timeout (default 10 s, i.e. 22 s), with the unit's `TimeoutStopSec=30`; raising
 `GPU_FAULT_COLLECTOR_HTTP_TIMEOUT_SECONDS` to 18 s or above requires raising that unit's stop timeout in step.
+A repeated SIGTERM during the stop cannot hang the collector before the drain either: its handler records the stop
+request only once, because CPython runs the handler again inside the previous handler's `Event.set()`, whose lock is not reentrant.
 The unit uses `KillMode=mixed`: at stop only the main process receives SIGTERM, and a running `nvidia-smi --gpu-reset`
 child process runs to completion before being reaped, so one `systemctl stop`/node shutdown may wait up to 1900 s, and when that exceeds
 the REBOOT step's 600 s grace the control plane judges the step as timed out. The three reinstall steps (`REMEDIATE_DRIVER`,

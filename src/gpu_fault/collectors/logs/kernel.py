@@ -184,6 +184,34 @@ def _count_queue_drop(
         )
 
 
+def _stop_handlers(
+    stop: threading.Event,
+) -> Callable[[Any], Callable[[int, Any], None]]:
+    """Signal handlers that set ``stop`` and then run the handler they replace.
+
+    Only the first signal sets ``stop``. CPython runs a Python handler between
+    two bytecodes of the main thread, inside another handler too, so a repeated
+    signal -- systemd repeats SIGTERM on a slow stop -- can run a handler inside
+    the first one's ``stop.set()``, whose lock is not reentrant: a second
+    ``set()`` there would block for ever, before the drain.
+    """
+
+    requested = False
+
+    def make_handler(previous: Any) -> Callable[[int, Any], None]:
+        def handler(signum: int, frame: Any) -> None:
+            nonlocal requested
+            if not requested:
+                requested = True
+                stop.set()
+            if callable(previous):
+                previous(signum, frame)
+
+        return handler
+
+    return make_handler
+
+
 # GPU identity after a boot: ``context_from_environment`` discovers the product
 # once, at start, and a collector that comes up before the driver answers would
 # stamp ``product=None`` on every XID for its whole life -- the control plane's
@@ -654,14 +682,7 @@ class KernelLogCollector:
             # from a worker thread is not the process's owner anyway.
             return lambda: None
 
-        def make_handler(previous: Any) -> Callable[[int, Any], None]:
-            def handler(signum: int, frame: Any) -> None:
-                self._shutdown.set()
-                if callable(previous):
-                    previous(signum, frame)
-
-            return handler
-
+        make_handler = _stop_handlers(self._shutdown)
         installed: list[tuple[int, Any]] = []
         for number in (signal.SIGTERM, signal.SIGINT):
             try:

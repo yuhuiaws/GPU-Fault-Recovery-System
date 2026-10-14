@@ -10,7 +10,10 @@ open, so an NTP step after that skewed every ``observed_at``.
 from __future__ import annotations
 
 import errno
+import json
+import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -547,6 +550,112 @@ def test_a_stop_signal_drains_the_delivery_queue_before_the_reader_exits(
     assert signal.getsignal(signal.SIGTERM) is before, (
         "the collector kept the process's SIGTERM handler after run() returned"
     )
+
+
+NESTED_STOP = """
+import json, os, signal, sys, threading
+from gpu_fault.collectors.logs.kernel import KernelLogCollector
+from gpu_fault.collectors.models import CollectorContext
+
+handled, fired = [], False
+
+
+class Sink:
+    def post(self, path, payload):
+        return {"accepted": True}
+
+    def buffer_for_replay(self, path, payload):
+        return True
+
+
+def second_signal(frame, event, _arg):
+    # Condition.notify_all runs only with the Event's lock held.
+    global fired
+    code = frame.f_code
+    if (
+        not fired
+        and event == "call"
+        and code.co_name == "notify_all"
+        and code.co_filename == threading.__file__
+    ):
+        fired = True
+        os.kill(os.getpid(), signal.SIGTERM)
+
+
+def stop(_seconds):
+    # The stream ended and the reader waits to reopen it: stop it here.
+    handler = signal.getsignal(signal.SIGTERM)
+
+    def counted(number, frame):
+        handled.append(number)
+        handler(number, frame)
+
+    signal.signal(signal.SIGTERM, counted)
+    sys.settrace(second_signal)
+    try:
+        os.kill(os.getpid(), signal.SIGTERM)
+    finally:
+        sys.settrace(None)
+
+
+KernelLogCollector(
+    Sink(),
+    CollectorContext(
+        cluster_id="hp-cluster",
+        runtime_profile_version="simulated-v1",
+        product="H100",
+        driver_branch=575,
+        cuda_version="12.9",
+    ),
+    node_id="worker-1",
+    boot_id="boot-123",
+    kmsg_path=sys.argv[1],
+    start_at_end=False,
+    sleep=stop,
+).run()
+print(json.dumps({
+    "handled": len(handled),
+    "nested": fired,
+    "restored": signal.getsignal(signal.SIGTERM) == signal.SIG_DFL,
+}))
+"""
+
+
+def test_a_second_sigterm_inside_the_stop_handler_cannot_deadlock_the_reader(
+    tmp_path: Path,
+) -> None:
+    """systemd may repeat SIGTERM on a slow stop, and CPython runs a Python
+    handler between two bytecodes of the main thread, inside another handler
+    too. A second SIGTERM that lands while the first handler is inside
+    ``_shutdown.set()`` runs the handler again there, where the Event's lock is
+    held and is not reentrant: the reader never reaches the drain. The child
+    sends that second, real SIGTERM from inside the first handler's
+    ``Event.set()``."""
+
+    kmsg = tmp_path / "kmsg"
+    kmsg.write_text("", encoding="utf-8")
+    root = Path(__file__).resolve().parents[2]
+    environment = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join((str(root / "src"), str(root))),
+    }
+    try:
+        completed = subprocess.run(
+            [sys.executable, "-c", NESTED_STOP, str(kmsg)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=environment,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("a second SIGTERM inside the stop handler deadlocked the reader")
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout.strip().splitlines()[-1]) == {
+        "handled": 2,
+        "nested": True,
+        "restored": True,
+    }
 
 
 def test_queued_records_are_buffered_for_replay_at_shutdown() -> None:
