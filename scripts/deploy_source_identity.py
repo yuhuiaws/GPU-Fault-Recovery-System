@@ -37,6 +37,9 @@ DEPLOY_HOST_ORCHESTRATION_INPUTS = (
     "deploy/control-plane/regional/probes/*.py",
     "deploy/control-plane/tools/*.py",
     "deploy/control-plane/tools/*.sh",
+    # The RDS CA bundle apply-rds-ca-bundle.sh installs: rolling the vendored
+    # copy alone must still ship (DEPLOY_HOST_ONLY), never be QUALITY_ONLY.
+    "deploy/control-plane/tools/rds-global-bundle.pem",
     "scripts/ci_gate.py",
     "scripts/ci_gate_artifacts.py",
     "scripts/ci_candidate_receipt.py",

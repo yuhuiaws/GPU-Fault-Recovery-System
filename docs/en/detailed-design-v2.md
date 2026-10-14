@@ -729,11 +729,20 @@ observability configuration is also its responsibility rather than a manual oper
   to another private-subnet zone (tier 1); `aurora_ready` re-checks against the first zone creation recorded (an old checkpoint re-reads the
   CPU nodes) and runs `failover-db-cluster` when the writer is elsewhere and a member there is available. The `status` placement finding and
   `aurora-failback` use the same function, counting the Running api-ha/control-worker Pods (`src/gpu_fault/admin/aurora_placement.py`).
+- `sslmode=verify-full` trusts the RDS CA bundle vendored in the release: `deploy/control-plane/tools/apply-rds-ca-bundle.sh` writes the
+  ConfigMap `gpu-fault-rds-ca-bundle` only when `deploy/control-plane/tools/rds-global-bundle.pem` matches the script's SHA-256 pin, and
+  deploy and `config` never download the bundle they trust (AWS changes the published bundle at every region launch). `status` compares,
+  read-only, the installed ConfigMap with the vendored copy, the published bundle with the vendored copy (added, removed and changed CAs by
+  subject and SHA-256 fingerprint, with the steps to roll the copy), and whether the CA of the Aurora instances' certificates (the root's
+  SHA-1 thumbprint from `describe-certificates`) is in the installed and the vendored bundle, all as findings
+  (`src/gpu_fault/admin/rds_ca_bundle_drift.py`).
 
 Tests: `tests/admin/test_admin_bootstrap_aurora.py` (group and family creation, no modification when aligned, only deviating parameters changed,
 one online modify attaching the group and enabling export at once, never reboots); `tests/admin/test_admin_bootstrap_aurora_writer_zone.py`
 (the rule itself, a writer in a minority zone of a multi-zone CPU cluster failed back, `aurora_ready` reusing the first zone or re-reading the
-nodes, tiers 0/1).
+nodes, tiers 0/1); `tests/admin/test_rds_ca_bundle_drift.py` (certificate parsing equal to cryptography's, added/removed/changed
+classification, finding text, read-only) and `tests/deploy/test_rds_ca_bundle_wiring.py` (the vendored copy installed by default, a modified
+copy fails closed, the download never takes part in trust).
 
 ## 3. Detailed Module Design
 

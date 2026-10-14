@@ -1314,8 +1314,10 @@ re-check the remaining time; terminal failure, error responses and identity mism
 and then writes the `gpu-fault-aurora` Secret;
 managed bootstrap explicitly uses `admin.rds_ca_bundle.RDS_CA_BUNDLE_PATH` to generate a
 `sslmode=verify-full` DSN, consistent with the non-optional read-only CA mount of the CPU, the schema Job and the refresher,
-neither depending on the deploy host exporting the CA path beforehand nor accepting an inherited environment override of that path. The CA install still checks the official bundle's
-fixed digest; a missing mount or an untrusted certificate still refuses the connection, and a legacy manual call without the CA input still refuses to generate the DSN.
+neither depending on the deploy host exporting the CA path beforehand nor accepting an inherited environment override of that path. The CA install writes the release's vendored
+`deploy/control-plane/tools/rds-global-bundle.pem` and checks the fixed digest in `apply-rds-ca-bundle.sh`; deploy and `config` never download the bundle they trust, the bundle AWS
+publishes is only compared after the write and reported in a notice, and `status` reports the drift (`admin.rds_ca_bundle_drift`, administrator operations §6.3). The vendored copy
+is a deploy-host orchestration input. A missing mount or an untrusted certificate still refuses the connection, and a legacy manual call without the CA input still refuses to generate the DSN.
 `aurora_refresh` likewise only prepares the refresher's IAM access, waiting for `aurora_ready` and Pod Identity, not for
 the candidate wheel or image; the first-install CronJob/ServiceAccount/RBAC are also deployed by the release.
 By default `node_keys:*` waits for CPU/GPU join and the fleet master. When custody is explicitly registered, all node key tasks sharing the CPU

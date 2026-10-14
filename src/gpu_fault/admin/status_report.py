@@ -12,6 +12,7 @@ from typing import Any
 from gpu_fault.admin.aurora_placement import placement_findings
 from gpu_fault.admin.command_log import ADMIN_LOG_ENVIRONMENT
 from gpu_fault.admin.ownership_release import status_findings
+from gpu_fault.admin.rds_ca_bundle_drift import rds_ca_bundle_findings
 from gpu_fault.admin.resource_registry_outcome import FIELD, status_view
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault_release.regional_admin_commands import status_header_lines
@@ -74,7 +75,10 @@ def print_status_report(
     it de-registered are read and added (the engine's report covers the
     clusters the site manages, the stale claim is on one it dropped), and so is
     an Aurora writer outside the control plane's zones (``aurora_placement``,
-    read-only; the remedy is ``aurora-failback``, never run from here).
+    read-only; the remedy is ``aurora-failback``, never run from here), and so
+    are the RDS CA bundle lines (``rds_ca_bundle_drift``, read-only: the
+    installed bundle against the release's pinned copy, the bundle AWS
+    publishes against that copy, the Aurora instances' CA in both).
 
     With ``site_file`` -- the managed site, whose directory holds the deploy
     host's records -- the installation registry sync record is added as the
@@ -89,6 +93,7 @@ def print_status_report(
             *findings,
             *status_findings(site),
             *placement_findings(site, state_dir=state_dir),
+            *rds_ca_bundle_findings(site),
         ]
     report = status_document(stdout or "")
     if site_file is not None:

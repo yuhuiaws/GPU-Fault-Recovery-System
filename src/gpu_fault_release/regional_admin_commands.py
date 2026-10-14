@@ -481,8 +481,9 @@ def apply_rds_ca_bundle(release: Any) -> None:
     ``GPU_FAULT_RDS_CA_BUNDLE`` at the mount path. This must run before any of
     those Aurora consumers, or they stay in ``CreateContainerConfigError`` --
     fail closed rather than fall back to an unverified connection. The bundle is
-    fetched from the official AWS truststore and checked against the pin baked
-    into the script; a digest mismatch aborts the deploy.
+    the copy vendored in the release, checked against the pin baked into the
+    script (a digest mismatch aborts the deploy); the bundle AWS publishes is
+    only compared with the pin afterwards, for a warning, never installed.
     """
 
     release.runner.run(

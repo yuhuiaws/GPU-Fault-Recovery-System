@@ -50,3 +50,25 @@ def _aurora_placement_is_not_read(
     monkeypatch.setattr(
         status_report, "placement_findings", lambda *_args, **_kwargs: []
     )
+
+
+@pytest.fixture(autouse=True)
+def _rds_ca_bundle_is_not_read(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``status`` reads the installed RDS CA bundle (kubectl), the published one
+    (curl, which the shared guard does not block) and the Aurora CAs (aws).
+
+    Every ``status`` test therefore reports no RDS CA bundle finding; the
+    module's own tests inject a recorded world and drive the real reader.
+    """
+
+    if request.module.__name__.rsplit(".", 1)[-1] == "test_rds_ca_bundle_drift":
+        return
+    try:
+        from gpu_fault.admin import status_report
+    except ImportError:  # the module is what the red run is missing
+        return
+    monkeypatch.setattr(
+        status_report, "rds_ca_bundle_findings", lambda *_args, **_kwargs: []
+    )

@@ -31,6 +31,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Remotely view/requeue a node collector's dead-letter outbox | `gpu-fault-admin collector-outbox --state-dir ... --cluster-id C --node N --collector kernel --action stats\|list\|requeue-dead [--path /v1/...] [--yes] --reference CHG-...` (no login to the GPU node; only metadata is returned; `requeue-dead` must carry `--yes`; there is no remote `--force`) | §9.3, §8 `GpuFaultCollectorSilent` |
 | Reclaim PostgreSQL hot-table bloat (after a campaign day, before a formal perf or acceptance round) | `gpu-fault-admin store-maintenance --state-dir ... --reference CHG-... [--confirm STORE_MAINTENANCE]` (without `--confirm` it only prints each hot table's live rows, pages, index bytes and proposed action; with the token it executes under the site operation lock; evidence under `$STATE_DIR/store-maintenance/`) | [§10.3](#103-hot-table-storage-parameters-and-store-maintenance-reclaiming-bloat) |
 | A failover left the Aurora writer outside the zone with the most control-plane Pods (`status` reports `finding: Aurora writer ... runs in ...`) | `gpu-fault-admin aurora-failback --state-dir ... --reference CHG-... [--confirm AURORA_FAILBACK]` (without `--confirm` it only prints the placement and the target member; with the token it executes under the site operation lock, refuses while work is in flight, waits for the cluster to be `available` and the control plane ready, journal under `$STATE_DIR/aurora-failback/`; never run automatically) | [§4.9](#49-aurora-writer-beside-the-control-plane-the-status-finding-and-aurora-failback) |
+| AWS published a new RDS global CA bundle (`status` reports `finding: RDS CA bundle drift: ...`), or `deploy`/`config` of an older release fails with `RDS CA bundle digest does not match the pinned SHA-256; refusing` | A current release only reports, it never blocks: roll the vendored copy and its pin in the source with the steps the finding gives, then `deploy`; on an older release, rerun the same command with `GPU_FAULT_RDS_CA_BUNDLE_SOURCE` set to a bundle byte-identical to the old pin | [§6.3](#63-rds-ca-bundle-vendored-in-the-release-aws-rotations-reported-by-status) |
 | The installation registry sync fails because it "would change recorded identities" and that key's physical resource really was replaced (a recreated subnet, a re-subscribed SNS e-mail) | `gpu-fault-admin replace-resource --state-dir ... --resource-key <key> --reference ...` for the read-only plan; add `--confirm REPLACE_RESOURCE` to execute | §4 |
 | Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | §10 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
@@ -2145,6 +2146,7 @@ cluster, and **administrators need to run no command**:
 | Node Action key | Node-level key version 2; existing legitimate randomly rotated values are kept | custody must be explicitly registered in advance and independently authorised; the deployment and witness after a single-node rotation cannot be replaced by a Secret snapshot or reinstall (§6.2) |
 | Node Agent TLS | A certificate is generated per node at installation and pinned by the signed heartbeat | A certificate change raises the Agent generation; rotate via a formal node rollout, never fall back to HTTP |
 | NLB server certificate | The certificate self-issued by bootstrap and **imported** into ACM (issued by a private root CA: server certificate valid 825 days, root CA 3650 days, nodes hold the CA public key). ACM does not auto-renew imported certificates; `status` alerts ahead of time on this 825-day server certificate per `certificateMinValidityDays` (default 30) | Before expiry re-issue and import the certificate, update the data-plane trust chain and switch via a formal node rollout; there is no `renew-certificate` verb and none is planned; `curl -k` is forbidden |
+| RDS CA bundle (the trust roots of Aurora `verify-full`) | The release vendors `deploy/control-plane/tools/rds-global-bundle.pem` and writes it to the ConfigMap `gpu-fault-rds-ca-bundle` only when its SHA-256 matches the pin in `apply-rds-ca-bundle.sh`; `deploy`/`config` never download the bundle they trust | When AWS rotates the published bundle `status` reports a drift finding (added/removed/changed CAs, whether the Aurora instances' CA is in it); roll the copy as in §6.3, and review removed or changed CAs first |
 | execution token | Exists only on the CPU control plane | Must not be distributed to the GPU data plane |
 | Notification email channel | Default `channel: sns`: the administrator address is the only confirmed subscription on the site SNS topic, shared with AMP alerts, and the control-plane role holds only `sns:Publish`; `channel: ses` sites additionally have a verified SES sending identity | When the subscription lapses, the monitoring check of `status` gives WARN, and rerunning `deploy` resends the confirmation email; switching from SES to SNS only needs `spec.notifications.channel` in `site.yaml` changed to `sns` and a `deploy` rerun, and the old SES identity is deleted by `uninstall` per the registry |
 - `GPU_FAULT_OPERATOR_ACKNOWLEDGEMENT_TIMEOUT_SECONDS` (default 86400): the wait cap of steps awaiting human confirmation
@@ -2400,6 +2402,65 @@ a `0600` file in a separately controlled directory on the trusted deployment hos
 and its retention and deletion follow the approved rotation process. The signed proof covers only the trusted delivery path and cannot prove the master never appeared at unobserved locations;
 local hermetic tests are not LIVE installation, KMS IAM or complete AUTH case acceptance evidence either.
 
+### 6.3 RDS CA Bundle: Vendored in the Release, AWS Rotations Reported by status
+
+**What is installed.** The control plane connects to Aurora with `sslmode=verify-full`; its trust roots come from the
+ConfigMap `gpu-fault-rds-ca-bundle` (mounted as `/etc/gpu-fault/rds/ca-bundle.pem`). The first bootstrap, `deploy` and
+`config` all write that ConfigMap with `deploy/control-plane/tools/apply-rds-ca-bundle.sh`, and what they write is the
+release's vendored `deploy/control-plane/tools/rds-global-bundle.pem`: only when its SHA-256 equals the script's
+`RDS_CA_BUNDLE_SHA256`, otherwise the step fails, like the wheel and node-bundle digest gates. The deploy host never
+downloads the bundle it trusts; `GPU_FAULT_RDS_CA_BUNDLE_SOURCE=<local PEM>` installs another file instead, which must
+equally be byte-identical to the pin.
+
+**Why it is no longer downloaded.** Whenever an RDS region launches, AWS adds that region's three root CAs to
+`https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem`. Older releases downloaded that file at deploy time
+and compared it with the pin, so every region launch failed every `deploy` and every `config` of a site with
+`RDS CA bundle digest does not match the pinned SHA-256; refusing` until a new pin shipped in a release; and because
+`config` runs the deployed release's snapshot, the site could not even change its administrator configuration until then.
+
+**How an AWS rotation shows up.** After writing the ConfigMap the script still downloads the published bundle once and
+compares it with the pin, for a notice only: on a mismatch it prints `WARNING: the published AWS RDS CA bundle changed: ...`
+(both digests and certificate counts), on a failed download one `note:` line; neither fails the step, and the download is
+never installed. `gpu-fault-admin status` (quick mode included) compares the following read-only every time, and every
+difference is one finding line — not a failing check; `healthy` and the exit code are unchanged:
+
+| Finding starts with | Meaning | Action |
+|---|---|---|
+| `RDS CA bundle: CRITICAL: ConfigMap gpu-fault-rds-ca-bundle does not hold the CA ...` | The CA the Aurora instances' server certificates are issued under (the instance's `CACertificateIdentifier`, matched by the root's SHA-1 thumbprint from `describe-certificates`) is not in the installed bundle: new `verify-full` connections fail | Apply a release whose vendored copy holds that CA, or move the instances to a CA the installed bundle holds |
+| `RDS CA bundle: ACTION BEFORE THE NEXT APPLY: ...` | The current release's vendored copy lacks that CA: the next `deploy`/`config` that runs the release engine writes it and breaks `verify-full` | Roll the vendored copy to a bundle that holds the CA first |
+| `RDS CA bundle drift: AWS REMOVED ...`, `RDS CA bundle drift: AWS CHANGED ...` | The published bundle dropped a CA of the vendored copy, or replaced it with another certificate of the same subject; each is listed by subject and SHA-256 fingerprint, with whether an Aurora instance chains to it | Review before rolling the copy; if Aurora chains to a removed CA, move the cluster to a CA that stays first |
+| `RDS CA bundle drift: AWS publishes ... this release pins and installs ...` | The published bundle differs from the vendored copy: the added, removed and changed CAs (subject and SHA-256), and the exact steps to roll the copy | Roll it as below; trust is unchanged until then |
+| `RDS CA bundle: ConfigMap gpu-fault-rds-ca-bundle holds ..., not the copy this release pins ...` | The cluster still holds the older bundle: the release that rolled the copy is deployed, the release engine has not applied it yet | The next `deploy` or `config` that runs the release engine writes it; nothing to do early when the new copy is a superset |
+| `... could not be read`, `RDS CA bundle drift could not be checked: ...` | An input could not be read (kubectl, curl or aws failed, or the deploy host has no internet access) | The report is printed as usual; the installed bundle does not depend on the download |
+
+The reads are four read-only commands: `kubectl get configmap gpu-fault-rds-ca-bundle`, a `curl --proto =https` download
+of the published bundle into a temporary directory, `describe-db-instances` filtered by the cluster, and
+`describe-certificates`; each is capped at 30 seconds, and the command runner refuses any mutating command.
+
+**Rolling the vendored copy** (a source change that ships in a release):
+
+```bash
+curl -fsS --proto '=https' https://truststore.pki.rds.amazonaws.com/global/global-bundle.pem \
+    -o deploy/control-plane/tools/rds-global-bundle.pem
+sha256sum deploy/control-plane/tools/rds-global-bundle.pem   # must equal the published digest in the finding
+```
+
+Review the added and removed CAs against the finding (a region launch adds that region's root CAs, subject
+`O=Amazon Web Services, Inc., OU=Amazon RDS`), set the script's `RDS_CA_BUNDLE_SHA256` to the new digest with one
+provenance line, then `deploy`. The copy is a deploy-host orchestration input, so a commit that changes only the copy is
+deployed as well and never treated as QUALITY_ONLY. An add-only rotation is a safe superset for the running control plane:
+every existing CA is kept byte for byte, the `verify-full` host name check does not depend on the bundle, kubelet updates
+the ConfigMap mount in place (no subPath), and libpq reads the file for every new connection, so no Pod restarts. If a
+removed CA still roots the Aurora certificate chain, move the instances to a CA that stays first (the RDS CA rotation
+procedure), then roll the copy.
+
+**Sites still on an older release.** After an AWS rotation the older release's script refuses every `deploy` and
+`config`. Until the new release ships, hand it a bundle byte-identical to the old pin: for example export the
+cluster's current ConfigMap
+(`kubectl get configmap gpu-fault-rds-ca-bundle -n gpu-fault-system -o jsonpath='{.data.ca-bundle\.pem}' > <file>`),
+check that `sha256sum <file>` equals the `expected` value of the error, and rerun the same command with
+`GPU_FAULT_RDS_CA_BUNDLE_SOURCE=<file>`; the digest gate is unchanged, and the cluster keeps trusting the same bundle.
+
 ## 7. Troubleshooting by Symptom
 
 | Symptom | First check | Detailed reference |
@@ -2415,6 +2476,7 @@ local hermetic tests are not LIVE installation, KMS IAM or complete AUTH case ac
 | Profile content drift within the same version | Release a new profile version; do not overwrite the original version | REG-8.1.3 |
 | Agents not converged after an upgrade | Keep the compatible window, check the Reconciler/Installer, do not force finalize | REG-8.1.4 |
 | Executor verifier fails | IRSA, token, CA, owner, artifact and protocol | REG-14 |
+| `deploy`/`config` reports `RDS CA bundle digest does not match the pinned SHA-256; refusing` | An older release that downloads the published bundle right after an AWS rotation; or the copy named by the `source:` line was modified (a current release installs only the vendored copy) | §6.3 |
 | SNS confirmation email arrives repeatedly | Duplicate confirmed/pending on the same Topic, bootstrap pending checkpoint | REG-7 |
 | StaleAttemptObservation | Training Pod, Completion Watcher, Observation delivery/outbox | REG-14 |
 | workflow FAILED but the incident is `RECOVERED`, reason contains `diagnostic inconclusive` | By design: the workflow contains only forensic/diagnostic/validation steps, failure means "diagnostic inconclusive", the incident is closed, the incident's markers retired, and a `DIAGNOSTIC_INCONCLUSIVE` email sent; the node was not isolated and needs no release, and the job may restart as usual. A failed VALIDATE_GPU/VALIDATE_FABRIC step's `error` now names the reason per node: `validation failed on nodes: <node> (active_gpu_health_findings[<finding> <severity> <value>><threshold> <GPU>; …])`, and every active finding (`finding_id`, `canonical_name`, `severity`, `value`, `threshold_value`, `gpu_uuid`, `pci_bdf`) is written to `details.node_findings` -- no trip to the finding store to learn which check failed | `详细设计-v2.md` §6.3 |

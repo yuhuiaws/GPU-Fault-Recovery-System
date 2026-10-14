@@ -13,24 +13,40 @@ that path real:
   sets ``GPU_FAULT_RDS_CA_BUNDLE`` to it;
 * the legacy regional environment exports the same path; the managed bootstrap
   behavior without that export is covered by the bootstrap preamble tests;
-* the bundle is fetched from the official AWS truststore and admitted only if
+* the bundle installed is the copy vendored in the release, admitted only if
   its SHA-256 matches the pinned value (fail closed), the same digest-gate
-  convention the wheel and node-bundle ship with.
+  convention the wheel and node-bundle ship with. The deploy and ``config``
+  paths never install a download: AWS republishes the bundle whenever an RDS
+  region launches, and while the script installed the download the 2026-09-30
+  and 2026-10-14 rotations failed every deploy and every ``config`` until a
+  release shipped a new pin. The published bundle is compared with the pin
+  after the install, for a warning only.
 
-Nothing here talks to kubectl or the network: the manifests are parsed as
-YAML and the fetch script is checked with ``bash -n`` and text assertions.
+Nothing here talks to a cluster or the network: the manifests are parsed as
+YAML, and the install script runs against a fake ``kubectl`` and ``curl``.
 """
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
 
+import pytest
 import yaml
 
-from gpu_fault.admin.rds_ca_bundle import RDS_CA_BUNDLE_PATH
+from gpu_fault.admin.rds_ca_bundle import (
+    APPLY_SCRIPT,
+    PUBLISHED_BUNDLE_URL,
+    RDS_CA_BUNDLE_PATH,
+    VENDORED_BUNDLE,
+)
+from scripts import deploy_source_identity
+from scripts.release_identity import file_set_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 DEPLOY = ROOT / "deploy"
@@ -48,7 +64,8 @@ CONTROL_PLANE = DEPLOY / "control-plane" / "base" / "control-plane-deployment.ya
 CREDENTIAL_REFRESH = (
     DEPLOY / "control-plane" / "regional" / "aurora-credential-refresh.yaml"
 )
-FETCH_SCRIPT = DEPLOY / "control-plane" / "tools" / "apply-rds-ca-bundle.sh"
+FETCH_SCRIPT = ROOT / APPLY_SCRIPT
+VENDORED = ROOT / VENDORED_BUNDLE
 REGIONAL_ENV = DEPLOY / "control-plane" / "regional" / "regional-env.example.sh"
 GENERATED = DEPLOY / "control-plane" / "regional" / "generated"
 
@@ -153,7 +170,93 @@ def test_admin_cli_deploy_environment_exports_the_same_canonical_path() -> None:
     )
 
 
-# --- the fetch script: official source, pinned digest, fail closed ---------
+# --- the install script: vendored copy, pinned digest, fail closed ---------
+
+# The Kubernetes API server refuses an object whose annotations exceed 256 KiB,
+# and `kubectl apply` keeps the whole ConfigMap in last-applied-configuration.
+ANNOTATIONS_LIMIT_BYTES = 262144
+FAKE_KUBECTL = """#!/usr/bin/env bash
+printf 'kubectl %s\\n' "$*" >> "${FAKE_LOG}"
+case " $* " in
+    *" create configmap "*)
+        for argument in "$@"; do
+            case "${argument}" in --from-file=*) cat "${argument#--from-file=*=}" ;; esac
+        done
+        ;;
+    *" apply -f - "*) cat > "${FAKE_APPLIED}" ;;
+esac
+"""
+FAKE_CURL = """#!/usr/bin/env bash
+printf 'curl %s\\n' "$*" >> "${FAKE_LOG}"
+if [[ -z "${FAKE_PUBLISHED:-}" ]]; then
+    echo "curl: (6) Could not resolve host: truststore.pki.rds.amazonaws.com" >&2
+    exit 6
+fi
+while (($#)); do
+    [[ "$1" == -o ]] && cp "${FAKE_PUBLISHED}" "$2"
+    shift
+done
+exit 0
+"""
+
+
+def _pin() -> str:
+    match = re.search(
+        r'^RDS_CA_BUNDLE_SHA256="([0-9a-f]{64})"$',
+        FETCH_SCRIPT.read_text(encoding="utf-8"),
+        re.MULTILINE,
+    )
+    assert match, "the script must pin a lowercase SHA-256 for the bundle"
+    return match.group(1)
+
+
+def _pem_blocks(data: bytes) -> list[bytes]:
+    return re.findall(
+        rb"-----BEGIN CERTIFICATE-----\n.*?-----END CERTIFICATE-----\n", data, re.S
+    )
+
+
+def _install(
+    tmp_path: Path,
+    *,
+    script: Path = FETCH_SCRIPT,
+    published: bytes | None = None,
+    environment: dict[str, str] | None = None,
+) -> tuple[subprocess.CompletedProcess[str], bytes | None, list[str]]:
+    """Run the install script against a fake kubectl and curl.
+
+    ``published`` is what the fake curl serves; ``None`` makes the download
+    fail. Returns the run, the bytes `kubectl apply` received and the ordered
+    kubectl/curl invocations.
+    """
+
+    fake_bin = tmp_path / "bin"
+    fake_bin.mkdir(exist_ok=True)
+    for name, body in (("kubectl", FAKE_KUBECTL), ("curl", FAKE_CURL)):
+        (fake_bin / name).write_text(body, encoding="utf-8")
+        (fake_bin / name).chmod(0o755)
+    log = tmp_path / "invocations.log"
+    applied = tmp_path / "applied.yaml"
+    for stale in (log, applied):
+        stale.unlink(missing_ok=True)
+    env = {
+        "PATH": f"{fake_bin}:/usr/bin:/bin",
+        "HOME": str(tmp_path),
+        "FAKE_LOG": str(log),
+        "FAKE_APPLIED": str(applied),
+        # A real kubectl could not reach a cluster even if the fake were skipped.
+        "KUBECONFIG": str(tmp_path / "no-such-kubeconfig"),
+        **(environment or {}),
+    }
+    if published is not None:
+        served = tmp_path / "served.pem"
+        served.write_bytes(published)
+        env["FAKE_PUBLISHED"] = str(served)
+    result = subprocess.run(
+        ["bash", str(script)], env=env, capture_output=True, text=True, check=False
+    )
+    calls = log.read_text(encoding="utf-8").splitlines() if log.exists() else []
+    return result, applied.read_bytes() if applied.exists() else None, calls
 
 
 def test_fetch_script_is_valid_bash() -> None:
@@ -163,43 +266,144 @@ def test_fetch_script_is_valid_bash() -> None:
     assert result.returncode == 0, result.stderr
 
 
-def test_fetch_script_pulls_the_official_bundle_and_pins_its_digest() -> None:
-    text = FETCH_SCRIPT.read_text(encoding="utf-8")
-    assert "truststore.pki.rds.amazonaws.com/global/global-bundle.pem" in text, (
-        "the bundle must come from the official AWS truststore"
+def test_the_vendored_bundle_is_the_pinned_bundle() -> None:
+    data = VENDORED.read_bytes()
+
+    assert hashlib.sha256(data).hexdigest() == _pin(), (
+        f"{VENDORED_BUNDLE} must be byte-identical to the bundle the script pins"
     )
-    pin = re.search(r"RDS_CA_BUNDLE_SHA256=\"([0-9a-f]{64})\"", text)
-    assert pin, "the script must pin a lowercase SHA-256 for the bundle"
-    # The digest gate must run against the pin and fail closed on mismatch.
+    assert len(_pem_blocks(data)) == data.count(b"-----BEGIN CERTIFICATE-----") > 0
+    text = FETCH_SCRIPT.read_text(encoding="utf-8")
     assert "sha256sum -c" in text, "the pin must be enforced with sha256sum -c"
-    assert CONFIGMAP_NAME in text, (
-        f"the script must create the {CONFIGMAP_NAME} ConfigMap"
+    assert CONFIGMAP_NAME in text, f"the script must create {CONFIGMAP_NAME}"
+    assert f':-{PUBLISHED_BUNDLE_URL}}}"' in text, (
+        "the drift warning compares the official AWS truststore bundle"
+    )
+    assert '"${SCRIPT_DIR}/rds-global-bundle.pem"' in text
+
+
+def test_the_vendored_bundle_is_installed_and_the_download_never_is(
+    tmp_path: Path,
+) -> None:
+    """The deploy/config path trusts the release, not the network: even when
+    the published bundle differs, the bytes applied are the vendored copy,
+    and the download happens only after the apply, for the warning."""
+
+    vendored = VENDORED.read_bytes()
+    published = b"".join(_pem_blocks(vendored)[:-1])
+
+    result, applied, calls = _install(tmp_path, published=published)
+
+    assert result.returncode == 0, result.stderr
+    assert applied == vendored, "the ConfigMap must carry the vendored copy"
+    assert [call.split()[0] for call in calls] == ["kubectl", "kubectl", "curl"], calls
+    assert "--proto =https" in calls[2] and PUBLISHED_BUNDLE_URL in calls[2]
+    assert "WARNING: the published AWS RDS CA bundle changed" in result.stderr
+    assert hashlib.sha256(published).hexdigest() in result.stderr
+    assert f"{_pin()} ({len(_pem_blocks(vendored))} certificates)" in result.stderr
+    assert "gpu-fault-admin status" in result.stderr
+
+
+def test_an_unchanged_published_bundle_prints_no_warning(tmp_path: Path) -> None:
+    result, applied, _calls = _install(tmp_path, published=VENDORED.read_bytes())
+
+    assert result.returncode == 0, result.stderr
+    assert applied == VENDORED.read_bytes()
+    assert "WARNING" not in result.stderr and "note:" not in result.stderr
+
+
+def test_a_failed_download_never_fails_the_install(tmp_path: Path) -> None:
+    result, applied, calls = _install(tmp_path, published=None)
+
+    assert result.returncode == 0, result.stderr
+    assert applied == VENDORED.read_bytes()
+    assert calls[-1].startswith("curl "), calls
+    assert "note: could not download" in result.stderr
+    assert "Could not resolve host" in result.stderr
+
+
+def _tampered_copy(tmp_path: Path) -> Path:
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    script = tools / FETCH_SCRIPT.name
+    shutil.copy2(FETCH_SCRIPT, script)
+    blocks = _pem_blocks(VENDORED.read_bytes())
+    # Every byte a real CA, one of them swapped out: still a valid-looking
+    # bundle, not the pinned one.
+    (tools / VENDORED.name).write_bytes(b"".join([*blocks[1:], blocks[0]]))
+    return script
+
+
+def test_a_tampered_vendored_copy_fails_closed(tmp_path: Path) -> None:
+    result, applied, calls = _install(
+        tmp_path, script=_tampered_copy(tmp_path), published=VENDORED.read_bytes()
+    )
+
+    assert result.returncode == 1, result.stderr
+    assert "does not match the pinned SHA-256; refusing" in result.stderr
+    assert applied is None and calls == [], (
+        "neither kubectl nor the download runs once the digest gate refuses"
     )
 
 
-def test_fetch_script_digest_gate_rejects_a_tampered_bundle(tmp_path: Path) -> None:
-    """A bundle whose bytes do not match the pin must abort with a non-zero
-    exit, so a swapped CA never reaches the cluster."""
+@pytest.mark.parametrize("identical", [True, False], ids=["identical", "other"])
+def test_a_source_override_passes_the_same_digest_gate(
+    tmp_path: Path, identical: bool
+) -> None:
+    override = tmp_path / "override.pem"
+    blocks = _pem_blocks(VENDORED.read_bytes())
+    override.write_bytes(b"".join(blocks if identical else blocks[:-1]))
 
-    text = FETCH_SCRIPT.read_text(encoding="utf-8")
-    pin = re.search(r'RDS_CA_BUNDLE_SHA256="([0-9a-f]{64})"', text).group(1)
-    tampered = tmp_path / "bundle.pem"
-    tampered.write_text("-----BEGIN CERTIFICATE-----\nnot the real bundle\n")
-
-    ok = subprocess.run(
-        [
-            "bash",
-            "-c",
-            'printf "%s  %s\\n" "$1" "$2" | sha256sum -c - >/dev/null',
-            "_",
-            pin,
-            str(tampered),
-        ],
-        capture_output=True,
-        text=True,
-        check=False,
+    result, applied, _calls = _install(
+        tmp_path,
+        published=VENDORED.read_bytes(),
+        environment={"GPU_FAULT_RDS_CA_BUNDLE_SOURCE": str(override)},
     )
-    assert ok.returncode != 0, "the digest gate must reject a tampered bundle"
+
+    if identical:
+        assert result.returncode == 0, result.stderr
+        assert applied == VENDORED.read_bytes()
+    else:
+        assert result.returncode == 1, result.stderr
+        assert applied is None
+        assert f"source:   {override}" in result.stderr
+
+
+def test_the_vendored_bundle_fits_the_last_applied_annotation() -> None:
+    """`kubectl apply` stores the whole ConfigMap as an annotation; a bundle
+    that outgrew the API server's 256 KiB annotation limit would fail every
+    deploy and config again, so a rotation that crosses it fails here first.
+    The fix then is server-side apply or create/replace in the script."""
+
+    document = {
+        "apiVersion": "v1",
+        "data": {"ca-bundle.pem": VENDORED.read_text(encoding="ascii")},
+        "kind": "ConfigMap",
+        "metadata": {
+            "annotations": {},
+            "creationTimestamp": None,
+            "name": CONFIGMAP_NAME,
+            "namespace": "gpu-fault-system",
+        },
+    }
+    annotation = json.dumps(document, separators=(",", ":")) + "\n"
+
+    assert len(annotation.encode()) < ANNOTATIONS_LIMIT_BYTES, (
+        f"last-applied-configuration would be {len(annotation.encode())} bytes"
+    )
+
+
+def test_rolling_the_vendored_bundle_moves_the_deploy_host_identity() -> None:
+    """A release whose only change is a rolled copy must still ship: the copy
+    is hashed with the script that installs it, so the deploy is not
+    QUALITY_ONLY (which keeps the site's snapshot)."""
+
+    orchestration = file_set_identity(
+        ROOT, deploy_source_identity.DEPLOY_HOST_ORCHESTRATION_INPUTS
+    )["files"]
+
+    assert VENDORED_BUNDLE in orchestration and APPLY_SCRIPT in orchestration
+    assert orchestration[VENDORED_BUNDLE]["sha256"] == _pin()
 
 
 # --- the rendered role-split manifests carry the same wiring ---------------
