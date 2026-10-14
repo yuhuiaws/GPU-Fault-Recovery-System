@@ -71,22 +71,53 @@ def _executor(client, **overrides) -> ClusterActionExecutor:
     )
 
 
+class Clock:
+    """The executor's monotonic clock; only the control plane and sleeps move it."""
+
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+
 class StoppingClient(EmptyClient):
-    """Answers four empty claims, then ends ``run()`` from the fifth."""
+    """Answers four empty claims, then ends ``run()`` from the fifth.
+
+    ``held`` is how long the control plane kept each empty claim open: the
+    whole wait for a real long-poll, nothing for one that will not hold it
+    (its per-cluster waiter cap, a deployment without the wakeup hub).
+    """
+
+    def __init__(self, clock: Clock, *, held: bool) -> None:
+        super().__init__()
+        self.clock = clock
+        self.held = held
+        self.started: list[float] = []
 
     def claim(self, executor_id, **kwargs):
         if len(self.claims) == 4:
             raise Stop
+        self.started.append(self.clock())
+        if self.held:
+            self.clock.now += kwargs["wait_seconds"]
         return super().claim(executor_id, **kwargs)
 
 
+def _sleeping_on(monkeypatch, clock: Clock, sleeps: list[float]) -> None:
+    def sleep(seconds):
+        sleeps.append(seconds)
+        clock.now += seconds
+
+    monkeypatch.setattr("gpu_fault.cluster_executor.executor.time.sleep", sleep)
+
+
 def test_a_long_poll_executor_does_not_sleep_after_an_empty_claim(monkeypatch):
-    client = StoppingClient()
-    executor = _executor(client, claim_wait_seconds=20)
+    clock = Clock()
+    client = StoppingClient(clock, held=True)
+    executor = _executor(client, claim_wait_seconds=20, clock=clock)
     sleeps: list[float] = []
-    monkeypatch.setattr(
-        "gpu_fault.cluster_executor.executor.time.sleep", lambda s: sleeps.append(s)
-    )
+    _sleeping_on(monkeypatch, clock, sleeps)
 
     with pytest.raises(Stop):
         executor.run()
@@ -98,6 +129,26 @@ def test_a_long_poll_executor_does_not_sleep_after_an_empty_claim(monkeypatch):
     )
     assert executor.last_successful_claim_at is not None, (
         "an empty long-poll is still a successful claim"
+    )
+
+
+def test_an_empty_long_poll_answered_at_once_is_paced_like_a_poll(monkeypatch):
+    """A control plane that answers every long-poll empty and at once did not
+    wait, so re-claiming at once would spin on it: one claim per poll_seconds."""
+
+    clock = Clock()
+    client = StoppingClient(clock, held=False)
+    executor = _executor(client, claim_wait_seconds=20, clock=clock)
+    sleeps: list[float] = []
+    _sleeping_on(monkeypatch, clock, sleeps)
+
+    with pytest.raises(Stop):
+        executor.run()
+
+    assert client.started == [0.0, 2.0, 4.0, 6.0], client.started
+    assert sleeps == [2.0, 2.0, 2.0, 2.0], "one poll_seconds after each answer"
+    assert all(claim["wait_seconds"] == 20 for claim in client.claims), (
+        "the claims still ask the control plane to hold them"
     )
 
 

@@ -1680,7 +1680,7 @@ mtime of `/tmp/executor-loop-alive`, and the probe (`deploy/dataplane/cluster-ac
 restarts the Pod when it decides that file has not been updated for more than 300s. This is distinct from `/tmp/executor-ready`: ready only
 says the startup checks passed, loop-alive says the loop is still turning; a replica stuck on a claim/renew is replaced through it.
 The same set of counters is now also exported from `:9111 /metrics` (`gpu_fault.cluster_executor.metrics`, family
-`gpu_fault_cluster_executor_*`, 27 series: 21 counters: `claims_total`, `results_succeeded_total` /
+`gpu_fault_cluster_executor_*`, 28 series: 21 counters: `claims_total`, `results_succeeded_total` /
 `results_failed_total` / `results_waiting_total`, `execution_timeouts_total`,
 `abandoned_lease_holds_total`, `fleet_fence_holds_total`, `lease_lost_total`,
 `transport_retries_total`, `report_failures_total` / `unexpected_failures_total` /
@@ -1689,13 +1689,17 @@ The same set of counters is now also exported from `:9111 /metrics` (`gpu_fault.
 `barrier_unavailable_holds_total`, `retryable_adapter_errors_total`, `retryable_transport_errors_total`,
 `batched_commands_total`, `batched_steps_total`, `batched_progress_failures_total`,
 `spare_reservations_reclaimed_total`; 4 gauges `in_flight_commands`, `claim_loop_alive`, `stuck_executions`,
-`consecutive_transport_degraded_cycles`; 2 timestamps `last_claim_timestamp`, `last_loop_iteration_timestamp`).
+`consecutive_transport_degraded_cycles`; 3 timestamps `last_claim_timestamp`, `last_loop_iteration_timestamp`,
+`last_lease_renewal_timestamp`).
 `increment` is the single write entry point of the executor counters and mirrors synchronously into this family; the two directly assigned keys (the degraded-streak gauge and the spare reclaim count) are hooked
 at their own write points, and a guard test pins "every key in the breadcrumb except `last_successful_claim_at` (ISO text, whose numeric twin is `last_claim_timestamp`)
-has a corresponding series", so the scrape and the readiness breadcrumb read the same set of numbers. How to read them:
+has a corresponding series" (the breadcrumb's top-level `last_successful_renewal_at` is ISO text as well, whose numeric twin is
+`last_lease_renewal_timestamp`), so the scrape and the readiness breadcrumb read the same set of numbers. How to read them:
 `claim_loop_alive == 0` or `last_loop_iteration_timestamp` aged beyond 300 s = the claim loop has stopped
-(the same signal as the exec liveness); loop alive but `last_claim_timestamp` aging = control plane unreachable, not a broken executor;
-`claims_total` only counts commands obtained; an empty poll adds 0.
+(the same signal as the exec liveness); loop alive but both `last_claim_timestamp` and `last_lease_renewal_timestamp` aging = control
+plane unreachable, not a broken executor; only `last_claim_timestamp` aging while `in_flight_commands` equals the slot count and the
+renewal timestamp stays fresh = every slot holds a long command (readiness stays Ready on the renewals); `claims_total` only counts
+commands obtained; an empty poll adds 0.
 
 **⑪ Exception handling**: credentials unresolvable → refuse to start; `CONFIRM_CLUSTER` mismatch → fail closed;
 Node Agent returns a refusal code from §3.1 ⑪ → decide between re-submitting and reporting failure by `retryable`/`requires_new_command`;
@@ -4171,7 +4175,7 @@ port ≤ 0 disables it, a bind failure logs a single ERROR line without affectin
 |---|---|---|
 | `gpu_fault_completion_*` | 9109 | Existing watcher family (`completion_metrics_server`), previously scraped by no one |
 | `gpu_fault_node_installer_*` | 9110 | reconciler, 12 series; counters count by **event** rather than re-accumulating per state each pass: `reconcile_passes_total` (only counts passes that ran to completion; a fail-closed pass does not move it), `nodes_seen_total`, `jobs_created_total` (counted at `budget.consume()`; a node whose annotation patch failed still counts the Job it received), `jobs_succeeded_total`, `jobs_failed_total` (counted only when Failed is first seen), `retries_scheduled_total`, `errors_total`; gauges `nodes_installed`, `nodes_retrying`, `nodes_pending`, `budget_in_flight`; timestamp `last_pass_completed_timestamp`. `/healthz` = heartbeat file fresh within 300 s |
-| `gpu_fault_cluster_executor_*` | 9111 | executor, 27 series (see §3.9 ⑩) |
+| `gpu_fault_cluster_executor_*` | 9111 | executor, 28 series (see §3.9 ⑩) |
 | `gpu_fault_node_resource_*` | — | Reserved for the node-resource collector; no endpoint yet |
 
 Corresponding new alerts: `GpuFaultProcessorFaultEventsRejected` (warning, 15-minute `increase()`>0,

@@ -447,6 +447,37 @@ def _claim_loop_settings_from_environment() -> dict[str, float | int]:
     }
 
 
+def _breadcrumb_age(value: object, now: datetime) -> float | None:
+    if not isinstance(value, str):
+        return None
+    try:
+        return max(0.0, (now - datetime.fromisoformat(value)).total_seconds())
+    except (TypeError, ValueError):
+        return None
+
+
+def _work_channel_age(state: dict[str, Any], now: datetime) -> float | None:
+    """Age of the newest claim or lease renewal the breadcrumb records.
+
+    Sent as ``last_successful_claim_age_seconds``. A renewal of a command in
+    flight is the same authenticated round trip as a claim -- token, trust
+    chain, route -- and while every slot holds a long command nothing is
+    claimed, so the claim time alone read five renewing reboots as an executor
+    that stopped working. The loop rewrites the breadcrumb with each renewal it
+    sees, so a loop that neither claims nor renews still ages out.
+    """
+
+    ages = [
+        age
+        for age in (
+            _breadcrumb_age(state.get("last_successful_claim_at"), now),
+            _breadcrumb_age(state.get("last_successful_renewal_at"), now),
+        )
+        if age is not None
+    ]
+    return min(ages) if ages else None
+
+
 def readiness_probe() -> int:
     """Authenticated readiness for the executor Pod.
 
@@ -456,7 +487,8 @@ def readiness_probe() -> int:
     trust chain to the control plane, or a backlog whose execution owners
     this executor does not implement all left the Pod Ready and claiming
     nothing. Runs as a separate process under the probe, so the last
-    successful claim is read from the breadcrumb the claim loop writes.
+    successful claim -- or lease renewal (``_work_channel_age``) -- is read
+    from the breadcrumb the claim loop writes.
     """
 
     configure_logging()
@@ -491,17 +523,7 @@ def readiness_probe() -> int:
         raw_owners = state.get("execution_owners")
         if isinstance(raw_owners, list):
             owners = [owner for owner in raw_owners if isinstance(owner, str)]
-        claimed_at = state.get("last_successful_claim_at")
-        if isinstance(claimed_at, str):
-            try:
-                claim_age = max(
-                    0.0,
-                    (
-                        datetime.now(timezone.utc) - datetime.fromisoformat(claimed_at)
-                    ).total_seconds(),
-                )
-            except (TypeError, ValueError):
-                claim_age = None
+        claim_age = _work_channel_age(state, datetime.now(timezone.utc))
     try:
         report = client.readiness(
             executor_id,

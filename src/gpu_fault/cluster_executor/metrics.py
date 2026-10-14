@@ -12,9 +12,9 @@ the scrape and the breadcrumb always read the same numbers. Every number the
 breadcrumb carries is exported -- the ``increment`` counters, the claim loop's
 degraded-cycle streak and the spare sweep's total (a merge once ported five
 counters that rode in the breadcrumb alone; the metrics test now pins the two
-sets against each other). Results, the loop breadcrumb and the batch in flight
-are the three things the counters never said, and they are recorded at the one
-place each is decided.
+sets against each other). Results, the loop breadcrumb, the commands in flight
+and the last lease renewal are what the counters never said, and they are
+recorded at the one place each is decided.
 """
 
 from __future__ import annotations
@@ -22,6 +22,7 @@ from __future__ import annotations
 import logging
 import os
 import time
+from datetime import datetime
 
 from gpu_fault.dataplane_metrics import MetricFamily
 from gpu_fault.regional import RemoteCommandStatus
@@ -221,6 +222,12 @@ def cluster_executor_metrics() -> MetricFamily:
                 "Unix seconds of the last liveness breadcrumb the claim loop "
                 "wrote; ageing past 300 s is the loop having stopped turning.",
             ),
+            (
+                "last_lease_renewal_timestamp",
+                "Unix seconds of the last successful lease renewal of a command "
+                "in flight; it keeps moving while every slot holds a long "
+                "command and last_claim_timestamp does not.",
+            ),
         ),
     )
 
@@ -246,8 +253,11 @@ class ClusterExecutorMetrics:
         if series is not None:
             self.family.inc(series)
 
-    def claimed(self) -> None:
-        self.family.mark("last_claim_timestamp")
+    def claimed(self, when: datetime | None = None) -> None:
+        self.family.mark("last_claim_timestamp", when)
+
+    def lease_renewed(self, when: datetime | None = None) -> None:
+        self.family.mark("last_lease_renewal_timestamp", when)
 
     def loop_iteration(self, *, alive: bool) -> None:
         """The claim loop wrote (or failed to write) its liveness breadcrumb."""

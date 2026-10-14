@@ -3101,13 +3101,14 @@ set 0 to disable; a port bind failure only logs one ERROR line, the main loop ru
 | Environment variable | Default | Description |
 |---|---|---|
 | `GPU_FAULT_NODE_INSTALLER_METRICS_PORT` | 9110 | The reconciler's `/metrics` + `/healthz`, family `gpu_fault_node_installer_*` (12 series, counters count events); `/healthz` asks the same question as the exec liveness: whether the heartbeat file is fresh within 300 s |
-| `GPU_FAULT_CLUSTER_EXECUTOR_METRICS_PORT` | 9111 | The executor's `/metrics` + `/healthz`, family `gpu_fault_cluster_executor_*` (27 series, same source as the readiness breadcrumb); `/healthz` reads the same loop-alive file |
+| `GPU_FAULT_CLUSTER_EXECUTOR_METRICS_PORT` | 9111 | The executor's `/metrics` + `/healthz`, family `gpu_fault_cluster_executor_*` (28 series, same source as the readiness breadcrumb); `/healthz` reads the same loop-alive file |
 
 How to read them: `gpu_fault_node_installer_reconcile_passes_total` flat across several reconcile periods, or
 `time() - gpu_fault_node_installer_last_pass_completed_timestamp` growing continuously = the loop is not doing work; `nodes_pending > 0`
 with `budget_in_flight == 0` unchanged for a long time = no installation is being scheduled. Executor side: `gpu_fault_cluster_executor_claim_loop_alive == 0`
 or `last_loop_iteration_timestamp` older than 300 s = the claim loop has stopped (the same signal as the exec liveness); loop alive but
-`last_claim_timestamp` aging = the control plane is unreachable, not a broken executor.
+both `last_claim_timestamp` and `last_lease_renewal_timestamp` aging = the control plane is unreachable, not a broken executor; only the
+former aging while `in_flight_commands` equals the slot count and the latter stays fresh = every slot holds a long command.
 
 **Consequence of explicitly scaling to 0 replicas (you must be informed): all path B alerts are disabled without exception** --
 queue depth, Store I/O, processing duration p95, and
@@ -5918,6 +5919,16 @@ production loop is no longer bound by it; it only still applies to the single-cy
 probes drive (claim one batch, wait until all of it has reported; with `BATCH_SIZE > MAX_CONCURRENT_COMMANDS` the surplus
 queues locally, which CAP-004's queued-lease proof exercises on purpose). Both settings only bound one executor's commands
 in flight; cluster-level remediation concurrency is still decided by the persistent remediation budgets.
+
+While long commands hold every slot nothing is claimed, but readiness does not drop for it: a successful lease renewal counts as
+progress (`last_successful_renewal_at` in the breadcrumb, the series `gpu_fault_cluster_executor_last_lease_renewal_timestamp`),
+the probe reports the age of the newest claim or renewal, and the spare sweep and the node-key sync keep their own schedules.
+Only no claim and no renewal for longer than `GPU_FAULT_EXECUTOR_READINESS_MAX_CLAIM_AGE_SECONDS` (default 300 seconds) reads
+not ready; a backlog nobody claims for longer than `GPU_FAULT_EXECUTOR_READINESS_MAX_UNCLAIMED_SECONDS` still does, unchanged.
+When the control plane does not hold the long-poll (more than 4 waiters per cluster, no wakeup hub), empty answers that come
+back at once are re-claimed at the `POLL_SECONDS` cadence instead of spinning. A claim held open while commands run can take a
+command again right after it handed back WAITING; the following claims take the idle wait as usual. That is bounded and
+accepted by design.
 
 Step 1: check in-flight commands:
 

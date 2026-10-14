@@ -496,6 +496,7 @@ class CommandLifecycle:
             )
             return False
         cancellation = watch.renewed(response, expires_at=expires_at)
+        self.executor.lease_renewed()
         if cancellation is not None:
             self.executor.increment("cancellations_observed_total")
         return watch.hold_reason() is None and not self.executor.stop_requested
@@ -969,6 +970,8 @@ class CommandLifecycle:
                     )
                     return
                 continue
+            # Proof the work channel is alive while no claim is being made.
+            self.executor.lease_renewed()
             if watch is None:
                 continue
             cancellation = watch.renewed(renewed, expires_at=expires_at)

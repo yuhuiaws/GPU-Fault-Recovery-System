@@ -58,6 +58,7 @@ class Claim:
     wait_seconds: float
     leased_before: int
     command_ids: tuple[str, ...]
+    at: float
 
 
 @dataclass(frozen=True)
@@ -109,6 +110,7 @@ class LeasingControlPlane:
         lease_seconds: int,
         wait_seconds: float = 0,
     ) -> list[RemoteActionCommand]:
+        at = time.monotonic()
         with self._condition:
             if self.claim_errors:
                 self.failed_claims += 1
@@ -137,6 +139,7 @@ class LeasingControlPlane:
                     wait_seconds=wait_seconds,
                     leased_before=len(self.leased),
                     command_ids=tuple(command.command_id for command in leased),
+                    at=at,
                 )
             )
             self.leased.update((command.command_id, command) for command in leased)
@@ -751,3 +754,36 @@ def test_a_held_command_with_free_slots_still_polls_under_long_poll(
     assert len(adapter.started_ids()) <= len(sleeps) + 3, adapter.started_ids()
     assert all(claim.wait_seconds == 20 for claim in client.claims), client.claims
     assert executor.last_cycle_advanced is False
+
+
+def test_an_empty_long_poll_answered_at_once_is_paced_with_commands_in_flight(
+    tmp_path: Path,
+) -> None:
+    """A control plane that will not hold the claim (its per-cluster waiter
+    cap, no wakeup hub) answers every long-poll empty and at once; with free
+    slots beside a running command the loop must not spin on it."""
+
+    client = LeasingControlPlane([remote_command("long")], hold_seconds=0)
+    adapter = GatedAdapter("long")
+    executor = slot_executor(
+        client,
+        adapter,
+        tmp_path,
+        batch_size=3,
+        max_concurrent_commands=3,
+        claim_wait_seconds=20,
+        poll_seconds=0.1,
+    )
+
+    with running(executor, adapter):
+        eventually(lambda: adapter.started_ids() == ["long"], "long never started")
+        REAL_SLEEP(1.0)
+        assert "long" not in client.reported_ids(), "long ran the whole window"
+
+    assert all(claim.wait_seconds == 20 for claim in client.claims), client.claims
+    empty = [claim for claim in client.claims if not claim.command_ids]
+    gaps = [later.at - earlier.at for earlier, later in zip(empty, empty[1:])]
+    assert len(empty) >= 3, f"the loop stopped claiming: {client.claims}"
+    assert min(gaps) >= 0.09, (
+        f"empty answers re-claimed sooner than poll_seconds (a spin): {gaps}"
+    )

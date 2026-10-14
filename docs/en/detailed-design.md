@@ -2450,8 +2450,15 @@ enters `ClusterActionExecutor.run()` (`ClaimLoop` in `executor.py`): every claim
 its own, the slot it frees is claimed again at once, a claim asks for the free slots only, and at most
 `min(BATCH_SIZE, MAX_CONCURRENT_COMMANDS)` commands are in flight. One claim's commands are still one cycle, judged when the
 last of them reports for progress (WAITING only takes the idle wait) and for the network-degraded streak; while the degraded
-back-off is active nothing is claimed with commands in flight. `run_once()` stays as the single-cycle primitive (claim one batch,
-wait until all of it has reported) that tests and acceptance probes drive.
+back-off is active nothing is claimed with commands in flight. An empty long-poll answer that came back in under half of
+`claim_wait_seconds` was not held (the control plane's per-cluster waiter cap, no wakeup hub): the next claim starts no sooner than
+`_idle_delay()` after it, like a poll, with commands in flight or not. A claim held open while commands run can take a command
+again right after it handed back WAITING (at the end of the hold or on the next PENDING wakeup), before the loop has judged that
+WAITING; the following claims take the idle wait as usual. That is bounded, never a spin, and accepted by design. While every slot
+is full the loop still runs the due spare sweep and node-key sync and rewrites the readiness breadcrumb whenever a lease renewal
+landed (`last_successful_renewal_at`); the readiness probe reports the age of the newest claim or renewal, so five long restarts
+holding every slot for more than 300 s stay Ready, while a loop that neither claims nor renews still ages out. `run_once()` stays
+as the single-cycle primitive (claim one batch, wait until all of it has reported) that tests and acceptance probes drive.
 
 `RegionalExecutorClient` handles outbound HTTP: request headers carry
 `Authorization: Bearer <cluster-token>` and `X-GPU-Fault-Cluster-ID`, default timeout

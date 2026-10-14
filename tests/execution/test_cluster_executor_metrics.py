@@ -117,6 +117,7 @@ EXPECTED_METRICS = {
     "gpu_fault_cluster_executor_stuck_executions": "gauge",
     "gpu_fault_cluster_executor_last_claim_timestamp": "gauge",
     "gpu_fault_cluster_executor_last_loop_iteration_timestamp": "gauge",
+    "gpu_fault_cluster_executor_last_lease_renewal_timestamp": "gauge",
 }
 
 

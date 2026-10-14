@@ -651,8 +651,9 @@ The reconciler and cluster executor now each have their own `/metrics` (9110 / 9
 `time() - gpu_fault_node_installer_last_pass_completed_timestamp` growing continuously = the reconciler loop is not doing work;
 `gpu_fault_node_installer_nodes_pending > 0` with `budget_in_flight == 0` unchanged for a long time = no installation is being scheduled.
 `gpu_fault_cluster_executor_claim_loop_alive == 0` or `last_loop_iteration_timestamp` older than 300 s
-= the claim loop has stopped (the same signal as the exec liveness); loop alive but `last_claim_timestamp` aging = the control plane is unreachable,
-not a broken executor. `gpu_fault_cluster_executor_consecutive_transport_degraded_cycles > 0` persisting = the executor's own network is degraded and
+= the claim loop has stopped (the same signal as the exec liveness); loop alive but both `last_claim_timestamp` and
+`last_lease_renewal_timestamp` aging = the control plane is unreachable, not a broken executor; only the former aging while
+`in_flight_commands` equals the slot count and the latter stays fresh = every slot holds a long command, and readiness stays Ready. `gpu_fault_cluster_executor_consecutive_transport_degraded_cycles > 0` persisting = the executor's own network is degraded and
 the claim loop is backing off; `retryable_transport_errors_total` rising while `retryable_adapter_errors_total` does not = the problem is on the executor side, not the
 target side; `batched_progress_failures_total` rising only means control-plane latency, no lost steps; `results_withheld_total` rising = the lease was lost before the result,
 and the next holder redoes that step. Variables and prerequisites are in the path B section of the Deployment and Operations Manual.

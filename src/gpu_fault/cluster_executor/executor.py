@@ -158,6 +158,10 @@ def _validate_settings(
         )
 
 
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
 class ClusterActionExecutor:
     def __init__(
         self,
@@ -201,6 +205,10 @@ class ClusterActionExecutor:
         self.max_execution_seconds = max_execution_seconds
         self.liveness_interval_seconds = liveness_interval_seconds
         self.clock = clock
+        # The wall clock the claim and renewal timestamps are read from, which
+        # the out-of-process readiness probe ages against its own. An attribute
+        # rather than a parameter: a test moves it to age the breadcrumb.
+        self.now: Callable[[], datetime] = _utc_now
         self._last_heartbeat_log_at: float | None = None
         # Only the report backoff sleeps inside a command's own thread, so it
         # is injectable: a test must not really wait half a second to prove the
@@ -299,6 +307,13 @@ class ClusterActionExecutor:
         self._stop_requested = False
         self._stop_reason: str | None = None
         self.last_successful_claim_at: datetime | None = None
+        # The last successful lease renewal of a command in flight, assigned by
+        # the renewer threads (``lease_renewed``). It is the same authenticated
+        # round trip as a claim -- token, trust chain, route -- so while every
+        # slot holds a long command and nothing is claimed, it is what keeps
+        # the readiness breadcrumb fresh (``refresh_claim_state``).
+        self.last_successful_renewal_at: datetime | None = None
+        self._renewal_in_breadcrumb: datetime | None = None
         # Whether the last claim cycle -- one claim's commands, judged once
         # the last of them reported -- moved any command off WAITING. run()
         # takes the idle path when it did not, so a held command polls at
@@ -499,7 +514,34 @@ class ClusterActionExecutor:
 
         self._record_claim_state(None)
 
+    def lease_renewed(self) -> None:
+        """A lease renewal of a command in flight landed (admission or renewer).
+
+        Called from the renewer threads; the loop thread copies the timestamp
+        into the readiness breadcrumb on its own cadence.
+        """
+
+        renewed_at = self.now()
+        self.last_successful_renewal_at = renewed_at
+        self.metrics.lease_renewed(renewed_at)
+
+    def refresh_claim_state(self) -> None:
+        """Rewrite the readiness breadcrumb when a renewal landed since the last.
+
+        The claim loop calls this while it waits: with every slot holding a
+        long command nothing is claimed, and a breadcrumb only claims rewrote
+        aged into "last successful claim was 301s ago" -- not ready -- for an
+        executor whose leases were all renewing. A loop that neither claims nor
+        rewrites this file still ages out, which is the stuck loop the check is
+        for.
+        """
+
+        if self.last_successful_renewal_at != self._renewal_in_breadcrumb:
+            self._record_claim_state(self.last_successful_claim_at)
+
     def _record_claim_state(self, claimed_at: datetime | None) -> None:
+        renewed_at = self.last_successful_renewal_at
+        self._renewal_in_breadcrumb = renewed_at
         try:
             path = self.claim_state_path
             temporary = f"{path}.tmp"
@@ -510,6 +552,9 @@ class ClusterActionExecutor:
                         "execution_owners": self.execution_owners,
                         "last_successful_claim_at": (
                             claimed_at.isoformat() if claimed_at is not None else None
+                        ),
+                        "last_successful_renewal_at": (
+                            renewed_at.isoformat() if renewed_at is not None else None
                         ),
                         "counters": self.metrics_snapshot(),
                     },
@@ -576,9 +621,9 @@ class ClusterActionExecutor:
         # chain and the control-plane route all work, even when the
         # queue is empty. That is the only useful executor liveness
         # signal; the readiness marker file only proves pip install ran.
-        self.last_successful_claim_at = datetime.now(timezone.utc)
+        self.last_successful_claim_at = self.now()
         self.increment("claimed_total", len(commands))
-        self.metrics.claimed()
+        self.metrics.claimed(self.last_successful_claim_at)
         self._record_successful_claim(self.last_successful_claim_at)
         self._log_claims(commands)
         return claimed
@@ -853,9 +898,25 @@ class ClaimLoop:
     * with nothing new since the last claim, a long-polling executor claims
       again at once while its last cycle advanced -- the control plane holds
       the claim -- and a polling one waits ``_idle_delay()``;
+    * an empty long-poll answer that came back in under half of
+      ``claim_wait_seconds`` was not held (the control plane's per-cluster
+      waiter cap, no wakeup hub): the next claim starts no sooner than
+      ``_idle_delay()`` after it, like a poll, with commands in flight or not;
     * while the network-degraded back-off is active nothing is claimed with
       commands in flight, as in the batch cycle: a replica that cannot reach
       its targets must not compete with its sibling for the work it releases.
+
+    A claim held open while a command runs can take that command again when
+    it next becomes claimable (a WAITING hand-back, at the end of the hold or
+    on the next PENDING wakeup) before the loop has judged that WAITING; the
+    idle path applies from the following claim. Accepted: bounded by the
+    claims themselves, never a spin.
+
+    Housekeeping (the spare sweep, the node-key sync) is due-gated and runs on
+    every turn of the loop, and while the loop waits it rewrites the readiness
+    breadcrumb whenever a lease renewal landed: neither waits for a claim, so
+    five long reboots holding every slot keep both on schedule and the Pod
+    Ready.
 
     After SIGTERM nothing new is claimed and ``run`` returns once every
     command in flight has reported; their renewers already stopped, so a
@@ -905,11 +966,18 @@ class ClaimLoop:
                 tick = executor.liveness_interval_seconds
                 self._settle(tick if wait is None else min(wait, tick))
                 executor._record_liveness()
+                # Renewals, not claims, are the progress while slots are full.
+                executor.refresh_claim_state()
             elif wait > 0:
                 # Nothing in flight: the batch cycle's plain idle sleep.
                 time.sleep(wait)
                 self._claim_now = True
-            elif self._claim():
+            else:
+                self._claim()
+            if not executor.stop_requested:
+                # Due-gated, whether or not this turn claimed: five reboots
+                # holding every slot must not stall the spare sweep or the
+                # node-key sync for as long as they run.
                 executor.sweep_spare_reservations()
                 executor.sync_node_action_keys()
 
@@ -937,10 +1005,11 @@ class ClaimLoop:
             return delay
         return max(0.0, self._gate_until - executor.clock())
 
-    def _claim(self) -> bool:
-        """Claim into the free slots; False after a failed cycle's back-off."""
+    def _claim(self) -> None:
+        """Claim into the free slots; a failed cycle backs off first."""
 
         executor = self.executor
+        started = executor.clock()
         try:
             claimed = executor._claim(self.free)
             self._start(claimed)
@@ -948,15 +1017,23 @@ class ClaimLoop:
             self._failures += 1
             time.sleep(self._failure_delay(exc))
             self._claim_now = True
-            return False
+            return
         self._failures = 0
         self._claim_now = False
         self._gate_until = None
-        if not claimed:
-            executor.last_cycle_advanced = True
-            if not self._running:
-                executor._clear_degraded_streak()
-        return True
+        if claimed:
+            return
+        executor.last_cycle_advanced = True
+        if not self._running:
+            executor._clear_degraded_streak()
+        if (
+            executor.claim_wait_seconds > 0
+            and executor.clock() - started < executor.claim_wait_seconds / 2
+        ):
+            # Not held: re-claiming at once would spin on a control plane that
+            # answers every long-poll empty and at once. A held claim that a
+            # wakeup ended early already waited, so only the rest is slept.
+            self._gate_until = started + executor._idle_delay()
 
     def _start(
         self, claimed: list[tuple[RemoteActionCommand, CommandLeaseWatch]]
