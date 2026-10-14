@@ -562,7 +562,11 @@ write `aborted` and skip registry cleanup. When the retries are spent the round 
 directory, `status.json` is marked `aborted` with `cleanup_error` and `recovery_command`, and the
 log prints one `recovery command: ...` line: `regional_capacity_suite.py teardown` with the
 original `--suite-id` and `--run-dir` (for integrated and correlated runs the directory moved
-under `_aborted/`), which finishes the cleanup once the cause is gone.
+under `_aborted/`), which finishes the cleanup once the cause is gone. A purge whose final read in the
+same transaction still finds the round's data deletes nothing, and its error names what is left as
+counts: the record kinds that appeared after its walk (a writer still touching the round's clusters),
+the walked kinds still present and the rows left per table -- no keys, payloads or credentials -- so
+the writer racing the purge can be attributed.
 
 Staged execution is only for controlled debugging:
 

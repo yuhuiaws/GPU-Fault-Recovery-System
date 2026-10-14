@@ -58,7 +58,10 @@ still present. When the retries are spent the run keeps its receipts,
 `status.json` is `aborted` with `cleanup_error` and `recovery_command`, and the
 log prints `recovery command: ...`, one line that runs
 `regional_capacity_suite.py teardown` with the run's `--suite-id` and `--run-dir`
-(integrated and correlated runs: the directory under `_aborted/`). Every suite's
+(integrated and correlated runs: the directory under `_aborted/`). A purge whose
+final read still finds the run's data deletes nothing; its error counts what is
+left per record kind (appeared after its walk / still present from it) and per
+table, without keys or payloads. Every suite's
 `run.json` carries the resume fields that command checks. A standalone
 `register` command requires `--keep-registration`, a shared `--suite-id`, and
 must be followed by `run` or `teardown`. Separate `run`, `purge`, and `teardown`

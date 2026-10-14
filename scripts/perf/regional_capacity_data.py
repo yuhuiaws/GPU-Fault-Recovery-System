@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sys
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -236,6 +237,46 @@ def table_counts(cursor: Any, cluster_ids: list[str]) -> dict[str, int]:
     return counts
 
 
+def remaining_data(
+    walked: dict[tuple[str, str], dict[str, Any]],
+    records: dict[tuple[str, str], dict[str, Any]],
+    tables: dict[str, int],
+) -> str:
+    """What the cleanup's final read still found, as counts ('' when nothing).
+
+    ``walked`` is the record walk the cleanup deleted, ``records`` and
+    ``tables`` its final read in the same transaction. A record the walk did
+    not have was written by someone still touching the run's clusters; one it
+    had was not deleted (or was written again under its key); a table row was
+    written after that table's delete, which removes every scoped row. Kinds
+    and tables with counts only -- no keys, payloads or credentials: the
+    message reaches the exec's stderr, ``status.json`` and the logs. Live
+    2026-10-13 a purge raised with "left run-owned data" alone and the writer
+    racing it was never identified.
+    """
+
+    groups = (
+        (
+            "new since the walk",
+            Counter(kind for kind, key in records if (kind, key) not in walked),
+        ),
+        (
+            "still present from the walk",
+            Counter(kind for kind, key in records if (kind, key) in walked),
+        ),
+        (
+            "table rows",
+            Counter({table: count for table, count in tables.items() if count}),
+        ),
+    )
+    return "; ".join(
+        f"{label} "
+        + ", ".join(f"{name}={count}" for name, count in sorted(counts.items()))
+        for label, counts in groups
+        if counts
+    )
+
+
 def drop_cluster_partitions(cursor: Any, cluster_ids: list[str]) -> list[str]:
     """Drop the synthetic clusters' latest-metric partitions (schema v23).
 
@@ -424,11 +465,13 @@ def inspect_or_cleanup(
                     ),
                     (cluster_ids,),
                 )
-            remaining = len(scope_records(cursor, cluster_ids)) + sum(
-                table_counts(cursor, cluster_ids).values()
+            remaining = remaining_data(
+                records,
+                scope_records(cursor, cluster_ids),
+                table_counts(cursor, cluster_ids),
             )
             if remaining:
-                raise RuntimeError("capacity cleanup left run-owned data")
+                raise RuntimeError(f"capacity cleanup left run-owned data: {remaining}")
     return {
         "run_id": run_id,
         "cluster_ids": cluster_ids,

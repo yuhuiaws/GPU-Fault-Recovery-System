@@ -200,3 +200,40 @@ def test_open_synthetic_records_are_listed_for_the_forced_teardown() -> None:
         ("workflow", "w-1"),
     ], "only open workflows and commands count; incidents and terminal rows do not"
     assert data.nonterminal_records({}) == [], "nothing open, nothing to force"
+
+
+def test_a_cleanup_that_left_data_names_it_by_kind_and_table_counts_only() -> None:
+    """Live 2026-10-13 a purge raised "capacity cleanup left run-owned data"
+    with nothing more, so the writer racing it stayed unknown. The final read
+    is reported by record kind -- split into records the walk never saw (a
+    writer still touching the run's clusters) and records it saw that are still
+    there -- and by table, as counts: no keys, payloads or cluster names."""
+
+    walked = {
+        ("workflow", "workflow-actionperf-run-a-c000-w000"): {"status": "SUCCEEDED"},
+        ("telemetry_metric_latest", "perf-cap-000/node-0"): {},
+    }
+    final = {
+        ("workflow", "workflow-actionperf-run-a-c000-w000"): {"status": "SUCCEEDED"},
+        ("notification", "collector-silent-run-a-node-0"): {"secret": "s3cr3t"},
+        ("notification", "collector-silent-run-a-node-1"): {},
+        ("collector_status", "perf-cap-000/node-0"): {},
+    }
+    tables = {
+        "gpu_fault_processor_queue": 0,
+        "gpu_fault_gpu_metric_latest": 3,
+        "gpu_fault_attempt_observations": 1,
+    }
+
+    message = data.remaining_data(walked, final, tables)
+
+    assert message == (
+        "new since the walk collector_status=1, notification=2; "
+        "still present from the walk workflow=1; "
+        "table rows gpu_fault_attempt_observations=1, gpu_fault_gpu_metric_latest=3"
+    ), message
+    for private in ("perf-cap-000", "run-a", "node-0", "s3cr3t"):
+        assert private not in message, f"{private} leaked into the cleanup error"
+    assert data.remaining_data(walked, {}, {"gpu_fault_processor_queue": 0}) == "", (
+        "nothing left reports nothing"
+    )

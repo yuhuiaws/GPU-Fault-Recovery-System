@@ -542,3 +542,65 @@ def test_capacity_cleanup_refuses_a_foreign_successor(
             )
     assert store.get_workflow(owned).status is WorkflowStatus.SUCCEEDED
     assert store.get_workflow(foreign).predecessor_workflow_id == owned
+
+
+def test_capacity_cleanup_names_what_a_racing_writer_left_and_deletes_nothing(
+    database: tuple[str, PostgresStore], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Live 2026-10-13 a purge raised "capacity cleanup left run-owned data": a
+    writer still touched the run's rows right after the run, and the error did
+    not say what it had written. Here another session commits a notification
+    and a training progress row for the run's cluster while the cleanup
+    transaction is open, after its deletes and before its final read: the
+    error names both by kind and table, as counts, and the cleanup deletes
+    nothing."""
+
+    import psycopg
+
+    url, store = database
+    publish_capacity_registry(store, [capacity_registration("perf-cap-000", "run-a")])
+    _, workflow_id = capacity_pair(store, "owned", "perf-cap-000")
+    walk = capacity_data.scope_records
+    reads: list[int] = []
+
+    def racing_writer() -> None:
+        with psycopg.connect(url, autocommit=True) as writer:
+            writer.execute(
+                "INSERT INTO gpu_fault_objects(kind,key,payload) "
+                "VALUES ('notification','capacity-late-notice',%s::jsonb)",
+                (
+                    json.dumps(
+                        {
+                            "notification_id": "capacity-late-notice",
+                            "cluster_name": "perf-cap-000",
+                        }
+                    ),
+                ),
+            )
+            writer.execute(
+                "INSERT INTO gpu_fault_training_progress"
+                "(key,cluster_id,attempt_id,rank,observed_at,payload) "
+                "VALUES ('capacity-late-progress','perf-cap-000','capacity-attempt',"
+                "0,now(),'{}'::jsonb)"
+            )
+
+    def scope_records(cursor: Any, cluster_ids: list[str]) -> Any:
+        reads.append(len(reads))
+        if len(reads) == 2:
+            racing_writer()  # the cleanup's final read comes next
+        return walk(cursor, cluster_ids)
+
+    monkeypatch.setattr(capacity_data, "scope_records", scope_records)
+    with psycopg.connect(url) as connection:
+        with pytest.raises(RuntimeError) as caught:
+            capacity_data.inspect_or_cleanup(
+                connection, run_id="run-a", cluster_ids=["perf-cap-000"], cleanup=True
+            )
+    assert str(caught.value) == (
+        "capacity cleanup left run-owned data: new since the walk notification=1; "
+        "table rows gpu_fault_training_progress=1"
+    ), "the error names the late writes by kind and table, counts only"
+    assert reads == [0, 1], "one walk and one final read"
+    assert store.get_workflow(workflow_id).status is WorkflowStatus.SUCCEEDED, (
+        "the refused cleanup is one transaction and deletes nothing"
+    )
