@@ -1018,7 +1018,11 @@ label -- using the `ec2:DescribeInstances`/`eks:DescribeNodegroup` grants the re
 checks the registered EKS cluster, the node subnets and name conflicts (`src/gpu_fault/node_key_attestation.py`), and one
 refused node does not hold back the others. The fleet master stays on the CPU; the executor gains no decryption power, it
 mounts the Secret for signing anyway, and its node-action adapter re-reads the mounted directory on a miss, rate-limited
-(`PropagatingNodeSecrets`), so a newly added key signs without an executor restart. The RBAC is the namespaced
+(`PropagatingNodeSecrets`), so a newly added key signs without an executor restart. When an installer Job had
+already failed before the key arrived, the executor marks a node still reading `Failed` with
+`installer-state=Retrying` and `installer-reason=NodeActionKeyAdded` under the Node's `resourceVersion`, and the
+Reconciler's next pass deletes and recreates that Job without counting a failure (`_replace_failed_job`); a `Retrying`
+without that reason, or a Job that failed on its own, keeps the normal backoff. The RBAC is the namespaced
 Role/RoleBinding `gpu-fault-cluster-executor-node-keys` in `deploy/dataplane/cluster-action-executor.yaml` (`secrets`
 `get`/`patch`, `resourceNames` limited to that Secret), unchanged by the statement path.
 

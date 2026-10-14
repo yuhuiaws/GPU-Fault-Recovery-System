@@ -2151,9 +2151,12 @@ the same origin as deploy's `CPU NodeName key conflict`: an administrator settle
 overwrites; 503 means the control plane's fleet master is unavailable. The sync only appends, never deletes or overwrites;
 removing a retired node's key is still the next `deploy`'s job. On a miss the executor re-reads the refreshed mounted
 files, rate-limited, so a newly added key signs node actions without an executor restart. An installer Job that had
-already failed before the key arrived (the node joined while the control plane still refused it) is retried on the
-Reconciler's backoff, at most an hour later; to skip the wait delete that failed Job (`kubectl --context "${GPU_CONTEXT}"
--n gpu-fault-system delete job <gpu-fault-install-...>`) and the next pass (5 s) recreates it.
+already failed before the key arrived (the node joined while the control plane still refused it, its Pod in `FailedMount`
+until the deadline) no longer waits out the Reconciler's backoff (up to an hour): right after adding the key, the executor
+marks a node that still reads `installer-state=Failed` with `installer-state=Retrying` and
+`installer-reason=NodeActionKeyAdded`, fenced by the Node's `resourceVersion`, and the Reconciler's next pass (5 s) deletes
+and recreates that Job without counting a failed attempt. A Job still running is left alone (the kubelet mounts the key once
+it exists), a Job that failed on its own keeps the normal backoff, and no manual delete is needed.
 
 ### 6.1 Cluster Token Rotation with an Overlap Window
 
@@ -2286,6 +2289,12 @@ The independent approver must confirm the SHA-256 pin and public key of the trus
 The custody read-only probe verifies the signed completion chain, the current release, the cluster/namespace/Node UIDs and the actual CPU/GPU
 key byte digests; with missing evidence it refuses, generating no preparation, signing nothing, and not relying on old key-shape
 checkpoints to pass. A completed receipt can be re-verified after the outer bootstrap checkpoint is lost.
+A key the executor's node-key sync added between deploys for a node the authorization does not bind is accepted only when it is
+exactly that node's derivation under the bound master: the re-check of a completed receipt recomputes it from the master read
+privately from its bound source and names it in the key task's evidence (`custody_derived_extra_keys`); a rotation recomputes it
+at its start and records it in the signed `Started.derived_extra_keys` (node -> digest), after which it is written out of the GPU
+Secret like every key of a node that is not authorized. Any other value, a mixed set, or a CPU mirror value that differs refuses
+the whole set (`live keys differ from the signed predecessor` / `does not match deployed key sources`).
 
 **Command**
 

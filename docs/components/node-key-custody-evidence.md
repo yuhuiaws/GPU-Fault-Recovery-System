@@ -50,6 +50,13 @@ closed.
    the bound CPU Secret, and signs an exclusive, fsynced `Started` receipt.
    Genesis requires the GPU key Secret to be absent and no target keys in
    the CPU map. Matching derived keys already present are not genesis proof.
+   A rotation accepts a live GPU key of a node the authorization does not
+   bind only when it is exactly `derive_node_action_secret` of that node
+   under the verified master (what the executor's node-key sync adds between
+   deploys) and the CPU map holds no other value for it; `Started` records it
+   in `derived_extra_keys` (node to digest, omitted while empty so earlier
+   receipts canonicalize unchanged) and the write leaves it out like every key
+   of an unbound node. Any other extra value refuses the whole set.
 3. The existing UID/resourceVersion CAS path writes only per-node key maps,
    retains unrelated CPU keys, and confirms both maps. Every custody-mode
    write rechecks the approval window and signed key plan. GPU metadata
@@ -182,6 +189,10 @@ recheck those identities; changed files require explicit reconfiguration.
    matching current keys, an incomplete start or a changed input file cannot.
    Join pauses retain the prepared namespace and local inputs, rather than
    automatically rolling them back and changing the preauthorized UIDs.
+   The re-check of a completed receipt accepts a GPU key of an unbound node
+   only as that node's derivation under the bound master, read privately from
+   its bound source, and the key task's evidence names it in
+   `custody_derived_extra_keys`; any other extra key refuses.
 
 When enabled, key tasks are serialized behind release completion, including
 mixed configured/legacy targets sharing the CPU key map; unrelated IAM and
