@@ -190,6 +190,13 @@ class CapacityWire:
             lambda _run_id: {
                 "workflows": {"SUCCEEDED": 1},
                 "commands": {"SUCCEEDED": 10},
+                # The run's one workflow on every scope kind it claims.
+                "budget_holders_max": {
+                    "region": 1,
+                    "cluster": 1,
+                    "class": 1,
+                    "node": 1,
+                },
             },
         )
         monkeypatch.setattr(action, "database_details", lambda _run_id: {})

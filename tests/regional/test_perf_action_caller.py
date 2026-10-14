@@ -335,7 +335,7 @@ def test_budget_tier_relaxes_the_executor_floor_under_the_production_budget() ->
         clusters=1,
         expected_commands=40,
         workers=8,
-        max_seconds=2400,
+        max_seconds=3600,
         delay_scale=1.0,
         lease_seconds=60,
         inject_renew_failure_once=False,
@@ -348,9 +348,120 @@ def test_budget_tier_relaxes_the_executor_floor_under_the_production_budget() ->
         for item in long_job["spec"]["template"]["spec"]["containers"][0]["env"]
         if "value" in item
     }
-    assert long_env["ACTION_MAX_SECONDS"] == "2400", (
+    assert long_env["ACTION_MAX_SECONDS"] == "3600", (
         "the executors' wall follows the runner's --timeout-seconds"
     )
-    assert long_job["spec"]["activeDeadlineSeconds"] == 2700, (
+    assert long_job["spec"]["activeDeadlineSeconds"] == 3900, (
         "the Job deadline leaves teardown slack past the executors' wall"
+    )
+
+
+PRODUCTION_BUDGET = {
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION": 20,
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER": 5,
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS": 2,
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE": 1,
+    "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN": 1,
+}
+
+
+@pytest.mark.parametrize(
+    ("holders", "violations"),
+    [
+        ({"region": 20, "cluster": 2, "class": 2, "node": 1}, []),
+        (
+            {"region": 21, "cluster": 2, "class": 2},
+            ["region scope held by 21 RUNNING workflows, limit 20"],
+        ),
+        (
+            {"region": 20, "cluster": 6, "class": 2},
+            ["cluster scope held by 6 RUNNING workflows, limit 5"],
+        ),
+        (
+            {"region": 20, "cluster": 3, "class": 3},
+            ["class scope held by 3 RUNNING workflows, limit 2"],
+        ),
+    ],
+)
+def test_budget_occupancy_bounds_every_history_sample_by_the_recorded_limits(
+    holders: dict[str, int], violations: list[str]
+) -> None:
+    """Claims are held until a workflow ends, so the production-budget tier
+    (32 x 4 under 20/5/2) must never show more than 20 RUNNING workflows with
+    claims, nor more than 2 in one cluster (every workflow of the model claims
+    each resource class), in any sample -- not only at admission."""
+
+    tier = action.budget_tier(
+        PRODUCTION_BUDGET, clusters=32, workflows_per_cluster=4, executor_workers=8
+    )
+    history = [
+        {"workflows": {"PENDING": 128}, "budget_holders_max": {}},
+        {"workflows": {"RUNNING": 20}, "budget_holders_max": holders},
+        {"workflows": {"SUCCEEDED": 128}, "budget_holders_max": {"region": 1}},
+    ]
+
+    verdict = action.budget_occupancy_check(history, tier)
+
+    assert verdict["violations"] == violations, "a sample over a limit fails the run"
+    assert verdict["passed"] is (not violations), "the verdict follows the violations"
+    assert verdict["limits"] == {"region": 20, "cluster": 5, "class": 2}, (
+        "the verdict reads the limits run.json.remediation_budget records"
+    )
+    assert verdict["samples"] == 3, "every sample is checked"
+
+
+def test_budget_occupancy_skips_unset_limits_and_needs_a_sample() -> None:
+    unbounded = action.budget_tier(
+        dict.fromkeys(PRODUCTION_BUDGET),
+        clusters=32,
+        workflows_per_cluster=4,
+        executor_workers=8,
+    )
+
+    assert action.budget_occupancy_check(
+        [{"budget_holders_max": {"region": 128, "cluster": 4, "class": 4}}], unbounded
+    )["passed"], "an unset limit bounds nothing"
+    assert action.budget_occupancy_check([{"workflows": {"RUNNING": 3}}], unbounded)[
+        "violations"
+    ] == ["history.json has no remediation budget occupancy sample"], (
+        "a history without occupancy samples proves nothing"
+    )
+
+
+def test_action_main_fails_a_run_whose_running_claims_exceed_a_limit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    CapacityWire(tmp_path, monkeypatch)
+    samples = iter(
+        [
+            {
+                "workflows": {"RUNNING": 1},
+                "commands": {"LEASED": 1},
+                "budget_holders_max": {"region": 1, "cluster": 1, "class": 5},
+            },
+            {
+                "workflows": {"SUCCEEDED": 1},
+                "commands": {"SUCCEEDED": 10},
+                "budget_holders_max": {},
+            },
+        ]
+    )
+    monkeypatch.setattr(action, "database_snapshot", lambda _run_id: next(samples))
+
+    assert action.main(action_args(tmp_path)) == action.BUDGET_LIMIT_EXCEEDED, (
+        "a completed run over a recorded limit still fails"
+    )
+
+    summary = json.loads((tmp_path / "summary.json").read_text())
+    assert summary["job_status"] == "Complete", "the workflows themselves completed"
+    assert summary["remediation_budget_occupancy"]["violations"] == [
+        "class scope held by 5 RUNNING workflows, limit 4"
+    ], "the fake raw-capacity tier allows 4 per resource class"
+    status = json.loads((tmp_path / "status.json").read_text())
+    assert status["reason"] == (
+        "remediation budget occupancy exceeded a configured limit"
+    ), "status.json names the failed check"
+    history = json.loads((tmp_path / "history.json").read_text())
+    assert [item["budget_holders_max"].get("class") for item in history] == [5, None], (
+        "history.json keeps every occupancy sample"
     )

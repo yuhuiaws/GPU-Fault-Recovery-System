@@ -444,7 +444,11 @@ Budget wait time must be counted separately; it must not be folded into the disp
 isolation step latency and then judged as an implementation regression. The production-budget
 tier is about throttling correctness, fairness of waiting and eventual convergence; only the
 raw-capacity tier compares first-action and workflow duration of different releases under the
-same concurrency topology.
+same concurrency topology. From the release that holds a claim until its workflow ends (detailed design
+v2 §9.5) on, the production-budget tier's workflow duration, first action and batch time are not
+comparable with the figures of earlier releases: those released a claim once the first budgeted
+step completed, and RUNNING climbed to the dispatcher's selection of 100 rows per tick in
+measurement (§4.3).
 
 ### 6.4 High Availability
 
@@ -658,8 +662,25 @@ run as `raw-capacity`, `production-budget` or `unbounded` per the table above an
 progress (1), and each executor's concurrency peak `max_concurrent_commands` is recorded as
 evidence rather than a pass condition — the per-node and failure-domain limits deliberately
 serialize same-cluster workflows. The executor wall clock and the Job `activeDeadlineSeconds`
-follow `--timeout-seconds`; the production-budget tier 32×4 takes about 23 minutes by the §4.3
-model and should be given `--timeout-seconds 2400` explicitly.
+follow `--timeout-seconds` (the runner's default is 900 s); the production-budget tier 32×4 takes
+about 23 minutes by the §4.3 model, about 27 minutes by the ratio of the latest measured round to
+the model, and should be given `--timeout-seconds 3600` explicitly (2400 leaves only about 1.5
+times headroom).
+
+On every sample (`history.json`, about every 2 seconds) the runner counts the run's `RUNNING`
+workflows whose claims list a scope (whatever their lease, as the store's occupancy rule does;
+the model makes no preemption handoff), and records the holders
+of the busiest scope of each kind as `budget_holders_max` (region, cluster, class; node and
+domain are evidence only). A claim is held until its workflow ends, so every sample must stay
+within the limits, not only the admissions: `summary.json.remediation_budget_occupancy` judges
+against `run.json.remediation_budget.limits`, and the run fails when any sample holds the region
+with more workflows than the Region limit, a cluster with more than the per-cluster limit, or a
+(cluster, resource class) with more than the per-resource-class limit (`violations` lists each
+one, the runner exits with 3 and `status.json` gives the reason `remediation budget occupancy
+exceeded a configured limit`); an unset limit is not checked, and a history without any
+occupancy sample fails as well. Under the production-budget tier 32×4 (20/5/2) this is RUNNING ≤
+20 and ≤ 2 per cluster (every workflow of the model claims all three resource classes); the
+raw-capacity and integrated workflow thresholds are unchanged.
 
 Every entry point must name the target kubeconfig/context explicitly. Production registry tokens
 and Secrets must not be written into artifacts; the registry baseline may keep only cluster IDs

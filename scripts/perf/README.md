@@ -82,7 +82,10 @@ Supported entry points:
   action workflows per synthetic cluster and simulated destructive execution.
 - `regional_capacity_suite.py`: registration, mixed/burst/multicluster load,
   metrics, Aurora sampling, teardown and artifacts.
-- `regional_action_capacity_suite.py`: regional action execution capacity.
+- `regional_action_capacity_suite.py`: regional action execution capacity; it
+  records the five remediation budget limits in `run.json` and fails a run
+  (exit 3) when any `history.json` sample holds the region, a cluster or a
+  resource class with more RUNNING workflows than its limit.
 - `regional_correlated_action_suite.py`: live synthetic event-to-action
   same-rank aggregation, preemption and failure-escalation chains, including
   budget-wave-aware scenario timeouts, a separate terminal-drain phase, exact

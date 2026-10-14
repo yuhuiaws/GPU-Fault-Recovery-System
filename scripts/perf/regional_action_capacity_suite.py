@@ -236,6 +236,56 @@ def budget_tier(
     }
 
 
+# The scope kinds the occupancy verdict bounds, and the limit each one reads
+# from ``run.json.remediation_budget.limits``. Node and failure-domain peaks are
+# recorded as evidence only.
+BUDGET_OCCUPANCY_LIMITS = {
+    "region": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION",
+    "cluster": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_CLUSTER",
+    "class": "GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS",
+}
+# ``execute_capacity_run``'s result when the workflows completed but a sample
+# held more RUNNING workflows on one scope than its limit.
+BUDGET_LIMIT_EXCEEDED = 3
+
+
+def budget_occupancy_check(history: list[dict], remediation_budget: dict) -> dict:
+    """RUNNING-with-claims against the run's recorded limits (性能压测验收方案 §8.2).
+
+    A claim is held until its workflow ends (详细设计-v2 §9.5), so every
+    ``history.json`` sample must stay within the limits, not only the
+    admissions: per sample, ``budget_holders_max`` is the number of RUNNING
+    workflows listing the busiest scope of each kind -- the region, the busiest
+    cluster, the busiest (cluster, resource class). A limit that is unset is
+    not checked; a history without any such sample fails, since it proves
+    nothing.
+    """
+
+    limits = remediation_budget.get("limits") or {}
+    peaks: dict[str, int] = {}
+    samples = [
+        item["budget_holders_max"] for item in history if "budget_holders_max" in item
+    ]
+    for holders in samples:
+        for kind, count in holders.items():
+            peaks[kind] = max(peaks.get(kind, 0), int(count))
+    bounded = {kind: limits.get(name) for kind, name in BUDGET_OCCUPANCY_LIMITS.items()}
+    violations = [
+        f"{kind} scope held by {peaks[kind]} RUNNING workflows, limit {limit}"
+        for kind, limit in bounded.items()
+        if limit is not None and peaks.get(kind, 0) > int(limit)
+    ]
+    if not samples:
+        violations.append("history.json has no remediation budget occupancy sample")
+    return {
+        "passed": not violations,
+        "samples": len(samples),
+        "peak_holders": peaks,
+        "limits": bounded,
+        "violations": violations,
+    }
+
+
 def executor_job(
     *,
     clusters: int,
@@ -818,6 +868,20 @@ with psycopg.connect(store_dsn()) as conn:
     first, last = cur.fetchone()
     out['first_created_at'] = first.isoformat() if first else None
     out['last_updated_at'] = last.isoformat() if last else None
+    # Holders of the busiest scope per kind: RUNNING rows listing it, whatever
+    # their lease, as the store counts them (the model makes no preemption
+    # handoff, the rule's other holder).
+    cur.execute(
+        "SELECT split_part(claim.scope, ':', 1), max(claim.holders) FROM ("
+        "SELECT held.scope, count(*) AS holders FROM gpu_fault_control_records r "
+        "CROSS JOIN LATERAL jsonb_array_elements_text(CASE WHEN "
+        "jsonb_typeof(r.payload->'remediation_budget_claims')='array' "
+        "THEN r.payload->'remediation_budget_claims' ELSE '[]'::jsonb END) "
+        "AS held(scope) WHERE r.kind='workflow' AND r.key LIKE %s "
+        "AND r.payload->>'status'='RUNNING' GROUP BY held.scope) claim GROUP BY 1",
+        (pattern,),
+    )
+    out['budget_holders_max'] = {{kind: int(n) for kind, n in cur.fetchall()}}
 print(json.dumps(out))
 """
     output = control(
@@ -998,6 +1062,7 @@ def execute_capacity_run(
     resources: RunResources,
     min_concurrent_commands: int | None = None,
     placement: dict | None = None,
+    remediation_budget: dict | None = None,
 ) -> int:
     if min_concurrent_commands is None:
         min_concurrent_commands = args.executor_workers
@@ -1124,6 +1189,7 @@ def execute_capacity_run(
     (artifacts / "history.json").write_text(json.dumps(history, indent=2) + "\n")
     final = history[-1] if history else {}
     details = database_details(run_id)
+    occupancy = budget_occupancy_check(history, remediation_budget or {})
     executor_metrics = aggregate_executor_documents(documents)
     workflows_succeeded = (
         final.get("workflows", {}).get("SUCCEEDED", 0) == expected_workflows
@@ -1150,6 +1216,7 @@ def execute_capacity_run(
         ),
         "workflow_statuses": final.get("workflows", {}),
         "command_statuses": final.get("commands", {}),
+        "remediation_budget_occupancy": occupancy,
         "store_bloat": store_bloat_section(before_postgres, after_postgres),
         "store_layout": store_layout_section(before_postgres, after_postgres),
         "placement": optional_placement_section(placement),
@@ -1172,7 +1239,9 @@ def execute_capacity_run(
             json.dumps(value, indent=2, sort_keys=True) + "\n"
         )
     print(json.dumps(summary, indent=2, sort_keys=True))
-    return 0 if summary["job_status"] == "Complete" else 1
+    if summary["job_status"] != "Complete":
+        return 1
+    return 0 if occupancy["passed"] else BUDGET_LIMIT_EXCEEDED
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1292,6 +1361,7 @@ def main(argv: list[str] | None = None) -> int:
             resources=resources,
             min_concurrent_commands=tier["min_concurrent_commands"],
             placement=placement,
+            remediation_budget=tier,
         )
     except BaseException as exc:
         failure = exc
@@ -1332,7 +1402,11 @@ def main(argv: list[str] | None = None) -> int:
         write_status(
             artifacts,
             status="aborted",
-            reason="action capacity job did not complete",
+            reason=(
+                "remediation budget occupancy exceeded a configured limit"
+                if result == BUDGET_LIMIT_EXCEEDED
+                else "action capacity job did not complete"
+            ),
         )
         log(f"aborted artifacts: {artifacts}")
         return result
