@@ -1376,7 +1376,9 @@ Read-only administrator commands reserve no compensation window. Cleanup still u
 `run_owned_command`; preparation, admission and startup overhead cannot regain the full window, and the remaining time is re-verified at launch and before returning success.
 `execution.deployment_deadline` wraps the whole operation's `interruption_scope(wait_all=True)`:
 SIGINT only registers a cancellation request and notifies registered non-cleanup commands via pidfd, and the safe boundary then raises
-`KeyboardInterrupt`; all supervisors are waited on before exit. Repeated SIGINT cannot asynchronously interrupt cleanup, and
+`KeyboardInterrupt`; all supervisors are waited on before exit. Repeated SIGINT cannot asynchronously interrupt cleanup, nor
+deadlock the handler: the cancellation request is registered only once, because CPython runs the handler again inside the previous
+handler's `Event.set()`, whose lock is not reentrant; and
 `allow_interrupted` is only for limited compensation/cleanup and does not bypass supervision loss or extend the deadline.
 Known command stdin is handed to the subprocess through an anonymous `0600` file descriptor and is not written to a named file or log.
 This way Manifests, dashboards and private HTTP messages larger than the pipe capacity do not depend on `communicate()` polling to keep writing,

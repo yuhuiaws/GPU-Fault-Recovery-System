@@ -285,3 +285,65 @@ def test_closed_descriptor_is_rejected_before_starting_any_command(tmp_path):
             pass_fds=(1_000_000_000,),
         )
     assert not marker.exists(), "invalid inherited descriptor started a command"
+
+
+NESTED_INTERRUPT = """
+import json, os, signal, sys, threading
+from gpu_fault.admin.process_supervisor import interruption_scope
+
+handled, fired = [], False
+
+
+def second_signal(frame, event, _arg):
+    # Condition.notify_all runs only with the Event's lock held.
+    global fired
+    code = frame.f_code
+    if (
+        not fired
+        and event == "call"
+        and code.co_name == "notify_all"
+        and code.co_filename == threading.__file__
+    ):
+        fired = True
+        os.kill(os.getpid(), signal.SIGINT)
+
+
+outcome = "completed"
+try:
+    with interruption_scope():
+        interrupt = signal.getsignal(signal.SIGINT)
+
+        def counted(number, frame):
+            handled.append(number)
+            interrupt(number, frame)
+
+        signal.signal(signal.SIGINT, counted)
+        sys.settrace(second_signal)
+        try:
+            os.kill(os.getpid(), signal.SIGINT)
+        finally:
+            sys.settrace(None)
+except KeyboardInterrupt:
+    outcome = "KeyboardInterrupt"
+print(json.dumps({"handled": len(handled), "nested": fired, "outcome": outcome}))
+"""
+
+
+def test_a_second_sigint_inside_the_interrupt_handler_cannot_deadlock_it():
+    """CPython runs a Python signal handler inside another one, between two
+    bytecodes. A repeated SIGINT that lands while the first handler is inside
+    ``_INTERRUPTED.set()`` runs the handler again there, where the Event's lock
+    is already held and is not reentrant; the child sends it at that point."""
+
+    try:
+        completed = execution.run_command(
+            [sys.executable, "-c", NESTED_INTERRUPT], timeout_seconds=60
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("a second SIGINT inside the interrupt handler deadlocked it")
+    assert completed.returncode == 0, completed.stderr
+    assert json.loads(completed.stdout) == {
+        "handled": 2,
+        "nested": True,
+        "outcome": "KeyboardInterrupt",
+    }

@@ -109,9 +109,15 @@ def interruption_scope(*, wait_all: bool = False) -> Iterator[None]:
         return
     _INTERRUPTED.clear()
     previous = signal.getsignal(signal.SIGINT)
+    requested = False
 
     def interrupt(_signum: int, _frame: object) -> None:
-        _INTERRUPTED.set()
+        # A repeated SIGINT runs this handler again inside the first one's
+        # _INTERRUPTED.set(), whose lock is not reentrant: set it only once.
+        nonlocal requested
+        if not requested:
+            requested = True
+            _INTERRUPTED.set()
         _cancel_guardians()
 
     signal.signal(signal.SIGINT, interrupt)
