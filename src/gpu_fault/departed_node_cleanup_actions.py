@@ -65,6 +65,9 @@ WORKFLOW_LIVE = "workflow_live"
 INCIDENT_NODES_PENDING = "incident_nodes_pending"
 CLUSTER_NOT_ACTIVE = "cluster_not_active"
 DECLARED_SPARE = "declared_spare"
+#: The node name carries no HyperPod instance, or the fleet recorded no EC2
+#: instance id for it: the provider can never be asked, so it never resolves.
+PROVIDER_IDENTITY_UNKNOWN = "provider_identity_unknown"
 WORKFLOW_CHANGED_NODE = "workflow_changed_node"
 REMOTE_COMMAND = "remote_command"
 QUARANTINED_INCIDENT = "quarantined_incident"
@@ -85,6 +88,7 @@ WAITING_KINDS = frozenset(
 BLOCKER_KINDS = WAITING_KINDS | {
     CLUSTER_NOT_ACTIVE,
     DECLARED_SPARE,
+    PROVIDER_IDENTITY_UNKNOWN,
     WORKFLOW_CHANGED_NODE,
     REMOTE_COMMAND,
     QUARANTINED_INCIDENT,

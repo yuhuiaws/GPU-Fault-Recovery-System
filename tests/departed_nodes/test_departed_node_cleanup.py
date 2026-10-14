@@ -626,6 +626,9 @@ def test_records_of_a_removed_cluster_and_old_cleaned_lines_are_pruned() -> None
 
 
 def test_an_eks_agent_without_a_recorded_instance_is_never_guessed() -> None:
+    """No EC2 id, no question to ask EC2: the operator's, with the manual
+    command -- it can never resolve on its own."""
+
     store = build_store()
     world_ = eks_departure(store)
     store.save_agent(
@@ -636,6 +639,38 @@ def test_an_eks_agent_without_a_recorded_instance_is_never_guessed() -> None:
 
     [record] = world_.cleanup.run_once()
 
-    assert record.status is DepartedNodeCleanupStatus.PENDING
-    assert record.blocker_classes == ["provider_unknown"]
+    assert record.status is DepartedNodeCleanupStatus.REFUSED
+    assert record.blocker_classes == ["provider_identity_unknown"]
+    assert any("--retire-departed-agents" in item for item in record.admin_commands), (
+        record.admin_commands
+    )
     assert world_.provider.calls == []
+
+
+def test_a_node_whose_agent_holds_its_lease_is_never_a_candidate() -> None:
+    """Whatever a report says, a heartbeating Agent is a live node: a node
+    that joined after the latest report, or a report that went stale, must
+    not put a healthy node in the ledger."""
+
+    store = build_store()
+    world_ = world(store)
+    store.save_regional_cluster(registration(HP_CLUSTER))
+    store.save_agent(
+        agent(HP_CLUSTER, HP_NODE, instance_id="node-uid-1", last_seen=ago(seconds=10))
+    )
+    pending_never_dispatched(store, HP_CLUSTER, HP_NODE, suffix="joined")
+    world_.reports_since(HP_CLUSTER, [HP_PRESENT], minutes=12)
+
+    assert world_.cleanup.run_once() == []
+
+    stale = build_store()
+    stale_world = world(stale)
+    stale.save_regional_cluster(registration(HP_CLUSTER))
+    stale.save_agent(
+        agent(HP_CLUSTER, HP_NODE, instance_id="node-uid-1", last_seen=ago(seconds=10))
+    )
+    for minute in range(40, 20, -1):
+        stale_world.report(HP_CLUSTER, [HP_PRESENT], at=ago(minutes=minute))
+
+    assert stale_world.cleanup.run_once() == []
+    assert stale.list_departed_node_cleanups() == []

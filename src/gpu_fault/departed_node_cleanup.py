@@ -60,6 +60,7 @@ from gpu_fault.departed_node_cleanup_actions import (
     DECLARED_SPARE,
     KUBERNETES_UNPROVEN,
     OPEN_INCIDENT_STATES,
+    PROVIDER_IDENTITY_UNKNOWN,
     PROVIDER_STILL_LISTS,
     PROVIDER_UNKNOWN,
     WAITING_KINDS,
@@ -93,6 +94,7 @@ from gpu_fault.departed_nodes import (
 from gpu_fault.env import env_bool
 from gpu_fault.fleet import AgentLifecycleState, AgentRecord
 from gpu_fault.kubernetes_node_inventory import (
+    NODE_INVENTORY_FRESHNESS,
     KubernetesAbsence,
     KubernetesNodeInventory,
     kubernetes_absence,
@@ -341,26 +343,45 @@ class DepartedNodeCleanup:
     ) -> set[str]:
         """Nodes the control plane knows of that may have left the cluster.
 
-        A live Agent or an open incident of a node the latest report does not
-        list; without any report, a live Agent whose lease expired (judged,
-        and reported as unproven, so ``status`` shows why nothing happens).
+        A node whose Agent still holds its lease is never one: it is alive,
+        whatever a report says. Otherwise an Agent that is not REVOKED, or an
+        open incident's node, that the latest fresh report does not list;
+        without a fresh report, only an Agent whose lease expired (judged, and
+        reported as unproven, so ``status`` shows why nothing happens). A node
+        already in the ledger stays a candidate until it is cleaned.
         """
 
-        listed = None if inventory is None else frozenset(inventory.node_names)
+        fresh = inventory is not None and (
+            now - inventory.received_at <= NODE_INVENTORY_FRESHNESS
+        )
+        listed = frozenset(inventory.node_names) if fresh and inventory else None
+
+        def lease_live(node_id: str) -> bool:
+            agent = agents.get(node_id)
+            return (
+                agent is not None
+                and agent.lifecycle_state is not AgentLifecycleState.REVOKED
+                and agent.lease_expires_at is not None
+                and agent.lease_expires_at > now
+            )
+
         nodes: set[str] = set()
         for node_id, agent in agents.items():
             if agent.lifecycle_state is AgentLifecycleState.REVOKED:
                 continue
-            if listed is None:
-                if agent.lease_expires_at is None or agent.lease_expires_at <= now:
-                    nodes.add(node_id)
-            elif node_id not in listed:
+            if lease_live(node_id):
+                continue
+            if listed is None or node_id not in listed:
                 nodes.add(node_id)
         if listed is not None:
             for incident in self.store.list_incidents_by_state(
                 cluster_id, OPEN_INCIDENT_STATES
             ):
-                nodes.update(node for node in incident.node_ids if node not in listed)
+                nodes.update(
+                    node
+                    for node in incident.node_ids
+                    if node not in listed and not lease_live(node)
+                )
         nodes.update(
             node_id
             for node_id, record in existing.items()
@@ -427,7 +448,7 @@ class DepartedNodeCleanup:
                 )
                 if proof.instance_id is None:
                     proof.block(
-                        PROVIDER_UNKNOWN,
+                        PROVIDER_IDENTITY_UNKNOWN,
                         NO_RECORDED_INSTANCE_BLOCKER,
                         retire_command(node_id),
                     )
@@ -435,7 +456,7 @@ class DepartedNodeCleanup:
                 proof.instance_id = hyperpod_instance_id(node_id)
                 if proof.instance_id is None:
                     proof.block(
-                        PROVIDER_UNKNOWN,
+                        PROVIDER_IDENTITY_UNKNOWN,
                         NO_HYPERPOD_INSTANCE_BLOCKER,
                         retire_command(node_id),
                     )
