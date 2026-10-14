@@ -282,6 +282,8 @@ def caller(
         pytest.fail("unmocked external command")
 
     monkeypatch.setattr(registry, "run", forbidden)
+    # A round naming no Aurora cluster records no placement or Aurora reading.
+    monkeypatch.delenv("GPU_FAULT_AURORA_CLUSTER_ID", raising=False)
     monkeypatch.setattr(base, "dataplane", harness.api)
     monkeypatch.setattr(base, "control", harness.control)
     monkeypatch.setattr(base, "validate_registry_target", lambda **_kwargs: "live")
@@ -395,7 +397,7 @@ def caller(
             "aggregate",
             "aggregate_executor_documents",
             "queue_drain",
-            "aurora_window",
+            "aurora_step",
             "placement_section",
             "control_pod_lifecycle",
             "processor_priority_latency",

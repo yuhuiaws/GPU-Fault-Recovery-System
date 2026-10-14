@@ -40,6 +40,8 @@ if TYPE_CHECKING or __package__:
         artifact_dir,
         control,
         dataplane,
+        measured_exit,
+        optional_aurora_step,
         postgres_counters,
         store_bloat_section,
         store_layout_section,
@@ -47,6 +49,7 @@ if TYPE_CHECKING or __package__:
         release_identity,
         scrape_cgroup,
         scrape_metrics,
+        step_status,
         teardown,
         upsert_configmap,
         validate_registered_resources,
@@ -80,6 +83,8 @@ else:
         artifact_dir,
         control,
         dataplane,
+        measured_exit,
+        optional_aurora_step,
         postgres_counters,
         store_bloat_section,
         store_layout_section,
@@ -87,6 +92,7 @@ else:
         release_identity,
         scrape_cgroup,
         scrape_metrics,
+        step_status,
         teardown,
         upsert_configmap,
         validate_registered_resources,
@@ -1245,6 +1251,7 @@ def execute_capacity_run(
         "store_bloat": store_bloat_section(before_postgres, after_postgres),
         "store_layout": store_layout_section(before_postgres, after_postgres),
         "placement": optional_placement_section(placement),
+        **optional_aurora_step(placement, seeded_at, time.time()),
         "postgres_deltas": {
             key: (after_postgres.get(key) or 0) - (before_postgres.get(key) or 0)
             for key in ("deadlocks", "xact_commit", "xact_rollback")
@@ -1267,7 +1274,7 @@ def execute_capacity_run(
     print(json.dumps(summary, indent=2, sort_keys=True))
     if summary["job_status"] != "Complete":
         return 1
-    return 0 if occupancy["passed"] else BUDGET_LIMIT_EXCEEDED
+    return measured_exit(0 if occupancy["passed"] else BUDGET_LIMIT_EXCEEDED, summary)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1427,11 +1434,11 @@ def main(argv: list[str] | None = None) -> int:
     if result:
         write_status(
             artifacts,
-            status="aborted",
-            reason=(
+            **step_status(
+                result,
                 "remediation budget occupancy exceeded a configured limit"
                 if result == BUDGET_LIMIT_EXCEEDED
-                else "action capacity job did not complete"
+                else "action capacity job did not complete",
             ),
         )
         log(f"aborted artifacts: {artifacts}")

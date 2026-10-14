@@ -549,9 +549,21 @@ the writer's Availability Zone and the Availability Zones of the control-plane P
 (`start`/`end`/`aurora_writer_changed`) afterwards: every statement crosses from a control-plane node's
 Availability Zone to the writer's, and the writer moves on every failover, so rounds without both are not
 comparable; after a failover inside a round its Aurora evidence describes only the writer the round
-started on. The §8.4 integrated runner records the same from `--aurora-cluster-id`; the §8.2 action
-runner reads no Aurora metrics, records the placement too when `GPU_FAULT_AURORA_CLUSTER_ID` is set, and
-otherwise runs as before with `recorded=false` in `summary.json.placement`.
+started on. The §8.4 integrated runner records the same from `--aurora-cluster-id`; the §8.2 action and
+§8.3 correlated runners record the placement and the Aurora evidence below when `GPU_FAULT_AURORA_CLUSTER_ID`
+is set, and otherwise run as before with `recorded=false` in `summary.json.placement`.
+
+Every step also records `summary.json.aurora_measurement` for the writer it resolved at its start:
+`serverless_capacity_acu` and `cpu_utilization_percent` with `at_step_start` (the one-minute datapoint
+holding the moment the writer was resolved), `at_window_start` (the load start) and `max_during_window`,
+and the named cluster's `database_connections_max_during_window`. `aurora.json` is therefore read from the
+step start (at most three hours before the window); `aurora_capacity_max` and `aurora_cpu_max` keep the
+load-window range they always had. A named cluster whose `DatabaseConnections` datapoints in the window are
+all zero is not the cluster the control plane uses -- rounds named an orphan cluster (0.5 ACU, no
+connections) and measured it without notice -- so `status=FAIL` fails the step's measurement: the product
+verdict and readings stay as they are, `status.json` says `measurement-failed` and the runner exits 4,
+which stops the formal suite before the next step measures the same cluster. No datapoint in the window is
+`UNVERIFIED` and fails nothing; a round that names no cluster records `UNVERIFIED` with the reason.
 
 During the load and the drain the runner keeps one sampling session in every control-plane Pod
 (`regional_capacity_timeseries.py`: one `kubectl exec -i` session whose program arrives length-prefixed

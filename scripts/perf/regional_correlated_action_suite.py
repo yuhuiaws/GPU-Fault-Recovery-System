@@ -12,6 +12,10 @@ if __package__:
         release_agent_identity,
         run_agent_heartbeat_refresher,
     )
+    from .regional_capacity_placement import (
+        optional_placement_section,
+        optional_start_placement,
+    )
     from .regional_capacity_recovery import resume_identity, write_aborted_status
     from .regional_capacity_registry import (
         CONNECTION_SECRET,
@@ -35,8 +39,11 @@ if __package__:
     )
     from .regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
+        measured_exit,
+        optional_aurora_step,
         purge_audit_rows,
         release_identity,
+        step_status,
         teardown,
         upsert_configmap,
     )
@@ -49,6 +56,10 @@ else:
         executor_identity,
         release_agent_identity,
         run_agent_heartbeat_refresher,
+    )
+    from regional_capacity_placement import (
+        optional_placement_section,
+        optional_start_placement,
     )
     from regional_capacity_recovery import resume_identity, write_aborted_status
     from regional_capacity_registry import (
@@ -69,8 +80,11 @@ else:
     from regional_capacity_results import artifact_dir, move_to_aborted, write_status
     from regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
+        measured_exit,
+        optional_aurora_step,
         purge_audit_rows,
         release_identity,
+        step_status,
         teardown,
         upsert_configmap,
     )
@@ -1018,6 +1032,8 @@ def main() -> int:
     try:
         resources = RunResources(artifacts, run_id, NAMESPACE, dataplane)
         validate_preemption_enabled()
+        # The Aurora writer and node zones, when the round names its cluster.
+        placement = optional_start_placement(artifacts)
         register(
             args.clusters,
             artifacts,
@@ -1064,6 +1080,7 @@ def main() -> int:
         (artifacts / "job.json").write_text(
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         )
+        window_start = time.time()
         resources.create(manifest)
         # The returned nodes' telemetry follows each recorded reboot (§8.3); the
         # session ends with the drain, before the teardown purges the run.
@@ -1102,6 +1119,8 @@ def main() -> int:
             "pod_results": pod_results,
             "audit": audit,
             "validation_telemetry": validation.summary,
+            "placement": optional_placement_section(placement),
+            **optional_aurora_step(placement, window_start, time.time()),
         }
         status, errors = verdict(summary, args.clusters)
         summary["status"] = status
@@ -1109,7 +1128,7 @@ def main() -> int:
         (artifacts / "summary.json").write_text(
             json.dumps(summary, indent=2, sort_keys=True) + "\n"
         )
-        result = int(status != "PASS")
+        result = measured_exit(int(status != "PASS"), summary)
     except BaseException as exc:
         failure = exc
     finally:
@@ -1128,11 +1147,7 @@ def main() -> int:
             scope=registry_scope,
         )
         raise failure.with_traceback(failure.__traceback__)
-    write_status(
-        artifacts,
-        status="ok" if result == 0 else "aborted",
-        reason=None if result == 0 else "scenario verdict failed",
-    )
+    write_status(artifacts, **step_status(result, "scenario verdict failed"))
     return result
 
 

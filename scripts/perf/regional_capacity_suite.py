@@ -105,6 +105,9 @@ _postgres_counters = capacity_database.postgres_counters
 store_bloat_section = capacity_database.store_bloat_section
 store_layout_section = capacity_database.store_layout_section
 _processor_priority_latency = capacity_database.processor_priority_latency
+MEASUREMENT_FAILED_EXIT = capacity_database.MEASUREMENT_FAILED_EXIT
+measured_exit = capacity_database.measured_exit
+step_status = capacity_database.step_status
 CONTROL_POD_PREFIXES = capacity_placement.CONTROL_POD_PREFIXES
 start_placement = capacity_placement.start_placement
 placement_section = capacity_placement.placement_section
@@ -599,6 +602,31 @@ def aurora_window(start: float, end: float, *, writer: dict) -> dict:
     )
 
 
+def aurora_step(start: float, end: float, *, placement: dict) -> dict:
+    """The step's Aurora evidence: ``aurora`` (aurora.json) read from the step
+    start, when the writer was resolved, to the window end, the load-window
+    maxima and ``aurora_measurement`` (``regional_capacity_database``)."""
+
+    since = min(start, capacity_database.step_started_at(placement) or start)
+    since = max(since, start - capacity_database.STEP_LOOKBACK_SECONDS)
+    metrics = aurora_window(since, end, writer=placement["aurora"])
+    return {
+        "aurora": metrics,
+        **capacity_database.aurora_step_fields(
+            metrics, placement=placement, window_start=start, window_end=end
+        ),
+    }
+
+
+def optional_aurora_step(placement: dict | None, start: float, end: float) -> dict:
+    """``aurora_step`` for a suite whose round may name no Aurora cluster."""
+
+    if placement is None:
+        reason = f"{capacity_placement.AURORA_CLUSTER_ENV} is not set"
+        return {"aurora_measurement": {"status": "UNVERIFIED", "reason": reason}}
+    return aurora_step(start, end, placement=placement)
+
+
 # --------------------------------------------------------------------------
 # execution + collection
 # --------------------------------------------------------------------------
@@ -879,9 +907,9 @@ def execute_case(
     (artifacts / "processor-priority-latency.json").write_text(
         json.dumps(priority_latency, indent=1) + "\n"
     )
-    aurora = aurora_window(window_start, window_end, writer=placement["aurora"])
+    aurora = aurora_step(window_start, window_end, placement=placement)
     (artifacts / "aurora.json").write_text(
-        json.dumps(aurora, indent=1, default=str) + "\n"
+        json.dumps(aurora.pop("aurora"), indent=1, default=str) + "\n"
     )
     summary = aggregate(documents)
     summary.update(
@@ -940,22 +968,8 @@ def execute_case(
             ),
             "processor_priority_latency": priority_latency,
             "placement": placement_section(placement, AURORA_CLUSTER_ID),
-            "aurora_capacity_max": max(
-                (
-                    point.get("maximum") or 0
-                    for point in aurora.get("ServerlessDatabaseCapacity", [])
-                    if isinstance(point, dict)
-                ),
-                default=None,
-            ),
-            "aurora_cpu_max": max(
-                (
-                    point.get("maximum") or 0
-                    for point in aurora.get("CPUUtilization", [])
-                    if isinstance(point, dict)
-                ),
-                default=None,
-            ),
+            # aurora_capacity_max, aurora_cpu_max and aurora_measurement.
+            **aurora,
         }
     )
     (artifacts / "summary.json").write_text(
@@ -1179,6 +1193,11 @@ def execute_capacity_command(
             if summary.get("job_status") != "Complete":
                 result = 1
                 aborted_reason = f"job status: {summary.get('job_status')}"
+            elif measured_exit(0, summary):
+                # The run measured some other database; its product readings
+                # stay in summary.json, but the step does not count.
+                result = MEASUREMENT_FAILED_EXIT
+                aborted_reason = summary["aurora_measurement"]["reason"]
     except BaseException as exc:
         failure = exc
     finally:
@@ -1221,11 +1240,8 @@ def execute_capacity_command(
         log(f"aborted artifacts: {artifacts}")
         raise failure.with_traceback(failure.__traceback__)
     if result:
-        write_status(
-            artifacts,
-            status="aborted",
-            reason=aborted_reason or "capacity run aborted",
-        )
+        failure_reason = aborted_reason or "capacity run aborted"
+        write_status(artifacts, **step_status(result, failure_reason, aborted_reason))
         log(f"aborted artifacts: {artifacts}")
         return result
     write_status(artifacts, status="ok")

@@ -48,7 +48,7 @@ if __package__:
     from .regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
         aggregate,
-        aurora_window,
+        aurora_step,
         build_job,
         collect_logs,
         control_pod_lifecycle,
@@ -56,6 +56,7 @@ if __package__:
         control_pods,
         drain_targets,
         ingress_process_model_preflight,
+        measured_exit,
         placement_section,
         postgres_counters,
         store_bloat_section,
@@ -70,6 +71,7 @@ if __package__:
         scrape_cgroup,
         scrape_metrics,
         start_placement,
+        step_status,
         teardown,
         upsert_configmap,
         wait_for_job,
@@ -105,7 +107,7 @@ else:
     from regional_capacity_suite import (
         DEFAULT_ARTIFACT_ROOT,
         aggregate,
-        aurora_window,
+        aurora_step,
         build_job,
         collect_logs,
         control_pod_lifecycle,
@@ -113,6 +115,7 @@ else:
         control_pods,
         drain_targets,
         ingress_process_model_preflight,
+        measured_exit,
         placement_section,
         postgres_counters,
         store_bloat_section,
@@ -127,6 +130,7 @@ else:
         scrape_cgroup,
         scrape_metrics,
         start_placement,
+        step_status,
         teardown,
         upsert_configmap,
         wait_for_job,
@@ -1209,7 +1213,7 @@ def execute_integrated_jobs(
         "store_layout": store_layout_section(postgres_before, postgres_after),
         "aurora_preflight": aurora_preflight,
         "placement": placement_section(placement, args.aurora_cluster_id),
-        "aurora": aurora_window(start_epoch, window_end, writer=placement["aurora"]),
+        **aurora_step(start_epoch, window_end, placement=placement),
         "cpu_throttling": {
             pod: {
                 key: int(after[key]) - int(cgroup_before.get(pod, {}).get(key, 0))
@@ -1248,7 +1252,7 @@ def execute_integrated_jobs(
         (artifacts / name).write_text(
             json.dumps(value, indent=2, sort_keys=True) + "\n"
         )
-    return int(status != "PASS")
+    return measured_exit(int(status != "PASS"), summary)
 
 
 def run(args: argparse.Namespace) -> int:
@@ -1435,11 +1439,7 @@ def run(args: argparse.Namespace) -> int:
             scope=registry_scope,
         )
         raise failure.with_traceback(failure.__traceback__)
-    write_status(
-        artifacts,
-        status="ok" if result == 0 else "aborted",
-        reason=None if result == 0 else "integrated verdict failed",
-    )
+    write_status(artifacts, **step_status(result, "integrated verdict failed"))
     print(json.dumps({"artifacts": str(artifacts), "result": result}))
     return result
 

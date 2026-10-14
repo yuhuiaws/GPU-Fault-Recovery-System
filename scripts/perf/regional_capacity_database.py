@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from datetime import datetime, timezone
-from typing import Callable
+from typing import Any, Callable
 
 try:
     from . import regional_capacity_priority_latency as priority_latency
@@ -105,6 +105,213 @@ def aurora_window(
             for item in points
         ]
     return metrics
+
+
+#: CloudWatch's period for every Aurora reading (``aurora_window``).
+PERIOD_SECONDS = 60
+#: The oldest datapoint that still stands for "the reading at" a moment.
+READING_STALENESS_SECONDS = 300
+#: How far before its window a step's Aurora read may begin: a step resolves
+#: its writer minutes before the load, and a read longer than a day of
+#: one-minute datapoints is refused by CloudWatch.
+STEP_LOOKBACK_SECONDS = 3 * 3600
+#: ``aurora_window`` used to start this long before the load window; the
+#: summary's ``aurora_capacity_max``/``aurora_cpu_max`` keep that range.
+LEGACY_LEAD_SECONDS = 120
+#: The writer readings a step records at its start and over its window.
+STEP_READINGS = {
+    "ServerlessDatabaseCapacity": "serverless_capacity_acu",
+    "CPUUtilization": "cpu_utilization_percent",
+}
+#: The exit code of a step whose Aurora measurement failed while its own run
+#: succeeded (1 is a failed run or verdict, 2 a usage error, 3 the action
+#: suite's budget limit).
+MEASUREMENT_FAILED_EXIT = 4
+MEASUREMENT_FAILED_REASON = (
+    "the Aurora measurement failed: see summary.json aurora_measurement"
+)
+
+
+def _epoch(value: object) -> float | None:
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, str) and value:
+        try:
+            moment = datetime.fromisoformat(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+Datapoint = tuple[float, float | None]
+
+
+def _datapoints(metrics: dict, name: str) -> list[tuple[float, Datapoint]]:
+    """(period start, (average, maximum)) per datapoint; none for an error."""
+
+    points = metrics.get(name)
+    parsed = []
+    for point in points if isinstance(points, list) else []:
+        at = _epoch(point.get("timestamp")) if isinstance(point, dict) else None
+        if at is not None:
+            parsed.append((at, (point.get("average"), point.get("maximum"))))
+    return sorted(parsed, key=lambda item: item[0])
+
+
+def _reading_at(
+    points: list[tuple[float, Datapoint]], moment: float | None
+) -> float | None:
+    """The average of the datapoint whose minute holds ``moment``, else of the
+    latest earlier one (at most ``READING_STALENESS_SECONDS`` old)."""
+
+    if moment is None:
+        return None
+    earlier = [
+        values
+        for at, values in points
+        if at <= moment and moment - at < READING_STALENESS_SECONDS
+    ]
+    if not earlier:
+        return None
+    average, maximum = earlier[-1]
+    value = average if average is not None else maximum
+    return None if value is None else float(value)
+
+
+def _peak_during(
+    points: list[tuple[float, Datapoint]], start: float, end: float
+) -> float | None:
+    values = [
+        float(maximum if maximum is not None else average)
+        for at, (average, maximum) in points
+        if at < end
+        and at + PERIOD_SECONDS > start
+        and (maximum if maximum is not None else average) is not None
+    ]
+    return max(values) if values else None
+
+
+def step_started_at(placement: dict) -> float | None:
+    """When the step resolved its Aurora writer (``run_placement``)."""
+
+    return _epoch(placement.get("observed_at"))
+
+
+def aurora_measurement(
+    metrics: dict, *, placement: dict, window_start: float, window_end: float
+) -> dict[str, Any]:
+    """The step's Aurora readings against the writer it resolved at its start.
+
+    ``serverless_capacity_acu`` and ``cpu_utilization_percent`` of that writer
+    at the step start, at the window start and their maximum over the window,
+    and the named cluster's peak ``DatabaseConnections`` over the window. A
+    cluster whose datapoints all read zero connections is not the one the
+    control plane uses (rounds named an orphan cluster at 0.5 ACU and measured
+    it without notice): ``FAIL`` fails the step's measurement, never its
+    product verdict. No datapoint at all is ``UNVERIFIED``.
+    """
+
+    writer = placement.get("aurora") or {}
+    step_start = step_started_at(placement)
+    document: dict[str, Any] = {
+        "cluster_id": writer.get("cluster_id"),
+        "writer_instance_id": writer.get("writer_instance_id"),
+        "step_started_at_epoch": step_start,
+        "window_start_epoch": window_start,
+        "window_end_epoch": window_end,
+    }
+    for name, key in STEP_READINGS.items():
+        points = _datapoints(metrics, name)
+        document[key] = {
+            "at_step_start": _reading_at(points, step_start),
+            "at_window_start": _reading_at(points, window_start),
+            "max_during_window": _peak_during(points, window_start, window_end),
+        }
+    connections = _peak_during(
+        _datapoints(metrics, "DatabaseConnections"), window_start, window_end
+    )
+    document["database_connections_max_during_window"] = connections
+    cluster = document["cluster_id"]
+    if connections is None:
+        status, reason = (
+            "UNVERIFIED",
+            (
+                "CloudWatch returned no DatabaseConnections datapoint of Aurora "
+                f"cluster {cluster} during the window"
+            ),
+        )
+    elif connections <= 0:
+        status, reason = (
+            "FAIL",
+            (
+                f"Aurora cluster {cluster} had zero DatabaseConnections during the "
+                "window: it is not the cluster the control plane uses, so its "
+                "capacity and CPU readings describe another database "
+                "(GPU_FAULT_AURORA_CLUSTER_ID / --aurora-cluster-id)"
+            ),
+        )
+    else:
+        status, reason = "PASS", None
+    return {**document, "status": status, "reason": reason}
+
+
+def aurora_step_fields(
+    metrics: dict, *, placement: dict, window_start: float, window_end: float
+) -> dict[str, Any]:
+    """summary.json's Aurora fields: the load-window maxima over the range
+    ``aurora_window`` used to read, and the step's ``aurora_measurement``."""
+
+    since = (window_start - LEGACY_LEAD_SECONDS) // PERIOD_SECONDS * PERIOD_SECONDS
+
+    def legacy_max(name: str) -> float | None:
+        return max(
+            (
+                maximum or 0
+                for at, (_average, maximum) in _datapoints(metrics, name)
+                if at >= since
+            ),
+            default=None,
+        )
+
+    return {
+        "aurora_capacity_max": legacy_max("ServerlessDatabaseCapacity"),
+        "aurora_cpu_max": legacy_max("CPUUtilization"),
+        "aurora_measurement": aurora_measurement(
+            metrics,
+            placement=placement,
+            window_start=window_start,
+            window_end=window_end,
+        ),
+    }
+
+
+def measured_exit(code: int, summary: dict) -> int:
+    """A step's own failure first; else ``MEASUREMENT_FAILED_EXIT`` when its
+    Aurora measurement failed."""
+
+    if code:
+        return code
+    measurement = summary.get("aurora_measurement") or {}
+    return MEASUREMENT_FAILED_EXIT if measurement.get("status") == "FAIL" else 0
+
+
+def step_status(
+    code: int, failure: str, measurement: str | None = None
+) -> dict[str, Any]:
+    """status.json's ``status`` and ``reason`` for a step's exit code."""
+
+    if code == 0:
+        return {"status": "ok"}
+    if code == MEASUREMENT_FAILED_EXIT:
+        return {
+            "status": "measurement-failed",
+            "reason": measurement or MEASUREMENT_FAILED_REASON,
+        }
+    return {"status": "aborted", "reason": failure}
 
 
 def postgres_counters(
