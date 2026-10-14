@@ -21,6 +21,7 @@ from gpu_fault.node_agent.operations.holders import (
     gpu_client_holder_evidence,
     gpu_client_holder_summary,
     idle_display_modules,
+    persistence_daemon_bystander,
 )
 
 MAX_RESET_BUSY_ATTEMPTS = 3
@@ -82,6 +83,12 @@ class ResetOutcomeUnknown(ResetProgressError):
         )
 
 
+def _bystander_details(bystanders: list[dict[str, Any]]) -> dict[str, Any]:
+    """The holders a display-stack release went ahead beside, when there were any."""
+
+    return {"display_release_bystanders": list(bystanders)} if bystanders else {}
+
+
 class ResetOperationsMixin:
     # Attributes supplied by the composed concrete implementation.
     _gpu_inventory: Callable[..., Any]
@@ -133,20 +140,34 @@ class ResetOperationsMixin:
         return dict(zip(fields, values, strict=True))
 
     def _release_idle_display_modules(
-        self, gpu_uuids: list[str], released: list[str]
+        self,
+        gpu_uuids: list[str],
+        released: list[str],
+        bystanders: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Unload ``nvidia_drm`` / ``nvidia_modeset`` when they are the only
         thing between a busy reset and a free GPU; appends what it unloaded to
         ``released`` and says whether it unloaded anything.
 
-        Only when no process holds any NVIDIA device node and no compute app
-        is running (``gpu_client_holder_evidence``): a holder is a client to
+        Only when no compute app is running and no process holds an NVIDIA
+        device node (``gpu_client_holder_evidence``): a holder is a client to
         wait for or report, not something to pull a kernel module from under.
-        The modules are loaded again after the reset (``_reload_display_modules``).
+        The persistence daemon the quiesce kept, holding nothing but the other
+        GPUs and ``/dev/nvidiactl``, is no such client
+        (``persistence_daemon_bystander``); it goes to ``bystanders``. The
+        modules are loaded again after the reset (``_reload_display_modules``).
         """
 
         evidence = self._gpu_client_holder_evidence(gpu_uuids)
-        if evidence.get("device_holders") or evidence.get("compute_client_count"):
+        if evidence.get("compute_client_count"):
+            return False
+        holders = evidence.get("device_holders") or []
+        targets = evidence.get("target_device_paths") or []
+        if evidence.get("device_holder_count", len(holders)) != len(holders) or any(
+            not persistence_daemon_bystander(holder, targets) for holder in holders
+        ):
+            # A listed holder that is a client, or more holders than the
+            # bounded evidence lists: nothing is unloaded.
             return False
         unloaded = False
         # Re-read ``/proc/modules`` after every unload: ``nvidia_modeset`` is
@@ -164,6 +185,13 @@ class ResetOperationsMixin:
             self._run_checked(["rmmod", candidates[0]], timeout=30)
             released.append(candidates[0])
             unloaded = True
+        if unloaded and bystanders is not None:
+            known = {item.get("pid") for item in bystanders}
+            bystanders.extend(
+                {key: holder[key] for key in ("pid", "process_name", "devices")}
+                for holder in holders
+                if holder.get("pid") not in known
+            )
         return unloaded
 
     def _reload_display_modules(self, released: list[str]) -> dict[str, Any]:
@@ -198,6 +226,7 @@ class ResetOperationsMixin:
         timeout: int,
         released: list[str] | None = None,
         calls: list[dict[str, Any]] | None = None,
+        bystanders: list[dict[str, Any]] | None = None,
     ) -> int:
         """Spawn ``command`` behind the final ownership checkpoint, retrying a
         driver refusal "In use by another client" up to ``_RESET_BUSY_ATTEMPTS``.
@@ -274,7 +303,7 @@ class ResetOperationsMixin:
                 if not busy:
                     raise
                 unloaded_before = len(released)
-                if self._release_idle_display_modules(gpu_uuids, released):
+                if self._release_idle_display_modules(gpu_uuids, released, bystanders):
                     # Each unload passed its own checkpoint before the rmmod.
                     calls.extend(
                         {"command": f"rmmod {module}", "outcome": "released"}
@@ -282,10 +311,10 @@ class ResetOperationsMixin:
                     )
                     # The DRM client was the holder; the next attempt is the
                     # first one that can succeed, so it needs no settle time.
-                    self._verify_no_clients(gpu_uuids)
+                    self._verify_no_clients(gpu_uuids, include_agent_activities=True)
                     continue
                 self.sleep(self.device_client_sample_interval_seconds)
-                self._verify_no_clients(gpu_uuids)
+                self._verify_no_clients(gpu_uuids, include_agent_activities=True)
         raise AssertionError("unreachable GPU reset retry state")
 
     def _gpu_client_holder_evidence(self, gpu_uuids: list[str]) -> dict[str, Any]:
@@ -316,7 +345,7 @@ class ResetOperationsMixin:
             )
         if not gpu_uuids:
             raise RuntimeError("GPU reset requires explicit GPU UUID targets")
-        self._verify_no_clients(gpu_uuids)
+        self._verify_no_clients(gpu_uuids, include_agent_activities=True)
 
     @contextmanager
     def _pre_spawn_guard(self, *, window_claimed: bool) -> Iterator[None]:
@@ -357,6 +386,7 @@ class ResetOperationsMixin:
         completed: list[str] = []
         released: list[str] = []
         calls: list[dict[str, Any]] = []
+        bystanders: list[dict[str, Any]] = []
         for index, gpu_uuid in enumerate(gpu_uuids):
             try:
                 reset_attempts += self._run_reset_with_busy_retry(
@@ -370,6 +400,7 @@ class ResetOperationsMixin:
                     timeout=120,
                     released=released,
                     calls=calls,
+                    bystanders=bystanders,
                 )
             except (RuntimeError, OwnershipRefused) as exc:
                 # Report the loop's progress: the GPUs already reset, the one
@@ -426,6 +457,7 @@ class ResetOperationsMixin:
                         "reset_not_attempted": gpu_uuids[
                             index if not_attempted else index + 1 :
                         ],
+                        **_bystander_details(bystanders),
                         **self._reload_display_modules(released),
                     },
                 ) from exc
@@ -437,6 +469,7 @@ class ResetOperationsMixin:
             "reset_successes": len(completed),
             "reset_busy_refusals": reset_attempts - len(completed),
             "physical_calls": calls,
+            **_bystander_details(bystanders),
             **self._reload_display_modules(released),
         }
 
@@ -463,7 +496,7 @@ class ResetOperationsMixin:
                 "requested GPU inventory does not match local inventory: "
                 f"requested={requested}; local={local_inventory}"
             )
-        self._verify_no_clients(local_inventory)
+        self._verify_no_clients(local_inventory, include_agent_activities=True)
         return local_inventory
 
     def _reset_all_gpus_nvswitches(
@@ -476,6 +509,7 @@ class ResetOperationsMixin:
             local_inventory = self._reset_all_preflight(gpu_uuids)
         released: list[str] = []
         calls: list[dict[str, Any]] = []
+        bystanders: list[dict[str, Any]] = []
         try:
             reset_attempts = self._run_reset_with_busy_retry(
                 ["nvidia-smi", "--gpu-reset"],
@@ -483,9 +517,11 @@ class ResetOperationsMixin:
                 timeout=180,
                 released=released,
                 calls=calls,
+                bystanders=bystanders,
             )
         except ResetProgressError as exc:
             exc.action_details["physical_calls"] = calls
+            exc.action_details.update(_bystander_details(bystanders))
             raise
         except OwnershipRefused as refused:
             # The boundary refused before the one fabric reset was (re)spawned:
@@ -535,6 +571,7 @@ class ResetOperationsMixin:
             "reset_successes": 1,
             "reset_busy_refusals": reset_attempts - 1,
             "physical_calls": calls,
+            **_bystander_details(bystanders),
             **reload,
         }
 

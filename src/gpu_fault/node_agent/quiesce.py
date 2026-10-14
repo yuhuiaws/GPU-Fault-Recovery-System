@@ -994,3 +994,38 @@ class GpuServiceQuiesceManager:
                 }
             )
         return result
+
+
+def open_quiesce_windows(manager: GpuServiceQuiesceManager) -> list[dict[str, Any]]:
+    """Every quiesce window open on this boot: incident, workflow and phase.
+
+    A state file exists from the moment a QUIESCE arms its fail-safe until the
+    restore removes it, in every phase in between (a failed quiesce or restore
+    included: its services may still be down). A file a previous boot left is
+    the boot reconcile's to restore, not a window. One that cannot be read is
+    reported with no owner, so foreign GPU work stays out (fail closed).
+    """
+
+    if not manager.state_dir.is_dir():
+        return []
+    boot_id = manager.boot_id_reader()
+    windows: list[dict[str, Any]] = []
+    for state_path in sorted(manager.state_dir.glob("quiesce-*.json")):
+        try:
+            state = manager._read_state(state_path)
+        except (OSError, ValueError, RuntimeError):
+            windows.append({"incident_id": None, "phase": "UNREADABLE"})
+            continue
+        if state is None:
+            continue
+        recorded = state.get("boot_id")
+        if recorded and boot_id and recorded != boot_id:
+            continue
+        windows.append(
+            {
+                "incident_id": state.get("incident_id"),
+                "workflow_request_id": state.get("workflow_request_id"),
+                "phase": state.get("phase"),
+            }
+        )
+    return windows

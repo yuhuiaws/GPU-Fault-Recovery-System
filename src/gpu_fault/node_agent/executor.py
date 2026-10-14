@@ -25,6 +25,12 @@ from gpu_fault.node_agent.late_ownership import (
     ownership_required,
 )
 from gpu_fault.collectors.outbox_maintenance import DEFAULT_OUTBOX_DIRECTORY
+from gpu_fault.node_agent.gpu_activity import (
+    DEFAULT_WINDOW_DRAIN_SECONDS,
+    CheckpointedRunner,
+    GpuActivityGate,
+    GpuActivityOverlapped,
+)
 from gpu_fault.node_agent.operations import (
     ClientOperationsMixin,
     CollectorOutboxOperationsMixin,
@@ -52,7 +58,10 @@ from gpu_fault.node_agent.protocol import (
     SignedNodeAction,
     sign_node_action,
 )
-from gpu_fault.node_agent.quiesce import GpuServiceQuiesceManager
+from gpu_fault.node_agent.quiesce import (
+    GpuServiceQuiesceManager,
+    open_quiesce_windows,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -155,6 +164,7 @@ class NodeActionExecutor(
         sleep: Callable[[float], None] = time.sleep,
         require_final_ownership: bool = False,
         cluster_provider: str = "hyperpod",
+        gpu_activity_drain_seconds: float = DEFAULT_WINDOW_DRAIN_SECONDS,
     ) -> None:
         if len(secret) < 32:
             raise ValueError("node action shared secret must be at least 32 characters")
@@ -237,7 +247,9 @@ class NodeActionExecutor(
         self._inflight: dict[str, Event] = {}
         self._counter_lock = RLock()
         self._counters: dict[str, int] = dict.fromkeys(COUNTER_NAMES, 0)
-        self.runner = runner
+        # The Agent's own GPU work stays out of another incident's quiesce window.
+        self.gpu_activity = self._gpu_activity_gate(now, gpu_activity_drain_seconds)
+        self.runner = CheckpointedRunner(runner, self.gpu_activity)
         # Who owns the machines: a plain EKS node runs no host DCGM by design.
         self.cluster_provider = cluster_provider
         self.device_client_finder = device_client_finder or self._device_clients
@@ -294,6 +306,19 @@ class NodeActionExecutor(
                 firmware_verify_sha256,
                 target_firmware_version or "",
             )
+
+    def _gpu_activity_gate(
+        self, now: Callable[[], datetime], drain_seconds: float
+    ) -> GpuActivityGate:
+        """The registry of the Agent's own GPU work (``gpu_activity``): admitted
+        operations are registered and each of their spawns passes its checkpoint
+        (``CheckpointedRunner``)."""
+
+        return GpuActivityGate(
+            open_windows=self._open_quiesce_windows,
+            now=now,
+            drain_seconds=drain_seconds,
+        )
 
     def set_agent_generation(self, generation: int) -> None:
         self.agent_generation = generation
@@ -358,6 +383,7 @@ class NodeActionExecutor(
                     "OWNERSHIP_PROTOCOL_UNAVAILABLE", boundary="AGENT_ADMISSION"
                 )
         self._reject_command_id_reuse(command)
+        self.gpu_activity.refuse_if_window_open(command.operation, command.incident_id)
         return command
 
     def _reject_command_id_reuse(self, command: NodeActionCommand) -> None:
@@ -506,9 +532,15 @@ class NodeActionExecutor(
             return existing
 
         fields = _command_log_fields(command, attempt)
-        self._count("accepted")
-        LOGGER.info("node action accepted %s", fields)
+        activity = None
         try:
+            # Registered before the window check (``gpu_activity``); a refusal
+            # here is a rejection like the admission one, nothing dispatched.
+            activity = self.gpu_activity.admit(
+                command.operation, command.command_id, command.incident_id
+            )
+            self._count("accepted")
+            LOGGER.info("node action accepted %s", fields)
             self.ledger.mark_in_progress(
                 command,
                 attempt,
@@ -520,6 +552,7 @@ class NodeActionExecutor(
             # Leaving it unset turns every later submit for this command_id into
             # a waiter that blocks for inflight_wait_timeout_seconds, so release
             # it before the failure travels back to the caller.
+            self.gpu_activity.release(activity)
             with self._inflight_lock:
                 self._inflight.pop(command.command_id, None)
                 inflight.set()
@@ -529,7 +562,11 @@ class NodeActionExecutor(
         exit_code: int | None = None
         try:
             handler = getattr(self, operation_handler_name(command.operation))
-            details = execute_with_final_ownership(self, envelope, handler)
+            with self.gpu_activity.running(activity):
+                details = execute_with_final_ownership(self, envelope, handler)
+            overlapped = self.gpu_activity.outcome_failure(activity, None)
+            if overlapped is not None:
+                raise overlapped
             result = NodeActionResult(
                 command_id=command.command_id,
                 operation=command.operation,
@@ -543,7 +580,9 @@ class NodeActionExecutor(
                 fields,
                 int((time.monotonic() - started) * 1000),
             )
-        except Exception as exc:
+        except Exception as raised:
+            # An activity a quiesce window overlapped reports no verdict.
+            exc = self.gpu_activity.outcome_failure(activity, raised) or raised
             returncode = getattr(exc, "returncode", None)
             exit_code = returncode if isinstance(returncode, int) else None
             result = NodeActionResult(
@@ -567,6 +606,7 @@ class NodeActionExecutor(
                             CollectorOutboxRefused,
                             OwnershipRefused,
                             GpuClientsActive,
+                            GpuActivityOverlapped,
                         ),
                     )
                     else {}
@@ -585,6 +625,7 @@ class NodeActionExecutor(
                 exit_code,
                 int((time.monotonic() - started) * 1000),
             )
+        self.gpu_activity.release(activity)
         try:
             result = self._persist_result(result, exit_code=exit_code, fields=fields)
         finally:
@@ -659,23 +700,38 @@ class NodeActionExecutor(
         # Read right after the scope: the bus ids come from the very report its
         # device nodes were resolved from (an empty target list is every GPU).
         whole_node = not command.gpu_uuids
-        return quiesce_manager.quiesce(
-            incident_id=command.incident_id,
-            workflow_request_id=command.workflow_request_id,
-            target_device_paths=target_device_paths,
-            workload_cgroup_paths=workload_cgroup_paths,
-            target_pci_bus_ids=(
-                None if whole_node else self._target_pci_bus_ids(command.gpu_uuids)
-            ),
-            whole_node=whole_node,
+        target_pci_bus_ids = (
+            None if whole_node else self._target_pci_bus_ids(command.gpu_uuids)
         )
+        # Closed to other incidents' GPU work before anything is stopped; the
+        # foreign work already running is flagged and given a bounded wait.
+        drained = self.gpu_activity.open_window(command.incident_id)
+        try:
+            result = quiesce_manager.quiesce(
+                incident_id=command.incident_id,
+                workflow_request_id=command.workflow_request_id,
+                target_device_paths=target_device_paths,
+                workload_cgroup_paths=workload_cgroup_paths,
+                target_pci_bus_ids=target_pci_bus_ids,
+                whole_node=whole_node,
+            )
+        finally:
+            self.gpu_activity.close_opening(command.incident_id)
+        return {**result, **drained}
+
+    def _open_quiesce_windows(self) -> list[dict[str, Any]]:
+        if self.quiesce_manager is None:
+            return []
+        return open_quiesce_windows(self.quiesce_manager)
 
     def _execute_verify_no_clients(self, command: NodeActionCommand) -> dict[str, Any]:
+        device_clients = not bool(command.parameters.get("compute_clients_only", False))
+        # The Agent's own GPU work counts for the full verification only: a
+        # compute-only probe (a warm spare's eligibility) asks about workloads.
         return self._verify_no_clients(
             command.gpu_uuids,
-            include_device_clients=not bool(
-                command.parameters.get("compute_clients_only", False)
-            ),
+            include_device_clients=device_clients,
+            include_agent_activities=device_clients,
         )
 
     def _execute_health_snapshot(self, _command: NodeActionCommand) -> dict[str, Any]:
@@ -760,7 +816,11 @@ class NodeActionExecutor(
         # gets here: the reset the driver was asked for keeps going after
         # nvidia-smi is killed, and an installer killed part-way has left the
         # node half-applied.
-        return isinstance(error, (OSError, TimeoutError, subprocess.TimeoutExpired))
+        # An activity a quiesce window overlapped runs again after the window.
+        return isinstance(
+            error,
+            (OSError, TimeoutError, subprocess.TimeoutExpired, GpuActivityOverlapped),
+        )
 
 
 validate_operation_handlers(NodeActionExecutor)

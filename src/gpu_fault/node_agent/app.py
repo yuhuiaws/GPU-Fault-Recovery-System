@@ -17,6 +17,7 @@ from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.logging_setup import configure_logging
 from gpu_fault.node_agent.config import executor_from_environment
+from gpu_fault.node_agent.gpu_activity import WINDOW_OPEN_REFUSAL
 from gpu_fault.node_agent.executor import (
     UNPERSISTED_RESULT_ERROR,
     NodeActionExecutor,
@@ -166,6 +167,15 @@ def _node_action_rejection(
             "STALE_FENCING_TOKEN",
             True,
             True,
+        )
+    elif WINDOW_OPEN_REFUSAL.lower() in normalized:
+        # Another incident's quiesce window is open on this node: the command
+        # is valid and runs as it is once RESTORE_GPU_SERVICES closes it.
+        status, code, retryable, new_command = (
+            409,
+            "GPU_MAINTENANCE_WINDOW_OPEN",
+            True,
+            False,
         )
     elif "command_id reused" in normalized:
         # The id already names a different command, so retrying this body can

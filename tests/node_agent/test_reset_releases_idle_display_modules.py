@@ -17,6 +17,8 @@ from __future__ import annotations
 from pathlib import Path
 from subprocess import CalledProcessError, CompletedProcess
 
+import pytest
+
 from gpu_fault.node_agent.operations.holders import idle_display_modules
 from gpu_fault.node_agent.protocol import NodeActionStatus
 from tests.node_agent._support import (
@@ -249,3 +251,100 @@ def test_a_modeset_user_that_stays_is_recorded_as_retained(tmp_path: Path) -> No
     assert result.details["display_modules_retained"] == [
         {"module": "nvidia_modeset", "refcount": 1, "used_by": ["ghost_user"]}
     ], "what stayed loaded, and who kept it, is in the record"
+
+
+def _holder(proc: Path, pid: str, comm: str, devices: list[str], cgroup: str) -> None:
+    process = proc / pid
+    (process / "fd").mkdir(parents=True)
+    for index, device in enumerate(devices, start=3):
+        (process / "fd" / str(index)).symlink_to(device)
+    (process / "comm").write_text(f"{comm}\n", encoding="ascii")
+    (process / "cgroup").write_text(f"0::{cgroup}\n", encoding="ascii")
+
+
+KEPT_DAEMON_DEVICES = [f"/dev/nvidia{minor}" for minor in range(1, 8)] + [
+    "/dev/nvidiactl"
+]
+
+
+def test_the_kept_persistence_daemon_does_not_keep_the_display_stack_loaded(
+    tmp_path: Path,
+) -> None:
+    """Live (GF-REGIONAL-DESTR-001 attempt 2, plain EKS p5en): the quiesce
+    released the target's persistence through ``nvidia-persistenced`` and kept
+    the daemon on the seven other GPUs and ``/dev/nvidiactl``. The display-stack
+    release read it as a holder, never unloaded the idle ``nvidia_drm`` /
+    ``nvidia_modeset``, and the reset failed busy three times -- every earlier
+    reset on these nodes had needed exactly that unload. The daemon holding
+    nothing of the target is a bystander now, recorded with the release."""
+
+    proc = _proc(tmp_path)
+    _holder(
+        proc,
+        "44878",
+        "nvidia-persiste",
+        KEPT_DAEMON_DEVICES,
+        "/system.slice/nvidia-persistenced.service",
+    )
+    runner = DisplayStackRunner(modules=proc / "modules")
+    agent = _agent(tmp_path, runner, proc)
+
+    result = agent.execute(envelope(command(WorkflowOperation.RESET_GPU)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result.error
+    assert result.details["released_kernel_modules"] == ["nvidia_drm", "nvidia_modeset"]
+    assert result.details["reset_attempts"] == 2
+    assert result.details["display_release_bystanders"] == [
+        {
+            "pid": "44878",
+            "process_name": "nvidia-persiste",
+            "devices": ",".join(sorted(KEPT_DAEMON_DEVICES)),
+        }
+    ], "the record says which holder the release went ahead beside"
+
+
+@pytest.mark.parametrize(
+    ("comm", "devices", "cgroup", "why"),
+    [
+        (
+            "nvidia-persiste",
+            ["/dev/nvidia0", "/dev/nvidiactl"],
+            "/system.slice/nvidia-persistenced.service",
+            "the daemon still holds the target GPU",
+        ),
+        (
+            "nvidia-persiste",
+            ["/dev/nvidia1", "/dev/nvidia-uvm", "/dev/nvidiactl"],
+            "/system.slice/nvidia-persistenced.service",
+            "a uvm handle is a compute client, not persistence",
+        ),
+        (
+            "nvidia-persiste",
+            ["/dev/nvidia1", "/dev/nvidiactl"],
+            "/kubepods.slice/kubepods-pod0123.slice/cri-containerd-abc.scope",
+            "a containerised process of that name is not the host daemon",
+        ),
+        (
+            "dcgm-exporter",
+            ["/dev/nvidia1", "/dev/nvidiactl"],
+            "/system.slice/dcgm-exporter.service",
+            "only the persistence daemon is a bystander",
+        ),
+    ],
+)
+def test_any_other_holder_still_keeps_every_module_loaded(
+    tmp_path: Path, comm: str, devices: list[str], cgroup: str, why: str
+) -> None:
+    proc = _proc(tmp_path)
+    _holder(proc, "4242", comm, devices, cgroup)
+    runner = DisplayStackRunner(modules=proc / "modules", busy_forever=True)
+    agent = _agent(tmp_path, runner, proc)
+
+    result = agent.execute(envelope(command(WorkflowOperation.RESET_GPU)))
+
+    assert result.status is NodeActionStatus.FAILED
+    assert not [item for item in runner.commands if item[0] in {"rmmod", "modprobe"}], (
+        why
+    )
+    assert "released_kernel_modules" not in result.details
+    assert "display_release_bystanders" not in result.details

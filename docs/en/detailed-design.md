@@ -1188,6 +1188,32 @@ RESET receipt each reset call's record in `physical_calls` (paired in order with
 targets' `target_persistence` and the other GPUs' `non_target_persistence_modes` as its final permit checkpoint read them.
 Every record is bounded in count and length.
 
+When the driver refuses the reset "In use by another client" and no process holds the target GPU, the Agent unloads the
+idle display stack after the first busy refusal (`nvidia_drm` at refcount 0, then `nvidia_modeset`), retries at once and
+loads it back after the reset whatever its outcome. The `nvidia-persistenced` the window kept holds only the other GPUs
+and `/dev/nvidiactl`: it is a client of neither the target GPU nor the display stack (whose clients the module reference
+counts decide), so it does not stop the unload, and the receipt records it in `display_release_bystanders`. Any other
+holder -- another process, a target device node, `nvidia-uvm`, a deleted device node, a containerised process, or an
+unknown target set -- still keeps every module loaded. The daemon used to count as a holder, the display stack was never
+unloaded, and every single-GPU reset on a plain EKS p5en node failed busy three times and escalated to RESTART_NODE.
+
+The quiesce window is exclusive against the Agent's own GPU work as well. `RUN_DCGM_DIAGNOSTIC`,
+`COLLECT_DIAGNOSTIC_BUNDLE`, `COLLECT_HUNG_TRIAGE`, `RUN_FIELD_DIAGNOSTIC`, `RUN_NVLINK74_WORKFLOW` and
+`TRIGGER_HEALTH_SNAPSHOT` open GPU clients of their own (`dcgmi` and its `nvvs`, `nvidia-smi`, the field diagnostic, the
+bug report) or restart the collectors the quiesce stopped, and the control plane does not treat them as node-exclusive.
+While a window is open on the node (a quiesce state file of this boot, or a QUIESCE still running), such a command of
+another incident is refused at admission: HTTP 409 `GPU_MAINTENANCE_WINDOW_OPEN`, retryable, no ledger row, and the
+control plane resubmits the same command after RESTORE_GPU_SERVICES closed the window; the window's own incident keeps
+its commands (the NVLink field diagnostic runs inside its own window). An admitted command of that kind is registered for
+its whole run, registered before the window check so no race is left. QUIESCE closes the window to foreign work before it
+stops any service, flags the foreign work in flight as overlapped and waits at most 30 s for it to end;
+`VERIFY_NO_GPU_CLIENTS` and the reset's preflight and busy re-checks fail closed with `GpuClientsActive`
+(`gpu_client_kind=agent`) while any registered work is in flight -- its subprocesses come and go between samples, and the
+sampled `/proc` scan would call them transient. Overlapped work stops before its next spawn, and its result is a retryable
+`GpuActivityOverlapped` (`gpu_activity_overlapped_by`, `gpu_activity_outcome`) with no diagnostic verdict; it runs again
+once the window is closed. With foreign work in flight the QUIESCE result carries `agent_gpu_activities_overlapped`,
+`agent_gpu_activities_running` and `agent_gpu_activity_wait_seconds`.
+
 The H200 code-specific SXIDs `10003/19084` use a dedicated
 `RESET_ALL_GPUS_NVSWITCHES` operation. The control plane generates the complete UUID
 inventory from recent GPU metrics of the same node and pins the fabric partition to that node's local NVSwitch domain. The Node Agent

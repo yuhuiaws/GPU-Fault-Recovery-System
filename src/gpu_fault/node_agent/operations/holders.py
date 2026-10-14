@@ -23,9 +23,14 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
+
+from gpu_fault.node_agent.common import (
+    NVIDIA_GPU_DEVICE_PATTERN,
+    PERSISTENCE_DAEMON_PROCESS,
+)
 
 #: Every NVIDIA device node a client can hold the driver through, with the
 #: ``(deleted)`` suffix a replaced node leaves on an open descriptor.
@@ -207,6 +212,42 @@ def idle_display_modules(proc_root: Path) -> list[str]:
         ):
             releasable.append("nvidia_modeset")
     return releasable
+
+
+def persistence_daemon_bystander(
+    holder: Mapping[str, Any], target_device_paths: Collection[str]
+) -> bool:
+    """Whether ``holder`` is the persistence daemon holding only other GPUs.
+
+    The quiesce releases persistence on the targets through a running
+    ``nvidia-persistenced`` and keeps the daemon (``quiesce_persistence``), so
+    in the window it still holds ``/dev/nvidiactl`` and every *other* GPU. That
+    is no client of the target and none of the display stack; read as one, it
+    kept the idle ``nvidia_drm``/``nvidia_modeset`` loaded and every busy reset
+    of a plain EKS p5en node failed three times "In use by another client"
+    (live, GF-REGIONAL-DESTR-001: holder ``nvidia-persiste`` on
+    ``/dev/nvidia1-7,/dev/nvidiactl``, ``nvidia_drm`` refcount 0). Anything
+    else -- another process, a target or deleted node, ``nvidia-uvm``, a
+    container, an unknown target set -- is a holder.
+    """
+
+    targets = set(target_device_paths)
+    if (
+        not targets
+        or holder.get("process_name") != PERSISTENCE_DAEMON_PROCESS
+        or holder.get("kubernetes")
+        or holder.get("deleted_device_node")
+    ):
+        return False
+    devices = [item for item in str(holder.get("devices") or "").split(",") if item]
+    return bool(devices) and all(
+        device == "/dev/nvidiactl"
+        or (
+            NVIDIA_GPU_DEVICE_PATTERN.fullmatch(device) is not None
+            and device not in targets
+        )
+        for device in devices
+    )
 
 
 def display_module_state(proc_root: Path) -> list[dict[str, Any]]:

@@ -1435,7 +1435,13 @@ Semantics and boundaries of `eks-managed`:
   `nvidia_modeset` -- live the only holder was `nvidia_modeset refcount=1 used_by nvidia_drm`), retries at once and
   loads it back with `modprobe nvidia_drm` after the reset whatever its outcome (`released_kernel_modules`/
   `reloaded_kernel_modules`, or `kernel_module_reload_error`); with a process holding a device node no module is
-  touched. Planner side: a RUNNING node-exclusive chain absorbs the `efa_kubernetes_allocatable_mismatch`/
+  touched -- except the `nvidia-persistenced` the window kept: holding only the other GPUs and `/dev/nvidiactl`, it does
+  not stop the unload and is recorded in `display_release_bystanders` (detailed design, quiesce). The Agent's own
+  diagnostic commands (RUN_DCGM_DIAGNOSTIC, COLLECT_DIAGNOSTIC_BUNDLE, COLLECT_HUNG_TRIAGE, the field diagnostic,
+  TRIGGER_HEALTH_SNAPSHOT) are refused while another incident's quiesce window is open (HTTP 409
+  `GPU_MAINTENANCE_WINDOW_OPEN`, retryable: the step stays WAITING and is resubmitted after the window closed); one
+  already running holds VERIFY_NO_GPU_CLIENTS (`gpu_client_kind=agent`) and its result is a retryable
+  `GpuActivityOverlapped` that runs again. Planner side: a RUNNING node-exclusive chain absorbs the `efa_kubernetes_allocatable_mismatch`/
   `gpu_kubernetes_allocatable_mismatch`/`dcgm_field_completeness` its own quiesce taint causes (the last one is the
   collector's failed scrape of the evicted exporter: a RUN_DCGM_DIAGNOSTIC no longer runs `dcgmi diag` inside the window
   and mints a DRAIN successor from its FAIL, and the chain's `VALIDATE_GPU` still refuses while the finding is active;

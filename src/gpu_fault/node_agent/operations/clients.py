@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 from xml.etree import ElementTree as ET
 
+from gpu_fault.node_agent.gpu_activity import GpuActivityGate
 from gpu_fault.node_agent.operations.holders import (
     CGROUP_PATH_LIMIT,
     GPU_CLIENT_HOLDER_LIMIT,
@@ -49,6 +50,7 @@ class ClientOperationsMixin:
     _run_checked: Callable[..., Any]
     device_client_finder: Callable[..., Any]
     device_client_sample_interval_seconds: Any
+    gpu_activity: GpuActivityGate
     proc_root: Any
     sleep: Callable[..., Any]
 
@@ -518,6 +520,31 @@ class ClientOperationsMixin:
             )
         return {gpu_uuid: causes[gpu_uuid] for gpu_uuid in missing}
 
+    def _refuse_agent_gpu_activities(self) -> None:
+        """Fail closed while one of the Agent's own GPU operations is running.
+
+        Its ``dcgmi``/``nvvs``/``nvidia-smi`` children come and go between the
+        samples, so the sampled scan below calls them transient and passes in a
+        gap between two captures -- and the reset that follows meets the next
+        one. The registry (``gpu_activity``) sees the operation for its whole
+        run; the reset waits, as for any other client.
+        """
+
+        activities = self.gpu_activity.in_flight()
+        if activities:
+            raise GpuClientsActive(
+                "GPU agent clients are still active: "
+                + ", ".join(
+                    f"{item['operation']}:{item['command_id']}"
+                    for item in activities[:8]
+                ),
+                action_details={
+                    "gpu_client_kind": "agent",
+                    "gpu_client_holders": activities[:GPU_CLIENT_HOLDER_LIMIT],
+                    "gpu_client_holders_total": len(activities),
+                },
+            )
+
     def _persistent_device_clients(
         self, target: set[str]
     ) -> tuple[list[dict[str, str]], list[dict[str, str]]]:
@@ -585,8 +612,11 @@ class ClientOperationsMixin:
         gpu_uuids: list[str],
         *,
         include_device_clients: bool = True,
+        include_agent_activities: bool = False,
     ) -> dict[str, Any]:
         target = set(gpu_uuids)
+        if include_agent_activities:
+            self._refuse_agent_gpu_activities()
         compute_clients = [
             item
             for item in self._compute_clients()
