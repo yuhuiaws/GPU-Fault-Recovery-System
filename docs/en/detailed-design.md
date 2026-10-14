@@ -3564,22 +3564,26 @@ costs at most one per fallback interval per process while a backlog exists; a st
 query, keeps the cadence. The answer is read after the empty claim, so what it cannot see is a row that commits later
 without an edge -- one whose edge went to a concurrent first writer that rolled back, or one admitted behind a PENDING
 row that completed before it committed -- and a lease that lapses after the read; each waits for the stream's next poll,
-at most the fallback (the lease-reclaim sweep also hands a lapsed row back to PENDING, which the trigger announces). The
-lane probe is asked first, as on every stream: a lane-blocked backlog of any tier keeps the fault busy ceiling (0.1 s),
-because no edge announces a freed lane and a finishing fault worker wakes only its own process -- the fault stream's
-routine-tier rows (collector health, admin and fleet paths) also queue behind lanes held in other pools and processes.
-The same test file proves the idle side: with no backlog the two coordinators poll the fault stream about once per 5 s
-instead of ten times and 5-6 times in the 5 s after an edge instead of 9-10, a row admitted to the empty queue is
+at most the fallback -- a fault row whose holder died is claimed again within 5 s of its lease lapsing instead of about
+0.5 s (the lease-reclaim sweep also hands a lapsed row back to PENDING, which the trigger announces). The lane probe is
+asked first, as on every stream: a lane-blocked backlog keeps the stream polling, because no edge announces a freed lane
+and a finishing fault worker wakes only its own process -- the fault stream's routine-tier rows (collector health, admin
+and fleet paths) also queue behind lanes held in other pools and processes -- at the fault busy ceiling (0.1 s) while a
+fault-tier row waits and at the routine busy ceiling (0.4 s), the one those rows get on a routine stream, while none
+does. The same test file proves the idle side: with no backlog the two coordinators poll the fault stream about once per
+5 s instead of ten times and 5-6 times in the 5 s after an edge instead of 9-10, a row admitted to the empty queue is
 claimed on its NOTIFY within 1 s, rows queued behind a deferred fault row are claimed within 0.6 s again, a fault row
 held by a worker of a third process leaves the idle streams at about one poll per 5 s (ten before) while the next row of
 its path is claimed on its own edge and the held row is claimed again within the fallback once its lease lapses, and a
-routine row queued behind a lane held elsewhere is claimed within 0.6 s of the lane freeing (about 3 s before). The
-payload carries no `request_id` any more: one edge wakes every shard-owning listener (`notify_work_available` applies no
-shard filter to a payload without `request_id`; per-row payloads with one are still routed). A suppressed or lost edge
-on a routine stream costs at most one fallback poll: `processor_notification_fallback_seconds` for a shard owner
-(default 5 s, `GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS`), `idle_backoff_max_seconds` 2 s for a process without
-a shard, 0.4 s while busy; the fault stream stays at 0.5 s (0.1 s while busy or lane-blocked) on every process while a
-fault-tier row waits to be claimed, and on a shard owner waits on the fallback while none does.
+routine row queued behind a lane held elsewhere is claimed within 0.5 s of the lane freeing (about 3 s before) while the
+streams poll it at most once per 0.4 s. The payload carries no `request_id` any more: one edge wakes every shard-owning
+listener (`notify_work_available` applies no shard filter to a payload without `request_id`; per-row payloads with one
+are still routed). A suppressed or lost edge on a routine stream costs at most one fallback poll:
+`processor_notification_fallback_seconds` for a shard owner (default 5 s,
+`GPU_FAULT_PROCESSOR_NOTIFICATION_FALLBACK_SECONDS`), `idle_backoff_max_seconds` 2 s for a process without a shard,
+0.4 s while busy; the fault stream stays at 0.5 s (0.1 s while busy or lane-blocked) on every process while a fault-tier
+row waits to be claimed, and on a shard owner waits on the fallback while none does (0.4 s while its backlog is
+lane-blocked).
 `tests/store/test_postgres_notify_edges.py` proves that the first PENDING row of a key notifies once, concurrent flushes on
 a busy key produce no notifying transaction, 12 concurrent first flushes of an idle key produce at most one, the next
 row after the key drains notifies again, and so does the next row of a key whose only other row is LEASED.

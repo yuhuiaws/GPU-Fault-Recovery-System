@@ -16,7 +16,8 @@ queue is claimed as soon as its NOTIFY arrives, and the next deferred row puts
 the stream back on the 0.5 s cadence. A fault row a worker elsewhere still
 holds is no backlog (it silences no edge; once its lease lapses it is claimed
 within the fallback), and a routine row queued behind a lane held elsewhere
-keeps the stream polling until the lane frees.
+keeps the stream polling at the routine busy ceiling (0.4 s) until the lane
+frees.
 """
 
 from __future__ import annotations
@@ -66,6 +67,14 @@ POST_EDGE_ROUNDS_MAX = 6
 # A lease that lapses silently waits for the stream's next poll: at most the
 # 5 s fallback, plus the claim loop on a loaded gate host.
 LAPSED_LEASE_BOUND_SECONDS = 6.0
+# With no fault-tier row waiting, a lane-blocked routine row is polled at the
+# routine busy ceiling (0.4 s): the claim after the lane frees starts within it,
+# plus the same scheduling slack as above.
+LANE_FREED_CLAIM_BOUND_SECONDS = 0.5
+# Fault rounds of one coordinator in the 3 s the lane is held: rounds are at
+# least 0.4 s apart, so 8, or 9 when a loaded host stretches the window (the
+# 0.1 s fault busy ceiling polled 28 times).
+LANE_BLOCKED_ROUNDS_MAX = 9
 
 
 @pytest.fixture
@@ -517,6 +526,10 @@ def test_a_routine_row_behind_a_lane_held_elsewhere_is_claimed_as_it_frees(
             ("freed_lane_claim_seconds", round(delay, 3)),
         ]
     )
-    assert delay < CLAIM_BOUND_SECONDS, (
+    assert max(blocked_rounds) <= LANE_BLOCKED_ROUNDS_MAX, (
+        f"while the lane was held the fault streams polled {blocked_rounds} "
+        "times in 3 s instead of at the routine busy ceiling"
+    )
+    assert delay < LANE_FREED_CLAIM_BOUND_SECONDS, (
         f"the routine row waited {delay:.3f} s after its lane was freed"
     )

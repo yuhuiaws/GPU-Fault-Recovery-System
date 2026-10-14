@@ -551,9 +551,9 @@ class TelemetrySpoolCoordinatorMixin:
     def _fault_backlog_is_empty(self, hold_seconds: float) -> bool:
         """Is no fault-tier row PENDING, or LEASED with a lapsed lease?
 
-        Asked by an empty fault round with notifications on that nothing
-        holds (claim_backoff.py), and read after the claim that came back
-        empty. A row under a live lease is not a backlog: it silences no
+        Asked by an empty fault round with notifications on that busy pools
+        do not hold (claim_backoff.py), and read after the claim that came
+        back empty. A row under a live lease is not a backlog: it silences no
         edge. An empty answer is never reused; a non-empty one is believed
         for ``hold_seconds`` -- the notification fallback -- so a fault
         backlog adds at most one query per fallback interval per replica. A

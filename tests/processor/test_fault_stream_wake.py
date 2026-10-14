@@ -17,7 +17,8 @@ asks the store for its fault backlog -- PENDING, or LEASED with a lapsed lease
 -- as soon as the answer can lengthen its interval, settled or not, and with
 none waits on the edge notification (the 5 s fallback). A backlog keeps the
 0.5 s cadence and is believed for one fallback interval; a row under a live
-lease is no backlog, and a lane-blocked backlog of any tier keeps 0.1 s.
+lease is no backlog. A lane-blocked backlog keeps 0.1 s while a fault-tier row
+waits and the routine busy ceiling, 0.4 s, while none does.
 """
 
 from __future__ import annotations
@@ -260,11 +261,30 @@ class _Probes:
             False,
             True,
             0.1,
-            ["lane"],
+            ["lane", "fault-backlog"],
             id="lane-blocked-backlog",
         ),
         pytest.param(
-            True, True, False, 1.0, True, True, 0.1, ["lane"], id="lane-blocked-routine"
+            True,
+            True,
+            False,
+            1.0,
+            True,
+            True,
+            0.4,
+            ["lane", "fault-backlog"],
+            id="lane-blocked-routine",
+        ),
+        pytest.param(
+            True,
+            False,
+            False,
+            0.2,
+            True,
+            True,
+            0.4,
+            ["lane", "fault-backlog"],
+            id="lane-blocked-routine-early",
         ),
         pytest.param(True, False, True, 1.0, True, False, 0.1, [], id="busy-path"),
         pytest.param(False, True, False, 1.0, True, False, 0.5, ["lane"], id="poller"),
@@ -519,12 +539,27 @@ def test_a_fault_row_under_a_live_lease_is_no_backlog(
     assert store.backlog_reads == 5
 
 
+def _complete_elsewhere(store: Any, holder: Any) -> None:
+    assert holder.leader_epoch is not None and holder.lease_token is not None
+    store.complete_active_processor_request(
+        holder.request_id,
+        "pod-z:1",
+        holder.leader_epoch,
+        holder.lease_token,
+        response_status=200,
+        response_content_type="application/json",
+        response_body_base64="e30=",
+    )
+
+
 def test_a_lane_blocked_routine_row_keeps_the_fault_stream_polling(
     sqlite_store: SqliteStore,
 ) -> None:
     """Admin, fleet and collector-health rows ride the fault stream. Behind a
     lane held in another pool or process nothing announces the lane freeing
-    up, so the lane probe holds the stream at the fault busy ceiling."""
+    up, so the lane probe keeps the stream polling -- at the routine busy
+    ceiling, the one those rows get on a routine stream, while no fault-tier
+    row waits."""
 
     store = _CountingStore(sqlite_store)
     marker = processor_request(
@@ -538,25 +573,35 @@ def test_a_lane_blocked_routine_row_keeps_the_fault_stream_polling(
     assert holder.ordering_key() == queued.ordering_key() == "cluster-a"
     processor = _notified_coordinator(store, shard=0)
 
-    assert _empty_fault_rounds(processor, 12) == pytest.approx([0.1] * 12)
-    assert store.backlog_reads == 0, "the lane probe settles the round first"
-
-    assert holder.leader_epoch is not None and holder.lease_token is not None
-    store.complete_active_processor_request(
-        holder.request_id,
-        "pod-z:1",
-        holder.leader_epoch,
-        holder.lease_token,
-        response_status=200,
-        response_content_type="application/json",
-        response_body_base64="e30=",
+    assert _empty_fault_rounds(processor, 12) == pytest.approx([0.2] + [0.4] * 11), (
+        "a held lane polls the routine row at most every 0.4 s"
     )
+    assert store.lane_probes == 12
+    assert store.backlog_reads == 12, "an empty fault backlog is read fresh"
+
+    _complete_elsewhere(store, holder)
     _empty_fault_rounds(processor, 1)
     taken = store.get_processor_request(queued.request_id)
     assert (taken.status, taken.lease_owner) == (
         ProcessorRequestStatus.LEASED,
         "pod-a:1",
     ), "the next fault round claims the row once its lane is free"
+
+
+def test_a_lane_blocked_fault_row_keeps_the_fault_busy_ceiling(
+    sqlite_store: SqliteStore,
+) -> None:
+    store = _CountingStore(sqlite_store)
+    xid = processor_request("/v1/gpu-events/xid", body=b'{"node_id":"node-a"}')
+    _claim_elsewhere(store, xid, lease=timedelta(minutes=2))
+    queued = processor_request("/v1/gpu-events/xid", body=b'{"node_id":"node-a"}')
+    store.enqueue_processor_request(queued)
+    processor = _notified_coordinator(store, shard=0)
+
+    assert _empty_fault_rounds(processor, 12) == pytest.approx([0.1] * 12), (
+        "a fault row behind a held lane is polled every 0.1 s"
+    )
+    assert store.backlog_reads == 1, "its PENDING row is believed for the hold"
 
 
 def test_a_backlog_the_store_cannot_count_keeps_the_fault_stream_polling(

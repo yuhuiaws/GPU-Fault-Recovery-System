@@ -53,10 +53,12 @@ admitted behind a PENDING row that completed before it committed -- and a
 lease that lapses after the read; each waits for the stream's next poll, at
 most the fallback (the lease-reclaim sweep hands a lapsed row back to PENDING,
 which the trigger announces too). The lane probe comes first, as on every
-stream: a lane-blocked backlog keeps the fault busy ceiling whatever the tier
-of its rows, because no edge announces a freed lane and ``FaultSlotWake``
-covers only this process's fault pool (collector health, admin and fleet rows
-also queue behind holders in other pools and processes).
+stream: a lane-blocked backlog keeps the stream polling, because no edge
+announces a freed lane and ``FaultSlotWake`` covers only this process's fault
+pool (collector health, admin and fleet rows also queue behind holders in
+other pools and processes) -- at the fault busy ceiling while a fault-tier row
+waits, and at the routine busy ceiling, the one those rows get on a routine
+stream, while none does.
 """
 
 from __future__ import annotations
@@ -103,9 +105,11 @@ def empty_round_ceiling(
     verdict on the backlog -- always does, and is consulted lazily because it
     is a round trip the idle path should not pay. ``fault_backlog_empty(hold)``
     -- no fault-tier row PENDING, or LEASED with a lapsed lease -- is asked
-    only by a fault stream with notifications on that nothing holds, once the
-    fallback would give a longer interval than ``fault_idle``; a backlog it
-    reports may be believed for ``hold``, the notification fallback.
+    only by a fault stream with notifications on that busy pools do not hold:
+    behind a blocked lane, to pick the busy ceiling of the waiting rows' tier,
+    and otherwise once the fallback would give a longer interval than
+    ``fault_idle``; a backlog it reports may be believed for ``hold``, the
+    notification fallback.
     """
 
     idle = ceilings.idle_ceiling(stream)
@@ -114,11 +118,16 @@ def empty_round_ceiling(
         return (pools_busy and not settled_empty) or lane_blocked()
 
     if stream == "fault":
-        if held():
+        if pools_busy and not settled_empty:
             return ceilings.fault_busy
         fallback = ceilings.notification_fallback
+        notified = ceilings.notifications_enabled
+        if lane_blocked():
+            if notified and fault_backlog_empty(fallback):
+                return ceilings.busy
+            return ceilings.fault_busy
         if (
-            ceilings.notifications_enabled
+            notified
             and min(next_interval, fallback) > idle
             and fault_backlog_empty(fallback)
         ):
