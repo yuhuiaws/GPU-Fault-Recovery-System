@@ -566,7 +566,21 @@ under `_aborted/`), which finishes the cleanup once the cause is gone. A purge w
 same transaction still finds the round's data deletes nothing, and its error names what is left as
 counts: the record kinds that appeared after its walk (a writer still touching the round's clusters),
 the walked kinds still present and the rows left per table -- no keys, payloads or credentials -- so
-the writer racing the purge can be attributed.
+the writer racing the purge can be attributed. Before the purge the teardown waits for the round's
+data to settle: every workflow and command of the round terminal, no open processor row, and the
+same counts in two probes 30 seconds apart (at most 300 seconds; open work that does not move for
+two windows counts as stuck and ends the wait -- the executors are gone, nothing will finish it).
+30 seconds after the purge it probes again: when the round's data reappears (measured: a
+collector-silence scan read the round's synthetic Agents before the purge committed and wrote their
+drill notifications, deliveries, results and deduplication links after it) it settles and purges
+again, at most 3 times, logging each later purge by kind, notification source and table and keeping
+it in `capacity-data-cleanup.json.late_purges`; data still appearing after that fails the teardown
+attempt and the bounded retries take over. A late write that still reaches the next round is
+adopted by that round's registration only when it is provably an earlier run's: the run the registry
+history last registered these clusters for is its only owner and every row is that run's drill
+residue (exactly what that run's own teardown accepts once it is deregistered). The registration
+then waits up to 120 seconds for it to settle, runs that run's purge, and logs it and records it in
+`registry-data-preflight.json.adopted_residue`; any other residue still refuses the registration.
 
 Staged execution is only for controlled debugging:
 

@@ -47,6 +47,7 @@ if TYPE_CHECKING or __package__:
     from . import regional_capacity_recovery as capacity_recovery
     from . import regional_capacity_registry as capacity_registry
     from . import regional_capacity_results as capacity_results
+    from . import regional_capacity_settle as capacity_settle
     from .regional_capacity_cleanup import (
         AUDIT_PURGE_STATEMENTS as AUDIT_PURGE_STATEMENTS,
     )
@@ -63,6 +64,7 @@ else:
     import regional_capacity_recovery as capacity_recovery
     import regional_capacity_registry as capacity_registry
     import regional_capacity_results as capacity_results
+    import regional_capacity_settle as capacity_settle
     from regional_capacity_cleanup import (
         AUDIT_PURGE_STATEMENTS as AUDIT_PURGE_STATEMENTS,
     )
@@ -990,37 +992,11 @@ def execute_case(
 def purge_audit_rows(
     *, run_id: str | None = None, artifacts: Path | None = None
 ) -> dict:
-    """Remove only a registered run's quiescent data, never a shared prefix."""
-    if (
-        not isinstance(run_id, str)
-        or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}", run_id) is None
-    ):
-        raise RuntimeError("capacity cleanup requires an explicit run identity")
-    if artifacts is None:
-        raise RuntimeError("capacity cleanup requires its registration receipt")
-    if __package__:
-        from .regional_capacity_data import invoke
-    else:
-        from regional_capacity_data import invoke
-    intent = json.loads((artifacts / "registry-registration-intent.json").read_text())
-    if (
-        intent.get("run_id") != run_id
-        or intent.get("data_empty_before_registration") is not True
-    ):
-        raise RuntimeError("capacity cleanup registration scope is unproven")
-    result = invoke(
-        control,
-        run_id=run_id,
-        cluster_ids=intent["cluster_ids"],
-        cleanup=True,
-        force_nonterminal=True,  # executor Jobs are gone; open commands never finish
+    """Remove only a registered run's quiescent data, never a shared prefix:
+    settle, purge, then purge what lands late (``regional_capacity_settle``)."""
+    return capacity_settle.purge_run_data(
+        control, run_id=run_id, artifacts=artifacts, log=log
     )
-    if type(result.get("total")) is not int or result["total"] != 0:
-        raise RuntimeError("capacity exact run-owned cleanup left data")
-    (artifacts / "capacity-data-cleanup.json").write_text(
-        json.dumps(result, sort_keys=True) + "\n", encoding="utf-8"
-    )
-    return result
 
 
 def _teardown_once(

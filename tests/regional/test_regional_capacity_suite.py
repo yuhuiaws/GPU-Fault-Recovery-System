@@ -635,11 +635,13 @@ def test_capacity_teardown_stops_owned_jobs_and_requires_exact_cleanup_before_re
 
     def residuals(control, *, run_id, cluster_ids, cleanup, force_nonterminal=False):
         assert run_id == "run-a"
-        assert cluster_ids == ["perf-cap-000"] and cleanup is True
+        assert cluster_ids == ["perf-cap-000"]
+        assert f"job/{job}" not in resources
+        if not cleanup:  # the settle probe before the purge: nothing lands late
+            return events.append("probe") or {"total": 0}
         assert force_nonterminal is True, (
             "the teardown may remove the run's open synthetic commands"
         )
-        assert f"job/{job}" not in resources
         events.append("residuals")
         return {"total": remaining}
 
@@ -662,6 +664,7 @@ def test_capacity_teardown_stops_owned_jobs_and_requires_exact_cleanup_before_re
         suite.teardown(**kwargs)
         assert events == [
             f"job/{job}",
+            "probe",
             "residuals",
             "deregister",
             f"secret/{suite.TOKEN_SECRET}",
@@ -672,7 +675,7 @@ def test_capacity_teardown_stops_owned_jobs_and_requires_exact_cleanup_before_re
     else:
         with pytest.raises(RuntimeError, match="exact run-owned cleanup"):
             suite.teardown(**kwargs)
-        assert events == [f"job/{job}", "residuals"]
+        assert events == [f"job/{job}", "probe", "residuals"]
         assert f"secret/{suite.TOKEN_SECRET}" in resources
 
 

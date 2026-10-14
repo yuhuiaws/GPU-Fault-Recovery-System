@@ -1324,15 +1324,23 @@ def register(
     ]
     if __package__:
         from .regional_capacity_data import invoke
+        from .regional_capacity_settle import adopt_earlier_run_residue
     else:
         from regional_capacity_data import invoke
+        from regional_capacity_settle import adopt_earlier_run_residue
     cluster_ids = [item["cluster_id"] for item in perf]
     data_preflight = invoke(
         control, run_id=run_id, cluster_ids=cluster_ids, cleanup=False
     )
     if data_preflight["total"] != 0:
-        raise RuntimeError(
-            "synthetic cluster data already exists; registration cannot adopt it"
+        # Only an earlier run's provable drill residue is purged (and logged);
+        # anything else refuses as "synthetic cluster data already exists".
+        data_preflight = adopt_earlier_run_residue(
+            control,
+            run_id=run_id,
+            cluster_ids=cluster_ids,
+            found=data_preflight,
+            log=log,
         )
     (artifacts / "registry-data-preflight.json").write_text(
         json.dumps(data_preflight, sort_keys=True) + "\n", encoding="utf-8"

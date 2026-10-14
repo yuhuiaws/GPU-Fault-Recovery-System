@@ -51,6 +51,9 @@ RECORDS_PER_CLUSTER = 4000
 # deleted set-based, or a 50-cluster teardown outlives its exec budget.
 CAS_KINDS = frozenset({"workflow", "remote_command", "incident"})
 BULK_DELETE_BATCH = 5000
+# How far back the registry history is read for the run that last registered
+# a residue's clusters (``previous_synthetic_owner``).
+REGISTRY_LOOKBACK = 20
 
 
 def record_bound(cluster_ids: list[str]) -> int:
@@ -277,6 +280,93 @@ def remaining_data(
     )
 
 
+def kind_counts(records: dict[tuple[str, str], dict[str, Any]]) -> dict[str, int]:
+    return dict(sorted(Counter(kind for kind, _ in records).items()))
+
+
+def notification_sources(
+    records: dict[tuple[str, str], dict[str, Any]],
+) -> dict[str, int]:
+    """Notifications by the producer family their incident id names.
+
+    Producers derive the incident id of an advisory from a fixed prefix
+    (``collector-silent-<node>``, ``incident-actionperf-<run>-...``), so its
+    first two words say which control-plane job wrote it without exposing a
+    node or run id.
+    """
+
+    return dict(
+        sorted(
+            Counter(
+                "-".join(str(payload.get("incident_id") or "none").split("-")[:2])
+                for (kind, _key), payload in records.items()
+                if kind == "notification"
+            ).items()
+        )
+    )
+
+
+def open_queue_rows(cursor: Any, cluster_ids: list[str]) -> int:
+    """Processor rows of the clusters that are not COMPLETED: open work.
+
+    COMPLETED rows are replay records the processor keeps for its idempotency
+    window and the cleanup deletes; counting them refused every teardown that
+    ran right after the probe stopped (HA-005 attempt 2: 26 COMPLETED rows,
+    3 refusals).
+    """
+
+    cursor.execute(
+        "SELECT count(*) FROM gpu_fault_processor_queue "
+        "WHERE cluster_id=ANY(%s) AND status <> 'COMPLETED'",
+        (cluster_ids,),
+    )
+    return int(cursor.fetchone()[0])
+
+
+def previous_synthetic_owner(cursor: Any, cluster_ids: list[str]) -> str | None:
+    """The run that last registered ``cluster_ids``, from the registry history.
+
+    The newest revision that registers any of them names it -- they may be a
+    subset (a 32-cluster run before a 50-cluster one). ``None`` while the head
+    registers one (its data belongs to the run registered now), when no
+    revision within ``REGISTRY_LOOKBACK`` does, or when that revision's
+    registrations of these clusters are not all one synthetic run's. Whether
+    the residue is that run's is ``drill_residue_only``'s to prove.
+    """
+
+    cursor.execute(
+        "SELECT payload FROM gpu_fault_objects "
+        "WHERE kind='regional_registry_head' AND key='current'"
+    )
+    row = cursor.fetchone()
+    if row is None:
+        return None
+    head = int(row[0]["generation"])
+    wanted = set(cluster_ids)
+    for generation in range(head, max(0, head - REGISTRY_LOOKBACK), -1):
+        cursor.execute(
+            "SELECT payload FROM gpu_fault_objects "
+            "WHERE kind='regional_registry_revision' AND key=%s",
+            (str(generation),),
+        )
+        row = cursor.fetchone()
+        if row is None:
+            return None
+        revision = RegionalRegistryRevision.model_validate(row[0])
+        mine = [item for item in revision.registrations if item.cluster_id in wanted]
+        if not mine:
+            continue
+        owners = {item.synthetic_run_id for item in mine if item.synthetic}
+        if (
+            generation == head
+            or not all(item.synthetic for item in mine)
+            or len(owners) != 1
+        ):
+            return None
+        return next(iter(owners))
+    return None
+
+
 def drop_cluster_partitions(cursor: Any, cluster_ids: list[str]) -> list[str]:
     """Drop the synthetic clusters' latest-metric partitions (schema v23).
 
@@ -392,11 +482,23 @@ def inspect_or_cleanup(
             )
             links = int(cursor.fetchone()[0])
             if not cleanup:
+                total = len(records) + links + sum(counts.values())
+                owner = previous_synthetic_owner(cursor, cluster_ids) if total else None
                 return {
                     "records": len(records),
                     "links": links,
                     **counts,
-                    "total": len(records) + links + sum(counts.values()),
+                    "total": total,
+                    # What is there and whether work is still open, for the
+                    # settle waits; whose it is, for a later registration.
+                    "by_kind": kind_counts(records),
+                    "notification_sources": notification_sources(records),
+                    "nonterminal": len(nonterminal_records(records)),
+                    "open_queue_rows": open_queue_rows(cursor, cluster_ids),
+                    "residue_owner": owner,
+                    "residue_owner_proven": bool(owner)
+                    and not sum(counts.values())
+                    and drill_residue_only(records, str(owner)),
                 }
             if (
                 not registered
@@ -406,16 +508,8 @@ def inspect_or_cleanup(
                 raise RuntimeError(
                     "capacity data has no current run-owned registration"
                 )
-            # Drained means no open work. COMPLETED rows are replay records the
-            # processor keeps for its idempotency window and this cleanup deletes
-            # below; counting them refused every teardown that ran right after
-            # the probe stopped (HA-005 attempt 2: 26 COMPLETED rows, 3 refusals).
-            cursor.execute(
-                "SELECT count(*) FROM gpu_fault_processor_queue "
-                "WHERE cluster_id=ANY(%s) AND status <> 'COMPLETED'",
-                (cluster_ids,),
-            )
-            if int(cursor.fetchone()[0]):
+            # Drained means no open work (``open_queue_rows``).
+            if open_queue_rows(cursor, cluster_ids):
                 raise RuntimeError("capacity processor queue has not drained")
             stuck = nonterminal_records(records)
             if stuck and not force_nonterminal:
@@ -480,6 +574,12 @@ def inspect_or_cleanup(
         "deleted_links": links,
         "forced_nonterminal": len(stuck),
         "dropped_partitions": dropped_partitions,
+        # What this purge removed, counts only: a later purge's attribution.
+        "deleted_by_kind": kind_counts(records),
+        "deleted_table_rows": {
+            table: count for table, count in counts.items() if count
+        },
+        "notification_sources": notification_sources(records),
     }
 
 

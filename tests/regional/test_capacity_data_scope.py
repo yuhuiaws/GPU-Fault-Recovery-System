@@ -237,3 +237,94 @@ def test_a_cleanup_that_left_data_names_it_by_kind_and_table_counts_only() -> No
     assert data.remaining_data(walked, {}, {"gpu_fault_processor_queue": 0}) == "", (
         "nothing left reports nothing"
     )
+
+
+def registration(cluster_id: str, run_id: str | None) -> Any:
+    from datetime import datetime, timedelta, timezone
+
+    from gpu_fault.regional import RegionalClusterRegistration
+
+    return RegionalClusterRegistration(
+        cluster_id=cluster_id,
+        region="us-west-2",
+        hyperpod_cluster_name=cluster_id,
+        eks_cluster_arn=f"arn:aws:eks:us-west-2:000000000000:cluster/{cluster_id}",
+        token_sha256="a" * 64,
+        agent_endpoint_allowed_cidrs=["127.0.0.1/32"],
+        synthetic=run_id is not None,
+        synthetic_run_id=run_id,
+        synthetic_expires_at=(
+            datetime.now(timezone.utc) + timedelta(hours=1) if run_id else None
+        ),
+    )
+
+
+class HistoryCursor:
+    """Answers the registry head and revision reads from a revision list."""
+
+    def __init__(self, revisions: list[list[Any]]) -> None:
+        from gpu_fault.regional import RegionalRegistryRevision
+
+        self.payloads = {
+            str(generation): RegionalRegistryRevision.build(
+                generation=generation,
+                registrations=registrations,
+                previous_generation=generation - 1 or None,
+                required_member_ids=[],
+                reason="test",
+            ).model_dump(mode="json")
+            for generation, registrations in enumerate(revisions, 1)
+        }
+        self._row: Any = None
+
+    def execute(self, query: str, params: Any = None) -> None:
+        if "regional_registry_head" in query:
+            self._row = ({"generation": len(self.payloads)},) if self.payloads else None
+        else:
+            payload = self.payloads.get(params[0])
+            self._row = (payload,) if payload is not None else None
+
+    def fetchone(self) -> Any:
+        return self._row
+
+
+@pytest.mark.parametrize(
+    ("revisions", "owner"),
+    [
+        ([[registration("perf-cap-000", "act-a")], []], "act-a"),
+        (
+            [[registration(f"perf-cap-{i:03d}", "burst-32") for i in range(2)], []],
+            "burst-32",
+        ),
+        ([[registration("perf-cap-000", "act-a")]], None),
+        (
+            [
+                [
+                    registration("perf-cap-000", "act-a"),
+                    registration("perf-cap-001", "act-b"),
+                ],
+                [],
+            ],
+            None,
+        ),
+        ([[registration("perf-cap-000", None)], []], None),
+        ([[]], None),
+    ],
+    ids=["deregistered", "subset", "registered-now", "two-runs", "production", "never"],
+)
+def test_the_registry_history_names_the_run_that_last_registered_the_clusters(
+    revisions: list[list[Any]], owner: str | None
+) -> None:
+    wanted = ["perf-cap-000", "perf-cap-001", "perf-cap-002"]
+
+    assert data.previous_synthetic_owner(HistoryCursor(revisions), wanted) == owner
+
+
+def test_the_registry_history_is_read_only_so_far_back() -> None:
+    revisions = [[registration("perf-cap-000", "act-old")]] + [[]] * (
+        data.REGISTRY_LOOKBACK
+    )
+
+    assert data.previous_synthetic_owner(
+        HistoryCursor(revisions), ["perf-cap-000"]
+    ) is (None), "an owner older than the lookback is no proof"

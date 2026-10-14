@@ -16,7 +16,12 @@ from uuid import uuid4
 import pytest
 
 from gpu_fault.app import ApplicationContext
-from gpu_fault.models import FaultIncident, IncidentState, WorkflowStatus
+from gpu_fault.models import (
+    AdvisoryNotification,
+    FaultIncident,
+    IncidentState,
+    WorkflowStatus,
+)
 from gpu_fault.regional import RegionalClusterRegistration, RegionalRegistryRevision
 from gpu_fault.state_table_migrate import backfill_state_table, set_state_table_mode
 from gpu_fault.store import NotFoundError, PostgresStore
@@ -604,3 +609,107 @@ def test_capacity_cleanup_names_what_a_racing_writer_left_and_deletes_nothing(
     assert store.get_workflow(workflow_id).status is WorkflowStatus.SUCCEEDED, (
         "the refused cleanup is one transaction and deletes nothing"
     )
+
+
+def deregister_capacity_clusters(store: PostgresStore) -> None:
+    """The run's teardown: the next revision no longer names its clusters."""
+
+    store.publish_regional_registry_revision(
+        RegionalRegistryRevision.build(
+            generation=2,
+            registrations=[],
+            previous_generation=1,
+            required_member_ids=[],
+            reason="capacity helper SQL test deregistration",
+        ),
+        expected_generation=1,
+    )
+
+
+def late_silence_advisory(store: PostgresStore, run_id: str) -> None:
+    """What the collector-silence scan writes for a run's synthetic node."""
+
+    node = f"actionperf-{run_id}-c000-w000-node-00"
+    store.save_notification_if_absent(
+        AdvisoryNotification(
+            deduplication_key=f"collector-silent/perf-cap-000/{node}/GPU_METRICS/1",
+            cluster_name="perf-cap-000",
+            incident_id=f"collector-silent-{node}",
+            subject="collector silent",
+            body_text="collector silent",
+            support_case_draft="check the collector",
+        )
+    )
+
+
+def test_capacity_probe_names_an_earlier_runs_drill_residue_for_its_purge(
+    database: tuple[str, PostgresStore],
+) -> None:
+    """Live 2026-10-14: drill advisories of a deregistered action run were found
+    by the next registration. The probe names the run the registry history last
+    registered the clusters for, proves the residue is that run's drill residue
+    and that run's own purge then removes it."""
+
+    import psycopg
+
+    url, store = database
+    publish_capacity_registry(store, [capacity_registration("perf-cap-000", "act-a")])
+    late_silence_advisory(store, "act-a")
+    with psycopg.connect(url) as connection:
+        registered = capacity_data.inspect_or_cleanup(
+            connection, run_id="corr-b", cluster_ids=["perf-cap-000"], cleanup=False
+        )
+    assert registered["residue_owner"] is None, (
+        "while the head registers the clusters their data is the live run's"
+    )
+    deregister_capacity_clusters(store)
+    with psycopg.connect(url) as connection:
+        found = capacity_data.inspect_or_cleanup(
+            connection, run_id="corr-b", cluster_ids=["perf-cap-000"], cleanup=False
+        )
+    assert (found["residue_owner"], found["residue_owner_proven"]) == ("act-a", True)
+    assert found["by_kind"] == {"notification": 1, "notification_delivery": 1}
+    assert found["notification_sources"] == {"collector-silent": 1}
+    assert (found["links"], found["nonterminal"], found["open_queue_rows"]) == (
+        1,
+        0,
+        0,
+    ), "the deduplication link, no open work"
+    with psycopg.connect(url) as connection:
+        removed = capacity_data.inspect_or_cleanup(
+            connection, run_id="act-a", cluster_ids=["perf-cap-000"], cleanup=True
+        )
+    assert removed["deleted_by_kind"] == found["by_kind"]
+    assert removed["notification_sources"] == {"collector-silent": 1}
+    with psycopg.connect(url) as connection:
+        assert (
+            capacity_data.inspect_or_cleanup(
+                connection, run_id="corr-b", cluster_ids=["perf-cap-000"], cleanup=False
+            )["total"]
+            == 0
+        ), "the next registration finds the clusters empty"
+
+
+def test_capacity_probe_does_not_prove_residue_that_is_not_drill_residue(
+    database: tuple[str, PostgresStore],
+) -> None:
+    import psycopg
+
+    url, store = database
+    publish_capacity_registry(store, [capacity_registration("perf-cap-000", "act-a")])
+    deregister_capacity_clusters(store)
+    late_silence_advisory(store, "act-a")
+    capacity_pair(store, "late-act-a", "perf-cap-000")
+    with psycopg.connect(url) as connection:
+        found = capacity_data.inspect_or_cleanup(
+            connection, run_id="corr-b", cluster_ids=["perf-cap-000"], cleanup=False
+        )
+    assert found["residue_owner"] == "act-a", "the history still names the run"
+    assert found["residue_owner_proven"] is False, (
+        "an incident and its workflow are no drill residue"
+    )
+    with psycopg.connect(url) as connection:
+        with pytest.raises(RuntimeError, match="no current run-owned registration"):
+            capacity_data.inspect_or_cleanup(
+                connection, run_id="act-a", cluster_ids=["perf-cap-000"], cleanup=True
+            )

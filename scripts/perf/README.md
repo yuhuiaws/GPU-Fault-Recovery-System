@@ -61,7 +61,12 @@ log prints `recovery command: ...`, one line that runs
 (integrated and correlated runs: the directory under `_aborted/`). A purge whose
 final read still finds the run's data deletes nothing; its error counts what is
 left per record kind (appeared after its walk / still present from it) and per
-table, without keys or payloads. Every suite's
+table, without keys or payloads. The purge waits for the run's data to settle
+first and probes again 30 s after it, purging what landed late (a
+collector-silence scan that read the run's Agents before the commit), at most
+three more times, each one logged by kind; a registration adopts residue only
+when it is provably an earlier run's drill residue and runs that run's purge
+(`regional_capacity_settle.py`). Every suite's
 `run.json` carries the resume fields that command checks. A standalone
 `register` command requires `--keep-registration`, a shared `--suite-id`, and
 must be followed by `run` or `teardown`. Separate `run`, `purge`, and `teardown`

@@ -240,8 +240,10 @@ class CallerHarness:
             # The run's synthetic Agent heartbeat refresh (seed script mode).
             self.events.append("heartbeat")
             return json.dumps({"run_id": "run-a", "agents_refreshed": 1})
-        self.events.append("purge")
-        self.requests.append(json.loads(args[-1]))
+        request = json.loads(args[-1])
+        # The shared purge probes the run's data before it deletes it.
+        self.events.append("purge" if request["cleanup"] else "probe")
+        self.requests.append(request)
         if self.data_error is not None:
             raise self.data_error
         return json.dumps(self.data_result)
@@ -432,14 +434,21 @@ def test_callers_create_labelled_receipts_and_pass_them_to_teardown(
             "run_id": "run-a",
         }
     ]
+    cluster_ids = [f"perf-cap-{index:03d}" for index in range(32)]
     assert caller.requests == [
         {
             "run_id": "run-a",
-            "cluster_ids": [f"perf-cap-{index:03d}" for index in range(32)],
+            "cluster_ids": cluster_ids,
+            "cleanup": False,
+            "force_nonterminal": False,
+        },
+        {
+            "run_id": "run-a",
+            "cluster_ids": cluster_ids,
             "cleanup": True,
             "force_nonterminal": True,
-        }
-    ]
+        },
+    ], "the purge settles on a probe of the run's data first"
     deleted = [
         event
         for event in caller.events
@@ -557,6 +566,7 @@ def test_registration_lost_ack_or_interrupt_uses_persisted_intent(
     assert caller.events == [
         "register",
         "teardown",
+        "probe",
         "purge",
         "revoke",
         f"delete:secret/{registry.TOKEN_SECRET}",
@@ -718,10 +728,11 @@ def test_retained_purge_stops_resources_before_exact_data_cleanup(
         {
             "run_id": "run-a",
             "cluster_ids": ["perf-cap-000"],
-            "cleanup": True,
-            "force_nonterminal": True,
+            "cleanup": cleanup,
+            "force_nonterminal": cleanup,
         }
-    ]
+        for cleanup in (False, True)
+    ], "the probe that settles the run's data, then the exact purge"
     assert "revoke" not in caller.events
 
 
