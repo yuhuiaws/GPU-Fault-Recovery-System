@@ -23,7 +23,8 @@ else:
 
 
 ROOT = Path(__file__).resolve().parents[1]
-# A repository module that an identity input imports is an identity input too
+# A repository file that an identity input imports or runs, by path or through
+# a make target, is an identity input too
 # (tests/test_deploy_identity_import_closure.py).
 DEPLOY_HOST_ORCHESTRATION_INPUTS = (
     "src/gpu_fault/admin/node_key_custody*.py",
@@ -64,6 +65,33 @@ DEPLOY_HOST_ORCHESTRATION_INPUTS = (
     "scripts/staging_state_hygiene.py",
     "tools/coverage_objectives.py",
     "tools/pytest_result_identity.py",
+    # What the inputs above run, and what those scripts import: the release
+    # engine's data-plane verifier and AMP installer, the deploy's gates and
+    # their make targets, and the Makefile that holds those targets.
+    "Makefile",
+    "deploy/dataplane/tools/verify_dataplane_executor.py",
+    "deploy/observability/install-amp-monitoring.sh",
+    "scripts/build-fault-evidence-index.py",
+    "scripts/build-grafana-dashboards.py",
+    "scripts/build-regional-case-index.py",
+    "scripts/check-*.py",
+    "scripts/doc_inventory.py",
+    "scripts/generate-cleanup-inventory.py",
+    "scripts/generate-env-reference.py",
+    "scripts/grafana_dashboard_catalog.py",
+    "scripts/grafana_dashboard_review_panels.py",
+    "scripts/postgres_shard_receipts.py",
+    "scripts/postgres_shard_worker.py",
+    "scripts/restore_ci_candidate.py",
+    "scripts/run_postgres_shards.py",
+    "scripts/select-affected-tests.py",
+    "scripts/verify-regional-alerting.py",
+    "scripts/verify-release-attestation.py",
+    "tools/case_scheduler.py",
+    "tools/generate_nvidia_xid_policy.py",
+    "tools/pytest_case_reporter.py",
+    "tools/regional_native_prerequisites.py",
+    "tools/run_fault_test_cases.py",
 )
 APPLICATION_IDENTITY_PROTOCOL_INPUTS = (
     "config/release-identity.yaml",
