@@ -4,15 +4,18 @@ import base64
 import json
 import logging
 import time
-from concurrent.futures import Future
+from collections.abc import Callable
+from concurrent.futures import Future, ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from threading import Event, Lock, RLock
 from typing import Any, Protocol
 
 from gpu_fault.channel_registry import (
     ATTEMPT_COVERAGE_PATH,
+    BATCHABLE_CHANNEL_PATHS,
     WORKLOAD_OBSERVATIONS_PATH,
 )
+from gpu_fault.processor.batching import telemetry_batch_size
 from gpu_fault.processor.completion_signals import ProcessorCompletionSignals
 from gpu_fault.processor.models import ProcessorRequest
 
@@ -132,6 +135,7 @@ class ProcessorCoordinatorStore(Protocol):
 
 
 class ProcessorLaneRuntimeMixin:
+    _OBSERVATION_BATCH_SIZE: int
     _claimed_not_started: dict[str, ProcessorRequest]
     _claimed_not_started_released_total: int
     _in_flight: dict[str, Any]
@@ -149,6 +153,10 @@ class ProcessorLaneRuntimeMixin:
     observation_stale_seconds: float
     _completion_failure_releases_total: int
     _retry_horizon_failures_total: int
+    _pool_for_request: Callable[[ProcessorRequest], str]
+    _process: Callable[[ProcessorRequest], None]
+    _process_observation_batch: Callable[[list[ProcessorRequest]], None]
+    _process_telemetry_batch: Callable[[list[ProcessorRequest]], None]
 
     def _configure_retry_backoff(
         self,
@@ -331,6 +339,72 @@ class ProcessorLaneRuntimeMixin:
         with self._state_lock:
             for request in requests:
                 self._claimed_not_started[request.request_id] = request
+
+    def _dispatch_claimed(
+        self,
+        requests: list[ProcessorRequest],
+        pools: dict[str, ThreadPoolExecutor],
+        futures: dict[str, set[Future[Any]]],
+        available: dict[str, int],
+    ) -> None:
+        """Start the workers of claimed rows while their pools have
+        ``available`` slots; the rest go back to PENDING. Observation rows run
+        in batches of ``_OBSERVATION_BATCH_SIZE``, batchable telemetry in its
+        path's batches. A claim cycle calls it twice with one ``available``:
+        for the fault stream's rows the moment their sub-claim returns -- a
+        P10 worker does not wait for the cycle's observation and evidence
+        claims -- and for the other rows once those are done.
+        """
+
+        self.register_claimed_requests(requests)
+        observation_requests: list[ProcessorRequest] = []
+        telemetry_requests: dict[tuple[str, str], list[ProcessorRequest]] = {}
+        for item in requests:
+            pool_name = self._pool_for_request(item)
+            if pool_name == "observation":
+                observation_requests.append(item)
+                continue
+            if pool_name in {"gpu", "host"} and item.path in BATCHABLE_CHANNEL_PATHS:
+                telemetry_requests.setdefault((pool_name, item.path), []).append(item)
+                continue
+            if available[pool_name] <= 0:
+                self._release(item)
+                continue
+            futures[pool_name].add(pools[pool_name].submit(self._process, item))
+            available[pool_name] -= 1
+        while observation_requests:
+            batch = observation_requests[: self._OBSERVATION_BATCH_SIZE]
+            del observation_requests[: len(batch)]
+            if available["observation"] <= 0:
+                for item in batch:
+                    self._release(item)
+                continue
+            futures["observation"].add(
+                pools["observation"].submit(
+                    self._process_observation_batch,
+                    batch,
+                )
+            )
+            available["observation"] -= 1
+        for (
+            pool_name,
+            path,
+        ), pending in telemetry_requests.items():
+            batch_size = telemetry_batch_size(path)
+            while pending:
+                batch = pending[:batch_size]
+                del pending[: len(batch)]
+                if available[pool_name] <= 0:
+                    for item in batch:
+                        self._release(item)
+                    continue
+                futures[pool_name].add(
+                    pools[pool_name].submit(
+                        self._process_telemetry_batch,
+                        batch,
+                    )
+                )
+                available[pool_name] -= 1
 
     def release_unstarted_claims(self) -> None:
         with self._state_lock:

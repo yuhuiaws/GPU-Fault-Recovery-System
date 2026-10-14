@@ -14,7 +14,6 @@ from urllib import error as urllib_error
 from urllib import request as urllib_request
 
 from gpu_fault.channel_registry import (
-    BATCHABLE_CHANNEL_PATHS,
     GPU_INVENTORY_PATH,
     GPU_METRICS_PATH,
     HOST_TELEMETRY_PATH,
@@ -30,7 +29,6 @@ from gpu_fault.processor.batching import (
     GPU_INVENTORY_BATCH_SIZE,
     GPU_METRICS_BATCH_SIZE,
     HOST_TELEMETRY_BATCH_SIZE,
-    telemetry_batch_size,
 )
 from gpu_fault.processor.lane_runtime import ProcessorLaneRuntimeMixin, SlotWake
 from gpu_fault.processor.metrics import ProcessorMetricsMixin
@@ -758,6 +756,9 @@ class ProcessorCoordinator(
                 requests = self._claim_active_by_pool(
                     available,
                     lease_duration=timedelta(seconds=lease_seconds),
+                    dispatch=lambda rows: self._dispatch_claimed(
+                        rows, pools, futures, available
+                    ),
                 )
             else:
                 # Guarded above: without active consumers a missing
@@ -771,60 +772,7 @@ class ProcessorCoordinator(
                     limit=total_available,
                 )
                 self._claim_saturated = len(requests) >= total_available
-            self.register_claimed_requests(requests)
-            observation_requests = []
-            telemetry_requests: dict[tuple[str, str], list[ProcessorRequest]] = {}
-            for item in requests:
-                pool_name = self._pool_for_request(item)
-                if pool_name == "observation":
-                    observation_requests.append(item)
-                    continue
-                if (
-                    pool_name in {"gpu", "host"}
-                    and item.path in BATCHABLE_CHANNEL_PATHS
-                ):
-                    telemetry_requests.setdefault((pool_name, item.path), []).append(
-                        item
-                    )
-                    continue
-                if available[pool_name] <= 0:
-                    self._release(item)
-                    continue
-                futures[pool_name].add(pools[pool_name].submit(self._process, item))
-                available[pool_name] -= 1
-            while observation_requests:
-                batch = observation_requests[: self._OBSERVATION_BATCH_SIZE]
-                del observation_requests[: len(batch)]
-                if available["observation"] <= 0:
-                    for item in batch:
-                        self._release(item)
-                    continue
-                futures["observation"].add(
-                    pools["observation"].submit(
-                        self._process_observation_batch,
-                        batch,
-                    )
-                )
-                available["observation"] -= 1
-            for (
-                pool_name,
-                path,
-            ), pending in telemetry_requests.items():
-                batch_size = telemetry_batch_size(path)
-                while pending:
-                    batch = pending[:batch_size]
-                    del pending[: len(batch)]
-                    if available[pool_name] <= 0:
-                        for item in batch:
-                            self._release(item)
-                        continue
-                    futures[pool_name].add(
-                        pools[pool_name].submit(
-                            self._process_telemetry_batch,
-                            batch,
-                        )
-                    )
-                    available[pool_name] -= 1
+                self._dispatch_claimed(requests, pools, futures, available)
             for item in requests:
                 LOGGER.info(
                     "processor request claimed "
@@ -856,6 +804,7 @@ class ProcessorCoordinator(
         available: dict[str, int],
         *,
         lease_duration: timedelta,
+        dispatch: Callable[[list[ProcessorRequest]], None] | None = None,
     ) -> list[ProcessorRequest]:
         now = datetime.now(timezone.utc)
         claimed: list[ProcessorRequest] = []
@@ -971,6 +920,8 @@ class ProcessorCoordinator(
             exclude_paths=dedicated_paths or None,
         )
         claimed.extend(fault_requests)
+        if dispatch is not None:  # fault workers start now, not after 7 more claims
+            dispatch(fault_requests)
         fault_pressure_active = self._processor_fault_pressure_active or bool(
             fault_requests
         )
@@ -1042,6 +993,8 @@ class ProcessorCoordinator(
                 ),
             ),
         )
+        if dispatch is not None:
+            dispatch(claimed[len(fault_requests) :])
         return claimed
 
     def _pool_for_request(self, item: ProcessorRequest) -> str:

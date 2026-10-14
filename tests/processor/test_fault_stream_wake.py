@@ -618,6 +618,7 @@ def test_a_lane_blocked_fault_row_keeps_the_fault_busy_ceiling(
 
 
 ALL_SLOTS_FREE = {"fault": 1, "observation": 0, "gpu": 1, "host": 1}
+ALL_POOLS = ("fault", "observation", "gpu", "host")
 
 
 def _lane_round(processor: ProcessorCoordinator, *, fault_backed_off: bool) -> Any:
@@ -789,6 +790,77 @@ def test_the_busy_rounds_after_a_fault_claim_leave_telemetry_its_slots(
     assert processor._stream_idle_interval["fault"] == pytest.approx(0.1), (
         "busy pools hold the fault stream at its busy ceiling"
     )
+
+
+class _SlowFirstDedicatedClaim:
+    """A store whose first claim naming its paths -- an observation or evidence
+    sub-claim -- takes ``seconds``, as one does behind a lane lock or a busy
+    writer; it notes when the fault stream's claim returned each row."""
+
+    def __init__(self, store: Any, seconds: float) -> None:
+        self._store, self._seconds = store, seconds
+        self.fault_claimed_at: dict[str, float] = {}
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._store, name)
+
+    def claim_active_processor_requests(self, *args: Any, **kwargs: Any) -> Any:
+        dedicated = kwargs.get("include_paths") is not None
+        if dedicated and self._seconds:
+            time.sleep(self._seconds)
+            self._seconds = 0.0
+        rows = self._store.claim_active_processor_requests(*args, **kwargs)
+        if not dedicated:
+            self.fault_claimed_at.update(
+                {row.request_id: time.monotonic() for row in rows}
+            )
+        return rows
+
+
+def test_a_fault_row_starts_without_waiting_for_the_cycles_other_claims(
+    sqlite_store: SqliteStore,
+) -> None:
+    """The fault stream claims first in a cycle, but its rows used to start
+    only once the cycle's observation and evidence sub-claims had returned --
+    up to seven more claim statements, ~1 s each under load. A P10 worker now
+    starts the moment the fault claim returns; the slow claim still runs."""
+
+    store = _SlowFirstDedicatedClaim(sqlite_store, seconds=1.0)
+    nk = sqlite_store.enqueue_processor_request(
+        _node_lane_row(NVIDIA_KERNEL_PATH, xid=79)
+    )
+    processor = ProcessorCoordinator(
+        store,
+        owner_id="pod-a:1",
+        internal_token="token-" + "x" * 32,
+        local_url="http://127.0.0.1:1",
+        pools=ProcessorPoolSettings(
+            fault_worker_count=1,
+            observation_worker_count=1,
+            gpu_telemetry_worker_count=1,
+            host_telemetry_worker_count=1,
+        ),
+        lease=ProcessorLeaseSettings(poll_seconds=0.1),
+        active_consumers=True,
+    )
+    started: dict[str, float] = {}
+    processor._process = lambda item: started.setdefault(  # type: ignore[method-assign]
+        item.request_id, time.monotonic()
+    )
+    pools: dict[str, Any] = {
+        "observation": _HeldPool(),
+        "gpu": _HeldPool(),
+        "host": _HeldPool(),
+    }
+    futures: dict[str, set[Future[Any]]] = {name: set() for name in ALL_POOLS}
+    began = time.monotonic()
+    with ThreadPoolExecutor(max_workers=1) as fault_pool:
+        pools["fault"] = fault_pool
+        processor._run_processor_cycle(pools, futures)
+
+    assert time.monotonic() - began >= 1.0, "the cycle ran its slow claim"
+    latency = started[nk.request_id] - store.fault_claimed_at[nk.request_id]
+    assert latency <= 0.05, f"the P10 worker started {latency:.3f} s after its claim"
 
 
 def test_a_backlog_the_store_cannot_count_keeps_the_fault_stream_polling(

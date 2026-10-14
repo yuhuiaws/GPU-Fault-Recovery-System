@@ -2679,6 +2679,14 @@ candidate; `tests/store/test_postgres_claim_planner_discipline.py` pins it as an
 the lane probe reports such a row as lane-blocked. Workload observations are exempt: the observation interlock runs them
 ahead of the correlated faults they share attempt lanes with, and the guard would hold both.
 
+A claim cycle runs the fault stream's sub-claim first and then those of the observation and evidence pools -- up to
+seven more claim statements. The fault rows go to their workers the moment their sub-claim returns, not when the cycle
+ends: a P10 worker used to wait for all of them, so a claim slowed by load or by a held lock delayed every fault row of
+its cycle (local Postgres, claim transactions held 0.3 s, 24 coordinators: P10 claim-to-start p50/p95
+0.63-1.29/1.24-1.66 s before, 1-5/3-39 ms after; `tests/processor/test_fault_stream_wake.py`: with one 1 s evidence
+claim in the cycle the P10 worker starts within 50 ms of its claim, 1.0 s before). The other rows start when the cycle
+ends, as before, and the cycle's wait and backoff decisions still see every claim of the cycle.
+
 The same completion batch is first grouped by cluster, and each group is still committed in an independent PostgreSQL transaction.
 `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY` controls whether different cluster groups run in parallel;
 the legal range is `1..min(8, pool_max_size)`; the production value is 1. Values 2/4 are only rolled out gradually after CAP-005's real
