@@ -3655,8 +3655,12 @@ twice (`test_a_restart_between_drain_and_revoke_resumes_on_postgres`). An incide
 only when those nodes are proven departed in the **same** cycle. Every case not ended has a bounded `kind` (also the
 `reason` label of `gpu_fault_departed_node_cleanup_refusals_total`) and a manual command, in two groups -- "waiting"
 (`PENDING`, resolving by itself) and "left to the operator" (`REFUSED`) -- tabled in §10.1.1 of administrator operations; a
-workflow that changed a node or has a remote command, a spare declaration and anything on a cluster that is not
-`ACTIVE` are only ever reported.
+workflow that changed a node or has a remote command and anything on a cluster that is not `ACTIVE` are only ever
+reported. A spare's records end as usual and its declaration on the deploy host is only reported (`DECLARED_SPARE`,
+which once seen stays with the departure by its instance): `config spare --release` releases only the record of a
+provably departed node (`admin/warm_spare_departed.py`, skipping the unlabel and uncordon that need the Node and saying
+why) and writes a `DepartedNodeSpareRelease` in the Pod (a generic `gpu_fault_objects` kind written by the administrator
+alone); the cleanup takes a release of the same node and instance as the answer to that finding.
 
 **Ledger and observability.** `DepartedNodeCleanupRecord` (a generic `gpu_fault_objects` kind), one line per node,
 rewritten when the verdict changes or 10 min after the last write; a `CLEANED` line stays 7 days and is deleted when the

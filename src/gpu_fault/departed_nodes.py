@@ -388,5 +388,31 @@ class DepartedNodeCleanupRecord(StrictModel):
         return departed_node_cleanup_key(self.cluster_id, self.node_id)
 
 
+class DepartedNodeSpareRelease(StrictModel):
+    """An administrator released the warm-spare declaration of a departed node.
+
+    The declaration is the deploy host's (``<state-dir>/warm-spares/<node>.json``;
+    the label and the cordon left with the Node), so the departed-node cleanup
+    can only report it. ``gpu-fault-admin config spare --release`` writes this
+    once it proved the node gone and released the record; the cleanup then
+    takes the spare finding of that departure -- the same node and instance --
+    as answered.
+    """
+
+    cluster_id: str
+    node_id: str
+    instance_id: str
+    change_reference: str
+    actor: str
+    released_at: datetime
+    #: ``released``: a gpu-fault-admin declaration record was released;
+    #: ``none``: the node carried the spare label without one.
+    declaration: str
+
+    @property
+    def key(self) -> str:
+        return departed_node_cleanup_key(self.cluster_id, self.node_id)
+
+
 def departed_node_cleanup_key(cluster_id: str, node_id: str) -> str:
     return f"{cluster_id}/{node_id}"

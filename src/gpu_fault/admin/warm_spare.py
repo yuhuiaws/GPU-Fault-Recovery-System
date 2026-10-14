@@ -32,6 +32,11 @@ leaves a record without ``declared_state``; the next declaration supersedes
 it, keeping it as history inside the new record, instead of demanding a
 ``--release`` of nothing.
 
+A spare the cluster no longer has -- a spot reclaim, a scale-in or a provider
+replacement took it -- has nothing left to restore: the label and the cordon
+went with the Node. ``--release`` then proves it departed and releases only
+the record (``warm_spare_departed``); an unproven departure is refused.
+
 Cluster access follows the other admin verbs: ``kubectl`` bound to the site's
 GPU kubeconfig and the cluster's context. The access object exposes the three
 ``CoreV1Api`` method names the flow uses, so a test -- or a Kubernetes client
@@ -112,16 +117,27 @@ MODES = ("check", "declare", "release")
 # a fresh read, at most this many attempts in total.
 PATCH_ATTEMPTS = 3
 CONFLICT_PATTERN = re.compile(r"the object has been modified|\(Conflict\)")
+# ``kubectl get node <name>`` for a Node the cluster does not have prints
+# ``Error from server (NotFound): nodes "<name>" not found``.
+NOT_FOUND_PATTERN = re.compile(r"\(NotFound\)")
 
 # Runs inside a CPU ingress Pod: the only place the Store is reachable from an
 # administrator command. Prints one JSON object; a missing Agent is a result,
-# not an error, so the caller can tell "no Agent" from "no Store".
+# not an error, so the caller can tell "no Agent" from "no Store". The
+# heartbeat, the lease and the Pod's clock are what a departed spare's release
+# judges the Agent on (``warm_spare_departed``).
 AGENT_SCRIPT = """
 import json
 import sys
+from datetime import datetime, timezone
 
 from gpu_fault.app import ApplicationContext
 from gpu_fault.store import NotFoundError
+
+
+def stamp(value):
+    return value.isoformat() if value is not None else None
+
 
 payload = json.load(sys.stdin)
 store = ApplicationContext.from_environment().store
@@ -130,12 +146,27 @@ try:
 except NotFoundError:
     print(json.dumps({"found": False}))
 else:
-    print(json.dumps({"found": True, "lifecycle_state": str(agent.lifecycle_state)}))
+    print(
+        json.dumps(
+            {
+                "found": True,
+                "lifecycle_state": str(agent.lifecycle_state),
+                "last_seen_at": stamp(agent.last_seen_at),
+                "lease_expires_at": stamp(agent.lease_expires_at),
+                "node_instance_id": agent.node_instance_id,
+                "evaluated_at": datetime.now(timezone.utc).isoformat(),
+            }
+        )
+    )
 """
 
 
 class WarmSpareError(BootstrapError):
     """A refusal or failure of the warm-spare flow; reported on one line."""
+
+
+class WarmSpareNodeMissing(WarmSpareError):
+    """``kubectl get node`` answered ``NotFound``: the cluster has no such Node."""
 
 
 class WarmSpareConflict(WarmSpareError):
@@ -167,9 +198,34 @@ class AgentState:
 
     lifecycle_state: str | None
     error: str | None = None
+    last_seen_at: str | None = None
+    lease_expires_at: str | None = None
+    node_instance_id: str | None = None
+    #: The Pod's clock when it read the record.
+    evaluated_at: str | None = None
 
 
 AgentLookup = Callable[[str, str], AgentState]
+
+
+class DepartedSpares(Protocol):
+    """The release of a spare the cluster no longer has.
+
+    Implemented, and bound to the managed site, by ``warm_spare_departed``
+    (``site_departed_spares``): it proves the node departed, releases only the
+    record and tells the control plane, or refuses.
+    """
+
+    def release(
+        self,
+        request: WarmSpareRequest,
+        *,
+        cluster_id: str,
+        record: Path,
+        agent_lookup: AgentLookup,
+        actor: str | None,
+        provider: str | None,
+    ) -> dict[str, Any]: ...
 
 
 @dataclass(frozen=True)
@@ -199,6 +255,12 @@ class KubectlNodeApi:
         )
         if completed.returncode:
             failed = f"kubectl {' '.join(arguments[:3])} failed: "
+            if arguments[:2] == ("get", "node") and NOT_FOUND_PATTERN.search(
+                completed.stderr or ""
+            ):
+                raise WarmSpareNodeMissing(
+                    failed + "the cluster has no such Node (NotFound)"
+                )
             if arguments[:1] == ("patch",) and CONFLICT_PATTERN.search(
                 completed.stderr or ""
             ):
@@ -853,7 +915,18 @@ def control_plane_agent_lookup(site: RenderedSite) -> AgentLookup:
             return AgentState(lifecycle_state=None, error=str(exc))
         if not result.get("found"):
             return AgentState(lifecycle_state=None)
-        return AgentState(lifecycle_state=str(result.get("lifecycle_state")))
+
+        def text(name: str) -> str | None:
+            value = result.get(name)
+            return str(value) if value not in (None, "") else None
+
+        return AgentState(
+            lifecycle_state=str(result.get("lifecycle_state")),
+            last_seen_at=text("last_seen_at"),
+            lease_expires_at=text("lease_expires_at"),
+            node_instance_id=text("node_instance_id"),
+            evaluated_at=text("evaluated_at"),
+        )
 
     return lookup
 
@@ -941,6 +1014,7 @@ def perform_warm_spare(
     agent_lookup: AgentLookup,
     actor: str | None = None,
     provider: str | None = None,
+    departed: DepartedSpares | None = None,
 ) -> dict[str, Any]:
     """Check, declare or release against ``api``; the report is the result.
 
@@ -948,18 +1022,37 @@ def perform_warm_spare(
     record directory (:func:`run_warm_spare`); the acceptance wrapper binds it
     to a site profile and its ``--baseline`` file. ``actor`` defaults to the
     operator's STS identity and is resolved only when something is written.
+    A release of a node the cluster no longer has goes through ``departed``
+    (``warm_spare_departed.release_departed_spare``); without it, refused.
     """
 
     if request.mode not in MODES:
         raise WarmSpareError(f"unknown warm-spare mode {request.mode!r}")
-    report = survey(
-        api,
-        node=request.node,
-        fault_node=request.fault_node,
-        cluster_id=cluster_id,
-        agent_lookup=agent_lookup,
-        provider=provider,
-    )
+    try:
+        report = survey(
+            api,
+            node=request.node,
+            fault_node=request.fault_node,
+            cluster_id=cluster_id,
+            agent_lookup=agent_lookup,
+            provider=provider,
+        )
+    except WarmSpareNodeMissing:
+        if request.mode != "release":
+            raise
+        if departed is None:
+            raise WarmSpareError(
+                "node cannot be released: node is not in the cluster and this "
+                "release cannot prove it departed"
+            ) from None
+        return departed.release(
+            request,
+            cluster_id=cluster_id,
+            record=record,
+            agent_lookup=agent_lookup,
+            actor=actor,
+            provider=provider,
+        )
     report["mode"] = request.mode
     report["record"] = str(record)
     if request.mode == "release":
@@ -1014,6 +1107,7 @@ def run_warm_spare(
     *,
     api: NodeApi | None = None,
     agent_lookup: AgentLookup | None = None,
+    departed: DepartedSpares | None = None,
 ) -> dict[str, Any]:
     """The managed-site binding: the cluster, kubectl, Store channel and record
     directory all come from the site and the state directory."""
@@ -1032,6 +1126,7 @@ def run_warm_spare(
         # The site's provider for the cluster; absent (a site rendered before
         # plain-EKS support) means HyperPod, as everywhere in the release.
         provider=cluster_provider(target.get("provider")).value,
+        departed=departed,
     )
 
 
@@ -1113,12 +1208,23 @@ def run_config_spare_command(
     site: RenderedSite,
     api: NodeApi | None = None,
     agent_lookup: AgentLookup | None = None,
+    departed_for: Callable[[RenderedSite], DepartedSpares] | None = None,
 ) -> int:
-    """Print the report; exit 1 when a read-only check finds refusals."""
+    """Print the report; exit 1 when a read-only check finds refusals.
+
+    ``departed_for`` binds the release of a spare the cluster no longer has
+    to the site the command runs against (``warm_spare_departed``).
+    """
 
     request = spare_request(arguments)
     if request.mode == "check":
-        report = run_warm_spare(site, request, api=api, agent_lookup=agent_lookup)
+        report = run_warm_spare(
+            site,
+            request,
+            api=api,
+            agent_lookup=agent_lookup,
+            departed=departed_for(site) if departed_for is not None else None,
+        )
     else:
         _confirmed(request)
         _approved_reference(request)
@@ -1126,6 +1232,12 @@ def run_config_spare_command(
         # rollout is exactly the kind of concurrent site change it exists for.
         with administrator_operation_lock(request.state_dir):
             site = reload_site_for_mutation(site)
-            report = run_warm_spare(site, request, api=api, agent_lookup=agent_lookup)
+            report = run_warm_spare(
+                site,
+                request,
+                api=api,
+                agent_lookup=agent_lookup,
+                departed=departed_for(site) if departed_for is not None else None,
+            )
     print(json.dumps(report, indent=2, sort_keys=True, default=str))
     return 0 if report["ready"] else 1

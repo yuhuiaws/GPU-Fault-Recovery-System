@@ -27,9 +27,11 @@ All three, judged by the rule ``workflow-reconcile`` judges with
 (``departed_nodes``), make a node proven departed; only then are its records
 ended, each through the CLI's own path (``departed_node_cleanup_actions``).
 What is not the cleanup's to end -- a workflow that changed a node or has a
-remote command, a QUARANTINED incident, a declared spare, an incident naming a
-node that is still present, anything on a cluster the registry does not hold
-``ACTIVE`` -- is reported instead: one ledger line per node
+remote command, an incident naming a node that is still present, anything on
+a cluster the registry does not hold ``ACTIVE``, and a departed spare's
+declaration (the deploy host's record, released by ``config spare --release``,
+which answers the finding with a ``DepartedNodeSpareRelease``) -- is reported
+instead: one ledger line per node
 (``DepartedNodeCleanupRecord``, read by ``gpu-fault-admin status``), one
 notification naming the node and the exact administrator command, and the
 refusal counter. A cleaned node gets one informational notification.
@@ -82,6 +84,7 @@ from gpu_fault.departed_nodes import (
     RETIREABLE_LIFECYCLES,
     DepartedNodeCleanupRecord,
     DepartedNodeCleanupStatus,
+    DepartedNodeSpareRelease,
     agent_retirement_reasons,
     cluster_provider_of,
     ec2_state_blocker,
@@ -294,12 +297,18 @@ class DepartedNodeCleanup:
             record.node_id: record
             for record in self.store.list_departed_node_cleanups(cluster_id)
         }
+        releases = {
+            item.node_id: item
+            for item in self.store.list_departed_node_spare_releases(cluster_id)
+        }
         listed = None if inventory is None else frozenset(inventory.node_names)
         for node_id in sorted(existing):
             if listed is not None and node_id in listed:
                 # The node is in Kubernetes again (it never left, or the name
                 # came back with a new instance): not a departure any more.
                 self.store.delete_departed_node_cleanup(cluster_id, node_id)
+                if node_id in releases:
+                    self.store.delete_departed_node_spare_release(cluster_id, node_id)
                 del existing[node_id]
         candidates = self._candidates(cluster_id, inventory, agents, existing, now)
         if not candidates:
@@ -327,6 +336,11 @@ class DepartedNodeCleanup:
                     agent=proof.agent,
                     reference=proof.reference(),
                 )
+                spare = self._spare_finding(
+                    proof, existing.get(node_id), releases.get(node_id)
+                )
+                if spare is not None:
+                    outcome.blockers.append(spare)
             records.append(
                 self._ledger(registration, proof, outcome, existing.get(node_id), now)
             )
@@ -423,13 +437,6 @@ class DepartedNodeCleanup:
                 )
             if proof.kubernetes.blocker is not None:
                 proof.block(KUBERNETES_UNPROVEN, proof.kubernetes.blocker)
-            if proof.kubernetes.was_spare:
-                proof.block(
-                    DECLARED_SPARE,
-                    "node was a declared or reserved warm spare when Kubernetes "
-                    "last listed it; its declaration is the administrator's",
-                    spare_command(node_id, registration.cluster_id),
-                )
             if agent is not None and agent.lifecycle_state.value in (
                 RETIREABLE_LIFECYCLES
             ):
@@ -466,6 +473,39 @@ class DepartedNodeCleanup:
         if ready:
             self._read_provider(registration, provider, ready)
         return proofs
+
+    @staticmethod
+    def _spare_finding(
+        proof: DepartureProof,
+        previous: DepartedNodeCleanupRecord | None,
+        release: DepartedNodeSpareRelease | None,
+    ) -> Blocker | None:
+        """The departed spare's declaration, until the administrator releases it.
+
+        A spare's records are ended like any departed node's; its declaration
+        lives on the deploy host and is only reported. Once seen the finding
+        sticks to the departure (the same instance) even after the inventory
+        forgets the label, and a ``DepartedNodeSpareRelease`` for that
+        instance answers it.
+        """
+
+        declared = proof.kubernetes.was_spare or (
+            previous is not None
+            and DECLARED_SPARE in previous.blocker_classes
+            and previous.instance_id == proof.instance_id
+        )
+        if not declared:
+            return None
+        if release is not None and release.instance_id == proof.instance_id:
+            return None
+        return Blocker(
+            DECLARED_SPARE,
+            "node was a declared or reserved warm spare when Kubernetes last "
+            "listed it; its declaration on the deploy host is the "
+            "administrator's to release (the label and the cordon left with "
+            "the Node)",
+            spare_command(proof.node_id, proof.cluster_id),
+        )
 
     def _read_provider(
         self, registration: Any, provider: str, ready: list[DepartureProof]
@@ -639,6 +679,7 @@ class DepartedNodeCleanup:
             )
 
     def _prune(self, registered: set[str], now: datetime) -> None:
+        kept: set[str] = set()
         for record in self.store.list_departed_node_cleanups():
             expired = (
                 record.status is DepartedNodeCleanupStatus.CLEANED
@@ -648,6 +689,20 @@ class DepartedNodeCleanup:
             if expired or record.cluster_id not in registered:
                 self.store.delete_departed_node_cleanup(
                     record.cluster_id, record.node_id
+                )
+            else:
+                kept.add(record.key)
+        # A spare release lives as long as its ledger line, or the retention
+        # when the administrator released it before the cleanup judged it.
+        for release in self.store.list_departed_node_spare_releases():
+            if release.key in kept:
+                continue
+            if (
+                release.cluster_id not in registered
+                or now - release.released_at > self.config.cleaned_retention
+            ):
+                self.store.delete_departed_node_spare_release(
+                    release.cluster_id, release.node_id
                 )
 
     # --------------------------------------------------------------- metrics

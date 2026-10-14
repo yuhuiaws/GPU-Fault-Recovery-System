@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 
-from gpu_fault.admin import cli, warm_spare
+from gpu_fault.admin import cli, warm_spare, warm_spare_departed
 from gpu_fault.admin.command_log import ADMIN_LOG_ENVIRONMENT
 from gpu_fault.admin.site import SiteConfigError
 from gpu_fault.admin.warm_spare import (
@@ -165,6 +165,9 @@ def test_run_dispatches_config_spare_to_the_warm_spare_command(
     (call,) = calls
     assert call["site"] is site
     assert call["arguments"].node == NODE
+    assert call["departed_for"] is warm_spare_departed.site_departed_spares, (
+        "a release of a spare the cluster no longer has is bound to the site"
+    )
 
 
 def _spare_arguments(state_dir: Path, *extra: str) -> Any:
@@ -350,7 +353,7 @@ def test_a_mutating_spare_action_is_teed_into_the_admin_command_log(
     monkeypatch.setattr(
         warm_spare,
         "run_config_spare_command",
-        lambda arguments, *, site: print(f"declared {arguments.node}") or 0,
+        lambda arguments, *, site, **_kwargs: print(f"declared {arguments.node}") or 0,
     )
     monkeypatch.setattr(
         sys,

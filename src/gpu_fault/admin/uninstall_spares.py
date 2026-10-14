@@ -6,7 +6,8 @@ node itself says what to put back. The Kubernetes node cleanup therefore cannot
 release a spare, and an uninstall that left one behind would leave a cordoned
 node with the solution's label on it. The uninstall releases every unreleased
 declaration here, with the same refusals as ``config spare --release``, before
-the cleanup touches node metadata.
+the cleanup touches node metadata -- a spare the cluster no longer has included,
+when it is provably departed (``warm_spare_departed``).
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from gpu_fault.admin.warm_spare import (
     read_record,
     site_cluster,
 )
+from gpu_fault.admin.warm_spare_departed import site_departed_spares
 
 ApiFactory = Callable[[RenderedSite, Mapping[str, Any]], NodeApi]
 
@@ -91,6 +93,7 @@ def release_declared_spares(
                 record=record,
                 agent_lookup=lookup,
                 actor=actor,
+                departed=site_departed_spares(site),
             )
         except WarmSpareError as exc:
             raise BootstrapError(

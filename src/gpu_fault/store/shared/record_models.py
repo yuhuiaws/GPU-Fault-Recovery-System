@@ -32,7 +32,10 @@ def record_models() -> dict[str, type[BaseModel]]:
     as the stores always did, keeps the module graph acyclic.
     """
 
-    from gpu_fault.departed_nodes import DepartedNodeCleanupRecord
+    from gpu_fault.departed_nodes import (
+        DepartedNodeCleanupRecord,
+        DepartedNodeSpareRelease,
+    )
     from gpu_fault.fleet import (
         AgentRecord,
         FleetDeployment,
@@ -113,6 +116,7 @@ def record_models() -> dict[str, type[BaseModel]]:
         "hyperpod_node_identity": HyperPodNodeIdentity,
         "kubernetes_node_inventory": KubernetesNodeInventory,
         "departed_node_cleanup": DepartedNodeCleanupRecord,
+        "departed_node_spare_release": DepartedNodeSpareRelease,
         "hyperpod_submission": HyperPodSubmissionRecord,
         "regional_cluster": RegionalClusterRegistration,
         "regional_registry_head": RegionalRegistryHead,

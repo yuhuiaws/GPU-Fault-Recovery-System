@@ -788,6 +788,8 @@ rules:
       - tests/regional/test_departed_node_status.py
       - tests/orchestration/test_incident_closure_departed_nodes.py
       - tests/admin/test_incident_close_departed_nodes.py
+      - src/gpu_fault/admin/warm_spare_departed.py
+      - tests/admin/test_admin_warm_spare_departed.py
     pytest:
       - tests/departed_nodes
       - tests/execution/test_cluster_executor_node_inventory.py
@@ -799,6 +801,8 @@ rules:
       - tests/regional/test_release_departed_nodes.py
       - tests/orchestration/test_incident_closure_departed_nodes.py
       - tests/admin/test_incident_close_departed_nodes.py
+      - tests/admin/test_admin_warm_spare_departed.py
+      - tests/admin/test_admin_warm_spare.py
     regional_cases: []
     postgres: true
 

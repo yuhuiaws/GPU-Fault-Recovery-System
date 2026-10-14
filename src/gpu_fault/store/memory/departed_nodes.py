@@ -7,6 +7,7 @@ from threading import RLock
 
 from gpu_fault.departed_nodes import (
     DepartedNodeCleanupRecord,
+    DepartedNodeSpareRelease,
     departed_node_cleanup_key,
 )
 from gpu_fault.kubernetes_node_inventory import (
@@ -21,6 +22,7 @@ class MemoryDepartedNodeMixin:
     _lock: RLock
     _kubernetes_node_inventories: dict[str, KubernetesNodeInventory]
     _departed_node_cleanups: dict[str, DepartedNodeCleanupRecord]
+    _departed_node_spare_releases: dict[str, DepartedNodeSpareRelease]
 
     def record_kubernetes_node_inventory(
         self,
@@ -57,5 +59,27 @@ class MemoryDepartedNodeMixin:
     def delete_departed_node_cleanup(self, cluster_id: str, node_id: str) -> None:
         with self._lock:
             self._departed_node_cleanups.pop(
+                departed_node_cleanup_key(cluster_id, node_id), None
+            )
+
+    def save_departed_node_spare_release(
+        self, release: DepartedNodeSpareRelease
+    ) -> None:
+        with self._lock:
+            self._departed_node_spare_releases[release.key] = release
+
+    def list_departed_node_spare_releases(
+        self, cluster_id: str | None = None
+    ) -> list[DepartedNodeSpareRelease]:
+        with self._lock:
+            releases = list(self._departed_node_spare_releases.values())
+        return sorted(
+            (item for item in releases if cluster_id in (None, item.cluster_id)),
+            key=lambda item: (item.cluster_id, item.node_id),
+        )
+
+    def delete_departed_node_spare_release(self, cluster_id: str, node_id: str) -> None:
+        with self._lock:
+            self._departed_node_spare_releases.pop(
                 departed_node_cleanup_key(cluster_id, node_id), None
             )

@@ -4,7 +4,9 @@ A cluster's Kubernetes Node inventory is one record merged under that
 cluster's lock: the merge reads the previous record, so two executor replicas
 reporting at once must not lose each other's absences. The ledger is one
 record per departed node, written by the single cleanup that holds the
-periodic task lease.
+periodic task lease. A spare release is written by the administrator's
+``config spare --release`` alone and only read by the cleanup, so it is a
+record of its own rather than a field the cleanup would rewrite.
 """
 
 from __future__ import annotations
@@ -14,6 +16,7 @@ from typing import cast
 
 from gpu_fault.departed_nodes import (
     DepartedNodeCleanupRecord,
+    DepartedNodeSpareRelease,
     departed_node_cleanup_key,
 )
 from gpu_fault.kubernetes_node_inventory import (
@@ -32,6 +35,7 @@ from gpu_fault.store.shared.primitives import (
 
 INVENTORY_KIND = "kubernetes_node_inventory"
 CLEANUP_KIND = "departed_node_cleanup"
+SPARE_RELEASE_KIND = "departed_node_spare_release"
 
 
 class SharedDepartedNodeMixin:
@@ -83,3 +87,24 @@ class SharedDepartedNodeMixin:
     def delete_departed_node_cleanup(self, cluster_id: str, node_id: str) -> None:
         with self._statement_guard():
             self._delete(CLEANUP_KIND, departed_node_cleanup_key(cluster_id, node_id))
+
+    def save_departed_node_spare_release(
+        self, release: DepartedNodeSpareRelease
+    ) -> None:
+        with self._statement_guard():
+            self._put(SPARE_RELEASE_KIND, release.key, release)
+
+    def list_departed_node_spare_releases(
+        self, cluster_id: str | None = None
+    ) -> list[DepartedNodeSpareRelease]:
+        releases = cast(list[DepartedNodeSpareRelease], self._list(SPARE_RELEASE_KIND))
+        return sorted(
+            (item for item in releases if cluster_id in (None, item.cluster_id)),
+            key=lambda item: (item.cluster_id, item.node_id),
+        )
+
+    def delete_departed_node_spare_release(self, cluster_id: str, node_id: str) -> None:
+        with self._statement_guard():
+            self._delete(
+                SPARE_RELEASE_KIND, departed_node_cleanup_key(cluster_id, node_id)
+            )

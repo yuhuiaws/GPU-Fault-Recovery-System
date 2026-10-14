@@ -20,7 +20,11 @@ from typing import Any
 
 import pytest
 
-from gpu_fault.departed_nodes import GUARD_REASON, DepartedNodeCleanupStatus
+from gpu_fault.departed_nodes import (
+    GUARD_REASON,
+    DepartedNodeCleanupStatus,
+    DepartedNodeSpareRelease,
+)
 from gpu_fault.fleet import AgentLifecycleState
 from gpu_fault.models import (
     IncidentState,
@@ -486,8 +490,9 @@ def test_a_quarantined_incident_that_also_names_a_present_node_keeps_its_refusal
     assert store.get_incident("incident-pair").state is IncidentState.QUARANTINED
 
 
-def test_a_declared_spare_is_left_to_the_administrator() -> None:
-    store = build_store()
+def _spare_departure(store: Any) -> World:
+    """``HP_NODE`` was a declared warm spare when Kubernetes last listed it."""
+
     world_ = world(store)
     store.save_regional_cluster(registration(HP_CLUSTER))
     store.save_agent(
@@ -498,6 +503,24 @@ def test_a_declared_spare_is_left_to_the_administrator() -> None:
             HP_CLUSTER, [HP_NODE, HP_PRESENT], at=ago(minutes=minute), spares=[HP_NODE]
         )
     world_.reports_since(HP_CLUSTER, [HP_PRESENT], minutes=14)
+    return world_
+
+
+def _spare_release(instance_id: str = HP_INSTANCE) -> DepartedNodeSpareRelease:
+    return DepartedNodeSpareRelease(
+        cluster_id=HP_CLUSTER,
+        node_id=HP_NODE,
+        instance_id=instance_id,
+        change_reference="CHG-1",
+        actor="ops@example",
+        released_at=ago(seconds=1),
+        declaration="released",
+    )
+
+
+def test_a_departed_spare_is_cleaned_and_its_declaration_reported() -> None:
+    store = build_store()
+    world_ = _spare_departure(store)
 
     [record] = world_.cleanup.run_once()
 
@@ -506,8 +529,54 @@ def test_a_declared_spare_is_left_to_the_administrator() -> None:
     assert any(
         "config spare" in item and "--release" in item for item in record.admin_commands
     ), record.admin_commands
+    assert record.actions == [f"agent-retired:{HP_NODE}"], (
+        "the spare's own records end like any departed node's"
+    )
     assert store.get_agent(HP_CLUSTER, HP_NODE).lifecycle_state is (
-        AgentLifecycleState.ACTIVE
+        AgentLifecycleState.REVOKED
+    )
+
+
+def test_the_administrators_release_answers_the_spare_finding() -> None:
+    store = build_store()
+    world_ = _spare_departure(store)
+    world_.cleanup.run_once()
+
+    store.save_departed_node_spare_release(_spare_release("i-0a00000f"))
+    [other_instance] = world_.cleanup.run_once()
+    store.save_departed_node_spare_release(_spare_release())
+    [released] = world_.cleanup.run_once()
+
+    assert other_instance.blocker_classes == ["declared_spare"], (
+        "a release of another instance answers another departure"
+    )
+    assert released.status is DepartedNodeCleanupStatus.CLEANED, released.blockers
+    assert world_.notification_subjects()[-1] == (
+        f"[NOTICE][GPU node departed: records ended] {HP_CLUSTER}: {HP_NODE}"
+    )
+
+
+def test_the_spare_finding_outlives_the_inventorys_memory_of_the_label() -> None:
+    store = build_store()
+    world_ = world(store)
+    store.save_regional_cluster(registration(HP_CLUSTER))
+    start = ago(hours=25)
+    store.save_agent(
+        agent(HP_CLUSTER, HP_NODE, instance_id="node-uid-1", last_seen=start)
+    )
+    world_.report(HP_CLUSTER, [HP_NODE, HP_PRESENT], at=start, spares=[HP_NODE])
+    for minute in range(1, 31):
+        world_.report(HP_CLUSTER, [HP_PRESENT], at=start + timedelta(minutes=minute))
+    world_.cleanup.now = lambda: start + timedelta(minutes=30)
+    [first] = world_.cleanup.run_once()
+    world_.reports_since(HP_CLUSTER, [HP_PRESENT], minutes=25 * 60 - 31)
+    world_.cleanup.now = lambda: ago(seconds=0)
+
+    [second] = world_.cleanup.run_once()
+
+    assert first.blocker_classes == ["declared_spare"]
+    assert second.blocker_classes == ["declared_spare"], (
+        "the inventory forgot the label after 24 hours; the finding did not"
     )
 
 

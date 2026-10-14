@@ -16,7 +16,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Resume after an interruption | Rerun the same `deploy --state-dir ...` as is; there is no separate `resume` | REG-8.1.4, §4 |
 | Roll back to the previous committed release | `gpu-fault-admin deploy --state-dir ... --rollback` | REG-8.1.4, REG-8.2, §4 |
 | Adjust administrator configuration | `gpu-fault-admin config --state-dir ... [--file F] [--dry-run] --reference ...` | [Administrator Capacity Configuration](administrator-capacity-configuration.md) |
-| Declare/release a warm-spare GPU node (the failover target of `REPLACE_NODE`) | `gpu-fault-admin config spare --state-dir ... --node <node>` for the read-only check; add `--declare --reference ... --confirm DECLARE_WARM_SPARE_CORDON` to declare (label + cordon), `--release --reference ... --confirm RELEASE_WARM_SPARE_UNCORDON` to restore per the baseline; recorded in `<state-dir>/warm-spares/<node>.json` | Manual, "Adding an independently repaired and re-accepted node to the spare pool" |
+| Declare/release a warm-spare GPU node (the failover target of `REPLACE_NODE`) | `gpu-fault-admin config spare --state-dir ... --node <node>` for the read-only check; add `--declare --reference ... --confirm DECLARE_WARM_SPARE_CORDON` to declare (label + cordon), `--release --reference ... --confirm RELEASE_WARM_SPARE_UNCORDON` to restore per the baseline (for a node a spot reclaim or the like took out of the cluster: proves the departure, then releases only the record and acknowledges it to the control plane, §10.1.1); recorded in `<state-dir>/warm-spares/<node>.json` | Manual, "Adding an independently repaired and re-accepted node to the spare pool" |
 | Approve a pending Profile plan | The same `deploy --state-dir ... --approve-profile-plan <plan_sha256> --reference ...`; there is no separate approval verb | [Runtime Profile Change Approval](administrator-profile-change-approval.md) |
 | The registration cluster left the site and deploy refuses with `registration cluster ... is not among the managed GPU clusters` | Run the refusal's `deploy --state-dir ... --registration-cluster <remaining cluster of that provider> --reference ...` (moves the anchor, then continues the same deploy) | §5.0.4 |
 | Release across schema versions | `deploy --state-dir ... --accept-schema-change` (takes an Aurora snapshot first; `--accept-schema-change-without-snapshot` skips the snapshot) | §4.7 |
@@ -158,7 +158,13 @@ An interrupted declaration whose patch never took effect (the record has no `dec
 `--declare` into the record's `superseded_interrupted_declarations` and re-declared directly,
 without a prior `--release`.
 A node originally cordoned stays cordoned; unknown pool state, reservation/isolation,
-cross-cluster records, missing baseline or Node UID change all refuse release. The read-only `config spare` check is not a declaration authorisation,
+cross-cluster records, missing baseline or Node UID change all refuse release. When the cluster no longer has the Node (spot reclaim, scale-in,
+provider replacement), `--release` first proves the node departed -- the Node read answers NotFound, the provider no longer has the instance
+(HyperPod's `list-cluster-nodes` for the instance the node name carries; on eks-managed, EC2 for the instance the declaration recorded, else the
+one the fleet recorded), its Agent is no longer alive -- and only then releases the record: `restored_state` is empty, `release_skipped` says the
+label and the cordon left with the Node and there is nothing to restore, the departure goes into `release_survey`; it then acknowledges the
+release to the control plane (`DepartedNodeSpareRelease`), which answers the departed-node cleanup's spare finding. Short of that proof it is
+refused and writes nothing; a departed spare with no record of this tool's is only acknowledged. The read-only `config spare` check is not a declaration authorisation,
 nor does it change `NodeRecovery=None` or the provider replace prohibition.
 
 ## 3. Complete Uninstall or Permanent Decommissioning
@@ -185,7 +191,8 @@ nor does it change `NodeRecovery=None` or the provider replace prohibition.
 - All GPU EKS/HyperPod clusters and customer training workloads are always kept;
 - Warm spares registered with `config spare --declare` are released before the Kubernetes cleanup according to their declaration records
   (`<state-dir>/warm-spares/`): the spare label is removed, the pre-declaration scheduling state is restored, and it is recorded in the uninstall journal's
-  `released_warm_spares`; a spare reserved by an incident, ALLOCATED or under isolation makes the uninstall fail closed.
+  `released_warm_spares`; a spare reserved by an incident, ALLOCATED or under isolation makes the uninstall fail closed; a spare
+  the cluster no longer has is released record-only once proven departed (as `config spare --release`), and fails closed otherwise.
 - `--cpu-cluster keep` is a **reinstall**: it keeps the CPU EKS/HyperPod and also keeps the solution-specific Aurora
   (the site's incident/workflow/registry records; the isolation taints on GPU nodes are keyed by the incident ids
   inside it). The next `deploy` takes over this existing Aurora (CPU-2), and records are not lost. Only an explicit
@@ -4065,7 +4072,7 @@ there is a manual path, the ledger line and the notification give the exact comm
 |---|---|---|
 | `workflow_changed_node` | the workflow ran steps or completed a node-mutating operation | `workflow-reconcile --workflow-id <id> --dry-run` (§10.2) |
 | `remote_command` | the workflow has a remote command | same |
-| `declared_spare` | the node was a declared or reserved warm spare when Kubernetes last listed it | `gpu-fault-admin config spare --node <node> --cluster-id <cluster> --release ...` |
+| `declared_spare` | the node was a declared or reserved warm spare when Kubernetes last listed it: its other records end as usual, the declaration on the deploy host is the administrator's (once seen, the finding stays with the departure even after the inventory forgets the label at 24 hours) | `gpu-fault-admin config spare --state-dir <state-dir> --node <node> --cluster-id <cluster> --release --reference <change> --confirm RELEASE_WARM_SPARE_UNCORDON`: for a provably departed node it releases only the record and acknowledges it to the control plane; the next cycle turns the ledger line `CLEANED` (§2) |
 | `incident_names_other_nodes` | the incident also names a node not proven departed | `--close-incident <id>` |
 | `cluster_not_active` | the cluster is not `ACTIVE` (or is disabled) in the registry | `--retire-departed-agents --node <node> --dry-run` |
 | `provider_identity_unknown` | the HyperPod node name carries no instance id, or the eks-managed Agent record has no EC2-shaped `node_instance_id` | same |

@@ -171,6 +171,7 @@ from gpu_fault.admin.submit_remediation import (
 )
 from gpu_fault.admin.uninstall import UninstallRequest, uninstall
 from gpu_fault.admin import warm_spare, workflow_reconcile_departed_agents
+from gpu_fault.admin import warm_spare_departed
 from gpu_fault.admin.workflow_reconcile import run_workflow_reconcile
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_validation_evidence import (
@@ -1270,7 +1271,7 @@ def _run_admin_config(arguments: argparse.Namespace) -> int:
     assert site_file is not None
     site = load_site(site_file)
     if getattr(arguments, "config_action", None) == "spare":
-        return warm_spare.run_config_spare_command(arguments, site=site)
+        return warm_spare_departed.config_spare(arguments, site=site)
     if arguments.dry_run:
         # Local only: no signature check, no cluster read, nothing written.
         current = load_desired_admin_config(arguments.state_dir)

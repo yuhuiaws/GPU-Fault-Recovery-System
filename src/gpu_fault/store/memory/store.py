@@ -126,6 +126,7 @@ class InMemoryStore(
         self._hyperpod_node_identities = {}
         self._kubernetes_node_inventories = {}
         self._departed_node_cleanups = {}
+        self._departed_node_spare_releases = {}
         self._hyperpod_submissions = {}
         self._regional_clusters = {}
         self._regional_registry_revisions = {}

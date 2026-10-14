@@ -23,7 +23,7 @@ import pytest
 
 from gpu_fault.app.periodic_services import PeriodicServiceRunner
 from gpu_fault.departed_node_cleanup import DepartedNodeCleanup
-from gpu_fault.departed_nodes import DepartedNodeCleanupStatus
+from gpu_fault.departed_nodes import DepartedNodeCleanupStatus, DepartedNodeSpareRelease
 from gpu_fault.fleet import AgentLifecycleState
 from gpu_fault.models import IncidentState, WorkflowStatus
 from gpu_fault.store import PostgresStore
@@ -235,3 +235,26 @@ def test_a_restart_between_drain_and_revoke_resumes_on_postgres(
     assert store.get_agent(HP_CLUSTER, HP_PRESENT).lifecycle_state is (
         AgentLifecycleState.ACTIVE
     )
+
+
+def test_a_spare_release_round_trips_on_postgres(store: PostgresStore) -> None:
+    """The administrator's release of a departed spare is its own record."""
+
+    release = DepartedNodeSpareRelease(
+        cluster_id=HP_CLUSTER,
+        node_id=HP_NODE,
+        instance_id="i-0a000001",
+        change_reference="CHG-1",
+        actor="ops@example",
+        released_at=ago(seconds=1),
+        declaration="released",
+    )
+
+    store.save_departed_node_spare_release(release)
+    listed = store.list_departed_node_spare_releases(HP_CLUSTER)
+    other = store.list_departed_node_spare_releases(EKS_CLUSTER)
+    store.delete_departed_node_spare_release(HP_CLUSTER, HP_NODE)
+
+    assert listed == [release]
+    assert other == []
+    assert store.list_departed_node_spare_releases() == []
