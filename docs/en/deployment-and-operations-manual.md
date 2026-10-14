@@ -5904,18 +5904,20 @@ executor because of a timeout; but once the Pod is deleted the renewal stops, an
 already produced side effects on the target cluster (cordon, delete pod, HyperPod reboot), re-execution relies on each
 adapter's idempotency keys. Therefore you must confirm there are no non-terminal commands before upgrading.
 
-A batch claim sets the lease on the whole batch at the same moment, yet the executor still executes the batch sequentially.
-The configuration must therefore satisfy:
+The executor's claim loop (`gpu_fault.cluster_executor.executor.ClaimLoop`) claims only into free slots:
+at most `min(GPU_FAULT_CLUSTER_EXECUTOR_BATCH_SIZE, GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS)`
+commands (default 5) are in flight, every claimed command starts at once on its own worker, renews its lease at admission and
+is then kept alive by its own renewal thread, reports when it finishes, and the slot it frees is claimed again at once.
+A reboot of 15-45 minutes therefore no longer holds the next steps of its short batch siblings or new claims, and no claimed
+command waits in a local queue until its lease expires.
 
-```text
-GPU_FAULT_CLUSTER_EXECUTOR_BATCH_SIZE × worst-case duration of one command
-    < GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS
-```
-
-Production should reserve at least 20% jitter margin. Measured on 2026-08-20 with 25 commands, about 5 seconds each and a 120-second lease,
-the first 23 succeeded and the 24th/25th had expired before their turn and returned 409; under that timing model a batch of at most
-20 is recommended. The current default `BATCH_SIZE=5` satisfies the constraint. Before increasing the batch you must recompute with the slowest
-NodeAction/HyperPod operation in the target environment; do not estimate from empty claim latency alone.
+The earlier loop claimed a batch and waited for the whole batch before claiming again, queuing locally whatever exceeded the
+concurrency, which is why `BATCH_SIZE × worst-case duration of one command < LEASE_SECONDS` used to be required (measured with
+25 commands of about 5 seconds each and a 120-second lease, the 24th/25th had expired before their turn and returned 409). The
+production loop is no longer bound by it; it only still applies to the single-cycle `run_once()` that tests and acceptance
+probes drive (claim one batch, wait until all of it has reported; with `BATCH_SIZE > MAX_CONCURRENT_COMMANDS` the surplus
+queues locally, which CAP-004's queued-lease proof exercises on purpose). Both settings only bound one executor's commands
+in flight; cluster-level remediation concurrency is still decided by the persistent remediation budgets.
 
 Step 1: check in-flight commands:
 

@@ -2446,7 +2446,12 @@ The logger name of every layer is still `gpu_fault.cluster_executor`; the only v
 `gpu_fault.cluster_executor.regional_client.ClusterExecutorError`.
 
 The process entry point is `gpu-fault-cluster-executor`; it is assembled by `executor_from_environment()` and then
-enters the `ClusterActionExecutor.run_once()` polling loop.
+enters `ClusterActionExecutor.run()` (`ClaimLoop` in `executor.py`): every claimed command runs on its own worker and reports on
+its own, the slot it frees is claimed again at once, a claim asks for the free slots only, and at most
+`min(BATCH_SIZE, MAX_CONCURRENT_COMMANDS)` commands are in flight. One claim's commands are still one cycle, judged when the
+last of them reports for progress (WAITING only takes the idle wait) and for the network-degraded streak; while the degraded
+back-off is active nothing is claimed with commands in flight. `run_once()` stays as the single-cycle primitive (claim one batch,
+wait until all of it has reported) that tests and acceptance probes drive.
 
 `RegionalExecutorClient` handles outbound HTTP: request headers carry
 `Authorization: Bearer <cluster-token>` and `X-GPU-Fault-Cluster-ID`, default timeout

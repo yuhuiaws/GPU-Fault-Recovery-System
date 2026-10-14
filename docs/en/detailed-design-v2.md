@@ -1541,8 +1541,12 @@ Node Agent client, readiness reporting (package `src/gpu_fault/cluster_executor/
 `executor.py`, dispatch and local checks in `dispatch.py`, lease and reporting in `lease.py`, outbound client and
 proxy in `regional_client.py`, environment assembly and `readiness_probe` in `bootstrap.py`).
 
-**④ Thread/coroutine model**: 2 replicas, each with one claim loop + at most
-`GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS=5` concurrent commands.
+**④ Thread/coroutine model**: 2 replicas, each with one claim loop (`ClaimLoop`) + at most
+`min(GPU_FAULT_CLUSTER_EXECUTOR_BATCH_SIZE, GPU_FAULT_CLUSTER_EXECUTOR_MAX_CONCURRENT_COMMANDS)`
+(default 5) commands in flight. Every command runs, renews and reports on its own worker, the slot it frees is claimed again
+at once, and a claim asks for the free slots only, so every claimed command starts at once and none queues locally; the loop
+used to wait for its whole claimed batch before claiming again, so a reboot of 15-45 minutes held the next steps of its short
+batch siblings and every new claim.
 
 **⑤ Start/stop procedure**: see §2.7: the pre-installed OCI starts directly → `touch /tmp/executor-ready`
 → verify IRSA and `CONFIRM_CLUSTER` → readiness is answered by the control plane. On shutdown the lease is **not returned**; only renewal stops,
@@ -1558,8 +1562,9 @@ claim** only after the signal arrived and was refused admission (`status_source=
 and completed parts are reported as usual: the lease is still its own, and the WAITING hand-back returned by the adapter (with the Agent pointer, not claiming
 `node_action_not_started`) is POSTed as usual, so the sibling replica can take over immediately. The renewal half is what matters for
 recovery time: when a process is killed by a rollout mid-command while still renewing, that command stays LEASED for a full lease window (120s)
-before the sibling replica may re-claim it, and that time is added directly to fault recovery time. SIGINT is not taken over; in interactive runs
-the first Ctrl-C still ends as a KeyboardInterrupt.
+before the sibling replica may re-claim it, and that time is added directly to fault recovery time. Once claiming stops, `run()` returns only after
+every command in flight when the signal arrived has reported; a command the kubelet SIGKILLs first expires with the lease it no longer renews.
+SIGINT is not taken over; in interactive runs the first Ctrl-C still ends as a KeyboardInterrupt.
 
 **A command whose cancellation is seen at admission reports a no-start.** The workflow deadline only *requests* the cancellation of a
 LEASED command; when the executor has just re-claimed a compound command, the admission renewal carries that request and admission is

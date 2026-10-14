@@ -24,6 +24,12 @@ from gpu_fault.cluster_executor import (
     RegionalExecutorClient,
     executor_from_environment,
 )
+from gpu_fault.models import WorkflowStepStatus
+from tests.execution.test_cluster_executor_lease_and_report import (
+    FakeExecutorClient,
+    RecordingAdapter,
+    remote_command,
+)
 
 
 class EmptyClient:
@@ -65,19 +71,18 @@ def _executor(client, **overrides) -> ClusterActionExecutor:
     )
 
 
-def test_a_long_poll_executor_does_not_sleep_after_an_empty_claim(monkeypatch):
-    client = EmptyClient()
-    executor = _executor(client, claim_wait_seconds=20)
-    stopped = {"claims": 0}
-    original = executor.run_once
+class StoppingClient(EmptyClient):
+    """Answers four empty claims, then ends ``run()`` from the fifth."""
 
-    def run_once():
-        stopped["claims"] += 1
-        if stopped["claims"] == 5:
+    def claim(self, executor_id, **kwargs):
+        if len(self.claims) == 4:
             raise Stop
-        return original()
+        return super().claim(executor_id, **kwargs)
 
-    monkeypatch.setattr(executor, "run_once", run_once)
+
+def test_a_long_poll_executor_does_not_sleep_after_an_empty_claim(monkeypatch):
+    client = StoppingClient()
+    executor = _executor(client, claim_wait_seconds=20)
     sleeps: list[float] = []
     monkeypatch.setattr(
         "gpu_fault.cluster_executor.executor.time.sleep", lambda s: sleeps.append(s)
@@ -113,15 +118,22 @@ def test_a_polling_executor_still_sleeps_poll_seconds(monkeypatch) -> None:
 
 def test_a_held_command_still_takes_the_idle_path_under_long_poll(monkeypatch):
     """A WAITING command is re-claimable at once, so without the idle sleep a
-    long-poll would spin on it exactly as pure polling did on 2026-09-04."""
+    long-poll would spin on it exactly as pure polling did on 2026-09-04.
 
-    executor = _executor(EmptyClient(), claim_wait_seconds=20)
+    One slot, so every claim follows the held command's own WAITING; the
+    free-slot case is ``test_cluster_executor_claim_slots``."""
 
-    def held_run_once():
-        executor.last_cycle_advanced = False
-        return 1
-
-    monkeypatch.setattr(executor, "run_once", held_run_once)
+    held = remote_command("command-a")
+    client = FakeExecutorClient([held], [held], [held])
+    executor = ClusterActionExecutor(
+        client,
+        [RecordingAdapter(status=WorkflowStepStatus.WAITING)],
+        executor_id="executor-a",
+        allowed_namespaces={"training"},
+        poll_seconds=2,
+        claim_wait_seconds=20,
+        batch_size=1,
+    )
     sleeps: list[float] = []
     _stop_after(monkeypatch, sleeps, 2)
 
@@ -129,6 +141,9 @@ def test_a_held_command_still_takes_the_idle_path_under_long_poll(monkeypatch):
         executor.run()
 
     assert sleeps == [2, 2]
+    assert [claim["wait_seconds"] for claim in client.claims] == [20, 20], (
+        "each claim still long-polls; only the wait between them is the idle path"
+    )
 
 
 def test_claim_failures_back_off_from_poll_seconds_under_long_poll(monkeypatch):

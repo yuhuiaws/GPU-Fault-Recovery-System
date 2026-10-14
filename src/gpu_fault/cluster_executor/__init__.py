@@ -11,7 +11,8 @@ import surface and splits the code along the seams it already had:
   selection, and the classification of whatever the adapter raised.
 * ``batching`` -- ``execute_batched_command``: a compound command's covered
   steps run in order through the dispatch pieces, with progress posts.
-* ``executor`` -- ``ClusterActionExecutor``: the claim loop (long-poll, the
+* ``executor`` -- ``ClusterActionExecutor`` and its ``ClaimLoop``: claims into
+  free worker slots, each command reporting on its own (long-poll, the
   network-degraded back-off), the counters, the breadcrumbs and the stop
   signal.
 * ``bootstrap`` -- ``executor_from_environment``, ``readiness_probe`` and

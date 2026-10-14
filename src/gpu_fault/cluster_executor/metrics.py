@@ -191,7 +191,7 @@ def cluster_executor_metrics() -> MetricFamily:
         gauges=(
             (
                 "in_flight_commands",
-                "Commands of the current batch still executing on a worker.",
+                "Claimed commands still executing on a worker.",
             ),
             (
                 "claim_loop_alive",

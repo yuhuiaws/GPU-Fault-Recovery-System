@@ -5,9 +5,11 @@ one on its own thread through ``CommandLifecycle`` (lease renewal, execution
 cap, result report) and ``CommandDispatch`` (validation, preflight, adapter,
 failure classification), keeps the counters every layer increments, writes the
 readiness and liveness breadcrumbs the container probes read, and turns
-SIGTERM into "stop claiming, let the leases lapse". The
-``SpareReservationSweep`` (``gpu_fault.spare_reservation_sweep``) is the one
-piece of housekeeping the loop runs between claims.
+SIGTERM into "stop claiming, let the leases lapse". ``ClaimLoop`` is ``run()``:
+every claimed command finishes and reports on its own worker, and the slot it
+frees is claimed again at once. The ``SpareReservationSweep``
+(``gpu_fault.spare_reservation_sweep``) is the one piece of housekeeping the
+loop runs between claims.
 """
 
 from __future__ import annotations
@@ -17,8 +19,9 @@ import logging
 import os
 import signal
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_for_futures
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import Lock
 from typing import Any, Callable
@@ -296,7 +299,8 @@ class ClusterActionExecutor:
         self._stop_requested = False
         self._stop_reason: str | None = None
         self.last_successful_claim_at: datetime | None = None
-        # Whether the last claim cycle moved any command off WAITING. run()
+        # Whether the last claim cycle -- one claim's commands, judged once
+        # the last of them reported -- moved any command off WAITING. run()
         # takes the idle path when it did not, so a held command polls at
         # poll_seconds instead of as fast as the control plane will answer.
         self.last_cycle_advanced = True
@@ -523,6 +527,28 @@ class ClusterActionExecutor:
             )
 
     def run_once(self) -> int:
+        """One whole claim cycle: claim, run every command, return the count.
+
+        Claims up to ``batch_size`` and returns only once every claimed
+        command has reported -- the single-cycle primitive tests and the
+        acceptance probes drive. ``run()`` no longer loops over it: waiting for
+        the whole batch left every freed slot idle and every new claim queued
+        behind the batch's longest command (``ClaimLoop``).
+        """
+
+        claimed = self._claim(self.batch_size)
+        self.last_cycle_advanced = True
+        if claimed:
+            self._conclude_cycle(self._run_cycle(claimed))
+        else:
+            self._clear_degraded_streak()
+        return len(claimed)
+
+    def _claim(
+        self, max_commands: int
+    ) -> list[tuple[RemoteActionCommand, CommandLeaseWatch]]:
+        """One claim round trip; each claimed command with its lease watch."""
+
         # Before the claim, not after: a claim that hangs must let the
         # breadcrumb go stale, and a claim that fails must not (the loop is
         # alive and merely cannot reach the control plane).
@@ -531,7 +557,7 @@ class ClusterActionExecutor:
             commands = self.client.claim(
                 self.executor_id,
                 execution_owners=self.execution_owners,
-                max_commands=self.batch_size,
+                max_commands=max_commands,
                 lease_seconds=self.lease_seconds,
                 wait_seconds=self.claim_wait_seconds,
             )
@@ -554,72 +580,83 @@ class ClusterActionExecutor:
         self.increment("claimed_total", len(commands))
         self.metrics.claimed()
         self._record_successful_claim(self.last_successful_claim_at)
-        self.last_cycle_advanced = True
         self._log_claims(commands)
-        if commands:
-            pool = ThreadPoolExecutor(
-                max_workers=min(
-                    self.max_concurrent_commands,
-                    len(commands),
-                ),
-                thread_name_prefix="gpu-fault-command",
-            )
-            try:
-                futures = [
-                    pool.submit(self._execute_and_report, command, watch)
-                    for command, watch in claimed
-                ]
-                pending = set(futures)
+        return claimed
+
+    def _run_cycle(
+        self, claimed: list[tuple[RemoteActionCommand, CommandLeaseWatch]]
+    ) -> list[CommandOutcome]:
+        """``run_once``'s batch: every claimed command run to its report."""
+
+        pool = ThreadPoolExecutor(
+            max_workers=min(self.max_concurrent_commands, len(claimed)),
+            thread_name_prefix="gpu-fault-command",
+        )
+        try:
+            futures = [
+                pool.submit(self._execute_and_report, command, watch)
+                for command, watch in claimed
+            ]
+            pending = set(futures)
+            self.metrics.in_flight(len(pending))
+            while pending:
+                # Every worker is bounded by ``max_execution_seconds``, so
+                # this loop always ends; the tick exists so that a
+                # twenty-minute REPLACE_NODE keeps refreshing the liveness
+                # breadcrumb instead of looking like a wedged loop.
+                _finished, pending = wait_for_futures(
+                    pending, timeout=self.liveness_interval_seconds
+                )
                 self.metrics.in_flight(len(pending))
-                while pending:
-                    # Every worker is bounded by ``max_execution_seconds``, so
-                    # this loop always ends; the tick exists so that a
-                    # twenty-minute REPLACE_NODE keeps refreshing the liveness
-                    # breadcrumb instead of looking like a wedged loop.
-                    _finished, pending = wait_for_futures(
-                        pending, timeout=self.liveness_interval_seconds
-                    )
-                    self.metrics.in_flight(len(pending))
-                    self._record_liveness()
-                outcomes = [future.result() for future in futures]
-                self._log_outcomes(commands, outcomes)
-            finally:
-                # Never wait: a worker that abandoned a stuck command has
-                # returned, but the thread it abandoned may still be inside a
-                # call that cannot be interrupted.
-                pool.shutdown(wait=False)
-            # A command that reports WAITING is re-claimable at once, so a
-            # batch that only waited puts run() straight back into claim()
-            # with nothing changed: on 2026-09-04 a single held
-            # STOP_WORKLOADS drove 25 claim/execute/complete round trips a
-            # second across two replicas, and 759 identical log lines a
-            # minute. Waiting is not progress, so it takes the idle path.
-            self.last_cycle_advanced = any(
-                outcome.status is not RemoteCommandStatus.WAITING
-                for outcome in outcomes
-            )
-            # A whole cycle that advanced nothing and failed at least one
-            # command on this executor's own connectivity is a degraded
-            # cycle: run() backs off once enough of them stack up, so the
-            # command this executor keeps releasing lands on a replica whose
-            # network works. Any progress, or a WAITING that was the target's
-            # fault (an adapter 5xx, a control-plane 503), clears the streak.
-            if not self.last_cycle_advanced and any(
-                outcome.transport_degraded for outcome in outcomes
-            ):
-                self.consecutive_transport_degraded_cycles += 1
-            else:
-                self.consecutive_transport_degraded_cycles = 0
+                self._record_liveness()
+            outcomes = [future.result() for future in futures]
+            self._log_outcomes([command for command, _ in claimed], outcomes)
+        finally:
+            # Never wait: a worker that abandoned a stuck command has
+            # returned, but the thread it abandoned may still be inside a
+            # call that cannot be interrupted.
+            pool.shutdown(wait=False)
+        return outcomes
+
+    def _conclude_cycle(self, outcomes: list[CommandOutcome]) -> None:
+        """Judge one claim's commands once the last of them has reported."""
+
+        # A command that reports WAITING is re-claimable at once, so a
+        # batch that only waited puts run() straight back into claim()
+        # with nothing changed: on 2026-09-04 a single held
+        # STOP_WORKLOADS drove 25 claim/execute/complete round trips a
+        # second across two replicas, and 759 identical log lines a
+        # minute. Waiting is not progress, so it takes the idle path.
+        self.last_cycle_advanced = any(
+            outcome.status is not RemoteCommandStatus.WAITING for outcome in outcomes
+        )
+        # A whole cycle that advanced nothing and failed at least one
+        # command on this executor's own connectivity is a degraded
+        # cycle: run() backs off once enough of them stack up, so the
+        # command this executor keeps releasing lands on a replica whose
+        # network works. Any progress, or a WAITING that was the target's
+        # fault (an adapter 5xx, a control-plane 503), clears the streak.
+        if not self.last_cycle_advanced and any(
+            outcome.transport_degraded for outcome in outcomes
+        ):
+            self.consecutive_transport_degraded_cycles += 1
         else:
-            # An empty claim round trip proves the control-plane route works
-            # and leaves nothing blocked, so it is not a degraded cycle.
             self.consecutive_transport_degraded_cycles = 0
         # Assigned, not incremented, so ``increment`` cannot mirror it: the
-        # gauge is set here, the one place the streak changes.
+        # gauge is set where the streak changes, here and below.
         self.metrics.transport_degraded_cycles(
             self.consecutive_transport_degraded_cycles
         )
-        return len(commands)
+
+    def _clear_degraded_streak(self) -> None:
+        """An empty claim with nothing in flight is not a degraded cycle.
+
+        The round trip proves the control-plane route works and leaves
+        nothing blocked.
+        """
+
+        self.consecutive_transport_degraded_cycles = 0
+        self.metrics.transport_degraded_cycles(0)
 
     def _log_claims(self, commands: list[RemoteActionCommand]) -> None:
         """What this executor took on, at INFO -- the first thing an operator
@@ -743,76 +780,15 @@ class ClusterActionExecutor:
             )
 
     def run(self) -> None:
-        consecutive_failures = 0
+        """Claim and execute until a stop is requested, then drain.
+
+        ``ClaimLoop`` does the work: each claimed command reports on its own
+        and its slot is claimed again at once. Returns once every command in
+        flight at the stop has reported.
+        """
+
         self.advertise_execution_owners()
-        while not self._stop_requested:
-            try:
-                count = self.run_once()
-                consecutive_failures = 0
-                self.sweep_spare_reservations()
-                self.sync_node_action_keys()
-            except Exception as exc:
-                consecutive_failures += 1
-                delay = min(
-                    self.claim_backoff_max_seconds,
-                    self.poll_seconds * (2 ** min(consecutive_failures - 1, 8)),
-                )
-                # A result that could not be posted no longer reaches here at
-                # all, but a defect after the claim still can, and calling it
-                # "claim failed" sent the operator to the wrong side of the
-                # wire (F11).
-                phase = (
-                    "claim failed"
-                    if isinstance(exc, ClusterExecutorClaimError)
-                    else "cycle failed after a successful claim"
-                )
-                if (
-                    consecutive_failures == 1
-                    and isinstance(exc, ClusterExecutorClaimError)
-                    and exc.status_code is None
-                ):
-                    # No verdict at all (the connection closed or timed out
-                    # before a status): the client defines this as safe to
-                    # retry, and one of them is what a control-plane Pod
-                    # leaving during its rolling restart can cost -- not an
-                    # executor error. Two in a row are reported as before.
-                    LOGGER.warning(
-                        "regional cluster executor claim got no verdict from "
-                        "the control plane: %s; retrying in %.1fs (consecutive=1)",
-                        exc,
-                        delay,
-                    )
-                elif (
-                    consecutive_failures == 1
-                    or consecutive_failures & (consecutive_failures - 1) == 0
-                ):
-                    LOGGER.exception(
-                        "regional cluster executor %s; "
-                        "retrying in %.1fs (consecutive=%d)",
-                        phase,
-                        delay,
-                        consecutive_failures,
-                    )
-                else:
-                    LOGGER.warning(
-                        "regional cluster executor %s, still failing: "
-                        "%s: %s; retrying in %.1fs "
-                        "(consecutive=%d)",
-                        phase,
-                        type(exc).__name__,
-                        exc,
-                        delay,
-                        consecutive_failures,
-                    )
-                time.sleep(delay)
-                continue
-            if count == 0 and self.claim_wait_seconds > 0:
-                # The control plane held this claim for up to
-                # claim_wait_seconds already; sleeping again would only add
-                # latency to the next command.
-                continue
-            if count == 0 or not self.last_cycle_advanced:
-                time.sleep(self._idle_delay())
+        ClaimLoop(self).run()
         self.metrics.loop_iteration(alive=False)
         LOGGER.warning(
             "regional cluster executor stopped claiming: executor=%s reason=%s",
@@ -839,3 +815,263 @@ class ClusterActionExecutor:
         """
 
         return self.dispatch.execute(command)
+
+
+@dataclass
+class _ClaimCycle:
+    """One claim's commands: each reports on its own, judged together."""
+
+    remaining: int
+    outcomes: list[CommandOutcome] = field(default_factory=list)
+
+
+class ClaimLoop:
+    """``ClusterActionExecutor.run``: claim into free worker slots, drain on stop.
+
+    ``run()`` used to be ``run_once`` in a loop: claim a batch, wait until every
+    command of it had reported, claim again. A reboot of fifteen to forty-five
+    minutes therefore held the batch's short commands' follow-up steps and every
+    new claim behind it (the quantizer batch 87 removed from the perf harness's
+    simulated executor). Here each claimed command runs and reports on its own
+    pool worker -- ``_execute_and_report``, so the lease watch, renewer,
+    execution cap, fencing checks and bounded idempotent report are the ones it
+    always had -- and the slot it frees can be claimed again at once.
+
+    At most ``min(batch_size, max_concurrent_commands)`` commands are in flight,
+    what one batch cycle could run at once, and a claim asks for the free slots
+    only: every claimed command starts on a free worker, so no claimed lease
+    waits in a local queue. Pacing keeps the batch cycle's rules, with one
+    claim's commands still the cycle that is judged, once its last command has
+    reported (``_conclude_cycle``):
+
+    * a command that finished with a verdict (SUCCEEDED or FAILED) frees its
+      slot for an immediate claim -- its workflow's next step is queued behind
+      that verdict;
+    * a cycle that only waited takes the idle path: the next claim waits
+      ``_idle_delay()`` from that conclusion (``poll_seconds``, or the
+      network-degraded back-off), and a verdict ends the wait early;
+    * with nothing new since the last claim, a long-polling executor claims
+      again at once while its last cycle advanced -- the control plane holds
+      the claim -- and a polling one waits ``_idle_delay()``;
+    * while the network-degraded back-off is active nothing is claimed with
+      commands in flight, as in the batch cycle: a replica that cannot reach
+      its targets must not compete with its sibling for the work it releases.
+
+    After SIGTERM nothing new is claimed and ``run`` returns once every
+    command in flight has reported; their renewers already stopped, so a
+    command the kubelet kills first lapses on the control plane's schedule.
+    Owned by the loop thread; the workers only run ``_execute_and_report``.
+    """
+
+    def __init__(self, executor: ClusterActionExecutor) -> None:
+        self.executor = executor
+        self.capacity = min(executor.batch_size, executor.max_concurrent_commands)
+        self._pool = ThreadPoolExecutor(
+            max_workers=self.capacity, thread_name_prefix="gpu-fault-command"
+        )
+        self._running: dict[
+            Future[CommandOutcome], tuple[int, RemoteActionCommand, _ClaimCycle]
+        ] = {}
+        self._started = 0
+        self._failures = 0
+        # Claim at the next turn: the first claim, a claim after the failure
+        # back-off, and a slot freed by a verdict.
+        self._claim_now = True
+        # The deadline of the idle wait in progress, if any.
+        self._gate_until: float | None = None
+
+    @property
+    def free(self) -> int:
+        return self.capacity - len(self._running)
+
+    def run(self) -> None:
+        try:
+            self._claim_until_stopped()
+            self._drain()
+        finally:
+            # Never wait: a worker that abandoned a stuck command has returned,
+            # but the thread it abandoned may still be inside a call that
+            # cannot be interrupted.
+            self._pool.shutdown(wait=False)
+
+    def _claim_until_stopped(self) -> None:
+        executor = self.executor
+        while not executor.stop_requested:
+            self._settle(0)
+            wait = self._next_claim_wait()
+            if wait is None or (wait > 0 and self._running):
+                # The tick keeps a forty-minute reboot from reading as a wedged
+                # loop, and bounds how long a stop request waits.
+                tick = executor.liveness_interval_seconds
+                self._settle(tick if wait is None else min(wait, tick))
+                executor._record_liveness()
+            elif wait > 0:
+                # Nothing in flight: the batch cycle's plain idle sleep.
+                time.sleep(wait)
+                self._claim_now = True
+            elif self._claim():
+                executor.sweep_spare_reservations()
+                executor.sync_node_action_keys()
+
+    def _next_claim_wait(self) -> float | None:
+        """Seconds until the next claim; None waits for a command to finish."""
+
+        executor = self.executor
+        if self.free <= 0:
+            return None
+        if (
+            self._running
+            and executor.consecutive_transport_degraded_cycles
+            >= executor.transport_degraded_backoff_after
+        ):
+            return None
+        if self._claim_now:
+            return 0.0
+        if self._gate_until is None:
+            if executor.claim_wait_seconds > 0 and executor.last_cycle_advanced:
+                # The control plane holds this claim for up to
+                # claim_wait_seconds; sleeping first would only add latency.
+                return 0.0
+            delay = executor._idle_delay()
+            self._gate_until = executor.clock() + delay
+            return delay
+        return max(0.0, self._gate_until - executor.clock())
+
+    def _claim(self) -> bool:
+        """Claim into the free slots; False after a failed cycle's back-off."""
+
+        executor = self.executor
+        try:
+            claimed = executor._claim(self.free)
+            self._start(claimed)
+        except Exception as exc:
+            self._failures += 1
+            time.sleep(self._failure_delay(exc))
+            self._claim_now = True
+            return False
+        self._failures = 0
+        self._claim_now = False
+        self._gate_until = None
+        if not claimed:
+            executor.last_cycle_advanced = True
+            if not self._running:
+                executor._clear_degraded_streak()
+        return True
+
+    def _start(
+        self, claimed: list[tuple[RemoteActionCommand, CommandLeaseWatch]]
+    ) -> None:
+        if not claimed:
+            return
+        cycle = _ClaimCycle(remaining=len(claimed))
+        for command, watch in claimed:
+            future = self._pool.submit(
+                self.executor._execute_and_report, command, watch
+            )
+            self._running[future] = (self._started, command, cycle)
+            self._started += 1
+        self.executor.metrics.in_flight(len(self._running))
+
+    def _settle(self, timeout: float) -> None:
+        """Collect what finished, waiting up to ``timeout`` for the first."""
+
+        if not self._running:
+            return
+        done, _pending = wait_for_futures(
+            tuple(self._running), timeout=timeout, return_when=FIRST_COMPLETED
+        )
+        if not done:
+            return
+        executor = self.executor
+        commands: list[RemoteActionCommand] = []
+        outcomes: list[CommandOutcome] = []
+        concluded: list[_ClaimCycle] = []
+        # In start order, so the log reads in claim order within one wakeup and
+        # cycles that end together are judged in the order they were claimed.
+        for future in sorted(done, key=lambda item: self._running[item][0]):
+            _order, command, cycle = self._running.pop(future)
+            outcome = future.result()
+            commands.append(command)
+            outcomes.append(outcome)
+            cycle.outcomes.append(outcome)
+            cycle.remaining -= 1
+            if not cycle.remaining:
+                concluded.append(cycle)
+        executor.metrics.in_flight(len(self._running))
+        executor._log_outcomes(commands, outcomes)
+        for cycle in concluded:
+            executor._conclude_cycle(cycle.outcomes)
+            if not executor.last_cycle_advanced:
+                # The idle wait runs from this cycle's conclusion.
+                self._gate_until = None
+        if any(item.status is not RemoteCommandStatus.WAITING for item in outcomes):
+            self._claim_now = True
+
+    def _drain(self) -> None:
+        """After a stop, wait until every command in flight has reported."""
+
+        executor = self.executor
+        if self._running:
+            LOGGER.info(
+                "regional cluster executor draining before it stops: "
+                "executor=%s in_flight=%d",
+                executor.executor_id,
+                len(self._running),
+            )
+        while self._running:
+            # Every worker is bounded by ``max_execution_seconds``.
+            self._settle(executor.liveness_interval_seconds)
+            executor._record_liveness()
+
+    def _failure_delay(self, exc: Exception) -> float:
+        """Log one failed claim cycle; the back-off before the next claim."""
+
+        executor = self.executor
+        failures = self._failures
+        delay = min(
+            executor.claim_backoff_max_seconds,
+            executor.poll_seconds * (1 << min(failures - 1, 8)),
+        )
+        # A result that could not be posted no longer reaches here at all, but
+        # a defect after the claim still can, and calling it "claim failed"
+        # sent the operator to the wrong side of the wire (F11).
+        phase = (
+            "claim failed"
+            if isinstance(exc, ClusterExecutorClaimError)
+            else "cycle failed after a successful claim"
+        )
+        if (
+            failures == 1
+            and isinstance(exc, ClusterExecutorClaimError)
+            and exc.status_code is None
+        ):
+            # No verdict at all (the connection closed or timed out before a
+            # status): the client defines this as safe to retry, and one of
+            # them is what a control-plane Pod leaving during its rolling
+            # restart can cost -- not an executor error. Two in a row are
+            # reported as before.
+            LOGGER.warning(
+                "regional cluster executor claim got no verdict from "
+                "the control plane: %s; retrying in %.1fs (consecutive=1)",
+                exc,
+                delay,
+            )
+        elif failures == 1 or failures & (failures - 1) == 0:
+            LOGGER.exception(
+                "regional cluster executor %s; retrying in %.1fs (consecutive=%d)",
+                phase,
+                delay,
+                failures,
+            )
+        else:
+            LOGGER.warning(
+                "regional cluster executor %s, still failing: "
+                "%s: %s; retrying in %.1fs "
+                "(consecutive=%d)",
+                phase,
+                type(exc).__name__,
+                exc,
+                delay,
+                failures,
+            )
+        return delay
