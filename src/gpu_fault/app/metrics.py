@@ -401,14 +401,28 @@ METRIC_CONTRIBUTORS.register(
     "collector-silence",
     collector_silence_lines,
 )
-# Process-local counters of the cleanup the worker tier runs; the roles
-# without background services never run it.
+
+
+def _departed_node_cleanup_lines(runtime: AppRuntime) -> list[str]:
+    """The cleanup's process-local counters and its ledger, read once per TTL."""
+
+    cleanup = getattr(runtime.context, "departed_node_cleanup", None)
+    return departed_node_cleanup_metric_lines(
+        cleanup,
+        ledger=(
+            None
+            if cleanup is None
+            else lambda: metric_scan_cache(runtime).shared(
+                "departed-node-ledger", cleanup.store.list_departed_node_cleanups
+            )
+        ),
+    )
+
+
+# The cleanup the worker tier runs: process-local counters, and the ledger
+# every worker reads alike; the roles without background services have none.
 METRIC_CONTRIBUTORS.register(
-    "departed-node-cleanup",
-    lambda runtime: departed_node_cleanup_metric_lines(
-        getattr(runtime.context, "departed_node_cleanup", None)
-    ),
-    fleet_level=True,
+    "departed-node-cleanup", _departed_node_cleanup_lines, fleet_level=True
 )
 
 

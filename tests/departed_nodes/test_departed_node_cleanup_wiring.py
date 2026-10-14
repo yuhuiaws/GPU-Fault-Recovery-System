@@ -10,7 +10,7 @@ the ingress tier skips.
 from __future__ import annotations
 
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from threading import Event
 from types import SimpleNamespace
 from typing import Any
@@ -160,7 +160,9 @@ def test_every_rendered_family_has_an_aggregation_strategy() -> None:
     world_ = hyperpod_departure(store)
     world_.cleanup.run_once()
 
-    lines = departed_node_cleanup_metric_lines(world_.cleanup)
+    lines = departed_node_cleanup_metric_lines(
+        world_.cleanup, ledger=store.list_departed_node_cleanups
+    )
     families = {line.split()[2] for line in lines if line.startswith("# TYPE ")}
 
     assert departed_node_cleanup_metric_lines(None) == []
@@ -170,6 +172,8 @@ def test_every_rendered_family_has_an_aggregation_strategy() -> None:
         "gpu_fault_departed_node_cleanup_last_cycle_timestamp_seconds",
         "gpu_fault_departed_node_cleanup_actions_total",
         "gpu_fault_departed_node_cleanup_refusals_total",
+        "gpu_fault_departed_node_cleanup_open_nodes",
+        "gpu_fault_departed_node_cleanup_oldest_open_age_seconds",
     }
     assert all(strategy_for(name) is not None for name in families), families
     assert (
@@ -182,3 +186,56 @@ def test_the_contributor_is_registered_for_the_worker_tier_only() -> None:
     from gpu_fault.app.metrics import METRIC_CONTRIBUTORS
 
     assert "departed-node-cleanup" in METRIC_CONTRIBUTORS.fleet_level_names
+
+
+def _ledger_line(cluster_id: str, node_id: str, status: Any, age: timedelta) -> Any:
+    from gpu_fault.departed_nodes import DepartedNodeCleanupRecord
+
+    seen = datetime.now(timezone.utc) - age
+    return DepartedNodeCleanupRecord(
+        cluster_id=cluster_id,
+        node_id=node_id,
+        status=status,
+        first_seen_at=seen,
+        updated_at=seen,
+    )
+
+
+def test_the_ledger_gauges_count_open_departures_and_age_the_oldest() -> None:
+    """``GpuFaultDepartedNodeCleanupStuck`` reads the age; CLEANED is not open."""
+
+    from gpu_fault.departed_node_cleanup import ledger_metric_lines
+    from gpu_fault.departed_nodes import DepartedNodeCleanupStatus as Status
+
+    records = [
+        _ledger_line("gpu-a", "n1", Status.PENDING, timedelta(hours=3)),
+        _ledger_line("gpu-a", "n2", Status.PENDING, timedelta(minutes=5)),
+        _ledger_line("gpu-a", "n3", Status.REFUSED, timedelta(minutes=30)),
+        _ledger_line("gpu-b", "n4", Status.CLEANED, timedelta(days=2)),
+    ]
+    now = datetime.now(timezone.utc)
+
+    samples = [
+        line
+        for line in ledger_metric_lines(records, now=now, enabled=True)
+        if not line.startswith("#")
+    ]
+    switched_off = ledger_metric_lines(records, now=now, enabled=False)
+
+    assert samples[0] == (
+        'gpu_fault_departed_node_cleanup_open_nodes{cluster_id="gpu-a",'
+        'status="PENDING"} 2'
+    )
+    assert samples[1] == (
+        "gpu_fault_departed_node_cleanup_oldest_open_age_seconds"
+        '{cluster_id="gpu-a",status="PENDING"} 10800'
+    ), "the oldest of the state, not the newest"
+    assert samples[2:] == [
+        'gpu_fault_departed_node_cleanup_open_nodes{cluster_id="gpu-a",'
+        'status="REFUSED"} 1',
+        "gpu_fault_departed_node_cleanup_oldest_open_age_seconds"
+        '{cluster_id="gpu-a",status="REFUSED"} 1800',
+    ]
+    assert all(line.startswith("#") for line in switched_off), (
+        "a switched-off cleanup works no line, so nothing ages toward the alert"
+    )

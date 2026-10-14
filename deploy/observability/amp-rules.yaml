@@ -2017,6 +2017,29 @@ groups:
             person and will not take back. Work the list in §9; an incident
             leaves this state only through an operator action, never through a
             retention sweep.
+      # A GPU node that left its cluster (spot reclaim, scale-in, provider
+      # replacement) is ended by the departed-node cleanup minutes after the
+      # departure is proven. A ledger line still PENDING (the proof does not
+      # come together) or REFUSED (something on the node is the
+      # administrator's) after two hours is residue nobody is ending: the Agent
+      # coverage check and the release preflight keep refusing until it is.
+      # The age is read from the ledger in the store, so every worker renders
+      # it alike; a switched-off cleanup renders none.
+      - alert: GpuFaultDepartedNodeCleanupStuck
+        expr: >-
+          max by (control_plane_cluster, region, cluster_id, status)
+          (gpu_fault_departed_node_cleanup_oldest_open_age_seconds) > 7200
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: A departed GPU node's records have not been ended for two hours
+          runbook_url: docs/en/administrator-operations.md#gpufaultdepartednodecleanupstuck
+          description: >-
+            The oldest {{ $labels.status }} departed node of GPU cluster
+            {{ $labels.cluster_id }} has waited {{ $value | humanizeDuration }}.
+            gpu-fault-admin status lists it under "departed node" with its
+            blocker and, when it is REFUSED, the exact manual command.
       # PENDING is the state a workflow waits in for a dispatcher to pick it up.
       # The dispatcher observes the age of the oldest PENDING workflow on every
       # tick and warns past a threshold; this is the same fact in AMP. Thirty

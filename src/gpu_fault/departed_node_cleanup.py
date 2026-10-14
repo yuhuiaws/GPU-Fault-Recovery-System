@@ -864,9 +864,76 @@ def departed_node_cleanup_from_context(context: Any) -> DepartedNodeCleanup | No
     )
 
 
+#: The ledger states an alert watches: a departure not (yet) ended.
+OPEN_STATUSES = (DepartedNodeCleanupStatus.PENDING, DepartedNodeCleanupStatus.REFUSED)
+
+
+def _label(value: str) -> str:
+    return value.replace("\\", "\\\\").replace('"', '\\"')
+
+
+def ledger_metric_lines(
+    records: list[DepartedNodeCleanupRecord], *, now: datetime, enabled: bool
+) -> list[str]:
+    """How many departures are still open per cluster and state, and since when.
+
+    Read from the ledger in the store, so every worker process renders the
+    same value whoever holds the task lease; ``GpuFaultDepartedNodeCleanupStuck``
+    reads the age. No samples while the cleanup is switched off: its lines
+    are not being worked then, and the administrator ends the records by hand.
+    """
+
+    lines = [
+        "# HELP gpu_fault_departed_node_cleanup_open_nodes Departed GPU nodes the "
+        "cleanup has not ended yet, by cluster and ledger state.",
+        "# TYPE gpu_fault_departed_node_cleanup_open_nodes gauge",
+        "# HELP gpu_fault_departed_node_cleanup_oldest_open_age_seconds Seconds "
+        "since the oldest departed GPU node of the cluster and state entered the "
+        "ledger.",
+        "# TYPE gpu_fault_departed_node_cleanup_oldest_open_age_seconds gauge",
+    ]
+    if not enabled:
+        return lines
+    counts: Counter[tuple[str, str]] = Counter()
+    oldest: dict[tuple[str, str], datetime] = {}
+    for record in records:
+        if record.status not in OPEN_STATUSES:
+            continue
+        key = (record.cluster_id, record.status.value)
+        counts[key] += 1
+        if key not in oldest or record.first_seen_at < oldest[key]:
+            oldest[key] = record.first_seen_at
+    for (cluster_id, status), count in sorted(counts.items()):
+        labels = f'cluster_id="{_label(cluster_id)}",status="{status}"'
+        age = max(0.0, (now - oldest[(cluster_id, status)]).total_seconds())
+        lines.append(f"gpu_fault_departed_node_cleanup_open_nodes{{{labels}}} {count}")
+        lines.append(
+            f"gpu_fault_departed_node_cleanup_oldest_open_age_seconds{{{labels}}} "
+            f"{age:.0f}"
+        )
+    return lines
+
+
 def departed_node_cleanup_metric_lines(
     cleanup: DepartedNodeCleanup | None,
+    *,
+    ledger: Callable[[], list[DepartedNodeCleanupRecord]] | None = None,
 ) -> list[str]:
-    """``/metrics`` lines of the cleanup; none where the cleanup does not run."""
+    """``/metrics`` lines of the cleanup; none where the cleanup does not run.
 
-    return cleanup.metric_lines() if cleanup is not None else []
+    ``ledger`` reads the ledger (the caller's scan cache); without it only
+    this process's counters are rendered.
+    """
+
+    if cleanup is None:
+        return []
+    lines = cleanup.metric_lines()
+    if ledger is not None:
+        lines.extend(
+            ledger_metric_lines(
+                ledger(),
+                now=datetime.now(timezone.utc),
+                enabled=cleanup.config.enabled,
+            )
+        )
+    return lines

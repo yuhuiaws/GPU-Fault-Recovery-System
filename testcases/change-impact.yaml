@@ -790,6 +790,7 @@ rules:
       - tests/admin/test_incident_close_departed_nodes.py
       - src/gpu_fault/admin/warm_spare_departed.py
       - tests/admin/test_admin_warm_spare_departed.py
+      - tests/metrics/test_departed_node_cleanup_promql.py
     pytest:
       - tests/departed_nodes
       - tests/execution/test_cluster_executor_node_inventory.py
@@ -803,6 +804,7 @@ rules:
       - tests/admin/test_incident_close_departed_nodes.py
       - tests/admin/test_admin_warm_spare_departed.py
       - tests/admin/test_admin_warm_spare.py
+      - tests/metrics/test_departed_node_cleanup_promql.py
     regional_cases: []
     postgres: true
 

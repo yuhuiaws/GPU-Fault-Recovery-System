@@ -162,6 +162,9 @@ _ANY = (
 # the worst process, high-water marks, and "any process is in this state".
 _MAX = (
     "gpu_fault_departed_node_cleanup_last_cycle_timestamp_seconds",
+    # Read from the store's ledger: every process renders the same value.
+    "gpu_fault_departed_node_cleanup_open_nodes",
+    "gpu_fault_departed_node_cleanup_oldest_open_age_seconds",
     "gpu_fault_notification_delivery_error_last_seen_timestamp_seconds",
     "gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds",
     "gpu_fault_notification_dispatch_last_cycle_timestamp_seconds",

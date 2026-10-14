@@ -3668,7 +3668,12 @@ node name is back in Kubernetes or the cluster is de-registered. The `control_ap
 ledger (without the evidence) to `status` and the release verification: the `status` header prints the summary and at
 most 5 lines of open nodes, and the Agent coverage drift refusal carries the cleanup's state. Notifications are
 de-duplicated per departure through `save_notification_if_absent`: an ending is `ACTION_COMPLETED` (priority 10), a refusal
-`OPERATOR_REVIEW` (priority 50); neither is an AMP alert.
+`OPERATOR_REVIEW` (priority 50); neither is an AMP alert. AMP reads the ledger: `ledger_metric_lines` reads it from the store
+through the `/metrics` scan cache and renders, per cluster and state, the number of open lines and the age of the oldest
+(the same value on every worker, none while switched off); `GpuFaultDepartedNodeCleanupStuck` fires at warning when the
+oldest `PENDING` or `REFUSED` line is past 7200 s for 5 min (proven with promtool in
+`tests/metrics/test_departed_node_cleanup_promql.py`), and all seven `gpu_fault_departed_node_cleanup_*` families are on the
+control-plane ADOT keep list.
 
 **Switch and guard.** `GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED` (AdminConfig `spec.workflow.departedNodeCleanup`,
 default true, the default kept out of records) is rendered into all three roles' core ConfigMaps: the worker decides
@@ -4329,7 +4334,7 @@ the real app assembled by `create_app(build_context())` (in-memory Store fixture
 exports **264 metric families** with `regional_mode` off and **277** with it on (the extra 13 are all emitted only in regional mode:
 9 `gpu_fault_remote_command_*`, 2 `gpu_fault_fleet_rollout_*`, 2 `gpu_fault_regional_registry_*`),
 all prefixed `gpu_fault_`; under the same fixture ingress is 225/227 and spool-worker is 224/226. Conditional families such as the Postgres connection pool,
-spare health, spool consumer, collector snapshot and the departed-node cleanup (`gpu_fault_departed_node_cleanup_*`, 5, on
+spare health, spool consumer, collector snapshot and the departed-node cleanup (`gpu_fault_departed_node_cleanup_*`, 7, on
 the regional-mode worker only, §7.10) are not in the count; a production worker only has more, never fewer. Distribution in regional mode:
 
 | Prefix | Families | Coverage |

@@ -1353,7 +1353,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
+        "w": 6,
         "x": 0,
         "y": 54
       },
@@ -1424,8 +1424,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 8,
+        "w": 6,
+        "x": 6,
         "y": 54
       },
       "id": 25,
@@ -1495,8 +1495,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 8,
-        "x": 16,
+        "w": 6,
+        "x": 12,
         "y": 54
       },
       "id": 26,
@@ -1528,6 +1528,77 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Age of the oldest PENDING or REFUSED line of the departed-node cleanup's ledger per GPU cluster; gpu-fault-admin status names the node and its blocker.\n\nAlert GpuFaultDepartedNodeCleanupStuck (warning, for 5m, > 7200): docs/en/administrator-operations.md#gpufaultdepartednodecleanupstuck",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 7200.0
+              }
+            ]
+          },
+          "unit": "s"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 6,
+        "x": 18,
+        "y": 54
+      },
+      "id": 27,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (cluster_id, status) (gpu_fault_departed_node_cleanup_oldest_open_age_seconds{cluster_id=~\"$cluster_id\",control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{cluster_id}} {{status}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Departed nodes not yet ended (oldest age)",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -1535,7 +1606,7 @@
         "x": 0,
         "y": 62
       },
-      "id": 27,
+      "id": 28,
       "panels": [],
       "title": "Dispatcher errors and notification outbox",
       "type": "row"
@@ -1583,7 +1654,7 @@
         "x": 0,
         "y": 63
       },
-      "id": 28,
+      "id": 29,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1654,7 +1725,7 @@
         "x": 8,
         "y": 63
       },
-      "id": 29,
+      "id": 30,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1725,7 +1796,7 @@
         "x": 16,
         "y": 63
       },
-      "id": 30,
+      "id": 31,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1796,7 +1867,7 @@
         "x": 0,
         "y": 71
       },
-      "id": 31,
+      "id": 32,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1878,7 +1949,7 @@
         "x": 12,
         "y": 71
       },
-      "id": 32,
+      "id": 33,
       "options": {
         "legend": {
           "displayMode": "list",

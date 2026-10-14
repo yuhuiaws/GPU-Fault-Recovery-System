@@ -2440,7 +2440,7 @@ from the panel table in `scripts/grafana_dashboard_catalog.py`, and `make grafan
 guarantees the checked-in JSON is byte-for-byte identical to the generated result. The generator reads `amp-rules.yaml`: whenever an alert expression ends in
 `> N` / `>= N` / `< N`, the panel drawing that metric gets a threshold line of the same value (critical red, warning
 orange); each panel's description lists the alert names it covers, their `for` durations and the anchors of the cards in this section, so it is one step from a panel to
-a triage card. Each of the 83 alerts lands on at least one panel (`tests/test_grafana_dashboards.py`
+a triage card. Each of the 84 alerts lands on at least one panel (`tests/test_grafana_dashboards.py`
 iterates over all rules asserting this, and asserts the thresholds too); a threshold changed in the rules without regenerating turns the gate red.
 
 Import path: the Grafana provisioning step of `gpu-fault-admin deploy` imports them automatically at deployment into
@@ -2498,7 +2498,7 @@ and the names are the card names below.
 | GPU Fault · Remote command (`gpu-fault-remote-command`) | `gpu-fault-remote-command` | Claim latency -> `GpuFaultRemoteCommandUnclaimed`, `GpuFaultRemoteCommandExecutorInternalError`; Command census -> `GpuFaultRemoteCommandUnclaimedExpired` (the per-state/per-cluster command count panels are trend readings) |
 | GPU Fault · Policy coverage (`gpu-fault-policy-coverage`) | `gpu-fault-policy-coverage` | Catalog coverage -> `GpuFaultUnknownProductFamily` (CRITICAL findings without an incident is a trend reading) |
 | GPU Fault · Orchestration invariants (`gpu-fault-orchestration-invariants`) | `gpu-fault-orchestration-invariants` | Node ownership -> `GpuFaultExclusiveNodeOwnershipInvariantViolation`, `GpuFaultStaleAttemptObservation`; Fleet rollout fence -> `GpuFaultFleetRolloutFenceStuck`; Pointers, agents and registry -> `GpuFaultIncidentDanglingWorkflowPointers`, `GpuFaultStaleAgents`, `GpuFaultFleetPinAheadOfFleet`, `GpuFaultRegionalRegistrySecretDrift` |
-| GPU Fault · Recovery outcome (`gpu-fault-recovery-outcome`) | `gpu-fault-recovery-outcome` | Workflows -> `GpuFaultRecoveryBlockedBacklog`, `GpuFaultWorkflowPendingAge`, `GpuFaultWorkflowDeadlineNotEnforced`; Step waiting -> `GpuFaultWorkflowStepStalled`; Counters (30m increase) -> `GpuFaultWorkflowLifetimeExceeded`, `GpuFaultJobWorkflowNodeBusyTimeout`, `GpuFaultProcessorRetryHorizonFailures`, `GpuFaultBranchEscalationBudgetRefused`; Closed loop and notifications -> `GpuFaultClosedLoopSlow`, `GpuFaultClosedLoopWindowIncomplete`, `GpuFaultNotificationDeliveryFailing`; Remediation budget -> `GpuFaultRemediationBudgetStarved`, `GpuFaultRemediationBudgetClusterSaturated`; Completion and incidents -> `GpuFaultCompletionEventsWithoutDecision`, `GpuFaultIncidentsAwaitingOperator`; Dispatcher errors and notification outbox -> `GpuFaultWorkflowDispatchInternalErrors`, `GpuFaultWorkflowFailureHandlingAbandoned`, `GpuFaultNotificationUndeliveredTooLong`, `GpuFaultNotificationOutboxNotDraining`, `GpuFaultNotificationExpiredUnsent` |
+| GPU Fault · Recovery outcome (`gpu-fault-recovery-outcome`) | `gpu-fault-recovery-outcome` | Workflows -> `GpuFaultRecoveryBlockedBacklog`, `GpuFaultWorkflowPendingAge`, `GpuFaultWorkflowDeadlineNotEnforced`; Step waiting -> `GpuFaultWorkflowStepStalled`; Counters (30m increase) -> `GpuFaultWorkflowLifetimeExceeded`, `GpuFaultJobWorkflowNodeBusyTimeout`, `GpuFaultProcessorRetryHorizonFailures`, `GpuFaultBranchEscalationBudgetRefused`; Closed loop and notifications -> `GpuFaultClosedLoopSlow`, `GpuFaultClosedLoopWindowIncomplete`, `GpuFaultNotificationDeliveryFailing`; Remediation budget -> `GpuFaultRemediationBudgetStarved`, `GpuFaultRemediationBudgetClusterSaturated`; Completion and incidents -> `GpuFaultCompletionEventsWithoutDecision`, `GpuFaultIncidentsAwaitingOperator`, `GpuFaultDepartedNodeCleanupStuck`; Dispatcher errors and notification outbox -> `GpuFaultWorkflowDispatchInternalErrors`, `GpuFaultWorkflowFailureHandlingAbandoned`, `GpuFaultNotificationUndeliveredTooLong`, `GpuFaultNotificationOutboxNotDraining`, `GpuFaultNotificationExpiredUnsent` |
 
 The last row of the overview, "Declared topology", is `gpu_fault_capacity_largest_cluster_node_count` /
 `gpu_fault_capacity_managed_node_count`: the topology declared by the release, from which the fault reservation and the Aurora capacity floor are derived;
@@ -3279,6 +3279,29 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   This is a handling process not closed out, not a monitoring false positive.
 - **Boundary**: only an operator action moves an incident out of this state; the retention policy does not; do not change Store
   rows or silence the rule to clear the alert -- silencing amounts to admitting this queue needs no one watching it.
+
+### GpuFaultDepartedNodeCleanupStuck
+
+- **Meaning**: a GPU node left its cluster (spot reclaim, scale-in, provider replacement), and the control plane's
+  departed-node cleanup ends the records it left minutes after proving the departure (§10.1.1). A departed node still
+  `PENDING` (the proof does not come together) or `REFUSED` (something on it is the administrator's) in the ledger after
+  two hours is residue nobody is ending: the Agent coverage check and the release preflight's `workflow_safety` keep
+  refusing because of it. Warning, does not page.
+- **Which metric it reads**: `gpu_fault_departed_node_cleanup_oldest_open_age_seconds{cluster_id,status}` -- seconds since
+  the oldest departed node of each GPU cluster and ledger state entered the ledger;
+  `gpu_fault_departed_node_cleanup_open_nodes` is the count. Both read the ledger in the store, so every worker process
+  renders the same value; a switched-off cleanup renders none.
+- **First check**: `gpu-fault-admin status` -- the header's `departed node <cluster>/<node>: <state> (<reason>)` lines name
+  the node and its first reason, and on a `REFUSED` line `manual:` is followed by the exact manual command; the whole
+  ledger is at `health.checks[control_api].details.clusters[<cluster>].departed_node_cleanup`. Act on the reason (the
+  table of §10.1.1): a `PENDING` line is mostly a failed provider read (`provider_unknown`: IAM, throttling; see the
+  control-worker WARNING `departed-node cleanup: <provider> lookup ... failed`), an Executor no longer reporting the node
+  inventory (`kubernetes_unproven` with `no Kubernetes node report` or a stale report) or a workflow still executing; a
+  `REFUSED` line follows its `manual:` command into §10.2, §9.1 or `config spare --release`. The next cycle (60 s) after
+  that turns the line `CLEANED` and the alert resolves.
+- **Boundary**: do not delete ledger lines or edit the store to clear the alert; the cleanup itself deletes a line when
+  the node name is back in Kubernetes, the cluster is de-registered or the line has been `CLEANED` for 7 days. To pause
+  the automatic cleanup use `spec.workflow.departedNodeCleanup: false` (§10.1.1), not a silence.
 
 ### GpuFaultWorkflowPendingAge
 
@@ -4102,7 +4125,13 @@ proven).
 - Metrics (only the control-worker process holding the lease has non-zero samples): `gpu_fault_departed_node_cleanup_enabled`,
   `gpu_fault_departed_node_cleanup_cycles_total`, `gpu_fault_departed_node_cleanup_last_cycle_timestamp_seconds`,
   `gpu_fault_departed_node_cleanup_actions_total{action="agent_retired|workflow_closed|incident_closed"}` and
-  `gpu_fault_departed_node_cleanup_refusals_total{reason="..."}` (counted once when a node's reason first appears).
+  `gpu_fault_departed_node_cleanup_refusals_total{reason="..."}` (counted once when a node's reason first appears); the
+  ledger itself is `gpu_fault_departed_node_cleanup_open_nodes{cluster_id,status}` and
+  `gpu_fault_departed_node_cleanup_oldest_open_age_seconds{cluster_id,status}` (the count of open `PENDING`/`REFUSED`
+  lines and the age of the oldest, read from the store so every worker renders the same value, none while switched
+  off). All seven families reach AMP through the control-plane ADOT; the oldest line past 2 hours raises the
+  warning-level, non-paging `GpuFaultDepartedNodeCleanupStuck` (triage card in §8), plotted on the Recovery outcome
+  dashboard's Completion and incidents row.
 - Logs (control-worker; cluster names, node names and counts only, never tokens): one line per verdict change
   `departed-node cleanup: <cluster>/<node> <state> actions=... blockers=...`; a failed provider read logs the WARNING
   `departed-node cleanup: <provider> lookup for cluster <cluster> failed; <n> node(s) stay unproven: <error code>`. A failed

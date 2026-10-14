@@ -1347,6 +1347,25 @@ RECOVERY_OUTCOME = Dashboard(
                     ),
                     description="ESCALATED is the operator queue the alert watches.",
                 ),
+                Panel(
+                    "Departed nodes not yet ended (oldest age)",
+                    (
+                        Target(
+                            "max by (cluster_id, status) ("
+                            + cluster_series(
+                                "gpu_fault_departed_node_cleanup_oldest_open_age_seconds"
+                            )
+                            + ")",
+                            "{{cluster_id}} {{status}}",
+                        ),
+                    ),
+                    unit="s",
+                    description=(
+                        "Age of the oldest PENDING or REFUSED line of the "
+                        "departed-node cleanup's ledger per GPU cluster; "
+                        "gpu-fault-admin status names the node and its blocker."
+                    ),
+                ),
             ),
         ),
         Row(
