@@ -50,6 +50,17 @@ SCALAR_METRICS: dict[str, tuple[str, ...]] = {
         "serverless_capacity_acu",
         "at_window_start",
     ),
+    # The store during the start-burst storm (performance plan §11).
+    "pg_buffer_content_share_first_two_minutes": (
+        "pg_activity",
+        "first_two_minutes",
+        "buffer_content_share",
+    ),
+    "pg_peak_admission_inserts_first_two_minutes": (
+        "pg_activity",
+        "first_two_minutes",
+        "peak_admission_inserts",
+    ),
     "mean_in_flight_while_backlog": (
         "processor_timeseries",
         "consumers",

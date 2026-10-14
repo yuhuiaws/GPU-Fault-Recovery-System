@@ -285,8 +285,9 @@ group's directory holds `run-1` ... `run-N`, each a complete run directory, and
 `repeat-summary.json`: every run's artifacts, run id, release, exit code and job status, and for
 each headline metric (throughput, fault p50/p99, per ingress path count, throughput and
 p50/p95/p99/max latency, queue drain seconds and depth at load stop, Aurora max ACU and CPU, the
-Aurora capacity at the step and window start (§8.1 `aurora_measurement`), the processor's mean
-in-flight while a backlog lasted) the per-run values, median, min, max and relative
+Aurora capacity at the step and window start (§8.1 `aurora_measurement`), the store's
+`LWLock:BufferContent` share and peak admission INSERTs in the first two minutes (§8.1 `pg_activity`),
+the processor's mean in-flight while a backlog lasted) the per-run values, median, min, max and relative
 spread `(max - min) / median`. The group stops at the first failed run and exits with its code;
 medians cover the runs that completed, and `same_release=false` means the release changed between
 runs, so the medians do not describe one build.
@@ -592,6 +593,16 @@ The drain probe starts the moment the load Job completes, beside the after-load 
 once the metrics, cgroup, PostgreSQL and log collection had finished (about 45 s later), and the readings at
 that point are kept as `queue_drain_seconds_after_collection` and `queue_depth_after_collection` for
 comparisons with older rounds.
+
+Beside it the runner keeps one more session, in one api-ha Pod (`regional_capacity_pg_activity.py`),
+that reads `pg_stat_activity` through the store's own DSN every 0.5 s: per sample the active client
+statements by wait event, how many are admission INSERTs into `gpu_fault_processor_queue`, the
+autovacuum workers and the most frequent statements (literals and numbers masked, 80 characters). The
+samples go to `pg-activity.json` (at most 7200), and `summary.json.pg_activity` gives, for the whole
+window and for the load's first two minutes (`first_two_minutes`), the active statement samples, the
+mean and peak active statements, the wait-event shares with `buffer_content_share`
+(`LWLock:BufferContent`), `peak_admission_inserts`, the samples with an autovacuum worker and their
+share, and the top statements -- the storm summary §11 asks of a formal record.
 
 `all`, `run` and the action, integrated and correlated suites must execute the same idempotent
 teardown in `finally` regardless of success, non-Complete, exception or interruption. Teardown
@@ -1140,6 +1151,7 @@ postgres-before.json
 postgres-after.json
 queue-drain.json
 processor-timeseries.json
+pg-activity.json
 processor-priority-latency.json
 aurora.json
 pods/
@@ -1170,7 +1182,8 @@ counts, pages and live rows of `gpu_fault_gpu_metric_latest_clusters` and `gpu_f
 `store_bloat.before.gpu_fault_processor_queue.index_pages_per_live_row` and `store_layout.mode` -- and the
 `pg_stat_activity` sampler summary of the first two storm minutes (active statement samples, `LWLock:BufferContent`
 share, peak concurrent admission INSERTs, autovacuum share; the four data points of §3.3 were told apart by exactly
-these readings): a PASS without them cannot say which store it ran on. The
+these readings; the burst runner records it as `summary.json.pg_activity.first_two_minutes`, §8.1): a PASS
+without them cannot say which store it ran on. The
 integrated runner must also record `control_plane_pod_lifecycle`, containing at least the total
 restart delta, the Pods that restarted, Pods that appeared/disappeared during the run, counter
 regressions and Pods not Ready at the end. If any item is non-empty or non-zero it cannot count

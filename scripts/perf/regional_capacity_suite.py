@@ -43,6 +43,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING or __package__:
     from . import regional_capacity_data as capacity_data
     from . import regional_capacity_database as capacity_database
+    from . import regional_capacity_pg_activity as capacity_pg_activity
     from . import regional_capacity_placement as capacity_placement
     from . import regional_capacity_recovery as capacity_recovery
     from . import regional_capacity_registry as capacity_registry
@@ -62,6 +63,7 @@ if TYPE_CHECKING or __package__:
 else:
     import regional_capacity_data as capacity_data
     import regional_capacity_database as capacity_database
+    import regional_capacity_pg_activity as capacity_pg_activity
     import regional_capacity_placement as capacity_placement
     import regional_capacity_recovery as capacity_recovery
     import regional_capacity_registry as capacity_registry
@@ -692,6 +694,10 @@ def start_processor_timeseries(pods: list[str]) -> Any:
     return capacity_timeseries.ProcessorTimeseries(pods).start()
 
 
+def start_pg_activity(pods: list[str]) -> Any:
+    return capacity_pg_activity.PgActivity(pods).start()
+
+
 def collect_after_load(
     pods: list[str], artifacts: Path, job: str, *, targets: tuple[float, float]
 ) -> tuple[dict, dict, list[dict], dict]:
@@ -873,6 +879,7 @@ def execute_case(
     sampler.start()
     # Per Pod, once a second, through the load and the drain.
     series = start_processor_timeseries(pods)
+    activity = start_pg_activity(pods)  # pg_stat_activity twice a second
     try:
         if gated_start:
             wait_for_load_pods(
@@ -900,11 +907,13 @@ def execute_case(
         priority_latency = processor_priority_latency(load_created_at)
     finally:
         series.stop()
+        activity.stop()
         sampler.stop()
         sampler.join(timeout=30)
     (artifacts / "processor-timeseries.json").write_text(
         json.dumps(series.document()) + "\n"
     )
+    (artifacts / "pg-activity.json").write_text(json.dumps(activity.document()) + "\n")
     (artifacts / "queue-drain.json").write_text(json.dumps(drain, indent=1) + "\n")
     (artifacts / "processor-priority-latency.json").write_text(
         json.dumps(priority_latency, indent=1) + "\n"
@@ -944,6 +953,7 @@ def execute_case(
             ),
             "queue_depth_after_collection": drain.get("depth_after_collection"),
             "processor_timeseries": series.summary(),
+            "pg_activity": activity.summary(window_start),
             "cpu_throttling": {
                 pod: {
                     key: int(after[key]) - int(cgroup_before.get(pod, {}).get(key, 0))

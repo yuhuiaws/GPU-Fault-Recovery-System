@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import subprocess
 import sys
 from contextlib import redirect_stdout
 from datetime import datetime, timedelta, timezone
@@ -32,6 +33,8 @@ from scripts.e2e.regional import run_net003_result_retry as net003
 from scripts.e2e.regional import run_preempt037_dispatcher_liveness as liveness
 from scripts.e2e.regional import seeded_command_fixture as seeded
 from scripts.perf import regional_capacity_data as capacity_data
+from scripts.perf import regional_capacity_pg_activity as pg_activity
+from scripts.perf import regional_capacity_timeseries as timeseries
 from tests._builders import workflow_request
 
 POSTGRES_URL = os.getenv("GPU_FAULT_TEST_POSTGRES_URL", "")
@@ -713,3 +716,69 @@ def test_capacity_probe_does_not_prove_residue_that_is_not_drill_residue(
             capacity_data.inspect_or_cleanup(
                 connection, run_id="act-a", cluster_ids=["perf-cap-000"], cleanup=True
             )
+
+
+def test_the_activity_sampler_sees_an_admission_insert_waiting_in_the_store(
+    tmp_path: Path,
+) -> None:
+    """The burst suite's in-Pod pg_stat_activity program, run against a real
+    server: a waiting admission-shaped INSERT is seen, classified and shaped."""
+
+    import psycopg
+    from psycopg import sql
+    from psycopg.conninfo import make_conninfo
+
+    name = "gpu_fault_activity_" + uuid4().hex
+    url = make_conninfo(POSTGRES_URL, dbname=name)
+    dsn_file = tmp_path / "postgres-url"
+    dsn_file.write_text(url, encoding="utf-8")
+    dsn_file.chmod(0o600)
+    with psycopg.connect(POSTGRES_URL, autocommit=True) as admin:
+        admin.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(name)))
+        try:
+            with psycopg.connect(url, autocommit=True) as writer:
+                writer.execute(
+                    "CREATE TABLE gpu_fault_processor_queue (request_id text)"
+                )
+                sampler = subprocess.Popen(
+                    [sys.executable, "-c", timeseries.BOOTSTRAP],
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=tmp_path,
+                    # The shard runner's URL carries no password: libpq reads
+                    # it from PGPASSFILE / HOME, so the environment passes on.
+                    env={
+                        **os.environ,
+                        "GPU_FAULT_STORE_URL_FILE": str(dsn_file),
+                        "SAMPLE_INTERVAL": "0.1",
+                        "SAMPLE_LIMIT": "200",
+                        "SAMPLE_TOP": "5",
+                    },
+                )
+                assert sampler.stdin is not None
+                sampler.stdin.write(timeseries.session_input(pg_activity.program()))
+                sampler.stdin.flush()
+                writer.execute(
+                    "INSERT INTO gpu_fault_processor_queue (request_id) "
+                    "SELECT 'request-42' FROM pg_sleep(1.5)"
+                )
+                output, errors = sampler.communicate(timeout=60)  # EOF stops it
+        finally:
+            admin.execute(
+                sql.SQL("DROP DATABASE {} WITH (FORCE)").format(sql.Identifier(name))
+            )
+
+    assert sampler.returncode == 0, errors.decode()[-2000:]
+    samples = [json.loads(line) for line in output.decode().splitlines()]
+    caught = [item for item in samples if item.get("admission_inserts")]
+    assert caught, samples
+    assert all(item["waits"].get("Timeout:PgSleep") for item in caught), caught
+    (statement,) = caught[0]["statements"]
+    assert statement.startswith(
+        "INSERT INTO gpu_fault_processor_queue (request_id) SELECT '?' FROM pg_sleep("
+    ), "literals are masked; the statement is cut to 80 characters"
+    assert len(statement) <= 80
+    summary = pg_activity.activity_summary(samples, load_start=samples[0]["t"])
+    assert summary["first_two_minutes"]["peak_admission_inserts"] == 1
+    assert summary["errors"] == 0

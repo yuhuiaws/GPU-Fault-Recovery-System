@@ -36,7 +36,7 @@ class SeriesStub:
     def document(self) -> dict[str, Any]:
         return {"pods": {}}
 
-    def summary(self) -> dict[str, Any]:
+    def summary(self, *_args: Any) -> dict[str, Any]:
         return {"pods": {}}
 
 
@@ -191,6 +191,7 @@ class CapacityWire:
         monkeypatch.setattr(
             capacity, "start_processor_timeseries", lambda _pods: SeriesStub()
         )
+        monkeypatch.setattr(capacity, "start_pg_activity", lambda _pods: SeriesStub())
         monkeypatch.setattr(
             action,
             "executor_identity",

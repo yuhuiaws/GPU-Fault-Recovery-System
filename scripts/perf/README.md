@@ -231,6 +231,9 @@ is split by responsibility:
 - `regional_capacity_priority_latency.py`: per-tier completion latency, read in
   an api-ha Pod from where the active store layout keeps completed requests
   (queue rows inline, replay partitions detached).
+- `regional_capacity_pg_activity.py`: one session in an api-ha Pod that reads
+  `pg_stat_activity` twice a second through the load and the drain, and the
+  storm summary of the load's first two minutes.
 - `regional_capacity_timeseries.py`: one sampling session per control-plane Pod
   through the load and the drain (processor in-flight, workers, queue depth and
   consumer cycles once per second), and the drain probe that starts at the

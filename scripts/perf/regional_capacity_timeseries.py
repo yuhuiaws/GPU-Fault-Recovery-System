@@ -106,7 +106,9 @@ def session_input(program: str) -> bytes:
     return str(len(encoded)).encode() + b"\n" + encoded
 
 
-class _PodSession:
+class PodSession:
+    """One long-lived in-Pod program: its process and the samples it printed."""
+
     def __init__(self, pod: str, process: Any, limit: int) -> None:
         self.pod = pod
         self.process = process
@@ -132,6 +134,50 @@ class _PodSession:
             self.samples.append(sample)
 
 
+def open_session(
+    pod: str,
+    argv: list[str],
+    program: str,
+    *,
+    limit: int,
+    popen: Callable[..., Any] = subprocess.Popen,
+) -> PodSession:
+    """Start ``argv`` (a ``kubectl exec -i`` running ``BOOTSTRAP``), hand it the
+    length-prefixed ``program`` and read its JSON lines; stdin stays open as
+    the session's stop channel."""
+
+    process = popen(
+        argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL
+    )
+    process.stdin.write(session_input(program))
+    process.stdin.flush()
+    session = PodSession(pod, process, limit)
+    session.reader.start()
+    return session
+
+
+def stop_sessions(
+    sessions: Iterable[PodSession], *, timeout_seconds: float = STOP_TIMEOUT_SECONDS
+) -> None:
+    """Close every session's stdin (its stop channel); kill what lingers."""
+
+    sessions = list(sessions)
+    for session in sessions:
+        try:
+            session.process.stdin.close()
+        except (OSError, ValueError):
+            pass
+    deadline = time.monotonic() + timeout_seconds
+    for session in sessions:
+        session.reader.join(timeout=max(0.0, deadline - time.monotonic()))
+        if session.reader.is_alive():
+            session.error = "the session did not stop; its kubectl was killed"
+            try:
+                session.process.kill()
+            except OSError:
+                pass
+
+
 class ProcessorTimeseries:
     """The run's per-Pod sampling sessions, from :meth:`start` to :meth:`stop`."""
 
@@ -147,7 +193,7 @@ class ProcessorTimeseries:
         self.interval_seconds = interval_seconds
         self.limit = limit
         self.popen = popen
-        self.sessions: dict[str, _PodSession] = {}
+        self.sessions: dict[str, PodSession] = {}
         self.failed: dict[str, str] = {}
 
     def _argv(self, pod: str) -> list[str]:
@@ -174,39 +220,19 @@ class ProcessorTimeseries:
     def start(self) -> ProcessorTimeseries:
         for pod in self.pods:
             try:
-                process = self.popen(
+                self.sessions[pod] = open_session(
+                    pod,
                     self._argv(pod),
-                    stdin=subprocess.PIPE,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,
+                    SAMPLE_PROGRAM,
+                    limit=self.limit,
+                    popen=self.popen,
                 )
-                process.stdin.write(session_input(SAMPLE_PROGRAM))
-                process.stdin.flush()
             except (OSError, ValueError, subprocess.SubprocessError) as exc:
                 self.failed[pod] = f"{type(exc).__name__}: {exc}"
-                continue
-            session = _PodSession(pod, process, self.limit)
-            session.reader.start()
-            self.sessions[pod] = session
         return self
 
     def stop(self, *, timeout_seconds: float = STOP_TIMEOUT_SECONDS) -> None:
-        """Close every session's stdin (its stop channel); kill what lingers."""
-
-        for session in self.sessions.values():
-            try:
-                session.process.stdin.close()
-            except (OSError, ValueError):
-                pass
-        deadline = time.monotonic() + timeout_seconds
-        for session in self.sessions.values():
-            session.reader.join(timeout=max(0.0, deadline - time.monotonic()))
-            if session.reader.is_alive():
-                session.error = "the session did not stop; its kubectl was killed"
-                try:
-                    session.process.kill()
-                except OSError:
-                    pass
+        stop_sessions(self.sessions.values(), timeout_seconds=timeout_seconds)
 
     def document(self) -> dict[str, Any]:
         return {
