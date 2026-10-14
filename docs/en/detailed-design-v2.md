@@ -278,7 +278,7 @@ ConfigMaps.
 | `gpu-fault-process-metrics` | All three roles (`POD_UID` exists; when unset the thread returns immediately without running the publish loop) | Every 5 s writes the rendered full `/metrics` of this process to `/dev/shm` for in-Pod aggregation (§10.2) |
 | `gpu-fault-processor-inbox` | `background_services_enabled` | Main consumer loop: claim → process → complete |
 | `gpu-fault-processor-notifications` | `background_services_enabled` and the Store supports `listen_processor_queue_notifications` | Listens to `pg_notify('gpu_fault_processor_queue')` and wakes the inbox |
-| `gpu-fault-periodic-services` | `background_services_enabled` | The 8 periodic tasks in `PeriodicServiceRunner._JOBS` (§2.3.1) |
+| `gpu-fault-periodic-services` | `background_services_enabled` | The 10 periodic tasks in `PeriodicServiceRunner._JOBS` (§2.3.1) |
 | `gpu-fault-workflow-dispatcher` | `background_services_enabled` | Scans runnable workflows and drives the state machine |
 | `gpu-fault-workflow-dispatch-wakeups-workflow` / `-remote-command` | dispatcher enabled and the Store has `run_wakeup_listener` | Each listens to the `pg_notify` of one `WakeupChannel` and translates it into `dispatcher.wake()` (§3.7 ④) |
 | `gpu-fault-xid-correlation` | `background_services_enabled` | Finalize of the XID correlation window |
@@ -308,6 +308,7 @@ does not block the other tasks (`src/gpu_fault/app/periodic_services.py`).
 | `processor-lease-reclaim` | 30s | `GPU_FAULT_PROCESSOR_LEASE_RECLAIM_SECONDS` | Reclaims queue rows whose lease has expired but are still LEASED, at most `LEASE_RECLAIM_BATCH=256` rows per round |
 | `processor-counter-drift` | 60s | `GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS` | Drift scan between the queue count table/shards and the real row count (`processor_counter_drift_abs`) |
 | `store-compaction` | 300s | `GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS` | Catalog scan of the hot tables' physical layout (`store/postgres/hot_table_bloat.py`: heap/index pages per live row, the least dense index's entries per page, exported as `gpu_fault_store_hot_table_*`); `REINDEX INDEX CONCURRENTLY` for an index of at least 64 pages below 8 entries per page, `VACUUM (FULL, ANALYZE)` for lanes/queue counts/priority shards at 16+ pages below 4 live rows per page; holds the `gpu_fault_schema_bootstrap` advisory lock, mutually exclusive with a schema ensure/`store-maintenance`; every round (nothing due included) logs one INFO `store-compaction scan: ...`, moves `gpu_fault_store_compaction_last_timestamp_seconds` and counts in `gpu_fault_store_compaction_rounds_total{outcome}`; rebuilds count in `gpu_fault_store_compaction_actions_total{table,action,status}` and `..._last_action_timestamp_seconds`; `..._index_max_pages`/`..._due_actions` export the rule's input and verdict; samples exist on the lease-holding process only; `0` disables |
+| `departed-node-cleanup` | 60s | `GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED` (switch, on by default; the interval is fixed) | Ends what a departed GPU node (spot reclaim, scale-in, provider replacement) left behind: retires the Agent, closes the workflows that never changed the node and the ESCALATED incidents; evidence and refusals in §7.10; exists only in regional mode with a fleet registry; `gpu_fault_departed_node_cleanup_*` has non-zero samples on the lease-holding process only |
 
 `collector-silence` runs in the background Worker in regional mode. `PeriodicServiceRunner._run_silence`
 schedules `notify_silent_collectors` (`src/gpu_fault/app/collector_silence.py`), which reads the collection state
@@ -3555,11 +3556,126 @@ For the corresponding behaviour coverage see `tests/completion/test_completion_s
 `tests/completion/test_restart_execution_premise.py` and
 `tests/execution/test_restart_budget_exhausted_preflight.py`.
 
+### 7.10 Automatic Cleanup After a Node Departs: Spot Reclaim, Scale-In and Provider Replacement
+
+When a node leaves its cluster (a spot reclaim, a scale-in, a provider replacing the instance by itself) everything on it
+disappears with the instance, and the control plane is left with three records nobody will ever move again: the fleet
+Agent (`ACTIVE`, lease expired), the workflow of the node's incident (`PENDING` and never dispatched, or
+`BLOCKED / NEEDS_OPERATOR` without having changed the node) and the `ESCALATED` incident. The departed-node cleanup
+(`src/gpu_fault/departed_node_cleanup.py`) ends them inside the control plane, judging and writing exclusively with the
+rule and the paths of the administrator's `workflow-reconcile`:
+
+- **One rule**: `src/gpu_fault/departed_nodes.py` -- the guard constant `DEPARTED_AGENT_GUARD_AGE` (10 min), the HyperPod
+  node name to instance id, the EC2 state verdicts, the Agent retirement reasons `agent_retirement_reasons` (lifecycle,
+  heartbeat older than the guard, lease expired), the evidence record shape `node_evidence`, the retirement write
+  `retire_departed_agent` and its audit line `retirement_audit`. `admin/workflow_reconcile_departed_agents.py`,
+  `admin/workflow_reconcile_departed_nodes.py` and `admin/workflow_reconcile_never_dispatched.py` export the very same
+  objects (`tests/departed_nodes/test_departed_node_rules.py` asserts identity); the scripts the CLI sends into the Pod call
+  the shared writes first and fall back to the same rule carried in the script on an image that predates them.
+- **One writer**: the periodic task `departed-node-cleanup` (§2.3.1); its periodic-task lease makes one control-worker
+  process in the whole site run a cycle at a time, and every write is a compare-and-set as well, so when the lease moves
+  or two cycles overlap the loser is refused instead of overwriting.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant Ex as cluster executor
+    participant API as api-ha
+    participant DB as Aurora
+    participant W as control-worker (task lease holder)
+    participant P as SageMaker / EC2
+
+    loop every 60 s
+        Ex->>Ex: paginated LIST of every Node (one snapshot, time taken before the LIST)
+        Ex->>API: POST /v1/regional/executors/node-inventory (cluster token)
+        API->>DB: merge under the cluster lock: absent[name].since; a gap > 5 min breaks the chain
+    end
+    Note over Ex: spot reclaim: the node drops out of the LIST, its Agent stops heartbeating
+    loop every 60 s
+        W->>DB: candidates: unrevoked Agents with an expired lease, open incidents' nodes, not in the latest fresh report
+        W->>W: absent >= 10 min, report <= 5 min old, heartbeat >= 10 min old, cluster ACTIVE, not a spare
+        W->>P: ListClusterNodes / DescribeInstances (once per cluster, only for nodes past every other check)
+        P-->>W: no longer listed / terminated / unknown (a failure = unproven, retried next cycle)
+        W->>DB: drain_agent -> revoke_agent (CAS)
+        W->>DB: never-dispatched / never-changed workflow -> SUPERSEDED (CAS)
+        W->>DB: ESCALATED incident -> RECOVERED (close_incident)
+        W->>DB: ledger line DepartedNodeCleanupRecord (CLEANED / PENDING / REFUSED)
+        W->>W: informational or refusal notification, counters, logs
+    end
+```
+
+Figure 7-10 Nothing is written before all three pieces of evidence are fresh; every write goes through the CLI's own path
+
+**Where the Kubernetes evidence comes from.** The control plane holds no GPU kubeconfig; the `kubernetes-node-resources`
+watcher reports GPU resource events, not "which Nodes does this cluster have now", and the collector it lives in is
+packaged in the Node Runtime closure, so changing it would roll the node Agents. The Executor already holds the cluster
+token and a Kubernetes client allowed to `list nodes`, so it does it between claims
+(`cluster_executor/node_inventory.py::NodeInventoryReporter`): every 60 s one paginated LIST without a selector, the
+report time taken before the LIST, the whole report dropped when any page fails (a partial list would read as absences),
+a failure being one WARNING that never touches the claim loop. The control plane's `kubernetes_node_inventory.py` keeps
+one record per cluster (a generic `gpu_fault_objects` kind, no DDL): `merge_node_inventory` reads the previous record
+and merges under the store's cluster lock, so two Executor replicas reporting at once both count
+(`tests/departed_nodes/test_departed_node_cleanup_postgres.py::test_two_executors_reporting_at_once_lose_nothing`); a
+report no newer than the stored one (the sibling replica's, a retry) is ignored as it is; a gap longer than
+`NODE_INVENTORY_MAX_GAP` (5 min) starts a new chain that remembers nothing; absences are remembered by name for 24 h,
+and an absence that began earlier, or a name the chain never listed, counts from the window's or the chain's start --
+both approximations only ever shorten an absence. A report whose LIST time is more than `NODE_INVENTORY_MAX_CLOCK_SKEW`
+(2 min) from the control plane's clock is refused. `kubernetes_absence` gives the verdict: a record, fresh
+(`NODE_INVENTORY_FRESHNESS`, 5 min), the node not in the latest report and left out of every report since at least the
+guard before it.
+
+**The provider evidence.** `departed_node_provider.py::Boto3ProviderMembership` is a narrow interface
+(`hyperpod_instance_ids`, `ec2_instance_states`); clients are created on first use, one per Region, with 10 s connect
+and read timeouts. HyperPod reads every page of `ListClusterNodes` (a repeating page token or more than
+`PROVIDER_PAGE_LIMIT` pages is a failure); EC2 filters by `instance-id` (at most `EC2_FILTER_BATCH` ids per call) --
+naming an id the account no longer knows fails the whole call with `InvalidInstanceID.NotFound`, while a filtered query
+simply returns nothing for it, which is exactly the "gone" answer. Any exception, throttle, denial or unparseable answer
+raises `ProviderLookupError` carrying the error code and never the message body, and the node is marked
+`provider_unknown`. It answers "is the instance gone?", the opposite of the EC2 read that attests a PRESENT node, hence a
+module of its own; integration can share the EC2 client and the IAM statement.
+
+**Actions and refusals.** `departed_node_cleanup_actions.py::DepartureWrites`: the Agent through
+`departed_nodes.retire_departed_agent` (the very write of the CLI's `--retire-departed-agents`); a `PENDING` record
+through `workflow_reconcile.close_never_dispatched_workflow` (the very write of `apply-never-dispatched`, extracted from
+the Pod script of `admin/workflow_reconcile_never_dispatched.py`); a `BLOCKED` record through
+`build_workflow_reconcile_plan` + `apply_workflow_reconcile_plan`, accepting only `terminalization=never-changed` with
+`never_changed_a_node` and checking the plan digest; the incident through `IncidentClosureService.close_incident`. The actor
+is `departed-node-cleanup`, the reference `departed-node-cleanup-<first 16 of sha256(cluster/node/instance/absent_since)>`,
+the transition `departed-node-cleanup/<reference>`. The reference is deterministic, so a resumed cycle after a restart
+lands on the same transition: a record left `DRAINING` is revoked under the transition that drained it, never drained
+twice (`test_a_restart_between_drain_and_revoke_resumes_on_postgres`). An incident that also names other nodes is closed
+only when those nodes are proven departed in the **same** cycle. Every case not ended has a bounded `kind` (also the
+`reason` label of `gpu_fault_departed_node_cleanup_refusals_total`) and a manual command, in two groups -- "waiting"
+(`PENDING`, resolving by itself) and "left to the operator" (`REFUSED`) -- tabled in §10.1.1 of administrator operations; a
+workflow that changed a node or has a remote command, a `QUARANTINED` incident, a spare declaration and anything on a
+cluster that is not `ACTIVE` are only ever reported.
+
+**Ledger and observability.** `DepartedNodeCleanupRecord` (a generic `gpu_fault_objects` kind), one line per node,
+rewritten when the verdict changes or 10 min after the last write; a `CLEANED` line stays 7 days and is deleted when the
+node name is back in Kubernetes or the cluster is de-registered. The `control_api_inspect` probe carries each cluster's
+ledger (without the evidence) to `status` and the release verification: the `status` header prints the summary and at
+most 5 lines of open nodes, and the Agent coverage drift refusal carries the cleanup's state. Notifications are
+de-duplicated per departure through `save_notification_if_absent`: an ending is `ACTION_COMPLETED` (priority 10), a refusal
+`OPERATOR_REVIEW` (priority 50); neither is an AMP alert.
+
+**Switch and guard.** `GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED` (AdminConfig `spec.workflow.departedNodeCleanup`,
+default true, the default kept out of records) is rendered into all three roles' core ConfigMaps: the worker decides
+from it whether to write, `control_api_inspect` reports it in `status`; the guard is `DEPARTED_AGENT_GUARD_AGE`, shared
+with the CLI and not configurable.
+
+Code basis: `src/gpu_fault/departed_node_cleanup.py::DepartedNodeCleanup.run_once`,
+`src/gpu_fault/departed_node_cleanup_actions.py::DepartureWrites`, `src/gpu_fault/departed_nodes.py`,
+`src/gpu_fault/kubernetes_node_inventory.py`, `src/gpu_fault/departed_node_provider.py`,
+`src/gpu_fault/cluster_executor/node_inventory.py`, `src/gpu_fault/store/shared/departed_nodes.py`.
+For the behaviour coverage see `tests/departed_nodes/` (both providers end to end on the in-memory store and on
+PostgreSQL, every refusal, the single writer, the resumed restart), `tests/execution/test_cluster_executor_node_inventory.py`,
+`tests/regional/test_departed_node_status.py` and `tests/admin/test_admin_config_departed_node_cleanup.py`.
+
 ---
 ## 8. Interface Design
 
 The route table in this chapter was obtained by **enumerating the routes one by one after assembling the real app**, not by copying them from the code
-(see §0.3 for the counting method). `create_app()` always mounts **89 application routes**
+(see §0.3 for the counting method). `create_app()` always mounts **92 application routes**
 (plus 4 FastAPI built-ins: `/docs`, `/redoc`, `/openapi.json`,
 `/docs/oauth2-redirect`); regional production mode installs the five-bucket default-deny middleware on top of them.
 `/v1/regional/*` is also mounted in local mode, but that mode is not a supported production authorization boundary.
@@ -3570,7 +3686,7 @@ The route table in this chapter was obtained by **enumerating the routes one by 
 
 | Bucket | Count | Credential | Who calls it |
 |---|---:|---|---|
-| `cluster-token` | 34 | `Authorization: Bearer <cluster token>` + `X-GPU-Fault-Cluster-ID` | Data plane (collector, cluster executor) |
+| `cluster-token` | 37 | `Authorization: Bearer <cluster token>` + `X-GPU-Fault-Cluster-ID` | Data plane (collector, cluster executor) |
 | `execution-token` | 45 | `X-GPU-Fault-Execution-Token` | Operations and the control plane itself |
 | `dual-credential` | 7 | Either one, chosen by the credential the request carries: with an execution token header, use the execution token; with only a cluster bearer + cluster header, use the cluster token; with neither, reject as execution token | Interfaces that may be called by either the data plane or operations (fleet queries, drain/revoke, GPU metrics reads) |
 | `metrics` | 1 | Loopback is exempt from authentication; non-loopback requires an execution token | `GET /metrics` |
@@ -3633,7 +3749,7 @@ from which the control plane decides whether to send new fields. Compatibility o
 
 | Route module | Count | What it does |
 |---|---:|---|
-| `src/gpu_fault/app/routes/regional.py` | 16 | All cluster-executor interactions (claim/renew/progress/result, evidence, readiness, spare health, HyperPod submission, drain/revoke) + `GET /v1/regional/clusters` (execution-token) |
+| `src/gpu_fault/app/routes/regional.py` | 19 | All cluster-executor interactions (claim/renew/progress/result, evidence, readiness, spare health, HyperPod submission, incident ownership, rollout fence, advisories, node keys, drain/revoke/reactivate, Kubernetes node inventory) + `GET /v1/regional/clusters` (execution-token) |
 | `src/gpu_fault/app/routes/regional_registry.py` | 4 | Online revision, convergence, rollback of the regional registry and cluster state transitions (`/v1/regional/registry/status`, `/revisions`, `/rollback`, `/clusters/{cluster_id}/transition`, all execution-token) |
 | `src/gpu_fault/app/routes/fleet.py` | 14 | Agent roster and heartbeats, batch deployments and waves, barrier, readiness |
 | `src/gpu_fault/app/routes/collector_events.py` | 10 | 7 collection channels + internal telemetry batch submission + EFA management actions + replacement drill |
@@ -3649,8 +3765,8 @@ from which the control plane decides whether to send new fields. Compatibility o
 
 All 3 installation-resource routes belong to `execution-token`:
 `POST /v1/installation-resources/sync`, `GET /v1/installation-resources`,
-`PUT /v1/installation-resources/{site_id}/{resource_key:path}`. The 13 modules in the table above total 89 routes,
-equal to the sum of the five buckets in §8.1 (34 + 45 + 7 + 1 + 2); the route total and bucket distribution are governed by this real-assembly count,
+`PUT /v1/installation-resources/{site_id}/{resource_key:path}`. The 13 modules in the table above total 92 routes,
+equal to the sum of the five buckets in §8.1 (37 + 45 + 7 + 1 + 2); the route total and bucket distribution are governed by this real-assembly count,
 and authorization audits must use the `ExplicitAuthorizationRegistry.inventory` of the assembled real app, not
 historical incremental estimates or old inventories. After the removal of the four HMA routes, the old addresses return 404;
 the response models of the Kernel/FM entry points moved to `gpu_fault.nvidia_logs`, with fields and event identity unchanged.
@@ -3747,6 +3863,7 @@ control plane, so the protocol itself carries idempotency.
 | Progress | `POST /v1/regional/executors/{command_id}/progress` | `executor_id`, `lease_token`, `batched_results` (`{"<step_index>": {status ∈ {WAITING, SUCCEEDED, FAILED}, status_source, details, error}}`, at least one entry); lease check same as renew, does not extend the lease or change state; used only by compound commands (protocol ≥3) |
 | Report | `POST /v1/regional/executors/{command_id}/result` | `lease_token`, `status ∈ {WAITING, SUCCEEDED, FAILED}`, `status_source`, `details`, `error` (required for `FAILED`) |
 | Readiness | `POST /v1/regional/executors/readiness` | In: `executor_id`, `execution_owners`, `last_successful_claim_age_seconds`; out: `ready`, `registered`, `unsupported_execution_owners`, `open_commands`, `pending_commands`, `oldest_unclaimed_age_seconds`, `reasons` |
+| Node inventory | `POST /v1/regional/executors/node-inventory` | In: `cluster_id` (must equal the token's cluster, otherwise 403), `executor_id`, `observed_at` (taken before the LIST; more than 2 min from the control plane's clock is 422), `resource_version`, `node_names` (every Node of the cluster, at most 5000, de-duplicated and sorted), `spare_node_names` (a subset of `node_names`); out: `recorded`, `node_count`, `absent_count`, `chain_started_at`, `reports_in_chain`. Every 60 s; the departed-node cleanup's Kubernetes evidence (§7.10) |
 
 Three design points that must be understood:
 
@@ -3781,6 +3898,9 @@ Three design points that must be understood:
    and automatically turns on once the next deploy narrows the pin; ③ the claim route filters by the
    `executor_protocol_version` in the request: executors <3 **never receive** compound commands (even if the pin is relaxed again);
    the command waits until the claim deadline and fails rather than crashing an old executor on decode.
+6. **The node inventory is a new route, not a protocol version**: the executor reports between claims; an older
+   control plane answers 404, the executor says so once at INFO and keeps claiming; shipping the control plane before
+   the data plane per §8.1 is all it takes.
 
 ### 8.6 Node Agent Interface
 
@@ -4197,7 +4317,8 @@ the real app assembled by `create_app(build_context())` (in-memory Store fixture
 exports **264 metric families** with `regional_mode` off and **277** with it on (the extra 13 are all emitted only in regional mode:
 9 `gpu_fault_remote_command_*`, 2 `gpu_fault_fleet_rollout_*`, 2 `gpu_fault_regional_registry_*`),
 all prefixed `gpu_fault_`; under the same fixture ingress is 225/227 and spool-worker is 224/226. Conditional families such as the Postgres connection pool,
-spare health, spool consumer and collector snapshot are not in the count; a production worker only has more, never fewer. Distribution in regional mode:
+spare health, spool consumer, collector snapshot and the departed-node cleanup (`gpu_fault_departed_node_cleanup_*`, 5, on
+the regional-mode worker only, §7.10) are not in the count; a production worker only has more, never fewer. Distribution in regional mode:
 
 | Prefix | Families | Coverage |
 |---|---:|---|
@@ -4561,7 +4682,7 @@ The test scale is not hard-coded in this document: `scripts/check-doc-facts.py` 
 (v1 §8 keeps only the recomputable structural assertion "`tests/regional/` is the largest"). **`make docs-check`
 only checks that the few document assertions declared in the `scripts/check-doc-facts.py` table agree with the code**; everything else still only checks that referenced
 paths/symbols exist, generated artifacts are in sync, and command order. The numbers in this document (264/277 metric families for the worker role,
-`regional_mode` off/on, 89 routes, 47 Store codec kinds, 20 notification types, 33 operations,
+`regional_mode` off/on, 92 routes, 47 Store codec kinds, 20 notification types, 33 operations,
 81 declared indexes, 18 schema versions) were all obtained by assembling the real app, instantiating the Store codec or reading the
 machine sources and recounting; recount them after changing code, no guard will discover they are stale for you.
 

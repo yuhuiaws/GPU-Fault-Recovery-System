@@ -41,6 +41,10 @@ Administrators can currently configure:
   so the controller is a constant there); and the adaptive cap of the batch delay (`admissionBatchDelayMaxSeconds`,
   0..0.5 s, default 0.05); the defaults of all seven are likewise omitted from records and YAML, see §4.6;
 - Workflow scan period and dispatcher thread count;
+- The departed-node cleanup switch `workflow.departedNodeCleanup` (default `true`; its default is likewise omitted from
+  records and YAML, the live digests do not move, so it is not one of the 22 template fields): with `false` the control
+  plane no longer retires a departed node's Agent or closes its never-changed workflows and ESCALATED incidents by
+  itself, and those records are left to `workflow-reconcile` (Administrator Operations §10.1.1);
 - Notification batch size and maximum attempts;
 - Raw evidence retention hours and per-node record cap.
 
@@ -529,7 +533,8 @@ The configuration digest is independent of the code release ID, image digest and
 - Runs no schema, GPU data-plane, Node Runtime or Runtime Profile phase;
 - Publishes no cluster registry revision;
 - A remediation budget or worker replica change rolls only the control-worker; a node count change changes the fault reserved depth shared by the three roles,
-  and therefore rolls all three CPU roles;
+  and therefore rolls all three CPU roles; the `workflow` section (`departedNodeCleanup` included) is in every role's digest, so
+  changing it rolls all three CPU roles as well;
 - The roles roll one at a time, each waiting for its own rollout, in the order ingress -> control-worker ->
   spool-worker (ingress's surge Pod needs a free slot on some node, which the consumer tier's added replicas would
   take; the preflight decides the deletion order of ingress's old Pods and writes it as `pod-deletion-cost`, and an

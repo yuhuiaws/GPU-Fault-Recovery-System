@@ -2225,7 +2225,9 @@ release.
 The regional overlay keeps
 `GPU_FAULT_ENABLE_HYPERPOD_MANAGED_OBSERVER=true`, so the CPU API Pods need to read HyperPod state in this Region.
 They need no GPU EKS kubeconfig and are granted no reboot/replace permission. Create a read-only SageMaker Pod Identity for the control-plane
-ServiceAccount:
+ServiceAccount; the policy's `DepartedNodeInstanceReads` statement lets the departed-node cleanup confirm that the EC2 instance an
+eks-managed node recorded is terminated or gone (`ec2:DescribeInstances` is granted only on `*`, limited to this Region by
+`aws:RequestedRegion`; the same statement the bootstrap writes into `GPUFaultRegionalObserve`, Administrator Operations §10.1.1):
 
 ```bash
 kubectl --kubeconfig "${CPU_KUBECONFIG}" -n "${NAMESPACE}" \
@@ -2269,6 +2271,12 @@ cat > /tmp/gpu-fault-control-plane-sagemaker-read.json <<EOF
       "sagemaker:DescribeClusterNode"
     ],
     "Resource": "arn:aws:sagemaker:${AWS_REGION}:${AWS_ACCOUNT_ID}:cluster/*"
+  }, {
+    "Sid": "DepartedNodeInstanceReads",
+    "Effect": "Allow",
+    "Action": "ec2:DescribeInstances",
+    "Resource": "*",
+    "Condition": {"StringEquals": {"aws:RequestedRegion": "${AWS_REGION}"}}
   }]
 }
 EOF

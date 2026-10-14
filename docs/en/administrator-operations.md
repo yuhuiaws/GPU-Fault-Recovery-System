@@ -34,8 +34,9 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | The installation registry sync fails because it "would change recorded identities" and that key's physical resource really was replaced (a recreated subnet, a re-subscribed SNS e-mail) | `gpu-fault-admin replace-resource --state-dir ... --resource-key <key> --reference ...` for the read-only plan; add `--confirm REPLACE_RESOURCE` to execute | §4 |
 | Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | §10 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
-| Converge historical workflows that recovered but stay BLOCKED, never-dispatched PENDING workflows whose node left with a spot replacement, and parked records whose node action the operator confirmed | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
-| Retire the fleet Agent record, still ACTIVE, of a node a spot reclaim removed (the release verification reports `Agent coverage drift` and rolls back) | `gpu-fault-admin workflow-reconcile --state-dir ... --retire-departed-agents [--node <node>] --dry-run` to see the plan and evidence, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
+| The residue a node leaves after a spot reclaim, a scale-in or a provider replacement (Agent record still ACTIVE, workflows that never changed the node, ESCALATED incidents) | No command: the control plane's departed-node cleanup ends it once the node is proven gone (switch `spec.workflow.departedNodeCleanup`, on by default); the `departed nodes:` lines of `gpu-fault-admin status` list the nodes cleaned, pending and left to the operator, with the exact commands | [§10.1.1](#1011-what-a-departed-gpu-node-leaves-behind-spot-reclaim-scale-in-provider-replacement) |
+| Converge historical workflows that recovered but stay BLOCKED, never-dispatched PENDING workflows whose node left with a spot replacement (the manual fallback when the departed-node cleanup is off or refuses), and parked records whose node action the operator confirmed | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
+| Retire the fleet Agent record, still ACTIVE, of a node a spot reclaim removed (the release verification reports `Agent coverage drift` and rolls back; the manual fallback when the departed-node cleanup is off or refuses) | `gpu-fault-admin workflow-reconcile --state-dir ... --retire-departed-agents [--node <node>] --dry-run` to see the plan and evidence, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
 | List and close ESCALATED incidents (node repaired but the record still only logs) | `GET /v1/incidents?state=ESCALATED` or `gpu-fault-admin workflow-reconcile --state-dir ... --close-escalated --dry-run` to list the queue; `--close-incident <id>` / `--close-escalated` with `--reason` `--reference` to close | §9.1 |
 | Node failure-domain (rack/instance group) mapping for remediation budget throttling | Automatic: `deploy`/`join-cluster`/`remove-cluster` render and apply it; read-only view with `gpu-fault-admin failure-domain-map --state-dir ... [--output ...]` | §5.1 |
 | Handle one AMP alert | Enter the triage card by alert name | §8 |
@@ -1532,8 +1533,9 @@ Semantics and boundaries of `eks-managed`:
 - The Completion Watcher runs with `GPU_FAULT_WATCHER_ENVIRONMENT=eks`.
 
 **Out of scope** (deliberately not provided for `eks-managed`): provider-side node replacement (`nodeReplace` is OWNed
-only as the warm-spare handover and never calls a provider replacement API; after a Spot interruption the node comes back under a new name and instance id -- retire the old Agent with
-`workflow-reconcile --retire-departed-agents` and let the reconciler install the new node; what to expect during that
+only as the warm-spare handover and never calls a provider replacement API; after a Spot interruption the node comes back under a new name and instance id -- the control plane's departed-node
+cleanup retires the old Agent (§10.1.1; by hand: `workflow-reconcile --retire-departed-agents`) and the reconciler
+installs the new node; what to expect during that
 join window is described in the paragraph below), HyperPod health labels /
 HMA signals, `UpdateClusterSoftware` re-imaging, HyperPod advisory notifications and the legacy single-cluster
 `deploy/hyperpod/deploy.sh`; the CPU control-plane cluster must still be HyperPod. When the GPU nodes carry the
@@ -1543,7 +1545,8 @@ node group in the cluster. An existing `dcgm-exporter` in the cluster must not b
 hostNetwork (ours binds only `127.0.0.1:9400` and dials the host nv-hostengine).
 
 **The join window of a replacement node (both providers; live 2026-10-07, managed node group roll).** After the old
-node is terminated: `workflow-reconcile --retire-departed-agents` retires the old Agent record; the
+node is terminated: the control plane's departed-node cleanup retires the old Agent record after the 10-minute guard
+(§10.1.1; by hand: `workflow-reconcile --retire-departed-agents`); the
 `gpu-fault-node-installer-reconciler` then creates an installer Job per new node (live: about 20 minutes after node
 creation, completing within minutes); within about one sync period (`GPU_FAULT_NODE_KEY_SYNC_SECONDS`, default 60 s)
 of the new node entering the cluster's node selector the cluster executor adds its key to `gpu-fault-node-action-keys`
@@ -3988,6 +3991,136 @@ that is live work, and only the lease-holding executor may settle it; the durati
 itself wrote `BLOCKED` because of an internal error (`blocked_kind=INTERNAL_ERROR`, already claimed) are not part of the
 compile-time shape and are handled per the `GpuFaultWorkflowDispatchInternalErrors` card.
 
+#### 10.1.1 What a Departed GPU Node Leaves Behind (Spot Reclaim, Scale-In, Provider Replacement)
+
+When a GPU node is reclaimed by spot, scaled in or replaced by its provider, it leaves three things in the control
+plane: the node's fleet Agent record stays `ACTIVE` with a long-expired lease (`status`'s `control_api` reports
+`Agent coverage drift ... Agents without a Kubernetes Node` and the release verification rolls back); the incident its
+last telemetry raised keeps a workflow nobody can run any more (`PENDING` and never dispatched, or
+`BLOCKED / NEEDS_OPERATOR` without having changed the node; the release preflight `workflow_safety` refuses the deploy
+with `active destructive workflows block release`); and that incident stays `ESCALATED`. Each of them used to need a
+hand-run `workflow-reconcile` (the third and fourth shapes of §10.2 and "The complete sequence after a spot node is
+reclaimed"). The control plane now ends them by itself, without any command: the control-worker periodic task
+`departed-node-cleanup` (`gpu_fault/departed_node_cleanup.py`) runs every 60 s and, like every other periodic task, only
+the one process holding its task lease writes; it judges with the very rule `workflow-reconcile` uses
+(`gpu_fault/departed_nodes.py`).
+
+**Evidence: all three must hold, each freshly read, before a node counts as departed.**
+
+- **Kubernetes**: every GPU cluster's Executor LISTs all Nodes of its cluster every 60 s without a selector (the question
+  the administrator's `kubectl get nodes` answers; a report is the whole paginated answer) and posts the names under the
+  cluster token to `POST /v1/regional/executors/node-inventory`; nodes carrying the `gpu-fault.io/spare=true` label or the
+  `gpu-fault.io/spare-reservation` annotation are marked as spares too. The control plane keeps one record per cluster:
+  the node must be absent from the latest report, that report must have arrived within 5 minutes, and every report since
+  at least 10 minutes earlier (`DEPARTED_AGENT_GUARD_AGE`, the CLI's own constant) must have left it out. Two reports more
+  than 5 minutes apart break the chain and the next report starts the count again -- the node could have come back in the
+  gap, so an absence is never carried across one. A report whose LIST time is more than 2 minutes from the control plane's
+  clock is refused with HTTP 422, one whose `cluster_id` does not match its token with 403. A NotReady or cordoned Node is
+  still a Node. Every time is the moment the control plane received the report.
+- **Provider, read by the control plane itself**: HyperPod -- `ListClusterNodes` for the HyperPod cluster name in the
+  registry (every page) no longer lists the instance the node name `hyperpod-<instance-id>` carries; eks-managed --
+  `ec2:DescribeInstances` (filtered by `instance-id`) for the `node_instance_id` of the node's Agent record answers
+  `terminated` or nothing at all. A failed, throttled, denied or unparseable lookup, or more pages than the limit, is
+  **not** proof: the node stays `PENDING` and is asked again next cycle. Only nodes that every other source has cleared are
+  asked about, at most one read per cluster per cycle.
+- **Agent**: no record, `REVOKED`, or `ACTIVE`/`DRAINING` with an expired lease and a last heartbeat older than
+  10 minutes. An Agent that still holds its lease is never a candidate, whatever a report says.
+
+So a spot reclaim is ended about 10–12 minutes after the node left Kubernetes (the 10-minute guard plus at most one 60 s
+period each of the report and the cleanup). Once a release carrying this change is live, residue left by nodes that
+departed earlier is ended too: after 10 minutes of an unbroken report chain, a node the chain never listed counts as
+absent from the chain's start.
+
+**Actions: each one through the CLI's own write path, compare-and-set and idempotent.** The audit names the actor
+`departed-node-cleanup` and the reference `departed-node-cleanup-<16 hex digits>` -- derived from the cluster, the node,
+the instance and the start of the absence, so one departure keeps its reference across cycles, replicas and restarts.
+
+1. **Retire the Agent**: `FleetRegistry.drain_agent`, then `revoke_agent`, under the transition
+   `departed-node-cleanup/<reference>`, with the audit line `--retire-departed-agents` writes as its reason
+   (`operator reconciliation <reference>: retired Agent <node> after its node left Kubernetes and HyperPod|EC2 (instance
+   ..., kubernetes read ..., hyperpod|ec2 read ...; actor departed-node-cleanup; admin plan <evidence digest>)`). The write
+   re-checks `generation`, `lifecycle_state` and `last_seen_at` and re-judges the guard at that moment; a record left
+   `DRAINING` by a cycle interrupted between the drain and the revoke is revoked under the transition that drained it,
+   never drained twice.
+2. **Close the workflows that never changed the node**: among the workflows of the node's open incidents, a `PENDING`
+   record never dispatched gets the very write of `apply-never-dispatched` (`SUPERSEDED`, an `OPERATOR_RECONCILED` event
+   with `terminalization=never-dispatched` and the per-node `departed_node_evidence`, the incident set `ESCALATED`); a
+   `BLOCKED` record the planner judges `never-changed` (`never_changed_a_node`) with no open remote command gets the very
+   apply of `workflow-reconcile --workflow-id` (`SUPERSEDED` after the plan digest is checked).
+3. **Close the incident**: once all its workflows are terminal, the node's `ESCALATED` incident is set `RECOVERED` by
+   `IncidentClosureService.close_incident` (the service behind `--close-incident`), with a reason that names the departure
+   evidence: `node departed: <node> absent from Kubernetes since <time>, HyperPod|EC2 no longer has instance <id> (read
+   <time>); departed-node cleanup <reference>`.
+
+**Never ended automatically, only reported (ledger state `REFUSED`)** -- these need the administrator's judgement; where
+there is a manual path, the ledger line and the notification give the exact command:
+
+| Reason (metric `reason` label) | Meaning | Manual path |
+|---|---|---|
+| `workflow_changed_node` | the workflow ran steps or completed a node-mutating operation | `workflow-reconcile --workflow-id <id> --dry-run` (§10.2) |
+| `remote_command` | the workflow has a remote command | same |
+| `quarantined_incident` | the incident is `QUARANTINED`: the node is gone, its isolation cannot be verified | no command closes it yet: `--close-incident` needs the node's isolation evidence and refuses a node the cluster no longer has (`its isolation state cannot be verified`); the ledger line stays `REFUSED` without a command |
+| `declared_spare` | the node was a declared or reserved warm spare when Kubernetes last listed it | `gpu-fault-admin config spare --node <node> --cluster-id <cluster> --release ...` |
+| `incident_names_other_nodes` | the incident also names a node not proven departed | `--close-incident <id>` |
+| `cluster_not_active` | the cluster is not `ACTIVE` (or is disabled) in the registry | `--retire-departed-agents --node <node> --dry-run` |
+| `provider_identity_unknown` | the HyperPod node name carries no instance id, or the eks-managed Agent record has no EC2-shaped `node_instance_id` | same |
+| `incident_not_closable`, `other` | the closure service refused, or another reason | per the refusal text |
+
+`PENDING` means still waiting, resolving by itself and retried every cycle: `kubernetes_unproven` (still in Kubernetes,
+no report or a stale one, absent for less than 10 minutes), `agent_alive` (heartbeat younger than 10 minutes or the lease
+not expired), `provider_still_lists`, `provider_unknown`, `record_moved` (a compare-and-set lost to another writer),
+`workflow_live` (the workflow is still executing), `incident_nodes_pending` (the incident's other nodes are still being
+proven).
+
+**How to see what it did:**
+
+- `gpu-fault-admin status` prints, after `failing checks`, the header line `departed nodes: <n> cleaned, <n> pending, <n>
+  left to the operator`, then one line per `PENDING`/`REFUSED` node (at most 5) `departed node <cluster>/<node>: <state>
+  (<first reason>)`, a `REFUSED` line followed by `; manual: <command>`; the whole ledger is in the JSON at
+  `health.checks[control_api].details.clusters[<cluster>].departed_node_cleanup` (the evidence stays in the store, out of
+  the report). A `CLEANED` line stays 7 days; a ledger line is deleted when the node name is listed by Kubernetes again.
+- The Agent coverage drift refusal ends with `automatic departed-node cleanup: <node> <state> (<reason>)`, or
+  `not judged yet`.
+- Notifications: one informational notice per departure ended, `[NOTICE][GPU node departed: records ended] <cluster>:
+  <node>` (`ACTION_COMPLETED`, no action needed; the body lists the evidence and the records ended); one
+  `[GPU node departed: operator action needed] <cluster>: <node>` (`OPERATOR_REVIEW`; the body lists what was ended
+  automatically, what is left for the operator and the exact commands) whenever a new set of refusal reasons appears.
+  Both go through the site's notification channel (SNS/SES), de-duplicated per departure; neither is an AMP alert and
+  neither pages.
+- Metrics (only the control-worker process holding the lease has non-zero samples): `gpu_fault_departed_node_cleanup_enabled`,
+  `gpu_fault_departed_node_cleanup_cycles_total`, `gpu_fault_departed_node_cleanup_last_cycle_timestamp_seconds`,
+  `gpu_fault_departed_node_cleanup_actions_total{action="agent_retired|workflow_closed|incident_closed"}` and
+  `gpu_fault_departed_node_cleanup_refusals_total{reason="..."}` (counted once when a node's reason first appears).
+- Logs (control-worker; cluster names, node names and counts only, never tokens): one line per verdict change
+  `departed-node cleanup: <cluster>/<node> <state> actions=... blockers=...`; a failed provider read logs the WARNING
+  `departed-node cleanup: <provider> lookup for cluster <cluster> failed; <n> node(s) stay unproven: <error code>`. A failed
+  Executor report logs the WARNING `Kubernetes node report failed`; a control plane older than this change is said once
+  at INFO while the Executor waits for its upgrade.
+
+**Switch**: `spec.workflow.departedNodeCleanup` (default `true`; left out of `desired.json` and `admin-config.yaml` while at
+its default, so an existing site's configuration digests do not move). To switch it off, write
+`departedNodeCleanup: false` under `spec.workflow` in `<state-dir>/admin-config.yaml`, look at the plan with
+`gpu-fault-admin config --state-dir <state-dir> --dry-run`, then run it without `--dry-run` (administrator capacity
+configuration §4). It renders as `GPU_FAULT_DEPARTED_NODE_CLEANUP_ENABLED` in the three CPU roles' core ConfigMaps, a
+config-only release that rolls the three roles one after another. Switched off, the periodic task still runs but writes
+nothing, `status` prints `departed-node cleanup is off (spec.workflow.departedNodeCleanup); ...`, and a departed node's
+records are handled by hand with the §10.2 commands as before. The 10-minute guard is shared with the CLI and is not
+configurable.
+
+**IAM**: the control-plane role already holds HyperPod's `ListClusterNodes`; the eks-managed proof needs
+`ec2:DescribeInstances`. The bootstrap's control-plane inline policy `GPUFaultRegionalObserve` gains the statement
+`DepartedNodeInstanceReads`: that one read permission, `Resource: "*"` (EC2 grants this read only on `*`), limited to the
+site's Region by `aws:RequestedRegion`. The next `deploy` carrying this change finds the policy difference when the
+bootstrap re-checks the control-plane role and writes it with `put-role-policy`; nothing else is needed. A site whose
+roles were created by hand adds the statement per CPU-4 of the deployment and operations manual. Until the permission is
+in effect, eks-managed nodes stay `PENDING` (`provider_unknown`, error code `UnauthorizedOperation`) and are never taken
+for departed.
+
+**Manual fallback**: the `workflow-reconcile` shapes of §10.2 are unchanged and judge with the same rule as the
+automatic cleanup. Use them when the switch is off, when the control plane predates this change, or for a ledger line in
+`REFUSED`. The two never act twice on one record: every write is a compare-and-set, the first writer wins and the other
+reads the record as ended (`REVOKED`, `SUPERSEDED`, `RECOVERED`) and skips it.
+
 ### 10.2 Closing Historical Records That Recovered but Stay BLOCKED (workflow-reconcile)
 
 The only manual shape kept: records whose successful recovery successor of the same incident has completed validation and
@@ -4051,7 +4184,9 @@ reason, `amend_workflow` with an audit event, compare-and-set `save_incident`)
 -- so this lever is usable on the very release whose preflight such records block; after the release the dispatcher's sweep also automatically closes out
 the same shape (except node actions with a still-unknown outcome; confirm first per §9.4). Do not change Store rows to make the count fall.
 
-**The third shape: a never-dispatched `PENDING` record whose node is gone (`never-dispatched`).** HyperPod reclaimed a
+**The third shape: a never-dispatched `PENDING` record whose node is gone (`never-dispatched`).** The control plane's
+departed-node cleanup (§10.1.1) now closes such records by itself; this is the manual path for when it is off, refuses
+(`REFUSED`) or the control plane predates it, judged by the same rule. HyperPod reclaimed a
 spot node while the control plane was still ingesting its last telemetry; the workflows of that node's incidents lost their
 Agent the moment they were created -- the fleet preflight will never dispatch them -- so the records sit at `PENDING`: zero
 step executions, zero remote commands, no events. The dispatcher's sweep leaves `PENDING` alone, `workflow_safety` counts
@@ -4108,7 +4243,8 @@ gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --close-inciden
   --reason "node reclaimed by HyperPod; workflow never dispatched" --reference CHG-12345
 ```
 
-**The fourth shape: the node is gone, its Agent record is still `ACTIVE` (`--retire-departed-agents`).** The same spot
+**The fourth shape: the node is gone, its Agent record is still `ACTIVE` (`--retire-departed-agents`).** As with the
+third shape, the departed-node cleanup (§10.1.1) now retires such records by itself; this is the manual fallback. The same spot
 reclaim leaves a third residue: the node's fleet Agent record. The Agent process died with the instance and no path ever
 revokes it -- the Agent's own lifecycle ends with its last heartbeat, and the HyperPod lifecycle adapter revokes only the
 nodes *it* replaces -- so the record stays `ACTIVE` with a long-expired lease. The release verification's `control_api`
@@ -4120,7 +4256,8 @@ Kubernetes Node the refusal ends with a hint naming this switch. The same `workf
 - **Discovery rule** (command-line side; a read-only `list-agents` in the Pod lists every Agent record of the site's
   clusters): the record is `ACTIVE` or `DRAINING` (`REVOKED` is no longer a candidate and is only counted under
   `discovery.revoked`); `last_seen_at` is **at least 10 minutes** before the Pod's clock (`DEPARTED_AGENT_GUARD_AGE` -- an
-  Agent that spoke within ten minutes is restarting, not gone); and the node is absent from the cluster's Kubernetes Node
+  Agent that spoke within ten minutes is restarting, not gone) and its lease has expired (otherwise `agent lease has not
+  expired`; the rule is the one the control plane's departed-node cleanup applies, `gpu_fault/departed_nodes.py`); and the node is absent from the cluster's Kubernetes Node
   list **and** the instance behind `hyperpod-<instance-id>` absent from the `aws sagemaker list-cluster-nodes` inventory.
   A node still in Kubernetes (NotReady or cordoned included) is `node is still in Kubernetes; an Agent is retired only for
   a node that left Kubernetes and HyperPod` and the provider is not consulted; an instance HyperPod still lists, a cluster
@@ -4200,7 +4337,10 @@ gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --close-inciden
   --reason "node rebooted and validated after the reset; record confirmed and reconciled" --reference CHG-12345
 ```
 
-**The complete sequence after a spot node is reclaimed** (three residues, one verb, one `--reference`):
+**The complete sequence after a spot node is reclaimed** (three residues, one verb, one `--reference`). With the
+departed-node cleanup on, the control plane has usually done these steps already: look at the `departed nodes:` lines
+of `gpu-fault-admin status` first and run the commands below only for residue marked `REFUSED` (the exact command
+follows `manual:`) or when the switch is off:
 
 ```bash
 # 1. Look at every residue: the BLOCKED backlog, the never-dispatched PENDING records (with per-node evidence),
