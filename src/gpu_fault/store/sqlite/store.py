@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 from gpu_fault.store.memory.telemetry_spool import MemoryTelemetrySpoolMixin
 from gpu_fault.store.shared.compositions import SharedCompositionMixin
 from gpu_fault.store.shared.control_records import SharedControlRecordMixin
+from gpu_fault.store.shared.departed_nodes import SharedDepartedNodeMixin
 from gpu_fault.store.shared.efa import (
     SharedEfaTrafficMixin,
     SharedEfaTrafficRulesMixin,
@@ -63,6 +64,7 @@ class SqliteStore(
     # Dialect-neutral templates over the key/value primitives.
     SharedRecordAccessMixin,
     SharedControlRecordMixin,
+    SharedDepartedNodeMixin,
     SharedEfaTrafficMixin,
     SharedFleetMixin,
     SharedNotificationMixin,

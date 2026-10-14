@@ -404,6 +404,23 @@ class RegionalExecutorClient:
             ).model_dump(mode="json"),
         )
 
+    def report_node_inventory(self, report: dict[str, Any]) -> dict[str, Any]:
+        """Post this cluster's Kubernetes Node names (``node_inventory``).
+
+        ``report`` is a ``KubernetesNodeInventoryReport`` as JSON; the answer
+        must be for this cluster, or the control plane recorded something
+        else than what was sent.
+        """
+
+        if report.get("cluster_id") != self.cluster_id:
+            raise ClusterExecutorError("node inventory names another cluster")
+        response = self._post("/v1/regional/executors/node-inventory", report)
+        if response.get("cluster_id") != self.cluster_id:
+            raise ClusterExecutorError(
+                "control plane answered the node inventory for another cluster"
+            )
+        return response
+
     def complete(
         self,
         command: RemoteActionCommand,

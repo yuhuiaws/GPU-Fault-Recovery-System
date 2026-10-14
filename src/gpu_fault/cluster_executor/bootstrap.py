@@ -36,6 +36,7 @@ from gpu_fault.cluster_executor.executor import (
 )
 from gpu_fault.cluster_executor.lease import DEFAULT_MAX_EXECUTION_SECONDS
 from gpu_fault.cluster_executor.metrics import loop_breadcrumb_is_fresh
+from gpu_fault.cluster_executor.node_inventory import NodeInventoryReporter
 from gpu_fault.cluster_executor.node_key_sync import NodeActionKeySync
 from gpu_fault.cluster_executor.regional_client import (
     ClusterExecutorError,
@@ -200,6 +201,11 @@ def executor_from_environment() -> ClusterActionExecutor:
         spare_reservation_sweep=sweep,
         node_key_sync=_node_key_sync_from_environment(
             regional_client, kubernetes_adapter.core
+        ),
+        # Every Node name of the cluster, the departed-node cleanup's
+        # Kubernetes evidence (the control plane holds no GPU kubeconfig).
+        node_inventory=NodeInventoryReporter(
+            regional_client, kubernetes_adapter.core, executor_id=executor_id
         ),
         # Only set when this executor actually owns HyperPod mutations.
         # Left None otherwise so an unexpectedly routed RESTART_NODE or

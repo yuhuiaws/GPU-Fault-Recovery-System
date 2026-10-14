@@ -73,6 +73,12 @@ from gpu_fault.orchestration.escalation import escalation_descends_from
 from gpu_fault.store import NotFoundError
 from gpu_fault.telemetry import RawEvidenceRecord
 from gpu_fault.workflow_quarantine import has_terminal_quarantine_hold
+from gpu_fault.kubernetes_node_inventory import (
+    InventoryReportRefused,
+    KubernetesNodeInventoryReceipt,
+    KubernetesNodeInventoryReport,
+    record_inventory_report,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -1160,3 +1166,43 @@ async def regional_reactivate_agent(
     return await _agent_transition(
         "reactivate", cluster_id, node_id, request, dependencies
     )
+
+
+@router.post(
+    "/executors/node-inventory",
+    response_model=KubernetesNodeInventoryReceipt,
+)
+@authorization_bucket("cluster-token")
+async def regional_node_inventory(
+    report: KubernetesNodeInventoryReport,
+    cluster_id: str | None = Header(
+        default=None,
+        alias="X-GPU-Fault-Cluster-ID",
+    ),
+    dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
+) -> KubernetesNodeInventoryReceipt:
+    """Record the cluster's Kubernetes Node names (``kubernetes_node_inventory``).
+
+    The departed-node cleanup's Kubernetes evidence. Only the authenticated
+    cluster's names are taken, and only from a report whose LIST time the
+    control plane's clock agrees with; the record is merged under the
+    cluster's lock, so two executor replicas reporting at once are both seen.
+    """
+
+    cluster_id = _require_cluster(cluster_id)
+    if report.cluster_id != cluster_id:
+        raise HTTPException(
+            status_code=403,
+            detail="authenticated cluster does not match request",
+        )
+
+    def record() -> KubernetesNodeInventoryReceipt:
+        try:
+            return record_inventory_report(dependencies.context.store, report)
+        except InventoryReportRefused as exc:
+            raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+    receipt: KubernetesNodeInventoryReceipt = await _store_call(
+        dependencies, record, retry_after="5"
+    )
+    return receipt

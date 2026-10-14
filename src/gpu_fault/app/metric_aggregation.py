@@ -70,6 +70,7 @@ MERGER_FAMILIES: dict[str, Strategy] = {
 # environment sit here too.
 _ANY = (
     # capacity / configuration constants
+    "gpu_fault_departed_node_cleanup_enabled",
     "gpu_fault_capacity_largest_cluster_node_count",
     "gpu_fault_capacity_managed_node_count",
     "gpu_fault_processor_notification_shard_count",
@@ -160,6 +161,7 @@ _ANY = (
 # Timestamps (newest event anywhere in the Pod), ages and durations read as
 # the worst process, high-water marks, and "any process is in this state".
 _MAX = (
+    "gpu_fault_departed_node_cleanup_last_cycle_timestamp_seconds",
     "gpu_fault_notification_delivery_error_last_seen_timestamp_seconds",
     "gpu_fault_notification_terminal_failure_last_seen_timestamp_seconds",
     "gpu_fault_notification_dispatch_last_cycle_timestamp_seconds",
@@ -228,6 +230,10 @@ _MIN = (
 
 # Reset domains and scan observations must survive aggregation as paired series.
 _PER_PROCESS = (
+    # The departed-node cleanup runs in the task lease holder only.
+    "gpu_fault_departed_node_cleanup_actions_total",
+    "gpu_fault_departed_node_cleanup_cycles_total",
+    "gpu_fault_departed_node_cleanup_refusals_total",
     "gpu_fault_processor_notification_shard",
     "gpu_fault_processor_counter_drift_abs",
     "gpu_fault_processor_counter_mismatched_clusters",

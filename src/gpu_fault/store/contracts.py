@@ -24,10 +24,15 @@ from gpu_fault.installation_resources import (
 from gpu_fault.store.shared.orphaned_commands import OrphanedCommandCancellation
 
 if TYPE_CHECKING:
+    from gpu_fault.departed_nodes import DepartedNodeCleanupRecord
     from gpu_fault.fleet import (
         AgentRecord,
         FleetDeployment,
         MultiNodeBarrier,
+    )
+    from gpu_fault.kubernetes_node_inventory import (
+        KubernetesNodeInventory,
+        KubernetesNodeInventoryReport,
     )
     from gpu_fault.models import (
         AdvisoryNotification,
@@ -243,6 +248,35 @@ class FleetStore(Protocol):
     def get_barrier(self, barrier_id: str) -> MultiNodeBarrier: ...
 
     def list_barriers(self) -> list[MultiNodeBarrier]: ...
+
+
+@runtime_checkable
+class DepartedNodeStore(Protocol):
+    """The departed-node cleanup's evidence and ledger (``departed_node_cleanup``).
+
+    One Kubernetes Node inventory per cluster, merged report by report under
+    the cluster's own lock (``kubernetes_node_inventory.merge_node_inventory``),
+    and one ledger line per departed node.
+    """
+
+    def record_kubernetes_node_inventory(
+        self,
+        report: KubernetesNodeInventoryReport,
+        *,
+        received_at: datetime,
+    ) -> KubernetesNodeInventory: ...
+
+    def get_kubernetes_node_inventory(
+        self, cluster_id: str
+    ) -> KubernetesNodeInventory | None: ...
+
+    def save_departed_node_cleanup(self, record: DepartedNodeCleanupRecord) -> None: ...
+
+    def list_departed_node_cleanups(
+        self, cluster_id: str | None = None
+    ) -> list[DepartedNodeCleanupRecord]: ...
+
+    def delete_departed_node_cleanup(self, cluster_id: str, node_id: str) -> None: ...
 
 
 @runtime_checkable
@@ -1185,6 +1219,7 @@ class NotificationStore(Protocol):
 class ControlPlaneStore(
     ProcessorStore,
     FleetStore,
+    DepartedNodeStore,
     InstallationResourceStore,
     WorkflowStore,
     CompletionStore,

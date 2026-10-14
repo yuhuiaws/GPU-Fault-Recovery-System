@@ -22,6 +22,9 @@ import surface and splits the code along the seams it already had:
 * ``node_key_sync`` -- ``NodeActionKeySync``: the periodic reconciliation that
   keys nodes HyperPod replaced after the last deploy (adds missing entries to
   the GPU node-key Secret, never overwrites or deletes).
+* ``node_inventory`` -- ``NodeInventoryReporter``: the periodic report of every
+  Kubernetes Node name of the cluster, the control plane's evidence that a node
+  left (the departed-node cleanup).
 
 ``SpareReservationSweep`` lives in ``gpu_fault.spare_reservation_sweep`` and is
 re-exported here, where it always was.
@@ -71,6 +74,7 @@ from gpu_fault.cluster_executor.metrics import (
     cluster_executor_metrics,
     loop_breadcrumb_is_fresh,
 )
+from gpu_fault.cluster_executor.node_inventory import NodeInventoryReporter
 from gpu_fault.cluster_executor.node_key_sync import (
     NODE_KEY_SYNC_INTERVAL_SECONDS,
     NodeActionKeySync,
@@ -112,6 +116,7 @@ __all__ = [
     "CommandLifecycle",
     "CommandOutcome",
     "NodeActionKeySync",
+    "NodeInventoryReporter",
     "RegionalExecutorClient",
     "RegionalFleetRegistry",
     "RegionalHyperPodSubmissionStore",

@@ -43,6 +43,7 @@ from gpu_fault.regional import (
     RemoteCommandResult,
     RemoteCommandStatus,
 )
+from gpu_fault.cluster_executor.node_inventory import NodeInventoryReporter
 from gpu_fault.cluster_executor.node_key_sync import NodeActionKeySync
 from gpu_fault.spare_reservation_sweep import SpareReservationSweep
 
@@ -187,6 +188,7 @@ class ClusterActionExecutor:
         sleep: Callable[[float], None] = time.sleep,
         spare_reservation_sweep: SpareReservationSweep | None = None,
         node_key_sync: NodeActionKeySync | None = None,
+        node_inventory: NodeInventoryReporter | None = None,
     ) -> None:
         _validate_settings(
             poll_seconds=poll_seconds,
@@ -216,6 +218,7 @@ class ClusterActionExecutor:
         self.sleep = sleep
         self.spare_reservation_sweep = spare_reservation_sweep
         self.node_key_sync = node_key_sync
+        self.node_inventory = node_inventory
         self.client = client
         self.adapters = adapters
         self.executor_id = executor_id
@@ -824,6 +827,15 @@ class ClusterActionExecutor:
                 exc,
             )
 
+    def report_node_inventory(self) -> None:
+        """Post the cluster's Kubernetes Node names when due; never raises.
+
+        The departed-node cleanup's Kubernetes evidence (``node_inventory``).
+        """
+
+        if self.node_inventory is not None:
+            self.node_inventory.report()
+
     def run(self) -> None:
         """Claim and execute until a stop is requested, then drain.
 
@@ -976,10 +988,11 @@ class ClaimLoop:
                 self._claim()
             if not executor.stop_requested:
                 # Due-gated, whether or not this turn claimed: five reboots
-                # holding every slot must not stall the spare sweep or the
-                # node-key sync for as long as they run.
+                # holding every slot must not stall the spare sweep, the
+                # node-key sync or the node inventory for as long as they run.
                 executor.sweep_spare_reservations()
                 executor.sync_node_action_keys()
+                executor.report_node_inventory()
 
     def _next_claim_wait(self) -> float | None:
         """Seconds until the next claim; None waits for a command to finish."""

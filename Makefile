@@ -116,6 +116,7 @@ POSTGRES_TESTS = \
 	tests/app_services/test_cleanup_unbounded_kinds.py \
 	tests/app_services/test_collector_ingestion_transaction.py \
 	tests/completion/test_cov95_withdrawal_postgres.py \
+	tests/departed_nodes/test_departed_node_cleanup_postgres.py \
 	tests/execution/test_branch_settlement.py \
 	tests/execution/test_workload_withdrawal.py \
 	tests/metrics/test_kernel_pcie_composite_postgres.py \

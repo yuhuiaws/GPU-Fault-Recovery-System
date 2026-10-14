@@ -73,6 +73,8 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "complete_remote_command",
         "complete_xid_correlation",
         "create_incident_workflow_if_absent",
+        # The departed-node ledger: one _delete / one _put each.
+        "delete_departed_node_cleanup",
         "enqueue_notification_delivery",
         "ensure_remote_command",
         "establish_notification_watermark",
@@ -82,6 +84,9 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "publish_regional_registry_revision",
         "reconcile_restored_workflow",
         "reconcile_retired_generation_workflow",
+        # Two round-trips (_get_optional + _put), both under _state_transaction:
+        # two executors reporting at once must not lose each other's absences.
+        "record_kubernetes_node_inventory",
         # Two round-trips (_get_optional + _put), both under _state_transaction.
         "record_remote_command_progress",
         "record_xid74_occurrences",
@@ -93,6 +98,7 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "save_barrier",
         "save_collector_metrics_snapshot",
         "save_decision",
+        "save_departed_node_cleanup",
         "save_fleet_deployment",
         "save_hyperpod_node_identity",
         "save_hyperpod_submission",

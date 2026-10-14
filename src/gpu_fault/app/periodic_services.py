@@ -309,6 +309,7 @@ class PeriodicServiceRunner:
         "lease_reclaim",
         "counter_drift",
         "store_compaction",
+        "departed_nodes",
     )
 
     def run_all_due(self, now: float) -> None:
@@ -530,6 +531,23 @@ class PeriodicServiceRunner:
             self.config.identity_interval,
             refresh,
             "HyperPod identity refresh failed",
+        )
+
+    def _run_departed_nodes(self, now: float) -> bool:
+        """End what a provably departed GPU node left (``departed_node_cleanup``).
+
+        Leased like every job here: one process in the fleet is the writer.
+        """
+
+        cleanup = getattr(self.context, "departed_node_cleanup", None)
+        if cleanup is None:
+            return False
+        return self._run_scheduled(
+            "departed-node-cleanup",
+            now,
+            cleanup.interval_seconds,
+            cleanup.run_once,
+            "departed-node cleanup failed",
         )
 
     def _run_cleanup(self, now: float) -> bool:

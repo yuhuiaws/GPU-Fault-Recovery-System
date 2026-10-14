@@ -22,6 +22,7 @@ from gpu_fault.models import (
     XidMetricBaseline,
 )
 from gpu_fault.store.memory.control_records import MemoryControlRecordMixin
+from gpu_fault.store.memory.departed_nodes import MemoryDepartedNodeMixin
 from gpu_fault.store.memory.efa import MemoryEfaTrafficMixin
 from gpu_fault.store.memory.fleet import MemoryFleetMixin
 from gpu_fault.store.memory.notifications import MemoryNotificationMixin
@@ -55,6 +56,7 @@ from gpu_fault.store.shared.wakeups import (
 class InMemoryStore(
     # Dict-backed implementations first: they override the shared compositions.
     MemoryControlRecordMixin,
+    MemoryDepartedNodeMixin,
     MemoryEfaTrafficMixin,
     MemoryNotificationMixin,
     MemoryRemoteCommandMixin,
@@ -122,6 +124,8 @@ class InMemoryStore(
         self._training_progress = {}
         self._raw_evidence = {}
         self._hyperpod_node_identities = {}
+        self._kubernetes_node_inventories = {}
+        self._departed_node_cleanups = {}
         self._hyperpod_submissions = {}
         self._regional_clusters = {}
         self._regional_registry_revisions = {}

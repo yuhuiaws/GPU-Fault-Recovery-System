@@ -19,6 +19,10 @@ from gpu_fault.adapters import (
 from gpu_fault.app.identity import pod_process_owner
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.control_record_archive import ControlRecordArchiver
+from gpu_fault.departed_node_cleanup import (
+    DepartedNodeCleanup,
+    departed_node_cleanup_from_context,
+)
 from gpu_fault.env import env_bool
 from gpu_fault.node_provider import ClusterProvider, cluster_provider
 from gpu_fault.env_validation import validate_gpu_fault_environment
@@ -430,6 +434,10 @@ class ApplicationContext:
         self.fleet_registry = fleet_registry
         self.barrier_coordinator = barrier_coordinator
         self.spare_health_controller = None
+        # The departed-node cleanup (``gpu_fault.departed_node_cleanup``):
+        # set by ``from_environment`` in regional mode, run by the periodic
+        # runner of the one process holding its task lease.
+        self.departed_node_cleanup: DepartedNodeCleanup | None = None
         self.control_record_archiver = None
         self.hyperpod_identity_registry = None
         self.hyperpod_identity_registries = []
@@ -614,6 +622,7 @@ class ApplicationContext:
             WorkflowDispatcherConfig.from_environment(config.enabled),
             failure_handler=(context.orchestrator.escalate_failed_hardware_remediation),
         )
+        context.departed_node_cleanup = departed_node_cleanup_from_context(context)
         # Review item 3: the timing knobs of executor, dispatcher, node-action
         # verification and branch escalation only make sense in a fixed order;
         # a violation refuses to start, a warning is logged once here.

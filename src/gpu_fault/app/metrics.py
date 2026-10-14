@@ -45,6 +45,7 @@ from gpu_fault.app.metrics_sections import (
 )
 from gpu_fault.app.process_health import render_process_health_metrics
 from gpu_fault.app.runtime import AppRuntime
+from gpu_fault.departed_node_cleanup import departed_node_cleanup_metric_lines
 from gpu_fault.store.contracts import ProcessorQueueStats
 
 
@@ -399,6 +400,15 @@ METRIC_CONTRIBUTORS.register(
 METRIC_CONTRIBUTORS.register(
     "collector-silence",
     collector_silence_lines,
+)
+# Process-local counters of the cleanup the worker tier runs; the roles
+# without background services never run it.
+METRIC_CONTRIBUTORS.register(
+    "departed-node-cleanup",
+    lambda runtime: departed_node_cleanup_metric_lines(
+        getattr(runtime.context, "departed_node_cleanup", None)
+    ),
+    fleet_level=True,
 )
 
 
