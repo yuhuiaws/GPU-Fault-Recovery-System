@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import signal
 import subprocess
 import threading
 from pathlib import Path
@@ -403,3 +404,42 @@ def test_a_failing_static_gate_names_the_command_that_failed(
 
     assert status == 2
     assert "check-deploy-layout.py" in capsys.readouterr().err
+
+
+def test_a_signal_while_the_gate_group_is_locked_cannot_deadlock_the_runner() -> None:
+    """The runner's SIGINT/SIGTERM handler calls ``interrupt()``, which takes the
+    group's lock. CPython runs a handler between two bytecodes of the main
+    thread, so a signal that lands while ``fail()`` -- or a first ``interrupt()``
+    -- holds that lock runs ``interrupt()`` inside it. The fake gate re-enters
+    the group exactly there, from the stop that ``fail()`` makes under the lock.
+    """
+
+    group = run_release_gates.GateGroup()
+
+    class Gate:
+        pid = 2_147_000_000  # beyond pid_max: killpg raises ProcessLookupError
+
+        def __init__(self) -> None:
+            self.stops = 0
+
+        def terminate(self) -> None:
+            self.stops += 1
+            if self.stops == 1:
+                group.interrupt(signal.SIGTERM)  # the handler runs right here
+
+    gate = Gate()
+    group.register("pytest", gate)  # type: ignore[arg-type]
+    finished = threading.Event()
+
+    def first_failure() -> None:
+        group.fail("postgres")
+        finished.set()
+
+    threading.Thread(target=first_failure, daemon=True).start()
+
+    assert finished.wait(timeout=10), (
+        "a signal handled while the gate group was locked deadlocked the runner"
+    )
+    assert group.first_failure == "postgres"
+    assert group.interrupted == signal.SIGTERM
+    assert gate.stops == 2, "fail() and the interrupt must both stop the gate"

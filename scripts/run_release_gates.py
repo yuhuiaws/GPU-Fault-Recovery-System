@@ -97,7 +97,10 @@ class GateGroup:
 
     def __init__(self) -> None:
         self.output_lock = threading.Lock()
-        self._lock = threading.Lock()
+        # Reentrant: the signal handler calls interrupt(), and CPython runs it
+        # between two bytecodes of the main thread -- also while that thread is
+        # inside fail() or a first interrupt() with this lock held.
+        self._lock = threading.RLock()
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._cancelled: set[str] = set()
         self.first_failure: str | None = None
