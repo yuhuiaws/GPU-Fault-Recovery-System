@@ -2,6 +2,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from gpu_fault.admin.config import default_admin_config
 from gpu_fault_release import regional_release_config as CONFIG
@@ -16,6 +17,7 @@ from scripts.component_wheels import (
     dependency_closure,
     entrypoint_modules,
 )
+from scripts.release_identity import file_set_identity
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -675,4 +677,52 @@ def test_the_served_scope_is_not_probed_without_a_committed_state(monkeypatch) -
     assert (
         SCOPE.SERVED_SCOPE_DRIFT_INPUT
         not in DIFF.classify_release(_release(), {}).changed
+    )
+
+
+def test_an_amp_installer_change_alone_reapplies_the_observability_component(
+    tmp_path: Path,
+) -> None:
+    """The release runs ``deploy/observability/install-amp-monitoring.sh`` to
+    apply the AMP rules, the Alertmanager definition and the control-plane
+    collector, but only when the observability digest moves. While the
+    installer was in no ``component_inputs.observability`` pattern, a fix to it
+    alone moved no digest: the plan skipped observability and the site kept
+    what the old installer had applied."""
+
+    identity = yaml.safe_load(
+        (ROOT / "config/release-identity.yaml").read_text(encoding="utf-8")
+    )
+    patterns = tuple(identity["component_inputs"]["observability"])
+    for pattern in patterns:
+        for source in sorted(ROOT.glob(pattern)):
+            target = tmp_path / source.relative_to(ROOT)
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(source.read_bytes())
+    installer = tmp_path / "deploy/observability/install-amp-monitoring.sh"
+    assert installer.is_file(), (
+        f"no observability component input matches the AMP installer: {patterns}"
+    )
+    before = file_set_identity(tmp_path, patterns)["sha256"]
+    installer.write_text(
+        installer.read_text(encoding="utf-8") + "\n# an installer fix\n",
+        encoding="utf-8",
+    )
+    after = file_set_identity(tmp_path, patterns)["sha256"]
+    assert after != before, "an installer edit left the observability digest alone"
+
+    # The live release recorded the old digest; the new one moves the release
+    # delivery identity too, which scopes nothing on its own.
+    release = _release()
+    release.config.delivery_component_digests["observability"] = after
+    state = _state()
+    state["observability_manifest_sha256"] = before
+    state["release_delivery_sha256"] = "0" * 64
+    diff = DIFF.classify_release(release, state)
+
+    assert diff.changed == {"observability_manifests", "release_delivery"}, diff
+    assert diff.kind is DIFF.ReleaseChangeKind.CONTROL_PLANE_ONLY
+    assert DIFF.build_execution_plan(diff).nodes == (
+        DIFF.ReleaseComponent.OBSERVABILITY,
+        DIFF.ReleaseComponent.VERIFY,
     )

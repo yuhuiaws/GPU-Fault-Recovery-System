@@ -154,10 +154,14 @@ component_inputs:
     # edit to it has to move this digest or the release skips the re-apply.
     # Substitution-only rendering, so the renderer modules are deliberately
     # not listed here (contrast dcgm, whose affinity is computed from code).
+    # The installer that applies the AMP rules, the Alertmanager definition
+    # and the control-plane collector is listed: the release runs it only
+    # when this digest moves, so a fix to it alone has to move the digest.
     - deploy/dataplane/adot-dataplane.yaml
     - deploy/observability/adot-control-plane.yaml
     - deploy/observability/amp-alertmanager.yaml
     - deploy/observability/amp-rules.yaml
     - deploy/observability/amp-sns-publish-policy.json
+    - deploy/observability/install-amp-monitoring.sh
   schema:
     - deploy/migrations/*.yaml

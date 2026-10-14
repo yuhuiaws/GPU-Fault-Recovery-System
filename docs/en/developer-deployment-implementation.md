@@ -2414,6 +2414,8 @@ therefore a probe-only change is also classified as `DEPLOY_HOST_ONLY`. `native_
 deploy-host closure and do not enter the three business component wheels. The shared `amp-sns-publish-policy.json` is included by
 `config/release-identity.yaml` in both the Manifest inputs and the observability component identity, and
 `bootstrap_task_inputs` also binds that asset and `monitoring_policy.py` so that the owning checkpoint is invalidated.
+The observability component identity also covers `deploy/observability/install-amp-monitoring.sh`, the installer the
+release runs to apply that component, so a change to the installer alone re-applies observability.
 The `deploy/migrations/postgres-schema-preflight-job.yaml` reused by the database proof is covered by the same Manifest
 input rule; probe source sent to CPU Jobs must come from this run's trusted deployment source and must not take an unbound script from elsewhere.
 
