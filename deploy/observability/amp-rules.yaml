@@ -1849,10 +1849,14 @@ groups:
       # held until its workflow is terminal -- a lapsed lease does not release
       # it -- and the holder's execution deadline bounds that hold: at that
       # deadline the watchdog fails the holder, and a holder still RUNNING past
-      # it is GpuFaultWorkflowDeadlineNotEnforced. The exception is a record
-      # parked BLOCKED / NEEDS_OPERATOR with an unresolved node action: its
-      # reset or reboot may still be running, so it keeps its claims until the
-      # operator answers it.
+      # it is GpuFaultWorkflowDeadlineNotEnforced. The exception is a parked
+      # record whose node action may still be running -- BLOCKED /
+      # NEEDS_OPERATOR with an unresolved node action, or INTERNAL_ERROR with a
+      # provider reboot still WAITING: it keeps its claims until the operator
+      # answers it, and once that action is older than
+      # NODE_ACTION_LONGEST_LIFE_SECONDS (5520 s) the dispatcher releases them
+      # itself (audit event PARKED_BUDGET_RELEASED). A scope holding more than
+      # its limit is GpuFaultRemediationBudgetOverLimit.
       - alert: GpuFaultRemediationBudgetStarved
         expr: >-
           max by (control_plane_cluster, region)
@@ -1871,10 +1875,17 @@ groups:
             its workflow is terminal and at most until the holder's execution
             deadline, at which the deadline watchdog fails it; a holder still
             RUNNING past its deadline is GpuFaultWorkflowDeadlineNotEnforced.
-            The exception is a record parked BLOCKED / NEEDS_OPERATOR with an
-            unresolved node action: its reset or reboot may still be running,
-            so it keeps its claims until submit-remediation --disposition
-            confirm-node-action answers it or workflow-reconcile ends it.
+            The exception is a parked record whose node action may still be
+            running (BLOCKED / NEEDS_OPERATOR with an unresolved node action,
+            or INTERNAL_ERROR with a provider reboot still WAITING): it keeps
+            its claims until submit-remediation --disposition
+            confirm-node-action answers it or workflow-reconcile ends it, and
+            once that action is older than NODE_ACTION_LONGEST_LIFE_SECONDS
+            (5520 s) the dispatcher releases them itself (audit event
+            PARKED_BUDGET_RELEASED, counted in
+            gpu_fault_remediation_budget_parked_holds_released_total); the
+            record stays BLOCKED for the operator. A scope holding more than
+            its limit is GpuFaultRemediationBudgetOverLimit.
       # S1: the per-cluster remediation budget is a safety limit (five
       # concurrent remediations per cluster as shipped). A correlated
       # whole-cluster fault -- one AZ, 500+ nodes -- therefore drains five at a
@@ -1917,10 +1928,9 @@ groups:
             limit for this cluster, confirm the active claims belong to
             workflows that are still progressing (a claim is held until its
             workflow is terminal, bounded by the holder's execution deadline;
-            a holder that stopped progressing, or a parked NEEDS_OPERATOR
-            record with an unresolved node action, is
-            GpuFaultRemediationBudgetStarved territory), and read the oldest
-            waiting workflow via
+            a holder that stopped progressing, or a parked record whose node
+            action may still be running, is GpuFaultRemediationBudgetStarved
+            territory), and read the oldest waiting workflow via
             gpu_fault_workflow_pending_age_seconds_max and its
             remediation_budget_last_blocked_reason.
       # A budget scope holding more workflows than its configured limit. Holds
@@ -1958,7 +1968,11 @@ groups:
             log warning that names each scope with its holders and limit, and
             compare gpu_fault_remediation_budget_active_claims with the limits;
             the excess drains as the remediations in flight end, bounded by
-            their deadlines. Do not raise the limit to clear this alert.
+            their deadlines and, for parked records, by
+            NODE_ACTION_LONGEST_LIFE_SECONDS (5520 s). A scope still over its
+            limit long after the roll ended means holders that no longer
+            progress: GpuFaultRemediationBudgetStarved. Do not raise the limit
+            to clear this alert.
       # A completion event with no decision row at all. Every persisted event
       # is meant to be decided in the same transaction; one without a decision
       # was recorded and then never judged, and nothing downstream will ever
