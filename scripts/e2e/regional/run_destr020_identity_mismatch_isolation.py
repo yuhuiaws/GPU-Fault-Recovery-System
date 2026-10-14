@@ -17,7 +17,12 @@ and the plan contains neither anyway. Nothing on this path can be armed.
 
 The case leaves control records behind by design -- a FAILED incident and its
 support escalation -- and records their ids as ``leftover_records``. There is
-no node to restore.
+no node to restore. An Agent record for the alias, should anything have
+registered one, is the case's own residue: the cleanup revokes it through the
+fleet registry's drain/revoke under a transition named after the run and
+reads it back REVOKED, or the case FAILs (a live Agent for a node that never
+existed keeps the departed-node cleanup's ledger and every release's Agent
+coverage on it).
 """
 
 from __future__ import annotations
@@ -143,6 +148,65 @@ print(
         },
         sort_keys=True,
         default=str,
+    )
+)
+"""
+
+
+# The case's own residue: an Agent record for the alias, should anything have
+# registered one. Revoked through the registry's lifecycle path -- drain, then
+# revoke, under one transition named after the run -- and read back. Argv:
+# cluster id, alias, transition id, reason.
+ALIAS_AGENT_CLEANUP = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.fleet import AgentLifecycleState, AgentTransitionRequest
+from gpu_fault.store import NotFoundError
+
+cluster_id, alias, transition_id, reason = sys.argv[1:5]
+context = ApplicationContext.from_environment()
+store = context.store
+
+
+def read():
+    try:
+        return store.get_agent(cluster_id, alias)
+    except (NotFoundError, KeyError):
+        return None
+
+
+before = read()
+revoked_by_case = False
+if before is not None and before.lifecycle_state is not AgentLifecycleState.REVOKED:
+    registry = context.fleet_registry
+    if registry is None:
+        raise SystemExit("the agent registry is not enabled in this Pod")
+    request = AgentTransitionRequest(
+        expected_generation=before.generation,
+        transition_id=(
+            transition_id
+            if before.lifecycle_state is AgentLifecycleState.ACTIVE
+            else before.transition_id or transition_id
+        ),
+        reason=reason,
+    )
+    if before.lifecycle_state is AgentLifecycleState.ACTIVE:
+        registry.drain_agent(cluster_id, alias, request)
+    registry.revoke_agent(cluster_id, alias, request)
+    revoked_by_case = True
+after = read()
+print(
+    json.dumps(
+        {
+            "found": before is not None,
+            "before": None if before is None else before.lifecycle_state.value,
+            "lifecycle_state": None if after is None else after.lifecycle_state.value,
+            "transition_id": None if after is None else after.transition_id,
+            "revoked_by_case": revoked_by_case,
+        },
+        sort_keys=True,
     )
 )
 """
@@ -600,7 +664,8 @@ def execute_case(
 
 
 def _cleanup(run: _LiveRun) -> dict[str, Any]:
-    """Nothing was mutated, so cleanup only proves that: fleet and identity."""
+    """No node was mutated; the alias's Agent record, if any, is revoked, then
+    the cleanup proves the rest: fleet and identity."""
 
     result: dict[str, Any] = {"errors": []}
 
@@ -610,6 +675,7 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
         except Exception as exc:  # noqa: BLE001 - a cleanup failure is a FAIL
             result["errors"].append(f"{label}: {type(exc).__name__}: {exc}")
 
+    guard("alias_agent", lambda: retire_alias_agent(run))
     guard("fleet_after", lambda: _fleet_after(run))
     guard(
         "runtime_identity",
@@ -619,6 +685,23 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
             stage=f"after {CASE_ID} cleanup",
         ),
     )
+    return result
+
+
+def retire_alias_agent(run: _LiveRun) -> dict[str, Any]:
+    """Revoke the alias's Agent record through the fleet registry; prove it gone."""
+
+    result = run.regional.cpu_python(
+        ALIAS_AGENT_CLEANUP,
+        run.settings.regional.cluster_id,
+        run.alias,
+        verdicts.alias_cleanup_transition(run.run_id),
+        verdicts.alias_cleanup_reason(run.run_id, run.alias),
+    )
+    write_json_atomic(run.case_dir / "alias-agent-cleanup.json", result)
+    errors = verdicts.alias_agent_cleanup_errors(result)
+    if errors:
+        raise RegionalFixtureError("; ".join(errors))
     return result
 
 

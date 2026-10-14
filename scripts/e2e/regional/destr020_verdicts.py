@@ -451,3 +451,36 @@ def leftover_records(state: dict[str, Any], chain: dict[str, Any]) -> dict[str, 
         "support_incident_id": support_incident.get("incident_id"),
         "support_workflow_request_id": support_workflow.get("request_id"),
     }
+
+
+def alias_cleanup_transition(run_id: str) -> str:
+    """The fleet transition the case's cleanup retires the alias Agent under."""
+
+    return f"{CASE_ID}/{run_id}/cleanup"
+
+
+def alias_cleanup_reason(run_id: str, alias: str) -> str:
+    """The audit line on that transition: whose residue it is and why."""
+
+    return (
+        f"{CASE_ID} cleanup (run {run_id}): the alias {alias} names a node that "
+        "never existed; its Agent record is the case's own residue, revoked "
+        "through the fleet registry"
+    )
+
+
+def alias_agent_cleanup_errors(result: dict[str, Any]) -> list[str]:
+    """The alias must end with no Agent record, or a REVOKED one.
+
+    The cleanup revokes whatever registered an Agent for the alias through
+    the registry's drain/revoke and reads it back; anything else is a FAIL --
+    a live Agent record for a node that never existed keeps the departed-node
+    cleanup's ledger, and every release's Agent coverage, on it.
+    """
+
+    if not result.get("found"):
+        return []
+    state = result.get("lifecycle_state")
+    if state != "REVOKED":
+        return [f"the alias Agent record is {state!r} after the cleanup, not REVOKED"]
+    return []

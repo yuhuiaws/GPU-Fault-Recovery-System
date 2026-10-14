@@ -696,3 +696,152 @@ def test_the_runner_is_executable_with_a_shebang_and_no_site_topology() -> None:
     source = path.read_text(encoding="utf-8")
     assert source.splitlines()[0] == "#!/usr/bin/env python3", source.splitlines()[0]
     assert not site_topology_leaks(source), site_topology_leaks(source)
+
+
+# --------------------------------------------------------------------------- #
+# Cleanup: the alias's Agent record is the case's own residue
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("result", "errors"),
+    [
+        pytest.param({"found": False}, [], id="never-registered"),
+        pytest.param({"found": True, "lifecycle_state": "REVOKED"}, [], id="revoked"),
+        pytest.param(
+            {"found": True, "lifecycle_state": "ACTIVE"},
+            ["the alias Agent record is 'ACTIVE' after the cleanup, not REVOKED"],
+            id="still-active",
+        ),
+    ],
+)
+def test_the_alias_must_end_without_a_live_agent(
+    result: dict[str, Any], errors: list[str]
+) -> None:
+    assert verdicts.alias_agent_cleanup_errors(result) == errors
+
+
+def _alias_agent(lifecycle: str) -> Any:
+    from datetime import datetime, timedelta, timezone
+
+    from gpu_fault.fleet import AgentLifecycleState, AgentRecord
+
+    seen = datetime.now(timezone.utc) - timedelta(hours=1)
+    return AgentRecord(
+        cluster_id="cluster-a",
+        node_id=ALIAS,
+        endpoint="https://10.0.0.7:9099",
+        agent_version="2026.10.14",
+        artifact_sha256="a" * 64,
+        policy_version="610",
+        runtime_profile_version="regional-v1",
+        config_digest="b" * 64,
+        allowed_operations=[],
+        node_instance_id=None,
+        agent_incarnation_id=f"inc-{ALIAS}",
+        first_seen_at=seen,
+        last_seen_at=seen,
+        lease_expires_at=seen + timedelta(minutes=2),
+        generation=3,
+        lifecycle_state=AgentLifecycleState(lifecycle),
+        transition_id="earlier/drain" if lifecycle == "DRAINING" else None,
+    )
+
+
+def _cleanup_in_pod(
+    monkeypatch: pytest.MonkeyPatch, store: Any, registry: Any
+) -> dict[str, Any]:
+    import io
+    import sys
+
+    from gpu_fault.app import ApplicationContext
+
+    context = ApplicationContext(store=store, fleet_registry=registry)
+    output = io.StringIO()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            ApplicationContext, "from_environment", classmethod(lambda cls: context)
+        )
+        scoped.setattr(
+            sys,
+            "argv",
+            [
+                "<pod>",
+                "cluster-a",
+                ALIAS,
+                verdicts.alias_cleanup_transition(RUN_ID),
+                verdicts.alias_cleanup_reason(RUN_ID, ALIAS),
+            ],
+        )
+        scoped.setattr(sys, "stdout", output)
+        exec(compile(destr020.ALIAS_AGENT_CLEANUP, "<pod>", "exec"), {})
+    return dict(json.loads(output.getvalue()))
+
+
+@pytest.mark.parametrize("lifecycle", ["ACTIVE", "DRAINING", "REVOKED", None])
+def test_the_cleanup_revokes_the_alias_agent_through_the_fleet_registry(
+    monkeypatch: pytest.MonkeyPatch, lifecycle: str | None
+) -> None:
+    from gpu_fault.fleet import FleetRegistry
+    from tests._builders import build_store
+
+    store = build_store()
+    registry = FleetRegistry(store, "s" * 32)
+    if lifecycle is not None:
+        store.save_agent(_alias_agent(lifecycle))
+        if lifecycle == "REVOKED":
+            store.save_agent(
+                _alias_agent("REVOKED").model_copy(update={"transition_id": "x"})
+            )
+
+    result = _cleanup_in_pod(monkeypatch, store, registry)
+
+    assert verdicts.alias_agent_cleanup_errors(result) == []
+    assert result["found"] is (lifecycle is not None)
+    assert result["revoked_by_case"] is (lifecycle in {"ACTIVE", "DRAINING"})
+    if lifecycle in {"ACTIVE", "DRAINING"}:
+        record = store.get_agent("cluster-a", ALIAS)
+        assert record.lifecycle_state.value == "REVOKED"
+        # A drain someone else started is finished under its own transition.
+        expected = (
+            verdicts.alias_cleanup_transition(RUN_ID)
+            if lifecycle == "ACTIVE"
+            else "earlier/drain"
+        )
+        assert record.transition_id == expected, "audited as the case's cleanup"
+        if lifecycle == "ACTIVE":
+            assert destr020.CASE_ID in str(record.transition_reason), (
+                record.transition_reason
+            )
+
+
+def test_a_cleanup_that_cannot_revoke_the_alias_agent_fails_the_case(
+    tmp_path: Path,
+) -> None:
+    from types import SimpleNamespace
+
+    calls: list[tuple[str, ...]] = []
+
+    def cpu_python(script: str, *arguments: str, **_options: Any) -> dict[str, Any]:
+        calls.append(arguments)
+        return {"found": True, "lifecycle_state": "ACTIVE", "revoked_by_case": False}
+
+    run = SimpleNamespace(
+        regional=SimpleNamespace(cpu_python=cpu_python),
+        settings=SimpleNamespace(regional=SimpleNamespace(cluster_id="cluster-a")),
+        alias=ALIAS,
+        run_id=RUN_ID,
+        case_dir=tmp_path,
+    )
+
+    with pytest.raises(destr020.RegionalFixtureError, match="not REVOKED"):
+        destr020.retire_alias_agent(run)
+
+    assert calls == [
+        (
+            "cluster-a",
+            ALIAS,
+            f"{destr020.CASE_ID}/{RUN_ID}/cleanup",
+            verdicts.alias_cleanup_reason(RUN_ID, ALIAS),
+        )
+    ]
+    evidence = json.loads((tmp_path / "alias-agent-cleanup.json").read_text())
+    assert evidence["lifecycle_state"] == "ACTIVE", "the failed read-back is kept"

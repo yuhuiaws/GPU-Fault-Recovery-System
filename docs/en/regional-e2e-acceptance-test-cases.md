@@ -12421,7 +12421,14 @@ the ledger migrates in place, and the next real command leaves a complete audit 
     (the support escalation is the end of the chain, asserted by `escalation_chain_depth`);
   - All real GPU nodes are item-by-item identical to the baseline, the alias never became a node; the provider verb set is empty;
   - The leftover FAILED incident and support records are written into the evidence as `leftover_records`.
-- Cleanup (`finally`): no node needs restoring; fleet snapshot comparison + runtime identity comparison.
+- Cleanup (`finally`): no node needs restoring. First the alias's Agent record is revoked, should anything have
+  registered one: it is the case's own residue, revoked in the CPU Pod through the fleet registry's lifecycle path --
+  `ACTIVE` is drained (`drain_agent`) then revoked (`revoke_agent`) under the transition
+  `GF-REGIONAL-DESTR-020/<run id>/cleanup`, with a reason naming the case's cleanup; a `DRAINING` one is revoked under
+  the transition that drained it -- and read back, the result written to `alias-agent-cleanup.json`. A read-back that
+  is not `REVOKED` (nor no record at all) is a FAIL: a live Agent record for a node that never existed keeps the
+  departed-node cleanup's ledger and every release's Agent coverage check on it. Then fleet snapshot comparison +
+  runtime identity comparison.
 - Known limitations:
   - The support workflow on an unknown alias proves only **refusal**, not **isolation**: it neither cordons nor
     quarantines, SUCCEEDED means "evidence frozen, handed to a human", the alias exists in no system,
@@ -12430,6 +12437,13 @@ the ledger migrates in place, and the next real command leaves a complete audit 
     are counted only inside the escalation service process and are not wired to `/metrics`, the runner cannot read them, so they are not asserted.
   - The leftover FAILED/ESCALATED control records do not leave on their own (control-record retention is off), the same
     precedent as `DESTR-012` group D; the evidence states the IDs.
+  - The leftover ESCALATED incident names the alias, so the control plane's departed-node cleanup lists the alias in
+    its ledger (`provider_identity_unknown`: the alias carries no instance id, the provider cannot be asked) and never
+    ends it by itself. Once the report chain covers the 10-minute guard the ledger gives the administrator's exit
+    `gpu-fault-admin workflow-reconcile --state-dir <state-dir> --retire-departed-agents --node <alias>
+    --accept-unknown-provider-identity --reason <why>` (`--dry-run` first, then with `--reference`; Administrator
+    Operations §10.2), after which the cleanup's next cycle closes those leftover records. The case itself does not
+    take that exit: the leftovers are evidence, ended by the administrator after checking them.
 
 ### GF-REGIONAL-DESTR-021
 
