@@ -417,34 +417,73 @@ def test_a_cluster_that_is_not_active_is_reported_not_acted_on(
     assert world_.provider.calls == []
 
 
-def test_a_quarantined_incident_is_never_closed_automatically() -> None:
-    store = build_store()
-    world_ = hyperpod_departure(store)
-    incident = store.get_incident("incident-hp-efa")
+def _quarantine(store: Any, incident_id: str, workflow_id: str) -> None:
+    """The node was quarantined and the quarantining workflow ended."""
+
+    incident = store.get_incident(incident_id)
     store.save_incident(
         incident.model_copy(update={"state": IncidentState.QUARANTINED})
     )
     store.save_workflow(
-        store.get_workflow("workflow-hp-efa").model_copy(
+        store.get_workflow(workflow_id).model_copy(
             update={"status": WorkflowStatus.FAILED}
         )
     )
 
+
+def test_a_quarantined_incident_of_a_departed_node_closes_on_the_departure() -> None:
+    """The node that carried the quarantine is gone, and the isolation with it:
+    the departure proof is the isolation evidence the closure service needs."""
+
+    store = build_store()
+    world_ = hyperpod_departure(store)
+    _quarantine(store, "incident-hp-efa", "workflow-hp-efa")
+
+    [record] = world_.cleanup.run_once()
+
+    assert record.status is DepartedNodeCleanupStatus.CLEANED, record.blockers
+    assert "incident-closed:incident-hp-efa" in record.actions
+    closed = store.get_incident("incident-hp-efa")
+    assert closed.state is IncidentState.RECOVERED
+    assert any("node departed:" in item for item in closed.reasons), closed.reasons
+    assert (
+        f"isolation no longer present on node {HP_NODE}: the node departed "
+        f"(gone from Kubernetes and HyperPod, instance {HP_INSTANCE})"
+    ) in closed.reasons
+    [event] = [
+        item
+        for item in store.get_workflow("workflow-hp-efa").events
+        if item.details.get("previous_incident_state") == "QUARANTINED"
+    ]
+    assert event.actor == "departed-node-cleanup"
+    [evidence] = event.details["isolation_evidence"]
+    assert evidence["exists"] is False
+    assert evidence["departure"]["absent_from_provider"] is True, (
+        "the audit keeps the departure the close rested on"
+    )
+
+
+def test_a_quarantined_incident_that_also_names_a_present_node_keeps_its_refusal() -> (
+    None
+):
+    store = build_store()
+    world_ = world(store)
+    store.save_regional_cluster(registration(HP_CLUSTER))
+    store.save_agent(
+        agent(HP_CLUSTER, HP_NODE, instance_id="node-uid-1", last_seen=ago(minutes=30))
+    )
+    world_.provider.hyperpod[HP_NAME] = {"i-0a000002"}
+    pending_never_dispatched(
+        store, HP_CLUSTER, HP_NODE, suffix="pair", node_ids=[HP_NODE, HP_PRESENT]
+    )
+    _quarantine(store, "incident-pair", "workflow-pair")
+    world_.reports_since(HP_CLUSTER, [HP_PRESENT], minutes=12)
+
     [record] = world_.cleanup.run_once()
 
     assert record.status is DepartedNodeCleanupStatus.REFUSED
-    assert record.blocker_classes == ["quarantined_incident"]
-    assert store.get_incident("incident-hp-efa").state is IncidentState.QUARANTINED
-    assert record.admin_commands == [], (
-        "--close-incident refuses a QUARANTINED incident whose node is gone; the "
-        "ledger names no command that cannot work"
-    )
-    assert any("no command ends it" in item for item in record.blockers), (
-        record.blockers
-    )
-    assert store.get_agent(HP_CLUSTER, HP_NODE).lifecycle_state is (
-        AgentLifecycleState.REVOKED
-    )
+    assert record.blocker_classes == ["incident_names_other_nodes"]
+    assert store.get_incident("incident-pair").state is IncidentState.QUARANTINED
 
 
 def test_a_declared_spare_is_left_to_the_administrator() -> None:

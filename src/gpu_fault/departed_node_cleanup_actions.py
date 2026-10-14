@@ -12,13 +12,15 @@ it with, so the automation adds no write of its own:
   planner judges ``never-changed`` through ``apply_workflow_reconcile_plan``
   (its own digest-checked apply);
 * the node's ``ESCALATED`` incidents once no workflow of theirs is open --
-  ``IncidentClosureService.close_incident``, the operator close.
+  ``IncidentClosureService.close_incident``, the operator close -- and its
+  ``QUARANTINED`` ones the same way, with the departure proof as the isolation
+  evidence: a node that is gone took its cordon and taint with it.
 
 The actor on every write is ``ACTOR`` and the reference is the departure's
 generated id, so the audit reads exactly as the CLI's would with those two
 substituted. Everything else is reported, never written: a workflow that
-changed a node, a remote command on it, a live execution, a QUARANTINED
-incident, an incident that also names a node not proven gone. Each refusal is a
+changed a node, a remote command on it, a live execution, an incident that
+also names a node not proven gone. Each refusal is a
 ``Blocker`` with a bounded ``kind`` (the metric label) and, when there is one,
 the exact administrator command that is the manual path.
 """
@@ -39,7 +41,10 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStatus,
 )
-from gpu_fault.orchestration.incident_closure import IncidentNotClosable
+from gpu_fault.orchestration.incident_closure import (
+    IncidentNotClosable,
+    NodeIsolationEvidence,
+)
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.shared.errors import StaleWriteError
 from gpu_fault.workflow_reconcile import (
@@ -70,7 +75,6 @@ DECLARED_SPARE = "declared_spare"
 PROVIDER_IDENTITY_UNKNOWN = "provider_identity_unknown"
 WORKFLOW_CHANGED_NODE = "workflow_changed_node"
 REMOTE_COMMAND = "remote_command"
-QUARANTINED_INCIDENT = "quarantined_incident"
 INCIDENT_NAMES_OTHER_NODES = "incident_names_other_nodes"
 INCIDENT_NOT_CLOSABLE = "incident_not_closable"
 OTHER = "other"
@@ -91,7 +95,6 @@ BLOCKER_KINDS = WAITING_KINDS | {
     PROVIDER_IDENTITY_UNKNOWN,
     WORKFLOW_CHANGED_NODE,
     REMOTE_COMMAND,
-    QUARANTINED_INCIDENT,
     INCIDENT_NAMES_OTHER_NODES,
     INCIDENT_NOT_CLOSABLE,
     OTHER,
@@ -358,20 +361,17 @@ class DepartureWrites:
         incident = self.store.get_incident(incident_id)
         if incident.state is IncidentState.RECOVERED:
             return
+        evidence: list[NodeIsolationEvidence] | None = None
         if incident.state is IncidentState.QUARANTINED:
-            # No command either: the administrator's close needs isolation
-            # evidence too, and refuses a node the cluster no longer has.
-            outcome.blockers.append(
-                Blocker(
-                    QUARANTINED_INCIDENT,
-                    f"incident {incident_id} is QUARANTINED; its isolation cannot "
-                    "be verified on a node that is gone, so it is never closed "
-                    "automatically, and --close-incident refuses it for the same "
-                    "reason: no command ends it yet",
+            # Every node is proven departed (``_incident``): the departure is
+            # the isolation evidence, judged by the closure service itself.
+            evidence = [
+                NodeIsolationEvidence(
+                    node_id=node, exists=False, departure=dict(self.evidence[node])
                 )
-            )
-            return
-        if incident.state is not IncidentState.ESCALATED:
+                for node in sorted(incident.node_ids)
+            ]
+        elif incident.state is not IncidentState.ESCALATED:
             outcome.blockers.append(
                 Blocker(
                     WORKFLOW_LIVE,
@@ -385,7 +385,11 @@ class DepartureWrites:
         )
         try:
             _closed, changed = self.incident_closure.close_incident(
-                incident_id, reason=reason, operator=ACTOR, reference=reference
+                incident_id,
+                reason=reason,
+                operator=ACTOR,
+                reference=reference,
+                evidence=evidence,
             )
         except IncidentNotClosable as exc:
             text = str(exc)

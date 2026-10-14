@@ -1113,15 +1113,22 @@ def test_a_missing_node_is_reported_as_evidence_the_service_refuses(
         dry_run=True,
     )
 
-    assert calls[1]["payload"]["evidence"]["inc-q1"] == [
-        {
-            "node_id": "node-gone",
-            "exists": False,
-            "unschedulable": False,
-            "quarantine_taint_value": None,
-            "isolation_annotations": {},
-        }
-    ]
+    [missing] = calls[1]["payload"]["evidence"]["inc-q1"]
+    departure = missing.pop("departure")
+    assert missing == {
+        "node_id": "node-gone",
+        "exists": False,
+        "unschedulable": False,
+        "quarantine_taint_value": None,
+        "isolation_annotations": {},
+    }
+    # The node name carries no HyperPod instance: the provider is never asked
+    # and the departure stays unproven, which the service refuses.
+    assert departure["absent_from_kubernetes"] is True
+    assert departure["absent_from_provider"] is False
+    assert departure["blockers"][-1] == (
+        "provider membership unknown: node name carries no HyperPod instance id"
+    )
 
 
 def test_close_quarantined_cannot_be_combined_with_explicit_ids(

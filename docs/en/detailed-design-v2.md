@@ -2736,7 +2736,7 @@ The same entry point has three more mutually exclusive incident-level switches (
 `--reason`/`--reference`/`--dry-run`): `--close-incident INCIDENT_ID ...` closes the named
 `ESCALATED` incident; `--close-escalated [--max-items N]` discovers and closes all `ESCALATED` incidents
 (`--dry-run` lists ids and decisions); `--close-quarantined [--max-items N]` closes
-`QUARANTINED` incidents whose node isolation no longer exists (ownership annotations left behind by a manually removed taint are stripped as well, see below).
+`QUARANTINED` incidents whose node isolation no longer exists, or whose node is provably departed (ownership annotations left behind by a manually removed taint are stripped as well, see below).
 
 **Retired generation** is another shape, handled automatically by the periodic sweep of `WorkflowDispatcher`,
 with no administrator mode. When an incident has already advanced to a higher fencing generation and points to another workflow,
@@ -3598,7 +3598,7 @@ sequenceDiagram
         P-->>W: no longer listed / terminated / unknown (a failure = unproven, retried next cycle)
         W->>DB: drain_agent -> revoke_agent (CAS)
         W->>DB: never-dispatched / never-changed workflow -> SUPERSEDED (CAS)
-        W->>DB: ESCALATED incident -> RECOVERED (close_incident)
+        W->>DB: ESCALATED / QUARANTINED incident -> RECOVERED (close_incident)
         W->>DB: ledger line DepartedNodeCleanupRecord (CLEANED / PENDING / REFUSED)
         W->>W: informational or refusal notification, counters, logs
     end
@@ -3639,7 +3639,11 @@ module of its own; integration can share the EC2 client and the IAM statement.
 through `workflow_reconcile.close_never_dispatched_workflow` (the very write of `apply-never-dispatched`, extracted from
 the Pod script of `admin/workflow_reconcile_never_dispatched.py`); a `BLOCKED` record through
 `build_workflow_reconcile_plan` + `apply_workflow_reconcile_plan`, accepting only `terminalization=never-changed` with
-`never_changed_a_node` and checking the plan digest; the incident through `IncidentClosureService.close_incident`. The actor
+`never_changed_a_node` and checking the plan digest; the incident through `IncidentClosureService.close_incident` -- a
+`QUARANTINED` one with the departure proof as its isolation evidence (`NodeIsolationEvidence.departure`, judged by the
+service's `isolation_verdict`: both absences must hold for that very node and its Agent record must not be alive by the
+shared rule; the CLI's `--close-quarantined`/`--close-incident` read the provider for a node the cluster no longer has and
+hand it to the same judgement). The actor
 is `departed-node-cleanup`, the reference `departed-node-cleanup-<first 16 of sha256(cluster/node/instance/absent_since)>`,
 the transition `departed-node-cleanup/<reference>`. The reference is deterministic, so a resumed cycle after a restart
 lands on the same transition: a record left `DRAINING` is revoked under the transition that drained it, never drained
@@ -3647,8 +3651,8 @@ twice (`test_a_restart_between_drain_and_revoke_resumes_on_postgres`). An incide
 only when those nodes are proven departed in the **same** cycle. Every case not ended has a bounded `kind` (also the
 `reason` label of `gpu_fault_departed_node_cleanup_refusals_total`) and a manual command, in two groups -- "waiting"
 (`PENDING`, resolving by itself) and "left to the operator" (`REFUSED`) -- tabled in §10.1.1 of administrator operations; a
-workflow that changed a node or has a remote command, a `QUARANTINED` incident, a spare declaration and anything on a
-cluster that is not `ACTIVE` are only ever reported.
+workflow that changed a node or has a remote command, a spare declaration and anything on a cluster that is not
+`ACTIVE` are only ever reported.
 
 **Ledger and observability.** `DepartedNodeCleanupRecord` (a generic `gpu_fault_objects` kind), one line per node,
 rewritten when the verdict changes or 10 min after the last write; a `CLEANED` line stays 7 days and is deleted when the

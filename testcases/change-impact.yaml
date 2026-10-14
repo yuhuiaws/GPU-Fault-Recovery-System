@@ -786,6 +786,8 @@ rules:
       - tests/execution/test_cluster_executor_node_inventory.py
       - tests/admin/test_admin_config_departed_node_cleanup.py
       - tests/regional/test_departed_node_status.py
+      - tests/orchestration/test_incident_closure_departed_nodes.py
+      - tests/admin/test_incident_close_departed_nodes.py
     pytest:
       - tests/departed_nodes
       - tests/execution/test_cluster_executor_node_inventory.py
@@ -795,6 +797,8 @@ rules:
       - tests/admin/test_admin_workflow_reconcile_never_dispatched.py
       - tests/eks_provider/test_departed_node_ec2_proof.py
       - tests/regional/test_release_departed_nodes.py
+      - tests/orchestration/test_incident_closure_departed_nodes.py
+      - tests/admin/test_incident_close_departed_nodes.py
     regional_cases: []
     postgres: true
 

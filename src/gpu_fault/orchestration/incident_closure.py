@@ -25,6 +25,10 @@ Two exits, one write path:
   API has no kubeconfig and never supplies evidence; the admin CLI reads it
   through the site's GPU kubeconfig (2026-09-10: 24 incidents sat QUARANTINED
   on nodes whose isolation a later incident or a cleanup had released).
+  A node the cluster no longer has carries nothing, so it clears only with the
+  proof that it departed (``departure``: gone from Kubernetes and from its
+  provider, ``departed_nodes``) and an Agent that is no longer alive -- the
+  rule the departed-node cleanup and ``workflow-reconcile`` judge with.
 
 Both write RECOVERED through ``save_incident(expected=)`` (compare-and-set,
 never a blind overwrite), append the reason to the incident, record one audit
@@ -38,7 +42,7 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, Mapping, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Sequence
 
 from gpu_fault.adapters.common import (
     ANNOTATION_FENCING,
@@ -50,6 +54,11 @@ from gpu_fault.adapters.common import (
 from gpu_fault.compile_blocked import (
     OPEN_REMOTE_STATUSES,
     close_settled_incident_blocked_workflow,
+)
+from gpu_fault.departed_nodes import (
+    EC2_SOURCE,
+    agent_retirement_reasons,
+    evidence_proves_departure,
 )
 from gpu_fault.execution.node_action_uncertainty import (
     has_unresolved_node_action,
@@ -131,7 +140,10 @@ class NodeIsolationEvidence:
     Read by the caller from the cluster (``kubectl get node``): the cordon
     flag, the value of the ``gpu-fault.io/quarantined`` taint if any, and the
     gpu-fault isolation annotations present (``ISOLATION_ANNOTATION_KEYS``,
-    key -> value). ``exists`` is False for a node the cluster no longer has.
+    key -> value). ``exists`` is False for a node the cluster no longer has;
+    ``departure`` is then the caller's proof that it departed -- the per-node
+    record ``departed_nodes.node_evidence`` builds (absent from Kubernetes and
+    from the provider, the sources and when they were read) -- or None.
     """
 
     node_id: str
@@ -139,6 +151,7 @@ class NodeIsolationEvidence:
     quarantine_taint_value: str | None = None
     isolation_annotations: Mapping[str, str] = field(default_factory=dict)
     exists: bool = True
+    departure: Mapping[str, Any] | None = None
 
     @classmethod
     def from_mapping(cls, value: Mapping[str, Any]) -> "NodeIsolationEvidence":
@@ -154,16 +167,24 @@ class NodeIsolationEvidence:
                 if key in ISOLATION_ANNOTATION_KEYS and item not in (None, "")
             },
             exists=bool(value.get("exists", True)),
+            departure=(
+                dict(value["departure"])
+                if isinstance(value.get("departure"), Mapping)
+                else None
+            ),
         )
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        document: dict[str, Any] = {
             "node_id": self.node_id,
             "exists": self.exists,
             "unschedulable": self.unschedulable,
             "quarantine_taint_value": self.quarantine_taint_value,
             "isolation_annotations": dict(self.isolation_annotations),
         }
+        if self.departure is not None:
+            document["departure"] = dict(self.departure)
+        return document
 
 
 def owned_quarantine_taint_values(incident_id: str) -> frozenset[str]:
@@ -174,9 +195,33 @@ def owned_quarantine_taint_values(incident_id: str) -> frozenset[str]:
     return frozenset({incident_id, quarantine_taint_value(incident_id)})
 
 
+def _departure_line(node_id: str, departure: Mapping[str, Any]) -> str:
+    sources = departure.get("sources") or {}
+    label = "EC2" if EC2_SOURCE in sources else "HyperPod"
+    return (
+        f"isolation no longer present on node {node_id}: the node departed "
+        f"(gone from Kubernetes and {label}, instance "
+        f"{departure.get('instance_id')})"
+    )
+
+
+def _unproven_departure(departure: Mapping[str, Any] | None) -> str:
+    if departure is None:
+        return ""
+    blockers = [str(item) for item in departure.get("blockers") or [] if item]
+    return "; its departure is unproven" + (
+        f" ({'; '.join(blockers)})" if blockers else ""
+    )
+
+
+AgentReasons = Callable[[str], list[str]]
+
+
 def isolation_verdict(
     incident: FaultIncident,
     evidence: Sequence[NodeIsolationEvidence],
+    *,
+    departed_agent_reasons: AgentReasons | None = None,
 ) -> tuple[str | None, list[str]]:
     """Whether ``evidence`` proves the isolation ``incident`` owned is gone.
 
@@ -185,8 +230,11 @@ def isolation_verdict(
     ``isolation no longer present on node <node>``, extended with the
     isolation another incident holds on it -- that other incident owns it and
     is not this one's business, but the record should say so. Every node the
-    incident names needs evidence; a node the cluster no longer has is not
-    proof either way and is refused.
+    incident names needs evidence. A node the cluster no longer has is no
+    proof either way -- unless it is provably departed: its ``departure``
+    shows it gone from Kubernetes and from its provider, and
+    ``departed_agent_reasons`` (the closure service's read of the node's
+    Agent record) finds no live Agent. The isolation left with the node.
     """
 
     by_node = {item.node_id: item for item in evidence}
@@ -197,11 +245,27 @@ def isolation_verdict(
         if node is None:
             return f"no isolation evidence was supplied for node {node_id}", []
         if not node.exists:
-            return (
-                f"node {node_id} is not in the cluster; its isolation state "
-                "cannot be verified",
-                [],
+            if node.departure is None or not evidence_proves_departure(
+                node.departure, node_id
+            ):
+                return (
+                    f"node {node_id} is not in the cluster; its isolation state "
+                    "cannot be verified" + _unproven_departure(node.departure),
+                    [],
+                )
+            alive = (
+                departed_agent_reasons(node_id)
+                if departed_agent_reasons is not None
+                else ["the node's Agent record was not read"]
             )
+            if alive:
+                return (
+                    f"node {node_id} is not in the cluster, but its Agent is not "
+                    f"departed: {'; '.join(alive)}",
+                    [],
+                )
+            reasons.append(_departure_line(node_id, node.departure))
+            continue
         if node.unschedulable:
             return f"node {node_id} is still cordoned (unschedulable)", []
         if node.quarantine_taint_value in owned_taints:
@@ -619,8 +683,11 @@ class IncidentClosureService:
         if incident.state is IncidentState.RECOVERED:
             return None, None, []
         isolation_reasons: list[str] = []
+        agents = self._departed_agent_reasons(incident.cluster_id)
         if incident.state in EVIDENCE_CLOSABLE_STATES and evidence is not None:
-            refusal, isolation_reasons = isolation_verdict(incident, evidence)
+            refusal, isolation_reasons = isolation_verdict(
+                incident, evidence, departed_agent_reasons=agents
+            )
             if refusal is not None:
                 return (
                     f"incident {incident.incident_id} is {incident.state.value} and "
@@ -635,7 +702,9 @@ class IncidentClosureService:
             # with the close (live, gpu-eks-cluster: an ESCALATED XID 46
             # incident whose reset record was confirmed on the node's reboot
             # stayed un-closable while that record was open).
-            cleared, reasons = isolation_verdict(incident, evidence)
+            cleared, reasons = isolation_verdict(
+                incident, evidence, departed_agent_reasons=agents
+            )
             if cleared is None:
                 isolation_reasons = reasons
         elif incident.state not in OPERATOR_CLOSABLE_STATES:
@@ -644,7 +713,8 @@ class IncidentClosureService:
                 "ESCALATED incident can be closed by an operator (a QUARANTINED "
                 "node is released by a validated restore workflow, or closed by "
                 "gpu-fault-admin workflow-reconcile --close-quarantined with node "
-                "evidence that the isolation is gone; a planning state by the "
+                "evidence that the isolation is gone or that the node departed; "
+                "a planning state by the "
                 "workflow that ends it)",
                 None,
                 [],
@@ -670,6 +740,33 @@ class IncidentClosureService:
                 [],
             )
         return None, None, isolation_reasons
+
+    def _departed_agent_reasons(self, cluster_id: str) -> AgentReasons:
+        """Why a departed node's Agent still counts as alive; empty when not.
+
+        The departed-node rule's Agent half, judged on this process's clock: no
+        record, a ``REVOKED`` one, or a lease that expired with a heartbeat
+        older than ``DEPARTED_AGENT_GUARD_AGE``.
+        """
+
+        evaluated_at = datetime.now(timezone.utc)
+
+        def reasons(node_id: str) -> list[str]:
+            try:
+                agent = self.store.get_agent(cluster_id, node_id)
+            except (KeyError, NotFoundError):
+                return []
+            lifecycle = str(getattr(agent.lifecycle_state, "value", ""))
+            if lifecycle == "REVOKED":
+                return []
+            return agent_retirement_reasons(
+                lifecycle,
+                agent.last_seen_at,
+                agent.lease_expires_at,
+                evaluated_at=evaluated_at,
+            )
+
+        return reasons
 
     def _operator_settled(self, workflow: WorkflowRequest) -> bool:
         """A parked record whose only hold on the node is its status.

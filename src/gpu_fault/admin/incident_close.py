@@ -24,7 +24,12 @@ naming it -- ``isolation_verdict``). The Pod has no kubeconfig, so the evidence
 is read here, through the site's GPU kubeconfig (the same ``kubectl`` path the
 BLOCKED reconcile uses for its node evidence; a site without one is refused),
 and handed to the script in a second pass for exactly the incidents the first
-pass reported as ``evidence_required``. ``--close-quarantined`` discovers the
+pass reported as ``evidence_required``. A node the cluster no longer has
+carries no isolation to read; it gets its departure proof instead
+(``departure_evidence``: the provider read the BLOCKED reconcile makes --
+HyperPod ``list-cluster-nodes``, or EC2 for the instance the fleet recorded),
+and the service clears it only when the node is provably departed and its
+Agent is not alive. ``--close-quarantined`` discovers the
 QUARANTINED queue the way ``--close-escalated`` discovers the ESCALATED one
 (2026-09-10: 24 incidents sat QUARANTINED on nodes a later incident or a
 cleanup had already released).
@@ -49,19 +54,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
-from gpu_fault.admin import operator_identity
+from gpu_fault.admin import operator_identity, workflow_reconcile_departed_nodes
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.admin.workflow_reconcile import (
     ISOLATION_ANNOTATIONS,
     REFERENCE_PATTERN,
+    _departed_node_evidence,
     _run_reconcile,
     cluster_nodes,
+    cluster_target,
     node_isolation_evidence,
     strip_node_isolation_annotations,
 )
 from gpu_fault.adapters.common import ANNOTATION_INCIDENT, quarantine_taint_value
+from gpu_fault.departed_nodes import node_evidence
 
 INCIDENT_CLOSE_HISTORY_PATH = Path("workflow-reconcile/incident-close/history")
 REASON_LIMIT = 512
@@ -288,9 +296,11 @@ def gather_isolation_evidence(
     pending: Sequence[dict[str, Any]],
     *,
     inventories: dict[str, dict[str, dict[str, Any]]] | None = None,
+    read_at: dict[str, dict[str, str]] | None = None,
 ) -> tuple[dict[str, list[dict[str, Any]]], dict[str, str]]:
     """Node isolation evidence for the incidents the Pod reported as
-    ``evidence_required``, one ``kubectl get nodes`` per cluster.
+    ``evidence_required``, one ``kubectl get nodes`` per cluster (its time in
+    ``read_at[cluster]["kubernetes"]``).
 
     Returns ``(evidence by incident id, refusal by incident id)``: an incident
     whose cluster cannot be read -- no GPU kubeconfig for the site, a cluster
@@ -314,6 +324,8 @@ def gather_isolation_evidence(
             continue
         by_cluster.setdefault(cluster_id, []).append(item)
     for cluster_id, items in sorted(by_cluster.items()):
+        if read_at is not None:
+            read_at[cluster_id] = {"kubernetes": datetime.now(timezone.utc).isoformat()}
         try:
             inventory = cluster_nodes(site, cluster_id)
         except BootstrapError as exc:
@@ -330,6 +342,77 @@ def gather_isolation_evidence(
                 inventory=inventory,
             )
     return evidence, refusals
+
+
+def departure_evidence(
+    site: RenderedSite,
+    pending: Sequence[dict[str, Any]],
+    evidence: dict[str, list[dict[str, Any]]],
+    *,
+    provider_inventories: dict[str, Any],
+    read_at: dict[str, dict[str, str]],
+) -> None:
+    """Give every node the cluster no longer has its departure proof, in place.
+
+    The Kubernetes half is the ``kubectl get nodes`` that did not list the
+    node; the provider half is read here, once per cluster
+    (``provider_inventories``), like the never-changed reconcile reads it:
+    HyperPod's ``list-cluster-nodes`` for the instance the node name carries,
+    or EC2 for the instance the fleet recorded on an eks-managed cluster. The
+    record is ``departed_nodes.node_evidence``'s; the closure service judges
+    it, and the node's Agent record, in the Pod. A node the cluster still has
+    is left as it is, and so is one that already carries a departure.
+    """
+
+    clusters = {
+        str(item.get("incident_id") or ""): str(item.get("cluster_id") or "")
+        for item in pending
+    }
+    missing = [
+        {
+            "cluster_id": clusters.get(incident_id, ""),
+            "node_ids": [
+                str(entry["node_id"]) for entry in items if not entry.get("exists")
+            ],
+        }
+        for incident_id, items in evidence.items()
+    ]
+    recorded = workflow_reconcile_departed_nodes.RecordedInstanceIds(
+        site, missing, cluster_target=cluster_target, run_script=_run_reconcile
+    )
+    for incident_id, items in evidence.items():
+        cluster_id = clusters.get(incident_id, "")
+        for entry in items:
+            if entry.get("exists", True) or "departure" in entry or not cluster_id:
+                continue
+            node_id = str(entry["node_id"])
+            sources_read = read_at.setdefault(cluster_id, {})
+            try:
+                departed = _departed_node_evidence(
+                    site,
+                    cluster_id,
+                    node_id,
+                    provider_inventories,
+                    sources_read,
+                    instance_id=recorded.get(cluster_id, node_id),
+                )
+                target = cluster_target(site, cluster_id)
+            except BootstrapError as exc:
+                departed = {
+                    "node_id": node_id,
+                    "exists": False,
+                    "restored": False,
+                    "blockers": [f"provider membership unknown: {exc}"],
+                }
+                target = {"cluster_id": cluster_id}
+            record = node_evidence(
+                node_id,
+                departed=departed,
+                target=target,
+                aws_region=site.release_config.get("aws_region"),
+            )
+            record["read_at"] = dict(sources_read)
+            entry["departure"] = record
 
 
 def orphaned_isolation_nodes(
@@ -538,8 +621,17 @@ def _with_evidence(
     if not pending:
         return result
     inventories: dict[str, dict[str, dict[str, Any]]] = {}
+    read_at: dict[str, dict[str, str]] = {}
+    provider_inventories: dict[str, Any] = {}
     evidence, refusals = gather_isolation_evidence(
-        site, pending, inventories=inventories
+        site, pending, inventories=inventories, read_at=read_at
+    )
+    departure_evidence(
+        site,
+        pending,
+        evidence,
+        provider_inventories=provider_inventories,
+        read_at=read_at,
     )
     dry_run = bool(payload.get("dry_run"))
     if not dry_run:
@@ -553,6 +645,15 @@ def _with_evidence(
         site, pending, evidence, dry_run=dry_run, inventories=inventories
     )
     refusals = {**refusals, **strip_refusals}
+    # The strip re-reads the nodes it patched; their incidents' departed nodes
+    # get the proof again, from the same provider read.
+    departure_evidence(
+        site,
+        pending,
+        evidence,
+        provider_inventories=provider_inventories,
+        read_at=read_at,
+    )
     strip_key = "would_strip_isolation_nodes" if dry_run else "stripped_isolation_nodes"
     replacements: dict[str, dict[str, Any]] = {}
     if evidence:
