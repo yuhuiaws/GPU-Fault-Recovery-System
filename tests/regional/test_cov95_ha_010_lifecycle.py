@@ -36,6 +36,21 @@ def test_full_aurora_blackout_lifecycle_measures_every_cpu_pod(
     assert harness.events.index("failover") < harness.events.index("delete-pod")
     assert harness.binding_reads == 2
     assert harness.events[-1] == "verify-runtime"
+    # Cleanup fails the writer back before it waits for the Deployments.
+    assert harness.restore_targets == ["old"] and harness.writer == "old"
+    restore = harness.events.index("restore")
+    assert harness.events[restore + 1 :] == [
+        "ready:deployment/gpu-fault-api-ha",
+        "ready:deployment/gpu-fault-control-worker",
+        "ready:deployment/gpu-fault-telemetry-spool-worker",
+        "verify-runtime",
+    ], "cleanup fails the writer back, then waits for the Deployments"
+    recorded = report["cleanup"]["writer_restore"]
+    assert recorded["action"] == "failover" and recorded["target"] == "old"
+    assert recorded["writer_before_restore"] == "new"
+    assert recorded["rds_after"]["writer"] == "old" and recorded["errors"] == []
+    evidence = json.loads((harness.directory / "writer-restore.json").read_text())
+    assert evidence == recorded
 
 
 @pytest.mark.parametrize("defect", ["busy", "binding", "uid", "spawn", "expired"])
@@ -175,3 +190,68 @@ def test_bad_live_budget_fails_preflight_before_sampler_start(
         harness.execute()
     assert harness.processes == []
     assert harness.events == []
+
+
+def test_a_writer_that_cannot_be_restored_fails_the_case(harness: HA010Harness) -> None:
+    harness.restore_ignored = True
+
+    code, report = harness.execute()
+
+    assert code == 1 and report["verdict"] == "FAIL"
+    assert report["errors"] == [], "the liveness verdict itself passed"
+    assert any(
+        item.startswith("writer_restore: RegionalFixtureError: ")
+        for item in report["cleanup"]["errors"]
+    ), report["cleanup"]["errors"]
+    evidence = json.loads((harness.directory / "writer-restore.json").read_text())
+    assert evidence["action"] == "failover" and evidence["target"] == "old"
+    assert "did not converge" in evidence["errors"][0], evidence["errors"]
+    assert harness.events[-1] == "verify-runtime", "the rest of cleanup still runs"
+
+
+def test_the_restore_waits_for_a_quiet_control_plane_and_then_refuses(
+    harness: HA010Harness,
+) -> None:
+    # Reads: preflight, before the failover, the post-check, then the restore's.
+    harness.busy_from_read = 4
+
+    code, report = harness.execute()
+
+    assert code == 1 and report["verdict"] == "FAIL"
+    assert harness.restore_targets == [], "no failover lands on busy work"
+    assert harness.writer == "new"
+    (error,) = [
+        item
+        for item in report["cleanup"]["errors"]
+        if item.startswith("writer_restore")
+    ]
+    assert "writer restore refused" in error and "aurora-failback" in error, error
+    assert (harness.directory / "store-before-restore.json").is_file(), (
+        "the refused restore keeps its store evidence"
+    )
+    assert harness.store_reads > 4, "the quiet rule is waited out, not read once"
+
+
+def test_no_failover_means_no_restore(harness: HA010Harness) -> None:
+    harness.busy_at_boundary = True
+
+    code, report = harness.execute()
+
+    assert code == 1
+    assert "failover" not in harness.events and "restore" not in harness.events
+    assert "writer_restore" not in report["cleanup"]
+    assert not (harness.directory / "writer-restore.json").exists(), (
+        "nothing moved, so nothing is restored"
+    )
+
+
+def test_a_failover_that_was_requested_is_restored_even_when_the_case_aborts(
+    harness: HA010Harness,
+) -> None:
+    harness.replace_on_delete = True
+
+    code, report = harness.execute()
+
+    assert code == 1 and "stale Pod UID" in report["error"]
+    assert harness.restore_targets == ["old"] and harness.writer == "old"
+    assert report["cleanup"]["writer_restore"]["rds_after"]["writer"] == "old"

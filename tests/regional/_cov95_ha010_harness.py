@@ -88,6 +88,8 @@ class HA010Harness:
         self.queue = {"depth": 0}
         self.remote_commands: dict[str, Any] = {"open_by_cluster": {}}
         self.busy_at_boundary = False
+        # The store read from which the fault queue holds work (None: never).
+        self.busy_from_read: int | None = None
         self.store_reads = 0
         self.env = {
             verdicts.STALE_SECONDS_VARIABLE: "90",
@@ -98,6 +100,10 @@ class HA010Harness:
         self.binding_failure_at: int | None = None
         self.failover_requested = False
         self.rds_reads = 0
+        self.writer = "old"
+        self.pending_writer: str | None = None
+        self.restore_targets: list[str] = []
+        self.restore_ignored = False
         self.replace_on_delete = False
         self.replacement_at: float | None = None
         self.never_ready = False
@@ -202,9 +208,10 @@ class HA010Harness:
 
     def store_snapshot(self, **kwargs: Any) -> dict[str, Any]:
         self.store_reads += 1
+        busy_from = 2 if self.busy_at_boundary else self.busy_from_read
         queue = (
             {"depth": 1}
-            if self.busy_at_boundary and self.store_reads >= 2
+            if busy_from is not None and self.store_reads >= busy_from
             else self.queue
         )
         return {
@@ -283,18 +290,31 @@ class HA010Harness:
         raise AssertionError("unexpected CPU fake transport call")
 
     def run(self, argv: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        """RDS: each failover reads ``failing-over`` once, then has a new writer."""
+
         assert argv[:2] == ["aws", "rds"]
         if argv[2] == "failover-db-cluster":
-            self.failover_requested = True
-            self.events.append("failover")
+            named = "--target-db-instance-identifier" in argv
+            self.events.append("restore" if named else "failover")
+            if named:
+                target = argv[argv.index("--target-db-instance-identifier") + 1]
+                self.restore_targets.append(target)
+                if self.restore_ignored:
+                    return subprocess.CompletedProcess(argv, 0, "{}", "")
+            else:
+                self.failover_requested = True
+                target = "new" if self.writer == "old" else "old"
+            self.pending_writer, self.rds_reads = target, 0
             return subprocess.CompletedProcess(argv, 0, "{}", "")
-        if self.failover_requested:
+        if self.pending_writer is not None:
             self.rds_reads += 1
+            if self.rds_reads >= 2:
+                self.writer, self.pending_writer = self.pending_writer, None
         cluster = {
-            "Status": "failing-over" if self.rds_reads == 1 else "available",
+            "Status": "available" if self.pending_writer is None else "failing-over",
             "DBClusterMembers": [
-                {"DBInstanceIdentifier": "old", "IsClusterWriter": self.rds_reads < 2},
-                {"DBInstanceIdentifier": "new", "IsClusterWriter": self.rds_reads >= 2},
+                {"DBInstanceIdentifier": name, "IsClusterWriter": name == self.writer}
+                for name in ("old", "new")
             ],
         }
         return subprocess.CompletedProcess(

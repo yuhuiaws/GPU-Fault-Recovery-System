@@ -81,6 +81,8 @@ def test_cleanup_does_not_accept_running_samplers_and_limits_remote_actions(
         samplers=[ha010.Sampler("stuck", process, T0)],
         case_dir=tmp_path,
         preflight={"runtime_identity": {}},
+        # No failover was requested, so cleanup has no writer to restore.
+        failover_requested_at=None,
         regional=SimpleNamespace(
             kubectl=unavailable,
             verify_runtime_identity=lambda *a, **kw: calls.append("verify") or {},

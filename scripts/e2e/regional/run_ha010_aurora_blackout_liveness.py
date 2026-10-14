@@ -16,6 +16,15 @@ reports ``regional_registry.secret_drift=false`` before and after (ARCH-H3).
 The case is refused while any remote command is open or the processor queue
 holds work: a failover under a live destructive step is HA-003's job, and
 mixing the two would make a restart here unattributable.
+
+Cleanup puts the writer back. The injected failover leaves it on whichever
+member RDS promoted, and nothing else moves it back: live 2026-10-13 it stayed
+in us-west-2b under a control plane entirely in us-west-2a (+~1.2 ms per
+database round trip, burst admission p99 x3) until an operator failed back by
+hand. Once the injected failover has settled the runner fails the writer back
+to the pre-case instance (``--target-db-instance-identifier``, under the same
+quiet-control-plane rule as the injection), records ``writer-restore.json``,
+and a writer it cannot restore fails the case.
 """
 
 from __future__ import annotations
@@ -377,7 +386,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "mutation": (
             "call RDS failover-db-cluster once with no workflow in flight, and "
             "delete exactly one Ready gpu-fault-api-ha Pod right after the "
-            "request; sample /livez and /healthz inside every CPU Pod. No GPU "
+            "request; sample /livez and /healthz inside every CPU Pod; in "
+            "cleanup fail the writer back to the pre-case instance. No GPU "
             "node, Node Agent, provider or executor action is involved."
         ),
         "preflight_identity": plan_identity(preflight),
@@ -397,6 +407,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "samplers_are_bounded_by_observe_seconds": True,
             "deleted_replica_is_recreated_by_its_deployment": True,
             "runner_finally_waits_for_every_deployment_to_be_ready": True,
+            "writer_is_failed_back_to_the_pre_case_instance": True,
         },
         "preflight": preflight,
     }
@@ -546,11 +557,13 @@ def _prepare_live_run(settings: Settings, run_dir: Path, attempt: int) -> _LiveR
     )
 
 
-def _quiet_control_plane(run: _LiveRun) -> None:
+def _quiet_control_plane(
+    run: _LiveRun, *, evidence: str = "store-before-failover.json"
+) -> None:
     """Refuse the failover while anything is open for this control plane."""
 
     state = run.regional.store_snapshot(queue_attempts=1)
-    write_json_atomic(run.case_dir / "store-before-failover.json", state)
+    write_json_atomic(run.case_dir / evidence, state)
     if (state.get("remote_commands") or {}).get("open_by_cluster"):
         raise RegionalFixtureError(
             "remote commands are open; a failover now is HA-003, not HA-010"
@@ -813,6 +826,87 @@ def execute_case(
     return 0 if result["verdict"] == "PASS" else 1
 
 
+def wait_rds_settled(settings: Settings, *, timeout_seconds: float) -> dict[str, Any]:
+    """Poll RDS until it is ``available`` with one writer."""
+
+    deadline = time.monotonic() + timeout_seconds
+    last: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last = rds_snapshot(settings)
+        if last.get("status") == "available" and last.get("writer"):
+            return last
+        time.sleep(5)
+    raise RegionalFixtureError(
+        f"Aurora did not settle before the writer restore: {last}"
+    )
+
+
+def _await_quiet_for_restore(run: _LiveRun) -> None:
+    """The injection's quiet rule, waited out for a bounded time."""
+
+    deadline = time.monotonic() + verdicts.RESTORE_QUIET_WAIT_SECONDS
+    while True:
+        try:
+            _quiet_control_plane(run, evidence="store-before-restore.json")
+            return
+        except RegionalFixtureError as exc:
+            if time.monotonic() >= deadline:
+                raise RegionalFixtureError(
+                    f"writer restore refused: {exc}; {verdicts.RESTORE_REMEDY} "
+                    "once the site is idle"
+                ) from exc
+        time.sleep(verdicts.RESTORE_QUIET_POLL_SECONDS)
+
+
+def restore_writer(run: _LiveRun) -> dict[str, Any]:
+    """Fail the writer back to the instance that wrote before the case.
+
+    Waits for the injected failover to settle first; a writer that never left
+    is recorded as ``action: none``. Writes ``writer-restore.json`` whatever
+    happens and raises when the placement was not restored.
+    """
+
+    original = str((run.preflight.get("rds") or {}).get("writer") or "")
+    record: dict[str, Any] = {"target": original, "action": "none"}
+    try:
+        settled = wait_rds_settled(
+            run.settings, timeout_seconds=verdicts.RESTORE_TIMEOUT_SECONDS
+        )
+        record["writer_before_restore"] = settled.get("writer")
+        if original and settled.get("writer") != original:
+            _await_quiet_for_restore(run)
+            record.update(
+                action="failover",
+                requested_at=datetime.now(timezone.utc).isoformat(),
+            )
+            record["request"] = ha003.aws_rds(
+                _rds(run.settings),
+                "failover-db-cluster",
+                "--db-cluster-identifier",
+                run.settings.rds_cluster_id,
+                "--target-db-instance-identifier",
+                original,
+            )
+            settled, record["samples"] = ha003.wait_rds_failover(
+                _rds(run.settings),
+                previous_writer=str(settled.get("writer")),
+                timeout_seconds=verdicts.RESTORE_TIMEOUT_SECONDS,
+            )
+            record["restored_at"] = datetime.now(timezone.utc).isoformat()
+        record["rds_after"] = settled
+        record["errors"] = verdicts.placement_restore_errors(
+            record, original_writer=original
+        )
+    except Exception as exc:
+        record["errors"] = [f"{type(exc).__name__}: {exc}"]
+        raise
+    finally:
+        write_json_atomic(run.case_dir / "writer-restore.json", record)
+    if record["errors"]:
+        raise RegionalFixtureError("writer restore: " + "; ".join(record["errors"]))
+    return record
+
+
 def cleanup_case(run: _LiveRun, *, remote_allowed: bool = True) -> dict[str, Any]:
     result: dict[str, Any] = {"errors": []}
 
@@ -841,6 +935,9 @@ def cleanup_case(run: _LiveRun, *, remote_allowed: bool = True) -> dict[str, Any
     if not remote_allowed:
         result["errors"].append("supervision lost; remote cleanup was not attempted")
         return result
+    if run.failover_requested_at is not None:
+        # Before the readiness wait: the restore is a second, shorter outage.
+        guard("writer_restore", lambda: restore_writer(run))
 
     def deployments_ready() -> bool:
         _wait_deployments_ready(run)

@@ -5431,14 +5431,9 @@ test_cases:
   - 采样时间线覆盖整个窗口：首个样本早于 failover 请求，末个样本晚于 readiness 恢复截止时刻；每 Pod 的 readiness 中断总秒数记入证据
   - 全程无任何 remote command 在飞、processor 队列为空；三个 Deployment 回到期望副本数，runtime identity 与 preflight 相同
   - failover之前再次校验CPU Secret/投影DSN/SQL writer与指定Aurora incarnation及release的绑定，不能故障转移另一套数据库
+  - 清理时把 writer 切回 preflight 记录的原 writer（--target-db-instance-identifier，注入同样的在途工作规则），Aurora available 且 writer 为原实例，记入 writer-restore.json；切不回即 FAIL
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: 381f265549b2cbab40412b04551a9eb72708c9128446a67e91b5638233d3e0f7
-      components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-010
   related_pytest: tests/regional/test_ha010_aurora_blackout_liveness.py::test_a_healthz_500_is_a_crash_not_a_refusal

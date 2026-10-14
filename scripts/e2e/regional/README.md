@@ -599,8 +599,12 @@ Current classification:
   and samples `/livez` and `/healthz` inside every CPU Pod
   (`probes/ha010_probe.py`): liveness must stay 200, readiness may only 503 and
   must return within the stale window, no pre-existing container may restart,
-  the replacement must not CrashLoop, and `secret_drift` must stay false. Its
-  verdicts live in `ha010_verdicts.py`.
+  the replacement must not CrashLoop, and `secret_drift` must stay false.
+  Cleanup fails the writer back to the pre-case instance
+  (`--target-db-instance-identifier`, under the injection's quiet rule) and
+  records `writer-restore.json`; a writer it cannot restore fails the case
+  (`gpu-fault-admin aurora-failback` is the operator's exit). Its verdicts
+  live in `ha010_verdicts.py`.
 - BOOT-023 has a reusable manual live driver for the release audit surfaces
   (ARCH-H2/H3/H5). It requires BOOT-020 PASS and the `noop` config that
   `boot020_release_candidates.py configs` materialises, refuses anything that

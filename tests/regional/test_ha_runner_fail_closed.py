@@ -138,6 +138,8 @@ def test_sampler_cleanup_waits_and_still_stops_the_other_sampler(
         ],
         case_dir=tmp_path,
         preflight={"runtime_identity": {}},
+        # No failover was requested, so cleanup has no writer to restore.
+        failover_requested_at=None,
         regional=SimpleNamespace(
             kubectl=lambda *a, **kw: "", verify_runtime_identity=lambda *a, **kw: {}
         ),

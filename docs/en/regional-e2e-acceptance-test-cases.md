@@ -7109,6 +7109,11 @@ execution lease; otherwise orphan cleanup could cancel the commands used for the
      `gpu-fault-api-ha` Pod (the sampler of the deleted Pod ends with it and is not counted in the timeline).
   4. Wait for RDS to return to `available` with a changed writer (reusing `HA-003`'s `wait_rds_failover`);
      wait for the replacement Pod to be Ready; collect all sampler output; re-read the Pod status and `/healthz` of the three Deployments.
+  5. In cleanup, fail the writer back to the pre-case writer recorded at preflight: first wait for the injected failover to settle
+     (`available` with a single writer), then, under the injection's own rule (no remote command in flight, empty fault queue, waited
+     out for at most 300 s), call `failover-db-cluster --target-db-instance-identifier <pre-case writer>` and wait for `available`
+     with that instance as the writer; the outcome goes to `writer-restore.json` and to `cleanup.writer_restore` of the case result.
+     Otherwise the failover leaves the writer in a zone outside the control plane's and every database round trip crosses zones.
 - Verdict:
   - every surviving Pod's `/livez` is 200 on every sample, with no single non-200 or unreachable sample;
   - `/healthz` may only return 503 (readiness); no 500 or other 5xx may appear, and it must not be unreachable while `/livez`
@@ -7123,7 +7128,11 @@ execution lease; otherwise orphan cleanup could cancel the commands used for the
   - the first sample of the sampling timeline precedes the failover request and the last sample follows the readiness-recovery deadline;
   - no remote command in flight throughout; the three Deployments return to their desired replica counts; runtime identity
     is the same as at preflight.
-- Cleanup (`finally`): terminate all samplers; wait for all three Deployments to be fully Ready; compare runtime identity.
+  - after cleanup the writer is the pre-case instance again and Aurora is `available`; a restore that is refused, times out or
+    lands on another member fails the case, and the leftover placement is failed back with `gpu-fault-admin aurora-failback`
+    (`administrator-operations.md` §4.9).
+- Cleanup (`finally`): terminate all samplers; once a failover was requested, fail the writer back to the pre-case instance
+  (step 5, before the readiness wait); wait for all three Deployments to be fully Ready; compare runtime identity.
   Failure of any step makes the case FAIL.
 - Known limitations:
   - **whether** `/healthz` shows 503 depends on whether the failover duration exceeds the stale window (90 s);
