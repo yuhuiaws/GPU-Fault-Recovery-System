@@ -22,7 +22,10 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     CommandRunner,
 )
-from gpu_fault.admin.cluster_removal_resources import removal_settled_keys
+from gpu_fault.admin.cluster_removal_resources import (
+    release_settled_providers,
+    removal_settled_keys,
+)
 from gpu_fault.admin.execution import cleanup_deadline, run_command as bounded_command
 from gpu_fault.admin.installation_lifecycle import (
     bind_retained_database,
@@ -1059,6 +1062,9 @@ def _prepare_aurora_boundary(
             state=state,
             settled=settled,
         )
+        if releases := release_settled_providers(cleaner, request.site, snapshot):
+            phase = "NON_AURORA_DELETE_IN_PROGRESS"
+            _transition(state_path, state, phase, oidc_provider_releases=releases)
         # Helm and other CPU Kubernetes resources must be proved gone while
         # the cluster's API is still available.
         _verify_resources(
@@ -1269,6 +1275,7 @@ def _finish_uninstall(
         "registry_entries_settled_by_removal": sorted(
             removal_settled_keys(request.site, snapshot)
         ),
+        "oidc_provider_releases": state.get("oidc_provider_releases", []),
         "delete_policy_residuals": 0,
         "final_registry": str(final_path),
         FIELD: state.get(FIELD),

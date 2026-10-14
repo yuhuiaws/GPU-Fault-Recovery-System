@@ -3182,7 +3182,12 @@ dependencies determine the deletion order, and it fails closed whenever ownershi
 with the registry, or the final residue is non-zero. The terminal rows of a cluster the site no longer lists, which
 `remove-cluster` (or a rolled-back join) settled (`cluster_removal_resources.removal_settled_keys`), are neither deleted nor
 probed again by the uninstall: the CREATED Executor OIDC provider row the removal leaves in place carries the removed cluster's
-`cluster_name`, which the cleaner's scope check would refuse.
+`cluster_name`, which the cleaner's scope check would refuse. A solution-created Executor OIDC provider is deleted by
+`remove-cluster` (after the target's roles) and by an uninstall (one an earlier removal left) only on a double proof
+(`admin/oidc_provider_release.py`): the registry row is the site's and the live provider carries the site tag; one complete
+listing of every IAM role in the account shows no trust policy naming it, as a principal or in a condition. A failed read, a
+throttle, a pagination marker or an unreadable trust policy is no proof: it is kept (row DETACHED) with a finding, and the
+verdict is journaled by either verb.
 
 Unit and integration tests cover model validation, identity immutability, the three-backend contract, execution-token
 authentication, deploy/takeover sync, cluster removal and full-site uninstall resumption, mainly in

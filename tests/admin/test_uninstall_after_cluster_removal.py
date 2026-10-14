@@ -16,16 +16,19 @@ from __future__ import annotations
 
 import copy
 from pathlib import Path
+from typing import Any
 
 import pytest
 import yaml
 
+from gpu_fault.admin import aws_commands
 from gpu_fault.admin.aws_cleanup_ownership import CleanupOwnership
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.cluster_removal_resources import (
     removal_settled_keys,
     remove_target_resources,
 )
+from gpu_fault.admin.oidc_provider_release import release_oidc_provider
 from gpu_fault.admin.resource_registry import load_installation_resource_snapshot
 from gpu_fault.admin.site import load_site
 from gpu_fault.admin.uninstall import uninstall
@@ -36,6 +39,7 @@ from gpu_fault.installation_resources import (
 from gpu_fault.installation_resources import InstallationResourceDeletePolicy as Policy
 from gpu_fault.installation_resources import InstallationResourceOwnership as Ownership
 from gpu_fault.installation_resources import InstallationResourceStatus as Status
+from tests.admin._aws_cleanup_support import TAGS, Aws
 from tests.admin.test_uninstall_lifecycle import Harness
 
 ACCOUNT = "123456789012"
@@ -125,6 +129,17 @@ class _RemovalCleaner:
     def delete(self, resource: InstallationResource) -> None:
         self.deleted.append(resource.resource_key)
 
+    def release_oidc_provider(
+        self, resource: InstallationResource, **_options: object
+    ) -> dict[str, object]:
+        # The removal found a customer IRSA role trusting the provider: kept.
+        return {
+            "resource_key": resource.resource_key,
+            "provider_arn": resource.resource_arn,
+            "outcome": "kept",
+            "trusting_roles": ["customer-irsa"],
+        }
+
 
 def _removed_b(harness: Harness, tmp_path: Path) -> list[InstallationResource]:
     """Run remove-cluster's registry step for gpu-b on the two-cluster site."""
@@ -155,16 +170,34 @@ def _removed_b(harness: Harness, tmp_path: Path) -> list[InstallationResource]:
         cleaner_factory=lambda _site: cleaner,
     )
     assert cleaner.deleted == [ROLE_B], "remove-cluster deletes the roles only"
-    assert evidence == {"deleted": [ROLE_B], "detached": sorted(REMOVED_B - {ROLE_B})}
+    assert evidence == {
+        "deleted": [ROLE_B],
+        "detached": sorted(REMOVED_B - {ROLE_B}),
+        "oidc_providers": [
+            {
+                "resource_key": PROVIDER_B,
+                "provider_arn": OIDC_B,
+                "outcome": "kept",
+                "trusting_roles": ["customer-irsa"],
+            }
+        ],
+    }
     return [item for item in removed.resources if item.resource_key in REMOVED_B]
 
 
-def _harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
+def _harness(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    trusted_by: tuple[str, ...] = ("customer-irsa",),
+) -> Harness:
     """The uninstall harness over a registry that still holds gpu-b's rows.
 
     Its fake cleaner applies the real cleaner's scope check first to every row
     bound to a cluster -- the step that refused the removed cluster's provider
-    (the harness's own fixture rows are not shaped for the rest of it).
+    (the harness's own fixture rows are not shaped for the rest of it) -- and
+    releases a left provider with the real double proof over IAM fakes in which
+    ``trusted_by`` still trust it.
     """
 
     harness = Harness(tmp_path, monkeypatch)
@@ -184,6 +217,36 @@ def _harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Harness:
         fake_delete(resource)
 
     monkeypatch.setattr(harness, "delete", delete)
+    trust = {"Statement": [{"Principal": {"Federated": OIDC_B}}]}
+
+    def deleted(_arguments: list[str]) -> dict[str, object]:
+        harness.existing.discard(PROVIDER_B)
+        return {}
+
+    aws = Aws(
+        {
+            ("iam", "list-open-id-connect-provider-tags"): {"Tags": TAGS},
+            ("iam", "list-roles"): {
+                "Roles": [
+                    {"RoleName": name, "AssumeRolePolicyDocument": trust}
+                    for name in trusted_by
+                ]
+            },
+            ("iam", "delete-open-id-connect-provider"): deleted,
+        }
+    )
+    monkeypatch.setattr(aws_commands, "bounded_command", aws)
+
+    def release(resource: InstallationResource, **options: Any) -> dict[str, Any]:
+        return release_oidc_provider(
+            resource,
+            ownership=CleanupOwnership(harness.site),
+            exists=harness.exists,
+            wait_absent=harness.wait_absent,
+            **options,
+        )
+
+    monkeypatch.setattr(harness, "release_oidc_provider", release, raising=False)
     return harness
 
 
@@ -196,7 +259,10 @@ def _final(harness: Harness) -> dict[str, Status]:
 
 @pytest.mark.parametrize("customer_deleted_cluster", [False, True])
 def test_uninstall_after_removing_a_cluster_with_a_created_oidc_provider(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, customer_deleted_cluster: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    customer_deleted_cluster: bool,
 ) -> None:
     harness = _harness(tmp_path, monkeypatch)
     if customer_deleted_cluster:
@@ -204,12 +270,22 @@ def test_uninstall_after_removing_a_cluster_with_a_created_oidc_provider(
 
     result = uninstall(harness.request(), runner=harness)
 
+    (verdict,) = result["oidc_provider_releases"]
+    assert (verdict["outcome"], verdict["trusting_roles"]) == (
+        "kept",
+        ["customer-irsa"],
+    )
+    assert harness.state()["oidc_provider_releases"] == [verdict], "journaled"
+    finding = capsys.readouterr().err
+    assert f"finding: OIDC provider {OIDC_B}" in finding
+    assert f"--open-id-connect-provider-arn {OIDC_B}" in finding
+
     assert harness.state()["phase"] == "COMPLETED"
     assert result["registry_entries_settled_by_removal"] == sorted(REMOVED_B)
     assert not [event for event in harness.events if "gpu-b" in event], (
         "uninstall settled a removed cluster's row a second time"
     )
-    assert PROVIDER_B in harness.existing, "the detached provider stays where it is"
+    assert PROVIDER_B in harness.existing, "a still-trusted provider stays"
     statuses = _final(harness)
     assert {key: statuses[key] for key in REMOVED_B} == {
         "cluster/gpu-b/eks": Status.PRESERVED,
@@ -218,6 +294,19 @@ def test_uninstall_after_removing_a_cluster_with_a_created_oidc_provider(
         PROVIDER_B: Status.DETACHED,
     }
     assert result["gpu_cluster_records_verified"] == 2, "only gpu-a is probed"
+
+
+def test_uninstall_deletes_a_left_provider_once_nothing_trusts_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = _harness(tmp_path, monkeypatch, trusted_by=())
+
+    result = uninstall(harness.request(), runner=harness)
+
+    (verdict,) = result["oidc_provider_releases"]
+    assert verdict["outcome"] == "deleted" and verdict["site_tagged"] is True
+    assert PROVIDER_B not in harness.existing, "the provider was not deleted"
+    assert _final(harness)[PROVIDER_B] is Status.DETACHED
 
 
 def test_a_removed_clusters_row_that_is_not_settled_is_still_refused(

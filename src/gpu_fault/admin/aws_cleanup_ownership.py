@@ -43,7 +43,16 @@ class CleanupOwnership:
     def aws(self, service: str, operation: str, *arguments: str) -> list[str]:
         return ["aws", service, operation, "--region", self.region, *arguments]
 
-    def validate_scope(self, resource: InstallationResource) -> None:
+    def validate_scope(
+        self, resource: InstallationResource, *, member: bool = True
+    ) -> None:
+        """The resource is this site's account, Region and provider.
+
+        ``member=False`` drops only the check that a ``cluster_name`` attribute
+        names a cluster the site lists: the row of a GPU cluster an earlier
+        ``remove-cluster`` released still names it.
+        """
+
         if (
             resource.site_id != self.site.registry_site_id
             or resource.region != self.region
@@ -85,13 +94,18 @@ class CleanupOwnership:
                     "SQS queue URL is outside the current site account/Region"
                 )
         cluster_name = resource.attributes.get("cluster_name")
-        if cluster_name and cluster_name not in {
-            self.cpu.resource_name,
-            *(
-                Arn.parse(str(cluster["eks_cluster_arn"])).resource_name
-                for cluster in self.config["clusters"]
-            ),
-        }:
+        if (
+            member
+            and cluster_name
+            and cluster_name
+            not in {
+                self.cpu.resource_name,
+                *(
+                    Arn.parse(str(cluster["eks_cluster_arn"])).resource_name
+                    for cluster in self.config["clusters"]
+                ),
+            }
+        ):
             raise BootstrapError(
                 "cleanup resource refers to a cluster outside the site"
             )
@@ -173,15 +187,18 @@ class CleanupOwnership:
         self.assert_tags(resource, tags)
         return resource
 
-    def prove_owned(self, resource: InstallationResource) -> None:
+    def prove_owned(
+        self, resource: InstallationResource, *, member: bool = True
+    ) -> None:
         """Prove a live ``resource`` is this site's, by the proof deletion uses.
 
         Its exact binding where the type has one (a subscription to the site's
         topic, a route-table association of a site-tagged table, ...), else the
-        site tag; ``replace-resource`` records nothing on less.
+        site tag; ``replace-resource`` records nothing on less. ``member`` as in
+        ``validate_scope``.
         """
 
-        self.validate_scope(resource)
+        self.validate_scope(resource, member=member)
         self.assert_caller()
         binding = self._binding(resource)
         tags = self._tags(resource) if binding is None else None

@@ -69,7 +69,10 @@ The eks-managed executor IAM needs only `ec2:DescribeInstances`, `ec2:RebootInst
 and no `sagemaker:*`. The node scope is `GPU_FAULT_NODE_SELECTOR`; the CPU node group must never match. The
 `eks:UpdateNodegroupConfig` / `sagemaker:UpdateCluster` that release the ownership label `gpu-fault.io/control-plane`
 (the last step of `remove-cluster`/`uninstall`) belong to the operator identity running the command alone and are
-granted to no runtime role.
+granted to no runtime role. So do `iam:GetOpenIDConnectProvider`, `iam:ListOpenIDConnectProviderTags`, `iam:ListRoles` (every
+role's trust policy in the account is read) and `iam:DeleteOpenIDConnectProvider`, which delete a solution-created Executor
+OIDC provider on its double proof (`remove-cluster`, and `uninstall` for a provider an earlier removal left); without any of
+the reads the proof fails, the provider is kept and a finding is printed.
 
 ### 2.1 Regional Acceptance Fixture Boundaries
 

@@ -332,8 +332,10 @@ effective policy, and the command output lists their keys in `registry_entries_s
 roles, preserved the EKS/HyperPod clusters and recorded a solution-created Executor OIDC provider DETACHED, left in place; processed
 again, the OIDC row carries the removed cluster's `cluster_name` and the cleaner's scope check refused "cleanup resource refers to a
 cluster outside the site" on every rerun, and a removed cluster the customer later deleted stopped the uninstall at "GPU cluster
-was not preserved". A provider left this way still carries the site tag; when no other role trusts it, an administrator may delete
-it by hand. A row of a cluster the site no longer lists that is not terminal is still refused.
+was not preserved". A solution-created OIDC provider an earlier removal left (its row DETACHED) is judged again in the non-Aurora
+deletion phase on the same double proof as `remove-cluster` (§5): deleted when it holds, otherwise kept with the same finding;
+the verdict goes into `oidc_provider_releases` of `uninstall/state.json` and the command output. A row of a cluster the site no
+longer lists that is not terminal is still refused.
 
 Historical rows of unknown origin in the Kubernetes installation inventory must stop the synchronisation and keep the original
 registry even when the corresponding object no longer exists; a developer reviews, adds an explicit retired entry in the trusted source inventory and ships it with a signed release;
@@ -1216,8 +1218,10 @@ Semantics and boundaries of `eks-managed`:
   its node group ARNs -- no `sagemaker:*` at all; the role name derives from the `cluster_id`. The deploy-host
   identity running `workflow-reconcile` additionally needs `ec2:DescribeInstances` (the departed-node EC2 proof); the
   operator identity running `remove-cluster`/`uninstall` additionally needs `eks:UpdateNodegroupConfig` (eks-managed) /
-  `sagemaker:UpdateCluster` (HyperPod) to release the ownership label (the "release" row of §5.0.0) -- neither write is
-  granted to the Executor or control-plane roles.
+  `sagemaker:UpdateCluster` (HyperPod) to release the ownership label (the "release" row of §5.0.0), and
+  `iam:GetOpenIDConnectProvider`, `iam:ListOpenIDConnectProviderTags`, `iam:ListRoles` and
+  `iam:DeleteOpenIDConnectProvider` to delete a solution-created Executor OIDC provider on its double proof (§5) --
+  none of these is granted to the Executor or control-plane roles.
 - The Runtime Profile applies per cluster: the site profile (`spec.runtimeProfile`) is every GPU cluster's default
   pin; `hyperpod-v1` names the HyperPod adapter as nodeReboot owner, `eks-v1` the EKS adapter. A cluster whose
   provider the site profile cannot reboot gets **its own** profile (`spec.clusters[].runtimeProfile`:
@@ -1693,6 +1697,17 @@ join/remove use the same site transaction lock. Disassociating an exclusive Rout
 Disassociation also requires a `CREATED/DETACH` resource registration with full zone/Region/VPC identity; CPU-native associations and
 external/reused associations are kept. Old numeric or cluster-form keys are not renamed on membership changes; read failures, unknown origin or
 duplicate physical records must be reconciled first, and "the association exists" cannot be taken as this site's right to delete.
+After the target cluster's roles are deleted, a solution-created (`CREATED/DETACH`) Executor OIDC provider is deleted only on a
+double proof (`admin/oidc_provider_release.py`): (a) the registry row is the site's and the live provider carries the site tag;
+(b) one listing of every IAM role in the account (`aws iam list-roles`, the CLI follows every page), every role's trust policy
+read, names neither the provider ARN nor its issuer, as a federated principal or in a condition key. A failed read, a throttle,
+a pagination marker left in the result, an unreadable trust policy, a missing tag or another live registry row naming the provider
+is no proof: the provider is kept, its row DETACHED as before, and one `finding:` line names the provider ARN, the roles that
+trust it and the manual command (`aws iam delete-open-id-connect-provider --open-id-connect-provider-arn <ARN>`). A deleted
+provider's row is DELETED; the verdict (`outcome` deleted/kept/absent, `trusting_roles`, `reason`, `manual_command`) is journaled
+in `AWS_DETACHED.oidc_providers` and shown in the command output's `oidc_providers`. An EXTERNAL provider is never touched. The
+operator identity needs `iam:GetOpenIDConnectProvider`, `iam:ListOpenIDConnectProviderTags`, `iam:ListRoles` and
+`iam:DeleteOpenIDConnectProvider` for it.
 Roles/RoleBindings rendered by the engine into workload namespaces (including system namespaces and kube-system)
 enter the original per-context cleanup snapshot only after the renderer policy, namespace/SA UID and full foreign-binding checks pass;
 `gpu-fault.io/workload-namespace-rbac=true` by itself authorises no deletion or orphan exemption.

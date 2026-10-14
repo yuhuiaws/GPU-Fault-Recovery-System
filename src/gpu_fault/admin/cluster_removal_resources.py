@@ -5,12 +5,13 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import copy_context
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from gpu_fault.admin.aws_cleanup import ResourceCleaner
 from gpu_fault.admin.bootstrap_common import Arn, BootstrapError
 from gpu_fault.admin.cluster_removal_network import NetworkRemovalRequest
 from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.oidc_provider_release import releasable_provider
 from gpu_fault.admin.resource_registry_dns import (
     find_vpc_association_resource,
     network_vpc_identity,
@@ -64,6 +65,32 @@ def removal_settled_keys(
         and (cluster_id := key_cluster_id(resource.resource_key)) is not None
         and cluster_id not in members
     )
+
+
+def release_settled_providers(
+    cleaner: ResourceCleaner,
+    site: RenderedSite,
+    snapshot: InstallationResourceSnapshot,
+) -> list[dict[str, Any]]:
+    """uninstall: release a site-created OIDC provider an earlier removal kept.
+
+    A removal before the double proof existed, or one that found a role still
+    trusting the provider, left it in place with its row DETACHED; uninstall
+    deletes it now on the same proof, or keeps it with the same finding.
+    """
+
+    settled = removal_settled_keys(site, snapshot)
+    return [
+        cleaner.release_oidc_provider(
+            item,
+            member=False,
+            recorded_elsewhere=provider_recorded_elsewhere(snapshot, [item], item),
+        )
+        for item in snapshot.resources
+        if item.resource_key in settled
+        and releasable_provider(item)
+        and item.status is InstallationResourceStatus.DETACHED
+    ]
 
 
 def key_cluster_id(resource_key: str) -> str | None:
@@ -326,6 +353,22 @@ def remove_target_resources(
                 for future in futures:
                     future.cancel()
                 raise
+    # After the roles: the cluster's own executor/ADOT roles trusted it.
+    providers = []
+    for resource in selected:
+        if not releasable_provider(resource):
+            continue
+        verdict = cleaner_factory(site).release_oidc_provider(
+            resource,
+            member=True,
+            recorded_elsewhere=provider_recorded_elsewhere(
+                snapshot, selected, resource
+            ),
+        )
+        providers.append(verdict)
+        if verdict["outcome"] != "kept":
+            detached.remove(resource.resource_key)
+            deleted.append(resource.resource_key)
     now = datetime.now(timezone.utc)
     updated = [
         resource.model_copy(
@@ -345,7 +388,32 @@ def remove_target_resources(
     ]
     value = InstallationResourceSnapshot(site_id=snapshot.site_id, resources=updated)
     value = value.model_copy(update={"source_sha256": value.digest()})
-    return value, {"deleted": sorted(deleted), "detached": sorted(detached)}
+    return value, {
+        "deleted": sorted(deleted),
+        "detached": sorted(detached),
+        "oidc_providers": providers,
+    }
+
+
+def provider_recorded_elsewhere(
+    snapshot: InstallationResourceSnapshot,
+    selected: Sequence[InstallationResource],
+    provider: InstallationResource,
+) -> list[str]:
+    """Live rows outside ``selected`` that name ``provider`` or depend on it."""
+
+    keys = {item.resource_key for item in selected}
+    arn = provider.resource_arn or provider.resource_id
+    return sorted(
+        item.resource_key
+        for item in snapshot.resources
+        if item.resource_key not in keys
+        and item.status not in TERMINAL_INSTALLATION_RESOURCE_STATUSES
+        and (
+            provider.resource_key in item.dependencies
+            or arn in {item.resource_id, item.resource_arn}
+        )
+    )
 
 
 def merge_removal_resources(

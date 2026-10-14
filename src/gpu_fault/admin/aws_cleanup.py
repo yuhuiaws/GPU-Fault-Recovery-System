@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from typing import Any, Iterable
+from typing import Any, Iterable, Sequence
 
 from gpu_fault.admin.aws_cleanup_clusters import (
     aurora_snapshot,
@@ -44,6 +44,7 @@ from gpu_fault.admin.aws_commands import (
 )
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.diagnostics import diagnostic_text
+from gpu_fault.admin.oidc_provider_release import release_oidc_provider
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.installation_resources import InstallationResource
 
@@ -1301,6 +1302,24 @@ class ResourceDeletion(ResourceProbe):
                 f"{resource.resource_key}"
             )
         self.wait_absent(resource)
+
+    def release_oidc_provider(
+        self,
+        resource: InstallationResource,
+        *,
+        member: bool = True,
+        recorded_elsewhere: Sequence[str] = (),
+    ) -> dict[str, Any]:
+        """Delete a site-created OIDC provider on the double proof, else keep it."""
+
+        return release_oidc_provider(
+            resource,
+            ownership=self._ownership,
+            exists=self.exists,
+            wait_absent=self.wait_absent,
+            member=member,
+            recorded_elsewhere=recorded_elsewhere,
+        )
 
     def wait_absent(
         self,

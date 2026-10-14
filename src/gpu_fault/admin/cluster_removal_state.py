@@ -491,6 +491,13 @@ def removal_result(
         "cpu_control_plane": "PRESERVED",
         "gpu_cluster": "PRESERVED",
         "ownership_label": ownership_release_summary(state),
+        # The verdict on a site-created executor OIDC provider (deleted, kept
+        # with the roles that trust it, or already absent).
+        "oidc_providers": (
+            ((state.get("evidence") or {}).get("AWS_DETACHED") or {}).get(
+                "oidc_providers", []
+            )
+        ),
         FIELD: state.get(FIELD),
         **(
             {REGISTRATION_REANCHOR: state[REGISTRATION_REANCHOR]}
