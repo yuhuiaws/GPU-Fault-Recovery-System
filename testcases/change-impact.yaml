@@ -247,6 +247,7 @@ rules:
       - tests/regional/test_release_rollback_state.py
       - tests/regional/test_release_rollback_container_env.py
       - tests/regional/test_release_rollback_restart.py
+      - tests/regional/test_release_rollback_restart_once.py
       - tests/regional/test_release_trust_security.py
       - tests/regional/test_allowed_namespace_preflight.py
       - tests/regional/test_release_supersede_failed_transaction.py

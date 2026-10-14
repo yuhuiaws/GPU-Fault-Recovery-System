@@ -2145,7 +2145,10 @@ Failure behaviour:
   (`RollbackRestartPlan`, `regional_release_rollback_restart.py`); every other tier inherits the live restart timestamp
   and proves the pins on `/healthz`, falling back to the restart when it cannot. A registry restore, a Secret restore
   that changes the data, or an incomplete proof still restarts every tier. Which tiers restarted and why is in both phases' `details.cpu_restart`;
-  an Executor-only rollback restarts no CPU tier.
+  an Executor-only rollback restarts no CPU tier. The controller staging records what each tier it restarted starts from (`restarted_onto`:
+  spec digest, the apply's restart token, runtime image, container env and role ConfigMap digests), and the CPU restore keeps such a tier
+  when its Pods are still that restart's and it would restart them onto the same image, env and ConfigMaps
+  (`controller_stage_restarted`), so an Agent or FULL rollback rolls a tier once.
 - before the first migration from a legacy release that installs wheels at start-up to an immutable runtime image, `sync-state`
   must record both the live real old image and the scanned rollback-compatible image with the old release CLI preinstalled. If at the start of the upgrade
   the real old image has drifted or the compatible image is not an immutable digest, it must fail before mutation;

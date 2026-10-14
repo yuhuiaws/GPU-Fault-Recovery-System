@@ -4681,8 +4681,20 @@ verbatim restore is waited for again; a restarted tier that neither converges no
 evidence is `rollback_timing.phases.{controller_stage,cpu_restore}.details.cpu_restart`: `restarted` (tier to reasons,
 `pin-proof-failed` for a fallback), `kept`, and the verdicts of each wait in `pin_wait` and `restart_wait`, or `report: missing`
 when the apply wrote none. An Executor-only rollback therefore restarts no CPU tier. A tier the controller staging restarted
-is restarted again by the CPU restore, because its Pods are newer than the capture. A forward apply never inherits these
-variables: `render_and_apply_cpu_roles` removes them from its environment.
+has Pods newer than the capture by construction, so the CPU restore judges it against that restart instead. After its apply
+the controller staging records `restarted_onto` for each tier it restarted (narrated as `rollback-cpu-restart-record`): the
+live `.spec` digest, the `restartedAt` token the apply minted (the ReplicaSet copies it onto every Pod), the template's
+`gpu-fault.io/runtime-image`, and the digests of its containers' `env`/`envFrom` and of the role ConfigMaps its Pods
+resolved. The CPU restore keeps such a tier when its spec still has that digest, every Pod carries the token, and its own
+runtime image, container env snapshot and role ConfigMap snapshot are the recorded ones; it restarts it on
+`runtime-image-changed`, `container-env-changed`, `config-maps-changed` (also when an interrupted earlier CPU restore had
+already put the ConfigMaps back), `spec-changed`, `pod-not-from-controller-stage`, `container-not-running` or
+`deployment-missing`. The tiers judged that way are `controller_stage_restarted` in the CPU restore's `cpu_restart` and on
+its `rollback-cpu-restart` line. A token the apply did not mint, a failed read, a missing baseline or a missing ConfigMap
+snapshot records nothing, and the CPU restore restarts the tier again as before. An Agent or FULL rollback therefore rolls a
+tier once, unless the forward release changed the CPU runtime image, the template's container env or a role ConfigMap the
+staging leaves alone. A forward apply never inherits these variables: `render_and_apply_cpu_roles` removes them from its
+environment.
 
 The workflow executor and the GPU Cluster Executor also check the Fleet readiness of the NodeAction targets later in the workflow
 before the first destructive step. On pin drift the workflow stays retryable, and

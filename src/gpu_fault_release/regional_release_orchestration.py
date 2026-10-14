@@ -1224,6 +1224,7 @@ def _restore_rollback_cpu(
     config_digest: str,
     runtime_profile_version: str,
     runtime_image: str,
+    timing: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Put the previous control plane back and say how its env was rebuilt.
 
@@ -1232,6 +1233,9 @@ def _restore_rollback_cpu(
     own snapshot or, for a transaction opened before that capture existed,
     from the current template. The distinction is what makes a later
     ``unknown GPU_FAULT environment variable`` rollback failure explainable.
+    ``timing`` is that record: a tier the controller stage restarted onto this
+    restore's runtime image, container env and role ConfigMaps keeps the Pods
+    of that restart (``RollbackRestartPlan``) instead of rolling a second time.
     """
 
     # Validated before the first mutation: a malformed snapshot stops the
@@ -1255,16 +1259,12 @@ def _restore_rollback_cpu(
     else:
         details = {"cpu_container_env": "snapshot"}
     previous_admin_config = AdminConfig.from_mapping(previous.get("admin_config") or {})
-    with RollbackRestartPlan(self, previous) as restart:
+    with RollbackRestartPlan(self, previous, timing) as restart:
         restart.restore_secret_and_registry()
         preserve_role_config_maps = restart.restore_role_config_maps(
             previous.get("cpu_role_config_maps")
         )
-        cpu_sha = self._config_map_sha(
-            self._cpu(),
-            cpu_wheel,
-            self.config.wheel.name,
-        )
+        cpu_sha = self._config_map_sha(self._cpu(), cpu_wheel, self.config.wheel.name)
         container_env_file = (
             write_rollback_container_env(container_env, restart.directory)
             if container_env is not None
@@ -1284,7 +1284,7 @@ def _restore_rollback_cpu(
             runtime_image=runtime_image,
             preserve_role_config_maps=preserve_role_config_maps,
             previous_container_env_file=container_env_file,
-            **restart.environment_arguments(),
+            **restart.environment_arguments(runtime_image, container_env),
         )
         _apply_rollback_cpu_environment(self, environment)
         return {**details, **restart.details()}
@@ -1304,7 +1304,9 @@ def _stage_rollback_controller(
     """Stage the CPU for the previous pins; ``stage_agents`` adds Agent identities.
 
     Returns which tiers restarted and why (see ``RollbackRestartPlan``): the
-    pins are hot-loaded, so only a changed start-up input restarts a tier.
+    pins are hot-loaded, so only a changed start-up input restarts a tier. It
+    also records what each restarted tier now starts from, so the CPU restore
+    keeps that restart when it would restart the tier onto the same inputs.
     """
 
     previous_admin_config = AdminConfig.from_mapping(previous.get("admin_config") or {})
@@ -1314,11 +1316,7 @@ def _stage_rollback_controller(
             restart.patch_controller_config(
                 rollback_controller_config_for(self, previous, runtime_profile_version)
             )
-        cpu_sha = self._config_map_sha(
-            self._cpu(),
-            cpu_wheel,
-            self.config.wheel.name,
-        )
+        cpu_sha = self._config_map_sha(self._cpu(), cpu_wheel, self.config.wheel.name)
         environment = build_rollback_environment(
             rollback_config=self.config.for_rollback(
                 config_digest,
@@ -1335,6 +1333,7 @@ def _stage_rollback_controller(
             **restart.environment_arguments(),
         )
         _apply_rollback_cpu_environment(self, environment)
+        restart.record_restarts()
         return restart.details()
 
 
@@ -1825,6 +1824,7 @@ def _rollback_release(
                 config_digest=config_digest,
                 runtime_profile_version=profile,
                 runtime_image=runtime_image,
+                timing=timing,
             ),
         )
     restore_dataplane_observability_phase(self, previous, compensation, run_phase)

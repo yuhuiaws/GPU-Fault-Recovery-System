@@ -9,7 +9,9 @@ BOOT-020 measured its Executor-only T_safe above the 900 s limit.
 ``RollbackRestartPlan`` decides per tier from proof. These tests pin which
 restored input restarts which tier, that an incomplete proof restarts (fail
 closed), what the apply environment carries, and the evidence each stage
-leaves in ``rollback_timing``.
+leaves in ``rollback_timing``. ``Site`` is the CPU cluster both this file and
+``test_release_rollback_restart_once.py`` (the controller stage's restarts,
+which the CPU restore keeps, and what a whole rollback costs) run against.
 """
 
 from __future__ import annotations
@@ -17,7 +19,7 @@ from __future__ import annotations
 import copy
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -27,15 +29,12 @@ import pytest
 
 from gpu_fault.admin.deadlines import DeploymentDeadlineExceeded
 from gpu_fault_release import regional_deployment_inventory as inventory
-from gpu_fault_release import regional_release_diff as DIFF
-from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
-from gpu_fault_release import regional_release_progress as PROGRESS
 from gpu_fault_release import regional_release_rollback_restart as RESTART
 from gpu_fault_release import rollout as ROLLOUT
 from gpu_fault_release.regional_release_config import ReleaseError
 from scripts.e2e.regional import run_boot020_release_rolling as boot020
 from tests.regional.test_release_rollback_container_env import _rollback_environment
-from tests.regional.test_release_rollback_state import _rollback_previous
+from tests.regional.test_release_rollback_state import PREVIOUS_RUNTIME_IMAGE
 
 NAMESPACE = "gpu-fault-system"
 EMAIL = "gpu-fault-email"
@@ -47,6 +46,17 @@ DEPLOYMENTS = RESTART.ROLE_DEPLOYMENTS
 EVERY_TIER = list(RESTART.ALL_ROLES)
 FORCE = "GPU_FAULT_FORCE_ROLE_RESTART"
 CONVERGED = {name: "converged" for name in DEPLOYMENTS.values()}
+RESTARTED_AT = RESTART.RESTARTED_AT_ANNOTATION
+IMAGE = RESTART.RUNTIME_IMAGE_ANNOTATION
+#: What the previous release runs and the CPU restore renders.
+RUNTIME = PREVIOUS_RUNTIME_IMAGE
+#: The previous Agent identities (``_rollback_previous``) the controller stage
+#: patches into every ``-config-core``; the capture's snapshot holds them too.
+PREVIOUS_PINS = {
+    "GPU_FAULT_REQUIRED_AGENT_VERSION": "0.10.0",
+    "GPU_FAULT_REQUIRED_POLICY_VERSION": "catalog",
+    "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION": "profile-v1",
+}
 
 
 def _iso(epoch: float) -> str:
@@ -55,28 +65,65 @@ def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def _container_env(name: str, **extra: str) -> dict[str, dict[str, list[Any]]]:
+    """A tier's containers' ``env``/``envFrom``, as the template renders them."""
+
+    env = [{"name": "GPU_FAULT_SERVICE_ROLE", "value": name}]
+    env += [{"name": key, "value": value} for key, value in sorted(extra.items())]
+    return {
+        container: {
+            "env": copy.deepcopy(env),
+            "envFrom": [
+                {"configMapRef": {"name": f"{name}-config-{domain}"}}
+                for domain in ("core", "processor")
+            ],
+        }
+        for container in ("app", "sidecar")
+    }
+
+
+def _template(
+    name: str, *, image: str, env: Mapping[str, Any], token: str
+) -> dict[str, Any]:
+    """A role Pod template as the apply renders it."""
+
+    return {
+        "metadata": {
+            "labels": {"app": name},
+            "annotations": {RESTARTED_AT: token, IMAGE: image},
+        },
+        "spec": {
+            "containers": [
+                {"name": container, "image": image, **copy.deepcopy(dict(spec))}
+                for container, spec in env.items()
+            ]
+        },
+    }
+
+
 def _deployment(name: str) -> dict[str, Any]:
     return {
         "metadata": {"name": name, "generation": 4},
         "spec": {
             "replicas": 2,
             "selector": {"matchLabels": {"app": name}},
-            "template": {
-                "metadata": {
-                    "labels": {"app": name},
-                    "annotations": {"kubectl.kubernetes.io/restartedAt": "forward"},
-                },
-                "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
-            },
+            "template": _template(
+                name, image=RUNTIME, env=_container_env(name), token="previous"
+            ),
         },
     }
 
 
-def _pod(deployment: str, index: int, started: float) -> dict[str, Any]:
+def _pod(
+    deployment: str, index: int, started: float, token: str = "previous"
+) -> dict[str, Any]:
+    """A role Pod; its template's annotations are copied onto it."""
+
     return {
         "metadata": {
             "name": f"{deployment}-{index}",
             "labels": {"app": deployment},
+            "annotations": {RESTARTED_AT: token},
             "creationTimestamp": _iso(started),
         },
         "spec": {"containers": [{"name": "app"}, {"name": "sidecar"}]},
@@ -95,28 +142,40 @@ class Site:
     The forward transaction captured the previous release half an hour ago;
     the role Pods have run since an hour before that capture. By default
     nothing a rollback restores differs from what they started with, which is
-    the Executor-only rollback.
+    the Executor-only rollback. Every Pod remembers what it started from
+    (``start_up``): its template's image and container env and its tier's
+    role ConfigMaps at creation, which is what the process environment holds.
     """
 
     def __init__(self) -> None:
         self.captured_at = time.time() - 1800.0
         self.deployments = {name: _deployment(name) for name in DEPLOYMENTS.values()}
+        self.config_maps = {
+            f"{name}-config-{domain}": {
+                "GPU_FAULT_PROCESSOR_WORKERS": "24",
+                **(PREVIOUS_PINS if domain == "core" else {}),
+            }
+            for name in DEPLOYMENTS.values()
+            for domain in ("core", "processor")
+        }
         self.pods = [
-            _pod(name, index, self.captured_at - 3600.0)
+            self.started(_pod(name, index, self.captured_at - 3600.0))
             for name in DEPLOYMENTS.values()
             for index in (0, 1)
         ]
         self.secrets = {EMAIL: dict(EMAIL_DATA), EMAIL_BACKUP: dict(EMAIL_DATA)}
-        self.config_maps = {
-            f"{name}-config-{domain}": {"GPU_FAULT_PROCESSOR_WORKERS": "24"}
-            for name in DEPLOYMENTS.values()
-            for domain in ("core", "processor")
-        }
         self.snapshots = copy.deepcopy(self.config_maps)
+        #: The containers' env the capture took, and what the checked-out
+        #: template renders (the same unless a test says otherwise).
+        self.container_env = {
+            name: _container_env(name) for name in DEPLOYMENTS.values()
+        }
+        self.template_env = copy.deepcopy(self.container_env)
         self.baseline = RESTART.cpu_restart_baseline(self.deployments, self.captured_at)
         self.registry_backup = False
         self.unreadable: set[str] = set()
         self.calls: list[str] = []
+        self.applies = 0
 
     def previous(self, **extra: Any) -> dict[str, Any]:
         """The previous-release record the forward capture wrote."""
@@ -124,6 +183,7 @@ class Site:
         return {
             "secret_backups": {"cpu": {"source": EMAIL, "backup": EMAIL_BACKUP}},
             "cpu_role_config_maps": copy.deepcopy(self.snapshots),
+            "cpu_role_container_env": copy.deepcopy(self.container_env),
             RESTART.BASELINE_KEY: copy.deepcopy(self.baseline),
             **extra,
         }
@@ -184,19 +244,109 @@ class Site:
         self.calls.append(f"patch {name}")
         return ""
 
-    def roll(self, roles: list[str]) -> None:
-        """What the apply does to a tier it restarts: a new token, new Pods."""
+    def tier_config_maps(self, name: str) -> dict[str, dict[str, str]]:
+        return {
+            key: dict(value)
+            for key, value in self.config_maps.items()
+            if key.startswith(f"{name}-config-")
+        }
 
-        now = time.time()
-        for role in roles:
-            name = DEPLOYMENTS[role]
-            template = self.deployments[name]["spec"]["template"]
-            template["metadata"]["annotations"]["kubectl.kubernetes.io/restartedAt"] = (
-                _iso(now)
+    def started(self, pod: dict[str, Any]) -> dict[str, Any]:
+        name = pod["metadata"]["labels"]["app"]
+        template = self.deployments[name]["spec"]["template"]
+        pod["start_up"] = {
+            "image": template["metadata"]["annotations"][IMAGE],
+            "env": {
+                container["name"]: {
+                    "env": container["env"],
+                    "envFrom": container["envFrom"],
+                }
+                for container in template["spec"]["containers"]
+            },
+            "config_maps": self.tier_config_maps(name),
+        }
+        return pod
+
+    def restored_start_up(self, name: str) -> dict[str, Any]:
+        """What the CPU restore puts a tier's Pods on: the previous image, the
+        captured container env and the captured role ConfigMaps."""
+
+        return {
+            "image": RUNTIME,
+            "env": copy.deepcopy(self.container_env[name]),
+            "config_maps": {
+                key: dict(value)
+                for key, value in self.snapshots.items()
+                if key.startswith(f"{name}-config-")
+            },
+        }
+
+    def apply_template(self, name: str, template: dict[str, Any]) -> bool:
+        """Kubernetes: a changed Pod template replaces every Pod of the tier."""
+
+        spec = self.deployments[name]["spec"]
+        if spec["template"] == template:
+            return False
+        spec["template"] = copy.deepcopy(template)
+        token = template["metadata"]["annotations"][RESTARTED_AT]
+        self.pods = [
+            pod for pod in self.pods if pod["metadata"]["labels"]["app"] != name
+        ] + [
+            self.started(_pod(name, 10 * self.applies + index, time.time(), token))
+            for index in (0, 1)
+        ]
+        return True
+
+    def apply(
+        self,
+        forced: list[str],
+        *,
+        image: str = RUNTIME,
+        env: Mapping[str, Any] | None = None,
+    ) -> list[str]:
+        """The role-split apply as Kubernetes sees it; returns the rolled tiers.
+
+        Every tier is rendered with ``image`` and ``env`` (the snapshot's, or
+        the checked-out template's); only a forced one gets this apply's new
+        restart token, every other one inherits the live token.
+        """
+
+        self.applies += 1
+        rolled = []
+        for role, name in DEPLOYMENTS.items():
+            live = self.deployments[name]["spec"]["template"]["metadata"]
+            template = _template(
+                name,
+                image=image,
+                env=self.template_env[name] if env is None else env[name],
+                token=(
+                    f"restart-{self.applies}"
+                    if role in forced
+                    else live["annotations"][RESTARTED_AT]
+                ),
             )
-            self.pods = [
-                pod for pod in self.pods if pod["metadata"]["labels"]["app"] != name
-            ] + [_pod(name, index, now) for index in (2, 3)]
+            if self.apply_template(name, template):
+                rolled.append(role)
+        return rolled
+
+    def forward(
+        self,
+        *,
+        config_maps: Mapping[str, Mapping[str, str]] | None = None,
+        image: str = RUNTIME,
+    ) -> None:
+        """The forward transaction (after the capture): the candidate's role
+        ConfigMap values, then a roll of every tier onto them."""
+
+        for name, data in (config_maps or {}).items():
+            self.config_maps[name].update(data)
+        for name in DEPLOYMENTS.values():
+            self.apply_template(
+                name,
+                _template(
+                    name, image=image, env=self.template_env[name], token="forward"
+                ),
+            )
 
     def release(self, **stubs: Any) -> SimpleNamespace:
         return SimpleNamespace(
@@ -738,150 +888,6 @@ def test_a_forward_apply_never_takes_a_per_tier_decision_from_the_shell(
     assert len(applied) == 2, "the render and the apply"
     for environment in applied:
         assert not set(RESTART.ROLE_RESTART_VARIABLES) & set(environment)
-
-
-# --------------------------------------------------------------------------
-# Through the rollback
-# --------------------------------------------------------------------------
-
-
-def _executor_only_state() -> dict[str, Any]:
-    state: dict[str, Any] = {
-        "execution_plan": {
-            "nodes": [
-                DIFF.ReleaseComponent.EXECUTOR.value,
-                DIFF.ReleaseComponent.VERIFY.value,
-            ]
-        },
-        "completed_phases": ["uploaded", "schema-ready"],
-    }
-    state["component_progress"] = PROGRESS.update_component_progress(
-        state,
-        DIFF.ReleaseComponent.EXECUTOR,
-        PROGRESS.PROGRESS_STARTED,
-        cluster_id="gpu-a",
-        observed_at_epoch=time.time(),
-    )
-    return state
-
-
-def _rollback(
-    monkeypatch: pytest.MonkeyPatch, site: Site
-) -> tuple[list[dict[str, Any]], dict[str, Any]]:
-    """Roll an Executor-only transaction back with both CPU stages live.
-
-    The apply is simulated on ``site``: it restarts exactly the tiers it was
-    told to and reports every tier converged. Returns what each stage handed
-    the environment builder, and the saved ``rollback_timing`` phases.
-    """
-
-    for name in (
-        "_rollback_gpu_clusters",
-        "_verify_and_complete_rollback",
-        "cleanup_candidate_rollout_state",
-    ):
-        monkeypatch.setattr(ORCHESTRATION, name, lambda *_args, **_kwargs: None)
-    builds: list[dict[str, Any]] = []
-
-    def build(**kwargs: Any) -> dict[str, str]:
-        builds.append(kwargs)
-        return {
-            RESTART.FORCE_ROLES_VARIABLE: ",".join(kwargs["force_restart_roles"]),
-            RESTART.REPORT_VARIABLE: kwargs["role_restart_report"],
-        }
-
-    def apply(_release: Any, environment: dict[str, str]) -> None:
-        forced = [
-            role
-            for role in environment[RESTART.FORCE_ROLES_VARIABLE].split(",")
-            if role
-        ]
-        site.roll(forced)
-        Path(environment[RESTART.REPORT_VARIABLE]).write_text(
-            json.dumps(
-                {
-                    "forced": forced,
-                    "fallback": [],
-                    "pin_wait": CONVERGED,
-                    "restart_wait": {},
-                }
-            ),
-            encoding="utf-8",
-        )
-
-    monkeypatch.setattr(ORCHESTRATION, "build_rollback_environment", build)
-    monkeypatch.setattr(ORCHESTRATION, "_apply_rollback_cpu_environment", apply)
-    saved: list[tuple[str, dict[str, Any]]] = []
-    release = site.release(
-        state=_executor_only_state(),
-        runtime_image="candidate-runtime",
-        node_installer_image="registry.example/installer:candidate",
-        config=SimpleNamespace(
-            namespace=NAMESPACE,
-            clusters=(SimpleNamespace(cluster_id="gpu-a"),),
-            schema_rollback_compatible=True,
-            wheel=SimpleNamespace(name="wheel"),
-            for_rollback=lambda digest, admin_config: SimpleNamespace(
-                digest=digest, admin_config=admin_config
-            ),
-        ),
-        _refresh_aurora_credentials=lambda: None,
-        _require_no_inflight_installs=lambda **_kwargs: None,
-        _save_state=lambda phase, **updates: saved.append((phase, updates)),
-        _config_map_sha=lambda *_args: "4" * 64,
-    )
-    previous = {
-        **_rollback_previous(),
-        "admin_config": {},
-        "clusters": {},
-        **site.previous(),
-    }
-
-    ORCHESTRATION.rollback_release(release, state=previous)
-
-    phases = dict(saved)["rollback-cpu-restored"]["rollback_timing"]["phases"]
-    return builds, phases
-
-
-def test_an_executor_only_rollback_forces_no_cpu_roll(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The BOOT-020 case: both CPU stages run, neither restarts a tier."""
-
-    builds, phases = _rollback(monkeypatch, Site())
-
-    assert [build["force_restart_roles"] for build in builds] == [[], []], (
-        "the controller stage, then the CPU restore"
-    )
-    for phase in ("controller_stage", "cpu_restore"):
-        evidence = phases[phase]["details"]["cpu_restart"]
-        assert evidence["restarted"] == {}, phase
-        assert evidence["kept"] == EVERY_TIER, phase
-        assert evidence["pin_wait"] == CONVERGED, phase
-
-
-def test_a_secret_restore_keeps_the_forced_restart_through_the_rollback(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The controller stage restarts every tier for the restored Secret; the CPU
-    restore cannot prove Pods started after the capture, so it restarts them
-    again rather than trust them. A forced restart is never lost."""
-
-    site = Site()
-    site.secrets[EMAIL]["email-sender"] = CHANGED_EMAIL
-
-    builds, phases = _rollback(monkeypatch, site)
-
-    assert [build["force_restart_roles"] for build in builds] == [
-        EVERY_TIER,
-        EVERY_TIER,
-    ]
-    assert phases["controller_stage"]["details"]["cpu_restart"]["restarted"] == {
-        role: ["secret-changed"] for role in EVERY_TIER
-    }
-    assert phases["cpu_restore"]["details"]["cpu_restart"]["restarted"] == {
-        role: ["pod-started-after-capture", "spec-changed"] for role in EVERY_TIER
-    }
 
 
 # --------------------------------------------------------------------------
