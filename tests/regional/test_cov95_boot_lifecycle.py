@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import boot_acceptance_lifecycle as lifecycle
+from tests.admin._registry_sync_support import record_registry_sync
 from tests.regional._cov95_boot_site import BootSite, report
 
 
@@ -120,6 +121,7 @@ def test_boot018_compares_rebuilds_to_live_identity_before_recording_success(
     args = arguments(tmp_path)
     args.bootstrap_state_dir.mkdir()
     (args.bootstrap_state_dir / "site.yaml").write_text("unit")
+    record_registry_sync(args.bootstrap_state_dir)
     if fault == "missing-agents":
         model.agents = []
     elif fault == "empty-clusters":

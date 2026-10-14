@@ -3063,6 +3063,13 @@ and that the Deployment generation/restartCount of the other production sites ma
 If the deployment fails before `site.yaml` is generated, a missing site must not be treated as "no resources created", nor may an
 uninstall target be guessed. Save the original bootstrap task terminal states and the installation registry; when resource disposition is unknown, record
 `UNKNOWN / RECONCILIATION_REQUIRED` and reconcile the original operation first; that state is not a successful cleanup.
+The runner's failure cleanup (BOOT-016) and the uninstall at the end of BOOT-018 first check the site's last installation
+registry sync with the product's own read (`scripts/e2e/regional/registry_sync_preflight.py`): while the record failed, is
+missing (a first deploy that stopped before its release step leaves none) or is unreadable, a new `uninstall` attempt can
+only be refused, so the runner does not run it and records `RECONCILIATION_REQUIRED` with a reason naming the recorded
+outcome, the product's remedy and the uninstall command to run after it; the runner never passes
+`--accept-unsynchronized-registry`, and an attempt whose `uninstall/state.json` exists is left to `uninstall` to resume. That
+state is not a successful cleanup either.
 
 ### GF-REGIONAL-BOOT-017
 
@@ -4467,9 +4474,11 @@ and does not count towards its sequence.
   `scripts/e2e/regional/boot029_providers.py` (provider discovery and grouping),
   `scripts/e2e/regional/boot029_receipts.py` (`pending`/`profile-plan`/`verify --joined-gpu-arn`),
   `scripts/e2e/regional/boot029_readme.py` (README parsing, `prepare_source_checkout`
-  pristine copy, `clean_environment` allowlist, `mixed_site_join_documented`). Offline contracts:
+  pristine copy, `clean_environment` allowlist, `mixed_site_join_documented`),
+  `scripts/e2e/regional/registry_sync_preflight.py` (the installation registry sync judgment before S2/S4). Offline contracts:
   `tests/regional/test_admin_lifecycle_sequence_script.py`,
   `tests/regional/test_admin_lifecycle_sequence_mixed_site.py` (mixed site, resume shapes),
+  `tests/regional/test_admin_lifecycle_sequence_registry_sync.py` (the S2/S4 sync gate and resumes),
   `tests/regional/test_boot029_providers.py`, `tests/regional/test_boot029_receipts_mixed_site.py`,
   `tests/regional/test_boot029_readme.py` (the latter parses the repository's real README).
 
@@ -4524,6 +4533,15 @@ and does not count towards its sequence.
    credentials and the commands `site-id` prints -- on exactly the groups the previous stage's journal recorded as
    `released` and waits for the provider to apply it (`boot029_ownership.py reapply`), then runs the precondition
    check above. The operator identity therefore needs `eks:UpdateNodegroupConfig` / `sagemaker:UpdateCluster`.
+8. Installation registry sync: the site's last installation registry sync on the deploy host must be a recorded success
+   (`release-deploy/installation-registry-sync.json`, Administrator Operations §3 and §4; S1's first deploy leaves one when
+   it completes). While it failed, is missing or is unreadable, `remove-cluster` and `uninstall` refuse to start a new
+   attempt; before every S2 removal and before the S4 uninstall the driver judges the record with the product's own read
+   (`scripts/e2e/regional/registry_sync_preflight.py`, local and read-only) and, when it does not hold, stops the stage
+   before the verb runs with the recorded outcome (status, time, reason) and the product's remedy (`gpu-fault-admin deploy`
+   of the site -- a NOOP deploy retries the sync too -- or a `config` re-roll), after which the same stage resumes; an
+   attempt whose journal already exists is left to the verb, which resumes it on the verdict it started with. The driver
+   never passes `--accept-unsynchronized-registry`.
 
 #### Steps
 

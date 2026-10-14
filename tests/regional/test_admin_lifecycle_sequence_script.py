@@ -112,6 +112,24 @@ def gpu_identity(arn):
        "gpu_clusters": [gpu_identity(arn) for arn in os.environ["FAKE_REQUEST_GPU_ARNS"].split()]}}}))
 PY
     if [[ "$state_dir" == "${FAKE_ADMIN_FAIL_DEPLOY_STATE:-}" ]]; then exit 19; fi
+    # The release step records its installation registry sync through the
+    # product's own writer; remove-cluster and uninstall judge that record.
+    python3 - "$state_dir" <<'PY'
+import os, pathlib, sys
+sys.path.insert(0, os.environ["FAKE_REPO_SRC"])
+from gpu_fault.admin.resource_registry_outcome import record_path, write_outcome
+state, mode = pathlib.Path(sys.argv[1]), os.getenv("FAKE_REGISTRY_SYNC", "synced")
+if mode == "unreadable":
+    record_path(state).parent.mkdir(parents=True, exist_ok=True)
+    record_path(state).write_text("{")
+elif mode in {"synced", "failed"}:
+    outcome = {"status": "SYNCED", "path": str(state / "installation-resources.json"),
+        "sha256": "a" * 64, "synced_at": "2026-01-01T00:00:00Z"}
+    if mode == "failed":
+        outcome = {"status": "UNAVAILABLE", "synced_at": "2026-01-01T00:00:00Z",
+            "error": "fixture registry sync failed"}
+    write_outcome(state, release_id="fixture-release", outcome=outcome)
+PY
     ;;
   remove-cluster)
     python3 - "$state_dir" <<'PY'

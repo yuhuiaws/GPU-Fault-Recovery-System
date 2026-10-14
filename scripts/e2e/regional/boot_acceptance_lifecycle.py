@@ -4,6 +4,7 @@ import argparse
 import base64
 import json
 import os
+import shlex
 import shutil
 import subprocess
 import sys
@@ -23,6 +24,7 @@ from scripts.e2e.regional.boot_acceptance_common import (
     run,
     write_log,
 )
+from scripts.e2e.regional.registry_sync_preflight import uninstall_refusal
 
 UNINSTALL_CONFIRMATION = "UNINSTALL_GPU_FAULT"
 # `gpu-fault-admin status` reuses a fresh deploy's quick-gate runtime-identity
@@ -100,8 +102,8 @@ def admin_command(
     )
 
 
-def uninstall_site(state_dir: Path) -> subprocess.CompletedProcess[str]:
-    return admin_command(
+def uninstall_arguments(state_dir: Path) -> tuple[str, ...]:
+    return (
         "uninstall",
         "--state-dir",
         str(state_dir),
@@ -110,6 +112,10 @@ def uninstall_site(state_dir: Path) -> subprocess.CompletedProcess[str]:
         "--confirm",
         UNINSTALL_CONFIRMATION,
     )
+
+
+def uninstall_site(state_dir: Path) -> subprocess.CompletedProcess[str]:
+    return admin_command(*uninstall_arguments(state_dir))
 
 
 def failure_outcome(exc: BaseException, *, limitation: str) -> dict[str, Any]:
@@ -397,6 +403,12 @@ def cleanup_isolated_site(
     Missing ``site.yaml`` does not prove resource absence: foundations and the
     parallel release build may already have created resources. Preserve their
     checkpoint for explicit reconciliation; never synthesize a cleanup site.
+    A new uninstall attempt refuses to start while the site's last
+    installation registry sync is not a recorded success (a first deploy that
+    stopped before its release step recorded none): the record then names that
+    refusal and its remedy instead of running a command that can only exit
+    non-zero (``registry_sync_preflight``); the cleanup never passes
+    ``--accept-unsynchronized-registry``.
     """
 
     site_present = (state_dir / "site.yaml").is_file()
@@ -429,6 +441,15 @@ def cleanup_isolated_site(
                 "state directory and reconcile possible foundation/build resources."
             ),
         )
+        return record
+    refusal = uninstall_refusal(
+        state_dir,
+        harness="the BOOT isolated-site cleanup",
+        then="resynchronize the isolated site, then run gpu-fault-admin "
+        + shlex.join(uninstall_arguments(state_dir)),
+    )
+    if refusal is not None:
+        record.update(disposition="RECONCILIATION_REQUIRED", reason=refusal)
         return record
     completed = (uninstall or uninstall_site)(state_dir)
     write_log(case_dir / log_name, completed)

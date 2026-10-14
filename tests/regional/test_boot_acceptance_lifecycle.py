@@ -20,6 +20,7 @@ import pytest
 
 from scripts.e2e.regional import boot_acceptance_lifecycle as lifecycle
 from scripts.e2e.regional.boot_acceptance_common import BootAcceptanceError
+from tests.admin._registry_sync_support import record_registry_sync
 
 
 def _completed(returncode: int, stdout: str = "") -> subprocess.CompletedProcess[str]:
@@ -70,7 +71,8 @@ def _arguments(tmp_path: Path, **overrides: Any) -> Namespace:
 
 
 class AdminRecorder:
-    """Stands in for ``admin_command``: deploy commits a site and then fails."""
+    """Stands in for ``admin_command``: deploy commits a site and its registry
+    sync, and then fails."""
 
     def __init__(self, state_dir: Path, *, deploy_error: BaseException) -> None:
         self.state_dir = state_dir
@@ -83,6 +85,7 @@ class AdminRecorder:
         self.calls.append(arguments)
         if arguments[0] == "deploy":
             (self.state_dir / "site.yaml").write_text("site: true\n", encoding="utf-8")
+            record_registry_sync(self.state_dir)
             raise self.deploy_error
         return _completed(0)
 
@@ -186,6 +189,7 @@ def test_boot018_uninstalls_when_the_build_raises(
     arguments = _arguments(tmp_path)
     arguments.bootstrap_state_dir.mkdir()
     (arguments.bootstrap_state_dir / "site.yaml").write_text("x", encoding="utf-8")
+    record_registry_sync(arguments.bootstrap_state_dir)
     uninstalls: list[Path] = []
     monkeypatch.setattr(
         lifecycle,
@@ -213,6 +217,7 @@ def test_boot018_records_cleanup_for_every_verdict_and_fails_a_bad_uninstall(
     arguments = _arguments(tmp_path)
     arguments.bootstrap_state_dir.mkdir()
     (arguments.bootstrap_state_dir / "site.yaml").write_text("x", encoding="utf-8")
+    record_registry_sync(arguments.bootstrap_state_dir)
     monkeypatch.setattr(lifecycle, "uninstall_site", lambda state_dir: _completed(1))
     monkeypatch.setattr(
         lifecycle,

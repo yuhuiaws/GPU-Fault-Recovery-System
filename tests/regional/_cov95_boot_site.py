@@ -10,6 +10,7 @@ from typing import Any
 
 from scripts.e2e.regional import boot_acceptance_common as common
 from scripts.e2e.regional import boot_acceptance_lifecycle as lifecycle
+from tests.admin._registry_sync_support import record_registry_sync
 from tests.regional.test_boot_acceptance_lifecycle import (
     AGENTS,
     CPU,
@@ -120,6 +121,9 @@ class BootSite:
         self.commands: list[Any] = []
         self.admin_calls: list[Any] = []
         self.failure = ""
+        # The fake deploy records its installation registry sync, as a deploy
+        # past its release step does; False models one that stopped before it.
+        self.registry_sync = True
         self.deploys = 0
         self.deployments = {
             "cpu": [
@@ -157,6 +161,8 @@ class BootSite:
             if self.failure != "missing-site":
                 (state / "site.yaml").write_text("unit site")
                 (state / "site.yaml").chmod(0o600)
+                if self.registry_sync:
+                    record_registry_sync(state)
             if self.failure == "generation" and self.deploys == 2:
                 self.deployments["cpu"][0]["metadata"]["generation"] = 2
         return subprocess.CompletedProcess(

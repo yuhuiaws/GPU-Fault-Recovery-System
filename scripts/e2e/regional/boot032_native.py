@@ -20,7 +20,6 @@ from gpu_fault.admin.process_supervisor import (
     ProcessSupervisionLost,
     ensure_supervision_safe,
 )
-from gpu_fault.admin.resource_registry_outcome import ACCEPT_FLAG, status_view
 from gpu_fault.admin.uninstall import (
     CPU_CLUSTER_BOUND_RESOURCE_KEYS,
     UninstallRequest,
@@ -52,6 +51,7 @@ from scripts.e2e.regional.boot032_observe import (
     runtime_observation,
 )
 from scripts.e2e.regional.live_driver_guard import details_sha256
+from scripts.e2e.regional.registry_sync_preflight import uninstall_refusal
 
 
 class RestartRequired(RuntimeError):
@@ -67,17 +67,15 @@ def registry_sync_refusal(settings: Settings) -> str | None:
     deployed before deploys recorded it; a resumed attempt keeps its verdict.
     BOOT-032 never passes the override flag, and judges this before its case
     journal binds the registry that the remedial deploy rewrites.
+    The judgment is the one every harness shares
+    (``registry_sync_preflight.uninstall_refusal``).
     """
 
-    if (settings.native_dir / "state.json").is_file():
-        return None
-    view = status_view(settings.target.source.parent, release_id=None)
-    if not view["deletion_verbs_refused"]:
-        return None
-    return (
-        f"native uninstall would refuse to start (installation registry sync "
-        f"{view['status']}): {view['finding']}; BOOT-032 never passes "
-        f"{ACCEPT_FLAG}: resynchronize the sacrificial site, then plan again"
+    return uninstall_refusal(
+        settings.target.source.parent,
+        verb="native uninstall",
+        harness="BOOT-032",
+        then="resynchronize the sacrificial site, then plan again",
     )
 
 

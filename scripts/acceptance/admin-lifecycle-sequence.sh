@@ -75,6 +75,17 @@
 # sees. Both go into the stage receipts (ownership_label_released,
 # ownership_label_reapplied; stage 2/4 journals add ownership_release).
 #
+# Registry sync. remove-cluster and uninstall refuse to start a new attempt
+# while the site's last installation registry sync is not a recorded success
+# (release-deploy/installation-registry-sync.json failed, missing or
+# unreadable). Before every stage-2 removal and the stage-4 uninstall the driver
+# judges that record with the product's own reader
+# (scripts/e2e/regional/registry_sync_preflight.py, local and read-only) and
+# stops the stage with the recorded outcome and the product's remedy before
+# the verb runs; an attempt whose journal already exists is left to the verb,
+# which resumes it on the verdict it started with. The driver never passes
+# --accept-unsynchronized-registry.
+#
 # Every admin command runs in the foreground and the next stage starts only
 # after it has exited. The first failing stage stops the run and prints its
 # number so `--stage N` can resume. Wall time and the sha256 of each stage's log
@@ -305,6 +316,14 @@ assert_ownership_released() {  # GPU_ARN...: after a de-registration, no node gr
   log "ownership label released on every de-registered GPU cluster ($# cluster(s))"
 }
 
+assert_registry_synchronized() {  # VERB [GPU_ARN]: before a deletion verb, the product's read of the last installation registry sync (local, read-only)
+  local verdict arguments=("$1" --state-dir "$STATE_DIR")
+  [[ $# -lt 2 ]] || arguments+=(--gpu-arn "$2")
+  verdict="$(python3 -m scripts.e2e.regional.registry_sync_preflight "${arguments[@]}" 2>>"$STAGE_LOG")" ||
+    fail "${verdict:-the installation registry sync preflight of $1 failed; see the stage log}"
+  printf '%s\n' "$verdict" >>"$STAGE_LOG"
+}
+
 reapply_ownership_labels() {  # STATE_DIR: before a re-join/re-deploy, the label goes back on the groups the previous stage's journal released (operator credentials, site-id commands)
   local report
   report="$(python3 -m scripts.e2e.regional.boot029_ownership reapply --cpu-arn "$CPU_ARN" "${GPU_RECEIPT_ARGS[@]}" \
@@ -498,6 +517,7 @@ stage_2() {  # one ARN at a time in removal_order; every removed cluster's journ
   discover_gpu_providers
   removal_order
   for arn in "${REMOVAL_ARNS[@]}"; do
+    assert_registry_synchronized remove-cluster "$arn"
     run_admin remove-cluster --state-dir "$STATE_DIR" --gpu-cluster-arn "$arn" \
       --confirm REMOVE_GPU_CLUSTER
     removed+=("$arn")
@@ -514,6 +534,7 @@ stage_3() {  # one join-cluster for every GPU cluster; one journal per ARN
 }
 
 stage_4() {
+  assert_registry_synchronized uninstall
   run_admin uninstall --state-dir "$STATE_DIR" --cpu-cluster keep --reset-database \
     --aurora-final-snapshot "$AURORA_FINAL_SNAPSHOT" --confirm UNINSTALL_GPU_FAULT
   assert_current_journal "$STATE_DIR"
