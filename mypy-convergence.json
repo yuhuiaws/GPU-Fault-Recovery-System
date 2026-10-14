@@ -10,7 +10,7 @@
     "why": "plan/family builders: type-arg on nested dicts is where a wrong plan shape hides"
   },
   "src/gpu_fault/app": {
-    "ceiling": 304,
+    "ceiling": 301,
     "priority": 3,
     "why": "route handlers and ingest: no-any-return on request bodies is the boundary that swallows bad payloads"
   },

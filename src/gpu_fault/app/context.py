@@ -144,6 +144,66 @@ class _LazyClusterObservers(dict[str, Any]):
             return observer
 
 
+def _is_hyperpod_registration(registration: Any) -> bool:
+    """``provider`` on a registration (default ``hyperpod``)."""
+
+    return (
+        str(getattr(registration, "provider", "") or "hyperpod")
+        == ClusterProvider.HYPERPOD.value
+    )
+
+
+class _ClusterIdentityRefresh:
+    """One registered cluster in a background identity refresh pass.
+
+    Refreshing resolves the cluster's observer through the shared observer
+    map: a cluster joined online gets its observer built here on first sight
+    and the workflow path then finds the same one. A build that raises is this
+    cluster's refresh failure, retried on the next pass.
+    """
+
+    def __init__(self, cluster_id: str, observers: Mapping[str, Any]) -> None:
+        self.cluster_id = cluster_id
+        self.observers = observers
+
+    def refresh(self) -> Any:
+        observer = self.observers.get(self.cluster_id)
+        if observer is None:
+            return []
+        return observer.identities.refresh()
+
+
+class _RegisteredIdentityRegistries:
+    """The clusters a background identity refresh serves: the registry's, now.
+
+    The lifespan used to hand the refresh workers a list copied at start-up, so
+    a HyperPod cluster joined online was refreshed only inside a managed
+    recovery observation until every CPU Pod restarted, and a cluster removed
+    online stayed in the refresh. A call walks the runtime's current snapshot
+    and returns entries, not observers, so the periodic runner's per-tick check
+    stays cheap. Only HyperPod registrations that are not synthetic count: a
+    perf or acceptance placeholder names a HyperPod cluster that does not
+    exist. An unavailable snapshot serves nothing, like the endpoint allow-list.
+    """
+
+    def __init__(
+        self, runtime: RegionalRegistryRuntime, observers: Mapping[str, Any]
+    ) -> None:
+        self.runtime = runtime
+        self.observers = observers
+
+    def __call__(self) -> list[_ClusterIdentityRefresh]:
+        try:
+            registrations = self.runtime.snapshot().registrations.values()
+        except RuntimeError:
+            return []
+        return [
+            _ClusterIdentityRefresh(registration.cluster_id, self.observers)
+            for registration in registrations
+            if _is_hyperpod_registration(registration) and not registration.synthetic
+        ]
+
+
 _pod_process_owner = pod_process_owner
 
 
@@ -305,6 +365,8 @@ class ApplicationContext:
         self.control_record_archiver = None
         self.hyperpod_identity_registry = None
         self.hyperpod_identity_registries = []
+        # Bound by `bind_regional_registry_runtime` (`background_identity_registries`).
+        self.registered_identity_registries: Callable[[], list[Any]] | None = None
         self.regional_mode = False
         # Digest of the configured Secret registry, compared with the durable
         # head by the registry runtime to report drift (review H3).
@@ -355,7 +417,8 @@ class ApplicationContext:
         observer map were built once from the store, so a cluster joined online
         was refused until every CPU Pod restarted (review H4). Both now resolve
         an unseen cluster from the runtime's snapshot on first sight and fail
-        closed when the snapshot does not contain it.
+        closed when the snapshot does not contain it. The background identity
+        refresh follows the same snapshot through the observer map.
         """
 
         if runtime is None or not self.regional_mode:
@@ -396,6 +459,22 @@ class ApplicationContext:
             observer.observers = _LazyClusterObservers(
                 observer.observers, resolver=resolve_observer
             )
+            self.registered_identity_registries = _RegisteredIdentityRegistries(
+                runtime, observer.observers
+            )
+
+    def background_identity_registries(self) -> list[Any] | Callable[[], list[Any]]:
+        """What the background identity refresh iterates: bound to a registry
+        runtime, a callable read on every pass (a cluster joined or removed
+        online needs no restart); otherwise the registries start-up built."""
+
+        if self.registered_identity_registries is not None:
+            return self.registered_identity_registries
+        local = self.hyperpod_identity_registry
+        return [
+            *([local] if local is not None else []),
+            *self.hyperpod_identity_registries,
+        ]
 
     def step_batching_policy(self) -> RemoteStepBatchingPolicy:
         """The compound-command gate as of now; asked at mint time.
@@ -789,14 +868,10 @@ class ApplicationContext:
                 def build_observer(
                     registration: RegionalClusterRegistration,
                 ) -> HyperPodManagedRecoveryObserver | None:
-                    # ``provider`` on the registration (default ``hyperpod``):
-                    # an eks-managed cluster gets no HyperPod identity registry
+                    # An eks-managed cluster gets no HyperPod identity registry
                     # and no observer -- there is nothing SageMaker could tell
                     # us about its nodes.
-                    if (
-                        str(getattr(registration, "provider", "") or "hyperpod")
-                        != ClusterProvider.HYPERPOD.value
-                    ):
+                    if not _is_hyperpod_registration(registration):
                         return None
                     lifecycle = HyperPodLifecycleAdapter(
                         HyperPodAdapterConfig.from_environment(

@@ -5215,8 +5215,7 @@ UNKNOWN gives 1, 6 to 31 nodes at most 2, at least 32 nodes are required for 4, 
 In parallel mode the first cluster still rolls alone as the canary; a whole deploy has a fixed 6-hour deadline, and the rollback of a
 failed attempt finishes cluster by cluster in a fixed 2-hour recovery reserve after it (neither is configurable), so estimate a release
 that rolls node runtimes on every cluster from the number of clusters. The other limits of multi-cluster sites (node names unique
-across the site, no HyperPod and plain EKS cluster sharing a name, background identity refresh of a cluster joined online) are in
-Administrator Operations §5.0.4.
+across the site, no HyperPod and plain EKS cluster sharing a name) are in Administrator Operations §5.0.4.
 
 After the CPU candidate phase completes, the orchestrator waits at most 75 seconds for Agents to refresh their heartbeats against the candidate control plane. Each Fleet
 wave waits at most 60 seconds before claiming, requiring Agents outside the wave to retain at least a 40-second lease; after claiming it checks a 30-second margin as

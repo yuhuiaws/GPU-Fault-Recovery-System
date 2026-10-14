@@ -6,7 +6,7 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from threading import Event, Lock
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 from gpu_fault.app.store_bloat_metrics import describe_scan, scan_gauge_tables
 from gpu_fault.collector_requirements import (
@@ -20,6 +20,16 @@ LOGGER = logging.getLogger(__name__)
 # What one cleanup call reports: a row count, or per-table counts.
 CleanupResult = int | dict[str, int]
 CleanupJob = tuple[str, Callable[[], CleanupResult]]
+# What a background identity refresh iterates: the registries start-up built,
+# or a callable read on every pass (``ApplicationContext.
+# background_identity_registries``: a regional process follows its registry).
+IdentityRegistrySource = Sequence[Any] | Callable[[], Sequence[Any]]
+
+
+def identity_registries_now(source: IdentityRegistrySource) -> Sequence[Any]:
+    """The identity registries one refresh pass serves."""
+
+    return source() if callable(source) else source
 
 
 @dataclass(frozen=True)
@@ -227,7 +237,7 @@ class PeriodicServiceRunner:
         context,
         processor,
         stop: Event,
-        identity_registries: list,
+        identity_registries: IdentityRegistrySource,
         ingest_node_health_findings: Callable,
         notify_silent_collectors: Callable,
         config: PeriodicServiceConfig | None = None,
@@ -498,12 +508,14 @@ class PeriodicServiceRunner:
         )
 
     def _run_identity(self, now: float) -> bool:
-        if not self.identity_registries:
+        # Asked again on every tick and pass, never kept: a cluster joined or
+        # removed online changes the answer without a restart.
+        if not identity_registries_now(self.identity_registries):
             return False
 
         def refresh() -> None:
             failure: Exception | None = None
-            for registry in self.identity_registries:
+            for registry in identity_registries_now(self.identity_registries):
                 try:
                     registry.refresh()
                 except Exception as exc:

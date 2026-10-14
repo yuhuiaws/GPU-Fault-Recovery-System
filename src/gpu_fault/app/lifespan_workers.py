@@ -8,7 +8,11 @@ from threading import Event, Thread
 from typing import TYPE_CHECKING, Any, Callable
 
 import gpu_fault.app.process_metrics as process_metrics
-from gpu_fault.app.periodic_services import PeriodicServiceRunner
+from gpu_fault.app.periodic_services import (
+    IdentityRegistrySource,
+    PeriodicServiceRunner,
+    identity_registries_now,
+)
 from gpu_fault.env_validation import training_health_monitor_enabled
 from gpu_fault.store.contracts import WakeupChannel
 
@@ -81,7 +85,7 @@ def start_processor_threads(
     processor,
     diagnostics_publisher,
     stop: Event,
-    identity_registries: list,
+    identity_registries: IdentityRegistrySource,
     ingest_node_health_findings,
     notify_silent_collectors,
 ) -> tuple[Thread, list[Thread]]:
@@ -232,7 +236,7 @@ def start_nonprocessor_workers(
     *,
     context,
     stop: Event,
-    identity_registries: list,
+    identity_registries: IdentityRegistrySource,
     ingest_node_health_findings,
 ) -> tuple[
     Thread,
@@ -300,13 +304,15 @@ def _start_spare_worker(context, stop):
 
 
 def _start_identity_worker(registries, stop):
-    if not registries:
+    # A callable follows the regional registry and can gain a cluster at any
+    # time; only a fixed empty list means there is never anything to refresh.
+    if not callable(registries) and not registries:
         return None
     interval = float(os.getenv("GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS", "20"))
 
     def refresh() -> None:
         while not stop.is_set():
-            for registry in registries:
+            for registry in identity_registries_now(registries):
                 try:
                     registry.refresh()
                 except Exception:

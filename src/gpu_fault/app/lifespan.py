@@ -151,14 +151,9 @@ def create_lifespan(dependencies: LifespanDependencies):
             )
         processor_threads: list[Thread] = []
         diagnostics_worker = None
-        identity_registries = [
-            *(
-                [ctx.hyperpod_identity_registry]
-                if ctx.hyperpod_identity_registry is not None
-                else []
-            ),
-            *ctx.hyperpod_identity_registries,
-        ]
+        # Not a start-up copy: a regional process hands the workers a callable
+        # they read on every pass, so online joins and removals need no restart.
+        identity_registries = ctx.background_identity_registries()
         if processor is not None and background_services_enabled:
             diagnostics_worker, processor_threads = start_processor_threads(
                 context=ctx,

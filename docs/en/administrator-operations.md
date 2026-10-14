@@ -1114,7 +1114,7 @@ Semantics and boundaries of `eks-managed`:
   version is a policy change and goes through the same review as a site profile change: the join writes
   `release-deploy/profile-plan.json` (`change_kind: CLUSTER_PROFILE_NEW`) and stops; record `plan_sha256` and run the
   printed `join-cluster ... --approve-profile-plan <sha> --reference <CHG>` (a `deploy --gpu-cluster-arn` adding a
-  cluster prints the same `join-cluster` command; do not switch to `deploy --approve-profile-plan`, see §5.0.4 limit 5);
+  cluster prints the same `join-cluster` command; do not switch to `deploy --approve-profile-plan`, see §5.0.4 limit 4);
   the approval is consumed, the
   immutable snapshot `profiles/<version>.yaml` is written and the join continues. Later clusters of the same provider
   reuse that snapshot without another review. A first `deploy` still requires its GPU clusters to share one provider
@@ -1907,13 +1907,7 @@ judgement).
    `src/gpu_fault/admin/deadlines.py`, not configurable); at the deadline the running step fails with `deployment
    deadline exceeded`. For a release that rolls node runtimes on every cluster, estimate from the number of clusters
    whether both budgets suffice.
-4. **A HyperPod cluster joined online gets background node identity refresh only after the CPU control-plane Pods
-   restart.** The control-worker sets up the background refresh of HyperPod node identities from the registry as it
-   stands at start-up; for a HyperPod cluster joined online by `join-cluster` (or by a `deploy` that releases nothing),
-   node identities are refreshed only on demand while managed recovery observes it, until the next CPU Pod restart (the
-   next application release restarts them) adds it to the background refresh. The fix ships with the next control-plane
-   release.
-5. **A new cluster stopped for a Runtime Profile review resumes only with the printed
+4. **A new cluster stopped for a Runtime Profile review resumes only with the printed
    `join-cluster ... --approve-profile-plan ...`.** A join started by `deploy --gpu-cluster-arn` prints the same
    `join-cluster` command when it stops. Do not switch to `deploy --approve-profile-plan`: a deploy that also runs an
    application release checks the approval against the site profile before it joins the new cluster, so it judges the

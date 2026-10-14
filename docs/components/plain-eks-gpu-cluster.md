@@ -137,7 +137,7 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 - 多集群站点（管理员日常运维 §5.0.4）：节点名必须全站唯一，普通 EKS 节点名由私有 IPv4 派生，VPC CIDR 重叠的两个普通
   EKS 集群可能同名（HyperPod 节点名不会）；HyperPod 集群与普通 EKS 集群不得同名（cluster id 与 IAM 角色名由该名字派生，
   `--cluster-id` 不在下一次 `deploy` 中保留）；集群多时发布只有一个 canary、回滚逐集群串行，且共用固定的 6 小时期限与
-  2 小时恢复预留；在线接入的 HyperPod 集群要等 CPU Pod 重启后才进入后台节点身份刷新（修复随下一个控制面 release）。
+  2 小时恢复预留。
 - 注册集群（`spec.runtimeProfile.registrationClusterId`）被 `remove-cluster` 移除且站点还有其他成员时，改为剩余的同
   provider 成员；没有同 provider 成员时拒绝移除，基线家族不会随移除改变。
 

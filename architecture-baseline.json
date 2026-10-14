@@ -68,7 +68,6 @@
     "src/gpu_fault/app/builtin_metric_contributors.py:closed_loop_metric_lines": 205,
     "src/gpu_fault/app/factory.py:_configure_service_runtime": 203,
     "src/gpu_fault/app/factory.py:create_app": 293,
-    "src/gpu_fault/app/lifespan.py:create_lifespan": 204,
     "src/gpu_fault/app/metrics.py:render_prometheus_metrics": 223,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor._execute_dag": 240,
     "src/gpu_fault/node_agent/app.py:create_node_agent_app": 329,

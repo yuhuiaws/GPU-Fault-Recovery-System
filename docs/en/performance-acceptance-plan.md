@@ -1516,10 +1516,11 @@ small and cannot explain second-level latency.
 8. **The load tool must verify the processor final response.** An ingress 202 only means
    enqueued; a dry run once found background 422s. The formal tool should judge any non-2xx
    receipt/final response as FAIL directly.
-9. **Isolate periodic cloud queries for the synthetic registry.** An audit cluster with a
-   placeholder HyperPod name produces `ResourceNotFound` logs. Add an explicit synthetic marker so
-   the identity refresher skips these entries and avoids polluting logs and a small amount of
-   control-plane resources.
+9. **Isolate periodic cloud queries for the synthetic registry.** An audit cluster carries a
+   placeholder HyperPod name, so refreshing it only produces `ResourceNotFound` logs. The background
+   identity refresh skips these entries by the registration's `synthetic` marker (it reads the
+   registry's current snapshot on every pass, so clusters a suite registers online are no exception),
+   keeping them out of the logs and off control-plane resources.
 10. **Before raising ACU further, check whether the bottleneck is still the database.** When
     Aurora CPU is already below about 70%–80% while lane wait is still at the second level, adding
     ACU has limited benefit; turn to transaction, lane and completion parallelism optimization.
