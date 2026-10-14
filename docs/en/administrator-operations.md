@@ -323,6 +323,16 @@ Historical LBC role/policy attachments are adjusted only in the temporary execut
 role, then delete the policy; when the role is kept, its policy must not be deleted, nor other principals' attachments forcibly detached.
 A SHA computed by the registry or local files on their own only shows integrity and grants no deletion right.
 
+The rows of a cluster that `remove-cluster` (or a rolled-back `join-cluster`) has settled are carried as recorded: the
+`cluster/<id>/…`, `aws/iam/executor/<id>/…` and `aws/iam/adot-writer/<id>/…` rows of a cluster the site no longer lists, once
+terminal (`DELETED/DETACHED/PRESERVED`), are neither deleted nor probed again; the final snapshot records them terminal by their
+effective policy, and the command output lists their keys in `registry_entries_settled_by_removal`. Why: the removal deleted the
+roles, preserved the EKS/HyperPod clusters and recorded a solution-created Executor OIDC provider DETACHED, left in place; processed
+again, the OIDC row carries the removed cluster's `cluster_name` and the cleaner's scope check refused "cleanup resource refers to a
+cluster outside the site" on every rerun, and a removed cluster the customer later deleted stopped the uninstall at "GPU cluster
+was not preserved". A provider left this way still carries the site tag; when no other role trusts it, an administrator may delete
+it by hand. A row of a cluster the site no longer lists that is not terminal is still refused.
+
 Historical rows of unknown origin in the Kubernetes installation inventory must stop the synchronisation and keep the original
 registry even when the corresponding object no longer exists; a developer reviews, adds an explicit retired entry in the trusted source inventory and ships it with a signed release;
 rows must not be hand-deleted to pass the cleanup gate. The cleanup identity includes scope, kind, namespace and name; a same-named object in a historical namespace

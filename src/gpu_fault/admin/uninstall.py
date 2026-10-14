@@ -22,6 +22,7 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     CommandRunner,
 )
+from gpu_fault.admin.cluster_removal_resources import removal_settled_keys
 from gpu_fault.admin.execution import cleanup_deadline, run_command as bounded_command
 from gpu_fault.admin.installation_lifecycle import (
     bind_retained_database,
@@ -664,12 +665,14 @@ def _delete_non_aurora_resources(
     cpu_disposition: CpuDisposition,
     state_path: Path,
     state: dict[str, Any],
+    settled: frozenset[str] = frozenset(),
 ) -> None:
     execution_dependencies = _execution_dependencies(snapshot)
     candidates = [
         resource
         for resource in snapshot.resources
         if not is_aurora_resource(resource)
+        and resource.resource_key not in settled
         and not (
             cpu_disposition == "delete"
             and resource.resource_key in CPU_CLUSTER_BOUND_RESOURCE_KEYS
@@ -746,6 +749,7 @@ def _verify_resources(
     reset_database: bool = False,
     aurora_cluster_policy: InstallationResourceDeletePolicy | None = None,
     cpu_deleted: bool = False,
+    settled: frozenset[str] = frozenset(),
 ) -> list[InstallationResource]:
     now = datetime.now(timezone.utc)
     verified = []
@@ -756,6 +760,10 @@ def _verify_resources(
             reset_database=reset_database,
             aurora_cluster_policy=aurora_cluster_policy,
         )
+        if resource.resource_key in settled:
+            # remove-cluster proved it; the cluster is no longer this site's.
+            verified.append(_terminal_resource(resource, policy=policy, now=now))
+            continue
         exists = (
             False
             if (
@@ -831,11 +839,13 @@ def _verify_gpu_clusters(
     snapshot: InstallationResourceSnapshot,
     *,
     allow_empty: bool = False,
+    settled: frozenset[str] = frozenset(),
 ) -> int:
     resources = [
         resource
         for resource in snapshot.resources
         if resource.resource_type in {"gpu_eks", "gpu_hyperpod"}
+        and resource.resource_key not in settled
     ]
     if not resources and not allow_empty:
         raise BootstrapError("installation registry contains no GPU clusters")
@@ -1039,6 +1049,7 @@ def _prepare_aurora_boundary(
     non_aurora = [
         resource for resource in snapshot.resources if not is_aurora_resource(resource)
     ]
+    settled = removal_settled_keys(request.site, snapshot)
     if not _reached(state, "NON_AURORA_VERIFIED"):
         _delete_non_aurora_resources(
             cleaner,
@@ -1046,6 +1057,7 @@ def _prepare_aurora_boundary(
             cpu_disposition=request.cpu_disposition,
             state_path=state_path,
             state=state,
+            settled=settled,
         )
         # Helm and other CPU Kubernetes resources must be proved gone while
         # the cluster's API is still available.
@@ -1058,6 +1070,7 @@ def _prepare_aurora_boundary(
                 and resource.resource_key not in CPU_CLUSTER_BOUND_RESOURCE_KEYS
             ],
             cpu_disposition=request.cpu_disposition,
+            settled=settled,
         )
         _transition(state_path, state, "NON_AURORA_VERIFIED")
     if not _reached(state, "CPU_VERIFIED"):
@@ -1079,6 +1092,7 @@ def _prepare_aurora_boundary(
         cpu_disposition=request.cpu_disposition,
         reset_database=request.reset_database,
         cpu_deleted=request.cpu_disposition == "delete",
+        settled=settled,
     )
     aurora_pending = [
         resource.model_copy(
@@ -1168,6 +1182,7 @@ def _finish_uninstall(
         reset_database=request.reset_database,
         aurora_cluster_policy=aurora_policy,
         cpu_deleted=request.cpu_disposition == "delete",
+        settled=removal_settled_keys(request.site, snapshot),
     )
     if final_snapshot is not None:
         binding = state.get("aurora_binding", {})
@@ -1251,6 +1266,9 @@ def _finish_uninstall(
         "registry_entries_deleted": deleted,
         "registry_entries_detached": detached,
         "registry_entries_preserved": preserved,
+        "registry_entries_settled_by_removal": sorted(
+            removal_settled_keys(request.site, snapshot)
+        ),
         "delete_policy_residuals": 0,
         "final_registry": str(final_path),
         FIELD: state.get(FIELD),
@@ -1411,9 +1429,9 @@ def _uninstall_locked(
     bind_retained_database(request, active_runner, state_path, state)
     _bind_cpu_deletion(request, cleaner, snapshot, state_path, state)
     _bind_dns_deletion(request, cleaner, snapshot, state_path, state)
-    _verify_gpu_clusters(
-        cleaner, snapshot, allow_empty=not request.site.release_config["clusters"]
-    )
+    settled = removal_settled_keys(request.site, snapshot)
+    allow_empty = not request.site.release_config["clusters"]
+    _verify_gpu_clusters(cleaner, snapshot, allow_empty=allow_empty, settled=settled)
     cleanup_document = _cleanup_document(request, active_runner, state_dir, state)
     cpu_deletion_started = request.cpu_disposition == "delete" and _reached(
         state, "CPU_DELETE_IN_PROGRESS"
@@ -1430,7 +1448,7 @@ def _uninstall_locked(
         )
     _prepare_aurora_boundary(request, cleaner, snapshot, state_path, state)
     gpu_records = _verify_gpu_clusters(
-        cleaner, snapshot, allow_empty=not request.site.release_config["clusters"]
+        cleaner, snapshot, allow_empty=allow_empty, settled=settled
     )
     bind_retained_database(request, active_runner, state_path, state)
     return _finish_uninstall(

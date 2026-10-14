@@ -25,6 +25,9 @@ from gpu_fault.installation_resources import (
 )
 
 
+CLUSTER_KEY_PREFIXES = ("aws/iam/executor/", "aws/iam/adot-writer/", "cluster/")
+
+
 def target_resource(resource: InstallationResource, cluster_id: str) -> bool:
     key = resource.resource_key
     return (
@@ -32,6 +35,45 @@ def target_resource(resource: InstallationResource, cluster_id: str) -> bool:
         or key.startswith(f"aws/iam/adot-writer/{cluster_id}/")
         or key.startswith(f"cluster/{cluster_id}/")
     )
+
+
+def removal_settled_keys(
+    site: RenderedSite, snapshot: InstallationResourceSnapshot
+) -> frozenset[str]:
+    """The rows of GPU clusters the site no longer lists, already terminal.
+
+    ``remove-cluster`` (and a rolled-back ``join-cluster``) settles a cluster's
+    rows -- the ones ``target_resource`` selects -- and records each as
+    DELETED or DETACHED before ``site.yaml`` drops the cluster: it deletes the
+    IAM roles, preserves the EKS/HyperPod clusters and leaves a CREATED
+    executor OIDC provider in place (DETACH). ``uninstall`` must not settle
+    them a second time: the cleaner refuses a resource bound to a cluster
+    outside the site (the OIDC provider row names its EKS cluster), so the
+    first uninstall after removing a cluster whose provider the site created
+    stopped there, on every rerun. A row of such a cluster that is not
+    terminal is not settled, and is refused as before.
+    """
+
+    members = {
+        str(cluster["cluster_id"]) for cluster in site.release_config["clusters"]
+    }
+    return frozenset(
+        resource.resource_key
+        for resource in snapshot.resources
+        if resource.status in TERMINAL_INSTALLATION_RESOURCE_STATUSES
+        and (cluster_id := key_cluster_id(resource.resource_key)) is not None
+        and cluster_id not in members
+    )
+
+
+def key_cluster_id(resource_key: str) -> str | None:
+    """The GPU cluster a ``target_resource`` key belongs to, if any."""
+
+    for prefix in CLUSTER_KEY_PREFIXES:
+        if resource_key.startswith(prefix):
+            cluster_id, separator, _ = resource_key.removeprefix(prefix).partition("/")
+            return cluster_id if cluster_id and separator else None
+    return None
 
 
 def association_to_detach(

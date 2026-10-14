@@ -3168,7 +3168,10 @@ success as a finding, and `uninstall` and `remove-cluster` refuse to start a new
 `DELETE_PENDING` and an external snapshot with SHA-256 is exported; Aurora may be deleted only after verification of the
 non-Aurora resources has finished, and the final snapshot may contain only `DELETED/DETACHED/PRESERVED`. Resource
 dependencies determine the deletion order, and it fails closed whenever ownership is unclear, the live state conflicts
-with the registry, or the final residue is non-zero.
+with the registry, or the final residue is non-zero. The terminal rows of a cluster the site no longer lists, which
+`remove-cluster` (or a rolled-back join) settled (`cluster_removal_resources.removal_settled_keys`), are neither deleted nor
+probed again by the uninstall: the CREATED Executor OIDC provider row the removal leaves in place carries the removed cluster's
+`cluster_name`, which the cleaner's scope check would refuse.
 
 Unit and integration tests cover model validation, identity immutability, the three-backend contract, execution-token
 authentication, deploy/takeover sync, cluster removal and full-site uninstall resumption, mainly in
