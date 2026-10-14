@@ -112,34 +112,88 @@ if TYPE_CHECKING:
 LOGGER = logging.getLogger(__name__)
 
 
+def _observer_identity(registration: Any) -> tuple[str, str, str, str]:
+    """The provider identity an observer is built from: its provider, the
+    region and HyperPod cluster its lifecycle adapter targets, and the EKS
+    orchestrator ARN. A registration that differs in any of them is another
+    cluster, whatever its cluster id."""
+
+    return (
+        str(getattr(registration, "provider", "") or "hyperpod"),
+        str(registration.region),
+        str(registration.hyperpod_cluster_name),
+        str(registration.eks_cluster_arn),
+    )
+
+
 class _LazyClusterObservers(dict[str, Any]):
-    """Observer map that builds one for an unseen registered cluster.
+    """The regional managed-recovery observers, checked against the registry.
 
     `RegionalHyperPodManagedRecoveryObserver` looks clusters up with `.get`,
-    which bypasses `__missing__`, so the override lives here. Observers are
-    cached once built: they hold an identity registry the refresh worker
-    iterates, so one per cluster is the invariant.
+    which bypasses `__missing__`, so the override lives here. An observer
+    holds the identity registry the background refresh serves, so one per
+    cluster is the invariant -- per cluster as the registry describes it now.
+    Each entry records the provider identity it was built from: a lookup whose
+    registration carries another one (removed and re-joined under the same id
+    as a different HyperPod or EKS cluster) drops the old observer for good and
+    builds a new one; the same cluster re-joined keeps its observer. With no
+    registration to compare -- not bound yet, a cluster absent from the
+    snapshot, no snapshot -- the map answers with what it holds, and nothing
+    for a cluster it never saw.
     """
 
-    def __init__(
-        self,
-        initial: Mapping[str, Any] | None,
-        *,
-        resolver: Callable[[str], Any | None],
-    ) -> None:
+    def __init__(self, initial: Mapping[str, Any] | None = None) -> None:
+        # A plain dict's entries carry no identity: one is never served for a
+        # registered cluster and is replaced on that cluster's first lookup.
         super().__init__(initial or {})
-        self.resolver = resolver
+        self._built_from: dict[str, tuple[tuple[str, ...], Any]] = {}
+        self._bound: tuple[Callable[[str], Any], Callable[[Any], Any]] | None = None
         self._build_lock = threading.Lock()
 
+    def adopt(self, registration: Any, observer: Any) -> None:
+        """Hold ``observer``, which start-up built from ``registration``."""
+
+        identity = _observer_identity(registration)
+        self._built_from[registration.cluster_id] = (identity, observer)
+        self[registration.cluster_id] = observer
+
+    def bind(
+        self,
+        registration_for: Callable[[str], Any],
+        factory: Callable[[Any], Any],
+    ) -> None:
+        """Resolve lookups from the registry: its registration, its observer."""
+
+        self._bound = (registration_for, factory)
+
     def get(self, cluster_id: str, default: Any = None) -> Any:
-        if cluster_id in self:
-            return self[cluster_id]
+        if self._bound is None:
+            return dict.get(self, cluster_id, default)
+        registration_for, factory = self._bound
+        registration = registration_for(cluster_id)
+        if registration is None:
+            return dict.get(self, cluster_id, default)
+        built = self._built_from.get(cluster_id)
+        if built is not None and built[0] == _observer_identity(registration):
+            return built[1]
         with self._build_lock:
-            if cluster_id in self:
-                return self[cluster_id]
-            observer = self.resolver(cluster_id)
+            # The newest registration decides, so a reader that loaded the
+            # snapshot before a switch cannot switch the map back.
+            registration = registration_for(cluster_id)
+            if registration is None:
+                return dict.get(self, cluster_id, default)
+            identity = _observer_identity(registration)
+            built = self._built_from.get(cluster_id)
+            if built is not None and built[0] == identity:
+                return built[1]
+            # Stale or of unknown origin: gone before the build, so a build
+            # that raises cannot leave the old observer to be served again.
+            self._built_from.pop(cluster_id, None)
+            self.pop(cluster_id, None)
+            observer = factory(registration)
             if observer is None:
                 return default
+            self._built_from[cluster_id] = (identity, observer)
             self[cluster_id] = observer
             return observer
 
@@ -417,7 +471,8 @@ class ApplicationContext:
         observer map were built once from the store, so a cluster joined online
         was refused until every CPU Pod restarted (review H4). Both now resolve
         an unseen cluster from the runtime's snapshot on first sight and fail
-        closed when the snapshot does not contain it. The background identity
+        closed when the snapshot does not contain it; an observer is rebuilt
+        when its cluster's provider identity changes. The background identity
         refresh follows the same snapshot through the observer map.
         """
 
@@ -449,18 +504,13 @@ class ApplicationContext:
         observer = self.regional_managed_observer
         factory = self.regional_observer_factory
         if observer is not None and factory is not None:
-
-            def resolve_observer(cluster_id: str) -> Any | None:
-                registration = registration_for(cluster_id)
-                if registration is None:
-                    return None
-                return factory(registration)
-
-            observer.observers = _LazyClusterObservers(
-                observer.observers, resolver=resolve_observer
-            )
+            observers = observer.observers
+            if not isinstance(observers, _LazyClusterObservers):
+                observers = _LazyClusterObservers(observers)  # a test double's dict
+                observer.observers = observers
+            observers.bind(registration_for, factory)
             self.registered_identity_registries = _RegisteredIdentityRegistries(
-                runtime, observer.observers
+                runtime, observers
             )
 
     def background_identity_registries(self) -> list[Any] | Callable[[], list[Any]]:
@@ -880,7 +930,6 @@ class ApplicationContext:
                         )
                     )
                     identities = HyperPodIdentityRegistry(lifecycle, context.store)
-                    context.hyperpod_identity_registries.append(identities)
                     return HyperPodManagedRecoveryObserver(
                         identities,
                         context.store,
@@ -890,14 +939,14 @@ class ApplicationContext:
                         alert_sender=(context.advisory_notifications.send),
                     )
 
-                observers = {
-                    registration.cluster_id: observer
-                    for registration in context.store.list_regional_clusters()
-                    if (observer := build_observer(registration)) is not None
-                }
+                observers = _LazyClusterObservers()
+                for registration in context.store.list_regional_clusters():
+                    if (observer := build_observer(registration)) is not None:
+                        observers.adopt(registration, observer)
+                        context.hyperpod_identity_registries.append(observer.identities)
                 managed_observer = RegionalHyperPodManagedRecoveryObserver(observers)
-                # Kept so `bind_regional_registry_runtime` can extend the map
-                # for clusters joined after start-up (review H4).
+                # Kept so `bind_regional_registry_runtime` can bind the map to
+                # the registry for clusters (re-)joined after start-up (H4).
                 context.regional_managed_observer = managed_observer
                 context.regional_observer_factory = build_observer
             else:
