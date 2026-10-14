@@ -1436,7 +1436,10 @@ Semantics and boundaries of `eks-managed`:
   loads it back with `modprobe nvidia_drm` after the reset whatever its outcome (`released_kernel_modules`/
   `reloaded_kernel_modules`, or `kernel_module_reload_error`); with a process holding a device node no module is
   touched. Planner side: a RUNNING node-exclusive chain absorbs the `efa_kubernetes_allocatable_mismatch`/
-  `gpu_kubernetes_allocatable_mismatch` its own quiesce taint causes (the covering check looks at the RUNNING incumbent,
+  `gpu_kubernetes_allocatable_mismatch`/`dcgm_field_completeness` its own quiesce taint causes (the last one is the
+  collector's failed scrape of the evicted exporter: a RUN_DCGM_DIAGNOSTIC no longer runs `dcgmi diag` inside the window
+  and mints a DRAIN successor from its FAIL, and the chain's `VALIDATE_GPU` still refuses while the finding is active;
+  the covering check looks at the RUNNING incumbent,
   not at a PENDING successor listed ahead of it); an in-place plan replacement of a queued successor **no longer** bumps
   the fencing token (it shares its RUNNING predecessor's generation; the bump turned every later command of the
   predecessor -- the reboot rung, the restore compensation -- into `command fencing token does not match

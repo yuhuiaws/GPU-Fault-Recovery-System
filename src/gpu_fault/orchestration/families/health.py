@@ -841,7 +841,8 @@ class NodeHealthIngestionService:
                 incident.incident_id,
             )
             LOGGER.info(
-                "absorbed transient GPU inventory finding %s into RUNNING workflow %s",
+                "absorbed transient %s finding %s into RUNNING workflow %s",
+                finding.metric_name,
                 finding.event_id,
                 workflow.request_id,
             )

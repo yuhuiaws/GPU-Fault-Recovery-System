@@ -1039,6 +1039,13 @@ when the batch has no errors and the existing finding is non-empty it writes `(k
 the WARNING left by the one or two failed scrapes when the collector came up before dcgm-exporter after a node reboot stayed active forever, and
 every validation recovery by `VALIDATE_GPU` for that node was refused with `active_gpu_health_findings`
 (the cleanup in DESTR-014 attempt 10 failed because of this).
+Raised while a RUNNING node-exclusive chain quiesces, resets or reboots the node (the eks-managed quiesce taint evicted
+the exporter and the collector's scrape failed before the quiesce stopped it), the finding is that chain's own side
+effect and is linked to the chain's incident without a workflow of its own
+(`orchestration/families/conflicts.DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS`, as long as the chain's `VALIDATE_GPU` is
+still ahead): no RUN_DCGM_DIAGNOSTIC runs `dcgmi diag` inside another workflow's quiesce window and no DRAIN successor
+is minted from a diagnostic of the window; the chain's `VALIDATE_GPU` still refuses while the finding is active, so a
+persisting collection failure is not lost.
 
 **⑧ Idempotency and concurrency control**: XID/SXID events carry an `event_id`; the control plane deduplicates by `event_id`.
 The inventory and metrics channels are `latest_wins=True`, so a newer sample from the same node overwrites the older one,

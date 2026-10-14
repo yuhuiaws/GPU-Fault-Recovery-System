@@ -43,6 +43,21 @@ DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS = frozenset(
         WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN,
     }
 )
+#: Operations during which the node's DCGM telemetry path is down on purpose:
+#: the eks-managed quiesce taint evicts the product's dcgm-exporter Pod before
+#: the quiesce stops the collector, the reset and the reboot take the GPUs away,
+#: the restore brings the exporter back. A scrape that fails meanwhile becomes a
+#: WARNING ``dcgm_field_completeness`` finding whose RUN_DIAGNOSTICS plan is not
+#: node-exclusive, so nothing held it behind the chain (live, plain EKS, XID 46
+#: reset): ``dcgmi diag`` ran inside the reset's quiesce window, measured it
+#: (Fabric Manager stopped, persistence released) and graded FAIL, and the DRAIN
+#: successor minted from that failure quarantined the node the reset recovered.
+DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS = TRANSIENT_GPU_INVENTORY_OPERATIONS | {
+    WorkflowOperation.QUIESCE_GPU_SERVICES,
+    WorkflowOperation.RESTORE_GPU_SERVICES,
+    WorkflowOperation.RESET_GPU,
+    WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
+}
 #: Finding -> the operations of a RUNNING node-exclusive workflow that make the
 #: finding transient while they run (validated by the workflow's own validation
 #: step, see ``INVENTORY_FINDING_VALIDATIONS``).
@@ -55,12 +70,16 @@ TRANSIENT_INVENTORY_FINDINGS = {
     "efa_kubernetes_allocatable_mismatch": (
         TRANSIENT_GPU_INVENTORY_OPERATIONS | DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS
     ),
+    "dcgm_field_completeness": DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS,
 }
 #: The validation step of the incumbent that must still be ahead for the finding
 #: to be absorbed: a GPU finding is judged by VALIDATE_GPU; an EFA one by
 #: VALIDATE_FABRIC when the plan has it, else by the GPU validation that ends a
 #: reset chain (the EFA plugin returns with the quiesce taint's removal, and a
-#: mismatch that outlives the chain is raised again by the next scan).
+#: mismatch that outlives the chain is raised again by the next scan). The
+#: collection-error finding stays active until a clean batch clears it, and
+#: VALIDATE_GPU refuses while it is active, so a scrape failure that outlives
+#: the chain fails the chain's own validation instead of being lost.
 _GPU_VALIDATIONS = frozenset({WorkflowOperation.VALIDATE_GPU})
 _EFA_VALIDATIONS = _GPU_VALIDATIONS | {WorkflowOperation.VALIDATE_FABRIC}
 INVENTORY_FINDING_VALIDATIONS = {
@@ -68,6 +87,7 @@ INVENTORY_FINDING_VALIDATIONS = {
     "gpu_kubernetes_allocatable_mismatch": _GPU_VALIDATIONS,
     "efa_inventory_mismatch": _EFA_VALIDATIONS,
     "efa_kubernetes_allocatable_mismatch": _EFA_VALIDATIONS,
+    "dcgm_field_completeness": _GPU_VALIDATIONS,
 }
 
 
