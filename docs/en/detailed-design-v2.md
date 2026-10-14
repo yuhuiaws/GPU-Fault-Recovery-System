@@ -4009,8 +4009,9 @@ release left `RUNNING` without their claims (it dropped them after the first bud
 release first dispatches them; while old and new dispatchers alternate during a control-plane roll the older one drops the claims
 again and admits on its own count; a lowered limit leaves its earlier holders in place. The dispatcher reports every scope above
 its configured limit (`gpu_fault_remediation_budget_over_limit_scopes{scope_type}` and
-`gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds` from the process holding the dispatch lease, and a warning
-naming scope, holders and limit at every change) and admits nothing new into it -- the store refuses, the guard passes over --
+`gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds` from the process holding the dispatch lease, a warning
+naming scope, holders and limit at every change, and the non-paging `GpuFaultRemediationBudgetOverLimit` once a scope stays over
+for 10 minutes) and admits nothing new into it -- the store refuses, the guard passes over --
 until it drains below its limit; holds and the compensation they owe keep running. The residual roll window: until no process
 runs the older release, its dispatcher ticks can exceed the limit, and a row it left without claims counts only from its first
 dispatch by this release (a parked `BLOCKED` one never claims again); the excess drains at the pace of the remediations in flight,

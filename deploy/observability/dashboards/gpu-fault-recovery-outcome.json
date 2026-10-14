@@ -1113,7 +1113,7 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
+        "w": 8,
         "x": 0,
         "y": 45
       },
@@ -1180,8 +1180,8 @@
       },
       "gridPos": {
         "h": 8,
-        "w": 12,
-        "x": 12,
+        "w": 8,
+        "x": 8,
         "y": 45
       },
       "id": 21,
@@ -1235,6 +1235,77 @@
       "type": "timeseries"
     },
     {
+      "datasource": {
+        "type": "prometheus",
+        "uid": "gpu-fault-amp"
+      },
+      "description": "Scopes holding more workflows than their configured limit, by scope type; nothing new is admitted into them until they drain below it.\n\nAlert GpuFaultRemediationBudgetOverLimit (warning, for 10m, > 0): docs/en/administrator-operations.md#gpufaultremediationbudgetoverlimit",
+      "fieldConfig": {
+        "defaults": {
+          "color": {
+            "mode": "palette-classic"
+          },
+          "custom": {
+            "fillOpacity": 10,
+            "lineWidth": 1,
+            "showPoints": "never",
+            "spanNulls": false,
+            "thresholdsStyle": {
+              "mode": "line"
+            }
+          },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              {
+                "color": "green",
+                "value": null
+              },
+              {
+                "color": "orange",
+                "value": 0.0
+              }
+            ]
+          },
+          "unit": "short"
+        },
+        "overrides": []
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 45
+      },
+      "id": 22,
+      "options": {
+        "legend": {
+          "displayMode": "list",
+          "placement": "bottom",
+          "showLegend": true
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "gpu-fault-amp"
+          },
+          "expr": "max by (scope_type) (gpu_fault_remediation_budget_over_limit_scopes{control_plane_cluster=~\"$control_plane_cluster\",region=~\"$region\"})",
+          "instant": false,
+          "legendFormat": "{{scope_type}}",
+          "range": true,
+          "refId": "A"
+        }
+      ],
+      "title": "Budget scopes above their limit",
+      "type": "timeseries"
+    },
+    {
       "collapsed": false,
       "gridPos": {
         "h": 1,
@@ -1242,7 +1313,7 @@
         "x": 0,
         "y": 53
       },
-      "id": 22,
+      "id": 23,
       "panels": [],
       "title": "Completion and incidents",
       "type": "row"
@@ -1286,7 +1357,7 @@
         "x": 0,
         "y": 54
       },
-      "id": 23,
+      "id": 24,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1357,7 +1428,7 @@
         "x": 8,
         "y": 54
       },
-      "id": 24,
+      "id": 25,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1428,7 +1499,7 @@
         "x": 16,
         "y": 54
       },
-      "id": 25,
+      "id": 26,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1464,7 +1535,7 @@
         "x": 0,
         "y": 62
       },
-      "id": 26,
+      "id": 27,
       "panels": [],
       "title": "Dispatcher errors and notification outbox",
       "type": "row"
@@ -1512,7 +1583,7 @@
         "x": 0,
         "y": 63
       },
-      "id": 27,
+      "id": 28,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1583,7 +1654,7 @@
         "x": 8,
         "y": 63
       },
-      "id": 28,
+      "id": 29,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1654,7 +1725,7 @@
         "x": 16,
         "y": 63
       },
-      "id": 29,
+      "id": 30,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1725,7 +1796,7 @@
         "x": 0,
         "y": 71
       },
-      "id": 30,
+      "id": 31,
       "options": {
         "legend": {
           "displayMode": "list",
@@ -1807,7 +1878,7 @@
         "x": 12,
         "y": 71
       },
-      "id": 31,
+      "id": 32,
       "options": {
         "legend": {
           "displayMode": "list",

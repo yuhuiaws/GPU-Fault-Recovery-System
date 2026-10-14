@@ -1290,6 +1290,22 @@ RECOVERY_OUTCOME = Dashboard(
                         "claims sit at the configured limit."
                     ),
                 ),
+                Panel(
+                    "Budget scopes above their limit",
+                    (
+                        Target(
+                            "max by (scope_type) ("
+                            + series("gpu_fault_remediation_budget_over_limit_scopes")
+                            + ")",
+                            "{{scope_type}}",
+                        ),
+                    ),
+                    description=(
+                        "Scopes holding more workflows than their configured limit, "
+                        "by scope type; nothing new is admitted into them until "
+                        "they drain below it."
+                    ),
+                ),
             ),
         ),
         Row(

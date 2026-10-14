@@ -3249,8 +3249,9 @@ kubectl --kubeconfig "${CPU_KUBECONFIG}" -n gpu-fault-system \
 The email subscription must be confirmed by the recipient clicking the confirmation link sent by AWS. When no email is configured, the rules and SNS topic
 are still deployed normally, but the alerts have no final receiver. The rules cover missing metrics, regional queue 70%/90%, oldest request
 over 30 seconds, single cluster 70%, admission rejections occurring, Store I/O over 90% or rejections occurring,
-processing duration p95 over 5 seconds, plus remote commands unclaimed for over 600 seconds and executor
-internal errors. If thresholds override the default capacity, the absolute values in
+processing duration p95 over 5 seconds, plus remote commands unclaimed for over 600 seconds, executor
+internal errors and a remediation budget scope held over its limit for 10 minutes (a warning, not a page:
+`GpuFaultRemediationBudgetOverLimit`). If thresholds override the default capacity, the absolute values in
 `deploy/observability/amp-rules.yaml` must be adjusted in step.
 
 The ARN bootstrap does not resend the confirmation email on every deploy: the Topic carries a generation tag; before the first

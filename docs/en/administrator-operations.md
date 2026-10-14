@@ -3116,6 +3116,24 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   at the expected rate, just wait and tell the business side the drain time. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md) and needs
   a change record and a rollback plan.
 
+### GpuFaultRemediationBudgetOverLimit
+
+- **Meaning**: for 10 minutes, at least one remediation budget scope has held more workflows than its configured limit
+  (`gpu_fault_remediation_budget_over_limit_scopes{scope_type}` above 0, read by the process holding the dispatch lease).
+  A hold is never refused -- refusing would strand a reset or a reboot in flight -- so a scope can only go over its limit in
+  the documented windows (detailed design §9.5): during a control-plane roll from a release that dropped claims after the
+  first budgeted step, its RUNNING workflows re-take their claims here and an older dispatcher still alternating with this one
+  admits on its own count; a limit was lowered under its existing holders; or a receipt-settled record re-took its hold for the
+  compensation it owes. Nothing new is admitted into such a scope until it drains below the limit, so the excess cannot grow
+  from this release.
+- **First check**: whether a control-plane roll is still running or any control-plane Pod still runs the older release; the
+  control-worker log warning `remediation budget scope(s) above their limit` names each scope with its holders and limit;
+  compare `gpu_fault_remediation_budget_active_claims` / `gpu_fault_remediation_budget_cluster_active_claims` with the limits
+  and confirm the holders are still progressing. The excess drains as the remediations in flight end, bounded by their
+  deadlines and, for parked records, by the longest a node action can live.
+- **Boundary**: do not raise the limit to clear the alert and do not edit Store claims. A scope still over its limit long after
+  the roll ended means holders that no longer progress: handle as `GpuFaultRemediationBudgetStarved`.
+
 ### GpuFaultCompletionEventsWithoutDecision
 
 - **Meaning**: there are completion events with no decision row at all. Events and decisions should land in the same transaction;

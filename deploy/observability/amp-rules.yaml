@@ -1923,6 +1923,42 @@ groups:
             waiting workflow via
             gpu_fault_workflow_pending_age_seconds_max and its
             remediation_budget_last_blocked_reason.
+      # A budget scope holding more workflows than its configured limit. Holds
+      # are never refused (a refusal would strand a reset or a reboot), so this
+      # is reachable only in documented windows (detailed design 9.5): rows an
+      # older release left RUNNING without their claims re-take them during a
+      # control-plane roll while an older dispatcher still alternating admits on
+      # its own count, a limit lowered under its holders, or a receipt-settled
+      # compensation re-taking its hold. Nothing new enters such a scope until it
+      # drains, so the excess cannot grow from this release: a warning, not a
+      # page. The gauge is read by the dispatch-lease holder only (the other
+      # processes report zero), so the inner max is per scope type.
+      - alert: GpuFaultRemediationBudgetOverLimit
+        expr: >-
+          sum by (control_plane_cluster, region) (
+            max by (control_plane_cluster, region, scope_type)
+            (gpu_fault_remediation_budget_over_limit_scopes)
+          ) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: A remediation budget scope has held more workflows than its limit for 10 minutes
+          runbook_url: docs/en/administrator-operations.md#gpufaultremediationbudgetoverlimit
+          description: >-
+            {{ $value | printf "%.0f" }} remediation budget scope(s) hold more
+            workflows than their configured limit. Holds are never refused, so
+            this happens only in documented windows: workflows an older release
+            left RUNNING without their claims re-take them during a
+            control-plane roll (an older dispatcher still in the roll admits on
+            its own count), a limit was lowered under its holders, or a
+            receipt-settled compensation re-took its hold. Nothing new is
+            admitted into such a scope until it drains below the limit. Check
+            that the control-plane roll has finished, read the control-worker
+            log warning that names each scope with its holders and limit, and
+            compare gpu_fault_remediation_budget_active_claims with the limits;
+            the excess drains as the remediations in flight end, bounded by
+            their deadlines. Do not raise the limit to clear this alert.
       # A completion event with no decision row at all. Every persisted event
       # is meant to be decided in the same transaction; one without a decision
       # was recorded and then never judged, and nothing downstream will ever

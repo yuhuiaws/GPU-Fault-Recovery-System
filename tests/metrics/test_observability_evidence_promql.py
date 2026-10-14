@@ -406,3 +406,122 @@ def test_observability_evidence_with_real_promql(
         check=False,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+OVER_LIMIT = "GpuFaultRemediationBudgetOverLimit"
+OVER_LIMIT_SCOPES = "gpu_fault_remediation_budget_over_limit_scopes"
+VALUE_TEMPLATE = '{{ $value | printf "%.0f" }}'
+
+
+@pytest.mark.parametrize(
+    ("inputs", "eval_time", "value"),
+    [
+        pytest.param(
+            [series(OVER_LIMIT_SCOPES, "0+0x30", scope_type="cluster")],
+            "20m",
+            None,
+            id="no-scope-over-its-limit",
+        ),
+        pytest.param(
+            [series(OVER_LIMIT_SCOPES, "0x5 1+0x25", scope_type="cluster")],
+            "20m",
+            1,
+            id="over-its-limit-for-ten-minutes",
+        ),
+        pytest.param(
+            [series(OVER_LIMIT_SCOPES, "0x5 1+0x8 0+0x16", scope_type="cluster")],
+            "15m",
+            None,
+            id="a-nine-minute-roll-window-stays-pending",
+        ),
+        pytest.param(
+            [
+                series(OVER_LIMIT_SCOPES, "0x5 1+0x10 0+0x14", scope_type="cluster"),
+                series(
+                    OVER_LIMIT_SCOPES,
+                    "0x15 1+0x15",
+                    pod="worker-b",
+                    scope_type="cluster",
+                ),
+                series(OVER_LIMIT_SCOPES, "0+0x30", pod="worker-b", scope_type="node"),
+            ],
+            "20m",
+            1,
+            id="the-dispatch-lease-moving-between-pods-keeps-one-scope-firing",
+        ),
+        pytest.param(
+            [
+                series(OVER_LIMIT_SCOPES, "0x5 1+0x25", scope_type="cluster"),
+                series(OVER_LIMIT_SCOPES, "0x5 2+0x25", scope_type="node"),
+            ],
+            "20m",
+            3,
+            id="scopes-of-every-type-are-counted",
+        ),
+    ],
+)
+def test_the_budget_over_limit_alert_waits_ten_minutes_and_counts_scopes(
+    tmp_path: Path, inputs, eval_time: str, value: int | None
+) -> None:
+    """A warning, not a page: the documented roll windows close by themselves,
+    so a scope must stay over its limit for ten minutes; the dispatch-lease
+    holder is the one process reporting, wherever the lease moves."""
+
+    promtool = shutil.which(os.environ.get("PROMTOOL", "promtool"))
+    assert promtool is not None, "set PROMTOOL to the pinned local promtool"
+    rule = rule_map("deploy/observability/amp-rules.yaml")[OVER_LIMIT]
+    assert rule["labels"] == {"severity": "warning"}, "the alert must not page"
+    rule_file = tmp_path / "rules.yaml"
+    rule_file.write_text(
+        yaml.safe_dump({"groups": [{"name": "budget", "rules": [rule]}]})
+    )
+    annotations = {
+        key: str(text).replace(VALUE_TEMPLATE, str(value))
+        for key, text in rule["annotations"].items()
+    }
+    expected = (
+        []
+        if value is None
+        else [
+            {
+                "exp_labels": {
+                    "control_plane_cluster": BASE["control_plane_cluster"],
+                    "region": BASE["region"],
+                    "severity": "warning",
+                },
+                "exp_annotations": annotations,
+            }
+        ]
+    )
+    test_file = tmp_path / "cases.yaml"
+    test_file.write_text(
+        yaml.safe_dump(
+            {
+                "rule_files": [str(rule_file)],
+                "evaluation_interval": "1m",
+                "tests": [
+                    {
+                        "interval": "1m",
+                        "input_series": inputs,
+                        "alert_rule_test": [
+                            {
+                                "alertname": OVER_LIMIT,
+                                "eval_time": eval_time,
+                                "exp_alerts": expected,
+                            }
+                        ],
+                    }
+                ],
+            }
+        )
+    )
+
+    result = subprocess.run(
+        [promtool, "test", "rules", str(test_file)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
