@@ -244,6 +244,16 @@ def _claim_window_sql(
     return separator.join(raw), separator.join(windows)
 
 
+# A claim takes a transaction-scoped try-lock on each lane it is about to
+# lease (two-key advisory locks, a key space of their own: class "lane"). A
+# lane that another claim is leasing right now is skipped instead of waited
+# for: the upsert below queued on that claim's uncommitted lane row -- on its
+# speculative insert for a new lane -- until it committed, and then found the
+# lane leased and returned nothing for it (1.6 s behind a claim held open
+# 2 s: gpu and host evidence of one node lane). The upsert's WHERE stays the
+# fence against a double lease; the try-lock only spares the wait.
+_LANE_LOCK_CLASS = 0x6C616E65
+
 # A full window that cannot fill a claim advances a bounded seek on the next
 # call. The original head and aging windows remain, so new high-priority work
 # and newly unblocked head rows are not hidden by the continuation. At most
@@ -327,6 +337,13 @@ selected AS MATERIALIZED (
     LIMIT %(limit)s
     FOR UPDATE OF queue SKIP LOCKED
 ),
+lane_locked AS MATERIALIZED (
+    SELECT selected.ordering_key, selected.lease_token
+    FROM selected
+    WHERE pg_try_advisory_xact_lock(
+        {_LANE_LOCK_CLASS}, hashtext(selected.ordering_key)
+    )
+),
 leased_lanes AS (
     INSERT INTO gpu_fault_processor_lanes (
         ordering_key,
@@ -337,13 +354,13 @@ leased_lanes AS (
         updated_at
     )
     SELECT
-        selected.ordering_key,
+        lane_locked.ordering_key,
         %(owner_id)s,
         1,
-        selected.lease_token,
+        lane_locked.lease_token,
         %(expires_at)s,
         %(now)s
-    FROM selected
+    FROM lane_locked
     -- selected is ordered by priority, so two
     -- workers claiming an overlapping set of
     -- ordering keys reach the lane rows in
@@ -356,7 +373,7 @@ leased_lanes AS (
     -- request receives is unaffected because the
     -- lease_token is already bound to the row in
     -- selected.
-    ORDER BY selected.ordering_key
+    ORDER BY lane_locked.ordering_key
     ON CONFLICT(ordering_key) DO UPDATE SET
         owner_id=excluded.owner_id,
         epoch=(

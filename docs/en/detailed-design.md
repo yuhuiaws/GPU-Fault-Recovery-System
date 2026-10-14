@@ -3668,6 +3668,16 @@ table's `fillfactor` is 50, so these updates are HOT. Lane rows are deleted by t
 lanes whose lease expired with no PENDING/LEASED request on the same ordering key are removed in LIMIT batches, by
 default one hour after expiry, by a sequential scan of the very table that retention keeps small.
 
+A claim takes a transaction-scoped try-lock on each lane it is about to lease (`pg_try_advisory_xact_lock`, the two-key
+form in a key space of its own) and skips a lane that another claim is leasing at that moment instead of waiting for it.
+The lane upsert used to queue on the other claim's uncommitted lane row -- for a new lane, on its speculative insert --
+until that claim committed, and then found the lane leased: 1.6 s for nothing behind a claim held open 2 s, between the
+gpu and host evidence of one node lane and for a P10 claim behind its lane's evidence
+(`tests/store/test_postgres_lane_claim_guard.py`). The upsert's `WHERE lease_expires_at <= now` stays the fence against
+a double lease; the try-lock only spares the wait and is taken once per row the claim selected, never inside the window
+scans (`tests/store/test_postgres_claim_planner_discipline.py`). SQLite runs one claim at a time, so a claim there never
+meets another claim's uncommitted lane.
+
 #### 3.1.5 admission Counters: A Per-Writer-Backend Ledger
 
 The admission quota needs the "current number of incomplete requests". Originally there was only

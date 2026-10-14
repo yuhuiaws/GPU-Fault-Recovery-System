@@ -89,7 +89,9 @@ def connection():
         try:
             yield connected
         finally:
-            connected.execute(f"ALTER TABLE {QUEUE} RESET (autovacuum_enabled)")
+            connected.execute(
+                f"ALTER TABLE IF EXISTS {QUEUE} RESET (autovacuum_enabled)"
+            )
 
 
 ANALYZED_ROWS = 138  # pg_class said reltuples 138 / relpages 45 during the burst
@@ -492,3 +494,34 @@ def test_a_dedicated_claim_probes_its_lane_head_by_index_under_a_generic_plan(
     assert head_scans and all(
         name == "gpu_fault_processor_queue_lane_rows" for _, name in head_scans
     ), f"the lane head is probed through the lane index: {head_scans}"
+
+
+def test_the_lane_try_lock_is_taken_for_the_selected_rows_only(
+    store: PostgresStore, connection: Any
+) -> None:
+    """The claim try-locks a lane it is about to lease (``_LANE_LOCK_CLASS``),
+    once per row the claim selected: evaluated inside a window scan, the
+    volatile call would lock every candidate lane it walks past and turn other
+    claims away from lanes this one never leases."""
+
+    _seed_evidence_lanes(connection)
+    sql, params = store.claim_active_processor_query(
+        "pod-plan",
+        now=datetime.now(timezone.utc),
+        lease_duration=REQUEST_LEASE,
+        limit=LIMIT,
+        include_paths={GPU_METRICS_PATH},
+    )
+    plan = _explain_generic(connection, sql, params, hot_path_planner_statements())
+    locking = [
+        node
+        for node in _nodes(plan)
+        if "pg_try_advisory_xact_lock" in str(node.get("Filter", ""))
+    ]
+
+    assert [(node["Node Type"], node.get("CTE Name")) for node in locking] == [
+        ("CTE Scan", "selected")
+    ], f"the try-lock filters the selected rows: {locking}"
+    (node,) = locking
+    tried = int(node["Actual Rows"]) + int(node.get("Rows Removed by Filter", 0))
+    assert 0 < tried <= LIMIT, f"one try-lock per selected row, {tried} for {LIMIT}"
