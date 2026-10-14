@@ -11113,7 +11113,11 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
   was released through it, and the sweep is only the fallback; the QUIESCE result's
   `persistence_mode`/`persistence_release`/`persistence_daemon`, the RESTORE result's `persistence_mode.after_restore` and
   `persistence_daemon_restored`, and the RESET receipt's `physical_calls[].target_persistence` make the window's
-  state readable from the evidence. Judgement: `tests/node_agent/test_quiesce_persistence_release.py`.
+  state readable from the evidence. Judgement: `tests/node_agent/test_quiesce_persistence_release.py`. The kept daemon
+  holds only the other GPUs and `/dev/nvidiactl` and no longer stops the reset's unload of the idle display stack when
+  the reset is busy (`display_release_bystanders`, judged by
+  `tests/node_agent/test_reset_releases_idle_display_modules.py`): read as a holder it made every single-GPU reset on an
+  `eks-managed` p5en node fail busy three times and escalate to RESTART_NODE (DESTR-001 attempt 2).
 - The physical overlap proof is limited by its clock calibration: on HyperPod attempt 3 the workflow completed and the two
   applied resets did overlap (raw overlap 0.41 s), yet the verdict FAILED on `physical_overlap_errors`. Each node had only the
   arm and collect clock exchanges, each a one-shot `kubectl exec` whose round trip (exec setup, interpreter start and the
