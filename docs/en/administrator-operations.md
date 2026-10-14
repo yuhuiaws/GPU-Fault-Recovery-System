@@ -1112,8 +1112,10 @@ Semantics and boundaries of `eks-managed`:
   version, its registration carries `runtime_profile_version`/`agent_config_digest`, and the control plane's fleet
   pin is checked per cluster (every other cluster keeps the site pins and renders byte for byte as before). A new
   version is a policy change and goes through the same review as a site profile change: the join writes
-  `release-deploy/profile-plan.json` (`change_kind: CLUSTER_PROFILE_NEW`) and stops; record `plan_sha256`, rerun the
-  same `join-cluster`/`deploy` with `--approve-profile-plan <sha> --reference <CHG>`; the approval is consumed, the
+  `release-deploy/profile-plan.json` (`change_kind: CLUSTER_PROFILE_NEW`) and stops; record `plan_sha256` and run the
+  printed `join-cluster ... --approve-profile-plan <sha> --reference <CHG>` (a `deploy --gpu-cluster-arn` adding a
+  cluster prints the same `join-cluster` command; do not switch to `deploy --approve-profile-plan`, see §5.0.4 limit 5);
+  the approval is consumed, the
   immutable snapshot `profiles/<version>.yaml` is written and the join continues. Later clusters of the same provider
   reuse that snapshot without another review. A first `deploy` still requires its GPU clusters to share one provider
   (an all-plain-EKS first deploy starts from `eks-v1`); the other provider joins afterwards with `join-cluster`.
@@ -1911,6 +1913,16 @@ judgement).
    node identities are refreshed only on demand while managed recovery observes it, until the next CPU Pod restart (the
    next application release restarts them) adds it to the background refresh. The fix ships with the next control-plane
    release.
+5. **A new cluster stopped for a Runtime Profile review resumes only with the printed
+   `join-cluster ... --approve-profile-plan ...`.** A join started by `deploy --gpu-cluster-arn` prints the same
+   `join-cluster` command when it stops. Do not switch to `deploy --approve-profile-plan`: a deploy that also runs an
+   application release checks the approval against the site profile before it joins the new cluster, so it judges the
+   `CLUSTER_PROFILE_NEW` approval stale and archives it as `SUPERSEDED` before the join; the join then stops again and
+   writes the same plan, and an archived `plan_sha256` cannot be approved again (`archived Profile approval differs from
+   the active approval`), so no command resumes that join any more. A deploy that runs no application release joins the
+   cluster and consumes the approval, but whether a deploy releases cannot be known beforehand. If a join was already
+   resumed that way, do not edit or delete the archive under `release-deploy/profile-approvals/`; keep the state-dir and
+   hand it to the development team (Profile change approval §1.2, §7). The fix of the order ships with a later release.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 

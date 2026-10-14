@@ -13,8 +13,8 @@ profile** 的 GPU 集群使用；一个集群也可以拥有自己的 profile（
 集群核对。GPU 集群加入和注销继续通过 `join-cluster/remove-cluster` 处理，不进入站点 profile 审批的
 稳定站点身份摘要；但**集群自己的新 profile 版本同样要审批**：join 写出同一份
 `release-deploy/profile-plan.json`（`change_kind: CLUSTER_PROFILE_NEW`，`registration_cluster_id` 为该集群），
-用 `join-cluster --approve-profile-plan <plan_sha256> --reference <CHG>`（或 `deploy` 的同名参数）
-审批后继续；审批消费后写入不可变快照 `profiles/<version>.yaml`，后续同 provider 的集群复用。
+用停止信息打印的 `join-cluster ... --approve-profile-plan <plan_sha256> --reference <CHG>` 审批后继续
+（`deploy --gpu-cluster-arn` 新增集群时打印的也是这条 `join-cluster` 命令；不要改用 `deploy --approve-profile-plan`，见 1.2）；审批消费后写入不可变快照 `profiles/<version>.yaml`，后续同 provider 的集群复用。
 多个集群需要同一版本时只出一份计划，一次审批覆盖全部（见 1.2）。
 
 ## 1. 最短操作路径
@@ -108,9 +108,15 @@ templateSource、本次发布的 `agentConfigDigest`），随发布注册该版�
 `clusters: <id>, <id>` 与 `(these clusters only)`，`changes` 每个集群一行，末行说明该版本是这些集群共用的一次审批与一个不可变快照。
 
 批量 join 与单集群 join 审核方式完全一致：在任何变更之前停止，计划覆盖的集群在各自 join 记录里记下这次停止，同批其余集群保持原状；
-按打印的续跑命令（同一批 `--gpu-cluster-arn`，加 `--approve-profile-plan <plan_sha256> --reference <CHG>`）继续。已纳管却没有自有
+按打印的续跑命令（`gpu-fault-admin join-cluster`，同一批 `--gpu-cluster-arn`，加 `--approve-profile-plan <plan_sha256> --reference <CHG>`）继续。已纳管却没有自有
 Profile、也没有已审批快照的集群（批量 join 计算集群 Profile 之前完成接入的普通 EKS 集群）由 `deploy` 以同样方式为其首个自有版本出计划
 （对照站点 Profile 审核），审批后写入快照并 pin 条目；已 pin 版本的快照缺失仍然拒绝。
+
+**新增集群的接入只能用打印的 `join-cluster` 命令续跑**，由 `deploy --gpu-cluster-arn` 发起的接入也一样，不能改用
+`deploy --approve-profile-plan`（已知限制，执行顺序的修复随后续版本发布）：同时执行应用 release 的 deploy 先按站点 Profile
+核对待审批记录、后接入新集群，这份 `CLUSTER_PROFILE_NEW` 审批在 join 之前就被判为过期并归档为 `SUPERSEDED`，join 随后再次停下、
+写出同一份计划；而已归档的 `plan_sha256` 不能再次审批（`archived Profile approval differs from the active approval`）。不发布
+应用 release 的 deploy 会直接接入并消费审批，但事先无法确定一次 deploy 是否发布。已经这样续跑过的按第 7 节处理。
 
 审批只覆盖它所审的那份计划：计划在被消费前变化（例如需要该版本的集群集合变了），旧审批归档为 `SUPERSEDED`，写出新计划并停止，打印新摘要。
 控制面按版本只保存一份 Profile，记录首次注册它的集群（`cluster_id`）；release 比较已注册的 Profile 时不比较这个注册锚点，所以 join 追加、
@@ -254,6 +260,7 @@ superseded.json
 | 发布已完成但归档收尾失败 | 重跑原四参数deploy；系统以`ALREADY_APPLIED`完成消费 |
 | 提示审批或发布正在进行 | 等待当前进程结束；不删除lock文件 |
 | GPU集群加入或注销 | 使用正式join/remove命令；GPU集合不改变稳定Profile审批身份 |
+| 新增集群的接入用 `deploy --approve-profile-plan` 续跑后审批归档为 `SUPERSEDED`，join 再次停下并打印同一摘要，再次审批被拒（`archived Profile approval differs from the active approval`） | 已知限制（1.2）：同一计划不能再次审批，没有命令能续跑这次接入；不要编辑、移动或删除 `profile-approvals/<plan_sha256>/` 与活动记录，保留 state-dir 交开发团队处理。新增集群一律用停止信息打印的 `join-cluster ... --approve-profile-plan` 续跑 |
 | 集群自有版本上出现 `approved Runtime Profile snapshot ... has a different policy than ...` | 模板策略在已 pin 版本下变化；重跑 `deploy`——它会规划后继版本 `regional-<provider>-<digest12>`（第 1.1 节）并打印续跑命令。不要删除已 pin 的快照 |
 
 ## 8. 禁止操作
