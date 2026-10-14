@@ -23,6 +23,7 @@ from gpu_fault.admin.profile_approval import (
     StaleProfileApprovalError,
     clear_profile_plan,
     consume_profile_approval,
+    pending_cluster_profile_plan,
     profile_plan_path,
     profile_plan_sha256,
     profile_site_identity_sha256,
@@ -570,6 +571,20 @@ def _resolve_profile_approval_state(
 ) -> ProfileApprovalResolution:
     profile_plan_payload = _profile_plan_payload(profile_plan)
     profile_plan_digest = str(profile_plan_payload["plan_sha256"])
+    if not profile_plan.approval_required and pending_cluster_profile_plan(
+        site_file.parent
+    ):
+        # The pending plan moves GPU clusters to a profile version of their
+        # own; it and its approval are the join's (or the deploy's cluster
+        # profile step's), which consumes the approval. The release of
+        # ``deploy --gpu-cluster-arn NEW --approve-profile-plan SHA`` runs
+        # before NEW joins: with no site profile change of its own it leaves
+        # both untouched (it used to archive the approval SUPERSEDED here).
+        return ProfileApprovalResolution(
+            profile_plan=profile_plan,
+            plan_sha256=profile_plan_digest,
+            relation=None,
+        )
     try:
         resolved = resolve_profile_approval(
             site_file.parent,

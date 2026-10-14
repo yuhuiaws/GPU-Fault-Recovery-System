@@ -17,6 +17,10 @@ from gpu_fault.digests import SHA256_PATTERN
 PROFILE_PLAN = Path("release-deploy/profile-plan.json")
 PROFILE_APPROVAL = Path("release-deploy/profile-approval.json")
 PROFILE_APPROVAL_ARCHIVE = Path("release-deploy/profile-approvals")
+#: ``change_kind`` of a plan that moves GPU clusters to their own Runtime
+#: Profile version (``cluster_join_profile``); every other kind is a plan of
+#: the site profile (``scripts/release_deploy_profile.py``).
+CLUSTER_PROFILE_CHANGE_KIND = "CLUSTER_PROFILE_NEW"
 APPROVAL_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{2,127}$")
 RELEASE_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 PLAN_IDENTITY_FIELDS = (
@@ -222,6 +226,38 @@ def clear_profile_plan(state_dir: Path) -> None:
             "cannot clear a Profile plan while an approval is active"
         )
     _unlink(profile_plan_path(state_dir))
+
+
+def pending_cluster_profile_plan(state_dir: Path) -> dict[str, Any] | None:
+    """The pending plan when it is a cluster profile plan, else ``None``.
+
+    Such a plan, and an approval of it, belong to the join (or the deploy's
+    cluster profile step) that wrote it: that step consumes a matching
+    approval or supersedes a stale one, so a site profile resolution with
+    nothing of its own to approve leaves both alone. An unreadable plan is no
+    cluster plan; an approval that is not the pending plan's is refused, as
+    ``resolve_profile_approval`` refuses it.
+    """
+
+    path = profile_plan_path(state_dir)
+    if not path.is_file():
+        return None
+    try:
+        plan, digest = _validated_plan(_read_json(path, "Profile plan"))
+    except ProfileApprovalError:
+        return None
+    if plan.get("change_kind") != CLUSTER_PROFILE_CHANGE_KIND:
+        return None
+    approval_path = profile_approval_path(state_dir)
+    if approval_path.is_file():
+        record = _validated_approval_record(
+            _read_json(approval_path, "Profile approval record")
+        )
+        if record["plan_sha256"] != digest:
+            raise ProfileApprovalError(
+                "Profile approval record does not match the pending plan"
+            )
+    return plan
 
 
 def _archive_initial_approval(

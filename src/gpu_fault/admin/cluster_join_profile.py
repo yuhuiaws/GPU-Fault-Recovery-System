@@ -57,6 +57,7 @@ from gpu_fault.admin.bootstrap_common import (
     profile_node_reboot_owner,
 )
 from gpu_fault.admin.profile_approval import (
+    CLUSTER_PROFILE_CHANGE_KIND,
     ProfileApprovalError,
     StaleProfileApprovalError,
     consume_profile_approval,
@@ -95,7 +96,6 @@ __all__ = [
     "reconcile_cluster_runtime_profiles",
 ]
 
-CLUSTER_PROFILE_CHANGE_KIND = "CLUSTER_PROFILE_NEW"
 PROFILES_DIR = "profiles"
 
 
