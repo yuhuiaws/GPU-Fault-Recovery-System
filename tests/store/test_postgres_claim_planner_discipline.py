@@ -18,24 +18,30 @@ counts are recorded as test properties, never compared as absolutes.
 The fault stream's backlog probe runs outside any claim transaction and takes
 no setting: it is written as the claim window's ordered walk, which stays an
 index walk under the generic plan the plan cache may keep once psycopg has
-prepared the statement (after five executions).
+prepared the statement (after five executions). A dedicated path's claim also
+probes each candidate's lane for a waiting row of a higher priority; under the
+pinned setting and a generic plan that probe is an index read of
+``gpu_fault_processor_queue_lane_rows``.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
 
+from gpu_fault.channel_registry import GPU_METRICS_PATH, NVIDIA_KERNEL_PATH
 from gpu_fault.processor.models import RESERVED_TIER_MAX_PRIORITY
 from gpu_fault.store import PostgresStore
 from gpu_fault.store.postgres.planner_discipline import (
     hot_path_planner_statements,
     pin_hot_path_plans,
 )
+from gpu_fault.store.postgres.processor_claims import _LANE_HEAD_SQL
 from gpu_fault.store.postgres.processor_storage import UNLEASED_FAULT_BACKLOG_SQL
 from tests._builders import processor_request
 from tests.store._postgres_processor_claim_support import REQUEST_LEASE, _truncate
@@ -364,3 +370,125 @@ def test_the_fault_backlog_probe_walks_the_claim_window_under_a_generic_plan(
         f"the probe walks the claim window, not the heap: {scans}"
     )
     assert _widest_queue_read(plan) == 0, "no fault row waits, and none was read"
+
+
+EVIDENCE_NODES = 1000
+
+
+def _seed_evidence_lanes(connection: Any) -> None:
+    """The spool-enabled queue: two P50 gpu evidence rows on every node lane
+    and a P10 fault row ahead of them on every other lane."""
+
+    _truncate()
+    at = datetime.now(timezone.utc)
+    items = []
+    for node in range(EVIDENCE_NODES):
+        body = {"node_id": f"node-{node}", "edge_filter_reasons": ["threshold"]}
+        items += [
+            processor_request(GPU_METRICS_PATH, body=json.dumps(body).encode())
+            for _ in range(2)
+        ]
+        if node % 2 == 0:
+            items.append(
+                processor_request(
+                    NVIDIA_KERNEL_PATH,
+                    body=json.dumps({"node_id": f"node-{node}", "xid": 79}).encode(),
+                )
+            )
+    with connection.cursor() as cursor:
+        with cursor.copy(
+            f"COPY {QUEUE} (request_id, status, cluster_id, correlation_key, "
+            "ordering_key, priority, lane_policy, created_at, updated_at, payload) "
+            "FROM STDIN"
+        ) as copy:
+            for index, item in enumerate(items):
+                created = at - timedelta(seconds=len(items) - index)
+                copy.write_row(
+                    (
+                        item.request_id,
+                        item.status.value,
+                        item.cluster_id,
+                        item.correlation_key,
+                        item.ordering_key(),
+                        item.queue_priority(),
+                        item.lane_policy.value,
+                        created,
+                        created,
+                        item.model_copy(
+                            update={"created_at": created, "updated_at": created}
+                        ).model_dump_json(),
+                    )
+                )
+    connection.execute(f"ANALYZE {QUEUE}")
+
+
+def _explain_generic(connection: Any, sql: str, params: dict, settings: tuple) -> dict:
+    """EXPLAIN ANALYZE of the named-parameter ``sql`` as a generic plan under
+    ``settings``, in a rolled-back transaction."""
+
+    from psycopg import sql as pgsql
+
+    names: list[str] = []
+
+    def positional(match: re.Match[str]) -> str:
+        if match.group(1) not in names:
+            names.append(match.group(1))
+        return f"${names.index(match.group(1)) + 1}"
+
+    prepared = re.sub(r"%\((\w+)\)s", positional, sql)
+
+    def body(conn: Any) -> dict:
+        conn.execute("SET LOCAL plan_cache_mode = force_generic_plan")
+        conn.execute(f"PREPARE dedicated_claim AS {prepared}")
+        try:
+            row = conn.execute(
+                pgsql.SQL(
+                    "EXPLAIN (ANALYZE, BUFFERS, FORMAT JSON) EXECUTE dedicated_claim({})"
+                ).format(pgsql.SQL(", ").join(pgsql.Literal(params[n]) for n in names))
+            ).fetchone()
+        finally:
+            conn.execute("DEALLOCATE dedicated_claim")
+        plan: dict = row[0][0]
+        return plan
+
+    return _in_transaction(connection, settings, body)
+
+
+def test_a_dedicated_claim_probes_its_lane_head_by_index_under_a_generic_plan(
+    store: PostgresStore, connection: Any, request
+) -> None:
+    _seed_evidence_lanes(connection)
+    sql, params = store.claim_active_processor_query(
+        "pod-plan",
+        now=datetime.now(timezone.utc),
+        lease_duration=REQUEST_LEASE,
+        limit=LIMIT,
+        include_paths={GPU_METRICS_PATH},
+    )
+    assert _LANE_HEAD_SQL in sql, "a dedicated path's claim guards its lane head"
+    pinned = hot_path_planner_statements()
+    guarded = _explain_generic(connection, sql, params, pinned)
+    unguarded = _explain_generic(
+        connection, sql.replace(_LANE_HEAD_SQL, ""), params, pinned
+    )
+    head_scans = {
+        (node["Node Type"], node.get("Index Name"))
+        for node in _nodes(guarded)
+        if node.get("Alias") == "head"
+    }
+    request.node.user_properties.extend(
+        [
+            ("guarded_shared_blocks", _shared_blocks(guarded)),
+            ("guarded_execution_ms", round(guarded.get("Execution Time", 0), 2)),
+            ("unguarded_shared_blocks", _shared_blocks(unguarded)),
+            ("unguarded_execution_ms", round(unguarded.get("Execution Time", 0), 2)),
+            ("head_scans", json.dumps(sorted(map(str, head_scans)))),
+        ]
+    )
+
+    assert all(kind != "Seq Scan" for kind, _ in _scans(guarded, QUEUE)), _scans(
+        guarded, QUEUE
+    )
+    assert head_scans and all(
+        name == "gpu_fault_processor_queue_lane_rows" for _, name in head_scans
+    ), f"the lane head is probed through the lane index: {head_scans}"

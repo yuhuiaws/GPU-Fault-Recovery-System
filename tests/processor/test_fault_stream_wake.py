@@ -39,7 +39,12 @@ from typing import Any, Callable
 
 import pytest
 
-from gpu_fault.channel_registry import GPU_METRICS_PATH, HOST_TELEMETRY_PATH
+from gpu_fault.channel_registry import (
+    FABRIC_MANAGER_PATH,
+    GPU_METRICS_PATH,
+    HOST_TELEMETRY_PATH,
+    NVIDIA_KERNEL_PATH,
+)
 from gpu_fault.processor import (
     ProcessorCoordinator,
     ProcessorLeaseSettings,
@@ -74,6 +79,7 @@ def _coordinator(
     host_workers: int,
     poll_seconds: float,
     fallback: float = 5.0,
+    gpu_workers: int = 0,
 ) -> ProcessorCoordinator:
     return ProcessorCoordinator(
         store,
@@ -83,7 +89,7 @@ def _coordinator(
         pools=ProcessorPoolSettings(
             fault_worker_count=fault_workers,
             observation_worker_count=0,
-            gpu_telemetry_worker_count=0,
+            gpu_telemetry_worker_count=gpu_workers,
             host_telemetry_worker_count=host_workers,
         ),
         lease=ProcessorLeaseSettings(
@@ -549,7 +555,7 @@ def _complete_elsewhere(store: Any, holder: Any) -> None:
     assert holder.leader_epoch is not None and holder.lease_token is not None
     store.complete_active_processor_request(
         holder.request_id,
-        "pod-z:1",
+        holder.lease_owner,
         holder.leader_epoch,
         holder.lease_token,
         response_status=200,
@@ -608,6 +614,73 @@ def test_a_lane_blocked_fault_row_keeps_the_fault_busy_ceiling(
         "a fault row behind a held lane is polled every 0.1 s"
     )
     assert store.backlog_reads == 1, "its PENDING row is believed for the hold"
+
+
+ALL_SLOTS_FREE = {"fault": 1, "observation": 0, "gpu": 1, "host": 1}
+
+
+def _lane_round(processor: ProcessorCoordinator, *, fault_backed_off: bool) -> Any:
+    """One claim round with every slot free and every stream due -- or the
+    fault stream still in its 0.1 s backoff."""
+
+    processor._stream_idle_until.clear()
+    if fault_backed_off:
+        processor._stream_idle_until["fault"] = time.monotonic() + 0.1
+    return processor._claim_active_by_pool(
+        ALL_SLOTS_FREE, lease_duration=timedelta(seconds=30)
+    )
+
+
+def _node_lane_row(path: str, **payload: Any) -> Any:
+    return processor_request(
+        path, body=json.dumps({"node_id": "n1", **payload}).encode(), cluster_id="c1"
+    )
+
+
+def test_a_freed_evidence_lane_goes_to_the_fault_row_waiting_on_it(
+    sqlite_store: SqliteStore,
+) -> None:
+    """Spool-enabled bursts put P10 faults and P50 evidence on one node lane.
+    The gpu evidence row finishes while the fault stream sits in its 0.1 s
+    backoff and the host stream is due: the lane belongs to the waiting
+    fault row, so the order is F E F E -- the host evidence used to take it
+    (F E E F), after every evidence row in a burst."""
+
+    nk = _node_lane_row(NVIDIA_KERNEL_PATH, xid=79)
+    gpu_ev = _node_lane_row(GPU_METRICS_PATH, edge_filter_reasons=["threshold"])
+    host_ev = _node_lane_row(HOST_TELEMETRY_PATH, edge_filter_reasons=["threshold"])
+    fm = _node_lane_row(FABRIC_MANAGER_PATH, sxid=12)
+    assert {row.ordering_key() for row in (nk, gpu_ev, host_ev, fm)} == {"c1:node:n1"}
+    for item in (nk, gpu_ev, host_ev):
+        sqlite_store.enqueue_processor_request(item)
+    processor = _coordinator(
+        sqlite_store, fault_workers=1, gpu_workers=1, host_workers=1, poll_seconds=0.1
+    )
+    leased: list[str] = []
+
+    def lane_round(*, fault_backed_off: bool = False) -> list[Any]:
+        rows = list(_lane_round(processor, fault_backed_off=fault_backed_off))
+        leased.extend(row.request_id for row in rows)
+        return rows
+
+    (first,) = lane_round()
+    _complete_elsewhere(sqlite_store, first)
+    (second,) = lane_round()
+    sqlite_store.enqueue_processor_request(fm)
+    _complete_elsewhere(sqlite_store, second)
+    assert lane_round(fault_backed_off=True) == [], (
+        "the host evidence does not take the lane its fault head waits on"
+    )
+    (third,) = lane_round()
+    _complete_elsewhere(sqlite_store, third)
+    lane_round()
+
+    assert leased == [
+        nk.request_id,
+        gpu_ev.request_id,
+        fm.request_id,
+        host_ev.request_id,
+    ]
 
 
 def test_a_backlog_the_store_cannot_count_keeps_the_fault_stream_polling(

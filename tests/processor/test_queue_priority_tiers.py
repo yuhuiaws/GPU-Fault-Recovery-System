@@ -17,6 +17,11 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from gpu_fault.channel_registry import (
+    GPU_METRICS_PATH,
+    NVIDIA_KERNEL_PATH,
+    WORKLOAD_OBSERVATIONS_PATH,
+)
 from gpu_fault.processor.coordinator import ProcessorCoordinator
 from gpu_fault.processor.models import (
     CONTROL_PLANE_ACTION_PRIORITY,
@@ -270,6 +275,95 @@ def test_only_an_unleased_fault_row_is_a_fault_backlog(processor_store) -> None:
     assert processor_store.has_unleased_fault_backlog(now=now) is True, (
         "a deferred PENDING row silences the next row of its key"
     )
+
+
+def _claim(store, now, *, include=None, exclude=None):
+    return store.claim_active_processor_requests(
+        "pod-z:1",
+        now=now,
+        lease_duration=timedelta(seconds=30),
+        limit=8,
+        include_paths=include,
+        exclude_paths=exclude,
+    )
+
+
+@pytest.mark.parametrize("processor_store", ["sqlite", "postgres"], indirect=True)
+def test_a_dedicated_claim_does_not_lease_a_lane_past_its_fault_head(
+    processor_store,
+) -> None:
+    """Spool-enabled bursts put P50 evidence and P10 faults on the same node
+    lane. The gpu stream's claim names only its path, so it leased the lane
+    for its evidence while the fault waited -- after every evidence row."""
+
+    now = datetime.now(timezone.utc)
+    fault = processor_request(
+        NVIDIA_KERNEL_PATH, body=b'{"node_id":"n1","xid":79}', cluster_id="c1"
+    )
+    evidence = processor_request(
+        GPU_METRICS_PATH,
+        body=b'{"node_id":"n1","edge_filter_reasons":["threshold"]}',
+        cluster_id="c1",
+    )
+    for item in (fault, evidence):
+        processor_store.enqueue_processor_request(item)
+    assert fault.ordering_key() == evidence.ordering_key() == "c1:node:n1"
+    assert (fault.queue_priority(), evidence.queue_priority()) == (10, 50)
+
+    assert _claim(processor_store, now, include={GPU_METRICS_PATH}) == []
+    assert processor_store.active_backlog_is_lane_blocked(
+        now=now, include_paths={GPU_METRICS_PATH}
+    ), "a row held behind its lane's head is lane-blocked, not drained"
+    (taken,) = _claim(processor_store, now, exclude={GPU_METRICS_PATH})
+    assert taken.request_id == fault.request_id
+    assert taken.leader_epoch is not None and taken.lease_token is not None
+    processor_store.complete_active_processor_request(
+        taken.request_id,
+        "pod-z:1",
+        taken.leader_epoch,
+        taken.lease_token,
+        response_status=200,
+        response_content_type="application/json",
+        response_body_base64="e30=",
+    )
+    later = datetime.now(timezone.utc)  # the completion released the lane at its clock
+    assert [
+        item.request_id
+        for item in _claim(processor_store, later, include={GPU_METRICS_PATH})
+    ] == [evidence.request_id], "the evidence follows once its head is done"
+
+
+@pytest.mark.parametrize("processor_store", ["sqlite", "postgres"], indirect=True)
+def test_a_workload_observation_still_runs_ahead_of_its_attempt_fault(
+    processor_store,
+) -> None:
+    """The observation interlock holds a correlated fault while an observation
+    of its scope is incomplete, so the observation is exempt from the lane-head
+    guard: holding it behind that fault would hold both forever."""
+
+    now = datetime.now(timezone.utc)
+    xid = processor_request(
+        "/v1/gpu-events/xid",
+        body=b'{"job_id":"j1","attempt_id":"a1","node_id":"n1","xid":79}',
+        cluster_id="c1",
+    )
+    observation = processor_request(
+        WORKLOAD_OBSERVATIONS_PATH,
+        body=b'{"job_id":"j1","attempt_id":"a1"}',
+        cluster_id="c1",
+    )
+    for item in (xid, observation):
+        processor_store.enqueue_processor_request(item)
+    assert xid.ordering_key() == observation.ordering_key() == "c1:attempt:a1"
+    assert xid.queue_priority() < observation.queue_priority()
+
+    assert _claim(processor_store, now, exclude={WORKLOAD_OBSERVATIONS_PATH}) == [], (
+        "the observation interlock holds the attempt fault"
+    )
+    assert [
+        item.request_id
+        for item in _claim(processor_store, now, include={WORKLOAD_OBSERVATIONS_PATH})
+    ] == [observation.request_id]
 
 
 def test_device_events_are_routed_to_the_fault_pool() -> None:

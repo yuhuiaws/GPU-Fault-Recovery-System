@@ -2669,6 +2669,16 @@ expires; only requests whose channel registry entry has
 `latest_wins=true` and priority=100 are created as `REORDERABLE`, allowing later
 safe snapshots in the same lane to pass them. Fault, evidence and control requests always stay `STRICT`.
 
+The lane's priority order also holds across paths. A dedicated pool's claim (GPU or host evidence, training progress)
+names its own path only, so a lane whose head was a row of another path looked free to it: in spool-enabled bursts P50
+GPU/host evidence and P10 device events share the node lane, and the evidence claims re-leased it after each of their
+own rows while the fault waited (P10 completion p50 6.1-6.9 s instead of 1.15 s; evidence took the lane ahead of the P10
+row 90-94% of the time). Such a claim therefore never leases a lane while a `STRICT`, due row of a higher priority waits
+on it, `PENDING` or with a lapsed lease, whatever its path (one probe of `gpu_fault_processor_queue_lane_rows` per
+candidate; `tests/store/test_postgres_claim_planner_discipline.py` pins it as an index read under the generic plan), and
+the lane probe reports such a row as lane-blocked. Workload observations are exempt: the observation interlock runs them
+ahead of the correlated faults they share attempt lanes with, and the guard would hold both.
+
 The same completion batch is first grouped by cluster, and each group is still committed in an independent PostgreSQL transaction.
 `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY` controls whether different cluster groups run in parallel;
 the legal range is `1..min(8, pool_max_size)`; the production value is 1. Values 2/4 are only rolled out gradually after CAP-005's real

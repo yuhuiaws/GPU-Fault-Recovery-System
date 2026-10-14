@@ -4,8 +4,10 @@ import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
+from gpu_fault.channel_registry import WORKLOAD_OBSERVATIONS_PATH
 from gpu_fault.processor import (
     ProcessorLaneLease,
+    ProcessorLanePolicy,
     ProcessorRequestStatus,
     deferred_strict_processor_lanes,
     processor_request_claimable,
@@ -24,6 +26,35 @@ from gpu_fault.store.shared.processor_helpers import (
 from gpu_fault.store.shared.processor_helpers import (
     pending_fault_scope_keys as _pending_fault_scope_keys,
 )
+
+
+def _lane_head_priorities(items: list[Any], now: datetime) -> dict[str, int]:
+    """The best priority waiting on each lane: STRICT rows that are due and
+    PENDING, or LEASED with a lapsed lease (``_LANE_HEAD_SQL`` in the
+    PostgreSQL store). A dedicated path's row is not claimed past them."""
+
+    heads: dict[str, int] = {}
+    for item in items:
+        if item.lane_policy is not ProcessorLanePolicy.STRICT:
+            continue
+        if not item.available_for_claim(now):
+            continue
+        if item.status is not ProcessorRequestStatus.PENDING and not (
+            item.status is ProcessorRequestStatus.LEASED
+            and (item.lease_expires_at is None or item.lease_expires_at <= now)
+        ):
+            continue
+        key = item.ordering_key()
+        priority = item.queue_priority()
+        heads[key] = min(priority, heads.get(key, priority))
+    return heads
+
+
+def _held_by_lane_head(item: Any, heads: dict[str, int]) -> bool:
+    if item.path == WORKLOAD_OBSERVATIONS_PATH:
+        return False
+    priority: int = item.queue_priority()
+    return heads.get(item.ordering_key(), priority) < priority
 
 
 class SqliteProcessorQueueMixin:
@@ -322,8 +353,12 @@ class SqliteProcessorQueueMixin:
                 if not item.waits_for_observation(observation_scope_keys)
             ]
             if include_paths is not None:
+                heads = _lane_head_priorities(items, now)
                 eligible_items = [
-                    item for item in eligible_items if item.path in include_paths
+                    item
+                    for item in eligible_items
+                    if item.path in include_paths
+                    and not _held_by_lane_head(item, heads)
                 ]
             if exclude_paths is not None:
                 eligible_items = [
@@ -418,6 +453,7 @@ class SqliteProcessorQueueMixin:
         lanes = {item.ordering_key: item for item in self._list("processor_lane")}
         items = self._list("processor_request")
         deferred_strict_lanes = deferred_strict_processor_lanes(items, now)
+        heads = _lane_head_priorities(items, now) if include_paths is not None else {}
         for item in items:
             if not processor_request_claimable(
                 item,
@@ -431,5 +467,7 @@ class SqliteProcessorQueueMixin:
                 continue
             lane = lanes.get(item.ordering_key())
             if lane is not None and lane.lease_expires_at > now:
+                return True
+            if include_paths is not None and _held_by_lane_head(item, heads):
                 return True
         return False

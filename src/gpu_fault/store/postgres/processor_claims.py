@@ -11,6 +11,7 @@ from typing import Any, Callable, cast
 from gpu_fault.channel_registry import (
     CHANNEL_REGISTRY,
     FAULT_CHANNEL_PATHS,
+    WORKLOAD_OBSERVATIONS_PATH,
 )
 from gpu_fault.processor.models import (
     ROUTINE_PRIORITY,
@@ -127,6 +128,31 @@ _CLAIM_ELIGIBLE_SQL = """\
 _PATH_EQUALS_SQL = """\
       AND candidate.path={path_literal}
 """
+# A dedicated pool's claim sees its own path only, so a lane whose head is a
+# row of another path -- a P10 fault on the node lane that gpu and host
+# evidence share -- looked free to it, and evidence re-leased the lane after
+# each of its own rows while the fault waited (spool-enabled burst: P10
+# completion p50 6.1-6.9 s). The lane's priority order holds across paths: no
+# row is claimed while a STRICT, due row of a higher priority waits on its
+# lane, PENDING or with a lapsed lease. gpu_fault_processor_queue_lane_rows
+# serves the probe. Workload observations are exempt: the observation
+# interlock deliberately runs them ahead of the correlated faults they share
+# attempt lanes with, and the guard would deadlock against it.
+_LANE_HEAD_ROW_SQL = """
+          SELECT 1
+          FROM gpu_fault_processor_queue AS head
+          WHERE head.ordering_key=candidate.ordering_key
+            AND head.lane_policy='STRICT'
+            AND head.priority < candidate.priority
+            AND (
+                head.status='PENDING'
+                OR (head.status='LEASED' AND head.lease_expires_at <= %(now)s)
+            )
+            AND (head.not_before IS NULL OR head.not_before <= %(now)s)
+"""
+_LANE_HEAD_SQL = f"""\
+      AND NOT EXISTS ({_LANE_HEAD_ROW_SQL}      )
+"""
 _PATH_EXCLUDES_SQL = """\
       AND NOT (
           candidate.path=ANY(%(excluded)s)
@@ -159,6 +185,11 @@ def _path_literal(path: str) -> str:
     if not _PATH_LITERAL_PATTERN.match(path):
         raise ValueError(f"processor claim path is not a route: {path!r}")
     return "'" + path + "'"
+
+
+def _included_path_filter(path: str) -> str:
+    equals = _PATH_EQUALS_SQL.format(path_literal=_path_literal(path))
+    return equals if path == WORKLOAD_OBSERVATIONS_PATH else equals + _LANE_HEAD_SQL
 
 
 def _claim_sub_window(
@@ -198,10 +229,7 @@ def _claim_window_sql(
     included: tuple[str, ...], excluded: bool, seeking: bool
 ) -> tuple[str, str]:
     filters = (
-        tuple(
-            _PATH_EQUALS_SQL.format(path_literal=_path_literal(path))
-            for path in included
-        )
+        tuple(_included_path_filter(path) for path in included)
         if included
         else (_PATH_EXCLUDES_SQL if excluded else "",)
     )
@@ -417,6 +445,70 @@ ORDER BY
     selected.effective_priority,
     selected.created_at,
     selected.request_id
+"""
+
+
+_LANE_BLOCKED_SQL = """
+SELECT EXISTS (
+    SELECT 1
+    FROM gpu_fault_processor_queue AS candidate
+    JOIN gpu_fault_processor_lanes AS lane
+      ON lane.ordering_key=candidate.ordering_key
+    WHERE (
+        candidate.status='PENDING'
+        OR (
+            candidate.status='LEASED'
+            AND candidate.lease_expires_at <= %(now)s
+        )
+    )
+      AND (
+          candidate.not_before IS NULL
+          OR candidate.not_before <= %(now)s
+      )
+      AND NOT EXISTS (
+          SELECT 1
+          FROM gpu_fault_processor_queue AS retry_barrier
+          WHERE retry_barrier.ordering_key
+                = candidate.ordering_key
+            AND retry_barrier.status='PENDING'
+            AND retry_barrier.lane_policy='STRICT'
+            AND retry_barrier.not_before > %(now)s
+      )
+      AND (
+          %(unfiltered)s
+          OR candidate.path=ANY(%(included)s)
+      )
+      AND (
+          %(unexcluded)s
+          OR NOT (
+              candidate.path=ANY(%(excluded)s)
+          )
+      )
+      AND lane.lease_expires_at > %(now)s
+    LIMIT 1
+)
+"""
+# The head-guarded paths' rows that only a higher-priority row of their lane
+# holds back; asked only by a claim that names such paths.
+_HEAD_BLOCKED_SQL = f"""
+OR EXISTS (
+    SELECT 1
+    FROM gpu_fault_processor_queue AS candidate
+    WHERE candidate.path=ANY(%(head_guarded)s)
+      AND (
+          candidate.status='PENDING'
+          OR (
+              candidate.status='LEASED'
+              AND candidate.lease_expires_at <= %(now)s
+          )
+      )
+      AND (
+          candidate.not_before IS NULL
+          OR candidate.not_before <= %(now)s
+      )
+      AND EXISTS ({_LANE_HEAD_ROW_SQL}      )
+    LIMIT 1
+)
 """
 
 
@@ -786,61 +878,24 @@ class PostgresProcessorClaimsMixin:
         plus its inverse - so this answers exactly the question the
         claim's empty result leaves open. ``LIMIT 1`` keeps it O(1) in
         queue depth; the consumer only asks when it is about to sleep.
+        A dedicated path's row held behind a higher-priority row of its
+        lane (``_LANE_HEAD_SQL``) is lane-blocked too: no edge announces
+        the head leaving.
         """
 
         included = sorted(include_paths or ())
         excluded = sorted(exclude_paths or ())
+        head_guarded = [path for path in included if path != WORKLOAD_OBSERVATIONS_PATH]
         with self._db.cursor() as cursor:
             cursor.execute(
-                """
-                SELECT EXISTS (
-                    SELECT 1
-                    FROM gpu_fault_processor_queue AS candidate
-                    JOIN gpu_fault_processor_lanes AS lane
-                      ON lane.ordering_key=candidate.ordering_key
-                    WHERE (
-                        candidate.status='PENDING'
-                        OR (
-                            candidate.status='LEASED'
-                            AND candidate.lease_expires_at <= %s
-                        )
-                    )
-                      AND (
-                          candidate.not_before IS NULL
-                          OR candidate.not_before <= %s
-                      )
-                      AND NOT EXISTS (
-                          SELECT 1
-                          FROM gpu_fault_processor_queue AS retry_barrier
-                          WHERE retry_barrier.ordering_key
-                                = candidate.ordering_key
-                            AND retry_barrier.status='PENDING'
-                            AND retry_barrier.lane_policy='STRICT'
-                            AND retry_barrier.not_before > %s
-                      )
-                      AND (
-                          %s
-                          OR candidate.path=ANY(%s)
-                      )
-                      AND (
-                          %s
-                          OR NOT (
-                              candidate.path=ANY(%s)
-                          )
-                      )
-                      AND lane.lease_expires_at > %s
-                    LIMIT 1
-                )
-                """,
-                (
-                    now,
-                    now,
-                    now,
-                    not included,
-                    included,
-                    not excluded,
-                    excluded,
-                    now,
-                ),
+                _LANE_BLOCKED_SQL + (_HEAD_BLOCKED_SQL if head_guarded else ""),
+                {
+                    "now": now,
+                    "unfiltered": not included,
+                    "included": included,
+                    "unexcluded": not excluded,
+                    "excluded": excluded,
+                    "head_guarded": head_guarded,
+                },
             )
             return bool(cursor.fetchone()[0])
