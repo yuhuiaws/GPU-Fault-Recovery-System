@@ -230,6 +230,9 @@ def test_ha_cleanup_closes_its_own_incident_and_names_a_residual(
         extra["timing"] = SimpleNamespace(
             restore=lambda: dict(baseline), baseline=baseline
         )
+    else:
+        # Where a writer restore would record its evidence (no failover here).
+        extra["case_dir"] = tmp_path
 
     result = module.cleanup_case(
         settings=SimpleNamespace(node=NODE),
@@ -260,7 +263,7 @@ def test_ha_cleanup_closes_its_own_incident_and_names_a_residual(
 
 @pytest.mark.parametrize("module", [ha003, ha004])
 def test_ha_cleanup_without_an_incident_closes_nothing(
-    module: Any, monkeypatch: pytest.MonkeyPatch
+    module: Any, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
     calls: list[dict[str, Any]] = []
     monkeypatch.setattr(module, "close_drill_incident", spy(calls, None))
@@ -270,6 +273,8 @@ def test_ha_cleanup_without_an_incident_closes_nothing(
         extra["timing"] = SimpleNamespace(
             restore=lambda: dict(baseline), baseline=baseline
         )
+    else:
+        extra["case_dir"] = tmp_path
 
     result = module.cleanup_case(
         settings=SimpleNamespace(node=NODE),

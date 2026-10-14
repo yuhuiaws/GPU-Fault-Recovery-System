@@ -46,6 +46,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.e2e.regional import aurora_writer_restore as writer_restore  # noqa: E402
 from scripts.e2e.regional import ha010_verdicts as verdicts  # noqa: E402
 from scripts.e2e.regional import run_ha003_aurora_failover_reset as ha003  # noqa: E402
 from scripts.e2e.regional.aurora_binding import regional_binding  # noqa: E402
@@ -557,13 +558,11 @@ def _prepare_live_run(settings: Settings, run_dir: Path, attempt: int) -> _LiveR
     )
 
 
-def _quiet_control_plane(
-    run: _LiveRun, *, evidence: str = "store-before-failover.json"
-) -> None:
+def _quiet_control_plane(run: _LiveRun) -> None:
     """Refuse the failover while anything is open for this control plane."""
 
     state = run.regional.store_snapshot(queue_attempts=1)
-    write_json_atomic(run.case_dir / evidence, state)
+    write_json_atomic(run.case_dir / "store-before-failover.json", state)
     if (state.get("remote_commands") or {}).get("open_by_cluster"):
         raise RegionalFixtureError(
             "remote commands are open; a failover now is HA-003, not HA-010"
@@ -826,85 +825,18 @@ def execute_case(
     return 0 if result["verdict"] == "PASS" else 1
 
 
-def wait_rds_settled(settings: Settings, *, timeout_seconds: float) -> dict[str, Any]:
-    """Poll RDS until it is ``available`` with one writer."""
-
-    deadline = time.monotonic() + timeout_seconds
-    last: dict[str, Any] = {}
-    while time.monotonic() < deadline:
-        last = rds_snapshot(settings)
-        if last.get("status") == "available" and last.get("writer"):
-            return last
-        time.sleep(5)
-    raise RegionalFixtureError(
-        f"Aurora did not settle before the writer restore: {last}"
-    )
-
-
-def _await_quiet_for_restore(run: _LiveRun) -> None:
-    """The injection's quiet rule, waited out for a bounded time."""
-
-    deadline = time.monotonic() + verdicts.RESTORE_QUIET_WAIT_SECONDS
-    while True:
-        try:
-            _quiet_control_plane(run, evidence="store-before-restore.json")
-            return
-        except RegionalFixtureError as exc:
-            if time.monotonic() >= deadline:
-                raise RegionalFixtureError(
-                    f"writer restore refused: {exc}; {verdicts.RESTORE_REMEDY} "
-                    "once the site is idle"
-                ) from exc
-        time.sleep(verdicts.RESTORE_QUIET_POLL_SECONDS)
-
-
 def restore_writer(run: _LiveRun) -> dict[str, Any]:
-    """Fail the writer back to the instance that wrote before the case.
+    """Fail the writer back to the pre-case instance (``aurora_writer_restore``)."""
 
-    Waits for the injected failover to settle first; a writer that never left
-    is recorded as ``action: none``. Writes ``writer-restore.json`` whatever
-    happens and raises when the placement was not restored.
-    """
-
-    original = str((run.preflight.get("rds") or {}).get("writer") or "")
-    record: dict[str, Any] = {"target": original, "action": "none"}
-    try:
-        settled = wait_rds_settled(
-            run.settings, timeout_seconds=verdicts.RESTORE_TIMEOUT_SECONDS
-        )
-        record["writer_before_restore"] = settled.get("writer")
-        if original and settled.get("writer") != original:
-            _await_quiet_for_restore(run)
-            record.update(
-                action="failover",
-                requested_at=datetime.now(timezone.utc).isoformat(),
-            )
-            record["request"] = ha003.aws_rds(
-                _rds(run.settings),
-                "failover-db-cluster",
-                "--db-cluster-identifier",
-                run.settings.rds_cluster_id,
-                "--target-db-instance-identifier",
-                original,
-            )
-            settled, record["samples"] = ha003.wait_rds_failover(
-                _rds(run.settings),
-                previous_writer=str(settled.get("writer")),
-                timeout_seconds=verdicts.RESTORE_TIMEOUT_SECONDS,
-            )
-            record["restored_at"] = datetime.now(timezone.utc).isoformat()
-        record["rds_after"] = settled
-        record["errors"] = verdicts.placement_restore_errors(
-            record, original_writer=original
-        )
-    except Exception as exc:
-        record["errors"] = [f"{type(exc).__name__}: {exc}"]
-        raise
-    finally:
-        write_json_atomic(run.case_dir / "writer-restore.json", record)
-    if record["errors"]:
-        raise RegionalFixtureError("writer restore: " + "; ".join(record["errors"]))
-    return record
+    return writer_restore.restore_writer(
+        ha003.writer_restore_rds(_rds(run.settings)),
+        original_writer=str((run.preflight.get("rds") or {}).get("writer") or ""),
+        case_dir=run.case_dir,
+        read_state=lambda: run.regional.store_snapshot(queue_attempts=1),
+        sleep=time.sleep,
+        monotonic=time.monotonic,
+        now=lambda: datetime.now(timezone.utc),
+    )
 
 
 def cleanup_case(run: _LiveRun, *, remote_allowed: bool = True) -> dict[str, Any]:

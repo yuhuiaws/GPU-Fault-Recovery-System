@@ -6652,6 +6652,11 @@ These checks add no CLI parameters and do not automatically modify IAM, Secrets,
      busy refusals proven not to have executed are recorded separately from successful actions.
   6. Check the workflow's `step_executions`: the number of `SUCCEEDED` entries for the same
      `step_index`.
+  7. Last in cleanup (after the node restore and the incident close), fail the writer back to the pre-case writer recorded at
+     preflight with the helper HA-010 shares, `scripts/e2e/regional/aurora_writer_restore.py`: wait for RDS to settle
+     (`available` with a single writer), wait for no remote command in flight and an empty fault queue (at most 300 s), call
+     `failover-db-cluster --target-db-instance-identifier <pre-case writer>` and wait for `available` with that instance as the
+     writer; the outcome goes to `writer-restore.json` and to `cleanup.writer_restore` of the case result.
 - Verdict:
   - the GPU reset happens **exactly once** on the physical node (double-confirmed by the Node Agent ledger and the
     journal);
@@ -6673,6 +6678,9 @@ These checks add no CLI parameters and do not automatically modify IAM, Secrets,
     the workflow stays executable and continues after the connection recovers;
   - when the processor's internal replay returns 408/425/429/5xx, the fresh request must release the lane and retry,
     and must not mark COMPLETED with a 500 and silently lose the collector samples.
+  - after cleanup the writer is the pre-case instance again and Aurora is `available` (step 7); a restore that is refused,
+    times out or lands on another member fails the case, and the leftover placement is failed back with
+    `gpu-fault-admin aurora-failback` (`administrator-operations.md` §4.9).
 - Meaning of failure: a database failover causes duplicate physical destructive operations. **Blocks go-live.**
 
 
@@ -7109,7 +7117,8 @@ execution lease; otherwise orphan cleanup could cancel the commands used for the
      `gpu-fault-api-ha` Pod (the sampler of the deleted Pod ends with it and is not counted in the timeline).
   4. Wait for RDS to return to `available` with a changed writer (reusing `HA-003`'s `wait_rds_failover`);
      wait for the replacement Pod to be Ready; collect all sampler output; re-read the Pod status and `/healthz` of the three Deployments.
-  5. In cleanup, fail the writer back to the pre-case writer recorded at preflight: first wait for the injected failover to settle
+  5. In cleanup, fail the writer back to the pre-case writer recorded at preflight (with the helper HA-003 shares,
+     `scripts/e2e/regional/aurora_writer_restore.py`): first wait for the injected failover to settle
      (`available` with a single writer), then, under the injection's own rule (no remote command in flight, empty fault queue, waited
      out for at most 300 s), call `failover-db-cluster --target-db-instance-identifier <pre-case writer>` and wait for `available`
      with that instance as the writer; the outcome goes to `writer-restore.json` and to `cleanup.writer_restore` of the case result.

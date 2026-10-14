@@ -3618,14 +3618,9 @@ test_cases:
   - processor内部重放的新鲜5xx响应释放lane并重试而不是标记COMPLETED
   - 若 failover 落在 reset command 已终态之后，结果记为 INCONCLUSIVE 而不是 PASS
   - reset及failover前重新证明CPU投影凭据和SQL writer绑定指定Aurora incarnation及已提交release；绑定重验后reset窗口仍须开放
+  - 清理最后把 writer 切回 preflight 记录的原 writer（--target-db-instance-identifier，与 HA-010 共用的在途工作规则），Aurora available 且 writer 为原实例，记入 writer-restore.json；切不回即 FAIL
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: f549089ca028420ab4f8d7c8300980c9bbfb5a26d4fc7ea0e81f0dd7bf224e11
-      components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-ha-003
   related_pytest: tests/regional/test_ha_reset_window_fixtures.py::test_ha003_waits_for_reset_claim_before_failover

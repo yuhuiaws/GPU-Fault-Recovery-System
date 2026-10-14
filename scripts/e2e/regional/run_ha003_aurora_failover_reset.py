@@ -17,6 +17,7 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.e2e.regional import aurora_writer_restore as writer_restore  # noqa: E402
 from scripts.e2e.regional import run_destr001_gpu_reset as reset_case  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
@@ -171,6 +172,29 @@ def rds_snapshot(settings: Settings) -> dict[str, Any]:
         "members": members,
         "writer": writers[0] if len(writers) == 1 else None,
     }
+
+
+def writer_restore_rds(settings: Settings) -> writer_restore.WriterRestoreRds:
+    """This module's RDS calls, bound for ``aurora_writer_restore`` (HA-010
+    passes its own settings: the calls read only ``regional.region`` and
+    ``rds_cluster_id``)."""
+
+    return writer_restore.WriterRestoreRds(
+        snapshot=lambda: rds_snapshot(settings),
+        fail_over_to=lambda target: aws_rds(
+            settings,
+            "failover-db-cluster",
+            "--db-cluster-identifier",
+            settings.rds_cluster_id,
+            "--target-db-instance-identifier",
+            target,
+        ),
+        wait_writer_left=lambda previous: wait_rds_failover(
+            settings,
+            previous_writer=previous,
+            timeout_seconds=writer_restore.RESTORE_TIMEOUT_SECONDS,
+        ),
+    )
 
 
 def reset_command_status(state: dict[str, Any]) -> str | None:
@@ -535,7 +559,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "mutation": (
             "execute one real GPU reset and call RDS failover-db-cluster while "
             "the RESET_GPU remote command is observed in flight (LEASED, or "
-            "WAITING on the Node Agent) and before it reaches a terminal state"
+            "WAITING on the Node Agent) and before it reaches a terminal state; "
+            "in cleanup fail the writer back to the pre-case instance"
         ),
         "preflight_identity": {
             "aurora_binding": preflight["aurora_binding"],
@@ -556,6 +581,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "Aurora failover does not change writer and return available",
             "workflow becomes BLOCKED or reset ledger/journal count differs from one",
             "cleanup cannot restore quiesce state or node ownership",
+            "cleanup cannot fail the Aurora writer back to the pre-case instance",
         ],
         "inconclusive_conditions": [
             "no store sample shows the writer changing (or the cluster leaving "
@@ -566,6 +592,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "quiesce_fail_safe_timer_is_independent": True,
             "runner_finally_restores_GPU_services": True,
             "runner_finally_uses_validation_first_node_restore_if_needed": True,
+            "writer_is_failed_back_to_the_pre_case_instance": True,
         },
         "preflight": preflight,
     }
@@ -730,6 +757,8 @@ def cleanup_case(
     incident_id: str,
     run_id: str,
     sampler_started: bool,
+    case_dir: Path,
+    failover_requested: bool = False,
 ) -> dict[str, Any]:
     result: dict[str, Any] = {"errors": []}
     if incident_id:
@@ -802,6 +831,21 @@ def cleanup_case(
                 }
         except Exception as exc:
             result["errors"].append(f"incident close: {type(exc).__name__}: {exc}")
+    if failover_requested:
+        # Last: the node restore above is remote-command work the restore's
+        # quiet rule would otherwise wait out.
+        try:
+            result["writer_restore"] = writer_restore.restore_writer(
+                writer_restore_rds(settings),
+                original_writer=str((preflight.get("rds") or {}).get("writer") or ""),
+                case_dir=case_dir,
+                read_state=lambda: regional.store_snapshot(queue_attempts=1),
+                sleep=time.sleep,
+                monotonic=time.monotonic,
+                now=lambda: datetime.now(timezone.utc),
+            )
+        except Exception as exc:
+            result["errors"].append(f"writer restore: {type(exc).__name__}: {exc}")
     return result
 
 
@@ -947,6 +991,9 @@ def execute_case(
     }
     incident_id = ""
     sampler_started = False
+    # ``requested_at`` is stamped just before the failover call: from then on
+    # the writer may have moved and cleanup restores it.
+    failover_timing: dict[str, Any] = {}
 
     def remember_incident(state: dict[str, Any]) -> None:
         nonlocal incident_id
@@ -1001,9 +1048,7 @@ def execute_case(
         if not incident_id:
             raise RegionalFixtureError("claimed reset has no cleanup incident identity")
         write_json_atomic(case_dir / "reset-claimed.json", claimed_state)
-        failover_timing: dict[str, Any] = {
-            "claim_observed_at": datetime.now(timezone.utc).isoformat()
-        }
+        failover_timing["claim_observed_at"] = datetime.now(timezone.utc).isoformat()
         failover_requested_at, failover = request_bound_failover(
             settings,
             regional,
@@ -1110,6 +1155,8 @@ def execute_case(
                 incident_id=incident_id,
                 run_id=run_id,
                 sampler_started=sampler_started,
+                case_dir=case_dir,
+                failover_requested="requested_at" in failover_timing,
             ),
         )
         result["cleanup"] = cleanup

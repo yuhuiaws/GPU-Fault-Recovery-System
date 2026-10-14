@@ -514,49 +514,6 @@ def test_the_startup_retry_line_is_recognised_but_informational() -> None:
     assert relevant == [lines[1]], relevant
 
 
-def _restore(**overrides: Any) -> dict[str, Any]:
-    record: dict[str, Any] = {
-        "target": "db-1",
-        "action": "failover",
-        "rds_after": {"status": "available", "writer": "db-1"},
-    }
-    record.update(overrides)
-    return record
-
-
-def test_a_writer_back_on_the_pre_case_instance_restores_placement() -> None:
-    assert verdicts.placement_restore_errors(_restore(), original_writer="db-1") == []
-    untouched = _restore(action="none")
-    assert verdicts.placement_restore_errors(untouched, original_writer="db-1") == [], (
-        "a writer that never left needs no failover"
-    )
-
-
-@pytest.mark.parametrize(
-    ("overrides", "original", "fragment"),
-    [
-        ({"rds_after": {"status": "available", "writer": "db-2"}}, "db-1", "db-2"),
-        (
-            {"rds_after": {"status": "failing-over", "writer": "db-1"}},
-            "db-1",
-            "not available",
-        ),
-        ({"rds_after": None}, "db-1", "after the restore"),
-        ({"target": "db-2"}, "db-1", "targeted 'db-2'"),
-        ({}, "", "pre-case writer is unknown"),
-    ],
-)
-def test_a_writer_left_elsewhere_fails_the_case_and_names_the_failback(
-    overrides: dict[str, Any], original: str, fragment: str
-) -> None:
-    errors = verdicts.placement_restore_errors(
-        _restore(**overrides), original_writer=original
-    )
-    assert any(fragment in item for item in errors), _text(errors)
-    if overrides.get("rds_after") and overrides["rds_after"]["writer"] == "db-2":
-        assert "gpu-fault-admin aurora-failback" in _text(errors), _text(errors)
-
-
 def test_the_plan_promises_the_writer_restore() -> None:
     details = ha010.plan_details(
         argparse.Namespace(rds_cluster_id="c", observe_seconds=420),  # type: ignore[arg-type]

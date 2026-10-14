@@ -248,6 +248,11 @@ class RegionalAPI(WindowApi):
         # failover request (reset injected, failover not yet requested) reports
         # a moved writer or a cluster that is not available.
         self.rds_drift_before_failover: str | None = None
+        # The cleanup's writer restore: each named failover reads
+        # ``failing-over`` once, then reports its target as the writer.
+        self.restore_targets: list[str] = []
+        self.restore_reads = 0
+        self.restore_ignored = False
         self.focused_returncode = 0
         self.removed = False
         self.replace_on_delete = False
@@ -323,29 +328,46 @@ class RegionalAPI(WindowApi):
             )
         assert argv[:2] == ["aws", "rds"]
         if argv[2] == "failover-db-cluster":
-            self.events.append("failover-request")
-            self.failover = True
+            if "--target-db-instance-identifier" in argv:
+                target = argv[argv.index("--target-db-instance-identifier") + 1]
+                self.events.append(f"restore-request:{target}")
+                self.restore_targets.append(target)
+                self.restore_reads = 0
+            else:
+                self.events.append("failover-request")
+                self.failover = True
             return subprocess.CompletedProcess(
                 argv, 0, json.dumps({"accepted": True}), ""
             )
         assert argv[2] == "describe-db-clusters"
         self.events.append("rds-describe")
-        if self.failover:
+        if self.restore_targets:
+            self.restore_reads += 1
+        elif self.failover:
             self.rds_reads += 1
         drift = (
             self.rds_drift_before_failover
             if "write-xid46" in self.events and not self.failover
             else None
         )
+        restored = (
+            bool(self.restore_targets)
+            and self.restore_reads >= 2
+            and not self.restore_ignored
+        )
+        settling = (
+            self.restore_reads == 1 if self.restore_targets else (self.rds_reads == 1)
+        )
         cluster = {
             "Status": "failing-over"
-            if self.rds_reads == 1 or drift == "status"
+            if settling or drift == "status"
             else self.rds_status,
             "DBClusterMembers": [
                 {
                     "DBInstanceIdentifier": name,
-                    "IsClusterWriter": (index == 0)
-                    != (self.rds_reads >= 2 or drift == "writer"),
+                    "IsClusterWriter": name == self.restore_targets[-1]
+                    if restored
+                    else (index == 0) != (self.rds_reads >= 2 or drift == "writer"),
                 }
                 for index, name in enumerate(
                     ["old-writer", "new-writer"][: self.rds_members]

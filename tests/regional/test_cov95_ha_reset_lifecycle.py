@@ -261,3 +261,73 @@ def test_executor_pod_uid_race_is_rejected_by_the_conditional_delete(
     assert "delete-owner" not in harness.events
     assert report["cleanup"]["errors"] == []
     assert harness.watchdog.returncode == 0
+
+
+@pytest.fixture
+def aurora(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> ResetHarness:
+    return ResetHarness(monkeypatch, tmp_path, ha003)
+
+
+@pytest.mark.parametrize("node_restore", [False, True], ids=["clean-node", "restore"])
+def test_ha003_cleanup_fails_the_writer_back_last(
+    aurora: ResetHarness, node_restore: bool
+) -> None:
+    if node_restore:
+        # The reset leaves the node owned (preflight refuses a pre-owned one),
+        # so cleanup runs the validated node restore before the writer restore.
+        terminal = aurora.api.wait_for_workflow
+
+        def owned_after_reset(**kwargs: Any) -> dict[str, Any]:
+            aurora.api.node["ownership_annotations"] = {
+                "gpu-fault.io/incident-id": "incident-unit"
+            }
+            return terminal(**kwargs)
+
+        aurora.api.wait_for_workflow = owned_after_reset  # type: ignore[method-assign]
+
+    code, report = aurora.execute()
+
+    assert code == 0 or node_restore, report.get("error", report.get("errors"))
+    assert report["cleanup"]["errors"] == [], report["cleanup"]["errors"]
+    assert aurora.api.restore_targets == ["old-writer"]
+    restore = aurora.events.index("restore-request:old-writer")
+    assert aurora.events.index("failover-request") < restore
+    assert aurora.events.index("host-cleanup") < restore
+    assert ("node-restore" in aurora.events[:restore]) is node_restore, (
+        "the node restore is remote-command work the writer restore follows"
+    )
+    recorded = report["cleanup"]["writer_restore"]
+    assert recorded["action"] == "failover" and recorded["target"] == "old-writer"
+    assert recorded["writer_before_restore"] == "new-writer"
+    assert recorded["rds_after"]["writer"] == "old-writer"
+    evidence = json.loads((aurora.directory / "writer-restore.json").read_text())
+    assert evidence == recorded
+
+
+def test_ha003_fails_when_the_writer_cannot_be_restored(aurora: ResetHarness) -> None:
+    aurora.api.restore_ignored = True
+
+    code, report = aurora.execute()
+
+    assert code == 1 and report["verdict"] == "FAIL"
+    (error,) = [
+        item for item in report["cleanup"]["errors"] if item.startswith("writer")
+    ]
+    assert "Aurora failover did not converge" in error, error
+    evidence = json.loads((aurora.directory / "writer-restore.json").read_text())
+    assert evidence["action"] == "failover" and evidence["errors"], evidence
+
+
+def test_ha003_restores_nothing_when_no_failover_was_requested(
+    aurora: ResetHarness,
+) -> None:
+    aurora.host.failure_at["write-xid46"] = RegionalFixtureError("unit abort")
+
+    code, report = aurora.execute()
+
+    assert code == 1 and "unit abort" in report["error"]
+    assert aurora.api.restore_targets == []
+    assert "writer_restore" not in report["cleanup"]
+    assert not (aurora.directory / "writer-restore.json").exists(), (
+        "nothing moved, so nothing is restored"
+    )

@@ -11,8 +11,8 @@ A replacement Pod deleted into the outage (H-2) comes up through the bounded
 start-up retry instead of CrashLoopBackOff. ``regional_registry.secret_drift``
 is false before and after: the Secret and the durable head agree. The case
 leaves the writer where it found it: its cleanup fails the writer back to the
-pre-case instance (live 2026-10-13 the injected failover left it in another
-zone than every control-plane Pod), and a writer it cannot restore fails it.
+pre-case instance (``aurora_writer_restore``, shared with HA-003), and a writer
+it cannot restore fails it.
 """
 
 from __future__ import annotations
@@ -49,15 +49,6 @@ OBSERVE_SECONDS_DEFAULT = 420
 OBSERVE_SECONDS_BOUNDS = (120, 900)
 FAILOVER_TIMEOUT_SECONDS = 900
 SAMPLE_INTERVAL_SECONDS = 2.0
-# The writer restore: how long it waits for the injected failover to settle and
-# for its own failover, and how long for a quiet control plane before it.
-RESTORE_TIMEOUT_SECONDS = 900
-RESTORE_QUIET_WAIT_SECONDS = 300
-RESTORE_QUIET_POLL_SECONDS = 15.0
-RESTORE_REMEDY = (
-    "fail the writer back with gpu-fault-admin aurora-failback --state-dir "
-    "<state-dir> --reference <change> --confirm AURORA_FAILBACK"
-)
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -363,40 +354,6 @@ def replacement_errors(
             f"replacement Pod {name} took "
             f"{(ready_at - deleted_at).total_seconds():.0f}s to become Ready; "
             f"budget is {budget_seconds:g}s"
-        )
-    return errors
-
-
-def placement_restore_errors(
-    record: dict[str, Any],
-    *,
-    original_writer: str,
-) -> list[str]:
-    """The writer is back on the instance that wrote before the case.
-
-    ``record`` is the runner's restore record: ``target``, ``action`` (``none``
-    when the writer never left, ``failover`` when it was failed back) and
-    ``rds_after``, the RDS snapshot the restore ended on (``status``,
-    ``writer``).
-    """
-
-    errors: list[str] = []
-    if not original_writer:
-        return ["the pre-case writer is unknown, so placement cannot be restored"]
-    if record.get("target") != original_writer:
-        errors.append(
-            f"the restore targeted {record.get('target')!r}, not the pre-case "
-            f"writer {original_writer}"
-        )
-    rds = record.get("rds_after") or {}
-    if rds.get("status") != "available":
-        errors.append(
-            f"Aurora is {rds.get('status')!r} after the writer restore, not available"
-        )
-    if rds.get("writer") != original_writer:
-        errors.append(
-            f"the writer is {rds.get('writer')!r} after the restore, not the "
-            f"pre-case writer {original_writer}; {RESTORE_REMEDY}"
         )
     return errors
 

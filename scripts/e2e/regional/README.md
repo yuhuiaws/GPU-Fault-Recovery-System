@@ -600,11 +600,11 @@ Current classification:
   (`probes/ha010_probe.py`): liveness must stay 200, readiness may only 503 and
   must return within the stale window, no pre-existing container may restart,
   the replacement must not CrashLoop, and `secret_drift` must stay false.
-  Cleanup fails the writer back to the pre-case instance
-  (`--target-db-instance-identifier`, under the injection's quiet rule) and
-  records `writer-restore.json`; a writer it cannot restore fails the case
-  (`gpu-fault-admin aurora-failback` is the operator's exit). Its verdicts
-  live in `ha010_verdicts.py`.
+  Cleanup fails the writer back to the pre-case instance through
+  `aurora_writer_restore.py` (shared with HA-003; `--target-db-instance-identifier`
+  under the injection's quiet rule) and records `writer-restore.json`; a writer
+  it cannot restore fails the case (`gpu-fault-admin aurora-failback` is the
+  operator's exit). Its verdicts live in `ha010_verdicts.py`.
 - BOOT-023 has a reusable manual live driver for the release audit surfaces
   (ARCH-H2/H3/H5). It requires BOOT-020 PASS and the `noop` config that
   `boot020_release_candidates.py configs` materialises, refuses anything that
@@ -687,7 +687,9 @@ Current classification:
 - HA-003/004 have reusable destructive live drivers. HA-003 triggers Aurora
   failover only after the real RESET_GPU command is observed in flight (LEASED,
   or WAITING while the Node Agent executes) and is `INCONCLUSIVE` rather than
-  PASS when the failover provably landed after the command was terminal. HA-004
+  PASS when the failover provably landed after the command was terminal; last
+  in cleanup it fails the writer back to the pre-case instance through
+  `aurora_writer_restore.py`, and a writer it cannot restore fails it. HA-004
   opens the 10s/2s lease/poll window on the two-replica executor Deployment
   through `executor_env_window.py`, arms a detached rollback watchdog, force
   deletes the first command owner and requires the same command ID to be
