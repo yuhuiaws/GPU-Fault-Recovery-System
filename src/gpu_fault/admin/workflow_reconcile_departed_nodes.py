@@ -21,24 +21,52 @@ it (no import cycle).
 from __future__ import annotations
 
 import json
-import re
 from datetime import datetime, timezone
 from typing import Any, Callable, Mapping, Sequence
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.diagnostics import diagnostic_text
 
-EKS_PROVIDER = "eks-managed"
-HYPERPOD_PROVIDER = "hyperpod"
-# HyperPod names an EKS node after its EC2 instance.
-HYPERPOD_NODE_NAME = re.compile(r"^hyperpod-(i-[0-9a-f]{8,17})$")
+# The verdicts are the shared rule (``gpu_fault.departed_nodes``), which the
+# control plane's departed-node cleanup judges with too; the names stay
+# importable from here for the reconcile paths and the release engine.
+from gpu_fault.departed_nodes import (
+    EC2_SOURCE,
+    EKS_PROVIDER,
+    HYPERPOD_NODE_NAME,
+    HYPERPOD_PROVIDER,
+    INSTANCE_ID,
+    NO_HYPERPOD_INSTANCE_BLOCKER,
+    NO_RECORDED_INSTANCE_BLOCKER,
+    NOT_FOUND,
+    TERMINATED,
+    cluster_provider_of,
+    ec2_state_blocker,
+    hyperpod_instance_id,
+    hyperpod_listing_blocker,
+    provider_lookup_blocker,
+    recorded_instance_id,
+)
+
+__all__ = [
+    "EC2_SOURCE",
+    "EKS_PROVIDER",
+    "HYPERPOD_NODE_NAME",
+    "HYPERPOD_PROVIDER",
+    "INSTANCE_ID",
+    "NOT_FOUND",
+    "TERMINATED",
+    "RecordedInstanceIds",
+    "cluster_provider_of",
+    "departed_node_evidence",
+    "ec2_instance_states",
+    "hyperpod_departed_node_evidence",
+    "hyperpod_instance_ids",
+    "recorded_instance_ids",
+]
+
 # Pages of ``list-cluster-nodes`` read before the lookup is declared broken.
 HYPERPOD_INVENTORY_PAGE_LIMIT = 100
-#: The source key of this proof under ``sources`` and ``read_at``.
-EC2_SOURCE = "ec2"
-INSTANCE_ID = re.compile(r"^i-[0-9a-f]{8,17}$")
-NOT_FOUND = "not-found"
-TERMINATED = "terminated"
 #: The cache slot a failed lookup occupies for its cluster.
 LOOKUP_ERROR = "__error__"
 
@@ -61,12 +89,6 @@ for node_id in payload["node_ids"]:
     instance_ids[node_id] = record.node_instance_id
 print(json.dumps({"mode": "agent-instance-ids", "instance_ids": instance_ids}))
 """
-
-
-def cluster_provider_of(target: Mapping[str, Any]) -> str:
-    """The site's ``provider`` for a cluster entry; absent means HyperPod."""
-
-    return str(target.get("provider") or HYPERPOD_PROVIDER).strip() or HYPERPOD_PROVIDER
 
 
 def recorded_instance_ids(
@@ -95,12 +117,7 @@ def recorded_instance_ids(
     if not isinstance(values, dict):
         raise BootstrapError("agent instance ids from the control plane are invalid")
     return {
-        str(node_id): (
-            value.strip()
-            if isinstance(value, str) and INSTANCE_ID.fullmatch(value.strip())
-            else None
-        )
-        for node_id, value in values.items()
+        str(node_id): recorded_instance_id(value) for node_id, value in values.items()
     }
 
 
@@ -213,14 +230,10 @@ def departed_node_evidence(
     """
 
     base = {**missing, "provider": EKS_PROVIDER, "instance_id": instance_id}
-    if not instance_id or not INSTANCE_ID.fullmatch(instance_id):
+    if not instance_id or recorded_instance_id(instance_id) is None:
         return {
             **base,
-            "blockers": [
-                *missing["blockers"],
-                "provider membership unknown: the fleet recorded no EC2 "
-                "instance id for the node (Agent node_instance_id)",
-            ],
+            "blockers": [*missing["blockers"], NO_RECORDED_INSTANCE_BLOCKER],
         }
     try:
         state = _state_of(
@@ -235,9 +248,10 @@ def departed_node_evidence(
     except BootstrapError as exc:
         return {
             **base,
-            "blockers": [*missing["blockers"], f"provider membership unknown: {exc}"],
+            "blockers": [*missing["blockers"], provider_lookup_blocker(exc)],
         }
-    if state in {NOT_FOUND, TERMINATED}:
+    blocker = ec2_state_blocker(instance_id, state)
+    if blocker is None:
         return {
             "node_id": node_id,
             "exists": False,
@@ -256,9 +270,7 @@ def departed_node_evidence(
         "ec2_state": state,
         "absent_from_provider": False,
         "restored": False,
-        "blockers": [
-            f"node is missing from Kubernetes but EC2 instance {instance_id} is {state}"
-        ],
+        "blockers": [blocker],
     }
 
 
@@ -357,17 +369,12 @@ def hyperpod_departed_node_evidence(
     its failure) per cluster, ``read_at`` records it under ``hyperpod``.
     """
 
-    match = HYPERPOD_NODE_NAME.fullmatch(node_id)
-    if match is None:
+    instance_id = hyperpod_instance_id(node_id)
+    if instance_id is None:
         return {
             **missing,
-            "blockers": [
-                *missing["blockers"],
-                "provider membership unknown: node name carries no HyperPod "
-                "instance id",
-            ],
+            "blockers": [*missing["blockers"], NO_HYPERPOD_INSTANCE_BLOCKER],
         }
-    instance_id = match.group(1)
     inventory = provider_inventories.get(cluster_id)
     if inventory is None:
         if read_at is not None:
@@ -383,12 +390,10 @@ def hyperpod_departed_node_evidence(
         return {
             **missing,
             "instance_id": instance_id,
-            "blockers": [
-                *missing["blockers"],
-                f"provider membership unknown: {inventory}",
-            ],
+            "blockers": [*missing["blockers"], provider_lookup_blocker(inventory)],
         }
-    if instance_id in inventory:
+    listed = hyperpod_listing_blocker(instance_id, inventory)
+    if listed is not None:
         return {
             "node_id": node_id,
             "exists": False,
@@ -396,10 +401,7 @@ def hyperpod_departed_node_evidence(
             "instance_id": instance_id,
             "absent_from_provider": False,
             "restored": False,
-            "blockers": [
-                "node is missing from Kubernetes but HyperPod still lists "
-                f"instance {instance_id}"
-            ],
+            "blockers": [listed],
         }
     return {
         "node_id": node_id,

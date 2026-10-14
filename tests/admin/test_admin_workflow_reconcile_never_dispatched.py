@@ -517,6 +517,20 @@ def _exec_script(
     return json.loads(capsys.readouterr().out)
 
 
+@pytest.fixture(params=["shared", "inline"])
+def close_path(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """The Pod closes through the shared write
+    (``workflow_reconcile.close_never_dispatched_workflow``, which the control
+    plane's departed-node cleanup uses too) or, on an image from before it,
+    through the script's inline copy; both must answer the same."""
+
+    if request.param == "inline":
+        import gpu_fault.workflow_reconcile as runtime
+
+        monkeypatch.delattr(runtime, "close_never_dispatched_workflow")
+    return str(request.param)
+
+
 def _control_plane(now: datetime) -> Any:
     """An in-memory control plane with the stuck record and its neighbours."""
 
@@ -619,7 +633,7 @@ def _evidence(
 
 
 def test_the_bridge_closes_the_record_and_hands_the_incident_to_the_operator(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], close_path: str
 ) -> None:
     """``apply-never-dispatched`` against an in-memory control plane: the rule
     re-derived minus the proof the evidence answers, the compare-and-set on
@@ -740,7 +754,7 @@ def test_the_bridge_closes_the_record_and_hands_the_incident_to_the_operator(
 
 
 def test_the_bridge_refuses_a_record_that_moved_under_the_approval(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], close_path: str
 ) -> None:
     from gpu_fault.models import WorkflowStatus
 

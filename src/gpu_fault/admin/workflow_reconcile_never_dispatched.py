@@ -32,11 +32,21 @@ from __future__ import annotations
 
 from typing import Any
 
-from gpu_fault.admin.workflow_reconcile_departed_nodes import (
-    EC2_SOURCE,
-    EKS_PROVIDER,
-)
+# The per-node evidence is the shared departed-node rule's
+# (``gpu_fault.departed_nodes``): the control plane's cleanup binds the same
+# shape to the same close.
+from gpu_fault.departed_nodes import KUBERNETES_PRESENT_BLOCKER, node_evidence
 from gpu_fault.workflow_resolution import DEPARTED_NODE_PROOF_REASON
+
+__all__ = [
+    "BRIDGE_MODE",
+    "KUBERNETES_PRESENT_BLOCKER",
+    "NEVER_DISPATCHED",
+    "SCRIPT_TAIL",
+    "bridge_entry",
+    "node_evidence",
+    "promote_never_dispatched",
+]
 
 NEVER_DISPATCHED = "never-dispatched"
 BRIDGE_MODE = "apply-never-dispatched"
@@ -46,10 +56,6 @@ NOT_BLOCKED_REASON = "workflow status is PENDING, not BLOCKED"
 # Read times are reported beside the evidence and left out of the digest: the
 # verdicts (present/listed) bind the approval, the clock does not.
 DIGEST_EXCLUDED_ITEM_FIELDS = frozenset({"evidence_read_at"})
-KUBERNETES_PRESENT_BLOCKER = (
-    "node is still in Kubernetes; a never-dispatched record is closed only "
-    "for a node that left Kubernetes and HyperPod"
-)
 
 # Appended to ``workflow_reconcile.RECONCILE_SCRIPT``'s mode chain, which ends
 # with ``result = None`` for a mode it does not know; the chain's end -- the
@@ -64,6 +70,12 @@ try:
     from gpu_fault.workflow_reconcile import never_dispatched_plan_items
 except ImportError:  # the deployed planner predates the shape
     never_dispatched_plan_items = None
+try:
+    # The write the control plane's departed-node cleanup makes too; an image
+    # from before it applies with the inline copy below.
+    from gpu_fault.workflow_reconcile import close_never_dispatched_workflow
+except ImportError:
+    close_never_dispatched_workflow = None
 try:
     from gpu_fault.workflow_resolution import never_dispatched_reconciliation_reasons
 except ImportError:
@@ -291,6 +303,21 @@ elif payload["mode"] == "apply-never-dispatched":
     for item in payload["items"]:
         request_id = item["request_id"]
         try:
+            if close_never_dispatched_workflow is not None:
+                _closed, closed_incident, closed_warnings = (
+                    close_never_dispatched_workflow(
+                        store,
+                        item,
+                        reference=payload["reference"],
+                        actor=payload.get("actor"),
+                        admin_plan_sha256=payload.get("admin_plan_sha256"),
+                        now=now,
+                    )
+                )
+                applied.append(request_id)
+                incidents.add(closed_incident.incident_id)
+                warnings.extend(closed_warnings)
+                continue
             workflow = store.get_workflow(request_id)
             incident = store.get_incident(workflow.incident_id)
             if workflow.fencing_token != item["fencing_token"]:
@@ -444,63 +471,6 @@ elif payload["mode"] == "apply-never-dispatched":
         "records_deleted": 0,
     }
 """
-
-
-def node_evidence(
-    node_id: str,
-    *,
-    departed: dict[str, Any] | None,
-    target: dict[str, Any],
-    aws_region: object,
-) -> dict[str, Any]:
-    """The per-node evidence of a never-dispatched item.
-
-    ``departed`` is ``workflow_reconcile._departed_node_evidence`` for a node
-    Kubernetes no longer has, ``None`` while it still has it. Unlike a
-    ``never-changed`` item, a node that is present is a blocker here whatever
-    its scheduling state: the record is closed for a node that is *gone*, not
-    for one that is clean. ``sources`` names what was consulted (``target`` is
-    the site's cluster entry, for the provider cluster name and region) and
-    what each said; a source that could not be read says so instead of
-    answering. The provider source is ``hyperpod`` (``list-cluster-nodes``)
-    or, on an ``eks-managed`` cluster, ``ec2`` (``describe-instances`` for the
-    recorded instance id).
-    """
-
-    if departed is None:
-        return {
-            "node_id": node_id,
-            "exists": True,
-            "absent_from_kubernetes": False,
-            "absent_from_provider": False,
-            "restored": False,
-            "blockers": [KUBERNETES_PRESENT_BLOCKER],
-            "sources": {"kubernetes": {"consulted": True, "present": True}},
-        }
-    eks_managed = departed.get("provider") == EKS_PROVIDER
-    provider: dict[str, Any] = {
-        "consulted": "absent_from_provider" in departed,
-        "cluster_name": (
-            str(target.get("cluster_id") or "").strip()
-            if eks_managed
-            else str(target.get("hyperpod_cluster_name") or "").strip()
-        )
-        or None,
-        "region": str(target.get("region") or aws_region or "").strip() or None,
-    }
-    if "absent_from_provider" in departed:
-        provider["listed"] = not bool(departed["absent_from_provider"])
-    if eks_managed and "ec2_state" in departed:
-        provider["state"] = departed["ec2_state"]
-    return {
-        **departed,
-        "absent_from_kubernetes": True,
-        "absent_from_provider": bool(departed.get("absent_from_provider", False)),
-        "sources": {
-            "kubernetes": {"consulted": True, "present": False},
-            (EC2_SOURCE if eks_managed else "hyperpod"): provider,
-        },
-    }
 
 
 def promote_never_dispatched(item: dict[str, Any]) -> None:

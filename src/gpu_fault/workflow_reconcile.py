@@ -16,11 +16,13 @@ from gpu_fault.execution.restart_budget_preflight import (
 from gpu_fault.models import (
     BlockedKind,
     FaultIncident,
+    IncidentState,
     RecoveryPlan,
     WorkflowEventKind,
     WorkflowRequest,
     WorkflowStatus,
     WorkflowStepStatus,
+    bounded_reasons,
     build_operator_event,
 )
 from gpu_fault.remote_command_models import RemoteCommandStatus
@@ -34,6 +36,7 @@ from gpu_fault.retired_generation import (
 from gpu_fault.store import NotFoundError
 from gpu_fault.store.contracts import ControlPlaneStore
 from gpu_fault.workflow_resolution import (
+    DEPARTED_NODE_PROOF_REASON,
     NEVER_DISPATCHED_GUARD_AGE,
     NODE_RESTORE_PROOF_REASON,
     OPEN_REMOTE_STATUSES,
@@ -225,6 +228,166 @@ def never_dispatched_plan_items(
             }
         )
     return items, report
+
+
+# The incident states a never-dispatched close hands to the operator: nobody
+# is going to act on the incident's behalf any more.
+_NEVER_DISPATCHED_HANDED_STATES = frozenset(
+    {
+        IncidentState.DETECTED,
+        IncidentState.ACTION_PENDING,
+        IncidentState.SAFETY_PENDING,
+    }
+)
+
+
+def _flat_departed_evidence(node: Mapping[str, Any]) -> dict[str, Any]:
+    """One node's departed evidence as one flat event record.
+
+    Event details are bounded two levels deep; the source (``hyperpod`` on
+    HyperPod, ``ec2`` on an eks-managed cluster), its verdict and read time
+    stay legible flattened.
+    """
+
+    sources = node.get("sources") or {}
+    provider = sources.get("hyperpod") or sources.get("ec2") or {}
+    read_at = node.get("read_at") or {}
+    return {
+        "node_id": node["node_id"],
+        "instance_id": node.get("instance_id"),
+        "provider": node.get("provider"),
+        "absent_from_kubernetes": True,
+        "absent_from_provider": True,
+        "hyperpod_cluster_name": provider.get("cluster_name"),
+        "region": provider.get("region"),
+        "kubernetes_read_at": read_at.get("kubernetes"),
+        "hyperpod_read_at": read_at.get("hyperpod") or read_at.get("ec2"),
+    }
+
+
+def close_never_dispatched_workflow(
+    store: ControlPlaneStore,
+    item: Mapping[str, Any],
+    *,
+    reference: str,
+    actor: str | None,
+    admin_plan_sha256: str | None,
+    now: datetime,
+) -> tuple[WorkflowRequest, FaultIncident, list[str]]:
+    """Close one never-dispatched PENDING record whose node departed.
+
+    The ``apply-never-dispatched`` write of ``workflow-reconcile`` and the
+    departed-node cleanup's, one definition: ``item`` is the bridge entry
+    (``request_id``, the ``fencing_token``/``execution_epoch``/
+    ``workflow_created_at`` the approval bound, ``departed_node_evidence``
+    per node). The rule is re-derived on ``now``
+    (``never_dispatched_reconciliation_reasons`` minus the departed-node proof
+    reason the evidence answers), the evidence must prove every node gone and
+    name exactly the incident's node set, and the record is written with
+    ``amend_workflow`` carrying the ``OPERATOR_RECONCILED`` event, then the
+    incident through a compare-and-set ``save_incident`` that hands it to the
+    operator (ESCALATED) with the same audit line. Returns the closed record,
+    the incident as it was read and the restart-reservation warnings; raises
+    ``ValueError`` naming what refused it.
+    """
+
+    request_id = str(item["request_id"])
+    workflow = store.get_workflow(request_id)
+    incident = store.get_incident(workflow.incident_id)
+    if workflow.fencing_token != item["fencing_token"]:
+        raise ValueError(
+            f"workflow fencing token changed: expected {item['fencing_token']}, "
+            f"found {workflow.fencing_token}"
+        )
+    if workflow.execution_epoch != item["execution_epoch"]:
+        raise ValueError(
+            "workflow execution epoch changed: expected "
+            f"{item['execution_epoch']}, found {workflow.execution_epoch}"
+        )
+    if workflow.created_at.isoformat() != item["workflow_created_at"]:
+        raise ValueError(
+            "workflow created_at changed: expected "
+            f"{item['workflow_created_at']}, found {workflow.created_at.isoformat()}"
+        )
+    reasons = [
+        reason
+        for reason in never_dispatched_reconciliation_reasons(
+            workflow,
+            incident,
+            store.list_remote_commands(workflow_request_ids=[request_id]),
+            evaluated_at=now,
+        )
+        if reason != DEPARTED_NODE_PROOF_REASON
+    ]
+    if reasons:
+        raise ValueError("; ".join(reasons))
+    evidence = list(item["departed_node_evidence"])
+    proven = sorted(
+        str(node["node_id"])
+        for node in evidence
+        if node.get("absent_from_kubernetes") is True
+        and node.get("absent_from_provider") is True
+    )
+    if not proven or proven != sorted(str(node["node_id"]) for node in evidence):
+        raise ValueError("departed-node evidence does not prove every node gone")
+    if proven != sorted(incident.node_ids):
+        raise ValueError(
+            "incident node set changed: evidence covers "
+            f"{proven}, incident names {sorted(incident.node_ids)}"
+        )
+    provider_label = (
+        "EC2"
+        if any(node.get("provider") == "eks-managed" for node in evidence)
+        else "HyperPod"
+    )
+    audit = (
+        f"operator reconciliation {reference}: closed "
+        f"{request_id}, never dispatched, after its node left "
+        f"Kubernetes and {provider_label} ({', '.join(proven)})"
+    )
+    superseded = workflow.model_copy(update={"status": WorkflowStatus.SUPERSEDED})
+    amended = store.amend_workflow(
+        request_id,
+        {
+            "status": WorkflowStatus.SUPERSEDED,
+            "preempted_by_workflow_id": None,
+            "preemption_reason": audit,
+            "superseded_at": now,
+        },
+        event=build_operator_event(
+            superseded,
+            WorkflowEventKind.OPERATOR_RECONCILED,
+            actor=actor,
+            reference=reference,
+            previous_status=workflow.status,
+            at=now,
+            details={
+                "terminalization": NEVER_DISPATCHED,
+                "expected_fencing_token": item["fencing_token"],
+                "expected_execution_epoch": item["execution_epoch"],
+                "admin_plan_sha256": admin_plan_sha256,
+                "departed_node_evidence": [
+                    _flat_departed_evidence(node) for node in evidence
+                ],
+            },
+        ),
+    )
+    updates: dict[str, Any] = {
+        "reasons": bounded_reasons([*incident.reasons, audit]),
+        "updated_at": now,
+    }
+    if incident.state in _NEVER_DISPATCHED_HANDED_STATES:
+        updates["state"] = IncidentState.ESCALATED
+    store.save_incident(incident.model_copy(update=updates), expected=incident)
+    warnings: list[str] = []
+    try:
+        release_unattempted_restart_reservations(store, amended)
+    except Exception as exc:  # noqa: BLE001 -- the row is terminal; a warning
+        warnings.append(
+            f"{request_id}: closed, but releasing its restart "
+            f"reservations failed ({type(exc).__name__}: {exc})"
+        )
+    return amended, incident, warnings
 
 
 def operator_confirmed_node_actions(workflow: WorkflowRequest) -> list[dict[str, Any]]:

@@ -36,7 +36,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -47,14 +47,35 @@ from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.site import RenderedSite
 
+# The guard, the retireable states and the eligibility rule are the shared
+# departed-node rule (``gpu_fault.departed_nodes``) the control plane's
+# automatic cleanup applies too.
+from gpu_fault.departed_nodes import (
+    DEPARTED_AGENT_GUARD_AGE,
+    GUARD_REASON,
+    RETIREABLE_LIFECYCLES,
+    agent_retirement_reasons,
+)
+
+__all__ = [
+    "AGENT_SCRIPT",
+    "DEPARTED_AGENT_GUARD_AGE",
+    "GUARD_REASON",
+    "RETIREABLE_LIFECYCLES",
+    "RETIRE_DEPARTED_AGENTS",
+    "add_arguments",
+    "agent_node_evidence",
+    "apply_entry",
+    "conflicting_flags",
+    "retire_departed_agents_command",
+    "run_retire_departed_agents",
+]
+
 RETIRE_DEPARTED_AGENTS = "retire-departed-agents"
-DEPARTED_AGENT_GUARD_AGE = timedelta(minutes=10)
 HISTORY_PATH = Path("workflow-reconcile/departed-agents")
 # Read times are reported beside the evidence and left out of the digest: the
 # verdicts (present/listed) and the record's keys bind the approval.
 DIGEST_EXCLUDED_ITEM_FIELDS = frozenset({"evidence_read_at"})
-RETIREABLE_LIFECYCLES = frozenset({"ACTIVE", "DRAINING"})
-GUARD_REASON = "agent heartbeat is younger than the 10-minute departure guard"
 NO_RECORD_REASON = "no Agent record in the fleet"
 KUBERNETES_PRESENT_REASON = (
     "node is still in Kubernetes; an Agent is retired only for a node that "
@@ -87,6 +108,13 @@ from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app import ApplicationContext
 from gpu_fault.fleet import AgentLifecycleState, AgentTransitionRequest
+
+try:
+    # The shared retirement the control plane's departed-node cleanup uses;
+    # an image from before it runs the inline copy below.
+    from gpu_fault.departed_nodes import retire_departed_agent, retirement_audit
+except ImportError:
+    retire_departed_agent = retirement_audit = None
 
 payload = json.load(sys.stdin)
 context = ApplicationContext.from_environment()
@@ -130,6 +158,40 @@ elif payload["mode"] == "retire-departed-agents":
     for item in payload["items"]:
         key = f"{item['cluster_id']}/{item['node_id']}"
         try:
+            if retire_departed_agent is not None:
+                evidence = item["departed_node_evidence"]
+                recorded = store.get_agent(item["cluster_id"], item["node_id"])
+                revoked = retire_departed_agent(
+                    registry,
+                    store,
+                    cluster_id=item["cluster_id"],
+                    node_id=item["node_id"],
+                    expected_generation=item["generation"],
+                    expected_lifecycle=item["lifecycle_state"],
+                    expected_last_seen_at=datetime.fromisoformat(
+                        str(item["last_seen_at"]).replace("Z", "+00:00")
+                    ),
+                    evidence=evidence,
+                    transition_id=payload["transition_id"],
+                    reason=retirement_audit(
+                        reference=payload["reference"],
+                        node_id=item["node_id"],
+                        evidence=evidence,
+                        recorded_instance=str(recorded.node_instance_id or ""),
+                        actor=payload.get("actor"),
+                        plan_sha256=payload.get("admin_plan_sha256"),
+                    ),
+                    now=now,
+                )
+                retired.append(
+                    {
+                        "agent": key,
+                        "generation": revoked.generation,
+                        "transition_id": revoked.transition_id,
+                        "lifecycle_state": revoked.lifecycle_state.value,
+                    }
+                )
+                continue
             current = store.get_agent(item["cluster_id"], item["node_id"])
             if current.generation != item["generation"]:
                 raise ValueError(
@@ -379,19 +441,12 @@ def _plan_item(
         **{field: agent.get(field) for field in RECORD_FIELDS},
         "terminalization": RETIRE_DEPARTED_AGENTS,
     }
-    reasons: list[str] = []
-    lifecycle = str(agent.get("lifecycle_state") or "")
-    if lifecycle not in RETIREABLE_LIFECYCLES:
-        reasons.append(f"agent lifecycle state is {lifecycle or 'unknown'}")
-    last_seen = agent.get("last_seen_at")
-    try:
-        seen_at = datetime.fromisoformat(str(last_seen))
-    except ValueError:
-        seen_at = None
-    if seen_at is None or seen_at.tzinfo is None:
-        reasons.append("agent last_seen_at is missing or not timezone-aware")
-    elif seen_at > evaluated_at - DEPARTED_AGENT_GUARD_AGE:
-        reasons.append(GUARD_REASON)
+    reasons = agent_retirement_reasons(
+        agent.get("lifecycle_state"),
+        agent.get("last_seen_at"),
+        agent.get("lease_expires_at"),
+        evaluated_at=evaluated_at,
+    )
     if cluster_id not in {
         str(entry["cluster_id"]) for entry in site.release_config["clusters"]
     }:

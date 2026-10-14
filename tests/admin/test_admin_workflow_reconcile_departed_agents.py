@@ -510,6 +510,19 @@ def test_a_discovery_with_nothing_eligible_writes_nothing(
 # ----------------------------------------------------------- the in-Pod script
 
 
+@pytest.fixture(params=["shared", "inline"])
+def retire_path(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch) -> str:
+    """The Pod retires through the shared write (``departed_nodes``, which the
+    control plane's departed-node cleanup uses too) or, on an image from before
+    it, through the script's inline copy; both must answer the same."""
+
+    if request.param == "inline":
+        import gpu_fault.departed_nodes as shared
+
+        monkeypatch.delattr(shared, "retire_departed_agent")
+    return str(request.param)
+
+
 def _record(node_id: str, now: datetime, **overrides: Any) -> AgentRecord:
     values: dict[str, Any] = {
         "cluster_id": "gpu-a",
@@ -627,7 +640,9 @@ def test_the_inventory_lists_every_record_with_its_keys(
 
 
 def test_the_script_retires_through_drain_and_revoke_with_the_evidence(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    retire_path: str,
 ) -> None:
     """The compare-and-set on generation, lifecycle and ``last_seen_at``, the
     guard re-checked on the Pod's clock, the evidence re-checked, the audit
@@ -735,7 +750,9 @@ def test_the_script_retires_through_drain_and_revoke_with_the_evidence(
 
 
 def test_the_script_accepts_the_inventory_spelling_of_the_heartbeat(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    retire_path: str,
 ) -> None:
     """The plan carries ``last_seen_at`` as the inventory serialized it (JSON
     ``Z`` suffix) while the record yields ``+00:00``; the compare-and-set must
@@ -777,7 +794,9 @@ def test_the_script_accepts_the_inventory_spelling_of_the_heartbeat(
 
 
 def test_a_record_whose_instance_field_is_a_node_uid_is_still_retired(
-    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    retire_path: str,
 ) -> None:
     """On HyperPod/EKS the registration stores the Kubernetes Node UID in
     ``node_instance_id``; it is not comparable with the EC2 instance id of the
