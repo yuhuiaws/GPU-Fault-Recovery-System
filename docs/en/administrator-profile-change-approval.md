@@ -135,9 +135,9 @@ started it, never with `deploy --approve-profile-plan` (a known limitation; the 
 release): a deploy that also runs an application release checks the pending approval against the site profile before it
 joins the new cluster, so the `CLUSTER_PROFILE_NEW` approval is judged stale and archived as `SUPERSEDED` before the
 join runs; the join then stops again and writes the same plan, and an archived `plan_sha256` cannot be approved again
-(`archived Profile approval differs from the active approval`). A deploy that runs no application release does join the
-cluster and consume the approval, but whether a deploy releases cannot be known beforehand. If a join was already
-resumed that way, see section 7.
+(`archived Profile approval differs from the active approval`). A deploy that names the new cluster's ARN and runs no
+application release does join the cluster and consume the approval, but whether a deploy releases cannot be known
+beforehand. If a join was already resumed that way, see section 7.
 
 An approval covers exactly the plan it was given for: when the plan changes before it is consumed (for example the set of
 clusters needing the version changed), the old approval is archived as `SUPERSEDED`, the new plan is written and the

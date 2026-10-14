@@ -115,8 +115,8 @@ Profile、也没有已审批快照的集群（批量 join 计算集群 Profile �
 **新增集群的接入只能用打印的 `join-cluster` 命令续跑**，由 `deploy --gpu-cluster-arn` 发起的接入也一样，不能改用
 `deploy --approve-profile-plan`（已知限制，执行顺序的修复随后续版本发布）：同时执行应用 release 的 deploy 先按站点 Profile
 核对待审批记录、后接入新集群，这份 `CLUSTER_PROFILE_NEW` 审批在 join 之前就被判为过期并归档为 `SUPERSEDED`，join 随后再次停下、
-写出同一份计划；而已归档的 `plan_sha256` 不能再次审批（`archived Profile approval differs from the active approval`）。不发布
-应用 release 的 deploy 会直接接入并消费审批，但事先无法确定一次 deploy 是否发布。已经这样续跑过的按第 7 节处理。
+写出同一份计划；而已归档的 `plan_sha256` 不能再次审批（`archived Profile approval differs from the active approval`）。带上新集群
+ARN 又不发布应用 release 的 deploy 会直接接入并消费审批，但事先无法确定一次 deploy 是否发布。已经这样续跑过的按第 7 节处理。
 
 审批只覆盖它所审的那份计划：计划在被消费前变化（例如需要该版本的集群集合变了），旧审批归档为 `SUPERSEDED`，写出新计划并停止，打印新摘要。
 控制面按版本只保存一份 Profile，记录首次注册它的集群（`cluster_id`）；release 比较已注册的 Profile 时不比较这个注册锚点，所以 join 追加、

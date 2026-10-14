@@ -1918,11 +1918,12 @@ judgement).
    `join-cluster` command when it stops. Do not switch to `deploy --approve-profile-plan`: a deploy that also runs an
    application release checks the approval against the site profile before it joins the new cluster, so it judges the
    `CLUSTER_PROFILE_NEW` approval stale and archives it as `SUPERSEDED` before the join; the join then stops again and
-   writes the same plan, and an archived `plan_sha256` cannot be approved again (`archived Profile approval differs from
-   the active approval`), so no command resumes that join any more. A deploy that runs no application release joins the
-   cluster and consumes the approval, but whether a deploy releases cannot be known beforehand. If a join was already
-   resumed that way, do not edit or delete the archive under `release-deploy/profile-approvals/`; keep the state-dir and
-   hand it to the development team (Profile change approval §1.2, §7). The fix of the order ships with a later release.
+   writes the same plan, and an archived `plan_sha256` cannot be approved again
+   (`archived Profile approval differs from the active approval`), so no command resumes that join any more. A deploy
+   that names the new cluster's ARN and runs no application release joins the cluster and consumes the approval, but
+   whether a deploy releases cannot be known beforehand. If a join was already resumed that way, do not edit or delete
+   the archive under `release-deploy/profile-approvals/`; keep the state-dir and hand it to the development team
+   (Profile change approval §1.2, §7). The fix of the order ships with a later release.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 
