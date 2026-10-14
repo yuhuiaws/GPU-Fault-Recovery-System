@@ -63,9 +63,9 @@ def test_a_writer_in_another_zone_is_a_finding_that_names_the_failback(
     (line,) = _findings(World(), tmp_path)
 
     assert line.startswith(
-        "Aurora writer aurora-a-reader runs in us-west-2b but the CPU control "
-        "plane (gpu-fault-api-ha, gpu-fault-control-worker) runs in us-west-2a: "
-        "every database round trip crosses zones; fail it back to "
+        "Aurora writer aurora-a-reader runs in us-west-2b, not in us-west-2a where "
+        "most CPU control-plane Pods run (gpu-fault-api-ha, gpu-fault-control-worker: "
+        "3 of 3): their database round trips cross zones; fail it back to "
         "aurora-a-writer (us-west-2a, promotion tier 0) with gpu-fault-admin "
         f"aurora-failback --state-dir {tmp_path / 'state'} --reference <change>"
     ), line
@@ -108,10 +108,44 @@ def test_the_preferred_member_is_available_in_zone_and_lowest_tier_first(
     }
 
 
-def test_a_control_plane_spanning_the_writer_zone_is_placed(tmp_path: Path) -> None:
+def test_the_zone_with_the_most_pods_decides_where_the_writer_belongs(
+    tmp_path: Path,
+) -> None:
+    # Two of the three Pods run on cpu-1 (us-west-2a), one on cpu-2 (us-west-2b).
     world = World(nodes={"cpu-1": "us-west-2a", "cpu-2": "us-west-2b"})
 
+    (line,) = _findings(world, tmp_path)
+
+    assert "not in us-west-2a where most CPU control-plane Pods run" in line, line
+    assert "gpu-fault-control-worker: 2 of 3)" in line, line
+    found = placement.read_writer_placement(
+        site(tmp_path),  # type: ignore[arg-type]
+        world,  # type: ignore[arg-type]
+    )
+    assert found.pods_by_zone == {"us-west-2a": 2, "us-west-2b": 1}
+    assert found.preferred_zone == "us-west-2a" and found.placed is False
+    assert found.evidence()["control_plane_pods"] == {
+        "gpu-fault-api-ha-0": "us-west-2a",
+        "gpu-fault-api-ha-1": "us-west-2b",
+        "gpu-fault-control-worker-0": "us-west-2a",
+    }
+
+    world.writer = "aurora-a-writer"
+    assert _findings(world, tmp_path) == [], "the writer in the majority zone"
+
+
+def test_a_zone_without_a_member_falls_to_the_next_pod_zone(tmp_path: Path) -> None:
+    # Most Pods run in us-west-2c, where no Aurora member was placed; the
+    # ordering skips it exactly as bootstrap's writer_first_zones does.
+    world = World(
+        writer="aurora-a-writer", nodes={"cpu-1": "us-west-2c", "cpu-2": "us-west-2a"}
+    )
+
     assert _findings(world, tmp_path) == []
+    world.nodes = {"cpu-1": "us-west-2c", "cpu-2": "us-west-2d"}
+    (line,) = _findings(world, tmp_path)
+    assert "no Aurora member is in a zone running the CPU control plane" in line, line
+    assert "there is no member to fail back to" in line, line
 
 
 def test_no_available_member_in_the_control_plane_zone_says_so(tmp_path: Path) -> None:
@@ -265,3 +299,52 @@ def test_status_prints_the_finding_and_keeps_the_engine_verdict(
     assert not any("failover-db-cluster" in " ".join(call) for call in world.calls), (
         "status never fails anything over"
     )
+
+
+@pytest.mark.parametrize(
+    ("tiers", "fragment"),
+    [
+        (
+            {"aurora-a-writer": 1, "aurora-a-reader": 1},
+            "aurora-a-writer (writer) is promotion tier 1",
+        ),
+        (
+            {"aurora-a-writer": 0, "aurora-a-reader": 0},
+            "aurora-a-reader (reader) is promotion tier 0",
+        ),
+        (
+            {"aurora-a-writer": None, "aurora-a-reader": 1},
+            "aurora-a-writer (writer) is of unknown promotion tier",
+        ),
+    ],
+    ids=["pre-rule-site", "both-tier-0", "unknown"],
+)
+def test_tiers_that_do_not_prefer_the_placed_writer_are_a_finding(
+    tmp_path: Path, tiers: dict[str, int | None], fragment: str
+) -> None:
+    world = World(writer="aurora-a-writer", tiers=tiers)
+
+    (line,) = _findings(world, tmp_path)
+
+    assert line.startswith(
+        "Aurora promotion tiers do not prefer aurora-a-writer in us-west-2a: "
+    ), line
+    assert fragment in line, line
+    assert "tiers are set only when an instance is created" in line, line
+    assert line.endswith("nothing changes them afterwards"), line
+
+
+def test_a_failover_alone_is_not_a_tier_finding(tmp_path: Path) -> None:
+    """After a failover the writer is the tier-1 member and the tier-0 one
+    reads: the tiers are right, the placement is what is wrong."""
+
+    lines = _findings(World(writer="aurora-a-reader"), tmp_path)
+
+    assert len(lines) == 1 and lines[0].startswith("Aurora writer aurora-a-reader")
+    both_tier_1 = World(
+        writer="aurora-a-reader", tiers={"aurora-a-writer": 1, "aurora-a-reader": 1}
+    )
+    placement_line, tier_line = _findings(both_tier_1, tmp_path)
+    assert placement_line.startswith("Aurora writer aurora-a-reader"), placement_line
+    assert "do not prefer aurora-a-writer" in tier_line, tier_line
+    assert "aurora-a-writer (reader) is promotion tier 1" in tier_line, tier_line

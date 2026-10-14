@@ -15,19 +15,24 @@ burst admission p99 tripled until an operator failed back by hand.
 back. Both read the placement here: the zone labels of the nodes the Running
 gpu-fault-api-ha and gpu-fault-control-worker Pods are scheduled on (the
 processes that talk to the writer) and every cluster member's zone, status and
-promotion tier. The preferred writer is an available member in a control-plane
-zone, lowest promotion tier first: the instance bootstrap created as the writer.
+promotion tier. One definition serves both, bootstrap's own: the writer belongs
+in the first zone of ``writer_first_zones`` -- the zone with the most of those
+Pods that holds an Aurora member -- and the member to fail back to is the
+available one there, lowest promotion tier first. ``status`` also flags
+promotion tiers that do not prefer that member (tier 0 for it, never tier 0 for
+another): tiers are set only when an instance is created, nothing re-tiers one.
 Reads only, each bounded by ``READ_TIMEOUT_SECONDS``.
 """
 
 from __future__ import annotations
 
 import json
+from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Mapping
 
-from gpu_fault.admin.bootstrap_aurora import NODE_ZONE_LABELS
+from gpu_fault.admin.bootstrap_aurora import NODE_ZONE_LABELS, writer_first_zones
 from gpu_fault.admin.bootstrap_common import (
     BootstrapError,
     CommandRunner,
@@ -74,12 +79,29 @@ class WriterPlacement:
     cluster_id: str
     cluster_status: str
     members: tuple[AuroraMember, ...]
-    # Control-plane node -> its zone label.
-    control_plane_nodes: Mapping[str, str] = field(default_factory=dict)
+    # Running control-plane Pod -> the zone label of its node.
+    control_plane_pods: Mapping[str, str] = field(default_factory=dict)
 
     @property
     def control_plane_zones(self) -> tuple[str, ...]:
-        return tuple(sorted(set(self.control_plane_nodes.values())))
+        return tuple(sorted(set(self.control_plane_pods.values())))
+
+    @property
+    def pods_by_zone(self) -> dict[str, int]:
+        return dict(sorted(Counter(self.control_plane_pods.values()).items()))
+
+    @property
+    def preferred_zone(self) -> str | None:
+        """Bootstrap's writer zone: the first of ``writer_first_zones`` over the
+        members' zones, weighted by Pod; ``None`` when no member is in a zone
+        that runs a control-plane Pod."""
+
+        member_zones = sorted(
+            {member.availability_zone for member in self.members} - {""}
+        )
+        pod_zones = list(self.control_plane_pods.values())
+        ordered = writer_first_zones(member_zones, pod_zones)
+        return ordered[0] if ordered and ordered[0] in set(pod_zones) else None
 
     @property
     def writer(self) -> AuroraMember | None:
@@ -88,22 +110,23 @@ class WriterPlacement:
 
     @property
     def placed(self) -> bool:
-        """The writer runs in a zone that hosts a control-plane Pod."""
+        """The writer runs in the preferred zone."""
 
         writer = self.writer
-        return writer is not None and writer.availability_zone in set(
-            self.control_plane_zones
+        zone = self.preferred_zone
+        return (
+            writer is not None and zone is not None and writer.availability_zone == zone
         )
 
     def preferred(self) -> AuroraMember | None:
-        """The member to fail back to: available, in a control-plane zone,
+        """The member to fail back to: available, in the preferred zone,
         lowest promotion tier first (bootstrap's writer is tier 0)."""
 
-        zones = set(self.control_plane_zones)
         candidates = [
             member
             for member in self.members
-            if member.status == "available" and member.availability_zone in zones
+            if member.status == "available"
+            and member.availability_zone == self.preferred_zone
         ]
         return min(
             candidates,
@@ -114,6 +137,25 @@ class WriterPlacement:
             default=None,
         )
 
+    def tier_problems(self) -> tuple[AuroraMember | None, list[str]]:
+        """The member tiers should prefer -- the writer when it is placed, else
+        the failback target -- and why they do not: it is not tier 0, or
+        another member is. After a failover the writer is the other member, so
+        the writer alone would flag every correctly tiered site."""
+
+        reference = self.writer if self.placed else self.preferred()
+        if reference is None:
+            return None, []
+        problems: list[str] = []
+        if reference.promotion_tier != 0:
+            problems.append(f"{_member_label(reference)} is {_tier(reference)}")
+        problems.extend(
+            f"{_member_label(member)} is promotion tier 0"
+            for member in self.members
+            if member is not reference and member.promotion_tier == 0
+        )
+        return reference, problems
+
     def evidence(self) -> dict[str, Any]:
         writer = self.writer
         preferred = self.preferred()
@@ -122,12 +164,24 @@ class WriterPlacement:
             "cluster_status": self.cluster_status,
             "writer": writer.instance_id if writer is not None else None,
             "writer_zone": writer.availability_zone if writer is not None else None,
+            "preferred_zone": self.preferred_zone,
             "control_plane_zones": list(self.control_plane_zones),
-            "control_plane_nodes": dict(sorted(self.control_plane_nodes.items())),
+            "control_plane_pods_by_zone": self.pods_by_zone,
+            "control_plane_pods": dict(sorted(self.control_plane_pods.items())),
             "placed": self.placed,
             "preferred": preferred.instance_id if preferred is not None else None,
             "members": [member.evidence() for member in self.members],
         }
+
+
+def _member_label(member: AuroraMember) -> str:
+    return f"{member.instance_id} ({'writer' if member.writer else 'reader'})"
+
+
+def _tier(member: AuroraMember) -> str:
+    if member.promotion_tier is None:
+        return "of unknown promotion tier"
+    return f"promotion tier {member.promotion_tier}"
 
 
 def _json_object(raw: str, what: str) -> dict[str, Any]:
@@ -137,10 +191,10 @@ def _json_object(raw: str, what: str) -> dict[str, Any]:
     return value
 
 
-def control_plane_zones_by_node(
+def control_plane_pod_zones(
     runner: CommandRunner, *, kubeconfig: str, namespace: str
 ) -> dict[str, str]:
-    """The zone of every node a Running api-ha or control-worker Pod is on."""
+    """Every Running api-ha or control-worker Pod and its node's zone."""
 
     kubectl = ["kubectl", "--kubeconfig", kubeconfig]
     pods = _json_object(
@@ -161,13 +215,14 @@ def control_plane_zones_by_node(
         ),
         "control-plane Pod list",
     )
-    nodes = sorted(
-        {
-            str((item.get("spec") or {}).get("nodeName") or "")
-            for item in pods.get("items") or []
-        }
-        - {""}
-    )
+    placed_on = {
+        str((item.get("metadata") or {}).get("name") or ""): str(
+            (item.get("spec") or {}).get("nodeName") or ""
+        )
+        for item in pods.get("items") or []
+    }
+    placed_on = {pod: node for pod, node in placed_on.items() if pod and node}
+    nodes = sorted(set(placed_on.values()))
     if not nodes:
         raise BootstrapError(
             "no Running " + " or ".join(CONTROL_PLANE_DEPLOYMENTS) + " Pod is on a node"
@@ -193,7 +248,7 @@ def control_plane_zones_by_node(
         raise BootstrapError(
             f"control-plane node(s) {', '.join(missing)} carry no zone label"
         )
-    return {node: zones[node] for node in nodes}
+    return {pod: zones[node] for pod, node in sorted(placed_on.items())}
 
 
 def aurora_members(
@@ -262,7 +317,7 @@ def aurora_members(
 def read_writer_placement(site: RenderedSite, runner: CommandRunner) -> WriterPlacement:
     config = site.release_config
     cluster_id = str(config["health"]["aurora_cluster_id"])
-    nodes = control_plane_zones_by_node(
+    pods = control_plane_pod_zones(
         runner,
         kubeconfig=str(config["cpu_kubeconfig"]),
         namespace=str(config["namespace"]),
@@ -270,7 +325,7 @@ def read_writer_placement(site: RenderedSite, runner: CommandRunner) -> WriterPl
     status, members = aurora_members(
         runner, aws_region=str(config["aws_region"]), cluster_id=cluster_id
     )
-    return WriterPlacement(cluster_id, status, members, nodes)
+    return WriterPlacement(cluster_id, status, members, pods)
 
 
 def placement_problem(placement: WriterPlacement) -> str | None:
@@ -294,7 +349,7 @@ def failback_commands(state_dir: Path) -> str:
 
 
 def placement_finding(placement: WriterPlacement, *, state_dir: Path) -> str | None:
-    """The ``status`` finding line, or ``None`` when the writer is placed."""
+    """The ``status`` placement line, or ``None`` when the writer is placed."""
 
     problem = placement_problem(placement)
     if problem is not None:
@@ -303,23 +358,46 @@ def placement_finding(placement: WriterPlacement, *, state_dir: Path) -> str | N
         return None
     writer = placement.writer
     assert writer is not None  # placement_problem rules a missing writer out
-    zones = ", ".join(placement.control_plane_zones)
+    deployments = ", ".join(CONTROL_PLANE_DEPLOYMENTS)
+    zone = placement.preferred_zone
+    if zone is None:
+        return (
+            f"Aurora writer {writer.instance_id} runs in {writer.availability_zone} "
+            f"and no Aurora member is in a zone running the CPU control plane "
+            f"({deployments}: {', '.join(placement.control_plane_zones)}): every "
+            "database round trip crosses zones and there is no member to fail back to"
+        )
+    pods = placement.pods_by_zone
     line = (
-        f"Aurora writer {writer.instance_id} runs in {writer.availability_zone} but "
-        f"the CPU control plane ({', '.join(CONTROL_PLANE_DEPLOYMENTS)}) runs in "
-        f"{zones}: every database round trip crosses zones"
+        f"Aurora writer {writer.instance_id} runs in {writer.availability_zone}, not "
+        f"in {zone} where most CPU control-plane Pods run ({deployments}: "
+        f"{pods[zone]} of {sum(pods.values())}): their database round trips cross zones"
     )
     preferred = placement.preferred()
     if preferred is None:
         return (
-            f"{line}, and no available Aurora member is in {zones} to fail back "
+            f"{line}, and no available Aurora member is in {zone} to fail back "
             f"to; once one is, run {failback_commands(state_dir)}"
         )
     return (
-        f"{line}; fail it back to {preferred.instance_id} "
-        f"({preferred.availability_zone}, promotion tier "
-        f"{'unknown' if preferred.promotion_tier is None else preferred.promotion_tier}"
-        f") with {failback_commands(state_dir)}"
+        f"{line}; fail it back to {preferred.instance_id} ({zone}, {_tier(preferred)}) "
+        f"with {failback_commands(state_dir)}"
+    )
+
+
+def tier_finding(placement: WriterPlacement) -> str | None:
+    """The ``status`` promotion-tier line, or ``None`` when tiers prefer the
+    member that should write."""
+
+    reference, problems = placement.tier_problems()
+    if reference is None or not problems:
+        return None
+    return (
+        f"Aurora promotion tiers do not prefer {reference.instance_id} in "
+        f"{reference.availability_zone}: {'; '.join(problems)}; tiers are set only "
+        "when an instance is created (bootstrap: tier 0 for the writer in the "
+        "control plane's zone, tier 1 for the reader) and nothing changes them "
+        "afterwards"
     )
 
 
@@ -329,7 +407,8 @@ def placement_findings(
     state_dir: Path | None = None,
     runner: CommandRunner | None = None,
 ) -> list[str]:
-    """``status``'s placement line; an unreadable placement is itself a line.
+    """``status``'s placement and tier lines; an unreadable placement is itself
+    a line.
 
     Read-only by construction: the runner refuses any mutating command.
     """
@@ -340,5 +419,8 @@ def placement_findings(
         )
     except READ_ERRORS as exc:
         return [f"Aurora writer placement could not be read: {exc}"]
-    line = placement_finding(placement, state_dir=state_dir or site.source.parent)
-    return [line] if line is not None else []
+    lines = [
+        placement_finding(placement, state_dir=state_dir or site.source.parent),
+        None if placement_problem(placement) else tier_finding(placement),
+    ]
+    return [line for line in lines if line is not None]

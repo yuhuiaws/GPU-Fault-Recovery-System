@@ -10,8 +10,9 @@ names it as the remedy of its placement finding, nothing calls it.
 Plan (no ``--confirm``) is read-only: the placement (the writer, every member's
 zone, status and promotion tier, the zones of the nodes running gpu-fault-api-ha
 and gpu-fault-control-worker) and the target, the preferred member: available,
-in a control-plane zone, lowest promotion tier first -- the instance bootstrap
-created as the writer at tier 0.
+in the first zone of bootstrap's ``writer_first_zones`` (the zone with the most
+of those Pods that holds a member), lowest promotion tier first -- the instance
+bootstrap created as the writer at tier 0.
 
 Execute (``--confirm AURORA_FAILBACK`` plus an approved ``--reference``) takes
 the site operation lock, so it refuses while a release or configuration
@@ -247,13 +248,19 @@ def plan_failback(
     elif placement.cluster_status != "available":
         action, reason = "wait", f"Aurora cluster is {placement.cluster_status}"
     elif placement.placed:
-        reason = "the writer already runs in a control-plane zone" + (
+        reason = "the writer already runs in the preferred zone" + (
             "; execute finishes the unfinished journal's waits" if unfinished else ""
         )
     elif target is None:
-        reason = "no available Aurora member is in a control-plane zone"
+        reason = _no_target(placement)
     else:
-        action, reason = "failover", "the writer runs outside every control-plane zone"
+        action, reason = (
+            "failover",
+            (
+                f"the writer runs outside {placement.preferred_zone}, the zone with the "
+                "most control-plane Pods"
+            ),
+        )
     return {
         "mode": "plan",
         "reference": reference,
@@ -267,6 +274,13 @@ def plan_failback(
             f"--reference {reference} --confirm {CONFIRMATION}"
         ),
     }
+
+
+def _no_target(placement: WriterPlacement) -> str:
+    zone = placement.preferred_zone
+    if zone is None:
+        return "no Aurora member is in a zone running a control-plane Pod"
+    return f"no available Aurora member is in {zone} to fail back to"
 
 
 def _supersede(
@@ -297,8 +311,8 @@ def _finish(
         if after.cluster_status != "available" or not after.placed:
             raise BootstrapError(
                 f"Aurora cluster is {after.cluster_status} with writer "
-                f"{evidence['writer']} in {evidence['writer_zone']}, not in a "
-                "control-plane zone"
+                f"{evidence['writer']} in {evidence['writer_zone']}, not in the "
+                f"preferred zone {evidence['preferred_zone']}"
             )
         journal.step(STEP_CLUSTER_AVAILABLE, after=evidence)
         control_plane = wait_control_plane_healthy(release, sleep=sleep)
@@ -360,10 +374,7 @@ def run_aurora_failback(
         return {**record, "journal": str(path)}
     target = placement.preferred()
     if target is None:
-        raise BootstrapError(
-            f"{VERB} refused: no available Aurora member is in "
-            f"{', '.join(placement.control_plane_zones)} to fail back to"
-        )
+        raise BootstrapError(f"{VERB} refused: {_no_target(placement)}")
     release = release_factory(site)
     guards = require_quiet_site(site, release)
     journal = _Journal(path, {**record, "status": STATUS_IN_PROGRESS}, now)
@@ -374,7 +385,7 @@ def run_aurora_failback(
             aws_region=str(site.release_config["aws_region"]),
             cluster_id=placement.cluster_id,
             instance_ids=[target.instance_id],
-            control_plane_zones=placement.control_plane_zones,
+            control_plane_zones=[target.availability_zone],
             sleep=sleep,
         )
     except READ_ERRORS as exc:
@@ -398,8 +409,8 @@ def add_command(
         ),
         help=(
             "fail the Aurora writer back to the preferred member (available, in "
-            "the CPU control plane's zone, lowest promotion tier) after a failover "
-            "left it in another zone: without --confirm prints the placement and "
+            "the zone with the most CPU control-plane Pods, lowest promotion tier) "
+            "after a failover left it elsewhere: without --confirm prints the placement and "
             f"the target and changes nothing; --confirm {CONFIRMATION} runs it "
             "under the site operation lock, refused while a release transaction "
             "is open, a remote command is in flight or a destructive workflow is "

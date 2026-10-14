@@ -158,7 +158,7 @@ def test_execute_fails_back_journals_each_step_and_waits_for_the_control_plane(
             "aws_region": REGION,
             "cluster_id": CLUSTER_ID,
             "instance_ids": ["aurora-a-writer"],
-            "control_plane_zones": ("us-west-2a",),
+            "control_plane_zones": ["us-west-2a"],
             "sleep": live.failovers[0]["sleep"],
         }
     ]
@@ -406,12 +406,7 @@ def test_plan_is_read_only_and_names_the_target(
 @pytest.mark.parametrize(
     ("writer", "status", "action", "reason"),
     [
-        (
-            "aurora-a-writer",
-            "available",
-            "none",
-            "already runs in a control-plane zone",
-        ),
+        ("aurora-a-writer", "available", "none", "already runs in the preferred zone"),
         ("aurora-a-reader", "failing-over", "wait", "Aurora cluster is failing-over"),
     ],
 )

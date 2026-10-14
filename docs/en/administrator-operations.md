@@ -29,7 +29,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Submit an explicit remediation after CHECK_MECHANICALS; trigger a validated restore after a QUARANTINED node (or the still-isolated node of an ESCALATED incident whose ladder is exhausted and every workflow ended) is repaired; manually confirm a node action with unknown outcome | `gpu-fault-admin submit-remediation --state-dir ... --incident-id ... --disposition {inspected,reset-gpu,reboot-node,quarantine,restore,confirm-node-action} [--node <node>] [--plan]` (`restore` see §9.2, `confirm-node-action --node` see §9.4) | §9, §9.2, §9.4, REG 8.3 |
 | Remotely view/requeue a node collector's dead-letter outbox | `gpu-fault-admin collector-outbox --state-dir ... --cluster-id C --node N --collector kernel --action stats\|list\|requeue-dead [--path /v1/...] [--yes] --reference CHG-...` (no login to the GPU node; only metadata is returned; `requeue-dead` must carry `--yes`; there is no remote `--force`) | §9.3, §8 `GpuFaultCollectorSilent` |
 | Reclaim PostgreSQL hot-table bloat (after a campaign day, before a formal perf or acceptance round) | `gpu-fault-admin store-maintenance --state-dir ... --reference CHG-... [--confirm STORE_MAINTENANCE]` (without `--confirm` it only prints each hot table's live rows, pages, index bytes and proposed action; with the token it executes under the site operation lock; evidence under `$STATE_DIR/store-maintenance/`) | [§10.3](#103-hot-table-storage-parameters-and-store-maintenance-reclaiming-bloat) |
-| A failover left the Aurora writer in a zone outside the control plane's (`status` reports `finding: Aurora writer ... runs in ...`) | `gpu-fault-admin aurora-failback --state-dir ... --reference CHG-... [--confirm AURORA_FAILBACK]` (without `--confirm` it only prints the placement and the target member; with the token it executes under the site operation lock, refuses while work is in flight, waits for the cluster to be `available` and the control plane ready, journal under `$STATE_DIR/aurora-failback/`; never run automatically) | [§4.9](#49-aurora-writer-beside-the-control-plane-the-status-finding-and-aurora-failback) |
+| A failover left the Aurora writer outside the zone with the most control-plane Pods (`status` reports `finding: Aurora writer ... runs in ...`) | `gpu-fault-admin aurora-failback --state-dir ... --reference CHG-... [--confirm AURORA_FAILBACK]` (without `--confirm` it only prints the placement and the target member; with the token it executes under the site operation lock, refuses while work is in flight, waits for the cluster to be `available` and the control plane ready, journal under `$STATE_DIR/aurora-failback/`; never run automatically) | [§4.9](#49-aurora-writer-beside-the-control-plane-the-status-finding-and-aurora-failback) |
 | Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | §10 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
 | Converge historical workflows that recovered but stay BLOCKED, never-dispatched PENDING workflows whose node left with a spot replacement, and parked records whose node action the operator confirmed | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
@@ -1027,15 +1027,24 @@ is promoted.
 leaves the writer on the member RDS chose, and nothing moves it back automatically; a rerun of `deploy` only re-proves bootstrap read-only.
 
 **How status reports it.** Every `gpu-fault-admin status` (the quick mode included) reads the zone labels of the nodes the Running
-`gpu-fault-api-ha` / `gpu-fault-control-worker` Pods are on and every Aurora member's zone, status and promotion tier. A writer whose zone is
-not among those zones adds one finding line -- not a failing check: `healthy` and the exit code are unchanged:
+`gpu-fault-api-ha` / `gpu-fault-control-worker` Pods are on and every Aurora member's zone, status and promotion tier. Where the writer belongs
+is bootstrap's own definition: the first zone of the `writer_first_zones` ordering, the zone with the most of those Pods that holds an Aurora
+member (a zone with a minority of the Pods does not count when the control plane spans zones). A writer elsewhere adds one finding line -- not
+a failing check: `healthy` and the exit code are unchanged:
 
 ```text
-gpu-fault-admin status: finding: Aurora writer <reader-instance> runs in <zone-b> but the CPU control plane
-  (gpu-fault-api-ha, gpu-fault-control-worker) runs in <zone-a>: every database round trip crosses zones; fail it
-  back to <writer-instance> (<zone-a>, promotion tier 0) with gpu-fault-admin aurora-failback --state-dir ...
-  --reference <change> (prints the plan), then the same with --confirm AURORA_FAILBACK
+gpu-fault-admin status: finding: Aurora writer <reader-instance> runs in <zone-b>, not in <zone-a> where most CPU
+  control-plane Pods run (gpu-fault-api-ha, gpu-fault-control-worker: 6 of 6): their database round trips cross
+  zones; fail it back to <writer-instance> (<zone-a>, promotion tier 0) with gpu-fault-admin aurora-failback
+  --state-dir ... --reference <change> (prints the plan), then the same with --confirm AURORA_FAILBACK
 ```
+
+Promotion tiers that do not prefer the member that should write add another finding line (again not a failing check): that member is the
+writer when it is placed and the failback target otherwise, and the line appears when it is not tier 0 or another member is -- a site created
+before the tier rule with both at tier 1, say, or one built with the old hand procedure with both at tier 0. The line names the members and
+tiers and says that tiers are set only when an instance is created and nothing changes them afterwards; the product does not fix them. A
+failover alone is no tier problem: the writer is then the tier-1 instance and the tier-0 one reads, the tiers still prefer the member that
+should write, and only the placement is reported.
 
 The read is four read-only commands (two `kubectl get`, `describe-db-clusters`, and `describe-db-instances` filtered to the cluster), each
 capped at 30 seconds, through a runner that refuses any mutating command. A placement it cannot read (kubectl/aws failing, no Running Pod, a
@@ -1051,18 +1060,18 @@ gpu-fault-admin aurora-failback --state-dir "$STATE_DIR" --reference CHG-...
 gpu-fault-admin aurora-failback --state-dir "$STATE_DIR" --reference CHG-... --confirm AURORA_FAILBACK
 ```
 
-- The target member: in a control-plane zone, status `available`, lowest promotion tier first -- the tier-0 writer bootstrap created.
+- The target member: in that zone, status `available`, lowest promotion tier first -- the tier-0 writer bootstrap created.
 - Execute takes the site operation lock (a release, config or other mutation in progress refuses), then refuses work in flight by the site's own
   safety checks: an unfinished release transaction, remote commands PENDING/LEASED/WAITING (the guard of `join-cluster`/`remove-cluster`/
   `rotate-token`), and an active destructive workflow (the deploy preflight's `workflow_safety`). A cluster that is not `available` (the
-  previous failover may still be settling), has no single writer, or has no available member in a control-plane zone is refused too. A
+  previous failover may still be settling), has no single writer, or has no available member in that zone is refused too. A
   refusal writes no journal and sends no request.
 - Once past the checks it records `PLANNED`, then runs bootstrap's own step: `failover-db-cluster --target-db-instance-identifier <target>`
   and a bounded wait (600 seconds) until the cluster is `available` with the target as its one writer, recorded as `CLUSTER_AVAILABLE`; then it
   waits for the control plane -- every Pod of the three CPU Deployments' current ReplicaSets Ready, each registry runtime ready on one
   generation, and one Store read over a fresh connection through the ingress Pod (300 seconds in all) -- recorded as `CONTROL_PLANE_HEALTHY`,
   and ends `COMPLETED`. Writes pause for seconds to tens of seconds, the connection pools self-heal, and no Pod restarts (HA-010's verdict).
-- A writer already in a control-plane zone is a `NOOP`: nothing is done. After an interrupted run or a wait that timed out (journal
+- A writer already in that zone is a `NOOP`: nothing is done. After an interrupted run or a wait that timed out (journal
   `IN_PROGRESS`/`FAILED`) rerun the same command: when the writer has moved back it only finishes the waits and completes that journal;
   otherwise it marks that journal `SUPERSEDED`, re-runs the checks and executes again.
 - Never automatic: `status` only reports, and neither `deploy`, `status` nor the release engine calls it. A hand-run
