@@ -12,7 +12,7 @@ of what the node left (live: DESTR-020's alias on gpu-eks-cluster).
 
 from __future__ import annotations
 
-from datetime import timedelta
+from datetime import datetime, timedelta
 from typing import Any
 
 import pytest
@@ -26,7 +26,6 @@ from gpu_fault.departed_nodes import (
 )
 from gpu_fault.fleet import AgentLifecycleState, FleetRegistry
 from gpu_fault.kubernetes_node_inventory import (
-    NODE_INVENTORY_ABSENCE_RETENTION,
     UNKNOWN_PROVIDER_ABSENCE,
     merge_node_inventory,
     unknown_provider_exit,
@@ -42,6 +41,7 @@ from tests.departed_nodes._support import (
     ago,
     blocked_never_changed,
     inventory_report,
+    now,
     pending_never_dispatched,
     registration,
     world,
@@ -78,77 +78,96 @@ def _acceptance(node_id: str = ALIAS) -> DepartedNodeIdentityAcceptance:
 
 
 # ----------------------------------------------------------------- the rule
+#
+# ``unknown_provider_exit`` judges at the ``now`` it is handed. Every report
+# below is stamped relative to that very instant, taken in the test body --
+# never at collection time -- so a long session cannot age a report past the
+# freshness limit before it is judged.
 
 
-def _inventory(*reports: tuple[list[str], timedelta]) -> Any:
+def _inventory(at: datetime, *reports: tuple[list[str], timedelta]) -> Any:
+    """The record of ``reports``, each received its age before ``at``."""
+
     record = None
     for names, age in reports:
-        at = ago(seconds=age.total_seconds())
+        received = at - age
         record = merge_node_inventory(
-            record, inventory_report(EKS_CLUSTER, names, observed_at=at), received_at=at
+            record,
+            inventory_report(EKS_CLUSTER, names, observed_at=received),
+            received_at=received,
         )
     return record
 
 
-def _chain(names_before: list[str], names_after: list[str], *, left: float) -> Any:
-    """A one-a-minute chain over ``left`` + 5 minutes: ``names_before`` then
-    ``names_after`` for the last ``left`` minutes."""
+def _chain(
+    at: datetime, names_before: list[str], names_after: list[str], *, left: int
+) -> Any:
+    """A one-a-minute chain over ``left`` + 5 minutes up to ``at``:
+    ``names_before``, then ``names_after`` for the last ``left`` minutes."""
 
     reports = [
         (names_before, timedelta(minutes=minute))
-        for minute in range(int(left) + 5, int(left), -1)
+        for minute in range(left + 5, left, -1)
     ]
     reports += [
-        (names_after, timedelta(minutes=minute)) for minute in range(int(left), -1, -1)
+        (names_after, timedelta(minutes=minute)) for minute in range(left, -1, -1)
     ]
-    return _inventory(*reports)
+    return _inventory(at, *reports)
 
 
 def test_a_node_no_report_ever_listed_is_open_once_the_chain_covers_the_guard() -> None:
-    covered = _chain([EKS_PRESENT], [EKS_PRESENT], left=12)
-    young = _chain([EKS_PRESENT], [EKS_PRESENT], left=3)
+    at = now()
+    covered = _chain(at, [EKS_PRESENT], [EKS_PRESENT], left=12)
+    young = _chain(at, [EKS_PRESENT], [EKS_PRESENT], left=3)
 
-    verdict = unknown_provider_exit(covered, ALIAS, now=ago(seconds=0), guard=GUARD)
-    early = unknown_provider_exit(young, ALIAS, now=ago(seconds=0), guard=GUARD)
+    verdict = unknown_provider_exit(covered, ALIAS, now=at, guard=GUARD)
+    early = unknown_provider_exit(young, ALIAS, now=at, guard=GUARD)
 
     assert verdict.open and verdict.never_reported, verdict
     assert verdict.absent_since == covered.chain_started_at
-    assert not early.open and "of the 600s guard" in str(early.blocker)
+    assert not early.open and "of the 600s guard" in str(early.blocker), early
 
 
 def test_a_node_a_report_listed_waits_out_its_24_hours() -> None:
-    left_an_hour_ago = _chain([ALIAS, EKS_PRESENT], [EKS_PRESENT], left=60)
+    at = now()
+    left_an_hour_ago = _chain(at, [ALIAS, EKS_PRESENT], [EKS_PRESENT], left=60)
 
-    verdict = unknown_provider_exit(
-        left_an_hour_ago, ALIAS, now=ago(seconds=0), guard=GUARD
+    verdict = unknown_provider_exit(left_an_hour_ago, ALIAS, now=at, guard=GUARD)
+    later = unknown_provider_exit(
+        left_an_hour_ago, ALIAS, now=verdict.opens_at or at, guard=GUARD
     )
 
     assert not verdict.open and not verdict.never_reported
-    assert verdict.opens_at is not None
+    assert verdict.opens_at == at - timedelta(minutes=60) + UNKNOWN_PROVIDER_ABSENCE
     assert verdict.opens_at - verdict.absent_since == UNKNOWN_PROVIDER_ABSENCE
     assert "accepted 24 hours after that" in str(verdict.blocker)
+    # Judged at the moment it opens, the same record is closed only by its
+    # own age: the verdict reads the clock it is handed, nothing else.
+    assert "latest Kubernetes node report is" in str(later.blocker), later
 
 
 @pytest.mark.parametrize(
-    ("inventory", "match"),
+    ("reports", "match"),
     [
-        pytest.param(None, "no Kubernetes node report", id="never-reported"),
+        pytest.param((), "no Kubernetes node report", id="never-reported"),
         pytest.param(
-            _inventory(([EKS_PRESENT], timedelta(minutes=20))),
+            (([EKS_PRESENT], timedelta(minutes=20)),),
             "latest Kubernetes node report is",
             id="stale",
         ),
         pytest.param(
-            _inventory(([ALIAS], timedelta(minutes=1))),
-            "still in Kubernetes",
-            id="present",
+            (([ALIAS], timedelta(minutes=1)),), "still in Kubernetes", id="present"
         ),
     ],
 )
 def test_no_fresh_report_or_a_listed_node_keeps_the_exit_closed(
-    inventory: Any, match: str
+    reports: tuple[tuple[list[str], timedelta], ...], match: str
 ) -> None:
-    verdict = unknown_provider_exit(inventory, ALIAS, now=ago(seconds=0), guard=GUARD)
+    at = now()
+
+    verdict = unknown_provider_exit(
+        _inventory(at, *reports), ALIAS, now=at, guard=GUARD
+    )
 
     assert not verdict.open and match in str(verdict.blocker), verdict.blocker
 
@@ -157,16 +176,17 @@ def test_an_absence_older_than_the_chains_memory_is_open_but_not_never() -> None
     """Pruned at 24 hours, the absence moved the retention window past the
     chain's start: open, but no longer claimed as never reported."""
 
-    record = _chain([ALIAS, EKS_PRESENT], [EKS_PRESENT], left=15)
+    at = now()
+    record = _chain(at, [ALIAS, EKS_PRESENT], [EKS_PRESENT], left=15)
+    assert record.retained_since == record.chain_started_at, "nothing pruned yet"
     record = record.model_copy(
         update={
             "absent": {},
-            "retained_since": record.chain_started_at
-            + NODE_INVENTORY_ABSENCE_RETENTION / 24,
+            "retained_since": record.chain_started_at + timedelta(minutes=5),
         }
     )
 
-    verdict = unknown_provider_exit(record, ALIAS, now=ago(seconds=0), guard=GUARD)
+    verdict = unknown_provider_exit(record, ALIAS, now=at, guard=GUARD)
 
     assert verdict.open and not verdict.never_reported and verdict.absent_since is None
 

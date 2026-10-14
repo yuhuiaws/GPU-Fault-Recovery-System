@@ -163,19 +163,27 @@ def _retire(store: Any, registry: FleetRegistry, **overrides: Any) -> Any:
     [
         ({"expected_generation": 3}, "generation changed"),
         ({"expected_lifecycle": "DRAINING"}, "lifecycle state changed"),
-        ({"expected_last_seen_at": ago(minutes=31)}, "heartbeat changed"),
+        # Times as ages, stamped in the test body: a value taken at collection
+        # time would age while the session runs.
+        ({"expected_last_seen_at": timedelta(minutes=31)}, "heartbeat changed"),
         ({"evidence": _evidence(absent_from_provider=False)}, "does not prove"),
         ({"evidence": _evidence(instance_id="i-0e000009")}, "instance changed"),
-        ({"now": ago(minutes=25)}, "younger than the 10-minute"),
+        ({"now": timedelta(minutes=25)}, "younger than the 10-minute"),
     ],
 )
 def test_the_retirement_refuses_anything_that_moved_or_is_not_proof(
     overrides: dict[str, Any], message: str
 ) -> None:
     store, registry = _registry()
+    stamped = {
+        key: ago(seconds=value.total_seconds())
+        if isinstance(value, timedelta)
+        else value
+        for key, value in overrides.items()
+    }
 
     with pytest.raises(ValueError, match=message):
-        _retire(store, registry, **overrides)
+        _retire(store, registry, **stamped)
 
     assert store.get_agent(HP_CLUSTER, HP_NODE).lifecycle_state is (
         AgentLifecycleState.ACTIVE
