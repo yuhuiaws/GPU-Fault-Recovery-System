@@ -11247,6 +11247,16 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
      limit, or the arm receipt is not bound to the scope (run/node/boot/GPU/unit/state directory/
      program digest), refuse before injection and record the refusal reason given by the host; do not
      fall back to merely comparing control-plane timestamps.
+     The witness knows only the Agent's known `nvidia-smi` calls of the window: the calibration and
+     client queries, `-q -x`, the target GPU's `--gpu-reset -i <uuid>`, and the quiesce's persistence
+     calls -- the read-only `--query-gpu=pci.bus_id,persistence_mode --format=csv,noheader` (before and
+     after the release and the restore's read-back) and `-i <bus id> -pm 0`, the latter only for the
+     target GPU's bus id the witness reads on the host when it is armed (`target_pci_bus_id` in its
+     state) and only when it ends before the first reset starts; the final record counts them in
+     `persistence_execs`. A `-pm 0` of another GPU or of the whole node, a `-pm 1`, extra arguments or
+     any other spelling stays "unknown NVIDIA invocation cannot prove no action" (plain EKS attempt 2
+     refused both nodes on those quiesce calls; judged by
+     `tests/regional/test_destr015_quiesce_persistence_witness.py`).
 - Steps:
   1. Record the full baseline of both nodes: Kubernetes UID, `boot_id`, labels/taints/
      `unschedulable`, Node Agent ledger row count, quiesce state, gpu-fault timers, list of active

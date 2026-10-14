@@ -93,6 +93,7 @@ PACKAGES = (
     "scripts/e2e/regional/probes",
 )
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
+PCI_BUS_ID = re.compile(r"^[0-9A-Fa-f]{4,8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$")
 MAX_MESSAGE_BYTES = 65536
 MIN_LIFETIME_SECONDS = 600
 MAX_LIFETIME_SECONDS = 7200
@@ -248,15 +249,29 @@ def resolve_executable() -> Path:
     return Path(executable).resolve()
 
 
-def gpu_present(gpu_uuid: str) -> bool:
+def gpu_pci_bus_id(gpu_uuid: str) -> str | None:
+    """The approved GPU's PCI bus id on this host, ``None`` when it is absent.
+
+    The witness's own read, outside the traced Agent: it names the one GPU the
+    quiesce's ``nvidia-smi -i <bus id> -pm 0`` may release (``reset_events``).
+    """
+
     completed = run(
-        ["nvidia-smi", "--query-gpu=uuid", "--format=csv,noheader,nounits"],
+        ["nvidia-smi", "--query-gpu=uuid,pci.bus_id", "--format=csv,noheader,nounits"],
         check=False,
         timeout=30,
     )
     if completed.returncode:
-        return False
-    return gpu_uuid in {line.strip() for line in completed.stdout.splitlines()}
+        return None
+    for line in completed.stdout.splitlines():
+        values = [value.strip() for value in line.split(",")]
+        if (
+            len(values) == 2
+            and values[0] == gpu_uuid
+            and PCI_BUS_ID.fullmatch(values[1])
+        ):
+            return values[1]
+    return None
 
 
 def reset_ledger_rows(ledger: Path = LEDGER) -> list[dict[str, Any]]:
@@ -425,7 +440,8 @@ def arm(
     if tracee.boot_id != scope.boot_id:
         raise ProbeError("Node Agent boot id differs from the scope")
     executable = resolve_executable()
-    if not gpu_present(scope.gpu_uuid):
+    pci_bus_id = gpu_pci_bus_id(scope.gpu_uuid)
+    if pci_bus_id is None:
         raise ProbeError("approved GPU is not present on this host")
     directory = run_directory(run_id, state_root=state_root)
     previous = read_json(directory / "state.json")
@@ -454,6 +470,7 @@ def arm(
         "program_sha256": program_sha256,
         "tracee_pid": tracee.pid,
         "executable_path": str(executable),
+        "target_pci_bus_id": pci_bus_id,
         "runner_clock": payload.get("runner_clock"),
         "disarmed_at": None,
         "refusal": None,
@@ -791,13 +808,19 @@ def final_record(
     scope: ResetIntervalScope,
     reason: str,
     baseline_ids: set[str],
+    pci_bus_id: str | None = None,
 ) -> dict[str, Any]:
     raw = witness.snapshot()
     executable = Path(start["executable_path"])
     refusal: str | None = None
+    persistence: dict[str, int] = {}
     try:
         actions, calibration = reset_events(
-            raw, executable=executable, gpu_uuid=scope.gpu_uuid
+            raw,
+            executable=executable,
+            gpu_uuid=scope.gpu_uuid,
+            pci_bus_id=pci_bus_id,
+            persistence=persistence,
         )
     except BoundaryDenied as exc:
         actions, calibration, refusal = [], 0, str(exc)
@@ -824,6 +847,8 @@ def final_record(
         "trace_bytes": len(raw),
         "calibration_execs": calibration,
         "actions": actions,
+        # The quiesce's persistence reads and its target release, by count.
+        "persistence_execs": persistence,
         "wall_minus_monotonic_min_ns": clock.minimum,
         "wall_minus_monotonic_max_ns": clock.maximum,
         "refusal": refusal,
@@ -852,6 +877,7 @@ def failure_record(
         "trace_bytes": 0,
         "calibration_execs": 0,
         "actions": [],
+        "persistence_execs": {},
         "wall_minus_monotonic_min_ns": None,
         "wall_minus_monotonic_max_ns": None,
         "refusal": refusal,
@@ -909,6 +935,7 @@ def run_witness(run_id: str, *, state_root: Path | None = None) -> int:
             scope=scope,
             reason=reason,
             baseline_ids=baseline_ids,
+            pci_bus_id=state.get("target_pci_bus_id"),
         )
     except Exception as exc:  # noqa: BLE001 - the record is the only report
         # A tracer that never attached (``attach`` closes its own failure) or

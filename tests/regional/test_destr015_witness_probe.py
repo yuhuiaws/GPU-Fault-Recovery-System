@@ -2,7 +2,7 @@
 
 Every host interaction is faked at the boundary the probe itself draws
 (``run``, ``boot_id``, ``agent_tracee``, ``resolve_executable``,
-``gpu_present``, ``AttachedExecWitness``); the state directory is a temporary
+``gpu_pci_bus_id``, ``AttachedExecWitness``); the state directory is a temporary
 tree and the runner's clock pings arrive on a faked stdin. Nothing here starts
 a process or touches a device.
 """
@@ -39,6 +39,7 @@ from tests.regional.test_acceptance_physical_interval_alignment import (
 RUN_ID = "destr015-0b111dddd0a2-a1"
 BOOT = "boot-node-a"
 GPU = "GPU-node-a"
+BUS = "00000000:59:00.0"
 LIFETIME = 3600
 
 
@@ -112,7 +113,9 @@ class FakeHost:
         monkeypatch.setattr(probe, "boot_id", lambda: self.boot)
         monkeypatch.setattr(probe, "agent_tracee", self.tracee)
         monkeypatch.setattr(probe, "resolve_executable", lambda: self.executable)
-        monkeypatch.setattr(probe, "gpu_present", lambda uuid: uuid in self.gpus)
+        monkeypatch.setattr(
+            probe, "gpu_pci_bus_id", lambda uuid: BUS if uuid in self.gpus else None
+        )
         monkeypatch.setattr(probe, "run", self.run)
         monkeypatch.setattr(probe, "ARM_WAIT_SECONDS", 1)
         monkeypatch.setattr(probe, "FINISH_WAIT_SECONDS", 1)
@@ -231,6 +234,9 @@ def test_arm_installs_the_program_starts_a_bounded_unit_and_binds_the_receipt(
     assert state["phase"] == "ARMED" and state["scope_sha256"] == scope.digest()
     assert state["unit"] == unit and state["lifetime_seconds"] == LIFETIME
     assert state["boot_id"] == BOOT and state["disarmed_at"] is None
+    assert state["target_pci_bus_id"] == BUS, (
+        "the one bus id the quiesce's persistence release may name"
+    )
     # A stale unit of the same name is cleared before the new one starts.
     stop = next(
         i for i, item in enumerate(host.commands) if item[:2] == ["systemctl", "stop"]
@@ -768,6 +774,7 @@ def unit(host: FakeHost, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
             "boot_id": BOOT,
             "lifetime_seconds": LIFETIME,
             "unit": probe.unit_name(RUN_ID) + ".service",
+            "target_pci_bus_id": BUS,
         },
     )
     return SimpleNamespace(scope=scope, directory=directory, root=host.root, host=host)
@@ -802,6 +809,65 @@ def test_run_witness_records_armed_then_final_on_a_finish_request(
     assert (unit.directory / "trace").stat().st_mode & 0o777 == 0o700
     for name in ("armed.json", "final.json"):
         assert (unit.directory / name).stat().st_mode & 0o777 == 0o600, name
+
+
+def _quiesce_window_trace(executable: str, gpu_uuid: str, bus: str) -> bytes:
+    """The Agent's nvidia-smi spawns of one live DESTR-015 node, in order: the
+    quiesce's persistence reads around the target's release, the verification,
+    the busy reset and its retry, and the restore's read-back."""
+
+    query = (
+        "nvidia-smi",
+        "--query-gpu=pci.bus_id,persistence_mode",
+        "--format=csv,noheader",
+    )
+    reset = ("nvidia-smi", "--gpu-reset", "-i", gpu_uuid)
+    steps = [
+        (query, 0),
+        (("nvidia-smi", "-i", bus, "-pm", "0"), 0),
+        (query, 0),
+        (("nvidia-smi", *QUERY_ARGS), 0),
+        (reset, 255),
+        (("nvidia-smi", *QUERY_ARGS), 0),
+        (reset, 0),
+        (query, 0),
+    ]
+    return b"".join(
+        trace_process(
+            200 + index, 2 * index + 1, 2 * index + 2, argv, code, executable=executable
+        )
+        for index, (argv, code) in enumerate(steps)
+    )
+
+
+def test_run_witness_classifies_the_quiesce_persistence_calls(
+    unit: SimpleNamespace,
+) -> None:
+    """Live (GF-REGIONAL-DESTR-001/015 on plain EKS): both nodes refused
+    "unknown NVIDIA invocation cannot prove no action" on the quiesce's
+    persistence reads and its ``-i <bus id> -pm 0``."""
+
+    FakeTracer.raw = _quiesce_window_trace(str(unit.host.executable), GPU, BUS)
+    (unit.directory / "finish.request").write_text("{}", encoding="utf-8")
+    assert probe.run_witness(RUN_ID, state_root=unit.root) == 0
+    final = json.loads((unit.directory / "final.json").read_text())
+    assert final["refusal"] is None, final["refusal"]
+    assert [item["returncode"] for item in final["actions"]] == [255, 0]
+    assert final["persistence_execs"] == {"queries": 3, "releases": 1}
+
+
+def test_run_witness_without_the_target_bus_id_refuses_the_release(
+    unit: SimpleNamespace,
+) -> None:
+    state = json.loads((unit.directory / "state.json").read_text())
+    del state["target_pci_bus_id"]
+    probe.write_private_json(unit.directory / "state.json", state)
+    FakeTracer.raw = _quiesce_window_trace(str(unit.host.executable), GPU, BUS)
+    (unit.directory / "finish.request").write_text("{}", encoding="utf-8")
+    assert probe.run_witness(RUN_ID, state_root=unit.root) == 0
+    final = json.loads((unit.directory / "final.json").read_text())
+    assert final["refusal"] == "unknown NVIDIA invocation cannot prove no action"
+    assert final["actions"] == []
 
 
 def test_run_witness_stops_itself_at_its_deadline(unit: SimpleNamespace) -> None:

@@ -25,6 +25,7 @@ from scripts.e2e.regional.destr015_physical_evidence import (
 from scripts.e2e.regional.late_ownership_barrier import BoundaryDenied, process_identity
 from scripts.e2e.regional.late_ownership_trace import (
     AttachedExecWitness,
+    ExecEvent,
     parse_exec_trace,
     physical_actions,
 )
@@ -34,6 +35,15 @@ QUERY_ARGS = (
     "--query-compute-apps=gpu_uuid,pid,process_name",
     "--format=csv,noheader,nounits",
 )
+#: The Node Agent quiesce's per-GPU persistence evidence (``PERSISTENCE_QUERY``
+#: of ``gpu_fault.node_agent.quiesce_persistence``): read before and after the
+#: target's release and again by the restore. Read-only.
+PERSISTENCE_QUERY_ARGS = (
+    "--query-gpu=pci.bus_id,persistence_mode",
+    "--format=csv,noheader",
+)
+#: The quiesce's target-scoped persistence release, ``-i <bus id> -pm 0``.
+PERSISTENCE_RELEASE_FLAGS = ("-pm", "0")
 
 
 class ClockEnvelope:
@@ -59,10 +69,65 @@ class ClockEnvelope:
         return {"monotonic_ns": after}
 
 
+def quiesce_persistence_execs(
+    events: tuple[ExecEvent, ...], *, executable: Path, pci_bus_id: str | None
+) -> tuple[tuple[ExecEvent, ...], list[ExecEvent], int]:
+    """Split the quiesce's persistence calls off the Agent's exec trace.
+
+    The Node Agent's QUIESCE_GPU_SERVICES releases persistence on the reset
+    target alone (``nvidia-smi -i <bus id> -pm 0``) and reads every GPU's
+    persistence mode around it; RESTORE_GPU_SERVICES reads it once more (live,
+    GF-REGIONAL-DESTR-015 attempt 2 on plain EKS: every one of them refused
+    the witness as an unknown NVIDIA invocation on both nodes). Only those
+    exact spellings, from the traced Agent, are taken out: the query anywhere,
+    the release only for ``pci_bus_id`` -- the target's own bus id, which the
+    witness reads on the host when it is armed. A release of any other GPU, of
+    every GPU, a ``-pm 1`` or a release with no bus id to compare stays in the
+    trace, and ``physical_actions`` refuses it.
+    """
+
+    remaining: list[ExecEvent] = []
+    releases: list[ExecEvent] = []
+    queries = 0
+    for event in events:
+        args = event.argv[1:]
+        if event.executable != str(executable):
+            remaining.append(event)
+        elif args == PERSISTENCE_QUERY_ARGS:
+            queries += 1
+        elif (
+            pci_bus_id is not None
+            and len(args) == 4
+            and args[0] == "-i"
+            and args[1].upper() == pci_bus_id.upper()
+            and args[2:] == PERSISTENCE_RELEASE_FLAGS
+        ):
+            releases.append(event)
+        else:
+            remaining.append(event)
+    return tuple(remaining), releases, queries
+
+
 def reset_events(
-    raw: bytes, *, executable: Path, gpu_uuid: str
+    raw: bytes,
+    *,
+    executable: Path,
+    gpu_uuid: str,
+    pci_bus_id: str | None = None,
+    persistence: dict[str, int] | None = None,
 ) -> tuple[list[dict[str, Any]], int]:
-    events = parse_exec_trace(raw)
+    """The reset invocations of the trace and its completed calibrations.
+
+    ``pci_bus_id`` is the target's bus id, for the quiesce's persistence release
+    (``quiesce_persistence_execs``); ``persistence`` receives how many of the
+    quiesce's persistence queries and releases the trace held.
+    """
+
+    events, releases, queries = quiesce_persistence_execs(
+        parse_exec_trace(raw), executable=executable, pci_bus_id=pci_bus_id
+    )
+    if persistence is not None:
+        persistence.update(queries=queries, releases=len(releases))
     physical_actions(
         events,
         nvidia_smi=executable,
@@ -95,6 +160,11 @@ def reset_events(
         for ended in calibration_ends
     ):
         raise BoundaryDenied("physical reset trace has no completed query calibration")
+    first_reset = min(reset["started_ns"] for reset in resets)
+    if any(release.ended_ns > first_reset for release in releases):
+        # The release belongs to the quiesce that precedes the reset; one that
+        # overlaps or follows it is not that quiesce's.
+        raise BoundaryDenied("persistence release is outside the quiesce before reset")
     return resets, len(calibration_ends)
 
 
