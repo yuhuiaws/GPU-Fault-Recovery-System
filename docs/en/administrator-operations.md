@@ -2944,7 +2944,12 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   (`gpu_fault_remediation_budget_region_limit` for the Region cap); confirm whether the workflows holding claims are still
   progressing. A claim is held until its workflow ends and a lapsed lease does not release it (a reset or reboot on the node
   does not stop with its executor's lease); a `RUNNING` holder that stopped progressing is failed by the deadline watchdog at
-  its execution deadline.
+  its execution deadline. A holder keeps its slot through long waits -- the node coming back after a reboot, a replacement,
+  validation, a workload restart -- up to its execution deadline (detailed design v2 §9.5: 30 minutes from the first claim for
+  a node workflow by default, at most the 1-hour lifetime for a job workflow); a `CHECK_MECHANICALS` waiting for an
+  operator's acknowledgement holds no slot. A rising `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}`
+  is the starvation guard passing over the waiters of a full scope -- throttling, not a stall; a holder still `RUNNING` past
+  its execution deadline is handled as `GpuFaultWorkflowDeadlineNotEnforced`.
 - **Boundary**: do not raise the budget directly to clear the alert; first confirm there is no "claim holder no longer
   progressing but still `RUNNING`" situation. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md).
 
@@ -2963,6 +2968,9 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   `gpu_fault_workflow_pending_age_seconds_max` finds the oldest waiting workflow; read its
   `remediation_budget_last_blocked_reason` / `remediation_budget_last_blocked_scope`.
   If a claim-holding workflow no longer progresses, handle as `GpuFaultRemediationBudgetStarved` instead.
+  A rising `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}` while other clusters' workflows still
+  start shows the starvation guard keeping the storm queued in this cluster alone; when the oldest waiter of the same storm
+  passes 30 minutes, `GpuFaultWorkflowPendingAge` fires as well and is handled here.
 - **Boundary**: the single-cluster cap is the safety cap on nodes changed simultaneously; do not raise it to clear the alert; when the waiting count falls
   at the expected rate, just wait and tell the business side the drain time. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md) and needs
   a change record and a rollback plan.
@@ -3064,6 +3072,11 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   ticks, so 30 minutes is not queueing latency but "no dispatcher will take it": a predecessor workflow not terminalised, a retired generation
   awaiting an operator, or the dispatcher itself stuck. The dispatcher observes this age on every tick and alerts once when over the threshold
   (`gpu_fault_workflow_pending_age_warnings_total`); this rule is the AMP version of the same fact.
+  The exception is budget queueing: claims are held until a workflow ends, so in a large correlated fault a `PENDING`
+  workflow waiting for remediation budget also passes 30 minutes. When the oldest `PENDING` workflow records
+  `remediation_budget_last_blocked_scope` and `GpuFaultRemediationBudgetClusterSaturated` or
+  `GpuFaultRemediationBudgetStarved` fires for that scope, handle it per those entries; the first checks below are for a
+  workflow no budget refused.
 - **Which metric it reads**: `gpu_fault_workflow_pending_age_seconds_max`; alongside
   `gpu_fault_workflow_retired_generation_awaiting_operator` (the number of retired generations still needing a human to close them)
   and `gpu_fault_workflow_dispatch_preemption_pending_seen_total`.

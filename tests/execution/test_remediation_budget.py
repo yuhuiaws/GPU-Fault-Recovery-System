@@ -276,3 +276,40 @@ def test_restore_compensation_never_waits_for_a_remediation_budget() -> None:
         )
         == {}
     )
+
+
+@pytest.mark.parametrize(
+    "operations",
+    [
+        (WorkflowOperation.FREEZE_EVIDENCE, WorkflowOperation.CHECK_MECHANICALS),
+        (
+            WorkflowOperation.FREEZE_EVIDENCE,
+            WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+            WorkflowOperation.CHECK_MECHANICALS,
+        ),
+    ],
+)
+def test_an_operator_acknowledgement_wait_holds_no_remediation_budget(
+    operations: tuple[WorkflowOperation, ...],
+) -> None:
+    """The CHECK_MECHANICALS plans the planner builds have no budgeted step, so
+    the wait for an operator (up to the 24-hour acknowledgement floor) keeps no
+    slot (design 9.5); a reset or reboot ordered afterwards is its own workflow.
+    """
+
+    store = InMemoryStore()
+    incident, workflow = _workflow(store, "inspection")
+    steps = [workflow_step(operation, node_ids=["node-a"]) for operation in operations]
+    waiting = workflow.model_copy(
+        update={
+            "status": WorkflowStatus.RUNNING,
+            "official_steps": steps,
+            "completed_step_indexes": [0],
+        }
+    )
+
+    assert budget_work_begun(waiting, steps) is False
+    assert (
+        remediation_budget_claims(RemediationBudgetPolicy(), waiting, incident, steps)
+        == {}
+    )

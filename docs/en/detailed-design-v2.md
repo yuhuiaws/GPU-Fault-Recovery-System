@@ -3932,6 +3932,30 @@ free slots: the first waiter may still not claim (a fleet-rollout fence holds it
 the waiters behind it. A fault storm in one cluster therefore cannot starve the others; a row never refused is still tried once.
 `RUNNING` rows are never passed over.
 
+Hold time and long waits: a claim is held until the workflow ends, so the long waits of one remediation -- the node coming
+back after a reboot, a replacement, validation telemetry, a workload restart -- keep the slot the whole time. The bound is the
+holder's execution deadline, at which the deadline watchdog fails it and the slot frees: `GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS`
+(default 1800 s) from the first claim for a sequential node workflow, at most the `GPU_FAULT_JOB_WORKFLOW_MAX_LIFETIME_SECONDS`
+lifetime (default 3600 s) for a DAG/job workflow, the install ceiling plus the containment allowance for a workflow with a node
+install. A workflow containing an operator-acknowledgement step (`CHECK_MECHANICALS`) has both deadlines floored at
+`GPU_FAULT_OPERATOR_ACKNOWLEDGEMENT_TIMEOUT_SECONDS` (default 86400 s), so a plan that also contained budgeted steps would hold
+its slot until the acknowledgement or that floor; the `CHECK_MECHANICALS` workflows the planner builds (`FREEZE_EVIDENCE` ->
+[`COLLECT_DIAGNOSTIC_BUNDLE`] -> `CHECK_MECHANICALS`) do not cordon, stop workloads or contain a budgeted step, claim no budget,
+and the wait for an operator's acknowledgement occupies no slot; a reset/reboot disposition submitted afterwards is a separate
+workflow admitted as usual.
+
+Observability: occupancy against the limits is `gpu_fault_remediation_budget_active_claims{scope_type}` (region, cluster, node,
+domain, class, counted by the admission rule), `gpu_fault_remediation_budget_cluster_active_claims{cluster_id}` against
+`gpu_fault_remediation_budget_cluster_limit`, and `active_claims{scope_type="region"}` against
+`gpu_fault_remediation_budget_region_limit`; waiting is `gpu_fault_remediation_budget_waiting_workflows` (by refusing scope type in
+`_by_scope`, per cluster in `gpu_fault_remediation_budget_cluster_waiting_workflows{cluster_id}`), the rows the starvation guard
+passes over each tick in `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}`, and the oldest waiter's age
+in `gpu_fault_workflow_pending_age_seconds_max`. The alerts `GpuFaultRemediationBudgetClusterSaturated` (a cluster at its limit
+with waiters for 30 minutes), `GpuFaultRemediationBudgetStarved` (waiters for 30 minutes) and `GpuFaultWorkflowPendingAge` (the
+oldest `PENDING` workflow older than 30 minutes) fire as expected during a large correlated fault; the handling is in the matching
+entries of administrator operations §8: confirm the holders still progress, estimate the drain time from the drain rate, and do
+not raise a limit to clear an alert.
+
 `GPU_FAULT_PROCESSOR_COMPLETION_CLUSTER_CONCURRENCY` is not a counterexample: it only controls
 the number of commit threads for different cluster transactions within a PostgreSQL completion batch; it does not limit how many nodes
 are in repair workflows at the same time, nor does it change the executor's action concurrency.
