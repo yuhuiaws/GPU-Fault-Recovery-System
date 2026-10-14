@@ -18,6 +18,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Adjust administrator configuration | `gpu-fault-admin config --state-dir ... [--file F] [--dry-run] --reference ...` | [Administrator Capacity Configuration](administrator-capacity-configuration.md) |
 | Declare/release a warm-spare GPU node (the failover target of `REPLACE_NODE`) | `gpu-fault-admin config spare --state-dir ... --node <node>` for the read-only check; add `--declare --reference ... --confirm DECLARE_WARM_SPARE_CORDON` to declare (label + cordon), `--release --reference ... --confirm RELEASE_WARM_SPARE_UNCORDON` to restore per the baseline; recorded in `<state-dir>/warm-spares/<node>.json` | Manual, "Adding an independently repaired and re-accepted node to the spare pool" |
 | Approve a pending Profile plan | The same `deploy --state-dir ... --approve-profile-plan <plan_sha256> --reference ...`; there is no separate approval verb | [Runtime Profile Change Approval](administrator-profile-change-approval.md) |
+| The registration cluster left the site and deploy refuses with `registration cluster ... is not among the managed GPU clusters` | Run the refusal's `deploy --state-dir ... --registration-cluster <remaining cluster of that provider> --reference ...` (moves the anchor, then continues the same deploy) | §5.0.4 |
 | Release across schema versions | `deploy --state-dir ... --accept-schema-change` (takes an Aurora snapshot first; `--accept-schema-change-without-snapshot` skips the snapshot) | §4.7 |
 | Join a GPU cluster | `deploy --state-dir ... --gpu-cluster-arn <all managed ARNs> --gpu-cluster-arn <new ARN>` (the given set must be the managed set or a superset of it; the extra ARNs are the joins; giving fewer is refused with `site manages GPU clusters the command omits ... use remove-cluster`; when there are code changes release first, then join), or the join-only `gpu-fault-admin join-cluster --state-dir ... --gpu-cluster-arn <new ARN>` (does not trigger a site release; already managed ARNs return `ALREADY_MANAGED`) | REG-8.1.5, §5 |
 | Remove a GPU cluster | `gpu-fault-admin remove-cluster --state-dir ... --gpu-cluster-arn <ARN> --confirm REMOVE_GPU_CLUSTER` | REG-8.1.6, REG-12, §5 |
@@ -1227,9 +1228,9 @@ Semantics and boundaries of `eks-managed`:
   version is a policy change and goes through the same review as a site profile change: the join writes
   `release-deploy/profile-plan.json` (`change_kind: CLUSTER_PROFILE_NEW`) and stops; record `plan_sha256` and run the
   printed `join-cluster ... --approve-profile-plan <sha> --reference <CHG>` (a `deploy --gpu-cluster-arn` adding a
-  cluster prints the same `join-cluster` command; do not switch to `deploy --approve-profile-plan`, see §5.0.4 limit 4);
-  the approval is consumed, the
-  immutable snapshot `profiles/<version>.yaml` is written and the join continues. Later clusters of the same provider
+  cluster prints the same `join-cluster` command; `deploy --approve-profile-plan` with the same flags and the new
+  cluster's ARN works too, its release leaves the cluster's pending plan alone, see Profile change approval §1.2); the
+  join consumes the approval, the immutable snapshot `profiles/<version>.yaml` is written and the join continues. Later clusters of the same provider
   reuse that snapshot without another review. A first `deploy` still requires its GPU clusters to share one provider
   (an all-plain-EKS first deploy starts from `eks-v1`); the other provider joins afterwards with `join-cluster`.
   Whenever a later `deploy` re-renders the site, the site profile base follows the **registration cluster's**
@@ -1979,7 +1980,21 @@ cluster itself while the site still has other GPU clusters:
   anything (no journal is written) and exits with `cannot remove <cluster-id>: it is the site Runtime Profile
   registration cluster ... Join another <provider> cluster first, then remove <cluster-id>: the anchor moves to that
   cluster. Nothing was changed`. Join a cluster of the same provider first, then remove the registration cluster.
-- Removing another cluster, or the last one, keeps the registration cluster (an empty site has no member to name).
+- Removing another cluster, or the last one, keeps the registration cluster (an empty site has no member to name); it
+  then names a cluster that **departed**, whose COMPLETED `remove-cluster/<cluster-id>/state.json` proves it left and
+  records its provider -- the family the site base keeps.
+
+**Joining clusters into an emptied site.** The first join must bring a cluster of that provider (one in the same
+`join-cluster`/`deploy --gpu-cluster-arn` is enough); a join of the other provider only is refused before anything
+changes with `... the first cluster to join must be a <provider> cluster, which takes over the anchor ... Nothing was
+changed`. Once the joined clusters are members, the registration cluster moves to one of that provider (a member on the
+site profile first, then the smallest cluster id): the command result carries `registration_reanchor` and
+`registration-anchor/journal.json` records the move with its proof. A `deploy` of the emptied site keeps the departed
+cluster's family (no fall back to the HyperPod base for "no cluster"); a new site profile version has no member to
+register under then and is refused at planning -- join a cluster first. Later deploys restore `spec.release` and
+`spec.runtimeProfile` from the last verified release but keep the current registration cluster: it follows membership,
+not the release (that step used to move a registration cluster `remove-cluster` had moved back to the removed one, and
+the next deploy refused).
 
 A version already registered keeps the anchor of its first registration: the control plane stores one copy per
 `profile_version`, labelled with the registration cluster of that time as its `cluster_id`, and the immutable snapshot
@@ -1987,8 +2002,13 @@ A version already registered keeps the anchor of its first registration: the con
 policy content, not that `cluster_id`, so after the registration cluster changes the same version is neither drift nor
 registered again; later versions register under the new registration cluster. An earlier `remove-cluster` kept a removed
 cluster as the registration cluster, and every later `deploy` then refused with `registration cluster <cluster-id> is not
-among the managed GPU clusters`; while that cluster still exists, such a site joins it back with `join-cluster` (same
-cluster id) and removes it once more with the current `remove-cluster`.
+among the managed GPU clusters`. The deploy now refuses before the source snapshot and names the way out: while a member
+of that provider remains, `gpu-fault-admin deploy --state-dir <dir> --registration-cluster <cluster-id> --reference <CHG>`
+checks the departed cluster's COMPLETED `remove-cluster/<id>/state.json`, confirms the target is a member of that
+provider, moves the anchor (journaled in `registration-anchor/journal.json` with the reference) and continues the same
+deploy; any later join moves it the same way. With no member of that provider left, join one first (`join-cluster`);
+without the removal journal the departure is unproven -- while the cluster exists, join it back with `join-cluster`
+(`--reclaim-cluster-token` when the site lost its entry). None of these moves changes the site base family.
 
 **Several plain EKS clusters in one batch.** The ARNs a `deploy` adds (including the remaining ARNs after a first deploy)
 and a `join-cluster` with several ARNs go through the batch join, and one batch may hold several plain EKS clusters: two
@@ -2020,17 +2040,6 @@ judgement).
    `src/gpu_fault/admin/deadlines.py`, not configurable); at the deadline the running step fails with `deployment
    deadline exceeded`. For a release that rolls node runtimes on every cluster, estimate from the number of clusters
    whether both budgets suffice.
-4. **A new cluster stopped for a Runtime Profile review resumes only with the printed
-   `join-cluster ... --approve-profile-plan ...`.** A join started by `deploy --gpu-cluster-arn` prints the same
-   `join-cluster` command when it stops. Do not switch to `deploy --approve-profile-plan`: a deploy that also runs an
-   application release checks the approval against the site profile before it joins the new cluster, so it judges the
-   `CLUSTER_PROFILE_NEW` approval stale and archives it as `SUPERSEDED` before the join; the join then stops again and
-   writes the same plan, and an archived `plan_sha256` cannot be approved again
-   (`archived Profile approval differs from the active approval`), so no command resumes that join any more. A deploy
-   that names the new cluster's ARN and runs no application release joins the cluster and consumes the approval, but
-   whether a deploy releases cannot be known beforehand. If a join was already resumed that way, do not edit or delete
-   the archive under `release-deploy/profile-approvals/`; keep the state-dir and hand it to the development team
-   (Profile change approval §1.2, §7). The fix of the order ships with a later release.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 

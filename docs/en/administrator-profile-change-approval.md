@@ -17,9 +17,9 @@ deregistrations continue to be handled by `join-cluster/remove-cluster` and do n
 of the site profile approval, but **a cluster's own new profile version is reviewed the same way**: the join writes the
 same `release-deploy/profile-plan.json` (`change_kind: CLUSTER_PROFILE_NEW`, `registration_cluster_id` naming the
 cluster), continues after the printed `join-cluster ... --approve-profile-plan <plan_sha256> --reference <CHG>` (a
-`deploy --gpu-cluster-arn` adding a cluster prints the same `join-cluster` command; do not switch to
-`deploy --approve-profile-plan`, see 1.2), and once the approval is consumed the immutable snapshot `profiles/<version>.yaml` is written and reused by
-later clusters of the same provider.
+`deploy --gpu-cluster-arn` adding a cluster prints the same `join-cluster` command; `deploy --approve-profile-plan`
+with the same flags resumes it too, see 1.2), and once the cluster's join consumed the approval the immutable snapshot
+`profiles/<version>.yaml` is written and reused by later clusters of the same provider.
 When several clusters need the same version, one plan covers them all and one approval approves it (see 1.2).
 
 ## 1. Shortest Operating Path
@@ -130,14 +130,18 @@ has no profile of its own and no approved snapshot (a plain EKS cluster a batch 
 cluster profiles) gets its first own version planned the same way by `deploy` (reviewed against the site profile); the
 approval writes the snapshot and pins the entry. A pinned version whose snapshot is missing is still refused.
 
-**Resume the join of a new cluster only with the printed `join-cluster` command**, also when `deploy --gpu-cluster-arn`
-started it, never with `deploy --approve-profile-plan` (a known limitation; the fix of the order ships with a later
-release): a deploy that also runs an application release checks the pending approval against the site profile before it
-joins the new cluster, so the `CLUSTER_PROFILE_NEW` approval is judged stale and archived as `SUPERSEDED` before the
-join runs; the join then stops again and writes the same plan, and an archived `plan_sha256` cannot be approved again
-(`archived Profile approval differs from the active approval`). A deploy that names the new cluster's ARN and runs no
-application release does join the cluster and consume the approval, but whether a deploy releases cannot be known
-beforehand. If a join was already resumed that way, see section 7.
+**A new cluster's join resumes with the printed `join-cluster` command or with `deploy --approve-profile-plan` and the
+same flags**; either way the cluster's join consumes the approval (`consumed.json` names `release_id: join-<cluster-id>`).
+A deploy that also runs an application release plans the site profile first and joins the new cluster afterwards: with
+the site profile unchanged, the release leaves a pending `CLUSTER_PROFILE_NEW` plan and its approval untouched for that
+join. A deploy resuming the join must name the new cluster's `--gpu-cluster-arn`; without it there is nothing to join
+and the approval waits for the next `join-cluster` or a deploy naming that ARN. When the site profile changed as well,
+the one plan file goes to the site profile first: the cluster's approval is archived as `SUPERSEDED`, the deploy stops
+for the site profile review, and the join writes its plan again afterwards. A plan whose approval was `SUPERSEDED` (or
+consumed, with the plan back under the same digest) can be approved again, explicitly: the earlier round moves, as it
+is, to `profile-approvals/<plan_sha256>.<n>/`, and `earlier-rounds.json` in the new round records how each earlier
+round ended, its reference and approver. Earlier releases refused that with `archived Profile approval differs from the
+active approval`; a join stopped that way continues once the printed command approves the plan again.
 
 An approval covers exactly the plan it was given for: when the plan changes before it is consumed (for example the set of
 clusters needing the version changed), the old approval is archived as `SUPERSEDED`, the new plan is written and the
@@ -191,7 +195,7 @@ The stop message has already printed the fields the administrator must review; f
 | `site_identity.aws_region` | Must be the approved Region |
 | `site_identity.cpu_eks_arn` | Must be the site's stable CPU control plane |
 | `site_identity_sha256` | Recomputed by the program to prevent the readable identity and digest disagreeing |
-| `registration_cluster_id` | The site's current registration cluster (`spec.runtimeProfile.registrationClusterId`), which new versions register under; `remove-cluster` moves it to a remaining member of the same provider when it removes that cluster. Registered versions and their immutable snapshots keep the anchor of their first registration, not required to still belong to the current GPU set |
+| `registration_cluster_id` | The site's current registration cluster (`spec.runtimeProfile.registrationClusterId`), which new versions register under; `remove-cluster` moves it to a remaining member of the same provider when it removes that cluster, and after the last cluster left the first joining cluster of that provider takes it over ([Administrator Operations](administrator-operations.md) §5.0.4). Registered versions and their immutable snapshots keep the anchor of their first registration, not required to still belong to the current GPU set |
 | `current_version` / `desired_version` | Must match the version migration described in the change ticket |
 | `change_kind` | Must be consistent with the risk and maintenance window |
 | `changes[]` | Every capability, mode, owner and adapter change must be explained |
@@ -255,6 +259,9 @@ On plan drift it automatically adds:
 superseded.json
 ```
 
+When the same plan is approved again, the earlier round's directory moves, as it is, to
+`profile-approvals/<plan_sha256>.<n>/` and the new round adds `earlier-rounds.json`.
+
 The corresponding release state is at:
 
 ```text
@@ -284,7 +291,7 @@ Success criteria:
 | Release completed but archive finalisation failed | Rerun the original four-parameter deploy; the system completes consumption with `ALREADY_APPLIED` |
 | Message that an approval or release is in progress | Wait for the current process to finish; do not delete the lock file |
 | GPU cluster join or deregistration | Use the formal join/remove commands; the GPU set does not change the stable Profile approval identity |
-| A new cluster's join resumed with `deploy --approve-profile-plan`: the approval is archived as `SUPERSEDED`, the join stops again with the same digest and approving it again is refused (`archived Profile approval differs from the active approval`) | Known limitation (1.2): the same plan cannot be approved again and no command resumes this join; do not edit, move or delete `profile-approvals/<plan_sha256>/` or the active records, keep the state-dir and hand it to the development team. Always resume a new cluster's join with the printed `join-cluster ... --approve-profile-plan` |
+| Under an earlier release a new cluster's join was resumed with `deploy --approve-profile-plan`: the approval was archived as `SUPERSEDED`, the join stopped again with the same digest and approving it again was refused (`archived Profile approval differs from the active approval`) | Approve the same `plan_sha256` again with the current release (the printed `join-cluster ... --approve-profile-plan`) and continue; the earlier round stays under `profile-approvals/<plan_sha256>.1/` (1.2). Do not edit, move or delete the archive by hand |
 | `approved Runtime Profile snapshot ... has a different policy than ...` on a cluster-owned version | The template policy changed under a pinned version; rerun `deploy` -- it plans the successor `regional-<provider>-<digest12>` (section 1.1) and prints the resume command. Do not remove the pinned snapshot |
 
 ## 8. Forbidden Operations

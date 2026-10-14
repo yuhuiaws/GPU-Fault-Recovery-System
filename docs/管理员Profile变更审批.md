@@ -14,7 +14,7 @@ profile** 的 GPU 集群使用；一个集群也可以拥有自己的 profile（
 稳定站点身份摘要；但**集群自己的新 profile 版本同样要审批**：join 写出同一份
 `release-deploy/profile-plan.json`（`change_kind: CLUSTER_PROFILE_NEW`，`registration_cluster_id` 为该集群），
 用停止信息打印的 `join-cluster ... --approve-profile-plan <plan_sha256> --reference <CHG>` 审批后继续
-（`deploy --gpu-cluster-arn` 新增集群时打印的也是这条 `join-cluster` 命令；不要改用 `deploy --approve-profile-plan`，见 1.2）；审批消费后写入不可变快照 `profiles/<version>.yaml`，后续同 provider 的集群复用。
+（`deploy --gpu-cluster-arn` 新增集群时打印的也是这条 `join-cluster` 命令；带同样参数的 `deploy --approve-profile-plan` 也能续跑，见 1.2）；审批由该集群的 join 消费，写入不可变快照 `profiles/<version>.yaml`，后续同 provider 的集群复用。
 多个集群需要同一版本时只出一份计划，一次审批覆盖全部（见 1.2）。
 
 ## 1. 最短操作路径
@@ -112,11 +112,14 @@ templateSource、本次发布的 `agentConfigDigest`），随发布注册该版�
 Profile、也没有已审批快照的集群（批量 join 计算集群 Profile 之前完成接入的普通 EKS 集群）由 `deploy` 以同样方式为其首个自有版本出计划
 （对照站点 Profile 审核），审批后写入快照并 pin 条目；已 pin 版本的快照缺失仍然拒绝。
 
-**新增集群的接入只能用打印的 `join-cluster` 命令续跑**，由 `deploy --gpu-cluster-arn` 发起的接入也一样，不能改用
-`deploy --approve-profile-plan`（已知限制，执行顺序的修复随后续版本发布）：同时执行应用 release 的 deploy 先按站点 Profile
-核对待审批记录、后接入新集群，这份 `CLUSTER_PROFILE_NEW` 审批在 join 之前就被判为过期并归档为 `SUPERSEDED`，join 随后再次停下、
-写出同一份计划；而已归档的 `plan_sha256` 不能再次审批（`archived Profile approval differs from the active approval`）。带上新集群
-ARN 又不发布应用 release 的 deploy 会直接接入并消费审批，但事先无法确定一次 deploy 是否发布。已经这样续跑过的按第 7 节处理。
+**新增集群的接入用打印的 `join-cluster` 命令或带同样参数的 `deploy --approve-profile-plan` 续跑**，两种方式都由该集群的
+join 消费审批（`consumed.json` 的 `release_id` 为 `join-<cluster-id>`）。同时执行应用 release 的 deploy 先为站点 Profile 出计划、
+后接入新集群：站点 Profile 未变化时，release 不动待审批的 `CLUSTER_PROFILE_NEW` 计划及其审批，留给随后的 join；用 deploy 续跑时
+要带上新集群的 `--gpu-cluster-arn`，否则这次 deploy 没有要接入的集群，审批留给下一次 `join-cluster` 或带该 ARN 的 deploy。站点
+Profile 本身也变化时计划文件仍只有一份，站点计划先审：集群的审批归档为 `SUPERSEDED`，deploy 停下等站点计划审批，join 之后再写出
+自己的计划。一个 `plan_sha256` 的审批被 `SUPERSEDED`（或已消费、计划又回到同一摘要）之后，同一计划可以再次明确审批：上一轮
+归档原样移到 `profile-approvals/<plan_sha256>.<n>/`，新一轮目录里的 `earlier-rounds.json` 记下每一轮的结局、变更单号与审批人。
+较早版本在这里以 `archived Profile approval differs from the active approval` 拒绝；那样停住的接入，用打印的命令再审批一次即可继续。
 
 审批只覆盖它所审的那份计划：计划在被消费前变化（例如需要该版本的集群集合变了），旧审批归档为 `SUPERSEDED`，写出新计划并停止，打印新摘要。
 控制面按版本只保存一份 Profile，记录首次注册它的集群（`cluster_id`）；release 比较已注册的 Profile 时不比较这个注册锚点，所以 join 追加、
@@ -167,7 +170,7 @@ release 把新版本注册在正在加入的集群名下。已存的 Profile 原
 | `site_identity.aws_region` | 必须是批准的Region |
 | `site_identity.cpu_eks_arn` | 必须是该站点稳定CPU控制面 |
 | `site_identity_sha256` | 由程序重新计算，防止可读身份与摘要不一致 |
-| `registration_cluster_id` | 站点当前的注册集群（`spec.runtimeProfile.registrationClusterId`），新版本以它注册；`remove-cluster` 移除它时会改为剩余的同 provider 成员。已注册版本与其不可变快照保留首次注册时的锚点，不要求仍属于当前GPU集合 |
+| `registration_cluster_id` | 站点当前的注册集群（`spec.runtimeProfile.registrationClusterId`），新版本以它注册；`remove-cluster` 移除它时会改为剩余的同 provider 成员，站点清空后由第一个接入的同 provider 集群接过（[管理员日常运维](管理员日常运维.md) §5.0.4）。已注册版本与其不可变快照保留首次注册时的锚点，不要求仍属于当前GPU集合 |
 | `current_version` / `desired_version` | 必须符合变更单描述的版本迁移 |
 | `change_kind` | 必须与风险和维护窗口一致 |
 | `changes[]` | 每项capability、mode、owner、adapter变化均须解释 |
@@ -231,6 +234,8 @@ consumed.json
 superseded.json
 ```
 
+同一计划再次审批时，上一轮目录原样移到`profile-approvals/<plan_sha256>.<n>/`，新一轮目录另有`earlier-rounds.json`。
+
 对应release状态位于：
 
 ```text
@@ -260,7 +265,7 @@ superseded.json
 | 发布已完成但归档收尾失败 | 重跑原四参数deploy；系统以`ALREADY_APPLIED`完成消费 |
 | 提示审批或发布正在进行 | 等待当前进程结束；不删除lock文件 |
 | GPU集群加入或注销 | 使用正式join/remove命令；GPU集合不改变稳定Profile审批身份 |
-| 新增集群的接入用 `deploy --approve-profile-plan` 续跑后审批归档为 `SUPERSEDED`，join 再次停下并打印同一摘要，再次审批被拒（`archived Profile approval differs from the active approval`） | 已知限制（1.2）：同一计划不能再次审批，没有命令能续跑这次接入；不要编辑、移动或删除 `profile-approvals/<plan_sha256>/` 与活动记录，保留 state-dir 交开发团队处理。新增集群一律用停止信息打印的 `join-cluster ... --approve-profile-plan` 续跑 |
+| 较早版本下新增集群的接入用 `deploy --approve-profile-plan` 续跑后审批归档为 `SUPERSEDED`，join 再次停下并打印同一摘要，再次审批被拒（`archived Profile approval differs from the active approval`） | 用当前版本再审批同一 `plan_sha256`（停止信息打印的 `join-cluster ... --approve-profile-plan`）并续跑；上一轮保留在 `profile-approvals/<plan_sha256>.1/`（1.2）。不要手工编辑、移动或删除归档 |
 | 集群自有版本上出现 `approved Runtime Profile snapshot ... has a different policy than ...` | 模板策略在已 pin 版本下变化；重跑 `deploy`——它会规划后继版本 `regional-<provider>-<digest12>`（第 1.1 节）并打印续跑命令。不要删除已 pin 的快照 |
 
 ## 8. 禁止操作

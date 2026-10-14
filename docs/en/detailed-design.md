@@ -3262,7 +3262,14 @@ following the site profile first, then by cluster id) and records it as `registr
 remaining-release-config digests the journal binds include that change, and `SITE_UPDATED` writes the site with the same
 `remaining_site_document`, so resumes and tombstone resolution validate as before. Without such a member the removal is
 refused before any journal is written: the base family follows the registration cluster's provider and must not change
-with a removal. A registered version's `cluster_id` is the label of its first registration: the registration check and
+with a removal. After the last cluster left, the registration cluster stays and names a departed cluster;
+`src/gpu_fault/admin/registration_anchor.py` proves the departure by that cluster's COMPLETED removal journal and reads its
+provider from it: the first join into the emptied site must bring a cluster of that provider, and once the join committed
+the anchor moves to one of them (`registration-anchor/journal.json`); a departed anchor an earlier release left is
+refused by deploy before the source snapshot and moved explicitly, proof-checked, by `deploy --registration-cluster`.
+`bootstrap_site.recover_verified_site_contract`, which restores `spec.runtimeProfile` from the last verified release,
+keeps the current registration cluster: it follows membership. A registered version's `cluster_id` is the label of its
+first registration: the registration check and
 verify of `gpu_fault_release.regional_runtime_profile` compare the policy only, not that label, and the
 immutable snapshot of `scripts/release_deploy_profile.py` keeps the anchor it records. The batch candidate site of
 `join-cluster` (`cluster_join._write_batch_candidate_site`) and the single-cluster commit
