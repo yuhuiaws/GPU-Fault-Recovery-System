@@ -44,6 +44,7 @@ from gpu_fault.cluster_executor.regional_client import (
     RegionalHyperPodSubmissionStore,
     RegionalIncidentOwnershipProvider,
 )
+from gpu_fault.eks_node_evidence import EksNodeEvidence
 from gpu_fault.eks_provider import EKS_ADAPTER_OWNER, eks_provider_from_environment
 from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
@@ -374,7 +375,9 @@ def _node_key_sync_from_environment(
     ``gpu-fault-admin deploy``, which is the pre-sync behaviour, so it is said
     out loud rather than left to be discovered at the next spot reclaim. The
     nodes are selected by ``GPU_FAULT_NODE_SELECTOR`` (for HyperPod, by default
-    the cluster-name label of ``GPU_FAULT_HYPERPOD_CLUSTER``).
+    the cluster-name label of ``GPU_FAULT_HYPERPOD_CLUSTER``). On an
+    ``eks-managed`` cluster the sync also gets the EC2 attester its replacement
+    nodes need (``_eks_node_evidence``).
     """
 
     interval = float(os.getenv("GPU_FAULT_NODE_KEY_SYNC_SECONDS", "60"))
@@ -404,7 +407,32 @@ def _node_key_sync_from_environment(
         node_selector=selector,
         namespace=namespace,
         interval_seconds=interval,
+        attester=(
+            _eks_node_evidence(selector)
+            if cluster_provider() is ClusterProvider.EKS_MANAGED
+            else None
+        ),
     )
+
+
+def _eks_node_evidence(selector: str) -> EksNodeEvidence | None:
+    """The EC2 attester of an eks-managed cluster, or None with one WARNING.
+
+    Without it the sync keys only nodes the control plane already knows, and
+    a never-installed replacement node is not one of them: it gets no key, and
+    no Agent, until the next ``gpu-fault-admin deploy``. That is said out loud
+    at start-up rather than found at the next spot reclaim.
+    """
+
+    try:
+        return EksNodeEvidence.from_environment(selector)
+    except ValueError as exc:
+        LOGGER.warning(
+            "replacement nodes of this eks-managed cluster get no Node Action "
+            "key until the next deploy: %s",
+            exc,
+        )
+        return None
 
 
 def _claim_loop_settings_from_environment() -> dict[str, float | int]:

@@ -251,7 +251,14 @@ def test_node_key_sync_lists_nodes_by_the_selector() -> None:
 
         def list_node(self, label_selector: str) -> dict[str, object]:
             self.selectors.append(label_selector)
-            return {"items": [{"metadata": {"name": "ip-10-0-33-205.ec2.internal"}}]}
+            # A Node as the API returns it: the sync checks the UID and the
+            # selector's labels the way the deploy host's helper does.
+            node = {
+                "name": "ip-10-0-33-205.ec2.internal",
+                "uid": "uid-1",
+                "labels": {"node-type": "gpu"},
+            }
+            return {"items": [{"metadata": node}]}
 
     core = Core()
     sync = NodeActionKeySync(

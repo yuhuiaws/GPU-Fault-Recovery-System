@@ -14,13 +14,23 @@ Invariants, each of them a test:
 
 * only keys for nodes the cluster's node selector matches are requested
   (``GPU_FAULT_NODE_SELECTOR``; for HyperPod the cluster-name label), the
-  same selection the deploy host's provisioning helper uses;
+  same selection the deploy host's provisioning helper uses, checked the way
+  it checks it: valid Node names, one UID each, no repeats, every node
+  matching the selector -- or nothing is requested at all;
 * only *missing* keys are written, in one merge patch fenced by the Secret's
   ``resourceVersion``, so an existing (possibly rotated) key is never
   overwritten and a concurrent writer makes the patch fail instead of losing;
 * nothing is deleted and the Secret is never created here;
-* any refusal or malformed answer from the control plane means no patch;
+* a refusal keys nothing for the nodes it covers, and a malformed answer or a
+  request without a verdict means no patch at all;
 * logs carry node names and counts, never key material.
+
+A plain EKS node that was never installed is unknown to the control plane
+(404): nothing there places it before its first install. On an
+``eks-managed`` cluster such a refusal is followed by one request per node
+carrying the EC2 identity ``attester`` read for it
+(``gpu_fault/eks_node_evidence.py``); a node it cannot attest is not
+asked for, and one refused node does not hold back the others.
 """
 
 from __future__ import annotations
@@ -28,13 +38,15 @@ from __future__ import annotations
 import base64
 import logging
 import time
-from typing import Any, Callable
+from typing import Any, Callable, Protocol, Sequence
 
 from gpu_fault.cluster_executor.regional_client import (
     ClusterExecutorError,
     RegionalExecutorClient,
 )
 from gpu_fault.cluster_scope import node_selector as scope_node_selector
+from gpu_fault.cluster_scope import selector_matches
+from gpu_fault.node_key_attestation import NODE_NAME_PATTERN, EksNodeAttestation
 from gpu_fault.node_provider import HYPERPOD_CLUSTER_LABEL as HYPERPOD_CLUSTER_LABEL
 
 # The pre-split module's name: operators filter on ``gpu_fault.cluster_executor``.
@@ -63,6 +75,14 @@ def _api_status(error: Exception) -> int | None:
     return status if isinstance(status, int) else None
 
 
+class NodeKeyAttester(Protocol):
+    """What the sync needs to attest nodes the control plane does not know."""
+
+    def attest(
+        self, nodes: Sequence[Any]
+    ) -> tuple[dict[str, EksNodeAttestation], dict[str, str]]: ...
+
+
 class NodeActionKeySync:
     """One reconciliation of the node-key Secret against the labelled nodes."""
 
@@ -77,6 +97,7 @@ class NodeActionKeySync:
         secret_name: str = NODE_ACTION_KEYS_SECRET_NAME,
         interval_seconds: float = NODE_KEY_SYNC_INTERVAL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        attester: NodeKeyAttester | None = None,
     ) -> None:
         # Either an explicit selector (any provider) or the HyperPod cluster
         # name, which implies the cluster-name label selector.
@@ -105,6 +126,9 @@ class NodeActionKeySync:
         self.secret_name = secret_name.strip()
         self.interval_seconds = interval_seconds
         self.clock = clock
+        # ``eks-managed`` only: states a node's EC2 identity when the control
+        # plane has no evidence of it; None everywhere else.
+        self.attester = attester
         self.added_total = 0
         self.failures_total = 0
         self._next_due: float | None = None
@@ -119,13 +143,46 @@ class NodeActionKeySync:
     def labelled_nodes(self) -> list[str]:
         """Names of the Kubernetes nodes this cluster's node selector matches."""
 
+        return list(self._inventory())
+
+    def _inventory(self) -> dict[str, Any]:
+        """The selected nodes by name, checked the way the deploy host checks them.
+
+        A name that is not a Kubernetes Node name, a missing UID, a repeated
+        name or UID, or a node the selector does not match means the list
+        cannot be trusted and nothing is requested from it (the provisioning
+        helper's "node identity is invalid or ambiguous"). A node being
+        deleted is left out: it is leaving.
+        """
+
         response = self.core.list_node(label_selector=self.node_selector)
+        nodes: dict[str, Any] = {}
         names: set[str] = set()
+        uids: set[str] = set()
         for item in _value(response, "items", []) or []:
-            name = _value(_value(item, "metadata", {}) or {}, "name")
-            if name:
-                names.add(str(name))
-        return sorted(names)
+            metadata = _value(item, "metadata", {}) or {}
+            name = str(_value(metadata, "name", "") or "")
+            uid = str(_value(metadata, "uid", "") or "")
+            labels = _value(metadata, "labels", {}) or {}
+            if (
+                NODE_NAME_PATTERN.fullmatch(name) is None
+                or not uid
+                or name in names
+                or uid in uids
+                or not selector_matches(dict(labels), self.node_selector)
+            ):
+                raise ClusterExecutorError(
+                    "the selected node inventory is invalid or ambiguous; no node "
+                    "action key is requested from it"
+                )
+            names.add(name)
+            uids.add(uid)
+            if not (
+                _value(metadata, "deletion_timestamp")
+                or _value(metadata, "deletionTimestamp")
+            ):
+                nodes[name] = item
+        return dict(sorted(nodes.items()))
 
     def _read_secret(self) -> tuple[str, frozenset[str]] | None:
         """The Secret's resourceVersion and key *names*; None when it is absent.
@@ -154,9 +211,11 @@ class NodeActionKeySync:
     def run(self) -> list[str]:
         """Add the keys the labelled nodes lack; returns the node names added.
 
-        Raises on any refusal, transport failure or malformed answer -- with
-        nothing written, because the patch is built only after every requested
-        key has been validated. The executor's wrapper turns that into a log
+        Raises on any refusal, transport failure or malformed answer. A
+        transport failure or a malformed answer writes nothing, because the
+        patch is built only after every requested key has been validated; a
+        refusal of some attested nodes still patches the keys granted for the
+        others before it raises. The executor's wrapper turns that into a log
         line and the next cycle tries again.
         """
 
@@ -168,7 +227,7 @@ class NodeActionKeySync:
             raise
 
     def _run(self) -> list[str]:
-        nodes = self.labelled_nodes()
+        nodes = self._inventory()
         current = self._read_secret()
         if current is None:
             # The deploy host creates the Secret with the deploy-time node set
@@ -183,13 +242,10 @@ class NodeActionKeySync:
         if not missing:
             return []
         encoded: dict[str, str] = {}
+        refused: dict[str, str] = {}
         for start in range(0, len(missing), NODE_KEY_REQUEST_BATCH):
             chunk = missing[start : start + NODE_KEY_REQUEST_BATCH]
-            keys = self.client.node_action_keys(chunk)
-            if set(keys) != set(chunk):
-                raise ClusterExecutorError(
-                    "control plane answered a different node set than requested"
-                )
+            keys = self._request(chunk, nodes, refused)
             for node_name, value in keys.items():
                 if len(value) < MIN_NODE_KEY_LENGTH or value != value.strip():
                     raise ClusterExecutorError(
@@ -198,6 +254,61 @@ class NodeActionKeySync:
                 encoded[node_name] = base64.b64encode(value.encode("utf-8")).decode(
                     "ascii"
                 )
+        added = self._patch(resource_version, encoded)
+        if refused:
+            raise ClusterExecutorError(
+                f"no node action key for {len(refused)} node(s): "
+                + "; ".join(f"{name}: {reason}" for name, reason in refused.items())
+            )
+        return added
+
+    def _request(
+        self, chunk: list[str], nodes: dict[str, Any], refused: dict[str, str]
+    ) -> dict[str, str]:
+        """The keys the control plane grants for ``chunk``; refusals go to ``refused``.
+
+        The plain request first, exactly what every control plane answers. A
+        404 on an ``eks-managed`` cluster -- a node nothing there knows yet --
+        is followed by one request per node: with the EC2 identity the
+        attester states for it, or plain when it states none (a node the
+        control plane knows by other evidence is still keyed). Every other
+        refusal of the first request, and any request without a verdict,
+        raises with nothing written.
+        """
+
+        try:
+            return self._checked(chunk, self.client.node_action_keys(chunk))
+        except ClusterExecutorError as exc:
+            if exc.status_code != 404 or self.attester is None:
+                raise
+        attestations, reasons = self.attester.attest([nodes[name] for name in chunk])
+        keys: dict[str, str] = {}
+        for name in chunk:
+            attestation = attestations.get(name)
+            try:
+                answer = self.client.node_action_keys(
+                    [name], attestations=[attestation] if attestation else None
+                )
+            except ClusterExecutorError as exc:
+                if exc.status_code is None:
+                    raise
+                # The attester's reason says more than the control plane's 404.
+                refused[name] = reasons.get(name) or str(exc)
+                continue
+            keys.update(self._checked([name], answer))
+        return keys
+
+    @staticmethod
+    def _checked(requested: list[str], keys: dict[str, str]) -> dict[str, str]:
+        if set(keys) != set(requested):
+            raise ClusterExecutorError(
+                "control plane answered a different node set than requested"
+            )
+        return keys
+
+    def _patch(self, resource_version: str, encoded: dict[str, str]) -> list[str]:
+        if not encoded:
+            return []
         # A JSON merge patch adds exactly these keys and touches no other; the
         # resourceVersion precondition makes the apiserver refuse it (409) if
         # anything -- the deploy host, the sibling replica -- wrote the Secret

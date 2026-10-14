@@ -20,6 +20,7 @@ from gpu_fault.cluster_executor.bootstrap import (
     executor_from_environment,
 )
 from gpu_fault.cluster_executor.regional_client import ClusterExecutorError
+from gpu_fault.eks_node_evidence import EksNodeEvidence
 from gpu_fault.eks_provider import EksManagedNodeProvider
 from gpu_fault.hyperpod_spares import HyperPodSpareCoordinator
 from gpu_fault.node_provider import ClusterProvider
@@ -242,3 +243,69 @@ def test_node_key_sync_is_disabled_without_any_scope(
     assert "GPU_FAULT_NODE_SELECTOR and GPU_FAULT_HYPERPOD_CLUSTER are unset" in (
         caplog.text
     )
+
+
+def test_an_eks_managed_sync_gets_the_ec2_attester_of_its_replacement_nodes(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    owned = "gpu-fault.io/control-plane=us-west-2-hp-cluster-0a1b2c3d"
+    monkeypatch.setenv("GPU_FAULT_CLUSTER_PROVIDER", "eks-managed")
+    monkeypatch.setenv("GPU_FAULT_NODE_SELECTOR", owned)
+    monkeypatch.setenv("GPU_FAULT_EKS_CLUSTER_NAME", "gpu-eks-cluster")
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    monkeypatch.delenv("GPU_FAULT_NODE_KEY_SYNC_SECONDS", raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.cluster_executor"):
+        sync = _node_key_sync_from_environment(object(), object())  # type: ignore[arg-type]
+
+    assert sync is not None
+    assert isinstance(sync.attester, EksNodeEvidence), type(sync.attester)
+    assert sync.attester.eks_cluster_name == "gpu-eks-cluster"
+    assert sync.attester.region_name == "us-west-2"
+    assert "no Node Action key" not in caplog.text
+
+
+@pytest.mark.parametrize(
+    ("selector", "eks_cluster", "reason"),
+    [
+        (
+            "gpu-fault.io/control-plane=us-west-2-hp-cluster-0a1b2c3d",
+            "",
+            "GPU_FAULT_EKS_CLUSTER_NAME",
+        ),
+        ("nvidia.com/gpu.present=true", "gpu-eks-cluster", "node-scope --converge"),
+    ],
+)
+def test_an_eks_managed_sync_that_cannot_attest_says_so_and_keeps_running(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    selector: str,
+    eks_cluster: str,
+    reason: str,
+) -> None:
+    monkeypatch.setenv("GPU_FAULT_CLUSTER_PROVIDER", "eks-managed")
+    monkeypatch.setenv("GPU_FAULT_NODE_SELECTOR", selector)
+    monkeypatch.setenv("GPU_FAULT_EKS_CLUSTER_NAME", eks_cluster)
+    monkeypatch.delenv("GPU_FAULT_NODE_KEY_SYNC_SECONDS", raising=False)
+
+    with caplog.at_level(logging.WARNING, logger="gpu_fault.cluster_executor"):
+        sync = _node_key_sync_from_environment(object(), object())  # type: ignore[arg-type]
+
+    assert sync is not None, "nodes the control plane knows are still keyed"
+    assert sync.attester is None
+    assert "get no Node Action key until the next deploy" in caplog.text
+    assert reason in caplog.text
+
+
+def test_a_hyperpod_sync_has_no_attester(monkeypatch: pytest.MonkeyPatch) -> None:
+    """SageMaker identities place HyperPod nodes on the control plane itself."""
+
+    monkeypatch.delenv("GPU_FAULT_CLUSTER_PROVIDER", raising=False)
+    monkeypatch.delenv("GPU_FAULT_NODE_SELECTOR", raising=False)
+    monkeypatch.setenv("GPU_FAULT_HYPERPOD_CLUSTER", "hp-cluster-a")
+    monkeypatch.delenv("GPU_FAULT_NODE_KEY_SYNC_SECONDS", raising=False)
+
+    sync = _node_key_sync_from_environment(object(), object())  # type: ignore[arg-type]
+
+    assert sync is not None
+    assert sync.attester is None

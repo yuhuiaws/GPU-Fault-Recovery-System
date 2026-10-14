@@ -36,6 +36,7 @@ from gpu_fault.fleet import (
 )
 from gpu_fault.hyperpod import HyperPodSubmissionRecord
 from gpu_fault.models import AdvisoryNotification
+from gpu_fault.node_key_attestation import EksNodeAttestation
 from gpu_fault.regional import (
     BatchedStepResult,
     RegionalExecutorReadinessRequest,
@@ -457,23 +458,31 @@ class RegionalExecutorClient:
         )
         return RemoteActionCommand.model_validate(response)
 
-    def node_action_keys(self, node_ids: list[str]) -> dict[str, str]:
+    def node_action_keys(
+        self,
+        node_ids: list[str],
+        attestations: list[EksNodeAttestation] | None = None,
+    ) -> dict[str, str]:
         """Node-scoped Node Action keys for ``node_ids`` of this cluster.
 
         Backs the executor's node-key sync: the control plane derives the
         version-2 key for each name it already knows from this cluster's own
         evidence, and refuses the whole request (404) when any name is unknown.
-        The values are secrets -- the caller writes them into the node-key
-        Secret and never logs them. The answer must be for this cluster and
-        must name exactly the nodes asked for; anything else is refused here so
-        a confused control plane cannot key a node it was not asked about.
+        ``attestations`` carries the EC2 identity of plain-EKS nodes it cannot
+        know yet (``gpu_fault.node_key_attestation``); the field is left out of
+        the body when there are none, so a control plane that predates it keeps
+        answering. The values are secrets -- the caller writes them into the
+        node-key Secret and never logs them. The answer must be for this
+        cluster and must name exactly the nodes asked for; anything else is
+        refused here so a confused control plane cannot key a node it was not
+        asked about.
         """
 
         requested = [str(node_id) for node_id in node_ids]
-        response = self._post(
-            "/v1/regional/node-action-keys",
-            {"cluster_id": self.cluster_id, "node_ids": requested},
-        )
+        body: dict[str, Any] = {"cluster_id": self.cluster_id, "node_ids": requested}
+        if attestations:
+            body["nodes"] = [item.model_dump(mode="json") for item in attestations]
+        response = self._post("/v1/regional/node-action-keys", body)
         keys = response.get("keys") if isinstance(response, dict) else None
         if response.get("cluster_id") != self.cluster_id or not isinstance(keys, dict):
             raise ClusterExecutorError(

@@ -67,7 +67,18 @@ class FakeCore:
 
     def list_node(self, label_selector: str) -> dict[str, Any]:
         self.list_selectors.append(label_selector)
-        return {"items": [{"metadata": {"name": name}} for name in self.nodes]}
+        return {
+            "items": [
+                {
+                    "metadata": {
+                        "name": name,
+                        "uid": f"{name}-uid",
+                        "labels": {HYPERPOD_CLUSTER_LABEL: HYPERPOD},
+                    }
+                }
+                for name in self.nodes
+            ]
+        }
 
     def read_namespaced_secret(self, name: str, namespace: str) -> dict[str, Any]:
         self.reads.append((name, namespace))
