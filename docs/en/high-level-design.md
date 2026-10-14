@@ -1070,7 +1070,7 @@ The terminal event, the `attempt_event` link, and the completion decision curren
 
 ### 6.3 Route Groups
 
-`create_app()` currently always mounts 89 application routes; the regional production form installs the five-bucket default-deny
+`create_app()` currently always mounts 92 application routes; the regional production form installs the five-bucket default-deny
 middleware on top of them. Grouped by function:
 
 - `/v1/gpu-events/*`: XID, distributed XID, SXID, and correlation progress lookup.

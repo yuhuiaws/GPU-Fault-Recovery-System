@@ -4701,7 +4701,10 @@ only checks that the few document assertions declared in the `scripts/check-doc-
 paths/symbols exist, generated artifacts are in sync, and command order. The numbers in this document (264/277 metric families for the worker role,
 `regional_mode` off/on, 92 routes, 47 Store codec kinds, 20 notification types, 33 operations,
 81 declared indexes, 18 schema versions) were all obtained by assembling the real app, instantiating the Store codec or reading the
-machine sources and recounting; recount them after changing code, no guard will discover they are stale for you.
+machine sources and recounting; recount them after changing code. The route total, the five-bucket distribution and the
+per-module route tables are held to the really assembled app by
+`tests/test_documentation_contracts.py::test_docs_state_the_assembled_apps_route_count_and_buckets`; for the other numbers
+no guard will discover they are stale for you.
 
 ---
 

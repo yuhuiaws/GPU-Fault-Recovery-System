@@ -701,10 +701,10 @@ and the training submission CLI), but that is a capability of the operations too
 
 ### 8.1 API Surface
 
-`create_app()` always mounts **89 application routes**; the regional production form enables on this set of routes
+`create_app()` always mounts **92 application routes**; the regional production form enables on this set of routes
 the default-deny model of "every route explicitly declares its bucket". The five buckets
 `public` / `metrics` / `cluster-token` / `dual-credential` /
-`execution-token` are currently distributed 2 / 1 / 34 / 7 / 45 (`public` is `/healthz` and
+`execution-token` are currently distributed 2 / 1 / 37 / 7 / 45 (`public` is `/healthz` and
 `/livez`; the numbers are authoritative as enumerated in-process by `create_app()` + `ExplicitAuthorizationRegistry.load()`).
 A new route without a declared bucket
 fails startup at application assembly; at runtime, failing to resolve a bucket always yields 403, but **a path that matches no route answers 404**

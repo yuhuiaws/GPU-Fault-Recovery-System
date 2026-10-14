@@ -820,3 +820,129 @@ def test_html_build_uses_the_current_authoritative_document_set() -> None:
         "docs/security/credential-exposure-20260823.md",
     ):
         assert historical_input not in builder
+
+
+ROUTE_COUNT_DOCUMENTS = (
+    "docs/概要设计.md",
+    "docs/概要设计-v2.md",
+    "docs/详细设计.md",
+    "docs/详细设计-v2.md",
+    "docs/扩展指南.md",
+    "docs/en/high-level-design.md",
+    "docs/en/high-level-design-v2.md",
+    "docs/en/detailed-design.md",
+    "docs/en/detailed-design-v2.md",
+    "docs/en/extension-guide.md",
+)
+ROUTE_TOTAL = re.compile(r"(\d+)\s*条应用路由|(\d+) application routes")
+#: ``public / metrics / cluster-token / dual-credential / execution-token``.
+BUCKET_SPREAD = re.compile(
+    r"(?:当前分布|currently distributed) (\d+) / (\d+) / (\d+) / (\d+) / (\d+)"
+)
+BUCKET_ROW = re.compile(
+    r"^\| `(public|metrics|cluster-token|dual-credential|execution-token)` "
+    r"\| (\d+) \|",
+    re.MULTILINE,
+)
+BUCKET_LINE = re.compile(
+    r"^(?:授权桶分布|Authorization bucket distribution)[^\n]*\n[^\n]*", re.MULTILINE
+)
+BUCKET_INLINE = re.compile(
+    r"`(public|metrics|cluster-token|dual-credential|execution-token)` (\d+)"
+)
+MODULE_ROW = re.compile(
+    r"^\| `(src/gpu_fault/app/[a-z_/]+\.py)` \| (\d+) \|", re.MULTILINE
+)
+#: ``cluster-token + execution-token + dual-credential + metrics + public``.
+BUCKET_SUM = re.compile(r"[（(](\d+) \+ (\d+) \+ (\d+) \+ (\d+) \+ (\d+)[）)]")
+MODULE_TOTAL = re.compile(
+    r"上表 (\d+) 个模块合计 (\d+) 条|The (\d+) modules in the table above total (\d+) routes"
+)
+
+
+def _assembled_routes() -> tuple[int, dict[str, int], dict[str, int]]:
+    """The route total, the bucket counts and the per-file counts of the real app."""
+
+    from collections import Counter
+
+    from gpu_fault.app import create_app
+    from gpu_fault.app.authorization import (
+        AUTHORIZATION_BUCKET_ATTRIBUTE,
+        iter_api_routes,
+    )
+    from tests._builders import build_context
+
+    routes = [
+        route
+        for route in iter_api_routes(create_app(build_context()).routes)
+        if route.path.startswith("/v1/")
+        or route.path in {"/healthz", "/livez", "/metrics"}
+    ]
+    buckets = Counter(
+        str(getattr(route.endpoint, AUTHORIZATION_BUCKET_ATTRIBUTE)) for route in routes
+    )
+    modules = Counter(
+        "src/" + route.endpoint.__module__.replace(".", "/") + ".py" for route in routes
+    )
+    return len(routes), dict(buckets), dict(modules)
+
+
+def test_docs_state_the_assembled_apps_route_count_and_buckets() -> None:
+    """Six design documents said 89 routes while the app mounted 92.
+
+    Every "N application routes" sentence, every five-bucket distribution and
+    every per-module route table must agree with the app ``create_app()``
+    actually assembles; each listed document must carry its total, so the
+    guard cannot silently stop guarding.
+    """
+
+    total, buckets, modules = _assembled_routes()
+    order = ("public", "metrics", "cluster-token", "dual-credential", "execution-token")
+    summed = (
+        "cluster-token",
+        "execution-token",
+        "dual-credential",
+        "metrics",
+        "public",
+    )
+    stale: list[str] = []
+    for relative in ROUTE_COUNT_DOCUMENTS:
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        totals = [int(a or b) for a, b in ROUTE_TOTAL.findall(text)]
+        if not totals:
+            stale.append(f"{relative} states no application route total")
+        stale.extend(
+            f"{relative} says {value} routes, the app mounts {total}"
+            for value in totals
+            if value != total
+        )
+        for spread in BUCKET_SPREAD.findall(text):
+            claimed = dict(zip(order, map(int, spread)))
+            if claimed != {name: buckets.get(name, 0) for name in order}:
+                stale.append(f"{relative} distributes {spread}, the app {buckets}")
+        rows = {name: int(value) for name, value in BUCKET_ROW.findall(text)}
+        for line in BUCKET_LINE.findall(text):
+            rows.update(
+                {name: int(value) for name, value in BUCKET_INLINE.findall(line)}
+            )
+        stale.extend(
+            f"{relative} counts {value} {name} routes, the app {buckets.get(name, 0)}"
+            for name, value in rows.items()
+            if value != buckets.get(name, 0)
+        )
+        for parts in BUCKET_SUM.findall(text):
+            if dict(zip(summed, map(int, parts))) != {
+                name: buckets.get(name, 0) for name in summed
+            }:
+                stale.append(f"{relative} sums the buckets as {parts}")
+        table = {path: int(value) for path, value in MODULE_ROW.findall(text)}
+        if table and table != modules:
+            stale.append(f"{relative} tables the modules as {table}, the app {modules}")
+        for match in MODULE_TOTAL.findall(text):
+            count, routes = (
+                int(item) for item in (match[0] or match[2], match[1] or match[3])
+            )
+            if (count, routes) != (len(modules), total):
+                stale.append(f"{relative} totals {count} modules / {routes} routes")
+
+    assert stale == [], "\n".join(stale)
