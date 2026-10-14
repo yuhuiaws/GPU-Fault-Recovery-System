@@ -9,6 +9,7 @@ from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.admin.aurora_placement import placement_findings
 from gpu_fault.admin.command_log import ADMIN_LOG_ENVIRONMENT
 from gpu_fault.admin.ownership_release import status_findings
 from gpu_fault.admin.resource_registry_outcome import FIELD, status_view
@@ -71,7 +72,9 @@ def print_status_report(
     administrator-side findings the engine's report cannot carry, one more
     header line each; with ``site`` the stale ownership claims of the clusters
     it de-registered are read and added (the engine's report covers the
-    clusters the site manages, the stale claim is on one it dropped).
+    clusters the site manages, the stale claim is on one it dropped), and so is
+    an Aurora writer outside the control plane's zones (``aurora_placement``,
+    read-only; the remedy is ``aurora-failback``, never run from here).
 
     With ``site_file`` -- the managed site, whose directory holds the deploy
     host's records -- the installation registry sync record is added as the
@@ -81,7 +84,12 @@ def print_status_report(
     engine's (``resource_registry_outcome`` says why).
     """
     if site is not None:
-        findings = [*findings, *status_findings(site)]
+        state_dir = site_file.parent if site_file is not None else None
+        findings = [
+            *findings,
+            *status_findings(site),
+            *placement_findings(site, state_dir=state_dir),
+        ]
     report = status_document(stdout or "")
     if site_file is not None:
         view = status_view(site_file.parent, release_id=_running_release_id(report))

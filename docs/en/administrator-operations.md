@@ -29,6 +29,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Submit an explicit remediation after CHECK_MECHANICALS; trigger a validated restore after a QUARANTINED node (or the still-isolated node of an ESCALATED incident whose ladder is exhausted and every workflow ended) is repaired; manually confirm a node action with unknown outcome | `gpu-fault-admin submit-remediation --state-dir ... --incident-id ... --disposition {inspected,reset-gpu,reboot-node,quarantine,restore,confirm-node-action} [--node <node>] [--plan]` (`restore` see §9.2, `confirm-node-action --node` see §9.4) | §9, §9.2, §9.4, REG 8.3 |
 | Remotely view/requeue a node collector's dead-letter outbox | `gpu-fault-admin collector-outbox --state-dir ... --cluster-id C --node N --collector kernel --action stats\|list\|requeue-dead [--path /v1/...] [--yes] --reference CHG-...` (no login to the GPU node; only metadata is returned; `requeue-dead` must carry `--yes`; there is no remote `--force`) | §9.3, §8 `GpuFaultCollectorSilent` |
 | Reclaim PostgreSQL hot-table bloat (after a campaign day, before a formal perf or acceptance round) | `gpu-fault-admin store-maintenance --state-dir ... --reference CHG-... [--confirm STORE_MAINTENANCE]` (without `--confirm` it only prints each hot table's live rows, pages, index bytes and proposed action; with the token it executes under the site operation lock; evidence under `$STATE_DIR/store-maintenance/`) | [§10.3](#103-hot-table-storage-parameters-and-store-maintenance-reclaiming-bloat) |
+| A failover left the Aurora writer in a zone outside the control plane's (`status` reports `finding: Aurora writer ... runs in ...`) | `gpu-fault-admin aurora-failback --state-dir ... --reference CHG-... [--confirm AURORA_FAILBACK]` (without `--confirm` it only prints the placement and the target member; with the token it executes under the site operation lock, refuses while work is in flight, waits for the cluster to be `available` and the control plane ready, journal under `$STATE_DIR/aurora-failback/`; never run automatically) | [§4.9](#49-aurora-writer-beside-the-control-plane-the-status-finding-and-aurora-failback) |
 | Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | §10 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
 | Converge historical workflows that recovered but stay BLOCKED, never-dispatched PENDING workflows whose node left with a spot replacement, and parked records whose node action the operator confirmed | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
@@ -856,14 +857,16 @@ aws rds describe-db-instances --region <region> \
   --query "DBInstances[?DBClusterIdentifier=='<aurora-cluster-id>'].[DBInstanceIdentifier,DBParameterGroups[0].ParameterApplyStatus]"
 ```
 
-**The only manual step: get the `pg_stat_statements` library loaded.** Both instances are promotion tier 0 and each other's failover targets;
-pick a window with no live acceptance case and no `LEASED` workflow:
+**The only manual step: get the `pg_stat_statements` library loaded.** The writer (created in the control plane's zone) is promotion tier 0
+and the reader tier 1; each is the other's only failover target (§4.9). Pick a window with no live acceptance case and no `LEASED` workflow:
 
 1. `aws rds reboot-db-instance --db-instance-identifier <reader>`, wait for it to be `available`;
 2. `aws rds failover-db-cluster --db-cluster-identifier <aurora-cluster-id>`; the reader is promoted to writer,
    business connections drop once at that moment, for seconds to tens of seconds, and the store's connection pool self-heals;
 3. `aws rds reboot-db-instance --db-instance-identifier <original writer>`.
-4. Afterwards `gpu-fault-store-migrate --ensure-diagnostics --postgres-url <url>` runs
+4. The writer now runs in the old reader's zone (`status` reports the placement finding): once the original writer is `available`,
+   fail back with `gpu-fault-admin aurora-failback` (§4.9) rather than another hand-run failover.
+5. Afterwards `gpu-fault-store-migrate --ensure-diagnostics --postgres-url <url>` runs
    `CREATE EXTENSION IF NOT EXISTS pg_stat_statements` in the database; in the deployment's `--schema-preflight` report
    `diagnostics.pg_stat_statements_installed` should be true.
 
@@ -1004,6 +1007,66 @@ These two used to live only in release records and human memory; both are now ch
 `adot_self_metrics` is rerun separately with `gpu-fault-admin status --full`; `control_record_archive_bucket`
 runs only in the preflight of `deploy`, so to rerun it rerun `deploy`. `preflight` / `verify` are internal pass-throughs of the release driver,
 absent from `--help`, and not open to administrators.
+
+### 4.9 Aurora Writer Beside the Control Plane: the status Finding and aurora-failback
+
+**Why it matters.** Every database round trip of `gpu-fault-api-ha` and `gpu-fault-control-worker` terminates in the Aurora writer's
+Availability Zone. A writer in another zone costs about 1.2 ms more per round trip, and single-cluster burst admission p99 measured about 3x
+its same-zone value.
+
+**How bootstrap places it.** Before creating the database, bootstrap reads the CPU nodes' zone labels and puts the zone with the most nodes
+that also has a private subnet first: the first instance is the initial writer, `--promotion-tier 0`; the reader goes to another
+private-subnet zone, `--promotion-tier 1` (`bootstrap_aurora.ensure_serverless_instances`, `writer_first_zones`). `aurora_ready` checks once
+more after both instances are available and runs `failover-db-cluster` when the writer is outside the control-plane zone and a member there is
+available (`ensure_writer_zone_affinity`). Tiers are set only when an instance is created; existing instances keep theirs. When RDS picks the
+promotion target itself it prefers tier 0, the instance in the control-plane zone; in a two-member cluster every failover has exactly one
+target, the other member. Serverless v2 readers in tiers 0 and 1 both scale with the writer, so either one has its capacity in place when it
+is promoted.
+
+**What moves it.** Any failover -- an RDS host event, a maintenance reboot, the §4.6 reboot window, the HA-003/HA-010 acceptance cases --
+leaves the writer on the member RDS chose, and nothing moves it back automatically; a rerun of `deploy` only re-proves bootstrap read-only.
+
+**How status reports it.** Every `gpu-fault-admin status` (the quick mode included) reads the zone labels of the nodes the Running
+`gpu-fault-api-ha` / `gpu-fault-control-worker` Pods are on and every Aurora member's zone, status and promotion tier. A writer whose zone is
+not among those zones adds one finding line -- not a failing check: `healthy` and the exit code are unchanged:
+
+```text
+gpu-fault-admin status: finding: Aurora writer <reader-instance> runs in <zone-b> but the CPU control plane
+  (gpu-fault-api-ha, gpu-fault-control-worker) runs in <zone-a>: every database round trip crosses zones; fail it
+  back to <writer-instance> (<zone-a>, promotion tier 0) with gpu-fault-admin aurora-failback --state-dir ...
+  --reference <change> (prints the plan), then the same with --confirm AURORA_FAILBACK
+```
+
+The read is four read-only commands (two `kubectl get`, `describe-db-clusters`, and `describe-db-instances` filtered to the cluster), each
+capped at 30 seconds, through a runner that refuses any mutating command. A placement it cannot read (kubectl/aws failing, no Running Pod, a
+node without a zone label, no single writer) is just one line, `finding: Aurora writer placement could not be read: ...`, and the report is
+printed as usual.
+
+**How to fail back: `aurora-failback`.**
+
+```bash
+# read-only plan: placement, target member and action (failover / none / wait)
+gpu-fault-admin aurora-failback --state-dir "$STATE_DIR" --reference CHG-...
+# execute; journal: $STATE_DIR/aurora-failback/<run-id>.json
+gpu-fault-admin aurora-failback --state-dir "$STATE_DIR" --reference CHG-... --confirm AURORA_FAILBACK
+```
+
+- The target member: in a control-plane zone, status `available`, lowest promotion tier first -- the tier-0 writer bootstrap created.
+- Execute takes the site operation lock (a release, config or other mutation in progress refuses), then refuses work in flight by the site's own
+  safety checks: an unfinished release transaction, remote commands PENDING/LEASED/WAITING (the guard of `join-cluster`/`remove-cluster`/
+  `rotate-token`), and an active destructive workflow (the deploy preflight's `workflow_safety`). A cluster that is not `available` (the
+  previous failover may still be settling), has no single writer, or has no available member in a control-plane zone is refused too. A
+  refusal writes no journal and sends no request.
+- Once past the checks it records `PLANNED`, then runs bootstrap's own step: `failover-db-cluster --target-db-instance-identifier <target>`
+  and a bounded wait (600 seconds) until the cluster is `available` with the target as its one writer, recorded as `CLUSTER_AVAILABLE`; then it
+  waits for the control plane -- every Pod of the three CPU Deployments' current ReplicaSets Ready, each registry runtime ready on one
+  generation, and one Store read over a fresh connection through the ingress Pod (300 seconds in all) -- recorded as `CONTROL_PLANE_HEALTHY`,
+  and ends `COMPLETED`. Writes pause for seconds to tens of seconds, the connection pools self-heal, and no Pod restarts (HA-010's verdict).
+- A writer already in a control-plane zone is a `NOOP`: nothing is done. After an interrupted run or a wait that timed out (journal
+  `IN_PROGRESS`/`FAILED`) rerun the same command: when the writer has moved back it only finishes the waits and completes that journal;
+  otherwise it marks that journal `SUPERSEDED`, re-runs the checks and executes again.
+- Never automatic: `status` only reports, and neither `deploy`, `status` nor the release engine calls it. A hand-run
+  `aws rds failover-db-cluster --target-db-instance-identifier` is no longer needed and should not be used.
 
 ## 5. Joining and Removing GPU Clusters
 
@@ -4300,6 +4363,7 @@ node-key-custody     configure explicitly registers forward-looking custody; aut
 submit-remediation   explicit remediation after CHECK_MECHANICALS
 collector-outbox     remotely view/requeue a node collector's dead-letter outbox (§9.3)
 store-maintenance    reclaim PostgreSQL hot-table bloat: without --confirm prints the plan, --confirm STORE_MAINTENANCE executes (§10.3)
+aurora-failback      fail the Aurora writer back to the control plane's zone: without --confirm prints the plan, --confirm AURORA_FAILBACK executes (§4.9)
 failure-domain-map   read-only debug: prints the failure-domain mapping the product would render
 ```
 

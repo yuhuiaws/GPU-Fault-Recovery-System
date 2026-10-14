@@ -28,3 +28,25 @@ def _fixed_operator_identity(
     monkeypatch.setattr(
         operator_identity, "caller_identity_arn", lambda **_kwargs: TEST_OPERATOR_ARN
     )
+
+
+@pytest.fixture(autouse=True)
+def _aurora_placement_is_not_read(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``status`` reads where the Aurora writer runs through kubectl and aws.
+
+    The shared guard refuses both binaries in a test, so every ``status`` test
+    reports no placement finding instead; the placement's own module injects a
+    recorded world and drives the real reader through ``status``.
+    """
+
+    if request.module.__name__.rsplit(".", 1)[-1] == "test_admin_aurora_placement":
+        return
+    try:
+        from gpu_fault.admin import status_report
+    except ImportError:  # the module is what the red run is missing
+        return
+    monkeypatch.setattr(
+        status_report, "placement_findings", lambda *_args, **_kwargs: []
+    )

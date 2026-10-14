@@ -68,6 +68,7 @@ def enforce(arguments: argparse.Namespace) -> None:
             "inspected",
         ],
         ["failure-domain-map", "--output", "map.json"],
+        ["aurora-failback", "--reference", "CHG-1", "--confirm", "AURORA_FAILBACK"],
         ["deploy", "--rollback"],
         ["deploy", "--rollback", "--allow-inflight-installs"],
         ["deploy", "--prepared-source-release"],
@@ -83,6 +84,7 @@ def enforce(arguments: argparse.Namespace) -> None:
         "close-incident",
         "remediation",
         "map-output",
+        "failback",
         "rollback",
         "rollback-consent",
         "prepared-deploy",
@@ -143,6 +145,7 @@ def test_outbox_reads_still_require_the_bound_cli(tmp_path: Path, action: str) -
             "--plan",
         ],
         ["failure-domain-map"],
+        ["aurora-failback", "--reference", "CHG-1"],
     ],
     ids=[
         "status",
@@ -154,6 +157,7 @@ def test_outbox_reads_still_require_the_bound_cli(tmp_path: Path, action: str) -
         "close-plan",
         "remediation-plan",
         "map",
+        "failback-plan",
     ],
 )
 def test_readonly_forms_remain_available_and_rotate_as_readonly(

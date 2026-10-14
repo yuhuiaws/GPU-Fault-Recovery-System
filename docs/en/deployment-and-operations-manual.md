@@ -1477,7 +1477,10 @@ aws ec2 describe-security-group-rules \
 
 Create the encrypted Aurora PostgreSQL cluster, the writer and the cross-AZ reader. `engine-mode` must be
 `provisioned`; Serverless v2 is enabled by the `db.serverless` instance class and the scaling
-configuration:
+configuration. The writer goes to the zone the CPU control-plane nodes run in (`CPU_PRIVATE_AZS[0]` must be that zone;
+bootstrap's `writer_first_zones` orders it first automatically) at promotion tier 0, and the reader to another zone at
+promotion tier 1, as bootstrap does: when RDS picks the promotion target itself it prefers the one in the control-plane zone
+(`administrator-operations.md` §4.9):
 
 ```bash
 mapfile -t CPU_PRIVATE_AZS < <(
@@ -1557,7 +1560,7 @@ if ! aws rds describe-db-instances \
     --engine aurora-postgresql \
     --db-instance-class db.serverless \
     --availability-zone "${CPU_PRIVATE_AZS[1]}" \
-    --promotion-tier 0
+    --promotion-tier 1
 fi
 
 aws rds wait db-instance-available \

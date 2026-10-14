@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-from gpu_fault.admin import operator_identity
+from gpu_fault.admin import aurora_failback, operator_identity
 from gpu_fault.admin.deploy_host_binding import (
     DEPLOY_HOST_STATE_BINDING as DEPLOY_HOST_STATE_BINDING,
     enforce_deploy_host_state_dir,
@@ -29,10 +29,7 @@ from gpu_fault.admin.aurora_capacity import (
     verify_aurora_capacity,
 )
 from gpu_fault.admin.bootstrap import bootstrap_from_arns, discover_cluster
-from gpu_fault.admin.bootstrap_common import (
-    BootstrapError,
-    CommandRunner,
-)
+from gpu_fault.admin.bootstrap_common import BootstrapError, CommandRunner
 from gpu_fault.admin.cluster_batch_join import join_clusters
 from gpu_fault.admin.cluster_join import join_cluster
 from gpu_fault.admin.cli_join import (
@@ -544,6 +541,7 @@ def parser() -> argparse.ArgumentParser:
     add_submit_remediation_command(commands, _add_managed_site_arguments)
     add_collector_outbox_command(commands, _add_managed_site_arguments)
     add_store_maintenance_command(commands, _add_managed_site_arguments)
+    aurora_failback.add_command(commands, _add_managed_site_arguments)
     join = commands.add_parser(
         "join-cluster",
         usage=(
@@ -1368,6 +1366,8 @@ def run(arguments: argparse.Namespace) -> int:
                 repository_root=arguments.repo_root,
             ),
         )
+    if arguments.command == aurora_failback.VERB:
+        return aurora_failback.run_command(arguments, _managed_site_file)
     if arguments.command in READONLY_COMMANDS:
         site_file = _managed_site_file(
             arguments,

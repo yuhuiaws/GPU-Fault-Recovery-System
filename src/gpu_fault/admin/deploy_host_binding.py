@@ -155,7 +155,7 @@ def is_readonly_command(
         return getattr(arguments, "dry_run", False) is True
     if command == "submit-remediation":
         return getattr(arguments, "plan", False) is True
-    if command == "store-maintenance":
+    if command in {"store-maintenance", "aurora-failback"}:
         return getattr(arguments, "confirm", None) is None
     if command == "failure-domain-map":
         return getattr(arguments, "output", None) is None
