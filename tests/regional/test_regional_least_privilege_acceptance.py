@@ -193,9 +193,14 @@ def test_blast002_the_control_plane_declares_no_gpu_write_permission() -> None:
     assert email["Resource"] == (f"arn:aws:ses:{REGION}:{ACCOUNT}:identity/{SENDER}")
     assert email["Condition"] == {"StringEquals": {"ses:FromAddress": SENDER}}
     # No configured sender means no mail permission at all, rather than a
-    # permission waiting for a sender to be set later.
+    # permission waiting for a sender to be set later. The one EC2 grant is the
+    # departed-node cleanup's read: is the recorded instance gone?
     assert [item.lower() for item in statement_actions(without_email)] == [
-        item for item in actions if item.startswith("sagemaker:")
+        *(item for item in actions if item.startswith("sagemaker:")),
+        "ec2:describeinstances",
+    ]
+    assert [item for item in actions if item.startswith("ec2:")] == [
+        "ec2:describeinstances"
     ]
 
     # Positive control: the same extractor does see a mutation action when the

@@ -240,12 +240,77 @@ def test_the_control_plane_policy_grants_no_node_mutation() -> None:
         "sagemaker:DescribeCluster",
         "sagemaker:ListClusterNodes",
         "sagemaker:DescribeClusterNode",
+        "ec2:DescribeInstances",
     ]
     assert document["Statement"][0]["Resource"] == (
         f"arn:aws:sagemaker:{REGION}:{ACCOUNT}:cluster/*"
     )
     for action in FORBIDDEN_ACTIONS:
         assert action not in _actions(document), f"{action} reached the control plane"
+
+
+def test_the_control_plane_reads_ec2_only_to_prove_a_node_gone() -> None:
+    """The departed-node cleanup asks EC2 whether an eks-managed node's
+    recorded instance is terminated: ``DescribeInstances`` alone, which EC2
+    grants only on ``*``, pinned to the site's region -- no other EC2 action,
+    so the control plane still cannot reboot, stop or terminate anything."""
+
+    document = control_plane_policy_document(region=REGION, account_id=ACCOUNT)
+    [statement] = [
+        item
+        for item in document["Statement"]
+        if item.get("Sid") == "DepartedNodeInstanceReads"
+    ]
+
+    assert statement == {
+        "Sid": "DepartedNodeInstanceReads",
+        "Effect": "Allow",
+        "Action": "ec2:DescribeInstances",
+        "Resource": "*",
+        "Condition": {"StringEquals": {"aws:RequestedRegion": REGION}},
+    }
+    assert [item for item in _actions(document) if item.startswith("ec2:")] == [
+        "ec2:DescribeInstances"
+    ]
+
+
+def test_the_next_deploy_adds_the_ec2_read_to_an_existing_role(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A site bootstrapped before the departed-node cleanup has the role
+    without the EC2 read. ``control_plane_role`` is re-proven by a read-only
+    probe on every deploy, so the drift is found and the one inline policy is
+    re-put -- nothing else about the role or its association moves."""
+
+    account = Account()
+    account.addon_installed = True
+    account.service_account_exists = True
+    account.role_exists = True
+    account.role_tags = [{"Key": SITE_TAG_KEY, "Value": SITE}]
+    account.role_trust = pod_identity_trust(_cluster())
+    previous = control_plane_policy_document(region=REGION, account_id=ACCOUNT)
+    previous["Statement"] = [
+        item
+        for item in previous["Statement"]
+        if item.get("Sid") != "DepartedNodeInstanceReads"
+    ]
+    account.role_policy = previous
+    account.associations = [{"associationId": "assoc-a"}]
+    account.association_role = f"arn:aws:iam::{ACCOUNT}:role/gpu-fault-{SITE}-control"
+    account.install(monkeypatch)
+
+    account.control_plane(tmp_path)
+
+    [put] = account.mutations("put-role-policy")
+    document = json.loads(put[put.index("--policy-document") + 1])
+    assert "ec2:DescribeInstances" in _actions(document)
+    for fragment in (
+        "create-role",
+        "update-assume-role-policy",
+        "create-pod-identity-association",
+        "update-pod-identity-association",
+    ):
+        assert not account.mutations(fragment), fragment
 
 
 def test_the_control_plane_policy_pins_email_to_the_verified_sender() -> None:
@@ -258,7 +323,11 @@ def test_the_control_plane_policy_pins_email_to_the_verified_sender() -> None:
     document = control_plane_policy_document(
         region=REGION, account_id=ACCOUNT, email_sender="alerts@example.com"
     )
-    email = document["Statement"][1]
+    email = next(
+        item
+        for item in document["Statement"]
+        if item.get("Sid") == "AdministratorEmail"
+    )
 
     assert email["Action"] == "ses:SendEmail"
     assert email["Resource"] == (

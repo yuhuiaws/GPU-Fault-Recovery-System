@@ -2,9 +2,9 @@
 
 Stated as documents so the same validator the release path applies to the
 executor role (``regional_release_iam``) can check them without an account:
-the control plane reads SageMaker and notifies through the site's own channel;
-an executor holds exactly one cluster's node reads and reboot, scoped to the
-provider that cluster runs on.
+the control plane reads SageMaker and whether an EC2 instance is gone, and
+notifies through the site's own channel; an executor holds exactly one
+cluster's node reads and reboot, scoped to the provider that cluster runs on.
 """
 
 from __future__ import annotations
@@ -30,13 +30,16 @@ def control_plane_policy_document(
 
     This is a value rather than a literal buried in ``ensure_control_plane_role``
     because it is the whole blast-radius argument for the CPU side: SageMaker
-    read-only, no node mutation of any kind, notifications only to the site's
-    own SNS topic (``channel: sns``) or only from the verified sender
-    (``channel: ses``), and -- only when ``site.yaml`` ``spec.retention`` names
-    an archive bucket -- ``PutObject`` under that one prefix, because the
-    archiver writes bundles and never reads or deletes them. Stated as a
-    document it can be checked against the same validator the release path
-    applies to the executor role, without an AWS account.
+    read-only, ``ec2:DescribeInstances`` in the site's region and nothing else
+    of EC2 (the departed-node cleanup asks whether an eks-managed node's
+    recorded instance is gone; a read EC2 grants only on ``*``), no node
+    mutation of any kind, notifications only to the site's own SNS topic
+    (``channel: sns``) or only from the verified sender (``channel: ses``),
+    and -- only when ``site.yaml`` ``spec.retention`` names an archive bucket
+    -- ``PutObject`` under that one prefix, because the archiver writes
+    bundles and never reads or deletes them. Stated as a document it can be
+    checked against the same validator the release path applies to the
+    executor role, without an AWS account.
     """
 
     statements: list[dict[str, Any]] = [
@@ -48,7 +51,14 @@ def control_plane_policy_document(
                 "sagemaker:DescribeClusterNode",
             ],
             "Resource": (f"arn:aws:sagemaker:{region}:{account_id}:cluster/*"),
-        }
+        },
+        {
+            "Sid": "DepartedNodeInstanceReads",
+            "Effect": "Allow",
+            "Action": "ec2:DescribeInstances",
+            "Resource": "*",
+            "Condition": {"StringEquals": {"aws:RequestedRegion": region}},
+        },
     ]
     if email_sender:
         statements.append(
