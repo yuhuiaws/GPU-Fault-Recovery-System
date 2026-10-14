@@ -173,6 +173,23 @@ class CleanupOwnership:
         self.assert_tags(resource, tags)
         return resource
 
+    def prove_owned(self, resource: InstallationResource) -> None:
+        """Prove a live ``resource`` is this site's, by the proof deletion uses.
+
+        Its exact binding where the type has one (a subscription to the site's
+        topic, a route-table association of a site-tagged table, ...), else the
+        site tag; ``replace-resource`` records nothing on less.
+        """
+
+        self.validate_scope(resource)
+        self.assert_caller()
+        binding = self._binding(resource)
+        tags = self._tags(resource) if binding is None else None
+        if binding is False or (binding is None and tags is None):
+            raise BootstrapError(f"{resource.resource_key} no longer exists")
+        if tags is not None:
+            self.assert_tags(resource, tags)
+
     def assert_tags(self, resource: InstallationResource, tags: dict[str, str]) -> None:
         if resource.resource_type.startswith("nlb"):
             owner = tags.get(SITE_TAG_KEY)

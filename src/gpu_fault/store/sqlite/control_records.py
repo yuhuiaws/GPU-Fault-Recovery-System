@@ -6,8 +6,11 @@ from typing import Any, Callable, Sequence, cast
 
 from gpu_fault.installation_resources import (
     InstallationResource,
+    InstallationResourceReplacement,
     batch_keys,
     refuse_identity_changes,
+    replacement_keys,
+    replacement_writes,
 )
 from gpu_fault.models import (
     DecisionStatus,
@@ -448,6 +451,21 @@ class SqliteControlRecordMixin(AttemptObservationTerminalSupport):
             for key, resource in zip(keys, resources):
                 self._put("installation_resource", key, resource)
         return list(resources)
+
+    def replace_installation_resources(
+        self,
+        replacements: Sequence[InstallationResourceReplacement],
+    ) -> list[InstallationResource]:
+        with self._state_transaction("installation_resource"):
+            current = {
+                key: existing
+                for key in replacement_keys(replacements)
+                if (existing := self._get_optional("installation_resource", key))
+                is not None
+            }
+            for key, resource in replacement_writes(current, replacements):
+                self._put("installation_resource", key, resource)
+        return [item.replacement for item in replacements]
 
     def get_installation_resource(
         self,

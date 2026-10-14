@@ -31,6 +31,12 @@ IDENTITY_FIELDS = (
     "dependencies",
 )
 IDENTITY_CONFLICT = "installation resource identity cannot change"
+STALE_RECORD = "installation resource changed since it was read"
+#: Where ``replace-resource`` retires a replaced row; no other writer or reader
+#: of the registry uses the prefix.
+RETIRED_KEY_PREFIX = "retired/"
+#: The identity fields a replacement may change: its physical resource.
+PHYSICAL_FIELDS = frozenset({"resource_id", "resource_arn"})
 
 
 class InstallationResourceConflict(ValueError):
@@ -190,10 +196,14 @@ class InstallationResource(StrictModel):
         )
 
 
+def store_key(resource: InstallationResource) -> str:
+    return f"{resource.site_id}/{resource.resource_key}"
+
+
 def batch_keys(resources: Sequence[InstallationResource]) -> list[str]:
     """The store key (``<site_id>/<resource_key>``) of every row of one write."""
 
-    keys = [f"{item.site_id}/{item.resource_key}" for item in resources]
+    keys = [store_key(item) for item in resources]
     if len(keys) != len(set(keys)):
         raise ValueError("installation resource keys must be unique")
     return keys
@@ -216,6 +226,131 @@ def refuse_identity_changes(
     ]
     if conflicts:
         raise InstallationResourceConflict(IDENTITY_CONFLICT, conflicts)
+
+
+def retired_resource_key(resource: InstallationResource) -> str:
+    """The key ``resource`` is retired under once its resource was replaced.
+
+    Derived from the key and the physical resource, so a retried transition
+    retires the row to the same key and two replacements never collide.
+    """
+
+    physical = f"{resource.resource_id}\x1f{resource.resource_arn or ''}"
+    digest = hashlib.sha256(physical.encode()).hexdigest()[:16]
+    return f"{RETIRED_KEY_PREFIX}{resource.resource_key}/{digest}"
+
+
+def retired_status(resource: InstallationResource) -> InstallationResourceStatus:
+    """The terminal status of a row whose physical resource is gone."""
+
+    if resource.delete_policy is InstallationResourceDeletePolicy.DELETE:
+        return InstallationResourceStatus.DELETED
+    return InstallationResourceStatus.DETACHED
+
+
+def changed_fields(
+    expected: InstallationResource, actual: InstallationResource
+) -> tuple[str, ...]:
+    left, right = expected.model_dump(mode="json"), actual.model_dump(mode="json")
+    return tuple(name for name in left if left[name] != right[name])
+
+
+class InstallationResourceReplacement(StrictModel):
+    """The one sanctioned identity change: a key's physical resource was replaced.
+
+    ``recorded`` is the row as the caller read it. It is retired, unchanged but
+    for its key and terminal status, under ``retired_resource_key``, and
+    ``replacement`` takes its key. Nothing but ``resource_id``/``resource_arn``
+    may change, so every dependency on the key keeps naming the same role.
+    """
+
+    recorded: InstallationResource
+    retired: InstallationResource
+    replacement: InstallationResource
+
+    @model_validator(mode="after")
+    def validate_transition(self) -> Self:
+        recorded, retired = self.recorded, self.retired
+        changes = set(recorded.identity_changes(self.replacement))
+        if (
+            recorded.status is not InstallationResourceStatus.ACTIVE
+            or self.replacement.status is not InstallationResourceStatus.ACTIVE
+            or not changes
+            or not changes <= PHYSICAL_FIELDS
+        ):
+            raise ValueError(
+                "an installation resource replacement changes only the physical "
+                "resource of an ACTIVE row"
+            )
+        if (
+            retired.resource_key != retired_resource_key(recorded)
+            or recorded.identity_changes(retired) != ("resource_key",)
+            or retired.status is not retired_status(recorded)
+            or retired.created_at != recorded.created_at
+        ):
+            raise ValueError(
+                "a retired installation resource is the recorded row under its "
+                "retired key"
+            )
+        return self
+
+
+class InstallationResourceReplacementRequest(StrictModel):
+    site_id: str
+    replacements: list[InstallationResourceReplacement]
+
+    @model_validator(mode="after")
+    def validate_replacements(self) -> Self:
+        keys = [item.recorded.resource_key for item in self.replacements]
+        if not keys or len(keys) != len(set(keys)):
+            raise ValueError("installation resource replacements need distinct keys")
+        if any(item.recorded.site_id != self.site_id for item in self.replacements):
+            raise ValueError("installation resource site_id mismatch")
+        return self
+
+
+def replacement_keys(
+    replacements: Sequence[InstallationResourceReplacement],
+) -> list[str]:
+    """Every store key a replacement reads or writes: the recorded and the retired."""
+
+    return [
+        key
+        for item in replacements
+        for key in (store_key(item.recorded), store_key(item.retired))
+    ]
+
+
+def replacement_writes(
+    current: Mapping[str, InstallationResource],
+    replacements: Sequence[InstallationResourceReplacement],
+) -> list[tuple[str, InstallationResource]]:
+    """The ``(store key, row)`` writes of a replacement, refused if any is stale.
+
+    A transition already stored is applied (its retry writes nothing); any other
+    must find its recorded row exactly as read and its retired key free. One
+    conflict names every stale key and field, before any write.
+    """
+
+    writes: list[tuple[str, InstallationResource]] = []
+    conflicts: list[tuple[str, tuple[str, ...]]] = []
+    for item in replacements:
+        key, retired_key = store_key(item.recorded), store_key(item.retired)
+        row, retired = current.get(key), current.get(retired_key)
+        if row == item.replacement and retired == item.retired:
+            continue
+        if row is None:
+            conflicts.append((item.recorded.resource_key, ("resource_key",)))
+        elif fields := changed_fields(item.recorded, row):
+            conflicts.append((item.recorded.resource_key, fields))
+        elif retired is not None:
+            taken = changed_fields(item.retired, retired) or ("resource_key",)
+            conflicts.append((item.retired.resource_key, taken))
+        else:
+            writes += [(retired_key, item.retired), (key, item.replacement)]
+    if conflicts:
+        raise InstallationResourceConflict(STALE_RECORD, conflicts)
+    return writes
 
 
 class InstallationResourceSnapshot(StrictModel):

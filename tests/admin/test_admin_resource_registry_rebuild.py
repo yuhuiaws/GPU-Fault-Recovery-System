@@ -335,8 +335,8 @@ def test_a_changed_identity_is_refused_by_key_and_field_before_any_write(
 
     assert str(refused.value) == (
         "installation registry rebuild would change recorded identities: "
-        "cluster/gpu-a/eks (resource_arn)"
-    )
+        "cluster/gpu-a/eks (resource_arn) -- " + registry.REPLACEMENT_REMEDY
+    ), "the refusal names key, field and the one supported transition"
     assert not [event for event in events if event[0] == "sync"], (
         "a refused rebuild must not reach the registry"
     )

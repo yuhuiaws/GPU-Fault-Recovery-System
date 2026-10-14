@@ -3146,6 +3146,7 @@ The regional APIs all belong to the `execution-token` bucket:
 | POST | `/v1/installation-resources/sync` | Write one digest-verified site snapshot in one transaction (all or nothing); returns 409 when it would change a recorded identity, the body's `reason` and `conflicts` (each a `resource_key` with its `fields`) naming every refused key and field |
 | GET | `/v1/installation-resources?site_id=...` | Query all resources or a single site's resources, stably sorted by site and key |
 | PUT | `/v1/installation-resources/{site_id}/{resource_key:path}` | Advance a single record's status; returns 409 when the path identity disagrees with the body, and a 409 with `conflicts` when it would change a recorded identity |
+| POST | `/v1/installation-resources/replacements` | The `replace-resource` transition: in one transaction every recorded row (exactly as the caller read it) moves to `retired/<key>/<digest>` and its replacement takes the key; a replacement may change only `resource_id`/`resource_arn`; a stored transition sent again is accepted as it is, a stale one is a 409 (`reason` `installation resource changed since it was read`) |
 
 An identity conflict is a deterministic refusal, hence a 409 and not a 500: the processor completes a 4xx at once as the
 request's final answer, while a 500 is replayed as retryable for its retry horizon (300 s) -- and with row-by-row saving every
@@ -3155,6 +3156,16 @@ fields (a `BootstrapError`, so the deploy/config completion step, join, the join
 closed on it), and neither retries nor falls back to the direct Aurora path; the in-Pod script passes on only the validated
 `reason`, keys and fields (exit 65, marker `GPU_FAULT_REGISTRY_CONFLICT`), never the response text. The direct fallback itself
 also writes in one transaction and names key and fields when it refuses.
+
+A key whose physical resource really was replaced moves only through `gpu-fault-admin replace-resource`
+(`admin/resource_replacement.py`), never automatically: the plan derives the replacement from the same rebuild the deploy completion
+step runs (without the named rows), allows only `resource_id`/`resource_arn` to change and requires the next rebuild to converge
+after the transition; the cleaner's own probes prove the old resource gone and the new one present and this site's (its site tag,
+or the exact binding of a subscription or association); execution takes the site operation lock and keeps a journal
+(PLANNED/COMMITTED/ABANDONED/REFUSED). The old row retires unchanged but for its key and terminal status to
+`retired/<key>/<digest>`: no rebuild, numbering, removal or dependency reads that key prefix, and an uninstall treats a retired row
+by its policy as any other (its resource is gone, so the probe finds it terminal). The replaceable types are a reviewed list
+(`REPLACEABLE_RESOURCE_TYPES`); cluster, Aurora, OIDC-provider, hosted-zone and identity-keyed rows are not on it.
 
 After a successful deployment or takeover of a legacy environment, `gpu-fault-admin` generates a snapshot from the
 bootstrap state, the live NLB/network objects and the
@@ -3185,8 +3196,8 @@ single transaction in `tests/app_services/test_installation_registry_conflicts.p
 ### 2.23 Administrator CLI and deployment assets `src/gpu_fault/admin/`
 
 `gpu-fault-admin` is the site's only change entry point (public verbs `status`, `deploy`, `config`, `workflow-reconcile`,
-`failure-domain-map`, `rotate-token`, `submit-remediation`, `collector-outbox`, `store-maintenance`, `join-cluster`,
-`remove-cluster`, `uninstall`; `preflight`/`verify` are only internal pass-throughs of the release driver and do not appear in `--help`).
+`failure-domain-map`, `rotate-token`, `submit-remediation`, `collector-outbox`, `store-maintenance`, `replace-resource`,
+`join-cluster`, `remove-cluster`, `uninstall`; `preflight`/`verify` are only internal pass-throughs of the release driver and do not appear in `--help`).
 It drives the site lifecycle and takes no part in fault decisions, but shares the Store model, the authentication boundary
 (the execution-token routes of §4) and the installation resource registry of §2.22 with the control plane. The administrator
 implementation belongs to a separate deploy-host distribution and does not enter the
@@ -3922,7 +3933,8 @@ and the documentation routes do not live under the `routes/` directory.
 | POST | `/v1/regional/registry/revisions` | execution-token | Publish the next registry generation with an `expected_generation` CAS, 409 on mismatch |
 | POST | `/v1/regional/registry/rollback` | execution-token | Republish the registry content of `target_generation` as a new generation |
 | POST | `/v1/regional/registry/clusters/{cluster_id}/transition` | execution-token | Single-cluster `lifecycle_state` transition, at most 8 CAS retries |
-| POST | `/v1/installation-resources/sync` | execution-token | Bulk-sync a digested snapshot of AWS installation resources |
+| POST | `/v1/installation-resources/sync` | execution-token | Sync a digested snapshot of AWS installation resources in one transaction; 409 when it would change a recorded identity |
+| POST | `/v1/installation-resources/replacements` | execution-token | The `replace-resource` transition (retire recorded rows, record their replacements, one transaction); 409 when stale |
 | GET | `/v1/installation-resources` | execution-token | Query installation resources by optional `site_id` |
 | PUT | `/v1/installation-resources/{site_id}/{resource_key:path}` | execution-token | Advance a resource state; returns 409 when the path and body identity disagree |
 | GET | `/v1/capabilities/operations` | execution-token | The actual capability set of the operation registry |

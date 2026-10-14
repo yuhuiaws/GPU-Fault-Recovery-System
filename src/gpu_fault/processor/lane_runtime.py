@@ -369,6 +369,7 @@ class ProcessorLaneRuntimeMixin:
             "/v1/attempts/terminal",
             "/v1/advisory-notifications/dispatch",
             "/v1/installation-resources/sync",
+            "/v1/installation-resources/replacements",
             "/v1/fleet/agents/heartbeat",
         }:
             return path

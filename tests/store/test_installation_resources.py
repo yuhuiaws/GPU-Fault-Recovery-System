@@ -9,7 +9,9 @@ from gpu_fault.installation_resources import (
     InstallationResourceConflict,
     InstallationResourceDeletePolicy,
     InstallationResourceOwnership,
+    InstallationResourceReplacement,
     InstallationResourceStatus,
+    retired_resource_key,
 )
 from gpu_fault.store import InMemoryStore, SqliteStore
 
@@ -157,3 +159,105 @@ def test_a_registry_batch_refuses_a_key_named_twice(installation_store) -> None:
             [_row("aws/a", "sg-a"), _row("aws/a", "sg-a")]
         )
     assert installation_store.list_installation_resources() == []
+
+
+def _replacement(
+    recorded: InstallationResource, resource_id: str
+) -> InstallationResourceReplacement:
+    retired = recorded.model_copy(
+        update={
+            "resource_key": retired_resource_key(recorded),
+            "status": InstallationResourceStatus.DELETED,
+            "attributes": {"replaced_by": resource_id},
+        }
+    )
+    return InstallationResourceReplacement(
+        recorded=recorded,
+        retired=retired,
+        replacement=recorded.model_copy(update={"resource_id": resource_id}),
+    )
+
+
+def test_a_replacement_retires_the_recorded_row_and_records_its_replacement(
+    installation_store,
+) -> None:
+    recorded = _row("aws/a", "sg-old")
+    installation_store.save_installation_resources([recorded, _row("aws/b", "sg-b")])
+    transition = _replacement(recorded, "sg-new")
+
+    saved = installation_store.replace_installation_resources([transition])
+
+    assert saved == [transition.replacement]
+    assert installation_store.get_installation_resource("site-a", "aws/a") == (
+        transition.replacement
+    )
+    retired = installation_store.get_installation_resource(
+        "site-a", transition.retired.resource_key
+    )
+    assert retired == transition.retired
+    assert retired.resource_key.startswith("retired/aws/a/"), retired.resource_key
+    before = installation_store.list_installation_resources("site-a")
+    assert installation_store.replace_installation_resources([transition]) == saved, (
+        "a stored transition must be accepted again (an interrupted attempt resumes)"
+    )
+    assert installation_store.list_installation_resources("site-a") == before
+
+
+def test_a_stale_replacement_writes_nothing_and_names_the_changed_fields(
+    installation_store,
+) -> None:
+    recorded, other = _row("aws/a", "sg-old"), _row("aws/b", "sg-b")
+    installation_store.save_installation_resources([recorded, other])
+    installation_store.save_installation_resource(
+        recorded.model_copy(update={"error": "drift observed"})
+    )
+    before = installation_store.list_installation_resources("site-a")
+
+    with pytest.raises(InstallationResourceConflict) as refused:
+        installation_store.replace_installation_resources(
+            [_replacement(recorded, "sg-new"), _replacement(other, "sg-b-new")]
+        )
+
+    assert refused.value.reason == "installation resource changed since it was read"
+    assert refused.value.conflicts == (("aws/a", ("error",)),)
+    assert installation_store.list_installation_resources("site-a") == before, (
+        "a refused replacement wrote some of its rows"
+    )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"dependencies": ["aws/other"]},
+        {"delete_policy": InstallationResourceDeletePolicy.DETACH},
+        {"resource_type": "ec2_subnet"},
+    ],
+)
+def test_a_replacement_changes_nothing_but_the_physical_resource(updates) -> None:
+    recorded = _row("aws/a", "sg-old")
+    transition = _replacement(recorded, "sg-new")
+    with pytest.raises(ValueError, match="only the physical resource"):
+        InstallationResourceReplacement(
+            recorded=recorded,
+            retired=transition.retired,
+            replacement=transition.replacement.model_copy(update=updates),
+        )
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"resource_key": "retired/aws/a/elsewhere"},
+        {"status": InstallationResourceStatus.DETACHED},
+        {"resource_id": "sg-new"},
+    ],
+)
+def test_a_retired_row_is_the_recorded_row_under_its_retired_key(updates) -> None:
+    recorded = _row("aws/a", "sg-old")
+    transition = _replacement(recorded, "sg-new")
+    with pytest.raises(ValueError, match="retired installation resource"):
+        InstallationResourceReplacement(
+            recorded=recorded,
+            retired=transition.retired.model_copy(update=updates),
+            replacement=transition.replacement,
+        )

@@ -8,7 +8,8 @@ replayed the request, rewriting them again, until its retry horizon (live
 key order and with the key text ``save_installation_resource`` always used, so a
 batch and a single-row writer of the same row exclude each other; it reads all
 recorded rows, refuses an identity change before writing anything, and commits
-all rows or none.
+all rows or none. ``replace_installation_resources`` (``replace-resource``)
+takes the same locks for each recorded row and its retired key.
 """
 
 from __future__ import annotations
@@ -18,8 +19,11 @@ from typing import Any, Callable, Protocol, Sequence, cast
 
 from gpu_fault.installation_resources import (
     InstallationResource,
+    InstallationResourceReplacement,
     batch_keys,
     refuse_identity_changes,
+    replacement_keys,
+    replacement_writes,
 )
 from gpu_fault.store.postgres.core import take_advisory_xact_locks
 from gpu_fault.store.shared.errors import NotFoundError
@@ -78,6 +82,19 @@ class PostgresInstallationResourceMixin:
             for key, resource in zip(keys, resources):
                 self._put("installation_resource", key, resource)
         return list(resources)
+
+    def replace_installation_resources(
+        self,
+        replacements: Sequence[InstallationResourceReplacement],
+    ) -> list[InstallationResource]:
+        keys = replacement_keys(replacements)
+        with self._db.transaction():
+            with self._db.cursor() as cursor:
+                take_advisory_xact_locks(cursor, (_lock_key(key) for key in keys))
+                current = self._recorded_installation_resources(cursor, keys)
+            for key, resource in replacement_writes(current, replacements):
+                self._put("installation_resource", key, resource)
+        return [item.replacement for item in replacements]
 
     def get_installation_resource(
         self,

@@ -1152,7 +1152,9 @@ synchronizes to Aurora
 `gpu_fault_objects(kind=installation_resource)`. The API writes the whole snapshot in one transaction; when it would change a
 recorded identity it answers 409, and the script hands only the validated reason, keys and fields to `InstallationRegistryConflict`
 through the `GPU_FAULT_REGISTRY_CONFLICT` protocol (exit 65), which neither retries nor falls back to the direct write; the direct
-path names key and fields as well when it refuses. Administrators do not hand-write these
+path names key and fields as well when it refuses. The `replace-resource` transition calls `/v1/installation-resources/replacements`
+through the same kind of in-Pod script (`REPLACE_SCRIPT`) and has no direct fallback: an older control plane without the route is
+refused by the old-API protocol (exit 44); the transition is idempotent, so an interrupted one is simply sent again. Administrators do not hand-write these
 fields in `site.yaml`, and must not add a second AWS inventory file.
 The completion step of deploy and `config` first reads the rows Aurora already records, then rebuilds the snapshot from the bootstrap state:
 numbered rows without a natural key (the CPU public subnets with their route tables and route-table associations, the NLB listeners and target

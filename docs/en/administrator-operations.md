@@ -30,6 +30,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Remotely view/requeue a node collector's dead-letter outbox | `gpu-fault-admin collector-outbox --state-dir ... --cluster-id C --node N --collector kernel --action stats\|list\|requeue-dead [--path /v1/...] [--yes] --reference CHG-...` (no login to the GPU node; only metadata is returned; `requeue-dead` must carry `--yes`; there is no remote `--force`) | §9.3, §8 `GpuFaultCollectorSilent` |
 | Reclaim PostgreSQL hot-table bloat (after a campaign day, before a formal perf or acceptance round) | `gpu-fault-admin store-maintenance --state-dir ... --reference CHG-... [--confirm STORE_MAINTENANCE]` (without `--confirm` it only prints each hot table's live rows, pages, index bytes and proposed action; with the token it executes under the site operation lock; evidence under `$STATE_DIR/store-maintenance/`) | [§10.3](#103-hot-table-storage-parameters-and-store-maintenance-reclaiming-bloat) |
 | A failover left the Aurora writer outside the zone with the most control-plane Pods (`status` reports `finding: Aurora writer ... runs in ...`) | `gpu-fault-admin aurora-failback --state-dir ... --reference CHG-... [--confirm AURORA_FAILBACK]` (without `--confirm` it only prints the placement and the target member; with the token it executes under the site operation lock, refuses while work is in flight, waits for the cluster to be `available` and the control plane ready, journal under `$STATE_DIR/aurora-failback/`; never run automatically) | [§4.9](#49-aurora-writer-beside-the-control-plane-the-status-finding-and-aurora-failback) |
+| The installation registry sync fails because it "would change recorded identities" and that key's physical resource really was replaced (a recreated subnet, a re-subscribed SNS e-mail) | `gpu-fault-admin replace-resource --state-dir ... --resource-key <key> --reference ...` for the read-only plan; add `--confirm REPLACE_RESOURCE` to execute | §4 |
 | Data migration | `gpu-fault-store-migrate` plus the stop-write state machine | §10 |
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
 | Converge historical workflows that recovered but stay BLOCKED, never-dispatched PENDING workflows whose node left with a spot replacement, and parked records whose node action the operator confirmed | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
@@ -447,6 +448,34 @@ judging "the description of what was installed is stale" unhealthy would make th
 ordinary NOOP deploy look unhealthy. The risk lies only with the two deletion verbs, which fail closed on their own (§3
 uninstall, §5 `remove-cluster`): `deletion_verbs_refused=true` when the record is `UNAVAILABLE`, missing or unreadable; a success
 that is only of an older release (for example an interrupted completion step) is reported as a finding without a refusal.
+
+When the sync fails because it "would change recorded identities" (the error lists key and fields, for example
+`aws/sns/email-subscription/<digest> (resource_id, resource_arn)` or `aws/nlb (dependencies)`), the registry never overwrites a
+recorded identity; only when the physical resource behind the key really was replaced is it moved with `replace-resource`:
+
+```bash
+gpu-fault-admin replace-resource --state-dir <dir> --resource-key <key> [--resource-key <key> ...] \
+  --reference <change>                       # plan: read-only, prints the proofs and any refusal
+gpu-fault-admin replace-resource --state-dir <dir> --resource-key <key> ... \
+  --reference <change> --confirm REPLACE_RESOURCE   # execute
+```
+
+The plan derives each key's replacement from the same rebuild the deploy completion step runs, without the named rows; the
+replacement may change only the physical resource (`resource_id`/`resource_arn`), and after the transition the next deploy's
+rebuild must change no recorded identity (otherwise the keys still in conflict are listed and must be named in the same
+transition). A dependency conflict comes with a hint: for `aws/nlb (dependencies)` the `dependency_hints` name the old dependency
+the rebuild no longer references (the recreated subnet), and what is replaced is that subnet with its route table and
+association, not the NLB. The live, read-only proofs use the cleaner's own probes: the old resource is gone (deleted, or for an
+association detached), the new one exists and is this site's (its site tag; a subscription or a route-table association by its
+exact binding); only rows this site created (CREATED), ACTIVE and of a reviewed type qualify (subnets, route tables and their
+associations, IGW, security groups, the NLB with its listeners/target groups, the SNS topic and subscriptions, ACM certificates).
+Execution runs under the site operation lock, refuses while an uninstall or a `remove-cluster` is open, journals the attempt as
+PLANNED in `<state-dir>/resource-replacement/<attempt>/journal.json` (plan, operator, change reference), sends it to the registry
+API -- one transaction moves every old row, unchanged but for its key and terminal status, to `retired/<key>/<digest>` and the
+replacement takes the key -- and journals COMMITTED; after an interruption the same keys rerun finish it (the API accepts a stored
+transition), and an attempt that no longer applies is journaled ABANDONED (none of its rows were written). It is never automatic;
+the next `deploy` (a NOOP one retries the sync too) or `config` re-roll then records a successful sync and the deletion verbs
+proceed again.
 
 If the command stops because of a Runtime Profile policy change, the stop message has already printed
 the review fields of `<state-dir>/release-deploy/profile-plan.json`, the real `plan_sha256` and the resume
@@ -4384,6 +4413,7 @@ submit-remediation   explicit remediation after CHECK_MECHANICALS
 collector-outbox     remotely view/requeue a node collector's dead-letter outbox (§9.3)
 store-maintenance    reclaim PostgreSQL hot-table bloat: without --confirm prints the plan, --confirm STORE_MAINTENANCE executes (§10.3)
 aurora-failback      fail the Aurora writer back to the control plane's zone: without --confirm prints the plan, --confirm AURORA_FAILBACK executes (§4.9)
+replace-resource     move an installation registry key whose physical resource really was replaced: without --confirm prints the plan and proofs, --confirm REPLACE_RESOURCE executes (§4 installation registry sync)
 failure-domain-map   read-only debug: prints the failure-domain mapping the product would render
 ```
 

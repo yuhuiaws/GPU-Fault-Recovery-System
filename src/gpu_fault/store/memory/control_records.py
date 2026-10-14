@@ -7,8 +7,10 @@ from typing import Any
 
 from gpu_fault.installation_resources import (
     InstallationResource,
+    InstallationResourceReplacement,
     batch_keys,
     refuse_identity_changes,
+    replacement_writes,
 )
 from gpu_fault.models import (
     CompletionDecision,
@@ -527,6 +529,16 @@ class MemoryControlRecordMixin(AttemptObservationTerminalSupport):
             refuse_identity_changes(self._installation_resources, resources)
             self._installation_resources.update(zip(keys, resources))
             return list(resources)
+
+    def replace_installation_resources(
+        self,
+        replacements: Sequence[InstallationResourceReplacement],
+    ) -> list[InstallationResource]:
+        with self._lock:
+            self._installation_resources.update(
+                replacement_writes(self._installation_resources, replacements)
+            )
+            return [item.replacement for item in replacements]
 
     def get_installation_resource(
         self,

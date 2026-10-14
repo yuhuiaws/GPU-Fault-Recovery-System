@@ -32,6 +32,7 @@ from gpu_fault.admin.resource_registry_scripts import (
     DIRECT_SYNC_SCRIPT,
     FETCH_SCRIPT,
     LEGACY_REGISTRY_MARKER,
+    REPLACE_SCRIPT,
     SYNC_SCRIPT,
     UNAVAILABLE_REGISTRY_MARKER,
     conflict_report,
@@ -41,12 +42,22 @@ from gpu_fault.installation_resources import (
     InstallationResource,
     InstallationResourceDeletePolicy,
     InstallationResourceOwnership,
+    InstallationResourceReplacementRequest,
     InstallationResourceSnapshot,
 )
 
 
 class LegacyInstallationRegistryMissing(BootstrapError):
     pass
+
+
+#: What a refused identity change tells the operator to do.
+REPLACEMENT_REMEDY = (
+    "a key whose physical resource was really replaced moves to its replacement "
+    "only through `gpu-fault-admin replace-resource --state-dir <dir> "
+    "--resource-key <key> --reference <change>`; any other identity change is a "
+    "defect to fix, never an overwrite"
+)
 
 
 class InstallationRegistryConflict(BootstrapError):
@@ -62,8 +73,8 @@ class InstallationRegistryConflict(BootstrapError):
         super().__init__(
             f"installation registry refused the write: {reason}: "
             + "; ".join(f"{key} ({', '.join(fields)})" for key, fields in conflicts)
-            + "; nothing was written -- a recorded identity changes only through "
-            "an explicit transition for a resource that was really replaced"
+            + "; nothing was written -- "
+            + REPLACEMENT_REMEDY
         )
 
 
@@ -754,31 +765,39 @@ def _keep_recorded_arns(
     return kept
 
 
+def recorded_identity_conflicts(
+    snapshot: InstallationResourceSnapshot,
+    existing: InstallationResourceSnapshot,
+) -> list[str]:
+    """``<key> (<fields>)`` of every rebuilt row that changes a recorded identity."""
+
+    recorded = {item.resource_key: item for item in existing.resources}
+    return [
+        f"{item.resource_key} ({', '.join(fields)})"
+        for item in snapshot.resources
+        if item.resource_key in recorded
+        and (fields := recorded[item.resource_key].identity_changes(item))
+    ]
+
+
 def _require_recorded_identities(
     snapshot: InstallationResourceSnapshot,
     existing: InstallationResourceSnapshot,
 ) -> None:
     """Refuse a rebuild that would change a recorded identity, before any write.
 
-    The store refuses it as well, but only row by row inside the queued
-    ``/sync`` request, which the processor replays until its retry horizon
-    after rewriting every row ahead of the conflict, and the direct fallback
-    reports only the exception class. Naming the keys and fields here makes the
-    completion warning actionable. A replaced resource needs an explicit
-    registry transition, never an overwrite.
+    The registry API refuses it too (409, one transaction); refusing here keeps
+    the conflict out of the processor queue and makes the completion warning
+    name the keys and fields with the remedy.
     """
 
-    recorded = {item.resource_key: item for item in existing.resources}
-    changes = [
-        f"{item.resource_key} ({', '.join(fields)})"
-        for item in snapshot.resources
-        if item.resource_key in recorded
-        and (fields := recorded[item.resource_key].identity_changes(item))
-    ]
+    changes = recorded_identity_conflicts(snapshot, existing)
     if changes:
         raise BootstrapError(
             "installation registry rebuild would change recorded identities: "
             + "; ".join(changes)
+            + " -- "
+            + REPLACEMENT_REMEDY
         )
 
 
@@ -1314,6 +1333,58 @@ def sync_installation_resource_snapshot_direct(
         )
     if result.stdout.strip() != str(len(snapshot.resources)):
         raise BootstrapError("direct Aurora registry synchronization proof is invalid")
+
+
+def replace_installation_resources(
+    site: RenderedSite,
+    request: InstallationResourceReplacementRequest,
+) -> list[InstallationResource]:
+    """Send one ``replace-resource`` transition to the registry API.
+
+    All or nothing, and idempotent: a transition already stored is accepted
+    again, so an interrupted attempt is finished by sending it again. There is
+    no direct fallback; a control plane without the route refuses (exit 44).
+    """
+
+    if request.site_id != site.registry_site_id:
+        raise BootstrapError(
+            "installation registry replacement belongs to another site"
+        )
+    result = run_command(
+        [
+            "kubectl",
+            "--kubeconfig",
+            site.release_config["cpu_kubeconfig"],
+            "-n",
+            site.release_config["namespace"],
+            "exec",
+            "-i",
+            _cpu_pod(site),
+            "--",
+            "python",
+            "-c",
+            REPLACE_SCRIPT,
+        ],
+        input_text=request.model_dump_json(),
+        timeout_seconds=90,
+    )
+    if result.returncode == 44 and result.stdout.strip() == LEGACY_REGISTRY_MARKER:
+        raise LegacyInstallationRegistryMissing(
+            "control plane predates the installation resource replacement API; "
+            "deploy a release that ships it, then rerun"
+        )
+    report = conflict_report(result.returncode, result.stdout)
+    if report is not None:
+        raise InstallationRegistryConflict(*report)
+    if result.returncode:
+        raise BootstrapError(
+            "installation registry replacement failed: "
+            + diagnostic_text((result.stderr or result.stdout or "").strip())
+        )
+    saved = _read_registry_snapshot(site, result.stdout).resources
+    if saved != [item.replacement for item in request.replacements]:
+        raise BootstrapError("installation registry replacement proof differs")
+    return saved
 
 
 def sync_installation_resource_registry(site: RenderedSite) -> Path:

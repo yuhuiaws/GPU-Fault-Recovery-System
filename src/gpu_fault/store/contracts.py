@@ -17,7 +17,10 @@ from typing import (
     runtime_checkable,
 )
 
-from gpu_fault.installation_resources import InstallationResource
+from gpu_fault.installation_resources import (
+    InstallationResource,
+    InstallationResourceReplacement,
+)
 from gpu_fault.store.shared.orphaned_commands import OrphanedCommandCancellation
 
 if TYPE_CHECKING:
@@ -257,6 +260,17 @@ class InstallationResourceStore(Protocol):
 
         Raises ``InstallationResourceConflict`` naming every row that would
         change the identity recorded under its key, before any write.
+        """
+        ...
+
+    def replace_installation_resources(
+        self,
+        replacements: Sequence[InstallationResourceReplacement],
+    ) -> list[InstallationResource]:
+        """Retire each recorded row and record its replacement, in one transaction.
+
+        Idempotent; raises ``InstallationResourceConflict`` (stale) when a
+        recorded row changed since it was read or its retired key is taken.
         """
         ...
 

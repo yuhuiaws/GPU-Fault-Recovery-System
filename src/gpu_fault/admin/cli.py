@@ -108,6 +108,10 @@ from gpu_fault.admin.store_maintenance import (
     add_store_maintenance_command,
     run_store_maintenance_command,
 )
+from gpu_fault.admin.resource_replacement import (
+    add_replace_resource_command,
+    run_replace_resource_command,
+)
 from gpu_fault.admin.incident_close import run_incident_close
 from gpu_fault.admin.membership_lock import (
     administrator_operation_lock,
@@ -542,6 +546,7 @@ def parser() -> argparse.ArgumentParser:
     add_collector_outbox_command(commands, _add_managed_site_arguments)
     add_store_maintenance_command(commands, _add_managed_site_arguments)
     aurora_failback.add_command(commands, _add_managed_site_arguments)
+    add_replace_resource_command(commands, _add_managed_site_arguments)
     join = commands.add_parser(
         "join-cluster",
         usage=(
@@ -1334,37 +1339,19 @@ def run(arguments: argparse.Namespace) -> int:
         return _run_workflow_reconcile(arguments)
     if arguments.command == "failure-domain-map":
         return _run_failure_domain_map(arguments)
-    if arguments.command == "rotate-token":
-        return run_rotate_token_command(
-            arguments,
-            site=load_site(
-                cast(Path, _managed_site_file(arguments, command="rotate-token")),
-                repository_root=arguments.repo_root,
-            ),
-        )
-    if arguments.command == "submit-remediation":
-        return run_submit_remediation_command(
-            arguments,
-            site=load_site(
-                cast(Path, _managed_site_file(arguments, command="submit-remediation")),
-                repository_root=arguments.repo_root,
-            ),
-        )
-    if arguments.command == "collector-outbox":
-        return run_collector_outbox_command(
-            arguments,
-            site=load_site(
-                cast(Path, _managed_site_file(arguments, command="collector-outbox")),
-                repository_root=arguments.repo_root,
-            ),
-        )
-    if arguments.command == "store-maintenance":
-        return run_store_maintenance_command(
-            arguments,
-            site=load_site(
-                cast(Path, _managed_site_file(arguments, command="store-maintenance")),
-                repository_root=arguments.repo_root,
-            ),
+    # The verbs of their own modules that take the managed site, looked up per
+    # call so a test can patch one.
+    site_verbs = {
+        "rotate-token": run_rotate_token_command,
+        "submit-remediation": run_submit_remediation_command,
+        "collector-outbox": run_collector_outbox_command,
+        "store-maintenance": run_store_maintenance_command,
+        "replace-resource": run_replace_resource_command,
+    }
+    if arguments.command in site_verbs:
+        site_file = cast(Path, _managed_site_file(arguments, command=arguments.command))
+        return site_verbs[arguments.command](
+            arguments, site=load_site(site_file, repository_root=arguments.repo_root)
         )
     if arguments.command == aurora_failback.VERB:
         return aurora_failback.run_command(arguments, _managed_site_file)

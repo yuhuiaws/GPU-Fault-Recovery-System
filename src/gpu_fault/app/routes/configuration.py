@@ -13,6 +13,7 @@ from gpu_fault.async_store import (
 from gpu_fault.capabilities import compile_runtime_profile
 from gpu_fault.installation_resources import (
     InstallationResource,
+    InstallationResourceReplacementRequest,
     InstallationResourceSnapshot,
 )
 from gpu_fault.models import (
@@ -118,6 +119,29 @@ async def sync_installation_resources(
             dependencies,
             dependencies.context.store.save_installation_resources,
             snapshot.resources,
+        ),
+    )
+
+
+@router.post(
+    "/v1/installation-resources/replacements",
+    response_model=list[InstallationResource],
+)
+@authorization_bucket("execution-token")
+async def replace_installation_resources(
+    request: InstallationResourceReplacementRequest,
+    dependencies: ConfigurationRouterDependencies = Depends(
+        get_configuration_dependencies
+    ),
+) -> list[InstallationResource]:
+    # ``gpu-fault-admin replace-resource``: retire each recorded row and record
+    # its replacement in one transaction; a stale row is a 409.
+    return cast(
+        list[InstallationResource],
+        await _store_call(
+            dependencies,
+            dependencies.context.store.replace_installation_resources,
+            request.replacements,
         ),
     )
 

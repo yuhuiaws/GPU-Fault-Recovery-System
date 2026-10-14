@@ -23,6 +23,7 @@ from gpu_fault.installation_resources import (
     InstallationResourceOwnership,
     InstallationResourceSnapshot,
     InstallationResourceStatus,
+    retired_resource_key,
 )
 from gpu_fault.processor import ProcessorCoordinator, ProcessorRequestStatus
 from gpu_fault.processor.replay_completion import finalize_replay_response
@@ -191,3 +192,73 @@ def test_a_500_is_still_replayed_as_retryable() -> None:
     current = store.get_processor_request(claimed.request_id)
     assert current.status is ProcessorRequestStatus.PENDING
     assert current.retry_count == 1
+
+
+REPLACEMENTS = "/v1/installation-resources/replacements"
+
+
+def _transition(row: InstallationResource, resource_id: str, **updates: object):
+    return {
+        "recorded": row.model_dump(mode="json"),
+        "retired": row.model_copy(
+            update={
+                "resource_key": retired_resource_key(row),
+                "status": InstallationResourceStatus.DELETED,
+            }
+        ).model_dump(mode="json"),
+        "replacement": row.model_copy(
+            update={"resource_id": resource_id, **updates}
+        ).model_dump(mode="json"),
+    }
+
+
+def test_a_replacement_is_one_transaction_and_a_stale_one_a_409() -> None:
+    context = _context()
+    first, second = _row("aws/a", "sg-a"), _row("aws/b", "sg-b")
+    read_earlier = second.model_copy(update={"error": "read before a write"})
+    created, stale, replaced, malformed = _requests(
+        context,
+        ("POST", SYNC, _snapshot(first, second)),
+        (
+            "POST",
+            REPLACEMENTS,
+            {
+                "site_id": "site-a",
+                "replacements": [
+                    _transition(first, "sg-a-new"),
+                    _transition(read_earlier, "sg-b-new"),
+                ],
+            },
+        ),
+        (
+            "POST",
+            REPLACEMENTS,
+            {"site_id": "site-a", "replacements": [_transition(first, "sg-a-new")]},
+        ),
+        (
+            "POST",
+            REPLACEMENTS,
+            {
+                "site_id": "site-a",
+                "replacements": [
+                    _transition(second, "sg-b-new", dependencies=["aws/a"])
+                ],
+            },
+        ),
+    )
+    assert created.status_code == 200, created.text
+    assert stale.status_code == 409
+    assert stale.json()["reason"] == "installation resource changed since it was read"
+    assert stale.json()["conflicts"] == [{"resource_key": "aws/b", "fields": ["error"]}]
+    assert replaced.status_code == 200, replaced.text
+    assert [row["resource_id"] for row in replaced.json()] == ["sg-a-new"]
+    assert malformed.status_code == 422, "only the physical resource may change"
+    stored = {
+        row.resource_key: row.resource_id
+        for row in context.store.list_installation_resources("site-a")
+    }
+    assert stored == {
+        "aws/a": "sg-a-new",
+        "aws/b": "sg-b",
+        retired_resource_key(first): "sg-a",
+    }

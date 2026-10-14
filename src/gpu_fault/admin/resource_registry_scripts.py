@@ -9,6 +9,7 @@ from gpu_fault.installation_resources import (
     IDENTITY_CONFLICT,
     IDENTITY_FIELDS,
     RESOURCE_KEY_PATTERN,
+    STALE_RECORD,
 )
 
 LEGACY_REGISTRY_MARKER = "GPU_FAULT_LEGACY_REGISTRY_API"
@@ -17,7 +18,7 @@ UNAVAILABLE_REGISTRY_MARKER = "GPU_FAULT_REGISTRY_UNAVAILABLE"
 #: fields on stdout (exit 65) -- validated, never the response text itself.
 CONFLICT_REGISTRY_MARKER = "GPU_FAULT_REGISTRY_CONFLICT"
 CONFLICT_EXIT = 65
-CONFLICT_REASONS = (IDENTITY_CONFLICT,)
+CONFLICT_REASONS = (IDENTITY_CONFLICT, STALE_RECORD)
 _FIELD_PATTERN = re.compile(r"^[a-z_]{1,32}$")
 
 _HTTP_PREAMBLE = (
@@ -131,16 +132,16 @@ def conflict_report(
     return reason, conflicts
 
 
-SYNC_SCRIPT = (
+_POST_SCRIPT = (
     _HTTP_PREAMBLE
     + r"""
-require_route("/v1/installation-resources/sync")
+require_route("@PATH@")
 payload = sys.stdin.buffer.read(8 * 1024 * 1024 + 1)
 if len(payload) > 8 * 1024 * 1024:
     print("registry snapshot exceeds input limit", file=sys.stderr)
     raise SystemExit(1)
 request = urllib.request.Request(
-    "http://127.0.0.1:8080/v1/installation-resources/sync",
+    "http://127.0.0.1:8080@PATH@",
     data=payload,
     method="POST",
     headers={
@@ -150,6 +151,11 @@ request = urllib.request.Request(
 )
 print(json.dumps(request_json(request), separators=(",", ":")))
 """
+)
+SYNC_SCRIPT = _POST_SCRIPT.replace("@PATH@", "/v1/installation-resources/sync")
+#: ``replace-resource``: an older control plane has no such route (exit 44).
+REPLACE_SCRIPT = _POST_SCRIPT.replace(
+    "@PATH@", "/v1/installation-resources/replacements"
 )
 
 FETCH_SCRIPT = (

@@ -10,7 +10,9 @@ from gpu_fault.installation_resources import (
     InstallationResourceConflict,
     InstallationResourceDeletePolicy,
     InstallationResourceOwnership,
+    InstallationResourceReplacement,
     InstallationResourceStatus,
+    retired_resource_key,
 )
 from gpu_fault.managed_recovery import HyperPodNodeIdentity
 from gpu_fault.models import MarkerScope, RecoveryAction
@@ -139,6 +141,53 @@ def test_an_installation_resource_batch_takes_the_single_row_writer_locks(store)
     worker.join(30)
     assert failures == []
     assert store.list_installation_resources() == [first, second]
+
+
+def test_an_installation_resource_replacement_is_one_idempotent_transaction(store):
+    """Batch 91 (``replace-resource``): the recorded row moves to its retired key
+    and the replacement takes the key in one transaction; a retry of a stored
+    transition is accepted, a stale one writes nothing."""
+
+    recorded = resource(
+        key="resource-a",
+        ownership=InstallationResourceOwnership.CREATED,
+        delete_policy=InstallationResourceDeletePolicy.DELETE,
+    )
+    other = resource(
+        key="resource-b",
+        ownership=InstallationResourceOwnership.CREATED,
+        delete_policy=InstallationResourceDeletePolicy.DELETE,
+    )
+    store.save_installation_resources([recorded, other])
+
+    def transition(row, resource_id):
+        return InstallationResourceReplacement(
+            recorded=row,
+            retired=row.model_copy(
+                update={
+                    "resource_key": retired_resource_key(row),
+                    "status": InstallationResourceStatus.DELETED,
+                }
+            ),
+            replacement=row.model_copy(update={"resource_id": resource_id}),
+        )
+
+    first = transition(recorded, "owned/replacement-a")
+    stale = transition(
+        other.model_copy(update={"attributes": {"phase": "read-before-a-write"}}),
+        "owned/replacement-b",
+    )
+    with pytest.raises(InstallationResourceConflict) as refused:
+        store.replace_installation_resources([first, stale])
+    assert refused.value.conflicts == (("resource-b", ("attributes",)),)
+    assert store.list_installation_resources() == [recorded, other], (
+        "a refused replacement committed some of its rows"
+    )
+    assert store.replace_installation_resources([first]) == [first.replacement]
+    assert store.replace_installation_resources([first]) == [first.replacement]
+    assert store.list_installation_resources() == sorted(
+        [first.replacement, other, first.retired], key=lambda row: row.resource_key
+    )
 
 
 def test_node_identity_lists_are_scoped_ordered_and_preserve_newer_generations(store):
