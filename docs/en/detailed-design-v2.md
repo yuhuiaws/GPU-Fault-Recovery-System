@@ -1388,7 +1388,10 @@ keeps the same-action aggregation optimization, and does not let a new event's a
 
 **④ Thread/coroutine model**: 1 scan thread + 2 wakeup listener threads +
 `GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS=8` execution threads, each scan taking a batch of
-`GPU_FAULT_WORKFLOW_BATCH_SIZE=100`. Every control-worker process starts a dispatcher (6 replicas × 4 processes by default),
+`GPU_FAULT_WORKFLOW_BATCH_SIZE` rows: unset, max(100, Region budget + 50), at most 400 (100 under the default budget of 20), so
+the oldest-rows selection never caps the Region budget, and a tick -- about 1 s + 0.15 s per workflow over the workers, 8.5 s at
+400 on 8 -- stays under the 15-s dispatch lease; startup refuses a Region budget above the batch and warns when a tick cannot
+finish inside the lease. Every control-worker process starts a dispatcher (6 replicas × 4 processes by default),
 but only one process dispatches at a time: each `run_once` first takes the fleet-wide periodic lease `workflow-dispatch`
 (`GPU_FAULT_WORKFLOW_DISPATCH_LEASE_SECONDS`, default `max(15, 3 × poll interval)` = 15 seconds, renewed by its holder every tick;
 the lease owner is the per-process executor id) and returns `lease_held_by_other` without scanning when another process holds it (F-A1). The
@@ -3967,9 +3970,9 @@ is reserved for that successor until the successor claims or ends -- no other wo
 for it (its own reservation is left out of its count), and exactly one hold exists through the handoff. Containment the successor
 inherited is not its own work; it is admitted for its budgeted steps still to run.
 
-Starvation guard: a refused workflow stays `PENDING` among the oldest `GPU_FAULT_WORKFLOW_BATCH_SIZE` (default 100) rows the
-dispatcher selects each tick. The dispatcher reads one occupancy aggregate per tick and passes over
-`PENDING` / `SAFETY_PENDING` rows whose recorded refusing scope is still full
+Starvation guard: a refused workflow stays `PENDING` among the oldest `GPU_FAULT_WORKFLOW_BATCH_SIZE` rows the dispatcher selects
+each tick (unset: max(100, Region budget + 50), at most 400). The dispatcher reads one occupancy aggregate per tick and passes
+over `PENDING` / `SAFETY_PENDING` rows whose recorded refusing scope is still full
 (`gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}`); once the scope has room its waiters are candidates
 again in their queue order -- the guard only skips and never reorders, so FIFO within a scope is unchanged. A row never refused
 has no recorded scope: while some scope is full, the dispatcher works out the scopes it would ask for (its incident's cluster,

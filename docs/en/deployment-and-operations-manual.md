@@ -7334,7 +7334,7 @@ sudo /opt/gpu-fault/uninstall
 | `GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER` | true | Effective in active |
 | `GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION` | true | Allows a higher-tier workflow on the same node with the same attempt, or with neither side having a job, to set the lower-tier predecessor to `SUPERSEDED` at a safe step boundary; on by default, can be explicitly disabled during emergency troubleshooting |
 | `GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS` | 5 | Fallback scan interval of persistent workflows; remote completion, GPU metrics and host telemetry actively wake this Pod's dispatcher after being stored |
-| `GPU_FAULT_WORKFLOW_BATCH_SIZE` | 100 | Per-batch cap |
+| `GPU_FAULT_WORKFLOW_BATCH_SIZE` | max(100, Region budget + 50), at most 400 | Oldest workflow rows selected per tick; unset, derived from the Region budget (100 by default); startup refuses a Region budget above it |
 | `GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS` | 8 | Number of dispatcher threads executing different incidents in parallel; at most one workflow per incident per round |
 | `GPU_FAULT_XID_CORRELATION_POLL_SECONDS` | 1 | Period for scanning expired XID 45 |
 | `GPU_FAULT_XID_CORRELATION_LEASE_SECONDS` | 30 | HA final-processing lease; minimum 5 seconds |

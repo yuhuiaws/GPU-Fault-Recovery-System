@@ -562,7 +562,7 @@ validates them (integers/numbers must parse, booleans must be `0/1/true/false/ye
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_FAILURE_DOMAIN` | Core/Other | integer | `'1'` | `gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_NODE` | Core/Other | integer | `'1'` | `gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMEDIATION_MAX_ACTIVE_PER_RESOURCE_CLASS` | Core/Other | integer | `'2'` | `gpu_fault.execution.remediation_budget` |
-| `GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION` | Core/Other | integer | `'20'` | `gpu_fault.app.builtin_metric_contributors`<br>`gpu_fault.execution.remediation_budget` |
+| `GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION` | Core/Other | integer | `'20'` | `gpu_fault.app.builtin_metric_contributors`<br>`gpu_fault.execution.config`<br>`gpu_fault.execution.remediation_budget` |
 | `GPU_FAULT_REMOTE_COMMAND_CLAIM_DEADLINE_SECONDS` | Core/Other | text | `'900'` | `gpu_fault.app.builtin_metric_contributors`<br>`gpu_fault.app.periodic_services` |
 | `GPU_FAULT_REMOTE_COMMAND_RETENTION_SECONDS` | Core/Other | text | `'86400'` | `gpu_fault.app.periodic_services` |
 | `GPU_FAULT_REMOTE_COMMAND_STALE_FENCE_GRACE_SECONDS` | Core/Other | number | `'600'` | `gpu_fault.app.periodic_services` |
@@ -655,7 +655,7 @@ validates them (integers/numbers must parse, booleans must be `0/1/true/false/ye
 | `GPU_FAULT_WATCHER_TERMINAL_RETENTION_SECONDS` | Core/Other | integer | `'3600'` | `gpu_fault.completion_controller` |
 | `GPU_FAULT_WATCHER_WATCH_TIMEOUT_SECONDS` | Core/Other | integer | `'30'` | `gpu_fault.completion_controller` |
 | `GPU_FAULT_WATCH_NAMESPACE` | Core/Other | text | `<implicit>` | `gpu_fault.completion_controller` |
-| `GPU_FAULT_WORKFLOW_BATCH_SIZE` | Workflow | integer | `'100'` | `gpu_fault.execution.config` |
+| `GPU_FAULT_WORKFLOW_BATCH_SIZE` | Workflow | integer | `str(derived_batch)` | `gpu_fault.execution.config` |
 | `GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS` | Workflow | integer | `'8'` | `gpu_fault.app.admission_runtime`<br>`gpu_fault.execution.config` |
 | `GPU_FAULT_WORKFLOW_DISPATCH_CYCLE_SECONDS` | Workflow | number | `'0'` | `gpu_fault.execution.config` |
 | `GPU_FAULT_WORKFLOW_DISPATCH_LEASE_SECONDS` | Workflow | number | `str(max(15.0, poll_interval_seconds * 3))` | `gpu_fault.execution.config` |

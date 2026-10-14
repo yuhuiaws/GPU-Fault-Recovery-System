@@ -21,7 +21,8 @@ Administrators can currently configure:
   Per the complete model of a 1000-node single cluster in Performance Acceptance Plan §13.4: at 1024, 1150 of 3000 routine telemetry requests got 429;
   at 4096 all 6500 requests got 202 with P0 and evidence unchanged. 4096 is recommended when a single cluster has >= 512 nodes;
   the default 1024 corresponds to the preset 256-node cluster model);
-- The Region, cluster and resource class caps of the remediation budget;
+- The Region, cluster and resource class caps of the remediation budget (Region 1..400: the dispatcher selects the oldest
+  max(100, Region cap + 50) open workflows a tick, at most 400, and refuses to start under a Region cap above its batch);
 - Aurora Serverless v2 Min/Max ACU;
 - Processor total queue, single-cluster queue, client backoff, persistent retry, completed record retention and the
   ingress's routine admission batch delay (`admissionBatchDelaySeconds`, 0..0.5 s, default 0.002; the default is

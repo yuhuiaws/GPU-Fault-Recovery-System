@@ -48,6 +48,7 @@ from gpu_fault.admin.config_parser import (
 )
 from gpu_fault.admin.operation_lock import SiteOperationBusy, site_operation_lock
 from gpu_fault.digests import SHA256_PATTERN
+from gpu_fault.execution.config import DISPATCH_BATCH_CEILING
 from gpu_fault.postgres_capacity import PostgresPoolCapacity, flush_slots_per_process
 
 __all__ = ["AdminConfigError", "aurora_min_acu_floor"]
@@ -103,7 +104,9 @@ class RemediationCapacity(_Section):
 
     def validate(self) -> None:
         bounds = {
-            "maxActiveRegion": (self.max_active_region, 1, 4096),
+            # The dispatch batch is derived from the Region budget and stops at
+            # DISPATCH_BATCH_CEILING; a larger budget would refuse to start.
+            "maxActiveRegion": (self.max_active_region, 1, DISPATCH_BATCH_CEILING),
             "maxActivePerCluster": (self.max_active_per_cluster, 1, 128),
             "maxActivePerResourceClass": (
                 self.max_active_per_resource_class,

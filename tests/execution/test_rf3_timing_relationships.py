@@ -23,6 +23,7 @@ from gpu_fault.execution.config import (
     validate_timing_or_raise,
     validate_timing_relationships,
 )
+from gpu_fault.execution.remediation_budget import RemediationBudgetPolicy
 
 EXECUTOR = ProductionExecutorConfig.from_mapping({})
 DISPATCHER = WorkflowDispatcherConfig.from_mapping({}, executor_enabled=True)
@@ -140,6 +141,13 @@ BROKEN: list[tuple[str, dict[str, Any], dict[str, Any], dict[str, Any], str]] = 
         {"cycle_deadline_seconds": 2.0},
         {},
         "the dispatch cycle deadline (2s) is below the poll interval (5s)",
+    ),
+    (
+        "region budget above the dispatch batch",
+        {"remediation_budget": RemediationBudgetPolicy(region_limit=150)},
+        {},
+        {},
+        "the region remediation budget (150) exceeds the dispatch batch size (100)",
     ),
 ]
 

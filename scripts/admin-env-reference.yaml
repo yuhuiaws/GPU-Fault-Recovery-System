@@ -224,7 +224,8 @@ categories:
       - name: GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS
         description: "持久 workflow 兜底扫描间隔；事件完成也会主动唤醒。"
       - name: GPU_FAULT_WORKFLOW_BATCH_SIZE
-        description: "每轮扫描的 workflow 上限。"
+        default: max(100, REMEDIATION_MAX_ACTIVE_REGION + 50)，上限 400
+        description: "每轮扫描选取的最老 workflow 行数；一般不设置，由 Region 预算推导，使选取不会卡住预算且一个 tick 留在派发租约内；启动时拒绝超过它的 Region 预算。"
       - name: GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS
         description: "每个 worker 进程的 workflow 执行线程数。"
       - name: GPU_FAULT_DEFAULT_RESTART_BUDGET

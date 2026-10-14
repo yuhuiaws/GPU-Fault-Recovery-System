@@ -328,6 +328,14 @@ gives 390/644 s, 307 s and about 12 minutes, and RUNNING climbed to the dispatch
 production-budget figures are the throttle's result: the verdict stays §6.3 (correct throttling,
 no starvation, final convergence), not a regression threshold.
 
+The dispatcher selects the oldest max(100, Region budget + 50) open workflows a tick, at most 400
+(detailed design §9.5). The production-budget tier (Region 20) keeps 100; the integrated runner's
+Region budgets of 128 and 200 give 178 and 250, so every workflow of a 32- or 50-cluster round is
+inside one tick's selection, where the fixed 100 rows made the second 100 workflows of the
+50-cluster round wait for the first (the scheduling model, with per-command completion and
+event-driven telemetry, puts the integrated-50 workflow p99 at about 155 s instead of about 207 s).
+Rounds measured with the fixed 100-row selection are not comparable with later ones.
+
 The current seeded synthetic steps set no `failure_domain`, `fabric_partition` or
 `availability_zone`, so they cannot prove that the failure-domain budget takes effect. Formal
 budget acceptance must give synthetic workflows deterministic domains covering both directions:

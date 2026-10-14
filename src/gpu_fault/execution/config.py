@@ -452,10 +452,33 @@ class ProductionExecutorConfig:
         )
 
 
+# The dispatch batch (GPU_FAULT_WORKFLOW_BATCH_SIZE unset): the region
+# remediation budget plus headroom, so the oldest-``batch_size`` selection never
+# caps the budget, between a floor and a ceiling that keeps one tick -- about
+# DISPATCH_TICK_OVERHEAD_SECONDS + batch x DISPATCH_ROW_SECONDS / workers
+# (batch 88's model of the live site: 8.5 s at 400 on 8 workers) -- under the
+# 15-s dispatch lease.
+DISPATCH_BATCH_FLOOR = 100
+DISPATCH_BATCH_HEADROOM = 50
+DISPATCH_BATCH_CEILING = 400
+DISPATCH_TICK_OVERHEAD_SECONDS = 1.0
+DISPATCH_ROW_SECONDS = 0.15
+
+
+def dispatch_batch_size(region_budget: int) -> int:
+    """max(100, region budget + 50), at most 400."""
+
+    return min(
+        DISPATCH_BATCH_CEILING,
+        max(DISPATCH_BATCH_FLOOR, region_budget + DISPATCH_BATCH_HEADROOM),
+    )
+
+
 @dataclass(frozen=True)
 class WorkflowDispatcherConfig:
     enabled: bool
     poll_interval_seconds: float = 5.0
+    # The environment derives it from the region budget (``dispatch_batch_size``).
     batch_size: int = 100
     max_workers: int = 8
     confirm_cluster_name: str | None = None
@@ -499,10 +522,15 @@ class WorkflowDispatcherConfig:
         poll_interval_seconds = float(
             values.get("GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS", "5")
         )
+        derived_batch = dispatch_batch_size(
+            int(values.get("GPU_FAULT_REMEDIATION_MAX_ACTIVE_REGION", "20"))
+        )
         return cls(
             enabled=(executor_enabled and dispatcher_enabled),
             poll_interval_seconds=poll_interval_seconds,
-            batch_size=int(values.get("GPU_FAULT_WORKFLOW_BATCH_SIZE", "100")),
+            batch_size=int(
+                values.get("GPU_FAULT_WORKFLOW_BATCH_SIZE", str(derived_batch))
+            ),
             max_workers=int(values.get("GPU_FAULT_WORKFLOW_DISPATCHER_WORKERS", "8")),
             confirm_cluster_name=(values.get("GPU_FAULT_HYPERPOD_CLUSTER") or None),
             dispatch_lease_seconds=float(
@@ -733,7 +761,43 @@ def validate_timing_relationships(
             f"interval ({_seconds(poll)}), so a cycle stops queuing work before "
             "the next scan is due"
         )
+    violations.extend(_dispatch_batch_relationships(executor, dispatcher))
     return violations
+
+
+def _dispatch_batch_relationships(
+    executor: ProductionExecutorConfig, dispatcher: WorkflowDispatcherConfig
+) -> list[str]:
+    """The region budget fits the dispatch batch; one tick fits the lease."""
+
+    found: list[str] = []
+    batch = dispatcher.batch_size
+    region = executor.remediation_budget.region_limit
+    if region > batch:
+        found.append(
+            f"the region remediation budget ({region}) exceeds the dispatch batch "
+            f"size ({batch}): the dispatcher works the oldest {batch} open "
+            "workflows a tick, so the selection, not the budget, would bound "
+            "concurrent remediations; unset, GPU_FAULT_WORKFLOW_BATCH_SIZE is "
+            f"max({DISPATCH_BATCH_FLOOR}, region budget + "
+            f"{DISPATCH_BATCH_HEADROOM}) up to {DISPATCH_BATCH_CEILING}"
+        )
+    lease = dispatcher.dispatch_lease_seconds
+    cycle = dispatcher.cycle_deadline_seconds
+    tick = (
+        DISPATCH_TICK_OVERHEAD_SECONDS
+        + batch * DISPATCH_ROW_SECONDS / dispatcher.max_workers
+    )
+    if lease > 0 and not 0 < cycle < lease and tick >= lease:
+        found.append(
+            f"warning: a dispatch tick of {batch} workflows on "
+            f"{dispatcher.max_workers} workers takes about {tick:.1f}s (batch 88's "
+            f"model, {DISPATCH_ROW_SECONDS}s per workflow per worker), not below "
+            f"the dispatch lease ({_seconds(lease)}): the lease can lapse "
+            "mid-tick and hand the scan to a second dispatcher; lower the batch, "
+            "add workers or set GPU_FAULT_WORKFLOW_DISPATCH_CYCLE_SECONDS"
+        )
+    return found
 
 
 def validate_timing_or_raise(

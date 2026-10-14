@@ -46,6 +46,7 @@ from gpu_fault.admin.config_parser import (
 )
 from gpu_fault.admin.config_patch import apply_patch, preset_admin_config
 from gpu_fault.admin.site import SiteConfigError
+from gpu_fault.execution.config import DISPATCH_BATCH_CEILING
 
 ROOT = Path(__file__).resolve().parents[2]
 SITE_IDENTITY = {
@@ -137,6 +138,16 @@ def test_default_as_dict_is_the_persisted_digest_contract() -> None:
     assert config.as_dict() == expected
     assert config.sha256() == canonical_sha256(expected)
     assert AdminConfig.from_mapping(expected) == config
+
+
+def test_the_region_budget_stops_at_the_dispatch_batch_ceiling() -> None:
+    """The dispatcher's batch is derived from the Region budget and capped at
+    400; the control plane refuses to start under a larger budget, so the
+    configuration refuses it first."""
+
+    RemediationCapacity(max_active_region=DISPATCH_BATCH_CEILING).validate()
+    with pytest.raises(AdminConfigError, match="maxActiveRegion must be within 1..400"):
+        RemediationCapacity(max_active_region=DISPATCH_BATCH_CEILING + 1).validate()
 
 
 def test_constant_budgets_are_readable_but_not_fields() -> None:
