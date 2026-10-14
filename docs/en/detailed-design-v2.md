@@ -3644,8 +3644,12 @@ the Pod script of `admin/workflow_reconcile_never_dispatched.py`); a `BLOCKED` r
 service's `isolation_verdict`: both absences must hold for that very node and its Agent record must not be alive by the
 shared rule; the CLI's `--close-quarantined`/`--close-incident` read the provider for a node the cluster no longer has and
 hand it to the same judgement). The actor
-is `departed-node-cleanup`, the reference `departed-node-cleanup-<first 16 of sha256(cluster/node/instance/absent_since)>`,
-the transition `departed-node-cleanup/<reference>`. The reference is deterministic, so a resumed cycle after a restart
+is `departed-node-cleanup`, the reference `departed-node-cleanup-<first 16 of sha256(cluster/node/instance)>`,
+the transition `departed-node-cleanup/<reference>`. When the absence began is not part of it: the inventory remembers an
+absence by name for 24 hours, an older one counts from the retention window and that start moves with the window,
+while an instance proven departed is one its provider no longer has and never comes back, so cluster, node and instance
+name one departure (`test_a_long_refusal_keeps_its_reference_when_the_absence_window_moves`). The reference is
+deterministic, so a resumed cycle after a restart
 lands on the same transition: a record left `DRAINING` is revoked under the transition that drained it, never drained
 twice (`test_a_restart_between_drain_and_revoke_resumes_on_postgres`). An incident that also names other nodes is closed
 only when those nodes are proven departed in the **same** cycle. Every case not ended has a bounded `kind` (also the

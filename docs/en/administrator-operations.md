@@ -4033,8 +4033,10 @@ departed earlier is ended too: after 10 minutes of an unbroken report chain, a n
 absent from the chain's start.
 
 **Actions: each one through the CLI's own write path, compare-and-set and idempotent.** The audit names the actor
-`departed-node-cleanup` and the reference `departed-node-cleanup-<16 hex digits>` -- derived from the cluster, the node,
-the instance and the start of the absence, so one departure keeps its reference across cycles, replicas and restarts.
+`departed-node-cleanup` and the reference `departed-node-cleanup-<16 hex digits>` -- derived from the cluster, the node
+and the instance (an instance proven departed is one its provider no longer has and never comes back, so the three name
+one departure), so one departure keeps its reference across cycles, replicas, restarts and an absence longer than the
+inventory's 24-hour memory.
 
 1. **Retire the Agent**: `FleetRegistry.drain_agent`, then `revoke_agent`, under the transition
    `departed-node-cleanup/<reference>`, with the audit line `--retire-departed-agents` writes as its reason

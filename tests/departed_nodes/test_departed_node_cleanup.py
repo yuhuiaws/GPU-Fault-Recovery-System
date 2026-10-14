@@ -648,6 +648,42 @@ def test_a_gap_in_the_reports_restarts_the_absence() -> None:
     assert record.blocker_classes == ["kubernetes_unproven"]
 
 
+def test_a_long_refusal_keeps_its_reference_when_the_absence_window_moves() -> None:
+    """After 24 hours the inventory forgets when an absence began and counts
+    from its retention window instead; the departure is still the same one
+    (the instance is gone for good), so its reference and the actions the
+    ledger line already records must not change with that window."""
+
+    store = build_store()
+    world_ = world(store)
+    store.save_regional_cluster(registration(HP_CLUSTER))
+    start = ago(hours=25)
+    store.save_agent(
+        agent(HP_CLUSTER, HP_NODE, instance_id="node-uid-1", last_seen=start)
+    )
+    world_.provider.hyperpod[HP_NAME] = {"i-0a000002"}
+    pending_never_dispatched(
+        store, HP_CLUSTER, HP_NODE, suffix="pair", node_ids=[HP_NODE, HP_PRESENT]
+    )
+    world_.report(HP_CLUSTER, [HP_NODE, HP_PRESENT], at=start)
+    for minute in range(1, 31):
+        world_.report(HP_CLUSTER, [HP_PRESENT], at=start + timedelta(minutes=minute))
+    world_.cleanup.now = lambda: start + timedelta(minutes=30)
+    [first] = world_.cleanup.run_once()
+    world_.reports_since(HP_CLUSTER, [HP_PRESENT], minutes=25 * 60 - 31)
+    world_.cleanup.now = lambda: ago(seconds=0)
+
+    [second] = world_.cleanup.run_once()
+
+    assert first.status is DepartedNodeCleanupStatus.REFUSED, first.blockers
+    assert first.actions == [f"agent-retired:{HP_NODE}"]
+    assert second.absent_since != first.absent_since, (
+        "the fixture must move the absence window"
+    )
+    assert second.reference == first.reference
+    assert second.actions == first.actions
+
+
 def test_records_of_a_removed_cluster_and_old_cleaned_lines_are_pruned() -> None:
     store = build_store()
     world_ = hyperpod_departure(store, cleaned_retention=timedelta(seconds=0))

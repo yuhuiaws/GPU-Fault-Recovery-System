@@ -215,17 +215,16 @@ class DepartureProof:
         return record
 
     def reference(self) -> str:
-        """The departure's id: stable across cycles, replicas and restarts."""
+        """The departure's id: stable across cycles, replicas and restarts.
+
+        Cluster, node and instance only. A proven departure is an instance its
+        provider no longer has -- it never comes back -- so they name one
+        departure; when the absence began is not part of it, because past the
+        inventory's 24-hour memory that moment moves to the retention window.
+        """
 
         digest = hashlib.sha256(
-            "/".join(
-                (
-                    self.cluster_id,
-                    self.node_id,
-                    self.instance_id or "-",
-                    _iso(self.kubernetes.absent_since) or "-",
-                )
-            ).encode()
+            "/".join((self.cluster_id, self.node_id, self.instance_id or "-")).encode()
         ).hexdigest()
         return f"departed-node-cleanup-{digest[:16]}"
 
