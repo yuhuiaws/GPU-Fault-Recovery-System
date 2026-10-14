@@ -8335,7 +8335,11 @@ workflow and evidence references, and returns the notification ID in the decisio
 The deduplication key is composed of the Event ID and the template version; a re-submission of the same event does not send twice. Subsequent
 `CHECK_MECHANICALS`, reset, reboot, training restart and other actions are notified separately with their own fixed templates.
 A successful single-GPU `RESET_GPU` uses `gpu-reset-zh-v1`; a successfully submitted
-`RESTART_WORKLOAD` uses `restart-workload-zh-v1`. When a workflow containing only forensic/diagnostic/validation steps
+`RESTART_WORKLOAD` uses `restart-workload-zh-v1`. A confirmed `RESTART_NODE` uses `restart-node-zh-v1`, whose
+provider lines follow the lifecycle adapter that rebooted the node: on HyperPod `HyperPod action:
+BatchRebootClusterNodes`, `HyperPod operation` and each node's `HyperPod status`; on plain EKS `EKS action: EC2
+RebootInstances on the managed node group instance`, `EKS operation` and each node's `EC2 instance state` (the EC2
+instance state the EKS adapter reads back). When a workflow containing only forensic/diagnostic/validation steps
 FAILs (the diagnostic reached no conclusion, the incident turns `RECOVERED` rather than `ESCALATED`, and the reason contains
 `diagnostic inconclusive`) it uses `diagnostic-inconclusive-zh-v1`, category `ADVISORY`,
 with deduplication key `<cluster>/<incident>/diagnostic-inconclusive/<workflow>`. The regional executor only executes actions and writes the

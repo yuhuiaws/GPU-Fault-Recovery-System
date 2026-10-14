@@ -374,3 +374,39 @@ def test_a_warm_spare_handover_on_eks_moves_the_workload_without_ec2() -> None:
         WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT
     ]
     assert node_actions.contexts[0].step.node_ids == [NODE_B]
+
+
+def test_the_reboot_notice_and_the_agent_revocation_name_the_eks_provider() -> None:
+    """Live (GF-REGIONAL-DESTR-001 attempt 2): the notice of an EC2 reboot read
+    "HyperPod action: BatchRebootClusterNodes" and "HyperPod status: Running",
+    and the revoked Agent's transition said "HyperPod RESTART_NODE submission"."""
+
+    harness = Harness(WorkflowOperation.RESTART_NODE)
+    harness.adapter.notification_sink = harness.store
+    reasons: list[str] = []
+    drain = harness.registry.drain_agent
+
+    def recording_drain(cluster_id: str, node_id: str, request: Any) -> Any:
+        reasons.append(request.reason)
+        return drain(cluster_id, node_id, request)
+
+    harness.registry.drain_agent = recording_drain  # type: ignore[method-assign]
+    pending = harness.adapter.execute(harness.context)
+    context = harness.with_waiting(pending)
+    harness.agent_rebooted()
+    harness.ec2.instances[INSTANCE_A] = ec2_instance(INSTANCE_A, private_dns=NODE_A)
+
+    confirmed = harness.adapter.execute(context)
+
+    assert confirmed.status is WorkflowStepStatus.SUCCEEDED, confirmed
+    assert reasons == ["EKS RESTART_NODE submission"]
+    notice = harness.store.get_notification(confirmed.details["notification_id"])
+    assert "- EKS action: EC2 RebootInstances on the managed node group instance\n" in (
+        notice.body_text
+    )
+    assert f"- EKS operation: {pending.adapter_operation_id}\n" in notice.body_text
+    assert f"InstanceId: {INSTANCE_A};" in notice.body_text
+    assert "; EC2 instance state: Running\n" in notice.body_text
+    assert EKS_REBOOT_CONFIRMATION_SOURCE in notice.body_text
+    for text in (notice.subject, notice.body_text):
+        assert "HyperPod" not in text, text

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from gpu_fault.hyperpod import HyperPodNode
 from gpu_fault.hyperpod_spares import HyperPodSpareCoordinator
 from gpu_fault.node_provider import ClusterProvider
 from gpu_fault.store import InMemoryStore
@@ -128,3 +129,29 @@ def test_the_hma_health_label_gates_spares_only_on_hyperpod() -> None:
     assert "HyperPod topology is unknown" in rejections[NODE_B], (
         "a HyperPod reading looks for the SageMaker instance-group label"
     )
+
+
+def test_spare_health_reasons_name_the_provider_of_the_spare() -> None:
+    """A plain EKS spare has no HyperPod status or topology: its group is the
+    managed node group and its status the EC2 state (or the Ready condition on
+    the Kubernetes-only path). HyperPod's wording is unchanged."""
+
+    unhealthy = HyperPodNode(
+        node_logical_id=NODE_B,
+        instance_id=INSTANCE_B,
+        status="Pending",
+        kubernetes_labels={SPARE_LABEL: "true"},
+    )
+
+    eks = _coordinator(_cluster(), ClusterProvider.EKS_MANAGED).health_reasons(
+        "gpu-a", unhealthy, NODE_B
+    )
+    hyperpod = _coordinator(_cluster(), ClusterProvider.HYPERPOD).health_reasons(
+        "gpu-a", unhealthy, NODE_B
+    )
+
+    assert "EKS node group topology is unknown" in eks, eks
+    assert "node status is Pending" in eks, eks
+    assert not [item for item in eks if "HyperPod" in item], eks
+    assert "HyperPod topology is unknown" in hyperpod, hyperpod
+    assert "HyperPod status is Pending" in hyperpod, hyperpod

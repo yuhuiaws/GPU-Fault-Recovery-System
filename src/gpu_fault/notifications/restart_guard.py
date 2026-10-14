@@ -14,6 +14,7 @@ from gpu_fault.notifications.common import (
     RESTART_WORKLOAD_TEMPLATE_VERSION,
     AdvisoryNotification,
     Any,
+    restart_node_provider_wording,
 )
 
 
@@ -212,7 +213,12 @@ class RestartGuardEmailBuilder:
         provider_observations: list[dict[str, Any]],
         confirmation_source: str,
         event_source: str | None = None,
+        provider_label: str = "HyperPod",
     ) -> AdvisoryNotification:
+        # The lifecycle adapter's provider names the reboot and the status
+        # source: HyperPod BatchRebootClusterNodes, or on plain EKS the EKS
+        # adapter's EC2 RebootInstances and the EC2 instance state.
+        wording = restart_node_provider_wording(provider_label)
         providers = {item.get("node_id"): item for item in provider_observations}
         lines = []
         for item in agent_observations:
@@ -224,7 +230,8 @@ class RestartGuardEmailBuilder:
                 "NodeLogicalId: {logical}; boot ID before restart: {old_boot}; "
                 "boot ID after restart: {new_boot}; "
                 "Agent incarnation: {incarnation}; "
-                "HyperPod status: {status}".format(
+                "{status_label}: {status}".format(
+                    status_label=wording["provider_status_label"],
                     node=node_id,
                     instance=provider.get("instance_id", "UNKNOWN"),
                     logical=provider.get("node_logical_id", "UNKNOWN"),
@@ -251,6 +258,7 @@ class RestartGuardEmailBuilder:
             node_observations="\n".join(lines) or "- UNKNOWN",
             confirmation_source=confirmation_source,
             template_version=RESTART_NODE_TEMPLATE_VERSION,
+            **wording,
         )
         return AdvisoryNotification(
             deduplication_key=(

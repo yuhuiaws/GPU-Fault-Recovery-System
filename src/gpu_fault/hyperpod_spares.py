@@ -94,6 +94,19 @@ class SpareAllocation:
     activation_inhibited: bool = False
 
 
+def _spare_health_subjects(provider: ClusterProvider) -> tuple[str, str]:
+    """What a spare health reason calls the spare's topology and status.
+
+    A plain EKS spare's group is its managed node group, and its status is the
+    EC2 instance state the EKS adapter joined or, on the Kubernetes-only path,
+    the node's Ready condition -- neither of them a HyperPod status.
+    """
+
+    if provider is ClusterProvider.HYPERPOD:
+        return "HyperPod topology", "HyperPod status"
+    return "EKS node group topology", "node status"
+
+
 class HyperPodSpareCoordinator:
     """Atomically activates healthy, topology-compatible warm spares."""
 
@@ -473,10 +486,11 @@ class HyperPodSpareCoordinator:
         gpu_client_checker: GpuClientChecker | None = None,
     ) -> list[str]:
         reasons = []
+        topology, status = _spare_health_subjects(self.provider)
         if not node.instance_group_name or not node.instance_type:
-            reasons.append("HyperPod topology is unknown")
+            reasons.append(f"{topology} is unknown")
         if node.status != "Running":
-            reasons.append(f"HyperPod status is {node.status}")
+            reasons.append(f"{status} is {node.status}")
         kubernetes_node = self.core.read_node(node_name)
         if not self._node_ready(kubernetes_node):
             reasons.append("Kubernetes node is not Ready")

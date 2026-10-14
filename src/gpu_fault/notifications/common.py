@@ -558,8 +558,8 @@ GPU node restarted automatically
 
 2. Restart
 - System action: RESTART_NODE
-- HyperPod action: BatchRebootClusterNodes
-- HyperPod operation: {operation_id}
+- {provider_action_label}: {provider_action}
+- {provider_operation_label}: {operation_id}
 - Restarted nodes:
 {node_observations}
 - Restart confirmed by: {confirmation_source}
@@ -572,6 +572,43 @@ GPU node restarted automatically
 
 Template: {template_version}
 """
+
+#: How the node lifecycle provider rebooted the node and where each node's
+#: status comes from, keyed by ``NodeLifecycleProvider.provider_label``.
+#: HyperPod's lines are the template's original text. A plain EKS node is
+#: rebooted by the EKS adapter with EC2 ``RebootInstances`` on its managed node
+#: group instance, and its status is the EC2 instance state the adapter reads
+#: back; the notice used to call both HyperPod on every provider.
+RESTART_NODE_PROVIDER_WORDING: dict[str, dict[str, str]] = {
+    "HyperPod": {
+        "provider_action_label": "HyperPod action",
+        "provider_action": "BatchRebootClusterNodes",
+        "provider_operation_label": "HyperPod operation",
+        "provider_status_label": "HyperPod status",
+    },
+    "EKS": {
+        "provider_action_label": "EKS action",
+        "provider_action": "EC2 RebootInstances on the managed node group instance",
+        "provider_operation_label": "EKS operation",
+        "provider_status_label": "EC2 instance state",
+    },
+}
+#: A provider the table does not name gets wording that claims nothing.
+RESTART_NODE_NEUTRAL_WORDING: dict[str, str] = {
+    "provider_action_label": "Provider action",
+    "provider_action": "node reboot",
+    "provider_operation_label": "Provider operation",
+    "provider_status_label": "Provider status",
+}
+
+
+def restart_node_provider_wording(provider_label: str) -> dict[str, str]:
+    """The RESTART_NODE notice's provider lines for ``provider_label``."""
+
+    return RESTART_NODE_PROVIDER_WORDING.get(
+        provider_label, RESTART_NODE_NEUTRAL_WORDING
+    )
+
 
 WARM_SPARE_REPLACEMENT_EMAIL_TEMPLATE = """\
 GPU node replaced by warm spare

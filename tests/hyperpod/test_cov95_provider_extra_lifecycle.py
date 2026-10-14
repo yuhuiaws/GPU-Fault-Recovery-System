@@ -136,6 +136,9 @@ def test_agent_revocation_failure_stops_before_provider_submission():
         "the failed transition was not attempted against the workflow's own Agent"
     )
     assert revoked == [], "the failed drain proceeded to revocation"
+    assert transitions[0][2].reason.startswith("HyperPod "), (
+        "the HyperPod adapter's transition reason keeps naming HyperPod"
+    )
 
 
 @pytest.mark.parametrize(

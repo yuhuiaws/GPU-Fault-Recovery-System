@@ -47,6 +47,8 @@ class HyperPodNotificationMixin:
         context: WorkflowStepContext,
         operation_id: str,
         details: dict[str, Any],
+        *,
+        provider_label: str = "HyperPod",
     ) -> str | None:
         if (
             context.step.operation is WorkflowOperation.REPLACE_NODE
@@ -95,6 +97,7 @@ class HyperPodNotificationMixin:
                     "explicit-operation-id",
                 )
             ),
+            provider_label=provider_label,
         )
         notification = self.notification_sink.save_notification_if_absent(notification)
         if self.alert_sender is not None:
@@ -229,7 +232,9 @@ class HyperPodNotificationMixin:
             reactivated.append(node_id)
         return reactivated
 
-    def _revoke_agents(self, context: WorkflowStepContext) -> list[str]:
+    def _revoke_agents(
+        self, context: WorkflowStepContext, *, provider_label: str = "HyperPod"
+    ) -> list[str]:
         if self.registry is None:
             return []
         transition_id = f"{context.idempotency_key}/hyperpod-lifecycle"
@@ -247,7 +252,7 @@ class HyperPodNotificationMixin:
             request = AgentTransitionRequest(
                 expected_generation=record.generation,
                 transition_id=transition_id,
-                reason=(f"HyperPod {context.step.operation.value} submission"),
+                reason=(f"{provider_label} {context.step.operation.value} submission"),
             )
             self.registry.drain_agent(
                 context.incident.cluster_id,

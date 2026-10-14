@@ -447,7 +447,7 @@ class HyperPodLifecycleStepAdapter(
             revoked_agents = (
                 list(pending.get("revoked_agents") or [])
                 if "revoked_agents" in pending
-                else self._revoke_agents(context)
+                else self._revoke_agents(context, provider_label=self.provider_label)
             )
             retry_details = {
                 **pending,
@@ -604,6 +604,7 @@ class HyperPodLifecycleStepAdapter(
                     context,
                     previous.adapter_operation_id,
                     details,
+                    provider_label=self.provider_label,
                 )
                 if notification_id:
                     details["notification_id"] = notification_id
@@ -624,6 +625,7 @@ class HyperPodLifecycleStepAdapter(
                     context,
                     previous.adapter_operation_id,
                     details,
+                    provider_label=self.provider_label,
                 )
                 if notification_id:
                     details["notification_id"] = notification_id
@@ -769,7 +771,9 @@ class HyperPodLifecycleStepAdapter(
             )
         try:
             require_mutation_ownership(context)
-            revoked_agents = self._revoke_agents(context)
+            revoked_agents = self._revoke_agents(
+                context, provider_label=self.provider_label
+            )
         except (KeyError, ValueError) as exc:
             return WorkflowStepOutcome.failed(
                 "failed to revoke node agent before "
