@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hmac
 import logging
 import secrets
 import time
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -32,8 +34,17 @@ from gpu_fault.models import (
     WorkflowStatus,
 )
 from gpu_fault.fleet_compatibility import NODE_ACTION_KEY_VERSION_DERIVED
-from gpu_fault.node_action_keys import resolve_node_action_secret
+from gpu_fault.node_action_keys import (
+    derive_node_action_secret,
+    resolve_node_action_secret,
+)
+from gpu_fault.node_key_attestation import (
+    AttestedNodeActionKeyRequest,
+    EksNodeAttestation,
+    eks_attestation_refusal,
+)
 from gpu_fault.regional import (
+    RegionalClusterLifecycle,
     RegionalClusterRegistration,
     RegionalExecutorReadinessReport,
     RegionalExecutorReadinessRequest,
@@ -49,7 +60,6 @@ from gpu_fault.regional import (
     RemoteHyperPodSubmissionRequest,
     RemoteHyperPodSubmissionReservation,
     RemoteIncidentOwnershipReport,
-    RemoteNodeActionKeyRequest,
     RemoteNodeActionKeys,
     RemoteSpareHealthReport,
     RemoteSpareHealthRequest,
@@ -659,10 +669,12 @@ def _node_known_to_cluster(
     """Whether data-plane evidence already places ``node_id`` in ``cluster_id``.
 
     Any one of: an Agent record (a node that heartbeated before, e.g. a
-    re-imaged node), a GPU inventory snapshot or GPU metric (the DCGM path
-    reports a fresh node long before its Agent exists), or a HyperPod node
-    identity whose current Kubernetes name or alias is this node. Retired
-    aliases do not count: a replaced node's old name must not be re-keyed.
+    re-imaged node), a GPU inventory snapshot or GPU metric (posted by the
+    host collectors an install starts, minutes before its Agent registers), or
+    a HyperPod node identity whose current Kubernetes name or alias is this
+    node. Retired aliases do not count: a replaced node's old name must not be
+    re-keyed. A plain EKS node that has never been installed has none of these
+    (``gpu_fault.node_key_attestation``).
     """
 
     try:
@@ -680,10 +692,80 @@ def _node_known_to_cluster(
     )
 
 
+#: Registrations whose evidence no longer claims a node name: their token is
+#: refused (``RegionalClusterRegistration.accepts_token``) and their removal or
+#: rollback owns whatever records they left behind.
+_RETIRED_REGISTRATIONS = frozenset(
+    {RegionalClusterLifecycle.REVOKED, RegionalClusterLifecycle.ROLLED_BACK}
+)
+
+
+def _attested_node_refusal(
+    store: Any,
+    registration: RegionalClusterRegistration | None,
+    node_secrets: Mapping[str, str],
+    fleet_secret: str,
+    attestation: EksNodeAttestation,
+) -> tuple[int, str] | None:
+    """``(status, reason)`` when an attested node gets no key, else ``None``.
+
+    403 when the statement does not place the node in the authenticated
+    cluster (``eks_attestation_refusal``). 409 when the name is taken, the two
+    ways the deploy host's provisioning refuses it too: the CPU node-key mirror
+    holds a key for the name that is not this cluster's (``CPU NodeName key
+    conflict``), or another live registration already reports the name. Node
+    names key one site-wide map, so exclusive ownership is an operator's
+    reconciliation, never something the sync decides.
+    """
+
+    if registration is None:
+        return 403, "the authenticated cluster's registration is unavailable"
+    refusal = eks_attestation_refusal(registration, attestation)
+    if refusal is not None:
+        return 403, refusal
+    cluster_id, node_id = registration.cluster_id, attestation.node_id
+    mirrored = node_secrets.get(node_id) or node_secrets.get(f"{cluster_id}/{node_id}")
+    derived = derive_node_action_secret(fleet_secret, cluster_id, node_id)
+    if mirrored is not None and not hmac.compare_digest(
+        mirrored.encode(), derived.encode()
+    ):
+        return 409, (
+            f"CPU NodeName key conflict for {node_id}; exclusive cluster "
+            "ownership requires reconciliation"
+        )
+    for other in store.list_regional_clusters():
+        if (
+            other.cluster_id == cluster_id
+            or other.lifecycle_state in _RETIRED_REGISTRATIONS
+        ):
+            continue
+        identities = (
+            list(store.list_hyperpod_node_identities(other.hyperpod_cluster_name))
+            if other.hyperpod_cluster_name
+            else []
+        )
+        if _node_known_to_cluster(
+            store, other.cluster_id, node_id, hyperpod_identities=identities
+        ):
+            # Which cluster stays in the control plane's log: the caller is
+            # authenticated as one cluster and never reads another's records.
+            LOGGER.warning(
+                "node name %s of cluster %s is already known to cluster %s",
+                node_id,
+                cluster_id,
+                other.cluster_id,
+            )
+            return 409, (
+                f"node name {node_id} is already known to another cluster; "
+                "exclusive cluster ownership requires reconciliation"
+            )
+    return None
+
+
 @router.post("/node-action-keys", response_model=RemoteNodeActionKeys)
 @authorization_bucket("cluster-token")
 async def regional_node_action_keys(
-    request: RemoteNodeActionKeyRequest,
+    request: AttestedNodeActionKeyRequest,
     cluster_id: str | None = Header(
         default=None,
         alias="X-GPU-Fault-Cluster-ID",
@@ -694,7 +776,7 @@ async def regional_node_action_keys(
 
     ``gpu-fault-admin deploy``/``join-cluster`` write one version-2 key per
     node into the GPU Secret ``gpu-fault-node-action-keys`` for the nodes
-    present at that time. A node HyperPod replaces later has none, so every
+    present at that time. A node the provider replaces later has none, so every
     installer Job for it fails on the missing Secret key (live 2026-09-30) and
     the node never gets an Agent. The cluster executor asks here for the
     missing names and patches only those keys in.
@@ -702,9 +784,12 @@ async def regional_node_action_keys(
     The fleet master never leaves the control plane: only the derived,
     node-scoped value is returned, only for the authenticated cluster (the
     payload ``cluster_id`` is bound by the middleware and re-checked here), and
-    only for node ids the control plane already knows from this cluster's own
-    data-plane evidence -- an executor cannot mint a key for a name nothing in
-    its cluster has ever reported. Key values are never logged.
+    only for node ids the control plane can place in that cluster: its own
+    data-plane evidence, or -- for a plain EKS node that was never installed,
+    which has none -- the EC2 identity the executor attests in ``nodes``, when
+    it binds to the cluster's registration and the name is nobody else's
+    (``_attested_node_refusal``). One refusal withholds every key of the
+    request. Key values are never logged.
     """
 
     cluster_id = _require_cluster(cluster_id)
@@ -728,6 +813,7 @@ async def regional_node_action_keys(
     auth_registry = dependencies.auth_registry
     registration = auth_registry.get(cluster_id) if auth_registry is not None else None
     hyperpod_cluster_name = getattr(registration, "hyperpod_cluster_name", None)
+    attested = {item.node_id: item for item in request.nodes}
 
     def issue() -> RemoteNodeActionKeys:
         store = dependencies.context.store
@@ -743,12 +829,13 @@ async def regional_node_action_keys(
                 store, cluster_id, node_id, hyperpod_identities=identities
             )
         ]
-        if unknown:
+        unplaced = [node_id for node_id in unknown if node_id not in attested]
+        if unplaced:
             LOGGER.warning(
                 "refused node action keys for cluster %s: %d of %d node ids are "
                 "not known to this cluster",
                 cluster_id,
-                len(unknown),
+                len(unplaced),
                 len(request.node_ids),
             )
             raise HTTPException(
@@ -757,6 +844,31 @@ async def regional_node_action_keys(
                     "one or more node_ids are not known to the control plane "
                     "for the authenticated cluster"
                 ),
+            )
+        for node_id in unknown:
+            attestation = attested[node_id]
+            refused = _attested_node_refusal(
+                store, registration, registry.node_secrets, fleet_secret, attestation
+            )
+            if refused is not None:
+                LOGGER.warning(
+                    "refused node action keys for cluster %s: node %s: %s",
+                    cluster_id,
+                    node_id,
+                    refused[1],
+                )
+                raise HTTPException(status_code=refused[0], detail=refused[1])
+            # The audit line of an admission by statement: which instance,
+            # node group and Node UID the executor vouched for.
+            LOGGER.info(
+                "admitted node %s of cluster %s by its EC2 identity: uid=%s "
+                "instance=%s nodegroup=%s address=%s",
+                node_id,
+                cluster_id,
+                attestation.node_uid,
+                attestation.instance_id,
+                attestation.nodegroup,
+                attestation.private_ip,
             )
         keys: dict[str, str] = {}
         for node_id in request.node_ids:
