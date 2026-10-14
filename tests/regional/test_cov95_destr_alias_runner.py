@@ -1,15 +1,31 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from scripts.e2e.regional import destr020_verdicts as verdicts
+from scripts.e2e.regional import run_destr020_identity_mismatch_isolation as case
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalFixtureAbort,
     RegionalFixtureError,
 )
 from tests.regional._cov95_destr_alias import AliasHarness
+
+NO_ALIAS_AGENT = {
+    "found": False,
+    "before": None,
+    "lifecycle_state": None,
+    "transition_id": None,
+    "revoked_by_case": False,
+}
+
+
+def _alias_agent_evidence(run_dir: Path) -> dict[str, Any]:
+    path = run_dir / "cases" / case.CASE_ID / "alias-agent-cleanup.json"
+    return dict(json.loads(path.read_text(encoding="utf-8")))
 
 
 def test_alias_case_proves_absence_and_bounded_escalation_without_node_mutation(
@@ -31,6 +47,73 @@ def test_alias_case_proves_absence_and_bounded_escalation_without_node_mutation(
     assert all(
         detail["args"][0] == "get" for name, detail in h.calls if name == "node.present"
     ), h.calls
+    # The cleanup asked the CPU Pod to revoke the alias's Agent under the
+    # case's own transition -- before it proved the fleet and the runtime --
+    # and kept the read-back as evidence: nothing had registered one.
+    run_id = case.run_identity(tmp_path, 1)
+    [revoke] = [detail for name, detail in h.calls if name == "alias.agent.cleanup"]
+    assert revoke == (
+        "cluster-a",
+        h.alias,
+        verdicts.alias_cleanup_transition(run_id),
+        verdicts.alias_cleanup_reason(run_id, h.alias),
+    ), revoke
+    names = [name for name, _ in h.calls]
+    revoked_at = names.index("alias.agent.cleanup")
+    assert "gpu.nodes" in names[revoked_at:], "the fleet is compared after it"
+    assert "runtime.verify" in names[revoked_at:], "the runtime is verified after it"
+    assert report["cleanup"]["alias_agent"] == NO_ALIAS_AGENT, report["cleanup"]
+    assert _alias_agent_evidence(tmp_path) == NO_ALIAS_AGENT
+
+
+@pytest.mark.parametrize("lifecycle", ["ACTIVE", "DRAINING", "REVOKED"])
+def test_an_alias_agent_left_behind_is_revoked_by_the_cleanup(
+    lifecycle: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = AliasHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    drained = None if lifecycle == "ACTIVE" else "earlier/drain"
+    h.cleanup_agent = {"lifecycle_state": lifecycle, "transition_id": drained}
+
+    code, report = h.execute(tmp_path)
+
+    run_id = case.run_identity(tmp_path, 1)
+    cleanup = report["cleanup"]["alias_agent"]
+    assert code == 0 and report["cleanup"]["errors"] == [], report
+    assert cleanup == {
+        "found": True,
+        "before": lifecycle,
+        "lifecycle_state": "REVOKED",
+        "transition_id": drained or verdicts.alias_cleanup_transition(run_id),
+        "revoked_by_case": lifecycle != "REVOKED",
+    }, cleanup
+    assert _alias_agent_evidence(tmp_path) == cleanup
+    if lifecycle != "REVOKED":
+        assert h.cleanup_agent is not None, h.calls
+        assert h.cleanup_agent["transition_reason"] == (
+            verdicts.alias_cleanup_reason(run_id, h.alias)
+        ), "audited as the case's cleanup"
+
+
+def test_an_alias_agent_the_cleanup_cannot_revoke_fails_the_case(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = AliasHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.cleanup_agent = {"lifecycle_state": "ACTIVE", "transition_id": None}
+    h.cleanup_agent_returns = True
+
+    code, report = h.execute(tmp_path)
+
+    assert code == 1 and report["verdict"] == "FAIL", report
+    assert report["cleanup"]["errors"] == [
+        "alias_agent: RegionalFixtureError: the alias Agent record is 'ACTIVE' "
+        "after the cleanup, not REVOKED"
+    ], report["cleanup"]
+    assert _alias_agent_evidence(tmp_path)["lifecycle_state"] == "ACTIVE"
+    assert {"fleet_after", "runtime_identity"} <= set(report["cleanup"]), (
+        "the rest of the cleanup still runs"
+    )
 
 
 @pytest.mark.parametrize("defect", ["node", "agent", "event", "predecessor", "tests"])
@@ -80,6 +163,7 @@ def test_alias_injection_rechecks_quiet_control_plane(
         "chain.read",
         "provider.events",
         "runtime.verify",
+        "alias.agent.cleanup",
     ],
 )
 def test_alias_phase_failure_is_recorded_and_cleanup_still_checks_fleet(

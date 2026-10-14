@@ -27,6 +27,11 @@ class AliasHarness:
         self.alias_present = False
         self.alias_agent: dict[str, Any] | None = None
         self.alias_event: dict[str, Any] | None = None
+        # The alias's Agent record as the cleanup finds it (None: nothing ever
+        # registered one), and whether something re-registers it after the
+        # revoke (the cleanup's read-back then finds it ACTIVE again).
+        self.cleanup_agent: dict[str, Any] | None = None
+        self.cleanup_agent_returns = False
         self.predecessor_valid = True
         self.tests_pass = True
         self.queue = {"depth": 0, "fault_backlog_depth": 0}
@@ -132,6 +137,39 @@ class AliasHarness:
         monkeypatch.setattr(case, "time", self.clock)
         monkeypatch.setattr(case, "datetime", self.clock)
 
+    def alias_agent_cleanup(
+        self, cluster_id: str, alias: str, transition_id: str, reason: str
+    ) -> dict[str, Any]:
+        """What ``case.ALIAS_AGENT_CLEANUP`` prints: revoke through the
+        registry (drain first when ACTIVE; a DRAINING record finishes under the
+        transition that drained it), then the record read back."""
+
+        before = deepcopy(self.cleanup_agent)
+        revoked = False
+        if before is not None and before["lifecycle_state"] != "REVOKED":
+            transition = (
+                transition_id
+                if before["lifecycle_state"] == "ACTIVE"
+                else before.get("transition_id") or transition_id
+            )
+            self.cleanup_agent = {
+                **before,
+                "lifecycle_state": "REVOKED",
+                "transition_id": transition,
+                "transition_reason": reason,
+            }
+            revoked = True
+        if before is not None and self.cleanup_agent_returns:
+            self.cleanup_agent = {**before, "lifecycle_state": "ACTIVE"}
+        after = self.cleanup_agent
+        return {
+            "found": before is not None,
+            "before": None if before is None else before["lifecycle_state"],
+            "lifecycle_state": None if after is None else after["lifecycle_state"],
+            "transition_id": None if after is None else after.get("transition_id"),
+            "revoked_by_case": revoked,
+        }
+
     def call(self, name: str, detail: Any = None) -> None:
         self.calls.append((name, deepcopy(detail)))
         if name in self.failures:
@@ -207,6 +245,10 @@ class AliasRegional:
                 self.h.chain_pending -= 1
                 chain["workflow"]["status"] = "RUNNING"
             return chain
+        if script == case.ALIAS_AGENT_CLEANUP:
+            self.h.call("alias.agent.cleanup", args)
+            cluster_id, alias, transition_id, reason = args
+            return self.h.alias_agent_cleanup(cluster_id, alias, transition_id, reason)
         raise AssertionError("unexpected fake CPU request")
 
     def node_metadata(self, node: str) -> dict[str, Any]:
