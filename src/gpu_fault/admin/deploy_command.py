@@ -569,8 +569,9 @@ def refuse_deploy_during_uninstall(state_dir: Path) -> None:
 # What a completed uninstall leaves behind that would make the next deploy treat
 # the directory as an installed site: the site document, the bootstrap
 # checkpoints, the source-deploy records and their signature, the installed-
-# resource registry and the last quick verdicts. Kept: admin-config/, the
-# release-signing keys, the deployer venv, kubeconfigs and logs.
+# resource registry and the last quick verdicts, and the membership journals
+# (registration-anchor/ records where the Runtime Profile anchor moved). Kept:
+# admin-config/, the release-signing keys, the deployer venv, kubeconfigs, logs.
 RETIRED_AFTER_UNINSTALL = (
     INITIAL_REQUEST_FILE,
     "site.yaml",
@@ -585,6 +586,7 @@ RETIRED_AFTER_UNINSTALL = (
     "release-deploy",
     "join-cluster",
     "remove-cluster",
+    "registration-anchor",
 )
 
 
