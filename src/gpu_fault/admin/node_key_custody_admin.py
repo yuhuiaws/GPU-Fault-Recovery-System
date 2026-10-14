@@ -184,20 +184,27 @@ def _completed(
     )
     if not chain_file.exists():
         return None
-    head = verify_completed_custody(runner, context, crypto, binding, chain_file)
+    head, derived = verify_completed_custody(
+        runner, context, crypto, binding, chain_file
+    )
     if head.authorization != authorization:
         raise CustodyError(
             "administrator custody completion belongs to another authorization"
         )
     if activation is not None:
         activation.io.bind_completed(head.completed.statement)
-    return {
+    result = {
         "cluster_id": context.cluster_id,
         "custody_chain": str(chain_file),
         "custody_chain_sha256": hashlib.sha256(read_regular(chain_file)).hexdigest(),
         "custody_authorization_sha256": statement_sha256(authorization),
         "runtime_activation": "NOT_PROVED",
     }
+    if derived:
+        # Keys the node-key sync added after this transaction, each proved to
+        # be its node's derivation: recorded, never adopted as custody keys.
+        result["custody_derived_extra_keys"] = ",".join(derived)
+    return result
 
 
 def run_custody_provisioner(

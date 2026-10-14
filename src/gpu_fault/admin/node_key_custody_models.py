@@ -11,9 +11,11 @@ from pydantic import (
     BaseModel,
     ConfigDict,
     Field,
+    SerializerFunctionWrapHandler,
     StringConstraints,
     ValidationInfo,
     field_validator,
+    model_serializer,
 )
 
 Digest = Annotated[str, StringConstraints(pattern=r"^[0-9a-f]{64}$")]
@@ -125,10 +127,26 @@ class Started(Statement):
     before_cpu_uid: Identity | None
     cpu_other_keys_sha256: Digest
     planned_keys: dict[NodeName, KeyState]
+    #: Live GPU keys of nodes outside the signed predecessor, each proved at
+    #: start to be ``derive_node_action_secret`` of its node under the bound
+    #: master -- what the executor's node-key sync adds for a node that joined
+    #: between deploys: node -> SHA-256 of the key bytes, never the key.
+    derived_extra_keys: dict[NodeName, Digest] = Field(default_factory=dict)
     master_source_verified: Literal[True] = True
     custody: Literal["cpu-secret-and-trusted-host-file"] = (
         "cpu-secret-and-trusted-host-file"
     )
+
+    @model_serializer(mode="wrap")
+    def _omit_absent_derived_extra_keys(
+        self, handler: SerializerFunctionWrapHandler
+    ) -> dict[str, Any]:
+        # Left out while empty, so a start signed before the field existed
+        # canonicalizes -- and verifies -- to exactly the bytes it was signed as.
+        data: dict[str, Any] = handler(self)
+        if not self.derived_extra_keys:
+            data.pop("derived_extra_keys", None)
+        return data
 
 
 class Completed(Statement):

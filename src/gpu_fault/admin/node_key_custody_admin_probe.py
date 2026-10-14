@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import subprocess
 from collections.abc import Callable, Sequence
@@ -37,6 +38,7 @@ from gpu_fault.admin.node_key_custody_models import (
 )
 from gpu_fault.admin.node_key_proof import read_node_key_proof
 from gpu_fault.admin.release_artifacts import verify_prebuilt_release
+from gpu_fault.node_action_keys import derive_node_action_secret
 
 
 @dataclass(frozen=True)
@@ -174,6 +176,14 @@ def live_node_uids(
 
 
 def master_source(runner: CommandRunner, context: AdminNodeKeyContext) -> MasterSource:
+    return _master_material(runner, context)[0]
+
+
+def _master_material(
+    runner: CommandRunner, context: AdminNodeKeyContext
+) -> tuple[MasterSource, bytes]:
+    """The bound master source and its bytes; the bytes never leave memory."""
+
     document = private_json(
         runner,
         [
@@ -205,12 +215,13 @@ def master_source(runner: CommandRunner, context: AdminNodeKeyContext) -> Master
             or material.strip() != material
         ):
             raise ValueError
-        return MasterSource(
+        source = MasterSource(
             secret_name="gpu-fault-node-installer",
             data_key="node-action-secret",
             secret_uid=metadata["uid"],
             sha256=hashlib.sha256(material).hexdigest(),
         )
+        return source, material
     except (AttributeError, KeyError, TypeError, ValueError, UnicodeError):
         raise CustodyError("administrator custody master source is invalid") from None
 
@@ -302,25 +313,77 @@ def current_binding(
     )
 
 
+def _derivations(
+    runner: CommandRunner,
+    context: AdminNodeKeyContext,
+    binding: CustodyBinding,
+    digests: dict[str, str],
+) -> bool:
+    """Whether each digest is its node's key derived from the bound master.
+
+    The executor's node-key sync keys a node that joins after the custody
+    transaction with ``derive_node_action_secret`` of the fleet master; the
+    master is read privately from its bound source and must still be the
+    bound one.
+    """
+
+    source, material = _master_material(runner, context)
+    if source != binding.master:
+        return False
+    master = material.decode("utf-8")
+    return all(
+        hmac.compare_digest(
+            digest,
+            hashlib.sha256(
+                derive_node_action_secret(
+                    master, binding.site.cluster_id, node
+                ).encode()
+            ).hexdigest(),
+        )
+        for node, digest in digests.items()
+    )
+
+
 def verify_completed_custody(
     runner: CommandRunner,
     context: AdminNodeKeyContext,
     crypto: CustodyCrypto,
     binding: CustodyBinding,
     chain_file: Path,
-) -> Transaction:
+) -> tuple[Transaction, tuple[str, ...]]:
+    """The verified head, and the GPU keys outside it proved to be derivations.
+
+    The GPU Secret must hold exactly the custody keys, except keys of nodes
+    the authorization does not bind that are each the node-scoped derivation
+    under the bound master (what the node-key sync adds between deploys);
+    any other extra key refuses, as does any differing custody key.
+    """
+
     runner = CustodyReadRunner(runner)
     chain = parse(Chain, read_regular(chain_file))
     head = verify_chain(chain, crypto, binding=binding)
+    derived: tuple[str, ...] = ()
     for plane in ("cpu", "gpu"):
         expected = getattr(head.completed.statement, plane)
         proof = read_node_key_proof(runner, context.kubectl(plane), context.namespace)
+        extras = (
+            sorted(set(proof.digests) - set(binding.nodes))
+            if proof is not None and plane == "gpu"
+            else []
+        )
         if (
             proof is None
             or proof.rotation_pending
             or proof.uid != expected.uid
             or plane == "gpu"
-            and set(proof.digests) != set(binding.nodes)
+            and not set(binding.nodes) <= set(proof.digests)
+            or extras
+            and not _derivations(
+                runner,
+                context,
+                binding,
+                {node: proof.digests[node] for node in extras},
+            )
             or any(
                 proof.digests.get(node) != state.sha256
                 for node, state in expected.keys.items()
@@ -329,4 +392,6 @@ def verify_completed_custody(
             raise CustodyError(
                 "administrator custody receipt does not match deployed key sources"
             )
-    return head
+        if plane == "gpu":
+            derived = tuple(extras)
+    return head, derived

@@ -92,12 +92,21 @@ def validate_transition(
             or state.sha256 == binding.master.sha256
             for node, state in completed.gpu.keys.items()
         )
+        # Keys proved to be derivations belong to no authorized node and to
+        # none of the planned key values.
+        or set(started.derived_extra_keys) & set(binding.nodes)
+        or any(
+            digest == binding.master.sha256
+            or digest in {state.sha256 for state in completed.gpu.keys.values()}
+            for digest in started.derived_extra_keys.values()
+        )
     ):
         raise CustodyError("custody receipt chain has an invalid provisioning edge")
     if previous is None:
         if (
             authorization.purpose != "install"
             or started.before_gpu is not None
+            or started.derived_extra_keys
             or any(state.generation != 1 for state in completed.gpu.keys.values())
         ):
             raise CustodyError("installation custody requires prospective absent keys")

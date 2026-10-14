@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import hmac
 import json
 import os
 import sys
@@ -42,6 +43,7 @@ from gpu_fault.admin.node_key_custody_models import (
     statement_sha256,
 )
 from gpu_fault.admin.node_key_custody_writer import ActivationWriterGuard
+from gpu_fault.node_action_keys import derive_node_action_secret
 
 
 class ProvisionInputs(Statement):
@@ -405,6 +407,7 @@ class ProvisionCustody:
             return
         nodes = self.binding.nodes
         before = None
+        derived_extra: dict[str, str] = {}
         if self.predecessor is None:
             if gpu is not None or cpu is not None and set(cpu.data) & set(nodes):
                 raise CustodyError(
@@ -412,15 +415,25 @@ class ProvisionCustody:
                 )
         else:
             previous = self.predecessor.completed.statement
+            signed = {node: state.sha256 for node, state in previous.gpu.keys.items()}
             if (
                 gpu is None
                 or cpu is None
                 or gpu.uid != previous.gpu.uid
                 or cpu.uid != previous.cpu.uid
-                or key_digests(gpu.data)
-                != {node: state.sha256 for node, state in previous.gpu.keys.items()}
-                or any(cpu.data.get(node) != value for node, value in gpu.data.items())
             ):
+                raise CustodyError(
+                    "custody live keys differ from the signed predecessor"
+                )
+            live = key_digests(gpu.data)
+            derived_extra = self._derived_extra_keys(
+                {node: digest for node, digest in live.items() if node not in signed},
+                gpu=gpu,
+                cpu=cpu,
+            )
+            if {node: digest for node, digest in live.items() if node in signed} != (
+                signed
+            ) or any(cpu.data.get(node) != gpu.data[node] for node in signed):
                 raise CustodyError(
                     "custody live keys differ from the signed predecessor"
                 )
@@ -458,6 +471,7 @@ class ProvisionCustody:
                 cpu.data if cpu is not None else {}, nodes
             ),
             planned_keys=planned,
+            derived_extra_keys=derived_extra,
         )
         material = [
             self._master_material,
@@ -484,6 +498,42 @@ class ProvisionCustody:
                 Path(self.inputs.retired_key_file),
                 base64.b64decode(gpu.data[self.statement.rotate_node], validate=True),
             )
+
+    def _derived_extra_keys(
+        self, extras: dict[str, str], *, gpu: Snapshot, cpu: Snapshot
+    ) -> dict[str, str]:
+        """``extras`` (node -> digest) when every one is its node's derivation.
+
+        The executor's node-key sync keys a node that joins between deploys
+        with what the control plane derives from the fleet master
+        (``derive_node_action_secret``), the derivation this helper uses too.
+        Recomputed here from the verified master and compared digest for
+        digest; a value that is not exactly that, a CPU mirror entry that
+        differs from it, or a name the authorization binds without a signed key
+        refuses the whole set as "live keys differ". Nothing here keeps the
+        extra keys: they belong to no authorized node, so the write below
+        leaves them out like every key of a node that is gone.
+        """
+
+        if not extras:
+            return {}
+        master = self._master_material.decode("utf-8")
+        cluster_id = self.binding.site.cluster_id
+        for node, digest in extras.items():
+            expected = hashlib.sha256(
+                derive_node_action_secret(master, cluster_id, node).encode()
+            ).hexdigest()
+            mirrored = cpu.data.get(node)
+            if (
+                node in self.binding.nodes
+                or not hmac.compare_digest(digest, expected)
+                or mirrored is not None
+                and mirrored != gpu.data[node]
+            ):
+                raise CustodyError(
+                    "custody live keys differ from the signed predecessor"
+                )
+        return dict(sorted(extras.items()))
 
     def finish(self, gpu: Snapshot, cpu: Snapshot) -> None:
         if self.started is None:
