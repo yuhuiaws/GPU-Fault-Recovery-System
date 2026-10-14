@@ -10,11 +10,15 @@ import pytest
 from scripts.e2e.regional import run_destr001_gpu_reset as reset_case
 from scripts.e2e.regional import run_destr023_idle_cluster_reset as idle_case
 from scripts.e2e.regional import run_destr024_watcher_down_fail_closed as watcher_case
+from scripts.e2e.regional.host_probe_fixture import HostProbeTransportError
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalFixtureAbort,
     RegionalFixtureError,
 )
 from tests.regional._cov95_destr_idle import IdleHarness
+from tests.regional._destructive_acceptance_builders import escalated_reset_state
+
+POD_GONE = "owned host probe Pod has terminated"
 
 
 @pytest.mark.parametrize("module", [reset_case, idle_case, watcher_case])
@@ -407,3 +411,179 @@ def test_cross_cluster_heartbeat_is_not_coverage(
     h.coverage_changes["heartbeat"] = {"cluster_id": "foreign"}
     with pytest.raises(RegionalFixtureError, match="another cluster"):
         idle_case.coverage_probe(h.regional, "node-a")
+
+
+def _dead_probe(
+    h: IdleHarness, monkeypatch: pytest.MonkeyPatch, *, reboot_on_failure: bool
+) -> list[str]:
+    """Post-reset probe calls fail on a terminated Pod; return what was attempted.
+
+    ``reboot_on_failure`` gives the node a new boot id at the moment the probe
+    is found dead: the reboot the node snapshot before the call did not show.
+    """
+
+    attempted: list[str] = []
+    original = h.host.execute
+
+    def execute(action: str, *args: str, **kwargs: Any) -> dict[str, Any]:
+        if action == "stop-reset-sampler" or (action == "snapshot" and args):
+            attempted.append(action)
+            if reboot_on_failure:
+                h.node["boot_id"] = "boot-after"
+            raise HostProbeTransportError(POD_GONE)
+        return original(action, *args, **kwargs)
+
+    monkeypatch.setattr(h.host, "execute", execute)
+    return attempted
+
+
+def test_reset_escalated_to_a_reboot_reports_the_product_story_not_the_dead_probe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """DESTR-001 on plain EKS: RESET_GPU failed busy and the product rebooted.
+
+    The reboot ended the probe Pod and the sampler; the result used to say only
+    ``HostProbeTransportError`` and lose the failed reset and its escalation.
+    """
+
+    h = IdleHarness(reset_case, tmp_path, monkeypatch)
+    h.node["boot_id"] = "boot-before"
+    h.plan(tmp_path)
+    h.workflow = escalated_reset_state()
+    original = h.regional.wait_for_workflow
+
+    def rebooted(**kwargs: Any) -> dict[str, Any]:
+        state = original(**kwargs)
+        h.node["boot_id"] = "boot-after"
+        return state
+
+    monkeypatch.setattr(h.regional, "wait_for_workflow", rebooted)
+    attempted = _dead_probe(h, monkeypatch, reboot_on_failure=False)
+    code, report = h.execute(tmp_path)
+
+    assert code == 1 and report["verdict"] == "FAIL", report
+    first = report["errors"][0]
+    assert first.startswith("RESET_GPU failed on node-a: ResetProgressError"), first
+    assert "In use by another client" in first, first
+    assert first.endswith("the product escalated the branch to RESTART_NODE"), first
+    escalation = report["product_escalation"]
+    assert escalation["escalations"][0]["from_operation"] == "RESET_GPU", escalation
+    assert escalation["escalations"][0]["to_operation"] == "RESTART_NODE", escalation
+    assert escalation["node_lifecycle_completed"] == ["RESTART_NODE"], escalation
+    assert "error" not in report, "the dead probe must not be the case's story"
+    assert "sampler_cleanup_error" not in report, report
+    assert "host_after_error" not in report, report
+    assert report["host_after_skipped"] == (
+        "RESTART_NODE completed; boot id changed from boot-before to boot-after"
+    ), report
+    assert report["sampler_stopped_by_reboot"] is True, report
+    assert any(
+        error.startswith(
+            "the physical single-GPU reset proof is unavailable because the "
+            "product rebooted the node"
+        )
+        for error in report["errors"]
+    ), report["errors"]
+    assert report["incident_id"] == "inc-destr001-escalated", report
+    assert report["workflow_request_id"] == "wf-destr001-escalated", report
+    assert attempted == [], "neither the snapshot nor the stop may use the dead Pod"
+    names = [name for name, _ in h.calls]
+    assert names.count("host.snapshot") == 1, names
+    for name in ("provider.events", "cpu.snapshot", "host.cleanup"):
+        assert name in names, f"{name} still runs after the product reboot: {names}"
+    assert report["reset_notification"]["notification_count"] == 0, report
+    assert report["post_case_isolation"]["unschedulable"] is False, report
+
+
+@pytest.mark.parametrize("reboot", [True, False])
+def test_probe_transport_loss_is_secondary_only_after_a_reboot(
+    reboot: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The reboot rung never completed, so the probe is asked and found dead.
+
+    A node that has a new boot by then turns the failure into the secondary
+    ``host_after_error``; one that does not keeps it as ``error``. Either way the
+    failed reset and its escalation were in ``errors`` before the probe call.
+    """
+
+    h = IdleHarness(reset_case, tmp_path, monkeypatch)
+    h.node["boot_id"] = "boot-before"
+    h.plan(tmp_path)
+    h.workflow = escalated_reset_state(restart_status="FAILED")
+    attempted = _dead_probe(h, monkeypatch, reboot_on_failure=reboot)
+    code, report = h.execute(tmp_path)
+
+    assert code == 1 and report["verdict"] == "FAIL", report
+    assert report["errors"][0].startswith("RESET_GPU failed on node-a"), report
+    assert report["product_escalation"]["node_lifecycle_completed"] == [], report
+    assert attempted[0] == "snapshot", attempted
+    failure = f"HostProbeTransportError: {POD_GONE}"
+    if reboot:
+        assert "error" not in report, report
+        assert report["host_after_error"] == failure, report
+        assert report["host_after_skipped"] == (
+            "boot id changed from boot-before to boot-after"
+        ), report
+        assert report["sampler_stopped_by_reboot"] is True, report
+        assert any(
+            "because the node rebooted during the case" in error
+            for error in report["errors"]
+        ), report["errors"]
+        assert attempted == ["snapshot"], attempted
+    else:
+        assert report["error"] == failure, report
+        assert "host_after_error" not in report, report
+        assert "host_after_skipped" not in report, report
+        assert report["sampler_cleanup_error"] == failure, report
+    assert "host.cleanup" in [name for name, _ in h.calls], h.calls
+
+
+@pytest.mark.parametrize("owner", ["other", "case"])
+def test_post_case_isolation_names_the_incident_still_holding_the_node(
+    owner: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Another incident re-cordoned and quarantined the node after the workflow."""
+
+    h = IdleHarness(reset_case, tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    incident = (
+        "inc-drain-after-workflow-8de85ab8"
+        if owner == "other"
+        else h.workflow["incident"]["incident_id"]
+    )
+    quarantine = {
+        "key": "gpu-fault.io/quarantined",
+        "value": "incident-c57db5a2",
+        "effect": "NoSchedule",
+    }
+    h.final_node_changes = {
+        "unschedulable": True,
+        "taints": [
+            quarantine,
+            {"key": "node.kubernetes.io/unschedulable", "effect": "NoSchedule"},
+        ],
+        "ownership_annotations": {
+            "gpu-fault.io/fencing-token": "1",
+            "gpu-fault.io/incident-id": incident,
+        },
+    }
+    code, report = h.execute(tmp_path)
+
+    assert code == 1 and report["verdict"] == "FAIL", report
+    isolation = report["post_case_isolation"]
+    assert isolation == {
+        "unschedulable": True,
+        "taints": [quarantine],
+        "ownership_incident": incident,
+        "owned_by_case_incident": owner == "case",
+        "other_incident_owner": incident if owner == "other" else None,
+    }, isolation
+    holder = "another incident" if owner == "other" else "this case's incident"
+    assert report["errors"] == [
+        "target node is still isolated at the end of the case: owned by "
+        f"{holder} {incident}; taint "
+        "gpu-fault.io/quarantined=incident-c57db5a2:NoSchedule; unschedulable"
+    ], report["errors"]
+    assert report["final_node"]["ownership_annotations"][
+        "gpu-fault.io/incident-id"
+    ] == (incident), report

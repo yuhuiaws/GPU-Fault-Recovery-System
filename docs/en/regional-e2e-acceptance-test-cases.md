@@ -9312,6 +9312,15 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
     `expected_status`) and to `reset_notification` in the result.
 - Rollback: if validation fails after the reset, the node stays quarantined; restore the
   services by hand as `RESTORE_GPU_SERVICES` would, then take the reboot path.
+- Evidence when the product escalates the reset: when RESET_GPU fails and the product escalates the branch
+  (`BRANCH_ESCALATED`), the result carries `product_escalation` and its first error reads
+  `RESET_GPU failed on <node>: <Agent error>; the product escalated the branch to RESTART_NODE`, recorded before any probe
+  call. When the product rebooted or replaced the node (a completed rung, or a `boot_id` that differs from the preflight
+  one), the probe Pod and the sampler ended with the old boot: the runner no longer asks the dead Pod for the post-reset
+  snapshot or `stop-reset-sampler` (`host_after_skipped`, `sampler_stopped_by_reboot`, plus an error that the physical
+  single-GPU reset proof is unavailable), and the other checks and the probe cleanup in `finally` still run. A node still
+  isolated at the end is recorded in `post_case_isolation`, naming the incident and taint that hold it. The verdict stays
+  **FAIL**.
 - DESTR/COLLECT preflights on a mixed-provider site: the "pre-existing taints" verdict counts only **isolating** taints.
   Any taint blocks a `hyperpod` node (as before); an `eks-managed` node (EKS node group label, no HyperPod label) carries
   its managed node group's `nvidia.com/gpu=present:NoSchedule` by construction, recorded in the snapshot's

@@ -55,7 +55,7 @@
     "scripts/e2e/regional/capacity_scrape_companion.py:capture_scrape_source": 210,
     "scripts/e2e/regional/collector_inventory_reboot.py:run_collect004": 257,
     "scripts/e2e/regional/run_collector_acceptance.py:run_collect002": 203,
-    "scripts/e2e/regional/run_destr001_gpu_reset.py:execute_case": 215,
+    "scripts/e2e/regional/run_destr001_gpu_reset.py:execute_case": 206,
     "scripts/e2e/regional/run_destr002_hyperpod_reboot.py:execute_case": 210,
     "scripts/e2e/regional/run_destr009_workload_restart.py:execute_case": 205,
     "scripts/e2e/regional/run_destr010_fabric_manager_restart.py:execute_case": 232,

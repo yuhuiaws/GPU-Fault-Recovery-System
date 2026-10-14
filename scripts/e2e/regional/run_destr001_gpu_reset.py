@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
+    HostProbeTransportError,
 )
 from scripts.e2e.regional.remote_command_shapes import (  # noqa: E402
     command_operations,
@@ -31,6 +33,14 @@ from scripts.e2e.regional.reset_dependency_chain import (  # noqa: E402
 )
 from scripts.e2e.regional.reset_notification_evidence import (  # noqa: E402
     reset_notification_evidence,
+)
+from scripts.e2e.regional.reset_escalation_evidence import (  # noqa: E402
+    escalation_errors,
+    isolation_errors,
+    post_case_isolation,
+    product_escalation,
+    product_reboot,
+    reboot_proof_error,
 )
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     CaseRunner,
@@ -666,8 +676,12 @@ def quiesce_recovery_report(
 
 def node_restored_errors(
     regional: RegionalLiveFixture, node: str, case_dir: Path
-) -> list[str]:
-    """The node after the reset: Ready, schedulable and no longer owned."""
+) -> tuple[list[str], dict[str, Any]]:
+    """The node after the reset: Ready, schedulable and no longer owned.
+
+    The snapshot is returned too: its ``boot_id`` against the preflight one is
+    how the runner learns that the node rebooted before it asks the probe Pod.
+    """
 
     node_after = regional.node_snapshot(node)
     write_json_atomic(case_dir / "node-after.json", node_after)
@@ -676,7 +690,7 @@ def node_restored_errors(
         errors.append("target node is not Ready after reset")
     if node_after["unschedulable"] or node_after["ownership_annotations"]:
         errors.append("target node scheduling ownership was not restored")
-    return errors
+    return errors, node_after
 
 
 def provider_evidence(
@@ -698,6 +712,94 @@ def provider_evidence(
     return provider, provisional
 
 
+def host_probe(settings: Settings, case_dir: Path, run_id: str) -> HostProbeFixture:
+    """This run's owned host probe on the target node."""
+
+    return HostProbeFixture(
+        HostProbeSettings(
+            state_directory=case_dir / "host-probes",
+            kubeconfig=settings.regional.gpu_kubeconfig,
+            context=settings.regional.gpu_context,
+            namespace=settings.regional.namespace,
+            node=settings.node,
+            image=settings.host_probe_image,
+            case_id=CASE_ID,
+            run_id=run_id,
+            probe_script=PROBE_SCRIPT,
+        )
+    )
+
+
+def post_reset_host(
+    host: HostProbeFixture,
+    case_dir: Path,
+    result: dict[str, Any],
+    after: dict[str, Any],
+    *,
+    arguments: tuple[str, ...],
+    stop_sampler: Callable[[], object],
+    reboot: str | None,
+    recheck: Callable[[], str | None],
+) -> str | None:
+    """Fill ``after`` with the post-reset host snapshot, then stop the sampler.
+
+    Returns ``None`` when both happened through the probe. A product reboot --
+    ``reboot``, judged from the node snapshot already taken -- ended the owned
+    probe Pod and the sampler's transient unit with the old boot, so neither is
+    asked of the dead Pod: the result records ``host_after_skipped`` and
+    ``sampler_stopped_by_reboot`` and the reason is returned. A probe transport
+    failure is judged once more against a fresh node read (``recheck``): after
+    a reboot it is the secondary ``host_after_error``, else it propagates.
+    """
+
+    if reboot is None:
+        try:
+            after.update(host.execute("snapshot", *arguments, timeout=180))
+            write_json_atomic(case_dir / "host-after.json", after)
+            # The sampler's job ends with the post-reset snapshot that reads its
+            # series; stopping it here rather than in `finally` keeps it from
+            # running through the node/provider/CPU checks that follow.
+            stop_sampler()
+            return None
+        except HostProbeTransportError as exc:
+            reboot = recheck()
+            if reboot is None:
+                raise
+            result["host_after_error"] = f"{type(exc).__name__}: {exc}"
+    result.update(host_after_skipped=reboot, sampler_stopped_by_reboot=True)
+    return reboot
+
+
+def postflight(
+    regional: RegionalLiveFixture,
+    node: str,
+    preflight_node: dict[str, Any],
+    result: dict[str, Any],
+    incident_id: str,
+) -> None:
+    """The final node read: the same node, Ready, and not left isolated.
+
+    ``post_case_isolation`` names whoever still holds the node: a node another
+    incident cordoned and quarantined after this case's workflow ended cannot
+    be reported as back, and the case fails naming that incident and taint.
+    """
+
+    try:
+        final_node = regional.node_snapshot(node)
+        isolation = post_case_isolation(final_node, incident_id)
+        result.update(final_node=final_node, post_case_isolation=isolation)
+        if final_node.get("uid") != preflight_node.get("uid"):
+            result.update(verdict="FAIL", node_identity_changed=True)
+        stranded = isolation_errors(isolation)
+        if stranded:
+            result.setdefault("errors", []).extend(stranded)
+        if final_node["ready"] != "True" or stranded:
+            result["verdict"] = "FAIL"
+    except Exception as exc:
+        result["postflight_error"] = f"{type(exc).__name__}: {exc}"
+        result["verdict"] = "FAIL"
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -716,19 +818,7 @@ def execute_case(
     regional = RegionalLiveFixture(settings.regional)
     run_id = f"destr001-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
     marker = f"destr001-{int(time.time())}-a{attempt}"
-    host = HostProbeFixture(
-        HostProbeSettings(
-            state_directory=case_dir / "host-probes",
-            kubeconfig=settings.regional.gpu_kubeconfig,
-            context=settings.regional.gpu_context,
-            namespace=settings.regional.namespace,
-            node=settings.node,
-            image=settings.host_probe_image,
-            case_id=CASE_ID,
-            run_id=run_id,
-            probe_script=PROBE_SCRIPT,
-        )
-    )
+    host = host_probe(settings, case_dir, run_id)
     result: dict[str, Any] = {
         "case_id": CASE_ID,
         "attempt": attempt,
@@ -808,35 +898,53 @@ def execute_case(
         )
         write_json_atomic(case_dir / "workflow-state.json", state)
         incident_id = str((state.get("incident") or {}).get("incident_id") or "")
-        errors = workflow_errors(state)
-        after = host.execute(
-            "snapshot",
-            "--since-epoch",
-            str(injection_started.timestamp()),
-            "--pci-bdf",
-            target_bdf,
-            "--run-id",
-            run_id,
-            timeout=180,
+        request_id = (state.get("workflow") or {}).get("request_id")
+        escalation = product_escalation(state)
+        # The product's own account comes first and is in the result before
+        # any probe call: a reboot that ended the probe Pod cannot erase it.
+        errors = [*escalation_errors(escalation), *workflow_errors(state)]
+        result.update(
+            errors=errors,
+            product_escalation=escalation,
+            marker=marker,
+            incident_id=incident_id,
+            workflow_request_id=request_id,
         )
-        write_json_atomic(case_dir / "host-after.json", after)
-        # The sampler's job ends with the post-reset snapshot that reads its
-        # series; stopping it here rather than in `finally` keeps it from
-        # running through the node/provider/CPU checks that follow.
-        stop_sampler()
-        errors.extend(
-            host_errors(
-                baseline_host,
-                after,
-                expected_gpu_count=expected_gpu_count,
-                target_bdf=target_bdf,
-                incident_id=incident_id,
-                workflow_request_id=str(
-                    (state.get("workflow") or {}).get("request_id") or ""
-                ),
+        restored, node_after = node_restored_errors(regional, settings.node, case_dir)
+        rebooted = post_reset_host(
+            host,
+            case_dir,
+            result,
+            after,
+            arguments=(
+                "--since-epoch",
+                str(injection_started.timestamp()),
+                "--pci-bdf",
+                target_bdf,
+                "--run-id",
+                run_id,
+            ),
+            stop_sampler=stop_sampler,
+            reboot=product_reboot(escalation, preflight["node"], node_after),
+            recheck=lambda: product_reboot(
+                escalation, preflight["node"], regional.node_snapshot(settings.node)
+            ),
+        )
+        if rebooted:
+            sampler_stopped = True  # the boot ended the sampler's transient unit
+            errors.append(reboot_proof_error(escalation, rebooted))
+        else:
+            errors.extend(
+                host_errors(
+                    baseline_host,
+                    after,
+                    expected_gpu_count=expected_gpu_count,
+                    target_bdf=target_bdf,
+                    incident_id=incident_id,
+                    workflow_request_id=str(request_id or ""),
+                )
             )
-        )
-        errors.extend(node_restored_errors(regional, settings.node, case_dir))
+        errors.extend(restored)
         provider, provider_provisional = provider_evidence(
             regional, case_dir, injection_started
         )
@@ -861,12 +969,6 @@ def execute_case(
         result.update(
             {
                 "verdict": "PASS" if not errors else "FAIL",
-                "errors": errors,
-                "marker": marker,
-                "workflow_request_id": (
-                    (state.get("workflow") or {}).get("request_id")
-                ),
-                "incident_id": incident_id,
                 "provider_events": provider,
                 "provider_events_provisional": provider_provisional,
                 "reset_notification": reset_mail,
@@ -900,16 +1002,7 @@ def execute_case(
         result["probe_residuals"] = residuals
         if any(residuals.values()):
             result["verdict"] = "FAIL"
-        try:
-            final_node = regional.node_snapshot(settings.node)
-            result["final_node"] = final_node
-            if final_node.get("uid") != preflight["node"].get("uid"):
-                result.update(verdict="FAIL", node_identity_changed=True)
-            if final_node["ready"] != "True":
-                result["verdict"] = "FAIL"
-        except Exception as exc:
-            result["postflight_error"] = f"{type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
+        postflight(regional, settings.node, preflight["node"], result, incident_id)
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
