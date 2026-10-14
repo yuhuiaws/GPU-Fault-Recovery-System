@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -35,6 +36,94 @@ def test_repository_deploy_tree_is_production_only() -> None:
     result = run_check(ROOT / "deploy")
 
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+CACHE_PREFIX_PROBE = (
+    "print-cache-prefix:\n\t@printf '%s\\n' \"$$PYTHONPYCACHEPREFIX\"\n"
+)
+# What a parent make or pytest leaves in the environment of this test.
+INHERITED_RUN_STATE = {"MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "MAKELEVEL"}
+
+
+def _make_cache_prefix(environment: dict[str, str]) -> str:
+    """``PYTHONPYCACHEPREFIX`` as a recipe of the repository Makefile receives
+    it -- ``test-parallel-release`` included: the Makefile exports it globally."""
+
+    completed = subprocess.run(
+        [
+            "make",
+            "--no-print-directory",
+            "-s",
+            "-f",
+            "Makefile",
+            "-f",
+            "-",
+            "print-cache-prefix",
+        ],
+        cwd=ROOT,
+        env=environment,
+        input=CACHE_PREFIX_PROBE,
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=120,
+    )
+    return completed.stdout.strip().splitlines()[-1]
+
+
+def test_a_direct_make_run_keeps_interpreter_caches_out_of_deploy(
+    tmp_path: Path,
+) -> None:
+    """A bare ``pytest`` collection writes deploy/control-plane/tools/
+    __pycache__ (the acceptance runners import the cleanup tools), which the
+    layout check above rejects; a direct ``make test-parallel-release`` does
+    not, because make hands every recipe a prefix outside the checkout."""
+
+    base = {
+        name: value
+        for name, value in os.environ.items()
+        if name != "PYTHONPYCACHEPREFIX"
+        and name not in INHERITED_RUN_STATE
+        and not name.startswith("PYTEST_")
+    }
+    assert _make_cache_prefix(base) == "/tmp/gpu-fault-pycache"
+    assert _make_cache_prefix({**base, "PYTHONPYCACHEPREFIX": ""}) == (
+        "/tmp/gpu-fault-pycache"
+    ), "an inherited empty prefix is no prefix to CPython"
+    prefix = tmp_path / "pycache"
+    assert _make_cache_prefix({**base, "PYTHONPYCACHEPREFIX": str(prefix)}) == str(
+        prefix
+    ), "a caller's own prefix (the release gate's) is kept"
+
+    deploy = ROOT / "deploy"
+    before = sorted(deploy.rglob("*.pyc"))
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-o",
+            "addopts=",
+            "-p",
+            "no:cacheprovider",
+            "--collect-only",
+            "-q",
+            "tests/regional/test_complete_acceptance_entries.py",
+        ],
+        cwd=ROOT,
+        env={**base, "PYTHONPYCACHEPREFIX": str(prefix)},
+        text=True,
+        capture_output=True,
+        check=True,
+        timeout=300,
+    )
+    assert sorted(deploy.rglob("*.pyc")) == before, (
+        "a collection under the make prefix writes no bytecode into deploy/"
+    )
+    mirrored = prefix / deploy.relative_to(deploy.anchor)
+    assert any(mirrored.rglob("*.pyc")), (
+        "the collection imported deploy modules, so the prefix took their bytecode"
+    )
 
 
 def test_layout_gate_rejects_test_manifest(tmp_path: Path) -> None:

@@ -5,6 +5,11 @@ PYTHON ?= $(firstword $(wildcard .venv/bin/python) python3)
 # Quality gates import Python modules from deploy/. Keep interpreter caches out
 # of the checkout so a prior gate cannot poison the later deploy layout check.
 PYTHONPYCACHEPREFIX ?= /tmp/gpu-fault-pycache
+# `?=` keeps an inherited empty value, and CPython reads an empty prefix as
+# none: the caches would land beside the deploy/ sources again.
+ifeq ($(strip $(PYTHONPYCACHEPREFIX)),)
+override PYTHONPYCACHEPREFIX := /tmp/gpu-fault-pycache
+endif
 export PYTHONPYCACHEPREFIX
 # Default to a quarter of the cores, bounded to 4..16: the release gate runs
 # this suite next to the artifact build and (in release mode) the static gates.
