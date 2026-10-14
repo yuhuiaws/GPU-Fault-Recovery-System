@@ -4080,12 +4080,20 @@ evaluated before dispatch and cannot recall a command already written to the Sto
 read across clusters. `regional_capture_evidence` and `regional_save_advisory_notification` let
 the cluster-side executor write evidence and notifications back to the control plane: the cluster side has no database (see §2.17).
 `node-action-keys` feeds the executor's node-key sync (`cluster_executor/node_key_sync.py`): body
-`{cluster_id, node_ids}` (at most 64, validated like every node id), `cluster_id` enters the cluster
-binding check, and the control plane derives the version-2 key from the fleet master only for nodes
-this cluster's own data-plane evidence has already reported (an Agent record, a GPU inventory
+`{cluster_id, node_ids, nodes?}` (at most 64, validated like every node id), `cluster_id` enters the
+cluster binding check, and the control plane derives the version-2 key from the fleet master for
+nodes this cluster's own data-plane evidence has already reported (an Agent record, a GPU inventory
 snapshot or metric, a HyperPod node identity's current name or alias; a rotated value in the CPU
-mirror wins). Any unknown node fails the whole request with 404; an unavailable fleet master is
-503. The fleet master never leaves the control plane and key values are never logged.
+mirror wins). An `eks-managed` node without evidence is admitted only by the EC2 identity in
+`nodes[]` (`EksNodeAttestation` in `gpu_fault/node_key_attestation.py`, built on the executor by
+`gpu_fault/eks_node_evidence.py` from `DescribeInstances`/`DescribeNodegroup`): a statement that does
+not bind to the registration is 403, a name another live cluster reports or that conflicts with the
+CPU mirror's key is 409, and a node with neither evidence nor statement fails the whole request with
+404; an unavailable fleet master is 503. Any refusal issues no key of the request. The executor sends
+the request without `nodes` first (a control plane predating the field answers as before) and only
+on 404 retries node by node (with the statement where the attester states one, plainly otherwise, so
+a node known by other evidence is still keyed); one refused node does not hold back the others.
+The fleet master never leaves the control plane and key values are never logged.
 
 ### 4.5 Authorization Model: Explicit Buckets + Default Deny
 

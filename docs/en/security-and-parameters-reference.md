@@ -610,10 +610,30 @@ That evidence covers only the trusted provisioning path and does not endorse uno
 Replacement nodes obtain their key through `POST /v1/regional/node-action-keys` (cluster-token
 bucket; the payload's `cluster_id` is subject to cluster binding, at most 64 node ids). Threat
 boundary: an executor holding one cluster's cluster token can only obtain v2 keys for **nodes the
-control plane has already seen in that cluster's own data-plane evidence**, and keys are derived
-scoped by cluster_id, so it cannot fetch keys for another cluster or for invented node names; the
-fleet master never leaves the CPU, values never enter logs or audit, only the cluster and node names
-enter the audit row. On the data-plane side the executor's Kubernetes permission is the namespaced
+control plane can place in that cluster**, and keys are derived scoped by cluster_id, so it cannot
+fetch keys for another cluster; the fleet master never leaves the CPU, values never enter logs or
+audit, only the cluster, the node names and the attested instance identity enter the audit rows.
+The control plane first looks at that cluster's own data-plane evidence (an Agent record, a GPU
+inventory snapshot or metric, a HyperPod node identity the control plane lists from SageMaker
+itself). A plain EKS (`eks-managed`) node that was never installed has none, so the executor attaches
+its EC2 identity to the request (`nodes[]`: the Node name and UID, the instance id in
+`spec.providerID`, and what `DescribeInstances` answered: state, private DNS name and address, the
+`eks:cluster-name`/`eks:nodegroup-name` tags). The executor reads it only with the grants it already
+holds for the reboot path (`ec2:DescribeInstances`, `eks:DescribeNodegroup`), and states it only for
+a node whose instance runs, is tagged for this EKS cluster, carries the Node's own private DNS name
+and address, and was launched by a managed node group that declares
+`gpu-fault.io/control-plane=<site id>` in its own labels (a kubelet can label its own Node, not its
+node group); a cluster whose node selector predates the ownership label convention states nothing.
+The control plane keys an attested node only when the statement binds to the cluster's
+registration -- `eks-managed`, the tag equals the registered EKS cluster, state `running`, the Node
+named after the private DNS name, the address (and the address an `ip-a-b-c-d` name encodes) a
+private address inside the registered node subnets `agentEndpointAllowedCidrs` -- otherwise 403;
+and only when the name is nobody else's: another live registration reporting the name, or a key for
+it in the CPU mirror that is not this cluster's derived key, is 409 (`CPU NodeName key conflict;
+exclusive cluster ownership requires reconciliation`, the deploy helper's own rule). A HyperPod
+cluster never admits a statement. The statement trusts the executor no further than before: the same
+cluster token already posts node telemetry, which is evidence too. On the data-plane side the
+executor's Kubernetes permission is unchanged, still the namespaced
 Role `gpu-fault-cluster-executor-node-keys`: `secrets` `get`/`patch` with `resourceNames`
 containing only `gpu-fault-node-action-keys`; no list/watch/create/delete, the sync only appends
 missing keys and uses a `resourceVersion` precondition so it cannot overwrite a concurrent write.

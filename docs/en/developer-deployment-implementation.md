@@ -1000,6 +1000,28 @@ Node UID set, the CPU mirror value and the GPU identity, then removes the marker
 Each CAS phase gets at most 3 attempts, 20 seconds per command, 15 seconds per Kubernetes request and a 300-second total helper window, still subject to the parent
 deadline. The fresh NodeName-to-UID binding passed in by join and the CPU compensation digest guard are described in §8.1.
 
+The helper runs only in `deploy`/`join-cluster`, so a node replaced afterwards (spot reclaim, hardware failure, on either
+provider) has no key: the installer Job's `node-secret` volume references a missing Secret key and the node never gets an
+Agent. The reconciler deliberately holds no `secrets` grant; the cluster executor fills the gap
+(`src/gpu_fault/cluster_executor/node_key_sync.py`, `NodeActionKeySync`): every `GPU_FAULT_NODE_KEY_SYNC_SECONDS`
+(default 60, 0 disables) it lists the nodes of the helper's node selector (`GPU_FAULT_NODE_SELECTOR`; on HyperPod by
+default `sagemaker.amazonaws.com/cluster-name=<GPU_FAULT_HYPERPOD_CLUSTER>`), checks them the helper's way (valid Node
+names, one UID each, no repeats, all matching the selector, or nothing is requested that pass), reads only the key names of
+the GPU Secret `gpu-fault-node-action-keys`, calls `POST /v1/regional/node-action-keys` for the missing nodes (cluster
+token; the control plane derives v2 keys from the fleet master only for nodes it can place in the cluster) and appends the
+granted keys in one merge patch fenced by `resourceVersion`: an existing (including randomly rotated) value is never
+overwritten, nothing is deleted, the Secret is never created, and a malformed answer or a request without a verdict writes
+nothing. A never-installed `eks-managed` node has no evidence on the control plane (404), so the executor retries node by
+node with the EC2 identity `src/gpu_fault/eks_node_evidence.py` read for it -- instance running, tagged for this EKS
+cluster, its private DNS name and address the Node's own, launched by a managed node group that declares the ownership
+label -- using the `ec2:DescribeInstances`/`eks:DescribeNodegroup` grants the reboot path already holds; the control plane
+checks the registered EKS cluster, the node subnets and name conflicts (`src/gpu_fault/node_key_attestation.py`), and one
+refused node does not hold back the others. The fleet master stays on the CPU; the executor gains no decryption power, it
+mounts the Secret for signing anyway, and its node-action adapter re-reads the mounted directory on a miss, rate-limited
+(`PropagatingNodeSecrets`), so a newly added key signs without an executor restart. The RBAC is the namespaced
+Role/RoleBinding `gpu-fault-cluster-executor-node-keys` in `deploy/dataplane/cluster-action-executor.yaml` (`secrets`
+`get`/`patch`, `resourceNames` limited to that Secret), unchanged by the statement path.
+
 ### 6.2 Node Key Custody
 
 custody is forward-looking forensics over the trusted delivery path above, not a second key synchronizer. The administrator procedure is in

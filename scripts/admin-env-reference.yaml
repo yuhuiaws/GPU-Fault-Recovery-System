@@ -273,7 +273,7 @@ categories:
       - name: GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_WAIT_SECONDS
         description: "claim 长轮询：控制面对空结果最多挂起的秒数（0–30，服务端上限 25）；0 关闭并退回纯轮询。"
       - name: GPU_FAULT_NODE_KEY_SYNC_SECONDS
-        description: "Executor 节点 key 补齐周期（默认 60）：比对本 HyperPod 集群标签下的节点与 GPU Secret `gpu-fault-node-action-keys` 的键名，只为缺失节点向控制面取 v2 key 并追加；0 关闭后替换节点要等下次 deploy 才有 Agent。"
+        description: "Executor 节点 key 补齐周期（默认 60）：比对本集群节点选择器下的节点与 GPU Secret `gpu-fault-node-action-keys` 的键名，只为缺失节点向控制面取 v2 key 并追加（`eks-managed` 节点附 EC2 身份声明，需 `GPU_FAULT_EKS_CLUSTER_NAME` 与归属标签选择器）；0 关闭后替换节点要等下次 deploy 才有 Agent。"
 
   - title: Collector、DCGM 与 inventory
     description: >-

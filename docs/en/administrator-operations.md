@@ -1545,8 +1545,10 @@ hostNetwork (ours binds only `127.0.0.1:9400` and dials the host nv-hostengine).
 **The join window of a replacement node (both providers; live 2026-10-07, managed node group roll).** After the old
 node is terminated: `workflow-reconcile --retire-departed-agents` retires the old Agent record; the
 `gpu-fault-node-installer-reconciler` then creates an installer Job per new node (live: about 20 minutes after node
-creation, completing within minutes); at the end of the install the Agent registers and the new node's key appears in
-`gpu-fault-node-action-keys`. Meanwhile:
+creation, completing within minutes); within about one sync period (`GPU_FAULT_NODE_KEY_SYNC_SECONDS`, default 60 s)
+of the new node entering the cluster's node selector the cluster executor adds its key to `gpu-fault-node-action-keys`
+(§6), the waiting installer Pod then mounts it -- a `FailedMount ... references non-existent secret key` event seen
+before that is transient -- and the Agent registers at the end of the install, no deploy needed. Meanwhile:
 - the preflight of `gpu-fault-admin deploy` / `status --full` is **transiently** red (`installer is not Succeeded`,
   `has no registered Node Agents`) -- a fail-closed true reading; rerun once the installer Job is Complete, never touch
   the Store for it;
@@ -2121,6 +2123,38 @@ Secret privately and compares the actual byte digests, not treating a complete k
 the CPU mirror and the marker's removal. Read failures, same-named rebuilds or unknown key conflicts must stop; do not hand-delete
 the marker, overwrite the whole CPU Secret or re-derive existing random keys to clear the error; the original Secret must not be output as evidence.
 
+A node replaced between two deploys (spot reclaim and the like, on either provider) gets its key from the cluster executor
+of its GPU cluster: every 60 s by default (`GPU_FAULT_NODE_KEY_SYNC_SECONDS`) it compares the nodes the cluster's node
+selector selects (`GPU_FAULT_NODE_SELECTOR`; the cluster-name label by default on HyperPod) with the key names of the GPU
+Secret `gpu-fault-node-action-keys`, asks the control plane for v2 keys for the missing nodes only and appends them; the
+waiting installer Pod then mounts its key and installs the Agent, about 1-2 minutes in all, no `deploy` needed. A HyperPod
+node is placed by the node identity the control plane lists from SageMaker itself; a never-installed `eks-managed` node by
+the EC2 identity the executor attaches (instance running, tagged for this EKS cluster, its private DNS name and address
+the Node's own, launched by a managed node group that declares `gpu-fault.io/control-plane=<site id>`), which the control
+plane checks against the registered EKS cluster, the node subnets and name conflicts (security and parameters reference
+§5). Check key names only, never values: `kubectl --context "${GPU_CONTEXT}" -n gpu-fault-system get secret
+gpu-fault-node-action-keys -o jsonpath='{.data}' | jq 'keys'` must contain the new node name; the executor log shows
+`added N node action key(s) to Secret ...` (node names only); the control plane logs `issued node action keys:
+cluster=... nodes=...`, and for a node admitted by its statement also `admitted node <node> of cluster <cluster> by its EC2
+identity: uid=... instance=... nodegroup=... address=...`. If the executor keeps logging `node action key sync failed`:
+404 means the control plane has no data-plane evidence of the node and no usable statement either -- on HyperPod check the
+control plane's HyperPod identity refresh; on `eks-managed` check the executor's start-up WARNING `replacement nodes of this
+eks-managed cluster get no Node Action key until the next deploy` (`GPU_FAULT_EKS_CLUSTER_NAME` unset, or a node selector
+that predates the ownership label and needs `gpu-fault-admin node-scope --converge`) and `no node action key for N node(s):
+<node>: <reason>` (why the executor states nothing for the node, e.g. its node group declares no ownership label, or EC2
+does not know the instance); 403 means the statement does not bind to the registration (an instance of another EKS cluster,
+an address outside the registered subnets, ...) or the executor's cluster token does not match the cluster_id it claims;
+409 is a name conflict (another cluster reports a node of that name -- the control plane's log line `node name <node> of
+cluster <cluster> is already known to cluster <other>` says which, the answer does not -- or the CPU mirror's key for it is
+not this cluster's),
+the same origin as deploy's `CPU NodeName key conflict`: an administrator settles who owns the name first, the sync never
+overwrites; 503 means the control plane's fleet master is unavailable. The sync only appends, never deletes or overwrites;
+removing a retired node's key is still the next `deploy`'s job. On a miss the executor re-reads the refreshed mounted
+files, rate-limited, so a newly added key signs node actions without an executor restart. An installer Job that had
+already failed before the key arrived (the node joined while the control plane still refused it) is retried on the
+Reconciler's backoff, at most an hour later; to skip the wait delete that failed Job (`kubectl --context "${GPU_CONTEXT}"
+-n gpu-fault-system delete job <gpu-fault-install-...>`) and the next pass (5 s) recreates it.
+
 ### 6.1 Cluster Token Rotation with an Overlap Window
 
 Each GPU cluster in the registry may declare both the current token and one **retiring** token at the same time:
@@ -2331,6 +2365,7 @@ local hermetic tests are not LIVE installation, KMS IAM or complete AUTH case ac
 | command LEASED for a long time | Executor Pod, lease renewal, result reporting | REG-14.3 |
 | step FAILED with an unclear reason | `status_source` and the executor traceback | REG-14.4 |
 | All Agents non-ACTIVE | node token, systemd, artifact/config/profile pins | REG-14.5 |
+| A replacement node has no Agent for long, its installer Job keeps showing `FailedMount ... references non-existent secret key` | Whether the GPU Secret `gpu-fault-node-action-keys` has the node's key name; executor log `node action key sync` (404/403/409 explained in §6) and the start-up WARNING `get no Node Action key until the next deploy`; whether `GPU_FAULT_NODE_KEY_SYNC_SECONDS` is 0 | §6 |
 | operator API returns 403 | Whether the execution token and cluster token are mixed up | REG-14.6 |
 | HyperPod outcome unknown | CloudTrail, actual node state, idempotent submission record | REG-14.7 |
 | Profile content drift within the same version | Release a new profile version; do not overwrite the original version | REG-8.1.3 |

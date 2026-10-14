@@ -170,6 +170,7 @@ The required/compatible pins are the core of rolling upgrades. A candidate versi
 | `GPU_FAULT_CLUSTER_EXECUTOR_LEASE_SECONDS` | — | `'120'` | Lease duration for an Executor claiming a remote command. |
 | `GPU_FAULT_CLUSTER_EXECUTOR_POLL_SECONDS` | — | `'2'` | Idle interval when a command returns to WAITING, also the starting point of the backoff when the control plane is unreachable; with long polling on, empty answers no longer sleep by it. |
 | `GPU_FAULT_CLUSTER_EXECUTOR_CLAIM_WAIT_SECONDS` | — | `'20'` | claim long poll: the maximum seconds the control plane holds an empty result (0–30, server cap 25); 0 disables and falls back to pure polling. |
+| `GPU_FAULT_NODE_KEY_SYNC_SECONDS` | — | `'60'` | Executor node-key sync period (default 60): compares the nodes of the cluster's node selector with the key names of the GPU Secret `gpu-fault-node-action-keys` and fetches v2 keys from the control plane for the missing nodes only (an `eks-managed` node with an EC2 identity statement, which needs `GPU_FAULT_EKS_CLUSTER_NAME` and an ownership-label selector); with 0 a replacement node gets no Agent until the next deploy. |
 
 ## 8. Collector, DCGM and Inventory
 
