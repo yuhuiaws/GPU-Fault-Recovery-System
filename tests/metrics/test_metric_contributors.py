@@ -19,6 +19,7 @@ from gpu_fault.app.metrics import collector_silence_lines
 from gpu_fault.app.metrics_sections import render_capacity_metrics
 from gpu_fault.models import (
     AdvisoryNotification,
+    BlockedKind,
     IncidentState,
     NotificationResult,
     NotificationStatus,
@@ -399,6 +400,49 @@ def test_budget_occupancy_gauges_count_a_holder_whose_lease_lapsed() -> None:
             "gpu_fault_remediation_budget_cluster_active_claims"
             f'{{cluster_id="{cluster_id}"}} 1'
         ) in lines, cluster_id
+
+
+def test_budget_occupancy_gauges_count_a_parked_record_whose_reboot_may_run() -> None:
+    """A BLOCKED / NEEDS_OPERATOR record whose reboot outcome is unknown keeps
+    its slot on the gauges as in admission; once confirmed it does not."""
+
+    store = build_store()
+    parked = workflow_request(
+        "workflow-parked",
+        "incident-parked",
+        WorkflowStatus.BLOCKED,
+        blocked_kind=BlockedKind.NEEDS_OPERATOR,
+        official_steps=[workflow_step(WorkflowOperation.RESTART_NODE)],
+        step_executions=[
+            workflow_step_execution(
+                0,
+                WorkflowOperation.RESTART_NODE,
+                WorkflowStepStatus.FAILED,
+                details={"outcome_unknown": True, "manual_confirmation_required": True},
+            )
+        ],
+        remediation_budget_claims=["cluster:cluster-a", "region"],
+    )
+    settled = parked.model_copy(
+        update={
+            "request_id": "workflow-settled",
+            "incident_id": "incident-settled",
+            "blocked_kind": BlockedKind.SAFETY_SETTLED,
+            "remediation_budget_claims": ["cluster:cluster-b", "region"],
+        }
+    )
+    for workflow in (parked, settled):
+        store.save_workflow(workflow)
+
+    lines = closed_loop_metric_lines(
+        SimpleNamespace(context=ApplicationContext(store=store))
+    )
+
+    assert 'gpu_fault_remediation_budget_active_claims{scope_type="region"} 1' in lines
+    assert (
+        'gpu_fault_remediation_budget_cluster_active_claims{cluster_id="cluster-a"} 1'
+    ) in lines
+    assert not [line for line in lines if 'cluster_id="cluster-b"' in line], lines
 
 
 def test_closed_loop_metrics_use_aggregate_notification_counts(monkeypatch) -> None:

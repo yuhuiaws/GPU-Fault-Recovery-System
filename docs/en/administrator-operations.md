@@ -3055,11 +3055,14 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   its execution deadline. A holder keeps its slot through long waits -- the node coming back after a reboot, a replacement,
   validation, a workload restart -- up to its execution deadline (detailed design v2 §9.5: 30 minutes from the first claim for
   a node workflow by default, at most the 1-hour lifetime for a job workflow); a `CHECK_MECHANICALS` waiting for an
-  operator's acknowledgement holds no slot. A rising `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}`
-  is the starvation guard passing over the waiters of a full scope -- throttling, not a stall; a holder still `RUNNING` past
-  its execution deadline is handled as `GpuFaultWorkflowDeadlineNotEnforced`.
+  operator's acknowledgement holds no slot. A `BLOCKED` / `NEEDS_OPERATOR` record parked with
+  `NODE_ACTION_OUTCOME_UNRESOLVED` also holds its claims, because its reset or reboot may still be running: answer it with
+  `submit-remediation --disposition confirm-node-action` (or end it with `workflow-reconcile`) and its slot frees. A rising
+  `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}` is the starvation guard passing over the waiters
+  of a full scope -- throttling, not a stall; a holder still `RUNNING` past its execution deadline is handled as
+  `GpuFaultWorkflowDeadlineNotEnforced`.
 - **Boundary**: do not raise the budget directly to clear the alert; first confirm there is no "claim holder no longer
-  progressing but still `RUNNING`" situation. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md).
+  progressing but still `RUNNING`" or "parked record waiting for its confirmation" situation. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md).
 
 ### GpuFaultRemediationBudgetClusterSaturated
 
@@ -3075,7 +3078,8 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   region/node/domain scope; estimate the drain time with the mean of `gpu_fault_workflow_duration_seconds`;
   `gpu_fault_workflow_pending_age_seconds_max` finds the oldest waiting workflow; read its
   `remediation_budget_last_blocked_reason` / `remediation_budget_last_blocked_scope`.
-  If a claim-holding workflow no longer progresses, handle as `GpuFaultRemediationBudgetStarved` instead.
+  If a claim-holding workflow no longer progresses, or a parked `NEEDS_OPERATOR` record with an unresolved node action holds
+  a slot, handle as `GpuFaultRemediationBudgetStarved` instead.
   A rising `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}` while other clusters' workflows still
   start shows the starvation guard keeping the storm queued in this cluster alone; when the oldest waiter of the same storm
   passes 30 minutes, `GpuFaultWorkflowPendingAge` fires as well and is handled here.

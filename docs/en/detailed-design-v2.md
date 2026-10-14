@@ -3931,15 +3931,31 @@ workflow's budgeted steps (node/workload changes) begin, every claim asks for th
 resource class scopes of its budgeted steps still to run; if any scope is full, the workflow stays retryable (with the refusing
 scope recorded) and does not call the adapter.
 
-Once admitted, the claim is held until the workflow is terminal (`SUCCEEDED`, `FAILED`, `SUPERSEDED` or `BLOCKED`): WAITING
-steps, long commands, the re-dispatch of every tick, lease renewal and an executor hand-over release nothing. Occupancy counts
+Once admitted, the claim is held until the workflow is terminal (`SUCCEEDED`, `FAILED`, `SUPERSEDED`, or a `BLOCKED` with
+nothing left in flight, below): WAITING steps, long commands, the re-dispatch of every tick, lease renewal and an executor hand-over release nothing. Occupancy counts
 `RUNNING` status, not the lease: a lease is execution ownership, and a dispatcher hand-over, a row past the batch cut or an
 internal-error release lets it lapse while the reset or reboot on the node goes on; the deadline watchdog bounds how long a row
 stays `RUNNING`. Once the workflow's own budgeted work has begun (completed, attempted, or a parked compensation), every later
 claim is a hold: it keeps the scopes held, adds its own plan's scopes and is never refused, so a reset, a reboot and the
 `RESTORE_GPU_SERVICES` compensation in flight are never blocked by the budget, and a record whose claims an older release dropped
-counts again. `BLOCKED` holds no budget: it no longer acts, the node it occupies stays fenced by the predecessor and node-busy
-gates, and an operator resume goes through a claim again.
+counts again.
+
+`BLOCKED` releases the claim unless the node may still be mid-action; the rule is the same for admission, the dispatcher's
+occupancy read and the `/metrics` gauges:
+
+- `NEEDS_OPERATOR` with an unresolved node action -- the shape `terminal_state` parks when a reset or reboot ended without a
+  verdict (`NODE_ACTION_OUTCOME_UNRESOLVED`): the claim keeps counting, because the action may still be running, until
+  `gpu-fault-admin submit-remediation --disposition confirm-node-action` answers it, a `workflow-reconcile` ends the record (its
+  claims cleared), or the receipt-settled sweep re-opens it once the receipts prove the outcome, after which it claims again as a
+  hold for the compensation it owes. A `NEEDS_OPERATOR` record whose action is answered holds its node only as paperwork and no
+  budget; one blocked at compile time never claimed any.
+- `INTERNAL_ERROR`: the dispatcher proved the record cannot be executed and nothing drives it; the terminal funnel already parks
+  any unresolved node action as `NEEDS_OPERATOR`, so it holds nothing (the shared rule would still keep one with an unresolved
+  action, a shape only an older writer leaves).
+- `SAFETY_SETTLED`: the safety plan ran to its end, nothing is in flight -- released. A legacy `BLOCKED` without a kind no longer
+  occupies its node -- released.
+
+The node of a record that holds no budget stays fenced by the predecessor and node-busy gates while its kind occupies it.
 
 Preemption handoff: when a predecessor gives way to a stronger successor at a step boundary and becomes `SUPERSEDED`, its claim
 is reserved for that successor until the successor claims or ends -- no other workflow takes the slot, the successor is not refused

@@ -16,6 +16,7 @@ from typing import Any, Iterable, Sequence
 from gpu_fault.execution import WorkflowStepOutcome
 from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.dispatcher import WorkflowDispatcher
+from gpu_fault.execution.node_action_confirmation import confirmed_execution
 from gpu_fault.execution.remediation_budget import RemediationBudgetPolicy
 from gpu_fault.models import (
     IncidentState,
@@ -87,6 +88,56 @@ class ScriptedAdapter:
         """Workflows that reached an adapter at all."""
 
         return {key.split("/", 1)[0] for key in self.calls}
+
+
+# What an executor that never saw a reboot's verdict records on the step.
+UNKNOWN_OUTCOME = {"outcome_unknown": True, "manual_confirmation_required": True}
+
+
+class UnknownOutcomeAdapter(ScriptedAdapter):
+    """Like ``ScriptedAdapter``, but the reboot of every workflow in ``unknown``
+    ends without a verdict, so ``terminal_state`` parks that record BLOCKED /
+    NEEDS_OPERATOR with its node action unresolved."""
+
+    def __init__(self, operations: Iterable[WorkflowOperation], unknown: set[str]):
+        super().__init__(operations)
+        self.unknown = unknown
+
+    def execute(self, context: Any) -> WorkflowStepOutcome:
+        if (
+            context.step.operation is WorkflowOperation.RESTART_NODE
+            and context.workflow.request_id in self.unknown
+        ):
+            self.calls.append(context.idempotency_key)
+            return WorkflowStepOutcome.failed(
+                "reboot outcome unknown", details=dict(UNKNOWN_OUTCOME)
+            )
+        return super().execute(context)
+
+
+def operator_confirmed(
+    workflow: WorkflowRequest, *, now: datetime, node_id: str
+) -> WorkflowRequest:
+    """``workflow`` as ``confirm-node-action`` leaves it: its reboot's
+    uncertainty answered on the step, the record itself still BLOCKED."""
+
+    confirmation = {
+        "actor": "operator-1",
+        "reference": "CHG-1",
+        "confirmed_at": now.isoformat(),
+        "node_id": node_id,
+        "operation": WorkflowOperation.RESTART_NODE.value,
+    }
+    return workflow.model_copy(
+        update={
+            "step_executions": [
+                confirmed_execution(item, confirmation, now=now)
+                if item.operation is WorkflowOperation.RESTART_NODE
+                else item
+                for item in workflow.step_executions
+            ]
+        }
+    )
 
 
 def seed(

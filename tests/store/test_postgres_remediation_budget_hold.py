@@ -20,18 +20,26 @@ from gpu_fault.execution.remediation_budget import (
     RemediationBudgetPolicy,
     remediation_budget_claims,
 )
-from gpu_fault.models import WorkflowStatus
+from gpu_fault.models import BlockedKind, WorkflowStatus, WorkflowStepStatus
 from gpu_fault.store import PostgresStore
 from gpu_fault.store.shared.errors import RemediationBudgetError
 from gpu_fault.store.shared.remediation_budgets import budget_occupancy
-from tests._builders import copy_model, execute_workflow, workflow_request
+from tests._builders import (
+    copy_model,
+    execute_workflow,
+    workflow_request,
+    workflow_step_execution,
+)
 from tests.execution._budget_hold_support import (
     REBOOT,
     REBOOT_PLAN,
     STOP,
+    UNKNOWN_OUTCOME,
     ScriptedAdapter,
+    UnknownOutcomeAdapter,
     budget_dispatcher,
     budget_executor,
+    operator_confirmed,
     seed,
 )
 from tests.store import test_postgres_state_tables as state_tables
@@ -152,6 +160,37 @@ def test_a_lapsed_lease_still_holds_the_scope(store):
     assert store.remediation_budget_occupancy().get(CLUSTER) == 1
 
 
+def test_a_parked_record_of_unknown_outcome_holds_until_an_operator_confirms(store):
+    """The BLOCKED rows a claim and the occupancy read are decided by the
+    shared rule in every storage mode."""
+
+    parked = seed(store, "a", created_at=NOW)
+    waiter = seed(store, "b", created_at=NOW + timedelta(seconds=1))
+    adapter = UnknownOutcomeAdapter(REBOOT_PLAN, {parked.request_id})
+    executor = budget_executor(store, adapter, ONE_PER_CLUSTER)
+    assert execute_workflow(executor, parked.request_id).status is (
+        WorkflowStatus.BLOCKED
+    )
+    assert store.get_workflow(parked.request_id).blocked_kind is (
+        BlockedKind.NEEDS_OPERATOR
+    )
+
+    assert store.remediation_budget_occupancy().get(CLUSTER) == 1
+    with pytest.raises(RemediationBudgetError) as refused:
+        execute_workflow(executor, waiter.request_id)
+    assert refused.value.scope == CLUSTER
+
+    row = store.get_workflow(parked.request_id)
+    store.save_workflow(
+        operator_confirmed(row, now=NOW, node_id="node-a"), expected=row
+    )
+    assert store.remediation_budget_occupancy().get(CLUSTER, 0) == 0
+    assert execute_workflow(executor, waiter.request_id).status is (
+        WorkflowStatus.RUNNING
+    )
+    assert waiter.request_id in adapter.started(), adapter.calls
+
+
 def test_the_handoff_reservation_keeps_exactly_one_hold(store):
     predecessor = seed(store, "a", created_at=NOW)
     adapter = ScriptedAdapter(REBOOT_PLAN)
@@ -234,6 +273,22 @@ def test_the_handoff_reservation_keeps_exactly_one_hold(store):
     assert CLUSTER in admitted.remediation_budget_claims
 
 
+def _blocked_shape(kind: BlockedKind, details: dict[str, bool]) -> dict[str, object]:
+    """A BLOCKED row of ``kind`` whose reboot failed with ``details``."""
+
+    return {
+        "status": WorkflowStatus.BLOCKED,
+        "blocked_kind": kind,
+        "completed_step_indexes": [0],
+        "step_executions": [
+            workflow_step_execution(0, STOP),
+            workflow_step_execution(
+                1, REBOOT, WorkflowStepStatus.FAILED, details=dict(details)
+            ),
+        ],
+    }
+
+
 def test_occupancy_matches_the_shared_rule_on_every_row_shape(store):
     shapes = {
         "running": {"status": WorkflowStatus.RUNNING},
@@ -243,6 +298,10 @@ def test_occupancy_matches_the_shared_rule_on_every_row_shape(store):
             "execution_lease_expires_at": NOW,
         },
         "blocked": {"status": WorkflowStatus.BLOCKED},
+        "blocked-parked": _blocked_shape(BlockedKind.NEEDS_OPERATOR, UNKNOWN_OUTCOME),
+        "blocked-answered": _blocked_shape(BlockedKind.NEEDS_OPERATOR, {}),
+        "blocked-settled": _blocked_shape(BlockedKind.SAFETY_SETTLED, UNKNOWN_OUTCOME),
+        "blocked-internal": _blocked_shape(BlockedKind.INTERNAL_ERROR, {}),
         "failed": {"status": WorkflowStatus.FAILED},
         "pending-stale": {"status": WorkflowStatus.PENDING},
         "superseded-alone": {"status": WorkflowStatus.SUPERSEDED},
@@ -281,10 +340,11 @@ def test_occupancy_matches_the_shared_rule_on_every_row_shape(store):
 
     assert occupancy == dict(budget_occupancy(store.list_workflows(None, limit=1000)))
     assert occupancy == {
-        CLUSTER: 3,
-        "region": 2,
+        CLUSTER: 4,
+        "region": 3,
         "node:running": 1,
         "node:lapsed": 1,
+        "node:blocked-parked": 1,
         "node:pred": 1,
     }
 

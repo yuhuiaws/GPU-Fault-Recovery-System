@@ -735,7 +735,7 @@ class PostgresWorkflowMixin:
 
     def remediation_budget_occupancy(self) -> dict[str, int]:
         with self._db.cursor() as cursor:
-            return occupancy_counts(cursor)
+            return occupancy_counts(cursor, self._decode)
 
     def renew_workflow_lease(
         self,

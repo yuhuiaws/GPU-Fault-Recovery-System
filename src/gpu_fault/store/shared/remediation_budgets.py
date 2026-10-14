@@ -1,7 +1,8 @@
 """Remediation budget occupancy, admission and hold (the store side of §9.5).
 
-A workflow's claims are held from its admission until it leaves RUNNING for a
-terminal status. Occupancy of a scope therefore counts:
+A workflow's claims are held from its admission until it ends -- or, parked
+BLOCKED, until nothing it started can still be running. Occupancy of a scope
+therefore counts:
 
 * every RUNNING workflow that lists the scope, whatever its lease says: a
   lease is execution ownership, the hold is a remediation in flight. A lease
@@ -12,10 +13,17 @@ terminal status. Occupancy of a scope therefore counts:
   claimed yet: its hold is reserved for that successor, so nobody else takes
   the slot in between and the successor is not refused for it (it is excluded
   from the successor's own count), and the reservation ends with the
-  successor's claim or its end -- exactly one hold through the handoff.
+  successor's claim or its end -- exactly one hold through the handoff;
+* a BLOCKED workflow that still occupies its node (``workflow_is_open``:
+  NEEDS_OPERATOR, INTERNAL_ERROR) with a node action whose outcome is still
+  unresolved: the reset or reboot may still be running, so the slot stays
+  taken until an operator answers it (``confirm-node-action``), a reconcile
+  ends the record, or the receipt-settled sweep re-opens it to claim again.
 
-A BLOCKED workflow holds nothing: it no longer acts; the node it occupies is
-still fenced by the predecessor and node-busy gates.
+Every other BLOCKED record holds nothing: a settled safety plan ran to its
+end, a legacy record without a kind no longer occupies its node, and a parked
+record whose action is answered holds its node only as paperwork -- that node
+stays fenced by the predecessor and node-busy gates.
 """
 
 from __future__ import annotations
@@ -24,7 +32,8 @@ from collections import Counter
 from collections.abc import Iterable
 from datetime import datetime
 
-from gpu_fault.models import WorkflowRequest, WorkflowStatus
+from gpu_fault.execution.node_action_uncertainty import has_unresolved_node_action
+from gpu_fault.models import WorkflowRequest, WorkflowStatus, workflow_is_open
 from gpu_fault.store.shared.errors import RemediationBudgetError
 
 _SUCCESSOR_WAITING = frozenset({WorkflowStatus.PENDING, WorkflowStatus.SAFETY_PENDING})
@@ -45,6 +54,17 @@ def reserved_for(
     )
 
 
+def held_while_blocked(workflow: WorkflowRequest) -> bool:
+    """Whether a BLOCKED record still holds its claims: it occupies its node
+    and a node action of its own may still be running."""
+
+    return (
+        workflow.status is WorkflowStatus.BLOCKED
+        and workflow_is_open(workflow.status, workflow.blocked_kind)
+        and has_unresolved_node_action(workflow)
+    )
+
+
 def budget_holds(
     workflows: Iterable[WorkflowRequest],
 ) -> list[tuple[WorkflowRequest, str | None]]:
@@ -61,7 +81,7 @@ def budget_holds(
     for row in rows:
         if not row.remediation_budget_claims:
             continue
-        if row.status is WorkflowStatus.RUNNING:
+        if row.status is WorkflowStatus.RUNNING or held_while_blocked(row):
             holds.append((row, None))
             continue
         successor = by_id.get(row.preempted_by_workflow_id or "")
