@@ -60,6 +60,9 @@ NODE_INVENTORY_MAX_GAP = timedelta(minutes=5)
 NODE_INVENTORY_ABSENCE_RETENTION = timedelta(hours=24)
 #: How far a report's LIST time may stand from the control plane's clock.
 NODE_INVENTORY_MAX_CLOCK_SKEW = timedelta(minutes=2)
+#: An unknown provider identity is the operator's to accept, and only once
+#: every report has left the node out this long -- or never listed it.
+UNKNOWN_PROVIDER_ABSENCE = timedelta(hours=24)
 #: A Kubernetes Node name (an RFC 1123 subdomain).
 NODE_NAME = re.compile(r"^[a-z0-9](?:[a-z0-9.-]{0,251}[a-z0-9])?$")
 
@@ -339,3 +342,116 @@ def kubernetes_absence(
         was_spare,
         blocker,
     )
+
+
+@dataclass(frozen=True)
+class UnknownProviderExit:
+    """Whether the reports let the operator accept an unknown provider identity.
+
+    ``never_reported``: no report of the unbroken chain the control plane
+    holds ever listed the node (a chain restarted after a gap remembers
+    nothing of before it); ``absent_since`` is then the chain's start, and
+    None for a node whose absence is older than the 24 hours the chain
+    remembers. ``opens_at``: for a node a report listed within those 24
+    hours, when its 24 hours out of every report are complete.
+    """
+
+    blocker: str | None
+    never_reported: bool = False
+    absent_since: datetime | None = None
+    chain_started_at: datetime | None = None
+    received_at: datetime | None = None
+    opens_at: datetime | None = None
+
+    @property
+    def open(self) -> bool:
+        return self.blocker is None
+
+    def as_dict(self) -> dict[str, Any]:
+        def iso(value: datetime | None) -> str | None:
+            return value.isoformat() if value is not None else None
+
+        return {
+            "open": self.open,
+            "blocker": self.blocker,
+            "never_reported": self.never_reported,
+            "absent_since": iso(self.absent_since),
+            "chain_started_at": iso(self.chain_started_at),
+            "received_at": iso(self.received_at),
+            "opens_at": iso(self.opens_at),
+        }
+
+
+def unknown_provider_exit(
+    inventory: KubernetesNodeInventory | None,
+    node_id: str,
+    *,
+    now: datetime,
+    guard: timedelta,
+) -> UnknownProviderExit:
+    """The Kubernetes half of the operator's exit for an unknown provider identity.
+
+    Open when the latest report is fresh, does not list the node, and either
+    no report of the chain ever listed it (the chain itself spanning at least
+    ``guard``) or every report has left it out for ``UNKNOWN_PROVIDER_ABSENCE``.
+    The provider cannot be asked about such a node, so the 24 hours stand in
+    for its answer; the Agent's guard is the caller's.
+    """
+
+    if inventory is None:
+        return UnknownProviderExit(NO_REPORT_BLOCKER)
+    chain_started_at = inventory.chain_started_at
+    received_at = inventory.received_at
+
+    def verdict(
+        blocker: str | None,
+        *,
+        never_reported: bool = False,
+        absent_since: datetime | None = None,
+        opens_at: datetime | None = None,
+    ) -> UnknownProviderExit:
+        return UnknownProviderExit(
+            blocker,
+            never_reported=never_reported,
+            absent_since=absent_since,
+            chain_started_at=chain_started_at,
+            received_at=received_at,
+            opens_at=opens_at,
+        )
+
+    age = now - received_at
+    if age > NODE_INVENTORY_FRESHNESS:
+        return verdict(
+            f"the cluster's latest Kubernetes node report is "
+            f"{age.total_seconds():.0f}s old (limit "
+            f"{NODE_INVENTORY_FRESHNESS.total_seconds():.0f}s)"
+        )
+    if node_id in inventory.node_names:
+        return verdict(PRESENT_BLOCKER)
+    entry = inventory.absent.get(node_id)
+    if entry is not None:
+        opens = entry.since + UNKNOWN_PROVIDER_ABSENCE
+        if now < opens:
+            return verdict(
+                f"the node left the Kubernetes node reports at "
+                f"{entry.since.isoformat()}; an unknown provider identity is "
+                f"accepted 24 hours after that, from {opens.isoformat()}",
+                absent_since=entry.since,
+                opens_at=opens,
+            )
+        return verdict(None, absent_since=entry.since)
+    # Not listed by any report the chain still remembers: either never listed
+    # at all, or listed so long ago (over 24 hours) that its absence was
+    # pruned -- which is what moved the retention window past the chain start.
+    pruned = inventory.retained_since > chain_started_at
+    since = None if pruned else chain_started_at
+    span = received_at - chain_started_at
+    if span < guard:
+        return verdict(
+            f"the cluster's unbroken run of Kubernetes node reports covers "
+            f"{max(0.0, span.total_seconds()):.0f}s of the "
+            f"{guard.total_seconds():.0f}s guard",
+            never_reported=not pruned,
+            absent_since=since,
+        )
+    return verdict(None, never_reported=not pruned, absent_since=since)

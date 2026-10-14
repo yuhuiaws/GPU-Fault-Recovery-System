@@ -7,6 +7,7 @@ from threading import RLock
 
 from gpu_fault.departed_nodes import (
     DepartedNodeCleanupRecord,
+    DepartedNodeIdentityAcceptance,
     DepartedNodeSpareRelease,
     departed_node_cleanup_key,
 )
@@ -23,6 +24,7 @@ class MemoryDepartedNodeMixin:
     _kubernetes_node_inventories: dict[str, KubernetesNodeInventory]
     _departed_node_cleanups: dict[str, DepartedNodeCleanupRecord]
     _departed_node_spare_releases: dict[str, DepartedNodeSpareRelease]
+    _departed_node_identity_acceptances: dict[str, DepartedNodeIdentityAcceptance]
 
     def record_kubernetes_node_inventory(
         self,
@@ -81,5 +83,29 @@ class MemoryDepartedNodeMixin:
     def delete_departed_node_spare_release(self, cluster_id: str, node_id: str) -> None:
         with self._lock:
             self._departed_node_spare_releases.pop(
+                departed_node_cleanup_key(cluster_id, node_id), None
+            )
+
+    def save_departed_node_identity_acceptance(
+        self, acceptance: DepartedNodeIdentityAcceptance
+    ) -> None:
+        with self._lock:
+            self._departed_node_identity_acceptances[acceptance.key] = acceptance
+
+    def list_departed_node_identity_acceptances(
+        self, cluster_id: str | None = None
+    ) -> list[DepartedNodeIdentityAcceptance]:
+        with self._lock:
+            acceptances = list(self._departed_node_identity_acceptances.values())
+        return sorted(
+            (item for item in acceptances if cluster_id in (None, item.cluster_id)),
+            key=lambda item: (item.cluster_id, item.node_id),
+        )
+
+    def delete_departed_node_identity_acceptance(
+        self, cluster_id: str, node_id: str
+    ) -> None:
+        with self._lock:
+            self._departed_node_identity_acceptances.pop(
                 departed_node_cleanup_key(cluster_id, node_id), None
             )

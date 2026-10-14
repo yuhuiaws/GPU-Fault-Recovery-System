@@ -36,7 +36,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Archive and delete expired incidents/workflows | **Enabled** by default (30 days, bucket created automatically by deploy); disabled only when `site.yaml` explicitly declares `spec.retention.controlRecordRetentionDays: 0` | §10 |
 | The residue a node leaves after a spot reclaim, a scale-in or a provider replacement (Agent record still ACTIVE, workflows that never changed the node, ESCALATED incidents) | No command: the control plane's departed-node cleanup ends it once the node is proven gone (switch `spec.workflow.departedNodeCleanup`, on by default); the `departed nodes:` lines of `gpu-fault-admin status` list the nodes cleaned, pending and left to the operator, with the exact commands | [§10.1.1](#1011-what-a-departed-gpu-node-leaves-behind-spot-reclaim-scale-in-provider-replacement) |
 | Converge historical workflows that recovered but stay BLOCKED, never-dispatched PENDING workflows whose node left with a spot replacement (the manual fallback when the departed-node cleanup is off or refuses), and parked records whose node action the operator confirmed | `gpu-fault-admin workflow-reconcile --state-dir ... --dry-run` to see the plan, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
-| Retire the fleet Agent record, still ACTIVE, of a node a spot reclaim removed (the release verification reports `Agent coverage drift` and rolls back; the manual fallback when the departed-node cleanup is off or refuses) | `gpu-fault-admin workflow-reconcile --state-dir ... --retire-departed-agents [--node <node>] --dry-run` to see the plan and evidence, then drop `--dry-run` and add `--reference` to execute once | §10.2 |
+| Retire the fleet Agent record, still ACTIVE, of a node a spot reclaim removed (the release verification reports `Agent coverage drift` and rolls back; the manual fallback when the departed-node cleanup is off or refuses) | `gpu-fault-admin workflow-reconcile --state-dir ... --retire-departed-agents [--node <node>] --dry-run` to see the plan and evidence, then drop `--dry-run` and add `--reference` to execute once; for a node whose provider identity is unknown (no instance id in the node name, no EC2 instance id on the record; ledger reason `provider_identity_unknown`) add `--node <node> --accept-unknown-provider-identity --reason <why>` | §10.2 |
 | List and close ESCALATED incidents (node repaired but the record still only logs) | `GET /v1/incidents?state=ESCALATED` or `gpu-fault-admin workflow-reconcile --state-dir ... --close-escalated --dry-run` to list the queue; `--close-incident <id>` / `--close-escalated` with `--reason` `--reference` to close | §9.1 |
 | Node failure-domain (rack/instance group) mapping for remediation budget throttling | Automatic: `deploy`/`join-cluster`/`remove-cluster` render and apply it; read-only view with `gpu-fault-admin failure-domain-map --state-dir ... [--output ...]` | §5.1 |
 | Handle one AMP alert | Enter the triage card by alert name | §8 |
@@ -3297,8 +3297,10 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   table of §10.1.1): a `PENDING` line is mostly a failed provider read (`provider_unknown`: IAM, throttling; see the
   control-worker WARNING `departed-node cleanup: <provider> lookup ... failed`), an Executor no longer reporting the node
   inventory (`kubernetes_unproven` with `no Kubernetes node report` or a stale report) or a workflow still executing; a
-  `REFUSED` line follows its `manual:` command into §10.2, §9.1 or `config spare --release`. The next cycle (60 s) after
-  that turns the line `CLEANED` and the alert resolves.
+  `REFUSED` line follows its `manual:` command into §10.2, §9.1 or `config spare --release`; on a
+  `provider_identity_unknown` line `manual:` is `--accept-unknown-provider-identity` (§10.2), and without a `manual:`
+  the reason says what that exit still waits for (a report chain short of 24 hours, an Agent still inside the guard).
+  The next cycle (60 s) after that turns the line `CLEANED` and the alert resolves.
 - **Boundary**: do not delete ledger lines or edit the store to clear the alert; the cleanup itself deletes a line when
   the node name is back in Kubernetes, the cluster is de-registered or the line has been `CLEANED` for 7 days. To pause
   the automatic cleanup use `spec.workflow.departedNodeCleanup: false` (§10.1.1), not a silence.
@@ -4097,8 +4099,8 @@ there is a manual path, the ledger line and the notification give the exact comm
 | `remote_command` | the workflow has a remote command | same |
 | `declared_spare` | the node was a declared or reserved warm spare when Kubernetes last listed it: its other records end as usual, the declaration on the deploy host is the administrator's (once seen, the finding stays with the departure even after the inventory forgets the label at 24 hours) | `gpu-fault-admin config spare --state-dir <state-dir> --node <node> --cluster-id <cluster> --release --reference <change> --confirm RELEASE_WARM_SPARE_UNCORDON`: for a provably departed node it releases only the record and acknowledges it to the control plane; the next cycle turns the ledger line `CLEANED` (§2) |
 | `incident_names_other_nodes` | the incident also names a node not proven departed | `--close-incident <id>` |
-| `cluster_not_active` | the cluster is not `ACTIVE` (or is disabled) in the registry | `--retire-departed-agents --node <node> --dry-run` |
-| `provider_identity_unknown` | the HyperPod node name carries no instance id, or the eks-managed Agent record has no EC2-shaped `node_instance_id` | same |
+| `cluster_not_active` | the cluster is not `ACTIVE` (or is disabled) in the registry | `--retire-departed-agents --node <node> --dry-run` (given only where the node's provider identity is known; for an unknown one see the next row) |
+| `provider_identity_unknown` | the HyperPod node name carries no instance id, or the eks-managed Agent record has no EC2-shaped `node_instance_id`: the provider can never be asked, and the cleanup neither retires such an Agent nor accepts its departure by itself | the administrator's exit `--retire-departed-agents --node <node> --accept-unknown-provider-identity --reason <why>` (`--dry-run` first, then without it and with `--reference`, §10.2). The ledger gives that command only when it would be taken: the latest Kubernetes node report fresh and not listing the node, the report chain never having listed it or leaving it out for 24 hours, and the Agent without a record, `REVOKED`, or with an expired lease and a heartbeat older than 10 minutes; otherwise the reason says what the exit still waits for (`... is not open yet: ...`) and no command is given |
 | `incident_not_closable`, `other` | the closure service refused, or another reason | per the refusal text |
 
 `PENDING` means still waiting, resolving by itself and retried every cycle: `kubernetes_unproven` (still in Kubernetes,
@@ -4106,6 +4108,25 @@ no report or a stale one, absent for less than 10 minutes), `agent_alive` (heart
 not expired), `provider_still_lists`, `provider_unknown`, `record_moved` (a compare-and-set lost to another writer),
 `workflow_live` (the workflow is still executing), `incident_nodes_pending` (the incident's other nodes are still being
 proven).
+
+**After the administrator's acceptance**: `--accept-unknown-provider-identity` retires the node's Agent (when it has a
+record not yet retired) and writes an acceptance (the store object `departed_node_identity_acceptance`: cluster, node,
+`--reference`, actor ARN, reason, time and the report verdict of that moment). The cleanup's next cycle takes the node
+as departed -- the provider is not asked, and the evidence's `provider_identity.accepted` carries the actor, the change
+reference and the reason -- and ends the workflows that never changed the node and its `ESCALATED` incidents as for
+any departure, with the reason `<node> absent from Kubernetes since <time>, its provider identity unknown and the
+departure accepted by <ARN> (<change>): <reason>`; the ledger line turns `CLEANED`. The Kubernetes side still requires
+a fresh latest report and an absence of 10 minutes. Two cases stay reported only: an Agent `ACTIVE` again after the
+acceptance (re-registered under the same name) keeps the line `REFUSED` and says so; a `QUARANTINED` incident is not
+closed (`incident_not_closable`, no command) -- an isolation is cleared only on the provider's departure proof, the
+administrator's acceptance answers only whether the node left, and the closes of §9.1 need that proof too, so such an
+incident has no product exit today. When the node name is listed by Kubernetes again, the ledger line and the
+acceptance are deleted together; an acceptance lives as long as its ledger line (a `CLEANED` line stays 7 days), and
+at most 7 days without one.
+
+**A line with nothing left is not kept**: when the proof does not hold but the node has no Agent record left unretired
+and no open incident (the administrator ended it by hand with `--close-incident`, say), the ledger line is deleted and
+the node no longer counts in `departed nodes:`.
 
 **How to see what it did:**
 
@@ -4328,6 +4349,50 @@ Kubernetes Node the refusal ends with a hint naming this switch. The same `workf
   no longer produces `collector readiness failed` or `GpuFaultCollectorSilent`. The node's `collector_status` rows are not
   deleted -- the Store has no deletion path and they are evidence -- readers simply stop counting them. Should a node
   re-register under the same name, the registry's normal heartbeat path makes it `ACTIVE` again.
+
+**The administrator's exit from the fourth shape: a node whose provider identity is unknown
+(`--accept-unknown-provider-identity`).** The discovery rule above needs the provider to prove the node gone. A HyperPod
+node whose name carries no instance id, an eks-managed node whose Agent record has no EC2 instance id (the alias node a
+DESTR-020 identity mismatch leaves behind, for one) can never be put to the provider, so it never qualifies
+(`provider membership unknown: ...`), and the departed-node cleanup can only report it as `provider_identity_unknown`
+(§10.1.1). Once the administrator has made sure the node really is gone, the same verb accepts its departure, by name:
+
+```bash
+# Look first: the plan lists the Agent record (if any), this read through the GPU kubeconfig and the report-chain verdict
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --retire-departed-agents \
+  --node <node> --accept-unknown-provider-identity --dry-run
+# Then execute once (plan, re-check and write in one invocation)
+gpu-fault-admin workflow-reconcile --state-dir /secure/gpu-fault --retire-departed-agents \
+  --node <node> --accept-unknown-provider-identity --reason "<why it is known to be gone>" --reference CHG-12345
+```
+
+- **Conditions** (all of them; the plan lists each unmet one, and the apply judges them again in the Pod on the store and
+  the clock of that moment): the flag is the explicit confirmation, and the automatic cleanup never uses it; the node must
+  be named with `--node` (never discovered), the apply needs `--reason` (at most 512 characters), and `--reason` without
+  the flag is refused; the node is found by its Agent record (in any state) or its departed-node ledger line in a managed
+  cluster, and a name found in several clusters is refused; its provider identity must really be unknown (a known one:
+  `the node's provider identity is known; retire it on the provider's proof, without
+  --accept-unknown-provider-identity`); the node is not in Kubernetes in this read through the GPU kubeconfig; of the
+  Kubernetes node reports the control plane holds, the latest arrived within 5 minutes and does not list the node, and
+  either no report of the current chain ever listed it (the chain itself covering the 10-minute guard) or it left the
+  reports 24 hours ago or more -- short of that it is refused with the moment the exit opens (`the node left the
+  Kubernetes node reports at <time>; an unknown provider identity is accepted 24 hours after that, from <time>`); the
+  Agent has no record, is `REVOKED`, or has an expired lease and a last heartbeat older than 10 minutes. "Never listed"
+  speaks of the current unbroken report chain only: a broken chain (two reports more than 5 minutes apart) starts
+  afresh, and the plan's `kubernetes_reports_read.chain_started_at` is where that evidence begins;
+  `kubernetes_reports` (`open`, `never_reported`) enters `plan_sha256`, the read times do not.
+- **Writes**: an Agent record not yet retired gets the drain and revoke above (the same compare-and-set and
+  `transition_id`), with the audit line `operator reconciliation <reference>: retired Agent <node> after its node left
+  Kubernetes; its provider identity is unknown (record node_instance_id <value|unset>) and the operator accepted the
+  departure: <reason> (kubernetes node reports: never listed since <time>|absent since <time>, latest <time>; actor
+  <ARN>; admin plan <sha256>)`; then the acceptance `departed_node_identity_acceptance` is written (cluster, node,
+  `--reference`, actor ARN, reason, time and the report verdict). The result's `accepted_identities` lists the nodes
+  accepted, `retired_agents` the records retired (empty for a node without an Agent record). Plan and result are archived
+  under `workflow-reconcile/departed-agents/<plan_sha256>/` as well.
+- **Afterwards**: the departed-node cleanup's next cycle (60 s) takes the node as departed, ends the rest of what it left
+  and turns its ledger line `CLEANED` (§10.1.1, "After the administrator's acceptance", including the two cases it still
+  leaves). On a control plane older than this change the plan refuses the exit with `the control plane predates the
+  unknown-provider-identity exit`; the other shapes are unaffected.
 
 **The fifth shape: a parked record whose node action the operator confirmed (`operator-confirmed`).** A node
 action whose outcome the Node Agent could not report parks its record `BLOCKED/NEEDS_OPERATOR` (§9.4); once the
@@ -4685,7 +4750,8 @@ workflow-reconcile   converges historical workflows that recovered but stay BLOC
                      --close-incident <id> / --close-escalated close ESCALATED incidents,
                      --close-quarantined closes QUARANTINED incidents whose isolation is no longer on the node (§9.1);
                      --retire-departed-agents [--node ID] retires the fleet Agent record, still ACTIVE, of a
-                     node that left Kubernetes and HyperPod (§10.2)
+                     node that left Kubernetes and HyperPod; with --accept-unknown-provider-identity --reason
+                     it accepts the departure of a named node whose provider identity is unknown (§10.2)
 rotate-token         one command completes the cluster token overlap-window rotation
 node-key-custody     configure explicitly registers forward-looking custody; authorised delivery is still performed by deploy/join (§6.2)
 submit-remediation   explicit remediation after CHECK_MECHANICALS

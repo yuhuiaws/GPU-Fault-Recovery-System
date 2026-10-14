@@ -26,6 +26,7 @@ from gpu_fault.store.shared.orphaned_commands import OrphanedCommandCancellation
 if TYPE_CHECKING:
     from gpu_fault.departed_nodes import (
         DepartedNodeCleanupRecord,
+        DepartedNodeIdentityAcceptance,
         DepartedNodeSpareRelease,
     )
     from gpu_fault.fleet import (
@@ -261,7 +262,8 @@ class DepartedNodeStore(Protocol):
     the cluster's own lock (``kubernetes_node_inventory.merge_node_inventory``),
     and one ledger line per departed node; beside them the administrator's
     release of a departed spare's declaration, which answers that line's
-    spare finding.
+    spare finding, and the administrator's acceptance of a departure whose
+    provider identity is unknown, which answers its identity finding.
     """
 
     def record_kubernetes_node_inventory(
@@ -292,6 +294,18 @@ class DepartedNodeStore(Protocol):
     ) -> list[DepartedNodeSpareRelease]: ...
 
     def delete_departed_node_spare_release(
+        self, cluster_id: str, node_id: str
+    ) -> None: ...
+
+    def save_departed_node_identity_acceptance(
+        self, acceptance: DepartedNodeIdentityAcceptance
+    ) -> None: ...
+
+    def list_departed_node_identity_acceptances(
+        self, cluster_id: str | None = None
+    ) -> list[DepartedNodeIdentityAcceptance]: ...
+
+    def delete_departed_node_identity_acceptance(
         self, cluster_id: str, node_id: str
     ) -> None: ...
 

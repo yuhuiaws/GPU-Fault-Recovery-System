@@ -28,10 +28,13 @@ All three, judged by the rule ``workflow-reconcile`` judges with
 ended, each through the CLI's own path (``departed_node_cleanup_actions``).
 What is not the cleanup's to end -- a workflow that changed a node or has a
 remote command, an incident naming a node that is still present, anything on
-a cluster the registry does not hold ``ACTIVE``, and a departed spare's
+a cluster the registry does not hold ``ACTIVE``, a departed spare's
 declaration (the deploy host's record, released by ``config spare --release``,
-which answers the finding with a ``DepartedNodeSpareRelease``) -- is reported
-instead: one ledger line per node
+which answers the finding with a ``DepartedNodeSpareRelease``), and a node
+whose provider identity is unknown (answered only by the administrator's
+``--accept-unknown-provider-identity``, a ``DepartedNodeIdentityAcceptance``;
+the cleanup never retires such an Agent itself) -- is reported instead: one
+ledger line per node
 (``DepartedNodeCleanupRecord``, read by ``gpu-fault-admin status``), one
 notification naming the node and the exact administrator command, and the
 refusal counter. A cleaned node gets one informational notification.
@@ -69,6 +72,7 @@ from gpu_fault.departed_node_cleanup_actions import (
     Blocker,
     CleanupOutcome,
     DepartureWrites,
+    accept_identity_command,
     retire_command,
     spare_command,
 )
@@ -84,6 +88,7 @@ from gpu_fault.departed_nodes import (
     RETIREABLE_LIFECYCLES,
     DepartedNodeCleanupRecord,
     DepartedNodeCleanupStatus,
+    DepartedNodeIdentityAcceptance,
     DepartedNodeSpareRelease,
     agent_retirement_reasons,
     cluster_provider_of,
@@ -101,6 +106,7 @@ from gpu_fault.kubernetes_node_inventory import (
     KubernetesAbsence,
     KubernetesNodeInventory,
     kubernetes_absence,
+    unknown_provider_exit,
 )
 from gpu_fault.models import AdvisoryNotification
 
@@ -161,6 +167,8 @@ class DepartureProof:
     provider_read_at: datetime | None = None
     #: The provider was read and no longer has the instance.
     provider_departed: bool = False
+    #: The provider can never be asked; the administrator accepted the departure.
+    accepted: DepartedNodeIdentityAcceptance | None = None
     blockers: list[Blocker] = field(default_factory=list)
 
     @property
@@ -184,6 +192,16 @@ class DepartureProof:
         }
         if self.provider == EKS_PROVIDER and self.provider_state is not None:
             departed["ec2_state"] = self.provider_state
+        if self.accepted is not None:
+            departed["provider_identity"] = {
+                "known": False,
+                "accepted": {
+                    "actor": self.accepted.actor,
+                    "change_reference": self.accepted.change_reference,
+                    "reason": self.accepted.reason,
+                    "accepted_at": self.accepted.accepted_at.isoformat(),
+                },
+            }
         source = EC2_SOURCE if self.provider == EKS_PROVIDER else HYPERPOD_SOURCE
         record = node_evidence(
             self.node_id,
@@ -301,19 +319,26 @@ class DepartedNodeCleanup:
             item.node_id: item
             for item in self.store.list_departed_node_spare_releases(cluster_id)
         }
+        acceptances = {
+            item.node_id: item
+            for item in self.store.list_departed_node_identity_acceptances(cluster_id)
+        }
         listed = None if inventory is None else frozenset(inventory.node_names)
         for node_id in sorted(existing):
             if listed is not None and node_id in listed:
                 # The node is in Kubernetes again (it never left, or the name
                 # came back with a new instance): not a departure any more.
-                self.store.delete_departed_node_cleanup(cluster_id, node_id)
-                if node_id in releases:
-                    self.store.delete_departed_node_spare_release(cluster_id, node_id)
+                self._forget(cluster_id, node_id, releases, acceptances)
                 del existing[node_id]
+        for node_id in sorted(set(acceptances) - set(existing)):
+            if listed is not None and node_id in listed:
+                self._forget(cluster_id, node_id, releases, acceptances)
         candidates = self._candidates(cluster_id, inventory, agents, existing, now)
         if not candidates:
             return []
-        proofs = self._proofs(registration, candidates, inventory, agents, now)
+        proofs = self._proofs(
+            registration, candidates, inventory, agents, acceptances, now
+        )
         proven = frozenset(node for node, proof in proofs.items() if proof.proven)
         writes = DepartureWrites(
             store=self.store,
@@ -324,11 +349,20 @@ class DepartedNodeCleanup:
             pending=frozenset(proofs),
             evidence={node: proofs[node].evidence(registration) for node in proven},
             waiting_ttl=self.waiting_ttl,
+            accepted=frozenset(
+                node for node in proven if proofs[node].accepted is not None
+            ),
         )
         records = []
         for node_id in sorted(proofs):
             proof = proofs[node_id]
             outcome = CleanupOutcome()
+            if not proof.proven and not self._residue(cluster_id, proof):
+                # Nothing the node left is open any more (the administrator
+                # ended it by hand, or it never had records): no line to keep.
+                if node_id in existing:
+                    self._forget(cluster_id, node_id, releases, acceptances)
+                continue
             if proof.proven:
                 outcome = writes.clean(
                     cluster_id,
@@ -345,6 +379,36 @@ class DepartedNodeCleanup:
                 self._ledger(registration, proof, outcome, existing.get(node_id), now)
             )
         return records
+
+    def _forget(
+        self,
+        cluster_id: str,
+        node_id: str,
+        releases: Mapping[str, DepartedNodeSpareRelease],
+        acceptances: Mapping[str, DepartedNodeIdentityAcceptance],
+    ) -> None:
+        """Drop a node's ledger line with the administrator's answers to it."""
+
+        self.store.delete_departed_node_cleanup(cluster_id, node_id)
+        if node_id in releases:
+            self.store.delete_departed_node_spare_release(cluster_id, node_id)
+        if node_id in acceptances:
+            self.store.delete_departed_node_identity_acceptance(cluster_id, node_id)
+
+    def _residue(self, cluster_id: str, proof: DepartureProof) -> bool:
+        """Whether anything the node left is still open: its Agent or an incident."""
+
+        agent = proof.agent
+        if (
+            agent is not None
+            and agent.lifecycle_state is not AgentLifecycleState.REVOKED
+        ):
+            return True
+        return bool(
+            self.store.list_incidents_by_state(
+                cluster_id, OPEN_INCIDENT_STATES, node_ids={proof.node_id}
+            )
+        )
 
     def _candidates(
         self,
@@ -410,6 +474,7 @@ class DepartedNodeCleanup:
         candidates: set[str],
         inventory: KubernetesNodeInventory | None,
         agents: Mapping[str, AgentRecord],
+        acceptances: Mapping[str, DepartedNodeIdentityAcceptance],
         now: datetime,
     ) -> dict[str, DepartureProof]:
         provider = cluster_provider_of({"provider": registration.provider})
@@ -425,6 +490,14 @@ class DepartedNodeCleanup:
                 kubernetes_absence(inventory, node_id, now=now, guard=guard),
                 agent,
             )
+            if provider == EKS_PROVIDER:
+                proof.instance_id = recorded_instance_id(
+                    agent.node_instance_id if agent is not None else None
+                )
+                unknown = NO_RECORDED_INSTANCE_BLOCKER
+            else:
+                proof.instance_id = hyperpod_instance_id(node_id)
+                unknown = NO_HYPERPOD_INSTANCE_BLOCKER
             if not active:
                 proof.block(
                     CLUSTER_NOT_ACTIVE,
@@ -433,7 +506,9 @@ class DepartedNodeCleanup:
                     + ("" if registration.enabled else " and disabled")
                     + " in the registry; departed-node cleanup acts on ACTIVE "
                     "clusters only",
-                    retire_command(node_id),
+                    # The administrator's retire proves the departure through
+                    # the provider: named only where the provider can be asked.
+                    retire_command(node_id) if proof.instance_id is not None else None,
                 )
             if proof.kubernetes.blocker is not None:
                 proof.block(KUBERNETES_UNPROVEN, proof.kubernetes.blocker)
@@ -448,31 +523,69 @@ class DepartedNodeCleanup:
                     guard=guard,
                 ):
                     proof.block(AGENT_ALIVE, reason)
-            if provider == EKS_PROVIDER:
-                proof.instance_id = recorded_instance_id(
-                    agent.node_instance_id if agent is not None else None
+            if proof.instance_id is None:
+                self._unknown_identity(
+                    proof, unknown, acceptances.get(node_id), inventory, now
                 )
-                if proof.instance_id is None:
-                    proof.block(
-                        PROVIDER_IDENTITY_UNKNOWN,
-                        NO_RECORDED_INSTANCE_BLOCKER,
-                        retire_command(node_id),
-                    )
-            else:
-                proof.instance_id = hyperpod_instance_id(node_id)
-                if proof.instance_id is None:
-                    proof.block(
-                        PROVIDER_IDENTITY_UNKNOWN,
-                        NO_HYPERPOD_INSTANCE_BLOCKER,
-                        retire_command(node_id),
-                    )
             proofs[node_id] = proof
         # The provider is asked only about nodes every other source already
-        # cleared: one read per cluster per cycle, never for a node in sight.
-        ready = [proof for proof in proofs.values() if proof.proven]
+        # cleared: one read per cluster per cycle, never for a node in sight
+        # nor for one it can never be asked about.
+        ready = [
+            proof
+            for proof in proofs.values()
+            if proof.proven and proof.accepted is None
+        ]
         if ready:
             self._read_provider(registration, provider, ready)
         return proofs
+
+    def _unknown_identity(
+        self,
+        proof: DepartureProof,
+        text: str,
+        acceptance: DepartedNodeIdentityAcceptance | None,
+        inventory: KubernetesNodeInventory | None,
+        now: datetime,
+    ) -> None:
+        """A provider that can never be asked: the administrator's to accept.
+
+        The administrator's acceptance stands in for the provider once the
+        Agent is retired (the accepting command retires it). Without one, the
+        finding names the accepting command only when it would be taken --
+        the reports allow it and the Agent is silent past the guard -- and
+        otherwise says what it waits for. The cleanup never accepts one, nor
+        retires such an Agent, by itself.
+        """
+
+        agent = proof.agent
+        retired = agent is None or agent.lifecycle_state is AgentLifecycleState.REVOKED
+        if acceptance is not None and retired:
+            proof.accepted = acceptance
+            return
+        if acceptance is not None:
+            text = (
+                f"the administrator accepted the departure "
+                f"({acceptance.change_reference}) but the node's Agent is "
+                f"{agent.lifecycle_state.value if agent is not None else 'absent'} "
+                f"again; {text}"
+            )
+        verdict = unknown_provider_exit(
+            inventory, proof.node_id, now=now, guard=self.config.guard
+        )
+        alive = [item.text for item in proof.blockers if item.kind == AGENT_ALIVE]
+        if verdict.open and not alive:
+            proof.block(
+                PROVIDER_IDENTITY_UNKNOWN,
+                f"{text}; the administrator may accept the departure",
+                accept_identity_command(proof.node_id),
+            )
+            return
+        proof.block(
+            PROVIDER_IDENTITY_UNKNOWN,
+            f"{text}; the administrator's exit (--accept-unknown-provider-identity) "
+            f"is not open yet: {verdict.blocker or '; '.join(alive)}",
+        )
 
     @staticmethod
     def _spare_finding(
@@ -692,8 +805,8 @@ class DepartedNodeCleanup:
                 )
             else:
                 kept.add(record.key)
-        # A spare release lives as long as its ledger line, or the retention
-        # when the administrator released it before the cleanup judged it.
+        # An administrator's answer lives as long as its ledger line, or the
+        # retention when it came before the cleanup judged the node.
         for release in self.store.list_departed_node_spare_releases():
             if release.key in kept:
                 continue
@@ -703,6 +816,16 @@ class DepartedNodeCleanup:
             ):
                 self.store.delete_departed_node_spare_release(
                     release.cluster_id, release.node_id
+                )
+        for acceptance in self.store.list_departed_node_identity_acceptances():
+            if acceptance.key in kept:
+                continue
+            if (
+                acceptance.cluster_id not in registered
+                or now - acceptance.accepted_at > self.config.cleaned_retention
+            ):
+                self.store.delete_departed_node_identity_acceptance(
+                    acceptance.cluster_id, acceptance.node_id
                 )
 
     # --------------------------------------------------------------- metrics

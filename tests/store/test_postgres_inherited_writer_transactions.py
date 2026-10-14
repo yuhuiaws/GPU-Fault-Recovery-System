@@ -75,6 +75,7 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "create_incident_workflow_if_absent",
         # The departed-node ledger and spare releases: one _delete / one _put each.
         "delete_departed_node_cleanup",
+        "delete_departed_node_identity_acceptance",
         "delete_departed_node_spare_release",
         "enqueue_notification_delivery",
         "ensure_remote_command",
@@ -100,6 +101,7 @@ REVIEWED_INHERITED_WRITERS = frozenset(
         "save_collector_metrics_snapshot",
         "save_decision",
         "save_departed_node_cleanup",
+        "save_departed_node_identity_acceptance",
         "save_departed_node_spare_release",
         "save_fleet_deployment",
         "save_hyperpod_node_identity",

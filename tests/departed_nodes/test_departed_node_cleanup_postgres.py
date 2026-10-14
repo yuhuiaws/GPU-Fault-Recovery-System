@@ -23,7 +23,11 @@ import pytest
 
 from gpu_fault.app.periodic_services import PeriodicServiceRunner
 from gpu_fault.departed_node_cleanup import DepartedNodeCleanup
-from gpu_fault.departed_nodes import DepartedNodeCleanupStatus, DepartedNodeSpareRelease
+from gpu_fault.departed_nodes import (
+    DepartedNodeCleanupStatus,
+    DepartedNodeIdentityAcceptance,
+    DepartedNodeSpareRelease,
+)
 from gpu_fault.fleet import AgentLifecycleState
 from gpu_fault.models import IncidentState, WorkflowStatus
 from gpu_fault.store import PostgresStore
@@ -32,13 +36,18 @@ from gpu_fault_release import regional_release_probes as PROBES
 from tests.departed_nodes._support import (
     EKS_CLUSTER,
     EKS_NODE,
+    EKS_PRESENT,
     HP_CLUSTER,
     HP_NODE,
     HP_PRESENT,
     ago,
+    blocked_never_changed,
     eks_departure,
     hyperpod_departure,
     inventory_report,
+    pending_never_dispatched,
+    registration,
+    world,
 )
 from tests.store._postgres_processor_claim_support import postgres_store_instance
 
@@ -258,3 +267,57 @@ def test_a_spare_release_round_trips_on_postgres(store: PostgresStore) -> None:
     assert listed == [release]
     assert other == []
     assert store.list_departed_node_spare_releases() == []
+
+
+def _acceptance(node_id: str) -> DepartedNodeIdentityAcceptance:
+    return DepartedNodeIdentityAcceptance(
+        cluster_id=EKS_CLUSTER,
+        node_id=node_id,
+        change_reference="CHG-2",
+        actor="ops@example",
+        reason="DESTR-020 alias; never a node",
+        accepted_at=ago(seconds=1),
+        kubernetes={"open": True, "never_reported": True},
+    )
+
+
+def test_an_identity_acceptance_round_trips_on_postgres(store: PostgresStore) -> None:
+    """The administrator's acceptance of an unknown provider identity is its own record."""
+
+    acceptance = _acceptance("acceptance-alias-0a0b0c0d0e0f")
+
+    store.save_departed_node_identity_acceptance(acceptance)
+    listed = store.list_departed_node_identity_acceptances(EKS_CLUSTER)
+    other = store.list_departed_node_identity_acceptances(HP_CLUSTER)
+    store.delete_departed_node_identity_acceptance(EKS_CLUSTER, acceptance.node_id)
+
+    assert listed == [acceptance]
+    assert other == []
+    assert store.list_departed_node_identity_acceptances() == []
+
+
+def test_an_accepted_alias_is_cleaned_on_postgres(store: PostgresStore) -> None:
+    """DESTR-020's residue: an ESCALATED incident for a node no report listed,
+    beside a never-dispatched record whose close reads the acceptance back."""
+
+    alias = "acceptance-alias-0a0b0c0d0e0f"
+    world_ = world(store)
+    store.save_regional_cluster(registration(EKS_CLUSTER, provider="eks-managed"))
+    blocked_never_changed(store, EKS_CLUSTER, alias, suffix="alias")
+    pending_never_dispatched(store, EKS_CLUSTER, alias, suffix="alias-xid")
+    world_.reports_since(EKS_CLUSTER, [EKS_PRESENT], minutes=15)
+    [refused] = world_.cleanup.run_once()
+    store.save_departed_node_identity_acceptance(_acceptance(alias))
+
+    [record] = world_.cleanup.run_once()
+
+    assert refused.blocker_classes == ["provider_identity_unknown"], refused.blockers
+    assert record.status is DepartedNodeCleanupStatus.CLEANED, record.blockers
+    for suffix in ("alias", "alias-xid"):
+        assert store.get_incident(f"incident-{suffix}").state is (
+            IncidentState.RECOVERED
+        ), suffix
+        assert store.get_workflow(f"workflow-{suffix}").status is (
+            WorkflowStatus.SUPERSEDED
+        ), suffix
+    assert world_.provider.calls == [], "nothing is ever put to the provider"

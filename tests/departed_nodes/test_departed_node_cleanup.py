@@ -20,6 +20,7 @@ from typing import Any
 
 import pytest
 
+from gpu_fault.departed_node_cleanup_actions import accept_identity_command
 from gpu_fault.departed_nodes import (
     GUARD_REASON,
     DepartedNodeCleanupStatus,
@@ -785,8 +786,8 @@ def test_an_eks_agent_without_a_recorded_instance_is_never_guessed() -> None:
 
     assert record.status is DepartedNodeCleanupStatus.REFUSED
     assert record.blocker_classes == ["provider_identity_unknown"]
-    assert any("--retire-departed-agents" in item for item in record.admin_commands), (
-        record.admin_commands
+    assert record.admin_commands == [accept_identity_command(EKS_NODE)], (
+        "never a retire the CLI would refuse: the administrator's exit"
     )
     assert world_.provider.calls == []
 

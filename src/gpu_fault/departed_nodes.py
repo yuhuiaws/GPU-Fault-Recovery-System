@@ -26,6 +26,14 @@ running or stopped, the name carries no instance id, no instance id was
 recorded, a lookup failed -- is not proof, and the blocker says which. Nothing
 here reads a source: the callers read Kubernetes and the provider their own
 way and hand the answers in.
+
+A provider identity that is unknown (no instance id in the HyperPod node
+name, no EC2 instance id recorded) can never be put to the provider. Only the
+administrator may then accept the departure, explicitly, once every
+Kubernetes node report the control plane holds has left the node out for 24
+hours or never listed it (``kubernetes_node_inventory.unknown_provider_exit``)
+and its Agent is not alive; ``DepartedNodeIdentityAcceptance`` records that,
+and the automatic cleanup never accepts one by itself.
 """
 
 from __future__ import annotations
@@ -38,6 +46,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import Field
 
+from gpu_fault.kubernetes_node_inventory import unknown_provider_exit
 from gpu_fault.models import StrictModel
 
 if TYPE_CHECKING:
@@ -69,6 +78,10 @@ NO_RECORDED_INSTANCE_BLOCKER = (
     "provider membership unknown: the fleet recorded no EC2 instance id for the "
     "node (Agent node_instance_id)"
 )
+#: The provider can never be asked about such a node.
+UNKNOWN_IDENTITY_BLOCKERS = frozenset(
+    {NO_HYPERPOD_INSTANCE_BLOCKER, NO_RECORDED_INSTANCE_BLOCKER}
+)
 KUBERNETES_PRESENT_BLOCKER = (
     "node is still in Kubernetes; a never-dispatched record is closed only "
     "for a node that left Kubernetes and HyperPod"
@@ -97,6 +110,14 @@ def recorded_instance_id(value: object) -> str | None:
 
     text = value.strip() if isinstance(value, str) else ""
     return text if INSTANCE_ID.fullmatch(text) else None
+
+
+def provider_identity(provider: object, node_id: str, recorded: object) -> str | None:
+    """The instance the provider would be asked about, or None when unknown."""
+
+    if str(provider or "") == EKS_PROVIDER:
+        return recorded_instance_id(recorded)
+    return hyperpod_instance_id(node_id)
 
 
 def provider_lookup_blocker(error: object) -> str:
@@ -260,6 +281,65 @@ def retirement_audit(
     )
 
 
+def accepted_identity_audit(
+    *,
+    reference: str,
+    node_id: str,
+    reason: str,
+    kubernetes: Mapping[str, Any],
+    recorded_instance: str,
+    actor: object,
+    plan_sha256: object,
+) -> str:
+    """The line an Agent retired on an accepted unknown provider identity records."""
+
+    if kubernetes.get("never_reported"):
+        reports = f"never listed since {kubernetes.get('chain_started_at')}"
+    elif kubernetes.get("absent_since"):
+        reports = f"absent since {kubernetes.get('absent_since')}"
+    else:
+        reports = "absent for over 24 hours"
+    return (
+        f"operator reconciliation {reference}: retired Agent {node_id} after its "
+        f"node left Kubernetes; its provider identity is unknown (record "
+        f"node_instance_id {recorded_instance or 'unset'}) and the operator "
+        f"accepted the departure: {reason} (kubernetes node reports: {reports}, "
+        f"latest {kubernetes.get('received_at')}; actor {actor}; admin plan "
+        f"{plan_sha256})"
+    )
+
+
+def unknown_identity_refusal(
+    store: Any,
+    *,
+    cluster_id: str,
+    node_id: str,
+    provider: object,
+    recorded_instance: object,
+    now: datetime,
+    guard: timedelta = DEPARTED_AGENT_GUARD_AGE,
+) -> str | None:
+    """Why the operator may not accept the node's departure yet; None when they may.
+
+    The identity must really be unknown (a known one is proven through the
+    provider) and the reports must allow it, judged on the store's own
+    Kubernetes node inventory at ``now``.
+    """
+
+    if provider_identity(provider, node_id, recorded_instance) is not None:
+        return (
+            "the node's provider identity is known; its departure is proven "
+            "through the provider, not accepted"
+        )
+    verdict = unknown_provider_exit(
+        store.get_kubernetes_node_inventory(cluster_id),
+        node_id,
+        now=now,
+        guard=guard,
+    )
+    return verdict.blocker
+
+
 def retire_departed_agent(
     registry: FleetRegistry,
     store: Any,
@@ -274,6 +354,7 @@ def retire_departed_agent(
     reason: str,
     now: datetime,
     guard: timedelta = DEPARTED_AGENT_GUARD_AGE,
+    accept_unknown_provider: bool = False,
 ) -> AgentRecord:
     """Retire one departed node's Agent through the registry's lifecycle path.
 
@@ -285,6 +366,12 @@ def retire_departed_agent(
     the registry lets only that one revoke -- which is also how a cleanup
     interrupted between the two writes resumes without a second drain.
     Raises ``ValueError`` naming the field that moved or the reason refused.
+
+    ``accept_unknown_provider`` is the administrator's explicit exit for a
+    node whose provider identity is unknown: the provider half of the proof
+    is replaced by ``unknown_identity_refusal`` -- re-judged here, on the
+    store's reports at ``now`` -- and the node must still be gone from
+    Kubernetes in the evidence.
     """
 
     from gpu_fault.fleet import AgentLifecycleState, AgentTransitionRequest
@@ -317,7 +404,26 @@ def retire_departed_agent(
     )
     if refusals:
         raise ValueError("; ".join(refusals))
-    if not evidence_proves_departure(evidence, node_id):
+    if accept_unknown_provider:
+        if (
+            evidence.get("node_id") != node_id
+            or evidence.get("absent_from_kubernetes") is not True
+        ):
+            raise ValueError(
+                "departed-node evidence does not show the node gone from Kubernetes"
+            )
+        refusal = unknown_identity_refusal(
+            store,
+            cluster_id=cluster_id,
+            node_id=node_id,
+            provider=evidence.get("provider"),
+            recorded_instance=current.node_instance_id,
+            now=now,
+            guard=guard,
+        )
+        if refusal is not None:
+            raise ValueError(f"an unknown provider identity is not accepted: {refusal}")
+    elif not evidence_proves_departure(evidence, node_id):
         raise ValueError("departed-node evidence does not prove the node gone")
     # Only an EC2-shaped record value can be compared with the evidence; a
     # HyperPod record's Node UID is carried in the audit line instead.
@@ -408,6 +514,32 @@ class DepartedNodeSpareRelease(StrictModel):
     #: ``released``: a gpu-fault-admin declaration record was released;
     #: ``none``: the node carried the spare label without one.
     declaration: str
+
+    @property
+    def key(self) -> str:
+        return departed_node_cleanup_key(self.cluster_id, self.node_id)
+
+
+class DepartedNodeIdentityAcceptance(StrictModel):
+    """An administrator accepted the departure of a node whose provider identity is unknown.
+
+    Written by ``workflow-reconcile --retire-departed-agents
+    --accept-unknown-provider-identity`` (which retires the node's Agent in
+    the same apply, when there is one) after the reports allowed it
+    (``unknown_identity_refusal``). The departed-node cleanup then takes the
+    node as departed -- on the administrator's word, recorded in every reason
+    it writes -- and ends what the node left like any departure; it never
+    accepts one by itself.
+    """
+
+    cluster_id: str
+    node_id: str
+    change_reference: str
+    actor: str
+    reason: str
+    accepted_at: datetime
+    #: ``unknown_provider_exit`` as the apply judged it.
+    kubernetes: dict[str, Any] = Field(default_factory=dict)
 
     @property
     def key(self) -> str:

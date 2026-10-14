@@ -3663,6 +3663,30 @@ provably departed node (`admin/warm_spare_departed.py`, skipping the unlabel and
 why) and writes a `DepartedNodeSpareRelease` in the Pod (a generic `gpu_fault_objects` kind written by the administrator
 alone); the cleanup takes a release of the same node and instance as the answer to that finding.
 
+**A node whose provider identity is unknown.** With no instance id in a HyperPod node name, or no EC2 instance id on an
+eks-managed Agent record, the provider can never be asked: the cleanup can neither prove the departure nor retires such
+an Agent by itself, and only reports `PROVIDER_IDENTITY_UNKNOWN`. The exit is the administrator's alone:
+`workflow-reconcile --retire-departed-agents --node <n> --accept-unknown-provider-identity --reason <why>`
+(`admin/workflow_reconcile_departed_agents.py`). The reports' half of it is `kubernetes_node_inventory.unknown_provider_exit`:
+the latest report fresh and not listing the node, and either the current unbroken chain never listed it (the chain
+covering at least the guard) or its absence has lasted `UNKNOWN_PROVIDER_ABSENCE` (24 h); a name whose absence the 24 h
+retention already pruned (`retained_since` past the chain's start) is open as well, but no longer claimed as never
+listed. The Agent's half is `agent_retirement_reasons`. The CLI's plan reads the control plane's verdict and ledger
+through the Pod mode `unknown-identity-facts` and Kubernetes through the GPU kubeconfig; the apply retires the Agent in
+the Pod through `retire_departed_agent(accept_unknown_provider=True)` -- re-judged with `unknown_identity_refusal` on the
+store and the Pod's clock, in place of the provider's half of the proof -- and writes a `DepartedNodeIdentityAcceptance`
+(a generic `gpu_fault_objects` kind written by the administrator alone). The cleanup takes a node with an acceptance
+and no Agent left (no record, or `REVOKED`) as departed: the provider is not asked, the evidence carries
+`provider_identity.accepted`, the workflows and `ESCALATED` incidents end as usual with reasons naming the actor and the
+change reference (the never-dispatched close, `close_never_dispatched_workflow`, reads the acceptance back from the
+store for a node that rests on it, never taking the evidence's word); a `QUARANTINED` incident is not closed (an isolation is cleared only on the provider's proof). Without
+an acceptance the ledger carries the command only when the exit would be taken (the reports open, no `AGENT_ALIVE`) and
+otherwise says what it waits for; the `--retire-departed-agents` command of `CLUSTER_NOT_ACTIVE` is likewise given only
+for a known identity -- the ledger never gives a command that would refuse. A line whose proof does not hold while the
+node has no unretired Agent and no open incident is deleted; when the node name is back in Kubernetes the acceptance goes
+with its ledger line (`tests/departed_nodes/test_unknown_provider_identity.py`,
+`tests/admin/test_admin_workflow_reconcile_unknown_identity.py`).
+
 **Ledger and observability.** `DepartedNodeCleanupRecord` (a generic `gpu_fault_objects` kind), one line per node,
 rewritten when the verdict changes or 10 min after the last write; a `CLEANED` line stays 7 days and is deleted when the
 node name is back in Kubernetes or the cluster is de-registered. The `control_api_inspect` probe carries each cluster's

@@ -252,17 +252,38 @@ def _flat_departed_evidence(node: Mapping[str, Any]) -> dict[str, Any]:
     sources = node.get("sources") or {}
     provider = sources.get("hyperpod") or sources.get("ec2") or {}
     read_at = node.get("read_at") or {}
-    return {
+    flat = {
         "node_id": node["node_id"],
         "instance_id": node.get("instance_id"),
         "provider": node.get("provider"),
         "absent_from_kubernetes": True,
-        "absent_from_provider": True,
+        "absent_from_provider": node.get("absent_from_provider") is True,
         "hyperpod_cluster_name": provider.get("cluster_name"),
         "region": provider.get("region"),
         "kubernetes_read_at": read_at.get("kubernetes"),
         "hyperpod_read_at": read_at.get("hyperpod") or read_at.get("ec2"),
     }
+    accepted = _accepted_identity(node)
+    if accepted:
+        flat["identity_accepted_by"] = accepted.get("actor")
+        flat["identity_accepted_reference"] = accepted.get("change_reference")
+    return flat
+
+
+def _accepted_identity(node: Mapping[str, Any]) -> Mapping[str, Any]:
+    """The administrator's acceptance of an unknown provider identity, if any."""
+
+    identity = node.get("provider_identity")
+    accepted = identity.get("accepted") if isinstance(identity, Mapping) else None
+    return accepted if isinstance(accepted, Mapping) else {}
+
+
+def _evidence_departed(node: Mapping[str, Any]) -> bool:
+    """Gone from Kubernetes, and from the provider or by the administrator's word."""
+
+    if node.get("absent_from_kubernetes") is not True:
+        return False
+    return node.get("absent_from_provider") is True or bool(_accepted_identity(node))
 
 
 def close_never_dispatched_workflow(
@@ -323,10 +344,7 @@ def close_never_dispatched_workflow(
         raise ValueError("; ".join(reasons))
     evidence = list(item["departed_node_evidence"])
     proven = sorted(
-        str(node["node_id"])
-        for node in evidence
-        if node.get("absent_from_kubernetes") is True
-        and node.get("absent_from_provider") is True
+        str(node["node_id"]) for node in evidence if _evidence_departed(node)
     )
     if not proven or proven != sorted(str(node["node_id"]) for node in evidence):
         raise ValueError("departed-node evidence does not prove every node gone")
@@ -335,6 +353,25 @@ def close_never_dispatched_workflow(
             "incident node set changed: evidence covers "
             f"{proven}, incident names {sorted(incident.node_ids)}"
         )
+    accepted = sorted(
+        str(node["node_id"])
+        for node in evidence
+        if node.get("absent_from_provider") is not True
+    )
+    if accepted:
+        # The administrator's word stands in for the provider only where the
+        # store holds it, never on the evidence's say-so.
+        held = {
+            record.node_id
+            for record in store.list_departed_node_identity_acceptances(
+                incident.cluster_id
+            )
+        }
+        if missing := sorted(set(accepted) - held):
+            raise ValueError(
+                "departed-node evidence rests on an accepted provider identity "
+                f"the store holds no acceptance for: {missing}"
+            )
     provider_label = (
         "EC2"
         if any(node.get("provider") == "eks-managed" for node in evidence)
@@ -344,6 +381,11 @@ def close_never_dispatched_workflow(
         f"operator reconciliation {reference}: closed "
         f"{request_id}, never dispatched, after its node left "
         f"Kubernetes and {provider_label} ({', '.join(proven)})"
+        if not accepted
+        else f"operator reconciliation {reference}: closed {request_id}, never "
+        f"dispatched, after its node left Kubernetes ({', '.join(proven)}); the "
+        f"provider identity of {', '.join(accepted)} is unknown and the "
+        "administrator accepted the departure"
     )
     superseded = workflow.model_copy(update={"status": WorkflowStatus.SUPERSEDED})
     amended = store.amend_workflow(

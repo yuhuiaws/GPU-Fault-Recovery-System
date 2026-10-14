@@ -791,12 +791,14 @@ rules:
       - src/gpu_fault/admin/warm_spare_departed.py
       - tests/admin/test_admin_warm_spare_departed.py
       - tests/metrics/test_departed_node_cleanup_promql.py
+      - tests/admin/test_admin_workflow_reconcile_unknown_identity.py
     pytest:
       - tests/departed_nodes
       - tests/execution/test_cluster_executor_node_inventory.py
       - tests/admin/test_admin_config_departed_node_cleanup.py
       - tests/regional/test_departed_node_status.py
       - tests/admin/test_admin_workflow_reconcile_departed_agents.py
+      - tests/admin/test_admin_workflow_reconcile_unknown_identity.py
       - tests/admin/test_admin_workflow_reconcile_never_dispatched.py
       - tests/eks_provider/test_departed_node_ec2_proof.py
       - tests/regional/test_release_departed_nodes.py

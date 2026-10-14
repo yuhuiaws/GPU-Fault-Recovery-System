@@ -453,7 +453,7 @@ def _add_incident_close_arguments(reconcile: argparse.ArgumentParser) -> None:
     reconcile.add_argument(
         "--reason",
         metavar="TEXT",
-        help="why the incident is closed; recorded on the incident and its audit event",
+        help="why the incident is closed or the departure accepted; kept in the audit",
     )
 
 
@@ -793,7 +793,7 @@ def _run_retire_departed_agents(arguments: argparse.Namespace) -> int:
 
 
 def _run_workflow_reconcile(arguments: argparse.Namespace) -> int:
-    if getattr(arguments, "retire_departed_agents", False):
+    if workflow_reconcile_departed_agents.selected(arguments):
         return _run_retire_departed_agents(arguments)
     if (
         getattr(arguments, "close_incident", None)

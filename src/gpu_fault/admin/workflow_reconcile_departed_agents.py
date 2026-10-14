@@ -21,6 +21,19 @@ than ``DEPARTED_AGENT_GUARD_AGE`` -- an Agent that spoke ten minutes ago is
 mid-restart, not gone. ``DRAINING`` qualifies beside ``ACTIVE``: a drain whose
 revoke never followed is the same residue.
 
+A node whose provider identity is unknown -- no EC2 instance id recorded on
+an eks-managed cluster, no instance in a HyperPod node name -- can never be
+put to the provider, so it never qualifies above. ``--node <id>
+--accept-unknown-provider-identity --reason <why>`` is the administrator's
+explicit exit for it: the node must be absent from Kubernetes now and from
+every Kubernetes node report the control plane holds for 24 hours (or never
+listed by one; ``kubernetes_node_inventory.unknown_provider_exit``, judged in
+the Pod), its Agent -- if it has a record -- past the guard with an expired
+lease. The apply retires that Agent, re-judging all of it, and records a
+``DepartedNodeIdentityAcceptance``, on which the control plane's departed-node
+cleanup ends the rest of what the node left; the cleanup never accepts one by
+itself. The reason is on the transition and the acceptance.
+
 The write goes through the registry's own lifecycle path, in the Pod:
 ``FleetRegistry.drain_agent`` then ``revoke_agent`` with one
 ``AgentTransitionRequest`` whose ``transition_id`` names this reconcile and
@@ -55,6 +68,8 @@ from gpu_fault.departed_nodes import (
     GUARD_REASON,
     RETIREABLE_LIFECYCLES,
     agent_retirement_reasons,
+    cluster_provider_of,
+    provider_identity,
 )
 
 __all__ = [
@@ -69,13 +84,16 @@ __all__ = [
     "conflicting_flags",
     "retire_departed_agents_command",
     "run_retire_departed_agents",
+    "selected",
 ]
 
 RETIRE_DEPARTED_AGENTS = "retire-departed-agents"
+ACCEPT_UNKNOWN_PROVIDER = "accept-unknown-provider-identity"
+ACCEPT_REASON_LIMIT = 512
 HISTORY_PATH = Path("workflow-reconcile/departed-agents")
 # Read times are reported beside the evidence and left out of the digest: the
 # verdicts (present/listed) and the record's keys bind the approval.
-DIGEST_EXCLUDED_ITEM_FIELDS = frozenset({"evidence_read_at"})
+DIGEST_EXCLUDED_ITEM_FIELDS = frozenset({"evidence_read_at", "kubernetes_reports_read"})
 NO_RECORD_REASON = "no Agent record in the fleet"
 KUBERNETES_PRESENT_REASON = (
     "node is still in Kubernetes; an Agent is retired only for a node that "
@@ -115,6 +133,18 @@ try:
     from gpu_fault.departed_nodes import retire_departed_agent, retirement_audit
 except ImportError:
     retire_departed_agent = retirement_audit = None
+try:
+    # The administrator's exit for an unknown provider identity; an image
+    # from before it refuses that exit and nothing else.
+    from gpu_fault.departed_nodes import (
+        DepartedNodeIdentityAcceptance,
+        accepted_identity_audit,
+        unknown_identity_refusal,
+    )
+    from gpu_fault.kubernetes_node_inventory import unknown_provider_exit
+except ImportError:
+    DepartedNodeIdentityAcceptance = None
+from gpu_fault.store import NotFoundError
 
 payload = json.load(sys.stdin)
 context = ApplicationContext.from_environment()
@@ -149,15 +179,139 @@ if payload["mode"] == "list-agents":
         "evaluated_at": now.isoformat(),
         "agents": sorted(agents, key=lambda item: (item["cluster_id"], item["node_id"])),
     }
+elif payload["mode"] == "unknown-identity-facts":
+    facts = []
+    for cluster_id in payload["cluster_ids"]:
+        ledger = (
+            {item.node_id for item in store.list_departed_node_cleanups(cluster_id)}
+            if hasattr(store, "list_departed_node_cleanups")
+            else set()
+        )
+        for node_id in payload["node_ids"]:
+            if DepartedNodeIdentityAcceptance is None:
+                verdict = {
+                    "open": False,
+                    "blocker": (
+                        "the control plane predates the unknown-provider-identity exit"
+                    ),
+                }
+            else:
+                verdict = unknown_provider_exit(
+                    store.get_kubernetes_node_inventory(cluster_id),
+                    node_id,
+                    now=now,
+                    guard=GUARD_AGE,
+                ).as_dict()
+            facts.append(
+                {
+                    "cluster_id": cluster_id,
+                    "node_id": node_id,
+                    "ledger": node_id in ledger,
+                    "exit": verdict,
+                }
+            )
+    result = {
+        "mode": "unknown-identity-facts",
+        "evaluated_at": now.isoformat(),
+        "facts": facts,
+    }
 elif payload["mode"] == "retire-departed-agents":
     registry = context.fleet_registry
     if registry is None:
         raise ValueError("the agent registry is not enabled in this Pod")
     retired = []
+    accepted_identities = []
     failures = {}
     for item in payload["items"]:
         key = f"{item['cluster_id']}/{item['node_id']}"
         try:
+            accept = item.get("accept_unknown_provider")
+            if accept is not None:
+                if DepartedNodeIdentityAcceptance is None or retire_departed_agent is None:
+                    raise ValueError(
+                        "the control plane predates the unknown-provider-identity exit"
+                    )
+                evidence = item["departed_node_evidence"]
+                verdict = unknown_provider_exit(
+                    store.get_kubernetes_node_inventory(item["cluster_id"]),
+                    item["node_id"],
+                    now=now,
+                    guard=GUARD_AGE,
+                ).as_dict()
+                if item.get("generation") is not None:
+                    recorded = store.get_agent(item["cluster_id"], item["node_id"])
+                    revoked = retire_departed_agent(
+                        registry,
+                        store,
+                        cluster_id=item["cluster_id"],
+                        node_id=item["node_id"],
+                        expected_generation=item["generation"],
+                        expected_lifecycle=item["lifecycle_state"],
+                        expected_last_seen_at=datetime.fromisoformat(
+                            str(item["last_seen_at"]).replace("Z", "+00:00")
+                        ),
+                        evidence=evidence,
+                        transition_id=payload["transition_id"],
+                        reason=accepted_identity_audit(
+                            reference=payload["reference"],
+                            node_id=item["node_id"],
+                            reason=accept["reason"],
+                            kubernetes=verdict,
+                            recorded_instance=str(recorded.node_instance_id or ""),
+                            actor=payload.get("actor"),
+                            plan_sha256=payload.get("admin_plan_sha256"),
+                        ),
+                        now=now,
+                        accept_unknown_provider=True,
+                    )
+                    retired.append(
+                        {
+                            "agent": key,
+                            "generation": revoked.generation,
+                            "transition_id": revoked.transition_id,
+                            "lifecycle_state": revoked.lifecycle_state.value,
+                        }
+                    )
+                else:
+                    try:
+                        current = store.get_agent(item["cluster_id"], item["node_id"])
+                    except NotFoundError:
+                        current = None
+                    if (
+                        current is not None
+                        and current.lifecycle_state is not AgentLifecycleState.REVOKED
+                    ):
+                        raise ValueError(
+                            "an Agent record for the node is "
+                            f"{current.lifecycle_state.value}; plan again"
+                        )
+                    refusal = unknown_identity_refusal(
+                        store,
+                        cluster_id=item["cluster_id"],
+                        node_id=item["node_id"],
+                        provider=evidence.get("provider"),
+                        recorded_instance=(
+                            current.node_instance_id if current is not None else None
+                        ),
+                        now=now,
+                    )
+                    if refusal is not None:
+                        raise ValueError(
+                            f"an unknown provider identity is not accepted: {refusal}"
+                        )
+                store.save_departed_node_identity_acceptance(
+                    DepartedNodeIdentityAcceptance(
+                        cluster_id=item["cluster_id"],
+                        node_id=item["node_id"],
+                        change_reference=payload["reference"],
+                        actor=str(payload.get("actor") or "unknown"),
+                        reason=accept["reason"],
+                        accepted_at=now,
+                        kubernetes=verdict,
+                    )
+                )
+                accepted_identities.append(key)
+                continue
             if retire_departed_agent is not None:
                 evidence = item["departed_node_evidence"]
                 recorded = store.get_agent(item["cluster_id"], item["node_id"])
@@ -287,6 +441,7 @@ elif payload["mode"] == "retire-departed-agents":
     result = {
         "mode": "retire-departed-agents-apply",
         "retired_agents": sorted(retired, key=lambda item: item["agent"]),
+        "accepted_identities": sorted(accepted_identities),
         "failed_agents": sorted(failures),
         "failures": dict(sorted(failures.items())),
     }
@@ -319,6 +474,26 @@ def add_arguments(parser: argparse.ArgumentParser) -> None:
         default=[],
         metavar="ID",
         help="retire only this node's Agent record (repeatable)",
+    )
+    parser.add_argument(
+        "--accept-unknown-provider-identity",
+        action="store_true",
+        help=(
+            "with --node and --reason: accept the departure of a node whose "
+            "provider identity is unknown (no EC2 instance id recorded, no "
+            "instance in a HyperPod node name) once every Kubernetes node report "
+            "has left it out for 24 hours or never listed it; retires its Agent "
+            "if it has one and lets the departed-node cleanup end the rest"
+        ),
+    )
+
+
+def selected(arguments: argparse.Namespace) -> bool:
+    """Whether ``workflow-reconcile`` runs this shape (or must refuse its flag)."""
+
+    return bool(
+        getattr(arguments, "retire_departed_agents", False)
+        or getattr(arguments, "accept_unknown_provider_identity", False)
     )
 
 
@@ -547,6 +722,188 @@ def _plan(site: RenderedSite, *, node_ids: Sequence[str]) -> dict[str, Any]:
     return plan
 
 
+def _identity_facts(
+    site: RenderedSite, node_ids: Sequence[str]
+) -> dict[tuple[str, str], dict[str, Any]]:
+    """The control plane's report verdict and ledger presence per cluster and node."""
+
+    result = run_pod_script(
+        site,
+        {
+            "mode": "unknown-identity-facts",
+            "cluster_ids": sorted(
+                str(item["cluster_id"]) for item in site.release_config["clusters"]
+            ),
+            "node_ids": sorted(set(node_ids)),
+        },
+    )
+    facts = result.get("facts")
+    if not isinstance(facts, list) or not all(isinstance(item, dict) for item in facts):
+        raise BootstrapError(
+            "unknown-identity facts from the control plane are invalid"
+        )
+    return {(str(item["cluster_id"]), str(item["node_id"])): item for item in facts}
+
+
+def _accept_item(
+    site: RenderedSite,
+    cluster_id: str,
+    node_id: str,
+    agent: dict[str, Any] | None,
+    fact: dict[str, Any] | None,
+    *,
+    evaluated_at: datetime,
+    kubernetes_inventories: dict[str, dict[str, dict[str, Any]]],
+    read_at: dict[str, dict[str, str]],
+) -> dict[str, Any]:
+    """One node of an unknown-provider-identity acceptance and why it may not be."""
+
+    retire = agent is not None and agent.get("lifecycle_state") != "REVOKED"
+    item: dict[str, Any] = {
+        "agent": _agent_key(cluster_id, node_id),
+        "cluster_id": cluster_id,
+        "node_id": node_id,
+        **({field: agent.get(field) for field in RECORD_FIELDS} if agent else {}),
+        "terminalization": ACCEPT_UNKNOWN_PROVIDER,
+        "retire": retire,
+    }
+    reasons: list[str] = []
+    if retire and agent is not None:
+        reasons.extend(
+            agent_retirement_reasons(
+                agent.get("lifecycle_state"),
+                agent.get("last_seen_at"),
+                agent.get("lease_expires_at"),
+                evaluated_at=evaluated_at,
+            )
+        )
+    target = reconcile.cluster_target(site, cluster_id)
+    provider = cluster_provider_of(target)
+    if provider_identity(
+        provider, node_id, agent.get("node_instance_id") if agent else None
+    ):
+        reasons.append(
+            "the node's provider identity is known; retire it on the provider's "
+            "proof, without --accept-unknown-provider-identity"
+        )
+    inventory = kubernetes_inventories.get(cluster_id)
+    if inventory is None:
+        read_at[cluster_id] = {"kubernetes": datetime.now(timezone.utc).isoformat()}
+        inventory = reconcile.cluster_nodes(site, cluster_id)
+        kubernetes_inventories[cluster_id] = inventory
+    present = inventory.get(node_id) is not None
+    if present:
+        reasons.append(KUBERNETES_PRESENT_REASON)
+    verdict = dict((fact or {}).get("exit") or {})
+    if not verdict.get("open"):
+        reasons.append(
+            "an unknown provider identity is not accepted yet: "
+            + str(verdict.get("blocker") or "the control plane gave no report verdict")
+        )
+    item["node_evidence"] = {
+        "node_id": node_id,
+        "exists": present,
+        "provider": provider,
+        "instance_id": None,
+        "absent_from_kubernetes": not present,
+        "absent_from_provider": False,
+        "provider_identity": {"known": False},
+        "sources": {"kubernetes": {"consulted": True, "present": present}},
+    }
+    item["kubernetes_reports"] = {
+        "open": bool(verdict.get("open")),
+        "never_reported": bool(verdict.get("never_reported")),
+    }
+    item["kubernetes_reports_read"] = {
+        key: verdict.get(key)
+        for key in ("absent_since", "chain_started_at", "received_at", "opens_at")
+    }
+    item["evidence_read_at"] = dict(read_at[cluster_id])
+    item["eligible"] = not reasons
+    item["reasons"] = reasons
+    return item
+
+
+def _accept_plan(site: RenderedSite, *, node_ids: Sequence[str]) -> dict[str, Any]:
+    """The plan of ``--accept-unknown-provider-identity``: named nodes only.
+
+    A node is found where the fleet has an Agent record for it (any state) or,
+    without one, where the control plane's departed-node ledger names it; a
+    node found in more than one managed cluster is refused, never guessed.
+    """
+
+    inventory = _inventory(site)
+    evaluated_at = datetime.fromisoformat(inventory["evaluated_at"])
+    if evaluated_at.tzinfo is None:
+        raise BootstrapError("agent inventory clock is not timezone-aware")
+    agents = {
+        (str(item.get("cluster_id")), str(item.get("node_id"))): item
+        for item in inventory["agents"]
+    }
+    facts = _identity_facts(site, node_ids)
+    kubernetes_inventories: dict[str, dict[str, dict[str, Any]]] = {}
+    read_at: dict[str, dict[str, str]] = {}
+    items: list[dict[str, Any]] = []
+    for node_id in sorted({str(item).strip() for item in node_ids}):
+        clusters = sorted(
+            {cluster for cluster, node in agents if node == node_id}
+            | {
+                cluster
+                for (cluster, node), fact in facts.items()
+                if node == node_id and fact.get("ledger")
+            }
+        )
+        if len(clusters) != 1:
+            items.append(
+                {
+                    "agent": node_id,
+                    "node_id": node_id,
+                    "terminalization": ACCEPT_UNKNOWN_PROVIDER,
+                    "eligible": False,
+                    "reasons": [
+                        "no Agent record and no departed-node ledger line names the "
+                        "node in any managed cluster"
+                        if not clusters
+                        else f"the node is named in several managed clusters: {clusters}"
+                    ],
+                }
+            )
+            continue
+        cluster_id = clusters[0]
+        items.append(
+            _accept_item(
+                site,
+                cluster_id,
+                node_id,
+                agents.get((cluster_id, node_id)),
+                facts.get((cluster_id, node_id)),
+                evaluated_at=evaluated_at,
+                kubernetes_inventories=kubernetes_inventories,
+                read_at=read_at,
+            )
+        )
+    plan = {
+        "schema_version": 1,
+        "mode": "accept-unknown-provider-identity-plan",
+        "evaluated_at": inventory["evaluated_at"],
+        "site_identity": reconcile._site_identity(site),
+        "discovery": {
+            "named": len(items),
+            "eligible": sum(1 for item in items if item["eligible"]),
+        },
+        "items": items,
+    }
+    plan["plan_sha256"] = _canonical_sha256(
+        {
+            "schema_version": plan["schema_version"],
+            "mode": plan["mode"],
+            "site_identity": plan["site_identity"],
+            "items": plan_digest_items(items),
+        }
+    )
+    return plan
+
+
 def _plan_drift(
     saved_items: list[dict[str, Any]], current_items: list[dict[str, Any]]
 ) -> list[str]:
@@ -613,6 +970,39 @@ def apply_entry(item: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def apply_accept_entry(item: dict[str, Any], reason: str) -> dict[str, Any]:
+    """The Pod's entry for one accepted node: the Agent's keys when it is retired."""
+
+    entry: dict[str, Any] = {
+        "cluster_id": str(item["cluster_id"]),
+        "node_id": str(item["node_id"]),
+        "accept_unknown_provider": {"reason": reason},
+        "departed_node_evidence": {
+            **{
+                key: item["node_evidence"].get(key)
+                for key in (
+                    "node_id",
+                    "instance_id",
+                    "provider",
+                    "absent_from_kubernetes",
+                    "absent_from_provider",
+                    "sources",
+                )
+            },
+            "read_at": dict(item.get("evidence_read_at") or {}),
+        },
+    }
+    if item.get("retire"):
+        entry.update(
+            {
+                "generation": int(item["generation"]),
+                "lifecycle_state": str(item["lifecycle_state"]),
+                "last_seen_at": str(item["last_seen_at"]),
+            }
+        )
+    return entry
+
+
 def run_retire_departed_agents(
     site: RenderedSite,
     state_dir: Path,
@@ -620,6 +1010,8 @@ def run_retire_departed_agents(
     node_ids: Sequence[str] = (),
     reference: str | None = None,
     dry_run: bool = False,
+    accept_unknown_provider: bool = False,
+    reason: str | None = None,
 ) -> dict[str, Any]:
     """Plan, and unless ``dry_run``, retire, in one invocation.
 
@@ -635,6 +1027,19 @@ def run_retire_departed_agents(
     if any(not str(item).strip() for item in node_ids):
         raise BootstrapError("--node must not be blank")
     requested = [str(item).strip() for item in node_ids]
+    accepted_reason = (reason or "").strip()
+    if accept_unknown_provider:
+        if not requested:
+            raise BootstrapError(
+                "--accept-unknown-provider-identity needs --node: an unknown "
+                "provider identity is accepted node by node, never discovered"
+            )
+        if not dry_run and not accepted_reason:
+            raise BootstrapError("--accept-unknown-provider-identity requires --reason")
+        if len(accepted_reason) > ACCEPT_REASON_LIMIT:
+            raise BootstrapError(
+                f"--reason must be at most {ACCEPT_REASON_LIMIT} characters"
+            )
     normalized_reference = reconcile._validate_request(
         workflow_ids=(),
         incident_ids=(),
@@ -642,7 +1047,13 @@ def run_retire_departed_agents(
         reference=reference,
         dry_run=dry_run,
     )
-    plan = _plan(site, node_ids=requested)
+
+    def make_plan(nodes: Sequence[str]) -> dict[str, Any]:
+        if accept_unknown_provider:
+            return _accept_plan(site, node_ids=nodes)
+        return _plan(site, node_ids=nodes)
+
+    plan = make_plan(requested)
     if dry_run:
         return {**plan, "dry_run": True}
     assert normalized_reference is not None
@@ -661,7 +1072,7 @@ def run_retire_departed_agents(
     else:
         # Re-planned for exactly the Agents about to be written and compared
         # field by field with the plan just made.
-        current = _plan(site, node_ids=[str(item["node_id"]) for item in eligible])
+        current = make_plan([str(item["node_id"]) for item in eligible])
         drift = _plan_drift(eligible, list(current["items"]))
         if drift:
             raise BootstrapError(
@@ -680,7 +1091,12 @@ def run_retire_departed_agents(
             site,
             {
                 "mode": RETIRE_DEPARTED_AGENTS,
-                "items": [apply_entry(item) for item in current["items"]],
+                "items": [
+                    apply_accept_entry(item, accepted_reason)
+                    if accept_unknown_provider
+                    else apply_entry(item)
+                    for item in current["items"]
+                ],
                 "reference": normalized_reference,
                 "actor": actor,
                 "admin_plan_sha256": current["plan_sha256"],
@@ -708,11 +1124,19 @@ def retire_departed_agents_command(
 ) -> dict[str, Any]:
     """The CLI entry: refuse selectors of the other shapes, then run."""
 
+    accept = bool(getattr(arguments, "accept_unknown_provider_identity", False))
+    if not getattr(arguments, "retire_departed_agents", False):
+        raise BootstrapError(
+            "--accept-unknown-provider-identity is taken by --retire-departed-agents only"
+        )
     conflicts = conflicting_flags(arguments)
+    if getattr(arguments, "reason", None) and not accept:
+        conflicts.append("--reason without --accept-unknown-provider-identity")
     if conflicts:
         raise BootstrapError(
-            "--retire-departed-agents takes --node, --reference and --dry-run only; "
-            "not " + ", ".join(conflicts)
+            "--retire-departed-agents takes --node, --reference, --dry-run and, "
+            "with --accept-unknown-provider-identity, --reason only; not "
+            + ", ".join(conflicts)
         )
     return run_retire_departed_agents(
         site,
@@ -720,4 +1144,6 @@ def retire_departed_agents_command(
         node_ids=tuple(arguments.node),
         reference=arguments.reference,
         dry_run=bool(getattr(arguments, "dry_run", False)),
+        accept_unknown_provider=accept,
+        reason=getattr(arguments, "reason", None),
     )

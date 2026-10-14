@@ -6,7 +6,8 @@ reporting at once must not lose each other's absences. The ledger is one
 record per departed node, written by the single cleanup that holds the
 periodic task lease. A spare release is written by the administrator's
 ``config spare --release`` alone and only read by the cleanup, so it is a
-record of its own rather than a field the cleanup would rewrite.
+record of its own rather than a field the cleanup would rewrite; so is the
+administrator's acceptance of an unknown provider identity.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from typing import cast
 
 from gpu_fault.departed_nodes import (
     DepartedNodeCleanupRecord,
+    DepartedNodeIdentityAcceptance,
     DepartedNodeSpareRelease,
     departed_node_cleanup_key,
 )
@@ -36,6 +38,7 @@ from gpu_fault.store.shared.primitives import (
 INVENTORY_KIND = "kubernetes_node_inventory"
 CLEANUP_KIND = "departed_node_cleanup"
 SPARE_RELEASE_KIND = "departed_node_spare_release"
+IDENTITY_ACCEPTANCE_KIND = "departed_node_identity_acceptance"
 
 
 class SharedDepartedNodeMixin:
@@ -107,4 +110,30 @@ class SharedDepartedNodeMixin:
         with self._statement_guard():
             self._delete(
                 SPARE_RELEASE_KIND, departed_node_cleanup_key(cluster_id, node_id)
+            )
+
+    def save_departed_node_identity_acceptance(
+        self, acceptance: DepartedNodeIdentityAcceptance
+    ) -> None:
+        with self._statement_guard():
+            self._put(IDENTITY_ACCEPTANCE_KIND, acceptance.key, acceptance)
+
+    def list_departed_node_identity_acceptances(
+        self, cluster_id: str | None = None
+    ) -> list[DepartedNodeIdentityAcceptance]:
+        acceptances = cast(
+            list[DepartedNodeIdentityAcceptance], self._list(IDENTITY_ACCEPTANCE_KIND)
+        )
+        return sorted(
+            (item for item in acceptances if cluster_id in (None, item.cluster_id)),
+            key=lambda item: (item.cluster_id, item.node_id),
+        )
+
+    def delete_departed_node_identity_acceptance(
+        self, cluster_id: str, node_id: str
+    ) -> None:
+        with self._statement_guard():
+            self._delete(
+                IDENTITY_ACCEPTANCE_KIND,
+                departed_node_cleanup_key(cluster_id, node_id),
             )

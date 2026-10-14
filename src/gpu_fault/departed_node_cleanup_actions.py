@@ -145,6 +145,16 @@ def incident_command(incident_id: str) -> str:
     )
 
 
+def accept_identity_command(node_id: str) -> str:
+    """The administrator's exit for a node whose provider identity is unknown."""
+
+    return (
+        f"gpu-fault-admin workflow-reconcile {_STATE_DIR} --retire-departed-agents "
+        f"--node {node_id} --accept-unknown-provider-identity --reason <why> "
+        "--dry-run, then without --dry-run and with --reference <change>"
+    )
+
+
 def spare_command(node_id: str, cluster_id: str) -> str:
     return (
         f"gpu-fault-admin config spare {_STATE_DIR} --node {node_id} --cluster-id "
@@ -231,6 +241,9 @@ class DepartureWrites:
     pending: frozenset[str]
     evidence: Mapping[str, Mapping[str, Any]]
     waiting_ttl: timedelta | None = None
+    #: Proven nodes whose departure rests on the administrator's acceptance of
+    #: an unknown provider identity, not on the provider's answer.
+    accepted: frozenset[str] = frozenset()
 
     def clean(
         self,
@@ -362,6 +375,20 @@ class DepartureWrites:
         if incident.state is IncidentState.RECOVERED:
             return
         evidence: list[NodeIsolationEvidence] | None = None
+        accepted = sorted(set(incident.node_ids) & self.accepted)
+        if incident.state is IncidentState.QUARANTINED and accepted:
+            # The isolation is cleared only on the provider's proof; the
+            # administrator's acceptance answers whether the node left.
+            outcome.blockers.append(
+                Blocker(
+                    INCIDENT_NOT_CLOSABLE,
+                    f"incident {incident_id} is QUARANTINED and the departure of "
+                    f"{', '.join(accepted)} rests on the administrator's acceptance "
+                    "of an unknown provider identity: no close clears an isolation "
+                    "without the provider's proof",
+                )
+            )
+            return
         if incident.state is IncidentState.QUARANTINED:
             # Every node is proven departed (``_incident``): the departure is
             # the isolation evidence, judged by the closure service itself.
@@ -456,9 +483,16 @@ class DepartureWrites:
                 "instance_id": self.evidence[node].get("instance_id"),
                 "provider": self.evidence[node].get("provider"),
                 "absent_from_kubernetes": True,
-                "absent_from_provider": True,
+                "absent_from_provider": (
+                    self.evidence[node].get("absent_from_provider") is True
+                ),
                 "sources": self.evidence[node].get("sources"),
                 "read_at": dict(self.evidence[node].get("read_at") or {}),
+                **(
+                    {"provider_identity": self.evidence[node]["provider_identity"]}
+                    if "provider_identity" in self.evidence[node]
+                    else {}
+                ),
             }
             for node in sorted(incident.node_ids)
         ]
@@ -536,6 +570,15 @@ def departure_reason(evidence: list[Mapping[str, Any]], reference: str) -> str:
         sources = node.get("sources") or {}
         label = "EC2" if "ec2" in sources else "HyperPod"
         read_at = node.get("read_at") or {}
+        accepted = (node.get("provider_identity") or {}).get("accepted")
+        if accepted:
+            parts.append(
+                f"{node.get('node_id')} absent from Kubernetes since "
+                f"{node.get('kubernetes_absent_since')}, its provider identity "
+                f"unknown and the departure accepted by {accepted.get('actor')} "
+                f"({accepted.get('change_reference')}): {accepted.get('reason')}"
+            )
+            continue
         parts.append(
             f"{node.get('node_id')} absent from Kubernetes since "
             f"{node.get('kubernetes_absent_since')}, {label} no longer has "
