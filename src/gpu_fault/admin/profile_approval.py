@@ -17,6 +17,8 @@ from gpu_fault.digests import SHA256_PATTERN
 PROFILE_PLAN = Path("release-deploy/profile-plan.json")
 PROFILE_APPROVAL = Path("release-deploy/profile-approval.json")
 PROFILE_APPROVAL_ARCHIVE = Path("release-deploy/profile-approvals")
+#: The audit file of a plan approved again after an earlier round ended.
+EARLIER_ROUNDS = "earlier-rounds.json"
 #: ``change_kind`` of a plan that moves GPU clusters to their own Runtime
 #: Profile version (``cluster_join_profile``); every other kind is a plan of
 #: the site profile (``scripts/release_deploy_profile.py``).
@@ -349,7 +351,9 @@ def approve_profile(
     change it under them and make an approved plan unwinnable.
 
     Refusals name the pending plan's digest so the operator can see whether
-    the plan they reviewed is still the one on disk.
+    the plan they reviewed is still the one on disk. A plan approved before
+    whose approval was superseded or consumed is approved anew; its earlier
+    round stays in the archive (``_keep_earlier_round``).
     """
 
     normalized = reference.strip()
@@ -414,13 +418,99 @@ def approve_profile(
             "approved_at": _utc_timestamp(approved_at),
             "approver_identity": approver,
         }
+        _keep_earlier_round(state_dir, digest)
         _archive_initial_approval(
             state_dir,
             plan=plan,
             record=record,
         )
+        _index_earlier_rounds(state_dir, digest, record)
         write_json_atomic(approval_path, record)
         return record
+
+
+def _earlier_rounds(state_dir: Path, digest: str) -> list[tuple[int, Path]]:
+    """``(n, profile-approvals/<plan_sha256>.<n>/)`` of every earlier round."""
+
+    archive = profile_approval_archive_path(state_dir, digest)
+    return sorted(
+        (int(suffix), path)
+        for path in archive.parent.glob(f"{digest}.*")
+        if path.is_dir() and (suffix := path.name.rsplit(".", 1)[1]).isdigit()
+    )
+
+
+def _keep_earlier_round(state_dir: Path, digest: str) -> Path | None:
+    """Move an earlier approval round of ``digest`` beside the new one.
+
+    A plan comes back under the same digest when its approval was superseded
+    before anything consumed it -- the plan file is one per site, so another
+    plan's review took its place (live shape: a ``deploy --approve-profile-plan``
+    of a new cluster's join, whose release archived the approval SUPERSEDED,
+    and the join then wrote the same plan again) -- or when a consumed change
+    was undone. That round's archive is immutable evidence and refused every
+    new approval of the plan ("archived Profile approval differs from the
+    active approval"), so the plan could never be approved again. A new
+    explicit approval starts a new round instead: the earlier one moves, as it
+    is, to ``profile-approvals/<plan_sha256>.<n>/``. Only a new record gets
+    here, so no approval of ``digest`` is active; nothing is approved for the
+    operator, and an approval still covers exactly the pending plan.
+    """
+
+    archive = profile_approval_archive_path(state_dir, digest)
+    if not archive.exists():
+        return None
+    rounds = _earlier_rounds(state_dir, digest)
+    earlier = archive.with_name(
+        f"{digest}.{max((n for n, _ in rounds), default=0) + 1}"
+    )
+    archive.rename(earlier)
+    return earlier
+
+
+def _index_earlier_rounds(state_dir: Path, digest: str, record: dict[str, Any]) -> None:
+    """The audit of a plan approved more than once.
+
+    ``earlier-rounds.json`` in the current round names each earlier round, how
+    it ended (``SUPERSEDED``, ``CONSUMED`` or ``UNFINISHED``) and who approved
+    it, beside the approval that reopened the plan.
+    """
+
+    rounds = _earlier_rounds(state_dir, digest)
+    if not rounds:
+        return
+
+    def summary(path: Path) -> dict[str, Any]:
+        try:
+            earlier = _read_json(path / "approval.json", "archived Profile approval")
+        except ProfileApprovalError:
+            earlier = {}
+        status = (
+            "CONSUMED"
+            if (path / "consumed.json").is_file()
+            else "SUPERSEDED"
+            if (path / "superseded.json").is_file()
+            else "UNFINISHED"
+        )
+        return {
+            "archive": path.name,
+            "status": status,
+            "reference": earlier.get("reference"),
+            "approver_identity": _approver_identity(earlier),
+            "approved_at": earlier.get("approved_at"),
+        }
+
+    write_json_atomic(
+        profile_approval_archive_path(state_dir, digest) / EARLIER_ROUNDS,
+        {
+            "schema_version": 1,
+            "plan_sha256": digest,
+            "reference": record["reference"],
+            "approver_identity": record["approver_identity"],
+            "approved_at": record["approved_at"],
+            "earlier_rounds": [summary(path) for _number, path in rounds],
+        },
+    )
 
 
 def approve_profile_plan_inline(
