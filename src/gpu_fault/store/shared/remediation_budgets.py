@@ -29,7 +29,7 @@ stays fenced by the predecessor and node-busy gates.
 from __future__ import annotations
 
 from collections import Counter
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from datetime import datetime
 
 from gpu_fault.execution.node_action_uncertainty import has_unresolved_node_action
@@ -122,11 +122,29 @@ def apply_remediation_budget(
 ) -> WorkflowRequest:
     """Admit ``workflow`` for ``claims`` or raise; with ``hold`` keep its claims.
 
-    Admission checks every scope against ``budget_occupancy``. A hold is the
-    claim of a workflow whose budgeted work has begun: it keeps every scope it
-    holds, adds ``claims`` and is never refused -- a refusal would strand a
-    reset, a reboot or the compensation it owes (§9.5).
+    Admission checks every scope against ``budget_occupancy`` of
+    ``active_workflows`` (every row that may hold one; the in-memory and SQLite
+    stores pass them all). A hold is the claim of a workflow whose budgeted
+    work has begun: it keeps every scope it holds, adds ``claims`` and is never
+    refused -- a refusal would strand a reset, a reboot or the compensation it
+    owes (§9.5).
     """
+
+    occupancy: Mapping[str, int] = (
+        {} if hold else budget_occupancy(active_workflows, claimant=workflow.request_id)
+    )
+    return admit_against_occupancy(workflow, occupancy, claims, hold=hold)
+
+
+def admit_against_occupancy(
+    workflow: WorkflowRequest,
+    occupancy: Mapping[str, int],
+    claims: dict[str, int],
+    *,
+    hold: bool = False,
+) -> WorkflowRequest:
+    """``apply_remediation_budget`` on holders already counted per scope, the
+    claimant's own hold left out (PostgreSQL counts its RUNNING holders in SQL)."""
 
     normalized = {
         str(scope): int(limit)
@@ -144,9 +162,8 @@ def apply_remediation_budget(
         }
         scopes = sorted(set(workflow.remediation_budget_claims) | set(normalized))
     else:
-        occupancy = budget_occupancy(active_workflows, claimant=workflow.request_id)
         for scope, limit in sorted(normalized.items()):
-            active = occupancy[scope]
+            active = occupancy.get(scope, 0)
             if active < limit:
                 continue
             raise RemediationBudgetError(
@@ -173,7 +190,21 @@ def extend_remediation_budget(
     Same counting rule as :func:`apply_remediation_budget`; the scopes the
     workflow already holds stay held, so a refusal changes nothing.
     """
-    extended = apply_remediation_budget(workflow, active_workflows, claims)
+    return extend_against_occupancy(
+        workflow,
+        budget_occupancy(active_workflows, claimant=workflow.request_id),
+        claims,
+    )
+
+
+def extend_against_occupancy(
+    workflow: WorkflowRequest,
+    occupancy: Mapping[str, int],
+    claims: dict[str, int],
+) -> WorkflowRequest:
+    """``extend_remediation_budget`` on holders already counted per scope."""
+
+    extended = admit_against_occupancy(workflow, occupancy, claims)
     return workflow.model_copy(
         update={
             "remediation_budget_claims": sorted(

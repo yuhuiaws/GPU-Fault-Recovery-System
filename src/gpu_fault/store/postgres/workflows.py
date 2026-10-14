@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Collection
 
@@ -14,7 +15,7 @@ from gpu_fault.models import (
 from gpu_fault.store.contracts import ACTIVE_WORKFLOW_INCIDENTS_LIMIT
 from gpu_fault.store.postgres.core import take_advisory_xact_locks
 from gpu_fault.store.postgres.remediation_budget_holders import (
-    budget_candidates,
+    claim_occupancy,
     occupancy_counts,
 )
 from gpu_fault.store.postgres.state_table_storage import (
@@ -30,9 +31,9 @@ from gpu_fault.store.shared.errors import (
     WorkflowLeaseError,
 )
 from gpu_fault.store.shared.remediation_budgets import (
-    apply_remediation_budget,
+    admit_against_occupancy,
     blocked_by_remediation_budget,
-    extend_remediation_budget,
+    extend_against_occupancy,
 )
 from gpu_fault.store.shared.time import utc_text as _utc_text
 from gpu_fault.store.shared.transactional_workflows import (
@@ -651,17 +652,18 @@ class PostgresWorkflowMixin:
             ):
                 raise WorkflowLeaseError("workflow is leased by another executor")
             if remediation_budget_claims is not None:
-                active: list[WorkflowRequest] = []
+                occupancy: Counter[str] = Counter()
                 if scopes and not remediation_budget_hold:
+                    # RUNNING holders are counted in SQL: decoding each one made
+                    # a burst of N admissions N^2 / 2 decodes under the locks.
                     with self._db.cursor() as cursor:
-                        active = [
-                            self._decode("workflow", payload)
-                            for payload in budget_candidates(cursor, request_id, scopes)
-                        ]
+                        occupancy = claim_occupancy(
+                            cursor, request_id, scopes, self._decode
+                        )
                 try:
-                    workflow = apply_remediation_budget(
+                    workflow = admit_against_occupancy(
                         workflow,
-                        active,
+                        occupancy,
                         remediation_budget_claims,
                         hold=remediation_budget_hold,
                     )
@@ -722,14 +724,13 @@ class PostgresWorkflowMixin:
                 or workflow.execution_lease_expires_at <= at
             ):
                 raise WorkflowLeaseError("workflow execution lease is stale")
-            active: list[WorkflowRequest] = []
+            occupancy: Counter[str] = Counter()
             if scopes:
                 with self._db.cursor() as cursor:
-                    active = [
-                        self._decode("workflow", payload)
-                        for payload in budget_candidates(cursor, request_id, scopes)
-                    ]
-            workflow = extend_remediation_budget(workflow, active, claims)
+                    occupancy = claim_occupancy(
+                        cursor, request_id, scopes, self._decode
+                    )
+            workflow = extend_against_occupancy(workflow, occupancy, claims)
             self._put("workflow", request_id, workflow)
             return workflow
 

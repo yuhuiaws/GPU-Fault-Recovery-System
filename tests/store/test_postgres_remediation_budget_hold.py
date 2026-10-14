@@ -10,6 +10,7 @@ dedicated row alike.
 from __future__ import annotations
 
 import os
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
 from threading import Barrier
@@ -20,8 +21,14 @@ from gpu_fault.execution.remediation_budget import (
     RemediationBudgetPolicy,
     remediation_budget_claims,
 )
-from gpu_fault.models import BlockedKind, WorkflowStatus, WorkflowStepStatus
+from gpu_fault.models import (
+    BlockedKind,
+    WorkflowRequest,
+    WorkflowStatus,
+    WorkflowStepStatus,
+)
 from gpu_fault.store import PostgresStore
+from gpu_fault.store.postgres.remediation_budget_holders import claim_occupancy
 from gpu_fault.store.shared.errors import RemediationBudgetError
 from gpu_fault.store.shared.remediation_budgets import budget_occupancy
 from tests._builders import (
@@ -289,7 +296,7 @@ def _blocked_shape(kind: BlockedKind, details: dict[str, bool]) -> dict[str, obj
     }
 
 
-def test_occupancy_matches_the_shared_rule_on_every_row_shape(store):
+def _seed_every_holder_shape(store) -> None:
     shapes = {
         "running": {"status": WorkflowStatus.RUNNING},
         "lapsed": {
@@ -336,6 +343,10 @@ def test_occupancy_matches_the_shared_rule_on_every_row_shape(store):
         )
     )
 
+
+def test_occupancy_matches_the_shared_rule_on_every_row_shape(store):
+    _seed_every_holder_shape(store)
+
     occupancy = store.remediation_budget_occupancy()
 
     assert occupancy == dict(budget_occupancy(store.list_workflows(None, limit=1000)))
@@ -347,6 +358,30 @@ def test_occupancy_matches_the_shared_rule_on_every_row_shape(store):
         "node:blocked-parked": 1,
         "node:pred": 1,
     }
+
+
+def test_a_claims_occupancy_is_the_shared_rule_with_running_holders_counted_in_sql(
+    store, migration_database
+):
+    """One claim's view: RUNNING holders counted in SQL, the BLOCKED rows and
+    the handoff pair decided by the shared rule, the claimant's own hold and
+    the one reserved for it left out."""
+
+    _seed_every_holder_shape(store)
+    rows = store.list_workflows(None, limit=1000)
+    scopes = sorted({scope for row in rows for scope in row.remediation_budget_claims})
+
+    def decode(kind: str, payload) -> WorkflowRequest:
+        assert kind == "workflow", kind
+        return WorkflowRequest.model_validate(payload)
+
+    for claimant in ("workflow-running", "workflow-succ", "workflow-pending-stale"):
+        with migration_database.cursor() as cursor:
+            counted = claim_occupancy(cursor, claimant, scopes, decode)
+        expected = budget_occupancy(rows, claimant=claimant)
+        assert +counted == +Counter({scope: expected[scope] for scope in scopes}), (
+            claimant
+        )
 
 
 def test_a_hold_is_never_refused_and_keeps_what_it_holds(store):

@@ -4,14 +4,15 @@ The counting rule lives in ``gpu_fault.store.shared.remediation_budgets``:
 RUNNING workflows listing a scope, whatever their lease, a BLOCKED record that
 still occupies its node with an unresolved node action, plus a SUPERSEDED
 predecessor whose preempting successor has not claimed yet (its hold is
-reserved for that successor). ``budget_candidates`` returns the rows that rule
-needs for one claim -- the RUNNING and node-occupying BLOCKED rows listing any
-requested scope and both rows of every such handoff -- so ``budget_occupancy``
-decides on exactly what the in-memory and SQLite stores decide on.
-``occupancy_counts`` is the same rule for the whole region: one aggregate over
-the RUNNING rows and the handoffs, plus the node-occupying BLOCKED rows decoded
-for the rule's node-action check (an operator queue, not a fleet-sized set);
-the dispatcher reads it once per tick (starvation guard).
+reserved for that successor). Both reads apply it in two parts: the RUNNING
+holders are counted in SQL -- decoding every holder for every admission made a
+burst of N admissions cost N^2 / 2 decodes under the region scope's lock
+(18.8 s for 350 in one tick, over the 15-s dispatch lease) -- and the
+node-occupying BLOCKED rows and the handoff pairs, an operator queue and a
+moment of a preemption rather than fleet-sized sets, are decoded for the
+shared rule. ``claim_occupancy`` is one claim's view (its requested scopes,
+its own hold left out); ``occupancy_counts`` the region's, which the dispatcher
+reads once per tick (starvation guard, over-limit scopes).
 """
 
 from __future__ import annotations
@@ -20,7 +21,10 @@ from collections import Counter
 from typing import Any, Callable
 
 from gpu_fault.models import WorkflowRequest
-from gpu_fault.store.shared.remediation_budgets import held_while_blocked
+from gpu_fault.store.shared.remediation_budgets import (
+    budget_occupancy,
+    held_while_blocked,
+)
 
 # Preemption handoffs still in progress: the successor flagged to preempt its
 # predecessor waits (PENDING / SAFETY_PENDING, the partial index
@@ -46,15 +50,37 @@ _OCCUPYING_BLOCKED = (
 )
 
 
-def budget_candidates(cursor: Any, claimant: str, scopes: list[str]) -> list[Any]:
-    """Raw payloads of every row that may hold one of ``scopes`` against
-    ``claimant`` (the claimant's own row is left out)."""
+def claim_occupancy(
+    cursor: Any,
+    claimant: str,
+    scopes: list[str],
+    decode: Callable[[str, Any], WorkflowRequest],
+) -> Counter[str]:
+    """Holders of each of ``scopes`` against ``claimant``, its own hold and the
+    one reserved for it left out."""
 
     cursor.execute(
         f"""
+        SELECT claim.scope, count(DISTINCT w.key)
+        FROM gpu_fault_workflow_records w
+        CROSS JOIN LATERAL jsonb_array_elements_text(
+            CASE WHEN jsonb_typeof({_CLAIMS.format(row="w")})='array'
+                 THEN {_CLAIMS.format(row="w")} ELSE '[]'::jsonb END
+        ) AS claim(scope)
+        WHERE w.kind='workflow' AND w.key<>%s AND w.status='RUNNING'
+          AND {_CLAIMS.format(row="w")} ?| %s
+          AND claim.scope = ANY(%s)
+        GROUP BY claim.scope
+        """,
+        (claimant, scopes, scopes),
+    )
+    counts: Counter[str] = Counter(
+        {str(scope): int(count) for scope, count in cursor.fetchall()}
+    )
+    cursor.execute(
+        f"""
         SELECT w.payload FROM gpu_fault_workflow_records w
-        WHERE w.kind='workflow' AND w.key<>%s
-          AND (w.status='RUNNING' OR ({_OCCUPYING_BLOCKED}))
+        WHERE w.kind='workflow' AND w.key<>%s AND {_OCCUPYING_BLOCKED}
           AND {_CLAIMS.format(row="w")} ?| %s
         UNION ALL
         SELECT pair.payload FROM (
@@ -69,7 +95,12 @@ def budget_candidates(cursor: Any, claimant: str, scopes: list[str]) -> list[Any
         """,
         (claimant, scopes, scopes),
     )
-    return [row[0] for row in cursor.fetchall()]
+    counts.update(
+        budget_occupancy(
+            [decode("workflow", row[0]) for row in cursor.fetchall()], claimant=claimant
+        )
+    )
+    return counts
 
 
 def occupancy_counts(

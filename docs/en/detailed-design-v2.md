@@ -3957,6 +3957,10 @@ occupancy read and the `/metrics` gauges:
   occupies its node -- released.
 
 The node of a record that holds no budget stays fenced by the predecessor and node-busy gates while its kind occupies it.
+PostgreSQL applies the rule in two parts: it counts the `RUNNING` holders of the requested scopes in SQL and decodes only the
+node-occupying `BLOCKED` rows and the preemption handoffs the rule has to judge. Decoding every holder for every admission made
+a burst of N admissions N²/2 decodes under the Region scope's lock (measured: 18.8 s for 350 admissions in one tick, over the
+dispatch lease; 6.8 s counted in SQL).
 
 Preemption handoff: when a predecessor gives way to a stronger successor at a step boundary and becomes `SUPERSEDED`, its claim
 is reserved for that successor until the successor claims or ends -- no other workflow takes the slot, the successor is not refused
