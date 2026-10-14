@@ -26,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from urllib.request import Request
@@ -50,7 +51,10 @@ from gpu_fault.node_action_keys import (
     derive_node_action_secret,
     resolve_node_action_secret,
 )
-from gpu_fault.node_installer_reconciler import NodeInstallerReconciler
+from gpu_fault.node_installer_reconciler import (
+    INSTALLER_STATE_ANNOTATION,
+    NodeInstallerReconciler,
+)
 from gpu_fault.regional import RegionalClusterRegistration, cluster_token_sha256
 from gpu_fault_release.regional_release_config import ClusterTarget
 from gpu_fault_release.regional_release_fleet_rollout import target_node_names
@@ -69,6 +73,7 @@ from tests.node_agent.test_node_installer_reconciler import (
     BUNDLE,
     TEMPLATE,
     BatchApi,
+    job,
     template,
 )
 from tests.regional._regional_support import NOW, TOKEN_A
@@ -355,3 +360,48 @@ def test_rotate_token_re_installs_exactly_the_nodes_the_sync_keys() -> None:
     assert all(name in cluster.secret["data"] for name in rolled), (
         "every node the rotation re-installs mounts its own key"
     )
+
+
+def test_an_install_that_failed_before_the_key_restarts_on_the_next_pass() -> None:
+    """No manual Job delete and no backoff: the key's arrival replays the node."""
+
+    _context, app = _control_plane()
+    cluster = Cluster({INSTALLED: _installed_key()})
+    batch = BatchApi()
+    reconciler = _reconciler(cluster, batch)
+
+    def jobs_for_new() -> list[dict[str, Any]]:
+        return [
+            body
+            for _, body in batch.created
+            if body["spec"]["template"]["spec"]["nodeName"] == NEW
+        ]
+
+    reconciler.reconcile_once()
+    (first,) = jobs_for_new()
+    assert cluster.mounts(first) is None, "created while the key was missing"
+    # FailedMount until activeDeadlineSeconds: the Job fails, the node is parked.
+    # (The fake answers a Job by a name fragment; the full name is one.)
+    name = first["metadata"]["name"]
+    batch.jobs[name] = job(condition="Failed", failed_at=datetime.now(UTC))
+    reconciler.reconcile_once()
+    reconciler.reconcile_once()
+    annotations = cluster.nodes[NEW]["metadata"]["annotations"]
+    assert annotations[INSTALLER_STATE_ANNOTATION] == "Failed", annotations
+    assert len(jobs_for_new()) == 1, "without the key the backoff holds, as before"
+    assert not [deleted for deleted in batch.deleted if deleted[0] == name]
+
+    assert _sync(app, cluster).run() == [NEW]
+    result = reconciler.reconcile_once()
+
+    assert result["created"] >= 1, result
+    assert [deleted[0] for deleted in batch.deleted if deleted[0] == name] == [name], (
+        "the failed Job was replaced, not left behind"
+    )
+    replacement = jobs_for_new()[-1]
+    assert len(jobs_for_new()) == 2, "replaced in the first pass after the key landed"
+    assert replacement["metadata"]["name"] == name
+    assert cluster.mounts(replacement) == derive_node_action_secret(SECRET, EKS, NEW)
+    assert cluster.nodes[NEW]["metadata"]["annotations"][
+        INSTALLER_STATE_ANNOTATION
+    ] == ("Installing")

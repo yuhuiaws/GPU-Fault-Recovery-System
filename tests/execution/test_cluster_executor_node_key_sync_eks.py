@@ -19,6 +19,7 @@ cluster is followed by one request per node carrying the EC2 identity
 from __future__ import annotations
 
 import base64
+import copy
 from typing import Any
 
 import pytest
@@ -26,6 +27,11 @@ import pytest
 from gpu_fault.cluster_executor import ClusterExecutorError, NodeActionKeySync
 from gpu_fault.cluster_scope import OWNERSHIP_LABEL
 from gpu_fault.eks_node_evidence import EksNodeEvidence
+from gpu_fault.node_installer_reconciler import (
+    INSTALLER_REASON_ANNOTATION,
+    INSTALLER_STATE_ANNOTATION,
+    NODE_KEY_ADDED_REASON,
+)
 from gpu_fault.node_key_attestation import EksNodeAttestation
 from tests.eks_provider._support import (
     EKS_CLUSTER,
@@ -356,3 +362,127 @@ def test_a_node_being_deleted_is_not_keyed() -> None:
 
     assert _sync(client, core, evidence).run() == []
     assert client.requests == []
+
+
+class VersionedCore(KeyedCore):
+    """Nodes as the API server keeps them: listed as copies, patched under a
+    resourceVersion precondition, ``on_secret_patch`` runs between the two."""
+
+    def __init__(self, nodes: list[dict], keys: dict[str, str]) -> None:
+        super().__init__(nodes, keys)
+        self.node_patches: list[tuple[str, dict[str, Any]]] = []
+        self.on_secret_patch: Any = None
+
+    def list_node(self, label_selector: str | None = None, **_: Any) -> dict:
+        return copy.deepcopy(super().list_node(label_selector))
+
+    def read_node(self, name: str, **_: Any) -> dict[str, Any]:
+        return copy.deepcopy(super().read_node(name))
+
+    def patch_namespaced_secret(
+        self, name: str, namespace: str, body: dict[str, Any]
+    ) -> None:
+        super().patch_namespaced_secret(name, namespace, body)
+        if self.on_secret_patch is not None:
+            self.on_secret_patch(self)
+
+    def patch_node(self, name: str, body: dict[str, Any], **_: Any) -> dict:
+        self.node_patches.append((name, copy.deepcopy(body)))
+        metadata = self.nodes[name]["metadata"]
+        if body["metadata"].get("resourceVersion") not in {
+            None,
+            metadata["resourceVersion"],
+        }:
+            error = RuntimeError("the object has been modified")
+            error.status = 409  # type: ignore[attr-defined]
+            raise error
+        metadata["resourceVersion"] = str(int(metadata["resourceVersion"]) + 1)
+        return super().patch_node(name, body)
+
+
+REPLAY = {
+    INSTALLER_STATE_ANNOTATION: "Retrying",
+    INSTALLER_REASON_ANNOTATION: NODE_KEY_ADDED_REASON,
+}
+
+
+def _installer_world(states: dict[str, str]) -> tuple[VersionedCore, Any]:
+    addresses = {
+        NEW: ("i-0b000021", "10.0.36.21"),
+        SIBLING: ("i-0b000022", "10.0.40.17"),
+    }
+    nodes, instances = [], []
+    for name, state in states.items():
+        instance_id, address = addresses[name]
+        item = _node(name, instance_id, address)
+        item["metadata"]["annotations"] = {INSTALLER_STATE_ANNOTATION: state}
+        nodes.append(item)
+        instances.append(_instance(instance_id, name, address))
+    _core, evidence = _world(nodes, instances)
+    return VersionedCore(nodes, {DEPARTED: KEY_OLD}), evidence
+
+
+def test_a_keyed_node_whose_install_failed_is_handed_back_to_the_reconciler() -> None:
+    """Its Job could not mount the missing key; the reconciler replaces it now."""
+
+    core, evidence = _installer_world({NEW: "Failed", SIBLING: "Installing"})
+
+    added = _sync(AttestingClient(), core, evidence).run()
+
+    assert added == [NEW, SIBLING]
+    assert core.node_patches == [
+        (NEW, {"metadata": {"resourceVersion": "7", "annotations": REPLAY}})
+    ], "a Job still running mounts the key by itself; only the failed one is replayed"
+    assert core.nodes[NEW]["metadata"]["annotations"] == REPLAY
+
+
+def test_a_node_the_reconciler_moved_on_meanwhile_is_not_replayed() -> None:
+    """A Retrying written over Installing would replay an install about to succeed."""
+
+    core, evidence = _installer_world({NEW: "Failed"})
+
+    def reconciler_retried(cluster: VersionedCore) -> None:
+        metadata = cluster.nodes[NEW]["metadata"]
+        metadata["annotations"] = {INSTALLER_STATE_ANNOTATION: "Installing"}
+        metadata["resourceVersion"] = "8"
+
+    core.on_secret_patch = reconciler_retried
+
+    assert _sync(AttestingClient(), core, evidence).run() == [NEW]
+
+    assert [name for name, _body in core.node_patches] == [NEW], (
+        "one fenced attempt, refused; the re-read shows the node moved on"
+    )
+    assert core.nodes[NEW]["metadata"]["annotations"] == {
+        INSTALLER_STATE_ANNOTATION: "Installing"
+    }
+
+
+def test_an_unrelated_node_update_is_re_read_and_the_replay_still_lands() -> None:
+    core, evidence = _installer_world({NEW: "Failed"})
+
+    def status_update(cluster: VersionedCore) -> None:
+        cluster.nodes[NEW]["metadata"]["resourceVersion"] = "9"
+
+    core.on_secret_patch = status_update
+
+    assert _sync(AttestingClient(), core, evidence).run() == [NEW]
+
+    assert [body["metadata"]["resourceVersion"] for _n, body in core.node_patches] == [
+        "7",
+        "9",
+    ]
+    assert core.nodes[NEW]["metadata"]["annotations"] == REPLAY
+
+
+def test_a_node_refused_its_key_is_never_replayed() -> None:
+    core, evidence = _installer_world({NEW: "Failed"})
+    conflict = ClusterExecutorError(
+        "regional control plane rejected request (409): CPU NodeName key conflict",
+        status_code=409,
+    )
+
+    with pytest.raises(ClusterExecutorError, match="key conflict"):
+        _sync(AttestingClient({NEW: conflict}), core, evidence).run()
+
+    assert core.node_patches == []

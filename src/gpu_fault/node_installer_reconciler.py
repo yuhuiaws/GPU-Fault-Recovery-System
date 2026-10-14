@@ -50,6 +50,10 @@ INSTALLER_REASON_ANNOTATION = "gpu-fault.io/installer-reason"
 # without this the very next pass would recreate it and the slot would churn
 # every 5 s instead of being held for 840 s.
 INSTALLER_RETRY_AFTER_ANNOTATION = "gpu-fault.io/installer-retry-after"
+#: ``installer-reason`` next to ``installer-state=Retrying`` when the
+#: executor's node-key sync has just added the key of a node whose installer
+#: Job failed without it: replace that Job now instead of after the backoff.
+NODE_KEY_ADDED_REASON = "NodeActionKeyAdded"
 #: Every node annotation this reconciler writes, in one place, because two
 #: other things have to remove them all: cluster removal
 #: (``gpu_fault.admin.cluster_removal``) and the clean-redeploy inventory
@@ -701,29 +705,9 @@ class NodeInstallerReconciler:
                 )
                 if retry_after is not None and self.now() < retry_after:
                     return "unsupported"
-            if not budget.allows_create:
-                return "deferred"
-            try:
-                body = self.build_job(node, name)
-            except ValueError as build_error:
-                LOGGER.error("node %s cannot be installed: %s", node_name, build_error)
-                return "unsupported"
-            try:
-                self.batch.create_namespaced_job(
-                    self.namespace, body, _request_timeout=REQUEST_TIMEOUT
-                )
-            except Exception as create_error:
-                if _api_status(create_error) != 409:
-                    raise
-            # Before the annotation patch: the slot is spent the moment the Job
-            # exists, whether or not this node's patch lands. The counter too.
-            budget.consume()
-            self.metrics.inc("jobs_created_total")
-            self._mark_node(
-                node_name, node_uid, "Installing", boot_id, annotations=annotations
+            return self._create_job(
+                node, name, budget=budget, boot_id=boot_id, annotations=annotations
             )
-            LOGGER.info("created installer Job %s for node %s", name, node_name)
-            return "created"
 
         if _job_condition(job, "Complete"):
             if not identity_matches or installer_state == "Retrying":
@@ -741,6 +725,14 @@ class NodeInstallerReconciler:
             )
             return "succeeded"
         if _job_condition(job, "Failed"):
+            if (
+                installer_state == "Retrying"
+                and annotations.get(INSTALLER_REASON_ANNOTATION)
+                == NODE_KEY_ADDED_REASON
+            ):
+                return self._replace_failed_job(
+                    node, name, budget=budget, boot_id=boot_id, annotations=annotations
+                )
             if installer_state != "Failed":
                 # First sight of this failure; a node parked in Failed is seen
                 # again every pass until its backoff elapses.
@@ -800,6 +792,93 @@ class NodeInstallerReconciler:
             )
             return "unsupported"
         return "running"
+
+    def _create_job(
+        self,
+        node: Any,
+        name: str,
+        *,
+        budget: _InstallBudget,
+        boot_id: str | None,
+        annotations: dict[str, str],
+        replay: bool = False,
+    ) -> str:
+        """Create ``node``'s installer Job ``name`` when the budget has a slot.
+
+        A 409 normally means a previous pass created the Job and lost its
+        annotation patch, so it counts as created. Right after a replay's
+        delete it means the old Job is still going away: the node stays
+        ``Retrying`` and the next pass creates the Job.
+        """
+
+        metadata = _metadata(node)
+        node_name = str(_value(metadata, "name"))
+        node_uid = str(_value(metadata, "uid"))
+        if not budget.allows_create:
+            return "deferred"
+        try:
+            body = self.build_job(node, name)
+        except ValueError as build_error:
+            LOGGER.error("node %s cannot be installed: %s", node_name, build_error)
+            return "unsupported"
+        try:
+            self.batch.create_namespaced_job(
+                self.namespace, body, _request_timeout=REQUEST_TIMEOUT
+            )
+        except Exception as create_error:
+            if _api_status(create_error) != 409:
+                raise
+            if replay:
+                return "running"
+        # Before the annotation patch: the slot is spent the moment the Job
+        # exists, whether or not this node's patch lands. The counter too.
+        budget.consume()
+        self.metrics.inc("jobs_created_total")
+        self._mark_node(
+            node_name, node_uid, "Installing", boot_id, annotations=annotations
+        )
+        LOGGER.info("created installer Job %s for node %s", name, node_name)
+        return "created"
+
+    def _replace_failed_job(
+        self,
+        node: Any,
+        name: str,
+        *,
+        budget: _InstallBudget,
+        boot_id: str | None,
+        annotations: dict[str, str],
+    ) -> str:
+        """Replace a failed Job in this pass: its node's key has just arrived.
+
+        The executor's node-key sync marks a node ``installer-state=Retrying``
+        with ``installer-reason=NodeActionKeyAdded`` right after it added the
+        node's missing key, and only when the node was ``Failed``: a Job created
+        before the key existed could only sit in ``FailedMount`` until its
+        deadline, so its failure says nothing about the node. Waiting out the
+        backoff would cost up to an hour for nothing, and the attempt is not
+        held against the node. A Job that failed on its own leaves the node
+        ``Failed`` (or this reconciler's own ``Retrying``, without that reason)
+        and keeps the normal backoff.
+        """
+
+        node_name = str(_value(_metadata(node), "name"))
+        self._delete_job(name)
+        self.metrics.inc("retries_scheduled_total")
+        LOGGER.warning(
+            "replacing failed installer Job %s of node %s at once: the node's "
+            "action key was added after the Job could not mount it",
+            name,
+            node_name,
+        )
+        return self._create_job(
+            node,
+            name,
+            budget=budget,
+            boot_id=boot_id,
+            annotations=annotations,
+            replay=True,
+        )
 
     def _delete_job(self, name: str) -> None:
         self.batch.delete_namespaced_job(

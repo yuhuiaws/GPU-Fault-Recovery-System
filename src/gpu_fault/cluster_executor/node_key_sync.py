@@ -31,6 +31,12 @@ A plain EKS node that was never installed is unknown to the control plane
 carrying the EC2 identity ``attester`` read for it
 (``gpu_fault/eks_node_evidence.py``); a node it cannot attest is not
 asked for, and one refused node does not hold back the others.
+
+A node whose installer Job already failed while its key was missing is then
+handed back to the reconciler (``installer-state=Retrying`` with
+``installer-reason=NodeActionKeyAdded``), which replaces the failed Job on its
+next pass instead of after a backoff of up to an hour. A Job still running
+needs nothing -- the kubelet mounts the key once it exists.
 """
 
 from __future__ import annotations
@@ -46,6 +52,11 @@ from gpu_fault.cluster_executor.regional_client import (
 )
 from gpu_fault.cluster_scope import node_selector as scope_node_selector
 from gpu_fault.cluster_scope import selector_matches
+from gpu_fault.node_installer_reconciler import (
+    INSTALLER_REASON_ANNOTATION,
+    INSTALLER_STATE_ANNOTATION,
+    NODE_KEY_ADDED_REASON,
+)
 from gpu_fault.node_key_attestation import NODE_NAME_PATTERN, EksNodeAttestation
 from gpu_fault.node_provider import HYPERPOD_CLUSTER_LABEL as HYPERPOD_CLUSTER_LABEL
 
@@ -255,6 +266,8 @@ class NodeActionKeySync:
                     "ascii"
                 )
         added = self._patch(resource_version, encoded)
+        for name in added:
+            self._request_replay(nodes[name])
         if refused:
             raise ClusterExecutorError(
                 f"no node action key for {len(refused)} node(s): "
@@ -305,6 +318,65 @@ class NodeActionKeySync:
                 "control plane answered a different node set than requested"
             )
         return keys
+
+    def _request_replay(self, node: Any) -> None:
+        """Ask the reconciler to replace a just-keyed node's failed installer Job.
+
+        Only a node whose state still reads ``Failed`` -- its Job failed while
+        the key was missing, so it never ran -- and only through a patch fenced
+        by the Node's ``resourceVersion``: the reconciler may have moved the
+        node on since it was listed, and a ``Retrying`` written over an
+        ``Installing`` would replay an install that is about to succeed. One
+        re-read after a conflict; anything else is a WARNING and the normal
+        backoff, never a failed sync.
+        """
+
+        metadata = _value(node, "metadata", {}) or {}
+        name = str(_value(metadata, "name", "") or "")
+        for _attempt in range(2):
+            annotations = _value(metadata, "annotations", {}) or {}
+            version = _value(metadata, "resource_version") or _value(
+                metadata, "resourceVersion"
+            )
+            if annotations.get(INSTALLER_STATE_ANNOTATION) != "Failed" or not version:
+                return
+            try:
+                self.core.patch_node(
+                    name,
+                    {
+                        "metadata": {
+                            "resourceVersion": str(version),
+                            "annotations": {
+                                INSTALLER_STATE_ANNOTATION: "Retrying",
+                                INSTALLER_REASON_ANNOTATION: NODE_KEY_ADDED_REASON,
+                            },
+                        }
+                    },
+                )
+            except Exception as exc:
+                if _api_status(exc) != 409:
+                    LOGGER.warning(
+                        "could not ask for a new installer Job for node %s: %s",
+                        name,
+                        type(exc).__name__,
+                    )
+                    return
+                try:
+                    metadata = _value(self.core.read_node(name), "metadata", {}) or {}
+                except Exception as read_error:
+                    LOGGER.warning(
+                        "could not re-read node %s: %s",
+                        name,
+                        type(read_error).__name__,
+                    )
+                    return
+                continue
+            LOGGER.warning(
+                "node %s has its action key now; asked the reconciler to replace "
+                "its failed installer Job",
+                name,
+            )
+            return
 
     def _patch(self, resource_version: str, encoded: dict[str, str]) -> list[str]:
         if not encoded:
