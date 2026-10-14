@@ -19,6 +19,7 @@ from scripts.perf import regional_capacity_registry as registry
 from scripts.perf import regional_capacity_suite as base
 from scripts.perf import regional_correlated_action_suite as correlated
 from scripts.perf import regional_integrated_workflow_capacity_suite as integrated
+from scripts.perf import regional_validation_telemetry as telemetry
 from scripts.perf.regional_capacity_resources import RunResources
 from tests.regional._perf_caller_support import PLACEMENT, AmpWire
 
@@ -322,6 +323,12 @@ def caller(
         )
         monkeypatch.setattr(
             module, "wait_for_terminal_drain", lambda *_args, **_kwargs: ({}, [])
+        )
+        # The node-return watch session runs in a CPU Pod; its own tests fake it.
+        monkeypatch.setattr(
+            module,
+            "start_validation_telemetry",
+            lambda **_kwargs: nullcontext(SimpleNamespace(summary={})),
         )
     else:
         harness.amp = AmpWire(monkeypatch)
@@ -773,4 +780,45 @@ def test_integrated_run_records_how_its_workflow_latencies_were_measured(
     assert summary["placement"] == {"start": PLACEMENT, "cluster": "test-aurora"}
     run = caller.report("run.json")
     assert run["simulated_command_completion"] == "per-command"
+    assert run["validation_telemetry"] == "event-driven+periodic-30s"
+
+
+@pytest.mark.parametrize("caller", [correlated], indirect=True, ids=["correlated"])
+def test_correlated_run_publishes_node_return_telemetry_after_recorded_reboots(
+    caller: CallerHarness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The escalated reboots' validation tails wait for telemetry newer than
+    the reboot: the run keeps the node-return watch open from the scenario Job
+    to the end of the terminal drain, and stops it before the teardown purges
+    the run's data."""
+
+    sessions: list[WatchSession] = []
+
+    def start(**options: Any) -> WatchSession:
+        sessions.append(WatchSession(caller.events, **options))
+        return sessions[-1]
+
+    monkeypatch.setattr(correlated, "start_validation_telemetry", start)
+
+    assert caller.run() == 0
+
+    (session,) = sessions
+    assert session.options == {
+        "run_id": "run-a",
+        "clusters": 32,
+        "mode": telemetry.NODE_RETURN_WATCH_MODE,
+        "deadline_seconds": 480,
+    }, "the session covers the scenario timeout and the terminal drain"
+    assert caller.events.index("create:job/gpu-fault-correlated-action") < (
+        caller.events.index("watch-start")
+    ), "the watch starts once the scenario Job exists"
+    assert caller.events.index("watch-start") < caller.events.index("heartbeat"), (
+        "the watch runs while the periodic refresh waits for the Job"
+    )
+    assert caller.events.index("watch-stop") < caller.events.index("teardown"), (
+        "the watcher must end before the run's data is purged"
+    )
+    summary = caller.report("summary.json")
+    assert summary["validation_telemetry"] == {"mode": "event-driven", "publishes": 3}
+    run = caller.report("run.json")
     assert run["validation_telemetry"] == "event-driven+periodic-30s"

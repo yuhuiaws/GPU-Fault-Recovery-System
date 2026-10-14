@@ -40,6 +40,10 @@ if __package__:
         teardown,
         upsert_configmap,
     )
+    from .regional_validation_telemetry import (
+        NODE_RETURN_WATCH_MODE,
+        start_validation_telemetry,
+    )
 else:
     from regional_action_capacity_suite import (
         executor_identity,
@@ -69,6 +73,10 @@ else:
         release_identity,
         teardown,
         upsert_configmap,
+    )
+    from regional_validation_telemetry import (
+        NODE_RETURN_WATCH_MODE,
+        start_validation_telemetry,
     )
 
 
@@ -878,6 +886,8 @@ def write_run_record(
                 "clusters": args.clusters,
                 "scenario_max_seconds": args.scenario_max_seconds,
                 "terminal_drain_seconds": args.terminal_drain_seconds,
+                # How the node-return telemetry is published (性能压测验收方案 §8.3).
+                "validation_telemetry": "event-driven+periodic-30s",
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 **resume_identity(suite_id=run_id, scope=scope, identity=identity),
             },
@@ -906,6 +916,57 @@ def scenario_teardown(
     except Exception as exc:
         return exc
     return None
+
+
+def wait_for_scenario_job(
+    *, run_id: str, clusters: int, timeout_seconds: int
+) -> tuple[str, dict, str]:
+    """``(wait output, Job, status)`` once the scenario Job ends or the wait ends.
+
+    Poll instead of one blocking `kubectl wait`: the scenario runs up to
+    scenario_max_seconds and the fleet compatibility preflight holds
+    destructive steps behind a stale Agent heartbeat, so the run's synthetic
+    Agents are refreshed while it waits (live 2026-09-22). telemetry=True: the
+    validation tail behind an escalated reboot waits for telemetry newer than
+    the reboot (live 2026-09-23); the in-Pod watch publishes it once the reboot
+    is recorded, and this 30 s refresh -- every node stamped with its own write
+    time -- is the fallback.
+    """
+
+    refresh_heartbeats = run_agent_heartbeat_refresher(
+        run_id=run_id,
+        clusters=clusters,
+        lease_seconds=1800,
+        control_fn=control,
+        telemetry=True,
+    )
+    wait_deadline = time.time() + timeout_seconds
+    wait = ""
+    while time.time() < wait_deadline:
+        refresh_heartbeats()
+        job = json.loads(dataplane("get", "job", JOB_NAME, "-o", "json"))
+        done = {
+            str(item.get("type"))
+            for item in job.get("status", {}).get("conditions", [])
+            if str(item.get("status")) == "True"
+        }
+        if done & {"Complete", "Failed"}:
+            wait = "job.batch/%s condition met" % JOB_NAME
+            break
+        time.sleep(10)
+    job = json.loads(dataplane("get", "job", JOB_NAME, "-o", "json"))
+    conditions = {
+        str(item.get("type")): str(item.get("status"))
+        for item in job.get("status", {}).get("conditions", [])
+    }
+    job_status = (
+        "Complete"
+        if conditions.get("Complete") == "True"
+        else "Failed"
+        if conditions.get("Failed") == "True"
+        else "Incomplete"
+    )
+    return wait, job, job_status
 
 
 def main() -> int:
@@ -1004,54 +1065,26 @@ def main() -> int:
             json.dumps(manifest, indent=2, sort_keys=True) + "\n"
         )
         resources.create(manifest)
-        # Poll instead of one blocking `kubectl wait`: the scenario runs up to
-        # scenario_max_seconds and the fleet compatibility preflight holds
-        # destructive steps behind a stale Agent heartbeat, so the run's
-        # synthetic Agents are refreshed while it waits (live 2026-09-22).
-        # telemetry=True: the validation tail behind the escalated RESTART_NODE
-        # rung waits for telemetry newer than the reboot (live 2026-09-23).
-        refresh_heartbeats = run_agent_heartbeat_refresher(
+        # The returned nodes' telemetry follows each recorded reboot (§8.3); the
+        # session ends with the drain, before the teardown purges the run.
+        with start_validation_telemetry(
             run_id=run_id,
             clusters=args.clusters,
-            lease_seconds=1800,
-            control_fn=control,
-            telemetry=True,
-        )
-        wait_deadline = time.time() + timeout_seconds
-        wait = ""
-        while time.time() < wait_deadline:
-            refresh_heartbeats()
-            job = json.loads(dataplane("get", "job", JOB_NAME, "-o", "json"))
-            done = {
-                str(item.get("type"))
-                for item in job.get("status", {}).get("conditions", [])
-                if str(item.get("status")) == "True"
-            }
-            if done & {"Complete", "Failed"}:
-                wait = "job.batch/%s condition met" % JOB_NAME
-                break
-            time.sleep(10)
-        job = json.loads(dataplane("get", "job", JOB_NAME, "-o", "json"))
-        conditions = {
-            str(item.get("type")): str(item.get("status"))
-            for item in job.get("status", {}).get("conditions", [])
-        }
-        job_status = (
-            "Complete"
-            if conditions.get("Complete") == "True"
-            else "Failed"
-            if conditions.get("Failed") == "True"
-            else "Incomplete"
-        )
-        pod_results = collect_logs(artifacts / "pods")
-        if job_status == "Complete":
-            audit, drain_history = wait_for_terminal_drain(
-                run_id,
-                timeout_seconds=args.terminal_drain_seconds,
+            mode=NODE_RETURN_WATCH_MODE,
+            deadline_seconds=timeout_seconds + args.terminal_drain_seconds + 300,
+        ) as validation:
+            wait, job, job_status = wait_for_scenario_job(
+                run_id=run_id, clusters=args.clusters, timeout_seconds=timeout_seconds
             )
-        else:
-            audit = database_audit(run_id)
-            drain_history = []
+            pod_results = collect_logs(artifacts / "pods")
+            if job_status == "Complete":
+                audit, drain_history = wait_for_terminal_drain(
+                    run_id,
+                    timeout_seconds=args.terminal_drain_seconds,
+                )
+            else:
+                audit = database_audit(run_id)
+                drain_history = []
         (artifacts / "terminal-drain.json").write_text(
             json.dumps(drain_history, indent=2, sort_keys=True) + "\n"
         )
@@ -1068,6 +1101,7 @@ def main() -> int:
             "terminal_drain_seconds": args.terminal_drain_seconds,
             "pod_results": pod_results,
             "audit": audit,
+            "validation_telemetry": validation.summary,
         }
         status, errors = verdict(summary, args.clusters)
         summary["status"] = status

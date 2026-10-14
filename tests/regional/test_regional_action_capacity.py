@@ -636,7 +636,7 @@ def test_run_heartbeat_refresh_touches_only_this_runs_active_agents() -> None:
 
     now = datetime(2026, 9, 22, 14, 0, tzinfo=timezone.utc)
     refreshed = seed.refresh_run_agent_heartbeats(
-        Context(), run_id="run-a", clusters=2, now=now, lease_seconds=600
+        Context(), run_id="run-a", clusters=2, lease_seconds=600, clock=lambda: now
     )
 
     assert refreshed == 2, "the two ACTIVE Agents of run-a are refreshed"
@@ -652,7 +652,7 @@ def test_run_heartbeat_refresh_touches_only_this_runs_active_agents() -> None:
     ), "the lease follows the heartbeat"
     with pytest.raises(RuntimeError, match="no synthetic Agent of run"):
         seed.refresh_run_agent_heartbeats(
-            Context(), run_id="run-zzz", clusters=2, now=now, lease_seconds=600
+            Context(), run_id="run-zzz", clusters=2, lease_seconds=600
         )
 
 
@@ -673,9 +673,9 @@ def test_run_agent_heartbeat_refresh_publishes_the_node_return_telemetry() -> No
         context,
         run_id="run-a",
         clusters=1,
-        now=refreshed_at,
         lease_seconds=600,
         publish_telemetry=True,
+        clock=lambda: refreshed_at,
     )
 
     assert count == 1
@@ -712,7 +712,7 @@ def test_run_agent_heartbeat_refresh_publishes_the_node_return_telemetry() -> No
     plain = ApplicationContext(store=build_store())
     plain.store.save_agent(agent)
     MODULE.refresh_run_agent_heartbeats(
-        plain, run_id="run-a", clusters=1, now=refreshed_at, lease_seconds=600
+        plain, run_id="run-a", clusters=1, lease_seconds=600
     )
     assert plain.gpu_metrics.latest("perf-cap-000", node_id) == []
     assert MODULE.synthetic_node_gpu_uuid("actionperf-run-a-c000-w000-node-00") == (

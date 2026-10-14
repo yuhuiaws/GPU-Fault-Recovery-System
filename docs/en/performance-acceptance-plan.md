@@ -746,12 +746,21 @@ This scenario establishes two independent attempts per synthetic cluster:
    `SUCCEEDED` after the node returns.
 
 Simulated nodes produce no telemetry of their own, and post-action validation after a reboot
-accepts only fresh samples later than the reboot barrier; the runner therefore refreshes this
-round's synthetic Agent heartbeats every 30 seconds while waiting, and at the refresh time
-publishes that node's healthy GPU/NVLink metrics (GPU UUIDs consistent with the attempt
-identity), host metrics and all collector success statuses to simulate "the node coming back".
-The refresh writes only this round's `corr-node-*` nodes and does not change production node
-data. The audit requires 2 incidents and 2 workflows per cluster (plus 1 for every cross-record
+accepts only fresh samples later than the reboot barrier (the time the control plane recorded the
+reboot step). From the creation of the scenario Job to the end of the terminal drain the runner
+keeps one `kubectl exec -i` session of the seeding script's `node-return-validation-watch` mode
+in an api-ha Pod (`regional_validation_telemetry.py`, the mechanism of §8.4): right after the
+dispatcher records a node's reboot step it publishes that node's healthy GPU/NVLink metrics (GPU
+UUIDs consistent with the attempt identity), host metrics and all collector success statuses to
+simulate "the node coming back", stamped with the actual write time and published again while
+not strictly later than the barrier; an executor result without the step record publishes
+nothing. The session ends before the teardown purges the round's data. The fallback is the
+heartbeat refresh every 30 seconds while waiting, which publishes the same package with every
+node stamped with its own write time (no longer the refresh script's start).
+`summary.json.validation_telemetry` records the sessions, restarts and barrier-to-publish delays,
+and `validation_telemetry: event-driven+periodic-30s` in `run.json` marks this method. The
+publishes and the refresh write only this round's `corr-node-*` nodes and do not change
+production node data. The audit requires 2 incidents and 2 workflows per cluster (plus 1 for every cross-record
 preemption and plus 1 for every reboot-after successor), every failed reset bound to exactly one
 reboot (an in-record `RESTART_NODE` rung or a `workflow-reboot-after-<id>` successor) with all of
 them `SUCCEEDED` and validated; ownerless reboots and `REPLACE_NODE` rungs number 0. Normally
@@ -1085,8 +1094,8 @@ Every ingress path in `summary.json` must include classified `transport_retries`
 executor must include `claim_error_counts` and bounded, redacted `claim_error_samples`. The burst,
 integrated and action runners' `run.json` and `summary.json` must also include `placement` (the Aurora
 writer instance, its Availability Zone and the control-plane node Availability Zones, §8.1; `recorded=false`
-for an action round that names no Aurora cluster), and the integrated runner's `summary.json` must also
-include `validation_telemetry` (§8.4). All three
+for an action round that names no Aurora cluster), and the integrated and correlated runners' `summary.json`
+must also include `validation_telemetry` (§8.4, §8.3). All three
 runners' `summary.json` must also carry `store_bloat`: `before`/`after` derive, from the `hot_tables`
 section of `postgres-before.json`/`postgres-after.json`, each hot table's live rows, heap pages, index
 pages, `heap_pages_per_live_row`, `index_pages_per_live_row`, `index_min_entries_per_page`, `index_max_pages` (the

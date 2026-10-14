@@ -8,6 +8,8 @@ import threading
 import time
 from collections.abc import Callable, Mapping
 from datetime import datetime, timedelta, timezone
+from functools import partial
+from typing import Any
 
 from gpu_fault.app import ApplicationContext
 from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS, cluster_provider
@@ -82,6 +84,9 @@ NODE_RETURN_TELEMETRY = "node-return"
 CORRELATED_NODE_OFFSET = re.compile(r"^corr-node-.*-c(\d{3})-[a-z]+$")
 #: The integrated suite's event-driven validation telemetry (§8.4).
 VALIDATION_WATCH_MODE = "integrated-validation-watch"
+#: The correlated suite's event-driven node return (§8.3): the same watch over
+#: the run's ``corr-node-*`` Agents and their node-return package.
+NODE_RETURN_WATCH_MODE = "node-return-validation-watch"
 #: Completing any of these is a telemetry barrier: post-action validation
 #: accepts only samples observed after the latest one
 #: (``telemetry_readiness_operations`` in ``adapters/gpu_validation.py``).
@@ -420,9 +425,9 @@ def refresh_run_agent_heartbeats(
     *,
     run_id: str,
     clusters: int,
-    now: datetime,
     lease_seconds: int,
     publish_telemetry: bool = False,
+    clock: Callable[[], datetime] = utc_now,
 ) -> int:
     """Refresh every ACTIVE synthetic Agent of this run in the perf clusters.
 
@@ -440,9 +445,45 @@ def refresh_run_agent_heartbeats(
     on its own (live 2026-09-23: every §8.3 node sat in ``VALIDATE_GPU`` until
     the step cap and walked on to ``REPLACE_NODE``). The action suite keeps
     the default: its seeded workflows carry no validation step.
+
+    Each Agent is stamped with its own write time (``clock`` per Agent), not
+    the refresh's start: a reboot barrier recorded while the refresh ran used
+    to leave the later nodes' samples older than the barrier until the next
+    refresh. It is the fallback behind ``watch_node_return_barriers``.
     """
 
     refreshed = 0
+    for cluster_id, record in run_agents(context, run_id=run_id, clusters=clusters):
+        written_at = clock()
+        context.store.save_agent(
+            record.model_copy(
+                update={
+                    "last_seen_at": written_at,
+                    "lease_expires_at": written_at + timedelta(seconds=lease_seconds),
+                }
+            )
+        )
+        if publish_telemetry:
+            publish_node_return_telemetry(
+                context,
+                record=record,
+                cluster_id=cluster_id,
+                run_id=run_id,
+                now=written_at,
+            )
+        refreshed += 1
+    if not refreshed:
+        raise RuntimeError(f"no synthetic Agent of run {run_id} to refresh")
+    return refreshed
+
+
+def run_agents(
+    context: ApplicationContext, *, run_id: str, clusters: int
+) -> list[tuple[str, AgentRecord]]:
+    """``(cluster id, Agent)`` of the run's ACTIVE synthetic Agents, matched by
+    the run id inside their node id."""
+
+    agents = []
     for cluster_index in range(clusters):
         cluster_id = f"perf-cap-{cluster_index:03d}"
         for record in context.store.list_agents(cluster_id):
@@ -450,31 +491,31 @@ def refresh_run_agent_heartbeats(
                 continue
             if record.lifecycle_state is not AgentLifecycleState.ACTIVE:
                 continue
-            context.store.save_agent(
-                record.model_copy(
-                    update={
-                        "last_seen_at": now,
-                        "lease_expires_at": now + timedelta(seconds=lease_seconds),
-                    }
-                )
-            )
-            if publish_telemetry:
-                publish_healthy_node_telemetry(
-                    context,
-                    record=record,
-                    cluster_id=cluster_id,
-                    now=now,
-                    gpu_uuid=synthetic_node_gpu_uuid(record.node_id),
-                    gpu_index="0",
-                    batch_id=(
-                        f"node-return-{run_id}-{record.node_id}-"
-                        f"{int(now.timestamp() * 1_000_000)}"
-                    ),
-                )
-            refreshed += 1
-    if not refreshed:
-        raise RuntimeError(f"no synthetic Agent of run {run_id} to refresh")
-    return refreshed
+            agents.append((cluster_id, record))
+    return agents
+
+
+def publish_node_return_telemetry(
+    context: ApplicationContext,
+    *,
+    record: AgentRecord,
+    cluster_id: str,
+    run_id: str,
+    now: datetime,
+) -> None:
+    """One returned node's healthy package, under the GPU its attempt names."""
+
+    publish_healthy_node_telemetry(
+        context,
+        record=record,
+        cluster_id=cluster_id,
+        now=now,
+        gpu_uuid=synthetic_node_gpu_uuid(record.node_id),
+        gpu_index="0",
+        batch_id=(
+            f"node-return-{run_id}-{record.node_id}-{int(now.timestamp() * 1_000_000)}"
+        ),
+    )
 
 
 def synthetic_node_gpu_uuid(node_id: str) -> str:
@@ -694,6 +735,87 @@ def watch_validation_barriers(
     run_id: str,
     clusters: int,
     workflows_per_cluster: int,
+    **options: Any,
+) -> dict[str, object]:
+    """The integrated suite's watch (§8.4) over its seeded nodes.
+
+    One workflow per node, so the session also ends once every run workflow is
+    terminal. ``options`` are :func:`watch_barriers`' keywords.
+    """
+
+    nodes = integrated_run_agents(
+        context,
+        run_id=run_id,
+        clusters=clusters,
+        workflows_per_cluster=workflows_per_cluster,
+    )
+    publishers = {
+        node: partial(
+            publish_integrated_node_telemetry,
+            context,
+            record=record,
+            run_id=run_id,
+            cluster_index=cluster_index,
+            workflow_index=workflow_index,
+        )
+        for node, (cluster_index, workflow_index, record) in nodes.items()
+    }
+    return watch_barriers(
+        context,
+        publishers,
+        mode=VALIDATION_WATCH_MODE,
+        run_id=run_id,
+        expected_workflows=clusters * workflows_per_cluster,
+        **options,
+    )
+
+
+def watch_node_return_barriers(
+    context: ApplicationContext,
+    *,
+    run_id: str,
+    clusters: int,
+    **options: Any,
+) -> dict[str, object]:
+    """The correlated suite's watch (§8.3): its nodes return after the reboot.
+
+    Both escalated reboots of a cluster (the in-record ``RESTART_NODE`` rung or a
+    ``workflow-reboot-after-<id>`` successor) are followed by post-action
+    validation that accepts only telemetry observed after the reboot, so the
+    run's ``corr-node-*`` Agents publish their node-return package -- the one
+    the periodic refresh publishes -- as soon as the reboot step is recorded.
+    Successors and escalations make the run's workflow count open-ended, so the
+    session ends when the runner stops it or at its deadline. ``options`` are
+    :func:`watch_barriers`' keywords.
+    """
+
+    publishers = {
+        record.node_id: partial(
+            publish_node_return_telemetry,
+            context,
+            record=record,
+            cluster_id=cluster_id,
+            run_id=run_id,
+        )
+        for cluster_id, record in run_agents(context, run_id=run_id, clusters=clusters)
+    }
+    return watch_barriers(
+        context,
+        publishers,
+        mode=NODE_RETURN_WATCH_MODE,
+        run_id=run_id,
+        expected_workflows=None,
+        **options,
+    )
+
+
+def watch_barriers(
+    context: ApplicationContext,
+    publishers: Mapping[str, Callable[..., None]],
+    *,
+    mode: str,
+    run_id: str,
+    expected_workflows: int | None,
     stopped: Callable[[], bool],
     poll_seconds: float = 1.0,
     deadline_seconds: float = 3600.0,
@@ -704,21 +826,16 @@ def watch_validation_barriers(
 ) -> dict[str, object]:
     """Publish a node's healthy telemetry right after its reset/reboot barrier.
 
-    Every poll reads the workflows saved since the previous one, takes each run
-    node's latest barrier (``readiness_barrier``) and publishes the node's
-    package once per new barrier, stamped with the actual publish time. A node
-    whose publish is not yet newer than its barrier (another Pod's clock ran
-    ahead) is published again on the next poll. Ends when ``stopped`` says so,
-    when every run workflow is terminal, or at ``deadline_seconds``.
+    ``publishers`` maps every watched node to its package, published with
+    ``now=``. Every poll reads the workflows saved since the previous one, takes
+    each watched node's latest barrier (``readiness_barrier``) and publishes the
+    node's package once per new barrier, stamped with the actual publish time.
+    A node whose publish is not yet newer than its barrier (another Pod's clock
+    ran ahead) is published again on the next poll. Ends when ``stopped`` says
+    so, when ``expected_workflows`` run workflows are terminal (never when it
+    is ``None``), or at ``deadline_seconds``.
     """
 
-    nodes = integrated_run_agents(
-        context,
-        run_id=run_id,
-        clusters=clusters,
-        workflows_per_cluster=workflows_per_cluster,
-    )
-    expected = clusters * workflows_per_cluster
     barriers: dict[str, datetime] = {}
     published: dict[str, datetime] = {}
     terminal: set[str] = set()
@@ -743,7 +860,7 @@ def watch_validation_barriers(
                 node
                 for step in (*workflow.official_steps, *workflow.safety_steps)
                 for node in step.node_ids
-                if node in nodes
+                if node in publishers
             }
             if not owned:
                 continue
@@ -757,20 +874,12 @@ def watch_validation_barriers(
         for node, barrier in sorted(barriers.items()):
             if node in published and published[node] > barrier:
                 continue
-            cluster_index, workflow_index, record = nodes[node]
             written_at = clock()
-            publish_integrated_node_telemetry(
-                context,
-                record=record,
-                run_id=run_id,
-                cluster_index=cluster_index,
-                workflow_index=workflow_index,
-                now=written_at,
-            )
+            publishers[node](now=written_at)
             published[node] = written_at
             delays.append((written_at - barrier).total_seconds())
         polls += 1
-        if len(terminal) >= expected:
+        if expected_workflows is not None and len(terminal) >= expected_workflows:
             ended_by = "all-terminal"
             break
         if progress is not None and time.monotonic() >= next_progress:
@@ -778,12 +887,12 @@ def watch_validation_barriers(
             next_progress = time.monotonic() + progress_seconds
         sleep(poll_seconds)
     return {
-        "mode": VALIDATION_WATCH_MODE,
+        "mode": mode,
         "run_id": run_id,
         "ended_by": ended_by,
         "polls": polls,
         "publishes": len(delays),
-        "nodes_watched": len(nodes),
+        "nodes_watched": len(publishers),
         "nodes_published": len(published),
         "terminal_workflows": len(terminal),
         "feed_truncated_polls": truncated,
@@ -899,9 +1008,11 @@ def refresh_document(
     *,
     run_id: str,
     clusters: int,
-    now: datetime,
 ) -> dict[str, object] | None:
-    """Run a refresh or watch mode and return its summary; ``None`` otherwise."""
+    """Run a refresh or watch mode and return its summary; ``None`` otherwise.
+
+    Every refresh and watch stamps what it writes with the actual write time.
+    """
 
     lease_seconds = int(os.getenv("ACTION_AGENT_LEASE_SECONDS", "1800"))
     workflows_per_cluster = int(os.getenv("ACTION_WORKFLOWS_PER_CLUSTER", "4"))
@@ -913,7 +1024,6 @@ def refresh_document(
             context,
             run_id=run_id,
             clusters=clusters,
-            now=now,
             lease_seconds=lease_seconds,
             publish_telemetry=telemetry == NODE_RETURN_TELEMETRY,
         )
@@ -932,18 +1042,27 @@ def refresh_document(
             lease_seconds=lease_seconds,
         )
         return {"run_id": run_id, "clusters": clusters, "agents_refreshed": refreshed}
-    if seed_mode == VALIDATION_WATCH_MODE:
+    if seed_mode in {VALIDATION_WATCH_MODE, NODE_RETURN_WATCH_MODE}:
+        watch_options: dict[str, Any] = {
+            "stopped": stdin_closed().is_set,
+            "poll_seconds": float(os.getenv("ACTION_WATCH_POLL_SECONDS", "1")),
+            "deadline_seconds": float(
+                os.getenv("ACTION_WATCH_DEADLINE_SECONDS", "3600")
+            ),
+            "progress": lambda status: print(
+                json.dumps({"progress": status}, sort_keys=True), flush=True
+            ),
+        }
+        if seed_mode == NODE_RETURN_WATCH_MODE:
+            return watch_node_return_barriers(
+                context, run_id=run_id, clusters=clusters, **watch_options
+            )
         return watch_validation_barriers(
             context,
             run_id=run_id,
             clusters=clusters,
             workflows_per_cluster=workflows_per_cluster,
-            stopped=stdin_closed().is_set,
-            poll_seconds=float(os.getenv("ACTION_WATCH_POLL_SECONDS", "1")),
-            deadline_seconds=float(os.getenv("ACTION_WATCH_DEADLINE_SECONDS", "3600")),
-            progress=lambda status: print(
-                json.dumps({"progress": status}, sort_keys=True), flush=True
-            ),
+            **watch_options,
         )
     return None
 
@@ -958,7 +1077,7 @@ def main() -> None:
     now = datetime.now(timezone.utc)
     try:
         document = refresh_document(
-            context, seed_mode, run_id=run_id, clusters=clusters, now=now
+            context, seed_mode, run_id=run_id, clusters=clusters
         )
         if document is not None:
             print(json.dumps(document, sort_keys=True))

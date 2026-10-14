@@ -1,15 +1,17 @@
-"""Event-driven validation telemetry for the integrated workflow suite (§8.4).
+"""Event-driven validation telemetry for the integrated and correlated suites.
 
 Post-reset/reboot validation accepts only telemetry observed after the control
 plane recorded the reset or reboot, and a synthetic node publishes nothing on
 its own. The runner's 30 s refresh used to be the only publisher, so every such
 workflow waited 5-30 s for it and the integrated percentiles measured the
 refresh period (batch 80). This keeps one ``kubectl exec -i`` session of
-``seed_regional_action_workflows.py`` in its ``integrated-validation-watch``
-mode running in an api-ha Pod for the whole workflow phase: the session
-publishes a node's healthy package right after the node's barrier is recorded,
-stamped with the actual publish time. The periodic refresh stays as the
-fallback.
+``seed_regional_action_workflows.py`` in a watch mode running in an api-ha Pod
+for the whole workflow phase: the session publishes a node's healthy package
+right after the node's barrier is recorded, stamped with the actual publish
+time. The periodic refresh stays as the fallback. The integrated suite (§8.4)
+watches its seeded nodes (``integrated-validation-watch``); the correlated suite
+(§8.3) the nodes whose escalated reboots it records
+(``node-return-validation-watch``).
 
 The session's program arrives length-prefixed on stdin and the rest of stdin is
 its stop channel: closing it ends the session (``stop``), and so does a runner
@@ -36,6 +38,7 @@ else:
 
 SEED_SCRIPT = Path(__file__).resolve().parent / "seed_regional_action_workflows.py"
 WATCH_MODE = "integrated-validation-watch"
+NODE_RETURN_WATCH_MODE = "node-return-validation-watch"
 #: ``python3 -`` reads stdin to its end before it runs anything; this reads
 #: exactly the length-prefixed program and leaves the rest of stdin open.
 BOOTSTRAP = (
@@ -79,8 +82,9 @@ class ValidationTelemetryWatcher:
         *,
         run_id: str,
         clusters: int,
-        workflows_per_cluster: int,
         deadline_seconds: float,
+        workflows_per_cluster: int | None = None,
+        mode: str = WATCH_MODE,
         poll_seconds: float = 1.0,
         max_restarts: int = 3,
         restart_pause_seconds: float = 2.0,
@@ -90,6 +94,7 @@ class ValidationTelemetryWatcher:
         self.run_id = run_id
         self.clusters = clusters
         self.workflows_per_cluster = workflows_per_cluster
+        self.mode = mode
         self.deadline_seconds = deadline_seconds
         self.poll_seconds = poll_seconds
         self.max_restarts = max_restarts
@@ -185,8 +190,12 @@ class ValidationTelemetryWatcher:
             "env",
             f"ACTION_RUN_ID={self.run_id}",
             f"ACTION_CLUSTERS={self.clusters}",
-            f"ACTION_WORKFLOWS_PER_CLUSTER={self.workflows_per_cluster}",
-            f"ACTION_SEED_MODE={WATCH_MODE}",
+            *(
+                []
+                if self.workflows_per_cluster is None
+                else [f"ACTION_WORKFLOWS_PER_CLUSTER={self.workflows_per_cluster}"]
+            ),
+            f"ACTION_SEED_MODE={self.mode}",
             f"ACTION_WATCH_POLL_SECONDS={self.poll_seconds}",
             f"ACTION_WATCH_DEADLINE_SECONDS={self.deadline_seconds:g}",
             "python3",
@@ -238,7 +247,7 @@ class ValidationTelemetryWatcher:
         result: dict[str, Any] = {}
         for raw in process.stdout:
             document = _json_line(raw)
-            if document.get("mode") == WATCH_MODE:
+            if document.get("mode") == self.mode:
                 result = document
         returncode = process.wait()
         reader.join(timeout=5)

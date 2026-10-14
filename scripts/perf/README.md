@@ -220,8 +220,11 @@ is split by responsibility:
 - `regional_capacity_database.py`: Aurora and PostgreSQL observations.
 - `regional_capacity_placement.py`: the run's Aurora writer, its Availability
   Zone and the control-plane node zones.
-- `regional_validation_telemetry.py`: the integrated runner's event-driven
-  validation telemetry session.
+- `regional_validation_telemetry.py`: the integrated and correlated runners'
+  event-driven validation telemetry session (the correlated one publishes a
+  node's node-return package right after its reboot step is recorded; the
+  30 s heartbeat refresh stays the fallback, every node stamped with its own
+  write time).
 - `regional_capacity_registry.py`: isolated/live target selection, synthetic
   registry metadata, residual detection and verified cleanup.
 - `regional_capacity_results.py`: metric parsing, aggregation and artifact
