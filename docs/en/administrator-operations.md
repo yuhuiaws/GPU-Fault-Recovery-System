@@ -2440,7 +2440,7 @@ from the panel table in `scripts/grafana_dashboard_catalog.py`, and `make grafan
 guarantees the checked-in JSON is byte-for-byte identical to the generated result. The generator reads `amp-rules.yaml`: whenever an alert expression ends in
 `> N` / `>= N` / `< N`, the panel drawing that metric gets a threshold line of the same value (critical red, warning
 orange); each panel's description lists the alert names it covers, their `for` durations and the anchors of the cards in this section, so it is one step from a panel to
-a triage card. Each of the 84 alerts lands on at least one panel (`tests/test_grafana_dashboards.py`
+a triage card. Each of the 85 alerts lands on at least one panel (`tests/test_grafana_dashboards.py`
 iterates over all rules asserting this, and asserts the thresholds too); a threshold changed in the rules without regenerating turns the gate red.
 
 Import path: the Grafana provisioning step of `gpu-fault-admin deploy` imports them automatically at deployment into
@@ -2483,7 +2483,7 @@ Role choice: on-call dashboard viewing uses `VIEWER`; give `EDITOR` / `ADMIN` on
 `gpu-fault-admin deploy` re-import -- a lasting change must be made in
 `scripts/grafana_dashboard_catalog.py` and regenerated. To revoke, replace `"action":"ADD"` with `"REVOKE"`.
 After authorisation log in via the Identity Center portal or by opening the address above directly; `Alerting -> Alert rules` with the AMP data source
-shows the live state of the 83 rules (7 groups), corresponding one-to-one to the cards below.
+shows the live state of the 85 rules (7 groups), corresponding one-to-one to the cards below.
 
 Reading the dashboards is consistent with the cards: only staying above the threshold line (or below it for `< N`-type panels) for longer than the `for` duration
 is an alert; the overview's "Alerts firing" panel reads AMP's `ALERTS{alertstate="firing"}` directly,
