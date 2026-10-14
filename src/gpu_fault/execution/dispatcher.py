@@ -13,7 +13,7 @@ from pydantic import ValidationError
 from gpu_fault.compile_blocked import close_compile_blocked_workflows
 from gpu_fault.execution.receipt_settled_resume import resume_receipt_settled_workflows
 from gpu_fault.execution import dispatcher_wakeups, restart_budget_preflight
-from gpu_fault.execution.budget_guard import SKIP_REASON, BudgetGuard
+from gpu_fault.execution import budget_guard
 from gpu_fault.execution.config import WorkflowDispatcherConfig
 from gpu_fault.execution.executor import (
     DISPATCHER_ACTOR,
@@ -132,6 +132,8 @@ class WorkflowDispatcher:
             seconds=max(3 * config.poll_interval_seconds, WAITING_LEASE_FLOOR_SECONDS)
         )
         self.failure_handling_abandoned_total = 0
+        # Incident clusters and over-limit budget scopes across ticks (§9.5).
+        self.budget_watch = budget_guard.BudgetWatch()
         self.plan_sync_misses_total = 0
         self.node_busy_timeouts_total = 0
         # Placement holds ended because the nodes they waited on were freed
@@ -206,6 +208,7 @@ class WorkflowDispatcher:
         # inside the store, is still a live thread.
         self.last_cycle_timestamp_seconds = time.time()
         if self.config.dispatch_lease_seconds > 0 and not self._holds_dispatch_lease():
+            self.budget_watch.idle()
             return WorkflowDispatchReport(
                 scanned=0,
                 executed=0,
@@ -307,10 +310,10 @@ class WorkflowDispatcher:
                 # Anything else says nothing about the record: an adapter
                 # wiring bug on this replica, a missing capability, a
                 # programming error. The lease the executor took is released,
-                # the row goes back to the status it was scanned in with a
-                # backoff, so it stays executable for a later tick (and the
-                # other replicas) without a hot loop; it is counted and logged
-                # with its traceback (F-B4 (3)). It used to be written BLOCKED.
+                # the row goes back (``released_status``) with a backoff, so
+                # it stays executable for a later tick (and the other
+                # replicas) without a hot loop; it is counted and logged with
+                # its traceback (F-B4 (3)). It used to be written BLOCKED.
                 internal_errors += 1
                 self.internal_errors_total += 1
                 self.internal_error_last_seen_timestamp_seconds = time.time()
@@ -384,7 +387,7 @@ class WorkflowDispatcher:
         the tick's answer to "why did nothing dispatch?".
         """
 
-        guard = BudgetGuard(self.store, lambda: self.executor.config.remediation_budget)
+        guard = self.budget_watch.guard(self.store, self.executor.config)
         page_size = max(self.config.batch_size * 20, 100)
         candidates: list[WorkflowRequest] = []
         filtered: dict[str, int] = {}
@@ -446,6 +449,7 @@ class WorkflowDispatcher:
                 dict(filtered),
             )
         self._observe_pending_age(first_page, now)
+        guard.observe()
         return batch, filtered, horizon_exhausted
 
     def _observe_pending_age(
@@ -495,7 +499,7 @@ class WorkflowDispatcher:
         rows: list[WorkflowRequest],
         now: datetime,
         retired: set[str],
-        guard: BudgetGuard,
+        guard: budget_guard.BudgetGuard,
     ) -> tuple[list[WorkflowRequest], dict[str, int]]:
         filtered: dict[str, int] = {}
 
@@ -575,7 +579,7 @@ class WorkflowDispatcher:
                 held("node_busy_timeout")
                 continue
             if guard.passes_over(workflow):
-                held(SKIP_REASON)
+                held(budget_guard.SKIP_REASON)
                 continue
             candidates.append(workflow)
         return candidates, filtered
@@ -947,13 +951,9 @@ class WorkflowDispatcher:
         now = datetime.now(timezone.utc)
         restored = current.model_copy(
             update={
-                # Back to the status the scan saw; RUNNING stays RUNNING so a
-                # resumed workflow keeps its progress.
-                "status": (
-                    workflow.status
-                    if workflow.status in self.EXECUTABLE_STATUSES
-                    else current.status
-                ),
+                # The status the scan saw, or RUNNING once its budgeted work
+                # began: the hold must outlive the backoff (§9.5).
+                "status": budget_guard.released_status(workflow, current),
                 "execution_owner_id": None,
                 "execution_lease_expires_at": None,
                 "not_before": now

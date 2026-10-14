@@ -94,6 +94,47 @@ def test_a_filter_reason_outside_the_known_set_is_still_exported(monkeypatch) ->
     )
 
 
+def test_budget_scopes_over_their_limit_reach_the_metrics_endpoint(monkeypatch) -> None:
+    """Zero for every scope type until the dispatcher finds one over its
+    limit; then the type's count and the newest sighting (§9.5)."""
+
+    context = _context(monkeypatch, "e")
+    app = create_app(context)
+    before = _scrape(app)
+    for scope_type in ("class", "cluster", "domain", "node", "region"):
+        assert_sample(
+            before,
+            "gpu_fault_remediation_budget_over_limit_scopes",
+            0,
+            scope_type=scope_type,
+        )
+    assert_sample(
+        before, "gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds", 0
+    )
+
+    context.dispatcher.budget_watch.observe(
+        {"cluster:cluster-a": (7, 5), "node:cluster-a:n1": (2, 1)}
+    )
+    after = _scrape(app)
+
+    for scope_type in ("cluster", "node"):
+        assert_sample(
+            after,
+            "gpu_fault_remediation_budget_over_limit_scopes",
+            1,
+            scope_type=scope_type,
+        )
+    assert_sample(
+        after, "gpu_fault_remediation_budget_over_limit_scopes", 0, scope_type="region"
+    )
+    seen = context.dispatcher.budget_watch.over_limit_last_seen_timestamp_seconds
+    assert seen > 0
+    assert (
+        f"gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds {seen:.3f}"
+        in after
+    )
+
+
 def test_completion_decision_and_incident_state_gauges_are_zero_filled(
     monkeypatch,
 ) -> None:

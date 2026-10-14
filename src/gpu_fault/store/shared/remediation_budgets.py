@@ -104,6 +104,15 @@ def budget_occupancy(
     return occupancy
 
 
+def budget_full_reason(scope: str, active: int, limit: int) -> str:
+    """The refusal a full scope records on a waiter (store and dispatcher)."""
+
+    return (
+        "remediation concurrency budget is full: "
+        f"scope={scope} active={active} limit={limit}"
+    )
+
+
 def apply_remediation_budget(
     workflow: WorkflowRequest,
     active_workflows: Iterable[WorkflowRequest],
@@ -141,9 +150,7 @@ def apply_remediation_budget(
             if active < limit:
                 continue
             raise RemediationBudgetError(
-                "remediation concurrency budget is full: "
-                f"scope={scope} active={active} limit={limit}",
-                scope=scope,
+                budget_full_reason(scope, active, limit), scope=scope
             )
         scopes = sorted(normalized)
     return workflow.model_copy(

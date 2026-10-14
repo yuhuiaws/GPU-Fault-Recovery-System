@@ -3938,7 +3938,8 @@ internal-error release lets it lapse while the reset or reboot on the node goes 
 stays `RUNNING`. Once the workflow's own budgeted work has begun (completed, attempted, or a parked compensation), every later
 claim is a hold: it keeps the scopes held, adds its own plan's scopes and is never refused, so a reset, a reboot and the
 `RESTORE_GPU_SERVICES` compensation in flight are never blocked by the budget, and a record whose claims an older release dropped
-counts again.
+counts again. A row the dispatcher hands back after an internal error stays `RUNNING` (rather than the `PENDING` its scan saw)
+once its budgeted work began in that dispatch, so its hold outlives the backoff while the node is mid-remediation.
 
 `BLOCKED` releases the claim unless the node may still be mid-action; the rule is the same for admission, the dispatcher's
 occupancy read and the `/metrics` gauges:
@@ -3963,12 +3964,16 @@ for it (its own reservation is left out of its count), and exactly one hold exis
 inherited is not its own work; it is admitted for its budgeted steps still to run.
 
 Starvation guard: a refused workflow stays `PENDING` among the oldest `GPU_FAULT_WORKFLOW_BATCH_SIZE` (default 100) rows the
-dispatcher selects each tick. The dispatcher reads one occupancy aggregate per tick at most and passes over `PENDING` /
-`SAFETY_PENDING` rows whose recorded refusing scope is still full
+dispatcher selects each tick. The dispatcher reads one occupancy aggregate per tick and passes over
+`PENDING` / `SAFETY_PENDING` rows whose recorded refusing scope is still full
 (`gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}`); once the scope has room its waiters are candidates
-again in their queue order -- the guard only skips and never reorders, so FIFO within a scope is unchanged. There is no quota of
-free slots: the first waiter may still not claim (a fleet-rollout fence holds it, for one), and a quota spent on it would starve
-the waiters behind it. A fault storm in one cluster therefore cannot starve the others; a row never refused is still tried once.
+again in their queue order -- the guard only skips and never reorders, so FIFO within a scope is unchanged. A row never refused
+has no recorded scope: while some scope is full, the dispatcher works out the scopes it would ask for (its incident's cluster,
+read once and cached), passes it over when one of them is full and records that refusal on the row as the store would (one
+compare-and-set write; at most 1000 incident reads and writes a tick, a row past that is left to the store), so a storm of N fresh
+rows no longer takes about N / batch size ticks of the selection before another cluster's first try, and the waiting gauges count
+every waiter. There is no quota of free slots: the first waiter may still not claim (a fleet-rollout fence holds it, for one),
+and a quota spent on it would starve the waiters behind it. A fault storm in one cluster therefore cannot starve the others.
 `RUNNING` rows are never passed over.
 
 Hold time and long waits: a claim is held until the workflow ends, so the long waits of one remediation -- the node coming
@@ -3982,6 +3987,19 @@ its slot until the acknowledgement or that floor; the `CHECK_MECHANICALS` workfl
 [`COLLECT_DIAGNOSTIC_BUNDLE`] -> `CHECK_MECHANICALS`) do not cordon, stop workloads or contain a budgeted step, claim no budget,
 and the wait for an operator's acknowledgement occupies no slot; a reset/reboot disposition submitted afterwards is a separate
 workflow admitted as usual.
+
+Over-limit scopes and the upgrade window: a hold is never refused, so a scope can hold more than its limit. Workflows an older
+release left `RUNNING` without their claims (it dropped them after the first budgeted step) re-take them as holds when this
+release first dispatches them; while old and new dispatchers alternate during a control-plane roll the older one drops the claims
+again and admits on its own count; a lowered limit leaves its earlier holders in place. The dispatcher reports every scope above
+its configured limit (`gpu_fault_remediation_budget_over_limit_scopes{scope_type}` and
+`gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds` from the process holding the dispatch lease, and a warning
+naming scope, holders and limit at every change) and admits nothing new into it -- the store refuses, the guard passes over --
+until it drains below its limit; holds and the compensation they owe keep running. The residual roll window: until no process
+runs the older release, its dispatcher ticks can exceed the limit, and a row it left without claims counts only from its first
+dispatch by this release (a parked `BLOCKED` one never claims again); the excess drains at the pace of the remediations in flight,
+bounded by their deadlines. A record the receipt-settled sweep re-opens holds nothing until it claims its compensation, so one
+other workflow admitted in that window shows the scope one over for as long as the compensation runs.
 
 Observability: occupancy against the limits is `gpu_fault_remediation_budget_active_claims{scope_type}` (region, cluster, node,
 domain, class, counted by the admission rule), `gpu_fault_remediation_budget_cluster_active_claims{cluster_id}` against

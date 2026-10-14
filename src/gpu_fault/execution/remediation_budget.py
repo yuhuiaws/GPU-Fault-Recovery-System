@@ -156,6 +156,18 @@ def remediation_budget_claims(
     The hold ends when the workflow does.
     """
 
+    return claims_in_cluster(policy, workflow, incident.cluster_id, steps)
+
+
+def claims_in_cluster(
+    policy: RemediationBudgetPolicy,
+    workflow: WorkflowRequest,
+    cluster_id: str,
+    steps: Sequence[WorkflowStepSpec],
+) -> dict[str, int]:
+    """``remediation_budget_claims`` for a workflow of ``cluster_id``: what the
+    dispatcher's guard asks of a row whose incident it knows only by cluster."""
+
     if budget_work_begun(workflow, steps):
         skipped = set(workflow.superseded_step_indexes) | set(
             workflow.inherited_step_indexes
@@ -169,7 +181,7 @@ def remediation_budget_claims(
     ]
     if not budgeted:
         return {}
-    return _scopes_for_steps(policy, incident.cluster_id, budgeted)
+    return _scopes_for_steps(policy, cluster_id, budgeted)
 
 
 def scope_limit(policy: RemediationBudgetPolicy, scope: str) -> int | None:

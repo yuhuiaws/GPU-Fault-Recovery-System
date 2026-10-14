@@ -195,6 +195,9 @@ _MAX = (
     "gpu_fault_telemetry_spool_fault_backlog_depth",
     "gpu_fault_workflow_pending_age_seconds_max",
     "gpu_fault_workflow_retired_generation_awaiting_operator",
+    # Read by the dispatch-lease holder only; the other processes report zero.
+    "gpu_fault_remediation_budget_over_limit_scopes",
+    "gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds",
     "gpu_fault_collector_last_success_age_seconds_max",
     "gpu_fault_regional_registry_refresh_error",
     "gpu_fault_regional_registry_secret_drift",

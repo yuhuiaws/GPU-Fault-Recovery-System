@@ -3060,7 +3060,9 @@ modifying Store JSON or repeating `send`; an isolated notifier result in accepta
   `submit-remediation --disposition confirm-node-action` (or end it with `workflow-reconcile`) and its slot frees. A rising
   `gpu_fault_workflow_dispatch_filtered_total{reason="remediation_budget"}` is the starvation guard passing over the waiters
   of a full scope -- throttling, not a stall; a holder still `RUNNING` past its execution deadline is handled as
-  `GpuFaultWorkflowDeadlineNotEnforced`.
+  `GpuFaultWorkflowDeadlineNotEnforced`. `gpu_fault_remediation_budget_over_limit_scopes` above 0 means a scope holds more
+  than its limit (holds re-taken after an upgrade, an older dispatcher still in the roll, or a lowered limit; the dispatcher
+  log names the scope); nothing new enters it until it drains below the limit.
 - **Boundary**: do not raise the budget directly to clear the alert; first confirm there is no "claim holder no longer
   progressing but still `RUNNING`" or "parked record waiting for its confirmation" situation. Quota adjustment goes through [Administrator Capacity Configuration](administrator-capacity-configuration.md).
 

@@ -13,6 +13,8 @@ from gpu_fault.app.runtime import AppRuntime
 from gpu_fault.app.store_bloat_metrics import store_bloat_metric_lines
 from gpu_fault.collector_requirements import agent_is_current
 from gpu_fault.execution import ProductionExecutorConfig
+from gpu_fault.execution.budget_guard import SCOPE_TYPES as BUDGET_SCOPE_TYPES
+from gpu_fault.execution.budget_guard import BudgetWatch
 from gpu_fault.fleet_deployment import DeploymentStatus
 from gpu_fault.models import (
     DecisionStatus,
@@ -668,7 +670,26 @@ def _dispatch_pending_state_lines(ctx: object, dispatcher: object) -> list[str]:
             "gpu_fault_workflow_dispatch_filtered_total"
             f'{{reason="{_escape_label(reason)}"}} {count}'
         )
-    return lines
+    return lines + _budget_over_limit_lines(getattr(dispatcher, "budget_watch", None))
+
+
+def _budget_over_limit_lines(watch: BudgetWatch | None) -> list[str]:
+    """Budget scopes the dispatcher found above their limit (§9.5). Only the
+    process holding the dispatch lease reads them; the others report zero."""
+
+    over = watch.over_limit_by_scope_type() if watch is not None else {}
+    seen = watch.over_limit_last_seen_timestamp_seconds if watch is not None else 0.0
+    return [
+        "# HELP gpu_fault_remediation_budget_over_limit_scopes Remediation budget scopes whose holders exceed the configured limit at this process's last dispatch cycle, by scope type: holds re-taken after an upgrade from a release that dropped them, an older dispatcher still in the roll, or a lowered limit. Nothing new is admitted into such a scope until it drains below its limit.",
+        "# TYPE gpu_fault_remediation_budget_over_limit_scopes gauge",
+        *(
+            f'gpu_fault_remediation_budget_over_limit_scopes{{scope_type="{scope_type}"}} {over.get(scope_type, 0)}'
+            for scope_type in BUDGET_SCOPE_TYPES
+        ),
+        "# HELP gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds Unix time this process's dispatcher last found a remediation budget scope above its limit; 0 if never (ARCH-E E4).",
+        "# TYPE gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds gauge",
+        f"gpu_fault_remediation_budget_over_limit_last_seen_timestamp_seconds {seen:.3f}",
+    ]
 
 
 # Both channels are always rendered, zero included, so an alert on a channel

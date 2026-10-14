@@ -415,3 +415,34 @@ def test_a_full_scope_storm_does_not_starve_another_cluster(store):
     assert store.get_workflow(late.request_id).status is WorkflowStatus.RUNNING
     assert report.filtered.get("remediation_budget") == 6, report.filtered
     assert f"{late.request_id}/1/{REBOOT.value}" in adapter.calls
+
+
+def test_never_refused_waiters_are_recorded_by_compare_and_set_in_every_mode(store):
+    """The dispatcher passes over a fresh row whose cluster is full and records
+    the refusal with a compare-and-set write of the row it scanned."""
+
+    storm = [
+        seed(store, f"fresh-{index}", created_at=NOW + timedelta(milliseconds=index))
+        for index in range(12)
+    ]
+    late = seed(
+        store, "late", cluster_id="cluster-b", created_at=NOW + timedelta(hours=1)
+    )
+    adapter = ScriptedAdapter(REBOOT_PLAN)
+    dispatcher = budget_dispatcher(store, adapter, TWO_PER_CLUSTER, batch_size=4)
+
+    dispatcher.run_once()
+    report = dispatcher.run_once()
+
+    assert store.get_workflow(late.request_id).status is WorkflowStatus.RUNNING, (
+        report.filtered
+    )
+    waiting = [
+        store.get_workflow(item.request_id)
+        for item in storm
+        if store.get_workflow(item.request_id).status is WorkflowStatus.PENDING
+    ]
+    assert len(waiting) == 10
+    assert {item.remediation_budget_last_blocked_scope for item in waiting} == {CLUSTER}
+    assert {item.remediation_budget_wait_count for item in waiting} == {1}
+    assert sum(item.request_id in adapter.started() for item in waiting) == 0
