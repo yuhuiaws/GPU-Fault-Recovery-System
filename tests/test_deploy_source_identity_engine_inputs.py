@@ -29,3 +29,22 @@ def test_engine_probes_scripts_and_tools_are_deploy_host_orchestration_inputs() 
         "src/gpu_fault_release/rollout.py",
     ):
         assert expected in files, f"{expected} must move the deploy-host identity"
+
+
+def test_every_release_engine_module_is_a_deploy_host_orchestration_input() -> None:
+    """``scripts/release_deploy.py`` and the modules split from it run from the
+    site snapshot. ``release_deploy_profile.py`` (the Runtime Profile plan and
+    approval of a release) was in no identity input, so a change to it alone
+    left both identities unchanged and the deploy applied nothing."""
+
+    files = MODULE.deploy_host_identity(ROOT)["orchestration"]["files"]
+    engine = sorted(
+        path.relative_to(ROOT).as_posix()
+        for path in (ROOT / "scripts").glob("release_deploy*.py")
+    )
+
+    assert "scripts/release_deploy_profile.py" in engine
+    missing = [path for path in engine if path not in files]
+    assert missing == [], (
+        f"release engine modules outside the deploy-host identity: {missing}"
+    )

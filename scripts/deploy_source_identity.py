@@ -40,6 +40,7 @@ DEPLOY_HOST_ORCHESTRATION_INPUTS = (
     "scripts/deploy_source_identity.py",
     "scripts/release_deploy.py",
     "scripts/release_deploy_evidence.py",
+    "scripts/release_deploy_profile.py",
     "scripts/release_failure_recovery.py",
     "scripts/release_live_state.py",
     "scripts/run_release_gates.py",
