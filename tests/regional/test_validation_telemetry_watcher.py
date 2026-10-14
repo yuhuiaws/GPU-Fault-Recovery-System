@@ -234,6 +234,10 @@ def test_the_bootstrap_runs_the_real_seed_watch_mode_until_stdin_closes(
 ) -> None:
     environment = {
         "PATH": os.environ.get("PATH", ""),
+        # The seed script imports gpu_fault.app, which the control-plane wheel
+        # ships in the Pod; outside it (the deploy's release gate runs in a
+        # deploy-host venv) only the checkout's src provides it.
+        "PYTHONPATH": os.pathsep.join((str(ROOT / "src"), str(ROOT))),
         "HOME": str(tmp_path),
         "ACTION_RUN_ID": "run-a",
         "ACTION_CLUSTERS": "1",
