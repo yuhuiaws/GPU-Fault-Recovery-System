@@ -5,8 +5,10 @@ from datetime import datetime, timezone
 from typing import Callable
 
 try:
+    from . import regional_capacity_priority_latency as priority_latency
     from .regional_capacity_registry import STORE_DSN_SNIPPET
 except ImportError:
+    import regional_capacity_priority_latency as priority_latency
     from regional_capacity_registry import STORE_DSN_SNIPPET
 
 try:
@@ -358,109 +360,11 @@ def processor_priority_latency(
     pods: list[str],
     *,
     cluster_prefix: str,
+    since_epoch: float = 0.0,
 ) -> dict:
-    if not pods:
-        return {"error": "no api pod available"}
-    script = f"""
-import json, os, psycopg
-{STORE_DSN_SNIPPET}
-prefix = {cluster_prefix!r} + '%'
-with psycopg.connect(store_dsn(), autocommit=True) as conn:
-    cur = conn.cursor()
-    cur.execute(
-        \"\"\"
-        SELECT priority, status, count(*)
-        FROM gpu_fault_processor_queue
-        WHERE cluster_id LIKE %s
-        GROUP BY priority, status
-        ORDER BY priority, status
-        \"\"\",
-        (prefix,),
+    """Per-tier completion latency from where the active store layout keeps
+    completed requests (``regional_capacity_priority_latency``)."""
+
+    return priority_latency.invoke(
+        control_command, pods, cluster_prefix=cluster_prefix, since_epoch=since_epoch
     )
-    statuses = {{}}
-    for priority, status, count in cur.fetchall():
-        statuses.setdefault(str(priority), {{}})[status] = count
-    cur.execute(
-        \"\"\"
-        SELECT
-            priority,
-            count(*),
-            percentile_cont(0.50) WITHIN GROUP (
-                ORDER BY extract(epoch FROM updated_at-created_at)*1000
-            ),
-            percentile_cont(0.95) WITHIN GROUP (
-                ORDER BY extract(epoch FROM updated_at-created_at)*1000
-            ),
-            percentile_cont(0.99) WITHIN GROUP (
-                ORDER BY extract(epoch FROM updated_at-created_at)*1000
-            ),
-            max(extract(epoch FROM updated_at-created_at)*1000)
-        FROM gpu_fault_processor_queue
-        WHERE cluster_id LIKE %s
-          AND status='COMPLETED'
-        GROUP BY priority
-        ORDER BY priority
-        \"\"\",
-        (prefix,),
-    )
-    latency = {{
-        str(priority): {{
-            'count': count,
-            'p50_ms': float(p50),
-            'p95_ms': float(p95),
-            'p99_ms': float(p99),
-            'max_ms': float(maximum),
-        }}
-        for priority, count, p50, p95, p99, maximum
-        in cur.fetchall()
-    }}
-    cur.execute(
-        \"\"\"
-        WITH per_cluster AS (
-            SELECT
-                priority,
-                cluster_id,
-                percentile_cont(0.99) WITHIN GROUP (
-                    ORDER BY
-                    extract(epoch FROM updated_at-created_at)*1000
-                ) AS p99_ms
-            FROM gpu_fault_processor_queue
-            WHERE cluster_id LIKE %s
-              AND status='COMPLETED'
-            GROUP BY priority, cluster_id
-        )
-        SELECT priority, min(p99_ms), max(p99_ms), avg(p99_ms)
-        FROM per_cluster
-        GROUP BY priority
-        ORDER BY priority
-        \"\"\",
-        (prefix,),
-    )
-    fairness = {{
-        str(priority): {{
-            'cluster_p99_min_ms': float(minimum),
-            'cluster_p99_max_ms': float(maximum),
-            'cluster_p99_mean_ms': float(mean),
-        }}
-        for priority, minimum, maximum, mean in cur.fetchall()
-    }}
-print(json.dumps({{
-    'status_counts': statuses,
-    'completion_latency': latency,
-    'cluster_fairness': fairness,
-}}))
-"""
-    output = control_command(
-        "exec",
-        pods[0],
-        "--",
-        "python3",
-        "-c",
-        script,
-        check=False,
-        timeout=300,
-    )
-    for line in reversed(output.splitlines()):
-        if line.startswith("{"):
-            return json.loads(line)
-    return {"error": output[-2000:]}

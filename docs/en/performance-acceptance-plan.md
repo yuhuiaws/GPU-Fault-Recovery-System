@@ -1151,6 +1151,24 @@ restart delta, the Pods that restarted, Pods that appeared/disappeared during th
 regressions and Pods not Ready at the end. If any item is non-empty or non-zero it cannot count
 as a formal PASS.
 
+`processor-priority-latency.json` (also `summary.json.processor_priority_latency`) is the per-tier
+completion latency of the round's requests: per tier `completion_latency` (count and p50/p95/p99/max in
+ms), `cluster_fairness` (the spread of the per-cluster p99) and `status_counts`, scoped to the synthetic
+clusters and to requests created since the load Job was created (`since_epoch`). It reads where
+`layout_mode` keeps completed requests: in `inline` the queue's COMPLETED rows with their stored
+priority, in `detached` the `gpu_fault_processor_replays` rows (`completed_source`); both tables are read,
+so a round across a layout switch is covered, and `sources` gives each table's count and first and last
+completion. A replay row stores no priority: the probe
+(`scripts/perf/regional_capacity_priority_latency.py`, run in an api-ha Pod with the product's
+interpreter) groups the rows by path and, on the edge-filtered channels, by the body's
+`collection_errors` and `edge_filter_reasons` extracted in SQL, and the product's own
+`ProcessorRequest.queue_priority()` decides each group; a body PostgreSQL cannot parse (`NaN`, empty,
+not an object) is classified on the whole body (`sources.replays.classified_on_full_body`). The product
+keeps completed requests for `completedRetentionSeconds` (600 s by default): when
+`sources.*.first_completed_at_epoch` is later than the window start, the record covers only the round's
+last part and must say so. The earlier probe read only queue rows, so on the detached layout the file
+was empty.
+
 An Action load test with a remediation budget must also save `remediation-budget.json`,
 containing at least the five-tier configuration, peak active claims per scope, wait counts,
 longest wait, the number of workflows that never got to execute and the number of lease-expiry

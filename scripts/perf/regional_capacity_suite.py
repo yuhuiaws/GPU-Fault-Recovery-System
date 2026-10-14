@@ -757,12 +757,16 @@ def postgres_counters() -> dict:
     return _postgres_counters(control, pods)
 
 
-def processor_priority_latency() -> dict:
+def processor_priority_latency(since_epoch: float = 0.0) -> dict:
+    """The run's requests: created since ``since_epoch`` (the load Job's
+    creation), on the synthetic clusters."""
+
     pods = [pod for pod in control_pods() if "api-ha" in pod]
     return _processor_priority_latency(
         control,
         pods,
         cluster_prefix=PERF_CLUSTER_PREFIX,
+        since_epoch=since_epoch,
     )
 
 
@@ -833,6 +837,7 @@ def execute_case(
     )
     manifest = run_manifest(manifest, resources.run_id)
     (artifacts / "job.json").write_text(json.dumps(manifest, indent=1) + "\n")
+    load_created_at = time.time()
     resources.create(manifest)
     sampler = TopSampler(artifacts / "control-plane-top.jsonl")
     sampler.start()
@@ -862,7 +867,7 @@ def execute_case(
         cgroup_after, pg_after, documents, drain = collect_after_load(
             pods, artifacts, job, targets=(target_queue_depth, target_spool_depth)
         )
-        priority_latency = processor_priority_latency()
+        priority_latency = processor_priority_latency(load_created_at)
     finally:
         series.stop()
         sampler.stop()

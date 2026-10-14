@@ -462,3 +462,93 @@ def test_the_layout_status_reports_mode_and_partitions(store) -> None:
         "index_bytes",
         "toast_bytes",
     }
+
+
+def test_the_perf_latency_probe_reads_completions_where_the_layout_keeps_them(
+    store,
+) -> None:
+    """``processor-priority-latency.json`` was empty on the detached layout: the
+    perf probe read completed queue rows, and a detached completion leaves the
+    queue. Both layouts must give the same per-tier document, scoped to the
+    synthetic clusters and to requests created since the load began."""
+
+    from scripts.perf import regional_capacity_priority_latency as probe
+
+    since = datetime.now(timezone.utc) - timedelta(minutes=5)
+    bodies = [
+        (FAULT_PATH, {"node_id": "f", "xid": 79}),
+        ("/v1/attempts/terminal", {"node_id": "a", "job_id": "j", "attempt_id": "a"}),
+        (HOST_PATH, {"node_id": "h1", "edge_filter_reasons": ["health-summary"]}),
+        (HOST_PATH, {"node_id": "h2", "edge_filter_reasons": ["threshold:cpu"]}),
+        (
+            "/v1/collector-events/gpu-metrics",
+            {"node_id": "g1", "collection_errors": ["dcgm unavailable"]},
+        ),
+        # PostgreSQL cannot read NaN; the product's json.loads can.
+        (HOST_PATH, b'{"node_id": "h3", "v": NaN}'),
+    ]
+    requests = [
+        processor_request(
+            path,
+            body=body if isinstance(body, bytes) else json.dumps(body).encode(),
+            cluster_id=f"perf-cap-00{index % 2}",
+        )
+        for index, (path, body) in enumerate(bodies)
+    ]
+    outside = processor_request(
+        FAULT_PATH, body=b'{"node_id": "o", "xid": 79}', cluster_id="layout-cluster"
+    )
+    early = processor_request(
+        FAULT_PATH, body=b'{"node_id": "e", "xid": 79}', cluster_id="perf-cap-000"
+    ).model_copy(update={"created_at": since - timedelta(hours=1)})
+    store.try_enqueue_processor_requests_batch(
+        [*requests, outside, early], max_depth=100, max_cluster_depth=100
+    )
+    for _round in range(10):
+        claimed = store.claim_active_processor_requests(
+            "owner",
+            now=datetime.now(timezone.utc),
+            lease_duration=REQUEST_LEASE,
+            limit=20,
+        )
+        if not claimed:
+            break
+        _complete(store, claimed)
+    pending = processor_request(
+        HOST_PATH, body=b'{"node_id": "p"}', cluster_id="perf-cap-001"
+    )
+    store.try_enqueue_processor_requests_batch(
+        [pending], max_depth=100, max_cluster_depth=100
+    )
+
+    with _connect() as connection:
+        document = probe.measure(
+            connection, prefix="perf-cap-", since_epoch=since.timestamp()
+        )
+
+    expected: dict[str, list[float]] = {}
+    for item in requests:
+        stored = store.get_processor_request(item.request_id)
+        assert stored.status.value == "COMPLETED", stored.status
+        expected.setdefault(str(item.queue_priority()), []).append(
+            (stored.updated_at - stored.created_at).total_seconds() * 1000
+        )
+    assert sorted(expected) == ["0", "10", "100", "50"], expected
+    completion = document["completion_latency"]
+    assert {tier: item["count"] for tier, item in completion.items()} == {
+        tier: len(values) for tier, values in expected.items()
+    }, "every completed request of the run, on the tier the product gave it"
+    for tier, values in expected.items():
+        assert completion[tier]["max_ms"] == pytest.approx(max(values), abs=0.01), tier
+    detached = store.hot_layout_mode() == "detached"
+    assert document["layout_mode"] == store.hot_layout_mode()
+    assert document["completed_source"] == ("replays" if detached else "queue")
+    sources = document["sources"]
+    assert (sources["queue"]["completed"], sources["replays"]["completed"]) == (
+        (0, len(requests)) if detached else (len(requests), 0)
+    ), sources
+    assert sources["replays"]["classified_on_full_body"] == (1 if detached else 0), (
+        "only the NaN body needs the product's own parse"
+    )
+    assert document["status_counts"]["100"] == {"COMPLETED": 2, "PENDING": 1}
+    assert set(document["cluster_fairness"]) == set(expected)

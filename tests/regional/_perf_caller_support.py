@@ -178,7 +178,7 @@ class CapacityWire:
         monkeypatch.setattr(capacity, "wait_for_job", self.wait_for_job)
         monkeypatch.setattr(capacity, "collect_logs", lambda *_args: [])
         monkeypatch.setattr(capacity, "queue_drain", lambda *_args, **_kwargs: {})
-        monkeypatch.setattr(capacity, "processor_priority_latency", lambda: {})
+        monkeypatch.setattr(capacity, "processor_priority_latency", lambda *_args: {})
         monkeypatch.setattr(capacity, "aurora_window", lambda *_args, **_kwargs: {})
         # The run's Aurora writer and node zones (tests/regional/test_perf_run_placement).
         monkeypatch.setattr(capacity, "AURORA_CLUSTER_ID", "test-aurora")

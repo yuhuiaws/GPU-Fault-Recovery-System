@@ -1140,6 +1140,7 @@ def execute_integrated_jobs(
     cgroup_before = scrape_cgroup(pods)
     postgres_before = postgres_counters()
     target_queue, target_spool = drain_targets(metrics_before)
+    load_created_at = time.time()
     resources.create(executor_manifest)
     resources.create(load_manifest)
     wait_for_executor_pods(args.clusters)
@@ -1221,7 +1222,7 @@ def execute_integrated_jobs(
             pod_runtime_before,
             pod_runtime_after,
         ),
-        "processor_priority_latency": processor_priority_latency(),
+        "processor_priority_latency": processor_priority_latency(load_created_at),
         "postgres_deltas": {
             key: (postgres_after.get(key) or 0) - (postgres_before.get(key) or 0)
             for key in ("deadlocks", "xact_commit", "xact_rollback")

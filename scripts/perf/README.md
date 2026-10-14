@@ -228,6 +228,9 @@ is split by responsibility:
 
 - `regional_capacity_job.py`: Indexed Job and start-gate manifest construction.
 - `regional_capacity_database.py`: Aurora and PostgreSQL observations.
+- `regional_capacity_priority_latency.py`: per-tier completion latency, read in
+  an api-ha Pod from where the active store layout keeps completed requests
+  (queue rows inline, replay partitions detached).
 - `regional_capacity_timeseries.py`: one sampling session per control-plane Pod
   through the load and the drain (processor in-flight, workers, queue depth and
   consumer cycles once per second), and the drain probe that starts at the
