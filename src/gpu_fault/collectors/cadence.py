@@ -13,9 +13,11 @@ is already spread over each interval. Two things that spread does not cover:
   15 s) and nothing else, so 12,800 nodes restarting together put their
   first posts into the same 15 s.
 
-This module adds the random part: every interval and every scheduled phase
-gets ``+-ratio`` of the interval (``GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO``,
-default 0.1, so a 300 s summary lands within 270-330 s), and a process adds a
+This module adds the random part: every repeating wait gets ``+-ratio`` of the
+interval and every scheduled phase half of that
+(``GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO``, default 0.1), so either way two
+consecutive posts are ``interval x (1 +- ratio)`` apart -- a 300 s summary
+270-330 s after the previous one -- and a process adds a
 uniform ``[0, GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS)`` (default 20 s) to
 its start-up spread. The readiness thresholds
 (``gpu_fault.collector_kinds.collector_silent_thresholds``) have to cover the
@@ -89,7 +91,8 @@ class CadenceJitter:
         return max(0.0, interval_seconds + self.offset(interval_seconds, uniform))
 
     def max_interval(self, interval_seconds: float) -> float:
-        """The longest wait :meth:`interval` can produce."""
+        """The longest wait :meth:`interval` can produce, and the longest spacing
+        of two consecutive :func:`jittered_next_phase` posts (bar the tick)."""
 
         return interval_seconds * (1 + self.ratio)
 
@@ -113,23 +116,32 @@ def jittered_next_phase(
     jitter: CadenceJitter,
     uniform: Callable[[float, float], float] = random.uniform,
 ) -> datetime:
-    """:func:`next_stable_phase` moved by the jitter, never into the past.
+    """The stable phase after the one ``observed_at`` served, moved by the jitter.
 
     The stable phase keeps the fleet spread across the interval and the node's
-    schedule restart-stable; the offset breaks the lockstep of nodes that
-    share a phase. A negative offset that would land before ``observed_at``
-    is clamped to it, which fires the post on the caller's next tick.
+    schedule restart-stable; the offset breaks the lockstep of nodes that share
+    a phase. Each phase moves by at most ``ratio x interval / 2``, so two
+    consecutive posts are ``interval x (1 +- ratio)`` apart, the bound
+    :func:`worst_case_silence_seconds` and the silence thresholds rely on.
+
+    A post goes out on the first tick at or after its moved phase, which can be
+    that half spread *before* the stable phase it serves, so the lookup starts
+    half a spread past ``observed_at``. Looking up from ``observed_at`` itself
+    found the phase just served a few seconds ahead and posted again on the
+    next tick or two, so about every other summary went out two or three times
+    and GF-REGIONAL-COLLECT-001 read the edge filter as not suppressing. The
+    result is never before ``observed_at``: the offset cannot exceed the lead.
     """
 
+    half_interval = interval_seconds / 2
     scheduled = next_stable_phase(
-        observed_at,
+        observed_at + timedelta(seconds=half_interval * jitter.ratio),
         cluster_id=cluster_id,
         node_id=node_id,
         channel=channel,
         interval_seconds=interval_seconds,
     )
-    moved = scheduled + timedelta(seconds=jitter.offset(interval_seconds, uniform))
-    return max(moved, observed_at)
+    return scheduled + timedelta(seconds=jitter.offset(half_interval, uniform))
 
 
 def worst_case_silence_seconds(

@@ -10330,8 +10330,10 @@ takes about half of that budget, which is why the 300 s channels stay on the rec
 keep-alive client connections cut 41,500 connection set-ups to 4,250 (no accept queue, median 0) but every closed-loop
 client's request went straight into the in-process admission queue (890 vs 1,100-1,140 req/s, p99 10-12.6 s) -- a real
 collector posts once per 30-300 s on its connection and is never in flight all at once. Jitter:
-`GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO` (0.1) moves every round of the inventory, the health summaries and the Agent
-heartbeat by +-10% (still anchored to the cluster/node/channel stable phase); `GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS`
+`GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO` (0.1) moves every Agent heartbeat wait by +-10% and every phase of the inventory
+and the health summaries by +-5% (still anchored to the cluster/node/channel stable phase; the next phase is looked up 5%
+past the observation, so an early post is never re-armed onto the phase it just served and sent twice), so two consecutive
+posts are always cadence x (1 +- 10%) apart; `GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS`
 (20) adds a random `[0, 20)` s start-up offset on top of the deterministic 15 s stagger (the kernel collector's first
 summary and the Agent's first heartbeat, its registration, are not delayed); the silence thresholds are checked against
 cadence x 1.1 + 15 + 20 + 47 s (the sink's full retry ladder): inventory 148 s <= 180 s, the 300 s channels 412 s <= 420 s
@@ -11043,7 +11045,7 @@ Parameter description:
 | `GPU_FAULT_WATCHER_RECONCILE_DEBOUNCE_SECONDS` | `0.5` | Debounce window merging Pod watch events per attempt, avoiding O(N²) full Observation resends for large jobs |
 | `GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS` | `15` | Stable stagger window for the first GPU/Host collection after an ordinary Collector starts/restarts; the phase is determined by a cluster/node/channel hash |
 | `GPU_FAULT_COLLECTOR_STARTUP_JITTER_SECONDS` | `20` | Random `[0, N)` start-up offset added on top of the stagger window; 0 disables it |
-| `GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO` | `0.1` | Random +-ratio x interval move of every periodic post (inventory, the health summaries, the Agent heartbeat), at most 0.5; 0 disables it |
+| `GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO` | `0.1` | Two consecutive periodic posts (inventory, the health summaries, the Agent heartbeat) are interval x (1 +- ratio) apart: each heartbeat wait moves +-ratio, each phase of a phase-anchored post +-ratio/2; at most 0.5; 0 disables it |
 | `GPU_FAULT_HTTP_CONNECTION_IDLE_SECONDS` | `90` | Idle ceiling of the node-side connection pool, below the NLB's 350 s; an idler connection is closed and replaced before reuse |
 | `GPU_FAULT_HTTP_CONNECTION_MAX_AGE_SECONDS` | `1800` | Longest life of a node-side connection (+-10% jitter); replaced at expiry so clients re-spread over Pods and workers; 0 unbounded |
 | `GPU_FAULT_HTTP_TCP_KEEPALIVE_SECONDS` | `60` | TCP keepalive idle time of node-side connections (probes every 15 s, 4 probes); 0 disables it |

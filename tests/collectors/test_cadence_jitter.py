@@ -8,7 +8,10 @@ bounds the readiness thresholds are proven to cover.
 
 from __future__ import annotations
 
+import random
+from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
+from typing import Any
 
 import pytest
 
@@ -25,9 +28,16 @@ from gpu_fault.collectors.cadence import (
     jittered_next_phase,
     worst_case_silence_seconds,
 )
-from gpu_fault.collectors.scheduling import next_stable_phase
+from gpu_fault.collectors.scheduling import next_stable_phase, stable_phase_seconds
 from gpu_fault.collectors.sinks import HttpEventSink
 from gpu_fault.telemetry import CollectorKind
+
+from ._support import (
+    DcgmMetricsCollector,
+    HostTelemetryCollector,
+    RecordingSink,
+    context,
+)
 
 NOW = datetime(2030, 1, 1, 12, 0, tzinfo=timezone.utc)
 #: The collectors' deterministic start-up spread (GPU_FAULT_COLLECTOR_STARTUP_SPREAD_SECONDS).
@@ -91,35 +101,155 @@ def test_zero_ratio_and_zero_startup_jitter_switch_the_randomness_off() -> None:
     )
 
 
-def test_a_jittered_phase_moves_within_the_ratio_and_never_into_the_past() -> None:
+def _next_phase(
+    observed_at: datetime,
+    jitter: CadenceJitter,
+    uniform: Callable[[float, float], float] = random.uniform,
+    channel: str = "gpu-metrics",
+) -> datetime:
+    return jittered_next_phase(
+        observed_at,
+        cluster_id="c",
+        node_id="n",
+        channel=channel,
+        interval_seconds=300,
+        jitter=jitter,
+        uniform=uniform,
+    )
+
+
+def test_a_jittered_phase_moves_by_half_the_ratio_and_never_into_the_past() -> None:
     jitter = CadenceJitter(ratio=0.1, startup_seconds=0.0)
     anchor = next_stable_phase(
         NOW, cluster_id="c", node_id="n", channel="gpu-metrics", interval_seconds=300
     )
+    assert (anchor - NOW).total_seconds() > 15.0, "NOW serves no phase"
     for _ in range(200):
-        moved = jittered_next_phase(
-            NOW,
-            cluster_id="c",
-            node_id="n",
-            channel="gpu-metrics",
-            interval_seconds=300,
-            jitter=jitter,
-        )
-        assert abs((moved - anchor).total_seconds()) <= 30.0
-        assert moved >= NOW
-    # A phase ten seconds away with the maximum negative offset (-30 s) would
-    # land in the past; it is clamped to the observation instead.
-    late = anchor - timedelta(seconds=10)
-    clamped = jittered_next_phase(
-        late,
-        cluster_id="c",
-        node_id="n",
-        channel="gpu-metrics",
-        interval_seconds=300,
-        jitter=jitter,
-        uniform=lambda low, high: low,
+        moved = _next_phase(NOW, jitter)
+        assert abs((moved - anchor).total_seconds()) <= 15.0
+        assert moved > NOW
+    # A post up to half a spread early, or late by a tick, served `anchor`; the
+    # next one belongs to the following phase whichever way the draw goes.
+    # Looking up from the post itself re-armed onto `anchor` (a few seconds
+    # ahead, or clamped to the post) and summarised twice (COLLECT-001).
+    following = anchor + timedelta(seconds=300)
+    for lead in (15.0, 10.0, 0.5, 0.0, -30.0):
+        served_at = anchor - timedelta(seconds=lead)
+        for draw, offset in ((lambda low, high: low, -15.0), (max, 15.0)):
+            moved = _next_phase(served_at, jitter, draw)
+            assert (moved - following).total_seconds() == pytest.approx(offset)
+
+
+@pytest.mark.parametrize("tick", [15.0, 15.4])
+@pytest.mark.parametrize("draw", ["lowest", "highest", "seeded"])
+def test_a_tick_loop_posts_once_per_stable_phase_within_the_spacing(
+    draw: str, tick: float
+) -> None:
+    """Every phase is posted exactly once and consecutive posts stay within
+    interval x (1 +- ratio) plus the tick that notices them, which is the bound
+    the silence thresholds are proven against. Before the fix the lowest draw
+    posted every phase twice and a seeded run doubled about every other one."""
+
+    jitter = CadenceJitter(ratio=0.1, startup_seconds=0.0)
+    uniform = {
+        "lowest": lambda low, high: low,
+        "highest": max,
+        "seeded": random.Random(65).uniform,
+    }[draw]
+    phase = stable_phase_seconds("c", "n", "host-telemetry", 300)
+    due: datetime | None = None
+    posts: list[datetime] = []
+    for index in range(int(3 * 3600 / tick)):
+        observed = NOW + timedelta(seconds=index * tick)
+        if due is None or observed >= due:
+            posts.append(observed)
+            due = _next_phase(observed, jitter, uniform, channel="host-telemetry")
+    scheduled = posts[1:]
+    served = [round((post.timestamp() - phase) / 300) for post in scheduled]
+    assert served == list(range(served[0], served[0] + len(served)))
+    gaps = [(b - a).total_seconds() for a, b in zip(scheduled, scheduled[1:])]
+    assert all(270.0 - tick <= gap <= 330.0 + tick for gap in gaps), gaps
+
+
+def _lowest_jitter_draw(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The collectors' own jitter at 0.1, every draw at its most negative: each
+    summary fires before its stable phase, the case the re-arm doubled."""
+
+    monkeypatch.setenv("GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO", "0.1")
+    offset = CadenceJitter.offset
+
+    def lowest(
+        self: CadenceJitter,
+        interval_seconds: float,
+        uniform: Callable[[float, float], float] = random.uniform,
+    ) -> float:
+        return offset(self, interval_seconds, lambda low, high: low)
+
+    monkeypatch.setattr(CadenceJitter, "offset", lowest)
+
+
+def _summary_gaps(requests: list[tuple[str, dict[str, Any]]]) -> list[float]:
+    stamps = [
+        datetime.fromisoformat(payload["observed_at"])
+        for _, payload in requests
+        if payload["edge_filter_reasons"] == ["health-summary"]
+    ]
+    return [(b - a).total_seconds() for a, b in zip(stamps, stamps[1:])]
+
+
+def test_the_dcgm_edge_filter_summarises_once_per_phase_with_the_jitter_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """COLLECT-001 on the live site: a healthy node's GPU_METRICS went out in
+    pairs one or two ticks apart because each early summary re-armed."""
+
+    _lowest_jitter_draw(monkeypatch)
+    sink = RecordingSink()
+    ticks = iter(NOW + timedelta(seconds=15 * index) for index in range(80))
+    collector = DcgmMetricsCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        now=lambda: next(ticks),
+        health_summary_seconds=300,
     )
-    assert clamped == late
+    text = (
+        'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 70\n'
+        'DCGM_FI_DEV_ECC_DBE_VOL_TOTAL{gpu="0",UUID="GPU-a"} 0\n'
+    )
+    for _ in range(80):
+        collector.collect_text(text)
+
+    reasons = [payload["edge_filter_reasons"] for _, payload in sink.requests]
+    assert reasons[0] == ["initial-baseline"]
+    assert set(map(tuple, reasons[1:])) == {("health-summary",)}
+    assert _summary_gaps(sink.requests) == [300.0] * (len(reasons) - 2)
+    assert len(reasons) >= 4
+
+
+def test_the_host_edge_filter_summarises_once_per_phase_with_the_jitter_on(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _lowest_jitter_draw(monkeypatch)
+    sink = RecordingSink()
+    ticks = iter(NOW + timedelta(seconds=15 * index) for index in range(80))
+    collector = HostTelemetryCollector(
+        sink,
+        context(),
+        node_id="worker-1",
+        now=lambda: next(ticks),
+        health_summary_seconds=300,
+    )
+    for name in HostTelemetryCollector.CONTRIBUTORS:
+        monkeypatch.setattr(collector, name, lambda _observed_at: [])
+    for _ in range(80):
+        collector.collect_once()
+
+    reasons = [payload["edge_filter_reasons"] for _, payload in sink.requests]
+    assert reasons[0] == ["baseline"]
+    assert set(map(tuple, reasons[1:])) == {("health-summary",)}
+    assert _summary_gaps(sink.requests) == [300.0] * (len(reasons) - 2)
+    assert len(reasons) >= 4
 
 
 def _retry_ladder_seconds() -> float:

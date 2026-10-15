@@ -2304,7 +2304,9 @@ after the write is retried once only for a GET or a POST carrying a retry identi
 `stale_connection_failures_total`), and §8.1 says which POST carries which. `stats()` / `transport_stats()` expose the
 counters and a log line summarises them every 300 s; the Agent heartbeat uses the pool with
 an `X-GPU-Fault-Request-ID` and `/healthz` gains `transport`. `CadenceJitter` (ratio 0.1, start-up 20 s) and
-`jittered_next_phase` (the stable phase +- ratio x interval, never before the observation) are wired into
+`jittered_next_phase` (the stable phase after the one the post served, +- ratio x interval / 2: the lookup starts that half
+spread past the observation, so an early post is never re-armed onto the phase it just served; consecutive posts are
+interval x (1 +- ratio) apart, never before the observation) are wired into
 `GpuInventoryCadence`, the DCGM/host/kernel/Fabric Manager/node-log/Kubernetes health summaries and the heartbeat wait;
 `collector_kinds.PostingCadence` puts each kind's posting interval next to its silence threshold and
 `silent_threshold_shortfalls(worst_case_silence)` is held by `tests/collectors/test_cadence_jitter.py` at
