@@ -423,8 +423,15 @@ def replay_completion(
                 windows["duplicate_window_start"] = datetime.now(
                     timezone.utc
                 ).isoformat()
+            # Called in process, so every parameter is passed by name (a route
+            # default is a FastAPI marker, not a value); the identity header is
+            # the one the executor sends with a result.
             completed = await complete_remote_command(
-                command.command_id, payload, cluster_id, dependencies
+                command.command_id,
+                payload,
+                cluster_id=cluster_id,
+                command_identity=command.command_id,
+                dependencies=dependencies,
             )
             statuses.append(completed.status.value)
             if index == 0:
