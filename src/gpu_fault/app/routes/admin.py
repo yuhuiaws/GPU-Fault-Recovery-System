@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any, Mapping
 
@@ -9,7 +10,7 @@ from fastapi.responses import JSONResponse
 
 from gpu_fault import __version__, module_digest
 from gpu_fault.app.authorization import authorization_bucket
-from gpu_fault.app.liveness import liveness_report
+from gpu_fault.app.liveness import READINESS_PATH, liveness_report
 from gpu_fault.operation_registry import OPERATION_REGISTRY
 
 
@@ -33,11 +34,17 @@ router = APIRouter(tags=["admin"])
 AGENT_PAGE_LIMIT = 500
 
 
-@router.get("/healthz")
-@authorization_bucket("public")
-async def healthz(
-    dependencies: AdminRouterDependencies = Depends(get_admin_dependencies),
-):
+def readiness_report(
+    dependencies: AdminRouterDependencies,
+) -> tuple[int, dict[str, Any]]:
+    """The ``/healthz`` verdict: HTTP status and a JSON-ready document.
+
+    Shared by the route and the per-process probe listener
+    (``gpu_fault.app.liveness``), which the kubelet's readiness probe reads so
+    that a cold-connect burst queued on the service socket cannot take every
+    replica out of the load balancer at once. 503 carries the same document.
+    """
+
     ctx = dependencies.context
     processor = dependencies.processor
     leadership = processor.leadership if processor is not None else None
@@ -96,10 +103,29 @@ async def healthz(
             else None
         ),
     }
-    if not processor_healthy or not registry_ready:
-        # The registry status carries datetimes; an unencoded payload made the
-        # 503 branch itself raise, which the probe read as a crash, not a 503.
-        return JSONResponse(status_code=503, content=jsonable_encoder(payload))
+    # The registry status carries datetimes; an unencoded payload made the 503
+    # branch itself raise, which the probe read as a crash, not a 503.
+    status = 200 if processor_healthy and registry_ready else 503
+    return status, jsonable_encoder(payload)
+
+
+def serve_readiness(
+    listener: Any | None, dependencies: Callable[[], AdminRouterDependencies]
+) -> None:
+    """Give the probe listener (when there is one) the ``/healthz`` verdict."""
+
+    if listener is not None:
+        listener.serve(READINESS_PATH, lambda: readiness_report(dependencies()))
+
+
+@router.get("/healthz")
+@authorization_bucket("public")
+async def healthz(
+    dependencies: AdminRouterDependencies = Depends(get_admin_dependencies),
+):
+    status, payload = readiness_report(dependencies)
+    if status != 200:
+        return JSONResponse(status_code=status, content=payload)
     return payload
 
 

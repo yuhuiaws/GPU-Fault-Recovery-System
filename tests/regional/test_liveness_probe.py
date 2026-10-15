@@ -106,6 +106,10 @@ def test_generated_deployments_probe_livez_for_liveness_and_healthz_for_readines
     assert container["readinessProbe"]["httpGet"]["path"] == "/healthz", (
         f"{manifest} readiness must keep the registry-aware /healthz"
     )
+    assert (
+        container["readinessProbe"]["httpGet"]["port"]
+        == container["livenessProbe"]["httpGet"]["port"]
+    ), f"{manifest} readiness must read /healthz on the probe listener"
 
 
 def test_regional_patch_stale_window_covers_an_aurora_writer_failover() -> None:

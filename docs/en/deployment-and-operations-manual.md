@@ -10249,8 +10249,25 @@ threads and 16 vs 8 flush slots gave identical results). On the dedicated port t
 median of 10 ms and a maximum of 0.61 s (that GC pause). The probe parameters are accordingly `periodSeconds: 10`,
 `timeoutSeconds: 10`, `failureThreshold: 3`: 10 s is an order of magnitude above the worst stall of a busy-but-alive
 process, and three unanswered probes in a row (30 s) mean the event loop has not run for longer than the whole burst --
-a real hang. Readiness keeps `/healthz` on the service port at 5 s x 3: a Pod that cannot accept a request promptly is
-exactly what readiness should report. When diagnosing, read `gpu_fault_listen_accept_queue_connections{port}` (accept
+a real hang. Readiness reads the same port too: the listener also answers `GET /healthz` with the route's own document
+(`readiness_report` in `app/routes/admin.py`: processor, spool consumer and registry freshness; 503 carries the same
+body), still at the base manifest's 5 s x 3, and the release engine's in-Pod registry check takes its port off the
+readiness probe as before. It used to read the service port on the theory that a Pod that cannot accept a request
+promptly should be NotReady, but under a fleet-wide burst every replica is that Pod at the same moment. Measured live
+in two 50-cluster rounds: the probe timed out three times in a row (`Client.Timeout exceeded while awaiting headers`)
+on all three api-ha Pods within 2.3 s while every load request was answered 2xx; the AWS Load Balancer Controller
+deregistered all three NLB targets within 2 s and revoked the NLB's ingress rule on the Pods' security group for
+3-4 s; the Pods were Ready again 4-6 s later and re-registered, yet the target group's `HealthyHostCount` stayed 0
+until the targets had passed the NLB health check again (the `target-health` readiness gate turned True ~40 s after
+re-registration), and simulated executor claims opened in that window were closed without a response
+(`RemoteDisconnected`; in one round every surviving executor within the same 1.2 s). Three earlier 50-cluster rounds show the same
+deregistrations (two or three targets, no restart) without a failed claim. Taking every replica out of the load
+balancer never relieves a backlog all replicas share, so readiness reports only what makes this process unfit for
+traffic. The service port keeps the startup probe (`tcpSocket`) and, for api-ha, the NLB health check (traffic port
+`/healthz`, 10 s timeout x 2 at a 10 s interval), which gates a roll through the readiness gate and, when every target
+misses it, fails open instead of deregistering anything. When diagnosing, read the kubelet's `Unhealthy` events and the
+controller's `deRegistering targets` / `revoking securityGroup ingress` lines with the target group's per-minute
+`HealthyHostCount`, and also `gpu_fault_listen_accept_queue_connections{port}` (accept
 queue depth of this process's listening socket; one `SO_REUSEPORT` socket per worker, so sum over the Pod's processes), `gpu_fault_listen_somaxconn`
 (the Pod network namespace's accept-queue cap: a Pod's own namespace gets the kernel default 4096, the 65535 the node
 DaemonSet writes does not reach the Pod, `--backlog 8192` is clamped to 4096, and once the queue is full new SYNs are

@@ -20,6 +20,25 @@ the same report the route gives. A stalled loop still fails the probe, because
 the accept and the answer both run on it; a loop that is merely busy answers
 within one iteration. The main-port ``/livez`` stays for single-process runs
 and operators.
+
+Readiness moved here as well. It stayed on the service port's ``/healthz``
+(5 s x 3) on the theory that a Pod that cannot accept a request promptly
+should be NotReady - but under a fleet-wide burst every replica is that Pod
+at the same moment. In two 50-cluster rounds the probe timed out three times
+in a row on all three api-ha Pods within 2.3 s while every load request was
+answered 2xx; the AWS Load Balancer Controller deregistered all three NLB
+targets (and revoked the NLB's ingress rule on the Pods' security group), and
+for the ~40 s the re-registered targets needed to pass the NLB health check
+again the load balancer had no healthy target, so executor claims opened in
+that window were closed without a response. Readiness asks whether *this*
+process should receive traffic - processor, spool consumer and registry
+freshness, the ``/healthz`` verdict - and a backlog all replicas share is not
+such a reason: taking every replica out turns a slow burst into an outage.
+So the listener answers ``GET`` :data:`READINESS_PATH` too, with the route's
+own document (:meth:`LivenessListener.serve`), and the renderer points the
+readiness probe here. The service port keeps the startup probe and, for the
+ingress, the NLB's health check, which gates a roll through the Pod readiness
+gate and fails open rather than deregistering when every target misses it.
 """
 
 from __future__ import annotations
@@ -35,6 +54,9 @@ LOGGER = logging.getLogger(__name__)
 
 LIVENESS_PORT_ENV = "GPU_FAULT_LIVENESS_PORT"
 LIVENESS_PATH = "/livez"
+#: The readiness document (``/healthz``) the listener serves once the app wires
+#: it (:meth:`LivenessListener.serve`); the kubelet's readiness probe reads it.
+READINESS_PATH = "/healthz"
 # A probe request is one line and a few headers; anything larger is not one.
 MAX_REQUEST_BYTES = 8192
 REQUEST_TIMEOUT_SECONDS = 2.0
@@ -122,12 +144,14 @@ _REASONS = {
 
 
 class LivenessListener:
-    """A per-process HTTP/1.1 responder for ``GET /livez`` on its own port.
+    """A per-process HTTP/1.1 responder for the kubelet's probes on its own port.
 
-    Bound with ``SO_REUSEPORT`` so every uvicorn worker in the Pod serves
-    the same port; the kubelet connects to the Pod IP and the kernel picks a
-    process. Runs entirely on the process's event loop: accepting the probe
-    and answering it are the liveness assertion.
+    ``GET /livez`` from construction, ``GET /healthz`` once the application
+    hands it the readiness verdict (:meth:`serve`). Bound with ``SO_REUSEPORT``
+    so every uvicorn worker in the Pod serves the same port; the kubelet
+    connects to the Pod IP and the kernel picks a process. Runs entirely on
+    the process's event loop: accepting the probe and answering it are the
+    liveness assertion.
     """
 
     def __init__(
@@ -144,6 +168,7 @@ class LivenessListener:
         self.host = host
         self.path = path
         self.report = report
+        self.routes: dict[str, LivenessReport] = {path: report}
         self.bound_port: int | None = None
         self.requests_total = 0
         self.failures_total = 0
@@ -160,12 +185,17 @@ class LivenessListener:
         )
         self.bound_port = self._server.sockets[0].getsockname()[1]
         LOGGER.info(
-            "liveness listener pid=%s port=%s path=%s",
+            "liveness listener pid=%s port=%s paths=%s",
             os.getpid(),
             self.bound_port,
-            self.path,
+            ",".join(sorted(self.routes)),
         )
         return self.bound_port
+
+    def serve(self, path: str, report: LivenessReport) -> None:
+        """Answer ``GET path`` with ``report`` as well (the readiness document)."""
+
+        self.routes[path] = report
 
     async def close(self) -> None:
         server, self._server = self._server, None
@@ -180,11 +210,12 @@ class LivenessListener:
         if len(parts) != 3 or not parts[2].startswith("HTTP/1."):
             return 400, {"detail": "malformed liveness request"}
         method, target = parts[0], parts[1].split("?", 1)[0]
-        if target != self.path:
+        report = self.routes.get(target)
+        if report is None:
             return 404, {"detail": "Not Found"}
         if method not in {"GET", "HEAD"}:
             return 405, {"detail": "Method Not Allowed"}
-        return self.report()
+        return report()
 
     async def _serve(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter

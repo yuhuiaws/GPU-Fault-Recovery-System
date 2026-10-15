@@ -2048,8 +2048,13 @@ evidence tier.
 Process liveness and the GC policy (`app/liveness.py`, `app/process_health.py`): at the end of lifespan start-up every
 uvicorn worker binds `GPU_FAULT_LIVENESS_PORT` with `SO_REUSEPORT` (the renderer sets service port + 10; 0 turns it
 off) and answers `GET /livez` on its own event loop with `liveness_report`, the verdict the route shares; the kubelet's
-liveness probe moves to that port with `periodSeconds/timeoutSeconds/failureThreshold = 10/10/3`, readiness is
-unchanged. The mechanism is in the deployment manual's liveness section (a cold-connect burst parks the probe connection
+liveness probe moves to that port with `periodSeconds/timeoutSeconds/failureThreshold = 10/10/3`. Readiness
+(`/healthz`, 5/5/3) reads that port too: at assembly `serve_readiness` hands the route's own verdict
+`readiness_report` (`app/routes/admin.py`, 503 with the same document) to `LivenessListener.serve`, and the renderer
+points the readiness probe at the listener port -- on the service port the same burst made all three api-ha Pods
+NotReady at once, the AWS Load Balancer Controller deregistered every NLB target, and for ~40 s the NLB had no healthy
+target and closed new claims without a response; the startup probe and the NLB health check stay on the service port.
+The mechanism is in the deployment manual's liveness section (a cold-connect burst parks the probe connection
 in the service socket's accept queue: locally, with 4,250 connections, a queue median of 3,874, a 3.6 s probe and 0.1 s
 in-app; on the dedicated port a median of 10 ms and a maximum of 0.61 s). `GPU_FAULT_GC_FREEZE_AFTER_STARTUP` (the
 renderer sets true) runs `gc.collect(); gc.freeze()` at the end of lifespan start-up; `GPU_FAULT_GC_GEN2_THRESHOLD`

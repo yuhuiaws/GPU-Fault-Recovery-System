@@ -92,13 +92,13 @@ LAUNCHER_MODULE = "gpu_fault.app.serve"
 # cut (transport/http_client.py), so 30 s heartbeats and 60 s inventory posts
 # keep one connection per process.
 KEEP_ALIVE_TIMEOUT_SECONDS = 100
-# The kubelet's liveness probe gets a per-process listener of its own
-# (``gpu_fault.app.liveness``), ten above the role's service port: the main
-# socket's accept queue is shared with the request storm, and a cold-connect
-# burst the ingress was absorbing in full (0 non-2xx) held ~3,900 of 4,250
-# connections in that queue, so ``/livez`` on the service port answered in
-# 3.6 s locally and past the 5 s timeout live - all three Pods restarted
-# while healthy. The probe timing itself lives in the regional patch.
+# The kubelet's probes get a per-process listener of their own
+# (``gpu_fault.app.liveness``), ten above the role's service port: its accept
+# queue is shared with the request storm, and a cold-connect burst the ingress
+# absorbed in full (0 non-2xx) held ~3,900 of 4,250 connections there, so
+# ``/livez`` on it took 3.6 s locally, >5 s live (all three Pods restarted) and
+# ``/healthz`` timed out 3 x 5 s on all three at once (every NLB target
+# deregistered). Liveness timing is in the regional patch, readiness's in base.
 LIVENESS_PORT_OFFSET = 10
 LIVENESS_PORT_NAME = "livez"
 # The ingress tier rolls behind the NLB (IP targets): a Pod must keep serving
@@ -392,13 +392,13 @@ def set_probe_port(container: dict, port: int) -> None:
 
 
 def set_liveness_port(container: dict[str, Any], port: int) -> None:
-    """Give the liveness probe the role's dedicated per-process listener.
+    """Give the liveness and readiness probes the role's per-process listener.
 
-    Adds (or renumbers) the ``livez`` containerPort, points the liveness
-    probe at it and tells every uvicorn worker which port to bind
-    (``GPU_FAULT_LIVENESS_PORT``, SO_REUSEPORT across the Pod's processes).
-    Readiness and startup keep the service port: a Pod that cannot accept
-    a request promptly is exactly what readiness should report.
+    Adds (or renumbers) the ``livez`` containerPort, points both HTTP probes
+    at it (``/livez`` and the ``/healthz`` document) and tells every uvicorn
+    worker which port to bind (``GPU_FAULT_LIVENESS_PORT``, SO_REUSEPORT
+    across the Pod's processes). Startup keeps the service port; a backlog
+    every replica shares is no reason to take one out of the load balancer.
     """
 
     ports = container.setdefault("ports", [])
@@ -409,9 +409,9 @@ def set_liveness_port(container: dict[str, Any], port: int) -> None:
         ports.append({"name": LIVENESS_PORT_NAME, "containerPort": port})
     else:
         declared["containerPort"] = port
-    probe = container.get("livenessProbe")
-    if probe and "httpGet" in probe:
-        probe["httpGet"]["port"] = port
+    for probe in (container.get("livenessProbe"), container.get("readinessProbe")):
+        if probe and "httpGet" in probe:
+            probe["httpGet"]["port"] = port
     set_env(container, "GPU_FAULT_LIVENESS_PORT", str(port))
 
 

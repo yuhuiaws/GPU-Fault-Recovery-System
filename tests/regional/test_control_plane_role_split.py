@@ -1391,7 +1391,7 @@ def test_role_split_refuses_an_unreadable_previous_container_env(tmp_path) -> No
 
 def test_role_split_gives_every_role_a_liveness_listener_port() -> None:
     """Service port + 10 per role, declared as the ``livez`` containerPort,
-    probed by the liveness probe and handed to the processes as
+    probed by the liveness and readiness probes and handed to the processes as
     ``GPU_FAULT_LIVENESS_PORT``; the start-up heap is frozen in every role.
     The probe's timing is the regional patch's and is checked from the
     generated manifests (tests/deploy/test_control_plane_liveness_probe.py)."""
@@ -1426,7 +1426,10 @@ def test_role_split_gives_every_role_a_liveness_listener_port() -> None:
         ports = {item["name"]: item["containerPort"] for item in container["ports"]}
         assert ports["livez"] == liveness_port, name
         assert container["livenessProbe"]["httpGet"]["port"] == liveness_port, name
-        assert container["readinessProbe"]["httpGet"]["port"] == service_port, name
+        # Readiness follows liveness onto the listener: on the service port a
+        # cold-connect burst timed it out on every replica at once (batch 107).
+        assert container["readinessProbe"]["httpGet"]["port"] == liveness_port, name
+        assert f"--port {service_port} " in container["args"][0], name
         env = _effective_env(items, deployment)
         assert env["GPU_FAULT_LIVENESS_PORT"] == str(liveness_port), name
         assert env["GPU_FAULT_GC_FREEZE_AFTER_STARTUP"] == "true", name

@@ -226,7 +226,7 @@ spec:
         readinessProbe:
           httpGet:
             path: /healthz
-            port: 8082
+            port: 8092
           initialDelaySeconds: 5
           periodSeconds: 5
           timeoutSeconds: 5

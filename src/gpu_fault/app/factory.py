@@ -75,6 +75,7 @@ from gpu_fault.app.remote_command_wakeups import RemoteCommandWakeupHub
 from gpu_fault.app.routes.admin import (
     AdminRouterDependencies,
     get_admin_dependencies,
+    serve_readiness,
 )
 from gpu_fault.app.routes.admin import (
     router as admin_router,
@@ -647,6 +648,10 @@ def _install_core_routes(
             regional_registry_runtime=regional_auth_registry,
             fleet_pin_runtime=ctx.fleet_pin_runtime,
         )
+    )
+    # The kubelet's readiness probe reads this verdict on the probe listener.
+    serve_readiness(
+        app.state.liveness_listener, app.dependency_overrides[get_admin_dependencies]
     )
     app.include_router(admin_router)
 

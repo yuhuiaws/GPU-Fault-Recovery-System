@@ -1,9 +1,14 @@
-"""The control-plane liveness probe: its own port, a sustained-stall threshold.
+"""The control-plane probes: their own port, a sustained-stall threshold.
 
-The regional patch is the source of the probe timing and the renderer gives
-each role its liveness listener port (service port + 10); the generated
-manifests must carry both. Readiness and startup are deliberately unchanged:
-a Pod that cannot accept a request promptly is what readiness should say.
+The regional patch is the source of the liveness timing and the renderer gives
+each role its probe listener port (service port + 10); the generated
+manifests must carry both. Readiness keeps the base's ``/healthz`` and 5 s x 3
+but reads it on that listener too: on the service port the 50-cluster
+cold-connect burst timed it out three times in a row on all three api-ha Pods
+within 2.3 s (every load request answered 2xx), the load balancer controller
+deregistered every NLB target, and executor claims opened while the
+re-registered targets waited for the NLB health check were closed without a
+response. Startup keeps the service port.
 
 Numbers (scripts/perf/ingress_event_loop_burst.py, 50 clusters x 85 cold-
 connect workers against four uvicorn processes): the service socket's accept
@@ -78,8 +83,10 @@ def test_every_generated_role_probes_its_liveness_listener_port():
         assert {key: probe[key] for key in LIVENESS_TIMING} == LIVENESS_TIMING
         ports = {item["name"]: item["containerPort"] for item in container["ports"]}
         assert ports == {"http": service_port, "livez": liveness_port}, filename
-        assert container["readinessProbe"]["httpGet"]["port"] == service_port
-        assert container["readinessProbe"]["timeoutSeconds"] == 5
+        readiness = container["readinessProbe"]
+        assert readiness["httpGet"] == {"path": "/healthz", "port": liveness_port}
+        assert (readiness["periodSeconds"], readiness["timeoutSeconds"]) == (5, 5)
+        assert container["startupProbe"]["tcpSocket"] == {"port": service_port}
         assert f"--port {service_port} " in container["args"][0]
 
 

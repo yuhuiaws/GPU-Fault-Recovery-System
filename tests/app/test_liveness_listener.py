@@ -8,6 +8,13 @@ restarted although every request was answered 202. The listener binds its
 own port with SO_REUSEPORT in every uvicorn worker and answers from the
 worker's event loop, so a stalled loop still fails the probe and a busy one
 answers within an iteration.
+
+The readiness probe reads ``/healthz`` on the same listener (batch 107): on the
+service port the same burst timed it out three times in a row on all three
+api-ha Pods at once, the load balancer controller deregistered every NLB
+target, and executor claims were closed without a response. The listener
+serves the route's own document, so the probe, the release tooling's in-Pod
+registry check and an operator read the same verdict.
 """
 
 from __future__ import annotations
@@ -17,6 +24,9 @@ import gc
 import http.client
 import json
 import socket
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -25,11 +35,18 @@ import pytest
 from gpu_fault.app import ApplicationContext, create_app
 from gpu_fault.app.liveness import (
     LIVENESS_PORT_ENV,
+    READINESS_PATH,
     LivenessListener,
     liveness_port_from_environment,
     liveness_report,
 )
-from tests._builders import build_store
+from tests._builders import asgi_client, build_context, build_store
+from tests.regional._regional_support import TOKEN_A, registration
+
+ROOT = Path(__file__).resolve().parents[2]
+REGISTRY_HEALTHZ_PROBE = (
+    ROOT / "deploy/control-plane/regional/probes/control_plane_registry_healthz.py"
+)
 
 
 def _get(port: int, path: str, method: str = "GET") -> tuple[int, bytes]:
@@ -70,7 +87,7 @@ def test_the_listener_answers_the_probe_from_the_event_loop() -> None:
             status, body = await asyncio.to_thread(_get, port, "/livez?probe=1")
             assert status == 503 and json.loads(body)["dead_threads"] == ["x"]
             status, _ = await asyncio.to_thread(_get, port, "/healthz")
-            assert status == 404, "only the liveness path is served here"
+            assert status == 404, "no readiness document until the app hands one"
             status, _ = await asyncio.to_thread(_get, port, "/livez", "POST")
             assert status == 405
             status, body = await asyncio.to_thread(_get, port, "/livez", "HEAD")
@@ -87,6 +104,79 @@ def test_the_listener_answers_the_probe_from_the_event_loop() -> None:
             _get(port, "/livez")
 
     asyncio.run(scenario())
+
+
+def test_the_listener_serves_the_readiness_document_it_is_handed() -> None:
+    verdicts: list[tuple[int, dict[str, Any]]] = [(200, {"status": "ok"})]
+
+    async def scenario() -> None:
+        listener = LivenessListener(
+            port=0, report=lambda: (200, {"status": "alive"}), host="127.0.0.1"
+        )
+        port = await listener.start()
+        try:
+            listener.serve(READINESS_PATH, lambda: verdicts[0])
+            status, body = await asyncio.to_thread(_get, port, "/healthz?verbose=1")
+            assert (status, json.loads(body)) == (200, {"status": "ok"})
+            verdicts[0] = (503, {"status": "unhealthy"})
+            status, body = await asyncio.to_thread(_get, port, "/healthz")
+            assert (status, json.loads(body)) == (503, {"status": "unhealthy"})
+            status, body = await asyncio.to_thread(_get, port, "/livez")
+            assert (status, json.loads(body)) == (200, {"status": "alive"})
+            status, _ = await asyncio.to_thread(_get, port, "/metrics")
+            assert status == 404, "the listener serves the probes, nothing else"
+        finally:
+            await listener.close()
+
+    asyncio.run(scenario())
+
+
+def test_the_app_answers_readiness_on_the_listener_with_the_route_document(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same document, same status, on both ports - 503 included, with the
+    registry's datetimes encoded - and the release engine's in-Pod registry
+    probe, which takes its port off the readiness probe, reads it there."""
+
+    port = _free_port()
+    monkeypatch.setenv(LIVENESS_PORT_ENV, str(port))
+    context = build_context()
+    context.regional_mode = True
+    context.store.save_regional_cluster(registration("cluster-a", TOKEN_A))
+    app = create_app(context)
+
+    async def scenario() -> list[tuple[int, dict[str, Any], int, dict[str, Any]]]:
+        seen = []
+        async with app.router.lifespan_context(app):
+            for ready in (True, False):
+                monkeypatch.setattr(
+                    app.state.regional_registry_runtime, "is_ready", lambda: ready
+                )
+                async with asgi_client(app) as client:
+                    route = await client.get("/healthz")
+                status, body = await asyncio.to_thread(_get, port, "/healthz")
+                seen.append((route.status_code, route.json(), status, json.loads(body)))
+            probe = await asyncio.to_thread(
+                subprocess.run,
+                [sys.executable, "-I", str(REGISTRY_HEALTHZ_PROBE)],
+                input=json.dumps({"port": port}),
+                capture_output=True,
+                text=True,
+                timeout=30,
+                check=True,
+            )
+        seen.append((0, json.loads(probe.stdout), 0, {}))
+        return seen
+
+    (ok, not_ready, probe) = asyncio.run(scenario())
+    assert ok[0] == ok[2] == 200 and ok[1] == ok[3], ok
+    assert not_ready[0] == not_ready[2] == 503, not_ready
+    assert not_ready[1] == not_ready[3], "the 503 branch carries the same document"
+    assert not_ready[3]["regional_registry"]["ready"] is False
+    refreshed = not_ready[3]["regional_registry"]["last_successful_refresh"]
+    assert isinstance(refreshed, str), "the registry's datetime must be encoded"
+    assert probe[1]["http_status"] == 503
+    assert probe[1]["regional_registry"]["ready"] is False
 
 
 def test_two_processes_worth_of_listeners_share_one_port() -> None:

@@ -2,7 +2,7 @@
 
 Request on stdin::
 
-    {"port": 8080}
+    {"port": 8090}
 
 Response: one JSON object on stdout with ``http_status`` (200 or 503 -- the
 route answers 503 with the same body while the process is not ready), the
@@ -16,10 +16,12 @@ The question this answers is the one a kubelet Ready condition does not: the
 Ready condition is the *last* probe's verdict, up to a probe period old, while
 a publish that execs into a Pod moments after a rollout needs to know that the
 registry runtime inside it has loaded the durable head *now*. ``port`` is a
-parameter because the three CPU roles serve their health documents on
-different ports (api-ha 8080, control-worker 8081, telemetry-spool-worker
-8082); the exec that runs this picks the port off the Deployment's own
-readiness probe, so the probe never guesses.
+parameter because the three CPU roles' readiness probes read the document on
+different ports (the per-process probe listener: api-ha 8090, control-worker
+8091, telemetry-spool-worker 8092; a release whose readiness still reads the
+service port 8080/8081/8082 serves the same document there); the exec that
+runs this picks the port off the Deployment's own readiness probe, so the
+probe never guesses.
 """
 
 import json

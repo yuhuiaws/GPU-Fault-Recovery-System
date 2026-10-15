@@ -86,7 +86,11 @@ def test_renderer_entrypoint_emits_isolated_roles_without_live_metadata(
         ), "DSN must remain a Secret reference in every role"
         assert f"--port {port} " in container["args"][0]
         assert f"--workers {workers} " in container["args"][0]
-        assert container["readinessProbe"]["httpGet"]["port"] == port
+        # Readiness reads /healthz on the role's probe listener, not the
+        # service port a cold-connect burst queues on (batch 107).
+        assert container["readinessProbe"]["httpGet"]["port"] == (
+            port + RENDERER.LIVENESS_PORT_OFFSET
+        )
         assert "--limit-max-requests" not in container["args"][0]
         if role != "worker":
             assert not set(RENDERER.PROCESSOR_POOL_ENV) & env.keys()

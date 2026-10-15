@@ -19,10 +19,10 @@ spec:
       containers:
         - name: api
           ports:
-            # The liveness probe's own listener (gpu_fault.app.liveness),
-            # bound by every uvicorn worker with SO_REUSEPORT; the renderer
-            # numbers it per role (service port + 10) and sets
-            # GPU_FAULT_LIVENESS_PORT to match.
+            # The probes' own listener (gpu_fault.app.liveness), bound by
+            # every uvicorn worker with SO_REUSEPORT; the renderer numbers it
+            # per role (service port + 10), points liveness (/livez) and
+            # readiness (/healthz) at it and sets GPU_FAULT_LIVENESS_PORT.
             - name: livez
               containerPort: 8090
           # Bounded so a queue burst cannot expand the API into the
@@ -220,7 +220,12 @@ spec:
           # order of magnitude above a busy-but-alive process, and three
           # misses in a row (30 s) means the event loop has not run for
           # longer than the burst itself - a real hang, not load. Readiness
-          # keeps 5 s x 3 on the service port, where queueing is the point.
+          # (the base's /healthz at 5 s x 3) moved to this port too: on the
+          # service port the same burst timed it out on all three Pods at
+          # once, and the load balancer controller deregistered every NLB
+          # target - a backlog all replicas share is not a reason to take
+          # them out of rotation. The NLB health check stays on the service
+          # port and gates a roll through the Pod readiness gate.
           livenessProbe:
             httpGet:
               path: /livez
