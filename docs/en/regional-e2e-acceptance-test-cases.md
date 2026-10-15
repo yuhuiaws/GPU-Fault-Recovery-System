@@ -10711,9 +10711,13 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
      HyperPod `NodeRecovery=None`.
   4. The windows have been opened with the helpers above: both variables read 6 and 600 on every ready
      replica.
-  5. The site's `GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS` is large enough that the two XIDs
-     the runner writes in succession still land in the same job DAG; the runner prints the current
-     value in the plan.
+  5. The site's `GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS` is at least 5 s, so that the two
+     XIDs the runner writes staggered still land in the same job DAG: the preflight reads the value in
+     effect on every ready control-worker replica (the smallest when replicas disagree; the release
+     state, then the shipped default of 5, when none sets it) and refuses anything below 5 s
+     (including 0, which turns aggregation off) by name ("multi-node aggregation window ... is below
+     5s"); the plan prints the value (`aggregation_window_seconds`) and the gap between the two
+     writes (`injection_stagger_seconds`).
   6. No synthetic replacement route is needed: the unknown-outcome direction here must not append
      `REPLACE_NODE`, and `GPU_FAULT_ENABLE_SYNTHETIC_REPLACEMENT_TESTS` should stay unset.
 - Steps:
@@ -10746,6 +10750,23 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
      (`destructive_node_probe.py write-xid79 / write-xid46`, each with its own BDF,
      marker and drill id). The order must not be reversed: hitting node-c first lets its reboot
      start early, so node-c's wait is already running while node-b is wrestling with the holder.
+     The two probe calls overlap (`run_destr014_branch_exhaustion.inject_in_window`): node-b's call
+     starts when node-c's has returned or after `INJECTION_STAGGER_SECONDS` (1.5 s), whichever comes
+     first, and is never made when node-c's write has already failed by then. One probe call wraps its
+     exec in three ownership reads on either side (about 1.2 s per kubectl call on eks-managed);
+     earlier the two calls ran back to back and wrote the XIDs 9 s apart, outside the 5 s window:
+     node-b's XID 46 arrived after the shared `STOP_WORKLOADS` of node-c's branch had stopped the job,
+     the completion watcher recorded the product's own stop at once (no longer after the 300 s
+     missing-Pod grace), so the event no longer belonged to the job and opened a node-level
+     `RESET_GPU` workflow of its own (PENDING for good, because node-c's workflow held the failure
+     domain's remediation budget), and the case judged 28 errors that all followed from it. Earlier
+     runs joined only because the stopped attempt kept reading as RUNNING through that grace. The
+     verdict reads the two stored events' own `observed_at` (`destr014_verdicts.injection_window_errors`):
+     node-c's XID 79 must precede node-b's XID 46 and the two must be less than the aggregation window
+     apart, otherwise the errors say so by name ("the two injections are ... apart, outside the ...
+     aggregation window" / "the injection order was not kept") -- the injection did not set the case
+     up, which is not a product defect; both `observed_at` values and both exec return times are
+     recorded in `injection-observed.json`.
   5. Observe the control plane: both XIDs land in the same `workflow_request_id`, `dag_enabled=true`,
      the shared `STOP_WORKLOADS` has `node_ids` exactly `[node-b, node-c]`;
      the node-b branch is `MARK_UNSCHEDULABLE → QUIESCE_GPU_SERVICES →

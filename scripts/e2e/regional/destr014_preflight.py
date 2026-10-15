@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Mapping
 from typing import Any, Protocol
 
 from scripts.e2e.regional import control_plane_env_window as control_window
@@ -30,6 +31,39 @@ from scripts.e2e.regional import warm_spare_provider
 from scripts.e2e.regional.node_agent_identity import agent_node_identity
 from scripts.e2e.regional.regional_workload_inventory import blocking_node_taints
 from scripts.e2e.regional.warm_spare_fixture import SPARE_LABEL
+
+AGGREGATION_WINDOW_VARIABLE = "GPU_FAULT_MULTI_NODE_AGGREGATION_WINDOW_SECONDS"
+# The shipped window, and the least the runner's staggered pair of kmsg writes
+# fits in: node-b's write trails node-c's by the injection stagger plus the two
+# collectors' own latency, and both must reach the PENDING job workflow.
+DEFAULT_AGGREGATION_WINDOW_SECONDS = 5
+MIN_AGGREGATION_WINDOW_SECONDS = 5
+
+
+def aggregation_window_seconds(control_env: Mapping[str, Any]) -> int:
+    """The window the preflight read; one it did not read is the shipped default."""
+
+    value = control_env.get("aggregation_window_seconds")
+    return DEFAULT_AGGREGATION_WINDOW_SECONDS if value is None else int(value)
+
+
+def resolved_aggregation_window(
+    replicas: list[dict[str, Any]], stated: Any = None
+) -> int:
+    """The window the control-worker replicas run with (the smallest while a
+    rollout leaves them disagreeing), else the release state's, else the
+    shipped default. An explicit 0 turns aggregation off; ``or 5`` used to read
+    it as the default."""
+
+    windows = [
+        int(value)
+        for item in replicas
+        if (value := (item.get("values") or {}).get(AGGREGATION_WINDOW_VARIABLE))
+        not in (None, "")
+    ]
+    if windows:
+        return min(windows)
+    return DEFAULT_AGGREGATION_WINDOW_SECONDS if stated is None else int(stated)
 
 
 class PreflightSettings(Protocol):
@@ -246,6 +280,13 @@ def preflight_errors(
             break
     if int(control_env.get("max_rungs") or 0) < 2:
         errors.append("GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS is below 2")
+    window = aggregation_window_seconds(control_env)
+    if window < MIN_AGGREGATION_WINDOW_SECONDS:
+        errors.append(
+            f"multi-node aggregation window {window}s is below "
+            f"{MIN_AGGREGATION_WINDOW_SECONDS}s; node-c's and node-b's XIDs "
+            "cannot land in one job DAG"
+        )
     errors.extend(budget_headroom_errors(budget))
     busy = [*fault_workloads, *sibling_workloads]
     if busy:
@@ -308,16 +349,17 @@ def _control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
         if parsed.get("poll"):
             values["poll_interval_seconds"] = float(parsed["poll"])
         break
-    # The branch rung count is read by the control-worker
-    # (``app.context._branch_escalator``), not by the executor.
+    # The branch rung count and the aggregation window are read by the
+    # control-worker (``app.context._branch_escalator``, the coordinator), not
+    # by the executor.
+    replicas = control_window.replica_env(
+        regional,
+        plane="cpu",
+        deployment=control_window.DEPLOYMENT,
+        names=["GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS", AGGREGATION_WINDOW_VARIABLE],
+    )
     rungs = [
-        item["values"].get("GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS")
-        for item in control_window.replica_env(
-            regional,
-            plane="cpu",
-            deployment=control_window.DEPLOYMENT,
-            names=["GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS"],
-        )
+        item["values"].get("GPU_FAULT_BRANCH_ESCALATION_MAX_RUNGS") for item in replicas
     ]
     values["max_rungs"] = min((int(value) for value in rungs if value), default=2)
     connection = json.loads(
@@ -329,8 +371,8 @@ def _control_env(regional: RegionalLiveFixture) -> dict[str, Any]:
     values["job_lifetime_seconds"] = int(
         state.get("job_workflow_lifetime_seconds") or 3600
     )
-    values["aggregation_window_seconds"] = int(
-        state.get("multi_node_aggregation_window_seconds") or 5
+    values["aggregation_window_seconds"] = resolved_aggregation_window(
+        replicas, state.get("multi_node_aggregation_window_seconds")
     )
     return values
 

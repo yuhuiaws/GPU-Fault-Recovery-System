@@ -36,6 +36,7 @@ import json
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, wait as wait_futures
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -56,6 +57,7 @@ from scripts.e2e.regional.destr014_preflight import (  # noqa: E402
     BUDGET_HEADROOM as BUDGET_HEADROOM,
     _control_env,
     agent_node_identity,
+    aggregation_window_seconds,
     budget_headroom,
     executor_env_snapshot,
     managed_recovery_errors,
@@ -125,6 +127,13 @@ CASE_ID = "GF-REGIONAL-DESTR-014"
 PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-008"
 CONFIRMATION = "DESTR014_EXECUTE"
 VARIANTS = ("unknown-reboot",)
+# node-c's XID 79 and node-b's XID 46 must land inside one aggregation window
+# (5 s by default), node-c first. A probe call brackets its exec with three
+# ownership reads on either side (about 1.2 s per kubectl call on eks-managed),
+# so two calls in a row wrote the faults 9 s apart: node-b's XID reached a job
+# already stopped and, since the watcher records our own stop at once, opened a
+# separate workflow. The two calls overlap; node-b's starts this much later.
+INJECTION_STAGGER_SECONDS = 1.5
 
 from scripts.e2e.regional.destr014_verdicts import (  # noqa: E402,F401
     canonical_digest as _digest,
@@ -147,6 +156,7 @@ from scripts.e2e.regional.destr014_verdicts import (  # noqa: E402,F401
     follow_up_errors,
     host_errors,
     injection_errors,
+    injection_window_errors,
     lifetime_errors,
     node_reboot_identities,
     operator_hold_reasons,
@@ -333,6 +343,10 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "manifest": str(settings.manifest),
         "verify_max_attempts": settings.verify_max_attempts,
         "managed_recovery_timeout_seconds": settings.managed_recovery_timeout_seconds,
+        "aggregation_window_seconds": aggregation_window_seconds(
+            preflight.get("control_env") or {}
+        ),
+        "injection_stagger_seconds": INJECTION_STAGGER_SECONDS,
         "recovery_safeguard": {
             "kind": "persistent-host-systemd",
             "helper_sha256": hashlib.sha256(recovery.PROBE.read_bytes()).hexdigest(),
@@ -785,6 +799,52 @@ def _build_live_run(
     return run
 
 
+def inject_in_window(run: _LiveRun) -> dict[str, str]:
+    """Write node-c's XID 79, then node-b's XID 46, inside one aggregation
+    window; return when each probe call returned. node-b's call starts when
+    node-c's returned or ``INJECTION_STAGGER_SECONDS`` passed, whichever is
+    first, and never after node-c's write failed by then."""
+
+    settings = run.settings
+    returned: dict[str, str] = {}
+
+    def write(node: str, probe: Any, command: str, label: str, bdf: str) -> None:
+        probe.execute(
+            command,
+            "--marker",
+            run.marker,
+            "--drill-id",
+            f"{run.run_id}-{label}",
+            "--pci-bdf",
+            bdf,
+        )
+        returned[node] = datetime.now(timezone.utc).isoformat()
+
+    with ThreadPoolExecutor(max_workers=2, thread_name_prefix="destr014-xid") as pool:
+        sibling = pool.submit(
+            write,
+            settings.sibling_node,
+            run.inject_sibling,
+            "write-xid79",
+            "c",
+            settings.sibling_pci_bdf,
+        )
+        wait_futures([sibling], timeout=INJECTION_STAGGER_SECONDS)
+        if sibling.done():
+            sibling.result()
+        fault = pool.submit(
+            write,
+            settings.fault_node,
+            run.inject_fault,
+            "write-xid46",
+            "b",
+            settings.fault_pci_bdf,
+        )
+        sibling.result()
+        fault.result()
+    return returned
+
+
 def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
     """Open the control-plane and executor env windows, start the job, arm
     both node-side failures, inject the two faults and wait until both land in
@@ -891,24 +951,7 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
     run.injection_started = True
     run.physical_outcome_unknown = True
     _checkpoint(run)
-    run.inject_sibling.execute(
-        "write-xid79",
-        "--marker",
-        run.marker,
-        "--drill-id",
-        f"{run_id}-c",
-        "--pci-bdf",
-        settings.sibling_pci_bdf,
-    )
-    run.inject_fault.execute(
-        "write-xid46",
-        "--marker",
-        run.marker,
-        "--drill-id",
-        f"{run_id}-b",
-        "--pci-bdf",
-        settings.fault_pci_bdf,
-    )
+    returned = inject_in_window(run)
     fault_state = run.regional.wait_for_workflow(
         node=settings.fault_node,
         marker=run.marker,
@@ -928,6 +971,23 @@ def _arm_and_inject(run: _LiveRun) -> tuple[dict[str, Any], dict[str, Any]]:
         timeout_seconds=300,
         hyperpod_cluster=settings.hyperpod_cluster,
         terminal=False,
+    )
+    # The verdict reads the events' own clocks; the exec returns are one
+    # kubectl round trip late and only say when the runner acted.
+    write_json_atomic(
+        case_dir / "injection-observed.json",
+        {
+            "marker": run.marker,
+            "exec_returned_at": returned,
+            "event_observed_at": {
+                settings.sibling_node: (sibling_state.get("event") or {}).get(
+                    "observed_at"
+                ),
+                settings.fault_node: (fault_state.get("event") or {}).get(
+                    "observed_at"
+                ),
+            },
+        },
     )
     run.incident_id = str((fault_state.get("incident") or {}).get("incident_id") or "")
     _checkpoint(run)
@@ -1186,6 +1246,17 @@ def execute_case(
             )
         fault_state, sibling_state = _arm_and_inject(run)
         errors = injection_errors(fault_state, sibling_state)
+        errors.extend(
+            injection_window_errors(
+                sibling_state,
+                fault_state,
+                sibling_node=settings.sibling_node,
+                fault_node=settings.fault_node,
+                aggregation_window_seconds=aggregation_window_seconds(
+                    run.preflight.get("control_env") or {}
+                ),
+            )
+        )
         state = _observe_until_terminal(run, fault_state)
         control_errors, workflow, incident = _control_plane_errors(run, state)
         errors.extend(control_errors)

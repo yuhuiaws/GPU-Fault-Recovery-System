@@ -57,6 +57,8 @@ class RunnerHarness:
         self.sibling_reboots = True
         self.installer_restores = False
         self.pending_reads = 0
+        # Seconds node-b's stored XID 46 trails node-c's XID 79.
+        self.injection_spread = 1.5
         self.restored_incidents: set[str] = set()
         self.live_release = "release-test"
         self.node_uids = {
@@ -252,7 +254,18 @@ class RunnerHarness:
     def make_regional(self) -> Any:
         def wait(**kwargs: Any) -> dict[str, Any]:
             self.event("workflow.wait")
-            return self.snapshot()
+            # The stored event on its node's own clock: node-c's XID 79 first,
+            # node-b's 1.5 s later, inside the 5 s aggregation window.
+            offset = self.injection_spread if kwargs["node"] == verdicts.FAULT else 0
+            return {
+                **self.snapshot(),
+                "event": {
+                    "node_id": kwargs["node"],
+                    "observed_at": datetime.fromtimestamp(
+                        1000 + offset, timezone.utc
+                    ).isoformat(),
+                },
+            }
 
         def node(node: str) -> dict[str, Any]:
             self.event("node.snapshot")
@@ -458,6 +471,28 @@ def test_live_runner_preserves_unknown_reboot_hold_after_agent_recovery(
         reason.startswith("product:") for reason in report["hold_reasons"]
     ), report["hold_reasons"]
     assert report["cleanup"]["hold_reasons"] == report["hold_reasons"]
+
+
+def test_a_pair_outside_the_window_names_the_injection_not_the_product(
+    runner: RunnerHarness,
+) -> None:
+    """The live eks-managed attempt wrote the two XIDs 9 s apart against a 5 s
+    window; the verdict now says so beside whatever the split caused."""
+
+    from tests.regional.test_acceptance_reboot_hold_alignment import unknown_reboot
+
+    runner.workflow = unknown_reboot()
+    runner.injection_spread = 9.0
+    code, report = runner.execute()
+    assert code == 1 and report["verdict"] == "FAIL", report
+    assert report["errors"] == [
+        "the two injections are 9.0s apart, outside the 5s aggregation window"
+    ], report["errors"]
+    observed = json.loads((runner.case_dir / "injection-observed.json").read_text())
+    nodes = {verdicts.FAULT, verdicts.SIBLING}
+    assert (
+        set(observed["event_observed_at"]) == set(observed["exec_returned_at"]) == nodes
+    )
 
 
 def test_installer_restored_sibling_is_accepted_and_the_hold_mirrors_the_product(

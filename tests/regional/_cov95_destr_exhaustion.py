@@ -156,6 +156,8 @@ class ExhaustionHarness(BranchHarness):
         self.support_incident = "support-owned"
         self.incident_state = "QUARANTINED"
         self.pending_reads = 0
+        # Seconds node-b's stored XID 46 trails node-c's XID 79.
+        self.injection_spread = 1.5
         self.rebooted = False
         self.agent_settle_reads = 0
         self.directory = tmp_path
@@ -375,9 +377,16 @@ class ExhaustionRegional(BranchRegional):
             if self.h.split and kwargs["node"] == data.SIBLING
             else data.REQUEST
         )
+        # Each node's stored event on its own clock: node-c's XID 79 first,
+        # node-b's ``injection_spread`` seconds later.
+        offset = self.h.injection_spread if kwargs["node"] == data.FAULT else 0.0
         return {
             "workflow": {"request_id": request, "dag_enabled": True},
             "incident": {"incident_id": data.INCIDENT},
+            "event": {
+                "node_id": kwargs["node"],
+                "observed_at": (NOW + timedelta(seconds=offset)).isoformat(),
+            },
         }
 
     def release_id(self) -> str:

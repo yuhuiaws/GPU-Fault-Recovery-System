@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import control_plane_env_window as control_window
+from scripts.e2e.regional import destr014_preflight as preflight
 from scripts.e2e.regional import executor_env_window as env_window
 from scripts.e2e.regional import run_destr014_branch_exhaustion as destr014
 from scripts.e2e.regional.regional_case_contract import RegionalCaseMetadata
@@ -823,6 +824,53 @@ def test_preflight_refuses_disabled_reboot_and_low_rung_ceiling() -> None:
     kwargs["reboot_probe_errors"] = ["HyperPod NodeRecovery is not None"]
     errors = destr014.preflight_errors(**kwargs)
     assert "HyperPod NodeRecovery is not None" in errors
+
+
+def test_preflight_refuses_a_window_the_staggered_xid_pair_cannot_fit() -> None:
+    kwargs = _happy_preflight_kwargs()
+    for window in (2, 0):
+        kwargs["control_env"]["aggregation_window_seconds"] = window
+        assert destr014.preflight_errors(**kwargs) == [
+            f"multi-node aggregation window {window}s is below 5s; node-c's and "
+            "node-b's XIDs cannot land in one job DAG"
+        ]
+    # A window the preflight did not read is the shipped default, not a refusal.
+    kwargs["control_env"].pop("aggregation_window_seconds")
+    assert destr014.preflight_errors(**kwargs) == []
+
+
+def test_the_window_is_the_one_every_control_worker_runs_with() -> None:
+    def replica(value: str | None) -> dict[str, Any]:
+        return {"values": {preflight.AGGREGATION_WINDOW_VARIABLE: value}}
+
+    # Mid-rollout the replicas disagree; the smaller window is the one a pair
+    # of writes has to fit.
+    assert preflight.resolved_aggregation_window([replica("5"), replica("3")]) == 3
+    assert preflight.resolved_aggregation_window([replica("8")], stated=5) == 8
+    # Unset on every replica: the release state, then the shipped default. An
+    # explicit 0 is aggregation turned off, not the default.
+    assert preflight.resolved_aggregation_window([replica(None)], stated=0) == 0
+    assert preflight.resolved_aggregation_window([replica("")]) == 5
+    assert preflight.resolved_aggregation_window([], stated=None) == 5
+
+
+def test_the_plan_prints_the_window_and_the_injection_stagger() -> None:
+    from types import SimpleNamespace
+
+    settings = SimpleNamespace(
+        variant="unknown-reboot",
+        fault_node=FAULT,
+        sibling_node=SIBLING,
+        job_id="job",
+        attempt_id="job-a001",
+        manifest=Path("manifest.yaml"),
+        verify_max_attempts=6,
+        managed_recovery_timeout_seconds=600,
+    )
+    preflight_view = {"control_env": {"aggregation_window_seconds": 7}}
+    details = destr014.plan_details(settings, preflight_view)
+    assert details["aggregation_window_seconds"] == 7
+    assert details["injection_stagger_seconds"] == destr014.INJECTION_STAGGER_SECONDS
 
 
 def test_preflight_refuses_busy_nodes_open_workflows_and_full_budget() -> None:

@@ -32,6 +32,10 @@ from scripts.e2e.regional.collector_reboot_evidence import (  # noqa: E402
     provider_event_source,
     reboot_event_names,
 )
+from scripts.e2e.regional.destr015_verdicts import (  # noqa: E402
+    event_observed_at,
+    spread_errors,
+)
 from scripts.e2e.regional.guardrail_audit_evidence import (  # noqa: E402
     EC2_REPLACEMENT_MUTATIONS,
 )
@@ -632,6 +636,34 @@ def injection_errors(
         errors.append("the two XID injections did not join one workflow_request_id")
     if not (fault_workflow.get("dag_enabled") and sibling_workflow.get("dag_enabled")):
         errors.append("the joined workflow is not dag_enabled")
+    return errors
+
+
+def injection_window_errors(
+    sibling_state: dict[str, Any],
+    fault_state: dict[str, Any],
+    *,
+    sibling_node: str,
+    fault_node: str,
+    aggregation_window_seconds: int,
+) -> list[str]:
+    """Step 4, judged on the stored events' own ``observed_at``: node-c's XID
+    79 first, node-b's XID 46 inside the same aggregation window. A pair that
+    misses the window was never a candidate for the in-window merge, so the
+    join verdicts alone would read like a product defect (an eks-managed run
+    wrote the two 9 s apart and judged 28 consequences of that)."""
+
+    observed = event_observed_at({sibling_node: sibling_state, fault_node: fault_state})
+    errors = spread_errors(
+        observed, aggregation_window_seconds=aggregation_window_seconds
+    )
+    if not errors and datetime.fromisoformat(
+        observed[fault_node].replace("Z", "+00:00")
+    ) <= datetime.fromisoformat(observed[sibling_node].replace("Z", "+00:00")):
+        errors.append(
+            "node-b's XID 46 was observed before node-c's XID 79; the "
+            "injection order was not kept"
+        )
     return errors
 
 
