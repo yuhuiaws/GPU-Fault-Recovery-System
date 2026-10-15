@@ -10302,9 +10302,12 @@ The node side (collectors and the Agent) moves to long-lived connections with ji
 the NLB's fixed 350 s idle timeout) is closed and replaced before reuse instead of wasting an attempt on a dead flow,
 `GPU_FAULT_HTTP_TCP_KEEPALIVE_SECONDS` (60 s, probes 15 s x 4) keeps the NLB's idle clock from expiring, and a connection
 older than `GPU_FAULT_HTTP_CONNECTION_MAX_AGE_SECONDS` (1800 s, +-10% jitter) is replaced so clients re-spread over Pods
-and workers; a keep-alive connection the peer closed meanwhile still fails closed -- only an idempotent request (GET, or a
-POST carrying `Idempotency-Key`/`X-GPU-Fault-Request-ID`; the Agent heartbeat now carries the latter) is retried once on
-a fresh connection. The server-side `--timeout-keep-alive` rises from 5 s to 100 s (above the client's 90 s idle cut), so
+and workers; a connection the peer closed while it idled (a control-plane roll, a keep-alive expiry) is found before
+anything is written to it and replaced (counted as `peer_closed_total`), and a request whose write failed is sent again on
+a fresh connection -- both safe for any request, a claim included; a failure after the write still fails closed -- only a
+GET, or a POST carrying `Idempotency-Key`/`X-GPU-Fault-Request-ID`/`X-GPU-Fault-Command-ID` (the Agent heartbeat carries the
+second, the executor's result/renewal/progress the third), is retried once on a fresh connection, and detailed design v2
+§8.1 says which POST carries which. The server-side `--timeout-keep-alive` rises from 5 s to 100 s (above the client's 90 s idle cut), so
 the 30 s heartbeat and the 60 s inventory each keep one connection per process while the 300 s health summaries still
 reconnect. Capacity arithmetic: uvicorn's `--limit-concurrency 4096` counts idle keep-alive connections, and the design
 scale (12,800 nodes x two sub-90 s channels = 25,600 long-lived connections / 12 ingress processes ~ 2,133 per process)

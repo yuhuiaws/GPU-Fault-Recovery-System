@@ -2086,9 +2086,15 @@ The renderer makes `-m gpu_fault.app.serve` a prefix contract (`LAUNCHER_MODULE`
 Node-side long connections and jitter (`transport/http_client.py`, `collectors/cadence.py`): the pool records
 `_PooledConnection(opened_at, last_used_at, expires_at)` under `ConnectionPolicy.from_environment` (90 s idle < the NLB's
 350 s, 1800 s +-10% lifetime, TCP keepalive 60 s / 15 s x 4; out-of-range values fail closed); before reuse an idle or
-aged connection is closed (`idle_expired_total` / `age_expired_total`), a connection the peer closed is retried once only
-for an idempotent request (`stale_connection_retries_total` vs `stale_connection_failures_total`), `stats()` /
-`transport_stats()` expose the counters and a log line summarises them every 300 s; the Agent heartbeat uses the pool with
+aged connection is closed (`idle_expired_total` / `age_expired_total`), and so is one the peer already closed: between two
+requests the peer owes nothing, so a socket that polls readable holds its FIN or RST (`peer_closed()`, counted as
+`peer_closed_total`) and is replaced before a byte is written. A request whose write itself failed (`_RequestNotWritten`:
+`http.client` writes the head, then the body, so the peer holds at most a head without its whole body, which no server
+acts on) is sent once more on a fresh connection. Both hold for every request, a non-idempotent claim included. A failure
+after the write is retried once only for a GET or a POST carrying a retry identity (`RETRY_IDENTITY_HEADERS`:
+`Idempotency-Key`, `X-GPU-Fault-Request-ID`, `X-GPU-Fault-Command-ID`; `stale_connection_retries_total` vs
+`stale_connection_failures_total`), and §8.1 says which POST carries which. `stats()` / `transport_stats()` expose the
+counters and a log line summarises them every 300 s; the Agent heartbeat uses the pool with
 an `X-GPU-Fault-Request-ID` and `/healthz` gains `transport`. `CadenceJitter` (ratio 0.1, start-up 20 s) and
 `jittered_next_phase` (the stable phase +- ratio x interval, never before the observation) are wired into
 `GpuInventoryCadence`, the DCGM/host/kernel/Fabric Manager/node-log/Kubernetes health summaries and the heartbeat wait;
@@ -2933,7 +2939,11 @@ Deduplication is four stacked layers; **there is no single `dedupKey`**:
 
 1. **Exact `event_id` deduplication**: `incident_by_event` in `gpu_fault_links`
    (`event_id` → `incident_id`) is a unique key. Re-posting the same `event_id` hits the existing incident,
-   and the decision returns `duplicate=true` with `correlated_event_id`. This is the concrete guarantee for at-least-once delivery.
+   the marker rewrites the same `marker-<event_id>` row, and each notification is stored once under an event-derived
+   deduplication key. An XID is recognised by `save_xid_event_if_absent`, which returns the stored decision marked
+   `duplicate=true`; an SXID's `duplicate` comes only from a process-local decision cache and is unreliable across replicas
+   (`correlated_event_id` names a companion event, not a repeat). This is the concrete guarantee for at-least-once
+   delivery; §8.1 states the client contract.
 2. **`NodeMarker` + TTL cooldown**: the decision writes a marker (`marker_id`, `scope`, `severity`,
    `recommended_action`, `expires_at`, `correlation_keys`, `active`). The default TTL of 3600s
    determines the evidence validity period; it does not mean every same-class event within the window is exempt from execution. Cross-source correlation preserves the evidence relationship,
@@ -3780,17 +3790,59 @@ whose `cluster_id` does not match) is a straight 403 with the error text
 | `X-GPU-Fault-Processor-Status` | Out | `COMPLETED` |
 | `X-GPU-Fault-Server-Duration-Ms` | Out | Server-side elapsed time, used for load-test data collection |
 | `Retry-After` | Out | Returned together with 429 / 503; value comes from `GPU_FAULT_PROCESSOR_RETRY_AFTER_SECONDS` (2 in production) |
+| `Idempotency-Key` | In | Server meaning only on processor-queued paths: the queue row id is derived from the cluster, the path, the key and a digest of the body (`processor-idem-…`), so a repeat with the same key and body gets the same row and its stored response; `direct` mode does not read it. Also the node-side pool's licence to retry |
+| `X-GPU-Fault-Request-ID` | In | No server meaning: the caller declares that repeating this POST is harmless (the Agent heartbeat, the executor readiness probe and others, see below); only the pool's licence to retry |
+| `X-GPU-Fault-Command-ID` | In | The command an executor result / renewal / progress post is about; it must equal the command in the path, else 400 without touching the store. Optional both ways: an older executor sends none, an older control plane reads none |
 
-**Idempotency keys**: different layers use different keys; there is no global `Idempotency-Key` header.
+**Idempotency keys**: different layers use different keys; `Idempotency-Key` means something only to the processor queue and is not a global deduplication key.
 
 | Layer | Idempotency key | Behavior on conflict |
 |---|---|---|
-| Event ingress | `event_id` (server-generated if omitted) → stored as an `incident_by_event` link | If it already exists, decide `duplicate=true` and do not create a second incident |
-| Queue request | `processor_request_id` (echoed in the response body and in `status_url`) | Repeated queries return the same result; a `COMPLETED` result is replayed verbatim |
+| Event ingress | `event_id` (server-generated if omitted, so nothing to deduplicate on) → an `incident_by_event` link, `marker-<event_id>`, event-derived notification deduplication keys | No second incident / workflow / marker / notification; the same `incident_id` and `marker_id` are answered; an XID decision is marked `duplicate=true`; a marker the recovery retired stays retired |
+| Queue request | `processor_request_id` (echoed in the response body and in `status_url`); derived from the key and the body when `Idempotency-Key` is sent | Repeated queries return the same result; a `COMPLETED` result is replayed verbatim; a repeat with the same key and body gets the same row while it exists (queued or leased, and at least `GPU_FAULT_PROCESSOR_COMPLETED_RETENTION_SECONDS` 600 s after completion) |
+| Executor command post | `command_id` (header `X-GPU-Fault-Command-ID`) + `lease_token` in the body | Result: a command already terminal is returned unchanged, whatever the repeat says; renewal: the same lease only moves its expiry; progress: merged per step, a repeat changes nothing; a lease that changed hands answers 409 |
 | Notification | `notification_dedup` link | On a hit, no further delivery |
 | Remote command | `command_id` | On an agent-side ledger hit, the archived result is replayed and nothing is executed a second time |
 | Workflow step | `(request_id, step_index)` + `completed_step_indexes` | Skipped if already completed |
 | HyperPod submission | `hyperpod-submissions/reserve` held by the control plane | No duplicate submission after an executor restart |
+
+**Pool retries and which POST carries what**: the node-side pool sends a request again on a fresh connection when it finds
+the idle connection closed by the peer before writing, or when the write itself fails -- safe for any request; a failure
+after the write is repeated once only for a POST carrying a retry identity, so only POSTs whose repeat is provably harmless
+carry one:
+
+- `X-GPU-Fault-Command-ID`: the executor's result (including the FAILED report for a command it cannot parse), renewal and
+  progress (deduplicated as "Executor command post" above).
+- `X-GPU-Fault-Request-ID`: the executor readiness probe (read-only; every probe is a new process whose first connection is
+  new, so the client asks once more itself after a close before any status line), node-inventory (a report that is not
+  newer keeps the stored record), node-action-keys (reads plus a deterministic derivation), fleet readiness and spare
+  health (read-only), advisory-notifications (unique `deduplication_key`, delivered through the async outbox in production;
+  inline delivery could send twice if the repeat overlaps an original still running), evidence (upsert by `record_id`),
+  agent drain / revoke (the same `transition_id` answers the current record), HyperPod outcome (rewrites the same record)
+  and the Agent heartbeat (a CAS of the signed envelope; unchanged content does not bump the generation).
+- `Idempotency-Key`: every collector post and the completion watcher's attempt / observation posts (the key comes from the
+  payload's id field).
+- No header: a claim (a repeat leases another batch under a fresh token and the lost response's commands wait for their
+  lease to expire; the pre-write replacement still applies, and the client itself claims once more 1 s after a close
+  before any status line), `hyperpod-submissions/reserve` (a repeat answers `reserved=false` and the submission then fails
+  closed as reserved elsewhere), agent reactivate (a repeat answers 409) and the watcher's `/v1/attempts/coverage` (no key;
+  a repeat is refused as not newer and counted as rejected, and the next heartbeat supersedes it).
+
+A rolling upgrade is compatible both ways: a newer executor talking to an older control plane sends headers the older
+routes do not declare, FastAPI ignores undeclared headers, and the store semantics above still deduplicate the repeat; an
+older executor talking to a newer control plane sends no header and is served as before.
+
+**Repeating an event (client contract)**: on `POST /v1/gpu-events/xid` and `/sxid`, repeating the identical body with a
+client `event_id` -- with or without `Idempotency-Key` -- yields one incident, one workflow, one marker and one notification
+of each kind, and the answer names the same `incident_id` and `marker_id`
+(`tests/app_services/test_ingest_repeat_contract.py`). A client that cannot tell whether its first POST landed (a load
+harness after a closed connection, say) may therefore post it again. Note: an event without `event_id` gets a
+server-generated id, so its repeat is a new event; with `Idempotency-Key`, queued mode also replays the stored response, but
+only for a byte-identical body (the load harness stamps `ingested_at` when it builds a payload and must keep the serialized
+bytes); `workflow_request_id` is the incident's current workflow, so a late repeat after an escalation names the successor;
+an SXID's `duplicate` cannot be relied on. `POST /v1/workload-observations` upserts by (cluster, attempt) and
+`/v1/training-progress` answers `accepted:false` for an `observed_at` that is not newer, so repeating either is harmless; in
+queued mode each repeat gets a new 202 receipt unless it carries the same `Idempotency-Key`.
 
 **Timeouts and retries**: clients only need to back off according to `Retry-After`; do not shorten it yourselves. For synchronous-wait requests the
 server-side ceiling is `GPU_FAULT_PROCESSOR_RESPONSE_TIMEOUT_SECONDS=115`; when it is reached the server returns 503 +

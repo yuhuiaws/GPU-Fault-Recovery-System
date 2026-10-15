@@ -1010,6 +1010,10 @@ renewal checks, fail an executor Pod, whose document names them in `fatal`. The 
 `backoffLimit: 0`: once a Pod fails on a fatal condition the round is invalid anyway, so the action and
 integrated runners stop waiting for workflows as soon as the executor Job has failed
 (`executor_job_failure` in the last history sample) instead of waiting out `--timeout-seconds`.
+The correlated scenario's attempt and XID/SXID posts may be repeated as they are, too: the control plane
+deduplicates by `event_id` (one incident, workflow, marker and notification of each kind), and repeating an
+observation or a training-progress post is harmless; with `Idempotency-Key` the repeat must resend a
+byte-identical body (the client contract is in detailed design v2 §8.1).
 
 Before registering the synthetic registry the runner records the current Min/Max and verifies it is not
 below `124/128` (a window above the floor is accepted as is); it **never modifies Aurora**: below the floor it
