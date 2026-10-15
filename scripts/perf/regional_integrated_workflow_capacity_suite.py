@@ -77,6 +77,7 @@ if __package__:
         wait_for_job,
         wait_for_load_pods,
     )
+    from .regional_executor_support import executor_job_failure, executor_scripts
     from .regional_validation_telemetry import start_validation_telemetry
 else:
     from regional_action_capacity_suite import (
@@ -136,6 +137,7 @@ else:
         wait_for_job,
         wait_for_load_pods,
     )
+    from regional_executor_support import executor_job_failure, executor_scripts
     from regional_validation_telemetry import start_validation_telemetry
 
 
@@ -905,6 +907,8 @@ def wait_for_workflows(
             and audit["terminal_command_count"] == audit["command_count"]
         ):
             return audit, history
+        if (stopped := executor_job_failure(EXECUTOR_JOB, dataplane)) is not None:
+            return {**audit, "executor_job_failure": stopped}, history  # none left
         time.sleep(2)
     return workflow_audit(run_id), history
 
@@ -1101,15 +1105,7 @@ def execute_integrated_jobs(
     resources = RunResources(artifacts, run_id, NAMESPACE, dataplane)
     placement = start_placement(args.aurora_cluster_id, artifacts)
     publish_fixtures("burst", resources=resources)
-    upsert_configmap(
-        EXECUTOR_CONFIGMAP,
-        text={
-            "benchmark_regional_action_executor.py": (
-                PERF_DIR / "benchmark_regional_action_executor.py"
-            ).read_text()
-        },
-        resources=resources,
-    )
+    upsert_configmap(EXECUTOR_CONFIGMAP, text=executor_scripts(), resources=resources)
     prepare_start_gate(resources=resources)
     load_manifest = build_load_manifest(
         run_id=run_id,

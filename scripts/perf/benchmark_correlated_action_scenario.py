@@ -4,11 +4,17 @@ import json
 import os
 import ssl
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib import error, request
 from urllib.parse import urlencode
+
+try:
+    from . import benchmark_transport_retry as transport
+except ImportError:  # /scripts in the scenario Pod, shipped beside this file
+    import benchmark_transport_retry as transport
 
 OWNERS = [
     "gpu-fault-kubernetes-adapter",
@@ -203,7 +209,12 @@ def command_result(
     *,
     failed: bool,
     executor_id: str,
-) -> None:
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[str]:
+    """Post the command's result, repeating a transient failure with the same
+    body (its lease token is the idempotency key); the categories retried, or
+    ``transport.Undelivered`` when the result is lost."""
+
     operation = command["step"]["operation"]
     details = {
         "simulated": True,
@@ -228,16 +239,20 @@ def command_result(
             else {}
         ),
     }
-    client.post(
-        f"/v1/regional/executors/{command['command_id']}/result",
-        {
-            "lease_token": command["lease_token"],
-            "status": "FAILED" if failed else "SUCCEEDED",
-            "status_source": "correlated-action-simulator",
-            "details": details,
-            **({"error": "synthetic reset failure"} if failed else {}),
-        },
+    body = {
+        "lease_token": command["lease_token"],
+        "status": "FAILED" if failed else "SUCCEEDED",
+        "status_source": "correlated-action-simulator",
+        "details": details,
+        **({"error": "synthetic reset failure"} if failed else {}),
+    }
+    _answer, retried = transport.deliver(
+        lambda: client.post(
+            f"/v1/regional/executors/{command['command_id']}/result", body
+        ),
+        sleep=sleep,
     )
+    return retried
 
 
 def post_attempt(
@@ -347,12 +362,34 @@ class ScenarioState:
     primary_containment: set[str] = field(default_factory=set)
     completed_ids: set[str] = field(default_factory=set)
     duplicate_claims: int = 0
+    # The fatal ones: a refused or persistently failing claim, a lost result,
+    # a refused ownership read; the transient ones are retried and counted.
     claim_errors: int = 0
     result_errors: int = 0
     ownership_errors: int = 0
+    claims: transport.ClaimRetries = field(default_factory=transport.ClaimRetries)
+    result_retries: int = 0
+    ownership_retries: int = 0
+    retry_counts: dict[str, int] = field(default_factory=dict)
     idle_started: float | None = None
     last_ownership_poll: float = 0.0
     operations: dict[str, int] = field(default_factory=dict)
+
+    def retried(self, kind: str, categories: list[str]) -> None:
+        for category in categories:
+            if kind == "result":
+                self.result_retries += 1
+            transport.count(self.retry_counts, f"{kind}:{category}")
+
+    def ownership_failed(self, exc: BaseException) -> None:
+        """A transient read is repeated by the next poll a second later; a
+        refusal is fatal."""
+
+        if transport.retryable(exc):
+            self.ownership_retries += 1
+            self.retried("ownership", [transport.category(exc)])
+        else:
+            self.ownership_errors += 1
 
 
 def _poll_ownership(client: Client, state: ScenarioState) -> None:
@@ -440,16 +477,18 @@ def handle_scenario_command(
         and not state.reset_gpu_failed
     )
     try:
-        command_result(
+        retried = command_result(
             client,
             command,
             failed=fail_primary_reset or fail_reset_gpu,
             executor_id=state.executor_id,
         )
-    except Exception:
+    except transport.Undelivered as lost:
         state.result_errors += 1
+        state.retried("result", lost.retried)
         time.sleep(0.1)
         return
+    state.retried("result", retried)
     state.completed_ids.add(command_id)
     state.operations[operation] = state.operations.get(operation, 0) + 1
     state.primary_reset_failed = state.primary_reset_failed or fail_primary_reset
@@ -551,6 +590,16 @@ def _scenario_output(
         "claim_errors": state.claim_errors,
         "result_errors": state.result_errors,
         "ownership_errors": state.ownership_errors,
+        "claim_retries": state.claims.retries,
+        "result_retries": state.result_retries,
+        "ownership_retries": state.ownership_retries,
+        "retry_counts": {
+            **{
+                f"claim:{key}": value
+                for key, value in state.claims.retry_counts.items()
+            },
+            **state.retry_counts,
+        },
         "operations": state.operations,
         "idle_terminal": (
             state.primary_reboot_succeeded and state.reset_reboot_succeeded
@@ -596,17 +645,22 @@ def run_scenario(
     state = ScenarioState(executor_id=f"correlated-action-{offset:03d}")
     deadline = time.monotonic() + float(os.getenv("SCENARIO_MAX_SECONDS", "600"))
 
+    started = time.monotonic()
     while time.monotonic() < deadline:
         try:
             claim = client.post(
                 "/v1/regional/executors/claim",
                 claim_payload(state.executor_id),
             )
-        except (error.HTTPError, error.URLError, OSError):
-            state.claim_errors += 1
-            time.sleep(0.1)
+            commands = claim.get("commands") or []
+        except Exception as exc:  # noqa: BLE001 - classified right here
+            retry_in = state.claims.failed(exc, elapsed=time.monotonic() - started)
+            if retry_in is None:
+                state.claim_errors += 1  # refused, or failing for a whole lease
+                break
+            time.sleep(retry_in)
             continue
-        commands = claim.get("commands") or []
+        state.claims.succeeded()
         if not commands:
             if state.idle_started is None:
                 state.idle_started = time.monotonic()
@@ -614,8 +668,8 @@ def run_scenario(
             if now_monotonic - state.last_ownership_poll >= 1:
                 try:
                     _poll_ownership(client, state)
-                except (error.HTTPError, error.URLError, OSError):
-                    state.ownership_errors += 1
+                except (error.HTTPError, error.URLError, OSError) as exc:
+                    state.ownership_failed(exc)
                 state.last_ownership_poll = now_monotonic
             if state.primary_reboot_succeeded and not state.reset_attempt_started:
                 _start_reset_attempt(

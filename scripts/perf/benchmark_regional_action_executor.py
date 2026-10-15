@@ -10,7 +10,12 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from pathlib import Path
 from threading import Event, Lock, Thread
-from urllib import error, request
+from urllib import error, request  # noqa: F401 - error: what callers classify
+
+try:
+    from . import benchmark_transport_retry as transport
+except ImportError:  # /scripts in the executor Pod, shipped beside this file
+    import benchmark_transport_retry as transport
 
 # Every owner a planned step can carry, both providers' lifecycle adapters
 # included: the simulator stands in for whichever executor the synthetic
@@ -39,13 +44,13 @@ DELAYS = {
     "RESTART_WORKLOAD": 2.0,
     "RESTORE_SCHEDULING": 0.5,
 }
-CLAIM_ERROR_SAMPLE_LIMIT = 20
+CLAIM_ERROR_SAMPLE_LIMIT = transport.SAMPLE_LIMIT
 # How the claim loop paces itself: an empty claim waits as long as it always
-# did, a failed claim waits its old backoff, and a loop whose every worker slot
-# is busy waits for the first command to finish (bounded so the wall-clock
-# limit is still checked).
+# did, a failed claim waits the product executor's retry pause
+# (``benchmark_transport_retry``), and a loop whose every worker slot is busy
+# waits for the first command to finish (bounded so the wall-clock limit is
+# still checked).
 IDLE_POLL_SECONDS = 0.05
-CLAIM_ERROR_BACKOFF_SECONDS = 0.1
 BUSY_WAIT_SECONDS = 1.0
 
 
@@ -68,12 +73,7 @@ def percentile(values: list[float], ratio: float) -> float:
     return ordered[int((len(ordered) - 1) * ratio)]
 
 
-def request_error_category(exc: BaseException) -> str:
-    if isinstance(exc, error.HTTPError):
-        return f"{type(exc).__name__}:{exc.code}"
-    if isinstance(exc, error.URLError):
-        return f"{type(exc).__name__}:{type(exc.reason).__name__}"
-    return type(exc).__name__
+request_error_category = transport.category
 
 
 class Client:
@@ -111,6 +111,19 @@ class Client:
             return json.loads(response.read() or b"{}")
 
 
+@dataclass(frozen=True)
+class Outcome:
+    """One command's end: ``failure`` is the category of a lost result (still
+    undelivered after its attempts, or refused); ``retried`` lists the result
+    posts that failed transiently and were repeated."""
+
+    command_id: str
+    operation: str
+    elapsed: float
+    failure: str | None
+    retried: list[str] = field(default_factory=list)
+
+
 @dataclass
 class SimulationState:
     client: Client
@@ -122,6 +135,8 @@ class SimulationState:
     inject_renew_failure_pending: bool
     # The simulated action duration; a test substitutes a virtual clock.
     sleep: Callable[[float], None] = time.sleep
+    # The pause between result attempts (``transport.deliver``).
+    retry_sleep: Callable[[float], None] = time.sleep
     counters_lock: Lock = field(default_factory=Lock)
     renewals: int = 0
     renewal_errors: int = 0
@@ -130,7 +145,7 @@ class SimulationState:
     active_commands: int = 0
     max_active_commands: int = 0
 
-    def execute(self, command: dict) -> tuple[str, str, float, str | None]:
+    def execute(self, command: dict) -> Outcome:
         command_id = command["command_id"]
         operation = command["step"]["operation"]
         node_count = len(command["step"].get("node_ids") or [])
@@ -178,36 +193,41 @@ class SimulationState:
         )
         renewal_thread.start()
         begin = time.monotonic()
+        result = {
+            "lease_token": command["lease_token"],
+            "status": "SUCCEEDED",
+            "status_source": "action-capacity-simulator",
+            "details": {
+                "simulated": True,
+                "operation": operation,
+                "node_count": node_count,
+                "executor_id": self.executor_id,
+                "simulated_delay_seconds": delay,
+            },
+        }
         try:
             self.sleep(delay)
-            self.client.post(
-                f"/v1/regional/executors/{command_id}/result",
-                {
-                    "lease_token": command["lease_token"],
-                    "status": "SUCCEEDED",
-                    "status_source": "action-capacity-simulator",
-                    "details": {
-                        "simulated": True,
-                        "operation": operation,
-                        "node_count": node_count,
-                        "executor_id": self.executor_id,
-                        "simulated_delay_seconds": delay,
-                    },
-                },
+            # The same body on every attempt: the lease token makes it idempotent.
+            _answer, retried = transport.deliver(
+                lambda: self.client.post(
+                    f"/v1/regional/executors/{command_id}/result", result
+                ),
+                sleep=self.retry_sleep,
             )
-        except Exception as exc:
-            return (
+        except transport.Undelivered as lost:
+            return Outcome(
                 command_id,
                 operation,
                 time.monotonic() - begin,
-                type(exc).__name__,
+                lost.category,
+                lost.retried,
             )
         finally:
             stop_renewal.set()
             renewal_thread.join(timeout=max(1.0, self.renewal_interval + 1))
             with self.counters_lock:
                 self.active_commands -= 1
-        return command_id, operation, time.monotonic() - begin, None
+        return Outcome(command_id, operation, time.monotonic() - begin, None, retried)
 
 
 def operation_delays() -> dict[str, float]:
@@ -224,14 +244,24 @@ def operation_delays() -> dict[str, float]:
 
 @dataclass
 class ClaimTally:
-    """What one executor's claim loop observed, for its summary document."""
+    """What one executor's claim loop observed, for its summary document.
+
+    ``claim_errors`` and ``result_errors`` are the fatal ones -- a refused or
+    persistently failing claim, a result still undelivered after its
+    attempts; the transient failures that were retried are counted apart
+    (``claims.retries``, ``result_retries``) and never fail the Pod.
+    """
 
     completed_ids: set[str] = field(default_factory=set)
     duplicate_claims: int = 0
+    claims: transport.ClaimRetries = field(default_factory=transport.ClaimRetries)
     claim_errors: int = 0
     claim_error_counts: dict[str, int] = field(default_factory=dict)
     claim_error_samples: list[dict[str, str | float]] = field(default_factory=list)
     result_errors: int = 0
+    result_error_counts: dict[str, int] = field(default_factory=dict)
+    result_retries: int = 0
+    result_retry_counts: dict[str, int] = field(default_factory=dict)
     latencies: list[float] = field(default_factory=list)
     by_operation: dict[str, list[float]] = field(default_factory=dict)
     wall_seconds: float = 0.0
@@ -239,20 +269,23 @@ class ClaimTally:
     def claim_failed(self, exc: BaseException, *, elapsed: float) -> None:
         self.claim_errors += 1
         category = request_error_category(exc)
-        self.claim_error_counts[category] = self.claim_error_counts.get(category, 0) + 1
+        transport.count(self.claim_error_counts, category)
         if len(self.claim_error_samples) < CLAIM_ERROR_SAMPLE_LIMIT:
             self.claim_error_samples.append(
                 {"category": category, "elapsed_seconds": round(elapsed, 6)}
             )
 
-    def finished(self, outcome: tuple[str, str, float, str | None]) -> None:
-        command_id, operation, elapsed, failure = outcome
-        self.latencies.append(elapsed)
-        self.by_operation.setdefault(operation, []).append(elapsed)
-        if failure is None:
-            self.completed_ids.add(command_id)
+    def finished(self, outcome: Outcome) -> None:
+        self.latencies.append(outcome.elapsed)
+        self.by_operation.setdefault(outcome.operation, []).append(outcome.elapsed)
+        for category in outcome.retried:
+            self.result_retries += 1
+            transport.count(self.result_retry_counts, category)
+        if outcome.failure is None:
+            self.completed_ids.add(outcome.command_id)
         else:
             self.result_errors += 1
+            transport.count(self.result_error_counts, outcome.failure)
 
 
 def run_claim_loop(
@@ -271,13 +304,16 @@ def run_claim_loop(
     RESTART_NODE parked the cluster's other workflows behind it and the
     integrated workflow percentiles moved in harness-made steps (batch 80).
     In flight never exceeds ``workers``: a claim asks for the free slots only
-    (and the old cap of 25). Claims, renewals and results are unchanged.
+    (and the old cap of 25). A claim or a result that fails without a verdict
+    is repeated on the product executor's policy (``benchmark_transport_retry``):
+    one dropped connection costs a pause, not the Pod.
     """
 
     tally = ClaimTally()
-    in_flight: dict[Future[tuple[str, str, float, str | None]], str] = {}
+    in_flight: dict[Future[Outcome], str] = {}
     started = time.monotonic()
     last_activity = started
+    next_claim_at = started
 
     def settle(timeout: float) -> None:
         """Record every finished command, waiting up to ``timeout`` for one."""
@@ -297,8 +333,13 @@ def run_claim_loop(
             expected <= 0 or len(tally.completed_ids) < expected
         ) and time.monotonic() - started < max_seconds:
             free = workers - len(in_flight)
-            if free <= 0:
-                settle(BUSY_WAIT_SECONDS)
+            pause = next_claim_at - time.monotonic()
+            if free <= 0 or pause > 0:
+                # A full pool waits for a slot, a failed claim for its retry
+                # pause; finished commands are recorded meanwhile either way.
+                settle(
+                    BUSY_WAIT_SECONDS if free <= 0 else min(BUSY_WAIT_SECONDS, pause)
+                )
                 continue
             try:
                 claim = state.client.post(
@@ -306,10 +347,17 @@ def run_claim_loop(
                     claim_payload(state.executor_id, min(25, free)),
                 )
                 commands = claim.get("commands") or []
-            except (error.HTTPError, error.URLError, OSError) as exc:
-                tally.claim_failed(exc, elapsed=time.monotonic() - started)
-                settle(CLAIM_ERROR_BACKOFF_SECONDS)
+            except Exception as exc:  # noqa: BLE001 - classified right here
+                elapsed = time.monotonic() - started
+                retry_in = tally.claims.failed(exc, elapsed=elapsed)
+                if retry_in is None:
+                    # Refused, or failing for a whole lease: claiming stops,
+                    # the commands in flight still report, and the Pod fails.
+                    tally.claim_failed(exc, elapsed=elapsed)
+                    break
+                next_claim_at = time.monotonic() + retry_in
                 continue
+            tally.claims.succeeded()
             if not commands:
                 if (
                     expected <= 0
@@ -337,6 +385,40 @@ def run_claim_loop(
             settle(BUSY_WAIT_SECONDS)
     tally.wall_seconds = time.monotonic() - started
     return tally
+
+
+def fatal_conditions(
+    output: dict,
+    *,
+    min_concurrent_commands: int,
+    inject_renew_failure: bool,
+) -> list[str]:
+    """Why the executor Pod fails: a lost result, a refused or persistently
+    failing claim, a protocol violation or an unmet run condition. A retried
+    claim or result is not among them; the summary counts it."""
+
+    expected = int(output["expected_commands"])
+    completed = int(output["completed_commands"])
+    fatal = []
+    if expected > 0 and completed != expected:
+        fatal.append(f"completed {completed} of {expected} commands")
+    if expected <= 0 and not completed:
+        fatal.append("completed no command")
+    if output["duplicate_claims"]:
+        fatal.append("duplicate claims")
+    if output["claim_errors"]:
+        fatal.append("a claim was refused or kept failing for a whole lease")
+    if output["result_errors"]:
+        fatal.append("results lost: undelivered after their attempts or refused")
+    if output["max_concurrent_commands"] < min_concurrent_commands:
+        fatal.append("concurrency stayed below ACTION_MIN_CONCURRENT_COMMANDS")
+    if output["long_commands"] and not output["renewals"]:
+        fatal.append("commands longer than their lease were never renewed")
+    if inject_renew_failure and (
+        output["injected_renewal_failures"] != 1 or output["renewal_errors"] < 1
+    ):
+        fatal.append("the injected renewal failure was not observed")
+    return fatal
 
 
 def main() -> None:
@@ -405,7 +487,13 @@ def main() -> None:
         "claim_errors": tally.claim_errors,
         "claim_error_counts": dict(sorted(tally.claim_error_counts.items())),
         "claim_error_samples": tally.claim_error_samples,
+        "claim_retries": tally.claims.retries,
+        "claim_retry_counts": dict(sorted(tally.claims.retry_counts.items())),
+        "claim_retry_samples": tally.claims.retry_samples,
         "result_errors": tally.result_errors,
+        "result_error_counts": dict(sorted(tally.result_error_counts.items())),
+        "result_retries": tally.result_retries,
+        "result_retry_counts": dict(sorted(tally.result_retry_counts.items())),
         "lease_seconds": lease_seconds,
         "renewal_interval_seconds": renewal_interval,
         "renewals": state.renewals,
@@ -426,19 +514,13 @@ def main() -> None:
             for operation, values in sorted(tally.by_operation.items())
         },
     }
+    output["fatal"] = fatal_conditions(
+        output,
+        min_concurrent_commands=min_concurrent_commands,
+        inject_renew_failure=inject_renew_failure,
+    )
     print(json.dumps(output, indent=2, sort_keys=True), flush=True)
-    if (
-        (expected > 0 and len(completed_ids) != expected)
-        or (expected <= 0 and not completed_ids)
-        or tally.duplicate_claims
-        or tally.result_errors
-        or state.max_active_commands < min_concurrent_commands
-        or (state.long_commands and state.renewals == 0)
-        or (
-            inject_renew_failure
-            and (state.injected_renewal_failures != 1 or state.renewal_errors < 1)
-        )
-    ):
+    if output["fatal"]:
         raise SystemExit(1)
 
 

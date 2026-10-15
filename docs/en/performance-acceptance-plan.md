@@ -995,6 +995,22 @@ counted in each path's `transport_retries`, not only the final HTTP success; the
 executor must aggregate `claim_error_counts` by HTTP status or exception type and save bounded
 time samples that contain no URL, token, cluster ID or exception body.
 
+The simulated executors (`benchmark_regional_action_executor.py`,
+`benchmark_correlated_action_scenario.py`) retry the way the product executor does
+(`benchmark_transport_retry.py`, shipped beside them in the script ConfigMap): a claim or result post
+that got no verdict -- the connection closed or reset before a status line, a read timeout, a TLS or
+connection error -- or a 408/425/429/500/502/503/504 is repeated. A claim is repeated after the client's
+1 s, then on the executor loop's 2 s doubling backoff up to 60 s; a result up to three attempts, 0.5 s and
+then 1 s apart with up to 50 % jitter, each carrying the same body, whose lease token makes the repeat
+idempotent (a command already terminal is returned unchanged). A retried failure goes to
+`claim_retry_counts`/`result_retry_counts` and never fails anything; `claim_error_counts` and
+`result_error_counts` keep only the fatal ones -- a refusal, claims failing for a whole lease (120 s),
+a result still undelivered after its attempts -- and only those, with the completion, duplicate and
+renewal checks, fail an executor Pod, whose document names them in `fatal`. The executor Jobs keep
+`backoffLimit: 0`: once a Pod fails on a fatal condition the round is invalid anyway, so the action and
+integrated runners stop waiting for workflows as soon as the executor Job has failed
+(`executor_job_failure` in the last history sample) instead of waiting out `--timeout-seconds`.
+
 Before registering the synthetic registry the runner records the current Min/Max and verifies it is not
 below `124/128` (a window above the floor is accepted as is); it **never modifies Aurora**: below the floor it
 fails closed and the error names the remedy -- write `aurora: 124/128` explicitly in admin-config.yaml and apply it
@@ -1159,7 +1175,9 @@ executors/
 ```
 
 Every ingress path in `summary.json` must include classified `transport_retries` counts; the
-executor must include `claim_error_counts` and bounded, redacted `claim_error_samples`. The burst,
+executor must include `claim_error_counts` and bounded, redacted `claim_error_samples`, the retried
+`claim_retry_counts`/`result_retry_counts` beside the fatal `result_error_counts`, and `fatal` for every
+executor Pod that failed (§8.2). The burst,
 integrated and action runners' `run.json` and `summary.json` must also include `placement` (the Aurora
 writer instance, its Availability Zone and the control-plane node Availability Zones, §8.1; `recorded=false`
 for an action round that names no Aurora cluster), and the integrated and correlated runners' `summary.json`

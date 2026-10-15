@@ -55,6 +55,11 @@ if TYPE_CHECKING or __package__:
         validate_registered_resources,
         write_status,
     )
+    from .regional_executor_support import (
+        executor_job_failure,
+        executor_scripts,
+        retry_fields,
+    )
     from .regional_remediation_budget import write_remediation_budget
 else:
     from regional_capacity_placement import (
@@ -97,6 +102,11 @@ else:
         upsert_configmap,
         validate_registered_resources,
         write_status,
+    )
+    from regional_executor_support import (
+        executor_job_failure,
+        executor_scripts,
+        retry_fields,
     )
     from regional_remediation_budget import write_remediation_budget
 
@@ -1068,6 +1078,7 @@ def aggregate_executor_documents(documents: list[dict]) -> dict:
         "claim_error_counts": dict(sorted(claim_error_counts.items())),
         "claim_error_samples": claim_error_samples[:CLAIM_ERROR_SAMPLE_LIMIT],
         "result_errors": sum(item.get("result_errors", 0) for item in documents),
+        **retry_fields(documents),
         "renewals": sum(item.get("renewals", 0) for item in documents),
         "renewal_errors": sum(item.get("renewal_errors", 0) for item in documents),
         "injected_renewal_failures": sum(
@@ -1097,15 +1108,7 @@ def execute_capacity_run(
 ) -> int:
     if min_concurrent_commands is None:
         min_concurrent_commands = args.executor_workers
-    upsert_configmap(
-        SCRIPT_CONFIGMAP,
-        resources=resources,
-        text={
-            "benchmark_regional_action_executor.py": (
-                PERF_DIR / "benchmark_regional_action_executor.py"
-            ).read_text()
-        },
-    )
+    upsert_configmap(SCRIPT_CONFIGMAP, resources=resources, text=executor_scripts())
     identity = executor_identity(
         require_dataplane_deployment=registry_scope == "live",
     )
@@ -1190,6 +1193,9 @@ def execute_capacity_run(
             if status in TERMINAL
         )
         if terminal == expected_workflows:
+            break
+        if (stopped := executor_job_failure(JOB_NAME, dataplane)) is not None:
+            snapshot["executor_job_failure"] = stopped  # nobody left to finish them
             break
         time.sleep(2)
     job_succeeded = ""

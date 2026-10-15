@@ -47,6 +47,7 @@ if __package__:
         teardown,
         upsert_configmap,
     )
+    from .regional_executor_support import executor_scripts
     from .regional_validation_telemetry import (
         NODE_RETURN_WATCH_MODE,
         start_validation_telemetry,
@@ -88,6 +89,7 @@ else:
         teardown,
         upsert_configmap,
     )
+    from regional_executor_support import executor_scripts
     from regional_validation_telemetry import (
         NODE_RETURN_WATCH_MODE,
         start_validation_telemetry,
@@ -1052,11 +1054,7 @@ def main() -> int:
         )
         upsert_configmap(
             SCRIPT_CONFIGMAP,
-            text={
-                "benchmark_correlated_action_scenario.py": (
-                    PERF_DIR / "benchmark_correlated_action_scenario.py"
-                ).read_text()
-            },
+            text=executor_scripts("benchmark_correlated_action_scenario.py"),
             resources=resources,
         )
         identity = executor_identity(

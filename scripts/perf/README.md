@@ -105,6 +105,13 @@ Supported entry points:
   workflow relationships and complete workflow/command terminal-state audit.
 - `seed_regional_action_workflows.py` and
   `benchmark_regional_action_executor.py`: action-side data and load drivers.
+- `benchmark_transport_retry.py`: the product executor's transport retries,
+  shipped beside both fake executor scripts in their ConfigMap (a claim or a
+  result that got no verdict is repeated; only a refusal, a claim failing for
+  a whole lease or a result still undelivered fails the Pod).
+- `regional_executor_support.py`: what the action, integrated and correlated
+  runners share around their executor Jobs -- the script ConfigMap, the Job
+  failure read that ends a workflow wait early, and the retry tallies.
 - `capture_processor_inflight.py`: optional in-flight sampling attached to a
   suite artifact directory.
 - `control_plane_capacity_probe.py`: control-plane capacity probe helper.
@@ -197,7 +204,9 @@ rows, and removes the synthetic registry revision. A completed teardown writes
 The integrated evidence distinguishes final client failures from recovered
 first-attempt transport failures. Each ingress path reports
 `transport_retries`; executor claim failures report bounded, redacted
-`claim_error_counts` and `claim_error_samples`. The runner also writes
+`claim_error_counts` and `claim_error_samples`, and the claims and results the
+executors retried report `claim_retry_counts` and `result_retry_counts`. The
+runner also writes
 `control-pods-before.json` and `control-pods-after.json` and rejects any
 control-plane Pod replacement, container restart, counter regression, or Pod
 that is not Ready after the run. These checks do not change request, timeout,
