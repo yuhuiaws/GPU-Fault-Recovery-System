@@ -16,15 +16,27 @@ available for the same reason.
 rather than a dashboard: an operator who silenced an alert during the release has
 said it is not a release blocker, and re-reading it as one would make silences
 unusable exactly when they are needed.
+
+A query that never got an answer -- no credentials to sign it with, AMP
+throttling or unreachable -- is not a count of zero and not a failed gate
+either: the probe prints ``{"unavailable": "<reason>"}`` and the engine takes
+the sample again (``regional_release_observation``). Any other failure, an
+HTTP 403 included, still exits non-zero.
 """
 
 import json
 import sys
+import urllib.error
 import urllib.request
 
 import boto3
 from botocore.auth import SigV4Auth
 from botocore.awsrequest import AWSRequest
+from botocore.exceptions import BotoCoreError
+
+
+def _unavailable(reason: str) -> None:
+    print(json.dumps({"unavailable": reason}, sort_keys=True))
 
 
 def main() -> None:
@@ -36,18 +48,31 @@ def main() -> None:
         f"{workspace_id}/alertmanager/api/v2/alerts"
         "?active=true&silenced=false&inhibited=false"
     )
-    session = boto3.Session(region_name=region)
-    credentials = session.get_credentials()
-    if credentials is None:
-        raise RuntimeError("AWS credentials are unavailable for AMP alert query")
+    try:
+        credentials = boto3.Session(region_name=region).get_credentials()
+        frozen = credentials.get_frozen_credentials() if credentials else None
+    except BotoCoreError:
+        frozen = None
+    if frozen is None:
+        _unavailable("no-credentials")
+        return
     signed = AWSRequest(method="GET", url=url, headers={"Accept": "application/json"})
-    SigV4Auth(credentials.get_frozen_credentials(), "aps", region).add_auth(signed)
+    SigV4Auth(frozen, "aps", region).add_auth(signed)
     http_request = urllib.request.Request(
         url,
         headers={key: str(value) for key, value in signed.headers.items()},
     )
-    with urllib.request.urlopen(http_request, timeout=30) as response:
-        alerts = json.loads(response.read())
+    try:
+        with urllib.request.urlopen(http_request, timeout=30) as response:
+            alerts = json.loads(response.read())
+    except urllib.error.HTTPError as error:
+        if error.code not in (429, 503):
+            raise
+        _unavailable("throttled")
+        return
+    except (urllib.error.URLError, TimeoutError, ConnectionError):
+        _unavailable("network")
+        return
     critical = [
         {
             "alertname": (item.get("labels") or {}).get("alertname"),

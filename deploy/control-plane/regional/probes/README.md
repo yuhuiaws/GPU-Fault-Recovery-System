@@ -46,7 +46,10 @@ sixth one cannot appear by accident:
   SigV4-signs a query to the AMP workspace with the deploy host's credentials,
   which the Pods deliberately do not have. It is here for the same reasons as
   the rest -- lint, types, and a name in the deploy log -- not because of where
-  it runs.
+  it runs. It has a second response shape, `{"unavailable": "<reason>"}`, for a
+  query that never got an answer (no credentials to sign it with, AMP throttling
+  or unreachable); the engine takes that stability sample again
+  (`src/gpu_fault_release/regional_release_observation.py`) instead of judging it.
 - `gpu_endpoint_gate.py` is not exec'd into a running Pod at all: the bootstrap
   puts it in the `command` of a short-lived Pod it creates in the GPU cluster,
   because the question is whether a Pod *there* can resolve, trust and

@@ -9,6 +9,7 @@ fails closed when the plugin fails.
 
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import stat
@@ -19,7 +20,10 @@ from pathlib import Path
 import pytest
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.admin import api_budget as API_BUDGET
+from gpu_fault.admin.deadlines import deadline_scope
 from gpu_fault_release import regional_kubeconfig_cache as CACHE
+from gpu_fault_release import regional_release_observation as OBSERVATION
 from gpu_fault_release import rollout as ROLLOUT
 from gpu_fault_release.regional_release_config import ReleaseError
 
@@ -41,16 +45,9 @@ print(json.dumps({
 """
 
 
-@pytest.fixture
-def plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
-    script = tmp_path / "aws"
-    script.write_text(f"#!{sys.executable}\n{PLUGIN}", encoding="utf-8")
-    script.chmod(0o700)
-    monkeypatch.setenv("PLUGIN_LOG", str(tmp_path / "plugin.log"))
-    monkeypatch.delenv("PLUGIN_FAIL", raising=False)
-    monkeypatch.delenv("PLUGIN_LIFETIME", raising=False)
-    monkeypatch.setenv("PLUGIN_TOKEN", "one")
-    monkeypatch.delenv(CACHE.TOKEN_CACHE_ENV, raising=False)
+def _run_local_plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Route the cache's `aws` to the test's own fixture, never a real CLI."""
+
     run = CACHE.run_command
 
     def fixture_command(arguments, **kwargs):
@@ -64,6 +61,19 @@ def plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
         return run([sys.executable, str(executable), *arguments[1:]], **kwargs)
 
     monkeypatch.setattr(CACHE, "run_command", fixture_command)
+
+
+@pytest.fixture
+def plugin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    script = tmp_path / "aws"
+    script.write_text(f"#!{sys.executable}\n{PLUGIN}", encoding="utf-8")
+    script.chmod(0o700)
+    monkeypatch.setenv("PLUGIN_LOG", str(tmp_path / "plugin.log"))
+    monkeypatch.delenv("PLUGIN_FAIL", raising=False)
+    monkeypatch.delenv("PLUGIN_LIFETIME", raising=False)
+    monkeypatch.setenv("PLUGIN_TOKEN", "one")
+    monkeypatch.delenv(CACHE.TOKEN_CACHE_ENV, raising=False)
+    _run_local_plugin(tmp_path, monkeypatch)
     return script
 
 
@@ -235,12 +245,15 @@ def test_a_failing_plugin_is_a_release_error_not_a_credential_less_kubeconfig(
 ) -> None:
     monkeypatch.setenv("PLUGIN_FAIL", "1")
     source = _kubeconfig(tmp_path / "cpu.kubeconfig", plugin)
+    pauses: list[float] = []
     with pytest.raises(ReleaseError, match="exited 3") as caught:
-        CACHE.ReleaseKubeconfigCache(str(source))
+        CACHE.ReleaseKubeconfigCache(str(source), sleep=pauses.append)
     assert "expired credentials" not in str(caught.value)
-    assert _plugin_calls(tmp_path) == [
-        "--region us-west-2 eks get-token --cluster-name cpu"
-    ], "the failure comes from the plugin the kubeconfig names"
+    assert (
+        _plugin_calls(tmp_path)
+        == ["--region us-west-2 eks get-token --cluster-name cpu"] * CACHE.EXEC_ATTEMPTS
+    ), "every attempt runs the plugin the kubeconfig names"
+    assert pauses == list(CACHE.EXEC_RETRY_DELAYS), "attempts back off in order"
 
 
 def test_a_failed_construction_leaves_no_temp_directory(
@@ -451,3 +464,298 @@ def test_cached_authentication_rejects_source_identity_drift(
         source.write_text(source.read_text() + "\n# changed\n")
         with pytest.raises(ReleaseError, match="kubeconfig changed"):
             cache.refresh_if_needed()
+
+
+# A plugin that follows a script, one outcome per attempt: ``ok``, an exit
+# status, ``hang`` or ``garbage``. Every failing attempt prints the token on
+# both streams, so a leak of plugin output into any message shows up as a leak
+# of the token.
+SCRIPTED_PLUGIN = """\
+import json, os, sys, time
+from pathlib import Path
+state = Path(os.environ["PLUGIN_STATE"])
+attempt = int(state.read_text()) if state.is_file() else 0
+state.write_text(str(attempt + 1))
+Path(os.environ["PLUGIN_STATE"] + ".env").write_text(json.dumps({
+    name: os.environ.get(name)
+    for name in ("AWS_METADATA_SERVICE_NUM_ATTEMPTS", "AWS_METADATA_SERVICE_TIMEOUT")
+}))
+outcomes = os.environ["PLUGIN_SCRIPT"].split(",")
+outcome = outcomes[min(attempt, len(outcomes) - 1)]
+token = "k8s-aws-v1." + os.environ["PLUGIN_TOKEN"]
+if outcome == "hang":
+    time.sleep(30)
+if outcome == "garbage":
+    print("not a credential " + token)
+    sys.exit(0)
+if outcome != "ok":
+    print(os.environ.get("PLUGIN_STDERR", "") + " " + token, file=sys.stderr)
+    print(token)
+    sys.exit(int(outcome))
+expiry = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() + 900))
+print(json.dumps({
+    "apiVersion": "client.authentication.k8s.io/v1beta1",
+    "kind": "ExecCredential",
+    "status": {"token": token, "expirationTimestamp": expiry},
+}))
+"""
+SECRET = "do-not-print-this-token"
+NO_CREDENTIALS = (
+    "Unable to locate credentials. You can configure credentials by running "
+    '"aws configure".'
+)
+
+
+@pytest.fixture
+def scripted(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    script = tmp_path / "scripted" / "aws"
+    script.parent.mkdir()
+    script.write_text(f"#!{sys.executable}\n{SCRIPTED_PLUGIN}", encoding="utf-8")
+    script.chmod(0o700)
+    monkeypatch.setenv("PLUGIN_STATE", str(tmp_path / "attempts"))
+    monkeypatch.setenv("PLUGIN_TOKEN", SECRET)
+    monkeypatch.setenv("PLUGIN_SCRIPT", "ok")
+    monkeypatch.delenv("PLUGIN_STDERR", raising=False)
+    monkeypatch.delenv(CACHE.TOKEN_CACHE_ENV, raising=False)
+    return script
+
+
+def _attempts(tmp_path: Path) -> int:
+    state = tmp_path / "attempts"
+    return int(state.read_text()) if state.is_file() else 0
+
+
+def _retry_lines(text: str) -> list[str]:
+    return [line for line in text.splitlines() if line.startswith("exec-credential-")]
+
+
+def test_a_plugin_that_fails_once_is_retried_and_its_token_cached(
+    tmp_path: Path,
+    scripted: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    """The live failure: one `aws eks get-token` exited 253 and took verify with it."""
+
+    _run_local_plugin(tmp_path, monkeypatch)
+    monkeypatch.setenv("PLUGIN_SCRIPT", "253,ok")
+    monkeypatch.setenv("PLUGIN_STDERR", NO_CREDENTIALS)
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", scripted)
+    pauses: list[float] = []
+
+    with CACHE.ReleaseKubeconfigCache(str(source), sleep=pauses.append) as cache:
+        token = _users(_load(cache.cpu_kubeconfig))["cpu-exec"]["token"]
+
+    assert token == f"k8s-aws-v1.{SECRET}", "the second attempt's token is cached"
+    assert _attempts(tmp_path) == 2, "one failure costs exactly one more attempt"
+    assert pauses == [CACHE.EXEC_RETRY_DELAYS[0]], "the retry backs off first"
+    output = capfd.readouterr()
+    [line] = _retry_lines(output.err)
+    for field in (
+        "attempt=1/3",
+        "failure=exited-253",
+        "reason=no-credentials",
+        "next=2s",
+    ):
+        assert field in line, f"the retry line must name {field}: {line}"
+    assert SECRET not in output.out + output.err, "the token reached the log"
+    assert "Unable to locate" not in output.err, "plugin stderr reached the log"
+
+
+@pytest.mark.parametrize(
+    "stderr,reason",
+    [
+        (NO_CREDENTIALS, "no-credentials"),
+        (
+            "Error when retrieving credentials from container-role: Error retrieving "
+            "metadata",
+            "no-credentials",
+        ),
+        (
+            "An error occurred (ExpiredToken) when calling the AssumeRole operation: "
+            "The security token included in the request is expired",
+            "expired",
+        ),
+        (
+            "An error occurred (AccessDenied) when calling the AssumeRole operation: "
+            "User is not authorized to perform: sts:AssumeRole",
+            "access-denied",
+        ),
+        (
+            "An error occurred (Throttling) when calling the AssumeRole operation: "
+            "Rate exceeded",
+            "throttled",
+        ),
+        (
+            'Could not connect to the endpoint URL: "https://sts.us-west-2.amazonaws.com/"',
+            "network",
+        ),
+        ("a message nobody has seen before", "unknown"),
+    ],
+)
+def test_a_persistent_failure_fails_closed_with_the_classified_reason(
+    tmp_path: Path,
+    scripted: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+    stderr: str,
+    reason: str,
+) -> None:
+    _run_local_plugin(tmp_path, monkeypatch)
+    monkeypatch.setenv("PLUGIN_SCRIPT", "253")
+    monkeypatch.setenv("PLUGIN_STDERR", stderr)
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", scripted)
+    pauses: list[float] = []
+
+    with pytest.raises(OBSERVATION.ApiUnavailable) as caught:
+        CACHE.ReleaseKubeconfigCache(str(source), sleep=pauses.append)
+
+    message = str(caught.value)
+    assert caught.value.reason == reason, message
+    assert message.startswith(
+        f"exec credential plugin exited 253 ({reason}) after 3 attempts in "
+    ), message
+    assert _attempts(tmp_path) == CACHE.EXEC_ATTEMPTS, "the retries were not bounded"
+    assert pauses == list(CACHE.EXEC_RETRY_DELAYS)
+    assert SECRET not in message and stderr not in message, (
+        "the error carries plugin output"
+    )
+    assert caught.value.__context__ is None, "a chained error could carry output"
+    output = capfd.readouterr()
+    assert SECRET not in output.out + output.err, "the token reached the log"
+    assert len(_retry_lines(output.err)) == CACHE.EXEC_ATTEMPTS - 1
+
+
+def test_output_that_is_not_json_is_retried_and_never_echoed(
+    tmp_path: Path, scripted: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _run_local_plugin(tmp_path, monkeypatch)
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", scripted)
+    monkeypatch.setenv("PLUGIN_SCRIPT", "garbage,ok")
+    with CACHE.ReleaseKubeconfigCache(str(source), sleep=lambda _seconds: None):
+        assert _attempts(tmp_path) == 2, "a truncated response is worth one more try"
+
+    (tmp_path / "attempts").unlink()
+    monkeypatch.setenv("PLUGIN_SCRIPT", "garbage")
+    with pytest.raises(OBSERVATION.ApiUnavailable) as caught:
+        CACHE.ReleaseKubeconfigCache(str(source), sleep=lambda _seconds: None)
+    assert str(caught.value).startswith(
+        "exec credential plugin did not return JSON (unknown) after 3 attempts"
+    ), str(caught.value)
+    assert SECRET not in str(caught.value)
+
+
+def test_a_contract_violation_is_not_retried(
+    tmp_path: Path, plugin: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same plugin returns the same wrong document: retrying only costs time."""
+
+    plugin.write_text(
+        f"#!{sys.executable}\n"
+        + PLUGIN.replace('"kind": "ExecCredential"', '"kind": "Something"')
+    )
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", plugin)
+    pauses: list[float] = []
+    with pytest.raises(ReleaseError, match="identity is invalid") as caught:
+        CACHE.ReleaseKubeconfigCache(str(source), sleep=pauses.append)
+    assert not isinstance(caught.value, OBSERVATION.ApiUnavailable), (
+        "a contract violation is a finding, not an unavailable API"
+    )
+    assert len(_plugin_calls(tmp_path)) == 1, "the plugin ran more than once"
+    assert pauses == [], "a contract violation paused for a retry"
+
+
+def test_a_hung_plugin_is_stopped_at_its_timeout_and_retried(
+    tmp_path: Path,
+    scripted: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    _run_local_plugin(tmp_path, monkeypatch)
+    monkeypatch.setattr(CACHE, "EXEC_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setenv("PLUGIN_SCRIPT", "hang,ok")
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", scripted)
+
+    started = time.monotonic()
+    with CACHE.ReleaseKubeconfigCache(str(source), sleep=lambda _seconds: None):
+        elapsed = time.monotonic() - started
+
+    assert _attempts(tmp_path) == 2
+    assert elapsed < 15, f"the hung attempt was not stopped at its timeout: {elapsed}"
+    [line] = _retry_lines(capfd.readouterr().err)
+    assert "failure=timed-out" in line, line
+
+
+def test_the_fetch_budget_bounds_every_attempt_and_pause(
+    tmp_path: Path, scripted: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No time left for a pause and an attempt: the fetch stops instead of starting one."""
+
+    _run_local_plugin(tmp_path, monkeypatch)
+    monkeypatch.setattr(CACHE, "EXEC_TIMEOUT_SECONDS", 1.0)
+    monkeypatch.setattr(CACHE, "EXEC_FETCH_SECONDS", 2.5)
+    monkeypatch.setenv("PLUGIN_SCRIPT", "hang")
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", scripted)
+    pauses: list[float] = []
+
+    started = time.monotonic()
+    with pytest.raises(OBSERVATION.ApiUnavailable) as caught:
+        CACHE.ReleaseKubeconfigCache(str(source), sleep=pauses.append)
+    elapsed = time.monotonic() - started
+
+    assert str(caught.value).startswith("exec credential plugin timed out"), str(
+        caught.value
+    )
+    assert "after 1 attempt in" in str(caught.value), str(caught.value)
+    assert pauses == [], "a pause that cannot be followed by an attempt is not taken"
+    assert elapsed < 12, f"the fetch outran its own budget: {elapsed}"
+
+
+def test_the_fetch_never_outlives_the_callers_deadline(
+    tmp_path: Path, scripted: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A refresh before a kubectl call runs inside that call's deadline."""
+
+    _run_local_plugin(tmp_path, monkeypatch)
+    monkeypatch.setenv("PLUGIN_SCRIPT", "hang")
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", scripted)
+
+    started = time.monotonic()
+    with deadline_scope("caller", 2.0):
+        with pytest.raises(OBSERVATION.ApiUnavailable, match="timed out"):
+            CACHE.ReleaseKubeconfigCache(str(source), sleep=lambda _seconds: None)
+    elapsed = time.monotonic() - started
+
+    assert _attempts(tmp_path) == 1, "a retry started after the caller's deadline"
+    assert elapsed < 12, f"the fetch outlived the caller's deadline: {elapsed}"
+
+
+@pytest.mark.allows_cluster_binaries("aws")
+def test_every_attempt_is_admitted_through_the_deployment_api_budget(
+    tmp_path: Path, scripted: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """No private path: each attempt is an `aws` call the shared budget admits.
+
+    It also reaches the plugin with the scope's IMDS defaults
+    (`api_budget.metadata_service_defaults`), the cheapest retry there is.
+    """
+
+    monkeypatch.delenv(API_BUDGET.ROOT_ENV, raising=False)
+    for name in API_BUDGET.METADATA_SERVICE_DEFAULTS:
+        monkeypatch.delenv(name, raising=False)
+    config = tmp_path / "aws-config"
+    config.write_text("[default]\nregion = us-west-2\n", encoding="utf-8")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(config))
+    monkeypatch.setenv("PLUGIN_SCRIPT", "253,ok")
+    source = _kubeconfig(tmp_path / "cpu.kubeconfig", scripted)
+
+    with API_BUDGET.deployment_api_budget():
+        with CACHE.ReleaseKubeconfigCache(str(source), sleep=lambda _seconds: None):
+            commands = API_BUDGET.statistics()["backends"]["aws"]["commands"]
+
+    assert commands == 2, "an attempt bypassed the deployment API budget"
+    seen = json.loads((tmp_path / "attempts.env").read_text())
+    assert seen == {
+        "AWS_METADATA_SERVICE_NUM_ATTEMPTS": "3",
+        "AWS_METADATA_SERVICE_TIMEOUT": "2",
+    }, "the plugin ran without the deployment scope's IMDS defaults"

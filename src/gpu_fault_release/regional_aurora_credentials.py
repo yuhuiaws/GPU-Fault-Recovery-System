@@ -44,6 +44,7 @@ if TYPE_CHECKING:
 
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_observation import ApiUnavailable
 from gpu_fault_release.regional_resource_probe import (
     ProbeState,
     ResourceRef,
@@ -75,10 +76,13 @@ def read_aurora_refresh_cronjob(release: RegionalRelease) -> dict[str, Any] | No
         timeout_seconds=CRONJOB_READ_TIMEOUT_SECONDS,
     )
     if observation.state is ProbeState.ERROR:
-        raise ReleaseError(
+        message = (
             "cannot read Aurora credential refresh CronJob; state is unknown: "
             + observation.error
         )
+        if observation.unavailable is not None:
+            raise ApiUnavailable(message, reason=observation.unavailable)
+        raise ReleaseError(message)
     return observation.require_readable()
 
 

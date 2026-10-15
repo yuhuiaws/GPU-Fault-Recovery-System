@@ -32,6 +32,10 @@ from typing import Any, cast
 
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_observation import (
+    ApiUnavailable,
+    failure_reason,
+)
 
 ROOT = repository_root()
 ADOT_POD_SELECTOR = "app=gpu-fault-adot"
@@ -86,6 +90,7 @@ def amp_instant_query(release: Any, expression: str) -> list[dict[str, Any]]:
         f"{workspace_id}/api/v1/query"
     )
     response: tuple[int, str] | None = None
+    failure = ""
     try:
         with deadline_scope("AMP query", AMP_QUERY_TIMEOUT_SECONDS):
             exported = export_aws_credentials(seconds=AMP_QUERY_TIMEOUT_SECONDS)
@@ -112,10 +117,19 @@ def amp_instant_query(release: Any, expression: str) -> list[dict[str, Any]]:
                 label="AMP query",
             )
             remaining_timeout(AMP_QUERY_TIMEOUT_SECONDS)
-    except NativeHttpError:
-        pass
+    except NativeHttpError as error:
+        failure = str(error)
+    # No answer, or AMP shedding load, says nothing about the series: the
+    # verify takes the report again (regional_release_observation).
     if response is None:
-        raise ReleaseError("AMP query transport or credential resolution failed")
+        raise ApiUnavailable(
+            "AMP query transport or credential resolution failed",
+            reason=failure_reason(failure),
+        )
+    if response[0] in (429, 503):
+        raise ApiUnavailable(
+            f"AMP query returned HTTP {response[0]}", reason="throttled"
+        )
     if response[0] != 200:
         raise ReleaseError(f"AMP query returned HTTP {response[0]}")
     try:

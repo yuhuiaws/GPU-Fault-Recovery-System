@@ -57,6 +57,18 @@ TRANSFER_CONCURRENCY = 4
 MAX_COMMAND_DEPTH = 8
 MAX_NESTED_OUTPUT_BYTES = 8 * 1024 * 1024
 _LABEL = re.compile(r"^[a-zA-Z0-9_./:-]{1,128}$")
+# The AWS CLI and boto3 ask the instance metadata service once, with a 1 s
+# timeout, then report "Unable to locate credentials" (aws exits 253). A deploy
+# host authenticating with its instance role runs hundreds of aws and kubectl
+# calls per release, up to eight at a time, and one slow IMDS answer failed a
+# verify live on 2026-10-15. Every child of a deployment scope gets these unless
+# the operator set them, in the environment or in the AWS config file. They
+# change nothing when credentials come from the environment, a profile or SSO:
+# the chain reaches IMDS last.
+METADATA_SERVICE_DEFAULTS = {
+    "AWS_METADATA_SERVICE_NUM_ATTEMPTS": ("metadata_service_num_attempts", "3"),
+    "AWS_METADATA_SERVICE_TIMEOUT": ("metadata_service_timeout", "2"),
+}
 
 
 class ApiBudgetError(RuntimeError):
@@ -594,6 +606,29 @@ def api_environment(environment: Mapping[str, str] | None) -> dict[str, str] | N
     return values
 
 
+def metadata_service_defaults(environment: Mapping[str, str]) -> dict[str, str]:
+    """The ``METADATA_SERVICE_DEFAULTS`` the operator has not set anywhere.
+
+    A config file that cannot be read says nothing about what the operator
+    chose, so then nothing is added.
+    """
+
+    source = Path(
+        environment.get("AWS_CONFIG_FILE") or os.path.expanduser("~/.aws/config")
+    )
+    parser = configparser.RawConfigParser()
+    try:
+        parser.read_string(source.read_text() if source.is_file() else "")
+    except (OSError, UnicodeError, configparser.Error):
+        return {}
+    configured = {key for section in parser.sections() for key in parser[section]}
+    return {
+        name: value
+        for name, (key, value) in METADATA_SERVICE_DEFAULTS.items()
+        if name not in environment and key not in configured
+    }
+
+
 def resolve_tool(name: str, path: str | None = None) -> str | None:
     root = budget_root()
     if root is None and path is None:
@@ -790,7 +825,8 @@ def deployment_api_budget() -> Iterator[None]:
     if budget_root() is not None:
         yield
         return
-    old = {name: os.environ.get(name) for name in (ROOT_ENV, PHASE_ENV, "PATH")}
+    restored = (ROOT_ENV, PHASE_ENV, "PATH", *METADATA_SERVICE_DEFAULTS)
+    old = {name: os.environ.get(name) for name in restored}
     with tempfile.TemporaryDirectory(prefix="gpu-fault-api-") as directory:
         root = Path(directory)
         path = root / "budget.sqlite3"
@@ -839,6 +875,7 @@ def deployment_api_budget() -> Iterator[None]:
             try:
                 os.environ[ROOT_ENV] = str(root)
                 os.environ.update(api_environment(None) or {})
+                os.environ.update(metadata_service_defaults(os.environ))
                 entered = True
                 yield
             finally:

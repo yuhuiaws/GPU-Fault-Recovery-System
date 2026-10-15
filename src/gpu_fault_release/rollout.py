@@ -83,6 +83,7 @@ from gpu_fault_release.regional_gpu_bootstrap import (
     verify_gpu_control_plane_endpoint,
 )
 from gpu_fault_release.regional_kubeconfig_cache import ReleaseKubeconfigCache
+from gpu_fault_release import regional_release_observation as observation
 from gpu_fault_release.regional_notifications import (
     ensure_notification_secret,
     notification_digest,
@@ -422,7 +423,7 @@ class Runner:
                         print(diagnostic_text(text), file=sys.stderr)
             # Own scripts reported themselves; a foreign command gets one line
             # naming the step and its last words.
-            raise child_failure(
+            failure = child_failure(
                 ReleaseError,
                 args,
                 completed.returncode,
@@ -435,6 +436,7 @@ class Runner:
                 if sensitive
                 else (),
             )
+            raise observation.unavailable_failure(failure, args, completed.stderr)
         return completed.stdout.strip() if capture else ""
 
     def condition(
@@ -1350,10 +1352,18 @@ IMAGE_LOCK_EXEMPT_MODES = frozenset({"drain-cluster"})
 def _run_mode(arguments: argparse.Namespace) -> int:
     validate_cluster_arguments(arguments)
     config = ReleaseConfig.load(arguments.config)
+    # verify/stability retry what they could not observe, this fetch included.
+    budget = observation.ObservationBudget.for_mode(
+        arguments.mode, dry_run=arguments.dry_run
+    )
     # Only bounded direct kubectl calls use cached tokens. Scripts retain
     # native exec authentication throughout their potentially longer lifetime.
-    with ReleaseKubeconfigCache(
-        config.cpu_kubeconfig, dry_run=arguments.dry_run
+    with observation.observed(
+        budget,
+        lambda: ReleaseKubeconfigCache(
+            config.cpu_kubeconfig, dry_run=arguments.dry_run
+        ),
+        what="credentials",
     ) as kubeconfigs:
         runner = Runner(dry_run=arguments.dry_run, kubeconfigs=kubeconfigs)
         if arguments.mode in IMAGE_LOCK_EXEMPT_MODES:
@@ -1363,10 +1373,14 @@ def _run_mode(arguments: argparse.Namespace) -> int:
             )
             return 0
         release = RegionalRelease(config, runner)
-        return _dispatch_mode(release, arguments)
+        return _dispatch_mode(release, arguments, budget)
 
 
-def _dispatch_mode(release: RegionalRelease, arguments: argparse.Namespace) -> int:
+def _dispatch_mode(
+    release: RegionalRelease,
+    arguments: argparse.Namespace,
+    budget: observation.ObservationBudget | None = None,
+) -> int:
     validate_cluster_arguments(arguments)
     exit_code = 0
     if arguments.mode == "plan":
@@ -1433,13 +1447,13 @@ def _dispatch_mode(release: RegionalRelease, arguments: argparse.Namespace) -> i
     elif arguments.mode == "sync-state":
         sync_release_state(release, cluster_id=arguments.cluster_id)
     elif arguments.mode == "verify":
-        release._apply_health_baseline(release._load_state())
-        report = build_health_report(release, mode="verify")
+        report, exit_code = observation.observed_health_report(
+            release, budget, build_health_report, report_exit_code
+        )
         print(json.dumps(report, indent=2, sort_keys=True))
-        exit_code = report_exit_code(report)
     elif arguments.mode == "stability":
         report = release.validate_stability_window(
-            release_kind=stability_release_kind(release)
+            release_kind=stability_release_kind(release), observation=budget
         )
         print(json.dumps(report, indent=2, sort_keys=True))
     return exit_code
@@ -1458,6 +1472,9 @@ def main() -> int:
     except InflightInstallsRefused as exc:
         # Nothing was changed; the release driver classifies on this code.
         exit_code = INFLIGHT_INSTALLS_REFUSED_EXIT_CODE
+        print(f"ERROR: {exc}", file=sys.stderr)
+    except observation.HealthUnobservable as exc:
+        exit_code = observation.HEALTH_UNOBSERVABLE_EXIT_CODE
         print(f"ERROR: {exc}", file=sys.stderr)
     except (
         ReleaseError,

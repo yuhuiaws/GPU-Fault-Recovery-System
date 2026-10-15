@@ -31,6 +31,11 @@ from gpu_fault_release.regional_release_gpu_rollout import (
     agents_converged,
     gpu_node_items,
 )
+from gpu_fault_release.regional_release_observation import (
+    ApiUnavailable,
+    ObservationBudget,
+    observed,
+)
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_profile_model import (
     target_runtime_profile_version,
@@ -339,6 +344,10 @@ def critical_amp_alerts(release: Any) -> dict[str, Any]:
     result = json.loads(raw)
     if not isinstance(result, dict):
         raise ReleaseError("AMP alert query returned a non-object")
+    if "unavailable" in result:
+        # The probe could not sign or deliver the query; it read no alerts.
+        reason = str(result["unavailable"])
+        raise ApiUnavailable(f"AMP alert query failed ({reason})", reason=reason)
     return result
 
 
@@ -558,6 +567,7 @@ def wait_for_stability_baseline(
     timeout_seconds: int = CRITICAL_CLEAR_TIMEOUT_SECONDS,
     sample_seconds: int = CRITICAL_CLEAR_SAMPLE_SECONDS,
     grace: _RestartGrace | None = None,
+    observation: ObservationBudget | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     """Open the window, waiting out only the alerts that are allowed to settle.
 
@@ -593,7 +603,9 @@ def wait_for_stability_baseline(
             "release stability baseline has non-settleable critical alerts: "
             + ", ".join(sorted(unexpected))
         )
-    metric_series = release._store_io_rejection_series_ready()
+    metric_series = observed(
+        observation, release._store_io_rejection_series_ready, what="metric-series"
+    )
     report["metric_series"] = metric_series
     if not metric_series.get("ready"):
         details = ", ".join(metric_series.get("errors") or [])
@@ -609,7 +621,7 @@ def wait_for_stability_baseline(
         delay = min(sample_seconds, timeout_seconds - waited)
         time.sleep(delay)
         waited += delay
-        sample = release._stability_snapshot()
+        sample = observed(observation, release._stability_snapshot, what="clear-wait")
         report["wait_seconds"] = waited
         report["sample_count"] = int(report["sample_count"]) + 1
         if sample["not_ready"]:
@@ -892,6 +904,12 @@ class _ControlPlaneOnlyWindow:
         if self.enabled and int((sample.get("critical_alerts") or {}).get("count", 0)):
             self._unclean("a sample had critical alerts")
 
+    def missed(self, what: str) -> None:
+        """An observation had to be taken again: what it left out is not clean."""
+
+        if self.enabled:
+            self._unclean(f"{what} had to be retried")
+
     def may_close(self, *, elapsed: float, clean_samples: int) -> bool:
         if (
             not self.enabled
@@ -899,7 +917,11 @@ class _ControlPlaneOnlyWindow:
             or clean_samples < CONTROL_PLANE_ONLY_MINIMUM_CLEAN_SAMPLES
         ):
             return False
-        reason = control_plane_deployments_converged(self._release)
+        try:
+            reason = control_plane_deployments_converged(self._release)
+        except ApiUnavailable as error:
+            self.missed(f"the convergence read ({error.reason})")
+            return False
         if reason is not None:
             self.reason = f"waiting for control-plane Deployments: {reason}"
             return False
@@ -919,6 +941,7 @@ def validate_stability_window(
     critical_clear_timeout_seconds: int = CRITICAL_CLEAR_TIMEOUT_SECONDS,
     critical_clear_sample_seconds: int = CRITICAL_CLEAR_SAMPLE_SECONDS,
     release_kind: str | None = None,
+    observation: ObservationBudget | None = None,
 ) -> dict[str, Any]:
     """Hold the release for the stability window; return the report.
 
@@ -927,6 +950,12 @@ def validate_stability_window(
     window at ``CONTROL_PLANE_ONLY_MINIMUM_WINDOW_SECONDS`` when every
     observation was clean and the control-plane Deployments converged. Every
     other kind, and every window that saw anything, runs the configured length.
+
+    A sample the engine could not take (``ApiUnavailable``) is taken again
+    within ``observation`` -- by default the configured length of unobserved
+    time -- and the window is extended by the time it could not see, so the
+    verdict still rests on a full window of samples; such a window never closes
+    early. A spent budget raises ``HealthUnobservable``.
     """
 
     configured = (
@@ -942,7 +971,8 @@ def validate_stability_window(
     # to fail the release now, not after the window has been paid for.
     queue_growth_floor = _queue_growth_floor()
     grace = _RestartGrace(release)
-    baseline = release._stability_snapshot()
+    observation = observation or ObservationBudget(configured, mode="stability")
+    baseline = observation.attempt(release._stability_snapshot, what="baseline")
     if baseline["not_ready"]:
         raise ReleaseError("release stability baseline has non-Ready Pods")
     baseline, critical_clear = wait_for_stability_baseline(
@@ -951,6 +981,7 @@ def validate_stability_window(
         timeout_seconds=critical_clear_timeout_seconds,
         sample_seconds=critical_clear_sample_seconds,
         grace=grace,
+        observation=observation,
     )
     samples = [baseline]
     early = _ControlPlaneOnlyWindow(
@@ -960,6 +991,8 @@ def validate_stability_window(
         baseline=baseline,
         critical_clear=critical_clear,
     )
+    if observation.retries:
+        early.missed("an observation before the window")
     deadline = time.monotonic() + configured
     started = deadline - configured
     while True:
@@ -969,7 +1002,13 @@ def validate_stability_window(
         ):
             break
         time.sleep(min(sample_seconds, max(0, deadline - time.monotonic())))
-        sample = release._stability_snapshot()
+        unobserved = observation.unobserved
+        sample = observation.attempt(release._stability_snapshot, what="sample")
+        if observation.unobserved > unobserved:
+            # Time the window could not see is not window time (whole seconds:
+            # a sliver would only buy a duplicate sample at the very end).
+            deadline += round(observation.unobserved - unobserved)
+            early.missed("a sample")
         if sample["not_ready"]:
             raise ReleaseError("release stability window has non-Ready Pods")
         # The collector going silent and its metrics snapshot going stale are
@@ -1028,6 +1067,7 @@ def validate_stability_window(
             "grace_seconds": DATA_CONVERGED_GRACE_SECONDS,
             "alerts": sorted(grace.alerts),
         },
+        "observation": observation.summary(),
     }
 
 

@@ -4,6 +4,16 @@ Generic exec plugins retain kubectl's native protocol. Child scripts and calls
 that can outlive the token use the original kubeconfig; process globals and
 source files are never rewritten. Credential fetches use the shared supervised
 command runner and never include plugin output in diagnostics.
+
+A fetch that fails for a reason another attempt can outlast -- a non-zero exit,
+a timeout, output that is not JSON -- is retried after ``EXEC_RETRY_DELAYS``
+within ``EXEC_FETCH_SECONDS`` and the caller's deadline; every attempt is an
+ordinary supervised command, so it is admitted through the deployment API
+budget like any other ``aws`` call. A fetch that still fails raises
+``ApiUnavailable`` naming the last failure and a reason word matched from the
+plugin's stderr (``regional_release_observation.failure_reason``), never the
+stderr itself. A response that breaks the ExecCredential contract is not
+retried: the same plugin returns the same document.
 """
 
 from __future__ import annotations
@@ -20,16 +30,30 @@ import time
 from collections.abc import Callable, MutableMapping
 from datetime import datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
-from gpu_fault.admin.execution import run_command
+from gpu_fault.admin.execution import deadline_scope, run_command
 from gpu_fault_release.regional_release_config import ReleaseConfig, ReleaseError
+from gpu_fault_release.regional_release_narration import narrate_step
+from gpu_fault_release.regional_release_observation import (
+    ApiUnavailable,
+    failure_reason,
+)
 
 TOKEN_CACHE_ENV = "GPU_FAULT_KUBECONFIG_TOKEN_CACHE"
 DEFAULT_LEAD_SECONDS = 180.0
 EXEC_TIMEOUT_SECONDS = 60.0
+# Pauses before the second and third attempt. Live on 2026-10-15 one `aws eks
+# get-token` exited 253 (no instance-role credentials for a moment) and, with a
+# single attempt, the verify and stability modes it fed died with it.
+EXEC_RETRY_DELAYS = (2.0, 5.0)
+EXEC_ATTEMPTS = len(EXEC_RETRY_DELAYS) + 1
+# Every attempt and pause of one fetch together; the caller's deadline still
+# caps it. Room for one hung attempt and the quick retries after it.
+EXEC_FETCH_SECONDS = 2 * EXEC_TIMEOUT_SECONDS
+MIN_ATTEMPT_SECONDS = 1.0
 MAX_CREDENTIAL_OUTPUT_BYTES = 8 * 1024 * 1024
 # kubeconfig file references are relative to the file's own directory; the copy
 # lives elsewhere, so they are made absolute against the source directory.
@@ -115,9 +139,11 @@ class KubeconfigTokenCache:
         *,
         directory: Path,
         now: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self.source = source.resolve()
         self._now = now
+        self._sleep = sleep
         self._lock = threading.Lock()
         try:
             text = self.source.read_text(encoding="utf-8")
@@ -180,7 +206,9 @@ class KubeconfigTokenCache:
         earliest: float | None = None
         updated: list[tuple[dict[str, Any], dict[str, Any]]] = []
         for user, exec_spec in self._exec_users:
-            token, expiry = _fetch_exec_credential(exec_spec, now=self._now)
+            token, expiry = _fetch_exec_credential(
+                exec_spec, now=self._now, sleep=self._sleep
+            )
             updated.append(
                 (user, {"token": token} if expiry is not None else {"exec": exec_spec})
             )
@@ -204,9 +232,7 @@ class KubeconfigTokenCache:
             raise
 
 
-def _fetch_exec_credential(
-    exec_spec: dict[str, Any], *, now: Callable[[], float]
-) -> tuple[str, float | None]:
+def _plugin_invocation(exec_spec: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
     command = exec_spec.get("command")
     if not isinstance(command, str) or not command:
         raise ReleaseError("kubeconfig exec entry has no command")
@@ -235,17 +261,40 @@ def _fetch_exec_credential(
             "spec": {"interactive": False},
         }
     )
+    return [command, *args], environment
+
+
+@dataclasses.dataclass(frozen=True)
+class _PluginFailure:
+    """One attempt another attempt may outlast: what happened, and why."""
+
+    failure: str
+    reason: str
+
+
+def _plugin_attempt(
+    arguments: list[str], environment: dict[str, str]
+) -> _PluginFailure | object:
+    """Run the plugin once: its decoded response, or the failure to retry."""
+
     try:
         completed = run_command(
-            [command, *args],
+            arguments,
             capture=True,
             environment=environment,
             timeout_seconds=EXEC_TIMEOUT_SECONDS,
         )
-    except (OSError, TimeoutError, subprocess.TimeoutExpired):
-        raise ReleaseError("exec credential plugin failed") from None
+    except (TimeoutError, subprocess.TimeoutExpired) as error:
+        partial = getattr(error, "stderr", None)
+        return _PluginFailure(
+            "timed out", failure_reason(partial if isinstance(partial, str) else None)
+        )
+    except OSError:
+        raise ReleaseError("exec credential plugin could not be started") from None
     if completed.returncode:
-        raise ReleaseError(f"exec credential plugin exited {completed.returncode}")
+        return _PluginFailure(
+            f"exited {completed.returncode}", failure_reason(completed.stderr)
+        )
     if (
         sum(
             len(value.encode("utf-8"))
@@ -255,16 +304,21 @@ def _fetch_exec_credential(
     ):
         raise ReleaseError("exec credential output exceeds its size limit")
     try:
-        credential = json.loads(completed.stdout)
+        return cast(object, json.loads(completed.stdout))
     except json.JSONDecodeError:
-        raise ReleaseError("exec credential plugin did not return JSON") from None
+        return _PluginFailure("did not return JSON", "unknown")
+
+
+def _credential_token(
+    credential: object, exec_spec: dict[str, Any], *, now: Callable[[], float]
+) -> tuple[str, float | None]:
     if (
         not isinstance(credential, dict)
         or credential.get("kind") != "ExecCredential"
         or credential.get("apiVersion") != exec_spec.get("apiVersion")
     ):
         raise ReleaseError("exec credential response identity is invalid")
-    status = credential.get("status") if isinstance(credential, dict) else None
+    status = credential.get("status")
     if not isinstance(status, dict):
         raise ReleaseError("exec credential plugin returned no status")
     if set(status).difference({"token", "expirationTimestamp"}):
@@ -273,6 +327,41 @@ def _fetch_exec_credential(
     if not isinstance(token, str) or not token:
         raise ReleaseError("exec credential plugin returned no status.token")
     return token, _parse_expiry(status.get("expirationTimestamp"), now())
+
+
+def _fetch_exec_credential(
+    exec_spec: dict[str, Any],
+    *,
+    now: Callable[[], float],
+    sleep: Callable[[float], None] = time.sleep,
+) -> tuple[str, float | None]:
+    arguments, environment = _plugin_invocation(exec_spec)
+    started = time.monotonic()
+    delays = iter(EXEC_RETRY_DELAYS)
+    attempt = 0
+    with deadline_scope("exec credential plugin", EXEC_FETCH_SECONDS) as deadline:
+        while True:
+            attempt += 1
+            outcome = _plugin_attempt(arguments, environment)
+            if not isinstance(outcome, _PluginFailure):
+                return _credential_token(outcome, exec_spec, now=now)
+            delay = next(delays, None)
+            left = deadline.expires - time.monotonic()
+            if delay is None or left <= delay + MIN_ATTEMPT_SECONDS:
+                raise ApiUnavailable(
+                    f"exec credential plugin {outcome.failure} ({outcome.reason}) "
+                    f"after {attempt} attempt{'' if attempt == 1 else 's'} in "
+                    f"{time.monotonic() - started:.0f}s",
+                    reason=outcome.reason,
+                )
+            narrate_step(
+                "exec-credential-retry",
+                attempt=f"{attempt}/{EXEC_ATTEMPTS}",
+                failure=outcome.failure.replace(" ", "-"),
+                reason=outcome.reason,
+                next=f"{delay:.0f}s",
+            )
+            sleep(delay)
 
 
 class ReleaseKubeconfigCache:
@@ -290,12 +379,14 @@ class ReleaseKubeconfigCache:
         dry_run: bool = False,
         environ: MutableMapping[str, str] | None = None,
         now: Callable[[], float] = time.time,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
         self._environ = os.environ if environ is None else environ
         self._original_kubeconfig = self._environ.get("KUBECONFIG")
         self._directory: Path | None = None
         self._caches: dict[Path, KubeconfigTokenCache] = {}
         self._now = now
+        self._sleep = sleep
         self._original_cpu_kubeconfig = cpu_kubeconfig
         self._cached_gpu_kubeconfig = self._original_kubeconfig
         self.cpu_kubeconfig = cpu_kubeconfig
@@ -328,7 +419,7 @@ class ReleaseKubeconfigCache:
         cache = self._caches.get(key)
         if cache is None:
             cache = KubeconfigTokenCache(
-                source, directory=self._directory, now=self._now
+                source, directory=self._directory, now=self._now, sleep=self._sleep
             )
             if not cache.has_exec_users or cache.earliest_expiry is None:
                 return original

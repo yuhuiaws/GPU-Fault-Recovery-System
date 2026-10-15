@@ -119,6 +119,10 @@ VERIFICATION_REPORT = "verification-report.json"
 STABILITY_REPORT = "stability-report.json"
 RELEASE_SUMMARY_REPORT = "release-summary.json"
 EXPECTED_STATE_SHA256_ENV = "GPU_FAULT_EXPECTED_RELEASE_STATE_SHA256"
+# Mirrors ``regional_release_observation.HEALTH_UNOBSERVABLE_EXIT_CODE`` (pinned
+# equal by tests/regional/test_release_observation.py): verify or stability ran
+# out of observation budget without seeing health, which still fails closed.
+HEALTH_UNOBSERVABLE_EXIT_CODE = 4
 
 
 class ReleaseStateNotFound(ReleaseDeployError):
@@ -353,6 +357,12 @@ def _run_json(
     if completed.returncode:
         raise ReleaseDeployError(
             f"command failed ({completed.returncode}): {arguments[0]}"
+            + (
+                "; release health could not be observed: the engine could not "
+                "authenticate to or reach its APIs within the observation budget"
+                if completed.returncode == HEALTH_UNOBSERVABLE_EXIT_CODE
+                else ""
+            )
         )
     try:
         value = json.loads(output)

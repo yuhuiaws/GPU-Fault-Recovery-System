@@ -9,6 +9,7 @@ from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault.admin.command_log import FAILURE_EXIT_CODE_ATTRIBUTE
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_observation import ApiUnavailable
 from gpu_fault_release.regional_resource_probe import ResourceRef, probe_resource
 
 BASE_RUNTIME_PATH = (
@@ -243,13 +244,19 @@ def exec_cpu_ingress(
                 137,
                 143,
             )
-            replaced = replacement_attempts_left > 0 and (
-                killed_in_flight
-                or not probe_resource(
-                    release.runner,
-                    release._cpu(),
-                    ResourceRef("pod", "Pod", pod, release.config.namespace),
-                ).exists()
+            # An API the engine could not reach cannot say whether the Pod
+            # went away either; the failure stays what it was.
+            replaced = (
+                replacement_attempts_left > 0
+                and not isinstance(exc, ApiUnavailable)
+                and (
+                    killed_in_flight
+                    or not probe_resource(
+                        release.runner,
+                        release._cpu(),
+                        ResourceRef("pod", "Pod", pod, release.config.namespace),
+                    ).exists()
+                )
             )
             forget_cpu_ingress_pod(release)
             refresh = True

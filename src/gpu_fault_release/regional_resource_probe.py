@@ -10,6 +10,10 @@ from typing import Protocol, cast
 
 from gpu_fault.admin.diagnostics import diagnostic_text
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_observation import (
+    ApiUnavailable,
+    unavailable_reason,
+)
 
 
 class ProbeState(StrEnum):
@@ -44,15 +48,22 @@ class ResourceObservation:
     reference: ResourceRef
     document: dict[str, object] | None = field(default=None, repr=False)
     error: str = ""
+    # Why the read never got an answer, when it was the client's failure
+    # (``regional_release_observation``); None for every other error.
+    unavailable: str | None = None
 
     def __bool__(self) -> bool:
         raise TypeError("resource observations require an explicit state check")
 
     def require_readable(self) -> dict[str, object] | None:
         if self.state is ProbeState.ERROR:
-            raise ReleaseError(
-                f"cannot read {self.reference.resource}/{self.reference.name}: {self.error}"
+            message = (
+                f"cannot read {self.reference.resource}/{self.reference.name}: "
+                f"{self.error}"
             )
+            if self.unavailable is not None:
+                raise ApiUnavailable(message, reason=self.unavailable)
+            raise ReleaseError(message)
         return self.document
 
     def exists(self) -> bool:
@@ -90,13 +101,17 @@ def probe_resource(
         )
     except (ReleaseError, TimeoutError, OSError) as exc:
         return ResourceObservation(
-            ProbeState.ERROR, reference, error=diagnostic_text(str(exc))
+            ProbeState.ERROR,
+            reference,
+            error=diagnostic_text(str(exc)),
+            unavailable=exc.reason if isinstance(exc, ApiUnavailable) else None,
         )
     if code:
         return ResourceObservation(
             ProbeState.ERROR,
             reference,
             error=f"read failed ({code}): {diagnostic_text(error)}",
+            unavailable=unavailable_reason(arguments, error),
         )
     if not output.strip():
         return ResourceObservation(ProbeState.ABSENT, reference)

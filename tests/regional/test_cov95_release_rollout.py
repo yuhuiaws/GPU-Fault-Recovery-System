@@ -30,6 +30,7 @@ class Driver:
         self.calls: list[tuple[str, Any]] = []
         self.healthy = True
         self.failure: Exception | None = None
+        self.observation: Any = None
 
     def record(self, name: str, details: Any = None) -> None:
         self.calls.append((name, details))
@@ -78,8 +79,11 @@ class Driver:
     def _apply_health_baseline(self, state: dict[str, Any]) -> None:
         self.record("health-baseline", state)
 
-    def validate_stability_window(self, *, release_kind=None) -> dict[str, Any]:
+    def validate_stability_window(
+        self, *, release_kind=None, observation=None
+    ) -> dict[str, Any]:
         self.record("stability", release_kind)
+        self.observation = observation
         return {"healthy": self.healthy}
 
 
@@ -196,6 +200,9 @@ def test_rollout_public_entrypoint_dispatches_exactly_one_selected_mode(
         ]
     elif mode == "stability":
         assert calls == [("load-state", None), ("stability", None)]
+        assert instance.observation.mode == "stability", (
+            "the window spends the observation budget its run opened"
+        )
     else:
         assert len(calls) == 1
         assert calls[0][0] == mode

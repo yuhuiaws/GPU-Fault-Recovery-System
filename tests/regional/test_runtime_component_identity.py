@@ -6,6 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from gpu_fault_release import regional_release_observation as OBSERVATION
 from gpu_fault_release import regional_release_runtime_identity as MODULE
 from gpu_fault_release.regional_release_config import ReleaseError
 from tests.regional._resource_probe_fakes import resource_probe_result
@@ -319,6 +320,38 @@ def test_a_probe_that_ran_against_a_live_pod_is_not_retried_without_retries() ->
             release, script="print(1)", failure="release safety checks", retries=0
         )
     assert release.execs == ["live-pod"]
+
+
+def test_an_unreachable_api_is_not_asked_whether_the_pod_went_away() -> None:
+    # The exec never reached the API server, so neither would the Pod lookup
+    # that decides on a replacement attempt: asking it turned the failure into
+    # "cannot read pod", which the stability window judged a finding. The
+    # failure stays ApiUnavailable, for the window to take the sample again.
+    release = ProbeRelease(pod="live-pod", live_pods=["live-pod"], failures=0)
+    release.prime()
+    resolve = release.runner.run
+
+    def unreachable(arguments, **kwargs):
+        if "exec" in arguments:
+            release.execs.append(arguments[arguments.index("--") - 1])
+            raise OBSERVATION.ApiUnavailable(
+                "command failed (1): kubectl: Unable to connect to the server",
+                reason="network",
+            )
+        return resolve(arguments, **kwargs)
+
+    def never(arguments, **_kwargs):
+        raise AssertionError(
+            f"the Pod was looked up over an unreachable API: {arguments}"
+        )
+
+    release.runner = SimpleNamespace(run=unreachable, probe_output=never, dry_run=False)
+
+    with pytest.raises(OBSERVATION.ApiUnavailable):
+        MODULE.exec_cpu_ingress_probe(
+            release, script="print(1)", failure="stability window", retries=1
+        )
+    assert release.execs == ["live-pod", "live-pod"], "the read-only retry still runs"
 
 
 def test_the_replacement_allowance_is_granted_once() -> None:
