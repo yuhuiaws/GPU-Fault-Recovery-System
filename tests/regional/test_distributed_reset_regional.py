@@ -61,7 +61,7 @@ class FleetClient(StoreClient):
                 return self.store.get_agent(CLUSTER, node).model_dump(mode="json")
         raise AssertionError(f"unexpected local fleet read: {path}")
 
-    def _post(self, path, payload):
+    def _post(self, path, payload, **_options):
         assert path == "/v1/fleet/readiness"
         assert payload["cluster_id"] == CLUSTER
         return self.registry.readiness(CLUSTER, payload["node_ids"]).model_dump(

@@ -564,7 +564,7 @@ def test_iso003_the_fleet_proxy_refuses_cross_cluster_reads_and_transitions() ->
             self.requests.append((path, None))
             return []
 
-        def _post(self, path, payload):
+        def _post(self, path, payload, **_options):
             self.requests.append((path, payload))
             return {}
 

@@ -18,12 +18,14 @@ import logging
 import socket
 import time
 import ssl
+from collections.abc import Mapping
 from datetime import datetime, timezone
 from http.client import HTTPException, RemoteDisconnected
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, urlencode
 from urllib.request import Request
+from uuid import uuid4
 
 from pydantic import ValidationError
 
@@ -60,7 +62,11 @@ from gpu_fault.regional_compatibility import (
     CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION,
 )
 from gpu_fault.telemetry import RawEvidenceRecord
-from gpu_fault.transport.http_client import urlopen
+from gpu_fault.transport.http_client import (
+    COMMAND_ID_HEADER,
+    REQUEST_ID_HEADER,
+    urlopen,
+)
 
 # Deliberately the pre-split module's name and not ``__name__``: the log format
 # carries ``%(name)s`` and operators filter on ``gpu_fault.cluster_executor``, so
@@ -129,6 +135,44 @@ def closed_without_response(exc: ClusterExecutorError) -> bool:
         inner = getattr(cause, "reason", None)
         cause = inner if isinstance(inner, BaseException) else cause.__cause__
     return False
+
+
+def command_identity_headers(command_id: str) -> dict[str, str]:
+    """``X-GPU-Fault-Command-ID`` for a lease-fenced post about one command.
+
+    The header licenses the transport's one repeat of the post on a fresh
+    connection when a reused one fails after the write. Repeating is safe for
+    exactly these posts because the control plane fences them by the lease
+    token in the body (``gpu_fault.store.shared.remote_commands``): a result
+    for a command already terminal returns it unchanged, a renewal under the
+    same token only moves the expiry, and progress merges per-step entries a
+    repeat leaves equal. The control plane refuses a header naming another
+    command than the path. An id a header cannot carry is sent without one.
+    """
+
+    if (
+        command_id
+        and command_id.isascii()
+        and command_id.isprintable()
+        and " " not in command_id
+    ):
+        return {COMMAND_ID_HEADER: command_id}
+    return {}
+
+
+def request_identity_headers() -> dict[str, str]:
+    """``X-GPU-Fault-Request-ID`` for a post answered alike when it arrives twice.
+
+    A read (readiness, fleet readiness, spare health, node keys) or a write
+    keyed by its body (node inventory by ``observed_at``, evidence by
+    ``record_id``, an advisory by its deduplication key, a drain or revoke by
+    its ``transition_id``, a submission outcome over its own record). The
+    control plane gives the value no meaning: it licenses the transport's one
+    repeat. Never on a claim, a submission reservation or a reactivation -- a
+    repeat of those leases more commands, answers ``reserved=False`` or 409s.
+    """
+
+    return {REQUEST_ID_HEADER: uuid4().hex}
 
 
 class RegionalExecutorClient:
@@ -219,7 +263,11 @@ class RegionalExecutorClient:
         payload: dict[str, Any],
         *,
         timeout_seconds: float | None = None,
+        headers: Mapping[str, str] | None = None,
     ) -> dict[str, Any]:
+        """One POST; ``headers`` adds a retry identity to a post that is safe
+        to repeat (``command_identity_headers``, ``request_identity_headers``)."""
+
         request = Request(
             self.base_url + path,
             data=json.dumps(payload, separators=(",", ":"), default=str).encode(),
@@ -227,6 +275,7 @@ class RegionalExecutorClient:
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {self.token}",
                 "X-GPU-Fault-Cluster-ID": self.cluster_id,
+                **(headers or {}),
             },
             method="POST",
         )
@@ -365,6 +414,7 @@ class RegionalExecutorClient:
                     status_source="executor-rejected",
                     error=summary,
                 ).model_dump(mode="json"),
+                headers=command_identity_headers(command_id),
             )
         except Exception:
             # The command keeps its lease and expires; the next claim tries
@@ -390,19 +440,36 @@ class RegionalExecutorClient:
         (403), a broken trust chain (URLError) and a backlog this
         executor cannot claim (503) all fail the same way, instead of the
         anonymous /healthz probe that passed through all four.
+
+        The route only reads (``remote_command_cluster_health``), so asking
+        twice is harmless: the request id licenses the transport's repeat on
+        a stale connection, and a connection closed before any status line
+        (a control-plane Pod leaving its roll) is asked once more here --
+        the probe runs in a fresh process, whose first connection is new.
         """
 
-        return self._post(
-            "/v1/regional/executors/readiness",
-            RegionalExecutorReadinessRequest(
-                executor_id=executor_id,
-                executor_protocol_version=(CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION),
-                executor_artifact_sha256=self.executor_artifact_sha256,
-                executor_compatibility_digest=(self.executor_compatibility_digest),
-                execution_owners=execution_owners,
-                last_successful_claim_age_seconds=(last_successful_claim_age_seconds),
-            ).model_dump(mode="json"),
-        )
+        body = RegionalExecutorReadinessRequest(
+            executor_id=executor_id,
+            executor_protocol_version=(CURRENT_REGIONAL_EXECUTOR_PROTOCOL_VERSION),
+            executor_artifact_sha256=self.executor_artifact_sha256,
+            executor_compatibility_digest=(self.executor_compatibility_digest),
+            execution_owners=execution_owners,
+            last_successful_claim_age_seconds=(last_successful_claim_age_seconds),
+        ).model_dump(mode="json")
+        identity = request_identity_headers()
+        path = "/v1/regional/executors/readiness"
+        try:
+            return self._post(path, body, headers=identity)
+        except ClusterExecutorError as exc:
+            if not closed_without_response(exc):
+                raise
+            LOGGER.warning(
+                "regional control plane closed the readiness connection without "
+                "a response (%s); asking once more",
+                exc,
+            )
+            time.sleep(CLOSED_WITHOUT_RESPONSE_RETRY_SECONDS)
+            return self._post(path, body, headers=identity)
 
     def report_node_inventory(self, report: dict[str, Any]) -> dict[str, Any]:
         """Post this cluster's Kubernetes Node names (``node_inventory``).
@@ -414,7 +481,11 @@ class RegionalExecutorClient:
 
         if report.get("cluster_id") != self.cluster_id:
             raise ClusterExecutorError("node inventory names another cluster")
-        response = self._post("/v1/regional/executors/node-inventory", report)
+        response = self._post(
+            "/v1/regional/executors/node-inventory",
+            report,
+            headers=request_identity_headers(),
+        )
         if response.get("cluster_id") != self.cluster_id:
             raise ClusterExecutorError(
                 "control plane answered the node inventory for another cluster"
@@ -429,6 +500,7 @@ class RegionalExecutorClient:
         response = self._post(
             f"/v1/regional/executors/{command.command_id}/result",
             result.model_dump(mode="json"),
+            headers=command_identity_headers(command.command_id),
         )
         return RemoteActionCommand.model_validate(response)
 
@@ -454,6 +526,7 @@ class RegionalExecutorClient:
                     for index, entry in batched_results.items()
                 },
             ).model_dump(mode="json"),
+            headers=command_identity_headers(command.command_id),
         )
         return RemoteActionCommand.model_validate(response)
 
@@ -472,6 +545,7 @@ class RegionalExecutorClient:
                 lease_token=command.lease_token,
                 lease_seconds=lease_seconds,
             ).model_dump(mode="json"),
+            headers=command_identity_headers(command.command_id),
         )
         return RemoteActionCommand.model_validate(response)
 
@@ -499,7 +573,9 @@ class RegionalExecutorClient:
         body: dict[str, Any] = {"cluster_id": self.cluster_id, "node_ids": requested}
         if attestations:
             body["nodes"] = [item.model_dump(mode="json") for item in attestations]
-        response = self._post("/v1/regional/node-action-keys", body)
+        response = self._post(
+            "/v1/regional/node-action-keys", body, headers=request_identity_headers()
+        )
         keys = response.get("keys") if isinstance(response, dict) else None
         if response.get("cluster_id") != self.cluster_id or not isinstance(keys, dict):
             raise ClusterExecutorError(
@@ -638,6 +714,7 @@ class RegionalFleetRegistry:
             FleetReadinessRequest(cluster_id=cluster_id, node_ids=node_ids).model_dump(
                 mode="json"
             ),
+            headers=request_identity_headers(),
         )
         return FleetReadinessReport.model_validate(response)
 
@@ -647,7 +724,7 @@ class RegionalFleetRegistry:
         node_id: str,
         request: AgentTransitionRequest,
     ) -> AgentRecord:
-        return self._transition(cluster_id, node_id, "drain", request)
+        return self._transition(cluster_id, node_id, "drain", request, repeatable=True)
 
     def revoke_agent(
         self,
@@ -655,7 +732,7 @@ class RegionalFleetRegistry:
         node_id: str,
         request: AgentTransitionRequest,
     ) -> AgentRecord:
-        return self._transition(cluster_id, node_id, "revoke", request)
+        return self._transition(cluster_id, node_id, "revoke", request, repeatable=True)
 
     def reactivate_agent(
         self,
@@ -671,12 +748,18 @@ class RegionalFleetRegistry:
         node_id: str,
         action: str,
         request: AgentTransitionRequest,
+        *,
+        repeatable: bool = False,
     ) -> AgentRecord:
+        """``repeatable``: a drain or revoke under the same ``transition_id``
+        answers the current record; a reactivation does not (its repeat 409s)."""
+
         if cluster_id != self.client.cluster_id:
             raise ClusterExecutorError("cannot transition an agent in another cluster")
         response = self.client._post(
             f"/v1/regional/executors/agents/{node_id}/{action}",
             request.model_dump(mode="json"),
+            headers=request_identity_headers() if repeatable else None,
         )
         return AgentRecord.model_validate(response)
 
@@ -696,6 +779,7 @@ class RegionalFleetRegistry:
                 incident_id=incident_id,
                 observed_after=observed_after,
             ).model_dump(mode="json"),
+            headers=request_identity_headers(),
         )
         return RemoteSpareHealthReport.model_validate(response).reasons
 
@@ -718,6 +802,7 @@ class RegionalFleetRegistry:
                 cluster_id=self.client.cluster_id,
                 notification=notification,
             ).model_dump(mode="json"),
+            headers=request_identity_headers(),
         )
         return AdvisoryNotification.model_validate(response)
 
@@ -730,6 +815,7 @@ class RegionalFleetRegistry:
         response = self.client._post(
             "/v1/regional/executors/evidence",
             request.model_dump(mode="json"),
+            headers=request_identity_headers(),
         )
         return RawEvidenceRecord.model_validate(response)
 
@@ -748,6 +834,8 @@ class RegionalHyperPodSubmissionStore:
         self.client = client
 
     def reserve_hyperpod_submission(self, record):
+        # No retry identity: a repeated reservation answers ``reserved=False``
+        # and the submission would then fail closed as reserved elsewhere.
         response = self.client._post(
             "/v1/regional/executors/hyperpod-submissions/reserve",
             RemoteHyperPodSubmissionRequest(
@@ -765,6 +853,7 @@ class RegionalHyperPodSubmissionStore:
                 cluster_id=self.client.cluster_id,
                 record=record,
             ).model_dump(mode="json"),
+            headers=request_identity_headers(),
         )
 
     def get_hyperpod_submission(self, cluster_name: str, idempotency_key: str):

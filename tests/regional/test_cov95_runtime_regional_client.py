@@ -68,6 +68,9 @@ def test_no_transport_verdict_is_not_misclassified_as_an_authentication_denial(
     monkeypatch: pytest.MonkeyPatch, error: BaseException
 ) -> None:
     api, wire = client(monkeypatch, error)
+    monkeypatch.setattr(
+        "gpu_fault.cluster_executor.regional_client.time.sleep", lambda _seconds: None
+    )
     with pytest.raises(ClusterExecutorError) as failed:
         api.readiness(
             "unit-executor",
@@ -76,7 +79,10 @@ def test_no_transport_verdict_is_not_misclassified_as_an_authentication_denial(
         )
     assert failed.value.status_code is None
     assert type(error).__name__ in str(failed.value)
-    assert len(wire.calls) == 1
+    # A read-only probe whose connection closed before any status line is
+    # asked once more; every other failure is the probe's answer at once.
+    closed = isinstance(error, ConnectionResetError)
+    assert len(wire.calls) == (2 if closed else 1)
 
 
 @pytest.mark.parametrize("status", [403, 404, 503])

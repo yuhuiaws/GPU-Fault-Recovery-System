@@ -72,6 +72,7 @@ from gpu_fault.regional_compatibility import (
 from gpu_fault.orchestration.escalation import escalation_descends_from
 from gpu_fault.store import NotFoundError
 from gpu_fault.telemetry import RawEvidenceRecord
+from gpu_fault.transport.http_client import COMMAND_ID_HEADER
 from gpu_fault.workflow_quarantine import has_terminal_quarantine_hold
 from gpu_fault.kubernetes_node_inventory import (
     InventoryReportRefused,
@@ -174,6 +175,25 @@ def _require_cluster(cluster_id: str | None) -> str:
             detail="X-GPU-Fault-Cluster-ID is required",
         )
     return cluster_id
+
+
+def require_command_identity(command_id: str, declared: str | None) -> None:
+    """``X-GPU-Fault-Command-ID``, when a command post carries it, must name the
+    command in the path.
+
+    The header is the executor's licence for its transport to repeat a result,
+    renewal or progress post once on a fresh connection; the repeat is safe
+    because the store answers it idempotently under the lease token. A header
+    naming another command is a client defect and is refused before the store
+    is touched. Optional both ways: an executor that predates it sends none,
+    and a control plane that predates it ignores it.
+    """
+
+    if declared is not None and declared.strip() != command_id:
+        raise HTTPException(
+            status_code=400,
+            detail=f"{COMMAND_ID_HEADER} does not name the command in the path",
+        )
 
 
 @router.get("/clusters")
@@ -373,8 +393,10 @@ async def renew_remote_command(
         default=None,
         alias="X-GPU-Fault-Cluster-ID",
     ),
+    command_identity: str | None = Header(default=None, alias=COMMAND_ID_HEADER),
     dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
 ) -> RemoteActionCommand:
+    require_command_identity(command_id, command_identity)
     return await _store_call(
         dependencies,
         dependencies.context.store.renew_remote_command_lease,
@@ -398,6 +420,7 @@ async def report_remote_command_progress(
         default=None,
         alias="X-GPU-Fault-Cluster-ID",
     ),
+    command_identity: str | None = Header(default=None, alias=COMMAND_ID_HEADER),
     dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
 ) -> RemoteActionCommand:
     """Per-step results of a compound command, before its terminal result.
@@ -410,6 +433,7 @@ async def report_remote_command_progress(
     with the terminal report (``dispatch_remote_completion``), never mid-run.
     """
 
+    require_command_identity(command_id, command_identity)
     ctx = dependencies.context
     command: RemoteActionCommand = await _store_call(
         dependencies,
@@ -442,8 +466,10 @@ async def complete_remote_command(
         default=None,
         alias="X-GPU-Fault-Cluster-ID",
     ),
+    command_identity: str | None = Header(default=None, alias=COMMAND_ID_HEADER),
     dependencies: RegionalRouterDependencies = Depends(get_regional_dependencies),
 ) -> RemoteActionCommand:
+    require_command_identity(command_id, command_identity)
     ctx = dependencies.context
     command = await _store_call(
         dependencies,

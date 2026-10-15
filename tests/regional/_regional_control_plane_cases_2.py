@@ -560,7 +560,7 @@ def test_regional_registry_persists_evidence_over_api() -> None:
         def __init__(self) -> None:
             self.requests = []
 
-        def _post(self, path, payload):
+        def _post(self, path, payload, **_options):
             self.requests.append((path, payload))
             return {
                 **payload,
@@ -593,7 +593,7 @@ def test_regional_registry_persists_notification_over_api() -> None:
         def __init__(self) -> None:
             self.requests = []
 
-        def _post(self, path, payload):
+        def _post(self, path, payload, **_options):
             self.requests.append((path, payload))
             return payload["notification"]
 

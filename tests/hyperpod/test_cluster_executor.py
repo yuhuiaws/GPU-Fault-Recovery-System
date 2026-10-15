@@ -49,7 +49,7 @@ def test_regional_executor_client_advertises_current_protocol(monkeypatch) -> No
     )
     payloads = []
 
-    def post(path, payload, *, timeout_seconds=None):
+    def post(path, payload, *, timeout_seconds=None, headers=None):
         payloads.append((path, payload))
         if path.endswith("/claim"):
             return {"commands": []}
@@ -85,7 +85,7 @@ def test_regional_executor_client_advertises_its_artifact(monkeypatch) -> None:
     )
     payloads = []
 
-    def post(path, payload, *, timeout_seconds=None):
+    def post(path, payload, *, timeout_seconds=None, headers=None):
         payloads.append((path, payload))
         return {"commands": []} if path.endswith("/claim") else {"ready": True}
 
