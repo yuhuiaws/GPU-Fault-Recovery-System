@@ -128,6 +128,9 @@ wait for), the window may end as early as 60 seconds (two 30-second samples afte
 - Every sample so far is clean: all Pods Ready, zero restarts relative to the baseline, no critical alerts after grace filtering
   (Collector-type alerts under grace also count as "not clean"), no non-terminal remote commands, and the baseline itself never waited for
   criticals to clear;
+- No observation had to be taken again: once the engine took any observation again (the baseline, the critical-clear wait, a window
+  sample) because it could not authenticate to or reach an API, the full window is kept, and so it is when the convergence read of the
+  control-plane Deployments cannot be made;
 - Every control-plane Deployment has converged: `status.replicas == updatedReplicas == readyReplicas
   == spec.replicas` and `observedGeneration == metadata.generation`.
 
@@ -177,15 +180,27 @@ the administrator must no longer manually apply the same release round following
 
 Every run of the `deploy`/`config` release engine generates, for the CPU kubeconfig and for the GPU kubeconfig pointed to by `KUBECONFIG`,
 **a run-specific token-cache copy**: the engine executes the exec credential plugin in the kubeconfig
-(`aws eks get-token`) exactly once, writes the returned token as a static `token` field, and leaves
+(`aws eks get-token`) once (a failed attempt is retried, see below), writes the returned token as a static `token` field, and leaves
 the rest unchanged; the copy lives in a `0700` private temporary directory created by `mkdtemp`, with file mode `0600`,
 and is deleted when the engine exits. From then on every `kubectl` of the engine itself and its child scripts reads that copy instead of
 calling the plugin each time (measured at about 0.8 s per call, roughly 250 calls per `config` release). Before each command the engine
 checks the expiry: when any token is less than 180 s from expiry it re-executes the plugin and atomically replaces the copy with `os.replace`,
-so the next `kubectl` of a running child script already reads the new token. A plugin failure terminates directly with
-`ReleaseError` and never falls back to a credential-less kubeconfig; `--dry-run` does not execute the plugin.
-Setting `GPU_FAULT_KUBECONFIG_TOKEN_CACHE=false` disables the cache and restores the original behaviour of calling the plugin every time
-(for comparison during troubleshooting).
+so the next `kubectl` of a running child script already reads the new token. A plugin that exits non-zero, times out or prints
+output that is not JSON is retried: at most 3 attempts with pauses of 2 s and 5 s, all attempts and pauses together within 120 s and
+within the caller's own deadline; every attempt is admitted through the deployment API budget, and every retry prints one
+`exec-credential-retry` line on stderr. A response that breaks the ExecCredential contract (wrong kind/apiVersion, extra status fields,
+no token, an expiry too soon) and a plugin that cannot be started are not retried. A fetch that still fails fails closed as before and
+never falls back to a credential-less kubeconfig: the error carries only the failure and one fixed reason word (for example
+`exec credential plugin exited 253 (no-credentials) after 3 attempts in 9s`), never the plugin's output or the token. The `verify` and
+`stability` modes treat such a failure as "could not observe" and take the observation again within the observation budget (the
+configured stability window length), ending with exit status 4 once it is spent; every other mode fails at once. Child processes of the
+same deployment scope also get `AWS_METADATA_SERVICE_NUM_ATTEMPTS=3` and `AWS_METADATA_SERVICE_TIMEOUT=2` by default, unless the
+administrator set them in the environment or the AWS config. Troubleshooting:
+[Administrator Operations §4.10](administrator-operations.md#410-when-verifystability-cannot-reach-an-api-credential-plugin-retries-the-observation-budget-and-exit-status-4);
+design: [Detailed Design v2 §2.12](detailed-design-v2.md#212-unobservable-is-not-unhealthy-credential-plugin-retries-imds-defaults-and-the-observation-budget).
+`--dry-run` does not execute the plugin. Setting `GPU_FAULT_KUBECONFIG_TOKEN_CACHE=false` disables the cache and restores the original
+behaviour of calling the plugin every time (for comparison during troubleshooting); kubectl then runs the plugin itself, and its failure
+(`getting credentials: exec`) is classified by the same rules, only without the engine's retries.
 
 For a new site, Aurora, AMP/SNS, runtime/cache ECR and the solution security group are
 created or reused as site base resources by the normal administrator entry point according to the CPU/GPU ARNs, which then builds the signed release and generates

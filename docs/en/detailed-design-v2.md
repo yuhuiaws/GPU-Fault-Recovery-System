@@ -744,6 +744,145 @@ nodes, tiers 0/1); `tests/admin/test_rds_ca_bundle_drift.py` (certificate parsin
 classification, finding text, read-only) and `tests/deploy/test_rds_ca_bundle_wiring.py` (the vendored copy installed by default, a modified
 copy fails closed, the download never takes part in trust).
 
+### 2.12 Unobservable is not unhealthy: credential plugin retries, IMDS defaults and the observation budget
+
+**The traced path** (2026-10-15). After `gpu-fault-admin config` had rolled a `CONTROL_PLANE_ONLY` change cleanly, the release driver's
+`_run_verification_and_stability` (`scripts/release_deploy.py`) started two read-only processes in parallel:
+`python -m gpu_fault.admin.cli verify` (which runs `deploy/control-plane/regional/rollout-regional-release.sh verify`) and
+`rollout-regional-release.sh stability`. Both engine processes construct `ReleaseKubeconfigCache` in `_run_mode`
+(`src/gpu_fault_release/rollout.py`) before any check, running `aws eks get-token` for the kubeconfig; at that moment the deploy host got
+no EC2 instance-role credentials over IMDS (AWS CLI v2 exit status 253: configuration or credentials unavailable; the AWS CLI's IMDS
+defaults are 1 attempt with a 1-second timeout), the single attempt of `_fetch_exec_credential` raised
+`ReleaseError("exec credential plugin exited 253")`, `main` ended through `report_failure` with exit status 2, and both processes were gone
+about 2 seconds in. The driver's `_run_json` recorded the non-zero exit as `command failed (2): ...`, and `recover_release_failure`
+(`scripts/release_failure_recovery.py`), with `deployment_succeeded` and `automatic_rollback`, called `rollback_after_failure`, which ran
+`rollout-regional-release.sh rollback --automatic`: an observation that never happened bought about seven minutes of forced restarts and
+took a healthy change back. Both rules were right -- the engine must not carry on with a credential-less kubeconfig, and the driver must
+not commit a release nobody verified; the mistake was reading "could not see" as "saw it unhealthy".
+
+**Three layers**
+
+1. **IMDS defaults in the CLI** (`src/gpu_fault/admin/api_budget.py` `METADATA_SERVICE_DEFAULTS`, `metadata_service_defaults`).
+   `deployment_api_budget()` is the root scope of every `gpu-fault-admin` verb and of the release engine; on entry it writes
+   `AWS_METADATA_SERVICE_NUM_ATTEMPTS=3` and `AWS_METADATA_SERVICE_TIMEOUT=2` into the process environment once, so `aws`, `kubectl` and
+   its `aws eks get-token` plugin, and the deploy-host boto3 probes of the scope all inherit them, and it restores them with `PATH` and the
+   rest on exit; a nested scope sets nothing. A variable already in the environment, or `metadata_service_num_attempts`/
+   `metadata_service_timeout` in any section of `AWS_CONFIG_FILE` (by default `~/.aws/config`), means that one is not added; a config
+   file that cannot be read (`OSError`, an encoding error, `configparser.Error`) means nothing is added. The chain reaches IMDS last, so
+   environment, profile and SSO credentials are unaffected; when IMDS really is down one lookup takes about 12 seconds at worst (about 2
+   before).
+2. **Credential fetch retries** (`src/gpu_fault_release/regional_kubeconfig_cache.py`). `_plugin_invocation` builds the command and its
+   environment and `_plugin_attempt` runs it once: a non-zero exit, a timeout or output that is not JSON comes back as a `_PluginFailure`
+   (the failure plus its reason word); a plugin that cannot be started (`OSError`) and output above 8 MiB are a `ReleaseError` at once;
+   `_credential_token` checks the ExecCredential contract (kind, apiVersion, a status holding only `token`/`expirationTimestamp`, a
+   non-empty token, an expiry more than 60 seconds away) and a violation is a `ReleaseError` that is not retried -- the same plugin returns
+   the same document. `_fetch_exec_credential` loops inside `deadline_scope("exec credential plugin", EXEC_FETCH_SECONDS)`:
+   `EXEC_ATTEMPTS = 3`, `EXEC_RETRY_DELAYS = (2.0, 5.0)`, `EXEC_FETCH_SECONDS = 2 * EXEC_TIMEOUT_SECONDS` (120 seconds: room for one hung
+   attempt and the quick retries after it), the nested deadline also bounded by the caller's; it stops when what is left cannot hold the
+   pause plus an attempt of at least `MIN_ATTEMPT_SECONDS`. Every attempt goes through `run_command`, bare `aws` through the deployment
+   API budget shim, admitted like any other `aws` call. Every retry narrates one `exec-credential-retry` line (`narrate_step`); a final
+   failure raises `ApiUnavailable` with a message such as `exec credential plugin exited 253 (no-credentials) after 3 attempts in 9s` --
+   the failure and the reason word, never the plugin's output or the token.
+3. **The observation budget** (the new module `src/gpu_fault_release/regional_release_observation.py`). Only for `OBSERVATION_MODES`
+   (`verify`, `stability`); `ObservationBudget.for_mode` returns `None` for every other mode and for `--dry-run`. While `observe` raises
+   `ApiUnavailable`, `attempt(observe, what=...)` charges the failed attempt's time to `unobserved`, pauses by
+   `OBSERVATION_RETRY_DELAYS = (5.0, 10.0, 20.0, 30.0)` (the last repeating), charges the pause too, and observes again; a pause that
+   would take the total past `seconds` raises `HealthUnobservable` instead. Any other exception passes through untouched: it is a finding,
+   and judging it is the caller's job. `seconds` is `observation_seconds()`, read from `GPU_FAULT_RELEASE_STABILITY_SECONDS` (120..300,
+   default 120; an invalid value falls back to 120 and `validate_stability_window` still refuses it). The wiring:
+   - `rollout._run_mode` constructs the kubeconfig cache through `observed(budget, ..., what="credentials")` and hands the same budget to
+     `_dispatch_mode`; `main` maps `HealthUnobservable` to `HEALTH_UNOBSERVABLE_EXIT_CODE` and prints
+     `ERROR: release health could not be observed: ...`;
+   - verify: `observed_health_report` reads the state, applies the health baseline and runs `build_health_report` on every attempt; when
+     `unobserved_checks` finds that every FAIL's `details` is `{"unobservable": <reason>}` it raises `_UnobservedReport` and the report is
+     built again, while one genuine FAIL ends as usual through `report_exit_code`; a report built again carries the `observation` summary
+     (`summary()`: `observed`, `budget_seconds`, `unobserved_seconds`, `retries`, `reasons`); a spent budget prints the last report
+     (`observation.observed=false`) and returns 4, and a state read that spends the budget raises `HealthUnobservable` itself;
+   - stability: the baseline of `validate_stability_window` (`baseline`), the Store I/O rejection series proof (`metric-series`) and the
+     clear-wait samples (`clear-wait`) of `wait_for_stability_baseline`, and the window samples (`sample`) share the one budget; the
+     unobserved time a window sample costs (in whole seconds) moves the window's deadline out, so the verdict still rests on a full window
+     of samples; `_ControlPlaneOnlyWindow.missed` turns the `CONTROL_PLANE_ONLY` early close off once anything before or inside the window
+     was taken again, and a convergence read in `may_close` that raises `ApiUnavailable` only keeps the full window; the report carries
+     `observation`;
+   - `exec_cpu_ingress` (`src/gpu_fault_release/regional_release_runtime_identity.py`): `ApiUnavailable` no longer triggers the "was the
+     Pod replaced" lookup and its extra attempt (an API the engine could not reach cannot say whether the Pod went away either, and the
+     lookup only rewrote the failure into the finding `cannot read pod`); the failure goes up to the budget as it is, and a read-only
+     probe's own retries still run.
+
+**Classification: where `ApiUnavailable` comes from.** `ApiUnavailable` is a `CheckFailure` whose `details` are always
+`{"unobservable": <reason>}`, so a check failing with it keeps "could not observe" as the evidence of its FAIL record. `failure_reason`
+matches the reason word (`REASONS`) from the last 64 KiB of the client's output in the order `expired`, `access-denied`,
+`no-credentials`, `throttled`, `network` -- a definitive cause wins over the transport words a give-up message also carries -- and
+`unknown` when nothing matches; it matches and never copies. `TRANSIENT_REASONS` are `no-credentials`, `throttled` and `network`. The
+sources:
+
+- The credential fetch (layer 2), whatever the reason: the engine could not authenticate;
+- `Runner.run` failures through `unavailable_failure`, decided by `unavailable_reason`: `kubectl` output with
+  `Unable to connect to the server`, `getting credentials: exec` or `(TooManyRequests)` and either a reason in `TRANSIENT_REASONS` or a
+  failing credential plugin (`getting credentials: exec`, the shape kubectl's own plugin call takes with
+  `GPU_FAULT_KUBECONFIG_TOKEN_CACHE=false`); output with `command terminated with exit code N` always stays the plain error. An `aws`
+  failure converts only with a reason in `TRANSIENT_REASONS`. The conversion keeps the error's message and the exit-status attributes
+  `child_failure` set;
+- Three-state resource reads: `probe_resource` (`src/gpu_fault_release/regional_resource_probe.py`) records why a read got no answer in
+  `ResourceObservation.unavailable` (from `unavailable_reason` for a failed read, or from an `ApiUnavailable` the runner raised), and
+  `require_readable` raises `ApiUnavailable` for it; `read_aurora_refresh_cronjob` (`src/gpu_fault_release/regional_aurora_credentials.py`)
+  draws the same distinction for its ERROR state;
+- AMP: `deploy/control-plane/regional/probes/critical_amp_alerts.py` prints `{"unavailable": "no-credentials"}` when it cannot get or
+  freeze credentials (`BotoCoreError`), `throttled` for HTTP 429/503 and `network` for `URLError`/timeouts/connection errors, with exit
+  status 0, and `regional_release_validation.critical_amp_alerts` turns that into `ApiUnavailable`; `amp_instant_query`
+  (`src/gpu_fault_release/regional_adot_self_metrics.py`) raises `ApiUnavailable` for every query that got no response (transport or
+  credential resolution failed, `NativeHttpError`), with the reason word `failure_reason` matches from the error text, and for HTTP
+  429/503 as `throttled`. Every other HTTP status of either (403 included) stays a finding.
+
+verify takes a report again only when every FAIL in it is unobservable, so every read a check makes has to keep that marker: one place
+that wraps a read it could not make in a plain `ReleaseError` turns a kube-API or credential outage into one "genuine" FAIL, and the
+whole report into a verdict.
+
+**Deliberately not classified.** RBAC `Forbidden`, `Unauthorized`, `AccessDenied`, expired sessions, `NotFound`, x509/TLS trust errors,
+anything a remote command printed (`kubectl exec` passes the in-Pod process's stderr through, and that is the Pod's finding: a Pod that
+cannot reach the Store is a verdict), AMP's HTTP 403, and child processes other than `kubectl`/`aws` (deploy tools and probes report
+their own result; the AMP alert probe declares `unavailable` explicitly). These need an operator or are findings in themselves; taking
+them again would only hide them until the budget runs out.
+
+**The exit status and the automatic rollback that stays.** 4 is distinct from the report verdicts (0 healthy, 1 unhealthy), an engine
+error (2) and the in-flight install refusal (3); `scripts/release_deploy.py` mirrors it as the constant of the same name,
+`HEALTH_UNOBSERVABLE_EXIT_CODE`, pinned equal by test, and `_run_json` records 4 as:
+
+```text
+command failed (4): <command>; release health could not be observed: the engine could not authenticate to or reach its APIs within the observation budget
+```
+
+The automatic rollback after a spent budget is **kept on purpose**: the contract is that a verify or stability failure rolls back per
+`spec.autoRollback` (`docs/en/high-level-design.md` §7.1, the failure behaviour in `docs/en/developer-deployment-implementation.md`
+§9.1), and a release whose health was never shown is not committed (fail closed). The rollback needs the same APIs; under a persistent
+outage it fails at its own credential fetch before touching anything: `rollback_after_failure` returns `status: FAILED`, the driver ends
+with `release validation failed and rollback also failed: ...`, and the transaction stays `complete` with `transaction_committed=false`
+for the next deploy to resume; with `spec.autoRollback: false` the failure is `SKIPPED_POLICY` as before.
+
+**Rejected alternatives**
+
+- Retrying whole verify/stability processes in the driver: loses the reason and pays for the stability window twice;
+- Treating every exit status 2 as unobservable: hides real defects;
+- Skipping the rollback when health was unobservable: contradicts the documented fail-closed contract and leaves an unverified release
+  live;
+- A separate `GPU_FAULT_*` budget variable: an env-inventory change rolls the node Agents.
+
+**Release impact.** Deploy host only: `src/gpu_fault_release/*`, `src/gpu_fault/admin/api_budget.py`, `scripts/release_deploy.py` and
+`deploy/control-plane/regional/probes/*.py` are deploy-host orchestration inputs; the control_plane/executor/node_runtime component
+wheels, the manifests, the images and the node bundle do not change, so the next deploy is NOOP for the clusters (no CPU/GPU roll, no
+node Agent waves); no new `GPU_FAULT_*` variable and no env-inventory change.
+
+Tests: `tests/regional/test_kubeconfig_cache.py` (a plugin failing once is retried and its token cached, a persistent failure fails
+closed with the classified reason, non-JSON output is retried and never echoed, a contract violation is not retried, a hung attempt is
+stopped at its timeout and retried, the fetch budget and the caller's deadline, every attempt admitted through the API budget),
+`tests/regional/test_release_observation.py` (reason words and classification, the runner, three-state reads, the refresh CronJob and
+the AMP queries, the budget, exit statuses and the driver constant, verify taken again and one genuine FAIL as the verdict, the
+stability window extended and never closing early, a credential plugin that recovers or never does, end to end),
+`tests/admin/test_api_budget_metadata_defaults.py` (the defaults set and restored, environment and config-file values winning, an
+unreadable config), `tests/regional/test_release_stability_window.py` (the window itself),
+`tests/admin/test_release_deploy_unobservable.py` (the driver's record and the rollback that stays) and
+`tests/regional/test_runtime_component_identity.py` (an unreachable API is no longer asked whether the Pod went away).
+
 ## 3. Detailed Module Design
 
 ### 3.0 Module Inventory and Template

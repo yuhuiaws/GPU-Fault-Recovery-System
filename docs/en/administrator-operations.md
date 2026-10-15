@@ -1145,6 +1145,148 @@ gpu-fault-admin aurora-failback --state-dir "$STATE_DIR" --reference CHG-... --c
 - Never automatic: `status` only reports, and neither `deploy`, `status` nor the release engine calls it. A hand-run
   `aws rds failover-db-cluster --target-db-instance-identifier` is no longer needed and should not be used.
 
+### 4.10 When verify/stability Cannot Reach an API: Credential Plugin Retries, the Observation Budget and Exit Status 4
+
+**Why this section exists.** On 2026-10-15 a `gpu-fault-admin config` rolled a `CONTROL_PLANE_ONLY` change cleanly; then the `verify`
+and `stability` engine processes that the release driver (`scripts/release_deploy.py`) starts in parallel both exited about 2 seconds in
+with `ERROR: exec credential plugin exited 253`. Before any check the engine runs the kubeconfig's `aws eks get-token` for a token (the
+token-cache paragraph of the [Deployment and Operations Manual](deployment-and-operations-manual.md)), and at that moment the deploy host
+got no EC2 instance-role credentials: AWS CLI v2 exit status 253 means that configuration or credentials are unavailable, and
+instance-role credentials come over IMDS, which the AWS CLI asks once with a 1-second timeout by default. The driver treats any
+verify/stability failure as a failed validation, the site has `spec.autoRollback: true`, and
+`rollout-regional-release.sh rollback --automatic` rolled a healthy change back. An observation that could not be made no longer counts
+as unhealthy; there are three layers:
+
+1. **IMDS defaults**: every child process of a deployment scope gets `AWS_METADATA_SERVICE_NUM_ATTEMPTS=3` and
+   `AWS_METADATA_SERVICE_TIMEOUT=2` unless the administrator set them (see "IMDS defaults and overrides" in this section).
+2. **Credential plugin retries**: a non-zero exit, a timeout or output that is not JSON is retried, at most 3 attempts with pauses of
+   2 and 5 seconds; all attempts and pauses together stay within 120 seconds (twice the 60-second per-attempt timeout) and within the
+   caller's own deadline. Every attempt is an ordinary supervised command, admitted through the deployment API budget like any `aws`
+   call. A response that breaks the ExecCredential contract (wrong kind/apiVersion, extra status fields, no token, an expiry too soon)
+   and a plugin that cannot be started are not retried: the same plugin only gives the same result.
+3. **The observation budget** (the `verify` and `stability` modes only): an observation that failed because the engine could not
+   authenticate to, or reach, an API it observes with is not a verdict; it is taken again within the budget, and only a spent budget
+   fails closed, with exit status 4. Other modes (deploy, rollback, commit, `status` and so on) do not take it again: a credential fetch
+   that still fails after its 3 attempts is that invocation's failure.
+
+**Lines in the log**
+
+| Line | Meaning |
+|---|---|
+| `exec-credential-retry <stamp> attempt=1/3 failure=exited-253 reason=no-credentials next=2s total=<seconds>s` | One credential plugin attempt failed; the next one comes in `next` seconds. `failure` is `exited-<status>`, `timed-out` or `did-not-return-JSON`; `reason` is in the reason table below. No error afterwards means a transient blip was absorbed and nothing needs doing |
+| `ERROR: exec credential plugin exited 253 (no-credentials) after 3 attempts in 9s` | The credential fetch failed for good (attempts used up, or too little time left for another). In verify/stability the observation budget catches it and takes the observation again; in any other mode it is that invocation's failure, which, when it happens at start-up (building the kubeconfig cache), comes before reading or writing any cluster |
+| `observation-retry <stamp> mode=verify what=report reason=no-credentials unobserved=12s/120s next=10s total=<seconds>s` | An observation was void because an API could not be reached; it is taken again in `next` seconds. `what`: `credentials` (the kubeconfig token), `report` (the whole verify report), `baseline`, `clear-wait` (a sample of the critical-clear wait), `metric-series` (the readiness proof of the Store I/O rejection series), `sample` (a window sample); `unobserved` is the unobserved time this invocation has spent / the budget |
+| `ERROR: release health could not be observed: for <n>s of its <B>s observation budget the <mode> <what> could not authenticate to or reach an API (<reason>): <last error>` | The budget is spent and the invocation ends with exit status 4 (`release-end ... exit_code=4`). verify still prints its last report when it produced one, with `observation.observed=false` |
+| `command failed (4): <command>; release health could not be observed: the engine could not authenticate to or reach its APIs within the observation budget` | The release driver's record of exit status 4; this attempt's `release-deploy/<release_id>/state.json` keeps it as its `error` (`ReleaseDeployError: command failed (4): ...`); `spec.autoRollback` decides what follows (see "Why a spent budget still rolls back" below) |
+
+**Reason words.** The reason is one fixed word matched from what the client printed, matched and never copied: when the engine fetches
+credentials, the plugin's stdout/stderr and the token appear in no message and no log.
+
+| Reason | Client text it matches | When one `aws` call fails with it |
+|---|---|---|
+| `no-credentials` | `Unable to locate credentials`, `Error when retrieving credentials`, `Partial credentials found` | Unobservable, taken again |
+| `expired` | `ExpiredToken`, an expired SSO session | A verdict: the session needs renewing |
+| `access-denied` | `AccessDenied`, `not authorized to perform`, `InvalidClientTokenId` | A verdict: the role or its trust needs fixing |
+| `throttled` | `Throttling`, `Rate exceeded`, `TooManyRequests`, `SlowDown`, `ServiceUnavailable` | Unobservable, taken again |
+| `network` | `Could not connect to the endpoint URL`, connect or read timeouts, connections reset or refused, name resolution failures, `i/o timeout`, `TLS handshake timeout` | Unobservable, taken again |
+| `unknown` | None of the above | A verdict |
+
+**What counts as unobservable.** Four sources only:
+
+- The engine's credential fetch failing, whatever the reason: the engine could not authenticate at all;
+- A `kubectl` call of the engine's own (every check reads Kubernetes resources through one) that never got through on the client
+  side (`Unable to connect to the server`, `getting credentials: exec`, `(TooManyRequests)`) with the reason
+  `no-credentials`/`throttled`/`network`, or a failing credential plugin. With the token cache off
+  (`GPU_FAULT_KUBECONFIG_TOKEN_CACHE=false`) kubectl runs the plugin itself on every call, and its `getting credentials: exec` is
+  classified the same way, only without the engine's 3 attempts; output carrying `command terminated with exit code N` (the remote
+  command ran) never counts;
+- An `aws` call failing with the reason `no-credentials`/`throttled`/`network`;
+- The deploy host's AMP queries: the alert probe of the stability samples
+  (`deploy/control-plane/regional/probes/critical_amp_alerts.py`) no longer fails when it cannot sign or deliver its query but prints
+  `{"unavailable": "<reason>"}` (`no-credentials` without credentials, `throttled` for HTTP 429/503, `network` when unreachable), and
+  the instant query of verify's `adot_self_metrics` (§4.8) counts as unobservable as well when its transport or credentials fail or
+  AMP answers HTTP 429/503. For both, HTTP 403 and every other HTTP error are still a verdict.
+
+Still an immediate verdict: RBAC `Forbidden`, a token the API server refuses (`Unauthorized`), `AccessDenied`, expired sessions,
+`NotFound`, x509/TLS trust errors, and anything a remote command printed -- an in-Pod script that cannot reach the Store is a finding,
+not an unobservable check.
+
+**How the budget is counted, and how verify and stability use it**
+
+- The budget is the configured stability window `GPU_FAULT_RELEASE_STABILITY_SECONDS` (120..300, default 120; with an invalid value the
+  budget is 120 while `stability` itself still refuses the value) of unobserved time per verify or stability invocation: the failed
+  attempts themselves plus the pauses. The pauses are 5, 10, 20, 30, 30... seconds, and a pause that would take the total past the
+  budget ends the invocation with exit status 4 instead.
+- verify: the whole report is built again only when **every** FAIL in it is unobservable (the FAIL record's `details` is
+  `{"unobservable": "<reason>"}`); one genuine FAIL is the verdict at once (exit status 1). A report that passed after retries carries
+  an `observation` summary: `observed`, `budget_seconds`, `unobserved_seconds`, `retries` and `reasons` counted per reason.
+- stability: the baseline, the samples of the critical-clear wait, the Store I/O metric-series proof and every window sample are taken
+  again; the window's deadline moves out by the time it could not see, so the verdict still rests on a full window of samples. A
+  `CONTROL_PLANE_ONLY` window that took any observation again never closes early (`early_exit_reason` reads
+  `full window kept: ... had to be retried`), and a convergence read of the control-plane Deployments that cannot be made keeps the full
+  window too. `stability-report.json` carries `observation`.
+
+**Why a spent budget still rolls back.** On purpose: the documented contract is that a verify or stability failure rolls back per
+`spec.autoRollback` (`high-level-design.md` §7.1, the failure behaviour in `developer-deployment-implementation.md` §9.1), and a release
+whose health was never shown is not committed (fail closed). The rollback needs the same APIs: under a persistent credential or network
+outage it fails at its own credential fetch before touching anything, the deploy records `rollback.status=FAILED`, the command ends with
+`release validation failed and rollback also failed: ...`, and the live transaction stays uncommitted (`complete`,
+`transaction_committed=false`) for the next run of the same command to resume; when the APIs are back by the time it runs, the rollback
+proceeds as usual. A site with `spec.autoRollback: false` records `SKIPPED_POLICY` as before. Do not edit `spec.autoRollback` to dodge
+this rollback, and do not raise `GPU_FAULT_RELEASE_STABILITY_SECONDS` to "buy" budget: it is the length of the stability window as well.
+
+**IMDS defaults and overrides**
+
+| Environment variable | AWS config key | Default in a deployment scope | The AWS CLI/boto3 default |
+|---|---|---|---|
+| `AWS_METADATA_SERVICE_NUM_ATTEMPTS` | `metadata_service_num_attempts` | `3` | `1` |
+| `AWS_METADATA_SERVICE_TIMEOUT` | `metadata_service_timeout` | `2` (seconds) | `1` (second) |
+
+- Set once by `deployment_api_budget()` (`src/gpu_fault/admin/api_budget.py`, the root scope of every `gpu-fault-admin` verb and of the
+  release engine) and inherited by every child process of the scope: `aws`, `kubectl` and its `aws eks get-token` plugin, and the
+  deploy-host boto3 probes; the previous values are restored when the scope exits.
+- A variable already in the environment, or its key in any section of the AWS config file (`AWS_CONFIG_FILE`, by default
+  `~/.aws/config`), means that one is not added; a config file that cannot be read means neither is added: unread, it cannot say what
+  the administrator chose.
+- No effect when credentials come from the environment, a profile or SSO: the chain reaches IMDS last. The cost: when IMDS really is
+  down, a credential lookup takes about 12 seconds to fail instead of about 2.
+- For other values, export the two variables in the environment `gpu-fault-admin` runs in, or write them into the AWS config:
+
+```ini
+[default]
+metadata_service_num_attempts = 5
+metadata_service_timeout = 3
+```
+
+**First checks when it keeps failing** (read-only commands; none prints a credential):
+
+```bash
+# 1. Can the deploy host get credentials right now (prints the identity ARN only)
+aws sts get-caller-identity
+# 2. Is IMDS reachable and an instance profile attached: IMDSv2 PUTs for a session token, then reads iam/info (the profile ARN only)
+IMDS_TOKEN="$(curl -sS -X PUT http://169.254.169.254/latest/api/token \
+  -H 'X-aws-ec2-metadata-token-ttl-seconds: 60')"
+curl -sS -H "X-aws-ec2-metadata-token: ${IMDS_TOKEN}" \
+  http://169.254.169.254/latest/meta-data/iam/info
+# 3. The instance's IMDS options (HttpTokens, HttpPutResponseHopLimit): from another machine with credentials, or the console
+aws ec2 describe-instances --instance-ids <deploy-host-instance-id> \
+  --query 'Reservations[0].Instances[0].MetadataOptions'
+```
+
+- The PUT refused or timing out: IMDS is disabled, or the hop limit is too low (with the CLI in a container,
+  `HttpPutResponseHopLimit` must be at least 2); `iam/info` answering 404: no instance profile is attached.
+- `network`: DNS resolution of, and the route from the deploy host to, `sts.<region>.amazonaws.com`, the EKS cluster API endpoint (the
+  kubeconfig's `server`) and `aps-workspaces.<region>.amazonaws.com`; a site that goes through VPC endpoints checks the endpoints and
+  their security groups.
+- `throttled`: in CloudTrail, look for events of the deploy-host role in the same period with an `errorCode` of `ThrottlingException`,
+  `TooManyRequestsException` or `RequestLimitExceeded`, to find who used up the API quota.
+- `expired`: renew the SSO session or fetch new temporary credentials; `access-denied`: fix the deploy-host role's permissions or trust.
+
+Once fixed, rerun the same `deploy`/`config` command unchanged: the same uncommitted candidate resumes, runs verify and stability again
+and commits when they pass; a release that was rolled back opens a new transaction from the current live baseline (see "Rollback" in
+§4). Design and trade-offs:
+[Detailed Design v2 §2.12](detailed-design-v2.md#212-unobservable-is-not-unhealthy-credential-plugin-retries-imds-defaults-and-the-observation-budget).
+
 ## 5. Joining and Removing GPU Clusters
 
 Giving `deploy` one more ARN is a join: pass all managed GPU ARNs plus the new cluster; `deploy` checks that the
@@ -2477,6 +2619,7 @@ check that `sha256sum <file>` equals the `expected` value of the error, and reru
 | Agents not converged after an upgrade | Keep the compatible window, check the Reconciler/Installer, do not force finalize | REG-8.1.4 |
 | Executor verifier fails | IRSA, token, CA, owner, artifact and protocol | REG-14 |
 | `deploy`/`config` reports `RDS CA bundle digest does not match the pinned SHA-256; refusing` | An older release that downloads the published bundle right after an AWS rotation; or the copy named by the `source:` line was modified (a current release installs only the vendored copy) | §6.3 |
+| `deploy`/`config` fails in verify/stability with `exec credential plugin exited 253`, repeated `observation-retry` lines, `release health could not be observed` or `command failed (4)` | The deploy host's credential chain: `aws sts get-caller-identity`, the instance profile, IMDS (IMDSv2 token PUT, hop limit), DNS and route to the STS/EKS/AMP endpoints, CloudTrail throttling; `expired` -> renew the SSO session, `access-denied` -> fix the role or its trust; then rerun the same command unchanged | §4.10 |
 | SNS confirmation email arrives repeatedly | Duplicate confirmed/pending on the same Topic, bootstrap pending checkpoint | REG-7 |
 | StaleAttemptObservation | Training Pod, Completion Watcher, Observation delivery/outbox | REG-14 |
 | workflow FAILED but the incident is `RECOVERED`, reason contains `diagnostic inconclusive` | By design: the workflow contains only forensic/diagnostic/validation steps, failure means "diagnostic inconclusive", the incident is closed, the incident's markers retired, and a `DIAGNOSTIC_INCONCLUSIVE` email sent; the node was not isolated and needs no release, and the job may restart as usual. A failed VALIDATE_GPU/VALIDATE_FABRIC step's `error` now names the reason per node: `validation failed on nodes: <node> (active_gpu_health_findings[<finding> <severity> <value>><threshold> <GPU>; …])`, and every active finding (`finding_id`, `canonical_name`, `severity`, `value`, `threshold_value`, `gpu_uuid`, `pci_bdf`) is written to `details.node_findings` -- no trip to the finding store to learn which check failed | `详细设计-v2.md` §6.3 |
