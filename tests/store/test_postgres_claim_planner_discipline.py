@@ -100,6 +100,14 @@ def connection():
         try:
             yield connected
         finally:
+            # pg_statistic outlives the harness's TRUNCATE: leave the lanes
+            # described as lapsed, not as the live leases a test analysed,
+            # which would mislead the next test's claim plans.
+            if connected.execute(f"SELECT to_regclass('{LANES}')").fetchone()[0]:
+                connected.execute(
+                    f"UPDATE {LANES} SET lease_expires_at = now() - interval '1 hour'"
+                )
+                connected.execute(f"ANALYZE {LANES}")
             for table in (QUEUE, LANES):
                 connected.execute(
                     f"ALTER TABLE IF EXISTS {table} RESET (autovacuum_enabled)"
@@ -593,6 +601,18 @@ def _burst_items(*, routine: bool) -> list[Any]:
     return items
 
 
+def _admit(store: PostgresStore, items: list[Any]) -> None:
+    for start in range(0, len(items), 500):
+        store.try_enqueue_processor_requests_batch(
+            items[start : start + 500],
+            max_depth=10**7,
+            max_cluster_depth=10**7,
+            reserved_fault_depth=0,
+            reserved_cluster_fault_depth=0,
+            global_admission_guard=0,
+        )
+
+
 def _seed_leased_burst(
     store: PostgresStore, connection: Any, *, routine: bool
 ) -> list[str]:
@@ -614,15 +634,7 @@ def _seed_leased_burst(
     for table in (QUEUE, LANES):
         connection.execute(f"ALTER TABLE {table} SET (autovacuum_enabled = false)")
     items = _burst_items(routine=routine)
-    for start in range(0, len(items), 500):
-        store.try_enqueue_processor_requests_batch(
-            items[start : start + 500],
-            max_depth=10**7,
-            max_cluster_depth=10**7,
-            reserved_fault_depth=0,
-            reserved_cluster_fault_depth=0,
-            global_admission_guard=0,
-        )
+    _admit(store, items)
     held: list[str] = []
     while len(held) < SPOOL_BURST_HELD:
         rows = store.claim_active_processor_requests(
@@ -695,4 +707,84 @@ def test_a_fault_claim_reads_its_window_while_the_lanes_are_leased(
     )
     assert [item.request_id for item in claimed] == expected, (
         "the four oldest fault rows whose lanes are free, oldest first"
+    )
+
+
+def _drain_after_a_burst(store: PostgresStore, connection: Any) -> None:
+    """The queue between two spool-enabled bursts: the previous burst analysed,
+    worked off -- its lanes kept with lapsed leases, as the lane retention does
+    for an hour -- and analysed again drained: ``reltuples`` 0 while the heap
+    keeps its pages, which tells the planner the queue is empty."""
+
+    _truncate()
+    with connection.cursor() as cursor:
+        hot_layout.write_layout_mode(cursor, "detached")
+        hot_layout.ensure_replay_partitions(cursor, datetime.now(timezone.utc))
+    for table in (QUEUE, LANES):
+        connection.execute(f"ALTER TABLE {table} SET (autovacuum_enabled = false)")
+    items = _burst_items(routine=False)
+    _admit(store, items)
+    connection.execute(
+        f"INSERT INTO {LANES} (ordering_key, owner_id, epoch, lease_token, "
+        "lease_expires_at, updated_at) SELECT DISTINCT ordering_key, 'pod-z:1', 1, "
+        f"'worked-off', now() - interval '10 minutes', now() FROM {QUEUE}"
+    )
+    connection.execute(f"ANALYZE {QUEUE}")
+    connection.execute(f"ANALYZE {LANES}")
+    connection.execute("DELETE FROM gpu_fault_processor_payloads")
+    connection.execute(f"DELETE FROM {QUEUE}")
+    connection.execute(f"ANALYZE {QUEUE}")
+    assert _queue_statistics(connection)[0] == 0, "analysed drained"
+    assert _queue_statistics(connection)[1] > 0, "the heap kept its pages"
+
+
+def _queue_statistics(connection: Any) -> tuple[int, int]:
+    reltuples, relpages = connection.execute(
+        f"SELECT reltuples, relpages FROM pg_class WHERE relname = '{QUEUE}'"
+    ).fetchone()
+    return int(reltuples), int(relpages)
+
+
+@pytest.mark.parametrize("burst", [True, False], ids=["full-window", "short-window"])
+def test_a_full_window_refreshes_the_statistics_of_a_drained_queue(
+    store: PostgresStore, connection: Any, burst: bool, request
+) -> None:
+    """On the drained queue's statistics every claim reads the whole burst,
+    however the window is spelled, until autoanalyze reaches the queue. A
+    claim whose window comes back full analyses it at once, and the next
+    claim walks its window; a claim that does not fill one leaves the
+    statistics alone."""
+
+    _drain_after_a_burst(store, connection)
+    items = _burst_items(routine=False)
+    _admit(store, items if burst else items[: FAULT_STREAM_WINDOW - 8])
+    shape = {"limit": FAULT_STREAM_LIMIT, "exclude_paths": DEDICATED_PATHS}
+    now = datetime.now(timezone.utc)
+    store.claim_active_processor_requests(
+        "pod-plan", now=now, lease_duration=REQUEST_LEASE, **shape
+    )
+    reltuples, _ = _queue_statistics(connection)
+    sql, params = store.claim_active_processor_query(
+        "pod-plan", now=now, lease_duration=REQUEST_LEASE, **shape
+    )
+    plan = _explain(
+        connection, sql, params, settings=hot_path_planner_statements(), analyze=True
+    )
+    request.node.user_properties.extend(
+        [
+            ("reltuples_after_first_claim", reltuples),
+            ("next_claim_shared_blocks", _shared_blocks(plan)),
+            ("next_claim_widest_queue_read", _widest_queue_read(plan)),
+        ]
+    )
+
+    if not burst:
+        assert reltuples == 0, "a window that did not fill proves nothing"
+        return
+    assert reltuples >= len(items) - FAULT_STREAM_LIMIT, (
+        f"the full window analysed the queue: reltuples {reltuples}"
+    )
+    assert _widest_queue_read(plan) <= FAULT_STREAM_WINDOW, (
+        "on the refreshed statistics the next claim walks its window; widest "
+        f"read {_widest_queue_read(plan)} rows"
     )

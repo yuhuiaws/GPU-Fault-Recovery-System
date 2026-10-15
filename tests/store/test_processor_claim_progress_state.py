@@ -26,6 +26,11 @@ class Cursor:
             # The hot-path planner pin: a settings statement with no result
             # set, not one of the scripted queries.
             return
+        if "FROM pg_class" in query:
+            # A full window makes the store read the planner's row count
+            # (queue_statistics.py); modeled as current, so no ANALYZE.
+            self.rows = [(1e9,)]
+            return
         if "gpu_fault_hot_layout_mode" in query:
             # Schema v23: a writer reads the hot-layout mode under a shared
             # advisory lock before its own statement (positional lock-name

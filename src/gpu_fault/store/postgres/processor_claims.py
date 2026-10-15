@@ -21,6 +21,10 @@ from gpu_fault.store.postgres.planner_discipline import pin_hot_path_plans
 from gpu_fault.store.postgres.processor_storage import (
     processor_queue_effective_payload_sql,
 )
+from gpu_fault.store.postgres.queue_statistics import (
+    QueueStatisticsGuard,
+    refresh_if_stale,
+)
 from gpu_fault.store.shared.time import (
     utc_text as _utc_text,
 )
@@ -104,8 +108,9 @@ _CLAIM_WINDOW_COLUMNS_SQL = f"""\
 # the lane test is an anti-join whose estimate follows the live leases: the
 # same claims read 1,000-1,200 blocks
 # (tests/store/test_postgres_claim_planner_discipline.py, design v2 "Planner
-# discipline"; statistics of a drained queue whose pages stayed allocated
-# still read the burst until the next autoanalyze).
+# discipline"). Statistics of a drained queue whose pages stayed allocated
+# tell the planner the queue is empty, which no spelling survives; the first
+# full window refreshes them (queue_statistics.py).
 _CLAIM_ELIGIBLE_SQL = """\
     FROM gpu_fault_processor_queue AS candidate
     WHERE candidate.status<>'COMPLETED'
@@ -901,6 +906,17 @@ class PostgresProcessorClaimsMixin:
             previous,
             after,
         )
+        if rows and rows[0][1] is not None:
+            # A raw window came back full: the queue holds at least a window,
+            # whatever the planner's statistics count (queue_statistics.py).
+            guard: QueueStatisticsGuard | None = getattr(
+                self, "_queue_statistics_guard", None
+            )
+            if guard is None:
+                guard = self._queue_statistics_guard = QueueStatisticsGuard()
+            refresh_if_stale(
+                self._db, guard, window_rows=cast(int, parameters["window_limit"])
+            )
         return claimed
 
     def active_backlog_is_lane_blocked(

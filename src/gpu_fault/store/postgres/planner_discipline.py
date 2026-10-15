@@ -49,7 +49,9 @@ seconds are JIT compilation, which the disabled sorts' penalty cost switches
 on). The setting cannot settle a window the planner expects to come back
 short, a never-analysed table included: with a row estimate below the LIMIT
 it reads every candidate. The window's predicates are spelled to keep that
-estimate up instead (processor_claims.py ``_CLAIM_ELIGIBLE_SQL``);
+estimate up instead (processor_claims.py ``_CLAIM_ELIGIBLE_SQL``), and the
+statistics of a drained queue, which tell the planner the table is empty, are
+refreshed by the first claim that fills its window (queue_statistics.py);
 ``enable_bitmapscan = off`` is not applied, because it prices the interlock's
 scope GIN probes out (GIN indexes are bitmap-only).
 

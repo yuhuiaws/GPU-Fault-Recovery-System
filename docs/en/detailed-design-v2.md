@@ -2099,11 +2099,25 @@ backlog whose every lane is leased is read whole by any plan (3,000 / 2,500). A 
 lagging the burst, PostgreSQL limited to six CPUs) halved both the claim time (101-105 -> 44-47 s) and the p99
 completion of the synchronous action faults (7.4-7.5 -> 3.4-3.6 s). The planner test pins the walk
 (`test_a_fault_claim_reads_its_window_while_the_lanes_are_leased`): 68 rows read on a 1,600-row burst and with 4,000
-routine rows behind it, 720 rows before. One
-state remains: statistics taken on the drained queue while its pages stayed allocated (`reltuples` 0, `relpages` > 0)
-tell the planner the table is empty, every claim then reads the burst whichever way the window is spelled (29,000
-blocks), and the next autoanalyze of the queue ends it. `enable_bitmapscan = off` is still not applied: it prices the
-interlock's scope GIN probes out (GIN indexes are bitmap-only). The pin
+routine rows behind it, 720 rows before. No spelling survives the statistics of a drained queue whose pages stayed
+allocated (`reltuples` 0, `relpages` > 0, what the autoanalyze after a worked-off burst leaves): the planner believes the
+queue is empty, and every claim reads the burst (29,000 blocks) until the queue's next autoanalyze. In the reproduction
+with the statistics left drained for the burst, 20 coordinators spent 83 % of its first 15 s inside claims, fault
+claims fell from 155 to 13-44 per half second, taken by 7-14 of the 20 processes, and the action faults' p99 reached
+16.1 s -- the live stall's signature. A claim whose window comes back full has proved that the queue holds at least a
+window, so when `pg_class` still counts fewer than two windows the store analyses the queue itself
+(`store/postgres/queue_statistics.py`; only the queue -- lanes analysed early in a burst, when nearly every lane row is
+one the burst has just leased, price the lane anti-join as if nothing were eligible, and the reproduction's p99 was
+4.5-6.3 s with them analysed alongside): it reads the count at most once a second per store after a full window, analyses
+at most once per 10 s per store and one process of the site at a time (a transaction-scoped try-lock of its own key
+space), and gives the table up after a 100 ms lock timeout when autovacuum holds it; ANALYZE takes a
+ShareUpdateExclusive lock, which claims, admissions and completions never wait for, and a role that may not analyse
+the table gets PostgreSQL's warning and the next autoanalyze, as before. Same reproduction: claim time 275 -> 46-56 s,
+action-fault p99 16.1 -> 3.4-4.3 s, claim-busy share 0.83 -> 0.15-0.18, no stall
+(`test_a_full_window_refreshes_the_statistics_of_a_drained_queue`: the first claim's full window leaves `reltuples` at
+the 1,600 rows queued and the next claim reads 68 rows, 1,600 before; a window that does not fill leaves the statistics
+alone). `enable_bitmapscan = off` is still not applied: it prices the interlock's scope GIN probes out (GIN indexes are
+bitmap-only). The pin
 statements are plain `SET LOCAL` without placeholders, executed with an explicit empty parameter tuple through the
 same cursor path as the statements they protect, so a test that stands a cursor double in for the database sees them
 as ordinary statements.
