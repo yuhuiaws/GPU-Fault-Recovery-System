@@ -652,6 +652,14 @@ def test_integrated_verdict_requires_causal_terminal_simulated_workflows() -> No
     assert status == "FAIL"
     assert "control-plane container restarts are nonzero" in errors
 
+    summary["control_plane_pod_lifecycle"]["restart_count_delta"] = 0
+    summary["control_plane_pod_lifecycle"]["restarted_pods"] = {}
+    summary["control_plane_pod_lifecycle"]["readiness_flaps"] = ["ingress-a"]
+    status, errors = suite.verdict(summary, expected_workflows=expected)
+
+    assert status == "FAIL"
+    assert errors == ["a control-plane Pod left Ready during the run"]
+
 
 @pytest.mark.parametrize(
     ("kind", "status_code", "rejected"),
@@ -774,7 +782,13 @@ def test_control_pod_runtime_snapshot_is_redacted_and_detects_restart(
                 "status": {
                     "phase": "Running",
                     "podIP": "10.0.0.1",
-                    "conditions": [{"type": "Ready", "status": "True"}],
+                    "conditions": [
+                        {
+                            "type": "Ready",
+                            "status": "True",
+                            "lastTransitionTime": "2026-09-01T09:00:05Z",
+                        }
+                    ],
                     "containerStatuses": [
                         {
                             "name": "api",
@@ -801,6 +815,7 @@ def test_control_pod_runtime_snapshot_is_redacted_and_detects_restart(
             "role": "gpu-fault-api-ha",
             "phase": "Running",
             "ready": True,
+            "ready_since": "2026-09-01T09:00:05Z",
             "restart_count": 0,
             "containers": {
                 "api": {
@@ -831,6 +846,38 @@ def test_control_pod_runtime_snapshot_is_redacted_and_detects_restart(
     assert lifecycle["restarted_pods"] == {"gpu-fault-api-ha-a": 1}
     assert lifecycle["added_pods"] == ["gpu-fault-control-worker-b"]
     assert lifecycle["not_ready_after"] == ["gpu-fault-api-ha-a"]
+    assert lifecycle["readiness_flaps"] == []
+
+
+def test_a_pod_that_left_ready_during_the_run_fails_the_round() -> None:
+    """Readiness flaps take the api-ha Pod's NLB target out, restarts or not.
+
+    In two 50-cluster rounds all three api-ha Pods went NotReady within 2.3 s
+    and Ready again 4-6 s later with no restart; the load balancer controller
+    deregistered every target and executor claims were closed without a
+    response, while restart counts, the Pod set and the after-run Ready state
+    all read clean. The Ready condition's transition time is what moved."""
+
+    pod = {
+        "role": "gpu-fault-api-ha",
+        "phase": "Running",
+        "ready": True,
+        "ready_since": "2026-10-15T00:08:58Z",
+        "restart_count": 0,
+        "containers": {},
+    }
+    steady = {**pod, "role": "gpu-fault-control-worker"}
+    before = {"gpu-fault-api-ha-a": pod, "gpu-fault-control-worker-b": steady}
+    after = {
+        "gpu-fault-api-ha-a": {**pod, "ready_since": "2026-10-15T00:23:28Z"},
+        "gpu-fault-control-worker-b": dict(steady),
+    }
+
+    lifecycle = suite.control_pod_lifecycle(before, after)
+
+    assert lifecycle["readiness_flaps"] == ["gpu-fault-api-ha-a"]
+    assert lifecycle["restart_count_delta"] == 0 and not lifecycle["not_ready_after"]
+    assert suite.control_pod_lifecycle(before, before)["readiness_flaps"] == []
 
 
 def test_50_cluster_manifest_uses_formal_41524_matrix() -> None:

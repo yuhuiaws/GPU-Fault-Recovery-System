@@ -978,6 +978,8 @@ def verdict(
             errors.append("control-plane Pod set changed during the run")
         if lifecycle.get("not_ready_after"):
             errors.append("a control-plane Pod is not Ready after the run")
+        if lifecycle.get("readiness_flaps"):
+            errors.append("a control-plane Pod left Ready during the run")
     ingress["reserved_rejections"] = reserved_rejections
     normal_total = sum(
         int((paths.get(kind) or {}).get("count", 0)) for kind in NORMAL_TELEMETRY_KINDS

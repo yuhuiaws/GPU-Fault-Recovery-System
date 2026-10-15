@@ -386,10 +386,8 @@ def control_pod_runtime_snapshot() -> dict[str, dict]:
         if not name.startswith(CONTROL_POD_PREFIXES):
             continue
         status = pod.get("status") or {}
-        ready = any(
-            item.get("type") == "Ready" and item.get("status") == "True"
-            for item in status.get("conditions") or []
-        )
+        conditions = {item.get("type"): item for item in status.get("conditions") or []}
+        ready = (conditions.get("Ready") or {}).get("status") == "True"
         containers = {}
         restart_count = 0
         for item in status.get("containerStatuses") or []:
@@ -417,6 +415,7 @@ def control_pod_runtime_snapshot() -> dict[str, dict]:
             "role": (metadata.get("labels") or {}).get("app"),
             "phase": status.get("phase"),
             "ready": ready,
+            "ready_since": (conditions.get("Ready") or {}).get("lastTransitionTime"),
             "restart_count": restart_count,
             "containers": dict(sorted(containers.items())),
         }
@@ -431,7 +430,10 @@ def control_pod_lifecycle(
     after_names = set(after)
     restarted_pods: dict[str, int] = {}
     counter_regressions: dict[str, dict[str, int]] = {}
+    readiness_flaps: list[str] = []
     for name in sorted(before_names & after_names):
+        if before[name].get("ready_since") != after[name].get("ready_since"):
+            readiness_flaps.append(name)  # left Ready (api-ha: NLB target out)
         before_count = int(before[name].get("restart_count", 0))
         after_count = int(after[name].get("restart_count", 0))
         if after_count > before_count:
@@ -450,6 +452,7 @@ def control_pod_lifecycle(
         "not_ready_after": sorted(
             name for name, item in after.items() if not item.get("ready")
         ),
+        "readiness_flaps": readiness_flaps,
     }
 
 

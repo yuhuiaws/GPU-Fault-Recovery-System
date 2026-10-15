@@ -1057,7 +1057,7 @@ workflow step count within 8..12
 reset, fabric reset, reboot, containment and restore operations all covered
 duplicate claim/idempotency/workflow step = 0
 fencing mismatch, claim/result error, permanent budget waiter = 0
-control-plane Pod set unchanged, container restart delta = 0 and all Ready at the end
+control-plane Pod set unchanged, container restart delta = 0, no readiness flap and all Ready at the end
 at least one lease renewal on a long action
 processor queue and spool back to the depth from before the round started
 ```
@@ -1204,8 +1204,11 @@ these readings; the burst runner records it as `summary.json.pg_activity.first_t
 without them cannot say which store it ran on. The
 integrated runner must also record `control_plane_pod_lifecycle`, containing at least the total
 restart delta, the Pods that restarted, Pods that appeared/disappeared during the run, counter
-regressions and Pods not Ready at the end. If any item is non-empty or non-zero it cannot count
-as a formal PASS.
+regressions, Pods not Ready at the end and `readiness_flaps` -- the Pods whose `Ready` condition
+changed its `lastTransitionTime` between `control-pods-before.json` and `control-pods-after.json`
+(each snapshot records it as `ready_since`): a Pod that left Ready and came back during the run,
+restart or not, which for api-ha means its NLB target was deregistered. If any item is non-empty or
+non-zero it cannot count as a formal PASS.
 
 `processor-priority-latency.json` (also `summary.json.processor_priority_latency`) is the per-tier
 completion latency of the round's requests: per tier `completion_latency` (count and p50/p95/p99/max in

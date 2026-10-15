@@ -208,8 +208,10 @@ first-attempt transport failures. Each ingress path reports
 executors retried report `claim_retry_counts` and `result_retry_counts`. The
 runner also writes
 `control-pods-before.json` and `control-pods-after.json` and rejects any
-control-plane Pod replacement, container restart, counter regression, or Pod
-that is not Ready after the run. These checks do not change request, timeout,
+control-plane Pod replacement, container restart, counter regression, Pod
+that is not Ready after the run, or Pod whose Ready condition moved during the
+run (`readiness_flaps`: an api-ha Pod that left Ready had its NLB target
+deregistered, restart or not). These checks do not change request, timeout,
 concurrency, or capacity thresholds.
 
 The synchronized ingress generator resolves the control-plane hostname with a
