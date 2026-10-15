@@ -18,7 +18,7 @@ from gpu_fault.host_health import (
     NodeHealthFinding,
     NodeHealthIngestionResult,
 )
-from gpu_fault.models import RecoveryAction, Severity, WorkloadState
+from gpu_fault.models import NodeMarker, RecoveryAction, Severity, WorkloadState
 from gpu_fault.nvidia_logs import (
     UNCLASSIFIED_SXID_REASON,
     UNPARSED_SXID_REASON,
@@ -515,9 +515,29 @@ class FaultIngestionService:
             return event
         return event.model_copy(update={"gpu_uuid": candidates.pop()})
 
+    def _record_event_marker(self, marker: NodeMarker, *, repeated: bool) -> None:
+        """Write an event's marker, but never revive one its incident retired.
+
+        ``marker_id`` derives from the event id, so a repeat of the same event
+        (a client retry, an outbox replay past the queue's dedupe window)
+        rewrites the same row from the stored decision. A marker the incident's
+        recovery already retired stays retired: the repeat reports the same
+        fault again, not a new one. Only a repeat pays the extra read.
+        """
+
+        if repeated and any(
+            item.marker_id == marker.marker_id and item.retired_at is not None
+            for item in self.context.store.list_markers_for_incident(marker.incident_id)
+        ):
+            return
+        self.context.completion.add_marker(marker)
+
     def finalize_xid(
         self, event: XidEvent, decision: FaultPolicyDecision
     ) -> FaultPolicyDecision:
+        # Before the companion merge below marks a new event as a duplicate of
+        # its companion: only a repeat of this very event is a repeat here.
+        repeated = decision.duplicate
         report_processor_replay_phase("xid_action_fence")
         decision = self.context.orchestrator.apply_fault_action_generation_fence(
             event, decision
@@ -561,7 +581,7 @@ class FaultIngestionService:
         incident, workflow = self.context.orchestrator.ingest(event, decision)
         decision = bind_marker_incident(decision, incident.incident_id)
         report_processor_replay_phase("xid_marker")
-        self.context.completion.add_marker(decision.marker)
+        self._record_event_marker(decision.marker, repeated=repeated)
         report_processor_replay_phase("xid_notification")
         if decision.disposition is ActionDisposition.NOT_APPLICABLE:
             notification = self.context.advisory_notifications.preview_not_applicable(
@@ -656,7 +676,9 @@ class FaultIngestionService:
             }
         )
         report_processor_replay_phase("sxid_marker")
-        self.context.completion.add_marker(decision.marker)
+        # The SXID duplicate flag comes from a process-local cache, so any
+        # replica may be serving a repeat: every SXID checks.
+        self._record_event_marker(decision.marker, repeated=True)
         report_processor_replay_phase("sxid_notification")
         notification = self.context.advisory_notifications.try_preview(
             incident.incident_id
