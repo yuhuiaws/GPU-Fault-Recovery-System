@@ -44,11 +44,14 @@ statement the planner still scans, so nothing fails. ``enable_sort = off`` was
 measured and rejected: it also yields the ordered walk, but the claim
 statement then executes in 1.3-1.7 s on a two-row table and on 5,000 rows
 alike (its remaining sorts -- the ordered lane insert, the ``DISTINCT ON`` and
-the final ordering -- are driven onto pathological alternatives). A table that
-has never been analysed at all (no ``pg_statistic`` rows -- a new database
-before its first autoanalyze) leaves the choice among index paths arbitrary;
-``enable_bitmapscan = off`` would settle it but prices the interlock's scope
-GIN probes out (GIN indexes are bitmap-only), so it is not applied.
+the final ordering -- are driven onto pathological alternatives; most of those
+seconds are JIT compilation, which the disabled sorts' penalty cost switches
+on). The setting cannot settle a window the planner expects to come back
+short, a never-analysed table included: with a row estimate below the LIMIT
+it reads every candidate. The window's predicates are spelled to keep that
+estimate up instead (processor_claims.py ``_CLAIM_ELIGIBLE_SQL``);
+``enable_bitmapscan = off`` is not applied, because it prices the interlock's
+scope GIN probes out (GIN indexes are bitmap-only).
 
 ``plan_cache_mode = force_custom_plan`` was evaluated and not adopted: psycopg
 prepares a statement after five executions, and a generic plan built under
@@ -58,6 +61,17 @@ the shape of the plan. Forcing custom plans would re-plan the claim's
 multi-CTE statement on every one of the several hundred rounds a second the
 worker tier issues. Should a generic plan ever prove worse, the tuple below is
 the one place to add it.
+
+``enable_material = off`` is the second setting. Once the window's predicates
+keep its row estimate up (processor_claims.py ``_CLAIM_ELIGIBLE_SQL``), the
+planner priced the retry-barrier anti-join as one Materialize over a full
+index scan of the queue -- every deferred STRICT row, computed once per claim
+-- instead of a probe of the lane index for each candidate the window's LIMIT
+lets it walk: a fault claim on a 3,200-row burst queue read 3,800 shared
+blocks with Materialize and 1,000 without it. Nothing else in the claim
+statement needs a Materialize node; priced out, the planner keeps the hash
+anti-join where every candidate must be read anyway (a backlog whose lanes are
+all leased).
 """
 
 from __future__ import annotations
@@ -66,7 +80,10 @@ from typing import Any
 
 #: ``(setting, value)`` pairs applied with ``SET LOCAL`` at the start of the
 #: claim transactions -- and only those (see the module docstring).
-HOT_PATH_PLANNER_SETTINGS: tuple[tuple[str, str], ...] = (("enable_seqscan", "off"),)
+HOT_PATH_PLANNER_SETTINGS: tuple[tuple[str, str], ...] = (
+    ("enable_seqscan", "off"),
+    ("enable_material", "off"),
+)
 
 
 def hot_path_planner_statements() -> tuple[str, ...]:

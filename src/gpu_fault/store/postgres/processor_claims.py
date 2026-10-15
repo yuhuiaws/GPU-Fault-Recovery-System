@@ -86,17 +86,33 @@ _CLAIM_WINDOW_COLUMNS_SQL = f"""\
 # in claim order; every predicate here is a cheap residual filter on the rows
 # that index yields (schema v23 keeps status out of every index so claims
 # are HOT updates).
+#
+# The walk stops at the window's LIMIT only while the planner expects more
+# eligible rows than the window holds; expecting fewer, it reads every
+# candidate (a bitmap scan or another index, the lane and retry probes for
+# each row, then a sort). So the predicates are spelled to keep that estimate
+# up whatever the statistics say, and during a burst they lag it: without
+# column statistics ``status='PENDING'`` is priced at 0.5 %, and lanes
+# analysed under live leases priced the former LEFT JOIN test
+# (``lane.ordering_key IS NULL OR lane.lease_expires_at <= now``) at one row.
+# A fault claim on a 3,200-row burst queue read 10,500 shared blocks under
+# those lane statistics, 13,200 on a never-analysed table and 32,300 with
+# 20,000 routine rows behind it; in the integrated 50-cluster fault phase all
+# 20 processes spent 74 % of a 4.5 s window inside 1.1-3.4 s claims while
+# fault rows waited 5-7 s. The status test below is the same set (status is
+# PENDING, LEASED or COMPLETED, never NULL) at a default price of ~99 %, and
+# the lane test is an anti-join whose estimate follows the live leases: the
+# same claims read 1,000-1,200 blocks
+# (tests/store/test_postgres_claim_planner_discipline.py, design v2 "Planner
+# discipline"; statistics of a drained queue whose pages stayed allocated
+# still read the burst until the next autoanalyze).
 _CLAIM_ELIGIBLE_SQL = """\
     FROM gpu_fault_processor_queue AS candidate
-    LEFT JOIN gpu_fault_processor_lanes AS lane
-      ON lane.ordering_key=candidate.ordering_key
-    WHERE (
-        candidate.status='PENDING'
-        OR (
-            candidate.status='LEASED'
-            AND candidate.lease_expires_at <= %(now)s
-        )
-    )
+    WHERE candidate.status<>'COMPLETED'
+      AND NOT (
+          candidate.status='LEASED'
+          AND candidate.lease_expires_at > %(now)s
+      )
       AND (
           candidate.not_before IS NULL
           OR candidate.not_before <= %(now)s
@@ -109,9 +125,11 @@ _CLAIM_ELIGIBLE_SQL = """\
             AND retry_barrier.lane_policy='STRICT'
             AND retry_barrier.not_before > %(now)s
       )
-      AND (
-          lane.ordering_key IS NULL
-          OR lane.lease_expires_at <= %(now)s
+      AND NOT EXISTS (
+          SELECT 1
+          FROM gpu_fault_processor_lanes AS lane
+          WHERE lane.ordering_key=candidate.ordering_key
+            AND lane.lease_expires_at > %(now)s
       )
 {path_filter}"""
 
@@ -135,15 +153,18 @@ _PATH_EQUALS_SQL = """\
 # completion p50 6.1-6.9 s). The lane's priority order holds across paths: no
 # row is claimed while a STRICT, due row of a higher priority waits on its
 # lane, PENDING or with a lapsed lease. gpu_fault_processor_queue_lane_rows
-# serves the probe. Workload observations are exempt: the observation
-# interlock deliberately runs them ahead of the correlated faults they share
-# attempt lanes with, and the guard would deadlock against it.
+# serves the probe; ``+ 0`` keeps it there, because a bare ``head.priority``
+# let the planner AND the lane index with a claim_window range over every
+# higher-priority row of the queue (24,300 instead of 7,200 blocks a claim on
+# a never-analysed table). Workload observations are exempt: the
+# observation interlock deliberately runs them ahead of the correlated faults
+# they share attempt lanes with, and the guard would deadlock against it.
 _LANE_HEAD_ROW_SQL = """
           SELECT 1
           FROM gpu_fault_processor_queue AS head
           WHERE head.ordering_key=candidate.ordering_key
             AND head.lane_policy='STRICT'
-            AND head.priority < candidate.priority
+            AND head.priority + 0 < candidate.priority
             AND (
                 head.status='PENDING'
                 OR (head.status='LEASED' AND head.lease_expires_at <= %(now)s)

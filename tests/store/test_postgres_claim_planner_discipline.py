@@ -34,9 +34,19 @@ from typing import Any
 
 import pytest
 
-from gpu_fault.channel_registry import GPU_METRICS_PATH, NVIDIA_KERNEL_PATH
+from gpu_fault.channel_registry import (
+    FABRIC_MANAGER_PATH,
+    GPU_INVENTORY_PATH,
+    GPU_METRICS_PATH,
+    HOST_TELEMETRY_PATH,
+    NODE_LOG_PATH,
+    NVIDIA_KERNEL_PATH,
+    ChannelPool,
+    paths_for_pool,
+)
 from gpu_fault.processor.models import RESERVED_TIER_MAX_PRIORITY
 from gpu_fault.store import PostgresStore
+from gpu_fault.store.postgres import hot_layout
 from gpu_fault.store.postgres.planner_discipline import (
     hot_path_planner_statements,
     pin_hot_path_plans,
@@ -51,6 +61,7 @@ pytestmark = pytest.mark.skipif(
     not POSTGRES_URL, reason="GPU_FAULT_TEST_POSTGRES_URL is not configured"
 )
 QUEUE = "gpu_fault_processor_queue"
+LANES = "gpu_fault_processor_lanes"
 HOST_TELEMETRY = "/v1/collector-events/host-telemetry"
 GPU_TELEMETRY = "/v1/collector-events/gpu-telemetry"
 BACKLOG = 5000
@@ -89,9 +100,10 @@ def connection():
         try:
             yield connected
         finally:
-            connected.execute(
-                f"ALTER TABLE IF EXISTS {QUEUE} RESET (autovacuum_enabled)"
-            )
+            for table in (QUEUE, LANES):
+                connected.execute(
+                    f"ALTER TABLE IF EXISTS {table} RESET (autovacuum_enabled)"
+                )
 
 
 ANALYZED_ROWS = 138  # pg_class said reltuples 138 / relpages 45 during the burst
@@ -237,14 +249,19 @@ def _widest_queue_read(plan: dict) -> int:
     )
 
 
-def test_pin_scopes_the_planner_setting_to_the_transaction(connection: Any) -> None:
-    assert hot_path_planner_statements() == ("SET LOCAL enable_seqscan = off",)
+def test_pin_scopes_the_planner_settings_to_the_transaction(connection: Any) -> None:
+    assert hot_path_planner_statements() == (
+        "SET LOCAL enable_seqscan = off",
+        "SET LOCAL enable_material = off",
+    )
     with connection.transaction():
         pin_hot_path_plans(connection)
-        assert connection.execute("SHOW enable_seqscan").fetchone() == ("off",)
-    assert connection.execute("SHOW enable_seqscan").fetchone() == ("on",), (
-        "SET LOCAL ends with the transaction"
-    )
+        for setting in ("enable_seqscan", "enable_material"):
+            assert connection.execute(f"SHOW {setting}").fetchone() == ("off",)
+    for setting in ("enable_seqscan", "enable_material"):
+        assert connection.execute(f"SHOW {setting}").fetchone() == ("on",), (
+            "SET LOCAL ends with the transaction"
+        )
 
 
 @pytest.mark.parametrize("statistics", ["stale", "fresh"])
@@ -525,3 +542,157 @@ def test_the_lane_try_lock_is_taken_for_the_selected_rows_only(
     (node,) = locking
     tried = int(node["Actual Rows"]) + int(node.get("Rows Removed by Filter", 0))
     assert 0 < tried <= LIMIT, f"one try-lock per selected row, {tried} for {LIMIT}"
+
+
+# The integrated fault phase: per node lane a P10 nvidia-kernel and a P10
+# fabric-manager row ahead of a P50 gpu and a P50 host evidence row, admitted
+# through the store; fault workers of another process hold the oldest fault rows
+# (their lanes leased, the fabric-manager rows behind them lane-blocked). The
+# claim is the fault stream's, shaped as a coordinator with four free fault
+# workers issues it: the dedicated pools' paths excluded, four rows, a 68-row
+# window. ``routine`` adds the telemetry a spool-disabled site queues behind it.
+SPOOL_BURST_LANES = 400
+SPOOL_BURST_HELD = 80
+ROUTINE_BEHIND = 4000
+FAULT_STREAM_LIMIT = 4
+FAULT_STREAM_WINDOW = max(FAULT_STREAM_LIMIT * 8, FAULT_STREAM_LIMIT + 64)
+DEDICATED_PATHS = set(paths_for_pool(ChannelPool.OBSERVATION)) | {
+    GPU_INVENTORY_PATH,
+    GPU_METRICS_PATH,
+    HOST_TELEMETRY_PATH,
+    NODE_LOG_PATH,
+}
+
+
+def _burst_items(*, routine: bool) -> list[Any]:
+    items = []
+    for path, extra in (
+        (NVIDIA_KERNEL_PATH, {"xid": 79}),
+        (FABRIC_MANAGER_PATH, {"sxid": 11001}),
+        (GPU_METRICS_PATH, {"edge_filter_reasons": ["threshold"]}),
+        (HOST_TELEMETRY_PATH, {"edge_filter_reasons": ["threshold"]}),
+    ):
+        for lane in range(SPOOL_BURST_LANES):
+            body = {"node_id": f"burst-node-{lane:04d}", **extra}
+            items.append(
+                processor_request(
+                    path,
+                    body=json.dumps(body).encode(),
+                    cluster_id=f"perf-cap-{lane % 50:03d}",
+                )
+            )
+    for index in range(ROUTINE_BEHIND if routine else 0):
+        body = {"node_id": f"routine-node-{index}", "gpus": []}
+        items.append(
+            processor_request(
+                GPU_INVENTORY_PATH,
+                body=json.dumps(body).encode(),
+                cluster_id=f"perf-cap-{index % 50:03d}",
+            )
+        )
+    return items
+
+
+def _seed_leased_burst(
+    store: PostgresStore, connection: Any, *, routine: bool
+) -> list[str]:
+    """The burst as the planner sees it once autoanalyze has caught up with
+    it, fixed by the test (autovacuum off for both tables, ``pg_class``
+    checked): the queue analysed with the burst queued and the lanes analysed
+    under the fault workers' live leases -- every lane row leased, so the
+    planner priced "the candidate's lane is free" at about nothing. Returns
+    the four fault rows the claim must take: the oldest nvidia-kernel rows
+    nothing holds."""
+
+    _truncate()
+    with connection.cursor() as cursor:
+        # The layout of a v23 site (narrow queue rows, bodies in the payloads
+        # table); the shared harness truncated the layout row to inline.
+        hot_layout.write_layout_mode(cursor, "detached")
+        hot_layout.ensure_replay_partitions(cursor, datetime.now(timezone.utc))
+    assert store.hot_layout_mode() == "detached"
+    for table in (QUEUE, LANES):
+        connection.execute(f"ALTER TABLE {table} SET (autovacuum_enabled = false)")
+    items = _burst_items(routine=routine)
+    for start in range(0, len(items), 500):
+        store.try_enqueue_processor_requests_batch(
+            items[start : start + 500],
+            max_depth=10**7,
+            max_cluster_depth=10**7,
+            reserved_fault_depth=0,
+            reserved_cluster_fault_depth=0,
+            global_admission_guard=0,
+        )
+    held: list[str] = []
+    while len(held) < SPOOL_BURST_HELD:
+        rows = store.claim_active_processor_requests(
+            "pod-z:1",
+            now=datetime.now(timezone.utc),
+            lease_duration=timedelta(minutes=10),
+            limit=16,
+            exclude_paths=DEDICATED_PATHS,
+        )
+        assert rows, "the held fault rows were claimed"
+        held += [row.request_id for row in rows]
+    connection.execute(f"ANALYZE {QUEUE}")
+    connection.execute(f"ANALYZE {LANES}")
+    queue_tuples, lane_tuples = connection.execute(
+        f"""
+        SELECT (SELECT reltuples FROM pg_class WHERE relname = '{QUEUE}'),
+               (SELECT reltuples FROM pg_class WHERE relname = '{LANES}')
+        """
+    ).fetchone()
+    assert int(queue_tuples) == len(items), f"the burst was analysed: {queue_tuples}"
+    assert int(lane_tuples) == SPOOL_BURST_HELD, f"lanes analysed leased: {lane_tuples}"
+    kernel = [item.request_id for item in items[:SPOOL_BURST_LANES]]
+    assert held == kernel[:SPOOL_BURST_HELD], "the oldest fault rows are held"
+    return kernel[SPOOL_BURST_HELD : SPOOL_BURST_HELD + FAULT_STREAM_LIMIT]
+
+
+@pytest.mark.parametrize("routine", [False, True], ids=["burst", "routine-behind"])
+def test_a_fault_claim_reads_its_window_while_the_lanes_are_leased(
+    store: PostgresStore, connection: Any, routine: bool, request
+) -> None:
+    """Lanes analysed under live leases priced the window's former ``LEFT JOIN``
+    lane test at one row, so the planner expected nothing eligible and read the
+    window whole -- every PENDING row through its lane and retry probes, then a
+    sort -- in each of the fault claims every coordinator issues several times
+    a second during a burst. The window is walked in claim order and stops at
+    its LIMIT; the answer is the four oldest fault rows nothing holds."""
+
+    expected = _seed_leased_burst(store, connection, routine=routine)
+    now = datetime.now(timezone.utc)
+    shape = {"limit": FAULT_STREAM_LIMIT, "exclude_paths": DEDICATED_PATHS}
+    sql, params = store.claim_active_processor_query(
+        "pod-plan", now=now, lease_duration=REQUEST_LEASE, **shape
+    )
+    # Measured first: even a rolled-back claim leaves a dead lane row and a dead
+    # queue row version behind, and this plan sits on a knife-edge between the
+    # ordered walk and the full read (one page of difference flips it).
+    pinned_plan = _explain(
+        connection, sql, params, settings=hot_path_planner_statements(), analyze=True
+    )
+    request.node.user_properties.extend(
+        [
+            ("pinned_shared_blocks", _shared_blocks(pinned_plan)),
+            ("pinned_widest_queue_read", _widest_queue_read(pinned_plan)),
+            ("pinned_execution_ms", round(pinned_plan.get("Execution Time", 0), 1)),
+            (
+                "pinned_queue_scans",
+                json.dumps(sorted(map(str, _scans(pinned_plan, QUEUE)))),
+            ),
+        ]
+    )
+
+    # 1,600 (5,600) rows queued, 720 fault rows PENDING: the walk passes the 80
+    # held rows and stops once the window holds 68 claimable ones.
+    assert _widest_queue_read(pinned_plan) <= FAULT_STREAM_WINDOW, (
+        "the window is walked in claim order and stops at its LIMIT; widest "
+        f"read {_widest_queue_read(pinned_plan)} rows"
+    )
+    claimed = store.claim_active_processor_requests(
+        "pod-plan", now=now, lease_duration=REQUEST_LEASE, **shape
+    )
+    assert [item.request_id for item in claimed] == expected, (
+        "the four oldest fault rows whose lanes are free, oldest first"
+    )

@@ -2049,7 +2049,7 @@ literals, not parameters. Window size = target batch × `GPU_FAULT_PROCESSOR_CLA
 
 **Planner discipline** (`store/postgres/planner_discipline.py`): the claim transactions
 (`claim_active_processor_requests` and the legacy `claim_processor_requests`) start with `SET LOCAL enable_seqscan =
-off`, scoped to that transaction -- and **only** the claim transactions. A
+off` (and `enable_material = off`, below), scoped to that transaction -- and **only** the claim transactions. A
 burst grew `gpu_fault_processor_queue` from 45 to 5,800 pages inside a minute while `pg_class` still said 138 rows
 (autoanalyze is asynchronous); on that estimate the planner chose "scan every candidate, sort, take the window" for
 the claim window and sequential scans for the correlated `EXISTS` probes (retry barrier, STRICT predecessor,
@@ -2072,16 +2072,46 @@ per-writer counter apply and the edge-triggered NOTIFY over the `added`/`removed
 tables have no indexes, so pricing the sequential scan out only degrades their plans into per-row probes. Those
 statements are keyed by request id, ordering key or cluster id and need no help; the per-cluster depth reads stay on
 the default planner.
-One state is not covered: a table that has never been analysed at all (no `pg_statistic` rows -- a new database
-before its first autoanalyze) leaves the choice among index paths arbitrary; `enable_bitmapscan = off` would settle
-it but prices the interlock's scope GIN probes out (GIN indexes are bitmap-only), so it is not applied. The pin
+The setting does not settle a window the planner expects to come back short, though: with a row estimate below the
+window's LIMIT the LIMIT promises no early stop, and the planner picks the cheapest plan that reads every candidate --
+a bitmap scan or another index, the lane and retry probes for every row, then a sort. During a spool-enabled burst
+that is the normal case, because the statistics lag the burst: without column statistics `status='PENDING'` is priced
+at 0.5 %, and once the lanes have been analysed under live leases the former `LEFT JOIN` lane test
+(`lane.ordering_key IS NULL OR lane.lease_expires_at <= now`) was priced at one row. In the integrated 50-cluster fault
+phase with the spool on, all 20 control-worker processes spent 74 % of a 4.5 s window inside 1.1-3.4 s claim
+statements (the writer's slow-statement log; their fault claims asked for four rows, so every fault worker was free)
+while fault rows waited 5-7 s to be claimed. The window's tests are therefore spelled so that their prices keep the
+estimate up whatever the statistics say (`processor_claims.py` `_CLAIM_ELIGIBLE_SQL`): `status<>'COMPLETED' AND NOT
+(status='LEASED' AND lease_expires_at > now)` -- the same set as "PENDING, or LEASED with a lapsed lease", because the
+status is one of the three and never NULL, priced at about 99 % -- and the lane test as a `NOT EXISTS` over live
+leases, whose anti-join estimate follows the leases. The lane-head probe compares `head.priority + 0`, which keeps it on
+`gpu_fault_processor_queue_lane_rows` (a bare `head.priority` let the planner AND that index with a `claim_window`
+range over every higher-priority row: 24,300 instead of 7,200 blocks a claim). The claim transactions also price out
+Materialize (`enable_material = off`): with the estimate up, the planner computed the retry-barrier anti-join once over
+a full index scan of the queue instead of probing the lane index per candidate the window walks (3,800 instead of 1,000
+blocks). Measured with the fault stream's claim (the dedicated pools' paths excluded, four rows, a 68-row window) on a
+3,200-row burst queue -- 800 node lanes, each a P10 nvidia-kernel and fabric-manager row ahead of a P50 gpu and host
+evidence row, the oldest 80 fault rows held by another process: 10,500 shared blocks before and 1,000 after on
+statistics analysed under those leases, 13,200 / 1,000 on a table never analysed, 32,300 / 1,200 with 20,000 routine
+rows queued behind (a spool-disabled site), 1,000 / 1,000 on statistics analysed before the leases were taken; a
+backlog whose every lane is leased is read whole by any plan (3,000 / 2,500). A local reproduction of the fault phase
+(20 coordinators with the production pools and cadence, 3,200 rows from 50 clusters, emulated handlers, statistics
+lagging the burst, PostgreSQL limited to six CPUs) halved both the claim time (101-105 -> 44-47 s) and the p99
+completion of the synchronous action faults (7.4-7.5 -> 3.4-3.6 s). The planner test pins the walk
+(`test_a_fault_claim_reads_its_window_while_the_lanes_are_leased`): 68 rows read on a 1,600-row burst and with 4,000
+routine rows behind it, 720 rows before. One
+state remains: statistics taken on the drained queue while its pages stayed allocated (`reltuples` 0, `relpages` > 0)
+tell the planner the table is empty, every claim then reads the burst whichever way the window is spelled (29,000
+blocks), and the next autoanalyze of the queue ends it. `enable_bitmapscan = off` is still not applied: it prices the
+interlock's scope GIN probes out (GIN indexes are bitmap-only). The pin
 statements are plain `SET LOCAL` without placeholders, executed with an explicit empty parameter tuple through the
 same cursor path as the statements they protect, so a test that stands a cursor double in for the database sees them
 as ordinary statements.
 `enable_sort = off` was measured and rejected: it also yields the ordered walk, but the claim
 statement then executes in 1.3-1.7 s on a two-row table and on 5,000 rows alike (the sorts that must remain -- the
-ordered lane insert, the `DISTINCT ON`, the final ordering -- are driven onto pathological alternatives) where the
-default takes a few milliseconds. The setting is a cost penalty, not a prohibition: a statement no index can serve
+ordered lane insert, the `DISTINCT ON`, the final ordering -- are driven onto pathological alternatives; most of those
+seconds are JIT compilation, switched on by the disabled sorts' penalty cost) where the default takes a few
+milliseconds. The setting is a cost penalty, not a prohibition: a statement no index can serve
 still scans and nothing fails. `plan_cache_mode = force_custom_plan` was evaluated and not adopted (psycopg prepares
 after the fifth execution; a generic plan built under `enable_seqscan = off` cannot regress to a heap scan, the only
 varying parameters are time bounds, limits and the owner, and forcing custom plans would re-plan the multi-CTE claim
