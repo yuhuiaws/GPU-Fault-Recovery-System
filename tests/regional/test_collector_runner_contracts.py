@@ -247,12 +247,18 @@ def test_collect001_judges_each_chain_by_its_own_interval_and_summary(
         "GPU_METRICS": {"interval": 5, "summary": 60},
         "HOST_TELEMETRY": {"interval": 15, "summary": 300},
     }
-    assert result["observation_seconds"] == 300 * 2 + 15 * 4
+    # collector.env never carries the jitter ratio: the collectors' default 0.1
+    # moves each summary 15 s either way, so two cycles need 2 x 330 s.
+    assert result["observation_seconds"] == 330 * 2 + 15 * 4
     gpu = result["deliveries"]["GPU_METRICS"]
     host = result["deliveries"]["HOST_TELEMETRY"]
-    assert gpu["summary_deliveries_in_window"] == 11
+    assert gpu["summary_deliveries_in_window"] == 12
     assert host["summary_deliveries_in_window"] == 2, (
         "the host chain is judged against its own 300s summary, not the max()"
+    )
+    assert (gpu["summary_window_seconds"], host["summary_window_seconds"]) == (
+        pytest.approx(60 * 0.9 - 10),
+        pytest.approx(300 * 0.9 - 30),
     )
     assert set(clock.sleeps) == {5}, "polling runs at the fastest chain's interval"
 

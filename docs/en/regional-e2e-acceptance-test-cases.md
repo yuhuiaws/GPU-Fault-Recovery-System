@@ -13477,30 +13477,43 @@ through the formal recovery scheduling; it neither clears `reset_issued` directl
   `interval_seconds` and `health_summary_seconds` must be read from the target node's
   `/etc/gpu-fault/collector.env`; 15/300 must not be hard-coded.
   `src/gpu_fault/collectors/ _should_deliver`:
-  with the edge filter on and no anomaly, only when
-  `(observed_at - _last_delivered_at) >= health_summary_seconds`
+  with the edge filter on and no anomaly, only when the observation reaches the next summary phase
+  (the cluster/node/channel stable phase, moved by the cadence jitter)
   is the `health-summary` reason appended and the batch delivered.
   → The reporting interval of a steady-state healthy node should be close to the summary period, not
   the collection period.
   If the measured interval is close to the collection period, the filter is not in effect (or has been
   turned off), i.e. "the config file was written but not consumed".
+- The cadence jitter `ratio` (`GPU_FAULT_COLLECTOR_CADENCE_JITTER_RATIO`; the installer does not write it
+  into `collector.env`, so nodes run the product default 0.1) moves every summary phase by +-`ratio/2` x
+  summary, so two consecutive summaries are `summary x (1 +- ratio)` apart, plus at most one collection
+  interval. The window and every threshold below are derived from `interval`, `summary` and `ratio`
+  (`scripts/e2e/regional/collector_cadence_evidence.py`); at `ratio=0` they reduce to the unjittered
+  `2 x summary + 4 x interval` and `summary - 2 x interval`.
 - Steps:
-  1. Record the start time `T0`; take the window as `2 x summary + 4 x interval`
-     (two complete summary periods must fall entirely inside the window,
+  1. Record the start time `T0`; take the window as `ceil(2 x summary x (1+ratio)) + 4 x interval`
+     (two complete jittered summary periods must fall entirely inside the window,
      otherwise "at least two deliveries" is not a property of this window).
   2. **Poll that node's collector status once per collection cycle**,
-     take the **deduplicated sequence** of `observed_at` recorded by the collector,
+     take the **deduplicated sequence** of `observed_at` recorded by the collector (with its `batch_id`),
      and keep only deliveries `>= T0`.
-  3. Compute the differences between adjacent `observed_at` values.
+  3. Compute the differences between adjacent `observed_at` values; the summary window
+     `W = summary x (1-ratio) - 2 x interval` is the shortest gap a healthy node keeps between two
+     consecutive summaries.
 - Verdict (judged separately for the DCGM and the host chain):
   - the number of deliveries in the window is ≥ 2;
-  - the number of deliveries is ≤ `window/summary period + 1`
-    (the extra one is the anomaly edge the node is entitled to report;
+  - the number of deliveries is ≤ `floor(window/W) + 1`
+    (the summaries that fit at their shortest spacing;
     `window/collection period` differs from it by an order of magnitude, which makes the criterion
     decidable);
-  - the maximum adjacent gap is ≥ `summary - 2 x interval`,
+  - the maximum adjacent gap is ≥ `W`,
     i.e. **a whole summary window without delivery was actually observed** --
-    this is the positive evidence that "suppression happened".
+    this is the positive evidence that "suppression happened";
+  - no pure summary delivery (a batch that did not become evidence) lands within `W` of the summary
+    delivery before it (a pure summary, or an evidence batch whose reasons include `health-summary`):
+    that is the schedule re-arming an early summary onto the phase it just served, the summary going
+    out two or three times in one window; an anomaly edge is written as evidence and is not bound by
+    this rule.
 - ⚠ **Never judge by the "current value" of `/latest`; only by the change of `observed_at`**:
   `/latest` always returns one record, and seeing that it "has a value" proves nothing;
   what changes is `observed_at`.

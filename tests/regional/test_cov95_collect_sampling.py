@@ -103,11 +103,11 @@ def test_cadence_observation_distinguishes_missing_unsuppressed_and_false_edges(
     )
     result = runner.run_collect001(fixture, tmp_path)
     assert result["verdict"] == ("PASS" if mode == "healthy" else "FAIL")
-    assert result["observation_seconds"] == 28
-    assert clock.now == 1028
+    assert result["observation_seconds"] == 30, "2 x 10 s x 1.1 jitter + 4 x 2 s"
+    assert clock.now == 1030
     assert calls[-1] == ("cluster-a", "node-a", ORIGIN.isoformat())
     if mode == "healthy":
-        assert result["deliveries"]["GPU_METRICS"]["delivered"] == 3
+        assert result["deliveries"]["GPU_METRICS"]["delivered"] == 4
     else:
         assert result["errors"], "bad cadence or mislabelled evidence must fail"
 

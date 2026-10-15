@@ -42,6 +42,7 @@ from scripts.e2e.regional.collector_inventory_evidence import (  # noqa: E402
     run_collect003 as run_collect003,
 )
 from scripts.e2e.regional import collect002_power_journal as journal  # noqa: E402
+from scripts.e2e.regional import collector_cadence_evidence as cadence  # noqa: E402
 from scripts.e2e.regional import collector_power_delivery as power  # noqa: E402
 from scripts.e2e.regional.collector_negative_evidence import (  # noqa: E402
     COLLECT011_SXIDS,
@@ -411,18 +412,16 @@ def run_collect001(
     }
     poll_interval = min(item["interval"] for item in chains.values())
     started_at = datetime.now(timezone.utc)
-    # Two full summary cycles of the *slowest* chain have to fit inside the
-    # window with room for the phase offset at either end, or "at least two
-    # deliveries" is not a property of the window for that chain.
-    duration = max(
-        item["summary"] * 2 + item["interval"] * 4 for item in chains.values()
-    )
+    # The window, like every bound of the verdict, follows the node's own
+    # interval, summary period and cadence jitter (collector_cadence_evidence).
+    ratio = cadence.jitter_ratio(env)
+    duration = cadence.observation_seconds(chains, ratio)
     # Poll the collector statuses, not the evidence history: steady-state
     # deliveries (no findings, no errors, reason `health-summary`) are not
     # persisted as evidence, which once read a healthy node as a dead chain. The
     # status row is upserted on every accepted batch; one poll per interval
     # cannot miss a delivery that is a summary apart.
-    deliveries: dict[str, list[str]] = {key: [] for key in COLLECT001_PRODUCERS}
+    deliveries: dict[str, dict[str, str]] = {key: {} for key in COLLECT001_PRODUCERS}
     timeline: list[dict[str, Any]] = []
     deadline = time.monotonic() + duration
     while True:
@@ -436,9 +435,7 @@ def run_collect001(
                 # distance to the first in-window delivery is not a gap this
                 # window measured.
                 continue
-            series = deliveries[str(record["collector"])]
-            if stamp not in series:
-                series.append(stamp)
+            deliveries[str(record["collector"])].setdefault(stamp, record["batch_id"])
         timeline.append(
             {
                 "observed_at": datetime.now(timezone.utc).isoformat(),
@@ -457,46 +454,25 @@ def run_collect001(
         observed_after=started_at,
     )
     by_kind = evidence_kinds(records)
+    edge_reasons = {
+        str(item.get("payload", {}).get("batch_id")): list(
+            item.get("payload", {}).get("edge_filter_reasons") or []
+        )
+        for item in records
+    }
     errors = []
     observed: dict[str, Any] = {}
     for kind in sorted(COLLECT001_PRODUCERS):
-        interval = chains[kind]["interval"]
-        summary = chains[kind]["summary"]
-        # What this chain's sampling loop would have delivered with the filter
-        # switched off, and what a suppressed steady state should deliver.
-        sampled = duration // interval
-        suppressed = duration // summary
-        stamps = sorted(parse_stamp(item) for item in deliveries[kind])
-        gaps = [
-            (right - left).total_seconds()
-            for left, right in zip(stamps, stamps[1:], strict=False)
-        ]
-        observed[kind] = {
-            "interval_seconds": interval,
-            "summary_seconds": summary,
-            "collection_samples_in_window": sampled,
-            "summary_deliveries_in_window": suppressed,
-            "delivered": len(stamps),
-            "observed_at": [item.isoformat() for item in stamps],
-            "gaps_seconds": gaps,
-        }
-        if len(stamps) < 2:
-            errors.append(f"{kind} delivered fewer than two batches in the window")
-            continue
-        # One extra delivery beyond the summary count is an edge the node was
-        # entitled to report; the sampling cadence is an order of magnitude away
-        # from that, which is what makes the criterion decidable.
-        if len(stamps) > suppressed + 1:
-            errors.append(
-                f"{kind} delivered {len(stamps)} batches, closer to the "
-                f"{sampled}-sample collection cadence than to the {suppressed} "
-                "the summary cadence allows"
-            )
-        if max(gaps) < summary - interval * 2:
-            errors.append(
-                f"{kind} never went a full summary window without delivering, "
-                f"so no suppression was observed: gaps {gaps}"
-            )
+        observed[kind], chain_errors = cadence.chain_verdict(
+            kind,
+            deliveries[kind],
+            interval=chains[kind]["interval"],
+            summary=chains[kind]["summary"],
+            ratio=ratio,
+            duration=duration,
+            edge_reasons=edge_reasons,
+        )
+        errors.extend(chain_errors)
     # The other half: a batch whose only reason is the periodic summary must not
     # be persisted at all -- the Kubernetes allocatable collector once called
     # every healthy summary a `recovered:` edge and wrote evidence forever.
