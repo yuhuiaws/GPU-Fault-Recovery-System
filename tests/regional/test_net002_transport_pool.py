@@ -99,13 +99,19 @@ def result() -> RemoteCommandResult:
 
 
 @pytest.mark.parametrize("gated", [False, True], ids=["retained-stale", "gated-fresh"])
-def test_stale_keepalive_requires_caller_reset_to_observe_result_409(
+def test_a_stale_keepalive_no_longer_hides_the_result_409(
     local_peer: Any, gated: bool
 ) -> None:
+    """The pool replaces a connection the peer closed while it idled before
+    writing to it, so the result meets the server's own 409 with or without
+    the probe's caller-pool reset (which the gated probe still performs)."""
+
     read_connection(local_peer.url + "/stale")
     assert local_peer.closed_idle.wait(1), (
-        "test_stale_keepalive_requires_caller_reset_to_observe_result_409: expected local_peer.closed_idle.wait(1)"
+        "test_a_stale_keepalive_no_longer_hides_the_result_409: expected local_peer.closed_idle.wait(1)"
     )
+    # Loopback delivers the FIN with the shutdown; the margin covers a loaded host.
+    time.sleep(0.05)
     client = probe.GatedRegionalExecutorClient(
         local_peer.url, "net002-synthetic", "example-only", timeout_seconds=2
     )
@@ -113,14 +119,11 @@ def test_stale_keepalive_requires_caller_reset_to_observe_result_409(
         probe.BLOCK.touch()
     with pytest.raises(probe.ClusterExecutorError) as raised:
         client.complete(SimpleNamespace(command_id="remote-net002"), result())
-    expected_status = 409 if gated else None
-    assert raised.value.status_code == expected_status
+    assert raised.value.status_code == 409
     receipt = json.loads(local_peer.receipt.read_text())
-    assert receipt["status_code"] == expected_status
+    assert receipt["status_code"] == 409
     assert receipt["caller_transport_pool_closed"] is gated
-    assert receipt["stale_lease_reason"] == (
-        probe.STALE_LEASE_DETAILS[0] if gated else None
-    )
+    assert receipt["stale_lease_reason"] == probe.STALE_LEASE_DETAILS[0]
 
 
 def test_result_gate_closes_only_the_callers_pool_not_another_threads(

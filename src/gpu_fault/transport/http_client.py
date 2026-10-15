@@ -21,9 +21,17 @@ What a long-lived connection has to respect (:class:`ConnectionPolicy`):
   reconnect in step) is replaced, which is what lets clients re-spread over
   Pods and workers after a roll - with ``SO_REUSEPORT`` service sockets a
   connection is pinned to the worker that accepted it;
-* a reused connection the peer closed meanwhile fails closed: the request is
-  retried once on a fresh connection only when it is idempotent (``GET``,
-  or a ``POST`` that carries an ``Idempotency-Key`` / request id).
+* a reused connection the peer already closed (its FIN or RST is queued: a
+  keep-alive expiry, a Pod leaving a roll) is replaced *before* anything is
+  written to it, and a request whose write failed is sent again on a fresh
+  connection; neither can have been acted on (the first wrote nothing, the
+  second at most a head without its whole body), so both hold for every
+  request, a non-idempotent claim included;
+* a reused connection that fails after the request was written fails
+  closed: it is retried once on a fresh connection only when the request is
+  safe to repeat (``GET``, or a ``POST`` carrying one of
+  :data:`RETRY_IDENTITY_HEADERS`: the caller vouches that the server
+  deduplicates a repeat).
 
 Every outcome is counted (:meth:`_KeepAliveConnectionPool.stats`) and
 summarised to the log every :data:`STATS_LOG_INTERVAL_SECONDS`; the node
@@ -36,6 +44,7 @@ import io
 import logging
 import os
 import random
+import select
 import socket
 import ssl
 import time
@@ -76,6 +85,19 @@ AGE_JITTER_RATIO = 0.1
 TCP_KEEPALIVE_INTERVAL_SECONDS = 15
 TCP_KEEPALIVE_PROBES = 4
 STATS_LOG_INTERVAL_SECONDS = 300.0
+
+#: The headers that license the one repeat of a ``POST`` whose reused
+#: connection failed after the request was written. Each names a server-side
+#: dedupe the caller relies on: ``Idempotency-Key`` derives the processor queue
+#: row (``gpu_fault.app.middleware.dispatch``); the request id marks a post the
+#: server answers alike when it arrives twice (the Agent heartbeat's CAS, the
+#: executor's reads and keyed writes); the command id names a lease-fenced
+#: command post (result, renewal, progress) the control plane answers
+#: idempotently and checks against the command in the path.
+IDEMPOTENCY_KEY_HEADER = "Idempotency-Key"
+REQUEST_ID_HEADER = "X-GPU-Fault-Request-ID"
+COMMAND_ID_HEADER = "X-GPU-Fault-Command-ID"
+RETRY_IDENTITY_HEADERS = (IDEMPOTENCY_KEY_HEADER, REQUEST_ID_HEADER, COMMAND_ID_HEADER)
 
 ConnectionKey = tuple[str, str, int] | tuple[str, str, int, int]
 
@@ -139,7 +161,51 @@ STAT_NAMES = (
     "idle_expired_total",
     "age_expired_total",
     "evicted_total",
+    "peer_closed_total",
 )
+
+
+class _RequestNotWritten(Exception):
+    """Writing the request failed, so the peer's application never had all of
+    it: nothing can have been acted on. Internal to the pool -- the caller
+    sees ``error``, the exception the write raised."""
+
+    def __init__(self, error: HTTPException | OSError) -> None:
+        super().__init__(str(error))
+        self.error = error
+
+
+def peer_closed(connection: object) -> bool:
+    """Whether an idle pooled connection can no longer carry a request.
+
+    Between two requests the peer owes nothing on a keep-alive connection, so
+    a socket that polls readable holds the peer's FIN or RST (it closed the
+    connection) or bytes nobody asked for; neither may carry the next request.
+    Asked before anything is written, which is what makes replacing the
+    connection safe for every request. A socket without a descriptor (a test
+    double) is taken as open.
+    """
+
+    fileno = getattr(getattr(connection, "sock", None), "fileno", None)
+    if fileno is None:
+        return False
+    try:
+        descriptor = fileno()
+    except (OSError, ValueError):
+        return True
+    if not isinstance(descriptor, int):
+        return False
+    if descriptor < 0:
+        return True
+    try:
+        if hasattr(select, "poll"):
+            poller = select.poll()
+            poller.register(descriptor, select.POLLIN | select.POLLPRI)
+            return bool(poller.poll(0))
+        readable, _, _ = select.select([descriptor], [], [], 0)
+    except (OSError, ValueError):
+        return True
+    return bool(readable)
 
 
 def enable_tcp_keepalive(sock: object, idle_seconds: float) -> bool:
@@ -167,9 +233,10 @@ class _KeepAliveConnectionPool:
 
     Connections are cached per thread because ``http.client`` connections
     are not safe to share; the counters and the policy are process-wide.
-    A reused connection is retried once because an idle keep-alive
-    connection can be closed by the peer between requests - but only for a
-    request that is safe to repeat.
+    An idle keep-alive connection can be closed by the peer between requests:
+    one found closed before the write is replaced (``peer_closed_total``), a
+    request whose write failed is sent again, and one that failed after the
+    write is repeated only when it is safe to repeat.
     """
 
     max_connections = 8
@@ -235,8 +302,8 @@ class _KeepAliveConnectionPool:
             counters = dict(self._counters)
         LOGGER.info(
             "transport pool: opened=%d reused=%d stale_retried=%d stale_failed=%d "
-            "idle_expired=%d age_expired=%d evicted=%d (idle max %.0f s, "
-            "age max %.0f s, tcp keepalive %.0f s)",
+            "idle_expired=%d age_expired=%d evicted=%d peer_closed=%d (idle max "
+            "%.0f s, age max %.0f s, tcp keepalive %.0f s)",
             *(counters[name] for name in STAT_NAMES),
             self.policy.max_idle_seconds,
             self.policy.max_age_seconds,
@@ -328,6 +395,11 @@ class _KeepAliveConnectionPool:
         reused = self._cache().pop(key, None)
         if reused is not None:
             expired = self._expired(reused, now)
+            if expired is None and peer_closed(reused.connection):
+                # The peer closed it while it idled (its keep-alive timeout, a
+                # Pod leaving a roll). Nothing has been written yet, so a fresh
+                # connection carries any request, a claim included.
+                expired = "peer_closed_total"
             if expired is not None:
                 # Closed here, cleanly, rather than discovered dead by the
                 # request: the NLB has dropped (or is about to drop) an idle
@@ -343,6 +415,11 @@ class _KeepAliveConnectionPool:
                 # A received response is not a broken keep-alive connection.
                 self._count("requests_reused_total")
                 raise
+            except _RequestNotWritten:
+                # The write itself failed: the peer never had the whole
+                # request, so sending it again is safe for any request.
+                reused.connection.close()
+                self._count("stale_connection_retries_total")
             except (HTTPException, OSError) as exc:
                 reused.connection.close()
                 if not self._retryable_request(request, headers):
@@ -369,12 +446,21 @@ class _KeepAliveConnectionPool:
             return self._exchange(record, request, key, path, headers, timeout)
         except HTTPError:
             raise
+        except _RequestNotWritten as failure:
+            connection.close()
+            unsent = failure.error
         except HTTPException as exc:
             connection.close()
             raise URLError(exc) from exc
         except OSError:
             connection.close()
             raise
+        # A fresh connection is never retried here: the caller sees what the
+        # write (or the connect inside it) raised, as before -- raised outside
+        # the handler so it carries no link back to the internal wrapper.
+        if isinstance(unsent, HTTPException):
+            raise URLError(unsent) from unsent
+        raise unsent
 
     @staticmethod
     def _retryable_request(
@@ -390,10 +476,9 @@ class _KeepAliveConnectionPool:
         }:
             return True
         normalized = {key.lower(): value for key, value in headers.items()}
-        return bool(
-            normalized.get("idempotency-key")
-            or normalized.get("x-gpu-fault-request-id")
-            or normalized.get("x-gpu-fault-command-id")
+        return any(
+            str(normalized.get(name.lower(), "")).strip()
+            for name in RETRY_IDENTITY_HEADERS
         )
 
     def _exchange(
@@ -410,12 +495,18 @@ class _KeepAliveConnectionPool:
             connection.timeout = timeout
             if connection.sock is not None:
                 connection.sock.settimeout(timeout)
-        connection.request(
-            request.get_method(),
-            path,
-            body=request.data,
-            headers=headers,
-        )
+        try:
+            connection.request(
+                request.get_method(),
+                path,
+                body=request.data,
+                headers=headers,
+            )
+        except (HTTPException, OSError) as exc:
+            # ``http.client`` writes the head, then the body: a failure here
+            # leaves the peer at most a head without its whole body, which no
+            # server acts on (ours read the body before any route runs).
+            raise _RequestNotWritten(exc) from exc
         response = connection.getresponse()
         body = response.read()
         if response.will_close or response.version != 11:
