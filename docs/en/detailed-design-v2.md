@@ -535,6 +535,31 @@ A few points that must be remembered:
   set all keep the grace period; Pods recreated by a later un-suspend still withdraw the tombstone (F2). An owner read failure that is
   not 404/410 (RBAC, timeout, no client) is still handled by the grace period, fail-closed. The tombstone does not forge a
   container exit code; the terminal event continues to use the allocation the Watcher has accumulated.
+  Once the product's own stop is recorded in the first round as a tombstone without containers, the stopped attempt has no
+  RUNNING observation left, and attribution can no longer read from containers which nodes it held. The control plane's
+  attribution fallback (`orchestration/families/evidence.EvidenceOperationService.stopped_attempt_observation`) takes the
+  allocation the tombstone dropped from the workflow that stopped it instead: when an XID/SXID fault event matches no
+  PENDING/RUNNING attempt and `active_recovery_attempt_observation` (which needs a container on the node) finds nothing, the
+  event belongs to the attempt of a STOPPED tombstone whose `termination_initiator_incident_id` names an incident whose current
+  workflow is still PENDING/RUNNING, has a `STOP_WORKLOADS` that ran (completed or under way, not superseded) over the event's
+  node, has not started its join (`RESTART_WORKLOAD`; `dag_branching.join_accepts_new_branch`, PREEMPT-020), and was created
+  no later than 30 s after both the tombstone and the event: a late fault on another member node is appended to the job DAG as
+  a branch (PREEMPT-018), and a late XID 79 on the node under reset supersedes the reset as before. An event whose own
+  job/attempt or workload differs, a tombstone older than that workflow (an earlier stop's), a STOP that does not cover the node
+  or never ran, a workflow that left PENDING/RUNNING, a join that already started, or more than one stopped attempt matching all
+  attribute nothing, and the event opens its own workflow as before. Earlier, node-b's XID 46 in the eks-managed
+  GF-REGIONAL-DESTR-014 arrived 2.6 s after the tombstone, opened a RESET_GPU workflow of its own and stayed PENDING behind the
+  failure-domain budget the job workflow held; no gate before the restart looked at it, so the job's join could have restarted the
+  job onto the faulted node, with only the placement hold after the restart to catch it. The 300 s grace used to let such events
+  join only by accident; the bound is now "until the stopping workflow's join starts". The judgement is per node: the tombstone no
+  longer knows which GPUs the job used, and the restart lands on these nodes, so a fault on any GPU of them is repaired first.
+  Node ownership (`ownership_metric_snapshot`) and topology attribution (`WorkloadTopologyService.resolve`) still count
+  PENDING/RUNNING containers only, and health findings do not take this fallback, so the stopped source attempt and its restarted
+  successor never both count as owners again. When the grouped-fault family scopes the job DAG from such an observation the
+  allocation is empty, so the workload steps still to run (the join's `node_ids` and `source_gpu_count`) keep their compiled
+  values instead of being rewritten to an empty set and 0 -- the same-node inheritance path (`active_recovery_attempt_observation`
+  returning an observation left with terminated containers only) used to break the join that way too. Cost: taken only when both
+  lookups above find nothing, one incident read and one workflow read per retained STOPPED tombstone that names an initiator.
   A non-zero exit while the Pod carries `metadata.deletionTimestamp` is likewise read as STOPPED (`deletion_requested`):
   a user/operator `kubectl delete` of the job first makes torchrun receive SIGTERM and exit with 1 and then makes the Pod disappear;
   this is not a training failure, no failure-detected is sent, no restart budget is consumed, no escalation.

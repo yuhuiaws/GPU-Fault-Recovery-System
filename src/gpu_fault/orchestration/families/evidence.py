@@ -8,8 +8,11 @@ from threading import Lock
 from typing import Any, Callable
 
 from gpu_fault.host_health import NodeHealthFinding
+from gpu_fault.models import WorkflowOperation, WorkflowRequest, WorkflowStatus
+from gpu_fault.orchestration.dag_branching import join_accepts_new_branch
 from gpu_fault.policy import SxidEvent, XidEvent
-from gpu_fault.watcher import AttemptObservation
+from gpu_fault.store import NotFoundError
+from gpu_fault.watcher import AttemptObservation, WorkloadPhase
 
 LOGGER = logging.getLogger(__name__)
 DEFAULT_ACTIVE_OBSERVATION_MAX_AGE_SECONDS = 120.0
@@ -213,7 +216,8 @@ class EvidenceOperationService:
             )
 
         candidates = []
-        for observation in self.store.list_attempt_observations(event.cluster_id):
+        observations = list(self.store.list_attempt_observations(event.cluster_id))
+        for observation in observations:
             if not self.observation_is_fresh(
                 observation,
                 freshness_reference,
@@ -305,10 +309,114 @@ class EvidenceOperationService:
                 recovered = self.active_recovery_attempt_observation(
                     event, event_gpu_uuids
                 )
+                if recovered is None:
+                    recovered = self.stopped_attempt_observation(event, observations)
                 if recovered is not None:
                     return recovered
             return None
         return max(candidates, key=lambda item: item.observed_at)
+
+    def stopped_attempt_observation(
+        self,
+        event: XidEvent | SxidEvent | NodeHealthFinding,
+        observations: Iterable[AttemptObservation],
+    ) -> AttemptObservation | None:
+        """The attempt our own STOP_WORKLOADS ended on this node, while the
+        job workflow that stopped it can still take the node as a branch.
+
+        The watcher records our own stop on its first missing pass
+        (``completion_observation.workload_objects_stopped_by_us``) as a
+        STOPPED tombstone without containers, so a second after the stop
+        neither the RUNNING match above nor
+        ``active_recovery_attempt_observation`` -- which needs a container on
+        the node -- sees the attempt. A late fault on another member node then
+        opened its own node workflow behind the budget the job workflow holds,
+        a late XID 79 on the node under reset no longer superseded the reset
+        (PREEMPT-018), and the job's restart could land on the faulted node.
+        The stop names the allocation the tombstone dropped: the attempt still
+        owns every node of a STOP_WORKLOADS that ran in the PENDING/RUNNING
+        workflow of the incident its tombstone names, until that workflow's
+        join has started (PREEMPT-020) -- after that the restarted successor is
+        the node's owner and the event is its own as before. Fault events only;
+        the health families keep their own reading. Node ownership is not read
+        here: ``ownership_metric_snapshot`` counts PENDING/RUNNING containers
+        alone, so the stopped attempt never owns a node beside its successor.
+        """
+
+        if not isinstance(event, (XidEvent, SxidEvent)):
+            return None
+        job_id = getattr(event, "job_id", None)
+        attempt_id = getattr(event, "attempt_id", None)
+        workload_ids = set(event.affected_workload_ids)
+        matches = [
+            observation
+            for observation in observations
+            if observation.workload_phase is WorkloadPhase.STOPPED
+            and observation.termination_initiator_incident_id
+            and job_id in (None, observation.job_id)
+            and attempt_id in (None, observation.attempt_id)
+            and (
+                not workload_ids or workload_ids.intersection(observation.workload_ids)
+            )
+            and self._stopper_takes_node(event, observation)
+        ]
+        identities = {(item.job_id, item.attempt_id) for item in matches}
+        if len(identities) != 1:
+            return None
+        selected = max(matches, key=lambda item: item.observed_at)
+        LOGGER.info(
+            "attributed event %s to attempt %s/%s: incident %s stopped it on "
+            "node %s and its job workflow still takes branches",
+            event.event_id,
+            selected.job_id,
+            selected.attempt_id,
+            selected.termination_initiator_incident_id,
+            event.node_id,
+        )
+        return selected
+
+    def _stopper_takes_node(
+        self,
+        event: XidEvent | SxidEvent,
+        observation: AttemptObservation,
+    ) -> bool:
+        """Whether the workflow that stopped ``observation`` still owns the
+        event's node: PENDING/RUNNING, a STOP_WORKLOADS over the node has run
+        (completed or under way, never superseded), its join has not started,
+        and neither the tombstone nor the event predates the workflow (a
+        tombstone older than the workflow is an earlier stop's)."""
+
+        try:
+            incident = self.store.get_incident(
+                str(observation.termination_initiator_incident_id)
+            )
+            if not incident.workflow_request_id:
+                return False
+            workflow: WorkflowRequest = self.store.get_workflow(
+                incident.workflow_request_id
+            )
+        except NotFoundError:
+            return False
+        ran = set(workflow.completed_step_indexes) | {
+            execution.step_index for execution in workflow.step_executions
+        }
+        earliest = self.utc(workflow.created_at) - timedelta(seconds=30)
+        return (
+            (incident.job_id, incident.attempt_id)
+            == (observation.job_id, observation.attempt_id)
+            and workflow.incident_id == incident.incident_id
+            and workflow.status in {WorkflowStatus.PENDING, WorkflowStatus.RUNNING}
+            and any(
+                step.operation is WorkflowOperation.STOP_WORKLOADS
+                and event.node_id in step.node_ids
+                and index in ran
+                and index not in workflow.superseded_step_indexes
+                for index, step in enumerate(workflow.official_steps)
+            )
+            and join_accepts_new_branch(workflow)
+            and self.utc(observation.observed_at) >= earliest
+            and self.utc(event.observed_at) >= earliest
+        )
 
     def active_recovery_attempt_observation(
         self,

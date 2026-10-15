@@ -108,6 +108,38 @@ _REWRITE_PHRASES = {
 }
 
 
+def join_accepts_new_branch(
+    workflow: WorkflowRequest, *, now: datetime | None = None
+) -> bool:
+    """Whether a job DAG's shared ``RESTART_WORKLOAD`` join can still take a
+    node branch: it exists and has neither completed, been superseded nor
+    started (PREEMPT-020), and the workflow is inside its lifetime."""
+
+    if lifetime_exceeded(workflow, now):
+        # Past its lifetime a workflow takes no new node branch (F-N1);
+        # disposition() records such events on the incident instead.
+        return False
+    restart_index = next(
+        (
+            index
+            for index, step in enumerate(workflow.official_steps)
+            if step.operation is WorkflowOperation.RESTART_WORKLOAD
+        ),
+        None,
+    )
+    if restart_index is None:
+        return False
+    return (
+        restart_index not in workflow.completed_step_indexes
+        and restart_index not in workflow.superseded_step_indexes
+        and not any(
+            item.step_index == restart_index
+            and item.operation is WorkflowOperation.RESTART_WORKLOAD
+            for item in workflow.step_executions
+        )
+    )
+
+
 class DagBrancher:
     def __init__(self, arbiter: RecoveryArbiter) -> None:
         self.arbiter = arbiter
@@ -191,33 +223,7 @@ class DagBrancher:
     def dag_join_accepts_new_branch(
         self, workflow: WorkflowRequest, *, now: datetime | None = None
     ) -> bool:
-        if lifetime_exceeded(workflow, now):
-            # Past its lifetime a workflow takes no new node branch (F-N1);
-            # disposition() records such events on the incident instead.
-            return False
-        restart_index = next(
-            (
-                index
-                for index, step in enumerate(workflow.official_steps)
-                if step.operation is WorkflowOperation.RESTART_WORKLOAD
-            ),
-            None,
-        )
-        if restart_index is None:
-            return False
-        return (
-            restart_index not in workflow.completed_step_indexes
-            and restart_index not in workflow.superseded_step_indexes
-            and (
-                not any(
-                    (
-                        item.step_index == restart_index
-                        and item.operation is WorkflowOperation.RESTART_WORKLOAD
-                        for item in workflow.step_executions
-                    )
-                )
-            )
-        )
+        return join_accepts_new_branch(workflow, now=now)
 
     def requires_live_pre_stop_capture(self, step: WorkflowStepSpec) -> bool:
         return bool(

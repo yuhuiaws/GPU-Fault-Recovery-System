@@ -456,7 +456,13 @@ class GroupedFaultService:
         workflow: WorkflowRequest,
         existing_workflow: WorkflowRequest | None,
     ) -> tuple[FaultIncident, WorkflowRequest]:
-        restart_parameters = self._restart_parameters(context)
+        # A stopped attempt's observation no longer names its allocation: the
+        # watcher's tombstone has no containers, a terminated one no live node.
+        # The job workflow's workload steps were compiled while the attempt
+        # ran; they keep the nodes and the GPU count they carry instead of the
+        # empty set and 0 a late fault's observation would write over them.
+        live = bool(context.allocation_nodes)
+        restart_parameters = self._restart_parameters(context) if live else {}
         workload_operations = {
             WorkflowOperation.CHECKPOINT_WORKLOADS,
             WorkflowOperation.STOP_WORKLOADS,
@@ -493,7 +499,7 @@ class GroupedFaultService:
                     update={
                         "node_ids": (
                             context.allocation_nodes
-                            if step.operation in workload_operations
+                            if live and step.operation in workload_operations
                             else step.node_ids
                         ),
                         "workload_ids": context.workload_ids,
