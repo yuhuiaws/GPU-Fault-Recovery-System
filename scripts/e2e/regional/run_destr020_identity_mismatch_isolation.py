@@ -28,6 +28,7 @@ coverage on it).
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import sys
@@ -252,7 +253,18 @@ def configure(arguments: argparse.Namespace) -> Settings:
 
 
 def run_identity(run_dir: Path, attempt: int) -> str:
-    return f"destr020-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
+    """Stable for one run directory and attempt, distinct across run directories.
+
+    The alias event stays in the event ledger, so a run id repeated by a later
+    run directory makes its preflight find the earlier run's event: the last
+    ``-`` token alone gave ``...-r8-eks`` and ``...-r9-eks`` the same id. The
+    digest of the resolved path keeps plan and execute (two processes) on one
+    alias without a timestamp.
+    """
+
+    token = run_dir.name.rsplit("-", 1)[-1].lower()
+    digest = hashlib.sha256(str(run_dir.resolve()).encode("utf-8")).hexdigest()[:8]
+    return f"destr020-{token}-{digest}-a{attempt}"
 
 
 def focused_tests(case_dir: Path) -> dict[str, Any]:

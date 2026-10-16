@@ -628,6 +628,19 @@ def test_the_run_identity_pins_the_alias_to_run_dir_and_attempt(tmp_path: Path) 
     ), "attempt 2 must not reuse attempt 1's alias"
 
 
+def test_the_run_identity_differs_between_run_dirs_with_the_same_last_token(
+    tmp_path: Path,
+) -> None:
+    # A later round's run directory ends in the same token as the earlier one;
+    # the earlier round's alias event must not block the later preflight.
+    earlier = tmp_path / "regional-acceptance-round-a-eks"
+    later = tmp_path / "regional-acceptance-round-b-eks"
+    assert destr020.run_identity(later, 1) == destr020.run_identity(later, 1)
+    assert verdicts.alias_for_run(
+        destr020.run_identity(earlier, 1)
+    ) != verdicts.alias_for_run(destr020.run_identity(later, 1))
+
+
 def test_the_runner_is_plan_by_default_and_needs_an_exact_confirmation() -> None:
     parser = destr020.parser()
     plan = parser.parse_args(["--run-dir", "/tmp/run"])

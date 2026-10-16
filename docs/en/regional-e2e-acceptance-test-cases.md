@@ -12482,9 +12482,10 @@ the ledger migrates in place, and the next real command leaves a complete audit 
   is exactly the same, while the plan does not contain a single physical operation, which is a stronger hard stop.
 - Preconditions:
   1. `DESTR-001` PASS.
-  2. The alias `acceptance-alias-<sha256(run id)[:12]>` (determined by the run directory and attempt, written into the
-     plan identity) exists in none of `kubectl get node`, `gpu_nodes()`, store `get_agent`/
-     `list_agents`.
+  2. The alias `acceptance-alias-<sha256(run id)[:12]>` (determined by the run directory's resolved path and the attempt:
+     the run id carries the first 8 hex digits of that path's sha256, so every round's new run directory gets its own alias
+     while plan and execute of one run directory share it; written into the plan identity) exists in none of
+     `kubectl get node`, `gpu_nodes()`, store `get_agent`/`list_agents`, and the store holds no earlier event for it.
   3. The reference node is Ready, without ownership annotation, without non-system workload; the processor queue is empty and
      no remote command is in flight (checked once at preflight and once right before injection).
 - Steps:
