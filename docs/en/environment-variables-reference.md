@@ -257,7 +257,7 @@ validates them (integers/numbers must parse, booleans must be `0/1/true/false/ye
 | `GPU_FAULT_HUNG_STRACE_SAMPLE_DURATION_SECONDS` | Core/Other | integer | `'3'` | `gpu_fault.host_health` |
 | `GPU_FAULT_HUNG_STRACE_SAMPLE_INTERVAL_SECONDS` | Core/Other | integer | `'2'` | `gpu_fault.host_health` |
 | `GPU_FAULT_HUNG_TRIAGE_MAX_NODES` | Core/Other | integer | `'8'` | `gpu_fault.orchestration.families.evidence` |
-| `GPU_FAULT_HYPERPOD_CLUSTER` | HyperPod | text | `<implicit>` | `gpu_fault.admin.bootstrap_services`<br>`gpu_fault.admin.node_key_custody_admin`<br>`gpu_fault.app.context`<br>`gpu_fault.execution.config`<br>`gpu_fault.hyperpod`<br>`gpu_fault.node_installer_reconciler`<br>`gpu_fault.settings` |
+| `GPU_FAULT_HYPERPOD_CLUSTER` | HyperPod | text | `<implicit>` | `gpu_fault.admin.bootstrap_common`<br>`gpu_fault.app.context`<br>`gpu_fault.cluster_executor.bootstrap`<br>`gpu_fault.cluster_scope`<br>`gpu_fault.execution.config`<br>`gpu_fault.hyperpod`<br>`gpu_fault.node_installer_reconciler`<br>`gpu_fault.node_provider`<br>`gpu_fault.settings` |
 | `GPU_FAULT_HYPERPOD_CONFIRM_CLUSTER` | HyperPod | text | `''` | `gpu_fault.cluster_executor.bootstrap` |
 | `GPU_FAULT_HYPERPOD_IDENTITY_REFRESH_SECONDS` | HyperPod | number | `'20'` | `gpu_fault.app.lifespan_workers`<br>`gpu_fault.app.periodic_services` |
 | `GPU_FAULT_HYPERPOD_MANAGED_RECOVERY_TIMEOUT_SECONDS` | HyperPod | integer | `'1800'` | `gpu_fault.execution.config` |

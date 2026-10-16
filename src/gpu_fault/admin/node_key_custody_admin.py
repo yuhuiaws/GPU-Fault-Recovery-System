@@ -15,6 +15,7 @@ from gpu_fault.admin.bootstrap_common import (
     BootstrapMutationRequired,
     ClusterIdentity,
     CommandRunner,
+    node_key_scope_environment,
 )
 from gpu_fault.admin.deadlines import deadline_environment, remaining_timeout
 from gpu_fault.admin.node_key_custody import (
@@ -344,7 +345,9 @@ def provision_admin_custody(
                 "GPU_FAULT_KUBECTL_CONTEXT": context.cluster.context,
                 "GPU_FAULT_NAMESPACE": context.namespace,
                 "GPU_FAULT_CLUSTER_ID": context.cluster_id,
-                "GPU_FAULT_HYPERPOD_CLUSTER": context.cluster.hyperpod_name,
+                # The scope normal provisioning hands the helper: provider
+                # name, provider and the cluster's own node selector.
+                **node_key_scope_environment(context.cluster, context.cluster_id),
                 "GPU_FAULT_FLEET_MASTER_FILE": str(fleet_master_file),
                 "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": str(context.cpu_kubeconfig),
                 "GPU_FAULT_CONTROL_PLANE_NAMESPACE": context.namespace,

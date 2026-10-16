@@ -17,6 +17,7 @@ from gpu_fault.admin.bootstrap_common import (
     ClusterIdentity,
     CommandRunner,
     ReadOnlyProbeRunner,
+    node_key_scope_name,
 )
 from gpu_fault.admin.node_key_custody import namespace_uid
 from gpu_fault.admin.node_key_custody_admin_config import AdminCustodyRegistration
@@ -304,7 +305,8 @@ def current_binding(
             cpu_eks_arn=context.cpu_eks_arn,
             gpu_eks_arn=context.cluster.eks_arn,
             cluster_id=context.cluster_id,
-            hyperpod_cluster=context.cluster.hyperpod_name,
+            # The provider scope the key helper is handed and binds against.
+            hyperpod_cluster=node_key_scope_name(context.cluster, context.cluster_id),
             namespace=context.namespace,
             **cluster_namespace_anchors(runner, context),
         ),

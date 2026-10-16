@@ -605,7 +605,11 @@ Registration does not rotate the key and does not call KMS signing; an unauthori
 the current Secret shape or a point-in-time scan cannot fabricate historical custody proof. AUTH-015 consumes the complete signature chain and verifies the new key, old key and sibling key against the real
 Agent; it does not itself hand out the master, nor restart or reinstall nodes.
 That evidence covers only the trusted provisioning path and does not endorse unobserved historical activity; see
-[Node Key Custody Evidence](../components/node-key-custody-evidence.md) for details.
+[Node Key Custody Evidence](../components/node-key-custody-evidence.md) for details. On a plain EKS (`eks-managed`)
+cluster custody hands the key helper the same scope as normal provisioning
+(`bootstrap_common.node_key_scope_environment`): the provider scope name is the `cluster_id` (the cluster has no
+HyperPod name), the nodes are the ones the cluster's own recorded selector covers, never the HyperPod cluster-name
+label, and a rotation's activation target carries the provider and the selector as well.
 
 Replacement nodes obtain their key through `POST /v1/regional/node-action-keys` (cluster-token
 bucket; the payload's `cluster_id` is subject to cluster binding, at most 64 node ids). Threat

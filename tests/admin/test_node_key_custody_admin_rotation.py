@@ -32,7 +32,12 @@ from tests.regional._cov95_identity_support import offline_guard as offline_guar
 
 @pytest.fixture
 def installed(tmp_path, monkeypatch):
-    world = AdminWorld(tmp_path, monkeypatch)
+    return authorized_rotation(AdminWorld(tmp_path, monkeypatch), monkeypatch)
+
+
+def authorized_rotation(world, monkeypatch):
+    """Install under custody, witness the activation, authorize node-a's rotation."""
+
     world.configure()
     world.access()
     world.release_ready = True

@@ -121,6 +121,25 @@ def _time(value: Any) -> datetime:
         raise CustodyError("node key activation has an invalid time binding") from None
 
 
+def activation_target(context: AdminNodeKeyContext) -> ClusterTarget:
+    """The release target the activation's node gates and convergence read
+    select through: a plain EKS cluster is its provider and recorded selector,
+    not a HyperPod target without a name."""
+
+    cluster = context.cluster
+    return ClusterTarget(
+        context.cluster_id,
+        cluster.context,
+        "",
+        cluster.region,
+        cluster.hyperpod_name,
+        cluster.eks_arn,
+        provider=cluster.provider,
+        node_selector=cluster.node_selector,
+        node_selector_source=cluster.node_selector_source,
+    )
+
+
 class CustodyActivationIO:
     def __init__(
         self,
@@ -140,14 +159,7 @@ class CustodyActivationIO:
             raise CustodyError(
                 "node key activation requires single-node rotation authorization"
             )
-        self.target = ClusterTarget(
-            context.cluster_id,
-            context.cluster.context,
-            "",
-            context.cluster.region,
-            context.cluster.hyperpod_name,
-            context.cluster.eks_arn,
-        )
+        self.target = activation_target(context)
 
     def bind_completed(self, completed: Completed) -> None:
         # Only provision_admin_custody calls this, after verifying the signed

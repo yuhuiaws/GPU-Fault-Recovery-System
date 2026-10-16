@@ -363,17 +363,27 @@ class AdminWorld(CommandRunner):
                         else {}
                     ),
                 )
+            # The wrapper's own argument defaults (provision-node-action-keys.sh):
+            # --hyperpod-cluster "${GPU_FAULT_HYPERPOD_CLUSTER:-${CLUSTER_ID}}"
+            # and --node-selector "${GPU_FAULT_NODE_SELECTOR:-}", so the
+            # environment each caller hands the helper is what it selects by.
+            environment = kwargs["env"]
+            cluster_id = environment.get("GPU_FAULT_CLUSTER_ID", "")
             PROVISION.provision(
                 PROVISION.Scope(("kubectl", "--context", "gpu-context"), NAMESPACE),
                 PROVISION.Scope(("kubectl", "--context", "cpu-context"), NAMESPACE),
-                cluster_id=self.cluster_id,
-                hyperpod_cluster=self.gpu.hyperpod_name,
+                cluster_id=cluster_id,
+                hyperpod_cluster=environment.get("GPU_FAULT_HYPERPOD_CLUSTER")
+                or cluster_id,
+                node_selector=(
+                    environment.get("GPU_FAULT_NODE_SELECTOR") or ""
+                ).strip(),
                 master_file=self.master_file,
-                rotate_node=kwargs["env"].get("GPU_FAULT_ROTATE_NODE_ACTION_KEY", ""),
+                rotate_node=environment.get("GPU_FAULT_ROTATE_NODE_ACTION_KEY", ""),
                 runner=self.private_run,
                 custody=custody,
                 expected_nodes=json.loads(
-                    kwargs["env"].get("GPU_FAULT_NODE_KEY_EXPECTED_NODES_JSON", "null")
+                    environment.get("GPU_FAULT_NODE_KEY_EXPECTED_NODES_JSON", "null")
                 ),
             )
             return "provisioned 2 node action keys"

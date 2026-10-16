@@ -70,7 +70,10 @@ def live_anchors(
         or target.region != expected.region
         or target.eks_cluster_arn != expected.gpu_eks_arn
         or target.cluster_id != expected.cluster_id
-        or target.hyperpod_cluster_name != expected.hyperpod_cluster
+        # The provider scope custody binds: the HyperPod name, or the cluster
+        # id of a plain EKS cluster (bootstrap_common.node_key_scope_name).
+        or (target.hyperpod_cluster_name or target.cluster_id)
+        != expected.hyperpod_cluster
         or site.namespace != expected.namespace
     ):
         raise CustodyError("AUTH015 site differs from the authorized custody site")

@@ -71,6 +71,17 @@ closed.
    Installation activation is a useful prerequisite, not a complete
    AUTH-015 rotation PASS.
 
+The site binding names the GPU cluster's provider scope in `hyperpod_cluster`:
+the HyperPod name, or the `cluster_id` of a plain EKS (`eks-managed`) cluster,
+which has no other provider-side name (`bootstrap_common.node_key_scope_name`).
+The NodeName-to-UID inventory is the set of nodes the cluster's own selector
+covers (`cluster_scope.node_selector`; on plain EKS the recorded
+ownership-label selector, never the HyperPod cluster-name label). The
+provisioning helper receives the same scope, provider and selector as normal
+provisioning (`bootstrap_common.node_key_scope_environment`), and a rotation's
+activation target carries the provider and the selector, so its node-state
+gate and convergence read select exactly the bound nodes.
+
 The currently supported v1 chain retains one release/site/Node UID binding.
 Identity or release transitions need new explicitly authorized evidence;
 there is no automatic provenance migration or grandfathering.

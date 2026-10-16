@@ -32,9 +32,12 @@ from gpu_fault.admin.execution import (
     run_command,
 )
 from gpu_fault.cluster_scope import (
+    NODE_SELECTOR_ENV,
+    PROVIDER_ENV,
     PROVIDER_NODE_REBOOT_OWNERS,
     PROVIDER_PROFILE_SOURCES,
     cluster_provider,
+    node_selector,
 )
 
 _TASK_COMMAND_COUNTS: ContextVar[dict[str, int] | None] = ContextVar(
@@ -141,6 +144,29 @@ class ClusterIdentity:
         """The name the provider scope carries: HyperPod name, else EKS name."""
 
         return self.hyperpod_name or self.eks_name
+
+
+def node_key_scope_name(cluster: ClusterIdentity, cluster_id: str) -> str:
+    """The provider cluster scope the node-key helper and its custody binding
+    name: the HyperPod name, or the ``cluster_id`` of a plain EKS cluster,
+    which has no other provider-side name."""
+
+    return cluster.hyperpod_name or cluster_id
+
+
+def node_key_scope_environment(
+    cluster: ClusterIdentity, cluster_id: str
+) -> dict[str, str]:
+    """What ``deploy/node/provision-node-action-keys.sh`` lists the GPU nodes
+    by: the provider scope, the provider and the cluster's node selector (the
+    HyperPod cluster-name label only for a HyperPod cluster that records no
+    selector). Normal provisioning and the custody path hand it the same."""
+
+    return {
+        "GPU_FAULT_HYPERPOD_CLUSTER": node_key_scope_name(cluster, cluster_id),
+        PROVIDER_ENV: cluster.provider,
+        NODE_SELECTOR_ENV: node_selector(cluster),
+    }
 
 
 def require_single_provider(

@@ -28,6 +28,7 @@ from gpu_fault.admin.bootstrap_common import (
     assert_site_tag,
     describe_or_absent,
     kubectl_apply,
+    node_key_scope_environment,
     safe_name,
     tag_map,
 )
@@ -57,11 +58,6 @@ from gpu_fault.admin.monitoring_policy import (
     validate_amp_workspace,
 )
 from gpu_fault.admin.rds_ca_bundle import ensure_rds_ca_bundle
-from gpu_fault.cluster_scope import (
-    NODE_SELECTOR_ENV,
-    PROVIDER_ENV,
-    node_selector,
-)
 
 # One Pod Identity add-on result per deploy run, keyed by the runner the run was
 # handed. Three call sites ensure the same add-on (`revalidate_pod_identity_agent`,
@@ -1374,11 +1370,7 @@ def provision_node_action_keys(
         "GPU_FAULT_KUBECTL_CONTEXT": cluster.context,
         "GPU_FAULT_NAMESPACE": namespace,
         "GPU_FAULT_CLUSTER_ID": cluster_id,
-        # The provider cluster scope: the HyperPod name, or the cluster_id of
-        # a plain EKS cluster, which has no other provider-side name.
-        "GPU_FAULT_HYPERPOD_CLUSTER": cluster.hyperpod_name or cluster_id,
-        PROVIDER_ENV: cluster.provider,
-        NODE_SELECTOR_ENV: node_selector(cluster),
+        **node_key_scope_environment(cluster, cluster_id),
         "GPU_FAULT_FLEET_MASTER_FILE": str(fleet_master_file),
         "GPU_FAULT_CONTROL_PLANE_KUBECONFIG": str(cpu_kubeconfig),
         "GPU_FAULT_CONTROL_PLANE_NAMESPACE": namespace,
