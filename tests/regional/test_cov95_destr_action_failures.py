@@ -214,15 +214,20 @@ def test_reboot_requires_unique_submission_and_provider_confirmation(
             {"event_name": "RebootClusterNodes", "session_issuer_role_name": "foreign"}
         ]
     elif defect == "final-unready":
-        h.transforms["regional.node_snapshot"] = lambda value, *_a: {
-            **value,
-            "ready": "False",
-            "unschedulable": True,
-        }
+        # The rebooted target only: the replacement executor's node (gpu-1) is
+        # read before the replay and must stay Ready for the case to reach
+        # the final node check this defect is about.
+        h.transforms["regional.node_snapshot"] = lambda value, args, _k: (
+            {**value, "ready": "False", "unschedulable": True}
+            if args[0] == "node-a"
+            else value
+        )
     else:
         h.transforms["regional.cpu_blast_snapshot"] = lambda *_a: {"changed": True}
     code, report = h.execute(tmp_path)
     assert code == 1 and (report.get("error") or report.get("errors")), report
+    if defect == "final-unready":
+        assert "target node is not Ready after reboot" in report["errors"], report
 
 
 @pytest.mark.parametrize(

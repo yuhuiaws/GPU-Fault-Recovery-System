@@ -9471,6 +9471,18 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   record reaches `SUBMITTED` it deletes the executor Pod that actually submitted, then has a
   new replica replay the same durable key directly, which must yield `duplicate=true`. Any
   replace/delete CloudTrail event is an immediate FAIL.
+  The arbiter Deployments tolerate the cordon and `gpu-fault.io/quarantined` by design (an
+  isolating control plane must not lock itself out), so the new replica may be scheduled onto
+  the very node this case is rebooting (idle and image-warm, it scores best; observed in both
+  HyperPod rounds): when it is not Ready within 300 s and is bound to that node, the replacement
+  wait takes the node-return budget (1800 s) and `executor-restart.json` records
+  `bound_to_rebooting_node`. Before the replay the new replica's node must have been Ready for
+  at least 45 s (HyperPod restarts kubelet with its final configuration about 30 s after a boot,
+  and an exec across that restart is refused); an exec kubectl refused before the probe ran
+  (for example `unable to upgrade connection`) is retried on the same Pod and UID every 5 s, up
+  to 180 s on a healthy node and 1800 s on the rebooting one; a failure or timeout after the
+  probe started is never retried. `duplicate-replay.json` records `executor_node`,
+  `replacement_on_rebooting_node`, `node_ready_seconds` and `refused_execs`.
 - Preconditions: `GPU_FAULT_ALLOW_HYPERPOD_REBOOT=true` (on by default on the executor side),
   HyperPod `NodeRecovery=None`.
 - Steps:

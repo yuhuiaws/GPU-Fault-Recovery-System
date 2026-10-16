@@ -22,6 +22,7 @@ for _path in (ROOT, ROOT / "src"):
         sys.path.insert(0, str(_path))
 
 from gpu_fault.cluster_scope import PROVIDER_NODE_REBOOT_OWNERS  # noqa: E402
+from scripts.e2e.regional import regional_pod_inventory  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
     write_json_atomic,
@@ -45,7 +46,10 @@ from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     reusable_focused_tests,
     run_standard_case,
 )
-from scripts.e2e.regional.regional_commands import RegionalCommandFailed  # noqa: E402
+from scripts.e2e.regional.regional_commands import (  # noqa: E402
+    RegionalCommandFailed,
+    exec_refused_before_script,
+)
 from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalFixtureError,
     RegionalLiveFixture,
@@ -72,6 +76,25 @@ FORBIDDEN_EVENTS = {
     "DeleteClusterNodes",
     "ReplaceClusterNodes",
 }
+EXECUTOR_APP = "gpu-fault-cluster-executor"
+# A replacement executor on a healthy node is Ready well inside this budget.
+REPLACEMENT_READY_SECONDS = 300
+# The arbiter Deployments tolerate the cordon and gpu-fault.io/quarantined by
+# design (an isolating control plane must not lock itself out), so the scheduler
+# may bind the replacement to the very node this case reboots: idle and
+# image-warm, it scores best (live round 8 and round 9 on HyperPod, 2/2). That
+# Pod cannot start before the node is back, so its wait and the replay take the
+# case's node-return budget instead (wait_node_ready's 1800 s).
+REPLACEMENT_ON_REBOOTING_NODE_SECONDS = 1800
+# How long the replacement's node must have been Ready before the replay execs:
+# HyperPod restarts kubelet with its final configuration ~30 s after a boot, and
+# an exec across that restart is refused -- live 2026-10-16 (round 9): Pod Ready
+# 06:47:43, kubelet "Starting" again 06:47:46, exec "unable to upgrade
+# connection" 06:47:46 (the rule of collector_inventory_reboot's settle wait).
+REPLAY_NODE_READY_SECONDS = 45.0
+# Retry budget on a healthy node for an exec kubectl refused before the probe ran.
+REPLAY_EXEC_RETRY_SECONDS = 180
+REPLAY_POLL_SECONDS = 5
 
 
 # Finds the executor's node lifecycle adapter by the owner each provider's
@@ -735,23 +758,152 @@ def restart_executor(
         "--wait=false",
         timeout=30,
     )
-    deadline = time.monotonic() + 300
+    started = time.monotonic()
+    pods_after, replaced = wait_ready_replacement(
+        regional,
+        pods_before,
+        str(target["uid"]),
+        deadline=started + REPLACEMENT_READY_SECONDS,
+    )
+    # Only once the healthy-node budget is spent: a replacement bound to the
+    # node this case reboots waits for that node, any other one has failed.
+    bound = None
+    if not replaced:
+        bound = pending_replacement_node(
+            regional,
+            {str(item["uid"]) for item in pods_before},
+            rebooting_nodes(command),
+        )
+    if not replaced and bound is not None:
+        pods_after, replaced = wait_ready_replacement(
+            regional,
+            pods_before,
+            str(target["uid"]),
+            deadline=started + REPLACEMENT_ON_REBOOTING_NODE_SECONDS,
+        )
+    if not replaced:
+        raise RegionalFixtureError(
+            f"executor Deployment did not replace deleted Pod: {pods_after}"
+        )
+    return {
+        "deleted": target,
+        "match_basis": match_basis,
+        "before": pods_before,
+        "after": pods_after,
+        "bound_to_rebooting_node": bound,
+    }
+
+
+def rebooting_nodes(command: dict[str, Any]) -> set[str]:
+    """The nodes the reboot step names: the ones this case takes down."""
+
+    return {str(item) for item in (command.get("step") or {}).get("node_ids") or []}
+
+
+def wait_ready_replacement(
+    regional: RegionalLiveFixture,
+    pods_before: list[dict[str, Any]],
+    deleted_uid: str,
+    *,
+    deadline: float,
+) -> tuple[list[dict[str, Any]], bool]:
+    """The last Ready executor Pods read, and whether they replace the deleted one."""
+
     pods_after: list[dict[str, Any]] = []
     while time.monotonic() < deadline:
-        pods_after = regional.ready_pods("gpu", "gpu-fault-cluster-executor")
+        pods_after = regional.ready_pods("gpu", EXECUTOR_APP)
         if len(pods_after) >= len(pods_before) and all(
-            item["uid"] != target["uid"] for item in pods_after
+            item["uid"] != deleted_uid for item in pods_after
         ):
-            return {
-                "deleted": target,
-                "match_basis": match_basis,
-                "before": pods_before,
-                "after": pods_after,
-            }
+            return pods_after, True
         time.sleep(5)
-    raise RegionalFixtureError(
-        f"executor Deployment did not replace deleted Pod: {pods_after}"
-    )
+    return pods_after, False
+
+
+def pending_replacement_node(
+    regional: RegionalLiveFixture,
+    previous_uids: set[str],
+    nodes: set[str],
+) -> str | None:
+    """The node in ``nodes`` a not-yet-Ready replacement executor is bound to.
+
+    A Pod of the executor app that is not one of ``previous_uids`` and is not
+    terminating is the Deployment's replacement. Best effort: an unreadable
+    inventory answers None, and the healthy-node verdict stands.
+    """
+
+    try:
+        items = regional_pod_inventory.pod_inventory(regional, "gpu", EXECUTOR_APP)[
+            "items"
+        ]
+    except (RegionalFixtureError, ValueError, KeyError, TypeError):
+        return None
+    for item in items if isinstance(items, list) else []:
+        metadata = (item.get("metadata") or {}) if isinstance(item, dict) else {}
+        node = ((item.get("spec") or {}) if isinstance(item, dict) else {}).get(
+            "nodeName"
+        )
+        if (
+            metadata.get("uid") not in previous_uids
+            and not metadata.get("deletionTimestamp")
+            and isinstance(node, str)
+            and node in nodes
+        ):
+            return node
+    return None
+
+
+def node_ready_age(snapshot: dict[str, Any]) -> float | None:
+    """Seconds since the node last flipped Ready; None without ``ready_since``."""
+
+    ready_since = snapshot.get("ready_since")
+    if not isinstance(ready_since, str) or not ready_since:
+        return None
+    since = datetime.fromisoformat(ready_since.replace("Z", "+00:00"))
+    return (datetime.now(timezone.utc) - since).total_seconds()
+
+
+def wait_replay_target(
+    regional: RegionalLiveFixture,
+    target: dict[str, Any],
+    *,
+    deadline: float,
+) -> dict[str, Any]:
+    """Block until an exec into the replacement can reach it; what was seen.
+
+    The Pod must still be the replacement ``restart_executor`` saw (same UID,
+    not terminating) and its node must have been Ready for
+    ``REPLAY_NODE_READY_SECONDS``. A node record without ``ready_since`` (an
+    older projection) and a Pod record without a node are not waited on.
+    """
+
+    while True:
+        current = json.loads(
+            regional.kubectl("gpu", "get", "pod", str(target["name"]), "-o", "json")
+        )
+        metadata = current.get("metadata") or {}
+        if metadata.get("uid") != target["uid"] or metadata.get("deletionTimestamp"):
+            raise RegionalFixtureError(
+                "replacement executor Pod UID changed before replay"
+            )
+        node = str(target.get("node") or "")
+        if not node:
+            return {"node": None, "node_ready_seconds": None}
+        try:
+            snapshot = regional.node_snapshot(node)
+        except (RegionalFixtureError, ValueError, KeyError):
+            snapshot = {}
+        age = node_ready_age(snapshot)
+        if snapshot.get("ready") == "True" and (
+            age is None or age >= REPLAY_NODE_READY_SECONDS
+        ):
+            return {"node": node, "node_ready_seconds": age}
+        if time.monotonic() >= deadline:
+            raise RegionalFixtureError(
+                f"replacement executor node {node} did not settle before the "
+                f"replay: ready={snapshot.get('ready')} ready_age={age}"
+            )
+        time.sleep(REPLAY_POLL_SECONDS)
 
 
 def replay_from_replacement(
@@ -764,12 +916,6 @@ def replay_from_replacement(
     if len(candidates) != 1:
         raise RegionalFixtureError("replacement executor Pod identity is not unique")
     target = candidates[0]
-    current = json.loads(
-        regional.kubectl("gpu", "get", "pod", str(target["name"]), "-o", "json")
-    )
-    metadata = current.get("metadata") or {}
-    if metadata.get("uid") != target["uid"] or metadata.get("deletionTimestamp"):
-        raise RegionalFixtureError("replacement executor Pod UID changed before replay")
     request = {
         "submission_idempotency_key": str(
             (command.get("result_details") or {}).get("submission_idempotency_key")
@@ -778,34 +924,61 @@ def replay_from_replacement(
             str(item) for item in (command.get("step") or {}).get("node_ids") or []
         ],
     }
-    try:
-        output = regional.kubectl(
-            "gpu",
-            "exec",
-            "-i",
-            str(target["name"]),
-            "--",
-            component_python("gpu"),
-            "-",
-            json.dumps(request, sort_keys=True),
-            input_text=STORE_REPLAY_PROBE,
-            timeout=180,
-        )
-    except RegionalCommandFailed as exc:
-        # The probe reports its own failures as JSON and exits 0, so this is
-        # the exec itself: the Pod not yet accepting exec, the container or
-        # the interpreter missing. Name the step; the output stays redacted.
-        raise RegionalFixtureError(
-            "DESTR-002 store-level replay could not run in replacement executor "
-            f"Pod {target['name']} (uid {target['uid']}): {exc}"
-        ) from exc
+    # On the node this case reboots the exec can also meet the reboot itself
+    # (a replacement Ready before the provider took the node down), so the
+    # budget is the node-return one there.
+    on_rebooting_node = str(target.get("node") or "") in rebooting_nodes(command)
+    deadline = time.monotonic() + (
+        REPLACEMENT_ON_REBOOTING_NODE_SECONDS
+        if on_rebooting_node
+        else REPLAY_EXEC_RETRY_SECONDS
+    )
+    refused: list[str] = []
+    while True:
+        reach = wait_replay_target(regional, target, deadline=deadline)
+        try:
+            output = regional.kubectl(
+                "gpu",
+                "exec",
+                "-i",
+                str(target["name"]),
+                "--",
+                component_python("gpu"),
+                "-",
+                json.dumps(request, sort_keys=True),
+                input_text=STORE_REPLAY_PROBE,
+                timeout=180,
+            )
+            break
+        except RegionalCommandFailed as exc:
+            # The probe reports its own failures as JSON and exits 0, so this
+            # is the exec itself. One kubectl refused before the probe ran (the
+            # kubelet restarting under it, the container not attached yet)
+            # repeated nothing and is tried again on the same Pod; anything
+            # else -- the interpreter missing -- is final. Output stays redacted.
+            if not exec_refused_before_script(exc) or time.monotonic() >= deadline:
+                raise RegionalFixtureError(
+                    "DESTR-002 store-level replay could not run in replacement "
+                    f"executor Pod {target['name']} (uid {target['uid']}): {exc}"
+                    + (f"; refused before: {refused}" if refused else "")
+                ) from exc
+            refused.append(exc.failure_class or "replica gone")
+            time.sleep(REPLAY_POLL_SECONDS)
     lines = [line for line in output.splitlines() if line.strip()]
     value = json.loads(lines[-1]) if lines else None
     if not isinstance(value, dict):
         raise RegionalFixtureError(
             f"replacement executor {target['name']} replay returned no object"
         )
-    return {**value, "executor_pod": target["name"], "executor_pod_uid": target["uid"]}
+    return {
+        **value,
+        "executor_pod": target["name"],
+        "executor_pod_uid": target["uid"],
+        "executor_node": reach["node"],
+        "replacement_on_rebooting_node": on_rebooting_node,
+        "node_ready_seconds": reach["node_ready_seconds"],
+        "refused_execs": refused,
+    }
 
 
 def workflow_errors(
