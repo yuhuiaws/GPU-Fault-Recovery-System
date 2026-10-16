@@ -25,7 +25,8 @@ UUID -- the workflow would be BLOCKED before MARK_UNSCHEDULABLE ever ran.
 from __future__ import annotations
 
 import hashlib
-from datetime import datetime, timezone
+import json
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
@@ -82,6 +83,34 @@ ESCALATION_TIMEOUT_SECONDS = 180
 # first one appeared. The dispatcher reconciles failed workflows every tick, so
 # a chain shows up within seconds; two minutes is generous.
 CHAIN_WATCH_SECONDS = 120
+# The alias's departure. The incidents the alias XID leaves name a node absent
+# from Kubernetes, so the control plane's departed-node cleanup lists the alias
+# in its ledger as ``provider_identity_unknown`` (no instance id the provider
+# could be asked about) and never ends that line by itself; two hours later
+# ``GpuFaultDepartedNodeCleanupStuck`` pages the site's administrator. The case
+# is that administrator for its own alias: it takes the product's exit, and the
+# product's dry run -- never a rule of the case's own -- judges when it may.
+# ``gpu_fault.departed_nodes.DEPARTED_AGENT_GUARD_AGE``: an Agent record the
+# exit retires must be this long silent, its lease expired.
+DEPARTED_GUARD_SECONDS = 600
+# ``gpu_fault.departed_node_cleanup.CLEANUP_INTERVAL_SECONDS``: one cycle of the
+# cleanup that lists the alias and, on the acceptance, ends what it left.
+DEPARTED_CLEANUP_INTERVAL_SECONDS = 60
+# Three cycles: a ledger line still to be written, a node report a little
+# late, the cleanup's task lease moving to another worker.
+DEPARTED_MARGIN_SECONDS = 3 * DEPARTED_CLEANUP_INTERVAL_SECONDS
+# The most the exit may take to open, and the ledger line, after the apply, to
+# end gone or CLEANED.
+DEPARTED_EXIT_BUDGET_SECONDS = DEPARTED_GUARD_SECONDS + DEPARTED_MARGIN_SECONDS
+DEPARTED_READBACK_SECONDS = 5 * DEPARTED_CLEANUP_INTERVAL_SECONDS
+DEPARTED_POLL_SECONDS = 30
+# How ``gpu_fault.admin.operation_lock`` refuses a second administrator
+# mutation on the site: the one refusal the case retries, within the budget.
+ADMIN_LOCK_BUSY = "another administrator mutation is in progress"
+# The exit's answer for a node nothing names (``_accept_plan``).
+NOTHING_NAMES_THE_NODE = (
+    "no Agent record and no departed-node ledger line names the node"
+)
 
 
 def parse_time(value: Any) -> datetime | None:
@@ -484,3 +513,144 @@ def alias_agent_cleanup_errors(result: dict[str, Any]) -> list[str]:
     if state != "REVOKED":
         return [f"the alias Agent record is {state!r} after the cleanup, not REVOKED"]
     return []
+
+
+# --------------------------------------------------------------------------- #
+# The alias's departure: the administrator's exit, taken by the case
+# --------------------------------------------------------------------------- #
+def departed_alias_reference(run_id: str) -> str:
+    """The change reference the case's acceptance of its alias is recorded under."""
+
+    return f"{CASE_ID}/{run_id}/departed-alias"
+
+
+def departed_alias_reason(run_id: str, alias: str) -> str:
+    """The ``--reason``: whose alias it is and why its departure is accepted."""
+
+    return (
+        f"{CASE_ID} cleanup (run {run_id}): {alias} is the case's own alias, a "
+        "node id that never existed -- no Kubernetes node, no provider instance; "
+        "the case posted an API-replay XID for it, and accepting its departure "
+        "lets the departed-node cleanup end what that XID left"
+    )
+
+
+def departed_alias_item(
+    plan: dict[str, Any] | None, alias: str
+) -> dict[str, Any] | None:
+    """The dry run's item for the alias, exactly as the product judged it."""
+
+    for item in (plan or {}).get("items") or []:
+        if isinstance(item, dict) and item.get("node_id") == alias:
+            return item
+    return None
+
+
+def departed_exit_opens_at(
+    item: dict[str, Any], *, guard: timedelta
+) -> datetime | None:
+    """When the dry run's own timestamps let the exit open; None: nothing to wait on.
+
+    Read from the item, never re-judged: an Agent record the exit would retire
+    (``retire``) once its last heartbeat is ``guard`` old and its lease ended;
+    a node report chain the plan says is still closed once it spans the guard;
+    a node a report listed once its 24 hours are complete (``opens_at``).
+    """
+
+    moments: list[datetime] = []
+    if item.get("retire"):
+        seen = parse_time(item.get("last_seen_at"))
+        if seen is not None:
+            moments.append(seen + guard)
+        lease = parse_time(item.get("lease_expires_at"))
+        if lease is not None:
+            moments.append(lease)
+    reports = item.get("kubernetes_reports_read") or {}
+    chain = parse_time(reports.get("chain_started_at"))
+    if chain is not None and not (item.get("kubernetes_reports") or {}).get("open"):
+        moments.append(chain + guard)
+    opens = parse_time(reports.get("opens_at"))
+    if opens is not None:
+        moments.append(opens)
+    return max(moments) if moments else None
+
+
+def admin_document(stdout: str) -> dict[str, Any] | None:
+    """The JSON document ``workflow-reconcile`` printed, or None."""
+
+    text = stdout.strip()
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        value, _end = json.JSONDecoder().raw_decode(text, start)
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def admin_refusal(returncode: int, stdout: str, stderr: str) -> str:
+    """What ``gpu-fault-admin`` said when it refused, in its own words."""
+
+    lines = [
+        line.removeprefix("gpu-fault-admin:").strip()
+        for line in stderr.splitlines()
+        if line.startswith("gpu-fault-admin:") and "full output in" not in line
+    ]
+    text = "; ".join(lines) or stderr.strip()[-500:] or stdout.strip()[-500:]
+    return f"exit {returncode}: {text or 'no output'}"
+
+
+def departed_plan_errors(item: dict[str, Any], *, cluster_id: str) -> list[str]:
+    """An eligible item must name the alias in the case's own cluster."""
+
+    if item.get("cluster_id") != cluster_id:
+        return [
+            f"the departed-node exit names {item.get('node_id')} in cluster "
+            f"{item.get('cluster_id')!r}, not the case's {cluster_id}"
+        ]
+    return []
+
+
+def departed_exit_errors(
+    item: dict[str, Any], *, alias: str, waited: float
+) -> list[str]:
+    """The exit did not open: the product's reasons, verbatim."""
+
+    reasons = "; ".join(str(reason) for reason in item.get("reasons") or [])
+    return [
+        f"the administrator's departed-node exit for {alias} did not open within "
+        f"{waited:.0f}s: {reasons or 'the dry run gave no reason'}"
+    ]
+
+
+def departed_apply_errors(attempt: dict[str, Any], *, key: str) -> list[str]:
+    """The apply must exit 0 and record the acceptance of ``cluster/alias``."""
+
+    result = attempt.get("result") or {}
+    if attempt.get("returncode") != 0 or result.get("failed_agents"):
+        failures = result.get("failures") or {}
+        detail = "; ".join(f"{name}: {text}" for name, text in sorted(failures.items()))
+        return [
+            f"the administrator's departed-node exit refused {key}: "
+            f"{detail or attempt.get('refusal')}"
+        ]
+    if key not in (result.get("accepted_identities") or []):
+        return [
+            f"the departed-node exit recorded no acceptance for {key}: "
+            f"{result.get('accepted_identities')}"
+        ]
+    return []
+
+
+def departed_ledger_errors(readback: dict[str, Any], *, alias: str) -> list[str]:
+    """The alias's ledger line must be gone or CLEANED: no departed-node residue."""
+
+    line = readback.get("ledger")
+    if line is None or line.get("status") == "CLEANED":
+        return []
+    classes = ", ".join(line.get("blocker_classes") or []) or "no blocker class"
+    return [
+        f"the departed-node ledger still lists {alias} as {line.get('status')} "
+        f"({classes}): {'; '.join(line.get('blockers') or [])[:600]}"
+    ]

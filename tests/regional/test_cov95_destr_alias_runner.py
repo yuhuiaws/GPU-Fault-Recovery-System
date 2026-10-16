@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from datetime import timedelta
 from pathlib import Path
 from typing import Any
 
@@ -12,7 +13,13 @@ from scripts.e2e.regional.regional_live_fixture import (
     RegionalFixtureAbort,
     RegionalFixtureError,
 )
-from tests.regional._cov95_destr_alias import AliasHarness
+from tests.regional._cov95_destr_alias import (
+    AliasHarness,
+    accepted,
+    eligible_item,
+    nothing_names,
+)
+from tests.regional._cov95_destr_warm import NOW
 
 NO_ALIAS_AGENT = {
     "found": False,
@@ -242,3 +249,336 @@ def test_alias_plan_reference_uid_drift_refuses_before_post(
     with pytest.raises(RegionalFixtureError, match="plan drifted"):
         h.execute(tmp_path)
     assert not h.posted, h.calls
+
+
+# --------------------------------------------------------------------------- #
+# The alias's departure: the administrator's exit, taken by the case
+# --------------------------------------------------------------------------- #
+GUARD_REASON = "agent heartbeat is younger than the 10-minute departure guard"
+
+
+def _departed_evidence(run_dir: Path) -> dict[str, Any]:
+    path = run_dir / "cases" / case.CASE_ID / case.DEPARTED_EVIDENCE
+    return dict(json.loads(path.read_text(encoding="utf-8")))
+
+
+def _admin_calls(h: AliasHarness) -> list[tuple[str, Any]]:
+    return [(name, detail) for name, detail in h.calls if name.startswith("admin.")]
+
+
+def _exit_shape(h: AliasHarness, argv: list[str]) -> bool:
+    """Every command is the ledger's exit for the alias: nothing weaker."""
+
+    head = [
+        "workflow-reconcile",
+        "--state-dir",
+        str(h.settings.admin_state_dir),
+        "--retire-departed-agents",
+        "--node",
+        h.alias,
+        "--accept-unknown-provider-identity",
+        "--reason",
+    ]
+    return argv[: len(head)] == head and len(argv) in {len(head) + 2, len(head) + 3}
+
+
+@pytest.mark.parametrize("ends", ["CLEANED", "gone"])
+def test_the_cleanup_takes_the_departed_node_exit_for_its_own_alias(
+    ends: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = AliasHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.departed.cycle = 60
+    h.departed.ends = ends
+
+    code, report = h.execute(tmp_path)
+
+    run_id = case.run_identity(tmp_path, 1)
+    state_dir = h.settings.admin_state_dir
+    reason = verdicts.departed_alias_reason(run_id, h.alias)
+    reference = verdicts.departed_alias_reference(run_id)
+    assert code == 0 and report["cleanup"]["errors"] == [], report["cleanup"]
+    # The ledger's own exit through the state dir's deploy-host CLI: the dry
+    # run first, then the apply once, under the case's reference.
+    assert _admin_calls(h) == [
+        (
+            "admin.dry-run",
+            case.departed_exit_argv(state_dir, h.alias, reason, reference=None),
+        ),
+        (
+            "admin.apply",
+            case.departed_exit_argv(state_dir, h.alias, reason, reference=reference),
+        ),
+    ], h.calls
+    [(_, dry_run), (_, apply)] = _admin_calls(h)
+    assert dry_run[-1] == "--dry-run" and "--reference" not in dry_run, dry_run
+    assert apply[-2:] == ["--reference", reference] and "--dry-run" not in apply
+    assert reference == f"{case.CASE_ID}/{run_id}/departed-alias", reference
+    names = [name for name, _ in h.calls]
+    assert names.index("admin.dry-run") > names.index("runtime.verify"), (
+        "the exit is the cleanup's last step"
+    )
+    evidence = _departed_evidence(tmp_path)
+    assert evidence["outcome"] == "accepted", evidence
+    assert evidence["command"] == [
+        str(state_dir / "deployer-venv" / "bin" / "gpu-fault-admin")
+    ], "the site's own deploy-host CLI"
+    assert [item["phase"] for item in evidence["attempts"]] == ["dry-run", "apply"]
+    assert evidence["ledger_before"]["ledger"]["status"] == "REFUSED", evidence
+    # The cleanup's next cycle ends the line: polled, never assumed.
+    assert [item["status"] for item in evidence["readback"]] == [
+        "REFUSED",
+        "REFUSED",
+        None if ends == "gone" else "CLEANED",
+    ], evidence["readback"]
+    assert report["cleanup"]["alias_departure"]["outcome"] == "accepted"
+
+
+def test_a_case_that_posted_nothing_records_a_no_op_departure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = AliasHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.quiet_queue = {"depth": 1}
+
+    code, report = h.execute(tmp_path)
+
+    assert code == 1 and not h.posted, report
+    assert report["cleanup"]["errors"] == [], report["cleanup"]
+    assert _admin_calls(h) == [], "nothing can have listed the alias"
+    evidence = _departed_evidence(tmp_path)
+    assert evidence["outcome"] == "no-op" and "posted no XID" in evidence["note"]
+    assert evidence["attempts"] == [], evidence
+
+
+def test_an_alias_nothing_ever_listed_is_a_recorded_no_op_after_the_margin(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = AliasHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.departed.line = None
+    h.departed.plans = [nothing_names(h.alias)]
+
+    code, report = h.execute(tmp_path)
+
+    assert code == 0 and report["cleanup"]["errors"] == [], report["cleanup"]
+    calls = _admin_calls(h)
+    assert {name for name, _ in calls} == {"admin.dry-run"}, "no line: no apply"
+    # Polled for the margin: a line still to be written had three cycles.
+    margin = verdicts.DEPARTED_MARGIN_SECONDS // verdicts.DEPARTED_POLL_SECONDS
+    assert len(calls) == margin + 1, calls
+    evidence = _departed_evidence(tmp_path)
+    assert evidence["outcome"] == "no-op", evidence
+    assert evidence["ledger_at_deadline"] == {"acceptance": None, "ledger": None}
+
+
+@pytest.mark.parametrize("stage", ["apply", "pod", "dry-run", "plan"])
+def test_a_refused_exit_fails_the_case_and_is_never_retried_weaker(
+    stage: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = AliasHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    key = f"cluster-a/{h.alias}"
+    if stage == "apply":
+        fragment = f"refuses ineligible Agents: {key}: an unknown provider identity"
+        h.departed.applies = [("refuse", f"retire-departed-agents {fragment} ...")]
+    elif stage == "pod":
+        fragment = "an Agent record for the node is ACTIVE; plan again"
+        h.departed.applies = [
+            (
+                1,
+                {
+                    "accepted_identities": [],
+                    "failed_agents": [key],
+                    "failures": {key: f"ValueError: {fragment}"},
+                },
+            )
+        ]
+    elif stage == "dry-run":
+        fragment = "workflow reconcile found no Running CPU ingress Pod"
+        h.departed.plans = [("refuse", fragment)]
+    else:
+        fragment = (
+            "the node's provider identity is known; retire it on the provider's "
+            "proof, without --accept-unknown-provider-identity"
+        )
+        h.departed.plans = [eligible_item(h.alias, eligible=False, reasons=[fragment])]
+
+    code, report = h.execute(tmp_path)
+
+    assert code == 1 and report["verdict"] == "FAIL", report
+    [error] = report["cleanup"]["errors"]
+    assert error.startswith("alias_departure: RegionalFixtureError: "), error
+    assert fragment in error, error
+    calls = _admin_calls(h)
+    applies = [name for name, _ in calls if name == "admin.apply"]
+    assert len(applies) == (1 if stage in {"apply", "pod"} else 0), calls
+    assert all(_exit_shape(h, argv) for _name, argv in calls), calls
+    if stage == "plan":
+        assert "did not open within 180s" in error, error
+    evidence = _departed_evidence(tmp_path)
+    assert evidence["outcome"] == "failed" and fragment in evidence["error"]
+
+
+def test_the_administrator_lock_is_waited_out_not_failed_on_sight(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = AliasHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.departed.plans = ["lock", "lock", eligible_item(h.alias)]
+    h.departed.applies = ["lock", accepted(h.alias)]
+
+    code, report = h.execute(tmp_path)
+
+    assert code == 0 and report["cleanup"]["errors"] == [], report["cleanup"]
+    assert [name for name, _ in _admin_calls(h)] == [
+        *["admin.dry-run"] * 3,
+        *["admin.apply"] * 2,
+    ], h.calls
+    evidence = _departed_evidence(tmp_path)
+    assert [item["lock_busy"] for item in evidence["attempts"]] == [
+        True,
+        True,
+        False,
+        True,
+        False,
+    ], evidence["attempts"]
+    assert "held by pid 4242" in evidence["attempts"][0]["refusal"], evidence
+    assert evidence["outcome"] == "accepted", evidence
+
+
+@pytest.mark.parametrize("stuck", ["lock", "chain", "heartbeat", "ledger"])
+def test_a_departure_that_cannot_clear_within_its_budget_fails_the_case(
+    stuck: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = AliasHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    if stuck == "lock":
+        h.departed.plans = ["lock"]
+        fragment = "administrator lock stayed held through the case's 780s budget"
+    elif stuck == "chain":
+        # A report chain that restarted a minute ago: the exit opens once it
+        # spans the guard -- and here it never does.
+        h.departed.plans = [
+            eligible_item(
+                h.alias,
+                eligible=False,
+                kubernetes_reports={"open": False, "never_reported": True},
+                kubernetes_reports_read={
+                    "chain_started_at": (NOW - timedelta(minutes=1)).isoformat()
+                },
+                reasons=["covers 60s of the 600s guard"],
+            )
+        ]
+        fragment = "did not open within"
+    elif stuck == "heartbeat":
+        # Something keeps the alias's Agent speaking: its own timestamps say
+        # the exit opens past the budget, so the case stops waiting.
+        h.departed.plans = [
+            lambda harness: eligible_item(
+                harness.alias,
+                eligible=False,
+                retire=True,
+                last_seen_at=harness.clock.now().isoformat(),
+                lease_expires_at=harness.clock.now().isoformat(),
+                reasons=[GUARD_REASON],
+            )
+        ]
+        fragment = "past the case's 780s budget: " + GUARD_REASON
+    else:
+        h.departed.ends = "stuck"
+        fragment = f"still lists {h.alias} as REFUSED (provider_identity_unknown)"
+
+    code, report = h.execute(tmp_path)
+
+    assert code == 1 and report["verdict"] == "FAIL", report
+    [error] = report["cleanup"]["errors"]
+    assert fragment in error, error
+    evidence = _departed_evidence(tmp_path)
+    assert evidence["outcome"] == "failed", evidence
+    polls = [item for item in evidence["attempts"] if item["phase"] == "dry-run"]
+    if stuck == "lock":
+        budget = verdicts.DEPARTED_EXIT_BUDGET_SECONDS // verdicts.DEPARTED_POLL_SECONDS
+        assert len(polls) == budget + 1, len(polls)
+    elif stuck == "chain":
+        # Waited for the chain, not just the margin, and never past the cap.
+        margin = verdicts.DEPARTED_MARGIN_SECONDS // verdicts.DEPARTED_POLL_SECONDS
+        assert margin + 1 < len(polls) <= 27, len(polls)
+    elif stuck == "ledger":
+        assert len(evidence["readback"]) == 11, evidence["readback"]
+
+
+def test_the_wait_follows_the_alias_records_own_timestamps(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The case's revoke failed and the alias's Agent is still ACTIVE: the
+    exit retires it itself once the record's guard and lease allow, and the
+    case waits exactly that long -- past the margin, inside the budget."""
+
+    h = AliasHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    h.failures["alias.agent.cleanup"] = RuntimeError("revoke did not land")
+    seen = NOW - timedelta(minutes=4)
+    record = {
+        "retire": True,
+        "lifecycle_state": "ACTIVE",
+        "last_seen_at": seen.isoformat(),
+        "lease_expires_at": (seen + timedelta(minutes=2)).isoformat(),
+    }
+
+    def plan(harness: AliasHarness) -> dict[str, Any]:
+        if harness.clock.now() < seen + timedelta(minutes=10):
+            return eligible_item(
+                harness.alias, eligible=False, reasons=[GUARD_REASON], **record
+            )
+        return eligible_item(harness.alias, **record)
+
+    h.departed.plans = [plan]
+
+    code, report = h.execute(tmp_path)
+
+    assert report["cleanup"]["errors"] == [
+        "alias_agent: RuntimeError: revoke did not land"
+    ], report["cleanup"]
+    evidence = _departed_evidence(tmp_path)
+    assert evidence["outcome"] == "accepted", evidence
+    polls = [item for item in evidence["attempts"] if item["phase"] == "dry-run"]
+    first, last = (verdicts.parse_time(polls[index]["at"]) for index in (0, -1))
+    assert first is not None and last is not None, polls
+    assert last >= seen + timedelta(minutes=10), "eligible only past the guard"
+    assert (
+        timedelta(seconds=verdicts.DEPARTED_MARGIN_SECONDS)
+        < last - first
+        < timedelta(seconds=verdicts.DEPARTED_EXIT_BUDGET_SECONDS)
+    ), (first, last)
+    assert code == 1, "the failed revoke stays the case's FAIL"
+
+
+@pytest.mark.parametrize("defect", ["unnamed", "cluster", "ledger"])
+def test_a_dry_run_that_does_not_settle_the_alias_fails_closed(
+    defect: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = AliasHarness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    if defect == "unnamed":
+        h.departed.plans = [{"items": ["junk", {"node_id": "acceptance-alias-other"}]}]
+        fragment = f"dry run did not name {h.alias}"
+    elif defect == "cluster":
+        h.departed.plans = [eligible_item(h.alias, cluster_id="cluster-b")]
+        fragment = "in cluster 'cluster-b', not the case's cluster-a"
+    else:
+        # The ledger lists the alias, yet the exit's plan finds nothing naming
+        # it: never taken as a no-op.
+        h.departed.plans = [nothing_names(h.alias)]
+        fragment = verdicts.NOTHING_NAMES_THE_NODE
+
+    code, report = h.execute(tmp_path)
+
+    assert code == 1 and report["verdict"] == "FAIL", report
+    [error] = report["cleanup"]["errors"]
+    assert fragment in error, error
+    assert "admin.apply" not in [name for name, _ in h.calls], "never applied"
+    evidence = _departed_evidence(tmp_path)
+    assert evidence["outcome"] == "failed", evidence
+    if defect == "ledger":
+        assert evidence["ledger_at_deadline"]["ledger"]["status"] == "REFUSED"

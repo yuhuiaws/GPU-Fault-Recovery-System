@@ -858,3 +858,582 @@ def test_a_cleanup_that_cannot_revoke_the_alias_agent_fails_the_case(
     ]
     evidence = json.loads((tmp_path / "alias-agent-cleanup.json").read_text())
     assert evidence["lifecycle_state"] == "ACTIVE", "the failed read-back is kept"
+
+
+# --------------------------------------------------------------------------- #
+# Cleanup: the alias's departure, through the administrator's own exit
+# --------------------------------------------------------------------------- #
+def test_the_departed_alias_exit_is_recorded_under_the_case_and_run(
+    tmp_path: Path,
+) -> None:
+    from gpu_fault.admin.workflow_reconcile import REFERENCE_PATTERN
+    from gpu_fault.admin.workflow_reconcile_departed_agents import ACCEPT_REASON_LIMIT
+
+    run_id = destr020.run_identity(
+        tmp_path / "regional-acceptance-20261016T0000Z-r9-eks", 1
+    )
+    reference = verdicts.departed_alias_reference(run_id)
+    reason = verdicts.departed_alias_reason(run_id, verdicts.alias_for_run(run_id))
+
+    assert reference == f"{destr020.CASE_ID}/{run_id}/departed-alias", reference
+    assert REFERENCE_PATTERN.fullmatch(reference), "the CLI must accept it"
+    assert len(reason) <= ACCEPT_REASON_LIMIT, len(reason)
+    assert destr020.CASE_ID in reason and run_id in reason, reason
+    assert verdicts.alias_for_run(run_id) in reason, reason
+
+
+def test_the_departed_budget_follows_the_products_guard_and_cadence() -> None:
+    from gpu_fault.departed_node_cleanup import CLEANUP_INTERVAL_SECONDS
+    from gpu_fault.departed_nodes import DEPARTED_AGENT_GUARD_AGE
+
+    assert verdicts.DEPARTED_GUARD_SECONDS == (
+        DEPARTED_AGENT_GUARD_AGE.total_seconds()
+    ), "the exit retires an Agent only past the product's guard"
+    assert verdicts.DEPARTED_CLEANUP_INTERVAL_SECONDS == CLEANUP_INTERVAL_SECONDS
+    assert verdicts.DEPARTED_EXIT_BUDGET_SECONDS == (
+        verdicts.DEPARTED_GUARD_SECONDS + verdicts.DEPARTED_MARGIN_SECONDS
+    ), "bounded: the guard plus three cleanup cycles"
+    assert verdicts.DEPARTED_READBACK_SECONDS >= 2 * CLEANUP_INTERVAL_SECONDS
+
+
+def test_the_lock_refusal_the_case_retries_is_the_products_own(tmp_path: Path) -> None:
+    from gpu_fault.admin.operation_lock import SiteOperationBusy, site_operation_lock
+
+    with site_operation_lock(tmp_path, wait=False):
+        with pytest.raises(SiteOperationBusy) as busy:
+            with site_operation_lock(tmp_path, wait=False):
+                pass
+
+    assert verdicts.ADMIN_LOCK_BUSY in str(busy.value), str(busy.value)
+
+
+def _exit_item(**overrides: Any) -> dict[str, Any]:
+    item: dict[str, Any] = {
+        "cluster_id": "cluster-a",
+        "node_id": ALIAS,
+        "retire": False,
+        "kubernetes_reports": {"open": True, "never_reported": True},
+        "kubernetes_reports_read": {
+            "chain_started_at": "2026-10-16T18:00:00+00:00",
+            "opens_at": None,
+        },
+        "eligible": False,
+        "reasons": [],
+    }
+    item.update(overrides)
+    return item
+
+
+@pytest.mark.parametrize(
+    ("overrides", "expected"),
+    [
+        pytest.param({}, None, id="revoked-or-no-record-nothing-to-wait-on"),
+        pytest.param(
+            {
+                "retire": True,
+                "last_seen_at": "2026-10-16T21:05:00Z",
+                "lease_expires_at": "2026-10-16T21:07:00+00:00",
+            },
+            "2026-10-16T21:15:00+00:00",
+            id="agent-guard",
+        ),
+        pytest.param(
+            {
+                "retire": True,
+                "last_seen_at": "2026-10-16T21:05:00+00:00",
+                "lease_expires_at": "2026-10-16T21:20:00+00:00",
+            },
+            "2026-10-16T21:20:00+00:00",
+            id="agent-lease",
+        ),
+        pytest.param(
+            {
+                "kubernetes_reports": {"open": False, "never_reported": True},
+                "kubernetes_reports_read": {
+                    "chain_started_at": "2026-10-16T21:08:00+00:00"
+                },
+            },
+            "2026-10-16T21:18:00+00:00",
+            id="short-report-chain",
+        ),
+        pytest.param(
+            {
+                "kubernetes_reports": {"open": False, "never_reported": False},
+                "kubernetes_reports_read": {
+                    "chain_started_at": "2026-10-16T18:00:00+00:00",
+                    "opens_at": "2026-10-17T21:00:00+00:00",
+                },
+            },
+            "2026-10-17T21:00:00+00:00",
+            id="listed-node-24-hours",
+        ),
+    ],
+)
+def test_the_wait_is_read_from_the_dry_runs_own_timestamps(
+    overrides: dict[str, Any], expected: str | None
+) -> None:
+    from datetime import timedelta
+
+    opens = verdicts.departed_exit_opens_at(
+        _exit_item(**overrides), guard=timedelta(seconds=600)
+    )
+
+    assert opens == verdicts.parse_time(expected), opens
+
+
+@pytest.mark.parametrize(
+    ("readback", "fragment"),
+    [
+        pytest.param({"ledger": None}, None, id="gone"),
+        pytest.param({"ledger": {"status": "CLEANED"}}, None, id="cleaned"),
+        pytest.param(
+            {
+                "ledger": {
+                    "status": "REFUSED",
+                    "blocker_classes": ["provider_identity_unknown"],
+                    "blockers": ["provider membership unknown: ..."],
+                }
+            },
+            "still lists",
+            id="refused",
+        ),
+        pytest.param(
+            {"ledger": {"status": "PENDING", "blockers": []}},
+            "no blocker class",
+            id="pending",
+        ),
+    ],
+)
+def test_the_alias_must_end_without_a_departed_node_ledger_line(
+    readback: dict[str, Any], fragment: str | None
+) -> None:
+    errors = verdicts.departed_ledger_errors(readback, alias=ALIAS)
+
+    assert (errors == []) is (fragment is None), errors
+    assert fragment is None or fragment in _text(errors), errors
+
+
+@pytest.mark.parametrize(
+    ("attempt", "fragment"),
+    [
+        pytest.param(
+            {
+                "returncode": 0,
+                "result": {"accepted_identities": [f"cluster-a/{ALIAS}"]},
+            },
+            None,
+            id="accepted",
+        ),
+        pytest.param(
+            {"returncode": 2, "result": None, "refusal": "exit 2: refuses ineligible"},
+            "refuses ineligible",
+            id="refused",
+        ),
+        pytest.param(
+            {
+                "returncode": 1,
+                "result": {
+                    "failed_agents": [f"cluster-a/{ALIAS}"],
+                    "failures": {f"cluster-a/{ALIAS}": "ValueError: plan again"},
+                },
+            },
+            "plan again",
+            id="failed-in-the-pod",
+        ),
+        pytest.param(
+            {"returncode": 0, "result": {"accepted_identities": []}},
+            "recorded no acceptance",
+            id="nothing-accepted",
+        ),
+    ],
+)
+def test_an_apply_must_record_the_acceptance_of_the_alias(
+    attempt: dict[str, Any], fragment: str | None
+) -> None:
+    errors = verdicts.departed_apply_errors(attempt, key=f"cluster-a/{ALIAS}")
+
+    assert (errors == []) is (fragment is None), errors
+    assert fragment is None or fragment in _text(errors), errors
+
+
+def test_an_eligible_item_must_name_the_cases_own_cluster() -> None:
+    assert verdicts.departed_plan_errors(_exit_item(), cluster_id="cluster-a") == []
+    errors = verdicts.departed_plan_errors(_exit_item(), cluster_id="cluster-b")
+    assert any("not the case's cluster-b" in item for item in errors), errors
+
+
+def test_the_admin_cli_is_read_in_its_own_words() -> None:
+    printed = 'gpu-fault-admin: note\n{\n  "items": [],\n  "mode": "plan"\n}\n'
+    stderr = (
+        "gpu-fault-admin: retire-departed-agents refuses ineligible Agents: x\n"
+        "gpu-fault-admin: full output in /state/logs/mutating/admin.log\n"
+    )
+
+    assert verdicts.admin_document(printed) == {"items": [], "mode": "plan"}
+    assert verdicts.admin_document("no document") is None
+    assert verdicts.admin_document("{ truncated") is None
+    assert verdicts.admin_refusal(2, "", stderr) == (
+        "exit 2: retire-departed-agents refuses ineligible Agents: x"
+    )
+    assert verdicts.admin_refusal(1, "", "") == "exit 1: no output"
+
+
+def test_configure_binds_the_administrator_state_directory(tmp_path: Path) -> None:
+    cpu = tmp_path / "cpu.kubeconfig"
+    gpu = tmp_path / "gpu.kubeconfig"
+    cpu.write_text("apiVersion: v1\n", encoding="utf-8")
+    gpu.write_text("apiVersion: v1\n", encoding="utf-8")
+    base = [
+        "--run-dir",
+        str(tmp_path),
+        "--cpu-kubeconfig",
+        str(cpu),
+        "--gpu-kubeconfig",
+        str(gpu),
+        "--gpu-context",
+        "ctx",
+        "--cluster-id",
+        "cluster-a",
+        "--region",
+        "us-west-2",
+        "--reference-node",
+        REFERENCE,
+    ]
+    state = tmp_path / "state"
+    with_state = [*base, "--admin-state-dir", str(state)]
+
+    with pytest.raises(Exception, match="--admin-state-dir is required"):
+        destr020.configure(destr020.parser().parse_args(base))
+    with pytest.raises(Exception, match="holds no site.yaml"):
+        destr020.configure(destr020.parser().parse_args(with_state))
+    state.mkdir()
+    (state / "site.yaml").write_text("site: test\n", encoding="utf-8")
+    settings = destr020.configure(destr020.parser().parse_args(with_state))
+
+    assert settings.admin_state_dir == state.resolve(), settings
+
+
+def _pod(
+    monkeypatch: pytest.MonkeyPatch,
+    store: Any,
+    script: str,
+    argv: list[str],
+    *,
+    registry: Any = None,
+    stdin: str = "",
+) -> dict[str, Any]:
+    """Run a CPU Pod script on an in-memory control plane."""
+
+    import io
+    import sys
+
+    from gpu_fault.app import ApplicationContext
+
+    context = ApplicationContext(store=store, fleet_registry=registry)
+    output = io.StringIO()
+    with monkeypatch.context() as scoped:
+        scoped.setattr(
+            ApplicationContext, "from_environment", classmethod(lambda cls: context)
+        )
+        scoped.setattr(sys, "argv", ["<pod>", *argv])
+        scoped.setattr(sys, "stdin", io.StringIO(stdin))
+        scoped.setattr(sys, "stdout", output)
+        exec(compile(script, "<pod>", "exec"), {})
+    return dict(json.loads(output.getvalue()))
+
+
+def _alias_residue(store: Any, *, revoked_agent: bool) -> Any:
+    """What the alias XID leaves, as the live round-9 run left it: the alias's
+    ESCALATED incident (FAILED isolation) and its support pair (SUCCEEDED), no
+    Agent record -- or the one the case's cleanup revoked a minute ago, well
+    inside the 10-minute guard, which binds only an Agent the exit retires."""
+
+    from gpu_fault.fleet import AgentLifecycleState
+    from gpu_fault.models import IncidentState, WorkflowOperation, WorkflowStatus
+    from tests._builders import fault_incident, workflow_request, workflow_step
+    from tests.departed_nodes._support import (
+        EKS_CLUSTER,
+        EKS_PRESENT,
+        agent,
+        ago,
+        registration,
+        world,
+    )
+
+    plane = world(store)
+    store.save_regional_cluster(registration(EKS_CLUSTER, provider="eks-managed"))
+    if revoked_agent:
+        store.save_agent(
+            agent(
+                EKS_CLUSTER,
+                ALIAS,
+                instance_id=None,
+                last_seen=ago(minutes=1),
+                lifecycle=AgentLifecycleState.REVOKED,
+            )
+        )
+    for incident_id, request_id, status in (
+        (INCIDENT, WORKFLOW, WorkflowStatus.FAILED),
+        (SUPPORT_INCIDENT, SUPPORT_WORKFLOW, WorkflowStatus.SUCCEEDED),
+    ):
+        store.save_workflow(
+            workflow_request(
+                request_id,
+                incident_id,
+                status=status,
+                official_steps=[
+                    workflow_step(WorkflowOperation.FREEZE_EVIDENCE, node_ids=[ALIAS])
+                ],
+                created_at=ago(minutes=5),
+                updated_at=ago(minutes=3),
+            )
+        )
+        store.save_incident(
+            fault_incident(
+                incident_id,
+                f"event-{incident_id}",
+                cluster_id=EKS_CLUSTER,
+                node_ids=[ALIAS],
+                state=IncidentState.ESCALATED,
+                workflow_request_id=request_id,
+            )
+        )
+    plane.reports_since(EKS_CLUSTER, [EKS_PRESENT], minutes=15)
+    return plane
+
+
+OPERATOR = "arn:aws:sts::123456789012:assumed-role/Admin/destr020"
+
+
+def _deploy_host_cli(
+    monkeypatch: pytest.MonkeyPatch, plane: Any, state_dir: Path
+) -> tuple[list[list[str]], Any]:
+    """The site's ``gpu-fault-admin``, in process: the real CLI parser and the
+    real ``workflow-reconcile --retire-departed-agents`` path, whose in-Pod
+    script runs on the in-memory control plane and whose GPU node read sees
+    one real node, never the alias."""
+
+    import subprocess
+    from types import SimpleNamespace
+
+    from gpu_fault.admin import cli, operator_identity
+    from gpu_fault.admin import workflow_reconcile as reconcile
+    from gpu_fault.admin import workflow_reconcile_departed_agents as departed
+    from gpu_fault.admin.bootstrap_common import BootstrapError
+    from scripts.e2e.regional.admin_cli import admin_command
+    from tests.departed_nodes._support import EKS_CLUSTER, EKS_PRESENT
+
+    site = SimpleNamespace(
+        release_config={
+            "site_name": "staging",
+            "aws_region": "us-west-2",
+            "cpu_eks_arn": "arn:aws:eks:us-west-2:123456789012:cluster/cpu-control",
+            "clusters": [
+                {
+                    "cluster_id": EKS_CLUSTER,
+                    "context": "gpu-eks-context",
+                    "provider": "eks-managed",
+                    "region": "us-west-2",
+                }
+            ],
+        },
+        environment={"KUBECONFIG": str(state_dir / "gpu.kubeconfig")},
+        source_sha256="a" * 64,
+    )
+    monkeypatch.setattr(
+        operator_identity, "caller_identity_arn", lambda **_kwargs: OPERATOR
+    )
+    monkeypatch.setattr(
+        departed,
+        "run_pod_script",
+        lambda _site, payload: _pod(
+            monkeypatch,
+            plane.store,
+            departed.AGENT_SCRIPT,
+            [],
+            registry=plane.registry,
+            stdin=json.dumps(payload),
+        ),
+    )
+
+    def gpu_nodes(command: list[str], **_options: Any) -> SimpleNamespace:
+        assert command[0] == "kubectl", "an unknown identity is never put to AWS"
+        node = {
+            "metadata": {"name": EKS_PRESENT, "annotations": {}},
+            "spec": {"unschedulable": False, "taints": []},
+        }
+        return SimpleNamespace(
+            returncode=0, stdout=json.dumps({"items": [node]}), stderr=""
+        )
+
+    monkeypatch.setattr(reconcile, "run_command", gpu_nodes)
+    commands: list[list[str]] = []
+
+    def run(command: list[str], **_options: Any) -> subprocess.CompletedProcess[str]:
+        prefix = admin_command(state_dir)
+        assert command[: len(prefix)] == prefix, command
+        commands.append(command[len(prefix) :])
+        arguments = cli.parser().parse_args(command[len(prefix) :])
+        try:
+            result = departed.retire_departed_agents_command(
+                arguments, site=site, state_dir=state_dir
+            )
+        except BootstrapError as exc:
+            return subprocess.CompletedProcess(
+                command, 2, "", f"gpu-fault-admin: {exc}\n"
+            )
+        code = 1 if result.get("failed_agents") else 0
+        return subprocess.CompletedProcess(
+            command, code, json.dumps(result, indent=2, sort_keys=True), ""
+        )
+
+    return commands, run
+
+
+class _CleanupCycles:
+    """The case's clock; each sleep is the departed-node cleanup's next cycle."""
+
+    def __init__(self, plane: Any) -> None:
+        self.plane = plane
+        self.elapsed = 0.0
+
+    def monotonic(self) -> float:
+        return self.elapsed
+
+    def sleep(self, seconds: float) -> None:
+        self.elapsed += seconds
+        self.plane.cleanup.run_once()
+
+
+@pytest.mark.parametrize("revoked_agent", [False, True])
+def test_the_case_takes_the_real_exit_and_the_cleanup_ends_the_alias(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, revoked_agent: bool
+) -> None:
+    """The live shape, offline: the real departed-node cleanup lists the alias,
+    the case runs the real ``workflow-reconcile`` exit through the real CLI
+    parser and in-Pod script, and the next real cycle ends the line CLEANED."""
+
+    from datetime import datetime, timezone
+    from types import SimpleNamespace
+
+    from gpu_fault.departed_node_cleanup_actions import accept_identity_command
+    from gpu_fault.departed_nodes import DepartedNodeCleanupStatus
+    from gpu_fault.models import IncidentState
+    from tests._builders import build_store
+    from tests.departed_nodes._support import EKS_CLUSTER
+
+    store = build_store()
+    plane = _alias_residue(store, revoked_agent=revoked_agent)
+    [line] = plane.cleanup.run_once()
+    assert line.blocker_classes == ["provider_identity_unknown"], line.blockers
+    assert line.admin_commands == [accept_identity_command(ALIAS)], line
+    state_dir = tmp_path / "state"
+    commands, deploy_host_cli = _deploy_host_cli(monkeypatch, plane, state_dir)
+    monkeypatch.setattr(destr020, "time", _CleanupCycles(plane))
+    run = SimpleNamespace(
+        settings=SimpleNamespace(
+            admin_state_dir=state_dir, regional=SimpleNamespace(cluster_id=EKS_CLUSTER)
+        ),
+        regional=SimpleNamespace(
+            run=deploy_host_cli,
+            cpu_python=lambda script, *argv: _pod(
+                monkeypatch, store, script, list(argv)
+            ),
+        ),
+        alias=ALIAS,
+        run_id=RUN_ID,
+        case_dir=tmp_path,
+        injected_at=datetime.now(timezone.utc),
+    )
+
+    evidence = destr020.accept_alias_departure(
+        run,  # type: ignore[arg-type]
+        {
+            "found": revoked_agent,
+            "lifecycle_state": "REVOKED" if revoked_agent else None,
+        },
+    )
+
+    reason = verdicts.departed_alias_reason(RUN_ID, ALIAS)
+    reference = verdicts.departed_alias_reference(RUN_ID)
+    assert evidence["outcome"] == "accepted", evidence.get("error")
+    assert commands == [
+        destr020.departed_exit_argv(state_dir, ALIAS, reason, reference=None),
+        destr020.departed_exit_argv(state_dir, ALIAS, reason, reference=reference),
+    ], commands
+    [acceptance] = store.list_departed_node_identity_acceptances(EKS_CLUSTER)
+    assert acceptance.change_reference == reference, acceptance
+    assert acceptance.reason == reason and acceptance.actor == OPERATOR, acceptance
+    [after] = store.list_departed_node_cleanups(EKS_CLUSTER)
+    assert after.status is DepartedNodeCleanupStatus.CLEANED, after.blockers
+    for incident_id in (INCIDENT, SUPPORT_INCIDENT):
+        state = store.get_incident(incident_id).state
+        assert state is IncidentState.RECOVERED, (incident_id, state)
+    assert [item["status"] for item in evidence["readback"]] == ["REFUSED", "CLEANED"]
+    assert evidence["ledger_before"]["ledger"]["status"] == "REFUSED", evidence
+    assert evidence["ledger_after"]["acceptance"]["change_reference"] == reference
+    [_dry_run, apply] = evidence["attempts"]
+    assert apply["result"]["retired_agents"] == [], "a revoked record stays as it is"
+    assert plane.provider.calls == [], "nothing is ever put to the provider"
+    saved = json.loads((tmp_path / destr020.DEPARTED_EVIDENCE).read_text())
+    assert saved["outcome"] == "accepted" and saved["reference"] == reference, saved
+
+
+def test_the_ledger_read_back_reads_the_alias_line_and_acceptance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime, timezone
+
+    from gpu_fault.departed_nodes import (
+        DepartedNodeCleanupRecord,
+        DepartedNodeCleanupStatus,
+        DepartedNodeIdentityAcceptance,
+    )
+    from tests._builders import build_store
+
+    store = build_store()
+    now = datetime.now(timezone.utc)
+    assert _pod(
+        monkeypatch, store, destr020.ALIAS_DEPARTED_LEDGER, ["cluster-a", ALIAS]
+    ) == {"acceptance": None, "ledger": None}
+    for node in (ALIAS, "node-b"):
+        store.save_departed_node_cleanup(
+            DepartedNodeCleanupRecord(
+                cluster_id="cluster-a",
+                node_id=node,
+                status=DepartedNodeCleanupStatus.REFUSED,
+                blockers=["provider membership unknown"],
+                blocker_classes=["provider_identity_unknown"],
+                first_seen_at=now,
+                updated_at=now,
+            )
+        )
+    store.save_departed_node_identity_acceptance(
+        DepartedNodeIdentityAcceptance(
+            cluster_id="cluster-a",
+            node_id=ALIAS,
+            change_reference="CHG-1",
+            actor="ops",
+            reason="alias",
+            accepted_at=now,
+        )
+    )
+
+    result = _pod(
+        monkeypatch, store, destr020.ALIAS_DEPARTED_LEDGER, ["cluster-a", ALIAS]
+    )
+
+    assert result["ledger"]["status"] == "REFUSED", result
+    assert result["ledger"]["blocker_classes"] == ["provider_identity_unknown"]
+    assert "evidence" not in result["ledger"], "only the verdict fields travel"
+    assert result["acceptance"]["change_reference"] == "CHG-1", result
+
+
+def test_an_agent_item_without_timestamps_gives_nothing_to_wait_on() -> None:
+    from datetime import timedelta
+
+    item = _exit_item(retire=True, kubernetes_reports_read={})
+
+    assert verdicts.departed_exit_opens_at(item, guard=timedelta(minutes=10)) is None
+    assert verdicts.departed_alias_item({"items": ["junk"]}, ALIAS) is None
+    assert verdicts.departed_alias_item(None, ALIAS) is None

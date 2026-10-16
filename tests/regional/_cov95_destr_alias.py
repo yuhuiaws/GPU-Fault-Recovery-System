@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from copy import deepcopy
 from datetime import timedelta
 from pathlib import Path
@@ -13,11 +14,163 @@ from scripts.e2e.regional import run_destr020_identity_mismatch_isolation as cas
 from tests.regional._cov95_destr_branches import ready_runtime
 from tests.regional._cov95_destr_warm import NOW, Clock, regional_settings
 
+LOCK_BUSY = (
+    "gpu-fault-admin: another administrator mutation is in progress (held by "
+    "pid 4242: gpu-fault-admin config --state-dir /state)\n"
+    "gpu-fault-admin: full output in /state/logs/mutating/admin.log\n"
+)
+# A product answer: "lock", ("refuse", message), a JSON document (exit 0),
+# (returncode, document) or a callable of the harness returning one of them.
+Answer = Any
+
+
+def eligible_item(alias: str, **overrides: Any) -> dict[str, Any]:
+    """The dry run's item for an alias the exit accepts (no Agent to retire)."""
+
+    item: dict[str, Any] = {
+        "agent": f"cluster-a/{alias}",
+        "cluster_id": "cluster-a",
+        "node_id": alias,
+        "terminalization": "accept-unknown-provider-identity",
+        "retire": False,
+        "kubernetes_reports": {"open": True, "never_reported": True},
+        "kubernetes_reports_read": {
+            "absent_since": (NOW - timedelta(hours=3)).isoformat(),
+            "chain_started_at": (NOW - timedelta(hours=3)).isoformat(),
+            "received_at": NOW.isoformat(),
+            "opens_at": None,
+        },
+        "eligible": True,
+        "reasons": [],
+    }
+    item.update(overrides)
+    return item
+
+
+def nothing_names(alias: str) -> dict[str, Any]:
+    return {
+        "agent": alias,
+        "node_id": alias,
+        "terminalization": "accept-unknown-provider-identity",
+        "eligible": False,
+        "reasons": [f"{verdicts.NOTHING_NAMES_THE_NODE} in any managed cluster"],
+    }
+
+
+def accepted(alias: str) -> dict[str, Any]:
+    return {
+        "mode": "retire-departed-agents-apply",
+        "retired_agents": [],
+        "accepted_identities": [f"cluster-a/{alias}"],
+        "failed_agents": [],
+        "failures": {},
+        "reference": "applied",
+        "dry_run": False,
+    }
+
+
+class DepartedExit:
+    """The product's departed-node exit for the alias, as its CLI answers it.
+
+    ``line`` is the alias's ledger line before the acceptance (None: none);
+    ``plans`` and ``applies`` script the dry runs and the applies in order
+    (the last answer repeats). An apply that accepts starts the cleanup's
+    clock: ``cycle`` seconds later its next cycle ends the line as ``ends``
+    says -- ``CLEANED``, ``gone`` or ``stuck`` (still REFUSED).
+    """
+
+    def __init__(self, harness: AliasHarness) -> None:
+        self.h = harness
+        self.line: dict[str, Any] | None = {
+            "status": "REFUSED",
+            "blocker_classes": ["provider_identity_unknown"],
+            "blockers": [
+                "provider membership unknown: the fleet recorded no EC2 instance "
+                "id for the node (Agent node_instance_id); the administrator may "
+                "accept the departure"
+            ],
+            "admin_commands": ["gpu-fault-admin workflow-reconcile ..."],
+            "actions": [],
+        }
+        self.plans: list[Answer] = [eligible_item(harness.alias)]
+        self.applies: list[Answer] = [accepted(harness.alias)]
+        self.cycle = 0.0
+        self.ends = "CLEANED"
+        self.accepted_at: float | None = None
+
+    def answer(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+        dry_run = "--dry-run" in argv
+        queue = self.plans if dry_run else self.applies
+        reply = queue.pop(0) if len(queue) > 1 else queue[0]
+        if callable(reply):
+            reply = reply(self.h)
+        if reply == "lock":
+            return subprocess.CompletedProcess(argv, 2, "", LOCK_BUSY)
+        if isinstance(reply, tuple) and reply[0] == "refuse":
+            return subprocess.CompletedProcess(
+                argv, 2, "", f"gpu-fault-admin: {reply[1]}\n"
+            )
+        code, document = reply if isinstance(reply, tuple) else (0, reply)
+        if dry_run and "items" not in document:
+            document = {
+                "mode": "accept-unknown-provider-identity-plan",
+                "evaluated_at": self.h.clock.now().isoformat(),
+                "discovery": {
+                    "named": 1,
+                    "eligible": int(bool(document.get("eligible"))),
+                },
+                "items": [document],
+                "plan_sha256": "a" * 64,
+                "dry_run": True,
+            }
+        if not dry_run and code == 0 and document.get("accepted_identities"):
+            self.accepted_at = self.h.clock.elapsed
+        return subprocess.CompletedProcess(
+            argv, code, json.dumps(document, indent=2), ""
+        )
+
+    def ledger(self) -> dict[str, Any]:
+        line = deepcopy(self.line)
+        done = (
+            self.accepted_at is not None
+            and self.h.clock.elapsed - self.accepted_at >= self.cycle
+        )
+        if done and self.ends == "gone":
+            line = None
+        elif done and self.ends == "CLEANED" and line is not None:
+            line.update(
+                status="CLEANED",
+                blockers=[],
+                blocker_classes=[],
+                admin_commands=[],
+                actions=[
+                    "incident-closed:incident-owned",
+                    "incident-closed:support-owned",
+                ],
+            )
+        acceptance = (
+            {"change_reference": "applied", "actor": "case"}
+            if self.accepted_at is not None
+            else None
+        )
+        return {"ledger": line, "acceptance": acceptance}
+
 
 class AliasHarness:
     def __init__(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        # The site's state directory with its own deploy-host CLI.
+        state_dir = tmp_path / "state"
+        (state_dir / "deployer-venv" / "bin").mkdir(parents=True, exist_ok=True)
+        (state_dir / "deployer-venv" / "bin" / "gpu-fault-admin").write_text(
+            "fake deploy-host CLI\n", encoding="utf-8"
+        )
+        (state_dir / "site.yaml").write_text("fake site\n", encoding="utf-8")
         self.settings = case.Settings(
-            regional_settings(tmp_path), "node-a", tmp_path / "predecessor.json", 30
+            regional_settings(tmp_path),
+            "node-a",
+            tmp_path / "predecessor.json",
+            30,
+            state_dir,
         )
         self.alias = verdicts.alias_for_run(case.run_identity(tmp_path, 1))
         self.clock = Clock()
@@ -126,6 +279,7 @@ class AliasHarness:
             "second_order_workflow": None,
         }
         self.events: list[dict[str, Any]] = []
+        self.departed = DepartedExit(self)
         self.regional = AliasRegional(self)
         monkeypatch.setattr(case, "RegionalLiveFixture", lambda _s: self.regional)
         monkeypatch.setattr(
@@ -249,7 +403,22 @@ class AliasRegional:
             self.h.call("alias.agent.cleanup", args)
             cluster_id, alias, transition_id, reason = args
             return self.h.alias_agent_cleanup(cluster_id, alias, transition_id, reason)
+        if script == case.ALIAS_DEPARTED_LEDGER:
+            self.h.call("departed.ledger", args)
+            assert args == ("cluster-a", self.h.alias), args
+            return self.h.departed.ledger()
         raise AssertionError("unexpected fake CPU request")
+
+    def run(
+        self, command: list[str], **kwargs: Any
+    ) -> subprocess.CompletedProcess[str]:
+        """The deploy-host CLI: only the departed-node exit for the alias."""
+
+        cli = case.admin_command(self.h.settings.admin_state_dir)
+        assert command[: len(cli)] == cli, command
+        argv = list(command[len(cli) :])
+        self.h.call("admin.dry-run" if "--dry-run" in argv else "admin.apply", argv)
+        return self.h.departed.answer(argv)
 
     def node_metadata(self, node: str) -> dict[str, Any]:
         self.h.call("metadata", node)

@@ -12439,7 +12439,8 @@ the ledger migrates in place, and the next real command leaves a complete audit 
   `scripts/e2e/regional/run_destr020_identity_mismatch_isolation.py`. By default it only generates the
   plan; before execute it must read `DESTR-001=PASS` (the same K8s adapter path has already been
   walked on a real node, so a failure on the alias can be attributed to identity), and it requires a real reference node (only its
-  `product` and runtime profile version are read, to build a valid payload):
+  `product` and runtime profile version are read, to build a valid payload) and the site's state directory `--admin-state-dir`
+  (with its `site.yaml`; the cleanup takes the departed-node exit through its deploy-host CLI):
 
   ```bash
   python3 scripts/e2e/regional/run_destr020_identity_mismatch_isolation.py \
@@ -12451,6 +12452,7 @@ the ledger migrates in place, and the next real command leaves a complete audit 
     --namespace "${NAMESPACE}" --cluster-id "${CLUSTER_ID}" \
     --region "${AWS_REGION}" \
     --reference-node "${NODE}" \
+    --admin-state-dir "${STATE_DIR}" \
     --predecessor-evidence "${PREDECESSOR_EVIDENCE_DIR}"
 
   python3 scripts/e2e/regional/run_destr020_identity_mismatch_isolation.py \
@@ -12464,6 +12466,7 @@ the ledger migrates in place, and the next real command leaves a complete audit 
     --namespace "${NAMESPACE}" --cluster-id "${CLUSTER_ID}" \
     --region "${AWS_REGION}" \
     --reference-node "${NODE}" \
+    --admin-state-dir "${STATE_DIR}" \
     --predecessor-evidence "${PREDECESSOR_EVIDENCE_DIR}"
   ```
 
@@ -12526,21 +12529,36 @@ the ledger migrates in place, and the next real command leaves a complete audit 
   is not `REVOKED` (nor no record at all) is a FAIL: a live Agent record for a node that never existed keeps the
   departed-node cleanup's ledger and every release's Agent coverage check on it. Then fleet snapshot comparison +
   runtime identity comparison.
+  Last, the case is the administrator for its own alias and takes the departed-node exit: the leftover incidents name the
+  alias, so the departed-node cleanup lists it in its ledger (`provider_identity_unknown`) and never ends that line by itself.
+  Through the deploy-host CLI of the site `--admin-state-dir` names (`admin_cli.admin_command`:
+  `<state-dir>/deployer-venv/bin/gpu-fault-admin`) it runs the command the ledger gives: first
+  `gpu-fault-admin workflow-reconcile --state-dir <state-dir> --retire-departed-agents --node <alias>
+  --accept-unknown-provider-identity --reason <case, run id and why> --dry-run`, polled until the product's plan calls the
+  alias `eligible` -- the product alone judges eligibility; how long to wait is read from the plan item's own timestamps (an
+  Agent record the exit would retire past the 10-minute guard with its lease expired, a node report chain spanning the
+  guard), capped at the guard plus three cleanup cycles; then once without `--dry-run` and with
+  `--reference GF-REGIONAL-DESTR-020/<run id>/departed-alias`; then the ledger is read back in the CPU Pod, and the alias's
+  line must be gone or `CLEANED` within five cleanup cycles (the cleanup then closes the two leftover incidents). All of it
+  is written to `alias-departed-acceptance.json`. The site's administrator lock (`another administrator mutation is in
+  progress`) is retried within the cap; any other refusal, an exit that does not open within the cap, or a ledger line that
+  does not end is a FAIL naming the product's reason, and is never retried with weaker flags. When the case posted no XID
+  and found no Agent record for the alias, or when at the deadline neither a ledger line nor an Agent record names it, the
+  step is recorded as a no-op.
 - Known limitations:
   - The support workflow on an unknown alias proves only **refusal**, not **isolation**: it neither cordons nor
     quarantines, SUCCEEDED means "evidence frozen, handed to a human", the alias exists in no system,
     so there is no isolation outcome to check; positive isolation on real nodes is covered by `DESTR-001`/`DESTR-002`.
     `containment_refused_escalations_total`/`escalation_chain_terminated_total`
     are counted only inside the escalation service process and are not wired to `/metrics`, the runner cannot read them, so they are not asserted.
-  - The leftover FAILED/ESCALATED control records do not leave on their own (control-record retention is off), the same
-    precedent as `DESTR-012` group D; the evidence states the IDs.
-  - The leftover ESCALATED incident names the alias, so the control plane's departed-node cleanup lists the alias in
-    its ledger (`provider_identity_unknown`: the alias carries no instance id, the provider cannot be asked) and never
-    ends it by itself. Once the report chain covers the 10-minute guard the ledger gives the administrator's exit
-    `gpu-fault-admin workflow-reconcile --state-dir <state-dir> --retire-departed-agents --node <alias>
-    --accept-unknown-provider-identity --reason <why>` (`--dry-run` first, then with `--reference`; Administrator
-    Operations §10.2), after which the cleanup's next cycle closes those leftover records. The case itself does not
-    take that exit: the leftovers are evidence, ended by the administrator after checking them.
+  - The leftover FAILED/SUCCEEDED workflow records do not leave on their own (control-record retention is off), the same
+    precedent as `DESTR-012` group D; the evidence states the IDs; the two ESCALATED incidents are closed by the
+    departed-node cleanup once the case has accepted the alias's departure.
+  - Only the administrator's exit `--accept-unknown-provider-identity` (Administrator Operations §10.2) ends the alias's
+    departed-node ledger line (`provider_identity_unknown`: the alias carries no instance id, the provider cannot be asked);
+    the case takes it for its own alias at the end of its cleanup, so a successful cleanup leaves no open ledger line (it
+    ends `CLEANED` or gone) and `GpuFaultDepartedNodeCleanupStuck` never fires for the alias; when the exit is refused or
+    runs out of its cap the line is left to the administrator, with the reason in the evidence.
 
 ### GF-REGIONAL-DESTR-021
 

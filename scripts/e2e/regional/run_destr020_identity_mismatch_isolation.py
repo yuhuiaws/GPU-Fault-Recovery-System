@@ -22,7 +22,14 @@ registered one, is the case's own residue: the cleanup revokes it through the
 fleet registry's drain/revoke under a transition named after the run and
 reads it back REVOKED, or the case FAILs (a live Agent for a node that never
 existed keeps the departed-node cleanup's ledger and every release's Agent
-coverage on it).
+coverage on it). The incidents name the alias, a node absent from Kubernetes,
+so the departed-node cleanup lists it as ``provider_identity_unknown`` and
+leaves that line to the administrator. Last, the case is that administrator
+for its own alias: through the site's deploy-host CLI it takes the exit the
+ledger names (``workflow-reconcile --retire-departed-agents --node <alias>
+--accept-unknown-provider-identity``: the dry run until the product calls the
+alias eligible, then the apply under ``<case>/<run id>/departed-alias``) and
+reads the line back gone or CLEANED, or the case FAILs.
 """
 
 from __future__ import annotations
@@ -48,6 +55,7 @@ from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
     write_json_atomic,
 )
+from scripts.e2e.regional.admin_cli import admin_command  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     add_live_arguments,
     authorize_execution,
@@ -212,6 +220,51 @@ print(
 )
 """
 
+# The alias's line in the departed-node ledger and the administrator's
+# acceptance of its departure, as the control plane holds them. Argv: cluster
+# id, alias.
+ALIAS_DEPARTED_LEDGER = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+
+cluster_id, alias = sys.argv[1:3]
+store = ApplicationContext.from_environment().store
+LINE = {
+    "status",
+    "reference",
+    "blockers",
+    "blocker_classes",
+    "admin_commands",
+    "actions",
+    "first_seen_at",
+    "updated_at",
+    "cleaned_at",
+}
+ACCEPTANCE = {"change_reference", "actor", "reason", "accepted_at"}
+
+
+def alias_record(records, fields):
+    for record in records:
+        if record.node_id == alias:
+            return record.model_dump(mode="json", include=fields)
+    return None
+
+
+print(
+    json.dumps(
+        {
+            "ledger": alias_record(store.list_departed_node_cleanups(cluster_id), LINE),
+            "acceptance": alias_record(
+                store.list_departed_node_identity_acceptances(cluster_id), ACCEPTANCE
+            ),
+        },
+        sort_keys=True,
+    )
+)
+"""
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -219,6 +272,9 @@ class Settings:
     reference_node: str
     predecessor_path: Path
     chain_watch_seconds: int
+    # The site's state directory; the cleanup takes the departed-node exit for
+    # the alias through its deploy-host CLI (``admin_cli.admin_command``).
+    admin_state_dir: Path
 
     def environment(self) -> dict[str, str]:
         return {
@@ -241,6 +297,17 @@ def configure(arguments: argparse.Namespace) -> Settings:
     )
     if not 30 <= int(arguments.chain_watch_seconds) <= 900:
         raise RegionalFixtureError("chain watch seconds is outside 30..900")
+    admin_state_dir = (
+        Path(required(str(arguments.admin_state_dir or ""), "--admin-state-dir"))
+        .expanduser()
+        .resolve()
+    )
+    if not (admin_state_dir / "site.yaml").is_file():
+        raise RegionalFixtureError(
+            f"--admin-state-dir {admin_state_dir} holds no site.yaml; the cleanup "
+            "takes the departed-node exit for the alias through that site's "
+            "gpu-fault-admin"
+        )
     return Settings(
         regional=settings_from_arguments(arguments),
         reference_node=required(
@@ -249,6 +316,7 @@ def configure(arguments: argparse.Namespace) -> Settings:
         ),
         predecessor_path=predecessor,
         chain_watch_seconds=int(arguments.chain_watch_seconds),
+        admin_state_dir=admin_state_dir,
     )
 
 
@@ -405,6 +473,23 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "reference_node": settings.reference_node,
         "injected_xid": verdicts.INJECTED_XID,
         "chain_watch_seconds": settings.chain_watch_seconds,
+        "administrator_exit": {
+            "admin_state_dir": str(settings.admin_state_dir),
+            "command": admin_command(settings.admin_state_dir),
+            "exit_budget_seconds": verdicts.DEPARTED_EXIT_BUDGET_SECONDS,
+            "readback_seconds": verdicts.DEPARTED_READBACK_SECONDS,
+        },
+        "cleanup": [
+            "revoke the alias's Agent record, should anything have registered "
+            f"one, under {CASE_ID}/<run id>/cleanup and read it back",
+            "compare every GPU node with the baseline; verify the runtime identity",
+            "take the departed-node exit for the alias: gpu-fault-admin "
+            "workflow-reconcile --retire-departed-agents --node <alias> "
+            "--accept-unknown-provider-identity --reason <why>, the dry run until "
+            "the product calls the alias eligible, then the apply with --reference "
+            f"{CASE_ID}/<run id>/departed-alias; read the departed-node ledger "
+            "line back gone or CLEANED",
+        ],
         "mutation": (
             "post one API-replay kernel XID absent from the NVIDIA catalog for an "
             "alias node id that is not a Kubernetes node, not a Node Agent and "
@@ -428,6 +513,9 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "the failed isolation escalates its own escalation (second-order "
             "chain, depth > 1)",
             "provider mutation appears",
+            "the cleanup cannot clear the alias's departed-node ledger line: the "
+            "exit is refused, does not open within its budget, or the line does "
+            "not end gone or CLEANED",
         ],
         "rollback": {
             "alias_has_no_node_agent_so_no_reset_command_can_be_addressed": True,
@@ -435,6 +523,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "plan_contains_no_physical_operation": True,
             "no_node_is_mutated_so_nothing_is_restored": True,
             "leftover_control_records_are_recorded_by_id": True,
+            "alias_departure_is_accepted_so_no_departed_node_ledger_line_stays": True,
         },
         "preflight": preflight,
     }
@@ -677,7 +766,8 @@ def execute_case(
 
 def _cleanup(run: _LiveRun) -> dict[str, Any]:
     """No node was mutated; the alias's Agent record, if any, is revoked, then
-    the cleanup proves the rest: fleet and identity."""
+    the cleanup proves the rest: fleet and identity. Last it takes the
+    departed-node exit for the alias, so no ledger line is left on it."""
 
     result: dict[str, Any] = {"errors": []}
 
@@ -696,6 +786,10 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
             evidence_path=run.case_dir / "runtime-identity-after-cleanup.json",
             stage=f"after {CASE_ID} cleanup",
         ),
+    )
+    guard(
+        "alias_departure",
+        lambda: accept_alias_departure(run, result.get("alias_agent")),
     )
     return result
 
@@ -726,6 +820,254 @@ def _fleet_after(run: _LiveRun) -> dict[str, dict[str, Any]]:
     return after
 
 
+DEPARTED_EVIDENCE = "alias-departed-acceptance.json"
+# One ``workflow-reconcile`` run; its own kubectl timeouts bound the in-Pod
+# reads, this caps a hang.
+ADMIN_TIMEOUT_SECONDS = 900
+
+
+def departed_exit_argv(
+    state_dir: Path, alias: str, reason: str, *, reference: str | None
+) -> list[str]:
+    """The exit the departed-node ledger names for the alias: dry run or apply."""
+
+    argv = [
+        "workflow-reconcile",
+        "--state-dir",
+        str(state_dir),
+        "--retire-departed-agents",
+        "--node",
+        alias,
+        "--accept-unknown-provider-identity",
+        "--reason",
+        reason,
+    ]
+    if reference is None:
+        return [*argv, "--dry-run"]
+    return [*argv, "--reference", reference]
+
+
+def accept_alias_departure(
+    run: _LiveRun, alias_agent: dict[str, Any] | None
+) -> dict[str, Any]:
+    """Take the administrator's departed-node exit for the case's own alias.
+
+    ``alias_agent`` is the Agent cleanup's read-back, None when it failed. A
+    case that posted no XID and found no Agent record has nothing anything
+    could have listed: a recorded no-op. Otherwise the exit's dry run is
+    polled until the product calls the alias eligible, as long as the item's
+    own timestamps say it may take (an Agent the exit would retire past the
+    guard and its lease, a report chain spanning the guard), within the guard
+    plus a margin; then the apply, once; then the ledger line is read back
+    gone or CLEANED. The site's administrator lock is the one refusal retried:
+    any other ends the step, a FAIL naming the product's reason -- never a
+    command of another shape. ``alias-departed-acceptance.json`` keeps it all.
+    """
+
+    state_dir = run.settings.admin_state_dir
+    evidence: dict[str, Any] = {
+        "alias": run.alias,
+        "cluster_id": run.settings.regional.cluster_id,
+        "admin_state_dir": str(state_dir),
+        "command": admin_command(state_dir),
+        "reference": verdicts.departed_alias_reference(run.run_id),
+        "reason": verdicts.departed_alias_reason(run.run_id, run.alias),
+        "attempts": [],
+        "readback": [],
+    }
+    try:
+        if (
+            run.injected_at is None
+            and alias_agent is not None
+            and not alias_agent.get("found")
+        ):
+            evidence["outcome"] = "no-op"
+            evidence["note"] = (
+                "the case posted no XID for the alias and found no Agent record "
+                "for it: nothing can have listed it"
+            )
+        else:
+            _take_departed_exit(run, evidence)
+        return evidence
+    except Exception as exc:
+        evidence["error"] = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        evidence.setdefault("outcome", "failed")
+        write_json_atomic(run.case_dir / DEPARTED_EVIDENCE, evidence)
+
+
+def _take_departed_exit(run: _LiveRun, evidence: dict[str, Any]) -> None:
+    evidence["ledger_before"] = _departed_ledger(run)
+    started = time.monotonic()
+    item = _await_departed_exit(run, evidence, started=started)
+    if item is None:
+        return
+    attempt = _departed_admin(
+        run,
+        evidence,
+        apply=True,
+        until=started + verdicts.DEPARTED_EXIT_BUDGET_SECONDS,
+    )
+    errors = verdicts.departed_apply_errors(
+        attempt, key=f"{item['cluster_id']}/{run.alias}"
+    )
+    if errors:
+        raise RegionalFixtureError("; ".join(errors))
+    _await_departed_ledger(run, evidence)
+    evidence["outcome"] = "accepted"
+
+
+def _await_departed_exit(
+    run: _LiveRun, evidence: dict[str, Any], *, started: float
+) -> dict[str, Any] | None:
+    """The dry run, polled until the alias is eligible; None: nothing names it."""
+
+    cap = started + verdicts.DEPARTED_EXIT_BUDGET_SECONDS
+    deadline = started + verdicts.DEPARTED_MARGIN_SECONDS
+    guard = timedelta(seconds=verdicts.DEPARTED_GUARD_SECONDS)
+    while True:
+        attempt = _departed_admin(run, evidence, apply=False, until=cap)
+        if attempt["returncode"] != 0:
+            raise RegionalFixtureError(
+                f"the departed-node exit's dry run for {run.alias} failed: "
+                f"{attempt['refusal']}"
+            )
+        item = attempt["item"]
+        if item is None:
+            raise RegionalFixtureError(
+                f"the departed-node exit's dry run did not name {run.alias}"
+            )
+        if item.get("eligible") is True:
+            errors = verdicts.departed_plan_errors(
+                item, cluster_id=run.settings.regional.cluster_id
+            )
+            if errors:
+                raise RegionalFixtureError("; ".join(errors))
+            return dict(item)
+        now = time.monotonic()
+        opens_at = verdicts.departed_exit_opens_at(item, guard=guard)
+        if opens_at is not None:
+            opens_in = (opens_at - datetime.now(timezone.utc)).total_seconds()
+            if now + opens_in > cap:
+                raise RegionalFixtureError(
+                    f"the departed-node exit for {run.alias} opens at "
+                    f"{opens_at.isoformat()}, past the case's "
+                    f"{verdicts.DEPARTED_EXIT_BUDGET_SECONDS}s budget: "
+                    + "; ".join(str(reason) for reason in item.get("reasons") or [])
+                )
+            deadline = max(
+                deadline, min(cap, now + opens_in + verdicts.DEPARTED_MARGIN_SECONDS)
+            )
+        if now >= deadline:
+            break
+        time.sleep(verdicts.DEPARTED_POLL_SECONDS)
+    reasons = " ".join(str(reason) for reason in item.get("reasons") or [])
+    if verdicts.NOTHING_NAMES_THE_NODE in reasons:
+        readback = _departed_ledger(run)
+        evidence["ledger_at_deadline"] = readback
+        if readback.get("ledger") is None:
+            evidence["outcome"] = "no-op"
+            evidence["note"] = (
+                "no departed-node ledger line and no Agent record names the "
+                "alias: nothing is left to accept"
+            )
+            return None
+    raise RegionalFixtureError(
+        "; ".join(
+            verdicts.departed_exit_errors(
+                item, alias=run.alias, waited=time.monotonic() - started
+            )
+        )
+    )
+
+
+def _departed_admin(
+    run: _LiveRun, evidence: dict[str, Any], *, apply: bool, until: float
+) -> dict[str, Any]:
+    """One exit command, retried only while the site's administrator lock is held."""
+
+    state_dir = run.settings.admin_state_dir
+    argv = departed_exit_argv(
+        state_dir,
+        run.alias,
+        evidence["reason"],
+        reference=evidence["reference"] if apply else None,
+    )
+    while True:
+        at = datetime.now(timezone.utc).isoformat()
+        completed = run.regional.run(
+            [*admin_command(state_dir), *argv],
+            check=False,
+            timeout=ADMIN_TIMEOUT_SECONDS,
+            cwd=ROOT,
+        )
+        document = verdicts.admin_document(completed.stdout)
+        refused = completed.returncode != 0
+        attempt: dict[str, Any] = {
+            "phase": "apply" if apply else "dry-run",
+            "argv": argv,
+            "at": at,
+            "returncode": completed.returncode,
+            "lock_busy": refused and verdicts.ADMIN_LOCK_BUSY in completed.stderr,
+            "refusal": (
+                verdicts.admin_refusal(
+                    completed.returncode, completed.stdout, completed.stderr
+                )
+                if refused
+                else None
+            ),
+        }
+        if apply:
+            attempt["result"] = document
+        else:
+            attempt["plan"] = {
+                key: (document or {}).get(key)
+                for key in ("evaluated_at", "plan_sha256", "discovery")
+            }
+            attempt["item"] = verdicts.departed_alias_item(document, run.alias)
+        evidence["attempts"].append(attempt)
+        if not attempt["lock_busy"]:
+            return attempt
+        if time.monotonic() >= until:
+            raise RegionalFixtureError(
+                "the site's administrator lock stayed held through the case's "
+                f"{verdicts.DEPARTED_EXIT_BUDGET_SECONDS}s budget: "
+                f"{attempt['refusal']}"
+            )
+        time.sleep(verdicts.DEPARTED_POLL_SECONDS)
+
+
+def _departed_ledger(run: _LiveRun) -> dict[str, Any]:
+    return run.regional.cpu_python(
+        ALIAS_DEPARTED_LEDGER, run.settings.regional.cluster_id, run.alias
+    )
+
+
+def _await_departed_ledger(run: _LiveRun, evidence: dict[str, Any]) -> None:
+    """After the apply, the cleanup's next cycles end the line gone or CLEANED."""
+
+    until = time.monotonic() + verdicts.DEPARTED_READBACK_SECONDS
+    while True:
+        readback = _departed_ledger(run)
+        line = readback.get("ledger") or {}
+        evidence["readback"].append(
+            {
+                "at": datetime.now(timezone.utc).isoformat(),
+                "status": line.get("status"),
+                "blocker_classes": line.get("blocker_classes"),
+                "actions": line.get("actions"),
+            }
+        )
+        evidence["ledger_after"] = readback
+        errors = verdicts.departed_ledger_errors(readback, alias=run.alias)
+        if not errors:
+            return
+        if time.monotonic() >= until:
+            raise RegionalFixtureError("; ".join(errors))
+        time.sleep(verdicts.DEPARTED_POLL_SECONDS)
+
+
 def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description=(
@@ -751,6 +1093,15 @@ def parser() -> argparse.ArgumentParser:
         ),
     )
     value.add_argument("--predecessor-evidence", default="")
+    value.add_argument(
+        "--admin-state-dir",
+        default="",
+        help=(
+            "the site's state directory (its site.yaml and deploy-host CLI); the "
+            "cleanup takes the administrator's departed-node exit for the "
+            "case's own alias through its gpu-fault-admin"
+        ),
+    )
     value.add_argument(
         "--chain-watch-seconds",
         type=int,

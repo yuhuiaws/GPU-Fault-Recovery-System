@@ -88,7 +88,9 @@ def cli_arguments(module: Any, tmp_path: Path) -> list[str]:
     if number == "015":
         common += ["--node-a", "node-a", "--node-b", "node-b"]
     if number == "020":
-        common += ["--reference-node", "node-a"]
+        # The site's state directory (its site.yaml is written above): the
+        # cleanup takes the departed-node exit through its gpu-fault-admin.
+        common += ["--reference-node", "node-a", "--admin-state-dir", str(tmp_path)]
     if number == "022":
         common += ["--spare-node", "node-b"]
     return common
