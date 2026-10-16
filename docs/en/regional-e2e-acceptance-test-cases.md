@@ -9355,7 +9355,8 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   cluster-scope convention), matched in the durable registry by `cluster_id`/EKS name; the HyperPod
   `describe-cluster`/NodeRecovery facts read `not-applicable`. For an `eks-managed` managed cluster DESTR-006/007 replace the
   "managed recovery is disabled" assertion with the provider's equivalent invariant, recorded as `eks_managed_invariant`:
-  the node reboot owner is `gpu-fault-eks-adapter`, nodeReplace is observe-only, and the audit window carries neither
+  the node reboot owner is `gpu-fault-eks-adapter`, nodeReplace is the warm-spare handover only
+  (`node_replace=warm-spare-only`; no EC2 instance is replaced), and the audit window carries neither
   `sagemaker` mutations nor EC2 `Terminate/Stop/Run/StartInstances` (`replace_events` queries both event sources).
   Calls AWS refused (`errorCode` set -- Karpenter's `RunInstances` dry-runs answer `Client.DryRunOperation`) ran
   nothing and are not mutations: `provider_calls` keeps them apart and the evidence records them as

@@ -12,8 +12,8 @@ AL2023_x86_64_NVIDIA AMI，加入一个已有 `hyperpod-v1` HyperPod 站点）�
 - 一个站点可以同时纳管 HyperPod 与普通 EKS 集群（混合 provider），每个集群运行自己的 Runtime Profile 版本。
 - HyperPod 集群的一切渲染（选择器、Secret 键、注册表摘要、manifest、安装器环境、CPU pin）逐字节不变；
   以测试固定（`tests/*eks_managed*`、`tests/regional/test_regional_token_rotation.py` 的摘要固定值）。
-- 不做：provider 侧节点替换（纯 EKS 没有 `nodeReplace`，profile 为 OBSERVE）、warm-spare、HyperPod
-  health-monitoring-agent 相关能力、在节点上安装 DCGM 主机工具。
+- 不做：provider 侧节点替换（adapter 拒绝 `REPLACE`，不替换任何 EC2 实例；`nodeReplace` 只作为 warm-spare 交接由
+  `gpu-fault-eks-adapter` OWN，见 §2.4）、HyperPod health-monitoring-agent 相关能力、在节点上安装 DCGM 主机工具。
 
 ## 2. 设计
 
@@ -53,7 +53,12 @@ release 注册每个在用版本，按集群渲染 Executor/Watcher/Reconciler/�
 （IAM 仅 `ec2:DescribeInstances`、按 `aws:ResourceTag/eks:cluster-name` 条件的 `ec2:RebootInstances`、限定
 ARN 的 `eks:DescribeCluster/DescribeNodegroup`，无 `sagemaker:*`），确认条件为实例 running + 新 Agent
 incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败域标签在实例组之后加入
-`eks.amazonaws.com/nodegroup`。
+`eks.amazonaws.com/nodegroup`。`nodeReplace` 同样由 `gpu-fault-eks-adapter` OWN
+（`config/runtime-profile.regional-eks-safe.example.yaml`，observed `warm-spare-v1`），含义是 Kubernetes 层的 warm-spare
+交接：executor 在两种 provider 上都构造 spare coordinator，`REPLACE_NODE`（`HEALTHY_WARM_SPARE_ONLY`）把工作负载交接到
+用 `gpu-fault-admin config spare --declare` 声明的热备（拓扑按节点组 + 实例类型）；`REPLACE` 从不在 adapter allowlist
+里、`submit` 拒绝它，所以没有声明热备时该步骤 fail closed。仍 pin 在 `nodeReplace` 为 OBSERVE 的旧 `eks-v1` 快照上的
+集群保持该声明，直到 `deploy` 规划后继版本 `regional-eks-<digest12>`（`CLUSTER_PROFILE_NEW`）并获批准。
 
 ### 2.5 数据面与节点
 - DCGM exporter：HyperPod AMI 以主机服务运行 DCGM，DaemonSet 连接 `127.0.0.1:5555`；AL2023 NVIDIA AMI 没有
@@ -126,7 +131,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 
 ## 4. 限制
 
-- `nodeReplace` 仅 OBSERVE；无 HyperPod 健康代理，`gpuDetection`/`providerHealthIsolation` 不声明。
+- 没有 provider 侧节点替换：`nodeReplace` 只是 warm-spare 交接，须先声明热备（§2.4）；无 HyperPod 健康代理，
+  `gpuDetection`/`providerHealthIsolation` 不声明。
 - 节点上无 DCGM 主机工具：`dcgmi diag` 不可用（WARN），诊断包里记录工具缺失。
 - 一个集群只能有一个 profile 版本；站点 profile 变更仍是站点级审批，集群 override 版本固定为示例 profile 的版本名。
 - 首次 `deploy` 不接受混合 provider（先部署一种，再 join 另一种）。

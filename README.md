@@ -19,7 +19,7 @@ English edition: [README.en.md](README.en.md).
 不应从仓库中的历史代码或示例推断额外支持范围：
 
 - HyperPod 单集群一体化只用于迁移、Canary 和历史环境维护。
-- 通用 Kubernetes 部署当前未实现为生产交付能力；无 HyperPod 的普通 EKS 集群（`provider: eks-managed`）是新增、验证较少的形态：按节点组上的归属标签枚举 GPU 节点、Executor 只持 EC2 Describe/Reboot、节点替换只观察，见[管理员日常运维 §5.0](docs/管理员日常运维.md)。
+- 通用 Kubernetes 部署当前未实现为生产交付能力；无 HyperPod 的普通 EKS 集群（`provider: eks-managed`）是新增、验证较少的形态：按节点组上的归属标签枚举 GPU 节点、Executor 只持 EC2 Describe/Reboot、provider 侧节点替换只观察，见[管理员日常运维 §5.0](docs/管理员日常运维.md)。
 - HyperPod Slurm 编排当前不支持。
 - GPU 节点上的 systemd Agent 属于区域数据面，不是独立部署架构。
 

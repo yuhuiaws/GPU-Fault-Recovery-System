@@ -17,7 +17,8 @@ site yet**; section 5 lists what one join cannot prove. This is the summary of b
 - Everything a HyperPod cluster renders (selectors, Secret keys, registry digests, manifests, installer environment,
   CPU pins) stays byte-identical, pinned by tests (`tests/*eks_managed*`, the digest constants in
   `tests/regional/test_regional_token_rotation.py`).
-- Out of scope: provider-side node replacement (`nodeReplace` stays OBSERVE), warm spares, HyperPod
+- Out of scope: provider-side node replacement (the adapter refuses `REPLACE` and no EC2 instance is replaced;
+  `nodeReplace` is OWNed by `gpu-fault-eks-adapter` only as the warm-spare handover of §2.4), HyperPod
   health-monitoring-agent capabilities, installing DCGM host tools on nodes.
 
 ## 2. Design
@@ -65,7 +66,13 @@ An `eks-managed` Executor builds `gpu-fault-eks-adapter`: `nodeReboot` calls `Re
 instance (IAM: `ec2:DescribeInstances`, `ec2:RebootInstances` conditioned on `aws:ResourceTag/eks:cluster-name`,
 ARN-scoped `eks:DescribeCluster/DescribeNodegroup`, no `sagemaker:*`), confirmed by instance running + a new Agent
 incarnation/boot_id; a departed node is proven through `ec2 describe-instances`; failure-domain labels add
-`eks.amazonaws.com/nodegroup` after the instance-group label.
+`eks.amazonaws.com/nodegroup` after the instance-group label. `nodeReplace` is OWNed by the same `gpu-fault-eks-adapter`
+(`config/runtime-profile.regional-eks-safe.example.yaml`, observed `warm-spare-v1`) as a Kubernetes-level warm-spare
+handover: the Executor builds the spare coordinator on both providers, and `REPLACE_NODE` (`HEALTHY_WARM_SPARE_ONLY`)
+moves the workload to a spare declared with `gpu-fault-admin config spare --declare` (topology: node group + instance
+type); `REPLACE` is never in the adapter allowlist and `submit` refuses it, so without a declared spare the step fails
+closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace` is OBSERVE keeps that claim until
+`deploy` plans the successor `regional-eks-<digest12>` (`CLUSTER_PROFILE_NEW`) and the plan is approved.
 
 ### 2.5 Data plane and nodes
 - DCGM exporter: the HyperPod AMI runs DCGM as a host service and the DaemonSet dials `127.0.0.1:5555`; the AL2023
@@ -158,7 +165,8 @@ incarnation/boot_id; a departed node is proven through `ec2 describe-instances`;
 
 ## 4. Limitations
 
-- `nodeReplace` is OBSERVE only; no HyperPod health agent, so `gpuDetection`/`providerHealthIsolation` are not claimed.
+- No provider-side node replacement: `nodeReplace` is only the warm-spare handover and needs a declared spare (§2.4);
+  no HyperPod health agent, so `gpuDetection`/`providerHealthIsolation` are not claimed.
 - No DCGM host tools on the node: `dcgmi diag` is unavailable (WARN); the diagnostic bundle records the missing tool.
 - One profile version per cluster; site profile changes stay site-level approvals; the override version is the example
   profile's version name.
