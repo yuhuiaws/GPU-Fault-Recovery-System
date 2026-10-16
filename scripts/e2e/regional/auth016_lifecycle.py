@@ -43,10 +43,16 @@ from scripts.e2e.regional.identity_acceptance_common import (
     read_cluster_token,
     run,
 )
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 ROTATION_TIMEOUT_SECONDS = 3600
 CONSUMER_TIMEOUT_SECONDS = 600
 SAMPLER_JOIN_SECONDS = 495
+#: The lifecycle of an Agent the fleet retired. The store keeps the record of a
+#: departed node (``workflow-reconcile --retire-departed-agents`` or the control
+#: plane's departed-node cleanup) as a tombstone of its identity; it consumes no
+#: credential and its node is gone, so no rotation can reinstall it.
+RETIRED_AGENT_LIFECYCLE = "REVOKED"
 
 CONSUMER_STORE_PROBE = r"""
 import json
@@ -157,6 +163,67 @@ def _stamp(value: Any) -> datetime:
         ) from None
 
 
+def agent_fleet(snapshot: dict[str, Any]) -> dict[str, list[str]]:
+    """The baseline's bound Agents (credential consumers) and retired records.
+
+    Live 2026-10-16 (AUTH-016 r9 a1, gpu-eks-cluster): the store still listed
+    the REVOKED Agent of a spot-reclaimed node; bound as a consumer, it turned
+    the COMPLETED rotation of the two remaining nodes into "did not reinstall
+    the complete bound node fleet".
+    """
+
+    agents = snapshot.get("agents")
+    if not isinstance(agents, dict):
+        return {"bound": [], "retired": []}
+    retired = sorted(
+        node
+        for node, agent in agents.items()
+        if isinstance(agent, dict) and agent.get("lifecycle") == RETIRED_AGENT_LIFECYCLE
+    )
+    return {"bound": sorted(set(agents) - set(retired)), "retired": retired}
+
+
+def agent_baseline_errors(snapshot: dict[str, Any]) -> list[str]:
+    """Why the Agent baseline cannot bind a rotation, judged before any mutation.
+
+    Every bound Agent must be ACTIVE with a live lease: a departed node not
+    retired yet, or a drain in flight, would otherwise fail the case only after
+    a full production rotation.
+    """
+
+    agents = snapshot.get("agents")
+    bound = agent_fleet(snapshot)["bound"]
+    if not isinstance(agents, dict) or not bound:
+        return ["no live Agent is registered"]
+    errors = []
+    try:
+        captured = _stamp(snapshot.get("captured_at"))
+        for node in bound:
+            agent = agents[node]
+            if agent.get("lifecycle") != "ACTIVE":
+                errors.append(f"{node} Agent is {agent.get('lifecycle')}")
+            elif _stamp(agent.get("lease_expires_at")) <= captured:
+                errors.append(
+                    f"{node} Agent lease expired (retire it with workflow-reconcile "
+                    "--retire-departed-agents if the node departed)"
+                )
+    except (AttributeError, IdentityAcceptanceError, KeyError, TypeError):
+        return ["Agent baseline evidence is incomplete"]
+    return errors
+
+
+def failure_reason(exc: Exception) -> str:
+    """Which step failed, safe for the evidence.
+
+    The runner's own text and a command's redacted exit summary name it; any
+    other exception is named by type only, since its text may quote a payload.
+    """
+
+    if isinstance(exc, (IdentityAcceptanceError, RegionalFixtureError)):
+        return str(exc)
+    return type(exc).__name__
+
+
 def registry_entry_committed(entry: dict[str, Any], new_digest: str) -> bool:
     """The durable registry entry has fully committed the new token.
 
@@ -208,13 +275,16 @@ def rotation_journal_errors(
     ) != set(CPU_RUNTIME_DEPLOYMENTS):
         errors.append("rotation did not roll all control-plane registry consumers")
     node_evidence = steps[STEP_NODES_ROLLED].get("evidence") or {}
-    if (
-        not node_names
-        or set(node_evidence.get("reinstalled_nodes", [])) != node_names
-        or set((state.get("node_rollout") or {}).get("completed_nodes", []))
-        != node_names
-    ):
-        errors.append("rotation did not reinstall the complete bound node fleet")
+    reinstalled = set(node_evidence.get("reinstalled_nodes", []))
+    completed = set((state.get("node_rollout") or {}).get("completed_nodes", []))
+    if not node_names or reinstalled != node_names or completed != node_names:
+        missing = sorted(node_names - (reinstalled & completed))
+        extra = sorted((reinstalled | completed) - node_names)
+        errors.append(
+            "rotation did not reinstall the complete bound node fleet"
+            + (f"; bound, not reinstalled: {missing}" if missing else "")
+            + (f"; reinstalled, not bound: {extra}" if extra else "")
+        )
     if (steps[STEP_RETIRING_DROPPED].get("evidence") or {}).get(
         "retiring_token_dropped"
     ) is not True:
@@ -247,11 +317,12 @@ def consumer_errors(
     after_withdrawal: datetime,
 ) -> list[str]:
     previous, agents = before.get("agents"), after.get("agents")
+    retired = set(agent_fleet(before)["retired"])
     if (
         before.get("cluster_id") != cluster_id
         or after.get("cluster_id") != cluster_id
         or not isinstance(previous, dict)
-        or not previous
+        or not set(previous) - retired
         or not isinstance(agents, dict)
         or set(previous) != set(agents)
     ):
@@ -259,6 +330,14 @@ def consumer_errors(
     errors = []
     try:
         for node, agent in agents.items():
+            if node in retired:
+                # A retired identity sends nothing and must stay retired.
+                if agent["lifecycle"] != RETIRED_AGENT_LIFECYCLE:
+                    errors.append(
+                        f"{node}: retired Agent is {agent['lifecycle']} after the "
+                        "rotation"
+                    )
+                continue
             required = previous[node]["required_collectors"]
             # Activation proof (live 2026-09-20, AUTH-016 a2): the reinstall wave
             # restarts the agent and re-registers it with the wave identity, which
@@ -512,8 +591,11 @@ def run_rotation_acceptance(
     primary = site.regional(target)
     before = primary.cpu_python(CONSUMER_STORE_PROBE, target.cluster_id)
     before_pods = pod_consumers(site, target, new_digest=old_digest)
-    if not isinstance(before.get("agents"), dict) or not before["agents"]:
-        raise IdentityAcceptanceError("rotation requires a complete Agent baseline")
+    if baseline_errors := agent_baseline_errors(before):
+        raise IdentityAcceptanceError(
+            "rotation requires a complete Agent baseline: " + "; ".join(baseline_errors)
+        )
+    fleet = agent_fleet(before)
     original_registry = site.registry()
     siblings = {
         item["cluster_id"]: item
@@ -548,6 +630,7 @@ def run_rotation_acceptance(
         "sampler_errors": sampler_errors,
         "reference": reference,
         "production_journal": str(state_path),
+        "agent_fleet": fleet,
         "cleanup_complete": False,
     }
 
@@ -596,7 +679,7 @@ def run_rotation_acceptance(
             reference=reference,
             cluster_id=target.cluster_id,
             old_digest=old_digest,
-            node_names=set(before["agents"]),
+            node_names=set(fleet["bound"]),
         )
         if errors:
             raise IdentityAcceptanceError("; ".join(errors))
@@ -650,12 +733,15 @@ def run_rotation_acceptance(
         result["cleanup_complete"] = True
     except Exception as exc:
         result["failure"] = type(exc).__name__
+        result["failure_reason"] = failure_reason(exc)
         result["reconciliation"] = (
             "Use the bound production rotate-token journal. Do not restore Secrets "
             "by hand; TOKEN_FILE_WRITTEN intent permits fail-forward only."
         )
         raise IdentityCaseFailure(
-            "production rotation acceptance did not complete", details=result
+            "production rotation acceptance did not complete: "
+            + result["failure_reason"],
+            details=result,
         ) from exc
     finally:
         finish_sampler(stop, thread, result)

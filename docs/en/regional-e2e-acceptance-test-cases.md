@@ -5235,6 +5235,9 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
   and `src/gpu_fault/regional.py::RegionalClusterRegistration.matched_token_slot`.
 - Preconditions: the public `rotate-token` requires remote commands to be quiescent, and the target must have no unreconciled in-flight rotation.
   The runner requires a complete Agent/data-plane Pod baseline, and the probe-only claim of the real consumers returns 200 with zero commands.
+  A complete Agent baseline means every Agent of the cluster other than the retired (`REVOKED`) records is `ACTIVE` with an
+  unexpired lease; otherwise the runner refuses, naming the Agent, before it writes the intent or calls `rotate-token` (retire a
+  departed node with `workflow-reconcile --retire-departed-agents` first, and let a drain in progress finish).
   It no longer creates a synthetic command to impersonate the continuity of an in-flight hardware action. Survival of a real destructive command across the rotation remains an untested,
   independent obligation; the current quiescent entry point does not support that experiment and cannot be used to claim it done.
 - Formal entry point: this runner calls the real
@@ -5255,6 +5258,11 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
 - Steps:
   1. Record the original registry, credential digests, all managed Agents and the data-plane consumers whose ownership is verified
      through Deployment/ReplicaSet/Pod; write a private intent bound to this run's reference/target/release.
+     The store keeps the `REVOKED` Agent record of a departed node (spot reclaim, scale-in, replacement) that
+     `workflow-reconcile --retire-departed-agents` or the control plane's departed-node cleanup retired: it is the tombstone of a
+     retired identity, not a credential consumer, and its node is gone, so no rotation will or can reinstall it. The runner splits
+     the baseline into `agent_fleet.bound` (the managed Agents) and `agent_fleet.retired` in the evidence and treats only the
+     bound group as managed Agents.
   2. Start real-consumer claim sampling every 2 seconds and call the public `rotate-token`. The three phases
      baseline, overlap and new-consumers must be observed; the probe switching tokens by itself is no substitute for the product taking effect.
      Every sample records the rotation journal's started-but-unfinished step at that instant (`active_step`); when the
@@ -5265,18 +5273,22 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
      zero-downtime (surge first, a preStop longer than the NLB deregistration delay, readiness gates -- see the
      deployment manual); any claim that fails during the roll is a FAIL.
   3. Check the complete order in the native journal: the overlap window, the update of every data-plane Deployment, the full node
-     wave, the roll of every CPU control-plane Deployment (api-ha, control-worker, telemetry-spool-worker) after the registry
+     wave (the reinstalled node set equals `agent_fleet.bound`), the roll of every CPU control-plane Deployment (api-ha, control-worker, telemetry-spool-worker) after the registry
      Secret rewrite, the revocation of the old slot and the quiescence acceptance all completed; rolling only the Executor is not
      enough, nor may running control-plane Pods keep the old Secret snapshot (`secret_drift`).
-  4. After revocation, every new consumer Pod uses the new credential and no old Pod may remain; Agents, required Collectors
+  4. After revocation, every new consumer Pod uses the new credential and no old Pod may remain; the bound Agents, required Collectors
      and the Watcher must have fresh post-revocation reports, and an independent request with the old token returns exactly 403.
+     The retired records must still be `REVOKED` after the rotation (a rotation must never revive a retired identity), and the
+     Agent inventory must neither grow nor shrink.
   5. Check that the new token file matches the committed registry digest, the retiring slot has been removed, temporary credentials have been cleaned up,
      sibling registrations are unchanged and the sampling thread has stopped. **Keep the committed new credential; do not restore the original Secret.**
 - Verdict: the real-consumer samples of all three phases are all 200 with zero commands (`claim_failures` empty,
   `sampler_errors` empty); the complete native transaction, activation of all consumers,
   post-revocation freshness, the old token's 403 and the quiescence window all have evidence. The report contains only digests and references;
   `auth016-details.json` also carries `step_timeline` (each step's start/completion time) so a failed sample can be
-  matched to the step active at that moment.
+  matched to the step active at that moment. On failure `failure` is the exception type and `failure_reason` the first failed
+  check: the runner's own verdict text or a command's redacted exit summary, any other exception by type only (its text may
+  quote a payload); the case JSON's `error` carries the same reason.
 - Failure recovery: keep the bound production rotation journal and intent; after the `TOKEN_FILE_WRITTEN` intent
   only native fail-forward is allowed. Do not hand-edit the Secret, delete the journal or reuse the old token to "clean up" on your own.
   Do not issue PASS when unreconciled or incompletely cleaned up, and do not treat the end of sampling as completion of the rotation.
