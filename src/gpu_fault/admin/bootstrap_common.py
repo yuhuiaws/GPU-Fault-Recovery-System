@@ -144,26 +144,42 @@ class ClusterIdentity:
 
 
 def require_single_provider(
-    providers: Sequence[object], *, joining: object | None = None
+    providers: Sequence[object],
+    *,
+    joining: object | None = None,
+    arns: Sequence[str] = (),
 ) -> None:
     """A first deploy's GPU clusters must all run on one provider.
 
     The first deploy writes one site Runtime Profile for every cluster it
     creates, and that profile's ``nodeReboot`` owner is one adapter. A cluster
     of the other provider is joined afterwards (``join-cluster``), which gives
-    it its own reviewed profile version.
+    it its own reviewed profile version. ``arns`` (parallel to ``providers``)
+    lets the refusal name which cluster runs on which provider.
     """
 
     kinds = {cluster_provider(item) for item in providers}
     if joining is not None:
         kinds.add(cluster_provider(joining))
-    if len(kinds) > 1:
-        raise BootstrapError(
-            "a first deploy's GPU clusters must share one provider (hyperpod or "
-            "eks-managed): deploy the clusters of one provider first, then join "
-            "the others with join-cluster, which gives them their own Runtime "
-            "Profile version"
-        )
+    if len(kinds) <= 1:
+        return
+    groups: dict[str, list[str]] = {}
+    for arn, provider in zip(arns, providers):
+        groups.setdefault(cluster_provider(provider).value, []).append(arn)
+    named = "; ".join(f"{kind}: {', '.join(names)}" for kind, names in groups.items())
+    raise BootstrapError(
+        "a first deploy's GPU clusters must share one provider (hyperpod or "
+        "eks-managed)"
+        + (f"; this request mixes {named}" if len(groups) > 1 else "")
+        + ". Deploy in two steps: first deploy the clusters of one provider "
+        "only; once that deploy completed, join the others with join-cluster "
+        "(<state-dir>/deployer-venv/bin/gpu-fault-admin join-cluster --state-dir "
+        "<state-dir> --gpu-cluster-arn <ARN>) or with gpu-fault-admin deploy "
+        "--state-dir <state-dir> given the managed ARNs plus the new ones; that "
+        "join gives them their own Runtime Profile version and stops once for "
+        "its plan (approve with --approve-profile-plan <plan_sha256> --reference "
+        "<change>)"
+    )
 
 
 def profile_node_reboot_owner(profile_source: Path) -> str | None:

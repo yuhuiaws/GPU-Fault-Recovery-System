@@ -794,7 +794,10 @@ def discover_bootstrap_scope(
     if existing is None:
         # A first deploy writes one site profile for every cluster it creates;
         # a second provider joins afterwards with its own profile (join-cluster).
-        require_single_provider([cluster.provider for cluster in gpu_clusters])
+        require_single_provider(
+            [cluster.provider for cluster in gpu_clusters],
+            arns=[cluster.input_arn for cluster in gpu_clusters],
+        )
     return existing, cpu, gpu_clusters
 
 

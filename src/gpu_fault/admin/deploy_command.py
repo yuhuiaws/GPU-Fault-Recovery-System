@@ -19,6 +19,7 @@ import argparse
 import json
 import sys
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
@@ -33,6 +34,7 @@ from gpu_fault.admin.bootstrap_site import load_existing_site
 from gpu_fault.admin.cluster_join import JoinClusterRequest
 from gpu_fault.admin.config_file import initialize_desired_admin_config
 from gpu_fault.admin.deploy_identity import INITIAL_REQUEST_FILE, initial_deploy_request
+from gpu_fault.admin.first_deploy_precheck import precheck_first_deploy
 from gpu_fault.admin.grafana import add_grafana_arguments
 from gpu_fault.admin.installation_lifecycle import retire_completed_site
 from gpu_fault.admin.membership_lock import administrator_operation_lock
@@ -253,11 +255,21 @@ def resolve_deploy_identity(
     gpu_arns = tuple(str(value) for value in getattr(arguments, "gpu_cluster_arn", []))
     admin_email = str(getattr(arguments, "alert_email", None) or "")
     if existing is None:
+        # The public hop runs bootstrap's discovery read-only before the
+        # request is recorded and before the email check creates the SNS
+        # topic; the inner (prepared) hop's bootstrap discovers anyway.
         cpu_arn, gpu_arns, admin_email = initial_deploy_request(
             state_dir,
             cpu_arn=cpu_arn,
             gpu_arns=gpu_arns,
             admin_email=admin_email,
+            precheck=(
+                None
+                if getattr(arguments, "prepared_source_release", False)
+                else partial(
+                    precheck_first_deploy, state_dir, discover=hooks.discover_cluster
+                )
+            ),
         )
         return cpu_arn, gpu_arns, admin_email, ()
     cpu_eks, cpu_aliases, aliases, site_email = managed_site_deploy_inputs(

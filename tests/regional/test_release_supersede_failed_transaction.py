@@ -30,6 +30,7 @@ from gpu_fault_release import regional_release_automatic_rollback as AUTOMATIC_R
 from gpu_fault_release import regional_release_orchestration as ORCHESTRATION
 from gpu_fault_release import regional_schema_change as SCHEMA_CHANGE
 from gpu_fault_release.regional_release_config import ReleaseError, canonical_sha256
+from tests.admin._first_deploy_discovery import stub_first_deploy_discovery
 from tests.regional._resource_probe_fakes import resource_probe_result
 
 ENV = "GPU_FAULT_RELEASE_SUPERSEDE_FAILED_TRANSACTION"
@@ -324,6 +325,7 @@ def test_the_flag_travels_to_the_source_preparer_as_environment(
     monkeypatch.delenv(ENV, raising=False)
     monkeypatch.delenv(admin_cli.ACCEPT_SCHEMA_CHANGE_ENV, raising=False)
     monkeypatch.chdir(tmp_path)
+    stub_first_deploy_discovery(monkeypatch)
     base = [
         "deploy",
         "--cpu-cluster-arn",

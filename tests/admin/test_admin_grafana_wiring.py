@@ -47,6 +47,7 @@ from gpu_fault.installation_resources import (
     InstallationResourceOwnership,
 )
 from tests.admin._bootstrap_support import _cluster
+from tests.admin._first_deploy_discovery import stub_first_deploy_discovery
 from tests.admin.test_admin_site import site_file
 
 SITE = "site-a"
@@ -635,6 +636,7 @@ def test_public_deploy_carries_the_grafana_options_to_the_source_preparer(
     monkeypatch.delenv(GRAFANA_WORKSPACE_ID_ENV, raising=False)
     monkeypatch.delenv(GRAFANA_VIEWER_ENV, raising=False)
     monkeypatch.chdir(tmp_path)
+    stub_first_deploy_discovery(monkeypatch)
     base = _deploy_arguments("--state-dir", str(tmp_path / "state"))
 
     assert admin_cli.run(admin_cli.parser().parse_args(base)) == 0

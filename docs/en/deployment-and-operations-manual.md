@@ -5384,7 +5384,9 @@ cluster name for plain EKS. A cluster joined before the convention keeps its rec
 `sagemaker.amazonaws.com/cluster-name=<HyperPod name>`, byte for byte as before) until
 `gpu-fault-admin node-scope --converge`. A mixed site takes two steps: a first
 `deploy`'s GPU clusters must share one provider (both providers in one first `deploy` are refused before anything is
-created), so deploy every cluster of one provider first and attach the other provider's clusters with this section's
+created: the public `deploy` runs bootstrap's cluster discovery read-only before it writes `initial-deploy-request.json`
+or creates the SNS topic, so every shape discovery refuses is refused there and the corrected rerun works in the same
+state directory), so deploy every cluster of one provider first and attach the other provider's clusters with this section's
 `join-cluster` -- that join writes its provider's own Runtime Profile plan and stops, and continues on the approved
 rerun; the acceptance driver of BOOT-029 runs exactly this order. The Runtime Profile applies per
 cluster: the site profile is the default pin; when its `nodeReboot` owner is not the target provider's adapter (plain

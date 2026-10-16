@@ -22,6 +22,7 @@ from gpu_fault.admin.site import (
     materialized_release_config,
 )
 from gpu_fault_release import regional_release_config as RELEASE_CONFIG
+from tests.admin._first_deploy_discovery import stub_first_deploy_discovery
 
 REGION = "us-east-1"
 ROOT = Path(__file__).resolve().parents[2]
@@ -826,6 +827,7 @@ def test_public_arn_deploy_delegates_to_internal_source_preparation(
         admin_cli, "run_source_deploy", lambda **kwargs: calls.append(kwargs) or 0
     )
     monkeypatch.chdir(tmp_path)
+    asked = stub_first_deploy_discovery(monkeypatch)
     arguments = admin_cli.parser().parse_args(
         [
             "deploy",
@@ -846,6 +848,10 @@ def test_public_arn_deploy_delegates_to_internal_source_preparation(
     assert calls[0]["gpu_cluster_arns"] == (
         "arn:aws:eks:us-east-1:123456789012:cluster/gpu",
     )
+    assert asked == [
+        ("arn:aws:eks:us-east-1:123456789012:cluster/cpu", "cpu"),
+        ("arn:aws:eks:us-east-1:123456789012:cluster/gpu", "gpu"),
+    ], "the first deploy is discovered read-only before it is recorded"
 
 
 def test_public_deploy_help_exposes_optional_admin_config(capsys) -> None:
@@ -1394,6 +1400,7 @@ def test_accept_schema_change_travels_to_the_source_preparer_as_environment(
     )
     monkeypatch.delenv(admin_cli.ACCEPT_SCHEMA_CHANGE_ENV, raising=False)
     monkeypatch.chdir(tmp_path)
+    stub_first_deploy_discovery(monkeypatch)
     base = [
         "deploy",
         "--cpu-cluster-arn",

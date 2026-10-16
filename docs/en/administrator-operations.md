@@ -1403,7 +1403,16 @@ Semantics and boundaries of `eks-managed`:
   cluster's ARN works too, its release leaves the cluster's pending plan alone, see Profile change approval §1.2); the
   join consumes the approval, the immutable snapshot `profiles/<version>.yaml` is written and the join continues. Later clusters of the same provider
   reuse that snapshot without another review. A first `deploy` still requires its GPU clusters to share one provider
-  (an all-plain-EKS first deploy starts from `eks-v1`); the other provider joins afterwards with `join-cluster`.
+  (an all-plain-EKS first deploy starts from `eks-v1`); the other provider joins afterwards with `join-cluster`. The
+  public `deploy` runs bootstrap's own cluster discovery read-only before it writes `initial-deploy-request.json` and
+  before the email check creates the SNS topic and subscription (`admin/first_deploy_precheck.py`): providers mixed (the
+  refusal lists each provider's ARNs and the two steps: deploy one provider only, then attach the others with
+  `join-cluster` or with `deploy --state-dir` given the managed ARNs plus the new ones), a GPU node group without this
+  site's ownership label or labelled for another site, a non-GPU instance type, node repair on, `NodeRecovery` not
+  `None`, a cluster that is not ACTIVE, a plain EKS CPU cluster, and one cluster named twice (its EKS and its HyperPod
+  ARN) are all refused before anything is recorded or created (`first deploy refused before anything was recorded or
+  created`), so the corrected rerun works in the same state directory. A directory in which an earlier version already
+  recorded a refused request resumes only that request; start over in a new empty state directory.
   Whenever a later `deploy` re-renders the site, the site profile base follows the **registration cluster's**
   provider (`spec.runtimeProfile.registrationClusterId`) alone: a site whose registration cluster is plain EKS keeps
   the `eks-v1` base for good and its HyperPod members join with the `hyperpod-v1` override -- it is never re-based to

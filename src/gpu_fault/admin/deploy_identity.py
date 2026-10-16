@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from gpu_fault.admin.bootstrap_common import Arn, BootstrapError
@@ -21,8 +21,15 @@ def initial_deploy_request(
     cpu_arn: str,
     gpu_arns: tuple[str, ...],
     admin_email: str,
+    precheck: Callable[[str, tuple[str, ...], bool], None] | None = None,
 ) -> tuple[str, tuple[str, ...], str]:
-    """Recover only exact, explicitly recorded inputs, never inferred resources."""
+    """Recover only exact, explicitly recorded inputs, never inferred resources.
+
+    ``precheck(cpu, gpus, recorded)`` (the public hop's read-only discovery,
+    ``first_deploy_precheck``) judges a new request before it is recorded and
+    a recorded one before it is resumed: a shape bootstrap refuses must not
+    pin the state directory to it.
+    """
     with administrator_operation_lock(state_dir):
         path = state_dir / INITIAL_REQUEST_FILE
         recorded: dict[str, Any] | None = None
@@ -67,11 +74,14 @@ def initial_deploy_request(
                     raise SiteConfigError(
                         f"initial deploy request conflicts on {key}; resume the original request"
                     )
-            return (
+            resumed = (
                 recorded["cpu_cluster_arn"],
                 tuple(recorded["gpu_cluster_arns"]),
                 recorded["admin_email"],
             )
+            if precheck is not None:
+                precheck(resumed[0], resumed[1], True)
+            return resumed
         if not cpu_arn or not gpu_arns:
             raise SiteConfigError(
                 "deploy requires --cpu-cluster-arn and at least one --gpu-cluster-arn"
@@ -103,6 +113,8 @@ def initial_deploy_request(
             admin_email = validate_admin_email(admin_email)
         except BootstrapError as exc:
             raise SiteConfigError(str(exc)) from exc
+        if precheck is not None:
+            precheck(cpu_arn, gpu_arns, False)
         write_json_atomic(
             path,
             {

@@ -4607,8 +4607,8 @@ Before resuming, the driver reads the state of the first deploy (`boot029_receip
 first deploy is **not run again** (a second run is a release whose images are registry reuse, no cold build);
 `first_deploy_already_complete` is recorded and the stage continues with the missing `join-cluster`, the cold-build
 verdict still reading the attempt log that holds the build. When `initial-deploy-request.json` records a GPU cluster
-set other than this first `deploy`'s (the live shape: the product recorded the two-provider request before refusing
-the mixed first deploy), the driver fails before any command with "a first deploy cannot change its request -- start
+set other than this first `deploy`'s (the shape an earlier version left when it recorded the two-provider request before
+refusing the mixed first deploy; the product now refuses that shape before it records anything), the driver fails before any command with "a first deploy cannot change its request -- start
 the sequence in a new empty state directory": the product refuses to change a recorded first-deploy request, so the
 sequence can only start over in a new empty directory.
 

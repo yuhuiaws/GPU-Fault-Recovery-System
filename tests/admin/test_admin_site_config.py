@@ -36,6 +36,7 @@ from gpu_fault.admin.config_file import (
 from gpu_fault.admin.config_patch import preset_admin_config
 from gpu_fault.admin.operation_lock import SiteOperationBusy, site_operation_lock
 from gpu_fault.admin.site import SiteConfigError
+from tests.admin._first_deploy_discovery import stub_first_deploy_discovery
 from tests.admin.test_admin_config import legacy_capacity_record
 from tests.admin.test_admin_site import REGION, mock_live_release, site_file
 
@@ -629,6 +630,7 @@ def test_first_deploy_can_import_private_admin_config(
     monkeypatch.setattr(
         admin_cli, "run_source_deploy", lambda **kwargs: calls.append(kwargs) or 0
     )
+    stub_first_deploy_discovery(monkeypatch)
     arguments = admin_cli.parser().parse_args(
         [
             "deploy",
