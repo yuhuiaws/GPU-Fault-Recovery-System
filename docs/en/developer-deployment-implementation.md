@@ -1528,6 +1528,13 @@ namespace, token, Executor IAM, Node Action key, NLB NAT EIP and Private Hosted 
 VPC association may none of them be created ahead of time for a cluster awaiting join. The remaining ARNs are kept only as batch join input. Route53
 associations are deduplicated by `Region + VPC ID`; when several GPU clusters share a VPC it is registered only once, and remove disassociates only when no
 remaining cluster references that VPC.
+That deduplication is for clusters joined one after another: a later join of the VPC finds the association (`association_adopted`) and its NAT EIP
+ingress rules (`InvalidPermission.Duplicate`; EIPs of managed members never count as created) and claims neither, so its rollback leaves them, and remove
+keeps both while a remaining member or the CPU cluster uses the VPC. The members of one batch would prepare that network in parallel from one shared
+baseline, whichever creates a rule or the association journals it (`created_ingress_eips`, `association_created`), and the rollback runs per member while
+its siblings stay; `cluster_batch_join._checkpoint_readonly_results` therefore refuses, after read-only discovery and before any prerequisite, a batch in
+which two members share a cluster id, EKS ARN, HyperPod name (`eks:<EKS ARN>` on plain EKS), kube context or VPC ID
+(`batch join discovered conflicting cluster identities`). The custody path joins serially and never reaches this check.
 `resource_registry_dns` generates association records centrally: the CPU native association is marked explicitly and cannot be inferred from list position;
 new GPU associations use a stable physical key, while existing numeric or cluster-form keys are kept by full zone/Region/VPC identity,
 so member reordering does not rewrite the immutable ownership, delete policy or dependencies. The association origin must be explicit:

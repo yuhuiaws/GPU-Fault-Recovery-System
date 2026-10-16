@@ -1804,7 +1804,7 @@ so as not to change UIDs pending or already authorised. Registration, independen
 The first infrastructure phase creates only the namespace, token, IAM, NAT whitelist
 and Private Hosted Zone VPC association needed by the CPU and the first baseline GPU cluster; other GPU ARNs get no network permission in advance. Each later join adds only
 its own exclusive resources. When several clusters share the same VPC it is associated only once, and removing one of them does not disassociate a VPC still used by other
-clusters.
+clusters. That holds for clusters joined one after another; one batch refuses two clusters of the same VPC (§5.0.4, known limit 4).
 
 State lives in `join-cluster/<arn-hash>/state.json` next to `site.yaml` (`<arn-hash>` = the first 12 characters of the sha256 of the ARN
 as given, not the internal cluster id; the same cluster written as EKS ARN and as HyperPod ARN lands in
@@ -2218,7 +2218,7 @@ without the removal journal the departure is unproven -- while the cluster exist
 and a `join-cluster` with several ARNs go through the batch join, and one batch may hold several plain EKS clusters: two
 `spec.clusters[]` entries are the same cluster only when their cluster id, EKS ARN or kube context match, or when both
 carry the same HyperPod name (`bootstrap_discovery.same_cluster_entry`; the single-cluster join commit uses the same
-judgement).
+judgement). The batch additionally refuses two members that share a VPC (known limit 4 below).
 
 **Known limits:**
 
@@ -2244,6 +2244,22 @@ judgement).
    `src/gpu_fault/admin/deadlines.py`, not configurable); at the deadline the running step fails with `deployment
    deadline exceeded`. For a release that rolls node runtimes on every cluster, estimate from the number of clusters
    whether both budgets suffice.
+4. **Two clusters of one VPC cannot join in one batch.** After read-only discovery, before any change to IAM, the
+   network, node keys or the clusters, the batch compares its members pairwise -- cluster id, EKS ARN, HyperPod name
+   (`eks:<EKS ARN>` for plain EKS), kube context, VPC ID -- and refuses the whole batch if any is equal:
+   `gpu-fault-admin: batch join discovered conflicting cluster identities` (it names neither the clusters nor the field;
+   between two distinct clusters it is a shared VPC, or the shared name of limit 2). Only members of the batch are
+   compared; a member in the VPC of a managed cluster or of the CPU cluster joins normally. Why: the members prepare
+   their network in parallel from one network baseline, whichever creates the NLB ingress rule of a NAT EIP or the
+   VPC's private hosted zone association records it as its own attempt's work, and a member that fails before
+   activation is rolled back alone -- revoking the rule and detaching the association that the other member of the VPC
+   still uses. Join such clusters one after another: `join-cluster` the first (clusters of other VPCs may share its
+   batch), then the next of that VPC in a separate `join-cluster` once the first returned `COMPLETED`; that join finds
+   the association and the rules in place and adopts them without claiming them, so its rollback leaves them, and
+   `remove-cluster` keeps both while a remaining member or the CPU cluster uses the VPC. `deploy` refuses the same way
+   when the ARNs it hands to the batch join (the added ARNs, or those after the first on a first deploy) contain such
+   a pair, and again on a rerun; join those clusters with `join-cluster` as above. A site with registered Node key
+   custody joins several ARNs one after the other and is not refused.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 

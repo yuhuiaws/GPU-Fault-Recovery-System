@@ -5444,6 +5444,11 @@ site.yaml). The batch summary (joined/already_managed/failed with each cluster's
 in the command result, and on partial failure it is output with the error message; no separate batch state file is written any more. Each cluster independently goes through
 `PENDING -> ACTIVE/FAILED -> ROLLED_BACK`; the formal site, release state and Aurora registry
 are merged incrementally inside the site operation lock, and one failed cluster does not undo the successful clusters of the same batch.
+Two clusters of one VPC cannot join in one batch: after read-only discovery and before any IAM, network or node-key change, the batch refuses with
+`batch join discovered conflicting cluster identities` when two members share a VPC ID (or a cluster id, EKS ARN, HyperPod name or
+kube context), because a member rolled back alone would revoke the NAT EIP ingress rule or detach the private hosted zone association it
+created while the other member of that VPC still uses it; join the next cluster of that VPC in a separate `join-cluster` after the first
+returned `COMPLETED` (`administrator-operations.md` §5.0.4, known limit 4).
 When several join CLIs start concurrently on the same site, only one obtains the site operation lock; the rest fail immediately reporting the pid and command of the
 lock holder (deploy, join, remove, uninstall, config and workflow-reconcile share this one
 lock and this one policy), never waiting silently. Parallelism only happens inside a single batch.
