@@ -5740,10 +5740,17 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
   is set by `--duration-seconds`, default `900` (one A claim sample every 30 seconds plus the sampling round's own
   duration -- about 19 samples in 900 s on the live sites); the 30 minutes below corresponds to `--duration-seconds 1800`.
   The baseline is 10 A claim samples at the same 30-second cadence (five minutes) before anything is blocked.
+  Every A claim is sampled with `CLAIM_LATENCY_PROBE` (`claim_sample`): inside the A executor container, whose CPU limit is
+  500m, the probe idles `0.3` s after its own start-up -- the exec, the interpreter and the `gpu_fault` import use up the
+  container's 50 ms CFS quota of a 100 ms period -- and reads the container's CFS counters (`cpu.stat`: cgroup v2
+  `nr_throttled`/`throttled_usec`, else cgroup v1 `throttled_time`) around the timed claim; a sample whose throttle counter
+  advanced carries `client_cpu_throttled=true` and `client_cpu_throttled_seconds`, one without a readable `cpu.stat` carries
+  `null`. The evidence's `a_claim_latency` names, per phase, the samples, the judged claims, the throttled and unread ones and
+  the fastest/p50/p95 they gave (`a_claim_base_*`, `a_claim_p50_*`, `a_claim_p95_*`).
 - Purpose: §12 gate. Requires two **physical** clusters.
 - Steps:
-  1. Record the normal baseline of both clusters: each one's claim latency p50/p95 (10 samples at the window's cadence, five
-     minutes) and the `sample_count` growth rate of `/v1/collector-status/*`.
+  1. Record the normal baseline of both clusters: each one's claim latency -- fastest, p50, p95 (10 samples at the window's
+     cadence, five minutes) -- and the `sample_count` growth rate of `/v1/collector-status/*`.
   2. Take cluster B offline as a whole: on the B nodes' OUTPUT/FORWARD chains `REJECT` TCP 443 to the
      explicit control-plane CIDR, first confirming node by node that the independent recovery timer has started.
      Do not delete B's Deployments and do not modify AWS security groups or NACLs.
@@ -5758,14 +5765,20 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
      - check the Ready status and restart counts of the three control-plane replicas every minute.
   4. Restore B's egress rules and observe how long B takes to recover.
 - Verdict:
-  - A's claim latency: the median rises by less than 20% or 10 ms and the p95 by less than 20% or 100 ms (whichever is
-    larger), with no 5xx throughout. The floors are the claim path's measured background, not a tolerance: on the live sites
-    the authenticated claim from an executor Pod is bimodal -- 14-30 ms, and 45-90 ms for a few samples every two to three
-    minutes -- before any block (attempts whose baseline showed the tail with cluster B still talking) and under the block
-    (a cut whose first eleven minutes showed the tail and whose last eight samples did not); a five-sample baseline that
-    happened to see the fast mode only then read the background as the block's doing (p95 22 ms -> 78 ms, median 21 -> 28 ms,
-    no rejection, no restart, no 5xx). A shared control plane giving way moves every claim -- the median -- by more than the
-    path's jitter or ends in 5xx, and both still fail the rule; 20% of a 20 ms baseline (4 ms) is below the jitter.
+  - A's claim latency, over the judged claims -- 200s with a valid latency that the probe's own container did not throttle:
+    the fastest claim and the median rise by less than 20% or 10 ms and the p95 by less than 20% or 100 ms (whichever is
+    larger), with no 5xx in any sample. Each phase needs at least half of its claims judged, otherwise its latency is not
+    judged and the case fails; the median is compared only when every judged claim of both phases carries a throttle
+    reading -- otherwise a `validation_limitations` line says so and the fastest claim and the p95 decide. A throttled claim
+    measured the executor container's CPU quota, not the control plane: before the probe settled and read its counters, A's
+    samples were a 13-29 ms fast mode plus, in half or more of them, one or two stalls of 20-75 ms -- in the baseline with
+    cluster B still talking and under the cut alike; the container's counters showed about half of its active CFS periods
+    throttled for 38-48 ms each, B's in-cut samples (a locally rejected connect that never reaches the control plane) carried
+    the same modes, and the control plane's store-I/O admission and pool checkout waits stayed under 0.1 ms with its API
+    Pods unthrottled. A median between those modes of 10 and 19 samples moved by -16 to +19 ms with nothing degraded, so it
+    passed or failed by chance. A shared control plane giving way moves every claim -- the fastest included -- by more than
+    the path's jitter or ends in 5xx, and both still fail the rule; a heavier tail fails on the p95. The floors are the fast
+    mode's own spread (10 ms; 20% of a 20 ms baseline is 4 ms) and the stalls' height (100 ms), not a tolerance.
   - A's XID 11 closed loop completes normally;
   - The three control-plane replicas have no restarts and no OOM;
   - B's `cluster_queue_depth` may grow but must not trigger
@@ -5775,6 +5788,8 @@ The former `probe-clusters` mode (one enabled claim per cluster) has been remove
 - Known limitations: the control plane's `store_io` thread pool and processor workers are **globally shared**,
   with no per-cluster quota. If A's latency rises while B is offline,
   the measured figures must be recorded in `validation_limitations` and used as capacity-planning input.
+- The throttle reading is the probe container's own cgroup: a stall imposed only by the Pod-level cgroup (the same 500m) is
+  not visible to it; the fastest-claim rule and the floors absorb such a stall.
 - `REJECT` refuses connections immediately and is not equivalent to the timeout pile-up of an SG/NACL `DROP`;
   this item cannot claim to have tested DROP. Both A and B must still prove the same release, node UIDs,
   workload/attempt and the complete set of Ready containers; cleanup waits for the actions' terminal state before deleting the owned resources.

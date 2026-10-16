@@ -614,7 +614,7 @@ class IdentitySite:
         return time.monotonic() - started
 
 
-CLAIM_PROBE = r"""
+_CLAIM_PROBE_REQUEST = r"""
 import errno
 import json
 import os
@@ -657,21 +657,24 @@ request = urllib.request.Request(
 context = ssl.create_default_context(
     cafile=os.environ["GPU_FAULT_CONTROL_PLANE_CA_FILE"]
 )
+"""
+
+_CLAIM_PROBE_TIMED = r"""
 started = time.monotonic()
 try:
     with urllib.request.urlopen(request, context=context, timeout=20) as response:
         body = json.loads(response.read() or b"{}")
-        print(json.dumps({
+        result = {
             "status": response.status,
             "latency_seconds": time.monotonic() - started,
             "command_count": len(body.get("commands") or []),
-        }))
+        }
 except urllib.error.HTTPError as exc:
-    print(json.dumps({
+    result = {
         "status": exc.code,
         "latency_seconds": time.monotonic() - started,
         "detail": exc.read().decode()[:500],
-    }))
+    }
 except Exception as exc:
     reason = exc.reason if isinstance(exc, urllib.error.URLError) else exc
     network_failure = (
@@ -681,13 +684,80 @@ except Exception as exc:
             errno.ECONNREFUSED, errno.ETIMEDOUT, errno.ENETUNREACH, errno.EHOSTUNREACH
         }
     )
-    print(json.dumps({
+    result = {
         "status": None,
         "transport_error": type(exc).__name__,
         "transport_failure_kind": "network" if network_failure else "unclassified",
         "latency_seconds": time.monotonic() - started,
-    }))
-""".replace("__PROBE_OWNER__", ACCEPTANCE_PROBE_OWNER)
+    }
+"""
+
+CLAIM_PROBE = (
+    _CLAIM_PROBE_REQUEST + _CLAIM_PROBE_TIMED + "print(json.dumps(result))\n"
+).replace("__PROBE_OWNER__", ACCEPTANCE_PROBE_OWNER)
+
+#: How long the latency probe idles after its imports before it times the
+#: claim. It runs in the executor container, whose CPU limit (500m: a 50 ms
+#: CFS quota per 100 ms period) its own start-up -- the exec, the interpreter,
+#: the ``gpu_fault`` import -- uses up; a claim timed straight after it absorbs
+#: throttle stalls (live, ISO-006: half or more of all A samples one or two
+#: stalls of 20-75 ms above a 13-29 ms fast mode, in the baseline and under the
+#: cut alike, and the same modes in cluster B's in-cut samples, which never
+#: leave B). Three idle periods hand the timed claim a refilled quota.
+CLAIM_LATENCY_SETTLE_SECONDS = 0.3
+
+#: Where a container reads its own CFS throttling counters: cgroup v2's
+#: unified ``cpu.stat`` (``throttled_usec``), else cgroup v1's ``cpu``
+#: controller (``throttled_time``, nanoseconds) under its two mount names.
+CLIENT_CPU_STAT_SOURCES = (
+    ("/sys/fs/cgroup/cpu.stat", "throttled_usec", 1e6),
+    ("/sys/fs/cgroup/cpu/cpu.stat", "throttled_time", 1e9),
+    ("/sys/fs/cgroup/cpu,cpuacct/cpu.stat", "throttled_time", 1e9),
+)
+
+#: Probe source (stdlib only): ``(throttled periods, throttled seconds)`` of
+#: the probe's own container, or None when no ``cpu.stat`` is readable.
+CLIENT_CPU_THROTTLING_SOURCE = r"""
+def client_cpu_throttling(sources=__CPU_STAT_SOURCES__):
+    for path, field, scale in sources:
+        try:
+            with open(path, encoding="ascii") as handle:
+                stat = dict(line.split(None, 1) for line in handle if line.strip())
+            return int(stat["nr_throttled"]), int(stat[field]) / scale
+        except (OSError, KeyError, ValueError):
+            continue
+    return None
+""".replace("__CPU_STAT_SOURCES__", repr(CLIENT_CPU_STAT_SOURCES))
+
+_CLAIM_LATENCY_SETTLE = f"""
+time.sleep({CLAIM_LATENCY_SETTLE_SECONDS!r})
+throttling_before = client_cpu_throttling()
+"""
+
+_CLAIM_LATENCY_RECORD = r"""
+throttling_after = client_cpu_throttling()
+measured = throttling_before is not None and throttling_after is not None
+result["client_cpu_throttled"] = (
+    throttling_after[0] > throttling_before[0] if measured else None
+)
+result["client_cpu_throttled_seconds"] = (
+    max(0.0, throttling_after[1] - throttling_before[1]) if measured else None
+)
+"""
+
+#: ``CLAIM_PROBE`` as a latency measurement: the same claim, timed after the
+#: settle, with ``client_cpu_throttled`` (True when the container's CFS
+#: throttle counter advanced while the claim was timed; None when unreadable)
+#: and ``client_cpu_throttled_seconds`` added to every outcome. A throttled
+#: sample measured the container's CPU quota, not the control plane.
+CLAIM_LATENCY_PROBE = (
+    _CLAIM_PROBE_REQUEST
+    + CLIENT_CPU_THROTTLING_SOURCE
+    + _CLAIM_LATENCY_SETTLE
+    + _CLAIM_PROBE_TIMED
+    + _CLAIM_LATENCY_RECORD
+    + "print(json.dumps(result))\n"
+).replace("__PROBE_OWNER__", ACCEPTANCE_PROBE_OWNER)
 
 
 def claim(site: IdentitySite, target: ClusterTarget) -> dict[str, Any]:
@@ -710,10 +780,14 @@ def claim_sample(
     so the claim runs in a Running Pod instead of waiting for a Ready one the
     block guarantees does not exist. The sample is the same measurement -- a
     transport failure proves the cut, a 200 proves the recovery.
+
+    The claim runs as ``CLAIM_LATENCY_PROBE``: timed after the settle, and
+    flagged ``client_cpu_throttled`` when the executor container's own CPU
+    quota stalled it, so a latency verdict can tell the two apart.
     """
 
     return fixture.executor_python(
-        CLAIM_PROBE, timeout=60, attempts=1, require_ready=not offline
+        CLAIM_LATENCY_PROBE, timeout=60, attempts=1, require_ready=not offline
     )
 
 

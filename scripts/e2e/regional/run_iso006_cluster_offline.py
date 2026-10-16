@@ -71,13 +71,8 @@ CIDR_HELP = (
     "NLB); repeatable; 0.0.0.0/0 is refused"
 )
 SAMPLE_INTERVAL_SECONDS = 30
-# The baseline samples at the window's cadence for five minutes. The A claim
-# path is bimodal on the live sites -- 14-30 ms, and 45-90 ms for a few samples
-# every two to three minutes -- before any block and with the block held
-# (attempt 6: slow samples in the first eleven minutes of the cut, none in the
-# last eight; attempts 2, 3 and 6: slow samples in the baseline with cluster B
-# still talking). Five samples over fifty seconds saw the fast mode only and
-# the verdict then read the background as the block's doing.
+# The baseline samples at the window's cadence for five minutes, so both phases
+# meet the same background.
 BASELINE_SAMPLES = 10
 BASELINE_INTERVAL_SECONDS = SAMPLE_INTERVAL_SECONDS
 # Margin between the observation window's end and the per-node restore timer:
@@ -87,15 +82,26 @@ RESTORE_MARGIN_SECONDS = 300
 MAX_BLOCK_SPAN_SECONDS = 120
 RECOVERY_TIMEOUT_SECONDS = 300
 LATENCY_MAX_INCREASE = 0.20
-# Floors under the relative rule: the fast mode's own spread within one phase
-# (14-30 ms) for the median, the slow mode's amplitude (45-90 ms) for the p95.
-# A shared-resource effect of the cut moves every claim -- the median -- by
-# more than the path's jitter, or ends in 5xx; it does not reproduce the
-# background's tail at the same height. 20 % of a 20 ms baseline is 4 ms.
+# What A's claim samples measured before the latency probe settled and read its
+# container's CFS counters: a 13-29 ms fast mode plus, in half or more of all
+# samples (baseline and cut alike, four live attempts), one or two stalls of
+# 20-75 ms -- the 500m executor container throttled while the claim was timed
+# (its counters: about half of its active CFS periods throttled, 38-48 ms
+# each). Cluster B's in-cut samples, which never leave B, carry the same modes;
+# the control plane's store-I/O admission and pool checkout waits stayed under
+# 0.1 ms and its API CPU unthrottled.
+# A median between two such modes of 10 and 19 samples moved -16, +9, +19 and
+# +15 ms across those attempts with nothing degraded. So a claim the probe's
+# container throttled is not a sample of the control plane; the floors stay
+# the measured spread of the fast mode (10 ms) and the stalls' height (100 ms).
+LATENCY_BASE_FLOOR_SECONDS = 0.010
 LATENCY_P50_FLOOR_SECONDS = 0.010
 LATENCY_P95_FLOOR_SECONDS = 0.100
 #: Kept for the callers that read the old name.
 LATENCY_P95_MAX_INCREASE = LATENCY_MAX_INCREASE
+#: The share of a phase's 200 claims that must be judgeable -- not throttled
+#: on the probe's side -- before that phase's latency means anything.
+MIN_JUDGED_SHARE = 0.5
 VALIDATION_LIMITATIONS = [
     "store_io admission and the processor worker pool are shared across the "
     "whole region; there is no per-cluster quota, so a blocked cluster's "
@@ -108,12 +114,15 @@ VALIDATION_LIMITATIONS = [
     "grow. Each block receipt names the node, its roles and the rules read back.",
     "A-cluster claim latency is sampled from one Ready executor Pod with the "
     "acceptance probe owner; it measures the authenticated claim path, not "
-    "the executor's own poll loop. The path is bimodal on the live sites "
-    "(14-30 ms, and 45-90 ms for a few samples every two to three minutes) with "
-    "or without a block, so the verdict compares the median within 20 % or 10 ms "
-    "and the p95 within 20 % or 100 ms, whichever is larger, over a baseline of "
-    "the window's cadence; a saturation of the shared control plane would move "
-    "every claim or end in 5xx, which the rule still catches.",
+    "the executor's own poll loop. The probe runs inside the executor "
+    "container (CPU limit 500m), so it idles after its start-up before timing "
+    "and reads the container's CFS counters around the claim: a claim the "
+    "container's own quota stalled is recorded (client_cpu_throttled) and left "
+    "out of the latency statistics, and each phase needs half its claims "
+    "judgeable. The verdict compares the fastest judged claim (every claim "
+    "moves when the shared control plane gives way) and the median within 20 % "
+    "or 10 ms, and the p95 within 20 % or 100 ms, whichever is larger; the "
+    "median is judged only on claims that carry a throttle reading.",
     "Cluster B's executor Pods are NotReady for the length of the block by "
     "design -- their readiness probe is an authenticated POST to the control "
     "plane the block rejects -- so B's cut proof, in-window claims and "
@@ -446,23 +455,53 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
     return details
 
 
-def latency_quantile(samples: list[dict[str, Any]], quantile: float) -> float | None:
-    """The nearest-rank quantile of the successful (200) claim latencies."""
-
-    values = sorted(
-        float(item["latency_seconds"])
-        for item in samples
-        if isinstance(item.get("latency_seconds"), (int, float))
-        and not isinstance(item["latency_seconds"], bool)
-        and math.isfinite(item["latency_seconds"])
-        and item["latency_seconds"] >= 0
-        and type(item.get("status")) is int
-        and item["status"] == 200
+def _valid_latency(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+        and value >= 0
     )
+
+
+def client_throttled(item: dict[str, Any]) -> bool | None:
+    """Whether the probe's own container was CPU-throttled while the claim was
+    timed (``CLAIM_LATENCY_PROBE``); None when the sample carries no reading."""
+
+    value = item.get("client_cpu_throttled")
+    return value if isinstance(value, bool) else None
+
+
+def judged_claims(samples: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The 200 claims with a valid latency the probe's container did not stall:
+    the samples of the control plane's claim path."""
+
+    return [
+        item
+        for item in samples
+        if type(item.get("status")) is int
+        and item["status"] == 200
+        and _valid_latency(item.get("latency_seconds"))
+        and client_throttled(item) is not True
+    ]
+
+
+def _quantile(values: list[float], quantile: float) -> float | None:
+    """The nearest-rank quantile of ``values``."""
+
     if not values:
         return None
-    index = max(0, min(len(values) - 1, round(quantile * (len(values) - 1))))
-    return values[index]
+    ordered = sorted(values)
+    index = max(0, min(len(ordered) - 1, round(quantile * (len(ordered) - 1))))
+    return ordered[index]
+
+
+def latency_quantile(samples: list[dict[str, Any]], quantile: float) -> float | None:
+    """The nearest-rank quantile of the judged claims' latencies."""
+
+    return _quantile(
+        [float(item["latency_seconds"]) for item in judged_claims(samples)], quantile
+    )
 
 
 def latency_p95(samples: list[dict[str, Any]]) -> float | None:
@@ -471,6 +510,40 @@ def latency_p95(samples: list[dict[str, Any]]) -> float | None:
 
 def latency_p50(samples: list[dict[str, Any]]) -> float | None:
     return latency_quantile(samples, 0.50)
+
+
+def latency_base(samples: list[dict[str, Any]]) -> float | None:
+    """The fastest judged claim: what the path costs without any queueing."""
+
+    return latency_quantile(samples, 0.0)
+
+
+def median_is_judged(
+    baseline: list[dict[str, Any]], window: list[dict[str, Any]]
+) -> bool:
+    """The median is compared only between claims proven unthrottled: every
+    judged claim of both phases carries a throttle reading. Samples from a
+    probe that read no ``cpu.stat`` may still hide a stall in either phase."""
+
+    judged = [*judged_claims(baseline), *judged_claims(window)]
+    return bool(judged) and all(client_throttled(item) is False for item in judged)
+
+
+def latency_summary(samples: list[dict[str, Any]]) -> dict[str, Any]:
+    """What one phase's claim latency rests on, for the evidence."""
+
+    judged = judged_claims(samples)
+    return {
+        "samples": len(samples),
+        "judged": len(judged),
+        "client_cpu_throttled": sum(client_throttled(item) is True for item in samples),
+        "client_cpu_throttle_unread": sum(
+            client_throttled(item) is None for item in judged
+        ),
+        "base_seconds": latency_base(samples),
+        "p50_seconds": latency_p50(samples),
+        "p95_seconds": latency_p95(samples),
+    }
 
 
 def _latency_rise_error(
@@ -485,22 +558,50 @@ def _latency_rise_error(
     )
 
 
+def _judged_share_errors(
+    baseline: list[dict[str, Any]], window: list[dict[str, Any]]
+) -> list[str]:
+    errors = []
+    for phase, samples in (("baseline", baseline), ("block", window)):
+        answered = [
+            item
+            for item in samples
+            if item.get("status") == 200 and _valid_latency(item.get("latency_seconds"))
+        ]
+        judged = judged_claims(samples)
+        if answered and len(judged) < math.ceil(MIN_JUDGED_SHARE * len(answered)):
+            errors.append(
+                f"A claim latency could not be judged during the {phase}: "
+                f"{len(answered) - len(judged)} of {len(answered)} claims were "
+                "stalled by the probe container's own CPU quota"
+            )
+    return errors
+
+
 def latency_errors(
     baseline: list[dict[str, Any]],
     window: list[dict[str, Any]],
 ) -> list[str]:
-    """The catalog's A-cluster judgments: the median within +20 % or 10 ms, the
-    p95 within +20 % or 100 ms (whichever is larger), no 5xx. The floors are
-    the claim path's measured background (``VALIDATION_LIMITATIONS``)."""
+    """The catalog's A-cluster judgments over the judged claims (``judged_claims``):
+    the fastest claim and -- between claims proven unthrottled -- the median
+    within +20 % or 10 ms, the p95 within +20 % or 100 ms (whichever is
+    larger), no 5xx in any sample. The floors are the claim path's measured
+    background (``VALIDATION_LIMITATIONS``)."""
 
-    errors = []
-    pairs = (
-        ("p50", latency_p50(baseline), latency_p50(window), LATENCY_P50_FLOOR_SECONDS),
-        ("p95", latency_p95(baseline), latency_p95(window), LATENCY_P95_FLOOR_SECONDS),
-    )
+    errors = _judged_share_errors(baseline, window)
+    checks = [
+        ("base latency", latency_base, LATENCY_BASE_FLOOR_SECONDS),
+        ("p95", latency_p95, LATENCY_P95_FLOOR_SECONDS),
+    ]
+    if median_is_judged(baseline, window):
+        checks.insert(1, ("p50", latency_p50, LATENCY_P50_FLOOR_SECONDS))
+    pairs = [
+        (name, measure(baseline), measure(window), floor)
+        for name, measure, floor in checks
+    ]
     if any(base is None or during is None for _, base, during, _ in pairs):
         errors.append("claim latency could not be measured in both phases")
-    else:
+    elif not errors:
         for name, base, during, floor in pairs:
             assert base is not None and during is not None
             risen = _latency_rise_error(name, base, during, floor)
@@ -509,19 +610,21 @@ def latency_errors(
     for phase, samples in (("baseline", baseline), ("block", window)):
         for item in samples:
             status = item.get("status")
-            latency = item.get("latency_seconds")
             if type(status) is not int or status != 200:
                 errors.append(f"A claim returned {status} during the {phase}")
                 break
-            if (
-                not isinstance(latency, (float, int))
-                or isinstance(latency, bool)
-                or not math.isfinite(latency)
-                or latency < 0
-            ):
+            if not _valid_latency(item.get("latency_seconds")):
                 errors.append(f"A claim latency is invalid during the {phase}")
                 break
     return errors
+
+
+MEDIAN_UNJUDGED = (
+    "A's claim median was not judged: some judged claims carry no CPU throttle "
+    "reading from the probe's container (cpu.stat unreadable), so a stall of "
+    "the probe's own quota cannot be told from the control plane; the fastest "
+    "claim and the p95 were judged."
+)
 
 
 def queue_depth_delta(before: dict[str, Any], after: dict[str, Any]) -> float | None:
@@ -665,10 +768,9 @@ def observe_recovery_during_cut(
     result["a_recovery_exercised"] = True
     containers_after = control_plane_container_statuses(a)
     pressure_after = result["samples"][-1]["b_pressure"] if result["samples"] else {}
-    errors = latency_errors(
-        result["baseline_samples"],
-        [item["a_claim"] for item in result["samples"]],
-    )
+    window_claims = [item["a_claim"] for item in result["samples"]]
+    errors = latency_errors(result["baseline_samples"], window_claims)
+    record_claim_latency(result, window_claims)
     errors.extend(pressure_errors(pressure_before, pressure_after))
     errors.extend(container_status_errors(containers_before, containers_after))
     result["pressure_before"] = pressure_before
@@ -686,12 +788,31 @@ def observe_recovery_during_cut(
             QUEUE_DEPTH_UNAVAILABLE,
         ]
     result["cpu_containers_after"] = containers_after
-    window_claims = [item["a_claim"] for item in result["samples"]]
-    result["a_claim_p95_baseline_seconds"] = latency_p95(result["baseline_samples"])
-    result["a_claim_p95_window_seconds"] = latency_p95(window_claims)
-    result["a_claim_p50_baseline_seconds"] = latency_p50(result["baseline_samples"])
-    result["a_claim_p50_window_seconds"] = latency_p50(window_claims)
     return errors
+
+
+def record_claim_latency(result: dict[str, Any], window: list[dict[str, Any]]) -> None:
+    """A's claim-latency figures over the judged claims, what each phase's
+    figures rest on, and why the median was left out when it was."""
+
+    baseline = result["baseline_samples"]
+    judged = median_is_judged(baseline, window)
+    result["a_claim_latency"] = {
+        "baseline": latency_summary(baseline),
+        "block": latency_summary(window),
+        "median_judged": judged,
+    }
+    result["a_claim_base_baseline_seconds"] = latency_base(baseline)
+    result["a_claim_base_window_seconds"] = latency_base(window)
+    result["a_claim_p95_baseline_seconds"] = latency_p95(baseline)
+    result["a_claim_p95_window_seconds"] = latency_p95(window)
+    result["a_claim_p50_baseline_seconds"] = latency_p50(baseline)
+    result["a_claim_p50_window_seconds"] = latency_p50(window)
+    if not judged:
+        result["validation_limitations"] = [
+            *result.get("validation_limitations", VALIDATION_LIMITATIONS),
+            MEDIAN_UNJUDGED,
+        ]
 
 
 def host_probes(
@@ -788,8 +909,13 @@ def execute_case(
                 }
             )
             time.sleep(BASELINE_INTERVAL_SECONDS)
-        if latency_errors(result["baseline_samples"], result["baseline_samples"]):
-            raise RegionalFixtureError("claim baseline is incomplete or unhealthy")
+        unhealthy = latency_errors(
+            result["baseline_samples"], result["baseline_samples"]
+        )
+        if unhealthy:
+            raise RegionalFixtureError(
+                "claim baseline is incomplete or unhealthy: " + "; ".join(unhealthy)
+            )
         # Every probe Pod Ready first, then the blocks back to back: each
         # node's restore timer is armed from its own block time, so the
         # blocks must not be spread over the Pod scheduling of the others.

@@ -277,11 +277,16 @@ journals retain their original guarded recovery path.
   `gpu-fault-certificate-check.timer`. Without them the expiry-alert checks are
   recorded `NOT_EVALUATED` and counted as false, so the case is `FAIL`.
 - `run_iso006_cluster_offline.py --duration-seconds` defaults to `900`
-  (30 A-claim samples at 30 s); the catalog's 30-minute window is reachable by
-  passing `1800`. The block is on both the `OUTPUT` and `FORWARD` chains of
-  every B node, TCP 443 to the explicit control-plane CIDRs only, and the run
-  refuses to observe until a `cut_proof` claim from B fails at the transport
-  (no HTTP status at all).
+  (about 19 A-claim samples, one every 30 s plus the sampling round); the
+  catalog's 30-minute window is reachable by passing `1800`. The block is on
+  both the `OUTPUT` and `FORWARD` chains of every B node, TCP 443 to the
+  explicit control-plane CIDRs only, and the run refuses to observe until a
+  `cut_proof` claim from B fails at the transport (no HTTP status at all).
+  A's claim latency is judged over the claims its probe's own executor
+  container did not CPU-throttle (`client_cpu_throttled`, read from the
+  container's `cpu.stat` around the timed claim after a 0.3 s settle): the
+  fastest claim and the median within 20 % or 10 ms, the p95 within 20 % or
+  100 ms, half of each phase's claims judged.
 - `run_destr016_preempting_reboot.py --max-hold-seconds` defaults to `2400`;
   the preflight refuses anything below `required_hold_seconds()` (barrier,
   absorb, preemption and supersession budgets plus margin).

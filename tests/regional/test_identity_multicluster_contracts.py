@@ -599,16 +599,19 @@ def test_iso006_cut_must_be_proven_at_the_transport() -> None:
     assert iso006.cut_proven({"status": 403}) is False
 
 
-def _claims(*latencies: float) -> list[dict[str, Any]]:
-    return [{"status": 200, "latency_seconds": value} for value in latencies]
+def _claims(*latencies: float, **reading: bool) -> list[dict[str, Any]]:
+    return [{"status": 200, "latency_seconds": value, **reading} for value in latencies]
 
 
-def test_iso006_latency_judgment_is_median_and_p95_within_bounds_and_no_5xx() -> None:
-    baseline = _claims(*([0.10] * 10))
-    fine = _claims(*([0.11] * 10))
-    slow = _claims(*([0.13] * 10))
+def test_iso006_latency_judgment_is_base_median_p95_and_no_5xx() -> None:
+    unthrottled = {"client_cpu_throttled": False}
+    baseline = _claims(*([0.10] * 10), **unthrottled)
+    fine = _claims(*([0.11] * 10), **unthrottled)
+    slow = _claims(*([0.13] * 10), **unthrottled)
     assert iso006.latency_errors(baseline, fine) == []
-    assert any("p50 rose" in item for item in iso006.latency_errors(baseline, slow)), (
+    assert [
+        item.split(" rose ")[0] for item in iso006.latency_errors(baseline, slow)
+    ] == ["A claim base latency", "A claim p50"], (
         "a 30% shift of every claim passed the 20% bound"
     )
     assert any(
@@ -625,9 +628,10 @@ def test_iso006_latency_judgment_is_median_and_p95_within_bounds_and_no_5xx() ->
 def test_iso006_latency_floors_read_the_bimodal_background_not_the_block() -> None:
     """Live (attempt 7): the baseline saw the fast mode only (15-22 ms) and the
     window the usual mix (eleven samples at 15-30 ms, eight at 56-91 ms) -- the
-    same tail the baselines of attempts 2, 3 and 6 showed with no block held.
-    The median moved 6.7 ms and the p95 56 ms; neither is the shared control
-    plane giving way, which moves every claim or ends in 5xx."""
+    same tail the baselines of attempts 2, 3 and 6 showed with no block held,
+    the probe container's own CPU throttling (test_iso006_claim_latency). The
+    fastest claim did not move and the p95 rose 56 ms; neither is the shared
+    control plane giving way, which moves every claim or ends in 5xx."""
 
     baseline = _claims(0.0199, 0.0154, 0.0210, 0.0220, 0.0221)
     window = _claims(
@@ -655,10 +659,9 @@ def test_iso006_latency_floors_read_the_bimodal_background_not_the_block() -> No
 
     every_claim_slower = _claims(*([0.040] * 19))
     assert [
-        item[:17] for item in iso006.latency_errors(baseline, every_claim_slower)
-    ] == ["A claim p50 rose "], (
-        "a sustained shift of the median is still the block's doing"
-    )
+        item.split(" rose ")[0]
+        for item in iso006.latency_errors(baseline, every_claim_slower)
+    ] == ["A claim base latency"], "a shift of every claim is still the block's doing"
 
     heavier_tail = _claims(*([0.020] * 15), *([0.180] * 4))
     assert [item[:17] for item in iso006.latency_errors(baseline, heavier_tail)] == [
