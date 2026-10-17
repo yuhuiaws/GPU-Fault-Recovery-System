@@ -369,8 +369,18 @@ def test_contexts_record_each_clusters_automatic_updates_beside_its_facts() -> N
     }, "the group the ownership selector covers; the unmanaged g6 group is not"
     eks = facts["providers"]["gpu-eks"]
     assert eks["node_groups"] == {
-        "cpu-ng": {"status": "ACTIVE", "node_repair": "disabled", "gpu": False},
-        "gpu-ng": {"status": "ACTIVE", "node_repair": "disabled", "gpu": True},
+        "cpu-ng": {
+            "status": "ACTIVE",
+            "node_repair": "disabled",
+            "update_strategy": "DEFAULT",
+            "gpu": False,
+        },
+        "gpu-ng": {
+            "status": "ACTIVE",
+            "node_repair": "disabled",
+            "update_strategy": "DEFAULT",
+            "gpu": True,
+        },
     }, "the node group facts are what they were"
     assert eks[FIELD]["node_groups"] == [
         {
@@ -456,6 +466,7 @@ def test_validate_eks_managed_cluster_hands_back_the_documents_it_read() -> None
     assert facts["gpu-ng"] == {
         "status": "ACTIVE",
         "node_repair": "disabled",
+        "update_strategy": "DEFAULT",
         "gpu": True,
     }
 
