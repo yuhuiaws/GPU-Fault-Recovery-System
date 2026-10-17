@@ -1751,7 +1751,9 @@ node is terminated: the control plane's departed-node cleanup retires the old Ag
 creation, completing within minutes); within about one sync period (`GPU_FAULT_NODE_KEY_SYNC_SECONDS`, default 60 s)
 of the new node entering the cluster's node selector the cluster executor adds its key to `gpu-fault-node-action-keys`
 (§6), the waiting installer Pod then mounts it -- a `FailedMount ... references non-existent secret key` event seen
-before that is transient -- and the Agent registers at the end of the install, no deploy needed. Meanwhile:
+before that is transient -- and the Agent registers at the end of the install, no deploy needed. With updateStrategy
+`MINIMAL` (the standard for plain EKS GPU node groups, §5.0.1) the old node is terminated before its replacement is
+launched, so the group runs that node short from the termination until the replacement's Agent registers. Meanwhile:
 - the preflight of `gpu-fault-admin deploy` / `status --full` is **transiently** red (`installer is not Succeeded`,
   `has no registered Node Agents`) -- a fail-closed true reading; rerun once the installer Job is Complete, never touch
   the Store for it;
@@ -2036,12 +2038,14 @@ systemctl enable --now nvidia-dcgm
 Once the user data is in the node group's launch template, the nodes still have to pick it up:
 
 - **New node group**: pass the launch template at creation -- `aws eks create-nodegroup … --launch-template
-  name=<lt>,version=<N>`; the nodes carry the packages from their first boot and nothing has to be rolled.
+  name=<lt>,version=<N>`, with `--update-config maxUnavailable=1,updateStrategy=MINIMAL` (step 4 below) for its later
+  version updates; the nodes carry the packages from their first boot and nothing has to be rolled.
 - **Existing node group**: only a managed node group created with a launch template can change versions --
   `update-nodegroup-version` accepts a launch template only for a node group originally deployed with one, and only another
   version of that same launch template. A node group created without a launch template cannot start using one: create a new
-  GPU node group with a launch template (ownership label and node auto repair off as well, see above and below), move the
-  workloads, then delete the old group. A node group with a launch template changes versions in four steps:
+  GPU node group with a launch template (ownership label, node auto repair off and updateStrategy MINIMAL as well, see above
+  and below), move the workloads, then delete the old group. A node group with a launch template changes versions in five
+  steps:
 
   ```bash
   # 1. The launch template and version the node group uses
@@ -2057,16 +2061,28 @@ Once the user data is in the node group's launch template, the nodes still have 
     --version-description "gpu-fault node prerequisites: python3.12 strace" \
     --launch-template-data "{\"UserData\":\"$(base64 -w0 gpu-fault-user-data.mime)\"}" \
     --query 'LaunchTemplateVersion.VersionNumber' --output text     # the new version <N>
-  # 4. Roll the node group to the new version and wait for the update
+  # 4. Once per node group, before the first roll: updateStrategy MINIMAL (terminate before launch, no spare GPU
+  #    instance needed)
+  aws eks describe-nodegroup --cluster-name <eks cluster> --nodegroup-name <GPU node group> \
+    --query 'nodegroup.updateConfig' --output json        # {"maxUnavailable": 1}: no updateStrategy = DEFAULT
+  aws eks update-nodegroup-config --cluster-name <eks cluster> --nodegroup-name <GPU node group> \
+    --update-config maxUnavailable=1,updateStrategy=MINIMAL   # repeat the group's own maxUnavailable (or maxUnavailablePercentage=<n>)
+  aws eks wait nodegroup-active --cluster-name <eks cluster> --nodegroup-name <GPU node group>
+  # 5. Roll the node group to the new version and wait for the update
   aws eks update-nodegroup-version --cluster-name <eks cluster> --nodegroup-name <GPU node group> \
     --launch-template name=<lt>,version=<N> --query 'update.id' --output text
   aws eks describe-update --name <eks cluster> --nodegroup-name <GPU node group> --update-id <id> \
     --query update.status                                       # until Successful
   ```
-- **Live caveats (2026-10-07, gpu-eks-cluster)**: the roll launches **one** extra instance first (maxUnavailable 1), so a
-  Spot node group needs Spot capacity for one more p5en.48xlarge in its AZ -- when there is none, EKS fails the update
-  with `NodeCreationFailure` after about 17 minutes and reverts the node group to the previous launch-template version
-  with the nodes untouched (two of three attempts went that way; repeat the update later, failed attempts are harmless).
+- **Live caveats (2026-10-07, gpu-eks-cluster)**: with the default update strategy (`DEFAULT`, also a group without
+  `updateStrategy`) the roll launches **one** extra instance first (maxUnavailable 1), so a Spot node group needs Spot
+  capacity for one more p5en.48xlarge in its AZ -- when there is none, EKS fails the update with `NodeCreationFailure`
+  after about 17 minutes and reverts the node group to the previous launch-template version with the nodes untouched (two
+  of three attempts on the Spot p5en group went that way; repeat the update later, failed attempts are harmless). That is
+  why step 4 sets `MINIMAL`: the roll then terminates one node before it launches its replacement, needs no spare
+  instance, and the group is one GPU node short (1 of 2 out at a time) until each replacement joins (the join window
+  paragraph above); a replacement that cannot launch (Spot capacity) leaves the group short until one does.
+  Keep `maxUnavailable` below the group size: at or above it a `MINIMAL` roll takes the whole group out at once.
   Never start a roll while `gpu-fault-admin config`/`deploy` may run -- the `regional_contexts` preflight fails closed
   while the node group is UPDATING. After a successful roll follow the replacement-node join window paragraph above
   (`--retire-departed-agents` → the reconciler installs the new nodes), and confirm the packages on a new node before
@@ -2108,7 +2124,17 @@ aws eks update-nodegroup-config --cluster-name <eks cluster> --nodegroup-name <G
 starts with `has node auto repair enabled` and names the node group); the `regional_contexts` check of the deploy preflight
 and `status --full`/`verify` records each node group's `node_repair` (`disabled`/`unset`) and fails on `enabled` for a group
 the cluster's recorded selector covers (the groups the ownership label selects, the group a legacy selector names, or
-the groups hosting GPU instance types). Only the `eks:DescribeNodegroup` read is needed:
+the groups hosting GPU instance types). Next to `node_repair` the same check records each node group's update strategy,
+`health.checks[regional_contexts].details.providers.<cluster id>.node_groups.<node group>.update_strategy` (`DEFAULT` --
+also when the field is absent -- or `MINIMAL`; step 4 above), but never fails or warns for it and never refuses a deploy
+or join, so existing sites stay deployable. `status --full` adds one line per selected GPU node group (the same groups)
+not on `MINIMAL`, `gpu-fault-admin status: finding: <cluster id>: node group <g> updates with DEFAULT (surge): a version
+update needs one more GPU instance; set updateStrategy=MINIMAL (administrator operations §5.0.1)`, with `healthy` and
+the exit code unchanged; `gpu-fault-admin node-scope` shows per plain EKS cluster `update_strategy`: `node_groups` (every
+managed node group's strategy) and `advisories` (the same advisory for each selected GPU group not on `MINIMAL`, printed
+as `gpu-fault-admin node-scope: finding: <cluster id>: node group <g> updates with ...` lines). Nothing changes for
+HyperPod: SageMaker `UpdateClusterSoftware` re-images its instance groups in place, and its clusters have no such field.
+Only the `eks:DescribeNodegroup` read is needed:
 the operator identity and the executor role already hold it; the control-plane role needs nothing.
 
 **Host DCGM (optional): real verdicts from the quick diagnostic.** In the default embedded mode the exporter runs its own
@@ -2298,7 +2324,8 @@ operator's own AWS credentials through the product's command runner (API budget,
 gpu-fault-admin prepare-eks-nodegroup --cpu-cluster-arn <CPU ARN> --gpu-cluster-arn <GPU EKS ARN> \
   [--nodegroup <name> ...] [--state-dir <site state dir> | --work-dir <dir>] \
   [--dcgm-hostengine {embedded,host} [--dcgm-version <version[-release]>]] \
-  [--adopt-user-data-part <index|file name> ...] [--allowed-namespace <ns> ...] [--roll-timeout-minutes N]
+  [--adopt-user-data-part <index|file name> ...] [--keep-update-strategy] \
+  [--allowed-namespace <ns> ...] [--roll-timeout-minutes N]
 # Apply: the same arguments plus --apply --confirm PREPARE_EKS_NODEGROUP --reference <change id>
 # (--apply also needs --state-dir or --work-dir)
 ```
@@ -2313,7 +2340,8 @@ carry `--cluster-name <eks cluster> --nodegroup-name <node group>`):
 | 1. user data | whether the current launch template version carries the current managed part (`python3.12`, `strace`) | `aws ec2 create-launch-template-version --launch-template-id <lt-id> --source-version <current> --version-description "gpu-fault node prerequisites: ..." --launch-template-data '{"UserData":"<base64>"}'`: only UserData changes; a version an earlier run created with exactly this data (otherwise identical to the current version) is reused instead of creating another |
 | 2. node auto repair | whether `nodeRepairConfig.enabled` is `false` | when enabled or unset, `aws eks update-nodegroup-config ... --node-repair-config '{"enabled":false}'` (written explicitly so the product records `disabled`) |
 | 3. labels | whether `gpu-fault.io/control-plane=<site id>` is present (host mode: also `gpu-fault.io/dcgm-hostengine=host`) | `aws eks update-nodegroup-config ... --labels '{"addOrUpdateLabels":{"gpu-fault.io/control-plane":"<site id>"}}'` (plus the DCGM label in host mode; an explicit `--dcgm-hostengine embedded` sends `removeLabels` for that key only when it holds host or an unknown value) |
-| 4. roll | whether the group runs a version carrying the managed part | `aws eks update-nodegroup-version ... --launch-template '{"id":"<lt-id>","version":"<N>"}' --release-version <current releaseVersion>`: the AMI release version is pinned to the running one, so the roll changes only the user data; then a bounded wait on `aws eks describe-update --name <eks cluster> --nodegroup-name <node group> --update-id <id>` (`--roll-timeout-minutes`, default 90, max 360; configuration updates wait at most 15 minutes) |
+| 4. update strategy | whether `updateConfig.updateStrategy` is `MINIMAL` (absent: `DEFAULT`) | `aws eks update-nodegroup-config ... --update-config '{"maxUnavailable":1,"updateStrategy":"MINIMAL"}'`: the group's own `maxUnavailable`/`maxUnavailablePercentage` exactly as `describe-nodegroup` shows them (neither set: only `updateStrategy`, the EKS default stays in force); planned also when no roll is needed, since the strategy governs every later version update of the group; `--keep-update-strategy` skips it with a finding |
+| 5. roll | whether the group runs a version carrying the managed part | `aws eks update-nodegroup-version ... --launch-template '{"id":"<lt-id>","version":"<N>"}' --release-version <current releaseVersion>`: the AMI release version is pinned to the running one, so the roll changes only the user data; then a bounded wait on `aws eks describe-update --name <eks cluster> --nodegroup-name <node group> --update-id <id>` (`--roll-timeout-minutes`, default 90, max 360; configuration updates wait at most 15 minutes) |
 | current nodes | a read-only SSM `AWS-RunShellScript` inventory of every running instance: python3.12 venv, strace, the driver's CUDA major (`nvidia-smi -q` "CUDA Version"), every installed DCGM package with its version-release, `systemctl is-active nvidia-dcgm`, the unit's `Restart`/`RestartUSec`/`StartLimitBurst`/`StartLimitIntervalUSec` (`systemctl show`) and whether the restart drop-in is present, a running nv-hostengine, `dcgmi discovery -l` | reported, no package or service changed: `current_nodes` in the plan, with findings for DCGM build drift across the nodes (for example `datacenter-gpu-manager-4-cuda13` 4.7.0-1 on one node, 4.7.0-2 on another), differing driver CUDA majors and, in embedded mode, an active host engine (it conflicts with the exporter's embedded engine); without SSM permission the inventory is `unavailable` with the reason and the plan still completes |
 | Kubernetes | the allowed workload namespaces exist (default: the site's shared `allowedNamespaces` with `--state-dir`, else `training`; the control-plane namespace is created by the join and not required); the NVIDIA device plugin (kube-system, `app.kubernetes.io/name=nvidia-device-plugin`, the DaemonSet mounting the kubelet device-plugins directory) and EFA device plugin (`name=aws-efa-k8s-device-plugin`) DaemonSets run; no GPU client DaemonSet tolerates `gpu-fault.io/quiesce` (a key-less `operator: Exists` without an effect or with NoExecute) | reported, never changed and never blocking; read through a temporary kubeconfig `aws eks update-kubeconfig` writes with the operator's credentials; without Kubernetes access the findings show `available: false` and the reason |
 
@@ -2334,10 +2362,35 @@ Refused: a foreign part using the managed file name, two managed parts, an `--ad
 non-shell part, non-MIME, gzip or >16 KiB user data. The plan shows the managed part's script and the full merged
 document.
 
+**Update strategy**: GPU node groups rarely have a spare instance of their type, even on demand, so the verb sets
+`updateStrategy` `MINIMAL` on every group not on it yet, before any roll and also when no roll is needed (§5.0.1,
+step 4). The console shows the step as `updateStrategy DEFAULT -> MINIMAL (maxUnavailable 1 kept)`, and the roll's
+summary ends with its capacity effect, `(updateStrategy MINIMAL: a roll terminates before it launches -- 1 of 2 GPU
+nodes out at a time, no extra GPU instance needed)`. Like the other configuration updates the step is journaled and
+waited for (at most 15 minutes), and the group must be ACTIVE again before the next step; a group already on `MINIMAL`
+is compliant, so a rerun changes nothing. The plan JSON has per group `update_strategy`: `current` (`DEFAULT`/`MINIMAL`),
+`planned` (the strategy the roll uses: `MINIMAL` unless kept), `kept`, `unavailable` (the group's
+`maxUnavailable`/`maxUnavailablePercentage` as set), `capacity_effect` and, when there is one, `finding`; `roll.caveat`
+describes the `MINIMAL` roll (a replacement that cannot launch -- Spot capacity -- leaves the group short until one
+does, and the roll stops `ROLL_FAILED` or `ROLL_IN_PROGRESS`: rerun later). A `MINIMAL` roll that would take the whole
+group out at once (`maxUnavailable` at or above the group's `desiredSize`, or `maxUnavailablePercentage` 100) keeps the
+value as set and adds the finding `<node group>: updateStrategy MINIMAL with maxUnavailable 2: a roll takes 2 of 2 GPU
+nodes (the whole group) out at a time; lower maxUnavailable below the group size to keep GPU nodes up during a roll`.
+`--keep-update-strategy` is for an operator who deliberately keeps `DEFAULT` (for example a group with spare capacity
+that must not lose a node during the roll): no `update-config` step; the plan records the finding
+`<node group>: updateStrategy DEFAULT kept (--keep-update-strategy): a roll launches a replacement before it terminates
+a node -- it needs one more GPU instance of the type; MINIMAL needs no spare instance` (console `finding:` line,
+`update_strategy.finding` in the JSON and the journal) and proceeds, `roll.caveat` keeps the surge caveat (one more
+instance first, `NodeCreationFailure` after about 17 minutes, old nodes and version kept) and the printed apply command
+repeats `--keep-update-strategy`. `status --full` and `node-scope` report each selected GPU group not on `MINIMAL` as a
+finding (§5.0.1).
+
 **Apply** (`--confirm PREPARE_EKS_NODEGROUP` and `--reference` both required) re-plans, refuses before any write if any
 group is refused, then runs exactly the planned steps in the order above, one node group at a time, stopping at the
 first group that does not complete. Before every EKS write the group is re-read and must still be ACTIVE on the launch
-template version the plan saw, else it stops `CHANGED_SINCE_PLAN` and writes nothing more. After the steps (also when
+template version the plan saw, else it stops `CHANGED_SINCE_PLAN` and writes nothing more; before the roll it must also
+update with the strategy the plan rolls with (`MINIMAL` unless kept), else the run stops `CHANGED_SINCE_PLAN` without
+rolling (rerun to plan again). After the steps (also when
 nothing needed changing) the same inventory script **verifies** every running instance (found with
 `ec2 describe-instances` by the `eks:cluster-name`/`eks:nodegroup-name` tags;
 `aws ssm send-command --document-name AWS-RunShellScript` and `get-command-invocation`, after a bounded
@@ -2350,15 +2403,17 @@ no debug Pod, works before a site exists and leaves nothing on the node; it need
 `ssm:SendCommand`/`ssm:GetCommandInvocation` for the operator and `AmazonSSMManagedInstanceCore` on the node role,
 otherwise the outcome is `UNVERIFIED` and the `kubectl debug node/... chroot /host` check of §5.0.1 is the alternative.
 
-Outcomes per group: `COMPLETED` (exit 0); `ROLL_FAILED`, for example `NodeCreationFailure` -- the roll launches one
-extra replacement instance first; without capacity for it (Spot in particular) EKS fails the update after about 17
-minutes and keeps the old nodes and version, a clear retryable stop: rerun the same command later, the prepared launch
+Outcomes per group: `COMPLETED` (exit 0); `ROLL_FAILED`, for example `NodeCreationFailure` -- the replacement did not
+join, most often for want of capacity (Spot in particular): updateStrategy `DEFAULT` keeps the old nodes (EKS fails the
+update after about 17 minutes and keeps the old version), `MINIMAL` already terminated the node it replaces and the
+group stays short until a replacement joins; a clear retryable stop: rerun the same command later, the prepared launch
 template version is reused; `ROLL_IN_PROGRESS` (the wait bound was reached; rerun to keep waiting); `UPDATE_FAILED`;
 `CHANGED_SINCE_PLAN`; `VERIFICATION_FAILED`; `UNVERIFIED`; `FAILED` (an AWS call was refused: the message names
 the permission and the step's manual command). Any stop exits 2 with the reason and journals the attempt's outcome.
 
-**Idempotent and resumable**: a step already done is skipped (label present, repair disabled, managed part current,
-group already on a version carrying it), so a rerun after any stop converges. An update still in flight when a run
+**Idempotent and resumable**: a step already done is skipped (label present, repair disabled, update strategy already
+MINIMAL, managed part current, group already on a version carrying it), so a rerun after any stop converges.
+An update still in flight when a run
 stopped is journaled as `pending_update` and the next run waits for it (one EKS no longer knows is cleared and the
 group planned again); a group that is UPDATING without such a
 journaled update is refused. The journal is the evidence:
@@ -2412,7 +2467,8 @@ and custom AMIs follow the manual steps of §5.0.1 (the ownership label: §5.0.0
 `sagemaker:ListClusters`/`sagemaker:DescribeCluster` (the HyperPod check and the site id), Kubernetes read (namespaces,
 daemonsets) for the findings; `ssm:SendCommand`/`ssm:GetCommandInvocation` for the node inventory and the verification
 (without them the plan only loses the inventory, the apply ends `UNVERIFIED`); `--apply` adds
-`ec2:CreateLaunchTemplateVersion`, `eks:UpdateNodegroupConfig` and `eks:UpdateNodegroupVersion`.
+`ec2:CreateLaunchTemplateVersion`, `eks:UpdateNodegroupConfig` (node auto repair, labels, update strategy) and
+`eks:UpdateNodegroupVersion`.
 
 #### 5.0.2 After a join: kubeconfig current-context, the Agent-set check and `status` attribution
 

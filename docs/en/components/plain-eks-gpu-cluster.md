@@ -174,9 +174,11 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
 
 1. Node group: `AL2023_x86_64_NVIDIA` (or equivalent) AMI; launch template user data installing `python3.12 strace`
    (administrator-operations §5.0.1); the node group's EKS node auto repair off (`nodeRepairConfig.enabled=false` or
-   unset, administrator-operations §5.0.1); NVIDIA and EFA device plugins running; a GPU taint is fine.
-   For `AL2023_x86_64_NVIDIA` node groups `gpu-fault-admin prepare-eks-nodegroup` automates this item's user data and
-   node auto repair and item 5's ownership label (a read-only plan by default, `--apply` runs it;
+   unset, administrator-operations §5.0.1); the node group's `updateConfig.updateStrategy` `MINIMAL` (a `DEFAULT` roll
+   launches one more GPU instance before it terminates one; administrator-operations §5.0.1); NVIDIA and EFA device
+   plugins running; a GPU taint is fine.
+   For `AL2023_x86_64_NVIDIA` node groups `gpu-fault-admin prepare-eks-nodegroup` automates this item's user data, node
+   auto repair and update strategy and item 5's ownership label (a read-only plan by default, `--apply` runs it;
    administrator-operations §5.0.1a).
 2. Namespaces: every workload namespace in `allowedNamespaces` (the site's default list, e.g. `training`) must exist,
    or pass `--allowed-namespace` with namespaces that do.
