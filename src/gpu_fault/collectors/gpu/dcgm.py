@@ -27,6 +27,7 @@ from gpu_fault.collectors.sinks import (
     deliver_or_raise,
 )
 from gpu_fault.dcgm_fields import missing_dcgm_metric_groups
+from gpu_fault.env import env_bool
 from gpu_fault.gpu_fabric_manager import (
     FABRIC_MANAGER_ERROR_CODE,
     FABRIC_MANAGER_HELD_SECONDS,
@@ -34,7 +35,6 @@ from gpu_fault.gpu_fabric_manager import (
     FABRIC_MANAGER_UNSETTLED_WINDOW_SECONDS,
     held_samples,
 )
-from gpu_fault.env import env_bool
 from gpu_fault.gpu_metrics import (
     GpuMetricBatch,
     GpuMetricSample,
