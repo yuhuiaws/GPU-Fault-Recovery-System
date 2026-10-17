@@ -15,7 +15,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, cast
 
-from gpu_fault.admin import aurora_failback, operator_identity
+from gpu_fault.admin import aurora_failback, eks_nodegroup_prepare, operator_identity
 from gpu_fault.admin.deploy_host_binding import (
     DEPLOY_HOST_STATE_BINDING as DEPLOY_HOST_STATE_BINDING,
     enforce_deploy_host_state_dir,
@@ -539,6 +539,7 @@ def parser() -> argparse.ArgumentParser:
         )
     add_deploy_command(commands)
     add_site_id_command(commands)
+    eks_nodegroup_prepare.add_command(commands)
     add_node_scope_command(commands, _add_managed_site_arguments)
     _add_admin_config_command(commands)
     _add_workflow_reconcile_command(commands)
@@ -1322,6 +1323,8 @@ def run(arguments: argparse.Namespace) -> int:
         return run_custody_command(arguments)
     if arguments.command == "site-id":
         return run_site_id_command(arguments)
+    if arguments.command == eks_nodegroup_prepare.VERB:
+        return eks_nodegroup_prepare.run_command(arguments)
     if arguments.command == "node-scope":
         return run_node_scope_command(
             arguments,

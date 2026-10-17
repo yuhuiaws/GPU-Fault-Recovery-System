@@ -42,6 +42,7 @@ rules:
       - src/gpu_fault/admin/bootstrap_ownership.py
       - src/gpu_fault/admin/node_scope_command.py
       - src/gpu_fault/admin/site_identity_command.py
+      - src/gpu_fault/admin/eks_nodegroup_*.py
       - src/gpu_fault/admin/bootstrap_iam_policies.py
       - src/gpu_fault/admin/cli_join.py
       - src/gpu_fault/admin/cluster_removal_preserved.py
@@ -51,6 +52,8 @@ rules:
       - tests/admin/test_admin_ownership_label_discovery.py
       - tests/admin/test_admin_site_id_verb.py
       - tests/admin/test_admin_node_scope_verb.py
+      - tests/admin/_eks_nodegroup_world.py
+      - tests/admin/test_admin_eks_nodegroup_*.py
       - tests/regional/test_regional_admin_checks_node_scope.py
       - tests/admin/test_admin_site_eks_managed.py
       - tests/admin/test_admin_eks_managed_join.py
@@ -64,6 +67,10 @@ rules:
       - tests/admin/test_admin_ownership_label_discovery.py
       - tests/admin/test_admin_site_id_verb.py
       - tests/admin/test_admin_node_scope_verb.py
+      - tests/admin/test_admin_eks_nodegroup_prepare.py
+      - tests/admin/test_admin_eks_nodegroup_user_data.py
+      - tests/admin/test_admin_eks_nodegroup_nodes.py
+      - tests/admin/test_admin_eks_nodegroup_checks.py
       - tests/regional/test_regional_admin_checks_node_scope.py
       - tests/admin/test_admin_site_eks_managed.py
       - tests/admin/test_admin_eks_managed_join.py

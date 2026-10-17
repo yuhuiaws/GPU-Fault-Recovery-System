@@ -163,6 +163,8 @@ def is_readonly_command(
         return not getattr(arguments, "converge", False) or bool(
             getattr(arguments, "dry_run", False)
         )
+    if command == "prepare-eks-nodegroup":
+        return not getattr(arguments, "apply", False)
     return command in readonly_commands
 
 
