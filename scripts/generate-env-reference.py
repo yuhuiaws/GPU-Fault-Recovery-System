@@ -760,6 +760,7 @@ def domain(name: str) -> str:
             "Provider",
             (
                 "GPU_FAULT_CLUSTER_PROVIDER",
+                "GPU_FAULT_DCGM_HOSTENGINE",
                 "GPU_FAULT_NODE_SELECTOR",
                 "GPU_FAULT_EKS_",
                 "GPU_FAULT_EFA_DEVICE_PLUGIN_",

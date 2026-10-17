@@ -20,6 +20,11 @@ INSTALLER_DIGEST_ANNOTATION = "gpu-fault.io/installer-config-digest"
 INSTALLER_ARTIFACT_ANNOTATION = "gpu-fault.io/installer-artifact-sha256"
 INSTALLER_BUNDLE_ANNOTATION = "gpu-fault.io/installer-bundle-sha256"
 INSTALLER_TEMPLATE_ANNOTATION = "gpu-fault.io/installer-template-sha256"
+#: ``host`` on an ``eks-managed`` node whose Agent was installed in DCGM host
+#: engine mode (``cluster_scope.DCGM_HOSTENGINE_ENV``), absent otherwise: part
+#: of the reconciler's node identity, so a mode change re-installs the Agents
+#: whose environment still names the other mode.
+INSTALLER_DCGM_HOSTENGINE_ANNOTATION = "gpu-fault.io/installer-dcgm-hostengine"
 INSTALLER_JOB_LABEL = "gpu-fault.io/node-installer"
 PREFLIGHT_JOB_LABEL = "gpu-fault.io/node-preflight"
 TEMPLATE_CONTENT_SHA256_ENV = "GPU_FAULT_INSTALLER_TEMPLATE_CONTENT_SHA256"

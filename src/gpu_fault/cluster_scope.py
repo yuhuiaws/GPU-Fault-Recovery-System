@@ -37,6 +37,10 @@ __all__ = [
     "CONNECTION_SECRET_NODE_SELECTOR_KEY",
     "CONNECTION_SECRET_NODE_SELECTOR_SOURCE_KEY",
     "CONNECTION_SECRET_PROVIDER_KEY",
+    "DCGM_HOSTENGINE_ENV",
+    "DCGM_HOSTENGINE_LABEL",
+    "DcgmHostEngine",
+    "DcgmHostEngineSource",
     "EKS_MANAGED_FAILURE_DOMAIN_LABELS",
     "EKS_CLUSTER_NAME_ENV",
     "EKS_NODEGROUP_LABEL",
@@ -53,6 +57,9 @@ __all__ = [
     "ClusterProvider",
     "NodeSelectorSource",
     "cluster_provider",
+    "dcgm_hostengine",
+    "dcgm_hostengine_environment",
+    "dcgm_hostengine_source",
     "default_failure_domain_labels",
     "ec2_instance_id_from_provider_id",
     "is_eks_managed",
@@ -102,6 +109,19 @@ INSTANCE_TYPE_LABEL = "node.kubernetes.io/instance-type"
 #: ``gpu-fault-admin site-id``) as the value; ``deploy`` and ``join-cluster``
 #: select a GPU cluster's nodes through it and refuse a cluster without it.
 OWNERSHIP_LABEL = "gpu-fault.io/control-plane"
+#: The node-group label that declares a host DCGM (``DcgmHostEngine.HOST``) on
+#: an ``eks-managed`` cluster: the group's node image installs DCGM and runs
+#: ``nvidia-dcgm`` (nv-hostengine on 127.0.0.1:5555), so the exporter dials it
+#: instead of starting its own embedded hostengine -- exactly one hostengine
+#: per node. ``host`` is its only value; a cluster whose selected node groups
+#: carry it on none runs the embedded engine. Node-image capability, not
+#: membership: deploy and join re-read it every time. The same key marks the
+#: rendered exporter DaemonSet's variant.
+DCGM_HOSTENGINE_LABEL = "gpu-fault.io/dcgm-hostengine"
+#: The cluster's DCGM host engine mode as the node installer, the node
+#: installer reconciler and the Node Agent read it; set on ``eks-managed``
+#: clusters only, so a HyperPod node's environment stays byte for byte the same.
+DCGM_HOSTENGINE_ENV = "GPU_FAULT_DCGM_HOSTENGINE"
 #: The ``nodeReboot`` owner each provider's executor advertises: the lifecycle
 #: adapter it constructs (``adapters/hyperpod/lifecycle.py`` default owner and
 #: ``eks_provider.EKS_ADAPTER_OWNER``). A Runtime Profile whose ``nodeReboot``
@@ -204,6 +224,38 @@ class NodeSelectorSource(StrEnum):
     FLAG_LEGACY = "flag-legacy"
 
 
+class DcgmHostEngine(StrEnum):
+    """Which nv-hostengine serves a GPU cluster's nodes.
+
+    * ``host``: the node image runs DCGM as a host service; the exporter dials
+      it, ``dcgmi diag`` grades the GPUs, and an absent dcgmi or an unreachable
+      engine is a failure. Every HyperPod cluster; an ``eks-managed`` cluster
+      whose selected node groups all carry ``DCGM_HOSTENGINE_LABEL=host``.
+    * ``embedded``: the exporter runs its own hostengine inside the container
+      and the node has none to dial, so the quick diagnostic reports the
+      missing tool or engine as a configuration-only WARN. The plain EKS
+      default.
+    """
+
+    HOST = "host"
+    EMBEDDED = "embedded"
+
+
+class DcgmHostEngineSource(StrEnum):
+    """Where a cluster's ``DcgmHostEngine`` came from.
+
+    * ``node-group-label``: every node group the cluster's selector selects
+      carries ``DCGM_HOSTENGINE_LABEL=host``.
+    * ``default``: none does; the embedded engine.
+    * ``provider``: HyperPod, whose AMI runs DCGM as a host service; never
+      recorded, derived on read.
+    """
+
+    NODE_GROUP_LABEL = "node-group-label"
+    DEFAULT = "default"
+    PROVIDER = "provider"
+
+
 def cluster_provider(value: object) -> ClusterProvider:
     """Parse a provider name; empty or absent means ``hyperpod``.
 
@@ -242,6 +294,85 @@ def is_eks_managed(target: object) -> bool:
     """Whether ``target`` (identity, site entry, release target) is plain EKS."""
 
     return cluster_provider(_field(target, "provider")) is ClusterProvider.EKS_MANAGED
+
+
+def _recorded_text(value: object) -> str:
+    return "" if value is None else str(value).strip()
+
+
+def dcgm_hostengine(
+    target: object, *, provider: object = None, mode: object = None
+) -> DcgmHostEngine:
+    """The DCGM host engine mode of ``target`` (identity, entry, target).
+
+    HyperPod is always ``host``; a recorded ``embedded`` there is a
+    configuration error. ``eks-managed`` reads the recorded mode
+    (``dcgm_hostengine`` / ``dcgmHostEngine``); an entry recorded before the
+    field existed is ``embedded``, which is what it ran. Keyword arguments
+    override what ``target`` carries; any other spelling fails closed.
+    """
+
+    kind = cluster_provider(
+        provider if provider is not None else _field(target, "provider")
+    )
+    recorded = _recorded_text(
+        mode
+        if mode is not None
+        else _field(target, "dcgm_hostengine", "dcgmHostEngine")
+    )
+    try:
+        parsed = DcgmHostEngine(recorded) if recorded else None
+    except ValueError:
+        raise ValueError(
+            "DCGM host engine must be one of "
+            + ", ".join(item.value for item in DcgmHostEngine)
+            + f", got {recorded!r}"
+        ) from None
+    if kind is ClusterProvider.HYPERPOD:
+        if parsed is DcgmHostEngine.EMBEDDED:
+            raise ValueError("a HyperPod cluster runs DCGM as a host service")
+        return DcgmHostEngine.HOST
+    return parsed or DcgmHostEngine.EMBEDDED
+
+
+def dcgm_hostengine_source(
+    target: object, *, provider: object = None, source: object = None
+) -> DcgmHostEngineSource:
+    """Where ``target``'s DCGM host engine mode came from (audit)."""
+
+    kind = cluster_provider(
+        provider if provider is not None else _field(target, "provider")
+    )
+    if kind is ClusterProvider.HYPERPOD:
+        return DcgmHostEngineSource.PROVIDER
+    recorded = _recorded_text(
+        source
+        if source is not None
+        else _field(target, "dcgm_hostengine_source", "dcgmHostEngineSource")
+    )
+    if not recorded:
+        return DcgmHostEngineSource.DEFAULT
+    try:
+        parsed = DcgmHostEngineSource(recorded)
+    except ValueError:
+        parsed = None
+    if parsed is None or parsed is DcgmHostEngineSource.PROVIDER:
+        raise ValueError(
+            "DCGM host engine source must be one of "
+            f"{DcgmHostEngineSource.NODE_GROUP_LABEL.value}, "
+            f"{DcgmHostEngineSource.DEFAULT.value}, got {recorded!r}"
+        )
+    return parsed
+
+
+def dcgm_hostengine_environment(target: object) -> str:
+    """``DCGM_HOSTENGINE_ENV``'s value for ``target``: the mode on
+    ``eks-managed``, empty on HyperPod (whose node environment, installer
+    template and reconciler identity stay exactly what they were)."""
+
+    if cluster_provider(_field(target, "provider")) is ClusterProvider.HYPERPOD:
+        return ""
+    return dcgm_hostengine(target).value
 
 
 def provider_cluster_name(target: object) -> str:
