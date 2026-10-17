@@ -717,3 +717,40 @@ def test_a_refused_reset_call_still_records_what_its_window_read() -> None:
         "read in the window before the refusal, not the preflight's"
     )
     assert runner.reports() == 2, "the refusal came after the window's read"
+
+
+def test_a_kept_fabric_manager_and_the_kept_daemon_unit_share_one_record(
+    tmp_path,
+) -> None:
+    """Batch 128: a per-GPU reset window keeps Fabric Manager beside the daemon
+    unit the release kept; one ``kept_services`` list names both, and only the
+    daemon unit stays in ``active_services`` (its restore start is a no-op)."""
+
+    node = PersistenceNode(
+        tmp_path, daemon="systemd", active=EKS_ACTIVE | {"nvidia-fabricmanager"}
+    )
+    service = GpuServiceQuiesceManager(
+        state_dir=str(node.proc.parent / "quiesce"),
+        services=("nvidia-fabricmanager", *SERVICES),
+        processes=(),
+        failsafe_seconds=30,
+        retry_seconds=10,
+        settle_seconds=0,
+        restore_settle_seconds=0,
+        proc_root=str(node.proc),
+        restore_command="/opt/gpu-fault/restore",
+        runner=node,
+        sleeper=node.tick,
+    )
+
+    result = quiesce(service, keep_fabric_manager=True)
+
+    assert [item["service"] for item in result["kept_services"]] == [
+        "nvidia-fabricmanager",
+        "nvidia-persistenced",
+    ]
+    assert "nvidia-fabricmanager" not in result["active_services"]
+    assert "nvidia-fabricmanager" not in node.stopped()
+    restored = service.restore(incident_id="incident-a")
+    assert "nvidia-fabricmanager" not in restored["restored_services"]
+    assert ["systemctl", "start", "nvidia-fabricmanager"] not in node.commands

@@ -66,8 +66,10 @@ from gpu_fault.node_agent.fabric_manager_restart import (
 from gpu_fault.node_agent.quiesce import (
     GpuServiceQuiesceManager,
     claimed_reset_scope,
+    fabric_manager_kept,
     open_quiesce_windows,
     record_reset_scope,
+    refuse_kept_fabric_manager,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -723,6 +725,8 @@ class NodeActionExecutor(
         quiesce_manager = self.quiesce_manager
         if quiesce_manager is None:
             raise RuntimeError("GPU service quiesce manager is unavailable")
+        # A value this Agent does not know is refused before anything stops.
+        keep = fabric_manager_kept(command.parameters)
         target_device_paths, workload_cgroup_paths = self._quiesce_scope(command)
         # Read right after the scope: the bus ids come from the very report its
         # device nodes were resolved from (an empty target list is every GPU).
@@ -741,6 +745,7 @@ class NodeActionExecutor(
                 workload_cgroup_paths=workload_cgroup_paths,
                 target_pci_bus_ids=target_pci_bus_ids,
                 whole_node=whole_node,
+                **({"keep_fabric_manager": True} if keep else {}),
             )
         finally:
             self.gpu_activity.close_opening(command.incident_id)
@@ -819,6 +824,11 @@ class NodeActionExecutor(
         quiesce_manager = self.quiesce_manager
         if quiesce_manager is None:
             raise RuntimeError("GPU service quiesce manager is unavailable")
+        # NVIDIA's order is Fabric Manager down for ``nvidia-smi -r``: never in
+        # a window that kept it for a per-GPU reset (one a successor adopted).
+        refuse_kept_fabric_manager(
+            quiesce_manager, command.incident_id, command.operation.value
+        )
         self._reset_all_preflight(command.gpu_uuids)
         self._claim_reset_window(quiesce_manager, command)
         record_reset_scope(

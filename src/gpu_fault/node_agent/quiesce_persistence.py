@@ -217,6 +217,7 @@ class TargetPersistence:
         holders: Callable[[], list[dict[str, Any]]],
         proc_root: Path,
         clock: Callable[[], float] = time.monotonic,
+        kept_services: Sequence[dict[str, str]] = (),
     ) -> None:
         self.run = run
         self.holders = holders
@@ -227,7 +228,9 @@ class TargetPersistence:
         self.modes: dict[str, list[dict[str, str]]] = {}
         self.errors: dict[str, str] = {}
         self.release: dict[str, Any] = {}
-        self.kept_services: list[dict[str, str]] = []
+        # What the window keeps running, with why: a Fabric Manager the
+        # inventory kept out of ``active_services``, and below the daemon unit.
+        self.kept_services: list[dict[str, str]] = list(kept_services)
 
     def _snapshot(self, name: str) -> None:
         self.modes[name], error = persistence_modes(self.run, self.budget, self.targets)
@@ -267,7 +270,7 @@ class TargetPersistence:
             and self.daemon["running"]
             and PERSISTENCE_DAEMON_UNIT in active_services
         ):
-            self.kept_services = [
+            self.kept_services.append(
                 {
                     "service": PERSISTENCE_DAEMON_UNIT,
                     "reason": (
@@ -276,7 +279,7 @@ class TargetPersistence:
                         "persistence on every other GPU of the node for the window"
                     ),
                 }
-            ]
+            )
             stopped.add(PERSISTENCE_DAEMON_UNIT)
         for service in reversed(active_services):
             if service not in stopped:
@@ -401,11 +404,15 @@ def restored_daemon(state: dict[str, Any], proc_root: Path) -> dict[str, Any]:
     The product does not own a daemon somebody else started, so the restore
     does not start one: it says the daemon is gone and leaves the decision to
     whoever started it. Persistence then comes from ``gpu-fault-gpu-persistence``
-    alone, in the legacy mode.
+    alone, in the legacy mode. The services the window kept running (a Fabric
+    Manager it never stopped) come back as ``kept_services``: not started here.
     """
 
     daemon = persistence_daemon(proc_root)
     fields: dict[str, Any] = {"persistence_daemon": daemon}
+    kept = state.get("kept_services")
+    if isinstance(kept, list) and kept:
+        fields["kept_services"] = kept
     swept = state.get("persistence_daemon_swept")
     if not isinstance(swept, dict):
         return fields

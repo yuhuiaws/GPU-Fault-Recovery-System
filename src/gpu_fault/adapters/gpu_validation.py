@@ -11,6 +11,7 @@ from gpu_fault.execution import (
     WorkflowStepOutcome,
 )
 from gpu_fault.gpu_fabric_manager import fabric_validation
+from gpu_fault.gpu_fabric_window import fabric_state_loss
 from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.gpu_metrics import GpuMetricSource, GpuMetricsService
 from gpu_fault.models import (
@@ -682,8 +683,9 @@ class GpuValidationAdapter:
         readiness_after: datetime | None,
         failures: dict[str, list[str]],
     ) -> dict[str, Any] | None:
-        """Every GPU of a Hopper NVSwitch node joined the NVLink fabric, and the
-        node's Fabric Manager unit runs.
+        """Every GPU of a Hopper NVSwitch node joined the NVLink fabric, the
+        node's Fabric Manager unit runs, and this workflow did not lose the
+        fabric state (``gpu_fabric_window.fabric_state_loss``).
 
         Live (round 9, plain EKS, GF-REGIONAL-COLLECT-015): the reboot's boot
         left Fabric Manager failed and every GPU "in progress", and VALIDATE_GPU,
@@ -709,8 +711,11 @@ class GpuValidationAdapter:
         graded, training, failure = fabric_validation(fresh)
         if not graded:
             return None
-        if failure is not None:
-            failures.setdefault(node_id, []).append(failure)
+        lost = fabric_state_loss(context.workflow, node_id)
+        if failure is not None or lost is not None:
+            failures.setdefault(node_id, []).extend(
+                item for item in (failure, lost) if item is not None
+            )
             return None
         pending: dict[str, Any] = (
             {"nvlink_fabric_training": training} if training else {}

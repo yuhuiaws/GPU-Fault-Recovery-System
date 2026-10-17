@@ -8,7 +8,7 @@
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 2337,
     "src/gpu_fault/gpu_metrics.py:GpuMetricsService": 1152,
     "src/gpu_fault/host_health.py:NodeHealthPolicy": 1018,
-    "src/gpu_fault/node_agent/quiesce.py:GpuServiceQuiesceManager": 850,
+    "src/gpu_fault/node_agent/quiesce.py:GpuServiceQuiesceManager": 848,
     "src/gpu_fault/notification_service.py:AdvisoryNotificationService": 1030,
     "src/gpu_fault/orchestration/coordinator.py:IncidentOrchestrator": 1817,
     "src/gpu_fault/policy/engine.py:GpuFaultPolicyEngine": 1412,

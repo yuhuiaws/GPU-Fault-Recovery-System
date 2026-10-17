@@ -20,6 +20,7 @@ from gpu_fault.adapters.node_action.verification_continuation import (
     VERIFY_EVIDENCE_KEYS,
 )
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
+from gpu_fault.gpu_fabric_window import quiesce_command_parameters
 from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from gpu_fault.node_agent.protocol import NodeActionResult, NodeActionStatus
 from gpu_fault.operation_registry import MULTI_NODE_BARRIER_OPERATIONS
@@ -57,6 +58,7 @@ QUIESCE_SERVICE_EVIDENCE = (
     ("active_services", "stopped_services"),
     ("inactive_services", "inactive_services"),
     ("protected_services", "protected_services"),
+    ("kept_services", "kept_services"),
     ("stopped_containers", "stopped_containers"),
 )
 RESTORE_SERVICE_EVIDENCE = (("restored_services", "restored_services"),)
@@ -93,6 +95,16 @@ class NodeActionExecutionService:
         self,
         context: WorkflowStepContext,
     ) -> WorkflowStepOutcome:
+        # A QUIESCE says what its window does with Fabric Manager; derived from
+        # the persisted plan, so every send of the command carries one body.
+        parameters = quiesce_command_parameters(
+            context.workflow, context.step_index, context.step
+        )
+        if parameters != context.step.parameters:
+            context = replace(
+                context,
+                step=context.step.model_copy(update={"parameters": parameters}),
+            )
         readiness = self._preflight(context)
         if isinstance(readiness, WorkflowStepOutcome):
             return readiness

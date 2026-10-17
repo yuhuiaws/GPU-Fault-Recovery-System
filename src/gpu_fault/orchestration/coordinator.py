@@ -1851,7 +1851,8 @@ class IncidentOrchestrator:
     ) -> WorkflowRequest:
         workload_ids = list(event.affected_workload_ids)
         node_ids = [event.node_id]
-        gpu_uuids = decision.marker.scope.gpu_uuids
+        fabric = self._builder.fabric_manager_restart_inventory(event, decision)
+        gpu_uuids = fabric or decision.marker.scope.gpu_uuids
         blocked_reasons: list[str] = []
 
         safety_operations = (
@@ -1867,7 +1868,7 @@ class IncidentOrchestrator:
             ]
         )
         official_operations = self._builder.official_operations(
-            event, decision, incident.effective_action
+            event, decision, incident.effective_action, fabric_restart=bool(fabric)
         )
 
         profile = None
@@ -1881,10 +1882,9 @@ class IncidentOrchestrator:
         else:
             blocked_reasons.append("runtime_profile_version is required for execution")
 
-        # The UNKNOWN-state refusal moved into ``compile_steps`` so the
-        # node-health family shares it (ARCH-B2); the official compile below
-        # is handed the event's workload state. The ACTIVE check stays here:
-        # it is about the event naming its workloads, not about the plan.
+        # The UNKNOWN-state refusal lives in ``compile_steps`` (ARCH-B2, shared
+        # with the node-health family, handed the event's workload state); the
+        # ACTIVE check stays here: it is about the event naming its workloads.
         if (
             self._builder.mutates_node(official_operations)
             and event.workload_state is WorkloadState.ACTIVE
@@ -1924,7 +1924,7 @@ class IncidentOrchestrator:
         ]
         blocked_reasons.extend(official_errors)
         blocked_reasons.extend(
-            self._builder.workflow_evidence_errors(event, official_operations)
+            self._builder.workflow_evidence_errors(event, official_operations, fabric)
         )
 
         hard_policy_block = decision.disposition in {

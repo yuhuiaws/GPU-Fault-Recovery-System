@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Sequence
 from datetime import datetime, timezone
 
+from gpu_fault.gpu_fabric_manager import graded_fabric_gpus
 from gpu_fault.models import (
     CapabilityMode,
     CapabilityName,
@@ -26,6 +28,8 @@ from gpu_fault.policy import (
 # UNKNOWN workload state; the fault family has spelt it this way since the
 # coordinator first carried the gate, so operators and tests match on it.
 WORKLOAD_STATE_UNKNOWN_REASON = "node workload state is UNKNOWN"
+#: The catalog's "Solo: RESTART_FM" (XID 45).
+RESTART_FABRIC_MANAGER_ACTION = "RESTART_FM"
 
 
 def _xid74_operations(
@@ -173,11 +177,44 @@ class WorkflowBuilder:
             or event.sxid in NVIDIA_CODE_SPECIFIC_FULL_RESET_SXIDS
         )
 
+    def fabric_manager_restart_inventory(
+        self,
+        event: XidEvent | SxidEvent,
+        decision: FaultPolicyDecision,
+    ) -> list[str]:
+        """The node's GPUs when its RESTART_FM is the full GPU + NVSwitch reset.
+
+        On a Hopper NVSwitch node a Fabric Manager restart alone loses the
+        fabric state: NVIDIA's Fabric Manager user guide has the restarted
+        service need every GPU of the NVLink fabric reset, and its H100-and-later
+        procedure is stop the CUDA applications and GPU services, stop Fabric
+        Manager, ``nvidia-smi -r``, start Fabric Manager. So the plan becomes the
+        fatal-trunk SXID's chain on these GPUs (``catalog_operations``). A node
+        is such a node when its latest samples are graded the way batch 127
+        grades the fabric (``graded_fabric_gpus``); empty -- any other node, or
+        one whose exporter reports no field 170 -- keeps RESTART_FABRIC_MANAGER.
+        """
+
+        if decision.official_action != RESTART_FABRIC_MANAGER_ACTION or not isinstance(
+            event, XidEvent
+        ):
+            return []
+        latest = self.store.list_gpu_metrics_latest(event.cluster_id, event.node_id)
+        return graded_fabric_gpus(
+            ((item.sample, item.observed_at) for item in latest),
+            product=event.product,
+        )
+
     def workflow_evidence_errors(
         self,
         event: XidEvent | SxidEvent,
         operations: list[WorkflowOperation],
+        fabric_inventory: Sequence[str] = (),
     ) -> list[str]:
+        """Why the plan lacks the evidence it acts on; ``fabric_inventory`` is
+        the graded inventory a Fabric Manager restart resets (it stands in for
+        the SXID's partition and participating GPUs)."""
+
         errors = []
         if (
             WorkflowOperation.RUN_NVLINK74_WORKFLOW in operations
@@ -188,12 +225,13 @@ class WorkflowBuilder:
                 "XID 74 Field Diagnostic requires all seven register "
                 "fields and an explicit NVLink identity"
             )
-        if (
+        full_reset = (
             WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES in operations
-            and not event.fabric_partition
-        ):
+            and not fabric_inventory
+        )
+        if full_reset and not event.fabric_partition:
             errors.append("full fabric reset requires fabric_partition mapping")
-        if WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES in operations and (
+        if full_reset and (
             not isinstance(event, SxidEvent) or not event.participating_gpu_uuids
         ):
             errors.append("full fabric reset requires complete node GPU inventory")
@@ -442,6 +480,14 @@ class WorkflowBuilder:
                 "fabric_partition": event.fabric_partition,
                 "sxid": event.sxid,
             }
+        if operation is WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES:
+            # A Fabric Manager restart on a Hopper NVSwitch node: the node's own
+            # NVSwitch fabric, named the way the SXID ingest names it.
+            return {
+                "fabric_partition": event.fabric_partition
+                or f"{event.cluster_id}/{event.node_id}/local-nvswitch",
+                "xid": event.xid,
+            }
         if operation is WorkflowOperation.REMEDIATE_DRIVER:
             return {"target_driver_branch": self.target_driver_branch}
         if operation is WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE:
@@ -510,7 +556,13 @@ class WorkflowBuilder:
         event: XidEvent | SxidEvent,
         decision: FaultPolicyDecision,
         effective_action: RecoveryAction | None = None,
+        *,
+        fabric_restart: bool = False,
     ) -> list[WorkflowOperation]:
+        """The catalog workflow; ``fabric_restart`` is RESTART_FM on a node
+        whose restart is the full GPU + NVSwitch reset
+        (``fabric_manager_restart_inventory``)."""
+
         action = effective_action or decision.action
         operations = [WorkflowOperation.FREEZE_EVIDENCE]
         if isinstance(event, XidEvent) and event.xid == 74:
@@ -551,7 +603,9 @@ class WorkflowBuilder:
             if event.affected_workload_ids:
                 operations.append(WorkflowOperation.RESTART_WORKLOAD)
             return operations
-        if decision.official_action == "RESET_ALL_GPUS_AND_NVSWITCHES":
+        if decision.official_action == "RESET_ALL_GPUS_AND_NVSWITCHES" or (
+            fabric_restart and decision.official_action == RESTART_FABRIC_MANAGER_ACTION
+        ):
             operations.append(WorkflowOperation.MARK_UNSCHEDULABLE)
             if event.workload_state is WorkloadState.ACTIVE:
                 if event.checkpoint_manifest_ref:
@@ -649,6 +703,8 @@ class WorkflowBuilder:
         event: XidEvent | SxidEvent,
         decision: FaultPolicyDecision,
         effective_action: RecoveryAction | None = None,
+        *,
+        fabric_restart: bool = False,
     ) -> list[WorkflowOperation]:
         """Compile the catalog workflow and honour its pre-actions.
 
@@ -658,7 +714,9 @@ class WorkflowBuilder:
         today's catalog, but a new branch must not be able to drop the
         cordon the policy asked for.
         """
-        operations = self.catalog_operations(event, decision, effective_action)
+        operations = self.catalog_operations(
+            event, decision, effective_action, fabric_restart=fabric_restart
+        )
         return self.with_pre_actions(event, decision, operations)
 
     def compile_steps(

@@ -141,6 +141,13 @@ class RemediationOperationsMixin:
             incident_id=incident_id,
             for_reset=False,
         )
+        # An install needs Fabric Manager down as well. Imported here because
+        # ``quiesce`` imports this package (``operations.holders``).
+        from gpu_fault.node_agent.quiesce import refuse_kept_fabric_manager
+
+        refuse_kept_fabric_manager(
+            self.quiesce_manager, incident_id, "driver/firmware remediation"
+        )
 
     @final_ownership_boundary
     def _remediate_driver(self, command: NodeActionCommand) -> dict[str, Any]:

@@ -196,6 +196,23 @@ def unsettled_fabric(
     return graded, unsettled
 
 
+def graded_fabric_gpus(
+    observations: Iterable[tuple[GpuMetricSample, datetime | None]],
+    *,
+    product: str | None = None,
+) -> list[str]:
+    """The GPU UUIDs whose fabric state is graded, sorted; [] for any other node.
+
+    Non-empty exactly for the nodes batch 127 grades: a Hopper SXM part on an
+    NVSwitch baseboard that reports a fabric state (:func:`unsettled_fabric`).
+    Planning reads it from the node's latest samples: a Fabric Manager restart
+    there is NVIDIA's H100-and-later procedure on all of these GPUs.
+    """
+
+    graded, _unsettled = unsettled_fabric(observations, product=product)
+    return sorted({sample.gpu_uuid for sample in graded.values() if sample.gpu_uuid})
+
+
 def fabric_validation(
     observations: Iterable[tuple[GpuMetricSample, datetime | None]],
 ) -> tuple[int, dict[str, str], str | None]:

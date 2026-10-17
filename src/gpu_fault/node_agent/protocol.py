@@ -13,6 +13,13 @@ from gpu_fault.models import StrictModel, WorkflowOperation
 from gpu_fault.node_agent.late_ownership import OwnershipChallenge, OwnershipPermit
 
 RESULT_QUERY_MAX_SKEW_SECONDS = 300
+#: The ``QUIESCE_GPU_SERVICES`` parameter that says what the window does with
+#: Fabric Manager, and its one documented value. Absent, the quiesce stops it,
+#: as every Agent always has; ``keep`` leaves it running for a window whose only
+#: GPU-state change is a per-GPU reset (``gpu_fault.gpu_fabric_window``). An
+#: Agent refuses any other value; one that predates the parameter ignores it.
+QUIESCE_FABRIC_MANAGER_PARAMETER = "fabric_manager"
+QUIESCE_FABRIC_MANAGER_KEEP = "keep"
 
 
 def canonical_command(command: NodeActionCommand) -> bytes:

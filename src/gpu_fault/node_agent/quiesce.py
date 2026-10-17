@@ -12,8 +12,9 @@ import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Sequence
+from typing import Any, Callable, Mapping, Sequence
 
+from gpu_fault.cluster_scope import FABRIC_MANAGER_UNIT
 from gpu_fault.node_agent.operations.holders import (
     kubernetes_attribution,
     process_cgroup_paths,
@@ -31,6 +32,10 @@ from gpu_fault.node_agent.common import (
     NVIDIA_GPU_DEVICE_PATTERN,
     PROCESS_NAME_PATTERN,
     SYSTEMD_NAME_PATTERN,
+)
+from gpu_fault.node_agent.protocol import (
+    QUIESCE_FABRIC_MANAGER_KEEP,
+    QUIESCE_FABRIC_MANAGER_PARAMETER,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -108,26 +113,72 @@ def _arm_quiesce_failsafe(
     )
 
 
+#: Why a window keeps Fabric Manager running (``kept_services``).
+FABRIC_MANAGER_KEPT_REASON = (
+    "the window's only GPU-state change is a per-GPU reset: from Hopper on a GPU "
+    "resets individually while Fabric Manager runs, and stopping Fabric Manager "
+    "would lose the fabric state of every other GPU (NVIDIA Fabric Manager user "
+    "guide), so no quiesce, restore or fail-safe stops or starts it"
+)
+
+
+def fabric_manager_kept(parameters: Mapping[str, Any]) -> bool:
+    """Whether a QUIESCE command keeps Fabric Manager running.
+
+    Absent means stop it, as before; the documented value ``keep`` keeps it.
+    Anything else is refused before the window opens, so a plan this Agent does
+    not understand never half-applies.
+    """
+
+    value = parameters.get(QUIESCE_FABRIC_MANAGER_PARAMETER)
+    if value is None:
+        return False
+    if value != QUIESCE_FABRIC_MANAGER_KEEP:
+        raise RuntimeError(
+            f"QUIESCE_GPU_SERVICES parameter {QUIESCE_FABRIC_MANAGER_PARAMETER} "
+            f"must be {QUIESCE_FABRIC_MANAGER_KEEP!r} or absent, got {value!r}"
+        )
+    return True
+
+
 def _service_inventory(
     manager: GpuServiceQuiesceManager,
-) -> tuple[list[str], list[str]]:
-    """``(active, inactive)`` among the configured, unprotected services.
+    keep_fabric_manager: bool = False,
+) -> tuple[list[str], list[str], list[dict[str, str]]]:
+    """``(active, inactive, kept)`` among the configured, unprotected services.
 
     ``active`` is what the quiesce stops (and the restore starts); ``inactive``
     is what it found nothing to stop -- a unit that is not running or not
     installed on this image. Both travel in the receipt and the state file:
     live (gpu-eks-cluster, XID 46) the reset failed busy and nothing in the
     record said whether ``nvidia-persistenced`` / ``nvidia-fabricmanager`` had
-    been stopped or were simply not there to stop.
+    been stopped or were simply not there to stop. ``kept`` is a running Fabric
+    Manager the window keeps (``keep_fabric_manager``): it is in neither list,
+    so no restore -- the step, the fail-safe timer, the boot reconcile -- starts
+    a second instance that would know only the GPUs this window reset.
     """
 
     active: list[str] = []
     inactive: list[str] = []
+    kept: list[dict[str, str]] = []
     for service in manager.services:
         if service in manager.protected_services:
             continue
-        (active if manager._service_active(service) else inactive).append(service)
-    return active, inactive
+        if not manager._service_active(service):
+            inactive.append(service)
+        elif keep_fabric_manager and service == FABRIC_MANAGER_UNIT:
+            kept.append({"service": service, "reason": FABRIC_MANAGER_KEPT_REASON})
+        else:
+            active.append(service)
+    return active, inactive, kept
+
+
+def _container_filter(selector: str) -> str:
+    namespace, name = selector.split("/", 1)
+    return (
+        'labels."io.kubernetes.pod.namespace"=='
+        f'{namespace},labels."io.kubernetes.container.name"=={name}'
+    )
 
 
 def _cgroup_matches(holder_paths: list[str], workload_cgroup_paths: set[str]) -> bool:
@@ -289,14 +340,6 @@ class GpuServiceQuiesceManager:
         )
         return completed.returncode == 0
 
-    @staticmethod
-    def _container_filter(selector: str) -> str:
-        namespace, name = selector.split("/", 1)
-        return (
-            'labels."io.kubernetes.pod.namespace"=='
-            f'{namespace},labels."io.kubernetes.container.name"=={name}'
-        )
-
     def _task_states(self) -> dict[str, str]:
         completed = self._run(
             ["ctr", "-n", "k8s.io", "tasks", "list"],
@@ -318,7 +361,7 @@ class GpuServiceQuiesceManager:
                 "containers",
                 "list",
                 "--quiet",
-                self._container_filter(selector),
+                _container_filter(selector),
             ],
             check=True,
         )
@@ -612,6 +655,7 @@ class GpuServiceQuiesceManager:
         workload_cgroup_paths: set[str] | None = None,
         target_pci_bus_ids: Sequence[str] | None = None,
         whole_node: bool = False,
+        keep_fabric_manager: bool = False,
     ) -> dict[str, Any]:
         """Open one incident's quiesce window: stop, release, sweep, record.
 
@@ -620,8 +664,9 @@ class GpuServiceQuiesceManager:
         GPU. Persistence ends on the targets alone, so the node's other GPUs
         stay initialised and no ``nvidia-smi`` of the window re-initialises
         them; the device sweep stays the fallback for a holder still there
-        afterwards. A QUIESCED window is answered as it is; a failed one is
-        restored first and quiesced again.
+        afterwards. ``keep_fabric_manager`` leaves a running Fabric Manager
+        alone (``_service_inventory``). A QUIESCED window is answered as it is;
+        a failed one is restored first and quiesced again.
         """
 
         workload_cgroup_paths = {
@@ -650,11 +695,14 @@ class GpuServiceQuiesceManager:
                     "quiesced": True,
                     "already_quiesced": True,
                     "active_services": existing.get("active_services", []),
+                    "kept_services": existing.get("kept_services", []),
                     "timer_unit": timer_unit + ".timer",
                     "state_path": str(state_path),
                 }
 
-            active_services, inactive_services = _service_inventory(self)
+            active_services, inactive_services, kept_services = _service_inventory(
+                self, keep_fabric_manager
+            )
             container_targets = self._resolve_container_targets()
             state = {
                 "schema_version": 1,
@@ -687,6 +735,7 @@ class GpuServiceQuiesceManager:
                 run=self._run,
                 holders=lambda: self._device_holders(target_device_paths),
                 proc_root=self.proc_root,
+                kept_services=kept_services,
             )
             try:
                 # Each service, last configured first, around the targets'
@@ -1061,6 +1110,41 @@ def record_reset_scope(
             "could not note the reset scope on the quiesce claim of %s",
             incident_id,
             exc_info=True,
+        )
+
+
+def refuse_kept_fabric_manager(
+    manager: GpuServiceQuiesceManager, incident_id: str, action: str
+) -> None:
+    """Refuse ``action`` inside a window that kept Fabric Manager running.
+
+    A window keeps Fabric Manager for its per-GPU reset (``fabric_manager_kept``).
+    The full GPU + NVSwitch reset and a driver or firmware install need it
+    stopped -- NVIDIA's order for H100 and later is stop Fabric Manager,
+    ``nvidia-smi -r``, start Fabric Manager -- and meet such a window only when
+    a preempting successor adopts it. Nothing is stopped here: the command fails
+    before it touches the node (the window's single reset stays unclaimed), the
+    window is restored as planned, and the ladder's reboot re-registers the
+    fabric as well. A stand-in manager or an unreadable window says nothing.
+    """
+
+    if not isinstance(manager, GpuServiceQuiesceManager):
+        return
+    state_path = manager._state_path(incident_id)
+    try:
+        with manager._locked(state_path):
+            state = manager._read_state(state_path)
+    except (OSError, ValueError, RuntimeError):
+        return
+    kept = (state or {}).get("kept_services")
+    if isinstance(kept, list) and any(
+        isinstance(item, dict) and item.get("service") == FABRIC_MANAGER_UNIT
+        for item in kept
+    ):
+        raise RuntimeError(
+            f"{action} needs {FABRIC_MANAGER_UNIT} stopped, and this quiesce "
+            "window kept it running for a per-GPU reset; restore the GPU services "
+            "and quiesce again, or let the ladder reboot the node"
         )
 
 
