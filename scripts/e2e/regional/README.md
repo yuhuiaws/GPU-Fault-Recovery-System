@@ -470,8 +470,14 @@ Current classification:
 - DESTR-011 has a reusable read-only/isolated guard audit.
 - DESTR-010 has a reusable manual live driver. It is plan-only by default,
   pins one idle GPU node, writes exactly one XID 45 through a temporary
-  host probe, verifies the two-step workflow and Node Agent ledger replay,
-  and restores Fabric Manager plus deletes probe resources in `finally`.
+  host probe, and restores Fabric Manager plus deletes probe resources in
+  `finally`. Its preflight reads the control plane's own fabric grading of the
+  node and pins the workflow shape in the plan (`fabric_restart_shape.py`,
+  shared with DESTR-019): the two-step Fabric Manager restart on a node that is
+  not graded, the full GPU + NVSwitch reset chain on a graded Hopper NVSwitch
+  node. It verifies that shape, one Fabric Manager down/up on the host and the
+  Node Agent ledger replay (the restart command, or the chain's
+  `RESTORE_GPU_SERVICES`).
 - DESTR-001/002/009/012 have reusable manual live drivers. Each is plan-only
   by default and validates a predecessor evidence file before mutation:
   `010 -> 001 -> 002 -> 009 -> 012`. DESTR-001/002 use the shared node-pinned
@@ -558,10 +564,13 @@ Current classification:
   must leave behind. It requires DESTR-010 PASS, refuses to restart while
   any remote command is open, arms a bounded `systemd-run --on-active` start
   of `gpu-fault-node-agent.service` *before* `systemctl restart`, and then
-  writes one solo XID 45 so the Fabric Manager restart DESTR-010 proved runs
-  again on the restarted Agent. It judges the Agent's `/healthz`
-  (`ledger.writable`, heartbeat, counters), the three structured journald
-  lines the command leaves, the ledger row's audit columns and
+  writes one solo XID 45 so the workflow DESTR-010 proved runs again on the
+  restarted Agent (the Fabric Manager restart, or on a graded node the full
+  reset chain, whose `RESET_ALL_GPUS_NVSWITCHES` is the audited command and
+  whose ledger attempts since the restart the counters must match). It judges
+  the Agent's `/healthz` (`ledger.writable`, heartbeat, counters), the three
+  structured journald lines the audited command leaves, the ledger row's
+  audit columns and
   `PRAGMA user_version`, and drills the pre-audit ledger schema's in-place
   migration on a scratch copy under `/var/lib/gpu-fault-acceptance` with the
   deployed wheel. Its verdicts live in `destr019_verdicts.py`, its node-local

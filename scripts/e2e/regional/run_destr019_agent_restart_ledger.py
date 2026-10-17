@@ -5,12 +5,15 @@ One idle GPU node. The Node Agent is restarted once behind a bounded fail-safe
 start timer while no command is in flight; it must come back on the same
 generation (same boot, same incarnation), and ``/healthz`` must report the
 ledger writable with a fresh heartbeat and zeroed counters. Then one real XID
-45 is written to ``/dev/kmsg`` -- the Fabric Manager restart DESTR-010 already
-proved -- and the command it produces has to leave the ARCH-C3/C4/C5 trail:
-three structured journald lines with the nine identifier fields, one ledger
-row keyed ``(command_id, attempt=1)`` with every audit column, and the health
-counters moving by exactly one accepted/completed. A scratch ledger built from
-the pre-ARCH-C4 schema is migrated in place by the deployed wheel, so the
+45 is written to ``/dev/kmsg`` -- the workflow DESTR-010 already proved -- and
+its node action has to leave the ARCH-C3/C4/C5 trail: three structured
+journald lines with the nine identifier fields, one ledger row keyed
+``(command_id, attempt=1)`` with every audit column, and the health counters
+moving exactly as the ledger did. On a node the product does not grade that
+action is the one Fabric Manager restart; on a graded Hopper NVSwitch node the
+XID 45 runs the full GPU + NVSwitch reset chain and the audit reads its
+RESET_ALL_GPUS_NVSWITCHES (``fabric_restart_shape``). A scratch ledger built
+from the pre-ARCH-C4 schema is migrated in place by the deployed wheel, so the
 upgrade path is proven on the node without touching the real ledger.
 
 The restart is placed *before* injection on purpose. An Agent restart while a
@@ -38,6 +41,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.regional import destr019_verdicts as verdicts  # noqa: E402
+from scripts.e2e.regional import fabric_restart_shape as shapes  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
     write_json_atomic,
@@ -124,6 +128,7 @@ def focused_tests(case_dir: Path) -> dict[str, Any]:
         "tests/node_agent/test_agent_observability.py",
         "tests/regional/test_destr019_node_probe.py",
         "tests/regional/test_destr019_agent_restart_ledger.py",
+        "tests/regional/test_destr019_fabric_reset_shape.py",
     ]
     completed = RegionalLiveFixture.run(command, cwd=ROOT, check=False, timeout=600)
     path = case_dir / "focused-tests.log"
@@ -165,6 +170,10 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     tests = focused_tests(case_dir)
     predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
     runtime_identity = fixture.runtime_identity()
+    # The control plane's own grading decides which workflow the XID 45 runs.
+    grading = fixture.cpu_python(
+        shapes.FABRIC_GRADING_PROBE, settings.regional.cluster_id, settings.node
+    )
     probe = _probe(settings, "destr019-preflight", AGENT_PROBE_SCRIPT, case_dir)
     try:
         probe.create()
@@ -182,6 +191,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         recent_event=state.get("event"),
         host=host,
         tests_passed=tests["passed"],
+        shape=shapes.shape_of(grading),
     )
     errors.extend(verdicts.health_errors(health, label="preflight"))
     errors.extend(runtime_identity_errors(runtime_identity))
@@ -200,10 +210,18 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         "cpu_blast": fixture.cpu_blast_snapshot(),
         "predecessor": predecessor,
         "runtime_identity": runtime_identity,
+        "fabric_grading": grading,
         "errors": errors,
     }
     write_json_atomic(case_dir / "preflight.json", result)
     return result
+
+
+def run_shape(preflight: dict[str, Any]) -> tuple[str, list[str]]:
+    """The workflow shape the plan recorded and the node's graded GPUs."""
+
+    grading = preflight.get("fabric_grading")
+    return shapes.shape_of(grading), shapes.graded_gpus(grading)
 
 
 def plan_identity(preflight: dict[str, Any]) -> dict[str, Any]:
@@ -218,37 +236,60 @@ def plan_identity(preflight: dict[str, Any]) -> dict[str, Any]:
         "ledger_user_version": (preflight.get("host") or {})
         .get("ledger", {})
         .get("user_version"),
+        "workflow_shape": run_shape(preflight)[0],
+        "graded_gpus": run_shape(preflight)[1],
     }
 
 
+PLAN_MUTATION = {
+    shapes.FABRIC_MANAGER_RESTART: (
+        "restart gpu-fault-node-agent.service once on an idle node behind a "
+        "bounded systemd fail-safe start timer, with no command in flight; "
+        "drill the ledger migration on a scratch copy; then write one "
+        "synthetic XID 45 to the real host /dev/kmsg so the Node Agent "
+        "restarts nvidia-fabricmanager.service once (the DESTR-010 path). "
+        "No reset, no reboot, no provider call, no isolation."
+    ),
+    shapes.FABRIC_RESET: (
+        "restart gpu-fault-node-agent.service once on an idle node behind a "
+        "bounded systemd fail-safe start timer, with no command in flight; "
+        "drill the ledger migration on a scratch copy; then write one "
+        "synthetic XID 45 to the real host /dev/kmsg on a Hopper NVSwitch node "
+        "the control plane grades, so the product runs the DESTR-010 full "
+        "GPU + NVSwitch reset chain (cordon, quiesce, one reset of every GPU "
+        "and NVSwitch, restore, validations, scheduling back). No reboot, no "
+        "provider call, no quarantine."
+    ),
+}
+
+
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
+    shape, _graded = run_shape(preflight)
     return {
-        "risk": "live-service-action",
+        "risk": (
+            "destructive" if shape == shapes.FABRIC_RESET else "live-service-action"
+        ),
         "predecessor": preflight["predecessor"],
         "target_node": settings.node,
         "restore_seconds": settings.restore_seconds,
-        "mutation": (
-            "restart gpu-fault-node-agent.service once on an idle node behind a "
-            "bounded systemd fail-safe start timer, with no command in flight; "
-            "drill the ledger migration on a scratch copy; then write one "
-            "synthetic XID 45 to the real host /dev/kmsg so the Node Agent "
-            "restarts nvidia-fabricmanager.service once (the DESTR-010 path). "
-            "No reset, no reboot, no provider call, no isolation."
-        ),
+        "workflow_shape": shape,
+        "mutation": PLAN_MUTATION[shape],
         "preflight_identity": plan_identity(preflight),
         "stop_conditions": [
             f"{PREDECESSOR_CASE_ID} has not passed in formal sequence",
             "preflight or focused regression failure",
             "target node is not Ready/schedulable/idle",
-            "the Node Agent is not ACTIVE, allows no RESTART_FABRIC_MANAGER, or "
-            "runs a ledger whose schema predates ARCH-C4",
+            "the Node Agent is not ACTIVE, does not allow the node actions of the "
+            "node's XID 45 workflow, or runs a ledger whose schema predates ARCH-C4",
+            "the node's fabric grading moved between plan and execute",
             "/healthz is not 200 with a writable ledger before the restart",
             "a fail-safe restore timer from an earlier run is still armed",
             "any remote command or processor work is open when the restart is due",
             "the Agent does not return active, or returns with a new generation "
             "or a new incarnation",
-            "the workflow is not the two-step Fabric Manager restart or reaches "
-            "any isolation, quiesce, reset or reboot operation",
+            "the workflow is not the node's XID 45 workflow (the two-step Fabric "
+            "Manager restart, or on a graded node the full GPU + NVSwitch reset "
+            "chain) or reaches a reboot, a replacement or a quarantine",
             "provider mutation appears",
             "cleanup leaves the fail-safe armed, the Agent down, Fabric Manager "
             "inactive or a probe resource behind",
@@ -260,7 +301,10 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "migration_drill_uses_a_scratch_ledger_only": True,
             "fabric_manager_is_confirmed_active_in_finally": True,
             "runner_finally_deletes_probe_resources": True,
-            "no_isolation_or_provider_action_is_authorized": True,
+            "no_isolation_or_provider_action_is_authorized": (
+                shape == shapes.FABRIC_MANAGER_RESTART
+            ),
+            "no_provider_action_is_authorized": True,
         },
         "preflight": preflight,
     }
@@ -463,9 +507,12 @@ def _inject_and_observe(run: _LiveRun) -> dict[str, Any]:
 def _audit_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
     if run.restarted_at is None:
         raise RegionalFixtureError("the audit follows the restart")
-    errors = verdicts.workflow_errors(state, node=run.settings.node)
-    commands = state.get("commands") or []
-    command = commands[0] if commands else {}
+    shape, graded = run_shape(run.preflight)
+    operation = verdicts.AUDITED_OPERATION[shape]
+    errors = verdicts.workflow_errors(
+        state, node=run.settings.node, shape=shape, expected_gpus=graded
+    )
+    command = verdicts.audited_command(state, shape)
     workflow = state.get("workflow") or {}
     generation = int(run.baseline_agent.get("generation") or 0)
     command_id = verdicts.expected_command_id(
@@ -489,6 +536,7 @@ def _audit_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
             node=run.settings.node,
             fencing_token=int(workflow.get("fencing_token") or 0),
             generation=generation,
+            operation=operation,
         )
     )
     audit = run.agent_probe.execute(
@@ -505,19 +553,35 @@ def _audit_errors(run: _LiveRun, state: dict[str, Any]) -> list[str]:
             baseline_interrupted=int(
                 (run.baseline_host.get("ledger") or {}).get("interrupted_count") or 0
             ),
+            operation=operation,
         )
     )
+    chain_audit = _chain_audit(run) if shape == shapes.FABRIC_RESET else None
+    if chain_audit is not None:
+        errors.extend(verdicts.chain_ledger_errors(chain_audit))
     health = run.agent_probe.execute("agent-health", timeout=60)
     write_json_atomic(run.case_dir / "health-after-command.json", health)
     errors.extend(
         verdicts.health_errors(
             health,
             label="after command",
-            expect_counters={"accepted": 1, "completed": 1, "failed": 0, "rejected": 0},
+            expect_counters=verdicts.counter_expectation(shape, chain_audit),
             max_heartbeat_age_seconds=120,
         )
     )
     return errors
+
+
+def _chain_audit(run: _LiveRun) -> dict[str, Any]:
+    """Every ledger attempt since the restart: the chain's node actions."""
+
+    if run.restarted_at is None:
+        raise RegionalFixtureError("the chain audit follows the restart")
+    audit = run.agent_probe.execute(
+        "ledger-audit", "--since", run.restarted_at.isoformat(), timeout=120
+    )
+    write_json_atomic(run.case_dir / "ledger-audit-chain.json", audit)
+    return audit
 
 
 def _provider_errors(run: _LiveRun) -> list[str]:

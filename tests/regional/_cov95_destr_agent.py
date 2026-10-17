@@ -187,6 +187,15 @@ class AgentHarness:
         }
         self.journal = journal()
         self.audit = audit()
+        # The control plane's fabric grading of the node (batch 128): not
+        # graded, so the XID 45 is the two-step Fabric Manager restart.
+        self.grading: dict[str, Any] = {
+            "available": True,
+            "graded_gpus": [],
+            "states": {},
+            "product": None,
+        }
+        self.chain_audit: dict[str, Any] = {"rows": []}
         self.disarm = {
             "restore_timer": {"ActiveState": "inactive"},
             "agent": {"ActiveState": "active"},
@@ -273,6 +282,10 @@ class AgentRegional:
     def cpu_blast_snapshot(self) -> dict[str, Any]:
         return {"cpu": ["api-a"]}
 
+    def cpu_python(self, script: str, *args: str, **kwargs: Any) -> dict[str, Any]:
+        self.h.call("cpu.python", args)
+        return deepcopy(self.h.grading)
+
     def wait_for_workflow(self, **kwargs: Any) -> dict[str, Any]:
         self.h.call("workflow.wait", kwargs)
         return deepcopy(self.h.state)
@@ -321,7 +334,7 @@ class AgentProbe:
         if action == "journal":
             return deepcopy(self.h.journal)
         if action == "ledger-audit":
-            return deepcopy(self.h.audit)
+            return deepcopy(self.h.chain_audit if "--since" in args else self.h.audit)
         if action == "disarm-restore":
             return deepcopy(self.h.disarm)
         return {"action": action, "ok": True}

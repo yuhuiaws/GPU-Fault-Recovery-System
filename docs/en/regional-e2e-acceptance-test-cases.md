@@ -493,7 +493,7 @@ per-phase notes of the machine execution order. Risk is labelled by the **actual
 | `live-non-destructive` | runs end to end on live hardware, but injects no fault and does not change the existing state of nodes and jobs | `GF-REGIONAL-WORKLOAD-001` |
 | `live-kernel-log-injection` | writes XID lines from user space into the real `/dev/kmsg`. The GPU itself is not broken, but the downstream policy is really driven | `GF-LIVE-KMSG-XID11-001` |
 | `live-isolation` | cordons + taints one **idle** node (automatically uncordoned afterwards); no reset, no reboot, no job stop | `GF-REGIONAL-COLLECT-009` |
-| `live-service-action` | issues controlled actions to services on the node, including really restarting that service process (e.g. Fabric Manager); no node reboot, no job stop | `GF-LIVE-XID74-ALLZERO-20260726`, `GF-LIVE-KMSG-XID45-SOLO-FM-20260724` |
+| `live-service-action` | issues controlled actions to services on the node, including really restarting that service process (e.g. Fabric Manager); no node reboot, no job stop | `GF-LIVE-XID74-ALLZERO-20260726`, `GF-REGIONAL-DESTR-018` |
 | `live-workload-restart` | really restarts the training job/attempt; the node is untouched | `GF-LIVE-XID11-001` |
 | `live-node-mutation` | changes devices or system components on the node (unbinding an EFA PCI function, deleting the device-plugin Pod), but does not reboot/replace the node | `GF-REGIONAL-COLLECT-017` |
 | `destructive` | issues destructive actions to the GPU itself (GPU reset etc.), affecting all jobs on that node | `GF-LIVE-XID95-DUAL-RESET-RESUME-20260724` |
@@ -10215,9 +10215,16 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
 
 ### GF-REGIONAL-DESTR-010
 
-**Fabric Manager restart and GPU service quiesce via the Node Agent**
+**The Fabric Manager action of an XID 45 through the Node Agent: a graded Hopper NVSwitch node takes the full GPU and NVSwitch reset, every other node restarts Fabric Manager**
 
-- Level: `live-service-action`.
+- Level: `destructive` (on a graded node it really resets every GPU and NVSwitch of the node; on a node that is not
+  graded it only restarts Fabric Manager, i.e. `live-service-action`).
+- Why there are two shapes: NVIDIA's Fabric Manager user guide states that stopping `nvidia-fabricmanager` loses the
+  fabric state and that, once it runs again, every GPU in the NVLink fabric needs a reset; its restart procedure for H100
+  and later systems is stop the CUDA applications and GPU services, stop Fabric Manager, `nvidia-smi -r`, start Fabric
+  Manager. So on a node whose fabric the control plane grades by DCGM field 170 (a Hopper SXM part on an NVSwitch
+  baseboard that reports a fabric state) the solo XID 45's `RESTART_FM` compiles to that procedure; only a node that is
+  not graded keeps the single Fabric Manager restart.
 - The formal entry point stays `manual` and by default only generates the plan. execute must use the same arguments, maintenance-window deadline and
   exact confirmation string:
 
@@ -10247,25 +10254,53 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   in `finally` it confirms that Fabric Manager is active and deletes the Pod/ConfigMap. The probe offers no ledger deletion or
   arbitrary command execution interface.
 - Steps:
-  1. Confirm that the current Profile's `fabricManagerRestart` is an executable Node Agent owner and that
-     the Node Agent allowlist/switches permit `RESTART_FABRIC_MANAGER`; record the service's
-     `MainPID`, start time, ledger, timer and the node scheduling-state baseline.
-  2. Inject a solo XID 45 via the real `/dev/kmsg`, with a correlation window separated from historical events;
+  1. The preflight reads, through a CPU probe, the control plane's own grading of the node's fabric
+     (`gpu_fault.gpu_fabric_manager.graded_fabric_gpus` over the node's latest samples), decides the expected shape from
+     it and writes the shape and the graded GPUs into the plan; execute reads it again and refuses when either moved. A
+     deployed control plane without that grading function does not compile the full reset chain either, so its shape is
+     the Fabric Manager restart.
+  2. Confirm that the current Profile and the Node Agent permit the shape's node actions: on a node that is not graded
+     `fabricManagerRestart` and `RESTART_FABRIC_MANAGER`; on a graded node `gpuReset`, `fabricReset` and
+     `QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`, `RESET_ALL_GPUS_NVSWITCHES`, `RESTORE_GPU_SERVICES`, each owned by
+     `gpu-fault-node-agent`; record the service's `MainPID`, start time, ledger, timer and the node scheduling-state
+     baseline.
+  3. Inject a solo XID 45 via the real `/dev/kmsg`, with a correlation window separated from historical events;
      the evidence must carry `kmsg://`, and policy must decide
      `official_action=RESTART_FM`, not the window-open/companion branch.
-  3. Confirm that the workflow is exactly
-     `FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER`, with the owner of the latter step being
-     `gpu-fault-node-agent`.
-  4. Confirm that there is no `MARK_UNSCHEDULABLE`, no quiesce/restore step, no quarantine
-     taint and no temporary fail-safe timer.
-  5. The journal and systemd state prove that Fabric Manager restarted exactly once and returned to active.
-  6. Take the deterministic `command_id` from the ledger and submit it again through the isolated replay fixture;
-     the ledger does not grow and `MainPID` does not change again.
-  7. The same incident has exactly one `ACTION_COMPLETED` Fabric Manager notification, and after the Node Agent replay
+  4. A node that is not graded: the workflow is exactly `FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER`, the latter step owned
+     by `gpu-fault-node-agent`; no `MARK_UNSCHEDULABLE`, no quiesce/restore step, no quarantine taint and no temporary
+     fail-safe timer; the journal and systemd state prove that Fabric Manager restarted exactly once and returned to
+     active.
+  5. A graded node: the workflow is exactly `FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUIESCE_GPU_SERVICES →
+     VERIFY_NO_GPU_CLIENTS → RESET_ALL_GPUS_NVSWITCHES → RESTORE_GPU_SERVICES → VALIDATE_GPU → VALIDATE_FABRIC →
+     RESTORE_SCHEDULING` (an idle node has no STOP_WORKLOADS), the four node actions owned by `gpu-fault-node-agent`,
+     `RESET_ALL_GPUS_NVSWITCHES` naming every graded GPU with `xid=45` in its parameters; QUIESCE, RESET_ALL and RESTORE
+     each have exactly one SUCCEEDED remote command and none FAILED; no `RESTART_FABRIC_MANAGER`, `RESET_GPU`,
+     `QUARANTINE`, reboot or replace appears. The Node Agent ledger adds exactly one QUIESCE, one RESET_ALL at attempt=1,
+     one RESTORE and at least one VERIFY. The journal shows `nvidia-fabricmanager.service` stopped exactly once (QUIESCE)
+     and started exactly once (RESTORE), `MainPID` and `InvocationID` changed and the final state active; after the
+     reset every graded GPU's fabric state in the control plane's latest samples is Success (field 170=3); the node's
+     scheduling fields are back at the baseline after RESTORE_SCHEDULING, and neither a quiesce state file nor a
+     fail-safe timer is left.
+  6. Take the deterministic `command_id` from the ledger and submit it again through the isolated replay fixture: on a
+     node that is not graded the Fabric Manager restart command, on a graded node the `RESTORE_GPU_SERVICES` command that
+     started Fabric Manager (a replay of the reset itself is refused by design once the quiesce maintenance window has
+     expired, and a replayed QUIESCE would taint the node again); the ledger does not grow and `MainPID` does not change
+     again.
+  7. The same incident has exactly one completion notification (on a node that is not graded the `ACTION_COMPLETED`
+     Fabric Manager notification, on a graded node the GPU/NVSwitch reset notification), and after the Node Agent replay
      the notification ID count does not increase; a drill notification may be recorded as `SKIPPED` per site policy, while a real event with mail enabled
      must be `SENT`.
-- Verdict: the real collection layer works end to end; the solo branch and the two-step workflow are correct; the service restarts only once;
-  no quarantine, no quiesce, no temporary timer; the replay returns the cached result and produces neither a second restart nor a second notification.
+  8. Manual supplementary check on a graded node (not part of the automated verdict): once the node is schedulable again
+     inside the maintenance window, run one 8-GPU NCCL all-reduce on it with `NCCL_NVLS_ENABLE=1` and confirm that NVLS
+     initializes. The automated verdict leaves it out: it needs an exclusive 8-GPU NCCL job while the case requires an
+     idle node with no non-system workload before and after, and Fabric Manager only logs a multicast failure when a job
+     requests a team, so reading the log on an idle node proves nothing about NVLS.
+- Verdict: the real collection layer works end to end; the solo branch and the node's workflow shape are correct; Fabric
+  Manager is stopped and started (or restarted) exactly once; a node that is not graded sees no quarantine, no quiesce and
+  no temporary timer, a graded node is isolated only inside the workflow and released by the product itself; the replay
+  returns the cached result and produces neither a second Fabric Manager action nor a second notification; no provider
+  mutation.
 
 ### GF-REGIONAL-DESTR-011
 
@@ -12039,7 +12074,7 @@ RESET rows after the cancellation**
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr018_lifetime_deadline.py`. By default it only produces the plan;
   before execute it must read `DESTR-010=PASS` (chain: `010 → 018`; this case only needs the single piece of evidence
-  "fabric manager restart established on live hardware", not `001/002/009/012`), and it requires the administrator
+  "the XID 45 Fabric Manager action established on live hardware", not `001/002/009/012`), and it requires the administrator
   to name the node explicitly:
 
   ```bash
@@ -12305,10 +12340,13 @@ serve as optional evidence: when unreadable, record "unreadable"; when readable 
 **Node Agent idle restart keeps the same generation, `/healthz` is writable with counters,
 the ledger migrates in place, and the next real command leaves a complete audit trail**
 
-- Level: `live-service-action`. Restart `gpu-fault-node-agent.service` once on an idle
-  GPU node (arm a fail-safe start first), then run the two-step XID 45 →
-  `RESTART_FABRIC_MANAGER` workflow already proven by `DESTR-010`;
-  **no reset, no reboot, no isolation, no provider API call of any kind**.
+- Level: `destructive`. Restart `gpu-fault-node-agent.service` once on an idle
+  GPU node (arm a fail-safe start first), then run the XID 45 workflow already proven by `DESTR-010`: on a
+  node whose fabric the control plane does not grade the two steps XID 45 → `RESTART_FABRIC_MANAGER`,
+  **no reset, no reboot, no isolation**; on a graded Hopper NVSwitch node (the live p5en) the full GPU and
+  NVSwitch reset chain (cordon, quiesce, one reset, restore, both validations, scheduling back),
+  **no reboot, no quarantine**. Neither shape makes **any provider API call**; the preflight reads the control
+  plane's own grading and records the shape in the plan.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr019_agent_restart_ledger.py`. By default it only generates the plan;
   before execute it must read `DESTR-010=PASS` (chain: `010 → 019`) and requires the administrator
@@ -12357,7 +12395,9 @@ the ledger migrates in place, and the next real command leaves a complete audit 
   1. `DESTR-010` PASS.
   2. One idle GPU node: Ready, schedulable, no `gpu-fault.io/` taint or ownership annotation,
      no non-system Pods, no active NVIDIA compute client; Node Agent ACTIVE with
-     `allowed_operations` containing `RESTART_FABRIC_MANAGER`; Fabric Manager active.
+     `allowed_operations` containing the node actions of the node's shape (`RESTART_FABRIC_MANAGER` on a node
+     that is not graded; `QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`, `RESET_ALL_GPUS_NVSWITCHES`,
+     `RESTORE_GPU_SERVICES` on a graded node); Fabric Manager active.
   3. The real ledger on the host has `PRAGMA user_version` equal to the deployed release's
      `gpu_fault.node_agent.ledger.LEDGER_SCHEMA_VERSION` (currently 3; the verdict imports the
      constant from the installed release instead of hard-coding it, so what it refuses is a node
@@ -12388,8 +12428,11 @@ the ledger migrates in place, and the next real command leaves a complete audit 
   4. `/healthz` after the restart: 200, all `counters` 0, heartbeat age ≤ 120 s.
   5. Injection: another probe (`probes/node_host_probe.py`) writes one solo XID 45 with a marker to
      `/dev/kmsg`; wait for the workflow terminal state.
-  6. Audit: with `<idempotency_key>/<node>/agent-<generation>` as the command_id, read journald
-     (`journalctl -t gpu-fault-node-agent`), the ledger audit columns and `/healthz`.
+  6. Audit: the audited command is the Fabric Manager restart command on a node that is not graded and the
+     chain's `RESET_ALL_GPUS_NVSWITCHES` command on a graded node; with
+     `<idempotency_key>/<node>/agent-<generation>` as the command_id, read journald
+     (`journalctl -t gpu-fault-node-agent`), the ledger audit columns and `/healthz`; on a graded node also
+     read every ledger attempt since the restart with `ledger-audit --since <restart instant>`.
 - Verdict:
   - Restart: `MainPID` and `InvocationID` changed, `boot_id` unchanged; the control-plane Agent has
     `lifecycle_state=ACTIVE`, `generation` and `agent_incarnation_id` equal to the baseline;
@@ -12399,9 +12442,10 @@ the ledger migrates in place, and the next real command leaves a complete audit 
     no `results_legacy` left behind; an old row's `attempt_history` reads back one entry with a
     readable payload; fencing preserved, the old token rejected; after the append the history is
     `[1, 2]`, `get()` returns attempt 2 with `exit_code=7`;
-  - The workflow is exactly `FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER`, owners
+  - A node that is not graded: the workflow is exactly `FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER`, owners
     `gpu-fault-control-plane`/`gpu-fault-node-agent`, SUCCEEDED, with no isolation,
-    quiesce, reset or reboot;
+    quiesce, reset or reboot; a graded node: the workflow is `DESTR-010`'s full reset chain and SUCCEEDED, with
+    no `RESTART_FABRIC_MANAGER`, `RESET_GPU`, `QUARANTINE`, reboot or replace;
   - journald has exactly three lines accepted/started/completed for that command_id, each containing
     `command_id incident_id workflow_request_id operation node_id fencing_token
     agent_generation gpu_count attempt`, with values matching the control plane, the completed line
@@ -12411,7 +12455,11 @@ the ledger migrates in place, and the next real command leaves a complete audit 
     `incident_id/workflow_request_id/fencing_token` matching the control plane,
     `started_at < completed_at`, `parameters_digest`/`signature_digest` are 64-character
     sha256, the `gpu_uuids` column is non-empty, `exit_code` is null; the INTERRUPTED row count equals the baseline;
-  - After the command `/healthz` `counters` are `accepted=1 completed=1 failed=0 rejected=0`;
+  - After the command `/healthz` `counters`: on a node that is not graded `accepted=1 completed=1 failed=0
+    rejected=0`; on a graded node they equal the chain's attempts in the ledger since the restart
+    (`accepted`=rows, `completed`=SUCCEEDED rows, `failed`=FAILED rows -- a VERIFY attempt that failed before the
+    host clients exited counts too -- `rejected=0`), and those rows hold only the chain's node actions, QUIESCE,
+    RESET_ALL and RESTORE once each;
   - The CloudTrail set of provider mutation verbs is empty; the node's Kubernetes state is field-by-field identical to the baseline.
 - Cleanup (`finally`): `ensure-agent-active`; `disarm-restore` and confirm no newly added
   gpu-fault timer remains; `ensure-fabric-manager-active`; node snapshot identical to the baseline with no non-system

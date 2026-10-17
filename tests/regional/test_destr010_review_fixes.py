@@ -346,9 +346,12 @@ def test_focused_tests_run_pytest_from_the_repo_root(
     assert runs[0]["check"] is False
     assert runs[0]["command"][1:4] == ["-m", "pytest", "-q"]
     assert all(
-        item.startswith(("tests/node_agent/", "tests/policy/"))
+        item.startswith(("tests/node_agent/", "tests/policy/", "tests/orchestration/"))
         for item in runs[0]["command"][4:]
     ), runs[0]["command"]
+    assert any(
+        "test_fabric_manager_restart_plan.py" in item for item in runs[0]["command"]
+    ), "the graded-node plan is part of the focused regression"
     assert result == {"passed": True, "returncode": 0, "command": runs[0]["command"]}
     assert (tmp_path / "focused-tests.log").read_text(encoding="utf-8") == "ok\n"
 

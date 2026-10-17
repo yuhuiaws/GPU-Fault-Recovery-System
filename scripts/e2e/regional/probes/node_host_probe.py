@@ -16,6 +16,16 @@ from typing import Any
 
 FABRIC_MANAGER_UNIT = "nvidia-fabricmanager.service"
 LEDGER = Path("/var/lib/gpu-fault/node-actions.db")
+# The node actions a solo XID 45 can run: the Fabric Manager restart, or on a
+# Hopper NVSwitch node whose fabric the product grades the full GPU + NVSwitch
+# reset chain's window, client check, reset and restore (DESTR-010).
+LEDGER_OPERATIONS = (
+    "RESTART_FABRIC_MANAGER",
+    "QUIESCE_GPU_SERVICES",
+    "VERIFY_NO_GPU_CLIENTS",
+    "RESET_ALL_GPUS_NVSWITCHES",
+    "RESTORE_GPU_SERVICES",
+)
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SAFE_BDF = re.compile(r"^0000:[0-9a-f]{2}:[0-9a-f]{2}$")
 
@@ -131,12 +141,14 @@ def ledger_rows() -> list[dict[str, Any]]:
         return []
     connection = sqlite3.connect(f"file:{LEDGER}?mode=ro", uri=True)
     try:
+        # The operations are this module's constants, never input.
+        operations = ", ".join(f"'{item}'" for item in LEDGER_OPERATIONS)
         rows = connection.execute(
-            """
+            f"""
             SELECT command_id, completed_at, attempt, state,
                    operation, started_at
             FROM results
-            WHERE operation='RESTART_FABRIC_MANAGER'
+            WHERE operation IN ({operations})
             ORDER BY completed_at, command_id
             """
         ).fetchall()

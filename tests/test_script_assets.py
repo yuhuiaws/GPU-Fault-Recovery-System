@@ -390,7 +390,6 @@ RECORDED_SCRIPT_SIZE_EXCEPTIONS = {
         "scripts/e2e/regional/run_destr001_gpu_reset.py:execute_case",
         "scripts/e2e/regional/run_destr002_hyperpod_reboot.py:execute_case",
         "scripts/e2e/regional/run_destr009_workload_restart.py:execute_case",
-        "scripts/e2e/regional/run_destr010_fabric_manager_restart.py:execute_case",
         "scripts/e2e/regional/run_destr023_idle_cluster_reset.py:execute_case",
         "scripts/e2e/regional/run_destr024_watcher_down_fail_closed.py:execute_case",
         "scripts/e2e/regional/run_notification_acceptance.py:run_notify005",

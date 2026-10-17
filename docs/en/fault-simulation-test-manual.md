@@ -381,20 +381,41 @@ hardware produced the XID.
 
 ### 7.5 HyperPod Standalone XID 45 Fabric Manager Restart
 
-`GF-LIVE-KMSG-XID45-SOLO-FM-20260724` and the mail case verify the complete `RESTART_FABRIC_MANAGER` chain for an
-XID 45 without a companion.
+A standalone XID 45 (no companion) is decided as `official_action=RESTART_FM`; the shape it runs in depends on whether
+the control plane grades the target node's NVLink fabric (a Hopper SXM part on an NVSwitch baseboard whose DCGM exporter
+reports field 170):
+
+- a node that is not graded: the workflow is `FREEZE_EVIDENCE` → `RESTART_FABRIC_MANAGER`, a Fabric Manager restart
+  only, with no isolation, no quiesce and no reset;
+- a graded node: stopping Fabric Manager loses the fabric state and every GPU of the fabric must be reset after it
+  restarts, so the workflow is the full GPU and NVSwitch reset chain: `FREEZE_EVIDENCE`, `MARK_UNSCHEDULABLE`,
+  (`STOP_WORKLOADS` with an ACTIVE workload), `QUIESCE_GPU_SERVICES` (stops Fabric Manager), `VERIFY_NO_GPU_CLIENTS`,
+  `RESET_ALL_GPUS_NVSWITCHES` (every graded GPU of the node), `RESTORE_GPU_SERVICES` (starts Fabric Manager),
+  `VALIDATE_GPU`, `VALIDATE_FABRIC`, `RESTORE_SCHEDULING`, (`RESTART_WORKLOAD` with an ACTIVE workload). The
+  `official_action` stays `RESTART_FM` and the completion notification is the GPU/NVSwitch reset notification.
+
+`GF-REGIONAL-DESTR-010` verifies both shapes: its preflight reads the control plane's own grading of the node and records
+the shape in the plan, and execute refuses a node whose grading moved. The former `GF-LIVE-KMSG-XID45-SOLO-FM-20260724`
+and the mail case `GF-LIVE-KMSG-XID45-FM-EMAIL-20260724` covered the two-step shape only; they are `SUPERSEDED` and no
+longer run.
 
 Preconditions:
 
-- `fabricManagerRestart` in the current Profile is OWNed by `gpu-fault-node-agent`;
+- a node that is not graded: `fabricManagerRestart` in the current Profile is OWNed by `gpu-fault-node-agent` and the
+  allowlist contains `RESTART_FABRIC_MANAGER`;
+- a graded node: `gpuReset` and `fabricReset` in the current Profile are OWNed by `gpu-fault-node-agent` and the
+  allowlist contains `QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`, `RESET_ALL_GPUS_NVSWITCHES` and
+  `RESTORE_GPU_SERVICES`;
 - the Agent is ACTIVE and the artifact/config/profile pins agree;
-- the allowlist contains `RESTART_FABRIC_MANAGER`;
-- the training heartbeat is normal and the Fabric Manager MainPID has been recorded.
+- the Fabric Manager MainPID has been recorded; `GF-REGIONAL-DESTR-010` requires an idle node.
 
 Write one standard XID 45 to a single target node only and wait for the full correlation window. The success criteria are
-`FINALIZED` with no companion, the workflow completing `FREEZE_EVIDENCE` and `RESTART_FABRIC_MANAGER`, a changed
-MainPID, and unchanged training Pods and attempt. With mail enabled, the fixed-template notification must also be verified
-as `SENT` and an idempotent replay must not deliver twice.
+`FINALIZED` with no companion, the workflow completing every step of the node's shape, a changed MainPID, and no
+`QUARANTINE`, reboot or replace. On a node that is not graded the training Pods and attempt are unchanged; on a graded
+node `RESET_ALL_GPUS_NVSWITCHES` runs once, Fabric Manager is stopped once and started once, every graded GPU's fabric
+state is back to Success after the reset, and the node is schedulable again after `RESTORE_SCHEDULING`. With mail
+enabled, the shape's fixed-template notification must also be verified as `SENT` and an idempotent replay must not
+deliver twice.
 
 ### 7.5.1 XID 45 Cross-Replica and Companion Correlation on Real Hardware
 

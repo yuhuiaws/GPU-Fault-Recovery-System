@@ -3,12 +3,21 @@
 The case proves ARCH-C3/C4/C5 on a real node: after a Node Agent restart on
 an idle node the Agent comes back on the *same* generation (same boot, same
 incarnation), ``/healthz`` reports the ledger writable with fresh heartbeat
-and zeroed counters, and the next real command -- the Fabric Manager restart
-DESTR-010 already proved -- leaves a full audit trail: three structured
+and zeroed counters, and the next real command -- the workflow DESTR-010
+already proved for a solo XID 45 -- leaves a full audit trail: three structured
 journald lines (accepted/started/completed) carrying the nine identifier
 fields and nothing else, one ledger row keyed ``(command_id, attempt=1)`` with
-every audit column, and the counters moving by exactly one. A scratch ledger
-built from the pre-C4 schema is migrated in place by the deployed wheel.
+every audit column, and the counters moving exactly as the ledger did. A
+scratch ledger built from the pre-C4 schema is migrated in place by the
+deployed wheel.
+
+The workflow has two shapes (``fabric_restart_shape``). On a node whose NVLink
+fabric the product does not grade it is the Fabric Manager restart: one
+command, counters accepted=1 completed=1. On a graded Hopper NVSwitch node (the
+live site) it is the full GPU + NVSwitch reset chain -- cordon, quiesce, client
+check, one reset, restore, validations -- so the audited command is the chain's
+RESET_ALL_GPUS_NVSWITCHES and the counters must equal the ledger rows the
+chain added since the restart (attempts, SUCCEEDED, FAILED, no rejection).
 
 What the case deliberately does *not* do is restart the Agent while a
 maintenance command is in flight. ``NodeActionLedger._interrupt_in_progress``
@@ -22,10 +31,12 @@ See the spec's 局限 for the reasoning.
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 from datetime import datetime, timezone
 from typing import Any
 
 from gpu_fault.node_agent.ledger import LEDGER_SCHEMA_VERSION
+from scripts.e2e.regional import fabric_restart_shape as shapes
 from scripts.e2e.regional.acceptance_runner_common import processor_queue_backlog
 
 CASE_ID = "GF-REGIONAL-DESTR-019"
@@ -33,7 +44,13 @@ PREDECESSOR_CASE_ID = "GF-REGIONAL-DESTR-010"
 CONFIRMATION = "DESTR019_RESTART_NODE_AGENT_LEDGER_AUDIT"
 EXPECTED_XID = 45
 COMMAND_OPERATION = "RESTART_FABRIC_MANAGER"
-EXPECTED_STEPS = ("FREEZE_EVIDENCE", "RESTART_FABRIC_MANAGER")
+# The command a graded node's chain is audited by: the one reset of the window.
+FABRIC_RESET_COMMAND_OPERATION = "RESET_ALL_GPUS_NVSWITCHES"
+AUDITED_OPERATION = {
+    shapes.FABRIC_MANAGER_RESTART: COMMAND_OPERATION,
+    shapes.FABRIC_RESET: FABRIC_RESET_COMMAND_OPERATION,
+}
+EXPECTED_STEPS = shapes.FABRIC_MANAGER_RESTART_STEPS
 EXPECTED_OWNERS = ("gpu-fault-control-plane", "gpu-fault-node-agent")
 FORBIDDEN_OPERATIONS = frozenset(
     {
@@ -129,6 +146,7 @@ def preflight_errors(
     recent_event: dict[str, Any] | None,
     host: dict[str, Any],
     tests_passed: bool,
+    shape: str = shapes.FABRIC_MANAGER_RESTART,
 ) -> list[str]:
     errors: list[str] = []
     if node.get("ready") != "True":
@@ -143,8 +161,9 @@ def preflight_errors(
         errors.append("target node has non-system running Pods")
     if agent.get("lifecycle_state") != "ACTIVE":
         errors.append("target Node Agent is not ACTIVE")
-    if not REQUIRED_AGENT_OPERATIONS <= set(agent.get("allowed_operations") or []):
-        errors.append("target Node Agent does not allow RESTART_FABRIC_MANAGER")
+    allowed = set(agent.get("allowed_operations") or [])
+    for operation in sorted(shapes.REQUIRED_AGENT_OPERATIONS[shape] - allowed):
+        errors.append(f"target Node Agent does not allow {operation}")
     if not isinstance(agent.get("generation"), int):
         errors.append("target Node Agent has no generation")
     if profile.get("warnings"):
@@ -298,7 +317,13 @@ def agent_record_errors(
 # --------------------------------------------------------------------------- #
 # Workflow (the DESTR-010 contract, compacted)
 # --------------------------------------------------------------------------- #
-def workflow_errors(state: dict[str, Any], *, node: str) -> list[str]:
+def workflow_errors(
+    state: dict[str, Any],
+    *,
+    node: str,
+    shape: str = shapes.FABRIC_MANAGER_RESTART,
+    expected_gpus: Sequence[str] = (),
+) -> list[str]:
     errors: list[str] = []
     event = state.get("event") or {}
     decision = state.get("decision") or {}
@@ -309,6 +334,13 @@ def workflow_errors(state: dict[str, Any], *, node: str) -> list[str]:
         errors.append(f"matched event is not XID {EXPECTED_XID}")
     if decision.get("official_action") != "RESTART_FM":
         errors.append("policy did not finalize XID 45 as RESTART_FM")
+    if list(incident.get("node_ids") or []) != [node]:
+        errors.append(f"incident covers {incident.get('node_ids')}, not just {node}")
+    if shape == shapes.FABRIC_RESET:
+        errors.extend(
+            shapes.fabric_reset_workflow_errors(workflow, commands, list(expected_gpus))
+        )
+        return errors
     steps = [item.get("operation") for item in workflow.get("official_steps") or []]
     if steps != list(EXPECTED_STEPS):
         errors.append(f"workflow steps {steps} != {list(EXPECTED_STEPS)}")
@@ -327,8 +359,54 @@ def workflow_errors(state: dict[str, Any], *, node: str) -> list[str]:
         errors.append(f"workflow reached forbidden operations: {forbidden}")
     if len(commands) != 1 or commands[0].get("status") != "SUCCEEDED":
         errors.append("remote Fabric Manager command is not uniquely SUCCEEDED")
-    if list(incident.get("node_ids") or []) != [node]:
-        errors.append(f"incident covers {incident.get('node_ids')}, not just {node}")
+    return errors
+
+
+def audited_command(state: dict[str, Any], shape: str) -> dict[str, Any]:
+    """The remote command whose node action the journald/ledger audit reads."""
+
+    commands = state.get("commands") or []
+    if shape == shapes.FABRIC_RESET:
+        return shapes.command_for(commands, FABRIC_RESET_COMMAND_OPERATION)
+    return commands[0] if commands else {}
+
+
+def counter_expectation(
+    shape: str, chain_audit: dict[str, Any] | None = None
+) -> dict[str, int]:
+    """What ``/healthz`` must count after the workflow: one Fabric Manager
+    restart, or exactly the chain's attempts the Agent's ledger holds."""
+
+    if shape != shapes.FABRIC_RESET:
+        return {"accepted": 1, "completed": 1, "failed": 0, "rejected": 0}
+    rows = (chain_audit or {}).get("rows") or []
+    return {
+        "accepted": len(rows),
+        "completed": sum(row.get("state") == "SUCCEEDED" for row in rows),
+        "failed": sum(row.get("state") == "FAILED" for row in rows),
+        "rejected": 0,
+    }
+
+
+def chain_ledger_errors(chain_audit: dict[str, Any]) -> list[str]:
+    """Every attempt the Agent took since the restart is a step of the chain,
+    and the window, the reset and the restore ran once each."""
+
+    rows = chain_audit.get("rows") or []
+    errors: list[str] = []
+    operations = sorted({str(row.get("operation")) for row in rows})
+    unexpected = sorted(set(operations) - set(shapes.FABRIC_RESET_NODE_STEPS))
+    if unexpected:
+        errors.append(f"the Agent ran operations outside the chain: {unexpected}")
+    for operation in shapes.FABRIC_RESET_SINGLE_COMMAND_STEPS:
+        attempts = [row for row in rows if row.get("operation") == operation]
+        if len(attempts) != 1:
+            errors.append(
+                f"the ledger holds {len(attempts)} {operation} attempts since the "
+                "restart, not one"
+            )
+    if not any(row.get("operation") == "VERIFY_NO_GPU_CLIENTS" for row in rows):
+        errors.append("the ledger holds no client verification since the restart")
     return errors
 
 
@@ -344,6 +422,7 @@ def journal_errors(
     node: str,
     fencing_token: int,
     generation: int,
+    operation: str = COMMAND_OPERATION,
 ) -> list[str]:
     errors: list[str] = []
     phases = [item.get("phase") for item in lines]
@@ -355,7 +434,7 @@ def journal_errors(
         "command_id": command_id,
         "incident_id": incident_id,
         "workflow_request_id": workflow_request_id,
-        "operation": COMMAND_OPERATION,
+        "operation": operation,
         "node_id": node,
         "fencing_token": str(fencing_token),
         "agent_generation": str(generation),
@@ -422,6 +501,7 @@ def ledger_row_errors(
     workflow_request_id: str,
     fencing_token: int,
     baseline_interrupted: int,
+    operation: str = COMMAND_OPERATION,
 ) -> list[str]:
     errors = ledger_schema_errors(audit)
     rows = [
@@ -435,7 +515,7 @@ def ledger_row_errors(
         errors.append(f"ledger attempt is {row.get('attempt')}, not 1")
     if row.get("state") != "SUCCEEDED":
         errors.append(f"ledger state is {row.get('state')}, not SUCCEEDED")
-    if row.get("operation") != COMMAND_OPERATION:
+    if row.get("operation") != operation:
         errors.append(f"ledger operation is {row.get('operation')}")
     for name, expected in (
         ("incident_id", incident_id),

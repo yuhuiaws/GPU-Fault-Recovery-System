@@ -9,12 +9,14 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from collections.abc import Sequence
 from typing import Any, cast
 
 ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.e2e.regional import fabric_restart_shape as shapes  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
     write_json_atomic,
@@ -48,7 +50,10 @@ FORBIDDEN_OPERATIONS = {
     "QUIESCE_GPU_SERVICES",
     "RESTORE_GPU_SERVICES",
 }
-EXPECTED_STEPS = ["FREEZE_EVIDENCE", "RESTART_FABRIC_MANAGER"]
+# The Fabric Manager restart of a node whose fabric the product does not
+# grade; a graded Hopper NVSwitch node runs the full GPU + NVSwitch reset chain
+# instead (``fabric_restart_shape``).
+EXPECTED_STEPS = list(shapes.FABRIC_MANAGER_RESTART_STEPS)
 EXPECTED_OWNERS = ["gpu-fault-control-plane", "gpu-fault-node-agent"]
 # The Node fields a Fabric Manager restart must leave alone. `ready` is judged
 # on its own: a node that flickers NotReady and returns is a different finding
@@ -86,10 +91,13 @@ def configure(arguments: argparse.Namespace) -> Settings:
 
 # What the shared STORE_PROBE does not carry and this case needs: the policy's
 # companion window, the node's XID events inside it, its active workflow
-# incidents, and -- at the terminal read only -- the raw NVIDIA kernel evidence
+# incidents, the control plane's grading of the node's NVLink fabric (which
+# decides the workflow shape before injection and every GPU's state after the
+# reset) and -- at the terminal read only -- the raw NVIDIA kernel evidence
 # that names the marker. The evidence scan pages through up to 1000 records,
 # which is why it is not part of the per-5s wait loop.
-FABRIC_PROBE = r"""
+FABRIC_PROBE = (
+    r"""
 import json
 import sys
 from datetime import datetime, timedelta, timezone
@@ -97,7 +105,9 @@ from datetime import datetime, timedelta, timezone
 from gpu_fault.app import ApplicationContext
 from gpu_fault.policy import load_xid_policy
 from gpu_fault.telemetry import EvidenceKind
-
+"""
+    + shapes.GRADING_SOURCE
+    + r"""
 cluster_id, node_id, marker, include_evidence = sys.argv[1:]
 store = ApplicationContext.from_environment().store
 now = datetime.now(timezone.utc)
@@ -147,8 +157,10 @@ print(json.dumps({
         for incident_item, workflow_item in active
     ],
     "evidence": evidence,
+    "fabric_grading": fabric_grading(store, cluster_id, node_id),
 }, sort_keys=True, default=str))
 """
+)
 
 
 def fabric_probe(
@@ -229,6 +241,12 @@ def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
         "test_fabric_manager_restart_requires_explicit_enable",
         "tests/policy/_policy_cases_2.py::"
         "test_xid_45_and_48_workflow_branches_are_exact",
+        "tests/orchestration/test_fabric_manager_restart_plan.py::"
+        "test_a_hopper_nvswitch_node_plans_the_full_gpu_and_nvswitch_reset",
+        "tests/orchestration/test_fabric_manager_restart_plan.py::"
+        "test_every_other_node_keeps_the_fabric_manager_restart",
+        "tests/node_agent/test_quiesce_fabric_manager_keep.py::"
+        "test_without_the_parameter_the_window_stops_and_starts_it_as_before",
     ]
     completed = RegionalLiveFixture.run(
         command,
@@ -264,18 +282,22 @@ def validate_preflight(
     agent = state.get("agent") or {}
     if agent.get("lifecycle_state") != "ACTIVE":
         errors.append("target Node Agent is not ACTIVE")
-    if "RESTART_FABRIC_MANAGER" not in (agent.get("allowed_operations") or []):
-        errors.append("target Node Agent does not allow RESTART_FABRIC_MANAGER")
+    # The node actions and capabilities the shape the node will run needs.
+    shape = shapes.shape_of(fabric.get("fabric_grading"))
+    allowed = set(agent.get("allowed_operations") or [])
+    for operation in sorted(shapes.REQUIRED_AGENT_OPERATIONS[shape] - allowed):
+        errors.append(f"target Node Agent does not allow {operation}")
     profile = state.get("profile") or {}
-    restart = capability(profile, "fabricManagerRestart")
-    if restart is None:
-        errors.append("runtime profile has no fabricManagerRestart capability")
-    elif (
-        restart.get("mode") != "OWN"
-        or restart.get("owner") != "gpu-fault-node-agent"
-        or restart.get("adapter") != "node-action"
-    ):
-        errors.append("fabricManagerRestart is not OWN by the Node Agent")
+    for name in shapes.REQUIRED_CAPABILITIES[shape]:
+        item = capability(profile, name)
+        if item is None:
+            errors.append(f"runtime profile has no {name} capability")
+        elif (
+            item.get("mode") != "OWN"
+            or item.get("owner") != "gpu-fault-node-agent"
+            or item.get("adapter") != "node-action"
+        ):
+            errors.append(f"{name} is not OWN by the Node Agent")
     if profile.get("warnings"):
         errors.append("runtime profile has warnings")
     if fabric.get("active_workflow_incidents"):
@@ -323,19 +345,27 @@ def read_only_preflight(
     return result
 
 
-def workflow_errors(state: dict[str, Any]) -> list[str]:
+def run_shape(preflight: dict[str, Any]) -> tuple[str, list[str]]:
+    """The shape the plan recorded and the node's graded GPUs."""
+
+    grading = (preflight.get("fabric") or {}).get("fabric_grading")
+    return shapes.shape_of(grading), shapes.graded_gpus(grading)
+
+
+def workflow_errors(
+    state: dict[str, Any],
+    shape: str = shapes.FABRIC_MANAGER_RESTART,
+    expected_gpus: Sequence[str] = (),
+) -> list[str]:
     errors = []
     event = state.get("event") or {}
     decision = state.get("decision") or {}
     workflow = state.get("workflow") or {}
     commands = state.get("commands") or []
     evidence = state.get("evidence") or []
-    notifications = [
-        item
-        for item in normalize_notifications(state.get("notifications") or [])
-        if item.get("category") == "ACTION_COMPLETED"
-        and "Fabric Manager" in str(item.get("subject") or "")
-    ]
+    notifications = shapes.shape_notifications(
+        normalize_notifications(state.get("notifications") or []), shape
+    )
     if event.get("xid") != 45:
         errors.append("matched event is not XID 45")
     if not str(event.get("evidence_ref") or "").startswith("kmsg://"):
@@ -344,6 +374,32 @@ def workflow_errors(state: dict[str, Any]) -> list[str]:
         errors.append("policy did not finalize XID 45 as RESTART_FM")
     if decision.get("disposition") != "EXECUTABLE":
         errors.append("policy decision is not EXECUTABLE")
+    if shape == shapes.FABRIC_RESET:
+        errors.extend(
+            shapes.fabric_reset_workflow_errors(workflow, commands, list(expected_gpus))
+        )
+    else:
+        errors.extend(_restart_workflow_errors(workflow, commands))
+    if not evidence:
+        errors.append("raw NVIDIA kernel evidence was not retained")
+    label = (
+        "Fabric Manager action"
+        if shape == shapes.FABRIC_MANAGER_RESTART
+        else "GPU/NVSwitch reset"
+    )
+    if len(notifications) != 1:
+        errors.append(f"{label} notification is not unique")
+    elif notifications[0].get("status") not in {"SENT", "SKIPPED"}:
+        errors.append(f"{label} notification is not terminal")
+    return errors
+
+
+def _restart_workflow_errors(
+    workflow: dict[str, Any], commands: list[dict[str, Any]]
+) -> list[str]:
+    """The two-step Fabric Manager restart of a node the product does not grade."""
+
+    errors = []
     official_steps = [
         item.get("operation") for item in workflow.get("official_steps", [])
     ]
@@ -361,13 +417,40 @@ def workflow_errors(state: dict[str, Any]) -> list[str]:
         errors.append("workflow is not SUCCEEDED")
     if len(commands) != 1 or commands[0].get("status") != "SUCCEEDED":
         errors.append("remote Fabric Manager command is not uniquely SUCCEEDED")
-    if not evidence:
-        errors.append("raw NVIDIA kernel evidence was not retained")
-    if len(notifications) != 1:
-        errors.append("Fabric Manager action notification is not unique")
-    elif notifications[0].get("status") not in {"SENT", "SKIPPED"}:
-        errors.append("Fabric Manager action notification is not terminal")
     return errors
+
+
+def terminal_errors(
+    state: dict[str, Any],
+    terminal_fabric: dict[str, Any],
+    shape: str,
+    expected_gpus: Sequence[str],
+) -> list[str]:
+    """The workflow verdict, and after a full reset every GPU's fabric state."""
+
+    errors = workflow_errors(state, shape, expected_gpus)
+    if shape == shapes.FABRIC_RESET:
+        errors.extend(
+            shapes.fabric_state_errors(
+                terminal_fabric.get("fabric_grading"), list(expected_gpus)
+            )
+        )
+    return errors
+
+
+def replay_target(state: dict[str, Any], shape: str) -> dict[str, Any]:
+    """The remote command the isolated replay submits again.
+
+    The Fabric Manager restart's own command; in the full reset chain the
+    RESTORE_GPU_SERVICES command, which started Fabric Manager again. A replay
+    of the reset itself is refused by design once the quiesce maintenance
+    window has expired, and a replayed QUIESCE would taint the node again.
+    """
+
+    commands = state.get("commands") or []
+    if shape == shapes.FABRIC_RESET:
+        return shapes.command_for(commands, "RESTORE_GPU_SERVICES")
+    return commands[0] if commands else {}
 
 
 def node_state_errors(
@@ -465,7 +548,13 @@ def host_errors(
     after_first: dict[str, Any],
     after_replay: dict[str, Any],
     expected_command_id: str,
+    *,
+    shape: str = shapes.FABRIC_MANAGER_RESTART,
 ) -> list[str]:
+    """Fabric Manager went down and up exactly once, and the replay changed
+    nothing. The restart restarts it; the full reset chain stops it in its
+    QUIESCE and starts it in its RESTORE (``expected_command_id``)."""
+
     errors = []
     before_service = baseline["fabric_manager"]
     first_service = after_first["fabric_manager"]
@@ -480,7 +569,11 @@ def host_errors(
         errors.append("journal does not show exactly one Fabric Manager start")
     baseline_ids = {item["command_id"] for item in baseline["ledger"]}
     first_ids = {item["command_id"] for item in after_first["ledger"]}
-    if first_ids - baseline_ids != {expected_command_id}:
+    if shape == shapes.FABRIC_RESET:
+        if after_first["journal"].get("stopped_count") != 1:
+            errors.append("journal does not show exactly one Fabric Manager stop")
+        errors.extend(_fabric_ledger_errors(baseline, after_first, expected_command_id))
+    elif first_ids - baseline_ids != {expected_command_id}:
         errors.append("Node Agent ledger did not add exactly the expected command")
     if replay_service.get("MainPID") != first_service.get("MainPID"):
         errors.append("Fabric Manager MainPID changed during replay")
@@ -499,13 +592,50 @@ def host_errors(
     return errors
 
 
+def _fabric_ledger_errors(
+    baseline: dict[str, Any], after_first: dict[str, Any], restore_command_id: str
+) -> list[str]:
+    """The chain's node actions on the Agent ledger: one window, one reset."""
+
+    known = {item["command_id"] for item in baseline["ledger"]}
+    added = [item for item in after_first["ledger"] if item["command_id"] not in known]
+    by_operation: dict[str, set[str]] = {}
+    for item in added:
+        by_operation.setdefault(str(item.get("operation")), set()).add(
+            item["command_id"]
+        )
+    errors = []
+    if restore_command_id not in {item["command_id"] for item in added}:
+        errors.append("Node Agent ledger does not hold the expected restore command")
+    for operation in shapes.FABRIC_RESET_SINGLE_COMMAND_STEPS:
+        count = len(by_operation.get(operation, set()))
+        if count != 1:
+            errors.append(f"Node Agent ledger added {count} {operation} commands")
+    if not by_operation.get("VERIFY_NO_GPU_CLIENTS"):
+        errors.append("Node Agent ledger shows no client verification")
+    unexpected = sorted(set(by_operation) - set(shapes.FABRIC_RESET_NODE_STEPS))
+    if unexpected:
+        errors.append(f"Node Agent ledger added unexpected operations {unexpected}")
+    resets = [
+        item.get("attempt")
+        for item in added
+        if item.get("operation") == "RESET_ALL_GPUS_NVSWITCHES"
+    ]
+    if resets != [1]:
+        errors.append("the full GPU + NVSwitch reset did not run exactly once")
+    return errors
+
+
 def preflight_identity(preflight: dict[str, Any]) -> dict[str, Any]:
     store = preflight["store"]
+    shape, graded = run_shape(preflight)
     return {
         "release_id": preflight["release_id"],
         "node_uid": preflight["node"]["uid"],
         "agent_generation": (store.get("agent") or {}).get("generation"),
         "runtime_profile_version": (store.get("profile") or {}).get("profile_version"),
+        "workflow_shape": shape,
+        "graded_gpus": graded,
     }
 
 
@@ -520,6 +650,71 @@ def prepare_host_baseline(fixture: HostProbeFixture, case_dir: Path) -> dict[str
     if baseline_host["fabric_manager"].get("ActiveState") != "active":
         raise RegionalFixtureError("Fabric Manager is not active at baseline")
     return baseline_host
+
+
+def provider_evidence(
+    regional: RegionalLiveFixture, case_dir: Path, injected_at: datetime
+) -> tuple[list[dict[str, Any]], bool]:
+    """CloudTrail's view of the injection window, recorded with its caveat.
+
+    "No provider mutation" is not provable inside CloudTrail's delivery window;
+    an empty read is recorded as provisional, not as proof.
+    """
+
+    window_end = datetime.now(timezone.utc)
+    events = regional.provider_events(injected_at, window_end)
+    provisional = not events and regional.provider_events_provisional(window_end)
+    write_json_atomic(
+        case_dir / "provider-events.json",
+        {"events": events, "provider_events_provisional": provisional},
+    )
+    return events, provisional
+
+
+def finish_case(
+    fixture: HostProbeFixture,
+    regional: RegionalLiveFixture,
+    node: str,
+    baseline_node: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    """Fabric Manager active, probe resources gone, node back at its baseline.
+
+    Runs in the case's ``finally``: every failure here makes the case FAIL.
+    """
+
+    recovery: dict[str, Any] = {}
+    residuals: dict[str, bool] = {}
+    try:
+        recovery = fixture.execute(
+            "ensure-fabric-manager-active",
+            timeout=120,
+        )
+    except Exception as exc:
+        recovery = {"error": f"{type(exc).__name__}: {exc}"}
+        result["verdict"] = "FAIL"
+    try:
+        residuals = fixture.cleanup()
+    except Exception as exc:
+        residuals = {"cleanup_error": True}
+        result["cleanup_error"] = f"{type(exc).__name__}: {exc}"
+        result["verdict"] = "FAIL"
+    result["recovery"] = recovery
+    result["probe_residuals"] = residuals
+    if any(residuals.values()):
+        result["verdict"] = "FAIL"
+    try:
+        final_node = regional.node_snapshot(node)
+        result["final_node"] = final_node
+        final_errors = node_state_errors(baseline_node, final_node, stage="final")
+        if final_errors:
+            result["verdict"] = "FAIL"
+            errors_recorded = result.setdefault("errors", [])
+            if isinstance(errors_recorded, list):
+                errors_recorded.extend(final_errors)
+    except Exception as exc:
+        result["postflight_error"] = f"{type(exc).__name__}: {exc}"
+        result["verdict"] = "FAIL"
 
 
 def execute_case(
@@ -542,6 +737,7 @@ def execute_case(
         raise RegionalFixtureError(f"DESTR-010 plan drifted: {planned} != {current}")
 
     regional = RegionalLiveFixture(settings.regional)
+    shape, graded = run_shape(preflight)
     run_id = f"destr010-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
     marker = f"destr010-{int(time.time())}-a{attempt}"
     fixture = HostProbeFixture(
@@ -563,6 +759,7 @@ def execute_case(
         "verdict": "FAIL",
         **preflight["evidence_identity"],
         "node": settings.node,
+        "workflow_shape": shape,
         "maintenance_window_end": maintenance_window_end.isoformat(),
         "focused_tests_reused": bool(
             preflight["focused_tests"].get("focused_tests_reused")
@@ -614,9 +811,9 @@ def execute_case(
             "notifications": normalize_notifications(state.get("notifications") or []),
         }
         write_json_atomic(case_dir / "workflow-state.json", state)
-        errors = workflow_errors(state)
+        errors = terminal_errors(state, terminal_fabric, shape, graded)
         workflow_request_id = str((state.get("workflow") or {}).get("request_id") or "")
-        command = state["commands"][0] if state.get("commands") else {}
+        command = replay_target(state, shape)
         generation = int((state.get("agent") or {}).get("generation") or 0)
         expected_command_id = (
             f"{command.get('idempotency_key')}/{settings.node}/agent-{generation}"
@@ -676,6 +873,7 @@ def execute_case(
                 after_first,
                 after_replay,
                 expected_command_id,
+                shape=shape,
             )
         )
         post_node = regional.node_snapshot(settings.node)
@@ -683,16 +881,8 @@ def execute_case(
         errors.extend(node_state_errors(baseline_node, post_node, stage="postflight"))
         if regional.business_workloads(settings.node):
             errors.append("target node acquired a non-system workload")
-        provider_window_end = datetime.now(timezone.utc)
-        events = regional.provider_events(injected_at, provider_window_end)
-        # "No provider mutation" is not provable inside CloudTrail's delivery
-        # window; an empty read is recorded as provisional, not as proof.
-        provider_provisional = not events and regional.provider_events_provisional(
-            provider_window_end
-        )
-        write_json_atomic(
-            case_dir / "provider-events.json",
-            {"events": events, "provider_events_provisional": provider_provisional},
+        events, provider_provisional = provider_evidence(
+            regional, case_dir, injected_at
         )
         if events:
             errors.append("provider mutation appeared during DESTR-010")
@@ -719,61 +909,58 @@ def execute_case(
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
-        recovery: dict[str, Any] = {}
-        residuals: dict[str, bool] = {}
-        try:
-            recovery = fixture.execute(
-                "ensure-fabric-manager-active",
-                timeout=120,
-            )
-        except Exception as exc:
-            recovery = {"error": f"{type(exc).__name__}: {exc}"}
-            result["verdict"] = "FAIL"
-        try:
-            residuals = fixture.cleanup()
-        except Exception as exc:
-            residuals = {"cleanup_error": True}
-            result["cleanup_error"] = f"{type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
-        result["recovery"] = recovery
-        result["probe_residuals"] = residuals
-        if any(residuals.values()):
-            result["verdict"] = "FAIL"
-        try:
-            final_node = regional.node_snapshot(settings.node)
-            result["final_node"] = final_node
-            final_errors = node_state_errors(baseline_node, final_node, stage="final")
-            if final_errors:
-                result["verdict"] = "FAIL"
-                errors_recorded = result.setdefault("errors", [])
-                if isinstance(errors_recorded, list):
-                    errors_recorded.extend(final_errors)
-        except Exception as exc:
-            result["postflight_error"] = f"{type(exc).__name__}: {exc}"
-            result["verdict"] = "FAIL"
+        finish_case(fixture, regional, settings.node, baseline_node, result)
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
 
 
+# What each shape does to the node, and the plan's stop line for its workflow.
+PLAN_MUTATION = {
+    shapes.FABRIC_MANAGER_RESTART: (
+        "write one synthetic XID 45 to the real host /dev/kmsg and allow "
+        "the Node Agent to restart nvidia-fabricmanager exactly once"
+    ),
+    shapes.FABRIC_RESET: (
+        "write one synthetic XID 45 to the real host /dev/kmsg on a Hopper "
+        "NVSwitch node whose fabric the control plane grades: the product "
+        "cordons the node, quiesces its GPU services (nvidia-fabricmanager "
+        "stopped once), resets every GPU and NVSwitch once, restores the services "
+        "(nvidia-fabricmanager started once), validates the GPUs and the fabric "
+        "and restores scheduling"
+    ),
+}
+PLAN_WORKFLOW_STOP = {
+    shapes.FABRIC_MANAGER_RESTART: (
+        "workflow differs from FREEZE_EVIDENCE -> RESTART_FABRIC_MANAGER"
+    ),
+    shapes.FABRIC_RESET: (
+        "workflow differs from the full GPU + NVSwitch reset chain, or a GPU's "
+        "fabric state is not Success after it"
+    ),
+}
+
+
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
+    shape, _graded = run_shape(preflight)
     details = {
-        "risk": "live-service-action",
+        "risk": (
+            "destructive" if shape == shapes.FABRIC_RESET else "live-service-action"
+        ),
         "release_id": preflight["release_id"],
         "target_node": settings.node,
-        "mutation": (
-            "write one synthetic XID 45 to the real host /dev/kmsg and allow "
-            "the Node Agent to restart nvidia-fabricmanager exactly once"
-        ),
+        "workflow_shape": shape,
+        "mutation": PLAN_MUTATION[shape],
         "preflight_identity": preflight_identity(preflight),
         "stop_conditions": [
             "preflight or focused regression failure",
             "target node is not Ready/schedulable/idle",
             "recent XID is inside the companion window",
             "Node Agent/Profile/pin drift",
+            "the node's fabric grading moved between plan and execute",
             "Fabric Manager or /dev/kmsg baseline is unhealthy",
-            "workflow differs from FREEZE_EVIDENCE -> RESTART_FABRIC_MANAGER",
-            "node scheduling state changes",
+            PLAN_WORKFLOW_STOP[shape],
+            "node scheduling state differs from the baseline afterwards",
             "provider mutation appears",
             "probe cleanup leaves a residual",
         ],
@@ -783,6 +970,9 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "runner_finally_deletes_probe_resources": True,
             "node_scheduling_state_must_equal_baseline": True,
             "node_readiness_is_judged_separately": True,
+            # The chain releases its own cordon and quiesce window; the runner
+            # never restores scheduling or services on the product's behalf.
+            "product_releases_its_own_cordon_and_quiesce": shape == shapes.FABRIC_RESET,
         },
         "preflight": preflight,
     }

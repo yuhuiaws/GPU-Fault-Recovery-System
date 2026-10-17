@@ -243,9 +243,14 @@ phases:
         环境窗口把 GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS 与
         GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS 压到 180 s；窗口在注入前打开、
         静默后关闭，不得与其他区域用例同窗执行。
+      - DESTR-010 的 solo XID 45 在控制面按 DCGM 字段 170 分级的 Hopper NVSwitch 节点上编译为全量 GPU 与 NVSwitch
+        reset 链（隔离、quiesce 停 Fabric Manager、一次 reset、restore 启 Fabric Manager、两道验证、恢复调度），在未分级
+        节点上仍是 FREEZE_EVIDENCE→RESTART_FABRIC_MANAGER 两步；preflight 读控制面自身的分级并把形态写入 plan。
+        分级节点上本用例真实 reset 节点的全部 GPU，须在维护窗口内执行。
       - DESTR-019 以 DESTR-010 PASS 为证据前置，只在无任何 remote command 在飞时重启一次
-        Node Agent（先 arm fail-safe start），随后走 DESTR-010 的 XID 45 两步工作流核对审计轨迹；
-        不含 reset/reboot/隔离。
+        Node Agent（先 arm fail-safe start），随后走 DESTR-010 的 XID 45 工作流核对审计轨迹：未分级节点为两步、
+        不含 reset/reboot/隔离；分级节点为全量 reset 链（审计其 RESET_ALL_GPUS_NVSWITCHES 命令，计数与账本一致），
+        不含 reboot/quarantine/provider 动作。
   - sequence: 14
     name: Warm spare
     maintenance_window: 是
