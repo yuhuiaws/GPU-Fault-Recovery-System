@@ -11,6 +11,20 @@ import pytest
 from scripts.e2e.regional import run_collector_acceptance as runner
 from tests.regional._collector_power_receipt import candidate_record, load_receipt
 
+EXPORTER_POD = {
+    "metadata": {"name": "gpu-fault-dcgm-exporter-a"},
+    "status": {"phase": "Running"},
+    "spec": {
+        "containers": [
+            {
+                "name": "exporter",
+                "args": ["-a", "127.0.0.1:9400", "-c", "15000"],
+                "env": [{"name": "DCGM_REMOTE_HOSTENGINE_INFO", "value": "x:5555"}],
+            }
+        ]
+    },
+}
+
 
 def test_same_attempt_in_distinct_campaigns_cannot_share_power_control_identity(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -229,7 +243,10 @@ def test_first_persisted_delivery_wins_over_a_later_status_snapshot(
         ],
     )
 
+    order: list[str] = []
+
     def execute(command: str, *arguments: str, **kwargs: object) -> dict[str, Any]:
+        order.append(command)
         if command == "throttle-gpu":
             current[0] = origin + timedelta(seconds=10)
             return {
@@ -245,9 +262,16 @@ def test_first_persisted_delivery_wins_over_a_later_status_snapshot(
             "cleanup_verified": True,
         }
 
+    def kubectl(plane: str, *arguments: str, **kwargs: object) -> str:
+        order.append(f"kubectl {plane} {' '.join(arguments[:3])}")
+        assert "spec.nodeName=node-a" in arguments
+        return json.dumps({"items": [EXPORTER_POD]})
+
     fixture = SimpleNamespace(
         node="node-a",
-        regional=SimpleNamespace(settings=SimpleNamespace(cluster_id="cluster-a")),
+        regional=SimpleNamespace(
+            settings=SimpleNamespace(cluster_id="cluster-a"), kubectl=kubectl
+        ),
         execute=execute,
         snapshot=lambda: {
             "collector_env": {
@@ -263,7 +287,26 @@ def test_first_persisted_delivery_wins_over_a_later_status_snapshot(
     result = runner.run_collect002(fixture, tmp_path, 1)
     assert result["verdict"] == "PASS", result["errors"]
     assert result["delivery_latency_seconds"] == 51
-    assert result["allowed_latency_seconds"] == 60
+    # The node's own exporter (host DCGM, -c 15000), read before any mutation;
+    # the ticks from the quiet delivery to the confirming sample carry 1 s of
+    # loop work, and the confirming batch reached the Store at its sample stamp.
+    assert order == [
+        "kubectl gpu get pod -l",
+        "throttle-gpu",
+        "restore-gpu-power-limit",
+    ]
+    assert result["allowed_latency_seconds"] == 62.0
+    breakdown = result["allowed_latency_breakdown"]
+    assert breakdown["components"] == {
+        "nvml_average_seconds": 1.0,
+        "dcgm_watch_seconds": 15.0,
+        "collector_phase_seconds": 15.0,
+        "confirmation_seconds": 30.0,
+        "collector_tick_overrun_seconds": 1.0,
+        "delivery_seconds": 0.0,
+    }
+    assert breakdown["exporter"]["dcgm_hostengine"] == "host"
+    assert breakdown["collector"]["window"]["ticks"] == 4
     assert result["preparation_seconds"] == 10
     assert result["sampled_status_at"] == (origin + timedelta(seconds=76)).isoformat()
     assert result["delivered_at"] == (origin + timedelta(seconds=61)).isoformat()

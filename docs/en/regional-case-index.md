@@ -391,7 +391,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
 | 170 | `COLLECT-001` | Steady-state suppression ratio proving the edge filter really takes effect on real hardware | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-001) |
-| 171 | `COLLECT-002` | An edge-filter abnormal edge must be delivered within the confirmation sample count plus one collection period | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-002) |
+| 171 | `COLLECT-002` | An edge-filter abnormal edge must be delivered within one DCGM sampling period, one collection period and the confirmation samples | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-002) |
 | 172 | `COLLECT-003` | EXPECTED_GPU_COUNT and EXPECTED_EFA_DEVICE_COUNT verified on real hardware | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-003) |
 | 173 | `COLLECT-004` | Real-hardware validation of the inventory mismatch debounce threshold | `destructive-provider-reboot` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-004) |
 | 174 | `COLLECT-005` | Collection layer and cursor persistence of the fabric-manager collector | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-005) |

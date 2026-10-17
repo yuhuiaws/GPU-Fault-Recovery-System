@@ -1381,11 +1381,11 @@ Current catalog: read-only-signal-replay; manual; NOT_RUN.
 
 ### GF-REGIONAL-COLLECT-002
 
-edge filter异常沿必须在确认样本数加一个采集周期内投递
+edge filter异常沿必须在DCGM一个采样周期、一个采集周期与确认样本内投递
 
 Current catalog: live-non-destructive; manual; NOT_RUN.
 
-- Purpose: Manual, live-non-destructive: lower enforced power limits, load one GPU, require a correlated anomaly within interval*(confirmation+1), and restore all limits.
+- Purpose: Manual, live-non-destructive: lower enforced power limits, load one GPU, require a correlated anomaly within the staged sampling bound (NVML 1 s + the node exporter's collect period + interval + (confirmation-1)*interval + the measured loop overrun and delivery), and restore all limits.
 - Runner: scripts/e2e/regional/run_collector_acceptance.py; scripts/e2e/regional/probes/collector_node_probe.py
 - Entry Points: run_collect002; gpu_metrics_stamp; throttle_gpu; restore_gpu_power_limit
 - Assertions: Aligns to a changed dcgm- status and uses the live confirmation count for latency.; Requires some candidate/threshold GPU_METRICS evidence and equal common default/limit sets after restoration.; Does not bind the candidate to the loaded UUID, power_limit_correlation, or the delivered batch.
@@ -1395,6 +1395,7 @@ Current catalog: live-non-destructive; manual; NOT_RUN.
 - Tests: selected: tests/collectors/test_gpu.py::test_dcgm_edge_filter_emits_counter_delta_and_candidate_recovery; runner_coverage: tests/regional/test_collector_and_multicluster_fixtures.py::test_collector_probe_arms_the_power_limit_restore_before_capping; tests/regional/test_collector_runner_contracts.py::test_collect002_restores_the_power_limit_and_keeps_the_original_error; tests/regional/test_collector_runner_contracts.py::test_collect002_reports_a_failed_restore_as_a_case_error; observation: Existing cleanup tests start after successful throttle. No partial-throttle, deadman-disarm-before-failed-restore, custom-baseline, or unrelated-candidate regression.; execution: Not run.
 - Findings At Review: Negative/stale delivery latency is not rejected.; UUID membership/count is not compared before and after.; Load safety compares load_seconds, not the subprocess timeout upper bound load_seconds+60.; No deadline recheck after waiting a summary interval before mutation.
 - Reviewer Handoff: Fixed partial throttle rollback, default-limit prerequisite, arm-before-cap, verify-before-disarm, negative latency and admission after summary wait. Unit failure/abort/deadman tests pass. Candidate-to-loaded-UUID/batch correlation remains a documented coverage proposal.
+- Current Disposition: The old interval*(confirmation+1) bound left nothing for NVML averaging, the collector loop's work or the delivery once its spare cycle covered the DCGM watch period, and failed a healthy node in host DCGM mode; the bound is now one term per sampling stage (scripts/e2e/regional/collect002_latency_bound.py, tests/regional/test_collect002_latency_bound.py), recorded in allowed_latency_breakdown; the case is NOT_RUN until re-run live.
 
 ### GF-REGIONAL-COLLECT-003
 

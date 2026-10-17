@@ -42,6 +42,7 @@ from scripts.e2e.regional.collector_inventory_evidence import (  # noqa: E402
     run_collect003 as run_collect003,
 )
 from scripts.e2e.regional import collect002_power_journal as journal  # noqa: E402
+from scripts.e2e.regional import collect002_latency_bound as latency_bound  # noqa: E402
 from scripts.e2e.regional import collector_cadence_evidence as cadence  # noqa: E402
 from scripts.e2e.regional import collector_power_delivery as power  # noqa: E402
 from scripts.e2e.regional.collector_negative_evidence import (  # noqa: E402
@@ -629,6 +630,7 @@ def run_collect002(
     if not baseline.get("gpu_power"):
         raise RegionalFixtureError("host probe could not read GPU power limits")
     require_dcgm_load_generator(baseline)
+    exporter = latency_bound.read_exporter(fixture)
     run_id = journal.claim_power_run(case_dir, attempt)
     # Step one: start right after a delivery, a whole summary period before the
     # next, or the periodic delivery could masquerade as the anomaly edge.
@@ -648,9 +650,6 @@ def run_collect002(
             )
         time.sleep(interval)
     quiet_stamp: str = current
-    # The edge filter confirms a candidate over `confirmation` samples, so the
-    # earliest honest bound is that many intervals plus the anomaly's own.
-    allowed_latency = interval * (confirmation + 1)
     load_seconds = interval * (confirmation + 6)
     requested_at = datetime.now(timezone.utc)
     started_at = requested_at
@@ -766,6 +765,9 @@ def run_collect002(
         observed_until=datetime.now(timezone.utc),
     )
     delivered_at = delivery["delivered_at"]
+    bound = latency_bound.allowed_latency(
+        interval, confirmation, exporter, quiet_stamp, records, delivery
+    )
     errors = list(window["errors"])
     errors.extend(delivery["errors"])
     if cleanup_error:
@@ -778,12 +780,7 @@ def run_collect002(
         )
     else:
         latency = (parse_stamp(delivered_at) - started_at).total_seconds()
-        if not 0 <= latency <= allowed_latency:
-            errors.append(
-                f"the anomaly took {latency:.1f}s to deliver, more than the "
-                f"{allowed_latency}s that {confirmation} confirmation samples at "
-                f"a {interval}s interval allow"
-            )
+        errors.extend(latency_bound.latency_errors(latency, bound, interval=interval))
     if not candidate:
         errors.append("no delivered evidence names a candidate or threshold reason")
     after = fixture.snapshot()
@@ -806,7 +803,8 @@ def run_collect002(
         "injection": injection,
         "restore": restore,
         "cleanup_error": cleanup_error,
-        "allowed_latency_seconds": allowed_latency,
+        "allowed_latency_seconds": bound["total_seconds"],
+        "allowed_latency_breakdown": bound,
         "requested_at": requested_at.isoformat(),
         "load_started_at": started_at.isoformat(),
         "preparation_seconds": (started_at - requested_at).total_seconds(),

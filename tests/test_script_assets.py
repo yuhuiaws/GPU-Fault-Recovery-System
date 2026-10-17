@@ -386,7 +386,6 @@ RECORDED_SCRIPT_SIZE_EXCEPTIONS = {
         "scripts/e2e/regional/capacity_queued_lease.py:run_queued_lease_proof",
         "scripts/e2e/regional/capacity_scrape_companion.py:capture_scrape_source",
         "scripts/e2e/regional/collector_inventory_reboot.py:run_collect004",
-        "scripts/e2e/regional/run_collector_acceptance.py:run_collect002",
         "scripts/e2e/regional/run_destr001_gpu_reset.py:execute_case",
         "scripts/e2e/regional/run_destr002_hyperpod_reboot.py:execute_case",
         "scripts/e2e/regional/run_destr009_workload_restart.py:execute_case",

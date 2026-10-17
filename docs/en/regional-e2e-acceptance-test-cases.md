@@ -13689,7 +13689,7 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
 
 ### GF-REGIONAL-COLLECT-002
 
-**Anomaly-edge delivery of the edge filter: after injection the report must arrive within confirmation samples + 1 collection cycles**
+**Anomaly-edge delivery of the edge filter: after injection the report must arrive within one DCGM sampling period, one collection cycle and the confirmation samples**
 
 - Formal entry: `scripts/e2e/regional/run_collector_acceptance.py --case GF-REGIONAL-COLLECT-002`.
 - Purpose: `COLLECT-001` proved "steady-state suppression",
@@ -13707,7 +13707,9 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
      prefix and wait for it to change once, obtaining a "just reported" starting point (`quiet_stamp`);
      at this moment the next health-summary is still close to a full summary period away
      (300 seconds in production). If there is no delivery within one summary period, fail outright --
-     with an unknown starting point there is no latency to speak of.
+     with an unknown starting point there is no latency to speak of. Before that, the running
+     `gpu-fault-dcgm-exporter` Pod on the target node is read once, read-only, for its collect period
+     and DCGM mode (see the bound below); a failed read does not block the case.
   2. The `throttle-gpu` probe first confirms the complete GPU UUID/index set, finite power values and
      the default power baseline, generates an independent run identity from this evidence directory and
      attempt, and saves the node-exclusive change intent and recovery record.
@@ -13755,8 +13757,15 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
      of files still on the node (see the cleanup entry under Safety notes), never a path or message.
 - Verdict (PASS only if all hold):
   - a new `observed_at` appears after injection;
-  - the delivery latency is ≤ `interval x (EDGE_CONFIRMATION_SAMPLES + 1)`
-    (in production 15 x (3+1) = 60 seconds, far below the 300-second summary);
+  - the delivery latency is ≤ the sum of the sampling stages
+    (`scripts/e2e/regional/collect002_latency_bound.py::allowed_latency`, every component written to
+    the result's `allowed_latency_breakdown`): NVML's 1-second power average + the exporter collect
+    period (the target node's exporter Pod `-c`/`--collect-interval`, i.e. the DCGM watch period) +
+    one `interval` + `(EDGE_CONFIRMATION_SAMPLES - 1) x interval` + the collector loop overrun measured
+    in this window + the confirming batch's delivery time
+    (in production 1 + 15 + 15 + 30 + about 1.6 + about 1 ≈ 63 seconds, far below the 300-second summary);
+  - the confirming batch's delivery from its sample stamp `observed_at` to the Store's `ingested_at` is
+    ≤ one `interval`; beyond that it is named as a slow or retried delivery, not counted as sampling;
   - within the window a `GPU_METRICS` evidence record exists whose `edge_filter_reasons` contains
     candidate / threshold;
   - at wrap-up every GPU's `power.limit` equals `power.default_limit`.
@@ -13764,18 +13773,52 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
     normal wrap-up receipt explicitly proves that the load stopped, the baseline was restored, the
     timer was revoked and cleanup completed; a PASS cannot rest on the current power reading alone.
 
-#### Why the upper bound is "confirmation samples + 1" and not "two collection cycles"
+#### Where the bound comes from, stage by stage: NVML, DCGM watch, collection cycle and confirmation samples
 
 `_should_deliver` appends `candidate-confirmed` only when
 `streak == edge_confirmation_samples`
 (`GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES`, 3 in production).
-This is **debouncing by design**: fewer readings than this do not count as an anomaly edge.
-So the old upper bound of "two collection cycles" was itself wrong --
-it is stricter than the fastest delivery the implementation allows,
-and would only turn a correct debounce into a P0.
-The honest upper bound is **the one cycle in which the anomaly appears, plus the
-`EDGE_CONFIRMATION_SAMPLES` cycles needed for confirmation**;
-exceeding it means the edge filter is waiting for its own summary, and that is the P0.
+This is **debouncing by design**: fewer readings than this do not count as an anomaly edge,
+so a bound faster than the debounce, such as "two collection cycles", is itself wrong and would only
+turn a correct debounce into a P0.
+But confirmation counts **samples**: the first anomalous sample is confirmation sample 1, and the
+confirming sample arrives `EDGE_CONFIRMATION_SAMPLES - 1` collection cycles after it.
+The one cycle the old bound `interval x (EDGE_CONFIRMATION_SAMPLES + 1)` counted too many stood in
+for the DCGM watch stage of the table below only while the exporter's `-c` happened to equal the
+collection cycle, and it left nothing for NVML's averaging window, the collector loop's own work or
+the delivery: with the DCGM and collector phases both near their worst, a healthy node also exceeds
+60 seconds (host DCGM mode failed at 61.3 seconds; the same node passed at 46.6 seconds on the rerun).
+
+The stages between the load-start receipt and the Store's `ingested_at`, read off the pinned
+dcgm-exporter `4.4.1-4.5.2`, its go-dcgm `a9c939c020ec`, DCGM 4.4.1 (the exporter's embedded engine)
+and 4.6.1 (the public source nearest the nodes' host engines), are the same in the embedded and the
+host hostengine (`DCGM_REMOTE_HOSTENGINE_INFO`) modes; the mode is recorded, never priced.
+
+| Stage | Mechanism | Bound component |
+| --- | --- | --- |
+| NVML | DCGM reads the power through `nvmlDeviceGetPowerUsage`, a 1-second average on Ampere and newer; utilization samples over at most 1 second | `nvml_average_seconds` = 1 |
+| DCGM watch | the exporter watches every field at `updateFreq = -c x 1000 us` with `maxKeepAge` 600 seconds; the cache manager samples a field only once its age reaches that period (`ActuallyUpdateAllFields`); a host engine samples at the shortest period of all its watchers, never longer. The lowered `DCGM_FI_DEV_POWER_MGMT_LIMIT` is polled on the same watch timer: DCGM appends a limit on change only when the limit is set through DCGM itself, and `nvidia-smi -pl` does not go through it | `dcgm_watch_seconds` = the exporter collect period |
+| exporter | no sampler of its own: `/metrics` runs `Gather` per request and reads DCGM's cached latest values (`dcgmEntityGetLatestValues`, no live flag, no field update); the product's counters contain no `DCGM_EXP_*` field, the only collectors that call `UpdateAllFields`, and that call updates only due fields anyway | 0 |
+| collector phase | one scrape per tick; the loop sleeps a full `interval` after each tick's work, so ticks are `interval` plus that tick's work apart; the cadence jitter moves the health summary, the inventory and the start-up only, not this tick | `collector_phase_seconds` = `interval` |
+| confirmation | `EDGE_CONFIRMATION_SAMPLES - 1` ticks after the first anomalous sample | `confirmation_seconds` |
+| loop overrun | `quiet_stamp` and the confirming sample are ticks of the same loop: the gap divided by `interval`, rounded down, is the tick count and the remainder is the ticks' summed work (the path's ticks are among them); measured | `collector_tick_overrun_seconds` |
+| delivery | the confirming batch from `observed_at` to `ingested_at`; measured, and at most one `interval` | `delivery_seconds` |
+
+The exporter collect period is read from the running Pod on the target node in the exporter's own
+order: `-c`/`--collect-interval`, otherwise `DCGM_EXPORTER_INTERVAL`, otherwise the exporter's 30-second
+default. With no readable product exporter Pod on the node, or a value that cannot be parsed, the bound
+takes 30 seconds and says so in `exporter.source`: it is not below the product's rendered 15 seconds, so
+for the product's exporter it can over-allow but never under-allow. In production the worst case from
+the physical change to the first collector sample carrying it is about 1 + 15 + 15 ≈ 31 seconds, about
+16 seconds typically; with the confirmation, the loop overrun and the delivery the bound is about
+63 seconds.
+
+The one stage without a component is `dcgmproftester`'s start-up between the receipt and its first
+kernel (it first starts its own embedded DCGM and a CUDA worker): no source bounds it and the case cannot
+observe it, so it is not priced; the result lists it under `stages_without_allowance`, and only the
+window's surplus tick work covers it. With both phases at their worst and a start-up well above one
+second a false failure remains possible; such a failure shows in `allowed_latency_breakdown` as normal
+measured components and an excess smaller than the start-up.
 
 #### ⚠ The P0 caught on the first live execution of this case: the duty-cycle counter suppressed the very fault it was meant to expose
 
