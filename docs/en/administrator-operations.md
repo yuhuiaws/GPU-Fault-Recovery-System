@@ -2005,18 +2005,48 @@ Once the user data is in the node group's launch template, the nodes still have 
 
 - **New node group**: pass the launch template at creation -- `aws eks create-nodegroup … --launch-template
   name=<lt>,version=<N>`; the nodes carry the packages from their first boot and nothing has to be rolled.
-- **Existing node group**: create a new launch-template version with the user data above, then
-  `aws eks update-nodegroup-version --cluster-name <eks cluster> --nodegroup-name <GPU node group> --launch-template
-  name=<lt>,version=<N>` and wait for `aws eks describe-update --cluster-name <eks cluster> --nodegroup-name <GPU node
-  group> --update-id <id> --query update.status` to read `Successful`.
+- **Existing node group**: only a managed node group created with a launch template can change versions --
+  `update-nodegroup-version` accepts a launch template only for a node group originally deployed with one, and only another
+  version of that same launch template. A node group created without a launch template cannot start using one: create a new
+  GPU node group with a launch template (ownership label and node auto repair off as well, see above and below), move the
+  workloads, then delete the old group. A node group with a launch template changes versions in four steps:
+
+  ```bash
+  # 1. The launch template and version the node group uses
+  aws eks describe-nodegroup --cluster-name <eks cluster> --nodegroup-name <GPU node group> \
+    --query 'nodegroup.launchTemplate' --output json        # {"name": "<lt>", "version": "<current>", "id": "lt-..."}
+  # 2. The user data the current version already has ("None": none). If there is some, merge the shell part above into the
+  #    same MIME document as one more part instead of replacing it; save the result as gpu-fault-user-data.mime
+  aws ec2 describe-launch-template-versions --launch-template-id <lt-id> --versions <current> \
+    --query 'LaunchTemplateVersions[0].LaunchTemplateData.UserData' --output text | base64 -d > current-user-data.mime
+  # 3. A new version based on the current one that replaces UserData only: --source-version keeps the instance type, EFA
+  #    network interfaces, storage and the rest; UserData must be base64
+  aws ec2 create-launch-template-version --launch-template-id <lt-id> --source-version <current> \
+    --version-description "gpu-fault node prerequisites: python3.12 strace" \
+    --launch-template-data "{\"UserData\":\"$(base64 -w0 gpu-fault-user-data.mime)\"}" \
+    --query 'LaunchTemplateVersion.VersionNumber' --output text     # the new version <N>
+  # 4. Roll the node group to the new version and wait for the update
+  aws eks update-nodegroup-version --cluster-name <eks cluster> --nodegroup-name <GPU node group> \
+    --launch-template name=<lt>,version=<N> --query 'update.id' --output text
+  aws eks describe-update --cluster-name <eks cluster> --nodegroup-name <GPU node group> --update-id <id> \
+    --query update.status                                       # until Successful
+  ```
 - **Live caveats (2026-10-07, gpu-eks-cluster)**: the roll launches **one** extra instance first (maxUnavailable 1), so a
   Spot node group needs Spot capacity for one more p5en.48xlarge in its AZ -- when there is none, EKS fails the update
   with `NodeCreationFailure` after about 17 minutes and reverts the node group to the previous launch-template version
   with the nodes untouched (two of three attempts went that way; repeat the update later, failed attempts are harmless).
   Never start a roll while `gpu-fault-admin config`/`deploy` may run -- the `regional_contexts` preflight fails closed
   while the node group is UPDATING. After a successful roll follow the replacement-node join window paragraph above
-  (`--retire-departed-agents` → the reconciler installs the new nodes), and confirm the packages on a new node over SSM
-  or `kubectl debug` before relying on it.
+  (`--retire-departed-agents` → the reconciler installs the new nodes), and confirm the packages on a new node before
+  relying on it (either one; delete the `node-debugger-*` Pod `kubectl debug` leaves behind, and SSM needs
+  `AmazonSSMManagedInstanceCore` on the node role):
+
+  ```bash
+  kubectl debug node/<node name> -it --image=public.ecr.aws/amazonlinux/amazonlinux:2023 -- \
+    chroot /host sh -c "/usr/bin/python3.12 -c 'import venv' && command -v strace"
+  aws ssm send-command --instance-ids <EC2 instance id> --document-name AWS-RunShellScript \
+    --parameters 'commands=["/usr/bin/python3.12 -c \"import venv\" && command -v strace"]'
+  ```
 - The shell part lists only the product's prerequisites; acceptance-only tooling (such as DCGM's `dcgmproftester` for
   COLLECT-002) is documented in the acceptance/fault-simulation manuals and may be appended to the same shell part by a
   test site.
