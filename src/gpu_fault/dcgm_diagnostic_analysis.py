@@ -400,6 +400,12 @@ def build_dcgm_recommendations(
         for finding in actionable
         if finding_is_fabric_manager_training(finding)
     }
+
+    def fabric(finding: dict[str, Any]) -> bool:
+        return finding_is_fabric_manager_training(finding) or (
+            str(finding["test_name"]) in fabric_tests and not finding["messages"]
+        )
+
     for finding in actionable:
         searchable = " ".join(
             [
@@ -407,9 +413,7 @@ def build_dcgm_recommendations(
                 *finding["messages"],
             ]
         ).lower()
-        if finding_is_fabric_manager_training(finding) or (
-            str(finding["test_name"]) in fabric_tests and not finding["messages"]
-        ):
+        if fabric(finding):
             rule = _FABRIC_GUIDANCE
             priority = "IMMEDIATE"
         elif finding_is_configuration_only(finding):
@@ -430,8 +434,16 @@ def build_dcgm_recommendations(
     # A non-zero dcgmi exit status is expected when the diagnostic
     # reports a configuration-severity failure, or the Fabric Manager
     # training failure; asking the operator to inspect hostengine health
-    # in either case is a false alarm.
-    if returncode != 0 and (configuration_only or fabric_tests) and not parse_error:
+    # in either case is a false alarm. Any other failure keeps the review.
+    expected_exit = configuration_only or (
+        bool(fabric_tests)
+        and all(
+            fabric(finding) or finding_is_configuration_only(finding)
+            for finding in actionable
+            if finding["status"] == "FAIL"
+        )
+    )
+    if returncode != 0 and expected_exit and not parse_error:
         return _sorted_recommendations(triggers)
 
     if returncode != 0 or parse_error:

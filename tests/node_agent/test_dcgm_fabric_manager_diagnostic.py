@@ -175,3 +175,31 @@ def test_a_field_id_that_happens_to_be_112_is_not_the_fabric() -> None:
     assert not finding_is_fabric_manager_training(finding), (
         "a number alone never names the fabric"
     )
+
+
+def test_another_failure_beside_the_fabric_keeps_the_execution_review() -> None:
+    findings = [
+        *extract_dcgm_diagnostic_findings(_payload(per_gpu_message=False)),
+        {
+            "test_name": "pcie",
+            "status": "FAIL",
+            "entities": ["GPU", "3"],
+            "error_codes": [],
+            "messages": ["PCIe link replay rate exceeded"],
+            "error_severities": ["2"],
+            "result_path": "$.pcie",
+        },
+    ]
+
+    actions = {
+        item["action_code"]
+        for item in build_dcgm_recommendations(
+            findings, returncode=226, parse_error=None
+        )
+    }
+
+    assert actions == {
+        "NVLINK_FABRIC_RECOVERY",
+        "PCIE_AER_INSPECTION",
+        "DCGM_EXECUTION_REVIEW",
+    }, f"only the fabric's own exit is expected: {actions}"
