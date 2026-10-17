@@ -546,3 +546,76 @@ def test_show_reports_a_cluster_without_a_connection_secret_as_absent(
         "source": None,
         "state": "absent",
     }, "a cluster the bootstrap has not reached yet has nothing to compare"
+
+
+def test_show_records_each_eks_node_groups_update_strategy_and_advises(
+    tmp_path: Path, capsys
+) -> None:
+    """A plain EKS cluster's node groups show their ``updateStrategy``; a GPU
+    group the recorded selector covers that rolls with DEFAULT (surge) gets
+    an advisory finding, the CPU group and a HyperPod cluster none."""
+
+    path = site_file(tmp_path)
+    document = yaml.safe_load(path.read_text())
+    document["spec"]["clusters"].append(
+        {
+            **document["spec"]["clusters"][0],
+            "clusterId": "gpu-eks-cluster",
+            "context": "gpu-eks",
+            "provider": "eks-managed",
+            "nodeSelector": EKS_LABEL_SELECTOR,
+            "nodeSelectorSource": "label-convention",
+            "eksClusterArn": EKS_ARN,
+        }
+    )
+    document["spec"]["clusters"][1].pop("hyperpodClusterName")
+    path.write_text(yaml.safe_dump(document, sort_keys=False))
+    nodegroups = {
+        "cpu-ng": {
+            "instanceTypes": ["m7i-flex.xlarge"],
+            "labels": {},
+            "updateConfig": {"maxUnavailable": 1},
+        },
+        "gpu-ng": {
+            "instanceTypes": ["p5en.48xlarge"],
+            "labels": {OWNERSHIP_LABEL: SITE_ID},
+            "updateConfig": {"maxUnavailable": 1},
+        },
+    }
+    runner = ScopeRunner(
+        hyperpod_groups=[_hp_group("spot-p5en", "ml.p5en.48xlarge", labelled=True)],
+        nodegroups=nodegroups,
+    )
+
+    code = verb.run_node_scope_command(
+        _arguments(state_dir=tmp_path), site=load_site(path), runner=runner
+    )
+
+    assert code == 0, "advice never fails the command"
+    captured = capsys.readouterr()
+    hyperpod, eks = json.loads(captured.out)["clusters"]
+    advice = (
+        "node group gpu-ng updates with DEFAULT (surge): a version update needs one "
+        "more GPU instance; set updateStrategy=MINIMAL (administrator operations "
+        "§5.0.1)"
+    )
+    assert eks["update_strategy"] == {
+        "node_groups": {"cpu-ng": "DEFAULT", "gpu-ng": "DEFAULT"},
+        "advisories": [advice],
+    }, "every group is shown; only the selected GPU group is advised on"
+    assert "update_strategy" not in hyperpod, "HyperPod has no update strategy"
+    assert f"gpu-fault-admin node-scope: finding: gpu-eks-cluster: {advice}" in (
+        captured.err
+    )
+
+    nodegroups["gpu-ng"]["updateConfig"]["updateStrategy"] = "MINIMAL"
+    assert (
+        verb.run_node_scope_command(
+            _arguments(state_dir=tmp_path), site=load_site(path), runner=runner
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    eks = json.loads(captured.out)["clusters"][1]
+    assert eks["update_strategy"]["advisories"] == []
+    assert "updates with" not in captured.err, "a MINIMAL group is not advised on"

@@ -90,6 +90,7 @@ def _prepared(world: World) -> None:
     document = world.nodegroups[GPU_GROUP]
     document["labels"] = {**document["labels"], OWNERSHIP_LABEL: SITE_ID}
     document["nodeRepairConfig"] = {"enabled": False}
+    document["updateConfig"] = {"maxUnavailable": 1, "updateStrategy": "MINIMAL"}
 
 
 def _no_writes(world: World) -> bool:
@@ -200,6 +201,7 @@ def test_plan_of_an_unprepared_group_lists_the_commands_in_order_and_writes_noth
         "launch-template-version",
         "node-repair",
         "labels",
+        "update-config",
         "roll",
     ]
     create = steps[0]["command"]
@@ -219,8 +221,10 @@ def test_plan_of_an_unprepared_group_lists_the_commands_in_order_and_writes_noth
     assert (
         f'--launch-template \'{{"id":"{LT_ID}","version":"<new version>"}}\' '
         f"--release-version {RELEASE}"
-    ) in steps[3]["command"], "the roll keeps the AMI release version"
-    assert "NodeCreationFailure" in group["roll"]["caveat"]
+    ) in steps[4]["command"], "the roll keeps the AMI release version"
+    assert "1 of 2 GPU nodes out at a time" in group["roll"]["caveat"], (
+        "the roll after the update-config step terminates before it launches"
+    )
     assert "Spot" in group["roll"]["caveat"]
     assert group["user_data"]["action"] == "add"
     assert document["apply_command"].endswith(
@@ -746,6 +750,7 @@ def test_apply_runs_the_planned_steps_in_order_then_verifies_the_new_nodes(
         "ec2 create-launch-template-version",
         "eks update-nodegroup-config",
         "eks update-nodegroup-config",
+        "eks update-nodegroup-config",
         "eks update-nodegroup-version",
     ]
     assert not [
@@ -793,6 +798,7 @@ def test_apply_runs_the_planned_steps_in_order_then_verifies_the_new_nodes(
         "launch-template-version",
         "node-repair",
         "labels",
+        "update-config",
         "roll",
         "verification",
     ]
@@ -1105,6 +1111,7 @@ def _host_prepared_before_the_dropin(world: World) -> str:
         DCGM_HOSTENGINE_LABEL: "host",
     }
     document["nodeRepairConfig"] = {"enabled": False}
+    document["updateConfig"] = {"maxUnavailable": 1, "updateStrategy": "MINIMAL"}
     world.node_facts = {
         instance: booted_node(text) for instance in world.instances[GPU_GROUP]
     }

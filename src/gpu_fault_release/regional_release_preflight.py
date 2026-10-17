@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease, Runner
 
+from gpu_fault.admin.eks_nodegroup_update_strategy import update_strategy
 from gpu_fault.cluster_scope import is_eks_managed, node_selector
 from gpu_fault.eks_node_repair import (
     hosts_gpu_instance_types,
@@ -215,8 +216,11 @@ def validate_eks_managed_cluster(
     recorded ``node_selector`` covers (``eks_node_repair.nodegroup_hosts_gpu_nodes``:
     the ownership label, a named node group, or -- for a legacy selector --
     an accelerator instance type). Returns the per-group facts (``status``,
-    ``node_repair``, ``gpu``) so the ``regional_contexts`` check records them;
-    ``unset`` is the opt-in field never written, which EKS treats as off.
+    ``node_repair``, ``update_strategy``, ``gpu``) so the ``regional_contexts``
+    check records them; ``unset`` is the opt-in field never written, which EKS
+    treats as off. ``update_strategy`` (``DEFAULT`` when absent) is recorded
+    only: a GPU group not on ``MINIMAL`` gets an advisory in ``status --full``,
+    never a refusal (``eks_nodegroup_update_strategy``).
     """
 
     eks_name = expected_eks_arn.rsplit("/", 1)[-1]
@@ -296,7 +300,12 @@ def validate_eks_managed_cluster(
             if node_selector
             else hosts_gpu_instance_types(group)
         )
-        facts[nodegroup] = {"status": status, "node_repair": repair, "gpu": gpu}
+        facts[nodegroup] = {
+            "status": status,
+            "node_repair": repair,
+            "update_strategy": update_strategy(group),
+            "gpu": gpu,
+        }
         if gpu:
             reason = node_repair_error(nodegroup, eks_name, repair)
             if reason is not None:

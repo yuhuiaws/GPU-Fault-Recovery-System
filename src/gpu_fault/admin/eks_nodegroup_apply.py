@@ -3,13 +3,14 @@
 Apply runs the steps of a fresh plan (``eks_nodegroup_plan``) in order and
 nothing else: before every EKS write the node group is read again and must
 still be ``ACTIVE`` on the launch template version the plan saw, otherwise the
-run stops without writing. Each EKS update is waited for, bounded, on
-``eks describe-update``: a configuration update for at most
-:data:`CONFIG_UPDATE_TIMEOUT_SECONDS`, the roll for ``--roll-timeout-minutes``.
-A failed roll is a stop, not a retry loop: ``NodeCreationFailure`` (no
-capacity for the replacement instance -- EKS keeps the old nodes and version)
-is reported as retryable, and the next run reuses the launch template version
-this one created.
+run stops without writing; before the roll it must also update with the
+strategy the plan rolls with (``MINIMAL`` unless kept). Each EKS update is
+waited for, bounded, on ``eks describe-update``: a configuration update for at
+most :data:`CONFIG_UPDATE_TIMEOUT_SECONDS`, the roll for
+``--roll-timeout-minutes``. A failed roll is a stop, not a retry loop:
+``NodeCreationFailure`` (the replacement instance did not join, most often for
+want of capacity) is reported as retryable, and the next run reuses the launch
+template version this one created.
 
 Every attempt is journaled under ``<state-dir|work-dir>/eks-nodegroup-prepare/
 <cluster>-<sha8 of the ARN>/<node group>.json`` (operator identity, change
@@ -49,6 +50,7 @@ from gpu_fault.admin.eks_nodegroup_plan import (
     with_version,
 )
 from gpu_fault.admin.eks_nodegroup_nodes import read_nodes
+from gpu_fault.admin.eks_nodegroup_update_strategy import update_strategy
 from gpu_fault.admin.eks_nodegroup_user_data import encode_user_data
 from gpu_fault.admin.process_supervisor import ensure_supervision_safe
 
@@ -83,9 +85,10 @@ UNKNOWN_UPDATE_ERRORS = ("ResourceNotFoundException", "InvalidParameterException
 #: What a failed roll's error code means for the operator.
 ROLL_ERROR_HINTS = {
     "NodeCreationFailure": (
-        "the replacement instance did not join (most often no capacity for one "
-        "more instance of the type, Spot in particular); EKS kept the old nodes "
-        "and launch template version: retryable, rerun later"
+        "the replacement instance did not join (most often no capacity for the "
+        "instance type, Spot in particular; updateStrategy DEFAULT keeps the old "
+        "nodes, MINIMAL already terminated the node it replaces and the group "
+        "stays short until a replacement joins): retryable, rerun later"
     ),
     "AsgInstanceLaunchFailures": (
         "the Auto Scaling group could not launch the replacement instance "
@@ -308,14 +311,21 @@ def settled_nodegroup(context: ApplyContext, name: str) -> Mapping[str, Any]:
         context.sleep(SETTLE_INTERVAL_SECONDS)
 
 
-def _guard(context: ApplyContext, plan: GroupPlan) -> str | None:
-    """Why the node group no longer matches the plan, ``None`` when it does."""
+def _guard(context: ApplyContext, plan: GroupPlan, step: Step) -> str | None:
+    """Why the node group no longer matches the plan, ``None`` when it does;
+    the roll also needs the strategy the plan rolls with."""
 
     document = settled_nodegroup(context, plan.name)
     status = str(document.get("status") or "")
     template = document.get("launchTemplate") or {}
     if status != "ACTIVE":
         return f"node group {plan.name} is {status or 'unknown'}"
+    planned = str(plan.strategy.get("planned") or "")
+    if step.name == STEP_ROLL and planned and update_strategy(document) != planned:
+        return (
+            f"node group {plan.name} updates with {update_strategy(document)}, the "
+            f"plan rolls it with updateStrategy {planned}"
+        )
     if str(template.get("id") or "") != str(plan.template.get("id") or "") or str(
         template.get("version") or ""
     ) != str(plan.current_version):
@@ -432,8 +442,8 @@ def _update_stop(
         f"update {update.get('update_id')} ({step}) ended {update.get('status')}: "
         + failure_text(update)
         + (
-            "; nothing else changed -- rerun the same command later (the prepared "
-            "launch template version is reused)"
+            "; rerun the same command later (the prepared launch template version "
+            "is reused)"
             if retryable and step == STEP_ROLL
             else ""
         ),
@@ -555,7 +565,7 @@ def _run_group(
                 command=aws_command(context.cluster.region, step.arguments),
             )
             continue
-        changed = _guard(context, plan)
+        changed = _guard(context, plan, step)
         if changed is not None:
             return _stop(
                 context,

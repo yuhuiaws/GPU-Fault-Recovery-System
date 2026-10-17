@@ -497,6 +497,7 @@ class PreflightRunner:
         nodegroup_status: str = "ACTIVE",
         node_repair: dict[str, bool | None] | None = None,
         labels: dict[str, dict[str, str]] | None = None,
+        update_strategy: dict[str, str] | None = None,
     ):
         self.status = status
         self.nodegroup_status = nodegroup_status
@@ -505,6 +506,9 @@ class PreflightRunner:
         # EKS node auto repair per node group; a None value leaves the opt-in
         # field out of the description, as EKS does for a group never configured.
         self.node_repair = node_repair or {}
+        # updateConfig.updateStrategy per node group; absent, as on the live
+        # group, means DEFAULT.
+        self.update_strategy = update_strategy or {}
         self.calls: list[list[str]] = []
 
     def run(self, args: list[str], **_kwargs: Any) -> str:
@@ -525,6 +529,9 @@ class PreflightRunner:
             }
             if self.node_repair.get(name) is not None:
                 group["nodeRepairConfig"] = {"enabled": self.node_repair[name]}
+            group["updateConfig"] = {"maxUnavailable": 1}
+            if name in self.update_strategy:
+                group["updateConfig"]["updateStrategy"] = self.update_strategy[name]
             return json.dumps(group)
         raise AssertionError(f"unexpected preflight command {args}")
 
@@ -538,9 +545,19 @@ def test_eks_managed_preflight_requires_active_cluster_and_nodegroups() -> None:
         "a plain EKS preflight must not describe a HyperPod cluster"
     )
     assert facts == {
-        "cpu-ng": {"status": "ACTIVE", "node_repair": "unset", "gpu": False},
-        "gpu-ng": {"status": "ACTIVE", "node_repair": "unset", "gpu": True},
-    }, "every node group's status and node auto repair are recorded"
+        "cpu-ng": {
+            "status": "ACTIVE",
+            "node_repair": "unset",
+            "update_strategy": "DEFAULT",
+            "gpu": False,
+        },
+        "gpu-ng": {
+            "status": "ACTIVE",
+            "node_repair": "unset",
+            "update_strategy": "DEFAULT",
+            "gpu": True,
+        },
+    }, "every node group's status, node auto repair and update strategy are recorded"
     with pytest.raises(ReleaseError, match="is not ACTIVE"):
         PREFLIGHT.validate_eks_managed_cluster(
             PreflightRunner(status="UPDATING"), region=REGION, expected_eks_arn=EKS_ARN
@@ -576,6 +593,7 @@ def test_eks_managed_preflight_refuses_node_auto_repair_on_gpu_node_groups() -> 
     assert facts["cpu-ng"] == {
         "status": "ACTIVE",
         "node_repair": "enabled",
+        "update_strategy": "DEFAULT",
         "gpu": False,
     }
     with pytest.raises(
@@ -618,6 +636,27 @@ def test_eks_managed_preflight_follows_the_ownership_label() -> None:
             expected_eks_arn=EKS_ARN,
             node_selector=f"gpu-fault.io/control-plane={site}",
         )
+
+
+def test_eks_managed_preflight_records_the_update_strategy_only() -> None:
+    """A GPU node group that rolls with DEFAULT (surge) is recorded for the
+    ``status --full`` advisory and passes: existing sites stay deployable."""
+
+    facts = PREFLIGHT.validate_eks_managed_cluster(
+        PreflightRunner(update_strategy={"gpu-ng": "MINIMAL"}),
+        region=REGION,
+        expected_eks_arn=EKS_ARN,
+    )
+    assert (facts["gpu-ng"]["update_strategy"], facts["cpu-ng"]["update_strategy"]) == (
+        "MINIMAL",
+        "DEFAULT",
+    )
+    facts = PREFLIGHT.validate_eks_managed_cluster(
+        PreflightRunner(update_strategy={"gpu-ng": "DEFAULT"}),
+        region=REGION,
+        expected_eks_arn=EKS_ARN,
+    )
+    assert facts["gpu-ng"]["update_strategy"] == "DEFAULT", "recorded, not refused"
 
 
 def test_eks_managed_preflight_refuses_a_different_cluster_arn() -> None:

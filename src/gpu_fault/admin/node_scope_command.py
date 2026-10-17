@@ -11,7 +11,9 @@ This verb is the explicit, journaled path from the recorded selector to the
 label. Read-only by default, it shows per cluster what the site records,
 what the node groups declare today, the two node sets side by side and what
 the cluster's connection Secret -- the selector the data plane actually runs
--- serves (``data_plane``). ``--converge`` rewrites one cluster's site entry
+-- serves (``data_plane``); for a plain EKS cluster also every node group's
+``updateStrategy`` (``update_strategy``), with an advisory for a selected GPU
+group that is not MINIMAL. ``--converge`` rewrites one cluster's site entry
 to the label selector only when the label-derived node set is the current
 node set to the name: a group the administrator forgot to label, a current
 node the provider has not labelled yet (HyperPod applies ``KubernetesConfig``
@@ -52,6 +54,7 @@ from gpu_fault.admin.dcgm_declaration import (
     PENDING as DCGM_PENDING,
     declaration_from_facts,
 )
+from gpu_fault.admin.eks_nodegroup_update_strategy import advisory, update_strategy
 from gpu_fault.admin.membership_lock import administrator_operation_lock
 from gpu_fault.admin.ownership_release import stale_claim_lines, stale_ownership_claims
 from gpu_fault.admin.site import RenderedSite
@@ -146,14 +149,23 @@ def _group_label(provider: ClusterProvider) -> str:
 
 def _node_group_facts(
     runner: CommandRunner, *, region: str, entry: Mapping[str, Any]
-) -> tuple[list[NodeGroupFacts], str]:
-    """The provider's node groups for ``entry`` and the cluster's display name."""
+) -> tuple[list[NodeGroupFacts], str, dict[str, str]]:
+    """The provider's node groups for ``entry``, the cluster's display name and,
+    for a plain EKS cluster, each managed node group's ``updateStrategy``."""
 
     provider = cluster_provider(entry.get("provider"))
     if provider is ClusterProvider.EKS_MANAGED:
         eks_name = str(entry["eks_cluster_arn"]).rsplit("/", 1)[-1]
         documents = eks_nodegroup_documents(runner, region=region, eks_name=eks_name)
-        return [eks_nodegroup_facts(item) for item in documents], eks_name
+        return (
+            [eks_nodegroup_facts(item) for item in documents],
+            eks_name,
+            {
+                str(item["nodegroupName"]): update_strategy(item)
+                for item in documents
+                if item.get("nodegroupName")
+            },
+        )
     hyperpod_name = str(entry.get("hyperpod_cluster_name") or "")
     described = runner.aws_json(
         region, "sagemaker", "describe-cluster", "--cluster-name", hyperpod_name
@@ -163,7 +175,7 @@ def _node_group_facts(
         for group in described.get("InstanceGroups") or ()
         if isinstance(group, Mapping)
     ]
-    return facts, hyperpod_name
+    return facts, hyperpod_name, {}
 
 
 def _kubectl(
@@ -303,7 +315,7 @@ def assess_cluster(
     site_id = str(site.release_config["site_name"])
     current_selector = node_selector(entry)
     current_source = node_selector_source(entry)
-    facts, cluster = _node_group_facts(runner, region=region, entry=entry)
+    facts, cluster, strategies = _node_group_facts(runner, region=region, entry=entry)
     report: dict[str, Any] = {
         "cluster_id": entry["cluster_id"],
         "provider": provider.value,
@@ -317,6 +329,16 @@ def assess_cluster(
             entry, facts, selector=current_selector, cluster=cluster
         ),
     }
+    if provider is ClusterProvider.EKS_MANAGED:
+        selected = [item.name for item in groups_for_selector(facts, current_selector)]
+        report["update_strategy"] = {
+            "node_groups": dict(sorted(strategies.items())),
+            "advisories": [
+                line
+                for name in selected
+                if (line := advisory(name, strategies.get(name, ""))) is not None
+            ],
+        }
     try:
         scope: NodeScope | None = resolve_node_scope(
             facts,
@@ -585,7 +607,12 @@ def run_node_scope_command(
         file=sys.stderr,
         flush=True,
     )
-    for line in stale_claim_lines(stale_claims):
+    advisories = [
+        f"{item['cluster_id']}: {line}"
+        for item in reports
+        for line in (item.get("update_strategy") or {}).get("advisories", ())
+    ]
+    for line in [*stale_claim_lines(stale_claims), *advisories]:
         print(
             f"gpu-fault-admin {COMMAND}: finding: {line}", file=sys.stderr, flush=True
         )

@@ -15,7 +15,11 @@ commands that would change the rest, in the order apply runs them:
 3. ``eks update-nodegroup-config --labels``: the ownership label
    ``gpu-fault.io/control-plane=<site id>`` and, in DCGM host mode, the
    ``gpu-fault.io/dcgm-hostengine=host`` declaration;
-4. ``eks update-nodegroup-version`` onto that launch template version with the
+4. ``eks update-nodegroup-config --update-config``: ``updateStrategy`` MINIMAL
+   with the group's own ``maxUnavailable`` (``eks_nodegroup_update_strategy``:
+   a GPU group rarely has the spare instance a DEFAULT, launch-first roll
+   needs), unless ``--keep-update-strategy`` keeps the group's strategy;
+5. ``eks update-nodegroup-version`` onto that launch template version with the
    AMI release version pinned to the running one, so the roll changes the user
    data and nothing else.
 
@@ -44,6 +48,16 @@ from typing import Any
 from gpu_fault.admin.bootstrap_common import Arn, BootstrapError, CommandRunner
 from gpu_fault.admin.bootstrap_ownership import eks_nodegroup_facts
 from gpu_fault.admin.eks_nodegroup_nodes import inventory_commands
+from gpu_fault.admin.eks_nodegroup_update_strategy import (
+    UPDATE_STRATEGY_MINIMAL,
+    capacity_effect,
+    minimal_update_config,
+    nodes_out,
+    takes_whole_group,
+    unavailable_setting,
+    unavailable_text,
+    update_strategy,
+)
 from gpu_fault.admin.eks_nodegroup_user_data import (
     DCGM_HOSTENGINE_EMBEDDED,
     DCGM_HOSTENGINE_HOST,
@@ -90,6 +104,7 @@ VERSION_DESCRIPTION_PREFIX = "gpu-fault node prerequisites"
 STEP_LAUNCH_TEMPLATE = "launch-template-version"
 STEP_NODE_REPAIR = "node-repair"
 STEP_LABELS = "labels"
+STEP_UPDATE_CONFIG = "update-config"
 STEP_ROLL = "roll"
 #: Stands for the version number create-launch-template-version returns.
 NEW_VERSION = "<new version>"
@@ -168,6 +183,8 @@ class GroupPlan:
     nodes: Mapping[str, Any] | None = None
     #: Per hand-written shell part: overlaps, contradictions, adoption drops.
     part_reports: tuple[Mapping[str, Any], ...] = ()
+    #: ``updateStrategy`` today, the one a roll uses after the steps, and why.
+    strategy: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def mode(self) -> str:
@@ -199,6 +216,8 @@ class GroupPlan:
             "dcgm_hostengine": dict(self.dcgm),
             "steps": [item.describe(region) for item in self.steps],
         }
+        if self.strategy:
+            report["update_strategy"] = dict(self.strategy)
         if self.pending_update is not None:
             report["pending_update"] = dict(self.pending_update)
         if self.merge is not None:
@@ -213,7 +232,11 @@ class GroupPlan:
         if self.nodes is not None:
             report["current_nodes"] = dict(self.nodes)
         if self.verdict in (COMPLIANT, CHANGES):
-            report["roll"] = _roll_note(document, self.step(STEP_ROLL) is not None)
+            report["roll"] = _roll_note(
+                document,
+                self.step(STEP_ROLL) is not None,
+                str(self.strategy.get("planned") or UPDATE_STRATEGY_MINIMAL),
+            )
             report["verification"] = {
                 "method": (
                     "SSM AWS-RunShellScript (read-only) on the group's running "
@@ -250,6 +273,8 @@ class GroupPlan:
             for item in self.part_reports
             if item.get("adoption_drops")
         ]
+        if self.strategy.get("finding"):
+            lines.append(f"{self.name}: {self.strategy['finding']}")
         nodes = self.nodes or {}
         if nodes.get("outcome") == "unavailable":
             lines.append(
@@ -259,22 +284,60 @@ class GroupPlan:
         return lines
 
 
-def _roll_note(document: Mapping[str, Any], needed: bool) -> dict[str, Any]:
+def _roll_note(
+    document: Mapping[str, Any], needed: bool, strategy: str
+) -> dict[str, Any]:
     note: dict[str, Any] = {"needed": needed}
-    if needed:
+    spot = str(document.get("capacityType") or "") == "SPOT"
+    if needed and strategy == UPDATE_STRATEGY_MINIMAL:
         note["caveat"] = (
-            "the roll launches a replacement instance before it drains one "
-            "(updateConfig); without capacity for it EKS fails the update with "
-            "NodeCreationFailure after about 17 minutes and keeps the old nodes "
-            "and launch template version -- harmless, rerun later"
+            f"updateStrategy {strategy}: {capacity_effect(document, strategy)}"
+            + "; a replacement that cannot launch ("
+            + ("Spot capacity" if spot else "capacity")
+            + ") leaves the group short until one does, and the roll stops "
+            "ROLL_FAILED or ROLL_IN_PROGRESS -- rerun later"
+        )
+    elif needed:
+        note["caveat"] = (
+            f"updateStrategy {strategy}: the roll launches a replacement instance "
+            "before it drains one; without capacity for it EKS fails the update "
+            "with NodeCreationFailure after about 17 minutes and keeps the old "
+            "nodes and launch template version -- harmless, rerun later"
             + (
                 " (Spot: one more instance of the type must be available in the "
                 "group's zones)"
-                if str(document.get("capacityType") or "") == "SPOT"
+                if spot
                 else ""
             )
         )
     return note
+
+
+def _strategy(document: Mapping[str, Any], *, keep: bool) -> dict[str, Any]:
+    """The group's ``updateStrategy`` today and the one its roll uses."""
+
+    current = update_strategy(document)
+    kept = keep and current != UPDATE_STRATEGY_MINIMAL
+    planned = current if kept else UPDATE_STRATEGY_MINIMAL
+    report: dict[str, Any] = {
+        "current": current,
+        "planned": planned,
+        "kept": kept,
+        "unavailable": unavailable_setting(document),
+        "capacity_effect": capacity_effect(document, planned),
+    }
+    if kept:
+        report["finding"] = (
+            f"updateStrategy {current} kept (--keep-update-strategy): "
+            f"{report['capacity_effect']}; MINIMAL needs no spare instance"
+        )
+    elif takes_whole_group(document):
+        report["finding"] = (
+            f"updateStrategy MINIMAL with {unavailable_text(document)}: a roll takes "
+            f"{nodes_out(document)}; lower maxUnavailable below the group size to "
+            "keep GPU nodes up during a roll"
+        )
+    return report
 
 
 # --- reads -------------------------------------------------------------------
@@ -558,6 +621,7 @@ def _steps(
     merge: UserDataMerge,
     reuse: int | None,
     labels: Mapping[str, Any],
+    strategy: Mapping[str, Any],
 ) -> tuple[Step, ...]:
     base = ("--cluster-name", cluster.name, "--nodegroup-name", name)
     steps: list[Step] = []
@@ -614,13 +678,34 @@ def _steps(
                 ),
             )
         )
+    if strategy["current"] != strategy["planned"]:
+        steps.append(
+            Step(
+                STEP_UPDATE_CONFIG,
+                f"updateStrategy {strategy['current']} -> {strategy['planned']} "
+                f"({unavailable_text(document)} kept)",
+                (
+                    "eks",
+                    "update-nodegroup-config",
+                    *base,
+                    "--update-config",
+                    json.dumps(
+                        minimal_update_config(document),
+                        sort_keys=True,
+                        separators=(",", ":"),
+                    ),
+                ),
+            )
+        )
     if merge.changed:
         release = str(document.get("releaseVersion") or "")
         steps.append(
             Step(
                 STEP_ROLL,
                 f"roll the node group onto launch template version {target}"
-                + (f", AMI release {release} unchanged" if release else ""),
+                + (f", AMI release {release} unchanged" if release else "")
+                + f" (updateStrategy {strategy['planned']}: "
+                + f"{strategy['capacity_effect']})",
                 (
                     "eks",
                     "update-nodegroup-version",
@@ -649,12 +734,14 @@ def plan_group(
     pending_update: Mapping[str, Any] | None = None,
     adopt: Sequence[str] = (),
     read_nodes: Callable[[str, DcgmPin | None], Mapping[str, Any]] | None = None,
+    keep_update_strategy: bool = False,
 ) -> GroupPlan:
     """What ``name`` needs; a refusal names the manual steps.
 
     ``read_nodes(mode, pin)`` reads the group's current nodes (the plan's
     read-only SSM inventory); ``adopt`` names hand-written parts the managed
-    part replaces (``--adopt-user-data-part``).
+    part replaces (``--adopt-user-data-part``); ``keep_update_strategy``
+    leaves a non-MINIMAL ``updateStrategy`` as it is, with a finding.
     """
 
     document = cluster.nodegroups[name]
@@ -757,6 +844,7 @@ def plan_group(
         if merge.changed
         else None
     )
+    strategy = _strategy(document, keep=keep_update_strategy)
     steps = _steps(
         cluster=cluster,
         name=name,
@@ -766,6 +854,7 @@ def plan_group(
         merge=merge,
         reuse=reuse,
         labels=_label_payload(labels, site_id=site_id, mode=mode, mode_source=source),
+        strategy=strategy,
     )
     return GroupPlan(
         name=name,
@@ -793,4 +882,5 @@ def plan_group(
         pin=pin,
         nodes=nodes,
         part_reports=part_reports,
+        strategy=strategy,
     )

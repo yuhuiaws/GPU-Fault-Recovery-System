@@ -236,6 +236,9 @@ class World:
             for key in payload.get("removeLabels") or ():
                 labels.pop(key, None)
             document["labels"] = labels
+        if "--update-config" in options:
+            # Replaced as a whole: a value the payload leaves out is gone.
+            document["updateConfig"] = json.loads(options["--update-config"][0])
         return self.new_update(
             group, "ConfigUpdate", polls=self.config_polls, final="Successful"
         )
@@ -259,6 +262,8 @@ class World:
             final=final,
             version=str(template["version"]),
             release=(options.get("--release-version") or [None])[0],
+            strategy=(document.get("updateConfig") or {}).get("updateStrategy")
+            or "DEFAULT",
         )
 
     def eks_describe_update(self, options: Mapping[str, list[str]]) -> dict[str, Any]:

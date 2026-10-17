@@ -20,6 +20,7 @@ from gpu_fault.admin.dcgm_declaration import (
     site_cluster_entries,
     unreadable_findings,
 )
+from gpu_fault.admin.eks_nodegroup_update_strategy import update_strategy_findings
 from gpu_fault.admin.ownership_release import status_findings
 from gpu_fault.admin.rds_ca_bundle_drift import rds_ca_bundle_findings
 from gpu_fault.admin.resource_registry_outcome import FIELD, status_view
@@ -117,7 +118,10 @@ def print_status_report(
     read-only; the remedy is ``aurora-failback``, never run from here), and so
     are the RDS CA bundle lines (``rds_ca_bundle_drift``, read-only: the
     installed bundle against the release's pinned copy, the bundle AWS
-    publishes against that copy, the Aurora instances' CA in both).
+    publishes against that copy, the Aurora instances' CA in both). A full
+    report adds one advisory per selected plain EKS GPU node group whose
+    ``updateStrategy`` is not MINIMAL, read from its ``regional_contexts`` check
+    (``eks_nodegroup_update_strategy``).
 
     With ``site_file`` -- the managed site, whose directory holds the deploy
     host's records -- the installation registry sync record is added as the
@@ -139,6 +143,7 @@ def print_status_report(
             *rds_ca_bundle_findings(site),
         ]
     report = status_document(stdout or "")
+    findings = [*findings, *update_strategy_findings(report)]
     if site_file is not None:
         fields, declaration_findings = dcgm_declaration_fields(report, site_file)
         view = status_view(site_file.parent, release_id=_running_release_id(report))

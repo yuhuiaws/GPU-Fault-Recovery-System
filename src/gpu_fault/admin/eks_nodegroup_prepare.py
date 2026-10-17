@@ -4,10 +4,11 @@ Before a plain EKS cluster (provider ``eks-managed``) can join a site, its GPU
 managed node groups need what administrator operations §5.0.0/§5.0.1 list:
 ``python3.12`` and ``strace`` installed by the launch template's user data,
 EKS node auto repair off and the ownership label
-``gpu-fault.io/control-plane=<site id>``. This verb does those three for the
-recommended AMI type ``AL2023_x86_64_NVIDIA`` with the operator's own
-credentials, before any site exists -- like ``site-id`` it needs only
-``--cpu-cluster-arn`` (the site id) and the GPU cluster's EKS ARN.
+``gpu-fault.io/control-plane=<site id>``; their rolls use ``updateStrategy``
+MINIMAL (terminate before launch: no spare GPU instance needed). This verb does
+those four for the recommended AMI type ``AL2023_x86_64_NVIDIA`` with the
+operator's own credentials, before any site exists -- like ``site-id`` it needs
+only ``--cpu-cluster-arn`` (the site id) and the GPU cluster's EKS ARN.
 
 Default is a read-only plan (``eks_nodegroup_plan``): per node group what is
 compliant, what would change and the exact commands, plus Kubernetes findings
@@ -111,14 +112,14 @@ def add_command(commands: Any) -> None:
             f"gpu-fault-admin {VERB} --cpu-cluster-arn CPU_ARN --gpu-cluster-arn "
             "EKS_ARN [--nodegroup NAME ...] [--state-dir STATE_DIR | --work-dir DIR] "
             "[--dcgm-hostengine {embedded,host} [--dcgm-version V]] "
-            "[--adopt-user-data-part PART ...] "
+            "[--adopt-user-data-part PART ...] [--keep-update-strategy] "
             f"[--apply --confirm {CONFIRMATION} --reference CHANGE_ID]"
         ),
         help=(
             "plan (default) or apply the preparation of a plain EKS GPU managed "
             "node group (AL2023_x86_64_NVIDIA): launch template user data for "
-            "python3.12/strace, node auto repair off, the ownership label, the "
-            "roll and an SSM check of the new nodes"
+            "python3.12/strace, node auto repair off, the ownership label, "
+            "updateStrategy MINIMAL, the roll and an SSM check of the new nodes"
         ),
         description=(
             "Read-only by default: per node group what is compliant, what would "
@@ -195,6 +196,15 @@ def add_command(commands: Any) -> None:
         ),
     )
     parser.add_argument(
+        "--keep-update-strategy",
+        action="store_true",
+        help=(
+            "keep a node group's updateStrategy DEFAULT (launch a replacement "
+            "before terminating a node: needs one more GPU instance) instead of "
+            "setting MINIMAL before the roll; recorded as a finding"
+        ),
+    )
+    parser.add_argument(
         "--allowed-namespace",
         action="append",
         default=[],
@@ -249,6 +259,7 @@ class PrepareRequest:
     apply: bool
     reference: str | None
     adopt_parts: tuple[str, ...] = ()
+    keep_update_strategy: bool = False
 
     @property
     def root(self) -> Path | None:
@@ -311,6 +322,7 @@ def prepare_request(arguments: argparse.Namespace) -> PrepareRequest:
         adopt_parts=tuple(
             dict.fromkeys(getattr(arguments, "adopt_user_data_part", None) or ())
         ),
+        keep_update_strategy=bool(getattr(arguments, "keep_update_strategy", False)),
     )
 
 
@@ -431,6 +443,7 @@ def _group_plan(
         ).pending_update(),
         adopt=request.adopt_parts,
         read_nodes=reader,
+        keep_update_strategy=request.keep_update_strategy,
     )
 
 
@@ -516,6 +529,8 @@ def apply_command(request: PrepareRequest) -> str:
         words += ["--allowed-namespace", name]
     for part in request.adopt_parts:
         words += ["--adopt-user-data-part", part]
+    if request.keep_update_strategy:
+        words.append("--keep-update-strategy")
     minutes = int(request.roll_timeout_seconds // 60)
     if minutes != DEFAULT_ROLL_TIMEOUT_MINUTES:
         words += ["--roll-timeout-minutes", str(minutes)]

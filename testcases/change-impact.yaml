@@ -79,6 +79,7 @@ rules:
       - tests/admin/test_admin_eks_nodegroup_user_data.py
       - tests/admin/test_admin_eks_nodegroup_nodes.py
       - tests/admin/test_admin_eks_nodegroup_checks.py
+      - tests/admin/test_admin_eks_nodegroup_update_strategy.py
       - tests/regional/test_regional_admin_checks_node_scope.py
       - tests/regional/test_regional_admin_checks_dcgm_live.py
       - tests/admin/test_admin_dcgm_declaration.py
