@@ -852,6 +852,7 @@ The complete list is in `管理员环境变量参考.md` (Administrator Environm
 | `GPU_FAULT_PROCESSOR_COUNTER_DRIFT_SCAN_SECONDS` | 60 | How often the periodic task compares the processor queue shard counters with the real PENDING/LEASED row counts, refreshing `gpu_fault_processor_counter_drift_abs` and `gpu_fault_processor_counter_mismatched_clusters` (not computed in the scrape) | Lengthen when the queue table is very large and this COUNT visibly slows Aurora; the alert window is 5 minutes, do not approach it |
 | `GPU_FAULT_STORE_COMPACTION_INTERVAL_SECONDS` | 300 | How often the periodic task reads the hot tables' physical layout from the catalog (heap/index pages per live row, the least dense index's entries per page, exported as `gpu_fault_store_hot_table_*`) and rebuilds an index past the threshold with `REINDEX INDEX CONCURRENTLY` or rewrites one of the three small tables with `VACUUM (FULL, ANALYZE)` (§10.3); `0` disables | Usually untouched; a scan without actions is a few milliseconds of catalog reads. Set `0` to leave compaction entirely to `store-maintenance` in a maintenance window |
 | `GPU_FAULT_WORKFLOW_INVARIANT_CHECKS` | log | After every lease-bearing write the executor checks the workflow record's state-machine invariants (indexes ordered and unique, DAG join markers, no owner/lease in terminal states, `events` bounded and ordered, etc.); `off` skips, `log` records an error log and continues, `raise` fails that write | Keep `log` in production; use `raise` in staging and acceptance drills to expose malformed records on the spot |
+| `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` | 180 | How long a node's GPU-metrics collector must keep failing its scrape (`collection_errors`) before `dcgm_field_completeness` escalates from NO_ACTION to RUN_DIAGNOSTICS and opens the diagnostic incident; until then it is only booked, so a single failure inside an exporter restart (release roll, OOM, eviction) no longer opens a workflow or quarantines a healthy node | 15-900; raise it when exporter restarts routinely exceed 3 minutes (e.g. a slow large image pull); do not lower it below one collector interval to detect real faults sooner |
 
 **Ordering relationships between timing parameters.** The wait-class parameters in the table above and elsewhere in §4 are not independent of each other; the code has an implicit ordering,
 checked item by item at startup by `gpu_fault.execution.config.validate_timing_relationships` (a violation refuses startup;
@@ -3334,6 +3335,12 @@ a reading of 0 means that release declared none. Every metric family on the dash
   the collector's journal on the node.
 - **Boundary**: the only way this alert self-heals is the node really delivering successfully once -- do not change thresholds, do not delete
   `collector_status` records. Repair entry points REG-6, REG-14.5.
+- **Relation to incidents**: the control plane books GPU_METRICS error batches as the node-level WARNING
+  `dcgm_field_completeness`, first with NO_ACTION (visible in `GET /v1/gpu-health-findings/{cluster_id}/{node_id}`, no
+  incident); only once the node's error batches have lasted `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS`
+  (default 180 s) back to back does it escalate to RUN_DIAGNOSTICS and open the one
+  `inc-gpu-<first error batch id of the streak>-dcgm-fields`. The alert without that incident means the failures have not
+  lasted the window yet, or a clean batch already cleared them.
 
 ### GpuFaultCollectorMetricsSnapshotStale
 

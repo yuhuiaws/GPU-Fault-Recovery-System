@@ -13895,6 +13895,9 @@ otherwise a machine with a non-EFA RDMA card mixed in would reach a false "consi
   When the DCGM exporter Pod is not yet ready after the reboot, the metrics collector's scrape failures
   are not reported within the `GPU_FAULT_DCGM_STARTUP_GRACE_SECONDS` grace period, otherwise every
   reboot could add a dcgm-fields diagnostic workflow, equally breaking "exactly one".
+  A short scrape failure after the grace (an exporter Pod restart) opens no workflow either: `dcgm_field_completeness`
+  is booked with NO_ACTION and opens the diagnostic incident only once the node's error batches have lasted
+  `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` (default 180 s) back to back.
   A publish response lost at the start of the reboot must not be republished either: the runner uses
   the batch IDs and event IDs saved before publishing to query the persistent evidence, then checks
   the workflow, commands and submission scope. A missing batch, mismatched identity or an explicit

@@ -559,7 +559,13 @@ GPU_FAULT_NVLINK_ERROR_DELTA_CRITICAL=1
 GPU_FAULT_POWER_VIOLATION_DELTA_WARNING_US=1
 GPU_FAULT_THERMAL_VIOLATION_DELTA_WARNING_US=1
 GPU_FAULT_THERMAL_VIOLATION_DRAIN_CONSECUTIVE_SAMPLES=2
+GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS=180
 ```
+
+A failed scrape is delivered as a sample-less batch carrying `collection_errors`; the control plane books it as the
+node-level WARNING `dcgm_field_completeness` (NO_ACTION, no incident) and opens the diagnostic incident only once the
+node's error batches have lasted `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` (default 180 s) back to back; the
+next clean scrape clears it.
 
 ## HMA Forwarding Retirement
 

@@ -7481,6 +7481,7 @@ decision via `GET /v1/gpu-events/xid/<event-id>/correlation`. HA deployments mus
 | `GPU_FAULT_DCGM_RETIRED_PAGES_DBE_DELTA_CRITICAL` | 1; positive | Threshold for newly uncorrectable retired pages |
 | `GPU_FAULT_DCGM_ROW_REMAP_CORRECTABLE_DELTA_WARNING` | 1; positive | Threshold for new correctable remaps |
 | `GPU_FAULT_DCGM_CORRECTABLE_MEMORY_DRAIN_CONSECUTIVE_SAMPLES` | 3; 2-10 | Count for the corrected-memory composite to escalate to DRAIN |
+| `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` | 180; 15-900 | How long a node's DCGM scrape failures must last before the RUN_DIAGNOSTICS incident opens; until then `dcgm_field_completeness` is booked with NO_ACTION |
 
 Rule sources and default handling are as follows:
 
@@ -7497,6 +7498,7 @@ Rule sources and default handling are as follows:
 | GPU/HBM fallback temperature | Uses 85/90 and 90/95 when the device exposes no limits | Site fallback |
 | Power violation increased | Warning, run diagnostics | NVIDIA DCGM Health signal; the delta allows site override |
 | Thermal violation increased | First Warning with diagnostics; continued growth escalates to `DRAIN` on the 2nd by default | NVIDIA DCGM Health signal plus site automated escalation |
+| DCGM scrape failed (`collection_errors`) | Warning `dcgm_field_completeness` booked at once (NO_ACTION, no incident); diagnostics run only once the node's error batches have lasted `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` (default 180 s) back to back; the next clean scrape clears it | Site policy `SITE_DCGM_FIELD_COMPLETENESS` |
 
 NVIDIA references:
 

@@ -1212,13 +1212,33 @@ when the batch has no errors and the existing finding is non-empty it writes `(k
 the WARNING left by the one or two failed scrapes when the collector came up before dcgm-exporter after a node reboot stayed active forever, and
 every validation recovery by `VALIDATE_GPU` for that node was refused with `active_gpu_health_findings`
 (the cleanup in DESTR-014 attempt 10 failed because of this).
+**Booked is not actionable**: the finding is booked with `automatic_action=NO_ACTION` -- status, metrics and readers
+still see the telemetry gap, and `VALIDATE_GPU` still refuses while it is active -- but it opens no incident and no
+workflow. Only once the node's GPU-metrics collector has sent error batches back to back (no clean batch in between)
+for `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` (`GpuMetricsThresholds.collection_error_sustain_seconds`,
+default 180, 15-900; measured on batch `observed_at` from the streak's first error batch) does it escalate to
+`RUN_DIAGNOSTICS` and open exactly one NODE_HEALTH incident through the existing path (an action change is an
+activation, the thermal consecutive-breach model). The streak start lives in the finding itself: its `observed_at` and
+`finding_id` are the first error batch's, the state's `observed_at` follows the latest batch, so memory, SQLite and
+PostgreSQL need no schema change and older code still decodes it; one streak has one event id
+(`gpu-<first batch id>-dcgm-fields`), replays are idempotent, late batches are still dropped by the state's time
+fence, and a finding an older release booked with `RUN_DIAGNOSTICS` stays escalated without activating again
+(`gpu_collection_errors.collection_error_finding`). 180 s is the 6th consecutive failure of the 15 s collector (its
+backoff reports at 0/15/30/60/120/180 s) and six times the longest live exporter-roll outage (< 30 s); an exporter
+that comes up after the collector at boot is covered by the 300 s startup grace above. Live lesson: a release
+re-rendered the dcgm-exporter DaemonSet, exactly one scrape inside the Pod restart failed and the next batch 15 s
+later was clean, yet the old logic opened the diagnostic incident at once; its `VALIDATE_GPU` ran 3 s before the clean
+batch cleared the finding and refused, the DRAIN successor quarantined a healthy node, and its WAITING
+diagnostic-bundle command failed the release's `rollout_wave_safety` probe and forced a rollback whose own exporter
+re-render repeated the sequence.
 Raised while a RUNNING node-exclusive chain quiesces, resets or reboots the node (the eks-managed quiesce taint evicted
 the exporter and the collector's scrape failed before the quiesce stopped it), the finding is that chain's own side
 effect and is linked to the chain's incident without a workflow of its own
 (`orchestration/families/conflicts.DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS`, as long as the chain's `VALIDATE_GPU` is
 still ahead): no RUN_DCGM_DIAGNOSTIC runs `dcgmi diag` inside another workflow's quiesce window and no DRAIN successor
 is minted from a diagnostic of the window; the chain's `VALIDATE_GPU` still refuses while the finding is active, so a
-persisting collection failure is not lost.
+persisting collection failure is not lost. (A failure shorter than the sustain window opens no workflow anyway; what
+the chain absorbs is the finding that escalates while it runs.)
 
 **⑧ Idempotency and concurrency control**: XID/SXID events carry an `event_id`; the control plane deduplicates by `event_id`.
 The inventory and metrics channels are `latest_wins=True`, so a newer sample from the same node overwrites the older one,
