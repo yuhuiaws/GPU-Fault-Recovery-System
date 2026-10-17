@@ -268,7 +268,8 @@ def node_dcgm_details(
 
     The cluster's mode and source; on ``eks-managed`` also the nodes whose
     Agent still runs the other mode (``dcgm_hostengine_pending_nodes``, the
-    reconciler annotation) and, when a node preflight observed them, every
+    reconciler annotation). When a node preflight observed them -- on either
+    provider: a HyperPod node is always held to its host engine -- every
     node's DCGM state with the time of that observation and the nodes whose
     state conflicts with the mode (a host engine next to the embedded one, or
     a host-mode node without a working ``nvidia-dcgm``).
@@ -279,15 +280,14 @@ def node_dcgm_details(
         "dcgm_hostengine": mode.value,
         "dcgm_hostengine_source": dcgm_hostengine_source(target).value,
     }
-    if cluster_provider(getattr(target, "provider", None)) is not (
+    if cluster_provider(getattr(target, "provider", None)) is (
         ClusterProvider.EKS_MANAGED
     ):
-        return details
-    details["dcgm_hostengine_pending_nodes"] = [
-        name
-        for name, item in _node_names(nodes)
-        if name and not installed_dcgm_hostengine_matches(item, mode.value)
-    ]
+        details["dcgm_hostengine_pending_nodes"] = [
+            name
+            for name, item in _node_names(nodes)
+            if name and not installed_dcgm_hostengine_matches(item, mode.value)
+        ]
     recorded = _recorded_node_states(release)
     cluster = (
         recorded.get(str(target.cluster_id)) if isinstance(recorded, Mapping) else None

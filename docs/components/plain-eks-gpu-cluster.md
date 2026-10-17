@@ -87,7 +87,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   `nv-hostengine`、active 的 `nvidia-dcgm` 与成功的 `timeout 30 dcgmi discovery -l`，同一条判定里列出。预检把每个节点的 DCGM 状态
   （`not-installed`/`installed-inactive`/`host-active`/`cuda-mismatch`/`host-failed`/`unmanaged-hostengine`）写进判定的 `dcgm` 对象：host 模式
   只接受 `host-active`，embedded 模式拒绝与内嵌 hostengine 并存（运行中、active/activating 或 enabled）的主机 hostengine
-  （`ERROR: DCGM host engine conflict: ...`）；最近一次预检的逐节点状态记入 release state `node_dcgm_hostengine`，`status --full` 显示为
+  （`ERROR: DCGM host engine conflict: ...`）；HyperPod 节点始终按 host 模式核对（`dcgmi`、`nv-hostengine`、active 的 `nvidia-dcgm`、
+  `dcgmi discovery -l` 缺一即拒绝，CUDA 不符与外来 nv-hostengine 只记 `WARN`）；最近一次预检的逐节点状态记入 release state `node_dcgm_hostengine`，`status --full` 显示为
   `node_scope.dcgm_hostengine_nodes`/`dcgm_hostengine_conflict_nodes`。Agent 始终按集群声明的模式判定。
 - Node Action key：所有节点清单读取都用集群选择器（含 CPU 镜像守卫）。
 

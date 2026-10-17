@@ -97,22 +97,31 @@ for command in \
 done
 runtime_missing=${#missing_prerequisites[@]}
 
-# The DCGM host engine of an eks-managed node, classified in both modes and
-# reported as the "dcgm" member of the verdict (HyperPod: nothing, verdict as
-# before). Host mode (node group label gpu-fault.io/dcgm-hostengine=host) needs
-# a running nvidia-dcgm that sees the GPUs and owns every nv-hostengine; the
+# The DCGM host engine of every GPU node, classified and reported as the
+# "dcgm" member of the verdict. Host mode -- every HyperPod node (its AMI runs
+# DCGM as a host service the exporter dials) and an eks-managed node group
+# labelled gpu-fault.io/dcgm-hostengine=host -- needs a running nvidia-dcgm
+# that sees the GPUs (dcgmi, nv-hostengine, systemctl is-active nvidia-dcgm,
+# dcgmi discovery -l); eks host mode also refuses a CUDA flavor that does not
+# match the driver and an nv-hostengine nvidia-dcgm.service does not own, which
+# a HyperPod node only reports (WARN; the AMI is not ours to rebuild). The
 # embedded mode needs no host engine at all, because the exporter starts its
 # own and two engines on one node fight over the GPUs.
 dcgm_member=""
 dcgm_remedy=""
 dcgm_conflicts=()
+dcgm_warnings=()
 classify_dcgm_hostengine() {
+    local provider="${GPU_FAULT_CLUSTER_PROVIDER:-hyperpod}"
     local mode="embedded" dcgmi="false" hostengine="false" active enabled
     local packages line major majors=() smi driver_major="" pids pid unit
     local processes="" unmanaged=() owned=() engine_runs="false" discovery="skipped"
     local status mismatch="false" state conflict="false" packages_json=""
     local installed=""
-    if [[ "${GPU_FAULT_DCGM_HOSTENGINE:-}" == "host" ]]; then mode="host"; fi
+    if [[ "${provider}" != "eks-managed" ||
+        "${GPU_FAULT_DCGM_HOSTENGINE:-}" == "host" ]]; then
+        mode="host"
+    fi
     if host_shell "command -v dcgmi >/dev/null"; then dcgmi="true"; fi
     if host_shell "command -v nv-hostengine >/dev/null"; then hostengine="true"; fi
     active="$(host_shell "systemctl is-active nvidia-dcgm 2>/dev/null || true")"
@@ -194,18 +203,28 @@ classify_dcgm_hostengine() {
         if [[ "${discovery}" == exit* ]]; then
             missing_prerequisites+=("dcgmi discovery -l (${discovery})")
         fi
-        if [[ "${mismatch}" == "true" ]]; then
-            missing_prerequisites+=("datacenter-gpu-manager-4-cuda${driver_major} (installed: ${installed})")
-        fi
-        for pid in "${unmanaged[@]}"; do
-            missing_prerequisites+=("nv-hostengine pid ${pid} outside nvidia-dcgm.service")
-        done
-        dcgm_remedy="the managed node group declares gpu-fault.io/dcgm-hostengine=host: install the pinned datacenter-gpu-manager-4 packages and systemctl enable --now nvidia-dcgm in the launch template user data (see 管理员日常运维 / administrator-operations §5.0.1), or remove the label and deploy to run the exporter's embedded hostengine"
-        if [[ "${mismatch}" == "true" ]]; then
-            dcgm_remedy="${dcgm_remedy}; the DCGM CUDA flavor must match the driver's CUDA major: install datacenter-gpu-manager-4-cuda${driver_major} (nvidia-smi reports CUDA Version ${driver_major})"
-        fi
-        if (( ${#unmanaged[@]} > 0 )); then
-            dcgm_remedy="${dcgm_remedy}; stop the hand-started nv-hostengine; nvidia-dcgm.service must own the host engine"
+        if [[ "${provider}" != "eks-managed" ]]; then
+            dcgm_remedy="a HyperPod node runs DCGM as a host service the exporter dials at 127.0.0.1:5555: the instance group's AMI must ship datacenter-gpu-manager-4 and run nvidia-dcgm (systemctl enable --now nvidia-dcgm; dcgmi discovery -l lists the GPUs; see 管理员日常运维 / administrator-operations §5.0.1)"
+            if [[ "${mismatch}" == "true" ]]; then
+                dcgm_warnings+=("datacenter-gpu-manager-4-cuda${driver_major} (installed: ${installed})")
+            fi
+            for pid in "${unmanaged[@]}"; do
+                dcgm_warnings+=("nv-hostengine pid ${pid} outside nvidia-dcgm.service")
+            done
+        else
+            if [[ "${mismatch}" == "true" ]]; then
+                missing_prerequisites+=("datacenter-gpu-manager-4-cuda${driver_major} (installed: ${installed})")
+            fi
+            for pid in "${unmanaged[@]}"; do
+                missing_prerequisites+=("nv-hostengine pid ${pid} outside nvidia-dcgm.service")
+            done
+            dcgm_remedy="the managed node group declares gpu-fault.io/dcgm-hostengine=host: install the pinned datacenter-gpu-manager-4 packages and systemctl enable --now nvidia-dcgm in the launch template user data (see 管理员日常运维 / administrator-operations §5.0.1), or remove the label and deploy to run the exporter's embedded hostengine"
+            if [[ "${mismatch}" == "true" ]]; then
+                dcgm_remedy="${dcgm_remedy}; the DCGM CUDA flavor must match the driver's CUDA major: install datacenter-gpu-manager-4-cuda${driver_major} (nvidia-smi reports CUDA Version ${driver_major})"
+            fi
+            if (( ${#unmanaged[@]} > 0 )); then
+                dcgm_remedy="${dcgm_remedy}; stop the hand-started nv-hostengine; nvidia-dcgm.service must own the host engine"
+            fi
         fi
     else
         # A host engine next to the exporter's embedded one: running, about
@@ -225,24 +244,25 @@ classify_dcgm_hostengine() {
         "${mode}" "${state}" "${active}" "${enabled}" "${dcgmi}" "${hostengine}" \
         "${packages_json}" "${driver_major}" "${processes}" "${discovery}" "${conflict}")"
 }
-if [[ "${GPU_FAULT_CLUSTER_PROVIDER:-hyperpod}" == "eks-managed" ]]; then
-    classify_dcgm_hostengine
-fi
+classify_dcgm_hostengine
+for warning in "${dcgm_warnings[@]}"; do
+    printf 'WARN  DCGM host engine: %s\n' "${warning}"
+done
 failure_reasons=()
 failure_messages=()
 if (( ${#missing_prerequisites[@]} > 0 )); then
     # Joined on a separator no item contains, so an item's own commas stay.
     missing_list="$(IFS=$'\x1f'; printf '%s' "${missing_prerequisites[*]}")"
     missing_list="${missing_list//$'\x1f'/, }"
-    remedy="install them on the node image before joining"
-    if [[ "${GPU_FAULT_CLUSTER_PROVIDER:-hyperpod}" == "eks-managed" ]]; then
-        remedy=""
-        if (( runtime_missing > 0 )); then
+    remedy=""
+    if (( runtime_missing > 0 )); then
+        remedy="install them on the node image before joining"
+        if [[ "${GPU_FAULT_CLUSTER_PROVIDER:-hyperpod}" == "eks-managed" ]]; then
             remedy="the EKS AL2023 NVIDIA AMI does not ship them; install them in the managed node group launch template user data (dnf install -y python3.12 strace; see 管理员日常运维 / administrator-operations §5.0.1) and roll the node group, then rerun the join"
         fi
-        if (( ${#missing_prerequisites[@]} > runtime_missing )); then
-            remedy="${remedy:+${remedy}; }${dcgm_remedy}"
-        fi
+    fi
+    if (( ${#missing_prerequisites[@]} > runtime_missing )); then
+        remedy="${remedy:+${remedy}; }${dcgm_remedy}"
     fi
     failure_reasons+=("host prerequisites unavailable: ${missing_list}")
     failure_messages+=("host prerequisites unavailable: ${missing_list}; ${remedy}")

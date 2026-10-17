@@ -110,7 +110,9 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   `nvidia-dcgm` and a successful `timeout 30 dcgmi discovery -l`, listed in the same verdict. The preflight records every
   node's DCGM state (`not-installed`/`installed-inactive`/`host-active`/`cuda-mismatch`/`host-failed`/`unmanaged-hostengine`)
   in the verdict's `dcgm` object: host mode accepts `host-active` only, and embedded mode refuses a host hostengine next
-  to the embedded one (running, active/activating or enabled; `ERROR: DCGM host engine conflict: ...`); the per-node
+  to the embedded one (running, active/activating or enabled; `ERROR: DCGM host engine conflict: ...`); a HyperPod node is
+  always checked as host mode (`dcgmi`, `nv-hostengine`, an active `nvidia-dcgm` and `dcgmi discovery -l` refuse, a CUDA
+  flavor mismatch or a foreign nv-hostengine only warns); the per-node
   states of the last preflight are recorded in the release state `node_dcgm_hostengine` and shown by `status --full` as
   `node_scope.dcgm_hostengine_nodes`/`dcgm_hostengine_conflict_nodes`. The Agent always grades by the cluster's declared
   mode.

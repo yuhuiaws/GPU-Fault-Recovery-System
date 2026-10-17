@@ -604,3 +604,42 @@ def test_status_reads_the_persisted_observations_without_replacing_the_state() -
         "the status read targets the release state ConfigMap"
     )
     assert DCGM.RELEASE_STATE_CONFIG_MAP == STATE.STATE_CONFIG_MAP
+
+
+def test_status_holds_a_hyperpod_cluster_to_its_host_engine_too() -> None:
+    """HyperPod is always host mode: the last preflight's per-node states are
+    shown and a node without a working nvidia-dcgm is flagged, but no Agent is
+    ever "pending" (the reconciler annotation is an eks-managed identity)."""
+
+    target = SimpleNamespace(
+        cluster_id="gpu-a",
+        provider="hyperpod",
+        hyperpod_cluster_name="hp-gpu-a",
+        node_selector="",
+        node_selector_source="",
+    )
+    state = {
+        DCGM.NODE_DCGM_STATE_KEY: {
+            "gpu-a": {
+                "mode": "host",
+                "observed_at": "observed",
+                "nodes": {
+                    "hyperpod-i-1": {"state": "host-active", "conflict": False},
+                    "hyperpod-i-2": {"state": "host-failed", "conflict": False},
+                },
+            }
+        }
+    }
+    details = DCGM.node_dcgm_details(
+        _status_release(state), target, {"items": [_status_node("hyperpod-i-1", None)]}
+    )
+    assert details == {
+        "dcgm_hostengine": "host",
+        "dcgm_hostengine_source": "provider",
+        "dcgm_hostengine_observed_at": "observed",
+        "dcgm_hostengine_nodes": {
+            "hyperpod-i-1": "host-active",
+            "hyperpod-i-2": "host-failed",
+        },
+        "dcgm_hostengine_conflict_nodes": ["hyperpod-i-2"],
+    }, details

@@ -177,10 +177,10 @@ def test_al2023_node_without_python312_and_strace_fails_with_one_full_verdict(
 
 
 def test_hyperpod_node_remedy_does_not_mention_the_eks_ami(tmp_path: Path) -> None:
-    root = _fake_node(
+    root = _dcgm_host(
         tmp_path,
-        ("curl", "nvidia-smi", "ps", "ss", "systemctl", "timeout"),
-        python312=True,
+        STATES["host-active"],
+        runtime=("curl", "nvidia-smi", "ps", "ss", "systemctl", "timeout"),
     )
     result = _run(tmp_path, root, provider="hyperpod")
     assert result.returncode == 1, result.stdout + result.stderr
@@ -195,7 +195,13 @@ def test_hyperpod_node_remedy_does_not_mention_the_eks_ami(tmp_path: Path) -> No
 def test_a_complete_node_passes_with_the_unchanged_verdict(
     tmp_path: Path, provider: str
 ) -> None:
-    root = _fake_node(tmp_path, HYPERPOD_TOOLS, python312=True)
+    # A HyperPod node is complete with its host DCGM running; a plain EKS node
+    # (embedded mode) needs none.
+    root = (
+        _dcgm_host(tmp_path, STATES["host-active"])
+        if provider == "hyperpod"
+        else _fake_node(tmp_path, HYPERPOD_TOOLS, python312=True)
+    )
     result = _run(tmp_path, root, provider=provider)
     assert result.returncode == 0, result.stdout + result.stderr
     verdict = json.loads(result.stdout.strip().splitlines()[-1])
@@ -205,13 +211,15 @@ def test_a_complete_node_passes_with_the_unchanged_verdict(
     assert result.stderr == "", "a passing preflight is silent on stderr"
 
 
-# --- the DCGM host engine of an eks-managed node ---------------------------------
+# --- the DCGM host engine of a GPU node -------------------------------------------
 #
-# Every eks-managed verdict reports the node's DCGM host engine ("dcgm"). Host
-# mode (node group label gpu-fault.io/dcgm-hostengine=host) refuses everything
-# but a running nvidia-dcgm that sees the GPUs and owns every nv-hostengine,
-# listed with the other missing prerequisites; the embedded mode refuses any host
-# engine next to the exporter's embedded one. HyperPod is not classified.
+# Every verdict reports the node's DCGM host engine ("dcgm"). Host mode (an
+# eks-managed node group labelled gpu-fault.io/dcgm-hostengine=host) refuses
+# everything but a running nvidia-dcgm that sees the GPUs and owns every
+# nv-hostengine, listed with the other missing prerequisites; the embedded mode
+# refuses any host engine next to the exporter's embedded one. A HyperPod node
+# is always host mode: the four engine checks refuse, a CUDA flavor mismatch or
+# an unowned nv-hostengine is reported (WARN) but not refused.
 UNIT_CGROUP = "0::/system.slice/nvidia-dcgm.service\n"
 SESSION_CGROUP = "0::/user.slice/user-1000.slice/session-3.scope\n"
 CORE = "datacenter-gpu-manager-4-core"
@@ -500,28 +508,98 @@ def test_missing_tools_and_a_conflict_fail_in_one_verdict(tmp_path: Path) -> Non
     ], result.stderr
 
 
-@pytest.mark.parametrize("state", ["host-active", "unmanaged-hostengine"])
-def test_only_eks_managed_verdicts_carry_the_dcgm_state(
+HYPERPOD_DCGM_REMEDY = (
+    "a HyperPod node runs DCGM as a host service the exporter dials at "
+    "127.0.0.1:5555: the instance group's AMI must ship datacenter-gpu-manager-4 "
+    "and run nvidia-dcgm (systemctl enable --now nvidia-dcgm; dcgmi discovery -l "
+    "lists the GPUs; see 管理员日常运维 / administrator-operations §5.0.1)"
+)
+#: HyperPod (always host mode): the four engine checks refuse, nothing else.
+HYPERPOD_MATRIX = {
+    "not-installed": (
+        "host prerequisites unavailable: dcgmi, nv-hostengine, "
+        "nvidia-dcgm.service (inactive)"
+    ),
+    "installed-inactive": (
+        "host prerequisites unavailable: nvidia-dcgm.service (inactive)"
+    ),
+    "host-active": None,
+    "cuda-mismatch": "host prerequisites unavailable: nvidia-dcgm.service (inactive)",
+    "host-failed": "host prerequisites unavailable: nvidia-dcgm.service (activating)",
+    "unmanaged-hostengine": (
+        "host prerequisites unavailable: nvidia-dcgm.service (inactive)"
+    ),
+}
+
+
+@pytest.mark.parametrize("state", sorted(HYPERPOD_MATRIX))
+def test_a_hyperpod_node_is_held_to_the_host_engine_the_exporter_dials(
     tmp_path: Path, state: str
 ) -> None:
+    """The HyperPod AMI is expected to run nvidia-dcgm (the checked-in exporter
+    dials it); an AMI release without it must not pass silently."""
+
     root = _dcgm_host(tmp_path, STATES[state])
-    eks = _run(tmp_path, root, provider="eks-managed", dcgm_hostengine="host")
-    assert _verdict(eks)["dcgm"]["state"] == state, eks.stdout
-    hyperpod = _run(tmp_path, root, provider="hyperpod", dcgm_hostengine="host")
-    assert hyperpod.returncode == 0, hyperpod.stdout + hyperpod.stderr
-    assert set(_verdict(hyperpod)) == {
-        "artifact_sha256",
-        "bundle_sha256",
-        "node_id",
-        "node_uid",
-        "status",
-    }, "a HyperPod verdict keeps exactly its historical members"
-    broken = _dcgm_host(
-        tmp_path / "broken", STATES[state], runtime=AL2023_TOOLS, python312=False
+    result = _run(tmp_path, root, provider="hyperpod")
+    verdict = _verdict(result)
+    assert (verdict["dcgm"]["mode"], verdict["dcgm"]["state"]) == ("host", state), (
+        verdict
     )
-    failed = _run(tmp_path / "broken", broken, provider="hyperpod")
-    assert failed.stdout.strip().splitlines()[-1] == (
-        '{"node_id":"ip-10-0-33-205.us-west-2.compute.internal","node_uid":'
-        '"node-uid-1","status":"FAILED","reasons":["host prerequisites '
-        'unavailable: /usr/bin/python3.12, strace"]}'
-    ), "the HyperPod refusal is byte for byte what it was"
+    reason = HYPERPOD_MATRIX[state]
+    if reason is None:
+        assert result.returncode == 0, result.stdout + result.stderr
+        assert verdict["status"] == "PASSED", verdict
+        return
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert verdict["reasons"] == [reason], verdict
+    assert result.stderr.strip().splitlines()[-1] == (
+        f"ERROR: {reason}; {HYPERPOD_DCGM_REMEDY}"
+    ), result.stderr
+    assert "AL2023" not in result.stderr and "dcgm-hostengine=host" not in (
+        result.stderr
+    ), "a HyperPod node gets the HyperPod remedy"
+
+
+def test_a_hyperpod_node_reports_but_keeps_a_flavor_mismatch_and_a_foreign_engine(
+    tmp_path: Path,
+) -> None:
+    node = DcgmNode(
+        packages=(CORE, "datacenter-gpu-manager-4-cuda12"),
+        active="active",
+        enabled="enabled",
+        processes=((4242, UNIT_CGROUP), (777, SESSION_CGROUP)),
+    )
+    root = _dcgm_host(tmp_path, node)
+    result = _run(tmp_path, root, provider="hyperpod")
+    assert result.returncode == 0, result.stdout + result.stderr
+    verdict = _verdict(result)
+    assert verdict["status"] == "PASSED", verdict
+    assert verdict["dcgm"]["state"] == "unmanaged-hostengine", verdict
+    assert verdict["dcgm"]["conflict"] is True, "status flags the unowned engine"
+    assert (
+        "WARN  DCGM host engine: datacenter-gpu-manager-4-cuda13 (installed: cuda12)"
+        in result.stdout
+    ), result.stdout
+    assert (
+        "WARN  DCGM host engine: nv-hostengine pid 777 outside nvidia-dcgm.service"
+        in result.stdout
+    ), result.stdout
+    assert result.stderr == "", "a warning is no refusal"
+
+
+def test_a_hyperpod_refusal_lists_the_runtime_tools_with_a_working_engine(
+    tmp_path: Path,
+) -> None:
+    root = _dcgm_host(
+        tmp_path, STATES["host-active"], runtime=AL2023_TOOLS, python312=False
+    )
+    result = _run(tmp_path, root, provider="hyperpod")
+    verdict = _verdict(result)
+    assert verdict["reasons"] == [
+        "host prerequisites unavailable: /usr/bin/python3.12, strace"
+    ], verdict
+    assert verdict["dcgm"]["state"] == "host-active", verdict
+    assert result.stderr.strip().splitlines()[-1] == (
+        "ERROR: host prerequisites unavailable: /usr/bin/python3.12, strace; "
+        "install them on the node image before joining"
+    ), result.stderr

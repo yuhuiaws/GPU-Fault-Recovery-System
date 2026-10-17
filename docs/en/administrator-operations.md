@@ -2170,14 +2170,21 @@ reconciler/Agents, and every join) are recorded in the release state (`node_dcgm
 shown by `status --full`/verify as `node_scope.dcgm_hostengine_nodes` and `node_scope.dcgm_hostengine_conflict_nodes` --
 that preflight's observation, not a live probe.
 
-| `dcgm.state` | Meaning | Host mode (labelled) |
-|---|---|---|
-| `not-installed` | no DCGM packages | refused |
-| `installed-inactive` | packages installed, `nvidia-dcgm` disabled and not running (the AL2023 default once installed) | refused |
-| `host-active` | `nvidia-dcgm` active and `dcgmi discovery -l` succeeds | passes |
-| `cuda-mismatch` | the installed `cudaN` flavor differs from the driver's CUDA major (e.g. cuda12 on a CUDA 13 driver; `dcgmproftester` exits 244 "Wrong version") | refused: the `cudaN` package must match the driver's CUDA major |
-| `host-failed` | `nvidia-dcgm` enabled but failed or crash-looping, or active with `dcgmi discovery -l` failing | refused |
-| `unmanaged-hostengine` | an nv-hostengine process outside `nvidia-dcgm.service` (e.g. started by hand) | refused: stop the hand-started nv-hostengine; `nvidia-dcgm.service` must own the host engine |
+| `dcgm.state` | Meaning | Host mode (labelled) | HyperPod (always host) |
+|---|---|---|---|
+| `not-installed` | no DCGM packages | refused | refused |
+| `installed-inactive` | packages installed, `nvidia-dcgm` disabled and not running (the AL2023 default once installed) | refused | refused |
+| `host-active` | `nvidia-dcgm` active and `dcgmi discovery -l` succeeds | passes | passes |
+| `cuda-mismatch` | the installed `cudaN` flavor differs from the driver's CUDA major (e.g. cuda12 on a CUDA 13 driver; `dcgmproftester` exits 244 "Wrong version") | refused: the `cudaN` package must match the driver's CUDA major | `WARN` only (passes when the engine itself works) |
+| `host-failed` | `nvidia-dcgm` enabled but failed or crash-looping, or active with `dcgmi discovery -l` failing | refused | refused |
+| `unmanaged-hostengine` | an nv-hostengine process outside `nvidia-dcgm.service` (e.g. started by hand) | refused: stop the hand-started nv-hostengine; `nvidia-dcgm.service` must own the host engine | `WARN` only (passes when the engine itself works) |
+
+A HyperPod cluster is always host mode: the node preflight holds every HyperPod node to the same `dcgmi`, `nv-hostengine`,
+active `nvidia-dcgm` and successful `dcgmi discovery -l` checks and refuses a node that fails one (the instance group's
+AMI must ship datacenter-gpu-manager-4 and run `nvidia-dcgm`), so an AMI release without the host engine cannot pass
+silently; a CUDA flavor mismatch or an nv-hostengine outside `nvidia-dcgm.service` is only reported (`WARN`, recorded in
+the state) because the AMI is not the site's to rebuild. HyperPod exporter renders, installer templates and Agent
+environments are unchanged.
 
 A host-mode refusal lists every item of every node in one `ERROR: host prerequisites unavailable: ...` pointing back here.
 In embedded mode (no label) a host engine next to the exporter's embedded one -- running, active/activating or enabled
