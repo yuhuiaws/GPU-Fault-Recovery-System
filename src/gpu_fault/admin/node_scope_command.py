@@ -46,6 +46,7 @@ from gpu_fault.admin.bootstrap_ownership import (
     NodeGroupFacts,
     NodeScope,
     eks_nodegroup_facts,
+    groups_for_selector,
     hyperpod_instance_group_facts,
     resolve_node_scope,
 )
