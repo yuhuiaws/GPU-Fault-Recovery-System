@@ -94,7 +94,11 @@ GB300 属于 GB200 列。
 
 - XID 45：先持久化为 `PENDING_CORRELATION`，等待 30 秒窗口闭合；伴随其他 XID
   时复用最严重伴随 XID 的 incident/workflow，solo 时保留 `RESTART_FM` 并编译为
-  `RESTART_FABRIC_MANAGER`，由 Node Agent 的 `fabricManagerRestart` 能力执行。共享
+  `RESTART_FABRIC_MANAGER`，由 Node Agent 的 `fabricManagerRestart` 能力执行。在最新 DCGM 样本被分级的
+  Hopper NVSwitch 节点上（Hopper SXM 部件报告字段 170），单独重启 Fabric Manager 会丢失 fabric 状态，
+  `RESTART_FM` 在这里改为编译 NVIDIA 对 H100 及之后的流程：在被分级的 GPU 上执行完整 GPU + NVSwitch reset 链
+  （停止并重启 Fabric Manager 的 quiesce 窗口内的 `RESET_ALL_GPUS_NVSWITCHES`，随后 VALIDATE_GPU 与
+  VALIDATE_FABRIC），使用 `fabricReset` 能力。共享
   Store lease 支持 HA、乱序到达和 Pod 重启。
 - XID 48：solo 执行 `RESET_GPU`；伴随 XID 63/64 时执行
   `DRAIN_AND_RESET`。

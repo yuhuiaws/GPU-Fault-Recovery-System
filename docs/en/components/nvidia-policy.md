@@ -96,7 +96,11 @@ GB300 belongs to the GB200 column.
 
 - XID 45: first persisted as `PENDING_CORRELATION`, waiting for the 30-second window to close; when accompanied by other XIDs
   it reuses the incident/workflow of the most severe accompanying XID; when solo it keeps `RESTART_FM` and compiles it to
-  `RESTART_FABRIC_MANAGER`, executed by the Node Agent's `fabricManagerRestart` capability. The shared
+  `RESTART_FABRIC_MANAGER`, executed by the Node Agent's `fabricManagerRestart` capability. On a Hopper NVSwitch node whose
+  latest DCGM samples are graded (field 170 on a Hopper SXM part), a Fabric Manager restart alone loses the fabric state, so
+  `RESTART_FM` compiles to NVIDIA's H100-and-later procedure there instead: the full GPU + NVSwitch reset chain
+  (`RESET_ALL_GPUS_NVSWITCHES` inside a quiesce window that stops and restarts Fabric Manager, then VALIDATE_GPU and
+  VALIDATE_FABRIC) on the graded GPUs, under the `fabricReset` capability. The shared
   Store lease supports HA, out-of-order arrival and Pod restarts.
 - XID 48: solo executes `RESET_GPU`; when accompanied by XID 63/64 it executes
   `DRAIN_AND_RESET`.

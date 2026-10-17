@@ -133,7 +133,7 @@ It is not a binary choice between "fully automatic" and "alert only", but graded
 | Isolation | `MARK_UNSCHEDULABLE`, `QUARANTINE`, `RESTORE_SCHEDULING` | Implemented |
 | Stop/resume training | `STOP_WORKLOADS`, `RESTART_WORKLOAD`, `CHECKPOINT_WORKLOADS` | Implemented (Job / PyTorchJob / JobSet) |
 | Device-level repair | `RESET_GPU`, `RESET_ALL_GPUS_NVSWITCHES`, `QUIESCE_GPU_SERVICES`, `RESTORE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS` | Implemented, dispatched signed; the installer's bare default disables reset, the current HyperPod production installation enables it explicitly |
-| Fabric Manager repair | `RESTART_FABRIC_MANAGER` | Implemented; the node side has an independent switch, the current HyperPod production installation enables it explicitly, and it verifies no compute client before execution and that the service is active after execution |
+| Fabric Manager repair | `RESTART_FABRIC_MANAGER` | Implemented; the node side has an independent switch, the current HyperPod production installation enables it explicitly, and it verifies no compute client before execution and that the service is active after execution. On a Hopper NVSwitch node whose fabric is graded a restart alone loses the fabric state, so XID 45's `RESTART_FM` is the full GPU + NVSwitch reset chain there; a per-GPU reset's quiesce window keeps Fabric Manager running |
 | Node-level repair | `RESTART_NODE` (HyperPod `BatchRebootClusterNodes`) | Implemented, controlled by `ALLOW_HYPERPOD_REBOOT`; the current regional data-plane production manifest sets it to true |
 | Software-plane repair | `REMEDIATE_EFA_DRIVER`, `RESTART_EFA_DEVICE_PLUGIN`, `RESTART_GPU_DEVICE_PLUGIN` | Implemented; the Node installer allows EFA driver remediation by default, and an explicit `--disable-efa-driver-remediation` both disables the permission and removes its operation; does not bypass the Profile, signature and workload-stop gates |
 | Site-script repair | `REMEDIATE_DRIVER`, `UPDATE_SOFTWARE_FIRMWARE` | Implemented but configuration-gated; not added to workflows by default, the applicable SXIDs, target version, absolute-path command and SHA-256 must be configured explicitly |
@@ -610,7 +610,7 @@ not a single condition inside an action:
 
 - `VERIFY_NO_GPU_CLIENTS`: re-checks compute clients and device file holders.
   This is the **only** operation allowed on the node side **by default**.
-- `QUIESCE_GPU_SERVICES` / `RESTORE_GPU_SERVICES`: stop/start the local GPU services as a pair before and after a reset.
+- `QUIESCE_GPU_SERVICES` / `RESTORE_GPU_SERVICES`: stop/start the local GPU services as a pair before and after a reset; a per-GPU reset's window keeps Fabric Manager running (stopping it loses the NVLink fabric state).
 - GPU reset is **off by default**, and occupancy is checked once more before execution (check at submission + re-check before execution).
 - The warm spare side checks the same way: "active gpu resource pods exist" / "active gpu clients"
   are classified as a `CONFIGURATION` reason and deferred, not treated as a hardware fault.

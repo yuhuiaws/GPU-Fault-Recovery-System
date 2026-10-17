@@ -794,6 +794,28 @@ nothing read the field. A healthy node reads 3/0.
   (`GPU_FAULT_GPU_METRICS_SILENT_AFTER_SECONDS`, 420 s) is not judged. Nothing reported is not judged: an exporter without the
   field, an ungraded part, an older Agent, a unit systemd does not enable. So a node whose Fabric Manager is still failed after
   a reboot or reset no longer gets its scheduling back (the COLLECT-015 shape); it climbs the ladder instead.
+- **Fabric Manager restart (XID 45)**: a solo XID 45 finalizes as the catalog's `RESTART_FM`. On a node whose latest
+  samples are graded (`graded_fabric_gpus`: a Hopper SXM part whose field 170 reports a fabric state), a Fabric Manager
+  restart alone loses the fabric state as well, so `fabric_manager_restart_inventory` in `orchestration/workflow_builder.py`
+  compiles NVIDIA's H100-and-later procedure on the graded GPUs -- the fatal trunk SXID's chain: `FREEZE_EVIDENCE →
+  MARK_UNSCHEDULABLE → [CHECKPOINT_WORKLOADS] → [STOP_WORKLOADS] → QUIESCE_GPU_SERVICES (a full-reset window: Fabric
+  Manager is stopped) → VERIFY_NO_GPU_CLIENTS → RESET_ALL_GPUS_NVSWITCHES (fabric_partition
+  <cluster>/<node>/local-nvswitch, xid 45) → RESTORE_GPU_SERVICES (starts it) → VALIDATE_GPU → VALIDATE_FABRIC →
+  RESTORE_SCHEDULING → [RESTART_WORKLOAD]`. The graded inventory stands in for an SXID's partition and participating GPUs
+  in the evidence gate; the workflow and incident keep `official_action=RESTART_FM`, and the fabric reset's completion
+  notification replaces the Fabric Manager restart mail. Every other node -- no field 170, a part that is not graded (L40S,
+  PCIe/NVL, Blackwell, NVL72), a NotSupported single GPU -- keeps `FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER`, and a
+  workflow compiled before the release keeps its two steps.
+- **Lost fabric state**: on a graded node VALIDATE_GPU also fails `nvlink_fabric_state_lost(step <q> stopped
+  nvidia-fabricmanager, step <r> reset GPUs individually; no full GPU + NVSwitch reset or reboot since)`
+  (`fabric_state_loss` in `gpu_fabric_window.py`): the workflow's successful steps on the node, walked in the order they
+  finished, show a QUIESCE whose receipt stopped Fabric Manager (`active_services` in `node_results`, else the lifted
+  `stopped_services`, and no `kept_services` entry for it) followed by a successful RESET_GPU, with no
+  RESET_ALL_GPUS_NVSWITCHES, RESTART_NODE or REPLACE_NODE of the node since. A later window that kept Fabric Manager does
+  not clear an earlier loss; a receipt that names no services says nothing. No NVIDIA field reports multicast-team health
+  (the per-GPU fabric state and unicast P2P stay healthy), so the guard reads the product's own evidence: it covers Agents
+  that predate `fabric_manager=keep` during a rolling upgrade and any later path that stops Fabric Manager. The ladder then
+  climbs to the reboot, whose own VALIDATE_GPU passes.
 - **DCGM diagnostic**: the software test's Fabric Manager message (`DCGM_FR_FABRIC_MANAGER_TRAINING_ERROR`, 112, severity CONFIG
   in DCGM's table; the variants training not started, training in progress, Training completed with an error, unknown fabric
   manager state) is never configuration-only: the run grades FAIL and the DRAIN successor holds the node; the summary and the
@@ -1229,7 +1251,7 @@ After a proactive event enters the Orchestrator:
 The Orchestrator itself does not call node or cloud APIs.
 
 GPU service quiesce is executed by the signed Node Agent. Before stopping services the Agent records the services that were originally active and
-creates a systemd transient timer, then stops kubelet, DCGM and Fabric
+creates a systemd transient timer, then stops kubelet, DCGM and -- unless the window keeps it running (below) -- Fabric
 Manager in reverse dependency order. The timer calls an independent recovery entry point that does not depend on the control plane or kubelet; when a reset, an Agent request or an explicit
 restore fails midway, the state file and the timer are kept and retried periodically. Recovery only starts the services that were active before the quiesce,
 verifies each one is active, then cancels the timer and deletes the state. Service names and process names use a strict allowlist
@@ -1257,6 +1279,47 @@ reason. The QUIESCE result records each GPU's `persistence_mode` before and afte
 RESET receipt each reset call's record in `physical_calls` (paired in order with `physical_ownership_checks`) carries the
 targets' `target_persistence` and the other GPUs' `non_target_persistence_modes` as its final permit checkpoint read them.
 Every record is bounded in count and length.
+
+**Fabric Manager across the window (`src/gpu_fault/gpu_fabric_window.py`).** Stopping `nvidia-fabricmanager` loses the
+fabric state, and once it runs again every GPU in the NVLink fabric needs a reset (NVIDIA Fabric Manager User Guide,
+"Stopping Fabric Manager"). The quiesce used to stop it in every window, so a window that reset one GPU left the restored
+Fabric Manager knowing that GPU alone. Live (plain EKS p5en, 8 x H200 SXM on 4 NVSwitches, driver 580.178.04, NVLink Inband
+and ALI) its log then said `failed to find the member GPU handle <n> in partition -1 in the multicast team setup request`
+and "All GPUs in the partition need to be reset to recover": every NVLink multicast team with one of the other seven GPUs
+failed and the node lost NVLS, while unicast P2P and DCGM field 170 still read healthy (NCCL up to 2.26 and from 2.29 fails
+at init with `NCCL_NVLS_ENABLE` at its default; 2.27/2.28 fall back silently and can hang a multi-node job). From Hopper on,
+an NVSwitch system resets one GPU while Fabric Manager runs (the guide: "a GPU can be individually reset"; the `nvidia-smi`
+man page: "the dependency on Fabric Manager to facilitate reset is removed"), and with NVLink Inband Fabric Manager does
+not open the GPUs at all (live: it holds only `/dev/nvidia-nvswitch*`, `/dev/nvidia-nvlink` and `nvidia-cap0`, never
+`/dev/nvidia[0-7]`). Hence:
+
+- **The window's policy**: the node-action adapter reads the QUIESCE's window off the persisted plan -- the steps after it
+  on its own branch (`branch_id`, none in a flat plan) that act on one of its nodes, up to the matching
+  RESTORE_GPU_SERVICES, whatever their status (`window_operations`) -- and when the window's only GPU-state change is
+  RESET_GPU (VERIFY_NO_GPU_CLIENTS beside it) adds `fabric_manager: keep` to the QUIESCE command's parameters
+  (`fabric_manager_policy`, `quiesce_command_parameters`; a value the plan already carries is sent as it is). Every other
+  window keeps the stop and the start: the full GPU + NVSwitch reset, a driver or firmware remediation, the NVLink74 field
+  diagnostic, a reboot handoff, any operation not listed, a window without its RESTORE on the branch (one handed to a
+  successor) or with a second QUIESCE first. The plan's structure, never live state, decides it, so every send of one
+  QUIESCE carries the same body: the Agent compares the parameter digest under a reused `command_id` and answers another
+  body with 409 `COMMAND_ID_REUSED` (§2.12). The policy is product-agnostic on purpose: the persisted plan names no GPU
+  product, a node without NVSwitches runs no Fabric Manager to keep, every supported NVSwitch type is Hopper or later
+  (`gpu_instance_inventory.py`), and VERIFY_NO_GPU_CLIENTS still fails closed should Fabric Manager ever hold a target
+  GPU's device node.
+- **On the Agent**: the parameter absent means stop it, as every Agent always has; `keep` keeps it; any other value fails
+  the QUIESCE before anything stops (`fabric_manager_kept`). A running Fabric Manager the window keeps is in neither
+  `active_services` nor `inactive_services` but in `kept_services` with its reason (one list with the persistence daemon
+  unit's entry above), so no restore -- the RESTORE step, the fail-safe timer, the boot reconcile -- starts a second
+  instance that would know only the GPUs the window reset; one that is not running is `inactive_services` as before. The
+  QUIESCE receipt, an already-QUIESCED answer and the RESTORE result carry `kept_services`, and the step lifts it per node
+  into its details beside `stopped_services`. A full GPU + NVSwitch reset or a driver/firmware install that meets a kept
+  window -- possible only when a preempting successor adopts it -- is refused before it touches the node
+  (`refuse_kept_fabric_manager`: `<operation> needs nvidia-fabricmanager stopped, and this quiesce window kept it running
+  for a per-GPU reset; ...`): those need Fabric Manager down (NVIDIA's order for H100 and later is stop Fabric Manager,
+  `nvidia-smi -r`, start Fabric Manager), the window's single reset stays unclaimed, the window is restored as planned and
+  the ladder's reboot re-registers the fabric.
+- **An Agent that predates the parameter** ignores it and still stops Fabric Manager; on a graded Hopper NVSwitch node
+  VALIDATE_GPU then fails it as `nvlink_fabric_state_lost` (§2.4.1) and the ladder reboots it.
 
 When the driver refuses the reset "In use by another client" and no process holds the target GPU, the Agent unloads the
 idle display stack after the first busy refusal (`nvidia_drm` at refcount 0, then `nvidia_modeset`), retries at once and
@@ -1906,6 +1969,14 @@ The outcome is the RESTORE step details' `fabric_manager_start` (`unit`, `state_
 `state_after`, `active`, and `output_tail` or `error`) and never a restore failure: VALIDATE_GPU judges whether the fabric
 trained (§2.4.1), and an untrained fabric climbs the ladder. A single-GPU reset's window notes no scope and its restore still
 starts only what the quiesce stopped; an older Agent's claim carries no note and reads as no scope too.
+
+A QUIESCE's `parameters.fabric_manager` is its window's Fabric Manager policy (§2.9; the names are
+`QUIESCE_FABRIC_MANAGER_PARAMETER` and `QUIESCE_FABRIC_MANAGER_KEEP` in `node_agent/protocol.py`): absent stops Fabric
+Manager, `keep` keeps it running, any other value fails the QUIESCE before anything stops (`fabric_manager_kept`), so a plan
+this Agent does not understand never half-applies; an Agent that predates the parameter ignores it. The parameter is part
+of the command body, so the ledger's parameter digest binds it to the `command_id` like every other parameter (item 7
+above). `_execute_reset_all` and the driver/firmware remediation fence refuse to run in a window that kept Fabric Manager
+(`refuse_kept_fabric_manager`), before the reset claim, so the refusal never spends the window's one reset.
 
 `COLLECTOR_OUTBOX_MAINTENANCE` is the 16th node-action operation and performs metadata-only maintenance:
 the administrator command `gpu-fault-admin collector-outbox` dispatches inspection/requeue of the node-local `gpu-fault-collector outbox`

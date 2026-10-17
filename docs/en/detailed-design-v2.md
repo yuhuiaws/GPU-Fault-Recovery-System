@@ -3493,7 +3493,7 @@ sequenceDiagram
     Note over A: /proc/<pid>/io mixes in already-reaped child processes; the reading must filter by currently live pids
     A-->>D: SUCCEEDED (no clients)
     D->>A: QUIESCE_GPU_SERVICES
-    A->>A: stop 7 units + 3 containers, write state to quiesce-*.json
+    A->>A: stop 6 units + 3 containers, keep Fabric Manager for the per-GPU reset, write state to quiesce-*.json
     A-->>D: SUCCEEDED + failsafe_seconds
     D->>D: record maintenance_window_expires_at = now + min(420s, failsafe_seconds)
     D->>A: RESET_GPU(command_id, fencing_token, ttl)

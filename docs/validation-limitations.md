@@ -722,3 +722,22 @@ and denominator remain intact.
 The explored coordinator is not adopted under this boundary; its unresolved
 platform requirements are recorded in
 [Atomic Ownership Fence Design](components/atomic-ownership-fence-design.md).
+
+## NVLink fabric state across GPU resets
+
+No NVIDIA counter exposes multicast-team health: after Fabric Manager is
+stopped and started around a per-GPU reset, `nvidia-smi -q` Fabric State and
+Status, DCGM field 170 and unicast P2P keep reading healthy while every NVLink
+multicast team with a GPU the restarted instance does not know fails (NVLS
+lost for the node). The product therefore detects a lost fabric state only
+through its own quiesce evidence: VALIDATE_GPU's `nvlink_fabric_state_lost`
+reads which window stopped Fabric Manager and what it reset. A Fabric Manager
+restart outside the product (an operator, systemd restarting a crashed unit)
+is not detected, and nothing re-validates a node between workflows. The Fabric
+Manager log collector forwards SXid lines only; turning its "failed to find the
+member GPU handle ... multicast team setup request" and "All GPUs in the
+partition need to be reset to recover" lines into a node-level finding is a
+proposal, not implemented. The keep-running policy is verified by unit tests
+with fake systemd runners and the live precondition (with NVLink Inband Fabric
+Manager holds no `/dev/nvidia[0-7]`) on Hopper HGX only; Blackwell NVSwitch
+nodes are covered by the same NVIDIA rule but were not observed live.

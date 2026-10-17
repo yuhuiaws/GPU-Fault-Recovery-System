@@ -579,6 +579,10 @@ rules:
       - tests/orchestration/test_fabric_manager_plan.py
       - tests/node_agent/test_dcgm_fabric_manager_diagnostic.py
       - tests/regional/test_dataplane_dcgm_counters.py
+      - tests/execution/test_quiesce_fabric_manager_policy.py
+      - tests/execution/test_validation_fabric_state_loss.py
+      - tests/orchestration/test_fabric_manager_restart_plan.py
+      - tests/node_agent/test_quiesce_fabric_manager_keep.py
     regional_cases:
       - GF-REGIONAL-COLLECT-001..020
     checks:
@@ -597,6 +601,7 @@ rules:
     pytest:
       - tests/node_agent
       - tests/fleet/test_dcgm_hostengine_heartbeat.py
+      - tests/execution/test_quiesce_fabric_manager_policy.py
       - tests/deploy/test_node_installer_security.py
       - tests/regional/test_dataplane_rbac_security.py
       - tests/regional/test_production_safety_config.py

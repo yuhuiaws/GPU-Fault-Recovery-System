@@ -7184,7 +7184,7 @@ these parameters do not replace the managed release, node identity or maintenanc
 | `--allow-efa-driver-remediation` | No | true (the installer default is already on; the parameter is only an explicit confirmation) | Allows rebinding the EFA PCI driver after workloads stop; the actual action still requires the workload, Profile and signing gates |
 | `--disable-efa-driver-remediation` | No | false | Explicitly disables EFA PCI driver rebinding and removes `REMEDIATE_EFA_DRIVER` from the node allowlist |
 | `--allow-firmware-update` | No | false | Allows explicitly mapped SXID firmware updates; must be given together with `--firmware-update-command`/`-sha256`, `--target-firmware-version`, `--firmware-verify-command`/`-sha256` |
-| `--quiesce-services` | No | `nvidia-fabricmanager,nvidia-dcgm,nvidia-persistenced,gpu-fault-gpu-persistence,gpu-fault-metrics-collector,gpu-fault-host-collector,kubelet` (7 items) | Restored in this order, stopped in reverse; the complete default is also in §7.5 |
+| `--quiesce-services` | No | `nvidia-fabricmanager,nvidia-dcgm,nvidia-persistenced,gpu-fault-gpu-persistence,gpu-fault-metrics-collector,gpu-fault-host-collector,kubelet` (7 items) | Restored in this order, stopped in reverse; a per-GPU reset window keeps a running `nvidia-fabricmanager` (Phase C, item 10); the complete default is also in §7.5 |
 | `--quiesce-processes` | No | NVIDIA/DCGM base processes | Sends TERM by exact process name |
 | `--quiesce-containers` | No | `aws-hyperpod/health-monitoring-agent,gpu-fault-system/exporter,kube-system/nvidia-device-plugin-ctr` | Kubernetes `namespace/container` selectors stopped during quiesce |
 | `--container-stop-timeout` | No | 30 seconds | Container graceful-stop timeout |
@@ -7406,6 +7406,9 @@ The companion window of XID 45 is fixed by the current NVIDIA Catalog's
 `companionWindowSeconds=30`. The first report returns `PENDING_CORRELATION`, with no
 incident/workflow at that point. You can query the window deadline, lease and final
 decision via `GET /v1/gpu-events/xid/<event-id>/correlation`. HA deployments must use PostgreSQL; SQLite is only for a single replica.
+A solo XID 45 finalizes as `RESTART_FM`: on a Hopper NVSwitch node whose latest DCGM samples are graded (field 170 on a
+Hopper SXM part) the plan is the full GPU + NVSwitch reset chain, because a Fabric Manager restart alone loses the fabric
+state; elsewhere it stays FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER (Phase C, item 10).
 
 <a id="82-adapter-与-owner"></a>
 ### 6.2 Adapters and Owners
@@ -9493,6 +9496,26 @@ Do not delete `${MIGRATION_STATE}` when the migration or verification fails; aft
 8. Make the reset and the explicit restore fail separately, confirming the fail-safe timer is kept and retries; after a successful recovery
    the timer is cancelled and the state file deleted.
 9. Verify the three gates -- GPU, host and fabric -- after the reset.
+10. Fabric Manager in the window: on an NVSwitch node a per-GPU reset window keeps `nvidia-fabricmanager` running -- the
+    QUIESCE step's details list it under `kept_services`, not `stopped_services`; `systemctl show -p
+    MainPID,ExecMainStartTimestamp nvidia-fabricmanager` is unchanged across the window and the RESTORE does not start it.
+    A full-fabric window (`RESET_ALL_GPUS_NVSWITCHES`, also XID 45's `RESTART_FM` on a graded Hopper node) still stops it
+    before `nvidia-smi -r` and starts it after. After a per-GPU reset, an 8-GPU NCCL job with `NCCL_NVLS_ENABLE=1` must
+    initialise NVLS, and the node's Fabric Manager log must carry no `multicast team setup request` or `All GPUs in the
+    partition need to be reset to recover` line. To recover a node whose fabric state was lost (VALIDATE_GPU
+    `nvlink_fabric_state_lost`, administrator operations §7) by hand: on the drained node stop the CUDA applications and
+    the GPU services including Fabric Manager, run `nvidia-smi -r`, start Fabric Manager and the services -- or reboot;
+    never restart Fabric Manager alone.
+
+Upgrade note (Fabric Manager in the quiesce window): the release is `DATA_PLANE_COMPATIBLE` -- the control-plane, executor and
+node_runtime wheels change (the control-plane roles roll; executor, completion-watcher and kubernetes-node-resource-collector on
+every GPU cluster; Node Agent waves on every GPU node); every release-identity file set and the Agent config digest are unchanged.
+During the roll: a new executor with an Agent not yet upgraded sends `fabric_manager=keep`, the old Agent ignores it and stops
+Fabric Manager, and on a graded node the new VALIDATE_GPU fails `nvlink_fabric_state_lost` and the ladder reboots the node (its
+fabric is consistent again); a new Agent with an old executor gets no parameter and stops Fabric Manager as before; a QUIESCE
+first sent by an older executor and re-sent by a newer one after a retryable Agent failure has another body and is answered
+409 `COMMAND_ID_REUSED` (manual confirmation; a narrow window, so let open quiesce windows finish before the executor roll
+where practical); an XID 45 workflow compiled before the control-plane roll keeps its two steps.
 
 #### Phase C.0: XID 74 NVLink Workflow
 
