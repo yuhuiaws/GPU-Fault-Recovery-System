@@ -41,6 +41,8 @@ import time
 from collections.abc import Callable
 from typing import Any
 
+from gpu_fault.cluster_scope import DCGM_HOSTENGINE_UNIT
+
 __all__ = [
     "RECOVERY_BUDGET_SECONDS",
     "recover_host_engine",
@@ -48,8 +50,6 @@ __all__ = [
 
 LOGGER = logging.getLogger(__name__)
 
-#: The host DCGM engine's unit (the DCGM 4 package's ``nvidia-dcgm``).
-DCGM_HOSTENGINE_UNIT = "nvidia-dcgm"
 #: How long the engine may take to answer ``dcgmi discovery -l`` after the start.
 RECOVERY_BUDGET_SECONDS = 30.0
 DISCOVERY_INTERVAL_SECONDS = 2.0

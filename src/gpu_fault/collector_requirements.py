@@ -17,6 +17,7 @@ from gpu_fault.collector_kinds import (
 from gpu_fault.collector_kinds import (
     collector_silent_thresholds as collector_silent_thresholds,
 )
+from gpu_fault.cluster_scope import DCGM_HOSTENGINE_UNIT
 from gpu_fault.env import env_bool
 from gpu_fault.models import StrictModel
 from gpu_fault.telemetry import CollectorKind
@@ -82,11 +83,18 @@ class CollectorServiceState(StrictModel):
         }
 
 
+#: The units an Agent record keeps from its heartbeat: the collectors, and the
+#: host DCGM engine every Agent reports beside them (``status`` shows it live).
+#: A heartbeat may name any unit -- ``ReportedCollectorServices`` takes them
+#: all, and the signature covers them -- so a unit only a newer Agent reports
+#: is verified and then dropped here, by this control plane or an older one.
+RECORDED_UNITS = frozenset({*COLLECTOR_SYSTEMD_UNITS.values(), DCGM_HOSTENGINE_UNIT})
+
+
 def validate_collector_services(value):
     if not isinstance(value, dict):
         return value
-    known_units = set(COLLECTOR_SYSTEMD_UNITS.values())
-    return {unit: state for unit, state in value.items() if unit in known_units}
+    return {unit: state for unit, state in value.items() if unit in RECORDED_UNITS}
 
 
 CollectorServices = Annotated[

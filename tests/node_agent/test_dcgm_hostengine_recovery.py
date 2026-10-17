@@ -365,6 +365,45 @@ def test_embedded_mode_never_touches_the_engine(tmp_path: Path) -> None:
     assert host.commands == [DIAG] and sleeps == []
 
 
+def test_a_quiesce_opening_during_the_recovery_stops_it_at_the_next_spawn(
+    tmp_path: Path,
+) -> None:
+    """The window check and the start are two spawns apart: a QUIESCE of another
+    incident that opens in between flags the diagnostic, which then stops before
+    its next spawn -- no verdict, retryable -- and the quiesce stops whatever it
+    finds active, the restore starts it again."""
+
+    host = EngineHost(state="failed")
+    agents: list[Any] = []
+
+    def opening(value, **kwargs):
+        completed = host(value, **kwargs)
+        if value == ["systemctl", "start", UNIT]:
+            agents[0].gpu_activity.open_window("incident-other")
+        return completed
+
+    agents.append(
+        node_action_executor(
+            tmp_path,
+            "race.db",
+            allowed_operations={DIAGNOSTIC},
+            diagnostic_output_dir=str(tmp_path / "race"),
+            runner=opening,
+            cluster_provider="eks-managed",
+            dcgm_hostengine="host",
+            sleep=lambda _seconds: None,
+            gpu_activity_drain_seconds=0,
+        )
+    )
+
+    result = agents[0].execute(envelope(command(DIAGNOSTIC)))
+
+    assert result.status is NodeActionStatus.FAILED
+    assert result.retryable is True, "it runs again once the window is closed"
+    assert result.details["gpu_activity_overlapped_by"] == "incident-other"
+    assert DISCOVERY not in host.commands, "stopped before its next spawn"
+
+
 def test_a_missing_dcgmi_is_never_installed(tmp_path: Path) -> None:
     calls: list[list[str]] = []
 

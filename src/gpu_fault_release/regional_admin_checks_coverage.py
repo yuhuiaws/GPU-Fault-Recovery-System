@@ -19,6 +19,14 @@ an Agent by itself once the node is proven gone).
 The same ledger is what ``status`` prints as its departed-node finding
 (``departed_node_lines``): every departed node the cleanup knows, cleaned or
 pending, with the blocker and the manual command where one is needed.
+
+Every Agent also reports its node's host DCGM engine (``nvidia-dcgm``) in each
+heartbeat, so the probe's Agent records carry it live; ``status --full`` shows
+it per cluster as ``dcgm_hostengine_live`` (``annotate_dcgm_hostengine_live``)
+and the header names the host-mode nodes whose engine is down and the
+embedded-mode nodes running one (``dcgm_hostengine_lines``) -- unlike the node
+preflight's ``node_scope.dcgm_hostengine_nodes``, which is the observation of
+the last deploy or join.
 """
 
 from __future__ import annotations
@@ -27,7 +35,10 @@ from collections.abc import Mapping
 from typing import Any
 
 from gpu_fault.cluster_scope import (
+    DCGM_HOSTENGINE_UNIT,
     HYPERPOD_CLUSTER_LABEL,
+    DcgmHostEngine,
+    dcgm_hostengine,
     is_eks_managed,
     node_selector,
     node_selector_source,
@@ -223,6 +234,112 @@ def annotate_kubernetes_nodes(
         cluster = clusters.get(cluster_id)
         if isinstance(cluster, dict):
             cluster["kubernetes_node_ids"] = sorted(node_ids)
+
+
+#: The engine states that count as running, and the enablement that starts it
+#: at boot: an embedded-mode node with either runs (or will run) a second
+#: engine next to the exporter's, the node preflight's conflict.
+RUNNING_ENGINE_STATES = frozenset({"active", "activating", "reloading"})
+BOOT_ENABLED_STATES = frozenset({"enabled", "enabled-runtime"})
+NOT_REPORTED = "not reported"
+
+
+def dcgm_hostengine_live(cluster: Mapping[str, Any], mode: str) -> dict[str, Any]:
+    """Every counted Agent's host DCGM engine as its last heartbeat reported it.
+
+    ``nodes`` maps each node to the unit's ``active``/``enabled`` answers and
+    the heartbeat time (``reported_at``); an Agent older than the report, or a
+    control plane that does not keep it yet, gives ``not reported``. In host
+    mode the nodes whose engine is not active are ``down_nodes``; in embedded
+    mode the nodes whose host engine runs or starts at boot are
+    ``conflict_nodes``.
+    """
+
+    nodes: dict[str, dict[str, Any]] = {}
+    for agent in counted_agents(dict(cluster)):
+        services = agent.get("collector_services")
+        state = (
+            services.get(DCGM_HOSTENGINE_UNIT) if isinstance(services, dict) else None
+        )
+        entry: dict[str, Any] = {"active": NOT_REPORTED}
+        if isinstance(state, Mapping):
+            entry = {
+                "active": str(state.get("active") or "unknown"),
+                "enabled": str(state.get("enabled") or "unknown"),
+            }
+        entry["reported_at"] = agent.get("last_seen_at")
+        nodes[str(agent.get("node_id"))] = entry
+    reported = {
+        name: entry for name, entry in nodes.items() if entry["active"] != NOT_REPORTED
+    }
+    live: dict[str, Any] = {
+        "mode": mode,
+        "unit": DCGM_HOSTENGINE_UNIT,
+        "nodes": dict(sorted(nodes.items())),
+        "not_reported_nodes": sorted(set(nodes) - set(reported)),
+    }
+    if mode == DcgmHostEngine.HOST.value:
+        live["down_nodes"] = sorted(
+            name for name, entry in reported.items() if entry["active"] != "active"
+        )
+    else:
+        live["conflict_nodes"] = sorted(
+            name
+            for name, entry in reported.items()
+            if entry["active"] in RUNNING_ENGINE_STATES
+            or entry.get("enabled") in BOOT_ENABLED_STATES
+        )
+    return live
+
+
+def annotate_dcgm_hostengine_live(report: dict[str, Any], targets: Any) -> None:
+    """Record ``dcgm_hostengine_live`` on each of the report's clusters, in place,
+    judged by the cluster's mode (``targets``: the site's cluster targets)."""
+
+    clusters = report.get("clusters")
+    if not isinstance(clusters, dict):
+        return
+    for target in targets:
+        cluster = clusters.get(target.cluster_id)
+        if isinstance(cluster, dict):
+            cluster["dcgm_hostengine_live"] = dcgm_hostengine_live(
+                cluster, dcgm_hostengine(target).value
+            )
+
+
+def _engine(live: Mapping[str, Any], name: str) -> str:
+    entry = (live.get("nodes") or {}).get(name) or {}
+    return f"{name} {entry.get('active', 'unknown')}/{entry.get('enabled', 'unknown')}"
+
+
+def dcgm_hostengine_lines(report: Mapping[str, Any]) -> list[str]:
+    """The ``status`` finding of the live host DCGM engines (``control_api``):
+    one line per cluster with a host-mode engine down or an embedded-mode node
+    running one; nothing when every reporting node is as its mode wants."""
+
+    clusters = report.get("clusters")
+    lines: list[str] = []
+    for cluster_id, cluster in sorted(
+        (clusters if isinstance(clusters, dict) else {}).items()
+    ):
+        live = (
+            cluster.get("dcgm_hostengine_live") if isinstance(cluster, dict) else None
+        )
+        if not isinstance(live, dict):
+            continue
+        down = [str(item) for item in live.get("down_nodes") or []]
+        conflict = [str(item) for item in live.get("conflict_nodes") or []]
+        if down:
+            lines.append(
+                f"DCGM host engine down on {cluster_id} (host mode, Agent heartbeats): "
+                + ", ".join(_engine(live, name) for name in down)
+            )
+        if conflict:
+            lines.append(
+                f"DCGM host engine next to the embedded one on {cluster_id} (Agent "
+                "heartbeats): " + ", ".join(_engine(live, name) for name in conflict)
+            )
+    return lines
 
 
 def counted_agents(cluster: dict[str, Any]) -> list[dict[str, Any]]:

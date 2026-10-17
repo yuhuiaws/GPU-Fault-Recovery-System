@@ -39,6 +39,7 @@ __all__ = [
     "CONNECTION_SECRET_PROVIDER_KEY",
     "DCGM_HOSTENGINE_ENV",
     "DCGM_HOSTENGINE_LABEL",
+    "DCGM_HOSTENGINE_UNIT",
     "DcgmHostEngine",
     "DcgmHostEngineSource",
     "EKS_MANAGED_FAILURE_DOMAIN_LABELS",
@@ -119,6 +120,10 @@ OWNERSHIP_LABEL = "gpu-fault.io/control-plane"
 #: membership: deploy and join re-read it every time. The same key marks the
 #: rendered exporter DaemonSet's variant.
 DCGM_HOSTENGINE_LABEL = "gpu-fault.io/dcgm-hostengine"
+#: The host DCGM engine's systemd unit (the DCGM 4 package's ``nvidia-dcgm``,
+#: nv-hostengine): what a host-mode Agent starts once when its quick diagnostic
+#: finds the engine down, and what every Agent reports in its heartbeat.
+DCGM_HOSTENGINE_UNIT = "nvidia-dcgm"
 #: The cluster's DCGM host engine mode as the node installer, the node
 #: installer reconciler and the Node Agent read it; set on ``eks-managed``
 #: clusters only, so a HyperPod node's environment stays byte for byte the same.

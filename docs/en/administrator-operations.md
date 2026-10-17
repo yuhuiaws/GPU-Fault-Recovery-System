@@ -2179,7 +2179,8 @@ order and without pausing between them:
    installed mode disagrees with the record) and `node_scope.dcgm_hostengine_conflict_nodes`, and `host-active` for every
    node in `node_scope.dcgm_hostengine_nodes`; in `gpu-fault-admin node-scope --state-dir <dir>` every cluster's
    `dcgm_hostengine` (`recorded`/`source`/`declared`/`state`/`refusal`) shows `state=converged` -- `pending deploy` means the
-   node groups' declaration changed and no deploy has run yet, `blocked` carries the refusal.
+   node groups' declaration changed and no deploy has run yet, `blocked` carries the refusal. Live, the `control_api`
+   check's `clusters.<id>.dcgm_hostengine_live.down_nodes` is empty (below, "Live engine state").
 
 The node preflight classifies every `eks-managed` GPU node's DCGM state into one row of the table below and records it in
 the `dcgm` object of its JSON verdict (`mode`, `state`, whether `nvidia-dcgm` is active/enabled, whether `dcgmi` and
@@ -2224,6 +2225,18 @@ tail); a recovery not attempted carries its `reason`. The Agent's journal logs `
 attempt. An embedded-mode node is never touched. Together with the restart drop-in of the launch template (§5.0.1,
 §5.0.1a) an engine that exits is restarted by systemd itself; the Agent's start covers what systemd gave up on and nodes
 without the drop-in (HyperPod, hand-built images).
+
+**Live engine state in `status --full`.** Every Agent reports `nvidia-dcgm` (`systemctl is-active`/`is-enabled`) in each
+heartbeat beside its collector units, and `status --full` shows it per cluster as
+`health.checks[control_api].details.clusters.<id>.dcgm_hostengine_live`: `mode`, `nodes` (per node `active`, `enabled`
+and `reported_at`, the heartbeat time; `not reported` for an Agent of an older release), in host mode `down_nodes` (the
+engine is not active) and in embedded mode `conflict_nodes` (an engine running or enabled next to the exporter's
+embedded one), and `not_reported_nodes`. The status header adds one line per cluster with such a node, for example
+`DCGM host engine down on <cluster> (host mode, Agent heartbeats): <node> failed/enabled`. This view is as fresh as the
+last heartbeat (about 30 s), unlike `node_scope.dcgm_hostengine_nodes` (the last node preflight's observation). It rides
+in the heartbeat's existing unit map, which has always taken any unit: a control plane of an older release verifies the
+heartbeat and drops the entry, an Agent of an older release has none -- no protocol or version change, and a
+mixed-version fleet shows `not reported` for the older Agents until they are upgraded.
 
 A host-mode refusal lists every item of every node in one `ERROR: host prerequisites unavailable: ...` pointing back here.
 In embedded mode (no label) a host engine next to the exporter's embedded one -- running, active/activating or enabled

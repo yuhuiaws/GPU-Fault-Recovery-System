@@ -55,6 +55,7 @@ rules:
       - tests/admin/_eks_nodegroup_world.py
       - tests/admin/test_admin_eks_nodegroup_*.py
       - tests/regional/test_regional_admin_checks_node_scope.py
+      - tests/regional/test_regional_admin_checks_dcgm_live.py
       - tests/admin/test_admin_site_eks_managed.py
       - tests/admin/test_admin_eks_managed_join.py
       - tests/admin/test_admin_eks_managed_lifecycle.py
@@ -72,6 +73,7 @@ rules:
       - tests/admin/test_admin_eks_nodegroup_nodes.py
       - tests/admin/test_admin_eks_nodegroup_checks.py
       - tests/regional/test_regional_admin_checks_node_scope.py
+      - tests/regional/test_regional_admin_checks_dcgm_live.py
       - tests/admin/test_admin_site_eks_managed.py
       - tests/admin/test_admin_eks_managed_join.py
       - tests/admin/test_admin_eks_managed_lifecycle.py
@@ -532,10 +534,12 @@ rules:
       - tests/collectors/**
       - tests/policy/**
       - tests/nvidia_logs/**
+      - tests/fleet/test_dcgm_hostengine_heartbeat.py
     pytest:
       - tests/collectors
       - tests/policy
       - tests/nvidia_logs
+      - tests/fleet/test_dcgm_hostengine_heartbeat.py
     regional_cases:
       - GF-REGIONAL-COLLECT-001..020
     checks:
@@ -553,6 +557,7 @@ rules:
       - tests/node_agent/**
     pytest:
       - tests/node_agent
+      - tests/fleet/test_dcgm_hostengine_heartbeat.py
       - tests/deploy/test_node_installer_security.py
       - tests/regional/test_dataplane_rbac_security.py
       - tests/regional/test_production_safety_config.py

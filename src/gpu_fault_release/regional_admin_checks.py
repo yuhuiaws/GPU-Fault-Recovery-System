@@ -416,7 +416,6 @@ def _aws_json(release: Any, arguments: list[str]) -> dict[str, Any]:
     # `regional_contexts` drives, where every GPU cluster attaches the same managed
     # policies. The second of those arrives from a thread pool inside a thread
     # pool, which is what the shared helper's promise-before-read is built for.
-    #
     # It stops at the report boundary on purpose. `_check_nlb_inputs` and
     # `_check_nlb_runtime` both describe the ACM certificate, but they belong to
     # the preflight and the verify report respectively, and the verify report
@@ -1253,6 +1252,7 @@ def _control_api_report(release: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ReleaseError("control API report returned non-object evidence")
     agent_coverage.annotate_kubernetes_nodes(result, kubernetes_nodes)
+    agent_coverage.annotate_dcgm_hostengine_live(result, release.config.clusters)
     return result
 
 

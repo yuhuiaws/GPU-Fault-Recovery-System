@@ -232,6 +232,7 @@
   "tests/regional/test_regional_admin_checks.py:module._hostname_matches": 3,
   "tests/regional/test_regional_admin_checks.py:module._read_snapshot": 4,
   "tests/regional/test_regional_admin_checks.py:release._read_snapshot": 2,
+  "tests/regional/test_regional_admin_checks_dcgm_live.py:CHECKS._control_api_report": 1,
   "tests/regional/test_regional_admin_commands.py:CHECKS._read_snapshot": 1,
   "tests/regional/test_regional_admin_commands.py:release._get_json": 3,
   "tests/regional/test_regional_admin_commands.py:release._load_state": 1,

@@ -16,6 +16,7 @@ from uuid import uuid4
 
 from gpu_fault import __version__
 from gpu_fault.collectors.cadence import CadenceJitter
+from gpu_fault.cluster_scope import DCGM_HOSTENGINE_UNIT
 from gpu_fault.collector_requirements import (
     COLLECTOR_SYSTEMD_UNITS,
     CollectorServiceState,
@@ -41,7 +42,13 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _collector_units() -> list[str]:
-    return sorted(set(COLLECTOR_SYSTEMD_UNITS.values()))
+    """The units every heartbeat reports: the collectors and the host DCGM
+    engine (``DCGM_HOSTENGINE_UNIT``), so ``status`` shows each node's engine
+    live. The heartbeat's unit map takes any unit and a control plane keeps the
+    units it knows: an older one drops the engine's entry, an older Agent
+    simply has none."""
+
+    return sorted({*COLLECTOR_SYSTEMD_UNITS.values(), DCGM_HOSTENGINE_UNIT})
 
 
 class CollectorServiceStates:
