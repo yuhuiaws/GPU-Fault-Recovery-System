@@ -1512,7 +1512,9 @@ Semantics and boundaries of `eks-managed`:
   the rest of the eks render are unchanged; the Agent (`GPU_FAULT_DCGM_HOSTENGINE=host`, written only into an
   eks-managed node's environment and not part of the Agent config digest) returns real verdicts as on HyperPod: a
   missing `dcgmi` or an unreachable host hostengine fails with `DCGM_EXECUTION_REVIEW` (`DRAIN_AND_QUARANTINE`) instead
-  of a configuration warning, and an eks-managed node's diagnostic result carries `dcgm_hostengine`. On a site with an
+  of a configuration warning, and an eks-managed node's diagnostic result carries `dcgm_hostengine`; before it grades an
+  unreachable engine whose `nvidia-dcgm` is down the Agent starts it once (here and on HyperPod; §5.0.1, "The Agent's one
+  start"). On a site with an
   `eks-managed` cluster the plan carries an extra `dcgm_eks_managed` (embedded variant) or `dcgm_eks_managed_host` (host
   variant) document group for the approver.
 - GPU reset quiesce: on HyperPod `QUIESCE_GPU_SERVICES` stops `kubelet` and the host GPU services first, then the
@@ -2202,7 +2204,26 @@ active `nvidia-dcgm` and successful `dcgmi discovery -l` checks and refuses a no
 AMI must ship datacenter-gpu-manager-4 and run `nvidia-dcgm`), so an AMI release without the host engine cannot pass
 silently; a CUDA flavor mismatch or an nv-hostengine outside `nvidia-dcgm.service` is only reported (`WARN`, recorded in
 the state) because the AMI is not the site's to rebuild. HyperPod exporter renders, installer templates and Agent
-environments are unchanged.
+environments are unchanged; HyperPod nodes keep the AMI's package unit (`Restart=on-abort`, no restart drop-in), so the
+Agent's one start below is what brings an engine back there.
+
+**The Agent's one start of an engine that is down (host mode and HyperPod).** When the quick diagnostic
+`dcgmi diag -r 1 -j` reaches no engine (exit status 226 or its connection error text; or any other failure without a
+JSON result while `nvidia-dcgm` is down), the Agent tries one recovery before it grades: only when `systemctl is-active
+nvidia-dcgm` is `inactive` or `failed` (`systemctl reset-failed` first, so a unit systemd gave up on can start, then
+`systemctl start nvidia-dcgm`; `activating`, systemd's own restart under way, is only waited for); only when `systemctl
+is-enabled` says the unit is enabled (a disabled engine -- leaving host mode, below -- and one that is not installed are
+left alone; the Agent never installs packages); never while a quiesce window is open on the node, whichever incident's,
+the diagnostic's own included (the quiesce stopped the engine on purpose and its restore starts it); and an `active`
+engine that does not answer is never restarted. It then waits at most 30 s for `dcgmi discovery -l` and runs the
+diagnostic once more; an engine that still does not answer is graded exactly as before (`DCGM_EXECUTION_REVIEW`). The
+step evidence records what was tried in `hostengine_recovery`: `attempted`, `before_state`/`after_state`
+(`systemctl is-active`), `unit_enabled`, `seconds` and, when attempted, `actions` (`reset-failed`, `start` or `wait`),
+`engine_answers`, `discovery_polls`, `diagnostic_rerun` and `first_attempt` (the first run's exit status and output
+tail); a recovery not attempted carries its `reason`. The Agent's journal logs `DCGM host engine recovery: ...` for each
+attempt. An embedded-mode node is never touched. Together with the restart drop-in of the launch template (§5.0.1,
+§5.0.1a) an engine that exits is restarted by systemd itself; the Agent's start covers what systemd gave up on and nodes
+without the drop-in (HyperPod, hand-built images).
 
 A host-mode refusal lists every item of every node in one `ERROR: host prerequisites unavailable: ...` pointing back here.
 In embedded mode (no label) a host engine next to the exporter's embedded one -- running, active/activating or enabled
@@ -2217,8 +2238,8 @@ of the launch template, run `systemctl disable --now nvidia-dcgm` on the nodes, 
 back to embedded and the Agents are re-installed as embedded). Deploying before disabling does not work: the
 embedded-mode conflict check refuses an `nvidia-dcgm` that is still active or enabled. Between stopping the service and
 that deploy the host-mode exporter has no engine to dial and a host-mode Agent grades the unreachable hostengine a failure
-(`DRAIN_AND_QUARANTINE`), so keep this window short too -- the mirror image of the entering window (enable -> label ->
-deploy), during which two hostengines run.
+(`DRAIN_AND_QUARANTINE`; it never starts a disabled `nvidia-dcgm`, so the disable holds), so keep this window short too --
+the mirror image of the entering window (enable -> label -> deploy), during which two hostengines run.
 
 #### 5.0.1a Automated preparation: `prepare-eks-nodegroup` (AL2023_x86_64_NVIDIA)
 

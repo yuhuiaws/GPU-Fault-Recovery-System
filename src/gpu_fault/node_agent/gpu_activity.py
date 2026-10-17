@@ -148,14 +148,21 @@ class GpuActivityGate:
         self._tokens = 0
         self._local = threading.local()
 
-    def _foreign_windows(self, incident_id: str) -> list[dict[str, Any]]:
+    def open_windows(self) -> list[dict[str, Any]]:
+        """Every quiesce window open on this node, whichever incident's: the
+        QUIESCE calls in progress and the windows on disk (an unreadable state
+        file counts, with no owner)."""
+
         with self._condition:
             opening = [
                 {"incident_id": owner, "phase": "OPENING"} for owner in self._opening
             ]
+        return [*opening, *self._open_windows()]
+
+    def _foreign_windows(self, incident_id: str) -> list[dict[str, Any]]:
         return [
             window
-            for window in [*opening, *self._open_windows()]
+            for window in self.open_windows()
             if window.get("incident_id") != incident_id
         ]
 

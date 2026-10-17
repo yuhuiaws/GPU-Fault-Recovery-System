@@ -20,6 +20,8 @@ from gpu_fault.dcgm_diagnostic_analysis import (
     normalize_dcgm_status,
 )
 from gpu_fault.models import WorkflowOperation
+from gpu_fault.node_agent.gpu_activity import GpuActivityGate
+from gpu_fault.node_agent.operations.hostengine_recovery import recover_host_engine
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
@@ -83,14 +85,20 @@ DCGM_UNAVAILABLE_GUIDANCE = {
 }
 
 
-def dcgm_hostengine_unreachable(result: subprocess.CompletedProcess[str]) -> bool:
-    """True when dcgmi ran but reached no hostengine and graded nothing."""
+def _graded(result: subprocess.CompletedProcess[str]) -> bool:
+    """Whether dcgmi printed a JSON result: a verdict, whatever it says."""
 
     try:
         json.loads(result.stdout or "")
     except (json.JSONDecodeError, TypeError):
-        pass
-    else:
+        return False
+    return True
+
+
+def dcgm_hostengine_unreachable(result: subprocess.CompletedProcess[str]) -> bool:
+    """True when dcgmi ran but reached no hostengine and graded nothing."""
+
+    if _graded(result):
         return False
     text = f"{result.stdout or ''}\n{result.stderr or ''}"
     return result.returncode == DCGM_CONNECTION_NOT_VALID_EXIT or bool(
@@ -120,6 +128,8 @@ class DiagnosticOperationsMixin:
     diagnostic_output_dir: Path
     diagnostic_retention_seconds: int
     diagnostic_s3_uri: str | None
+    gpu_activity: GpuActivityGate
+    sleep: Callable[[float], None]
     field_diagnostic_command: tuple[str, ...]
     field_diagnostic_sha256: str | None
     field_diagnostic_timeout_seconds: int
@@ -588,6 +598,40 @@ class DiagnosticOperationsMixin:
                 )
         return statuses
 
+    def _dcgmi_quick_diagnostic(
+        self,
+    ) -> tuple[subprocess.CompletedProcess[str], str | None]:
+        """``dcgmi diag -r 1 -j``; a missing dcgmi is a 127 result and the reason."""
+
+        argv = ["dcgmi", "diag", "-r", "1", "-j"]
+        try:
+            completed = self.runner(
+                argv, check=False, capture_output=True, text=True, timeout=300
+            )
+        except OSError as exc:
+            reason = f"dcgmi unavailable on this node: {exc}"
+            return subprocess.CompletedProcess(argv, 127, "", reason), reason
+        return completed, None
+
+    def _recover_dcgm_hostengine(
+        self, result: subprocess.CompletedProcess[str]
+    ) -> dict[str, Any] | None:
+        """One start of a host-mode node's engine that is down
+        (``hostengine_recovery``); never on an embedded-mode node."""
+
+        if self.dcgm_hostengine != "host":
+            return None
+        unreachable = dcgm_hostengine_unreachable(result)
+        if not unreachable and (result.returncode == 0 or _graded(result)):
+            return None
+        return recover_host_engine(
+            self.runner,
+            windows=self.gpu_activity.open_windows,
+            sleep=self.sleep,
+            # Any other ungraded failure counts only when the unit is down.
+            only_when_down=not unreachable,
+        )
+
     def _run_dcgm_diagnostic(self, command: NodeActionCommand) -> dict[str, Any]:
         tool_unavailable: str | None = None
         unavailable_code = "DCGM_TOOL_UNAVAILABLE"
@@ -597,23 +641,23 @@ class DiagnosticOperationsMixin:
         # unreachable engine on HyperPod, its absence is a failure, not a
         # configuration-only warning.
         host_engine_declared = eks_managed and self.dcgm_hostengine == "host"
-        try:
-            result = self.runner(
-                ["dcgmi", "diag", "-r", "1", "-j"],
-                check=False,
-                capture_output=True,
-                text=True,
-                timeout=300,
-            )
-        except OSError as exc:
+        result, missing = self._dcgmi_quick_diagnostic()
+        # Host mode: an engine that is down gets one start before grading, and
+        # the diagnostic runs once more when the engine answers again.
+        recovery = None if missing else self._recover_dcgm_hostengine(result)
+        if recovery is not None and recovery.get("engine_answers"):
+            first = result
+            result, missing = self._dcgmi_quick_diagnostic()
+            recovery["diagnostic_rerun"] = True
+            recovery["first_attempt"] = {
+                "returncode": first.returncode,
+                "output_tail": f"{first.stdout or ''}\n{first.stderr or ''}"[-400:],
+            }
+        if missing is not None:
             # A plain EKS node (AL2023 NVIDIA AMI) ships no DCGM host tools:
             # no dcgmi, no nv-hostengine. That is a host configuration fact,
             # not a GPU verdict -- the node must not be drained for it.
-            reason = f"dcgmi unavailable on this node: {exc}"
-            tool_unavailable = None if host_engine_declared else reason
-            result = subprocess.CompletedProcess(
-                ["dcgmi", "diag", "-r", "1", "-j"], 127, "", reason
-            )
+            tool_unavailable = None if host_engine_declared else missing
         if (
             eks_managed
             and not host_engine_declared
@@ -729,6 +773,9 @@ class DiagnosticOperationsMixin:
         if eks_managed:
             # Which grading applied; a HyperPod result stays exactly as it was.
             details["dcgm_hostengine"] = self.dcgm_hostengine
+        if recovery is not None:
+            # What the one start of an engine that was down did (host mode).
+            details["hostengine_recovery"] = recovery
         return details
 
     def _run_checked(
