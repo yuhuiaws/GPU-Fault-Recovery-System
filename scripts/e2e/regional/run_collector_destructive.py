@@ -187,9 +187,14 @@ import sys
 from gpu_fault.app import ApplicationContext
 
 cluster_id, node_id = sys.argv[1:]
-store = ApplicationContext.from_environment().store
+context = ApplicationContext.from_environment()
+store = context.store
 snapshot = store.get_gpu_inventory_snapshot(cluster_id, node_id)
 print(json.dumps({
+    "snapshot_max_age_seconds": context.gpu_inventory_max_age.total_seconds(),
+    "legacy_max_age_seconds": (
+        context.legacy_gpu_metrics_inventory_max_age.total_seconds()
+    ),
     "present": snapshot is not None,
     "observed_at": snapshot.observed_at.isoformat() if snapshot else None,
     "source_boot_id": snapshot.source_boot_id if snapshot else None,
@@ -922,12 +927,31 @@ def restore_incident(
     return restore.wait_workflow_id(str(created["workflow_request_id"]))
 
 
+def _max_age(inventory: dict[str, Any], key: str) -> timedelta | None:
+    value = inventory.get(key)
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
+        return None
+    return timedelta(seconds=float(value))
+
+
 def fail_closed_timing_errors(
     inventory: dict[str, Any],
     *,
     event_time: datetime,
 ) -> list[str]:
-    """Both dedicated and legacy inventory must be outside the event window."""
+    """Both dedicated and legacy inventory must be outside the event window.
+
+    Ingest takes a sample as evidence while ``-30s <= event - sample <= max
+    age`` (``app/ingest/faults.py``: the snapshot's ``gpu_inventory_max_age``,
+    the latest metrics' ``legacy_gpu_metrics_inventory_max_age``). A sample is
+    therefore safe on either side: newer than the event by the future
+    tolerance plus a margin, or older than the max age plus that margin. The
+    second side matters for latest-metric rows a node no longer refreshes --
+    a derived ``fabric_manager_status_held_seconds`` after the fabric trained,
+    an XID field host-mode dcgm-exporter leaves blank -- which used to refuse
+    the case on a healthy node. Without the product's max age (an older probe)
+    only the newer side counts.
+    """
 
     if type(inventory.get("present")) is not bool:
         return ["dedicated GPU inventory presence is unknown; SXID is not posted"]
@@ -935,11 +959,20 @@ def fail_closed_timing_errors(
     if not isinstance(legacy, list):
         return ["legacy GPU inventory was not checked; SXID is not posted"]
     samples = [
-        *([inventory.get("observed_at")] if inventory["present"] else []),
-        *legacy,
+        *(
+            [
+                (
+                    inventory.get("observed_at"),
+                    _max_age(inventory, "snapshot_max_age_seconds"),
+                )
+            ]
+            if inventory["present"]
+            else []
+        ),
+        *((item, _max_age(inventory, "legacy_max_age_seconds")) for item in legacy),
     ]
     needed = INGEST_FUTURE_TOLERANCE + FAIL_CLOSED_SAFETY_MARGIN
-    for sample in samples:
+    for sample, max_age in samples:
         try:
             observed_at = datetime.fromisoformat(str(sample).replace("Z", "+00:00"))
             if observed_at.tzinfo is None:
@@ -947,13 +980,21 @@ def fail_closed_timing_errors(
             margin = observed_at - event_time
         except (TypeError, ValueError):
             return ["stored GPU inventory time is unknown; SXID is not posted"]
-        if margin < needed:
-            return [
-                f"stored GPU inventory ({observed_at.isoformat()}) is only "
-                f"{margin.total_seconds():.0f}s newer than the back-dated event; "
-                f"{needed.total_seconds():.0f}s are required for the fail-closed "
-                "premise to hold, so the SXID is not posted"
-            ]
+        if margin >= needed:
+            continue
+        if max_age is not None and -margin >= max_age + FAIL_CLOSED_SAFETY_MARGIN:
+            continue
+        older = (
+            f" or {(max_age + FAIL_CLOSED_SAFETY_MARGIN).total_seconds():.0f}s older"
+            if max_age is not None
+            else ""
+        )
+        return [
+            f"stored GPU inventory ({observed_at.isoformat()}) is "
+            f"{margin.total_seconds():.0f}s from the back-dated event; it must be "
+            f"{needed.total_seconds():.0f}s newer{older} for the fail-closed "
+            "premise to hold, so the SXID is not posted"
+        ]
     return []
 
 

@@ -389,3 +389,68 @@ def test_full_fabric_negative_refuses_unknown_inventory_proof(
     assert destructive.fail_closed_timing_errors(
         inventory, event_time=datetime.now(timezone.utc)
     ), f"unknown inventory proof allowed the fail-closed injection: {inventory!r}"
+
+
+def test_full_fabric_negative_accepts_rows_older_than_the_products_window() -> None:
+    """A latest-metric row the node stopped refreshing cannot vouch for the SXID.
+
+    Live 2026-10-17 (plain EKS, host DCGM mode): after a fabric recovery the
+    derived ``fabric_manager_status_held_seconds`` rows and the blank-in-host-
+    mode ``xid_last_error`` rows stayed at their last write, and the premise
+    refused COLLECT-014 although ingest's window (-30 s .. max age) excludes
+    them. The product's own max ages decide; without them only newer counts.
+    """
+
+    event = datetime.now(timezone.utc) - destructive.FAIL_CLOSED_EVENT_AGE
+    fresh = (event + timedelta(minutes=7)).isoformat()
+    inventory: dict[str, Any] = {
+        "present": True,
+        "observed_at": fresh,
+        "snapshot_max_age_seconds": 180.0,
+        "legacy_max_age_seconds": 600.0,
+        "legacy_observed_at": [fresh, (event - timedelta(seconds=1016)).isoformat()],
+    }
+    assert destructive.fail_closed_timing_errors(inventory, event_time=event) == []
+    inventory["legacy_observed_at"] = [
+        fresh,
+        (event - timedelta(seconds=590)).isoformat(),
+    ]
+    errors = destructive.fail_closed_timing_errors(inventory, event_time=event)
+    assert errors and "660s older" in errors[0], errors
+    inventory["legacy_observed_at"] = [
+        fresh,
+        (event - timedelta(seconds=659)).isoformat(),
+    ]
+    assert destructive.fail_closed_timing_errors(inventory, event_time=event), (
+        "a row inside max age + margin could still be read as evidence"
+    )
+    del inventory["legacy_max_age_seconds"]
+    inventory["legacy_observed_at"] = [(event - timedelta(seconds=5000)).isoformat()]
+    assert destructive.fail_closed_timing_errors(inventory, event_time=event), (
+        "without the product's max age an older row must not pass"
+    )
+
+
+@pytest.mark.parametrize("value", [None, 0, -5, True, "600"])
+def test_full_fabric_negative_ignores_an_unusable_max_age(value: object) -> None:
+    event = datetime.now(timezone.utc) - destructive.FAIL_CLOSED_EVENT_AGE
+    inventory: dict[str, Any] = {
+        "present": False,
+        "legacy_max_age_seconds": value,
+        "legacy_observed_at": [(event - timedelta(seconds=5000)).isoformat()],
+    }
+    assert destructive.fail_closed_timing_errors(inventory, event_time=event)
+
+
+def test_full_fabric_negative_snapshot_older_than_its_window_is_safe() -> None:
+    event = datetime.now(timezone.utc) - destructive.FAIL_CLOSED_EVENT_AGE
+    inventory: dict[str, Any] = {
+        "present": True,
+        "observed_at": (event - timedelta(seconds=300)).isoformat(),
+        "snapshot_max_age_seconds": 180.0,
+        "legacy_max_age_seconds": 600.0,
+        "legacy_observed_at": [],
+    }
+    assert destructive.fail_closed_timing_errors(inventory, event_time=event) == []
+    inventory["observed_at"] = (event - timedelta(seconds=200)).isoformat()
+    assert destructive.fail_closed_timing_errors(inventory, event_time=event)
