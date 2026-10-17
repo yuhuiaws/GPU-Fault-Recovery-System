@@ -45,7 +45,10 @@ from gpu_fault.cluster_scope import (
     selector_matches,
 )
 from gpu_fault_release.regional_release_config import ReleaseError
-from gpu_fault_release.regional_release_dcgm import node_dcgm_details
+from gpu_fault_release.regional_release_dcgm import (
+    check_dcgm_hostengine_agreement,
+    node_dcgm_details,
+)
 from gpu_fault_release.regional_release_node_scope import check_node_scope_agreement
 
 RETIRE_DEPARTED_AGENTS_HINT = (
@@ -203,7 +206,9 @@ def node_scope_report(
     (``connection_secret``) and the scope each consumer Deployment's Pods were
     rendered for (``consumers``). A Secret or a stamped consumer that
     disagrees with the site fails the check, naming the cluster and both
-    values; ``deploy`` rolls the recorded scope.
+    values; ``deploy`` rolls the recorded scope. So does a plain EKS
+    cluster's live exporter or reconciler serving another DCGM host engine
+    mode than ``dcgm_hostengine`` (``dcgm_hostengine_served``).
     """
 
     details = node_scope_details(release, target, selector, nodes)
@@ -214,6 +219,9 @@ def node_scope_report(
             recorded={"selector": selector, "source": str(details["source"])},
         )
     )
+    # The same for the DCGM host engine mode: the live exporter and reconciler
+    # against ``dcgm_hostengine`` (what site.yaml records).
+    details.update(check_dcgm_hostengine_agreement(release, target))
     return details
 
 

@@ -39,14 +39,18 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 from gpu_fault.admin import operator_identity
 from gpu_fault.admin.bootstrap import discover_cluster
 from gpu_fault.admin.bootstrap_common import Arn, BootstrapError, CommandRunner
+from gpu_fault.admin.bootstrap_discovery import eks_nodegroup_documents
 from gpu_fault.admin.bootstrap_ownership import (
     NodeGroupFacts,
     NodeScope,
     eks_nodegroup_facts,
-    groups_for_selector,
     hyperpod_instance_group_facts,
-    resolve_dcgm_hostengine,
     resolve_node_scope,
+)
+from gpu_fault.admin.dcgm_declaration import (
+    BLOCKED as DCGM_BLOCKED,
+    PENDING as DCGM_PENDING,
+    declaration_from_facts,
 )
 from gpu_fault.admin.membership_lock import administrator_operation_lock
 from gpu_fault.admin.ownership_release import stale_claim_lines, stale_ownership_claims
@@ -58,8 +62,6 @@ from gpu_fault.cluster_scope import (
     ClusterProvider,
     NodeSelectorSource,
     cluster_provider,
-    dcgm_hostengine,
-    dcgm_hostengine_source,
     node_selector,
     node_selector_source,
     selector_matches,
@@ -150,29 +152,8 @@ def _node_group_facts(
     provider = cluster_provider(entry.get("provider"))
     if provider is ClusterProvider.EKS_MANAGED:
         eks_name = str(entry["eks_cluster_arn"]).rsplit("/", 1)[-1]
-        names = [
-            str(item)
-            for item in runner.aws_json(
-                region, "eks", "list-nodegroups", "--cluster-name", eks_name
-            ).get("nodegroups", [])
-            if item
-        ]
-        facts = [
-            eks_nodegroup_facts(
-                runner.aws_json(
-                    region,
-                    "eks",
-                    "describe-nodegroup",
-                    "--cluster-name",
-                    eks_name,
-                    "--nodegroup-name",
-                    name,
-                ).get("nodegroup")
-                or {}
-            )
-            for name in sorted(names)
-        ]
-        return facts, eks_name
+        documents = eks_nodegroup_documents(runner, region=region, eks_name=eks_name)
+        return [eks_nodegroup_facts(item) for item in documents], eks_name
     hyperpod_name = str(entry.get("hyperpod_cluster_name") or "")
     described = runner.aws_json(
         region, "sagemaker", "describe-cluster", "--cluster-name", hyperpod_name
@@ -282,36 +263,34 @@ def dcgm_hostengine_report(
 ) -> dict[str, Any]:
     """The recorded DCGM host engine mode against what the node groups declare.
 
-    Unlike the selector the mode is re-derived by every deploy and join, so
-    ``pending deploy`` only means the next deploy records the declared mode
-    (and rolls the exporter and the Agents for it); ``blocked`` carries the
-    refusal that deploy would print.
+    Unlike the selector the mode is re-derived by every deploy and join --
+    also a deploy of an unchanged source -- so ``pending deploy`` means the
+    next deploy is not a NOOP: it records the declared mode and rolls it
+    (``next_deploy``: DATA_PLANE_COMPATIBLE, the exporter, the node installer
+    reconciler and the Agents). ``blocked`` carries the refusal that deploy
+    prints. Read as discovery reads it (``dcgm_declaration``).
     """
 
-    recorded = dcgm_hostengine(entry).value
-    report: dict[str, Any] = {
-        "recorded": recorded,
-        "source": dcgm_hostengine_source(entry).value,
-        "declared": recorded,
-        "refusal": None,
-    }
-    if cluster_provider(entry.get("provider")) is ClusterProvider.EKS_MANAGED:
-        try:
-            declared, _source = resolve_dcgm_hostengine(
-                groups_for_selector(facts, selector), cluster=cluster
-            )
-            report["declared"] = declared.value
-        except BootstrapError as exc:
-            report["declared"] = None
-            report["refusal"] = str(exc)
-    report["state"] = (
-        BLOCKED
-        if report["refusal"]
-        else DATA_PLANE_CONVERGED
-        if report["declared"] == recorded
-        else DATA_PLANE_PENDING
+    declaration = declaration_from_facts(
+        entry, facts, cluster=cluster, selector=selector
     )
-    return report
+    next_deploy = None
+    if declaration.state == DCGM_PENDING:
+        next_deploy = (
+            f"DATA_PLANE_COMPATIBLE: records dcgmHostEngine {declaration.declared}, "
+            "re-renders the DCGM exporter and re-installs the Agents"
+        )
+    elif declaration.state == DCGM_BLOCKED:
+        next_deploy = "refused: see refusal"
+    return {
+        "recorded": declaration.recorded,
+        "source": declaration.recorded_source,
+        "declared": declaration.declared,
+        "declared_source": declaration.declared_source,
+        "refusal": declaration.refusal,
+        "state": declaration.state,
+        "next_deploy": next_deploy,
+    }
 
 
 def assess_cluster(
@@ -524,6 +503,19 @@ def _selected_entries(
     return selected
 
 
+def _dcgm_line(report: Mapping[str, Any]) -> str:
+    """The summary's DCGM part: the recorded mode, and what the next deploy does."""
+
+    if report["state"] == DCGM_PENDING:
+        return (
+            f"{report['recorded']}, declared {report['declared']} (pending deploy: "
+            "the next deploy is DATA_PLANE_COMPATIBLE, not NOOP)"
+        )
+    if report["state"] == DCGM_BLOCKED:
+        return f"{report['recorded']} (blocked: the next deploy refuses, see refusal)"
+    return f"{report['recorded']} ({report['state']})"
+
+
 def run_node_scope_command(
     arguments: argparse.Namespace,
     *,
@@ -587,8 +579,7 @@ def run_node_scope_command(
         + "; ".join(
             f"{item['cluster_id']} {item['source']} -> {item['convergence']}; "
             f"data plane {item['data_plane']['state']}; DCGM host engine "
-            f"{item['dcgm_hostengine']['recorded']} "
-            f"({item['dcgm_hostengine']['state']})"
+            + _dcgm_line(item["dcgm_hostengine"])
             for item in reports
         ),
         file=sys.stderr,

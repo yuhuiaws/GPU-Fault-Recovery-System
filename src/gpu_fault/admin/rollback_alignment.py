@@ -24,6 +24,12 @@ from gpu_fault.admin.rollback_baseline import (
     require_baseline_membership,
 )
 from gpu_fault.admin.site import SiteConfigError
+from gpu_fault.cluster_scope import (
+    DcgmHostEngine,
+    DcgmHostEngineSource,
+    dcgm_hostengine,
+    is_eks_managed,
+)
 from gpu_fault_release import containing_repository_root
 
 # The recorded previous release_id becomes a directory name below the state
@@ -285,6 +291,49 @@ def find_previous_release_manifest(
     return max(matches, key=lambda item: item[0].stat().st_mtime)[0]
 
 
+def restore_rolled_back_dcgm_hostengines(
+    spec: Mapping[str, Any], previous: Mapping[str, Any]
+) -> list[str]:
+    """Record on each plain EKS entry the DCGM mode the rolled-back release ran.
+
+    A deploy's bootstrap re-reads the node-group label and rewrites the entry
+    before the release, and the attempt's baseline is recorded after that, so
+    a refused flip used to come back with the baseline and be committed by the
+    ``sync-state`` that follows as if it had rolled (live 2026-10-17: record and
+    digest host, exporter embedded, ``next deploy: NOOP``). The mode the
+    release ran is the one its previous snapshot captured from the live
+    exporter (absent: a release before the mode existed, embedded). The
+    label stays declared; ``status`` reports it as the next deploy's change.
+    Returns the cluster ids whose entry was rewritten.
+    """
+
+    captured = previous.get("clusters") if isinstance(previous, Mapping) else None
+    restored: list[str] = []
+    for entry in spec.get("clusters") or ():
+        if not isinstance(entry, dict) or not is_eks_managed(entry):
+            continue
+        cluster = (
+            captured.get(str(entry.get("clusterId")))
+            if isinstance(captured, Mapping)
+            else None
+        )
+        if not isinstance(cluster, Mapping):
+            continue
+        ran = str(cluster.get("dcgm_hostengine") or DcgmHostEngine.EMBEDDED.value)
+        if ran not in {item.value for item in DcgmHostEngine}:
+            continue
+        if ran == dcgm_hostengine(entry).value:
+            continue
+        entry["dcgmHostEngine"] = ran
+        entry["dcgmHostEngineSource"] = (
+            DcgmHostEngineSource.NODE_GROUP_LABEL.value
+            if ran == DcgmHostEngine.HOST.value
+            else DcgmHostEngineSource.DEFAULT.value
+        )
+        restored.append(str(entry.get("clusterId")))
+    return restored
+
+
 def rollback_management_document(
     site_file: Path,
     live_state: dict[str, Any],
@@ -337,6 +386,7 @@ def rollback_management_document(
     if not previous_profile or not profile_snapshot.is_file():
         raise SiteConfigError("rolled-back Runtime Profile snapshot is unavailable")
     spec["repositoryRoot"] = str(repository_root)
+    restore_rolled_back_dcgm_hostengines(spec, previous)
     release["manifest"] = (
         str(manifest.relative_to(repository_root))
         if manifest.is_relative_to(repository_root)

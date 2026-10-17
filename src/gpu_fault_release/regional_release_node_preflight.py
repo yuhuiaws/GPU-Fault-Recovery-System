@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
-from collections.abc import Callable
+import tempfile
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
@@ -18,9 +20,20 @@ from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseErro
 from gpu_fault_release.regional_release_dcgm import record_node_dcgm_states
 from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
+from gpu_fault_release.regional_release_observation import ApiUnavailable
 from gpu_fault_release.regional_release_rendering import build_reconciler_environment
 
 ROOT = repository_root()
+#: Where the preflight batch writes its per-node report
+#: (``regional_node_batch.NODE_PREFLIGHT_REPORT_ENV``, spelled here because the
+#: batch imports the engine's runner; a test keeps the two equal).
+NODE_PREFLIGHT_REPORT_ENV = "GPU_FAULT_NODE_PREFLIGHT_REPORT"
+#: One refusal line per failed node: its reasons are kept whole while the line
+#: stays under this many characters (the first reason always), the rest counted.
+NODE_REFUSAL_LINE_CHARACTERS = 600
+#: Failed nodes and distinct remedies named in one refusal; the rest counted.
+NODE_REFUSAL_NODE_LIMIT = 50
+NODE_REFUSAL_REMEDY_LIMIT = 5
 CORDON_TAINT = "node.kubernetes.io/unschedulable"
 BLOCKING_TAINT_KEYS = frozenset(
     {
@@ -202,13 +215,26 @@ def run_node_installer_preflight(
             "GPU_FAULT_WAIT_FOR_RECONCILER_ROLLOUT": "false",
         }
     )
-    raw = release.runner.run(
-        [str(ROOT / "deploy/node/deploy-node-installer-reconciler.sh")],
-        env=environment,
-        capture=True,
-        sensitive=bool(target.fleet_master_file),
-        timeout_seconds=max(600, len(candidate.node_names) * 300),
-    )
+    with tempfile.TemporaryDirectory(prefix="gpu-fault-node-preflight-") as private:
+        # The batch's per-node report: on a refusal it is what names every
+        # failed node and keeps each node's DCGM state for status --full.
+        report = Path(private) / "report.json"
+        environment[NODE_PREFLIGHT_REPORT_ENV] = str(report)
+        try:
+            raw = release.runner.run(
+                [str(ROOT / "deploy/node/deploy-node-installer-reconciler.sh")],
+                env=environment,
+                capture=True,
+                sensitive=bool(target.fleet_master_file),
+                timeout_seconds=max(600, len(candidate.node_names) * 300),
+            )
+        except ReleaseError as exc:
+            refusal = node_preflight_refusal(release, target, report, candidate)
+            if refusal is None or isinstance(exc, ApiUnavailable):
+                raise
+            for name, value in vars(exc).items():
+                setattr(refusal, name, value)
+            raise refusal from exc
     lines = [line for line in str(raw).splitlines() if line.strip()]
     try:
         result = json.loads(lines[-1])
@@ -225,6 +251,78 @@ def run_node_installer_preflight(
     # Each eks node's DCGM state as the preflight classified it, for status
     # and verify (``node_scope.dcgm_hostengine_nodes``).
     record_node_dcgm_states(release, target, result.get("dcgm_hostengine"))
+
+
+def _read_preflight_report(path: Path) -> Mapping[str, Any] | None:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return value if isinstance(value, Mapping) else None
+
+
+def node_refusal_line(name: str, refusal: Mapping[str, Any]) -> str:
+    """``<node>: <reason>; <reason>`` -- whole reasons only, bounded.
+
+    The first reason is always there whole; the next ones while the line,
+    with room for the ``(+N more)`` count, stays within the bound.
+    """
+
+    reasons = [str(item) for item in refusal.get("reasons") or () if str(item)]
+    line = f"  {name}: " + (reasons[0] if reasons else "no reason reported")
+    budget = NODE_REFUSAL_LINE_CHARACTERS - len(" (+999 more)")
+    for index, reason in enumerate(reasons[1:], start=1):
+        if len(line) + len(reason) + 2 > budget:
+            return line + f" (+{len(reasons) - index} more)"
+        line += f"; {reason}"
+    return line
+
+
+def node_preflight_refusal(
+    release: RegionalRelease,
+    target: ClusterTarget,
+    report_path: Path,
+    candidate: NodeMutationPreflight,
+) -> ReleaseError | None:
+    """The refusal a failed node preflight's report names, or None without one.
+
+    Every node's DCGM state the preflight observed is recorded first (release
+    state ``node_dcgm_hostengine``: ``status --full`` shows it after the
+    refusal too), then one line per failed node with its verdict's reasons
+    whole, and the distinct remedies once. Without a report (an older batch,
+    a failure before any Job) the command's own failure stands.
+    """
+
+    report = _read_preflight_report(report_path)
+    refused = report.get("refused") if report is not None else None
+    if report is None or not isinstance(refused, Mapping):
+        return None
+    record_node_dcgm_states(release, target, report.get("dcgm_hostengine"))
+    if not refused:
+        return None
+    names = sorted(str(name) for name in refused)
+    lines = [
+        f"{target.cluster_id} node preflight refused {len(names)} of "
+        f"{len(candidate.node_names)} node(s) before any node changed:"
+    ]
+    lines.extend(
+        node_refusal_line(name, refused[name])
+        for name in names[:NODE_REFUSAL_NODE_LIMIT]
+        if isinstance(refused[name], Mapping)
+    )
+    if len(names) > NODE_REFUSAL_NODE_LIMIT:
+        lines.append(f"  ... {len(names) - NODE_REFUSAL_NODE_LIMIT} more node(s)")
+    remedies = list(
+        dict.fromkeys(
+            str(remedy)
+            for name in names
+            if isinstance(refused[name], Mapping)
+            for remedy in refused[name].get("remedies") or ()
+            if str(remedy)
+        )
+    )
+    lines.extend(f"  remedy: {item}" for item in remedies[:NODE_REFUSAL_REMEDY_LIMIT])
+    return ReleaseError("\n".join(lines))
 
 
 def ensure_node_candidate_preflight(

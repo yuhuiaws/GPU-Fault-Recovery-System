@@ -854,3 +854,57 @@ def test_status_baseline_without_a_recorded_baseline_still_reads_the_site(
     document, _config, _root = rollback_management_document(site, live_state)
 
     assert [item["clusterId"] for item in document["spec"]["clusters"]] == ["gpu-a"]
+
+
+def test_a_refused_dcgm_flip_is_not_committed_by_the_rollback_alignment(
+    tmp_path: Path,
+) -> None:
+    """The attempt's baseline is recorded after its bootstrap re-read the node
+    group label, so it already says host; the release that rolled back ran the
+    embedded exporter (its previous snapshot captured the live mark). Live
+    2026-10-17 the rebuilt site kept host and sync-state committed it."""
+
+    site, _manifest, live_state, _admin_config = _fixture(tmp_path)
+    document = yaml.safe_load(site.read_text(encoding="utf-8"))
+    eks = {
+        "clusterId": "gpu-eks-cluster",
+        "provider": "eks-managed",
+        "nodeSelector": "gpu-fault.io/control-plane=test-site",
+        "dcgmHostEngine": "host",
+        "dcgmHostEngineSource": "node-group-label",
+    }
+    stays = {**eks, "clusterId": "gpu-eks-b"}
+    document["spec"]["clusters"] += [eks, stays, {"clusterId": "hp-b"}]
+    site.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
+    live_state["previous"]["clusters"].update(
+        {
+            "gpu-eks-cluster": {
+                "dcgm_image": "old-dcgm",
+                "dcgm_hostengine": "embedded",
+            },
+            "gpu-eks-b": {"dcgm_image": "old-dcgm", "dcgm_hostengine": "host"},
+        }
+    )
+
+    rebuilt, _config, _root = rollback_management_document(site, live_state)
+
+    clusters = {item["clusterId"]: item for item in rebuilt["spec"]["clusters"]}
+    assert (
+        clusters["gpu-eks-cluster"]["dcgmHostEngine"],
+        clusters["gpu-eks-cluster"]["dcgmHostEngineSource"],
+    ) == ("embedded", "default"), "the mode the rolled-back release ran"
+    assert clusters["gpu-eks-b"] == stays, "a mode that did roll is kept as it is"
+    assert clusters["hp-b"] == {"clusterId": "hp-b"}, "HyperPod records no mode"
+    assert clusters["gpu-a"] == {"clusterId": "gpu-a"}
+
+    predating = {"dcgm_image": "old-dcgm"}
+    live_state["previous"]["clusters"]["gpu-eks-cluster"] = predating
+    rebuilt, _config, _root = rollback_management_document(site, live_state)
+    (entry,) = [
+        item
+        for item in rebuilt["spec"]["clusters"]
+        if item["clusterId"] == "gpu-eks-cluster"
+    ]
+    assert entry["dcgmHostEngine"] == "embedded", (
+        "a previous release captured before the mode existed ran embedded"
+    )

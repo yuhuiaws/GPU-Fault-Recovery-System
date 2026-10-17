@@ -28,6 +28,7 @@ from gpu_fault_release import REPOSITORY_ROOT_ENV
 if __package__:
     from scripts.setup_deploy_host import prune_venv_versions
     from scripts.staging_deploy_inputs import (
+        dcgm_declaration_mode,
         deploy_rerun_command,
         early_consent_refusal,
         live_release_block,
@@ -66,6 +67,7 @@ if __package__:
 else:
     from setup_deploy_host import prune_venv_versions
     from staging_deploy_inputs import (
+        dcgm_declaration_mode,
         deploy_rerun_command,
         early_consent_refusal,
         live_release_block,
@@ -104,6 +106,19 @@ else:
 
 
 ROOT = Path(__file__).resolve().parents[1]
+#: Pending changes of the next deploy only an application release applies:
+#: drift the release's own probes see (observability, Aurora refresh, a live
+#: DCGM exporter serving another mode than recorded) and a DCGM host engine
+#: mode the site records or its node groups declare but no release rolled.
+#: Every shortcut (UNCHANGED, QUALITY_ONLY, DEPLOY_HOST_ONLY) would leave it.
+RELEASE_ONLY_CHANGES = frozenset(
+    {
+        "observability_drift",
+        "aurora_refresh_drift",
+        "dcgm_hostengines",
+        "dcgm_hostengine_drift",
+    }
+)
 
 
 def validate_source_checkout(
@@ -1170,7 +1185,7 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
                 isinstance(report, dict)
                 and isinstance(report.get("next_deploy"), dict)
                 and bool(
-                    {"observability_drift", "aurora_refresh_drift"}.intersection(
+                    RELEASE_ONLY_CHANGES.intersection(
                         report["next_deploy"].get("changed", [])
                     )
                 )
@@ -1183,6 +1198,9 @@ def deploy(arguments: argparse.Namespace) -> dict[str, object]:
             # An explicit custody enrollment is an administrator input, not an
             # application source change; it still must reach bootstrap's gate.
             mode = "APPLICATION_RELEASE"
+        # So is a plain EKS node group's DCGM host engine label: re-read before
+        # any shortcut, refused before anything when mixed.
+        mode = dcgm_declaration_mode(report, state_dir=state_dir, mode=mode)
         trusted_ci_candidate = (
             restore_trusted_ci_candidate(
                 source.repository_root,

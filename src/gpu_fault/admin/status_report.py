@@ -11,6 +11,15 @@ from typing import Any
 
 from gpu_fault.admin.aurora_placement import placement_findings
 from gpu_fault.admin.command_log import ADMIN_LOG_ENVIRONMENT
+from gpu_fault.admin.dcgm_declaration import (
+    READ_ERRORS,
+    STATUS_FIELD,
+    declarations_document,
+    next_deploy_with_declarations,
+    read_dcgm_declarations,
+    site_cluster_entries,
+    unreadable_findings,
+)
 from gpu_fault.admin.ownership_release import status_findings
 from gpu_fault.admin.rds_ca_bundle_drift import rds_ca_bundle_findings
 from gpu_fault.admin.resource_registry_outcome import FIELD, status_view
@@ -46,8 +55,8 @@ def _running_release_id(report: dict[str, Any] | None) -> str | None:
     return None
 
 
-def _with_registry_sync(stdout: str | None, view: dict[str, Any]) -> str | None:
-    """The engine's document plus the deploy-host field, else ``stdout`` as is."""
+def _with_deploy_host_fields(stdout: str | None, fields: dict[str, Any]) -> str | None:
+    """The engine's document plus the deploy-host fields, else ``stdout`` as is."""
 
     try:
         value = json.loads(stdout or "")
@@ -55,7 +64,37 @@ def _with_registry_sync(stdout: str | None, view: dict[str, Any]) -> str | None:
         return stdout
     if not isinstance(value, dict):
         return stdout
-    return json.dumps({**value, FIELD: view}, indent=2, sort_keys=True) + "\n"
+    return json.dumps({**value, **fields}, indent=2, sort_keys=True) + "\n"
+
+
+def dcgm_declaration_fields(
+    report: dict[str, Any] | None, site_file: Path
+) -> tuple[dict[str, Any], list[str]]:
+    """``(fields, findings)`` of the plain EKS clusters' DCGM declarations.
+
+    Nothing for a site without one, or for an engine that printed no document
+    (the output stays the engine's). Each declaration is read as the next
+    deploy's discovery reads it; a pending one rewrites ``next_deploy`` to
+    what that deploy will do, in ``report`` too, so the header and every
+    reader of the document see the same verdict. The checks are left as they
+    are: the change is the next deploy's, not drift.
+    """
+
+    if report is None:
+        return {}, []
+    try:
+        declarations = read_dcgm_declarations(site_cluster_entries(site_file))
+    except READ_ERRORS as exc:
+        return {}, [f"DCGM host engine declarations could not be read: {exc}"]
+    if not declarations:
+        return {}, []
+    fields: dict[str, Any] = {STATUS_FIELD: declarations_document(declarations)}
+    engine = report.get("next_deploy")
+    if isinstance(engine, dict):
+        overlaid = next_deploy_with_declarations(engine, declarations)
+        if overlaid != engine:
+            fields["next_deploy"] = report["next_deploy"] = overlaid
+    return fields, unreadable_findings(declarations)
 
 
 def print_status_report(
@@ -85,7 +124,11 @@ def print_status_report(
     ``installation_registry_sync`` field (when the output is one JSON object)
     and, unless it is a success for the release the site runs, as a finding.
     A finding, not a failing check: ``healthy`` and the exit code stay the
-    engine's (``resource_registry_outcome`` says why).
+    engine's (``resource_registry_outcome`` says why). A site with plain EKS
+    clusters also gets their DCGM host engine declarations
+    (``dcgm_declaration_fields``): a label flipped since the last deploy is
+    the next deploy's change, ``next deploy: DATA_PLANE_COMPATIBLE
+    (dcgm_hostengine: ...)``, where the engine read the recorded entry only.
     """
     if site is not None:
         state_dir = site_file.parent if site_file is not None else None
@@ -97,9 +140,14 @@ def print_status_report(
         ]
     report = status_document(stdout or "")
     if site_file is not None:
+        fields, declaration_findings = dcgm_declaration_fields(report, site_file)
         view = status_view(site_file.parent, release_id=_running_release_id(report))
-        findings = [*findings, *([view["finding"]] if view["finding"] else [])]
-        stdout = _with_registry_sync(stdout, view)
+        findings = [
+            *findings,
+            *declaration_findings,
+            *([view["finding"]] if view["finding"] else []),
+        ]
+        stdout = _with_deploy_host_fields(stdout, {**fields, FIELD: view})
     log_path = os.environ.get(ADMIN_LOG_ENVIRONMENT, "").strip()
     destination = "stdout" + (f" (also in {log_path})" if log_path else "")
     lines = (

@@ -18,7 +18,15 @@ flips and roll what depends on it:
   captured (``captured_dcgm_hostengine``);
 * the node preflight classifies each eks node's DCGM state (its JSON verdict's
   ``dcgm`` object) and the release keeps the last observation per cluster
-  (``node_dcgm_hostengine``) for ``status --full`` and verify.
+  (``node_dcgm_hostengine``) for ``status --full`` and verify -- also when it
+  refused the release, and across the ``sync-state`` re-commit that follows
+  (``carried_node_dcgm_states``);
+* the diff also probes what the data plane serves (``dcgm_hostengine_drift``):
+  a live exporter whose mark names another mode than site.yaml records is
+  ``dcgm_hostengine_drift``, planned like a flip. A recorded digest says what
+  a release committed; after a refused flip was committed by a ``sync-state``
+  from the attempt's own site (live 2026-10-17: exporter embedded, record and
+  digest host, ``next deploy: NOOP``) only the exporter still told the truth.
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ from datetime import UTC, datetime
 from typing import Any, Iterable, Mapping
 
 from gpu_fault.cluster_scope import (
+    DCGM_HOSTENGINE_ENV,
     ClusterProvider,
     DcgmHostEngine,
     cluster_provider,
@@ -36,16 +45,27 @@ from gpu_fault.cluster_scope import (
     dcgm_hostengine_source,
 )
 from gpu_fault.node_installer_rendering import INSTALLER_DCGM_HOSTENGINE_ANNOTATION
+from gpu_fault_release.regional_deployment_inventory import GPU_RECONCILER_DEPLOYMENT
+from gpu_fault_release.regional_release_config import ReleaseError
 
 __all__ = [
     "DCGM_HOSTENGINES_INPUT",
     "DCGM_HOSTENGINES_STATE_KEY",
+    "DCGM_HOSTENGINE_DRIFT_INPUT",
     "NODE_DCGM_STATE_KEY",
     "capture_exporter_identity",
     "captured_dcgm_hostengine",
+    "carried_node_dcgm_states",
+    "check_dcgm_hostengine_agreement",
     "cluster_dcgm_hostengines",
     "daemonset_dcgm_hostengine",
+    "dcgm_hostengine_drift",
     "dcgm_hostengines_digest",
+    "exporter_served_mode",
+    "live_dcgm_hostengines_digest",
+    "reconciler_served_mode",
+    "served_dcgm_hostengines",
+    "sync_state_dcgm",
     "forward_dcgm_hostengine",
     "installed_dcgm_hostengine_matches",
     "node_dcgm_details",
@@ -56,6 +76,18 @@ __all__ = [
 #: The diff input and the state key that records its value at commit.
 DCGM_HOSTENGINES_INPUT = "dcgm_hostengines"
 DCGM_HOSTENGINES_STATE_KEY = "dcgm_hostengines_sha256"
+#: The diff input of a live exporter serving another mode than site.yaml records.
+DCGM_HOSTENGINE_DRIFT_INPUT = "dcgm_hostengine_drift"
+EXPORTER_DAEMONSET = "gpu-fault-dcgm-exporter"
+#: ``regional_release_rendering.REMOTE_HOSTENGINE_ENV``, spelled here because
+#: that module imports this one (a test keeps the two equal): only the host
+#: variant of the exporter dials the node's engine.
+REMOTE_HOSTENGINE_ENV = "DCGM_REMOTE_HOSTENGINE_INFO"
+#: What each live mode-dependent render is called in a refusal.
+SERVED_RENDERS = {
+    "exporter": f"exporter DaemonSet {EXPORTER_DAEMONSET}",
+    "reconciler": f"node installer reconciler {GPU_RECONCILER_DEPLOYMENT}",
+}
 #: Release state key: ``{cluster_id: {mode, observed_at, nodes}}`` -- the DCGM
 #: state the last node preflight observed on every node of the cluster.
 NODE_DCGM_STATE_KEY = "node_dcgm_hostengine"
@@ -110,6 +142,227 @@ def daemonset_dcgm_hostengine(daemonset: Mapping[str, Any] | None) -> str | None
     return value if value in {item.value for item in DcgmHostEngine} else None
 
 
+def _modes() -> frozenset[str]:
+    return frozenset(item.value for item in DcgmHostEngine)
+
+
+def exporter_served_mode(daemonset: Mapping[str, Any] | None) -> str | None:
+    """The eks variant a live exporter DaemonSet serves; ``None`` without one.
+
+    Its mark; an exporter rendered before the mark existed is told by its
+    environment -- the host variant dials ``DCGM_REMOTE_HOSTENGINE_INFO``.
+    """
+
+    if not daemonset:
+        return None
+    marked = daemonset_dcgm_hostengine(daemonset)
+    if marked is not None:
+        return marked
+    template = (daemonset.get("spec") or {}).get("template") or {}
+    names = {
+        str(item.get("name"))
+        for container in (template.get("spec") or {}).get("containers") or ()
+        if isinstance(container, Mapping)
+        for item in container.get("env") or ()
+        if isinstance(item, Mapping)
+    }
+    host = REMOTE_HOSTENGINE_ENV in names
+    return (DcgmHostEngine.HOST if host else DcgmHostEngine.EMBEDDED).value
+
+
+def reconciler_served_mode(deployment: Mapping[str, Any] | None) -> str | None:
+    """The mode a live node installer reconciler installs Agents in.
+
+    Its ``GPU_FAULT_DCGM_HOSTENGINE``; one rendered before the variable
+    existed installs embedded Agents. ``None`` without the Deployment or its
+    container, or for a value that is no mode.
+    """
+
+    template = ((deployment or {}).get("spec") or {}).get("template") or {}
+    container = next(
+        (
+            item
+            for item in (template.get("spec") or {}).get("containers") or ()
+            if isinstance(item, Mapping) and item.get("name") == "reconciler"
+        ),
+        None,
+    )
+    if container is None:
+        return None
+    for item in container.get("env") or ():
+        if isinstance(item, Mapping) and item.get("name") == DCGM_HOSTENGINE_ENV:
+            value = str(item.get("value") or "")
+            return value if value in _modes() else None
+    return DcgmHostEngine.EMBEDDED.value
+
+
+def _reads_clusters(release: Any) -> bool:
+    """The gate of every classification-time probe (``node_scope_drift``):
+    never a dry run, a release without a delivered control plane or a bare
+    test double without a cluster reader."""
+
+    runner = getattr(release, "runner", None)
+    config = getattr(release, "config", None)
+    return (
+        runner is not None
+        and not getattr(runner, "dry_run", False)
+        and bool((getattr(config, "delivery_component_digests", None) or {}).get("cpu"))
+        and callable(getattr(release, "_get_json", None))
+        and callable(getattr(release, "_gpu", None))
+    )
+
+
+def _is_eks(target: Any) -> bool:
+    return cluster_provider(getattr(target, "provider", None)) is (
+        ClusterProvider.EKS_MANAGED
+    )
+
+
+def served_dcgm_hostengines(release: Any, target: Any) -> dict[str, str]:
+    """``{"exporter": mode, "reconciler": mode}``: what ``target``'s live
+    mode-dependent renders serve, for those that exist."""
+
+    def read(kind: str, name: str) -> dict[str, Any]:
+        value = release._get_json(
+            release._gpu(
+                target,
+                "-n",
+                release.config.namespace,
+                "get",
+                kind,
+                name,
+                "--ignore-not-found",
+            )
+        )
+        return value if isinstance(value, dict) else {}
+
+    served: dict[str, str] = {}
+    exporter = exporter_served_mode(read("daemonset", EXPORTER_DAEMONSET))
+    if exporter is not None:
+        served["exporter"] = exporter
+    reconciler = reconciler_served_mode(read("deployment", GPU_RECONCILER_DEPLOYMENT))
+    if reconciler is not None:
+        served["reconciler"] = reconciler
+    return served
+
+
+def dcgm_hostengine_drift(release: Any) -> dict[str, dict[str, str]]:
+    """Plain EKS clusters whose live renders serve another mode than recorded.
+
+    ``{cluster_id: {"recorded": mode, "exporter": mode, "reconciler": mode}}``
+    -- the exporter DaemonSet's variant and the reconciler's environment, the
+    two per-cluster renders of the mode. A classification-time probe like
+    ``node_scope_drift`` (the same gate, ``_reads_clusters``); a render that
+    does not exist yet (a cluster not bootstrapped) is not drift, and HyperPod
+    has no mode to serve. Live 2026-10-17 a refused flip's ``sync-state``
+    had recorded the host digest; the next release re-installed host Agents
+    and never re-rendered the embedded exporter -- only this probe sees that.
+    """
+
+    if not _reads_clusters(release):
+        return {}
+    drift: dict[str, dict[str, str]] = {}
+    for target in getattr(release.config, "clusters", None) or ():
+        if not _is_eks(target):
+            continue
+        recorded = dcgm_hostengine(target).value
+        served = served_dcgm_hostengines(release, target)
+        if any(value != recorded for value in served.values()):
+            drift[str(target.cluster_id)] = {"recorded": recorded, **served}
+    return drift
+
+
+def check_dcgm_hostengine_agreement(release: Any, target: Any) -> dict[str, Any]:
+    """The ``gpu_cluster:<id>`` view of the served mode; refuse a disagreement.
+
+    ``status --full`` and verify compare what the live exporter and reconciler
+    serve (``dcgm_hostengine_served``) with ``node_scope.dcgm_hostengine``, the
+    mode site.yaml records -- a host-mode node engine next to the exporter's
+    embedded one is exactly the conflict the mode exists to prevent. A
+    disagreement fails the check, naming the cluster and each render; the
+    next deploy rolls the recorded mode (``dcgm_hostengine_drift``).
+    """
+
+    if not _is_eks(target) or not callable(getattr(release, "_get_json", None)):
+        return {}
+    recorded = dcgm_hostengine(target).value
+    served = served_dcgm_hostengines(release, target)
+    wrong = {name: value for name, value in served.items() if value != recorded}
+    if wrong:
+        raise ReleaseError(
+            f"{target.cluster_id} DCGM host engine disagreement: site.yaml records "
+            f"{recorded}; "
+            + "; ".join(
+                f"the {SERVED_RENDERS[name]} serves {value}"
+                for name, value in sorted(wrong.items())
+            )
+            + "; gpu-fault-admin deploy re-renders it for the recorded mode"
+        )
+    return {"dcgm_hostengine_served": served}
+
+
+def live_dcgm_hostengines_digest(release: Any) -> str:
+    """The ``dcgm_hostengines`` digest of what the exporters serve (``sync-state``).
+
+    ``sync-state`` commits the site as running; the mode is the one input a
+    refused release's bootstrap may already have rewritten, so the commit
+    takes it from the live exporter, and from the record only for a cluster
+    whose exporter cannot be read (none yet, a dry run, a test double).
+    """
+
+    probe = _reads_clusters(release)
+    modes: dict[str, str] = {}
+    for target in getattr(getattr(release, "config", None), "clusters", ()) or ():
+        if not _is_eks(target):
+            continue
+        mode = dcgm_hostengine(target).value
+        if probe:
+            served = served_dcgm_hostengines(release, target).get("exporter")
+            mode = served or mode
+        if mode == DcgmHostEngine.HOST.value:
+            modes[str(target.cluster_id)] = mode
+    return _digest(modes)
+
+
+def sync_state_dcgm(release: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    """``(state to start from, state updates)`` of a ``sync-state`` re-commit:
+    the node DCGM observations it keeps and, when the exporters serve another
+    mode than the site records, the live mode digest instead of the record's
+    (every other re-commit stays byte for byte what it was)."""
+
+    live = live_dcgm_hostengines_digest(release)
+    recorded = dcgm_hostengines_digest(getattr(release, "config", None))
+    updates = {} if live == recorded else {DCGM_HOSTENGINES_STATE_KEY: live}
+    return carried_node_dcgm_states(release), updates
+
+
+def carried_node_dcgm_states(release: Any) -> dict[str, Any]:
+    """What a ``sync-state`` re-commit keeps of the state it replaces.
+
+    The commit is written from the site afresh; the last node preflight's
+    per-node DCGM states are evidence about the nodes, not something the
+    commit decides, and a refused release recorded them for ``status --full``.
+    Kept for the clusters the site still manages; nothing when the state
+    cannot be read (a site without one yet, a test double).
+    """
+
+    try:
+        state = release._load_state()
+    except Exception:  # noqa: BLE001 - nothing to carry from an unreadable state
+        return {}
+    recorded = state.get(NODE_DCGM_STATE_KEY) if isinstance(state, Mapping) else None
+    managed = {
+        str(target.cluster_id)
+        for target in getattr(getattr(release, "config", None), "clusters", ())
+    }
+    kept = {
+        str(name): value
+        for name, value in (recorded.items() if isinstance(recorded, Mapping) else ())
+        if str(name) in managed
+    }
+    return {NODE_DCGM_STATE_KEY: kept} if kept else {}
+
+
 def capture_exporter_identity(release: Any, target: Any) -> dict[str, Any]:
     """The live exporter's image -- and on ``eks-managed`` its mode -- for the
     previous-identity snapshot a rollback restores."""
@@ -121,7 +374,7 @@ def capture_exporter_identity(release: Any, target: Any) -> dict[str, Any]:
             release.config.namespace,
             "get",
             "daemonset",
-            "gpu-fault-dcgm-exporter",
+            EXPORTER_DAEMONSET,
         )
     )
     identity: dict[str, Any] = {

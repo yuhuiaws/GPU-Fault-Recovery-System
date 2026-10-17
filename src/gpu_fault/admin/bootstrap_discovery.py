@@ -22,6 +22,7 @@ from gpu_fault.admin.bootstrap_common import (
     describe_or_absent,
 )
 from gpu_fault.admin.bootstrap_ownership import (
+    NodeGroupFacts,
     NodeScope,
     RecordedNodeScope,
     eks_nodegroup_facts,
@@ -42,9 +43,11 @@ __all__ = [
     "cluster_provider_entries",
     "registration_cluster_provider",
     "discover_eks_managed_cluster",
+    "eks_nodegroup_documents",
     "find_hyperpod_for_eks",
     "gpu_nodegroups",
     "orchestrator_eks_arn",
+    "recorded_scope_groups",
     "regional_profile_for",
     "same_cluster_entry",
 ]
@@ -232,6 +235,64 @@ def find_hyperpod_for_eks(
     return matches[0] if matches else None
 
 
+def eks_nodegroup_documents(
+    runner: CommandRunner, *, region: str, eks_name: str
+) -> list[dict[str, Any]]:
+    """Every managed node group of ``eks_name`` as ``describe-nodegroup`` returns it.
+
+    One ``list-nodegroups`` and one ``describe-nodegroup`` per group, in name
+    order: the read behind discovery (``gpu_nodegroups``), ``node-scope`` and
+    the DCGM host engine declaration (``dcgm_declaration``), so the three see
+    the same groups the same way.
+    """
+
+    names = [
+        str(item)
+        for item in runner.aws_json(
+            region,
+            "eks",
+            "list-nodegroups",
+            "--cluster-name",
+            eks_name,
+        ).get("nodegroups", [])
+        if item
+    ]
+    return [
+        runner.aws_json(
+            region,
+            "eks",
+            "describe-nodegroup",
+            "--cluster-name",
+            eks_name,
+            "--nodegroup-name",
+            name,
+        ).get("nodegroup")
+        or {}
+        for name in sorted(names)
+    ]
+
+
+def recorded_scope_groups(
+    facts: Sequence[NodeGroupFacts], *, selector: str, eks_name: str
+) -> list[NodeGroupFacts]:
+    """The node groups a managed cluster's recorded ``selector`` covers.
+
+    What a deploy selects for an already-managed plain EKS cluster: its node
+    subnets, node repair gate and DCGM host engine declaration all come from
+    these groups. A selector that covers none is refused.
+    """
+
+    covered = groups_for_selector(facts, selector)
+    if not covered:
+        raise BootstrapError(
+            f"the recorded node selector {selector!r} of EKS cluster "
+            f"{eks_name} covers none of its managed node groups ("
+            + (", ".join(item.describe() for item in facts) or "none")
+            + ")"
+        )
+    return covered
+
+
 def gpu_nodegroups(
     runner: CommandRunner,
     *,
@@ -252,30 +313,7 @@ def gpu_nodegroups(
     never qualify, so their subnets never widen the Agent endpoint CIDRs.
     """
 
-    names = [
-        str(item)
-        for item in runner.aws_json(
-            region,
-            "eks",
-            "list-nodegroups",
-            "--cluster-name",
-            eks_name,
-        ).get("nodegroups", [])
-        if item
-    ]
-    described = [
-        runner.aws_json(
-            region,
-            "eks",
-            "describe-nodegroup",
-            "--cluster-name",
-            eks_name,
-            "--nodegroup-name",
-            name,
-        ).get("nodegroup")
-        or {}
-        for name in sorted(names)
-    ]
+    described = eks_nodegroup_documents(runner, region=region, eks_name=eks_name)
     facts = [eks_nodegroup_facts(item) for item in described]
     if recorded is not None and not recorded.selector:
         # An identity-only read (remove-cluster, rotate-token): no scope is
@@ -288,14 +326,9 @@ def gpu_nodegroups(
             evidence=tuple(facts),
         )
     elif recorded is not None:
-        covered = groups_for_selector(facts, recorded.selector)
-        if not covered:
-            raise BootstrapError(
-                f"the recorded node selector {recorded.selector!r} of EKS cluster "
-                f"{eks_name} covers none of its managed node groups ("
-                + (", ".join(item.describe() for item in facts) or "none")
-                + ")"
-            )
+        covered = recorded_scope_groups(
+            facts, selector=recorded.selector, eks_name=eks_name
+        )
         scope = NodeScope(
             selector=recorded.selector,
             source=NodeSelectorSource(recorded.source),
@@ -394,7 +427,9 @@ def discover_eks_managed_cluster(
         repair_states.append(node_repair_state(nodegroup))
     # The DCGM host engine mode is a node-image capability of the groups the
     # scope selects, re-read on every deploy and join (not membership); an
-    # identity-only read resolves no scope and records no mode.
+    # identity-only read resolves no scope and records no mode. `status` and
+    # the deploy's NOOP shortcut read the same declaration between deploys
+    # (`dcgm_declaration`), so a label flip is never a silent NOOP.
     dcgm_mode, dcgm_source = (
         resolve_dcgm_hostengine(
             [item for item in scope.evidence if item.name in scope.owned_groups],

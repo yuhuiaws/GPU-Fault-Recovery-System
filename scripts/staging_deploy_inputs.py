@@ -3,8 +3,9 @@
 Split from ``staging_deploy.py``: what the command needs to know before the
 source scan, the gates and the build -- the cluster ARNs and the administrator
 email (from the command or from ``site.yaml``), the SES/SNS confirmation check,
-and the consent refusal the outer hop can already make from the quick status
-report and a reused release manifest.
+the consent refusal the outer hop can already make from the quick status
+report and a reused release manifest, and the plain EKS DCGM host engine
+declarations an unchanged source must not skip (``dcgm_declaration_mode``).
 """
 
 from __future__ import annotations
@@ -25,6 +26,15 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
 )
 from gpu_fault.admin.bootstrap_site import site_identifier
+from gpu_fault.admin.dcgm_declaration import (
+    BLOCKED,
+    PENDING,
+    UNREADABLE,
+    declarations_from_report,
+    eks_managed_entries,
+    read_dcgm_declarations,
+    site_cluster_entries,
+)
 from gpu_fault.admin.deploy_consent import consent_refusal, load_release_manifest
 from gpu_fault.admin.notification_precheck import (
     EmailConfirmation,
@@ -258,3 +268,68 @@ def early_consent_refusal(
         acceptance_recorded=isinstance(live.get("schema_change_acceptance"), Mapping),
         environment=environment,
     )
+
+
+APPLICATION_RELEASE = "APPLICATION_RELEASE"
+
+
+def dcgm_declaration_mode(
+    report: Mapping[str, object] | None,
+    *,
+    state_dir: Path,
+    mode: str,
+    runner: CommandRunner | None = None,
+) -> str:
+    """``mode``, or the application release when a DCGM host engine label flipped.
+
+    The NOOP shortcuts (UNCHANGED, QUALITY_ONLY, DEPLOY_HOST_ONLY) compare
+    source identities and the recorded site; the plain EKS node-group label
+    ``gpu-fault.io/dcgm-hostengine`` is in neither, and only the application
+    release's bootstrap re-reads it and rewrites the entry before its release
+    (live 2026-10-17: a labelled group and an unchanged source re-signed the
+    success record in 90 s and changed nothing). So before a shortcut is taken
+    every plain EKS cluster's declaration is compared with ``site.yaml``:
+
+    * a changed one runs the application release (the site entry is rewritten
+      there, never here, and the success record is signed only after it);
+    * a mixed or unknown declaration -- the discovery refusal -- or one that
+      cannot be read stops the deploy before anything changes.
+
+    The quick status already read carries the declarations when its deploy
+    host reads them (``dcgm_hostengine_declarations``); they are read here only
+    when it does not, and not at all for a site without plain EKS clusters or
+    for an application release, whose bootstrap reads and refuses them anyway.
+    """
+
+    site_file = state_dir / "site.yaml"
+    if not site_file.is_file():
+        return mode
+    try:
+        entries = eks_managed_entries(site_cluster_entries(site_file))
+        declarations = declarations_from_report(report, entries) if entries else []
+    except (BootstrapError, ValueError) as exc:
+        raise StagingDeployError(f"managed site.yaml is unreadable: {exc}") from exc
+    if not entries:
+        return mode
+    if declarations is None:
+        if mode == APPLICATION_RELEASE:
+            return mode
+        declarations = read_dcgm_declarations(entries, runner)
+    stops = [
+        item.summary() for item in declarations if item.state in {BLOCKED, UNREADABLE}
+    ]
+    if stops:
+        raise StagingDeployError(
+            "the DCGM host engine declaration stops this deploy before any change: "
+            + "; ".join(stops)
+        )
+    pending = [item.summary() for item in declarations if item.state == PENDING]
+    if pending and mode != APPLICATION_RELEASE:
+        print(
+            "+ " + "; ".join(pending) + f": {mode} would skip the release that "
+            "records it; running the application release",
+            file=sys.stderr,
+            flush=True,
+        )
+        return APPLICATION_RELEASE
+    return mode

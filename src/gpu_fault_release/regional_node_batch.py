@@ -15,7 +15,7 @@ from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, Protocol, Sequence, TypeVar
+from typing import Callable, Iterable, Iterator, Mapping, Protocol, Sequence, TypeVar
 from uuid import uuid4
 
 from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
@@ -34,6 +34,14 @@ from gpu_fault_release import repository_root
 MAX_SNAPSHOT_BYTES = 64 * 1024 * 1024
 MAX_ADMISSION_BATCH_NODES = 4
 MAX_ADMISSION_BATCH_BYTES = 1024 * 1024
+#: The private file the release engine names (``regional_release_node_preflight``
+#: spells the same name; a test keeps the two equal) for this batch's per-node
+#: report; the reconciler script passes it through.
+#: Written on success and on refusal alike: each node's DCGM observation and,
+#: for every failed node, its verdict's reasons and the remedies its Job named
+#: -- what the operator needs, which a sensitive command's ``ERROR:`` lines
+#: (three, cut at 200 characters) cannot carry for more than one node.
+NODE_PREFLIGHT_REPORT_ENV = "GPU_FAULT_NODE_PREFLIGHT_REPORT"
 _T = TypeVar("_T")
 
 
@@ -280,12 +288,8 @@ def _bounded_preflights(
         raise combined
 
 
-def preflight_dcgm_observation(logs: str) -> dict[str, object] | None:
-    """The ``dcgm`` object of the last JSON verdict a preflight Job printed.
-
-    An eks-managed node's verdict carries its DCGM state (the node preflight's
-    classification); HyperPod verdicts and older scripts carry none.
-    """
+def preflight_verdict(logs: str) -> dict[str, object] | None:
+    """The last JSON verdict (an object with ``status``) a preflight Job printed."""
 
     for line in reversed(str(logs or "").splitlines()):
         text = line.strip()
@@ -296,9 +300,55 @@ def preflight_dcgm_observation(logs: str) -> dict[str, object] | None:
         except json.JSONDecodeError:
             continue
         if isinstance(verdict, dict) and "status" in verdict:
-            dcgm = verdict.get("dcgm")
-            return dict(dcgm) if isinstance(dcgm, dict) else None
+            return verdict
     return None
+
+
+def preflight_dcgm_observation(logs: str) -> dict[str, object] | None:
+    """The ``dcgm`` object of the last JSON verdict a preflight Job printed.
+
+    An eks-managed node's verdict carries its DCGM state (the node preflight's
+    classification); HyperPod verdicts and older scripts carry none.
+    """
+
+    dcgm = (preflight_verdict(logs) or {}).get("dcgm")
+    return dict(dcgm) if isinstance(dcgm, dict) else None
+
+
+def preflight_refusal(logs: str, failure: BaseException) -> dict[str, list[str]]:
+    """Why one node's host preflight failed: ``{"reasons": [...], "remedies": [...]}``.
+
+    ``reasons`` are the Job verdict's own, each whole -- the list of what to
+    fix on that node; ``remedies`` what each of the Job's ``ERROR:`` lines adds
+    to a reason (``<reason>; <remedy>``). A Job that printed no verdict (it
+    never ran, or died before judging) gives its ``ERROR:`` lines instead, and
+    one without logs the failure's first line.
+    """
+
+    verdict = preflight_verdict(logs) or {}
+    raw_reasons = verdict.get("reasons")
+    reasons = [
+        diagnostic_text(str(item))
+        for item in (raw_reasons if isinstance(raw_reasons, list) else ())
+        if str(item).strip()
+    ]
+    errors = list(
+        dict.fromkeys(
+            diagnostic_text(line.strip().removeprefix("ERROR: "))
+            for line in str(logs or "").splitlines()
+            if line.strip().startswith("ERROR: ")
+        )
+    )
+    remedies = [
+        error[len(reason) + 2 :]
+        for reason in reasons
+        for error in errors
+        if error.startswith(f"{reason}; ")
+    ]
+    if not reasons:
+        first = diagnostic_text(str(failure)).strip().splitlines()
+        reasons = errors or [first[0] if first else type(failure).__name__]
+    return {"reasons": reasons, "remedies": list(dict.fromkeys(remedies))}
 
 
 def run_node_preflights(
@@ -308,17 +358,22 @@ def run_node_preflights(
     runner: PreflightRunner,
     *,
     workers: int = 8,
+    observations: dict[str, dict[str, object]] | None = None,
+    refused: dict[str, dict[str, list[str]]] | None = None,
 ) -> dict[str, dict[str, object]]:
     """Run every node's host preflight Job; the DCGM state each one observed.
 
     Every node runs even after one failed (``stop_on_failure=False``), and the
     batch fails once naming every failed node with its own verdict.
+    ``observations`` and ``refused`` (``preflight_refusal`` per failed node)
+    are filled as the Jobs finish, so a caller still has them on failure.
     """
 
     if not 1 <= workers <= DEPLOY_CONCURRENCY.read_only_checks:
         raise ValueError("node preflight concurrency is outside its safety budget")
     kubectl = ["kubectl", "--context", scope.context, "-n", scope.namespace]
-    observations: dict[str, dict[str, object]] = {}
+    observations = {} if observations is None else observations
+    refused = {} if refused is None else refused
 
     def job_logs(node: PreparedNode) -> str:
         return runner.run(
@@ -372,6 +427,7 @@ def run_node_preflights(
                 observations[node.node.name] = observed
         except Exception as exc:
             failure = exc
+            logs = ""
             try:
                 with cleanup_deadline("node preflight diagnostics", 30):
                     logs = job_logs(node)
@@ -388,6 +444,7 @@ def run_node_preflights(
                         )
             except Exception:
                 pass
+            refused[node.node.name] = preflight_refusal(logs, exc)
             raise
         finally:
             try:
@@ -469,6 +526,36 @@ def run_node_preflights(
     return dict(sorted(observations.items()))
 
 
+def write_preflight_report(
+    node_count: int,
+    observations: Mapping[str, Mapping[str, object]],
+    refused: Mapping[str, Mapping[str, list[str]]],
+    *,
+    failed: bool,
+) -> None:
+    """Write the per-node report to the engine's ``NODE_PREFLIGHT_REPORT_ENV`` path.
+
+    Nothing without the variable (an older engine). A report that cannot be
+    written is said on stderr and never replaces the batch's own verdict.
+    """
+
+    target = os.environ.get(NODE_PREFLIGHT_REPORT_ENV, "").strip()
+    if not target:
+        return
+    document = {
+        "status": "FAILED" if failed else "PASSED",
+        "node_count": node_count,
+        "dcgm_hostengine": {
+            name: dict(value) for name, value in sorted(observations.items())
+        },
+        "refused": {name: dict(value) for name, value in sorted(refused.items())},
+    }
+    try:
+        _write_private_json(Path(target), document)
+    except OSError as exc:
+        print(f"WARN  node preflight report not written: {exc}", file=sys.stderr)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Render and verify scoped node preflight Jobs."
@@ -521,6 +608,8 @@ def main() -> None:
         require_rollback_slot=arguments.require_rollback_slot == "true",
     )
     observations: dict[str, dict[str, object]] = {}
+    refused: dict[str, dict[str, list[str]]] = {}
+    nodes: list[PreparedNode] = []
     try:
         nodes = prepare_node_batch(
             arguments.inputs, arguments.template, arguments.output, scope, identity
@@ -529,12 +618,22 @@ def main() -> None:
             from gpu_fault_release.rollout import Runner
 
             observations = run_node_preflights(
-                nodes, scope, identity, Runner(), workers=arguments.workers
+                nodes,
+                scope,
+                identity,
+                Runner(),
+                workers=arguments.workers,
+                observations=observations,
+                refused=refused,
             )
     except Exception as exc:
+        if arguments.run_preflights:
+            write_preflight_report(len(nodes), observations, refused, failed=True)
         for note in getattr(exc, "__notes__", ()):
             print(note, file=sys.stderr)
         raise SystemExit(f"ERROR: node preflight batch failed: {exc}") from None
+    if arguments.run_preflights:
+        write_preflight_report(len(nodes), observations, refused, failed=False)
     summary: dict[str, object] = {
         "node_count": len(nodes),
         "status": "PASSED" if arguments.run_preflights else "RENDERED",

@@ -474,9 +474,14 @@ def test_node_scope_reports_a_declared_flip_as_pending_deploy() -> None:
         "recorded": "embedded",
         "source": "default",
         "declared": "host",
+        "declared_source": "node-group-label",
         "refusal": None,
         "state": "pending deploy",
-    }
+        "next_deploy": (
+            "DATA_PLANE_COMPATIBLE: records dcgmHostEngine host, re-renders the "
+            "DCGM exporter and re-installs the Agents"
+        ),
+    }, "a flip is the next deploy's change, never a NOOP"
     converged = dcgm_hostengine_report(
         _entry(dcgm_hostengine="host", dcgm_hostengine_source="node-group-label"),
         facts,
@@ -510,8 +515,10 @@ def test_node_scope_reports_hyperpod_as_host_from_the_provider() -> None:
         "recorded": "host",
         "source": "provider",
         "declared": "host",
+        "declared_source": "provider",
         "refusal": None,
         "state": "converged",
+        "next_deploy": None,
     }
 
 

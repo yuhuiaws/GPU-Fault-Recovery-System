@@ -1140,6 +1140,14 @@ def status_header_lines(report: dict[str, Any], *, json_destination: str) -> lis
     )
     if next_deploy.get("resume"):
         next_kind += f" (resume {next_deploy.get('action')})"
+    # Site declarations the deploy re-reads before it classifies (the admin
+    # status adds them: a DCGM host engine label flipped since the last deploy).
+    pending = [str(item) for item in next_deploy.get("pending") or ()]
+    refused = [str(item) for item in next_deploy.get("refused") or ()]
+    if refused:
+        next_kind = "refused (" + "; ".join(refused) + ")"
+    elif pending:
+        next_kind += " (" + "; ".join(pending) + ")"
     isolated = live.get("product_isolated_nodes")
     partial = []
     if isinstance(isolated, dict) and isolated:

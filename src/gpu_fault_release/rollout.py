@@ -116,6 +116,7 @@ from gpu_fault_release.regional_release_config import (
     amp_writer_role_name,
     resolve_release_image,
 )
+from gpu_fault_release.regional_release_dcgm import sync_state_dcgm
 from gpu_fault_release.regional_release_diff import (
     ReleaseChangeKind,
     ReleaseDiff,
@@ -511,7 +512,7 @@ def sync_release_state(
         if cluster_id is not None
         else None
     )
-    release.state = {}
+    release.state, dcgm_state = sync_state_dcgm(release)
     release._save_state(
         "complete",
         previous=None,
@@ -532,6 +533,7 @@ def sync_release_state(
         completed_phases=["complete"],
         completed_cluster_ids=cluster_ids,
         **({"cluster_attempts": joined} if joined is not None else {}),
+        **dcgm_state,
     )
 
 

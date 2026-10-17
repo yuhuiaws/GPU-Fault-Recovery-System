@@ -7,7 +7,9 @@ from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Iterable
 
 from gpu_fault_release.regional_release_dcgm import (
+    DCGM_HOSTENGINE_DRIFT_INPUT,
     DCGM_HOSTENGINES_INPUT,
+    dcgm_hostengine_drift,
     dcgm_hostengines_digest,
     recorded_dcgm_hostengines_digest,
 )
@@ -178,9 +180,10 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "adot_image",
         }
     )
-    # A cluster's DCGM host engine mode flipped: re-render its exporter and
-    # re-install the Agents whose environment and reconciler identity name it.
-    dcgm_modes = DCGM_HOSTENGINES_INPUT in changed
+    # A cluster's DCGM host engine mode flipped, or its live exporter serves
+    # another mode than recorded: re-render its exporter and re-install the
+    # Agents whose environment and reconciler identity name it.
+    dcgm_modes = bool(changed & {DCGM_HOSTENGINES_INPUT, DCGM_HOSTENGINE_DRIFT_INPUT})
     dcgm = dcgm_modes or bool(changed & {"dcgm", "dcgm_manifests", "dcgm_image"})
     executor = node_scope or bool(
         changed
@@ -552,6 +555,8 @@ def classify_release(release: RegionalRelease, state: dict[str, Any]) -> Release
         changed.add(CPU_POD_PROFILE_DRIFT)
     if state and node_scope_drift(release):
         changed.add(SERVED_SCOPE_DRIFT_INPUT)
+    if state and dcgm_hostengine_drift(release):
+        changed.add(DCGM_HOSTENGINE_DRIFT_INPUT)
     if AURORA_PREREQUISITE_REPAIR_KEY in state and not (
         state.get("transaction_committed") is False
         and isinstance(state.get("previous"), dict)
