@@ -39,7 +39,8 @@ from email.parser import HeaderParser
 from typing import Any
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
-from gpu_fault_release.regional_release_rendering import DCGM_HOSTENGINE_ANNOTATION
+from gpu_fault.cluster_scope import DCGM_HOSTENGINE_LABEL as _DCGM_LABEL
+from gpu_fault.cluster_scope import DcgmHostEngine
 
 __all__ = [
     "DCGM_HOSTENGINE_EMBEDDED",
@@ -76,13 +77,13 @@ DEFAULT_BOUNDARY = "==GPU-FAULT-USER-DATA=="
 USER_DATA_LIMIT_BYTES = 16 * 1024
 NODE_PACKAGES = ("python3.12", "strace")
 
-#: The node group label declaring the DCGM host engine mode, and its value:
-#: the one definition every reader of the declaration points at. The key is
-#: the one the exporter DaemonSet already carries as its variant annotation.
-DCGM_HOSTENGINE_LABEL = DCGM_HOSTENGINE_ANNOTATION
-DCGM_HOSTENGINE_HOST = "host"
+#: The node group label declaring the DCGM host engine mode and its values:
+#: ``gpu_fault.cluster_scope`` holds the one definition discovery, the
+#: renderer and this verb all read.
+DCGM_HOSTENGINE_LABEL = _DCGM_LABEL
+DCGM_HOSTENGINE_HOST = DcgmHostEngine.HOST.value
 #: The mode of a node group without the label: the exporter's own engine.
-DCGM_HOSTENGINE_EMBEDDED = "embedded"
+DCGM_HOSTENGINE_EMBEDDED = DcgmHostEngine.EMBEDDED.value
 #: The DCGM 4 build host mode installs unless ``--dcgm-version`` names another.
 DCGM_PACKAGE_VERSION = "4.7.0-2"
 DCGM_CORE_PACKAGE = "datacenter-gpu-manager-4-core"

@@ -2051,7 +2051,7 @@ Once the user data is in the node group's launch template, the nodes still have 
   # 4. Roll the node group to the new version and wait for the update
   aws eks update-nodegroup-version --cluster-name <eks cluster> --nodegroup-name <GPU node group> \
     --launch-template name=<lt>,version=<N> --query 'update.id' --output text
-  aws eks describe-update --cluster-name <eks cluster> --nodegroup-name <GPU node group> --update-id <id> \
+  aws eks describe-update --name <eks cluster> --nodegroup-name <GPU node group> --update-id <id> \
     --query update.status                                       # until Successful
   ```
 - **Live caveats (2026-10-07, gpu-eks-cluster)**: the roll launches **one** extra instance first (maxUnavailable 1), so a
