@@ -16,7 +16,7 @@ from uuid import uuid4
 
 from gpu_fault import __version__
 from gpu_fault.collectors.cadence import CadenceJitter
-from gpu_fault.cluster_scope import DCGM_HOSTENGINE_UNIT
+from gpu_fault.cluster_scope import DCGM_HOSTENGINE_UNIT, FABRIC_MANAGER_UNIT
 from gpu_fault.collector_requirements import (
     COLLECTOR_SYSTEMD_UNITS,
     CollectorServiceState,
@@ -42,13 +42,16 @@ LOGGER = logging.getLogger(__name__)
 
 
 def _collector_units() -> list[str]:
-    """The units every heartbeat reports: the collectors and the host DCGM
+    """The units every heartbeat reports: the collectors, the host DCGM
     engine (``DCGM_HOSTENGINE_UNIT``), so ``status`` shows each node's engine
-    live. The heartbeat's unit map takes any unit and a control plane keeps the
-    units it knows: an older one drops the engine's entry, an older Agent
-    simply has none."""
+    live, and Fabric Manager (``FABRIC_MANAGER_UNIT``), which VALIDATE_GPU
+    requires running on a Hopper NVSwitch node. The heartbeat's unit map takes
+    any unit and a control plane keeps the units it knows: an older one drops
+    those entries, an older Agent simply has none."""
 
-    return sorted({*COLLECTOR_SYSTEMD_UNITS.values(), DCGM_HOSTENGINE_UNIT})
+    return sorted(
+        {*COLLECTOR_SYSTEMD_UNITS.values(), DCGM_HOSTENGINE_UNIT, FABRIC_MANAGER_UNIT}
+    )
 
 
 class CollectorServiceStates:

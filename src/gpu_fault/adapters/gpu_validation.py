@@ -4,11 +4,13 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from gpu_fault.cluster_scope import FABRIC_MANAGER_UNIT
 from gpu_fault.dcgm_fields import missing_fabric_metric_groups
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
+from gpu_fault.gpu_fabric_manager import fabric_validation
 from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.gpu_metrics import GpuMetricSource, GpuMetricsService
 from gpu_fault.models import (
@@ -23,6 +25,7 @@ from gpu_fault.operation_registry import (
 from gpu_fault.adapters.common import quarantine_taint_value
 from gpu_fault.orchestration.escalation import escalation_origin
 from gpu_fault.orchestration.validated_restore import is_validated_restore_workflow
+from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.telemetry import (
     CollectorKind,
 )
@@ -211,6 +214,13 @@ class GpuValidationAdapter:
                 )
                 if fabric_pending is not None:
                     pending[node_id] = fabric_pending
+                    continue
+            if operation is WorkflowOperation.VALIDATE_GPU:
+                nvlink_pending = self._validate_nvlink_fabric(
+                    context, node_id, now, readiness_after, failures
+                )
+                if nvlink_pending is not None:
+                    pending[node_id] = nvlink_pending
                     continue
             finding_pending = self._validate_active_findings(
                 context, node_id, operation, now, failures, node_findings
@@ -663,6 +673,76 @@ class GpuValidationAdapter:
         if failed:
             failures.setdefault(node_id, []).extend(sorted(set(failed)))
         return None
+
+    def _validate_nvlink_fabric(
+        self,
+        context: WorkflowStepContext,
+        node_id: str,
+        now: datetime,
+        readiness_after: datetime | None,
+        failures: dict[str, list[str]],
+    ) -> dict[str, Any] | None:
+        """Every GPU of a Hopper NVSwitch node joined the NVLink fabric, and the
+        node's Fabric Manager unit runs.
+
+        Live (round 9, plain EKS, GF-REGIONAL-COLLECT-015): the reboot's boot
+        left Fabric Manager failed and every GPU "in progress", and VALIDATE_GPU,
+        VALIDATE_HOST and VALIDATE_FABRIC all passed, so scheduling was restored
+        on a node where CUDA could not start. Read from the fresh samples of the
+        same window as the presence check. Nothing reported is not a failure: an
+        exporter without field 170, a product the fabric state is not graded
+        for (``gpu_fabric_manager.nvswitch_fabric_product``), an Agent that does
+        not report the unit, a unit systemd does not enable.
+        """
+
+        max_age = (
+            self.post_action_max_sample_age
+            if readiness_after is not None
+            else self.max_sample_age
+        )
+        fresh = [
+            (item.sample, item.observed_at)
+            for item in self.metrics.latest(context.incident.cluster_id, node_id)
+            if now - item.observed_at <= max_age
+            and (readiness_after is None or item.observed_at > readiness_after)
+        ]
+        graded, training, failure = fabric_validation(fresh)
+        if not graded:
+            return None
+        if failure is not None:
+            failures.setdefault(node_id, []).append(failure)
+            return None
+        pending: dict[str, Any] = (
+            {"nvlink_fabric_training": training} if training else {}
+        )
+        unit = self._fabric_manager_unit(
+            context.incident.cluster_id, node_id, readiness_after
+        )
+        if unit in {"activating", "reloading", "not_reported_since_action"}:
+            pending["fabric_manager_unit"] = unit
+        elif unit is not None:
+            failures.setdefault(node_id, []).append(f"fabric_manager_unit_{unit}")
+        return pending or None
+
+    def _fabric_manager_unit(
+        self, cluster_id: str, node_id: str, readiness_after: datetime | None
+    ) -> str | None:
+        """The Fabric Manager unit's state when it is not simply running."""
+
+        try:
+            agent = self.store.get_agent(cluster_id, node_id)
+        except (AttributeError, KeyError, NotFoundError):
+            return None
+        state = agent.collector_services.get(FABRIC_MANAGER_UNIT)
+        if state is None or state.enabled.value not in {
+            "enabled",
+            "enabled-runtime",
+            "static",
+        }:
+            return None
+        if readiness_after is not None and agent.last_seen_at <= readiness_after:
+            return "not_reported_since_action"
+        return None if state.active.value == "active" else state.active.value
 
     def _validate_active_findings(
         self,

@@ -26,6 +26,7 @@ from gpu_fault.gpu_composites import (
 from gpu_fault.gpu_composites import (
     SITE_CORRELATION_POLICY_VERSION as SITE_CORRELATION_POLICY_VERSION,
 )
+from gpu_fault.gpu_fabric_manager import track_fabric_manager_state
 from gpu_fault.gpu_metric_models import (
     SITE_METRIC_POLICY_VERSION,
     GpuHealthSeverity,
@@ -516,6 +517,11 @@ class GpuMetricsService:
                 xid = self._xid_event(batch, sample, gpu_key)
                 if xid is not None:
                     xid_events.append(xid)
+            # The NVLink fabric state (DCGM field 170) is one finding per node,
+            # graded over every GPU's state rather than per sample.
+            track_fabric_manager_state(
+                self.store, batch, findings, finding_updates, findings_by_update
+            )
             activated_values = self.store.update_gpu_findings(finding_updates)
             new_findings.extend(
                 finding
@@ -1080,12 +1086,7 @@ class GpuMetricsService:
         scope_key: str,
         rule_id: str,
     ) -> tuple[str, str, str, str]:
-        return (
-            batch.cluster_id,
-            batch.node_id,
-            scope_key,
-            f"composite:{rule_id}",
-        )
+        return (batch.cluster_id, batch.node_id, scope_key, f"composite:{rule_id}")
 
     def latest(self, cluster_id: str, node_id: str) -> list[GpuMetricLatest]:
         result = self.store.list_gpu_metrics_latest(cluster_id, node_id)

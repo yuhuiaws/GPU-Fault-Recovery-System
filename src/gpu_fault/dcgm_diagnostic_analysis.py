@@ -135,6 +135,36 @@ _FALLBACK_GUIDANCE = (
     "service.",
 )
 
+#: ``DCGM_FR_FABRIC_MANAGER_TRAINING_ERROR`` (112, ``dcgm_errors.h``): the
+#: software test's "Fabric Manager (Cluster UUID: ..., Clique ID: ...[, Health
+#: Mask: ...]): training not started | training in progress | Training completed
+#: with an error ... | Receiving an unknown fabric manager state from NVML"
+#: (DCGM 4.0 and later). Matched on the text, not the number: the extractor
+#: also reads field ids, and field 112 is the clock throttle reasons. DCGM files
+#: it under severity CONFIG, but a GPU that has not registered with the NVLink
+#: fabric cannot run CUDA on an NVSwitch node: it is never a "do not drain, fix
+#: the host configuration" condition.
+_FABRIC_MANAGER_TRAINING = re.compile(
+    r"\bfabric manager\b.*\b(?:training|fabric manager state)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+_FABRIC_GUIDANCE = (
+    "NVLINK_FABRIC_RECOVERY",
+    "Keep the node out of service: Fabric Manager has not finished registering "
+    "the GPUs with the NVLink fabric, so CUDA cannot start on this NVSwitch "
+    "node. This is not a host configuration fix and a Fabric Manager restart "
+    "alone does not re-register the GPUs. The product's recovery is the "
+    "fabric_manager_status finding: stop Fabric Manager and the GPU services, "
+    "reset every GPU and NVSwitch, start Fabric Manager, and validate that every "
+    "GPU's fabric state is Success; it climbs to a reboot and then a replacement "
+    "when the fabric still does not train. When this diagnostic's own DRAIN "
+    "already holds the node, that recovery cannot take the node over: repair "
+    "it out of band (reboot the instance), then restore it through the product "
+    "(submit-remediation --disposition restore), whose VALIDATE_GPU refuses a "
+    "node whose GPUs have not all registered with the fabric.",
+)
+
 _CONFIGURATION_GUIDANCE = (
     "GPU_HOST_CONFIG_REMEDIATION",
     "DCGM reports a configuration-severity condition only "
@@ -303,6 +333,15 @@ def extract_dcgm_diagnostic_findings(
     return findings
 
 
+def finding_is_fabric_manager_training(finding: dict[str, Any]) -> bool:
+    """True when the finding is DCGM's Fabric Manager training failure."""
+
+    return any(
+        _FABRIC_MANAGER_TRAINING.search(str(message))
+        for message in finding.get("messages") or []
+    )
+
+
 def finding_is_configuration_only(
     finding: dict[str, Any],
 ) -> bool:
@@ -312,8 +351,12 @@ def finding_is_configuration_only(
     configured" — the GPU is not diagnosed as faulty, so the finding
     must not drain a node. A finding that reports no severity at all
     (older DCGM builds) is deliberately *not* treated as
-    configuration: unknown severity stays fail-closed.
+    configuration: unknown severity stays fail-closed. DCGM's Fabric
+    Manager training failure is CONFIG by DCGM's table and never
+    configuration-only here (:func:`finding_is_fabric_manager_training`).
     """
+    if finding_is_fabric_manager_training(finding):
+        return False
     severities = [
         str(item).strip()
         for item in (finding.get("error_severities") or [])
@@ -350,6 +393,13 @@ def build_dcgm_recommendations(
     actionable = [
         finding for finding in findings if finding["status"] in {"FAIL", "WARN"}
     ]
+    # DCGM writes the Fabric Manager message once, on the test summary; the
+    # per-GPU results of the same test fail with no message of their own.
+    fabric_tests = {
+        str(finding["test_name"])
+        for finding in actionable
+        if finding_is_fabric_manager_training(finding)
+    }
     for finding in actionable:
         searchable = " ".join(
             [
@@ -357,7 +407,12 @@ def build_dcgm_recommendations(
                 *finding["messages"],
             ]
         ).lower()
-        if finding_is_configuration_only(finding):
+        if finding_is_fabric_manager_training(finding) or (
+            str(finding["test_name"]) in fabric_tests and not finding["messages"]
+        ):
+            rule = _FABRIC_GUIDANCE
+            priority = "IMMEDIATE"
+        elif finding_is_configuration_only(finding):
             rule = _CONFIGURATION_GUIDANCE
             priority = "REVIEW"
         else:
@@ -373,9 +428,10 @@ def build_dcgm_recommendations(
         triggers[(rule[0], priority, rule[1])].add(str(finding["test_name"]))
 
     # A non-zero dcgmi exit status is expected when the diagnostic
-    # reports a configuration-severity failure; asking the operator to
-    # inspect hostengine health in that case is a false alarm.
-    if returncode != 0 and configuration_only and not parse_error:
+    # reports a configuration-severity failure, or the Fabric Manager
+    # training failure; asking the operator to inspect hostengine health
+    # in either case is a false alarm.
+    if returncode != 0 and (configuration_only or fabric_tests) and not parse_error:
         return _sorted_recommendations(triggers)
 
     if returncode != 0 or parse_error:

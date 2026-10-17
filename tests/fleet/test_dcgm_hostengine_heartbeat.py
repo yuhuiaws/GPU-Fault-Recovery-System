@@ -34,6 +34,9 @@ from tests.fleet._support import (
 )
 
 ENGINE = "nvidia-dcgm"
+#: Reported the same way since batch 127: VALIDATE_GPU requires it running on a
+#: Hopper NVSwitch node whose systemd enables it.
+FABRIC_MANAGER = "nvidia-fabricmanager"
 FAILED = {"active": "failed", "enabled": "enabled"}
 COLLECTOR = "gpu-fault-kernel-collector"
 RUNNING = {"active": "active", "enabled": "enabled"}
@@ -80,9 +83,13 @@ def test_the_agent_reports_the_engine_beside_its_collectors() -> None:
 
     (envelope,) = sent
     services = envelope.heartbeat.collector_services
-    assert set(services) == {*COLLECTOR_SYSTEMD_UNITS.values(), ENGINE}
+    assert set(services) == {*COLLECTOR_SYSTEMD_UNITS.values(), ENGINE, FABRIC_MANAGER}
     assert services[ENGINE].active.value == "failed"
+    assert services[FABRIC_MANAGER].active.value == "active", (
+        "Fabric Manager's unit rides in the same map, asked the same way"
+    )
     assert ["systemctl", "is-active", ENGINE] in asked
+    assert ["systemctl", "is-active", FABRIC_MANAGER] in asked
     assert envelope.signature == sign_agent_heartbeat(envelope.heartbeat, SECRET), (
         "the signature covers the engine's entry"
     )
@@ -93,6 +100,7 @@ def test_the_record_keeps_the_engine_and_still_drops_unknown_units() -> None:
         "node-a",
         collector_services={
             ENGINE: FAILED,
+            FABRIC_MANAGER: FAILED,
             COLLECTOR: RUNNING,
             "gpu-fault-future-collector": RUNNING,
         },
@@ -100,10 +108,13 @@ def test_the_record_keeps_the_engine_and_still_drops_unknown_units() -> None:
 
     record = registry().register(signed(value))
 
-    assert set(record.collector_services) == {ENGINE, COLLECTOR}
+    assert set(record.collector_services) == {ENGINE, FABRIC_MANAGER, COLLECTOR}
     assert record.collector_services[ENGINE].active.value == "failed"
+    assert record.collector_services[FABRIC_MANAGER].active.value == "failed", (
+        "VALIDATE_GPU reads Fabric Manager's state off the record"
+    )
     assert collector_requirements.RECORDED_UNITS == frozenset(
-        {*COLLECTOR_SYSTEMD_UNITS.values(), ENGINE}
+        {*COLLECTOR_SYSTEMD_UNITS.values(), ENGINE, FABRIC_MANAGER}
     )
 
 

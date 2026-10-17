@@ -59,9 +59,15 @@ from gpu_fault.node_agent.protocol import (
     SignedNodeAction,
     sign_node_action,
 )
+from gpu_fault.node_agent.fabric_manager_restart import (
+    FULL_FABRIC_RESET_SCOPE,
+    start_fabric_manager_after_reset,
+)
 from gpu_fault.node_agent.quiesce import (
     GpuServiceQuiesceManager,
+    claimed_reset_scope,
     open_quiesce_windows,
+    record_reset_scope,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -815,6 +821,9 @@ class NodeActionExecutor(
             raise RuntimeError("GPU service quiesce manager is unavailable")
         self._reset_all_preflight(command.gpu_uuids)
         self._claim_reset_window(quiesce_manager, command)
+        record_reset_scope(
+            quiesce_manager, command.incident_id, FULL_FABRIC_RESET_SCOPE
+        )
         return self._reset_all_gpus_nvswitches(command.gpu_uuids, window_claimed=True)
 
     def _execute_restore(self, command: NodeActionCommand) -> dict[str, Any]:
@@ -823,7 +832,20 @@ class NodeActionExecutor(
         quiesce_manager = self.quiesce_manager
         if quiesce_manager is None:
             raise RuntimeError("GPU service quiesce manager is unavailable")
-        return quiesce_manager.restore(incident_id=command.incident_id)
+        # Read before the restore removes the window: a full fabric reset is
+        # the one reset after which a Fabric Manager found down is started.
+        fabric_reset = (
+            claimed_reset_scope(quiesce_manager, command.incident_id)
+            == FULL_FABRIC_RESET_SCOPE
+        )
+        result = quiesce_manager.restore(incident_id=command.incident_id)
+        if fabric_reset and not result.get("already_restored"):
+            result.update(
+                start_fabric_manager_after_reset(
+                    quiesce_manager.runner, result.get("restored_services") or []
+                )
+            )
+        return result
 
     @staticmethod
     def _retryable_action_error(error: Exception) -> bool:

@@ -58,6 +58,15 @@ DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS = TRANSIENT_GPU_INVENTORY_OPERATIONS | {
     WorkflowOperation.RESET_GPU,
     WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
 }
+#: Operations that take a node's GPUs out of the NVLink fabric on purpose and
+#: re-register them (``gpu_fault.gpu_fabric_manager``): the quiesce stops
+#: Fabric Manager, resets, reboots and replacements re-initialise the GPUs, the
+#: restore starts Fabric Manager again, and a Fabric Manager restart alone
+#: loses the fabric state. A ``fabric_manager_status`` finding raised while one
+#: of them runs is the workflow's to judge; its VALIDATE_GPU fails on it.
+FABRIC_MANAGER_OWNED_OPERATIONS = DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS | {
+    WorkflowOperation.RESTART_FABRIC_MANAGER,
+}
 #: Finding -> the operations of a RUNNING node-exclusive workflow that make the
 #: finding transient while they run (validated by the workflow's own validation
 #: step, see ``INVENTORY_FINDING_VALIDATIONS``).
@@ -71,6 +80,7 @@ TRANSIENT_INVENTORY_FINDINGS = {
         TRANSIENT_GPU_INVENTORY_OPERATIONS | DEVICE_PLUGIN_UNAVAILABLE_OPERATIONS
     ),
     "dcgm_field_completeness": DCGM_TELEMETRY_UNAVAILABLE_OPERATIONS,
+    "fabric_manager_status": FABRIC_MANAGER_OWNED_OPERATIONS,
 }
 #: The validation step of the incumbent that must still be ahead for the finding
 #: to be absorbed: a GPU finding is judged by VALIDATE_GPU; an EFA one by
@@ -88,6 +98,7 @@ INVENTORY_FINDING_VALIDATIONS = {
     "efa_inventory_mismatch": _EFA_VALIDATIONS,
     "efa_kubernetes_allocatable_mismatch": _EFA_VALIDATIONS,
     "dcgm_field_completeness": _GPU_VALIDATIONS,
+    "fabric_manager_status": _GPU_VALIDATIONS,
 }
 
 

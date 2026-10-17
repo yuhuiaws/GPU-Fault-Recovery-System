@@ -1029,3 +1029,58 @@ def open_quiesce_windows(manager: GpuServiceQuiesceManager) -> list[dict[str, An
             }
         )
     return windows
+
+
+def record_reset_scope(
+    manager: GpuServiceQuiesceManager, incident_id: str, scope: str
+) -> None:
+    """Note on the window's reset claim what the claimed reset resets.
+
+    The restore reads it back (:func:`claimed_reset_scope`): after a full GPU +
+    NVSwitch reset it starts a Fabric Manager the quiesce found down, which a
+    single-GPU reset never asks for. Best effort, because it runs between the
+    claim and the reset: a failure here must not cost the window its one reset.
+    A claim without the note -- an older Agent's, or a failed write -- reads as
+    no scope, and the restore then starts only what the quiesce stopped. A
+    quiesce manager that keeps no state file (a stand-in) has nothing to note.
+    """
+
+    if not isinstance(manager, GpuServiceQuiesceManager):
+        return
+    state_path = manager._state_path(incident_id)
+    try:
+        with manager._locked(state_path):
+            state = manager._read_state(state_path)
+            issued = (state or {}).get("reset_issued")
+            if state is None or not isinstance(issued, dict):
+                return
+            issued["scope"] = scope
+            manager._write_state(state_path, state)
+    except (OSError, ValueError, RuntimeError):
+        LOGGER.warning(
+            "could not note the reset scope on the quiesce claim of %s",
+            incident_id,
+            exc_info=True,
+        )
+
+
+def claimed_reset_scope(
+    manager: GpuServiceQuiesceManager, incident_id: str
+) -> str | None:
+    """The scope noted on the window's reset claim, if a reset was claimed.
+
+    An unreadable window reads as no scope: the restore that follows reports
+    the problem itself.
+    """
+
+    if not isinstance(manager, GpuServiceQuiesceManager):
+        return None
+    state_path = manager._state_path(incident_id)
+    try:
+        with manager._locked(state_path):
+            state = manager._read_state(state_path)
+    except (OSError, ValueError, RuntimeError):
+        return None
+    issued = (state or {}).get("reset_issued")
+    scope = issued.get("scope") if isinstance(issued, dict) else None
+    return scope if isinstance(scope, str) else None

@@ -34,6 +34,9 @@ LOGGER = logging.getLogger(__name__)
 #: ``<batch>-<metric_name>-<device|node>-<rule_id lower>`` and the rule id
 #: travels in ``diagnostic_parameters["signal"]``.
 HOST_RESOURCE_POLICY_SOURCE = "SITE_HOST_RESOURCE_HEALTH"
+#: The official action that turns a RESET_GPU node-health finding into the full
+#: GPU + NVSwitch reset (``gpu_fabric_manager.FABRIC_MANAGER_OFFICIAL_ACTION``).
+FULL_FABRIC_RESET_ACTION = "RESET_ALL_GPUS_AND_NVSWITCHES"
 
 #: An incident in one of these states has not been settled: ACTION_PENDING
 #: means its diagnostic is queued or running, ESCALATED means the diagnostic
@@ -354,7 +357,11 @@ class NodeHealthPlanBuilder:
         elif action is RecoveryAction.REPLACE_NODE:
             operations += self._replacement_operations(active, restart)
         elif action is RecoveryAction.RESET_GPU:
-            operations += self._reset_operations(active, restart)
+            operations += self._reset_operations(
+                active,
+                restart,
+                fabric=finding.official_action == FULL_FABRIC_RESET_ACTION,
+            )
         elif action is RecoveryAction.REBOOT_NODE:
             operations += self._reboot_operations(active, restart)
         return operations
@@ -437,16 +444,30 @@ class NodeHealthPlanBuilder:
     def _reset_operations(
         active: bool,
         restart: bool,
+        *,
+        fabric: bool = False,
     ) -> list[WorkflowOperation]:
+        """The GPU reset chain; ``fabric`` is the full GPU + NVSwitch reset.
+
+        A finding whose official action is the full fabric reset (the node's
+        NVLink fabric never trained, ``gpu_fabric_manager``) gets the chain a
+        fatal trunk SXID gets: one reset of every GPU and NVSwitch inside the
+        quiesce window, which stops Fabric Manager first and starts it after,
+        then both validations.
+        """
+
         operations = [WorkflowOperation.MARK_UNSCHEDULABLE]
         if active:
             operations.append(WorkflowOperation.STOP_WORKLOADS)
         operations += [
             WorkflowOperation.QUIESCE_GPU_SERVICES,
             WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
-            WorkflowOperation.RESET_GPU,
+            WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES
+            if fabric
+            else WorkflowOperation.RESET_GPU,
             WorkflowOperation.RESTORE_GPU_SERVICES,
             WorkflowOperation.VALIDATE_GPU,
+            *([WorkflowOperation.VALIDATE_FABRIC] if fabric else []),
             WorkflowOperation.RESTORE_SCHEDULING,
         ]
         if restart:

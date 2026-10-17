@@ -27,6 +27,13 @@ from gpu_fault.collectors.sinks import (
     deliver_or_raise,
 )
 from gpu_fault.dcgm_fields import missing_dcgm_metric_groups
+from gpu_fault.gpu_fabric_manager import (
+    FABRIC_MANAGER_ERROR_CODE,
+    FABRIC_MANAGER_HELD_SECONDS,
+    FABRIC_MANAGER_STATUS,
+    FABRIC_MANAGER_UNSETTLED_WINDOW_SECONDS,
+    held_samples,
+)
 from gpu_fault.env import env_bool
 from gpu_fault.gpu_metrics import (
     GpuMetricBatch,
@@ -69,6 +76,12 @@ DCGM_NANOSECOND_DURATION_FIELDS = {
     "power_violation_total_us",
     "thermal_violation_total_us",
 }
+#: State gauges whose every change is a delivery edge: the last XID, and a
+#: GPU's NVLink fabric state (VALIDATE_GPU waits on the change to SUCCESS).
+STATE_CHANGE_REASONS = {
+    "xid_last_error": "xid-changed",
+    FABRIC_MANAGER_STATUS: "fabric-manager-status-changed",
+}
 
 DCGM_METRICS: dict[str, tuple[str, str | None]] = {
     "DCGM_FI_DEV_GPU_TEMP": ("gpu_temperature_c", "celsius"),
@@ -95,6 +108,10 @@ DCGM_METRICS: dict[str, tuple[str, str | None]] = {
         "bitmask",
     ),
     "DCGM_FI_DEV_XID_ERRORS": ("xid_last_error", None),
+    # dcgmFabricManagerStatus_t / the DCGM return code of a completed NVLink
+    # fabric registration (gpu_fault.gpu_fabric_manager).
+    "DCGM_FI_DEV_FABRIC_MANAGER_STATUS": (FABRIC_MANAGER_STATUS, None),
+    "DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE": (FABRIC_MANAGER_ERROR_CODE, None),
     "DCGM_FI_DEV_ECC_SBE_VOL_TOTAL": (
         "ecc_sbe_volatile_total",
         "errors",
@@ -506,8 +523,9 @@ class DcgmMetricsCollector:
                     )
                 )
         dcgm_sample_count = len(samples)
-        samples.extend(extra_samples or [])
         timestamp = observed_at or self.now()
+        samples.extend(held_samples(samples, self._value_first_seen, timestamp))
+        samples.extend(extra_samples or [])
         if dcgm_sample_count == 0:
             raise CollectorError(
                 "DCGM scrape contained no supported GPU metrics; "
@@ -597,6 +615,19 @@ class DcgmMetricsCollector:
     def _sample_key(sample: GpuMetricSample) -> str:
         device = sample.gpu_uuid or sample.pci_bdf or sample.gpu_index or "node"
         return f"{device}/{sample.canonical_name}"
+
+    def _value_first_seen(self, sample: GpuMetricSample) -> datetime | None:
+        """When this collector first saw the sample's current value, if it has.
+
+        ``_remember_value`` keeps that time for an unchanged value, so it is how
+        long a GPU has held its fabric state; a restarted collector knows
+        nothing and starts the clock again.
+        """
+
+        remembered = self._previous_values.get(self._sample_key(sample))
+        if remembered is None or remembered[0] != sample.value:
+            return None
+        return remembered[1]
 
     @staticmethod
     def _is_duty_cycle_counter(sample: GpuMetricSample) -> bool:
@@ -757,6 +788,12 @@ class DcgmMetricsCollector:
                 }
                 and sample.value > 0
             ) or (name == "xid_last_error" and sample.value > 0)
+            # A fabric state held past the window is delivered once confirmed,
+            # not at the next health summary.
+            breached = breached or (
+                name == FABRIC_MANAGER_HELD_SECONDS
+                and sample.value >= FABRIC_MANAGER_UNSETTLED_WINDOW_SECONDS
+            )
             duty_cycle, no_new_value = self._grade_duty_cycle(sample, batch.observed_at)
             if no_new_value:
                 carried_over.add(self._sample_key(sample))
@@ -888,11 +925,11 @@ class DcgmMetricsCollector:
                     "counter-increased" if sample.value > previous else "counter-reset"
                 )
             if (
-                sample.canonical_name == "xid_last_error"
+                sample.canonical_name in STATE_CHANGE_REASONS
                 and previous is not None
                 and sample.value != previous
             ):
-                reasons.append("xid-changed")
+                reasons.append(STATE_CHANGE_REASONS[sample.canonical_name])
         return bool(reasons), list(dict.fromkeys(reasons))
 
     def _remember_value(

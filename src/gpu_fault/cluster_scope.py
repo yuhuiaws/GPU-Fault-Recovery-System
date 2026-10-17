@@ -40,6 +40,7 @@ __all__ = [
     "DCGM_HOSTENGINE_ENV",
     "DCGM_HOSTENGINE_LABEL",
     "DCGM_HOSTENGINE_UNIT",
+    "FABRIC_MANAGER_UNIT",
     "DcgmHostEngine",
     "DcgmHostEngineSource",
     "EKS_MANAGED_FAILURE_DOMAIN_LABELS",
@@ -124,6 +125,10 @@ DCGM_HOSTENGINE_LABEL = "gpu-fault.io/dcgm-hostengine"
 #: nv-hostengine): what a host-mode Agent starts once when its quick diagnostic
 #: finds the engine down, and what every Agent reports in its heartbeat.
 DCGM_HOSTENGINE_UNIT = "nvidia-dcgm"
+#: NVIDIA Fabric Manager's systemd unit: what every Agent reports beside the
+#: engine, and what VALIDATE_GPU requires running on a Hopper NVSwitch node
+#: whose systemd enables it (``gpu_fault.gpu_fabric_manager``).
+FABRIC_MANAGER_UNIT = "nvidia-fabricmanager"
 #: The cluster's DCGM host engine mode as the node installer, the node
 #: installer reconciler and the Node Agent read it; set on ``eks-managed``
 #: clusters only, so a HyperPod node's environment stays byte for byte the same.
