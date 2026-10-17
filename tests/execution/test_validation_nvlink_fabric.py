@@ -62,9 +62,11 @@ def _context(
     after: WorkflowOperation = WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
     unit: dict[str, str] | None = None,
     heartbeat_after_action: bool = True,
+    restored: bool = False,
 ):
     acted_at = datetime.now(timezone.utc) - timedelta(seconds=60)
     seen_at = acted_at + timedelta(seconds=20)
+    restored_at = seen_at + timedelta(seconds=10)
 
     class ValidationStore:
         def list_collector_statuses(self, cluster_id, node_id):
@@ -117,13 +119,22 @@ def _context(
             return []
 
     store = build_store()
-    incident, workflow = workflow_state(store, [after, WorkflowOperation.VALIDATE_GPU])
+    restore = [WorkflowOperation.RESTORE_GPU_SERVICES] if restored else []
+    operations = [after, *restore, WorkflowOperation.VALIDATE_GPU]
+    incident, workflow = workflow_state(store, operations)
     workflow = copy_model(
         workflow,
-        step_executions=[workflow_step_execution(0, after, updated_at=acted_at)],
+        step_executions=[
+            workflow_step_execution(0, after, updated_at=acted_at),
+            *(
+                [workflow_step_execution(1, restore[0], updated_at=restored_at)]
+                if restored
+                else []
+            ),
+        ],
     )
     step = copy_model(
-        workflow.official_steps[1],
+        workflow.official_steps[-1],
         execution_owner="gpu-fault-validation-adapter",
         gpu_uuids=GPUS,
     )
@@ -132,7 +143,7 @@ def _context(
         workflow=workflow,
         incident=incident,
         step=step,
-        step_index=1,
+        step_index=len(operations) - 1,
         request=WorkflowExecutionRequest(expected_fencing_token=3),
         idempotency_key="validation/nvlink-fabric",
     )
@@ -259,3 +270,20 @@ def test_a_unit_systemd_does_not_run_is_not_judged(unit) -> None:
     outcome = adapter.execute(context)
 
     assert outcome.status is WorkflowStepStatus.SUCCEEDED, outcome.details
+
+
+def test_a_heartbeat_from_inside_the_window_does_not_judge_the_restored_unit() -> None:
+    """Reset, then a heartbeat that still sees Fabric Manager down, then the
+    RESTORE that starts it: the validation waits for a heartbeat after the
+    restore instead of failing on the stale "inactive"."""
+
+    adapter, context = _context(
+        fabric=3, unit={"active": "inactive", "enabled": "enabled"}, restored=True
+    )
+
+    outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.WAITING, outcome.details
+    assert outcome.details["node_pending"]["node-a"]["fabric_manager_unit"] == (
+        "not_reported_since_action"
+    )

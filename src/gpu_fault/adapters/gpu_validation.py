@@ -715,9 +715,7 @@ class GpuValidationAdapter:
         pending: dict[str, Any] = (
             {"nvlink_fabric_training": training} if training else {}
         )
-        unit = self._fabric_manager_unit(
-            context.incident.cluster_id, node_id, readiness_after
-        )
+        unit = self._fabric_manager_unit(context, node_id, now)
         if unit in {"activating", "reloading", "not_reported_since_action"}:
             pending["fabric_manager_unit"] = unit
         elif unit is not None:
@@ -725,12 +723,19 @@ class GpuValidationAdapter:
         return pending or None
 
     def _fabric_manager_unit(
-        self, cluster_id: str, node_id: str, readiness_after: datetime | None
+        self, context: WorkflowStepContext, node_id: str, now: datetime
     ) -> str | None:
-        """The Fabric Manager unit's state when it is not simply running."""
+        """The Fabric Manager unit's state when it is not simply running.
+
+        Read off the Agent record, which every heartbeat (30 s) refreshes. It
+        must postdate the workflow's last completed step, not just the reset: a
+        heartbeat sent between the reset and the RESTORE that started Fabric
+        Manager again says "inactive" about a unit that is running now. With no
+        step before this one, a record older than the sample age says nothing.
+        """
 
         try:
-            agent = self.store.get_agent(cluster_id, node_id)
+            agent = self.store.get_agent(context.incident.cluster_id, node_id)
         except (AttributeError, KeyError, NotFoundError):
             return None
         state = agent.collector_services.get(FABRIC_MANAGER_UNIT)
@@ -740,8 +745,16 @@ class GpuValidationAdapter:
             "static",
         }:
             return None
-        if readiness_after is not None and agent.last_seen_at <= readiness_after:
+        acted = [
+            execution.updated_at
+            for execution in context.workflow.step_executions
+            if execution.step_index < context.step_index
+            and execution.status is WorkflowStepStatus.SUCCEEDED
+        ]
+        if acted and agent.last_seen_at <= max(acted):
             return "not_reported_since_action"
+        if not acted and now - agent.last_seen_at > self.max_sample_age:
+            return None
         return None if state.active.value == "active" else state.active.value
 
     def _validate_active_findings(
