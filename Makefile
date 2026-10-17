@@ -144,6 +144,7 @@ POSTGRES_TESTS = \
 	tests/regional/test_stuck_workflow_baseline.py \
 	tests/store/test_active_workflow_incidents_bound.py \
 	tests/store/test_cleanup_logging.py \
+	tests/store/test_collection_error_streak_postgres.py \
 	tests/store/test_completion_decision_reads.py \
 	tests/store/test_control_record_archive.py \
 	tests/store/test_cov95_migration_postgres.py \

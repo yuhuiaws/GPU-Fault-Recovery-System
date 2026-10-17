@@ -305,7 +305,11 @@ def test_nonfinite_metrics_are_ignored_and_collection_failure_clears_after_clean
             "observed_at": support.NOW + timedelta(seconds=2),
         }
     )
-    assert len(service.ingest(repeated).new_findings) == 1
+    returned = service.ingest(repeated)
+    assert [item.finding_id for item in returned.findings] == [
+        "error-returned-dcgm-fields"
+    ], "the returned failure starts a new streak"
+    assert returned.new_findings == [], "no incident inside the sustain window"
 
 
 @pytest.mark.parametrize(

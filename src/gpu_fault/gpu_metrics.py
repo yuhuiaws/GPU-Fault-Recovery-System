@@ -160,6 +160,9 @@ class GpuMetricsThresholds(StrictModel):
     power_violation_delta_warning_us: float = Field(default=1, gt=0)
     thermal_violation_delta_warning_us: float = Field(default=1, gt=0)
     thermal_violation_drain_consecutive_samples: int = Field(default=2, ge=2)
+    # How long a collection-error streak lasts before it asks for diagnostics
+    # (gpu_collection_errors): the 6th consecutive failure of the 15 s scrape.
+    collection_error_sustain_seconds: int = Field(default=180, ge=15, le=900)
     correlation_window_seconds: int = Field(default=45, ge=15, le=300)
     composite_consecutive_samples: int = Field(default=2, ge=2, le=10)
     power_limit_ratio: float = Field(default=0.95, gt=0, le=1)
@@ -218,6 +221,12 @@ class GpuMetricsThresholds(StrictModel):
             int(raw_consecutive)
             if raw_consecutive is not None
             else defaults.thermal_violation_drain_consecutive_samples
+        )
+        raw_sustain = os.getenv("GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS")
+        values["collection_error_sustain_seconds"] = (
+            int(raw_sustain)
+            if raw_sustain is not None
+            else defaults.collection_error_sustain_seconds
         )
         raw_window = os.getenv("GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS")
         values["correlation_window_seconds"] = (
@@ -422,22 +431,22 @@ class GpuMetricsService:
                 tuple[tuple[str, str, str, str], GpuHealthFinding | None, datetime]
             ] = []
             findings_by_update: list[GpuHealthFinding | None] = []
-            collection_error = collection_error_finding(batch)
+            collection_error = collection_error_finding(
+                batch, previous_completeness, self.thresholds
+            )
             if collection_error is not None:
-                error_key, error_finding = collection_error
+                error_key, error_finding, actionable = collection_error
                 findings.append(error_finding)
                 finding_updates.append((error_key, error_finding, batch.observed_at))
-                findings_by_update.append(error_finding)
+                findings_by_update.append(error_finding if actionable else None)
             elif (
                 previous_completeness is not None
                 and previous_completeness.finding is not None
             ):
-                # A clean scrape clears the collection-error finding. Without
-                # this the WARNING a collector raised while dcgm-exporter was
-                # still starting after a reboot stayed active for good, and
-                # VALIDATE_GPU refused every validated restore of that node
-                # with active_gpu_health_findings (DESTR-014 attempt 10,
-                # 2026-09-09).
+                # A clean scrape clears the finding. Without this the WARNING of
+                # an exporter still starting after a reboot stayed active for good
+                # and VALIDATE_GPU refused every validated restore of the node
+                # (active_gpu_health_findings, DESTR-014 attempt 10, 2026-09-09).
                 finding_updates.append((completeness_key, None, batch.observed_at))
                 findings_by_update.append(None)
             state_by_key = {}

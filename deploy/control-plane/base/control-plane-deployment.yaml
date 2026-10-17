@@ -518,6 +518,8 @@ spec:
               value: "120"
             - name: GPU_FAULT_TRANSIENT_GPU_WARNING_GRACE_SECONDS
               value: "120"
+            - name: GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS
+              value: "180"
             - name: GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS
               value: "45"
             - name: GPU_FAULT_DCGM_COMPOSITE_CONSECUTIVE_SAMPLES

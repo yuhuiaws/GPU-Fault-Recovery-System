@@ -22,14 +22,15 @@ running chain too; the chain's VALIDATE_GPU still refuses while it is active.
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from gpu_fault.app import default_simulated_profile
 from gpu_fault.app.ingest.gpu_findings import gpu_node_health_findings
 from gpu_fault.gpu_collection_errors import collection_error_finding
-from gpu_fault.gpu_metrics import GpuMetricSource
+from gpu_fault.gpu_metric_models import GpuFindingState
+from gpu_fault.gpu_metrics import GpuMetricSource, GpuMetricsThresholds
 from gpu_fault.host_health import NodeHealthCategory, NodeHealthFinding
 from gpu_fault.models import RecoveryAction, WorkflowOperation, WorkflowStatus
 from gpu_fault.orchestration import IncidentOrchestrator
@@ -110,23 +111,39 @@ def _gpu_allocatable() -> NodeHealthFinding:
 
 
 def _dcgm_completeness() -> NodeHealthFinding:
-    """What the ingest books for the collector's failed scrape, built by the
-    production path: batch -> collection-error finding -> node-health finding."""
+    """What the ingest books for the collector's failed scrapes once they have
+    lasted the sustain window, built by the production path: batches ->
+    collection-error finding -> node-health finding. Only the escalated finding
+    reaches node health (batch 126), under the streak's first batch id."""
 
-    batch = gpu_metric_batch(
-        "batch-1",
-        NOW,
-        GpuMetricSource.DCGM_EXPORTER,
-        [],
-        cluster_id=CLUSTER,
-        node_id="node-a",
-        collection_errors=[
-            "CollectorError: cannot scrape DCGM exporter: http://127.0.0.1:9400/metrics"
-        ],
-        runtime_profile_version="simulated-v1",
+    def erroring(batch_id: str, observed_at: datetime):
+        return gpu_metric_batch(
+            batch_id,
+            observed_at,
+            GpuMetricSource.DCGM_EXPORTER,
+            [],
+            cluster_id=CLUSTER,
+            node_id="node-a",
+            collection_errors=[
+                "CollectorError: cannot scrape DCGM exporter: "
+                "http://127.0.0.1:9400/metrics"
+            ],
+            runtime_profile_version="simulated-v1",
+        )
+
+    thresholds = GpuMetricsThresholds()
+    window = thresholds.collection_error_sustain_seconds
+    first = collection_error_finding(
+        erroring("batch-1", NOW - timedelta(seconds=window)), None, thresholds
     )
-    booked = collection_error_finding(batch)
-    assert booked is not None, "a batch with collection_errors is booked"
+    assert first is not None, "a batch with collection_errors is booked"
+    assert first[2] is False, "the first failure asks for nothing"
+    booked = collection_error_finding(
+        erroring("batch-7", NOW),
+        GpuFindingState(observed_at=NOW - timedelta(seconds=60), finding=first[1]),
+        thresholds,
+    )
+    assert booked is not None and booked[2] is True, "the window has passed"
     (finding,) = gpu_node_health_findings(None, [booked[1]])
     assert (
         finding.event_id,
