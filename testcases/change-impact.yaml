@@ -476,6 +476,7 @@ rules:
       - GF-REGIONAL-PREEMPT-014..022
       - GF-REGIONAL-PREEMPT-024..033
       - GF-REGIONAL-PREEMPT-035
+      - GF-REGIONAL-DESTR-010
       - GF-REGIONAL-DESTR-015
       - GF-REGIONAL-DESTR-016
       - GF-REGIONAL-DESTR-017
@@ -583,6 +584,8 @@ rules:
       - tests/execution/test_validation_fabric_state_loss.py
       - tests/orchestration/test_fabric_manager_restart_plan.py
       - tests/node_agent/test_quiesce_fabric_manager_keep.py
+      - tests/regional/test_destr010_fabric_reset_shape.py
+      - tests/regional/test_destr019_fabric_reset_shape.py
     regional_cases:
       - GF-REGIONAL-COLLECT-001..020
     checks:
@@ -592,6 +595,7 @@ rules:
     description: Node Agent, installer, quiesce, diagnostics, and reset.
     paths:
       - src/gpu_fault/node_agent/**
+      - src/gpu_fault/gpu_fabric_window.py
       - src/gpu_fault/node_installer_reconciler.py
       - src/gpu_fault/adapters/node_action/**
       - deploy/node/**
@@ -602,6 +606,7 @@ rules:
       - tests/node_agent
       - tests/fleet/test_dcgm_hostengine_heartbeat.py
       - tests/execution/test_quiesce_fabric_manager_policy.py
+      - tests/execution/test_validation_fabric_state_loss.py
       - tests/deploy/test_node_installer_security.py
       - tests/regional/test_dataplane_rbac_security.py
       - tests/regional/test_production_safety_config.py
