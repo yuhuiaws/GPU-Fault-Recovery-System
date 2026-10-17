@@ -300,6 +300,7 @@ rules:
       - tests/regional/test_release_cpu_apply_evidence_environment.py
       - tests/regional/test_release_aurora_refresh_preflight.py
       - tests/test_artifact_consistency.py
+      - tests/regional/test_dataplane_dcgm_counters.py
     regional_cases:
       - GF-REGIONAL-BOOT-018..023
       - GF-REGIONAL-HA-007..010
@@ -566,11 +567,18 @@ rules:
       - tests/policy/**
       - tests/nvidia_logs/**
       - tests/fleet/test_dcgm_hostengine_heartbeat.py
+      - tests/metrics/test_fabric_manager_state.py
+      - tests/regional/test_dataplane_dcgm_counters.py
     pytest:
       - tests/collectors
       - tests/policy
       - tests/nvidia_logs
       - tests/fleet/test_dcgm_hostengine_heartbeat.py
+      - tests/metrics/test_fabric_manager_state.py
+      - tests/execution/test_validation_nvlink_fabric.py
+      - tests/orchestration/test_fabric_manager_plan.py
+      - tests/node_agent/test_dcgm_fabric_manager_diagnostic.py
+      - tests/regional/test_dataplane_dcgm_counters.py
     regional_cases:
       - GF-REGIONAL-COLLECT-001..020
     checks:
