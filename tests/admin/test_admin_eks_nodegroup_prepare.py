@@ -725,8 +725,12 @@ def test_cluster_level_refusals(capsys: pytest.CaptureFixture[str]) -> None:
 
 
 def test_apply_runs_the_planned_steps_in_order_then_verifies_the_new_nodes(
-    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    # The release gate runs inside `gpu-fault-admin deploy`, whose own log
+    # (GPU_FAULT_ADMIN_LOG) a nested admin command writes into instead of
+    # opening one; the work-dir log asserted below is the stand-alone case.
+    monkeypatch.delenv("GPU_FAULT_ADMIN_LOG", raising=False)
     world = World(user_data=site_user_data())
 
     code, document, err = _run(world, capsys, *apply_arguments(tmp_path))
