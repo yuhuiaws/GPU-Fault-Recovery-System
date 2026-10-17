@@ -41,6 +41,7 @@ rules:
       - src/gpu_fault/admin/bootstrap_discovery.py
       - src/gpu_fault/admin/bootstrap_ownership.py
       - src/gpu_fault/admin/node_scope_command.py
+      - src/gpu_fault/admin/dcgm_declaration.py
       - src/gpu_fault/admin/site_identity_command.py
       - src/gpu_fault/admin/eks_nodegroup_*.py
       - src/gpu_fault/admin/bootstrap_iam_policies.py
@@ -54,6 +55,12 @@ rules:
       - tests/admin/test_admin_node_scope_verb.py
       - tests/admin/_eks_nodegroup_world.py
       - tests/admin/test_admin_eks_nodegroup_*.py
+      - tests/admin/_dcgm_declaration_world.py
+      - tests/admin/test_admin_dcgm_declaration.py
+      - tests/test_staging_deploy_dcgm_declaration.py
+      - tests/regional/test_release_dcgm_served_drift.py
+      - tests/regional/test_release_node_preflight_refusal.py
+      - tests/deploy/test_node_preflight_report.py
       - tests/regional/test_regional_admin_checks_node_scope.py
       - tests/regional/test_regional_admin_checks_dcgm_live.py
       - tests/admin/test_admin_site_eks_managed.py
@@ -74,6 +81,11 @@ rules:
       - tests/admin/test_admin_eks_nodegroup_checks.py
       - tests/regional/test_regional_admin_checks_node_scope.py
       - tests/regional/test_regional_admin_checks_dcgm_live.py
+      - tests/admin/test_admin_dcgm_declaration.py
+      - tests/test_staging_deploy_dcgm_declaration.py
+      - tests/regional/test_release_dcgm_served_drift.py
+      - tests/regional/test_release_node_preflight_refusal.py
+      - tests/deploy/test_node_preflight_report.py
       - tests/admin/test_admin_site_eks_managed.py
       - tests/admin/test_admin_eks_managed_join.py
       - tests/admin/test_admin_eks_managed_lifecycle.py
@@ -229,12 +241,15 @@ rules:
       - scripts/deploy_source_identity.py
       - scripts/restore_ci_candidate.py
       - scripts/staging_deploy.py
+      - scripts/staging_deploy_inputs.py
       - scripts/staging_state_hygiene.py
       - scripts/staging_source_snapshot.py
       - tests/admin/test_admin_source_deploy.py
       - tests/admin/test_release_deploy.py
       - tests/test_staging_deploy.py
       - tests/test_staging_deploy_repair.py
+      - tests/test_staging_deploy_inputs.py
+      - tests/test_staging_deploy_dcgm_declaration.py
       - tests/_staging_deploy_support.py
       - tests/test_staging_deploy_snapshots.py
       - tests/test_restore_ci_candidate.py
@@ -246,6 +261,8 @@ rules:
       - tests/admin/test_release_deploy.py
       - tests/test_staging_deploy.py
       - tests/test_staging_deploy_repair.py
+      - tests/test_staging_deploy_inputs.py
+      - tests/test_staging_deploy_dcgm_declaration.py
       - tests/test_staging_deploy_snapshots.py
       - tests/test_restore_ci_candidate.py
       - tests/regional/test_boot020_runner.py
@@ -308,6 +325,7 @@ rules:
       - scripts/setup-deploy-host.sh
       - scripts/setup_deploy_host.py
       - scripts/staging_deploy.py
+      - scripts/staging_deploy_inputs.py
       - scripts/staging_state_hygiene.py
       - scripts/staging_source_snapshot.py
       - config/admin-config.example.yaml
@@ -318,6 +336,8 @@ rules:
       - tests/admin/test_admin_cluster_*.py
       - tests/test_staging_deploy.py
       - tests/test_staging_deploy_repair.py
+      - tests/test_staging_deploy_inputs.py
+      - tests/test_staging_deploy_dcgm_declaration.py
       - tests/_staging_deploy_support.py
       - tests/test_staging_deploy_snapshots.py
       - tests/test_deploy_host_setup.py
@@ -331,6 +351,8 @@ rules:
       - tests/admin/test_admin_cluster_removal.py
       - tests/test_staging_deploy.py
       - tests/test_staging_deploy_repair.py
+      - tests/test_staging_deploy_inputs.py
+      - tests/test_staging_deploy_dcgm_declaration.py
       - tests/test_staging_deploy_snapshots.py
       - tests/test_deploy_host_setup.py
       - tests/test_restore_ci_candidate.py

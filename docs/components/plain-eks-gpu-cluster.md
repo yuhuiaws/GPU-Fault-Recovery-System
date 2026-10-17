@@ -75,7 +75,13 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   模式变化是 release diff 输入 `dcgm_hostengines`：规划 DCGM + reconciler + Agent（`DATA_PLANE_COMPATIBLE`），exporter 重新应用、
   该集群的 Agent 分波重装（reconciler 节点注解 `gpu-fault.io/installer-dcgm-hostengine=host`），变更前的节点预检先核对主机 hostengine。
   `status --full` 的 `node_scope.dcgm_hostengine`/`dcgm_hostengine_source`/`dcgm_hostengine_pending_nodes` 与 `node-scope` 的
-  `dcgm_hostengine` 显示模式、来源与待重装的节点。
+  `dcgm_hostengine` 显示模式、来源与待重装的节点。源码不变的 deploy 也在 NOOP 捷径之前用同一套发现读取重读标签，声明与
+  记录不同就改走应用发布，混合声明在任何变更之前拒绝；`status`（快速与 `--full`）与 `node-scope` 把尚未发布的声明显示为
+  `next deploy: DATA_PLANE_COMPATIBLE (dcgm_hostengine: <集群> declared host, recorded embedded)`。exporter 或 reconciler 实际运行的
+  模式（DaemonSet 注解/环境，reconciler 的 `GPU_FAULT_DCGM_HOSTENGINE`）与记录不同为 release diff 输入 `dcgm_hostengine_drift`，同样
+  规划 DCGM + reconciler + Agent，`status --full`/verify 的 `gpu_cluster:<id>` 检查对这种不一致判失败（`node_scope.dcgm_hostengine_served`）；
+  被拒绝并回滚的发布由回滚对齐把记录恢复为实际运行的模式，`sync-state` 按 exporter 实际运行的模式记录摘要，节点预检的拒绝
+  逐节点列出完整原因并记下每个节点的 DCGM 状态。
 - 节点 collector 从 exporter HTTP 取 DCGM 指标，不依赖 dcgmi；节点 agent 的快速 DCGM 诊断（`dcgmi diag -r 1 -j`）在 embedded 模式下
   对无 dcgmi 或连不上 hostengine 记配置性 `WARN`（`DCGM_TOOL_UNAVAILABLE`/`DCGM_HOSTENGINE_UNAVAILABLE`，不排空）；host 模式下
   （Agent 环境 `GPU_FAULT_DCGM_HOSTENGINE=host`，只写入 eks-managed 节点、不进 config digest）给出真实判定，缺 dcgmi 或连不上主机
@@ -153,7 +159,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    `nvidia-dcgm.service.d/90-gpu-fault-restart.conf`（软件包单元的 `Restart=on-abort` 让一次非零退出或一轮崩溃循环永久停着）并
    `systemctl enable --now nvidia-dcgm`，
    在节点上用 `dcgmi discovery -l`、`dcgmi diag -r 1` 确认，给该集群的**每个** GPU 节点组加 `gpu-fault.io/dcgm-hostengine=host`，随即
-   deploy/join（启用而不加标签的 deploy 会被 embedded 冲突检查拒绝）；退出时摘标签、把 `nvidia-dcgm` 从 launch template 拿掉并在节点上
+   deploy/join（源码不变也照样 deploy，它会重读标签；之前 `status` 显示待生效的 `next deploy`；启用而不加标签的 deploy 会被
+   embedded 冲突检查拒绝）；退出时摘标签、把 `nvidia-dcgm` 从 launch template 拿掉并在节点上
    `systemctl disable --now nvidia-dcgm`，再立即 deploy（次序与命令见管理员日常运维 §5.0.1「主机 DCGM」）。
 
 ## 4. 限制

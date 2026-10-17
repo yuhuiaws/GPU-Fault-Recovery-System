@@ -95,7 +95,17 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   exporter is re-applied and the cluster's Agents are re-installed in waves (reconciler node annotation
   `gpu-fault.io/installer-dcgm-hostengine=host`), and the node preflight checks the host hostengine before any change.
   `node_scope.dcgm_hostengine`/`dcgm_hostengine_source`/`dcgm_hostengine_pending_nodes` of `status --full` and the
-  `dcgm_hostengine` of `node-scope` show the mode, its source and the nodes still to re-install.
+  `dcgm_hostengine` of `node-scope` show the mode, its source and the nodes still to re-install. A deploy of an unchanged
+  source re-reads the label with the same discovery reads before its NOOP shortcut and takes the application release when
+  the declaration differs from the record (a mixed one is refused before any change); `status` (quick and `--full`) and
+  `node-scope` show a declaration not yet released as
+  `next deploy: DATA_PLANE_COMPATIBLE (dcgm_hostengine: <cluster> declared host, recorded embedded)`. An exporter or
+  reconciler whose live mode (the DaemonSet annotation/environment, the reconciler's `GPU_FAULT_DCGM_HOSTENGINE`) differs
+  from the record is the release-diff input `dcgm_hostengine_drift`, planned like a flip (DCGM + reconciler + Agent), and
+  the `gpu_cluster:<id>` check of `status --full`/verify fails on it (`node_scope.dcgm_hostengine_served`); after a
+  refused and rolled-back release the rollback alignment restores the record to the mode that runs and `sync-state`
+  records the digest of the mode the exporters run, and a node preflight refusal names every node with its whole
+  reasons and records every node's DCGM state.
 - The node collector scrapes DCGM metrics from the exporter over HTTP, never dcgmi; in embedded mode the node agent's
   quick DCGM diagnostic (`dcgmi diag -r 1 -j`) reports a missing dcgmi or an unreachable hostengine as a configuration
   `WARN` (`DCGM_TOOL_UNAVAILABLE`/`DCGM_HOSTENGINE_UNAVAILABLE`, never drained); in host mode (Agent environment
@@ -199,7 +209,8 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
    `nvidia-dcgm.service.d/90-gpu-fault-restart.conf` (the package unit's `Restart=on-abort` leaves a non-zero exit or a
    crash loop down for good) and runs `systemctl enable --now nvidia-dcgm`; confirm on a node with
    `dcgmi discovery -l` and `dcgmi diag -r 1`, label **every** GPU node group of the cluster
-   `gpu-fault.io/dcgm-hostengine=host` and deploy/join right away (a deploy with the service enabled but no label is
+   `gpu-fault.io/dcgm-hostengine=host` and deploy/join right away (also over an unchanged source: the deploy re-reads the
+   label, and `status` shows the pending `next deploy` before it; a deploy with the service enabled but no label is
    refused by the embedded conflict check); to leave, remove the label, take `nvidia-dcgm` out of the launch template and
    run `systemctl disable --now nvidia-dcgm` on the nodes, then deploy at once (order and commands in
    administrator-operations §5.0.1, "Host DCGM").

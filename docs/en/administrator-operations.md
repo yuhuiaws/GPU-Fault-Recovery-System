@@ -1355,7 +1355,7 @@ Which nodes a site manages is declared by an **ownership label on the node group
 (2) a node group's label value names another site (one GPU cluster belongs to one site);
 (3) a node group labelled for this site runs an instance type outside the GPU inventory (for example `ml.g6.12xlarge`, `m7i-flex.xlarge`).
 
-**Lifecycle**: removing the label from a node group = the planned departure of its nodes -- they leave the selected set at once, their Agent records follow the departed-node paths (`workflow-reconcile --retire-departed-agents`, §10.2), and the next release's waves, Agent coverage, collector readiness and failure-domain mapping all read the one selected set (single source of truth `cluster_scope.node_selector`); labelling a new node group = its nodes join the managed set automatically. Removing the label from every node group of a cluster leaves it without managed nodes: use `remove-cluster` instead. After `remove-cluster`/`uninstall` the label is released (unless `--keep-ownership-label`; the "release" row above): a node group of a de-registered cluster still carrying this site's id is a **stale claim** -- the next `deploy`/`join-cluster` of the same site id would re-adopt it without a fresh declaration, and another site is refused with `one GPU cluster belongs to one site`; `gpu-fault-admin status` and `node-scope` list it as a finding (`stale_ownership_claims`: the de-registered cluster, the groups still labelled and the exact release commands); when the node groups a tombstone would read belong to a current member (the same physical cluster joined again, judged by the HyperPod cluster name or the plain EKS cluster whatever the `cluster_id`, compared normalized; a HyperPod cluster recreated under its name on another EKS cluster included), their label is the member's own declaration and is not reported, while a `cluster_id` reused for another physical cluster still reports the removed one; the `release` section of `site-id` states the release semantics, and the label is re-applied with the commands `site-id` prints before the cluster joins again.
+**Lifecycle**: removing the label from a node group = the planned departure of its nodes -- they leave the selected set at once, their Agent records follow the departed-node paths (`workflow-reconcile --retire-departed-agents`, §10.2), and the next release's waves, Agent coverage, collector readiness and failure-domain mapping all read the one selected set (single source of truth `cluster_scope.node_selector`); labelling a new node group = its nodes join the managed set automatically. Removing the label from every node group of a cluster leaves it without managed nodes: use `remove-cluster` instead. After `remove-cluster`/`uninstall` the label is released (unless `--keep-ownership-label`; the "release" row above): a node group of a de-registered cluster still carrying this site's id is a **stale claim** -- the next `deploy`/`join-cluster` of the same site id would re-adopt it without a fresh declaration, and another site is refused with `one GPU cluster belongs to one site`; `gpu-fault-admin status` and `node-scope` list it as a finding (`stale_ownership_claims`: the de-registered cluster, the groups still labelled and the exact release commands); when the node groups a tombstone would read belong to a current member (the same physical cluster joined again, judged by the HyperPod cluster name or the plain EKS cluster whatever the `cluster_id`, compared normalized; a HyperPod cluster recreated under its name on another EKS cluster included), their label is the member's own declaration and is not reported, while a `cluster_id` reused for another physical cluster still reports the removed one; the `release` section of `site-id` states the release semantics, and the label is re-applied with the commands `site-id` prints before the cluster joins again. The `gpu-fault.io/dcgm-hostengine` label on the same node groups (§5.0.1) is node-image capability, not membership: every deploy -- one of an unchanged source too -- re-reads it, and a declaration that differs from the `site.yaml` record is shown by `status` (quick and `--full`) and `node-scope` as the pending `next deploy`.
 
 **Clusters joined before the convention** keep the selector their site entry records as the runtime truth, with the source `provider-default-legacy` (HyperPod: `sagemaker.amazonaws.com/cluster-name=<name>`, the whole HyperPod cluster) or `flag-legacy` (plain EKS: the selector recorded by the retired `--gpu-nodegroup`/`--node-selector` flags or their `nvidia.com/gpu.present=true` default). The convergence path is a journaled administrator step:
 (1) label the cluster's GPU node groups / instance groups; (2) `gpu-fault-admin node-scope --state-dir <dir>` shows, read-only, each cluster's recorded selector and source, the label-derived selector, and the two node sets with their differences; (3) `gpu-fault-admin node-scope --state-dir <dir> --gpu-cluster-arn <ARN> --converge --reference <change request>` (first with `--dry-run`) rewrites the `site.yaml` entry (`nodeSelector`, `nodeSelectorSource: label-convention`) only when the label selects **exactly** the current node set, keeping a backup of the previous `site.yaml` and appending `node-scope/<cluster_id>/journal.json`; any difference refuses and names the nodes: current nodes of a labelled instance group that do not carry the label yet (HyperPod applies `KubernetesConfig` labels through its own reconciliation and may reach only nodes created afterwards -- wait, or label the existing nodes with `kubectl label nodes -l sagemaker.amazonaws.com/instance-group-name=<group> gpu-fault.io/control-plane=<site id>` and retry), current nodes the label does not select (label their group, or `remove-cluster` and `join-cluster` again), nodes the label newly selects; (4) `gpu-fault-admin deploy --state-dir <dir>` rolls the converged selector into the data plane. The recorded scope of every cluster (`nodeSelector`/`nodeSelectorSource`) is a release input (`cluster_node_scopes`, recorded in the release state as `cluster_node_scopes_sha256`), and the release diff also probes each cluster's connection Secret (`cluster_node_scope_drift`): a converged entry, or a Secret that serves another selector than the site records, classifies the deploy `DATA_PLANE_COMPATIBLE` and plans, per affected cluster, the `connection` component (re-render `gpu-fault-regional-connection` with the `node-selector`/`node-selector-source` keys) followed by a roll of the three Deployments that read `GPU_FAULT_NODE_SELECTOR` from it -- the cluster executor, the Completion Watcher and the node installer reconciler; their Pod templates carry `gpu-fault.io/node-scope-sha256`, the digest of the scope they were rendered for, so the Pods restart and read the new selector. The node-resource collector, DCGM, the NLB/DNS endpoint, the node Agents and the CPU control plane are not touched; an automatic rollback restores the Secret backup and re-renders the consumers for the scope it restored. A `deploy` that reports `NOOP` after a convergence is the defect this paragraph closes, not the expected result.
@@ -2125,8 +2125,20 @@ with the labelling command. Karpenter NodePools are not read; a HyperPod cluster
 `provider`), its label is ignored and nothing is recorded. The result is written into the cluster's `site.yaml` entry as
 `dcgmHostEngine` (`host`/`embedded`) and `dcgmHostEngineSource` (`node-group-label`/`default`): it is a capability of the
 node image, not membership, so every deploy/join rewrites it from the node groups instead of keeping the previous entry
-the way `nodeSelector` is kept; an older entry without the keys reads as embedded/`default`. Follow these steps in
-order and without pausing between them:
+the way `nodeSelector` is kept; an older entry without the keys reads as embedded/`default`. A deploy of an unchanged
+source re-reads the label too: before it takes the UNCHANGED, QUALITY_ONLY or DEPLOY_HOST_ONLY shortcut it compares every
+plain EKS cluster's declaration, read the way discovery reads it (`list-nodegroups` and one `describe-nodegroup` per
+group, `admin/dcgm_declaration.py`), with the `site.yaml` record: a difference takes the application release instead (the
+entry is rewritten only by the bootstrap of that release path, the release diff then sees `dcgm_hostengines` move, and
+the success record is signed only after the release), and a mix, an unknown value or an unreadable node group is refused
+before any change; without a difference the shortcut is what it was, plus this one node group read (reused from the
+quick `status` when that already read it). `status` (quick and `--full`) and `node-scope` read it the same way and show
+a mode change that has not been released yet: the header says
+`next deploy: DATA_PLANE_COMPATIBLE (dcgm_hostengine: <cluster> declared host, recorded embedded)`, a mixed declaration
+`next deploy: refused (dcgm_hostengine: <cluster>: <refusal>)`; the JSON `next_deploy` carries `dcgm_hostengines` and
+`pending`/`refused`, and `dcgm_hostengine_declarations` lists every plain EKS cluster's
+`recorded`/`declared`/`node_groups`/`state`; no check changes its verdict -- it is the next deploy's change, not drift.
+Follow these steps in order and without pausing between them:
 
 1. **Enable the host hostengine.** Add the pinned DCGM install and `systemctl enable --now nvidia-dcgm` at the end of the
    shell part to the launch template: one version-release for both packages and every GPU node group of the cluster
@@ -2173,13 +2185,33 @@ order and without pausing between them:
    annotation `gpu-fault.io/dcgm-hostengine: host`), the cluster's Agents are re-installed in waves (Agent environment
    `GPU_FAULT_DCGM_HOSTENGINE=host`, node annotation `gpu-fault.io/installer-dcgm-hostengine=host`) and `site.yaml` records
    `dcgmHostEngine: host`. Between enabling the hostengine in step 1 and this deploy's re-render two hostengines run on
-   each node (the exporter's embedded one and the host service), so keep that window short.
+   each node (the exporter's embedded one and the host service), so keep that window short. Deploy even when the source
+   did not change; before it, `status` shows the `next deploy: DATA_PLANE_COMPATIBLE (dcgm_hostengine: ...)` above. A
+   refusal names every failed node on a line of its own (reasons whole, never cut; reasons beyond the line length are
+   counted) and each remedy once: the preflight batch writes a per-node report to a private file the release engine
+   names (`GPU_FAULT_NODE_PREFLIGHT_REPORT`), every node's DCGM state is recorded in the release state on a refusal too,
+   and the next `status --full` still shows `node_scope.dcgm_hostengine_nodes` (the `sync-state` re-commit after the
+   rollback keeps them). A refused and automatically rolled-back release does not leave `dcgmHostEngine: host` in
+   `site.yaml` as if it had been released: the rollback alignment restores the mode the rolled-back release ran (the
+   one its previous snapshot captured from the exporter's annotation); the node groups still declare host and `status`
+   keeps showing it as the next deploy's change; the `sync-state` after the rollback records `dcgm_hostengines_sha256`
+   from the mode the exporter actually runs, never a mode no release rolled. The release diff also probes the mode the
+   two mode-dependent renders actually run -- the exporter DaemonSet (annotation `gpu-fault.io/dcgm-hostengine`; an older
+   render without it by whether it dials `DCGM_REMOTE_HOSTENGINE_INFO`) and the node installer reconciler (environment
+   `GPU_FAULT_DCGM_HOSTENGINE`): either one differing from the `site.yaml` record is `dcgm_hostengine_drift`, planned like a
+   flip (exporter + reconciler + Agent, `DATA_PLANE_COMPATIBLE`), and no deploy shortcut skips it -- when the recorded
+   digest already says host while the exporter still runs embedded, only this probe makes the next deploy re-render it.
 5. **Check**: in the `gpu_cluster:<id>` check of `status --full`, `node_scope.dcgm_hostengine=host`,
    `node_scope.dcgm_hostengine_source=node-group-label`, an empty `node_scope.dcgm_hostengine_pending_nodes` (nodes whose
-   installed mode disagrees with the record) and `node_scope.dcgm_hostengine_conflict_nodes`, and `host-active` for every
-   node in `node_scope.dcgm_hostengine_nodes`; in `gpu-fault-admin node-scope --state-dir <dir>` every cluster's
-   `dcgm_hostengine` (`recorded`/`source`/`declared`/`state`/`refusal`) shows `state=converged` -- `pending deploy` means the
-   node groups' declaration changed and no deploy has run yet, `blocked` carries the refusal. Live, the `control_api`
+   installed mode disagrees with the record) and `node_scope.dcgm_hostengine_conflict_nodes`, `host-active` for every
+   node in `node_scope.dcgm_hostengine_nodes`, and `node_scope.dcgm_hostengine_served` (the mode the exporter and the
+   reconciler actually run) equal to `node_scope.dcgm_hostengine` -- otherwise the check fails (`<cluster> DCGM host engine
+   disagreement: site.yaml records host; the exporter DaemonSet gpu-fault-dcgm-exporter serves embedded; ...`) and the
+   remedy is a deploy; in `gpu-fault-admin node-scope --state-dir <dir>` every cluster's
+   `dcgm_hostengine` (`recorded`/`source`/`declared`/`declared_source`/`state`/`refusal`/`next_deploy`) shows
+   `state=converged` -- `pending deploy` means the node groups' declaration changed and no deploy has run yet
+   (`next_deploy` says the next deploy is `DATA_PLANE_COMPATIBLE`, re-renders the exporter and re-installs the Agents,
+   not a NOOP), `blocked` carries the refusal (the one the next deploy's discovery raises). Live, the `control_api`
    check's `clusters.<id>.dcgm_hostengine_live.down_nodes` is empty (below, "Live engine state").
 
 The node preflight classifies every `eks-managed` GPU node's DCGM state into one row of the table below and records it in

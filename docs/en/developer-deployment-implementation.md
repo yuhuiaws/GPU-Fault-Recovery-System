@@ -1482,6 +1482,8 @@ so the time of this phase can be attributed directly in the release log.
 Once an existing release has taken over monitoring, bootstrap still does not overwrite ADOT/AMP ahead of time. Ownership is judged from the CPU cluster's release
 state; a missing local site cannot prove this is a first install. Release classification runs a read-only check of ADOT declaration differences, available replicas and AMP
 definitions through `regional_observability_drift.observability_drift`; drift selects the OBSERVABILITY node, and even when the application source is unchanged the deploy-host-only/NOOP shortcut may not be taken.
+The same holds for the DCGM host engine mode: `dcgm_hostengine_drift` (the mode the exporter or the reconciler actually runs differs from the record), `dcgm_hostengines` (a recorded mode no release rolled yet) and a node group declaration change `status` reports (`dcgm_hostengine_declarations`);
+see `RELEASE_ONLY_CHANGES` in `scripts/staging_deploy.py` and `staging_deploy_inputs.dcgm_declaration_mode`, which reads the declaration itself with discovery's reads when the status brought none back and refuses a mixed one before any change.
 A legitimate unhealthy JSON that status returns with exit code 1 can still be used for release difference diagnosis, including monitoring and refresher drift;
 it does not constitute health evidence and cannot be reused as a passed verify. Invalid output and other exit codes are not accepted as normal diagnostics.
 The actual repair still happens after the previous snapshot; afterwards no-drift is proved again. When ADOT is missing, the CPU namespace
