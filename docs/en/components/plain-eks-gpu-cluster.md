@@ -216,6 +216,13 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
    refused by the embedded conflict check); to leave, remove the label, take `nvidia-dcgm` out of the launch template and
    run `systemctl disable --now nvidia-dcgm` on the nodes, then deploy at once (order and commands in
    administrator-operations §5.0.1, "Host DCGM").
+8. Automatic node updates: managed node groups have no scheduled update, but a Karpenter NodePool's `expireAfter`
+   (default 720h), drift and consolidation, EKS Auto Mode node pools, an ASG `MaxInstanceLifetime` and automation
+   calling `UpdateNodegroupVersion` on a schedule all replace GPU nodes: give the NodePools `expireAfter: Never` and a
+   `nodes: "0"` budget, keep `MaxInstanceLifetime` unset and move the automation into the maintenance window; the
+   Capacity Rebalance EKS enables on Spot node groups is handled by the replacement-node join window. `status
+   --full`/`node-scope` record and announce them (never refuse); the operator identity needs
+   `autoscaling:DescribeAutoScalingGroups` (administrator-operations §5.0.5).
 
 ## 4. Limitations
 

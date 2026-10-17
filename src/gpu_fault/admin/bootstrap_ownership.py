@@ -24,7 +24,9 @@ keeps selecting exactly what it selected.
 The same node groups also declare a node-image capability, which IS
 re-derived on every deploy and join: ``cluster_scope.DCGM_HOSTENGINE_LABEL``
 (``resolve_dcgm_hostengine``) says whether an EKS group's image runs a host
-DCGM the exporter and ``dcgmi diag`` can rely on.
+DCGM the exporter and ``dcgmi diag`` can rely on. HyperPod discovery also
+announces the automatic updates of the instance groups the scope selects
+(``automatic_node_updates``: advisory, never a refusal).
 """
 
 from __future__ import annotations
@@ -32,6 +34,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Sequence
 
+from gpu_fault.admin.automatic_node_updates import announce, hyperpod_updates
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.cluster_scope import (
     DCGM_HOSTENGINE_LABEL,
@@ -60,6 +63,7 @@ __all__ = [
     "dcgm_hostengine_remedy",
     "eks_nodegroup_facts",
     "groups_for_selector",
+    "hyperpod_groups_for_selector",
     "hyperpod_instance_group_facts",
     "hyperpod_node_scope",
     "label_remedy",
@@ -328,6 +332,22 @@ def groups_for_selector(
     return [item for item in facts if item.hosts_gpu_types]
 
 
+def hyperpod_groups_for_selector(
+    groups: Sequence[Any], *, cluster_name: str, selector: str
+) -> list[str]:
+    """The ``describe-cluster`` instance groups a HyperPod cluster's recorded
+    selector covers; an empty selector is the legacy cluster-name label, which
+    covers every group of the cluster."""
+
+    facts = [
+        hyperpod_instance_group_facts(group, cluster_name=cluster_name)
+        for group in groups
+        if isinstance(group, Mapping)
+    ]
+    effective = selector or f"{HYPERPOD_CLUSTER_LABEL}={cluster_name}"
+    return [item.name for item in groups_for_selector(facts, effective)]
+
+
 def dcgm_hostengine_remedy(*, cluster: str, group: str) -> str:
     """The provider command that declares a host DCGM on EKS node group ``group``."""
 
@@ -439,12 +459,20 @@ def hyperpod_node_scope(
     An already-managed cluster keeps what its site entry records (an empty
     selector is the legacy cluster-name default). A cluster joining now
     resolves through its instance groups' ``KubernetesConfig`` labels and is
-    refused without a group labelled for this site.
+    refused without a group labelled for this site. Either way the selected
+    groups' ``ScheduledUpdateConfig``/``AutoPatchConfig`` are announced on
+    stderr (``automatic_node_updates``), from the document already read.
     """
 
-    if recorded is not None:
-        return recorded.selector, recorded.source
     hyperpod_name = str(hyperpod.get("ClusterName") or "")
+    groups = [
+        group
+        for group in hyperpod.get("InstanceGroups") or ()
+        if isinstance(group, Mapping)
+    ]
+    if recorded is not None:
+        _announce_updates(hyperpod, groups, selector=recorded.selector)
+        return recorded.selector, recorded.source
     if site_id is None:
         raise BootstrapError(
             f"discovering the GPU instance groups of HyperPod cluster "
@@ -453,12 +481,42 @@ def hyperpod_node_scope(
     scope = resolve_node_scope(
         [
             hyperpod_instance_group_facts(group, cluster_name=hyperpod_name)
-            for group in hyperpod.get("InstanceGroups") or ()
-            if isinstance(group, Mapping)
+            for group in groups
         ],
         provider=ClusterProvider.HYPERPOD,
         cluster=hyperpod_name,
         site_id=site_id,
         hyperpod_cluster_name=hyperpod_name,
     )
+    _announce_updates(hyperpod, groups, owned=scope.owned_groups)
     return scope.selector, scope.source.value if scope.source is not None else ""
+
+
+def _announce_updates(
+    hyperpod: Mapping[str, Any],
+    groups: Sequence[Mapping[str, Any]],
+    *,
+    selector: str | None = None,
+    owned: Sequence[str] = (),
+) -> None:
+    """Discovery's advisory for the selected instance groups; never raises."""
+
+    name = str(hyperpod.get("ClusterName") or "")
+    try:
+        selected = (
+            list(owned)
+            if selector is None
+            else hyperpod_groups_for_selector(
+                groups, cluster_name=name, selector=selector
+            )
+        )
+        announce(
+            f"HyperPod cluster {name}",
+            hyperpod_updates(
+                groups,
+                selected=selected,
+                gpu_cluster_arn=str(hyperpod.get("ClusterArn") or ""),
+            ),
+        )
+    except Exception:  # noqa: BLE001 - an advisory never fails discovery
+        return

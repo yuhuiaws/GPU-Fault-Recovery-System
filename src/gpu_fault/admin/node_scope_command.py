@@ -23,6 +23,13 @@ input (``regional_release_node_scope``): the next ``deploy`` classifies the
 change ``DATA_PLANE_COMPATIBLE``, re-renders the connection Secret and
 restarts the executor, Completion Watcher and node installer reconciler that
 read it, and its verify refuses a cluster whose Secret still disagrees.
+
+Each cluster's report also carries ``automatic_node_updates``, the advisory
+block ``status --full`` records too: the selected HyperPod instance groups'
+``ScheduledUpdateConfig``/``AutoPatchConfig``, the selected EKS node groups'
+Auto Scaling ``MaxInstanceLifetime``/``CapacityRebalance`` and the site's
+Karpenter NodePools' ``expireAfter`` and budgets; its advisory lines follow the
+summary on stderr. It never changes ``convergence`` or the exit code.
 """
 
 from __future__ import annotations
@@ -39,6 +46,16 @@ from typing import Any, Callable, Mapping
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin import operator_identity
+from gpu_fault.admin.automatic_node_updates import (
+    ASG_QUERY,
+    FIELD as AUTOMATIC_NODE_UPDATES,
+    KARPENTER_NODEPOOLS,
+    advisory_lines,
+    eks_node_group_updates,
+    guarded,
+    hyperpod_updates,
+    karpenter_updates,
+)
 from gpu_fault.admin.bootstrap import discover_cluster
 from gpu_fault.admin.bootstrap_common import Arn, BootstrapError, CommandRunner
 from gpu_fault.admin.bootstrap_discovery import eks_nodegroup_documents
@@ -150,9 +167,10 @@ def _group_label(provider: ClusterProvider) -> str:
 
 def _node_group_facts(
     runner: CommandRunner, *, region: str, entry: Mapping[str, Any]
-) -> tuple[list[NodeGroupFacts], str, dict[str, str]]:
-    """The provider's node groups for ``entry``, the cluster's display name and,
-    for a plain EKS cluster, each managed node group's ``updateStrategy``."""
+) -> tuple[list[NodeGroupFacts], str, dict[str, Mapping[str, Any]]]:
+    """The provider's node groups for ``entry``, the cluster's display name and
+    each group's provider document by name (a plain EKS group's
+    ``updateStrategy`` and Auto Scaling groups are read from it)."""
 
     provider = cluster_provider(entry.get("provider"))
     if provider is ClusterProvider.EKS_MANAGED:
@@ -162,7 +180,7 @@ def _node_group_facts(
             [eks_nodegroup_facts(item) for item in documents],
             eks_name,
             {
-                str(item["nodegroupName"]): update_strategy(item)
+                str(item["nodegroupName"]): item
                 for item in documents
                 if item.get("nodegroupName")
             },
@@ -171,12 +189,19 @@ def _node_group_facts(
     described = runner.aws_json(
         region, "sagemaker", "describe-cluster", "--cluster-name", hyperpod_name
     )
-    facts = [
-        hyperpod_instance_group_facts(group, cluster_name=hyperpod_name)
+    groups = [
+        group
         for group in described.get("InstanceGroups") or ()
         if isinstance(group, Mapping)
     ]
-    return facts, hyperpod_name, {}
+    return (
+        [
+            hyperpod_instance_group_facts(group, cluster_name=hyperpod_name)
+            for group in groups
+        ],
+        hyperpod_name,
+        {str(group.get("InstanceGroupName") or ""): group for group in groups},
+    )
 
 
 def _kubectl(
@@ -306,6 +331,63 @@ def dcgm_hostengine_report(
     }
 
 
+def automatic_updates_report(
+    runner: CommandRunner,
+    *,
+    site: RenderedSite,
+    entry: Mapping[str, Any],
+    region: str,
+    selected: list[str],
+    documents: Mapping[str, Mapping[str, Any]],
+) -> dict[str, Any]:
+    """The ``automatic_node_updates`` block of one cluster (advisory only).
+
+    HyperPod reads nothing new; an eks-managed cluster adds one
+    ``describe-auto-scaling-groups`` and one Karpenter NodePool list, each
+    recorded ``unknown`` when it fails (``absent`` without the Karpenter CRD).
+    """
+
+    if cluster_provider(entry.get("provider")) is not ClusterProvider.EKS_MANAGED:
+        return hyperpod_updates(
+            documents.values(),
+            selected=selected,
+            gpu_cluster_arn=str(entry.get("eks_cluster_arn") or ""),
+        )
+
+    def read_nodepools() -> Mapping[str, Any] | None:
+        try:
+            raw = runner.run(
+                _kubectl(site, entry, "get", KARPENTER_NODEPOOLS, "-o", "json"),
+                capture=True,
+                timeout_seconds=60,
+            )
+        except BootstrapError as exc:
+            if "doesn't have a resource type" in str(exc):
+                return None
+            raise
+        value = json.loads(raw) if raw.strip() else {}
+        return value if isinstance(value, dict) else {}
+
+    return {
+        "node_groups": eks_node_group_updates(
+            documents,
+            selected=selected,
+            read_asgs=lambda names: runner.aws_json(
+                region,
+                "autoscaling",
+                "describe-auto-scaling-groups",
+                "--auto-scaling-group-names",
+                *names,
+                "--query",
+                ASG_QUERY,
+            ),
+        ),
+        "karpenter": karpenter_updates(
+            read_nodepools, site_id=str(site.release_config["site_name"])
+        ),
+    }
+
+
 def assess_cluster(
     runner: CommandRunner, *, site: RenderedSite, entry: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -316,7 +398,7 @@ def assess_cluster(
     site_id = str(site.release_config["site_name"])
     current_selector = node_selector(entry)
     current_source = node_selector_source(entry)
-    facts, cluster, strategies = _node_group_facts(runner, region=region, entry=entry)
+    facts, cluster, documents = _node_group_facts(runner, region=region, entry=entry)
     report: dict[str, Any] = {
         "cluster_id": entry["cluster_id"],
         "provider": provider.value,
@@ -329,9 +411,22 @@ def assess_cluster(
         "dcgm_hostengine": dcgm_hostengine_report(
             entry, facts, selector=current_selector, cluster=cluster
         ),
+        AUTOMATIC_NODE_UPDATES: guarded(
+            lambda: automatic_updates_report(
+                runner,
+                site=site,
+                entry=entry,
+                region=region,
+                selected=[
+                    item.name for item in groups_for_selector(facts, current_selector)
+                ],
+                documents=documents,
+            )
+        ),
     }
     if provider is ClusterProvider.EKS_MANAGED:
         selected = [item.name for item in groups_for_selector(facts, current_selector)]
+        strategies = {name: update_strategy(item) for name, item in documents.items()}
         report["update_strategy"] = {
             "node_groups": dict(sorted(strategies.items())),
             "advisories": [
@@ -617,4 +712,9 @@ def run_node_scope_command(
         print(
             f"gpu-fault-admin {COMMAND}: finding: {line}", file=sys.stderr, flush=True
         )
+    for item in reports:
+        for line in advisory_lines(
+            str(item["cluster_id"]), item.get(AUTOMATIC_NODE_UPDATES)
+        ):
+            print(f"gpu-fault-admin {COMMAND}: {line}", file=sys.stderr, flush=True)
     return 0

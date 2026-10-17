@@ -96,7 +96,9 @@ The current version still references the token, CA and fleet master through cont
 ## 4. First-Deployment Gates
 
 1. An existing 3-node CPU EKS/HyperPod cluster.
-2. At least one existing GPU EKS/HyperPod cluster with `NodeRecovery=None`.
+2. At least one existing GPU EKS/HyperPod cluster with `NodeRecovery=None`; the managed instance groups' / node groups'
+   automatic updates (HyperPod `ScheduledUpdateConfig` and the like) switched off and done by hand in a maintenance
+   window (announced only, see [Administrator Operations](administrator-operations.md) §5.0.5).
 3. The GPU VPC already has a usable NAT egress.
 4. The executing identity has ECR, EC2, RDS, AMP, SNS, EKS, Kubernetes and IAM permissions.
 5. The deployment host has the Python 3.12 project environment installed plus `aws`, `cosign`, Docker Buildx, `kubectl` (>=1.28: the release engine's wait loops use `kubectl wait --for=jsonpath=...` (including value-less field-existence checks) and `kubectl rollout status` instead of fixed-interval sleeps), `helm`, `curl`, `jq`, `openssl`, `sha256sum` and `make`; the ARN entry point verifies these commands before any AWS mutation but does not install system tools automatically.

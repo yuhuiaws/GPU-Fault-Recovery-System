@@ -43,6 +43,8 @@ rules:
       - src/gpu_fault/admin/node_scope_command.py
       - src/gpu_fault/admin/dcgm_declaration.py
       - src/gpu_fault/admin/site_identity_command.py
+      - src/gpu_fault/admin/automatic_node_updates.py
+      - src/gpu_fault/admin/hyperpod_scheduled_update.py
       - src/gpu_fault/admin/eks_nodegroup_*.py
       - src/gpu_fault/admin/bootstrap_iam_policies.py
       - src/gpu_fault/admin/cli_join.py
@@ -53,6 +55,9 @@ rules:
       - tests/admin/test_admin_ownership_label_discovery.py
       - tests/admin/test_admin_site_id_verb.py
       - tests/admin/test_admin_node_scope_verb.py
+      - tests/admin/test_admin_automatic_node_updates.py
+      - tests/admin/test_admin_hyperpod_scheduled_update.py
+      - tests/regional/test_regional_release_automatic_updates.py
       - tests/admin/_eks_nodegroup_world.py
       - tests/admin/test_admin_eks_nodegroup_*.py
       - tests/admin/_dcgm_declaration_world.py
@@ -75,6 +80,9 @@ rules:
       - tests/admin/test_admin_ownership_label_discovery.py
       - tests/admin/test_admin_site_id_verb.py
       - tests/admin/test_admin_node_scope_verb.py
+      - tests/admin/test_admin_automatic_node_updates.py
+      - tests/admin/test_admin_hyperpod_scheduled_update.py
+      - tests/regional/test_regional_release_automatic_updates.py
       - tests/admin/test_admin_eks_nodegroup_prepare.py
       - tests/admin/test_admin_eks_nodegroup_user_data.py
       - tests/admin/test_admin_eks_nodegroup_nodes.py

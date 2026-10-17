@@ -33,15 +33,18 @@ def test_public_help_offers_status_and_not_verify_or_preflight(capsys) -> None:
             f"{verb} is a driver passthrough, not a public verb"
         )
     assert admin_cli.PUBLIC_READONLY_COMMANDS == ("status",)
-    assert admin_cli.NODE_SCOPE_COMMANDS == ("site-id", "node-scope"), (
-        "the node-scope verbs are the read-only verbs outside the health report"
-    )
+    assert admin_cli.NODE_SCOPE_COMMANDS == (
+        "site-id",
+        "node-scope",
+        "hyperpod-scheduled-update",
+    ), "the node-scope verbs are the read-only verbs outside the health report"
     assert set(admin_cli.READONLY_COMMANDS) == {
         "status",
         "preflight",
         "verify",
         "site-id",
         "node-scope",
+        "hyperpod-scheduled-update",
     }
 
 

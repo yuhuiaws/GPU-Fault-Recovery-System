@@ -9,6 +9,16 @@ from typing import TYPE_CHECKING, Any
 if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease, Runner
 
+from gpu_fault.admin.automatic_node_updates import (
+    ASG_QUERY,
+    FIELD as AUTOMATIC_NODE_UPDATES,
+    KARPENTER_NODEPOOLS,
+    eks_node_group_updates,
+    guarded,
+    hyperpod_updates,
+    karpenter_updates,
+)
+from gpu_fault.admin.bootstrap_ownership import hyperpod_groups_for_selector
 from gpu_fault.admin.eks_nodegroup_update_strategy import update_strategy
 from gpu_fault.cluster_scope import is_eks_managed, node_selector
 from gpu_fault.eks_node_repair import (
@@ -206,6 +216,7 @@ def validate_eks_managed_cluster(
     region: str,
     expected_eks_arn: str,
     node_selector: str = "",
+    described: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """A plain EKS GPU cluster: the cluster and its managed node groups are ACTIVE
     and no node group hosting GPU nodes repairs them itself.
@@ -220,7 +231,9 @@ def validate_eks_managed_cluster(
     check records them; ``unset`` is the opt-in field never written, which EKS
     treats as off. ``update_strategy`` (``DEFAULT`` when absent) is recorded
     only: a GPU group not on ``MINIMAL`` gets an advisory in ``status --full``,
-    never a refusal (``eks_nodegroup_update_strategy``).
+    never a refusal (``eks_nodegroup_update_strategy``). ``described`` collects
+    each ``describe-nodegroup`` document, for the advisory reads that follow
+    (``eks_automatic_updates``).
     """
 
     eks_name = expected_eks_arn.rsplit("/", 1)[-1]
@@ -268,7 +281,7 @@ def validate_eks_managed_cluster(
     )
     facts: dict[str, dict[str, Any]] = {}
     for nodegroup in sorted(str(item) for item in nodegroups):
-        described = json.loads(
+        document = json.loads(
             runner.run(
                 [
                     "aws",
@@ -288,7 +301,9 @@ def validate_eks_managed_cluster(
                 capture=True,
             )
         )
-        group = described if isinstance(described, dict) else {}
+        group = document if isinstance(document, dict) else {}
+        if described is not None:
+            described[nodegroup] = group
         status = group.get("status")
         if status != "ACTIVE":
             raise ReleaseError(
@@ -320,7 +335,10 @@ def _validate_hyperpod_cluster(
     cluster_name: str,
     expected_eks_arn: str,
     require_node_recovery_none: bool,
-) -> None:
+) -> list[dict[str, Any]]:
+    """Bind the HyperPod cluster to its EKS ARN and NodeRecovery; return the
+    instance groups the same describe reads for ``hyperpod_automatic_updates``."""
+
     raw = runner.run(
         [
             "aws",
@@ -331,7 +349,7 @@ def _validate_hyperpod_cluster(
             "--cluster-name",
             cluster_name,
             "--query",
-            "{EksClusterArn:Orchestrator.Eks.ClusterArn,NodeRecovery:NodeRecovery}",
+            HYPERPOD_CONTEXT_QUERY,
             "--output",
             "json",
         ],
@@ -347,6 +365,88 @@ def _validate_hyperpod_cluster(
         raise ReleaseError(
             f"HyperPod cluster {cluster_name} must set NodeRecovery=None"
         )
+    groups = value.get("InstanceGroups")
+    return [item for item in groups or () if isinstance(item, dict)]
+
+
+#: The context describe of a HyperPod cluster: its binding, and per instance
+#: group what the automatic-update advisory needs (one read serves both).
+HYPERPOD_CONTEXT_QUERY = (
+    "{EksClusterArn:Orchestrator.Eks.ClusterArn,NodeRecovery:NodeRecovery,"
+    "InstanceGroups:InstanceGroups[].{InstanceGroupName:InstanceGroupName,"
+    "InstanceType:InstanceType,KubernetesConfig:KubernetesConfig,"
+    "ScheduledUpdateConfig:ScheduledUpdateConfig,AutoPatchConfig:AutoPatchConfig}}"
+)
+
+
+def hyperpod_automatic_updates(
+    groups: list[dict[str, Any]], target: ClusterTarget
+) -> dict[str, Any]:
+    """The advisory block of a HyperPod cluster: the instance groups its
+    recorded selector covers (``automatic_node_updates``); no extra read."""
+
+    selected = hyperpod_groups_for_selector(
+        groups,
+        cluster_name=target.hyperpod_cluster_name,
+        selector=node_selector(target),
+    )
+    return hyperpod_updates(
+        groups, selected=selected, gpu_cluster_arn=target.eks_cluster_arn
+    )
+
+
+def eks_automatic_updates(
+    release: RegionalRelease,
+    target: ClusterTarget,
+    described: dict[str, dict[str, Any]],
+    facts: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    """The advisory block of an eks-managed cluster (``automatic_node_updates``).
+
+    Two reads, both advisory -- a failure records ``unknown``, never fails the
+    check: the Auto Scaling groups of the node groups that host GPU nodes
+    (``autoscaling:DescribeAutoScalingGroups``) and the site's Karpenter
+    NodePools (a cluster without the CRD is ``absent``).
+    """
+
+    def read_asgs(names: Any) -> dict[str, Any]:
+        return aws_json(
+            release,
+            [
+                "autoscaling",
+                "describe-auto-scaling-groups",
+                "--region",
+                target.region,
+                "--auto-scaling-group-names",
+                *names,
+                "--query",
+                ASG_QUERY,
+            ],
+            region=False,
+        )
+
+    def read_nodepools() -> dict[str, Any] | None:
+        code, output, error = release.runner.probe_output(
+            release._gpu(target, "get", KARPENTER_NODEPOOLS, "-o", "json"),
+            timeout_seconds=60,
+        )
+        if code == 0:
+            value = json.loads(output) if output.strip() else {}
+            return value if isinstance(value, dict) else {}
+        if "doesn't have a resource type" in error:
+            return None
+        raise ReleaseError(error.strip() or f"kubectl exited {code}")
+
+    return {
+        "node_groups": eks_node_group_updates(
+            described,
+            selected=[name for name, item in facts.items() if item.get("gpu")],
+            read_asgs=read_asgs,
+        ),
+        "karpenter": karpenter_updates(
+            read_nodepools, site_id=release.config.site_name
+        ),
+    }
 
 
 def _validate_agent_endpoint_cidrs(
@@ -398,7 +498,8 @@ def _validate_agent_endpoint_cidrs(
 
 def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
     """Validate every context; return what the ``regional_contexts`` check records
-    (the cluster ids and, per eks-managed cluster, its node groups' facts)."""
+    (the cluster ids and, per eks-managed cluster, its node groups' facts; per
+    GPU cluster the ``automatic_node_updates`` advisory block)."""
 
     config = release.config
     runner = release.runner
@@ -430,6 +531,8 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
                 f"GPU context for {target.cluster_id} does not match "
                 "configured eks_cluster_arn"
             )
+        described: dict[str, dict[str, Any]] = {}
+        groups: list[dict[str, Any]] = []
         if is_eks_managed(target):
             providers[target.cluster_id] = {
                 "provider": "eks-managed",
@@ -438,11 +541,12 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
                     region=target.region,
                     expected_eks_arn=target.eks_cluster_arn,
                     node_selector=node_selector(target),
+                    described=described,
                 ),
             }
         else:
             providers[target.cluster_id] = {"provider": "hyperpod"}
-            _validate_hyperpod_cluster(
+            groups = _validate_hyperpod_cluster(
                 runner,
                 region=target.region,
                 cluster_name=target.hyperpod_cluster_name,
@@ -459,6 +563,16 @@ def ensure_region_contexts(release: RegionalRelease) -> dict[str, Any]:
         )
         release._validate_executor_iam_role(target)
         preflight_retired_collectors(release, target)
+        # Advisory only (automatic_node_updates): recorded beside the facts it
+        # extends, after every gate above, and never a failure of this check.
+        entry = providers[target.cluster_id]
+        entry[AUTOMATIC_NODE_UPDATES] = guarded(
+            lambda: (
+                eks_automatic_updates(release, target, described, entry["node_groups"])
+                if is_eks_managed(target)
+                else hyperpod_automatic_updates(groups, target)
+            )
+        )
 
     facts = {"clusters": [item.cluster_id for item in config.clusters]}
     if not config.clusters:

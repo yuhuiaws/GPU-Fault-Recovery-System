@@ -96,7 +96,9 @@ __all__ = [
     "ClusterGroups",
     "deregistered_clusters",
     "describe_cluster_groups",
+    "hyperpod_current_labels",
     "hyperpod_instance_group_specification",
+    "hyperpod_write_refusal",
     "nodepool_release_edit",
     "release_cluster_ownership",
     "release_command",
@@ -451,6 +453,12 @@ def _auto_patch_specification(details: Mapping[str, Any]) -> dict[str, Any]:
     return specification
 
 
+def hyperpod_current_labels(details: Mapping[str, Any]) -> dict[str, str]:
+    """The labels an instance group's nodes carry now (``CurrentLabels``)."""
+
+    return _hyperpod_labels(details)[0]
+
+
 def _hyperpod_labels(
     details: Mapping[str, Any],
 ) -> tuple[dict[str, str], dict[str, str] | None]:
@@ -490,18 +498,35 @@ def require_hyperpod_writable(groups: ClusterGroups, names: Sequence[str]) -> No
     informational: recorded per group in the evidence, never a refusal.
     """
 
-    if groups.cluster_status != "InService":
-        raise _refuse(
-            groups,
-            names[0],
-            f"the cluster is {groups.cluster_status or 'in an unknown state'} (an "
-            "update is in progress; UpdateCluster can scale or re-image a group)",
-        )
     for name in names:
-        details = groups.documents.get(name) or {}
-        reason = _hyperpod_unsettled(details) or _hyperpod_change_pending(details)
+        reason = hyperpod_write_refusal(
+            groups.cluster_status, groups.documents.get(name) or {}
+        )
         if reason is not None:
             raise _refuse(groups, name, reason)
+
+
+def hyperpod_write_refusal(
+    cluster_status: str,
+    details: Mapping[str, Any],
+    *,
+    allow_label_release: bool = True,
+) -> str | None:
+    """Why ``UpdateCluster`` with the group's full definition could do more than
+    the one change it carries, or ``None``: what ``require_hyperpod_writable``
+    refuses on. ``allow_label_release=False`` (a definition that keeps the
+    ``CurrentLabels``, ``hyperpod_scheduled_update``) also refuses while this
+    module's own release of the ownership label is still converging -- the
+    definition would put the label back."""
+
+    if cluster_status != "InService":
+        return (
+            f"the cluster is {cluster_status or 'in an unknown state'} (an "
+            "update is in progress; UpdateCluster can scale or re-image a group)"
+        )
+    return _hyperpod_unsettled(details) or _hyperpod_change_pending(
+        details, allow_label_release=allow_label_release
+    )
 
 
 def _hyperpod_unsettled(details: Mapping[str, Any]) -> str | None:
@@ -536,20 +561,23 @@ def _hyperpod_unsettled(details: Mapping[str, Any]) -> str | None:
     return None
 
 
-def _hyperpod_change_pending(details: Mapping[str, Any]) -> str | None:
+def _hyperpod_change_pending(
+    details: Mapping[str, Any], *, allow_label_release: bool = True
+) -> str | None:
     """Why a change other than this release is pending, or ``None``.
 
     Every ``Desired*`` the description carries must equal its ``Current*``
-    (the release's own pending label change excepted), and the running image
-    release must be one the service still offers, or ``UpdateCluster`` could
-    apply more than the label.
+    (the release's own pending label change excepted, unless
+    ``allow_label_release`` is false), and the running image release must be
+    one the service still offers, or ``UpdateCluster`` could apply more than
+    the label.
     """
 
     current, desired = _hyperpod_labels(details)
     if desired is not None and desired != current:
         pending_release = dict(current)
         pending_release.pop(OWNERSHIP_LABEL, None)
-        if desired != pending_release:
+        if not allow_label_release or desired != pending_release:
             return (
                 f"DesiredLabels {json.dumps(desired, sort_keys=True)} differ from "
                 f"CurrentLabels {json.dumps(current, sort_keys=True)} (a label "

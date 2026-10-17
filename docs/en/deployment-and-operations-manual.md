@@ -953,7 +953,9 @@ temporarily relaxed during a maintenance window:
 1. HyperPod `NodeRecovery` of a managed GPU cluster must be `None`;
    `NodeRecovery=Automatic` is not within the supported scope. The plain-EKS counterpart: a managed node group hosting
    GPU nodes with `nodeRepairConfig.enabled=true` (EKS node auto repair) is equally unsupported; join/deploy/status read
-   `describe-nodegroup` and refuse it.
+   `describe-nodegroup` and refuse it. The other automatic replacement/re-image mechanisms (an instance group's
+   `ScheduledUpdateConfig`/`AutoPatchConfig`, Karpenter expiry, an ASG `MaxInstanceLifetime`) are announced, not
+   refused: switch them off and update by hand in a maintenance window, see Administrator Operations §5.0.5.
 2. Under no circumstances may this solution's code or execution roles call
    `BatchReplaceClusterNodes`. `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` is always
    `false`, and the Executor IAM must not grant that API either. Production recovery uses only managed warm spares;

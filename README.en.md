@@ -129,7 +129,9 @@ Every production deployment must satisfy these common prerequisites before it st
    `nodeRepairConfig.enabled=false` or unset) and a schedulable non-GPU node group besides it. On
    `AL2023_x86_64_NVIDIA` node groups, `gpu-fault-admin prepare-eks-nodegroup` sets up the launch template user data
    for `python3.12`/`strace`, node auto repair off and the ownership label
-   ([Administrator Operations §5.0.1a](docs/en/administrator-operations.md)).
+   ([Administrator Operations §5.0.1a](docs/en/administrator-operations.md)). Automatic updates of the managed node
+   groups (HyperPod `ScheduledUpdateConfig`, Karpenter expiry, an ASG `MaxInstanceLifetime`) are switched off and done
+   by hand in a maintenance window (announced only; [Administrator Operations §5.0.5](docs/en/administrator-operations.md)).
 3. The GPU VPC already has NAT egress.
 4. The executing identity holds the required AWS, EKS and Kubernetes administrative permissions.
 5. The deploy host has the Python 3.12 project environment plus `aws`, `cosign`, Docker Buildx, `kubectl`, `helm`, `curl`, `jq`, `openssl`, `sha256sum` and `make`; the command only verifies these prerequisites and never installs system tools.

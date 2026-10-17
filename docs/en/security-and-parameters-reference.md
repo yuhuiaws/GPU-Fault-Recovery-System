@@ -72,7 +72,10 @@ and no `sagemaker:*`. The node scope is `GPU_FAULT_NODE_SELECTOR`; the CPU node 
 granted to no runtime role. So do `iam:GetOpenIDConnectProvider`, `iam:ListOpenIDConnectProviderTags`, `iam:ListRoles` (every
 role's trust policy in the account is read) and `iam:DeleteOpenIDConnectProvider`, which delete a solution-created Executor
 OIDC provider on its double proof (`remove-cluster`, and `uninstall` for a provider an earlier removal left); without any of
-the reads the proof fails, the provider is kept and a finding is printed.
+the reads the proof fails, the provider is kept and a finding is printed. The `autoscaling:DescribeAutoScalingGroups`
+read of the GPU node groups' Auto Scaling groups behind the automatic-node-update advisory (Administrator Operations
+§5.0.5) belongs to the operator identity as well (`join-cluster`/`deploy`/`status --full`/`node-scope`); denied, it
+records `unknown` and the command completes.
 
 ### 2.1 Regional Acceptance Fixture Boundaries
 

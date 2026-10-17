@@ -16,6 +16,7 @@ from pathlib import Path
 from typing import Any, cast
 
 from gpu_fault.admin import aurora_failback, eks_nodegroup_prepare, operator_identity
+from gpu_fault.admin import hyperpod_scheduled_update
 from gpu_fault.admin.deploy_host_binding import (
     DEPLOY_HOST_STATE_BINDING as DEPLOY_HOST_STATE_BINDING,
     enforce_deploy_host_state_dir,
@@ -193,9 +194,9 @@ COMMANDS = {
 # so the verb is `status`: five readable lines on stderr, the cheap checks by
 # default, `--full` for the whole report acceptance evidence records.
 PUBLIC_READONLY_COMMANDS = ("status",)
-# Read-only node-scope verbs: `site-id` (the ownership label value before the
-# first deploy) and `node-scope` (`--converge` is its one mutation).
-NODE_SCOPE_COMMANDS = ("site-id", "node-scope")
+# Read-only node-scope verbs: `site-id`, `node-scope` (`--converge` is its one
+# mutation) and `hyperpod-scheduled-update` (prints a command, never runs one).
+NODE_SCOPE_COMMANDS = ("site-id", "node-scope", hyperpod_scheduled_update.VERB)
 # Driver-only engine passthroughs: ``scripts/release_deploy.py`` runs `verify`
 # beside the stability window and ``scripts/staging_deploy.py`` runs
 # `preflight` for a deploy-host-only change. They are not advertised, not in
@@ -541,6 +542,7 @@ def parser() -> argparse.ArgumentParser:
     add_site_id_command(commands)
     eks_nodegroup_prepare.add_command(commands)
     add_node_scope_command(commands, _add_managed_site_arguments)
+    hyperpod_scheduled_update.add_command(commands)
     _add_admin_config_command(commands)
     _add_workflow_reconcile_command(commands)
     add_failure_domain_map_command(commands, _add_managed_site_arguments)
@@ -1325,6 +1327,8 @@ def run(arguments: argparse.Namespace) -> int:
         return run_site_id_command(arguments)
     if arguments.command == eks_nodegroup_prepare.VERB:
         return eks_nodegroup_prepare.run_command(arguments)
+    if arguments.command == hyperpod_scheduled_update.VERB:
+        return hyperpod_scheduled_update.run_command(arguments)
     if arguments.command == "node-scope":
         return run_node_scope_command(
             arguments,
@@ -1427,11 +1431,7 @@ def run(arguments: argparse.Namespace) -> int:
             env=environment,
             check=False,
         )
-        if completed.returncode:
-            return completed.returncode
-        if arguments.command != "deploy":
-            return 0
-        return 0
+        return completed.returncode
 
 
 def _run_reporting_failures(arguments: argparse.Namespace) -> int:

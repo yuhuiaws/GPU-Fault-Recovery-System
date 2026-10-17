@@ -22,6 +22,7 @@ rationale and special recovery steps are kept in the [Deployment and Operations 
 | Release across schema versions | `deploy --state-dir ... --accept-schema-change` (takes an Aurora snapshot first; `--accept-schema-change-without-snapshot` skips the snapshot) | §4.7 |
 | Join a GPU cluster | `deploy --state-dir ... --gpu-cluster-arn <all managed ARNs> --gpu-cluster-arn <new ARN>` (the given set must be the managed set or a superset of it; the extra ARNs are the joins; giving fewer is refused with `site manages GPU clusters the command omits ... use remove-cluster`; when there are code changes release first, then join), or the join-only `gpu-fault-admin join-cluster --state-dir ... --gpu-cluster-arn <new ARN>` (does not trigger a site release; already managed ARNs return `ALREADY_MANAGED`) | REG-8.1.5, §5 |
 | Remove a GPU cluster | `gpu-fault-admin remove-cluster --state-dir ... --gpu-cluster-arn <ARN> --confirm REMOVE_GPU_CLUSTER` | REG-8.1.6, REG-12, §5 |
+| Switch a HyperPod instance group's automatic updates off (`ScheduledUpdateConfig`/`AutoPatchConfig`; `status --full` reports `advisory: HyperPod instance group ...`) | `gpu-fault-admin hyperpod-scheduled-update --state-dir ... --gpu-cluster-arn <ARN>` is read-only and prints the `aws sagemaker update-cluster` to run in a maintenance window; manual updates use `update-cluster-software`; the plain-EKS equivalents (Karpenter expiry, an ASG `MaxInstanceLifetime`) are in the same section | §5.0.5 |
 | Reinstall while keeping the CPU/GPU EKS | `gpu-fault-admin uninstall --state-dir ... --cpu-cluster keep --confirm UNINSTALL_GPU_FAULT` followed by a fresh `deploy`; keep preserves Aurora by default (historical incidents/workflows are not lost), and only an explicit `--reset-database` wipes the database | §3 |
 | Permanently decommission and delete the CPU cluster | `gpu-fault-admin uninstall --state-dir ... --cpu-cluster delete --confirm DELETE_CPU_CONTROL_PLANE` (`--aurora-final-snapshot retain|skip` decides the final snapshot) | REG-13, §3 |
 | Troubleshoot PENDING/LEASED commands, Pods not Ready, certificate/Agent version drift | `gpu-fault-admin status --full` (the former `doctor` idea has been folded into status), then follow the symptom table | §7, REG-14.2/14.3 |
@@ -678,7 +679,8 @@ handled as above. When the old previous lacks the container environment snapshot
 but `/opt/gpu-fault`, `/var/lib/gpu-fault`, `/etc/gpu-fault` and all `gpu-fault-*` systemd
 units disappear, and the Agent lease expires accordingly. The node-installer-reconciler used to compare only annotations and Node UID,
 so it judged such a node `current` and did not reinstall; the release then failed at "previous Agent identity capture" with
-`<cluster> has no active Agent identity to capture`.
+`<cluster> has no active Agent identity to capture`. An instance group with a `ScheduledUpdateConfig` (or `AutoPatchConfig`)
+gets this re-image automatically on its schedule: switch it off and update by hand in a maintenance window, see §5.0.5.
 
 The reconciler now binds the installation record to `status.nodeInfo.bootID` (annotation
 `gpu-fault.io/installer-boot-id`): after a boot id change it first probes the Agent port
@@ -1387,7 +1389,9 @@ Semantics and boundaries of `eks-managed`:
   operator identity running `remove-cluster`/`uninstall` additionally needs `eks:UpdateNodegroupConfig` (eks-managed) /
   `sagemaker:UpdateCluster` (HyperPod) to release the ownership label (the "release" row of §5.0.0), and
   `iam:GetOpenIDConnectProvider`, `iam:ListOpenIDConnectProviderTags`, `iam:ListRoles` and
-  `iam:DeleteOpenIDConnectProvider` to delete a solution-created Executor OIDC provider on its double proof (§5) --
+  `iam:DeleteOpenIDConnectProvider` to delete a solution-created Executor OIDC provider on its double proof (§5); the
+  operator identity running `join-cluster`/`deploy`/`status --full`/`node-scope` also reads
+  `autoscaling:DescribeAutoScalingGroups` (the automatic-node-update advisory of §5.0.5; denied, it records `unknown`) --
   none of these is granted to the Executor or control-plane roles.
 - The Runtime Profile applies per cluster: the site profile (`spec.runtimeProfile`) is every GPU cluster's default
   pin; `hyperpod-v1` names the HyperPod adapter as nodeReboot owner, `eks-v1` the EKS adapter. A cluster whose
@@ -2136,6 +2140,7 @@ as `gpu-fault-admin node-scope: finding: <cluster id>: node group <g> updates wi
 HyperPod: SageMaker `UpdateClusterSoftware` re-images its instance groups in place, and its clusters have no such field.
 Only the `eks:DescribeNodegroup` read is needed:
 the operator identity and the executor role already hold it; the control-plane role needs nothing.
+The other mechanisms that replace or re-image GPU nodes on their own (Karpenter expiry/drift/consolidation, an ASG `MaxInstanceLifetime`, Spot Capacity Rebalance, EKS Auto Mode, automation calling `UpdateNodegroupVersion` on a schedule) are announced, never refused; §5.0.5 says how to switch them off and update by hand.
 
 **Host DCGM (optional): real verdicts from the quick diagnostic.** In the default embedded mode the exporter runs its own
 hostengine inside the container and the node has no host nv-hostengine to dial, so the Agent's quick diagnostic
@@ -2682,6 +2687,107 @@ judgement). The batch additionally refuses two members that share a VPC (known l
    when the ARNs it hands to the batch join (the added ARNs, or those after the first on a first deploy) contain such
    a pair, and again on a rerun; join those clusters with `join-cluster` as above. A site with registered Node key
    custody joins several ARNs one after the other and is not refused.
+
+#### 5.0.5 Automatic node updates: off, manual instead
+
+The GPU nodes the site manages must not be replaced or re-imaged by automatic provider schedules: administrators
+update node groups by hand in a maintenance window, and never while `gpu-fault-admin config`/`deploy` runs. EKS node
+auto repair stays a hard refusal (§5.0.1); the product records and announces (advisory) every other automatic
+mechanism below -- it changes no check verdict, no `healthy` and no exit code, and blocks neither `deploy` nor
+`join-cluster`:
+
+| Where | Recorded and announced |
+|---|---|
+| `join-cluster`/`deploy` discovery | once the node scope is resolved, one `gpu-fault-admin: advisory: ...` stderr line per finding: the `ScheduledUpdateConfig`/`AutoPatchConfig` of the selected HyperPod instance groups (read off the `describe-cluster` discovery already makes); a `MaxInstanceLifetime` on the Auto Scaling group of a selected eks-managed node group (one read-only `autoscaling describe-auto-scaling-groups`). There is no kube context yet, so Karpenter NodePools are read by the two below |
+| the `regional_contexts` check of `status --full` and deploy preflight | `details.providers.<cluster_id>.automatic_node_updates`: HyperPod `instance_groups[]` for the groups the cluster's recorded selector covers (`name`, `scheduled_update` = the cron expression or `null`, `auto_patch` = the patching strategy or `null`, `gpu_cluster_arn`), with no new read; eks-managed `node_groups[].auto_scaling_groups[]` for the node groups hosting GPU nodes (`name`, `max_instance_lifetime` in seconds or `null`, `capacity_rebalance`) and `karpenter` (`state` `read`/`absent` (no Karpenter CRD)/`unknown`; `nodepools[]`: `expire_after`, `budgets`, `zero_budget` of the NodePools whose template labels carry this site's ownership label). The `status --full` header gains one `advisory: ...` line per finding; the check still passes |
+| `gpu-fault-admin node-scope` | the same `automatic_node_updates` block in each cluster's report and one `advisory:` stderr line per finding after the summary; `convergence` and the exit code are unchanged |
+
+A failed read -- most often an operator identity without `autoscaling:DescribeAutoScalingGroups`, or a refused NodePool
+list -- records `unknown` with the reason and never fails the command. Only three findings are announced: a HyperPod
+instance group with a scheduled update (or automatic patching), an Auto Scaling group with a `MaxInstanceLifetime`, and a
+site GPU NodePool whose `expireAfter` is not `Never` or that has no zero disruption budget; `capacity_rebalance` and
+`unknown` are recorded only.
+
+**HyperPod: switch `ScheduledUpdateConfig` off.** An instance group's `ScheduledUpdateConfig` applies platform software
+updates on its cron expression: every instance of the group is re-imaged in place (same instance id, root volume
+replaced, the Node Agent reinstalled by the node installer reconciler, see §4.0); `AutoPatchConfig` applies security
+patch images on its patch schedule (cordon, then re-image). Switch both off on every instance group the site manages. A
+read-only helper verb prints the command to run and writes nothing itself:
+
+```bash
+gpu-fault-admin hyperpod-scheduled-update --state-dir /secure/gpu-fault \
+  --gpu-cluster-arn <HyperPod ARN or the EKS ARN it orchestrates> [--instance-group <instance group> ...]
+```
+
+- Selection: the groups `--instance-group` names; else the groups the `--state-dir` site's recorded selector covers
+  for the cluster (the groups labelled with this site's id when the site does not manage it); else the groups carrying
+  the ownership label. A plain EKS ARN is refused (managed node groups have no `ScheduledUpdateConfig`, see below).
+- Output: the stdout JSON gives each selected instance group's `outcome` (`disable` with `removes`, `none`, or
+  `refused` with `refusal`), `update_cluster.command` -- one `aws sagemaker update-cluster --instance-groups '<full
+  definition>'` --, `update_cluster.verify` (the `describe-cluster` read to run afterwards) and each group's
+  `manual_update`; stderr has one line per group and repeats the command to run.
+- The full definition comes from the builder the ownership release uses (§5.0.0, the "release" row: the
+  `ClusterInstanceGroupSpecification` fields taken from the current details, `ImageId`/`ImageReleaseVersion` from
+  `CurrentImageId`/`CurrentImageReleaseVersion`, `InstanceCount` from `TargetCount`, `MinInstanceCount` from
+  `MinCount`, labels and taints unchanged -- the ownership label stays), minus `ScheduledUpdateConfig` and
+  `AutoPatchConfig`. The refusals are the same too: the cluster or the group not `InService`, `ActiveOperations` not
+  empty, the last software update not settled, `CurrentCount≠TargetCount`, any `Desired*` differing from its `Current*`
+  (including an ownership-label release still converging -- the definition would write the label back), the running
+  image release `EndOfLife`, or a field the builder does not know; then no command is printed and the exit status is 2:
+  rerun once the update has finished.
+- How the schedule is removed (checked offline against the service model): only the `CreateCluster`/`UpdateCluster`
+  inputs carry the two fields; `ScheduleExpression` is required with a minimum length of 1 (as is `AutoPatchConfig`'s
+  `PatchingStrategy`), so neither an empty structure nor an empty expression is a valid request, and the full
+  definition without the field is the only request that can say "no schedule". The model does not say whether the
+  service reads an omitted field as "remove" or as "unchanged": after running the command, run the printed `verify` and
+  confirm the group's `ScheduledUpdateConfig` is `null` (a rerun of the verb shows the group `none`); if it is still
+  there, do not write it again and again -- the advisory keeps reporting it -- and confirm with AWS Support.
+
+Manual updates run in a maintenance window, one instance group at a time and one instance at a time:
+
+```bash
+aws sagemaker update-cluster-software --cluster-name <HyperPod name> \
+  --instance-groups InstanceGroupName=<instance group> \
+  --deployment-config 'RollingUpdatePolicy={MaximumBatchSize={Type=INSTANCE_COUNT,Value=1}},WaitIntervalInSeconds=<seconds>'
+# optional: append ,AutoRollbackConfiguration=[{AlarmName=<CloudWatch alarm>}] to --deployment-config to roll back on an alarm
+```
+
+Always pass `--instance-groups`: without it the service patches every instance group. Never run it while
+`config`/`deploy` runs, and never on top of another `update-cluster`. What the product does during the in-place
+re-image: the instances are re-imaged in batches, the Node object, its UID and its annotations stay, the host's
+`/opt/gpu-fault` and the other directories and every `gpu-fault-*` unit are gone, and the Agent lease expires; the node
+installer reconciler sees the boot id change, probes the Agent port and, with no answer once the node has been Ready for
+`GPU_FAULT_INSTALLER_REBOOT_GRACE_SECONDS` (default 600 s), reinstalls it in the normal waves (bounded by
+`max-unavailable`, §4.0). Until then the node has no Agent and takes none of this solution's node actions; while the
+cluster is not `InService` (`SystemUpdating`/`Updating`) the HyperPod reboot preflight refuses to submit. Run
+`config`/`deploy` only after the update has finished and every Agent has registered again; `status --full` is healthy
+again.
+
+**Plain EKS (eks-managed): no scheduled update, but equivalent automatic replacement.** A managed node group has no
+scheduled update: its version changes only on `UpdateNodegroupVersion`. These mechanisms still replace site GPU nodes:
+
+| Mechanism | Behaviour | What this solution requires and shows |
+|---|---|---|
+| EKS node auto repair | reboots/replaces unhealthy nodes by itself | hard refusal (§5.0.1), unchanged |
+| Karpenter NodePool (template labels carry `gpu-fault.io/control-plane=<site id>`, §5.0.0) | `expireAfter` replaces nodes forcibly on expiry (default 720h; expiry ignores disruption budgets), drift and consolidation replace them within the budgets | set `spec.template.spec.expireAfter: Never` and a disruption budget `nodes: "0"` (or a schedule budget that opens only in the maintenance window); `expire_after`/`budgets` recorded, announced when `expireAfter` is not `Never` or there is no zero budget |
+| EKS Auto Mode node pools | nodes expire and are replaced automatically | not suitable for site GPU nodes |
+| ASG Capacity Rebalance of a Spot managed node group | enabled by EKS (not configurable through EKS); replaces instances early when their Spot interruption risk rises | inherent Spot behaviour, handled by the replacement-node join window of §5.0; `capacity_rebalance` recorded, not announced |
+| ASG `MaxInstanceLifetime` | replaces each instance at that age | must stay unset; announced when set, cleared with `aws autoscaling update-auto-scaling-group --auto-scaling-group-name <ASG> --max-instance-lifetime 0` |
+| Customer automation calling `UpdateNodegroupVersion` | pipelines, EventBridge Scheduler, SSM Automation roll the node group on a schedule | move it into the maintenance window, never while `config`/`deploy` runs (the group is `UPDATING` during the roll and the `regional_contexts` preflight fails closed) |
+
+A Karpenter NodePool is the customer's provisioning CRD and the product never edits it; one patch for both settings
+(a merge patch replaces the whole `budgets` list):
+
+```bash
+kubectl --context <GPU context> patch nodepool <NodePool> --type merge \
+  -p '{"spec":{"template":{"spec":{"expireAfter":"Never"}},"disruption":{"budgets":[{"nodes":"0"}]}}}'
+```
+
+**Permissions.** The reads use the identity of the operator running the command: `sagemaker:DescribeCluster` (plus
+`sagemaker:ListClusters` for the helper given an EKS ARN the site does not record), `eks:DescribeNodegroup`,
+`autoscaling:DescribeAutoScalingGroups`, and list on `nodepools.karpenter.sh` in the GPU cluster. Running the printed
+commands also needs `sagemaker:UpdateCluster`, `sagemaker:UpdateClusterSoftware` or `autoscaling:UpdateAutoScalingGroup`.
+No runtime role is granted any of them.
 
 ### 5.1 Node Failure-Domain Mapping (Automatic)
 

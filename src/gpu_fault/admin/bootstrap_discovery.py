@@ -14,6 +14,11 @@ from pathlib import Path
 import yaml  # type: ignore[import-untyped,unused-ignore]
 from typing import Any, Callable, Mapping, Sequence
 
+from gpu_fault.admin.automatic_node_updates import (
+    ASG_QUERY,
+    announce,
+    eks_node_group_updates,
+)
 from gpu_fault.admin.bootstrap_common import (
     Arn,
     BootstrapError,
@@ -310,7 +315,10 @@ def gpu_nodegroups(
     already-managed cluster (``recorded``) keeps the selector its site entry
     records and the groups are the ones that selector covers. Every selected
     group must be ACTIVE and must not repair its own nodes; the CPU node groups
-    never qualify, so their subnets never widen the Agent endpoint CIDRs.
+    never qualify, so their subnets never widen the Agent endpoint CIDRs. A
+    resolved scope also announces a set ``MaxInstanceLifetime`` on the selected
+    groups' Auto Scaling groups (``automatic_node_updates``: one read-only
+    ``describe-auto-scaling-groups``, advisory, never a refusal).
     """
 
     described = eks_nodegroup_documents(runner, region=region, eks_name=eks_name)
@@ -362,7 +370,39 @@ def gpu_nodegroups(
         )
         if reason is not None:
             raise BootstrapError(reason)
+    if scope.source is not None:
+        _announce_updates(runner, region=region, eks_name=eks_name, selected=selected)
     return selected, scope
+
+
+def _announce_updates(
+    runner: CommandRunner,
+    *,
+    region: str,
+    eks_name: str,
+    selected: Sequence[Mapping[str, Any]],
+) -> None:
+    """Discovery's advisory for the selected node groups' Auto Scaling groups."""
+
+    documents = {str(item.get("nodegroupName") or ""): item for item in selected}
+    announce(
+        f"EKS cluster {eks_name}",
+        {
+            "node_groups": eks_node_group_updates(
+                documents,
+                selected=documents,
+                read_asgs=lambda names: runner.aws_json(
+                    region,
+                    "autoscaling",
+                    "describe-auto-scaling-groups",
+                    "--auto-scaling-group-names",
+                    *names,
+                    "--query",
+                    ASG_QUERY,
+                ),
+            )
+        },
+    )
 
 
 def discover_eks_managed_cluster(

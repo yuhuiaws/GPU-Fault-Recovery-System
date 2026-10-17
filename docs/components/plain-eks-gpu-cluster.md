@@ -163,6 +163,11 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    deploy/join（源码不变也照样 deploy，它会重读标签；之前 `status` 显示待生效的 `next deploy`；启用而不加标签的 deploy 会被
    embedded 冲突检查拒绝）；退出时摘标签、把 `nvidia-dcgm` 从 launch template 拿掉并在节点上
    `systemctl disable --now nvidia-dcgm`，再立即 deploy（次序与命令见管理员日常运维 §5.0.1「主机 DCGM」）。
+8. 自动节点更新：托管节点组没有计划更新，但 Karpenter NodePool 的 `expireAfter`（默认 720h）、drift 与 consolidation、
+   EKS Auto Mode 节点池、ASG `MaxInstanceLifetime` 和按计划调用 `UpdateNodegroupVersion` 的自动化都会替换 GPU 节点：
+   NodePool 设 `expireAfter: Never` 并加 `nodes: "0"` 预算，`MaxInstanceLifetime` 保持未设置，自动化移到维护窗口；Spot 节点组的
+   Capacity Rebalance 由 EKS 开启，按替换节点的接入窗口处理。`status --full`/`node-scope` 记录并提示（不拒绝），操作者身份需
+   `autoscaling:DescribeAutoScalingGroups`（管理员日常运维 §5.0.5）。
 
 ## 4. 限制
 

@@ -5,6 +5,8 @@ import json
 import os
 from typing import Any
 
+from gpu_fault.admin.automatic_node_updates import FIELD as AUTOMATIC_NODE_UPDATES
+from gpu_fault.admin.automatic_node_updates import advisory_lines
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_admin_checks import (
@@ -1173,6 +1175,7 @@ def status_header_lines(report: dict[str, Any], *, json_destination: str) -> lis
         *partial,
         "failing checks: " + (", ".join(failing) if failing else "none"),
         *_control_api_findings(health),
+        *automatic_update_lines(health),
         f"full JSON report: {json_destination}",
     ]
 
@@ -1186,6 +1189,32 @@ def _control_api_findings(health: object) -> list[str]:
         details = check.get("details") if isinstance(check, dict) else None
         if check.get("name") == "control_api" and isinstance(details, dict):
             return [*departed_node_lines(details), *dcgm_hostengine_lines(details)]
+    return []
+
+
+def automatic_update_lines(health: object) -> list[str]:
+    """The advisory lines of the ``regional_contexts`` check's
+    ``automatic_node_updates`` blocks (``status --full``, which runs the check):
+    a scheduled or auto-patched HyperPod instance group, a set
+    ``MaxInstanceLifetime``, a site NodePool that expires or has no zero
+    budget. Lines only -- the check's status and ``healthy`` are untouched."""
+
+    checks = health.get("checks") if isinstance(health, dict) else None
+    for check in checks if isinstance(checks, list) else []:
+        details = check.get("details") if isinstance(check, dict) else None
+        if check.get("name") != "regional_contexts" or not isinstance(details, dict):
+            continue
+        providers = details.get("providers")
+        return [
+            line
+            for cluster_id, entry in sorted(
+                (providers if isinstance(providers, dict) else {}).items()
+            )
+            if isinstance(entry, dict)
+            for line in advisory_lines(
+                str(cluster_id), entry.get(AUTOMATIC_NODE_UPDATES)
+            )
+        ]
     return []
 
 
