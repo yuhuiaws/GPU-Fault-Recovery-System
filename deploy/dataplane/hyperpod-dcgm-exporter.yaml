@@ -18,6 +18,17 @@ spec:
     metadata:
       labels:
         app: gpu-fault-dcgm-exporter
+      # dcgm-exporter reads its counters CSV only at process start, and the
+      # ConfigMap below is mounted with subPath, which kubelet never refreshes
+      # in a running Pod. A CSV-only change would leave this template as it
+      # is, and re-applying an unchanged template restarts nothing: the new
+      # fields would never be exported. The digest of the CSV the ConfigMap is
+      # built from is rendered here (render_dcgm_exporter_manifest in
+      # regional_release_rendering; the legacy deploy.sh seds it in), so a
+      # counters change is a template change and rolls the Pods one node at a
+      # time (maxUnavailable: 1).
+      annotations:
+        gpu-fault.io/dcgm-counters-sha256: "REPLACE_WITH_DCGM_COUNTERS_SHA256"
     spec:
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet

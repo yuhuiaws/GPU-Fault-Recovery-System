@@ -29,6 +29,7 @@ from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseErro
 from gpu_fault_release.regional_release_probes import probe_source
 from gpu_fault_release.regional_release_rendering import (
     DATAPLANE_ADOT_DEPLOYMENT,
+    DCGM_COUNTERS_CSV,
     dataplane_adot_skip_reason,
     render_dataplane_adot_for_target,
     render_dcgm_exporter_manifest,
@@ -49,7 +50,9 @@ def _render_gpu_dcgm_exporter(
     image: str | None = None,
     dcgm_hostengine: str | None = None,
 ) -> tuple[str, str]:
-    counters = ROOT / "deploy/dataplane/dcgm-counters.csv"
+    # The file whose digest the rendered pod template carries, so a counters
+    # change rolls the exporter Pods (the CSV is read only at start).
+    counters = ROOT / DCGM_COUNTERS_CSV
     rendered_config_map = release.runner.run(
         release._gpu(
             target,

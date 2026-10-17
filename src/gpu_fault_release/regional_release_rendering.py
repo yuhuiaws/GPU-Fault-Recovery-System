@@ -61,6 +61,26 @@ DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
 DEFAULT_DCGM_EXPORTER_IMAGE = "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04"
 #: What the checked-in DaemonSet carries in place of the instance-type list.
 SUPPORTED_INSTANCE_TYPES_PLACEHOLDER = "REPLACE_WITH_SUPPORTED_INSTANCE_TYPES"
+#: The exporter's counters CSV, relative to the repository root: the file the
+#: ``gpu-fault-dcgm-counters`` ConfigMap is built from
+#: (``regional_gpu_bootstrap``) and whose digest the pod template carries.
+DCGM_COUNTERS_CSV = "deploy/dataplane/dcgm-counters.csv"
+#: What the checked-in pod template carries in place of that digest.
+DCGM_COUNTERS_SHA256_PLACEHOLDER = "REPLACE_WITH_DCGM_COUNTERS_SHA256"
+
+
+def dcgm_counters_sha256() -> str:
+    """The sha256 of the counters CSV, for the exporter's pod template.
+
+    dcgm-exporter reads the CSV only at process start, and the DaemonSet mounts
+    the ConfigMap with ``subPath``, which a running Pod never sees refreshed. A
+    CSV-only release would apply a new ConfigMap and an unchanged template, and
+    an unchanged template restarts no Pod: the new fields would never be
+    exported. With the digest in the template, a counters change rolls the
+    DaemonSet.
+    """
+
+    return hashlib.sha256((ROOT / DCGM_COUNTERS_CSV).read_bytes()).hexdigest()
 
 
 def _supported_instance_types() -> str:
@@ -174,7 +194,9 @@ def render_dcgm_exporter_manifest(
     The collect period (``-c``) is rendered from
     :data:`gpu_fault.dcgm_exporter_cadence.DCGM_EXPORTER_COLLECT_INTERVAL_MS`,
     the same constant the node installer reconciler hands every install Job so
-    the host collector learns the period of an ``existing`` exporter.
+    the host collector learns the period of an ``existing`` exporter. The pod
+    template's ``gpu-fault.io/dcgm-counters-sha256`` is
+    :func:`dcgm_counters_sha256`, so a counters-only change rolls the Pods.
     """
 
     text = (ROOT / "deploy/dataplane/hyperpod-dcgm-exporter.yaml").read_text(
@@ -194,10 +216,12 @@ def render_dcgm_exporter_manifest(
             DCGM_EXPORTER_COLLECT_INTERVAL_PLACEHOLDER,
             str(DCGM_EXPORTER_COLLECT_INTERVAL_MS),
         )
+        .replace(DCGM_COUNTERS_SHA256_PLACEHOLDER, dcgm_counters_sha256())
     )
     for placeholder in (
         SUPPORTED_INSTANCE_TYPES_PLACEHOLDER,
         DCGM_EXPORTER_COLLECT_INTERVAL_PLACEHOLDER,
+        DCGM_COUNTERS_SHA256_PLACEHOLDER,
     ):
         if placeholder in text:
             raise ReleaseError(f"DCGM exporter manifest still carries {placeholder}")

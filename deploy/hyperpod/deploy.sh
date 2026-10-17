@@ -2660,7 +2660,7 @@ configure_dcgm_exporter() {
             gpu-fault-dcgm-exporter --ignore-not-found
         return 0
     fi
-    local instance_type
+    local instance_type counters_sha256
     instance_type="$(
         kubectl get nodes \
             -l "sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER_NAME}" \
@@ -2671,17 +2671,17 @@ configure_dcgm_exporter() {
             "${HYPERPOD_CLUSTER_NAME}" >&2
         return 1
     }
-    # Two placeholders the regional release renders from gpu_instance_inventory
-    # and dcgm_exporter_cadence; this legacy path has no renderer, so it pins
-    # the one instance type found above (see the patch below) and the reviewed
-    # period. Applied verbatim, the affinity matches no node: zero Pods and a
-    # trivially passing `rollout status`. Legacy caveat: the period reaches only
-    # this DaemonSet; run_node_installer_job's Jobs pass an empty
-    # DCGM_EXPORTER_INTERVAL_MS, so `existing`-mode nodes never learn it.
+    # Placeholders the regional release renders, pinned here by hand: the type
+    # found above (see the patch below), the reviewed period and the counters
+    # CSV digest. Verbatim, the affinity matches no node: zero Pods and a
+    # trivially passing `rollout status`. Caveat: run_node_installer_job's Jobs
+    # pass an empty DCGM_EXPORTER_INTERVAL_MS; `existing` nodes never learn it.
+    counters_sha256="$(sha256sum "${REPO_DIR}/deploy/dataplane/dcgm-counters.csv" | cut -d' ' -f1)"
     sed \
         -e "s#${DEFAULT_DCGM_EXPORTER_IMAGE}#${DCGM_EXPORTER_IMAGE}#g" \
         -e "s#REPLACE_WITH_SUPPORTED_INSTANCE_TYPES#\"${instance_type}\"#g" \
         -e "s#REPLACE_WITH_DCGM_EXPORTER_COLLECT_INTERVAL_MS#15000#g" \
+        -e "s#REPLACE_WITH_DCGM_COUNTERS_SHA256#${counters_sha256}#g" \
         "${REPO_DIR}/deploy/dataplane/hyperpod-dcgm-exporter.yaml" |
         kubectl apply -f -
     kubectl -n "${NAMESPACE}" patch daemonset \

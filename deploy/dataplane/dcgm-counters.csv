@@ -11,6 +11,8 @@ DCGM_FI_DEV_SM_CLOCK, gauge, SM clock in MHz
 DCGM_FI_DEV_MEM_CLOCK, gauge, Memory clock in MHz
 DCGM_FI_DEV_CLOCK_THROTTLE_REASONS, gauge, Active clock throttle reason bitmask
 DCGM_FI_DEV_XID_ERRORS, gauge, Last XID error code
+DCGM_FI_DEV_FABRIC_MANAGER_STATUS, gauge, NVLink fabric registration state (dcgmFabricManagerStatus_t: 0 not supported / 1 not started / 2 in progress / 3 success / 4 failure)
+DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE, gauge, DCGM return code of a completed NVLink fabric registration (0 = OK; no sample until registration completes)
 DCGM_FI_DEV_ECC_SBE_VOL_TOTAL, counter, Volatile corrected ECC errors
 DCGM_FI_DEV_ECC_DBE_VOL_TOTAL, counter, Volatile uncorrected ECC errors
 DCGM_FI_DEV_ECC_SBE_AGG_TOTAL, counter, Aggregate corrected ECC errors
