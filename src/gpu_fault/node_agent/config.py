@@ -9,6 +9,8 @@ import tempfile
 from collections.abc import Mapping
 from pathlib import Path
 
+from gpu_fault.cluster_scope import DCGM_HOSTENGINE_ENV, ClusterProvider
+from gpu_fault.cluster_scope import dcgm_hostengine as parse_dcgm_hostengine
 from gpu_fault.env import env_bool
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.node_agent.common import (
@@ -202,6 +204,30 @@ def protected_quiesce_services(
     return ()
 
 
+def dcgm_hostengine_from_environment(
+    provider: str, environ: Mapping[str, str] | None = None
+) -> str:
+    """The node's DCGM host engine mode (``cluster_scope.DcgmHostEngine``).
+
+    ``GPU_FAULT_DCGM_HOSTENGINE`` as the node installer wrote it: ``host`` or
+    ``embedded`` on an ``eks-managed`` node, absent (``embedded``) on one
+    installed before the mode existed. HyperPod always runs DCGM as a host
+    service. Any other spelling fails the Agent start: the mode decides
+    whether an unreachable engine drains the node. Not part of the config
+    digest, like the provider itself.
+    """
+
+    values = os.environ if environ is None else environ
+    kind = (
+        ClusterProvider.EKS_MANAGED
+        if provider == "eks-managed"
+        else ClusterProvider.HYPERPOD
+    )
+    return parse_dcgm_hostengine(
+        None, provider=kind, mode=values.get(DCGM_HOSTENGINE_ENV) or ""
+    ).value
+
+
 def _quiesce_from_environment(proc_root, operations):
     quiesce_enabled = env_bool("GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE", False)
     state_dir = os.getenv(
@@ -294,6 +320,9 @@ def _quiesce_from_environment(proc_root, operations):
 def _executor_from_settings(
     node_ids, operations, proc_root, quiesce_enabled, quiesce_manager
 ):
+    provider = (
+        str(os.getenv("GPU_FAULT_CLUSTER_PROVIDER") or "hyperpod").strip() or "hyperpod"
+    )
     return NodeActionExecutor(
         require_final_ownership=True,
         secret=os.getenv("GPU_FAULT_NODE_ACTION_SECRET", ""),
@@ -311,10 +340,8 @@ def _executor_from_settings(
             "GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART", False
         ),
         service_quiesce_enabled=quiesce_enabled,
-        cluster_provider=(
-            str(os.getenv("GPU_FAULT_CLUSTER_PROVIDER") or "hyperpod").strip()
-            or "hyperpod"
-        ),
+        cluster_provider=provider,
+        dcgm_hostengine=dcgm_hostengine_from_environment(provider),
         diagnostic_output_dir=os.getenv(
             "GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR",
             "/var/lib/gpu-fault/diagnostics",

@@ -66,14 +66,19 @@ DCGM_UNAVAILABLE_GUIDANCE = {
     "DCGM_TOOL_UNAVAILABLE": (
         "dcgmi is not installed on this node (plain EKS NVIDIA AMIs ship no "
         "DCGM host tools); GPU metrics still come from the exporter's embedded "
-        "hostengine. Install datacenter-gpu-manager on the node image if the "
-        "quick diagnostic is required."
+        "hostengine. For real DCGM diagnostic verdicts install and enable the "
+        "pinned datacenter-gpu-manager-4 packages (nvidia-dcgm) in the node "
+        "group's launch template and declare host mode with the node-group "
+        "label gpu-fault.io/dcgm-hostengine=host (管理员日常运维 / "
+        "administrator-operations §5.0.1)."
     ),
     "DCGM_HOSTENGINE_UNAVAILABLE": (
-        "dcgmi found no nv-hostengine to connect to (a plain EKS node runs DCGM "
-        "only inside the exporter's embedded hostengine); GPU metrics still come "
-        "from the exporter. Run a host nv-hostengine on the node image if the "
-        "quick diagnostic is required."
+        "dcgmi found no nv-hostengine to connect to (a plain EKS node in the "
+        "embedded mode runs DCGM only inside the exporter); GPU metrics still "
+        "come from the exporter. For real DCGM diagnostic verdicts enable "
+        "nvidia-dcgm in the node group's launch template and declare host mode "
+        "with the node-group label gpu-fault.io/dcgm-hostengine=host (管理员日常运维 "
+        "/ administrator-operations §5.0.1)."
     ),
 }
 
@@ -110,6 +115,7 @@ class DiagnosticOperationsMixin:
     _capture_hung_process_state: Callable[..., Any]
     _verify_no_clients: Callable[..., Any]
     cluster_provider: str
+    dcgm_hostengine: str
     diagnostic_max_archives: int
     diagnostic_output_dir: Path
     diagnostic_retention_seconds: int
@@ -585,6 +591,12 @@ class DiagnosticOperationsMixin:
     def _run_dcgm_diagnostic(self, command: NodeActionCommand) -> dict[str, Any]:
         tool_unavailable: str | None = None
         unavailable_code = "DCGM_TOOL_UNAVAILABLE"
+        eks_managed = self.cluster_provider == "eks-managed"
+        # A plain EKS node whose node group declares a host DCGM
+        # (gpu-fault.io/dcgm-hostengine=host) promised one: there, as for an
+        # unreachable engine on HyperPod, its absence is a failure, not a
+        # configuration-only warning.
+        host_engine_declared = eks_managed and self.dcgm_hostengine == "host"
         try:
             result = self.runner(
                 ["dcgmi", "diag", "-r", "1", "-j"],
@@ -597,12 +609,15 @@ class DiagnosticOperationsMixin:
             # A plain EKS node (AL2023 NVIDIA AMI) ships no DCGM host tools:
             # no dcgmi, no nv-hostengine. That is a host configuration fact,
             # not a GPU verdict -- the node must not be drained for it.
-            tool_unavailable = f"dcgmi unavailable on this node: {exc}"
+            reason = f"dcgmi unavailable on this node: {exc}"
+            tool_unavailable = None if host_engine_declared else reason
             result = subprocess.CompletedProcess(
-                ["dcgmi", "diag", "-r", "1", "-j"], 127, "", tool_unavailable
+                ["dcgmi", "diag", "-r", "1", "-j"], 127, "", reason
             )
-        if self.cluster_provider == "eks-managed" and dcgm_hostengine_unreachable(
-            result
+        if (
+            eks_managed
+            and not host_engine_declared
+            and dcgm_hostengine_unreachable(result)
         ):
             # The image may ship dcgmi without a host nv-hostengine (live
             # 2026-10-06, exit status 226 = DCGM_ST_CONNECTION_NOT_VALID): on
@@ -690,7 +705,7 @@ class DiagnosticOperationsMixin:
                 configuration_only=configuration_only,
             )
         )
-        return {
+        details: dict[str, Any] = {
             "diagnostic_outcome": outcome,
             "configuration_only_failures": configuration_only,
             "returncode": result.returncode,
@@ -711,6 +726,10 @@ class DiagnosticOperationsMixin:
             "sha256": digest,
             "size_bytes": output_path.stat().st_size,
         }
+        if eks_managed:
+            # Which grading applied; a HyperPod result stays exactly as it was.
+            details["dcgm_hostengine"] = self.dcgm_hostengine
+        return details
 
     def _run_checked(
         self, command: list[str], *, timeout: int

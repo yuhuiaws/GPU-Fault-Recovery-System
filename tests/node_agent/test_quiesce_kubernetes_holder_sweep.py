@@ -204,8 +204,11 @@ def test_only_the_eks_managed_installer_job_asks_for_the_sweep() -> None:
     assert 'if [[ "\\${CLUSTER_PROVIDER}" == "eks-managed" ]]; then' in job
     assert (
         "quiesce_args=(--quiesce-sweep-kubernetes-device-holders "
-        "--cluster-provider eks-managed)"
-    ) in job, "the eks-managed agent learns its provider with the sweep switch"
+        "--cluster-provider eks-managed${DCGM_HOSTENGINE_INSTALLER_ARGS})"
+    ) in job, (
+        "the eks-managed agent learns its provider (and, when the release sets "
+        "it, its DCGM host engine mode) with the sweep switch"
+    )
     assert '"\\${quiesce_args[@]}"' in job, "the installer receives the provider's args"
     assert "--quiesce-sweep-kubernetes-device-holders)" in installer
     assert "--cluster-provider) require_value" in installer

@@ -224,6 +224,7 @@
       "gpu-fault.io/installer-artifact-sha256",
       "gpu-fault.io/installer-bundle-sha256",
       "gpu-fault.io/installer-template-sha256",
+      "gpu-fault.io/installer-dcgm-hostengine",
       "gpu-fault.io/installer-node-uid",
       "gpu-fault.io/installer-state",
       "gpu-fault.io/installer-boot-id",

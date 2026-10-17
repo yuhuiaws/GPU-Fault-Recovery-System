@@ -10,6 +10,11 @@ HYPERPOD_CLUSTER="${GPU_FAULT_HYPERPOD_CLUSTER:-${CLUSTER_ID}}"
 # Provider scope (gpu_fault.cluster_scope): the GPU node selector defaults to
 # the HyperPod cluster label; a plain EKS (eks-managed) cluster passes its own.
 CLUSTER_PROVIDER="${GPU_FAULT_CLUSTER_PROVIDER:-hyperpod}"
+# eks-managed only: `host` when the cluster's node groups declare a host
+# nvidia-dcgm (gpu-fault.io/dcgm-hostengine=host), `embedded` otherwise. Baked
+# into the installer template and the reconciler's node identity, so a mode
+# change re-installs the Agents; empty (HyperPod) changes neither.
+DCGM_HOSTENGINE="${GPU_FAULT_DCGM_HOSTENGINE:-}"
 NODE_SELECTOR="${GPU_FAULT_NODE_SELECTOR:-sagemaker.amazonaws.com/cluster-name=${HYPERPOD_CLUSTER}}"
 VERSION="${GPU_FAULT_VERSION:-0.10.0}"
 RUNTIME_PROFILE="${GPU_FAULT_RUNTIME_PROFILE:-hyperpod-v1}"
@@ -156,6 +161,21 @@ fi
     printf 'ERROR: invalid GPU_FAULT_EXECUTOR_WHEEL_FILENAME\n' >&2
     exit 2
 }
+case "${DCGM_HOSTENGINE}" in
+    "") ;;
+    host|embedded)
+        [[ "${CLUSTER_PROVIDER}" == "eks-managed" ]] || {
+            printf 'ERROR: GPU_FAULT_DCGM_HOSTENGINE is an eks-managed setting; a %s cluster runs DCGM as a host service\n' \
+                "${CLUSTER_PROVIDER}" >&2
+            exit 2
+        }
+        ;;
+    *)
+        printf 'ERROR: GPU_FAULT_DCGM_HOSTENGINE must be host or embedded, got %s\n' \
+            "${DCGM_HOSTENGINE}" >&2
+        exit 2
+        ;;
+esac
 
 kubectl_context() {
     command kubectl --context "${KUBECTL_CONTEXT}" "$@"
@@ -389,6 +409,7 @@ render_installer_job() {
     GPU_FAULT_NAMESPACE="${NAMESPACE}" \
     GPU_FAULT_CLUSTER_ID="${CLUSTER_ID}" \
     GPU_FAULT_CLUSTER_PROVIDER="${CLUSTER_PROVIDER}" \
+    GPU_FAULT_DCGM_HOSTENGINE="${DCGM_HOSTENGINE}" \
     GPU_FAULT_CONNECTION_MODE=regional \
     GPU_FAULT_REGIONAL_CONNECTION_SECRET=gpu-fault-regional-connection \
     GPU_FAULT_NODE_ACTION_KEYS_SECRET="${NODE_ACTION_KEYS_SECRET}" \
@@ -455,7 +476,8 @@ sed \
 python3 - "${RECONCILER_MANIFEST}" "${NODE_DEPENDENCY_IMAGE}" \
     "${NODE_WHEELHOUSE_SHA256}" "${NODE_ACTION_KEYS_SECRET}" \
     "${TEMPLATE_CONTENT_SHA256}" "${TEMPLATE_SOURCE_SHA256}" \
-    "${ARTIFACT_SHA256}" "${BUNDLE_SHA256}" "${CONFIG_DIGEST}" <<'PY'
+    "${ARTIFACT_SHA256}" "${BUNDLE_SHA256}" "${CONFIG_DIGEST}" \
+    "${DCGM_HOSTENGINE}" <<'PY'
 from pathlib import Path
 import sys
 import yaml
@@ -482,6 +504,10 @@ updates = {
     "GPU_FAULT_INSTALLER_BUNDLE_SHA256": sys.argv[8],
     "GPU_FAULT_INSTALLER_CONFIG_DIGEST": sys.argv[9],
 }
+# The reconciler's node identity names the DCGM host engine mode of an
+# eks-managed cluster; a HyperPod reconciler manifest stays as it was.
+if sys.argv[10]:
+    updates["GPU_FAULT_DCGM_HOSTENGINE"] = sys.argv[10]
 container["env"] = [
     item for item in container["env"] if item["name"] not in updates
 ] + [{"name": name, "value": value} for name, value in updates.items()]
@@ -491,7 +517,8 @@ PY
 if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
     kubectl_context apply --dry-run=server \
         -f "${RECONCILER_MANIFEST}" >/dev/null
-    python3 -m gpu_fault_release.regional_node_batch \
+    batch_status=0
+    batch_output="$(python3 -m gpu_fault_release.regional_node_batch \
         --inputs "${NODE_INPUTS_FILE}" --template "${MANIFEST}" \
         --output "${PREFLIGHT_OUTPUT_DIR}" --context "${KUBECTL_CONTEXT}" \
         --namespace "${NAMESPACE}" --cluster-id "${CLUSTER_ID}" \
@@ -504,9 +531,27 @@ if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
         --node-wheelhouse-sha256 "${NODE_WHEELHOUSE_SHA256}" \
         --require-rollback-slot "${REQUIRE_ROLLBACK_SLOT}" \
         --metrics-url-template "${DCGM_METRICS_URL}" \
-        --deadline-seconds "${ACTIVE_DEADLINE_SECONDS}" --workers 8 --run-preflights
-    printf '{"node_count":%d,"status":"PASSED","template_config_map":"%s"}\n' \
-        "${#NODES[@]}" "${TEMPLATE_CONFIG_MAP}"
+        --deadline-seconds "${ACTIVE_DEADLINE_SECONDS}" --workers 8 \
+        --run-preflights)" || batch_status=$?
+    [[ -z "${batch_output}" ]] || printf '%s\n' "${batch_output}"
+    ((batch_status == 0)) || exit "${batch_status}"
+    # The batch's own summary (its last line) reports each eks-managed node's
+    # DCGM host engine state; the verdict carries it on, nothing else changes.
+    python3 - "${#NODES[@]}" "${TEMPLATE_CONFIG_MAP}" "${batch_output}" <<'PY'
+import json
+import sys
+
+count, config_map, output = int(sys.argv[1]), sys.argv[2], sys.argv[3]
+verdict = {"node_count": count, "status": "PASSED", "template_config_map": config_map}
+lines = [line for line in output.splitlines() if line.strip()]
+try:
+    summary = json.loads(lines[-1]) if lines else None
+except ValueError:
+    summary = None
+if isinstance(summary, dict) and "dcgm_hostengine" in summary:
+    verdict["dcgm_hostengine"] = summary["dcgm_hostengine"]
+print(json.dumps(verdict, separators=(",", ":")))
+PY
     exit 0
 fi
 

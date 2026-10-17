@@ -14,6 +14,7 @@ from gpu_fault.fleet import (
     NODE_ACTION_KEY_VERSION_DERIVED,
     NODE_ACTION_KEY_VERSION_SHARED,
 )
+from gpu_fault.cluster_scope import DcgmHostEngine
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.node_agent.ledger import NodeActionLedger, canonical_digest
 from gpu_fault.node_agent.late_ownership import (
@@ -94,6 +95,25 @@ def _command_log_fields(command: NodeActionCommand, attempt: int) -> str:
     )
 
 
+def _dcgm_hostengine_mode(cluster_provider: str, mode: str) -> str:
+    """Which nv-hostengine the quick DCGM diagnostic dials (``DcgmHostEngine``).
+
+    Who owns the machines decides the default: a plain EKS node runs no host
+    DCGM by design, unless its node group declares one
+    (``gpu-fault.io/dcgm-hostengine=host``); HyperPod always runs DCGM as a
+    host service. Any other spelling fails closed.
+    """
+
+    value = mode or (
+        DcgmHostEngine.EMBEDDED.value
+        if cluster_provider == "eks-managed"
+        else DcgmHostEngine.HOST.value
+    )
+    if value not in {item.value for item in DcgmHostEngine}:
+        raise ValueError(f"DCGM host engine must be host or embedded, got {mode!r}")
+    return value
+
+
 class NodeActionExecutor(
     DiagnosticOperationsMixin,
     RemediationOperationsMixin,
@@ -164,6 +184,7 @@ class NodeActionExecutor(
         sleep: Callable[[float], None] = time.sleep,
         require_final_ownership: bool = False,
         cluster_provider: str = "hyperpod",
+        dcgm_hostengine: str = "",
         gpu_activity_drain_seconds: float = DEFAULT_WINDOW_DRAIN_SECONDS,
     ) -> None:
         if len(secret) < 32:
@@ -250,8 +271,8 @@ class NodeActionExecutor(
         # The Agent's own GPU work stays out of another incident's quiesce window.
         self.gpu_activity = self._gpu_activity_gate(now, gpu_activity_drain_seconds)
         self.runner = CheckpointedRunner(runner, self.gpu_activity)
-        # Who owns the machines: a plain EKS node runs no host DCGM by design.
         self.cluster_provider = cluster_provider
+        self.dcgm_hostengine = _dcgm_hostengine_mode(cluster_provider, dcgm_hostengine)
         self.device_client_finder = device_client_finder or self._device_clients
         self.gpu_device_path_finder = gpu_device_path_finder or self._gpu_device_paths
         self.device_client_samples = device_client_samples

@@ -115,8 +115,9 @@ QUIESCE_PROCESSES=""
 QUIESCE_CONTAINERS="aws-hyperpod/health-monitoring-agent,gpu-fault-system/exporter,kube-system/nvidia-device-plugin-ctr"
 # eks-managed only: quiesce also stops Kubernetes containers still holding the target GPU.
 QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS="false"
-# hyperpod (default) or eks-managed; only eks-managed reaches the Agent environment (it keeps kubelet/containerd up).
+# hyperpod (default) or eks-managed (+ its DCGM host engine mode); only eks-managed reaches the Agent environment.
 CLUSTER_PROVIDER="hyperpod"
+DCGM_HOSTENGINE="embedded"
 CONTAINER_STOP_TIMEOUT_SECONDS="30"
 CONTAINER_RESTORE_TIMEOUT_SECONDS="180"
 # How long quiesce waits for a TERMed /dev/nvidiaN holder to let go
@@ -234,6 +235,7 @@ usage() {
         "  --firmware-verify-sha256 HEX    Pinned verification executable SHA-256" \
         "  --quiesce-services NAMES        Ordered restore list; comma-separated" \
         "  --cluster-provider NAME         hyperpod (default) or eks-managed; eks-managed never quiesces kubelet/containerd" \
+        "  --dcgm-hostengine MODE          eks-managed: host (node runs nvidia-dcgm) or embedded (default)" \
         "  --quiesce-processes NAMES       Exact process names sent TERM" \
         "  --quiesce-containers NAMES      Kubernetes namespace/container selectors" \
         "  --container-stop-timeout SEC    Graceful container stop timeout; default: 30" \
@@ -593,6 +595,7 @@ while [[ $# -gt 0 ]]; do
         --quiesce-containers) require_value "$@"; QUIESCE_CONTAINERS="$2"; shift 2 ;;
         --quiesce-sweep-kubernetes-device-holders) QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS="true"; shift ;;
         --cluster-provider) require_value "$@"; CLUSTER_PROVIDER="$2"; shift 2 ;;
+        --dcgm-hostengine) require_value "$@"; DCGM_HOSTENGINE="$2"; shift 2 ;;
         --container-stop-timeout) require_value "$@"; CONTAINER_STOP_TIMEOUT_SECONDS="$2"; shift 2 ;;
         --container-restore-timeout) require_value "$@"; CONTAINER_RESTORE_TIMEOUT_SECONDS="$2"; shift 2 ;;
         --device-sweep-timeout) require_value "$@"; DEVICE_SWEEP_TIMEOUT_SECONDS="$2"; shift 2 ;;
@@ -950,6 +953,7 @@ if [[ "${ALLOW_SERVICE_QUIESCE}" == "true" &&
     die "--allow-service-quiesce requires --allow-gpu-reset"
 fi
 [[ "${CLUSTER_PROVIDER}" == "hyperpod" || "${CLUSTER_PROVIDER}" == "eks-managed" ]] || die "--cluster-provider must be hyperpod or eks-managed"
+[[ "${DCGM_HOSTENGINE}" == "embedded" || ( "${DCGM_HOSTENGINE}" == "host" && "${CLUSTER_PROVIDER}" == "eks-managed" ) ]] || die "--dcgm-hostengine must be embedded, or host with --cluster-provider eks-managed"
 if [[ "${ALLOW_FABRIC_RESET}" == "true" &&
     "${ALLOW_SERVICE_QUIESCE}" != "true" ]]; then
     die "--allow-fabric-reset requires --allow-service-quiesce"
@@ -1536,14 +1540,12 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
             "${ALLOW_FABRIC_MANAGER_RESTART}"
         write_env GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE "${ALLOW_SERVICE_QUIESCE}"
         write_env GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR "${DIAGNOSTIC_OUTPUT_DIR}"
-        write_env GPU_FAULT_DIAGNOSTIC_S3_URI \
-            "${DIAGNOSTIC_S3_URI}"
+        write_env GPU_FAULT_DIAGNOSTIC_S3_URI "${DIAGNOSTIC_S3_URI}"
         write_env GPU_FAULT_DIAGNOSTIC_RETENTION_SECONDS \
             "${DIAGNOSTIC_RETENTION_SECONDS}"
         write_env GPU_FAULT_DIAGNOSTIC_MAX_ARCHIVES \
             "${DIAGNOSTIC_MAX_ARCHIVES}"
-        write_env GPU_FAULT_PYTHON_STACK_TOOL \
-            "${PY_SPY_COMMAND}"
+        write_env GPU_FAULT_PYTHON_STACK_TOOL "${PY_SPY_COMMAND}"
         write_env GPU_FAULT_NODE_ALLOW_FIELD_DIAGNOSTIC \
             "${ALLOW_FIELD_DIAGNOSTIC}"
         write_env GPU_FAULT_FIELD_DIAGNOSTIC_COMMAND \
@@ -1563,8 +1565,7 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
             "${DRIVER_REMEDIATION_COMMAND}"
         write_env GPU_FAULT_DRIVER_REMEDIATION_SHA256 \
             "${DRIVER_REMEDIATION_SHA256}"
-        write_env GPU_FAULT_TARGET_DRIVER_BRANCH \
-            "${TARGET_DRIVER_BRANCH}"
+        write_env GPU_FAULT_TARGET_DRIVER_BRANCH "${TARGET_DRIVER_BRANCH}"
         write_env GPU_FAULT_NODE_ALLOW_FIRMWARE_UPDATE \
             "${ALLOW_FIRMWARE_UPDATE}"
         write_env GPU_FAULT_FIRMWARE_UPDATE_COMMAND \
@@ -1583,6 +1584,7 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
         # Only when set: a HyperPod agent environment file stays byte for byte the same.
         if [[ "${QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS}" == "true" ]]; then write_env GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS "true"; fi
         if [[ "${CLUSTER_PROVIDER}" == "eks-managed" ]]; then write_env GPU_FAULT_CLUSTER_PROVIDER "${CLUSTER_PROVIDER}"; fi
+        if [[ "${CLUSTER_PROVIDER}" == "eks-managed" ]]; then write_env GPU_FAULT_DCGM_HOSTENGINE "${DCGM_HOSTENGINE}"; fi
         write_env GPU_FAULT_CONTAINER_STOP_TIMEOUT_SECONDS "${CONTAINER_STOP_TIMEOUT_SECONDS}"
         write_env GPU_FAULT_CONTAINER_RESTORE_TIMEOUT_SECONDS \
             "${CONTAINER_RESTORE_TIMEOUT_SECONDS}"
@@ -1606,8 +1608,7 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
             write_env GPU_FAULT_NODE_AGENT_TLS_CLIENT_CA \
                 "${NODE_AGENT_TLS_CLIENT_CA}"
         fi
-        write_env GPU_FAULT_NODE_CONTROL_PLANE_URL \
-            "${CONTROL_PLANE_URL}"
+        write_env GPU_FAULT_NODE_CONTROL_PLANE_URL "${CONTROL_PLANE_URL}"
         write_env GPU_FAULT_NODE_CONTROL_PLANE_TOKEN "${TOKEN}"
         if [[ -n "${CONTROL_PLANE_CA_CERTIFICATE}" ]]; then
             write_env SSL_CERT_FILE "/etc/gpu-fault/control-plane-ca.crt"
@@ -1615,8 +1616,7 @@ if [[ "${ENABLE_NODE_AGENT}" == "true" ]]; then
                 "${CERTIFICATE_MIN_VALIDITY_SECONDS}"
         fi
         write_env GPU_FAULT_NODE_CLUSTER_ID "${CLUSTER_ID}"
-        write_env GPU_FAULT_NODE_RUNTIME_PROFILE_VERSION \
-            "${PROFILE_VERSION}"
+        write_env GPU_FAULT_NODE_RUNTIME_PROFILE_VERSION "${PROFILE_VERSION}"
         write_env GPU_FAULT_NODE_ARTIFACT_SHA256 "${WHEEL_SHA256}"
         if [[ -n "${GPU_FAULT_INSTALLER_BUNDLE_SHA256:-}" ]]; then
             write_env GPU_FAULT_NODE_INSTALLER_BUNDLE_SHA256 \

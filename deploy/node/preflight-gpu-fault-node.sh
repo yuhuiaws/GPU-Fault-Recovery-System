@@ -95,16 +95,173 @@ for command in \
     host_shell "command -v '${command}' >/dev/null" ||
         missing_prerequisites+=("${command}")
 done
+runtime_missing=${#missing_prerequisites[@]}
+
+# The DCGM host engine of an eks-managed node, classified in both modes and
+# reported as the "dcgm" member of the verdict (HyperPod: nothing, verdict as
+# before). Host mode (node group label gpu-fault.io/dcgm-hostengine=host) needs
+# a running nvidia-dcgm that sees the GPUs and owns every nv-hostengine; the
+# embedded mode needs no host engine at all, because the exporter starts its
+# own and two engines on one node fight over the GPUs.
+dcgm_member=""
+dcgm_remedy=""
+dcgm_conflicts=()
+classify_dcgm_hostengine() {
+    local mode="embedded" dcgmi="false" hostengine="false" active enabled
+    local packages line major majors=() smi driver_major="" pids pid unit
+    local processes="" unmanaged=() owned=() engine_runs="false" discovery="skipped"
+    local status mismatch="false" state conflict="false" packages_json=""
+    local installed=""
+    if [[ "${GPU_FAULT_DCGM_HOSTENGINE:-}" == "host" ]]; then mode="host"; fi
+    if host_shell "command -v dcgmi >/dev/null"; then dcgmi="true"; fi
+    if host_shell "command -v nv-hostengine >/dev/null"; then hostengine="true"; fi
+    active="$(host_shell "systemctl is-active nvidia-dcgm 2>/dev/null || true")"
+    active="${active%%$'\n'*}"
+    active="${active//[^A-Za-z0-9._-]/}"
+    enabled="$(host_shell "systemctl is-enabled nvidia-dcgm 2>/dev/null || true")"
+    enabled="${enabled%%$'\n'*}"
+    enabled="${enabled//[^A-Za-z0-9._-]/}"
+    # The CUDA flavors of DCGM installed (datacenter-gpu-manager-4-cudaN).
+    packages="$(host_shell "if command -v rpm >/dev/null; then rpm -qa --qf '%{NAME}\n' 'datacenter-gpu-manager-4-cuda*'; elif command -v dpkg-query >/dev/null; then dpkg-query -W -f='\${Package}\n' 'datacenter-gpu-manager-4-cuda*' 2>/dev/null; fi || true")"
+    while IFS= read -r line; do
+        if [[ "${line}" =~ ^datacenter-gpu-manager-4-cuda([0-9]+)$ ]]; then
+            majors+=("${BASH_REMATCH[1]}")
+        fi
+    done <<<"${packages}"
+    if (( ${#majors[@]} > 0 )); then
+        mapfile -t majors < <(printf '%s\n' "${majors[@]}" | sort -nu)
+    fi
+    # The CUDA major the driver reports in the nvidia-smi header.
+    smi="$(host_shell "nvidia-smi 2>/dev/null || true")"
+    if [[ "${smi}" =~ CUDA\ Version:\ *([0-9]+) ]]; then
+        driver_major="${BASH_REMATCH[1]}"
+    fi
+    # Every nv-hostengine, and whether nvidia-dcgm.service owns it.
+    pids="$(host_shell "pgrep -x nv-hostengine 2>/dev/null || true")"
+    while IFS= read -r pid; do
+        [[ "${pid}" =~ ^[0-9]+$ ]] || continue
+        unit=""
+        if grep -qs 'nvidia-dcgm\.service' "${HOST_ROOT}/proc/${pid}/cgroup"; then
+            unit="nvidia-dcgm.service"
+            owned+=("${pid}")
+        else
+            unmanaged+=("${pid}")
+        fi
+        engine_runs="true"
+        processes="${processes:+${processes},}{\"pid\":${pid},\"unit\":\"${unit}\"}"
+    done <<<"${pids}"
+    if [[ "${active}" == "active" ]]; then engine_runs="true"; fi
+    if [[ "${dcgmi}" == "true" && "${engine_runs}" == "true" ]]; then
+        status=0
+        host_shell "timeout 30 dcgmi discovery -l >/dev/null 2>&1" || status=$?
+        discovery="ok"
+        if (( status != 0 )); then discovery="exit ${status}"; fi
+    fi
+    for major in "${majors[@]}"; do
+        packages_json="${packages_json:+${packages_json},}\"${major}\""
+        installed="${installed:+${installed},}cuda${major}"
+    done
+    if (( ${#majors[@]} > 0 )) && [[ -n "${driver_major}" &&
+        " ${majors[*]} " != *" ${driver_major} "* ]]; then
+        mismatch="true"
+    fi
+    if (( ${#unmanaged[@]} > 0 )); then
+        state="unmanaged-hostengine"
+    elif [[ "${enabled}" == "enabled" &&
+        "${active}" =~ ^(activating|deactivating|failed)$ ]] ||
+        [[ "${active}" == "active" && "${discovery}" != "ok" ]]; then
+        state="host-failed"
+    elif [[ "${mismatch}" == "true" ]]; then
+        state="cuda-mismatch"
+    elif [[ "${active}" == "active" ]]; then
+        state="host-active"
+    elif [[ "${dcgmi}" == "true" || "${hostengine}" == "true" ]]; then
+        state="installed-inactive"
+    else
+        state="not-installed"
+    fi
+    if [[ "${mode}" == "host" ]]; then
+        # Everything that keeps this node from host-active, with the missing
+        # runtime tools in one verdict.
+        if (( ${#unmanaged[@]} > 0 )); then conflict="true"; fi
+        if [[ "${dcgmi}" != "true" ]]; then missing_prerequisites+=("dcgmi"); fi
+        if [[ "${hostengine}" != "true" ]]; then
+            missing_prerequisites+=("nv-hostengine")
+        fi
+        if [[ "${active}" != "active" ]]; then
+            missing_prerequisites+=("nvidia-dcgm.service (${active:-unknown})")
+        fi
+        if [[ "${discovery}" == exit* ]]; then
+            missing_prerequisites+=("dcgmi discovery -l (${discovery})")
+        fi
+        if [[ "${mismatch}" == "true" ]]; then
+            missing_prerequisites+=("datacenter-gpu-manager-4-cuda${driver_major} (installed: ${installed})")
+        fi
+        for pid in "${unmanaged[@]}"; do
+            missing_prerequisites+=("nv-hostengine pid ${pid} outside nvidia-dcgm.service")
+        done
+        dcgm_remedy="the managed node group declares gpu-fault.io/dcgm-hostengine=host: install the pinned datacenter-gpu-manager-4 packages and systemctl enable --now nvidia-dcgm in the launch template user data (see 管理员日常运维 / administrator-operations §5.0.1), or remove the label and deploy to run the exporter's embedded hostengine"
+        if [[ "${mismatch}" == "true" ]]; then
+            dcgm_remedy="${dcgm_remedy}; the DCGM CUDA flavor must match the driver's CUDA major: install datacenter-gpu-manager-4-cuda${driver_major} (nvidia-smi reports CUDA Version ${driver_major})"
+        fi
+        if (( ${#unmanaged[@]} > 0 )); then
+            dcgm_remedy="${dcgm_remedy}; stop the hand-started nv-hostengine; nvidia-dcgm.service must own the host engine"
+        fi
+    else
+        # A host engine next to the exporter's embedded one: running, about
+        # to run, or starting at the next boot.
+        if [[ "${active}" =~ ^(active|activating)$ || "${enabled}" == "enabled" ]]; then
+            dcgm_conflicts+=("nvidia-dcgm.service (${active:-unknown}, ${enabled:-unknown})")
+        fi
+        for pid in "${owned[@]}"; do
+            dcgm_conflicts+=("nv-hostengine pid ${pid}")
+        done
+        for pid in "${unmanaged[@]}"; do
+            dcgm_conflicts+=("nv-hostengine pid ${pid} outside nvidia-dcgm.service")
+        done
+        if (( ${#dcgm_conflicts[@]} > 0 )); then conflict="true"; fi
+    fi
+    dcgm_member="$(printf '"dcgm":{"mode":"%s","state":"%s","service":{"active":"%s","enabled":"%s"},"dcgmi":%s,"nv_hostengine":%s,"cuda_packages":[%s],"driver_cuda_major":"%s","processes":[%s],"discovery":"%s","conflict":%s}' \
+        "${mode}" "${state}" "${active}" "${enabled}" "${dcgmi}" "${hostengine}" \
+        "${packages_json}" "${driver_major}" "${processes}" "${discovery}" "${conflict}")"
+}
+if [[ "${GPU_FAULT_CLUSTER_PROVIDER:-hyperpod}" == "eks-managed" ]]; then
+    classify_dcgm_hostengine
+fi
+failure_reasons=()
+failure_messages=()
 if (( ${#missing_prerequisites[@]} > 0 )); then
-    missing_list="$(IFS=,; printf '%s' "${missing_prerequisites[*]}")"
-    missing_list="${missing_list//,/, }"
+    # Joined on a separator no item contains, so an item's own commas stay.
+    missing_list="$(IFS=$'\x1f'; printf '%s' "${missing_prerequisites[*]}")"
+    missing_list="${missing_list//$'\x1f'/, }"
     remedy="install them on the node image before joining"
     if [[ "${GPU_FAULT_CLUSTER_PROVIDER:-hyperpod}" == "eks-managed" ]]; then
-        remedy="the EKS AL2023 NVIDIA AMI does not ship them; install them in the managed node group launch template user data (dnf install -y python3.12 strace; see 管理员日常运维 / administrator-operations §5.0.1) and roll the node group, then rerun the join"
+        remedy=""
+        if (( runtime_missing > 0 )); then
+            remedy="the EKS AL2023 NVIDIA AMI does not ship them; install them in the managed node group launch template user data (dnf install -y python3.12 strace; see 管理员日常运维 / administrator-operations §5.0.1) and roll the node group, then rerun the join"
+        fi
+        if (( ${#missing_prerequisites[@]} > runtime_missing )); then
+            remedy="${remedy:+${remedy}; }${dcgm_remedy}"
+        fi
     fi
-    printf '{"node_id":"%s","node_uid":"%s","status":"FAILED","reasons":["host prerequisites unavailable: %s"]}\n' \
-        "${TARGET_NODE_NAME}" "${TARGET_NODE_UID}" "${missing_list}"
-    die "host prerequisites unavailable: ${missing_list}; ${remedy}"
+    failure_reasons+=("host prerequisites unavailable: ${missing_list}")
+    failure_messages+=("host prerequisites unavailable: ${missing_list}; ${remedy}")
+fi
+if (( ${#dcgm_conflicts[@]} > 0 )); then
+    conflict_list="$(IFS=$'\x1f'; printf '%s' "${dcgm_conflicts[*]}")"
+    conflict_list="${conflict_list//$'\x1f'/, }"
+    failure_reasons+=("DCGM host engine conflict: ${conflict_list}")
+    failure_messages+=("DCGM host engine conflict: ${conflict_list}; a host nv-hostengine runs or is enabled next to the exporter's embedded hostengine: label the node group gpu-fault.io/dcgm-hostengine=host and deploy, or disable nvidia-dcgm (systemctl disable --now nvidia-dcgm; stop a hand-started nv-hostengine)")
+fi
+if (( ${#failure_reasons[@]} > 0 )); then
+    reasons_json="$(printf '"%s",' "${failure_reasons[@]}")"
+    printf '{"node_id":"%s","node_uid":"%s","status":"FAILED","reasons":[%s]%s}\n' \
+        "${TARGET_NODE_NAME}" "${TARGET_NODE_UID}" "${reasons_json%,}" \
+        "${dcgm_member:+,${dcgm_member}}"
+    for ((index = 0; index < ${#failure_messages[@]} - 1; index++)); do
+        printf 'ERROR: %s\n' "${failure_messages[index]}" >&2
+    done
+    die "${failure_messages[${#failure_messages[@]} - 1]}"
 fi
 host_shell \
     "/usr/bin/python3.12 -c 'import sys, venv; raise SystemExit(sys.version_info < (3, 12))'" ||
@@ -184,8 +341,9 @@ if [[ "${REQUIRE_ROLLBACK_SLOT}" == "true" ]]; then
         die "rollback runtime integrity validation failed"
 fi
 
-printf '{"artifact_sha256":"%s","bundle_sha256":"%s","node_id":"%s","node_uid":"%s","status":"PASSED"}\n' \
+printf '{"artifact_sha256":"%s","bundle_sha256":"%s",%s"node_id":"%s","node_uid":"%s","status":"PASSED"}\n' \
     "${EXPECTED_ARTIFACT_SHA256}" \
     "${EXPECTED_BUNDLE_SHA256}" \
+    "${dcgm_member:+${dcgm_member},}" \
     "${TARGET_NODE_NAME}" \
     "${TARGET_NODE_UID}"

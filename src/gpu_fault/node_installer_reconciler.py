@@ -12,10 +12,12 @@ from typing import Any, Callable
 
 from gpu_fault.dataplane_metrics import MetricFamily, start_metrics_server
 from gpu_fault.logging_setup import configure_logging
+from gpu_fault.cluster_scope import DCGM_HOSTENGINE_ENV, DcgmHostEngine
 from gpu_fault.cluster_scope import node_selector as scope_node_selector
 from gpu_fault.node_installer_rendering import (
     INSTALLER_ARTIFACT_ANNOTATION,
     INSTALLER_BUNDLE_ANNOTATION,
+    INSTALLER_DCGM_HOSTENGINE_ANNOTATION,
     INSTALLER_DIGEST_ANNOTATION,
     INSTALLER_JOB_LABEL,
     INSTALLER_TEMPLATE_ANNOTATION,
@@ -69,6 +71,7 @@ INSTALLER_NODE_ANNOTATIONS: tuple[str, ...] = (
     INSTALLER_ARTIFACT_ANNOTATION,
     INSTALLER_BUNDLE_ANNOTATION,
     INSTALLER_TEMPLATE_ANNOTATION,
+    INSTALLER_DCGM_HOSTENGINE_ANNOTATION,
     INSTALLER_NODE_UID_ANNOTATION,
     INSTALLER_STATE_ANNOTATION,
     INSTALLER_BOOT_ID_ANNOTATION,
@@ -365,6 +368,23 @@ def _api_status(error: Exception) -> int | None:
     return getattr(error, "status", None)
 
 
+def _desired_dcgm_hostengine(value: object) -> str:
+    """The node-identity value of ``DCGM_HOSTENGINE_ENV``.
+
+    ``host`` on an ``eks-managed`` cluster whose node groups declare a host
+    DCGM; empty for the embedded engine, for HyperPod and for a reconciler
+    rendered before the mode existed, so their node identity and Job names
+    stay exactly what they were. Any other spelling fails closed.
+    """
+
+    text = str(value or "").strip()
+    if text == DcgmHostEngine.HOST.value:
+        return text
+    if text in ("", DcgmHostEngine.EMBEDDED.value):
+        return ""
+    raise ValueError(f"{DCGM_HOSTENGINE_ENV} must be host or embedded, got {text!r}")
+
+
 def _job_name(node_name: str, node_uid: str, digest: str) -> str:
     suffix = hashlib.sha256(f"{node_uid}:{digest}".encode()).hexdigest()[:10]
     safe_name = re.sub(r"[^a-z0-9-]+", "-", node_name.lower()).strip("-")
@@ -400,6 +420,7 @@ class NodeInstallerReconciler:
         node_dependency_image: str = "",
         node_wheelhouse_sha256: str = "",
         node_action_keys_secret: str = ("gpu-fault-node-action-keys"),
+        dcgm_hostengine: str = "",
         retry_seconds: int = 300,
         max_unavailable: int = 1,
         job_active_deadline_seconds: int = 840,
@@ -444,6 +465,10 @@ class NodeInstallerReconciler:
         self.job_template = job_template
         self.dcgm_metrics_url_template = dcgm_metrics_url_template
         self.node_action_keys_secret = node_action_keys_secret
+        # The DCGM host engine mode the template's Agent environment names
+        # (``INSTALLER_DCGM_HOSTENGINE_ANNOTATION``): a node installed under the
+        # other mode is not current, so a mode change re-installs its Agent.
+        self.dcgm_hostengine = _desired_dcgm_hostengine(dcgm_hostengine)
         self.installer_identity = InstallerIdentity(
             namespace=namespace,
             config_digest=config_digest,
@@ -628,6 +653,8 @@ class NodeInstallerReconciler:
             and annotations.get(INSTALLER_ARTIFACT_ANNOTATION) == self.artifact_sha256
             and annotations.get(INSTALLER_BUNDLE_ANNOTATION) == self.bundle_sha256
             and annotations.get(INSTALLER_TEMPLATE_ANNOTATION) == self.template_sha256
+            and annotations.get(INSTALLER_DCGM_HOSTENGINE_ANNOTATION, "")
+            == self.dcgm_hostengine
             and annotations.get(INSTALLER_NODE_UID_ANNOTATION) == node_uid
         )
         installer_state = annotations.get(INSTALLER_STATE_ANNOTATION)
@@ -686,6 +713,7 @@ class NodeInstallerReconciler:
                 f"{self.config_digest}:{self.artifact_sha256}:"
                 f"{self.bundle_sha256}:{self.template_sha256}"
                 + (f":node-key:{activation}" if activation else "")
+                + (":dcgm-hostengine:host" if self.dcgm_hostengine else "")
             ),
         )
         try:
@@ -1000,6 +1028,10 @@ class NodeInstallerReconciler:
             INSTALLER_NODE_UID_ANNOTATION: node_uid,
             INSTALLER_STATE_ANNOTATION: state,
         }
+        if self.dcgm_hostengine:
+            desired[INSTALLER_DCGM_HOSTENGINE_ANNOTATION] = self.dcgm_hostengine
+        elif INSTALLER_DCGM_HOSTENGINE_ANNOTATION in annotations:
+            desired[INSTALLER_DCGM_HOSTENGINE_ANNOTATION] = None
         activation = annotations.get(INSTALLER_ACTIVATION_ANNOTATION)
         if activation and state == "Succeeded":
             desired[INSTALLER_ACTIVATED_ANNOTATION] = activation
@@ -1175,6 +1207,7 @@ def main() -> None:
             "GPU_FAULT_NODE_ACTION_KEYS_SECRET",
             "gpu-fault-node-action-keys",
         ),
+        dcgm_hostengine=os.environ.get(DCGM_HOSTENGINE_ENV, ""),
         retry_seconds=retry_seconds,
         max_unavailable=max_unavailable,
         job_active_deadline_seconds=active_deadline_seconds,

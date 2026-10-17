@@ -51,6 +51,41 @@ case "${CLUSTER_PROVIDER}" in
         exit 2
         ;;
 esac
+# DCGM host engine mode of an eks-managed cluster (gpu_fault.cluster_scope
+# DcgmHostEngine): `host` when its node groups declare a host nvidia-dcgm,
+# `embedded` otherwise; empty for HyperPod, whose AMI always runs DCGM as a host
+# service. Baked into the rendered Job only when set, so a HyperPod (or
+# mode-less) render is byte for byte what it was: the preflight then requires
+# the host engine and the Agent grades an unreachable one as a failure.
+DCGM_HOSTENGINE="${GPU_FAULT_DCGM_HOSTENGINE:-}"
+case "${DCGM_HOSTENGINE}" in
+    "") ;;
+    host|embedded)
+        [[ "${CLUSTER_PROVIDER}" == "eks-managed" ]] || {
+            printf 'ERROR: GPU_FAULT_DCGM_HOSTENGINE is an eks-managed setting; a %s cluster runs DCGM as a host service\n' \
+                "${CLUSTER_PROVIDER}" >&2
+            exit 2
+        }
+        ;;
+    *)
+        printf 'ERROR: GPU_FAULT_DCGM_HOSTENGINE must be host or embedded, got %s\n' \
+            "${DCGM_HOSTENGINE}" >&2
+        exit 2
+        ;;
+esac
+DCGM_HOSTENGINE_ENV_YAML=""
+DCGM_HOSTENGINE_PREFLIGHT_ENV=""
+DCGM_HOSTENGINE_INSTALL_ENV=""
+DCGM_HOSTENGINE_INSTALLER_ARGS=""
+if [[ -n "${DCGM_HOSTENGINE}" ]]; then
+    DCGM_HOSTENGINE_ENV_YAML="$(printf '\n            - name: DCGM_HOSTENGINE\n              value: "%s"' "${DCGM_HOSTENGINE}")"
+    # shellcheck disable=SC2016 # Spliced into the Job's remote script; ${DCGM_HOSTENGINE} expands in the pod.
+    DCGM_HOSTENGINE_PREFLIGHT_ENV=' GPU_FAULT_DCGM_HOSTENGINE="${DCGM_HOSTENGINE}"'
+    # shellcheck disable=SC2016 # Spliced into the Job's remote script; ${DCGM_HOSTENGINE} expands in the pod.
+    DCGM_HOSTENGINE_INSTALL_ENV=' DCGM_HOSTENGINE="${DCGM_HOSTENGINE}"'
+    # shellcheck disable=SC2016 # Spliced into the chroot script; ${DCGM_HOSTENGINE} expands there.
+    DCGM_HOSTENGINE_INSTALLER_ARGS=' --dcgm-hostengine "${DCGM_HOSTENGINE}"'
+fi
 DEFAULT_NODE_INSTALLER_IMAGE="public.ecr.aws/amazonlinux/amazonlinux:2023"
 NODE_INSTALLER_IMAGE="${GPU_FAULT_NODE_INSTALLER_IMAGE:-${DEFAULT_NODE_INSTALLER_IMAGE}}"
 NODE_DEPENDENCY_IMAGE="${GPU_FAULT_NODE_DEPENDENCY_IMAGE:-}"
@@ -543,7 +578,7 @@ spec:
             - name: TARGET_NODE_PROVIDER_ID
               value: "${NODE_PROVIDER_ID}"
             - name: CLUSTER_PROVIDER
-              value: "${CLUSTER_PROVIDER}"
+              value: "${CLUSTER_PROVIDER}"${DCGM_HOSTENGINE_ENV_YAML}
             - name: INSTALLER_ACTIVE_DEADLINE_SECONDS
               value: "${INSTALLER_ACTIVE_DEADLINE_SECONDS}"
             - name: INSTALL_RUN_ID
@@ -658,7 +693,7 @@ ${CONTROL_PLANE_ENV}
                 GPU_FAULT_PREFLIGHT_ARTIFACT_SHA256="${INSTALLER_ARTIFACT_SHA256}" \
                 GPU_FAULT_NODE_WHEELHOUSE_SHA256="\${NODE_WHEELHOUSE_SHA256}" \
                 GPU_FAULT_REQUIRE_ROLLBACK_SLOT="\${REQUIRE_ROLLBACK_SLOT}" \
-                GPU_FAULT_CLUSTER_PROVIDER="\${CLUSTER_PROVIDER}" \
+                GPU_FAULT_CLUSTER_PROVIDER="\${CLUSTER_PROVIDER}"${DCGM_HOSTENGINE_PREFLIGHT_ENV} \
                 TARGET_NODE_NAME="\${TARGET_NODE_NAME}" \
                 TARGET_NODE_UID="\${TARGET_NODE_UID}" \
                   /bin/bash -ceu -o pipefail '
@@ -696,7 +731,7 @@ ${CONTROL_PLANE_ENV}
                 TARGET_NODE_IP="\${TARGET_NODE_IP}" \
                 TARGET_NODE_UID="\${TARGET_NODE_UID}" \
                 TARGET_NODE_PROVIDER_ID="\${TARGET_NODE_PROVIDER_ID}" \
-                CLUSTER_PROVIDER="\${CLUSTER_PROVIDER}" \
+                CLUSTER_PROVIDER="\${CLUSTER_PROVIDER}"${DCGM_HOSTENGINE_INSTALL_ENV} \
                 INSTALL_RUN_ID="\${INSTALL_RUN_ID}" \
                 INSTALLER_LOCK_TIMEOUT_SECONDS="\${INSTALLER_LOCK_TIMEOUT_SECONDS}" \
                 GPU_FAULT_INSTALLER_BUNDLE_SHA256="${INSTALLER_BUNDLE_SHA256}" \
@@ -924,7 +959,7 @@ ${CONTROL_PLANE_ENV}
                   # (the configured list and the config digest stay the same).
                   quiesce_args=()
                   if [[ "\${CLUSTER_PROVIDER}" == "eks-managed" ]]; then
-                    quiesce_args=(--quiesce-sweep-kubernetes-device-holders --cluster-provider eks-managed)
+                    quiesce_args=(--quiesce-sweep-kubernetes-device-holders --cluster-provider eks-managed${DCGM_HOSTENGINE_INSTALLER_ARGS})
                   fi
                   node_instance_id="\${TARGET_NODE_UID}"
                   if [[ "\${CLUSTER_PROVIDER}" == "eks-managed" ]]; then
@@ -1051,6 +1086,15 @@ if [[ "${PREFLIGHT_ONLY}" == "true" ]]; then
         --ignore-not-found --wait=true
     exit 0
 fi
+# The node identity the reconciler compares (node_installer_reconciler): an
+# eks-managed node installed in host mode carries the DCGM host engine mark,
+# one installed otherwise must not keep a stale one; HyperPod is unchanged.
+DCGM_HOSTENGINE_ANNOTATION_ARGS=()
+if [[ "${DCGM_HOSTENGINE}" == "host" ]]; then
+    DCGM_HOSTENGINE_ANNOTATION_ARGS=("gpu-fault.io/installer-dcgm-hostengine=host")
+elif [[ "${CLUSTER_PROVIDER}" == "eks-managed" ]]; then
+    DCGM_HOSTENGINE_ANNOTATION_ARGS=("gpu-fault.io/installer-dcgm-hostengine-")
+fi
 kubectl annotate node "${NODE_NAME}" --overwrite \
     "gpu-fault.io/installer-version=${VERSION}" \
     "gpu-fault.io/installer-config-digest=${INSTALLER_CONFIG_DIGEST}" \
@@ -1058,4 +1102,5 @@ kubectl annotate node "${NODE_NAME}" --overwrite \
     "gpu-fault.io/installer-bundle-sha256=${INSTALLER_BUNDLE_SHA256}" \
     "gpu-fault.io/installer-template-sha256=${INSTALLER_TEMPLATE_SHA256}" \
     "gpu-fault.io/installer-node-uid=${NODE_UID}" \
-    "gpu-fault.io/installer-state=Succeeded"
+    "gpu-fault.io/installer-state=Succeeded" \
+    ${DCGM_HOSTENGINE_ANNOTATION_ARGS[@]+"${DCGM_HOSTENGINE_ANNOTATION_ARGS[@]}"}
