@@ -349,6 +349,7 @@ exporter，还会等待 `/v1/gpu-metrics/.../latest` 出现该节点的实际样
 - PCIe replay、NVLink CRC/data/replay/recovery counter。
 - power/thermal violation duration。
 - `DCGM_FI_DEV_XID_ERRORS`。
+- NVLink fabric 注册状态 `DCGM_FI_DEV_FABRIC_MANAGER_STATUS` 与 `DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE`。
 
 DCGM Exporter 必须配置 `deploy/dataplane/dcgm-counters.csv` 中的字段，两条启动路径
 （`deploy/dataplane/hyperpod-dcgm-exporter.yaml` 与 `deploy/systemd/gpu-fault-dcgm-exporter.service`）
@@ -370,6 +371,11 @@ in-cluster DaemonSet 模板 `gpu-metrics-collector.yaml` 已删除，不得重�
 的实例类型表渲染；占位符未被替换时渲染报错失败关闭，因此未知实例类型上不会起一个
 采不到数的 exporter。
 
+exporter 只在进程启动时读 counters CSV，ConfigMap 又以 subPath 挂载，运行中的 Pod 看不到更新；因此 pod 模板带 CSV 的
+sha256 注解 `gpu-fault.io/dcgm-counters-sha256`（同样由 `render_dcgm_exporter_manifest` 渲染），只改 CSV 也会逐节点
+滚动 exporter Pod。CSV 的每条记录必须恰好 3 个字段（帮助文本里不能有逗号），字段名与类型必须是钉定 exporter 认识的，
+否则每个 GPU 节点上的 exporter 启动即退出（部署和运维手册 §6.5）。
+
 不同 DCGM/GPU 代际可能同时暴露旧字段和 aggregate 字段。当前兼容契约为：
 
 - row-remap 使用 `DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS` 与
@@ -379,6 +385,9 @@ in-cluster DaemonSet 模板 `gpu-metrics-collector.yaml` 已删除，不得重�
 - exporter 返回 `N/A`、空值或目标 GPU 不支持字段时忽略该样本，不能转成数值 0，
   也不能据此产生 finding；
 - `DCGM_FI_DEV_XID_ERRORS` 是“最后一次 XID”状态，不是事件计数器。
+- `DCGM_FI_DEV_FABRIC_MANAGER_STATUS` 是状态 gauge（`dcgmFabricManagerStatus_t`），不是计数器；
+  `DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE` 在注册完成之前为空，exporter 不输出样本。两者都不是必需字段，exporter
+  缺少它们时只是没有 fabric 检测。
 
 `NvidiaSmiMetricsCollector` 的实现作为后续验证能力保留。只有显式传入
 `--enable-nvidia-smi-metrics-collector` 才允许使用；它采集核心、ECC、retired-page
@@ -401,6 +410,16 @@ finding，其处置来自站点指标策略，不能冒充NVIDIA XID Immediate A
 上的相同 XID gauge 值不会在每次 scrape 时重复触发。由于该字段表示持久化的“最后一次
 XID”，collector 启动后的首个值仅建立 baseline；之后从 0 或其他 XID 发生变化时才
 生成事件。原始 `/dev/kmsg` 仍是捕获新事件及识别同一 XID 重复发生的主要事件源。
+
+`DCGM_FI_DEV_FABRIC_MANAGER_STATUS`（字段 170：0 NotSupported、1 NotStarted、2 InProgress、3 Success、4 Failure、
+5 Unrecognized、6 NvmlTooOld）映射为 `fabric_manager_status`，`DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE`（字段 171，已完成
+注册的 DCGM 返回码，0 为成功）映射为 `fabric_manager_error_code`。状态为 1/2/4 的每块 GPU 旁，collector 附派生样本
+`fabric_manager_status_held_seconds`：从本 collector 首次观察到当前值起算的秒数，collector 重启（每次 quiesce/restore
+与 reboot 都会）即从 0 计时，状态稳定后不再发送。状态的任何变化都是投递边沿 `fabric-manager-status-changed`（与
+`xid-changed` 同类）；held 值达到 300 s 窗口即成为 candidate，连续 `GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES` 个样本后以
+`candidate-confirmed` 投递，状态稳定后为 `candidate-recovered`。控制面据此为 Hopper SXM 节点分级一个节点级
+`fabric_manager_status` finding（详细设计 §2.4.1）。只有 DCGM exporter 模式有该信号，`nvidia-smi` 指标模式不报告
+fabric 状态。
 
 温度采集边沿与控制面共用`gpu_temperature_policy.temperature_decision`，包括设备推导
 限制与站点fallback。确认按severity/action语义分别累计，已确认warning不能吞掉

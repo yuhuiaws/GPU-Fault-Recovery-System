@@ -7489,6 +7489,7 @@ Rule sources and default handling are as follows:
 |---|---|---|
 | PCIe replay rate `>8/min` | Warning, run GPU diagnostics | NVIDIA DCGM Health `DCGM_FR_PCI_REPLAY_RATE` |
 | NVLink error counter delta `>=1` | Critical, stop affected jobs, isolate and analyse the GPU | NVIDIA DCGM Health `DCGM_FR_NVLINK_ERROR_CRITICAL` |
+| Untrained NVLink fabric (`fabric_manager_status`): a Hopper SXM GPU's Fabric Manager state held NotStarted/InProgress/Failure for >=300 s | Critical, cordon, [stop jobs], reset every GPU and NVSwitch inside the quiesce window (the restore starts a Fabric Manager that is not running) and validate that every GPU's fabric state is Success; failure escalates to reboot, then warm-spare replacement | NVIDIA Fabric Manager User Guide (`NVIDIA_FABRIC_MANAGER_STATE`); the 300 s window is a site constant, not configurable |
 | Volatile DBE non-zero or increased | Critical, stop affected jobs, isolate and analyse the GPU | NVIDIA DCGM Health `DCGM_FR_VOLATILE_DBE_DETECTED` |
 | Row-remap pending | Stop jobs, reset the GPU in a controlled window, then validate | NVIDIA GPU Memory Error Management |
 | Row-remap failure | Stop jobs and isolate; RMA can be judged only after running the NVIDIA Field Diagnostic | NVIDIA GPU Memory Error Management RMA Policy |
@@ -7551,6 +7552,7 @@ The email does not use a large language model. Common action codes:
 | `THERMAL_COOLING_INSPECTION` | Inspect airflow, fans, heatsinks, ambient temperature and device limits |
 | `PCIE_AER_INSPECTION` | Inspect the PCIe link, AER, replay counters and physical connections |
 | `NVLINK_NVSWITCH_INSPECTION` | Inspect NVLink/NVSwitch, topology and Fabric Manager |
+| `NVLINK_FABRIC_RECOVERY` | The GPUs have not finished registering with the NVLink fabric: keep the node out of service; it is no host configuration problem and a Fabric Manager restart alone does not help; the product runs the full GPU/NVSwitch reset of `fabric_manager_status`; when this diagnostic's DRAIN already holds the node, reboot the instance out of band and, once the fabric state is Success, run `submit-remediation --disposition restore` (administrator operations §7) |
 | `GPU_MEMORY_FIELD_DIAGNOSTIC` | Inspect ECC/row-remap and run the NVIDIA Field Diagnostic |
 | `DRIVER_DCGM_REMEDIATION` | Inspect driver/DCGM/CUDA compatibility and services |
 | `DEEP_DIAGNOSTIC_REVIEW` | Unrecognised result; review the complete evidence and run deep diagnostics |
@@ -7577,6 +7579,31 @@ missing fields refuse the upgrade at the deployment validation phase, and the ex
 `NvidiaSmiMetricsCollector` is currently disabled by default. An explicitly enabled `nvidia-smi` fallback cannot reliably
 obtain the full throttle bitmask or PCIe/NVLink counters,
 the related correlated rules are not enabled, and missing signals must not be interpreted as healthy.
+
+Fabric Manager fields: the bundled `deploy/dataplane/dcgm-counters.csv` also exports `DCGM_FI_DEV_FABRIC_MANAGER_STATUS` (170) and
+`DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE` (171) for the passive detection of an untrained NVLink fabric (`fabric_manager_status` in
+the table above). Both are exported, never required: `DCGM_EXPORTER_FIELD_GROUPS` and the missing-field check are unchanged (171 has
+no sample until registration completes), and an `existing`-mode customer exporter without them simply has no such detection. Both
+fields exist since DCGM 4.0.0 and the pinned `dcgm-exporter:4.4.1-4.5.2` knows both names; any host engine that 4.4.1 client can
+read at all is 4.0 or later, so they cannot break a working exporter (HyperPod p5en runs DCGM 4.6.0, plain EKS 4.7.0). When editing
+the CSV: that exporter parses it at start-up and exits on every GPU node at a record that is not exactly three fields (no comma in a
+help text), an unknown field name or an unknown type; while that exporter is pinned, never add the newer
+`DCGM_FI_DEV_FABRIC_HEALTH_MASK` (174), `DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY` (175) or DCGM 4.6's rename
+`DCGM_FI_DEV_FABRIC_MANAGER_ERROR`.
+
+The exporter reads the CSV only at process start and the DaemonSet mounts the ConfigMap with subPath, which a running Pod never sees
+refreshed, so a counters-only release used to update the ConfigMap and restart no Pod. The pod template of
+`deploy/dataplane/hyperpod-dcgm-exporter.yaml` now carries the annotation `gpu-fault.io/dcgm-counters-sha256` (the sha256 of the CSV
+the ConfigMap is built from, rendered by `render_dcgm_exporter_manifest`, failing closed on a surviving placeholder; the legacy
+single-cluster `deploy/hyperpod/deploy.sh` substitutes it with sed): a counters change is a template change, and dcgm-exporter rolls
+on every GPU cluster one node at a time (RollingUpdate, `maxUnavailable: 1`).
+
+Upgrade note (Fabric Manager fields): the release that ships them is `DATA_PLANE_COMPATIBLE`: the control-plane, executor and
+node_runtime wheels all move (the three control-plane roles roll; executor, completion-watcher and kubernetes-node-resource-collector
+on every GPU cluster; Node Agent waves on every GPU node -- the CSV is also a node template input shipped in the node bundle), and the
+dcgm component (ConfigMap and DaemonSet template) changes, so every GPU cluster rolls dcgm-exporter. Have the release in which a single
+failed DCGM scrape opens no incident live first: before it, one failed scrape during the exporter roll opens a RUN_DIAGNOSTICS incident
+that can quarantine a healthy node.
 
 When the thermal composite is first Warning, GPU validation puts the temperature, thermal violation,
 thermal throttle and `THERMAL_STRESS` together into the

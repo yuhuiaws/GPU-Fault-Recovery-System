@@ -348,6 +348,7 @@ Prefer `dcgm`, which reads the DCGM Exporter with the official `prometheus_clien
 - PCIe replay, NVLink CRC/data/replay/recovery counters.
 - power/thermal violation duration.
 - `DCGM_FI_DEV_XID_ERRORS`.
+- the NVLink fabric registration state, `DCGM_FI_DEV_FABRIC_MANAGER_STATUS` and `DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE`.
 
 The DCGM Exporter must be configured with the fields in `deploy/dataplane/dcgm-counters.csv`; both start-up paths
 (`deploy/dataplane/hyperpod-dcgm-exporter.yaml` and `deploy/systemd/gpu-fault-dcgm-exporter.service`)
@@ -368,6 +369,11 @@ does not use a nodeSelector but a `nodeAffinity` that lists the supported GPU in
 `regional_release_rendering.render_dcgm_exporter_manifest` from the instance-type table in `node_installer_reconciler`;
 if a placeholder is left unreplaced, rendering errors and fails closed, so an exporter that collects nothing never starts on an unknown instance type.
 
+The exporter reads the counters CSV only at process start and the ConfigMap is mounted with subPath, which a running Pod never sees refreshed;
+the pod template therefore carries the CSV's sha256 as the annotation `gpu-fault.io/dcgm-counters-sha256` (rendered by `render_dcgm_exporter_manifest` too),
+so a counters-only change still rolls the exporter Pods one node at a time. Every CSV record must be exactly three fields (no comma in a help text) with a field
+name and type the pinned exporter knows, otherwise the exporter exits at start-up on every GPU node (deployment and operations manual §6.5).
+
 Different DCGM/GPU generations may expose old fields and aggregate fields at the same time. The current compatibility contract is:
 
 - row-remap uses `DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS` and
@@ -377,6 +383,9 @@ Different DCGM/GPU generations may expose old fields and aggregate fields at the
 - when the exporter returns `N/A`, an empty value, or the target GPU does not support the field, the sample is ignored; it must not be converted to the number 0,
   nor may a finding be produced from it;
 - `DCGM_FI_DEV_XID_ERRORS` is a "last XID" state, not an event counter.
+- `DCGM_FI_DEV_FABRIC_MANAGER_STATUS` is a state gauge (`dcgmFabricManagerStatus_t`), not a counter;
+  `DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE` is blank, so the exporter emits no sample, until registration completes. Neither is required:
+  an exporter without them simply has no fabric detection.
 
 The `NvidiaSmiMetricsCollector` implementation is kept as a capability for later validation. It may be used only when
 `--enable-nvidia-smi-metrics-collector` is passed explicitly; it collects the four field groups core, ECC, retired-page
@@ -399,6 +408,16 @@ A new non-zero `DCGM_FI_DEV_XID_ERRORS` state is converted to an `XidEvent` and 
 does not fire again on every scrape. Because the field represents a persisted "last
 XID", the first value after collector start-up only establishes a baseline; an event is generated only when it later changes from 0 or from another XID.
 Raw `/dev/kmsg` remains the primary event source for capturing new events and recognising repeated occurrences of the same XID.
+
+`DCGM_FI_DEV_FABRIC_MANAGER_STATUS` (field 170: 0 NotSupported, 1 NotStarted, 2 InProgress, 3 Success, 4 Failure, 5 Unrecognized,
+6 NvmlTooOld) maps to `fabric_manager_status`, `DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE` (field 171, the DCGM return code of a completed
+registration, 0 = OK) to `fabric_manager_error_code`. Beside every GPU whose state is 1/2/4 the collector adds the derived sample
+`fabric_manager_status_held_seconds`: seconds since the collector first observed the current value, starting from 0 again whenever the
+collector restarts (every quiesce/restore and reboot), and no longer sent once the state settles. Any state change is the delivery edge
+`fabric-manager-status-changed` (like `xid-changed`); a held value at the 300 s window is a candidate delivered after
+`GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES` consecutive samples as `candidate-confirmed`, and `candidate-recovered` once the state settles.
+From it the control plane grades one node-level `fabric_manager_status` finding for a Hopper SXM node (detailed design §2.4.1). Only the
+DCGM exporter mode carries the signal; the `nvidia-smi` metrics mode does not report the fabric state.
 
 Temperature collection edges share `gpu_temperature_policy.temperature_decision` with the control plane, including device-derived
 limits and the site fallback. Confirmation accumulates separately by severity/action semantics: a confirmed warning cannot swallow
