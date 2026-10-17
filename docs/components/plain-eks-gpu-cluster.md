@@ -128,6 +128,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 1. 节点组：`AL2023_x86_64_NVIDIA`（或等价）AMI；launch template user data 安装 `python3.12 strace`
    （管理员日常运维 §5.0.1）；节点组的 EKS node auto repair 关闭（`nodeRepairConfig.enabled=false` 或未设置，
    管理员日常运维 §5.0.1）；NVIDIA device plugin 与 EFA device plugin 运行；GPU 污点可有。
+   `AL2023_x86_64_NVIDIA` 节点组可用 `gpu-fault-admin prepare-eks-nodegroup` 自动完成本条的 user data 与 node auto repair
+   以及第 5 条的归属标签（默认只读计划，`--apply` 执行；管理员日常运维 §5.0.1a）。
 2. 命名空间：`allowedNamespaces` 里的工作负载命名空间（缺省站点列表，如 `training`）必须已存在，或用
    `--allowed-namespace` 指定存在的列表。
 3. 网络：GPU VPC 的 NAT EIP 加入 NLB 白名单、Route53 私有区关联、Agent CIDR 来自节点组子网——join 自动完成，

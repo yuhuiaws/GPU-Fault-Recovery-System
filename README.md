@@ -115,7 +115,7 @@ make test-parallel
 所有生产部署开始前必须满足以下共同前提：
 
 1. 一个已有且至少有3个Ready节点的CPU EKS/HyperPod集群。
-2. 至少一个已有GPU EKS/HyperPod集群；GPU HyperPod必须为`NodeRecovery=None`；普通EKS需有受支持GPU实例类型的managed node group（其 EKS node auto repair 必须关闭：`nodeRepairConfig.enabled=false` 或未设置）和可调度的非GPU节点组，GPU节点镜像带`python3.12`与`strace`（AL2023 NVIDIA AMI默认不带，放进节点组launch template的user data安装），并已创建workload namespace `training`。
+2. 至少一个已有GPU EKS/HyperPod集群；GPU HyperPod必须为`NodeRecovery=None`；普通EKS需有受支持GPU实例类型的managed node group（其 EKS node auto repair 必须关闭：`nodeRepairConfig.enabled=false` 或未设置）和可调度的非GPU节点组，GPU节点镜像带`python3.12`与`strace`（AL2023 NVIDIA AMI默认不带，放进节点组launch template的user data安装），并已创建workload namespace `training`；`AL2023_x86_64_NVIDIA`节点组可用`gpu-fault-admin prepare-eks-nodegroup`自动完成user data、node auto repair与归属标签（[管理员日常运维 §5.0.1a](docs/管理员日常运维.md)）。
 3. GPU VPC已有NAT出口。
 4. 执行身份具有所需AWS、EKS和Kubernetes管理权限。
 5. 部署机已安装Python 3.12项目环境以及`aws`、`cosign`、Docker Buildx、`kubectl`、`helm`、`curl`、`jq`、`openssl`、`sha256sum`和`make`；命令只验证这些前置，不自动安装系统工具。

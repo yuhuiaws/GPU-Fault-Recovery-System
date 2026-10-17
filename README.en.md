@@ -126,7 +126,10 @@ Every production deployment must satisfy these common prerequisites before it st
 1. An existing CPU EKS/HyperPod cluster with at least 3 Ready nodes.
 2. At least one existing GPU EKS/HyperPod cluster; a GPU HyperPod cluster must have `NodeRecovery=None`; a plain EKS GPU
    cluster must have a managed node group with a supported GPU instance type (its EKS node auto repair off:
-   `nodeRepairConfig.enabled=false` or unset) and a schedulable non-GPU node group besides it.
+   `nodeRepairConfig.enabled=false` or unset) and a schedulable non-GPU node group besides it. On
+   `AL2023_x86_64_NVIDIA` node groups, `gpu-fault-admin prepare-eks-nodegroup` sets up the launch template user data
+   for `python3.12`/`strace`, node auto repair off and the ownership label
+   ([Administrator Operations §5.0.1a](docs/en/administrator-operations.md)).
 3. The GPU VPC already has NAT egress.
 4. The executing identity holds the required AWS, EKS and Kubernetes administrative permissions.
 5. The deploy host has the Python 3.12 project environment plus `aws`, `cosign`, Docker Buildx, `kubectl`, `helm`, `curl`, `jq`, `openssl`, `sha256sum` and `make`; the command only verifies these prerequisites and never installs system tools.

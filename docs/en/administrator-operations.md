@@ -2202,6 +2202,126 @@ that deploy the host-mode exporter has no engine to dial and a host-mode Agent g
 (`DRAIN_AND_QUARANTINE`), so keep this window short too -- the mirror image of the entering window (enable -> label ->
 deploy), during which two hostengines run.
 
+#### 5.0.1a Automated preparation: `prepare-eks-nodegroup` (AL2023_x86_64_NVIDIA)
+
+Plain EKS (`eks-managed`) GPU managed node groups on the recommended AMI type `AL2023_x86_64_NVIDIA` can leave the
+manual steps of §5.0.0 (the ownership label) and §5.0.1 to this verb. Like `site-id` it works before any site exists:
+the site id (the label value) is derived from `--cpu-cluster-arn` exactly as `site-id` derives it. It runs with the
+operator's own AWS credentials through the product's command runner (API budget, deadlines).
+
+```bash
+# Read-only plan (default): JSON on stdout, summary and finding lines on stderr; exit 0, or 2 when a group is refused
+gpu-fault-admin prepare-eks-nodegroup --cpu-cluster-arn <CPU ARN> --gpu-cluster-arn <GPU EKS ARN> \
+  [--nodegroup <name> ...] [--state-dir <site state dir> | --work-dir <dir>] \
+  [--dcgm-hostengine {embedded,host} [--dcgm-version <version[-release]>]] \
+  [--adopt-user-data-part <index|file name> ...] [--allowed-namespace <ns> ...] [--roll-timeout-minutes N]
+# Apply: the same arguments plus --apply --confirm PREPARE_EKS_NODEGROUP --reference <change id>
+# (--apply also needs --state-dir or --work-dir)
+```
+
+`--nodegroup` is repeatable; by default every managed node group whose instance types are all GPU inventory types
+(`GPU_INSTANCE_INVENTORY`; for a launch-template group without `instanceTypes`, the template's `InstanceType`). Per
+group the plan shows what is compliant, what would change and the exact AWS commands in apply order (the EKS commands
+carry `--cluster-name <eks cluster> --nodegroup-name <node group>`):
+
+| item | the plan checks | when it must change (apply runs these in this order) |
+|---|---|---|
+| 1. user data | whether the current launch template version carries the current managed part (`python3.12`, `strace`) | `aws ec2 create-launch-template-version --launch-template-id <lt-id> --source-version <current> --version-description "gpu-fault node prerequisites: ..." --launch-template-data '{"UserData":"<base64>"}'`: only UserData changes; a version an earlier run created with exactly this data (otherwise identical to the current version) is reused instead of creating another |
+| 2. node auto repair | whether `nodeRepairConfig.enabled` is `false` | when enabled or unset, `aws eks update-nodegroup-config ... --node-repair-config '{"enabled":false}'` (written explicitly so the product records `disabled`) |
+| 3. labels | whether `gpu-fault.io/control-plane=<site id>` is present (host mode: also `gpu-fault.io/dcgm-hostengine=host`) | `aws eks update-nodegroup-config ... --labels '{"addOrUpdateLabels":{"gpu-fault.io/control-plane":"<site id>"}}'` (plus the DCGM label in host mode; an explicit `--dcgm-hostengine embedded` sends `removeLabels` for that key only when it holds host or an unknown value) |
+| 4. roll | whether the group runs a version carrying the managed part | `aws eks update-nodegroup-version ... --launch-template '{"id":"<lt-id>","version":"<N>"}' --release-version <current releaseVersion>`: the AMI release version is pinned to the running one, so the roll changes only the user data; then a bounded wait on `aws eks describe-update --name <eks cluster> --nodegroup-name <node group> --update-id <id>` (`--roll-timeout-minutes`, default 90, max 360; configuration updates wait at most 15 minutes) |
+| current nodes | a read-only SSM `AWS-RunShellScript` inventory of every running instance: python3.12 venv, strace, the driver's CUDA major (`nvidia-smi -q` "CUDA Version"), every installed DCGM package with its version-release, `systemctl is-active nvidia-dcgm`, a running nv-hostengine, `dcgmi discovery -l` | reported, no package or service changed: `current_nodes` in the plan, with findings for DCGM build drift across the nodes (for example `datacenter-gpu-manager-4-cuda13` 4.7.0-1 on one node, 4.7.0-2 on another), differing driver CUDA majors and, in embedded mode, an active host engine (it conflicts with the exporter's embedded engine); without SSM permission the inventory is `unavailable` with the reason and the plan still completes |
+| Kubernetes | the allowed workload namespaces exist (default: the site's shared `allowedNamespaces` with `--state-dir`, else `training`; the control-plane namespace is created by the join and not required); the NVIDIA device plugin (kube-system, `app.kubernetes.io/name=nvidia-device-plugin`, the DaemonSet mounting the kubelet device-plugins directory) and EFA device plugin (`name=aws-efa-k8s-device-plugin`) DaemonSets run; no GPU client DaemonSet tolerates `gpu-fault.io/quiesce` (a key-less `operator: Exists` without an effect or with NoExecute) | reported, never changed and never blocking; read through a temporary kubeconfig `aws eks update-kubeconfig` writes with the operator's credentials; without Kubernetes access the findings show `available: false` and the reason |
+
+**User data merge**: every other MIME part (the `NodeConfig` part, site scripts) is kept byte for byte; only the
+**managed part** is added or replaced -- the `text/x-shellscript` part identified by the comment line
+`# gpu-fault.io/user-data-part: node-prerequisites` (file name `gpu-fault-managed-node-prerequisites.sh`), replaced as a
+whole when its content changes, so site additions belong in a part of their own. Hand-written (unmarked) shell parts,
+such as a site's own `dnf install -y python3.12 strace datacenter-gpu-manager-4-core datacenter-gpu-manager-4-cuda13`
+with retries, are kept byte for byte by default and reported: the plan lists each part's install lines and packages, its
+overlaps with the managed part (`python3.12`/`strace`; DCGM in host mode), its contradictions (an unpinned or
+differently pinned DCGM package against the host-mode pin; a DCGM CUDA build whose major differs from the nodes' driver
+CUDA major; a line enabling `nvidia-dcgm`/`nv-hostengine` in embedded mode) and its other packages; nothing is silently
+duplicated or dropped. `--adopt-user-data-part PART` (repeatable; the part's 1-based index or file name as the plan
+shows it) replaces that hand-written part with the managed part, and the plan lists exactly what the adoption drops (for
+example acceptance-only DCGM packages in embedded mode); a rerun with the same flag is then a no-op. Without any user
+data a new MIME document holds only the managed part (EKS merges its own `NodeConfig` into a managed node group's copy).
+Refused: a foreign part using the managed file name, two managed parts, an `--adopt-user-data-part` naming no part or a
+non-shell part, non-MIME, gzip or >16 KiB user data. The plan shows the managed part's script and the full merged
+document.
+
+**Apply** (`--confirm PREPARE_EKS_NODEGROUP` and `--reference` both required) re-plans, refuses before any write if any
+group is refused, then runs exactly the planned steps in the order above, one node group at a time, stopping at the
+first group that does not complete. Before every EKS write the group is re-read and must still be ACTIVE on the launch
+template version the plan saw, else it stops `CHANGED_SINCE_PLAN` and writes nothing more. After the steps (also when
+nothing needed changing) the same inventory script **verifies** every running instance (found with
+`ec2 describe-instances` by the `eks:cluster-name`/`eks:nodegroup-name` tags;
+`aws ssm send-command --document-name AWS-RunShellScript` and `get-command-invocation`, after a bounded
+`cloud-init status --wait`): a node fails without python3.12 venv or strace and, in host mode, when a DCGM package is
+not accepted by the pin, the CUDA build does not match the driver's CUDA major, `nvidia-dcgm` is not active or
+`dcgmi discovery -l` fails; a CUDA build of another major beside it and a host engine in embedded mode are non-blocking
+findings; a group without running instances records `skipped`. SSM was chosen because it needs no Kubernetes access and
+no debug Pod, works before a site exists and leaves nothing on the node; it needs
+`ssm:SendCommand`/`ssm:GetCommandInvocation` for the operator and `AmazonSSMManagedInstanceCore` on the node role,
+otherwise the outcome is `UNVERIFIED` and the `kubectl debug node/... chroot /host` check of §5.0.1 is the alternative.
+
+Outcomes per group: `COMPLETED` (exit 0); `ROLL_FAILED`, for example `NodeCreationFailure` -- the roll launches one
+extra replacement instance first; without capacity for it (Spot in particular) EKS fails the update after about 17
+minutes and keeps the old nodes and version, a clear retryable stop: rerun the same command later, the prepared launch
+template version is reused; `ROLL_IN_PROGRESS` (the wait bound was reached; rerun to keep waiting); `UPDATE_FAILED`;
+`CHANGED_SINCE_PLAN`; `VERIFICATION_FAILED`; `UNVERIFIED`; `FAILED` (an AWS call was refused: the message names
+the permission and the step's manual command). Any stop exits 2 with the reason and journals the attempt's outcome.
+
+**Idempotent and resumable**: a step already done is skipped (label present, repair disabled, managed part current,
+group already on a version carrying it), so a rerun after any stop converges. An update still in flight when a run
+stopped is journaled as `pending_update` and the next run waits for it (one EKS no longer knows is cleared and the
+group planned again); a group that is UPDATING without such a
+journaled update is refused. The journal is the evidence:
+`<state-dir|work-dir>/eks-nodegroup-prepare/<eks cluster>-<sha8 of the ARN>/<node group>.json` (per attempt the
+operator's STS identity, the reference, the plan, each step's command and outcome, the verification per instance). Logs:
+with `--state-dir` the usual `<state-dir>/logs/readonly|mutating/`, with `--work-dir` under `<work-dir>/logs/`.
+
+**`--state-dir` or `--work-dir`**: before a site exists use `--work-dir`. With a site's `--state-dir` the recorded
+`site.yaml` `metadata.name` must equal the derived site id, and the apply holds the site operation lock for its whole
+run: refused at once while a `gpu-fault-admin config`/`deploy` holds it, and none can start during the roll. Never roll
+while `config`/`deploy` may run (`regional_contexts` fails closed while a group is UPDATING); without a state directory
+that is the operator's responsibility. A bound deploy-host CLI (`<state-dir>/deployer-venv/bin/gpu-fault-admin`) needs
+`--state-dir`; an `--apply` with `--state-dir` must run with that site's own CLI (the deploy-host binding rule), the
+read-only plan is exempt. For a cluster the site already manages, after a roll the node installer reconciler installs
+the replacement nodes and the departed nodes' Agents retire automatically -- do not run `deploy` to onboard them; a
+cluster not yet managed then joins with `join-cluster` or the first `deploy`.
+
+**DCGM host engine** (`--dcgm-hostengine host`): the same managed part also installs `datacenter-gpu-manager-4-core-<v>`
+and `datacenter-gpu-manager-4-cuda<CUDA major>-<v>`, pinned because unpinned installs drifted between nodes:
+`--dcgm-version 4.7.0-2` (a version-release, the default) installs and accepts exactly that build;
+`--dcgm-version 4.7.0` (a version) lets dnf install the newest 4.7.0 build at boot and accepts any build of 4.7.0
+(4.7.0-1 and 4.7.0-2 alike; differing builds across the nodes are then reported as drift). The plan states which applies
+(`dcgm_hostengine.installs`); a pin already in the managed part is kept on reruns. The CUDA major is read on the node at
+boot from the `nvidia-smi -q` "CUDA Version", so it always matches the driver; then `systemctl enable --now nvidia-dcgm`
+and `dcgmi discovery -l`, and the group is labelled `gpu-fault.io/dcgm-hostengine=host`. Without the flag the group
+keeps the mode its label declares (`host`, or an explicit `embedded`, kept as is), else `embedded` (the current mode:
+the DCGM exporter runs its own embedded host engine, no DCGM host packages); any other label value is refused unless
+`--dcgm-hostengine` is given (`host` sets host, `embedded` removes the value). The label declares the group's mode to
+the release; host mode is for releases whose exporter honours it.
+
+**Refusals** (nothing is changed; the message names the manual steps of §5.0.1): a CPU ARN without a HyperPod
+orchestrator; a HyperPod cluster (a SageMaker ARN, or an EKS cluster orchestrated by HyperPod) -- never touched; the GPU
+cluster is the CPU cluster; the cluster is not ACTIVE; any node group of the cluster labelled for another site (one GPU
+cluster belongs to one site); a named node group that does not exist (without `--nodegroup`: no group of GPU inventory
+types); an amiType other than `AL2023_x86_64_NVIDIA` (custom AMI, AL2, Bottlerocket, ARM, ...); a node group without a
+launch template (it cannot start using one: create a new GPU node group with one); a launch template version naming its
+own `ImageId` (custom AMI); a node group not ACTIVE (unless resuming its own journaled update); instance types outside
+the GPU inventory; user data that cannot be merged; an unknown `gpu-fault.io/dcgm-hostengine` value without
+`--dcgm-hostengine`; a recorded site id mismatch; the site lock held. Other AMIs, node groups without a launch template
+and custom AMIs follow the manual steps of §5.0.1 (the ownership label: §5.0.0).
+
+**Operator permissions**: reads `eks:DescribeCluster`, `eks:ListNodegroups`, `eks:DescribeNodegroup`,
+`eks:DescribeUpdate`, `ec2:DescribeLaunchTemplateVersions`, `ec2:DescribeInstances` and
+`sagemaker:ListClusters`/`sagemaker:DescribeCluster` (the HyperPod check and the site id), Kubernetes read (namespaces,
+daemonsets) for the findings; `ssm:SendCommand`/`ssm:GetCommandInvocation` for the node inventory and the verification
+(without them the plan only loses the inventory, the apply ends `UNVERIFIED`); `--apply` adds
+`ec2:CreateLaunchTemplateVersion`, `eks:UpdateNodegroupConfig` and `eks:UpdateNodegroupVersion`.
+
 #### 5.0.2 After a join: kubeconfig current-context, the Agent-set check and `status` attribution
 
 - After `join-cluster` writes the new cluster's context into `gpu.kubeconfig`, it switches the current-context back
