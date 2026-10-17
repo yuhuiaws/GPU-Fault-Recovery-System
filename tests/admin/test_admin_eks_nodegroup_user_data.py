@@ -9,8 +9,11 @@ part already present -- identical (no-op) or different (only it replaced).
 from __future__ import annotations
 
 import base64
+import configparser
 import email
 import gzip
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -355,6 +358,84 @@ def test_host_mode_script_pins_both_packages_in_the_driver_cuda_build() -> None:
     assert EMBEDDED.startswith("#!/bin/bash\n# " + user_data.MANAGED_PART_MARKER), (
         "the marker is the first comment line"
     )
+
+
+def test_host_mode_writes_the_restart_dropin_before_it_enables_nvidia_dcgm(
+    tmp_path: Path,
+) -> None:
+    """The package unit (Restart=on-abort, 5 starts in 10 s) leaves a non-zero
+    exit or a crash loop down for good; the drop-in restarts both."""
+
+    lines = HOST.splitlines()
+    write = next(
+        index for index, line in enumerate(lines) if line.startswith("printf '%s\\n'")
+    )
+    reload = lines.index("systemctl daemon-reload")
+    enable = lines.index("systemctl enable --now nvidia-dcgm")
+    install = next(
+        index
+        for index, line in enumerate(lines)
+        if line.startswith('gpu_fault_install "datacenter-gpu-manager-4-core')
+    )
+    assert install < write < reload < enable, (
+        "installed, then the drop-in, then systemd reloaded, then enabled and started"
+    )
+    assert lines[reload - 1] == f"  > {user_data.DCGM_RESTART_DROPIN}"
+    # Run the rendered lines with the unit directory moved under tmp_path.
+    block = "\n".join(lines[write - 1 : reload]).replace(
+        "/etc/systemd/system", str(tmp_path)
+    )
+    subprocess.run(["bash", "-euo", "pipefail", "-c", block], check=True, timeout=30)
+    written = tmp_path / "nvidia-dcgm.service.d" / "90-gpu-fault-restart.conf"
+    assert written.read_text(encoding="utf-8") == user_data.DCGM_RESTART_DROPIN_TEXT
+    parsed = configparser.ConfigParser()
+    parsed.optionxform = str  # type: ignore[assignment,method-assign]
+    parsed.read_string(user_data.DCGM_RESTART_DROPIN_TEXT)
+    assert {section: dict(parsed[section]) for section in parsed.sections()} == {
+        "Unit": {"StartLimitIntervalSec": "300", "StartLimitBurst": "10"},
+        "Service": {"Restart": "on-failure", "RestartSec": "5s"},
+    }, "on-failure: a clean systemctl stop (the gpu-fault quiesce) is not restarted"
+    assert user_data.DCGM_RESTART_DROPIN not in EMBEDDED, (
+        "embedded mode writes no drop-in: its managed part is unchanged"
+    )
+
+
+def test_the_plan_view_of_the_dropin_names_its_settings_and_reason() -> None:
+    view = user_data.restart_dropin()
+
+    assert view["path"] == (
+        "/etc/systemd/system/nvidia-dcgm.service.d/90-gpu-fault-restart.conf"
+    )
+    assert view["content"] == user_data.DCGM_RESTART_DROPIN_TEXT
+    assert view["settings"] == (
+        "StartLimitIntervalSec=300 StartLimitBurst=10 Restart=on-failure RestartSec=5s"
+    )
+    assert "Restart=on-abort" in view["reason"] and "quiesce" in view["reason"]
+
+
+def test_a_host_part_written_before_the_dropin_is_replaced_once() -> None:
+    older = _without_dropin(HOST)
+    current = user_data.merge_managed_part(site_user_data(), older).text
+
+    merge = user_data.merge_managed_part(current, HOST)
+
+    assert merge.action == "replace", "the managed part changed: it is replaced"
+    assert merge.managed_script == older
+    assert user_data.DCGM_RESTART_DROPIN in merge.text
+    assert NODECONFIG_PART in merge.text and SITE_SCRIPT_PART in merge.text
+    assert user_data.merge_managed_part(merge.text, HOST).action == "keep", (
+        "a rerun over the replaced part changes nothing"
+    )
+    assert user_data.pinned_dcgm_version(merge.managed_script) == "4.7.0-2", (
+        "the older part's pin is still read, so a rerun keeps it"
+    )
+
+
+def _without_dropin(script: str) -> str:
+    """A host-mode managed part as it was written before the restart drop-in."""
+
+    head, rest = script.split("# nvidia-dcgm restarts after a failure", 1)
+    return head + rest[rest.index("systemctl enable --now nvidia-dcgm") :]
 
 
 @pytest.mark.parametrize(

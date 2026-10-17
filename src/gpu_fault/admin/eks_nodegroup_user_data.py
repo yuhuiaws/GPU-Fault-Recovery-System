@@ -23,7 +23,8 @@ The optional DCGM host engine mode (:data:`DCGM_HOSTENGINE_LABEL` =
 :data:`DCGM_HOSTENGINE_HOST` on the node group) adds the DCGM 4 packages to the
 same part, pinned (:class:`DcgmPin`) because unpinned installs drifted between
 nodes, in the CUDA build matching the driver's ``nvidia-smi`` CUDA major (read
-on the node at boot), and enables ``nvidia-dcgm``.
+on the node at boot), writes the restart drop-in
+:data:`DCGM_RESTART_DROPIN` and enables ``nvidia-dcgm``.
 """
 
 from __future__ import annotations
@@ -47,6 +48,9 @@ __all__ = [
     "DCGM_HOSTENGINE_HOST",
     "DCGM_HOSTENGINE_LABEL",
     "DCGM_PACKAGE_VERSION",
+    "DCGM_RESTART_DROPIN",
+    "DCGM_RESTART_DROPIN_TEXT",
+    "DCGM_RESTART_POLICY",
     "MANAGED_PART_FILENAME",
     "MANAGED_PART_MARKER",
     "DcgmPin",
@@ -63,6 +67,7 @@ __all__ = [
     "package_kind",
     "part_findings",
     "pinned_dcgm_version",
+    "restart_dropin",
 ]
 
 #: The comment line that identifies the one part this verb owns.
@@ -89,6 +94,28 @@ DCGM_PACKAGE_VERSION = "4.7.0-2"
 DCGM_CORE_PACKAGE = "datacenter-gpu-manager-4-core"
 DCGM_CUDA_PACKAGE_PREFIX = "datacenter-gpu-manager-4-cuda"
 DCGM_SERVICE = "nvidia-dcgm"
+#: The systemd drop-in host mode writes before it enables ``nvidia-dcgm``. The
+#: DCGM 4 package unit restarts nv-hostengine only after an unclean signal
+#: (``Restart=on-abort``) and gives up after 5 starts in 10 s, so a non-zero
+#: exit or a crash loop left the node without its host engine for good.
+#: ``on-failure`` restarts after both, within a wider start limit; a clean
+#: ``systemctl stop`` -- the gpu-fault quiesce stops ``nvidia-dcgm`` this way --
+#: is never restarted, so the quiesce is not fought.
+DCGM_RESTART_DROPIN = (
+    f"/etc/systemd/system/{DCGM_SERVICE}.service.d/90-gpu-fault-restart.conf"
+)
+DCGM_RESTART_POLICY = "on-failure"
+DCGM_RESTART_DROPIN_TEXT = (
+    "# gpu-fault-admin prepare-eks-nodegroup: restart nv-hostengine after a "
+    "failure; a clean stop stays stopped.\n"
+    "[Unit]\n"
+    "StartLimitIntervalSec=300\n"
+    "StartLimitBurst=10\n"
+    "\n"
+    "[Service]\n"
+    f"Restart={DCGM_RESTART_POLICY}\n"
+    "RestartSec=5s\n"
+)
 _DCGM_PIN = re.compile(r"^[0-9]+(?:\.[0-9]+){1,3}(?:-[0-9]+)?$")
 _PINNED_LINE = re.compile(r"^dcgm_version='(?P<version>[^']*)'$", re.MULTILINE)
 _CORE_SPEC = re.compile(r"^datacenter-gpu-manager-4-core(?:-(?P<version>[0-9]\S*))?$")
@@ -167,6 +194,44 @@ def _cuda_major_lines() -> list[str]:
     ]
 
 
+def _restart_dropin_lines() -> list[str]:
+    """Write :data:`DCGM_RESTART_DROPIN` and reload systemd, before the enable."""
+
+    lines = DCGM_RESTART_DROPIN_TEXT.splitlines()
+    if any("'" in line for line in lines):
+        raise ValueError("the drop-in text is written single-quoted")
+    return [
+        "# nvidia-dcgm restarts after a failure: the package unit restarts it only",
+        "# after an unclean signal and gives up after 5 starts in 10 s. A clean",
+        "# systemctl stop (the gpu-fault quiesce) stays stopped.",
+        f"mkdir -p {DCGM_RESTART_DROPIN.rsplit('/', 1)[0]}",
+        "printf '%s\\n' \\",
+        *(f"  '{line}' \\" for line in lines),
+        f"  > {DCGM_RESTART_DROPIN}",
+        "systemctl daemon-reload",
+    ]
+
+
+def restart_dropin() -> dict[str, str]:
+    """The restart drop-in host mode writes, as the plan shows it."""
+
+    return {
+        "path": DCGM_RESTART_DROPIN,
+        "content": DCGM_RESTART_DROPIN_TEXT,
+        "settings": " ".join(
+            line
+            for line in DCGM_RESTART_DROPIN_TEXT.splitlines()
+            if "=" in line and not line.startswith("#")
+        ),
+        "reason": (
+            "the DCGM 4 package unit restarts nv-hostengine only after an unclean "
+            "signal (Restart=on-abort) and gives up after 5 starts in 10 s, so a "
+            "non-zero exit or a crash loop would leave the host engine down for "
+            "good; a clean systemctl stop (the gpu-fault quiesce) stays stopped"
+        ),
+    }
+
+
 def managed_script(*, dcgm: DcgmPin | None = None) -> str:
     """The shell script of the managed part; DCGM host lines when pinned."""
 
@@ -203,6 +268,7 @@ def managed_script(*, dcgm: DcgmPin | None = None) -> str:
             *_cuda_major_lines(),
             f'gpu_fault_install "{DCGM_CORE_PACKAGE}-${{dcgm_version}}" '
             f'"{DCGM_CUDA_PACKAGE_PREFIX}${{cuda_major}}-${{dcgm_version}}"',
+            *_restart_dropin_lines(),
             f"systemctl enable --now {DCGM_SERVICE}",
             "dcgmi discovery -l >/dev/null",
         ]

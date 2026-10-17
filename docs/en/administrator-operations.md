@@ -2020,6 +2020,13 @@ DCGM_VERSION=REPLACE_WITH_DCGM_VERSION_RELEASE   # e.g. 4.7.0-2
 CUDA_MAJOR=REPLACE_WITH_CUDA_MAJOR               # e.g. 13
 dnf install -y "datacenter-gpu-manager-4-core-${DCGM_VERSION}" \
   "datacenter-gpu-manager-4-cuda${CUDA_MAJOR}-${DCGM_VERSION}"
+# Restart nvidia-dcgm after a failure: the package unit restarts it only after an unclean
+# signal (Restart=on-abort) and gives up after 5 starts in 10 s; a clean stop stays stopped.
+mkdir -p /etc/systemd/system/nvidia-dcgm.service.d
+printf '%s\n' '[Unit]' 'StartLimitIntervalSec=300' 'StartLimitBurst=10' '' \
+  '[Service]' 'Restart=on-failure' 'RestartSec=5s' \
+  > /etc/systemd/system/nvidia-dcgm.service.d/90-gpu-fault-restart.conf
+systemctl daemon-reload
 systemctl enable --now nvidia-dcgm
 --==GPU-FAULT==--
 ```
@@ -2125,14 +2132,25 @@ order and without pausing between them:
    releases), and a `cudaN` package matching the major of the "CUDA Version" `nvidia-smi` prints (a mismatched build
    fails, e.g. `dcgmproftester` exits 244); change the launch template version and roll the node group as above. A node
    that already carries both packages may also run `systemctl enable --now nvidia-dcgm` directly, but only the launch
-   template keeps it on replacement nodes.
-2. **Confirm on a node** (either one, like the check above):
+   template keeps it on replacement nodes. Write the restart drop-in of the shell part before the enable
+   (`/etc/systemd/system/nvidia-dcgm.service.d/90-gpu-fault-restart.conf`: `[Unit] StartLimitIntervalSec=300
+   StartLimitBurst=10`, `[Service] Restart=on-failure RestartSec=5s`, then `systemctl daemon-reload`). The DCGM 4
+   package unit (`Type=simple`, `ExecStart=/usr/bin/nv-hostengine -n --service-account nvidia-dcgm`, the same on the
+   AL2023 NVIDIA AMI and on HyperPod) carries `Restart=on-abort` with `StartLimitBurst=5` per 10 s: systemd restarts
+   nv-hostengine only after an unclean signal (segfault, abort, SIGKILL), never after a non-zero exit or a hang, and
+   gives up after 5 starts in 10 s -- so a non-zero exit or a crash loop leaves the host engine down for good, and the
+   node's next quick diagnostic grades the unreachable engine a failure (`DCGM_EXECUTION_REVIEW`, the node is
+   drained). `on-failure` restarts after a non-zero exit, an unclean signal or a timeout, at most 10 starts in 300 s;
+   an explicit `systemctl stop` -- the quiesce stops an active `nvidia-dcgm` this way and its restore starts it again --
+   is never restarted, so the drop-in does not fight the quiesce. A running node can take the same drop-in by hand;
+   `systemctl daemon-reload` is enough (the policy applies from the engine's next exit, no restart needed).
+2. **Confirm on a node** (either one, like the check above; `systemctl show` must print `Restart=on-failure`):
 
    ```bash
    kubectl debug node/<node name> -it --image=public.ecr.aws/amazonlinux/amazonlinux:2023 -- \
-     chroot /host sh -c "systemctl is-active nvidia-dcgm && dcgmi discovery -l && dcgmi diag -r 1"
+     chroot /host sh -c "systemctl is-active nvidia-dcgm && systemctl show nvidia-dcgm -p Restart && dcgmi discovery -l && dcgmi diag -r 1"
    aws ssm send-command --instance-ids <EC2 instance id> --document-name AWS-RunShellScript \
-     --parameters 'commands=["systemctl is-active nvidia-dcgm && dcgmi discovery -l && dcgmi diag -r 1"]'
+     --parameters 'commands=["systemctl is-active nvidia-dcgm && systemctl show nvidia-dcgm -p Restart && dcgmi discovery -l && dcgmi diag -r 1"]'
    ```
 3. **Label every GPU node group the site selects for the cluster** and wait until the node group is `ACTIVE` again:
 
@@ -2230,7 +2248,7 @@ carry `--cluster-name <eks cluster> --nodegroup-name <node group>`):
 | 2. node auto repair | whether `nodeRepairConfig.enabled` is `false` | when enabled or unset, `aws eks update-nodegroup-config ... --node-repair-config '{"enabled":false}'` (written explicitly so the product records `disabled`) |
 | 3. labels | whether `gpu-fault.io/control-plane=<site id>` is present (host mode: also `gpu-fault.io/dcgm-hostengine=host`) | `aws eks update-nodegroup-config ... --labels '{"addOrUpdateLabels":{"gpu-fault.io/control-plane":"<site id>"}}'` (plus the DCGM label in host mode; an explicit `--dcgm-hostengine embedded` sends `removeLabels` for that key only when it holds host or an unknown value) |
 | 4. roll | whether the group runs a version carrying the managed part | `aws eks update-nodegroup-version ... --launch-template '{"id":"<lt-id>","version":"<N>"}' --release-version <current releaseVersion>`: the AMI release version is pinned to the running one, so the roll changes only the user data; then a bounded wait on `aws eks describe-update --name <eks cluster> --nodegroup-name <node group> --update-id <id>` (`--roll-timeout-minutes`, default 90, max 360; configuration updates wait at most 15 minutes) |
-| current nodes | a read-only SSM `AWS-RunShellScript` inventory of every running instance: python3.12 venv, strace, the driver's CUDA major (`nvidia-smi -q` "CUDA Version"), every installed DCGM package with its version-release, `systemctl is-active nvidia-dcgm`, a running nv-hostengine, `dcgmi discovery -l` | reported, no package or service changed: `current_nodes` in the plan, with findings for DCGM build drift across the nodes (for example `datacenter-gpu-manager-4-cuda13` 4.7.0-1 on one node, 4.7.0-2 on another), differing driver CUDA majors and, in embedded mode, an active host engine (it conflicts with the exporter's embedded engine); without SSM permission the inventory is `unavailable` with the reason and the plan still completes |
+| current nodes | a read-only SSM `AWS-RunShellScript` inventory of every running instance: python3.12 venv, strace, the driver's CUDA major (`nvidia-smi -q` "CUDA Version"), every installed DCGM package with its version-release, `systemctl is-active nvidia-dcgm`, the unit's `Restart`/`RestartUSec`/`StartLimitBurst`/`StartLimitIntervalUSec` (`systemctl show`) and whether the restart drop-in is present, a running nv-hostengine, `dcgmi discovery -l` | reported, no package or service changed: `current_nodes` in the plan, with findings for DCGM build drift across the nodes (for example `datacenter-gpu-manager-4-cuda13` 4.7.0-1 on one node, 4.7.0-2 on another), differing driver CUDA majors and, in embedded mode, an active host engine (it conflicts with the exporter's embedded engine); without SSM permission the inventory is `unavailable` with the reason and the plan still completes |
 | Kubernetes | the allowed workload namespaces exist (default: the site's shared `allowedNamespaces` with `--state-dir`, else `training`; the control-plane namespace is created by the join and not required); the NVIDIA device plugin (kube-system, `app.kubernetes.io/name=nvidia-device-plugin`, the DaemonSet mounting the kubelet device-plugins directory) and EFA device plugin (`name=aws-efa-k8s-device-plugin`) DaemonSets run; no GPU client DaemonSet tolerates `gpu-fault.io/quiesce` (a key-less `operator: Exists` without an effect or with NoExecute) | reported, never changed and never blocking; read through a temporary kubeconfig `aws eks update-kubeconfig` writes with the operator's credentials; without Kubernetes access the findings show `available: false` and the reason |
 
 **User data merge**: every other MIME part (the `NodeConfig` part, site scripts) is kept byte for byte; only the
@@ -2258,9 +2276,10 @@ nothing needed changing) the same inventory script **verifies** every running in
 `ec2 describe-instances` by the `eks:cluster-name`/`eks:nodegroup-name` tags;
 `aws ssm send-command --document-name AWS-RunShellScript` and `get-command-invocation`, after a bounded
 `cloud-init status --wait`): a node fails without python3.12 venv or strace and, in host mode, when a DCGM package is
-not accepted by the pin, the CUDA build does not match the driver's CUDA major, `nvidia-dcgm` is not active or
-`dcgmi discovery -l` fails; a CUDA build of another major beside it and a host engine in embedded mode are non-blocking
-findings; a group without running instances records `skipped`. SSM was chosen because it needs no Kubernetes access and
+not accepted by the pin, the CUDA build does not match the driver's CUDA major, `nvidia-dcgm` is not active, its
+`Restart` is not `on-failure` (check `nvidia-dcgm-restart`) or the restart drop-in is missing (check
+`nvidia-dcgm-restart-dropin`), or `dcgmi discovery -l` fails; a CUDA build of another major beside it and a host
+engine in embedded mode are non-blocking findings; a group without running instances records `skipped`. SSM was chosen because it needs no Kubernetes access and
 no debug Pod, works before a site exists and leaves nothing on the node; it needs
 `ssm:SendCommand`/`ssm:GetCommandInvocation` for the operator and `AmazonSSMManagedInstanceCore` on the node role,
 otherwise the outcome is `UNVERIFIED` and the `kubectl debug node/... chroot /host` check of §5.0.1 is the alternative.
@@ -2297,8 +2316,15 @@ and `datacenter-gpu-manager-4-cuda<CUDA major>-<v>`, pinned because unpinned ins
 `--dcgm-version 4.7.0` (a version) lets dnf install the newest 4.7.0 build at boot and accepts any build of 4.7.0
 (4.7.0-1 and 4.7.0-2 alike; differing builds across the nodes are then reported as drift). The plan states which applies
 (`dcgm_hostengine.installs`); a pin already in the managed part is kept on reruns. The CUDA major is read on the node at
-boot from the `nvidia-smi -q` "CUDA Version", so it always matches the driver; then `systemctl enable --now nvidia-dcgm`
-and `dcgmi discovery -l`, and the group is labelled `gpu-fault.io/dcgm-hostengine=host`. Without the flag the group
+boot from the `nvidia-smi -q` "CUDA Version", so it always matches the driver; then the managed part writes the restart
+drop-in of §5.0.1 (`/etc/systemd/system/nvidia-dcgm.service.d/90-gpu-fault-restart.conf`, `Restart=on-failure`
+`RestartSec=5s`, `StartLimitBurst=10` per `StartLimitIntervalSec=300`; the package's `Restart=on-abort` leaves a
+non-zero exit or a crash loop down for good, a clean stop such as the quiesce's stays stopped) and runs
+`systemctl daemon-reload`, `systemctl enable --now nvidia-dcgm` and `dcgmi discovery -l`, and the group is labelled
+`gpu-fault.io/dcgm-hostengine=host`. The plan shows the drop-in (`dcgm_hostengine.restart_dropin`: path, content,
+settings, reason; one console line per group) and the verification checks it on every new node; a group a host-mode
+run prepared before the drop-in existed is planned once more (the managed part is `replace`d and the group rolled),
+after which reruns change nothing; embedded-mode groups are untouched. Without the flag the group
 keeps the mode its label declares (`host`, or an explicit `embedded`, kept as is), else `embedded` (the current mode:
 the DCGM exporter runs its own embedded host engine, no DCGM host packages); any other label value is refused unless
 `--dcgm-hostengine` is given (`host` sets host, `embedded` removes the value). The label declares the group's mode to

@@ -609,6 +609,13 @@ def _summary(result: PlanResult) -> None:
             )
         else:
             _say(f"{item.name}: compliant")
+        dropin = item.dcgm.get("restart_dropin") if item.verdict != REFUSED else None
+        if isinstance(dropin, Mapping):
+            _say(
+                f"{item.name}: host DCGM: the managed part writes the nvidia-dcgm "
+                f"drop-in {dropin.get('path')} ({dropin.get('settings')}) before "
+                "enabling it"
+            )
         for line in item.finding_lines():
             _say(f"finding: {line}")
     for line in finding_lines(result.findings):

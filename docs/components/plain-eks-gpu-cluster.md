@@ -149,7 +149,9 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
    `gpu-fault.io/quiesce`（不要用无 key 的 `operator: Exists` 通配容忍；按 key 列出 `nvidia.com/gpu` 等即可），并须容忍在
    quiesce 窗口内被停止/驱逐；NVIDIA device plugin 与 GFD 的默认清单只容忍 `nvidia.com/gpu`，无需改动。
 7. 主机 DCGM（可选，真实的 `dcgmi diag` 判定）：launch template 固定版本安装 `datacenter-gpu-manager-4-core-<ver>` 与
-   `datacenter-gpu-manager-4-cuda<CUDA 主版本>-<ver>`（主版本与 `nvidia-smi` 的 "CUDA Version" 一致）并 `systemctl enable --now nvidia-dcgm`，
+   `datacenter-gpu-manager-4-cuda<CUDA 主版本>-<ver>`（主版本与 `nvidia-smi` 的 "CUDA Version" 一致），写入 `Restart=on-failure` 的 drop-in
+   `nvidia-dcgm.service.d/90-gpu-fault-restart.conf`（软件包单元的 `Restart=on-abort` 让一次非零退出或一轮崩溃循环永久停着）并
+   `systemctl enable --now nvidia-dcgm`，
    在节点上用 `dcgmi discovery -l`、`dcgmi diag -r 1` 确认，给该集群的**每个** GPU 节点组加 `gpu-fault.io/dcgm-hostengine=host`，随即
    deploy/join（启用而不加标签的 deploy 会被 embedded 冲突检查拒绝）；退出时摘标签、把 `nvidia-dcgm` 从 launch template 拿掉并在节点上
    `systemctl disable --now nvidia-dcgm`，再立即 deploy（次序与命令见管理员日常运维 §5.0.1「主机 DCGM」）。

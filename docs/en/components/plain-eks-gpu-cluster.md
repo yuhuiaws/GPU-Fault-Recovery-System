@@ -195,7 +195,9 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
    device plugin and GFD manifests tolerate only `nvidia.com/gpu` and need no change.
 7. Host DCGM (optional, real `dcgmi diag` verdicts): the launch template installs a pinned
    `datacenter-gpu-manager-4-core-<ver>` and `datacenter-gpu-manager-4-cuda<CUDA major>-<ver>` (the major of the
-   "CUDA Version" `nvidia-smi` prints) and runs `systemctl enable --now nvidia-dcgm`; confirm on a node with
+   "CUDA Version" `nvidia-smi` prints), writes the `Restart=on-failure` drop-in
+   `nvidia-dcgm.service.d/90-gpu-fault-restart.conf` (the package unit's `Restart=on-abort` leaves a non-zero exit or a
+   crash loop down for good) and runs `systemctl enable --now nvidia-dcgm`; confirm on a node with
    `dcgmi discovery -l` and `dcgmi diag -r 1`, label **every** GPU node group of the cluster
    `gpu-fault.io/dcgm-hostengine=host` and deploy/join right away (a deploy with the service enabled but no label is
    refused by the embedded conflict check); to leave, remove the label, take `nvidia-dcgm` out of the launch template and

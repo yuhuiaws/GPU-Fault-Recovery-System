@@ -62,6 +62,7 @@ from gpu_fault.admin.eks_nodegroup_user_data import (
     merge_managed_part,
     part_findings,
     pinned_dcgm_version,
+    restart_dropin,
 )
 from gpu_fault.cluster_scope import OWNERSHIP_LABEL
 from gpu_fault.eks_node_repair import NODE_REPAIR_DISABLED, node_repair_state
@@ -782,6 +783,8 @@ def plan_group(
             "source": source,
             "pin": pin.value if pin else None,
             "installs": pin.describe() if pin else "no DCGM host packages",
+            # Host mode writes it before enabling nvidia-dcgm (the managed part).
+            **({"restart_dropin": restart_dropin()} if pin else {}),
         },
         script=script,
         merge=merge,

@@ -24,9 +24,12 @@ from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.deploy_host_binding import is_readonly_command
 from gpu_fault.admin.eks_nodegroup_user_data import (
     DCGM_HOSTENGINE_LABEL,
+    DCGM_RESTART_DROPIN,
     MANAGED_PART_MARKER,
+    dcgm_pin,
     managed_script,
     merge_managed_part,
+    restart_dropin,
 )
 from gpu_fault.admin.operation_lock import site_operation_lock
 from gpu_fault.cluster_scope import OWNERSHIP_LABEL
@@ -37,12 +40,14 @@ from tests.admin._eks_nodegroup_world import (
     GPU_GROUP,
     LT_ID,
     NODECONFIG_PART,
+    PACKAGE_UNIT,
     RELEASE,
     SITE_ID,
     SITE_SCRIPT_PART,
     FakeClock,
     World,
     apply_arguments,
+    booted_node,
     encoded,
     journal_file,
     old_node,
@@ -533,7 +538,8 @@ def test_the_plan_shows_the_current_nodes_and_their_dcgm_drift(
         "source": "flag",
         "pin": "4.7.0-2",
         "installs": "exactly build 4.7.0-2 of both DCGM packages",
-    }
+        "restart_dropin": restart_dropin(),
+    }, "the plan names the restart drop-in host mode writes"
     site_part = group["user_data"]["parts"][1]
     assert (
         "part 2 line 2: datacenter-gpu-manager-4-core is unpinned (the newest build), "
@@ -1048,8 +1054,22 @@ def test_host_mode_apply_pins_dcgm_labels_the_group_and_verifies_dcgm(
         "dcgm-cuda-flavor",
         "dcgm-cuda-version",
         "nvidia-dcgm",
+        "nvidia-dcgm-restart",
+        "nvidia-dcgm-restart-dropin",
         "dcgmi-discovery",
     }
+    assert {
+        item["instance_id"]: (
+            item["facts"]["nvidia-dcgm-unit"]["Restart"],
+            item["facts"]["nvidia-dcgm-restart-dropin"],
+        )
+        for item in nodes
+    } == {"i-new1a": ("on-failure", "present"), "i-new1b": ("on-failure", "present")}, (
+        "every new node reports its restart policy and the drop-in"
+    )
+    assert script.index(DCGM_RESTART_DROPIN) < script.index(
+        "systemctl enable --now nvidia-dcgm"
+    )
     world.calls.clear()
 
     code, document, err = _run(world, capsys, *apply_arguments(tmp_path))
@@ -1068,6 +1088,132 @@ def test_host_mode_apply_pins_dcgm_labels_the_group_and_verifies_dcgm(
         "roll",
     ], "switching back removes the DCGM lines and the label, and rolls"
     assert "nvidia-dcgm" not in group["managed_part_script"]
+
+
+def _host_prepared_before_the_dropin(world: World) -> str:
+    """The group as a host-mode run of the verb left it before the drop-in."""
+
+    full = managed_script(dcgm=dcgm_pin("4.7.0-2"))
+    head, rest = full.split("# nvidia-dcgm restarts after a failure", 1)
+    older = head + rest[rest.index("systemctl enable --now nvidia-dcgm") :]
+    text = merge_managed_part(site_user_data(), older).text
+    world.templates[LT_ID][3]["data"]["UserData"] = encoded(text)
+    document = world.nodegroups[GPU_GROUP]
+    document["labels"] = {
+        **document["labels"],
+        OWNERSHIP_LABEL: SITE_ID,
+        DCGM_HOSTENGINE_LABEL: "host",
+    }
+    document["nodeRepairConfig"] = {"enabled": False}
+    world.node_facts = {
+        instance: booted_node(text) for instance in world.instances[GPU_GROUP]
+    }
+    return older
+
+
+def test_the_host_mode_plan_shows_the_restart_dropin(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    world = World(user_data=site_user_data())
+
+    code, document, err = _run(world, capsys, "--dcgm-hostengine", "host")
+
+    assert code == 0
+    group = _group(document)
+    assert group["dcgm_hostengine"]["restart_dropin"] == restart_dropin()
+    assert DCGM_RESTART_DROPIN in group["managed_part_script"]
+    assert DCGM_RESTART_DROPIN in group["merged_user_data"]
+    assert (
+        f"{GPU_GROUP}: host DCGM: the managed part writes the nvidia-dcgm drop-in "
+        f"{DCGM_RESTART_DROPIN} (StartLimitIntervalSec=300 StartLimitBurst=10 "
+        "Restart=on-failure RestartSec=5s) before enabling it"
+    ) in err, "the console summary names the drop-in"
+    assert any(
+        DCGM_RESTART_DROPIN in line for line in group["verification"]["commands"]
+    ), "the verification after the roll looks for it"
+
+    code, embedded, err = _run(world, capsys)
+    assert "restart_dropin" not in _group(embedded)["dcgm_hostengine"]
+    assert "drop-in" not in err, "embedded mode writes no drop-in"
+
+
+def test_a_host_group_prepared_before_the_dropin_is_rolled_once_then_compliant(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = World()
+    older = _host_prepared_before_the_dropin(world)
+
+    code, plan, _err = _run(world, capsys)
+
+    assert code == 0
+    group = _group(plan)
+    assert (group["dcgm_hostengine"]["source"], group["dcgm_hostengine"]["pin"]) == (
+        "label",
+        "4.7.0-2",
+    ), "the label keeps host mode and the part's pin is kept"
+    assert group["user_data"]["action"] == "replace"
+    assert [item["step"] for item in group["steps"]] == [
+        "launch-template-version",
+        "roll",
+    ], "only the managed part changes: no label or repair step"
+    current = group["current_nodes"]
+    assert current["outcome"] == "failed"
+    assert {
+        name
+        for item in current["nodes"]
+        for name, check in item["checks"].items()
+        if not check["ok"]
+    } == {"nvidia-dcgm-restart", "nvidia-dcgm-restart-dropin"}, (
+        "today's nodes run the package unit's Restart=on-abort"
+    )
+
+    code, document, err = _run(world, capsys, *apply_arguments(tmp_path))
+
+    assert code == 0, err
+    assert world.aws_operations(mutate=True) == [
+        "ec2 create-launch-template-version",
+        "eks update-nodegroup-version",
+    ]
+    text = world.template_user_data(4)
+    assert DCGM_RESTART_DROPIN in text and older not in text
+    verification = document["apply"]["results"][0]["verification"]
+    assert verification["outcome"] == "passed"
+    world.calls.clear()
+
+    code, again, err = _run(world, capsys, *apply_arguments(tmp_path))
+
+    assert code == 0, err
+    assert world.aws_operations(mutate=True) == [], "a rerun changes nothing"
+    assert _group(again)["verdict"] == "COMPLIANT"
+
+
+def test_a_new_node_without_the_dropin_fails_the_host_verification(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    world = World(user_data=site_user_data())
+    original = world.eks_describe_update
+
+    def describe(options):  # type: ignore[no-untyped-def]
+        result = original(options)
+        for instance in world.instances.get(GPU_GROUP, []):
+            facts = world.node_facts.get(instance)
+            if instance.startswith("i-new") and facts is not None:
+                facts.update(
+                    {"restart-dropin": "absent", "unit-properties": dict(PACKAGE_UNIT)}
+                )
+        return result
+
+    world.eks_describe_update = describe  # type: ignore[method-assign]
+
+    code, document, err = _run(
+        world, capsys, *apply_arguments(tmp_path, "--dcgm-hostengine", "host")
+    )
+
+    assert code == 2 and "VERIFICATION_FAILED" in err
+    assert (
+        "i-new1a (Success: nvidia-dcgm-restart on-abort (expected on-failure), "
+        "nvidia-dcgm-restart-dropin absent (expected present))"
+    ) in err, "the stop names the restart policy and the missing drop-in per node"
 
 
 def test_adoption_in_apply_replaces_the_hand_written_part(

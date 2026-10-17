@@ -26,6 +26,7 @@ from gpu_fault.admin.bootstrap_common import (
     CommandRunner,
 )
 from gpu_fault.admin.bootstrap_site import site_identifier
+from gpu_fault.admin.eks_nodegroup_user_data import DCGM_RESTART_DROPIN
 
 REGION = "us-west-2"
 ACCOUNT = "123456789012"
@@ -388,6 +389,7 @@ class World:
                 "strace",
                 "driver-cuda-major",
                 "service",
+                "restart-dropin",
                 "hostengine",
                 "dcgmi-discovery",
             )
@@ -395,6 +397,10 @@ class World:
         lines += [
             f"gpu-fault-node package {name} {version}"
             for name, version in sorted(facts["packages"].items())
+        ]
+        lines += [
+            f"gpu-fault-node unit-property {name} {value}"
+            for name, value in sorted(facts["unit-properties"].items())
         ]
         return {
             "Status": facts.get("ssm_status", "Success"),
@@ -429,6 +435,23 @@ class World:
         return json.dumps({"items": self.daemonsets})
 
 
+#: ``systemctl show nvidia-dcgm`` without a unit file (systemd's defaults), with
+#: the DCGM 4 package unit, and with the package unit plus the restart drop-in.
+NO_UNIT = {
+    "Restart": "no",
+    "RestartUSec": "100ms",
+    "StartLimitBurst": "5",
+    "StartLimitIntervalUSec": "10s",
+}
+PACKAGE_UNIT = {**NO_UNIT, "Restart": "on-abort"}
+DROPIN_UNIT = {
+    "Restart": "on-failure",
+    "RestartUSec": "5s",
+    "StartLimitBurst": "10",
+    "StartLimitIntervalUSec": "5min",
+}
+
+
 def old_node(**overrides: Any) -> dict[str, Any]:
     """A node prepared by hand: python3.12 and strace, no DCGM host packages."""
 
@@ -437,6 +460,8 @@ def old_node(**overrides: Any) -> dict[str, Any]:
         "strace": "ok",
         "driver-cuda-major": "13",
         "service": "inactive",
+        "restart-dropin": "absent",
+        "unit-properties": dict(NO_UNIT),
         "hostengine": "absent",
         "dcgmi-discovery": "failed",
         "packages": {},
@@ -447,7 +472,8 @@ def old_node(**overrides: Any) -> dict[str, Any]:
 
 def booted_node(user_data: str | None) -> dict[str, Any]:
     """What a node booted from ``user_data`` reports: the managed part's
-    packages (the DCGM pin in the CUDA 13 build of the driver)."""
+    packages (the DCGM pin in the CUDA 13 build of the driver) and, when the
+    part writes it, the restart drop-in in effect."""
 
     text = user_data or ""
     managed = "gpu-fault.io/user-data-part: node-prerequisites" in text
@@ -457,6 +483,7 @@ def booted_node(user_data: str | None) -> dict[str, Any]:
     pin = re.search(r"dcgm_version='([^']+)'", text)
     if pin is not None:
         build = pin.group(1) if "-" in pin.group(1) else f"{pin.group(1)}-2"
+        dropin = "> " + DCGM_RESTART_DROPIN in text
         facts.update(
             service="active",
             hostengine="running",
@@ -466,6 +493,8 @@ def booted_node(user_data: str | None) -> dict[str, Any]:
             },
         )
         facts["dcgmi-discovery"] = "ok"
+        facts["restart-dropin"] = "present" if dropin else "absent"
+        facts["unit-properties"] = dict(DROPIN_UNIT if dropin else PACKAGE_UNIT)
     return facts
 
 

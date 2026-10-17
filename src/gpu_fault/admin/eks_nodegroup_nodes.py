@@ -7,15 +7,16 @@ reads the nodes after the roll, with the same POSIX ``sh`` script sent as SSM
 tags). The script changes nothing: it reports whether ``/usr/bin/python3.12``
 can build a venv and ``strace`` exists, the driver's CUDA major
 (``nvidia-smi -q`` "CUDA Version"), every installed DCGM package with its
-``version-release``, ``systemctl is-active nvidia-dcgm``, a running
-``nv-hostengine`` and whether ``dcgmi discovery -l`` answers. The judgment is
-made here, per DCGM mode:
+``version-release``, ``systemctl is-active nvidia-dcgm``, the unit's effective
+restart settings (``systemctl show``) and whether the restart drop-in
+(``DCGM_RESTART_DROPIN``) is there, a running ``nv-hostengine`` and whether
+``dcgmi discovery -l`` answers. The judgment is made here, per DCGM mode:
 
 * always: python3.12 venv and strace present;
 * host mode: both DCGM 4 packages accepted by the pin (``DcgmPin``), the CUDA
-  build matching the driver's CUDA major, ``nvidia-dcgm`` active and
-  ``dcgmi discovery -l`` answering; a CUDA build of another major beside it
-  is a finding;
+  build matching the driver's CUDA major, ``nvidia-dcgm`` active with
+  ``Restart=on-failure`` from the drop-in, and ``dcgmi discovery -l``
+  answering; a CUDA build of another major beside it is a finding;
 * embedded mode: an active host engine is a finding -- it conflicts with the
   exporter's embedded engine.
 
@@ -42,6 +43,8 @@ from gpu_fault.admin.eks_nodegroup_user_data import (
     DCGM_CORE_PACKAGE,
     DCGM_CUDA_PACKAGE_PREFIX,
     DCGM_HOSTENGINE_HOST,
+    DCGM_RESTART_DROPIN,
+    DCGM_RESTART_POLICY,
     DCGM_SERVICE,
     DcgmPin,
 )
@@ -63,6 +66,14 @@ SSM_INTERVAL_SECONDS = 10.0
 SSM_PENDING = frozenset({"Pending", "InProgress", "Delayed", "Cancelling"})
 FACT_PREFIX = "gpu-fault-node "
 _CUDA_PACKAGE = re.compile(rf"^{re.escape(DCGM_CUDA_PACKAGE_PREFIX)}(?P<major>[0-9]+)$")
+#: The unit properties the inventory reads (``systemctl show``): the restart
+#: policy host mode requires and the limits the drop-in sets beside it.
+UNIT_PROPERTIES = (
+    "Restart",
+    "RestartUSec",
+    "StartLimitBurst",
+    "StartLimitIntervalUSec",
+)
 MANUAL_CHECK = (
     "kubectl debug node/<node> -it --image=public.ecr.aws/amazonlinux/"
     'amazonlinux:2023 -- chroot /host sh -c "/usr/bin/python3.12 -c '
@@ -92,6 +103,12 @@ def inventory_commands(*, wait_for_cloud_init: bool) -> list[str]:
         f"rpm -qa --qf '{FACT_PREFIX}package %{{NAME}} %{{VERSION}}-%{{RELEASE}}\\n' "
         "'datacenter-gpu-manager*' 2>/dev/null || true",
         f'say service "$(systemctl is-active {DCGM_SERVICE} 2>/dev/null || true)"',
+        f"systemctl show {DCGM_SERVICE} "
+        + " ".join(f"-p {name}" for name in UNIT_PROPERTIES)
+        + " 2>/dev/null | sed -n "
+        + f"'s/^\\([A-Za-z]*\\)=\\(.*\\)$/{FACT_PREFIX}unit-property \\1 \\2/p'",
+        f"if [ -f {DCGM_RESTART_DROPIN} ]; then say restart-dropin present; "
+        "else say restart-dropin absent; fi",
         "if pgrep -x nv-hostengine >/dev/null 2>&1; then say hostengine running; "
         "else say hostengine absent; fi",
         "if ! command -v dcgmi >/dev/null 2>&1; then say dcgmi-discovery absent; "
@@ -112,6 +129,13 @@ class NodeFacts:
     service: str = ""
     hostengine: str = ""
     dcgmi: str = ""
+    #: ``systemctl show`` values of :data:`UNIT_PROPERTIES`.
+    unit_properties: Mapping[str, str] = field(default_factory=dict)
+    restart_dropin: str = ""
+
+    @property
+    def restart(self) -> str:
+        return str(self.unit_properties.get("Restart") or "")
 
     @property
     def cuda_builds(self) -> dict[str, str]:
@@ -131,6 +155,11 @@ class NodeFacts:
             "driver_cuda_major": self.driver_cuda_major or "unknown",
             "dcgm_packages": dict(sorted(self.packages.items())),
             "nvidia-dcgm": self.service or "unknown",
+            "nvidia-dcgm-unit": {
+                name: self.unit_properties.get(name) or "unknown"
+                for name in UNIT_PROPERTIES
+            },
+            "nvidia-dcgm-restart-dropin": self.restart_dropin or "unknown",
             "nv-hostengine": self.hostengine or "unknown",
             "dcgmi_discovery": self.dcgmi or "unknown",
         }
@@ -139,6 +168,7 @@ class NodeFacts:
 def parse_inventory(instance_id: str, status: str, output: str) -> NodeFacts:
     values: dict[str, str] = {}
     packages: dict[str, str] = {}
+    properties: dict[str, str] = {}
     for line in output.splitlines():
         if not line.startswith(FACT_PREFIX):
             continue
@@ -147,6 +177,8 @@ def parse_inventory(instance_id: str, status: str, output: str) -> NodeFacts:
             continue
         if words[0] == "package" and len(words) == 3:
             packages[words[1]] = words[2]
+        elif words[0] == "unit-property" and len(words) >= 2:
+            properties[words[1]] = " ".join(words[2:])
         else:
             values[words[0]] = " ".join(words[1:])
     major = values.get("driver-cuda-major", "")
@@ -160,6 +192,8 @@ def parse_inventory(instance_id: str, status: str, output: str) -> NodeFacts:
         service=values.get("service", ""),
         hostengine=values.get("hostengine", ""),
         dcgmi=values.get("dcgmi-discovery", ""),
+        unit_properties=properties,
+        restart_dropin=values.get("restart-dropin", ""),
     )
 
 
@@ -191,6 +225,13 @@ def judge(facts: NodeFacts, *, mode: str, pin: DcgmPin | None) -> dict[str, Any]
         )
         checks[DCGM_SERVICE] = _check(
             facts.service == "active", facts.service, "active"
+        )
+        # The drop-in the managed part writes, and systemd honouring it.
+        checks[f"{DCGM_SERVICE}-restart"] = _check(
+            facts.restart == DCGM_RESTART_POLICY, facts.restart, DCGM_RESTART_POLICY
+        )
+        checks[f"{DCGM_SERVICE}-restart-dropin"] = _check(
+            facts.restart_dropin == "present", facts.restart_dropin, "present"
         )
         checks["dcgmi-discovery"] = _check(facts.dcgmi == "ok", facts.dcgmi, "ok")
         for other in sorted(set(builds) - {major}):

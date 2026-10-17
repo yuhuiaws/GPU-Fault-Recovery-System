@@ -2,12 +2,14 @@
 
 Per node: python3.12 venv and strace always; in host mode the DCGM packages
 accepted by the pin, the CUDA build of the driver's CUDA major, nvidia-dcgm
-active and ``dcgmi discovery -l`` answering; in embedded mode an active host
-engine is a finding. Across nodes: DCGM build drift and driver CUDA majors.
+active with ``Restart=on-failure`` from the restart drop-in, and
+``dcgmi discovery -l`` answering; in embedded mode an active host engine is a
+finding. Across nodes: DCGM build drift and driver CUDA majors.
 """
 
 from __future__ import annotations
 
+import re
 import subprocess
 from pathlib import Path
 
@@ -17,8 +19,10 @@ from gpu_fault.admin import eks_nodegroup_nodes as nodes
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.admin.eks_nodegroup_user_data import dcgm_pin
 from tests.admin._eks_nodegroup_world import (
+    DROPIN_UNIT,
     GPU_GROUP,
     GPU_NAME,
+    PACKAGE_UNIT,
     REGION,
     FakeAws,
     FakeClock,
@@ -44,6 +48,8 @@ def _facts(**fields: object) -> nodes.NodeFacts:
         "service": "active",
         "hostengine": "running",
         "dcgmi": "ok",
+        "unit_properties": dict(DROPIN_UNIT),
+        "restart_dropin": "present",
     }
     values.update(fields)
     return nodes.NodeFacts(**values)  # type: ignore[arg-type]
@@ -70,7 +76,11 @@ def test_the_inventory_script_reports_every_fact_and_changes_nothing(
             "printf 'gpu-fault-node package datacenter-gpu-manager-4-core 4.7.0-2\\n"
             "gpu-fault-node package datacenter-gpu-manager-4-cuda13 4.7.0-1\\n'"
         ),
-        "systemctl": "echo inactive; exit 3",
+        "systemctl": (
+            'if [ "$1" = show ]; then printf "Restart=on-abort\\nRestartUSec=100ms'
+            '\\nStartLimitBurst=5\\nStartLimitIntervalUSec=10s\\n"; exit 0; fi\n'
+            "echo inactive; exit 3"
+        ),
         "pgrep": "exit 1",
         "dcgmi": "exit 226",
         "strace": "exit 0",
@@ -102,9 +112,15 @@ def test_the_inventory_script_reports_every_fact_and_changes_nothing(
         "failed",
     )
     assert facts.strace == "ok"
-    assert not any(
-        word in script for word in ("dnf ", "install", "enable", "start", "rm ")
-    ), "the inventory never installs, starts or removes anything"
+    assert facts.unit_properties == PACKAGE_UNIT, (
+        "the package unit's own restart settings are read with systemctl show"
+    )
+    assert (facts.restart, facts.restart_dropin) == ("on-abort", "absent")
+    assert not re.search(
+        r"\bdnf\b|\byum\b|\brpm -[iUe]|\binstall\b|\brm\b|>\s*/etc|"
+        r"systemctl (?:start|restart|enable|disable|stop|daemon-reload|reset-failed)",
+        script,
+    ), "the inventory never installs, starts, writes or removes anything"
 
 
 def test_host_mode_passes_with_the_pinned_build_of_the_driver_cuda_major() -> None:
@@ -118,6 +134,8 @@ def test_host_mode_passes_with_the_pinned_build_of_the_driver_cuda_major() -> No
         "dcgm-cuda-flavor",
         "dcgm-cuda-version",
         "nvidia-dcgm",
+        "nvidia-dcgm-restart",
+        "nvidia-dcgm-restart-dropin",
         "dcgmi-discovery",
     }
     assert result["findings"] == []
@@ -158,6 +176,28 @@ def test_host_mode_passes_with_the_pinned_build_of_the_driver_cuda_major() -> No
         ),
         ({"service": "inactive"}, {"nvidia-dcgm": ("inactive", "active")}),
         ({"dcgmi": "failed"}, {"dcgmi-discovery": ("failed", "ok")}),
+        (
+            {"unit_properties": dict(PACKAGE_UNIT), "restart_dropin": "absent"},
+            {
+                "nvidia-dcgm-restart": ("on-abort", "on-failure"),
+                "nvidia-dcgm-restart-dropin": ("absent", "present"),
+            },
+        ),
+        (
+            {"unit_properties": {**DROPIN_UNIT, "Restart": "no"}},
+            {"nvidia-dcgm-restart": ("no", "on-failure")},
+        ),
+    ],
+    ids=[
+        "no-venv",
+        "no-strace",
+        "no-core-package",
+        "cuda-build-of-another-version",
+        "cuda-build-of-another-major",
+        "service-inactive",
+        "discovery-failed",
+        "package-unit-without-dropin",
+        "dropin-overridden",
     ],
 )
 def test_host_mode_names_each_failing_check(
