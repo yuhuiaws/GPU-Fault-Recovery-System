@@ -15200,8 +15200,10 @@ reboot, and the marker carries retirement fields after restore**
   - on an `eks-managed` cluster `RUN_DCGM_DIAGNOSTIC` is judged by the DCGM mode: host mode
     (GPU node groups labelled `gpu-fault.io/dcgm-hostengine=host`, exporter annotation
     `gpu-fault.io/dcgm-hostengine: host`) requires a real DCGM verdict -- the node's result
-    carries neither `DCGM_TOOL_UNAVAILABLE` nor `DCGM_HOSTENGINE_UNAVAILABLE` and the node is
-    not in the step's `configuration_only_nodes` (the result carries `dcgm_hostengine=host`);
+    carries neither `DCGM_TOOL_UNAVAILABLE` nor `DCGM_HOSTENGINE_UNAVAILABLE` and is a graded
+    outcome of parsed DCGM output (`PASS`/`WARN`/`FAIL` with `status_counts`, no `parse_error`;
+    a `WARN` from DCGM's own CONFIG-severity findings is a real verdict too; the result carries
+    `dcgm_hostengine=host`);
     in embedded mode (the default) those two configuration `WARN`s remain the expected
     outcome and never drain the node; HyperPod is unchanged;
   - confirmed by finding metric, incident event_id and marker_id -- not just by

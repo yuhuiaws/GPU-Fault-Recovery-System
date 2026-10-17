@@ -170,17 +170,24 @@ def test_each_cluster_is_applied_its_own_mode_and_a_rollback_its_captured_one(
         tmp_path, _hyperpod_cluster(tmp_path), _eks(tmp_path, **HOST_ENTRY)
     )
     hyperpod, eks = release.config.clusters
-    _config_map, host_text = GPU_BOOTSTRAP._render_gpu_dcgm_exporter(release, eks)
+
+    def applied(target: Any, **options: Any) -> list[str]:
+        before = len(release.runner.calls)  # type: ignore[attr-defined]
+        GPU_BOOTSTRAP.apply_gpu_dcgm_exporter(release, target, **options)
+        return [
+            str(call_options.get("input_text") or "")
+            for arguments, call_options in release.runner.calls[before:]  # type: ignore[attr-defined]
+            if arguments[-3:] == ["apply", "-f", "-"]
+            and "kind: DaemonSet" in str(call_options.get("input_text") or "")
+        ]
+
+    (host_text,) = applied(eks)
     assert _exporter_env(_daemonset(host_text))[REMOTE] == "127.0.0.1:5555"
-    _config_map, restored = GPU_BOOTSTRAP._render_gpu_dcgm_exporter(
-        release, eks, dcgm_hostengine="embedded"
-    )
+    (restored,) = applied(eks, dcgm_hostengine="embedded")
     assert REMOTE not in _exporter_env(_daemonset(restored)), (
         "a rollback renders the mode the previous DaemonSet ran"
     )
-    _config_map, hyperpod_text = GPU_BOOTSTRAP._render_gpu_dcgm_exporter(
-        release, hyperpod
-    )
+    (hyperpod_text,) = applied(hyperpod)
     assert hyperpod_text == _render(), "HyperPod applies the checked-in text"
 
 
@@ -253,7 +260,7 @@ def test_the_release_state_records_the_modes_it_rolled(tmp_path: Path) -> None:
     release = _release(
         tmp_path, _hyperpod_cluster(tmp_path), _eks(tmp_path, **HOST_ENTRY)
     )
-    STATE._write_state(release, "dcgm-test")
+    STATE.save_state(release, "dcgm-test")
     assert release.state[DCGM.DCGM_HOSTENGINES_STATE_KEY] == (
         DCGM.dcgm_hostengines_digest(release.config)
     )
@@ -322,11 +329,13 @@ def _eks_target(scenario: SimpleNamespace, mode: str) -> SimpleNamespace:
 
 @pytest.mark.parametrize("mode", ["host", "embedded"])
 def test_forward_waves_wait_for_the_agents_installed_in_the_cluster_mode(
-    node_release: SimpleNamespace, mode: str
+    node_release: SimpleNamespace, mode: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     release = node_release.release
     waits: list[dict[str, Any]] = []
-    release._wait_agents = lambda *_args, **options: waits.append(options)
+    monkeypatch.setattr(
+        release, "_wait_agents", lambda *_args, **options: waits.append(options)
+    )
     target = _eks_target(node_release, mode)
     upgrade_gpu_target(
         release,
@@ -364,11 +373,15 @@ def test_the_mode_annotation_decides_convergence_only_when_asked() -> None:
     assert not agents_converged(
         [node(None)], target, "a" * 64, dcgm_hostengine="host"
     ), "an Agent installed before the flip is still pending"
-    assert agents_converged([node("host")], target, "a" * 64, dcgm_hostengine="host")
+    assert agents_converged([node("host")], target, "a" * 64, dcgm_hostengine="host"), (
+        "the reconciler re-installed the Agent in host mode"
+    )
     assert not agents_converged(
         [node("host")], target, "a" * 64, dcgm_hostengine="embedded"
     ), "leaving host mode waits for the reconciler to remove the annotation"
-    assert agents_converged([node(None)], target, "a" * 64, dcgm_hostengine="embedded")
+    assert agents_converged(
+        [node(None)], target, "a" * 64, dcgm_hostengine="embedded"
+    ), "an embedded Agent carries no annotation"
     hyperpod = SimpleNamespace(provider="hyperpod", hyperpod_cluster_name="hp")
     assert DCGM.forward_dcgm_hostengine(hyperpod, "upgrade") is None
     assert DCGM.forward_dcgm_hostengine(target, "rollback") is None, (
