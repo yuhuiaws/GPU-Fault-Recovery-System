@@ -353,11 +353,18 @@ def test_failed_preflight_does_not_leave_its_started_jobs(rendered_batch, dry_ru
     source, template, output, scope, identity = rendered_batch
     nodes = batch.prepare_node_batch(source, template, output, scope, identity)
     runner = Runner(fail_dry_run=dry_run, fail_wait=not dry_run)
-    with pytest.raises(RuntimeError, match="refused|failed"):
+    with pytest.raises(RuntimeError, match="refused|failed") as raised:
         batch.run_node_preflights(nodes, scope, identity, runner, workers=1)
     assert runner.active == set()
     creates = sum("create" in command for command in runner.commands)
-    assert creates == (0 if dry_run else 1)
+    # A refused admission starts no host Job; a failed host preflight does not
+    # stop the others, so the one error names every node the operator must fix.
+    assert creates == (0 if dry_run else len(nodes))
+    if not dry_run:
+        notes = "\n".join(getattr(raised.value, "__notes__", ()))
+        assert all(
+            f"node preflight failed for {node.node.name}" in notes for node in nodes
+        ), notes
 
 
 def test_lost_create_ack_is_compensated_with_a_uid_precondition(rendered_batch):
@@ -367,7 +374,7 @@ def test_lost_create_ack_is_compensated_with_a_uid_precondition(rendered_batch):
     with pytest.raises(RuntimeError, match="acknowledgement lost"):
         batch.run_node_preflights(nodes, scope, identity, runner, workers=1)
     assert runner.active == set()
-    assert sum("--raw" in command for command in runner.commands) == 1
+    assert sum("--raw" in command for command in runner.commands) == len(nodes)
 
 
 def test_duplicate_node_uid_is_refused_before_any_rendered_job(rendered_batch):

@@ -11,6 +11,7 @@ from gpu_fault.node_installer_rendering import (
 )
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
+from gpu_fault_release.regional_release_dcgm import captured_dcgm_hostengine
 from gpu_fault_release.regional_release_diff import ReleaseComponent
 from gpu_fault_release.regional_release_images import (
     NodeDependencyTarget,
@@ -137,7 +138,13 @@ def rollback_target(
             raise ReleaseError(
                 f"{target.cluster_id} previous DCGM image is unavailable"
             )
-        self._apply_gpu_dcgm_exporter(target, image=old["dcgm_image"])
+        # The previous DaemonSet's DCGM host engine mode, not the site's: a
+        # rolled-back mode flip restores the exporter the old Agents expect.
+        self._apply_gpu_dcgm_exporter(
+            target,
+            image=old["dcgm_image"],
+            dcgm_hostengine=captured_dcgm_hostengine(previous, target),
+        )
     deployment_names = {
         deployment
         for component, deployment in (

@@ -314,10 +314,11 @@ def validate_saved_join_target(
         raise JoinTargetIdentityError(
             "cannot confirm the recorded GPU join target"
         ) from exc
+    # Recorded before these fields existed: the rest is still compared.
     if "node_selector_source" not in discovery["target"]:
-        # Recorded before the source field existed: the selector itself is
-        # still compared, the derived source is not news.
         current = replace(current, node_selector_source="")
+    if "dcgm_hostengine" not in discovery["target"]:
+        current = replace(current, dcgm_hostengine="", dcgm_hostengine_source="")
     if current != recorded or cluster_id != discovery.get("cluster_id"):
         raise JoinTargetIdentityError(
             "GPU join target identity changed since discovery"

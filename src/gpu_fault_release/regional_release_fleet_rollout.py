@@ -113,6 +113,8 @@ class FleetWaveContext:
     allow_legacy_identity: bool
     agent_identity: dict[str, Any] | None
     template_content_sha256: str | None = None
+    #: The DCGM host engine mode a forward wave waits for (eks-managed only).
+    dcgm_hostengine: str | None = None
 
     @property
     def node_dependency_target(self) -> NodeDependencyTarget:
@@ -1338,6 +1340,7 @@ def run_fleet_waves(
                 node_names=wave,
                 legacy_identity=context.allow_legacy_identity,
                 agent_identity=context.agent_identity,
+                dcgm_hostengine=context.dcgm_hostengine,
             )
             safety_node_names.update(wave)
             install_seconds = time.monotonic() - install_started

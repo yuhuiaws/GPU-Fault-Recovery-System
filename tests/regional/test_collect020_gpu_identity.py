@@ -286,3 +286,76 @@ def test_the_case_constants_and_plan_name_the_hard_stop() -> None:
         details["rollback"]["quarantine_is_restored_only_by_validation_workflow"]
         is True
     )
+
+
+# --- the DCGM host engine mode (eks-managed) -----------------------------------
+
+
+def _dcgm_step(node: str, result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "operation": "RUN_DCGM_DIAGNOSTIC",
+        "status": "SUCCEEDED",
+        "details": {"node_results": {node: result}},
+    }
+
+
+def _with_dcgm(*steps: dict[str, Any]) -> dict[str, Any]:
+    activity = _activity()
+    activity["workflows"][0]["step_executions"] = list(steps)
+    return activity
+
+
+GRADED = {
+    "diagnostic_outcome": "PASS",
+    "configuration_only_failures": False,
+    "status_counts": {"PASS": 12},
+    "parse_error": None,
+    "recommended_actions": [],
+    "dcgm_hostengine": "host",
+}
+
+
+def test_the_exporter_annotation_names_the_mode_the_case_judges() -> None:
+    assert (
+        verdicts.exporter_dcgm_hostengine(
+            {"metadata": {"annotations": {"gpu-fault.io/dcgm-hostengine": "host"}}}
+        )
+        == "host"
+    )
+    assert verdicts.exporter_dcgm_hostengine({"metadata": {}}) == "", (
+        "the unmarked HyperPod text is not re-judged"
+    )
+
+
+def test_host_mode_expects_a_real_dcgm_verdict_on_the_node() -> None:
+    node = "ip-10-0-33-205"
+    assert (
+        verdicts.dcgm_verdict_errors(
+            _with_dcgm(_dcgm_step(node, GRADED)), node=node, dcgm_hostengine="host"
+        )
+        == []
+    ), "a graded diagnostic of parsed DCGM output passes"
+    unreachable = {
+        **GRADED,
+        "diagnostic_outcome": "WARN",
+        "configuration_only_failures": True,
+        "status_counts": {},
+        "parse_error": "JSONDecodeError: Expecting value",
+        "recommended_actions": [{"action_code": "DCGM_HOSTENGINE_UNAVAILABLE"}],
+    }
+    errors = verdicts.dcgm_verdict_errors(
+        _with_dcgm(_dcgm_step(node, unreachable)), node=node, dcgm_hostengine="host"
+    )
+    assert "reported ['DCGM_HOSTENGINE_UNAVAILABLE']" in _text(errors), errors
+    assert "produced no DCGM verdict" in _text(errors), errors
+    assert "no RUN_DCGM_DIAGNOSTIC result" in _text(
+        verdicts.dcgm_verdict_errors(_with_dcgm(), node=node, dcgm_hostengine="host")
+    )
+    assert (
+        verdicts.dcgm_verdict_errors(
+            _with_dcgm(_dcgm_step(node, unreachable)),
+            node=node,
+            dcgm_hostengine="embedded",
+        )
+        == []
+    ), "embedded mode keeps accepting the configuration WARN"

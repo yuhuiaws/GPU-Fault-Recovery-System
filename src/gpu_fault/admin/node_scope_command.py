@@ -43,7 +43,9 @@ from gpu_fault.admin.bootstrap_ownership import (
     NodeGroupFacts,
     NodeScope,
     eks_nodegroup_facts,
+    groups_for_selector,
     hyperpod_instance_group_facts,
+    resolve_dcgm_hostengine,
     resolve_node_scope,
 )
 from gpu_fault.admin.membership_lock import administrator_operation_lock
@@ -56,6 +58,8 @@ from gpu_fault.cluster_scope import (
     ClusterProvider,
     NodeSelectorSource,
     cluster_provider,
+    dcgm_hostengine,
+    dcgm_hostengine_source,
     node_selector,
     node_selector_source,
     selector_matches,
@@ -269,6 +273,47 @@ def _nodes(
 # --- assessment --------------------------------------------------------------
 
 
+def dcgm_hostengine_report(
+    entry: Mapping[str, Any],
+    facts: list[NodeGroupFacts],
+    *,
+    selector: str,
+    cluster: str,
+) -> dict[str, Any]:
+    """The recorded DCGM host engine mode against what the node groups declare.
+
+    Unlike the selector the mode is re-derived by every deploy and join, so
+    ``pending deploy`` only means the next deploy records the declared mode
+    (and rolls the exporter and the Agents for it); ``blocked`` carries the
+    refusal that deploy would print.
+    """
+
+    recorded = dcgm_hostengine(entry).value
+    report: dict[str, Any] = {
+        "recorded": recorded,
+        "source": dcgm_hostengine_source(entry).value,
+        "declared": recorded,
+        "refusal": None,
+    }
+    if cluster_provider(entry.get("provider")) is ClusterProvider.EKS_MANAGED:
+        try:
+            declared, _source = resolve_dcgm_hostengine(
+                groups_for_selector(facts, selector), cluster=cluster
+            )
+            report["declared"] = declared.value
+        except BootstrapError as exc:
+            report["declared"] = None
+            report["refusal"] = str(exc)
+    report["state"] = (
+        BLOCKED
+        if report["refusal"]
+        else DATA_PLANE_CONVERGED
+        if report["declared"] == recorded
+        else DATA_PLANE_PENDING
+    )
+    return report
+
+
 def assess_cluster(
     runner: CommandRunner, *, site: RenderedSite, entry: Mapping[str, Any]
 ) -> dict[str, Any]:
@@ -289,6 +334,9 @@ def assess_cluster(
         "label": {"selector": None, "owned_groups": [], "refusal": None},
         "nodes": {},
         "data_plane": _data_plane_scope(runner, site=site, entry=entry),
+        "dcgm_hostengine": dcgm_hostengine_report(
+            entry, facts, selector=current_selector, cluster=cluster
+        ),
     }
     try:
         scope: NodeScope | None = resolve_node_scope(
@@ -538,7 +586,9 @@ def run_node_scope_command(
         f"gpu-fault-admin {COMMAND}: "
         + "; ".join(
             f"{item['cluster_id']} {item['source']} -> {item['convergence']}; "
-            f"data plane {item['data_plane']['state']}"
+            f"data plane {item['data_plane']['state']}; DCGM host engine "
+            f"{item['dcgm_hostengine']['recorded']} "
+            f"({item['dcgm_hostengine']['state']})"
             for item in reports
         ),
         file=sys.stderr,

@@ -33,6 +33,7 @@ from gpu_fault.cluster_scope import (
     default_failure_domain_labels,
     node_selector,
     node_selector_source,
+    validate_dcgm_hostengine,
 )
 from gpu_fault.digests import SHA256_PATTERN
 from gpu_fault.failure_domains import FAILURE_DOMAIN_LABELS
@@ -894,6 +895,12 @@ class GpuClusterSiteConfig:
     node_selector_source: str = ""
     #: This cluster's own Runtime Profile; ``None`` inherits the site profile.
     runtime_profile: ClusterRuntimeProfileSiteConfig | None = None
+    #: eks-managed only: the DCGM host engine mode its node groups declare
+    #: (``cluster_scope.DcgmHostEngine``) and its source, rewritten by every
+    #: deploy and join; empty on HyperPod entries (always ``host``) and on
+    #: entries written before the field existed (read as ``embedded``).
+    dcgm_hostengine: str = ""
+    dcgm_hostengine_source: str = ""
 
     @property
     def gpu_node_selector(self) -> str:
@@ -920,6 +927,8 @@ class GpuClusterSiteConfig:
                 "provider",
                 "nodeSelector",
                 "nodeSelectorSource",
+                "dcgmHostEngine",
+                "dcgmHostEngineSource",
                 "runtimeProfile",
                 "hyperpodClusterName",
                 "eksClusterArn",
@@ -977,6 +986,16 @@ class GpuClusterSiteConfig:
             )
         except ValueError as exc:
             raise SiteConfigError(f"{path}.nodeSelectorSource: {exc}") from None
+        try:
+            dcgm_mode, dcgm_source = validate_dcgm_hostengine(
+                provider,
+                _optional_text(data.get("dcgmHostEngine"), f"{path}.dcgmHostEngine"),
+                _optional_text(
+                    data.get("dcgmHostEngineSource"), f"{path}.dcgmHostEngineSource"
+                ),
+            )
+        except ValueError as exc:
+            raise SiteConfigError(f"{path}.dcgmHostEngine: {exc}") from None
         return cls(
             cluster_id=cluster_id,
             context=_required_text(data.get("context"), f"{path}.context"),
@@ -985,6 +1004,8 @@ class GpuClusterSiteConfig:
             provider=provider.value,
             node_selector=selector or "",
             node_selector_source=source or "",
+            dcgm_hostengine=dcgm_mode,
+            dcgm_hostengine_source=dcgm_source,
             runtime_profile=(
                 ClusterRuntimeProfileSiteConfig.from_value(
                     data["runtimeProfile"], f"{path}.runtimeProfile"
@@ -1293,6 +1314,9 @@ def load_site(path: Path, *, repository_root: Path | None = None) -> RenderedSit
             entry["node_selector"] = cluster.node_selector
         if cluster.node_selector_source:
             entry["node_selector_source"] = cluster.node_selector_source
+        if cluster.dcgm_hostengine:
+            entry["dcgm_hostengine"] = cluster.dcgm_hostengine
+            entry["dcgm_hostengine_source"] = cluster.dcgm_hostengine_source
         # A cluster's own Runtime Profile; absent means the site profile, so
         # a single-profile site renders exactly as before.
         if cluster.runtime_profile is not None:

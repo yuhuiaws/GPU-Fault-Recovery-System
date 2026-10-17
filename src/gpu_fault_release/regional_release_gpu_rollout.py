@@ -21,6 +21,7 @@ from gpu_fault_release.regional_release_config import (
     ClusterTarget,
     ReleaseError,
 )
+from gpu_fault_release.regional_release_dcgm import installed_dcgm_hostengine_matches
 from gpu_fault_release.regional_release_diff import (
     ReleaseComponent,
     ReleaseDiff,
@@ -552,7 +553,11 @@ def agents_converged(
     config_digest: str | None = None,
     require_node_uid: bool = False,
     node_names: frozenset[str] | None = None,
+    dcgm_hostengine: str | None = None,
 ) -> bool:
+    """Every selected node runs an installer of this identity (and, when
+    ``dcgm_hostengine`` is given, an Agent installed for that DCGM mode)."""
+
     selector = node_selector(target)
     nodes = [
         item
@@ -605,6 +610,7 @@ def agents_converged(
                 .get("gpu-fault.io/installer-template-sha256")
                 == template_sha
             )
+            and installed_dcgm_hostengine_matches(item, dcgm_hostengine)
         )
     ]
     return bool(nodes) and len(aligned) == len(nodes)

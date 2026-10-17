@@ -71,6 +71,7 @@ __all__ = [
     "selector_matches",
     "selector_ownership_value",
     "selector_requirements",
+    "validate_dcgm_hostengine",
     "validate_node_selector",
     "validate_ownership_value",
 ]
@@ -363,6 +364,39 @@ def dcgm_hostengine_source(
             f"{DcgmHostEngineSource.DEFAULT.value}, got {recorded!r}"
         )
     return parsed
+
+
+def validate_dcgm_hostengine(
+    provider: object, mode: object, source: object
+) -> tuple[str, str]:
+    """A recorded ``(mode, source)`` pair, normalised, or ``ValueError``.
+
+    Recorded on ``eks-managed`` entries only, both or neither, and in the one
+    pairing discovery writes: ``host`` from ``node-group-label``, ``embedded``
+    from ``default``. A HyperPod entry records neither (always ``host``).
+    """
+
+    mode_text, source_text = _recorded_text(mode), _recorded_text(source)
+    if not mode_text and not source_text:
+        return "", ""
+    if cluster_provider(provider) is ClusterProvider.HYPERPOD:
+        raise ValueError(
+            "a HyperPod cluster runs DCGM as a host service; the DCGM host "
+            "engine mode is recorded for eks-managed clusters only"
+        )
+    parsed = dcgm_hostengine(None, provider=provider, mode=mode_text)
+    parsed_source = dcgm_hostengine_source(None, provider=provider, source=source_text)
+    expected = (
+        DcgmHostEngineSource.NODE_GROUP_LABEL
+        if parsed is DcgmHostEngine.HOST
+        else DcgmHostEngineSource.DEFAULT
+    )
+    if not mode_text or not source_text or parsed_source is not expected:
+        raise ValueError(
+            f"DCGM host engine {parsed.value} is recorded with source "
+            f"{expected.value}, got {source_text or 'none'}"
+        )
+    return parsed.value, parsed_source.value
 
 
 def dcgm_hostengine_environment(target: object) -> str:

@@ -34,6 +34,7 @@ from gpu_fault.cluster_scope import (
     selector_matches,
 )
 from gpu_fault_release.regional_release_config import ReleaseError
+from gpu_fault_release.regional_release_dcgm import node_dcgm_details
 from gpu_fault_release.regional_release_node_scope import check_node_scope_agreement
 
 RETIRE_DEPARTED_AGENTS_HINT = (
@@ -164,6 +165,8 @@ def node_scope_details(
         "selector": selector,
         "source": node_selector_source(target).value,
         "selected_nodes": len(selected),
+        # The DCGM host engine mode and, on eks-managed, every node's state.
+        **node_dcgm_details(release, target, nodes),
     }
     if not is_eks_managed(target) and target.hyperpod_cluster_name:
         cluster_label = f"{HYPERPOD_CLUSTER_LABEL}={target.hyperpod_cluster_name}"

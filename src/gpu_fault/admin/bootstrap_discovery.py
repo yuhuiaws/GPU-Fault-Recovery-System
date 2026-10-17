@@ -26,6 +26,7 @@ from gpu_fault.admin.bootstrap_ownership import (
     RecordedNodeScope,
     eks_nodegroup_facts,
     groups_for_selector,
+    resolve_dcgm_hostengine,
     resolve_node_scope,
 )
 from gpu_fault.admin.bootstrap_site import hyperpod_inventory
@@ -146,6 +147,9 @@ def cluster_provider_entries(cluster: ClusterIdentity) -> dict[str, str]:
     the selector discovery resolved (a HyperPod cluster joined before the
     ownership convention recorded none and keeps selecting on its cluster-name
     label) and ``nodeSelectorSource``, the audit trail of where it came from.
+    A plain EKS cluster also records the DCGM host engine mode its node groups
+    declare (``dcgmHostEngine`` / ``dcgmHostEngineSource``); a HyperPod entry
+    never does, it is always ``host``.
     """
 
     entries: dict[str, str] = (
@@ -157,6 +161,9 @@ def cluster_provider_entries(cluster: ClusterIdentity) -> dict[str, str]:
         entries["nodeSelector"] = cluster.node_selector
     if cluster.node_selector_source:
         entries["nodeSelectorSource"] = cluster.node_selector_source
+    if cluster.is_eks_managed and cluster.dcgm_hostengine:
+        entries["dcgmHostEngine"] = cluster.dcgm_hostengine
+        entries["dcgmHostEngineSource"] = cluster.dcgm_hostengine_source
     return entries
 
 
@@ -385,6 +392,17 @@ def discover_eks_managed_cluster(
     for nodegroup in nodegroups:
         node_subnets.extend(str(item) for item in nodegroup.get("subnets") or ())
         repair_states.append(node_repair_state(nodegroup))
+    # The DCGM host engine mode is a node-image capability of the groups the
+    # scope selects, re-read on every deploy and join (not membership); an
+    # identity-only read resolves no scope and records no mode.
+    dcgm_mode, dcgm_source = (
+        resolve_dcgm_hostengine(
+            [item for item in scope.evidence if item.name in scope.owned_groups],
+            cluster=eks_name,
+        )
+        if scope.source is not None
+        else ("", "")
+    )
     cidrs = subnet_cidrs(
         runner,
         region=parsed.region,
@@ -408,4 +426,6 @@ def discover_eks_managed_cluster(
         node_selector=scope.selector,
         node_selector_source=scope.source.value if scope.source is not None else "",
         node_repair=aggregate_node_repair(repair_states),
+        dcgm_hostengine=str(dcgm_mode),
+        dcgm_hostengine_source=str(dcgm_source),
     )

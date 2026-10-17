@@ -11,6 +11,7 @@ import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.cluster_scope import (
     cluster_provider,
+    dcgm_hostengine_environment,
     node_selector,
     node_selector_source,
 )
@@ -46,6 +47,7 @@ def _render_gpu_dcgm_exporter(
     target: ClusterTarget,
     *,
     image: str | None = None,
+    dcgm_hostengine: str | None = None,
 ) -> tuple[str, str]:
     counters = ROOT / "deploy/dataplane/dcgm-counters.csv"
     rendered_config_map = release.runner.run(
@@ -64,11 +66,13 @@ def _render_gpu_dcgm_exporter(
         capture=True,
     )
     # The same renderer the plan payload uses, so an approver reads the text
-    # this function is about to apply -- including the instance-type list.
+    # this function is about to apply -- including the instance-type list. A
+    # rollback hands the mode its captured DaemonSet ran (``dcgm_hostengine``).
     manifest = render_dcgm_exporter_manifest(
         namespace=release.config.namespace,
         image=image or release.dcgm_exporter_image,
         provider=getattr(target, "provider", None),
+        dcgm_hostengine=dcgm_hostengine or dcgm_hostengine_environment(target),
     )
     return rendered_config_map, manifest
 
@@ -91,11 +95,13 @@ def apply_gpu_dcgm_exporter(
     target: ClusterTarget,
     *,
     image: str | None = None,
+    dcgm_hostengine: str | None = None,
 ) -> None:
     rendered_config_map, manifest = _render_gpu_dcgm_exporter(
         release,
         target,
         image=image,
+        dcgm_hostengine=dcgm_hostengine,
     )
     for candidate in (rendered_config_map, manifest):
         release.runner.run(

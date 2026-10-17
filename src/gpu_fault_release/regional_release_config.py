@@ -18,6 +18,7 @@ from gpu_fault.cluster_scope import (
     cluster_provider,
     node_selector,
     node_selector_source,
+    validate_dcgm_hostengine,
 )
 from gpu_fault_release import containing_repository_root, repository_root
 from gpu_fault_release.regional_release_profile_model import (
@@ -245,6 +246,10 @@ class ClusterTarget:
     #: Where the selector came from (``cluster_scope.NodeSelectorSource``);
     #: empty on configs rendered before the field existed, derived on read.
     node_selector_source: str = ""
+    #: eks-managed only: the recorded DCGM host engine mode and its source
+    #: (``cluster_scope.dcgm_hostengine``; empty reads as ``embedded``).
+    dcgm_hostengine: str = ""
+    dcgm_hostengine_source: str = ""
     #: This cluster's own Runtime Profile; empty fields inherit the site's.
     #: ``ReleaseConfig.load`` fills them from the site profile, so every
     #: reader sees one effective value per cluster.
@@ -385,6 +390,14 @@ class ClusterTarget:
             )
         except ValueError as exc:
             raise ReleaseError(f"cluster target node_selector_source: {exc}") from None
+        try:
+            dcgm_mode, dcgm_source = validate_dcgm_hostengine(
+                provider,
+                value.get("dcgm_hostengine"),
+                value.get("dcgm_hostengine_source"),
+            )
+        except ValueError as exc:
+            raise ReleaseError(f"cluster target dcgm_hostengine: {exc}") from None
         region = validate_aws_region(value["region"], "cluster target region")
         if region != expected_region:
             raise ReleaseError(
@@ -441,6 +454,8 @@ class ClusterTarget:
             provider=provider.value,
             node_selector=selector,
             node_selector_source=selector_source,
+            dcgm_hostengine=dcgm_mode,
+            dcgm_hostengine_source=dcgm_source,
             runtime_profile_source=profile_fields[0],
             runtime_profile_template_source=profile_fields[1],
             runtime_profile_version=profile_fields[2],

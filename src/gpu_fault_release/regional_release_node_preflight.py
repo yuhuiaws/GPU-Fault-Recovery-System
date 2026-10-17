@@ -15,6 +15,7 @@ from gpu_fault.hyperpod_spares import (
 )
 from gpu_fault_release import repository_root
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
+from gpu_fault_release.regional_release_dcgm import record_node_dcgm_states
 from gpu_fault_release.regional_release_gpu_rollout import gpu_node_items
 from gpu_fault_release.regional_release_images import NodeDependencyTarget
 from gpu_fault_release.regional_release_rendering import build_reconciler_environment
@@ -221,6 +222,9 @@ def run_node_installer_preflight(
         raise ReleaseError(
             f"{target.cluster_id} node preflight did not cover every target node"
         )
+    # Each eks node's DCGM state as the preflight classified it, for status
+    # and verify (``node_scope.dcgm_hostengine_nodes``).
+    record_node_dcgm_states(release, target, result.get("dcgm_hostengine"))
 
 
 def ensure_node_candidate_preflight(

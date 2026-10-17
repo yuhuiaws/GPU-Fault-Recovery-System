@@ -4,6 +4,7 @@ from collections.abc import Callable
 from typing import Any
 
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
+from gpu_fault_release.regional_release_dcgm import forward_dcgm_hostengine
 from gpu_fault_release.regional_release_fleet_rollout import (
     FleetWaveContext,
     NodeRolloutPolicy,
@@ -219,6 +220,7 @@ def _finalize_node_runtime(
         **({"node_names": candidate.node_names} if candidate.excluded_nodes else {}),
         legacy_identity=allow_legacy_identity,
         agent_identity=agent_identity,
+        dcgm_hostengine=forward_dcgm_hostengine(target, candidate.phase),
     )
     return final_identity
 
@@ -546,6 +548,7 @@ def roll_node_runtime(
             allow_legacy_identity=allow_legacy_identity,
             agent_identity=agent_identity,
             template_content_sha256=template_content_sha256,
+            dcgm_hostengine=forward_dcgm_hostengine(target, phase),
         ),
         deployment,
     )

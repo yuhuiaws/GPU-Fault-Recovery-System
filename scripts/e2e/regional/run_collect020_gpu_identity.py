@@ -20,6 +20,7 @@ restore workflow (never by deleting taints). Plan-only by default.
 
 from __future__ import annotations
 
+import json
 import sys
 import time
 from datetime import datetime
@@ -259,6 +260,17 @@ def execute(
         activity, dropped_uuid=dropped_uuid
     )
     stages["dcgm_notification"] = verdicts.dcgm_notification_errors(activity)
+    # In DCGM host engine mode the quick diagnostic must grade the GPUs.
+    dcgm_hostengine = verdicts.exporter_dcgm_hostengine(
+        json.loads(
+            fixture.regional.kubectl(
+                "gpu", "get", "daemonset", "gpu-fault-dcgm-exporter", "-o", "json"
+            )
+        )
+    )
+    stages["dcgm_verdict"] = verdicts.dcgm_verdict_errors(
+        activity, node=fixture.node, dcgm_hostengine=dcgm_hostengine
+    )
     restores = _restore(fixture, activity, profile_version=profile_version)
     write_json_atomic(case_dir / "restore.json", {"workflows": restores})
     final = fixture.node_activity(since, evidence_kind="GPU_INVENTORY")
@@ -280,6 +292,7 @@ def execute(
         "instance_type": instance_type,
         "expected_gpu_count": expected_count,
         "dropped_uuid": dropped_uuid,
+        "dcgm_hostengine": dcgm_hostengine,
         "window_open": opened,
         "activity": {key: value for key, value in final.items() if key != "evidence"},
         "inventory_evidence_record_ids": [

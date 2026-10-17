@@ -142,6 +142,8 @@ def test_full_status_shows_the_selector_source_and_the_nodes_left_out() -> None:
         "selector": HP_LABEL_SELECTOR,
         "source": "label-convention",
         "selected_nodes": 1,
+        "dcgm_hostengine": "host",
+        "dcgm_hostengine_source": "provider",
         "cluster_nodes_outside_selector": ["hyperpod-i-9"],
     }, "the report names the HyperPod nodes the selector leaves to the provider"
     assert release.commands == [
@@ -156,6 +158,8 @@ def test_full_status_shows_the_selector_source_and_the_nodes_left_out() -> None:
         "selector": HP_SELECTOR,
         "source": "provider-default-legacy",
         "selected_nodes": 2,
+        "dcgm_hostengine": "host",
+        "dcgm_hostengine_source": "provider",
     }, "a legacy cluster selects every cluster node, so there is nothing to compare"
 
     eks = _target(
@@ -172,6 +176,9 @@ def test_full_status_shows_the_selector_source_and_the_nodes_left_out() -> None:
         "selector": "eks.amazonaws.com/nodegroup=gpu-ng",
         "source": "flag-legacy",
         "selected_nodes": 0,
+        "dcgm_hostengine": "embedded",
+        "dcgm_hostengine_source": "default",
+        "dcgm_hostengine_pending_nodes": [],
     }
 
 
@@ -230,6 +237,8 @@ def test_the_gpu_cluster_check_reports_the_scope_the_secret_serves() -> None:
         "selector": HP_LABEL_SELECTOR,
         "source": "label-convention",
         "selected_nodes": 1,
+        "dcgm_hostengine": "host",
+        "dcgm_hostengine_source": "provider",
         "cluster_nodes_outside_selector": [],
         "connection_secret": {**converged, "selector_recorded": True},
         "consumers": {

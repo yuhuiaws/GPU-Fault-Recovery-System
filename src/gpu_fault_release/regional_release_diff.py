@@ -6,6 +6,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, Iterable
 
+from gpu_fault_release.regional_release_dcgm import (
+    DCGM_HOSTENGINES_INPUT,
+    dcgm_hostengines_digest,
+    recorded_dcgm_hostengines_digest,
+)
 from gpu_fault_release.regional_release_node_scope import (
     RECORDED_SCOPES_DIGEST_STATE_KEY,
     RECORDED_SCOPES_INPUT,
@@ -173,7 +178,10 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "adot_image",
         }
     )
-    dcgm = bool(changed & {"dcgm", "dcgm_manifests", "dcgm_image"})
+    # A cluster's DCGM host engine mode flipped: re-render its exporter and
+    # re-install the Agents whose environment and reconciler identity name it.
+    dcgm_modes = DCGM_HOSTENGINES_INPUT in changed
+    dcgm = dcgm_modes or bool(changed & {"dcgm", "dcgm_manifests", "dcgm_image"})
     executor = node_scope or bool(
         changed
         & {
@@ -204,7 +212,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "clusters",
         }
     )
-    agent = bool(
+    agent = dcgm_modes or bool(
         changed
         & {
             "node_runtime_wheel",
@@ -220,7 +228,7 @@ def build_execution_plan(diff: ReleaseDiff) -> ReleaseExecutionPlan:
             "cluster_runtime_profiles",
         }
     )
-    reconciler = node_scope or bool(
+    reconciler = (node_scope or dcgm_modes) or bool(
         changed
         & {
             "executor_wheel",
@@ -420,6 +428,7 @@ def classify_release(release: RegionalRelease, state: dict[str, Any]) -> Release
         RECORDED_SCOPES_INPUT: recorded_scopes,
         "endpoint": release.endpoint_digest,
         "dcgm": release.dcgm_digest,
+        DCGM_HOSTENGINES_INPUT: dcgm_hostengines_digest(release.config),
         "notifications": release.notification_digest,
         "clusters": release.cluster_registry_digest,
         "admin_config_ingress": release.admin_config_role_digests["ingress"],
@@ -485,6 +494,7 @@ def classify_release(release: RegionalRelease, state: dict[str, Any]) -> Release
         ),
         "endpoint": state.get("endpoint_digest"),
         "dcgm": state.get("dcgm_digest"),
+        DCGM_HOSTENGINES_INPUT: recorded_dcgm_hostengines_digest(state),
         "notifications": state.get("notification_digest"),
         "clusters": _current_registry_digest(release, state),
         "admin_config_ingress": (

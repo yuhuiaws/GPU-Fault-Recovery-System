@@ -59,6 +59,8 @@ class WindowHost:
             store_snapshot=lambda **kwargs: {
                 "profile": {"profile_version": "profile-a"}
             },
+            # The unmarked (HyperPod) exporter DaemonSet COLLECT-020 reads.
+            kubectl=lambda *arguments, **options: "{}",
         )
         self.settings = SimpleNamespace(
             node=self.node, regional=SimpleNamespace(cluster_id="cluster-a")

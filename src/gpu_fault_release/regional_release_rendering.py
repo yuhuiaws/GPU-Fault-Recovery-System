@@ -16,17 +16,22 @@ from gpu_fault_release import repository_root
 from gpu_fault_release.regional_notifications import notification_digest
 from gpu_fault_release.regional_release_aurora_refresh import render_aurora_refresh
 from gpu_fault.cluster_scope import (
+    DCGM_HOSTENGINE_ENV,
     NODE_SELECTOR_ENV,
     PROVIDER_ENV,
     ClusterProvider,
+    DcgmHostEngine,
+    dcgm_hostengine_environment,
     provider_cluster_name,
 )
+from gpu_fault.cluster_scope import dcgm_hostengine as cluster_dcgm_hostengine
 from gpu_fault_release.regional_release_config import (
     ClusterTarget,
     ReleaseError,
     render_nlb_manifest,
     ses_configuration_set,
 )
+from gpu_fault_release.regional_release_dcgm import captured_dcgm_hostengine
 from gpu_fault_release.regional_release_images import (
     NodeDependencyTarget,
     node_dependency_environment,
@@ -76,7 +81,8 @@ def _supported_instance_types() -> str:
 
 
 #: Marks the DaemonSet variant a plain EKS cluster gets (see
-#: :func:`render_dcgm_exporter_manifest`); the HyperPod text carries no mark.
+#: :func:`render_dcgm_exporter_manifest`): ``embedded`` or ``host``
+#: (``cluster_scope.DcgmHostEngine``); the HyperPod text carries no mark.
 DCGM_HOSTENGINE_ANNOTATION = "gpu-fault.io/dcgm-hostengine"
 REMOTE_HOSTENGINE_ENV = "DCGM_REMOTE_HOSTENGINE_INFO"
 #: What the eks-managed exporter tolerates instead of the checked-in wildcard
@@ -98,7 +104,9 @@ EMBEDDED_HOSTENGINE_ENV = (
 )
 
 
-def _embedded_hostengine_documents(text: str) -> str:
+def _embedded_hostengine_documents(
+    text: str, mode: DcgmHostEngine = DcgmHostEngine.EMBEDDED
+) -> str:
     """The exporter DaemonSet for a cluster whose nodes run no host DCGM.
 
     The checked-in DaemonSet dials the node's ``nv-hostengine`` at
@@ -110,6 +118,13 @@ def _embedded_hostengine_documents(text: str) -> str:
     container instead, as the upstream chart does on EKS. Everything the node
     collector relies on stays: hostNetwork, the loopback bind on 9400, the
     instance-type affinity and the counters ConfigMap.
+
+    ``mode=host`` is the same eks variant for node groups that declare a host
+    DCGM (``cluster_scope.DCGM_HOSTENGINE_LABEL``): it keeps dialling the
+    node's ``nvidia-dcgm`` at ``127.0.0.1:5555`` as the HyperPod text does, so
+    each node runs exactly one hostengine, and keeps the explicit tolerations
+    (no quiesce toleration: the quiesce stops ``nvidia-dcgm`` and evicts the
+    exporter with it) and the rest of the eks variant.
     """
 
     documents = list(yaml.safe_load_all(text))
@@ -118,7 +133,7 @@ def _embedded_hostengine_documents(text: str) -> str:
             continue
         metadata = document.setdefault("metadata", {})
         annotations = metadata.setdefault("annotations", {})
-        annotations[DCGM_HOSTENGINE_ANNOTATION] = "embedded"
+        annotations[DCGM_HOSTENGINE_ANNOTATION] = mode.value
         pod = document["spec"]["template"]["spec"]
         pod["tolerations"] = [dict(item) for item in EMBEDDED_EXPORTER_TOLERATIONS]
         for container in pod.get("containers", []):
@@ -127,7 +142,8 @@ def _embedded_hostengine_documents(text: str) -> str:
             env = [
                 item
                 for item in container.get("env", [])
-                if item.get("name") != REMOTE_HOSTENGINE_ENV
+                if mode is DcgmHostEngine.HOST
+                or item.get("name") != REMOTE_HOSTENGINE_ENV
             ]
             env.extend(dict(item) for item in EMBEDDED_HOSTENGINE_ENV)
             container["env"] = env
@@ -135,14 +151,19 @@ def _embedded_hostengine_documents(text: str) -> str:
 
 
 def render_dcgm_exporter_manifest(
-    *, namespace: str, image: str, provider: str | None = None
+    *,
+    namespace: str,
+    image: str,
+    provider: str | None = None,
+    dcgm_hostengine: str | None = None,
 ) -> str:
     """The one exporter DaemonSet text, for the plan payload and for the apply.
 
     ``provider`` is the GPU cluster's provider (``gpu_fault.cluster_scope``):
-    a plain EKS cluster gets the embedded-hostengine variant
-    (:func:`_embedded_hostengine_documents`); HyperPod, or no provider, the
-    checked-in text byte for byte.
+    a plain EKS cluster gets the eks variant
+    (:func:`_embedded_hostengine_documents`) for its ``dcgm_hostengine`` mode
+    -- embedded unless its node groups declare ``host``; HyperPod, or no
+    provider, the checked-in text byte for byte.
 
     Both used to substitute for themselves and the payload renderer knew only
     about namespace and image, so the plan an approver read carried a literal
@@ -181,7 +202,10 @@ def render_dcgm_exporter_manifest(
         if placeholder in text:
             raise ReleaseError(f"DCGM exporter manifest still carries {placeholder}")
     if cluster_provider(provider) is ClusterProvider.EKS_MANAGED:
-        return _embedded_hostengine_documents(text)
+        mode = cluster_dcgm_hostengine(
+            None, provider=provider, mode=dcgm_hostengine or ""
+        )
+        return _embedded_hostengine_documents(text, mode)
     return text
 
 
@@ -588,19 +612,29 @@ def _render_release_payload(release: RegionalRelease) -> dict[str, Any]:
         namespace=config.namespace,
         image=release.dcgm_exporter_image,
     )
-    # A mixed site applies a second DaemonSet text to its plain EKS clusters;
-    # the approver reads that one too. Absent on a HyperPod-only site.
-    eks_dcgm_documents = (
-        _documents(
+    # A site with plain EKS clusters applies them the eks DaemonSet text, one
+    # per DCGM host engine mode its clusters run; the approver reads each.
+    # Absent on a HyperPod-only site.
+    eks_modes = {
+        cluster_dcgm_hostengine(target)
+        for target in config.clusters
+        if is_eks_managed(target)
+    }
+    eks_dcgm_documents = {
+        key: _documents(
             render_dcgm_exporter_manifest(
                 namespace=config.namespace,
                 image=release.dcgm_exporter_image,
                 provider=ClusterProvider.EKS_MANAGED.value,
+                dcgm_hostengine=mode.value,
             )
         )
-        if any(is_eks_managed(target) for target in config.clusters)
-        else None
-    )
+        for mode, key in (
+            (DcgmHostEngine.EMBEDDED, "dcgm_eks_managed"),
+            (DcgmHostEngine.HOST, "dcgm_eks_managed_host"),
+        )
+        if mode in eks_modes
+    }
     observability_text = (
         ROOT / "deploy/observability/adot-control-plane.yaml"
     ).read_text(encoding="utf-8")
@@ -619,7 +653,7 @@ def _render_release_payload(release: RegionalRelease) -> dict[str, Any]:
         "aurora_refresh": _documents(refresh_text),
         "nlb": nlb_documents,
         "dcgm": _documents(dcgm_text),
-        **({"dcgm_eks_managed": eks_dcgm_documents} if eks_dcgm_documents else {}),
+        **eks_dcgm_documents,
         "observability": _documents(observability_text),
         # Per GPU cluster; an empty list is a cluster the release will skip
         # (no AMP workspace or no IRSA role for the collector yet), so the
@@ -945,6 +979,9 @@ def build_reconciler_environment(
         # plain EKS cluster; the selector is what the scripts enumerate on.
         "GPU_FAULT_HYPERPOD_CLUSTER": provider_cluster_name(target),
         PROVIDER_ENV: cluster_provider(getattr(target, "provider", None)).value,
+        # The DCGM host engine mode the installer template, the reconciler's
+        # node identity and the Agent environment carry (empty on HyperPod).
+        DCGM_HOSTENGINE_ENV: dcgm_hostengine_environment(target),
         # The scope the Secret serves: the site's, or a rollback's restored one.
         NODE_SELECTOR_ENV: (
             str(node_scope["selector"]) if node_scope else node_selector(target)
@@ -1004,6 +1041,11 @@ def build_reconciler_environment(
             "GPU_FAULT_INSTALLER_BUNDLE_SHA256",
         ):
             environment[name] = previous_template_identity[name]
+        # The mode the restored template was rendered for, not the site's.
+        environment[DCGM_HOSTENGINE_ENV] = (
+            captured_dcgm_hostengine(release.state.get("previous"), target)
+            or environment[DCGM_HOSTENGINE_ENV]
+        )
     elif node_dependency_target is NodeDependencyTarget.CANDIDATE:
         if config.release_manifest_schema_version >= 4 and (
             bundle_cm != release.bundle_cm
@@ -1100,7 +1142,7 @@ CONFIG_MAP_NAME = re.compile(r"^[a-z0-9]([-a-z0-9.]*[a-z0-9])?$")
 #: only when set so a HyperPod site's products keep the digest they had
 #: (``GPU_FAULT_CLUSTER_PROVIDER=hyperpod`` with the HyperPod selector is the
 #: state every recorded product already describes).
-INSTALLER_PRODUCT_PROVIDER_ENV = (PROVIDER_ENV, NODE_SELECTOR_ENV)
+INSTALLER_PRODUCT_PROVIDER_ENV = (PROVIDER_ENV, NODE_SELECTOR_ENV, DCGM_HOSTENGINE_ENV)
 
 
 def installer_product_inputs_digest(environment: dict[str, str]) -> str:

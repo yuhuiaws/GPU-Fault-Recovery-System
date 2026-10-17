@@ -42,6 +42,11 @@ from gpu_fault_release.regional_observability_rollback import (
     capture_previous_monitoring,
 )
 from gpu_fault_release.regional_release_config import ClusterTarget, ReleaseError
+from gpu_fault_release.regional_release_dcgm import (
+    DCGM_HOSTENGINES_STATE_KEY,
+    capture_exporter_identity,
+    dcgm_hostengines_digest,
+)
 from gpu_fault_release.regional_release_diff import (
     ReleaseComponent,
     ReleaseExecutionPlan,
@@ -788,23 +793,9 @@ def capture_gpu_cluster_snapshot(
         "bundle": bundle_name,
         "bundle_key": bundle_key,
         "bundle_sha256": bundle_sha256,
-        "dcgm_image": (
-            release._get_json(
-                release._gpu(
-                    target,
-                    "-n",
-                    release.config.namespace,
-                    "get",
-                    "daemonset",
-                    "gpu-fault-dcgm-exporter",
-                )
-            )
-            .get("spec", {})
-            .get("template", {})
-            .get("spec", {})
-            .get("containers", [{}])[0]
-            .get("image")
-        ),
+        # The exporter image, and on eks-managed the DCGM host engine mode the
+        # live DaemonSet runs: a rollback re-renders it for that mode.
+        **capture_exporter_identity(release, target),
     }
     return snapshot, runtime_images, installer.installer_image
 
@@ -1375,6 +1366,7 @@ def _write_state(release: Any, phase: str, **updates: Any) -> str:
             "agent_config_digest": release.config.agent_config_digest,
             "endpoint_digest": release.endpoint_digest,
             "dcgm_digest": release.dcgm_digest,
+            DCGM_HOSTENGINES_STATE_KEY: dcgm_hostengines_digest(release.config),
             "notification_digest": release.notification_digest,
             "cluster_ids": sorted(item.cluster_id for item in release.config.clusters),
             "cluster_registry_digest": release.cluster_registry_digest,

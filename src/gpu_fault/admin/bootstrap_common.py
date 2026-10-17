@@ -134,6 +134,11 @@ class ClusterIdentity:
     #: opt-in feature absent, recorded rather than invented); discovery refuses
     #: an ``enabled`` group before it is ever recorded. Empty for HyperPod.
     node_repair: str = ""
+    #: eks-managed only: the DCGM host engine mode its selected node groups
+    #: declare (``cluster_scope.DcgmHostEngine``) and its source; empty for
+    #: HyperPod (always ``host``) and for identity-only reads.
+    dcgm_hostengine: str = ""
+    dcgm_hostengine_source: str = ""
 
     @property
     def is_eks_managed(self) -> bool:

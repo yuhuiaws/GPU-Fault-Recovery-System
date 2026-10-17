@@ -20,6 +20,11 @@ A cluster joined before the convention keeps the selector it recorded
 of an already-managed cluster never re-derives membership -- that is the
 journaled ``node-scope --converge`` step -- so a deploy over a legacy site
 keeps selecting exactly what it selected.
+
+The same node groups also declare a node-image capability, which IS
+re-derived on every deploy and join: ``cluster_scope.DCGM_HOSTENGINE_LABEL``
+(``resolve_dcgm_hostengine``) says whether an EKS group's image runs a host
+DCGM the exporter and ``dcgmi diag`` can rely on.
 """
 
 from __future__ import annotations
@@ -29,12 +34,15 @@ from typing import Any, Mapping, Sequence
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.cluster_scope import (
+    DCGM_HOSTENGINE_LABEL,
     EKS_NODEGROUP_LABEL,
     HYPERPOD_CLUSTER_LABEL,
     HYPERPOD_INSTANCE_GROUP_LABEL,
     INSTANCE_TYPE_LABEL,
     OWNERSHIP_LABEL,
     ClusterProvider,
+    DcgmHostEngine,
+    DcgmHostEngineSource,
     NodeSelectorSource,
     cluster_provider,
     node_selector_source,
@@ -49,12 +57,14 @@ __all__ = [
     "NodeGroupFacts",
     "NodeScope",
     "RecordedNodeScope",
+    "dcgm_hostengine_remedy",
     "eks_nodegroup_facts",
     "groups_for_selector",
     "hyperpod_instance_group_facts",
     "hyperpod_node_scope",
     "label_remedy",
     "recorded_node_scope",
+    "resolve_dcgm_hostengine",
     "resolve_node_scope",
 ]
 
@@ -316,6 +326,61 @@ def groups_for_selector(
     if names_a_group:
         return []
     return [item for item in facts if item.hosts_gpu_types]
+
+
+def dcgm_hostengine_remedy(*, cluster: str, group: str) -> str:
+    """The provider command that declares a host DCGM on EKS node group ``group``."""
+
+    return (
+        f"aws eks update-nodegroup-config --cluster-name {cluster} "
+        f"--nodegroup-name {group} --labels "
+        f"addOrUpdateLabels={{{DCGM_HOSTENGINE_LABEL}={DcgmHostEngine.HOST.value}}}"
+    )
+
+
+def resolve_dcgm_hostengine(
+    facts: Sequence[NodeGroupFacts], *, cluster: str
+) -> tuple[DcgmHostEngine, DcgmHostEngineSource]:
+    """The DCGM host engine mode the selected node groups of EKS ``cluster`` declare.
+
+    ``facts`` are the node groups the cluster's selector selects: the
+    ownership-labelled groups of a joining cluster, the groups a recorded
+    selector covers. All carrying ``DCGM_HOSTENGINE_LABEL=host`` declare a host
+    DCGM; none carrying it is the exporter's embedded engine. Anything else is
+    refused before any change, naming every group and its value the way the
+    ownership refusals do: one exporter DaemonSet serves the whole cluster, so
+    a mixed cluster would run two hostengines on some nodes and none to dial
+    on others, and any other value is a typo that must not quietly mean
+    ``embedded``.
+    """
+
+    host = DcgmHostEngine.HOST.value
+    values = {item.name: item.labels.get(DCGM_HOSTENGINE_LABEL) for item in facts}
+    evidence = "; ".join(
+        f"{name} {DCGM_HOSTENGINE_LABEL}={'absent' if value is None else value}"
+        for name, value in values.items()
+    )
+    if any(value not in (None, host) for value in values.values()):
+        raise BootstrapError(
+            f"managed node groups of EKS cluster {cluster} carry "
+            f"{DCGM_HOSTENGINE_LABEL} values other than {host}: {evidence}. The "
+            f"label's only value is {host}; remove it to run the exporter's "
+            "embedded hostengine, then rerun"
+        )
+    unlabelled = [name for name, value in values.items() if value is None]
+    if len(unlabelled) == len(values):
+        return DcgmHostEngine.EMBEDDED, DcgmHostEngineSource.DEFAULT
+    if not unlabelled:
+        return DcgmHostEngine.HOST, DcgmHostEngineSource.NODE_GROUP_LABEL
+    raise BootstrapError(
+        f"managed node groups of EKS cluster {cluster} disagree on "
+        f"{DCGM_HOSTENGINE_LABEL}: {evidence}. One cluster runs one DCGM host "
+        f"engine mode: label every GPU node group {DCGM_HOSTENGINE_LABEL}={host} "
+        "once its node image installs and enables nvidia-dcgm (管理员日常运维 / "
+        "administrator-operations §5.0.1), for example "
+        + dcgm_hostengine_remedy(cluster=cluster, group=unlabelled[0])
+        + ", or remove the label from all of them, then rerun"
+    )
 
 
 def _entry_field(entry: Mapping[str, Any], *names: str) -> str:

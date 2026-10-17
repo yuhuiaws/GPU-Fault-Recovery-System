@@ -80,6 +80,7 @@ def installer_node_states(
     template_sha: str | None,
     config_digest: str | None,
     node_names: frozenset[str] | None,
+    dcgm_hostengine: str | None = None,
 ) -> dict[str, str]:
     """The installer state of every node this wait is still waiting for.
 
@@ -107,6 +108,7 @@ def installer_node_states(
             config_digest=config_digest,
             require_node_uid=True,
             node_names=frozenset({name}),
+            dcgm_hostengine=dcgm_hostengine,
         ):
             continue
         pending[name] = str(
@@ -137,7 +139,14 @@ def wait_agents(
     timeout_seconds: int = 900,
     legacy_identity: bool = False,
     agent_identity: dict[str, Any] | None = None,
+    dcgm_hostengine: str | None = None,
 ) -> None:
+    """Wait until the Reconciler installed this identity on every selected
+    node and the Agents' heartbeats report it; ``dcgm_hostengine`` (a forward
+    rollout of an eks-managed cluster) also waits for the Agents installed in
+    the cluster's DCGM host engine mode, so a mode flip is not waited out by
+    the identity alone."""
+
     expected_bundle = None
     expected_template = None
     if not legacy_identity:
@@ -210,6 +219,7 @@ def wait_agents(
             config_digest=expected_config,
             require_node_uid=True,
             node_names=expected_nodes,
+            dcgm_hostengine=dcgm_hostengine,
         )
         if installers_aligned and release._agent_heartbeats_converged(
             target,
@@ -241,6 +251,7 @@ def wait_agents(
             template_sha=expected_template,
             config_digest=expected_config,
             node_names=expected_nodes,
+            dcgm_hostengine=dcgm_hostengine,
         )
         now = time.monotonic()
         changed = pending != narrated

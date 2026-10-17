@@ -34,6 +34,12 @@ DIAGNOSTIC_OPERATIONS = frozenset({"RUN_DCGM_DIAGNOSTIC", "VALIDATE_GPU"})
 FORBIDDEN_OPERATIONS = frozenset(
     {"RESTART_NODE", "REPLACE_NODE", "RESET_GPU", "RESET_ALL_GPUS_NVSWITCHES"}
 )
+#: The quick diagnostic's "no verdict" codes: the node had no dcgmi, or dcgmi
+#: reached no host engine. A host-mode cluster must never report them.
+DCGM_UNAVAILABLE_CODES = frozenset(
+    {"DCGM_TOOL_UNAVAILABLE", "DCGM_HOSTENGINE_UNAVAILABLE"}
+)
+GRADED_OUTCOMES = frozenset({"PASS", "WARN", "FAIL"})
 DROP_CALLS = 1
 WINDOW_RESTORE_SECONDS = 900
 FINDING_TIMEOUT_SECONDS = 600
@@ -257,6 +263,68 @@ def dcgm_notification_errors(activity: dict[str, Any]) -> list[str]:
     if not matches:
         return ["no DCGM diagnostic completion notification was created"]
     return []
+
+
+def exporter_dcgm_hostengine(daemonset: dict[str, Any]) -> str:
+    """The eks-managed DCGM host engine mode the exporter DaemonSet runs.
+
+    ``host`` or ``embedded`` (its ``gpu-fault.io/dcgm-hostengine`` annotation);
+    empty for the unmarked HyperPod text, which this case does not re-judge.
+    """
+
+    annotations = (daemonset.get("metadata") or {}).get("annotations") or {}
+    return str(annotations.get("gpu-fault.io/dcgm-hostengine") or "")
+
+
+def dcgm_verdict_errors(
+    activity: dict[str, Any], *, node: str, dcgm_hostengine: str
+) -> list[str]:
+    """eks-managed host mode: the identity workflow's quick DCGM diagnostic
+    graded the GPUs.
+
+    In host mode the exporter dials the node's ``nvidia-dcgm`` and the Agent
+    runs ``dcgmi diag -r 1`` against it, so the case expects a real DCGM
+    verdict for the node: a graded outcome from parsed DCGM output, never the
+    "no dcgmi" / "no host engine" configuration warning the embedded mode
+    accepts. Embedded mode and the HyperPod text are not judged here.
+    """
+
+    if dcgm_hostengine != "host":
+        return []
+    incident_ids = {
+        str(item.get("incident_id")) for item in _identity_incidents(activity)
+    }
+    results = [
+        result
+        for workflow in activity.get("workflows") or []
+        if str(workflow.get("incident_id")) in incident_ids
+        for step in workflow.get("step_executions") or []
+        if step.get("operation") == "RUN_DCGM_DIAGNOSTIC"
+        for name, result in (
+            (step.get("details") or {}).get("node_results") or {}
+        ).items()
+        if name == node and isinstance(result, dict)
+    ]
+    if not results:
+        return [f"host mode: no RUN_DCGM_DIAGNOSTIC result for {node}"]
+    errors: list[str] = []
+    for result in results:
+        codes = {
+            str(action.get("action_code"))
+            for action in result.get("recommended_actions") or []
+            if isinstance(action, dict)
+        }
+        unavailable = sorted(codes & DCGM_UNAVAILABLE_CODES)
+        if unavailable:
+            errors.append(f"host mode: the quick diagnostic reported {unavailable}")
+        if result.get("parse_error") or not result.get("status_counts"):
+            errors.append("host mode: the quick diagnostic produced no DCGM verdict")
+        if result.get("diagnostic_outcome") not in GRADED_OUTCOMES:
+            errors.append(
+                "host mode: the quick diagnostic outcome is "
+                f"{result.get('diagnostic_outcome')!r}"
+            )
+    return errors
 
 
 def no_reboot_errors(
