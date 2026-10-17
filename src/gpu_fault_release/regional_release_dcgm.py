@@ -202,15 +202,20 @@ def record_node_dcgm_states(
     """Keep what the node preflight observed on ``target``'s nodes.
 
     ``observed`` is the preflight summary's ``dcgm_hostengine`` map
-    (``{node: dcgm object}``); nothing is recorded for a cluster whose
-    preflight reported none (HyperPod, an older script).
+    (``{node: dcgm object}``); only each node's ``state`` and ``conflict`` are
+    kept, so the release state stays small on a large fleet (the full object is
+    in the preflight Job's verdict). Nothing is recorded for a cluster whose
+    preflight reported none (an older script).
     """
 
     state = getattr(release, "state", None)
     if not isinstance(state, dict) or not isinstance(observed, Mapping):
         return None
     nodes = {
-        str(name): dict(value)
+        str(name): {
+            "state": str(value.get("state") or "unknown"),
+            "conflict": value.get("conflict") is True,
+        }
         for name, value in sorted(observed.items())
         if isinstance(value, Mapping)
     }

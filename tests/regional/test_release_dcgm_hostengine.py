@@ -474,7 +474,12 @@ def test_a_node_preflight_records_its_dcgm_states_for_status(
         if options.get("capture"):
             summary = json.loads(result)
             summary["dcgm_hostengine"] = {
-                "node-a": {"mode": "host", "state": "host-active", "conflict": False}
+                "node-a": {
+                    "mode": "host",
+                    "state": "host-active",
+                    "conflict": False,
+                    "processes": [{"pid": 4242, "unit": "nvidia-dcgm.service"}],
+                }
             }
             return json.dumps(summary)
         return result
@@ -493,9 +498,9 @@ def test_a_node_preflight_records_its_dcgm_states_for_status(
     )
     record = release.state[DCGM.NODE_DCGM_STATE_KEY]["gpu-a"]
     assert record["mode"] == "host" and record["observed_at"], record
-    assert record["nodes"] == {
-        "node-a": {"mode": "host", "state": "host-active", "conflict": False}
-    }
+    assert record["nodes"] == {"node-a": {"state": "host-active", "conflict": False}}, (
+        "only what status shows is kept in the release state"
+    )
 
 
 def _status_release(state: dict[str, Any]) -> SimpleNamespace:
