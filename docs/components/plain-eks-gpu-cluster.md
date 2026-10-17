@@ -65,13 +65,30 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   nv-hostengine/dcgmi，`eks-managed` 渲染去掉 `DCGM_REMOTE_HOSTENGINE_INFO`，容器内嵌 hostengine
   （`NVIDIA_VISIBLE_DEVICES=all`、`NVIDIA_DRIVER_CAPABILITIES=utility`，无 SYS_ADMIN、不申请 `nvidia.com/gpu`），
   hostNetwork/回环 9400/实例类型亲和不变；容忍改为显式的 `nvidia.com/gpu` 与 `gpu-fault.io/quarantined`
-  （不容忍 §2.7 的 quiesce 污点；HyperPod 清单的通配容忍逐字节不变）；混合站点 plan 多出 `dcgm_eks_managed`。
-- 节点 collector 从 exporter HTTP 取 DCGM 指标，不依赖 dcgmi；节点 agent 的快速 DCGM 诊断在无 dcgmi 节点记为
-  `WARN`/`DCGM_TOOL_UNAVAILABLE`。
+  （不容忍 §2.7 的 quiesce 污点；HyperPod 清单的通配容忍逐字节不变）；以上是 embedded 模式（默认），plan 多出 `dcgm_eks_managed`。
+- DCGM 主机模式：GPU 节点组带 `gpu-fault.io/dcgm-hostengine=host`（唯一取值，§3 第 7 条）时集群是 host 模式。deploy/join 每次
+  对选择器选中的节点组求值——全部 `host` 为 host（来源 `node-group-label`），都没有为 embedded（来源 `default`），混合或其他取值
+  在任何变更之前拒绝并逐组列出 `<节点组> gpu-fault.io/dcgm-hostengine=<值|absent>`；Karpenter NodePool 不读，HyperPod 始终是 host
+  （来源 `provider`，不记录）。`site.yaml` 的 eks 条目记 `dcgmHostEngine`/`dcgmHostEngineSource`，每次 deploy/join 按节点组改写
+  （节点镜像能力，不像 `nodeSelector` 那样沿用）。host 变体的 exporter 保留 `DCGM_REMOTE_HOSTENGINE_INFO=127.0.0.1:5555`、
+  注解 `gpu-fault.io/dcgm-hostengine: host`，显式容忍与其余 eks 渲染不变，plan 对应 `dcgm_eks_managed_host`；embedded 变体逐字节不变。
+  模式变化是 release diff 输入 `dcgm_hostengines`：规划 DCGM + reconciler + Agent（`DATA_PLANE_COMPATIBLE`），exporter 重新应用、
+  该集群的 Agent 分波重装（reconciler 节点注解 `gpu-fault.io/installer-dcgm-hostengine=host`），变更前的节点预检先核对主机 hostengine。
+  `status --full` 的 `node_scope.dcgm_hostengine`/`dcgm_hostengine_source`/`dcgm_hostengine_pending_nodes` 与 `node-scope` 的
+  `dcgm_hostengine` 显示模式、来源与待重装的节点。
+- 节点 collector 从 exporter HTTP 取 DCGM 指标，不依赖 dcgmi；节点 agent 的快速 DCGM 诊断（`dcgmi diag -r 1 -j`）在 embedded 模式下
+  对无 dcgmi 或连不上 hostengine 记配置性 `WARN`（`DCGM_TOOL_UNAVAILABLE`/`DCGM_HOSTENGINE_UNAVAILABLE`，不排空）；host 模式下
+  （Agent 环境 `GPU_FAULT_DCGM_HOSTENGINE=host`，只写入 eks-managed 节点、不进 config digest）给出真实判定，缺 dcgmi 或连不上主机
+  hostengine 按 HyperPod 判 FAIL/`DCGM_EXECUTION_REVIEW`（`DRAIN_AND_QUARANTINE`）。
 - 数据面 Deployment（executor、watcher、reconciler、node-resource collector、ADOT）不钉节点、不容忍 GPU 污点，
   落在 CPU 节点。
 - 节点预检 Job 在 `chroot /host` 核对主机前置并一次列全缺失项（`ERROR: host prerequisites unavailable: ...`
-  + JSON 判定）；AL2023 需 launch template 安装 `python3.12 strace`（管理员日常运维 §5.0.1）。
+  + JSON 判定）；AL2023 需 launch template 安装 `python3.12 strace`（管理员日常运维 §5.0.1）；host 模式另需 `dcgmi`、
+  `nv-hostengine`、active 的 `nvidia-dcgm` 与成功的 `timeout 30 dcgmi discovery -l`，同一条判定里列出。预检把每个节点的 DCGM 状态
+  （`not-installed`/`installed-inactive`/`host-active`/`cuda-mismatch`/`host-failed`/`unmanaged-hostengine`）写进判定的 `dcgm` 对象：host 模式
+  只接受 `host-active`，embedded 模式拒绝与内嵌 hostengine 并存（运行中、active/activating 或 enabled）的主机 hostengine
+  （`ERROR: DCGM host engine conflict: ...`）；最近一次预检的逐节点状态记入 release state `node_dcgm_hostengine`，`status --full` 显示为
+  `node_scope.dcgm_hostengine_nodes`/`dcgm_hostengine_conflict_nodes`。Agent 始终按集群声明的模式判定。
 - Node Action key：所有节点清单读取都用集群选择器（含 CPU 镜像守卫）。
 
 ### 2.6 join 的可恢复性与诊断（本分支修的产品缺口）
@@ -128,12 +145,18 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 6. 第三方 GPU 客户端 DaemonSet（客户自己的 dcgm-exporter、GPU feature discovery、监控 agent 等）**不得容忍**
    `gpu-fault.io/quiesce`（不要用无 key 的 `operator: Exists` 通配容忍；按 key 列出 `nvidia.com/gpu` 等即可），并须容忍在
    quiesce 窗口内被停止/驱逐；NVIDIA device plugin 与 GFD 的默认清单只容忍 `nvidia.com/gpu`，无需改动。
+7. 主机 DCGM（可选，真实的 `dcgmi diag` 判定）：launch template 固定版本安装 `datacenter-gpu-manager-4-core-<ver>` 与
+   `datacenter-gpu-manager-4-cuda<CUDA 主版本>-<ver>`（主版本与 `nvidia-smi` 的 "CUDA Version" 一致）并 `systemctl enable --now nvidia-dcgm`，
+   在节点上用 `dcgmi discovery -l`、`dcgmi diag -r 1` 确认，给该集群的**每个** GPU 节点组加 `gpu-fault.io/dcgm-hostengine=host`，随即
+   deploy/join（启用而不加标签的 deploy 会被 embedded 冲突检查拒绝）；退出时摘标签、把 `nvidia-dcgm` 从 launch template 拿掉并在节点上
+   `systemctl disable --now nvidia-dcgm`，再立即 deploy（次序与命令见管理员日常运维 §5.0.1「主机 DCGM」）。
 
 ## 4. 限制
 
 - 没有 provider 侧节点替换：`nodeReplace` 只是 warm-spare 交接，须先声明热备（§2.4）；无 HyperPod 健康代理，
   `gpuDetection`/`providerHealthIsolation` 不声明。
-- 节点上无 DCGM 主机工具：`dcgmi diag` 不可用（WARN），诊断包里记录工具缺失。
+- embedded 模式（默认，节点组未声明主机 DCGM）：节点上没有主机 hostengine，快速诊断 `dcgmi diag` 只记配置性 WARN，诊断包里
+  记录工具缺失；声明 host 模式（§3 第 7 条）后才有真实判定。
 - 一个集群只能有一个 profile 版本；站点 profile 变更仍是站点级审批，集群 override 版本固定为示例 profile 的版本名。
 - 首次 `deploy` 不接受混合 provider（先部署一种，再 join 另一种）。
 - 嵌入式 hostengine 依赖 AMI 的默认 NVIDIA 容器运行时；若集群不是默认 `nvidia` runtime，需为 DaemonSet 加
@@ -155,7 +178,7 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 - 单元/契约：`tests/*eks_managed*`、`tests/fleet/test_cluster_profile_pins.py`、
   `tests/eks_provider/test_mixed_site_owner_resolution.py`、`tests/deploy/test_node_preflight_host_prerequisites.py`
   等；HyperPod 中立性以摘要固定值与逐字节渲染断言保证。
-- **未验证**：quiesce 污点（§2.7）与 RECOVERED 事件的 restore 出口只有单元测试，真机 DESTR-001 第三轮待跑；混合站点上的验收 campaign（故障注入、nodeReboot 实际执行与确认、离场节点、token 轮换、
+- **未验证**：DCGM host 模式（§2.5）只有单元/契约测试，真机待验；quiesce 污点（§2.7）与 RECOVERED 事件的 restore 出口只有单元测试，真机 DESTR-001 第三轮待跑；混合站点上的验收 campaign（故障注入、nodeReboot 实际执行与确认、离场节点、token 轮换、
   remove-cluster/uninstall 对 eks-managed 的真机路径、Agent 升级/回滚、长期稳定性）；多于一个普通 EKS 集群（一批 join 多个
   普通 EKS 集群只有单元测试）；
   非 AL2023 AMI；`training` 以外的工作负载命名空间；非默认 NVIDIA runtime 的集群。

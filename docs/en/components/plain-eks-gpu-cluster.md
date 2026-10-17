@@ -80,14 +80,40 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   embedded hostengine (`NVIDIA_VISIBLE_DEVICES=all`, `NVIDIA_DRIVER_CAPABILITIES=utility`, no SYS_ADMIN, no
   `nvidia.com/gpu` request); hostNetwork, the loopback 9400 bind and instance-type affinity are unchanged; the
   tolerations become explicit `nvidia.com/gpu` and `gpu-fault.io/quarantined` (not the quiesce taint of §2.7; the
-  HyperPod manifest's wildcard toleration is byte for byte unchanged); a mixed site's plan adds `dcgm_eks_managed`.
-- The node collector scrapes DCGM metrics from the exporter over HTTP, never dcgmi; the node agent's quick DCGM
-  diagnostic reports `WARN`/`DCGM_TOOL_UNAVAILABLE` on nodes without dcgmi.
+  HyperPod manifest's wildcard toleration is byte for byte unchanged); this is the (default) embedded mode, and the plan
+  adds `dcgm_eks_managed`.
+- DCGM host mode: a cluster whose GPU node groups carry `gpu-fault.io/dcgm-hostengine=host` (its only value, §3 item 7)
+  runs in host mode. Every deploy/join evaluates the node groups the selector selects -- all `host` is host (source
+  `node-group-label`), none is embedded (source `default`), a mix or any other value is refused before any change,
+  naming every group as `<node group> gpu-fault.io/dcgm-hostengine=<value|absent>`; Karpenter NodePools are not read, and
+  HyperPod is always host (source `provider`, never recorded). The eks entry of `site.yaml` records
+  `dcgmHostEngine`/`dcgmHostEngineSource`, rewritten from the node groups by every deploy/join (a node-image capability,
+  not kept the way `nodeSelector` is). The host variant of the exporter keeps `DCGM_REMOTE_HOSTENGINE_INFO=127.0.0.1:5555`
+  with the annotation `gpu-fault.io/dcgm-hostengine: host`, the explicit tolerations and the rest of the eks render are
+  unchanged, and the plan shows it as `dcgm_eks_managed_host`; the embedded variant is byte for byte unchanged. A mode
+  change is the release-diff input `dcgm_hostengines`: it plans DCGM + reconciler + Agent (`DATA_PLANE_COMPATIBLE`), the
+  exporter is re-applied and the cluster's Agents are re-installed in waves (reconciler node annotation
+  `gpu-fault.io/installer-dcgm-hostengine=host`), and the node preflight checks the host hostengine before any change.
+  `node_scope.dcgm_hostengine`/`dcgm_hostengine_source`/`dcgm_hostengine_pending_nodes` of `status --full` and the
+  `dcgm_hostengine` of `node-scope` show the mode, its source and the nodes still to re-install.
+- The node collector scrapes DCGM metrics from the exporter over HTTP, never dcgmi; in embedded mode the node agent's
+  quick DCGM diagnostic (`dcgmi diag -r 1 -j`) reports a missing dcgmi or an unreachable hostengine as a configuration
+  `WARN` (`DCGM_TOOL_UNAVAILABLE`/`DCGM_HOSTENGINE_UNAVAILABLE`, never drained); in host mode (Agent environment
+  `GPU_FAULT_DCGM_HOSTENGINE=host`, written on eks-managed nodes only and not part of the config digest) it returns
+  real verdicts, and a missing dcgmi or an unreachable host hostengine fails as on HyperPod with `DCGM_EXECUTION_REVIEW`
+  (`DRAIN_AND_QUARANTINE`).
 - Data-plane Deployments (executor, watcher, reconciler, node-resource collector, ADOT) carry no node pin and tolerate
   no GPU taint; they land on CPU nodes.
 - The node preflight Job checks the host prerequisites inside `chroot /host` and reports every missing one at once
   (`ERROR: host prerequisites unavailable: ...` plus a JSON verdict); AL2023 needs `python3.12 strace` from the launch
-  template (administrator-operations §5.0.1).
+  template (administrator-operations §5.0.1); host mode additionally needs `dcgmi`, `nv-hostengine`, an active
+  `nvidia-dcgm` and a successful `timeout 30 dcgmi discovery -l`, listed in the same verdict. The preflight records every
+  node's DCGM state (`not-installed`/`installed-inactive`/`host-active`/`cuda-mismatch`/`host-failed`/`unmanaged-hostengine`)
+  in the verdict's `dcgm` object: host mode accepts `host-active` only, and embedded mode refuses a host hostengine next
+  to the embedded one (running, active/activating or enabled; `ERROR: DCGM host engine conflict: ...`); the per-node
+  states of the last preflight are recorded in the release state `node_dcgm_hostengine` and shown by `status --full` as
+  `node_scope.dcgm_hostengine_nodes`/`dcgm_hostengine_conflict_nodes`. The Agent always grades by the cluster's declared
+  mode.
 - Node Action keys: every node inventory read, including the CPU mirror guard, uses the cluster selector.
 
 ### 2.6 Join recoverability and diagnostics (product gaps fixed on this branch)
@@ -162,12 +188,22 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
    **must not tolerate** `gpu-fault.io/quiesce` (no key-less `operator: Exists` wildcard toleration; list the keys such
    as `nvidia.com/gpu` instead) and must tolerate being stopped/evicted inside a quiesce window; the default NVIDIA
    device plugin and GFD manifests tolerate only `nvidia.com/gpu` and need no change.
+7. Host DCGM (optional, real `dcgmi diag` verdicts): the launch template installs a pinned
+   `datacenter-gpu-manager-4-core-<ver>` and `datacenter-gpu-manager-4-cuda<CUDA major>-<ver>` (the major of the
+   "CUDA Version" `nvidia-smi` prints) and runs `systemctl enable --now nvidia-dcgm`; confirm on a node with
+   `dcgmi discovery -l` and `dcgmi diag -r 1`, label **every** GPU node group of the cluster
+   `gpu-fault.io/dcgm-hostengine=host` and deploy/join right away (a deploy with the service enabled but no label is
+   refused by the embedded conflict check); to leave, remove the label, take `nvidia-dcgm` out of the launch template and
+   run `systemctl disable --now nvidia-dcgm` on the nodes, then deploy at once (order and commands in
+   administrator-operations §5.0.1, "Host DCGM").
 
 ## 4. Limitations
 
 - No provider-side node replacement: `nodeReplace` is only the warm-spare handover and needs a declared spare (§2.4);
   no HyperPod health agent, so `gpuDetection`/`providerHealthIsolation` are not claimed.
-- No DCGM host tools on the node: `dcgmi diag` is unavailable (WARN); the diagnostic bundle records the missing tool.
+- Embedded mode (the default, no node group declares host DCGM): the node has no host hostengine, the quick diagnostic
+  `dcgmi diag` only records a configuration WARN and the diagnostic bundle records the missing tool; real verdicts need
+  host mode (§3 item 7).
 - One profile version per cluster; site profile changes stay site-level approvals; the override version is the example
   profile's version name.
 - A first `deploy` refuses mixed providers (deploy one provider, join the other).
@@ -194,7 +230,7 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
 - Unit/contract: `tests/*eks_managed*`, `tests/fleet/test_cluster_profile_pins.py`,
   `tests/eks_provider/test_mixed_site_owner_resolution.py`, `tests/deploy/test_node_preflight_host_prerequisites.py`
   and others; HyperPod neutrality is pinned by digest constants and byte-identical render assertions.
-- **Not validated**: the quiesce taint (§2.7) and the restore exit for a RECOVERED incident have unit tests only; the third live DESTR-001 round is still to run; the acceptance campaign on a mixed site (fault injection, real `nodeReboot` execution and
+- **Not validated**: DCGM host mode (§2.5) has unit/contract tests only and is still to be proven live; the quiesce taint (§2.7) and the restore exit for a RECOVERED incident have unit tests only; the third live DESTR-001 round is still to run; the acceptance campaign on a mixed site (fault injection, real `nodeReboot` execution and
   confirmation, departed nodes, token rotation, the live `remove-cluster`/`uninstall` paths for eks-managed, Agent
   upgrade/rollback, long-run stability); more than one plain EKS cluster (a batch join of several plain EKS clusters has
   unit tests only); non-AL2023 AMIs; workload namespaces other

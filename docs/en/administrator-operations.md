@@ -1493,22 +1493,33 @@ Semantics and boundaries of `eks-managed`:
   kubelet `device-plugins` directory is the plugin (GFD and MPS are companions).
 - DCGM: the HyperPod AMI runs DCGM as a host service and the exporter DaemonSet dials the node's nv-hostengine at
   `127.0.0.1:5555`; the plain EKS AL2023 NVIDIA AMI has no host nv-hostengine (a `dcgmi` binary may still be present,
-  from the image or installed by hand), so an `eks-managed` cluster's
+  from the image or installed by hand), so in the default embedded mode an `eks-managed` cluster's
   exporter is rendered without `DCGM_REMOTE_HOSTENGINE_INFO` and runs its embedded hostengine in the container
   (`NVIDIA_VISIBLE_DEVICES=all`, `NVIDIA_DRIVER_CAPABILITIES=utility`, GPUs injected by the AMI's default NVIDIA
   container runtime; annotation `gpu-fault.io/dcgm-hostengine: embedded`). hostNetwork, the loopback bind on 9400, the
   instance-type affinity and the counters ConfigMap are unchanged, the node collector keeps scraping
-  `http://127.0.0.1:9400/metrics`, and the HyperPod text is byte-identical. The node runs no host hostengine: the
-  quick DCGM diagnostic (`dcgmi diag`) reports `WARN`/`DCGM_TOOL_UNAVAILABLE` (no `dcgmi`) or
+  `http://127.0.0.1:9400/metrics`, and the HyperPod text is byte-identical. An embedded-mode node runs no host
+  hostengine: the quick DCGM diagnostic (`dcgmi diag`) reports `WARN`/`DCGM_TOOL_UNAVAILABLE` (no `dcgmi`) or
   `WARN`/`DCGM_HOSTENGINE_UNAVAILABLE` (`dcgmi` present but no hostengine to connect to: exit status 226 =
   `DCGM_ST_CONNECTION_NOT_VALID`, or its connection error text, with no gradable JSON) on such nodes -- both
   configuration warnings that never drain the node; the Agent reads that semantics from
-  `GPU_FAULT_CLUSTER_PROVIDER=eks-managed`, and a HyperPod node that cannot reach its host hostengine still fails
-  with `DCGM_EXECUTION_REVIEW`. The diagnostic bundle's `dcgm-diag.json` records the missing tool. A mixed site's plan
-  carries an extra `dcgm_eks_managed` document group for the approver.
+  `GPU_FAULT_CLUSTER_PROVIDER=eks-managed` (with `GPU_FAULT_DCGM_HOSTENGINE` other than `host`), and a HyperPod node
+  that cannot reach its host hostengine still fails with `DCGM_EXECUTION_REVIEW`. The diagnostic bundle's
+  `dcgm-diag.json` records the missing tool. An `eks-managed` cluster whose node image ships DCGM and whose GPU node
+  groups declare `gpu-fault.io/dcgm-hostengine=host` runs in **host mode** (§5.0.1, "Host DCGM"): every node runs exactly
+  one hostengine, the host service `nvidia-dcgm`; the exporter keeps `DCGM_REMOTE_HOSTENGINE_INFO=127.0.0.1:5555` with
+  the annotation `gpu-fault.io/dcgm-hostengine: host`, and the explicit tolerations (still not the quiesce taint) and
+  the rest of the eks render are unchanged; the Agent (`GPU_FAULT_DCGM_HOSTENGINE=host`, written only into an
+  eks-managed node's environment and not part of the Agent config digest) returns real verdicts as on HyperPod: a
+  missing `dcgmi` or an unreachable host hostengine fails with `DCGM_EXECUTION_REVIEW` (`DRAIN_AND_QUARANTINE`) instead
+  of a configuration warning, and an eks-managed node's diagnostic result carries `dcgm_hostengine`. On a site with an
+  `eks-managed` cluster the plan carries an extra `dcgm_eks_managed` (embedded variant) or `dcgm_eks_managed_host` (host
+  variant) document group for the approver.
 - GPU reset quiesce: on HyperPod `QUIESCE_GPU_SERVICES` stops `kubelet` and the host GPU services first, then the
   containers it knows by name (`gpu-fault-system/exporter`, `kube-system/nvidia-device-plugin-ctr`, HyperPod's HMA). A
-  plain EKS node runs no host DCGM, so every GPU client is a container, and the `eks-managed` node installer Job adds
+  plain EKS node in embedded mode runs no host DCGM, so every GPU client is a container (a host-mode node also runs the
+  host `nvidia-dcgm`: it is on the default quiesce service list, stopped only when active and restored by
+  `RESTORE_GPU_SERVICES`, and `nv-hostengine` is on the device-holder sweep list), and the `eks-managed` node installer Job adds
   `--quiesce-sweep-kubernetes-device-holders` (Agent environment `GPU_FAULT_QUIESCE_SWEEP_KUBERNETES_DEVICE_HOLDERS=true`):
   a **Kubernetes container** outside that list that still holds the target GPU (a customer `dcgm-exporter`, GPU feature
   discovery, any monitoring client) is TERM/KILLed as well, recorded as
@@ -1708,7 +1719,10 @@ Semantics and boundaries of `eks-managed`:
   and `nvidia-smi` on the host (manual §3.1). The AL2023 NVIDIA AMI lacks `python3.12` and `strace`; install them through the
   launch template user data of §5.0.1. The node preflight Job lists every missing item at once
   (`ERROR: host prerequisites unavailable: ...` plus a JSON verdict), and a failed sensitive command in the release log
-  keeps those `ERROR:` lines.
+  keeps those `ERROR:` lines. A cluster that declares host DCGM (§5.0.1, "Host DCGM") additionally needs `dcgmi`,
+  `nv-hostengine`, an active `nvidia-dcgm` and a successful `timeout 30 dcgmi discovery -l`, listed in the same verdict
+  as the other missing prerequisites; on an undeclared (embedded) cluster a host hostengine that runs, is
+  active/activating or enabled is a conflict the preflight refuses with `ERROR: DCGM host engine conflict: ...`.
 - Registry: no `gpu_hyperpod` resource is recorded; `remove-cluster`, `uninstall` and `rotate-token` tolerate its
   absence and verify only `gpu_eks` and the Executor role.
 - Failure domains: with `spec.failureDomainLabels` unset, a site with an `eks-managed` cluster adds
@@ -1998,6 +2012,15 @@ set -euo pipefail
 dnf install -y python3.12 strace
 /usr/bin/python3.12 -c 'import venv'
 command -v strace
+# Host DCGM, optional: only together with the node-group label
+# gpu-fault.io/dcgm-hostengine=host (管理员日常运维 / administrator-operations §5.0.1).
+# Pin one exact version-release for both packages on every GPU node group of the
+# cluster; the cudaN build must match the major of the "CUDA Version" nvidia-smi prints.
+DCGM_VERSION=REPLACE_WITH_DCGM_VERSION_RELEASE   # e.g. 4.7.0-2
+CUDA_MAJOR=REPLACE_WITH_CUDA_MAJOR               # e.g. 13
+dnf install -y "datacenter-gpu-manager-4-core-${DCGM_VERSION}" \
+  "datacenter-gpu-manager-4-cuda${CUDA_MAJOR}-${DCGM_VERSION}"
+systemctl enable --now nvidia-dcgm
 --==GPU-FAULT==--
 ```
 
@@ -2047,7 +2070,8 @@ Once the user data is in the node group's launch template, the nodes still have 
   aws ssm send-command --instance-ids <EC2 instance id> --document-name AWS-RunShellScript \
     --parameters 'commands=["/usr/bin/python3.12 -c \"import venv\" && command -v strace"]'
   ```
-- The shell part lists only the product's prerequisites; acceptance-only tooling (such as DCGM's `dcgmproftester` for
+- The shell part lists only the product's prerequisites (the DCGM lines at its end serve "Host DCGM" below only; leave
+  them out of a node group that does not declare host mode); acceptance-only tooling (such as DCGM's `dcgmproftester` for
   COLLECT-002) is documented in the acceptance/fault-simulation manuals and may be appended to the same shell part by a
   test site.
 
@@ -2077,6 +2101,99 @@ and `status --full`/`verify` records each node group's `node_repair` (`disabled`
 the cluster's recorded selector covers (the groups the ownership label selects, the group a legacy selector names, or
 the groups hosting GPU instance types). Only the `eks:DescribeNodegroup` read is needed:
 the operator identity and the executor role already hold it; the control-plane role needs nothing.
+
+**Host DCGM (optional): real verdicts from the quick diagnostic.** In the default embedded mode the exporter runs its own
+hostengine inside the container and the node has no host nv-hostengine to dial, so the Agent's quick diagnostic
+`dcgmi diag -r 1` can only record a configuration `WARN` (the DCGM item of §5.0). Once the node image installs a pinned
+DCGM and enables `nvidia-dcgm` with the last lines of the shell part above, declare host mode on the node groups: every
+node runs exactly one hostengine (the host service), the exporter dials it, and `dcgmi diag` returns real verdicts. The
+declaration is the managed node group label `gpu-fault.io/dcgm-hostengine=host` (`host` is its only value), kept next to
+the launch template that installs DCGM. `deploy`/`join-cluster` re-evaluate it every time over the node groups the
+cluster's selector selects (on a join the ownership-labelled groups, on a managed cluster the groups its recorded
+selector covers): all `host` is host mode (source `node-group-label`), none is embedded (source `default`), and a mix or
+any other value is refused before any change, naming every group as `<node group> gpu-fault.io/dcgm-hostengine=<value|absent>`
+with the labelling command. Karpenter NodePools are not read; a HyperPod cluster is always host mode (source
+`provider`), its label is ignored and nothing is recorded. The result is written into the cluster's `site.yaml` entry as
+`dcgmHostEngine` (`host`/`embedded`) and `dcgmHostEngineSource` (`node-group-label`/`default`): it is a capability of the
+node image, not membership, so every deploy/join rewrites it from the node groups instead of keeping the previous entry
+the way `nodeSelector` is kept; an older entry without the keys reads as embedded/`default`. Follow these steps in
+order and without pausing between them:
+
+1. **Enable the host hostengine.** Add the pinned DCGM install and `systemctl enable --now nvidia-dcgm` at the end of the
+   shell part to the launch template: one version-release for both packages and every GPU node group of the cluster
+   (choose it with `dnf list --showduplicates datacenter-gpu-manager-4-core`; without the pin nodes drift between
+   releases), and a `cudaN` package matching the major of the "CUDA Version" `nvidia-smi` prints (a mismatched build
+   fails, e.g. `dcgmproftester` exits 244); change the launch template version and roll the node group as above. A node
+   that already carries both packages may also run `systemctl enable --now nvidia-dcgm` directly, but only the launch
+   template keeps it on replacement nodes.
+2. **Confirm on a node** (either one, like the check above):
+
+   ```bash
+   kubectl debug node/<node name> -it --image=public.ecr.aws/amazonlinux/amazonlinux:2023 -- \
+     chroot /host sh -c "systemctl is-active nvidia-dcgm && dcgmi discovery -l && dcgmi diag -r 1"
+   aws ssm send-command --instance-ids <EC2 instance id> --document-name AWS-RunShellScript \
+     --parameters 'commands=["systemctl is-active nvidia-dcgm && dcgmi discovery -l && dcgmi diag -r 1"]'
+   ```
+3. **Label every GPU node group the site selects for the cluster** and wait until the node group is `ACTIVE` again:
+
+   ```bash
+   aws eks update-nodegroup-config --cluster-name <eks cluster> --nodegroup-name <GPU node group> \
+     --labels 'addOrUpdateLabels={gpu-fault.io/dcgm-hostengine=host}'
+   aws eks wait nodegroup-active --cluster-name <eks cluster> --nodegroup-name <GPU node group>
+   ```
+4. **Run `deploy` right away** (`join-cluster` for a new cluster). The release diff plans the DCGM exporter + reconciler +
+   Agent from the change of `dcgm_hostengines` (state key `dcgm_hostengines_sha256`; `DATA_PLANE_COMPATIBLE`). The node
+   candidate preflight, which runs before any change, additionally requires `dcgmi`, `nv-hostengine`,
+   `systemctl is-active nvidia-dcgm` = `active` and a successful `timeout 30 dcgmi discovery -l` in host mode and lists
+   what is missing together with the other host prerequisites in
+   `ERROR: host prerequisites unavailable: ...; the managed node group declares gpu-fault.io/dcgm-hostengine=host: ...` --
+   so labelling before the hostengine runs is refused and the exporter is left untouched; conversely, enabling
+   `nvidia-dcgm` (even `enable` without a start) and deploying without the label is refused by the embedded-mode conflict
+   check (see the table below). Once the preflight passes the exporter is re-rendered (dialling `127.0.0.1:5555`,
+   annotation `gpu-fault.io/dcgm-hostengine: host`), the cluster's Agents are re-installed in waves (Agent environment
+   `GPU_FAULT_DCGM_HOSTENGINE=host`, node annotation `gpu-fault.io/installer-dcgm-hostengine=host`) and `site.yaml` records
+   `dcgmHostEngine: host`. Between enabling the hostengine in step 1 and this deploy's re-render two hostengines run on
+   each node (the exporter's embedded one and the host service), so keep that window short.
+5. **Check**: in the `gpu_cluster:<id>` check of `status --full`, `node_scope.dcgm_hostengine=host`,
+   `node_scope.dcgm_hostengine_source=node-group-label`, an empty `node_scope.dcgm_hostengine_pending_nodes` (nodes whose
+   installed mode disagrees with the record) and `node_scope.dcgm_hostengine_conflict_nodes`, and `host-active` for every
+   node in `node_scope.dcgm_hostengine_nodes`; in `gpu-fault-admin node-scope --state-dir <dir>` every cluster's
+   `dcgm_hostengine` (`recorded`/`source`/`declared`/`state`/`refusal`) shows `state=converged` -- `pending deploy` means the
+   node groups' declaration changed and no deploy has run yet, `blocked` carries the refusal.
+
+The node preflight classifies every `eks-managed` GPU node's DCGM state into one row of the table below and records it in
+the `dcgm` object of its JSON verdict (`mode`, `state`, whether `nvidia-dcgm` is active/enabled, whether `dcgmi` and
+`nv-hostengine` are present, the installed `cudaN` flavors against the driver's CUDA major, the nv-hostengine processes
+and their owning unit, the `dcgmi discovery -l` result and `conflict`). The release preflight runs every node and refuses
+once, naming every failed node; the per-node states of the last node preflight (every deploy that rolls the
+reconciler/Agents, and every join) are recorded in the release state (`node_dcgm_hostengine`, with `observed_at`) and
+shown by `status --full`/verify as `node_scope.dcgm_hostengine_nodes` and `node_scope.dcgm_hostengine_conflict_nodes` --
+that preflight's observation, not a live probe.
+
+| `dcgm.state` | Meaning | Host mode (labelled) |
+|---|---|---|
+| `not-installed` | no DCGM packages | refused |
+| `installed-inactive` | packages installed, `nvidia-dcgm` disabled and not running (the AL2023 default once installed) | refused |
+| `host-active` | `nvidia-dcgm` active and `dcgmi discovery -l` succeeds | passes |
+| `cuda-mismatch` | the installed `cudaN` flavor differs from the driver's CUDA major (e.g. cuda12 on a CUDA 13 driver; `dcgmproftester` exits 244 "Wrong version") | refused: the `cudaN` package must match the driver's CUDA major |
+| `host-failed` | `nvidia-dcgm` enabled but failed or crash-looping, or active with `dcgmi discovery -l` failing | refused |
+| `unmanaged-hostengine` | an nv-hostengine process outside `nvidia-dcgm.service` (e.g. started by hand) | refused: stop the hand-started nv-hostengine; `nvidia-dcgm.service` must own the host engine |
+
+A host-mode refusal lists every item of every node in one `ERROR: host prerequisites unavailable: ...` pointing back here.
+In embedded mode (no label) a host engine next to the exporter's embedded one -- running, active/activating or enabled
+(starting at boot) -- is a conflict, refused with `ERROR: DCGM host engine conflict: <items>; ...` and two ways out: label
+the node group `gpu-fault.io/dcgm-hostengine=host` and deploy, or disable `nvidia-dcgm` (`systemctl disable --now
+nvidia-dcgm`; stop a hand-started nv-hostengine as well); `not-installed`, `installed-inactive` (disabled) and
+`cuda-mismatch` pass in embedded mode. The Agent always grades by the cluster's declared mode, never by a per-node guess.
+
+Leaving host mode: remove the label from every GPU node group (`aws eks update-nodegroup-config --cluster-name <eks
+cluster> --nodegroup-name <GPU node group> --labels 'removeLabels=gpu-fault.io/dcgm-hostengine'`), take `nvidia-dcgm` out
+of the launch template, run `systemctl disable --now nvidia-dcgm` on the nodes, then deploy at once (the exporter goes
+back to embedded and the Agents are re-installed as embedded). Deploying before disabling does not work: the
+embedded-mode conflict check refuses an `nvidia-dcgm` that is still active or enabled. Between stopping the service and
+that deploy the host-mode exporter has no engine to dial and a host-mode Agent grades the unreachable hostengine a failure
+(`DRAIN_AND_QUARANTINE`), so keep this window short too -- the mirror image of the entering window (enable -> label ->
+deploy), during which two hostengines run.
 
 #### 5.0.2 After a join: kubeconfig current-context, the Agent-set check and `status` attribution
 

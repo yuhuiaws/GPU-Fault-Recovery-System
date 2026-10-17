@@ -9294,6 +9294,12 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
        and not capturing it is **FAIL**;
      - after the reset the GPU count equals the expected count declared by the site;
      - `RESTORE_GPU_SERVICES` restored the originally active services and cancelled the timer;
+     - `eks-managed` host mode (GPU node groups labelled `gpu-fault.io/dcgm-hostengine=host`):
+       `QUIESCE_GPU_SERVICES` stops the active host `nvidia-dcgm` (step `stopped_services`;
+       `nv-hostengine` is on the device-holder sweep list and the exporter Pod leaves the node with
+       the quiesce taint) and `RESTORE_GPU_SERVICES` restores it (`restored_services`); every service
+       active at baseline (`nvidia-dcgm.service` included) must be active again after the restore. An
+       embedded-mode node runs no host `nvidia-dcgm` and the quiesce does not stop it;
      - the Node Agent ledger is keyed by the deterministic `command_id` and records exactly one result.
   6. CloudTrail confirms there is no `BatchRebootClusterNodes`,
      `BatchReplaceClusterNodes` or `BatchDeleteClusterNodes`. The periodic read-only
@@ -15191,6 +15197,13 @@ reboot, and the marker carries retirement fields after restore**
     RESTART_NODE/REPLACE_NODE/RESET_*, and reaches a terminal state;
   - there is an `OPERATOR_REVIEW` notification and one DCGM-diagnostic-completed
     notification;
+  - on an `eks-managed` cluster `RUN_DCGM_DIAGNOSTIC` is judged by the DCGM mode: host mode
+    (GPU node groups labelled `gpu-fault.io/dcgm-hostengine=host`, exporter annotation
+    `gpu-fault.io/dcgm-hostengine: host`) requires a real DCGM verdict -- the node's result
+    carries neither `DCGM_TOOL_UNAVAILABLE` nor `DCGM_HOSTENGINE_UNAVAILABLE` and the node is
+    not in the step's `configuration_only_nodes` (the result carries `dcgm_hostengine=host`);
+    in embedded mode (the default) those two configuration `WARN`s remain the expected
+    outcome and never drain the node; HyperPod is unchanged;
   - confirmed by finding metric, incident event_id and marker_id -- not just by
     searching the reason -- that there is no `gpu_expected_count_unknown` and no
     `gpu_inventory_mismatch`; boot_id unchanged;
