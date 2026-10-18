@@ -4,6 +4,7 @@ import os
 from collections.abc import Sequence
 from datetime import datetime, timezone
 
+from gpu_fault.env import env_bool
 from gpu_fault.gpu_fabric_manager import graded_fabric_gpus
 from gpu_fault.models import (
     CapabilityMode,
@@ -15,6 +16,7 @@ from gpu_fault.models import (
     WorkloadState,
 )
 from gpu_fault.operation_registry import NODE_MUTATING_OPERATIONS
+from gpu_fault.orchestration.xid45_policy import observe_only, solo_restart_fm
 from gpu_fault.policy import (
     NVIDIA_CODE_SPECIFIC_FULL_RESET_SXIDS,
     ActionDisposition,
@@ -30,6 +32,24 @@ from gpu_fault.policy import (
 WORKLOAD_STATE_UNKNOWN_REASON = "node workload state is UNKNOWN"
 #: The catalog's "Solo: RESTART_FM" (XID 45).
 RESTART_FABRIC_MANAGER_ACTION = "RESTART_FM"
+
+
+def parse_sxid_codes(name: str) -> set[int]:
+    """The positive SXID codes in the comma-separated environment variable."""
+
+    values = set()
+    for item in os.getenv(name, "").split(","):
+        item = item.strip()
+        if not item:
+            continue
+        try:
+            code = int(item)
+        except ValueError as exc:
+            raise ValueError(f"{name} must contain comma-separated integers") from exc
+        if code <= 0:
+            raise ValueError(f"{name} values must be positive")
+        values.add(code)
+    return values
 
 
 def _xid74_operations(
@@ -135,6 +155,7 @@ class WorkflowBuilder:
         official_workflow_operation,
         pre_action_order,
         pre_action_operation,
+        xid45_solo_restart_fm: bool | None = None,
     ) -> None:
         self.store = store
         self.target_driver_branch = target_driver_branch
@@ -145,6 +166,13 @@ class WorkflowBuilder:
         self.official_workflow_operation = official_workflow_operation
         self.pre_action_order = pre_action_order
         self.pre_action_operation = pre_action_operation
+        # The site switch of ``xid45_policy``: True runs the catalog's RESTART_FM
+        # on a graded NVSwitch node; unset (the default) is observe-only there.
+        self.xid45_solo_restart_fm = (
+            env_bool("GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM", False)
+            if xid45_solo_restart_fm is None
+            else xid45_solo_restart_fm
+        )
 
     @staticmethod
     def _utc(value: datetime) -> datetime:
@@ -194,6 +222,8 @@ class WorkflowBuilder:
         is such a node when its latest samples are graded the way batch 127
         grades the fabric (``graded_fabric_gpus``); empty -- any other node, or
         one whose exporter reports no field 170 -- keeps RESTART_FABRIC_MANAGER.
+        A solo XID 45 reaches the chain only when the site opted in: by default
+        it is observe-only there (``xid45_site_policy``).
         """
 
         if decision.official_action != RESTART_FABRIC_MANAGER_ACTION or not isinstance(
@@ -205,6 +235,25 @@ class WorkflowBuilder:
             ((item.sample, item.observed_at) for item in latest),
             product=event.product,
         )
+
+    def xid45_site_policy(
+        self,
+        event: XidEvent | SxidEvent,
+        decision: FaultPolicyDecision,
+    ) -> FaultPolicyDecision:
+        """A solo XID 45 on a graded NVSwitch node: observe-only by default.
+
+        ``xid45_policy`` holds the NVIDIA evidence. Unchanged: the site opted in
+        (``GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM``), any other decision, and
+        a node whose latest samples are not graded (A100, PCIe/NVL, GH200,
+        GB200/GB300, no field 170), where RESTART_FM is the Fabric Manager
+        restart. Idempotent: the observe-only decision is not solo RESTART_FM.
+        """
+
+        if self.xid45_solo_restart_fm or not solo_restart_fm(event, decision):
+            return decision
+        graded = self.fabric_manager_restart_inventory(event, decision)
+        return observe_only(decision, graded) if graded else decision
 
     def workflow_evidence_errors(
         self,

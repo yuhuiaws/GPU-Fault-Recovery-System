@@ -1613,6 +1613,15 @@
     "GPU_FAULT_WORKLOAD_LOG_TIMEOUT_SECONDS": {
       "kind": "number"
     },
+    "GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM": {
+      "kind": "boolean",
+      "true_tokens": [
+        "1",
+        "on",
+        "true",
+        "yes"
+      ]
+    },
     "GPU_FAULT_XID_CORRELATION_LEASE_SECONDS": {
       "kind": "integer"
     },
@@ -2301,6 +2310,7 @@
     "GPU_FAULT_WORKLOAD_LOG_TAIL_LINES",
     "GPU_FAULT_WORKLOAD_LOG_TIMEOUT_SECONDS",
     "GPU_FAULT_WORKLOAD_STATE",
+    "GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM",
     "GPU_FAULT_XID_CORRELATION_LEASE_SECONDS",
     "GPU_FAULT_XID_CORRELATION_POLL_SECONDS",
     "GPU_FAULT_XID_POLICY_PATH"

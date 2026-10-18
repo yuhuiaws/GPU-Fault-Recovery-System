@@ -213,6 +213,9 @@ categories:
         description: "是否启动 workflow dispatcher；关闭后只保存状态不推进动作。"
       - name: GPU_FAULT_ENABLE_WORKFLOW_PREEMPTION
         description: "允许更高 recovery rank 在安全边界抢占较弱 workflow。"
+      - name: GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM
+        production: 默认不设置（observe-only）；只在站点评审后写进控制面源清单并随发布生效
+        description: "站点策略开关。未设置/false：受 fabric 分级的 NVSwitch 节点（Hopper SXM、HGX B200/B300）上的 solo XID 45 只观测，记录 incident、证据和调查通知，不动节点、不隔离，官方动作 RESTART_FM 照旧记录（NVIDIA GPU debug guidelines 把 solo XID 45 判为信息性，A100 除外）。true：恢复 catalog 行为，RESTART_FM 编译为完整 GPU + NVSwitch reset 链。未分级节点（含 A100）始终是 Fabric Manager 重启，非 solo 的 XID 45 跟随伴随 XID。"
       - name: GPU_FAULT_WORKFLOW_LEASE_DURATION_SECONDS
         description: "Workflow execution lease；过期后其他 worker 递增 epoch 接管。"
       - name: GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS

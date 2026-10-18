@@ -88,9 +88,11 @@ from gpu_fault.orchestration.reboot_window import (
     cover_fault,
     owning_reboot,
 )
+from gpu_fault.orchestration.workflow_builder import parse_sxid_codes
 from gpu_fault.orchestration.workflow_merge import (
     WorkflowMergeService,
 )
+from gpu_fault.orchestration.xid45_policy import observe_only_reference
 from gpu_fault.policy import (
     ActionDisposition,
     DistributedXidBatch,
@@ -235,12 +237,12 @@ class IncidentOrchestrator:
         self.sxid_driver_remediation_codes = (
             sxid_driver_remediation_codes
             if sxid_driver_remediation_codes is not None
-            else self._parse_sxid_codes("GPU_FAULT_SXID_DRIVER_REMEDIATION_CODES")
+            else parse_sxid_codes("GPU_FAULT_SXID_DRIVER_REMEDIATION_CODES")
         )
         self.sxid_firmware_update_codes = (
             sxid_firmware_update_codes
             if sxid_firmware_update_codes is not None
-            else self._parse_sxid_codes("GPU_FAULT_SXID_FIRMWARE_UPDATE_CODES")
+            else parse_sxid_codes("GPU_FAULT_SXID_FIRMWARE_UPDATE_CODES")
         )
         self.target_driver_branch = (
             target_driver_branch
@@ -492,24 +494,6 @@ class IncidentOrchestrator:
             workflow_resource_claims_by_node=(self._workflow_resource_claims_by_node),
         )
 
-    @staticmethod
-    def _parse_sxid_codes(name: str) -> set[int]:
-        values = set()
-        for item in os.getenv(name, "").split(","):
-            item = item.strip()
-            if not item:
-                continue
-            try:
-                code = int(item)
-            except ValueError as exc:
-                raise ValueError(
-                    f"{name} must contain comma-separated integers"
-                ) from exc
-            if code <= 0:
-                raise ValueError(f"{name} values must be positive")
-            values.add(code)
-        return values
-
     def gpu_metric_action(
         self,
         *,
@@ -741,6 +725,7 @@ class IncidentOrchestrator:
 
             # Marker association is evidence; store groups arbitrate atomically.
             decision = execution_decision(event, decision, existing)
+            decision = self._builder.xid45_site_policy(event, decision)
 
             stale = self._fence_stale_generation_without_baseline(event, decision)
             if stale is not None:
@@ -825,6 +810,7 @@ class IncidentOrchestrator:
             workload_identity_source=(event.workload_identity_source),
             policy_version=decision.policy_version,
             policy_source=decision.source.value,
+            policy_reference=observe_only_reference(decision),
             official_action=decision.official_action,
             effective_action=effective_action,
             safety_action=decision.safety_action,
@@ -1743,8 +1729,14 @@ class IncidentOrchestrator:
         shows how late the action ran; only the disposition is left alone.
         Rejected alternative -- raising the limit -- keeps the coupling and
         just moves the backlog length at which remediation silently stops.
+
+        First of all, a solo XID 45 on a graded NVSwitch node becomes the site's
+        observe-only decision unless the site opted in (``xid45_policy``): it
+        acts on nothing, so no fence applies, and every later reader -- the
+        incident, the notification, the persisted decision -- sees it.
         """
 
+        decision = self._builder.xid45_site_policy(event, decision)
         if decision.disposition is not ActionDisposition.EXECUTABLE:
             return decision
         operations = self._builder.official_operations(event, decision, decision.action)

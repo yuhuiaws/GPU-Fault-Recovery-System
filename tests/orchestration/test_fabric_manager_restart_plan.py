@@ -9,6 +9,11 @@ Fabric Manager, ``nvidia-smi -r``, start Fabric Manager. The plan there is the
 fatal-trunk SXID's chain on the node's graded GPUs; the window stops Fabric
 Manager (it is a full reset), the restore starts it, both validations run.
 Every other node keeps FREEZE_EVIDENCE -> RESTART_FABRIC_MANAGER.
+
+From batch 131 a solo XID 45 reaches that chain only when the site opts in
+(``GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true``); by default it is
+observe-only on a graded node (``tests/orchestration/test_xid45_observe_only.py``).
+The chain tests here therefore run opted in.
 """
 
 from __future__ import annotations
@@ -18,7 +23,8 @@ import pytest
 from gpu_fault.gpu_fabric_manager import FABRIC_MANAGER_STATUS, graded_fabric_gpus
 from gpu_fault.gpu_fabric_window import quiesce_command_parameters
 from gpu_fault.gpu_metrics import GpuMetricSample, GpuMetricSource, GpuMetricsService
-from tests._builders import gpu_metric_batch
+from gpu_fault.orchestration.xid45_policy import XID45_SOLO_RESTART_FM_ENV
+from tests._builders import build_store, gpu_metric_batch
 
 from ._support import (
     NOW,
@@ -43,6 +49,14 @@ FABRIC_RESTART_PLAN = [
     Op.VALIDATE_FABRIC,
     Op.RESTORE_SCHEDULING,
 ]
+
+
+@pytest.fixture
+def opted_in(monkeypatch: pytest.MonkeyPatch) -> ApplicationContext:
+    """A control plane whose site runs the catalog's RESTART_FM on graded nodes."""
+
+    monkeypatch.setenv(XID45_SOLO_RESTART_FM_ENV, "true")
+    return ApplicationContext(store=build_store())
 
 
 def _report(context: ApplicationContext, model: str, status: float) -> None:
@@ -78,8 +92,9 @@ def _solo_xid45(context: ApplicationContext, **values):
 
 @pytest.mark.parametrize("model", ["NVIDIA H200", "NVIDIA B200", "NVIDIA B300 SXM6 AC"])
 def test_a_hopper_nvswitch_node_plans_the_full_gpu_and_nvswitch_reset(
-    context: ApplicationContext, model: str
+    opted_in: ApplicationContext, model: str
 ) -> None:
+    context = opted_in
     _report(context, model, 3.0)
 
     incident, workflow = _solo_xid45(context)
@@ -104,8 +119,9 @@ def test_a_hopper_nvswitch_node_plans_the_full_gpu_and_nvswitch_reset(
 
 
 def test_an_active_workload_is_stopped_and_restarted_around_it(
-    context: ApplicationContext,
+    opted_in: ApplicationContext,
 ) -> None:
+    context = opted_in
     _report(context, "NVIDIA H100 80GB HBM3", 3.0)
 
     _incident, workflow = _solo_xid45(
