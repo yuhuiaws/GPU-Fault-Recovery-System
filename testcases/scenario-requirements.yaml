@@ -552,6 +552,25 @@ requirements:
       - nodeid: tests/execution/test_branch_escalation.py::test_a_single_node_plan_with_an_unknown_outcome_is_not_adopted
       - nodeid: tests/regional/test_destr025_verdicts.py::test_in_record_reboot_without_successor_is_the_pass_shape
     critical: true
+  - id: GF-REQ-RECOVERY-SAME-NODE-MERGE
+    family: recovery
+    title: Same-window faults on two GPUs of one node share one reset window and one workload restart
+    source: [src/gpu_fault/orchestration/families/grouped_faults.py, src/gpu_fault/orchestration/coordinator.py, src/gpu_fault/node_agent/operations/reset.py]
+    covers: [recovery:same-node-merge]
+    conditions: [normal, repeat, safety]
+    assertions:
+      - Same-level faults on two GPUs of one node before the reset is issued widen one workflow's node actions to both GPUs with gpu_uuids_by_node.
+      - One Node Agent reset command resets both GPUs one after another inside one quiesce window and releases the display stack once.
+      - A fault after the reset was issued queues a successor branch before the single join; after the join started it gets its own workflow.
+    cases: [GF-REGIONAL-DESTR-026]
+    runners: [scripts/e2e/regional/run_destr026_same_node_two_gpu_reset.py]
+    checks:
+      - nodeid: tests/orchestration/test_merge.py::test_merged_reset_targets_every_faulted_gpu
+      - nodeid: tests/orchestration/test_same_node_job_reset_merge.py::test_both_faults_before_any_step_widen_one_linear_job_workflow
+      - nodeid: tests/orchestration/test_same_node_job_reset_merge.py::test_a_fault_after_the_reset_was_issued_queues_a_successor_branch
+      - nodeid: tests/node_agent/test_reset_two_gpus_one_window.py::test_one_command_resets_both_gpus_one_after_another
+      - nodeid: tests/regional/test_destr026_same_node_two_gpu_reset.py::test_the_single_window_two_gpu_reset_is_the_pass_shape
+    critical: true
   - id: GF-REQ-RECOVERY-REBOOT-SAFEGUARD
     family: recovery
     title: Reboot-surviving safeguard and explicit unknown-outcome protection

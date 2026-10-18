@@ -13243,6 +13243,145 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
   - When the cluster remediation budget cannot accommodate the reboot rung, the product fails closed (branch exhausted, record FAILED,
     whole-record escalation generates a reboot-after); that is the other shape covered by DESTR-014/performance acceptance §8.3, this case requires budget headroom at the plan
     stage and does not judge a budget refusal as PASS.
+
+### GF-REGIONAL-DESTR-026
+
+> Both providers: the case runs under this id on HyperPod and on an `eks-managed` (p5en) cluster, judged identically.
+> On HyperPod `QUIESCE_GPU_SERVICES` stops kubelet; on `eks-managed` it applies the `gpu-fault.io/quiesce` taint instead.
+> Between the injection and the workflow's terminal state the runner reads the store only on both, and every host read waits
+> until the fault node answers again. The preflight is DESTR-015's: the fault node's stored GPU inventory identity names one
+> product, comes from the current boot and is at most 180 s old, or the injected XIDs would be quarantined as `product UNKNOWN`.
+
+**Two GPUs of one node fault in the same window: one quiesce window resets both cards one after the other, and the training job restarts once**
+
+- Level: `destructive`. On the fault node, which runs the case's own two-node training job, it really executes one
+  `QUIESCE_GPU_SERVICES` and one `RESET_GPU` covering two GPUs (two physical `nvidia-smi --gpu-reset`), and the job is stopped
+  and restarted once. **No reboot, no replace, no warm spare is declared, no control-plane or executor setting is changed; the job's
+  second node is only stopped and restarted with the job.**
+- The reusable formal entry point is `scripts/e2e/regional/run_destr026_same_node_two_gpu_reset.py` (verdicts in
+  `scripts/e2e/regional/destr026_verdicts.py`, unit tests in `tests/regional/test_destr026_same_node_two_gpu_reset.py`; the product
+  shapes it relies on are pinned by `tests/orchestration/test_same_node_job_reset_merge.py` and
+  `tests/node_agent/test_reset_two_gpus_one_window.py`). By default it only generates the plan; before execute it must read
+  `DESTR-015=PASS` on the same release. `--fault-node` and `--node-b` bind from the site profile's `fault-node` and `node-b`
+  (the job's Master is pinned to the former, its Worker to the latter); the two target GPUs' PCI BDFs default to the first two cards
+  the fault node's host probe enumerates and can be given with `--pci-bdf-a` and `--pci-bdf-b`:
+
+  ```bash
+  python3 scripts/e2e/regional/run_destr026_same_node_two_gpu_reset.py \
+    --run-dir "${RUN_DIR}" --attempt 1 --plan \
+    --site-profile "${SITE_PROFILE}" \
+    --fault-node "${FAULT_NODE}" --node-b "${NODE_B}"
+
+  python3 scripts/e2e/regional/run_destr026_same_node_two_gpu_reset.py \
+    --run-dir "${RUN_DIR}" --attempt 1 --execute \
+    --confirm DESTR026_EXECUTE \
+    --maintenance-window-end "${MAINTENANCE_WINDOW_END}" \
+    --site-profile "${SITE_PROFILE}" \
+    --fault-node "${FAULT_NODE}" --node-b "${NODE_B}"
+  ```
+
+- Purpose: two GPUs of one node reporting same-level faults in quick succession is a common shape. If the second fault opened a
+  workflow of its own, the node would be quiesced twice and the job stopped and restarted twice; if the merge widened only the incident
+  and not the steps, the workflow would reset one card and still validate both and readmit them. The product merges same-node same-level
+  faults into one workflow before the `RESET_GPU` command is issued: an idle node takes the node merge, a node running a managed job the
+  attempt-scoped merge (`src/gpu_fault/orchestration/families/grouped_faults.py`: the still rewritable record is replaced, then
+  QUIESCE/VERIFY/RESET/RESTORE are widened to both cards with `parameters.gpu_uuids_by_node`); the Node Agent resets them one after the
+  other inside the one window (`src/gpu_fault/node_agent/operations/reset.py`, the display-module release list is shared across the loop).
+  DESTR-001 resets one card, DESTR-015 one card on each of two nodes, and DESTR-016's second same-level XID is absorbed and then preempted;
+  the same-node two-card merge on the job path had no live evidence.
+- Preconditions:
+  1. `DESTR-015` PASS (same `release_id`/`cluster_id`; the real reset of `DESTR-001` and the job restart of `DESTR-009` on its chain
+     are established).
+  2. The fault node and the second node are both Ready, schedulable, without `gpu-fault.io/` taint or ownership annotation, each
+     allocatable with 8 GPUs and carrying no business workload; the whole GPU cluster has no other GPU workload; the fault node has had
+     no XID event in the last ten minutes.
+  3. The fault node hosts no arbiter Pod (`gpu-fault-cluster-executor`, `gpu-fault-completion-watcher`,
+     `gpu-fault-node-installer-reconciler`) and does not hold every kube-dns endpoint (only it is quiesced); the second node is not
+     restricted.
+  4. The fault node's Node Agent is `ACTIVE` with `allowed_operations` containing `QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`,
+     `RESET_GPU`, `RESTORE_GPU_SERVICES`; in the Runtime Profile `gpuReset` is `OWN` by the Node Agent and
+     `workloadStop`/`workloadRestart` are `OWN` by the Kubernetes adapter through the regional executor; the profile has no warnings.
+  5. Processor queue and remote command queue empty; the control plane's multi-node aggregation window is at least 5 s and the job
+     workflow lifetime fits the case's estimated duration.
+- Steps:
+  1. The plan binds both nodes' UID and boot id, the release and the runtime identity; they are recomputed before execute and a drift is
+     refused.
+  2. Prewarm the training image on both nodes; submit the 16-GPU PyTorchJob with the Master pinned to the fault node and the Worker to the
+     second node, wait for both Pods Running, Ready and heartbeating, and for a 16-GPU RUNNING attempt observation in the store; both
+     target GPUs must be in the Master's allocation.
+  3. Start three host probes (two on the fault node, one on the second node), record both hosts' baselines (GPU inventory, Node Agent
+     ledger, services, quiesce state, timers) and the scheduling state of every GPU node of the cluster; arm DESTR-001's detached sampler
+     on the fault node (`start-reset-sampler`).
+  4. The two fault-node probes each run one `write-xid46` concurrently (their own marker, drill id and PCI BDF, with the maintenance
+     window deadline); wait until each event shows a workflow. When the two events did not land in one incident and one workflow, or their
+     `observed_at` differ by the aggregation window or more, the observation stops there (cleanup runs as usual).
+  5. Observe the workflow to its terminal state from the store alone (ceiling 2400 s); on success authorize and wait for the job to be
+     replaced once, then watch for 60 s that the Pods no longer change.
+  6. Once the fault node answers again (ceiling 900 s) read its host snapshot and stop the sampler, read the kernel journal once more for
+     the second card's BDF, read the second node's snapshot; collect the nodes, the GPU node list, CloudTrail, the control-plane logs and
+     the CPU-side state, and compute the verdict.
+- Verdict (PASS only when all hold):
+  - Both events are kmsg XID 46 events of the GPU each was written for, both finalized as `RESET_GPU`, and they land in one incident and
+    one `workflow_request_id`; their `observed_at` differ by less than the aggregation window;
+  - The incident's `gpu_uuids` are exactly the two faulted GPUs and its `node_ids` only the fault node; the workflow is the linear job
+    reset plan, `FREEZE_EVIDENCE`, `MARK_UNSCHEDULABLE`, `STOP_WORKLOADS`, `QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`,
+    `RESET_GPU`, `RESTORE_GPU_SERVICES`, `VALIDATE_GPU`, `RESTORE_SCHEDULING`, `RESTART_WORKLOAD` exactly once each and all
+    `SUCCEEDED` (order and remote delegation judged by DESTR-001's reset contract), workflow `SUCCEEDED`, incident `RECOVERED`;
+  - The `gpu_uuids` of `QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`, `RESET_GPU` and `RESTORE_GPU_SERVICES` are exactly the two
+    cards, and their `parameters.gpu_uuids_by_node` has the fault node as its only entry, mapping exactly those two cards;
+    `VALIDATE_GPU` covers both cards too and `SUCCEEDED` (each card with its own fresh sample after the reset);
+  - Apart from the job-level `STOP_WORKLOADS` and `RESTART_WORKLOAD` (`node_ids` exactly the job's two nodes) no step acts on a node
+    other than the fault node; no `RESTART_NODE`, `REPLACE_NODE`, `RESET_ALL_GPUS_NVSWITCHES`, `QUARANTINE` or `ESCALATE_SUPPORT`,
+    no superseded step, no branch escalation;
+  - The fault node's Node Agent ledger adds for this workflow exactly one successful `QUIESCE_GPU_SERVICES`, one successful
+    `RESET_GPU` with `attempt=1` and the two cards in `gpu_uuids`, and one successful `RESTORE_GPU_SERVICES`, with the reset's start and
+    end inside that one quiesce window; no RESET_ALL row, no duplicate `command_id`, no new row of another workflow;
+  - The `RESET_GPU` result is read once from the control plane's `node_results` and once from the node's ledger row (the `evidence` the
+    host probe reads) and the `physical_calls` agree: `reset_gpu_uuids` exactly the two cards, `reset_successes=2`; each card's last
+    `nvidia-smi --gpu-reset` answered `reset` and succeeded once, `busy` only before it; the two cards' calls do not interleave and run
+    one after the other in command order; no other GPU is reset;
+  - The display modules are released at most once and loaded back at most once: each `rmmod` module appears at most once in
+    `physical_calls`, and `released_kernel_modules` and `reloaded_kernel_modules` repeat no module;
+  - On a node running Fabric Manager the window keeps it: the QUIESCE's `kept_services` names `nvidia-fabricmanager` and its
+    `stopped_services` does not, the RESTORE's `restored_services` does not, the node ledger's quiesce row records it as kept, and the
+    unit's `MainPID` and `InvocationID` on the host are unchanged;
+  - The detached host sampler saw each of the two target GPUs leave the enumeration and no other GPU ever leave, and its last sample is
+    all 8 GPUs again; the kernel journal holds at most one kernel reset line per target BDF;
+  - `RESTART_WORKLOAD` executed exactly once, starting no earlier than `RESTORE_SCHEDULING` finished, with source/target GPU counts of
+    16; restart budget `budget=1`, `restart_count=1`; the new attempt's two Pod UIDs differ from the source attempt's, the Pods are on the
+    same two nodes, Running and Ready, carry one new attempt id and do not change for 60 s after the restart; the store knows only the
+    source attempt and this one new attempt of the job;
+  - The fault node's `boot_id` is unchanged, no quiesce state or fail-safe timer is left, and every baseline-active service is active
+    again; both nodes are Ready, schedulable, without gpu-fault taint or ownership annotation;
+  - The second node's `boot_id` is unchanged, its Node Agent ledger gained no row, it has no quiesce state, and its GPU inventory and
+    Fabric Manager are unchanged; every other GPU node of the cluster keeps its `unschedulable` and taints;
+  - No provider mutation in CloudTrail; no Kubernetes workload write in the control-plane logs; the control-plane EKS comparison is
+    IDENTICAL.
+- Cleanup (`finally`): delete the test job once the workflow and the remote commands are quiet; a node still isolated is released only
+  through the validated-restore workflow; the sampler is stopped and the fault node's two probes deleted only after the fault node answers
+  again; delete the second node's probe and the prewarm Pods; recheck the runtime identity. Any cleanup failure is FAIL; a fault node that
+  never answers again is not exec'd, and the sampler unit and the probe resources there are left for the operator to reconcile -- **no
+  manual taint deletion**.
+- The other timing (a second fault arriving after the reset already ran) is not driven by this case; the product's shapes are recorded:
+  - The job's join has not started: the issued `RESET_GPU` is not rewritten, the record grows into a DAG with a
+    `branch:<node>:successor:1` node successor branch (event `BRANCH_SUCCESSOR_QUEUED`) that, after the first branch's
+    `RESTORE_SCHEDULING`, cordons, quiesces, verifies, resets only the second card, restores, validates and restores scheduling again;
+    `RESTART_WORKLOAD` depends on both branches' `RESTORE_SCHEDULING`, and the job still restarts once;
+  - The join has started: a successor workflow whose `predecessor_workflow_id` names the original one, with its own `STOP_WORKLOADS`
+    and `RESTART_WORKLOAD`, so the job is stopped and restarted a second time (with a restart budget of 1 that restart is held to the
+    budget);
+  - Both shapes are pinned by `tests/orchestration/test_same_node_job_reset_merge.py`, and this case's verdicts judge the first as not
+    this case's shape (two `RESET_GPU`). Why it is not driven: inside the fault node's quiesce window `gpu-fault-host-collector` (and on
+    HyperPod kubelet) is stopped, so neither a probe exec nor the node's own kernel collector can deliver a kmsg XID after the reset claim
+    and before the restore; it needs a detached trigger armed before the injection that reads the reset claim in the quiesce state and
+    writes the kmsg line from the host itself when it appears (authorized like DESTR-016's holder pre-authorization), which the harness
+    does not have.
+- Known limitations:
+  - When the second fault arrives after `QUIESCE_GPU_SERVICES` ran and before `RESET_GPU` is issued, the control plane still widens
+    VERIFY/RESET/RESTORE to both cards, but the quiesce that ran released persistence and swept device holders for the first card only, so
+    a process holding the second card's device node (`nvidia-persistenced`, for one) makes the widened VERIFY fail; this case's concurrent
+    injection makes both events arrive before the first step and does not cover that timing.
+
 ## 13. NOTIFY: Mail notifications
 
 ### GF-REGIONAL-NOTIFY-001
@@ -16045,7 +16184,7 @@ conclusions of the layers above are not trustworthy:
 | 10 Capacity | `CAP-001` → ... → `CAP-005` | no | |
 | 11 Network outage and late submission | `NET-001` → ... → `NET-008` | recommended | `NET-007` uses the reviewed runner; network recovery and the independent watchdog must be verified; `NET-008` stops the kernel collector for a few seconds |
 | 12 Non-destructive HA | `HA-001` → `HA-002` → `HA-005` → `HA-006` → ... → `HA-011` | recommended | `005` covers rolling, `009` covers zero-rollout credential rotation; `010` has `001` as predecessor, `011` has `010` as predecessor |
-| 13 Destructive capability acceptance (incl. non-destructive fail-closed negative cases) | `DESTR-005` → `006` → `007` → `010` → `001` → `BLAST-001` → `DESTR-002` → `009` → `012(B→A→D→C)` → `015` → `016` → `017` → `018` → `019` → `020` → `021` → `023` → `024` → `025` | **yes** | BLAST-001 read-only reuses DESTR-001; DESTR-002 still has DESTR-001 as evidence predecessor; the remaining exact dependencies are in the YAML |
+| 13 Destructive capability acceptance (incl. non-destructive fail-closed negative cases) | `DESTR-005` → `006` → `007` → `010` → `001` → `BLAST-001` → `DESTR-002` → `009` → `012(B→A→D→C)` → `015` → `016` → `017` → `018` → `019` → `020` → `021` → `023` → `024` → `025` → `026` | **yes** | BLAST-001 read-only reuses DESTR-001; DESTR-002 still has DESTR-001 as evidence predecessor; DESTR-026 has DESTR-015 as evidence predecessor; the remaining exact dependencies are in the YAML |
 | 14 Warm spare | `DESTR-003` → `DESTR-008` → `DESTR-022` → `DESTR-014` | **yes** | `DESTR-022` uses the spare still declared by `003/008`, with `008` as evidence predecessor; `DESTR-014` declares no spare and must precede `DESTR-013` |
 | 15 Failover and constraint disproof | `HA-003` → `HA-004` → `DESTR-013` | graded | `DESTR-013` must be last |
 | 16 Multiple physical clusters | `ISO-006` → `E2E-002` → `ISO-007` | yes | needs a second physical cluster; includes network outage and real job restart, BLOCKED when preconditions are insufficient |

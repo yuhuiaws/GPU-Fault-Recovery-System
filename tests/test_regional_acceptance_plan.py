@@ -72,8 +72,8 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
         "GF-REGIONAL-PREEMPT-023",
         "GF-REGIONAL-PREEMPT-034",
     )
-    assert len(plan.execution_order) == 192
-    assert len(plan.cases) == 201
+    assert len(plan.execution_order) == 193
+    assert len(plan.cases) == 202
     assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-016", "GF-REGIONAL-BOOT-011")
     assert plan.execution_order[-1] == "GF-REGIONAL-BOOT-032"
     assert plan.do_not_run_case_ids == retired

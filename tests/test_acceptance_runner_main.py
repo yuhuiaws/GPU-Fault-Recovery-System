@@ -65,6 +65,7 @@ STANDARD_RUNNERS = (
     "run_destr016_preempting_reboot",
     "run_destr017_out_of_band_reboot_fence",
     "run_destr018_lifetime_deadline",
+    "run_destr026_same_node_two_gpu_reset",
     "run_e2e002_multicluster_fault",
     "run_ha003_aurora_failover_reset",
     "run_ha004_waiting_reclaim_reset",

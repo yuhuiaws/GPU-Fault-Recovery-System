@@ -508,6 +508,34 @@ rules:
       - GF-REGIONAL-DESTR-014
     counts_as_domain: false
 
+  - id: same-node-multi-gpu-reset
+    description: >-
+      Two GPUs of one node in one window (GF-REGIONAL-DESTR-026): the
+      attempt-scoped merge that widens a job's reset to both GPUs, the Node
+      Agent's one-window reset loop with its shared display-stack release, and
+      the case's runner and verdicts.
+    paths:
+      - src/gpu_fault/orchestration/families/grouped_faults.py
+      - src/gpu_fault/orchestration/workflow_merge.py
+      - src/gpu_fault/orchestration/disposition.py
+      - src/gpu_fault/orchestration/dag_branching.py
+      - src/gpu_fault/orchestration/coordinator.py
+      - src/gpu_fault/node_agent/operations/reset.py
+      - src/gpu_fault/node_agent/operations/holders.py
+      - scripts/e2e/regional/run_destr026_same_node_two_gpu_reset.py
+      - scripts/e2e/regional/destr026_verdicts.py
+      - tests/regional/test_destr026_same_node_two_gpu_reset.py
+      - tests/orchestration/test_same_node_job_reset_merge.py
+      - tests/node_agent/test_reset_two_gpus_one_window.py
+    pytest:
+      - tests/regional/test_destr026_same_node_two_gpu_reset.py
+      - tests/orchestration/test_same_node_job_reset_merge.py
+      - tests/orchestration/test_merge.py
+      - tests/node_agent/test_reset_two_gpus_one_window.py
+    regional_cases:
+      - GF-REGIONAL-DESTR-026
+    counts_as_domain: false
+
   - id: store-processor
     description: Store implementations, Processor queues, concurrency, and counters.
     paths:

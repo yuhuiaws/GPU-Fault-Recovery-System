@@ -30,6 +30,22 @@ NODE_ACTION_OPERATIONS = {
     "RESTORE_GPU_SERVICES",
     "VALIDATE_GPU",
 }
+#: The result keys a ledger row carries as ``evidence`` (``ledger_evidence``).
+LEDGER_EVIDENCE_KEYS = {
+    "RESET_GPU": (
+        "reset_gpu_uuids",
+        "reset_attempts",
+        "reset_successes",
+        "physical_calls",
+        "released_kernel_modules",
+        "reloaded_kernel_modules",
+        "display_stack_restored",
+    ),
+    "QUIESCE_GPU_SERVICES": ("active_services", "kept_services"),
+    "RESTORE_GPU_SERVICES": ("restored_services", "kept_services"),
+}
+LEDGER_CALL_FIELDS = ("command", "attempt", "outcome")
+LEDGER_EVIDENCE_LIMIT = 32
 ALLOWED_XIDS = {46, 48, 62, 63, 79, 109}
 SERVICE_UNITS = (
     "kubelet.service",
@@ -203,23 +219,61 @@ def ledger_rows() -> list[dict[str, Any]]:
         ).fetchall()
     finally:
         connection.close()
-    return [
-        {
-            "command_id": row[0],
-            "completed_at": row[1],
-            "attempt": row[2],
-            "state": row[3],
-            "operation": row[4],
-            "started_at": row[5],
-            "incident_id": row[6],
-            "workflow_request_id": row[7],
-            "fencing_token": row[8],
-            "agent_generation": row[9],
-            "gpu_uuids": json.loads(row[10]) if row[10] else [],
-            "error": (json.loads(row[11]) or {}).get("error"),
-        }
-        for row in rows
-    ]
+    result = []
+    for row in rows:
+        payload = json.loads(row[11]) or {}
+        evidence = ledger_evidence(str(row[4]), payload)
+        result.append(
+            {
+                "command_id": row[0],
+                "completed_at": row[1],
+                "attempt": row[2],
+                "state": row[3],
+                "operation": row[4],
+                "started_at": row[5],
+                "incident_id": row[6],
+                "workflow_request_id": row[7],
+                "fencing_token": row[8],
+                "agent_generation": row[9],
+                "gpu_uuids": json.loads(row[10]) if row[10] else [],
+                "error": payload.get("error") if isinstance(payload, dict) else None,
+                **({"evidence": evidence} if evidence else {}),
+            }
+        )
+    return result
+
+
+def ledger_evidence(operation: str, payload: Any) -> dict[str, Any]:
+    """What one row's own result says about its window, bounded.
+
+    A reset's per-GPU calls and display-stack release, the services a quiesce
+    stopped or kept and a restore started again: the node's account of a
+    multi-GPU window (GF-REGIONAL-DESTR-026). Physical calls keep only
+    command, attempt and outcome; kept services only their names.
+    """
+
+    details = payload.get("details") if isinstance(payload, dict) else None
+    if not isinstance(details, dict):
+        return {}
+    evidence: dict[str, Any] = {}
+    for key in LEDGER_EVIDENCE_KEYS.get(operation, ()):
+        if key not in details:
+            continue
+        value = details[key]
+        if isinstance(value, list):
+            value = value[:LEDGER_EVIDENCE_LIMIT]
+            if key == "physical_calls":
+                value = [
+                    {name: call[name] for name in LEDGER_CALL_FIELDS if name in call}
+                    for call in value
+                    if isinstance(call, dict)
+                ]
+            elif key == "kept_services":
+                value = [
+                    item.get("service") for item in value if isinstance(item, dict)
+                ]
+        evidence[key] = value
+    return evidence
 
 
 def gpu_fault_timers() -> list[str]:

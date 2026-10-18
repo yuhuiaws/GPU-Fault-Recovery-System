@@ -4894,6 +4894,44 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-025
   related_pytest: tests/regional/test_destr025_verdicts.py::test_in_record_reboot_without_successor_is_the_pass_shape
+- id: GF-REGIONAL-DESTR-026
+  title: 同一节点两张 GPU 同窗故障：一个 quiesce 窗口内依次 reset 两张卡，训练作业只重启一次
+  category: regional-destructive-acceptance
+  level: staging
+  risk: destructive
+  problem: >-
+    同一节点的两张 GPU 先后报出同级故障是常见形态：第二个故障若另开工作流，节点会被 quiesce 两次、
+    作业被停止并重启两次；合并时若只扩大 incident 而不扩大步骤，工作流会只 reset 一张卡，
+    却把两张卡都验证后放回调度。产品在 RESET_GPU 命令下发之前把同节点同级故障合并为一条工作流，
+    把 QUIESCE/VERIFY/RESET/RESTORE 扩到两张卡（parameters.gpu_uuids_by_node），Node Agent 在同一窗口内
+    依次 reset。这只有单元与 integration 证据；节点运行受管作业时走作业 attempt 合并路径，此前没有任何真机用例：
+    DESTR-001 只 reset 一张卡，DESTR-015 是两台节点各一张，DESTR-016 的第二条同级 XID 被吸收后随即被抢占。
+  injection: >-
+    对 Master 固定到故障节点、Worker 固定到第二台节点的两副本 16-GPU PyTorchJob，在故障节点上用两个宿主探针
+    同时向 /dev/kmsg 各写一条 XID 46：两个 marker、两个 drill id、两张不同 GPU 的 PCI 地址（默认取宿主枚举的前两张），
+    使两条事件都在作业工作流第一步被领取之前到达控制面；注入前在故障节点武装 DESTR-001 的 detached 宿主采样器。
+    不改任何 executor 或控制面环境变量，不声明 warm spare，不触发任何 provider 动作。
+  expected:
+  - 两条事件均为 kmsg 的 XID 46、各自对应被写入的那张 GPU、策略均为 RESET_GPU，落在同一个 incident 与同一个 workflow_request_id；两条事件的 observed_at 相差小于聚合窗口
+  - incident.gpu_uuids 恰为两张故障 GPU、node_ids 只有故障节点；工作流为线性的作业 reset 计划，FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、STOP_WORKLOADS、QUIESCE_GPU_SERVICES、VERIFY_NO_GPU_CLIENTS、RESET_GPU、RESTORE_GPU_SERVICES、VALIDATE_GPU、RESTORE_SCHEDULING、RESTART_WORKLOAD 各恰一次且全部 SUCCEEDED，workflow SUCCEEDED、incident RECOVERED
+  - QUIESCE_GPU_SERVICES、VERIFY_NO_GPU_CLIENTS、RESET_GPU、RESTORE_GPU_SERVICES 的 gpu_uuids 恰为两张卡，parameters.gpu_uuids_by_node 只有故障节点一项且恰为这两张卡；VALIDATE_GPU 同样覆盖两张卡并 SUCCEEDED（每张卡各自有 reset 之后的新鲜样本）
+  - 除作业级 STOP_WORKLOADS 与 RESTART_WORKLOAD（node_ids 恰为作业的两台节点）外，没有步骤作用于故障节点以外的节点；不出现 RESTART_NODE、REPLACE_NODE、RESET_ALL_GPUS_NVSWITCHES、QUARANTINE、ESCALATE_SUPPORT，无 superseded 步骤、无分支升级
+  - 故障节点 Node Agent ledger 为本工作流新增恰一条成功的 QUIESCE_GPU_SERVICES、一条 attempt=1 且 gpu_uuids 为两张卡的成功 RESET_GPU、一条成功的 RESTORE_GPU_SERVICES，reset 的开始与结束都落在这一个 quiesce 窗口内；无 RESET_ALL 行、无重复 command_id、无其他工作流的新行
+  - RESET_GPU 结果由控制面 node_results 与节点 ledger 行各读一次且 physical_calls 一致：reset_gpu_uuids 恰为两张卡、reset_successes=2；每张卡最后一次 nvidia-smi --gpu-reset 为 reset 且只成功一次，busy 只能在其之前；两张卡的调用不交错、按命令顺序先后执行；不 reset 其他 GPU
+  - display 模块至多释放一次、至多装回一次：physical_calls 中每个 rmmod 模块至多出现一次，released_kernel_modules 与 reloaded_kernel_modules 不重复
+  - 节点运行 Fabric Manager 时窗口保留它：QUIESCE 的 kept_services 含 nvidia-fabricmanager 而 stopped_services 不含，RESTORE 的 restored_services 不含，节点 ledger 的 quiesce 行同样记为 kept，宿主上该 unit 的 MainPID 与 InvocationID 前后不变
+  - detached 宿主采样器看到两张目标 GPU 各自离开过枚举、从未有其他 GPU 离开，最终样本恢复为全部 8 张；kernel journal 中每个目标 BDF 的 reset 行至多一条
+  - RESTART_WORKLOAD 恰执行一次且开始不早于 RESTORE_SCHEDULING 完成，source/target GPU 数均为 16；restart budget 为 budget=1、restart_count=1；新 attempt 的两个 Pod UID 与源 attempt 不同、仍在同两台节点、Running 且 Ready、携带同一个新 attempt id，重启后 60 s 内不再变化；Store 中该作业只有源 attempt 与这一个新 attempt
+  - 故障节点 boot_id 不变，quiesce state 与 fail-safe timer 无残留，基线 active 的服务回到 active；两台节点 Ready、schedulable、无 gpu-fault taint 与 ownership 注解
+  - 第二台节点 boot_id 不变、Node Agent ledger 无新增行、无 quiesce state、GPU inventory 与 Fabric Manager 不变；集群其他 GPU 节点的 unschedulable 与 taint 前后不变
+  - CloudTrail 中无 provider 变更；控制面日志无 Kubernetes workload 写操作；控制面 EKS 比对结果为 IDENTICAL
+  - reset 已执行之后才到达的第二个故障不由本用例驱动：作业 join 未开始时产品追加节点后继分支（BRANCH_SUCCESSOR_QUEUED，已下发的 RESET_GPU 不改写，join 依赖两条分支的 RESTORE_SCHEDULING，作业仍只重启一次）；join 已开始时另开后继工作流并再停止、再重启作业一次；两种形状由单元测试固定
+  - 清理后：测试作业已删除且远端命令静默；采样器已停止，探针 Pod/ConfigMap 与预热 Pod 无残留；故障节点重新应答之前不被 exec；若节点仍隔离，只允许经 validated restore 工作流解除
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-026
+  related_pytest: tests/regional/test_destr026_same_node_two_gpu_reset.py::test_the_single_window_two_gpu_reset_is_the_pass_shape
 - id: GF-REGIONAL-DESTR-013
   title: 硬约束否证 NodeRecovery 恒为 None 且全程不存在 BatchReplaceClusterNodes
   category: regional-destructive-acceptance

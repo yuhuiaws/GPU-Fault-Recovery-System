@@ -209,7 +209,14 @@ phases:
       - case: GF-REGIONAL-DESTR-024
       - case: GF-REGIONAL-DESTR-025
         predecessor: GF-REGIONAL-DESTR-002
+      - case: GF-REGIONAL-DESTR-026
+        predecessor: GF-REGIONAL-DESTR-015
     notes:
+      - DESTR-026 以 DESTR-015 PASS 为证据前置（两节点作业的真实 reset 与单次 join 已成立），在两节点训练作业
+        Master 所在节点上同时为两张 GPU 各写入一条 XID 46，证明同节点同级的两个故障在首步之前合并为一个 incident、
+        一条工作流、一个同时覆盖两张 GPU 的 quiesce/reset 窗口，作业只停一次、只重启一次；作业的第二台节点只随作业
+        停止与重启，不 cordon、不 quiesce、不 reset。reset 已执行后才到达的第二个故障另成后继分支或后继工作流，
+        本用例只记录其形状，不驱动。
       - DESTR-025 以 DESTR-002 PASS 为证据前置，在单节点 RESET_GPU 工作流上用设备持有者制造已知的 reset 失败，
         证明线性单节点记录在同一记录内升级为一次真实 RESTART_NODE 并 SUCCEEDED，不产生 workflow-reboot-after 后继；
         不禁用 Agent、不开托管恢复窗口、不声明 spare。

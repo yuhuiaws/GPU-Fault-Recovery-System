@@ -346,10 +346,11 @@ def spread_errors(
 def host_errors(
     hosts: dict[str, dict[str, dict[str, Any]]],
     *,
-    nodes: tuple[str, str],
+    nodes: tuple[str, ...],
     expected_gpu_count: int,
 ) -> list[str]:
-    """``hosts[node] = {"before": snapshot, "after": snapshot}`` per node."""
+    """``hosts[node] = {"before": snapshot, "after": snapshot}`` per node; any
+    number of nodes (DESTR-026 grades its one reset node with it)."""
 
     errors: list[str] = []
     for node in nodes:

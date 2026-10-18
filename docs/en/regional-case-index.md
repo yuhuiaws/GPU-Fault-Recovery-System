@@ -13,13 +13,13 @@ in what order**. There are only two sources of truth:
 Case bodies are in [`regional-e2e-acceptance-test-cases.md`](regional-e2e-acceptance-test-cases.md); the "Body" column jumps straight to that case's section. Execution verdicts and site identifiers from real environments are kept in a non-public internal evidence store and do not enter this index.
 Regenerate: `python3 scripts/build-regional-case-index.py`.
 
-**198** cases in total: 189 executed by phase, 9 `DO_NOT_RUN`.
+**202** cases in total: 193 executed by phase, 9 `DO_NOT_RUN`.
 
 ## Phase Overview
 
 | Phase | Name | Cases | Maintenance window | Prerequisite |
 | --- | --- | --- | --- | --- |
-| 0 | Deployability | 21 | Per case | — |
+| 0 | Deployability | 24 | Per case | — |
 | 1 | Boot configuration guards | 9 | No | — |
 | 2 | Identity boundaries | 14 | Per case | — |
 | 3 | Training workload baseline | 2 | **Yes** | — |
@@ -32,7 +32,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 | 10 | Capacity | 5 | No | — |
 | 11 | Network outage and re-submission | 8 | Recommended | — |
 | 12 | Non-destructive HA | 9 | Recommended | — |
-| 13 | Destructive capability acceptance (including non-destructive fail-closed negative cases) | 19 | **Yes** | — |
+| 13 | Destructive capability acceptance (including non-destructive fail-closed negative cases) | 20 | **Yes** | — |
 | 14 | Warm spare | 4 | **Yes** | — |
 | 15 | Failover and constraint refutation | 3 | Per case | — |
 | 16 | Multiple physical clusters | 3 | **Yes** | At least two enabled physical GPU clusters |
@@ -295,6 +295,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 > **Maintenance window required.**
 
+> - DESTR-026 takes a DESTR-015 PASS as its evidence predecessor (a real reset and a single join of a two-node job are established) and writes one XID 46 for each of two GPUs at the same moment on the node that runs the Master of a two-node training job, proving that two same-level faults of one node merge before the first step into one incident, one workflow and one quiesce/reset window covering both GPUs, and that the job is stopped once and restarted once; the job's second node is only stopped and restarted with the job, never cordoned, quiesced or reset. A second fault that arrives after the reset already ran becomes a successor branch or a successor workflow; the case only records that shape and does not drive it.
 > - DESTR-025 takes a DESTR-002 PASS as its evidence predecessor and uses a device holder to produce a known reset failure on a single-node RESET_GPU workflow, proving that the linear single-node record escalates within the same record to one real RESTART_NODE and SUCCEEDED without producing a workflow-reboot-after successor; it does not disable the Agent, open a managed-recovery window or claim a spare.
 > - After the ordinary DESTR-015 PASS and its cleanup complete, the physical-ownership supplementary acceptance is approved separately and runs in the order unchanged-owner, ownership-drift, late-sibling; it uses an independent, non-nested run-dir and does not overwrite the ordinary case evidence. It is attributed to DESTR-015 as a whole, and PREEMPT-033 only references the same set of mechanism evidence; it must not be inserted into phase-6 or repeat the physical trial under an alias. --ordinary-destr015-evidence explicitly binds the success and cleanup result of the original ordinary case, and --predecessor-evidence still keeps the DESTR-012 predecessor proof.
 > - DESTR-023 takes a DESTR-001 PASS as its evidence predecessor and performs another real GPU reset on a truly idle cluster with no managed job, all observation streams expired and only the watcher coverage heartbeat left, proving the node is not BLOCKED because of UNKNOWN; it changes no control-plane or watcher setting.
@@ -332,6 +333,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 | 157 | `DESTR-023` | Autonomous reset on a truly idle cluster: with no managed job and all observation streams expired, the watcher coverage heartbeat keeps the node IDLE and XID 46 completes the eight-step RESET_GPU without being blocked by UNKNOWN | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-023) |
 | 158 | `DESTR-024` | Fail-closed while the watcher is down: after the coverage heartbeat expires the node is UNKNOWN, XID 46 only isolates and goes BLOCKED with no quiesce and no reset; once the watcher recovers the heartbeat returns and isolation is lifted through validated restore | `live-isolation` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-024) |
 | 159 | `DESTR-025` | After a known single-node RESET_GPU failure, the same workflow record escalates to a real RESTART_NODE and closes out without producing a reboot-after successor | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-025) |
+| 160 | `DESTR-026` | Two GPUs of one node fault in the same window: one quiesce window resets both cards one after the other, and the training job restarts once | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-026) |
 
 ## Phase 14 — Warm spare
 
@@ -344,10 +346,10 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 160 | `DESTR-003` | Warm-spare node replacement uses only customer-provisioned hot-spare GPU nodes | `destructive-warm-spare` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-003) |
-| 161 | `DESTR-008` | An insufficient hot-spare pool fails and alerts, never degrading to provider replace | `destructive-warm-spare` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-008) |
-| 162 | `DESTR-022` | The deployed executor's spare reservation sweep reclaims stale reservations by TTL while the hot spare stays cordoned throughout | `live-node-mutation` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-022) |
-| 163 | `DESTR-014` | Two nodes of the same job repaired: a known failure may escalate, an unknown reboot outcome keeps the manual safeguard and does not restart the job | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-014) |
+| 161 | `DESTR-003` | Warm-spare node replacement uses only customer-provisioned hot-spare GPU nodes | `destructive-warm-spare` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-003) |
+| 162 | `DESTR-008` | An insufficient hot-spare pool fails and alerts, never degrading to provider replace | `destructive-warm-spare` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-008) |
+| 163 | `DESTR-022` | The deployed executor's spare reservation sweep reclaims stale reservations by TTL while the hot spare stays cordoned throughout | `live-node-mutation` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-022) |
+| 164 | `DESTR-014` | Two nodes of the same job repaired: a known failure may escalate, an unknown reboot outcome keeps the manual safeguard and does not restart the job | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-014) |
 
 ## Phase 15 — Failover and constraint refutation
 
@@ -358,9 +360,9 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 164 | `HA-003` | No destructive step executes twice during an Aurora failover | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-003) |
-| 165 | `HA-004` | Two executor replicas re-claiming a WAITING command produce no duplicate physical action | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-004) |
-| 166 | `DESTR-013` | Hard-constraint refutation: NodeRecovery is always None and no BatchReplaceClusterNodes occurs throughout | `non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-013) |
+| 165 | `HA-003` | No destructive step executes twice during an Aurora failover | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-003) |
+| 166 | `HA-004` | Two executor replicas re-claiming a WAITING command produce no duplicate physical action | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-ha-004) |
+| 167 | `DESTR-013` | Hard-constraint refutation: NodeRecovery is always None and no BatchReplaceClusterNodes occurs throughout | `non-destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-destr-013) |
 
 ## Phase 16 — Multiple physical clusters
 
@@ -373,9 +375,9 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 167 | `ISO-006` | One GPU cluster going fully offline does not block other clusters | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-006) |
-| 168 | `E2E-002` | Concurrent faults of the same kind in two clusters do not interfere | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-e2e-002) |
-| 169 | `ISO-007` | Cluster B still completes recovery independently when cluster A's recovery is denied by the budget | `live-workload-restart` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-007) |
+| 168 | `ISO-006` | One GPU cluster going fully offline does not block other clusters | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-006) |
+| 169 | `E2E-002` | Concurrent faults of the same kind in two clusters do not interfere | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-e2e-002) |
+| 170 | `ISO-007` | Cluster B still completes recovery independently when cluster A's recovery is denied by the budget | `live-workload-restart` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-iso-007) |
 
 ## Phase 17 — Collection and decision coverage
 
@@ -390,28 +392,28 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 170 | `COLLECT-001` | Steady-state suppression ratio proving the edge filter really takes effect on real hardware | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-001) |
-| 171 | `COLLECT-002` | An edge-filter abnormal edge must be delivered within one DCGM sampling period, one collection period and the confirmation samples | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-002) |
-| 172 | `COLLECT-003` | EXPECTED_GPU_COUNT and EXPECTED_EFA_DEVICE_COUNT verified on real hardware | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-003) |
-| 173 | `COLLECT-004` | Real-hardware validation of the inventory mismatch debounce threshold | `destructive-provider-reboot` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-004) |
-| 174 | `COLLECT-005` | Collection layer and cursor persistence of the fabric-manager collector | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-005) |
-| 175 | `COLLECT-022` | Post-deploy FM collector recovery from private cursor loss, corruption and log rotation | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-022) |
-| 176 | `COLLECT-006` | Table-driven full coverage of the 95 NVLink5 decode-table rules | `non-destructive` | component | command | — |
-| 177 | `COLLECT-007` | Full coverage of the 172 XID catalog rules times 4 product-family decision layers | `non-destructive` | component | command | — |
-| 178 | `COLLECT-009` | CHECK_MECHANICALS wait and manual confirmation loop runs end to end on real hardware | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-009) |
-| 179 | `COLLECT-010` | UPDATE_SWFW must fail closed when no firmware target version is configured | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-010) |
-| 180 | `COLLECT-011` | SXID SCOPE_DEPENDENT_RESET fails closed in both directions | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-011) |
-| 181 | `COLLECT-012` | XID RESTART_APP switched from API replay to real kmsg injection | `live-kernel-log-injection` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-012) |
-| 182 | `COLLECT-008` | WORKFLOW_XID_48 real dual kmsg injection drives DRAIN_AND_RESET | `destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-008) |
-| 183 | `COLLECT-013` | XID RESET_GPU real kmsg injection that really executes a single-GPU reset | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-013) |
-| 184 | `COLLECT-014` | Dual evidence gate and positive path of the SXID whole-node GPU and NVSwitch reset | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-014) |
-| 185 | `COLLECT-016` | RESTART_APP and RESET_GPU execution segments under real distributed training | `destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-016) |
-| 186 | `COLLECT-021` | Pod dies first, RESTART_APP XID arrives later: the idle verdict is MONITOR_ONLY and the passive path still restarts | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-021) |
-| 187 | `COLLECT-017` | EFA layered recovery and Kubernetes accelerator allocatable | `live-node-mutation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-017) |
-| 188 | `COLLECT-018` | Fault-tier events rejected after a 202 are counted, alerted and land in the node collector status; an unnumbered Xid line becomes an operator-review finding instead of being silently dropped | `live-kernel-log-injection` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-018) |
-| 189 | `COLLECT-019` | When nvidia-smi hangs past the timeout for several rounds, the host collector does not restart, keeps delivering error batches with the circuit-breaker reason, and the control plane reports erroring rather than silent | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-019) |
-| 190 | `COLLECT-020` | Without a configured expected GPU count it is derived from the instance type; one inventory query missing one UUID is a CRITICAL identity finding, diagnosed rather than rebooted, and the marker carries the retirement fields after restore | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-020) |
-| 191 | `COLLECT-015` | SXID ALWAYS_FATAL real whole-node reboot through the provider | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-015) |
+| 171 | `COLLECT-001` | Steady-state suppression ratio proving the edge filter really takes effect on real hardware | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-001) |
+| 172 | `COLLECT-002` | An edge-filter abnormal edge must be delivered within one DCGM sampling period, one collection period and the confirmation samples | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-002) |
+| 173 | `COLLECT-003` | EXPECTED_GPU_COUNT and EXPECTED_EFA_DEVICE_COUNT verified on real hardware | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-003) |
+| 174 | `COLLECT-004` | Real-hardware validation of the inventory mismatch debounce threshold | `destructive-provider-reboot` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-004) |
+| 175 | `COLLECT-005` | Collection layer and cursor persistence of the fabric-manager collector | `non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-005) |
+| 176 | `COLLECT-022` | Post-deploy FM collector recovery from private cursor loss, corruption and log rotation | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-022) |
+| 177 | `COLLECT-006` | Table-driven full coverage of the 95 NVLink5 decode-table rules | `non-destructive` | component | command | — |
+| 178 | `COLLECT-007` | Full coverage of the 172 XID catalog rules times 4 product-family decision layers | `non-destructive` | component | command | — |
+| 179 | `COLLECT-009` | CHECK_MECHANICALS wait and manual confirmation loop runs end to end on real hardware | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-009) |
+| 180 | `COLLECT-010` | UPDATE_SWFW must fail closed when no firmware target version is configured | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-010) |
+| 181 | `COLLECT-011` | SXID SCOPE_DEPENDENT_RESET fails closed in both directions | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-011) |
+| 182 | `COLLECT-012` | XID RESTART_APP switched from API replay to real kmsg injection | `live-kernel-log-injection` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-012) |
+| 183 | `COLLECT-008` | WORKFLOW_XID_48 real dual kmsg injection drives DRAIN_AND_RESET | `destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-008) |
+| 184 | `COLLECT-013` | XID RESET_GPU real kmsg injection that really executes a single-GPU reset | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-013) |
+| 185 | `COLLECT-014` | Dual evidence gate and positive path of the SXID whole-node GPU and NVSwitch reset | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-014) |
+| 186 | `COLLECT-016` | RESTART_APP and RESET_GPU execution segments under real distributed training | `destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-016) |
+| 187 | `COLLECT-021` | Pod dies first, RESTART_APP XID arrives later: the idle verdict is MONITOR_ONLY and the passive path still restarts | `live-workload-restart` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-021) |
+| 188 | `COLLECT-017` | EFA layered recovery and Kubernetes accelerator allocatable | `live-node-mutation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-017) |
+| 189 | `COLLECT-018` | Fault-tier events rejected after a 202 are counted, alerted and land in the node collector status; an unnumbered Xid line becomes an operator-review finding instead of being silently dropped | `live-kernel-log-injection` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-018) |
+| 190 | `COLLECT-019` | When nvidia-smi hangs past the timeout for several rounds, the host collector does not restart, keeps delivering error batches with the circuit-breaker reason, and the control plane reports erroring rather than silent | `live-non-destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-019) |
+| 191 | `COLLECT-020` | Without a configured expected GPU count it is derived from the instance type; one inventory query missing one UUID is a CRITICAL identity finding, diagnosed rather than rebooted, and the marker carries the retirement fields after restore | `live-isolation` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-020) |
+| 192 | `COLLECT-015` | SXID ALWAYS_FATAL real whole-node reboot through the provider | `destructive-provider-reboot` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-collect-015) |
 
 ## Phase 18 — Full uninstall of an isolated site
 
@@ -423,7 +425,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
-| 192 | `BOOT-032` | Full uninstall of an isolated acceptance site, resume after interruption and shared-resource protection | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-032) |
+| 193 | `BOOT-032` | Full uninstall of an isolated acceptance site, resume after interruption and shared-resource protection | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-032) |
 
 ## DO_NOT_RUN (historical ids retained only)
 
