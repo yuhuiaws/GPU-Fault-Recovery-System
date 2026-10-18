@@ -23,15 +23,18 @@ from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import psycopg
 import pytest
-from psycopg import sql
-from psycopg.pq import TransactionStatus
 
 from gpu_fault.admin import store_maintenance_script as script
 from gpu_fault.store.postgres import hot_table_bloat
+
+if TYPE_CHECKING:
+    # psycopg is the optional ``postgres`` extra: it is imported where a case
+    # runs, never at module scope, or the whole suite fails to collect without
+    # it (tests/store/test_store_override_contracts.py).
+    from psycopg.pq import TransactionStatus
 
 PAGE = 8192
 SERVER_VERSION = "PostgreSQL 16.4 on aarch64-unknown-linux-gnu, compiled by gcc"
@@ -158,6 +161,8 @@ class Store:
             raise failure
 
     def answer(self, statement: Any, parameters: Any) -> list[tuple[Any, ...]]:
+        from psycopg import sql
+
         if isinstance(statement, sql.Composable):
             return self.maintain(statement.as_string(None))
         bound = tuple(parameters or ())
@@ -225,19 +230,24 @@ class Cursor:
         return list(self.rows)
 
 
+def transaction_status(name: str) -> TransactionStatus:
+    """psycopg's own ``TransactionStatus`` member, imported when a case runs."""
+
+    from psycopg.pq import TransactionStatus
+
+    return TransactionStatus[name]
+
+
 class Connection:
-    """A psycopg connection as the script uses one."""
+    """A psycopg connection as the script uses one; ``status`` names its
+    ``TransactionStatus`` member."""
 
     def __init__(
-        self,
-        store: Store,
-        *,
-        autocommit: bool = True,
-        status: TransactionStatus = TransactionStatus.IDLE,
+        self, store: Store, *, autocommit: bool = True, status: str = "IDLE"
     ) -> None:
         self.store = store
         self.autocommit = autocommit
-        self.info = SimpleNamespace(transaction_status=status)
+        self.info = SimpleNamespace(transaction_status=transaction_status(status))
         self.cursors: list[Cursor] = []
         self.session: list[str] = []
         self.closed = False
@@ -309,7 +319,7 @@ def install_store(
         opened.append(SimpleNamespace(dsn=dsn, options=options, connection=connection))
         return connection
 
-    monkeypatch.setattr(psycopg, "connect", connect)
+    monkeypatch.setattr("psycopg.connect", connect)
     return opened
 
 
@@ -556,16 +566,14 @@ def test_the_plan_identity_names_tables_actions_and_indexes_not_sizes(
             lambda store: Connection(store, autocommit=False), id="no-autocommit"
         ),
         pytest.param(
-            lambda store: Connection(store, status=TransactionStatus.INTRANS),
-            id="inside-a-transaction",
+            lambda store: Connection(store, status="INTRANS"), id="inside-a-transaction"
         ),
         pytest.param(
-            lambda store: Connection(store, status=TransactionStatus.INERROR),
-            id="failed-transaction",
+            lambda store: Connection(store, status="INERROR"), id="failed-transaction"
         ),
         pytest.param(
             lambda store: SimpleNamespace(
-                info=SimpleNamespace(transaction_status=TransactionStatus.IDLE)
+                info=SimpleNamespace(transaction_status=transaction_status("IDLE"))
             ),
             id="no-autocommit-attribute",
         ),
