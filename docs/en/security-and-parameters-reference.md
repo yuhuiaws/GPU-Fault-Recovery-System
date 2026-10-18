@@ -187,6 +187,15 @@ When the provider has accepted the reboot but the original resume proof is lost,
 Kubernetes reads; return `STOP_REBOOT_AUTHORIZATION_MISSING`, keep the result unknown,
 wait for manual reconciliation, and neither resubmit the reboot nor escalate to replacement.
 This does not constitute atomic mutual exclusion between external ownership writes and provider calls.
+The same receipt binds the release: `RESTORE_SCHEDULING` re-reads the receipt's nodes before releasing them, and a changed UID or
+a boot change no confirmed reboot of this workflow explains refuses the release (`STOP_OWNERSHIP_DRIFT`); the node keeps its
+isolation until it is validated again on the current boot, and a node that cannot be read is no refusal. A containment recheck
+that fails after the STOP's suspend landed is recorded FAILED with the receipt and `workloads_suspended`, never as a
+pre-execution refusal (`node_action_not_started`). A pre-dispatch gate (fleet consistency, maintenance window, generation fence)
+refusing a command an Agent already accepted keeps `outcome_unknown` and the command pointer and must not rewrite it into an
+ordinary failure an escalation may climb from. Proof that a node left the cluster (gone from Kubernetes and from its provider,
+its Agent not alive) may settle that node's unresolved node actions as `settled_by: node_departed`; it settles nothing for a
+step that also names a node whose departure is not proven.
 
 Distributed reset computes the expanded size of the per-node DAG at compile time, sharing the 256-step cap with the executor.
 Exceeding the cap does not truncate the node set, nor is it saved as an executable reset; only evidence collection,

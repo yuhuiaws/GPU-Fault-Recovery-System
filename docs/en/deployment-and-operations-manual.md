@@ -9082,7 +9082,9 @@ needs `--node`, see item 9).
    `gpu-fault-admin submit-remediation --state-dir ... --incident-id <QUARANTINED incident>
    --disposition restore --reference CHG-xxxx [--plan]`. All preconditions are checked before writing, refusing if any fails:
    incident `state=QUARANTINED`; the incident has no PENDING/RUNNING/SAFETY_PENDING
-   workflow; every node is in the cluster; the incident and its last workflow have the same fencing token (otherwise
+   workflow; every node is in the cluster, or proven to have left it (for a node not in `kubectl get nodes` the CLI reads the
+   departure proof from HyperPod `list-cluster-nodes` or EC2, and the Agent in the Pod's inspection must not be alive: such a node
+   is `skip` with `departed: true` in `node_decisions`, neither validated nor released); the incident and its last workflow have the same fencing token (otherwise
    a stale generation); at least one node is still isolated by this incident. Isolation ownership is judged per node and written into the
    `node_decisions` of `--plan`: nodes carrying a `gpu-fault.io/quarantined` taint whose value equals `quarantine_taint_value(<incident>)`,
    or carrying this incident's `gpu-fault.io/incident-id` annotation (taint/cordon removed by hand, annotation
@@ -9104,7 +9106,10 @@ needs `--node`, see item 9).
    but every event GPU must be validated and all validation precedes restoring scheduling. A missing inventory does not authorise dropping UUIDs or treating an empty intersection
    as node health; a wrong scope of an old incident needs checked reconciliation and cannot be rewritten automatically from a missing inventory. When only
    some nodes of the incident are restored (`restore_node_ids` is a proper subset of `node_ids`), the steps do not carry the incident's GPU scope but do full per-node
-   validation: the GPUs named by the incident may be on already restored sibling nodes.
+   validation: the GPUs named by the incident may be on already restored sibling nodes. The restore does not restart a job a
+   STOP suspended: `suspended_workloads`/`warnings` of `--plan` and the result message name each workload the incident's records
+   left suspended and no RESTART_WORKLOAD brought back (`workload <namespace>/<kind>/<name> stays suspended (stopped by workflow
+   <id>): the restore does not restart it; its owner must restart it`), for the job owner to resume (Administrator Operations §9.2).
 9. **`confirm-node-action` (manual confirmation of a node action with unknown outcome)**:
    `gpu-fault-admin submit-remediation --state-dir ... --incident-id <incident>
    --disposition confirm-node-action --node <node_id> --reference CHG-xxxx [--plan]`. Applies when
@@ -9119,11 +9124,15 @@ needs `--node`, see item 9).
    Evidence rules: the record is BLOCKED, has no owner, its lease has expired, has no WAITING step and no open remote command; the node is in the incident's
    node list and that record really has a pending node action on this node. `RESTART_NODE` requires the node Ready, the Agent ACTIVE
    with a heartbeat after the action started, kubelet and the Agent reporting the same boot id which differs from the boot id recorded before the action
-   (`agent_baselines` / `stop_reboot_authorization_v1` / the single-node incident's `source_boot_id`;
-   refused when none exists); other node actions require the Agent's terminal answer (`node_results`) on the remote command, or a later validated restore of the same incident
+   (`agent_baselines` / `stop_reboot_authorization_v1` / the workflow's own STOP receipt carried along its confirmed reboots --
+   the baseline whenever it names the node / the single-node incident's `source_boot_id`; refused when none exists); other node actions require the Agent's terminal answer (`node_results`) on the remote command, or a later validated restore of the same incident
    having completed `VALIDATE_GPU` and `RESTORE_SCHEDULING` on that node and made the incident
    RECOVERED, or -- the same evidence as `RESTART_NODE` -- a reboot of the node since the action (no GPU reset survives a boot;
-   the confirmation's `settled_by` names `terminal_node_result`/`validated_restore`/`reboot_since_action`). Effect: the step's uncertainty flags are set to false, `operator_confirmed` records the evidence verbatim, the step stays FAILED,
+   the confirmation's `settled_by` names `terminal_node_result`/`validated_restore`/`reboot_since_action`). For a node no
+   longer in the cluster the CLI reads its departure proof (HyperPod `list-cluster-nodes` / EC2); gone from Kubernetes and from
+   the provider with its Agent not alive (no record, `REVOKED`, or an expired lease with its last heartbeat more than 10 minutes
+   old), the node's unresolved actions are confirmed `settled_by: node_departed`, and the Pod re-checks the departure proof and
+   the Agent record; a step that also names another node is refused (Administrator Operations §9.4). Effect: the step's uncertainty flags are set to false, `operator_confirmed` records the evidence verbatim, the step stays FAILED,
    and the record stays BLOCKED; afterwards the restore of item 8 makes the incident RECOVERED and produces a verified restore successor,
    and `workflow-reconcile` closes out the record (Administrator Operations §10.2). Idempotent: rerunning for an already confirmed node gives `no_op=true`.
    The evidence file is `<state-dir>/submit-remediation/<incident-id>/confirm-node-action-<time>.json`.

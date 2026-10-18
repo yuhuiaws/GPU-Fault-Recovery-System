@@ -575,13 +575,26 @@ rules:
       - src/gpu_fault/workload_annotate_cli.py
       - src/gpu_fault/completion/**
       - src/gpu_fault/adapters/kubernetes/**
+      # The jobs a STOP suspended and nothing restarted (batch 139, G7): read
+      # by the restore plan, the hand-off email and the cleaned notice.
+      - src/gpu_fault/suspended_workloads.py
       - deploy/dataplane/completion-watcher.yaml
       - tests/completion/**
       - tests/hyperpod/test_training_*.py
+      - tests/regional/test_b138_reimage_reset_and_after.py
+      - tests/execution/test_support_escalation_suspended_jobs.py
     pytest:
       - tests/completion
       - tests/hyperpod/test_training_submit_cli.py
       - tests/hyperpod/test_workload_annotate_cli.py
+      # The STOP receipt's rechecks: before a node action, after the suspend
+      # and before a release (RESTORE_SCHEDULING, batch 139).
+      - tests/regional/test_stop_ownership_reboot_transition.py
+      - tests/regional/test_late_ownership_containment.py
+      - tests/regional/test_late_ownership_dispatch.py
+      - tests/regional/test_b138_reimage_reset_and_after.py
+      - tests/execution/test_support_escalation_suspended_jobs.py
+      - tests/admin/test_remediation_departed_nodes.py
     regional_cases:
       - GF-REGIONAL-WORKLOAD-001..002
       - GF-REGIONAL-CMD-015
@@ -918,8 +931,12 @@ rules:
       - tests/admin/test_admin_warm_spare_departed.py
       - tests/metrics/test_departed_node_cleanup_promql.py
       - tests/admin/test_admin_workflow_reconcile_unknown_identity.py
+      # The departure proof submit-remediation reads (restore, confirm-node-action).
+      - src/gpu_fault/admin/remediation_departures.py
+      - tests/admin/test_remediation_departed_nodes.py
     pytest:
       - tests/departed_nodes
+      - tests/admin/test_remediation_departed_nodes.py
       - tests/execution/test_cluster_executor_node_inventory.py
       - tests/admin/test_admin_config_departed_node_cleanup.py
       - tests/regional/test_departed_node_status.py
@@ -946,6 +963,10 @@ rules:
       - src/gpu_fault/orphaned_commands.py
       - src/gpu_fault/admin/workflow_reconcile.py
       - src/gpu_fault/execution/node_action_confirmation.py
+      - src/gpu_fault/execution/node_action_baseline.py
+      - src/gpu_fault/execution/node_departure_settlement.py
+      - tests/execution/test_node_action_baseline.py
+      - tests/regional/test_b138_reimage_before_reset.py
       - tests/test_workflow_reconcile.py
       - tests/test_workflow_reconcile_operator_exit.py
       - tests/test_workflow_reconcile_non_plan_successor.py
@@ -970,6 +991,10 @@ rules:
       - tests/admin/test_admin_workflow_reconcile_cli.py
       - tests/admin/test_workflow_reconcile_epoch_cas.py
       - tests/admin/test_admin_confirm_node_action.py
+      - tests/admin/test_remediation_departed_nodes.py
+      - tests/execution/test_node_action_baseline.py
+      - tests/regional/test_b138_reimage_before_reset.py
+      - tests/departed_nodes/test_b138_replacement_in_flight.py
       - tests/execution/test_retired_generation.py
       - tests/execution/test_compile_blocked_sweep.py
       - tests/admin/test_node_action_confirmation.py

@@ -1845,7 +1845,12 @@ These two flags are cleared after manual confirmation by the operator: `gpu-faul
 verifies against fleet/Kubernetes evidence (reboot: node Ready, Agent ACTIVE, kubelet and Agent report the same boot id that differs from the pre-action one; other node actions:
 the Agent's terminal answer in the remote command's `node_results`, or the validated restore successor of the same incident has already completed VALIDATE_GPU + RESTORE_SCHEDULING on that node),
 sets `outcome_unknown`/`manual_confirmation_required` to false via compare-and-set, records `operator_confirmed` evidence and a `NODE_ACTION_CONFIRMED` event;
-the step stays FAILED and the record stays BLOCKED. A subsequent `--disposition restore` restores only nodes still isolated by this incident; a BLOCKED record not driven by a plan can be
+the step stays FAILED and the record stays BLOCKED. The pre-action boot baseline is taken first from the workflow's own STOP receipt, carried along its confirmed
+reboots (`execution/node_action_baseline.py`), so a re-image before the STOP no longer reads as "rebooted since the action" against the incident's fault-time
+`source_boot_id`. When the platform takes a node away (a managed node group roll, a Spot reclaim, a HyperPod replacement), the departure proof -- gone from
+Kubernetes and from its provider, the Agent not alive -- itself answers the actions parked on it: `confirm-node-action` for a node no longer in the cluster, the
+evidence close with the departure proof and the departed-node cleanup all confirm them `settled_by: node_departed` (`execution/node_departure_settlement.py`;
+nothing is confirmed for a step that also names a node not proven departed), and the close ends the record SUPERSEDED with it. A subsequent `--disposition restore` restores only nodes still isolated by this incident; a BLOCKED record not driven by a plan can be
 closed by `workflow-reconcile` once it has a verified restore successor (a source recovery plan is no longer required), and the dispatcher's periodic sweep closes the same shape automatically.
 Three details: (1) the only exceptions are the three operations `ESCALATE_SUPPORT` / `FREEZE_EVIDENCE` / `CHECKPOINT_WORKLOADS`
 whose own outcome is unknown: they are still handled as "workflow FAILED, no successor", to avoid opening another support ticket for the same incident; all
@@ -4385,7 +4390,7 @@ See the four layers of mutual exclusion in §6.5. Three additional runtime facts
 The taint is `gpu-fault.io/quarantined = incident-<first 24 hex chars of sha256(incident_id)>`; the value
 carries the incident identity, so "this taint is mine" can be distinguished from "another incident's taint".
 
-The three hard rules of `RESTORE_SCHEDULING`:
+The four hard rules of `RESTORE_SCHEDULING`:
 
 1. **Verify ownership first**: the incident-id and fencing-token in the annotations must both match the current
    incident and workflow, otherwise the whole step fails
@@ -4397,6 +4402,19 @@ The three hard rules of `RESTORE_SCHEDULING`:
 3. **Do all four things in one patch**: clear the taint, restore `unschedulable`, clear the three annotations, and carry
    `resourceVersion` for optimistic concurrency. Splitting into multiple patches produces the intermediate state "taint cleared but cordon remains",
    and nothing in that intermediate state proves who it belongs to.
+4. **Re-read the STOP receipt's nodes before the release**: the annotations prove *who* isolated the node, not that it is
+   still the same machine -- a HyperPod in-place re-image (`UpdateClusterSoftware`) keeps the Node object, the UID, the
+   annotations, the cordon and the taint and replaces only the boot and the root disk (Agent and collectors are gone). When
+   the workflow has its own completed STOP, the regional executor re-reads every node the step releases against the receipt
+   before the adapter runs (`KubernetesStopOwnershipValidator.check_release`): a changed UID, or a changed boot that is not
+   a reboot this workflow submitted and confirmed (`authorized_boot_transition`, the rule the node-action recheck applies),
+   fails the step `STOP_OWNERSHIP_DRIFT` (`ownership_check_boundary=EXECUTOR_PRE_RELEASE`, details `receipt_node` /
+   `observed_node`) and nothing is patched; the node keeps its isolation for the operator's validated restore, which
+   validates it again on the current boot. Only an **observed** drift refuses: no STOP, no usable receipt, a node that
+   cannot be read or was deleted all go on to the patch as before, so a failed API read never strands a compensating
+   release. Residual: VALIDATE_* samples carry no boot label (DCGM batches have no boot id) and the re-read sees the boot
+   kubelet has reported, so a release landing in the seconds a re-image has begun and kubelet has not reported the new boot
+   is not caught (the node is NotReady then and the scheduler's not-ready taint holds new Pods off it).
 
 ### 9.5 Concurrency and Blast Radius
 
@@ -4587,6 +4605,13 @@ before executing:
   may already have restored on its own (reporting `already_restored`), so it must still be allowed to execute.
 - The `agent_generations` in the evidence are compared node by node: if the Agent restarted in the middle of the window (generation changed) →
   `maintenance agent fence failed for <node>`, likewise refused.
+- These two gates and the fleet consistency gate answer before the transport reads the command back. When the step's record
+  shows the Agent **accepted** the command (`node_action_command_id` plus `node_action_accepted_nodes` covering a node of the
+  step, or a record that is unresolved already), the gate's FAILED keeps `outcome_unknown`,
+  `manual_confirmation_required` and the command pointer (`step_execution.keep_accepted_uncertainty`, the rule
+  `step_bounds` applies at a cap): an Agent a re-image took away, or that came back as a new incarnation, may have done the
+  action, so the record parks `BLOCKED/NEEDS_OPERATOR` for `confirm-node-action` and neither the branch ladder nor the
+  whole-workflow escalation climbs to a reboot on a guess. A step whose record shows no acceptance stays a plain FAILED.
 
 In other words, "quiescing services" and "touching hardware" must be tight enough together; otherwise the system would rather fail and start over than act on a machine
 that may already have restored its services on its own. **There is no calendar-style maintenance window such as "02:00–04:00 daily".**
