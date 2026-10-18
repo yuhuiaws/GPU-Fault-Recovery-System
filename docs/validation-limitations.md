@@ -741,3 +741,73 @@ proposal, not implemented. The keep-running policy is verified by unit tests
 with fake systemd runners and the live precondition (with NVLink Inband Fabric
 Manager holds no `/dev/nvidia[0-7]`) on Hopper HGX only; Blackwell NVSwitch
 nodes are covered by the same NVIDIA rule but were not observed live.
+
+HGX B200/B300 (fourth-generation NVSwitches, NVL5; driver product strings
+`NVIDIA B200` and `NVIDIA B300 SXM6 AC`) are graded NVSwitch nodes by the same
+rules as Hopper SXM, but the site has no p6-b200/p6-b300 node and none was
+observed live. The 300 s `fabric_manager_status` window, VALIDATE_GPU's fabric
+and Fabric Manager unit checks, the `nvlink_fabric_state_lost` guard, the
+per-GPU reset window's `fabric_manager=keep` and the display-stack bystander
+rule are all unverified on NVL5: unit tests grade B200/B300 parts (299 s held:
+no finding; 300 s: one node finding) and run VALIDATE_GPU, the state-loss guard
+and the RESTART_FM chain on them, but nothing ran on an NVL5 node. On NVL5 one
+unit, `nvidia-fabricmanager.service`, starts the NVLink Subnet Manager (NVLSM)
+and then Fabric Manager (NVIDIA Fabric Manager user guide, "The Fabric Manager
+Service": "The FM service unit file is also updated to start the NVLSM process
+if applicable. In this case, the FM systemd service status indicates the
+process status for FM and NVLSM, and operations such as systemd start, stop,
+and so on will operate on both processes."), so keeping or stopping the unit
+keeps or stops both.
+
+NVLSM blind spot: the R580 unit's `PIDFile` is Fabric Manager's
+(`/var/run/nvidia-fabricmanager/nv-fabricmanager.pid`; NVLSM's PID is in
+`/var/run/nvidia-fabricmanager/nvlsm.pid`), so systemd tracks only Fabric
+Manager's PID. An NVLSM that died beside a running Fabric Manager does not show
+in the unit's state, and VALIDATE_GPU's unit check cannot see it; DCGM field
+170 or the Fabric Manager log may. No product component checks the NVLSM
+process itself.
+
+The quiesce never signals a process named `nvlsm` or any process of the Fabric
+Manager unit's cgroup, but the display-stack bystander rule excuses Fabric
+Manager itself only (`nv-fabricmanage` holding nothing but the fabric's own
+device nodes). An `nvlsm`, or an NVL5 Fabric Manager, holding any other NVIDIA
+device node is not a display-release bystander: the display stack stays
+loaded, so a per-GPU reset the driver refuses as busy escalates up the ladder
+(fail closed). Which device nodes the NVL5 processes hold was not observed.
+
+Fabric Manager start budget: the Agent waits 780 s for one `systemctl start`
+or `restart` of `nvidia-fabricmanager` (the R580 unit's `TimeoutStartSec=720`
+plus a minute) and RESTORE_GPU_SERVICES/RESTART_FABRIC_MANAGER may wait up to
+1200 s, but the workflow execution budget
+(`GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS`, 1800 s) was not changed. A
+Fabric Manager start near NVIDIA's 720 s (on NVL5 the start script polls up to
+60 s for the InfiniBand device, then starts NVLSM and Fabric Manager) keeps the
+full GPU + NVSwitch reset chain close to that budget. No NVL5 start time was
+measured.
+
+## Solo XID 45 on graded NVSwitch nodes
+
+A solo XID 45 on a graded NVSwitch node (Hopper SXM, HGX B200/B300) is
+observe-only by default: MONITOR_ONLY / NO_ACTION with RESTART_FM kept as the
+official action, an incident recorded RECOVERED, the XID investigatory
+notification, and no workflow, node action or cordon.
+`GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true` on the control plane restores
+the catalog's RESTART_FM, which compiles there to the full GPU + NVSwitch reset
+chain. The default relies on the field-170 grading of the node's latest
+samples: a Hopper or Blackwell NVSwitch node whose exporter reports no field
+170 (the shipped `dcgm-counters.csv` exports 170 and 171) is not graded and
+keeps FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER whatever the switch says: a
+Fabric Manager restart, which loses the fabric state there, in a two-step chain
+that runs no VALIDATE_GPU. Every other ungraded node (A100, PCIe/NVL, GH200,
+GB200/GB300, unknown parts) keeps the Fabric Manager restart as well.
+
+Evidence: NVIDIA GPU Debug Guidelines, GPU Node Triage, section
+"Understanding Xid Messages", row "45 Robust Channel Preemptive Removal",
+docs version 615, page "Last updated on Oct 04, 2026":
+https://docs.nvidia.com/deploy/gpu-debug-guidelines/gpu-node-triage.html#understanding-xid-messages
+"No action, informative only. Indicates channels affected by another failure. On A100, this error could be seen by itself due to unexpected Fabric Manager shutdown when FM is running in the same OS environment as the GPU. Otherwise, this error is safe to ignore as an informational message."
+NVIDIA XID Catalog, docs version 615, page "Last updated on Sep 09, 2026":
+https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html -- code
+45, Investigatory Action
+"Solo: RESTART_FM / Not Solo: IGNORE (follow other Xid)"; the pinned catalog
+data is unchanged, and A100 keeps RESTART_FM.

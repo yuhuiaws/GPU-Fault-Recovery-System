@@ -417,9 +417,16 @@ XID”，collector 启动后的首个值仅建立 baseline；之后从 0 或其�
 `fabric_manager_status_held_seconds`：从本 collector 首次观察到当前值起算的秒数，collector 重启（每次 quiesce/restore
 与 reboot 都会）即从 0 计时，状态稳定后不再发送。状态的任何变化都是投递边沿 `fabric-manager-status-changed`（与
 `xid-changed` 同类）；held 值达到 300 s 窗口即成为 candidate，连续 `GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES` 个样本后以
-`candidate-confirmed` 投递，状态稳定后为 `candidate-recovered`。控制面据此为 Hopper SXM 节点分级一个节点级
-`fabric_manager_status` finding（详细设计 §2.4.1）。只有 DCGM exporter 模式有该信号，`nvidia-smi` 指标模式不报告
-fabric 状态。
+`candidate-confirmed` 投递，状态稳定后为 `candidate-recovered`。控制面据此为受分级的 NVSwitch 节点（Hopper SXM、
+HGX B200/B300）分级一个节点级 `fabric_manager_status` finding（详细设计 §2.4.1；B200/B300 按同一规则分级，未在现网
+观察过）。只有 DCGM exporter 模式有该信号，`nvidia-smi` 指标模式不报告 fabric 状态。
+
+held 计时的前提是 collector 在 Fabric Manager 之后启动：`gpu-fault-metrics-collector.service` 为
+`After=network-online.target nvidia-persistenced.service nvidia-fabricmanager.service`。这只是排序，没有
+`Requires=`/`Wants=`：没有 NVSwitch 的节点没有这个 unit，失败的 Fabric Manager 也不能让 collector 停着。开机时
+collector 在 Fabric Manager 的 start job 结束之后才启动（NVL5 上同一 unit 先启动 NVLSM、再启动 Fabric Manager）。
+该 unit 随节点 bundle 落地（`deploy/node/build-node-installer-bundle.sh` 复制 `deploy/systemd/*.service`，安装器原样
+安装并执行 `systemctl daemon-reload`），下一次开机生效。
 
 温度采集边沿与控制面共用`gpu_temperature_policy.temperature_decision`，包括设备推导
 限制与站点fallback。确认按severity/action语义分别累计，已确认warning不能吞掉

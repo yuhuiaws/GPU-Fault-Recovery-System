@@ -416,8 +416,16 @@ registration, 0 = OK) to `fabric_manager_error_code`. Beside every GPU whose sta
 collector restarts (every quiesce/restore and reboot), and no longer sent once the state settles. Any state change is the delivery edge
 `fabric-manager-status-changed` (like `xid-changed`); a held value at the 300 s window is a candidate delivered after
 `GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES` consecutive samples as `candidate-confirmed`, and `candidate-recovered` once the state settles.
-From it the control plane grades one node-level `fabric_manager_status` finding for a Hopper SXM node (detailed design §2.4.1). Only the
+From it the control plane grades one node-level `fabric_manager_status` finding for a graded NVSwitch node (Hopper SXM, HGX B200/B300;
+detailed design §2.4.1; B200/B300 are graded by the same rules but have not been observed live). Only the
 DCGM exporter mode carries the signal; the `nvidia-smi` metrics mode does not report the fabric state.
+
+The held clock's premise is a collector that starts after Fabric Manager: `gpu-fault-metrics-collector.service` has
+`After=network-online.target nvidia-persistenced.service nvidia-fabricmanager.service`. That is ordering only, with no
+`Requires=`/`Wants=`: a node without NVSwitches has no such unit, and a failed Fabric Manager must not keep the collector down.
+At boot the collector starts once Fabric Manager's start job has finished (on NVL5 the same unit starts NVLSM, then Fabric
+Manager). The unit lands with the node bundle (`deploy/node/build-node-installer-bundle.sh` copies `deploy/systemd/*.service`,
+the installer installs it verbatim and runs `systemctl daemon-reload`) and takes effect at the next boot.
 
 Temperature collection edges share `gpu_temperature_policy.temperature_decision` with the control plane, including device-derived
 limits and the site fallback. Confirmation accumulates separately by severity/action semantics: a confirmed warning cannot swallow

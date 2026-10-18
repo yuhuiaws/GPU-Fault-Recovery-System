@@ -93,12 +93,21 @@ GB300 属于 GB200 列。
 ## 已实现的官方 workflow
 
 - XID 45：先持久化为 `PENDING_CORRELATION`，等待 30 秒窗口闭合；伴随其他 XID
-  时复用最严重伴随 XID 的 incident/workflow，solo 时保留 `RESTART_FM` 并编译为
-  `RESTART_FABRIC_MANAGER`，由 Node Agent 的 `fabricManagerRestart` 能力执行。在最新 DCGM 样本被分级的
-  Hopper NVSwitch 节点上（Hopper SXM 部件报告字段 170），单独重启 Fabric Manager 会丢失 fabric 状态，
-  `RESTART_FM` 在这里改为编译 NVIDIA 对 H100 及之后的流程：在被分级的 GPU 上执行完整 GPU + NVSwitch reset 链
-  （停止并重启 Fabric Manager 的 quiesce 窗口内的 `RESET_ALL_GPUS_NVSWITCHES`，随后 VALIDATE_GPU 与
-  VALIDATE_FABRIC），使用 `fabricReset` 能力。共享
+  时复用最严重伴随 XID 的 incident/workflow，solo 时保留 `RESTART_FM`。未分级的节点——A100
+  （NVIDIA 自己的 solo 情形）、PCIe/NVL 变体、GH200、GB200/GB300、未知部件，以及 exporter 不报告
+  字段 170 的 Hopper/Blackwell 节点——不论下述开关如何，都把它编译为 `RESTART_FABRIC_MANAGER`
+  （`FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER`），由 Node Agent 的 `fabricManagerRestart` 能力执行。
+  在受分级的 NVSwitch 节点（最新 DCGM 样本里 Hopper SXM 或 HGX B200/B300 部件报告字段 170）上，单独重启
+  Fabric Manager 会丢失 fabric 状态，`RESTART_FM` 在那里只能是 NVIDIA 对 H100 及之后的流程，即完整
+  GPU + NVSwitch reset；NVIDIA 的 GPU 排障指南则把这种 solo XID 45 判为信息性（见下文「依据」）。
+  因此这类节点默认**只观测**（`orchestration/xid45_policy.py`）：判定改为 `MONITOR_ONLY` /
+  `NO_ACTION`，`official_action` 仍为 `RESTART_FM`、`investigatory_action` 不变，marker 为 INFO 且
+  不 active；incident 以 RECOVERED 记录并带证据，`policy_reference` 为排障指南的 URL，reasons 写明
+  原因与开关；照常发送 XID 调查通知；不建 workflow、不下发节点动作、不 cordon。控制面环境变量
+  `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true`（与 SXID remediation 列表同一种「catalog 动作的
+  站点变体」机制；默认不设置 = 只观测）恢复 catalog 行为：`RESTART_FM` 在被分级的 GPU 上编译为完整
+  GPU + NVSwitch reset 链（停止并重启 Fabric Manager 的 quiesce 窗口内的 `RESET_ALL_GPUS_NVSWITCHES`，
+  随后 VALIDATE_GPU 与 VALIDATE_FABRIC），使用 `fabricReset` 能力。共享
   Store lease 支持 HA、乱序到达和 Pod 重启。
 - XID 48：solo 执行 `RESET_GPU`；伴随 XID 63/64 时执行
   `DRAIN_AND_RESET`。
@@ -114,6 +123,30 @@ GB300 属于 GB200 列。
 关联原文达到保留期限后重投同一事件，必须复用尚存的最终决策及 incident 绑定。
 原文被清理不代表事件从未处理，不能用未关联的策略缓存结果覆盖最终决策；
 仍处于 `PENDING_CORRELATION` 的记录继续按原窗口修复流程处理。
+
+### 依据（Evidence）：受分级 NVSwitch 节点上 solo XID 45 的只观测默认
+
+两处页面均已对照 NVIDIA 在线页面核实：
+
+- NVIDIA GPU Debug Guidelines — GPU Node Triage，章节「Understanding Xid Messages」，XID 表中的行
+  「45 Robust Channel Preemptive Removal」；docs version 615，页面 "Last updated on Oct 04, 2026"：
+  `https://docs.nvidia.com/deploy/gpu-debug-guidelines/gpu-node-triage.html#understanding-xid-messages`
+  原文（英文，逐字）：
+  "No action, informative only. Indicates channels affected by another failure. On A100, this error could be seen by itself due to unexpected Fabric Manager shutdown when FM is running in the same OS environment as the GPU. Otherwise, this error is safe to ignore as an informational message."
+- NVIDIA XID Catalog，docs version 615，页面 "Last updated on Sep 09, 2026"：
+  `https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html`；spreadsheet
+  `https://docs.nvidia.com/deploy/xid-errors/_downloads/4586dadb59119a55d1e93a181caa4272/Xid-Catalog.xlsx`
+  （sha256 `7f70ce9684be0c9d98a367770341ccc1d8bca4465cebe42dab7e23d57df5d5a5`，与上文固定的 XLSX 逐字节相同）。
+  「Xids」sheet 的 Code 45：Immediate Action `WORKFLOW_XID_45`；Investigatory Action
+  "Solo: RESTART_FM / Not Solo: IGNORE (follow other Xid)"；Trigger：
+  "This event is logged when the user application aborts and the kernel driver tears down the GPU application running on the GPU. Control-C, GPU resets, sigkill are all examples where the application is aborted and this event is created. In many cases, this is not indicative of a bug but rather a user or system action."
+
+结论：NVIDIA 自己的排障指南把 catalog 的「Solo: RESTART_FM」解释为 A100 的情形（Fabric Manager 与 GPU
+在同一 OS 中、意外停止），其余 solo XID 45 判为信息性。默认动作只在 NVIDIA 自己的排障指南判为信息性的
+地方——受分级的 NVSwitch Hopper/Blackwell 节点——偏离 catalog 的 investigatory action；catalog 数据本身
+不变（生成物、摘要与 `mapping_version` 照旧）；A100 保留 `RESTART_FM`（NVIDIA 自己的 solo 情形）。只观测
+incident 的 `policy_reference` 就是上面排障指南的 URL；站点需要 catalog 行为时设置
+`GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true`。
 
 ## SXID
 

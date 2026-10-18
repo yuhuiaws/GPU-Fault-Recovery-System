@@ -95,12 +95,22 @@ GB300 belongs to the GB200 column.
 ## Implemented Official Workflows
 
 - XID 45: first persisted as `PENDING_CORRELATION`, waiting for the 30-second window to close; when accompanied by other XIDs
-  it reuses the incident/workflow of the most severe accompanying XID; when solo it keeps `RESTART_FM` and compiles it to
-  `RESTART_FABRIC_MANAGER`, executed by the Node Agent's `fabricManagerRestart` capability. On a Hopper NVSwitch node whose
-  latest DCGM samples are graded (field 170 on a Hopper SXM part), a Fabric Manager restart alone loses the fabric state, so
-  `RESTART_FM` compiles to NVIDIA's H100-and-later procedure there instead: the full GPU + NVSwitch reset chain
-  (`RESET_ALL_GPUS_NVSWITCHES` inside a quiesce window that stops and restarts Fabric Manager, then VALIDATE_GPU and
-  VALIDATE_FABRIC) on the graded GPUs, under the `fabricReset` capability. The shared
+  it reuses the incident/workflow of the most severe accompanying XID; when solo it keeps `RESTART_FM`. A node that is not
+  graded -- A100 (NVIDIA's own solo case), PCIe/NVL variants, GH200, GB200/GB300, unknown parts, and a Hopper/Blackwell node
+  whose exporter reports no field 170 -- compiles it to `RESTART_FABRIC_MANAGER` (`FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER`)
+  whatever the switch below says, executed by the Node Agent's `fabricManagerRestart` capability. On a graded NVSwitch node
+  (a Hopper SXM or HGX B200/B300 part whose latest DCGM samples report field 170), a Fabric Manager restart alone
+  loses the fabric state, so `RESTART_FM` there can only be NVIDIA's H100-and-later procedure, the full GPU + NVSwitch reset;
+  NVIDIA's GPU debug guidelines, on the other hand, read such a solo XID 45 as informational (see "Evidence" below). Such a
+  node is therefore **observe-only** by default (`orchestration/xid45_policy.py`): the decision becomes `MONITOR_ONLY` /
+  `NO_ACTION`, `official_action` stays `RESTART_FM` and `investigatory_action` is unchanged, the marker is INFO and not
+  active; the incident is recorded RECOVERED with its evidence, its `policy_reference` is the debug-guidelines URL and its
+  reasons say why and name the switch; the XID investigatory notification is sent as usual; no workflow is built, no node
+  action is sent and nothing cordons the node. The control-plane environment variable
+  `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true` (the mechanism the SXID remediation lists already use for site variants of
+  catalog actions; unset by default = observe-only) restores the catalog behaviour: `RESTART_FM` compiles to the full GPU +
+  NVSwitch reset chain on the graded GPUs (`RESET_ALL_GPUS_NVSWITCHES` inside a quiesce window that stops and restarts
+  Fabric Manager, then VALIDATE_GPU and VALIDATE_FABRIC), under the `fabricReset` capability. The shared
   Store lease supports HA, out-of-order arrival and Pod restarts.
 - XID 48: solo executes `RESET_GPU`; when accompanied by XID 63/64 it executes
   `DRAIN_AND_RESET`.
@@ -116,6 +126,31 @@ GB300 belongs to the GB200 column.
 When the correlated raw record reaches its retention limit and the same event is re-delivered, the surviving final decision and incident binding must be reused.
 A purged raw record does not mean the event was never handled; an uncorrelated cached policy result must not overwrite the final decision;
 records still in `PENDING_CORRELATION` continue through the original window repair flow.
+
+### Evidence: the observe-only default for a solo XID 45 on a graded NVSwitch node
+
+Both pages were verified against NVIDIA's live pages:
+
+- NVIDIA GPU Debug Guidelines -- GPU Node Triage, section "Understanding Xid Messages", XID table row
+  "45 Robust Channel Preemptive Removal"; docs version 615, page "Last updated on Oct 04, 2026":
+  `https://docs.nvidia.com/deploy/gpu-debug-guidelines/gpu-node-triage.html#understanding-xid-messages`
+  Verbatim:
+  "No action, informative only. Indicates channels affected by another failure. On A100, this error could be seen by itself due to unexpected Fabric Manager shutdown when FM is running in the same OS environment as the GPU. Otherwise, this error is safe to ignore as an informational message."
+- NVIDIA XID Catalog, docs version 615, page "Last updated on Sep 09, 2026":
+  `https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html`; spreadsheet
+  `https://docs.nvidia.com/deploy/xid-errors/_downloads/4586dadb59119a55d1e93a181caa4272/Xid-Catalog.xlsx`
+  (sha256 `7f70ce9684be0c9d98a367770341ccc1d8bca4465cebe42dab7e23d57df5d5a5`, byte-identical to the XLSX pinned above).
+  "Xids" sheet, Code 45: Immediate Action `WORKFLOW_XID_45`; Investigatory Action
+  "Solo: RESTART_FM / Not Solo: IGNORE (follow other Xid)"; Trigger:
+  "This event is logged when the user application aborts and the kernel driver tears down the GPU application running on the GPU. Control-C, GPU resets, sigkill are all examples where the application is aborted and this event is created. In many cases, this is not indicative of a bug but rather a user or system action."
+
+Conclusion: NVIDIA's own triage guide explains the catalog's "Solo: RESTART_FM" as the A100 case (an unexpected Fabric
+Manager shutdown with Fabric Manager in the GPU's OS) and reads every other solo XID 45 as informational. The default
+departs from the catalog's investigatory action only where NVIDIA's own debug guidance reads the solo event as
+informational -- graded NVSwitch Hopper/Blackwell nodes; the catalog data itself is unchanged (the generated artifact, its
+digests and `mapping_version` stay as they are); A100 keeps `RESTART_FM` (NVIDIA's own solo case). An observe-only
+incident's `policy_reference` is the debug-guidelines URL above; a site that wants the catalog behaviour sets
+`GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true`.
 
 ## SXID
 
