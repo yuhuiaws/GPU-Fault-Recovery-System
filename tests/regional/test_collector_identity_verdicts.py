@@ -410,7 +410,9 @@ def test_full_fabric_negative_accepts_rows_older_than_the_products_window() -> N
         "legacy_max_age_seconds": 600.0,
         "legacy_observed_at": [fresh, (event - timedelta(seconds=1016)).isoformat()],
     }
-    assert destructive.fail_closed_timing_errors(inventory, event_time=event) == []
+    assert destructive.fail_closed_timing_errors(inventory, event_time=event) == [], (
+        "a row older than the legacy window plus margin cannot vouch for the SXID"
+    )
     inventory["legacy_observed_at"] = [
         fresh,
         (event - timedelta(seconds=590)).isoformat(),
@@ -439,7 +441,9 @@ def test_full_fabric_negative_ignores_an_unusable_max_age(value: object) -> None
         "legacy_max_age_seconds": value,
         "legacy_observed_at": [(event - timedelta(seconds=5000)).isoformat()],
     }
-    assert destructive.fail_closed_timing_errors(inventory, event_time=event)
+    assert destructive.fail_closed_timing_errors(inventory, event_time=event), (
+        f"an unusable max age ({value!r}) must keep the newer-only rule"
+    )
 
 
 def test_full_fabric_negative_snapshot_older_than_its_window_is_safe() -> None:
@@ -451,6 +455,10 @@ def test_full_fabric_negative_snapshot_older_than_its_window_is_safe() -> None:
         "legacy_max_age_seconds": 600.0,
         "legacy_observed_at": [],
     }
-    assert destructive.fail_closed_timing_errors(inventory, event_time=event) == []
+    assert destructive.fail_closed_timing_errors(inventory, event_time=event) == [], (
+        "a snapshot older than its window plus margin cannot vouch for the SXID"
+    )
     inventory["observed_at"] = (event - timedelta(seconds=200)).isoformat()
-    assert destructive.fail_closed_timing_errors(inventory, event_time=event)
+    assert destructive.fail_closed_timing_errors(inventory, event_time=event), (
+        "a snapshot inside its window plus margin could still be read as evidence"
+    )

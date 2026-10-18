@@ -55,6 +55,11 @@ from scripts.e2e.regional.collector_inventory_reboot import (  # noqa: E402
     wait_mismatch_finding as wait_mismatch_finding,
 )
 from scripts.e2e.regional import collect015_provider as collect015  # noqa: E402
+from scripts.e2e.regional.collect014_premise import (  # noqa: E402
+    FAIL_CLOSED_SAFETY_MARGIN as FAIL_CLOSED_SAFETY_MARGIN,
+    INGEST_FUTURE_TOLERANCE as INGEST_FUTURE_TOLERANCE,
+    fail_closed_timing_errors as fail_closed_timing_errors,
+)
 from scripts.e2e.regional.collector_reboot_evidence import (  # noqa: E402
     capture_reboot_scope,
 )
@@ -113,13 +118,6 @@ DEFAULT_COLLECT013_XID = 109
 # stored inventory sample can count as evidence for it (see run_collect014).
 # Must stay below GPU_FAULT_FAULT_ACTION_MAX_AGE_SECONDS (900s).
 FAIL_CLOSED_EVENT_AGE = timedelta(minutes=8)
-# Ingest accepts an inventory sample as evidence while
-# event.observed_at - sample.observed_at >= -30s (src/gpu_fault/app/ingest/
-# faults.py, _fresh_gpu_inventory). The back-dated event is only safe when the
-# newest stored sample is newer than event + 30s by a margin ingestion lag
-# cannot eat; 60s is that margin.
-INGEST_FUTURE_TOLERANCE = timedelta(seconds=30)
-FAIL_CLOSED_SAFETY_MARGIN = timedelta(seconds=60)
 FAIL_CLOSED_REASON = "requires fabric_partition and complete node GPU inventory"
 FULL_FABRIC_RESET_ACTIONS = frozenset({"RESET_ALL_GPUS_AND_NVSWITCHES"})
 # `GPU_FAULT_ALLOW_HYPERPOD_REPLACE` unset or any of these spellings is "false".
@@ -925,77 +923,6 @@ def restore_incident(
         reason=reason,
     )
     return restore.wait_workflow_id(str(created["workflow_request_id"]))
-
-
-def _max_age(inventory: dict[str, Any], key: str) -> timedelta | None:
-    value = inventory.get(key)
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value <= 0:
-        return None
-    return timedelta(seconds=float(value))
-
-
-def fail_closed_timing_errors(
-    inventory: dict[str, Any],
-    *,
-    event_time: datetime,
-) -> list[str]:
-    """Both dedicated and legacy inventory must be outside the event window.
-
-    Ingest takes a sample as evidence while ``-30s <= event - sample <= max
-    age`` (``app/ingest/faults.py``: the snapshot's ``gpu_inventory_max_age``,
-    the latest metrics' ``legacy_gpu_metrics_inventory_max_age``). A sample is
-    therefore safe on either side: newer than the event by the future
-    tolerance plus a margin, or older than the max age plus that margin. The
-    second side matters for latest-metric rows a node no longer refreshes --
-    a derived ``fabric_manager_status_held_seconds`` after the fabric trained,
-    an XID field host-mode dcgm-exporter leaves blank -- which used to refuse
-    the case on a healthy node. Without the product's max age (an older probe)
-    only the newer side counts.
-    """
-
-    if type(inventory.get("present")) is not bool:
-        return ["dedicated GPU inventory presence is unknown; SXID is not posted"]
-    legacy = inventory.get("legacy_observed_at")
-    if not isinstance(legacy, list):
-        return ["legacy GPU inventory was not checked; SXID is not posted"]
-    samples = [
-        *(
-            [
-                (
-                    inventory.get("observed_at"),
-                    _max_age(inventory, "snapshot_max_age_seconds"),
-                )
-            ]
-            if inventory["present"]
-            else []
-        ),
-        *((item, _max_age(inventory, "legacy_max_age_seconds")) for item in legacy),
-    ]
-    needed = INGEST_FUTURE_TOLERANCE + FAIL_CLOSED_SAFETY_MARGIN
-    for sample, max_age in samples:
-        try:
-            observed_at = datetime.fromisoformat(str(sample).replace("Z", "+00:00"))
-            if observed_at.tzinfo is None:
-                raise ValueError("inventory timestamp has no timezone")
-            margin = observed_at - event_time
-        except (TypeError, ValueError):
-            return ["stored GPU inventory time is unknown; SXID is not posted"]
-        if margin >= needed:
-            continue
-        if max_age is not None and -margin >= max_age + FAIL_CLOSED_SAFETY_MARGIN:
-            continue
-        older = (
-            f" or {(max_age + FAIL_CLOSED_SAFETY_MARGIN).total_seconds():.0f}s older"
-            if max_age is not None
-            else ""
-        )
-        return [
-            f"stored GPU inventory ({observed_at.isoformat()}) is "
-            f"{margin.total_seconds():.0f}s from the back-dated event; it must be "
-            f"{needed.total_seconds():.0f}s newer{older} for the fail-closed "
-            "premise to hold, so the SXID is not posted"
-        ]
-    return []
 
 
 def run_collect014(
