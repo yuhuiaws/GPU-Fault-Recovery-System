@@ -63,14 +63,17 @@ def server_fixture(mode: str) -> Iterator[tuple[str, list[dict[str, Any]]]]:
                         self.send_header("Transfer-Encoding", "chunked")
                     self.end_headers()
                 if mode in {"headers", "trailers", "chunk-size"}:
+                    # Each mode drips one line that never ends -- a header, a
+                    # chunk size, a trailer -- so the worker blocks inside that
+                    # framing read until the deadline. Whole trailer lines do
+                    # not: CPython 3.12.14+ refuses the 101st trailer ("got
+                    # more than 100 trailers") after about one second.
                     if mode == "trailers":
-                        self.wfile.write(b"0\r\n")
+                        self.wfile.write(b"0\r\nX-Trailer: ")
                     elif mode == "chunk-size":
                         self.wfile.write(b"1;extension=")
                     while not stopped.is_set():
-                        self.wfile.write(
-                            b"X-Trailer: x\r\n" if mode == "trailers" else b"x"
-                        )
+                        self.wfile.write(b"x")
                         self.wfile.flush()
                         stopped.wait(0.01)
                 elif mode.startswith("large"):
