@@ -101,7 +101,9 @@ def fabric_manager_policy(
     starts it. Provider- and product-agnostic on purpose: the persisted plan
     names no GPU product, a node without NVSwitches runs no Fabric Manager to
     keep, every supported NVSwitch type is Hopper or later
-    (``gpu_instance_inventory``), and VERIFY_NO_GPU_CLIENTS still fails closed
+    (``gpu_instance_inventory``: p5/p5e/p5en Hopper, p6-b200/p6-b300 NVL5, whose
+    unit keeps NVLSM running with Fabric Manager), and VERIFY_NO_GPU_CLIENTS
+    still fails closed
     should Fabric Manager ever hold a target GPU's device node.
     """
 

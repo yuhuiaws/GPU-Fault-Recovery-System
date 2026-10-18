@@ -184,8 +184,9 @@ class WorkflowBuilder:
     ) -> list[str]:
         """The node's GPUs when its RESTART_FM is the full GPU + NVSwitch reset.
 
-        On a Hopper NVSwitch node a Fabric Manager restart alone loses the
-        fabric state: NVIDIA's Fabric Manager user guide has the restarted
+        On a graded NVSwitch node (Hopper SXM, HGX B200/B300) a Fabric Manager
+        restart alone loses the fabric state: NVIDIA's Fabric Manager user
+        guide has the restarted
         service need every GPU of the NVLink fabric reset, and its H100-and-later
         procedure is stop the CUDA applications and GPU services, stop Fabric
         Manager, ``nvidia-smi -r``, start Fabric Manager. So the plan becomes the
@@ -481,7 +482,7 @@ class WorkflowBuilder:
                 "sxid": event.sxid,
             }
         if operation is WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES:
-            # A Fabric Manager restart on a Hopper NVSwitch node: the node's own
+            # A Fabric Manager restart on a graded NVSwitch node: the node's own
             # NVSwitch fabric, named the way the SXID ingest names it.
             return {
                 "fabric_partition": event.fabric_partition

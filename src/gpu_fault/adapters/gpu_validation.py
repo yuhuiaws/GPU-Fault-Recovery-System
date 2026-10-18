@@ -683,9 +683,11 @@ class GpuValidationAdapter:
         readiness_after: datetime | None,
         failures: dict[str, list[str]],
     ) -> dict[str, Any] | None:
-        """Every GPU of a Hopper NVSwitch node joined the NVLink fabric, the
-        node's Fabric Manager unit runs, and this workflow did not lose the
-        fabric state (``gpu_fabric_window.fabric_state_loss``).
+        """Every GPU of a graded NVSwitch node (Hopper SXM, HGX B200/B300)
+        joined the NVLink fabric, the node's Fabric Manager unit runs (on NVL5
+        it runs NVLSM too; its state follows Fabric Manager's PID), and this
+        workflow did not lose the fabric state
+        (``gpu_fabric_window.fabric_state_loss``).
 
         Live (round 9, plain EKS, GF-REGIONAL-COLLECT-015): the reboot's boot
         left Fabric Manager failed and every GPU "in progress", and VALIDATE_GPU,

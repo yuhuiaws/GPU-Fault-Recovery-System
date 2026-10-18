@@ -1,4 +1,4 @@
-"""VALIDATE_GPU refuses a Hopper NVSwitch node whose fabric did not train.
+"""VALIDATE_GPU refuses a graded NVSwitch node whose fabric did not train.
 
 Live (round 9, plain EKS, GF-REGIONAL-COLLECT-015): the product's own reboot
 came back with Fabric Manager failed ("not all local fabric manager instances
@@ -8,7 +8,8 @@ node where CUDA could not start. VALIDATE_GPU now reads every GPU's fabric
 state from the fresh post-action samples (DCGM field 170) and the node's Fabric
 Manager unit from the Agent's heartbeat record: training waits, a failed
 registration or a state held past the window fails -- and the existing ladder
-climbs (reset -> reboot -> replacement).
+climbs (reset -> reboot -> replacement). From batch 131 the graded nodes are
+Hopper SXM and HGX B200/B300; on NVL5 the Fabric Manager unit runs NVLSM too.
 """
 
 from __future__ import annotations
@@ -207,9 +208,20 @@ def test_a_failed_registration_fails_without_waiting() -> None:
         (None, "NVIDIA H200"),
         (2, "NVIDIA L40S"),
         (2, "NVIDIA GB200"),
+        (2, "NVIDIA GB300"),
+        (2, "NVIDIA RTX PRO 6000 Blackwell Server Edition"),
         (0, "NVIDIA H200"),
+        (0, "NVIDIA B200"),
     ],
-    ids=["field-not-exported", "no-nvswitch", "multi-node-nvlink", "not-supported"],
+    ids=[
+        "field-not-exported",
+        "no-nvswitch",
+        "multi-node-nvlink",
+        "gb300-nvl72",
+        "blackwell-pcie-workstation",
+        "not-supported",
+        "b200-not-supported",
+    ],
 )
 def test_nothing_graded_is_not_a_failure(fabric, model) -> None:
     adapter, context = _context(
@@ -287,3 +299,27 @@ def test_a_heartbeat_from_inside_the_window_does_not_judge_the_restored_unit() -
     assert outcome.details["node_pending"]["node-a"]["fabric_manager_unit"] == (
         "not_reported_since_action"
     )
+
+
+@pytest.mark.parametrize("model", ["NVIDIA B200", "NVIDIA B300 SXM6 AC"])
+def test_hgx_blackwell_is_validated_like_hopper(model) -> None:
+    """HGX B200/B300: the fabric state and the Fabric Manager unit are judged."""
+
+    adapter, context = _context(fabric=3, unit=RUNNING, model=model)
+    assert adapter.execute(context).status is WorkflowStepStatus.SUCCEEDED
+
+    adapter, context = _context(fabric=2, held=float(WINDOW), model=model)
+    outcome = adapter.execute(context)
+    assert outcome.status is WorkflowStepStatus.FAILED, outcome.details
+    assert outcome.details["node_failures"] == {
+        "node-a": ["nvlink_fabric_not_trained(IN_PROGRESS: 2/2 GPUs)"]
+    }
+
+    adapter, context = _context(
+        fabric=3, model=model, unit={"active": "failed", "enabled": "enabled"}
+    )
+    outcome = adapter.execute(context)
+    assert outcome.status is WorkflowStepStatus.FAILED, outcome.details
+    assert outcome.details["node_failures"]["node-a"] == [
+        "fabric_manager_unit_failed"
+    ], "the NVL5 unit (Fabric Manager and NVLSM) must be active"

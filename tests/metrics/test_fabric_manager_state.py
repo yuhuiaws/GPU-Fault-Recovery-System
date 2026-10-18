@@ -5,7 +5,8 @@ every GPU reported ``DCGM_FI_DEV_FABRIC_MANAGER_STATUS`` 2 (in progress) for
 19.5 h while nothing looked at the field; a healthy peer reports 3. The node is
 graded once, at node level, after a GPU has held an unsettled state for the
 window -- never during boot-time training, never on a GPU with no NVSwitch
-fabric, never on a part whose registration semantics differ.
+fabric, never on a part whose registration semantics differ. The graded parts
+are Hopper SXM and, from batch 131, HGX B200/B300 (NVL5).
 """
 
 from __future__ import annotations
@@ -185,9 +186,12 @@ def test_a_failed_registration_past_the_window_is_graded() -> None:
         "NVIDIA L40S",
         "NVIDIA H100 PCIe",
         "NVIDIA H100 NVL",
+        "NVIDIA H200 NVL",
         "NVIDIA GH200 480GB",
-        "NVIDIA B200",
         "NVIDIA GB200",
+        "NVIDIA GB300",
+        "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+        "NVIDIA B100",
         "NVIDIA A100-SXM4-80GB",
         "",
     ],
@@ -198,16 +202,53 @@ def test_parts_without_a_graded_nvswitch_fabric_never_fire(model) -> None:
     result = service.ingest(_batch("dcgm-1", status=2, held=WINDOW * 10, model=model))
 
     assert _fabric_findings(result) == [], (
-        f"{model or 'an unknown product'} has no Hopper NVSwitch fabric to grade"
+        f"{model or 'an unknown product'} has no graded NVSwitch fabric"
     )
     assert not nvswitch_fabric_product(model), f"{model} is not graded"
 
 
 @pytest.mark.parametrize(
-    "model", ["NVIDIA H100 80GB HBM3", "NVIDIA H200", "NVIDIA H800", "NVIDIA H20"]
+    "model",
+    [
+        "NVIDIA H100 80GB HBM3",
+        "NVIDIA H200",
+        "NVIDIA H800",
+        "NVIDIA H20",
+        "NVIDIA B200",
+        "NVIDIA B300 SXM6 AC",
+    ],
 )
-def test_hopper_sxm_parts_are_graded(model) -> None:
+def test_hopper_sxm_and_hgx_blackwell_parts_are_graded(model) -> None:
     assert nvswitch_fabric_product(model), model
+
+
+@pytest.mark.parametrize("model", ["NVIDIA B200", "NVIDIA B300 SXM6 AC"])
+def test_hgx_blackwell_is_graded_on_the_same_window(model) -> None:
+    """HGX B200/B300 (NVL5): one node finding at 300 s held, none at 299 s."""
+
+    store = build_store()
+    service = GpuMetricsService(store=store)
+
+    inside = service.ingest(
+        _batch("dcgm-1", status=2, held=float(WINDOW - 1), model=model)
+    )
+    assert WINDOW == 300, "the documented window"
+    assert _fabric_findings(inside) == [], "299 s is still boot-time training"
+    assert store.get_gpu_finding_state(KEY) is None, "nothing written inside it"
+
+    past = service.ingest(
+        _batch(
+            "dcgm-2",
+            status=2,
+            held=float(WINDOW),
+            model=model,
+            at=NOW + timedelta(seconds=1),
+        )
+    )
+    (finding,) = _fabric_findings(past)
+    assert finding.affected_gpu_uuids == GPUS, "the whole NVL5 fabric"
+    assert finding.official_action == "RESET_ALL_GPUS_AND_NVSWITCHES"
+    assert "IN_PROGRESS" in finding.reason and "8/8 GPUs" in finding.reason
 
 
 def test_a_settled_report_clears_the_finding_and_a_silent_batch_keeps_it() -> None:
@@ -282,7 +323,15 @@ def test_validation_reading_waits_on_training_and_fails_past_the_window() -> Non
     )
 
     assert fabric_validation(observations(2, WINDOW, "NVIDIA L40S")) == (0, {}, None)
+    assert fabric_validation(observations(2, WINDOW, "NVIDIA GB300")) == (0, {}, None)
     assert fabric_validation([]) == (0, {}, None), "nothing reported, nothing graded"
+
+    _graded, _training, failure = fabric_validation(
+        observations(2, WINDOW, "NVIDIA B300 SXM6 AC")
+    )
+    assert failure == "nvlink_fabric_not_trained(IN_PROGRESS: 8/8 GPUs)", (
+        "HGX B300 is read like Hopper"
+    )
 
 
 def test_validation_pairs_a_held_value_with_its_own_observation() -> None:

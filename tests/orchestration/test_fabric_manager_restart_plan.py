@@ -76,10 +76,11 @@ def _solo_xid45(context: ApplicationContext, **values):
     return incident, workflow
 
 
+@pytest.mark.parametrize("model", ["NVIDIA H200", "NVIDIA B200", "NVIDIA B300 SXM6 AC"])
 def test_a_hopper_nvswitch_node_plans_the_full_gpu_and_nvswitch_reset(
-    context: ApplicationContext,
+    context: ApplicationContext, model: str
 ) -> None:
-    _report(context, "NVIDIA H200", 3.0)
+    _report(context, model, 3.0)
 
     incident, workflow = _solo_xid45(context)
 
@@ -130,16 +131,18 @@ def test_an_active_workload_is_stopped_and_restarted_around_it(
     [
         (None, None),
         ("NVIDIA L40S", 3.0),
-        ("NVIDIA B200", 3.0),
         ("NVIDIA GB200", 3.0),
+        ("NVIDIA GB300", 3.0),
+        ("NVIDIA RTX PRO 6000 Blackwell Server Edition", 3.0),
         ("NVIDIA H100 PCIe", 3.0),
         ("NVIDIA H100 80GB HBM3", 0.0),
     ],
     ids=[
         "no-field-170",
         "no-nvswitch",
-        "blackwell-hgx",
         "nvl72",
+        "gb300-nvl72",
+        "blackwell-workstation",
         "pcie",
         "not-supported-single-gpu",
     ],

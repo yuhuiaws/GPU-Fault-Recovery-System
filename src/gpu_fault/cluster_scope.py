@@ -126,8 +126,9 @@ DCGM_HOSTENGINE_LABEL = "gpu-fault.io/dcgm-hostengine"
 #: finds the engine down, and what every Agent reports in its heartbeat.
 DCGM_HOSTENGINE_UNIT = "nvidia-dcgm"
 #: NVIDIA Fabric Manager's systemd unit: what every Agent reports beside the
-#: engine, and what VALIDATE_GPU requires running on a Hopper NVSwitch node
-#: whose systemd enables it (``gpu_fault.gpu_fabric_manager``).
+#: engine, and what VALIDATE_GPU requires running on a graded NVSwitch node
+#: (Hopper SXM, HGX B200/B300) whose systemd enables it
+#: (``gpu_fault.gpu_fabric_manager``). On NVL5 the unit also runs NVLSM.
 FABRIC_MANAGER_UNIT = "nvidia-fabricmanager"
 #: The cluster's DCGM host engine mode as the node installer, the node
 #: installer reconciler and the Node Agent read it; set on ``eks-managed``

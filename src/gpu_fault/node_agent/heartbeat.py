@@ -45,7 +45,8 @@ def _collector_units() -> list[str]:
     """The units every heartbeat reports: the collectors, the host DCGM
     engine (``DCGM_HOSTENGINE_UNIT``), so ``status`` shows each node's engine
     live, and Fabric Manager (``FABRIC_MANAGER_UNIT``), which VALIDATE_GPU
-    requires running on a Hopper NVSwitch node. The heartbeat's unit map takes
+    requires running on a graded NVSwitch node (Hopper SXM, HGX B200/B300).
+    The heartbeat's unit map takes
     any unit and a control plane keeps the units it knows: an older one drops
     those entries, an older Agent simply has none."""
 

@@ -152,16 +152,20 @@ def _context(
     )
 
 
-def test_a_stopped_fabric_manager_around_a_per_gpu_reset_fails_the_node() -> None:
+@pytest.mark.parametrize("model", ["NVIDIA H200", "NVIDIA B200", "NVIDIA B300 SXM6 AC"])
+def test_a_stopped_fabric_manager_around_a_per_gpu_reset_fails_the_node(model) -> None:
     """The pre-batch-128 Agent's window: quiesce stopped Fabric Manager, one GPU
-    reset, the restore started a new instance."""
+    reset, the restore started a new instance. HGX B200/B300 (batch 131) are
+    judged the same way: their unit stops and starts NVLSM with Fabric
+    Manager."""
 
     adapter, context = _context(
         [
             (Op.QUIESCE_GPU_SERVICES, STOPPED),
             (Op.RESET_GPU, {}),
             (Op.RESTORE_GPU_SERVICES, {"node_results": {"node-a": {}}}),
-        ]
+        ],
+        model=model,
     )
 
     outcome = adapter.execute(context)
@@ -214,10 +218,19 @@ def test_a_window_that_kept_or_re_registered_the_fabric_passes(executions) -> No
     [
         ("NVIDIA L40S", 3),
         ("NVIDIA GB200", 3),
+        ("NVIDIA GB300", 3),
         ("NVIDIA H100 80GB HBM3", 0),
         ("NVIDIA H200", None),
+        ("NVIDIA B200", None),
     ],
-    ids=["no-nvswitch", "multi-node-nvlink", "not-supported", "field-not-exported"],
+    ids=[
+        "no-nvswitch",
+        "multi-node-nvlink",
+        "gb300-nvl72",
+        "not-supported",
+        "field-not-exported",
+        "b200-field-not-exported",
+    ],
 )
 def test_a_node_whose_fabric_is_not_graded_is_not_judged(model, fabric) -> None:
     adapter, context = _context(

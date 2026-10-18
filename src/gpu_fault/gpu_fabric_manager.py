@@ -1,8 +1,10 @@
 """NVLink fabric registration state: DCGM field 170, graded per node.
 
-On a Hopper HGX node (H100/H200/H800/H20 SXM on third-generation NVSwitches)
-every GPU registers with the NVLink fabric that Fabric Manager trains; until a
-GPU's registration completes, CUDA does not start on it (NVIDIA Fabric Manager
+On a graded NVSwitch node -- a Hopper SXM part on third-generation NVSwitches
+(H100/H200/H800/H20 SXM) or an HGX B200/B300 on fourth-generation NVSwitches
+(NVL5; the driver names the parts ``NVIDIA B200`` and ``NVIDIA B300 SXM6 AC``)
+-- every GPU registers with the NVLink fabric that Fabric Manager trains; until
+a GPU's registration completes, CUDA does not start on it (NVIDIA Fabric Manager
 user guide, "Initializing NVSwitch and NVLink"). DCGM reports the registration
 state per GPU as ``DCGM_FI_DEV_FABRIC_MANAGER_STATUS`` (170), a
 ``dcgmFabricManagerStatus_t`` (``dcgm_structs.h``, identical in DCGM 4.4.1 and
@@ -10,20 +12,32 @@ state per GPU as ``DCGM_FI_DEV_FABRIC_MANAGER_STATUS`` (170), a
 ``DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE`` (171), blank -- no exporter sample --
 until it completes.
 
+On NVL5 the same ``nvidia-fabricmanager`` unit also runs the NVLink Subnet
+Manager (NVLSM): "The FM service unit file is also updated to start the NVLSM
+process if applicable. In this case, the FM systemd service status indicates
+the process status for FM and NVLSM, and operations such as systemd start,
+stop, and so on will operate on both processes." (Fabric Manager user guide,
+"The Fabric Manager Service"). Keeping or stopping the unit keeps or stops
+both; the unit tracks Fabric Manager's PID only (``PIDFile``), so an NVLSM that
+died beside a running Fabric Manager does not show in the unit's state.
+
 Live (plain EKS p5en, H200 HGX, driver 580.178.04, DCGM 4.7.0): Fabric Manager
 failed at boot ("failed to configure all the available GPUs or NVSwitches") and
 every GPU stayed at 2 (in progress) for 19.5 h while nothing in the product
-looked at the field. A healthy peer reports 3 / 0.
+looked at the field. A healthy peer reports 3 / 0. HGX B200/B300 are graded by
+the same rules but have not been observed live.
 
 The collector reports, beside each GPU whose state is not settled, how long it
 has held that state (:data:`FABRIC_MANAGER_HELD_SECONDS`, measured from the
 collector's first observation of the value), and the control plane grades one
 node-level finding once any GPU has held an unsettled state for
 :data:`FABRIC_MANAGER_UNSETTLED_WINDOW_SECONDS`. The window is what keeps
-boot-time training (seconds to about a minute, finished before the collectors
-start) and the product's own Fabric Manager stops out: the quiesce stops the
-collector with Fabric Manager, so the clock starts again after every restore
-and every reboot.
+boot-time training (seconds to about a minute) and the product's own Fabric
+Manager stops out: the metrics collector's unit is ordered
+``After=nvidia-fabricmanager.service`` (ordering only, no dependency), so at
+boot its clock starts once Fabric Manager's start has returned, and the quiesce
+stops the collector with Fabric Manager, so the clock starts again after every
+restore and every reboot.
 """
 
 from __future__ import annotations
@@ -49,9 +63,11 @@ FABRIC_MANAGER_ERROR_CODE = "fabric_manager_error_code"
 #: Derived by the collector, never exported by DCGM: seconds the GPU has
 #: reported its current unsettled state. Emitted only while it is unsettled.
 FABRIC_MANAGER_HELD_SECONDS = "fabric_manager_status_held_seconds"
-#: Boot-time training ends within about a minute, and the collectors start
-#: after Fabric Manager; five minutes of an unchanged unsettled state is a
-#: fabric that is not going to train on its own.
+#: Boot-time training ends within about a minute, and the metrics collector
+#: starts after Fabric Manager (``deploy/systemd/gpu-fault-metrics-collector.
+#: service``: ``After=nvidia-fabricmanager.service``, ordering only); five
+#: minutes of an unchanged unsettled state is a fabric that is not going to
+#: train on its own.
 FABRIC_MANAGER_UNSETTLED_WINDOW_SECONDS = 300
 FABRIC_MANAGER_POLICY_SOURCE = "NVIDIA_FABRIC_MANAGER_STATE"
 FABRIC_MANAGER_REFERENCE = (
@@ -90,13 +106,17 @@ UNSETTLED_STATUSES = frozenset(
 #: one whose fabric (and Fabric Manager unit) VALIDATE_GPU judges.
 FABRIC_STATES = UNSETTLED_STATUSES | {FabricManagerStatus.SUCCESS}
 
-#: Hopper SXM parts on third-generation NVSwitch baseboards. PCIe and NVL
-#: (NVLink bridge) variants have no NVSwitch fabric; Grace Hopper (GH200) and
-#: every Blackwell part (B200/B300 with NVLSM, GB200/GB300 NVL72 with the
-#: fabric run from the switch trays) register differently and are deliberately
-#: not graded: NVIDIA documents no bound on a healthy multi-node tray's time
-#: in "in progress".
-_NVSWITCH_FABRIC_PRODUCT = re.compile(r"\bH(?:100|200|800|20)\b", re.IGNORECASE)
+#: The graded NVSwitch nodes: Hopper SXM parts on third-generation NVSwitch
+#: baseboards (H100/H200/H800/H20) and HGX B200/B300 on fourth-generation
+#: NVSwitches (NVL5: the ``nvidia-fabricmanager`` unit runs Fabric Manager and
+#: NVLSM). PCIe and NVL (NVLink bridge) variants have no NVSwitch fabric; Grace
+#: Hopper (GH200), GB200/GB300 NVL72 (the fabric runs from the switch trays, the
+#: compute trays have no local Fabric Manager) and every other or unknown part
+#: (B100, RTX PRO 6000 Blackwell, ...) are deliberately not graded: NVIDIA
+#: documents no bound on a healthy multi-node tray's time in "in progress".
+_NVSWITCH_FABRIC_PRODUCT = re.compile(
+    r"\b(?:H(?:100|200|800|20)|B(?:200|300))\b", re.IGNORECASE
+)
 _NO_NVSWITCH_FABRIC = re.compile(r"\b(?:PCIE|NVL)\b", re.IGNORECASE)
 
 
@@ -203,10 +223,12 @@ def graded_fabric_gpus(
 ) -> list[str]:
     """The GPU UUIDs whose fabric state is graded, sorted; [] for any other node.
 
-    Non-empty exactly for the nodes batch 127 grades: a Hopper SXM part on an
-    NVSwitch baseboard that reports a fabric state (:func:`unsettled_fabric`).
-    Planning reads it from the node's latest samples: a Fabric Manager restart
-    there is NVIDIA's H100-and-later procedure on all of these GPUs.
+    Non-empty exactly for the graded NVSwitch nodes (Hopper SXM, HGX
+    B200/B300) that report a fabric state (:func:`unsettled_fabric`). Planning
+    reads it from the node's latest samples: a Fabric Manager restart there is
+    NVIDIA's H100-and-later procedure on all of these GPUs, and a solo XID 45
+    there is observe-only unless the site opts in
+    (``orchestration/xid45_policy.py``).
     """
 
     graded, _unsettled = unsettled_fabric(observations, product=product)
