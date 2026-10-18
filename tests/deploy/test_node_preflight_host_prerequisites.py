@@ -38,13 +38,14 @@ HYPERPOD_TOOLS = ("curl", "nvidia-smi", "ps", "ss", "strace", "systemctl", "time
 AL2023_TOOLS = ("curl", "nvidia-smi", "ps", "ss", "systemctl", "timeout")
 
 
-def _bundle(path: Path) -> tuple[str, str]:
+def _bundle(path: Path, extra_members: tuple[str, ...] = ()) -> tuple[str, str]:
     wheel = b"fixture-node-runtime-wheel"
     buffer = io.BytesIO()
     with tarfile.open(fileobj=buffer, mode="w:gz") as archive:
         for member in (
             *REQUIRED_MEMBERS,
             "dist/gpu_fault_node_runtime-0.0.0-py3-none-any.whl",
+            *extra_members,
         ):
             data = wheel if member.endswith(".whl") else b"#\n"
             info = tarfile.TarInfo(f"gpu-fault-node-installer-0/{member}")
@@ -113,10 +114,15 @@ def _fake_node(
 
 
 def _run(
-    tmp_path: Path, root: Path, *, provider: str, dcgm_hostengine: str | None = None
+    tmp_path: Path,
+    root: Path,
+    *,
+    provider: str,
+    dcgm_hostengine: str | None = None,
+    extra_members: tuple[str, ...] = (),
 ) -> subprocess.CompletedProcess[str]:
     bundle = tmp_path / "bundle.tar.gz"
-    bundle_sha, wheel_sha = _bundle(bundle)
+    bundle_sha, wheel_sha = _bundle(bundle, extra_members)
     return subprocess.run(
         ["bash", str(PREFLIGHT)],
         env={
@@ -209,6 +215,29 @@ def test_a_complete_node_passes_with_the_unchanged_verdict(
     assert verdict["status"] == "PASSED" and verdict["node_uid"] == "node-uid-1", (
         verdict
     )
+    assert result.stderr == "", "a passing preflight is silent on stderr"
+
+
+def test_a_listing_longer_than_a_pipe_buffer_still_holds_every_member(
+    tmp_path: Path,
+) -> None:
+    """Each required member was matched with ``printf '%s\\n' <listing> | grep -q``
+    under ``pipefail``. grep -q exits at its first match, and the printf still
+    writing the listing then dies of SIGPIPE: a member that is in the bundle was
+    reported missing whenever grep won that race (CI, a loaded runner: "candidate
+    installer bundle is missing /deploy/node/preflight-gpu-fault-node.sh" for this
+    file's own fixture bundle). Behind the required members a listing of about
+    390 KiB -- six pipe buffers -- makes grep win every time; the check reads the
+    listing in the shell and passes."""
+
+    root = _fake_node(tmp_path, HYPERPOD_TOOLS, python312=True)
+    listing = tuple(f"share/fixture/{index:05d}-{'f' * 50}" for index in range(4000))
+
+    result = _run(tmp_path, root, provider="eks-managed", extra_members=listing)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    verdict = json.loads(result.stdout.strip().splitlines()[-1])
+    assert verdict["status"] == "PASSED", verdict
     assert result.stderr == "", "a passing preflight is silent on stderr"
 
 

@@ -54,6 +54,10 @@ observed_artifact_sha256="$(
 [[ "${observed_artifact_sha256}" == "${EXPECTED_ARTIFACT_SHA256}" ]] ||
     die "candidate node-runtime wheel SHA-256 mismatch"
 
+# Matched in the shell, not with `printf ... | grep -q`: grep -q exits at its
+# first match, and under pipefail the printf still writing the rest of the
+# listing dies of SIGPIPE, so a member that is present was reported missing
+# whenever grep won that race (always, once the listing outgrows a pipe buffer).
 for required_member in \
     /deploy/node/install-gpu-fault-collector.sh \
     /deploy/node/runtime-slot.sh \
@@ -64,8 +68,14 @@ for required_member in \
     /deploy/systemd/gpu-fault-kernel-collector.service \
     /deploy/systemd/gpu-fault-metrics-collector.service \
     /requirements/node-runtime.lock; do
-    printf '%s\n' "${bundle_members[@]}" |
-        grep -q "${required_member}$" ||
+    member_found="false"
+    for bundle_member in "${bundle_members[@]}"; do
+        if [[ "${bundle_member}" == *"${required_member}" ]]; then
+            member_found="true"
+            break
+        fi
+    done
+    [[ "${member_found}" == "true" ]] ||
         die "candidate installer bundle is missing ${required_member}"
 done
 
