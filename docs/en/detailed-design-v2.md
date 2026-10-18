@@ -378,7 +378,7 @@ premise is that these processes must never compete with training jobs for resour
 | Unit | ExecStart | Write permission | CPUQuota | MemoryMax | Notes |
 |---|---|---|---:|---:|---|
 | `gpu-fault-kernel-collector` | `gpu-fault-collector kernel` | `StateDirectory=gpu-fault` | 50% | 256M | `ReadOnlyPaths=/dev/kmsg /proc/sys/kernel/random/boot_id` |
-| `gpu-fault-metrics-collector` | `gpu-fault-collector ${GPU_FAULT_METRICS_MODE}` | `ReadWritePaths=/var/lib/gpu-fault` | 100% | 1G | mode is `dcgm` or `nvidia-smi` |
+| `gpu-fault-metrics-collector` | `gpu-fault-collector ${GPU_FAULT_METRICS_MODE}` | `ReadWritePaths=/var/lib/gpu-fault` | 100% | 1G | mode is `dcgm` or `nvidia-smi`; `After=nvidia-persistenced.service nvidia-fabricmanager.service` (ordering only, no Requires/Wants: the fabric state window counts from the collector's first observation, so at boot it starts once Fabric Manager's start job has finished) |
 | `gpu-fault-host-collector` | `gpu-fault-collector host` | `ReadWritePaths=/var/lib/gpu-fault` | 100% | 512M | 15s sampling |
 | `gpu-fault-log-collector` | `gpu-fault-collector logs` | `StateDirectory=gpu-fault` | 100% | 768M | `SupplementaryGroups=systemd-journal` |
 | `gpu-fault-fabric-manager-collector` | `gpu-fault-collector fabric-manager` | `StateDirectory=gpu-fault` | 50% | 256M | `After=nvidia-fabricmanager.service` |
@@ -3413,6 +3413,7 @@ periodic-task lease), so "two replicas each send a mail" and "each finalizes the
 | Action validity | 900s | Expired actions are not executed; when the event boot_id matches the Agent's, only an annotation is recorded, no blocking |
 | after_incident restart wait | Lifetime of the repair workflow (fallback 240s) | Keeps waiting while the repair is still open; on expiry `NODE_REMEDIATION_TIMEOUT` |
 | Per-step wait for reinstall steps | 1900s | `GPU_FAULT_WORKFLOW_INSTALL_STEP_TIMEOUT_SECONDS`, only for `REMEDIATE_DRIVER` / `UPDATE_SOFTWARE_FIRMWARE` / `REMEDIATE_EFA_DRIVER`; on expiry that step fails |
+| Per-step wait for steps that may start Fabric Manager | 1200s (the Agent's 780s start/restart bound for `nvidia-fabricmanager` + 420s for the rest of a restore) | Only for `RESTORE_GPU_SERVICES` / `RESTART_FABRIC_MANAGER`; never below the default step cap, never above the node workflow lifetime (it follows DESTR-018's compressed window); on expiry that step fails |
 | Execution deadline floor for workflows containing reinstall steps | 1900s + 600s (`GPU_FAULT_WORKFLOW_INSTALL_CONTAINMENT_SECONDS`, 0 allowed), not exceeding the lifetime | Raises the execution deadline only on the stamped claim (DAG re-stamps on every claim), leaving the lifetime untouched; the startup check rejects "reinstall ceiling ≤ lifetime < floor", and the error string names the three variables; sites whose active nodes run `STOP_WORKLOADS` first should raise the margin |
 | Agent install subprocess | 1800s | Result unknown, handed to the operator (§3.1 ⑦) |
 | Correlation window | 30s | Forced finalize |
