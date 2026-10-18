@@ -213,15 +213,15 @@ class WorkflowBuilder:
         """The node's GPUs when its RESTART_FM is the full GPU + NVSwitch reset.
 
         On a graded NVSwitch node (Hopper SXM, HGX B200/B300) a Fabric Manager
-        restart alone loses the fabric state: NVIDIA's Fabric Manager user
-        guide has the restarted
-        service need every GPU of the NVLink fabric reset, and its H100-and-later
-        procedure is stop the CUDA applications and GPU services, stop Fabric
-        Manager, ``nvidia-smi -r``, start Fabric Manager. So the plan becomes the
-        fatal-trunk SXID's chain on these GPUs (``catalog_operations``). A node
-        is such a node when its latest samples are graded the way batch 127
-        grades the fabric (``graded_fabric_gpus``); empty -- any other node, or
-        one whose exporter reports no field 170 -- keeps RESTART_FABRIC_MANAGER.
+        restart alone loses the fabric state: NVIDIA's Fabric Manager user guide
+        has the restarted service need every GPU of the NVLink fabric reset, and
+        its H100-and-later procedure is stop the CUDA applications and GPU
+        services, stop Fabric Manager, ``nvidia-smi -r``, start Fabric Manager.
+        So the plan becomes the fatal-trunk SXID's chain on these GPUs
+        (``catalog_operations``). A node is such a node when its latest samples
+        are graded the way batch 127 grades the fabric (``graded_fabric_gpus``);
+        empty -- any other node, or one whose exporter reports no field 170 --
+        keeps RESTART_FABRIC_MANAGER.
         A solo XID 45 reaches the chain only when the site opted in: by default
         it is observe-only there (``xid45_site_policy``).
         """
