@@ -22,6 +22,7 @@ import pytest
 from scripts.e2e.regional import destr019_verdicts as verdicts
 from scripts.e2e.regional import fabric_restart_shape as shapes
 from scripts.e2e.regional import run_destr019_agent_restart_ledger as destr019
+from scripts.e2e.regional import xid45_opt_in
 from tests.regional._cov95_destr_agent import (
     GENERATION,
     INCIDENT,
@@ -32,6 +33,7 @@ from tests.regional._cov95_destr_agent import (
     health,
     journal,
 )
+from tests.regional._cov95_destr_branches import ready_runtime
 from tests.regional._cov95_destr_warm import NOW
 
 GPUS = [f"GPU-{index}" for index in range(8)]
@@ -266,3 +268,90 @@ def test_counters_that_disagree_with_the_ledger_fail_the_graded_run(
 
     assert code == 1, report
     assert "counters" in " ".join(report["errors"]), report["errors"]
+
+
+# --- batch 131: the chain under the XID 45 opt-in window -------------------------
+
+
+def _opt_in_harness(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> AgentHarness:
+    """A graded node whose control plane makes a solo XID 45 observe-only."""
+
+    h = _graded_harness(tmp_path, monkeypatch)
+    h.grading["observe_only_default"] = True
+    h.xid45_switch = {"opted_in": False, "replicas": []}
+    after = ready_runtime()
+    after["deployments"]["cpu"]["gpu-fault-control-worker"].update(
+        generation=3, observed_generation=3
+    )
+    h.identity_after = after
+    return h
+
+
+def test_the_audit_runs_the_chain_inside_the_opt_in_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _opt_in_harness(tmp_path, monkeypatch)
+    preflight = h.plan(tmp_path)
+    assert preflight["errors"] == [], preflight
+    details = destr019.plan_details(h.settings, preflight)
+    assert details["workflow_shape"] == shapes.FABRIC_RESET
+    assert details["xid45_opt_in_window"] is True
+    assert xid45_opt_in.SWITCH in details["mutation"], details["mutation"]
+    assert details["rollback"]["cleanup_closes_the_xid45_opt_in_window"] is True
+
+    code, report = h.execute(tmp_path)
+
+    assert code == 0 and report["errors"] == [], report
+    names = [name for name, _detail in h.calls]
+    assert names.index("xid45.open") < names.index("agent.restart-agent"), (
+        "the window rolls the control-worker before the quiet check and restart"
+    )
+    assert names.index("injector.write-xid45") > names.index("xid45.open")
+    assert h.windows == ["open", "close"], "closed again in the cleanup"
+    assert "runtime_identity" in report["cleanup"], report["cleanup"]
+
+
+def test_a_window_that_was_not_closed_fails_the_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _opt_in_harness(tmp_path, monkeypatch)
+    h.plan(tmp_path)
+    monkeypatch.setattr(
+        destr019.xid45_opt_in,
+        "close_window",
+        lambda _regional, _case_dir: {"state": "OPEN"},
+    )
+    h.identity_after = ready_runtime()
+
+    code, report = h.execute(tmp_path)
+
+    assert code == 1, report
+    errors = " ".join(report["cleanup"]["errors"])
+    assert "opt-in window was not closed again" in errors, errors
+    assert "runtime_identity" in errors, "and the worker's rolls do not add up"
+
+
+def test_a_site_that_opted_in_runs_the_chain_without_a_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _opt_in_harness(tmp_path, monkeypatch)
+    h.xid45_switch = {"opted_in": True, "replicas": []}
+    h.identity_after = None
+    preflight = h.plan(tmp_path)
+
+    assert destr019.plan_details(h.settings, preflight)["xid45_opt_in_window"] is False
+    code, report = h.execute(tmp_path)
+
+    assert code == 0, report
+    assert h.windows == [], "no window, the strict runtime identity check"
+
+
+def test_a_half_rolled_switch_refuses_the_plan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    h = _opt_in_harness(tmp_path, monkeypatch)
+    h.xid45_switch = {"opted_in": None, "replicas": []}
+
+    preflight = h.plan(tmp_path)
+
+    assert any(xid45_opt_in.SWITCH in item for item in preflight["errors"]), preflight

@@ -209,7 +209,9 @@ def test_the_site_switch_restores_the_catalog_fabric_chain(
 
     assert decision.disposition is ActionDisposition.EXECUTABLE, decision
     assert incident is not None and incident.policy_reference is None
-    assert not any(item.startswith("observe-only") for item in incident.reasons)
+    assert not any(item.startswith("observe-only") for item in incident.reasons), (
+        "the opted-in chain carries no observe-only reason"
+    )
     assert workflow is not None, "the catalog's RESTART_FM is compiled"
     assert workflow.official_action == "RESTART_FM"
     assert [step.operation for step in workflow.official_steps] == FABRIC_CHAIN, (
@@ -272,7 +274,9 @@ def test_a_non_solo_xid45_follows_its_companion_unchanged(
     assert finalized.action is RecoveryAction.REBOOT_NODE, finalized
     assert finalized.correlated_event_id == "xid79"
     assert finalized.incident_id == companion["incident_id"]
-    assert not any(item.startswith("observe-only") for item in finalized.reasons)
+    assert not any(item.startswith("observe-only") for item in finalized.reasons), (
+        "a non-solo XID 45 follows its companion untouched"
+    )
 
 
 def test_the_rewrite_is_idempotent_and_guards_a_direct_ingest(

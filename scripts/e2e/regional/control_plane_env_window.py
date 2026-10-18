@@ -65,6 +65,14 @@ never restored) only once the live Deployment proves a deploy already closed
 the window: re-rendered, with no assignment still in effect. The variable
 allow-list is compiled in; it can change nothing else, and it can only *lower*
 a bound, never raise one above the shipped default.
+
+One policy switch rides the same window (batch 131):
+``GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM``, which DESTR-010 and DESTR-019 set
+to ``true`` -- the only value it accepts -- so that a solo XID 45 on a graded
+NVSwitch node runs the catalog's RESTART_FM (the full GPU + NVSwitch reset
+chain) instead of the observe-only default, and which the close removes again.
+It is no timing variable: the lockstep derivation and the timing validator
+leave it alone, and the DESTR-018 set is unchanged.
 """
 
 from __future__ import annotations
@@ -160,7 +168,12 @@ OBSERVED_VARIABLES = (
     "GPU_FAULT_WORKFLOW_POLL_INTERVAL_SECONDS",
     "GPU_FAULT_JOB_WORKFLOW_MAX_LIFETIME_SECONDS",
 )
-SURVEYED_VARIABLES = ALLOWED_VARIABLES + OBSERVED_VARIABLES
+# The policy switches a window may set, each to its only accepted value.
+XID45_SOLO_RESTART_FM_VARIABLE = "GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM"
+POLICY_SWITCHES: dict[str, str] = {XID45_SOLO_RESTART_FM_VARIABLE: "true"}
+# Everything a window may write: the timing set, then the policy switches.
+WINDOW_VARIABLES = ALLOWED_VARIABLES + tuple(POLICY_SWITCHES)
+SURVEYED_VARIABLES = WINDOW_VARIABLES + OBSERVED_VARIABLES
 # A lifetime under a minute cannot contain the containment steps that must run
 # before the deadline; above the shipped default this stops being a compression
 # window and becomes a way to make production workflows outlive their bound.
@@ -197,6 +210,16 @@ def parse_assignments(pairs: list[str]) -> dict[str, str]:
         name, separator, value = pair.partition("=")
         if not separator:
             raise RegionalFixtureError(f"--set must be NAME=VALUE, got {pair!r}")
+        if name in POLICY_SWITCHES:
+            if value != POLICY_SWITCHES[name]:
+                raise RegionalFixtureError(
+                    f"{name} may only be set to {POLICY_SWITCHES[name]!r}, "
+                    f"got {value!r}"
+                )
+            if name in result:
+                raise RegionalFixtureError(f"{name} was set twice")
+            result[name] = value
+            continue
         if name not in ALLOWED_VARIABLES:
             raise RegionalFixtureError(
                 f"{name} is not in the control-plane env window allow-list"
@@ -309,7 +332,11 @@ def assignment_errors(assignments: dict[str, str]) -> list[str]:
     would CrashLoop every worker replica instead of opening a window.
     """
 
-    errors: list[str] = []
+    errors = [
+        f"{name} may only be set to {POLICY_SWITCHES[name]!r}"
+        for name, value in assignments.items()
+        if name in POLICY_SWITCHES and value != POLICY_SWITCHES[name]
+    ]
     lifetime = assignments.get(LIFETIME_VARIABLE)
     timeout = assignments.get(EXECUTION_TIMEOUT_VARIABLE)
     step = assignments.get(STEP_TIMEOUT_VARIABLE)
@@ -431,7 +458,7 @@ def deployment_env(regional: RegionalLiveFixture) -> dict[str, Any]:
             plane=PLANE,
             deployment=DEPLOYMENT,
             container=CONTAINER,
-            variables=ALLOWED_VARIABLES,
+            variables=WINDOW_VARIABLES,
         ),
     }
 
@@ -592,7 +619,7 @@ def open_window(
             )
         )
     if record is not None:
-        require_window_record(record, scope, report["deployment"], ALLOWED_VARIABLES)
+        require_window_record(record, scope, report["deployment"], WINDOW_VARIABLES)
     decision = open_decision(record, report["deployment"], assignments)
     if (
         record is not None
@@ -695,10 +722,10 @@ def close_window(
         # apply keeps env the manifest never listed): restore the recorded
         # baseline exactly as that release would, validating the record
         # against its own scope, and say under which release it closed.
-        require_window_record(record, record["scope"], live, ALLOWED_VARIABLES)
+        require_window_record(record, record["scope"], live, WINDOW_VARIABLES)
         record["closed_under_release"] = scope["identity"]["release_id"]
     else:
-        require_window_record(record, scope, live, ALLOWED_VARIABLES)
+        require_window_record(record, scope, live, WINDOW_VARIABLES)
     baseline = record["baseline"]
     names = record["assignments"]
     restored_already = managed_variables_match(live, baseline, names)
@@ -802,7 +829,8 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser(
         description=(
             "Open or close the control-worker workflow-lifetime env window for "
-            "GF-REGIONAL-DESTR-018. Read-only unless --open or --close is given."
+            "GF-REGIONAL-DESTR-018, or the XID 45 opt-in of DESTR-010/019. "
+            "Read-only unless --open or --close is given."
         )
     )
     value.add_argument("--site-profile", default="")
@@ -827,6 +855,8 @@ def parser() -> argparse.ArgumentParser:
             "NAME=VALUE for --open; the rest of the timing set is derived from "
             f"{LIFETIME_VARIABLE} unless set explicitly. Allowed names: "
             + ", ".join(ALLOWED_VARIABLES)
+            + "; policy switches: "
+            + ", ".join(f"{name}={value}" for name, value in POLICY_SWITCHES.items())
         ),
     )
     mode = value.add_mutually_exclusive_group()

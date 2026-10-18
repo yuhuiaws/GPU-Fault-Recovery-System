@@ -167,6 +167,12 @@ def _isolate(module: Any, monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
                 "recent_xid_events": [],
             },
         )
+        # The control-worker's XID 45 switch (batch 131), read off its replicas.
+        monkeypatch.setattr(
+            module.xid45_opt_in,
+            "switch_survey",
+            lambda _regional: {"opted_in": False, "replicas": []},
+        )
     else:
 
         def predecessor_evidence(path: Path, case_id: str, **identity: Any) -> Any:

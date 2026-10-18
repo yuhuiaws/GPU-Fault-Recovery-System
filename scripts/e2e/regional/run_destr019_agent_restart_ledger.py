@@ -10,9 +10,14 @@ its node action has to leave the ARCH-C3/C4/C5 trail: three structured
 journald lines with the nine identifier fields, one ledger row keyed
 ``(command_id, attempt=1)`` with every audit column, and the health counters
 moving exactly as the ledger did. On a node the product does not grade that
-action is the one Fabric Manager restart; on a graded Hopper NVSwitch node the
-XID 45 runs the full GPU + NVSwitch reset chain and the audit reads its
-RESET_ALL_GPUS_NVSWITCHES (``fabric_restart_shape``). A scratch ledger built
+action is the one Fabric Manager restart; on a graded NVSwitch node (Hopper
+SXM, HGX B200/B300) the XID 45 runs the full GPU + NVSwitch reset chain and the
+audit reads its RESET_ALL_GPUS_NVSWITCHES (``fabric_restart_shape``). Where the
+site's default makes that XID 45 observe-only (batch 131) there is no command
+to audit, so the case opens DESTR-010's XID 45 opt-in window
+(``xid45_opt_in``) before the restart and closes it in its cleanup; the runtime
+identity then allows exactly the window's two control-worker rolls. A scratch
+ledger built
 from the pre-ARCH-C4 schema is migrated in place by the deployed wheel, so the
 upgrade path is proven on the node without touching the real ledger.
 
@@ -42,6 +47,7 @@ if str(ROOT) not in sys.path:
 
 from scripts.e2e.regional import destr019_verdicts as verdicts  # noqa: E402
 from scripts.e2e.regional import fabric_restart_shape as shapes  # noqa: E402
+from scripts.e2e.regional import xid45_opt_in  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
     write_json_atomic,
@@ -170,10 +176,12 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
     tests = focused_tests(case_dir)
     predecessor = predecessor_evidence(settings.predecessor_path, PREDECESSOR_CASE_ID)
     runtime_identity = fixture.runtime_identity()
-    # The control plane's own grading decides which workflow the XID 45 runs.
+    # The control plane's own grading decides which workflow the XID 45 runs,
+    # and the control-worker's switch whether the case must opt in for it.
     grading = fixture.cpu_python(
         shapes.FABRIC_GRADING_PROBE, settings.regional.cluster_id, settings.node
     )
+    switch = xid45_opt_in.switch_survey(fixture)
     probe = _probe(settings, "destr019-preflight", AGENT_PROBE_SCRIPT, case_dir)
     try:
         probe.create()
@@ -191,8 +199,9 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         recent_event=state.get("event"),
         host=host,
         tests_passed=tests["passed"],
-        shape=shapes.shape_of(grading),
+        shape=shapes.node_action_shape(grading),
     )
+    errors.extend(xid45_opt_in.switch_errors(grading, switch))
     errors.extend(verdicts.health_errors(health, label="preflight"))
     errors.extend(runtime_identity_errors(runtime_identity))
     if not predecessor["valid"]:
@@ -211,6 +220,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         "predecessor": predecessor,
         "runtime_identity": runtime_identity,
         "fabric_grading": grading,
+        "xid45_switch": switch,
         "errors": errors,
     }
     write_json_atomic(case_dir / "preflight.json", result)
@@ -221,7 +231,15 @@ def run_shape(preflight: dict[str, Any]) -> tuple[str, list[str]]:
     """The workflow shape the plan recorded and the node's graded GPUs."""
 
     grading = preflight.get("fabric_grading")
-    return shapes.shape_of(grading), shapes.graded_gpus(grading)
+    return shapes.node_action_shape(grading), shapes.graded_gpus(grading)
+
+
+def opt_in_window(preflight: dict[str, Any]) -> bool:
+    """Whether the chain needs the XID 45 opt-in window on this node."""
+
+    return xid45_opt_in.needs_window(
+        preflight.get("fabric_grading"), preflight.get("xid45_switch")
+    )
 
 
 def plan_identity(preflight: dict[str, Any]) -> dict[str, Any]:
@@ -238,6 +256,7 @@ def plan_identity(preflight: dict[str, Any]) -> dict[str, Any]:
         .get("user_version"),
         "workflow_shape": run_shape(preflight)[0],
         "graded_gpus": run_shape(preflight)[1],
+        "xid45_opt_in_window": opt_in_window(preflight),
     }
 
 
@@ -254,17 +273,26 @@ PLAN_MUTATION = {
         "restart gpu-fault-node-agent.service once on an idle node behind a "
         "bounded systemd fail-safe start timer, with no command in flight; "
         "drill the ledger migration on a scratch copy; then write one "
-        "synthetic XID 45 to the real host /dev/kmsg on a Hopper NVSwitch node "
-        "the control plane grades, so the product runs the DESTR-010 full "
-        "GPU + NVSwitch reset chain (cordon, quiesce, one reset of every GPU "
-        "and NVSwitch, restore, validations, scheduling back). No reboot, no "
-        "provider call, no quarantine."
+        "synthetic XID 45 to the real host /dev/kmsg on a graded NVSwitch node "
+        "(Hopper SXM, HGX B200/B300) whose site runs the catalog's RESTART_FM, "
+        "so the product runs the DESTR-010 full GPU + NVSwitch reset chain "
+        "(cordon, quiesce, one reset of every GPU and NVSwitch, restore, "
+        "validations, scheduling back). No reboot, no provider call, no "
+        "quarantine."
     ),
 }
+# The opt-in the chain needs where a solo XID 45 is observe-only by default.
+PLAN_OPT_IN = (
+    "before the Agent restart, open the control-worker env window "
+    "GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true (one control-worker roll) so "
+    "the XID 45 runs the chain instead of the observe-only default; close it "
+    "again in the cleanup (a second roll)"
+)
 
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     shape, _graded = run_shape(preflight)
+    window = opt_in_window(preflight)
     return {
         "risk": (
             "destructive" if shape == shapes.FABRIC_RESET else "live-service-action"
@@ -273,7 +301,12 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "target_node": settings.node,
         "restore_seconds": settings.restore_seconds,
         "workflow_shape": shape,
-        "mutation": PLAN_MUTATION[shape],
+        "xid45_opt_in_window": window,
+        "mutation": (
+            f"{PLAN_OPT_IN}; then {PLAN_MUTATION[shape]}"
+            if window
+            else PLAN_MUTATION[shape]
+        ),
         "preflight_identity": plan_identity(preflight),
         "stop_conditions": [
             f"{PREDECESSOR_CASE_ID} has not passed in formal sequence",
@@ -293,6 +326,14 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "provider mutation appears",
             "cleanup leaves the fail-safe armed, the Agent down, Fabric Manager "
             "inactive or a probe resource behind",
+            *(
+                [
+                    "control-worker replicas disagree on the XID 45 switch",
+                    "the XID 45 opt-in window cannot be opened or closed again",
+                ]
+                if window
+                else []
+            ),
         ],
         "rollback": {
             "fail_safe_start_timer_is_armed_before_the_restart": True,
@@ -305,6 +346,7 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
                 shape == shapes.FABRIC_MANAGER_RESTART
             ),
             "no_provider_action_is_authorized": True,
+            "cleanup_closes_the_xid45_opt_in_window": window,
         },
         "preflight": preflight,
     }
@@ -337,6 +379,7 @@ class _LiveRun:
     baseline_agent: dict[str, Any] = field(default_factory=dict)
     incident_id: str = ""
     workflow_request_id: str = ""
+    opt_in_opened: bool = False
 
 
 def _prepare_live_run(settings: Settings, run_dir: Path, attempt: int) -> _LiveRun:
@@ -621,6 +664,13 @@ def execute_case(
             raise RegionalFixtureError(
                 "approved maintenance window ended before restart"
             )
+        if opt_in_window(run.preflight):
+            # The chain the audit reads needs the opt-in; the window rolls the
+            # control-worker, so it opens before the quiet check and the restart.
+            run.opt_in_opened = True
+            result["xid45_opt_in"] = xid45_opt_in.open_window(
+                run.regional, run.case_dir
+            )
         errors.extend(_restart(run))
         if errors:
             raise RegionalFixtureError("; ".join(errors))
@@ -691,15 +741,34 @@ def _cleanup(run: _LiveRun) -> dict[str, Any]:
             f"probe_cleanup_{label}",
             lambda probe=probe: _refuse_residual_map(probe.cleanup()),
         )
-    guard(
-        "runtime_identity",
-        lambda: run.regional.verify_runtime_identity(
+    if run.opt_in_opened:
+        guard("xid45_opt_in_close", lambda: _close_opt_in(run))
+    guard("runtime_identity", lambda: _runtime_identity(run))
+    return result
+
+
+def _close_opt_in(run: _LiveRun) -> dict[str, Any] | None:
+    closed = xid45_opt_in.close_window(run.regional, run.case_dir)
+    if closed is None or closed.get("state") != "CLOSED":
+        raise RegionalFixtureError("the XID 45 opt-in window was not closed again")
+    return closed
+
+
+def _runtime_identity(run: _LiveRun) -> dict[str, Any]:
+    """The preflight's runtime identity, but for the opt-in window's two rolls."""
+
+    if not run.opt_in_opened:
+        return run.regional.verify_runtime_identity(
             run.preflight["runtime_identity"],
             evidence_path=run.case_dir / "runtime-identity-after-cleanup.json",
             stage=f"after {CASE_ID} cleanup",
-        ),
-    )
-    return result
+        )
+    current = run.regional.runtime_identity()
+    write_json_atomic(run.case_dir / "runtime-identity-after-cleanup.json", current)
+    errors = xid45_opt_in.identity_errors(run.preflight["runtime_identity"], current)
+    if errors:
+        raise RegionalFixtureError(f"after {CASE_ID} cleanup: " + "; ".join(errors))
+    return current
 
 
 def _disarm(run: _LiveRun) -> dict[str, Any]:

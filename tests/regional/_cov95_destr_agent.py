@@ -196,6 +196,12 @@ class AgentHarness:
             "product": None,
         }
         self.chain_audit: dict[str, Any] = {"rows": []}
+        # What every ready control-worker replica reads for the XID 45 switch
+        # (batch 131), the opt-in windows the run opened and closed, and the
+        # runtime identity the cleanup reads (None: the preflight's).
+        self.xid45_switch: dict[str, Any] = {"opted_in": False, "replicas": []}
+        self.windows: list[str] = []
+        self.identity_after: dict[str, Any] | None = None
         self.disarm = {
             "restore_timer": {"ActiveState": "inactive"},
             "agent": {"ActiveState": "active"},
@@ -214,6 +220,28 @@ class AgentHarness:
         )
         monkeypatch.setattr(case, "time", self.clock)
         monkeypatch.setattr(case, "datetime", self.clock)
+        monkeypatch.setattr(
+            case.xid45_opt_in,
+            "switch_survey",
+            lambda _regional: deepcopy(self.xid45_switch),
+        )
+        monkeypatch.setattr(case.xid45_opt_in, "open_window", self.open_window)
+        monkeypatch.setattr(case.xid45_opt_in, "close_window", self.close_window)
+
+    def open_window(self, _regional: Any, _case_dir: Path) -> dict[str, Any]:
+        self.call("xid45.open")
+        self.windows.append("open")
+        return {
+            "state": "OPEN",
+            "assignments": {case.xid45_opt_in.SWITCH: case.xid45_opt_in.OPTED_IN},
+        }
+
+    def close_window(self, _regional: Any, _case_dir: Path) -> dict[str, Any] | None:
+        self.call("xid45.close")
+        if "open" not in self.windows:
+            return None
+        self.windows.append("close")
+        return {"state": "CLOSED"}
 
     def probe(self, settings: Any) -> Any:
         label = "injector" if settings.run_id.endswith("-inject") else "agent"
@@ -277,6 +305,8 @@ class AgentRegional:
         return deepcopy(self.h.workloads)
 
     def runtime_identity(self) -> dict[str, Any]:
+        if self.h.injected and self.h.identity_after is not None:
+            return deepcopy(self.h.identity_after)
         return ready_runtime()
 
     def cpu_blast_snapshot(self) -> dict[str, Any]:

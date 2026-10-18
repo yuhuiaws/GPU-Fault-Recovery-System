@@ -369,7 +369,7 @@ def test_deployment_env_reads_the_worker_container() -> None:
     assert value["variables"] == {
         **{
             name: {"present": False, "value": None}
-            for name in env_window.ALLOWED_VARIABLES
+            for name in env_window.WINDOW_VARIABLES
         },
         TIMEOUT: {"present": True, "value": "1800"},
     }
@@ -617,9 +617,7 @@ def test_open_records_and_converges_on_the_completed_set(
     )
     baseline = json.loads((tmp_path / "b.json").read_text(encoding="utf-8"))
     assert baseline["assignments"] == expected
-    assert set(baseline["baseline"]["variables"]) == set(
-        env_window.ALLOWED_VARIABLES
-    ), (
+    assert set(baseline["baseline"]["variables"]) == set(env_window.WINDOW_VARIABLES), (
         "the baseline records every variable the window may write, so --close "
         "deletes each one it added"
     )

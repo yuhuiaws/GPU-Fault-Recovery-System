@@ -4365,22 +4365,29 @@ test_cases:
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-destr-009
   related_pytest: tests/regional/test_destructive_acceptance_fixtures.py::test_destr009_workflow_contract_scales_to_expected_gpu_count
 - id: GF-REGIONAL-DESTR-010
-  title: XID 45 的 Fabric Manager 动作经 Node Agent：受分级的 Hopper NVSwitch 节点走全量 GPU 与 NVSwitch reset，其余节点重启 Fabric Manager
+  title: XID 45 的 Fabric Manager 动作经 Node Agent：受分级的 NVSwitch 节点默认只观测、站点 opt-in 后走全量 GPU 与 NVSwitch reset，其余节点重启 Fabric Manager
   category: regional-destructive-acceptance
   level: staging
   risk: destructive
   problem: >-
     服务级 Fabric Manager 动作必须由 Node Agent owner 执行、只执行一次且不遗留 fail-safe timer。NVIDIA Fabric Manager
     用户指南：停掉 Fabric Manager 即丢失 fabric 状态，再启动后 NVLink fabric 内全部 GPU 都要 reset。所以在控制面按 DCGM
-    字段 170 分级的 Hopper NVSwitch 节点上，solo XID 45 的 RESTART_FM 编译为 NVIDIA H100 及以后的重启流程（隔离、quiesce 停
+    字段 170 分级的 NVSwitch 节点（Hopper SXM、HGX B200/B300）上，solo XID 45 的 RESTART_FM 编译为 NVIDIA H100 及以后的重启流程（隔离、quiesce 停
     Fabric Manager、一次全部 GPU 与 NVSwitch reset、restore 启 Fabric Manager、两道验证、恢复调度）；只有未分级节点仍是
-    Fabric Manager 单步重启。
+    Fabric Manager 单步重启。NVIDIA GPU debug guidelines（GPU node triage，Understanding Xid Messages，docs 615）把 solo XID 45
+    判为信息性（A100 上同 OS 内 Fabric Manager 意外退出除外），所以分级节点上的默认是只观测：记录 incident 与证据、发调查通知，
+    不动节点、不隔离，官方动作 RESTART_FM 照旧记录；站点开关 GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true 才恢复上述全量链。
   injection: >-
     在空闲 GPU 节点通过真实 /dev/kmsg 注入 solo XID45，再对同一终态 workflow 中启动 Fabric Manager 的节点命令执行一次重放；
-    preflight 按控制面自身对该节点的 fabric 分级决定预期形态并写入 plan。
+    preflight 按控制面自身对该节点的 fabric 分级与 control-worker 上的 XID 45 开关决定阶段并写入 plan。分级节点在默认只观测时
+    分两段：先注入一次证明默认只观测，再由 runner 在 gpu-fault-control-worker 上开 control_plane_env_window
+    （GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true，滚动一次），等过第一条的伴随窗口后注入第二次走全量链，
+    终态后在 finally 按 baseline 原样关窗（再滚动一次）。站点已永久 opt-in 或控制面早于该默认时直接走全量链，不开窗。
   expected:
   - raw evidence 带 kmsg://，solo相关窗口最终判定 official_action=RESTART_FM
-  - preflight 记录控制面对该节点的 fabric 分级（graded_gpus）与工作流形态；plan 与 execute 之间形态或分级变化即拒绝执行
+  - preflight 记录控制面对该节点的 fabric 分级（graded_gpus、observe_only_default）、control-worker 开关读数与阶段（workflow_phases）；plan 与 execute 之间阶段或分级变化即拒绝执行；control-worker 副本对开关读数不一致即拒绝
+  - 分级节点默认段：决策 disposition=MONITOR_ONLY、action=NO_ACTION、official_action 仍为 RESTART_FM；incident 为 RECOVERED、无 workflow、policy_reference 为 NVIDIA GPU debug guidelines 的 XID 表 URL，reasons 含 observe-only 原因（含分级 GPU 数）与开启方式（GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true）；恰有一条 XID 调查通知（FAULT_DETECTED，drill 可为 SKIPPED）且无完成通知；无 remote command、Node Agent ledger 不变、nvidia-fabricmanager MainPID/InvocationID 不变且无 stop/start、gpu-fault timer 不变、节点调度字段与基线相同；默认段不成立时不开窗、不跑全量链，直接 FAIL
+  - 分级节点 opt-in 段：开窗记录只含 GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true 且收敛到全部 ready 副本，关窗后状态 CLOSED、副本读数回到基线
   - 分级节点：workflow 恰为 FREEZE_EVIDENCE、MARK_UNSCHEDULABLE、QUIESCE_GPU_SERVICES、VERIFY_NO_GPU_CLIENTS、RESET_ALL_GPUS_NVSWITCHES、RESTORE_GPU_SERVICES、VALIDATE_GPU、VALIDATE_FABRIC、RESTORE_SCHEDULING，四个节点动作经 gpu-fault-node-agent owner 下发，RESET_ALL_GPUS_NVSWITCHES 覆盖全部分级 GPU 并带 xid=45；不出现 RESTART_FABRIC_MANAGER、RESET_GPU、QUARANTINE、reboot 或 replace
   - 分级节点：QUIESCE、RESET_ALL 与 RESTORE 各恰一条 SUCCEEDED remote command 且无 FAILED；Node Agent ledger 恰新增一条 QUIESCE、一条 attempt=1 的 RESET_ALL 与一条 RESTORE，外加至少一条 VERIFY，无其它操作
   - 分级节点：journal 中 nvidia-fabricmanager.service 恰停一次、启一次，MainPID 与 InvocationID 变化且终态 active；reset 后每张分级 GPU 的 fabric 状态为 Success（字段 170=3）
@@ -4659,20 +4666,23 @@ test_cases:
     定时器 arm 一个有界 fail-safe start，再 systemctl restart gpu-fault-node-agent.service 一次；
     用部署 venv 里的 NodeActionLedger 打开一份按 84ce59f 之前 CREATE/ALTER 语句构造的临时旧 schema 账本
     （只在 /var/lib/gpu-fault-acceptance 下，不碰真实账本）；然后向真实 /dev/kmsg 写入一条 solo XID 45
-    走 DESTR-010 已证明的工作流：控制面未分级 fabric 的节点为 RESTART_FABRIC_MANAGER 两步，受分级的 Hopper NVSwitch
-    节点为全量 GPU 与 NVSwitch reset 链（隔离、quiesce、一次 reset、restore、验证、恢复调度）。不 reboot、不 quarantine、
-    不调用 provider。
+    走 DESTR-010 已证明的工作流：控制面未分级 fabric 的节点为 RESTART_FABRIC_MANAGER 两步，受分级的 NVSwitch
+    节点（Hopper SXM、HGX B200/B300）为全量 GPU 与 NVSwitch reset 链（隔离、quiesce、一次 reset、restore、验证、恢复调度）。
+    分级节点上 solo XID 45 默认只观测、没有可审计的命令，所以控制面默认只观测时 runner 在 Agent 重启之前开 DESTR-010 同一个
+    XID 45 opt-in 窗口（gpu-fault-control-worker 上 GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true），清理时按 baseline
+    原样关窗；站点已永久 opt-in 或控制面早于该默认时不开窗。不 reboot、不 quarantine、不调用 provider。
   expected:
   - "重启前 /healthz 为 200：status=ok、ledger.writable=true、heartbeat.configured=true 且 last_success_at 非空、counters 恰含 accepted/completed/failed/rejected"
   - 重启后 Agent MainPID 与 InvocationID 变化、boot_id 不变；控制面 agent 记录 lifecycle ACTIVE、generation 与 agent_incarnation_id 与基线相同、last_seen_at 晚于重启时刻；/healthz 计数全部归零且心跳年龄不超过 120 s
   - "迁移演练：旧账本 user_version=0、主键仅 command_id，打开后 user_version等于部署的LEDGER_SCHEMA_VERSION（当前3）、主键 (command_id, attempt)、审计列齐全、行数不变、results_legacy 不残留；旧行 attempt_history 读回一条、payload 可读；fencing 表保留且旧 token 仍被拒；追加 attempt 2 后 history 为 [1, 2]、get() 返回 attempt 2、exit_code 保留"
-  - preflight 按控制面对该节点的 fabric 分级记录工作流形态，plan 与 execute 之间变化即拒绝执行
+  - preflight 按控制面对该节点的 fabric 分级与 control-worker 的 XID 45 开关记录工作流形态与是否开窗（xid45_opt_in_window），plan 与 execute 之间变化即拒绝执行；control-worker 副本对开关读数不一致即拒绝
+  - 开窗时：窗口在 Agent 重启与静默检查之前打开、收敛到全部 ready 副本，清理时关窗回到基线（状态 CLOSED）；关窗失败即 FAIL
   - 未分级节点：XID 45 工作流恰为 FREEZE_EVIDENCE 与 RESTART_FABRIC_MANAGER 两步、owner 为 gpu-fault-control-plane/gpu-fault-node-agent、SUCCEEDED，不出现任何隔离/quiesce/reset/reboot 操作；分级节点：工作流为 DESTR-010 的全量 reset 链且 SUCCEEDED，不出现 RESTART_FABRIC_MANAGER/RESET_GPU/QUARANTINE/reboot/replace
   - "被审计命令为未分级节点的 Fabric Manager 重启命令或分级节点链上的 RESET_ALL_GPUS_NVSWITCHES 命令；journald（SyslogIdentifier=gpu-fault-node-agent）中该 command_id 恰有 accepted、started、completed 三行，每行含 command_id/incident_id/workflow_request_id/operation/node_id/fencing_token/agent_generation/gpu_count/attempt 九个字段且值与控制面一致，completed 行 status=SUCCEEDED 且 duration_ms 为整数；不含 parameters、GPU UUID 列表、signature、secret"
   - "真实账本 PRAGMA user_version等于部署的LEDGER_SCHEMA_VERSION（当前3）、主键 (command_id, attempt)；该命令恰一行 attempt=1、state=SUCCEEDED，incident_id/workflow_request_id/fencing_token 与控制面一致，started_at 早于 completed_at，parameters_digest 与 signature_digest 为 64 位 sha256，gpu_uuids 列非空，exit_code 为空；INTERRUPTED 行数与基线相同"
   - "命令后 /healthz counters：未分级节点为 accepted=1、completed=1、failed=0、rejected=0；分级节点等于重启后账本里链上全部 attempt（accepted=行数、completed=SUCCEEDED 行数、failed=FAILED 行数、rejected=0），且重启后账本只含链上的节点动作、QUIESCE/RESET_ALL/RESTORE 各一次"
   - CloudTrail provider 变更动词集合为空；节点 Kubernetes 状态与基线逐字段相同
-  - 清理后：fail-safe 定时器已解除且不留任何新增 gpu-fault timer、Agent 与 Fabric Manager 均 active、探针 Pod/ConfigMap 零残留、runtime identity 与 preflight 相同
+  - 清理后：fail-safe 定时器已解除且不留任何新增 gpu-fault timer、Agent 与 Fabric Manager 均 active、探针 Pod/ConfigMap 零残留、runtime identity 与 preflight 相同（开过窗时只允许 gpu-fault-control-worker 的 generation 恰好多两次滚动，pod template 摘要回到开窗前）
   evidence:
     verdict: NOT_RUN
   automation: manual

@@ -16,7 +16,9 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.e2e.regional import destr010_observe_only as observe  # noqa: E402
 from scripts.e2e.regional import fabric_restart_shape as shapes  # noqa: E402
+from scripts.e2e.regional import xid45_opt_in  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     processor_queue_backlog,
     write_json_atomic,
@@ -51,8 +53,10 @@ FORBIDDEN_OPERATIONS = {
     "RESTORE_GPU_SERVICES",
 }
 # The Fabric Manager restart of a node whose fabric the product does not
-# grade; a graded Hopper NVSwitch node runs the full GPU + NVSwitch reset chain
-# instead (``fabric_restart_shape``).
+# grade; on a graded NVSwitch node (Hopper SXM, HGX B200/B300) a solo XID 45 is
+# observe-only by default and the case proves that first, then opens the XID 45
+# opt-in window and proves the full GPU + NVSwitch reset chain
+# (``fabric_restart_shape``, ``destr010_observe_only``, ``xid45_opt_in``).
 EXPECTED_STEPS = list(shapes.FABRIC_MANAGER_RESTART_STEPS)
 EXPECTED_OWNERS = ["gpu-fault-control-plane", "gpu-fault-node-agent"]
 # The Node fields a Fabric Manager restart must leave alone. `ready` is judged
@@ -247,6 +251,10 @@ def focused_tests(case_dir: Path, *, reuse: bool = False) -> dict[str, Any]:
         "test_every_other_node_keeps_the_fabric_manager_restart",
         "tests/node_agent/test_quiesce_fabric_manager_keep.py::"
         "test_without_the_parameter_the_window_stops_and_starts_it_as_before",
+        "tests/orchestration/test_xid45_observe_only.py::"
+        "test_a_solo_xid45_on_a_graded_node_is_observe_only_by_default",
+        "tests/orchestration/test_xid45_observe_only.py::"
+        "test_the_site_switch_restores_the_catalog_fabric_chain",
     ]
     completed = RegionalLiveFixture.run(
         command,
@@ -269,8 +277,10 @@ def validate_preflight(
     fabric: dict[str, Any],
     node: dict[str, Any],
     workloads: list[dict[str, str]],
+    *,
+    xid45: dict[str, Any] | None = None,
 ) -> list[str]:
-    errors = []
+    errors = xid45_opt_in.switch_errors(fabric.get("fabric_grading"), xid45)
     if node["ready"] != "True":
         errors.append("target node is not Ready")
     if node["unschedulable"]:
@@ -282,8 +292,10 @@ def validate_preflight(
     agent = state.get("agent") or {}
     if agent.get("lifecycle_state") != "ACTIVE":
         errors.append("target Node Agent is not ACTIVE")
-    # The node actions and capabilities the shape the node will run needs.
-    shape = shapes.shape_of(fabric.get("fabric_grading"))
+    # The node actions and capabilities the shape the node will run needs: the
+    # chain on a graded node (under the opt-in window when the default is
+    # observe-only), the Fabric Manager restart elsewhere.
+    shape = shapes.node_action_shape(fabric.get("fabric_grading"))
     allowed = set(agent.get("allowed_operations") or [])
     for operation in sorted(shapes.REQUIRED_AGENT_OPERATIONS[shape] - allowed):
         errors.append(f"target Node Agent does not allow {operation}")
@@ -325,10 +337,11 @@ def read_only_preflight(
     # loops below take the single sample.
     state = regional.store_snapshot(node=settings.node)
     fabric = fabric_probe(regional, settings.node)
+    switch = xid45_opt_in.switch_survey(regional)
     node = regional.node_snapshot(settings.node)
     workloads = regional.business_workloads(settings.node)
     tests = focused_tests(case_dir, reuse=reuse_focused_tests)
-    errors = validate_preflight(state, fabric, node, workloads)
+    errors = validate_preflight(state, fabric, node, workloads, xid45=switch)
     if not tests["passed"]:
         errors.append("focused regression tests failed")
     result = {
@@ -338,6 +351,7 @@ def read_only_preflight(
         "business_workloads": workloads,
         "store": state,
         "fabric": fabric,
+        "xid45_switch": switch,
         "focused_tests": tests,
         "errors": errors,
     }
@@ -345,11 +359,34 @@ def read_only_preflight(
     return result
 
 
-def run_shape(preflight: dict[str, Any]) -> tuple[str, list[str]]:
-    """The shape the plan recorded and the node's graded GPUs."""
+def run_phases(preflight: dict[str, Any]) -> list[str]:
+    """The shapes the case proves, in order.
+
+    A graded node under the observe-only default proves the default first and
+    then, inside the opt-in window, the full chain; a site that opted in for
+    good, or a control plane that predates the default, runs the chain at once;
+    any other node is the Fabric Manager restart.
+    """
 
     grading = (preflight.get("fabric") or {}).get("fabric_grading")
-    return shapes.shape_of(grading), shapes.graded_gpus(grading)
+    opted_in = (preflight.get("xid45_switch") or {}).get("opted_in") is True
+    shape = shapes.shape_of(grading, opted_in=opted_in)
+    if shape == shapes.OBSERVE_ONLY:
+        return [shapes.OBSERVE_ONLY, shapes.FABRIC_RESET]
+    return [shape]
+
+
+def run_shape(preflight: dict[str, Any]) -> tuple[str, list[str]]:
+    """The node action the case proves (its last phase) and the graded GPUs."""
+
+    grading = (preflight.get("fabric") or {}).get("fabric_grading")
+    return run_phases(preflight)[-1], shapes.graded_gpus(grading)
+
+
+def opt_in_window(preflight: dict[str, Any]) -> bool:
+    """Whether the case opens the XID 45 opt-in window (observe-only first)."""
+
+    return run_phases(preflight)[0] == shapes.OBSERVE_ONLY
 
 
 def workflow_errors(
@@ -635,6 +672,7 @@ def preflight_identity(preflight: dict[str, Any]) -> dict[str, Any]:
         "agent_generation": (store.get("agent") or {}).get("generation"),
         "runtime_profile_version": (store.get("profile") or {}).get("profile_version"),
         "workflow_shape": shape,
+        "workflow_phases": run_phases(preflight),
         "graded_gpus": graded,
     }
 
@@ -717,6 +755,204 @@ def finish_case(
         result["verdict"] = "FAIL"
 
 
+def _chain_phase(
+    settings: Settings,
+    regional: RegionalLiveFixture,
+    fixture: HostProbeFixture,
+    case_dir: Path,
+    *,
+    preflight: dict[str, Any],
+    baseline_host: dict[str, Any],
+    baseline_node: dict[str, Any],
+    run_id: str,
+    marker: str,
+    maintenance_window_end: datetime,
+) -> tuple[list[str], dict[str, Any]]:
+    """Inject the XID 45 whose node action the case proves; judge it end to end.
+
+    The Fabric Manager restart on a node the product does not grade; the full
+    GPU + NVSwitch reset chain on a graded one (under the opt-in window when the
+    site's default is observe-only). Returns the errors and the result fields.
+    """
+
+    shape, graded = run_shape(preflight)
+    injected_at = datetime.now(timezone.utc)
+    injection = fixture.execute(
+        "write-xid45",
+        "--marker",
+        marker,
+        "--drill-id",
+        run_id,
+        "--pci-bdf",
+        baseline_host["gpu_pci_bdf"],
+    )
+    write_json_atomic(case_dir / "injection.json", injection)
+    timeout = int(preflight["fabric"]["companion_window_seconds"]) + 300
+    # The shared wait: one cheap store read per 5s, commands filtered to
+    # the marker's workflow, notifications to its incident, no raw
+    # evidence scan. The evidence scan happens once, at the terminal read.
+    state = regional.wait_for_workflow(
+        node=settings.node,
+        marker=marker,
+        observed_after=injected_at,
+        case_dir=case_dir,
+        timeout_seconds=timeout,
+    )
+    terminal_fabric = fabric_probe(
+        regional,
+        settings.node,
+        marker=marker,
+        include_evidence=True,
+    )
+    state = {
+        **state,
+        "evidence": terminal_fabric.get("evidence") or [],
+        "notifications": normalize_notifications(state.get("notifications") or []),
+    }
+    write_json_atomic(case_dir / "workflow-state.json", state)
+    errors = terminal_errors(state, terminal_fabric, shape, graded)
+    workflow_request_id = str((state.get("workflow") or {}).get("request_id") or "")
+    command = replay_target(state, shape)
+    generation = int((state.get("agent") or {}).get("generation") or 0)
+    expected_command_id = (
+        f"{command.get('idempotency_key')}/{settings.node}/agent-{generation}"
+    )
+    after_first = fixture.execute(
+        "snapshot",
+        "--since-epoch",
+        str(injected_at.timestamp()),
+    )
+    write_json_atomic(case_dir / "host-after-first.json", after_first)
+    ledger_ids = {item["command_id"] for item in after_first["ledger"]}
+    if expected_command_id not in ledger_ids:
+        errors.append("expected Node Agent command ID is absent from the ledger")
+
+    replay: dict[str, Any] = {}
+    if not errors:
+        if datetime.now(timezone.utc) >= maintenance_window_end:
+            raise RegionalFixtureError(
+                "maintenance window ended before Node Agent replay"
+            )
+        replay = replay_command(regional, command)
+        write_json_atomic(case_dir / "replay.json", replay)
+        if replay.get("status") != "SUCCEEDED":
+            errors.append("isolated Node Agent replay did not return SUCCEEDED")
+    after_replay_state = regional.store_snapshot(
+        node=settings.node,
+        marker=marker,
+        observed_after=injected_at,
+        queue_attempts=1,
+        workflow_request_ids=[workflow_request_id] if workflow_request_id else None,
+    )
+    after_replay_state["notifications"] = normalize_notifications(
+        after_replay_state.get("notifications") or []
+    )
+    write_json_atomic(
+        case_dir / "store-after-replay.json",
+        after_replay_state,
+    )
+    first_notification_ids = {
+        item.get("notification_id") for item in state.get("notifications") or []
+    }
+    replay_notification_ids = {
+        item.get("notification_id")
+        for item in after_replay_state.get("notifications") or []
+    }
+    if replay_notification_ids != first_notification_ids:
+        errors.append("notification set changed during Node Agent replay")
+    after_replay = fixture.execute(
+        "snapshot",
+        "--since-epoch",
+        str(injected_at.timestamp()),
+    )
+    write_json_atomic(case_dir / "host-after-replay.json", after_replay)
+    errors.extend(
+        host_errors(
+            baseline_host,
+            after_first,
+            after_replay,
+            expected_command_id,
+            shape=shape,
+        )
+    )
+    post_node = regional.node_snapshot(settings.node)
+    write_json_atomic(case_dir / "node-postflight.json", post_node)
+    errors.extend(node_state_errors(baseline_node, post_node, stage="postflight"))
+    if regional.business_workloads(settings.node):
+        errors.append("target node acquired a non-system workload")
+    events, provider_provisional = provider_evidence(regional, case_dir, injected_at)
+    if events:
+        errors.append("provider mutation appeared during DESTR-010")
+    return errors, {
+        "marker": marker,
+        "workflow": {
+            "request_id": workflow_request_id or None,
+            "status": (state.get("workflow") or {}).get("status"),
+            "official_action": (state.get("workflow") or {}).get("official_action"),
+        },
+        "remote_command_id": command.get("command_id"),
+        "node_action_command_id": expected_command_id,
+        "replay": replay,
+        "notifications": after_replay_state.get("notifications") or [],
+        "provider_events": events,
+        "provider_events_provisional": provider_provisional,
+    }
+
+
+def _observe_then_opt_in(
+    settings: Settings,
+    regional: RegionalLiveFixture,
+    fixture: HostProbeFixture,
+    case_dir: Path,
+    *,
+    preflight: dict[str, Any],
+    baseline_host: dict[str, Any],
+    baseline_node: dict[str, Any],
+    run_id: str,
+    attempt: int,
+    maintenance_window_end: datetime,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The observe-only phase, then the opt-in window; the chain's host baseline.
+
+    Returns the phase's report and the host snapshot the chain is judged
+    against (the observe-only XID changed nothing, but the chain counts from
+    after it). A default that did not hold opens no window: the case stops
+    there, and the chain is not driven over a node the default already touched.
+    """
+
+    _shape, graded = run_shape(preflight)
+    window = int(preflight["fabric"]["companion_window_seconds"])
+    report = observe.run_phase(
+        regional,
+        fixture,
+        case_dir,
+        node=settings.node,
+        run_id=run_id,
+        attempt=attempt,
+        baseline_host=baseline_host,
+        baseline_node=baseline_node,
+        graded_gpus=graded,
+        companion_window_seconds=window,
+        node_state_errors=node_state_errors,
+    )
+    if report["errors"]:
+        return report, baseline_host
+    if datetime.now(timezone.utc) >= maintenance_window_end:
+        raise RegionalFixtureError("maintenance window ended before the opt-in")
+    report["opt_in_window"] = xid45_opt_in.open_window(regional, case_dir)
+    observe.wait_outside_companion_window(
+        datetime.fromisoformat(report["injected_at"]), window
+    )
+    recent = fabric_probe(regional, settings.node).get("recent_xid_events")
+    if recent:
+        raise RegionalFixtureError(
+            "target node has XID events inside the companion window before the chain"
+        )
+    chain_baseline = fixture.execute("snapshot")
+    write_json_atomic(case_dir / "host-baseline-chain.json", chain_baseline)
+    return report, chain_baseline
+
+
 def execute_case(
     settings: Settings,
     run_dir: Path,
@@ -737,7 +973,7 @@ def execute_case(
         raise RegionalFixtureError(f"DESTR-010 plan drifted: {planned} != {current}")
 
     regional = RegionalLiveFixture(settings.regional)
-    shape, graded = run_shape(preflight)
+    shape, _graded = run_shape(preflight)
     run_id = f"destr010-{run_dir.name.rsplit('-', 1)[-1].lower()}-a{attempt}"
     marker = f"destr010-{int(time.time())}-a{attempt}"
     fixture = HostProbeFixture(
@@ -760,14 +996,14 @@ def execute_case(
         **preflight["evidence_identity"],
         "node": settings.node,
         "workflow_shape": shape,
+        "workflow_phases": run_phases(preflight),
         "maintenance_window_end": maintenance_window_end.isoformat(),
         "focused_tests_reused": bool(
             preflight["focused_tests"].get("focused_tests_reused")
         ),
     }
     baseline_node = preflight["node"]
-    baseline_host: dict[str, Any] | None = None
-    injected_at: datetime | None = None
+    errors: list[str] = []
     try:
         if datetime.now(timezone.utc) >= maintenance_window_end:
             raise RegionalFixtureError("maintenance window ended before probe creation")
@@ -776,143 +1012,72 @@ def execute_case(
             raise RegionalFixtureError(
                 "approved maintenance window ended before injection"
             )
-
-        injected_at = datetime.now(timezone.utc)
-        injection = fixture.execute(
-            "write-xid45",
-            "--marker",
-            marker,
-            "--drill-id",
-            run_id,
-            "--pci-bdf",
-            baseline_host["gpu_pci_bdf"],
-        )
-        write_json_atomic(case_dir / "injection.json", injection)
-        timeout = int(preflight["fabric"]["companion_window_seconds"]) + 300
-        # The shared wait: one cheap store read per 5s, commands filtered to
-        # the marker's workflow, notifications to its incident, no raw
-        # evidence scan. The evidence scan happens once, at the terminal read.
-        state = regional.wait_for_workflow(
-            node=settings.node,
-            marker=marker,
-            observed_after=injected_at,
-            case_dir=case_dir,
-            timeout_seconds=timeout,
-        )
-        terminal_fabric = fabric_probe(
-            regional,
-            settings.node,
-            marker=marker,
-            include_evidence=True,
-        )
-        state = {
-            **state,
-            "evidence": terminal_fabric.get("evidence") or [],
-            "notifications": normalize_notifications(state.get("notifications") or []),
-        }
-        write_json_atomic(case_dir / "workflow-state.json", state)
-        errors = terminal_errors(state, terminal_fabric, shape, graded)
-        workflow_request_id = str((state.get("workflow") or {}).get("request_id") or "")
-        command = replay_target(state, shape)
-        generation = int((state.get("agent") or {}).get("generation") or 0)
-        expected_command_id = (
-            f"{command.get('idempotency_key')}/{settings.node}/agent-{generation}"
-        )
-        after_first = fixture.execute(
-            "snapshot",
-            "--since-epoch",
-            str(injected_at.timestamp()),
-        )
-        write_json_atomic(case_dir / "host-after-first.json", after_first)
-        ledger_ids = {item["command_id"] for item in after_first["ledger"]}
-        if expected_command_id not in ledger_ids:
-            errors.append("expected Node Agent command ID is absent from the ledger")
-
-        replay: dict[str, Any] = {}
-        if not errors:
-            if datetime.now(timezone.utc) >= maintenance_window_end:
-                raise RegionalFixtureError(
-                    "maintenance window ended before Node Agent replay"
-                )
-            replay = replay_command(regional, command)
-            write_json_atomic(case_dir / "replay.json", replay)
-            if replay.get("status") != "SUCCEEDED":
-                errors.append("isolated Node Agent replay did not return SUCCEEDED")
-        after_replay_state = regional.store_snapshot(
-            node=settings.node,
-            marker=marker,
-            observed_after=injected_at,
-            queue_attempts=1,
-            workflow_request_ids=[workflow_request_id] if workflow_request_id else None,
-        )
-        after_replay_state["notifications"] = normalize_notifications(
-            after_replay_state.get("notifications") or []
-        )
-        write_json_atomic(
-            case_dir / "store-after-replay.json",
-            after_replay_state,
-        )
-        first_notification_ids = {
-            item.get("notification_id") for item in state.get("notifications") or []
-        }
-        replay_notification_ids = {
-            item.get("notification_id")
-            for item in after_replay_state.get("notifications") or []
-        }
-        if replay_notification_ids != first_notification_ids:
-            errors.append("notification set changed during Node Agent replay")
-        after_replay = fixture.execute(
-            "snapshot",
-            "--since-epoch",
-            str(injected_at.timestamp()),
-        )
-        write_json_atomic(case_dir / "host-after-replay.json", after_replay)
-        errors.extend(
-            host_errors(
-                baseline_host,
-                after_first,
-                after_replay,
-                expected_command_id,
-                shape=shape,
+        if opt_in_window(preflight):
+            result["observe_only"], baseline_host = _observe_then_opt_in(
+                settings,
+                regional,
+                fixture,
+                case_dir,
+                preflight=preflight,
+                baseline_host=baseline_host,
+                baseline_node=baseline_node,
+                run_id=run_id,
+                attempt=attempt,
+                maintenance_window_end=maintenance_window_end,
             )
-        )
-        post_node = regional.node_snapshot(settings.node)
-        write_json_atomic(case_dir / "node-postflight.json", post_node)
-        errors.extend(node_state_errors(baseline_node, post_node, stage="postflight"))
-        if regional.business_workloads(settings.node):
-            errors.append("target node acquired a non-system workload")
-        events, provider_provisional = provider_evidence(
-            regional, case_dir, injected_at
-        )
-        if events:
-            errors.append("provider mutation appeared during DESTR-010")
-        result.update(
-            {
-                "verdict": "PASS" if not errors else "FAIL",
-                "errors": errors,
-                "marker": marker,
-                "workflow": {
-                    "request_id": workflow_request_id or None,
-                    "status": (state.get("workflow") or {}).get("status"),
-                    "official_action": (state.get("workflow") or {}).get(
-                        "official_action"
-                    ),
-                },
-                "remote_command_id": command.get("command_id"),
-                "node_action_command_id": expected_command_id,
-                "replay": replay,
-                "notifications": after_replay_state.get("notifications") or [],
-                "provider_events": events,
-                "provider_events_provisional": provider_provisional,
-            }
-        )
+            errors.extend(result["observe_only"]["errors"])
+        if not errors:
+            chain_errors, chain = _chain_phase(
+                settings,
+                regional,
+                fixture,
+                case_dir,
+                preflight=preflight,
+                baseline_host=baseline_host,
+                baseline_node=baseline_node,
+                run_id=run_id,
+                marker=marker,
+                maintenance_window_end=maintenance_window_end,
+            )
+            errors.extend(chain_errors)
+            result.update(chain)
+        result.update({"verdict": "PASS" if not errors else "FAIL", "errors": errors})
     except Exception as exc:
         result["error"] = f"{type(exc).__name__}: {exc}"
     finally:
+        close_opt_in(regional, case_dir, result)
         finish_case(fixture, regional, settings.node, baseline_node, result)
     write_json_atomic(case_dir / f"{CASE_ID}.json", result)
     print(json.dumps(result, sort_keys=True))
     return 0 if result["verdict"] == "PASS" else 1
+
+
+def close_opt_in(
+    regional: RegionalLiveFixture, case_dir: Path, result: dict[str, Any]
+) -> None:
+    """Close the opt-in window this run opened; any failure here is a FAIL.
+
+    Runs in the case's ``finally``, before the probe cleanup. A window that
+    cannot be closed is left on its record, which ``control_plane_env_window.py
+    --close`` restores by hand.
+    """
+
+    try:
+        closed = xid45_opt_in.close_window(regional, case_dir)
+    except Exception as exc:
+        result["opt_in_close_error"] = f"{type(exc).__name__}: {exc}"
+        result["verdict"] = "FAIL"
+        return
+    if closed is None:
+        return
+    opened = (result.get("observe_only") or {}).get("opt_in_window")
+    window_errors = xid45_opt_in.window_errors(opened, closed)
+    result["opt_in_window_closed"] = closed.get("state")
+    if window_errors:
+        result["verdict"] = "FAIL"
+        recorded = result.setdefault("errors", [])
+        if isinstance(recorded, list):
+            recorded.extend(window_errors)
 
 
 # What each shape does to the node, and the plan's stop line for its workflow.
@@ -922,14 +1087,22 @@ PLAN_MUTATION = {
         "the Node Agent to restart nvidia-fabricmanager exactly once"
     ),
     shapes.FABRIC_RESET: (
-        "write one synthetic XID 45 to the real host /dev/kmsg on a Hopper "
-        "NVSwitch node whose fabric the control plane grades: the product "
-        "cordons the node, quiesces its GPU services (nvidia-fabricmanager "
-        "stopped once), resets every GPU and NVSwitch once, restores the services "
-        "(nvidia-fabricmanager started once), validates the GPUs and the fabric "
-        "and restores scheduling"
+        "write one synthetic XID 45 to the real host /dev/kmsg on a graded "
+        "NVSwitch node (Hopper SXM, HGX B200/B300) whose site runs the catalog's "
+        "RESTART_FM: the product cordons the node, quiesces its GPU services "
+        "(nvidia-fabricmanager stopped once), resets every GPU and NVSwitch once, "
+        "restores the services (nvidia-fabricmanager started once), validates the "
+        "GPUs and the fabric and restores scheduling"
     ),
 }
+# Before the chain, on a graded node under the observe-only default.
+PLAN_OBSERVE_ONLY = (
+    "first write one synthetic XID 45 under the site's default and prove it "
+    "observe-only (MONITOR_ONLY, no workflow, no node action, no cordon); then "
+    "open the control-worker env window GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM="
+    "true (one control-worker roll), write a second XID 45 for the chain, and "
+    "close the window again (a second roll) once the chain is terminal"
+)
 PLAN_WORKFLOW_STOP = {
     shapes.FABRIC_MANAGER_RESTART: (
         "workflow differs from FREEZE_EVIDENCE -> RESTART_FABRIC_MANAGER"
@@ -943,6 +1116,7 @@ PLAN_WORKFLOW_STOP = {
 
 def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any]:
     shape, _graded = run_shape(preflight)
+    window = opt_in_window(preflight)
     details = {
         "risk": (
             "destructive" if shape == shapes.FABRIC_RESET else "live-service-action"
@@ -950,7 +1124,13 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "release_id": preflight["release_id"],
         "target_node": settings.node,
         "workflow_shape": shape,
-        "mutation": PLAN_MUTATION[shape],
+        "workflow_phases": run_phases(preflight),
+        "xid45_opt_in_window": window,
+        "mutation": (
+            f"{PLAN_OBSERVE_ONLY}; the chain: {PLAN_MUTATION[shape]}"
+            if window
+            else PLAN_MUTATION[shape]
+        ),
         "preflight_identity": preflight_identity(preflight),
         "stop_conditions": [
             "preflight or focused regression failure",
@@ -960,6 +1140,16 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             "the node's fabric grading moved between plan and execute",
             "Fabric Manager or /dev/kmsg baseline is unhealthy",
             PLAN_WORKFLOW_STOP[shape],
+            *(
+                [
+                    "the default XID 45 is not observe-only (a workflow, a node "
+                    "action, a cordon or a missing reason): no opt-in, no chain",
+                    "control-worker replicas disagree on the XID 45 switch",
+                    "the opt-in window cannot be opened or closed again",
+                ]
+                if window
+                else []
+            ),
             "node scheduling state differs from the baseline afterwards",
             "provider mutation appears",
             "probe cleanup leaves a residual",
@@ -973,6 +1163,10 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
             # The chain releases its own cordon and quiesce window; the runner
             # never restores scheduling or services on the product's behalf.
             "product_releases_its_own_cordon_and_quiesce": shape == shapes.FABRIC_RESET,
+            # The opt-in window is restored exactly from its baseline record in
+            # the runner's finally; control_plane_env_window.py --close is the
+            # operator's way back when the runner died.
+            "runner_finally_closes_the_xid45_opt_in_window": window,
         },
         "preflight": preflight,
     }
