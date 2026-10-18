@@ -1575,7 +1575,8 @@ reset step inside the branch names only this node and carries only this node's G
 SXID merge ever produces a reset step whose `node_ids` span nodes (the regional executor has no barrier
 coordinator, and `CommandDispatch._barrier_hold` holds such a step fail-closed). A higher-rank event for the same
 node replaces the plan in place when the plan has not started, and is queued as a successor of that node's branch once it has started;
-additional GPUs for the same node and same category only widen the GPU scope of that node's step. Regardless of how many
+additional GPUs for the same node and same category only widen the GPU scope of that node's step until that node's QUIESCE is dispatched,
+and are queued as a successor of that node's branch after it (§2.9.1, `orchestration/reset_window.py`). Regardless of how many
 nodes or how many reset categories, the whole workflow has exactly one `shared` `STOP_WORKLOADS` and one
 `join` `RESTART_WORKLOAD`: the join gate opens only after all branches complete reset/validation, and the whole
 training job is restarted only once. The incident's `official_action` takes the action with the higher recovery rank; a later
@@ -1838,8 +1839,23 @@ and does not keep using an old ready list to submit steps that a new plan has wi
 the branch escalation count, exhaustion and candidate identity follow the original branch ownership. The exhaustion operation is idempotent, retires only the exact branch,
 and does not cancel independent sibling branches or later-added isolation steps along with it.
 
-When a same-node, same-level `RESET_GPU` targets different GPUs, the GPU set of the same step is widened if the reset has not been submitted;
-a submitted command cannot be rewritten, and the added GPUs enter the subsequent recovery phase. Arbitration compares not only rank but also uses explicit
+When a same-node, same-level `RESET_GPU` targets different GPUs, the GPU set of the same step is widened if the reset has not been submitted
+(the QUIESCE/VERIFY/RESTORE of the same window widen with it); a submitted command cannot be rewritten, and the added GPUs enter the subsequent
+recovery phase. A reset window is committed from the moment its QUIESCE is dispatched (`src/gpu_fault/orchestration/reset_window.py`): once
+the QUIESCE completed or has an execution record of any status, the QUIESCE and every later step of that node on the same branch keep the node
+and GPU scope they were dispatched with -- the four widening passes (`disposition.widen_in_place`, `DagBrancher.widen_parallel_job_branch`,
+`IncidentOrchestrator._widen_node_action_scope`, `merge_sxid_step_scope` in `ingest/sxid.py`) share `fixed_scope_step_indexes` to leave them
+alone; when a fault names a GPU the dispatched QUIESCE did not cover (`widens_dispatched_window`), the merge no longer answers
+`WIDEN_IN_PLACE`/`WIDEN_BRANCH`: a job record whose join has not started gets a node successor branch (`QUEUE_BRANCH_SUCCESSOR`,
+`branch:<node>:successor:<n>`, which cordons, quiesces, verifies, resets, restores, validates and restores scheduling again after the first
+branch restored scheduling; there is still one join), a record with no join or a started join gets a successor workflow, and in both the added
+GPU is reset in a quiesce window of its own; an event with no GPU identity has nothing to widen and leaves the record as it was. Two reasons.
+The Node Agent's QUIESCE ran `nvidia-smi -i <bus id> -pm 0` and swept clients for the GPUs it named only, and the `nvidia-persistenced` the
+window kept still holds every other GPU's device node: a widened VERIFY_NO_GPU_CLIENTS met it on the new GPU and failed closed, and the ladder
+climbed to reboot; the Agent also refuses a QUIESCE with another target set for the same incident ("quiesce target GPU scope changed after
+quiesce"). With remote step batching the QUIESCE is the head of a compound command whose VERIFY, RESET and RESTORE passengers carry the scope
+they had when it was minted and run on the data plane under one lease, their results read back by step index: a widened RESET_GPU was recorded
+SUCCEEDED for two GPUs while the node reset one. Arbitration compares not only rank but also uses explicit
 operation dominance: `RESTART_NODE` covers reset/reset-all/fabric-manager restart,
 `REPLACE_NODE` covers node lifecycle and GPU runtime repair; quarantine, mechanical checks and support escalation
 are not treated as having repaired other fault domains.
