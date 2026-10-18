@@ -16,6 +16,10 @@ from gpu_fault.notifications.common import (
     Any,
     restart_node_provider_wording,
 )
+from gpu_fault.notifications.display_stack import (
+    display_stack_follow_up,
+    display_stack_subject_marker,
+)
 
 
 class RestartGuardEmailBuilder:
@@ -404,6 +408,7 @@ class RestartGuardEmailBuilder:
             workloads=", ".join(workload_ids) or "NONE",
             operation_id=operation_id,
             node_results="\n".join(result_lines) or "- UNKNOWN",
+            display_stack=display_stack_follow_up(node_results),
             template_version=FABRIC_RESET_TEMPLATE_VERSION,
         )
         return AdvisoryNotification(
@@ -413,7 +418,8 @@ class RestartGuardEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                "[NOTICE][GPU/NVSwitch reset automatically] "
+                "[NOTICE][GPU/NVSwitch reset automatically]"
+                f"{display_stack_subject_marker(node_results)} "
                 f"{cluster_id}: {', '.join(sorted(node_results))}"
             ),
             body_text=body,
@@ -471,6 +477,7 @@ class RestartGuardEmailBuilder:
             node_ids=", ".join(node_ids) or "UNKNOWN",
             gpu_uuids=", ".join(gpu_uuids) or "UNKNOWN",
             node_results="\n".join(result_lines) or "- UNKNOWN",
+            display_stack=display_stack_follow_up(node_results),
             template_version=GPU_RESET_TEMPLATE_VERSION,
         )
         return AdvisoryNotification(
@@ -478,7 +485,8 @@ class RestartGuardEmailBuilder:
             cluster_name=cluster_id,
             incident_id=incident_id,
             subject=(
-                f"[NOTICE][GPU reset automatically] {cluster_id}: "
+                "[NOTICE][GPU reset automatically]"
+                f"{display_stack_subject_marker(node_results)} {cluster_id}: "
                 f"{', '.join(gpu_uuids) or 'UNKNOWN'}"
             ),
             body_text=body,

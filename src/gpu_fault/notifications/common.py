@@ -31,8 +31,8 @@ RESTART_WORKLOAD_TEMPLATE_VERSION = "restart-workload-zh-v1"
 RESTART_NODE_TEMPLATE_VERSION = "restart-node-zh-v1"
 WARM_SPARE_REPLACEMENT_TEMPLATE_VERSION = "warm-spare-replacement-zh-v1"
 RESTART_FABRIC_MANAGER_TEMPLATE_VERSION = "restart-fabric-manager-zh-v1"
-GPU_RESET_TEMPLATE_VERSION = "gpu-reset-zh-v1"
-FABRIC_RESET_TEMPLATE_VERSION = "fabric-reset-zh-v1"
+GPU_RESET_TEMPLATE_VERSION = "gpu-reset-zh-v2"
+FABRIC_RESET_TEMPLATE_VERSION = "fabric-reset-zh-v2"
 NOT_APPLICABLE_TEMPLATE_VERSION = "xid-not-applicable-zh-v2"
 XID_INVESTIGATORY_TEMPLATE_VERSION = "xid-investigatory-zh-v1"
 SXID_EVENT_TEMPLATE_VERSION = "sxid-event-zh-v1"
@@ -699,7 +699,7 @@ GPU reset completed automatically
 - GPU validation: the workflow's VALIDATE_GPU step
 - Scheduling: restored by the RESTORE_SCHEDULING step after validation passes
 - Training: restarted by the RESTART_WORKLOAD step after all validation passes
-
+{display_stack}
 Template: {template_version}
 """
 
@@ -732,6 +732,6 @@ GPU/NVSwitch reset completed automatically
 - GPU validation: the workflow's VALIDATE_GPU step
 - Fabric validation: the workflow's VALIDATE_FABRIC step
 - Training: restarted by the RESTART_WORKLOAD step after all validation passes
-
+{display_stack}
 Template: {template_version}
 """
