@@ -487,6 +487,11 @@ rules:
       - tests/regional/test_destr010_fabric_reset_shape.py
       - tests/regional/test_destr019_fabric_reset_shape.py
       - tests/regional/test_xid45_opt_in_window.py
+      # A dispatched QUIESCE commits its window (orchestration/reset_window.py):
+      # the compound command minted with it and the Agent's window per GPU set
+      # are what the merge rule protects (batch 136).
+      - tests/regional/test_post_quiesce_merge_batched.py
+      - tests/node_agent/test_quiesce_window_per_gpu_set.py
     regional_cases:
       - GF-REGIONAL-PREEMPT-001..012
       - GF-REGIONAL-PREEMPT-014..022

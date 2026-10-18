@@ -14,13 +14,13 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     lifetime_exceeded,
     record_workflow_event,
-    resolved_step_indexes,
 )
 from gpu_fault.operation_registry import SHARED_DAG_OPERATIONS
 from gpu_fault.orchestration.arbitration import (
     RecoveryArbiter,
     fault_scope_covered,
 )
+from gpu_fault.orchestration.reset_window import fixed_scope_step_indexes
 from gpu_fault.workflow_quarantine import (
     inherit_terminal_quarantine,
     suppress_readmission,
@@ -722,13 +722,11 @@ class DagBrancher:
         gpu_uuids: set[str],
     ) -> WorkflowRequest:
         indexes = set(self.node_branch_step_indexes(existing, node_id))
-        # Steps that finished, were superseded or already have a command in
-        # flight keep the scope they ran with; only pending steps widen
-        # (F-B6). Rewriting history would make the ledger claim a wider
-        # reset than the agent performed.
-        untouchable = set(resolved_step_indexes(existing)) | {
-            execution.step_index for execution in existing.step_executions
-        }
+        # Steps that finished, were superseded, have a command in flight or
+        # belong to a dispatched window keep the scope they ran with; only
+        # pending steps widen (F-B6, ``reset_window``). Rewriting history would
+        # make the ledger claim a wider reset than the agent performed.
+        untouchable = fixed_scope_step_indexes(existing)
         candidate_by_operation = {
             step.operation: step
             for step in candidate.official_steps

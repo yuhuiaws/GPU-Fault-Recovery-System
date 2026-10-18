@@ -32,6 +32,7 @@ from gpu_fault.models import (
 from gpu_fault.orchestration.arbitration import RecoveryArbiter
 from gpu_fault.orchestration.dag_branching import DagBrancher
 from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
+from gpu_fault.orchestration.reset_window import fixed_scope_step_indexes
 from gpu_fault.orchestration.workflow_builder import WorkflowBuilder
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 from gpu_fault.policy import (
@@ -109,11 +110,10 @@ def merge_sxid_step_scope(
         WorkflowOperation.RESET_GPU,
         WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
     }
-    # Finished, superseded and in-flight steps keep the scope they ran with;
+    # Finished, superseded and in-flight steps keep the scope they ran with,
+    # and so does a window whose QUIESCE was dispatched (``reset_window``);
     # only pending steps take the new node's GPUs and SXIDs (F-B6).
-    untouchable = set(resolved_step_indexes(workflow)) | {
-        execution.step_index for execution in workflow.step_executions
-    }
+    untouchable = fixed_scope_step_indexes(workflow)
     steps = []
     for index, step in enumerate(workflow.official_steps):
         if (

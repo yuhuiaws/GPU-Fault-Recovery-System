@@ -23,7 +23,6 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     WorkloadState,
     bounded_reasons,
-    resolved_step_indexes,
 )
 from gpu_fault.operation_registry import (
     MERGE_INTENT_OPERATIONS,
@@ -88,6 +87,7 @@ from gpu_fault.orchestration.reboot_window import (
     cover_fault,
     owning_reboot,
 )
+from gpu_fault.orchestration.reset_window import fixed_scope_step_indexes
 from gpu_fault.orchestration.workflow_builder import parse_sxid_codes
 from gpu_fault.orchestration.workflow_merge import (
     WorkflowMergeService,
@@ -1447,11 +1447,9 @@ class IncidentOrchestrator:
             gpu_uuid for values in gpu_uuids_by_node.values() for gpu_uuid in values
         }
         # Finished, superseded and in-flight steps are history or a command
-        # the agent already holds; widening them would make the ledger
-        # disagree with what ran (F-B6). Only pending steps take the union.
-        untouchable = set(resolved_step_indexes(workflow)) | {
-            execution.step_index for execution in workflow.step_executions
-        }
+        # the agent already holds, and so is a window whose QUIESCE was
+        # dispatched (F-B6, ``reset_window``): only pending steps widen.
+        untouchable = fixed_scope_step_indexes(workflow)
         steps = []
         for index, step in enumerate(workflow.official_steps):
             if (

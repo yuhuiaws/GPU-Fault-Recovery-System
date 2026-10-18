@@ -25,10 +25,10 @@ from gpu_fault.models import (
     WorkflowRequest,
     WorkflowStepSpec,
     record_workflow_event,
-    resolved_step_indexes,
 )
 from gpu_fault.orchestration.arbitration import RecoveryArbiter
 from gpu_fault.orchestration.dag_branching import DagBrancher, plan_digest
+from gpu_fault.orchestration.reset_window import fixed_scope_step_indexes
 from gpu_fault.workflow_quarantine import inherit_terminal_quarantine
 
 AggregationDeadlines = Callable[[datetime, WorkflowRequest], tuple[datetime, datetime]]
@@ -86,13 +86,13 @@ def widen_in_place(
     The non-DAG twin of ``DagBrancher.widen_parallel_job_branch``: every
     step that still has to run on ``node_id`` takes the union of its own
     GPUs, the matching candidate step's GPUs and ``gpu_uuids``. Steps that
-    completed, were superseded or already have an execution record are left
-    alone -- rewriting a step the agent is running would make the ledger
-    disagree with the command in flight. Workload-scoped steps do not name
-    GPUs.
+    completed, were superseded, already have an execution record or belong to
+    a window whose QUIESCE was dispatched are left alone
+    (``fixed_scope_step_indexes``) -- rewriting a step the agent is running
+    would make the ledger disagree with the command in flight. Workload-scoped
+    steps do not name GPUs.
     """
-    resolved = resolved_step_indexes(existing)
-    in_flight = {execution.step_index for execution in existing.step_executions}
+    fixed = fixed_scope_step_indexes(existing)
     candidate_by_operation = {
         step.operation: step
         for step in candidate.official_steps
@@ -101,8 +101,7 @@ def widen_in_place(
     steps: list[WorkflowStepSpec] = []
     for index, step in enumerate(existing.official_steps):
         if (
-            index in resolved
-            or index in in_flight
+            index in fixed
             or node_id not in step.node_ids
             or step.operation in workload_scoped_operations
         ):

@@ -24,6 +24,7 @@ from ._cross_fault_arbitration_cases_2 import (
     test_cross_node_sxid_only_resets_its_hardware_node,
     test_dag_appends_same_node_successor_after_branch_started,
     test_dag_compares_recovery_rank_within_the_target_node_branch,
+    test_dag_queues_a_same_node_successor_branch_once_the_quiesce_ran,
     test_dag_widens_unstarted_same_rank_branch_for_another_gpu,
     test_event_after_current_attempt_start_is_processed,
     test_fresh_sxid_waits_for_running_previous_attempt,

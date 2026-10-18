@@ -11,6 +11,7 @@ from gpu_fault.models import (
     WorkflowEventKind,
     WorkflowOperation,
     WorkflowStatus,
+    WorkflowStepSpec,
     WorkflowStepStatus,
 )
 from gpu_fault.orchestration import IncidentOrchestrator
@@ -252,10 +253,18 @@ def test_dag_compares_recovery_rank_within_the_target_node_branch() -> None:
     )
 
 
-@pytest.mark.parametrize("completed_through_quiesce", [False, True])
-def test_dag_widens_unstarted_same_rank_branch_for_another_gpu(
-    completed_through_quiesce: bool,
-) -> None:
+_CONTAINMENT = (
+    WorkflowOperation.FREEZE_EVIDENCE,
+    WorkflowOperation.MARK_UNSCHEDULABLE,
+    WorkflowOperation.STOP_WORKLOADS,
+)
+
+
+def _two_node_branches_through(*operations: WorkflowOperation):
+    """A two-node job DAG (node-a reset, node-b reboot) whose ``operations``
+    completed, then a second XID on another GPU of node-a; the merged record
+    and the indexes that had completed."""
+
     context = build_context()
     context.orchestrator = IncidentOrchestrator(
         context.store, workflow_preemption_enabled=True
@@ -272,19 +281,12 @@ def test_dag_widens_unstarted_same_rank_branch_for_another_gpu(
     node_b.update({"node_id": "node-b", "gpu_uuid": "GPU-b", "pci_bdf": "0000:ca:00.0"})
     asyncio.run(post_faults(context, [("/v1/gpu-events/xid", node_b)]))
     before = context.store.get_workflow(first["workflow_request_id"])
-    completed_indexes = []
-    if completed_through_quiesce:
-        completed_operations = {
-            WorkflowOperation.FREEZE_EVIDENCE,
-            WorkflowOperation.MARK_UNSCHEDULABLE,
-            WorkflowOperation.STOP_WORKLOADS,
-            WorkflowOperation.QUIESCE_GPU_SERVICES,
-        }
-        completed_indexes = [
-            index
-            for index, step in enumerate(before.official_steps)
-            if step.operation in completed_operations
-        ]
+    completed_indexes = [
+        index
+        for index, step in enumerate(before.official_steps)
+        if step.operation in operations
+    ]
+    if completed_indexes:
         context.store.save_workflow(
             before.model_copy(
                 update={
@@ -310,28 +312,69 @@ def test_dag_widens_unstarted_same_rank_branch_for_another_gpu(
 
     workflow = context.store.get_workflow(result["workflow_request_id"])
     assert workflow.request_id == first["workflow_request_id"]
-    resets = [
-        step
-        for step in workflow.official_steps
+    assert set(completed_indexes) <= set(workflow.completed_step_indexes)
+    return before, workflow
+
+
+def _node_a_resets(workflow) -> list[tuple[int, WorkflowStepSpec]]:
+    return [
+        (index, step)
+        for index, step in enumerate(workflow.official_steps)
         if step.operation is WorkflowOperation.RESET_GPU and step.node_ids == ["node-a"]
     ]
+
+
+def _one_stop_and_one_restart(workflow) -> None:
+    for operation in (
+        WorkflowOperation.STOP_WORKLOADS,
+        WorkflowOperation.RESTART_WORKLOAD,
+    ):
+        assert (
+            sum(step.operation is operation for step in workflow.official_steps) == 1
+        ), f"expected exactly one {operation.value}"
+
+
+@pytest.mark.parametrize("completed_through_containment", [False, True])
+def test_dag_widens_unstarted_same_rank_branch_for_another_gpu(
+    completed_through_containment: bool,
+) -> None:
+    """Nothing of node-a's window was dispatched: one reset for both GPUs."""
+
+    _, workflow = _two_node_branches_through(
+        *(_CONTAINMENT if completed_through_containment else ())
+    )
+
+    resets = _node_a_resets(workflow)
     assert len(resets) == 1
-    assert set(resets[0].gpu_uuids) == {"GPU-a", "GPU-a2"}
-    assert set(completed_indexes) <= set(workflow.completed_step_indexes)
-    assert (
-        sum(
-            step.operation is WorkflowOperation.STOP_WORKLOADS
-            for step in workflow.official_steps
-        )
-        == 1
+    assert set(resets[0][1].gpu_uuids) == {"GPU-a", "GPU-a2"}
+    _one_stop_and_one_restart(workflow)
+
+
+def test_dag_queues_a_same_node_successor_branch_once_the_quiesce_ran() -> None:
+    """node-a's QUIESCE ran for GPU-a alone, so its window is committed: the
+    second GPU gets a successor branch of its own before the single join."""
+
+    before, workflow = _two_node_branches_through(
+        *_CONTAINMENT, WorkflowOperation.QUIESCE_GPU_SERVICES
     )
-    assert (
-        sum(
-            step.operation is WorkflowOperation.RESTART_WORKLOAD
-            for step in workflow.official_steps
-        )
-        == 1
-    )
+
+    (original_index, original), (_, added) = _node_a_resets(workflow)
+    assert original.gpu_uuids == ["GPU-a"], "the dispatched window keeps its GPU"
+    assert original == before.official_steps[original_index]
+    assert added.gpu_uuids == ["GPU-a2"]
+    assert added.branch_id != original.branch_id
+    (join,) = [
+        step
+        for step in workflow.official_steps
+        if step.operation is WorkflowOperation.RESTART_WORKLOAD
+    ]
+    assert {
+        index
+        for index, step in enumerate(workflow.official_steps)
+        if step.operation is WorkflowOperation.RESTORE_SCHEDULING
+        and step.branch_id == added.branch_id
+    } <= set(join.depends_on_step_indexes), "the join waits for the second window"
+    _one_stop_and_one_restart(workflow)
 
 
 def test_dag_appends_same_node_successor_after_branch_started() -> None:

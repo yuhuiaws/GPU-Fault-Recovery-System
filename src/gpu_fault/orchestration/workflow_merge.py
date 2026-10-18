@@ -26,6 +26,7 @@ from gpu_fault.operation_registry import (
 )
 from gpu_fault.orchestration.disposition import Disposition
 from gpu_fault.orchestration.preemption_boundary import preemption_boundary
+from gpu_fault.orchestration.reset_window import widens_dispatched_window
 from gpu_fault.workflow_quarantine import (
     inherit_terminal_quarantine,
     terminal_quarantine_covered,
@@ -216,6 +217,9 @@ class WorkflowMergeService:
                 existing,
                 list(range(len(existing.official_steps))),
             )
+            # A dispatched QUIESCE commits its window to the GPUs it named: a
+            # GPU it left out needs a window of its own (``reset_window``).
+            and not widens_dispatched_window(existing, node_id, gpu_uuids)
         ):
             return Disposition.WIDEN_IN_PLACE
         if (
@@ -357,6 +361,7 @@ class WorkflowMergeService:
             candidate_rank == existing_rank
             and candidate_primary == existing_primary
             and not self.recovery_action_has_started(existing, indexes)
+            and not widens_dispatched_window(existing, node_id, gpu_uuids, indexes)
         ):
             return Disposition.WIDEN_BRANCH
         if (
