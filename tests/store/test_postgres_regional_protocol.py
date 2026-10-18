@@ -5,6 +5,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import select
 import subprocess
 import sys
 from contextlib import redirect_stdout
@@ -756,9 +757,17 @@ def test_the_activity_sampler_sees_an_admission_insert_waiting_in_the_store(
                         "SAMPLE_TOP": "5",
                     },
                 )
-                assert sampler.stdin is not None
+                assert sampler.stdin is not None and sampler.stdout is not None
                 sampler.stdin.write(timeseries.session_input(pg_activity.program()))
                 sampler.stdin.flush()
+                # The INSERT's 1.5 s window opens once the sampler is connected,
+                # i.e. after its first sample: inside a loaded release gate the
+                # sampler's start-up (interpreter, psycopg, connect) outlasted
+                # the window, communicate() then closed stdin before the first
+                # sample, and the sampler printed nothing at all.
+                ready, _, _ = select.select([sampler.stdout], [], [], 60)
+                assert ready, "the sampler printed no sample within 60 s"
+                first = sampler.stdout.readline()
                 writer.execute(
                     "INSERT INTO gpu_fault_processor_queue (request_id) "
                     "SELECT 'request-42' FROM pg_sleep(1.5)"
@@ -770,7 +779,7 @@ def test_the_activity_sampler_sees_an_admission_insert_waiting_in_the_store(
             )
 
     assert sampler.returncode == 0, errors.decode()[-2000:]
-    samples = [json.loads(line) for line in output.decode().splitlines()]
+    samples = [json.loads(line) for line in (first + output).decode().splitlines()]
     caught = [item for item in samples if item.get("admission_inserts")]
     assert caught, samples
     assert all(item["waits"].get("Timeout:PgSleep") for item in caught), caught

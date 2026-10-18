@@ -13,6 +13,7 @@ from __future__ import annotations
 import http.server
 import json
 import os
+import select
 import subprocess
 import sys
 import threading
@@ -213,9 +214,15 @@ def test_the_in_pod_program_samples_its_own_metrics_until_stdin_closes(
                 "SAMPLE_FAMILIES": ",".join(timeseries.SAMPLED_FAMILIES),
             },
         )
-        assert process.stdin is not None
+        assert process.stdin is not None and process.stdout is not None
         process.stdin.write(timeseries.session_input(timeseries.SAMPLE_PROGRAM))
         process.stdin.flush()
+        # The 0.5 s of sampling starts with the first sample: under a loaded
+        # release gate the interpreter's start-up alone can outlast a fixed
+        # sleep, and stdin's EOF would then stop the program before it sampled.
+        ready, _, _ = select.select([process.stdout], [], [], 60)
+        assert ready, "the sampler printed no sample within 60 s"
+        first = process.stdout.readline()
         time.sleep(0.5)
         assert process.poll() is None, "the sampler stopped while stdin was open"
         output, errors = process.communicate(timeout=60)  # closes stdin: EOF
@@ -223,7 +230,7 @@ def test_the_in_pod_program_samples_its_own_metrics_until_stdin_closes(
         server.shutdown()
 
     assert process.returncode == 0, errors.decode()
-    lines = [json.loads(line) for line in output.decode().splitlines()]
+    lines = [json.loads(line) for line in (first + output).decode().splitlines()]
     assert len(lines) >= 3, "about one sample per interval"
     assert lines[0]["v"] == {
         "gpu_fault_processor_in_flight": 7.0,
