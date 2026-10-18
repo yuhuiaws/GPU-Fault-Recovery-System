@@ -13378,25 +13378,29 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
   again; delete the second node's probe and the prewarm Pods; recheck the runtime identity. Any cleanup failure is FAIL; a fault node that
   never answers again is not exec'd, and the sampler unit and the probe resources there are left for the operator to reconcile -- **no
   manual taint deletion**.
-- The other timing (a second fault arriving after the reset already ran) is not driven by this case; the product's shapes are recorded:
-  - The job's join has not started: the issued `RESET_GPU` is not rewritten, the record grows into a DAG with a
+- The other timing (a second fault arriving after the window's `QUIESCE_GPU_SERVICES` was dispatched) is not driven by this case; the
+  product's shapes are recorded: a dispatched QUIESCE commits the reset window (GF-REGIONAL-PREEMPT-021), handled like a submitted reset:
+  - The job's join has not started: the dispatched window (`QUIESCE_GPU_SERVICES` and the steps behind it) is not rewritten, the
+    record grows into a DAG with a
     `branch:<node>:successor:1` node successor branch (event `BRANCH_SUCCESSOR_QUEUED`) that, after the first branch's
     `RESTORE_SCHEDULING`, cordons, quiesces, verifies, resets only the second card, restores, validates and restores scheduling again;
     `RESTART_WORKLOAD` depends on both branches' `RESTORE_SCHEDULING`, and the job still restarts once;
   - The join has started: a successor workflow whose `predecessor_workflow_id` names the original one, with its own `STOP_WORKLOADS`
     and `RESTART_WORKLOAD`, so the job is stopped and restarted a second time (with a restart budget of 1 that restart is held to the
     budget);
-  - Both shapes are pinned by `tests/orchestration/test_same_node_job_reset_merge.py`, and this case's verdicts judge the first as not
+  - Both shapes are pinned by `tests/orchestration/test_same_node_job_reset_merge.py` and
+    `tests/orchestration/test_post_quiesce_same_node_merge.py`, and this case's verdicts judge the first as not
     this case's shape (two `RESET_GPU`). Why it is not driven: inside the fault node's quiesce window `gpu-fault-host-collector` (and on
     HyperPod kubelet) is stopped, so neither a probe exec nor the node's own kernel collector can deliver a kmsg XID after the reset claim
     and before the restore; it needs a detached trigger armed before the injection that reads the reset claim in the quiesce state and
     writes the kmsg line from the host itself when it appears (authorized like DESTR-016's holder pre-authorization), which the harness
     does not have.
 - Known limitations:
-  - When the second fault arrives after `QUIESCE_GPU_SERVICES` ran and before `RESET_GPU` is issued, the control plane still widens
-    VERIFY/RESET/RESTORE to both cards, but the quiesce that ran released persistence and swept device holders for the first card only, so
-    a process holding the second card's device node (`nvidia-persistenced`, for one) makes the widened VERIFY fail; this case's concurrent
-    injection makes both events arrive before the first step and does not cover that timing.
+  - This case's concurrent injection makes both events arrive before the first step and does not cover a second fault arriving after
+    the QUIESCE was dispatched. That timing no longer widens the window: the quiesce that ran released persistence and swept device
+    holders for the first card only, so a VERIFY/RESET/RESTORE widened to both cards would fail on a process holding the second card's
+    device node (`nvidia-persistenced`, for one), and a batched dispatch would reset the second card only in the record; the second card
+    takes the successor shape above instead (judged by GF-REGIONAL-PREEMPT-021).
 
 ## 13. NOTIFY: Mail notifications
 
