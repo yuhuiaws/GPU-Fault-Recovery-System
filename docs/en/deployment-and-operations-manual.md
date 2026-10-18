@@ -7660,8 +7660,9 @@ from a host engine that serves them; the solution does not grade them yet.
 T.Limit field: the CSV also exports `DCGM_FI_DEV_GPU_TEMP_LIMIT` (153, gauge), the current reading `gpu_tlimit_c` that
 the T.Limit thresholds above grade. DCGM 4.1.0 introduced it (release notes: "Add a field to track the TLIMIT"; field
 description: "Thermal margin temperature (distance to nearest slowdown threshold) for this GPU"), and DCGM 4.6.0
-renamed it `DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS`; the pinned exporter's go-dcgm knows only the 4.1 name, so never write
-the new one while it is pinned. Likewise exported, never required: an exporter without it puts the GPU core back on the
+renamed it `DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS`; the pinned exporter's go-dcgm (`v1.4611.2`) resolves the 4.1 name to 153
+as a deprecated alias and renders the field under the CSV's name, which is the name the collector maps, so the CSV keeps the
+4.1 name; never write the new one. Likewise exported, never required: an exporter without it puts the GPU core back on the
 grading of its absolute reading. In host mode the host engine must be DCGM 4.1.0 or later (live: 4.6.0 and 4.7.0).
 
 The exporter reads the CSV only at process start and the DaemonSet mounts the ConfigMap with subPath, which a running Pod never sees
@@ -7767,7 +7768,7 @@ failed scrapes).
   (`DCGM_REMOTE_HOSTENGINE_INFO`); the `host:port` form is unchanged, the URI forms need DCGM ≥ 4.5.
 - CSV format unchanged: Go `encoding/csv`, `#` comments, exactly 3 fields, types counter/gauge/untyped/label; an unknown field name
   still fails the start-up; the retired PCIe throughput fields 200/201 are now refused (not in the solution's CSV).
-- All 35 fields of the solution's CSV resolve in go-dcgm `v1.4611.2`, 22 of them as deprecated aliases kept in its legacy map (e.g.
+- All 36 fields of the solution's CSV resolve in go-dcgm `v1.4611.2`, 23 of them as deprecated aliases kept in its legacy map (e.g.
   `DCGM_FI_DEV_GPU_TEMP`, whose current name is `DCGM_FI_DEV_GPU_TEMP_CELSIUS`); the exporter renders each under the CSV's name, so
   metric names and the collector mapping are unchanged.
 - The label `Hostname` is renamed `hostname` (4.8.3, #655); with a loopback remote host engine the label is the local hostname

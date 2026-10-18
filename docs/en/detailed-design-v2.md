@@ -1273,7 +1273,7 @@ look at `collection_errors` and `DRIVER_QUERY_FAILED`; details in the v1 Detaile
 
 **⑫ Unit test scope**: decoding and action mapping for every rule in the XID catalog; NVLink5 sub-codes take
 the v1/v2 bit patterns on either side of `driverBoundary`; SXID classification into official/investigatory actions;
-the 35 `DCGM_FI_*` field mappings in `dcgm-counters.csv` and the threshold boundaries of the 7 composite rules (including "N consecutive samples" and "low-utilization suppression");
+the 36 `DCGM_FI_*` field mappings in `dcgm-counters.csv` and the threshold boundaries of the 7 composite rules (including "N consecutive samples" and "low-utilization suppression");
 `collection_errors` raises the EDGE_FILTERED priority; outbox write failures and replay order.
 
 ### 3.3 Event Normalization and Channel Admission
