@@ -1,6 +1,7 @@
 # DCGM field, Prometheus type, help text
 DCGM_FI_DEV_GPU_TEMP, gauge, GPU temperature in Celsius
 DCGM_FI_DEV_MEMORY_TEMP, gauge, GPU memory temperature in Celsius
+DCGM_FI_DEV_GPU_TEMP_LIMIT, gauge, GPU T.Limit thermal margin in Celsius (signed; counts down to the max operating temperature at 0)
 DCGM_FI_DEV_POWER_USAGE, gauge, GPU power usage in watts
 DCGM_FI_DEV_POWER_MGMT_LIMIT, gauge, GPU enforced power limit in watts
 DCGM_FI_DEV_GPU_UTIL, gauge, GPU utilization in percent

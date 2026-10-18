@@ -42,7 +42,11 @@ from gpu_fault.gpu_power_policy import (
     NVIDIA_DCGM_POLICY_VERSION,
     power_violation_decision,
 )
-from gpu_fault.gpu_temperature_policy import temperature_decision
+from gpu_fault.gpu_temperature_policy import (
+    TEMPERATURE_FINDING_NAMES,
+    TEMPERATURE_LIMIT_CONTEXT,
+    temperature_decision,
+)
 from gpu_fault.gpu_temperature_policy import (
     NVIDIA_NVML_TEMPERATURE_REFERENCE as NVIDIA_NVML_TEMPERATURE_REFERENCE,
 )
@@ -326,12 +330,7 @@ class GpuMetricsService:
         "row_remap_correctable_total",
         "row_remap_uncorrectable_total",
     }
-    _TEMPERATURE_LIMITS = {
-        "gpu_slowdown_temperature_c",
-        "gpu_shutdown_temperature_c",
-        "gpu_max_operating_temperature_c",
-        "memory_max_operating_temperature_c",
-    }
+    _TEMPERATURE_LIMITS = TEMPERATURE_LIMIT_CONTEXT
     _COMPOSITE_RULE_IDS = {
         "THERMAL_STRESS",
         "POWER_LIMIT_THROTTLING",
@@ -812,10 +811,7 @@ class GpuMetricsService:
         temperature = next(
             (
                 components[name]
-                for name in {
-                    "gpu_temperature_c",
-                    "memory_temperature_c",
-                }
+                for name in sorted(TEMPERATURE_FINDING_NAMES)
                 if name in components
             ),
             None,
@@ -1009,12 +1005,11 @@ class GpuMetricsService:
         utilization = metrics.get("gpu_utilization_percent")
         has_temperature_finding = any(
             name in components
-            for name in {
-                "gpu_temperature_c",
-                "memory_temperature_c",
+            for name in (
+                *TEMPERATURE_FINDING_NAMES,
                 "thermal_violation_total_us",
                 "clock_throttle_reasons",
-            }
+            )
         )
         if (
             power is not None

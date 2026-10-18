@@ -76,6 +76,9 @@ UNKNOWN_TO_THE_PINNED_EXPORTER = frozenset(
         "DCGM_FI_DEV_FABRIC_HEALTH_MASK",
         "DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY",
         "DCGM_FI_DEV_FABRIC_MANAGER_ERROR",
+        # DCGM 4.6's name for field 153; the pinned go-dcgm knows
+        # DCGM_FI_DEV_GPU_TEMP_LIMIT only.
+        "DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS",
     }
 )
 #: Fields 170 and 171, both in the pinned go-dcgm's map (DCGM_FT_INT64).
@@ -424,4 +427,32 @@ def test_the_fabric_manager_fields_are_never_required_of_an_exporter() -> None:
         "an exporter that serves every counters field but the Fabric Manager "
         "ones must not raise 'DCGM exporter is missing required fields': "
         f"{DCGM_FIELDS.missing_dcgm_metric_groups(served)}"
+    )
+
+
+def test_the_tlimit_margin_is_exported_as_a_gauge_and_never_required() -> None:
+    """Field 153 is the reading the T.Limit thresholds grade (batch 134).
+
+    DCGM 4.1.0 added it ("Add a field to track the TLIMIT"), the pinned go-dcgm
+    maps DCGM_FI_DEV_GPU_TEMP_LIMIT to 153, and both host engines of the site
+    are newer. An exporter without it only loses the margin grading: the GPU
+    core is graded on its absolute reading again.
+    """
+
+    kinds = {
+        fields[0]: fields[1]
+        for _number, fields in _exporter_records(COUNTERS.read_text(encoding="utf-8"))
+    }
+    assert kinds.get("DCGM_FI_DEV_GPU_TEMP_LIMIT") == "gauge", (
+        "the T.Limit margin is a reading, not a count, and the grading needs it"
+    )
+    assert DCGM_METRICS["DCGM_FI_DEV_GPU_TEMP_LIMIT"] == ("gpu_tlimit_c", "celsius")
+    required = {
+        name for group in DCGM_FIELDS.DCGM_EXPORTER_FIELD_GROUPS for name in group
+    }
+    assert "DCGM_FI_DEV_GPU_TEMP_LIMIT" not in required, (
+        "an exporter without field 153 must not fail the metrics probe"
+    )
+    assert "gpu_tlimit_c" not in DCGM_FIELDS.DCGM_CORE_CANONICAL_FIELDS, (
+        "a scrape without the margin must not report a missing required field"
     )

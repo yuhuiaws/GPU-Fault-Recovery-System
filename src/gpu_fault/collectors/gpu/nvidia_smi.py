@@ -32,6 +32,7 @@ from gpu_fault.gpu_metrics import (
     GpuMetricSample,
     GpuMetricSource,
 )
+from gpu_fault.gpu_temperature_policy import TLIMIT_READING
 
 LOGGER = logging.getLogger(__name__)
 
@@ -69,6 +70,17 @@ NVIDIA_SMI_ECC_FIELDS: dict[str, tuple[str, str | None]] = {
         "ecc_dbe_aggregate_total",
         "errors",
     ),
+}
+
+#: The current T.Limit (``nvidia-smi --help-query-gpu``: "GPU T.Limit
+#: temperature. in degrees C."), the reading the T.Limit thresholds of
+#: ``nvidia-smi -q -x`` grade (gpu_temperature_policy.py). Queried only once the
+#: limits probe found T.Limit thresholds, and dropped for the process's lifetime
+#: the first time the driver refuses it (570.86 did: the 570.124.06 release notes
+#: fixed "nvidia-smi --query-gpu=temperature.gpu.tlimit fails with an "Argument
+#: Version Mismatch" error").
+NVIDIA_SMI_TLIMIT_FIELDS: dict[str, tuple[str, str | None]] = {
+    "temperature.gpu.tlimit": (TLIMIT_READING, "celsius"),
 }
 
 NVIDIA_SMI_RETIRED_FIELDS: dict[str, tuple[str, str | None]] = {
@@ -169,6 +181,7 @@ class NvidiaSmiMetricsCollector:
         )
         self._consecutive_failures = 0
         self._merged_query_refusals = 0
+        self._tlimit_refused = False
 
     def collect_once(self) -> GpuMetricBatch:
         started_at = self.now()
@@ -321,11 +334,17 @@ class NvidiaSmiMetricsCollector:
         successful query are skipped per field by ``parse_csv`` as before.
         """
 
+        tlimit = (
+            NVIDIA_SMI_TLIMIT_FIELDS
+            if self._temperature_limits.reports_tlimit and not self._tlimit_refused
+            else {}
+        )
         merged: dict[str, tuple[str, str | None]] = {
             **NVIDIA_SMI_CORE_FIELDS,
             **NVIDIA_SMI_ECC_FIELDS,
             **NVIDIA_SMI_RETIRED_FIELDS,
             **NVIDIA_SMI_REMAP_FIELDS,
+            **tlimit,
         }
         query_fields = [*self._IDENTITY_FIELDS, *merged]
         result = self._run_query(query_fields)
@@ -347,7 +366,24 @@ class NvidiaSmiMetricsCollector:
             NVIDIA_SMI_REMAP_FIELDS,
         ):
             samples.extend(self._query(optional_fields, required=False))
+        if tlimit:
+            samples.extend(self._query_tlimit())
         return samples
+
+    def _query_tlimit(self) -> list[GpuMetricSample]:
+        """The T.Limit reading alone; a refusal drops it for good, warned once."""
+
+        query_fields = [*self._IDENTITY_FIELDS, *NVIDIA_SMI_TLIMIT_FIELDS]
+        result = self._run_query(query_fields)
+        if result.returncode == 0:
+            return self.parse_csv(result.stdout, query_fields, NVIDIA_SMI_TLIMIT_FIELDS)
+        self._tlimit_refused = True
+        LOGGER.warning(
+            "nvidia-smi refused temperature.gpu.tlimit (%s); the GPU core "
+            "temperature is graded on its absolute reading from now on",
+            result.stderr.strip() or "no error detail",
+        )
+        return []
 
     def _run_query(self, query_fields: list[str]) -> subprocess.CompletedProcess[str]:
         command = [

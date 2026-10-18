@@ -28,6 +28,7 @@ from gpu_fault.gpu_metrics import (
     GpuMetricSample,
     GpuMetricSource,
 )
+from gpu_fault.gpu_temperature_policy import plausible_tlimit
 
 LOGGER = logging.getLogger(__name__)
 
@@ -81,6 +82,9 @@ def expected_gpu_count_from_environment() -> int | None:
     return counts["gpu"] if counts is not None else None
 
 
+#: Absolute thresholds in degrees Celsius: what ``nvidia-smi -q -x`` prints for
+#: a GPU without the T.Limit sensor (nvidia-smi(1): "GPU Shutdown Temp: The
+#: temperature at which a GPU will shutdown."). Positive by construction.
 NVIDIA_TEMPERATURE_LIMIT_TAGS = {
     "gpu_slowdown_temperature_c": ("gpu_temp_slow_threshold",),
     "gpu_shutdown_temperature_c": ("gpu_temp_max_threshold",),
@@ -93,6 +97,48 @@ NVIDIA_TEMPERATURE_LIMIT_TAGS = {
         "memory_max_operating_temp",
     ),
 }
+#: The same four thresholds on the T.Limit scale: signed margins in degrees
+#: Celsius that count down, so 0 and negative values are real (live, driver
+#: 580.178.04 on H200: shutdown -8 C, slowdown -2 C, max operating 0 C). The
+#: DTD nvidia-smi 580.178.04 embeds (``nvidia-smi -q -x --dtd``) makes each
+#: threshold one tag or the other, never both:
+#:   <!ELEMENT temperature (gpu_temp, gpu_temp_tlimit,
+#:     (gpu_temp_max_threshold|gpu_temp_max_tlimit_threshold),
+#:     (gpu_temp_slow_threshold|gpu_temp_slow_tlimit_threshold),
+#:     (gpu_temp_max_gpu_threshold|gpu_temp_max_gpu_tlimit_threshold),
+#:     gpu_target_temperature,memory_temp,
+#:     (gpu_temp_max_mem_threshold|gpu_temp_max_mem_tlimit_threshold))>
+#: and https://docs.nvidia.com/deploy/nvidia-smi/index.html (GPU ATTRIBUTES >
+#: Temperature) says why: "when the T.Limit sensor is supported, available
+#: temperature thresholds are also reported relative to T.Limit (see below)
+#: instead of absolute measurements". ``gpu_temp_tlimit`` itself is the current
+#: reading, not a limit; this probe caches its answer for the process lifetime,
+#: so the reading comes per tick from DCGM field 153 or
+#: ``temperature.gpu.tlimit`` instead (gpu_temperature_policy.py).
+NVIDIA_TEMPERATURE_TLIMIT_TAGS = {
+    "gpu_shutdown_tlimit_c": ("gpu_temp_max_tlimit_threshold",),
+    "gpu_slowdown_tlimit_c": ("gpu_temp_slow_tlimit_threshold",),
+    "gpu_max_operating_tlimit_c": ("gpu_temp_max_gpu_tlimit_threshold",),
+    "memory_max_operating_tlimit_c": ("gpu_temp_max_mem_tlimit_threshold",),
+}
+
+
+def _xml_celsius(temperature: ET.Element, tags: tuple[str, ...]) -> float | None:
+    """The first of ``tags`` that carries a finite number, or ``None``.
+
+    "N/A", an empty tag and an unparseable value are missing, never 0.
+    """
+
+    raw = next(
+        (text for tag in tags if (text := temperature.findtext(tag))),
+        None,
+    )
+    match = re.search(r"-?\d+(?:\.\d+)?", raw) if raw is not None else None
+    if match is None:
+        return None
+    value = float(match.group())
+    return value if math.isfinite(value) else None
+
 
 GPU_PRODUCT_PATTERN = re.compile(
     r"\b(?:(GB|GH|A|H|B)\s*[-_]?\s*(\d{2,4})|"
@@ -107,6 +153,12 @@ def query_nvidia_temperature_limits(
     runner: Runner | None = None,
 ) -> list[GpuMetricSample]:
     """Read firmware/driver temperature limits from nvidia-smi XML.
+
+    Each threshold comes on the scale the driver prints it on: absolute
+    (``*_temperature_c``, positive) or T.Limit (``*_tlimit_c``, signed). Driver
+    580 prints only the T.Limit tags on H200, and this query used to know only
+    the absolute ones: it answered ``[]``, the probe warned once a minute and
+    the GPU was graded on the configured fallback instead of its own limits.
 
     Every failure mode answers ``CollectorError``, the way
     ``query_gpu_inventory`` does: a wedged driver hangs this call into
@@ -156,22 +208,19 @@ def query_nvidia_temperature_limits(
             labels["modelName"] = product
         if pci_bdf:
             labels["pci_bus_id"] = pci_bdf
-        for canonical_name, tags in NVIDIA_TEMPERATURE_LIMIT_TAGS.items():
-            raw = next(
-                (
-                    temperature.findtext(tag)
-                    for tag in tags
-                    if temperature.findtext(tag)
-                ),
-                None,
+        for canonical_name, tags in (
+            *NVIDIA_TEMPERATURE_LIMIT_TAGS.items(),
+            *NVIDIA_TEMPERATURE_TLIMIT_TAGS.items(),
+        ):
+            raw = _xml_celsius(temperature, tags)
+            value = (
+                plausible_tlimit(raw)
+                if canonical_name in NVIDIA_TEMPERATURE_TLIMIT_TAGS
+                else raw
+                if raw is not None and raw > 0
+                else None
             )
-            if raw is None:
-                continue
-            match = re.search(r"-?\d+(?:\.\d+)?", raw)
-            if match is None:
-                continue
-            value = float(match.group())
-            if not math.isfinite(value) or value <= 0:
+            if value is None:
                 continue
             samples.append(
                 GpuMetricSample(

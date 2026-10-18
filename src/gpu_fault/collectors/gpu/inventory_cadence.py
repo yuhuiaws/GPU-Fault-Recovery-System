@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from typing import Callable
 
 from gpu_fault.gpu_metrics import GpuInventorySnapshot, GpuMetricSample
+from gpu_fault.gpu_temperature_policy import TLIMIT_THRESHOLDS
 
 from gpu_fault.collectors.gpu.discovery import (
     deliver_gpu_inventory,
@@ -35,6 +36,11 @@ INVENTORY_FAILURE_BACKOFF_THRESHOLD = 3
 # Consecutive temperature-limit failures after which the query drops to the
 # inventory cadence instead of costing every tick a 15 s subprocess timeout.
 TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD = 3
+# From the threshold on, each further failure doubles the retry interval, up to
+# this cap: an answer that never carries thresholds (a vGPU, a MIG device, or an
+# XML schema the parser does not know) is a property of the node, not of the
+# minute, and used to cost one probe and one WARNING per minute for ever.
+TEMPERATURE_LIMIT_RETRY_CAP_SECONDS = 3600
 
 #: Every inventory failure mode is a ``CollectorError`` by contract
 #: (``query_gpu_inventory``, ``read_host_boot_id`` and the snapshot's own
@@ -159,9 +165,18 @@ class TemperatureLimitProbe:
     either: treating it as one left the samples unset and cleared the failure
     counter, so the probe ran on every tick for the process's whole lifetime.
     After ``TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD`` consecutive failures
-    the retry drops to ``retry_interval_seconds`` (the inventory cadence), so a
-    driver that stays wedged costs one probe per interval instead of one per
-    tick.
+    the retry drops to ``retry_interval_seconds`` (the inventory cadence) and
+    doubles with every further failure up to ``retry_cap_seconds``, so a driver
+    that stays wedged costs one probe per hour at worst instead of one per tick.
+
+    The fixed one-minute retry is what flooded the plain-EKS nodes: driver 580
+    prints its thresholds as T.Limit tags the parser did not know, so every
+    probe "failed", and the 60 s retry, rounded up to the next 15 s tick, logged
+    one WARNING about every 64 s -- the 28 per 30 minutes of the live log. The
+    counter only restarts with the process (a release roll, a quiesce or reset
+    window, a TRIGGER_HEALTH_SNAPSHOT step, which restarts this unit, a reboot),
+    and each restart probes three times in 30 s by design. A failure now warns
+    once per distinct reason; repeats of it are DEBUG.
     """
 
     def __init__(
@@ -170,13 +185,24 @@ class TemperatureLimitProbe:
         retry_interval_seconds: int,
         logger: logging.Logger,
         failure_backoff_threshold: int = TEMPERATURE_LIMIT_FAILURE_BACKOFF_THRESHOLD,
+        retry_cap_seconds: int = TEMPERATURE_LIMIT_RETRY_CAP_SECONDS,
     ) -> None:
         self.retry_interval_seconds = retry_interval_seconds
+        self.retry_cap_seconds = max(retry_cap_seconds, retry_interval_seconds)
         self.logger = logger
         self.failure_backoff_threshold = failure_backoff_threshold
         self.samples: list[GpuMetricSample] | None = None
         self.failures = 0
         self.next_attempt_at: datetime | None = None
+        self.last_failure: str | None = None
+
+    @property
+    def reports_tlimit(self) -> bool:
+        """Whether the discovered limits are on the T.Limit scale."""
+
+        return any(
+            item.canonical_name in TLIMIT_THRESHOLDS for item in self.samples or ()
+        )
 
     def refresh(self, observed_at: datetime, runner: Runner) -> list[GpuMetricSample]:
         """The cached limits, probing for them when unknown and not backed off."""
@@ -195,20 +221,38 @@ class TemperatureLimitProbe:
                 observed_at, "nvidia-smi reported no temperature thresholds"
             )
             return []
+        if self.failures:
+            self.logger.info(
+                "NVIDIA temperature limits available after %d failed probe(s)",
+                self.failures,
+            )
         self.failures = 0
         self.next_attempt_at = None
+        self.last_failure = None
         self.samples = discovered
         return discovered
 
+    def retry_delay_seconds(self) -> int | None:
+        """The wait after the current failure count, ``None`` below the threshold."""
+
+        excess = self.failures - self.failure_backoff_threshold
+        if excess < 0:
+            return None
+        # Capped exponent: the doubling is past the cap after a dozen failures.
+        delay = self.retry_interval_seconds * (1 << min(excess, 32))
+        return min(delay, self.retry_cap_seconds)
+
     def _unavailable(self, observed_at: datetime, detail: str) -> None:
         self.failures += 1
-        if self.failures >= self.failure_backoff_threshold:
-            self.next_attempt_at = observed_at + timedelta(
-                seconds=self.retry_interval_seconds
-            )
-        self.logger.warning(
+        delay = self.retry_delay_seconds()
+        if delay is not None:
+            self.next_attempt_at = observed_at + timedelta(seconds=delay)
+        log = self.logger.debug if detail == self.last_failure else self.logger.warning
+        self.last_failure = detail
+        log(
             "NVIDIA temperature limits unavailable (%d consecutive); "
-            "using configured fallback thresholds: %s",
+            "using configured fallback thresholds, next probe %s: %s",
             self.failures,
+            "next tick" if delay is None else f"in {delay} s",
             detail,
         )

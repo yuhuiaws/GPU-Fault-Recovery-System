@@ -41,7 +41,7 @@ from gpu_fault.gpu_metrics import (
     GpuMetricSource,
     GpuMetricsThresholds,
 )
-from gpu_fault.gpu_temperature_policy import temperature_decision
+from gpu_fault.gpu_temperature_policy import TLIMIT_READING, temperature_decision
 from gpu_fault.transport.http_client import urlopen
 
 LOGGER = logging.getLogger(__name__)
@@ -85,6 +85,14 @@ STATE_CHANGE_REASONS = {
 
 DCGM_METRICS: dict[str, tuple[str, str | None]] = {
     "DCGM_FI_DEV_GPU_TEMP": ("gpu_temperature_c", "celsius"),
+    # Field 153, the current T.Limit: a signed margin that counts down, graded
+    # against the T.Limit thresholds of ``nvidia-smi -q -x`` (DCGM 4.1.0
+    # release notes: "Add a field to track the TLIMIT DCGM_FI_DEV_GPU_TEMP_LIMIT";
+    # https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html:
+    # "Thermal margin temperature (distance to nearest slowdown threshold) for
+    # this GPU"). DCGM 4.6 renamed it DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS; the
+    # pinned exporter's go-dcgm knows the 4.1 name. Exported, never required.
+    "DCGM_FI_DEV_GPU_TEMP_LIMIT": (TLIMIT_READING, "celsius"),
     "DCGM_FI_DEV_MEMORY_TEMP": (
         "memory_temperature_c",
         "celsius",

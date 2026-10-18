@@ -128,6 +128,12 @@ _GPU_METRIC_FAULT_CLASSES = {
     "gpu_shutdown_temperature_c": "GPU_THERMAL",
     "gpu_max_operating_temperature_c": "GPU_THERMAL",
     "memory_max_operating_temperature_c": "GPU_THERMAL",
+    # The T.Limit scale (gpu_temperature_policy.py): the reading and its limits.
+    "gpu_tlimit_c": "GPU_THERMAL",
+    "gpu_slowdown_tlimit_c": "GPU_THERMAL",
+    "gpu_shutdown_tlimit_c": "GPU_THERMAL",
+    "gpu_max_operating_tlimit_c": "GPU_THERMAL",
+    "memory_max_operating_tlimit_c": "GPU_THERMAL",
     "thermal_violation_total_us": "GPU_THERMAL",
     "power_violation_total_us": "GPU_THERMAL",
     "power_usage_w": "GPU_THERMAL",

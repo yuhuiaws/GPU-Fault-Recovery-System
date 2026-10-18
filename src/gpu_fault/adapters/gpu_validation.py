@@ -14,6 +14,7 @@ from gpu_fault.gpu_fabric_manager import fabric_validation
 from gpu_fault.gpu_fabric_window import fabric_state_loss
 from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.gpu_metrics import GpuMetricSource, GpuMetricsService
+from gpu_fault.gpu_temperature_policy import TLIMIT_READING
 from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStepSpec,
@@ -792,6 +793,7 @@ class GpuValidationAdapter:
             return None
         thermal_names = {
             "gpu_temperature_c",
+            TLIMIT_READING,
             "memory_temperature_c",
             "thermal_violation_total_us",
             "clock_throttle_reasons",
@@ -922,10 +924,16 @@ def _finding_text(summary: dict[str, Any]) -> str:
     if summary.get("severity"):
         parts.append(str(summary["severity"]))
     value, threshold = summary.get("value"), summary.get("threshold_value")
+    # A T.Limit margin counts down: it breaches at or below its threshold.
+    relation = "<=" if summary.get("canonical_name") == TLIMIT_READING else ">"
     if isinstance(value, (int, float)):
         parts.append(
             f"{value:g}"
-            + (f">{threshold:g}" if isinstance(threshold, (int, float)) else "")
+            + (
+                f"{relation}{threshold:g}"
+                if isinstance(threshold, (int, float))
+                else ""
+            )
         )
     if summary.get("gpu_uuid"):
         parts.append(str(summary["gpu_uuid"]))
