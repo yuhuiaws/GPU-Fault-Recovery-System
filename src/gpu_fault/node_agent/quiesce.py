@@ -16,6 +16,7 @@ from typing import Any, Callable, Mapping, Sequence
 
 from gpu_fault.cluster_scope import FABRIC_MANAGER_UNIT
 from gpu_fault.node_agent.operations.holders import (
+    fabric_manager_process,
     kubernetes_attribution,
     process_cgroup_paths,
 )
@@ -29,6 +30,7 @@ from gpu_fault.node_agent.common import (
     DEFAULT_QUIESCE_CONTAINERS,
     DEFAULT_QUIESCE_PROCESSES,
     DEFAULT_QUIESCE_SERVICES,
+    FABRIC_MANAGER_PROCESS,
     NVIDIA_GPU_DEVICE_PATTERN,
     PROCESS_NAME_PATTERN,
     SYSTEMD_NAME_PATTERN,
@@ -253,6 +255,8 @@ class GpuServiceQuiesceManager:
         for process in processes:
             if not PROCESS_NAME_PATTERN.fullmatch(process):
                 raise ValueError(f"invalid quiesce process name: {process}")
+        if FABRIC_MANAGER_PROCESS in processes:
+            raise ValueError("the quiesce never signals Fabric Manager by name")
         for process in device_sweep_processes:
             if not PROCESS_NAME_PATTERN.fullmatch(process):
                 raise ValueError(f"invalid device sweep process name: {process}")
@@ -397,12 +401,9 @@ class GpuServiceQuiesceManager:
         return False
 
     def _kill_task(self, container_id: str, signal_name: str) -> None:
-        """Signal a container task; ``ctr``'s exit status is advisory.
-
-        A task can exit on its own before the kill (kubelet is stopped, nothing
-        restarts it) and ``ctr`` then fails with "process already finished";
-        ``_wait_task_stopped`` is the authority on whether the task is gone.
-        """
+        """Signal a container task; ``ctr``'s exit status is advisory: a task
+        that exited on its own first (kubelet is stopped, nothing restarts it)
+        fails "process already finished"; ``_wait_task_stopped`` decides."""
 
         completed = self._run(
             [
@@ -553,10 +554,10 @@ class GpuServiceQuiesceManager:
         said ``quiesced: True`` and ``VERIFY_NO_GPU_CLIENTS`` failed closed
         forever. The sweep is limited to the target GPU and to an explicit
         process whitelist, the affected workload's cgroup, or -- when
-        ``sweep_kubernetes_device_holders`` is set -- a Kubernetes container.
-        Other holders stay alive so verification fails closed rather than kill
-        an unrelated workload. Returns the signalled holders in the order found;
-        survivors are not an error here, VERIFY remains the authority.
+        ``sweep_kubernetes_device_holders`` is set -- a Kubernetes container,
+        never Fabric Manager (signalled, it loses every GPU's fabric state).
+        Others stay alive: VERIFY, the authority on survivors too, fails closed
+        rather than kill an unrelated workload. Returns the signalled holders.
         """
         swept: list[dict[str, Any]] = []
         skipped: list[dict[str, Any]] = []
@@ -571,14 +572,15 @@ class GpuServiceQuiesceManager:
             kubernetes_allowed = (
                 self.sweep_kubernetes_device_holders and attribution["kubernetes"]
             )
-            if not process_allowed and not cgroup_allowed and not kubernetes_allowed:
-                skipped.append(
-                    {
-                        **holder,
-                        **attribution,
-                        "reason": ("outside_workload_cgroup_and_process_whitelist"),
-                    }
-                )
+            reason = (
+                "fabric_manager_never_swept"
+                if fabric_manager_process(holder)
+                else None
+                if process_allowed or cgroup_allowed or kubernetes_allowed
+                else "outside_workload_cgroup_and_process_whitelist"
+            )
+            if reason is not None:
+                skipped.append({**holder, **attribution, "reason": reason})
                 continue
             record = dict(holder)
             if kubernetes_allowed and not process_allowed and not cgroup_allowed:
@@ -1113,6 +1115,41 @@ def record_reset_scope(
         )
 
 
+def _window_state(
+    manager: GpuServiceQuiesceManager, incident_id: str
+) -> dict[str, Any] | None:
+    """The incident's quiesce state, read under its lock; None for a stand-in
+    manager, no window, or one that cannot be read."""
+
+    if not isinstance(manager, GpuServiceQuiesceManager):
+        return None
+    state_path = manager._state_path(incident_id)
+    try:
+        with manager._locked(state_path):
+            return manager._read_state(state_path)
+    except (OSError, ValueError, RuntimeError):
+        return None
+
+
+def window_kept_services(
+    manager: GpuServiceQuiesceManager, incident_id: str
+) -> frozenset[str]:
+    """The services the incident's quiesce window keeps running (``kept_services``).
+
+    The reset reads it right after its claim: a Fabric Manager is a bystander
+    of the display-stack release only when this window's own record kept it
+    (``holders.fabric_manager_bystander``), never one a window meant to stop. A
+    stand-in manager or an unreadable window keeps nothing; never raises.
+    """
+
+    kept = (_window_state(manager, incident_id) or {}).get("kept_services")
+    return frozenset(
+        item["service"]
+        for item in (kept if isinstance(kept, list) else ())
+        if isinstance(item, dict) and isinstance(item.get("service"), str)
+    )
+
+
 def refuse_kept_fabric_manager(
     manager: GpuServiceQuiesceManager, incident_id: str, action: str
 ) -> None:
@@ -1128,19 +1165,7 @@ def refuse_kept_fabric_manager(
     fabric as well. A stand-in manager or an unreadable window says nothing.
     """
 
-    if not isinstance(manager, GpuServiceQuiesceManager):
-        return
-    state_path = manager._state_path(incident_id)
-    try:
-        with manager._locked(state_path):
-            state = manager._read_state(state_path)
-    except (OSError, ValueError, RuntimeError):
-        return
-    kept = (state or {}).get("kept_services")
-    if isinstance(kept, list) and any(
-        isinstance(item, dict) and item.get("service") == FABRIC_MANAGER_UNIT
-        for item in kept
-    ):
+    if FABRIC_MANAGER_UNIT in window_kept_services(manager, incident_id):
         raise RuntimeError(
             f"{action} needs {FABRIC_MANAGER_UNIT} stopped, and this quiesce "
             "window kept it running for a per-GPU reset; restore the GPU services "
@@ -1157,14 +1182,6 @@ def claimed_reset_scope(
     the problem itself.
     """
 
-    if not isinstance(manager, GpuServiceQuiesceManager):
-        return None
-    state_path = manager._state_path(incident_id)
-    try:
-        with manager._locked(state_path):
-            state = manager._read_state(state_path)
-    except (OSError, ValueError, RuntimeError):
-        return None
-    issued = (state or {}).get("reset_issued")
+    issued = (_window_state(manager, incident_id) or {}).get("reset_issued")
     scope = issued.get("scope") if isinstance(issued, dict) else None
     return scope if isinstance(scope, str) else None

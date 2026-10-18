@@ -70,6 +70,7 @@ from gpu_fault.node_agent.quiesce import (
     open_quiesce_windows,
     record_reset_scope,
     refuse_kept_fabric_manager,
+    window_kept_services,
 )
 
 LOGGER = logging.getLogger(__name__)
@@ -772,6 +773,7 @@ class NodeActionExecutor(
     @final_ownership_boundary
     def _execute_reset_gpu(self, command: NodeActionCommand) -> dict[str, Any]:
         window_claimed = False
+        kept_services: frozenset[str] = frozenset()
         if self.service_quiesce_enabled:
             quiesce_manager = self.quiesce_manager
             if quiesce_manager is None:
@@ -785,7 +787,15 @@ class NodeActionExecutor(
             self._reset_gpu_preflight(command.gpu_uuids)
             self._claim_reset_window(quiesce_manager, command)
             window_claimed = True
-        return self._reset_gpu(command.gpu_uuids, window_claimed=window_claimed)
+            # The claimed window's own record of what it kept running: only a
+            # Fabric Manager named there is a bystander of the display-stack
+            # release. A read that fails keeps nothing (and never raises).
+            kept_services = window_kept_services(quiesce_manager, command.incident_id)
+        return self._reset_gpu(
+            command.gpu_uuids,
+            window_claimed=window_claimed,
+            kept_services=kept_services,
+        )
 
     def _claim_reset_window(
         self, quiesce_manager: GpuServiceQuiesceManager, command: NodeActionCommand

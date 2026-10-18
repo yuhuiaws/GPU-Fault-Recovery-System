@@ -27,7 +27,9 @@ from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
+from gpu_fault.cluster_scope import FABRIC_MANAGER_UNIT
 from gpu_fault.node_agent.common import (
+    FABRIC_MANAGER_PROCESS,
     NVIDIA_GPU_DEVICE_PATTERN,
     PERSISTENCE_DAEMON_PROCESS,
 )
@@ -248,6 +250,85 @@ def persistence_daemon_bystander(
         )
         for device in devices
     )
+
+
+#: What Fabric Manager opens with NVLink Inband (Hopper and later): the
+#: fabric-management capability, the NVSwitches and the NVLink node -- never a
+#: GPU or ``/dev/nvidiactl`` ("not opening and operating on GPUs directly", its
+#: own log on a p5en node). The holder scan lists only the capability.
+FABRIC_MANAGER_DEVICE_PATTERN = re.compile(
+    r"^/dev/nvidia-(?:caps/[A-Za-z0-9_.-]+|nvswitch(?:\d+|ctl)|nvlink)$"
+)
+
+
+def systemd_unit_cgroup(cgroup_paths: Iterable[str], unit: str) -> bool:
+    """Whether the cgroup paths place a process in ``<unit>.service`` and in
+    no other unit or scope (a cgroup-v1 controller's parent slice is neither)."""
+
+    leaves = {
+        path.rsplit("/", 1)[-1]
+        for path in cgroup_paths
+        if path.endswith((".service", ".scope"))
+    }
+    return leaves == {f"{unit}.service"}
+
+
+def fabric_manager_process(holder: Mapping[str, Any]) -> bool:
+    """A Fabric Manager by its name or by its unit's cgroup: never signalled."""
+
+    return holder.get("process_name") == FABRIC_MANAGER_PROCESS or any(
+        str(path).endswith(f"/{FABRIC_MANAGER_UNIT}.service")
+        for path in holder.get("cgroup_paths") or ()
+    )
+
+
+def fabric_manager_bystander(
+    holder: Mapping[str, Any], kept_services: Collection[str]
+) -> bool:
+    """Whether ``holder`` is the Fabric Manager this window kept running.
+
+    A per-GPU reset window keeps ``nvidia-fabricmanager`` (stopping it loses
+    the fabric state of every other GPU), and with NVLink Inband it holds only
+    the fabric's own nodes (``FABRIC_MANAGER_DEVICE_PATTERN``): no client of
+    the target GPU and none of the display stack. Read as one, it kept the idle
+    ``nvidia_drm``/``nvidia_modeset`` loaded and every busy reset of a plain
+    EKS p5en node failed three times "In use by another client" (live,
+    GF-REGIONAL-DESTR-001: ``nv-fabricmanage`` in ``nvidia-fabricmanager.service``
+    on ``/dev/nvidia-caps/nvidia-cap0``). Only that one: the window's own record
+    names it kept (``kept_services``), the process runs in the unit's cgroup and
+    no container, and it holds no deleted node and no GPU, ``/dev/nvidiactl``
+    or ``nvidia-uvm`` -- a Fabric Manager that opens those operates the GPUs
+    through the driver and is a client like any other.
+    """
+
+    if (
+        FABRIC_MANAGER_UNIT not in kept_services
+        or holder.get("process_name") != FABRIC_MANAGER_PROCESS
+        or holder.get("kubernetes")
+        or holder.get("deleted_device_node")
+        or not systemd_unit_cgroup(
+            holder.get("cgroup_paths") or (), FABRIC_MANAGER_UNIT
+        )
+    ):
+        return False
+    devices = [item for item in str(holder.get("devices") or "").split(",") if item]
+    return bool(devices) and all(
+        FABRIC_MANAGER_DEVICE_PATTERN.fullmatch(device) for device in devices
+    )
+
+
+def display_release_bystander(
+    holder: Mapping[str, Any],
+    target_device_paths: Collection[str],
+    kept_services: Collection[str] = (),
+) -> bool:
+    """A holder the display-stack release goes ahead beside: the persistence
+    daemon on the other GPUs, or the Fabric Manager the window kept (it holds
+    no GPU node at all, so the target set does not enter its rule)."""
+
+    return persistence_daemon_bystander(
+        holder, target_device_paths
+    ) or fabric_manager_bystander(holder, kept_services)
 
 
 def display_module_state(proc_root: Path) -> list[dict[str, Any]]:

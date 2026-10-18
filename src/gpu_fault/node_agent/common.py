@@ -14,6 +14,9 @@ PERSISTENCE_DAEMON_PROCESS = "nvidia-persiste"
 # Our oneshot ``nvidia-smi -pm 1``: the restore re-enables what the quiesce
 # released through it, in whichever regime (daemon or legacy) the node runs.
 PERSISTENCE_RESTORE_UNIT = "gpu-fault-gpu-persistence"
+# Fabric Manager's ``comm`` (``nv-fabricmanager`` cut at 15 characters); its
+# unit is ``cluster_scope.FABRIC_MANAGER_UNIT``.
+FABRIC_MANAGER_PROCESS = "nv-fabricmanage"
 
 DEFAULT_QUIESCE_SERVICES = (
     "nvidia-fabricmanager",

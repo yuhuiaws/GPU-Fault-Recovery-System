@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
-from collections.abc import Iterator
+from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
@@ -18,10 +18,10 @@ from gpu_fault.node_agent.late_ownership import (
 from gpu_fault.node_agent.operations.holders import (
     IDLE_DISPLAY_MODULES,
     display_module_state,
+    display_release_bystander,
     gpu_client_holder_evidence,
     gpu_client_holder_summary,
     idle_display_modules,
-    persistence_daemon_bystander,
 )
 
 MAX_RESET_BUSY_ATTEMPTS = 3
@@ -144,6 +144,7 @@ class ResetOperationsMixin:
         gpu_uuids: list[str],
         released: list[str],
         bystanders: list[dict[str, Any]] | None = None,
+        kept_services: Collection[str] = (),
     ) -> bool:
         """Unload ``nvidia_drm`` / ``nvidia_modeset`` when they are the only
         thing between a busy reset and a free GPU; appends what it unloaded to
@@ -153,9 +154,11 @@ class ResetOperationsMixin:
         device node (``gpu_client_holder_evidence``): a holder is a client to
         wait for or report, not something to pull a kernel module from under.
         The persistence daemon the quiesce kept, holding nothing but the other
-        GPUs and ``/dev/nvidiactl``, is no such client
-        (``persistence_daemon_bystander``); it goes to ``bystanders``. The
-        modules are loaded again after the reset (``_reload_display_modules``).
+        GPUs and ``/dev/nvidiactl``, and the Fabric Manager the window kept
+        (``kept_services``, the window's own record), holding nothing but the
+        fabric's nodes, are no such clients (``display_release_bystander``);
+        they go to ``bystanders``. The modules are loaded again after the reset
+        (``_reload_display_modules``).
         """
 
         evidence = self._gpu_client_holder_evidence(gpu_uuids)
@@ -164,7 +167,8 @@ class ResetOperationsMixin:
         holders = evidence.get("device_holders") or []
         targets = evidence.get("target_device_paths") or []
         if evidence.get("device_holder_count", len(holders)) != len(holders) or any(
-            not persistence_daemon_bystander(holder, targets) for holder in holders
+            not display_release_bystander(holder, targets, kept_services)
+            for holder in holders
         ):
             # A listed holder that is a client, or more holders than the
             # bounded evidence lists: nothing is unloaded.
@@ -227,6 +231,7 @@ class ResetOperationsMixin:
         released: list[str] | None = None,
         calls: list[dict[str, Any]] | None = None,
         bystanders: list[dict[str, Any]] | None = None,
+        kept_services: Collection[str] = (),
     ) -> int:
         """Spawn ``command`` behind the final ownership checkpoint, retrying a
         driver refusal "In use by another client" up to ``_RESET_BUSY_ATTEMPTS``.
@@ -303,7 +308,9 @@ class ResetOperationsMixin:
                 if not busy:
                     raise
                 unloaded_before = len(released)
-                if self._release_idle_display_modules(gpu_uuids, released, bystanders):
+                if self._release_idle_display_modules(
+                    gpu_uuids, released, bystanders, kept_services
+                ):
                     # Each unload passed its own checkpoint before the rmmod.
                     calls.extend(
                         {"command": f"rmmod {module}", "outcome": "released"}
@@ -379,7 +386,11 @@ class ResetOperationsMixin:
         gpu_uuids: list[str],
         *,
         window_claimed: bool = False,
+        kept_services: Collection[str] = (),
     ) -> dict[str, Any]:
+        """Reset each GPU in turn; ``kept_services`` names what the claimed
+        quiesce window kept running (``quiesce.window_kept_services``)."""
+
         with self._pre_spawn_guard(window_claimed=window_claimed):
             self._reset_gpu_preflight(gpu_uuids)
         reset_attempts = 0
@@ -401,6 +412,7 @@ class ResetOperationsMixin:
                     released=released,
                     calls=calls,
                     bystanders=bystanders,
+                    kept_services=kept_services,
                 )
             except (RuntimeError, OwnershipRefused) as exc:
                 # Report the loop's progress: the GPUs already reset, the one
