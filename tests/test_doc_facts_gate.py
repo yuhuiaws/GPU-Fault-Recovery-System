@@ -169,3 +169,65 @@ def test_cli_reports_and_exits_nonzero_on_a_stale_root(tmp_path: Path) -> None:
     assert result.returncode == 1
     assert "collectors-no-stale-auth-claim" in result.stdout
     assert "collectors-bearer-auth" in result.stdout
+
+
+XID45_FACTS = (
+    "xid45-evidence-url",
+    "xid45-evidence-quote",
+    "xid45-evidence-url-en",
+    "xid45-evidence-quote-en",
+)
+XID45_POLICY = "src/gpu_fault/orchestration/xid45_policy.py"
+NVIDIA_POLICY = "docs/components/nvidia-policy.md"
+NVIDIA_POLICY_EN = "docs/en/components/nvidia-policy.md"
+
+
+def _copy_source(root: Path, relative: str, replace: tuple[str, str] | None) -> None:
+    text = (ROOT / relative).read_text(encoding="utf-8")
+    if replace is not None:
+        old, new = replace
+        assert old in text, f"{relative} no longer carries {old!r}"
+        text = text.replace(old, new, 1)
+    target = root / relative
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text, encoding="utf-8")
+
+
+def test_the_xid45_evidence_is_cited_by_the_policy_and_both_docs(
+    tmp_path: Path,
+) -> None:
+    """Batch 131: NVIDIA's GPU debug guidelines row for XID 45 is the basis of
+    the observe-only default; the policy module and both language editions of
+    the policy audit carry its URL and the verbatim quote."""
+
+    for relative in (NVIDIA_POLICY, NVIDIA_POLICY_EN):
+        _copy_doc(tmp_path, relative, None)
+    _copy_source(tmp_path, XID45_POLICY, None)
+
+    assert MODULE.check_facts(tmp_path, _facts(*XID45_FACTS)) == []
+
+
+def test_dropping_the_xid45_citation_from_a_doc_is_reported(tmp_path: Path) -> None:
+    _copy_doc(tmp_path, NVIDIA_POLICY, None)
+    _copy_doc(tmp_path, NVIDIA_POLICY_EN, (MODULE.XID45_EVIDENCE_URL, "(link removed)"))
+    _copy_source(tmp_path, XID45_POLICY, None)
+
+    failures = MODULE.check_facts(tmp_path, _facts(*XID45_FACTS))
+
+    assert len(failures) == 1, failures
+    assert NVIDIA_POLICY_EN in failures[0] and "statement not found" in failures[0]
+
+
+def test_dropping_the_xid45_evidence_from_the_policy_is_reported(
+    tmp_path: Path,
+) -> None:
+    for relative in (NVIDIA_POLICY, NVIDIA_POLICY_EN):
+        _copy_doc(tmp_path, relative, None)
+    _copy_source(
+        tmp_path, XID45_POLICY, ('"#understanding-xid-messages"', '"#somewhere-else"')
+    )
+
+    failures = MODULE.check_facts(tmp_path, _facts(*XID45_FACTS))
+
+    assert len(failures) == 4, failures
+    assert all("the GPU debug guidelines URL" in item for item in failures), failures

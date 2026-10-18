@@ -36,6 +36,22 @@ COLLECTORS = "COLLECTORS.md"
 AUTH_MIDDLEWARE = "src/gpu_fault/app/middleware/auth.py"
 APP_FACTORY = "src/gpu_fault/app/factory.py"
 REGIONAL = "src/gpu_fault/regional.py"
+# The NVIDIA evidence for the observe-only solo XID 45 (batch 131): the policy
+# module records it, and both language editions of the policy audit cite it.
+XID45_POLICY = "src/gpu_fault/orchestration/xid45_policy.py"
+NVIDIA_POLICY = "docs/components/nvidia-policy.md"
+NVIDIA_POLICY_EN = "docs/en/components/nvidia-policy.md"
+XID45_EVIDENCE_URL = (
+    "https://docs.nvidia.com/deploy/gpu-debug-guidelines/gpu-node-triage.html"
+    "#understanding-xid-messages"
+)
+XID45_EVIDENCE_QUOTE = (
+    "No action, informative only. Indicates channels affected by another "
+    "failure. On A100, this error could be seen by itself due to unexpected "
+    "Fabric Manager shutdown when FM is running in the same OS environment as "
+    "the GPU. Otherwise, this error is safe to ignore as an informational "
+    "message."
+)
 
 Predicate = Callable[[Path], str | None]
 
@@ -153,6 +169,25 @@ def default_deny_bucket_is_implemented(root: Path) -> str | None:
     return None
 
 
+def xid45_policy_records_the_evidence(root: Path) -> str | None:
+    """The policy module carries NVIDIA's URL and quote as string constants."""
+
+    tree = _parse(root, XID45_POLICY)
+    if tree is None:
+        return f"{XID45_POLICY} is missing"
+    missing = [
+        label
+        for label, text in (
+            ("the GPU debug guidelines URL", XID45_EVIDENCE_URL),
+            ("the verbatim XID 45 row", XID45_EVIDENCE_QUOTE),
+        )
+        if not _has_string(tree, text)
+    ]
+    if missing:
+        return f"{XID45_POLICY} no longer records " + " and ".join(missing)
+    return None
+
+
 FACTS: tuple[Fact, ...] = (
     Forbidden(
         id="test-file-count-not-literal",
@@ -201,6 +236,30 @@ FACTS: tuple[Fact, ...] = (
         document=COLLECTORS,
         phrase="未声明授权桶的路由默认拒绝",
         truth=default_deny_bucket_is_implemented,
+    ),
+    Statement(
+        id="xid45-evidence-url",
+        document=NVIDIA_POLICY,
+        phrase=XID45_EVIDENCE_URL,
+        truth=xid45_policy_records_the_evidence,
+    ),
+    Statement(
+        id="xid45-evidence-quote",
+        document=NVIDIA_POLICY,
+        phrase=XID45_EVIDENCE_QUOTE,
+        truth=xid45_policy_records_the_evidence,
+    ),
+    Statement(
+        id="xid45-evidence-url-en",
+        document=NVIDIA_POLICY_EN,
+        phrase=XID45_EVIDENCE_URL,
+        truth=xid45_policy_records_the_evidence,
+    ),
+    Statement(
+        id="xid45-evidence-quote-en",
+        document=NVIDIA_POLICY_EN,
+        phrase=XID45_EVIDENCE_QUOTE,
+        truth=xid45_policy_records_the_evidence,
     ),
 )
 

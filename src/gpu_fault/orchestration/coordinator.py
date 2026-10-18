@@ -698,6 +698,7 @@ class IncidentOrchestrator:
         decision: FaultPolicyDecision,
     ) -> tuple[FaultIncident, WorkflowRequest | None]:
         with self._node_locks.held([(event.cluster_id, event.node_id)]):
+            decision = self._builder.xid45_site_policy(event, decision)  # idempotent
             existing = self.store.get_incident_by_event(event.event_id)
             if existing is not None:
                 linked = self._linked_workflow(existing, event.event_id)
@@ -725,7 +726,6 @@ class IncidentOrchestrator:
 
             # Marker association is evidence; store groups arbitrate atomically.
             decision = execution_decision(event, decision, existing)
-            decision = self._builder.xid45_site_policy(event, decision)
 
             stale = self._fence_stale_generation_without_baseline(event, decision)
             if stale is not None:

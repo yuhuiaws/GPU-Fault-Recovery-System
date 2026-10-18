@@ -103,6 +103,10 @@ rules:
       - tests/deploy/test_node_installer_eks_managed_job.py
       - tests/node_agent/test_node_installer_eks_managed.py
       - tests/regional/test_regional_least_privilege_acceptance.py
+      # cluster_scope.py also holds the Fabric Manager unit and its start bound
+      # (batch 131): the Agent's 780 s and the control plane's 1200 s step cap.
+      - tests/node_agent/test_fabric_manager_unit_timing.py
+      - tests/execution/test_fabric_manager_step_waiting_cap.py
     regional_cases:
       - GF-REGIONAL-BOOT-033..035
     checks:
@@ -471,6 +475,11 @@ rules:
     pytest:
       - tests/orchestration
       - tests/execution
+      # The XID 45 site policy (orchestration/xid45_policy.py) decides the
+      # shape DESTR-010/019 drive (batch 131).
+      - tests/regional/test_destr010_fabric_reset_shape.py
+      - tests/regional/test_destr019_fabric_reset_shape.py
+      - tests/regional/test_xid45_opt_in_window.py
     regional_cases:
       - GF-REGIONAL-PREEMPT-001..012
       - GF-REGIONAL-PREEMPT-014..022
@@ -481,6 +490,7 @@ rules:
       - GF-REGIONAL-DESTR-016
       - GF-REGIONAL-DESTR-017
       - GF-REGIONAL-DESTR-018
+      - GF-REGIONAL-DESTR-019
     checks:
       - architecture-check
 
@@ -586,6 +596,9 @@ rules:
       - tests/node_agent/test_quiesce_fabric_manager_keep.py
       - tests/regional/test_destr010_fabric_reset_shape.py
       - tests/regional/test_destr019_fabric_reset_shape.py
+      # The grading also decides the observe-only solo XID 45 (batch 131).
+      - tests/orchestration/test_xid45_observe_only.py
+      - tests/regional/test_xid45_opt_in_window.py
     regional_cases:
       - GF-REGIONAL-COLLECT-001..020
     checks:
@@ -607,6 +620,7 @@ rules:
       - tests/fleet/test_dcgm_hostengine_heartbeat.py
       - tests/execution/test_quiesce_fabric_manager_policy.py
       - tests/execution/test_validation_fabric_state_loss.py
+      - tests/execution/test_fabric_manager_step_waiting_cap.py
       - tests/deploy/test_node_installer_security.py
       - tests/regional/test_dataplane_rbac_security.py
       - tests/regional/test_production_safety_config.py
