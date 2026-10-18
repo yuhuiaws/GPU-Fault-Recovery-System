@@ -681,6 +681,111 @@ The temperature policy prefers the device limits that the collector reads via `n
 | PCIe replay rate warning | `>8/min` |
 | NVLink error delta critical | `>=1` |
 
+**The two scales of a temperature limit.** NVIDIA reports device temperature limits on two scales and the product never
+converts one into the other (`gpu_temperature_policy.py`; collector side `collectors/gpu/discovery.py`):
+
+| Scale | `nvidia-smi -q -x` tags | Canonical | Graded reading | Critical (`DRAIN`) | Warning (`RUN_DIAGNOSTICS`) | `threshold_source` |
+|---|---|---|---|---|---|---|
+| Absolute (°C, positive) | `gpu_temp_slow_threshold`, `gpu_temp_max_threshold`, `gpu_temp_max_gpu_threshold`, `gpu_temp_max_mem_threshold` | `gpu_slowdown_temperature_c`, `gpu_shutdown_temperature_c`, `gpu_max_operating_temperature_c`, `memory_max_operating_temperature_c` | `gpu_temperature_c`, `memory_temperature_c` (DCGM 150/140), reading ≥ threshold | slowdown, else max-operating, else shutdown − 3 °C; HBM: memory max-operating | min(critical − 5 °C, max-operating); HBM: critical − 5 °C | `NVIDIA_DEVICE_LIMIT` |
+| T.Limit (signed margin, counts down) | `gpu_temp_slow_tlimit_threshold`, `gpu_temp_max_tlimit_threshold`, `gpu_temp_max_gpu_tlimit_threshold`, `gpu_temp_max_mem_tlimit_threshold` | `gpu_slowdown_tlimit_c`, `gpu_shutdown_tlimit_c`, `gpu_max_operating_tlimit_c`, `memory_max_operating_tlimit_c` | `gpu_tlimit_c`: DCGM field 153 `DCGM_FI_DEV_GPU_TEMP_LIMIT` (exported by the bundled counters), `temperature.gpu.tlimit` in nvidia-smi metrics mode; reading ≤ threshold | slowdown T.Limit, else max-operating T.Limit, else shutdown T.Limit + 3 °C | max(critical + 5 °C, GPU max-operating T.Limit, memory max-operating T.Limit) | `NVIDIA_DEVICE_TLIMIT` |
+| Site fallback | — | — | `gpu_temperature_c`, `memory_temperature_c`, reading ≥ threshold | 90 °C / 95 °C | 85 °C / 90 °C | `CONFIGURED_FALLBACK` |
+
+NVIDIA's words and where they are (verbatim):
+
+- nvidia-smi documentation <https://docs.nvidia.com/deploy/nvidia-smi/index.html>, GPU ATTRIBUTES › Temperature (the
+  v610 documentation set; the `nvidia-smi(1)` man page shipped with driver 580.178.04 has the same text, the man page
+  carries this section since 575.57.08 and 570.211.01 does not):
+  - "T.Limit: The T.Limit sensor measures the current margin in degree Celsius to the maximum operating temperature.
+    As such it is not an absolute temperature reading rather a relative measurement."
+  - "When supported, nvidia-smi reports the current T.Limit temperature as a signed value that counts down. A T.Limit
+    temperature of 0 C or lower indicates that the GPU may optimize its clock based on thermal conditions. Further,
+    when the T.Limit sensor is supported, available temperature thresholds are also reported relative to T.Limit (see
+    below) instead of absolute measurements."
+  - "GPU Current T.Limit Temp: Current margin in degrees Celsius from the maximum GPU operating temperature." (the 580
+    label is "GPU T.Limit Temp"; the page's Change Log, "Changes between nvidia-smi v610 Update and v595": "Renamed 'GPU
+    T.Limit Temp' to 'GPU Current T.Limit Temp'", and "Specification" appended to the static thresholds)
+  - "GPU Shutdown T.Limit Temp Specification: The T.Limit temperature below which a GPU may shutdown. Since shutdown
+    can only triggered by the maximum GPU temperature it is possible for the current T.Limit to be more negative than
+    this threshold."
+  - "GPU Slowdown T.Limit Temp Specification: The T.Limit temperature at or below which GPU HW may optimize its clocks
+    for thermal conditions. Since this clock adjustment can only triggered by the maximum GPU temperature it is
+    possible for the current T.Limit to be more negative than this threshold."
+  - "GPU Max Operating T.Limit Temp Specification: The T.Limit temperature below which GPU SW will optimize its clock
+    for thermal conditions."
+  - "Memory Max Operating T.Limit Temp Specification: The temperature at which GPU SW will optimize its memory clocks
+    for thermal conditions. Only available on supported devices."
+- The DTD embedded in nvidia-smi 580.178.04 (`nvidia-smi -q -x --dtd`, identical from 535.288.01 to 580.178.04) makes
+  every threshold either the absolute tag or the T.Limit tag: `<!ELEMENT temperature (gpu_temp, gpu_temp_tlimit,
+  (gpu_temp_max_threshold|gpu_temp_max_tlimit_threshold), (gpu_temp_slow_threshold|gpu_temp_slow_tlimit_threshold),
+  (gpu_temp_max_gpu_threshold|gpu_temp_max_gpu_tlimit_threshold), gpu_target_temperature,memory_temp,
+  (gpu_temp_max_mem_threshold|gpu_temp_max_mem_tlimit_threshold))>`.
+- NVML (`nvml.h` of cuda-nvml-dev 13.0; <https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlFieldValueEnums.html>):
+  "GPU T.Limit temperature thresholds in degree Celsius. These fields are supported on Ada and later architectures and
+  supersedes nvmlDeviceGetTemperatureThreshold."; `NVML_FI_DEV_TEMPERATURE_SHUTDOWN_TLIMIT` (193) "T.Limit temperature
+  after which GPU may shut down for HW protection", `NVML_FI_DEV_TEMPERATURE_SLOWDOWN_TLIMIT` (194) "T.Limit temperature
+  after which GPU may begin HW slowdown", `NVML_FI_DEV_TEMPERATURE_MEM_MAX_TLIMIT` (195) "T.Limit temperature after
+  which GPU may begin SW slowdown due to memory temperature", `NVML_FI_DEV_TEMPERATURE_GPU_MAX_TLIMIT` (196) "T.Limit
+  temperature after which GPU may be throttled below base clock". `nvmlDeviceGetTemperatureThreshold`
+  (<https://docs.nvidia.com/deploy/nvml-api/latest/api/group__nvmlDeviceQueries.html>): "This API is no longer the
+  preferred interface for retrieving the following temperature thresholds on Ada and later architectures:
+  NVML_TEMPERATURE_THRESHOLD_SHUTDOWN, NVML_TEMPERATURE_THRESHOLD_SLOWDOWN, NVML_TEMPERATURE_THRESHOLD_MEM_MAX and
+  NVML_TEMPERATURE_THRESHOLD_GPU_MAX."; on the same page `nvmlDeviceGetMarginTemperature`: "Retrieves the thermal
+  margin temperature (distance to nearest slowdown threshold)." (`nvmlMarginTemperature_v1_t.marginTemperature` is a
+  signed `int`). NVML Change Log (<https://docs.nvidia.com/deploy/nvml-api/change-log.html>), "Changes between v530 and
+  v535": "Added new field IDs NVML_FI_DEV_TEMPERATURE_SHUTDOWN_TLIMIT, NVML_FI_DEV_TEMPERATURE_SLOWDOWN_TLIMIT,
+  NVML_FI_DEV_TEMPERATURE_MEM_MAX_TLIMIT, and NVML_FI_DEV_TEMPERATURE_GPU_MAX_TLIMIT to query temperature thresholds on
+  Ada and later architectures."; "Changes between v565 and v570": "Added nvmlDeviceGetMarginTemperature() to retrieve
+  the thermal margin temperature (distance to nearest slowdown threshold)."
+- DCGM: <https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html> 4.1.0 New Features: "Add a field
+  to track the TLIMIT DCGM_FI_DEV_GPU_TEMP_LIMIT" (renamed `DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS` in 4.6.0);
+  <https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html>: "Thermal margin temperature
+  (distance to nearest slowdown threshold) for this GPU."; the DCGM 4.4.1 source `dcgmlib/src/DcgmCacheManager.cpp`
+  reads field 153 with `nvmlDeviceGetMarginTemperature`.
+- Driver release notes: <https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-535-129-03/index.html>
+  "1.2. Fixed Issues": "4165142 – Fixed an issue arising from a race condition between internal GPU microcontrollers in
+  fetching GPU memory temperature which causes the current HBM temperature to return an invalid value which is above
+  the memory maximum operating temperature. This produced a negative T.Limit temperature reading.";
+  <https://docs.nvidia.com/datacenter/tesla/tesla-release-notes-570-124-06/index.html> "1.2. Fixed Issues": "The command
+  nvidia-smi --query-gpu=temperature.gpu.tlimit fails with an "Argument Version Mismatch" error. The underlying NVML
+  API now checks a version number that is set by nvidia-smi." Of all 60 data center driver release notes from 535.54.03
+  to 615.71.09 only these two mention T.Limit, and none announces the XML switch to the T.Limit tags; that change is
+  recorded only in the nvidia-smi documentation and the DTD above.
+
+**No absolute threshold follows.** NVIDIA defines margins only: T.Limit "is not an absolute temperature reading", the
+thresholds are "reported relative to T.Limit ... instead of absolute measurements", and the shutdown/slowdown entries
+say the current T.Limit can be more negative than the threshold without the trigger firing (the triggers look at "the
+maximum GPU temperature"). NVIDIA gives no conversion formula, so the product never derives an absolute threshold from
+something like `gpu_temp + T.Limit`; it grades on the T.Limit scale, where a breach is "at or below". The live H200
+(driver 580.178.04: shutdown −8, slowdown −2, GPU and memory max-operating 0) warns at `gpu_tlimit_c` ≤ 3
+(max(−2 + 5, 0, 0)) and is critical at ≤ −2.
+
+**Precedence.** GPU core: the T.Limit judgement (a plausible `gpu_tlimit_c` plus at least one GPU T.Limit threshold)
+before the absolute device limits, those before the site fallback (NVML: "supersedes
+nvmlDeviceGetTemperatureThreshold"); while the T.Limit judgement exists the absolute reading `gpu_temperature_c` is not
+graded on the fallback, so one condition is not reported twice. NVIDIA has no separate memory T.Limit reading
+(`memory_temp` is absolute), but the 535.129.03 fix shows that the one T.Limit reading covers the GPU and its memory (an
+HBM read above the memory maximum operating temperature drove T.Limit negative; this agrees with the shutdown/slowdown
+entries: both trigger on "the maximum GPU temperature" only, so the current T.Limit can be more negative than them).
+The memory max-operating T.Limit threshold (NVML: "T.Limit temperature after which GPU may begin SW slowdown due to
+memory temperature") therefore joins the warning boundary as the GPU's own SW slowdown point does; critical stays the
+HW slowdown threshold, because one reading cannot tell whose margin it is. `memory_temperature_c` keeps the absolute
+memory max-operating limit or the 90/95 °C fallback: NVIDIA reports the memory temperature only in absolute degrees,
+and the T.Limit's memory share rests on a bug-fix note rather than a definition, so that memory safety net stays. A
+T.Limit value further than 150 °C from 0 (a sentinel or a wrapped integer) is ignored like N/A; that is input
+validation, not an NVIDIA value. The `policy_reference` of a T.Limit finding is the nvidia-smi documentation, that of
+an absolute limit is NVML `nvmlDeviceGetTemperatureThreshold` (the old `nvml-api/group__nvmlDeviceQueries.html` link
+is a 404); the VALIDATE_GPU failure text writes a T.Limit breach as `value<=threshold`. A T.Limit finding is
+`GPU_THERMAL` like a temperature finding, is the temperature component of `THERMAL_STRESS`, and rules out the power
+correlation.
+
+**Probe and logging (`TemperatureLimitProbe` in `collectors/gpu/inventory_cadence.py`).** Thresholds on either scale
+are a success, cached for the process's lifetime; after 3 consecutive failures the retry drops to the inventory
+interval (60 s) and doubles with every further failure, capped at 3600 s; one WARNING per distinct reason, repeats are
+DEBUG, and limits found later log one INFO. Before, the fixed 60 s retry warned on every probe: the 580 T.Limit tags
+were unknown, the 60 s retry rounded up to the next 15 s tick, about one line per 64 s per node (28 per 30 minutes);
+the counter only restarted with the process (a release roll, a quiesce or reset window, a `TRIGGER_HEALTH_SNAPSHOT`
+step, which restarts the unit, a reboot), and every restart probes three times in 30 s by design.
+
 The DCGM XID gauge only establishes a baseline on its first reading; only later value changes produce an XidEvent, and repeated identical values do not re-alert.
 row-remap uses the correctable/uncorrectable remapped-row fields; on environments such as H200 the aggregated
 `DCGM_FI_DEV_NVLINK_ERROR_DL_CRC/RECOVERY/REPLAY` fields are preferred. The collector treats
@@ -696,8 +801,9 @@ A GPU metric finding stores `policy_source`, `policy_version`,
 - Pending row remap uses the controlled reset workflow.
 - Row-remap failure uses drain/quarantine; only after NVIDIA Field Diagnostic validation can it
   proceed to the RMA/replacement decision.
-- Device temperature limit derivation rules use `SITE_NVIDIA_DEVICE_LIMIT_DERIVED`; reaching the device operating limit
-  uses `DRAIN`, and the fixed temperatures serve only as the `SITE_DCGM_METRIC` fallback when the read fails.
+- Device temperature limit derivation rules (absolute and T.Limit scale) use `SITE_NVIDIA_DEVICE_LIMIT_DERIVED`;
+  reaching the device operating limit uses `DRAIN`, and the fixed temperatures serve only as the `SITE_DCGM_METRIC`
+  fallback when the device exposes no usable limit, or T.Limit thresholds without a T.Limit reading.
 - The first thermal violation increase goes to diagnostics; once consecutive increases reach the configured count it escalates to `DRAIN`.
 - When a finding escalates from warning to critical or its automatic action changes, a `new_finding` is emitted again so that the existing
   attempt workflow can escalate in place or create a successor.

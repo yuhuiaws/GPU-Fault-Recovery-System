@@ -7530,9 +7530,9 @@ Rule sources and default handling are as follows:
 | Row-remap pending | Stop jobs, reset the GPU in a controlled window, then validate | NVIDIA GPU Memory Error Management |
 | Row-remap failure | Stop jobs and isolate; RMA can be judged only after running the NVIDIA Field Diagnostic | NVIDIA GPU Memory Error Management RMA Policy |
 | Aggregate DBE/uncorrectable remap counter increased | Warning, run diagnostics | Site conservative policy; the first scrape of a cumulative value only establishes a baseline |
-| GPU temperature | Prefers the device slowdown/max-operating/shutdown limits; warning runs diagnostics, reaching the operating limit executes `DRAIN` | Site action derived from NVIDIA device limits |
+| GPU temperature | Prefers the device slowdown/max-operating/shutdown limits: on the T.Limit scale (H200 on driver 580) `gpu_tlimit_c` ≤ threshold, on the absolute scale `gpu_temperature_c` ≥ threshold; warning runs diagnostics, reaching the operating limit executes `DRAIN` | Site action derived from NVIDIA device limits |
 | HBM temperature | Prefers the device memory max-operating limit; warning runs diagnostics, reaching the limit executes `DRAIN` | Site action derived from NVIDIA device limits |
-| GPU/HBM fallback temperature | Uses 85/90 and 90/95 when the device exposes no limits | Site fallback |
+| GPU/HBM fallback temperature | Uses 85/90 when the device exposes no usable limit, or T.Limit thresholds without a T.Limit reading; 90/95 for HBM without an absolute limit | Site fallback |
 | Power violation increased | Warning, run diagnostics | NVIDIA DCGM Health signal; the delta allows site override |
 | Thermal violation increased | First Warning with diagnostics; continued growth escalates to `DRAIN` on the 2nd by default | NVIDIA DCGM Health signal plus site automated escalation |
 | DCGM scrape failed (`collection_errors`) | Warning `dcgm_field_completeness` booked at once (NO_ACTION, no incident); diagnostics run only once the node's error batches have lasted `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` (default 180 s) back to back; the next clean scrape clears it | Site policy `SITE_DCGM_FIELD_COMPLETENESS` |
@@ -7553,10 +7553,34 @@ The old parameters `GPU_FAULT_PCIE_REPLAY_DELTA_WARNING` and
 so that a change in collection period does not produce different results for the same behaviour.
 
 The node collector reads and caches each GPU's slowdown, shutdown, GPU max-operating and memory max-operating temperatures using structured `nvidia-smi -q -x`.
-The warning threshold is the device limit minus the configured margin; on reaching the device operating limit it stops the affected training, forbids scheduling, isolates and validates the GPU.
-Only when the command fails, an XML field is missing, or the target GPU does not support the field does it use the fixed fallback values. Device limits are used only to derive
-site actions, and the incident's `policy_source` is recorded as
-`SITE_NVIDIA_DEVICE_LIMIT_DERIVED`, not masquerading as an NVIDIA-mandated automatic recovery action.
+NVIDIA reports them on two scales (the full quotes and sources are in Detailed Design §2.4.1): a GPU without the T.Limit
+sensor prints the absolute tags (`gpu_temp_slow_threshold` and so on, canonical `gpu_slowdown_temperature_c` and so
+on); a GPU with it prints only the T.Limit tags (`gpu_temp_slow_tlimit_threshold` and so on, canonical
+`gpu_slowdown_tlimit_c` and so on, signed). The H200 of the live plain-EKS p5en (driver 580.178.04) is the latter:
+shutdown −8 C, slowdown −2 C, GPU and memory max-operating 0 C. The nvidia-smi documentation
+(<https://docs.nvidia.com/deploy/nvidia-smi/index.html>, GPU ATTRIBUTES › Temperature): "The T.Limit sensor measures
+the current margin in degree Celsius to the maximum operating temperature. As such it is not an absolute temperature
+reading rather a relative measurement." and "when the T.Limit sensor is supported, available temperature thresholds are
+also reported relative to T.Limit (see below) instead of absolute measurements." NVIDIA gives no formula to absolute
+degrees, so the T.Limit thresholds grade the current T.Limit reading `gpu_tlimit_c` (DCGM field 153
+`DCGM_FI_DEV_GPU_TEMP_LIMIT`, `temperature.gpu.tlimit` in nvidia-smi metrics mode), and a breach is "at or below":
+critical is the slowdown T.Limit, warning is max(critical + `GPU_FAULT_GPU_TEMP_WARNING_MARGIN_C`, GPU/memory
+max-operating T.Limit), on the H200 ≤ 3 warns and ≤ −2 is `DRAIN`. On the absolute scale the warning threshold is the
+device limit minus the configured margin. On reaching the device operating limit it stops the affected training, forbids
+scheduling, isolates and validates the GPU. While a T.Limit judgement exists `gpu_temperature_c` is no longer graded on
+the 85/90 fallback; the memory reading `memory_temperature_c` is absolute only and keeps the 90/95 fallback when there
+is no absolute limit. Only when the command fails, an XML field is missing, the target GPU does not support the field,
+or there are T.Limit thresholds while the exporter does not export field 153 does it use the fixed fallback values.
+Device limits are used only to derive site actions, and the incident's `policy_source` is recorded as
+`SITE_NVIDIA_DEVICE_LIMIT_DERIVED` (`threshold_source` `NVIDIA_DEVICE_TLIMIT` or `NVIDIA_DEVICE_LIMIT`), not
+masquerading as an NVIDIA-mandated automatic recovery action.
+
+The collector's log: `NVIDIA temperature limits unavailable (N consecutive); using configured fallback thresholds, next
+probe ...` is one WARNING per reason (repeats are DEBUG), and the retry doubles from 60 s after three quick probes, capped
+at 3600 s; limits found later log the INFO `NVIDIA temperature limits available after N failed probe(s)`. On driver 580
+nodes that WARNING no longer appears; it used to come about every 64 s per node (28 per 30 minutes) because the parser
+did not know the T.Limit tags. If it persists, check the `<temperature>` element of `nvidia-smi -q -x` (a vGPU or MIG
+device without threshold tags is expected).
 
 A temperature warning has the Node Agent run `dcgmi diag -r 1 -j`. Before deployment confirm that
 `dcgmi` exists in the node image and that `GPU_FAULT_NODE_ALLOWED_OPERATIONS` also contains
@@ -7626,6 +7650,13 @@ the CSV: that exporter parses it at start-up and exits on every GPU node at a re
 help text), an unknown field name or an unknown type; while that exporter is pinned, never add the newer
 `DCGM_FI_DEV_FABRIC_HEALTH_MASK` (174), `DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY` (175) or DCGM 4.6's rename
 `DCGM_FI_DEV_FABRIC_MANAGER_ERROR`.
+
+T.Limit field: the CSV also exports `DCGM_FI_DEV_GPU_TEMP_LIMIT` (153, gauge), the current reading `gpu_tlimit_c` that
+the T.Limit thresholds above grade. DCGM 4.1.0 introduced it (release notes: "Add a field to track the TLIMIT"; field
+description: "Thermal margin temperature (distance to nearest slowdown threshold) for this GPU"), and DCGM 4.6.0
+renamed it `DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS`; the pinned exporter's go-dcgm knows only the 4.1 name, so never write
+the new one while it is pinned. Likewise exported, never required: an exporter without it puts the GPU core back on the
+grading of its absolute reading. In host mode the host engine must be DCGM 4.1.0 or later (live: 4.6.0 and 4.7.0).
 
 The exporter reads the CSV only at process start and the DaemonSet mounts the ConfigMap with subPath, which a running Pod never sees
 refreshed, so a counters-only release used to update the ConfigMap and restart no Pod. The pod template of
