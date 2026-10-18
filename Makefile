@@ -87,6 +87,7 @@ YAMLLINT_CONFIG = .yamllint
 YAMLLINT_ROOTS = deploy examples testcases config scripts/e2e scripts/perf
 PROMQL_TESTS = \
 	tests/metrics/test_closed_loop_promql.py \
+	tests/metrics/test_departed_node_cleanup_promql.py \
 	tests/metrics/test_observability_evidence_promql.py \
 	tests/metrics/test_review_dashboard_promql.py \
 	tests/test_alert_rules_promtool.py

@@ -530,6 +530,7 @@ def test_coverage_excludes_the_static_documentation_and_ci_tests() -> None:
 
     assert promql == {
         "tests/metrics/test_closed_loop_promql.py",
+        "tests/metrics/test_departed_node_cleanup_promql.py",
         "tests/metrics/test_observability_evidence_promql.py",
         "tests/metrics/test_review_dashboard_promql.py",
         "tests/test_alert_rules_promtool.py",

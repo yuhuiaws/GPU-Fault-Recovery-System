@@ -122,6 +122,7 @@
   "tests": {
     "coverage_excluded_files": [
       "tests/metrics/test_closed_loop_promql.py",
+      "tests/metrics/test_departed_node_cleanup_promql.py",
       "tests/metrics/test_observability_evidence_promql.py",
       "tests/metrics/test_review_dashboard_promql.py",
       "tests/regional/test_complete_acceptance_entries.py",
