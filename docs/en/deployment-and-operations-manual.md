@@ -9586,19 +9586,22 @@ first sent by an older executor and re-sent by a newer one after a retryable Age
 409 `COMMAND_ID_REUSED` (manual confirmation; a narrow window, so let open quiesce windows finish before the executor roll
 where practical); an XID 45 workflow compiled before the control-plane roll keeps its two steps.
 
-Upgrade note (the observe-only solo XID 45 default, NVL5 timing and the HGX B200/B300 grading): the release rolls the
-control plane (cpu: api-ha, control-worker, spool-worker), the GPU-cluster executor and the node runtime (Node Agent waves
-on every GPU node; the metrics collector's systemd unit is a node template input) -- `src/gpu_fault/gpu_fabric_manager.py`
-and `src/gpu_fault/execution/config.py` sit in all three closures, and `env-inventory.json` changes too; there is no schema
-change, and the Agent config digest (the timeouts are not digest inputs) and the fleet pins are unchanged. While
-control-plane replicas of the two releases coexist, an old replica still plans the full GPU + NVSwitch reset chain for a
-solo XID 45 on a graded node and a new one is observe-only; the XID 45 decision is finalized on the control-worker only,
-so once the control-worker has rolled the new default holds. An old Agent keeps its old Fabric Manager bounds (120 s for
-the restore loop and the restart, 180 s for the start after a full reset), which a new control plane's 1200 s step cap
-does not hurt; a new Agent under an old control plane can wait up to 780 s inside an old 600 s step cap -- so finish the
-Node Agent waves after the control plane. The collector's `After=nvidia-fabricmanager.service` takes effect at each
-node's next boot. Visible on the live H200 sites: the observe-only XID 45 default, the collector ordering (from the next
-boot), the 780 s Fabric Manager start/restart bound and the 1200 s step cap; the B200/B300 grading is dormant there.
+Upgrade note (the observe-only solo XID 45 default, NVL5 timing and the HGX B200/B300 grading): the release is
+`DATA_PLANE_COMPATIBLE` (the deploy host's source classification is `APPLICATION_RELEASE`) -- the control-plane,
+executor and node_runtime wheels, the node bundle and the node template inputs change: the control plane (cpu: api-ha,
+control-worker, spool-worker), the executor, completion-watcher and kubernetes-node-resource-collector of every GPU
+cluster and the Node Agent waves on every GPU node (the metrics collector's systemd unit is a node template input) roll,
+the DCGM exporter does not -- `src/gpu_fault/gpu_fabric_manager.py` and `src/gpu_fault/execution/config.py` sit in all
+three closures, and `env-inventory.json` changes too; there is no schema, protocol-version or Runtime Profile change,
+and the Agent config digest (the timeouts are not digest inputs) and the fleet pins are unchanged. While control-plane
+replicas of the two releases coexist, an old replica still plans the full GPU + NVSwitch reset chain for a solo XID 45
+on a graded node and a new one is observe-only; the XID 45 decision is finalized on the control-worker only, so once the
+control-worker has rolled the new default holds. An old Agent keeps its old Fabric Manager bounds (120 s for the restore
+loop and the restart, 180 s for the start after a full reset), which a new control plane's 1200 s step cap does not
+hurt; a new Agent under an old control plane can wait up to 780 s inside an old 600 s step cap -- so finish the Node
+Agent waves after the control plane. The collector's `After=nvidia-fabricmanager.service` takes effect at each node's
+next boot. Visible on the live H200 sites: the observe-only XID 45 default, the collector ordering (from the next boot),
+the 780 s Fabric Manager start/restart bound and the 1200 s step cap; the B200/B300 grading is dormant there.
 
 #### Phase C.0: XID 74 NVLink Workflow
 
