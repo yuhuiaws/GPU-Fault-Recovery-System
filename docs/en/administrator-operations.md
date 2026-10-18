@@ -2524,9 +2524,9 @@ client"). The plan states which applies (`dcgm_hostengine.installs`), the export
 `client-newer` or `host-newer`). A pin already in the managed part is kept on reruns (without `--dcgm-version` the existing
 pin wins over the default), so a group prepared earlier with 4.7.0-2 keeps 4.7.0-2 until a rerun with
 `--dcgm-version 4.6.1-1`; for a pin that is not the exporter's DCGM the plan adds a finding (a console `finding:` line) that
-names the flag (`<exporter image>` is the pinned `nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless`):
-`<node group>: the DCGM pin 4.7.0-2 is newer than the DCGM client 4.6.1 of the product's exporter <exporter image>; NVIDIA requires the client to be at least the host engine version: plan with --dcgm-version 4.6.1-1`
-(for an older pin `<node group>: the DCGM pin <pin> is not the version paired with the DCGM client 4.6.1 of the product's exporter <exporter image>; NVIDIA supports the paired version only: plan with --dcgm-version 4.6.1-1`).
+names the flag:
+`<node group>: the DCGM pin 4.7.0-2 is newer than the DCGM client 4.6.1 of the product's exporter nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless; NVIDIA requires the client to be at least the host engine version: plan with --dcgm-version 4.6.1-1`
+(for an older pin `<node group>: the DCGM pin <pin> is not the version paired with the DCGM client 4.6.1 of the product's exporter nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless; NVIDIA supports the paired version only: plan with --dcgm-version 4.6.1-1`).
 A rerun with the flag replaces the managed part and rolls the group (MINIMAL), the new nodes install 4.6.1-1 and the
 verification checks the new pin; the finding is advisory and blocks neither the plan nor the apply. The CUDA major is read
 on the node at boot from the `nvidia-smi -q` "CUDA Version", so it always matches the driver; then the managed part writes the restart

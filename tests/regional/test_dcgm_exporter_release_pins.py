@@ -50,8 +50,10 @@ LITERAL_PINS = {
 LOCK = ROOT / "config/release-images.lock.json"
 #: Where a tag of the exporter may appear in prose or code without being a pin.
 SCANNED = ("src", "deploy", "scripts", "config", "docs", "COLLECTORS.md")
+#: An OCI tag (letters, digits, ``_``, ``.``, ``-``); prose punctuation that
+#: follows it (``;``, a sentence's ``.``) is not part of it.
 EXPORTER_REFERENCE = re.compile(
-    r"nvcr\.io/nvidia/k8s/dcgm-exporter:(?P<tag>[^\s`'\"<)|,]+)"
+    r"nvcr\.io/nvidia/k8s/dcgm-exporter:(?P<tag>[A-Za-z0-9_][A-Za-z0-9_.-]*[A-Za-z0-9_])"
 )
 
 
