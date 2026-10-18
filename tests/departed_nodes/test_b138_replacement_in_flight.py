@@ -38,13 +38,19 @@ it climbs is refused on the absent node) and is pinned once, by the shape-A
 files ``tests/regional/test_b138_reimage_before_reset.py`` (QUIESCE) and
 ``tests/regional/test_b138_reimage_reset_and_after.py`` (RESET_GPU).
 
-Each gap is an ``xfail(strict=True)`` test that asserts the safe exit or the
-safe verdict and fails on 9132d9f4 at that assertion; the stuck states and the
-one shape that already ends safely are plain tests. In-memory store only.
+Batch 138 wrote each gap as an ``xfail(strict=True)`` test asserting the safe
+exit or the safe verdict, failing on 9132d9f4 at that assertion. Batch 139
+closed them and they are plain tests now: the departure proof settles a parked
+node action ``node_departed`` (the cleanup, the operator's evidence close,
+``confirm-node-action``), the restore skips a proven-departed node, and a STOP
+refused after its suspend keeps its receipt and says the job is suspended. The
+shapes without the proof still refuse, and are pinned as such. In-memory store
+only.
 """
 
 from __future__ import annotations
 
+import json
 from datetime import timedelta
 from typing import Any
 
@@ -70,12 +76,16 @@ from gpu_fault.departed_nodes import (
 )
 from gpu_fault.execution import WorkflowStepContext
 from gpu_fault.execution.node_action_confirmation import (
+    NODE_DEPARTED,
     AgentEvidence,
     KubernetesNodeEvidence,
+    apply_node_action_confirmation,
     confirm_node_action,
 )
-from gpu_fault.execution.node_action_uncertainty import has_unresolved_node_action
-from gpu_fault.fleet import AgentLifecycleState
+from gpu_fault.execution.node_action_uncertainty import (
+    has_unresolved_node_action,
+    unresolved_node_action,
+)
 from gpu_fault.models import (
     BlockedKind,
     IncidentState,
@@ -95,6 +105,7 @@ from gpu_fault.workflow_reconcile import (
 )
 from tests._builders import (
     build_store,
+    contained_stop_receipt,
     fault_incident,
     workflow_request,
     workflow_step,
@@ -343,11 +354,19 @@ def _inspection(store: Any, incident_id: str) -> dict[str, Any]:
     incident = store.get_incident(incident_id)
     workflow = store.get_workflow(str(incident.workflow_request_id))
     blocked = [workflow] if workflow.status is WorkflowStatus.BLOCKED else []
+    agents: dict[str, Any] = {}
+    for node_id in incident.node_ids:
+        try:
+            record = store.get_agent(incident.cluster_id, node_id)
+        except KeyError:
+            record = None
+        agents[node_id] = record.model_dump(mode="json") if record else None
     return {
         "incident": incident.model_dump(mode="json"),
         "workflow": workflow.model_dump(mode="json"),
         "open_workflows": [],
         "blocked_workflows": [item.model_dump(mode="json") for item in blocked],
+        "agents": agents,
     }
 
 
@@ -359,55 +378,34 @@ PARKED_SHAPES = [
 
 
 @pytest.mark.parametrize(("provider", "operation"), PARKED_SHAPES)
-def test_a_parked_node_action_on_a_departed_node_has_no_supported_exit(
+def test_without_its_departure_proof_a_parked_node_action_still_has_no_exit(
     provider: str, operation: OP
 ) -> None:
-    """Shape B, RESTART_NODE in flight / RESET_GPU claimed: DEAD END (pinned).
+    """Shape B, RESTART_NODE in flight / RESET_GPU claimed (pinned).
 
-    The departure is proven on every source, yet each supported verb refuses:
-    the cleanup retires the Agent and stops at ``workflow_changed_node``
-    (``departed_node_cleanup_actions.py:441-485``, ``:534-545``); the record is no
-    reconcile
-    shape (no verified restore successor, it changed the node, no operator
-    confirmation: ``workflow_resolution.py:373-463``,
-    ``workflow_reconcile.py:531-612``); ``confirm-node-action`` refuses a node
-    the cluster no longer has (``node_action_confirmation.py:620-659``); the
-    close with the departure as isolation evidence clears the node but refuses
-    the open record (``incident_closure.py:723-742``, ``_open_workflow``
-    ``:830-848``); and ``restore`` refuses an incident whose node is missing
-    (``remediation_plans.py:394-401``). The incident stays QUARANTINED and the
-    record BLOCKED for good -- the uninstall and release gates count it.
+    Was the DEAD END of 9132d9f4; the departure proof is the exit since batch
+    139 (the tests below). Without the proof every supported verb still
+    refuses: the record is no reconcile shape (no verified restore successor,
+    it changed the node, no operator confirmation:
+    ``workflow_resolution.py:373-463``, ``workflow_reconcile.py:531-612``);
+    ``confirm-node-action`` cannot judge a node the cluster no longer has
+    (``node_action_confirmation.py`` ``_common_evidence_refusals``); the close
+    cannot clear a missing node (``isolation_verdict``); and ``restore``
+    refuses an incident whose node is missing (``remediation_plans.py``).
     """
 
     store = build_store()
-    world_, cluster_id, node_id, _present = _departure(store, provider)
+    _world, cluster_id, node_id, _present = _departure(store, provider)
     request_id, incident_id = _parked(
         store, cluster_id, node_id, provider=provider, operation=operation
     )
-
-    [record] = world_.cleanup.run_once()
-
-    assert record.status is DepartedNodeCleanupStatus.REFUSED, record.blockers
-    assert record.blocker_classes == ["workflow_changed_node"], record.blockers
-    assert record.actions == [f"agent-retired:{node_id}"]
-    assert any(
-        f"--workflow-id {request_id}" in item for item in record.admin_commands
-    ), record.admin_commands
-    assert store.get_agent(cluster_id, node_id).lifecycle_state is (
-        AgentLifecycleState.REVOKED
-    )
     workflow = store.get_workflow(request_id)
-    assert workflow.status is WorkflowStatus.BLOCKED
-    assert store.get_incident(incident_id).state is IncidentState.QUARANTINED
 
-    # The cleanup's manual path: the deployed reconcile planner.
     [item] = build_workflow_reconcile_plan(store, [request_id], now=now())["items"]
     assert item["eligible"] is False, item
     assert operator_confirmed_plan_items(store, [request_id], now=now()) == [], (
         "no confirmation exists, so the operator-confirmed shape has no item"
     )
-
-    # confirm-node-action: the node the cluster no longer has cannot be judged.
     verdict = confirm_node_action(
         workflow=workflow,
         incident=store.get_incident(incident_id),
@@ -421,24 +419,14 @@ def test_a_parked_node_action_on_a_departed_node_has_no_supported_exit(
     )
     assert verdict.confirmations == ()
     assert f"node {node_id} is not in the cluster" in verdict.refusals, verdict.refusals
-
-    # --close-quarantined / --close-incident with the departure proof.
-    with pytest.raises(IncidentNotClosable, match="still has an open workflow"):
+    with pytest.raises(IncidentNotClosable, match="isolation state cannot be verified"):
         IncidentClosureService(store).close_incident(
             incident_id,
             reason="node replaced by the platform",
             operator=ACTOR,
             reference=REFERENCE,
-            evidence=[
-                NodeIsolationEvidence(
-                    node_id=node_id,
-                    exists=False,
-                    departure=_departure_proof(provider, node_id),
-                )
-            ],
+            evidence=[NodeIsolationEvidence(node_id=node_id, exists=False)],
         )
-
-    # submit-remediation --disposition restore.
     with pytest.raises(BootstrapError, match="missing from cluster"):
         build_restore_plan(
             _inspection(store, incident_id),
@@ -451,15 +439,230 @@ def test_a_parked_node_action_on_a_departed_node_has_no_supported_exit(
     assert has_unresolved_node_action(store.get_workflow(request_id)), (
         "nothing above answered the record's question"
     )
+    assert store.get_incident(incident_id).state is IncidentState.QUARANTINED
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "b138 gap B1: a proven departure does not settle a parked node action "
-        "on the departed node; the cleanup refuses workflow_changed_node"
-    ),
-)
+@pytest.mark.parametrize(("provider", "operation"), PARKED_SHAPES)
+def test_confirm_node_action_settles_the_departed_nodes_action_on_its_proof(
+    provider: str, operation: OP
+) -> None:
+    """Exit B1 (operator, step by step): ``confirm-node-action`` on a node the
+    cluster no longer has takes its departure proof -- gone from Kubernetes
+    and the provider, the Agent not alive -- and settles the parked action
+    ``node_departed``; the existing exits then finish: the operator-confirmed
+    reconcile shape plans the record, and the evidence close ends it with the
+    incident."""
+
+    store = build_store()
+    _world, cluster_id, node_id, _present = _departure(store, provider)
+    request_id, incident_id = _parked(
+        store, cluster_id, node_id, provider=provider, operation=operation
+    )
+    workflow = store.get_workflow(request_id)
+    departure = _departure_proof(provider, node_id)
+
+    verdict = confirm_node_action(
+        workflow=workflow,
+        incident=store.get_incident(incident_id),
+        node_id=node_id,
+        node=KubernetesNodeEvidence.from_node(node_id, None),
+        agent=AgentEvidence.from_record(node_id, store.get_agent(cluster_id, node_id)),
+        remote_commands=[],
+        actor=ACTOR,
+        reference=REFERENCE,
+        now=now(),
+        departure=departure,
+    )
+
+    assert verdict.refusals == (), verdict.refusals
+    (confirmation,) = verdict.confirmations
+    assert confirmation["settled_by"] == NODE_DEPARTED
+    assert confirmation["operation"] == operation.value
+    assert confirmation["node_departures"][node_id]["absent_from_provider"] is True
+    assert confirmation["superseded_flags"]["outcome_unknown"] is True
+    confirmed = apply_node_action_confirmation(workflow, verdict, now=now())
+    assert not has_unresolved_node_action(confirmed), "the departure answered it"
+    store.save_workflow(confirmed, expected=workflow)
+    [planned] = operator_confirmed_plan_items(store, [request_id], now=now())
+    assert planned["request_id"] == request_id
+    closed, changed = IncidentClosureService(store).close_incident(
+        incident_id,
+        reason="node replaced by the platform",
+        operator=ACTOR,
+        reference=REFERENCE,
+        evidence=[
+            NodeIsolationEvidence(node_id=node_id, exists=False, departure=departure)
+        ],
+    )
+    assert changed is True and closed.state is IncidentState.RECOVERED
+    assert store.get_workflow(request_id).status is WorkflowStatus.SUPERSEDED
+
+
+@pytest.mark.parametrize("provider", PROVIDERS)
+def test_an_escalated_parked_record_asks_for_evidence_once_its_node_left(
+    provider: str,
+) -> None:
+    """``--close-incident`` runs a first pass without evidence; the preview
+    asks for node evidence only when a departure may answer the record -- the
+    latest Kubernetes report omits the node or its Agent is past the guard --
+    and the second pass with the departure proof settles and closes it."""
+
+    store = build_store()
+    _world, cluster_id, node_id, _present = _departure(store, provider)
+    request_id, incident_id = _parked(
+        store, cluster_id, node_id, provider=provider, operation=OP.RESET_GPU
+    )
+    incident = store.get_incident(incident_id)
+    store.save_incident(
+        incident.model_copy(update={"state": IncidentState.ESCALATED}),
+        expected=incident,
+    )
+    service = IncidentClosureService(store)
+
+    first = service.preview(incident_id)
+
+    assert first["closable"] is False and first["evidence_required"] is True, first
+    second = service.preview(
+        incident_id,
+        evidence=[
+            NodeIsolationEvidence(
+                node_id=node_id,
+                exists=False,
+                departure=_departure_proof(provider, node_id),
+            )
+        ],
+    )
+    assert second["closable"] is True, second
+    closed, changed = service.close_incident(
+        incident_id,
+        reason="node replaced by the platform",
+        operator=ACTOR,
+        reference=REFERENCE,
+        evidence=[
+            NodeIsolationEvidence(
+                node_id=node_id,
+                exists=False,
+                departure=_departure_proof(provider, node_id),
+            )
+        ],
+    )
+    assert changed is True and closed.state is IncidentState.RECOVERED
+    assert store.get_workflow(request_id).status is WorkflowStatus.SUPERSEDED
+
+
+def test_confirm_node_action_refuses_a_departure_it_cannot_prove() -> None:
+    """The proof is the departed-node rule, all of it: the provider must no
+    longer have the instance, the Agent must not be alive, and a step that also
+    names another node is not answered by this one leaving."""
+
+    store = build_store()
+    _world, cluster_id, node_id, present = _departure(store, EKS_PROVIDER)
+    request_id, incident_id = _parked(
+        store, cluster_id, node_id, provider=EKS_PROVIDER, operation=OP.RESET_GPU
+    )
+    workflow = store.get_workflow(request_id)
+    incident = store.get_incident(incident_id)
+    proof = _departure_proof(EKS_PROVIDER, node_id)
+
+    def judge(*, departure=proof, agent=None, record=workflow):
+        return confirm_node_action(
+            workflow=record,
+            incident=incident,
+            node_id=node_id,
+            node=KubernetesNodeEvidence.from_node(node_id, None),
+            agent=agent
+            or AgentEvidence.from_record(node_id, store.get_agent(cluster_id, node_id)),
+            remote_commands=[],
+            actor=ACTOR,
+            reference=REFERENCE,
+            now=now(),
+            departure=departure,
+        )
+
+    listed = {**proof, "absent_from_provider": False, "blockers": ["EC2 says running"]}
+    unproven = judge(departure=listed)
+    assert unproven.confirmations == ()
+    assert any(
+        "departure is unproven (EC2 says running)" in item for item in unproven.refusals
+    ), unproven.refusals
+    alive = judge(
+        agent=AgentEvidence.from_mapping(
+            {
+                "node_id": node_id,
+                "lifecycle_state": "ACTIVE",
+                "last_seen_at": ago(minutes=2).isoformat(),
+                "lease_expires_at": ago(minutes=1).isoformat(),
+            }
+        )
+    )
+    assert any("Node Agent is not departed" in item for item in alive.refusals), (
+        alive.refusals
+    )
+    shared = workflow.model_copy(
+        update={
+            "official_steps": [
+                step.model_copy(update={"node_ids": [node_id, present]})
+                if step.operation is OP.RESET_GPU
+                else step
+                for step in workflow.official_steps
+            ]
+        }
+    )
+    sibling = judge(record=shared)
+    assert any(f"also names {present}" in item for item in sibling.refusals), (
+        sibling.refusals
+    )
+
+
+def test_the_close_names_what_a_departure_does_not_answer() -> None:
+    """The evidence close settles a parked record only when every unresolved
+    node action is on a node the evidence proves departed; a reset that also
+    names the node that is still there keeps refusing, and says why."""
+
+    store = build_store()
+    _world, cluster_id, departed, present = _departure(store, EKS_PROVIDER)
+    request_id, incident_id = _parked(
+        store, cluster_id, departed, provider=EKS_PROVIDER, operation=OP.RESET_GPU
+    )
+    workflow = store.get_workflow(request_id)
+    store.save_workflow(
+        workflow.model_copy(
+            update={
+                "official_steps": [
+                    step.model_copy(update={"node_ids": [departed, present]})
+                    if step.operation is OP.RESET_GPU
+                    else step
+                    for step in workflow.official_steps
+                ]
+            }
+        ),
+        expected=workflow,
+    )
+    incident = store.get_incident(incident_id)
+    store.save_incident(
+        incident.model_copy(update={"node_ids": [departed, present]}), expected=incident
+    )
+
+    with pytest.raises(IncidentNotClosable, match="do not answer: step 4 RESET_GPU"):
+        IncidentClosureService(store).close_incident(
+            incident_id,
+            reason="one node replaced, the other clean",
+            operator=ACTOR,
+            reference=REFERENCE,
+            evidence=[
+                NodeIsolationEvidence(
+                    node_id=departed,
+                    exists=False,
+                    departure=_departure_proof(EKS_PROVIDER, departed),
+                ),
+                NodeIsolationEvidence(node_id=present),
+            ],
+        )
+    assert has_unresolved_node_action(store.get_workflow(request_id)), (
+        "the refused close settled nothing"
+    )
+
+
 @pytest.mark.parametrize(("provider", "operation"), PARKED_SHAPES)
 def test_the_departure_proof_settles_a_parked_node_action_by_itself(
     provider: str, operation: OP
@@ -485,14 +688,67 @@ def test_the_departure_proof_settles_a_parked_node_action_by_itself(
     assert store.get_incident(incident_id).state is IncidentState.RECOVERED
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=IncidentNotClosable,
-    reason=(
-        "b138 gap B1: the operator's close with the departure proof refuses "
-        "a parked record whose only unresolved action is on the departed node"
-    ),
-)
+def _with_stop_receipt(store: Any, request_id: str) -> None:
+    """The parked record's STOP as it really lands: with its receipt."""
+
+    workflow = store.get_workflow(request_id)
+    receipt = contained_stop_receipt(
+        workflow_id=request_id,
+        workloads=[
+            {
+                "workload_id": WORKLOAD,
+                "namespace": "training",
+                "kind": "pytorchjob",
+                "name": "job",
+                "uid": "job-uid",
+                "attempt_id": "attempt-1",
+                "owners": [],
+            }
+        ],
+    )
+    executions = [
+        item.model_copy(update={"details": {STOP_RECEIPT_KEY: receipt}})
+        if item.operation is OP.STOP_WORKLOADS
+        else item
+        for item in workflow.step_executions
+    ]
+    store.save_workflow(
+        workflow.model_copy(update={"step_executions": executions}), expected=workflow
+    )
+
+
+@pytest.mark.parametrize("state", [IncidentState.QUARANTINED, IncidentState.ESCALATED])
+def test_the_cleaned_notice_names_the_job_the_settled_record_left_suspended(
+    state: IncidentState,
+) -> None:
+    """G7 (user decision, batch 139): nothing restarts the job a settled record
+    stopped -- not the cleanup, not a restore; its owner does. The cleaned
+    notice therefore no longer says "no action is needed" and names the job.
+    An ESCALATED incident is settled the same way: the cleanup hands the close
+    the departure as evidence for it too."""
+
+    store = build_store()
+    world_, cluster_id, node_id, _present = _departure(store, EKS_PROVIDER)
+    request_id, incident_id = _parked(
+        store, cluster_id, node_id, provider=EKS_PROVIDER, operation=OP.RESET_GPU
+    )
+    _with_stop_receipt(store, request_id)
+    incident = store.get_incident(incident_id)
+    store.save_incident(incident.model_copy(update={"state": state}), expected=incident)
+
+    [record] = world_.cleanup.run_once()
+
+    assert record.status is DepartedNodeCleanupStatus.CLEANED, record.blockers
+    assert f"workflow-closed:{request_id}" in record.actions, record.actions
+    assert store.get_workflow(request_id).status is WorkflowStatus.SUPERSEDED
+    [notice] = [store.get_notification(item) for item in world_.notifications.sent]
+    assert "No action is needed" not in notice.body_text
+    assert (
+        "workload training/pytorchjob/job stays suspended (stopped by workflow "
+        f"{request_id}): the restore does not restart it; its owner must restart it"
+    ) in notice.body_text
+
+
 @pytest.mark.parametrize(("provider", "operation"), PARKED_SHAPES)
 def test_the_operator_closes_a_parked_record_on_the_departure_proof(
     provider: str, operation: OP
@@ -613,8 +869,8 @@ def _isolated(node_id: str, incident_id: str) -> dict[str, Any]:
 
 
 def test_a_partly_departed_quarantine_keeps_the_surviving_node_isolated() -> None:
-    """Shape B, two-node incident (a job DAG / a multi-node reset): DEAD END
-    for the node that is still there (pinned).
+    """Shape B, two-node incident (a job DAG / a multi-node reset), without
+    the departure proof (pinned; was the DEAD END of 9132d9f4).
 
     One node was reclaimed; the workflow FAILED and the other node keeps the
     incident's cordon, taint and annotations. The cleanup proves the departure
@@ -622,8 +878,9 @@ def test_a_partly_departed_quarantine_keeps_the_surviving_node_isolated() -> Non
     ``departed_node_cleanup_actions.py:316-342``) and points at
     ``--close-incident``, which refuses while the present node is isolated
     (``incident_closure.py:269-270``); the exit for an isolated node is the
-    validated restore, which refuses the whole incident because one node is
-    missing (``remediation_plans.py:394-401``).
+    validated restore, which refuses the whole incident while a node is missing
+    without a proven departure (``remediation_plans.py``). With the proof the
+    restore releases the node that is still there (next test).
     """
 
     store = build_store()
@@ -672,22 +929,15 @@ def test_a_partly_departed_quarantine_keeps_the_surviving_node_isolated() -> Non
     assert store.get_incident(incident_id).state is IncidentState.QUARANTINED
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=BootstrapError,
-    reason=(
-        "b138 gap B2: restore refuses an incident with a departed node, so the "
-        "node that is still there can never be released"
-    ),
-)
 def test_the_restore_releases_the_surviving_node_of_a_partly_departed_quarantine() -> (
     None
 ):
-    """Desired exit B2: the validated restore covers the nodes the cluster
+    """Exit B2 (batch 139): the validated restore covers the nodes the cluster
     still has and skips a node whose departure is proven (its isolation left
     with it), the per-node decision the plan already makes for a node another
-    incident owns (``remediation_plans.py:172-270``). Fails on 9132d9f4 with
-    ``BootstrapError: incident nodes are missing from cluster``."""
+    incident owns (``remediation_plans.py`` ``departed_node_decision``).
+    Failed on 9132d9f4 with ``BootstrapError: incident nodes are missing from
+    cluster``."""
 
     store = build_store()
     _world, cluster_id, departed, present = _departure(store, EKS_PROVIDER)
@@ -700,12 +950,53 @@ def test_the_restore_releases_the_surviving_node_of_a_partly_departed_quarantine
         reference=REFERENCE,
         live_nodes={present: _isolated(present, incident_id)},
         now=now(),
+        departures={departed: _departure_proof(EKS_PROVIDER, departed)},
     )
 
     assert plan.restore_node_ids == (present,)
-    assert {item["node_id"]: item["decision"] for item in plan.node_decisions}[
-        present
-    ] == "restore"
+    decisions = {item["node_id"]: item for item in plan.node_decisions}
+    assert decisions[present]["decision"] == "restore"
+    assert decisions[departed]["decision"] == "skip"
+    assert decisions[departed]["departed"] is True
+    assert "isolation left with it" in decisions[departed]["reason"]
+    assert decisions[departed]["departure"]["absent_from_provider"] is True
+    assert {node for step in plan.steps for node in step["node_ids"]} == {present}, (
+        "the departed node is neither validated nor released"
+    )
+
+
+def test_the_restore_keeps_refusing_a_missing_node_it_cannot_prove_departed() -> None:
+    """The skip rests on the departed-node rule: a proof the provider does not
+    back (the instance still listed) or an Agent that is still alive leaves the
+    node missing, and the restore refuses as before, naming why."""
+
+    store = build_store()
+    _world, cluster_id, departed, present = _departure(store, EKS_PROVIDER)
+    incident_id = _pair(store, cluster_id, departed, present)
+    proof = _departure_proof(EKS_PROVIDER, departed)
+    listed = {**proof, "absent_from_provider": False, "blockers": ["EC2 is running"]}
+    inspection = _inspection(store, incident_id)
+
+    def plan(departure, inspected=inspection):
+        return build_restore_plan(
+            inspected,
+            incident_id=incident_id,
+            operator=ACTOR,
+            reference=REFERENCE,
+            live_nodes={present: _isolated(present, incident_id)},
+            now=now(),
+            departures={departed: departure},
+        )
+
+    with pytest.raises(BootstrapError, match="departure is unproven .EC2 is running"):
+        plan(listed)
+    alive = json.loads(json.dumps(inspection))
+    alive["agents"][departed]["last_seen_at"] = ago(minutes=1).isoformat()
+    with pytest.raises(BootstrapError, match="Node Agent is not departed"):
+        plan(proof, alive)
+    blind = {key: value for key, value in inspection.items() if key != "agents"}
+    with pytest.raises(BootstrapError, match="missing from cluster"):
+        plan(proof, blind)
 
 
 def test_a_failed_record_that_changed_the_departed_node_ends_by_itself() -> None:
@@ -777,13 +1068,6 @@ def _vanishing_runtime(shape: str) -> tuple[Any, Any, Any, WorkflowStepContext]:
     return state, adapter, validator, context
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "b138 gap B4: a STOP whose node left (or was re-imaged) after the suspend "
-        "is recorded node_action_not_started and drops its receipt"
-    ),
-)
 @pytest.mark.parametrize(
     "shape",
     [
@@ -809,7 +1093,11 @@ def test_a_stop_whose_node_changed_after_the_suspend_says_the_job_was_stopped(
     RESTART_WORKLOAD runs; a passive restart needs a SUCCEEDED predecessor's
     receipt, ``stop_ownership.py:746-790``), and the departed-node cleanup (B) or
     the operator's restore (A) then ends the incident with the job suspended.
-    Fails on 9132d9f4 at ``node_action_not_started``."""
+    Failed on 9132d9f4 at ``node_action_not_started``; since batch 139 the
+    post-suspend refusal (``stop_ownership._suspended_refusal``) keeps the
+    receipt, says ``workloads_suspended`` and attests the suspend's outcome,
+    so the record neither parks on an unknown outcome nor reads as a no-op.
+    Restarting the job is still the operator's (G7, not decided)."""
 
     state, adapter, validator, context = _vanishing_runtime(shape)
 
@@ -822,3 +1110,22 @@ def test_a_stop_whose_node_changed_after_the_suspend_says_the_job_was_stopped(
     details = outcome.details or {}
     assert details.get("node_action_not_started") is not True, details
     assert STOP_RECEIPT_KEY in details, "the receipt of the suspended job is kept"
+    assert details["workloads_suspended"] is True
+    assert details["reason"] == (
+        "STOP_OWNERSHIP_UNVERIFIABLE" if shape == "deleted" else "STOP_OWNERSHIP_DRIFT"
+    ), details
+    assert details[STOP_RECEIPT_KEY]["contained"] is False, (
+        "the receipt is the capture, never a contained one a node action could use"
+    )
+    record = WorkflowStepExecution(
+        step_index=0,
+        operation=OP.STOP_WORKLOADS,
+        status=WorkflowStepStatus.FAILED,
+        phase="official",
+        error=outcome.error,
+        details=details,
+    )
+    assert unresolved_node_action(record) is False, (
+        "the suspend's outcome is known: nothing is in flight to confirm"
+    )
+    assert "were suspended" in (outcome.error or ""), outcome.error

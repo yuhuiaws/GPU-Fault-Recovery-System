@@ -25,10 +25,12 @@ One script, four modes, chosen by ``payload["mode"]`` on stdin:
     from this script's ``inspect`` output and the node read through the GPU
     kubeconfig; the script binds the write to the exact step record the admin
     judged, re-checks the live facts it can read itself (the fleet agent
-    record against the kubelet's boot id and the recorded pre-reboot boot id),
-    answers the step's uncertainty flags, records the confirmation verbatim,
-    appends the ``OPERATOR_RECONCILED`` / ``NODE_ACTION_CONFIRMED`` event and
-    writes with a compare-and-set.
+    record against the kubelet's boot id and the recorded pre-reboot boot id;
+    for a ``node_departed`` confirmation, the departure proof the admin side
+    read and an Agent that is not alive), answers the step's uncertainty
+    flags, records the confirmation verbatim, appends the
+    ``OPERATOR_RECONCILED`` / ``NODE_ACTION_CONFIRMED`` event and writes with a
+    compare-and-set.
 
 Every write mode compares the record with what the admin side inspected
 (``expected``) and exits with the drift named, so a record that moved between
@@ -51,7 +53,7 @@ from __future__ import annotations
 REMEDIATION_SCRIPT = """
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from gpu_fault.app import ApplicationContext
 from gpu_fault.models import (
@@ -333,6 +335,32 @@ def recheck_live_facts(incident, node_id, items, node_evidence, now):
             )
 
 
+def recheck_departure(incident, node_id, items, node_evidence, now):
+    # A node_departed confirmation rests on the admin side's read of Kubernetes
+    # and the provider (the departure in node_evidence); the Pod re-checks that
+    # record and what it can read itself: the node's Agent is not alive -- no
+    # record, REVOKED, or an expired lease with a heartbeat past the 10-minute
+    # departure guard.
+    departure = node_evidence.get("departure")
+    if (
+        node_evidence.get("exists") is not False
+        or not isinstance(departure, dict)
+        or departure.get("node_id") != node_id
+        or departure.get("absent_from_kubernetes") is not True
+        or departure.get("absent_from_provider") is not True
+    ):
+        refuse(f"node {node_id}: the departure proof does not show it gone")
+    for item in items:
+        if set(item["confirmation"].get("step_node_ids") or [node_id]) != {node_id}:
+            refuse(f"a node_departed confirmation on {node_id} names other nodes")
+    agent = agent_record(incident.cluster_id, node_id)
+    if agent is not None and agent.lifecycle_state.value != "REVOKED":
+        if agent.lease_expires_at is not None and agent.lease_expires_at > now:
+            refuse(f"node {node_id} Node Agent lease has not expired; it is not departed")
+        if agent.last_seen_at > now - timedelta(minutes=10):
+            refuse(f"node {node_id} Node Agent was seen in the last 10 minutes")
+
+
 if payload["mode"] == "inspect":
     incident, workflow = load(payload["incident_id"])
     nodes = set(incident.node_ids)
@@ -448,7 +476,12 @@ elif payload["mode"] == "confirm-node-action":
             workflow.execution_lease_expires_at > now
         ):
             refuse(f"workflow {workflow.request_id} execution lease has not expired")
-        recheck_live_facts(incident, node_id, items, payload["node_evidence"], now)
+        if all(
+            item["confirmation"].get("settled_by") == "node_departed" for item in items
+        ):
+            recheck_departure(incident, node_id, items, payload["node_evidence"], now)
+        else:
+            recheck_live_facts(incident, node_id, items, payload["node_evidence"], now)
         executions = list(workflow.step_executions)
         updated = workflow
         for item in items:

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+from typing import Any
+
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
 from gpu_fault.models import (
+    WorkflowRequest,
     WorkflowStepSpec,
     WorkflowStepStatus,
 )
@@ -16,6 +19,38 @@ from gpu_fault.operation_registry import (
     OperationAdapter,
     operations_for_adapter,
 )
+from gpu_fault.orchestration.escalation import escalation_origin
+from gpu_fault.store.shared.errors import NotFoundError
+from gpu_fault.suspended_workloads import suspended_workload_line, suspended_workloads
+
+#: How far the hand-off email walks the escalation chain for suspended jobs.
+LINEAGE_LIMIT = 8
+
+
+def escalation_lineage(
+    store: Any, context: WorkflowStepContext
+) -> list[WorkflowRequest]:
+    """The hand-off workflow and the workflows it escalated from, newest first.
+
+    ``<rung>-after-<workflow>`` event ids (``escalation_origin``) name each
+    predecessor; an unreadable record ends the walk.
+    """
+
+    lineage = [context.workflow]
+    seen = {context.workflow.request_id}
+    event_id = context.incident.event_id
+    for _ in range(LINEAGE_LIMIT):
+        origin = escalation_origin(event_id)
+        if origin is None or origin[1] in seen:
+            break
+        try:
+            workflow = store.get_workflow(origin[1])
+            event_id = store.get_incident(workflow.incident_id).event_id
+        except (KeyError, NotFoundError):
+            break
+        seen.add(workflow.request_id)
+        lineage.append(workflow)
+    return lineage
 
 
 class SupportEscalationAdapter:
@@ -67,6 +102,14 @@ class SupportEscalationAdapter:
                             if execution.status is WorkflowStepStatus.FAILED
                         }
                     ),
+                    # The jobs the remediation left suspended: the operator's
+                    # restore does not restart them (G7, batch 139).
+                    "suspended_workloads": [
+                        suspended_workload_line(item)
+                        for item in suspended_workloads(
+                            escalation_lineage(self.store, context)
+                        )
+                    ],
                 }
                 if builder is self.builder
                 else {}

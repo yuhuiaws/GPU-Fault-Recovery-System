@@ -30,7 +30,15 @@ built here from the control plane's inspection and the live nodes, and
     queued RESTART_GPU_DEVICE_PLUGIN successor took the incident to RECOVERED):
     the node stayed cordoned, tainted and annotated and ``restore`` refused it
     as "RECOVERED". Same rule as ESCALATED: every workflow ended, a node still
-    carries this incident's isolation, same incident and fencing token.
+    carries this incident's isolation, same incident and fencing token. A node
+    the cluster no longer has is skipped when its departure is proven (gone
+    from Kubernetes and from its provider, its Agent not alive: the
+    ``departures`` the CLI reads) -- its isolation left with it -- and the
+    nodes still there are validated and released (batch 139: a two-node
+    incident with one reclaimed node could not be restored at all). The plan
+    and its result also name every workload a STOP of the incident's records
+    suspended and nothing restarted (``suspended_workloads``): the restore
+    never restarts a job, its owner does (user decision G7).
 
 ``confirm-node-action`` (``ConfirmNodeActionPlan``)
     the operator's confirmation of a node action whose outcome the executor
@@ -38,6 +46,8 @@ built here from the control plane's inspection and the live nodes, and
     the named node unresolved, reads the node through the GPU kubeconfig and
     the fleet record from the inspection, and computes the same verdict the
     Pod recomputes before it writes (``execution.node_action_confirmation``).
+    A node the cluster no longer has is judged on its departure proof
+    (``settled_by: node_departed``).
 """
 
 from __future__ import annotations
@@ -53,10 +63,12 @@ from gpu_fault.adapters.common import (
 )
 from gpu_fault.admin.bootstrap_common import BootstrapError
 from gpu_fault.execution.node_action_confirmation import (
+    DEPARTURE_SUMMARY_KEYS,
     AgentEvidence,
     KubernetesNodeEvidence,
     confirm_node_action,
     confirmed_node_actions_on,
+    departure_refusals,
     unresolved_node_actions_on,
 )
 from gpu_fault.models import FaultIncident, WorkflowRequest
@@ -66,6 +78,7 @@ from gpu_fault.orchestration.validated_restore import (
     is_validated_restore_workflow,
     restore_reason,
 )
+from gpu_fault.suspended_workloads import suspended_workload_line, suspended_workloads
 
 DISPOSITION_RESTORE = "restore"
 DISPOSITION_CONFIRM_NODE_ACTION = "confirm-node-action"
@@ -125,6 +138,9 @@ class RestorePlan:
     disposition: str = DISPOSITION_RESTORE
     restore_node_ids: tuple[str, ...] = ()
     node_decisions: tuple[dict[str, Any], ...] = ()
+    # Workloads a STOP of the incident's records suspended and nothing
+    # restarted (``suspended_workloads``); the restore leaves them stopped.
+    suspended_workloads: tuple[dict[str, str], ...] = ()
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -134,6 +150,7 @@ class RestorePlan:
             "node_ids": list(self.node_ids),
             "restore_node_ids": list(self.restore_node_ids),
             "node_decisions": [dict(item) for item in self.node_decisions],
+            "suspended_workloads": [dict(item) for item in self.suspended_workloads],
             "gpu_uuids": list(self.gpu_uuids),
             "fencing_token": self.fencing_token,
             "workflow_request_id": self.workflow_request_id,
@@ -350,11 +367,60 @@ def _validate_ended_restore(
         )
 
 
+def _inspected_agent(inspection: Mapping[str, Any], node_id: str) -> AgentEvidence:
+    """The fleet record the inspection carries for ``node_id``.
+
+    An inspection without fleet evidence (an image that predates it) reads as
+    an Agent that may be alive, so no departure is accepted on it.
+    """
+
+    agents = inspection.get("agents")
+    if not isinstance(agents, Mapping):
+        return AgentEvidence(
+            node_id=node_id, present=True, lifecycle_state="UNKNOWN (not inspected)"
+        )
+    raw = agents.get(node_id)
+    return (
+        AgentEvidence.from_mapping(raw)
+        if isinstance(raw, Mapping)
+        else AgentEvidence(node_id=node_id)
+    )
+
+
+def departed_node_decision(
+    node_id: str, departure: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The restore's skip of a node whose departure is proven."""
+
+    sources = departure.get("sources") or {}
+    label = "EC2" if "ec2" in sources else "HyperPod"
+    return {
+        "node_id": node_id,
+        "decision": DECISION_SKIP,
+        "departed": True,
+        "quarantine_taint_value": None,
+        "quiesce_taint_value": None,
+        "incident_annotation": None,
+        "unschedulable": False,
+        "quiesce_taint_only": False,
+        "reason": (
+            f"node {node_id} departed (gone from Kubernetes and {label}, instance "
+            f"{departure.get('instance_id')}): its isolation left with it; the "
+            "restore validates and releases the nodes the cluster still has"
+        ),
+        "departure": {
+            key: departure[key] for key in DEPARTURE_SUMMARY_KEYS if key in departure
+        },
+    }
+
+
 def _validate_restore_record(
     inspection: Mapping[str, Any],
     *,
     incident_id: str,
     live_nodes: Mapping[str, Mapping[str, Any]],
+    departures: Mapping[str, Mapping[str, Any]] | None = None,
+    now: datetime,
 ) -> tuple[dict[str, Any], dict[str, Any], str | None, list[dict[str, Any]]]:
     """The restore preconditions, all before any write.
 
@@ -362,8 +428,9 @@ def _validate_restore_record(
     workflow already open under it (the idempotent rerun; no node is judged
     then) and the per-node decisions, or raises the first refusal: neither
     QUARANTINED nor ESCALATED-with-every-workflow-ended; another workflow still
-    open; a node missing from the cluster
-    (its isolation cannot be judged); incident and workflow fencing tokens
+    open; a node missing from the cluster without a proven departure in
+    ``departures`` (its isolation cannot be judged; a departed node is skipped,
+    ``departed_node_decision``); incident and workflow fencing tokens
     differing (a stale generation the node's annotation would reject); no
     node still isolated by this incident (close it instead).
     """
@@ -393,14 +460,29 @@ def _validate_restore_record(
             )
             + "; wait for it to end or reconcile it first"
         )
-    missing = sorted(set(node_ids) - set(live_nodes))
-    if missing:
+    departed: dict[str, dict[str, Any]] = {}
+    unproven: list[str] = []
+    for node_id in sorted(set(node_ids) - set(live_nodes)):
+        departure = (departures or {}).get(node_id)
+        reasons = (
+            departure_refusals(
+                node_id, departure, _inspected_agent(inspection, node_id), now
+            )
+            if departure is not None
+            else []
+        )
+        if departure is None or reasons:
+            unproven.append(node_id + (f" ({'; '.join(reasons)})" if reasons else ""))
+        else:
+            departed[node_id] = departed_node_decision(node_id, departure)
+    if unproven:
         raise BootstrapError(
             f"incident nodes are missing from cluster {incident['cluster_id']}: "
-            + ", ".join(missing)
+            + ", ".join(unproven)
         )
     decisions = [
-        node_restore_decision(node_id, live_nodes[node_id], incident_id=incident_id)
+        departed.get(node_id)
+        or node_restore_decision(node_id, live_nodes[node_id], incident_id=incident_id)
         for node_id in node_ids
     ]
     if not any(item["decision"] == DECISION_RESTORE for item in decisions):
@@ -413,6 +495,28 @@ def _validate_restore_record(
     return incident, workflow, None, decisions
 
 
+def inspected_suspended_workloads(
+    inspection: Mapping[str, Any],
+) -> list[dict[str, str]]:
+    """The workloads the inspected records suspended and did not restart.
+
+    The incident's pointer workflow and its BLOCKED workflows, newest first
+    (``suspended_workloads``).
+    """
+
+    rows: dict[str, Mapping[str, Any]] = {}
+    for raw in [
+        inspection.get("workflow"),
+        *(inspection.get("blocked_workflows") or []),
+    ]:
+        if isinstance(raw, dict) and raw.get("request_id"):
+            rows.setdefault(str(raw["request_id"]), raw)
+    newest_first: list[Mapping[str, Any]] = sorted(
+        rows.values(), key=lambda item: str(item.get("updated_at") or ""), reverse=True
+    )
+    return suspended_workloads(newest_first)
+
+
 def build_restore_plan(
     inspection: Mapping[str, Any],
     *,
@@ -421,12 +525,21 @@ def build_restore_plan(
     reference: str | None,
     live_nodes: Mapping[str, Mapping[str, Any]],
     now: datetime | None = None,
+    departures: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> RestorePlan:
-    """Turn the QUARANTINED / settled ESCALATED record into its restore, or refuse."""
+    """Turn the QUARANTINED / settled ESCALATED record into its restore, or refuse.
+
+    ``departures`` is the departure proof the CLI read for the incident nodes
+    the cluster no longer lists (``admin/remediation_departures.py``).
+    """
 
     stamp = now or _utc_now()
     incident, workflow, existing, decisions = _validate_restore_record(
-        inspection, incident_id=incident_id, live_nodes=live_nodes
+        inspection,
+        incident_id=incident_id,
+        live_nodes=live_nodes,
+        departures=departures,
+        now=stamp,
     )
     record = FaultIncident.model_validate(incident)
     restore_nodes = tuple(
@@ -453,6 +566,7 @@ def build_restore_plan(
         node_gpu_uuids=inventory if isinstance(inventory, Mapping) else None,
         release_only_node_ids=list(release_only),
     )
+    suspended = inspected_suspended_workloads(inspection)
     warnings = tuple(
         f"node {item['node_id']} is cordoned without gpu-fault isolation metadata of "
         f"{incident_id}; the restore cannot release a cordon it does not own and "
@@ -462,7 +576,7 @@ def build_restore_plan(
         and item["unschedulable"]
         and item["quarantine_taint_value"] is None
         and item["incident_annotation"] is None
-    )
+    ) + tuple(suspended_workload_line(item) for item in suspended)
     return RestorePlan(
         incident_id=incident_id,
         cluster_id=str(incident["cluster_id"]),
@@ -485,6 +599,7 @@ def build_restore_plan(
         warnings=warnings,
         restore_node_ids=restore_nodes,
         node_decisions=tuple(decisions),
+        suspended_workloads=tuple(suspended),
     )
 
 
@@ -615,11 +730,14 @@ def build_confirm_node_action_plan(
     reference: str | None,
     live_nodes: Mapping[str, Mapping[str, Any]],
     now: datetime | None = None,
+    departure: Mapping[str, Any] | None = None,
 ) -> ConfirmNodeActionPlan:
     """Derive the confirmation from the record, the fleet and the node, or refuse.
 
     The verdict is ``execution.node_action_confirmation.confirm_node_action``
     over the inspection's records; every refusal it names is raised verbatim.
+    ``departure`` is the departure proof the CLI read for a node the cluster
+    no longer lists.
     """
 
     stamp = now or _utc_now()
@@ -681,6 +799,7 @@ def build_confirm_node_action_plan(
         now=stamp,
         successor=successor,
         node_validations=node_validations,
+        departure=departure,
     )
     if verdict.refusals:
         raise BootstrapError(
@@ -701,7 +820,11 @@ def build_confirm_node_action_plan(
         ),
         confirmations=verdict.confirmations,
         already_confirmed=verdict.already_confirmed,
-        node_evidence=node.as_dict(),
+        node_evidence=(
+            {**node.as_dict(), "departure": dict(departure)}
+            if departure is not None and not node.exists
+            else node.as_dict()
+        ),
         agent_evidence=agent.as_dict(),
         executions=tuple(
             {

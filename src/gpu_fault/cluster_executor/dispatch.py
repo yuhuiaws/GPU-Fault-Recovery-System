@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any
 from gpu_fault.adapters.common import node_action_accepted_nodes
 from gpu_fault.adapters.node_action.lease_guard import lease_hold_reason
 from gpu_fault.adapters.kubernetes.stop_ownership import (
+    node_release_ownership_guard,
     node_submission_ownership_guard,
     stop_ownership_scope,
 )
@@ -182,7 +183,11 @@ class CommandDispatch:
                 | {WorkflowOperation.STOP_WORKLOADS}
             )
             if context.step.operation not in guarded_at_mutation:
-                denied = node_submission_ownership_guard(context)
+                # A release re-reads the STOP receipt's nodes: a re-image keeps
+                # the annotations the restore patch trusts (batch 138).
+                denied = node_submission_ownership_guard(
+                    context
+                ) or node_release_ownership_guard(context)
                 if denied is not None:
                     if context.step.operation is WorkflowOperation.RESTART_WORKLOAD:
                         assert denied.details is not None

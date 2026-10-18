@@ -28,7 +28,12 @@ Two exits, one write path:
   A node the cluster no longer has carries nothing, so it clears only with the
   proof that it departed (``departure``: gone from Kubernetes and from its
   provider, ``departed_nodes``) and an Agent that is no longer alive -- the
-  rule the departed-node cleanup and ``workflow-reconcile`` judge with.
+  rule the departed-node cleanup and ``workflow-reconcile`` judge with. That
+  proof also answers a parked record's unresolved node actions on the
+  departed nodes: the close settles them ``node_departed``
+  (``execution/node_departure_settlement.py``) and ends the record with the
+  incident (batch 139; a replaced node's parked RESTART_NODE or RESET had no
+  exit before).
 
 Both write RECOVERED through ``save_incident(expected=)`` (compare-and-set,
 never a blind overwrite), append the reason to the incident, record one audit
@@ -60,9 +65,16 @@ from gpu_fault.departed_nodes import (
     agent_retirement_reasons,
     evidence_proves_departure,
 )
+from gpu_fault.execution.node_action_confirmation import node_action_executions
 from gpu_fault.execution.node_action_uncertainty import (
     has_unresolved_node_action,
     node_actions_operator_confirmed,
+    unresolved_node_action,
+)
+from gpu_fault.execution.node_departure_settlement import (
+    DepartureSettlement,
+    apply_departure_settlement,
+    departure_settlement,
 )
 from gpu_fault.markers import retire_markers_for_incident
 from gpu_fault.models import (
@@ -397,7 +409,12 @@ class IncidentClosureService:
                 or (
                     incident.state in OPERATOR_CLOSABLE_STATES
                     and open_workflow is not None
-                    and self._operator_settled(open_workflow)
+                    and (
+                        self._operator_settled(open_workflow)
+                        # A parked record a departure may answer: the evidence
+                        # pass reads the departure proof of a missing node.
+                        or self._departure_plausible(incident, open_workflow)
+                    )
                 )
             ),
             "isolation_reasons": isolation_reasons,
@@ -429,6 +446,10 @@ class IncidentClosureService:
         refusal, _, isolation_reasons = self._refusal(incident, evidence)
         if refusal is not None:
             raise IncidentNotClosable(refusal)
+        if isolation_reasons:
+            self._record_departure_settlement(
+                incident, evidence, operator=operator, reference=reference
+            )
         details: dict[str, Any] = {
             "closed_by": CLOSED_BY_OPERATOR,
             "operator": operator,
@@ -455,6 +476,51 @@ class IncidentClosureService:
         )
         self._settle_blocked_workflow(closed, operator=operator, reference=reference)
         return closed, True
+
+    def _record_departure_settlement(
+        self,
+        incident: FaultIncident,
+        evidence: Sequence[NodeIsolationEvidence] | None,
+        *,
+        operator: str,
+        reference: str | None,
+    ) -> None:
+        """Write the departure's answer onto the parked record the close passes.
+
+        ``_refusal`` let the close through past this record because the
+        departure evidence answers every unresolved node action on it
+        (``_departure_settles``); the answers are recorded with a
+        compare-and-set before the incident moves, so ``_settle_blocked_workflow``
+        finds a settled record. A record that moved in between refuses the close.
+        """
+
+        workflow = self._open_workflow(incident)
+        if workflow is None or self._operator_settled(workflow):
+            return
+        now = datetime.now(timezone.utc)
+        settlement = self._departure_answers(
+            incident,
+            workflow,
+            evidence,
+            actor=operator,
+            reference=reference or f"incident-close/{incident.incident_id}",
+            now=now,
+        )
+        if not settlement.complete:
+            raise IncidentNotClosable(
+                f"incident {incident.incident_id}: the open workflow "
+                f"{workflow.request_id} changed during the close; judge it again"
+            )
+        self.store.save_workflow(
+            apply_departure_settlement(workflow, settlement, now=now),
+            expected=workflow,
+        )
+        LOGGER.info(
+            "workflow %s: %d node action(s) settled by node departure (%s)",
+            workflow.request_id,
+            len(settlement.settled),
+            operator,
+        )
 
     def _settle_blocked_workflow(
         self, incident: FaultIncident, *, operator: str, reference: str | None
@@ -720,22 +786,44 @@ class IncidentClosureService:
                 [],
             )
         open_workflow = self._open_workflow(incident)
-        if open_workflow is not None and not (
+        unanswered: tuple[str, ...] = ()
+        if open_workflow is not None and isolation_reasons:
             # A BLOCKED / NEEDS_OPERATOR record whose node action an operator
             # confirmed on evidence holds the node as paperwork only. When the
             # node evidence also clears every node, the operator closing the
             # incident is the act the record was waiting for, and the close
             # settles it (``_settle_blocked_workflow``). Without clearing
-            # evidence the record keeps refusing the close (DESTR-014).
-            isolation_reasons and self._operator_settled(open_workflow)
-        ):
+            # evidence the record keeps refusing the close (DESTR-014). A
+            # record whose unresolved node actions are all on nodes the
+            # evidence proves departed is answered by that proof and settled
+            # by the close the same way (``_departure_settles``, batch 139).
+            if self._operator_settled(open_workflow):
+                return None, None, isolation_reasons
+            if self._departure_candidate(open_workflow):
+                settlement = self._departure_answers(
+                    incident,
+                    open_workflow,
+                    evidence,
+                    actor="incident-close",
+                    reference="preview",
+                    now=datetime.now(timezone.utc),
+                )
+                if settlement.complete:
+                    return None, None, isolation_reasons
+                unanswered = settlement.unanswered
+        if open_workflow is not None:
             status = open_workflow.status.value
             if open_workflow.blocked_kind is not None:
                 status = f"{status}/{open_workflow.blocked_kind.value}"
             return (
                 f"incident {incident.incident_id} still has an open workflow "
                 f"{open_workflow.request_id} ({status}); wait for it to end or "
-                "reconcile it with gpu-fault-admin workflow-reconcile first",
+                "reconcile it with gpu-fault-admin workflow-reconcile first"
+                + (
+                    "; the node departures do not answer: " + "; ".join(unanswered)
+                    if unanswered
+                    else ""
+                ),
                 open_workflow,
                 [],
             )
@@ -777,8 +865,90 @@ class IncidentClosureService:
         answered by an operator confirmation (``node_actions_operator_confirmed``).
         """
 
-        if not node_actions_operator_confirmed(workflow):
+        return node_actions_operator_confirmed(workflow) and self._holds_nothing_live(
+            workflow
+        )
+
+    def _departure_candidate(self, workflow: WorkflowRequest) -> bool:
+        """A parked record held open only by unresolved node actions, which a
+        node departure may answer (``_departure_answers``)."""
+
+        return (
+            workflow.status is WorkflowStatus.BLOCKED
+            and has_unresolved_node_action(workflow)
+            and self._holds_nothing_live(workflow)
+        )
+
+    def _departure_plausible(
+        self, incident: FaultIncident, workflow: WorkflowRequest
+    ) -> bool:
+        """A departure candidate with an unresolved node action on a node that
+        may have left: the cluster's latest Kubernetes node report omits it, or
+        its Agent record is retired or past the departed-node guard. Only then
+        is the evidence pass worth its provider read; a record parked on a node
+        that is reported and heartbeats is not answered by evidence."""
+
+        if not self._departure_candidate(workflow):
             return False
+        nodes = sorted(
+            {
+                node
+                for execution, step in node_action_executions(workflow)
+                if step is not None and unresolved_node_action(execution)
+                for node in step.node_ids
+            }
+            & set(incident.node_ids)
+        )
+        inventory = self.store.get_kubernetes_node_inventory(incident.cluster_id)
+        listed = None if inventory is None else set(inventory.node_names)
+        evaluated_at = datetime.now(timezone.utc)
+        for node in nodes:
+            if listed is not None and node not in listed:
+                return True
+            try:
+                agent = self.store.get_agent(incident.cluster_id, node)
+            except (KeyError, NotFoundError):
+                continue
+            lifecycle = str(getattr(agent.lifecycle_state, "value", ""))
+            if lifecycle == "REVOKED" or not agent_retirement_reasons(
+                lifecycle,
+                agent.last_seen_at,
+                agent.lease_expires_at,
+                evaluated_at=evaluated_at,
+            ):
+                return True
+        return False
+
+    @staticmethod
+    def _departure_answers(
+        incident: FaultIncident,
+        workflow: WorkflowRequest,
+        evidence: Sequence[NodeIsolationEvidence] | None,
+        *,
+        actor: str,
+        reference: str,
+        now: datetime,
+    ) -> DepartureSettlement:
+        """What the departures in ``evidence`` answer on ``workflow``.
+
+        Only the incident's own nodes the cluster no longer has, with their
+        departure proof; ``isolation_verdict`` has judged their Agents (the
+        caller only asks once the evidence cleared every node).
+        """
+
+        named = set(incident.node_ids)
+        departures = {
+            item.node_id: item.departure
+            for item in evidence or ()
+            if item.node_id in named and not item.exists and item.departure is not None
+        }
+        return departure_settlement(
+            workflow, departures, actor=actor, reference=reference, now=now
+        )
+
+    def _holds_nothing_live(self, workflow: WorkflowRequest) -> bool:
+        """No owner, no live lease, no WAITING step, no open remote command."""
+
         if (
             workflow.execution_owner_id is not None
             or (

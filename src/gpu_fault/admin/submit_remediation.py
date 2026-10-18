@@ -32,7 +32,12 @@ generation, deadline passed), and submits:
     ``gpu_fault.orchestration.validated_restore`` inside the CPU Pod, for the
     nodes still isolated by this incident (its taint or its isolation
     annotation); nodes already clean, or another incident's business, are
-    skipped and the plan says why (``gpu_fault.admin.remediation_plans``).
+    skipped and the plan says why (``gpu_fault.admin.remediation_plans``). A
+    node the cluster no longer lists is skipped only on its departure proof
+    (``admin/remediation_departures.py``: gone from the provider too, its
+    Agent not alive); without one the restore refuses. The plan and the result
+    name every workload the incident's records suspended and nothing restarted:
+    the restore does not restart a job, its owner does.
     Refused unless the incident is QUARANTINED, or ESCALATED / RECOVERED with
     every workflow FAILED/SUPERSEDED/SUCCEEDED, with no open workflow and at least
     one node still isolated by it; with none left the advice is to close the
@@ -49,8 +54,11 @@ generation, deadline passed), and submits:
     agent with a live lease seen since the action started, kubelet and agent
     agreeing on a boot id that differs from the one recorded before the reboot
     (or, for other node actions, the agent's terminal answer relayed on the
-    remote command). The Pod records the confirmation on the step with a
-    compare-and-set and an ``OPERATOR_RECONCILED`` / ``NODE_ACTION_CONFIRMED``
+    remote command). A node the cluster no longer lists is judged on its
+    departure proof instead (``settled_by: node_departed``: gone from the
+    provider, its Agent not alive). The Pod records the confirmation on the
+    step with a compare-and-set and an ``OPERATOR_RECONCILED`` /
+    ``NODE_ACTION_CONFIRMED``
     event. The record stays BLOCKED: ``restore`` and ``workflow-reconcile``
     (or an evidence close) end it -- this disposition only answers the
     question they were waiting on.
@@ -98,6 +106,7 @@ from gpu_fault.admin.remediation_plans import (
     build_confirm_node_action_plan,
     build_restore_plan,
 )
+from gpu_fault.admin.remediation_departures import node_departures
 from gpu_fault.admin.remediation_script import REMEDIATION_SCRIPT
 from gpu_fault.admin.site import RenderedSite
 from gpu_fault.admin.site_cluster_profile import cluster_runtime_profile_version
@@ -107,6 +116,7 @@ from gpu_fault.admin.workflow_reconcile import (
     run_control_plane_script,
 )
 from gpu_fault.models import RecoveryAction
+from gpu_fault.suspended_workloads import suspended_workload_line
 
 __all__ = [
     "DISPOSITIONS",
@@ -724,7 +734,11 @@ def _submit_restore(
         site, request.incident_id, disposition=request.disposition
     )
     incident = cast(dict[str, Any], inspection.get("incident") or {})
-    live_nodes = cluster_nodes(site, str(incident.get("cluster_id") or ""))
+    cluster_id = str(incident.get("cluster_id") or "")
+    live_nodes = cluster_nodes(site, cluster_id)
+    missing = sorted(
+        {str(item) for item in incident.get("node_ids") or []} - set(live_nodes)
+    )
     plan = build_restore_plan(
         inspection,
         incident_id=request.incident_id,
@@ -732,21 +746,37 @@ def _submit_restore(
         reference=request.reference,
         live_nodes=live_nodes,
         now=stamp,
+        departures=(
+            node_departures(
+                site,
+                cluster_id,
+                missing,
+                agents=cast(Mapping[str, Any], inspection.get("agents") or {}),
+            )
+            if missing
+            else None
+        ),
     )
     result = SubmissionResult(plan=plan)
     operations = " -> ".join(str(item["operation"]) for item in plan.steps)
     targets = ", ".join(plan.restore_node_ids) or "every node"
+    # The restore never restarts a job its records left suspended (G7): say so
+    # on the plan and on the result, the owner restarts it.
+    suspended = "".join(
+        f"; {suspended_workload_line(item)}" for item in plan.suspended_workloads
+    )
     if request.plan_only:
         result.message = (
             f"plan only; nothing was written (would create {operations} on {targets} "
             f"under incident {plan.incident_id}, fencing token {plan.fencing_token})"
+            + suspended
         )
         return result
     if plan.existing_restore_workflow_id:
         result.no_op = True
         result.message = (
             f"restore workflow {plan.existing_restore_workflow_id} is already open "
-            f"under incident {plan.incident_id}; nothing to do"
+            f"under incident {plan.incident_id}; nothing to do" + suspended
         )
         record_submission(site, result, now=stamp)
         return result
@@ -759,14 +789,14 @@ def _submit_restore(
         result.no_op = True
         result.message = (
             f"restore workflow {workflow.get('request_id')} is already open under "
-            f"incident {plan.incident_id}; nothing to do"
+            f"incident {plan.incident_id}; nothing to do" + suspended
         )
     else:
         result.message = (
             f"workflow {workflow.get('request_id')} (fencing token "
             f"{workflow.get('fencing_token')}, {workflow.get('status')}) runs "
             f"{operations} on {targets}; incident {plan.incident_id} is now "
-            f"{(submission.get('incident') or {}).get('state')}"
+            f"{(submission.get('incident') or {}).get('state')}" + suspended
         )
     record_submission(site, result, now=stamp)
     return result
@@ -838,6 +868,8 @@ def _describe_confirmations(items: tuple[dict[str, Any], ...]) -> str:
         + (
             f" (boot {item['previous_boot_id']} -> {item['observed_boot_id']})"
             if item.get("previous_boot_id")
+            else " (node departed)"
+            if item.get("settled_by") == "node_departed"
             else ""
         )
         for item in items
@@ -862,15 +894,31 @@ def _submit_confirm_node_action(
         site, request.incident_id, disposition=request.disposition
     )
     incident = cast(dict[str, Any], inspection.get("incident") or {})
-    live_nodes = cluster_nodes(site, str(incident.get("cluster_id") or ""))
+    cluster_id = str(incident.get("cluster_id") or "")
+    node_id = str(request.node_id)
+    live_nodes = cluster_nodes(site, cluster_id)
+    # A node the cluster no longer lists is judged on its departure proof
+    # (``node_departed``), read only for a node of the incident.
+    departure = (
+        node_departures(
+            site,
+            cluster_id,
+            [node_id],
+            agents=cast(Mapping[str, Any], inspection.get("agents") or {}),
+        )[node_id]
+        if node_id not in live_nodes
+        and node_id in {str(item) for item in incident.get("node_ids") or []}
+        else None
+    )
     plan = build_confirm_node_action_plan(
         inspection,
         incident_id=request.incident_id,
-        node_id=str(request.node_id),
+        node_id=node_id,
         operator=operator,
         reference=request.reference,
         live_nodes=live_nodes,
         now=stamp,
+        departure=departure,
     )
     result = SubmissionResult(plan=plan)
     described = _describe_confirmations(plan.confirmations)

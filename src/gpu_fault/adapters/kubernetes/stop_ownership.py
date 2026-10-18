@@ -57,6 +57,11 @@ LOGGER = logging.getLogger(__name__)
 # containment's receipt under it, the guard reads it back under it.
 STOP_RECEIPT_KEY = STOP_OWNERSHIP_RECEIPT_KEY
 SUBMISSION_BOUNDARY = "EXECUTOR_PRE_SUBMIT"
+# A release (RESTORE_SCHEDULING) re-checked against the STOP receipt
+# (``check_release``), and a STOP whose containment check failed after its
+# suspend had landed (``finish_stop_ownership``).
+RELEASE_BOUNDARY = "EXECUTOR_PRE_RELEASE"
+POST_SUSPEND_BOUNDARY = "EXECUTOR_POST_SUSPEND"
 GUARD_VERSION = "kubernetes-stop-ownership/v1"
 # Refusal reasons that report a violation this validator *observed*: the STOP
 # receipt no longer matches the cluster, a participant is active, an identity
@@ -868,6 +873,88 @@ class KubernetesStopOwnershipValidator:
             return unverifiable_refusal(exc, check="receipt recheck")
         return None
 
+    def check_release(self, context: WorkflowStepContext) -> WorkflowStepOutcome | None:
+        """Refuse the release of a STOP participant whose Node changed under it.
+
+        RESTORE_SCHEDULING is containment-only, so ``check`` never runs for it,
+        and the restore patch keys ownership on the incident annotations, which
+        a HyperPod in-place re-image (``UpdateClusterSoftware``) keeps along
+        with the UID, the cordon and the taint. The workflow's own contained
+        STOP receipt binds every participant's UID and boot: a release of a
+        node whose UID moved, or whose boot moved without a reboot this
+        workflow submitted and confirmed (``authorized_boot_transition``),
+        would hand back a node whose Agent and collectors are not reinstalled
+        (batch 138). It is refused as ``STOP_OWNERSHIP_DRIFT``; the node keeps
+        its isolation for the operator's validated restore. Only an observed
+        drift refuses: no STOP, no usable receipt, a node the cluster no
+        longer has or one that cannot be read leaves the release to the
+        restore patch, so an unreadable API never strands a compensating
+        release.
+        """
+
+        steps = (
+            context.workflow.safety_steps
+            if context.workflow.executes_safety_steps
+            else context.workflow.official_steps
+        )
+        if not any(
+            step.operation is WorkflowOperation.STOP_WORKLOADS for step in steps
+        ):
+            return None
+        try:
+            receipt, _scope = self._own_receipt(context, steps)
+        except Exception:  # noqa: BLE001 - no binding to check against
+            return None
+        if not receipt.contained or receipt.completed_at is None:
+            return None
+        bound = {node.name: node for node in receipt.nodes}
+        for name in context.step.node_ids:
+            expected = bound.get(name)
+            if expected is None:
+                continue
+            try:
+                observed = self._node(name)
+            except Exception:  # noqa: BLE001 - unreadable or gone: no drift seen
+                continue
+            if observed == expected or (
+                observed.uid == expected.uid
+                and authorized_boot_transition(
+                    context,
+                    node_id=name,
+                    node_uid=expected.uid,
+                    receipt_digest=receipt.digest(),
+                    previous_boot_id=expected.boot_id,
+                    current_boot_id=observed.boot_id,
+                    stopped_at=receipt.completed_at,
+                )
+            ):
+                continue
+            change = (
+                f"its Node UID changed from {expected.uid} to {observed.uid}"
+                if observed.uid != expected.uid
+                else f"its boot changed from {expected.boot_id} to "
+                f"{observed.boot_id} on the same Node UID"
+            )
+            LOGGER.warning(
+                "release of node %s refused: STOP receipt drift (%s)", name, change
+            )
+            return WorkflowStepOutcome.failed(
+                f"node {name} changed since the STOP of workflow "
+                f"{receipt.workflow_id}: {change}, without a reboot this workflow "
+                "submitted and confirmed; the release is refused and the node keeps "
+                "its isolation for a validated restore",
+                details={
+                    "reason": "STOP_OWNERSHIP_DRIFT",
+                    "safety_rejection": True,
+                    "node_id": name,
+                    "receipt_node": expected.model_dump(mode="json"),
+                    "observed_node": observed.model_dump(mode="json"),
+                    "ownership_guard": GUARD_VERSION,
+                    "ownership_check_boundary": RELEASE_BOUNDARY,
+                },
+            )
+        return None
+
 
 @dataclass(frozen=True)
 class _GuardScope:
@@ -928,17 +1015,62 @@ def finish_stop_ownership(
     receipt: StopOwnershipReceipt | None,
     outcome: WorkflowStepOutcome,
 ) -> WorkflowStepOutcome:
+    """Re-check the containment after the suspend patch (``_set_workloads``).
+
+    Called only once the suspend landed, so a check that fails here is never a
+    pre-submit refusal (``_suspended_refusal``).
+    """
+
     if receipt is None:
         return outcome
     scope = _active_scope.get()
     if scope is None or scope.validator is None:
-        return refusal("STOP_OWNERSHIP_VALIDATOR_UNAVAILABLE")
+        refused = refusal("STOP_OWNERSHIP_VALIDATOR_UNAVAILABLE")
+        return _suspended_refusal(refused, receipt, outcome)
     try:
         return scope.validator.finish(context, receipt, outcome)
     except StopOwnershipError as exc:
-        return refusal(exc.reason)
+        return _suspended_refusal(refusal(exc.reason), receipt, outcome)
     except Exception as exc:
-        return unverifiable_refusal(exc, check="containment finish")
+        refused = unverifiable_refusal(exc, check="containment finish")
+        return _suspended_refusal(refused, receipt, outcome)
+
+
+def _suspended_refusal(
+    refused: WorkflowStepOutcome,
+    receipt: StopOwnershipReceipt,
+    outcome: WorkflowStepOutcome,
+) -> WorkflowStepOutcome:
+    """A STOP whose containment check failed after its suspend landed.
+
+    ``refusal`` is the pre-submit shape: ``node_action_not_started`` -- the key
+    the control plane reads as proof nothing was mutated -- and no receipt. A
+    STOP whose node was deleted (404) or re-imaged (boot drift) between the
+    suspend and the re-check recorded the job it had suspended as never
+    touched (batch 138). The verdict stays FAILED with its reason; the record
+    says the workloads are suspended, keeps the receipt, and attests the
+    outcome of the STOP's one physical call (``node_action_outcome_known``: the
+    suspend returned), so it neither parks on an unknown outcome nor reads as a
+    no-op. Like any refusal it climbs no ladder.
+    """
+
+    details = {**(outcome.details or {}), **(refused.details or {})}
+    details.pop("node_action_not_started", None)
+    details.update(
+        {
+            "workloads_suspended": True,
+            "suspended": True,
+            "node_action_outcome_known": True,
+            "ownership_check_boundary": POST_SUSPEND_BOUNDARY,
+            STOP_RECEIPT_KEY: receipt.model_dump(mode="json"),
+        }
+    )
+    workloads = ", ".join(item.workload_id for item in receipt.workloads)
+    return WorkflowStepOutcome.failed(
+        f"workloads {workloads} were suspended, but their containment could not "
+        f"be confirmed ({details.get('reason')})",
+        details=details,
+    )
 
 
 def node_submission_ownership_guard(
@@ -969,6 +1101,26 @@ def node_submission_ownership_guard(
     if not context.step.workload_ids and not stopped:
         return scope.validator.check_idle(context)
     return scope.validator.check(context)
+
+
+def node_release_ownership_guard(
+    context: WorkflowStepContext,
+) -> WorkflowStepOutcome | None:
+    """``check_release`` for a RESTORE_SCHEDULING under the regional scope.
+
+    Without a scope (the in-process executor) or a validator there is no
+    receipt to bind: a release is never blocked for want of a check, only on
+    the drift the check observes.
+    """
+
+    scope = _active_scope.get()
+    if (
+        scope is None
+        or scope.validator is None
+        or context.step.operation is not WorkflowOperation.RESTORE_SCHEDULING
+    ):
+        return None
+    return scope.validator.check_release(context)
 
 
 def regional_ownership_enforced() -> bool:

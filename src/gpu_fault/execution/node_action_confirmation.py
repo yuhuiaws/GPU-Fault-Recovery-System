@@ -29,11 +29,16 @@ Ready, the Node Agent is ACTIVE with a live lease and was seen after the
 action started, kubelet and the agent report the *same* boot id, and that boot
 id differs from the one recorded before the reboot (``agent_baselines`` on
 the step or its remote command -- the same baseline the HyperPod lifecycle
-adapter's automatic confirmation reads -- the STOP ownership authorization, or
-a single-node incident's ``source_boot_id``). For every other node-mutating
+adapter's automatic confirmation reads -- the STOP ownership authorization,
+the workflow's own STOP receipt carried along its confirmed reboots, or a
+single-node incident's ``source_boot_id``). For every other node-mutating
 operation the only proof the control plane holds is the Node Agent's own
-terminal answer relayed on the remote command (``node_results``); without one
-the ledger on the node is the sole record and the verb refuses. Refusals name
+terminal answer relayed on the remote command (``node_results``), a later
+validated restore of the node, or a reboot since the action against the same
+baseline; without one the ledger on the node is the sole record and the verb
+refuses. A node the platform took away -- gone from Kubernetes and from its
+provider, its Agent not alive -- settles its own actions with
+``settled_by: node_departed`` (``node_departure_settlement``). Refusals name
 the exact fact that is missing, so the operator knows what to establish, not
 what to type.
 
@@ -51,6 +56,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Any
 
+from gpu_fault.departed_nodes import agent_retirement_reasons, evidence_proves_departure
+from gpu_fault.execution.node_action_baseline import UNPROVABLE, stop_receipt_boot
 from gpu_fault.execution.node_action_uncertainty import (
     OPERATOR_CONFIRMED_KEY,
     latest_node_action_executions,
@@ -86,6 +93,18 @@ UNCERTAINTY_FLAGS = (
 OPEN_REMOTE_STATUSES = frozenset({"PENDING", "LEASED", "WAITING"})
 TERMINAL_NODE_RESULT_STATUSES = frozenset({"SUCCEEDED", "FAILED"})
 BOOT_TRANSITION_OPERATIONS = frozenset({WorkflowOperation.RESTART_NODE})
+#: ``settled_by`` of a node action its node's proven departure answered.
+NODE_DEPARTED = "node_departed"
+#: The departure evidence keys a ``node_departed`` confirmation keeps per node.
+DEPARTURE_SUMMARY_KEYS = (
+    "instance_id",
+    "provider",
+    "absent_from_kubernetes",
+    "absent_from_provider",
+    "kubernetes_absent_since",
+    "sources",
+    "read_at",
+)
 AGENT_BASELINES_KEY = "agent_baselines"
 STOP_REBOOT_AUTHORIZATION_KEY = "stop_reboot_authorization_v1"
 NODE_RESULTS_KEY = "node_results"
@@ -501,6 +520,7 @@ def previous_boot_id(
     node_id: str,
     agent: AgentEvidence,
     remote_commands: Sequence[Mapping[str, Any]],
+    workflow: WorkflowRequest | None = None,
 ) -> tuple[str, str, str | None] | None:
     """``(boot_id, source, baseline incarnation)`` recorded before the action.
 
@@ -510,8 +530,11 @@ def previous_boot_id(
     the remote command that carried the step (per command, then per batched
     entry -- the CPU-side record keeps pointers, the command keeps the
     payload), the STOP ownership authorization the kubernetes adapter captured
-    for the reboot, and finally the incident's ``source_boot_id`` -- only for
-    a single-node incident, or when the agent has retired that boot as an
+    for the reboot, then the workflow's own contained STOP receipt carried
+    along its confirmed reboots (``node_action_baseline``: when it names the
+    node it is authoritative, and a chain it cannot follow yields no baseline
+    at all), and finally the incident's ``source_boot_id`` -- only for a
+    single-node incident, or when the agent has retired that boot as an
     incarnation, the same rule the automatic confirmation applies.
     """
 
@@ -568,6 +591,15 @@ def previous_boot_id(
             )
             if boot:
                 return boot, f"{label}.{STOP_REBOOT_AUTHORIZATION_KEY}", None
+    receipt = (
+        stop_receipt_boot(workflow, incident, node_id, execution)
+        if workflow is not None
+        else None
+    )
+    if receipt is UNPROVABLE:
+        return None
+    if isinstance(receipt, tuple):
+        return receipt[0], receipt[1], None
     source = incident.source_boot_id
     if source and (
         list(incident.node_ids) == [node_id] or source in agent.retired_incarnation_ids
@@ -666,6 +698,7 @@ def _boot_transition_refusals(
     node: KubernetesNodeEvidence,
     agent: AgentEvidence,
     remote_commands: Sequence[Mapping[str, Any]],
+    workflow: WorkflowRequest | None = None,
 ) -> tuple[list[str], tuple[str, str, str | None] | None]:
     reasons: list[str] = []
     operation = execution.operation.value
@@ -678,13 +711,17 @@ def _boot_transition_refusals(
             f"node {node_id} kubelet reports boot {node.boot_id} but the Node Agent "
             f"reports {agent.boot_id}; the two must agree on the running boot"
         )
-    previous = previous_boot_id(execution, incident, node_id, agent, remote_commands)
+    previous = previous_boot_id(
+        execution, incident, node_id, agent, remote_commands, workflow
+    )
     if previous is None:
         reasons.append(
             f"no pre-reboot boot id is recorded for node {node_id}: neither "
             f"{AGENT_BASELINES_KEY} on {operation} step {execution.step_index} or its "
-            f"remote commands, nor {STOP_REBOOT_AUTHORIZATION_KEY}, nor a usable "
-            "incident source_boot_id; the reboot cannot be proven from the record"
+            f"remote commands, nor {STOP_REBOOT_AUTHORIZATION_KEY}, nor the "
+            "workflow's STOP receipt carried along its confirmed reboots, nor a "
+            "usable incident source_boot_id; the reboot cannot be proven from the "
+            "record"
         )
         return reasons, None
     boot, _source, baseline_incarnation = previous
@@ -893,6 +930,148 @@ def _confirmation(
     }
 
 
+def departure_refusals(
+    node_id: str,
+    departure: Mapping[str, Any] | None,
+    agent: AgentEvidence,
+    now: datetime,
+) -> list[str]:
+    """Why ``departure`` does not prove ``node_id`` departed; empty when it does.
+
+    The departed-node rule (``departed_nodes``): gone from Kubernetes and from
+    the provider in the evidence, and an Agent that is not alive -- no record,
+    a ``REVOKED`` one, or an expired lease with a heartbeat older than the
+    10-minute guard.
+    """
+
+    reasons: list[str] = []
+    if departure is None or not evidence_proves_departure(departure, node_id):
+        blockers = [
+            str(item) for item in (departure or {}).get("blockers") or [] if item
+        ]
+        reasons.append(
+            f"node {node_id} is not in the cluster and its departure is unproven"
+            + (f" ({'; '.join(blockers)})" if blockers else "")
+        )
+    if agent.present and agent.lifecycle_state != AgentLifecycleState.REVOKED.value:
+        alive = agent_retirement_reasons(
+            agent.lifecycle_state,
+            agent.last_seen_at,
+            agent.lease_expires_at,
+            evaluated_at=now,
+        )
+        if alive:
+            reasons.append(
+                f"node {node_id} is not in the cluster, but its Node Agent is not "
+                f"departed: {'; '.join(alive)}"
+            )
+    return reasons
+
+
+def departure_confirmation(
+    execution: WorkflowStepExecution,
+    step: WorkflowStepSpec | None,
+    node_id: str,
+    departures: Mapping[str, Mapping[str, Any]],
+    *,
+    actor: str,
+    reference: str,
+    now: datetime,
+) -> dict[str, Any]:
+    """The ``node_departed`` confirmation of one node action (batch 139).
+
+    The same attribution and step identity an evidence confirmation carries;
+    the proof is the departure of every node the step names, summarized from
+    the evidence it rested on (``DEPARTURE_SUMMARY_KEYS``).
+    """
+
+    nodes = list(step.node_ids) if step is not None else [node_id]
+    return {
+        "version": CONFIRMATION_VERSION,
+        "actor": actor,
+        "reference": reference,
+        "confirmed_at": now.isoformat(),
+        "node_id": node_id,
+        "operation": execution.operation.value,
+        "step_index": execution.step_index,
+        "phase": execution.phase,
+        "step_node_ids": nodes,
+        "adapter_operation_id": execution.adapter_operation_id,
+        "remote_command_id": _text(execution.details.get("remote_command_id")),
+        "observed_boot_id": None,
+        "previous_boot_id": None,
+        "previous_boot_id_source": None,
+        "terminal_node_result": None,
+        "terminal_node_result_source": None,
+        "validated_by_workflow": None,
+        "settled_by": NODE_DEPARTED,
+        "node_departures": {
+            node: {
+                key: departures[node][key]
+                for key in DEPARTURE_SUMMARY_KEYS
+                if key in departures[node]
+            }
+            for node in nodes
+            if node in departures
+        },
+        "superseded_flags": {
+            key: execution.details[key]
+            for key in UNCERTAINTY_FLAGS
+            if key in execution.details
+        },
+    }
+
+
+def _departure_verdict(
+    node_id: str,
+    targets: Sequence[tuple[WorkflowStepExecution, WorkflowStepSpec | None]],
+    already: Sequence[dict[str, Any]],
+    departure: Mapping[str, Any] | None,
+    agent: AgentEvidence,
+    *,
+    actor: str,
+    reference: str,
+    now: datetime,
+) -> NodeActionConfirmationVerdict:
+    """``confirm_node_action`` for a node the cluster no longer has.
+
+    Settled only on the departure proof, and only for steps that name no other
+    node: a sibling's share of a multi-node action is not answered by this
+    node leaving (the evidence close of the incident judges every node).
+    """
+
+    reasons = departure_refusals(node_id, departure, agent, now)
+    for execution, step in targets:
+        others = sorted(set(step.node_ids) - {node_id}) if step is not None else []
+        if others:
+            reasons.append(
+                f"{describe_node_action(execution, step)} also names "
+                f"{', '.join(others)}; the departure of {node_id} does not answer "
+                "their share of the outcome (close the incident with the departure "
+                "evidence of every node instead)"
+            )
+    if reasons:
+        return NodeActionConfirmationVerdict(node_id=node_id, refusals=tuple(reasons))
+    assert departure is not None, "departure_refusals refuses a missing departure"
+    return NodeActionConfirmationVerdict(
+        node_id=node_id,
+        confirmations=tuple(
+            departure_confirmation(
+                execution,
+                step,
+                node_id,
+                {node_id: departure},
+                actor=actor,
+                reference=reference,
+                now=now,
+            )
+            for execution, step in targets
+        ),
+        executions=tuple(execution for execution, _ in targets),
+        already_confirmed=tuple(already),
+    )
+
+
 def confirm_node_action(
     *,
     workflow: WorkflowRequest,
@@ -906,6 +1085,7 @@ def confirm_node_action(
     now: datetime,
     successor: WorkflowRequest | None = None,
     node_validations: Sequence[WorkflowRequest] = (),
+    departure: Mapping[str, Any] | None = None,
 ) -> NodeActionConfirmationVerdict:
     """Judge the evidence for every unresolved node action on ``node_id``.
 
@@ -918,7 +1098,10 @@ def confirm_node_action(
     other than a reboot it is accepted as evidence beside, or instead of, the
     agent's terminal answer on the remote command; so is any later validated
     restore of the node among ``node_validations`` (``node_validation``),
-    whichever incident it answered.
+    whichever incident it answered. ``departure`` is the node's departure
+    evidence (``departed_nodes.node_evidence``) when the cluster no longer has
+    it: the proven departure settles its actions ``node_departed``
+    (``_departure_verdict``).
     """
 
     refusals = _record_refusals(workflow, incident, node_id, remote_commands, now)
@@ -944,6 +1127,17 @@ def confirm_node_action(
         )
     if refusals:
         return NodeActionConfirmationVerdict(node_id=node_id, refusals=tuple(refusals))
+    if departure is not None and not node.exists:
+        return _departure_verdict(
+            node_id,
+            targets,
+            already,
+            departure,
+            agent,
+            actor=actor,
+            reference=reference,
+            now=now,
+        )
     confirmations: list[dict[str, Any]] = []
     executions: list[WorkflowStepExecution] = []
     for execution, step in targets:
@@ -953,7 +1147,7 @@ def confirm_node_action(
         validated_by: dict[str, Any] | None = None
         if execution.operation in BOOT_TRANSITION_OPERATIONS:
             more, previous = _boot_transition_refusals(
-                execution, incident, node_id, node, agent, remote_commands
+                execution, incident, node_id, node, agent, remote_commands, workflow
             )
             reasons.extend(more)
         else:
@@ -973,7 +1167,7 @@ def confirm_node_action(
                 # nothing could close (the ``uninstall`` "active workflows"
                 # gate included).
                 rebooted, previous = _boot_transition_refusals(
-                    execution, incident, node_id, node, agent, remote_commands
+                    execution, incident, node_id, node, agent, remote_commands, workflow
                 )
                 if rebooted:
                     previous = None

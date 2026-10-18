@@ -18,7 +18,6 @@
     ],
     "deployment_only_globs": [
       "src/gpu_fault/admin/*.py",
-      "src/gpu_fault/execution/node_action_confirmation.py",
       "src/gpu_fault/failure_domains.py",
       "src/gpu_fault/release_state_snapshot.py",
       "src/gpu_fault_release/*.py",
@@ -40,10 +39,9 @@
     "module_floors": [
       {
         "id": "administrator-tools",
-        "description": "Administrator CLI modules (plus the operator node-action confirmation evidence rules the CLI evaluates). They are omitted from every runtime shard, so only the combined report knows their coverage and the repository floor cannot see them.",
+        "description": "Administrator CLI modules. They are omitted from every runtime shard, so only the combined report knows their coverage and the repository floor cannot see them. The operator node-action confirmation evidence rules (execution/node_action_confirmation.py) left this group in batch 139: the control plane's incident close and departed-node cleanup now settle a departed node's actions through them, so the runtime shards measure them.",
         "globs": [
-          "src/gpu_fault/admin/*.py",
-          "src/gpu_fault/execution/node_action_confirmation.py"
+          "src/gpu_fault/admin/*.py"
         ],
         "group_floor": 68,
         "file_floor": 60

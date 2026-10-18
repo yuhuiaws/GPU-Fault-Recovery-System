@@ -1,3 +1,5 @@
+from collections.abc import Sequence
+
 from gpu_fault.notifications.common import (
     HARDWARE_ESCALATION_EMAIL_TEMPLATE,
     HARDWARE_ESCALATION_TEMPLATE_VERSION,
@@ -23,7 +25,11 @@ class HardwareEscalationEmailBuilder:
         policy_source: str,
         official_action: str | None,
         ticket_id: str,
+        suspended_workloads: Sequence[str] = (),
     ) -> AdvisoryNotification:
+        """``suspended_workloads``: one line per job the remediation left
+        suspended (``suspended_workloads.suspended_workload_line``)."""
+
         body = HARDWARE_ESCALATION_EMAIL_TEMPLATE.format(
             cluster_id=cluster_id,
             incident_id=incident_id,
@@ -34,6 +40,9 @@ class HardwareEscalationEmailBuilder:
             event_id=event_id,
             reasons=("\n".join(f"  - {item}" for item in reasons) or "  - UNKNOWN"),
             failed_operations=(", ".join(failed_operations) or "NONE_RECORDED"),
+            suspended_workloads=(
+                "\n".join(f"  - {item}" for item in suspended_workloads) or "  - NONE"
+            ),
             ticket_id=ticket_id,
             policy_source=policy_source,
             official_action=official_action or "NONE",
@@ -52,6 +61,14 @@ class HardwareEscalationEmailBuilder:
                 ),
                 "Reasons:",
                 *[f"- {item}" for item in reasons],
+                *(
+                    [
+                        "Suspended workloads:",
+                        *[f"- {item}" for item in suspended_workloads],
+                    ]
+                    if suspended_workloads
+                    else []
+                ),
             ]
         )
         return AdvisoryNotification(

@@ -36,7 +36,7 @@ FABRIC_RESET_TEMPLATE_VERSION = "fabric-reset-zh-v2"
 NOT_APPLICABLE_TEMPLATE_VERSION = "xid-not-applicable-zh-v2"
 XID_INVESTIGATORY_TEMPLATE_VERSION = "xid-investigatory-zh-v1"
 SXID_EVENT_TEMPLATE_VERSION = "sxid-event-zh-v1"
-HARDWARE_ESCALATION_TEMPLATE_VERSION = "hardware-escalation-zh-v2"
+HARDWARE_ESCALATION_TEMPLATE_VERSION = "hardware-escalation-zh-v3"
 NVLINK74_SUPPORT_TEMPLATE_VERSION = "xid74-support-zh-v3"
 NVLINK74_MECHANICAL_TEMPLATE_VERSION = "xid74-mechanical-zh-v1"
 GPU_MECHANICAL_TEMPLATE_VERSION = "gpu-mechanical-zh-v1"
@@ -321,6 +321,9 @@ GPU node automatic recovery failed: hardware taken out of service
 - Automatic recovery steps that failed: {failed_operations}
 - The faulty nodes stay unschedulable and quarantined; scheduling is not
   restored.
+- Workloads the remediation suspended and did not restart (a validated
+  restore does not restart them either; their owner must):
+{suspended_workloads}
 - An internal vendor-support escalation record was created: {ticket_id}
 
 3. Ticket

@@ -16,14 +16,17 @@ What the product does, and where it is still wrong:
   and a ticket only (safe; pinned below).
 * A ``VERIFY_NO_GPU_CLIENTS`` after the re-image is fenced by the quiesce's
   agent generation (safe; pinned below).
-* A QUIESCE the Agent had accepted is recorded as a plain FAILED once the
-  Agent's lease expires: the node action's fleet readiness gate runs before
-  the accepted command is polled and erases its unknown outcome (xfail).
-* ``confirm-node-action`` settles a parked node action by "a reboot since the
+* A QUIESCE the Agent had accepted was recorded as a plain FAILED once the
+  Agent's lease expired: the node action's fleet readiness gate runs before
+  the accepted command is polled and erased its unknown outcome (batch 138
+  xfail; since batch 139 the gate's FAILED keeps it).
+* ``confirm-node-action`` settled a parked node action by "a reboot since the
   action" against the incident's *fault-time* boot: a re-image between the
-  fault and the STOP is accepted as a reboot after an action that ran on the
-  current boot (xfail), and a multi-node incident has no baseline at all,
-  although the STOP receipt pins the boot every guarded action ran on (xfail).
+  fault and the STOP was accepted as a reboot after an action that ran on the
+  current boot, and a multi-node incident had no baseline at all, although the
+  STOP receipt pins the boot every guarded action ran on (batch 138 xfails;
+  since batch 139 the receipt, carried along the confirmed reboots, is the
+  baseline).
 * A QUARANTINED incident whose record parked with an unresolved node action
   still has a supported exit: ``restore`` then ``confirm-node-action`` on the
   validated restore (pinned below).
@@ -32,8 +35,6 @@ What the product does, and where it is still wrong:
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
-
-import pytest
 
 from gpu_fault.adapters.common import (
     ANNOTATION_FENCING,
@@ -186,17 +187,6 @@ def test_a_reimage_after_the_stop_refuses_the_quiesce_before_the_new_agent() -> 
     assert classification[0] == NODE_ACTION_REFUSED_STAGE, classification
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "b138: an accepted QUIESCE whose Agent the re-image took away is failed by "
-        "the node action's fleet readiness gate (barriers.py:98-118, run by "
-        "step_execution.py:203-215 before the accepted command is polled): a plain "
-        "FAILED without outcome_unknown, so the record neither parks NEEDS_OPERATOR "
-        "nor owes a compensation restore although the Agent may have stopped the "
-        "services (lease expiry is taken as proof the action stopped)"
-    ),
-)
 def test_an_accepted_quiesce_whose_agent_vanished_stays_unresolved() -> None:
     """Point 3, re-image in progress after the Agent accepted the QUIESCE.
 
@@ -204,9 +194,11 @@ def test_an_accepted_quiesce_whose_agent_vanished_stays_unresolved() -> None:
     ``node_action_accepted_nodes``). The Agent is gone, its lease expired. The
     cluster executor itself skips its destructive preflight for an accepted
     command (``cluster_executor/dispatch.py:472-510``: "the work lives in the
-    agent's ledger and cannot be called back"), but the adapter's own readiness
-    gate does not, and its FAILED replaces the PENDING record wholesale
-    (``execution/step_bounds.py:352-415``).
+    agent's ledger and cannot be called back"); the adapter's own readiness
+    gate still answers first, and before batch 139 its plain FAILED replaced
+    the PENDING record wholesale (``execution/step_bounds.py:352-415``). Now
+    the gate's FAILED keeps ``outcome_unknown``, ``manual_confirmation_required``
+    and the command pointer (``step_execution.keep_accepted_uncertainty``).
     """
 
     _state, _kubernetes, validator, reset = stopped_runtime()
@@ -243,6 +235,36 @@ def test_an_accepted_quiesce_whose_agent_vanished_stays_unresolved() -> None:
         f"(WAITING/outcome_unknown), got {outcome.status.value}: {outcome.error} "
         f"{outcome.details}"
     )
+    assert outcome.status is WorkflowStepStatus.FAILED
+    assert "fleet consistency gate failed" in (outcome.error or ""), outcome.error
+    assert outcome.details["node_action_command_id"] == f"{QUIESCE_KEY}/node-a/agent-7"
+    assert outcome.details["node_action_accepted_nodes"] == ["node-a"]
+    assert outcome.details["outcome_unknown"] is True
+    assert "node_action_not_started" not in outcome.details
+
+
+def test_a_quiesce_the_agent_never_accepted_still_fails_plainly() -> None:
+    """Control for the rule above: a QUIESCE whose record shows no acceptance
+    (the send never reached an Agent) keeps the gate's plain FAILED -- the
+    readiness verdict is the whole truth, nothing may be running."""
+
+    _state, _kubernetes, validator, reset = stopped_runtime()
+    refused = WorkflowStepExecution(
+        step_index=1,
+        operation=OP.QUIESCE_GPU_SERVICES,
+        status=WorkflowStepStatus.WAITING,
+        phase="official",
+        details={"node_action_state": "TRANSPORT_RETRY", "waiting_node": "node-a"},
+    )
+    context = _quiesce_context(reset, refused)
+    registry = StubFleetRegistry({"node-a": GONE_AGENT}, generation=7, ready=False)
+    adapter = NodeActionWorkflowAdapter({}, "s" * 32, registry=registry)
+
+    with stop_ownership_scope(validator):
+        outcome = adapter.execute(context)
+
+    assert outcome.status is WorkflowStepStatus.FAILED, outcome
+    assert "outcome_unknown" not in (outcome.details or {}), outcome.details
 
 
 def test_a_verify_after_the_reimage_is_fenced_by_the_quiesce_generation() -> None:
@@ -478,23 +500,15 @@ def _confirm(incident, workflow, boot_id: str, **values):
     )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "b138: confirm-node-action takes the incident's fault-time source_boot_id "
-        "as the pre-action boot (node_action_confirmation.py:498-578), so a "
-        "re-image between the XID and the STOP reads as a reboot after a QUIESCE "
-        "that ran on the boot the node still runs; the STOP receipt, which binds "
-        "the boot every guarded action was checked against, is not consulted"
-    ),
-)
 def test_a_reimage_before_the_stop_is_not_a_reboot_since_the_quiesce() -> None:
     """Point 1, re-image finished before the STOP; a later node action parks.
 
     The STOP captured the re-imaged boot, the QUIESCE ran on it, its answer
     was lost (step cap / execution cap), and the node has not rebooted since.
-    Nothing settles the action -- the ledger on the node is the record -- yet
-    the verb confirms it ``settled_by=reboot_since_action``.
+    Nothing settles the action -- the ledger on the node is the record. Before
+    batch 139 the verb read the incident's fault-time ``source_boot_id`` and
+    confirmed it ``settled_by=reboot_since_action``; it now takes the boot from
+    the workflow's own STOP receipt (``node_action_baseline``) and refuses.
     """
 
     incident, workflow = _parked_quiesce(
@@ -507,27 +521,20 @@ def test_a_reimage_before_the_stop_is_not_a_reboot_since_the_quiesce() -> None:
         "the action ran on the boot the node still runs; no reboot since it is "
         f"proven, but it was confirmed: {verdict.confirmations}"
     )
+    assert any(f"still runs boot {NEW_BOOT}" in item for item in verdict.refusals), (
+        verdict.refusals
+    )
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "b138: for a multi-node incident confirm-node-action has no pre-action "
-        "boot for a QUIESCE/RESET (no agent_baselines, no reboot authorization, "
-        "source_boot_id only for single-node incidents and never in "
-        "retired_incarnation_ids, which hold sha256 incarnation digests -- "
-        "heartbeat.py:253-271), so a re-image after the action cannot be proven "
-        "although the STOP receipt pins the node's boot"
-    ),
-)
 def test_a_reimage_after_the_quiesce_settles_it_on_a_multi_node_incident() -> None:
     """Point 3, re-image after the accepted QUIESCE of a two-node job.
 
     The receipt bound the node at ``FAULT_BOOT``; the node now runs a new boot
     under a new Agent incarnation. The re-image ended whatever the quiesce left
-    running, exactly the ``reboot_since_action`` rule -- but the verb refuses
-    for want of a baseline. A QUARANTINED record still exits through
-    ``restore`` (next test); an ESCALATED one with this refusal has no exit.
+    running, exactly the ``reboot_since_action`` rule. Before batch 139 the
+    verb refused for want of a baseline (a multi-node incident has no usable
+    ``source_boot_id``), which left an ESCALATED record with no exit; the STOP
+    receipt is that baseline now.
     """
 
     incident, workflow = _parked_quiesce(
@@ -541,6 +548,9 @@ def test_a_reimage_after_the_quiesce_settles_it_on_a_multi_node_incident() -> No
     (confirmation,) = verdict.confirmations
     assert confirmation["settled_by"] == "reboot_since_action", confirmation
     assert confirmation["previous_boot_id"] == FAULT_BOOT, confirmation
+    assert confirmation["previous_boot_id_source"] == (
+        "stop.stop_ownership_receipt_v1"
+    ), confirmation
 
 
 def test_a_quarantined_parked_record_exits_through_restore_then_confirmation() -> None:

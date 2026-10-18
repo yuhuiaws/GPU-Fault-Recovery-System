@@ -20,10 +20,19 @@ from gpu_fault.adapters.node_action.verification_continuation import (
     VERIFY_EVIDENCE_KEYS,
 )
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
+from gpu_fault.execution.node_action_uncertainty import unresolved_node_action
 from gpu_fault.gpu_fabric_window import quiesce_command_parameters
-from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
+from gpu_fault.models import (
+    WorkflowOperation,
+    WorkflowStepStatus,
+    execution_matches_step,
+    execution_phase,
+)
 from gpu_fault.node_agent.protocol import NodeActionResult, NodeActionStatus
-from gpu_fault.operation_registry import MULTI_NODE_BARRIER_OPERATIONS
+from gpu_fault.operation_registry import (
+    MULTI_NODE_BARRIER_OPERATIONS,
+    NODE_MUTATING_OPERATIONS,
+)
 from gpu_fault.orchestration.escalation import (
     node_action_refused_before_acting,
     unknown_outcome_failure,
@@ -62,6 +71,67 @@ QUIESCE_SERVICE_EVIDENCE = (
     ("stopped_containers", "stopped_containers"),
 )
 RESTORE_SERVICE_EVIDENCE = (("restored_services", "restored_services"),)
+#: The command pointer of an accepted node action's record, kept on the FAILED
+#: record a pre-dispatch gate writes over it (``keep_accepted_uncertainty``).
+ACCEPTED_COMMAND_KEYS = (
+    "node_action_command_id",
+    NODE_ACTION_ACCEPTED_NODES_KEY,
+    "node_action_state",
+    "node_action_endpoint",
+    "remote_command_id",
+    "waiting_node",
+)
+
+
+def keep_accepted_uncertainty(
+    context: WorkflowStepContext, outcome: WorkflowStepOutcome
+) -> WorkflowStepOutcome:
+    """A pre-dispatch gate's FAILED over a command an Agent already accepted.
+
+    The fleet readiness gate and the quiesce window / generation fence
+    (``barriers.py``) answer before the transport reads the accepted command
+    back. When the Agent that accepted it vanished -- a HyperPod re-image took
+    it with its ledger, or it came back as a new incarnation -- the gate's plain
+    FAILED replaced the record that said the outcome is unknown: nothing
+    parked, no compensating restore was owed, and the ladder climbed on a guess
+    (a RESET to a reboot; batch 138). The gate's verdict stands, but the record
+    keeps what it knew: ``outcome_unknown``, ``manual_confirmation_required``
+    and the command pointer -- the rule ``execution/step_bounds.py`` applies at
+    a cap. Only more conservative: a step whose record shows no acceptance
+    keeps the plain failure.
+    """
+
+    operation = context.step.operation
+    if (
+        outcome.status is not WorkflowStepStatus.FAILED
+        or operation not in NODE_MUTATING_OPERATIONS
+    ):
+        return outcome
+    phase = execution_phase(context.workflow)
+    previous = next(
+        (
+            item
+            for item in reversed(context.workflow.step_executions)
+            if execution_matches_step(item, context.step_index, operation, phase)
+        ),
+        None,
+    )
+    if previous is None or previous.status is WorkflowStepStatus.SUCCEEDED:
+        return outcome
+    accepted = bool(previous.details.get("node_action_command_id")) and bool(
+        node_action_accepted_nodes(previous.details) & set(context.step.node_ids)
+    )
+    if not accepted and not unresolved_node_action(previous):
+        return outcome
+    details = {
+        key: previous.details[key]
+        for key in ACCEPTED_COMMAND_KEYS
+        if key in previous.details
+    }
+    details.update(outcome.details or {})
+    details.update(outcome_unknown=True, manual_confirmation_required=True)
+    details.pop("node_action_not_started", None)
+    return replace(outcome, details=details)
 
 
 def service_evidence(
@@ -107,7 +177,7 @@ class NodeActionExecutionService:
             )
         readiness = self._preflight(context)
         if isinstance(readiness, WorkflowStepOutcome):
-            return readiness
+            return keep_accepted_uncertainty(context, readiness)
         if (
             context.step.operation in MULTI_NODE_BARRIER_OPERATIONS
             and len(context.step.node_ids) > 1

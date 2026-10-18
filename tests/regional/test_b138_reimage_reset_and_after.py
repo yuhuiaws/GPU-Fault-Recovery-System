@@ -15,28 +15,30 @@ accepts it as a same-instance reboot and bumps its generation
 What these tests pin, against the real adapters and the in-memory store:
 
 * the STOP receipt already proves the re-image -- a node action after it is
-  STOP_OWNERSHIP_DRIFT -- but the release of the node (RESTORE_SCHEDULING) is not
-  bound to that proof and hands back a node whose boot changed after its
-  validation (point 8, unsafe: xfail strict);
-* an accepted RESET_GPU whose Agent vanished with the old root disk is turned into
-  a plain FAILED -- outcome no longer unknown -- by the maintenance window or the
-  generation fence that run before the result poll, and the branch ladder then
-  climbs to a reboot on that guess (point 5, unsafe by the ladder's own rule:
-  xfail strict);
+  STOP_OWNERSHIP_DRIFT -- and since batch 139 the release of the node
+  (RESTORE_SCHEDULING) is bound to that proof too: a node whose UID or boot
+  moved without this workflow's confirmed reboot is not released (point 8, was
+  unsafe: batch 138 xfail);
+* an accepted RESET_GPU whose Agent vanished with the old root disk was turned
+  into a plain FAILED -- outcome no longer unknown -- by the maintenance window
+  or the generation fence that run before the result poll, and the branch
+  ladder climbed to a reboot on that guess; since batch 139 the gate's FAILED
+  keeps the unknown outcome and the command pointer (point 5, batch 138
+  xfail);
 * a RESTART_NODE overtaken by the re-image and parked at its cap has its exit:
   confirm-node-action proves it once the reinstalled Agent heartbeats (point 10,
   passing).
 
 A RESET of a multi-node job that parks with an unknown outcome is the QUIESCE
 shape of ``tests/regional/test_b138_reimage_before_reset.py``: confirm-node-action
-finds no pre-action boot for it although the workflow's own STOP receipt holds
-one (xfail strict there), and the restore-first exit -- ``restore`` of the
-QUARANTINED incident, then the confirmation settled by that validated restore --
-is pinned there.
+takes its pre-action boot from the workflow's own STOP receipt since batch 139,
+and the restore-first exit -- ``restore`` of the QUARANTINED incident, then the
+confirmation settled by that validated restore -- is pinned there.
 """
 
 from __future__ import annotations
 
+import json
 from copy import deepcopy
 from dataclasses import replace
 from datetime import datetime, timedelta, timezone
@@ -52,7 +54,11 @@ from gpu_fault.adapters.common import (
     QUARANTINE_TAINT,
     quarantine_taint_value,
 )
+from gpu_fault.adapters.kubernetes.stop_boot_transition import REBOOT_AUTHORIZATION_KEY
 from gpu_fault.adapters.kubernetes.stop_ownership import (
+    STOP_RECEIPT_KEY,
+    StopOwnershipReceipt,
+    node_release_ownership_guard,
     node_submission_ownership_guard,
     stop_ownership_scope,
 )
@@ -64,6 +70,7 @@ from gpu_fault.execution.node_action_confirmation import (
     confirm_node_action,
 )
 from gpu_fault.execution.node_action_uncertainty import unresolved_node_action
+from gpu_fault.hyperpod import hyperpod_submission_idempotency_key
 from gpu_fault.models import (
     BlockedKind,
     IncidentState,
@@ -74,6 +81,7 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     WorkflowStepStatus,
 )
+from gpu_fault.node_provider import HYPERPOD_REBOOT_CONFIRMATION_SOURCE
 from gpu_fault.orchestration.escalation import unknown_outcome_failure
 from tests._builders import (
     build_store,
@@ -206,29 +214,20 @@ def test_the_stop_receipt_already_reads_the_reimage_as_drift_for_a_node_action()
     assert refused.details["node_action_not_started"] is True
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "b138 point 8: RESTORE_SCHEDULING is containment-only, so neither the "
-        "cluster executor's STOP guard (dispatch.py:179-191, stop_ownership.py:"
-        "944-951) nor the restore patch (node_operations.py:562-710, ownership by "
-        "the incident annotation the re-image keeps) checks the boot: a node "
-        "re-imaged after its VALIDATE_GPU is released to scheduling"
-    ),
-)
 def test_restore_scheduling_refuses_to_release_a_node_reimaged_after_its_validation():
-    """Shape A, point 8 (unsafe). VALIDATE_GPU succeeded on samples the node
-    posted before the re-image -- the adapter only needs samples after the
-    reset's completion and younger than six minutes, with no boot binding
-    (``gpu_validation.py:139-155``, ``gpu_validation.py:320-361``); the
-    re-image then lands before RESTORE_SCHEDULING. The release runs through
-    the real cluster-executor boundary with the STOP validator in scope and
-    uncordons the node, strips the quarantine taint and the incident
-    annotations -- a node on a new image whose Agent and collectors are not
-    reinstalled yet (the reconciler waits 600 s of Ready first) goes back to
-    scheduling, and RESTART_WORKLOAD may then place the job on it. Desired: the
-    release is refused on the boot drift the receipt proves, and the node keeps
-    its isolation for an operator's validated restore."""
+    """Shape A, point 8 (was unsafe, fixed in batch 139). VALIDATE_GPU
+    succeeded on samples the node posted before the re-image -- the adapter
+    only needs samples after the reset's completion and younger than six
+    minutes, with no boot binding (``gpu_validation.py:139-155``,
+    ``gpu_validation.py:320-361``); the re-image then lands before
+    RESTORE_SCHEDULING. Before the fix the release ran through the real
+    cluster-executor boundary with the STOP validator in scope and uncordoned
+    the node, stripped the quarantine taint and the incident annotations -- a
+    node on a new image whose Agent and collectors are not reinstalled yet
+    went back to scheduling. Now the release re-reads the receipt's node
+    (``stop_ownership.py`` ``check_release``): the boot drift the receipt
+    proves refuses it, nothing is patched, and the node keeps its isolation
+    for an operator's validated restore."""
 
     state, kubernetes, validator, _reset, release = _reimaged_release()
     dispatch = CommandDispatch(SimpleNamespace(stop_ownership_validator=validator))
@@ -239,11 +238,175 @@ def test_restore_scheduling_refuses_to_release_a_node_reimaged_after_its_validat
     assert outcome.status is WorkflowStepStatus.FAILED, (
         f"the re-imaged node was released: {outcome.status.value} {outcome.details}"
     )
-    assert (outcome.details or {}).get("safety_rejection") is True
+    details = outcome.details or {}
+    assert details.get("safety_rejection") is True
+    assert details["reason"] == "STOP_OWNERSHIP_DRIFT", details
+    assert details["node_id"] == "node-a"
+    assert details["receipt_node"]["boot_id"] == "node-a-boot"
+    assert details["observed_node"]["boot_id"] == "node-a-boot-after-reimage"
+    assert ("patch-node", "node-a") not in state.calls, "the node was patched"
     assert node["spec"]["unschedulable"] is True, "the release uncordoned the node"
     assert any(
         taint.get("key") == QUARANTINE_TAINT for taint in node["spec"]["taints"]
     ), "the release stripped the quarantine taint"
+    assert node["metadata"]["annotations"][ANNOTATION_INCIDENT] == (
+        release.incident.incident_id
+    ), "the release dropped the incident annotation"
+
+
+def test_restore_scheduling_releases_a_node_whose_boot_did_not_move():
+    """Control for the re-check: the same release on the boot the receipt
+    bound uncordons node-a and strips the taint and the annotations."""
+
+    state, kubernetes, validator, _reset, release = _reimaged_release()
+    state.nodes["node-a"]["status"]["nodeInfo"]["bootID"] = "node-a-boot"
+    dispatch = CommandDispatch(SimpleNamespace(stop_ownership_validator=validator))
+
+    outcome = dispatch.execute_adapter(kubernetes, release)
+
+    node = state.nodes["node-a"]
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED, outcome
+    assert outcome.details["restored_nodes"] == ["node-a"]
+    assert node["spec"]["unschedulable"] is False
+    assert not any(
+        taint.get("key") == QUARANTINE_TAINT for taint in node["spec"]["taints"]
+    ), "the release keeps the quarantine taint"
+
+
+def test_restore_scheduling_is_not_blocked_by_a_node_it_cannot_read():
+    """Only observed drift refuses the release. A Node read that raises (here
+    the API server answers 500) is no drift: the re-check stands aside and the
+    restore patch, which reads the node again, decides -- an unreadable API
+    never strands a compensating release."""
+
+    state, _kubernetes, validator, _reset, release = _reimaged_release()
+
+    class Unreadable(Exception):
+        status = 500
+
+    def unreadable(name: str) -> Any:
+        raise Unreadable(name)
+
+    state.read_node = unreadable
+    with stop_ownership_scope(validator):
+        assert node_release_ownership_guard(release) is None
+
+
+def test_restore_scheduling_counts_a_deleted_node_as_absent():
+    """A Node the cluster deleted (404) is no drift either: the re-check
+    stands aside and the restore patch counts the node absent, as before."""
+
+    state, kubernetes, validator, _reset, release = _reimaged_release()
+
+    class Gone(Exception):
+        status = 404
+
+    def gone(name: str) -> Any:
+        raise Gone(name)
+
+    state.read_node = gone
+    dispatch = CommandDispatch(SimpleNamespace(stop_ownership_validator=validator))
+
+    outcome = dispatch.execute_adapter(kubernetes, release)
+
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED, outcome
+    assert outcome.details["absent_nodes"] == ["node-a"]
+
+
+def test_restore_scheduling_follows_a_reboot_the_workflow_confirmed():
+    """A reboot chain changes the boot on purpose: the RESTART_NODE record this
+    workflow submitted under the receipt's authorization and the provider and
+    the new Agent incarnation confirmed (``stop_boot_transition``, shape 1)
+    accounts for the new boot, so the release proceeds."""
+
+    state, kubernetes, validator, reset, release = _reimaged_release()
+    workflow = release.workflow
+    receipt = workflow.step_executions[0].details[STOP_RECEIPT_KEY]
+    stopped_at = datetime.fromisoformat(receipt["completed_at"])
+    digest = StopOwnershipReceipt.model_validate_json(json.dumps(receipt)).digest()
+    reboot_index = len(workflow.official_steps)
+    reboot = WorkflowStepSpec(
+        operation=OP.RESTART_NODE,
+        execution_owner="gpu-fault-hyperpod-adapter",
+        node_ids=["node-a"],
+    )
+    key = hyperpod_submission_idempotency_key(
+        workflow.request_id, reboot_index, OP.RESTART_NODE
+    )
+    # The chain may not end after "now"; the STOP completed a moment ago, so
+    # the reboot is stamped at the receipt's own instant.
+    submitted = confirmed = stopped_at
+    record = WorkflowStepExecution(
+        step_index=reboot_index,
+        operation=OP.RESTART_NODE,
+        status=WorkflowStepStatus.SUCCEEDED,
+        phase="official",
+        adapter_operation_id="remote/remote-reboot",
+        started_at=submitted,
+        updated_at=confirmed,
+        details={
+            "action": "REBOOT",
+            "submission_idempotency_key": key,
+            "externally_confirmed": True,
+            "confirmation_source": HYPERPOD_REBOOT_CONFIRMATION_SOURCE,
+            "submitted_nodes": ["i-0reboot"],
+            "agent_baselines": {
+                "node-a": {"boot_id": "node-a-boot", "agent_incarnation_id": "inc-1"}
+            },
+            "agent_observations": [
+                {
+                    "node_id": "node-a",
+                    "boot_id": "node-a-boot-after-reimage",
+                    "agent_incarnation_id": "inc-2",
+                }
+            ],
+            "provider_observations": [
+                {
+                    "node_id": "node-a",
+                    "node_logical_id": "i-0reboot",
+                    "instance_id": "i-0reboot",
+                    "status": "Running",
+                }
+            ],
+            "observed_isolation": {
+                "node-a": {
+                    "kubernetes_node": "node-a",
+                    "unschedulable": True,
+                    "incident": release.incident.incident_id,
+                    "fencing_token": str(workflow.fencing_token),
+                }
+            },
+            REBOOT_AUTHORIZATION_KEY: {
+                "version": 1,
+                "cluster_id": release.incident.cluster_id,
+                "workflow_id": workflow.request_id,
+                "incident_id": release.incident.incident_id,
+                "fencing_token": workflow.fencing_token,
+                "execution_epoch": workflow.execution_epoch,
+                "phase": "official",
+                "step_index": reboot_index,
+                "execution_owner": reboot.execution_owner,
+                "submission_idempotency_key": key,
+                "stop_receipt_sha256": digest,
+                "nodes": {"node-a": {"uid": "node-a-uid", "boot_id": "node-a-boot"}},
+                "checked_at": submitted.isoformat(),
+            },
+        },
+    )
+    rebooted = workflow.model_copy(
+        update={
+            "official_steps": [*workflow.official_steps, reboot],
+            "completed_step_indexes": [*workflow.completed_step_indexes, reboot_index],
+            "step_executions": [*workflow.step_executions, record],
+        }
+    )
+    context = replace(release, workflow=rebooted)
+    dispatch = CommandDispatch(SimpleNamespace(stop_ownership_validator=validator))
+
+    outcome = dispatch.execute_adapter(kubernetes, context)
+
+    assert outcome.status is WorkflowStepStatus.SUCCEEDED, outcome
+    assert state.nodes["node-a"]["spec"]["unschedulable"] is False
 
 
 # --------------------------------------------------------------------------- #
@@ -365,16 +528,6 @@ def _accepted_reset(variant: str):
     return adapter, context, sent
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason=(
-        "b138 point 5: NodeActionExecutionService.execute runs the maintenance "
-        "window and generation fence (barriers.py:121-219) before the ledger poll "
-        "(step_execution.py:108-110), so an accepted RESET whose Agent was "
-        "re-imaged away ends as a plain FAILED without outcome_unknown and the "
-        "branch ladder climbs to RESTART_NODE on that guess"
-    ),
-)
 @pytest.mark.parametrize("variant", ["window", "generation"])
 def test_an_accepted_reset_keeps_its_unknown_outcome_past_the_window_and_the_fence(
     variant,
@@ -393,7 +546,10 @@ def test_an_accepted_reset_keeps_its_unknown_outcome_past_the_window_and_the_fen
     Physically contained in shape A -- HyperPod's preflight refuses lifecycle
     calls on a cluster that is not InService or a node not Running
     (hyperpod.py:654-680), and after the re-image the STOP guard refuses the
-    rung as drift -- but the record lies and the classification climbs."""
+    rung as drift -- but the record lied and the classification climbed. Since
+    batch 139 the gate's FAILED keeps the unknown outcome and the command
+    pointer (``step_execution.keep_accepted_uncertainty``): the record parks
+    for ``confirm-node-action`` and neither ladder climbs."""
 
     adapter, context, sent = _accepted_reset(variant)
 

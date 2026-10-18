@@ -14,13 +14,19 @@ it with, so the automation adds no write of its own:
 * the node's ``ESCALATED`` incidents once no workflow of theirs is open --
   ``IncidentClosureService.close_incident``, the operator close -- and its
   ``QUARANTINED`` ones the same way, with the departure proof as the isolation
-  evidence: a node that is gone took its cordon and taint with it.
+  evidence: a node that is gone took its cordon and taint with it;
+* a ``BLOCKED`` record parked on node actions whose every unresolved one is on
+  a node proven departed (a RESTART_NODE in flight when the node left, a RESET
+  the Agent accepted and never answered): the same close settles them
+  ``node_departed`` on the departure proof and ends the record with the
+  incident (``execution/node_departure_settlement.py``, batch 139).
 
 The actor on every write is ``ACTOR`` and the reference is the departure's
 generated id, so the audit reads exactly as the CLI's would with those two
 substituted. Everything else is reported, never written: a workflow that
-changed a node, a remote command on it, a live execution, an incident that
-also names a node not proven gone. Each refusal is a
+changed a node and holds no unresolved action the departure answers, a remote
+command on it, a live execution, an incident that also names a node not proven
+gone. Each refusal is a
 ``Blocker`` with a bounded ``kind`` (the metric label) and, when there is one,
 the exact administrator command that is the manual path.
 """
@@ -34,18 +40,26 @@ from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 from gpu_fault.departed_nodes import retire_departed_agent, retirement_audit
+from gpu_fault.execution.node_action_uncertainty import (
+    has_unresolved_node_action,
+    node_actions_operator_confirmed,
+)
+from gpu_fault.execution.node_departure_settlement import departure_settlement
 from gpu_fault.fleet import AgentLifecycleState, AgentRecord
+from gpu_fault.compile_blocked import OPEN_REMOTE_STATUSES
 from gpu_fault.models import (
     FaultIncident,
     IncidentState,
     WorkflowRequest,
     WorkflowStatus,
+    WorkflowStepStatus,
 )
 from gpu_fault.orchestration.incident_closure import (
     IncidentNotClosable,
     NodeIsolationEvidence,
 )
 from gpu_fault.store import NotFoundError
+from gpu_fault.suspended_workloads import suspended_workload_line, suspended_workloads
 from gpu_fault.store.shared.errors import StaleWriteError
 from gpu_fault.workflow_reconcile import (
     NEVER_CHANGED,
@@ -109,6 +123,10 @@ _KIND_PRECEDENCE = (
     WORKFLOW_LIVE,
     RECORD_MOVED,
 )
+# How one workflow of a departure ended this cycle (``DepartureWrites._workflow``).
+CLOSED = "closed"
+ANSWERED = "answered"
+LEFT_OPEN = "left-open"
 # Action labels (bounded: they label the action counter).
 AGENT_RETIRED = "agent_retired"
 WORKFLOW_CLOSED = "workflow_closed"
@@ -183,6 +201,9 @@ class CleanupOutcome:
     actions: list[str] = field(default_factory=list)
     action_kinds: list[str] = field(default_factory=list)
     blockers: list[Blocker] = field(default_factory=list)
+    #: Jobs a closed incident's records left suspended (G7): the cleaned
+    #: notice names them; nothing restarts them but their owner.
+    suspended: list[str] = field(default_factory=list)
 
     def acted(self, kind: str, label: str) -> None:
         self.actions.append(label)
@@ -334,13 +355,18 @@ class DepartureWrites:
             )
             return
         left_open = False
+        answered: list[str] = []
         for workflow in self._open_workflows(incident):
-            closed = self._workflow(workflow, incident, reference, outcome)
-            left_open = left_open or not closed
+            verdict = self._workflow(workflow, incident, reference, outcome)
+            if verdict == ANSWERED:
+                answered.append(workflow.request_id)
+            left_open = left_open or verdict == LEFT_OPEN
         if not left_open:
             # A workflow left open already says why; the close would only
             # repeat it as "still has an open workflow".
-            self._close_incident(incident.incident_id, node_id, reference, outcome)
+            self._close_incident(
+                incident.incident_id, node_id, reference, outcome, answered=answered
+            )
 
     def _open_workflows(self, incident: FaultIncident) -> list[WorkflowRequest]:
         """The incident's workflows that are not terminal, oldest id first."""
@@ -370,7 +396,16 @@ class DepartureWrites:
         node_id: str,
         reference: str,
         outcome: CleanupOutcome,
+        *,
+        answered: list[str] | None = None,
     ) -> None:
+        """Close the incident; ``answered`` names its records the close settles.
+
+        A record whose unresolved node actions the departure answers
+        (``_workflow``) is settled by the close itself, which needs the
+        departure as isolation evidence for an ESCALATED incident as well.
+        """
+
         incident = self.store.get_incident(incident_id)
         if incident.state is IncidentState.RECOVERED:
             return
@@ -389,7 +424,9 @@ class DepartureWrites:
                 )
             )
             return
-        if incident.state is IncidentState.QUARANTINED:
+        if incident.state is IncidentState.QUARANTINED or (
+            incident.state is IncidentState.ESCALATED and answered and not accepted
+        ):
             # Every node is proven departed (``_incident``): the departure is
             # the isolation evidence, judged by the closure service itself.
             evidence = [
@@ -435,6 +472,30 @@ class DepartureWrites:
             return
         if changed:
             outcome.acted(INCIDENT_CLOSED, f"incident-closed:{incident_id}")
+        records: list[WorkflowRequest] = []
+        for request_id in dict.fromkeys(
+            [*(answered or ()), incident.workflow_request_id]
+        ):
+            if not request_id:
+                continue
+            try:
+                record = self.store.get_workflow(request_id)
+            except (KeyError, NotFoundError):
+                continue
+            records.append(record)
+            if (
+                request_id in (answered or ())
+                and record.status in _TERMINAL_WORKFLOW_STATUSES
+            ):
+                outcome.acted(WORKFLOW_CLOSED, f"workflow-closed:{request_id}")
+        if changed:
+            newest_first: list[WorkflowRequest] = sorted(
+                records, key=lambda item: item.updated_at, reverse=True
+            )
+            outcome.suspended.extend(
+                suspended_workload_line(item)
+                for item in suspended_workloads(newest_first)
+            )
 
     # ------------------------------------------------------------- workflows
 
@@ -444,12 +505,28 @@ class DepartureWrites:
         incident: FaultIncident,
         reference: str,
         outcome: CleanupOutcome,
-    ) -> bool:
-        """Close one workflow of the departure; ``False`` when it stays open."""
+    ) -> str:
+        """Close one workflow of the departure.
+
+        ``CLOSED`` when it ended here, ``ANSWERED`` when the incident close
+        settles it (a parked record the departure answers, ``_answered``),
+        ``LEFT_OPEN`` with a blocker otherwise.
+        """
 
         request_id = workflow.request_id
         if workflow.status is WorkflowStatus.PENDING:
             reasons = self._close_never_dispatched(request_id, incident, reference)
+        elif (
+            workflow.status is WorkflowStatus.BLOCKED
+            and (
+                has_unresolved_node_action(workflow)
+                or node_actions_operator_confirmed(workflow)
+            )
+            and self._idle(workflow)
+        ):
+            reasons = self._answered(workflow)
+            if not reasons:
+                return ANSWERED
         elif workflow.status is WorkflowStatus.BLOCKED:
             reasons = self._close_never_changed(request_id, incident, reference)
         else:
@@ -460,10 +537,10 @@ class DepartureWrites:
                     "executor ends it",
                 )
             )
-            return False
+            return LEFT_OPEN
         if not reasons:
             outcome.acted(WORKFLOW_CLOSED, f"workflow-closed:{request_id}")
-            return True
+            return CLOSED
         kinds = {_workflow_reason_kind(reason) for reason in reasons}
         kind = next(item for item in _KIND_PRECEDENCE if item in kinds)
         outcome.blockers.append(
@@ -474,7 +551,59 @@ class DepartureWrites:
                 None if kind in WAITING_KINDS else workflow_command(request_id),
             )
         )
-        return False
+        return LEFT_OPEN
+
+    def _idle(self, workflow: WorkflowRequest) -> bool:
+        """Nothing on the record is live: no owner, no unexpired lease, no
+        WAITING step, no open remote command. A live record keeps the
+        never-changed planner's verdict, which names what is live."""
+
+        return (
+            workflow.execution_owner_id is None
+            and (
+                workflow.execution_lease_expires_at is None
+                or workflow.execution_lease_expires_at <= self.now
+            )
+            and not any(
+                item.status is WorkflowStepStatus.WAITING
+                for item in workflow.step_executions
+            )
+            and not any(
+                command.status in OPEN_REMOTE_STATUSES
+                for command in self.store.list_remote_commands(
+                    workflow_request_ids=[workflow.request_id]
+                )
+            )
+        )
+
+    def _answered(self, workflow: WorkflowRequest) -> list[str]:
+        """Why the departures do not answer a parked record; empty when they do.
+
+        A record an operator already confirmed is answered; otherwise every
+        unresolved node action must be on nodes the provider proved departed
+        (an administrator's acceptance of an unknown provider identity answers
+        whether the node left, never what an action on it did).
+        """
+
+        if node_actions_operator_confirmed(workflow):
+            return []
+        departures = {
+            node: self.evidence[node]
+            for node in sorted(self.proven - self.accepted)
+            if node in self.evidence
+        }
+        settlement = departure_settlement(
+            workflow, departures, actor=ACTOR, reference="plan", now=self.now
+        )
+        if settlement.complete:
+            return []
+        return [
+            "workflow completed a node-mutating operation",
+            *(
+                f"unresolved node action not answered by a departure: {item}"
+                for item in settlement.unanswered
+            ),
+        ]
 
     def _node_evidence(self, incident: FaultIncident) -> list[dict[str, Any]]:
         return [

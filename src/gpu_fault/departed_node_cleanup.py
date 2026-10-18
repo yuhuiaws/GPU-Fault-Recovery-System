@@ -55,7 +55,7 @@ from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from threading import Lock
-from typing import Any, Callable, Mapping
+from typing import Any, Callable, Mapping, Sequence
 
 from gpu_fault.departed_node_cleanup_actions import (
     ACTION_KINDS,
@@ -712,7 +712,7 @@ class DepartedNodeCleanup:
         if self._changed(record, previous, now):
             self.store.save_departed_node_cleanup(record)
             self._log(record, previous)
-            self._notify(record, previous)
+            self._notify(record, previous, outcome.suspended)
         return record
 
     def _count(
@@ -762,13 +762,14 @@ class DepartedNodeCleanup:
         self,
         record: DepartedNodeCleanupRecord,
         previous: DepartedNodeCleanupRecord | None,
+        suspended: Sequence[str] = (),
     ) -> None:
         if self.notifications is None:
             return
         if record.status is DepartedNodeCleanupStatus.CLEANED:
             if previous is not None and previous.status is record.status:
                 return
-            candidate = cleaned_notification(record)
+            candidate = cleaned_notification(record, suspended)
         elif record.status is DepartedNodeCleanupStatus.REFUSED:
             if (
                 previous is not None
@@ -898,10 +899,24 @@ def _summary(record: DepartedNodeCleanupRecord) -> str:
     )
 
 
-def cleaned_notification(record: DepartedNodeCleanupRecord) -> AdvisoryNotification:
-    """The informational notice for a node whose records were all ended."""
+def cleaned_notification(
+    record: DepartedNodeCleanupRecord, suspended: Sequence[str] = ()
+) -> AdvisoryNotification:
+    """The informational notice for a node whose records were all ended.
+
+    ``suspended`` names the jobs a closed incident's records left suspended
+    (``suspended_workloads``): the cleanup does not restart them, their owner
+    does, so the notice says so instead of "no action is needed".
+    """
 
     actions = "\n".join(f"  - {item}" for item in record.actions) or "  - none left"
+    left = (
+        "\nLeft suspended (their owner must restart them):\n"
+        + "\n".join(f"  - {item}" for item in suspended)
+        + "\n"
+        if suspended
+        else ""
+    )
     return AdvisoryNotification(
         deduplication_key=(
             f"departed-node-cleaned/{record.cluster_id}/{record.node_id}/"
@@ -915,8 +930,16 @@ def cleaned_notification(record: DepartedNodeCleanupRecord) -> AdvisoryNotificat
         ),
         body_text=(
             "The control plane proved this GPU node gone from Kubernetes and "
-            "from its provider and ended the records it left behind. No action "
-            "is needed.\n\n" + _summary(record) + f"\nEnded:\n{actions}\n"
+            "from its provider and ended the records it left behind. "
+            + (
+                "The workloads named below stay suspended."
+                if suspended
+                else "No action is needed."
+            )
+            + "\n\n"
+            + _summary(record)
+            + f"\nEnded:\n{actions}\n"
+            + left
         ),
         support_case_draft="",
         category="ACTION_COMPLETED",
