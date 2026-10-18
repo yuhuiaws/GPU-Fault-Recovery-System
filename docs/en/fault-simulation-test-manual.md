@@ -381,35 +381,61 @@ hardware produced the XID.
 
 ### 7.5 HyperPod Standalone XID 45 Fabric Manager Restart
 
-A standalone XID 45 (no companion) is decided as `official_action=RESTART_FM`; the shape it runs in depends on whether
-the control plane grades the target node's NVLink fabric (a Hopper SXM part on an NVSwitch baseboard whose DCGM exporter
-reports field 170):
+A standalone XID 45 (no companion) is decided as `official_action=RESTART_FM` (the Xid catalog's Investigatory Action is
+"Solo: RESTART_FM / Not Solo: IGNORE (follow other Xid)"); the shape it runs in depends on whether the control plane
+grades the target node's NVLink fabric (a graded NVSwitch node: Hopper SXM, HGX B200/B300, on an NVSwitch baseboard whose
+DCGM exporter reports field 170), and on the control plane's site switch `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM`:
 
-- a node that is not graded: the workflow is `FREEZE_EVIDENCE` → `RESTART_FABRIC_MANAGER`, a Fabric Manager restart
+- a node that is not graded (A100, PCIe/NVL, GH200, GB200/GB300, unknown parts, a node that reports no field 170):
+  whatever the switch says, the workflow is `FREEZE_EVIDENCE` → `RESTART_FABRIC_MANAGER`, a Fabric Manager restart
   only, with no isolation, no quiesce and no reset;
-- a graded node: stopping Fabric Manager loses the fabric state and every GPU of the fabric must be reset after it
-  restarts, so the workflow is the full GPU and NVSwitch reset chain: `FREEZE_EVIDENCE`, `MARK_UNSCHEDULABLE`,
-  (`STOP_WORKLOADS` with an ACTIVE workload), `QUIESCE_GPU_SERVICES` (stops Fabric Manager), `VERIFY_NO_GPU_CLIENTS`,
-  `RESET_ALL_GPUS_NVSWITCHES` (every graded GPU of the node), `RESTORE_GPU_SERVICES` (starts Fabric Manager),
-  `VALIDATE_GPU`, `VALIDATE_FABRIC`, `RESTORE_SCHEDULING`, (`RESTART_WORKLOAD` with an ACTIVE workload). The
-  `official_action` stays `RESTART_FM` and the completion notification is the GPU/NVSwitch reset notification.
+- a graded node with the switch unset (the default): observe-only. The decision is `MONITOR_ONLY`/`NO_ACTION` with
+  `official_action` still `RESTART_FM`; the incident is recorded `RECOVERED` with its evidence, its reasons say why (with
+  the graded GPU count) and how to opt in, and its `policy_reference` is the NVIDIA page below; only the XID
+  investigatory notification is sent (subject `[GPU FAULT][XID 45 investigatory action] <cluster> <node>`,
+  `FAULT_DETECTED`), with no workflow, no node command and no isolation. Evidence: NVIDIA GPU Debug Guidelines, GPU Node
+  Triage, "Understanding Xid Messages", XID table row "45 Robust Channel Preemptive Removal"
+  (https://docs.nvidia.com/deploy/gpu-debug-guidelines/gpu-node-triage.html#understanding-xid-messages, docs version
+  615, page "Last updated on Oct 04, 2026"): "No action, informative only. Indicates channels affected by another
+  failure. On A100, this error could be seen by itself due to unexpected Fabric Manager shutdown when FM is running in
+  the same OS environment as the GPU. Otherwise, this error is safe to ignore as an informational message.";
+- a graded node with the switch `true`: stopping Fabric Manager loses the fabric state and every GPU of the fabric must
+  be reset after it restarts, so the workflow is the full GPU and NVSwitch reset chain: `FREEZE_EVIDENCE`,
+  `MARK_UNSCHEDULABLE`, (`STOP_WORKLOADS` with an ACTIVE workload), `QUIESCE_GPU_SERVICES` (stops Fabric Manager),
+  `VERIFY_NO_GPU_CLIENTS`, `RESET_ALL_GPUS_NVSWITCHES` (every graded GPU of the node), `RESTORE_GPU_SERVICES` (starts
+  Fabric Manager), `VALIDATE_GPU`, `VALIDATE_FABRIC`, `RESTORE_SCHEDULING`, (`RESTART_WORKLOAD` with an ACTIVE
+  workload). The `official_action` stays `RESTART_FM` and the completion notification is the GPU/NVSwitch reset
+  notification.
 
-`GF-REGIONAL-DESTR-010` verifies both shapes: its preflight reads the control plane's own grading of the node and records
-the shape in the plan, and execute refuses a node whose grading moved. The former `GF-LIVE-KMSG-XID45-SOLO-FM-20260724`
-and the mail case `GF-LIVE-KMSG-XID45-FM-EMAIL-20260724` covered the two-step shape only; they are `SUPERSEDED` and no
-longer run.
+`GF-REGIONAL-DESTR-010` verifies all three shapes: its preflight reads the control plane's own grading of the node and
+what every ready `gpu-fault-control-worker` replica reads for the switch (on a graded node under the default a
+disagreement refuses), records the phases in the plan, and execute refuses a node whose grading or phases moved. Under the default a graded node runs two phases: one
+injection first proves observe-only (incident `RECOVERED`, a single investigatory notification, no remote command, Fabric
+Manager's MainPID/InvocationID and the Agent ledger unchanged, the node never isolated), then the runner opens an
+environment window `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true` on `gpu-fault-control-worker`
+(`scripts/e2e/regional/control_plane_env_window.py`, through `scripts/e2e/regional/xid45_opt_in.py`; one control-worker
+roll), injects a second time after the first XID's companion window to run the full chain, and closes the window exactly
+to its baseline once the workflow is terminal (a second roll); a default that did not hold opens no window and runs no
+chain. While the window is open every graded node's solo XID 45 on the site runs the full chain, so no other regional
+case may run at the same time. A site that opted in for good, or a control plane that predates the default, runs the
+chain at once. The former `GF-LIVE-KMSG-XID45-SOLO-FM-20260724` and the mail case `GF-LIVE-KMSG-XID45-FM-EMAIL-20260724`
+covered the two-step shape only; they are `SUPERSEDED` and no longer run.
 
 Preconditions:
 
 - a node that is not graded: `fabricManagerRestart` in the current Profile is OWNed by `gpu-fault-node-agent` and the
   allowlist contains `RESTART_FABRIC_MANAGER`;
-- a graded node: `gpuReset` and `fabricReset` in the current Profile are OWNed by `gpu-fault-node-agent` and the
-  allowlist contains `QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`, `RESET_ALL_GPUS_NVSWITCHES` and
-  `RESTORE_GPU_SERVICES`;
+- a graded node (also one that is observe-only first): `gpuReset` and `fabricReset` in the current Profile are OWNed by
+  `gpu-fault-node-agent` and the allowlist contains `QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`,
+  `RESET_ALL_GPUS_NVSWITCHES` and `RESTORE_GPU_SERVICES`; the ready `gpu-fault-control-worker` replicas agree on the
+  switch;
 - the Agent is ACTIVE and the artifact/config/profile pins agree;
 - the Fabric Manager MainPID has been recorded; `GF-REGIONAL-DESTR-010` requires an idle node.
 
-Write one standard XID 45 to a single target node only and wait for the full correlation window. The success criteria are
+Write one standard XID 45 to a single target node only and wait for the full correlation window. The success criteria of
+the observe-only default phase are `FINALIZED` with no companion, an incident `RECOVERED` without a workflow whose reasons
+carry the observe-only reason and the way to opt in, a single investigatory notification, an unchanged MainPID and an
+unchanged node scheduling state. The success criteria of the full chain and of the Fabric Manager restart are
 `FINALIZED` with no companion, the workflow completing every step of the node's shape, a changed MainPID, and no
 `QUARANTINE`, reboot or replace. On a node that is not graded the training Pods and attempt are unchanged; on a graded
 node `RESET_ALL_GPUS_NVSWITCHES` runs once, Fabric Manager is stopped once and started once, every graded GPU's fabric

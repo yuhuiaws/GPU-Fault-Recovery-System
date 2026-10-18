@@ -10223,16 +10223,33 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
 
 ### GF-REGIONAL-DESTR-010
 
-**The Fabric Manager action of an XID 45 through the Node Agent: a graded Hopper NVSwitch node takes the full GPU and NVSwitch reset, every other node restarts Fabric Manager**
+**The Fabric Manager action of an XID 45 through the Node Agent: a graded NVSwitch node is observe-only by default and takes the full GPU and NVSwitch reset once the site opts in, every other node restarts Fabric Manager**
 
 - Level: `destructive` (on a graded node it really resets every GPU and NVSwitch of the node; on a node that is not
-  graded it only restarts Fabric Manager, i.e. `live-service-action`).
+  graded it only restarts Fabric Manager, i.e. `live-service-action`). On a graded node under the observe-only default
+  the case also opens a temporary environment window on the CPU-side `gpu-fault-control-worker`, **and while it is open
+  the case must not share a window with any other regional case**: with the window open, every graded node's solo XID 45
+  on the site runs the full chain.
 - Why there are two shapes: NVIDIA's Fabric Manager user guide states that stopping `nvidia-fabricmanager` loses the
   fabric state and that, once it runs again, every GPU in the NVLink fabric needs a reset; its restart procedure for H100
   and later systems is stop the CUDA applications and GPU services, stop Fabric Manager, `nvidia-smi -r`, start Fabric
-  Manager. So on a node whose fabric the control plane grades by DCGM field 170 (a Hopper SXM part on an NVSwitch
-  baseboard that reports a fabric state) the solo XID 45's `RESTART_FM` compiles to that procedure; only a node that is
-  not graded keeps the single Fabric Manager restart.
+  Manager. So on a node whose fabric the control plane grades by DCGM field 170 (a graded NVSwitch node: Hopper SXM,
+  HGX B200/B300, on an NVSwitch baseboard that reports a fabric state) the solo XID 45's `RESTART_FM` compiles to that
+  procedure; only a node that is not graded keeps the single Fabric Manager restart.
+- Why a graded node runs two phases: NVIDIA's GPU debug guidelines (GPU node triage, Understanding Xid Messages, XID
+  table row "45 Robust Channel Preemptive Removal", docs version 615,
+  https://docs.nvidia.com/deploy/gpu-debug-guidelines/gpu-node-triage.html#understanding-xid-messages) read a solo
+  XID 45 as informational: "No action, informative only. Indicates channels affected by another failure. On A100, this
+  error could be seen by itself due to unexpected Fabric Manager shutdown when FM is running in the same OS environment
+  as the GPU. Otherwise, this error is safe to ignore as an informational message." So on a graded node the default is
+  observe-only: the decision is `MONITOR_ONLY`/`NO_ACTION` with `official_action` still `RESTART_FM`, the incident is
+  recorded `RECOVERED` with its evidence and the XID investigatory notification is sent, and nothing touches or
+  cordons the node; only the site switch `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true` brings the chain above back.
+  The case first proves the observe-only default (phase one), then the runner itself opens and closes that switch as an
+  environment window on `gpu-fault-control-worker` (`scripts/e2e/regional/control_plane_env_window.py`, through
+  `scripts/e2e/regional/xid45_opt_in.py`) and proves the full chain inside it (phase two). A site that opted in for good
+  (every ready replica reads true), or a deployed control plane that predates the default, runs the chain at once
+  without a window; a node that is not graded never opens one.
 - The formal entry point stays `manual` and by default only generates the plan. execute must use the same arguments, maintenance-window deadline and
   exact confirmation string:
 
@@ -10259,27 +10276,65 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   ```
 
   The runner uses `host_probe_fixture.py` to create a node-pinned temporary probe with an active deadline;
-  in `finally` it confirms that Fabric Manager is active and deletes the Pod/ConfigMap. The probe offers no ledger deletion or
-  arbitrary command execution interface.
+  in `finally` it first closes the opt-in window (when it opened one), then confirms that Fabric Manager is active and
+  deletes the Pod/ConfigMap. The probe offers no ledger deletion or arbitrary command execution interface.
+
+  The runner opens and closes the opt-in window itself: its baseline record is `<case_dir>/xid45-opt-in-window.json`
+  (`<case_dir>` being `${RUN_DIR}/cases/GF-REGIONAL-DESTR-010`), and the open and close evidence is
+  `xid45-opt-in-open.json` and `xid45-opt-in-close.json`. When the runner died with the window still open, the operator
+  closes it from the same baseline record (it restores the switch alone, deleting it when it was unset before the
+  window):
+
+  ```bash
+  python3 scripts/e2e/regional/control_plane_env_window.py \
+    --site-profile "${SITE_PROFILE}" \
+    --baseline "${RUN_DIR}/cases/GF-REGIONAL-DESTR-010/xid45-opt-in-window.json" \
+    --close --confirm CLOSE_CONTROL_PLANE_ENV_WINDOW
+  ```
 - Steps:
   1. The preflight reads, through a CPU probe, the control plane's own grading of the node's fabric
-     (`gpu_fault.gpu_fabric_manager.graded_fabric_gpus` over the node's latest samples), decides the expected shape from
-     it and writes the shape and the graded GPUs into the plan; execute reads it again and refuses when either moved. A
-     deployed control plane without that grading function does not compile the full reset chain either, so its shape is
-     the Fabric Manager restart.
+     (`gpu_fault.gpu_fabric_manager.graded_fabric_gpus` over the node's latest samples; `observe_only_default` is true
+     when the deployed control plane has `gpu_fault.orchestration.xid45_policy`), and what every ready
+     `gpu-fault-control-worker` replica reads for `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM` (opted in only when all
+     read true; on a graded node under the observe-only default, replicas that disagree, or no ready replica, refuse),
+     and decides the phases `workflow_phases` from them: `observe-only` then `fabric-reset` on a graded node under the
+     observe-only default, `fabric-reset` alone on a
+     graded node whose site opted in or whose control plane predates the default, `fabric-manager-restart` on a node
+     that is not graded; it writes the phases, the shape and the graded GPUs into the plan, and execute reads them again
+     and refuses when the phases or the grading moved. A deployed control plane without that grading function does not
+     compile the full reset chain either, so its shape is the Fabric Manager restart.
   2. Confirm that the current Profile and the Node Agent permit the shape's node actions: on a node that is not graded
-     `fabricManagerRestart` and `RESTART_FABRIC_MANAGER`; on a graded node `gpuReset`, `fabricReset` and
-     `QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`, `RESET_ALL_GPUS_NVSWITCHES`, `RESTORE_GPU_SERVICES`, each owned by
-     `gpu-fault-node-agent`; record the service's `MainPID`, start time, ledger, timer and the node scheduling-state
-     baseline.
-  3. Inject a solo XID 45 via the real `/dev/kmsg`, with a correlation window separated from historical events;
-     the evidence must carry `kmsg://`, and policy must decide
-     `official_action=RESTART_FM`, not the window-open/companion branch.
-  4. A node that is not graded: the workflow is exactly `FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER`, the latter step owned
+     `fabricManagerRestart` and `RESTART_FABRIC_MANAGER`; on a graded node (also one that is observe-only first)
+     `gpuReset`, `fabricReset` and `QUIESCE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS`, `RESET_ALL_GPUS_NVSWITCHES`,
+     `RESTORE_GPU_SERVICES`, each owned by `gpu-fault-node-agent`; record the service's `MainPID`, start time, ledger,
+     timer and the node scheduling-state baseline.
+  3. Phase one (only on a graded node under the observe-only default): inject one solo XID 45 via the real `/dev/kmsg`,
+     wait until its companion window has closed and its incident is recorded, then watch for 60 s more so that a workflow
+     or node action that must not come has the time to come; the evidence is under `<case_dir>/observe-only/`
+     (`injection.json`, `store.json`, `host.json`, `verdict.json`). Assertions: the evidence carries `kmsg://`; the
+     decision has `official_action=RESTART_FM`, `disposition=MONITOR_ONLY`, `action=NO_ACTION` and an inactive marker;
+     the incident is `RECOVERED` with no workflow and `policy_reference` equal to the GPU debug guidelines URL above, and
+     its reasons carry exactly one `observe-only: ...` reason (stating `<n> GPUs report`, n being the graded GPU count)
+     and one that says how to opt in (naming `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM`); the incident has exactly one
+     notification, the XID investigatory notification (subject containing `[XID 45 investigatory action]`,
+     `FAULT_DETECTED`, `SENT`, or `SKIPPED` for a drill), and no completion notification; no remote command was created
+     for it and the cluster has none open; on the host Fabric Manager is active, its `MainPID` and `InvocationID` are
+     unchanged and the journal shows no stop or start, and the Node Agent ledger and the gpu-fault timers are unchanged;
+     the node's scheduling fields equal the baseline. If any of this does not hold, no window is opened, no chain is run,
+     and the case FAILs.
+  4. Open the window (once phase one held): open the environment window
+     `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true` on `gpu-fault-control-worker` (one control-worker roll); the window
+     record carries that assignment alone, its state is `OPEN`, and every ready replica has converged on it; wait out the
+     first XID's companion window (plus 5 s) and stop when the node still has XID events inside the companion window;
+     read the host baseline again (`host-baseline-chain.json`), from which the chain is counted.
+  5. Inject (the chain; a node that is not graded and a site that opted in start here): inject a solo XID 45 via the
+     real `/dev/kmsg`, with a correlation window separated from historical events; the evidence must carry `kmsg://`,
+     and policy must decide `official_action=RESTART_FM`, `EXECUTABLE`, not the window-open/companion branch.
+  6. A node that is not graded: the workflow is exactly `FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER`, the latter step owned
      by `gpu-fault-node-agent`; no `MARK_UNSCHEDULABLE`, no quiesce/restore step, no quarantine taint and no temporary
      fail-safe timer; the journal and systemd state prove that Fabric Manager restarted exactly once and returned to
      active.
-  5. A graded node: the workflow is exactly `FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUIESCE_GPU_SERVICES →
+  7. A graded node: the workflow is exactly `FREEZE_EVIDENCE → MARK_UNSCHEDULABLE → QUIESCE_GPU_SERVICES →
      VERIFY_NO_GPU_CLIENTS → RESET_ALL_GPUS_NVSWITCHES → RESTORE_GPU_SERVICES → VALIDATE_GPU → VALIDATE_FABRIC →
      RESTORE_SCHEDULING` (an idle node has no STOP_WORKLOADS), the four node actions owned by `gpu-fault-node-agent`,
      `RESET_ALL_GPUS_NVSWITCHES` naming every graded GPU with `xid=45` in its parameters; QUIESCE, RESET_ALL and RESTORE
@@ -10290,25 +10345,48 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
      reset every graded GPU's fabric state in the control plane's latest samples is Success (field 170=3); the node's
      scheduling fields are back at the baseline after RESTORE_SCHEDULING, and neither a quiesce state file nor a
      fail-safe timer is left.
-  6. Take the deterministic `command_id` from the ledger and submit it again through the isolated replay fixture: on a
+  8. Take the deterministic `command_id` from the ledger and submit it again through the isolated replay fixture: on a
      node that is not graded the Fabric Manager restart command, on a graded node the `RESTORE_GPU_SERVICES` command that
      started Fabric Manager (a replay of the reset itself is refused by design once the quiesce maintenance window has
      expired, and a replayed QUIESCE would taint the node again); the ledger does not grow and `MainPID` does not change
      again.
-  7. The same incident has exactly one completion notification (on a node that is not graded the `ACTION_COMPLETED`
+  9. The same incident has exactly one completion notification (on a node that is not graded the `ACTION_COMPLETED`
      Fabric Manager notification, on a graded node the GPU/NVSwitch reset notification), and after the Node Agent replay
      the notification ID count does not increase; a drill notification may be recorded as `SKIPPED` per site policy, while a real event with mail enabled
      must be `SENT`.
-  8. Manual supplementary check on a graded node (not part of the automated verdict): once the node is schedulable again
-     inside the maintenance window, run one 8-GPU NCCL all-reduce on it with `NCCL_NVLS_ENABLE=1` and confirm that NVLS
-     initializes. The automated verdict leaves it out: it needs an exclusive 8-GPU NCCL job while the case requires an
-     idle node with no non-system workload before and after, and Fabric Manager only logs a multicast failure when a job
-     requests a team, so reading the log on an idle node proves nothing about NVLS.
-- Verdict: the real collection layer works end to end; the solo branch and the node's workflow shape are correct; Fabric
-  Manager is stopped and started (or restarted) exactly once; a node that is not graded sees no quarantine, no quiesce and
-  no temporary timer, a graded node is isolated only inside the workflow and released by the product itself; the replay
-  returns the cached result and produces neither a second Fabric Manager action nor a second notification; no provider
-  mutation.
+  10. Close the window (when one was opened, in `finally`, before the probe cleanup): restore exactly what the baseline
+      record holds (a second control-worker roll); the record's state is `CLOSED` and every ready replica reads its
+      pre-window value again; a window that cannot be closed, or a window record carrying anything but the switch,
+      FAILs the case.
+  11. Manual supplementary check on a graded node (not part of the automated verdict): once the node is schedulable again
+      inside the maintenance window, run one 8-GPU NCCL all-reduce on it with `NCCL_NVLS_ENABLE=1` and confirm that NVLS
+      initializes. The automated verdict leaves it out: it needs an exclusive 8-GPU NCCL job while the case requires an
+      idle node with no non-system workload before and after, and Fabric Manager only logs a multicast failure when a job
+      requests a team, so reading the log on an idle node proves nothing about NVLS.
+- Stop conditions (written into the plan): a preflight or focused regression failure; a target node that is not Ready,
+  schedulable or idle; a recent XID inside the companion window; Node Agent, Profile or pin drift; a node whose grading
+  moved between plan and execute; an unhealthy Fabric Manager or `/dev/kmsg` baseline; a workflow that differs from the
+  shape (not `FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER` on a node that is not graded; not the full chain on a graded node,
+  or a GPU whose fabric state is not Success after it); with a window, three more: the default XID 45 is not
+  observe-only (a workflow, a node action, a cordon or a missing reason) -- no opt-in, no chain; control-worker replicas
+  disagree on the switch; the window cannot be opened or closed again. And: the node's scheduling state differs from the
+  baseline afterwards; a provider mutation appears; the probe cleanup leaves a residual.
+- Verdict: the real collection layer works end to end; on a graded node the default is observe-only (incident, evidence
+  and investigatory notification complete, nothing happened on the node); the solo branch and the node's workflow shape
+  are correct; Fabric Manager is stopped and started (or restarted) exactly once; a node that is not graded sees no
+  quarantine, no quiesce and no temporary timer, a graded node is isolated only inside the workflow and released by the
+  product itself; the replay returns the cached result and produces neither a second Fabric Manager action nor a second
+  notification; an opt-in window that was opened is back at its baseline; no provider mutation.
+- Cleanup (`finally`): close the opt-in window first (when one was opened), then `ensure-fabric-manager-active` and
+  delete the probe Pod/ConfigMap; the node's scheduling fields equal the baseline; any failing step makes the case FAIL.
+  The runner never restores scheduling or services on the product's behalf: the full chain releases its own cordon and
+  quiesce window.
+- Known limitations:
+  - While the window is open the switch applies to the whole site: every graded node's solo XID 45 runs the full chain,
+    so the case owns its maintenance window and no other regional case may run inside it.
+  - HGX B200/B300 are graded and judged by the same rules as Hopper SXM; on a site without such nodes, B200/B300 have
+    unit evidence only.
+  - NVLS availability is not part of the automated verdict (step 11).
 
 ### GF-REGIONAL-DESTR-011
 
@@ -10750,8 +10828,9 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   ```
 
   The executor helper recognises exactly one variable name, `GPU_FAULT_GPU_CLIENT_VERIFY_MAX_ATTEMPTS`;
-  the control-plane helper's whitelist is the six timing variables of `DESTR-018` (see §DESTR-018).
-  Both are hard-coded in the scripts; they are not tools for "changing arbitrary env on a live
+  the control-plane helper's whitelist is the whole set of eight timing variables of `DESTR-018` (see §DESTR-018)
+  plus one policy switch, `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM` (`true` only, for the XID 45 opt-in window of
+  `DESTR-010`/`DESTR-019`). Both are hard-coded in the scripts; they are not tools for "changing arbitrary env on a live
   Deployment". Their shape is the same as
   `scripts/e2e/regional/synthetic_replacement_route.py`: opening/closing only counts as done once
   **every ready replica reports the same value**; a `kubectl rollout status` return is not the verdict
@@ -12159,7 +12238,10 @@ RESET rows after the cancellation**
   verdict wins. The helper only changes the `control-worker` container of the CPU-plane `gpu-fault-control-worker`,
   and writes the pre-window env of the eight variables plus the Deployment template digest into `--baseline`;
   closing the window restores all eight **exactly** from the baseline (variables that were unset before the window are deleted, not written as
-  shipped defaults).
+  shipped defaults). The same helper also carries one policy switch, `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM`: it
+  accepts `true` alone, is never derived or timing-validated, and is surveyed per replica, recorded in the baseline and
+  restored exactly like the timing variables, for the XID 45 opt-in window of `DESTR-010`/`DESTR-019` only; this case
+  never sets it, and the eight timing variables and the derivation rules in the table above are unchanged.
   The administrator may also run only this case in the selective mode of §2.3; in that case `DESTR-010` is recorded as
   `SKIPPED_BY_OPERATOR`, this case's verdict is still judged against every assertion in this section, but it cannot serve as the predecessor of a later
   formal case.
@@ -12354,10 +12436,16 @@ the ledger migrates in place, and the next real command leaves a complete audit 
 - Level: `destructive`. Restart `gpu-fault-node-agent.service` once on an idle
   GPU node (arm a fail-safe start first), then run the XID 45 workflow already proven by `DESTR-010`: on a
   node whose fabric the control plane does not grade the two steps XID 45 → `RESTART_FABRIC_MANAGER`,
-  **no reset, no reboot, no isolation**; on a graded Hopper NVSwitch node (the live p5en) the full GPU and
-  NVSwitch reset chain (cordon, quiesce, one reset, restore, both validations, scheduling back),
+  **no reset, no reboot, no isolation**; on a graded NVSwitch node (Hopper SXM, HGX B200/B300; the live p5en) the full
+  GPU and NVSwitch reset chain (cordon, quiesce, one reset, restore, both validations, scheduling back),
   **no reboot, no quarantine**. Neither shape makes **any provider API call**; the preflight reads the control
-  plane's own grading and records the shape in the plan.
+  plane's own grading and the XID 45 switch of `gpu-fault-control-worker`, and records the shape and whether a window
+  is opened (`xid45_opt_in_window`) in the plan. On a graded node a solo XID 45 is observe-only by default and leaves no
+  command to audit, so where the control plane is observe-only by default the runner opens `DESTR-010`'s same opt-in
+  window (`GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true`, one control-worker roll) before the quiet check and the
+  Agent restart, and closes it exactly to its baseline in the cleanup (a second roll); a site that opted in for good, or
+  a control plane that predates the default, opens no window. While the window is open the case **must not share a
+  window with any other regional case**.
 - The reusable formal entry point is
   `scripts/e2e/regional/run_destr019_agent_restart_ledger.py`. By default it only generates the plan;
   before execute it must read `DESTR-010=PASS` (chain: `010 → 019`) and requires the administrator
@@ -12418,6 +12506,9 @@ the ledger migrates in place, and the next real command leaves a complete audit 
      `counters` contains exactly `accepted/completed/failed/rejected`.
   5. **No remote command in flight and the processor queue is empty** (checked once at preflight
      and once right before the restart); no fail-safe timer left over from a previous round.
+  6. On a graded node under the observe-only default, every ready `gpu-fault-control-worker` replica reads the same
+     `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM` (replicas that disagree, or no ready replica, refuse: nothing may be
+     planned on a half rollout).
 - Steps:
   1. Baseline: node snapshot, Agent record (generation, incarnation, boot_id), host
      `snapshot` (Agent `MainPID`/`InvocationID`, ledger schema and INTERRUPTED row count,
@@ -12431,15 +12522,21 @@ the ledger migrates in place, and the next real command leaves a complete audit 
      than the ledger's retention (30 days by default) is refused -- the ledger purges such rows the
      moment it opens, and the "row count changed" it would read is not the migration's doing (a fixed
      test clock that aged past the retention once read 3 -> 0 rows).
-  3. Restart: the probe first runs `systemd-run --on-active=<restore>s systemctl start
+  3. Open the window (only when the plan has `xid45_opt_in_window=true`): before the quiet check that precedes the
+     restart and before the Agent restart, open `DESTR-010`'s XID 45 opt-in window
+     (`GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true`, one control-worker roll, converged on every ready replica); its
+     baseline record is `<case_dir>/xid45-opt-in-window.json` (`<case_dir>` being
+     `${RUN_DIR}/cases/GF-REGIONAL-DESTR-019`), the evidence `xid45-opt-in-open.json`. The window rolls the
+     control-worker, so it must open before the restart and the injection.
+  4. Restart: the probe first runs `systemd-run --on-active=<restore>s systemctl start
      gpu-fault-node-agent.service` (fail-safe), then
      `systemctl restart gpu-fault-node-agent.service`, waits for active, records
      `MainPID`/`InvocationID` before and after; waits until the control-plane Agent record's
      `last_seen_at` is later than the restart instant.
-  4. `/healthz` after the restart: 200, all `counters` 0, heartbeat age ≤ 120 s.
-  5. Injection: another probe (`probes/node_host_probe.py`) writes one solo XID 45 with a marker to
+  5. `/healthz` after the restart: 200, all `counters` 0, heartbeat age ≤ 120 s.
+  6. Injection: another probe (`probes/node_host_probe.py`) writes one solo XID 45 with a marker to
      `/dev/kmsg`; wait for the workflow terminal state.
-  6. Audit: the audited command is the Fabric Manager restart command on a node that is not graded and the
+  7. Audit: the audited command is the Fabric Manager restart command on a node that is not graded and the
      chain's `RESET_ALL_GPUS_NVSWITCHES` command on a graded node; with
      `<idempotency_key>/<node>/agent-<generation>` as the command_id, read journald
      (`journalctl -t gpu-fault-node-agent`), the ledger audit columns and `/healthz`; on a graded node also
@@ -12457,6 +12554,9 @@ the ledger migrates in place, and the next real command leaves a complete audit 
     `gpu-fault-control-plane`/`gpu-fault-node-agent`, SUCCEEDED, with no isolation,
     quiesce, reset or reboot; a graded node: the workflow is `DESTR-010`'s full reset chain and SUCCEEDED, with
     no `RESTART_FABRIC_MANAGER`, `RESET_GPU`, `QUARANTINE`, reboot or replace;
+  - With a window: it opened before the quiet check and the Agent restart, its record carries
+    `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true` alone and every ready replica converged on it; the cleanup closes
+    it back to its baseline (state `CLOSED`), and a window that cannot be closed FAILs the case;
   - journald has exactly three lines accepted/started/completed for that command_id, each containing
     `command_id incident_id workflow_request_id operation node_id fencing_token
     agent_generation gpu_count attempt`, with values matching the control plane, the completed line
@@ -12474,9 +12574,21 @@ the ledger migrates in place, and the next real command leaves a complete audit 
   - The CloudTrail set of provider mutation verbs is empty; the node's Kubernetes state is field-by-field identical to the baseline.
 - Cleanup (`finally`): `ensure-agent-active`; `disarm-restore` and confirm no newly added
   gpu-fault timer remains; `ensure-fabric-manager-active`; node snapshot identical to the baseline with no non-system
-  workload; zero residue from the two probe Pods/ConfigMaps; runtime identity equal to preflight.
-  Any failing step makes the case FAIL.
+  workload; zero residue from the two probe Pods/ConfigMaps; with a window, then close it (`xid45-opt-in-close.json`,
+  a second control-worker roll); runtime identity equal to preflight -- with a window, by `DESTR-018`'s rule, only the
+  `gpu-fault-control-worker` generation may move, by exactly the window's two rolls, and its pod template digest must be
+  back at its pre-window value; without one, field by field identical. Any failing step makes the case FAIL. When the
+  runner died with the window still open, the operator closes it from the same baseline record:
+
+  ```bash
+  python3 scripts/e2e/regional/control_plane_env_window.py \
+    --site-profile "${SITE_PROFILE}" \
+    --baseline "${RUN_DIR}/cases/GF-REGIONAL-DESTR-019/xid45-opt-in-window.json" \
+    --close --confirm CLOSE_CONTROL_PLANE_ENV_WINDOW
+  ```
 - Known limitations:
+  - While the window is open the switch applies to the whole site: every graded node's solo XID 45 runs the full chain,
+    so the case owns its maintenance window whenever it opens one.
   - **The Agent is not restarted while a command is in flight.** `NodeActionLedger._interrupt_in_progress`
     marks in-flight rows INTERRUPTED (`retryable=false`),
     `adapters/node_action/step_execution.py::_fold_result` folds INTERRUPTED straight to

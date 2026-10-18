@@ -469,15 +469,33 @@ Current classification:
   plan/execute guard and roll-forward recovery contract.
 - DESTR-011 has a reusable read-only/isolated guard audit.
 - DESTR-010 has a reusable manual live driver. It is plan-only by default,
-  pins one idle GPU node, writes exactly one XID 45 through a temporary
-  host probe, and restores Fabric Manager plus deletes probe resources in
-  `finally`. Its preflight reads the control plane's own fabric grading of the
-  node and pins the workflow shape in the plan (`fabric_restart_shape.py`,
+  pins one idle GPU node, writes its XID 45s through a temporary host probe,
+  and closes its opt-in window, restores Fabric Manager and deletes probe
+  resources in `finally`. Its preflight reads the control plane's own fabric
+  grading of the node, whether that control plane has the observe-only
+  default, and what every ready control-worker replica reads for
+  `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM` (replicas that disagree refuse
+  the plan), and pins the phases in the plan (`fabric_restart_shape.py`,
   shared with DESTR-019): the two-step Fabric Manager restart on a node that is
-  not graded, the full GPU + NVSwitch reset chain on a graded Hopper NVSwitch
-  node. It verifies that shape, one Fabric Manager down/up on the host and the
-  Node Agent ledger replay (the restart command, or the chain's
-  `RESTORE_GPU_SERVICES`).
+  not graded; on a graded NVSwitch node (Hopper SXM, HGX B200/B300) under the
+  default, first the observe-only phase (`destr010_observe_only.py`: one solo
+  XID 45 that must stay MONITOR_ONLY/NO_ACTION with RESTART_FM kept, an
+  incident RECOVERED without a workflow that cites NVIDIA's GPU debug
+  guidelines and says how to opt in, the XID investigatory notification
+  alone, no remote command, and Fabric Manager, the Agent ledger, the
+  gpu-fault timers and the node's scheduling untouched; a default that does
+  not hold opens no window and runs no chain), then the opt-in window
+  (`xid45_opt_in.py`: the switch set to `true` on the control-worker through
+  `control_plane_env_window.py`, one roll to open and one to close, its own
+  baseline file `xid45-opt-in-window.json` in the case directory) and the full
+  GPU + NVSwitch reset chain inside it; a site that opted in for good, or a
+  control plane that predates the default, runs the chain at once. It verifies
+  that shape, one Fabric Manager down/up on the host and the Node Agent ledger
+  replay (the restart command, or the chain's `RESTORE_GPU_SERVICES`); a
+  window that is not closed again FAILs the case, and
+  `control_plane_env_window.py --close` with that baseline file is the way
+  back when the runner died. While the window is open every graded node's solo
+  XID 45 on the site runs the chain, so no other case runs beside it.
 - DESTR-001/002/009/012 have reusable manual live drivers. Each is plan-only
   by default and validates a predecessor evidence file before mutation:
   `010 -> 001 -> 002 -> 009 -> 012`. DESTR-001/002 use the shared node-pinned
@@ -567,7 +585,14 @@ Current classification:
   writes one solo XID 45 so the workflow DESTR-010 proved runs again on the
   restarted Agent (the Fabric Manager restart, or on a graded node the full
   reset chain, whose `RESET_ALL_GPUS_NVSWITCHES` is the audited command and
-  whose ledger attempts since the restart the counters must match). It judges
+  whose ledger attempts since the restart the counters must match). On a
+  graded node whose control plane is observe-only by default that XID 45
+  would leave no command to audit, so the driver opens DESTR-010's opt-in
+  window (`xid45_opt_in.py`) before the quiet check and the Agent restart and
+  closes it in its cleanup; the cleanup's runtime identity then allows exactly
+  the window's two control-worker rolls (DESTR-018's rule: only the
+  control-worker's generation moves, and its pod template digest returns) and
+  stays strict otherwise. It judges
   the Agent's `/healthz` (`ledger.writable`, heartbeat, counters), the three
   structured journald lines the audited command leaves, the ledger row's
   audit columns and
@@ -762,17 +787,25 @@ marker/evidence/workflow lookup plus allowlisted XID, SXID, collector cursor,
 EFA and expected-count operations. `multi_cluster_fixture.py` owns the
 redacted two-cluster registration and context binding used by ISO/E2E cases.
 
-`control_plane_env_window.py` opens and closes the one env window DESTR-018
-needs. It is read-only unless `--open` or `--close` is given, each with its own
+`control_plane_env_window.py` opens and closes the control-worker env window
+DESTR-018 needs (and that DESTR-010/019 use for the XID 45 opt-in). It is
+read-only unless `--open` or `--close` is given, each with its own
 confirmation string (`OPEN_CONTROL_PLANE_ENV_WINDOW` /
 `CLOSE_CONTROL_PLANE_ENV_WINDOW`). It touches exactly one container
 (`control-worker` of the CPU-plane `gpu-fault-control-worker` Deployment),
-accepts only the two allowlisted variable names as positive integers of at least
-60 seconds, records the pre-window env plus the Deployment's template digest in a
+accepts only DESTR-018's timing set -- the two operator-chosen values as
+integers of 60..3600 seconds, the rest derived in lockstep (or set explicitly)
+and never above their shipped defaults -- plus one policy switch,
+`GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM`, whose only accepted value is
+`true` and which is never derived or timing-validated, records the pre-window
+env plus the Deployment's template digest in a
 `--baseline` file, and restores exactly that on close — a variable that was unset
 before the window is unset again, not set to the shipped default. It also
 surveys the values every ready replica actually runs, so a half-finished rollout
-is reported as disagreement rather than averaged.
+is reported as disagreement rather than averaged. `xid45_opt_in.py` is the
+case-side wrapper DESTR-010/019 open and close the switch through (its own
+baseline file, the read-only switch survey, the runtime-identity rule across
+the window's two rolls).
 
 `probes/destr018_node_probe.py` holds one GPU device open. `arm-holder` starts a
 bounded systemd transient unit that opens `/dev/nvidiaN` and sleeps, so the
