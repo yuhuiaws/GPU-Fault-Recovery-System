@@ -4,9 +4,10 @@ NVIDIA ("Install DCGM Exporter", "Requirements and Version Compatibility"):
 the exporter's DCGM client library must be at least the version of the host
 engine it connects to, and only the DCGM version an exporter release is paired
 with is supported. Until batch 135 the product ran the 4.4.1 client of
-``dcgm-exporter:4.4.1-4.5.2`` against host engines 4.6.0 (HyperPod AMI) and
-4.7.0 (``prepare-eks-nodegroup``'s pin): the image was spelled in six files and
-the EKS pin in a seventh, with nothing tying the two halves of the pair.
+``dcgm-exporter:4.4.1-4.5.2`` against newer host engines (the HyperPod AMI's
+own, whose version the AMI decides, and 4.7.0, ``prepare-eks-nodegroup``'s
+pin): the image was spelled in six files and the EKS pin in a seventh, with
+nothing tying the two halves of the pair.
 ``gpu_fault.admin.dcgm_exporter_release`` is now the one source; every literal
 spelling must equal it, and the EKS pin is derived from the exporter's DCGM.
 """

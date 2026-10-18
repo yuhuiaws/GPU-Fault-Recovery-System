@@ -32,16 +32,19 @@ GitHub release ``4.8.4`` says "Release DCGM Exporter 4.8.4 with DCGM 4.6.1 and
 go-dcgm v1.4611.2". It is the newest exporter release: no exporter is paired
 with DCGM 4.7.x on the registry or GitHub, although DCGM 4.7.0 packages are
 published (the go-dcgm ``v1.4701.*`` bindings exist, no exporter release uses
-them). ``4.6.0-4.8.3-distroless``, the release paired with the HyperPod AMI's
-DCGM 4.6.0, ships no ``/etc/ld.so.cache`` (checked in its layers), and its
-start-up check for ``libdcgm.so.4`` then exits with a bare "exit status 1"
-unless the container runtime's NVIDIA hook writes one
-(github.com/NVIDIA/dcgm-exporter#612, fixed by #724 in 4.8.4), so it is not an
-option. Since 4.8.2 NVIDIA publishes the distroless variant only.
+them). ``4.6.0-4.8.3-distroless`` (DCGM 4.6.0) ships no ``/etc/ld.so.cache``
+(checked in its layers), and its start-up check for ``libdcgm.so.4`` then
+exits with a bare "exit status 1" unless the container runtime's NVIDIA hook
+writes one (github.com/NVIDIA/dcgm-exporter#612, fixed by #724 in 4.8.4), so
+it is not an option. Since 4.8.2 NVIDIA publishes the distroless variant only.
 
-So HyperPod's AMI-managed engine (DCGM 4.6.0) meets the connection requirement
-with this 4.6.1 client but is no supported pair; a plain EKS node group in host
-mode installs 4.6.1 and is one. Upgrading: pick the newest
+So a plain EKS node group in host mode installs 4.6.1 and runs the supported
+pair. HyperPod's engine is the AMI's, not ours to pin, and the AMI decides its
+version: the p5en nodes' Agent heartbeats report 4.7.0, newer than this 4.6.1
+client (``host-newer``, NVIDIA's connection requirement broken), which the
+release and ``status --full`` only advise about. No exporter release is built
+on DCGM 4.7.0 or later yet; once one is, moving this pin to it meets the
+requirement on HyperPod too. Upgrading: pick the newest
 ``<dcgm>-<exporter>-<variant>`` tag whose DCGM is at least every host engine of
 the site, read its manifest-list digest from the registry, change this module,
 the literals listed above and the lock together, and roll the EKS node groups

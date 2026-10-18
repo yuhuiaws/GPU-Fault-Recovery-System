@@ -5,7 +5,8 @@ must also be greater than or equal to the DCGM host engine version. Meeting
 this connection requirement does not make a mismatched release pair
 supported." (NVIDIA, "Install DCGM Exporter", "Requirements and Version
 Compatibility"). The product read neither version: it ran a 4.4.1 client
-against 4.6.0 and 4.7.0 engines without anything saying so.
+against newer engines (the HyperPod AMI's own, the plain EKS pin's 4.7.0)
+without anything saying so.
 """
 
 from __future__ import annotations
