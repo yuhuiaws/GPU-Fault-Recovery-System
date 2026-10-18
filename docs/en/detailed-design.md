@@ -1414,6 +1414,22 @@ a TERM list (`GPU_FAULT_QUIESCE_PROCESSES`, `pkill --exact`) or sweep whitelist 
 none shipped) naming `nv-fabricmanage` or `nvlsm` is refused at Agent construction ("the quiesce never signals Fabric
 Manager or NVLSM").
 
+`/proc/modules` decides whether the display stack is back (`node_agent/operations/display_stack.py`): after one
+`modprobe` of the outermost module (`nvidia_drm`, which pulls `nvidia_modeset` in first), a module the reset unloaded
+that is not `Live` -- `modprobe` failed, exited 0 and loaded nothing (an `install` override in `modprobe.d`), or brought
+back `nvidia_modeset` alone -- earns one more try after a 5 s pause; each `modprobe` is bounded at 12 s, under 30 s in
+all, and a `modprobe` killed by its timeout does not stop the kernel finishing the load, which the retry then sees. Each
+attempt is recorded in `display_module_reload_attempts` and the verdict is `display_stack_restored`; a stack still not
+back also carries `display_modules_missing`, the last `kernel_module_reload_error` and the remedy in
+`display_stack_remedy` (`modprobe nvidia_drm, or reboot the node`). A display stack that is not back neither fails a
+successful reset nor counts as a GPU fault: CUDA does not use the DRM device, and draining, quarantining or resetting
+for it would be disproportionate. It reaches the operator through the reset's own completion mail
+(`notifications/display_stack.py`: GPU_RESET_COMPLETED/FABRIC_RESET_COMPLETED already receive every node's result; the
+subject gains `[display stack not restored]` and "3. Follow-up" names, per node, the missing modules, the last error and
+the remedy). The channels not taken: a node-health finding opens an incident and a workflow, a GPU finding fails the
+chain's own VALIDATE_GPU, VALIDATE_HOST is not in a reset chain and has no non-blocking finding, and a heartbeat report
+would change the signed heartbeat protocol.
+
 The quiesce window is exclusive against the Agent's own GPU work as well. `RUN_DCGM_DIAGNOSTIC`,
 `COLLECT_DIAGNOSTIC_BUNDLE`, `COLLECT_HUNG_TRIAGE`, `RUN_FIELD_DIAGNOSTIC`, `RUN_NVLINK74_WORKFLOW` and
 `TRIGGER_HEALTH_SNAPSHOT` open GPU clients of their own (`dcgmi` and its `nvvs`, `nvidia-smi`, the field diagnostic, the

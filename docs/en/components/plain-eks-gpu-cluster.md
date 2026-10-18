@@ -164,7 +164,11 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   escalation lineage (`escalation_descends_from`; `escalation_lineage` of
   `/executors/incident-ownership?successor_workflow_id=`) instead of one hop.
 - A busy reset with no process holding a device node unloads the idle `nvidia_drm`/`nvidia_modeset`, retries at once
-  and reloads them after the reset (`released_kernel_modules`/`reloaded_kernel_modules`); the `nvidia-persistenced` the
+  and reloads them after the reset (`released_kernel_modules`/`reloaded_kernel_modules`; `/proc/modules` checks the
+  reload, a missing module earns one retry after a 5 s pause, and a stack still not back is
+  `display_stack_restored=false`: the reset stays successful, it is not handled as a GPU fault, and the GPU reset
+  completion mail carries `[display stack not restored]` and the remedy `modprobe nvidia_drm` or a node reboot); the
+  `nvidia-persistenced` the
   window kept (on the other GPUs only) and the Fabric Manager the window kept (named in its `kept_services`, on
   `/dev/nvidia-caps/*`/`/dev/nvidia-nvswitch*`/`/dev/nvidia-nvlink` only) do not stop the unload and are recorded in
   `display_release_bystanders` (Fabric Manager itself only: on NVL5 an `nvlsm` of the same unit holding an NVIDIA device

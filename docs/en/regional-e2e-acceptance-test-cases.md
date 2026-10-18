@@ -9222,7 +9222,10 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   failure compensation's RESTORE_GPU_SERVICES runs even while the record carries an unresolved node action (the node is
   isolated; host services and taint come back first, the record then parks BLOCKED for `confirm-node-action` on a
   really unknown outcome); the display stack is unloaded with a re-read of `/proc/modules` per module,
-  `reloaded_kernel_modules` is written in load order and whatever stayed loaded is in `display_modules_retained`; a
+  `reloaded_kernel_modules` is written in load order and whatever stayed loaded is in `display_modules_retained`; the
+  reload is checked against `/proc/modules` too and retried once when a module is missing
+  (`display_module_reload_attempts`, verdict `display_stack_restored`), a stack not back does not fail the reset, and the
+  GPU reset completion mail then carries `[display stack not restored]` and the remedy; a
   validated restore's VALIDATE_GPU FAILS at once naming the collectors that have not reported after
   `restore_collector_grace` (default 120 s) instead of waiting out the 600 s cap. The final ownership boundary asks for
   its permit only after the slow local reads -- the compute-apps `nvidia-smi` (which pays the whole driver initialisation

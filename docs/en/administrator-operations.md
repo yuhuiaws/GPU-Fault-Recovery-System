@@ -1613,14 +1613,28 @@ Semantics and boundaries of `eks-managed`:
   device node, the Agent unloads the idle display stack after the first busy refusal (`nvidia_drm` at refcount 0, then
   `nvidia_modeset` -- live the only holder was `nvidia_modeset refcount=1 used_by nvidia_drm`), retries at once and
   loads it back with `modprobe nvidia_drm` after the reset whatever its outcome (`released_kernel_modules`/
-  `reloaded_kernel_modules`, or `kernel_module_reload_error`); with a process holding a device node no module is
+  `reloaded_kernel_modules`/`display_stack_restored`); with a process holding a device node no module is
   touched -- except the `nvidia-persistenced` the window kept (holding only the other GPUs and `/dev/nvidiactl`) and the
   Fabric Manager the window kept (`nv-fabricmanage` in `nvidia-fabricmanager.service`, holding only `/dev/nvidia-caps/*`,
   `/dev/nvidia-nvswitch*` and `/dev/nvidia-nvlink`; judged by that window's own `kept_services`, so a window that meant to
   stop it, one that does not manage it, or no window excuses nothing; it excuses Fabric Manager itself only -- on NVL5 an
   `nvlsm` of the same unit holding an NVIDIA device node is still a client and fails closed, not observed live): they do
   not stop the unload and are both recorded
-  in `display_release_bystanders` (detailed design, quiesce). The Agent's own
+  in `display_release_bystanders` (detailed design, quiesce). **`/proc/modules` decides whether the stack is back**: when
+  a module the reset unloaded is still missing after the load (`modprobe` failed, exited 0 and loaded nothing, or brought
+  back `nvidia_modeset` alone), the Agent pauses 5 s and tries once more (each `modprobe` bounded at 12 s, under 30 s in
+  all), both attempts recorded in `display_module_reload_attempts`; `reloaded_kernel_modules` lists only the modules
+  verified back. A stack still not back is `display_stack_restored=false`, with `display_modules_missing`, the last error
+  in `kernel_module_reload_error` and the remedy in `display_stack_remedy` (`modprobe nvidia_drm, or reboot the node`).
+  That is neither a failed reset nor a GPU fault: the reset stays SUCCEEDED, nothing is drained, quarantined or escalated
+  to a reset or reboot (CUDA does not use the display stack), but until the stack is loaded or the node reboots it has no
+  `/dev/dri` and graphics/EGL/Vulkan workloads get no DRM device. The operator reads it in that reset's completion mail:
+  `GPU_RESET_COMPLETED`/`FABRIC_RESET_COMPLETED` (templates `gpu-reset-zh-v2`/`fabric-reset-zh-v2`, category still
+  `ACTION_COMPLETED`) carries `[display stack not restored]` in the subject and, per node, the missing modules, the last
+  error and the remedy under "3. Follow-up"; the same fields are in the reset step's `node_results.<node>` of
+  `GET /v1/workflows/{workflow_id}`. Remedy: on that node run `modprobe nvidia_drm` as root (`modprobe nvidia_modeset` when
+  only `nvidia_modeset` was unloaded), or reboot the node; later reset records and mails no longer carry it. An older
+  Agent reports only `kernel_module_reload_error`, and the control plane renders the same remedy for it. The Agent's own
   diagnostic commands (RUN_DCGM_DIAGNOSTIC, COLLECT_DIAGNOSTIC_BUNDLE, COLLECT_HUNG_TRIAGE, the field diagnostic,
   TRIGGER_HEALTH_SNAPSHOT) are refused while another incident's quiesce window is open (HTTP 409
   `GPU_MAINTENANCE_WINDOW_OPEN`, retryable: the step stays WAITING and is resubmitted after the window closed); one
@@ -1669,7 +1683,8 @@ Semantics and boundaries of `eks-managed`:
   default 420 s) remains the last line. The display-stack unload re-reads `/proc/modules` after every module: `nvidia_modeset` is judged with
   `nvidia_drm` really gone (the single snapshot used to unload drm alone and leave modeset at refcount 1), whatever stayed
   loaded is recorded with its refcount/users in `display_modules_retained`, and `reloaded_kernel_modules` is written in
-  load order (`nvidia_modeset` before `nvidia_drm`; `modprobe nvidia_drm` pulls the dependency in itself). **Third-party GPU client DaemonSets on GPU nodes must therefore not tolerate
+  load order (`nvidia_modeset` before `nvidia_drm`; `modprobe nvidia_drm` pulls the dependency in itself) and lists only
+  the modules `/proc/modules` shows back (the retry and a stack that stays unloaded: see above). **Third-party GPU client DaemonSets on GPU nodes must therefore not tolerate
   `gpu-fault.io/quiesce`** (a key-less `operator: Exists` wildcard toleration keeps them inside the window and the
   reset still fails with `In use by another client`) and must tolerate being stopped inside the window; otherwise keep
   them off nodes carrying the `gpu-fault.io/quarantined` taint by their own affinity. When `nvidia-smi --gpu-reset`

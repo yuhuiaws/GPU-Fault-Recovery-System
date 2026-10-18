@@ -8423,7 +8423,11 @@ switch/port/PCI BDF, Official/Effective/Safety/Investigatory Action, incident,
 workflow and evidence references, and returns the notification ID in the decision's `investigatory_notification_id`.
 The deduplication key is composed of the Event ID and the template version; a re-submission of the same event does not send twice. Subsequent
 `CHECK_MECHANICALS`, reset, reboot, training restart and other actions are notified separately with their own fixed templates.
-A successful single-GPU `RESET_GPU` uses `gpu-reset-zh-v1`; a successfully submitted
+A successful single-GPU `RESET_GPU` uses `gpu-reset-zh-v2` and a full GPU/NVSwitch reset `fabric-reset-zh-v2`: when
+the display stack the reset unloaded (`nvidia_drm`/`nvidia_modeset`) did not come back, the subject carries
+`[display stack not restored]` and "3. Follow-up" names, per node, the missing modules, the last error and the remedy
+(`modprobe nvidia_drm`, or reboot the node); the category stays `ACTION_COMPLETED` and nothing is done automatically, and
+with the stack back or untouched the body reads as in v1. A successfully submitted
 `RESTART_WORKLOAD` uses `restart-workload-zh-v1`. A confirmed `RESTART_NODE` uses `restart-node-zh-v1`, whose
 provider lines follow the lifecycle adapter that rebooted the node: on HyperPod `HyperPod action:
 BatchRebootClusterNodes`, `HyperPod operation` and each node's `HyperPod status`; on plain EKS `EKS action: EC2
