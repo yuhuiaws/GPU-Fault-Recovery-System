@@ -130,6 +130,14 @@ DCGM_HOSTENGINE_UNIT = "nvidia-dcgm"
 #: (Hopper SXM, HGX B200/B300) whose systemd enables it
 #: (``gpu_fault.gpu_fabric_manager``). On NVL5 the unit also runs NVLSM.
 FABRIC_MANAGER_UNIT = "nvidia-fabricmanager"
+#: How long the Agent waits for one ``systemctl start``/``restart`` of
+#: ``FABRIC_MANAGER_UNIT``: NVIDIA's R580 unit allows ``TimeoutStartSec=720``
+#: (on NVL5 its start script polls up to 60 s for the InfiniBand device, starts
+#: NVLSM, then Fabric Manager; the R535 unit allowed 240), and a restart adds
+#: the stop, so the unit's own bound plus a minute. Every other unit keeps the
+#: Agent's 120 s; the control plane sizes the waiting cap of the steps that may
+#: start it from this (``execution.config``).
+FABRIC_MANAGER_START_TIMEOUT_SECONDS = 780
 #: The cluster's DCGM host engine mode as the node installer, the node
 #: installer reconciler and the Node Agent read it; set on ``eks-managed``
 #: clusters only, so a HyperPod node's environment stays byte for byte the same.

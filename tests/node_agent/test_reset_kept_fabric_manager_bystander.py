@@ -667,24 +667,44 @@ def test_the_window_record_is_read_without_raising(tmp_path: Path) -> None:
     assert window_kept_services(manager, "incident-a") == frozenset(), "unreadable"
 
 
-# -- the quiesce never signals Fabric Manager -----------------------------
+# -- the quiesce never signals Fabric Manager (or NVLSM) -------------------
+
+KUBERNETES_CGROUP = "/kubepods.slice/kubepods-pod0123.slice/cri-containerd-abc.scope"
 
 
 @pytest.mark.parametrize(
-    ("route", "overrides", "workload_cgroups", "cgroup"),
+    ("route", "overrides", "workload_cgroups", "cgroup", "comm"),
     [
-        (
-            "whitelist",
-            {"device_sweep_processes": ("nv-fabricmanage",)},
-            None,
-            FM_CGROUP,
-        ),
-        ("workload cgroup", {}, {"/system.slice"}, FM_CGROUP),
+        ("workload cgroup", {}, {"/system.slice"}, FM_CGROUP, "nv-fabricmanage"),
         (
             "kubernetes container",
             {"sweep_kubernetes_device_holders": True},
             None,
-            "/kubepods.slice/kubepods-pod0123.slice/cri-containerd-abc.scope",
+            KUBERNETES_CGROUP,
+            "nv-fabricmanage",
+        ),
+        # NVL5 (HGX B200/B300): the unit's start script runs NVLSM in its cgroup.
+        ("nvlsm, workload cgroup", {}, {"/system.slice"}, FM_CGROUP, "nvlsm"),
+        (
+            "nvlsm by name, kubernetes container",
+            {"sweep_kubernetes_device_holders": True},
+            None,
+            KUBERNETES_CGROUP,
+            "nvlsm",
+        ),
+        (
+            "nvlsm by name, in the workload's own cgroup",
+            {},
+            {"/kubepods.slice/kubepods-pod0123.slice"},
+            KUBERNETES_CGROUP,
+            "nvlsm",
+        ),
+        (
+            "any process of the unit",
+            {"sweep_kubernetes_device_holders": True},
+            {"/system.slice"},
+            FM_CGROUP,
+            "fm-helper",
         ),
     ],
 )
@@ -694,9 +714,14 @@ def test_the_device_sweep_never_signals_fabric_manager(
     overrides: dict[str, Any],
     workload_cgroups: set[str] | None,
     cgroup: str,
+    comm: str,
 ) -> None:
     node = P5enNode(
-        tmp_path, daemon=False, fm_devices=FM_HOLDS_A_TARGET_GPU, fm_cgroup=cgroup
+        tmp_path,
+        daemon=False,
+        fm_devices=FM_HOLDS_A_TARGET_GPU,
+        fm_cgroup=cgroup,
+        fm_comm=comm,
     )
     manager = _manager(node, services=("kubelet",), **overrides)
 
@@ -714,10 +739,31 @@ def test_the_device_sweep_never_signals_fabric_manager(
     assert node.fabric_manager_touched() == [] and node.fm_running(), route
 
 
+@pytest.mark.parametrize("name", ["nv-fabricmanage", "nvlsm"])
+@pytest.mark.parametrize("setting", ["processes", "device_sweep_processes"])
 def test_a_quiesce_that_would_signal_fabric_manager_by_name_is_refused(
-    tmp_path: Path,
+    tmp_path: Path, name: str, setting: str
 ) -> None:
+    """GPU_FAULT_QUIESCE_PROCESSES (``pkill --exact`` TERM) and
+    GPU_FAULT_DEVICE_SWEEP_PROCESSES (the sweep whitelist) name neither Fabric
+    Manager nor NVLSM: the Agent refuses the configuration at construction."""
+
     node = P5enNode(tmp_path)
 
-    with pytest.raises(ValueError, match="never signals Fabric Manager"):
-        _manager(node, processes=("nv-fabricmanage",))
+    with pytest.raises(ValueError, match="never signals Fabric Manager or NVLSM"):
+        _manager(node, **{setting: (name, "nv-hostengine")})
+
+
+def test_nvlsm_is_part_of_the_fabric_by_name_or_by_its_unit() -> None:
+    assert fabric_manager_process({"process_name": "nvlsm"}) is True, "by name"
+    assert (
+        fabric_manager_process({"process_name": "nvlsm", "cgroup_paths": [FM_CGROUP]})
+        is True
+    ), "in the unit"
+    assert fabric_manager_process({"process_name": "nvlsm-bug-repo"}) is False, (
+        "an exact comm, not a prefix"
+    )
+    nvlsm = {**LIVE_FM_HOLDER, "process_name": "nvlsm"}
+    assert fabric_manager_bystander(nvlsm, {FM}) is False, (
+        "only Fabric Manager itself is a display-release bystander"
+    )

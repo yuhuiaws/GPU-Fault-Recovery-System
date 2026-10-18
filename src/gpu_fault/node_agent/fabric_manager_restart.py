@@ -25,13 +25,19 @@ import subprocess
 from collections.abc import Callable, Sequence
 from typing import Any
 
-from gpu_fault.cluster_scope import FABRIC_MANAGER_UNIT
+from gpu_fault.cluster_scope import (
+    FABRIC_MANAGER_START_TIMEOUT_SECONDS,
+    FABRIC_MANAGER_UNIT,
+)
 
 #: The scope ``_execute_reset_all`` notes on its quiesce-window claim.
 FULL_FABRIC_RESET_SCOPE = "ALL_LOCAL_GPUS_AND_NVSWITCHES"
 #: Fabric Manager's start returns once it has configured the fabric or given up
-#: (34 s to give up, live); systemd's own start timeout is 90 s.
-START_TIMEOUT_SECONDS = 180
+#: (34 s to give up, live on H200); NVIDIA's R580 unit allows
+#: ``TimeoutStartSec=720`` (on NVL5 the start script polls for the InfiniBand
+#: device and starts NVLSM first), so the Agent waits the unit's bound plus a
+#: minute (``cluster_scope.FABRIC_MANAGER_START_TIMEOUT_SECONDS``).
+START_TIMEOUT_SECONDS = FABRIC_MANAGER_START_TIMEOUT_SECONDS
 QUERY_TIMEOUT_SECONDS = 15
 #: A unit an operator disabled or masked stays down: that is a decision, not a
 #: failure this chain may override.

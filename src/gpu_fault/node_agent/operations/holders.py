@@ -30,6 +30,7 @@ from typing import Any
 from gpu_fault.cluster_scope import FABRIC_MANAGER_UNIT
 from gpu_fault.node_agent.common import (
     FABRIC_MANAGER_PROCESS,
+    FABRIC_PROCESSES,
     NVIDIA_GPU_DEVICE_PATTERN,
     PERSISTENCE_DAEMON_PROCESS,
 )
@@ -274,9 +275,16 @@ def systemd_unit_cgroup(cgroup_paths: Iterable[str], unit: str) -> bool:
 
 
 def fabric_manager_process(holder: Mapping[str, Any]) -> bool:
-    """A Fabric Manager by its name or by its unit's cgroup: never signalled."""
+    """Fabric Manager or NVLSM, by name or by the unit's cgroup: never signalled.
 
-    return holder.get("process_name") == FABRIC_MANAGER_PROCESS or any(
+    On NVL5 (HGX B200/B300) the ``nvidia-fabricmanager`` unit's start script
+    runs the NVLink Subnet Manager (``nvlsm``) beside Fabric Manager, in the same
+    cgroup; NVIDIA ships no unit of its own for it. Any process of that unit, and
+    a process with either name wherever it runs, is part of the fabric: the sweep
+    skips it (``fabric_manager_never_swept``) and VERIFY stays the judge.
+    """
+
+    return holder.get("process_name") in FABRIC_PROCESSES or any(
         str(path).endswith(f"/{FABRIC_MANAGER_UNIT}.service")
         for path in holder.get("cgroup_paths") or ()
     )

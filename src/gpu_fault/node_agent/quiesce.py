@@ -30,10 +30,11 @@ from gpu_fault.node_agent.common import (
     DEFAULT_QUIESCE_CONTAINERS,
     DEFAULT_QUIESCE_PROCESSES,
     DEFAULT_QUIESCE_SERVICES,
-    FABRIC_MANAGER_PROCESS,
+    FABRIC_PROCESSES,
     NVIDIA_GPU_DEVICE_PATTERN,
     PROCESS_NAME_PATTERN,
     SYSTEMD_NAME_PATTERN,
+    unit_start_timeout_seconds,
 )
 from gpu_fault.node_agent.protocol import (
     QUIESCE_FABRIC_MANAGER_KEEP,
@@ -255,8 +256,8 @@ class GpuServiceQuiesceManager:
         for process in processes:
             if not PROCESS_NAME_PATTERN.fullmatch(process):
                 raise ValueError(f"invalid quiesce process name: {process}")
-        if FABRIC_MANAGER_PROCESS in processes:
-            raise ValueError("the quiesce never signals Fabric Manager by name")
+        if FABRIC_PROCESSES.intersection((*processes, *device_sweep_processes)):
+            raise ValueError("the quiesce never signals Fabric Manager or NVLSM")
         for process in device_sweep_processes:
             if not PROCESS_NAME_PATTERN.fullmatch(process):
                 raise ValueError(f"invalid device sweep process name: {process}")
@@ -555,7 +556,7 @@ class GpuServiceQuiesceManager:
         forever. The sweep is limited to the target GPU and to an explicit
         process whitelist, the affected workload's cgroup, or -- when
         ``sweep_kubernetes_device_holders`` is set -- a Kubernetes container,
-        never Fabric Manager (signalled, it loses every GPU's fabric state).
+        never Fabric Manager or NVLSM (signalled, the fabric loses its state).
         Others stay alive: VERIFY, the authority on survivors too, fails closed
         rather than kill an unrelated workload. Returns the signalled holders.
         """
@@ -994,7 +995,7 @@ class GpuServiceQuiesceManager:
                 self._run(
                     ["systemctl", "start", service],
                     check=True,
-                    timeout=120,
+                    timeout=unit_start_timeout_seconds(service),
                 )
             inactive = [
                 service for service in services if not self._service_active(service)

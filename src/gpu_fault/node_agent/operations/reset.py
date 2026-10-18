@@ -7,6 +7,10 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Callable
 
+from gpu_fault.cluster_scope import (
+    FABRIC_MANAGER_START_TIMEOUT_SECONDS,
+    FABRIC_MANAGER_UNIT,
+)
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
@@ -597,7 +601,7 @@ class ResetOperationsMixin:
             command.gpu_uuids,
             include_device_clients=False,
         )
-        service = "nvidia-fabricmanager"
+        service = FABRIC_MANAGER_UNIT
         before = self._run_checked(
             [
                 "systemctl",
@@ -609,9 +613,11 @@ class ResetOperationsMixin:
             timeout=30,
         ).stdout.strip()
         require_physical_ownership()
+        # The unit's own start bound plus its stop (NVL5: NVLSM and Fabric
+        # Manager), not the 120 s every other unit gets.
         self._run_checked(
             ["systemctl", "restart", service],
-            timeout=120,
+            timeout=FABRIC_MANAGER_START_TIMEOUT_SECONDS,
         )
         self._run_checked(
             ["systemctl", "is-active", "--quiet", service],

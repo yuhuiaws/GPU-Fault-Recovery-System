@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from typing import Iterable, Mapping
 from uuid import uuid4
 
+from gpu_fault.cluster_scope import FABRIC_MANAGER_START_TIMEOUT_SECONDS
 from gpu_fault.env import env_bool
 from gpu_fault.execution.invariants import InvariantMode
 from gpu_fault.execution.models import WorkflowExecutionError
@@ -110,6 +111,42 @@ def node_install_step_overrides(
     return {operation: ceiling for operation in NODE_INSTALL_OPERATIONS}
 
 
+# The operations whose node action may start ``nvidia-fabricmanager``: a
+# window's RESTORE (its restore loop, or the start after a full GPU + NVSwitch
+# reset that found the unit down) and the Fabric Manager restart. The Agent
+# gives that unit FABRIC_MANAGER_START_TIMEOUT_SECONDS (780 s: the R580 unit's
+# TimeoutStartSec=720 plus a minute; on NVL5 the unit starts NVLSM first) where
+# every other unit gets 120 s, so the default 600 s cap would fail a step whose
+# Fabric Manager is still legitimately starting, on the generic "past the
+# per-step cap" path, before the Agent's own verdict lands.
+FABRIC_MANAGER_START_OPERATIONS = (
+    WorkflowOperation.RESTORE_GPU_SERVICES,
+    WorkflowOperation.RESTART_FABRIC_MANAGER,
+)
+# The Agent's 780 s for the unit plus 420 s for the rest of a restore: the
+# container restore wait (180 s), the restore settle (30 s), the other units'
+# starts and the persistence read-back -- 1200 s. A restart is the unit alone
+# (780 s and three ``systemctl`` reads).
+FABRIC_MANAGER_STEP_TIMEOUT_SECONDS = FABRIC_MANAGER_START_TIMEOUT_SECONDS + 420
+
+
+def fabric_manager_step_overrides(
+    values: Mapping[str, str],
+) -> dict[WorkflowOperation, int]:
+    """The waiting ceiling of the steps that may start Fabric Manager.
+
+    Never below the default cap (an override only raises a ceiling) and never
+    above the node workflow lifetime, which would fail the step first anyway: a
+    compression drill that lowers both (``DESTR-018``) keeps a bootable set.
+    The keys and defaults are written out for ``generate-env-reference.py``.
+    """
+
+    step = int(values.get("GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS", "600"))
+    lifetime = int(values.get("GPU_FAULT_NODE_WORKFLOW_MAX_LIFETIME_SECONDS", "3600"))
+    ceiling = max(step, min(FABRIC_MANAGER_STEP_TIMEOUT_SECONDS, lifetime))
+    return {operation: ceiling for operation in FABRIC_MANAGER_START_OPERATIONS}
+
+
 DEFAULT_NODE_INSTALL_CONTAINMENT_SECONDS = 600
 
 
@@ -138,7 +175,11 @@ def node_install_containment_seconds(values: Mapping[str, str]) -> int:
 def _adapter_owned_step_overrides() -> dict[WorkflowOperation, int]:
     """The overrides a directly built config must not lose (see the field)."""
 
-    return {**managed_recovery_step_overrides({}), **node_install_step_overrides({})}
+    return {
+        **managed_recovery_step_overrides({}),
+        **node_install_step_overrides({}),
+        **fabric_manager_step_overrides({}),
+    }
 
 
 # Steps whose whole purpose is to wait for a human to act and confirm
@@ -193,6 +234,7 @@ def default_step_waiting_overrides(
     return {
         **managed_recovery_step_overrides(values),
         **node_install_step_overrides(values),
+        **fabric_manager_step_overrides(values),
         **{
             operation: acknowledgement
             for operation in OPERATOR_ACKNOWLEDGEMENT_OPERATIONS
