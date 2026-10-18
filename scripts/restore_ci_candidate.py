@@ -14,6 +14,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import quote
 
 if __package__:
+    from scripts.ci_coverage_config import SHARDS
     from scripts.ci_gate_artifacts import (
         GateArtifactError,
         api_json,
@@ -23,6 +24,7 @@ if __package__:
     )
     from scripts.resolve_ci_run import ResolveCiRunError, resolve_ci_run
 else:
+    from ci_coverage_config import SHARDS
     from ci_gate_artifacts import (
         GateArtifactError,
         api_json,
@@ -35,16 +37,10 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_NAME = "gpu-fault-ci-candidate"
-EXPECTED_SHARDS = frozenset(
-    {
-        "deployment",
-        "fault_runner",
-        "postgres",
-        "runtime_0",
-        "runtime_1",
-        "runtime_2",
-    }
-)
+# Every physical coverage shard the unit gate embeds; the list is owned by
+# scripts/ci_coverage_config.py so a matrix change cannot leave the deploy-host
+# verifier accepting a candidate with a missing shard.
+EXPECTED_SHARDS = frozenset(SHARDS)
 REPOSITORY_PATTERN = re.compile(
     r"(?:github\.com[:/])(?P<repository>[^/\s]+/[^/\s]+?)(?:\.git)?$"
 )

@@ -9,6 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from tests import conftest
 
@@ -254,6 +255,23 @@ def test_tests_do_not_need_new_architecture_size_exceptions() -> None:
     )
 
 
+class _FakeConfig:
+    """Records ``pytest_deselected`` calls the way ``config.hook`` would."""
+
+    def __init__(self) -> None:
+        self.deselected: list[object] = []
+        self.hook = SimpleNamespace(
+            pytest_deselected=lambda items: self.deselected.extend(items)
+        )
+
+
+def _shuffle_items(count: int) -> list[SimpleNamespace]:
+    return [
+        SimpleNamespace(nodeid=f"tests/test_module_{index}.py::test_case[{index}]")
+        for index in range(count)
+    ]
+
+
 def test_shuffled_order_is_seeded_and_reproducible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -268,19 +286,26 @@ def test_shuffled_order_is_seeded_and_reproducible(
         for index in range(64)
     ]
 
-    monkeypatch.delenv(conftest.SHUFFLE_SEED_VARIABLE, raising=False)
+    # The CI shuffle legs export the shard variables; a test about the seed
+    # alone must not inherit them from the job it happens to run in.
+    for name in (
+        conftest.SHUFFLE_SEED_VARIABLE,
+        conftest.SHUFFLE_SHARDS_VARIABLE,
+        conftest.SHUFFLE_SHARD_VARIABLE,
+    ):
+        monkeypatch.delenv(name, raising=False)
     untouched = list(original)
-    conftest.pytest_collection_modifyitems(untouched)
+    conftest.pytest_collection_modifyitems(_FakeConfig(), untouched)
 
     monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "11")
     seeded = list(original)
-    conftest.pytest_collection_modifyitems(seeded)
+    conftest.pytest_collection_modifyitems(_FakeConfig(), seeded)
     from_reversed_input = list(reversed(original))
-    conftest.pytest_collection_modifyitems(from_reversed_input)
+    conftest.pytest_collection_modifyitems(_FakeConfig(), from_reversed_input)
 
     monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "12")
     other_seed = list(original)
-    conftest.pytest_collection_modifyitems(other_seed)
+    conftest.pytest_collection_modifyitems(_FakeConfig(), other_seed)
 
     assert untouched == original, "没设种子时收集顺序必须原样保留"
     assert seeded != original, "设了种子却没有打乱"
@@ -291,11 +316,142 @@ def test_shuffled_order_is_seeded_and_reproducible(
     assert other_seed != seeded, "不同种子应当给出不同顺序"
 
 
-def test_shuffle_seed_rejects_a_non_integer(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "not-a-number")
+@pytest.mark.parametrize("count", [1, 2, 4, 7])
+def test_shuffle_shards_partition_the_seeded_order_exactly_once(
+    monkeypatch: pytest.MonkeyPatch, count: int
+) -> None:
+    """N 份互不相交、并集等于全部收集结果，而且每份都是完整打乱顺序的子序列。
+
+    CI 把打乱那一轮拆成 N 个 Runner 跑：这条用例就是"拆了以后一条用例都没丢、也没
+    跑两遍"的证明。顺序断言同样重要——每份保留整体顺序里自己那几个位置的相对次序，
+    所以同一种子不分片重放得到的仍是同一条顺序，红了可以按种子复现。
+    """
+    original = _shuffle_items(101)
+    monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "2026")
+    monkeypatch.delenv(conftest.SHUFFLE_SHARDS_VARIABLE, raising=False)
+    monkeypatch.delenv(conftest.SHUFFLE_SHARD_VARIABLE, raising=False)
+    whole = list(original)
+    conftest.pytest_collection_modifyitems(_FakeConfig(), whole)
+
+    shards: list[list[SimpleNamespace]] = []
+    deselected_counts: list[int] = []
+    monkeypatch.setenv(conftest.SHUFFLE_SHARDS_VARIABLE, str(count))
+    for index in range(count):
+        monkeypatch.setenv(conftest.SHUFFLE_SHARD_VARIABLE, str(index))
+        config = _FakeConfig()
+        items = list(reversed(original))
+        conftest.pytest_collection_modifyitems(config, items)
+        shards.append(items)
+        deselected_counts.append(len(config.deselected))
+
+    nodeids = [[item.nodeid for item in shard] for shard in shards]
+    union = [nodeid for shard in nodeids for nodeid in shard]
+    assert sorted(union) == sorted(item.nodeid for item in original), (
+        "the union of the shuffle shards must be the complete collection"
+    )
+    assert len(union) == len(set(union)), "shuffle shards must be pairwise disjoint"
+    assert max(map(len, nodeids)) - min(map(len, nodeids)) <= 1, (
+        "shuffle shards must stay balanced in size"
+    )
+    for index, shard in enumerate(nodeids):
+        assert shard == [item.nodeid for item in whole[index::count]], (
+            "each shard must be the seeded whole-suite order restricted to its slots"
+        )
+    assert deselected_counts == [len(original) - len(shard) for shard in nodeids], (
+        "every item outside the shard must be reported as deselected"
+    )
+    for index in range(count):
+        monkeypatch.setenv(conftest.SHUFFLE_SHARD_VARIABLE, str(index))
+        replay = list(original)
+        conftest.pytest_collection_modifyitems(_FakeConfig(), replay)
+        assert replay == shards[index], (
+            "the same seed, shard count and index must reproduce the same shard"
+        )
+
+
+@pytest.mark.parametrize(
+    ("shards", "shard"),
+    [("4", ""), ("", "1"), ("4", "4"), ("0", "0"), ("x", "1"), ("4", "-1")],
+)
+def test_shuffle_shard_variables_must_be_a_consistent_pair(
+    monkeypatch: pytest.MonkeyPatch, shards: str, shard: str
+) -> None:
+    monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "7")
+    monkeypatch.setenv(conftest.SHUFFLE_SHARDS_VARIABLE, shards)
+    monkeypatch.setenv(conftest.SHUFFLE_SHARD_VARIABLE, shard)
 
     with pytest.raises(pytest.UsageError):
-        conftest.pytest_collection_modifyitems([])
+        conftest.pytest_collection_modifyitems(_FakeConfig(), _shuffle_items(8))
+
+
+def test_shuffle_shard_is_taken_from_the_environment_once_and_not_inherited(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The controlling session keeps its slice in the stash and strips the
+    variables from the process environment, so a nested pytest a test spawns
+    runs whole; xdist workers receive the slice through ``workerinput``."""
+    monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "9")
+    monkeypatch.setenv(conftest.SHUFFLE_SHARDS_VARIABLE, "3")
+    monkeypatch.setenv(conftest.SHUFFLE_SHARD_VARIABLE, "2")
+    controller = SimpleNamespace(
+        addinivalue_line=lambda *_args: None,
+        stash=pytest.Stash(),
+        hook=SimpleNamespace(pytest_deselected=lambda items: None),
+    )
+
+    conftest.pytest_configure(controller)  # type: ignore[arg-type]
+
+    assert controller.stash[conftest.SHUFFLE_SHARD_KEY] == (3, 2)
+    assert conftest.SHUFFLE_SHARDS_VARIABLE not in os.environ, (
+        "children of the controller must not inherit the shard count"
+    )
+    assert conftest.SHUFFLE_SHARD_VARIABLE not in os.environ, (
+        "children of the controller must not inherit the shard index"
+    )
+    assert os.environ[conftest.SHUFFLE_SEED_VARIABLE] == "9", (
+        "the seed stays exported; a nested session only changes order"
+    )
+    items = _shuffle_items(30)
+    conftest.pytest_collection_modifyitems(controller, items)  # type: ignore[arg-type]
+    assert len(items) == 10, "the stashed slice still shards this session"
+
+    node = SimpleNamespace(config=controller, workerinput={})
+    conftest.pytest_configure_node(node)
+    assert node.workerinput[conftest.SHUFFLE_SHARD_WORKERINPUT] == (3, 2)
+    worker = SimpleNamespace(
+        workerinput=dict(node.workerinput),
+        hook=SimpleNamespace(pytest_deselected=lambda items: None),
+    )
+    worker_items = _shuffle_items(30)
+    conftest.pytest_collection_modifyitems(worker, worker_items)  # type: ignore[arg-type]
+    assert worker_items == items, (
+        "a worker must select the same slice as the controller without the variables"
+    )
+    assert conftest.pytest_report_header(worker) == [  # type: ignore[arg-type]
+        f"test order shuffled: {conftest.SHUFFLE_SEED_VARIABLE}=9",
+        f"shuffled shard 2 of 3: {conftest.SHUFFLE_SHARDS_VARIABLE}=3 "
+        f"{conftest.SHUFFLE_SHARD_VARIABLE}=2",
+    ]
+
+
+def test_shuffle_shards_require_a_seed(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A shard without a seed would silently run an unshuffled fraction of the
+    suite and let the gate go green on a quarter of its tests."""
+    monkeypatch.delenv(conftest.SHUFFLE_SEED_VARIABLE, raising=False)
+    monkeypatch.setenv(conftest.SHUFFLE_SHARDS_VARIABLE, "4")
+    monkeypatch.setenv(conftest.SHUFFLE_SHARD_VARIABLE, "0")
+
+    with pytest.raises(pytest.UsageError):
+        conftest.pytest_collection_modifyitems(_FakeConfig(), _shuffle_items(8))
+
+
+def test_shuffle_seed_rejects_a_non_integer(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv(conftest.SHUFFLE_SEED_VARIABLE, "not-a-number")
+    monkeypatch.delenv(conftest.SHUFFLE_SHARDS_VARIABLE, raising=False)
+    monkeypatch.delenv(conftest.SHUFFLE_SHARD_VARIABLE, raising=False)
+
+    with pytest.raises(pytest.UsageError):
+        conftest.pytest_collection_modifyitems(_FakeConfig(), [])
 
 
 def test_shuffled_order_is_a_required_ci_gate() -> None:
@@ -311,6 +467,31 @@ def test_shuffled_order_is_a_required_ci_gate() -> None:
     assert "make test-shuffled PYTHON=python" in workflow
     # 只有作为必需门禁才算数：不进 needs 就只是个装饰。
     assert 'needs.shuffle.result }}" = "success"' in required
+
+
+def test_shuffled_order_matrix_covers_every_shard_exactly_once() -> None:
+    """CI 把打乱那一轮拆成 N 个 Runner：矩阵里的 index 必须正好是 0..N-1，
+    N 又必须等于每个 job 导出的 shard 总数，否则就有用例没人跑或被跑两遍。"""
+    workflow = yaml.safe_load(
+        (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    )
+    job = workflow["jobs"]["shuffle"]
+    matrix = job["strategy"]["matrix"]["shard"]
+    count = job["env"][conftest.SHUFFLE_SHARDS_VARIABLE]
+
+    assert job["strategy"]["fail-fast"] is False, (
+        "one red shard must not cancel the others; every shard is evidence"
+    )
+    assert str(count).isdecimal() and int(count) == len(matrix) >= 2, (
+        "the exported shard count must equal the number of matrix legs"
+    )
+    assert sorted(int(index) for index in matrix) == list(range(len(matrix))), (
+        "matrix legs must be exactly the indices 0..N-1"
+    )
+    assert job["env"][conftest.SHUFFLE_SHARD_VARIABLE] == "${{ matrix.shard }}"
+    assert job["env"][conftest.SHUFFLE_SEED_VARIABLE] == "${{ github.run_id }}", (
+        "every shard must shuffle with the same per-run seed"
+    )
 
 
 def test_pydantic_mypy_plugin_checks_models(tmp_path: Path) -> None:

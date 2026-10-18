@@ -14,7 +14,7 @@ import ast
 import fnmatch
 import json
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping, NamedTuple
 
 if TYPE_CHECKING or __package__:
     from scripts.ci_coverage_floors import (
@@ -33,11 +33,33 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG_PATH = ROOT / "config/ci-unit-gate.json"
-CONFIG_SCHEMA_VERSION = 4
+CONFIG_SCHEMA_VERSION = 5
 POSTGRES_TEST_URL_ENV = "GPU_FAULT_TEST_POSTGRES_URL"
-RUNTIME_SHARDS = ("runtime_0", "runtime_1", "runtime_2")
-SHARDS = (*RUNTIME_SHARDS, "deployment", "fault_runner", "postgres")
 TEST_DOMAINS = ("runtime", "deployment", "fault_runner", "postgres")
+# Logical domains split into physical shards by ``partition_for_nodeid`` (a
+# SHA-256 of the stable pytest nodeid modulo the count): deterministic, disjoint
+# and complete, and every shard of a domain carries the same content identity
+# groups plus its own ``partition_count``/``partition_index``. The counts are
+# the CI matrix widths; ``config/ci-unit-gate.json`` must agree
+# (``protocol.partitions``) and ``.github/workflows/ci.yml`` is pinned to them
+# by tests/test_script_assets.py. Sized from the 2026-10-03 ubuntu-latest
+# measurements (4 workers): deployment 36 min as one shard, postgres 15 min
+# contract + 14 min stress serially, runtime 7-11 min per third.
+PARTITIONED_DOMAINS: dict[str, int] = {"runtime": 3, "deployment": 4, "postgres": 4}
+# A directory argument may stand in for its test files when at most this
+# fraction of the test files below it belong to other shards (they become
+# ``--ignore`` options); see ``shard_arguments``.
+DIRECTORY_ARGUMENT_MAX_IGNORED_FRACTION = 0.2
+
+
+def _partition_shards(domain: str) -> tuple[str, ...]:
+    return tuple(f"{domain}_{index}" for index in range(PARTITIONED_DOMAINS[domain]))
+
+
+RUNTIME_SHARDS = _partition_shards("runtime")
+DEPLOYMENT_SHARDS = _partition_shards("deployment")
+POSTGRES_SHARDS = _partition_shards("postgres")
+SHARDS = (*RUNTIME_SHARDS, *DEPLOYMENT_SHARDS, "fault_runner", *POSTGRES_SHARDS)
 IDENTITY_GROUPS = {
     "dependencies",
     "deployment_source",
@@ -82,7 +104,7 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
         or not isinstance(value.get("identity"), dict)
         or not isinstance(value.get("protocol"), dict)
         or set(value.get("shards", {})) != set(SHARDS)
-        or value["protocol"].get("runtime_partitions") != len(RUNTIME_SHARDS)
+        or value["protocol"].get("partitions") != PARTITIONED_DOMAINS
     ):
         raise CoverageGateError("coverage shard config is incomplete")
     identity = value["identity"]
@@ -121,15 +143,16 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
             raise CoverageGateError("PostgreSQL stress protocol is incomplete")
     for shard in SHARDS:
         raw = value["shards"][shard]
+        domain = logical_test_domain(shard)
         required_groups = {
             "dependencies",
             "protocol",
             "runtime_source",
             "fault_runner_source",
             "shared_tests",
-            f"{logical_test_domain(shard)}_tests",
+            f"{domain}_tests",
         }
-        if shard == "deployment":
+        if domain == "deployment":
             required_groups.add("deployment_source")
         if (
             not isinstance(raw, dict)
@@ -137,7 +160,7 @@ def load_config(root: Path = ROOT) -> dict[str, Any]:
             or not isinstance(raw.get("omit_deployment_source"), bool)
             or not set(raw["identity_groups"]) <= IDENTITY_GROUPS
             or not required_groups <= set(raw["identity_groups"])
-            or raw["omit_deployment_source"] != (shard != "deployment")
+            or raw["omit_deployment_source"] != (domain != "deployment")
         ):
             raise CoverageGateError(f"coverage shard config is invalid: {shard}")
     return value
@@ -350,11 +373,34 @@ def _test_owner(relative: str, config: Mapping[str, Any], *, root: Path) -> str 
 
 
 def logical_test_domain(shard: str) -> str:
-    return "runtime" if shard in RUNTIME_SHARDS else shard
+    """The test domain a shard (or a domain name itself) belongs to."""
+    if shard in TEST_DOMAINS:
+        return shard
+    domain, separator, index = shard.rpartition("_")
+    if separator and domain in PARTITIONED_DOMAINS and index.isdecimal():
+        return domain
+    return shard
+
+
+def shard_partition(shard: str) -> tuple[int, int] | None:
+    """``(count, index)`` for a physical shard of a partitioned domain, else
+    ``None`` for a domain that runs as a single shard."""
+    if shard not in SHARDS:
+        raise CoverageGateError(f"unknown coverage shard: {shard}")
+    domain = logical_test_domain(shard)
+    if domain == shard:
+        return None
+    return PARTITIONED_DOMAINS[domain], int(shard.rsplit("_", 1)[1])
+
+
+def is_postgres_shard(shard: str) -> bool:
+    return logical_test_domain(shard) == "postgres"
 
 
 def pytest_targets(root: Path, shard: str) -> tuple[str, ...]:
-    if shard not in SHARDS:
+    """Test files of ``shard``; a logical domain name selects the same files
+    as any of its physical shards (the nodeid partition happens at collection)."""
+    if shard not in SHARDS and shard not in TEST_DOMAINS:
         raise CoverageGateError(f"unknown coverage shard: {shard}")
     config = load_config(root)
     expected_group = f"{logical_test_domain(shard)}_tests"
@@ -371,6 +417,73 @@ def pytest_targets(root: Path, shard: str) -> tuple[str, ...]:
     if not targets:
         raise CoverageGateError(f"coverage shard has no pytest targets: {shard}")
     return tuple(sorted(targets))
+
+
+class ShardArguments(NamedTuple):
+    """The pytest command line that collects exactly ``pytest_targets``."""
+
+    paths: tuple[str, ...]
+    ignores: tuple[str, ...]
+
+    def options(self) -> tuple[str, ...]:
+        return (*self.paths, *(f"--ignore={path}" for path in self.ignores))
+
+
+def _is_test_file(relative: str, name: str) -> bool:
+    return (
+        relative.startswith("tests/")
+        and name.startswith("test_")
+        and name.endswith(".py")
+    )
+
+
+def shard_arguments(root: Path, shard: str) -> ShardArguments:
+    """Directory and file arguments whose collection is exactly ``pytest_targets``.
+
+    pytest re-collects a file argument's whole parent directory for every file
+    argument (``Session.collect`` skips its collection cache for bare file
+    paths), so a shard that names 843 files under ``tests/regional`` builds
+    about 800k Module nodes and spends minutes before the first test runs
+    (190 s against 63 s for this form, measured 2026-10-03 on the deployment
+    domain). A directory argument is collected once; the few test files below
+    it that belong to another shard are excluded with ``--ignore``. The result
+    is a pure function of the repository file list and the shard config, and
+    the receipt's ``collected_files`` must still equal ``pytest_targets``, so a
+    wrong argument set fails the shard gate instead of running the wrong tests.
+    """
+
+    targets = set(pytest_targets(root, shard))
+    test_files = sorted(
+        path.relative_to(root).as_posix()
+        for path in repository_files(root)
+        if _is_test_file(path.relative_to(root).as_posix(), path.name)
+    )
+    paths: list[str] = []
+    ignores: list[str] = []
+
+    def visit(directory: str) -> None:
+        prefix = directory + "/"
+        below = [relative for relative in test_files if relative.startswith(prefix)]
+        included = [relative for relative in below if relative in targets]
+        if not included:
+            return
+        excluded = [relative for relative in below if relative not in targets]
+        if len(excluded) <= DIRECTORY_ARGUMENT_MAX_IGNORED_FRACTION * len(included):
+            paths.append(directory)
+            ignores.extend(excluded)
+            return
+        subdirectories = set()
+        for relative in below:
+            remainder = relative[len(prefix) :]
+            if "/" in remainder:
+                subdirectories.add(remainder.split("/", 1)[0])
+            elif relative in targets:
+                paths.append(relative)
+        for name in sorted(subdirectories):
+            visit(f"{directory}/{name}")
+
+    visit("tests")
+    return ShardArguments(tuple(sorted(paths)), tuple(sorted(ignores)))
 
 
 def validate_test_partition(root: Path = ROOT) -> dict[str, int]:
