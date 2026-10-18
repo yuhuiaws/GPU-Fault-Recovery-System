@@ -125,7 +125,9 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   （`escalation_descends_from`，`/executors/incident-ownership?successor_workflow_id=` 的 `escalation_lineage`），
   不再只认一跳。
 - reset 忙碌且 `/proc` 无进程持有设备时，Agent 卸载空闲的 `nvidia_drm`/`nvidia_modeset` 后立刻重试并在 reset 后装回
-  （`released_kernel_modules`/`reloaded_kernel_modules`）；QUIESCE details 带 `stopped_services`/`inactive_services`/`protected_services`。
+  （`released_kernel_modules`/`reloaded_kernel_modules`）；窗口保留的 `nvidia-persistenced`（只持有其余 GPU）与窗口保留的
+  Fabric Manager（窗口的 `kept_services` 记着它，只持有 `/dev/nvidia-caps/*`/`/dev/nvidia-nvswitch*`/`/dev/nvidia-nvlink`）
+  不阻止卸载，记在 `display_release_bystanders`；QUIESCE details 带 `stopped_services`/`inactive_services`/`protected_services`。
 - 不容忍该污点的 DaemonSet Pod 在窗口内被驱逐、窗口后回来；带无 key 通配容忍（`operator: Exists`）的第三方 GPU 客户端会留在
   窗口里，reset 仍会 `In use by another client`——见 §3 第 6 条。
 

@@ -1531,7 +1531,10 @@ Semantics and boundaries of `eks-managed`:
   a **Kubernetes container** outside that list that still holds the target GPU (a customer `dcgm-exporter`, GPU feature
   discovery, any monitoring client) is TERM/KILLed as well, recorded as
   `swept_device_holders[].reason=kubernetes_container_on_quarantined_node` with its container id and Pod UID; on HyperPod
-  kubelet is already down so nothing restarts it, and `RESTORE_GPU_SERVICES` starting kubelet brings it back.
+  kubelet is already down so nothing restarts it, and `RESTORE_GPU_SERVICES` starting kubelet brings it back. Whatever
+  route matched it, the sweep never signals Fabric Manager (recognised by its process name `nv-fabricmanage` or its unit's
+  cgroup, recorded as `unswept_device_holders[].reason=fabric_manager_never_swept`), and a `GPU_FAULT_QUIESCE_PROCESSES`
+  naming it is refused when the Agent starts.
   **An `eks-managed` quiesce never stops `kubelet` or `containerd`** (2026-10-05, gpu-eks-cluster DESTR-001: stopping
   kubelet took the node NotReady, and a plain EKS node has no HyperPod health agent to carry it): the installer Job adds
   `--cluster-provider eks-managed` (Agent environment `GPU_FAULT_CLUSTER_PROVIDER=eks-managed`), the Agent skips the two
@@ -1605,8 +1608,11 @@ Semantics and boundaries of `eks-managed`:
   `nvidia_modeset` -- live the only holder was `nvidia_modeset refcount=1 used_by nvidia_drm`), retries at once and
   loads it back with `modprobe nvidia_drm` after the reset whatever its outcome (`released_kernel_modules`/
   `reloaded_kernel_modules`, or `kernel_module_reload_error`); with a process holding a device node no module is
-  touched -- except the `nvidia-persistenced` the window kept: holding only the other GPUs and `/dev/nvidiactl`, it does
-  not stop the unload and is recorded in `display_release_bystanders` (detailed design, quiesce). The Agent's own
+  touched -- except the `nvidia-persistenced` the window kept (holding only the other GPUs and `/dev/nvidiactl`) and the
+  Fabric Manager the window kept (`nv-fabricmanage` in `nvidia-fabricmanager.service`, holding only `/dev/nvidia-caps/*`,
+  `/dev/nvidia-nvswitch*` and `/dev/nvidia-nvlink`; judged by that window's own `kept_services`, so a window that meant to
+  stop it, one that does not manage it, or no window excuses nothing): they do not stop the unload and are both recorded
+  in `display_release_bystanders` (detailed design, quiesce). The Agent's own
   diagnostic commands (RUN_DCGM_DIAGNOSTIC, COLLECT_DIAGNOSTIC_BUNDLE, COLLECT_HUNG_TRIAGE, the field diagnostic,
   TRIGGER_HEALTH_SNAPSHOT) are refused while another incident's quiesce window is open (HTTP 409
   `GPU_MAINTENANCE_WINDOW_OPEN`, retryable: the step stays WAITING and is resubmitted after the window closed); one

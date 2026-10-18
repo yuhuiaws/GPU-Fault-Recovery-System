@@ -1329,6 +1329,24 @@ counts decide), so it does not stop the unload, and the receipt records it in `d
 holder -- another process, a target device node, `nvidia-uvm`, a deleted device node, a containerised process, or an
 unknown target set -- still keeps every module loaded. The daemon used to count as a holder, the display stack was never
 unloaded, and every single-GPU reset on a plain EKS p5en node failed busy three times and escalated to RESTART_NODE.
+The Fabric Manager the window kept is the second bystander (`holders.fabric_manager_bystander`, combined with the
+daemon's rule in `display_release_bystander`): with NVLink Inband it holds only the fabric's own nodes --
+`/dev/nvidia-caps/*` (the fabric-management capability), `/dev/nvidia-nvswitch*` and `/dev/nvidia-nvlink`, never a GPU
+or `/dev/nvidiactl` -- and is a client of neither the target GPU nor the display stack either. Only that one: the
+claimed window's own `kept_services` names it kept (`quiesce.window_kept_services`, read right after the reset claim
+and never raising; a stand-in manager or an unreadable window keeps nothing), its process is `nv-fabricmanage`, its
+cgroup is the `nvidia-fabricmanager.service` unit and no other unit or scope, it runs in no container, holds no deleted
+device node and nothing outside those three kinds; one holding `/dev/nvidiactl`, `nvidia-uvm` or any `/dev/nvidiaN`
+(target or not) is not -- that is a Fabric Manager operating the GPUs through the driver, a client like any other. A
+window that meant to stop it (the process outlived its unit's stop), a window that does not manage it, or no window at
+all excuses nothing. Once per-GPU reset windows kept Fabric Manager, it counted as a holder on
+`/dev/nvidia-caps/nvidia-cap0`, and every busy single-GPU reset on a plain EKS p5en node again failed busy three times
+and escalated to RESTART_NODE with no module unloaded. VERIFY_NO_GPU_CLIENTS and the final ownership recheck scan only
+the targets' `/dev/nvidiaN` and never saw it; one holding a target still fails them closed. The quiesce never signals
+Fabric Manager: the device sweep recognises it by process name or unit cgroup and skips it whichever route matched it --
+the process list, the workload cgroup or a Kubernetes container
+(`unswept_device_holders[].reason=fabric_manager_never_swept`) -- and a TERM list (`GPU_FAULT_QUIESCE_PROCESSES`)
+naming `nv-fabricmanage` is refused when the Agent starts.
 
 The quiesce window is exclusive against the Agent's own GPU work as well. `RUN_DCGM_DIAGNOSTIC`,
 `COLLECT_DIAGNOSTIC_BUNDLE`, `COLLECT_HUNG_TRIAGE`, `RUN_FIELD_DIAGNOSTIC`, `RUN_NVLINK74_WORKFLOW` and

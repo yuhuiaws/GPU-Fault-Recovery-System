@@ -9199,7 +9199,10 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   separately approved subsequent `DESTR-002`.
   The reset-chain gaps the third eks-managed XID 46 drill exposed are closed on the product side (administrator
   operations §5.0/§9.2): `RESET_GPU` unloads the idle `nvidia_drm`/`nvidia_modeset` when it stays busy with no process
-  holding a device node, retries and reloads them (`released_kernel_modules`); QUIESCE details carry
+  holding a device node, retries and reloads them (`released_kernel_modules`), with the
+  `nvidia-persistenced` and the Fabric Manager the window kept as bystanders (in a window that kept Fabric Manager
+  `display_release_bystanders` lists `nv-fabricmanage` beside `nvidia-persiste` and the QUIESCE's `kept_services` names
+  `nvidia-fabricmanager`); QUIESCE details carry
   `stopped_services`/`inactive_services`/`protected_services`; an in-place replacement of a queued successor no longer
   bumps the fencing token (it used to turn the RESTART_NODE and REPLACE_NODE rungs and the RESTORE_GPU_SERVICES
   compensation into `command fencing token does not match`); a step the executor refused does not escalate; the
@@ -9357,7 +9360,12 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
 - The product gaps plain EKS attempt 2 exposed are closed (detailed design, GPU service quiesce paragraph): (1) the
   `nvidia-persistenced` the quiesce keeps holds only the other GPUs and `/dev/nvidiactl` and no longer stops the reset's
   unload of the idle display stack when it is busy (read as a holder it made the reset fail busy three times and escalate
-  to RESTART_NODE); assert `released_kernel_modules` and `display_release_bystanders` after the busy refusal. (2) Another
+  to RESTART_NODE); assert `released_kernel_modules` and `display_release_bystanders` after the busy refusal; in
+  a window that kept Fabric Manager the QUIESCE's `kept_services` names `nvidia-fabricmanager` and
+  `display_release_bystanders` lists `nv-fabricmanage` beside `nvidia-persiste` (that kept Fabric Manager used to count as
+  a holder: no `rmmod` at all, three busy refusals, RESTART_NODE; now only the one the window's own `kept_services` names,
+  on the fabric's nodes alone, is a bystander, and the quiesce never signals Fabric Manager), the reset succeeds at
+  attempt 2 and Fabric Manager's MainPID is unchanged. (2) Another
   incident's Agent GPU work (RUN_DCGM_DIAGNOSTIC, the diagnostic bundle, the field diagnostic, TRIGGER_HEALTH_SNAPSHOT
   and the like) is refused at admission while the window is open (HTTP 409 `GPU_MAINTENANCE_WINDOW_OPEN`, resubmitted
   after the window closed); work already running holds VERIFY with `gpu_client_kind=agent` and its result is voided and
@@ -11240,7 +11248,10 @@ when `env | grep` finds nothing, that must not be judged FAIL outright.
   holds only the other GPUs and `/dev/nvidiactl` and no longer stops the reset's unload of the idle display stack when
   the reset is busy (`display_release_bystanders`, judged by
   `tests/node_agent/test_reset_releases_idle_display_modules.py`): read as a holder it made every single-GPU reset on an
-  `eks-managed` p5en node fail busy three times and escalate to RESTART_NODE (DESTR-001 attempt 2).
+  `eks-managed` p5en node fail busy three times and escalate to RESTART_NODE (DESTR-001 attempt 2). The Fabric Manager a
+  per-GPU reset window keeps is no holder either when the window's own `kept_services` names it and it holds only the
+  fabric's nodes (judged by `tests/node_agent/test_reset_kept_fabric_manager_bystander.py`); read as one on
+  `/dev/nvidia-caps/nvidia-cap0` it made DESTR-001 fail busy three times and escalate to RESTART_NODE again.
 - The physical overlap proof is limited by its clock calibration: on HyperPod attempt 3 the workflow completed and the two
   applied resets did overlap (raw overlap 0.41 s), yet the verdict FAILED on `physical_overlap_errors`. Each node had only the
   arm and collect clock exchanges, each a one-shot `kubectl exec` whose round trip (exec setup, interpreter start and the

@@ -164,7 +164,10 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   escalation lineage (`escalation_descends_from`; `escalation_lineage` of
   `/executors/incident-ownership?successor_workflow_id=`) instead of one hop.
 - A busy reset with no process holding a device node unloads the idle `nvidia_drm`/`nvidia_modeset`, retries at once
-  and reloads them after the reset (`released_kernel_modules`/`reloaded_kernel_modules`); QUIESCE details carry
+  and reloads them after the reset (`released_kernel_modules`/`reloaded_kernel_modules`); the `nvidia-persistenced` the
+  window kept (on the other GPUs only) and the Fabric Manager the window kept (named in its `kept_services`, on
+  `/dev/nvidia-caps/*`/`/dev/nvidia-nvswitch*`/`/dev/nvidia-nvlink` only) do not stop the unload and are recorded in
+  `display_release_bystanders`; QUIESCE details carry
   `stopped_services`/`inactive_services`/`protected_services`.
 - DaemonSet Pods that do not tolerate the taint are evicted for the window and return after it; third-party GPU
   clients with a key-less wildcard toleration (`operator: Exists`) stay inside the window and the reset still answers
