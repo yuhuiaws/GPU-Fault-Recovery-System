@@ -127,7 +127,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
 - reset 忙碌且 `/proc` 无进程持有设备时，Agent 卸载空闲的 `nvidia_drm`/`nvidia_modeset` 后立刻重试并在 reset 后装回
   （`released_kernel_modules`/`reloaded_kernel_modules`）；窗口保留的 `nvidia-persistenced`（只持有其余 GPU）与窗口保留的
   Fabric Manager（窗口的 `kept_services` 记着它，只持有 `/dev/nvidia-caps/*`/`/dev/nvidia-nvswitch*`/`/dev/nvidia-nvlink`）
-  不阻止卸载，记在 `display_release_bystanders`；QUIESCE details 带 `stopped_services`/`inactive_services`/`protected_services`。
+  不阻止卸载，记在 `display_release_bystanders`（只豁免 Fabric Manager 本身：NVL5 上同一单元里的 `nvlsm` 若持有 NVIDIA
+  设备节点仍算客户端，quiesce 也从不 signal 它）；QUIESCE details 带 `stopped_services`/`inactive_services`/`protected_services`。
 - 不容忍该污点的 DaemonSet Pod 在窗口内被驱逐、窗口后回来；带无 key 通配容忍（`operator: Exists`）的第三方 GPU 客户端会留在
   窗口里，reset 仍会 `In use by another client`——见 §3 第 6 条。
 
@@ -202,6 +203,8 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   remove-cluster/uninstall 对 eks-managed 的真机路径、Agent 升级/回滚、长期稳定性）；多于一个普通 EKS 集群（一批 join 多个
   普通 EKS 集群只有单元测试）；
   非 AL2023 AMI；`training` 以外的工作负载命名空间；非默认 NVIDIA runtime 的集群。
+- p6-b200/p6-b300（HGX B200/B300）按与 Hopper SXM 相同的规则分级（fabric 状态窗口、VALIDATE_GPU 的 fabric 与单元检查、
+  solo XID 45 默认只观测），但现网没有这类节点，未观察过。
 
 ## 6. 提交（基线 0d151512 → 3dedcd07，摘录）
 

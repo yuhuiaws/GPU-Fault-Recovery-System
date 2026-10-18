@@ -4491,7 +4491,7 @@ Every new GPU node ends up with the following host systemd services installed an
 |---|---|---|
 | `gpu-fault-kernel-collector` | Continuously reads `/dev/kmsg` and reports NVIDIA XIDs (`After=network-online.target nvidia-persistenced.service`: starts after the driver's persistence daemon so the start-up GPU product discovery can succeed) | Enabled |
 | `gpu-fault-fabric-manager-collector` | Reads the Fabric Manager journal/log and reports SXIDs | Enabled |
-| `gpu-fault-metrics-collector` | Scrapes the DCGM Exporter and performs node-side edge filtering (also `After=nvidia-persistenced.service`) | Enabled |
+| `gpu-fault-metrics-collector` | Scrapes the DCGM Exporter and performs node-side edge filtering (`After=network-online.target nvidia-persistenced.service nvidia-fabricmanager.service`: ordering only for Fabric Manager, no Requires/Wants -- a node without NVSwitches has no such unit, and a failed Fabric Manager must not keep the collector down; so at boot the 300 s window of `fabric_manager_status` starts once Fabric Manager's start job has finished, on NVL5 once NVLSM and Fabric Manager have both started. The unit ships in the node bundle, the installer installs it verbatim and runs `systemctl daemon-reload`, and the ordering takes effect at the node's next boot) | Enabled |
 | `gpu-fault-host-collector` | Collects CPU, memory, disk, network, RDMA/EFA, GPU/EFA inventory (also `After=nvidia-persistenced.service`) | Enabled |
 | `gpu-fault-node-agent` | Heartbeat, diagnostics and controlled node actions | Enabled |
 | `gpu-fault-gpu-persistence` | oneshot: `nvidia-smi -pm 1` turns on GPU persistence mode (`After=nvidia-persistenced.service`) | Enabled |
@@ -7184,7 +7184,7 @@ these parameters do not replace the managed release, node identity or maintenanc
 | `--allow-efa-driver-remediation` | No | true (the installer default is already on; the parameter is only an explicit confirmation) | Allows rebinding the EFA PCI driver after workloads stop; the actual action still requires the workload, Profile and signing gates |
 | `--disable-efa-driver-remediation` | No | false | Explicitly disables EFA PCI driver rebinding and removes `REMEDIATE_EFA_DRIVER` from the node allowlist |
 | `--allow-firmware-update` | No | false | Allows explicitly mapped SXID firmware updates; must be given together with `--firmware-update-command`/`-sha256`, `--target-firmware-version`, `--firmware-verify-command`/`-sha256` |
-| `--quiesce-services` | No | `nvidia-fabricmanager,nvidia-dcgm,nvidia-persistenced,gpu-fault-gpu-persistence,gpu-fault-metrics-collector,gpu-fault-host-collector,kubelet` (7 items) | Restored in this order, stopped in reverse; a per-GPU reset window keeps a running `nvidia-fabricmanager` (Phase C, item 10); the complete default is also in §7.5 |
+| `--quiesce-services` | No | `nvidia-fabricmanager,nvidia-dcgm,nvidia-persistenced,gpu-fault-gpu-persistence,gpu-fault-metrics-collector,gpu-fault-host-collector,kubelet` (7 items) | Restored in this order, stopped in reverse; a per-GPU reset window keeps a running `nvidia-fabricmanager` (Phase C, item 10; on NVL5 the unit also runs NVLSM, kept or stopped together, item 11); the complete default is also in §7.5 |
 | `--quiesce-processes` | No | NVIDIA/DCGM base processes | Sends TERM by exact process name |
 | `--quiesce-containers` | No | `aws-hyperpod/health-monitoring-agent,gpu-fault-system/exporter,kube-system/nvidia-device-plugin-ctr` | Kubernetes `namespace/container` selectors stopped during quiesce |
 | `--container-stop-timeout` | No | 30 seconds | Container graceful-stop timeout |
@@ -7406,9 +7406,42 @@ The companion window of XID 45 is fixed by the current NVIDIA Catalog's
 `companionWindowSeconds=30`. The first report returns `PENDING_CORRELATION`, with no
 incident/workflow at that point. You can query the window deadline, lease and final
 decision via `GET /v1/gpu-events/xid/<event-id>/correlation`. HA deployments must use PostgreSQL; SQLite is only for a single replica.
-A solo XID 45 finalizes as `RESTART_FM`: on a Hopper NVSwitch node whose latest DCGM samples are graded (field 170 on a
-Hopper SXM part) the plan is the full GPU + NVSwitch reset chain, because a Fabric Manager restart alone loses the fabric
-state; elsewhere it stays FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER (Phase C, item 10).
+A solo XID 45 finalizes as `RESTART_FM` (the catalog's Investigatory Action is "Solo: RESTART_FM / Not Solo: IGNORE
+(follow other Xid)"). On an NVSwitch node whose latest DCGM samples are graded (Hopper SXM, HGX B200/B300: field 170 on
+the part) it is **observe-only by default**: the decision is rewritten to `MONITOR_ONLY`/`NO_ACTION` (`official_action`
+still `RESTART_FM`), the incident is recorded `RECOVERED` with its evidence and the XID investigatory notification is
+sent, with no workflow, no node command and no cordon; the incident's reasons say why and how to opt in, and its
+`policy_reference` is the NVIDIA page below. Evidence: NVIDIA GPU Debug Guidelines, GPU Node Triage, "Understanding Xid
+Messages", XID table row "45 Robust Channel Preemptive Removal"
+(https://docs.nvidia.com/deploy/gpu-debug-guidelines/gpu-node-triage.html#understanding-xid-messages, docs version 615,
+page "Last updated on Oct 04, 2026"): "No action, informative only. Indicates channels affected by another failure. On
+A100, this error could be seen by itself due to unexpected Fabric Manager shutdown when FM is running in the same OS
+environment as the GPU. Otherwise, this error is safe to ignore as an informational message." The catalog data itself is
+unchanged; the default deviates from the catalog's investigatory action only on the nodes where NVIDIA's own debug
+guidance reads the solo event as informational, and A100 keeps RESTART_FM (NVIDIA's own solo case).
+
+The site switch `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM` (boolean, `1`/`on`/`true`/`yes` are true, unset meaning false)
+set to `true` restores the catalog behaviour: on those nodes the plan is the full GPU + NVSwitch reset chain, because a
+Fabric Manager restart alone loses the fabric state. The control plane reads it where workflows compile (the
+control-worker's XID correlation loop and fault processor finalize XIDs), so it belongs in the core configuration every
+control-plane role shares. Like the SXID remediation lists of Phase C.2, a regional site changes it only after review in
+the source Manifests (the env of `deploy/control-plane/base/control-plane-deployment.yaml` or the regional patch),
+renders it into `regional/generated/gpu-fault-*-config-core.yaml` through the renderer and releases it with the checked
+release (component cpu rolls); never `set env` on a live Deployment:
+
+```bash
+# After adding name: GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM, value: "true" to the source manifest env (back out: remove it):
+make PYTHON=.venv/bin/python deployment-contracts-update
+# Build, verify signatures and release per section 4; do not edit the generated ConfigMaps directly.
+gpu-fault-admin deploy --state-dir /secure/gpu-fault
+```
+
+To back out, remove the entry and release again. Acceptance cases `DESTR-010`/`DESTR-019` open it temporarily through
+`scripts/e2e/regional/control_plane_env_window.py` inside their own maintenance window to run the full chain (`true`
+only, restored exactly from the baseline at the end); that is no site configuration. Every other node -- A100,
+PCIe/NVL, GH200, GB200/GB300, unknown parts, a node whose exporter reports no field 170 -- keeps
+FREEZE_EVIDENCE → RESTART_FABRIC_MANAGER whatever the switch says (Phase C, item 10); a non-solo XID 45 follows its
+companion, and the 30 s `PENDING_CORRELATION` window is unchanged.
 
 <a id="82-adapter-与-owner"></a>
 ### 6.2 Adapters and Owners
@@ -7492,7 +7525,7 @@ Rule sources and default handling are as follows:
 |---|---|---|
 | PCIe replay rate `>8/min` | Warning, run GPU diagnostics | NVIDIA DCGM Health `DCGM_FR_PCI_REPLAY_RATE` |
 | NVLink error counter delta `>=1` | Critical, stop affected jobs, isolate and analyse the GPU | NVIDIA DCGM Health `DCGM_FR_NVLINK_ERROR_CRITICAL` |
-| Untrained NVLink fabric (`fabric_manager_status`): a Hopper SXM GPU's Fabric Manager state held NotStarted/InProgress/Failure for >=300 s | Critical, cordon, [stop jobs], reset every GPU and NVSwitch inside the quiesce window (the restore starts a Fabric Manager that is not running) and validate that every GPU's fabric state is Success; failure escalates to reboot, then warm-spare replacement | NVIDIA Fabric Manager User Guide (`NVIDIA_FABRIC_MANAGER_STATE`); the 300 s window is a site constant, not configurable |
+| Untrained NVLink fabric (`fabric_manager_status`): the Fabric Manager state of a GPU on a graded NVSwitch node (Hopper SXM, HGX B200/B300) held NotStarted/InProgress/Failure for >=300 s | Critical, cordon, [stop jobs], reset every GPU and NVSwitch inside the quiesce window (the restore starts a Fabric Manager that is not running) and validate that every GPU's fabric state is Success; failure escalates to reboot, then warm-spare replacement | NVIDIA Fabric Manager User Guide (`NVIDIA_FABRIC_MANAGER_STATE`); the 300 s window is a site constant, not configurable |
 | Volatile DBE non-zero or increased | Critical, stop affected jobs, isolate and analyse the GPU | NVIDIA DCGM Health `DCGM_FR_VOLATILE_DBE_DETECTED` |
 | Row-remap pending | Stop jobs, reset the GPU in a controlled window, then validate | NVIDIA GPU Memory Error Management |
 | Row-remap failure | Stop jobs and isolate; RMA can be judged only after running the NVIDIA Field Diagnostic | NVIDIA GPU Memory Error Management RMA Policy |
@@ -8115,7 +8148,7 @@ The installation script generates these variables; when deploying the Agent by h
 | `GPU_FAULT_FIRMWARE_VERIFY_COMMAND` | Empty | Absolute-path command whose stdout prints only the current exact version |
 | `GPU_FAULT_FIRMWARE_VERIFY_SHA256` | Empty | SHA-256 of the firmware verification executable |
 | `GPU_FAULT_QUIESCE_SERVICES` | Generated by the installation script, containing `nvidia-persistenced`, `gpu-fault-gpu-persistence`, DCGM/FM/collector/kubelet | Restore order; stop order is the reverse |
-| `GPU_FAULT_QUIESCE_PROCESSES` | The set of NVIDIA/DCGM processes | Process names for exact TERM |
+| `GPU_FAULT_QUIESCE_PROCESSES` | The set of NVIDIA/DCGM processes | Process names for exact TERM; never `nv-fabricmanage` or `nvlsm` (refused when the Agent starts, as in `GPU_FAULT_DEVICE_SWEEP_PROCESSES`: the quiesce never signals Fabric Manager or NVLSM) |
 | `GPU_FAULT_QUIESCE_FAILSAFE_SECONDS` | 420, 30-3600 | Delay of the first automatic recovery |
 | `GPU_FAULT_QUIESCE_RETRY_SECONDS` | 60, 10-600 | Automatic recovery retry period |
 | `GPU_FAULT_QUIESCE_SETTLE_SECONDS` | 2, 0-60 | Wait after stopping services |
@@ -9499,13 +9532,49 @@ Do not delete `${MIGRATION_STATE}` when the migration or verification fails; aft
 10. Fabric Manager in the window: on an NVSwitch node a per-GPU reset window keeps `nvidia-fabricmanager` running -- the
     QUIESCE step's details list it under `kept_services`, not `stopped_services`; `systemctl show -p
     MainPID,ExecMainStartTimestamp nvidia-fabricmanager` is unchanged across the window and the RESTORE does not start it.
-    A full-fabric window (`RESET_ALL_GPUS_NVSWITCHES`, also XID 45's `RESTART_FM` on a graded Hopper node) still stops it
-    before `nvidia-smi -r` and starts it after. After a per-GPU reset, an 8-GPU NCCL job with `NCCL_NVLS_ENABLE=1` must
+    A full-fabric window (`RESET_ALL_GPUS_NVSWITCHES`, also XID 45's `RESTART_FM` on a graded NVSwitch node once the site
+    turned on `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM` -- by default it is observe-only, §6.1) still stops it before
+    `nvidia-smi -r` and starts it after. The Agent waits up to 780 s for a start or restart of `nvidia-fabricmanager`
+    (NVIDIA's R580 unit allows `TimeoutStartSec=720`, plus a minute, which also covers a restart's stop; the restore loop
+    -- RESTORE, the fail-safe timer's restore and the boot reconcile --, the start after a full reset and the
+    RESTART_FABRIC_MANAGER restart all use it, every other unit still 120 s), so the control-plane waiting cap of
+    RESTORE_GPU_SERVICES and RESTART_FABRIC_MANAGER is 1200 s (780 + 420, never below the default 600 s and never above the
+    node lifetime) while QUIESCE, VERIFY, RESET_* and VALIDATE_* keep 600 s; a B200 Fabric Manager start near NVIDIA's full
+    720 s brings the whole chain close to the 1800 s workflow execution budget (`GPU_FAULT_WORKFLOW_EXECUTION_TIMEOUT_SECONDS`,
+    unchanged). After a per-GPU reset, an 8-GPU NCCL job with `NCCL_NVLS_ENABLE=1` must
     initialise NVLS, and the node's Fabric Manager log must carry no `multicast team setup request` or `All GPUs in the
     partition need to be reset to recover` line. To recover a node whose fabric state was lost (VALIDATE_GPU
     `nvlink_fabric_state_lost`, administrator operations §7) by hand: on the drained node stop the CUDA applications and
     the GPU services including Fabric Manager, run `nvidia-smi -r`, start Fabric Manager and the services -- or reboot;
     never restart Fabric Manager alone.
+11. NVL5 (HGX B200/B300) nodes: the one `nvidia-fabricmanager.service` starts the NVLink Subnet Manager (NVLSM) and then
+    Fabric Manager. NVIDIA Fabric Manager user guide, "The Fabric Manager Service"
+    (https://docs.nvidia.com/datacenter/tesla/fabric-manager-user-guide/index.html): "The FM service unit file is also
+    updated to start the NVLSM process if applicable. In this case, the FM systemd service status indicates the process
+    status for FM and NVLSM, and operations such as systemd start, stop, and so on will operate on both processes." So a
+    quiesce window that keeps or stops the unit keeps or stops both; NVIDIA ships no separate nvlsm unit (the `nvlsm`
+    package has none) and the product adds none. The R580 unit (package `nvidia-fabricmanager` 580.178.04): `Type=forking`,
+    `TimeoutStartSec=720` (the R535 unit had 240), `PIDFile=/var/run/nvidia-fabricmanager/nv-fabricmanager.pid` (Fabric
+    Manager's PID only; NVLSM's is in `/var/run/nvidia-fabricmanager/nvlsm.pid`), and
+    `ExecStartPre`/`ExecStart`/`ExecStop` are `/usr/bin/nvidia-fabricmanager-start.sh --mode precheck|start|stop`. Node
+    prerequisites (checked by the start script): the kernel module `ib_umad` loaded, the `nvlsm` package installed
+    (`/opt/nvidia/nvlsm/sbin/nvlsm`, config `/usr/share/nvidia/nvlsm/nvlsm.conf`, log `/var/log/nvlsm.log`), and `ibstat`
+    from infiniband-diags. `journalctl -u nvidia-fabricmanager` should show `Detected NVL5+ system`, then
+    `Started "Nvidia NVLink Subnet Manager"` and `Started "Nvidia Fabric Manager"` (Hopper prints
+    `Detected Pre-NVL5 system`), and `Using device <ib device>, port <guid>`; with a Mellanox device with `SW_MNG` present
+    the precheck polls up to 60 s (`Polling for at least one Infiniband device before starting Fabric Manager...`, timing
+    out with `No devices found in /sys/class/infiniband within 60 seconds.`); a missing prerequisite prints
+    `Kernel module "ib_umad" has not been loaded, fabric manager cannot be started` and
+    `Please run "modprobe ib_umad" before starting fabric manager`, or `"ibstat" command not found! Please install "ibstat".`.
+    Fabric Manager's own log stays `/var/log/fabricmanager.log` (`LOG_USE_SYSLOG=0`), with NVL5-only lines such as
+    `received GPU reset event for GPU (GUID...)`, `Pkey table not updated. GPU reset required. Failing the probe request.`
+    and `Lost connection with Subnet Manager`. Blind spot: systemd tracks Fabric Manager's PID only, so an NVLSM that died
+    beside a running Fabric Manager does not show in the unit's state and VALIDATE_GPU's unit check cannot see it (DCGM
+    field 170 or the Fabric Manager log may). The quiesce device sweep never signals a process named `nvlsm`, nor any
+    process in the Fabric Manager unit's cgroup; a `GPU_FAULT_QUIESCE_PROCESSES` or `GPU_FAULT_DEVICE_SWEEP_PROCESSES`
+    naming `nv-fabricmanage` or `nvlsm` is refused when the Agent starts. The same guide states "NVSwitch SXID errors are no
+    longer applicable to DGX B200/B300 and NVIDIA HGX B200/B300 systems.", so the SXID path of Phase C.1 does not apply on
+    these nodes. HGX B200/B300 are graded by the same rules as Hopper SXM but have not been observed live.
 
 Upgrade note (Fabric Manager in the quiesce window): the release is `DATA_PLANE_COMPATIBLE` -- the control-plane, executor and
 node_runtime wheels change (the control-plane roles roll; executor, completion-watcher and kubernetes-node-resource-collector on
@@ -9516,6 +9585,20 @@ fabric is consistent again); a new Agent with an old executor gets no parameter 
 first sent by an older executor and re-sent by a newer one after a retryable Agent failure has another body and is answered
 409 `COMMAND_ID_REUSED` (manual confirmation; a narrow window, so let open quiesce windows finish before the executor roll
 where practical); an XID 45 workflow compiled before the control-plane roll keeps its two steps.
+
+Upgrade note (the observe-only solo XID 45 default, NVL5 timing and the HGX B200/B300 grading): the release rolls the
+control plane (cpu: api-ha, control-worker, spool-worker), the GPU-cluster executor and the node runtime (Node Agent waves
+on every GPU node; the metrics collector's systemd unit is a node template input) -- `src/gpu_fault/gpu_fabric_manager.py`
+and `src/gpu_fault/execution/config.py` sit in all three closures, and `env-inventory.json` changes too; there is no schema
+change, and the Agent config digest (the timeouts are not digest inputs) and the fleet pins are unchanged. While
+control-plane replicas of the two releases coexist, an old replica still plans the full GPU + NVSwitch reset chain for a
+solo XID 45 on a graded node and a new one is observe-only; the XID 45 decision is finalized on the control-worker only,
+so once the control-worker has rolled the new default holds. An old Agent keeps its old Fabric Manager bounds (120 s for
+the restore loop and the restart, 180 s for the start after a full reset), which a new control plane's 1200 s step cap
+does not hurt; a new Agent under an old control plane can wait up to 780 s inside an old 600 s step cap -- so finish the
+Node Agent waves after the control plane. The collector's `After=nvidia-fabricmanager.service` takes effect at each
+node's next boot. Visible on the live H200 sites: the observe-only XID 45 default, the collector ordering (from the next
+boot), the 780 s Fabric Manager start/restart bound and the 1200 s step cap; the B200/B300 grading is dormant there.
 
 #### Phase C.0: XID 74 NVLink Workflow
 
