@@ -7646,8 +7646,9 @@ the table above). Both are exported, never required: `DCGM_EXPORTER_FIELD_GROUPS
 no sample until registration completes), and an `existing`-mode customer exporter without them simply has no such detection. Both
 fields exist since DCGM 4.0.0 and the pinned dcgm-exporter `4.6.1-4.8.4` (go-dcgm `v1.4611.2`) knows both names (171's name is a
 deprecated alias it keeps; DCGM 4.6 calls the field `DCGM_FI_DEV_FABRIC_MANAGER_ERROR`); every engine the solution runs is 4.0 or
-later (the exporter's embedded 4.6.1, the AMI's 4.6.0 on HyperPod p5en, 4.6.1 in plain EKS host mode as pinned from the exporter,
-4.7.0 on a node group prepared earlier until it is prepared again), so they cannot break a working exporter. When editing the CSV:
+later (the exporter's embedded 4.6.1; on HyperPod p5en the AMI's own engine, whose version the AMI decides, 4.7.0 as the live
+Agent heartbeats report; 4.6.1 in plain EKS host mode as pinned from the exporter, 4.7.0 on a node group prepared earlier until it
+is prepared again), so they cannot break a working exporter. When editing the CSV:
 that exporter parses it at start-up with Go's `encoding/csv` (`#` starts a comment) and exits on every GPU node at a record that is
 not exactly three fields (no comma in a help text), an unknown field name (go-dcgm's `GetFieldID` reads the current field map, then
 the legacy one), a type other than counter/gauge/untyped/label, or one of the retired PCIe throughput fields 200/201, which it now
@@ -7663,7 +7664,8 @@ description: "Thermal margin temperature (distance to nearest slowdown threshold
 renamed it `DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS`; the pinned exporter's go-dcgm (`v1.4611.2`) resolves the 4.1 name to 153
 as a deprecated alias and renders the field under the CSV's name, which is the name the collector maps, so the CSV keeps the
 4.1 name; never write the new one. Likewise exported, never required: an exporter without it puts the GPU core back on the
-grading of its absolute reading. In host mode the host engine must be DCGM 4.1.0 or later (live: 4.6.0 and 4.7.0).
+grading of its absolute reading. In host mode the host engine must be DCGM 4.1.0 or later (live: 4.7.0 for the HyperPod
+AMI's engine and the plain EKS node group's, as the Agent heartbeats report; 4.6.1 once the node group is prepared again).
 
 The exporter reads the CSV only at process start and the DaemonSet mounts the ConfigMap with subPath, which a running Pod never sees
 refreshed, so a counters-only release used to update the ConfigMap and restart no Pod. The pod template of
@@ -7705,11 +7707,11 @@ below and in [NVIDIA Official Policy Implementation Audit](components/nvidia-pol
 `4.6.1-4.8.4-distroless`, `4.8.4` and `latest` are one manifest list; the image config carries `com.nvidia.dcgm.version=4.6.1` and
 `org.opencontainers.image.version=4.8.4`, base `nvcr.io/nvidia/distroless/cc:v4.1.4`, and the layers ship `libdcgm.so.4.6.1` and
 `/etc/ld.so.cache`. It is the newest exporter release: DCGM 4.7.0 packages are published, but no exporter paired with DCGM 4.7.x
-exists on the registry or on GitHub. `4.6.0-4.8.3-distroless`, the release paired with the HyperPod AMI's DCGM 4.6.0, ships no
+exists on the registry or on GitHub. `4.6.0-4.8.3-distroless`, the release paired with DCGM 4.6.0, ships no
 `/etc/ld.so.cache` and exits at start-up with "exit status 1" unless the container runtime's NVIDIA hook writes one
 (github.com/NVIDIA/dcgm-exporter issue #612, fixed by PR #724 in 4.8.4), so it is no option. Since 4.8.2 NVIDIA publishes the
-distroless variant only. The 4.4.1 client of the previous pin `4.4.1-4.5.2-ubuntu22.04` was older than both host engines (HyperPod
-4.6.0, plain EKS 4.7.0).
+distroless variant only. The 4.4.1 client of the previous pin `4.4.1-4.5.2-ubuntu22.04` was older than both host engines (the
+HyperPod AMI's own engine, plain EKS's pinned 4.7.0).
 
 **The pairing per cluster** (the client is the exporter's DCGM 4.6.1):
 
@@ -7717,14 +7719,17 @@ distroless variant only. The 4.4.1 client of the previous pin `4.4.1-4.5.2-ubunt
 |---|---|---|
 | Plain EKS host mode | 4.6.1 after `prepare-eks-nodegroup --dcgm-hostengine host --dcgm-version 4.6.1-1` and its MINIMAL roll | `paired`, the pair NVIDIA supports. Until then nodes installed with 4.7.0-x run 4.7.0, newer than the client (`host-newer`, the connection requirement broken), and get the advisories below; still better than before: the previous 4.4.1 client was older than both host engines |
 | Plain EKS embedded mode | no host engine: the exporter runs its own embedded 4.6.1 | nothing to compare |
-| HyperPod | the AMI-managed DCGM 4.6.0 | `client-newer`: 4.6.1 ≥ 4.6.0 meets the connection requirement but is no supported pair ("Meeting this connection requirement does not make a mismatched release pair supported."); `status --full` lists such nodes under `unpaired_nodes` only, with no header line |
+| HyperPod | the AMI's own engine, whose version the AMI decides (4.7.0 as the live Agent heartbeats report) | `host-newer`: 4.7.0 is newer than the 4.6.1 client, the connection requirement broken ("For a separate DCGM host engine, the exporter’s DCGM client library version must also be greater than or equal to the DCGM host engine version."). The engine belongs to the AMI, so the product has no remedy and only advises: the `status --full` header line and the `WARN` line of the deploy/join node preflight (the AMI remedy part) name these nodes (below). No exporter release built on DCGM 4.7.0 or later exists yet; once NVIDIA publishes one, moving the pin to it meets the connection requirement (a pair when its DCGM is the engine's version) |
 
-A paired exporter image per cluster (or per provider) is **not implemented**, and not worth it now: the only release paired with
-4.6.0 (`4.6.0-4.8.3`) is the one with the start-up defect (#612); a per-cluster image needs the image lock (exactly one
-`dcgm_exporter` entry today), the release manifest's delivery images, `site.yaml` `images.dcgmExporter`, the plan payload and the
-rollback identity to carry an image per cluster (or per provider), and it doubles the vetted exporter set. Revisit when the HyperPod
-AMI and the newest exporter release diverge by more than a patch, or when a usable release paired with the AMI's DCGM exists: then add
-a provider-keyed exporter image (e.g. `dcgm_exporter_hyperpod`) to the lock and render per target.
+An exporter image per cluster (or per provider) is **not implemented**, and it would not help now: the HyperPod AMI's engine
+(4.7.0 live) is newer than the DCGM of every published exporter release (the newest, `4.6.1-4.8.4`, is on 4.6.1), so no release
+meets the connection requirement on HyperPod; a per-cluster image also needs the image lock (exactly one `dcgm_exporter` entry
+today), the release manifest's delivery images, `site.yaml` `images.dcgmExporter`, the plan payload and the rollback identity to
+carry an image per cluster (or per provider), and it doubles the vetted exporter set. When NVIDIA publishes an exporter release on
+DCGM 4.7.x, move the one pin to it (the upgrade steps below; the plain EKS host package is derived to the same version): as long as
+the AMI's engine is no newer than it, HyperPod meets the connection requirement. Revisit when a usable release paired with the AMI's DCGM
+exists that is not the pinned one: then add a provider-keyed exporter image (e.g. `dcgm_exporter_hyperpod`) to the lock and render
+per target.
 
 **Version reporting and advisories (advisory only, never a refusal).** `gpu_fault/dcgm_versions.py` names the host engine's
 version against the exporter's client: `paired` (the same DCGM version), `client-newer` (the connection requirement holds, no pair),
@@ -7756,10 +7761,10 @@ readings:
    is not the exporter's DCGM, a finding that names the pairing `--dcgm-version` (administrator operations §5.0.1a).
 
 All of it is advisory: no check verdict, `healthy` or exit code changes, no node and no release is refused, existing sites stay
-deployable. Why: metrics flow with mismatched versions (NVIDIA: "might function"; the previous 4.4.1 client ran live against 4.6.0
-and 4.7.0 engines); the HyperPod engine belongs to the AMI, not the release; a refusal would also refuse the very release that brings
-a newer exporter and block deploys of existing sites; a broken exporter is still caught by the DCGM collection checks (missing fields,
-failed scrapes).
+deployable. Why: metrics flow with mismatched versions (NVIDIA: "might function"; the previous 4.4.1 client ran live against newer
+engines, and so does the 4.6.1 client against the live 4.7.0 engines); the HyperPod engine belongs to the AMI, not the release; a
+refusal would also refuse the very release that brings a newer exporter and block deploys of existing sites; a broken exporter is
+still caught by the DCGM collection checks (missing fields, failed scrapes).
 
 **Breaking-change review, exporter 4.5.2 → 4.8.4** (nothing the solution uses is affected):
 
@@ -7806,7 +7811,8 @@ failed scrapes).
 **When an AMI ships a newer DCGM.** HyperPod: once a node runs the new AMI, the header line above appears within one heartbeat
 refresh window (about 15 minutes; the next deploy/join's node preflight prints the `WARN` too); deploy an exporter release whose
 DCGM is at least the engine's (the steps above); while NVIDIA has published none, the combination "might function": watch the DCGM
-collection health and do not downgrade the AMI's DCGM by hand. Plain EKS: the AL2023 NVIDIA AMI ships no DCGM and the solution's
+collection health and do not downgrade the AMI's DCGM by hand. This is HyperPod's live state: the AMI's engine is 4.7.0 and NVIDIA
+has published no exporter release on DCGM 4.7.x. Plain EKS: the AL2023 NVIDIA AMI ships no DCGM and the solution's
 user data pins it -- keep it at the exporter's version (a version-only pin such as `4.6.1` accepts any build of 4.6.1, never a newer
 minor).
 
@@ -7815,7 +7821,9 @@ node_runtime wheels all move (`collector_requirements.py` and the new `dcgm_vers
 node_runtime: the three control-plane roles roll, and executor, completion-watcher and kubernetes-node-resource-collector on every GPU
 cluster); the node preflight script is a node template input, so Node Agent waves run on every GPU node; the dcgm component (the
 DaemonSet's image) changes, so every GPU cluster rolls gpu-fault-dcgm-exporter; the image lock changes the release identity. Then
-run step 5 above for the host-mode plain EKS node groups; until then their 4.7.0 engines appear in the advisories.
+run step 5 above for the host-mode plain EKS node groups; until then their 4.7.0 engines appear in the advisories. The HyperPod
+nodes' AMI engines (4.7.0 live) stay in them until NVIDIA publishes an exporter on DCGM 4.7.0 or later and the pin moves to it (the
+pairing table above).
 
 When the thermal composite is first Warning, GPU validation puts the temperature, thermal violation,
 thermal throttle and `THERMAL_STRESS` together into the

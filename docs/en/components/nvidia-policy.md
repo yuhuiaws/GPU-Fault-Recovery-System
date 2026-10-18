@@ -80,13 +80,14 @@ NVIDIA's rules, verbatim:
 
 Why this release: it is the newest exporter release; DCGM 4.7.0 packages are published, but no exporter paired with DCGM
 4.7.x exists on the registry or on GitHub (go-dcgm's `v1.4701.*` bindings exist, no exporter release uses them).
-`4.6.0-4.8.3-distroless`, the release paired with the HyperPod AMI's DCGM 4.6.0, ships no `/etc/ld.so.cache`, and its
+`4.6.0-4.8.3-distroless`, the release paired with DCGM 4.6.0, ships no `/etc/ld.so.cache`, and its
 start-up check for `libdcgm.so.4` then exits with "exit status 1" unless the container runtime's NVIDIA hook writes one
 (github.com/NVIDIA/dcgm-exporter issue #612, fixed by PR #724 in 4.8.4). Since 4.8.2 NVIDIA publishes the distroless variant
-only. The pairing per cluster (plain EKS host mode is a supported pair, HyperPod's 4.6.0 only meets the connection
-requirement), why the product advises rather than refuses, and the upgrade steps are in the
-[Deployment and Operations Manual](../deployment-and-operations-manual.md) §6.5, "DCGM exporter version and the host
-hostengine pairing".
+only. The pairing per cluster (plain EKS host mode is a supported pair; the HyperPod engine is the AMI's, whose version the AMI
+decides, 4.7.0 as the live Agent heartbeats report, newer than the 4.6.1 client, the connection requirement broken with no product
+remedy, advised about until NVIDIA publishes an exporter on DCGM 4.7.0 or later), why the product advises rather than refuses,
+and the upgrade steps are in the [Deployment and Operations Manual](../deployment-and-operations-manual.md) §6.5, "DCGM
+exporter version and the host hostengine pairing".
 
 Re-verify (NGC registry v2 API, anonymous pull token):
 

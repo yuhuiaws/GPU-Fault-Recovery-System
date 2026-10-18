@@ -2346,9 +2346,11 @@ exporter release is paired with ("Install DCGM Exporter", "Requirements and Vers
 <https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html#requirements-and-version-compatibility>):
 "For a separate DCGM host engine, the exporter’s DCGM client library version must also be greater than or equal to the DCGM host engine version. Meeting this connection requirement does not make a mismatched release pair supported."
 The client of the product's exporter `nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless` is DCGM 4.6.1: host-mode plain
-EKS node groups install the paired `4.6.1-1` by step 1 above (or the §5.0.1a default); the HyperPod AMI's engine 4.6.0 meets
-the connection requirement but is no pair (deployment and operations manual §6.5, "DCGM exporter version and the host
-hostengine pairing", says why the exporter is not switched per cluster). The product compares the two in three places
+EKS node groups install the paired `4.6.1-1` by step 1 above (or the §5.0.1a default); the HyperPod engine is the AMI's, whose
+version the AMI decides: the live Agent heartbeats report 4.7.0, newer than the client (`host-newer`, the connection requirement
+broken), which the product has no remedy for, so the HyperPod nodes stay in the advisories below until NVIDIA publishes an
+exporter on DCGM 4.7.0 or later (deployment and operations manual §6.5, "DCGM exporter version and the host hostengine
+pairing", says why an exporter per cluster would not help). The product compares the two in three places
 (`gpu_fault/dcgm_versions.py`: `paired`, `client-newer`, `host-newer`, `unknown`; only `major.minor.patch` counts):
 
 - deploy/join record the node preflight's `dcgm.version` in the release state (`node_scope.dcgm_hostengine_versions`,
@@ -2374,7 +2376,7 @@ again with `prepare-eks-nodegroup --dcgm-hostengine host --dcgm-version 4.6.1-1`
 hand-written launch template set `DCGM_VERSION` to `4.6.1-1` and change versions and roll as above); for a HyperPod header line
 (an AMI that brings a newer DCGM) deploy an exporter release whose DCGM is at least the engine's, and while NVIDIA has
 published none, watch the DCGM collection health and do not downgrade the AMI's DCGM by hand (deployment and operations
-manual §6.5).
+manual §6.5); the live HyperPod 4.7.0 engines are this case: no exporter release on DCGM 4.7.x exists yet.
 
 A host-mode refusal lists every item of every node in one `ERROR: host prerequisites unavailable: ...` pointing back here.
 In embedded mode (no label) a host engine next to the exporter's embedded one -- running, active/activating or enabled

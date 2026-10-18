@@ -77,10 +77,11 @@ NVIDIA 的规则（原文）：
   Bug Fixes、Core："Add safeguards against potential memory errors when using mismatched clients and hostengines."
 
 为什么是这个 release：它是最新的 exporter release；DCGM 4.7.0 的软件包已经发布，但 registry 与 GitHub 上都没有与 DCGM 4.7.x
-配对的 exporter（go-dcgm 的 `v1.4701.*` 绑定存在，没有 exporter release 使用它）。与 HyperPod AMI 的 DCGM 4.6.0 配对的
+配对的 exporter（go-dcgm 的 `v1.4701.*` 绑定存在，没有 exporter release 使用它）。与 DCGM 4.6.0 配对的
 `4.6.0-4.8.3-distroless` 不带 `/etc/ld.so.cache`，启动时对 `libdcgm.so.4` 的检查随即以 "exit status 1" 退出，除非容器运行时的
 NVIDIA hook 写入一个（github.com/NVIDIA/dcgm-exporter issue #612，由 4.8.4 的 PR #724 修复）。自 4.8.2 起 NVIDIA 只发布
-distroless 变体。各集群的配对（普通 EKS host 模式为受支持的配对，HyperPod 的 4.6.0 只满足连接要求）、只提示不拒绝的理由与升级
+distroless 变体。各集群的配对（普通 EKS host 模式为受支持的配对；HyperPod 的引擎由 AMI 决定，现网 Agent 心跳报告 4.7.0，比 4.6.1
+客户端新，违反连接要求，产品没有补救手段，在 NVIDIA 发布基于 DCGM 4.7.0 或更新版本的 exporter 之前只提示）、只提示不拒绝的理由与升级
 步骤见[部署和运维手册](../部署和运维手册.md) §6.5「DCGM exporter 版本与主机 hostengine 配对」。
 
 重新核对（NGC registry v2 API，匿名 pull token）：
