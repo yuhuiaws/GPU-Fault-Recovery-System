@@ -46,6 +46,7 @@ rules:
       - src/gpu_fault/admin/automatic_node_updates.py
       - src/gpu_fault/admin/hyperpod_scheduled_update.py
       - src/gpu_fault/admin/eks_nodegroup_*.py
+      - src/gpu_fault/admin/dcgm_exporter_release.py
       - src/gpu_fault/admin/bootstrap_iam_policies.py
       - src/gpu_fault/admin/cli_join.py
       - src/gpu_fault/admin/cluster_removal_preserved.py
@@ -68,6 +69,7 @@ rules:
       - tests/deploy/test_node_preflight_report.py
       - tests/regional/test_regional_admin_checks_node_scope.py
       - tests/regional/test_regional_admin_checks_dcgm_live.py
+      - tests/regional/test_release_dcgm_hostengine_version.py
       - tests/admin/test_admin_site_eks_managed.py
       - tests/admin/test_admin_eks_managed_join.py
       - tests/admin/test_admin_eks_managed_lifecycle.py
@@ -88,6 +90,9 @@ rules:
       - tests/admin/test_admin_eks_nodegroup_nodes.py
       - tests/admin/test_admin_eks_nodegroup_checks.py
       - tests/admin/test_admin_eks_nodegroup_update_strategy.py
+      - tests/admin/test_admin_eks_nodegroup_dcgm_pairing.py
+      - tests/regional/test_release_dcgm_hostengine_version.py
+      - tests/regional/test_dcgm_exporter_release_pins.py
       - tests/regional/test_regional_admin_checks_node_scope.py
       - tests/regional/test_regional_admin_checks_dcgm_live.py
       - tests/admin/test_admin_dcgm_declaration.py
@@ -246,6 +251,7 @@ rules:
       - src/gpu_fault/admin/release_artifacts.py
       - src/gpu_fault/admin/source_deploy.py
       - src/gpu_fault/admin/site.py
+      - src/gpu_fault/admin/dcgm_exporter_release.py
       - src/gpu_fault/fleet_deployment.py
       - scripts/capture_release_evidence.py
       - scripts/release_deploy.py
@@ -305,6 +311,7 @@ rules:
       - tests/regional/test_release_aurora_refresh_preflight.py
       - tests/test_artifact_consistency.py
       - tests/regional/test_dataplane_dcgm_counters.py
+      - tests/regional/test_dcgm_exporter_release_pins.py
     regional_cases:
       - GF-REGIONAL-BOOT-018..023
       - GF-REGIONAL-HA-007..010
@@ -608,6 +615,10 @@ rules:
       - tests/fleet/test_dcgm_hostengine_heartbeat.py
       - tests/metrics/test_fabric_manager_state.py
       - tests/regional/test_dataplane_dcgm_counters.py
+      - src/gpu_fault/admin/dcgm_exporter_release.py
+      - tests/test_dcgm_versions.py
+      - tests/fleet/test_dcgm_hostengine_version_heartbeat.py
+      - tests/regional/test_dcgm_exporter_release_pins.py
     pytest:
       - tests/collectors
       - tests/policy
@@ -618,6 +629,11 @@ rules:
       - tests/orchestration/test_fabric_manager_plan.py
       - tests/node_agent/test_dcgm_fabric_manager_diagnostic.py
       - tests/regional/test_dataplane_dcgm_counters.py
+      - tests/test_dcgm_versions.py
+      - tests/fleet/test_dcgm_hostengine_version_heartbeat.py
+      - tests/regional/test_dcgm_exporter_release_pins.py
+      - tests/regional/test_release_dcgm_hostengine_version.py
+      - tests/regional/test_regional_admin_checks_dcgm_live.py
       - tests/execution/test_quiesce_fabric_manager_policy.py
       - tests/execution/test_validation_fabric_state_loss.py
       - tests/orchestration/test_fabric_manager_restart_plan.py
@@ -646,6 +662,8 @@ rules:
     pytest:
       - tests/node_agent
       - tests/fleet/test_dcgm_hostengine_heartbeat.py
+      - tests/fleet/test_dcgm_hostengine_version_heartbeat.py
+      - tests/deploy/test_node_preflight_host_prerequisites.py
       - tests/execution/test_quiesce_fabric_manager_policy.py
       - tests/execution/test_validation_fabric_state_loss.py
       - tests/execution/test_fabric_manager_step_waiting_cap.py
