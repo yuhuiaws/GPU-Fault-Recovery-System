@@ -782,7 +782,15 @@ def test_the_activity_sampler_sees_an_admission_insert_waiting_in_the_store(
     samples = [json.loads(line) for line in (first + output).decode().splitlines()]
     caught = [item for item in samples if item.get("admission_inserts")]
     assert caught, samples
-    assert all(item["waits"].get("Timeout:PgSleep") for item in caught), caught
+    # Every sample classifies the one active statement once, by what it was
+    # doing at that instant: in pg_sleep for the INSERT's 1.5 s, then still
+    # active on the CPU, IO:DataFileExtend and IO:WALSync while it writes its
+    # row and commits (about 1 ms here, longer on a CI runner's disk). A sample
+    # that lands there is correct, so "every sample shows PgSleep" was a race.
+    assert all(item["active"] == sum(item["waits"].values()) == 1 for item in caught), (
+        caught
+    )
+    assert any(item["waits"] == {"Timeout:PgSleep": 1} for item in caught), caught
     (statement,) = caught[0]["statements"]
     assert statement.startswith(
         "INSERT INTO gpu_fault_processor_queue (request_id) SELECT '?' FROM pg_sleep("
