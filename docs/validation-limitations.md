@@ -783,7 +783,13 @@ plus a minute) and RESTORE_GPU_SERVICES/RESTART_FABRIC_MANAGER may wait up to
 Fabric Manager start near NVIDIA's 720 s (on NVL5 the start script polls up to
 60 s for the InfiniBand device, then starts NVLSM and Fabric Manager) keeps the
 full GPU + NVSwitch reset chain close to that budget. No NVL5 start time was
-measured.
+measured. The same 780 s bounds the Agent's boot reconcile, which restores a
+quiesce state file a reboot orphaned before the Agent serves its first command
+or sends its first heartbeat: a `systemctl start nvidia-fabricmanager` there
+joins the unit's own boot start job, so an NVL5 Fabric Manager that takes long
+to start delays the Agent's startup up to 780 s (120 s before) after a reboot
+that interrupted a quiesce window. On Hopper the start returns in about half a
+minute, or fails; neither case changed.
 
 ## Solo XID 45 on graded NVSwitch nodes
 
