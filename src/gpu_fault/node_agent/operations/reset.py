@@ -19,9 +19,9 @@ from gpu_fault.node_agent.late_ownership import (
     final_ownership_boundary,
     require_physical_ownership,
 )
+from gpu_fault.node_agent.operations.display_stack import reload_display_stack
 from gpu_fault.node_agent.operations.holders import (
     IDLE_DISPLAY_MODULES,
-    display_module_state,
     display_release_bystander,
     gpu_client_holder_evidence,
     gpu_client_holder_summary,
@@ -203,28 +203,15 @@ class ResetOperationsMixin:
         return unloaded
 
     def _reload_display_modules(self, released: list[str]) -> dict[str, Any]:
-        """Load the display stack this reset unloaded; evidence, never a failure."""
+        """Load the display stack this reset unloaded, retried once and checked
+        against ``/proc/modules``; never a failure (``display_stack``)."""
 
-        if not released:
-            return {}
-        details: dict[str, Any] = {"released_kernel_modules": list(released)}
-        try:
-            retained = display_module_state(self.proc_root)
-        except Exception:  # noqa: BLE001 - evidence only
-            retained = []
-        if retained:
-            # What the release left loaded (and why: its refcount and users),
-            # so a modeset that stayed behind is readable from the record.
-            details["display_modules_retained"] = retained
-        # ``nvidia_drm`` depends on ``nvidia_modeset``: loading the outermost
-        # module restores the stack exactly as the image had it, modeset first.
-        outermost = "nvidia_drm" if "nvidia_drm" in released else released[-1]
-        try:
-            self._run_checked(["modprobe", outermost], timeout=60)
-            details["reloaded_kernel_modules"] = list(reversed(released))
-        except Exception as exc:  # noqa: BLE001 - the error is the evidence
-            details["kernel_module_reload_error"] = f"{type(exc).__name__}: {exc}"
-        return details
+        return reload_display_stack(
+            released,
+            run_checked=self._run_checked,
+            sleep=self.sleep,
+            proc_root=self.proc_root,
+        )
 
     def _run_reset_with_busy_retry(
         self,
