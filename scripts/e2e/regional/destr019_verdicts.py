@@ -13,11 +13,13 @@ deployed wheel.
 
 The workflow has two shapes (``fabric_restart_shape``). On a node whose NVLink
 fabric the product does not grade it is the Fabric Manager restart: one
-command, counters accepted=1 completed=1. On a graded Hopper NVSwitch node (the
-live site) it is the full GPU + NVSwitch reset chain -- cordon, quiesce, client
-check, one reset, restore, validations -- so the audited command is the chain's
-RESET_ALL_GPUS_NVSWITCHES and the counters must equal the ledger rows the
-chain added since the restart (attempts, SUCCEEDED, FAILED, no rejection).
+command, counters accepted=1 completed=1. On a graded NVSwitch node (Hopper
+SXM, HGX B200/B300; the live site) it is the full GPU + NVSwitch reset chain --
+cordon, quiesce, client check, one reset, restore, validations -- so the
+audited command is the chain's RESET_ALL_GPUS_NVSWITCHES and the counters must
+equal the ledger rows the chain added since the restart (attempts, SUCCEEDED,
+FAILED, no rejection). Where the site's default makes that XID 45 observe-only
+(batch 131) the runner opens DESTR-010's XID 45 opt-in window for the chain.
 
 What the case deliberately does *not* do is restart the Agent while a
 maintenance command is in flight. ``NodeActionLedger._interrupt_in_progress``

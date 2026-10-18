@@ -17,8 +17,9 @@ from typing import Any
 FABRIC_MANAGER_UNIT = "nvidia-fabricmanager.service"
 LEDGER = Path("/var/lib/gpu-fault/node-actions.db")
 # The node actions a solo XID 45 can run: the Fabric Manager restart, or on a
-# Hopper NVSwitch node whose fabric the product grades the full GPU + NVSwitch
-# reset chain's window, client check, reset and restore (DESTR-010).
+# graded NVSwitch node (Hopper SXM, HGX B200/B300) whose site opted in the full
+# GPU + NVSwitch reset chain's window, client check, reset and restore
+# (DESTR-010). By default a solo XID 45 there runs nothing (observe-only).
 LEDGER_OPERATIONS = (
     "RESTART_FABRIC_MANAGER",
     "QUIESCE_GPU_SERVICES",
