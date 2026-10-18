@@ -29,6 +29,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -613,6 +614,20 @@ def _admit(store: PostgresStore, items: list[Any]) -> None:
         )
 
 
+def _await_layout(store: PostgresStore, mode: str) -> None:
+    """Until the store reports ``mode``: its readers keep the layout they read
+    for 0.25 s, and the fixture's store read ``inline`` (the harness had just
+    truncated the layout row) moments before this test wrote the mode. Asserting
+    at once measured how long the harness's TRUNCATE took -- past 0.25 s on the
+    gate host, under it on a CI runner, where both burst cases failed with
+    ``'inline' == 'detached'``."""
+
+    deadline = time.monotonic() + 5.0
+    while store.hot_layout_mode() != mode:
+        assert time.monotonic() < deadline, f"the store never reported {mode}"
+        time.sleep(0.05)
+
+
 def _seed_leased_burst(
     store: PostgresStore, connection: Any, *, routine: bool
 ) -> list[str]:
@@ -630,7 +645,7 @@ def _seed_leased_burst(
         # table); the shared harness truncated the layout row to inline.
         hot_layout.write_layout_mode(cursor, "detached")
         hot_layout.ensure_replay_partitions(cursor, datetime.now(timezone.utc))
-    assert store.hot_layout_mode() == "detached"
+    _await_layout(store, "detached")
     for table in (QUEUE, LANES):
         connection.execute(f"ALTER TABLE {table} SET (autovacuum_enabled = false)")
     items = _burst_items(routine=routine)
