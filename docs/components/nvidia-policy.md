@@ -46,6 +46,72 @@ PYTHONPATH=src python tools/generate_nvidia_xid_policy.py --check
 `artifacts/upstream/nvidia/xid-catalog-610/<source-sha256>/`，并将该目录归档到
 受控对象存储；`artifacts/` 只作为本地工作区。
 
+### DCGM Exporter
+
+- 镜像：`nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless`（DCGM 4.6.1 客户端库、exporter 4.8.4、distroless 变体；
+  该 release 使用 go-dcgm `v1.4611.2`）
+- manifest list SHA-256：
+  `sha256:148b0c025e5f2850256816fa33754fbf4733b7a086697a95613fc0ba3db5b003`（`4.6.1-4.8.4`、`4.6.1-4.8.4-distroless`、
+  `4.8.4` 与 `latest` 都指向它）
+- linux/amd64 manifest SHA-256：
+  `sha256:804c17f67ab63e8a4dd5301546beefaa104129f833dae4a68f5ff7c4819f471b`
+- 镜像配置：`com.nvidia.dcgm.version=4.6.1`、`org.opencontainers.image.version=4.8.4`，基础镜像
+  `nvcr.io/nvidia/distroless/cc:v4.1.4`；层中有 `libdcgm.so.4.6.1` 与 `/etc/ld.so.cache`
+- 产品中的位置：唯一来源 `src/gpu_fault/admin/dcgm_exporter_release.py`；`config/release-images.lock.json` 的
+  `dcgm_exporter`（`reference` 为 manifest-list digest，`source` 为 tag）；普通 EKS host 模式的主机 DCGM
+  `4.6.1-1`（`DCGM_HOST_PACKAGE_VERSION`）由它推导；规则在 `src/gpu_fault/dcgm_versions.py`
+
+NVIDIA 的规则（原文）：
+
+- "Install DCGM Exporter"，"Requirements and Version Compatibility"
+  （<https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html#requirements-and-version-compatibility>）：
+  - "DCGM Exporter releases pair a DCGM version with an exporter version. Container image tags encode the tested pair as `<dcgm-version>-<dcgm-exporter-version>-<image-variant>`."
+  - "Run DCGM Exporter with the DCGM version paired with that exporter release. Mismatched combinations might function, but they are not tested or supported. When troubleshooting, first update to matching, current versions of DCGM and DCGM Exporter."
+  - "For a separate DCGM host engine, the exporter’s DCGM client library version must also be greater than or equal to the DCGM host engine version. Meeting this connection requirement does not make a mismatched release pair supported."
+  - 同页排障："For a separate DCGM host engine, verify the endpoint, transport, socket mount, and client/host-engine version relationship."
+- 同页 "Connect to a DCGM Host Engine"（<https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html#connect-to-a-dcgm-host-engine>）：
+  "The URI forms require DCGM 4.5 or later."（产品沿用 `host:port` 形式 `127.0.0.1:5555`）
+- README（<https://github.com/NVIDIA/dcgm-exporter>，"Version compatibility"）："Run DCGM Exporter with the DCGM version paired with that exporter release."
+- GitHub release（<https://github.com/NVIDIA/dcgm-exporter/releases/tag/4.8.4>）："Release DCGM Exporter 4.8.4 with DCGM 4.6.1 and go-dcgm v1.4611.2."
+- DCGM release notes（<https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html>）4.6.1 的
+  Bug Fixes、Core："Add safeguards against potential memory errors when using mismatched clients and hostengines."
+
+为什么是这个 release：它是最新的 exporter release；DCGM 4.7.0 的软件包已经发布，但 registry 与 GitHub 上都没有与 DCGM 4.7.x
+配对的 exporter（go-dcgm 的 `v1.4701.*` 绑定存在，没有 exporter release 使用它）。与 HyperPod AMI 的 DCGM 4.6.0 配对的
+`4.6.0-4.8.3-distroless` 不带 `/etc/ld.so.cache`，启动时对 `libdcgm.so.4` 的检查随即以 "exit status 1" 退出，除非容器运行时的
+NVIDIA hook 写入一个（github.com/NVIDIA/dcgm-exporter issue #612，由 4.8.4 的 PR #724 修复）。自 4.8.2 起 NVIDIA 只发布
+distroless 变体。各集群的配对（普通 EKS host 模式为受支持的配对，HyperPod 的 4.6.0 只满足连接要求）、只提示不拒绝的理由与升级
+步骤见[部署和运维手册](../部署和运维手册.md) §6.5「DCGM exporter 版本与主机 hostengine 配对」。
+
+重新核对（NGC registry v2 API，匿名 pull token）：
+
+```bash
+token="$(curl -s 'https://nvcr.io/proxy_auth?scope=repository:nvidia/k8s/dcgm-exporter:pull' \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])')"
+registry=https://nvcr.io/v2/nvidia/k8s/dcgm-exporter
+# manifest-list digest of each tag: one value for 4.6.1-4.8.4, 4.6.1-4.8.4-distroless, 4.8.4 and latest
+for tag in 4.6.1-4.8.4 4.6.1-4.8.4-distroless 4.8.4 latest; do
+  curl -sI -H "Authorization: Bearer ${token}" \
+    -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+    "${registry}/manifests/${tag}" | grep -i docker-content-digest
+done
+# the linux/amd64 manifest of the list, then its image config labels
+curl -s -H "Authorization: Bearer ${token}" \
+  -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+  "${registry}/manifests/4.6.1-4.8.4-distroless" \
+  | python3 -c 'import json, sys; print([m["digest"] for m in json.load(sys.stdin)["manifests"] if m["platform"]["architecture"] == "amd64"][0])'
+config="$(curl -s -H "Authorization: Bearer ${token}" \
+  -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+  "${registry}/manifests/sha256:804c17f67ab63e8a4dd5301546beefaa104129f833dae4a68f5ff7c4819f471b" \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["config"]["digest"])')"
+curl -sL -H "Authorization: Bearer ${token}" "${registry}/blobs/${config}" \
+  | python3 -c 'import json, sys; labels = json.load(sys.stdin)["config"]["Labels"]; print({key: labels[key] for key in ("com.nvidia.dcgm.version", "org.opencontainers.image.version", "org.opencontainers.image.base.name")})'
+```
+
+换 release 时按部署和运维手册 §6.5 的升级步骤同时修改上面的来源、字面值与镜像锁（`tests/regional/test_dcgm_exporter_release_pins.py`），
+并按新 release 的 go-dcgm（其 `go.mod`）的 `pkg/dcgm/const_fields.go` 重新读取 counters 字段表
+（`tests/regional/test_dataplane_dcgm_counters.py` 的 `PINNED_FIELD_IDS`）。
+
 ## 决策语义
 
 策略结果分别保存：

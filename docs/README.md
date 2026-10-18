@@ -40,7 +40,7 @@ links point at `docs/en/administrator-operations.md`.
 | [概要设计 v2（闭环视角）](概要设计-v2.md) | 发现到重新纳管的每一环由谁做、能力边界在哪、缺口是什么 |
 | [详细设计](详细设计.md) | 当前代码模块、协议和状态机如何实现 |
 | [详细设计 v2（可编码视角）](详细设计-v2.md) | 每个模块怎么跑、数据怎么流、异常怎么处理，够据此编码联调 |
-| [NVIDIA 策略供应链与实现](components/nvidia-policy.md) | Catalog 固定来源、生成摘要、动作语义和运行时门禁 |
+| [NVIDIA 策略供应链与实现](components/nvidia-policy.md) | Catalog 与 DCGM exporter 的固定来源、生成摘要、动作语义和运行时门禁 |
 | [普通 EKS GPU 集群与混合 provider 站点](components/plain-eks-gpu-cluster.md) | `eks-managed` 的设计、操作员前置、限制与验证状态汇总 |
 | [故障类别与处置动作总表](故障类别与处置动作总表.md) | 每类故障、每个 XID/SXID 的检测规则、NVIDIA 官方建议、策略判定和实际执行步骤 |
 | [CI 发布流程](CI发布流程.md) | main CI如何生成签名候选，Release如何验签晋级和交付制品 |

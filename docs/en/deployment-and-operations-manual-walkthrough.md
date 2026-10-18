@@ -338,6 +338,8 @@ That feature is not yet fully implemented and tested as a deliverable capability
 
 Covers policies for temperature, PCIe replay, NVLink, ECC, row-remap, power/thermal violation and so on.
 The defaults are a conservative site policy and must not be claimed as official NVIDIA RMA thresholds.
+The section also records the pinned DCGM exporter's version pairing with the host hostengine: NVIDIA's rules verbatim, the
+pairing per cluster, the advisory (never refusing) version comparison and the exporter upgrade steps.
 
 ### 6.6 HyperPod
 

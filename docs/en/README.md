@@ -69,7 +69,7 @@ The normal path does not require administrators to read the full deployment manu
 | [High-Level Design v2 (closed-loop view)](high-level-design-v2.md) | Who performs each link from detection to re-onboarding, where the capability boundaries are, what the gaps are |
 | [Detailed Design](detailed-design.md) | How the current code modules, protocols and state machines are implemented |
 | [Detailed Design v2 (implementation view)](detailed-design-v2.md) | How each module runs, how data flows, how exceptions are handled, enough to code and integrate from it |
-| [NVIDIA Policy Supply Chain and Implementation](components/nvidia-policy.md) | Catalog pinned sources, generated digests, action semantics and runtime gates |
+| [NVIDIA Policy Supply Chain and Implementation](components/nvidia-policy.md) | Catalog and DCGM exporter pinned sources, generated digests, action semantics and runtime gates |
 | [Fault Categories and Actions](fault-categories-and-actions.md) | For every fault category and every XID/SXID: detection rules, NVIDIA official recommendations, policy decisions and actual execution steps |
 | [CI Release Process](ci-release-process.md) | How main CI produces signed candidates, how Release verifies signatures, promotes and delivers artifacts |
 | [EC2 Source Staging Unified Deployment Process](ec2-source-staging-reproduction.md) | First deploy, dirty iterations and subsequent upgrades all use the four-parameter `gpu-fault-admin deploy` |

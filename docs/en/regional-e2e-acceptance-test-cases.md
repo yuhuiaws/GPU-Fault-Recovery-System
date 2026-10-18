@@ -14055,15 +14055,15 @@ the delivery: with the DCGM and collector phases both near their worst, a health
 60 seconds (host DCGM mode failed at 61.3 seconds; the same node passed at 46.6 seconds on the rerun).
 
 The stages between the load-start receipt and the Store's `ingested_at`, read off the pinned
-dcgm-exporter `4.4.1-4.5.2`, its go-dcgm `a9c939c020ec`, DCGM 4.4.1 (the exporter's embedded engine)
-and 4.6.1 (the public source nearest the nodes' host engines), are the same in the embedded and the
+dcgm-exporter `4.6.1-4.8.4`, its go-dcgm `v1.4611.2` and DCGM 4.6.1 (the exporter's embedded engine,
+and the public source nearest the nodes' host engines), are the same in the embedded and the
 host hostengine (`DCGM_REMOTE_HOSTENGINE_INFO`) modes; the mode is recorded, never priced.
 
 | Stage | Mechanism | Bound component |
 | --- | --- | --- |
 | NVML | DCGM reads the power through `nvmlDeviceGetPowerUsage`, a 1-second average on Ampere and newer; utilization samples over at most 1 second | `nvml_average_seconds` = 1 |
 | DCGM watch | the exporter watches every field at `updateFreq = -c x 1000 us` with `maxKeepAge` 600 seconds; the cache manager samples a field only once its age reaches that period (`ActuallyUpdateAllFields`); a host engine samples at the shortest period of all its watchers, never longer. The lowered `DCGM_FI_DEV_POWER_MGMT_LIMIT` is polled on the same watch timer: DCGM appends a limit on change only when the limit is set through DCGM itself, and `nvidia-smi -pl` does not go through it | `dcgm_watch_seconds` = the exporter collect period |
-| exporter | no sampler of its own: `/metrics` runs `Gather` per request and reads DCGM's cached latest values (`dcgmEntityGetLatestValues`, no live flag, no field update); the product's counters contain no `DCGM_EXP_*` field, the only collectors that call `UpdateAllFields`, and that call updates only due fields anyway | 0 |
+| exporter | no sampler of its own: `/metrics` runs `Gather` per request (overlapping scrapes are coalesced into one `Gather`) and reads DCGM's cached latest values (`dcgmEntityGetLatestValues`, no live flag, no field update; only a profiling-watch re-arm forces one, and the product exports no profiling field); the product's counters contain no `DCGM_EXP_*` field, the only collectors that call `UpdateAllFields`, and that call updates only due fields anyway | 0 |
 | collector phase | one scrape per tick; the loop sleeps a full `interval` after each tick's work, so ticks are `interval` plus that tick's work apart; the cadence jitter moves the health summary, the inventory and the start-up only, not this tick | `collector_phase_seconds` = `interval` |
 | confirmation | `EDGE_CONFIRMATION_SAMPLES - 1` ticks after the first anomalous sample | `confirmation_seconds` |
 | loop overrun | `quiet_stamp` and the confirming sample are ticks of the same loop: the gap divided by `interval`, rounded down, is the tick count and the remainder is the ticks' summed work (the path's ticks are among them); measured | `collector_tick_overrun_seconds` |

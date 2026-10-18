@@ -48,6 +48,76 @@ The upstream XLSX does not enter the source tree. Before regenerating, store the
 `artifacts/upstream/nvidia/xid-catalog-610/<source-sha256>/` and archive that directory to
 controlled object storage; `artifacts/` is only a local workspace.
 
+### DCGM Exporter
+
+- Image: `nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless` (DCGM 4.6.1 client library, exporter 4.8.4, distroless
+  variant; the release uses go-dcgm `v1.4611.2`)
+- Manifest list SHA-256:
+  `sha256:148b0c025e5f2850256816fa33754fbf4733b7a086697a95613fc0ba3db5b003` (`4.6.1-4.8.4`, `4.6.1-4.8.4-distroless`,
+  `4.8.4` and `latest` all name it)
+- linux/amd64 manifest SHA-256:
+  `sha256:804c17f67ab63e8a4dd5301546beefaa104129f833dae4a68f5ff7c4819f471b`
+- Image config: `com.nvidia.dcgm.version=4.6.1`, `org.opencontainers.image.version=4.8.4`, base
+  `nvcr.io/nvidia/distroless/cc:v4.1.4`; the layers ship `libdcgm.so.4.6.1` and `/etc/ld.so.cache`
+- Where the product holds it: the one source `src/gpu_fault/admin/dcgm_exporter_release.py`; the `dcgm_exporter` entry of
+  `config/release-images.lock.json` (`reference` the manifest-list digest, `source` the tag); the plain EKS host-mode host
+  DCGM `4.6.1-1` (`DCGM_HOST_PACKAGE_VERSION`) is derived from it; the rule is in `src/gpu_fault/dcgm_versions.py`
+
+NVIDIA's rules, verbatim:
+
+- "Install DCGM Exporter", "Requirements and Version Compatibility"
+  (<https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html#requirements-and-version-compatibility>):
+  - "DCGM Exporter releases pair a DCGM version with an exporter version. Container image tags encode the tested pair as `<dcgm-version>-<dcgm-exporter-version>-<image-variant>`."
+  - "Run DCGM Exporter with the DCGM version paired with that exporter release. Mismatched combinations might function, but they are not tested or supported. When troubleshooting, first update to matching, current versions of DCGM and DCGM Exporter."
+  - "For a separate DCGM host engine, the exporter’s DCGM client library version must also be greater than or equal to the DCGM host engine version. Meeting this connection requirement does not make a mismatched release pair supported."
+  - Troubleshooting, same page: "For a separate DCGM host engine, verify the endpoint, transport, socket mount, and client/host-engine version relationship."
+- Same page, "Connect to a DCGM Host Engine" (<https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html#connect-to-a-dcgm-host-engine>):
+  "The URI forms require DCGM 4.5 or later." (the product keeps the `host:port` form `127.0.0.1:5555`)
+- README (<https://github.com/NVIDIA/dcgm-exporter>, "Version compatibility"): "Run DCGM Exporter with the DCGM version paired with that exporter release."
+- GitHub release (<https://github.com/NVIDIA/dcgm-exporter/releases/tag/4.8.4>): "Release DCGM Exporter 4.8.4 with DCGM 4.6.1 and go-dcgm v1.4611.2."
+- DCGM release notes (<https://docs.nvidia.com/datacenter/dcgm/latest/release-notes/changelog.html>), 4.6.1,
+  Bug Fixes, Core: "Add safeguards against potential memory errors when using mismatched clients and hostengines."
+
+Why this release: it is the newest exporter release; DCGM 4.7.0 packages are published, but no exporter paired with DCGM
+4.7.x exists on the registry or on GitHub (go-dcgm's `v1.4701.*` bindings exist, no exporter release uses them).
+`4.6.0-4.8.3-distroless`, the release paired with the HyperPod AMI's DCGM 4.6.0, ships no `/etc/ld.so.cache`, and its
+start-up check for `libdcgm.so.4` then exits with "exit status 1" unless the container runtime's NVIDIA hook writes one
+(github.com/NVIDIA/dcgm-exporter issue #612, fixed by PR #724 in 4.8.4). Since 4.8.2 NVIDIA publishes the distroless variant
+only. The pairing per cluster (plain EKS host mode is a supported pair, HyperPod's 4.6.0 only meets the connection
+requirement), why the product advises rather than refuses, and the upgrade steps are in the
+[Deployment and Operations Manual](../deployment-and-operations-manual.md) §6.5, "DCGM exporter version and the host
+hostengine pairing".
+
+Re-verify (NGC registry v2 API, anonymous pull token):
+
+```bash
+token="$(curl -s 'https://nvcr.io/proxy_auth?scope=repository:nvidia/k8s/dcgm-exporter:pull' \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["token"])')"
+registry=https://nvcr.io/v2/nvidia/k8s/dcgm-exporter
+# manifest-list digest of each tag: one value for 4.6.1-4.8.4, 4.6.1-4.8.4-distroless, 4.8.4 and latest
+for tag in 4.6.1-4.8.4 4.6.1-4.8.4-distroless 4.8.4 latest; do
+  curl -sI -H "Authorization: Bearer ${token}" \
+    -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+    "${registry}/manifests/${tag}" | grep -i docker-content-digest
+done
+# the linux/amd64 manifest of the list, then its image config labels
+curl -s -H "Authorization: Bearer ${token}" \
+  -H 'Accept: application/vnd.docker.distribution.manifest.list.v2+json' \
+  "${registry}/manifests/4.6.1-4.8.4-distroless" \
+  | python3 -c 'import json, sys; print([m["digest"] for m in json.load(sys.stdin)["manifests"] if m["platform"]["architecture"] == "amd64"][0])'
+config="$(curl -s -H "Authorization: Bearer ${token}" \
+  -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+  "${registry}/manifests/sha256:804c17f67ab63e8a4dd5301546beefaa104129f833dae4a68f5ff7c4819f471b" \
+  | python3 -c 'import json, sys; print(json.load(sys.stdin)["config"]["digest"])')"
+curl -sL -H "Authorization: Bearer ${token}" "${registry}/blobs/${config}" \
+  | python3 -c 'import json, sys; labels = json.load(sys.stdin)["config"]["Labels"]; print({key: labels[key] for key in ("com.nvidia.dcgm.version", "org.opencontainers.image.version", "org.opencontainers.image.base.name")})'
+```
+
+A release change follows the upgrade steps of the deployment and operations manual §6.5: the source, the literals and the
+image lock above change together (`tests/regional/test_dcgm_exporter_release_pins.py`), and the counters field table is read
+again from `pkg/dcgm/const_fields.go` of the new release's go-dcgm (its `go.mod`) (`PINNED_FIELD_IDS` in
+`tests/regional/test_dataplane_dcgm_counters.py`).
+
 ## Decision Semantics
 
 The policy results are stored separately:

@@ -309,6 +309,16 @@ sudo deploy/node/install-gpu-fault-collector.sh \
   --dcgm-exporter-image nvcr.io/nvidia/k8s/dcgm-exporter:<approved-tag>
 ```
 
+`<approved-tag>` must follow NVIDIA's `<dcgm-version>-<dcgm-exporter-version>-<image-variant>` scheme, the pair of DCGM and
+exporter versions NVIDIA tested ("Install DCGM Exporter", <https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html#requirements-and-version-compatibility>);
+without a reason to differ, use the default (pinned) tag of the product's managed exporter, `4.6.1-4.8.4-distroless`. The
+docker-mode exporter runs its own embedded engine (the installer refuses when an `nv-hostengine` already runs), so the tag's
+DCGM version is the node's engine version; where an exporter dials a host hostengine (HyperPod, plain EKS host mode), NVIDIA
+requires the tag's DCGM version (the exporter's client library) to be at least the host engine's version, and the product reads
+the client version from the managed exporter image's tag and compares it with the node engines
+([Deployment and Operations Manual](docs/en/deployment-and-operations-manual.md) §6.5, "DCGM exporter version and the host
+hostengine pairing").
+
 Docker mode uses the host network, but the exporter listens only on `127.0.0.1:9400` and mounts
 the project's DCGM counter list. It does not enter the HMA Pod, does not modify HMA's `nv-hostengine`, and does not
 request Kubernetes `nvidia.com/gpu` resources. When the installer detects an existing `nv-hostengine` or DCGM

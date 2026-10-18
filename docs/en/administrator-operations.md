@@ -2053,8 +2053,11 @@ command -v strace
 # Host DCGM, optional: only together with the node-group label
 # gpu-fault.io/dcgm-hostengine=host (管理员日常运维 / administrator-operations §5.0.1).
 # Pin one exact version-release for both packages on every GPU node group of the
-# cluster; the cudaN build must match the major of the "CUDA Version" nvidia-smi prints.
-DCGM_VERSION=REPLACE_WITH_DCGM_VERSION_RELEASE   # e.g. 4.7.0-2
+# cluster: the DCGM version the product's exporter is paired with (the <dcgm> of its
+# image tag <dcgm>-<exporter>-<variant>, NVIDIA's supported pair; the exporter's DCGM
+# client must never be older than this engine). The cudaN build must match the major
+# of the "CUDA Version" nvidia-smi prints.
+DCGM_VERSION=REPLACE_WITH_DCGM_VERSION_RELEASE   # e.g. 4.6.1-1 (exporter 4.6.1-4.8.4)
 CUDA_MAJOR=REPLACE_WITH_CUDA_MAJOR               # e.g. 13
 dnf install -y "datacenter-gpu-manager-4-core-${DCGM_VERSION}" \
   "datacenter-gpu-manager-4-cuda${CUDA_MAJOR}-${DCGM_VERSION}"
@@ -2202,8 +2205,10 @@ a mode change that has not been released yet: the header says
 Follow these steps in order and without pausing between them:
 
 1. **Enable the host hostengine.** Add the pinned DCGM install and `systemctl enable --now nvidia-dcgm` at the end of the
-   shell part to the launch template: one version-release for both packages and every GPU node group of the cluster
-   (choose it with `dnf list --showduplicates datacenter-gpu-manager-4-core`; without the pin nodes drift between
+   shell part to the launch template: one version-release for both packages and every GPU node group of the cluster,
+   the DCGM version the product's exporter is paired with (currently `4.6.1-1`, the DCGM 4.6.1 of the exporter
+   `4.6.1-4.8.4-distroless`; see "Host engine version against the exporter's DCGM client" below;
+   `dnf list --showduplicates datacenter-gpu-manager-4-core` lists the available builds; without the pin nodes drift between
    releases), and a `cudaN` package matching the major of the "CUDA Version" `nvidia-smi` prints (a mismatched build
    fails, e.g. `dcgmproftester` exits 244); change the launch template version and roll the node group as above. A node
    that already carries both packages may also run `systemctl enable --now nvidia-dcgm` directly, but only the launch
@@ -2278,11 +2283,13 @@ Follow these steps in order and without pausing between them:
 The node preflight classifies every `eks-managed` GPU node's DCGM state into one row of the table below and records it in
 the `dcgm` object of its JSON verdict (`mode`, `state`, whether `nvidia-dcgm` is active/enabled, whether `dcgmi` and
 `nv-hostengine` are present, the installed `cudaN` flavors against the driver's CUDA major, the nv-hostengine processes
-and their owning unit, the `dcgmi discovery -l` result and `conflict`). The release preflight runs every node and refuses
-once, naming every failed node; the per-node states of the last node preflight (every deploy that rolls the
-reconciler/Agents, and every join) are recorded in the release state (`node_dcgm_hostengine`, with `observed_at`) and
-shown by `status --full`/verify as `node_scope.dcgm_hostengine_nodes` and `node_scope.dcgm_hostengine_conflict_nodes` --
-that preflight's observation, not a live probe.
+and their owning unit, the `dcgmi discovery -l` result, the version the running engine reports, `version` -- the
+"Hostengine build info" of `dcgmi -v`, empty when unknown; see "Host engine version" below -- and `conflict`). The release
+preflight runs every node and refuses once, naming every failed node; the per-node states of the last node preflight (every
+deploy that rolls the reconciler/Agents, and every join) are recorded in the release state (`node_dcgm_hostengine`, with
+`observed_at`) and shown by `status --full`/verify as `node_scope.dcgm_hostengine_nodes` and
+`node_scope.dcgm_hostengine_conflict_nodes` (with versions, also `node_scope.dcgm_hostengine_versions`) -- that preflight's
+observation, not a live probe.
 
 | `dcgm.state` | Meaning | Host mode (labelled) | HyperPod (always host) |
 |---|---|---|---|
@@ -2321,15 +2328,53 @@ without the drop-in (HyperPod, hand-built images).
 
 **Live engine state in `status --full`.** Every Agent reports `nvidia-dcgm` (`systemctl is-active`/`is-enabled`) in each
 heartbeat beside its collector units, and `status --full` shows it per cluster as
-`health.checks[control_api].details.clusters.<id>.dcgm_hostengine_live`: `mode`, `nodes` (per node `active`, `enabled`
-and `reported_at`, the heartbeat time; `not reported` for an Agent of an older release), in host mode `down_nodes` (the
-engine is not active) and in embedded mode `conflict_nodes` (an engine running or enabled next to the exporter's
-embedded one), and `not_reported_nodes`. The status header adds one line per cluster with such a node, for example
+`health.checks[control_api].details.clusters.<id>.dcgm_hostengine_live`: `mode`, `nodes` (per node `active`, `enabled`,
+the running engine's `version` when the Agent reports one, and `reported_at`, the heartbeat time; `not reported` for an
+Agent of an older release), in host mode `down_nodes` (the engine is not active) and the version comparison's
+`exporter_client_version`, `newer_than_client_nodes` and `unpaired_nodes` (next paragraph), in embedded mode
+`conflict_nodes` (an engine running or enabled next to the exporter's embedded one), and `not_reported_nodes`. The status
+header adds one line per cluster with such a node, for example
 `DCGM host engine down on <cluster> (host mode, Agent heartbeats): <node> failed/enabled`. This view is as fresh as the
 last heartbeat (about 30 s), unlike `node_scope.dcgm_hostengine_nodes` (the last node preflight's observation). It rides
 in the heartbeat's existing unit map, which has always taken any unit: a control plane of an older release verifies the
 heartbeat and drops the entry, an Agent of an older release has none -- no protocol or version change, and a
 mixed-version fleet shows `not reported` for the older Agents until they are upgraded.
+
+**Host engine version against the exporter's DCGM client (advisory).** NVIDIA requires the DCGM client library of an
+exporter that dials a separate host engine to be at least that engine's version, and supports only the DCGM version an
+exporter release is paired with ("Install DCGM Exporter", "Requirements and Version Compatibility",
+<https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html#requirements-and-version-compatibility>):
+"For a separate DCGM host engine, the exporter’s DCGM client library version must also be greater than or equal to the DCGM host engine version. Meeting this connection requirement does not make a mismatched release pair supported."
+The client of the product's exporter `nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless` is DCGM 4.6.1: host-mode plain
+EKS node groups install the paired `4.6.1-1` by step 1 above (or the §5.0.1a default); the HyperPod AMI's engine 4.6.0 meets
+the connection requirement but is no pair (deployment and operations manual §6.5, "DCGM exporter version and the host
+hostengine pairing", says why the exporter is not switched per cluster). The product compares the two in three places
+(`gpu_fault/dcgm_versions.py`: `paired`, `client-newer`, `host-newer`, `unknown`; only `major.minor.patch` counts):
+
+- deploy/join record the node preflight's `dcgm.version` in the release state (`node_scope.dcgm_hostengine_versions`,
+  `node_scope.dcgm_exporter_client_version`, `node_scope.dcgm_hostengine_newer_than_client_nodes`) and, when engines are
+  newer than the client, print one line per cluster naming those nodes:
+  `WARN  DCGM host engine newer than the exporter's DCGM client 4.6.1 on <cluster>: <node> 4.7.0; NVIDIA requires the exporter's DCGM client library to be at least the host engine version (https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html#requirements-and-version-compatibility); install DCGM 4.6.1 on the node group (gpu-fault-admin prepare-eks-nodegroup --dcgm-hostengine host --dcgm-version 4.6.1) or deploy an exporter whose DCGM is at least the engine's (administrator operations §5.0.1)`
+  (HyperPod's remedy part: `the AMI ships the engine: deploy an exporter whose DCGM is at least the engine's`).
+- While `nvidia-dcgm` is active the Agent reads `dcgmi -v` when the engine has just become active and on every enablement
+  refresh tick (every 30th heartbeat, about 15 minutes) and reports one more entry, `nvidia-dcgm/version=<version>`, in its
+  heartbeat; every node of `dcgm_hostengine_live` then carries `version`, and host mode adds `exporter_client_version`,
+  `newer_than_client_nodes` (the connection requirement broken) and `unpaired_nodes` (older than the client: the requirement
+  holds, no pair); the former adds a status header line
+  `DCGM host engine newer than the exporter's DCGM client 4.6.1 on <cluster> (host mode, Agent heartbeats): <node> 4.7.0; NVIDIA requires the client to be at least the host engine version (https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html#requirements-and-version-compatibility; administrator operations §5.0.1)`.
+  An older Agent reports no version (no `version` for its node), an older control plane verifies and drops the entry.
+- The `prepare-eks-nodegroup` plan carries `dcgm_hostengine.exporter_dcgm_client`/`exporter_pairing` and the pairing finding
+  (§5.0.1a).
+
+All of it is advisory: no check verdict, `healthy` or exit code changes, and no node or deploy is refused -- metrics flow
+with mismatched versions (NVIDIA: "might function"), the HyperPod engine belongs to the AMI, and a refusal would also block
+the release that brings a newer exporter and the deploys of existing sites; a broken exporter is still caught by the DCGM
+collection checks (missing fields, failed scrapes). What to do: for a plain EKS header line or `WARN`, prepare the node group
+again with `prepare-eks-nodegroup --dcgm-hostengine host --dcgm-version 4.6.1-1` and complete its MINIMAL roll (§5.0.1a; with a
+hand-written launch template set `DCGM_VERSION` to `4.6.1-1` and change versions and roll as above); for a HyperPod header line
+(an AMI that brings a newer DCGM) deploy an exporter release whose DCGM is at least the engine's, and while NVIDIA has
+published none, watch the DCGM collection health and do not downgrade the AMI's DCGM by hand (deployment and operations
+manual §6.5).
 
 A host-mode refusal lists every item of every node in one `ERROR: host prerequisites unavailable: ...` pointing back here.
 In embedded mode (no label) a host engine next to the exporter's embedded one -- running, active/activating or enabled
@@ -2468,11 +2513,23 @@ cluster not yet managed then joins with `join-cluster` or the first `deploy`.
 
 **DCGM host engine** (`--dcgm-hostengine host`): the same managed part also installs `datacenter-gpu-manager-4-core-<v>`
 and `datacenter-gpu-manager-4-cuda<CUDA major>-<v>`, pinned because unpinned installs drifted between nodes:
-`--dcgm-version 4.7.0-2` (a version-release, the default) installs and accepts exactly that build;
-`--dcgm-version 4.7.0` (a version) lets dnf install the newest 4.7.0 build at boot and accepts any build of 4.7.0
-(4.7.0-1 and 4.7.0-2 alike; differing builds across the nodes are then reported as drift). The plan states which applies
-(`dcgm_hostengine.installs`); a pin already in the managed part is kept on reruns. The CUDA major is read on the node at
-boot from the `nvidia-smi -q` "CUDA Version", so it always matches the driver; then the managed part writes the restart
+`--dcgm-version 4.6.1-1` (a version-release, the default) installs and accepts exactly that build;
+`--dcgm-version 4.6.1` (a version) lets dnf install the newest 4.6.1 build at boot and accepts any build of 4.6.1
+(differing builds across the nodes are then reported as drift; never a newer minor). The default is the DCGM the product's
+exporter `nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless` is paired with (derived by `src/gpu_fault/admin/dcgm_exporter_release.py`;
+the previous default was 4.7.0-2): NVIDIA supports only the DCGM version an exporter release is paired with and requires the
+exporter's DCGM client to be at least the host engine's version (§5.0.1, "Host engine version against the exporter's DCGM
+client"). The plan states which applies (`dcgm_hostengine.installs`), the exporter's DCGM client
+(`dcgm_hostengine.exporter_dcgm_client`, `4.6.1`) and the pin's relation to it (`dcgm_hostengine.exporter_pairing`: `paired`,
+`client-newer` or `host-newer`). A pin already in the managed part is kept on reruns (without `--dcgm-version` the existing
+pin wins over the default), so a group prepared earlier with 4.7.0-2 keeps 4.7.0-2 until a rerun with
+`--dcgm-version 4.6.1-1`; for a pin that is not the exporter's DCGM the plan adds a finding (a console `finding:` line) that
+names the flag (`<exporter image>` is the pinned `nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless`):
+`<node group>: the DCGM pin 4.7.0-2 is newer than the DCGM client 4.6.1 of the product's exporter <exporter image>; NVIDIA requires the client to be at least the host engine version: plan with --dcgm-version 4.6.1-1`
+(for an older pin `<node group>: the DCGM pin <pin> is not the version paired with the DCGM client 4.6.1 of the product's exporter <exporter image>; NVIDIA supports the paired version only: plan with --dcgm-version 4.6.1-1`).
+A rerun with the flag replaces the managed part and rolls the group (MINIMAL), the new nodes install 4.6.1-1 and the
+verification checks the new pin; the finding is advisory and blocks neither the plan nor the apply. The CUDA major is read
+on the node at boot from the `nvidia-smi -q` "CUDA Version", so it always matches the driver; then the managed part writes the restart
 drop-in of §5.0.1 (`/etc/systemd/system/nvidia-dcgm.service.d/90-gpu-fault-restart.conf`, `Restart=on-failure`
 `RestartSec=5s`, `StartLimitBurst=10` per `StartLimitIntervalSec=300`; the package's `Restart=on-abort` leaves a
 non-zero exit or a crash loop down for good, a clean stop such as the quiesce's stays stopped) and runs

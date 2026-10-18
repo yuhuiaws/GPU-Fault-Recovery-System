@@ -310,6 +310,13 @@ sudo deploy/node/install-gpu-fault-collector.sh \
   --dcgm-exporter-image nvcr.io/nvidia/k8s/dcgm-exporter:<approved-tag>
 ```
 
+`<approved-tag>` 须遵循 NVIDIA 的 `<dcgm-version>-<dcgm-exporter-version>-<image-variant>` 编码，即 NVIDIA 测试过的一对 DCGM 与
+exporter 版本（"Install DCGM Exporter"，<https://docs.nvidia.com/datacenter/dcgm/latest/installation/install-dcgm-exporter.html#requirements-and-version-compatibility>）；
+没有特别理由时用产品托管 exporter 的缺省（钉定）tag `4.6.1-4.8.4-distroless`。docker 模式的 exporter 运行自己内嵌的引擎
+（已有 `nv-hostengine` 时安装器拒绝），tag 的 DCGM 版本就是该节点的引擎版本；exporter 连接主机 hostengine 时（HyperPod、普通 EKS
+host 模式），NVIDIA 要求 tag 的 DCGM 版本（exporter 的客户端库）不低于该主机引擎的版本，产品从托管 exporter 镜像的 tag 读取
+客户端版本并与节点引擎比较（[部署和运维手册](docs/部署和运维手册.md) §6.5「DCGM exporter 版本与主机 hostengine 配对」）。
+
 Docker 模式使用 host network，但 exporter 仅监听 `127.0.0.1:9400`，并挂载
 项目的 DCGM counter 列表。它不进入 HMA Pod、不修改 HMA 的 `nv-hostengine`，也不
 申请 Kubernetes `nvidia.com/gpu` 资源。安装器检测到已有 `nv-hostengine` 或 DCGM
