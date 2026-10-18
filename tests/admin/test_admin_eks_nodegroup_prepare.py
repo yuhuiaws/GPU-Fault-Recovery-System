@@ -21,9 +21,11 @@ import yaml
 from gpu_fault.admin import cli as admin_cli
 from gpu_fault.admin import eks_nodegroup_prepare as verb
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.dcgm_exporter_release import DCGM_EXPORTER_DCGM_VERSION
 from gpu_fault.admin.deploy_host_binding import is_readonly_command
 from gpu_fault.admin.eks_nodegroup_user_data import (
     DCGM_HOSTENGINE_LABEL,
+    DCGM_PACKAGE_VERSION,
     DCGM_RESTART_DROPIN,
     MANAGED_PART_MARKER,
     dcgm_pin,
@@ -540,14 +542,16 @@ def test_the_plan_shows_the_current_nodes_and_their_dcgm_drift(
     assert group["dcgm_hostengine"] == {
         "mode": "host",
         "source": "flag",
-        "pin": "4.7.0-2",
-        "installs": "exactly build 4.7.0-2 of both DCGM packages",
+        "pin": DCGM_PACKAGE_VERSION,
+        "installs": f"exactly build {DCGM_PACKAGE_VERSION} of both DCGM packages",
         "restart_dropin": restart_dropin(),
-    }, "the plan names the restart drop-in host mode writes"
+        "exporter_dcgm_client": DCGM_EXPORTER_DCGM_VERSION,
+        "exporter_pairing": "paired",
+    }, "the plan names the restart drop-in and the exporter the engine pairs with"
     site_part = group["user_data"]["parts"][1]
     assert (
         "part 2 line 2: datacenter-gpu-manager-4-core is unpinned (the newest build), "
-        "the pin is 4.7.0-2"
+        f"the pin is {DCGM_PACKAGE_VERSION}"
     ) in site_part["contradictions"]
     assert _no_writes(world), "the inventory is a read-only SSM command"
 
@@ -1046,7 +1050,7 @@ def test_host_mode_apply_pins_dcgm_labels_the_group_and_verifies_dcgm(
 
     assert code == 0, err
     script = world.template_user_data(4)
-    assert "dcgm_version='4.7.0-2'" in script
+    assert f"dcgm_version='{DCGM_PACKAGE_VERSION}'" in script
     assert "systemctl enable --now nvidia-dcgm" in script
     labels = world.nodegroups[GPU_GROUP]["labels"]
     assert (labels[OWNERSHIP_LABEL], labels[DCGM_HOSTENGINE_LABEL]) == (SITE_ID, "host")

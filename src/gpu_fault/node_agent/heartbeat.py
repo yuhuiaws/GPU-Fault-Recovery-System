@@ -19,7 +19,12 @@ from gpu_fault.collectors.cadence import CadenceJitter
 from gpu_fault.cluster_scope import DCGM_HOSTENGINE_UNIT, FABRIC_MANAGER_UNIT
 from gpu_fault.collector_requirements import (
     COLLECTOR_SYSTEMD_UNITS,
+    CollectorActiveState,
     CollectorServiceState,
+)
+from gpu_fault.dcgm_versions import (
+    hostengine_version_from_dcgmi,
+    hostengine_version_key,
 )
 from gpu_fault.fleet import (
     CURRENT_AGENT_PROTOCOL_VERSION,
@@ -73,6 +78,15 @@ class CollectorServiceStates:
     answer for -- a failed call, or a unit the installer just added -- is
     asked about on its own: one slow ``systemctl`` must not put the whole
     node's enablement back on the tick that is already running late.
+
+    The running host DCGM engine's version rides along as one more entry,
+    ``nvidia-dcgm/version=<v>`` (``gpu_fault.dcgm_versions``), with the unit's
+    state: NVIDIA requires the exporter's DCGM client to be at least the
+    engine's version, and ``status --full`` compares the two. ``dcgmi -v`` is
+    asked only while ``nvidia-dcgm`` is active, and only when it has just
+    become active or on the enablement refresh tick -- a version changes with
+    a package upgrade and an engine restart, never in between -- so a node
+    spends one ``dcgmi`` call per refresh window, not one per heartbeat.
     """
 
     def __init__(
@@ -87,6 +101,8 @@ class CollectorServiceStates:
         self._refresh_every = max(1, refresh_every)
         self._enabled: dict[str, str] = {}
         self._ticks = 0
+        self._engine_active = False
+        self._engine_version: str | None = None
 
     def __call__(self) -> dict[str, CollectorServiceState]:
         units = self._units()
@@ -108,11 +124,34 @@ class CollectorServiceStates:
                 enabled=enabled or "unknown",
             )
         self._enabled = cached
+        engine = result.get(DCGM_HOSTENGINE_UNIT)
+        key = hostengine_version_key(self._hostengine_version(engine, refresh))
+        if engine is not None and key is not None:
+            result[key] = engine
         return result
+
+    def _hostengine_version(
+        self, engine: CollectorServiceState | None, refresh: bool
+    ) -> str | None:
+        """The running engine's version, re-read when it (re)starts or on a
+        refresh tick; nothing while the engine is not active."""
+
+        active = engine is not None and engine.active == CollectorActiveState.ACTIVE
+        if not active:
+            self._engine_version = None
+        elif refresh or not self._engine_active:
+            output = self._query_output(["dcgmi", "-v"])
+            self._engine_version = hostengine_version_from_dcgmi(output)
+        self._engine_active = active
+        return self._engine_version
 
     def _query(self, argv: list[str]) -> str | None:
         """The trimmed answer, or None when the call itself failed."""
 
+        output = self._query_output(argv)
+        return None if output is None else output.strip() or "unknown"
+
+    def _query_output(self, argv: list[str]) -> str | None:
         try:
             completed = self._runner(
                 argv,
@@ -123,7 +162,7 @@ class CollectorServiceStates:
             )
         except (OSError, subprocess.TimeoutExpired):
             return None
-        return (completed.stdout or "").strip() or "unknown"
+        return completed.stdout or ""
 
 
 class XidPolicyVersion:

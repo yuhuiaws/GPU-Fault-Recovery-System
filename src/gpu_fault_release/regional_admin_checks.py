@@ -1252,7 +1252,7 @@ def _control_api_report(release: Any) -> dict[str, Any]:
     if not isinstance(result, dict):
         raise ReleaseError("control API report returned non-object evidence")
     agent_coverage.annotate_kubernetes_nodes(result, kubernetes_nodes)
-    agent_coverage.annotate_dcgm_hostengine_live(result, release.config.clusters)
+    agent_coverage.annotate_dcgm_hostengine_live(result, release)
     return result
 
 

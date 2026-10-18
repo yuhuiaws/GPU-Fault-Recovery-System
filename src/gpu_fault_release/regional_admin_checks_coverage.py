@@ -26,7 +26,11 @@ it per cluster as ``dcgm_hostengine_live`` (``annotate_dcgm_hostengine_live``)
 and the header names the host-mode nodes whose engine is down and the
 embedded-mode nodes running one (``dcgm_hostengine_lines``) -- unlike the node
 preflight's ``node_scope.dcgm_hostengine_nodes``, which is the observation of
-the last deploy or join.
+the last deploy or join. The heartbeat also carries the running engine's
+version (``gpu_fault.dcgm_versions``): in host mode each node's is compared with
+the DCGM client of the release's exporter, and a node whose engine is newer --
+NVIDIA's connection requirement broken -- gets a header line too (advisory:
+no verdict changes).
 """
 
 from __future__ import annotations
@@ -44,9 +48,16 @@ from gpu_fault.cluster_scope import (
     node_selector_source,
     selector_matches,
 )
+from gpu_fault.dcgm_versions import (
+    NVIDIA_EXPORTER_COMPATIBILITY_URL,
+    DcgmVersionRelation,
+    dcgm_version_relation,
+    hostengine_version,
+)
 from gpu_fault_release.regional_release_config import ReleaseError
 from gpu_fault_release.regional_release_dcgm import (
     check_dcgm_hostengine_agreement,
+    exporter_client_version,
     node_dcgm_details,
 )
 from gpu_fault_release.regional_release_node_scope import check_node_scope_agreement
@@ -252,15 +263,20 @@ BOOT_ENABLED_STATES = frozenset({"enabled", "enabled-runtime"})
 NOT_REPORTED = "not reported"
 
 
-def dcgm_hostengine_live(cluster: Mapping[str, Any], mode: str) -> dict[str, Any]:
+def dcgm_hostengine_live(
+    cluster: Mapping[str, Any], mode: str, client_version: str | None = None
+) -> dict[str, Any]:
     """Every counted Agent's host DCGM engine as its last heartbeat reported it.
 
-    ``nodes`` maps each node to the unit's ``active``/``enabled`` answers and
-    the heartbeat time (``reported_at``); an Agent older than the report, or a
-    control plane that does not keep it yet, gives ``not reported``. In host
-    mode the nodes whose engine is not active are ``down_nodes``; in embedded
-    mode the nodes whose host engine runs or starts at boot are
-    ``conflict_nodes``.
+    ``nodes`` maps each node to the unit's ``active``/``enabled`` answers, the
+    running engine's ``version`` when the Agent reports one, and the heartbeat
+    time (``reported_at``); an Agent older than the report, or a control plane
+    that does not keep it yet, gives ``not reported``. In host mode the nodes
+    whose engine is not active are ``down_nodes`` and, against
+    ``client_version`` (the exporter's DCGM client, ``exporter_client_version``),
+    the nodes whose engine is newer are ``newer_than_client_nodes`` and those
+    running another version below it ``unpaired_nodes``; in embedded mode the
+    nodes whose host engine runs or starts at boot are ``conflict_nodes``.
     """
 
     nodes: dict[str, dict[str, Any]] = {}
@@ -275,6 +291,9 @@ def dcgm_hostengine_live(cluster: Mapping[str, Any], mode: str) -> dict[str, Any
                 "active": str(state.get("active") or "unknown"),
                 "enabled": str(state.get("enabled") or "unknown"),
             }
+            version = hostengine_version(services)
+            if version is not None:
+                entry["version"] = version
         entry["reported_at"] = agent.get("last_seen_at")
         nodes[str(agent.get("node_id"))] = entry
     reported = {
@@ -290,6 +309,22 @@ def dcgm_hostengine_live(cluster: Mapping[str, Any], mode: str) -> dict[str, Any
         live["down_nodes"] = sorted(
             name for name, entry in reported.items() if entry["active"] != "active"
         )
+        relations = {
+            name: dcgm_version_relation(entry.get("version"), client_version)
+            for name, entry in reported.items()
+            if "version" in entry
+        }
+        live["exporter_client_version"] = client_version or "unknown"
+        live["newer_than_client_nodes"] = sorted(
+            name
+            for name, relation in relations.items()
+            if relation is DcgmVersionRelation.HOST_NEWER
+        )
+        live["unpaired_nodes"] = sorted(
+            name
+            for name, relation in relations.items()
+            if relation is DcgmVersionRelation.CLIENT_NEWER
+        )
     else:
         live["conflict_nodes"] = sorted(
             name
@@ -300,18 +335,20 @@ def dcgm_hostengine_live(cluster: Mapping[str, Any], mode: str) -> dict[str, Any
     return live
 
 
-def annotate_dcgm_hostengine_live(report: dict[str, Any], targets: Any) -> None:
+def annotate_dcgm_hostengine_live(report: dict[str, Any], release: Any) -> None:
     """Record ``dcgm_hostengine_live`` on each of the report's clusters, in place,
-    judged by the cluster's mode (``targets``: the site's cluster targets)."""
+    judged by the cluster's mode (the release's cluster targets) against the
+    DCGM client of the release's exporter."""
 
     clusters = report.get("clusters")
     if not isinstance(clusters, dict):
         return
-    for target in targets:
+    client = exporter_client_version(release)
+    for target in release.config.clusters:
         cluster = clusters.get(target.cluster_id)
         if isinstance(cluster, dict):
             cluster["dcgm_hostengine_live"] = dcgm_hostengine_live(
-                cluster, dcgm_hostengine(target).value
+                cluster, dcgm_hostengine(target).value, client
             )
 
 
@@ -337,6 +374,7 @@ def dcgm_hostengine_lines(report: Mapping[str, Any]) -> list[str]:
             continue
         down = [str(item) for item in live.get("down_nodes") or []]
         conflict = [str(item) for item in live.get("conflict_nodes") or []]
+        newer = [str(item) for item in live.get("newer_than_client_nodes") or []]
         if down:
             lines.append(
                 f"DCGM host engine down on {cluster_id} (host mode, Agent heartbeats): "
@@ -347,7 +385,27 @@ def dcgm_hostengine_lines(report: Mapping[str, Any]) -> list[str]:
                 f"DCGM host engine next to the embedded one on {cluster_id} (Agent "
                 "heartbeats): " + ", ".join(_engine(live, name) for name in conflict)
             )
+        if newer:
+            lines.append(newer_engine_line(str(cluster_id), live, newer))
     return lines
+
+
+def newer_engine_line(
+    cluster_id: str, live: Mapping[str, Any], newer: list[str]
+) -> str:
+    """The header line of host engines newer than the exporter's DCGM client."""
+
+    nodes = live.get("nodes") or {}
+    return (
+        "DCGM host engine newer than the exporter's DCGM client "
+        f"{live.get('exporter_client_version') or 'unknown'} on {cluster_id} "
+        "(host mode, Agent heartbeats): "
+        + ", ".join(
+            f"{name} {(nodes.get(name) or {}).get('version')}" for name in newer
+        )
+        + "; NVIDIA requires the client to be at least the host engine version "
+        f"({NVIDIA_EXPORTER_COMPATIBILITY_URL}; administrator operations §5.0.1)"
+    )
 
 
 def counted_agents(cluster: dict[str, Any]) -> list[dict[str, Any]]:

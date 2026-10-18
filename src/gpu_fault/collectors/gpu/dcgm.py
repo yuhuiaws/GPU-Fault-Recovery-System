@@ -91,7 +91,9 @@ DCGM_METRICS: dict[str, tuple[str, str | None]] = {
     # https://docs.nvidia.com/datacenter/dcgm/latest/dcgm-api/dcgm-api-field-ids.html:
     # "Thermal margin temperature (distance to nearest slowdown threshold) for
     # this GPU"). DCGM 4.6 renamed it DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS; the
-    # pinned exporter's go-dcgm knows the 4.1 name. Exported, never required.
+    # counters CSV keeps the 4.1 name, which the pinned exporter's go-dcgm
+    # (v1.4611.2) resolves as a deprecated alias and renders unchanged.
+    # Exported, never required.
     "DCGM_FI_DEV_GPU_TEMP_LIMIT": (TLIMIT_READING, "celsius"),
     "DCGM_FI_DEV_MEMORY_TEMP": (
         "memory_temperature_c",

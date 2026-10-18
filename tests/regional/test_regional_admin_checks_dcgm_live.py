@@ -106,7 +106,9 @@ def test_each_cluster_is_judged_by_its_own_mode() -> None:
         SimpleNamespace(cluster_id="not-in-report", provider="hyperpod"),
     ]
 
-    annotate_dcgm_hostengine_live(report, targets)
+    annotate_dcgm_hostengine_live(
+        report, SimpleNamespace(config=SimpleNamespace(clusters=targets))
+    )
 
     modes = {
         cluster_id: cluster["dcgm_hostengine_live"]["mode"]
@@ -194,3 +196,150 @@ def test_the_control_api_report_carries_the_live_view(
     assert (live["mode"], live["down_nodes"]) == ("host", ["node-b", "node-d"])
     assert report["clusters"]["eks-host"]["kubernetes_node_ids"] == ["node-a"]
     assert len(asked) == 1, "no extra exec: the Agent records are already read"
+
+
+# --- the engine's version against the exporter's DCGM client (batch 135) ------
+#
+# NVIDIA requires the exporter's DCGM client library to be at least the host
+# engine's version. The Agent reports the running engine's version
+# (``nvidia-dcgm/version=<v>``); host mode compares it with the client of the
+# release's exporter (the DCGM half of its image tag). Advisory: a header line,
+# no verdict.
+CLIENT_IMAGE = "nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless"
+DIGEST = "sha256:" + "d" * 64
+
+
+def _versioned(node: str, version: str | None) -> dict[str, Any]:
+    agent = _agent(node, {"active": "active", "enabled": "enabled"})
+    if version is not None:
+        agent["collector_services"][f"nvidia-dcgm/version={version}"] = {
+            "active": "active",
+            "enabled": "enabled",
+        }
+    return agent
+
+
+def _version_cluster() -> dict[str, Any]:
+    return {
+        "agents": [
+            _versioned("node-a", "4.7.0"),
+            _versioned("node-b", "4.6.1"),
+            _versioned("node-c", "4.6.0"),
+            _versioned("node-d", None),
+        ]
+    }
+
+
+def test_host_mode_names_engines_newer_than_the_exporters_client() -> None:
+    live = dcgm_hostengine_live(_version_cluster(), "host", "4.6.1")
+
+    assert {name: entry.get("version") for name, entry in live["nodes"].items()} == {
+        "node-a": "4.7.0",
+        "node-b": "4.6.1",
+        "node-c": "4.6.0",
+        "node-d": None,
+    }, "each node's running engine as its Agent reports it; an older Agent none"
+    assert live["exporter_client_version"] == "4.6.1"
+    assert live["newer_than_client_nodes"] == ["node-a"], (
+        "4.7.0 > 4.6.1 breaks NVIDIA's connection requirement"
+    )
+    assert live["unpaired_nodes"] == ["node-c"], (
+        "4.6.0 < 4.6.1 meets the requirement but is no supported pair"
+    )
+    assert live["down_nodes"] == []
+    unknown = dcgm_hostengine_live(_version_cluster(), "host")
+    assert unknown["exporter_client_version"] == "unknown"
+    assert unknown["newer_than_client_nodes"] == [], (
+        "an exporter whose client version is unknown judges no node"
+    )
+    embedded = dcgm_hostengine_live(_version_cluster(), "embedded", "4.6.1")
+    assert "newer_than_client_nodes" not in embedded, (
+        "the embedded exporter runs its own engine: no host engine is its peer"
+    )
+
+
+def test_the_status_header_names_engines_newer_than_the_client() -> None:
+    cluster = _version_cluster()
+    cluster["dcgm_hostengine_live"] = dcgm_hostengine_live(cluster, "host", "4.6.1")
+
+    assert dcgm_hostengine_lines({"clusters": {"gpu-eks": cluster}}) == [
+        "DCGM host engine newer than the exporter's DCGM client 4.6.1 on gpu-eks "
+        "(host mode, Agent heartbeats): node-a 4.7.0; NVIDIA requires the client "
+        "to be at least the host engine version (https://docs.nvidia.com/"
+        "datacenter/dcgm/latest/installation/install-dcgm-exporter.html"
+        "#requirements-and-version-compatibility; administrator operations §5.0.1)"
+    ], "one advisory line; the unpaired 4.6.0 node is in the details only"
+
+
+@pytest.mark.parametrize(
+    ("image", "identity", "client"),
+    [
+        pytest.param(CLIENT_IMAGE, {}, "4.6.1", id="tag"),
+        pytest.param(
+            f"nvcr.io/nvidia/k8s/dcgm-exporter@{DIGEST}",
+            {
+                "images": {
+                    "dcgm_exporter": {
+                        "reference": f"nvcr.io/nvidia/k8s/dcgm-exporter@{DIGEST}",
+                        "source": CLIENT_IMAGE,
+                    }
+                }
+            },
+            "4.6.1",
+            id="locked-digest",
+        ),
+        pytest.param(
+            f"mirror.example/dcgm-exporter@{DIGEST}",
+            {
+                "images": {
+                    "dcgm_exporter": {
+                        "reference": f"nvcr.io/nvidia/k8s/dcgm-exporter@{DIGEST}",
+                        "source": CLIENT_IMAGE,
+                    }
+                }
+            },
+            "4.6.1",
+            id="mirror-of-the-locked-digest",
+        ),
+        pytest.param(
+            "mirror.example/dcgm-exporter@sha256:" + "e" * 64,
+            {
+                "images": {
+                    "dcgm_exporter": {
+                        "reference": f"nvcr.io/nvidia/k8s/dcgm-exporter@{DIGEST}",
+                        "source": CLIENT_IMAGE,
+                    }
+                }
+            },
+            None,
+            id="another-digest",
+        ),
+        pytest.param("nvcr.io/nvidia/k8s/dcgm-exporter:4.8.4", {}, None, id="bare"),
+    ],
+)
+def test_the_client_is_read_from_the_release_exporter_image(
+    image: str, identity: dict[str, Any], client: str | None
+) -> None:
+    report = {"clusters": {"eks-host": _version_cluster()}}
+    release = SimpleNamespace(
+        dcgm_exporter_image=image,
+        config=SimpleNamespace(
+            release_delivery_identity=identity,
+            clusters=[
+                SimpleNamespace(
+                    cluster_id="eks-host",
+                    provider="eks-managed",
+                    dcgm_hostengine="host",
+                )
+            ],
+        ),
+    )
+
+    annotate_dcgm_hostengine_live(report, release)
+
+    live = report["clusters"]["eks-host"]["dcgm_hostengine_live"]
+    assert live["exporter_client_version"] == (client or "unknown"), (
+        "the DCGM half of the exporter's tag, through the image lock's source "
+        "tag when the release pins the locked digest"
+    )
+    assert live["newer_than_client_nodes"] == (["node-a"] if client else []), live

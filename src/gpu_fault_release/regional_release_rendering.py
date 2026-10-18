@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any, Mapping
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
 from gpu_fault.admin.config import AdminConfig
+from gpu_fault.admin.dcgm_exporter_release import DCGM_EXPORTER_IMAGE
 from gpu_fault.cluster_scope import cluster_provider, is_eks_managed, node_selector
 from gpu_fault_release import regional_deployment_inventory as inventory
 from gpu_fault_release import repository_root
@@ -58,7 +59,10 @@ ROOT = repository_root()
 if TYPE_CHECKING:
     from gpu_fault_release.rollout import RegionalRelease
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
-DEFAULT_DCGM_EXPORTER_IMAGE = "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04"
+#: The exporter the checked-in DaemonSet names, and the text the renderer
+#: replaces with the release image: one constant with the EKS host DCGM pin
+#: (``gpu_fault.admin.dcgm_exporter_release``).
+DEFAULT_DCGM_EXPORTER_IMAGE = DCGM_EXPORTER_IMAGE
 #: What the checked-in DaemonSet carries in place of the instance-type list.
 SUPPORTED_INSTANCE_TYPES_PLACEHOLDER = "REPLACE_WITH_SUPPORTED_INSTANCE_TYPES"
 #: The exporter's counters CSV, relative to the repository root: the file the
@@ -225,6 +229,13 @@ def render_dcgm_exporter_manifest(
     ):
         if placeholder in text:
             raise ReleaseError(f"DCGM exporter manifest still carries {placeholder}")
+    if image not in text:
+        # The checked-in image is the text the release image replaces: a
+        # manifest naming another one would ship it instead, by tag.
+        raise ReleaseError(
+            "DCGM exporter manifest does not name "
+            f"{DEFAULT_DCGM_EXPORTER_IMAGE}, so {image} cannot replace it"
+        )
     if cluster_provider(provider) is ClusterProvider.EKS_MANAGED:
         mode = cluster_dcgm_hostengine(
             None, provider=provider, mode=dcgm_hostengine or ""

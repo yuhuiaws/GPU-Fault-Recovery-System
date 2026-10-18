@@ -106,7 +106,10 @@ runtime_missing=${#missing_prerequisites[@]}
 # match the driver and an nv-hostengine nvidia-dcgm.service does not own, which
 # a HyperPod node only reports (WARN; the AMI is not ours to rebuild). The
 # embedded mode needs no host engine at all, because the exporter starts its
-# own and two engines on one node fight over the GPUs.
+# own and two engines on one node fight over the GPUs. A running engine's own
+# version (dcgmi -v, "Hostengine build info") is reported as "version": NVIDIA
+# requires the exporter's DCGM client library to be at least that version, and
+# the release compares the two (gpu_fault.dcgm_versions).
 dcgm_member=""
 dcgm_remedy=""
 dcgm_conflicts=()
@@ -117,7 +120,8 @@ classify_dcgm_hostengine() {
     local packages line major majors=() smi driver_major="" pids pid unit
     local processes="" unmanaged=() owned=() engine_runs="false" discovery="skipped"
     local status mismatch="false" state conflict="false" packages_json=""
-    local installed=""
+    local installed="" version="" version_report
+    local version_pattern='Hostengine build info:[[:space:]]*Version[[:space:]]*:[[:space:]]*([0-9]+[.][0-9]+[.][0-9]+)'
     if [[ "${provider}" != "eks-managed" ||
         "${GPU_FAULT_DCGM_HOSTENGINE:-}" == "host" ]]; then
         mode="host"
@@ -165,6 +169,10 @@ classify_dcgm_hostengine() {
         host_shell "timeout 30 dcgmi discovery -l >/dev/null 2>&1" || status=$?
         discovery="ok"
         if (( status != 0 )); then discovery="exit ${status}"; fi
+        version_report="$(host_shell "timeout 10 dcgmi -v 2>/dev/null || true")"
+        if [[ "${version_report}" =~ ${version_pattern} ]]; then
+            version="${BASH_REMATCH[1]}"
+        fi
     fi
     for major in "${majors[@]}"; do
         packages_json="${packages_json:+${packages_json},}\"${major}\""
@@ -240,9 +248,10 @@ classify_dcgm_hostengine() {
         done
         if (( ${#dcgm_conflicts[@]} > 0 )); then conflict="true"; fi
     fi
-    dcgm_member="$(printf '"dcgm":{"mode":"%s","state":"%s","service":{"active":"%s","enabled":"%s"},"dcgmi":%s,"nv_hostengine":%s,"cuda_packages":[%s],"driver_cuda_major":"%s","processes":[%s],"discovery":"%s","conflict":%s}' \
+    dcgm_member="$(printf '"dcgm":{"mode":"%s","state":"%s","service":{"active":"%s","enabled":"%s"},"dcgmi":%s,"nv_hostengine":%s,"cuda_packages":[%s],"driver_cuda_major":"%s","processes":[%s],"discovery":"%s","version":"%s","conflict":%s}' \
         "${mode}" "${state}" "${active}" "${enabled}" "${dcgmi}" "${hostengine}" \
-        "${packages_json}" "${driver_major}" "${processes}" "${discovery}" "${conflict}")"
+        "${packages_json}" "${driver_major}" "${processes}" "${discovery}" \
+        "${version}" "${conflict}")"
 }
 classify_dcgm_hostengine
 for warning in "${dcgm_warnings[@]}"; do

@@ -15,11 +15,15 @@ it exists to stop. Both outages hit every GPU node at once:
   ``gpu-fault.io/dcgm-counters-sha256``, the digest of the CSV the ConfigMap is
   built from: a counters change is a template change and rolls the exporter
   one node at a time.
-* The pinned exporter (``dcgm-exporter:4.4.1-4.5.2``, go-dcgm ``a9c939c020ec``)
-  parses the CSV with Go's ``encoding/csv`` (``Comment='#'``) and calls
-  ``os.Exit(1)`` at startup on a record that is not exactly three fields (a
-  comma in the help text), on a field name its go-dcgm does not know, or on an
-  unknown Prometheus type: one bad line crash-loops the exporter everywhere.
+* The pinned exporter (``dcgm-exporter:4.6.1-4.8.4``, go-dcgm ``v1.4611.2``,
+  ``internal/pkg/counters/counter_config.go``) parses the CSV with Go's
+  ``encoding/csv`` (``Comment='#'``) and fails at startup on a record that is
+  not exactly three fields (a comma in the help text), on a field name its
+  go-dcgm does not know (``dcgm.GetFieldID``: the current map, then the legacy
+  one), on a retired PCIe throughput field, or on an unknown Prometheus type:
+  one bad line crash-loops the exporter everywhere. The field names are pinned
+  to what that go-dcgm resolves (:data:`PINNED_FIELD_IDS`), so an exporter
+  upgrade must re-read them.
 """
 
 from __future__ import annotations
@@ -34,7 +38,9 @@ import pytest
 import yaml
 
 from gpu_fault import dcgm_fields as DCGM_FIELDS
+from gpu_fault.admin import dcgm_exporter_release as EXPORTER_RELEASE
 from gpu_fault.collectors.gpu.dcgm import DCGM_METRICS
+from gpu_fault.dcgm_versions import exporter_tag_versions
 from gpu_fault_release import regional_gpu_bootstrap as BOOTSTRAP
 from gpu_fault_release import regional_release_rendering as RENDERING
 from gpu_fault_release.regional_release_config import ReleaseError
@@ -66,20 +72,86 @@ VARIANTS = (
     pytest.param({"provider": "eks-managed", "dcgm_hostengine": "host"}, id="eks-host"),
 )
 #: The Prometheus types the collector reads. The exporter also accepts
-#: histogram, summary and label; no DCGM field of this file is one of them.
+#: untyped and label; no DCGM field of this file is one of them.
 COUNTER_TYPES = frozenset({"gauge", "counter"})
-#: Names newer than the pinned exporter's go-dcgm: the fabric health fields
-#: (174, 175) and DCGM 4.6's rename of field 171. Each makes
-#: ``counters.GetCounterSet`` fail, and the exporter exits at startup.
-UNKNOWN_TO_THE_PINNED_EXPORTER = frozenset(
+#: The exporter release the field table below was read for, and its go-dcgm.
+PINNED_EXPORTER = ("4.6.1", "4.8.4")
+PINNED_GO_DCGM = "v1.4611.2"
+#: Every counters field as go-dcgm v1.4611.2's ``dcgm.GetFieldID`` resolves it
+#: (``pkg/dcgm/const_fields.go``: ``dcgmFields``, then ``legacyDCGMFields``).
+#: The exporter renders each under the name the CSV gives, so the collector's
+#: ``DCGM_METRICS`` keys stay valid; :data:`LEGACY_NAMES` are the deprecated
+#: aliases (DCGM 4.6/4.7 gave those fields unit-bearing names) that still
+#: resolve -- the first place to look when a newer go-dcgm drops one.
+PINNED_FIELD_IDS = {
+    "DCGM_FI_DEV_GPU_TEMP": 150,
+    "DCGM_FI_DEV_MEMORY_TEMP": 140,
+    "DCGM_FI_DEV_GPU_TEMP_LIMIT": 153,
+    "DCGM_FI_DEV_POWER_USAGE": 155,
+    "DCGM_FI_DEV_POWER_MGMT_LIMIT": 160,
+    "DCGM_FI_DEV_GPU_UTIL": 203,
+    "DCGM_FI_DEV_MEM_COPY_UTIL": 204,
+    "DCGM_FI_DEV_FB_USED": 252,
+    "DCGM_FI_DEV_FB_FREE": 251,
+    "DCGM_FI_DEV_SM_CLOCK": 100,
+    "DCGM_FI_DEV_MEM_CLOCK": 101,
+    "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS": 112,
+    "DCGM_FI_DEV_XID_ERRORS": 230,
+    "DCGM_FI_DEV_FABRIC_MANAGER_STATUS": 170,
+    "DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE": 171,
+    "DCGM_FI_DEV_ECC_SBE_VOL_TOTAL": 310,
+    "DCGM_FI_DEV_ECC_DBE_VOL_TOTAL": 311,
+    "DCGM_FI_DEV_ECC_SBE_AGG_TOTAL": 312,
+    "DCGM_FI_DEV_ECC_DBE_AGG_TOTAL": 313,
+    "DCGM_FI_DEV_RETIRED_SBE": 390,
+    "DCGM_FI_DEV_RETIRED_DBE": 391,
+    "DCGM_FI_DEV_RETIRED_PENDING": 392,
+    "DCGM_FI_DEV_ROW_REMAP_FAILURE": 395,
+    "DCGM_FI_DEV_ROW_REMAP_PENDING": 396,
+    "DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS": 394,
+    "DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS": 393,
+    "DCGM_FI_DEV_PCIE_REPLAY_COUNTER": 202,
+    "DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL": 409,
+    "DCGM_FI_DEV_NVLINK_CRC_DATA_ERROR_COUNT_TOTAL": 419,
+    "DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL": 429,
+    "DCGM_FI_DEV_NVLINK_RECOVERY_ERROR_COUNT_TOTAL": 439,
+    "DCGM_FI_DEV_NVLINK_ERROR_DL_CRC": 497,
+    "DCGM_FI_DEV_NVLINK_ERROR_DL_RECOVERY": 498,
+    "DCGM_FI_DEV_NVLINK_ERROR_DL_REPLAY": 499,
+    "DCGM_FI_DEV_POWER_VIOLATION": 240,
+    "DCGM_FI_DEV_THERMAL_VIOLATION": 241,
+}
+LEGACY_NAMES = frozenset(
     {
-        "DCGM_FI_DEV_FABRIC_HEALTH_MASK",
-        "DCGM_FI_DEV_FABRIC_HEALTH_SUMMARY",
-        "DCGM_FI_DEV_FABRIC_MANAGER_ERROR",
-        # DCGM 4.6's name for field 153; the pinned go-dcgm knows
-        # DCGM_FI_DEV_GPU_TEMP_LIMIT only.
-        "DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS",
+        "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
+        "DCGM_FI_DEV_CORRECTABLE_REMAPPED_ROWS",
+        "DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE",
+        "DCGM_FI_DEV_GPU_TEMP",
+        "DCGM_FI_DEV_GPU_TEMP_LIMIT",
+        "DCGM_FI_DEV_GPU_UTIL",
+        "DCGM_FI_DEV_MEMORY_TEMP",
+        "DCGM_FI_DEV_NVLINK_CRC_DATA_ERROR_COUNT_TOTAL",
+        "DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL",
+        "DCGM_FI_DEV_NVLINK_ERROR_DL_CRC",
+        "DCGM_FI_DEV_NVLINK_ERROR_DL_RECOVERY",
+        "DCGM_FI_DEV_NVLINK_ERROR_DL_REPLAY",
+        "DCGM_FI_DEV_NVLINK_RECOVERY_ERROR_COUNT_TOTAL",
+        "DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL",
+        "DCGM_FI_DEV_PCIE_REPLAY_COUNTER",
+        "DCGM_FI_DEV_POWER_MGMT_LIMIT",
+        "DCGM_FI_DEV_POWER_USAGE",
+        "DCGM_FI_DEV_RETIRED_DBE",
+        "DCGM_FI_DEV_RETIRED_PENDING",
+        "DCGM_FI_DEV_RETIRED_SBE",
+        "DCGM_FI_DEV_ROW_REMAP_FAILURE",
+        "DCGM_FI_DEV_UNCORRECTABLE_REMAPPED_ROWS",
+        "DCGM_FI_DEV_XID_ERRORS",
     }
+)
+#: Fields the pinned exporter refuses outright ("is no longer supported"), the
+#: retired PCIe throughput fields 200 and 201.
+REFUSED_BY_THE_PINNED_EXPORTER = frozenset(
+    {"DCGM_FI_DEV_PCIE_TX_THROUGHPUT", "DCGM_FI_DEV_PCIE_RX_THROUGHPUT"}
 )
 #: Fields 170 and 171, both in the pinned go-dcgm's map (DCGM_FT_INT64).
 FABRIC_MANAGER_FIELDS = (
@@ -384,11 +456,18 @@ def test_the_counters_csv_parses_the_way_the_pinned_exporter_reads_it() -> None:
         f"fields listed twice: {repeated}; a DCGM field is one metric family and "
         "must be listed once"
     )
-    unknown = sorted(UNKNOWN_TO_THE_PINNED_EXPORTER.intersection(names))
-    assert not unknown, (
-        f"{unknown} are unknown to the pinned exporter's go-dcgm (a9c939c020ec): "
-        "counters.GetCounterSet fails and the exporter calls os.Exit(1) on every "
-        "GPU node; DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE is the name it knows"
+    assert sorted(names) == sorted(PINNED_FIELD_IDS), (
+        f"every counters field must be one the pinned exporter's go-dcgm "
+        f"({PINNED_GO_DCGM}) resolves -- an unknown name fails GetCounterSet and "
+        "the exporter exits on every GPU node. Read the new field's id from that "
+        "go-dcgm's pkg/dcgm/const_fields.go into PINNED_FIELD_IDS: "
+        f"added {sorted(set(names) - set(PINNED_FIELD_IDS))}, "
+        f"removed {sorted(set(PINNED_FIELD_IDS) - set(names))}"
+    )
+    refused = sorted(REFUSED_BY_THE_PINNED_EXPORTER.intersection(names))
+    assert not refused, (
+        f"{refused} are retired PCIe fields the pinned exporter refuses at "
+        "startup; DCGM_FI_PROF_PCIE_TX_BYTES / _RX_BYTES replace them"
     )
     kinds = {fields[0]: fields[1] for _number, fields in records}
     for field in FABRIC_MANAGER_FIELDS:
@@ -433,9 +512,10 @@ def test_the_fabric_manager_fields_are_never_required_of_an_exporter() -> None:
 def test_the_tlimit_margin_is_exported_as_a_gauge_and_never_required() -> None:
     """Field 153 is the reading the T.Limit thresholds grade (batch 134).
 
-    DCGM 4.1.0 added it ("Add a field to track the TLIMIT"), the pinned go-dcgm
-    maps DCGM_FI_DEV_GPU_TEMP_LIMIT to 153, and both host engines of the site
-    are newer. An exporter without it only loses the margin grading: the GPU
+    DCGM 4.1.0 added it ("Add a field to track the TLIMIT"), DCGM 4.6 renamed it
+    DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS, the pinned go-dcgm still resolves the
+    4.1 name to 153 (a deprecated alias), and both host engines of the site
+    are newer than 4.1.0. An exporter without it only loses the margin grading: the GPU
     core is graded on its absolute reading again.
     """
 
@@ -455,4 +535,79 @@ def test_the_tlimit_margin_is_exported_as_a_gauge_and_never_required() -> None:
     )
     assert "gpu_tlimit_c" not in DCGM_FIELDS.DCGM_CORE_CANONICAL_FIELDS, (
         "a scrape without the margin must not report a missing required field"
+    )
+
+
+def test_the_field_table_was_read_for_the_pinned_exporter() -> None:
+    """An exporter upgrade re-reads the names: the table names its release."""
+
+    assert (
+        exporter_tag_versions(EXPORTER_RELEASE.DCGM_EXPORTER_IMAGE) == PINNED_EXPORTER
+    ), (
+        f"the exporter moved off {PINNED_EXPORTER}: re-read every counters field "
+        "from the new release's go-dcgm (go.mod) const_fields.go, then update "
+        "PINNED_EXPORTER, PINNED_GO_DCGM, PINNED_FIELD_IDS and LEGACY_NAMES"
+    )
+    assert LEGACY_NAMES <= set(PINNED_FIELD_IDS), (
+        "a deprecated alias that is not a counters field is a stale entry"
+    )
+    for field in FABRIC_MANAGER_FIELDS:
+        assert field in DCGM_METRICS, (
+            f"{field}: the exporter renders a field under its CSV name, the "
+            "collector maps that name"
+        )
+    assert set(PINNED_FIELD_IDS) <= set(DCGM_METRICS), (
+        "every exported field is one the collector maps (metric family = CSV name): "
+        f"{sorted(set(PINNED_FIELD_IDS) - set(DCGM_METRICS))}"
+    )
+
+
+#: The pinned exporter's flags and environment variables the product uses, as
+#: ``pkg/cmd/app.go`` of dcgm-exporter 4.8.4 declares them: name, alias, env.
+PINNED_EXPORTER_OPTIONS = {
+    "address": ("a", "DCGM_EXPORTER_LISTEN"),
+    "collect-interval": ("c", "DCGM_EXPORTER_INTERVAL"),
+    "collectors": ("f", "DCGM_EXPORTER_COLLECTORS"),
+    "remote-hostengine-info": ("r", "DCGM_REMOTE_HOSTENGINE_INFO"),
+}
+
+
+@pytest.mark.parametrize("options", VARIANTS)
+def test_the_exporter_is_started_only_with_options_the_pinned_release_knows(
+    options: dict[str, str],
+) -> None:
+    """urfave/cli exits on an unknown flag; an unknown variable is ignored.
+
+    The ``-r`` value is the ``host:port`` form, which every DCGM 4 client
+    accepts; the ``tcp://``/``unix://``/``vsock://`` URI forms need DCGM 4.5 on
+    both sides, and the HyperPod AMI's engine is not ours to pin.
+    """
+
+    (container,) = _daemonset(_render(**options))["spec"]["template"]["spec"][
+        "containers"
+    ]
+    aliases = {alias for alias, _env in PINNED_EXPORTER_OPTIONS.values()}
+    flags = [item for item in container.get("args") or () if item.startswith("-")]
+    assert "command" not in container, (
+        "the image's entrypoint must start the exporter: the distroless image has "
+        "no shell utilities a replacement command could rely on"
+    )
+    assert {item.lstrip("-") for item in flags} <= aliases | set(
+        PINNED_EXPORTER_OPTIONS
+    ), f"{flags}: a flag the pinned exporter does not declare makes it exit"
+    environment = {
+        item["name"]: item.get("value") for item in container.get("env") or ()
+    }
+    known = {env for _alias, env in PINNED_EXPORTER_OPTIONS.values()}
+    exporter_variables = {name for name in environment if name.startswith("DCGM_")}
+    assert exporter_variables <= known, (
+        f"{sorted(exporter_variables - known)} are not variables the pinned "
+        "exporter reads: the setting would be silently ignored"
+    )
+    remote = environment.get("DCGM_REMOTE_HOSTENGINE_INFO")
+    if remote is not None:
+        assert re.fullmatch(r"127\.0\.0\.1:5555", remote), remote
+    mounts = {item["mountPath"] for item in container.get("volumeMounts") or ()}
+    assert environment["DCGM_EXPORTER_COLLECTORS"] in mounts, (
+        "the exporter reads the counters CSV the ConfigMap mounts"
     )

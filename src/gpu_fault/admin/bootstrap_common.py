@@ -24,6 +24,7 @@ from gpu_fault.admin.command_log import (
     sensitive_error_lines,
 )
 from gpu_fault.admin.bootstrap_task_inputs import TaskInputSpec
+from gpu_fault.admin.dcgm_exporter_release import DCGM_EXPORTER_IMAGE
 from gpu_fault.admin.deploy_limits import DEPLOY_CONCURRENCY
 from gpu_fault.admin.diagnostics import diagnostic_command, diagnostic_text
 from gpu_fault.admin.execution import (
@@ -51,7 +52,7 @@ ARN_PATTERN = re.compile(
 SAFE_NAME = re.compile(r"[^A-Za-z0-9-]+")
 DEFAULT_RUNTIME_IMAGE = "public.ecr.aws/docker/library/python:3.12-slim"
 DEFAULT_NODE_INSTALLER_IMAGE = "public.ecr.aws/amazonlinux/amazonlinux:2023"
-DEFAULT_DCGM_IMAGE = "nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04"
+DEFAULT_DCGM_IMAGE = DCGM_EXPORTER_IMAGE
 NODE_ALLOWED_OPERATIONS = (
     "COLLECT_HUNG_TRIAGE,COLLECT_DIAGNOSTIC_BUNDLE,"
     "RUN_DCGM_DIAGNOSTIC,QUIESCE_GPU_SERVICES,"

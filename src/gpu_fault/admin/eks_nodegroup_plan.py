@@ -47,6 +47,10 @@ from typing import Any
 
 from gpu_fault.admin.bootstrap_common import Arn, BootstrapError, CommandRunner
 from gpu_fault.admin.bootstrap_ownership import eks_nodegroup_facts
+from gpu_fault.admin.dcgm_exporter_release import (
+    DCGM_EXPORTER_DCGM_VERSION,
+    DCGM_EXPORTER_IMAGE,
+)
 from gpu_fault.admin.eks_nodegroup_nodes import inventory_commands
 from gpu_fault.admin.eks_nodegroup_update_strategy import (
     UPDATE_STRATEGY_MINIMAL,
@@ -79,6 +83,7 @@ from gpu_fault.admin.eks_nodegroup_user_data import (
     restart_dropin,
 )
 from gpu_fault.cluster_scope import OWNERSHIP_LABEL
+from gpu_fault.dcgm_versions import DcgmVersionRelation, dcgm_version_relation
 from gpu_fault.eks_node_repair import NODE_REPAIR_DISABLED, node_repair_state
 from gpu_fault.gpu_instance_inventory import GPU_INSTANCE_INVENTORY
 
@@ -87,6 +92,7 @@ __all__ = [
     "GroupPlan",
     "Step",
     "aws_command",
+    "dcgm_pairing_finding",
     "plan_group",
     "read_cluster",
     "select_nodegroups",
@@ -275,6 +281,9 @@ class GroupPlan:
         ]
         if self.strategy.get("finding"):
             lines.append(f"{self.name}: {self.strategy['finding']}")
+        pairing = dcgm_pairing_finding(self.pin)
+        if pairing:
+            lines.append(f"{self.name}: {pairing}")
         nodes = self.nodes or {}
         if nodes.get("outcome") == "unavailable":
             lines.append(
@@ -282,6 +291,38 @@ class GroupPlan:
             )
         lines += [f"{self.name}: nodes: {line}" for line in nodes.get("findings", ())]
         return lines
+
+
+def dcgm_pairing_finding(pin: DcgmPin | None) -> str | None:
+    """Why a host-mode pin is not the DCGM the product's exporter is paired with.
+
+    NVIDIA requires the exporter's DCGM client library to be at least the host
+    engine's version, and supports the paired version only
+    (``gpu_fault.dcgm_versions``). The pin of a node group prepared earlier is
+    kept on a re-run, so a pin older or newer than the exporter's is named
+    with the flag that pairs it; nothing for the paired pin or no pin.
+    """
+
+    if pin is None:
+        return None
+    relation = dcgm_version_relation(pin.value, DCGM_EXPORTER_DCGM_VERSION)
+    if relation is DcgmVersionRelation.PAIRED:
+        return None
+    exporter = (
+        f"the DCGM client {DCGM_EXPORTER_DCGM_VERSION} of the product's exporter "
+        f"{DCGM_EXPORTER_IMAGE}"
+    )
+    if relation is DcgmVersionRelation.HOST_NEWER:
+        why = (
+            f"the DCGM pin {pin.value} is newer than {exporter}; NVIDIA requires the "
+            "client to be at least the host engine version"
+        )
+    else:
+        why = (
+            f"the DCGM pin {pin.value} is not the version paired with {exporter}; "
+            "NVIDIA supports the paired version only"
+        )
+    return f"{why}: plan with --dcgm-version {DCGM_PACKAGE_VERSION}"
 
 
 def _roll_note(
@@ -874,6 +915,17 @@ def plan_group(
             "installs": pin.describe() if pin else "no DCGM host packages",
             # Host mode writes it before enabling nvidia-dcgm (the managed part).
             **({"restart_dropin": restart_dropin()} if pin else {}),
+            # The exporter dials this engine: its DCGM client and the pairing.
+            **(
+                {
+                    "exporter_dcgm_client": DCGM_EXPORTER_DCGM_VERSION,
+                    "exporter_pairing": dcgm_version_relation(
+                        pin.value, DCGM_EXPORTER_DCGM_VERSION
+                    ).value,
+                }
+                if pin
+                else {}
+            ),
         },
         script=script,
         merge=merge,

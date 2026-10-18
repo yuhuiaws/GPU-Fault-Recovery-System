@@ -3,9 +3,9 @@
 The case measures from the load-start receipt the probe writes right before it
 execs ``dcgmproftester`` to the Store's ``ingested_at`` of the first accepted
 power candidate. The stages in between, read off the pinned sources --
-dcgm-exporter ``4.4.1-4.5.2``, its go-dcgm ``a9c939c020ec``, DCGM 4.4.1 (the
-exporter's embedded engine) and 4.6.1 (the nearest public source of the node
-host engines) -- are the same in the exporter's embedded and host
+dcgm-exporter ``4.6.1-4.8.4``, its go-dcgm ``v1.4611.2`` and DCGM 4.6.1 (the
+exporter's embedded engine, and the nearest public source of the node host
+engines) -- are the same in the exporter's embedded and host
 (``DCGM_REMOTE_HOSTENGINE_INFO``) modes:
 
 1. NVML. DCGM reads the power through ``nvmlDeviceGetPowerUsage``, a 1-s average
@@ -19,7 +19,10 @@ host engines) -- are the same in the exporter's embedded and host
    DCGM appends a limit on change only when the limit is set through DCGM.
    Up to one exporter collect interval.
 3. The exporter adds no sampler of its own: ``/metrics`` gathers on request
-   and reads DCGM's cached latest values (no live flag, no field update).
+   (overlapping scrapes are coalesced into one gather) and reads DCGM's cached
+   latest values (``dcgmEntityGetLatestValues``: no live flag, no field
+   update; only a profiling-watch re-arm forces one, and the product exports
+   no profiling field).
 4. Collector. One scrape per tick. The loop sleeps the interval after each
    tick's work, so ticks are the interval plus that work apart; the cadence
    jitter does not touch this tick (it moves the health summary, the inventory

@@ -171,6 +171,7 @@ def test_al2023_node_without_python312_and_strace_fails_with_one_full_verdict(
             "driver_cuda_major": "",
             "processes": [],
             "discovery": "skipped",
+            "version": "",
             "conflict": False,
         },
     }, "the machine-readable verdict names every missing prerequisite at once"
@@ -263,6 +264,9 @@ class DcgmNode:
     enabled: str = "disabled"
     processes: tuple[tuple[int, str], ...] = ()
     discovery_status: int = 0
+    #: What ``dcgmi -v`` prints after its own build info: the running engine's
+    #: block (DCGM 4.6 prints nothing for an unreachable one).
+    hostengine_info: str = "Hostengine build info:\\nVersion : 4.6.0\\nBuild ID : 9\\n"
 
 
 #: The six states of an eks-managed GPU node, one installation each.
@@ -316,6 +320,10 @@ def _host_bodies(node: DcgmNode) -> dict[str, str]:
         or "exit 1\n",
         "dcgmi": (
             f'[[ "$1 ${{2:-}}" == "discovery -l" ]] && exit {node.discovery_status}\n'
+            'if [[ "$1" == -v ]]; then\n'
+            "  printf '\\nLocal build info:\\nVersion : 4.6.1\\nBuild ID : 12\\n\\n'\n"
+            f"  printf '{node.hostengine_info}'\n"
+            "fi\n"
             "exit 0\n"
         ),
         "timeout": 'shift\nexec "$@"\n',
@@ -431,8 +439,9 @@ def test_the_dcgm_member_describes_the_node(tmp_path: Path) -> None:
         "driver_cuda_major": "13",
         "processes": [{"pid": 4242, "unit": "nvidia-dcgm.service"}],
         "discovery": "ok",
+        "version": "4.6.0",
         "conflict": False,
-    }, "the deploy sees which engine the node runs and who owns it"
+    }, "the deploy sees which engine the node runs, who owns it, and its version"
     unmanaged = _dcgm_host(tmp_path / "unmanaged", STATES["unmanaged-hostengine"])
     dcgm = _verdict(
         _run(
@@ -603,3 +612,61 @@ def test_a_hyperpod_refusal_lists_the_runtime_tools_with_a_working_engine(
         "ERROR: host prerequisites unavailable: /usr/bin/python3.12, strace; "
         "install them on the node image before joining"
     ), result.stderr
+
+
+# --- the running engine's version (batch 135) ---------------------------------
+#
+# NVIDIA requires the exporter's DCGM client to be at least the host engine's
+# version. The verdict reports the version the running engine gives `dcgmi -v`
+# ("Hostengine build info"); the release compares it with the exporter's client.
+
+
+@pytest.mark.parametrize(
+    ("info", "version"),
+    [
+        pytest.param(
+            "Hostengine build info:\\nVersion : 4.7.0\\nBuild ID : 3\\n",
+            "4.7.0",
+            id="dcgm-4.7-engine",
+        ),
+        pytest.param(
+            "Hostengine build info not available: could not connect to hostengine "
+            "at localhost: Host engine connection invalid/disconnected\\n",
+            "",
+            id="dcgm-4.7-unreachable",
+        ),
+        pytest.param("", "", id="dcgm-4.6-silent"),
+    ],
+)
+def test_the_verdict_reports_the_running_engines_version(
+    tmp_path: Path, info: str, version: str
+) -> None:
+    node = DcgmNode(
+        active="active",
+        enabled="enabled",
+        processes=((4242, UNIT_CGROUP),),
+        hostengine_info=info,
+    )
+    result = _run(
+        tmp_path, _dcgm_host(tmp_path, node), provider="hyperpod", dcgm_hostengine=None
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _verdict(result)["dcgm"]["version"] == version, (
+        "the engine's own version, never the dcgmi binary's (4.6.1 in the stub); "
+        "nothing when the engine does not answer"
+    )
+
+
+def test_no_engine_no_version_and_no_dcgmi_v(tmp_path: Path) -> None:
+    root = _dcgm_host(tmp_path, STATES["installed-inactive"])
+    marker = root / "dcgmi-v-called"
+    stub = root / "bin" / "dcgmi"
+    body = stub.read_text(encoding="utf-8")
+    probe = 'if [[ "$1" == -v ]]; then\n'
+    assert probe in body, "the dcgmi stub answers -v"
+    stub.write_text(body.replace(probe, f'{probe}  : > "{marker}"\n'), encoding="utf-8")
+    result = _run(tmp_path, root, provider="eks-managed", dcgm_hostengine="embedded")
+
+    assert _verdict(result)["dcgm"]["version"] == ""
+    assert not marker.exists(), "a stopped engine is never asked"

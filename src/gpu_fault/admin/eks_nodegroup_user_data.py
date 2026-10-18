@@ -40,6 +40,7 @@ from email.parser import HeaderParser
 from typing import Any
 
 from gpu_fault.admin.bootstrap_common import BootstrapError
+from gpu_fault.admin.dcgm_exporter_release import DCGM_HOST_PACKAGE_VERSION
 from gpu_fault.cluster_scope import DCGM_HOSTENGINE_LABEL as _DCGM_LABEL
 from gpu_fault.cluster_scope import DcgmHostEngine
 
@@ -89,8 +90,11 @@ DCGM_HOSTENGINE_LABEL = _DCGM_LABEL
 DCGM_HOSTENGINE_HOST = DcgmHostEngine.HOST.value
 #: The mode of a node group without the label: the exporter's own engine.
 DCGM_HOSTENGINE_EMBEDDED = DcgmHostEngine.EMBEDDED.value
-#: The DCGM 4 build host mode installs unless ``--dcgm-version`` names another.
-DCGM_PACKAGE_VERSION = "4.7.0-2"
+#: The DCGM 4 build host mode installs unless ``--dcgm-version`` names another:
+#: the DCGM version the product's exporter is paired with
+#: (``gpu_fault.admin.dcgm_exporter_release``), so the exporter's client library
+#: is never older than the engine it dials and the pair is NVIDIA's supported one.
+DCGM_PACKAGE_VERSION = DCGM_HOST_PACKAGE_VERSION
 DCGM_CORE_PACKAGE = "datacenter-gpu-manager-4-core"
 DCGM_CUDA_PACKAGE_PREFIX = "datacenter-gpu-manager-4-cuda"
 DCGM_SERVICE = "nvidia-dcgm"

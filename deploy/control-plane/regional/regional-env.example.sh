@@ -46,7 +46,7 @@ export GPU_FAULT_RDS_CA_BUNDLE='/etc/gpu-fault/rds/ca-bundle.pem'
 
 export GPU_FAULT_RUNTIME_IMAGE='public.ecr.aws/docker/library/python:3.12-slim'
 export GPU_FAULT_NODE_INSTALLER_IMAGE='public.ecr.aws/amazonlinux/amazonlinux:2023'
-export GPU_FAULT_DCGM_EXPORTER_IMAGE='nvcr.io/nvidia/k8s/dcgm-exporter:4.4.1-4.5.2-ubuntu22.04'
+export GPU_FAULT_DCGM_EXPORTER_IMAGE='nvcr.io/nvidia/k8s/dcgm-exporter:4.6.1-4.8.4-distroless'
 export GPU_FAULT_ADOT_IMAGE='REPLACE_WITH_APPROVED_ADOT_IMAGE'
 
 regional_require() {

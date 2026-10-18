@@ -18,6 +18,7 @@ from gpu_fault.collector_kinds import (
     collector_silent_thresholds as collector_silent_thresholds,
 )
 from gpu_fault.cluster_scope import DCGM_HOSTENGINE_UNIT, FABRIC_MANAGER_UNIT
+from gpu_fault.dcgm_versions import is_hostengine_version_key
 from gpu_fault.env import env_bool
 from gpu_fault.models import StrictModel
 from gpu_fault.telemetry import CollectorKind
@@ -92,12 +93,22 @@ class CollectorServiceState(StrictModel):
 RECORDED_UNITS = frozenset(
     {*COLLECTOR_SYSTEMD_UNITS.values(), DCGM_HOSTENGINE_UNIT, FABRIC_MANAGER_UNIT}
 )
+#: Entries kept by shape rather than name: the host engine's version
+#: (``nvidia-dcgm/version=<v>``, ``gpu_fault.dcgm_versions``), which ``status``
+#: compares with the exporter's DCGM client. One only: a map naming two
+#: versions reports none.
+RECORDED_UNIT_SHAPES = (is_hostengine_version_key,)
 
 
 def validate_collector_services(value):
     if not isinstance(value, dict):
         return value
-    return {unit: state for unit, state in value.items() if unit in RECORDED_UNITS}
+    kept = {unit: state for unit, state in value.items() if unit in RECORDED_UNITS}
+    for shape in RECORDED_UNIT_SHAPES:
+        matched = [unit for unit in value if shape(unit)]
+        if len(matched) == 1:
+            kept[matched[0]] = value[matched[0]]
+    return kept
 
 
 CollectorServices = Annotated[

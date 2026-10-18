@@ -27,12 +27,22 @@ flips and roll what depends on it:
   a release committed; after a refused flip was committed by a ``sync-state``
   from the attempt's own site (live 2026-10-17: exporter embedded, record and
   digest host, ``next deploy: NOOP``) only the exporter still told the truth.
+
+The engine's version against the exporter's DCGM client library
+(``gpu_fault.dcgm_versions``): the node preflight reads each running engine's
+version and the release keeps it with the node's state; in host mode it also
+keeps the client version of the release's exporter (``exporter_client_version``,
+the DCGM half of its image tag) and names, with a ``WARN`` line, every node
+whose engine is newer than that client -- NVIDIA's connection requirement.
+Advisory: no node and no release is refused for it (see
+``newer_hostengine_warning``).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
+import sys
 from datetime import UTC, datetime
 from typing import Any, Iterable, Mapping
 
@@ -43,6 +53,13 @@ from gpu_fault.cluster_scope import (
     cluster_provider,
     dcgm_hostengine,
     dcgm_hostengine_source,
+)
+from gpu_fault.dcgm_versions import (
+    NVIDIA_EXPORTER_COMPATIBILITY_URL,
+    DcgmVersionRelation,
+    dcgm_version,
+    dcgm_version_relation,
+    exporter_tag_versions,
 )
 from gpu_fault.node_installer_rendering import INSTALLER_DCGM_HOSTENGINE_ANNOTATION
 from gpu_fault_release.regional_deployment_inventory import GPU_RECONCILER_DEPLOYMENT
@@ -61,6 +78,7 @@ __all__ = [
     "daemonset_dcgm_hostengine",
     "dcgm_hostengine_drift",
     "dcgm_hostengines_digest",
+    "exporter_client_version",
     "exporter_served_mode",
     "live_dcgm_hostengines_digest",
     "reconciler_served_mode",
@@ -68,6 +86,7 @@ __all__ = [
     "sync_state_dcgm",
     "forward_dcgm_hostengine",
     "installed_dcgm_hostengine_matches",
+    "newer_hostengine_warning",
     "node_dcgm_details",
     "record_node_dcgm_states",
     "recorded_dcgm_hostengines_digest",
@@ -464,21 +483,38 @@ def record_node_dcgm_states(
     state = getattr(release, "state", None)
     if not isinstance(state, dict) or not isinstance(observed, Mapping):
         return None
-    nodes = {
-        str(name): {
+    nodes: dict[str, dict[str, Any]] = {}
+    for name, value in sorted(observed.items()):
+        if not isinstance(value, Mapping):
+            continue
+        nodes[str(name)] = {
             "state": str(value.get("state") or "unknown"),
             "conflict": value.get("conflict") is True,
         }
-        for name, value in sorted(observed.items())
-        if isinstance(value, Mapping)
-    }
+        version = dcgm_version(value.get("version"))
+        if version is not None:
+            nodes[str(name)]["version"] = version
     if not nodes:
         return None
-    record = {
-        "mode": dcgm_hostengine(target).value,
+    mode = dcgm_hostengine(target)
+    record: dict[str, Any] = {
+        "mode": mode.value,
         "observed_at": (now or datetime.now(UTC)).isoformat(),
         "nodes": nodes,
     }
+    if mode is DcgmHostEngine.HOST and any(
+        "version" in item for item in nodes.values()
+    ):
+        client = exporter_client_version(release)
+        record["exporter_client_version"] = client or "unknown"
+        newer = newer_hostengine_nodes(nodes, client)
+        if newer:
+            record["hostengine_newer_than_client_nodes"] = newer
+            print(
+                newer_hostengine_warning(target, nodes, newer, client),
+                file=sys.stderr,
+                flush=True,
+            )
     recorded = state.get(NODE_DCGM_STATE_KEY)
     clusters = dict(recorded) if isinstance(recorded, Mapping) else {}
     clusters[str(target.cluster_id)] = record
@@ -570,4 +606,86 @@ def node_dcgm_details(
         if value.get("conflict") is True
         or (mode is DcgmHostEngine.HOST and value.get("state") != HOST_READY_STATE)
     )
+    versions = {
+        name: str(value["version"])
+        for name, value in sorted(observed.items())
+        if value.get("version")
+    }
+    if versions:
+        details["dcgm_hostengine_versions"] = versions
+    if "exporter_client_version" in cluster:
+        details["dcgm_exporter_client_version"] = cluster.get("exporter_client_version")
+        details["dcgm_hostengine_newer_than_client_nodes"] = sorted(
+            str(item)
+            for item in cluster.get("hostengine_newer_than_client_nodes") or ()
+        )
     return details
+
+
+# --- the engine's version against the exporter's DCGM client ------------------
+
+
+def exporter_client_version(release: Any) -> str | None:
+    """The DCGM client library version of ``release``'s exporter, or None.
+
+    The DCGM half of its image tag (``<dcgm>-<exporter>-<variant>``); a
+    digest-pinned image (every schema v3 release) is read through the image
+    lock's ``source`` tag when the digest is the locked one. An image whose tag
+    does not follow NVIDIA's scheme (a private mirror by digest alone, the bare
+    ``4.8.4``) names no version.
+    """
+
+    image = str(getattr(release, "dcgm_exporter_image", "") or "")
+    versions = exporter_tag_versions(image)
+    if versions is None and "@sha256:" in image:
+        identity = getattr(
+            getattr(release, "config", None), "release_delivery_identity", None
+        )
+        images = identity.get("images") if isinstance(identity, Mapping) else None
+        locked = images.get("dcgm_exporter") if isinstance(images, Mapping) else None
+        if isinstance(locked, Mapping):
+            reference = str(locked.get("reference") or "")
+            if reference.rpartition("@sha256:")[2] == image.rpartition("@sha256:")[2]:
+                versions = exporter_tag_versions(locked.get("source"))
+    return None if versions is None else versions[0]
+
+
+def newer_hostengine_nodes(nodes: Mapping[str, Any], client: str | None) -> list[str]:
+    """The nodes whose recorded engine version is newer than ``client``."""
+
+    return sorted(
+        str(name)
+        for name, value in nodes.items()
+        if isinstance(value, Mapping)
+        and dcgm_version_relation(value.get("version"), client)
+        is DcgmVersionRelation.HOST_NEWER
+    )
+
+
+def newer_hostengine_warning(
+    target: Any, nodes: Mapping[str, Any], newer: Iterable[str], client: str | None
+) -> str:
+    """The release's ``WARN`` line for engines newer than the exporter's client.
+
+    Advisory, never a refusal: the exporter still connects and metrics still
+    flow (NVIDIA: mismatched combinations "might function"), a HyperPod AMI's
+    engine is not the release's to change, and refusing would also refuse the
+    release that brings a newer exporter. The remedy is the provider's.
+    """
+
+    names = ", ".join(
+        f"{name} {(nodes.get(name) or {}).get('version')}" for name in newer
+    )
+    remedy = (
+        f"install DCGM {client} on the node group "
+        f"(gpu-fault-admin prepare-eks-nodegroup --dcgm-hostengine host --dcgm-version {client}) "
+        "or deploy an exporter whose DCGM is at least the engine's"
+        if _is_eks(target)
+        else "the AMI ships the engine: deploy an exporter whose DCGM is at least the engine's"
+    )
+    return (
+        f"WARN  DCGM host engine newer than the exporter's DCGM client {client or 'unknown'} "
+        f"on {target.cluster_id}: {names}; NVIDIA requires the exporter's DCGM client "
+        f"library to be at least the host engine version ({NVIDIA_EXPORTER_COMPATIBILITY_URL}); "
+        f"{remedy} (administrator operations §5.0.1)"
+    )
