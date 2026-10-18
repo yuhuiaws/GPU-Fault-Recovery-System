@@ -6132,21 +6132,16 @@ test_cases:
   problem: >-
     同节点两张卡各报一次 RESET_GPU，若各自建 workflow 就会出现两次 STOP 与 RESTART。
   injection: >-
-    node-A 的 GPU-a 与 GPU-b 分别上报 RESET_GPU， 分别在 reset 未提交与 reset 已有 execution 两种时点注入。
+    node-A 的 GPU-a 与 GPU-b 分别上报 RESET_GPU，分别在 node-A 的 QUIESCE 下发之前、QUIESCE 下发之后与 reset 已有 execution 三种时点注入。
   expected:
-  - RESET step 尚未提交时合并为一个 step，目标 GPU 集合包含两张卡
+  - node-A 的 QUIESCE 尚未下发时合并为一个 reset step，目标 GPU 集合包含两张卡
   - 不生成第二个 workflow，也不产生第二次 STOP 与 RESTART
-  - 只完成 FREEZE/MARK/QUIESCE 时仍按 reset 未提交处理
+  - 只完成 FREEZE/MARK/STOP 时仍按 reset 未提交处理
+  - QUIESCE 一旦下发（WAITING 或已完成）即按 reset 已提交处理，该窗口的 QUIESCE/VERIFY/RESET/RESTORE 保持下发时的 GPU 范围
   - RESET step 已有 WAITING 或 LEASED execution 后不改写已提交 command
-  - 新增 GPU 进入同一 attempt DAG 的后续恢复阶段，join 仍只有一个
+  - 新增 GPU 进入同一 attempt DAG 的节点后继分支，带自己的 quiesce 窗口，join 仍只有一个
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: 08565043352062f1a49ea9956042f3e3997387673e0941fa05987a8e130296e8
-      components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+    verdict: NOT_RUN
   automation: command
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-preempt-021同节点同级不同gpu
   execution:
@@ -6162,7 +6157,9 @@ test_cases:
   - pytest
   - -q
   - tests/orchestration/test_cross_fault_arbitration.py::test_dag_widens_unstarted_same_rank_branch_for_another_gpu
+  - tests/orchestration/test_cross_fault_arbitration.py::test_dag_queues_a_same_node_successor_branch_once_the_quiesce_ran
   - tests/orchestration/test_cross_fault_arbitration.py::test_dag_appends_same_node_successor_after_branch_started
+  - tests/orchestration/test_post_quiesce_same_node_merge.py
 - id: GF-REGIONAL-PREEMPT-022
   title: 仲裁必须是 branch-local，不被别的节点污染
   category: regional-preemption

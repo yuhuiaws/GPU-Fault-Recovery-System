@@ -7566,13 +7566,27 @@ The new event creates an independent workflow; it is serialized conservatively a
 
 ### GF-REGIONAL-PREEMPT-021: Same node, same rank, different GPUs
 
-- Setup: GPU-a and GPU-b on node-A each report `RESET_GPU`.
+- Setup: GPU-a and GPU-b on node-A each report `RESET_GPU`; the second fault arrives before node-A's
+  `QUIESCE_GPU_SERVICES` is dispatched, after it is dispatched (the QUIESCE in flight or done, the VERIFY behind it in
+  flight or done), and after the RESET has an execution.
 - Verdict:
-  - while the RESET step is not yet submitted, they must merge into one step whose target GPU set is
-    `{GPU-a,GPU-b}`; no second workflow or second STOP/RESTART may be generated.
-  - when the workflow is already RUNNING but has completed only FREEZE/MARK/QUIESCE, it is still handled as "reset not submitted".
-  - once the RESET step has a WAITING/LEASED execution, the submitted command must not be rewritten; the added GPU enters
-    the later recovery phase of the same attempt DAG, and there is still only one join.
+  - while node-A's QUIESCE is not yet dispatched (no execution record, not completed), they must merge into one reset step
+    whose target GPU set is `{GPU-a,GPU-b}`, the QUIESCE/VERIFY/RESTORE of the same window widened with it; no second
+    workflow or second STOP/RESTART may be generated. When the workflow is already RUNNING but has completed only
+    FREEZE/MARK/STOP, it is still handled as "reset not submitted".
+  - once the QUIESCE is dispatched, the window is committed and handled as "reset submitted": the QUIESCE and every later
+    step of that node on the same branch keep the node and GPU scope they were dispatched with and must not be rewritten
+    (`orchestration/reset_window.py`). That QUIESCE released persistence and swept clients for the GPUs it named only, the
+    `nvidia-persistenced` the window kept still holds every other GPU's device node, and the Node Agent refuses a QUIESCE
+    with another target set for the same incident; with remote step batching the VERIFY, RESET and RESTORE are passengers
+    of that QUIESCE's compound command, carrying the scope they had when it was minted.
+  - once the RESET step has a WAITING/LEASED execution, the submitted command must not be rewritten either. In both cases
+    the added GPU enters a node successor branch of the same attempt DAG (`branch:<node>:successor:<n>`, event
+    `BRANCH_SUCCESSOR_QUEUED`) with a quiesce window of its own -- cordon, QUIESCE, VERIFY, RESET, RESTORE, VALIDATE,
+    scheduling restore -- run after the first window's branch restored scheduling; there is still only one join, it
+    depends on both branches' `RESTORE_SCHEDULING`, and the job restarts once. Without a join (an idle node) the added GPU
+    is queued as a successor workflow (`predecessor_workflow_id` names the original workflow).
+  - a same-rank event with no GPU identity does not widen a dispatched window; the record stays as it was.
 
 
 ### GF-REGIONAL-PREEMPT-022: Same-node branch-local rank
@@ -11896,9 +11910,11 @@ BDF must show no kernel-sourced reset row at all (this case has no GPU reset any
     restored). The single-node `RESET_GPU` step itself never parks in WAITING, so "a physical step in progress"
     means the **physical step sequence** is in flight, not that a reset call is interrupted; "preempted halfway through
     a reset call" is unreachable in the current implementation and no assertion should be written on it.
-  - The disposition of the second XID 46 is `ABSORB` for the same GPU UUID and `WIDEN_IN_PLACE` when there is no UUID or a different card.
-    The **observable outcome** of both is the same (same incident, same workflow,
-    unchanged step table); this case only asserts these shared observations, not the disposition label.
+  - The disposition of the second XID 46 is `ABSORB` for the same GPU UUID and `WIDEN_IN_PLACE` when there is no UUID (no
+    GPU identity, nothing to widen). The **observable outcome** of both is the same (same incident, same workflow,
+    unchanged step table); this case only asserts these shared observations, not the disposition label. The case injects
+    the same card; for a different card the QUIESCE is already dispatched and the window committed, so the second card is
+    queued as a successor workflow with a quiesce window of its own (`GF-REGIONAL-PREEMPT-021`), outside this case's shape.
   - `SUPERSEDED` is persisted when the preempted workflow's executor next reaches a step boundary,
     so it may lag the creation of the successor workflow by up to one lease period; the runner budgets for this;
     readers must not treat this lag as a defect.

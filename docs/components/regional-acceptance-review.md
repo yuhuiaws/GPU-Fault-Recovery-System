@@ -3104,15 +3104,15 @@ Current catalog: non-destructive; pytest; NOT_RUN.
 
 Current catalog: non-destructive; command; NOT_RUN.
 
-- Purpose: Same-node equal-rank second GPU widens unsubmitted reset, otherwise appends protected successor branch.
-- Runner: tests/orchestration/_cross_fault_arbitration_cases_2.py
-- Entry Points: catalog command is python3 -m pytest with two nodeids, three parameter variants
-- Assertions: Single reset with both GPUs before submission, including completed QUIESCE; After WAITING execution, old step/execution untouched, second GPU reset appended and dependent; one STOP/restart
+- Purpose: Same-node equal-rank second GPU widens a reset window whose QUIESCE is not yet dispatched, otherwise appends a protected successor branch with a quiesce window of its own.
+- Runner: tests/orchestration/_cross_fault_arbitration_cases_2.py; tests/orchestration/test_post_quiesce_same_node_merge.py
+- Entry Points: catalog command is python3 -m pytest with three nodeids (four variants) and the module tests/orchestration/test_post_quiesce_same_node_merge.py
+- Assertions: Single reset with both GPUs before the QUIESCE is dispatched, including completed FREEZE/MARK/STOP; once the QUIESCE is dispatched (waiting or done, VERIFY waiting or done) or the RESET has a WAITING execution, the window's steps/executions untouched, second GPU's window appended as a successor branch and dependent; idle node queues a successor workflow; one STOP/restart
 - Safety And Cleanup: Synthetic ASGI/Memory, no actual remote command or GPU reset
 - Necessity: Useful precise submitted/unsubmitted distinction; shared helper use is not duplicate coverage.
 - Overlap: case_ids: GF-REGIONAL-CMD-018; GF-REGIONAL-PREEMPT-018; classification: different_layer; rationale: Planner preserves submitted step vs adapter holds sibling identity; dynamic nodes vs GPU scope.
-- Tests: tests/orchestration/test_cross_fault_arbitration.py::test_dag_widens_unstarted_same_rank_branch_for_another_gpu; tests/orchestration/test_cross_fault_arbitration.py::test_dag_appends_same_node_successor_after_branch_started
-- Findings At Review: No actual LEASED command raced against merge; WAITING execution is seeded
+- Tests: tests/orchestration/test_cross_fault_arbitration.py::test_dag_widens_unstarted_same_rank_branch_for_another_gpu; tests/orchestration/test_cross_fault_arbitration.py::test_dag_queues_a_same_node_successor_branch_once_the_quiesce_ran; tests/orchestration/test_cross_fault_arbitration.py::test_dag_appends_same_node_successor_after_branch_started; tests/orchestration/test_post_quiesce_same_node_merge.py
+- Findings At Review: No actual LEASED command raced against merge; WAITING execution is seeded; the compound command minted at QUIESCE is exercised end to end in tests/regional/test_post_quiesce_merge_batched.py, the Agent's window per GPU set in tests/node_agent/test_quiesce_window_per_gpu_set.py
 - Reviewer Handoff: reviewed_local_contract
 
 ### GF-REGIONAL-PREEMPT-022
