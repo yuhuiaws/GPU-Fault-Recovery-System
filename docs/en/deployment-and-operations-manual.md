@@ -8188,7 +8188,7 @@ gpu-fault-collector training-progress \
 | Environment variable | Default | Description |
 |---|---|---|
 | `GPU_FAULT_AFFECTED_WORKLOAD_IDS` | Empty | Comma-separated workload IDs; usually completed automatically by the control-plane topology |
-| `GPU_FAULT_WORKLOAD_STATE` | `UNKNOWN` | `UNKNOWN/IDLE/ACTIVE` |
+| `GPU_FAULT_WORKLOAD_STATE` | `UNKNOWN` | `UNKNOWN/IDLE/ACTIVE`; the deploy does not set it, and the control plane fills UNKNOWN from the attempt observations. `IDLE` is only for nodes that never run training: low CPU/GPU utilisation edges are no longer delivered and the two rules do not grade the node; `ACTIVE` is only a pre-filter and never replaces the managed attempt the control plane resolves |
 | `GPU_FAULT_CHECKPOINT_MANIFEST_REF` | Empty | Checkpoint manifest of the current workload |
 | `GPU_FAULT_GPU_UUIDS` | Empty | Comma-separated GPU UUIDs used by Training Progress |
 | `GPU_FAULT_KMSG_PATH` | `/dev/kmsg` | Kernel Collector input |
@@ -10161,7 +10161,9 @@ in pursuit of faster recovery.
 Zero traffic alone cannot distinguish a wedged collective from checkpoint writing or graph compilation, and
 `TrainingProgressCollector` requires the training script itself to write the progress file -- in multi-node torchrun jobs
 usually only individual ranks write logs, so it cannot be the sole per-node/per-rank basis. The Host
-Collector therefore reads three procfs files for every GPU compute process on this node in every collection period (default 15 s),
+Collector therefore reads three procfs files for every GPU compute process on this node in every collection period (default 15 s)
+(the process list comes from `nvidia-smi --query-compute-apps=pid,gpu_uuid`, which also yields the per-GPU
+`training_rank_cpu_percent` that `LOW_CPU_UTILIZATION` reads; see "Configuring Host Resource Persistent Hazard Monitoring" below),
 and the node side directly answers "how long ago was rank progress last seen":
 
 | Parameter | Default | Meaning |
@@ -10215,7 +10217,7 @@ export GPU_FAULT_LOCAL_FILESYSTEM_DURATION_SECONDS=60
 
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
-| `GPU_FAULT_LOW_UTILIZATION_THRESHOLD_PERCENT` | 5 | Upper bound of low CPU or single-GPU utilisation on an ACTIVE training node |
+| `GPU_FAULT_LOW_UTILIZATION_THRESHOLD_PERCENT` | 5 | Upper bound of the utilisation (`utilization.gpu`) of each GPU a managed attempt holds, and of the CPU of the training processes on that GPU (percent of one core, independent of the host's vCPU count) |
 | `GPU_FAULT_LOW_UTILIZATION_DURATION_SECONDS` | 300 | Continuous low-utilisation duration of one managed attempt (restarts from zero when another attempt or job takes over the node) |
 | `GPU_FAULT_HOST_NOTIFICATION_COOLDOWN_SECONDS` | 3600 | Email cooldown for the same node, job and signal |
 | `GPU_FAULT_MEMORY_AVAILABLE_WARNING_PERCENT` | 5 | Lower alert bound of `MemAvailable/MemTotal` |
@@ -10238,8 +10240,26 @@ gpu-fault-admin deploy --state-dir /secure/gpu-fault
 The old single-cluster path writes the same set of variables into the control-plane Deployment with `deploy/hyperpod/deploy.sh deploy` (Appendix A).
 
 Low CPU/GPU triggers only when the node is associated with an ACTIVE training job; the window is timed per managed attempt
-the control plane resolves, so a job that takes over the node never inherits its predecessor's low time. Low memory, high page cache and high local disk
-usage do not require a training job. The event action is fixed as `RUN_DIAGNOSTICS`, and neither node nor job is restarted automatically;
+the control plane resolves, so a job that takes over the node never inherits its predecessor's low time. Both rules grade
+only the GPUs that attempt's live containers on the node hold: for a job that holds part of a node, the unallocated GPUs and
+those of other workloads are never reported as idle. Which GPUs it holds comes from the GPU UUIDs the completion watcher
+reads for each container (the `gpu-fault.io/gpu-uuids` annotation, or, with `GPU_FAULT_DISCOVER_POD_GPU_UUIDS=true`,
+`nvidia-smi --query-gpu=uuid` run inside the running container, which needs `nvidia-smi` in the image and `pods/exec` for
+the watcher); without UUIDs, the attempt holds every GPU only when its declared `nvidia.com/gpu` covers the whole node,
+otherwise those GPUs are not graded and, once the attempt has run for a whole window, the control-plane log shows one
+WARNING `low CPU/GPU utilisation cannot grade every GPU of attempt ...`; restore the UUID source it names.
+`LOW_CPU_UTILIZATION` reads the per-GPU `training_rank_cpu_percent`: the CPU used by the processes holding a compute context
+on that GPU, in percent of one core, the same whether the host has 96 or 192 vCPUs; a healthy rank waiting on its GPU spins
+about one core (about 100 %), and a blocked attempt whose ranks all sit off-CPU reads near 0. It relies on the node's
+per-rank probe: with `GPU_FAULT_RANK_LIVENESS_ENABLED=false` there is no such sample and the rule never fires, and processes
+that burn CPU without using CUDA have none either. The host-wide `cpu_usage_percent` only feeds the 98 % saturation rule and
+VALIDATE_HOST. The node's low-utilisation delivery edges are per GPU and no longer depend on `GPU_FAULT_WORKLOAD_STATE` (the
+deploy does not set it; collectors report UNKNOWN and the control plane fills it from the attempt observations): only a node
+explicitly set to `IDLE` delivers none of these edges and is not graded by the two rules. The node-side edges use the
+collector's own `GPU_FAULT_LOW_UTILIZATION_THRESHOLD_PERCENT` (default 5; the node installer does not carry the
+control-plane value), so when the control plane uses another threshold, crossings between the two are seen only on health
+summaries. Low memory, high page cache and
+high local disk usage do not require a training job. The event action is fixed as `RUN_DIAGNOSTICS`, and neither node nor job is restarted automatically;
 the administrator email uses the `host-resource-event-zh-v1` fixed template. Findings of several GPUs of the same node in the same HostTelemetry batch
 are aggregated into one email, deduplicated by cluster, workload, node, signal and
 cooldown window; findings and evidence are still kept per device, without mass-sending per GPU.
@@ -10249,6 +10269,7 @@ Verify the Host Collector's raw reports:
 ```bash
 sudo journalctl -u gpu-fault-host-collector.service -n 100 --no-pager
 nvidia-smi --query-gpu=uuid,utilization.gpu --format=csv,noheader,nounits
+nvidia-smi --query-compute-apps=pid,gpu_uuid --format=csv,noheader,nounits
 awk '/MemTotal|MemFree|MemAvailable|Cached|SReclaimable|Shmem/ {print}' \
   /proc/meminfo
 df -PT / /var /tmp

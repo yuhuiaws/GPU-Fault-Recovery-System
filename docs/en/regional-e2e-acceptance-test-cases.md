@@ -13593,7 +13593,9 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
 - Purpose: the last item of the §12 gate.
 - Steps:
   1. Construct a sustained low-utilisation state on one 8-GPU node
-     (submit a job that uses only 1 GPU and keep it running longer than the detection window).
+     (submit a managed job that holds all 8 GPUs of the node and burns CPU only, and keep it running longer than the
+     detection window; the product grades only the GPUs a managed attempt holds, so a one-GPU job would be graded on that
+     one GPU and leave nothing to aggregate).
   2. Count the notifications generated within that window.
   3. Extend to 3 nodes with 24 GPUs and repeat the count.
 - Verdict: the notification count grows with the **number of nodes or jobs** (≤3),
@@ -13602,16 +13604,20 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
   detector never fired at all", so the runner additionally requires that **every selected node was
   reported in its own phase**, and asserts that **each notification points to exactly one node** and
   that **several GPUs appear in one notification** -- the sustained low-utilisation signal is tracked
-  per GPU device, an 8-GPU node produces 8 findings, and one mail covering all of them at once is the
-  very evidence of "aggregation"; the 24 in the verdict is the count without aggregation.
+  per GPU device, the 8 GPUs the attempt holds produce 8 findings, and one mail covering all of them at once is the
+  very evidence of "aggregation"; the 24 in the verdict is the count without aggregation. The runner also asserts that no
+  `LOW_CPU_UTILIZATION` mail names the phase's nodes (`cpu_rule_silent`): that rule reads the CPU of the processes holding
+  a compute context on a GPU (in percent of one core), and the CPU burners create no CUDA context, so there is nothing to
+  grade.
 - The signal is **latched**: it fires once per activation period of each managed attempt. Window and
   latch are both per attempt, so a job that takes over the node starts from zero and inherits neither
   its predecessor's low time nor its latch; the unscoped continuity window resets only when the node
   reports "no active workload" again. This yields three execution constraints; the runner implements
   them and manual execution must follow them too:
-  - There must be no **other** GPU-holding Pods on the selected nodes. Another managed job that holds
-    GPUs while idling leaves the node without a single managed attempt, so the signal never starts
-    timing and this case will never see a new notification no matter how long it waits; the runner
+  - There must be no **other** GPU-holding Pods on the selected nodes. The fixture needs all 8 GPUs of
+    each node, so any other GPU holder keeps it from scheduling; another managed job also leaves the node
+    without a single managed attempt, so the signal never starts timing and this case will never see a
+    new notification no matter how long it waits; the runner
     lists the GPU-holding Pods on the selected nodes before each phase starts and refuses to execute
     outright, instead of producing an unattributable FAIL a dozen minutes later.
   - The two phases share nodes, so **leave a gap between phases**: after the job is deleted an idle
@@ -13627,7 +13633,8 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
     it as the detector not firing.
   - Notifications must not be awaited with a fixed sleep, because the wait time is two stages in
     series, not one detection window: the signal starts its timer only after a delivery batch with
-    "active workload + GPU near zero"; and the host collector's edge filter subtracts **already active**
+    "active workload + GPU near zero" (each GPU's low-utilisation crossing is an edge reason of its own,
+    `sustained:host_gpu_utilization_percent:<GPU UUID>`); and the host collector's edge filter subtracts **already active**
     edge reasons from the delivery reasons (`_edge_reasons`'s `reasons - self._active_edge_reasons`),
     so after the first edge delivery the next telemetry batch is triggered only by the periodic health
     summary. Hence "the timer has covered one detection window" can only be seen on the next summary
@@ -13638,9 +13645,10 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
     `phase_deadline_seconds` (3 x detection window + 300 seconds)
     and records the result of every poll in `polls`.
   - On phase timeout the runner additionally records `silent_nodes` and those nodes'
-    `attempt_observations`: the premise for judging "sustained low utilisation" is that this telemetry
-    reported an ACTIVE workload, so whether the control plane actually saw the job land on that node is
-    the key evidence separating a detector defect from a job that never landed.
+    `attempt_observations` (with each container's `gpu_uuids`): the premise for judging "sustained low
+    utilisation" is that this telemetry reported an ACTIVE workload and that only the GPUs whose UUIDs the
+    containers list are graded, so whether the control plane actually saw the job land on that node, and read
+    its GPU UUIDs, is the key evidence separating a detector defect from a job that never landed.
 - Cleanup: each phase saves a private `*.ownership.json` recording the creation confirmation, UID and
   a deletion-only proof. First delete the controller with UID/resourceVersion preconditions and the
   `Orphan` policy, then delete its Pods with zero grace, to avoid the Job controller recreating them

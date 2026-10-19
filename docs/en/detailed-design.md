@@ -3151,6 +3151,9 @@ The bottleneck where accepted stalled at 11k-13k in the load test is in this lay
   `Cached + SReclaimable - Shmem` to avoid double-counting shared memory;
 - `nvidia-smi --query-gpu=uuid,utilization.gpu` to produce
   `host_gpu_utilization_percent` per GPU UUID;
+- `nvidia-smi --query-compute-apps=pid,gpu_uuid` plus each process's `/proc/<pid>/stat` to produce
+  `training_rank_cpu_percent` per GPU UUID: the CPU the processes holding a compute context on that GPU used since the
+  previous cycle, in percent of one core (the `top` %CPU convention; it can exceed 100);
 - `statvfs` on the mount points in `GPU_FAULT_FILESYSTEMS`, excluding NFS, Lustre, CIFS, Ceph, EFS and S3FS according to
   `/proc/self/mountinfo`, to produce
   `local_filesystem_used_percent`.
@@ -3175,12 +3178,62 @@ the previous attempt does not silence the next one. The unscoped key `cluster/no
 call as the continuity gate: a sample without exactly one managed attempt lands only on it and resets it; it is never
 latched, and a finding needs both windows to have run for the configured duration. The EFA-traffic rule needs no change:
 its state is already keyed by cluster/node/job/attempt and a new attempt starts in WARMUP
-(`tests/host_health/test_low_utilization_attempt_window.py`). The default rules are as follows:
+(`tests/host_health/test_low_utilization_attempt_window.py`).
+
+Both rules are graded per GPU, and only on the GPUs that attempt holds (`host_low_utilization.py`). Graded per node, a
+job holding one GPU of eight (DESTR-012 group D, or any partial-node job in production) left seven unallocated GPUs that
+read 0 % by definition, and after 300 s each was reported as "GPU idle while a training workload is active". The GPUs an
+attempt holds are the union of the `gpu_uuids` of its live containers on the node: the completion watcher reads the Pod's
+`gpu-fault.io/gpu-uuids` annotation or, without it, runs `nvidia-smi --query-gpu=uuid` inside the running container
+(`GPU_FAULT_DISCOVER_POD_GPU_UUIDS`, on by default). HyperPod and plain EKS go through the same Pod parsing, which yields
+the same UUIDs the host collector names its devices by (compared ignoring case and surrounding blanks)
+(`tests/host_health/test_low_utilization_provider_parity.py`). A GPU the attempt does not hold is an idle sample: it resets
+the unscoped continuity window and is never timed for the attempt. A container that declares more `nvidia.com/gpu` than it
+lists UUIDs leaves the allocation unresolved: if the GPUs the attempt declares on the node cover every GPU the node reports,
+it holds them all (the product requires Kubernetes allocatable to equal the host GPU inventory, otherwise it raises
+`gpu_kubernetes_allocatable_mismatch`), so a full-node job keeps its coverage when the UUID lookup failed; otherwise only
+the listed UUIDs are graded -- a missed finding rather than a false one. The gap is observable: a debug line per batch, and
+one WARNING per attempt and node once the attempt has run for a whole window (`low CPU/GPU utilisation cannot grade every
+GPU of attempt ...`) (`tests/host_health/test_low_utilization_owned_gpus.py`). Several managed attempts on one node still
+count as "no single attempt" and are not graded.
+
+`LOW_CPU_UTILIZATION` no longer reads the host-wide `cpu_usage_percent` (every CPU in `/proc/stat`). The live HyperPod
+`ml.p5en.48xlarge` nodes expose 96 vCPUs and plain EKS `p5en.48xlarge` nodes 192: eight ranks each spinning about one core
+while they wait on their GPU make the same healthy job read 8.3 % on the first and 4.2 % on the second, which is below 5 %
+and read as idle. The rule now reads `training_rank_cpu_percent`: the same threshold and window
+(`GPU_FAULT_LOW_UTILIZATION_THRESHOLD_PERCENT`/`_DURATION_SECONDS`), only the denominator is one core instead of the whole
+host, and it too is graded only on the GPUs the attempt holds, whatever the host's size. The query is the
+`--query-compute-apps=pid,gpu_uuid` the Node Agent already runs, and utime+stime cover the whole thread group; a process on
+several GPUs counts on each, and a process without a baseline yet gives no sample rather than a 0. The premise is CUDA's
+default scheduling, `cudaDeviceScheduleAuto` (https://docs.nvidia.com/cuda/cuda-runtime-api/group__CUDART__DEVICE.html, CUDA Runtime API Reference Manual 13.4, 6.3. Device Management >
+`cudaSetDeviceFlags`): "If C > P, then CUDA will yield to other OS threads when waiting for the device, otherwise CUDA will not yield while waiting for results and actively spin on the processor." A training process holds far fewer contexts than the host has logical CPUs, so a rank
+waiting on its GPU spins a core and reads near 100 %; a blocked attempt whose ranks all sit off-CPU (a dead data loader, a
+deadlock, I/O that never returns) reads near 0 and still trips the rule; NOTIFY-005's CPU-only burners create no CUDA
+context and leave nothing to grade; an idle node has neither a managed attempt nor a compute process. Known limitation: a
+healthy job that explicitly selects `cudaDeviceScheduleBlockingSync` (same page: "Instruct CUDA to block the CPU thread on a synchronization primitive when waiting for the device to finish work.") can read near 0 during
+long GPU steps and trips `LOW_CPU_UTILIZATION` as it did under the old rule (the action is FREEZE_EVIDENCE + VALIDATE_HOST
+only; the job is not stopped). Rejected alternatives: scaling the 5 % by the vCPU count or a busy-core threshold -- still a
+host-wide reading that co-tenant jobs and daemons decide, and a one-GPU job's single rank still reads as idle; the Pod
+cgroup's CPU against its request -- a new cgroup v1/v2 and cgroup-driver dependent reader, for a request that says nothing
+about how much CPU a waiting rank uses; counting CPU only while the GPU is idle as well -- that hides a hang in
+blocking-sync mode. The host-wide `cpu_usage_percent` still feeds the 98 % saturation rule and VALIDATE_HOST
+(`tests/collectors/test_low_cpu_rank_criterion.py` runs both on simulated 96- and 192-vCPU hosts).
+
+The delivery edges of low utilisation are per GPU (`collectors/host/collector.py`): `host_gpu_utilization_percent` or
+`training_rank_cpu_percent` at or below the threshold gives every GPU its own edge reason `sustained:<metric>:<device>`.
+The two reasons used to be computed only for a collector statically configured `GPU_FAULT_WORKLOAD_STATE=ACTIVE`, which no
+deploy path sets (the live HyperPod and plain EKS collectors report UNKNOWN and the control plane fills it from the
+topology), so low utilisation was never an edge and the windows could only be judged on health summaries 270-330 seconds
+apart; and a reason per metric name stays present while any unallocated GPU idles, so the held GPU's recovery could not be
+delivered either. Now every GPU's crossing is delivered unless the collector explicitly declares `IDLE`; a collector's
+first (baseline) delivery leaves these reasons out: idle GPUs read low from the first cycle, which is a state and not an
+edge, and with them every collector start would post evidence-class traffic instead of a routine baseline the spool can
+take (`tests/collectors/test_rank_cpu_and_low_utilization_edges.py`). The default rules are as follows:
 
 | Signal | Default threshold | Duration | Action |
 | --- | ---: | ---: | --- |
-| CPU utilization near 0 | `<=5%` | 300 seconds | `RUN_DIAGNOSTICS` |
-| Single-GPU utilization near 0 | `<=5%` | 300 seconds | `RUN_DIAGNOSTICS` |
+| CPU of the processes on a GPU the attempt holds near 0 (percent of one core) | `<=5%` | 300 seconds | `RUN_DIAGNOSTICS` |
+| Utilization of a single GPU the attempt holds near 0 | `<=5%` | 300 seconds | `RUN_DIAGNOSTICS` |
 | `MemAvailable` very low | `<=5%` | 60 seconds | `RUN_DIAGNOSTICS` |
 | page cache very high | `>=90%` | 300 seconds | `RUN_DIAGNOSTICS` |
 | Local filesystem usage very high | `>=90%` | 60 seconds | `RUN_DIAGNOSTICS` |

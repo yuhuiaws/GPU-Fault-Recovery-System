@@ -623,12 +623,13 @@ lines, the ~2 s cadence, the step counts and the total duration are unchanged, t
 draws far less than the power limit, and SIGTERM finishes the batch in flight, synchronizes and exits 143, so a stop
 leaves no kernel running on the GPU. The reason: a real training job keeps kernels running, while a heartbeat that only
 all-reduces one value and sleeps reads about 0 % `utilization.gpu` in `nvidia-smi`, which the product's
-`LOW_GPU_UTILIZATION` rule (any GPU of the node at or below 5 % for 300 s by default while a managed attempt is live
-there, each GPU graded on its own) correctly reports in any case that runs that long. The 10 ms period is far shorter than the shortest sample period
+`LOW_GPU_UTILIZATION` rule (any GPU a live managed attempt holds on the node at or below 5 % for 300 s by default,
+each GPU graded on its own) correctly reports in any case that runs that long. The 10 ms period is far shorter than the shortest sample period
 (1/6 s), so every sample reads about the duty. `0` restores the idle heartbeat; a case that needs idle GPUs sets it in its
 rendered manifest (`scripts/e2e/regional/acceptance_gpu_load.py::set_gpu_duty_percent`). The NOTIFY-005 CPU-only load,
 the warm-spare GPU holder Pod and the late-ownership CUDA holder stay GPU-idle by design; the one-GPU
-`xid11-single-node-job.yaml` keeps only its own GPU busy while the product still grades every other GPU of the node; and
+`xid11-single-node-job.yaml` keeps only its own GPU busy, and the node's seven other GPUs, which the attempt does not hold,
+are not graded; and
 COLLECT-021 deliberately SIGKILLs the training processes, which can land inside a batch. The copies in the manifests
 equal the canonical text in `scripts/e2e/regional/acceptance_gpu_load.py`, checked by
 `python3 -m scripts.e2e.regional.acceptance_gpu_load` (`--write` rewrites the copies).
@@ -667,7 +668,7 @@ event is created."
 | Out-of-band reboot | A node reboot that bypasses the HyperPod API | `systemd-run --on-active` runs `systemctl reboot` after a delay | DESTR-017 | `scripts/e2e/regional/probes/destr017_node_probe.py::arm_reboot` |
 | Disable the Node Agent or kubelet | The Agent stops registering, the node goes NotReady, the hot spare becomes unavailable | Arm the recovery timer first, then `systemctl disable` or `stop` | DESTR-008, DESTR-014, DESTR-019 | `scripts/e2e/regional/probes/warm_spare_node_probe.py::stop_with_failsafe`, `scripts/e2e/regional/probes/destr014_node_probe.py::disable_agent_restart`, `scripts/e2e/regional/probes/destr019_node_probe.py::restart_agent` |
 | Real quiesce and restore cycle | Stop fabricmanager, dcgm, persistenced and kubelet, then restore | Call the Node Agent's quiesce manager; or run `systemctl stop` in a chroot from a Manifest and restore on a timer | PREEMPT-012, the dual-node quiesce Manifest | `scripts/e2e/regional/probes/preempt012_node_probe.py`, `DEFAULT_QUIESCE_SERVICES` in `src/gpu_fault/node_agent/common.py` |
-| Real low-utilization training load | The `LOW_GPU_UTILIZATION` sustained rule | Submit a CPU-only burn PyTorchJob | NOTIFY-005 | `scripts/e2e/regional/notify005_checks.py::low_utilization_manifest` |
+| Real low-utilization training load | The `LOW_GPU_UTILIZATION` sustained rule (`LOW_CPU_UTILIZATION` stays silent) | Submit a CPU-only burn PyTorchJob that holds all 8 GPUs of each node and creates no CUDA context | NOTIFY-005 | `scripts/e2e/regional/notify005_checks.py::low_utilization_manifest` |
 
 ### 8.5 Control-Plane API Layer
 

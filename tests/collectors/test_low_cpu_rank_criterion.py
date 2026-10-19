@@ -19,9 +19,11 @@ from __future__ import annotations
 
 import subprocess
 from datetime import timedelta
+from pathlib import Path
 
 import pytest
 
+from gpu_fault import host_low_utilization as low_utilization
 from gpu_fault.collectors import HostTelemetryCollector
 from gpu_fault.host_health import NodeHealthPolicy
 from gpu_fault.models import WorkloadState
@@ -234,3 +236,20 @@ def test_an_idle_node_reads_no_rank_cpu_and_raises_nothing(tmp_path, monkeypatch
 
     assert not any(fired.values()), fired
     assert host_cpu and max(host_cpu) < 1
+
+
+def test_the_cpu_rules_cuda_premise_is_quoted_verbatim_in_both_editions():
+    """The premise -- a rank waiting on its GPU spins a core, a blocking-sync
+    job need not -- is NVIDIA's documented behaviour, cited where it is used."""
+
+    root = Path(__file__).resolve().parents[2]
+    for edition in ("docs/详细设计.md", "docs/en/detailed-design.md"):
+        text = " ".join((root / edition).read_text(encoding="utf-8").split())
+        for value in (
+            low_utilization.CUDA_SCHEDULING_REFERENCE,
+            low_utilization.CUDA_SCHEDULING_DOCS_VERSION,
+            *low_utilization.CUDA_SCHEDULING_SECTION,
+            low_utilization.CUDA_SCHEDULE_AUTO_QUOTE,
+            low_utilization.CUDA_SCHEDULE_BLOCKING_SYNC_QUOTE,
+        ):
+            assert value in text, f"{edition} does not cite {value!r}"
