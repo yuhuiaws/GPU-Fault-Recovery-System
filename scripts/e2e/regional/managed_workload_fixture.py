@@ -41,6 +41,7 @@ from scripts.e2e.regional.fixture_ownership import (  # noqa: E402
 from scripts.e2e.regional.workload_restart_custody import (  # noqa: E402
     RestartCustody,
     WorkloadOwnershipError,
+    unbound_restart_root,
 )
 
 
@@ -513,6 +514,8 @@ class ManagedWorkloadFixture:
         self.owned_uids: dict[tuple[str, str], str] = {}
         self.restart_custody: RestartCustody | None = None
         self.retired_pod_uids: set[str] = set()
+        #: Product restarts no custody bound that ``delete`` still removed.
+        self.unbound_restart_resources: set[str] = set()
         self.cleanup_snapshots: dict[tuple[str, str], CleanupCustody] = {}
         self.ownership: FixtureOwnership | None = None
         if state_path is not None:
@@ -612,12 +615,12 @@ class ManagedWorkloadFixture:
                 kind, name, uid = resource_identity(self.regional, document)
                 self.owned_uids[(kind, name)] = uid
             else:
-                self.adopt(document)
+                self.adopt_for_cleanup(document)
         for (kind, name), uid in self.owned_uids.copy().items():
             current = read_resource(self.regional, kind, name)
             if current is not None:
                 if not self.deletion_only(current):
-                    self.adopt(current)
+                    self.adopt_for_cleanup(current)
                 if resource_identity(self.regional, current)[2] != uid:
                     raise RegionalFixtureError("managed workload UID changed")
                 if current not in documents:
@@ -651,7 +654,7 @@ class ManagedWorkloadFixture:
         # An already-dispatched controller request can create a final child.
         remaining = self.inventory()
         for document in remaining:
-            self.adopt(document)
+            self.adopt_for_cleanup(document)
         for document in sorted(
             remaining,
             key=lambda item: priority[resource_identity(self.regional, item)[0]],
@@ -720,7 +723,7 @@ class ManagedWorkloadFixture:
                     "managed workload UID changed before deletion"
                 )
             if not self.deletion_only(current):
-                self.adopt(current)
+                self.adopt_for_cleanup(current)
             try:
                 delete_resource(
                     self.regional,
@@ -737,7 +740,7 @@ class ManagedWorkloadFixture:
                         "managed workload UID changed during deletion"
                     )
                 if not self.deletion_only(latest):
-                    self.adopt(latest)
+                    self.adopt_for_cleanup(latest)
                 if (
                     attempt == 2
                     or latest["metadata"]["resourceVersion"]
@@ -814,6 +817,41 @@ class ManagedWorkloadFixture:
                 document, lambda kind, name: read_resource(self.regional, kind, name)
             )
         self.owned_uids[(kind, name)] = uid
+
+    def adopt_for_cleanup(self, document: dict[str, Any]) -> None:
+        """``adopt``, or -- for deletion only -- a product restart never bound.
+
+        A case that failed before ``authorize_restart`` still has to remove the
+        copy the product's RESTART_WORKLOAD made of its workload; the lineage
+        rule is ``unbound_restart_root``. A resumable fixture keeps the strict
+        rule: its journal records what it created, never a product copy.
+        """
+
+        try:
+            self.adopt(document)
+        except WorkloadOwnershipError as strict:
+            if self.ownership is not None:
+                raise
+            kind, name, uid = resource_identity(self.regional, document)
+            try:
+                root = unbound_restart_root(
+                    document,
+                    namespace=self.regional.settings.namespace,
+                    owner=self.owner,
+                    job_id=self.settings.job_id,
+                    source_attempt_id=self.settings.attempt_id,
+                    known_uids=self.owned_uids,
+                    retired_uids=self.retired_pod_uids,
+                    read=lambda kind, name: read_resource(self.regional, kind, name),
+                )
+            except WorkloadOwnershipError as refused:
+                raise WorkloadOwnershipError(f"{strict}; {refused}") from refused
+            previous = self.owned_uids.get((kind, name))
+            if kind == "pod" and previous not in (None, uid):
+                self.retired_pod_uids.add(str(previous))
+            self.owned_uids[root[:2]] = root[2]
+            self.owned_uids[(kind, name)] = uid
+            self.unbound_restart_resources.add(f"{kind}/{name}")
 
     def require_served_kind(self) -> None:
         """Refuse by name when the GPU cluster does not serve the workload's API.

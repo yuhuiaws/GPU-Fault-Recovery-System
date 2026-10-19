@@ -361,3 +361,127 @@ class RestartCustody:
         raise WorkloadOwnershipError(
             "managed workload controller chain exceeds its bound"
         )
+
+
+#: The labels a managed fixture writes on every object it submits, Pod
+#: templates included; the product's RESTART_WORKLOAD copies them.
+OWNER_LABEL = "gpu-fault.io/acceptance-owner"
+JOB_LABEL = "gpu-fault.io/job-id"
+ATTEMPT_LABEL = "gpu-fault.io/attempt-id"
+OPERATION_ANNOTATION = "gpu-fault.io/operation-id"
+CONTROLLER_KINDS = frozenset({"Job", "PyTorchJob", "JobSet"})
+
+
+def cleanup_require(value: bool, reason: str) -> None:
+    if not value:
+        raise WorkloadOwnershipError(f"managed workload cleanup: {reason}")
+
+
+def unbound_restart_root(
+    document: dict[str, Any],
+    *,
+    namespace: str,
+    owner: str,
+    job_id: str,
+    source_attempt_id: str,
+    known_uids: Mapping[tuple[str, str], str],
+    retired_uids: set[str],
+    read: Callable[[str, str], dict[str, Any] | None],
+) -> tuple[str, str, str]:
+    """Cleanup-only lineage of a resource the restart custody never bound.
+
+    ``RestartCustody`` adopts a replacement only after the case has read the
+    completed product restart that made it. A case that fails before that read
+    still owns what the product restarted: live, COLLECT-021's death wait timed
+    out while the passive restart went ahead, and the cleanup refused the
+    ``-r-`` copy ("ownership or UID changed") before deleting anything, so the
+    source PyTorchJob and its restarted copy both stayed on the cluster.
+
+    Deletion asks less than adoption. Every object on the chain carries this
+    fixture's random owner nonce and job id (only this fixture's submission
+    writes the nonce; RESTART_WORKLOAD copies it) and either the source attempt
+    id or one the product derived from it (``<source[:52]>-r-<hash>``,
+    ``adapters/kubernetes/restart_operations.py``); a retired Pod UID never
+    comes back. The chain must end at a controller the fixture owns by UID or
+    at a restart copy: a new controller of the derived attempt whose
+    ``gpu-fault.io/operation-id`` names the RESTART_WORKLOAD that created it.
+    Returns the root controller; nothing here makes the resource a replacement
+    a case may count, which ``ManagedWorkloadFixture.adopt`` alone decides.
+    """
+
+    lineage = f"{source_attempt_id[:52]}-r-"
+    current = document
+    visited: set[tuple[str, str]] = set()
+    for _ in range(8):
+        metadata = current.get("metadata")
+        cleanup_require(isinstance(metadata, dict), "resource metadata is missing")
+        metadata = cast(dict[str, Any], metadata)
+        raw_kind, name, uid = (
+            current.get("kind"),
+            metadata.get("name"),
+            metadata.get("uid"),
+        )
+        cleanup_require(
+            raw_kind in {"Pod", *CONTROLLER_KINDS}
+            and isinstance(name, str)
+            and bool(name)
+            and isinstance(uid, str)
+            and bool(uid)
+            and metadata.get("namespace") == namespace,
+            "resource identity differs",
+        )
+        kind, name, uid = str(raw_kind).lower(), cast(str, name), cast(str, uid)
+        labels = metadata.get("labels") or {}
+        attempt = labels.get(ATTEMPT_LABEL) if isinstance(labels, dict) else None
+        cleanup_require(
+            isinstance(labels, dict)
+            and labels.get(OWNER_LABEL) == owner
+            and labels.get(JOB_LABEL) == job_id
+            and isinstance(attempt, str)
+            and (attempt == source_attempt_id or attempt.startswith(lineage)),
+            f"{kind}/{name} is neither this fixture's workload nor its restart",
+        )
+        cleanup_require(uid not in retired_uids, "a retired Pod UID reappeared")
+        cleanup_require((kind, name) not in visited, "controller chain cycles")
+        visited.add((kind, name))
+        if kind != "pod":
+            known = known_uids.get((kind, name))
+            if known is not None:
+                cleanup_require(known == uid, f"{kind}/{name} UID changed")
+                return kind, name, uid
+            annotations = metadata.get("annotations") or {}
+            cleanup_require(
+                cast(str, attempt).startswith(lineage)
+                and isinstance(annotations, dict)
+                and str(annotations.get(OPERATION_ANNOTATION) or "").endswith(
+                    "/RESTART_WORKLOAD"
+                ),
+                f"{kind}/{name} is not a product restart of this workload",
+            )
+            return kind, name, uid
+        owners = metadata.get("ownerReferences")
+        cleanup_require(
+            isinstance(owners, list)
+            and len(owners) == 1
+            and isinstance(owners[0], dict)
+            and owners[0].get("controller") is True
+            and owners[0].get("kind") in CONTROLLER_KINDS
+            and isinstance(owners[0].get("name"), str)
+            and isinstance(owners[0].get("uid"), str),
+            f"pod/{name} has no unique supported controller",
+        )
+        parent = cast(dict[str, Any], owners[0])
+        parent_key = (str(parent["kind"]).lower(), str(parent["name"]))
+        if known_uids.get(parent_key) == parent["uid"]:
+            # Already owned: no read, so a child left behind by a controller
+            # this cleanup deleted first is still recognized.
+            return parent_key[0], parent_key[1], str(parent["uid"])
+        parent_document = read(*parent_key)
+        cleanup_require(
+            parent_document is not None
+            and parent_document.get("apiVersion") == parent.get("apiVersion")
+            and (parent_document.get("metadata") or {}).get("uid") == parent["uid"],
+            f"pod/{name} controller reference changed",
+        )
+        current = cast(dict[str, Any], parent_document)
+    raise WorkloadOwnershipError("managed workload cleanup: controller chain too deep")

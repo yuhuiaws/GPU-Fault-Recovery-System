@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from copy import deepcopy
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -360,3 +361,103 @@ def test_restart_controller_walk_has_a_fixed_depth_limit(
     with pytest.raises(WorkloadOwnershipError, match="exceeds its bound"):
         fixture.adopt(child_pod)
     assert fixture.owned_uids == before
+
+
+RESTART_COPY = "-r-282771a2"
+
+
+def unbound_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> tuple[Any, Any, dict[str, Any], dict[str, Any]]:
+    """The live residue: the source failed, the product's passive restart made
+    ``<source>-r-<hash>`` and its Pods, and the case never bound that restart."""
+
+    fixture, api, rendered = harness(
+        tmp_path, monkeypatch, "manifests/training/xid11-three-node-pytorchjob.yaml"
+    )
+    fixture.submit_rendered(rendered)
+    source = api.objects[(fixture.resource, fixture.name)]
+    source_pod = pod(source, uid="source-pod")
+    api.add(source_pod)
+    fixture.pods()
+    state = restart_state(fixture, retry_parent_name=fixture.name + RESTART_COPY)
+    restarted = deepcopy(source)
+    restarted["metadata"].update(name=fixture.name + RESTART_COPY, uid="copy-uid")
+    apply_restart_metadata(restarted, state)
+    restarted = api.add(restarted)
+    copy_pod = pod(restarted, uid="copy-pod")
+    copy_pod["metadata"]["name"] = "training-copy"
+    api.add(copy_pod)
+    return fixture, api, source, restarted
+
+
+def test_cleanup_removes_a_product_restart_the_case_never_bound(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Live COLLECT-021 on plain EKS: the death wait timed out before the case
+    read the passive restart, and ``delete`` refused the restarted copy
+    ("managed workload ownership or UID changed") before deleting anything,
+    leaving the Failed source and the restarted copy on the cluster."""
+
+    fixture, api, source, restarted = unbound_restart(monkeypatch, tmp_path)
+    fixture.delete()
+    assert api.objects == {}, "the source, the copy and both Pods are gone"
+    assert {options["preconditions"]["uid"] for _k, _n, options in api.deletes} == {
+        source["metadata"]["uid"],
+        restarted["metadata"]["uid"],
+        "source-pod",
+        "copy-pod",
+    }
+    assert all(
+        options["propagationPolicy"] == "Orphan"
+        for kind, _name, options in api.deletes
+        if kind != "pod"
+    ), "controllers are orphaned before their Pods go, as for a bound restart"
+    assert fixture.unbound_restart_resources == {
+        f"pytorchjob/{fixture.name}{RESTART_COPY}",
+        "pod/training-copy",
+    }
+    assert fixture.restart_custody is None, "cleanup grants no restart custody"
+
+
+def test_an_in_place_restart_of_the_source_is_cleaned_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    fixture, api, rendered = harness(tmp_path, monkeypatch)
+    fixture.submit_rendered(rendered)
+    source = api.objects[(fixture.resource, fixture.name)]
+    api.add(pod(source, uid="old-pod"))
+    fixture.pods()
+    apply_restart_metadata(source, restart_state(fixture))
+    api.objects.pop(("pod", "training"))
+    api.add(pod(source, uid="new-pod"))
+    fixture.delete()
+    assert api.objects == {}
+    assert "old-pod" in fixture.retired_pod_uids, "the replaced Pod UID is retired"
+
+
+@pytest.mark.parametrize(
+    "defect", ["foreign-owner", "foreign-attempt", "no-restart-operation", "resuming"]
+)
+def test_cleanup_still_refuses_what_is_not_this_fixtures_restart(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, defect: str
+) -> None:
+    fixture, api, _source, restarted = unbound_restart(monkeypatch, tmp_path)
+    labels = restarted["metadata"]["labels"]
+    if defect == "foreign-owner":
+        labels["gpu-fault.io/acceptance-owner"] = "another-fixture"
+    elif defect == "foreign-attempt":
+        labels["gpu-fault.io/attempt-id"] = "another-attempt"
+    elif defect == "no-restart-operation":
+        restarted["metadata"]["annotations"].pop("gpu-fault.io/operation-id")
+    else:
+        fixture.ownership = SimpleNamespace()
+        with pytest.raises(WorkloadOwnershipError):
+            fixture.adopt_for_cleanup(restarted)
+        return
+    before = deepcopy(fixture.owned_uids)
+    with pytest.raises(WorkloadOwnershipError, match="managed workload cleanup"):
+        fixture.delete()
+    assert api.deletes == [], "nothing is deleted before the whole set is proven"
+    assert fixture.owned_uids == before
+    assert fixture.unbound_restart_resources == set()
