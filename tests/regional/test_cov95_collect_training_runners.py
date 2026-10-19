@@ -71,6 +71,42 @@ def test_full_case_uses_real_sections_then_cleans_owned_resources(
         assert names.count("cpu-read") == 2
 
 
+@pytest.mark.parametrize("training_case", [c021], indirect=True)
+def test_a_superseded_death_reading_is_proven_by_the_failure_containment(
+    training_case: Any,
+) -> None:
+    """Live on plain EKS the Store's reading of the killed attempt never again
+    listed the killed container after the containment deleted its Pod first:
+    RUNNING on the survivor, then the TIMED_OUT terminal with no container. The
+    case polled for that reading for 300 s and failed "the killed attempt
+    observation never went FAILED" although the product had opened the
+    attempt-failure containment naming rank 0's exit 137 a second after the kill.
+    """
+
+    harness = training_case
+    harness.problem = "superseded-death"
+    assert execute(harness) == 0, report(harness)
+    result = report(harness)
+    assert result["verdict"] == "PASS"
+    death = result["late_xid"]["death"]
+    assert death["proven_by"] == "failure_incident"
+    assert death["killed_rank"] == 0
+    names = [call[0] for call in harness.calls]
+    assert (
+        names.index("kill-workload")
+        < names.index("death-read")
+        < names.index("write-xid")
+    )
+    record = json.loads(
+        (harness.root / "cases" / c021.CASE_ID / "death-record.json").read_text()
+    )
+    assert record["failure_incident"]["reasons"][1:3] == [
+        "first_failed_rank=0",
+        "exit_code=137",
+    ]
+    assert record["observation"]["containers"], "the Store's own reading is kept"
+
+
 @pytest.mark.parametrize("training_case", [c016, c021], indirect=True)
 def test_restart_custody_rejection_prevents_pod_wait_and_preserves_cleanup(
     training_case: Any,

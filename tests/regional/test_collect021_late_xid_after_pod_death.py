@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import copy
 from argparse import Namespace
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -289,10 +290,25 @@ def test_an_unrelated_taint_is_not_ours() -> None:
 # --- runner: passive side ----------------------------------------------------
 
 
-def _death() -> dict[str, Any]:
-    dead = _observation(workload_phase="FAILED")
-    dead["containers"][0].update(terminated=True, exit_code=137)
-    return dead
+KILLED_AFTER = "2026-01-01T00:00:00+00:00"
+
+
+def _death(observation: dict[str, Any] | None = None) -> dict[str, Any]:
+    """A ``collect021_death`` record whose observation shows the death."""
+
+    if observation is None:
+        observation = _observation(workload_phase="FAILED")
+        observation["containers"][0].update(terminated=True, exit_code=137)
+    return {
+        "proven_by": "observation",
+        "recorded_at": "2026-01-01T00:00:10+00:00",
+        "cluster_id": "cluster-a",
+        "job_id": JOB_ID,
+        "killed_rank": 0,
+        "killed_after": KILLED_AFTER,
+        "observation": observation,
+        "failure_incident": None,
+    }
 
 
 def _restarted() -> dict[str, Any]:
@@ -328,6 +344,7 @@ def _restart_state() -> dict[str, Any]:
         attempt_id=ATTEMPT_ID,
         new_attempt_id="c021-1-a002",
         pods=_restarted()["pods"],
+        rank_exit_status=[{"rank": 0, "node_id": NODE, "exit_code": 137}],
     )
 
 
@@ -353,12 +370,29 @@ def test_passive_side_passes_on_the_documented_readings() -> None:
         ("kill", lambda k: k.__setitem__("killed", []), "killed"),
         (
             "death",
-            lambda d: d["containers"][0].update(terminated=True, exit_code=0),
+            lambda d: d["observation"]["containers"][0].update(
+                terminated=True, exit_code=0
+            ),
             "exit",
         ),
         # RUNNING with the killed container terminated is the failure-detected
         # reading and counts as Pod death; SUCCEEDED never does.
-        ("death", lambda d: d.__setitem__("workload_phase", "SUCCEEDED"), "phase"),
+        (
+            "death",
+            lambda d: d["observation"].__setitem__("workload_phase", "SUCCEEDED"),
+            "phase",
+        ),
+        # The death has to be on record before the late XID is written.
+        (
+            "death",
+            lambda d: d.__setitem__("recorded_at", "2026-01-01T00:02:00+00:00"),
+            "before the late XID",
+        ),
+        (
+            "restart_state",
+            lambda s: s["completion_event"].__setitem__("rank_exit_status", []),
+            "terminal event",
+        ),
         ("restarted", lambda r: r["pods"].pop(), "all 3 Running pods"),
         ("restarted", lambda r: r["pods"][0].__setitem__("uid", "s1"), "source"),
         (
@@ -378,7 +412,7 @@ def test_passive_side_passes_on_the_documented_readings() -> None:
         ),
         (
             "restart_state",
-            lambda s: s.__setitem__("observations", [_death()]),
+            lambda s: s.__setitem__("observations", [_death()["observation"]]),
             "observation",
         ),
     ],
@@ -392,13 +426,17 @@ def test_each_passive_reading_is_checked(field: str, mutate, fragment: str) -> N
     }
     mutate(inputs[field])
     errors = collect021.passive_errors(
-        source_uids={"s1", "s2", "s3"}, pod_uid=POD_UID, attempt_id=ATTEMPT_ID, **inputs
+        source_uids={"s1", "s2", "s3"},
+        pod_uid=POD_UID,
+        attempt_id=ATTEMPT_ID,
+        xid_injected_at=datetime(2026, 1, 1, 0, 1, tzinfo=timezone.utc),
+        **inputs,
     )
     assert any(fragment in item for item in errors), (fragment, errors)
 
 
 def test_stopped_phase_without_the_killed_container_is_not_process_death() -> None:
-    death = _observation(workload_phase="STOPPED", containers=[])
+    death = _death(_observation(workload_phase="STOPPED", containers=[]))
     errors = collect021.passive_errors(
         kill={"killed": [{"pid": 1, "comm": "python"}]},
         death=death,
@@ -572,7 +610,7 @@ def test_failure_detected_reading_with_the_killed_container_terminated_is_pod_de
     product's failure-detected observation; waiting for phase FAILED instead
     hands the late-XID window to the passive restart (live 2026-09-28)."""
 
-    death = _death()
+    death = _death()["observation"]
     death["workload_phase"] = "RUNNING"
     errors = collect021.death_observation_errors(
         death, node=None, job_id=None, attempt_id=ATTEMPT_ID, pod_uid=POD_UID
@@ -583,7 +621,7 @@ def test_failure_detected_reading_with_the_killed_container_terminated_is_pod_de
 def test_running_phase_without_the_terminated_killed_container_is_not_pod_death() -> (
     None
 ):
-    death = _death()
+    death = _death()["observation"]
     death["workload_phase"] = "RUNNING"
     for item in death["containers"]:
         if item.get("pod_uid") == POD_UID:

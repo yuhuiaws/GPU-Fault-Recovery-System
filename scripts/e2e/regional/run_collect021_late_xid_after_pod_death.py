@@ -39,6 +39,14 @@ from scripts.e2e.regional.collector_action_guard import (  # noqa: E402
     finite_seconds,
     require_action_time,
 )
+from scripts.e2e.regional.collect021_death import (  # noqa: E402
+    DEATH_PROBE as DEATH_PROBE,
+    death_observation_errors as death_observation_errors,
+    death_record_errors,
+    killed_pod_rank,
+    terminal_death_errors,
+    wait_death_record,
+)
 from scripts.e2e.regional.collect021_passive import (  # noqa: E402
     completion_chain_errors,
     wait_passive_completion,
@@ -75,6 +83,8 @@ CONFIRMATION = "COLLECT021_EXECUTE"
 # what is new, not the code.
 LATE_XID = 13
 QUARANTINE_TAINT_PREFIX = "gpu-fault.io"
+#: What the case result keeps of the death record; death-record.json has all.
+DEATH_SUMMARY_KEYS = ("proven_by", "recorded_at", "killed_rank", "killed_after")
 
 
 @dataclass(frozen=True)
@@ -377,11 +387,15 @@ def passive_errors(
     attempt_id: str,
     node: str | None = None,
     job_id: str | None = None,
+    xid_injected_at: datetime | None = None,
 ) -> list[str]:
     """The passive judgement: the attempt's own failure still restarts the job.
 
     The inactive MONITOR_ONLY XID leaves the source terminal event to the
     no-hardware-evidence restart plan and any required containment predecessor.
+    ``death`` is the ``collect021_death`` record: the product's failure
+    containment or an observation proved the killed Pod's non-zero exit before
+    the late XID, and the source terminal event names that rank's exit too.
     """
 
     errors: list[str] = []
@@ -396,12 +410,20 @@ def passive_errors(
     if not kill.get("killed"):
         errors.append("kill-workload reported no killed processes")
     errors.extend(
-        death_observation_errors(
+        death_record_errors(
             death,
             node=node,
             job_id=job_id,
             attempt_id=attempt_id,
             pod_uid=pod_uid,
+            xid_injected_at=xid_injected_at,
+        )
+    )
+    errors.extend(
+        terminal_death_errors(
+            restart_state.get("completion_event"),
+            rank=(death or {}).get("killed_rank"),
+            node=node,
         )
     )
     pods = restarted.get("pods") or []
@@ -433,96 +455,6 @@ def passive_errors(
     ):
         errors.append("no new attempt observation appeared after the restart")
     return errors
-
-
-def death_observation_errors(
-    observation: dict[str, Any],
-    *,
-    node: str | None,
-    job_id: str | None,
-    attempt_id: str,
-    pod_uid: str,
-) -> list[str]:
-    errors = []
-    if job_id is not None and observation.get("job_id") != job_id:
-        errors.append("death observation belongs to another job")
-    if observation.get("attempt_id") != attempt_id:
-        errors.append("death observation belongs to another attempt")
-    containers = [
-        item
-        for item in observation.get("containers") or []
-        if item.get("pod_uid") == pod_uid
-        and (node is None or item.get("node_id") == node)
-    ]
-    killed_terminated = bool(containers) and all(
-        item.get("terminated") is True
-        and type(item.get("exit_code")) is int
-        and item["exit_code"] != 0
-        for item in containers
-    )
-    # The product's failure-detected reading is posted the moment the killed
-    # container's exit is seen; the PyTorchJob flips to Failed a moment later
-    # and no re-post follows for that flip alone, so the next observation with
-    # phase FAILED may be the terminal one -- which is also when the passive
-    # restart re-owns the node (live 2026-09-28: 57 s vs the usual 22 s, and
-    # the late-XID window was gone). Pod death is the terminated killed
-    # container, in a RUNNING/PENDING phase as much as in FAILED.
-    phase = observation.get("workload_phase")
-    if phase != "FAILED" and not (
-        phase in {"RUNNING", "PENDING"} and killed_terminated
-    ):
-        errors.append("death observation phase is not FAILED")
-    if not containers:
-        errors.append("death observation does not contain the killed Pod on its node")
-    elif any(item.get("terminated") is not True for item in containers):
-        errors.append("killed container is not terminated in the observation")
-    if containers and not any(
-        type(item.get("exit_code")) is int and item["exit_code"] != 0
-        for item in containers
-    ):
-        errors.append("killed container has no non-zero exit code")
-    return errors
-
-
-def wait_death_observation(
-    regional: RegionalLiveFixture,
-    *,
-    node: str,
-    job_id: str,
-    attempt_id: str,
-    pod_uid: str,
-    timeout_seconds: int = 300,
-    poll_seconds: int = 5,
-) -> dict[str, Any]:
-    """Poll until the store shows the killed container terminated / phase FAILED."""
-
-    deadline = time.monotonic() + timeout_seconds
-    last: dict[str, Any] = {}
-    while True:
-        state = regional.store_snapshot(
-            node=node,
-            job_id=job_id,
-            attempt_id=attempt_id,
-            queue_attempts=1,
-        )
-        for observation in state.get("observations") or []:
-            if not isinstance(observation, dict):
-                continue
-            if not death_observation_errors(
-                observation,
-                node=node,
-                job_id=job_id,
-                attempt_id=attempt_id,
-                pod_uid=pod_uid,
-            ):
-                return observation
-            last = observation
-        if time.monotonic() >= deadline:
-            break
-        time.sleep(poll_seconds)
-    raise RegionalFixtureError(
-        f"the killed attempt observation never went FAILED: {last}"
-    )
 
 
 def node_attempt_blockers(
@@ -750,6 +682,64 @@ def wait_for_decision(
     raise RegionalFixtureError(f"policy recorded no decision for the late XID: {last}")
 
 
+def submit_late_xid(
+    regional: RegionalLiveFixture,
+    collector: CollectorAcceptanceFixture,
+    cleanup: base.CaseCleanup,
+    *,
+    case_dir: Path,
+    node: str,
+    job_id: str,
+    attempt_id: str,
+    foreign_drain: dict[str, Any],
+    bdf: str,
+) -> tuple[str, datetime]:
+    """Prove the late-XID window is still open, then write the XID.
+
+    A long grace wait belongs before the kill; afterward the late-XID window
+    must still be open, not overtaken by a new passive restart or foreign job.
+    """
+
+    with deadline_scope("COLLECT-021 late-XID proof and submission", 60) as deadline:
+        require_action_time()
+        blockers = read_node_attempt_blockers(
+            regional,
+            node=node,
+            own_job_id=job_id,
+            own_attempt_id=attempt_id,
+            own_must_be_idle=True,
+        )
+        require_action_time()
+        write_json_atomic(
+            case_dir / "foreign-attempts-before-xid.json",
+            {
+                **foreign_drain,
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "clear": not blockers,
+                "blockers": blockers,
+            },
+        )
+        deadline.remaining()
+        require_action_time()
+        if blockers:
+            raise RegionalFixtureError("node ownership changed before the late XID")
+        marker = f"c021-{int(time.time())}"
+        injected_at = datetime.now(timezone.utc)
+        cleanup.register_seed(collector, marker)
+        collector.execute(
+            "write-xid",
+            "--xid",
+            str(LATE_XID),
+            "--marker",
+            marker,
+            "--pci-bdf",
+            bdf,
+            "--message",
+            "Graphics Exception after process death",
+        )
+    return marker, injected_at
+
+
 def run_late_xid_section(
     settings: Settings,
     regional: RegionalLiveFixture,
@@ -794,7 +784,8 @@ def run_late_xid_section(
     target_node = str(source["pods"][0]["node"])
     target_uid = str(source["pods"][0]["uid"])
     node_before = regional.node_snapshot(target_node)
-    workload_case.wait_observation(
+    # The product's own pre-kill reading ranks the Pod and names its GPUs.
+    running = workload_case.wait_observation(
         regional,
         workload_settings(
             settings, manifest=manifest, job_id=job_id, attempt_id=attempt_id
@@ -824,55 +815,31 @@ def run_late_xid_section(
     # Kill the process before any XID exists, so the container exits non-zero
     # and the Pod object survives (a deleted Pod reads as a user stop).
     require_action_time(120)
+    killed_after = datetime.now(timezone.utc)
     kill = collector.execute("kill-workload", "--pod-uid", target_uid, timeout=120)
-    death = wait_death_observation(
+    # The product's failure containment records the death durably; the Store's
+    # one observation per attempt is superseded within seconds (collect021_death).
+    death = wait_death_record(
         regional,
         node=target_node,
         job_id=job_id,
         attempt_id=attempt_id,
         pod_uid=target_uid,
+        rank=killed_pod_rank(running, pod_uid=target_uid, node=target_node),
+        killed_after=killed_after,
     )
-
-    # A long grace wait belongs before the kill; afterward the late-XID window
-    # must still be open, not overtaken by a new passive restart or foreign job.
-    with deadline_scope("COLLECT-021 late-XID proof and submission", 60) as deadline:
-        require_action_time()
-        blockers = read_node_attempt_blockers(
-            regional,
-            node=target_node,
-            own_job_id=job_id,
-            own_attempt_id=attempt_id,
-            own_must_be_idle=True,
-        )
-        require_action_time()
-        write_json_atomic(
-            case_dir / "foreign-attempts-before-xid.json",
-            {
-                **foreign_drain,
-                "observed_at": datetime.now(timezone.utc).isoformat(),
-                "clear": not blockers,
-                "blockers": blockers,
-            },
-        )
-        deadline.remaining()
-        require_action_time()
-        if blockers:
-            raise RegionalFixtureError("node ownership changed before the late XID")
-        marker = f"c021-{int(time.time())}"
-        injected_at = datetime.now(timezone.utc)
-        bdf = target_bdf(death, inventory, pod_uid=target_uid)
-        cleanup.register_seed(collector, marker)
-        collector.execute(
-            "write-xid",
-            "--xid",
-            str(LATE_XID),
-            "--marker",
-            marker,
-            "--pci-bdf",
-            bdf,
-            "--message",
-            "Graphics Exception after process death",
-        )
+    write_json_atomic(case_dir / "death-record.json", death)
+    marker, injected_at = submit_late_xid(
+        regional,
+        collector,
+        cleanup,
+        case_dir=case_dir,
+        node=target_node,
+        job_id=job_id,
+        attempt_id=attempt_id,
+        foreign_drain=foreign_drain,
+        bdf=target_bdf(running, inventory, pod_uid=target_uid),
+    )
     state = wait_for_decision(
         regional,
         node=target_node,
@@ -922,6 +889,7 @@ def run_late_xid_section(
             attempt_id=attempt_id,
             node=target_node,
             job_id=job_id,
+            xid_injected_at=injected_at,
         )
     )
     return {
@@ -932,6 +900,7 @@ def run_late_xid_section(
         "target_node": target_node,
         "killed_pod_uid": target_uid,
         "kill": kill,
+        "death": {key: death.get(key) for key in DEATH_SUMMARY_KEYS},
         "source_pod_uids": sorted(source_uids),
         "restarted_pod_uids": sorted(str(item["uid"]) for item in restarted["pods"]),
         "event": state.get("event"),
@@ -1052,6 +1021,9 @@ def execute_case(
                 result["errors"].append(
                     f"workload cleanup failed: {type(exc).__name__}: {exc}"
                 )
+            # A passive restart the case failed before binding is still ours.
+            if unbound := sorted(getattr(workload, "unbound_restart_resources", ())):
+                result["unbound_restart_resources_deleted"] = unbound
         for fixture in fixtures:
             try:
                 residuals = fixture.cleanup()

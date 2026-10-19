@@ -13,7 +13,12 @@ from typing import Any
 import pytest
 
 from gpu_fault.models import Environment
-from gpu_fault.watcher import AttemptObservation, ContainerObservation, WorkloadPhase
+from gpu_fault.watcher import (
+    AttemptObservation,
+    ContainerObservation,
+    WorkloadPhase,
+    failure_containment_ids,
+)
 from scripts.e2e.regional import (
     collect017_training,
     collect021_passive,
@@ -59,9 +64,64 @@ def training_attempt_observation(
     ).model_dump(mode="json")
 
 
+def survivors_only(workload: Any) -> dict[str, Any]:
+    """The live plain-EKS reading after the containment deleted the killed Pod:
+    the attempt RUNNING on its surviving Pods, the killed one not listed."""
+
+    observation = training_attempt_observation(
+        workload, attempt_id=workload.settings.attempt_id, phase=WorkloadPhase.RUNNING
+    )
+    observation["containers"] = observation["containers"][1:]
+    return observation
+
+
+def failure_containment(workload: Any) -> dict[str, Any]:
+    """The incident the product's failure-detected handler opens for the kill."""
+
+    attempt_id = workload.settings.attempt_id
+    event_key = f"cluster-a/{attempt_id}/TrainingAttemptFailureDetected"
+    return {
+        "incident_id": failure_containment_ids(event_key)[0],
+        "event_id": event_key,
+        "event_type": "TRAINING_ATTEMPT_FAILURE_DETECTED",
+        "cluster_id": "cluster-a",
+        "job_id": workload.settings.job_id,
+        "attempt_id": attempt_id,
+        "node_ids": sorted(row["node"] for row in workload.source["pods"]),
+        "reasons": [
+            "critical container exited non-zero",
+            "first_failed_rank=0",
+            "exit_code=137",
+        ],
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
+def training_death_read(harness: Any, note: Any, *args: str) -> dict[str, Any]:
+    note("death-read", *args)
+    workload = harness.workloads[-1]
+    superseded = harness.problem == "superseded-death"
+    return {
+        "observations": [
+            survivors_only(workload)
+            if superseded
+            else training_attempt_observation(
+                workload,
+                attempt_id=workload.settings.attempt_id,
+                phase=WorkloadPhase.FAILED,
+                killed=harness.killed,
+            )
+        ],
+        "failure_incident": failure_containment(workload) if superseded else None,
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+    }
+
+
 def training_cpu_read(
     harness: Any, note: Any, bundle: Any, script: str, *args: str
 ) -> dict[str, Any]:
+    if harness.module is c021 and script == c021.DEATH_PROBE:
+        return training_death_read(harness, note, *args)
     note("cpu-read", *args)
     if script == collect021_passive.PASSIVE_PROBE:
         workload = harness.workloads[-1]
@@ -69,12 +129,14 @@ def training_cpu_read(
             {**row, "uid": row["uid"] + "-new", "attempt_id": workload.new_attempt}
             for row in workload.source["pods"]
         ]
+        killed = workload.source["pods"][0]
         state = completed_passive_state(
             cluster_id=args[0],
             job_id=args[1],
             attempt_id=args[2],
             new_attempt_id=workload.new_attempt,
             pods=pods,
+            rank_exit_status=[{"rank": 0, "node_id": killed["node"], "exit_code": 137}],
         )
         if not args[3]:
             state["observations"] = []
@@ -223,6 +285,8 @@ def make_training_regional(
                     "workflow": None,
                     "commands": [],
                 }
+            if kwargs.get("attempt_id") and harness.problem == "superseded-death":
+                return {"observations": [survivors_only(harness.workloads[-1])]}
             if kwargs.get("attempt_id"):
                 workload = harness.workloads[-1]
                 return {
@@ -265,6 +329,8 @@ def make_training_regional(
             if harness.module is c021 and not job_id:
                 note("node-attempt-read")
                 workload = harness.workloads[-1]
+                if harness.killed and harness.problem == "superseded-death":
+                    return {"observations": [survivors_only(workload)]}
                 return {
                     "observations": [
                         training_attempt_observation(
@@ -495,6 +561,28 @@ def make_training_auxiliary(regional: Any, harness: Any, note: Any) -> Any:
     return ResetHost, Prewarm, Plugin
 
 
+def running_observation(harness: Any) -> Any:
+    """``wait_observation``'s RUNNING reading; COLLECT-021 ranks its kill from it."""
+
+    def running(regional: Any, settings: Any, **kwargs: Any) -> dict[str, Any]:
+        observation = {
+            "cluster_id": settings.regional.cluster_id,
+            "job_id": settings.job_id,
+            "attempt_id": settings.attempt_id,
+            "workload_phase": "RUNNING",
+            "observed_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if harness.module is c021:
+            observation["containers"] = training_attempt_observation(
+                harness.workloads[-1],
+                attempt_id=settings.attempt_id,
+                phase=WorkloadPhase.RUNNING,
+            )["containers"]
+        return observation
+
+    return running
+
+
 @pytest.fixture(
     params=(c016, c017, c021), ids=("collect016", "collect017", "collect021")
 )
@@ -662,15 +750,7 @@ def training_case(request: Any, tmp_path: Path, monkeypatch: Any) -> Any:
         monkeypatch.setattr(module.base, "DevicePluginFixture", Plugin)
     else:
         monkeypatch.setattr(
-            module.workload_case,
-            "wait_observation",
-            lambda regional, settings, **kwargs: {
-                "cluster_id": settings.regional.cluster_id,
-                "job_id": settings.job_id,
-                "attempt_id": settings.attempt_id,
-                "workload_phase": "RUNNING",
-                "observed_at": datetime.now(timezone.utc).isoformat(),
-            },
+            module.workload_case, "wait_observation", running_observation(harness)
         )
     if module is c016:
         monkeypatch.setattr(module, "HostProbeFixture", ResetHost)

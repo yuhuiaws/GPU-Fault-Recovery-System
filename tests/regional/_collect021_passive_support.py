@@ -13,6 +13,7 @@ from gpu_fault.models import (
     IncidentState,
     PlanStatus,
     PlanStep,
+    RankExitStatus,
     RecoveryAction,
     RecoveryPlan,
     TerminalEvent,
@@ -38,7 +39,10 @@ def completed_passive_state(
     new_attempt_id: str = "attempt-b",
     pods: list[dict[str, Any]] | None = None,
     with_predecessor: bool = False,
+    rank_exit_status: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
+    """``rank_exit_status`` is the source terminal's exits (rank, node_id, exit_code)."""
+
     now = datetime.now(timezone.utc)
     pods = pods or [
         {
@@ -61,6 +65,9 @@ def completed_passive_state(
         allocation=[
             AllocationEntry(node_id=pod["node"], rank=index, gpu_count=8)
             for index, pod in enumerate(pods)
+        ],
+        rank_exit_status=[
+            RankExitStatus.model_validate(item) for item in rank_exit_status or []
         ],
     )
     incident = fault_incident(

@@ -323,23 +323,29 @@ def test_death_wait_ignores_wrong_or_incomplete_identity(
     invalid = {**death_observation(), **overrides}
     valid = death_observation()
     reads = iter([{"observations": [invalid]}, {"observations": [valid]}])
-    calls: list[dict[str, Any]] = []
+    calls: list[tuple[str, ...]] = []
 
-    def snapshot(**kwargs: Any) -> dict[str, Any]:
-        calls.append(kwargs)
+    def probe(script: str, *arguments: str) -> dict[str, Any]:
+        assert script == late.DEATH_PROBE
+        calls.append(arguments)
         return deepcopy(next(reads))
 
     monkeypatch.setattr(late.time, "sleep", lambda _: None)
-    result = late.wait_death_observation(
-        SimpleNamespace(store_snapshot=snapshot),
+    result = late.wait_death_record(
+        SimpleNamespace(
+            cpu_python=probe, settings=SimpleNamespace(cluster_id="cluster-a")
+        ),
         node="node-a",
         job_id="job-a",
         attempt_id="attempt-a",
         pod_uid="pod-a",
+        rank=0,
+        killed_after=datetime.now(timezone.utc),
         poll_seconds=0,
     )
-    assert result == valid
-    assert len(calls) == 2
+    assert result["proven_by"] == "observation"
+    assert result["observation"] == valid
+    assert calls == [("cluster-a", "job-a", "attempt-a")] * 2
 
 
 def test_unknown_death_state_is_not_idle() -> None:
