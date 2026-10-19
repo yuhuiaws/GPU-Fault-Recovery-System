@@ -5,7 +5,7 @@ fake clock and a fake GPU timeline: the HEARTBEAT lines the cases parse, their
 cadence, the step counts, the duty every nvidia-smi sample period would read
 and the SIGTERM exit are observed, not grepped. The idle-by-design workloads
 are pinned idle, and the NVIDIA definition the duty rests on is pinned in the
-helper and the snippet copies.
+helper, the snippet copies and both editions of the test manual.
 """
 
 from __future__ import annotations
@@ -44,6 +44,10 @@ from scripts.e2e.regional.warm_spare_fixture import GpuHolderFixture
 ROOT = Path(__file__).resolve().parents[2]
 REGIONAL = ROOT / "scripts/e2e/regional"
 TRAINING = REGIONAL / "manifests/training"
+MANUALS = (
+    ROOT / "docs/故障模拟测试手册.md",
+    ROOT / "docs/en/fault-simulation-test-manual.md",
+)
 HEREDOC = re.compile(r"<<'PY'\n(.*?)\nPY(?:\n|$)", re.S)
 SAMPLE_PERIODS = (1 / 6, 1.0)
 KERNEL_SECONDS = 30e-6
@@ -871,3 +875,21 @@ def test_the_nvidia_evidence_is_pinned_in_the_helper_and_the_snippet() -> None:
         f"docs version {load.NVIDIA_XID_CATALOG_DOCS_VERSION}",
     ):
         assert evidence in docstring, evidence
+
+
+@pytest.mark.parametrize("manual", MANUALS, ids=lambda path: path.name)
+def test_both_manual_editions_cite_the_nvidia_evidence(manual: Path) -> None:
+    text = normalized(manual.read_text(encoding="utf-8"))
+    for evidence in (
+        load.NVIDIA_SMI_REFERENCE,
+        load.NVIDIA_SMI_SECTION,
+        load.NVIDIA_SMI_DOCS_VERSION,
+        load.NVIDIA_SMI_CHANGE_LOG,
+        load.NVIDIA_SMI_UTILIZATION_GPU_QUOTE,
+        load.NVIDIA_XID_CATALOG_REFERENCE,
+        f"docs version {load.NVIDIA_XID_CATALOG_DOCS_VERSION}",
+        load.NVIDIA_XID45_TRIGGER_QUOTE,
+        load.GPU_DUTY_ENV,
+        "scripts/e2e/regional/acceptance_gpu_load.py",
+    ):
+        assert evidence in text, (manual.name, evidence)

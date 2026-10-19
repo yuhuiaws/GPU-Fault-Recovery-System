@@ -614,6 +614,35 @@ The only synthetic feature switch in the whole repository is `GPU_FAULT_ENABLE_S
 combined with the execution token. No CLI has an inject or simulate subcommand; all injection is done by e2e probe scripts
 or control-plane routes.
 
+The managed training fixtures keep their GPUs busy between two heartbeats. The four long-running heartbeat jobs under
+`scripts/e2e/regional/manifests/training/` (`xid11-three-node-pytorchjob.yaml`, `two-node-replace-pytorchjob.yaml`,
+`single-node-warm-spare-pytorchjob.yaml`, `xid11-single-node-job.yaml`) run fp16 matmuls on every GPU they hold for
+`GPU_FAULT_ACCEPTANCE_GPU_DUTY_PERCENT` (default `30`, range `0` to `50`) of every 10 ms period, call
+`torch.cuda.synchronize` after every eight, and stop at the deadline the old `sleep(2)` had: the `HEARTBEAT`/`SUCCESS`
+lines, the ~2 s cadence, the step counts and the total duration are unchanged, the load holds about 24 MiB per GPU and
+draws far less than the power limit, and SIGTERM finishes the batch in flight, synchronizes and exits 143, so a stop
+leaves no kernel running on the GPU. The reason: a real training job keeps kernels running, while a heartbeat that only
+all-reduces one value and sleeps reads about 0 % `utilization.gpu` in `nvidia-smi`, which the product's
+`LOW_GPU_UTILIZATION` rule (any GPU of the node at or below 5 % for 300 s by default while a managed attempt is live
+there, each GPU graded on its own) correctly reports in any case that runs that long. The 10 ms period is far shorter than the shortest sample period
+(1/6 s), so every sample reads about the duty. `0` restores the idle heartbeat; a case that needs idle GPUs sets it in its
+rendered manifest (`scripts/e2e/regional/acceptance_gpu_load.py::set_gpu_duty_percent`). The NOTIFY-005 CPU-only load,
+the warm-spare GPU holder Pod and the late-ownership CUDA holder stay GPU-idle by design; the one-GPU
+`xid11-single-node-job.yaml` keeps only its own GPU busy while the product still grades every other GPU of the node; and
+COLLECT-021 deliberately SIGKILLs the training processes, which can land inside a batch. The copies in the manifests
+equal the canonical text in `scripts/e2e/regional/acceptance_gpu_load.py`, checked by
+`python3 -m scripts.e2e.regional.acceptance_gpu_load` (`--write` rewrites the copies).
+
+Evidence: NVIDIA nvidia-smi documentation, GPU ATTRIBUTES > Utilization > GPU
+(https://docs.nvidia.com/deploy/nvidia-smi/index.html, nvidia-smi v610 Update, newest change-log entry "Changes between
+nvidia-smi v610 Update and v595"): "Percent of time over the past sample period during which one or more kernels was
+executing on the GPU. The sample period may be between 1 second and 1/6 second depending on the product." Evidence for
+leaving no kernel running at a stop: NVIDIA Xid catalog (docs version 615,
+https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html, "Xids" sheet of the linked Xid-Catalog.xlsx, code 45
+Trigger Conditions): "This event is logged when the user application aborts and the kernel driver tears down the GPU
+application running on the GPU. Control-C, GPU resets, sigkill are all examples where the application is aborted and this
+event is created."
+
 ### 8.3 Node Kernel and Driver Log Layer
 
 | Injection method | Real signal produced | Mechanism | Typical cases | Code reference |
