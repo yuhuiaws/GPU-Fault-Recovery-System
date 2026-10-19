@@ -17,6 +17,7 @@ observed on the node, on both host sizes.
 
 from __future__ import annotations
 
+import os
 import subprocess
 from datetime import timedelta
 from pathlib import Path
@@ -70,6 +71,10 @@ class _Host:
             return original(path, *args, **kwargs)
 
         monkeypatch.setattr(type(tmp_path), "read_text", read_text)
+        # load1_per_cpu divides the faked /proc/loadavg by os.cpu_count(): pin
+        # it to the simulated host, not the runner (a 4-vCPU CI runner read
+        # 8 / 4 = 2.0 and tripped the system-load rule on the idle node).
+        monkeypatch.setattr(os, "cpu_count", lambda: vcpus)
         self.collector = HostTelemetryCollector(
             RecordingSink(),
             context(),
