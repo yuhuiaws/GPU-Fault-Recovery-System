@@ -45,8 +45,73 @@ spec:
                 - |
                   cat >/tmp/xid11_train.py <<'PY'
                   import os
+                  import signal
                   import socket
+                  import threading
                   import time
+
+                  # BEGIN gpu-fault acceptance GPU load (scripts/e2e/regional/acceptance_gpu_load.py)
+                  # A training job keeps kernels running; an idle heartbeat reads 0 % in nvidia-smi
+                  # utilization.gpu, "Percent of time over the past sample period during which one
+                  # or more kernels was executing on the GPU. The sample period may be between 1
+                  # second and 1/6 second depending on the product." (nvidia-smi v610 Update docs,
+                  # GPU ATTRIBUTES > Utilization > GPU,
+                  # https://docs.nvidia.com/deploy/nvidia-smi/index.html). So between heartbeats
+                  # every GPU runs fp16 matmuls for GPU_FAULT_ACCEPTANCE_GPU_DUTY_PERCENT (0-50,
+                  # default 30, 0 = idle) of every 10 ms, synchronized per batch of eight; SIGTERM
+                  # ends the batch in flight and exits 143.
+                  GPU_DUTY_ENV = "GPU_FAULT_ACCEPTANCE_GPU_DUTY_PERCENT"
+                  GPU_DUTY_PERIOD_SECONDS = 0.01
+                  GPU_LOAD_MATRIX = 2048
+                  GPU_LOAD_BATCH = 8
+                  GPU_TERM_GRACE_SECONDS = 1.0
+                  GPU_LOAD = {}
+                  TERMINATING = threading.Event()
+
+
+                  def gpu_duty_percent():
+                      raw = os.environ.get(GPU_DUTY_ENV, "30").strip()
+                      if not (raw.isascii() and raw.isdigit()) or int(raw) > 50:
+                          raise SystemExit(f"{GPU_DUTY_ENV} must be an integer 0-50, not {raw!r}")
+                      return int(raw)
+
+
+                  def watch_sigterm():
+                      def watch():
+                          signal.sigwait({signal.SIGTERM})
+                          TERMINATING.set()
+                          time.sleep(GPU_TERM_GRACE_SECONDS)
+                          os._exit(143)
+
+                      signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+                      threading.Thread(target=watch, daemon=True).start()
+
+
+                  def gpu_busy_until(deadline, device):
+                      load = GPU_LOAD.get(str(device))
+                      if load is None and GPU_DUTY_PERCENT:
+                          shape = (GPU_LOAD_MATRIX, GPU_LOAD_MATRIX)
+                          load = GPU_LOAD[str(device)] = [
+                              torch.randn(shape, device=device, dtype=torch.float16) for _ in range(3)
+                          ]
+                      while not TERMINATING.is_set():
+                          start = time.monotonic()
+                          if start >= deadline:
+                              return
+                          period = min(GPU_DUTY_PERIOD_SECONDS, deadline - start)
+                          busy_until = start + period * GPU_DUTY_PERCENT / 100
+                          while load and time.monotonic() < busy_until:
+                              for _ in range(GPU_LOAD_BATCH):
+                                  torch.mm(load[0], load[1], out=load[2])
+                              torch.cuda.synchronize(device)
+                          TERMINATING.wait(max(0.0, start + period - time.monotonic()))
+                      torch.cuda.synchronize(device)
+                      os._exit(143)
+
+
+                  GPU_DUTY_PERCENT = gpu_duty_percent()
+                  watch_sigterm()
+                  # END gpu-fault acceptance GPU load
 
                   import torch
                   import torch.distributed as dist
@@ -74,7 +139,7 @@ spec:
                               f"elapsed={time.time() - started:.1f}",
                               flush=True,
                           )
-                      time.sleep(2)
+                      gpu_busy_until(time.monotonic() + 2, device)
 
                   dist.barrier()
                   print(
@@ -100,6 +165,8 @@ spec:
                   value: "1"
                 - name: FI_EFA_FORK_SAFE
                   value: "1"
+                - name: GPU_FAULT_ACCEPTANCE_GPU_DUTY_PERCENT
+                  value: "30"
               resources:
                 requests:
                   cpu: "8"
@@ -145,8 +212,73 @@ spec:
                 - |
                   cat >/tmp/xid11_train.py <<'PY'
                   import os
+                  import signal
                   import socket
+                  import threading
                   import time
+
+                  # BEGIN gpu-fault acceptance GPU load (scripts/e2e/regional/acceptance_gpu_load.py)
+                  # A training job keeps kernels running; an idle heartbeat reads 0 % in nvidia-smi
+                  # utilization.gpu, "Percent of time over the past sample period during which one
+                  # or more kernels was executing on the GPU. The sample period may be between 1
+                  # second and 1/6 second depending on the product." (nvidia-smi v610 Update docs,
+                  # GPU ATTRIBUTES > Utilization > GPU,
+                  # https://docs.nvidia.com/deploy/nvidia-smi/index.html). So between heartbeats
+                  # every GPU runs fp16 matmuls for GPU_FAULT_ACCEPTANCE_GPU_DUTY_PERCENT (0-50,
+                  # default 30, 0 = idle) of every 10 ms, synchronized per batch of eight; SIGTERM
+                  # ends the batch in flight and exits 143.
+                  GPU_DUTY_ENV = "GPU_FAULT_ACCEPTANCE_GPU_DUTY_PERCENT"
+                  GPU_DUTY_PERIOD_SECONDS = 0.01
+                  GPU_LOAD_MATRIX = 2048
+                  GPU_LOAD_BATCH = 8
+                  GPU_TERM_GRACE_SECONDS = 1.0
+                  GPU_LOAD = {}
+                  TERMINATING = threading.Event()
+
+
+                  def gpu_duty_percent():
+                      raw = os.environ.get(GPU_DUTY_ENV, "30").strip()
+                      if not (raw.isascii() and raw.isdigit()) or int(raw) > 50:
+                          raise SystemExit(f"{GPU_DUTY_ENV} must be an integer 0-50, not {raw!r}")
+                      return int(raw)
+
+
+                  def watch_sigterm():
+                      def watch():
+                          signal.sigwait({signal.SIGTERM})
+                          TERMINATING.set()
+                          time.sleep(GPU_TERM_GRACE_SECONDS)
+                          os._exit(143)
+
+                      signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGTERM})
+                      threading.Thread(target=watch, daemon=True).start()
+
+
+                  def gpu_busy_until(deadline, device):
+                      load = GPU_LOAD.get(str(device))
+                      if load is None and GPU_DUTY_PERCENT:
+                          shape = (GPU_LOAD_MATRIX, GPU_LOAD_MATRIX)
+                          load = GPU_LOAD[str(device)] = [
+                              torch.randn(shape, device=device, dtype=torch.float16) for _ in range(3)
+                          ]
+                      while not TERMINATING.is_set():
+                          start = time.monotonic()
+                          if start >= deadline:
+                              return
+                          period = min(GPU_DUTY_PERIOD_SECONDS, deadline - start)
+                          busy_until = start + period * GPU_DUTY_PERCENT / 100
+                          while load and time.monotonic() < busy_until:
+                              for _ in range(GPU_LOAD_BATCH):
+                                  torch.mm(load[0], load[1], out=load[2])
+                              torch.cuda.synchronize(device)
+                          TERMINATING.wait(max(0.0, start + period - time.monotonic()))
+                      torch.cuda.synchronize(device)
+                      os._exit(143)
+
+
+                  GPU_DUTY_PERCENT = gpu_duty_percent()
+                  watch_sigterm()
+                  # END gpu-fault acceptance GPU load
 
                   import torch
                   import torch.distributed as dist
@@ -174,7 +306,7 @@ spec:
                               f"elapsed={time.time() - started:.1f}",
                               flush=True,
                           )
-                      time.sleep(2)
+                      gpu_busy_until(time.monotonic() + 2, device)
 
                   dist.barrier()
                   print(
@@ -200,6 +332,8 @@ spec:
                   value: "1"
                 - name: FI_EFA_FORK_SAFE
                   value: "1"
+                - name: GPU_FAULT_ACCEPTANCE_GPU_DUTY_PERCENT
+                  value: "30"
               resources:
                 requests:
                   cpu: "8"

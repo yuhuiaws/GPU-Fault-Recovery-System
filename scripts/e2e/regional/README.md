@@ -860,6 +860,11 @@ hand `kubectl set env` and a note to remember.
 ## Manifests
 
 All regional E2E Kubernetes inputs live under `manifests/`, split into
-`fault-injection/` and `training/` where appropriate.
+`fault-injection/` and `training/` where appropriate. The long-running training
+fixtures keep their GPUs busy between heartbeats, as real training does
+(`GPU_FAULT_ACCEPTANCE_GPU_DUTY_PERCENT`, default 30; `0` is the idle
+heartbeat). Their copies of the shared snippet are checked against
+`acceptance_gpu_load.py` with `python3 -m scripts.e2e.regional.acceptance_gpu_load`
+(`--write` rewrites them).
 `manifests/regional-isolation-gpu-job.yaml` is a source workload. Render it
 with `gpu-training-submit` into a test namespace; do not apply it directly.
