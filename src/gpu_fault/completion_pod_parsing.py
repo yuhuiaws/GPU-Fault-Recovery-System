@@ -18,6 +18,7 @@ from typing import Any, Callable
 from gpu_fault.completion_attempt_state import AttemptSpec
 from gpu_fault.completion_observation import (
     TERMINATION_INCIDENT_ANNOTATION,
+    carry_vanished_failed_ranks,
     observe_containers,
     pod_container_has_started,
 )
@@ -116,6 +117,7 @@ class CompletionPodParsingMixin:
             pod_container_has_started(pod, item.container_name)
             for pod, item in zip(critical_pods, containers, strict=True)
         )
+        containers = carry_vanished_failed_ranks(self, attempt_id, containers)
         terminated = [item for item in containers if item.terminated]
         failed = [
             item

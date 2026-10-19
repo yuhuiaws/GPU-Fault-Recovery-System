@@ -529,6 +529,40 @@ def restored_attempt_observation(
     )
 
 
+def carry_vanished_failed_ranks(
+    controller: Any, attempt_id: str, containers: list[ContainerObservation]
+) -> list[ContainerObservation]:
+    """Keep the exited ranks of a failed attempt whose Pods are already gone.
+
+    Once the attempt's failure is detected, the passive containment's
+    STOP_WORKLOADS annotates its Pods, suspends the workload and deletes the
+    Pods with zero grace, one after another. A pass that lands between two of
+    those deletes lists only the survivors. Built from them alone, the reading
+    dropped the rank that died and, with no exited container left, put the
+    attempt back to RUNNING; the TIMED_OUT terminal reading built from it then
+    listed no container at all while the terminal event still named the dead
+    rank's exit (COLLECT-021 live on plain EKS: ``containers: []`` against
+    rank 0's exit 137). A pass that lists no Pod republishes the previous
+    reading as it is; this keeps the same exits for the ranks a partial pass
+    no longer lists. An exit is final. A rank whose Pod is listed again -- the
+    job controller's replacement -- is read from that Pod, and a running rank
+    whose Pod is gone is not carried.
+    """
+
+    if attempt_id not in controller._failure_events:
+        return containers
+    previous = controller._last_observations.get(attempt_id)
+    if previous is None:
+        return containers
+    listed = {item.rank for item in containers}
+    carried = [
+        item
+        for item in previous.containers
+        if item.terminated and item.rank not in listed
+    ]
+    return [*containers, *carried] if carried else containers
+
+
 def observe_containers(
     controller: Any, pods: list[dict[str, Any]]
 ) -> list[ContainerObservation]:

@@ -555,6 +555,91 @@ def test_cleanup_timeout_submits_when_remaining_pod_disappears() -> None:
     assert observation["containers"][0]["terminated"] is True
 
 
+def test_a_pass_between_the_stops_pod_deletes_keeps_the_dead_rank() -> None:
+    """COLLECT-021 live on plain EKS: the passive containment annotated both
+    Pods, then deleted them with zero grace, the dead rank first. A pass between
+    the two deletes listed only the survivor and published the attempt RUNNING
+    without the dead rank; the TIMED_OUT terminal reading built from it carried
+    no container while the terminal event named rank 0's exit 137."""
+
+    clock = Clock()
+    incident, _ = failure_containment_ids(
+        "hp-cluster/train-a1/TrainingAttemptFailureDetected"
+    )
+    core = FakeCoreApi(
+        [pod(0, exit_code=137, expected_ranks=2), pod(1, expected_ranks=2)]
+    )
+    sink = FakeSink()
+    subject = KubernetesCompletionController(
+        core,
+        sink,
+        cluster_id="hp-cluster",
+        environment=Environment.HYPERPOD_EKS,
+        cleanup_timeout_seconds=30,
+        now=clock,
+        publish_observations=True,
+    )
+
+    def observations() -> list[dict]:
+        return [
+            payload
+            for path, payload in sink.posts
+            if path == "/v1/workload-observations"
+        ]
+
+    subject.run_once()
+    core.pods = [
+        pod(0, exit_code=137, expected_ranks=2, initiator=incident),
+        pod(1, expected_ranks=2, initiator=incident),
+    ]
+    subject.run_once()
+    core.pods = [pod(1, expected_ranks=2, initiator=incident)]
+    clock.value += timedelta(seconds=1)
+    subject.run_once()
+    partial = observations()[-1]
+    assert partial["workload_phase"] == "FAILED", "a failed attempt stays failed"
+    assert sorted(
+        (item["rank"], item["terminated"], item["exit_code"])
+        for item in partial["containers"]
+    ) == [(0, True, 137), (1, False, None)], "the dead rank's exit is kept"
+
+    core.pods = []
+    clock.value += timedelta(seconds=30)
+    subject.run_once()
+    terminal = next(
+        payload for path, payload in sink.posts if path == "/v1/attempts/terminal"
+    )
+    final = observations()[-1]
+    assert terminal["terminal_status"] == "TIMED_OUT"
+    assert terminal["termination_initiator_incident_id"] == incident
+    assert [(item["rank"], item["exit_code"]) for item in final["containers"]] == [
+        (0, 137)
+    ], "the terminal reading names the rank its terminal event names"
+    assert final["workload_phase"] == "FAILED"
+
+
+def test_a_failed_ranks_replacement_pod_is_read_not_carried() -> None:
+    """Only ranks a pass no longer lists are carried; a listed Pod is the truth."""
+
+    core = FakeCoreApi(
+        [pod(0, exit_code=1, expected_ranks=2), pod(1, expected_ranks=2)]
+    )
+    sink = FakeSink()
+    subject = controller(core, sink)
+    subject.publish_observations = True
+    subject.run_once()
+    replacement = pod(0, expected_ranks=2)
+    replacement["metadata"]["uid"] = "pod-0-replacement"
+    core.pods = [replacement, pod(1, expected_ranks=2)]
+    subject.run_once()
+    latest = [
+        payload for path, payload in sink.posts if path == "/v1/workload-observations"
+    ][-1]
+    assert sorted(
+        (item["pod_uid"], item["terminated"]) for item in latest["containers"]
+    ) == [("pod-0-replacement", False), ("pod-1", False)]
+
+
 def test_missing_required_metadata_fails_closed() -> None:
     invalid = pod(0, exit_code=1)
     del invalid["metadata"]["annotations"]["gpu-fault.io/runtime-profile-version"]
