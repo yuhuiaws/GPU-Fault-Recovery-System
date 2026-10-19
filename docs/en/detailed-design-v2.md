@@ -563,6 +563,14 @@ A few points that must be remembered:
   A non-zero exit while the Pod carries `metadata.deletionTimestamp` is likewise read as STOPPED (`deletion_requested`):
   a user/operator `kubectl delete` of the job first makes torchrun receive SIGTERM and exit with 1 and then makes the Pod disappear;
   this is not a training failure, no failure-detected is sent, no restart budget is consumed, no escalation.
+  Once an attempt's failure is detected, the passive containment's STOP_WORKLOADS annotates its Pods and then deletes them with
+  zero grace, one after another; a pass that lands between two of those deletes lists only the surviving Pods. That pass keeps the
+  exits of the ranks the previous pass saw terminated (`completion_observation.carry_vanished_failed_ranks`): the observation stays
+  FAILED and the TIMED_OUT terminal observation still lists that rank, consistent with the terminal event's `rank_exit_status`; it
+  is the same rule as republishing the previous observation unchanged when no Pod is left. A Pod listed again (the controller's
+  replacement) is read from that Pod, and a running rank whose Pod is gone is not carried. Before, such a pass put the attempt back
+  to RUNNING without the dead rank, the surviving node counted as an active attempt's node until the terminal, and the terminal
+  observation was `containers: []` (GF-REGIONAL-COLLECT-021 on plain EKS).
   ownership only accepts Observations whose `ingested_at` is not more than 120 seconds relative to the event; older
   `PENDING/RUNNING` records go into the stale gauge and no longer participate in node-mutation attribution.
   `/v1/workload-observations` is sent directly under normal conditions; after a send failure it is written per attempt, latest-wins, into the

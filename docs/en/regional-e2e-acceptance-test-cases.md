@@ -15688,15 +15688,43 @@ constitute an atomic mutual exclusion against external writers.
    the restart; the container must exit non-zero on its own. The end-of-case cleanup
    exploits exactly this in reverse: `--force`-delete the Pods first, then the job, so
    cleanup consumes no restart budget and does not escalate.
-3. Poll the `observations` of `store_snapshot(node,job_id,attempt_id,queue_attempts=1)`
-   until the killed container has terminated and `workload_phase=FAILED` (the node
-   resolves as IDLE).
+3. Wait until the product has recorded this Pod's death
+   (`collect021_death.wait_death_record`: one light CPU-side `DEATH_PROBE` read every
+   5 s, at most 300 s). The Store keeps only the latest observation per attempt, and the
+   one that shows the killed container is superseded within seconds: the failure-detected
+   event opens the passive containment (FREEZE_EVIDENCE, STOP_WORKLOADS), whose stop step
+   annotates the attempt's Pods, suspends the job and deletes the Pods with zero grace,
+   one after another; a Completion Watcher pass that lands between two of those deletes
+   lists only the surviving Pod, and the TIMED_OUT terminal observation is later built
+   from that pass. Measured on plain EKS: the observation with the killed container
+   existed for about 2 s, every later one named no container of the killed Pod, and the
+   terminal observation carried `containers: []` while the same attempt's terminal event
+   still recorded rank 0's exit 137. The death is therefore proven from the records the
+   product keeps; either one suffices:
+   - the passive failure-containment incident `inc-attempt-failure-<sha>` (derived from
+     `<cluster>/<attempt>/TrainingAttemptFailureDetected`, created about 1 s after the
+     kill and never superseded): its id, event type and cluster/job/attempt match
+     exactly, `node_ids` contains the target node, the reasons contain
+     `critical container exited non-zero`, `first_failed_rank=<r>` and a non-zero
+     `exit_code=<c>` (a containment the terminal path created writes
+     `rank <r> exit_code=<c>`, also accepted), and it was created no earlier than the kill
+     (5 s clock-skew allowance). `r` comes from the product's own RUNNING observation
+     before the kill (`wait_observation` in step 1): the killed Pod UID's rank on the
+     target node;
+   - or any read observation in which the killed container has terminated with a non-zero
+     exit (`workload_phase=FAILED`, or RUNNING/PENDING with the killed container
+     terminated).
+   The full record is written to `death-record.json` (including the observation the
+   Store held at the time); the result's `late_xid.death` keeps only
+   `proven_by`/`recorded_at`/`killed_rank`/`killed_after`.
 4. Immediately write the late XID:
    ```
    <3>NVRM: Xid (PCI:0000:59:00): 13, pid=<uniq>, name=python, \
    Graphics Exception after process death marker=c021-<ts>
    ```
-   (The PCI address is the GPU BDF of the killed Pod; if missing, the node's first GPU.)
+   (The PCI address is the GPU BDF of the killed Pod: the GPU UUIDs come from the RUNNING
+   observation before the kill, since a terminated container's observation carries no GPU
+   UUID; if missing, the node's first GPU.)
 5. **Active-side verdict**: `wait_for_workflow` cannot be used (it waits for a workflow
    and would spin until timeout); use `wait_for_decision` instead, polling until the
    policy has recorded a decision (the marker-scoped `observed_after` is widened by the
@@ -15719,14 +15747,28 @@ constitute an atomic mutual exclusion against external writers.
    predecessor's success and incident=RECOVERED must also be proven.
    `restart_budget.restart_count` goes from 0 to 1; the new Observation must match the
    same cluster/job, the new attempt and the complete new Pod UID set, be fresh in time,
-   and have no contradicting records. Save `passive-completion.json`. Finally re-check
-   that the node is schedulable, has no leftover `gpu-fault.io` taint/ownership, and its
-   boot_id is unchanged.
+   and have no contradicting records. Save `passive-completion.json`. The death record of
+   step 3 must precede the late XID (`recorded_at` earlier than the injection), and the
+   source terminal event's `rank_exit_status` must record the killed rank's non-zero exit
+   on the target node. Finally re-check that the node is schedulable, has no leftover
+   `gpu-fault.io` taint/ownership, and its boot_id is unchanged.
 7. Cleanup (`finally`): delete the training job (including the `-r-` restart replicas),
    delete the probe Pod, delete the pre-warm Pods; write
    `cases/GF-REGIONAL-COLLECT-021/GF-REGIONAL-COLLECT-021.json`
    (case_id/attempt/verdict/errors/release_id/cluster_id and each segment); exit 0 on
-   PASS.
+   PASS. When the case fails before it has read the passive restart (for example a death
+   wait that timed out), the product may already have created the `-r-` restart copy that
+   the fixture has not bound. Cleanup still deletes the copy together with the source job
+   (`workload_restart_custody.unbound_restart_root`): every object on the chain carries
+   this fixture's owner nonce and job id, its attempt is the source attempt or one derived
+   from it (`<first 52 characters of the source attempt>-r-<hash>`), a retired Pod UID
+   never reappears, and the controller chain ends at a controller the fixture holds by UID
+   or at a new controller whose `gpu-fault.io/operation-id` names the `RESTART_WORKLOAD`
+   that created it. Objects deleted this way are listed in the result's
+   `unbound_restart_resources_deleted`; an object with a foreign nonce, an unrelated
+   attempt or no restart annotation is still refused, and nothing is deleted before the
+   whole set is proven. This grants deletion only, never counts the copy as the case's
+   replacement; a resumable fixture with a state file keeps the strict rule.
 - Verdict: active side IDLE→MONITOR_ONLY/NO_ACTION, no workflow, zero node changes;
   passive side completed by the proven budgeted restart plan, `restart_count` 0→1, node
   finally back to its original baseline.
@@ -15746,6 +15788,15 @@ constitute an atomic mutual exclusion against external writers.
   (`node_reads_idle`/`proactive_errors`/`passive_errors`) are module-level pure
   functions covered by the unit test
   `tests/regional/test_collect021_late_xid_after_pod_death.py`.
+- The death proof lives in `scripts/e2e/regional/collect021_death.py`: `DEATH_PROBE` reads
+  the attempt's observation and failure containment in one call, and the pure functions
+  `killed_pod_rank`/`death_record`/`death_record_errors`/`terminal_death_errors` judge
+  them. `tests/regional/test_collect021_death_record.py` covers each reading and executes
+  the probe against the real Store API with the incident the failure-detected handler
+  creates; `tests/regional/test_cov95_collect_training_runners.py` replays the measured
+  race (the Store holds only the surviving Pod's observation, and the case still PASSes).
+  Cleanup of an unbound restart copy is covered by
+  `tests/regional/test_workload_restart_custody.py`.
 
 ### GF-REGIONAL-COLLECT-015
 

@@ -1714,8 +1714,8 @@ Pod dies first, RESTART_APP XID arrives later — the idle verdict is MONITOR_ON
 Current catalog: live-workload-restart; manual; NOT_RUN.
 
 - Purpose: Manual, live-workload-restart: kill selected Pod processes, prove its nonzero terminal exit before late user-space XID13, idle/no workflow, passive budgeted new attempt.
-- Runner: scripts/e2e/regional/run_collect021_late_xid_after_pod_death.py; scripts/e2e/regional/probes/collector_node_probe.py; scripts/e2e/regional/managed_workload_fixture.py; scripts/e2e/regional/run_destr009_workload_restart.py
-- Entry Points: run_late_xid_section; wait_death_observation; node_reads_idle; proactive_errors; passive_errors; workload_processes; kill_workload
+- Runner: scripts/e2e/regional/run_collect021_late_xid_after_pod_death.py; scripts/e2e/regional/collect021_death.py; scripts/e2e/regional/probes/collector_node_probe.py; scripts/e2e/regional/managed_workload_fixture.py; scripts/e2e/regional/workload_restart_custody.py; scripts/e2e/regional/run_destr009_workload_restart.py
+- Entry Points: run_late_xid_section; wait_death_record; death_record_errors; terminal_death_errors; node_reads_idle; proactive_errors; passive_errors; workload_processes; kill_workload; unbound_restart_root
 - Assertions: Good exact proactive decision/no-command/no-workflow and boot/taint/ownership checks.; Passive accepts FAILED or STOPPED, disjoint UIDs, changed attempt, count=1, any non-source pending/running observation.; Death wait ignores pod_uid; unknown phase reads idle and absent target containers can pass.; No exact kmsg provenance or event/decision/incident identity linkage.
 - Safety And Cleanup: Resources registered before creation; shared workload deletion lacks residual proof.; Process selection uses arbitrary pod<UID> substrings and later numeric-PID kill without lifetime/cgroup revalidation.; No deadline recheck after long waits or validated unexpected-isolation recovery.
 - Necessity: Distinct terminal-before-XID race, but death must be this selected failed container, not unknown state/user STOPPED. Never substitute Pod deletion for the injection.
