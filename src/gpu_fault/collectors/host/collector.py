@@ -38,6 +38,12 @@ from gpu_fault.host_health import (
 from gpu_fault.models import WorkloadState
 
 LOGGER = logging.getLogger(__name__)
+#: The per-GPU samples the low CPU/GPU utilisation rules grade; each GPU's own
+#: crossing of the threshold is an edge (``sustained:<metric>:<device>``).
+LOW_UTILIZATION_METRICS = ("host_gpu_utilization_percent", "training_rank_cpu_percent")
+LOW_UTILIZATION_REASONS = tuple(
+    f"sustained:{name}:" for name in LOW_UTILIZATION_METRICS
+)
 
 
 def sd_notify(state: str) -> bool:
@@ -532,6 +538,14 @@ class HostTelemetryCollector(
         if not self.edge_filter_enabled:
             delivery_reasons.add("filter-disabled")
         elif self._last_delivered_at is None:
+            # Idle GPUs read low from a node's first tick: a state, not an
+            # edge. Left in, every collector start would post evidence-class
+            # traffic instead of a routine (spoolable) baseline.
+            delivery_reasons = {
+                reason
+                for reason in delivery_reasons
+                if not reason.startswith(LOW_UTILIZATION_REASONS)
+            }
             delivery_reasons.add("baseline")
         if self._active_edge_reasons - reasons:
             delivery_reasons.add("recovered")
@@ -621,19 +635,18 @@ class HostTelemetryCollector(
                 self.local_filesystem_warning_percent,
             ),
         }
-        if batch.workload_state is WorkloadState.ACTIVE:
-            sustained.update(
-                {
-                    "cpu_usage_percent": (
-                        "lte",
-                        self.low_utilization_threshold_percent,
-                    ),
-                    "host_gpu_utilization_percent": (
-                        "lte",
-                        self.low_utilization_threshold_percent,
-                    ),
-                }
-            )
+        # Low utilisation is graded per GPU, and only for the GPUs the control
+        # plane finds a managed attempt holding, so every GPU's own crossing is
+        # an edge: one GPU recovering while the unallocated ones stay at 0 %
+        # must still be delivered. This used to wait for the collector's static
+        # GPU_FAULT_WORKLOAD_STATE=ACTIVE, which no deploy path sets, so the
+        # windows were judged on health summaries minutes apart. An explicit
+        # IDLE still means nothing on this node is graded.
+        low_utilization = (
+            ()
+            if batch.workload_state is WorkloadState.IDLE
+            else LOW_UTILIZATION_METRICS
+        )
         for sample in batch.samples:
             immediate = NodeHealthPolicy.METRIC_RULES.get(sample.name)
             if immediate is not None and sample.value >= immediate[0]:
@@ -651,6 +664,11 @@ class HostTelemetryCollector(
                     comparison == "gte" and sample.value >= threshold
                 ):
                     reasons.add(f"sustained:{sample.name}")
+            if (
+                sample.name in low_utilization
+                and sample.value <= self.low_utilization_threshold_percent
+            ):
+                reasons.add(f"sustained:{sample.name}:{sample.device or 'node'}")
             if sample.name == "efa_traffic_bytes_per_second":
                 previous = self._last_efa_rate
                 if (

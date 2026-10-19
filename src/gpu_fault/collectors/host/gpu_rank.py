@@ -36,6 +36,13 @@ class HostGpuRankMixin:
         "--query-gpu=uuid,utilization.gpu",
         "--format=csv,noheader,nounits",
     )
+    #: Every compute context, one line per process and GPU: the ranks the
+    #: liveness probe samples and the GPUs whose CPU use they are counted on.
+    COMPUTE_APPS_ARGV = (
+        "nvidia-smi",
+        "--query-compute-apps=pid,gpu_uuid",
+        "--format=csv,noheader,nounits",
+    )
 
     def _gpu_utilization(self, observed_at: datetime) -> list[HostMetricSample]:
         self._last_gpu_utilization_percent = None
@@ -78,28 +85,26 @@ class HostGpuRankMixin:
             detail,
         )
 
-    def _gpu_compute_pids(self, observed_at: datetime) -> list[int]:
+    def _gpu_compute_processes(self, observed_at: datetime) -> dict[int, set[str]]:
+        """``pid -> GPU UUIDs`` of every process holding a compute context."""
+
         try:
-            completed = self._nvidia_smi(
-                [
-                    "nvidia-smi",
-                    "--query-compute-apps=pid",
-                    "--format=csv,noheader,nounits",
-                ],
-                observed_at,
-            )
+            completed = self._nvidia_smi(list(self.COMPUTE_APPS_ARGV), observed_at)
         except (OSError, CollectorError) as exc:
             self._warn_rank_liveness(str(exc))
-            return []
+            return {}
         if completed.returncode != 0:
             self._warn_rank_liveness(completed.stderr.strip())
-            return []
-        pids = []
+            return {}
+        processes: dict[int, set[str]] = {}
         for line in completed.stdout.splitlines():
-            token = line.strip()
-            if token.isdigit():
-                pids.append(int(token))
-        return sorted(set(pids))
+            token, _, gpu_uuid = (item.strip() for item in line.partition(","))
+            if not token.isdigit():
+                continue
+            gpus = processes.setdefault(int(token), set())
+            if gpu_uuid.startswith(("GPU-", "MIG-")):
+                gpus.add(gpu_uuid)
+        return dict(sorted(processes.items()))
 
     def _rank_counters(self, pid: int) -> tuple[str, dict[str, float]] | None:
         """Cheap per-rank progress counters straight from procfs.
@@ -201,8 +206,8 @@ class HostGpuRankMixin:
 
         if not self.rank_liveness_enabled:
             return []
-        pids = self._gpu_compute_pids(observed_at)
-        if not pids:
+        processes = self._gpu_compute_processes(observed_at)
+        if not processes:
             self._rank_progress_at = None
             self._prune_rank_counters(set())
             return []
@@ -223,7 +228,8 @@ class HostGpuRankMixin:
         live_keys = set()
         previous_ranks = self._sampled_rank_identities()
         identities: set[str] = set()
-        for pid in pids:
+        gpu_cpu_cores: dict[str, list[float]] = {}
+        for pid, gpu_uuids in processes.items():
             reading = self._rank_counters(pid)
             if reading is None:
                 continue
@@ -251,6 +257,8 @@ class HostGpuRankMixin:
                 / interval
             )
             cpu_cores = deltas.get("cpu_ticks", 0.0) / self._clock_ticks / interval
+            for gpu_uuid in gpu_uuids:
+                gpu_cpu_cores.setdefault(gpu_uuid, []).append(cpu_cores)
             # A rank stuck in a collective keeps its spin kernel resident,
             # so the GPU reads busy while nothing leaves the process. Host
             # CPU alone is not progress: the NCCL wait spins too. It only
@@ -322,6 +330,21 @@ class HostGpuRankMixin:
                     "seconds",
                 )
             )
+        # LOW_CPU_UTILIZATION's input: the CPU the processes driving one GPU
+        # used since the last tick, in percent of one core, so the reading does
+        # not depend on how many vCPUs the host has (a rank waiting on its GPU
+        # spins about one core; an off-CPU rank reads ~0). A GPU whose
+        # processes have no baseline yet gets no sample rather than a 0.
+        result.extend(
+            HostMetricSample(
+                name="training_rank_cpu_percent",
+                value=100.0 * sum(cores),
+                unit="percent",
+                device=gpu_uuid,
+                labels={"processes": str(len(cores))},
+            )
+            for gpu_uuid, cores in sorted(gpu_cpu_cores.items())
+        )
         return result
 
     def _nvswitch_topology(self, _: datetime) -> list[HostMetricSample]:

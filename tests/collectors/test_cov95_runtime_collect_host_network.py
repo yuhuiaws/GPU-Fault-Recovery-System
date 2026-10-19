@@ -136,7 +136,11 @@ def test_tcp_ignores_unrelated_sections_and_emits_delta_for_tcp_only(
 def test_failed_rank_discovery_warns_once_and_never_invents_live_ranks(
     host_case, result, caplog
 ):
-    argv = ("nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits")
+    argv = (
+        "nvidia-smi",
+        "--query-compute-apps=pid,gpu_uuid",
+        "--format=csv,noheader,nounits",
+    )
     host_case.outputs[argv] = result
     collector = host_case.build("_rank_liveness")
     assert collector.collect_once().samples == []
@@ -148,7 +152,11 @@ def test_failed_rank_discovery_warns_once_and_never_invents_live_ranks(
 @pytest.mark.parametrize("stat", ["", "23 (name) S 0", "23 (name) " + "bad " * 20])
 def test_disappearing_or_corrupt_rank_stat_is_not_a_progress_sample(host_case, stat):
     host_case.outputs[
-        ("nvidia-smi", "--query-compute-apps=pid", "--format=csv,noheader,nounits")
+        (
+            "nvidia-smi",
+            "--query-compute-apps=pid,gpu_uuid",
+            "--format=csv,noheader,nounits",
+        )
     ] = ("23\n23\nN/A\n", "", 0)
     support.write_file(host_case.roots.proc / "23/stat", stat)
     values = support.values(host_case.build("_rank_liveness").collect_once())
