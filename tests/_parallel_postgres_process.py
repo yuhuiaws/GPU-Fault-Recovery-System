@@ -27,6 +27,7 @@ from gpu_fault.admin.release_postgres import isolated_postgres_allocation
 from scripts import postgres_shard_worker as worker
 from scripts import run_postgres_shards as runner
 from scripts.postgres_shard_receipts import PostgresShardError, read_private_json
+from scripts.postgres_shard_worker import serial_test_command
 from tests.admin import _release_postgres_support as postgres_double
 from tests.admin._release_postgres_support import CID, FakePostgresDocker
 from tools.pytest_result_identity import source_identity
@@ -57,10 +58,29 @@ class CleanupProcessDocker(FakePostgresDocker):
         return result
 
 
+def lifecycle_test_command(
+    python: str, *, state: Path, tests: Sequence[str], durations: int
+) -> list[str]:
+    """The worker's own serial command, without the suite's conftest.
+
+    The lifecycle cases use nothing from ``tests/conftest.py``, and importing it
+    (``gpu_fault.app``, ``tests._builders``) is three quarters of a nested
+    session's start-up: 2.4 of 3.2 CPU-s without bytecode, as on CI. The CI job
+    sets PYTHONPYCACHEPREFIX, so pip and the outer pytest write bytecode only
+    there, and ``worker_environment`` drops the variable. Eight sessions start
+    at once, so on a loaded 4-vCPU runner the workers took 23-25 s to be ready.
+    """
+    return [
+        *serial_test_command(python, state=state, tests=tests, durations=durations),
+        "--noconftest",
+    ]
+
+
 def lifecycle_worker(mode: str, state: Path) -> int:
     postgres_double.CID = hashlib.sha256(state.name.encode()).hexdigest()
     with pytest.MonkeyPatch.context() as patch, worker.cancellation_scope():
         patch.setattr(worker, "CommandRunner", lambda: CleanupProcessDocker(state))
+        patch.setattr(worker, "serial_test_command", lifecycle_test_command)
         return worker.run_worker(
             state=state,
             tests=(LIFECYCLE_CASES,),
@@ -93,15 +113,20 @@ def lifecycle_gate(mode: str, state: Path) -> int:
             "PARALLEL_POSTGRES_IDENTITY": identity,
         }
         jobs.append(runner.ShardJob(index, directory, command, environment))
-    write_json_atomic(state / "group.json", {"pid": os.getpid()})
     failure = "unexpected-success"
     try:
         with (
             deployment_deadline(
-                "nested local sharding regression", 35, recovery_seconds=10
-            ),
+                "nested local sharding regression", 60, recovery_seconds=10
+            ) as deadline,
             worker.cancellation_scope(request_only=True) as interrupted,
         ):
+            # Workers nobody asks to cancel run their tests until this deadline.
+            # The test reads it (CLOCK_MONOTONIC is system-wide): cleanup that
+            # starts before it was requested, not forced by the deadline.
+            write_json_atomic(
+                state / "group.json", {"pid": os.getpid(), "deadline": deadline.expires}
+            )
             try:
                 runner.run_jobs(
                     jobs,
@@ -353,6 +378,7 @@ def main() -> int:
     if operation == "nested-signal":
         return nested_signal(mode, state)
     if operation == "lifecycle-wrapper":
+        # Outlives the gate's 60-s deadline and its 10-s recovery reserve.
         result = run_command(
             [
                 sys.executable,
@@ -363,7 +389,7 @@ def main() -> int:
                 mode,
                 str(state),
             ],
-            timeout_seconds=50,
+            timeout_seconds=80,
         )
         return int(result.returncode)
     if operation == "allocate-and-exit":

@@ -281,11 +281,12 @@ def test_eight_nested_workers_can_run_owned_cleanup_after_first_pytest_failure(
     tmp_path: Path, mode: str
 ) -> None:
     tmp_path.chmod(0o700)
+    # The wrapper bounds the gate at 80 s (a 60-s deadline plus 10 s recovery).
     result = run_owned_command(
         [sys.executable, "-B", "-m", HELPER, "lifecycle-wrapper", mode, str(tmp_path)],
         environment=environment(),
         cwd=ROOT,
-        timeout=60,
+        timeout=90,
     )
     assert result.returncode == 0, "nested process harness failed"
     outcome = read_private_json(tmp_path / "result.json")
@@ -340,9 +341,12 @@ def test_eight_nested_workers_finish_owned_cleanup_after_repeated_signals(
             ],
             environment=environment(),
             cwd=ROOT,
-            timeout=60,
+            timeout=90,
         )
-        until = time.monotonic() + 25
+        # The eight workers are ready in about 3 s locally and 10 s on a loaded
+        # 4-vCPU runner (16 s when two such fixtures overlap). Waiting 40 s
+        # still leaves the cleanup wait its 15 s inside the gate's 60-s deadline.
+        until = time.monotonic() + 40
         while not all(
             (tmp_path / f"shard-{index}/test-running.json").exists()
             for index in range(8)
@@ -352,14 +356,16 @@ def test_eight_nested_workers_finish_owned_cleanup_after_repeated_signals(
             )
             assert not future.done(), "nested worker fixture exited before cancellation"
             time.sleep(0.02)
-        descriptor = os.pidfd_open(read_private_json(tmp_path / "group.json")["pid"])
+        group = read_private_json(tmp_path / "group.json")
+        descriptor = os.pidfd_open(group["pid"])
         try:
             signal.pidfd_send_signal(descriptor, signum)
             signal.pidfd_send_signal(descriptor, signum)
-            # Cleanup starts about 0.3 s after the signals even with another full
-            # suite running. A gate that never asks its workers to cancel lets
-            # them run until its 35-s deadline, so say which side is missing.
-            until = time.monotonic() + 15
+            # Cleanup starts 0.3 s after the signals locally and about 1 s on a
+            # loaded 4-vCPU runner. A gate that never asks its workers to cancel
+            # lets them run until its deadline and cleans up then, so the wait
+            # ends there, and the failure says which side is missing.
+            until = min(time.monotonic() + 15, group["deadline"])
             while not all(
                 (tmp_path / f"shard-{index}/cleanup-started.json").exists()
                 for index in range(8)
@@ -373,8 +379,8 @@ def test_eight_nested_workers_finish_owned_cleanup_after_repeated_signals(
             signal.pidfd_send_signal(descriptor, signum)
         finally:
             os.close(descriptor)
-        # Same rule: the fixture's own run_owned_command timeout is 60 seconds.
-        result = future.result(timeout=75)
+        # Same rule: the fixture's own run_owned_command timeout is 90 seconds.
+        result = future.result(timeout=105)
     assert result.returncode == 0, "nested cancellation harness failed"
     assert read_private_json(tmp_path / "result.json") == {
         "failure": "KeyboardInterrupt",
