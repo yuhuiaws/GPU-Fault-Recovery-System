@@ -10216,7 +10216,7 @@ export GPU_FAULT_LOCAL_FILESYSTEM_DURATION_SECONDS=60
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
 | `GPU_FAULT_LOW_UTILIZATION_THRESHOLD_PERCENT` | 5 | Upper bound of low CPU or single-GPU utilisation on an ACTIVE training node |
-| `GPU_FAULT_LOW_UTILIZATION_DURATION_SECONDS` | 300 | Continuous low-utilisation duration |
+| `GPU_FAULT_LOW_UTILIZATION_DURATION_SECONDS` | 300 | Continuous low-utilisation duration of one managed attempt (restarts from zero when another attempt or job takes over the node) |
 | `GPU_FAULT_HOST_NOTIFICATION_COOLDOWN_SECONDS` | 3600 | Email cooldown for the same node, job and signal |
 | `GPU_FAULT_MEMORY_AVAILABLE_WARNING_PERCENT` | 5 | Lower alert bound of `MemAvailable/MemTotal` |
 | `GPU_FAULT_MEMORY_PRESSURE_DURATION_SECONDS` | 60 | Continuous low-available-memory duration |
@@ -10237,7 +10237,8 @@ gpu-fault-admin deploy --state-dir /secure/gpu-fault
 
 The old single-cluster path writes the same set of variables into the control-plane Deployment with `deploy/hyperpod/deploy.sh deploy` (Appendix A).
 
-Low CPU/GPU triggers only when the node is associated with an ACTIVE training job. Low memory, high page cache and high local disk
+Low CPU/GPU triggers only when the node is associated with an ACTIVE training job; the window is timed per managed attempt
+the control plane resolves, so a job that takes over the node never inherits its predecessor's low time. Low memory, high page cache and high local disk
 usage do not require a training job. The event action is fixed as `RUN_DIAGNOSTICS`, and neither node nor job is restarted automatically;
 the administrator email uses the `host-resource-event-zh-v1` fixed template. Findings of several GPUs of the same node in the same HostTelemetry batch
 are aggregated into one email, deduplicated by cluster, workload, node, signal and

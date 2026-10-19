@@ -3167,7 +3167,15 @@ Low CPU/GPU utilization is timed only when the control plane can resolve exactly
 observation, and still having non-terminated containers on this node); the collector's
 self-reported `ACTIVE` workload state is only an environment-variable-derived pre-filter and is not sufficient to start the timer; failing to resolve, or
 resolving to multiple attempts, is treated as an idle sample and resets the persistence window, avoiding false alarms on idle nodes held by placeholder jobs.
-The finding carries the resolved `job_id`/`attempt_id`. The default rules are as follows:
+The finding carries the resolved `job_id`/`attempt_id`. The window is timed per that attempt: the claimed `HealthSignalState`
+key is `cluster/node/metric/device/rule/job_id/attempt_id`, so when another attempt (or job) takes over the node the window
+starts from zero with a notification latch of its own -- the previous attempt's low time is not counted against its
+successor (a job about one minute old was once flagged as idle and stopped/restarted that way), and a delivered finding of
+the previous attempt does not silence the next one. The unscoped key `cluster/node/metric/device/rule` is claimed in the same
+call as the continuity gate: a sample without exactly one managed attempt lands only on it and resets it; it is never
+latched, and a finding needs both windows to have run for the configured duration. The EFA-traffic rule needs no change:
+its state is already keyed by cluster/node/job/attempt and a new attempt starts in WARMUP
+(`tests/host_health/test_low_utilization_attempt_window.py`). The default rules are as follows:
 
 | Signal | Default threshold | Duration | Action |
 | --- | ---: | ---: | --- |

@@ -13604,20 +13604,24 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
   that **several GPUs appear in one notification** -- the sustained low-utilisation signal is tracked
   per GPU device, an 8-GPU node produces 8 findings, and one mail covering all of them at once is the
   very evidence of "aggregation"; the 24 in the verdict is the count without aggregation.
-- The signal is **latched**: it fires once per activation period and re-arms only when the node
+- The signal is **latched**: it fires once per activation period of each managed attempt. Window and
+  latch are both per attempt, so a job that takes over the node starts from zero and inherits neither
+  its predecessor's low time nor its latch; the unscoped continuity window resets only when the node
   reports "no active workload" again. This yields three execution constraints; the runner implements
   them and manual execution must follow them too:
-  - There must be no **other** GPU-holding Pods on the selected nodes. Any long-lived workload that
-    holds GPUs while idling pins the node's signal permanently in the already-reported state, and this
-    case will never see a new notification no matter how long it waits; the runner lists the
-    GPU-holding Pods on the selected nodes before each phase starts and refuses to execute outright,
-    instead of producing an unattributable FAIL a dozen minutes later.
-  - The two phases share nodes, so **leave a gap between phases**: deleting the job is not enough to
-    clear the latch, an idle node falls back to delivering only on the periodic health summary, and the
-    batch that clears the state may arrive several minutes later.
+  - There must be no **other** GPU-holding Pods on the selected nodes. Another managed job that holds
+    GPUs while idling leaves the node without a single managed attempt, so the signal never starts
+    timing and this case will never see a new notification no matter how long it waits; the runner
+    lists the GPU-holding Pods on the selected nodes before each phase starts and refuses to execute
+    outright, instead of producing an unattributable FAIL a dozen minutes later.
+  - The two phases share nodes, so **leave a gap between phases**: after the job is deleted an idle
+    node falls back to delivering only on the periodic health summary, and the batch that resets the
+    continuity window may arrive several minutes later.
     This gap **must not be a fixed sleep** either -- "detection window + 90 seconds" was once used and
-    measured only 25 seconds of headroom. The runner instead reads the signal state of the selected
-    nodes directly and polls until all of them have re-armed before submitting the next phase, bounded
+    measured only 25 seconds of headroom. The runner instead reads the unscoped signal state
+    (`cluster/node/metric/device/rule`) of the selected nodes directly -- a key that also names an
+    attempt belongs to a finished job, stays in its last reported state and cannot hold the next phase
+    back -- and polls until all of them have re-armed before submitting the next phase, bounded
     by `quiesce_deadline_seconds` (3 x detection window + 300 seconds); the wait is recorded in that
     phase's `quiesce_polls`; on timeout it fails outright as "latch not released" rather than counting
     it as the detector not firing.
