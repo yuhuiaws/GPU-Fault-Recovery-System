@@ -4,11 +4,10 @@ A real training job keeps kernels running on its GPUs. The long-running managed
 fixtures used to all-reduce one value, print a ``HEARTBEAT`` line and sleep two
 seconds, so nvidia-smi read about 0 % ``utilization.gpu`` for their whole life.
 The product's sustained ``LOW_GPU_UTILIZATION`` rule (``host_health.py``: a GPU
-of a node at or below 5 % for 300 s while the control plane resolves a live
-managed attempt there, each GPU graded on its own) reads that correctly as
-"GPUs idle while training is active", so every case whose job lived 300 s
-could open a host-health incident (GF-REGIONAL-E2E-002 had its injected XID
-merged into one).
+the live managed attempt holds on the node at or below 5 % for 300 s, each GPU
+graded on its own) reads that correctly as "GPUs idle while training is
+active", so every case whose job lived 300 s could open a host-health incident
+(GF-REGIONAL-E2E-002 had its injected XID merged into one).
 
 What ``utilization.gpu`` measures. nvidia-smi documentation,
 https://docs.nvidia.com/deploy/nvidia-smi/index.html, GPU ATTRIBUTES >
@@ -59,14 +58,16 @@ Inventory: every GPU workload the regional harness submits.
   ``two-node-replace-pytorchjob.yaml`` (DESTR-014/015/026),
   ``single-node-warm-spare-pytorchjob.yaml`` (DESTR-003/008) and
   ``xid11-single-node-job.yaml`` (DESTR-012 group D; one GPU, so the node's
-  seven other GPUs stay idle -- the product grades every GPU of the node).
+  seven other GPUs stay idle -- the product grades only the GPUs an attempt
+  holds, so they are not graded).
 * Short-lived, unchanged: ``three-node-managed-pytorchjob.yaml`` and
   ``examples/hyperpod/three-node-pytorchjob.yaml`` (three DDP steps, done in
   seconds; WORKLOAD-001/002's baseline).
 * Idle by design, unchanged: NOTIFY-005's CPU-only burn
   (``notify005_checks.low_utilization_manifest``: it exists to trip
-  ``LOW_GPU_UTILIZATION``, and it relies on the node's unallocated GPUs being
-  graded too), the warm-spare GPU holder Pod
+  ``LOW_GPU_UTILIZATION``, so it holds every GPU of its nodes and creates no
+  CUDA context, which also leaves ``LOW_CPU_UTILIZATION`` nothing to grade),
+  the warm-spare GPU holder Pod
   (``warm_spare_fixture.GpuHolderFixture``, unmanaged) and the late-ownership
   CUDA holder (``late_ownership_resources.CUDA_HOLDER``, 240 s deadline).
 * Not submitted by any runner or case procedure, unchanged: ``q118-*.yaml``

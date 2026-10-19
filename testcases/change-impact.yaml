@@ -749,9 +749,12 @@ rules:
       - tests/admin/test_admin_notification_bootstrap.py
       - tests/admin/test_admin_site_notification_channel.py
       # The NOTIFY-001..007 runner; NOTIFY-005 reads only the unscoped
-      # low-utilisation window between its phases (batch 140).
+      # low-utilisation window between its phases (batch 140) and holds every
+      # GPU of its nodes, since only held GPUs are graded (batch 142).
       - scripts/e2e/regional/run_notification_acceptance.py
+      - scripts/e2e/regional/notify005_checks.py
       - tests/regional/test_notify005_latch_probe.py
+      - tests/regional/test_notify005_owned_gpus.py
     pytest:
       - tests/notifications
       - tests/admin/test_admin_notifications.py
@@ -759,6 +762,7 @@ rules:
       - tests/admin/test_admin_site_notification_channel.py
       - tests/regional/test_notify005_latch_probe.py
       - tests/regional/test_notify005_behavior.py
+      - tests/regional/test_notify005_owned_gpus.py
       - tests/regional/test_notification_acceptance_runner.py
     regional_cases:
       - GF-REGIONAL-NOTIFY-001

@@ -53,6 +53,7 @@ from scripts.e2e.regional.notification_evidence import (  # noqa: E402
     split_drill_tagged_live_records,
 )
 from scripts.e2e.regional.notify005_checks import (  # noqa: E402
+    NODE_GPU_COUNT,
     low_utilization_manifest,
     node_errors,
     phase_checks,
@@ -779,7 +780,8 @@ for notification in store.list_notifications():
             notification.body_text,
         )
     )
-    if "LOW_GPU_UTILIZATION" not in searchable or not any(node in searchable for node in nodes):
+    low_cpu = "LOW_CPU_UTILIZATION" in searchable
+    if not (low_cpu or "LOW_GPU_UTILIZATION" in searchable) or not any(node in searchable for node in nodes):
         continue
     incident = store.get_incident(notification.incident_id)
     if incident.cluster_id != cluster_id:
@@ -793,6 +795,7 @@ for notification in store.list_notifications():
         "created_at": notification.created_at.isoformat(),
         "category": notification.category,
         "low_gpu_utilization": "LOW_GPU_UTILIZATION" in searchable,
+        "low_cpu_utilization": low_cpu,
         "matched_nodes": matched,
         # Every GPU the message speaks for. The sustained low-utilization signal
         # is tracked per device, so a node with 8 GPUs raises 8 findings; the
@@ -815,11 +818,10 @@ import json
 import sys
 from gpu_fault.app import ApplicationContext
 
-# Only read when a phase times out. The sustained low-utilization rule is gated
-# on the batch reporting an ACTIVE workload, so a node whose containers the
-# control plane never observed cannot raise the signal no matter how long the
-# case waits -- and this is the difference between a detector defect and a
-# workload that never landed where the case thinks it did.
+# Only read when a phase times out. The rule times a node only while the control
+# plane sees the attempt live there, and only the GPUs whose UUIDs its containers
+# list: this separates a detector defect from a workload that never landed where
+# the case thinks it did, or whose GPU UUIDs the watcher never read.
 cluster_id, *nodes = sys.argv[1:]
 store = ApplicationContext.from_environment().store
 records = []
@@ -829,6 +831,7 @@ for observation in store.list_attempt_observations(cluster_id):
             "node_id": container.node_id,
             "pod_name": container.pod_name,
             "gpu_count": container.gpu_count,
+            "gpu_uuids": list(container.gpu_uuids),
             "terminated": container.terminated,
         }
         for container in observation.containers
@@ -986,13 +989,11 @@ def foreign_gpu_reservations(
 ) -> list[dict[str, Any]]:
     """Running Pods that already hold a GPU on one of the selected nodes.
 
-    The sustained low-utilization signal latches: it fires once per activation
-    episode and stays quiet until the node stops reporting an active workload.
-    So an unrelated Pod that reserves a GPU and then idles keeps the node's
-    signal permanently notified, and no fixture this case submits can ever
-    produce a notification there. That is not a detector defect and it is not
-    something a longer wait fixes, so it has to be refused up front instead of
-    surfacing as an unattributable FAIL 15 minutes later.
+    The fixture requests every GPU of the node (only the GPUs a managed attempt
+    holds are graded), so any other holder keeps it Pending, and another
+    managed attempt leaves no single attempt to time. Neither is a detector
+    defect or something a longer wait fixes: refused up front, not reported as
+    an unattributable FAIL 15 minutes later.
     """
 
     value = json.loads(
@@ -1115,6 +1116,9 @@ def wait_low_utilization_notifications(
             {
                 "observed_at": utc_now(),
                 "notification_count": len(records),
+                "low_cpu_notification_count": sum(
+                    bool(item.get("low_cpu_utilization")) for item in query["records"]
+                ),
                 "reported_nodes": sorted(reported),
             }
         )
@@ -1204,24 +1208,19 @@ def run_notify005(
         LOW_UTILIZATION_CONFIG_PROBE,
     )
     duration_seconds = int(config["duration_seconds"])
-    # Three times the sustained window plus five minutes, because the wait is
-    # two stages in series rather than one window. The signal needs a delivered
-    # batch that reports an active workload with near-zero GPU use before the
-    # window starts counting, and the host edge filter subtracts an already
-    # active edge reason from its delivery reasons, so once the low-utilization
-    # edge has been delivered the next batch only arrives on the periodic health
-    # summary. The window therefore expires unobserved and is judged one summary
-    # cycle later: interval + duration + summary, on top of however long the
-    # workload takes to register as active. Live worst case was 748 seconds
-    # against a 900-second budget, which is too little margin to keep.
+    # Three windows plus five minutes: the wait is two stages in series. The
+    # window starts at the first delivered batch with an active workload and a
+    # near-zero GPU, and the host edge filter delivers an edge reason only when
+    # it appears, so the expired window is judged on the next health summary:
+    # interval + duration + summary, plus however long the workload takes to
+    # register as active. Live worst case was 748 seconds against a 900-second
+    # budget, which is too little margin to keep.
     phase_deadline_seconds = duration_seconds * 3 + 300
-    # The two phases share nodes, and the latch only clears once the node
-    # reports no active workload. Deleting the fixture is not enough: an idle
-    # node stops delivering on every collection interval and falls back to its
-    # health summary, so the clearing batch can be several minutes out. Without
-    # that quiet gap the second phase inherits phase one's notified latch and
-    # the node stays silent for a reason that has nothing to do with the case.
-    # The gap is polled rather than slept: a fixed `duration + 90` once cleared
+    # The two phases share nodes, and the unscoped window only resets once the
+    # node reports no active workload. Deleting the fixture is not enough: an
+    # idle node falls back to its health summary, so the clearing batch can be
+    # several minutes out, and the next phase starts once it has arrived. The
+    # gap is polled rather than slept: a fixed `duration + 90` once cleared
     # with 25 seconds to spare, which is a flake waiting to be recorded as a
     # FAIL against the detector.
     quiesce_deadline_seconds = duration_seconds * 3 + 300
@@ -1263,7 +1262,7 @@ def run_notify005(
             if holders:
                 raise NotificationAcceptanceError(
                     "selected nodes already hold GPUs for unrelated workloads, "
-                    "whose idle reservation latches the low-utilization signal: "
+                    "and the fixture needs every GPU of each node: "
                     f"{holders}"
                 )
             quiesce_polls = wait_low_utilization_latch_disarmed(
@@ -1300,7 +1299,7 @@ def run_notify005(
                     attempt_id=f"{name}-a001",
                     restart_budget=0,
                     expected_pods=count,
-                    expected_gpu_count=count,
+                    expected_gpu_count=count * NODE_GPU_COUNT,
                 ),
                 state_path=case_dir / f"{name}.ownership.json",
             )
@@ -1368,7 +1367,7 @@ def run_notify005(
         if cleanup_errors:
             result["verdict"] = "FAIL"
     result["limitations"] = [
-        "The workloads intentionally reserve one GPU while performing CPU work; "
+        "The workloads reserve every GPU of each node while doing CPU work only; "
         "they validate notification aggregation without damaging hardware.",
         "The sustained low-utilization signal latches per GPU and attempt, and "
         "its unscoped window resets only after the node reports no active "

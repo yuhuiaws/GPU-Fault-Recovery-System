@@ -5,6 +5,12 @@ from __future__ import annotations
 import copy
 from typing import Any
 
+#: GPUs of a selected node, every one of which the fixture requests: the
+#: product grades low utilisation only on the GPUs a managed attempt holds
+#: (``gpu_fault/host_low_utilization.py``), so one requested GPU of eight
+#: would give one graded GPU and nothing to aggregate.
+NODE_GPU_COUNT = 8
+
 
 def low_utilization_manifest(
     *,
@@ -12,6 +18,14 @@ def low_utilization_manifest(
     nodes: tuple[str, ...],
     image: str,
 ) -> dict[str, Any]:
+    """Eight CPU burners per node, holding every GPU and touching none.
+
+    No burner creates a CUDA context, so nvidia-smi lists no compute process:
+    ``LOW_GPU_UTILIZATION`` fires on each held GPU and ``LOW_CPU_UTILIZATION``
+    (the CPU of the processes driving a GPU) has nothing to grade.
+    """
+
+    gpus = str(NODE_GPU_COUNT)
     command = [
         "/bin/bash",
         "-ceu",
@@ -36,8 +50,8 @@ def low_utilization_manifest(
         "imagePullPolicy": "IfNotPresent",
         "command": command,
         "resources": {
-            "requests": {"cpu": "8", "memory": "2Gi", "nvidia.com/gpu": "1"},
-            "limits": {"cpu": "16", "memory": "4Gi", "nvidia.com/gpu": "1"},
+            "requests": {"cpu": "8", "memory": "2Gi", "nvidia.com/gpu": gpus},
+            "limits": {"cpu": "16", "memory": "4Gi", "nvidia.com/gpu": gpus},
         },
     }
     if len(nodes) == 1:
@@ -118,7 +132,7 @@ def node_errors(node: dict[str, Any]) -> list[str]:
         errors.append("node identity or Ready state is unknown")
     if node.get("unschedulable") is not False or node.get("ownership_annotations"):
         errors.append("node is cordoned or owned by another workflow")
-    if str(node.get("gpu_allocatable")) != "8":
+    if str(node.get("gpu_allocatable")) != str(NODE_GPU_COUNT):
         errors.append("the aggregation fixture requires an eight-GPU node")
     return errors
 
@@ -137,7 +151,13 @@ def phase_checks(observation: dict[str, Any]) -> dict[str, bool]:
             len(item["matched_nodes"]) == 1 for item in records
         ),
         "notifications_aggregate_multiple_gpu_devices": bool(records)
-        and all(1 < len(item["gpu_devices"]) <= 8 for item in records),
+        and all(1 < len(item["gpu_devices"]) <= NODE_GPU_COUNT for item in records),
+        # The burners hold no compute context: a LOW_CPU_UTILIZATION mail for
+        # these nodes would be the host-wide CPU reading the rule dropped.
+        "cpu_rule_silent": not any(
+            poll.get("low_cpu_notification_count")
+            for poll in observation.get("polls", [])
+        ),
         "every_notification_sent": bool(records)
         and all(
             item.get("status") == "SENT"

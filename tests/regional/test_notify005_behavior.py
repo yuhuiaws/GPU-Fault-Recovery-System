@@ -192,6 +192,11 @@ def test_two_phase_flow_stops_on_failure_and_keeps_cleanup_errors(
         "PASS" if first_sent and not cleanup_fails else "FAIL"
     ), result
     assert len(created) == (2 if first_sent and not cleanup_fails else 1)
+    # Each phase's fixture holds every GPU of its nodes (only held GPUs are
+    # graded), and its ownership binding records that count.
+    assert [fixture.settings.expected_gpu_count for fixture in created] == [8, 24][
+        : len(created)
+    ], [fixture.settings for fixture in created]
     if cleanup_fails:
         assert result["cleanup_errors"]
         assert "deletion refused" in result["error"]
