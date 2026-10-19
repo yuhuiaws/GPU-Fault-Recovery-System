@@ -29,9 +29,15 @@ from gpu_fault.models import (
     WorkloadState,
     recovery_action_sort_key,
 )
-from gpu_fault.store.shared.health_signals import finding_health_signal_fingerprint
+from gpu_fault.store.shared.health_signals import (
+    attempt_signal_key,
+    finding_health_signal_fingerprint,
+    health_signal_key,
+)
 
 LOGGER = logging.getLogger(__name__)
+# ``(signal_key, active, observed_at, minimum_active_seconds)`` of one claim.
+_Transition = tuple[str, bool, datetime, float]
 
 
 class HostMetricSample(StrictModel):
@@ -385,7 +391,7 @@ def efa_inventory_rule(
 
 
 class _BatchManagedAttempt:
-    """Resolve the managed attempt that owns a telemetry batch, once.
+    """Resolve, once, the managed attempt owning a batch; scope its windows.
 
     A batch carries eight GPUs times several rules and the resolver walks
     every attempt observation in the cluster; the answer cannot change inside
@@ -393,7 +399,7 @@ class _BatchManagedAttempt:
     the call. Nothing lands on the policy, so no state leaks across batches.
     """
 
-    __slots__ = ("_attempt", "_batch", "_explained", "_policy", "_resolved")
+    __slots__ = ("_attempt", "_batch", "_explained", "_gates", "_policy", "_resolved")
 
     def __init__(self, policy: NodeHealthPolicy, batch: HostTelemetryBatch) -> None:
         self._policy = policy
@@ -401,6 +407,43 @@ class _BatchManagedAttempt:
         self._resolved = False
         self._attempt: Any = None
         self._explained = False
+        self._gates: dict[str, _Transition] = {}
+
+    def scope(self, transition: _Transition) -> _Transition:
+        """Time an active-workload window per resolved managed attempt.
+
+        A replacement attempt must not inherit the node's low time or latch
+        (round 10: E2E-002 restarted a minute after taking over from
+        COLLECT-017). The claim runs under the attempt's key; the unscoped
+        transition rides along as its gate, the only key that sees -- and is
+        reset by -- a sample without one managed attempt. Both are store rows:
+        every replica shares them and they survive restarts.
+        """
+
+        attempt = self.resolve()
+        if attempt is None:
+            return transition
+        signal_key, active, observed_at, duration = transition
+        scoped = attempt_signal_key(signal_key, attempt.job_id, attempt.attempt_id)
+        self._gates[scoped] = transition
+        return scoped, active, observed_at, duration
+
+    def claim(
+        self, transitions: list[_Transition], fingerprints: list[str]
+    ) -> list[bool]:
+        """Claim transitions and gates in one store call; a scoped window emits
+        only if its gate, never latched, has been active as long."""
+
+        gated = [i for i, item in enumerate(transitions) if item[0] in self._gates]
+        emitted = self._policy.store.claim_health_signal_transitions(
+            [*transitions, *(self._gates[transitions[i][0]] for i in gated)],
+            received_at=self._batch.received_at,
+            semantic_fingerprints=[*fingerprints, *(fingerprints[i] for i in gated)],
+        )
+        verdicts: list[bool] = emitted[: len(transitions)]
+        for index, gate in zip(gated, emitted[len(transitions) :], strict=True):
+            verdicts[index] = verdicts[index] and gate
+        return verdicts
 
     def resolve(self) -> Any:
         """The one managed attempt on the batch's node, or ``None``; memoized."""
@@ -961,13 +1004,9 @@ class NodeHealthPolicy:
                 )
             )
         self.store.observe_telemetry_metrics(latest_metrics)
-        emitted = self.store.claim_health_signal_transitions(
+        emitted = managed_attempt.claim(
             transitions,
-            received_at=batch.received_at,
-            semantic_fingerprints=[
-                finding_health_signal_fingerprint(finding)
-                for finding in transition_findings
-            ],
+            [finding_health_signal_fingerprint(item) for item in transition_findings],
         )
         findings.extend(
             finding
@@ -1027,32 +1066,27 @@ class NodeHealthPolicy:
         # counts while the control plane resolves one real managed attempt with
         # a live container on this node (the resolver the EFA-traffic rule
         # already trusts). Anything else is an idle sample and resets the
-        # sustain window exactly as a healthy reading would.
+        # sustain window exactly as a healthy reading would. The window is
+        # that attempt's own: a replacement attempt starts from zero.
         attempt = managed_attempt.resolve() if active_workload_only else None
         if active_workload_only and attempt is None:
             if active:
                 managed_attempt.explain_inactive(rule_id, sample)
             active = False
-        signal_key = "/".join(
-            [
-                batch.cluster_id,
-                batch.node_id,
-                sample.name,
-                sample.device or "node",
-                rule_id,
-            ]
+        transition = (
+            health_signal_key(
+                batch.cluster_id, batch.node_id, sample.name, sample.device, rule_id
+            ),
+            active,
+            batch.observed_at,
+            duration,
         )
         event_id = (
             f"{batch.batch_id}-{sample.name}-"
             f"{self._safe(sample.device or 'node')}-{rule_id.lower()}"
         )
         return (
-            (
-                signal_key,
-                active,
-                batch.observed_at,
-                duration,
-            ),
+            managed_attempt.scope(transition) if active_workload_only else transition,
             NodeHealthFinding(
                 finding_id=f"finding-{event_id}",
                 event_id=event_id,

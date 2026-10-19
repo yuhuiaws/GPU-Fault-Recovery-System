@@ -853,11 +853,11 @@ import json
 import sys
 from gpu_fault.app import ApplicationContext
 
-# The disarm state of the sustained low-utilization signal on the selected
-# nodes. This is what the inter-phase quiet gap is actually waiting for, so the
-# runner reads it instead of assuming a sleep was long enough: the latch is
-# per GPU device, it clears only on a batch that reports no active workload, and
-# an idle node delivers those batches one health summary apart.
+# The disarm state of the selected nodes' unscoped low-utilization windows
+# (cluster/node/metric/device/rule), which only a batch reporting no active
+# workload resets -- one health summary apart on an idle node -- so the runner
+# polls it instead of trusting a sleep. Longer keys are one attempt's own
+# window and latch; no later attempt inherits them, so they are skipped.
 cluster_id, *nodes = sys.argv[1:]
 store = ApplicationContext.from_environment().store
 records = []
@@ -865,7 +865,7 @@ for item in store._list("health_signal_state"):
     document = item if isinstance(item, dict) else item.model_dump(mode="json")
     key = str(document.get("signal_key", ""))
     parts = key.split("/")
-    if len(parts) < 5:
+    if len(parts) != 5:
         continue
     if parts[0] != cluster_id or parts[1] not in nodes:
         continue
@@ -1370,10 +1370,10 @@ def run_notify005(
     result["limitations"] = [
         "The workloads intentionally reserve one GPU while performing CPU work; "
         "they validate notification aggregation without damaging hardware.",
-        "The sustained low-utilization signal latches per GPU and re-arms only "
-        "after the node reports no active workload, so the case refuses nodes "
-        "that already hold a GPU for an unrelated workload and waits for each "
-        "phase's nodes to be observably re-armed before submitting; "
+        "The sustained low-utilization signal latches per GPU and attempt, and "
+        "its unscoped window resets only after the node reports no active "
+        "workload, so the case refuses nodes that already hold a GPU for an "
+        "unrelated workload and waits for each phase's nodes to be re-armed; "
         "quiesce_polls records that wait and pre_existing_notifications records "
         "the episodes that preceded the run.",
     ]

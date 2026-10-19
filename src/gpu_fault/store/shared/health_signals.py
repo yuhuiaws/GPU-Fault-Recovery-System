@@ -103,19 +103,49 @@ def finding_health_signal_fingerprint(finding: NodeHealthFinding) -> str:
     ).hexdigest()
 
 
+def health_signal_key(
+    cluster_id: str,
+    node_id: str,
+    metric_name: str,
+    device: str | None,
+    rule_id: str | None = None,
+) -> str:
+    """``cluster/node/metric/device``, plus the sustained rule id if any."""
+
+    parts = [cluster_id, node_id, metric_name, device or "node"]
+    if rule_id:
+        parts.append(rule_id)
+    return "/".join(parts)
+
+
+def attempt_signal_key(signal_key: str, job_id: str, attempt_id: str) -> str:
+    """The window of an active-workload rule for one managed attempt.
+
+    Low CPU/GPU utilisation is timed per attempt: a job that replaces another
+    on the node starts a fresh window and a fresh notification latch instead of
+    inheriting the previous attempt's low time (round 10, COLLECT-017 ->
+    E2E-002). Rows accumulate per attempt, as EFA-traffic and training-health
+    states already do.
+    """
+
+    return "/".join([signal_key, job_id, attempt_id])
+
+
 def finding_health_signal_key(finding: NodeHealthFinding) -> str:
     """The health-signal key ``HostHealthService.evaluate_metrics`` claimed for
     a finding: ``cluster/node/metric/device`` plus the sustained rule id when
-    the finding came from one (it travels as ``diagnostic_parameters["signal"]``).
+    the finding came from one (it travels as ``diagnostic_parameters["signal"]``)
+    and, for a rule timed per managed attempt, the attempt the finding names.
     """
 
-    parts = [
+    rule_id = finding.diagnostic_parameters.get("signal")
+    key = health_signal_key(
         finding.cluster_id,
         finding.node_id,
         str(finding.metric_name),
-        finding.device or "node",
-    ]
-    rule_id = finding.diagnostic_parameters.get("signal")
-    if rule_id:
-        parts.append(str(rule_id))
-    return "/".join(parts)
+        finding.device,
+        str(rule_id) if rule_id else None,
+    )
+    if rule_id and finding.job_id and finding.attempt_id:
+        return attempt_signal_key(key, finding.job_id, finding.attempt_id)
+    return key

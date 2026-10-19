@@ -560,6 +560,10 @@ rules:
     pytest:
       - tests/store/test_store_contracts.py
       - tests/processor
+      # The key a delivered finding latches is the key the claim used, the
+      # attempt-scoped low-utilisation windows included (batch 140).
+      - tests/store/test_health_signal_semantics.py
+      - tests/app_services/test_health_signal_notified_after_delivery.py
     regional_cases:
       - GF-REGIONAL-CAP-001..005
       - GF-REGIONAL-HA-003
@@ -617,6 +621,8 @@ rules:
       - src/gpu_fault/dcgm_*.py
       - src/gpu_fault/gpu_*.py
       - src/gpu_fault/host_health.py
+      # Low CPU/GPU utilisation windows timed per managed attempt (batch 140).
+      - tests/host_health/test_low_utilization_attempt_window.py
       - src/gpu_fault/control_record_archive.py
       - src/gpu_fault/efa_traffic_state.py
       - src/gpu_fault/log_rules.py
@@ -641,6 +647,9 @@ rules:
       - tests/collectors
       - tests/policy
       - tests/nvidia_logs
+      # host_health.py's own rules: the sustained host-resource windows, the
+      # managed-attempt gate and its per-attempt scope (batch 140).
+      - tests/host_health
       - tests/fleet/test_dcgm_hostengine_heartbeat.py
       - tests/metrics/test_fabric_manager_state.py
       - tests/execution/test_validation_nvlink_fabric.py
@@ -735,11 +744,18 @@ rules:
       - tests/admin/test_admin_notifications.py
       - tests/admin/test_admin_notification_bootstrap.py
       - tests/admin/test_admin_site_notification_channel.py
+      # The NOTIFY-001..007 runner; NOTIFY-005 reads only the unscoped
+      # low-utilisation window between its phases (batch 140).
+      - scripts/e2e/regional/run_notification_acceptance.py
+      - tests/regional/test_notify005_latch_probe.py
     pytest:
       - tests/notifications
       - tests/admin/test_admin_notifications.py
       - tests/admin/test_admin_notification_bootstrap.py
       - tests/admin/test_admin_site_notification_channel.py
+      - tests/regional/test_notify005_latch_probe.py
+      - tests/regional/test_notify005_behavior.py
+      - tests/regional/test_notification_acceptance_runner.py
     regional_cases:
       - GF-REGIONAL-NOTIFY-001
       - GF-REGIONAL-NOTIFY-003..007
