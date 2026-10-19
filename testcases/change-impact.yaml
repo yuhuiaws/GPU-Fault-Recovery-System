@@ -621,8 +621,12 @@ rules:
       - src/gpu_fault/dcgm_*.py
       - src/gpu_fault/gpu_*.py
       - src/gpu_fault/host_health.py
-      # Low CPU/GPU utilisation windows timed per managed attempt (batch 140).
+      # Low CPU/GPU utilisation windows timed per managed attempt (batch 140),
+      # graded only on the GPUs that attempt holds (batch 142).
+      - src/gpu_fault/host_low_utilization.py
       - tests/host_health/test_low_utilization_attempt_window.py
+      - tests/host_health/test_low_utilization_owned_gpus.py
+      - tests/host_health/test_low_utilization_provider_parity.py
       - src/gpu_fault/control_record_archive.py
       - src/gpu_fault/efa_traffic_state.py
       - src/gpu_fault/log_rules.py

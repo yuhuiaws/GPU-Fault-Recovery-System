@@ -40,9 +40,16 @@ WORKLOAD = "training/job/shared"
 GPUS = ("GPU-0", "GPU-1")
 A = ("job-a", "attempt-a")
 B = ("job-b", "attempt-b")
-CPU = ("cpu_usage_percent", None)
+CPU0 = ("training_rank_cpu_percent", "GPU-0")
+CPU1 = ("training_rank_cpu_percent", "GPU-1")
 GPU0 = ("host_gpu_utilization_percent", "GPU-0")
 GPU1 = ("host_gpu_utilization_percent", "GPU-1")
+
+
+def _every_signal(attempt):
+    """Both rules on both GPUs the attempt holds, in ``_owners`` order."""
+
+    return sorted((*signal, attempt) for signal in (CPU0, CPU1, GPU0, GPU1))
 
 
 def _observe(
@@ -108,7 +115,15 @@ def _sample(
             f"low-{offset}",
             observed_at,
             [
-                HostMetricSample(name="cpu_usage_percent", value=cpu, unit="percent"),
+                *(
+                    HostMetricSample(
+                        name="training_rank_cpu_percent",
+                        value=cpu,
+                        unit="percent",
+                        device=device,
+                    )
+                    for device in GPUS
+                ),
                 *(
                     HostMetricSample(
                         name="host_gpu_utilization_percent",
@@ -163,7 +178,7 @@ def test_a_replacement_attempt_does_not_inherit_the_previous_attempts_low_time()
         f"first low-utilisation finding at {first} s; attempt B started at 270 s "
         f"and must be low for {WINDOW} s itself: {_owners(fired.get(first, []))}"
     )
-    assert _owners(fired[first]) == [(*CPU, B), (*GPU0, B), (*GPU1, B)]
+    assert _owners(fired[first]) == _every_signal(B)
 
 
 def test_the_first_sample_of_a_replacement_attempt_does_not_fire_on_the_old_window():
@@ -171,11 +186,7 @@ def test_the_first_sample_of_a_replacement_attempt_does_not_fire_on_the_old_wind
     policy = NodeHealthPolicy(store)
     for offset in (0, 100, 200):
         assert _sample(policy, store, offset, A) == []
-    assert _owners(_sample(policy, store, 300, A)) == [
-        (*CPU, A),
-        (*GPU0, A),
-        (*GPU1, A),
-    ]
+    assert _owners(_sample(policy, store, 300, A)) == _every_signal(A)
     _end(store, A, 310)
 
     findings = _sample(policy, store, 320, B)
@@ -203,7 +214,7 @@ def test_a_delivered_finding_for_one_attempt_does_not_silence_the_next():
         "attempt A's latch silenced attempt B or B fired early: "
         f"{ {offset: _owners(items) for offset, items in fired.items() if items} }"
     )
-    assert _owners(fired[420 + WINDOW]) == [(*CPU, B), (*GPU0, B), (*GPU1, B)]
+    assert _owners(fired[420 + WINDOW]) == _every_signal(B)
     assert fired[780] == [], "a delivered finding repeated for attempt B"
 
 
@@ -213,7 +224,7 @@ def test_the_same_attempt_keeps_accumulating_across_batches():
     fired = {offset: _sample(policy, store, offset, A) for offset in range(0, 301, 30)}
 
     assert _first_fire(fired) == WINDOW
-    assert _owners(fired[WINDOW]) == [(*CPU, A), (*GPU0, A), (*GPU1, A)]
+    assert _owners(fired[WINDOW]) == _every_signal(A)
 
 
 def _collector_idle(policy, store, offset):
@@ -251,7 +262,7 @@ def test_a_sample_without_one_managed_attempt_still_resets_the_window(gap):
         "the window did not restart after the sample without a managed attempt: "
         f"{ {offset: _owners(items) for offset, items in fired.items() if items} }"
     )
-    assert _owners(fired[600]) == [(*CPU, A), (*GPU0, A), (*GPU1, A)]
+    assert _owners(fired[600]) == _every_signal(A)
 
 
 def test_each_gpu_keeps_its_own_window_inside_each_attempt():
@@ -285,7 +296,7 @@ def test_the_latch_key_of_a_low_utilisation_finding_names_its_attempt():
         _sample(policy, store, offset, A)
     findings = _sample(policy, store, 300, A)
 
-    assert len(findings) == 3, findings
+    assert len(findings) == 4, findings
     for finding in findings:
         key = finding_health_signal_key(finding)
         assert key.endswith("/job-a/attempt-a"), key

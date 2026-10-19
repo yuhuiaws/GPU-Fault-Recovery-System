@@ -54,8 +54,16 @@ def efa_telemetry(
 
 
 def observe_running_attempt(
-    store: InMemoryStore, observed_at: datetime, node_ids: tuple[str, ...] = ("node-a",)
+    store: InMemoryStore,
+    observed_at: datetime,
+    node_ids: tuple[str, ...] = ("node-a",),
+    *,
+    gpus: tuple[str, ...] | None = None,
 ) -> None:
+    """``job-a``/``attempt-a`` running one container per node; container
+    ``index`` holds ``GPU-<index>`` unless ``gpus`` names what each one holds
+    (the low-utilisation rules grade only the GPUs an attempt holds)."""
+
     store.save_attempt_observation(
         attempt_observation(
             "job-a",
@@ -69,7 +77,7 @@ def observe_running_attempt(
                     f"worker-{index}",
                     index,
                     node_id,
-                    gpu_uuids=[f"GPU-{index}"],
+                    gpu_uuids=list(gpus) if gpus is not None else [f"GPU-{index}"],
                 )
                 for index, node_id in enumerate(node_ids)
             ],

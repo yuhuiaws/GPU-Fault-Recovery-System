@@ -18,6 +18,11 @@ from pydantic import (
 )
 
 from gpu_fault.env import env_bool
+from gpu_fault.host_low_utilization import (
+    BatchManagedAttempt,
+    UnresolvedAllocationWarnings,
+    resolve_managed_attempt,
+)
 from gpu_fault.log_rules import NODE_LOG_RULES
 from gpu_fault.models import (
     EfaTrafficSignal,
@@ -30,14 +35,11 @@ from gpu_fault.models import (
     recovery_action_sort_key,
 )
 from gpu_fault.store.shared.health_signals import (
-    attempt_signal_key,
     finding_health_signal_fingerprint,
     health_signal_key,
 )
 
 LOGGER = logging.getLogger(__name__)
-# ``(signal_key, active, observed_at, minimum_active_seconds)`` of one claim.
-_Transition = tuple[str, bool, datetime, float]
 
 
 class HostMetricSample(StrictModel):
@@ -390,100 +392,6 @@ def efa_inventory_rule(
     )
 
 
-class _BatchManagedAttempt:
-    """Resolve, once, the managed attempt owning a batch; scope its windows.
-
-    A batch carries eight GPUs times several rules and the resolver walks
-    every attempt observation in the cluster; the answer cannot change inside
-    one ``evaluate_metrics`` call, so it is memoised here and discarded with
-    the call. Nothing lands on the policy, so no state leaks across batches.
-    """
-
-    __slots__ = ("_attempt", "_batch", "_explained", "_gates", "_policy", "_resolved")
-
-    def __init__(self, policy: NodeHealthPolicy, batch: HostTelemetryBatch) -> None:
-        self._policy = policy
-        self._batch = batch
-        self._resolved = False
-        self._attempt: Any = None
-        self._explained = False
-        self._gates: dict[str, _Transition] = {}
-
-    def scope(self, transition: _Transition) -> _Transition:
-        """Time an active-workload window per resolved managed attempt.
-
-        A replacement attempt must not inherit the node's low time or latch
-        (round 10: E2E-002 restarted a minute after taking over from
-        COLLECT-017). The claim runs under the attempt's key; the unscoped
-        transition rides along as its gate, the only key that sees -- and is
-        reset by -- a sample without one managed attempt. Both are store rows:
-        every replica shares them and they survive restarts.
-        """
-
-        attempt = self.resolve()
-        if attempt is None:
-            return transition
-        signal_key, active, observed_at, duration = transition
-        scoped = attempt_signal_key(signal_key, attempt.job_id, attempt.attempt_id)
-        self._gates[scoped] = transition
-        return scoped, active, observed_at, duration
-
-    def claim(
-        self, transitions: list[_Transition], fingerprints: list[str]
-    ) -> list[bool]:
-        """Claim transitions and gates in one store call; a scoped window emits
-        only if its gate, never latched, has been active as long."""
-
-        gated = [i for i, item in enumerate(transitions) if item[0] in self._gates]
-        emitted = self._policy.store.claim_health_signal_transitions(
-            [*transitions, *(self._gates[transitions[i][0]] for i in gated)],
-            received_at=self._batch.received_at,
-            semantic_fingerprints=[*fingerprints, *(fingerprints[i] for i in gated)],
-        )
-        verdicts: list[bool] = emitted[: len(transitions)]
-        for index, gate in zip(gated, emitted[len(transitions) :], strict=True):
-            verdicts[index] = verdicts[index] and gate
-        return verdicts
-
-    def resolve(self) -> Any:
-        """The one managed attempt on the batch's node, or ``None``; memoized."""
-
-        if not self._resolved:
-            self._attempt = self._policy._active_attempt(self._batch)
-            self._resolved = True
-        return self._attempt
-
-    def explain_inactive(self, rule_id: str, sample: HostMetricSample) -> None:
-        """Debug-log, once per batch, why an active-workload rule stays idle."""
-
-        if self._explained:
-            return
-        self._explained = True
-        batch = self._batch
-        if (
-            batch.workload_state is not WorkloadState.ACTIVE
-            or not batch.affected_workload_ids
-        ):
-            reason = "collector reports no ACTIVE workload"
-        else:
-            reason = (
-                "collector declares an ACTIVE workload but no single managed "
-                "attempt with a live container resolves on this node"
-            )
-        LOGGER.debug(
-            "%s on cluster=%s node=%s (first breach %s%s) treated as inactive: %s; "
-            "workload_state=%s affected_workload_ids=%s",
-            rule_id,
-            batch.cluster_id,
-            batch.node_id,
-            sample.name,
-            f"/{sample.device}" if sample.device else "",
-            reason,
-            batch.workload_state.value,
-            batch.affected_workload_ids,
-        )
-
-
 class NodeHealthPolicy:
     LATEST_METRICS_REQUIRED = _HOST_VALIDATION_LATEST_METRICS | {
         "gpu_inventory_expected_count",
@@ -505,13 +413,17 @@ class NodeHealthPolicy:
         "efa_cq_errors_delta",
     }
     SUSTAINED_METRIC_RULES = {
-        "cpu_usage_percent": (
+        # Per GPU, in percent of one core (collectors/host/gpu_rank.py): the
+        # host-wide cpu_usage_percent read a healthy 8-rank job as idle on a
+        # 192-vCPU host and as busy on a 96-vCPU one.
+        "training_rank_cpu_percent": (
             "LOW_CPU_UTILIZATION",
             "lte",
             NodeHealthCategory.CPU,
             Severity.WARNING,
             RecoveryAction.RUN_DIAGNOSTICS,
-            "CPU utilization remained near zero while a training workload was active",
+            "the training processes on this GPU used almost no CPU while their "
+            "managed attempt was active",
             True,
             "low_utilization",
         ),
@@ -764,6 +676,7 @@ class NodeHealthPolicy:
 
     def __init__(self, store) -> None:
         self.store = store
+        self.unresolved_gpu_allocations = UnresolvedAllocationWarnings()
         self.efa_minimum_active_bps = float(
             os.getenv("GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS", "1048576")
         )
@@ -924,7 +837,7 @@ class NodeHealthPolicy:
 
         findings = []
         related_metrics = {sample.name: sample.value for sample in batch.samples}
-        managed_attempt = _BatchManagedAttempt(self, batch)
+        managed_attempt = BatchManagedAttempt(self, batch)
         latest_metrics = []
         transitions = []
         transition_findings = []
@@ -1024,7 +937,7 @@ class NodeHealthPolicy:
         sample: HostMetricSample,
         rule,
         related_metrics: dict[str, float],
-        managed_attempt: _BatchManagedAttempt,
+        managed_attempt: BatchManagedAttempt,
     ):
         (
             rule_id,
@@ -1065,14 +978,15 @@ class NodeHealthPolicy:
         # reports ACTIVE while a placeholder job holds it idle. The signal only
         # counts while the control plane resolves one real managed attempt with
         # a live container on this node (the resolver the EFA-traffic rule
-        # already trusts). Anything else is an idle sample and resets the
-        # sustain window exactly as a healthy reading would. The window is
+        # already trusts), and only on a GPU that attempt holds there
+        # (host_low_utilization.py). Anything else is an idle sample and resets
+        # the sustain window exactly as a healthy reading would. The window is
         # that attempt's own: a replacement attempt starts from zero.
-        attempt = managed_attempt.resolve() if active_workload_only else None
-        if active_workload_only and attempt is None:
-            if active:
-                managed_attempt.explain_inactive(rule_id, sample)
-            active = False
+        graded = False
+        if active_workload_only:
+            graded = managed_attempt.grades(rule_id, sample, active)
+            active = active and graded
+        attempt = managed_attempt.resolve() if graded else None
         transition = (
             health_signal_key(
                 batch.cluster_id, batch.node_id, sample.name, sample.device, rule_id
@@ -1086,7 +1000,7 @@ class NodeHealthPolicy:
             f"{self._safe(sample.device or 'node')}-{rule_id.lower()}"
         )
         return (
-            managed_attempt.scope(transition) if active_workload_only else transition,
+            managed_attempt.scope(transition) if graded else transition,
             NodeHealthFinding(
                 finding_id=f"finding-{event_id}",
                 event_id=event_id,
@@ -1120,37 +1034,7 @@ class NodeHealthPolicy:
         )
 
     def _active_attempt(self, batch: HostTelemetryBatch):
-        if (
-            batch.workload_state is not WorkloadState.ACTIVE
-            or not batch.affected_workload_ids
-        ):
-            return None
-        workload_ids = set(batch.affected_workload_ids)
-        candidates = []
-        for observation in self.store.list_attempt_observations(batch.cluster_id):
-            age = (batch.observed_at - observation.observed_at).total_seconds()
-            if (
-                age < -30
-                or age > 120
-                or observation.workload_phase.value not in {"PENDING", "RUNNING"}
-                or not workload_ids.intersection(observation.workload_ids)
-                or not any(
-                    container.node_id == batch.node_id and not container.terminated
-                    for container in observation.containers
-                )
-            ):
-                continue
-            candidates.append(observation)
-        identities = {(item.job_id, item.attempt_id) for item in candidates}
-        if len(identities) > 1:
-            LOGGER.warning(
-                "ambiguous managed attempt ownership: cluster=%s node=%s identities=%s",
-                batch.cluster_id,
-                batch.node_id,
-                sorted(identities),
-            )
-            return None
-        return candidates[0] if len(identities) == 1 else None
+        return resolve_managed_attempt(self.store, batch)
 
     def _training_progress_at(
         self, cluster_id: str, attempt_id: str
@@ -1232,7 +1116,7 @@ class NodeHealthPolicy:
     def _evaluate_efa_traffic(
         self,
         batch: HostTelemetryBatch,
-        managed_attempt: _BatchManagedAttempt | None = None,
+        managed_attempt: BatchManagedAttempt | None = None,
     ) -> list[NodeHealthFinding]:
         samples = [
             item

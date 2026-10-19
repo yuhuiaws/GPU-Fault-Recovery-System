@@ -69,8 +69,11 @@ def test_the_latch_probe_skips_a_finished_attempts_own_window(
                     "attempt-a",
                     START + timedelta(seconds=offset),
                     workload_ids=[WORKLOAD],
+                    # The phase's job holds the GPU it is graded on.
                     containers=[
-                        container_observation("pod-a", "worker-a", 0, "node-a")
+                        container_observation(
+                            "pod-a", "worker-a", 0, "node-a", gpu_uuids=["GPU-0"]
+                        )
                     ],
                 )
             )

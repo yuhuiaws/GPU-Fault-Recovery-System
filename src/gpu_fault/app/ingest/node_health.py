@@ -118,7 +118,7 @@ class NodeHealthIngestionService:
             elif (
                 finding.metric_name
                 in {
-                    "cpu_usage_percent",
+                    "training_rank_cpu_percent",
                     "host_gpu_utilization_percent",
                     "memory_available_percent",
                     "page_cache_percent",

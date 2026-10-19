@@ -35,16 +35,14 @@ def _low_utilization_batch(batch_id: str, offset: float, *, node_id: str = "node
         batch_id,
         NOW + timedelta(seconds=offset),
         [
-            HostMetricSample(name="cpu_usage_percent", value=1.0, unit="percent"),
             *(
-                HostMetricSample(
-                    name="host_gpu_utilization_percent",
-                    value=0.0,
-                    unit="percent",
-                    device=device,
+                HostMetricSample(name=name, value=0.0, unit="percent", device=device)
+                for name in (
+                    "training_rank_cpu_percent",
+                    "host_gpu_utilization_percent",
                 )
                 for device in GPUS
-            ),
+            )
         ],
         node_id=node_id,
         workload_state="ACTIVE",
@@ -106,7 +104,8 @@ def test_running_attempt_on_the_node_fires_once_per_device_with_its_identity() -
     policy = NodeHealthPolicy(store)
 
     emitted = _run_low_utilization(
-        policy, seed=lambda observed_at: observe_running_attempt(store, observed_at)
+        policy,
+        seed=lambda observed_at: observe_running_attempt(store, observed_at, gpus=GPUS),
     )
 
     assert all(
@@ -120,12 +119,15 @@ def test_running_attempt_on_the_node_fires_once_per_device_with_its_identity() -
     ]
     assert sorted((item.metric_name, item.device) for item in findings) == sorted(
         [
-            ("cpu_usage_percent", None),
+            ("training_rank_cpu_percent", "GPU-0"),
+            ("training_rank_cpu_percent", "GPU-1"),
             ("host_gpu_utilization_percent", "GPU-0"),
             ("host_gpu_utilization_percent", "GPU-1"),
         ]
     ), findings
-    gpu_findings = [item for item in findings if item.device is not None]
+    gpu_findings = [
+        item for item in findings if item.metric_name == "host_gpu_utilization_percent"
+    ]
     assert len({item.event_id for item in gpu_findings}) == 2, (
         "per-GPU event ids collapsed"
     )

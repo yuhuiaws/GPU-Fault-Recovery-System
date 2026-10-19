@@ -364,8 +364,8 @@ def test_host_validation_metrics_are_persisted_as_latest() -> None:
 @pytest.mark.parametrize(
     ("metric_name", "value", "normal_value", "device"),
     [
-        ("cpu_usage_percent", 1, 50, None),
-        ("host_gpu_utilization_percent", 0, 90, "GPU-a"),
+        ("training_rank_cpu_percent", 1, 50, "GPU-0"),
+        ("host_gpu_utilization_percent", 0, 90, "GPU-0"),
         ("memory_available_percent", 2, 50, None),
         ("page_cache_percent", 95, 20, None),
         ("local_filesystem_used_percent", 92, 40, "/"),
@@ -720,8 +720,8 @@ def test_gpu_low_utilization_email_is_aggregated_per_node(monkeypatch) -> None:
     context = ApplicationContext(notification_notifier=notifier)
     clock = _IngestionClock(monkeypatch, NOW)
     # A declared ACTIVE state is only a pre-filter; the rule counts while a
-    # managed attempt is observed running on the node.
-    observe_running_attempt(context.store, NOW)
+    # managed attempt is observed running on the node, on the GPUs it holds.
+    observe_running_attempt(context.store, NOW, gpus=("GPU-a", "GPU-b"))
 
     def batch(batch_id: str, observed_at: datetime):
         return host_telemetry_batch(
