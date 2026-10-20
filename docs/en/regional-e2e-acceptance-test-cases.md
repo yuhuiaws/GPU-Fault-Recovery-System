@@ -10352,6 +10352,21 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   workload. If the POST/creation ACK is unknown, QUIESCENT is stale, or commands are still active, keep the protection in place and FAIL.
   The last scenario must likewise have complete cleanup proof; its `verdict=PASS` alone does not complete the matrix.
   Only ownership/reservation written by this workflow may be deleted; installer annotations must not be wildcard-deleted.
+  "Stale" counts from the moment the observer writes its terminal receipt: the receipt is written once, the 30-second
+  bound (`MAX_RECEIPT_AGE`) is not relaxed, and after the watchdog certifies it the fence close certifies it again on
+  its own (after two release-state reads, one more control read). `wait_quiescence` therefore runs its read-only runtime
+  checks as one concurrent batch (`destr008_parallel.gather`), and a pass reads only the control, the Job and the Pod
+  (three round trips plus one second); once a pass's control read shows QUIESCENT, the same pass reads the Job and the
+  Pod, re-verifies the control and the four supporting resources in one concurrent batch, and certifies freshness on the
+  last read before it records the verdict (four round trips); the fence adds three. The supporting resources used to be
+  re-read sequentially on every pass, about 22 sequential reads between the close request and the certification: at
+  about 1.2 s per kubectl call, and 2-6 s while parallel test suites saturate the acceptance host's disk I/O, the
+  receipt was 36 s old when certified, so only a cleanup observer could re-establish the proof and the case FAILed. A
+  receipt that really exceeds the bound is still refused: a refusal by the watchdog falls back to a cleanup observer and
+  FAILs, a refusal by the fence keeps the protection, defers cleanup and FAILs. `finish()` errors keep the harness's own
+  fixed reason (the `RegionalFixtureError` text, kubectl output already redacted; any other exception keeps only its
+  class), and the scenario result's `errors` carries them with an `independent safety: ` prefix. Verdicts:
+  `tests/regional/test_destr008_receipt_freshness.py`.
 - An existing run only enters cleanup resumption; it does not re-send the POST, re-create the workload or stop a service again; the original
   attempt, Plan and deadlines are kept, and a successful cleanup does not turn the original failure into a PASS. A metadata-only interruption
   whose original modification baseline was not preserved cannot guess recovery from the current labels and must be reconciled by hand. A completed and fully cleaned
