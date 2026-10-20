@@ -1620,12 +1620,21 @@ Semantics and boundaries of `eks-managed`:
   stop it, one that does not manage it, or no window excuses nothing; it excuses Fabric Manager itself only -- on NVL5 an
   `nvlsm` of the same unit holding an NVIDIA device node is still a client and fails closed, not observed live): they do
   not stop the unload and are both recorded
-  in `display_release_bystanders` (detailed design, quiesce). **`/proc/modules` decides whether the stack is back**: when
-  a module the reset unloaded is still missing after the load (`modprobe` failed, exited 0 and loaded nothing, or brought
-  back `nvidia_modeset` alone), the Agent pauses 5 s and tries once more (each `modprobe` bounded at 12 s, under 30 s in
-  all), both attempts recorded in `display_module_reload_attempts`; `reloaded_kernel_modules` lists only the modules
-  verified back. A stack still not back is `display_stack_restored=false`, with `display_modules_missing`, the last error
-  in `kernel_module_reload_error` and the remedy in `display_stack_remedy` (`modprobe nvidia_drm, or reboot the node`).
+  in `display_release_bystanders` (detailed design, quiesce). **`/proc/modules` and `/sys/class/drm` decide whether the
+  stack is back**: before the unload the Agent notes which GPUs have an NVIDIA DRM device, and after the load every module
+  the reset unloaded must be `Live` again and every one of those GPUs must have its DRM device back. A missing module
+  (`modprobe` failed, exited 0 and loaded nothing, or brought back `nvidia_modeset` alone) earns one more `modprobe` after
+  a 5 s pause; every module live but a GPU without its DRM device (a partial load) earns one retry as
+  `rmmod nvidia_drm && modprobe nvidia_drm`, and none while `nvidia_drm` has a user. Each `modprobe` is bounded at 12 s
+  plus 5 s per GPU (52 s on eight GPUs): after the unload the GPUs are cold with persistence off and the load initialises
+  them one by one (about 2.2 s per H200 on p5en); the former 12 s bound killed `modprobe` after a fabric reset, the last
+  two GPUs got no DRM device (kernel `request_irq() failed (-4)`), and `/proc/modules` still read as restored. Both
+  attempts are recorded in `display_module_reload_attempts`; `reloaded_kernel_modules` lists only the modules verified
+  back and `display_drm_devices_before`/`_after` count the DRM devices. A stack still not back is
+  `display_stack_restored=false`, with `display_modules_missing` or `display_drm_devices_missing` (the PCI addresses of
+  the GPUs without a DRM device), the last error in `kernel_module_reload_error` and the remedy in `display_stack_remedy`
+  (`modprobe nvidia_drm, or reboot the node`; for a partial load `rmmod nvidia_drm && modprobe nvidia_drm, or reboot the
+  node`); a failed fabric reset's step details carry the same fields.
   That is neither a failed reset nor a GPU fault: the reset stays SUCCEEDED, nothing is drained, quarantined or escalated
   to a reset or reboot (CUDA does not use the display stack), but until the stack is loaded or the node reboots it has no
   `/dev/dri` and graphics/EGL/Vulkan workloads get no DRM device. The operator reads it in that reset's completion mail:
@@ -1633,8 +1642,10 @@ Semantics and boundaries of `eks-managed`:
   `ACTION_COMPLETED`) carries `[display stack not restored]` in the subject and, per node, the missing modules, the last
   error and the remedy under "3. Follow-up"; the same fields are in the reset step's `node_results.<node>` of
   `GET /v1/workflows/{workflow_id}`. Remedy: on that node run `modprobe nvidia_drm` as root (`modprobe nvidia_modeset` when
-  only `nvidia_modeset` was unloaded), or reboot the node; later reset records and mails no longer carry it. An older
-  Agent reports only `kernel_module_reload_error`, and the control plane renders the same remedy for it. The Agent's own
+  only `nvidia_modeset` was unloaded; after a partial load `rmmod nvidia_drm` first, and `ls /dev/dri` should then show one
+  `renderD*` per GPU), or reboot the node -- before a fabric reset on such a node: its GPUs without a DRM device are
+  cold, and a busy reset may run out of the command's two minutes; later reset records and mails no longer carry it. An
+  older Agent reports only `kernel_module_reload_error`, and the control plane renders the same remedy for it. The Agent's own
   diagnostic commands (RUN_DCGM_DIAGNOSTIC, COLLECT_DIAGNOSTIC_BUNDLE, COLLECT_HUNG_TRIAGE, the field diagnostic,
   TRIGGER_HEALTH_SNAPSHOT) are refused while another incident's quiesce window is open (HTTP 409
   `GPU_MAINTENANCE_WINDOW_OPEN`, retryable: the step stays WAITING and is resubmitted after the window closed); one
@@ -4824,7 +4835,11 @@ cause is on the step: a persistent device holder is named in `persistent_device_
 (`OWNERSHIP_PERMIT_EXPIRED`) carries `ownership_permit_timing` -- `pre_permit_seconds` (the compute-apps query and the
 sampled holder classification, run before the permit is asked for), `permit_wait_seconds`, `post_permit_seconds` (the
 fence/quiesce checks and one holder sample inside the window) and `permit_lifetime_seconds` -- and every granted checkpoint
-in `physical_ownership_checks` carries the same four figures, so a slow node shows where its seconds went. The in-window
+in `physical_ownership_checks` carries the same four figures, so a slow node shows where its seconds went; a local
+safety check that itself failed (`OWNERSHIP_FINAL_SAFETY_CHANGED`) carries `refusal_cause` (the exception class), and
+`TimeoutExpired` there means a read-only `nvidia-smi` query before the permit outlived its bound scaled by the node's GPU
+count (15 s plus 5 s per GPU, 55 s on eight -- with persistence off in the quiesce and the display stack unloaded by a busy
+reset every query initialises every GPU of the node), a driver treated as unresponsive. The in-window
 path is bounded: nothing is spawned inside the window (the device-node map is resolved before the permit and cached
 across it), holders are sampled once from `/proc`, a query-only holder is ignored at once and only a holder that is not a
 query is sampled once more (`in_window_holder_samples`); when the window still runs out the boundary asks for one fresh

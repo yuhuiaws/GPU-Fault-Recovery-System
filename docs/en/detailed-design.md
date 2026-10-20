@@ -1521,19 +1521,54 @@ a TERM list (`GPU_FAULT_QUIESCE_PROCESSES`, `pkill --exact`) or sweep whitelist 
 none shipped) naming `nv-fabricmanage` or `nvlsm` is refused at Agent construction ("the quiesce never signals Fabric
 Manager or NVLSM").
 
-`/proc/modules` decides whether the display stack is back (`node_agent/operations/display_stack.py`): after one
-`modprobe` of the outermost module (`nvidia_drm`, which pulls `nvidia_modeset` in first), a module the reset unloaded
-that is not `Live` -- `modprobe` failed, exited 0 and loaded nothing (an `install` override in `modprobe.d`), or brought
-back `nvidia_modeset` alone -- earns one more try after a 5 s pause; each `modprobe` is bounded at 12 s, under 30 s in
-all, and a `modprobe` killed by its timeout does not stop the kernel finishing the load, which the retry then sees. Each
-attempt is recorded in `display_module_reload_attempts` and the verdict is `display_stack_restored`; a stack still not
-back also carries `display_modules_missing`, the last `kernel_module_reload_error` and the remedy in
-`display_stack_remedy` (`modprobe nvidia_drm, or reboot the node`). A display stack that is not back neither fails a
-successful reset nor counts as a GPU fault: CUDA does not use the DRM device, and draining, quarantining or resetting
-for it would be disproportionate. It reaches the operator through the reset's own completion mail
-(`notifications/display_stack.py`: GPU_RESET_COMPLETED/FABRIC_RESET_COMPLETED already receive every node's result; the
-subject gains `[display stack not restored]` and "3. Follow-up" names, per node, the missing modules, the last error and
-the remedy). The channels not taken: a node-health finding opens an incident and a workflow, a GPU finding fails the
+After the display-stack release the GPUs are cold: the quiesce window has persistence mode off, a GPU no client holds
+does not stay initialised, and from then on every `nvidia-smi` initialises every GPU of the node one after another and
+tears it down again on exit, as `modprobe nvidia_drm` does (about 2.2 s per H200 on a plain EKS p5en). The Agent's
+read-only `nvidia-smi` queries -- compute apps, `-q -x`, the index map, the inventory -- are therefore bounded by the
+node's GPU count: 15 s plus 5 s per GPU (`nvidia_smi_query_timeout` in `node_agent/operations/clients.py`; the count is
+the driver's own `/proc/driver/nvidia/gpus`, eight when it cannot be read), 55 s on an eight-GPU node. The flat 15 s it
+replaces killed the first compute-apps query after `nvidia_drm` was unloaded on GF-REGIONAL-DESTR-010 (p5en, fabric
+reset) -- the pre-permit recheck of the checkpoint before `rmmod nvidia_modeset` -- and the final ownership boundary
+turned that `TimeoutExpired` into `OWNERSHIP_FINAL_SAFETY_CHANGED`: a recoverable busy reset ended FAILED. A query that
+outlives the larger bound still refuses (`refusal_cause=TimeoutExpired`), and a client that appears still refuses. After
+the release the busy loop no longer runs a sampled verification of its own: with a final ownership gate the boundary
+re-reads the compute apps, resolves the targets' device nodes and samples their holders right before the retry's spawn
+anyway, and the loop keeps only the check of the Agent's own GPU work the boundary does not make; on cold GPUs that
+repeated read would push the retry's checkpoint past the command's two-minute lifetime (`OWNERSHIP_COMMAND_EXPIRED`).
+Without a final ownership gate the loop's verification stays whole. A refusal between the two unloads still lists, in
+`physical_calls`, the `rmmod` that ran and the one refused, one to one with `physical_ownership_checks[i]`. The limit
+that remains: each checkpoint after the release still makes two cold reads (compute apps and `-q -x`), about 36 s on
+eight cold GPUs; on a node an earlier partial load left short (a GPU without its DRM device is cold before the release
+already) the reads before the release slow down too, and a busy fabric reset may run out of the command's two minutes --
+the reload brings every GPU's DRM device back, so the next attempt starts warm.
+
+`/proc/modules` and `/sys/class/drm` decide whether the display stack is back (`node_agent/operations/display_stack.py`):
+right before the first unload the Agent notes which GPUs have a DRM device of the NVIDIA driver (`card*`/`renderD*`
+bound to the `nvidia` PCI driver; a firmware framebuffer's `card0` does not count), and after one `modprobe` of the
+outermost module (`nvidia_drm`, which pulls `nvidia_modeset` in first) every module the reset unloaded must be `Live`
+again and every one of those GPUs must have its DRM device back. A module that is not `Live` -- `modprobe` failed,
+exited 0 and loaded nothing (an `install` override in `modprobe.d`), or brought back `nvidia_modeset` alone -- earns one
+more `modprobe` after a 5 s pause; every module live but a GPU without its DRM device (a partial load) earns one retry as
+`rmmod nvidia_drm && modprobe nvidia_drm` (never `modprobe -r`, which also removes `nvidia` itself once nothing else uses
+it), and none while `nvidia_drm` has a user -- that is reported. Each `modprobe` is bounded for the initialisation of
+every GPU of the node: 12 s plus 5 s per GPU (`display_reload_timeout`, 52 s on eight GPUs). A `modprobe` killed by its
+timeout does not leave the kernel to finish the load: the pending SIGKILL fails the killable wait behind every GPU probe
+not yet started (`request_irq() failed (-4)`, "Failed to allocate NvKmsKapiDevice") and `nvidia_drm` goes `Live` anyway
+-- on GF-REGIONAL-DESTR-010 the former 12 s bound met eight cold H200, six render nodes came back, `0000:a5:00.0` and
+`0000:59:00.0` had no DRM device, and `/proc/modules` alone called the stack restored. Each attempt is recorded in
+`display_module_reload_attempts` (a partial one with `drm_devices_missing`) and the verdict is `display_stack_restored`,
+beside `display_drm_devices_before`/`_after`; a stack still not back also carries `display_modules_missing` or
+`display_drm_devices_missing` (PCI addresses), the last `kernel_module_reload_error` and the remedy in
+`display_stack_remedy` (`modprobe nvidia_drm, or reboot the node` for a missing module,
+`rmmod nvidia_drm && modprobe nvidia_drm, or reboot the node` for a partial load). A fabric reset that fails -- a final
+ownership refusal included -- merges these fields into its failure details as RESET_GPU does, and RESET_GPU puts the
+display stack back before an exception that is no reset verdict (a probe between two attempts that timed out) travels
+on. A display stack that is not back neither fails a successful reset nor counts as a GPU fault: CUDA does not use the
+DRM device, and draining, quarantining or resetting for it would be disproportionate. It reaches the operator through
+the reset's own completion mail (`notifications/display_stack.py`: GPU_RESET_COMPLETED/FABRIC_RESET_COMPLETED already
+receive every node's result; the subject gains `[display stack not restored]` and "3. Follow-up" names, per node, the
+missing modules, the last error and the remedy; for a partial load the line lists the modules the reset unloaded, the
+last error names the GPUs without a DRM device and the remedy unloads before it loads). The channels not taken: a node-health finding opens an incident and a workflow, a GPU finding fails the
 chain's own VALIDATE_GPU, VALIDATE_HOST is not in a reset chain and has no non-blocking finding, and a heartbeat report
 would change the signed heartbeat protocol.
 

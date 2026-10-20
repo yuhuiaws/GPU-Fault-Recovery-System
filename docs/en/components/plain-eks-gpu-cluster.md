@@ -164,9 +164,12 @@ closed. A cluster still pinned to an older `eks-v1` snapshot whose `nodeReplace`
   escalation lineage (`escalation_descends_from`; `escalation_lineage` of
   `/executors/incident-ownership?successor_workflow_id=`) instead of one hop.
 - A busy reset with no process holding a device node unloads the idle `nvidia_drm`/`nvidia_modeset`, retries at once
-  and reloads them after the reset (`released_kernel_modules`/`reloaded_kernel_modules`; `/proc/modules` checks the
-  reload, a missing module earns one retry after a 5 s pause, and a stack still not back is
-  `display_stack_restored=false`: the reset stays successful, it is not handled as a GPU fault, and the GPU reset
+  and reloads them after the reset (`released_kernel_modules`/`reloaded_kernel_modules`; the GPUs are cold after the
+  unload, so the read-only `nvidia-smi` queries and the reload's `modprobe` are bounded by the node's GPU count, 55 s and
+  52 s on eight GPUs; `/proc/modules` and `/sys/class/drm` check the reload -- every GPU's DRM device must come back --,
+  a missing module earns one retry after a 5 s pause, a partial load one `rmmod nvidia_drm && modprobe nvidia_drm`, and a
+  stack still not back is `display_stack_restored=false`, the GPUs without a DRM device in
+  `display_drm_devices_missing`: the reset stays successful, it is not handled as a GPU fault, and the GPU reset
   completion mail carries `[display stack not restored]` and the remedy `modprobe nvidia_drm` or a node reboot); the
   `nvidia-persistenced` the
   window kept (on the other GPUs only) and the Fabric Manager the window kept (named in its `kept_services`, on

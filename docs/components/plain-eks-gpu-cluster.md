@@ -125,8 +125,10 @@ incarnation/boot_id；离场节点经 `ec2 describe-instances` 证明；失败�
   （`escalation_descends_from`，`/executors/incident-ownership?successor_workflow_id=` 的 `escalation_lineage`），
   不再只认一跳。
 - reset 忙碌且 `/proc` 无进程持有设备时，Agent 卸载空闲的 `nvidia_drm`/`nvidia_modeset` 后立刻重试并在 reset 后装回
-  （`released_kernel_modules`/`reloaded_kernel_modules`；装回以 `/proc/modules` 核对，缺失时暂停 5 s 重试一次，仍未装回
-  则 `display_stack_restored=false`：reset 照样成功、不当 GPU 故障处理，GPU reset 完成通知的主题带
+  （`released_kernel_modules`/`reloaded_kernel_modules`；卸载后 GPU 是冷的，只读 `nvidia-smi` 查询与装回的 modprobe 的
+  上限都按节点 GPU 数放大（8 GPU 为 55 s 与 52 s）；装回以 `/proc/modules` 与 `/sys/class/drm` 核对——每张 GPU 的 DRM
+  设备都须回来——缺失时暂停 5 s 重试一次，部分装载重试为 `rmmod nvidia_drm && modprobe nvidia_drm`，仍未装回
+  则 `display_stack_restored=false`，缺 DRM 设备的 GPU 记在 `display_drm_devices_missing`：reset 照样成功、不当 GPU 故障处理，GPU reset 完成通知的主题带
   `[display stack not restored]` 并给出补救 `modprobe nvidia_drm` 或重启节点）；窗口保留的 `nvidia-persistenced`（只持有其余 GPU）与窗口保留的
   Fabric Manager（窗口的 `kept_services` 记着它，只持有 `/dev/nvidia-caps/*`/`/dev/nvidia-nvswitch*`/`/dev/nvidia-nvlink`）
   不阻止卸载，记在 `display_release_bystanders`（只豁免 Fabric Manager 本身：NVL5 上同一单元里的 `nvlsm` 若持有 NVIDIA
