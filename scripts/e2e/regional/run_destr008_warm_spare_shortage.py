@@ -834,6 +834,9 @@ def cleanup_scenario(
         result["independent_safety_cleanup"] = proof
         if proof["errors"]:
             result["verdict"] = "FAIL"
+            result.setdefault("errors", []).extend(
+                "independent safety: " + error for error in proof["errors"]
+            )
         if proof["quiescent"] is not True:
             cleanup_safe = False
             result["cleanup_deferred"] = True

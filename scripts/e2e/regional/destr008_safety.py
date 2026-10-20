@@ -27,6 +27,21 @@ if TYPE_CHECKING:
 MINIMUM_HEADROOM_SECONDS = 120
 
 
+def failure(label: str, exc: Exception) -> str:
+    """``label: Class: reason`` for this harness's own failures, else ``label: Class``.
+
+    ``RegionalFixtureError`` reasons are fixed strings or already redacted
+    (``cpu()`` and ``RegionalCommandFailed`` drop command output); any other
+    exception may carry foreign data, so only its class is kept. DESTR-008
+    attempt 3 kept only the class, and the cleanup that followed overwrote the
+    journal, so no evidence named the check that failed.
+    """
+
+    if isinstance(exc, RegionalFixtureError):
+        return f"{label}: {type(exc).__name__}: {exc}"
+    return f"{label}: {type(exc).__name__}"
+
+
 class ShortageSafety:
     def __init__(
         self,
@@ -209,7 +224,7 @@ class ShortageSafety:
                     receipt = self.watchdog.wait_quiescence()
                 except Exception as exc:
                     result["errors"].append(
-                        f"original watchdog completion: {type(exc).__name__}"
+                        failure("original watchdog completion", exc)
                     )
                     receipt = self.watchdog.resume_cleanup(seconds=180)
                 self.fence.close(self.control)
@@ -235,13 +250,13 @@ class ShortageSafety:
                         "independent cancellation deadline elapsed before normal closure"
                     )
         except Exception as exc:
-            result["errors"].append(f"quiescence: {type(exc).__name__}")
+            result["errors"].append(failure("quiescence", exc))
         if self.quiescent and self.watchdog is not None:
             try:
                 self.watchdog.cleanup()
                 result["retired"] = True
             except Exception as exc:
-                result["errors"].append(f"watchdog cleanup: {type(exc).__name__}")
+                result["errors"].append(failure("watchdog cleanup", exc))
         elif self.quiescent:
             result["retired"] = True
         return result

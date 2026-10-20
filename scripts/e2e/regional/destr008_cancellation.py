@@ -15,6 +15,7 @@ from uuid import uuid4
 
 from gpu_fault.admin.atomic_json import write_json_atomic
 from scripts.e2e.regional import destr008_controller_lock as locking
+from scripts.e2e.regional import destr008_parallel as parallel
 from scripts.e2e.regional import destr008_watchdog_admission as admission
 from scripts.e2e.regional import destr008_watchdog_control as control_api
 from scripts.e2e.regional import destr008_watchdog_journal as journal
@@ -90,6 +91,7 @@ def _sources() -> dict[str, str]:
                 "journal": journal.__file__,
                 "admission": admission.__file__,
                 "retirement": retirement.__file__,
+                "parallel": parallel.__file__,
             }.items()
         }
     )
@@ -134,10 +136,12 @@ class CancellationWatchdog:
                 *args, stdin=stdin, timeout=timeout
             ),
             read=self._read,
+            read_many=self._read_many,
             namespace=self._namespace,
             runtime_check=lambda execution: self._live_runtime(execution=execution),
             control=self._control,
             control_snapshot=self._control_snapshot,
+            control_document=self._control_document,
             update_resource=self._put_resource,
             update_job=self._put_job,
             uid=self._uid,
@@ -240,17 +244,36 @@ class CancellationWatchdog:
             raise RegionalFixtureError("watchdog CPU namespace was replaced")
 
     def _live_runtime(self, *, execution: bool) -> None:
-        self._namespace()
         if execution:
+            self._namespace()
             if (
                 resources.read_runtime(self.regional).identity()
                 != self.runtime.identity()
             ):
                 raise RegionalFixtureError("watchdog CPU runtime changed")
+            scope = self.regional.evidence_identity()
         else:
-            deployment = resources.read_object(
-                self.regional, "deployment", resources.DEPLOYMENT
+            # Independent reads share one concurrent round trip; on the
+            # quiescence path they sit inside the receipt's freshness window.
+            namespace, deployment, *configmaps, scope = parallel.gather(
+                [
+                    lambda: resources.read_object(
+                        self.regional, "namespace", self.runtime.namespace
+                    ),
+                    lambda: resources.read_object(
+                        self.regional, "deployment", resources.DEPLOYMENT
+                    ),
+                    *[
+                        lambda name=name: resources.read_object(
+                            self.regional, "configmap", name
+                        )
+                        for name in self.runtime.config_identities
+                    ],
+                    lambda: dict(self.regional.evidence_identity()),
+                ]
             )
+            if namespace["metadata"]["uid"] != self.runtime.namespace_uid:
+                raise RegionalFixtureError("watchdog CPU namespace was replaced")
             meta = deployment["metadata"]
             containers = _object(
                 _object(_object(deployment.get("spec")).get("template")).get("spec")
@@ -265,16 +288,15 @@ class CancellationWatchdog:
                 or containers[0].get("image") != self.runtime.image
             ):
                 raise RegionalFixtureError("watchdog cleanup runtime identity changed")
-            for name, identity in self.runtime.config_identities.items():
-                meta = resources.read_object(self.regional, "configmap", name)[
-                    "metadata"
-                ]
+            for identity, configmap in zip(
+                self.runtime.config_identities.values(), configmaps, strict=True
+            ):
+                meta = configmap["metadata"]
                 if (
                     meta["uid"] != identity["uid"]
                     or meta["resourceVersion"] != identity["resource_version"]
                 ):
                     raise RegionalFixtureError("watchdog cleanup configuration changed")
-        scope = self.regional.evidence_identity()
         if (
             scope.get("release_id") != self.plan.release_id
             or scope.get("cluster_id") != self.plan.cluster_id
@@ -291,18 +313,48 @@ class CancellationWatchdog:
                 :3
             ] == ("patch", "configmap", self.name):
                 self._cleanup_patch(stdin)
-            try:
-                result = self.regional.kubectl(
-                    "cpu",
-                    *args,
-                    input_text=None if stdin is None else stdin.decode("utf-8"),
-                    **kwargs,
-                )
-            except Exception:
-                raise RegionalFixtureError(
-                    "watchdog CPU Kubernetes request failed"
-                ) from None
-            return result
+            return self._kubectl(*args, stdin=stdin, **kwargs)
+
+    def _kubectl(self, *args: str, stdin: bytes | None = None, **kwargs: Any) -> str:
+        try:
+            return self.regional.kubectl(
+                "cpu",
+                *args,
+                input_text=None if stdin is None else stdin.decode("utf-8"),
+                **kwargs,
+            )
+        except Exception:
+            raise RegionalFixtureError(
+                "watchdog CPU Kubernetes request failed"
+            ) from None
+
+    def _read_many(self, targets: list[tuple[str, str]]) -> list[dict[str, Any] | None]:
+        """``_read`` for independent resources, in one concurrent round trip.
+
+        ``cpu()``'s controller lock is per-thread and non-blocking, so worker
+        threads cannot take it: this thread holds it for the whole batch and
+        proves the scope ``cpu()`` checks per request before and after it.
+        """
+
+        with locking.controller_ownership(self.path):
+            self._scope()
+            _load(self.path)
+            raws = parallel.gather(
+                [
+                    lambda kind=kind, name=name: self._kubectl(
+                        "get",
+                        kind,
+                        name,
+                        "--ignore-not-found",
+                        "-o",
+                        "json",
+                        timeout=30,
+                    )
+                    for kind, name in targets
+                ]
+            )
+            self._scope()
+        return [_document(raw) if raw.strip() else None for raw in raws]
 
     def _cleanup_patch(self, stdin: bytes | None) -> None:
         try:
@@ -387,9 +439,16 @@ class CancellationWatchdog:
         )
 
     def _control_snapshot(self) -> control_api.ControlSnapshot:
-        item = self.record.support.get("configmap/" + self.name)
         control = self._control()
-        actual = self._read("configmap", self.name)
+        return self._control_document(self._read("configmap", self.name), control)
+
+    def _control_document(
+        self,
+        actual: dict[str, Any] | None,
+        control: CancellationControl | None = None,
+    ) -> control_api.ControlSnapshot:
+        item = self.record.support.get("configmap/" + self.name)
+        control = self._control() if control is None else control
         if actual is None or item is None:
             raise RegionalFixtureError("watchdog control resource disappeared")
         self._admission.unchanged(actual, item)
@@ -584,11 +643,24 @@ class CancellationWatchdog:
                 "watchdog receipt belongs to an earlier observer"
             )
 
-    def _wait_quiescence(self, index: int, *, seconds: int) -> Receipt:
+    def _wait_quiescence(
+        self,
+        index: int,
+        *,
+        seconds: int,
+        snapshot: control_api.ControlSnapshot | None = None,
+    ) -> Receipt:
+        # The observer writes its terminal receipt once; from then on it ages
+        # against MAX_RECEIPT_AGE, here and again in the fence close three reads
+        # after this returns. A pass reads only the control, the Job and the Pod;
+        # the supporting resources are verified once the observer has completed
+        # (one concurrent batch) and the certifying read is the last one before
+        # the verdict. DESTR-008 attempt 3 certified only after ~22 sequential
+        # reads, 36 s after the receipt on a loaded acceptance host.
         deadline = self.monotonic() + seconds
         while self.monotonic() < deadline:
-            self._admission.support()
-            snapshot = self._control_snapshot()
+            if snapshot is None:
+                snapshot = self._control_snapshot()
             current = snapshot.receipt
             job_value = self._admission.job_read(index)
             pod_value = self._admission.discover_pod(index, execution=True)
@@ -629,6 +701,7 @@ class CancellationWatchdog:
                             pod_uid=pod.uid,
                             phase="succeeded",
                         )
+                        self._admission.support()
                         verified = self._control().quiescence()
                         self._receipt_job(verified, job)
                         if verified.monitoring:
@@ -646,6 +719,7 @@ class CancellationWatchdog:
                 raise RegionalFixtureError(
                     "watchdog Pod did not terminate successfully"
                 )
+            snapshot = None
             self.sleep(1)
         raise RegionalFixtureError("watchdog terminal quiescence deadline expired")
 
@@ -665,7 +739,7 @@ class CancellationWatchdog:
                     "watchdog close or revocation must precede quiescence"
                 )
             return self._wait_quiescence(
-                self._active_job(), seconds=wire.DRAIN_SECONDS + 30
+                self._active_job(), seconds=wire.DRAIN_SECONDS + 30, snapshot=snapshot
             )
 
     def _mark_cleanup(self) -> None:

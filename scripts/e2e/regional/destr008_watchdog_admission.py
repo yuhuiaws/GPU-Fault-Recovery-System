@@ -123,7 +123,14 @@ class WatchdogAdmission:
     def owned_resource(
         self, item: ManagedResource, expected: dict[str, Any]
     ) -> dict[str, Any]:
-        actual = self.owner._read(item.kind, item.name)
+        return self.verify_owned(item, expected, self.owner._read(item.kind, item.name))
+
+    def verify_owned(
+        self,
+        item: ManagedResource,
+        expected: dict[str, Any],
+        actual: dict[str, Any] | None,
+    ) -> dict[str, Any]:
         if actual is None:
             raise RegionalFixtureError("watchdog owned resource disappeared")
         self.unchanged(actual, item)
@@ -149,18 +156,35 @@ class WatchdogAdmission:
         )
 
     def support(self) -> None:
+        """Verify the control map and every supporting resource in one round trip.
+
+        The reads are independent, so they share one concurrent batch; the
+        documents are verified in the order, and with the precedence, of the
+        sequential reads they replace.
+        """
+
         control = self.owner.record.support.get("configmap/" + self.owner.name)
         if control is None:
             raise RegionalFixtureError(
                 "watchdog control creation has not been acknowledged"
             )
-        self.owner._control_snapshot()
-        for expected in self.manifests()[:-1]:
+        manifests = self.manifests()[:-1]
+        owned = []
+        for expected in manifests:
             key = expected["kind"].lower() + "/" + expected["metadata"]["name"]
             item = self.owner.record.support.get(key)
             if item is None:
-                raise RegionalFixtureError("watchdog supporting resource is missing")
-            self.owned_resource(item, expected)
+                break
+            owned.append((item, expected))
+        actual, *documents = self.owner._read_many(
+            [("configmap", self.owner.name)]
+            + [(item.kind, item.name) for item, _ in owned]
+        )
+        self.owner._control_document(actual)
+        for (item, expected), document in zip(owned, documents, strict=True):
+            self.verify_owned(item, expected, document)
+        if len(owned) != len(manifests):
+            raise RegionalFixtureError("watchdog supporting resource is missing")
 
     def job_manifest(
         self, *, name: str, cleanup_id: str | None, seconds: int

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
@@ -397,6 +398,41 @@ def test_pod_discovery_reads_only_this_jobs_pods_from_the_typed_list(
         for verb, args, _ in api.calls
         if verb == "get" and args[1:4] == ("pod", "-o", "json")
     ], "a namespace-wide kubectl Pod list is neither bounded nor a typed list"
+
+
+def test_typed_list_items_that_this_job_does_not_own_are_ignored(
+    setup: tuple[CpuApi, wire.Plan, resources.CpuRuntime],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    api, plan, runtime = setup
+    watchdog = api.watchdog(plan, runtime)
+    watchdog.arm()
+    owned = api.journal()["jobs"][0]["pod"]["uid"]
+    foreign = {
+        "metadata": {
+            "name": "unrelated-abcde",
+            "namespace": runtime.namespace,
+            "uid": "unrelated-uid",
+            "labels": {"app": "unrelated"},
+            "ownerReferences": [],
+        },
+        "status": {"phase": "Running"},
+    }
+    kubectl = api.regional.kubectl
+
+    def with_foreign(plane: str, *args: str, **kwargs: Any) -> str:
+        raw = kubectl(plane, *args, **kwargs)
+        if args[:2] == ("get", "--raw") and "controller-uid" in args[2]:
+            value = json.loads(raw)
+            value["items"].insert(0, foreign)
+            return json.dumps(value)
+        return raw
+
+    monkeypatch.setattr(api.regional, "kubectl", with_foreign)
+    watchdog.validate_running()
+    assert api.journal()["jobs"][0]["pod"]["uid"] == owned, (
+        "only the Pod this Job owns may be bound, whatever else the list carries"
+    )
 
 
 @pytest.mark.parametrize(

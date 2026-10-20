@@ -332,10 +332,12 @@ class LifecycleOwner:
     sleep: Callable[[float], None]
     request: Callable[[tuple[str, ...], bytes | None, int], str]
     read: Callable[[str, str], JsonObject | None]
+    read_many: Callable[[list[tuple[str, str]]], list[JsonObject | None]]
     namespace: Callable[[], None]
     runtime_check: Callable[[bool], None]
     control: Callable[[], control_api.CancellationControl]
     control_snapshot: Callable[[], control_api.ControlSnapshot]
+    control_document: Callable[[JsonObject | None], control_api.ControlSnapshot]
     update_resource: Callable[[ManagedResource, int | None], None]
     update_job: Callable[[int, JobChanges], ObserverJob]
     uid: Callable[[ManagedResource], str]
@@ -350,6 +352,9 @@ class LifecycleOwner:
     def _read(self, kind: str, name: str) -> JsonObject | None:
         return self.read(kind, name)
 
+    def _read_many(self, targets: list[tuple[str, str]]) -> list[JsonObject | None]:
+        return self.read_many(targets)
+
     def _namespace(self) -> None:
         self.namespace()
 
@@ -361,6 +366,11 @@ class LifecycleOwner:
 
     def _control_snapshot(self) -> control_api.ControlSnapshot:
         return self.control_snapshot()
+
+    def _control_document(
+        self, actual: JsonObject | None
+    ) -> control_api.ControlSnapshot:
+        return self.control_document(actual)
 
     def _put_resource(self, item: ManagedResource, index: int | None = None) -> None:
         self.update_resource(item, index)

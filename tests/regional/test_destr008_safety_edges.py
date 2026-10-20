@@ -199,7 +199,9 @@ def test_lost_in_memory_watchdog_handle_does_not_leave_control_as_authority(
     h.safety.watchdog = None
     report = h.safety.finish()
     assert report["quiescent"] is False and report["retired"] is False, report
-    assert report["errors"] == ["quiescence: RegionalFixtureError"]
+    assert report["errors"] == [
+        "quiescence: RegionalFixtureError: watchdog resource ownership is unavailable"
+    ], "the evidence must name the refused check, not only its class"
     assert h.safety.quiescent is False and h.gpu.objects, report
     assert not any(verb == "delete" for verb, _ in cpu_mutations(h)), h.cpu.calls
 
@@ -233,7 +235,9 @@ def test_cpu_retirement_failure_is_not_cleanup_complete_and_can_resume(
     h.cpu.failed_delete.add("role")
     report = h.safety.finish()
     assert report["quiescent"] is True and report["retired"] is False, report
-    assert report["errors"] == ["watchdog cleanup: RegionalFixtureError"]
+    assert report["errors"] == [
+        "watchdog cleanup: RegionalFixtureError: watchdog CPU Kubernetes request failed"
+    ], "a sanitized retirement failure keeps its fixed reason"
     assert h.gpu.objects == {} and h.cpu.journal()["closed"] is False
     h.cpu.failed_delete.clear()
     retried = h.safety.finish()
