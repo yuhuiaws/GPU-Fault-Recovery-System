@@ -571,6 +571,33 @@ A few points that must be remembered:
   replacement) is read from that Pod, and a running rank whose Pod is gone is not carried. Before, such a pass put the attempt back
   to RUNNING without the dead rank, the surviving node counted as an active attempt's node until the terminal, and the terminal
   observation was `containers: []` (GF-REGIONAL-COLLECT-021 on plain EKS).
+  A container's GPUs come from the `gpu-fault.io/gpu-uuids` annotation or from an `nvidia-smi` exec into the running container,
+  and an exited container cannot be exec'd, so the reading of a rank that died used to carry no GPU UUID at all: the
+  failure-detected event and the attempt-failure incident (`inc-attempt-failure-*` and its FREEZE_EVIDENCE/STOP_WORKLOADS steps)
+  named only the surviving ranks' GPUs, the terminal allocation listed the dead rank with `gpu_uuids` empty (`gpu_count` still the
+  declared 8), and the recovery incident compiled from the terminal lacked the same GPUs (GF-REGIONAL-COLLECT-021: 8 of 16 on
+  plain EKS, 16 of 24 on HyperPod). Those lists do not decide the main path's plan (FREEZE_EVIDENCE records incident references,
+  STOP/RESTART act on workloads and nodes, `source_gpu_count` prefers the declared `nvidia.com/gpu`, and the live COLLECT-021 took
+  one restart without hardware evidence), but three narrow paths read them: the attempt attribution of a late fault
+  (`orchestration/families/evidence.active_recovery_attempt_observation`: when the active node-exclusive workflow on the node
+  belongs to an incident of that attempt -- a recovery incident compiled from a marker plan, the escalation successor of a failed
+  passive workflow -- and its GPU list does not intersect the fault's GPUs, the fault is not attributed to the attempt and opens a
+  workflow queued behind it); VALIDATE_GPU/VALIDATE_FABRIC scoped by the incident's GPUs (the validated restore and the escalation
+  successor look only at findings on the GPUs the step names, so findings on the dead rank's GPUs were ignored); and a Pod that
+  declares no `nvidia.com/gpu` (MIG resources only, for example), whose `source_gpu_count` falls back to counting UUIDs, came out
+  short and made the restart guard wait for a GPU-count-change approval.
+  Now a container a pass reads without UUIDs keeps the ones the previous reading held for the same
+  Pod UID, container and rank (`completion_observation.keep_known_gpu_uuids`, called before `carry_vanished_failed_ranks`): the
+  kubelet assigns a container its devices once for the life of its Pod, and a restart in place reuses them, so that set is still
+  this container's. The failure event is thereby the union of every critical rank's known GPUs, each terminal allocation entry
+  carries its rank's GPUs, and `allocation_completeness` is COMPLETE. After a watcher restart the previous reading is the persisted
+  active record (which already stores each Pod's `gpu_uuids`), so a rank that died while the watcher was down keeps its GPUs too,
+  and so does a running container whose exec fails after the restart. A container never read with UUIDs (exited the first time it
+  was seen, or its exec failed for as long as it ran) keeps none and its allocation stays INCOMPLETE -- nothing is guessed -- and a
+  replacement Pod has a new UID and is read from its own Pod. Limit: a FAILED reading is not an active one, so publishing it deletes
+  the persisted record; a watcher that restarts after that and before the terminal re-reads the exited rank from its Pod and cannot
+  know its GPUs (it reports INCOMPLETE). The containment incident still follows the first process's failure event (delivered, or
+  replayed from the outbox, where the first record written for a key is kept).
   ownership only accepts Observations whose `ingested_at` is not more than 120 seconds relative to the event; older
   `PENDING/RUNNING` records go into the stale gauge and no longer participate in node-mutation attribution.
   `/v1/workload-observations` is sent directly under normal conditions; after a send failure it is written per attempt, latest-wins, into the

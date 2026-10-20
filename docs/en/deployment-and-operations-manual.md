@@ -8125,6 +8125,9 @@ training container. The result is cached by Pod UID and re-queried after a Pod i
 the Python Kubernetes client uses WebSocket GET, while kubectl exec usually uses POST/create.
 The feature uses no shell and accepts no command arguments from the workload. On query failure, empty result, duplicate UUIDs
 or non-GPU/MIG UUIDs the allocation stays incomplete, and the restart guard does not guess the source GPU count.
+An exited container cannot be exec'd; it keeps the UUIDs read while it ran (same Pod UID, container and rank; after a
+Watcher restart, from the persisted active record), so the attempt-failure incident and the terminal allocation still name
+the GPUs of the rank that died; a container never read with UUIDs keeps none.
 An explicit `gpu-fault.io/gpu-uuids` annotation still has the highest priority.
 
 Restart budget configuration priority:
