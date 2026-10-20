@@ -7579,6 +7579,56 @@ test_cases:
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-035
   related_pytest: tests/admin/test_admin_eks_managed_join.py::test_hyperpod_discovery_selects_the_labelled_instance_groups
+- id: GF-REGIONAL-BOOT-036
+  title: 普通 EKS GPU 节点组准备的只读计划：已准备的节点组 COMPLIANT、每台节点检查通过、DCGM 与 exporter 配对，拒绝在任何变更前停止
+  category: regional-deployability
+  level: live
+  risk: read-only-signal-replay
+  problem: >-
+    prepare-eks-nodegroup 的只读计划、SSM 节点清点与拒绝路径只有单元测试和一次人工驱动的真机核对，没有正式用例证明
+    站点纳管的普通 EKS GPU 节点组在一轮破坏性用例之后仍然合规、每台节点的先决条件仍在、拒绝在读取或改动任何节点组之前停止。
+  injection: >-
+    经站点自己的部署机 CLI 运行 gpu-fault-admin prepare-eks-nodegroup 的默认只读计划：对站点归属标签选中的每个节点组计划一次
+    （含 SSM AWS-RunShellScript 只读清点）；再依次以 CPU 控制面、HyperPod 集群与 HyperPod 编排的 EKS 集群作为 GPU 集群、
+    不存在的节点组、指向不存在部分的 --adopt-user-data-part 与集群中工具不能准备的节点组各计划一次。不带 --apply。
+  expected:
+  - 正式前置 COLLECT-015 通过，release 与集群身份一致；目标是站点纳管的 eks-managed 成员，节点组的节点未被产品占用
+  - 每个节点组 verdict 为 COMPLIANT、没有步骤、node auto repair 为 disabled、带本站点归属标签、updateStrategy 为 MINIMAL，托管 user data 部分恰有一个且手写部分无矛盾行
+  - host 模式下 DCGM 钉选与产品 exporter 的 DCGM 客户端为 paired，计划带 nvidia-dcgm 重启 drop-in
+  - SSM 清点 outcome 为 passed，每台节点每项检查 ok、无节点或机群 finding，清点的实例恰为该组运行中的实例与 Kubernetes Node，数量等于 desiredSize
+  - Kubernetes finding 可读：允许的工作负载命名空间齐全，NVIDIA 与 EFA device plugin 运行，没有容忍 quiesce 污点的 GPU DaemonSet
+  - CPU 控制面、HyperPod 集群与 HyperPod 编排的 EKS 集群作为 GPU 集群以及不存在的节点组以退出码 2 拒绝，拒绝之前未读取节点组或节点
+  - 指向不存在部分的采纳在托管部分已在时只记 nothing to adopt 且计划不变，否则拒绝；工具不能准备的节点组为 REFUSED 并指向手工步骤
+  - 节点组配置、launch template 最新版本、运行中实例、Node 与工具 journal 前后完全相同，执行期间集群没有新 incident
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-036
+  related_pytest: tests/regional/test_boot036_eks_nodegroup_plan.py::test_a_prepared_site_passes_every_stage
+- id: GF-REGIONAL-BOOT-037
+  title: 普通 EKS GPU 节点组以 MINIMAL 滚动：替换节点带齐先决条件并被产品接管、离场 Agent 自行退役，节点改名交给 campaign 输入
+  category: regional-deployability
+  level: live
+  risk: destructive
+  problem: >-
+    prepare-eks-nodegroup --apply 在真机上只人工驱动验证过一次，没有正式用例证明它把站点纳管的 GPU 节点组以 updateStrategy
+    MINIMAL 滚动之后，替换节点带齐先决条件并被产品接管、离场节点的记录被清理，且整个滚动不触发 incident。
+  injection: >-
+    在维护窗口内、节点组没有业务负载与产品动作时，以让计划滚动该组的目标配置（首次准备、新的托管部分、另一 DCGM 钉选或
+    采纳手写部分）运行 prepare-eks-nodegroup --apply --confirm PREPARE_EKS_NODEGROUP；EKS 逐台终止并替换该组的每台 GPU 节点。
+  expected:
+  - 正式前置 BOOT-036 通过；目标配置的只读计划为 CHANGES 且含 roll，updateStrategy 计划为 MINIMAL，host 模式钉选为 paired
+  - 执行前每台节点 Ready、可调度、无隔离污点，无业务负载与绑定的 attempt，集群无活动 incident 与可执行 workflow，每台节点的 Agent 为 ACTIVE，维护窗口覆盖滚动与全部有界等待
+  - apply 为 COMPLETED：roll 更新为 Successful，工具自己的 SSM 核对为 passed
+  - 离场 Node 全部消失，替换 Node 数等于 desiredSize 且 Ready，带本站点归属标签，host 模式另带 gpu-fault.io/dcgm-hostengine=host
+  - 滚动之后同一目标的只读计划为 COMPLIANT，每台替换节点每项检查 ok，DCGM 钉选为 paired
+  - 每台替换节点的 Agent 由节点安装 reconciler 置为 ACTIVE，离场节点的 Agent 自行退役，自滚动开始集群没有新 incident，替换节点 Ready 10 分钟且可调度、无污点
+  - 结果给出 node_renames 与命名离场节点的 site profile 参数；campaign 输入据此更新后才能继续使用该组节点的用例
+  evidence:
+    verdict: NOT_RUN
+  automation: manual
+  procedure: docs/区域模式端到端验收测试用例.md#gf-regional-boot-037
+  related_pytest: tests/regional/test_boot037_eks_nodegroup_roll.py::test_a_drifted_group_rolls_and_every_replacement_is_adopted
 - id: GF-REGIONAL-HA-011
   title: 隔离部署运行时的繁忙processor与spool进程接管
   category: regional-high-availability

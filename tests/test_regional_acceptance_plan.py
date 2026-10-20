@@ -72,10 +72,10 @@ def test_formal_plan_expands_complete_order_and_serial_dependency_chain() -> Non
         "GF-REGIONAL-PREEMPT-023",
         "GF-REGIONAL-PREEMPT-034",
     )
-    assert len(plan.execution_order) == 193
-    assert len(plan.cases) == 202
+    assert len(plan.execution_order) == 195
+    assert len(plan.cases) == 204
     assert plan.execution_order[:2] == ("GF-REGIONAL-BOOT-016", "GF-REGIONAL-BOOT-011")
-    assert plan.execution_order[-1] == "GF-REGIONAL-BOOT-032"
+    assert plan.execution_order[-1] == "GF-REGIONAL-BOOT-037"
     assert plan.do_not_run_case_ids == retired
     assert plan.case_ids == (*plan.execution_order, *retired)
 
@@ -268,13 +268,15 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
     ]
     # HA-011 and NOTIFY-008 add local regression proxies; BOOT-032 stays
     # destructive; the ownership-label cases BOOT-033/034 (live-non-destructive
-    # with a related pytest) are proxied, BOOT-035 (a live join) is not.
-    assert len(automated) == 112, "local proxy eligibility changed unexpectedly"
+    # with a related pytest) are proxied, BOOT-035 (a live join) is not; the
+    # read-only node-group audit BOOT-036 is proxied, its roll BOOT-037 is not.
+    assert len(automated) == 113, "local proxy eligibility changed unexpectedly"
     for case_id in (
         "GF-REGIONAL-BOOT-030",
         "GF-REGIONAL-BOOT-031",
         "GF-REGIONAL-BOOT-033",
         "GF-REGIONAL-BOOT-034",
+        "GF-REGIONAL-BOOT-036",
         "GF-REGIONAL-COLLECT-022",
         "GF-REGIONAL-HA-011",
         "GF-REGIONAL-NOTIFY-008",
@@ -285,6 +287,7 @@ def test_local_preacceptance_parallelizes_only_safe_or_proxy_work() -> None:
         "GF-REGIONAL-HA-005",
         "GF-REGIONAL-BOOT-032",
         "GF-REGIONAL-BOOT-035",
+        "GF-REGIONAL-BOOT-037",
         *(f"GF-REGIONAL-BOOT-{number:03d}" for number in range(24, 30)),
     ):
         assert plan.case(case_id).executor is ExecutorKind.HUMAN, case_id
@@ -511,7 +514,8 @@ def test_order_rejects_duplicate_unknown_and_missing_cases(tmp_path: Path) -> No
     missing_phases = cast(list[dict[str, Any]], missing_value["phases"])
     final_entries = cast(list[dict[str, Any]], missing_phases.pop()["entries"])
     assert final_entries == [
-        {"case": "GF-REGIONAL-BOOT-032", "predecessor": "GF-REGIONAL-COLLECT-015"}
+        {"case": "GF-REGIONAL-BOOT-036", "predecessor": "GF-REGIONAL-COLLECT-015"},
+        {"case": "GF-REGIONAL-BOOT-037", "predecessor": "GF-REGIONAL-BOOT-036"},
     ]
     missing_order = _write_yaml(tmp_path / "missing.yaml", missing_value)
     with pytest.raises(ValueError, match="missing from execution order"):

@@ -151,6 +151,10 @@ def test_explicit_predecessors_are_the_documented_anchor_cases() -> None:
         # them in the order, so the anchor has to be explicit.
         "GF-REGIONAL-COLLECT-017": "GF-REGIONAL-COLLECT-016",
         "GF-REGIONAL-COLLECT-015": "GF-REGIONAL-COLLECT-017",
+        # The node-group preparation closes the round: the read-only audit
+        # follows the last case on the site's GPU nodes, the roll follows it.
+        "GF-REGIONAL-BOOT-036": "GF-REGIONAL-COLLECT-015",
+        "GF-REGIONAL-BOOT-037": "GF-REGIONAL-BOOT-036",
     }
     ordered = contract.ordered_case_ids()
     for case_id, predecessor in contract.explicit_predecessors().items():

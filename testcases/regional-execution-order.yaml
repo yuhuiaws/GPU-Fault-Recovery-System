@@ -351,6 +351,21 @@ phases:
       - 只操作预先独立部署并带本用例归属标签的可销毁站点，不卸载持续验收站点。
       - 首次执行在原生Kubernetes清理验证后返回RESTART_REQUIRED；新进程按同一审批续跑，最终PASS前不得继续。
       - CPU集群删除、Aurora最终快照、GPU集群保留及持续站点无变化必须全部核验，不能用API不可读代替删除证明。
+  - sequence: 19
+    name: 普通 EKS 节点组准备
+    maintenance_window: 分级
+    entries:
+      - case: GF-REGIONAL-BOOT-036
+        predecessor: GF-REGIONAL-COLLECT-015
+      - case: GF-REGIONAL-BOOT-037
+        predecessor: GF-REGIONAL-BOOT-036
+    notes:
+      - 只适用于站点纳管的 eks-managed 成员；没有该成员的站点两条均记 BLOCKED_PREREQUISITE。
+      - BOOT-036 以 COLLECT-015 PASS 为证据前置，在本轮的破坏性与采集用例之后只读核对节点组仍然合规；它在节点上经 SSM
+        运行 nvidia-smi -q 与 dcgmi discovery -l，不得与 reset、quiesce 或 reboot 该组节点的用例同时执行，不需要维护窗口。
+      - BOOT-037 以 BOOT-036 PASS 为证据前置，替换该组的每一台 GPU 节点并停止其上的全部工作负载，需要维护窗口并独占站点；
+        它是一轮的最后一条：其后 campaign 输入（site profile 的节点参数等）按结果的 node_renames 与 profile_updates 更新，
+        之前不得再运行使用该组节点的用例。目标配置必须让计划滚动该组（首次准备、新的托管部分、另一 DCGM 钉选或采纳手写部分）。
 do_not_run:
   - case: GF-REGIONAL-BOOT-006
     reason: >-

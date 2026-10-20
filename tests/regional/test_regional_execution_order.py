@@ -85,7 +85,7 @@ def test_regional_execution_order_covers_every_documented_case() -> None:
     indexed = [*ordered, *do_not_run]
     assert len(indexed) == len(set(indexed))
     assert set(indexed) == set(document_cases)
-    assert len(indexed) == len(document_cases) == 202, (
+    assert len(indexed) == len(document_cases) == 204, (
         "main lifecycle and distinct WIP cases must all remain indexed"
     )
 
@@ -202,8 +202,11 @@ def test_regional_execution_order_pins_special_dependencies() -> None:
     assert position["GF-REGIONAL-COLLECT-017"] < position["GF-REGIONAL-COLLECT-018"]
     assert position["GF-REGIONAL-COLLECT-020"] < position["GF-REGIONAL-COLLECT-015"]
     assert position["GF-REGIONAL-HA-003"] < position["GF-REGIONAL-DESTR-013"]
-    assert ordered[-2:] == ["GF-REGIONAL-COLLECT-015", "GF-REGIONAL-BOOT-032"], (
+    assert ordered[-4:-2] == ["GF-REGIONAL-COLLECT-015", "GF-REGIONAL-BOOT-032"], (
         "full isolated uninstall follows the final collector acceptance"
+    )
+    assert ordered[-2:] == ["GF-REGIONAL-BOOT-036", "GF-REGIONAL-BOOT-037"], (
+        "the node-group roll replaces every GPU node of the group, so it closes the round"
     )
 
 
