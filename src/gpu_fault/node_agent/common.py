@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 from gpu_fault.cluster_scope import (
     FABRIC_MANAGER_START_TIMEOUT_SECONDS,
@@ -41,6 +42,36 @@ def unit_start_timeout_seconds(service: str) -> int:
         if service.removesuffix(".service") == FABRIC_MANAGER_UNIT
         else UNIT_START_TIMEOUT_SECONDS
     )
+
+
+#: What one GPU's driver initialisation may take when nothing holds the GPU.
+#: With persistence mode off (the quiesce window) a GPU stays initialised only
+#: while a client holds it -- on the AL2023 NVIDIA AMI the display stack's DRM
+#: device does -- and every ``nvidia-smi`` or ``modprobe nvidia_drm`` after
+#: that initialises every GPU of the node, one after another (live,
+#: gpu-eks-cluster p5en: ``[nvidia-drm] Loading driver`` 2.2 s apart per H200
+#: once the busy reset had unloaded the display stack). Bounds that cover a
+#: whole node are sized from this, about twice the measured time.
+COLD_GPU_INIT_BOUND_SECONDS = 5
+#: The largest node shape (p5, p5en, p6: eight GPUs), for a node whose driver
+#: GPU list cannot be read: the bound errs long, never short.
+DEFAULT_NODE_GPU_COUNT = 8
+
+
+def nvidia_gpu_count(proc_root: Path | str | None) -> int | None:
+    """The GPUs the NVIDIA driver manages, from ``<proc>/driver/nvidia/gpus``.
+
+    One directory per PCI device, listed whether or not the GPU is initialised,
+    and read without spawning anything; ``None`` when there is no such list.
+    """
+
+    if proc_root is None:
+        return None
+    try:
+        count = sum(1 for _ in (Path(proc_root) / "driver/nvidia/gpus").iterdir())
+    except OSError:
+        return None
+    return count or None
 
 
 DEFAULT_QUIESCE_SERVICES = (

@@ -15,6 +15,7 @@ from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
 from gpu_fault.node_agent.late_ownership import (
+    NodeOwnershipGate,
     OwnershipRefused,
     final_ownership_boundary,
     require_physical_ownership,
@@ -98,10 +99,13 @@ class ResetOperationsMixin:
     _gpu_inventory: Callable[..., Any]
     _run_checked: Callable[..., Any]
     _verify_no_clients: Callable[..., Any]
+    _refuse_agent_gpu_activities: Callable[[], None]
     _target_persistence_states: Callable[..., dict[str, Any]]
     _compute_clients: Callable[[], list[dict[str, str]]]
     _gpu_device_paths: Callable[[], dict[str, str]]
     proc_root: Path
+    #: The final ownership gate (``execute`` runs every reset behind it).
+    ownership_gate: NodeOwnershipGate | None = None
     device_client_sample_interval_seconds: float
     fabric_manager_restart_enabled: bool
     fabric_reset_enabled: bool
@@ -149,10 +153,17 @@ class ResetOperationsMixin:
         released: list[str],
         bystanders: list[dict[str, Any]] | None = None,
         kept_services: Collection[str] = (),
+        calls: list[dict[str, Any]] | None = None,
     ) -> bool:
         """Unload ``nvidia_drm`` / ``nvidia_modeset`` when they are the only
         thing between a busy reset and a free GPU; appends what it unloaded to
         ``released`` and says whether it unloaded anything.
+
+        Each unload passes its own checkpoint and gets its record in ``calls``
+        as it happens -- refused, failed or released -- so a refusal between
+        the two unloads still lists the one that ran (live, gpu-eks-cluster
+        p5en: two granted checkpoints, and ``physical_calls`` named the busy
+        reset alone).
 
         Only when no compute app is running and no process holds an NVIDIA
         device node (``gpu_client_holder_evidence``): a holder is a client to
@@ -189,8 +200,20 @@ class ResetOperationsMixin:
             ]
             if not candidates:
                 break
-            require_physical_ownership()
-            self._run_checked(["rmmod", candidates[0]], timeout=30)
+            record: dict[str, Any] = {"command": f"rmmod {candidates[0]}"}
+            if calls is not None:
+                calls.append(record)
+            try:
+                require_physical_ownership()
+            except OwnershipRefused as refused:
+                record["outcome"] = f"refused: {refused.action_details['reason']}"
+                raise
+            try:
+                self._run_checked(["rmmod", candidates[0]], timeout=30)
+            except Exception as exc:
+                record["outcome"] = f"error: {type(exc).__name__}"
+                raise
+            record["outcome"] = "released"
             released.append(candidates[0])
             unloaded = True
         if unloaded and bystanders is not None:
@@ -298,22 +321,47 @@ class ResetOperationsMixin:
                     ) from exc
                 if not busy:
                     raise
-                unloaded_before = len(released)
-                if self._release_idle_display_modules(
-                    gpu_uuids, released, bystanders, kept_services
-                ):
-                    # Each unload passed its own checkpoint before the rmmod.
-                    calls.extend(
-                        {"command": f"rmmod {module}", "outcome": "released"}
-                        for module in released[unloaded_before:]
+                try:
+                    unloaded = self._release_idle_display_modules(
+                        gpu_uuids, released, bystanders, kept_services, calls
                     )
+                except OwnershipRefused as refused:
+                    # Refused before an unload: this attempt's reset was spawned.
+                    refused.action_details["gpu_reset_attempts_spawned"] = attempt
+                    raise
+                if unloaded:
                     # The DRM client was the holder; the next attempt is the
-                    # first one that can succeed, so it needs no settle time.
-                    self._verify_no_clients(gpu_uuids, include_agent_activities=True)
+                    # first one that can succeed, so it needs no settle time --
+                    # and no client read of its own when the boundary reads
+                    # them right before the retry's spawn. With the display
+                    # stack gone and persistence off nothing keeps a GPU up,
+                    # every nvidia-smi initialises all of them (live,
+                    # gpu-eks-cluster p5en: about 2.2 s per H200, eight of
+                    # them), and this sampled verification on top of the
+                    # boundary's reads would push the retry's checkpoint past
+                    # the command's two minutes. The boundary does not read
+                    # the Agent's own GPU work; without a boundary the
+                    # verification stays whole.
+                    if self._boundary_rereads_clients():
+                        self._refuse_agent_gpu_activities()
+                    else:
+                        self._verify_no_clients(
+                            gpu_uuids, include_agent_activities=True
+                        )
                     continue
                 self.sleep(self.device_client_sample_interval_seconds)
                 self._verify_no_clients(gpu_uuids, include_agent_activities=True)
         raise AssertionError("unreachable GPU reset retry state")
+
+    def _boundary_rereads_clients(self) -> bool:
+        """Whether the final ownership boundary reads the clients before the
+        next spawn: ``execute`` runs every reset behind it once the Agent has
+        an ownership gate, and for both resets its pre-permit recheck reads
+        the compute apps, resolves the targets' device nodes and samples their
+        holders (``late_ownership``, ``device_recheck``) -- what the busy
+        loop's own verification would read again right before it."""
+
+        return self.ownership_gate is not None
 
     def _gpu_client_holder_evidence(self, gpu_uuids: list[str]) -> dict[str, Any]:
         return gpu_client_holder_evidence(

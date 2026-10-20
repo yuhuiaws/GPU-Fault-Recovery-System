@@ -9,6 +9,11 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Sequence
 from xml.etree import ElementTree as ET
 
+from gpu_fault.node_agent.common import (
+    COLD_GPU_INIT_BOUND_SECONDS,
+    DEFAULT_NODE_GPU_COUNT,
+    nvidia_gpu_count,
+)
 from gpu_fault.node_agent.gpu_activity import GpuActivityGate
 from gpu_fault.node_agent.operations.holders import (
     CGROUP_PATH_LIMIT,
@@ -24,6 +29,26 @@ from gpu_fault.node_agent.query_clients import query_only_device_client
 PCI_BUS_ID_PATTERN = re.compile(
     r"^[0-9A-Fa-f]{4,8}:[0-9A-Fa-f]{2}:[0-9A-Fa-f]{2}\.[0-7]$"
 )
+
+#: A read-only ``nvidia-smi`` query (compute apps, ``-q -x``, the index map,
+#: the inventory) on a driver that keeps its GPUs initialised.
+NVIDIA_SMI_QUERY_TIMEOUT_SECONDS = 15
+#: What each GPU of the node adds to that bound: with nothing holding them,
+#: each query initialises every GPU of the node first (``common``). The flat
+#: 15 s killed the first compute-apps query after a busy reset unloaded the
+#: display stack -- eight cold H200 -- and the final ownership boundary refused
+#: the reset OWNERSHIP_FINAL_SAFETY_CHANGED (live, gpu-eks-cluster p5en,
+#: GF-REGIONAL-DESTR-010). A driver that does not answer within the larger
+#: bound still fails the query, and the boundary still refuses.
+NVIDIA_SMI_COLD_INIT_SECONDS_PER_GPU = COLD_GPU_INIT_BOUND_SECONDS
+
+
+def nvidia_smi_query_timeout(gpu_count: int | None) -> int:
+    """15 s plus 5 s per GPU: 55 s on an eight-GPU node, cold or warm."""
+
+    return NVIDIA_SMI_QUERY_TIMEOUT_SECONDS + NVIDIA_SMI_COLD_INIT_SECONDS_PER_GPU * (
+        gpu_count or DEFAULT_NODE_GPU_COUNT
+    )
 
 
 class GpuClientsActive(RuntimeError):
@@ -60,6 +85,11 @@ class ClientOperationsMixin:
     # slot the concrete executor has to build.
     _device_path_state = threading.local()
 
+    def _nvidia_smi_query_timeout(self) -> int:
+        """The bound of one read-only query on this node (its driver's GPU list)."""
+
+        return nvidia_smi_query_timeout(nvidia_gpu_count(self.proc_root))
+
     def _compute_clients(self) -> list[dict[str, str]]:
         completed = self._run_checked(
             [
@@ -67,7 +97,7 @@ class ClientOperationsMixin:
                 "--query-compute-apps=gpu_uuid,pid,process_name",
                 "--format=csv,noheader,nounits",
             ],
-            timeout=15,
+            timeout=self._nvidia_smi_query_timeout(),
         )
         clients = []
         for line in completed.stdout.splitlines():
@@ -250,7 +280,9 @@ class ClientOperationsMixin:
         """
 
         try:
-            completed = self._run_checked(["nvidia-smi", "-q", "-x"], timeout=15)
+            completed = self._run_checked(
+                ["nvidia-smi", "-q", "-x"], timeout=self._nvidia_smi_query_timeout()
+            )
         except (OSError, RuntimeError, subprocess.SubprocessError):
             return None, {}, {}
         try:
@@ -310,7 +342,7 @@ class ClientOperationsMixin:
                 "--query-gpu=uuid,index",
                 "--format=csv,noheader,nounits",
             ],
-            timeout=15,
+            timeout=self._nvidia_smi_query_timeout(),
         )
         paths = {}
         for line in completed.stdout.splitlines():
@@ -357,7 +389,7 @@ class ClientOperationsMixin:
                 "--query-gpu=uuid",
                 "--format=csv,noheader,nounits",
             ],
-            timeout=15,
+            timeout=self._nvidia_smi_query_timeout(),
         )
         inventory = sorted(
             {line.strip() for line in completed.stdout.splitlines() if line.strip()}
