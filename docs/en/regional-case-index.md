@@ -13,7 +13,7 @@ in what order**. There are only two sources of truth:
 Case bodies are in [`regional-e2e-acceptance-test-cases.md`](regional-e2e-acceptance-test-cases.md); the "Body" column jumps straight to that case's section. Execution verdicts and site identifiers from real environments are kept in a non-public internal evidence store and do not enter this index.
 Regenerate: `python3 scripts/build-regional-case-index.py`.
 
-**202** cases in total: 193 executed by phase, 9 `DO_NOT_RUN`.
+**204** cases in total: 195 executed by phase, 9 `DO_NOT_RUN`.
 
 ## Phase Overview
 
@@ -38,6 +38,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 | 16 | Multiple physical clusters | 3 | **Yes** | At least two enabled physical GPU clusters |
 | 17 | Collection and decision coverage | 22 | Per case | — |
 | 18 | Full uninstall of an isolated site | 1 | **Yes** | — |
+| 19 | Plain EKS node-group preparation | 2 | Per case | — |
 
 ## Phase 0 — Deployability
 
@@ -426,6 +427,19 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 | # | Case | Title | Level | Tier | Automation | Body |
 | --- | --- | --- | --- | --- | --- | --- |
 | 193 | `BOOT-032` | Full uninstall of an isolated acceptance site, resume after interruption and shared-resource protection | `destructive` | staging | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-032) |
+
+## Phase 19 — Plain EKS node-group preparation
+
+> **Maintenance window graded per case**: the cases in this phase differ in side effects; check the "Level" column case by case.
+
+> - Applies to a site-managed eks-managed member only; on a site without one both cases record BLOCKED_PREREQUISITE.
+> - BOOT-036 takes COLLECT-015 PASS as its evidence predecessor and checks read-only, after the round's destructive and collector cases, that the node groups are still compliant; it runs nvidia-smi -q and dcgmi discovery -l on the nodes over SSM, must never run beside a case that resets, quiesces or reboots the group's nodes, and needs no maintenance window.
+> - BOOT-037 takes BOOT-036 PASS as its evidence predecessor, replaces every GPU node of the group and stops every workload on it, needs a maintenance window and the exclusive site; it is the last case of a round: the campaign inputs (the site profile's node arguments and the like) then follow the result's node_renames and profile_updates, and no case using the group's nodes runs before. The target configuration must make the plan roll the group (a first preparation, a new managed part, another DCGM pin or an adopted hand-written part).
+
+| # | Case | Title | Level | Tier | Automation | Body |
+| --- | --- | --- | --- | --- | --- | --- |
+| 194 | `BOOT-036` | The read-only plan of a plain EKS GPU node group's preparation: a prepared group is COMPLIANT, every node check passes, DCGM is paired with the exporter, and the refusals stop before any change | `read-only-signal-replay` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-036) |
+| 195 | `BOOT-037` | A plain EKS GPU node group rolls with MINIMAL: the replacements carry the prerequisites and are adopted by the product, the departed Agents retire by themselves, the renames go to the campaign inputs | `destructive` | live | manual + unit tests | [§](regional-e2e-acceptance-test-cases.md#gf-regional-boot-037) |
 
 ## DO_NOT_RUN (historical ids retained only)
 

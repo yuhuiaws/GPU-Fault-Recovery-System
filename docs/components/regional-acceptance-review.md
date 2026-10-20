@@ -142,6 +142,8 @@ neither registration nor local regressions establish deployed execution.
 | BOOT-026 (historical WIP; now BOOT-032) | Full uninstall, interrupted native teardown, fresh-process resume and protected-site preservation | The current entry is `run_boot032_full_uninstall.py`. It uses a separately provisioned sacrificial site, native confirmation/state binding/locks/cleanup, an available final database snapshot and independent resource readback. It does not reuse or destroy the ongoing acceptance site. |
 | HA-011 | Busy processor and spool takeover with a stale callback while the replacement is still executing | `run_ha011_busy_cpu_takeover.py` uses a private namespace, the deployed runtime image and isolated PostgreSQL. Only probe-owned processes are killed; it is not a business-Pod failure or CPU-saturation SLO test. |
 | NOTIFY-008 | Provider acceptance before durable commit, independently observed across actual process loss | `run_notify008_commit_ambiguity.py` uses private PostgreSQL and a separate SIMULATED provider. It distinguishes the three commit windows and does not claim external exactly-once delivery, real SNS/SES mail or Aurora acceptance. |
+| BOOT-036 | A prepared plain EKS GPU node group plans nothing, every node check passes on exactly the group's instances, and every refusal stops before a node group is read or changed | `run_boot036_eks_nodegroup_plan.py` runs only the default read-only plan of `gpu-fault-admin prepare-eks-nodegroup` through the site's deploy-host CLI (one main plan, up to six refusal probes) and proves no drift of the groups, instances, Nodes and tool journals. It refuses to inventory nodes the product holds. |
+| BOOT-037 | `prepare-eks-nodegroup --apply` rolls one site-managed group with updateStrategy MINIMAL; the replacements are prepared, adopted by the fleet, the departed Agents retire, no incident opens | `run_boot037_eks_nodegroup_roll.py` is destructive: it replaces every GPU node of the group, runs last in a round under the exclusive site, rolls nothing back and reports `node_renames`/`profile_updates` for the campaign inputs instead of editing them. |
 
 The new tests exposed additional failure boundaries: opaque spool claim fences,
 known create-ACK UIDs retained before fallible readback, global IAM identities
@@ -967,6 +969,40 @@ Current catalog: read-only-signal-replay; manual; NOT_RUN.
 - Tests: tests/regional/test_state_table_acceptance_postgres.py
 - Findings At Review: Approved LIVE validation remains NOT_RUN; local tests are not hardware evidence.
 - Reviewer Handoff: Implemented; final local verification is recorded in the verification section.
+
+### GF-REGIONAL-BOOT-036
+
+普通 EKS GPU 节点组准备的只读计划：已准备的节点组 COMPLIANT、每台节点检查通过、DCGM 与 exporter 配对，拒绝在任何变更前停止
+
+Current catalog: read-only-signal-replay; manual; NOT_RUN.
+
+- Purpose: After the round's destructive and collector cases, prove read-only that the site's plain EKS GPU node groups are still prepared (managed user data part, node auto repair off, ownership label, MINIMAL, paired DCGM pin with the restart drop-in) and that the plan's refusals stop early.
+- Runner: scripts/e2e/regional/run_boot036_eks_nodegroup_plan.py; scripts/e2e/regional/eks_nodegroup_case.py; scripts/e2e/regional/eks_nodegroup_verdicts.py
+- Entry Points: CaseRunner -> read_only_preflight (identity, predecessor COLLECT-015, site record, `--help` of the site's CLI, groups, Nodes, store holds, probe targets) -> execute_case -> audit: snapshot, main plan, refusal probes, snapshot, store since start, identity
+- Assertions: compliant_plan_errors (verdict, steps, node repair, label, strategy, user data, DCGM pairing, inventory on exactly the instances and Nodes, Kubernetes findings); refusal_errors (exit 2, the fact named, no node group or node read before a cluster-level refusal, nothing-changed line of a group refusal, the adoption no-op note); snapshot_drift; incidents opened during the case; release unchanged
+- Safety And Cleanup: Every tool run is the verb's read-only plan (probe runner refuses mutating calls); the preflight refuses held nodes because the inventory runs nvidia-smi -q and dcgmi discovery; nothing to clean up
+- Necessity: The verb's plan and refusals had unit tests and one hand-driven live check only; the SSM inventory is the only proof that the nodes still carry the prerequisites after resets and reboots.
+- Overlap: case_ids: GF-REGIONAL-BOOT-033; GF-REGIONAL-BOOT-037; classification: complementary; rationale: BOOT-033 audits the label-based join, BOOT-037 the roll; neither inventories the prepared nodes read-only.
+- Tests: tests/regional/test_boot036_eks_nodegroup_plan.py; tests/regional/test_eks_nodegroup_verdicts.py; tests/regional/test_eks_nodegroup_case.py (the real verb against tests/admin/_eks_nodegroup_world.py)
+- Findings At Review: none open; a read-only plan step ran clean on the acceptance site, no execute verdict exists
+- Reviewer Handoff: Implemented; NOT_RUN until an approved execute.
+
+### GF-REGIONAL-BOOT-037
+
+普通 EKS GPU 节点组以 MINIMAL 滚动：替换节点带齐先决条件并被产品接管、离场 Agent 自行退役，节点改名交给 campaign 输入
+
+Current catalog: destructive; manual; NOT_RUN.
+
+- Purpose: Prove `prepare-eks-nodegroup --apply` on a site-managed group: a MINIMAL roll onto a launch template version that changes only the user data, replacements prepared and adopted by the node installer reconciler, departed Agents retired, no incident, renames reported.
+- Runner: scripts/e2e/regional/run_boot037_eks_nodegroup_roll.py; scripts/e2e/regional/eks_nodegroup_case.py; scripts/e2e/regional/eks_nodegroup_verdicts.py
+- Entry Points: CaseRunner -> read_only_preflight (identity, predecessor BOOT-036, the tool's read-only plan of the target configuration, Nodes, business workloads and bound attempts, store holds, Agents, window) -> execute_case -> roll: apply, wait_replacement, replan_errors, label_errors, wait_agents, wait_stable, incidents since the roll, renames
+- Assertions: roll_plan_errors (CHANGES with roll, MINIMAL, paired pin, readable inventory); apply_errors (COMPLETED, roll Successful, tool verification passed); replacement_errors; compliant_plan_errors after the roll; agent_errors; incident_errors since the roll; stability_errors; node_renames/profile_updates
+- Safety And Cleanup: Destructive and irreversible: the preflight refuses any held node, workload, attempt, incident, workflow or non-ACTIVE Agent and a short window; the tool holds the site lock; a failed roll stops waiting and names the rerun of the same apply; a lingering departed Agent names workflow-reconcile --retire-departed-agents; the campaign inputs are reported, never edited
+- Necessity: The apply path (launch template version, MINIMAL, roll, SSM verification) and its interaction with the fleet (installer reconciler, departed-node cleanup) had one hand-driven live run and no formal verdict.
+- Overlap: case_ids: GF-REGIONAL-BOOT-036; GF-REGIONAL-DESTR-013; classification: complementary; rationale: BOOT-036 is the read-only audit it builds on; DESTR-013 judges the executor role's provider calls and is unaffected by an administrator's roll.
+- Tests: tests/regional/test_boot037_eks_nodegroup_roll.py (the verb's apply rolls the group in tests/admin/_eks_nodegroup_world.py); tests/regional/test_eks_nodegroup_verdicts.py
+- Findings At Review: none open; a read-only plan step ran clean on the acceptance site (CHANGES: launch-template-version + roll for a version-only re-pin of the paired DCGM release), no execute verdict exists
+- Reviewer Handoff: Implemented; NOT_RUN until an approved maintenance window.
 
 ### GF-REGIONAL-CAP-001
 

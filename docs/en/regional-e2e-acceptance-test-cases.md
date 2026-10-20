@@ -572,6 +572,7 @@ These reads are not a cross-table atomic snapshot, and they do not fabricate evi
 | Notification | `NOTIFY-001..005` | `run_notification_acceptance.py --case <case>` |
 | Capacity | `CAP-001..004` | `run_capacity_acceptance.py --case <case>` |
 | Network | `NET-001` | `run_net001_collector_replay.py` |
+| Plain EKS node-group preparation | `BOOT-036..037` | `run_boot036_eks_nodegroup_plan.py`, `run_boot037_eks_nodegroup_roll.py` |
 
 The common plan/execute shape is:
 
@@ -3791,6 +3792,230 @@ release_id and the remedy: run `gpu-fault-admin deploy` of the site's own releas
 - Local regression: `tests/admin/test_admin_eks_managed_join.py`
   (`test_hyperpod_discovery_selects_the_labelled_instance_groups`), `tests/test_cluster_scope.py`
   (`…matches_only_this_sites_nodes`), `tests/regional/test_regional_admin_checks_node_scope.py`.
+
+### GF-REGIONAL-BOOT-036
+
+**The read-only plan of a plain EKS GPU node group's preparation: a prepared group is COMPLIANT, every node check passes, DCGM is paired with the exporter, and the refusals stop before any change**
+
+- Level: `read-only-signal-replay`. Runs only the default read-only plan of `gpu-fault-admin prepare-eks-nodegroup`
+  (Administrator Operations §5.0.1a), never `--apply`: AWS describe/list reads, `kubectl get` on a kubeconfig written to a
+  temporary directory, and one SSM `AWS-RunShellScript` read-only inventory per planned node group (python3.12 venv,
+  strace, `nvidia-smi -q`, `rpm -qa`, `systemctl is-active/show`, `pgrep nv-hostengine`, `dcgmi discovery -l`). The CLI
+  runs the plan through a read-only probe runner that refuses any mutating call; with `--state-dir` it keeps its usual log
+  under `<state-dir>/logs/readonly/`. No maintenance window is needed.
+- Purpose: the prerequisites of a plain EKS (`eks-managed`) GPU managed node group (§5.0.1: the managed user data part
+  installs python3.12 and strace, in host mode also the pinned DCGM 4 and the `nvidia-dcgm` restart drop-in; EKS node auto
+  repair off; the ownership label; `updateStrategy` MINIMAL) are prepared by this verb, which so far had unit tests and one
+  hand-driven live check. This case proves, after a round's destructive and collector cases, that the site-managed groups
+  are still compliant, that every node still carries the prerequisites, and that each refusal of the plan stops before a
+  node group is read or changed and names the fact.
+- Runner: `scripts/e2e/regional/run_boot036_eks_nodegroup_plan.py`. The site arguments (kubeconfigs, `--cluster-id`,
+  `--region`, `--state-dir`) come from `--site-profile`; `--nodegroup` is repeatable and defaults to every group labelled
+  `gpu-fault.io/control-plane=<site id>`; `--dcgm-hostengine`/`--dcgm-version` are passed to the tool unchanged and
+  default to the mode the group's label declares and the pin its managed part already carries. The tool always runs
+  through the site's own deploy-host CLI (`<state-dir>/deployer-venv/bin/gpu-fault-admin`):
+
+  ```bash
+  python3 scripts/e2e/regional/run_boot036_eks_nodegroup_plan.py \
+    --site-profile "${SITE_PROFILE}" --run-dir "${RUN_DIR}" --attempt 1 --plan
+  python3 scripts/e2e/regional/run_boot036_eks_nodegroup_plan.py \
+    --site-profile "${SITE_PROFILE}" --run-dir "${RUN_DIR}" --attempt 1 \
+    --execute --confirm BOOT036_READ_ONLY_EKS_NODEGROUP_PLAN \
+    --maintenance-window-end "${MAINTENANCE_WINDOW_END}"
+  ```
+
+  `--plan` reads the site record, the provider, Kubernetes and the store only and runs no tool but
+  `prepare-eks-nodegroup --help`; the plan binds the release, each group's launch template version, instances and Nodes,
+  and the refusal probe targets, and `--execute` refuses any drift.
+
+#### Prerequisites and isolation
+
+1. The formal predecessor is `COLLECT-015` PASS (same release and cluster); a selective run records
+   `SKIPPED_BY_OPERATOR`.
+2. The target is a site-managed `eks-managed` member (`provider: eks-managed` and `eksClusterArn` of the cluster in
+   `site.yaml`); a HyperPod target or a site without an `eks-managed` member records `BLOCKED_PREREQUISITE`.
+3. Every audited group is ACTIVE with running instances; every node is Ready, schedulable and carries no isolating taint,
+   and no active or escalated incident and no executable workflow in the store names it. The inventory runs
+   `nvidia-smi -q` and `dcgmi discovery -l` on these nodes: never run it beside a case that resets, quiesces or reboots the
+   group's nodes, and a node the product holds is never read.
+4. The site's own deploy-host CLI has the verb (`prepare-eks-nodegroup --help` exits 0).
+
+#### Steps
+
+1. Baseline: each group's status, launch template and its latest version, labels, `updateConfig`, `nodeRepairConfig`,
+   `scalingConfig`, AMI release, running instances (by the `eks:cluster-name`/`eks:nodegroup-name` tags) and Kubernetes
+   Nodes, plus the digests of the tool's journals under `<state-dir>/eks-nodegroup-prepare/`; the unsupported group a
+   refusal probe uses is recorded by configuration only.
+2. Main plan: `prepare-eks-nodegroup --cpu-cluster-arn <CPU ARN> --gpu-cluster-arn <GPU EKS ARN> --state-dir <STATE_DIR>
+   --nodegroup <group> ...` (plus the passed-through `--dcgm-*`).
+3. Refusal probes, one plan each:
+   - the CPU control plane's EKS ARN as `--gpu-cluster-arn` (`is the CPU control plane, not a GPU cluster`);
+   - a HyperPod cluster's SageMaker ARN (the site's HyperPod member, else the CPU control plane's HyperPod) as the GPU
+     cluster (`is a HyperPod cluster; prepare-eks-nodegroup never touches HyperPod instance groups`);
+   - the EKS ARN of the site's HyperPod member (only when the site has one; `is orchestrated by HyperPod cluster <name>`);
+   - an absent node group `gf-acceptance-absent-<run digest>` (`has no managed node group …; its node groups: …`);
+   - `--adopt-user-data-part gf-acceptance-absent-part-<run digest>.sh`: with the managed part in place only the note
+     `--adopt-user-data-part …: nothing to adopt (the managed part is in place)` and an unchanged plan (exit 0), without it a
+     refusal with `names no part of the user data`;
+   - a node group of the cluster the verb cannot prepare (carrying no ownership label, with an `amiType` other than
+     `AL2023_x86_64_NVIDIA`, no launch template or declared non-GPU instance types; only when the cluster has one):
+     `REFUSED`, pointing at the manual steps of §5.0.1.
+4. Read everything of step 1 again, the cluster's incidents since the case began, and the release identity once more.
+
+##### Verdict
+
+- The main plan is `COMPLIANT`: every group's verdict `COMPLIANT`, no step, `node_repair` `disabled`, this site's ownership
+  label, `update_strategy.current` `MINIMAL` without a finding, `roll.needed` false; user data `action` `keep` with exactly
+  one managed part and no contradicting line in a hand-written part; the DCGM mode equals the site's recorded
+  `dcgmHostEngine`, and in host mode the group carries `gpu-fault.io/dcgm-hostengine=host`, the pin is `paired` with the
+  DCGM client of the product's exporter and the plan carries the restart drop-in; `current_nodes.outcome` is `passed`,
+  every node has `ssm_status` `Success`, every check `ok`, no node or fleet finding, the inventoried instances are exactly
+  the group's running instances and its Kubernetes Nodes' instances, as many as `desiredSize`; the Kubernetes findings are
+  readable, the allowed workload namespaces exist, the NVIDIA and EFA device plugins run and no GPU DaemonSet tolerates the
+  quiesce taint.
+- Every refusal probe ends as expected: the cluster-level refusals (CPU control plane, HyperPod, HyperPod-orchestrated EKS)
+  exit 2 without printing a plan and without any `eks list-nodegroups`/`eks describe-nodegroup`/`ec2 describe-instances`/
+  `ssm send-command` among the provider calls they echo; the absent group is refused with exit 2 before any node is read;
+  a group-level refusal prints a `REFUSED` plan and says `nothing was changed`.
+- The reads of step 1 and step 4 are identical (no new launch template version; labels, update strategy, node repair,
+  instances and Nodes unchanged; no journal written), no incident opened on the cluster during the case and the release did
+  not change. Anything else is FAIL.
+- Local regression: `tests/regional/test_boot036_eks_nodegroup_plan.py`, `tests/regional/test_eks_nodegroup_verdicts.py`,
+  `tests/regional/test_eks_nodegroup_case.py` (running the real verb against the tool's own
+  `tests/admin/_eks_nodegroup_world.py`), `tests/admin/test_admin_eks_nodegroup_*.py`.
+
+##### Evidence
+
+`cases/GF-REGIONAL-BOOT-036/`: `GF-REGIONAL-BOOT-036.json` (release and cluster identity, the errors of every stage, each
+probe's expectation and outcome), `preflight.json`, `tool-plan.json` and `tool-plan.stderr.log` (the main plan document and
+the CLI output with credential lines removed), `tool-refusal-<name>.*` per refusal probe,
+`snapshot-before.json`/`snapshot-after.json`, `store-after.json`.
+
+##### Known limitations
+
+- The node checks are the tool's own SSM inventory judged per DCGM mode; the case independently checks which instances and
+  Nodes the inventory must cover, it does not repeat each check's reading.
+- The unsupported-group refusal runs only where the cluster has such a group; the HyperPod-orchestrated EKS refusal only on
+  a site with a HyperPod member.
+
+### GF-REGIONAL-BOOT-037
+
+**A plain EKS GPU node group rolls with MINIMAL: the replacements carry the prerequisites and are adopted by the product, the departed Agents retire by themselves, the renames go to the campaign inputs**
+
+- Level: `destructive`. `prepare-eks-nodegroup --apply --confirm PREPARE_EKS_NODEGROUP` creates a launch template version
+  that changes only UserData, sets `updateStrategy` MINIMAL where needed and rolls the node group onto it: EKS terminates
+  `maxUnavailable` nodes at a time before launching their replacements, **every** GPU node of the group is replaced, every
+  workload on it stops, and the replacements get new names and instance ids. It is an administrator's maintenance action,
+  not a product recovery path (the product never calls provider replace); the risk is recorded by the actual maximum side
+  effect as `destructive`.
+- Purpose: `--apply` so far had unit tests and one hand-driven live roll. This case proves that after it rolls a
+  site-managed GPU node group with MINIMAL, the replacements carry the prerequisites of §5.0.1, the node installer
+  reconciler adopts them, the departed nodes' Agents are retired by the departed-node cleanup, the whole roll opens no
+  incident, and the renames are handed to the campaign inputs.
+- Runner: `scripts/e2e/regional/run_boot037_eks_nodegroup_roll.py`. Exactly one `--nodegroup`; the target configuration's
+  `--dcgm-hostengine`/`--dcgm-version`/`--adopt-user-data-part` are passed to the tool unchanged;
+  `--roll-timeout-minutes` defaults to 150 (1..360); `--reference` defaults to
+  `GF-REGIONAL-BOOT-037:a<attempt>:<run digest>`:
+
+  ```bash
+  python3 scripts/e2e/regional/run_boot037_eks_nodegroup_roll.py \
+    --site-profile "${SITE_PROFILE}" --run-dir "${RUN_DIR}" --attempt 1 \
+    --nodegroup <group> [--dcgm-hostengine host --dcgm-version <pin>] [--adopt-user-data-part <part>] --plan
+  python3 scripts/e2e/regional/run_boot037_eks_nodegroup_roll.py \
+    --site-profile "${SITE_PROFILE}" --run-dir "${RUN_DIR}" --attempt 1 \
+    --nodegroup <group> [the same target arguments] \
+    --execute --confirm BOOT037_REPLACE_EVERY_GPU_NODE_OF_THE_GROUP \
+    --maintenance-window-end "${MAINTENANCE_WINDOW_END}"
+  ```
+
+  `--plan` runs the tool's read-only plan once (SSM inventory included) and binds the plan's steps, pin, instances and
+  Nodes; `apply_command` in `plan.json` is the complete apply `--execute` will run. `--execute` repeats the preflight and
+  refuses any drift without writing anything.
+
+#### Prerequisites and isolation
+
+1. The formal predecessor is `BOOT-036` PASS (same release and cluster); the target is a site-managed `eks-managed` member.
+2. The read-only plan of the target configuration must roll the group: status `CHANGES`, steps only out of
+   launch-template-version/node-repair/labels/update-config/roll and including roll, `update_strategy.planned` `MINIMAL`
+   (the runner never passes `--keep-update-strategy`), in host mode a `paired` pin, current nodes readable and as many as
+   `desiredSize`. A group already on the target configuration (`COMPLIANT`), a refused one (`REFUSED`) or an earlier
+   apply's update still running (`IN_PROGRESS`: rerun that apply first, it resumes the journaled update) is refused at
+   preflight. What makes the plan roll: a first preparation, a new managed part after the product's paired DCGM version
+   moved, `--adopt-user-data-part`; when none applies, the acceptance alternates between the two spellings of a pin of the
+   same paired DCGM version -- `--dcgm-version <version>-<build>` (installs and accepts that build only) and
+   `--dcgm-version <version>` (installs and accepts any build of that version) are both paired with the exporter's DCGM
+   client, the managed part differs in the pin line only, and the plan is launch-template-version + roll; the next round
+   switches back.
+3. Nothing holds the group: every node Ready, schedulable and without an isolating taint; no business Pod and no attempt
+   the control plane binds to a node; no active incident and no executable workflow on the cluster and no escalated incident
+   on the group's nodes; every node's Agent ACTIVE; no declared warm spare (a declared spare is cordoned and refused by the
+   first condition).
+4. The maintenance window covers `--roll-timeout-minutes` plus the rest of the apply (two configuration updates of at most
+   15 minutes each, the tool's SSM verification of at most 25 minutes, a margin) and all the bounded waits below; otherwise
+   the preflight refuses.
+5. Mutually exclusive with every other regional case (exclusive site). The apply holds the site's administrator operation
+   lock for its whole run: `config`/`deploy` refuse at once while it is held and cannot start during the roll. A Spot
+   group's replacement may not launch for want of capacity (MINIMAL has already terminated the node it replaces): the tool
+   stops `ROLL_FAILED` or `ROLL_IN_PROGRESS` and the group is one node short until the same apply command is rerun.
+6. Place in a round: the last case (the "Plain EKS node-group preparation" phase comes after "Full uninstall of an
+   independent site"). After the PASS the campaign inputs (the site profile arguments naming nodes, run scripts and the
+   provider matrix) follow `node_renames` and `profile_updates` of the result before any later case uses the group's nodes;
+   the runner never edits them itself.
+
+#### Steps
+
+1. Repeat the preflight and compare it with the approved plan (release, group, launch template version, steps, pin,
+   instances, Nodes).
+2. Run `apply_command` (`--apply --confirm PREPARE_EKS_NODEGROUP --reference <ref> --roll-timeout-minutes <N>`); the tool
+   journals every step to `<state-dir>/eks-nodegroup-prepare/`, re-reads the group before every EKS write and checks the new
+   nodes with the same SSM script after the roll.
+3. Wait (at most 30 minutes) until no departed Node is left and as many replacement Nodes as `desiredSize` are Ready: when
+   EKS reports the update done, the last departed instance may still be shutting down and its NotReady Node stays until the
+   node lifecycle controller deletes it.
+4. Plan the same target configuration read-only again (without `--adopt-user-data-part`: the adopted part is the managed
+   part now).
+5. Wait (at most 30 minutes) until the node installer reconciler made every replacement's Agent ACTIVE, then (at most
+   20 minutes) until the departed-node cleanup retired the departed nodes' Agents.
+6. Wait (at most 20 minutes) until every replacement has been Ready for 10 minutes, schedulable and without an isolating
+   taint; read the cluster's incidents since the roll began and the release identity once more.
+
+##### Verdict
+
+- The apply is `COMPLETED`: exit 0, `apply.status` `COMPLETED`, the group's `outcome` `COMPLETED`, the roll update
+  `Successful`, the tool's own `verification.outcome` `passed`.
+- No departed Node is left; as many replacement Nodes as `desiredSize`, all Ready, labelled
+  `gpu-fault.io/control-plane=<site id>` and in host mode also `gpu-fault.io/dcgm-hostengine=host`.
+- The plan of step 4 meets the main-plan verdict of `BOOT-036` (`COMPLIANT`, every check ok on every replacement, the
+  inventory exactly the replacement instances, the DCGM pin the target pin and `paired`).
+- Every replacement's Agent is ACTIVE; no departed node has an ACTIVE/DRAINING Agent; no incident opened on the cluster since
+  the roll began and no active incident or executable workflow is left; the replacements have been Ready for 10 minutes,
+  schedulable and untainted; the release did not change. Anything else is FAIL.
+- The result names `departed_nodes`, `replacement_nodes`, `node_renames` (departed and replacement nodes paired in name
+  order) and `profile_updates` (the site profile arguments naming a departed node and the replacement name they should
+  carry).
+- Local regression: `tests/regional/test_boot037_eks_nodegroup_roll.py` (the tool's apply really rolls the group in the
+  recorded world), `tests/regional/test_eks_nodegroup_verdicts.py`, `tests/admin/test_admin_eks_nodegroup_prepare.py`.
+
+##### Cleanup and exits
+
+A roll cannot be undone and the runner rolls nothing back. When the apply stops `ROLL_FAILED`/`ROLL_IN_PROGRESS` or the
+replacements do not come back, the result's `exits` names the same apply command: rerun it (the journal resumes the update
+and reuses the prepared launch template version). A departed node's Agent still ACTIVE:
+`gpu-fault-admin workflow-reconcile --state-dir <STATE_DIR> --retire-departed-agents --node <node> --reference <ref>`. The
+attempt stays FAIL; a later acceptance needs another target configuration that makes the plan roll.
+
+##### Evidence
+
+`cases/GF-REGIONAL-BOOT-037/`: `GF-REGIONAL-BOOT-037.json` (release and cluster identity, `roll_started_at`/`roll_ended_at`,
+the errors of every stage, `departed_nodes`, `replacement_nodes`, `node_renames`, `profile_updates`, `exits`),
+`preflight.json`, `tool-plan-before.json`, `tool-apply.json`, `tool-plan-after.json` with their `.stderr.log`,
+`store-after.json`; the tool's journal is `<state-dir>/eks-nodegroup-prepare/<cluster name>-<ARN sha8>/<node group>.json`.
+
+##### Known limitations
+
+- A replacement keeps no identity; pairing departed and replacement nodes in name order is a convention.
+- Proves the replacements this roll produced only; whether a later AMI release or an EKS-initiated replacement prepares
+  nodes the same way is outside this case.
 
 ### GF-REGIONAL-BOOT-024
 
@@ -16249,6 +16474,10 @@ Mandatory field notes:
 > `BOOT-032` uses a separate, independently destroyable site and binds `COLLECT-015`'s
 > evidence to the protected site; historical evidence of the lifecycle chain and the
 > continuous acceptance site must not be borrowed or rewritten to authorise the uninstall.
+> `BOOT-036/037` apply to a site-managed `eks-managed` member only (otherwise `BLOCKED_PREREQUISITE`): `BOOT-036`
+> takes `COLLECT-015` as evidence predecessor and checks read-only that the node groups are still compliant;
+> `BOOT-037` takes `BOOT-036` and replaces every GPU node of one group, closes the round, and the campaign inputs then
+> follow the result's `node_renames`/`profile_updates`.
 
 Acceptance of the split deployment must proceed bottom-up; when a lower layer fails, the
 conclusions of the layers above are not trustworthy:
@@ -16274,6 +16503,7 @@ conclusions of the layers above are not trustworthy:
 | 16 Multiple physical clusters | `ISO-006` → `E2E-002` → `ISO-007` | yes | needs a second physical cluster; includes network outage and real job restart, BLOCKED when preconditions are insufficient |
 | 17 Collection and decision coverage | exact order in the machine index; `COLLECT-015` reboot last | graded | adds `COLLECT-017`, `COLLECT-018..020` (`020` cordons a node, needs a maintenance window) |
 | 18 Full uninstall of an independent site | `BOOT-032` | **yes** | destroys only a pre-prepared independent acceptance site; the first RESTART_REQUIRED is not a PASS, a new process must resume and complete every check |
+| 19 Plain EKS node-group preparation | `BOOT-036` → `BOOT-037` | graded | site-managed eks-managed members only; `036` is read-only, `037` replaces every GPU node of the group, needs a maintenance window and the exclusive site, and the campaign inputs then follow `node_renames`/`profile_updates` |
 
 The order of the three destructive phases -- **"Destructive capability acceptance (incl.
 non-destructive fail-closed negative cases)" → "Warm spare" → "Failover and constraint
