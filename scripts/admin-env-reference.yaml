@@ -527,6 +527,10 @@ categories:
         description: "completion event/decision 记录保留秒数（默认 30 天）；≤0 关闭清理。仍被 incident 引用的不删。"
       - name: GPU_FAULT_REGISTRY_MEMBER_RETENTION_SECONDS
         description: "区域 registry 成员心跳记录的保留秒数（默认 1 天）；≤0 关闭清理。仅 regional 角色运行该清扫。"
+      - name: GPU_FAULT_HEALTH_SIGNAL_RETENTION_SECONDS
+        description: "健康信号状态行（health_signal_state、efa_traffic_state）的保留秒数（默认 30 天）：节点级/设备级行、以及无 watcher 担保集群上的 attempt 行，超过该时长无任何申领写入即删除；≤0 关闭整个健康信号保留清扫。"
+      - name: GPU_FAULT_HEALTH_SIGNAL_GRACE_SECONDS
+        description: "健康信号保留的宽限秒数（默认 1 天，取值 600 至保留期）：宽限内被写过的行从不删除；attempt 已结束、节点已证明离开或旧版本按 attempt 存的 EFA 行，须超过宽限无写入才删除。"
       - name: GPU_FAULT_REMOTE_COMMAND_STALE_FENCE_GRACE_SECONDS
         production: "600"
         description: "LEASED 远程命令租约过期后，栅栏不再匹配的命令被清扫为 FAILED(stale-fence) 前的宽限秒数（D-9）。"

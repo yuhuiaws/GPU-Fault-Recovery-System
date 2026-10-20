@@ -17,6 +17,9 @@ from gpu_fault.models import (
     StrictModel,
 )
 from gpu_fault.orchestration.families.identity import derived_record_id
+from gpu_fault.store.shared.health_signals import (
+    training_signal_key as _training_signal_key,
+)
 from gpu_fault.training_models import (
     TrainingProgressHeartbeat as TrainingProgressHeartbeat,
 )
@@ -64,10 +67,6 @@ class TrainingHealthPolicy(StrictModel):
 
 
 TRAINING_EVIDENCE_SCHEME = "training-progress://"
-
-
-def _training_signal_key(cluster_id: str, attempt_id: str, rank: int, kind: str) -> str:
-    return f"{cluster_id}/{attempt_id}/rank-{rank}/training-{kind}"
 
 
 def training_health_signal_key(finding: NodeHealthFinding) -> str | None:

@@ -594,6 +594,11 @@ rules:
       # attempt-scoped low-utilisation windows included (batch 140).
       - tests/store/test_health_signal_semantics.py
       - tests/app_services/test_health_signal_notified_after_delivery.py
+      # Health-signal state retention (batch 145): the sweep's rules on every
+      # backend, its periodic job, and the EFA traffic row per node it keeps.
+      - tests/store/test_health_signal_retention.py
+      - tests/app_services/test_health_signal_retention_job.py
+      - tests/host_health/test_efa_traffic_node_state.py
     regional_cases:
       - GF-REGIONAL-CAP-001..005
       - GF-REGIONAL-HA-003

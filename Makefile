@@ -181,6 +181,7 @@ POSTGRES_TESTS = \
 	tests/store/test_postgres_ensure_schema_locks.py \
 	tests/store/test_postgres_find_open_remote_command.py \
 	tests/store/test_postgres_health_signal_claim_isolation.py \
+	tests/store/test_postgres_health_signal_retention.py \
 	tests/store/test_postgres_health_signal_semantics.py \
 	tests/store/test_postgres_hot_table_compaction.py \
 	tests/store/test_postgres_hot_layout.py \

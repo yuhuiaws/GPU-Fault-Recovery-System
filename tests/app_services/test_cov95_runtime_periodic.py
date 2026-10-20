@@ -99,6 +99,7 @@ def test_optional_retention_jobs_respect_disabled_configuration(
             notification_retention=0,
             completion_record_retention=0,
             registry_member_retention=0,
+            health_signal_retention=0,
             remote_stale_fence_grace=0,
             remote_claim_deadline=0,
             observation_max_age=0,
@@ -116,6 +117,7 @@ def test_optional_retention_jobs_respect_disabled_configuration(
         "cleanup_terminal_notifications",
         "cleanup_completion_records",
         "cleanup_stale_regional_registry_members",
+        "cleanup_health_signal_states",
         "expire_stale_fenced_remote_commands",
         "expire_unclaimed_remote_commands",
     }

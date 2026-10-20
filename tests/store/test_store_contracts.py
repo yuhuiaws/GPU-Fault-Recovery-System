@@ -64,6 +64,7 @@ from tests._builders import (
 # reviewed change here.
 MEMORY_SHARED_PUBLIC = frozenset(
     {
+        "cleanup_health_signal_states",
         "complete_active_processor_requests_batch",
         "efa_traffic_state_key",
         "get_decision_by_attempt",
@@ -86,6 +87,7 @@ SQLITE_SHARED_PUBLIC = frozenset(
         "amend_workflow",
         "apply_efa_traffic_admin_action",
         "cancel_orphaned_remote_commands",
+        "cleanup_health_signal_states",
         "cleanup_stale_regional_registry_members",
         "complete_active_processor_requests_batch",
         "complete_notification_delivery",
@@ -209,6 +211,7 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "amend_workflow",
         "apply_efa_traffic_admin_action",
         "cancel_orphaned_remote_commands",
+        "cleanup_health_signal_states",
         "complete_remote_command",
         "complete_xid_correlation",
         "create_incident_workflow_if_absent",
@@ -1103,6 +1106,9 @@ POSTGRES_CONCURRENCY_SEMANTICS: dict[str, str] = {
     ),
     "record_kubernetes_node_inventory": (
         "tests/departed_nodes/test_departed_node_cleanup_postgres.py"
+    ),
+    "cleanup_health_signal_states": (
+        "tests/store/test_postgres_health_signal_retention.py"
     ),
 }
 

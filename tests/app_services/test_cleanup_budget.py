@@ -50,11 +50,13 @@ def _config(**overrides) -> PeriodicServiceConfig:
         # The budget arithmetic below is pinned to the four original local
         # jobs; the F-8 sweeps (markers, notifications, completion records,
         # registry members) have their own tests in
-        # test_cleanup_unbounded_kinds.py.
+        # test_cleanup_unbounded_kinds.py, the health-signal retention in
+        # test_health_signal_retention_job.py.
         marker_retention=0.0,
         notification_retention=0.0,
         completion_record_retention=0.0,
         registry_member_retention=0.0,
+        health_signal_retention=0.0,
     )
     return replace(base, **overrides)
 

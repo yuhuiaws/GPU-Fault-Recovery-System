@@ -11,6 +11,7 @@ from collections.abc import Sequence
 from datetime import datetime
 import hashlib
 import json
+import re
 from typing import TYPE_CHECKING
 
 from gpu_fault.models import HealthSignalState
@@ -118,17 +119,54 @@ def health_signal_key(
     return "/".join(parts)
 
 
+#: The ``active_workload_only`` rules of ``NodeHealthPolicy``: the only rules
+#: whose windows are claimed under :func:`attempt_signal_key` (pinned against
+#: ``SUSTAINED_METRIC_RULES`` by a test). Retention recognises such a key by
+#: this segment, three from the end.
+ATTEMPT_SCOPED_RULE_IDS = frozenset({"LOW_CPU_UTILIZATION", "LOW_GPU_UTILIZATION"})
+
+_TRAINING_SIGNAL_KEY = re.compile(
+    r"(?P<cluster>[^/]+)/(?P<attempt>[^/]+)/rank-(?P<rank>[0-9]+)/training-[a-z-]+"
+)
+
+
 def attempt_signal_key(signal_key: str, job_id: str, attempt_id: str) -> str:
     """The window of an active-workload rule for one managed attempt.
 
     Low CPU/GPU utilisation is timed per attempt: a job that replaces another
     on the node starts a fresh window and a fresh notification latch instead of
     inheriting the previous attempt's low time (round 10, COLLECT-017 ->
-    E2E-002). Rows accumulate per attempt, as EFA-traffic and training-health
-    states already do.
+    E2E-002). Rows accumulate per attempt, like training-health states; the
+    health-signal retention removes them once the attempt has ended
+    (``store/shared/signal_retention.py``).
     """
 
     return "/".join([signal_key, job_id, attempt_id])
+
+
+def training_signal_key(cluster_id: str, attempt_id: str, rank: int, kind: str) -> str:
+    """``cluster/attempt/rank-N/training-<kind>``: one training-health signal."""
+
+    return f"{cluster_id}/{attempt_id}/rank-{rank}/training-{kind}"
+
+
+def signal_key_attempt(signal_key: str) -> tuple[str | None, str] | None:
+    """``(job_id, attempt_id)`` of an attempt-scoped key, else None.
+
+    Two shapes carry an attempt: :func:`attempt_signal_key` (``job_id`` and
+    ``attempt_id`` follow an attempt-scoped rule id) and
+    :func:`training_signal_key` (no job, no node). Kubernetes names and label
+    values never contain ``/``, so the segments are unambiguous; a device can
+    (a mount point), which is why the rule id is matched from the end.
+    """
+
+    training = _TRAINING_SIGNAL_KEY.fullmatch(signal_key)
+    if training is not None:
+        return None, training["attempt"]
+    parts = signal_key.split("/")
+    if len(parts) >= 7 and parts[-3] in ATTEMPT_SCOPED_RULE_IDS:
+        return parts[-2], parts[-1]
+    return None
 
 
 def finding_health_signal_key(finding: NodeHealthFinding) -> str:

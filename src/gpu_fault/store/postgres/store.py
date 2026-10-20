@@ -40,6 +40,7 @@ from gpu_fault.store.postgres.processor_storage import PostgresProcessorStorageM
 from gpu_fault.store.postgres.record_cas import PostgresRecordCasMixin
 from gpu_fault.store.postgres.remote_commands import PostgresRemoteCommandMixin
 from gpu_fault.store.postgres.schema_state import PostgresSchemaMixin
+from gpu_fault.store.postgres.signal_retention import PostgresSignalRetentionMixin
 from gpu_fault.store.postgres.telemetry_spool import PostgresTelemetrySpoolMixin
 from gpu_fault.store.postgres.wakeups import PostgresWakeupMixin
 from gpu_fault.store.postgres.workflows import PostgresWorkflowMixin
@@ -60,6 +61,7 @@ from gpu_fault.store.shared.primitives import (
 from gpu_fault.store.shared.processor_leases import SharedProcessorLeaseMixin
 from gpu_fault.store.shared.record_models import record_models
 from gpu_fault.store.shared.remote_commands import SharedRemoteCommandMixin
+from gpu_fault.store.shared.signal_retention import SharedSignalRetentionMixin
 from gpu_fault.store.shared.telemetry_records import SharedTelemetryRecordMixin
 from gpu_fault.store.shared.transactional_workflows import TransactionalWorkflowMixin
 from gpu_fault.store.shared.workflow_records import SharedWorkflowRecordMixin
@@ -92,6 +94,7 @@ class PostgresStore(
     PostgresProcessorCompletionMixin,
     PostgresProcessorLeaseMixin,
     PostgresProcessorStorageMixin,
+    PostgresSignalRetentionMixin,
     # Dialect-neutral templates over the key/value primitives.
     TransactionalWorkflowMixin,
     SharedRecordAccessMixin,
@@ -105,6 +108,7 @@ class PostgresStore(
     SharedXidMixin,
     SharedTelemetryRecordMixin,
     SharedProcessorLeaseMixin,
+    SharedSignalRetentionMixin,
     # Pure rules and public-contract compositions every store shares.
     SharedEfaTrafficRulesMixin,
     SharedXidSignalMixin,

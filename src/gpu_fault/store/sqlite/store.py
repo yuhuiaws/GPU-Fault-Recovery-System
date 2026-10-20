@@ -31,6 +31,7 @@ from gpu_fault.store.shared.primitives import (
 from gpu_fault.store.shared.processor_leases import SharedProcessorLeaseMixin
 from gpu_fault.store.shared.record_models import record_models
 from gpu_fault.store.shared.remote_commands import SharedRemoteCommandMixin
+from gpu_fault.store.shared.signal_retention import SharedSignalRetentionMixin
 from gpu_fault.store.shared.telemetry_records import SharedTelemetryRecordMixin
 from gpu_fault.store.shared.transactional_workflows import TransactionalWorkflowMixin
 from gpu_fault.store.shared.wakeups import InProcessWakeupMixin, WakeupHub
@@ -43,6 +44,7 @@ from gpu_fault.store.sqlite.notifications import SqliteNotificationMixin
 from gpu_fault.store.sqlite.processor_leases import SqliteProcessorLeaseMixin
 from gpu_fault.store.sqlite.processor_queue import SqliteProcessorQueueMixin
 from gpu_fault.store.sqlite.remote_commands import SqliteRemoteCommandMixin
+from gpu_fault.store.sqlite.signal_retention import SqliteSignalRetentionMixin
 from gpu_fault.store.sqlite.telemetry import SqliteTelemetryMixin
 from gpu_fault.store.sqlite.workflows import SqliteWorkflowMixin
 from gpu_fault.store.sqlite.xid import SqliteXidMixin
@@ -61,6 +63,7 @@ class SqliteStore(
     SqliteTelemetryMixin,
     SqliteProcessorQueueMixin,
     SqliteProcessorLeaseMixin,
+    SqliteSignalRetentionMixin,
     # Dialect-neutral templates over the key/value primitives.
     SharedRecordAccessMixin,
     SharedControlRecordMixin,
@@ -73,6 +76,7 @@ class SqliteStore(
     SharedXidMixin,
     SharedTelemetryRecordMixin,
     SharedProcessorLeaseMixin,
+    SharedSignalRetentionMixin,
     # Pure rules and public-contract compositions every store shares.
     SharedEfaTrafficRulesMixin,
     SharedXidSignalMixin,

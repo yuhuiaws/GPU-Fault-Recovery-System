@@ -29,6 +29,7 @@ from gpu_fault.store.memory.notifications import MemoryNotificationMixin
 from gpu_fault.store.memory.processor_leases import MemoryProcessorLeaseMixin
 from gpu_fault.store.memory.processor_queue import MemoryProcessorQueueMixin
 from gpu_fault.store.memory.remote_commands import MemoryRemoteCommandMixin
+from gpu_fault.store.memory.signal_retention import MemorySignalRetentionMixin
 from gpu_fault.store.memory.telemetry import MemoryTelemetryMixin
 from gpu_fault.store.memory.telemetry_spool import MemoryTelemetrySpoolMixin
 from gpu_fault.store.memory.workflows import MemoryWorkflowMixin
@@ -44,6 +45,7 @@ from gpu_fault.store.shared.errors import (
 from gpu_fault.store.shared.errors import (
     WorkflowLeaseError as WorkflowLeaseError,
 )
+from gpu_fault.store.shared.signal_retention import SharedSignalRetentionMixin
 from gpu_fault.store.shared.xid import SharedXidSignalMixin
 from gpu_fault.store.shared.wakeups import (
     InProcessWakeupMixin,
@@ -67,7 +69,9 @@ class InMemoryStore(
     MemoryProcessorQueueMixin,
     MemoryProcessorLeaseMixin,
     MemoryFleetMixin,
+    MemorySignalRetentionMixin,
     # Pure rules and public-contract compositions every store shares.
+    SharedSignalRetentionMixin,
     SharedEfaTrafficRulesMixin,
     SharedXidSignalMixin,
     SharedCompositionMixin,

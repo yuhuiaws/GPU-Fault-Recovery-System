@@ -80,6 +80,12 @@ class PeriodicServiceConfig:
     # lease lapsed this long ago while its workflow moved to another
     # fencing_token is failed with status_source="stale-fence".
     remote_stale_fence_grace: float = 600.0
+    # Batch 145: health-signal and EFA traffic state rows of attempts that
+    # ended and nodes that departed go once nothing wrote them for the grace;
+    # any other row once nothing wrote it for the retention (non-positive:
+    # the sweep is off). store/shared/signal_retention.py has the rules.
+    health_signal_retention: float = 2592000.0
+    health_signal_grace: float = 86400.0
 
     def __post_init__(self) -> None:
         # The env reference generator infers a variable's kind from the
@@ -100,6 +106,13 @@ class PeriodicServiceConfig:
         if self.archive_batch_size <= 0:
             raise ValueError(
                 "GPU_FAULT_CONTROL_RECORD_ARCHIVE_BATCH_SIZE must be positive"
+            )
+        if self.health_signal_retention > 0 and not (
+            600 <= self.health_signal_grace <= self.health_signal_retention
+        ):
+            raise ValueError(
+                "GPU_FAULT_HEALTH_SIGNAL_GRACE_SECONDS must be at least 600 and "
+                "at most GPU_FAULT_HEALTH_SIGNAL_RETENTION_SECONDS"
             )
 
     @classmethod
@@ -226,6 +239,12 @@ class PeriodicServiceConfig:
             ),
             remote_stale_fence_grace=float(
                 os.getenv("GPU_FAULT_REMOTE_COMMAND_STALE_FENCE_GRACE_SECONDS", "600")
+            ),
+            health_signal_retention=float(
+                os.getenv("GPU_FAULT_HEALTH_SIGNAL_RETENTION_SECONDS", "2592000")
+            ),
+            health_signal_grace=float(
+                os.getenv("GPU_FAULT_HEALTH_SIGNAL_GRACE_SECONDS", "86400")
             ),
         )
 
@@ -646,7 +665,8 @@ class PeriodicServiceRunner:
         the archiver bundles those with the incident (F-I1) -- and takes only
         rows in a terminal state: inactive markers, notifications whose
         delivery is SENT/DEAD (never PENDING/RETRY/LEASED) and completion
-        decisions whose attempt event aged out.
+        decisions whose attempt event aged out. Health-signal state rows go
+        with their ended attempt or departed node (batch 145).
         """
 
         cfg = self.config
@@ -680,6 +700,18 @@ class PeriodicServiceRunner:
                     lambda: self.context.store.cleanup_completion_records(
                         older_than=datetime.now(timezone.utc)
                         - timedelta(seconds=cfg.completion_record_retention),
+                        limit=cfg.cleanup_batch_size,
+                    ),
+                )
+            )
+        if cfg.health_signal_retention > 0:
+            jobs.append(
+                (
+                    "health_signal_states",
+                    lambda: self.context.store.cleanup_health_signal_states(
+                        now=datetime.now(timezone.utc),
+                        grace=timedelta(seconds=cfg.health_signal_grace),
+                        retention=timedelta(seconds=cfg.health_signal_retention),
                         limit=cfg.cleanup_batch_size,
                     ),
                 )
