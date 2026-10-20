@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import signal
 import socket
+import statistics
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -784,6 +785,13 @@ def test_an_empty_long_poll_answered_at_once_is_paced_with_commands_in_flight(
     empty = [claim for claim in client.claims if not claim.command_ids]
     gaps = [later.at - earlier.at for earlier, later in zip(empty, empty[1:])]
     assert len(empty) >= 3, f"the loop stopped claiming: {client.claims}"
-    assert min(gaps) >= 0.09, (
-        f"empty answers re-claimed sooner than poll_seconds (a spin): {gaps}"
+    # The loop spaces claim *starts* poll_seconds apart (the gate runs from the
+    # claim's start, so a held claim's wait counts toward it). ``at`` is read on
+    # the fake's side, after the client's own request work, and that work's
+    # duration jitters with the host's load: a release gate under 16 workers
+    # read one gap of 0.076 s beside a median of 0.105 s. A spin re-claims
+    # within one call's round trip, far under half the period.
+    assert min(gaps) >= 0.05, f"empty answers re-claimed at once (a spin): {gaps}"
+    assert statistics.median(gaps) >= 0.09, (
+        f"empty answers re-claimed faster than poll_seconds: {gaps}"
     )
