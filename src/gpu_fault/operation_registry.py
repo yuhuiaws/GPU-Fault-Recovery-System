@@ -26,7 +26,8 @@ class OperationAdapter(StrEnum):
     GPU_VALIDATION = "gpu-validation"
     HYPERPOD = "hyperpod"
     # Plain EKS clusters: the same lifecycle step adapter over EC2
-    # RebootInstances (owner ``gpu-fault-eks-adapter``); replace is OBSERVE.
+    # RebootInstances (owner ``gpu-fault-eks-adapter``); REPLACE_NODE is the
+    # warm-spare handover only, never a provider replacement.
     EKS = "eks"
     MANAGED_RECOVERY = "managed-recovery"
     SUPPORT = "support"
