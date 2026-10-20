@@ -112,8 +112,11 @@ rules:
       # (batch 131): the Agent's 780 s and the control plane's 1200 s step cap.
       - tests/node_agent/test_fabric_manager_unit_timing.py
       - tests/execution/test_fabric_manager_step_waiting_cap.py
+      # prepare-eks-nodegroup's acceptance cases run the verb itself.
+      - tests/regional/test_boot036_eks_nodegroup_plan.py
+      - tests/regional/test_boot037_eks_nodegroup_roll.py
     regional_cases:
-      - GF-REGIONAL-BOOT-033..035
+      - GF-REGIONAL-BOOT-033..037
     checks:
       - docs-check
     full: false
@@ -546,6 +549,32 @@ rules:
       - tests/node_agent/test_reset_two_gpus_one_window.py
     regional_cases:
       - GF-REGIONAL-DESTR-026
+    counts_as_domain: false
+
+  - id: eks-nodegroup-preparation-acceptance
+    description: >-
+      The plain EKS node-group preparation cases: GF-REGIONAL-BOOT-036 audits
+      the read-only plan of the site's prepared groups and its refusals,
+      GF-REGIONAL-BOOT-037 rolls one group with updateStrategy MINIMAL and
+      follows the replacements into the fleet; their runners, the shared reads
+      and verdicts, and their tests over the verb's own recorded world.
+    paths:
+      - scripts/e2e/regional/run_boot036_eks_nodegroup_plan.py
+      - scripts/e2e/regional/run_boot037_eks_nodegroup_roll.py
+      - scripts/e2e/regional/eks_nodegroup_case.py
+      - scripts/e2e/regional/eks_nodegroup_verdicts.py
+      - tests/regional/_eks_nodegroup_site.py
+      - tests/regional/test_boot036_eks_nodegroup_plan.py
+      - tests/regional/test_boot037_eks_nodegroup_roll.py
+      - tests/regional/test_eks_nodegroup_case.py
+      - tests/regional/test_eks_nodegroup_verdicts.py
+    pytest:
+      - tests/regional/test_boot036_eks_nodegroup_plan.py
+      - tests/regional/test_boot037_eks_nodegroup_roll.py
+      - tests/regional/test_eks_nodegroup_case.py
+      - tests/regional/test_eks_nodegroup_verdicts.py
+    regional_cases:
+      - GF-REGIONAL-BOOT-036..037
     counts_as_domain: false
 
   - id: store-processor

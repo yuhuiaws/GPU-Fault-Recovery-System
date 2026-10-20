@@ -854,6 +854,26 @@ requirements:
       - nodeid: tests/regional/test_regional_admin_checks_node_scope.py::test_full_status_shows_the_selector_source_and_the_nodes_left_out
     gap: BOOT-033..035 are manual isolated-site cases without a dedicated runner; the lifecycle driver checks the ownership-label precondition before it acts (scripts/e2e/regional/boot029_node_scope.py) but no runner drives the three cases or records their verdicts.
     level: regional
+  - id: GF-REQ-LIFECYCLE-EKS-NODEGROUP-PREPARATION
+    family: lifecycle
+    title: Plain EKS GPU node groups prepared by plan, refused early and rolled with MINIMAL
+    source: [src/gpu_fault/admin/eks_nodegroup_prepare.py, src/gpu_fault/admin/eks_nodegroup_plan.py, src/gpu_fault/admin/eks_nodegroup_apply.py, src/gpu_fault/admin/eks_nodegroup_nodes.py]
+    covers: [lifecycle:eks-nodegroup-preparation]
+    conditions: [normal, failure, safety]
+    assertions:
+      - A prepared group plans nothing, and its read-only SSM inventory passes every node check on exactly the group's running instances with the DCGM pin paired with the exporter.
+      - The CPU control plane, a HyperPod cluster, an unknown group, an adoption reference naming no part and a group the verb cannot prepare are refused before any write; cluster-level refusals read no node group.
+      - The apply rolls the group with updateStrategy MINIMAL onto a launch template version that changes only the user data; the replacements pass the verification, their Agents turn ACTIVE, the departed Agents retire and the renames are reported for the campaign inputs.
+    cases: [GF-REGIONAL-BOOT-036, GF-REGIONAL-BOOT-037]
+    runners: [scripts/e2e/regional/run_boot036_eks_nodegroup_plan.py, scripts/e2e/regional/run_boot037_eks_nodegroup_roll.py]
+    checks:
+      - nodeid: tests/regional/test_boot036_eks_nodegroup_plan.py::test_a_prepared_site_passes_every_stage
+      - nodeid: tests/regional/test_boot037_eks_nodegroup_roll.py::test_a_drifted_group_rolls_and_every_replacement_is_adopted
+      - nodeid: tests/regional/test_eks_nodegroup_verdicts.py::test_a_refusal_must_exit_two_say_the_fact_and_stop_early
+      - nodeid: tests/admin/test_admin_eks_nodegroup_prepare.py::test_plan_of_a_prepared_group_is_compliant
+      - nodeid: tests/admin/test_admin_eks_nodegroup_prepare.py::test_cluster_level_refusals
+      - nodeid: tests/admin/test_admin_eks_nodegroup_prepare.py::test_apply_runs_the_planned_steps_in_order_then_verifies_the_new_nodes
+    level: regional
   - id: GF-REQ-LIFECYCLE-REMOTE-TABLE
     family: lifecycle
     title: Remote-command migration, old-writer fencing and HOT lease renewal
