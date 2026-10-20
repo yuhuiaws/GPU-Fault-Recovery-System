@@ -563,6 +563,44 @@ def carry_vanished_failed_ranks(
     return [*containers, *carried] if carried else containers
 
 
+def keep_known_gpu_uuids(
+    controller: Any, attempt_id: str, containers: list[ContainerObservation]
+) -> list[ContainerObservation]:
+    """A container read without GPU UUIDs keeps the ones it was last read with.
+
+    The GPUs come from the ``gpu-fault.io/gpu-uuids`` annotation or from an
+    ``nvidia-smi`` exec into the running container, and an exited container
+    cannot be exec'd. The reading of a rank that died therefore carried no GPU:
+    the failure event and its containment incident named only the survivors'
+    GPUs, and the terminal allocation listed the dead rank with none
+    (COLLECT-021 live, plain EKS and HyperPod) -- the GPUs of the rank that
+    failed are the ones evidence and repair are about. The kubelet assigns a
+    container its devices once for the life of its Pod (a restart in place
+    reuses them), so what the previous reading held for the same Pod UID,
+    container and rank is still this container's; after a watcher restart the
+    previous reading is the persisted record, which keeps the UUIDs. A running
+    container whose exec fails keeps them the same way. A container never read
+    with GPUs keeps none, so its allocation stays INCOMPLETE instead of
+    invented, and a replacement Pod has a new UID and is read fresh.
+    """
+
+    previous = controller._last_observations.get(attempt_id)
+    if previous is None:
+        return containers
+    known = {
+        (item.pod_uid, item.container_name, item.rank): item.gpu_uuids
+        for item in previous.containers
+        if item.gpu_uuids
+    }
+    return [
+        item.model_copy(update={"gpu_uuids": list(gpu_uuids)})
+        if not item.gpu_uuids
+        and (gpu_uuids := known.get((item.pod_uid, item.container_name, item.rank)))
+        else item
+        for item in containers
+    ]
+
+
 def observe_containers(
     controller: Any, pods: list[dict[str, Any]]
 ) -> list[ContainerObservation]:
