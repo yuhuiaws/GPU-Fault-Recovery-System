@@ -4683,7 +4683,12 @@ gpu-fault-admin submit-remediation --state-dir "$STATE_DIR" \
 The order above denotes validation phases and does not guarantee a multi-node incident has exactly four steps. When the inventory can completely and uniquely prove
 which node a GPU belongs to, GPU/Fabric validation expands per node, and all must still pass before scheduling is restored. GPUs the incident requires
 are not excluded because the current inventory lacks that UUID; such a failure should first be investigated as a lost card or a wrong historical scope,
-and must not be released by narrowing the validation scope or lifting isolation by hand.
+and must not be released by narrowing the validation scope or lifting isolation by hand. An escalation successor's GPU list
+(event id `<rung>-after-<workflow>`) was gathered over its source's nodes, so the restore also reads the inventories of the nodes
+on its escalation lineage (the `--plan` inspection lists them in `node_gpu_uuids`): a GPU another lineage node's inventory
+reports and no restored node's inventory claims is no longer named on the restored node's validation, and the `--plan` steps
+show only that node's own GPUs -- the restore of a successor an earlier release built with all 16 GPUs of a two-node attempt on
+one node no longer waits on the other node's 8. A successor built now names only the failed node's GPUs anyway.
 
 **The escalation ladder and node ownership (reset -> reboot -> replace)**: when the predecessor workflow fails after
 its cordon (RESET_GPU, or the VALIDATE_GPU after it) the incident reads QUARANTINED and the Dispatcher opens the successor

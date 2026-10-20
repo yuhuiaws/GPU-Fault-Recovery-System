@@ -598,6 +598,13 @@ A few points that must be remembered:
   the persisted record; a watcher that restarts after that and before the terminal re-reads the exited rank from its Pod and cannot
   know its GPUs (it reports INCOMPLETE). The containment incident still follows the first process's failure event (delivered, or
   replayed from the outbox, where the first record written for a key is kept).
+  The complete list also exposed a gap in the scope by the incident's GPUs: the escalation successor narrows the nodes to the
+  failed ones, and when the source workflow had not recorded which GPU sits on which node it inherited every GPU of the source --
+  on one node of a two-node attempt a single-node VALIDATE_GPU named the other node's 8 GPUs, which a healthy node can never
+  report, so it waited out the per-step cap and was escalated to REPLACE_NODE; the operator restore of that successor copied the
+  same list. Now each failed node's validation names the GPUs placed on that node (the dead rank's GPUs are validated on the dead
+  rank's node, a surviving rank's GPUs no longer appear on its steps); the placement rules and the decision for a GPU nothing
+  places are in the hardware recovery escalation of the detailed design §2.9 (`orchestration/gpu_placement.py`).
   ownership only accepts Observations whose `ingested_at` is not more than 120 seconds relative to the event; older
   `PENDING/RUNNING` records go into the stale gauge and no longer participate in node-mutation attribution.
   `/v1/workload-observations` is sent directly under normal conditions; after a send failure it is written per attempt, latest-wins, into the

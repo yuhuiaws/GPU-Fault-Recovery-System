@@ -1817,8 +1817,17 @@ full verification. `submit-remediation restore` reads the incident nodes' GPU in
 When the inventory is complete and every incident GPU has a unique owner, the GPU/Fabric verification may be split into per-node steps; the single `RESTORE_SCHEDULING` runs only after
 all verifications pass. When the inventory is missing, incomplete or ambiguous, the original verification scope is kept;
 the verification requirement may not be deleted because a UUID is temporarily not enumerable, and an empty intersection may not be downgraded to a success check with no GPU scope.
-A single-node escalation incident prefers the node/GPU correspondence already on the original step and may not inherit the GPUs of an unrelated sibling node;
-an unprovable historical scope error needs supervised reconciliation and is not guessed and corrected at restore time.
+An escalation successor's GPU scope is decided by placement in `escalation_gpu_scope` of `orchestration/gpu_placement.py`: first
+what the scope's nodes report themselves (GPU inventory snapshot, latest per-GPU telemetry) and the attempt's container
+observations, then the original workflow's own per-node lists (only for GPUs the store says nothing about), last a single-node
+source incident's own GPUs; the scope nodes include the source incident's escalation lineage
+(`escalation.escalation_lineage_nodes`). A GPU placed only on nodes that did not fail never enters the successor, so a
+single-node escalation incident does not inherit a sibling's GPUs; a GPU nothing places stays when every scope node failed,
+otherwise it does not enter the successor and the failed node's VALIDATE_* steps name its full known inventory instead
+(`scope_validation_steps`; node-wide when nothing is known). For an escalation successor the inventory the restore reads also
+covers its lineage's nodes: a GPU another lineage node's inventory reports and no restored node's inventory claims is not named
+on the restored node -- that is the supervised reconciliation of a historical scope error; an unprovable one (the lineage
+unreadable, the GPU in no inventory) is still not guessed and corrected at restore time.
 
 Quiet observation requires `0 < quiet-seconds < acceptance-timeout-seconds`; the first wait follows the last
 data-plane mutation, reads and polls share the remaining deadline, and each probe round pins `quiet_start`.

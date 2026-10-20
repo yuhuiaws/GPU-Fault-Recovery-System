@@ -71,6 +71,28 @@ Every required GPU still needs fresh telemetry, and all validation precedes
 restoring scheduling. Old records with unproven cross-node GPU scope remain
 fail-closed and need authoritative reconciliation, not automatic scope shrinkage.
 
+An escalation successor places each source GPU before it builds its steps: a
+single-node step names only GPUs placed on its node (the node's own inventory
+snapshot or latest per-GPU telemetry, the attempt's container observations, then
+the workflow's own per-node lists). A GPU nothing places is kept when every node
+of the source scope failed; in a wider scope it is named on no successor step and
+each failed node validates its full known inventory instead. That drop is a
+deliberate liveness choice: such a GPU was never reported by any scope node, so
+requiring it could only time out on a healthy node. The validated restore removes
+an incident GPU only on positive evidence that it sits elsewhere: the inventory of
+a release-only node of the incident or, for an escalation successor, of a node on
+its escalation lineage lists it and no restored node's inventory does. That
+lineage reading is the authoritative reconciliation above; absence alone still
+removes nothing. Residuals: with every store read failing, the workflow's own
+per-node lists decide alone, so a step narrowed to one node that kept the union of
+GPUs still reads as that node's; `RecoveryArbiter.merged_gpu_scope` still gives
+each node of a multi-node node-action step without `gpu_uuids_by_node` the whole
+GPU list when it widens (no current producer builds such a RESET step); the
+restore preview passes release-only nodes to the builder while the executed
+restore never receives them, so for that shape the preview's scope can differ
+from the created workflow. Local tests use the in-memory store and fake
+inventories; they do not measure a live escalation.
+
 Collector acceptance waits account for the leased metrics census and preceding
 attempt-missing grace. They are bounded by the existing operation and maintenance
 deadlines, reject incomplete evidence, and never extend the approved window.

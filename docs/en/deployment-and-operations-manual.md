@@ -9107,7 +9107,14 @@ needs `--node`, see item 9).
    `warm_spare_fixture.py` goes through the same constructor, so the script and the product do not evolve separately.
    The arrows here denote validation phases; a complete, unambiguous inventory can expand multi-node GPU/Fabric validation into per-node steps,
    but every event GPU must be validated and all validation precedes restoring scheduling. A missing inventory does not authorise dropping UUIDs or treating an empty intersection
-   as node health; a wrong scope of an old incident needs checked reconciliation and cannot be rewritten automatically from a missing inventory. When only
+   as node health; a wrong scope of an old incident needs checked reconciliation and cannot be rewritten automatically from a missing inventory. An
+   escalation successor's GPU list (event id `<rung>-after-<workflow>`) was gathered over its source's nodes, so the command also
+   reads the inventories of the nodes on the successor's escalation lineage (the `--plan` inspection lists them in
+   `node_gpu_uuids`), and that is the checked reconciliation: a GPU another lineage node's inventory reports and no restored node's
+   inventory claims is no longer named on the restored node's validation -- the restore of a successor an earlier release built
+   with all 16 GPUs of a two-node attempt on one node no longer waits on the other node's 8; in the `--plan` preview the inventory
+   of a release-only (quiesce-taint-only) node does the same. A missing inventory still drops no GPU, and an unrelated node's
+   inventory never removes an original incident's GPU. When only
    some nodes of the incident are restored (`restore_node_ids` is a proper subset of `node_ids`), the steps do not carry the incident's GPU scope but do full per-node
    validation: the GPUs named by the incident may be on already restored sibling nodes. The restore does not restart a job a
    STOP suspended: `suspended_workloads`/`warnings` of `--plan` and the result message name each workload the incident's records

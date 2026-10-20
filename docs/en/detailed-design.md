@@ -1661,6 +1661,26 @@ rewritten to the successor incident; a terminal QUARANTINE and a spare failover'
 RESTORE_SCHEDULING succeeds the chain's still-QUARANTINED predecessors are closed automatically; a failed validation
 escalates only the nodes the recovery action acted on.
 
+The successor's GPU scope (`escalation_gpu_scope` in `orchestration/gpu_placement.py`): a single-node VALIDATE_GPU needs fresh
+per-GPU telemetry on its node for every GPU it names (only VALIDATE_GPU waits per GPU; VALIDATE_GPU/VALIDATE_FABRIC count only the
+findings on the named GPUs; VALIDATE_HOST reads none), so naming another node's GPU can only wait out the per-step cap and escalate
+a healthy node to REPLACE_NODE, and naming only another node's GPUs also misses the node's own findings. The successor's steps on a
+failed node therefore name only the source GPUs placed on that node. Placement, in order: what the scope's nodes report themselves
+-- the GPU inventory snapshot and the latest per-GPU telemetry (a GPU that fell off the bus keeps its last sample there and stays
+placed on its node) -- and the attempt's container observations (the node and the GPUs the kubelet assigned); then the source
+workflow's own per-node lists (`gpu_uuids_by_node` on a step, a single-node step's GPUs), only for GPUs the store says nothing
+about -- a step narrowed to one node that kept the union of GPUs (a RESTORE_SCHEDULING that readmits one node, a compensation
+restore) does not prove a sibling's GPU is here; last, a single-node source incident places its own GPUs on its node. The scope
+nodes include the source incident's escalation lineage (`escalation.escalation_lineage_nodes`), so a successor an earlier release
+built, every single-node step of it naming the inherited list, is scoped by the nodes' reports when it fails in turn. A GPU placed
+only on nodes that did not fail never enters the successor. A GPU nothing places is an explicit fail-closed decision: when every
+node of the scope failed it stays (it can only be on the successor's nodes, as before); otherwise no successor step names it (it
+stays on the source incident) and each failed node's VALIDATE_GPU/VALIDATE_HOST/VALIDATE_FABRIC names the node's full known GPU
+inventory instead (`scope_validation_steps`) -- every GPU the node reports must report fresh, and a node nothing is known about is
+validated node-wide (fresh node telemetry, every finding on the node). Such a GPU was never reported by any node of the scope, so
+the failed node gives up no evidence it could have produced. Node-action steps carry `gpu_uuids_by_node` only when every failed
+node holds a share and every source GPU is placed; when the store cannot be read, the workflow's own lists decide, as before.
+
 `KernelLogCollector` is the current production primary collector for SXIDs. NVIDIA's official documentation states that NVSwitch runtime
 errors are written by the driver to the OS kernel/event log; the Collector reads the
 `nvidia-nvswitchN: SXid (PCI:<BDF>): <code>, <Fatal|Non-fatal>, Link ...`
@@ -1856,7 +1876,11 @@ window kept still holds every other GPU's device node: a widened VERIFY_NO_GPU_C
 climbed to reboot; the Agent also refuses a QUIESCE with another target set for the same incident ("quiesce target GPU scope changed after
 quiesce"). With remote step batching the QUIESCE is the head of a compound command whose VERIFY, RESET and RESTORE passengers carry the scope
 they had when it was minted and run on the data plane under one lease, their results read back by step index: a widened RESET_GPU was recorded
-SUCCEEDED for two GPUs while the node reset one. Arbitration compares not only rank but also uses explicit
+SUCCEEDED for two GPUs while the node reset one. When a multi-node step widens (the barrier hands each node its
+`gpu_uuids_by_node` entry), the widened node's entry takes only its own GPUs (the new event's, and those of the candidate's
+single-node step on that node), as `DagBrancher.widen_parallel_job_branch` does; `disposition.widen_in_place` used to add the
+step's whole GPU list to that entry, so the barrier sent a sibling's GPU to this node's Agent and the reset failed on a UUID it
+does not have. Arbitration compares not only rank but also uses explicit
 operation dominance: `RESTART_NODE` covers reset/reset-all/fabric-manager restart,
 `REPLACE_NODE` covers node lifecycle and GPU runtime repair; quarantine, mechanical checks and support escalation
 are not treated as having repaired other fault domains.
