@@ -95,6 +95,7 @@
   "tests/execution/test_dispatcher_wake.py:dispatcher._wake": 2,
   "tests/execution/test_dispatcher_write_path_isolation.py:node_busy._busy_node": 2,
   "tests/execution/test_dispatcher_write_path_isolation.py:node_busy._job_workflow": 2,
+  "tests/execution/test_hung_triage_efa_node_row.py:executor._hung_efa_zero_pending_times": 1,
   "tests/execution/test_node_busy_wait_from_eligibility.py:node_busy._busy_node": 3,
   "tests/execution/test_preemption_cancel_live_check.py:branches._escalator": 1,
   "tests/execution/test_preemption_cancel_live_check.py:branches._job_dag": 1,

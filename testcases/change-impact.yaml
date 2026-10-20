@@ -599,6 +599,7 @@ rules:
       - tests/store/test_health_signal_retention.py
       - tests/app_services/test_health_signal_retention_job.py
       - tests/host_health/test_efa_traffic_node_state.py
+      - tests/execution/test_hung_triage_efa_node_row.py
     regional_cases:
       - GF-REGIONAL-CAP-001..005
       - GF-REGIONAL-HA-003
