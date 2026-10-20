@@ -128,7 +128,11 @@ def test_a_capped_validation_escalates_only_the_node_the_reset_acted_on() -> Non
         "the sibling the merge added to the validation had no reset; the reboot "
         "rung is not its business"
     )
-    assert scope["gpu_uuids"] == ["GPU-a", "GPU-b"]
+    assert scope["gpu_uuids"] == ["GPU-a"], (
+        "GPU-b came with the sibling the merge added; nothing places it on the "
+        "reset node, so the reboot successor does not name it there (batch 149)"
+    )
+    assert scope["validation_gpu_uuids_by_node"] == {RESET_NODE: ["GPU-a"]}
 
 
 def test_pending_nodes_of_a_capped_step_count_as_its_failed_nodes() -> None:

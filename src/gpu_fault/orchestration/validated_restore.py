@@ -34,6 +34,7 @@ from gpu_fault.models import (
     WorkflowStepSpec,
     bounded_reasons,
 )
+from gpu_fault.orchestration.escalation import escalation_origin
 
 RESTORE_WORKFLOW_PREFIX = "workflow-validated-restore-"
 RESTORE_OFFICIAL_ACTION = WorkflowOperation.RESTORE_SCHEDULING.value
@@ -59,12 +60,26 @@ def restore_reason(operator: str, reference: str | None) -> str:
     return f"operator restore requested by {operator} ({reference or 'no reference'})"
 
 
+def _inventory(
+    node_gpu_uuids: Mapping[str, Sequence[str]] | None, node: str
+) -> list[str]:
+    values = None if node_gpu_uuids is None else node_gpu_uuids.get(node)
+    if (
+        isinstance(values, Sequence)
+        and not isinstance(values, (str, bytes))
+        and all(isinstance(value, str) and value for value in values)
+    ):
+        return list(values)
+    return []
+
+
 def validated_restore_steps(
     node_ids: Sequence[str],
     gpu_uuids: Sequence[str] = (),
     *,
     node_gpu_uuids: Mapping[str, Sequence[str]] | None = None,
     release_only_node_ids: Sequence[str] = (),
+    placement_evidence_node_ids: Sequence[str] = (),
 ) -> list[WorkflowStepSpec]:
     """Validate all targets before restoring scheduling, retaining every named GPU.
 
@@ -73,11 +88,26 @@ def validated_restore_steps(
     quiesce taint while another incident's cordon keeps them out of scheduling.
     Validating them would wait on the exporter that taint evicts, and a node
     that stays cordoned afterwards has nothing to prove here.
+
+    A GPU that the inventory of a release-only node, or of a node in
+    ``placement_evidence_node_ids``, puts there -- and no validated node's
+    inventory claims -- is not named on the validated nodes' steps: a
+    single-node step needs fresh telemetry for every GPU it names, and that
+    node can never report another node's GPU (batch 149). Absence from an
+    inventory never drops a GPU.
     """
 
     release_only = {node for node in release_only_node_ids if node in node_ids}
     nodes = [node for node in node_ids if node not in release_only]
     gpus = list(gpu_uuids) if nodes else []
+    elsewhere = {
+        gpu
+        for node in {*release_only, *placement_evidence_node_ids} - set(nodes)
+        for gpu in _inventory(node_gpu_uuids, node)
+    }
+    if elsewhere:
+        here = {gpu for node in nodes for gpu in _inventory(node_gpu_uuids, node)}
+        gpus = [gpu for gpu in gpus if gpu in here or gpu not in elsewhere]
     if not nodes:
         return [
             WorkflowStepSpec(
@@ -163,6 +193,12 @@ def build_validated_restore_workflow(
     inventory. It never removes an incident GPU: absence from inventory may be
     the hardware failure being validated. Unknown, incomplete or ambiguous
     ownership keeps the original scope and its per-GPU telemetry requirement.
+    For an escalation successor (``escalation_origin`` of its event id) the
+    GPU list was gathered over its source's nodes, so ``node_gpu_uuids``
+    entries for nodes outside the restore are its lineage's inventories
+    (``submit-remediation`` reads them) and a GPU they place there is not
+    named on the restored node; an original incident's GPUs are its own, and
+    an unrelated node's inventory removes none of them.
     The incident moves to ACTION_PENDING, points at the workflow, and records
     ``reason`` (default ``restore_reason``).
     """
@@ -185,6 +221,11 @@ def build_validated_restore_workflow(
             gpu_uuids,
             node_gpu_uuids=node_gpu_uuids,
             release_only_node_ids=release_only_node_ids,
+            placement_evidence_node_ids=(
+                list(node_gpu_uuids or ())
+                if escalation_origin(incident.event_id) is not None
+                else ()
+            ),
         ),
         created_at=now,
         updated_at=now,

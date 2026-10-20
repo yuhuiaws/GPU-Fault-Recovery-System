@@ -152,8 +152,14 @@ def test_multi_node_steps_are_not_guessed_to_be_single_node_gpu_evidence():
     )
 
     assert scope["ordered_failed_nodes"] == ["node-a"]
-    assert scope["gpu_uuids"] == ["GPU-a", "GPU-b"]
+    assert scope["gpu_uuids"] == [], (
+        "nothing places GPU-a or GPU-b on node-a and the source spans node-b: "
+        "the successor names neither on node-a (batch 149)"
+    )
     assert scope["gpu_uuids_by_node"] == {}
+    assert scope["validation_gpu_uuids_by_node"] == {"node-a": []}, (
+        "node-a validates node-wide instead of waiting on a sibling's GPU"
+    )
 
 
 def test_explicit_gpu_mapping_takes_precedence_over_derived_step_scope():
@@ -176,7 +182,7 @@ def test_explicit_gpu_mapping_takes_precedence_over_derived_step_scope():
     assert scope["gpu_uuids_by_node"] == {"node-a": ["GPU-a"]}
 
 
-def test_unassigned_gpu_scope_is_retained_instead_of_assumed_to_be_a_sibling():
+def test_an_unassigned_gpu_of_a_two_node_scope_is_not_pinned_on_the_failed_node():
     source = _incident().model_copy(
         update={"gpu_uuids": ["GPU-a", "GPU-b", "GPU-missing"]}
     )
@@ -189,8 +195,12 @@ def test_unassigned_gpu_scope_is_retained_instead_of_assumed_to_be_a_sibling():
     )
 
     assert scope["ordered_failed_nodes"] == ["node-a"]
-    assert scope["gpu_uuids"] == ["GPU-a", "GPU-b", "GPU-missing"]
+    assert scope["gpu_uuids"] == ["GPU-a"], (
+        "GPU-b is node-b's by its own step and GPU-missing may be node-b's too: "
+        "naming either on node-a's steps can only time out (batch 149)"
+    )
     assert scope["gpu_uuids_by_node"] == {}
+    assert scope["validation_gpu_uuids_by_node"] == {"node-a": ["GPU-a"]}
 
 
 def test_partially_mapped_failed_nodes_do_not_lose_the_unmapped_nodes_gpus():

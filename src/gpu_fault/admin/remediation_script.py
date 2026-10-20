@@ -7,7 +7,8 @@ One script, four modes, chosen by ``payload["mode"]`` on stdin:
     nodes, active attempt observations, existing operator markers, the fleet
     agent records of the incident's nodes, the remote commands of those
     workflows reduced to their evidence keys, and the GPU inventory of the
-    nodes. Every disposition starts here; nothing is written.
+    nodes (for an escalation successor also of its lineage's nodes). Every
+    disposition starts here; nothing is written.
 ``restore``
     the validated restore of a QUARANTINED incident -- or of an ESCALATED one
     whose workflows have all ended, judged on the admin side -- for the nodes
@@ -43,7 +44,8 @@ since before ``confirm-node-action`` existed: ``store.get_incident`` /
 ``list_active_workflow_incidents`` / ``save_workflow(expected=)`` /
 ``save_incident_and_workflow``, ``models.record_workflow_event`` and
 ``models.bounded_event_details``, ``validated_restore.build_validated_restore_workflow``
-(with ``node_ids``) and ``node_rebinding.inventory_gpu_uuids``. Nothing here
+(with ``node_ids``), ``node_rebinding.inventory_gpu_uuids`` and
+``escalation.escalation_origin``. Nothing here
 imports a module added together with the disposition, so the lever works on
 the release whose parked records block the very deploy that would ship it.
 """
@@ -195,12 +197,35 @@ def node_validations(incident):
     return [dump(item) for item in found[:10]]
 
 
+def lineage_nodes(incident):
+    # An escalation successor's GPU list was gathered over its source's nodes:
+    # the incidents and workflows its "<rung>-after-<workflow>" event ids lead
+    # back to (bounded; an unreadable link ends the walk). Their inventories
+    # tell the restore which of those GPUs sit on another node.
+    from gpu_fault.orchestration.escalation import escalation_origin
+
+    nodes = set()
+    current = incident
+    for _ in range(8):
+        origin = escalation_origin(current.event_id)
+        if origin is None:
+            break
+        try:
+            source = store.get_workflow(origin[1])
+            current = store.get_incident(source.incident_id)
+        except Exception:  # noqa: BLE001 - an unreadable link ends the walk
+            break
+        nodes.update(current.node_ids)
+        nodes.update(node for step in source.official_steps for node in step.node_ids)
+    return sorted(nodes - set(incident.node_ids))
+
+
 def node_inventory(incident):
     from gpu_fault.execution.node_rebinding import inventory_gpu_uuids
 
     return {
         node_id: inventory_gpu_uuids(store, incident.cluster_id, node_id)
-        for node_id in incident.node_ids
+        for node_id in [*incident.node_ids, *lineage_nodes(incident)]
     }
 
 

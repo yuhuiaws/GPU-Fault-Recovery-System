@@ -121,7 +121,22 @@ def widen_in_place(
                 for key, values in raw.items()
                 if isinstance(values, list)
             }
-            widened_gpus = set(mapping.get(node_id, [])) | set(merged)
+            # A multi-node step's GPU list is every node's: the node's entry
+            # takes only its own GPUs, as the DAG twin does. The union put a
+            # sibling's GPU into the reset this node's agent runs (batch 149).
+            own = (
+                merged
+                if step.node_ids == [node_id]
+                else [
+                    *gpu_uuids,
+                    *(
+                        matching.gpu_uuids
+                        if matching and matching.node_ids == [node_id]
+                        else []
+                    ),
+                ]
+            )
+            widened_gpus = set(mapping.get(node_id, [])) | set(own)
             if widened_gpus:
                 mapping[node_id] = sorted(widened_gpus)
             parameters["gpu_uuids_by_node"] = mapping

@@ -272,6 +272,51 @@ def test_widen_in_place_does_not_touch_a_step_the_agent_is_already_running():
     assert workflow.official_steps[2].gpu_uuids == ["GPU-1", "GPU-2"]
 
 
+def test_widen_in_place_keeps_a_siblings_gpu_out_of_the_widened_nodes_mapping():
+    """A flat two-node reset (the barrier sends each agent its mapping entry):
+    widening node-a with GPU-a2 must not hand node-a node-b's GPU. The union of
+    the step's GPU list put GPU-b1 into node-a's entry, and node-a's agent
+    failed the reset on the UUID it does not have (batch 149)."""
+
+    existing = workflow_request(
+        "wf-a",
+        "inc-a",
+        status=WorkflowStatus.RUNNING,
+        official_steps=[
+            workflow_step(
+                RESET,
+                node_ids=["node-a", "node-b"],
+                gpu_uuids=["GPU-a1", "GPU-b1"],
+                parameters={
+                    "gpu_uuids_by_node": {"node-a": ["GPU-a1"], "node-b": ["GPU-b1"]}
+                },
+            )
+        ],
+    )
+    candidate = _reset_workflow(
+        "wf-b", "node-a", ["GPU-a2"], status=WorkflowStatus.PENDING
+    )
+
+    workflow, _ = _applier().apply(
+        Disposition.WIDEN_IN_PLACE,
+        node_id="node-a",
+        candidate=fault_incident("inc-b", "event-b"),
+        candidate_workflow=candidate,
+        existing_incident=fault_incident("inc-a", "event-a"),
+        existing_workflow=existing,
+        gpu_uuids={"GPU-a2"},
+        mutable=False,
+        now=NOW,
+    )
+
+    reset = workflow.official_steps[0]
+    assert reset.gpu_uuids == ["GPU-a1", "GPU-a2", "GPU-b1"]
+    assert reset.parameters["gpu_uuids_by_node"] == {
+        "node-a": ["GPU-a1", "GPU-a2"],
+        "node-b": ["GPU-b1"],
+    }
+
+
 # ------------------------------------------------------------ REPLACE_IN_PLACE
 
 

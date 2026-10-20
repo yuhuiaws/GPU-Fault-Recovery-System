@@ -23,6 +23,11 @@ from gpu_fault.operation_registry import (
     NODE_ACTION_SCOPE_OPERATIONS,
 )
 from gpu_fault.orchestration.families.identity import note_stale_event_link
+from gpu_fault.orchestration.gpu_placement import (
+    EscalationGpuScope,
+    escalation_gpu_scope,
+    scope_validation_steps,
+)
 from gpu_fault.store.shared.errors import NotFoundError
 
 RESTART_SAFETY_PARAMETERS = (
@@ -526,6 +531,48 @@ def next_rung(
     return None
 
 
+def escalation_lineage_nodes(
+    store: Any, incident: FaultIncident, *, limit: int = 8
+) -> set[str]:
+    """The nodes of the workflows and incidents ``incident``'s
+    ``<rung>-after-<workflow>`` event ids lead back to, at most ``limit`` hops;
+    an unreadable link ends the walk."""
+
+    nodes: set[str] = set()
+    current = incident
+    for _ in range(limit):
+        origin = escalation_origin(current.event_id)
+        if origin is None:
+            break
+        try:
+            workflow = store.get_workflow(origin[1])
+            current = store.get_incident(workflow.incident_id)
+        except (NotFoundError, KeyError, TypeError):
+            break
+        nodes.update(current.node_ids)
+        nodes.update(node for step in workflow.official_steps for node in step.node_ids)
+    return nodes
+
+
+def _successor_gpu_scope(
+    workflow: WorkflowRequest,
+    source: FaultIncident,
+    failed_nodes: list[str],
+    store: Any,
+) -> EscalationGpuScope:
+    """``escalation_gpu_scope`` with the store and the source's own lineage."""
+
+    return escalation_gpu_scope(
+        workflow,
+        source,
+        failed_nodes,
+        store,
+        lineage_node_ids=(
+            () if store is None else escalation_lineage_nodes(store, source)
+        ),
+    )
+
+
 def _escalation_operations(
     failed_stage: str,
     next_action: RecoveryAction,
@@ -642,54 +689,6 @@ def _chain_termination_reason(
         f"{', '.join(failed_operations) or 'no recorded step'}; no further "
         f"{escalation_name} workflow is opened, operator attention required"
     )
-
-
-def _escalation_gpu_scope(
-    workflow: WorkflowRequest,
-    source: FaultIncident,
-    failed_nodes: list[str],
-) -> tuple[list[str], dict[str, list[str]]]:
-    """Resolve failed-node GPUs without assigning a sibling's scope to them."""
-
-    explicit: dict[str, list[str]] = {}
-    derived: dict[str, list[str]] = {}
-    for step in workflow.official_steps:
-        mapping = step.parameters.get("gpu_uuids_by_node", {})
-        if isinstance(mapping, dict):
-            for node_id, values in mapping.items():
-                if (
-                    node_id in step.node_ids
-                    and isinstance(values, list)
-                    and values
-                    and all(isinstance(value, str) and value for value in values)
-                ):
-                    explicit.setdefault(node_id, []).extend(values)
-        # Job DAG branches carry node-local GPUs directly on single-node steps.
-        if len(step.node_ids) == 1 and step.gpu_uuids:
-            derived.setdefault(step.node_ids[0], []).extend(step.gpu_uuids)
-    by_node = {
-        node_id: list(dict.fromkeys(explicit.get(node_id) or derived[node_id]))
-        for node_id in explicit.keys() | derived.keys()
-    }
-    all_gpus = list(
-        dict.fromkeys(
-            [
-                *source.gpu_uuids,
-                *(gpu for step in workflow.official_steps for gpu in step.gpu_uuids),
-                *(gpu for node_id in sorted(by_node) for gpu in by_node[node_id]),
-            ]
-        )
-    )
-    assigned = {gpu for values in by_node.values() for gpu in values}
-    if any(not by_node.get(node_id) for node_id in failed_nodes) or (
-        set(all_gpus) - assigned
-    ):
-        # Partial ownership is not evidence that an unassigned GPU is a sibling.
-        return all_gpus, {}
-    scoped = {node_id: by_node[node_id] for node_id in failed_nodes}
-    return list(
-        dict.fromkeys(gpu for values in scoped.values() for gpu in values)
-    ), scoped
 
 
 class HardwareEscalationService:
@@ -989,6 +988,7 @@ class HardwareEscalationService:
         workflow: WorkflowRequest,
         source: FaultIncident,
         failed_executions,
+        store: Any = None,
     ) -> dict:
         failed_nodes: set[str] = set()
         node_failures: dict[str, list[str]] = {}
@@ -1030,8 +1030,10 @@ class HardwareEscalationService:
                 for workload_id in step.workload_ids
             )
         )
-        gpu_uuids, gpu_uuids_by_node = _escalation_gpu_scope(
-            workflow, source, ordered_failed_nodes
+        # Placement read from ``store`` too; a sibling's GPU is never named on
+        # a failed node's step (batch 149, ``orchestration/gpu_placement.py``).
+        gpu_uuids, gpu_uuids_by_node, validation_gpus = _successor_gpu_scope(
+            workflow, source, ordered_failed_nodes, store
         )
         failed = ", ".join(sorted(operation.value for operation in failed_operations))
         node_reason = "; ".join(
@@ -1104,6 +1106,7 @@ class HardwareEscalationService:
                 for node_id in ordered_failed_nodes
                 if gpu_uuids_by_node.get(node_id)
             },
+            "validation_gpu_uuids_by_node": validation_gpus,
             "failed_operations": failed_operations,
             "failed": failed,
             "node_reason": node_reason,
@@ -1120,6 +1123,7 @@ class HardwareEscalationService:
         gpu_uuids: list[str],
         workload_ids: list[str],
         gpu_uuids_by_node: dict[str, list[str]] | None = None,
+        validation_gpu_uuids_by_node: dict[str, list[str]] | None = None,
     ) -> tuple[list, list[str]]:
         profile = None
         errors = []
@@ -1223,8 +1227,9 @@ class HardwareEscalationService:
                 if scoped:
                     parameters["gpu_uuids_by_node"] = scoped
             normalized_steps.append(step.model_copy(update={"parameters": parameters}))
-        replacement_steps = normalized_steps
-        return replacement_steps, errors
+        return scope_validation_steps(
+            normalized_steps, validation_gpu_uuids_by_node or {}
+        ), errors
 
     def emit(
         self,
@@ -1301,6 +1306,7 @@ class HardwareEscalationService:
             gpu_uuids,
             workload_ids,
             scope.get("gpu_uuids_by_node") or None,
+            scope.get("validation_gpu_uuids_by_node"),
         )
         replacement = WorkflowRequest(
             request_id=(f"workflow-{escalation_name}-after-{workflow.request_id}"),
@@ -1457,6 +1463,7 @@ class HardwareEscalationService:
             workflow,
             source,
             self._exhausted_branch_executions(workflow, failed_executions),
+            self.store,
         )
         return self.emit(
             workflow,
