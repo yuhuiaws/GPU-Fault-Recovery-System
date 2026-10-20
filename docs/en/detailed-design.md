@@ -3315,12 +3315,15 @@ row is enough; the state still belongs to one attempt only:
 - a newer sample of another attempt starts again at WARMUP and inherits none of the previous attempt's baseline,
   zero-traffic clock, first-observed time or spike acknowledgement.
 
-Before batch 145 there was one row per `cluster/node/job/attempt`, never deleted. On an upgrade, an attempt the node row
-does not carry yet continues from its old per-attempt row: read under that row's own advisory lock (a writer of the older
-release still holds it during a rolling upgrade) and deleted once the node row is written. An upgrade therefore neither
+Before batch 145 there was one row per `cluster/node/job/attempt`, never deleted. When the node row is not the attempt's,
+or is more than `LEGACY_EFA_RECHECK_GAP` (2 minutes; the node's edge filter reports a steady node every few minutes, a
+shorter gap is an ordinary one) behind the sample, the attempt's old per-attempt row is consulted: read under that row's
+own advisory lock (a writer of the older release still holds it during a rolling upgrade), the row with the later sample
+continues, and the old row is deleted once the node row is written -- after a rollback the older release keeps writing the
+old row, so a new upgrade does not resume the node row left before the rollback. An upgrade therefore neither
 restarts a running attempt at WARMUP (a hang already in its zero-traffic streak would never escalate: zero-traffic detection
 first needs a valid sample) nor leaves the old row behind. After a rollback the older release reads only per-attempt rows:
-migrated ones are gone, every attempt starts at WARMUP, and detection waits for a first valid sample and the startup grace
+migrated ones are gone, so those attempts start at WARMUP, and detection waits for a first valid sample and the startup grace
 -- it never alarms early. If an old row survives (re-created by an older writer during the roll), the older release resumes
 its stale zero-traffic clock and its first zero sample can escalate to `HUNG_SUSPECTED`; that is why the health-signal
 retention sweep deletes such superseded rows after the grace period (§3.2.1).
@@ -3377,8 +3380,9 @@ After confirming the SPIKE, the administrator submits one of the following actio
 The state keeps the Event ID of the currently active SPIKE. In the same state transaction the Store verifies that the
 node row still belongs to the requested `job/attempt`, that the signal is still `SPIKE`, and that the Event ID is still the
 active transition; SQLite uses a write transaction, PostgreSQL/Aurora use an advisory transaction lock. An old email, an old
-attempt (another attempt has taken over the node row), or an event that has already recovered naturally returns `409` and
-cannot overwrite the newer state; a state still in its old per-attempt row moves to the node row together with the decision. The decision uses the Event ID and action as its idempotency key
+attempt (another attempt has taken over the node row, even while its old per-attempt row remains), or an event that has
+already recovered naturally returns `409` and cannot overwrite the newer state; a (newer) state still in its old
+per-attempt row moves to the node row together with the decision. The decision uses the Event ID and action as its idempotency key
 and is saved as `ADMIN_ACTION` evidence.
 
 #### 2.20.3 Read-only forensics chain for HUNG_SUSPECTED
@@ -4471,6 +4475,11 @@ lock, and the ingest path waits on it for at most that one statement; a claim ei
 or starts after the delete (no row: its own sample opens a fresh window) -- it can neither write a deleted state back nor
 lose a window it is writing (`tests/store/test_postgres_health_signal_retention.py`: a held advisory lock, a held row lock,
 a claim parked mid-decision on another connection, a claim after the delete).
+
+A row this release cannot decode (for example one a newer release wrote before a rollback) is not judged and stays, with
+one WARNING `health-signal retention kept N <kind> rows it cannot decode`, and the walk goes on past it; the cursor is saved
+page by page, so after a failing page the next call continues there instead of at the start; the two kinds are walked
+separately, one failing does not stop the other, and the failure still reaches the job's error counter.
 
 No schema change and no index: the page is a range scan of `gpu_fault_objects_pkey` (pinned by an EXPLAIN test). An
 expression index on the clock would allow "oldest first", but it adds an index write to every claim update and needs a new

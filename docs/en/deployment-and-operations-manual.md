@@ -10215,8 +10215,9 @@ in pursuit of faster recovery.
 The traffic state is one row per node (`cluster/node`) and belongs to the attempt currently evaluated on that node; when
 another attempt takes the node it starts again at WARMUP and inherits neither the previous attempt's baseline nor its
 zero-traffic clock. On an upgrade a running attempt continues from the row the older release kept per attempt (which is
-then deleted) and does not re-enter WARMUP; after a rollback the older release does not find the migrated rows, every
-attempt starts at WARMUP, and zero-traffic detection waits for a valid sample and `STARTUP_GRACE_SECONDS` -- no false
+then deleted) and does not re-enter WARMUP; on an upgrade after a rollback the row with the later sample continues, not the
+node row left before the rollback; after a rollback the older release does not find the migrated rows, those
+attempts start at WARMUP, and zero-traffic detection waits for a valid sample and `STARTUP_GRACE_SECONDS` -- no false
 alarm.
 
 ### Per-Rank Liveness Decision Before Escalation (Independent of Application Instrumentation)
