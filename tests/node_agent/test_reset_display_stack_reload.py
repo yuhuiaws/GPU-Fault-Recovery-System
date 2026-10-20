@@ -24,7 +24,7 @@ import pytest
 
 from gpu_fault.node_agent.operations.display_stack import (
     DISPLAY_RELOAD_PAUSE_SECONDS,
-    DISPLAY_RELOAD_TIMEOUT_SECONDS,
+    display_reload_timeout,
     display_stack_remedy,
     live_display_modules,
     reload_display_stack,
@@ -247,8 +247,9 @@ def test_a_stack_that_stays_unloaded_is_reported_with_its_remedy(
     assert "reloaded_kernel_modules" not in result.details
     assert len(result.details["display_module_reload_attempts"]) == 2
     timeouts = [item[2] for item in node.modprobes()]
-    assert timeouts == [DISPLAY_RELOAD_TIMEOUT_SECONDS] * 2, timeouts
-    assert sum(timeouts) + DISPLAY_RELOAD_PAUSE_SECONDS <= 30, "bounded reload"
+    # Bounded per load, for every GPU the load may have to initialise: this
+    # fake ``/proc`` lists no GPUs, so the bound is the largest node shape's.
+    assert timeouts == [display_reload_timeout(None)] * 2, timeouts
     commands = node.commands()
     assert commands[-1] == ["modprobe", "nvidia_drm"], (
         "nothing runs after the second load: no third try, no further reset"

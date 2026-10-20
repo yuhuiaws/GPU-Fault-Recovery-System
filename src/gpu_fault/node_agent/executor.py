@@ -135,6 +135,9 @@ class NodeActionExecutor(
     CollectorOutboxOperationsMixin,
 ):
     OPERATIONS = frozenset(OPERATION_HANDLERS)
+    #: Where the DRM devices a busy reset's display-stack release must bring
+    #: back are read (``operations.display_stack``); tests point it elsewhere.
+    drm_class_root: Path | None = Path("/sys/class/drm")
 
     def __init__(
         self,

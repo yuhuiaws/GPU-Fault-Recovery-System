@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import subprocess
+import sys
 from collections.abc import Collection, Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -14,13 +15,18 @@ from gpu_fault.cluster_scope import (
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
+from gpu_fault.node_agent.common import nvidia_gpu_count
 from gpu_fault.node_agent.late_ownership import (
     NodeOwnershipGate,
     OwnershipRefused,
     final_ownership_boundary,
     require_physical_ownership,
 )
-from gpu_fault.node_agent.operations.display_stack import reload_display_stack
+from gpu_fault.node_agent.operations.display_stack import (
+    DisplayRelease,
+    nvidia_drm_devices,
+    reload_display_stack,
+)
 from gpu_fault.node_agent.operations.holders import (
     IDLE_DISPLAY_MODULES,
     display_release_bystander,
@@ -104,6 +110,9 @@ class ResetOperationsMixin:
     _compute_clients: Callable[[], list[dict[str, str]]]
     _gpu_device_paths: Callable[[], dict[str, str]]
     proc_root: Path
+    #: ``/sys/class/drm`` on the executor; a composed stand-in without one
+    #: reads no DRM devices, and the reload is judged by ``/proc/modules``.
+    drm_class_root: Path | None = None
     #: The final ownership gate (``execute`` runs every reset behind it).
     ownership_gate: NodeOwnershipGate | None = None
     device_client_sample_interval_seconds: float
@@ -150,7 +159,7 @@ class ResetOperationsMixin:
     def _release_idle_display_modules(
         self,
         gpu_uuids: list[str],
-        released: list[str],
+        released: DisplayRelease,
         bystanders: list[dict[str, Any]] | None = None,
         kept_services: Collection[str] = (),
         calls: list[dict[str, Any]] | None = None,
@@ -163,7 +172,8 @@ class ResetOperationsMixin:
         as it happens -- refused, failed or released -- so a refusal between
         the two unloads still lists the one that ran (live, gpu-eks-cluster
         p5en: two granted checkpoints, and ``physical_calls`` named the busy
-        reset alone).
+        reset alone). The GPUs' DRM devices are read right before the first
+        unload: what the reload has to bring back (``display_stack``).
 
         Only when no compute app is running and no process holds an NVIDIA
         device node (``gpu_client_holder_evidence``): a holder is a client to
@@ -196,7 +206,7 @@ class ResetOperationsMixin:
             candidates = [
                 module
                 for module in idle_display_modules(self.proc_root)
-                if module not in released
+                if module not in released.modules
             ]
             if not candidates:
                 break
@@ -208,13 +218,15 @@ class ResetOperationsMixin:
             except OwnershipRefused as refused:
                 record["outcome"] = f"refused: {refused.action_details['reason']}"
                 raise
+            if not released.modules:
+                released.drm_devices = nvidia_drm_devices(self.drm_class_root)
             try:
                 self._run_checked(["rmmod", candidates[0]], timeout=30)
             except Exception as exc:
                 record["outcome"] = f"error: {type(exc).__name__}"
                 raise
             record["outcome"] = "released"
-            released.append(candidates[0])
+            released.modules.append(candidates[0])
             unloaded = True
         if unloaded and bystanders is not None:
             known = {item.get("pid") for item in bystanders}
@@ -225,15 +237,20 @@ class ResetOperationsMixin:
             )
         return unloaded
 
-    def _reload_display_modules(self, released: list[str]) -> dict[str, Any]:
+    def _reload_display_modules(self, released: DisplayRelease) -> dict[str, Any]:
         """Load the display stack this reset unloaded, retried once and checked
-        against ``/proc/modules``; never a failure (``display_stack``)."""
+        against ``/proc/modules`` and the DRM devices the release found; never
+        a failure (``display_stack``). The load is bounded for every GPU of
+        the node (the driver's own list)."""
 
         return reload_display_stack(
-            released,
+            released.modules,
             run_checked=self._run_checked,
             sleep=self.sleep,
             proc_root=self.proc_root,
+            drm_class_root=self.drm_class_root,
+            drm_devices_before=released.drm_devices,
+            gpu_count=nvidia_gpu_count(self.proc_root),
         )
 
     def _run_reset_with_busy_retry(
@@ -242,7 +259,7 @@ class ResetOperationsMixin:
         *,
         gpu_uuids: list[str],
         timeout: int,
-        released: list[str] | None = None,
+        released: DisplayRelease | None = None,
         calls: list[dict[str, Any]] | None = None,
         bystanders: list[dict[str, Any]] | None = None,
         kept_services: Collection[str] = (),
@@ -263,7 +280,7 @@ class ResetOperationsMixin:
         GF-REGIONAL-DESTR-015), and this is where that shows.
         """
 
-        released = [] if released is None else released
+        released = DisplayRelease() if released is None else released
         calls = [] if calls is None else calls
         for attempt in range(1, self._RESET_BUSY_ATTEMPTS + 1):
             record: dict[str, Any] = {"command": " ".join(command), "attempt": attempt}
@@ -434,7 +451,7 @@ class ResetOperationsMixin:
             self._reset_gpu_preflight(gpu_uuids)
         reset_attempts = 0
         completed: list[str] = []
-        released: list[str] = []
+        released = DisplayRelease()
         calls: list[dict[str, Any]] = []
         bystanders: list[dict[str, Any]] = []
         for index, gpu_uuid in enumerate(gpu_uuids):
@@ -512,6 +529,12 @@ class ResetOperationsMixin:
                         **self._reload_display_modules(released),
                     },
                 ) from exc
+            except Exception:
+                # No verdict of this reset (a probe between two attempts timed
+                # out, ``/proc`` went unreadable): it travels on as it is, with
+                # the display stack it unloaded put back first.
+                self._reload_display_modules(released)
+                raise
             completed.append(gpu_uuid)
         return {
             "reset_gpu_uuids": gpu_uuids,
@@ -558,7 +581,7 @@ class ResetOperationsMixin:
     ) -> dict[str, Any]:
         with self._pre_spawn_guard(window_claimed=window_claimed):
             local_inventory = self._reset_all_preflight(gpu_uuids)
-        released: list[str] = []
+        released = DisplayRelease()
         calls: list[dict[str, Any]] = []
         bystanders: list[dict[str, Any]] = []
         try:
@@ -605,6 +628,14 @@ class ResetOperationsMixin:
             raise
         finally:
             reload = self._reload_display_modules(released)
+            # A reset that did not complete says what its display stack came
+            # back as, the way ``_reset_gpu``'s failure does: the refused
+            # fabric reset of GF-REGIONAL-DESTR-010 (gpu-eks-cluster p5en) had
+            # no word of the release or the reload, while two of its GPUs had
+            # lost their DRM device.
+            failure = getattr(sys.exc_info()[1], "action_details", None)
+            if isinstance(failure, dict):
+                failure.update(reload)
         observed_after = self._gpu_inventory()
         if observed_after != local_inventory:
             raise RuntimeError(
