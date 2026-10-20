@@ -35,7 +35,8 @@ rules:
       contract, the ownership label convention (site-id, discovery by label,
       journaled convergence), release rendering, IAM boundary and installer
       identity. Plain EKS (eks-managed) is the newer, less validated form;
-      node replacement stays observe-only.
+      provider-side node replacement is observe-only (nodeReplace is the
+      warm-spare handover only).
     paths:
       - src/gpu_fault/cluster_scope.py
       - src/gpu_fault/admin/bootstrap_discovery.py
