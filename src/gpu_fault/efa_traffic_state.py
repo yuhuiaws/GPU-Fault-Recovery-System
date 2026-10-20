@@ -269,12 +269,60 @@ def legacy_efa_traffic_state_key(node_key: str, job_id: str, attempt_id: str) ->
     return "/".join([node_key, job_id, attempt_id])
 
 
-def efa_state_belongs_to(
-    state: EfaTrafficState, job_id: str | None, attempt_id: str | None
-) -> bool:
-    """Whether ``state`` is the named attempt's (an unnamed one owns nothing)."""
+def efa_state_belongs_to(state: EfaTrafficState, job_id: str, attempt_id: str) -> bool:
+    """Whether ``state`` is the named attempt's."""
 
     return state.job_id == job_id and state.attempt_id == attempt_id
+
+
+#: A node row whose last sample is this far behind the incoming one may have
+#: been overtaken by a writer of the release before batch 145 -- a rollback and
+#: a new upgrade, or the older Pods of a rolling one -- that wrote the
+#: attempt's per-attempt row instead: that row is consulted and the newer of
+#: the two continues. Below it a sample gap is an ordinary one (the host's edge
+#: filter reports a steady node every few minutes; one consult per such sample).
+LEGACY_EFA_RECHECK_GAP = timedelta(minutes=2)
+
+
+def legacy_efa_state_due(
+    node_state: EfaTrafficState | None,
+    job_id: str,
+    attempt_id: str,
+    observed_at: datetime,
+) -> bool:
+    """Whether a sample must consult the attempt's per-attempt row."""
+
+    if node_state is None:
+        return True
+    if observed_at <= node_state.observed_at:
+        return False  # a replay or late sample: dropped against the node row
+    if not efa_state_belongs_to(node_state, job_id, attempt_id):
+        return True
+    return observed_at - node_state.observed_at > LEGACY_EFA_RECHECK_GAP
+
+
+def continued_efa_state(
+    node_state: EfaTrafficState | None,
+    legacy_state: EfaTrafficState | None,
+    job_id: str,
+    attempt_id: str,
+) -> EfaTrafficState | None:
+    """What the attempt's next sample continues from.
+
+    Its per-attempt row when that saw the later sample or the node row is not
+    the attempt's, else the node row -- which, when it belongs to another
+    attempt, ``next_efa_traffic_state`` starts again at WARMUP.
+    """
+
+    if legacy_state is None:
+        return node_state
+    if node_state is None or not efa_state_belongs_to(node_state, job_id, attempt_id):
+        return legacy_state
+    return (
+        legacy_state
+        if legacy_state.observed_at > node_state.observed_at
+        else node_state
+    )
 
 
 def efa_traffic_admin_decision_id(event_id: str, action: EfaTrafficAdminAction) -> str:

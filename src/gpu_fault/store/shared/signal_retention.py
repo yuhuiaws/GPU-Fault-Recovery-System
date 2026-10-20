@@ -84,6 +84,30 @@ class SignalPage:
     #: Keys the page read; fewer than asked means the key space ended.
     scanned: int
     last_key: str | None
+    #: Rows this release cannot decode (one a newer release wrote, before a
+    #: rollback): never judged, so kept, and the walk goes on past them.
+    undecodable: int = 0
+
+
+def decoded_signal_rows(
+    kind: str,
+    rows: Sequence[tuple[str, str]],
+    decode: Callable[[str, str], Any],
+    stale_before: datetime,
+) -> tuple[tuple[SignalRow, ...], int]:
+    """``(rows older than the bound, undecodable count)`` of stored payloads."""
+
+    decoded: list[SignalRow] = []
+    undecodable = 0
+    for key, payload in rows:
+        try:
+            state = decode(kind, payload)
+        except ValueError:  # pydantic's ValidationError included
+            undecodable += 1
+            continue
+        if signal_state_clock(state) < stale_before:
+            decoded.append(SignalRow(key, state, payload))
+    return tuple(decoded), undecodable
 
 
 def _utc(value: datetime) -> datetime:
@@ -243,17 +267,25 @@ class SharedSignalRetentionMixin:
             )
         now = _utc(now)
         evidence = RetentionEvidence(self, now=now, grace=grace)
-        return {
-            kind: self._sweep_signal_kind(
-                kind,
-                evidence,
-                now=now,
-                grace=grace,
-                retention=retention,
-                limit=limit,
-            )
-            for kind in SIGNAL_RETENTION_KINDS
-        }
+        removed: dict[str, int] = {}
+        failure: Exception | None = None
+        for kind in SIGNAL_RETENTION_KINDS:
+            # One kind that keeps failing must not starve the other; the
+            # failure still reaches the job's error counter.
+            try:
+                removed[kind] = self._sweep_signal_kind(
+                    kind,
+                    evidence,
+                    now=now,
+                    grace=grace,
+                    retention=retention,
+                    limit=limit,
+                )
+            except Exception as exc:
+                failure = failure or exc
+        if failure is not None:
+            raise failure
+        return removed
 
     def _sweep_signal_kind(
         self,
@@ -272,10 +304,12 @@ class SharedSignalRetentionMixin:
         after = cursors.get(kind, "")
         removed: dict[str, str] = {}
         attempted = 0
+        undecodable = 0
         for _ in range(SIGNAL_RETENTION_PAGES_PER_CALL):
             page = self._signal_state_page(
                 kind, after_key=after, limit=limit, stale_before=now - grace
             )
+            undecodable += page.undecodable
             victims: list[SignalRow] = []
             reasons: dict[str, str] = {}
             resume = page.last_key
@@ -294,13 +328,20 @@ class SharedSignalRetentionMixin:
             attempted += len(victims)
             for key in self._delete_unchanged_signal_states(kind, victims):
                 removed[key] = reasons[key]
+            # Saved page by page: a later page that fails does not make the
+            # next call walk this one again.
             if page.scanned < limit and resume == page.last_key:
-                after = ""
+                cursors[kind] = after = ""
                 break
-            after = resume or after
+            cursors[kind] = after = resume or after
             if attempted >= limit:
                 break
-        cursors[kind] = after
+        if undecodable:
+            LOGGER.warning(
+                "health-signal retention kept %d %s rows it cannot decode",
+                undecodable,
+                kind,
+            )
         if removed:
             counts: dict[str, int] = {}
             for reason in removed.values():

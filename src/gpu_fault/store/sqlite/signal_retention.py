@@ -18,7 +18,7 @@ from pydantic import BaseModel
 from gpu_fault.store.shared.signal_retention import (
     SignalPage,
     SignalRow,
-    signal_state_clock,
+    decoded_signal_rows,
 )
 
 
@@ -47,18 +47,17 @@ class SqliteSignalRetentionMixin:
                 """,
                 (kind, after_key, limit),
             ).fetchall()
-        model = self._models[kind]
-        page = [
-            (key, model.model_validate_json(payload), payload) for key, payload in rows
-        ]
+        stale, undecodable = decoded_signal_rows(
+            kind,
+            rows,
+            lambda name, payload: self._models[name].model_validate_json(payload),
+            stale_before,
+        )
         return SignalPage(
-            rows=tuple(
-                SignalRow(key, state, payload)
-                for key, state, payload in page
-                if signal_state_clock(state) < stale_before
-            ),
+            rows=stale,
             scanned=len(rows),
             last_key=rows[-1][0] if rows else None,
+            undecodable=undecodable,
         )
 
     def _delete_unchanged_signal_states(

@@ -27,7 +27,11 @@ from contextlib import AbstractContextManager
 from datetime import datetime
 from typing import Any, Callable, Protocol
 
-from gpu_fault.store.shared.signal_retention import SignalPage, SignalRow
+from gpu_fault.store.shared.signal_retention import (
+    SignalPage,
+    SignalRow,
+    decoded_signal_rows,
+)
 from gpu_fault.store.shared.time import utc_text as _utc_text
 
 # A health signal's clock is ``clock_at`` (control-plane receive time) when it
@@ -97,14 +101,17 @@ class PostgresSignalRetentionMixin:
                 _SIGNAL_STATE_PAGE, (_utc_text(stale_before), kind, after_key, limit)
             )
             rows = cursor.fetchall()
+        stale, undecodable = decoded_signal_rows(
+            kind,
+            [(key, payload) for key, payload in rows if payload is not None],
+            self._decode,
+            stale_before,
+        )
         return SignalPage(
-            rows=tuple(
-                SignalRow(key, self._decode(kind, payload), payload)
-                for key, payload in rows
-                if payload is not None
-            ),
+            rows=stale,
             scanned=len(rows),
             last_key=rows[-1][0] if rows else None,
+            undecodable=undecodable,
         )
 
     def _delete_unchanged_signal_states(

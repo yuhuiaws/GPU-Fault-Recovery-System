@@ -13,6 +13,7 @@ half, including a concurrent claim, is
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import timedelta
 from functools import partial
 from types import SimpleNamespace
@@ -462,3 +463,81 @@ def test_observations_without_a_heartbeat_reader_cannot_end_an_attempt() -> None
     assert evidence.attempt_status(CLUSTER, None, "attempt-live") == LIVE
     assert evidence.attempt_status(CLUSTER, "job-a", "attempt-old") == UNKNOWN
     assert evidence.attempt_status(CLUSTER, "job-b", "attempt-live") == ENDED
+
+
+# ------------------------------------------------------------- the failures
+
+
+def test_a_row_this_release_cannot_decode_is_kept_and_walked_past(tmp_path) -> None:
+    """A row a newer release wrote (before a rollback) fails this release's
+    model: it is neither judged nor deleted, and the rows after it still are."""
+
+    path = tmp_path / "undecodable.db"
+    store = SqliteStore(str(path))
+    try:
+        claim(store, LINK, ANCIENT)
+        connection = sqlite3.connect(str(path))
+        with connection:
+            connection.execute(
+                "INSERT INTO objects(kind, key, payload) VALUES (?, ?, ?)",
+                (
+                    "health_signal_state",
+                    f"{CLUSTER}/node-0/newer/node",
+                    '{"signal_key": "x", "active": true, "from_a_newer": 1}',
+                ),
+            )
+        connection.close()
+
+        assert sweep(store, limit=1)["health_signal_state"] == 1
+        assert health_rows(store, [LINK]) == set()
+    finally:
+        store.close()
+
+
+def test_one_kind_failing_does_not_starve_the_other(store, monkeypatch) -> None:
+    claim(store, LINK, ANCIENT)
+    stale_efa, _ = efa(store, "node-d", ANCIENT)
+    read_page = getattr(store, "_signal_state_page")
+
+    def failing_health_page(kind, **arguments):
+        if kind == "health_signal_state":
+            raise RuntimeError("health_signal_state page failed")
+        return read_page(kind, **arguments)
+
+    monkeypatch.setattr(store, "_signal_state_page", failing_health_page)
+
+    with pytest.raises(RuntimeError, match="health_signal_state page failed"):
+        sweep(store)
+    assert efa_rows(store, [stale_efa.state_key]) == set()
+    assert health_rows(store, [LINK]) == {LINK}
+
+
+def test_a_failing_page_does_not_send_the_next_call_back_to_the_start(
+    store, monkeypatch
+) -> None:
+    claim(store, f"{CLUSTER}/node-0/network_link_down/eth0", OLD)  # stays
+    for index in (1, 2):
+        claim(store, f"{CLUSTER}/node-{index}/network_link_down/eth0", ANCIENT)
+    read_page = getattr(store, "_signal_state_page")
+    pages: list[str] = []
+
+    def second_page_fails(kind, **arguments):
+        if kind == "health_signal_state":
+            pages.append(arguments["after_key"])
+            if len(pages) == 2:
+                raise RuntimeError("second page failed")
+        return read_page(kind, **arguments)
+
+    monkeypatch.setattr(store, "_signal_state_page", second_page_fails)
+
+    with pytest.raises(RuntimeError, match="second page failed"):
+        sweep(store, limit=1)
+    assert sweep(store, limit=1)["health_signal_state"] == 1
+
+    # The first call read one page (node-0, which stays) and failed on the
+    # next; the second call resumed after node-0, not at the start.
+    first = f"{CLUSTER}/node-0/network_link_down/eth0"
+    assert pages == ["", first, first]
+    assert health_rows(store, [first, f"{CLUSTER}/node-1/network_link_down/eth0"]) == {
+        first
+    }

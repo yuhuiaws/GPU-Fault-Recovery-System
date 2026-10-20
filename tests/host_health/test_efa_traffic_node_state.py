@@ -23,6 +23,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from gpu_fault.efa_traffic_state import (
+    LEGACY_EFA_RECHECK_GAP,
     efa_traffic_state_key,
     legacy_efa_traffic_state_key,
 )
@@ -262,3 +263,70 @@ def test_an_admin_decision_on_the_attempts_own_row(store) -> None:
     assert named.attempt_id == "attempt-1"
     # The decision is idempotent by event and action, named or not.
     assert _decide(store, spike.active_spike_event_id) == named
+
+
+def test_an_admin_decision_never_overwrites_the_attempt_that_owns_the_node(
+    store,
+) -> None:
+    """The spike's attempt left the node while its old per-attempt row stays:
+    acting on that spike must not replace the new owner's state."""
+
+    spike = _spike(store, state_key=LEGACY)
+    owner, _ = efa(store, "node-a", _at(150), attempt_id="attempt-2", bps=0)
+
+    with pytest.raises(EfaTrafficAdminConflict, match="attempt job-a/attempt-2"):
+        _decide(
+            store, spike.active_spike_event_id, job_id="job-a", attempt_id="attempt-1"
+        )
+
+    assert store.get_efa_traffic_state(NODE) == owner
+    assert store.get_efa_traffic_state(LEGACY).active_spike_event_id == (
+        spike.active_spike_event_id
+    )
+
+
+def test_a_rollback_and_a_new_upgrade_resume_the_newer_row(store) -> None:
+    """The older release kept writing the attempt's per-attempt row after a
+    rollback; the node row this release left is behind it and must not win."""
+
+    stale = _hung_streak(store)  # this release: zero since 150 s
+    assert stale.zero_since == _at(150)
+    # Rolled back: the older release writes the per-attempt row -- an hour of
+    # traffic, so no zero streak any more.
+    for second in (300, 1800, 3900):
+        efa(store, "node-a", _at(second), state_key=LEGACY)
+    newer = store.get_efa_traffic_state(LEGACY)
+    assert newer.zero_since is None
+
+    # Upgraded again: the first zero sample continues from the newer row.
+    state, emitted = efa(store, "node-a", _at(4000), bps=0)
+
+    assert (state.signal, emitted) == (EfaTrafficSignal.ZERO_PENDING, False)
+    assert state.zero_since == _at(4000)
+    assert state.baseline_bytes_per_second == newer.baseline_bytes_per_second
+    with pytest.raises(NotFoundError):
+        store.get_efa_traffic_state(LEGACY)
+
+
+def test_a_node_row_just_behind_a_steady_sample_skips_the_old_row(store) -> None:
+    """A gap below LEGACY_EFA_RECHECK_GAP is an ordinary one: the per-attempt
+    row is not consulted, and an older one is left for the retention."""
+
+    efa(store, "node-a", _at(0))
+    efa(store, "node-a", _at(10), state_key=LEGACY, bps=9000)
+    state, _ = efa(
+        store, "node-a", _at(10) + LEGACY_EFA_RECHECK_GAP - timedelta(seconds=11)
+    )
+    assert state.baseline_bytes_per_second == 1000
+    assert store.get_efa_traffic_state(LEGACY).last_bytes_per_second == 9000
+
+
+def test_the_attempts_state_is_the_newer_of_its_two_rows(store) -> None:
+    efa(store, "node-a", _at(0))
+    efa(store, "node-a", _at(500), state_key=LEGACY, bps=2000)
+
+    state = store.get_efa_traffic_state(NODE, job_id="job-a", attempt_id="attempt-1")
+
+    assert (state.state_key, state.last_bytes_per_second) == (LEGACY, 2000)
+    with pytest.raises(ValueError, match="job_id and attempt_id"):
+        store.get_efa_traffic_state(NODE, job_id="job-a")
