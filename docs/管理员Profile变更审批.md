@@ -76,6 +76,15 @@ gpu-fault-admin deploy \
 provider 声明的版本（`eks-v1` / `hyperpod-v1`），由 `join-cluster` 审核（`change_kind: CLUSTER_PROFILE_NEW`，
 `registration_cluster_id: <cluster>`）。快照 `profiles/<version>.yaml` 不可变：一个版本永不对应两种策略。
 
+首个版本的 `changes` 行写明该集群的 `nodeReboot` owner，以及快照里 `nodeReplace` 实际做什么（从模板读出，不是固定文字）。
+两个示例 Profile 都把 `nodeReplace` OWN 为 warm-spare 交接（`warm-spare-v1`），该行写
+`nodeReplace owned by <adapter> as the warm-spare handover only (...)`：REPLACE_NODE 只把工作负载交接到已声明的健康热备节点，
+没有热备时 fail closed，从不调用 provider replace API。`nodeReplace` 为 OBSERVE 的模板写 `nodeReplace OBSERVE (...)`：既不交接热备
+也不替换节点，REPLACE_NODE 没有可执行 owner，其工作流 BLOCKED 交给运维。该行与模板文件的原始字节（`source_sha256`，注释也算）
+都计入 `plan_sha256`：较早的 admin CLI 写出、行里固定为 `nodeReplace OBSERVE` 的待审批计划，升级后续跑时按新措辞重新出计划并换一个
+摘要，已作的审批归档为 `SUPERSEDED`，命令停下并打印新的 `plan_sha256`（`policy_digest`、`snapshot_sha256` 不变），按第 4 节再审一次；
+在此之前不会写入任何快照。
+
 pin 之后 provider 示例 Profile 的策略变化（`templateSource` 与已 pin 快照不同）时，`deploy` 不复用版本名，而是
 计算后继版本 `regional-<provider>-<digest12>`（模板策略摘要的前 12 位十六进制），写出计划并在 release bundle
 与各项 gate 之前停止：

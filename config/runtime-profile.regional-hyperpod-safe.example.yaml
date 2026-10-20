@@ -2,9 +2,13 @@
 # 每个 OWN/DELEGATE 的 owner 必须由目标 GPU 集群 executor 实际构造的
 # adapter 广告出来，否则该 owner 的 remote command 永远不会被 claim。
 # nodeReboot / nodeReplace 的 gpu-fault-hyperpod-adapter 要求 executor
-# 设置 GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true。当前 profile 同时 OWN 两项能力，
-# 注册前必须完成部署和运维手册阶段 D.1/D.2 的独立验收；若只批准 reboot，
-# 应发布新的 profile version 并将 nodeReplace 保持为 OBSERVE。
+# 设置 GPU_FAULT_ENABLE_HYPERPOD_ADAPTER=true。当前 profile 同时 OWN 两项能力；
+# nodeReplace 由 gpu-fault-hyperpod-adapter OWN 为 warm-spare 交接（observed
+# warm-spare-v1）：REPLACE_NODE 只把工作负载交接到已声明的健康热备节点，没有热备时
+# fail closed，从不调用 provider replace API（BatchReplaceClusterNodes）。
+# 注册前必须完成部署和运维手册阶段 D.1/D.2 的独立验收；若只批准 reboot（D.1），
+# 应发布新的 profile version 并将 nodeReplace 保持为 OBSERVE：REPLACE_NODE 没有
+# 可执行 owner，其工作流 BLOCKED 交给运维，既不交接热备也不替换节点。
 # 校验命令见 docs/部署和运维手册.md 的"区域模式故障排查"小节。
 # cluster_id 是稳定注册锚点，不是 HyperPod provider 名；可沿用首次集群 ID，
 # 但该集群退役后锚点仍保持不变，不要求属于当前纳管集合。
@@ -100,6 +104,10 @@ claims:
     mode: OWN
     owner: gpu-fault-hyperpod-adapter
     adapter: regional-cluster-executor
+  # REPLACE_NODE is the warm-spare handover (HEALTHY_WARM_SPARE_ONLY) the
+  # executor's spare coordinator runs: the adapter refuses provider replacement
+  # (BatchReplaceClusterNodes is never called) and the step fails closed
+  # without a declared healthy spare.
   - capability: nodeReplace
     mode: OWN
     owner: gpu-fault-hyperpod-adapter

@@ -243,6 +243,68 @@ def _snapshot_text(override: ClusterProfileOverride) -> str:
     return str(yaml.safe_dump(_snapshot_document(override), sort_keys=False))
 
 
+#: What a ``nodeReplace`` claim that no executor runs means to the approver.
+_NO_NODE_REPLACEMENT = (
+    "nothing replaces the node or hands its work to a spare: a REPLACE_NODE "
+    "step has no executable owner and its workflow is BLOCKED for the operator"
+)
+
+
+def _entries(value: object) -> list[dict[str, Any]]:
+    items = value if isinstance(value, list) else []
+    return [item for item in items if isinstance(item, dict)]
+
+
+def _node_replace_policy(document: dict[str, Any]) -> str:
+    """The reviewed snapshot's ``nodeReplace``, in the approver's words.
+
+    Read from the snapshot, never assumed: the plan line once hard-coded
+    ``nodeReplace OBSERVE`` while both provider templates OWN it. An OWN claim
+    is the warm-spare handover: REPLACE_NODE runs ``HEALTHY_WARM_SPARE_ONLY``
+    and both ``HyperPodLifecycleAdapter.submit`` and
+    ``EksManagedNodeProvider.submit`` refuse ``REPLACE``. OWN or DELEGATE
+    without an available observed implementation is the OBSERVE that
+    ``compile_runtime_profile`` reduces it to, and a claim no executor runs
+    leaves REPLACE_NODE without an owner (``WorkflowBuilder.compile_steps``).
+    """
+
+    claims = [
+        item
+        for item in _entries(document.get("claims"))
+        if item.get("capability") == "nodeReplace"
+    ]
+    active = [item for item in claims if item.get("mode") != "DISABLED"]
+    if not active:
+        state = "DISABLED" if claims else "not claimed"
+        return f"nodeReplace {state} ({_NO_NODE_REPLACEMENT})"
+    mode, owner = str(active[0].get("mode")), str(active[0].get("owner"))
+    if mode not in {"OWN", "DELEGATE"}:
+        return f"nodeReplace {mode} ({_NO_NODE_REPLACEMENT})"
+    observed = next(
+        (
+            item
+            for item in _entries(document.get("observed"))
+            if item.get("capability") == "nodeReplace"
+            and item.get("owner") == owner
+            and item.get("available") is True
+        ),
+        None,
+    )
+    if observed is None:
+        return (
+            f"nodeReplace {mode} by {owner} without an available observed "
+            f"implementation, so OBSERVE ({_NO_NODE_REPLACEMENT})"
+        )
+    if mode == "DELEGATE":
+        return f"nodeReplace delegated to {owner}"
+    version = f"{observed['version']}: " if observed.get("version") else ""
+    return (
+        f"nodeReplace owned by {owner} as the warm-spare handover only ({version}"
+        "REPLACE_NODE moves the workload to a declared healthy spare, fails "
+        "closed without one and never calls a provider replace API)"
+    )
+
+
 @dataclass(frozen=True)
 class _PlannedMember:
     """One cluster a plan moves to the plan's version."""
@@ -262,6 +324,7 @@ def _change_line(
     member: _PlannedMember,
     *,
     alone: bool,
+    node_replace: str,
 ) -> str:
     before = member.current_version
     if before is not None:
@@ -275,7 +338,7 @@ def _change_line(
     line = (
         f"cluster {member.cluster_id} ({member.provider}) runs its own Runtime "
         f"Profile {override.version}: nodeReboot owned by {override.owner}, "
-        "nodeReplace OBSERVE"
+        f"{node_replace}"
     )
     if alone:
         line += (
@@ -310,7 +373,11 @@ def _plan_document(
     )
     digests = {member.current_policy_digest for member in members}
     alone = len(members) == 1
-    changes = [_change_line(facts, override, member, alone=alone) for member in members]
+    node_replace = _node_replace_policy(_snapshot_document(override))
+    changes = [
+        _change_line(facts, override, member, alone=alone, node_replace=node_replace)
+        for member in members
+    ]
     if not alone:
         changes.append(
             f"{override.version} is one approval and one immutable snapshot for "

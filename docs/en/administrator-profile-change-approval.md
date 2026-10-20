@@ -85,6 +85,17 @@ one (`eks-v1` / `hyperpod-v1`) and is reviewed by `join-cluster` (`change_kind: 
 `registration_cluster_id: <cluster>`). The snapshot `profiles/<version>.yaml` is immutable: a version never
 names two policies.
 
+The `changes` line of a first version names the cluster's `nodeReboot` owner and what the snapshot's `nodeReplace`
+actually does, read from the template rather than fixed text. Both example profiles OWN `nodeReplace` as the warm-spare
+handover (`warm-spare-v1`) and the line reads `nodeReplace owned by <adapter> as the warm-spare handover only (...)`:
+REPLACE_NODE moves the workload to a declared healthy spare, fails closed without one and never calls a provider replace
+API. A template whose `nodeReplace` is OBSERVE reads `nodeReplace OBSERVE (...)`: no spare handover and no replacement,
+REPLACE_NODE has no executable owner and its workflow is BLOCKED for the operator. The line and the template file's raw
+bytes (`source_sha256`, comments included) are both part of `plan_sha256`: a pending plan an earlier admin CLI wrote with
+the fixed `nodeReplace OBSERVE` wording is re-planned under the new wording and a new digest on the rerun after the
+upgrade; an approval already given is archived `SUPERSEDED` and the command stops printing the new `plan_sha256` (same
+`policy_digest` and `snapshot_sha256`) for one more review per section 4. No snapshot is written before that.
+
 When the provider's example profile changes policy after the pin (`templateSource` differs from the pinned
 snapshot), `deploy` does not reuse the version. It computes the successor version
 `regional-<provider>-<digest12>` (the first 12 hex digits of the template's policy digest), writes the plan
