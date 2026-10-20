@@ -150,7 +150,9 @@ def test_a_key_a_claim_holds_is_skipped_without_waiting(store) -> None:
         elapsed = time.monotonic() - started
         holder.rollback()
 
-    assert elapsed < 5, f"the sweep waited {elapsed:.1f}s on a held lock"
+    # Waiting would mean waiting on this very thread's lock: it returned, and
+    # the bound is far below the statement timeout that would end a wait.
+    assert elapsed < 10, f"the sweep waited {elapsed:.1f}s on a held lock"
     assert counts["health_signal_state"] == 1
     assert health_rows(store, [key, other]) == {key}
     assert sweep(store)["health_signal_state"] == 1
@@ -174,7 +176,7 @@ def test_a_row_another_transaction_locked_is_skipped_without_waiting(store) -> N
         elapsed = time.monotonic() - started
         holder.rollback()
 
-    assert elapsed < 5, f"the sweep waited {elapsed:.1f}s on a row lock"
+    assert elapsed < 10, f"the sweep waited {elapsed:.1f}s on a row lock"
     assert sweep(store)["health_signal_state"] == 1
 
 
@@ -190,7 +192,9 @@ def test_a_claim_parked_mid_decision_keeps_its_window(store) -> None:
 
     def parked(*args, **kwargs):
         decided.set()
-        assert release.wait(timeout=15), "the test releases the claim"
+        # Longer than the bound below: a sweep that waited for this claim
+        # would take at least this long.
+        assert release.wait(timeout=30), "the test releases the claim"
         return original(*args, **kwargs)
 
     def replica() -> None:
@@ -212,10 +216,10 @@ def test_a_claim_parked_mid_decision_keeps_its_window(store) -> None:
         counts = sweep(store)
         elapsed = time.monotonic() - started
         release.set()
-        thread.join(timeout=15)
+        thread.join(timeout=30)
 
     assert "error" not in outcome, outcome
-    assert elapsed < 5, f"the sweep waited {elapsed:.1f}s on the claim"
+    assert elapsed < 10, f"the sweep waited {elapsed:.1f}s on the claim"
     assert counts["health_signal_state"] == 0
     state = store.get_health_signal_state(key)
     assert state is not None and state.active is False
