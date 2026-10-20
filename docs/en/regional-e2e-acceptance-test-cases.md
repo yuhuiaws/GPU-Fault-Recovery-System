@@ -13867,8 +13867,9 @@ BLOCKED, no quiesce and no reset; once the watcher recovers the heartbeat return
     This gap **must not be a fixed sleep** either -- "detection window + 90 seconds" was once used and
     measured only 25 seconds of headroom. The runner instead reads the unscoped signal state
     (`cluster/node/metric/device/rule`) of the selected nodes directly -- a key that also names an
-    attempt belongs to a finished job, stays in its last reported state and cannot hold the next phase
-    back -- and polls until all of them have re-armed before submitting the next phase, bounded
+    attempt belongs to a finished job, stays in its last reported state until the health-signal retention
+    deletes it after its grace period, and cannot hold the next phase back -- and polls until all of them
+    have re-armed before submitting the next phase, bounded
     by `quiesce_deadline_seconds` (3 x detection window + 300 seconds); the wait is recorded in that
     phase's `quiesce_polls`; on timeout it fails outright as "latch not released" rather than counting
     it as the detector not firing.

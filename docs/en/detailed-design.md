@@ -3205,9 +3205,10 @@ starts from zero with a notification latch of its own -- the previous attempt's 
 successor (a job about one minute old was once flagged as idle and stopped/restarted that way), and a delivered finding of
 the previous attempt does not silence the next one. The unscoped key `cluster/node/metric/device/rule` is claimed in the same
 call as the continuity gate: a sample without exactly one managed attempt lands only on it and resets it; it is never
-latched, and a finding needs both windows to have run for the configured duration. The EFA-traffic rule needs no change:
-its state is already keyed by cluster/node/job/attempt and a new attempt starts in WARMUP
-(`tests/host_health/test_low_utilization_attempt_window.py`).
+latched, and a finding needs both windows to have run for the configured duration
+(`tests/host_health/test_low_utilization_attempt_window.py`). The EFA traffic state is one row per node, owned by the attempt
+it records, and starts again at WARMUP when another attempt takes the node (§2.20.1). Once an attempt has ended, the
+health-signal retention sweep reclaims the window rows it left (§3.2.1).
 
 Both rules are graded per GPU, and only on the GPUs that attempt holds (`host_low_utilization.py`). Graded per node, a
 job holding one GPU of eight (DESTR-012 group D, or any partial-node job in production) left seven unallocated GPUs that
@@ -3284,7 +3285,7 @@ Different metrics and different nodes still each open their own; once the incide
 
 The input of this section is the EFA hardware counter; the output has three tiers: ordinary traffic anomaly (send mail, do not touch the machine),
 administrator-confirmed action (change the baseline), and suspected collective hang (read-only deep forensics). The three tiers share the same
-state machine stored per `cluster/node/job/attempt`.
+state machine, whose state is one row per node and belongs to the attempt currently evaluated on that node.
 
 #### 2.20.1 Traffic state machine and baseline
 
@@ -3304,9 +3305,29 @@ The control plane runs the state machine on a node's total throughput only when 
 When EFA traffic encounters multiple active attempts it records a warning containing the candidate jobs/attempts and
 fails closed, without silently guessing the owner -- this is how condition 2 is implemented.
 
-State is stored per `cluster/node/job/attempt` in InMemory, SQLite or PostgreSQL. The Aurora
-implementation uses a PostgreSQL advisory transaction lock to guarantee that multiple API replicas do not advance
-the same state twice. Non-anomalous samples update the baseline by EWMA; spike, drop, zero warning and
+State is stored in InMemory, SQLite or PostgreSQL as one row per node, keyed `cluster/node`
+(`efa_traffic_state_key`); the `job_id`/`attempt_id` in the payload say which attempt it belongs to. The node's total
+throughput is a node-wide aggregate and the rule only runs while exactly one managed attempt resolves on the node, so one
+row is enough; the state still belongs to one attempt only:
+
+- a sample not newer than the row's last one is a replay or arrived out of order and changes nothing, whichever attempt it
+  names (a late sample of the previous attempt cannot reset its successor);
+- a newer sample of another attempt starts again at WARMUP and inherits none of the previous attempt's baseline,
+  zero-traffic clock, first-observed time or spike acknowledgement.
+
+Before batch 145 there was one row per `cluster/node/job/attempt`, never deleted. On an upgrade, an attempt the node row
+does not carry yet continues from its old per-attempt row: read under that row's own advisory lock (a writer of the older
+release still holds it during a rolling upgrade) and deleted once the node row is written. An upgrade therefore neither
+restarts a running attempt at WARMUP (a hang already in its zero-traffic streak would never escalate: zero-traffic detection
+first needs a valid sample) nor leaves the old row behind. After a rollback the older release reads only per-attempt rows:
+migrated ones are gone, every attempt starts at WARMUP, and detection waits for a first valid sample and the startup grace
+-- it never alarms early. If an old row survives (re-created by an older writer during the roll), the older release resumes
+its stale zero-traffic clock and its first zero sample can escalate to `HUNG_SUSPECTED`; that is why the health-signal
+retention sweep deletes such superseded rows after the grace period (§3.2.1).
+(`tests/host_health/test_efa_traffic_node_state.py`)
+
+The Aurora implementation uses a PostgreSQL advisory transaction lock to guarantee that multiple API replicas do not
+advance the same state twice. Non-anomalous samples update the baseline by EWMA; spike, drop, zero warning and
 hung generate findings only on state transitions.
 
 ```mermaid
@@ -3353,10 +3374,11 @@ After confirming the SPIKE, the administrator submits one of the following actio
 - `ACCEPT_NEW_BASELINE`: atomically sets that state's `last_bytes_per_second` as the baseline
   and switches the signal to `NORMAL`.
 
-The state keeps the Event ID of the currently active SPIKE. In the same state transaction the Store verifies
-`cluster/node/job/attempt`, that the signal is still `SPIKE`, and that the Event ID is still the active transition; SQLite uses
-a write transaction, PostgreSQL/Aurora use an advisory transaction lock. An old email, an old attempt, or an event that has already
-recovered naturally returns `409` and cannot overwrite the newer state. The decision uses the Event ID and action as its idempotency key
+The state keeps the Event ID of the currently active SPIKE. In the same state transaction the Store verifies that the
+node row still belongs to the requested `job/attempt`, that the signal is still `SPIKE`, and that the Event ID is still the
+active transition; SQLite uses a write transaction, PostgreSQL/Aurora use an advisory transaction lock. An old email, an old
+attempt (another attempt has taken over the node row), or an event that has already recovered naturally returns `409` and
+cannot overwrite the newer state; a state still in its old per-attempt row moves to the node row together with the decision. The decision uses the Event ID and action as its idempotency key
 and is saved as `ADMIN_ACTION` evidence.
 
 #### 2.20.3 Read-only forensics chain for HUNG_SUSPECTED
@@ -4352,7 +4374,9 @@ Aurora/PostgreSQL has no built-in TTL; all expiry is done at the application lay
   `GPU_FAULT_COMPLETION_RECORD_RETENTION_SECONDS`; a non-positive value disables that sweep; active deliveries are not cleaned by this TTL,
   and completion records still referenced by an incident wait for archiving;
 - regional registry member heartbeat rows are retained for 86400 seconds (`GPU_FAULT_REGISTRY_MEMBER_RETENTION_SECONDS`),
-  and Processor lanes for 1 hour (`GPU_FAULT_PROCESSOR_LANE_RETENTION_SECONDS`).
+  and Processor lanes for 1 hour (`GPU_FAULT_PROCESSOR_LANE_RETENTION_SECONDS`);
+- health-signal state rows (`health_signal_state`, `efa_traffic_state`) are deleted once their attempt has ended, their node
+  has been proven departed, or nothing has written them for a long time; see §3.2.1.
 
 raw evidence queries filter by `expires_at`; in addition, the control-plane replica holding the periodic-task lease
 calls `cleanup_expired_raw_evidence()` on the processor cleanup period to delete physically, without depending on
@@ -4398,6 +4422,68 @@ excluding the conditional PostgreSQL/regional/refresh-file families; see the mul
 
 Aurora backup retention and row-level retention are two different concepts: deleting from a live table does not immediately delete historical data
 in automated backups or manual snapshots.
+
+#### 3.2.1 Retention of health-signal state rows
+
+`health_signal_state` (sustained windows, notification latches) and `efa_traffic_state` used to be never deleted. The rows
+that accumulate:
+
+| Rows | Key | Growth |
+|---|---|---|
+| Low CPU/GPU attempt windows (batch 140/142) | `cluster/node/metric/gpu/rule/job_id/attempt_id` | up to 16 per node for every attempt that ever read low (8 GPUs × 2 rules) |
+| Training-health signals | `cluster/attempt/rank-N/training-<kind>` | up to 4 per rank per attempt (only with the training-health monitor on) |
+| EFA traffic state of the older release | `cluster/node/job/attempt` | 1 per attempt per node; now 1 per node (§2.20.1) |
+| Node- and device-level signals (including the low-utilisation continuity gate) | `cluster/node/metric/device[/rule]` | bounded per node, but nodes that left the cluster (spot replacements, re-images, node-group rolls) and replaced GPU UUIDs stay forever |
+
+`efa_traffic_admin_decision` (written only when an administrator acts on a SPIKE; audit) is not among them;
+`training_progress` and attempt observations belong to the hot-state cleanup.
+
+The control plane's `processor-cleanup` round (protected by its periodic task lease: one writer across the site at a time)
+gains one job, `health_signal_states` (`store/shared/signal_retention.py`, one set of rules shared by the three stores).
+A row is deleted only when all of the following hold:
+
+1. **Nothing wrote it within the grace period**: the row's clock (`clock_at`, the control-plane receive time, else
+   `observed_at`) is before `now - GPU_FAULT_HEALTH_SIGNAL_GRACE_SECONDS` (default 86400). An open window is written on
+   every sample and is never a candidate; neither is a row being claimed right now (see the lock protocol below).
+2. **Attempt-scoped rows** (a low-utilisation attempt window, recognised by the rule id three segments from the end; a
+   training-health key): the attempt has ended -- its observation is terminal, the attempt id now belongs to another job
+   (after a metadata takeover the old pair is never resolved again), or the cluster's watcher coverage heartbeat is fresh
+   while the attempt was not observed within the grace period. A live attempt's rows stay however old they are (its latch
+   still suppresses the next notification); with no watcher vouching for the cluster, silence proves nothing and only the
+   retention period (`GPU_FAULT_HEALTH_SIGNAL_RETENTION_SECONDS`, default 2592000) applies.
+3. **Any other row**: its node has been proven departed by the departed-node cleanup (a ledger line with a `reference`, and
+   the row is not newer than the line's last confirmation, so a node that rejoined under the same name keeps its rows), or
+   nothing wrote it within the retention period. The unscoped gate of a live node is written by every sample and always
+   stays.
+4. **A superseded per-attempt EFA row of the older release**: deleted after the grace period, so a rollback cannot resume
+   its stale zero-traffic clock.
+
+The scan is a keyset walk over the `(kind, key)` primary key: one page per statement of at most `limit`
+(`GPU_FAULT_PROCESSOR_CLEANUP_BATCH_SIZE`, default 1000) keys, at most 10 pages per call and kind, with the cursor kept on
+the store object so the next call continues where this one stopped and the walk wraps around at the end; at most `limit`
+rows per call and kind are deleted. A deletion is conditional on the row still being exactly what was judged: the
+in-memory store compares object identity, SQLite deletes by the original payload inside a `BEGIN IMMEDIATE` write
+transaction (claims run under the same process lock and write transaction), and PostgreSQL uses one statement that only
+*tries* each candidate's advisory lock (`pg_try_advisory_xact_lock`, the same lock text `claim_health_signal_transitions`,
+`mark_health_signal_notified` and `observe_efa_traffic` hold for their whole read-decide-write), requires the payload to
+equal the one read, and skips rows row-locked by anybody else (`SKIP LOCKED`). The sweep therefore never waits on any
+lock, and the ingest path waits on it for at most that one statement; a claim either finished first (the row changed: kept)
+or starts after the delete (no row: its own sample opens a fresh window) -- it can neither write a deleted state back nor
+lose a window it is writing (`tests/store/test_postgres_health_signal_retention.py`: a held advisory lock, a held row lock,
+a claim parked mid-decision on another connection, a claim after the delete).
+
+No schema change and no index: the page is a range scan of `gpu_fault_objects_pkey` (pinned by an EXPLAIN test). An
+expression index on the clock would allow "oldest first", but it adds an index write to every claim update and needs a new
+schema version, and a schema change cannot be rolled back; retention needs no order.
+
+Observability: whenever a kind removes rows, one INFO line
+`health-signal retention removed N <kind> rows (attempt_ended=…, node_departed=…, not_updated=…, superseded=…)` and the
+shared `cleanup <kind> deleted N rows; keys[:20]=…`; the removed rows are counted in
+`gpu_fault_periodic_cleanup_rows_total{periodic_job="health_signal_states"}`, errors and budget stops in
+`gpu_fault_periodic_cleanup_job_errors_total` / `gpu_fault_periodic_cleanup_budget_exhausted_total` with the same label (no
+new metric family). A non-positive `GPU_FAULT_HEALTH_SIGNAL_RETENTION_SECONDS` switches the whole sweep off; the grace period
+must be between 600 seconds and the retention period, or start-up refuses
+(`tests/store/test_health_signal_retention.py`, `tests/app_services/test_health_signal_retention_job.py`).
 
 ### 3.3 Schema Versioned Migration, Bootstrap and Consistency
 

@@ -9188,7 +9188,7 @@ is 200 records / 10 minutes; `gpu_fault_control_record_archive_archived_total` s
 cleanup job (event dedup links, group links, etc.) are archived and deleted only together with the incident -- **as long as the incident
 exists, they are kept**; inactive markers, terminal notifications, completion decisions and expired registry
 members are reclaimed by `processor-cleanup` according to their own `*_RETENTION_SECONDS`, and those referenced by an incident are likewise kept
-(see `docs/详细设计-v2.md` §2.3.1).
+(see `docs/详细设计-v2.md` §2.3.1); health-signal state rows: see §8.5.
 
 Do not run single-table `DELETE`s separately: the incident is also referenced by event dedup links,
 attempt/node group links, notification dedup links and predecessor workflows. Once dangling
@@ -9450,6 +9450,52 @@ To satisfy regulatory deletion requirements, besides the live database operation
 NDJSON, mailboxes/mail archives, logging systems and manual Aurora snapshots must also be handled according to the organisation's process.
 
 <a id="11-数据迁移"></a>
+### 8.5 Retention of Health-Signal State Rows
+
+`health_signal_state` (sustained windows and notification latches) and `efa_traffic_state` are reclaimed by the
+`health_signal_states` job of the `processor-cleanup` round, run by the Pod holding the `processor-cleanup` task lease; no
+manual action is needed. What is kept and what is deleted:
+
+| Rows | Deleted when | Kept while |
+|---|---|---|
+| Low CPU/GPU attempt windows `…/rule/job_id/attempt_id`, training-health signals `cluster/attempt/rank-N/training-<kind>` | the attempt has ended (terminal observation, the attempt id now belongs to another job, or the watcher coverage heartbeat is fresh while the attempt was not observed within the grace period) and nothing wrote the row within the grace period | the attempt is live (however old the row: its latch keeps suppressing a repeated notification); without a fresh watcher heartbeat for the cluster, until the retention period |
+| Node- and device-level signals `cluster/node/metric/device[/rule]` (including the low-utilisation continuity gate), the per-node EFA row `cluster/node` | the node has been proven departed by the departed-node cleanup (ledger line with a `reference`, the row not newer than the line's last confirmation) and nothing wrote the row within the grace period; or nothing wrote it within the retention period | the node is live: every sample writes these rows |
+| Per-attempt EFA rows of the older release `cluster/node/job/attempt` | nothing wrote them within the grace period (superseded by the per-node row; keeping one would let a rollback resume a stale zero-traffic clock) | still written within the grace period (during a rolling upgrade) |
+
+Parameters: `GPU_FAULT_HEALTH_SIGNAL_RETENTION_SECONDS` (default 2592000, i.e. 30 days; `0` switches it off) and
+`GPU_FAULT_HEALTH_SIGNAL_GRACE_SECONDS` (default 86400, i.e. 1 day; must be between 600 seconds and the retention period);
+the per-call deletion and scan bounds follow `GPU_FAULT_PROCESSOR_CLEANUP_BATCH_SIZE` (at most that many deletions per kind
+and call, at most 10 pages scanned). No schema change is needed: the scan pages over the primary key, and on PostgreSQL a
+deletion only *tries* the advisory lock a claim holds; a row being claimed or locked is skipped, the sweep never waits and
+never blocks the ingest path.
+
+Observing it:
+
+```bash
+# Log of a round that deleted rows: printed by the control-worker Pod holding the processor-cleanup task lease
+kubectl --kubeconfig "${CPU_KUBECONFIG}" -n gpu-fault-system logs \
+  -l app=gpu-fault-control-worker --since=1h --prefix | grep 'health-signal retention removed'
+```
+
+The cumulative removed rows are the Prometheus counter
+`gpu_fault_periodic_cleanup_rows_total{periodic_job="health_signal_states"}`.
+
+The log line reads like `health-signal retention removed 37 health_signal_state rows (attempt_ended=32, node_departed=5)`,
+followed by the shared `cleanup health_signal_state deleted 37 rows; keys[:20]=…`. Growth of
+`gpu_fault_periodic_cleanup_job_errors_total{periodic_job="health_signal_states"}` means the sweep failed; steady growth of
+`gpu_fault_periodic_cleanup_budget_exhausted_total{periodic_job="health_signal_states"}` means a backlog (for example the
+first cleanup of historical rows after an upgrade), and every round still makes progress. Remaining rows (read-only):
+
+```sql
+SELECT kind, count(*) FROM gpu_fault_objects
+WHERE kind IN ('health_signal_state', 'efa_traffic_state') GROUP BY kind;
+```
+
+Tuning: the retention period only affects rows nothing has written for a long time; shortening it never deletes a row that
+is still being updated. The grace period is both the minimum time a row stays after its attempt ended or its node left and
+how long "the watcher is there but no longer observes the attempt" must last before the attempt counts as ended; do not set
+it below a few hours.
+
 ## 9. Data Migration
 
 The migration command requires the target database to be empty and no writer during the migration window. First determine the deployment mode and record
@@ -10165,6 +10211,13 @@ export GPU_FAULT_EFA_TRAFFIC_STARTUP_GRACE_SECONDS=120
 `ZERO_HUNG_SECONDS` must be greater than or equal to `ZERO_WARNING_SECONDS`. For communication-sparse models,
 raise both durations according to the longest communication-free period of a normal step; do not lower them to a few seconds
 in pursuit of faster recovery.
+
+The traffic state is one row per node (`cluster/node`) and belongs to the attempt currently evaluated on that node; when
+another attempt takes the node it starts again at WARMUP and inherits neither the previous attempt's baseline nor its
+zero-traffic clock. On an upgrade a running attempt continues from the row the older release kept per attempt (which is
+then deleted) and does not re-enter WARMUP; after a rollback the older release does not find the migrated rows, every
+attempt starts at WARMUP, and zero-traffic detection waits for a valid sample and `STARTUP_GRACE_SECONDS` -- no false
+alarm.
 
 ### Per-Rank Liveness Decision Before Escalation (Independent of Application Instrumentation)
 
@@ -11442,6 +11495,8 @@ Parameter description:
 | `GPU_FAULT_HOT_STATE_TERMINAL_RETENTION_SECONDS` | `2592000` | Retention of the terminal attempt observation and training progress dedicated tables |
 | `GPU_FAULT_HOT_STATE_LATEST_RETENTION_SECONDS` | `2592000` | Retention of the GPU latest dedicated table for long-unupdated entries |
 | `GPU_FAULT_GPU_FINDING_HISTORY_RETENTION_SECONDS` | `2592000` | GPU finding history is kept 30 days by default; the periodic task deletes in batches |
+| `GPU_FAULT_HEALTH_SIGNAL_RETENTION_SECONDS` | `2592000` | Retention of health-signal state rows (`health_signal_state`, `efa_traffic_state`): node- and device-level rows, and attempt rows on a cluster no watcher vouches for, are deleted once nothing has written them for this long; `0` or a negative value switches the whole health-signal retention sweep off |
+| `GPU_FAULT_HEALTH_SIGNAL_GRACE_SECONDS` | `86400` | Grace period of the health-signal retention (between 600 seconds and the retention period, or start-up refuses): a row written within it is never deleted; rows of an ended attempt, of a proven departed node, and per-attempt EFA rows of the older release go only once it passed without a write |
 | `GPU_FAULT_DCGM_EXPORTER_MODE` | `auto` | `auto/existing/managed/disabled`, see A.2 |
 | `GPU_FAULT_DCGM_EDGE_FILTER_ENABLED` | `true` | The node side sends only the initial baseline, health summaries, fault candidate edges/recoveries and error counter deltas |
 | `GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS` | `300` | Full health summary period when normal and unchanged |

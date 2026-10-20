@@ -430,6 +430,14 @@ then stop the writers and use the transactional purge; the script refuses to del
 or with inconsistent evidence.
 Mail archives and Aurora snapshots need separate handling.
 
+### 8.5 Retention of Health-Signal State Rows
+
+`health_signal_state` and `efa_traffic_state` are reclaimed automatically by `processor-cleanup`; nothing to do by hand: a
+row written within the grace period (default 1 day) is not deleted; a row is deleted only once its attempt has ended, its
+node has been proven departed, or nothing has written it within the retention period (default 30 days); a live attempt's
+rows stay however old they are. Watch the `health-signal retention removed` log line and
+`gpu_fault_periodic_cleanup_rows_total{periodic_job="health_signal_states"}`.
+
 ## 9. Data Migration
 
 - **Purpose**: SQLite -> PostgreSQL or PostgreSQL -> PostgreSQL.

@@ -349,6 +349,14 @@ errors and budget exhaustion are counted respectively in `gpu_fault_periodic_cle
 `periodic_job_errors_total` and triggers `GpuFaultPeriodicServiceErrors`, and `job_last_run` is no longer
 refreshed by a failed round (F-1).
 
+Health-signal state rows (`health_signal_state` sustained windows and notification latches, `efa_traffic_state`) are
+reclaimed by the same round's `health_signal_states` job: a row written within the grace period
+(`GPU_FAULT_HEALTH_SIGNAL_GRACE_SECONDS`, default 86,400s) is never deleted; attempt-scoped rows go once their attempt has
+ended, while a live attempt's rows stay however old they are; any other row goes once the departed-node cleanup has proven
+its node departed, or once nothing has written it within the retention period (`GPU_FAULT_HEALTH_SIGNAL_RETENTION_SECONDS`,
+default 2,592,000s, 0 disables it). The scan is keyset paging over the primary key, and a PostgreSQL deletion only tries
+the advisory lock a claim holds and never waits (`detailed-design.md` §3.2.1).
+
 The regional registry's member heartbeat no longer writes on every 1s poll: it upserts only when the member row content changes or when more than
 `GPU_FAULT_REGISTRY_STALE_SECONDS / 3` (production 90s → 30s) has elapsed since the last write (F-5);
 `active_registry_member_ids` still judges liveness by the stale window, allowing two consecutive missed heartbeats.
