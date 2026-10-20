@@ -295,6 +295,15 @@ Any of the following escalates to `make check` and the full regional plan:
 The full regional plan is still only a plan. `GF-REGIONAL-DESTR-004` never enters the selection result; other
 destructive/live cases appear only in the approval section and are not executed by `test-impact`.
 
+Escalation widens the plan; it does not change the condition that a destructive/live case runs only when its own
+implementation is affected (see "Execution tiers"). In a regression round, `GF-REGIONAL-BOOT-020`/`GF-REGIONAL-BOOT-023`,
+which verify the release engine itself and hold the whole site for hours, are re-run only when, since the source of the
+release they last passed on, a change matches a rule that names them (today `release-rollout` and `runtime-foundation`),
+changes their own runners or helpers (`scripts/e2e/regional/*boot020*`, `*boot023*`), or leaves an implementation file
+(`src/**`, `deploy/**`) that only a fail-closed rule catches. A full plan forced only by shared contracts, the schema, more
+than three impact domains or other non-implementation files is not by itself a reason; the round records both as not
+selected by the change scope, naming the pass it relies on.
+
 ## Rule maintenance
 
 Each rule contains:
