@@ -412,6 +412,9 @@ def test_a_roll_short_of_capacity_fails_with_the_rerun_exit(
     ]["apply"]
     assert "replacement" not in result["stages"], "nothing waits after a failed roll"
     assert result["state_after_roll"]["nodegroup"]["status"] == "ACTIVE"
+    assert result["node_renames"] == [] and result["profile_updates"] == [], (
+        "a stopped roll names no rename: the group is part old, part new"
+    )
     assert len(result["exits"]) == 1 and "--apply" in result["exits"][0]
 
 

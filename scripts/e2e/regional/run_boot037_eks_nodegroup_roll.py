@@ -620,13 +620,17 @@ def roll(
         since=started,
         nodes=[str(node["name"]) for node in [*departed, *nodes]],
     )
-    renames = verdicts.node_renames(departed, nodes)
+    # Renames only for a complete replacement: after a stopped roll the group
+    # is part old, part new until the same apply is rerun (state_after_roll).
+    replaced = not stages["apply"] and not stages.get("replacement")
+    renames = verdicts.node_renames(departed, nodes) if replaced else []
     result["replacement_nodes"] = [
-        {key: node[key] for key in ("name", "instance_id")} for node in nodes
+        {key: node[key] for key in ("name", "instance_id")}
+        for node in (nodes if replaced else [])
     ]
     result["node_renames"] = renames
-    result["profile_updates"] = verdicts.profile_updates(
-        case.profile_arguments(), renames
+    result["profile_updates"] = (
+        verdicts.profile_updates(case.profile_arguments(), renames) if renames else []
     )
     identity = dict(fixture.evidence_identity())
     stages["identity"] = (

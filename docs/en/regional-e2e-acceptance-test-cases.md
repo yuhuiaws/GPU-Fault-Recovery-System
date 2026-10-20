@@ -3992,7 +3992,8 @@ the CLI output with credential lines removed), `tool-refusal-<name>.*` per refus
   schedulable and untainted; the release did not change. Anything else is FAIL.
 - The result names `departed_nodes`, `replacement_nodes`, `node_renames` (departed and replacement nodes paired in name
   order) and `profile_updates` (the site profile arguments naming a departed node and the replacement name they should
-  carry).
+  carry); the last three only for a complete replacement: after a stopped roll the group holds old and new nodes and
+  `state_after_roll` records the group and its Nodes as they were.
 - Local regression: `tests/regional/test_boot037_eks_nodegroup_roll.py` (the tool's apply really rolls the group in the
   recorded world), `tests/regional/test_eks_nodegroup_verdicts.py`, `tests/admin/test_admin_eks_nodegroup_prepare.py`.
 
