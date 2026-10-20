@@ -15,7 +15,7 @@ from gpu_fault.models import EfaTrafficAdminAction, EfaTrafficSignal, EfaTraffic
 from gpu_fault.store.shared.errors import EfaTrafficAdminConflict
 
 NOW = datetime(2026, 9, 12, 12, tzinfo=timezone.utc)
-KEY = "cluster-a/node-a/job-a/attempt-a"
+KEY = "cluster-a/node-a"
 
 
 def sample(
@@ -65,9 +65,7 @@ def test_traffic_baseline_requires_active_sample_and_ignores_warmup_for_alerting
     assert normal.signal is EfaTrafficSignal.NORMAL and emit_normal is False, normal
     assert normal.baseline_bytes_per_second == 1050, normal
     assert normal.first_observed_at == NOW, normal
-    assert efa_traffic_state_key("cluster-a", "node-a", "job-a", "attempt-a") == KEY, (
-        normal
-    )
+    assert efa_traffic_state_key("cluster-a", "node-a") == KEY, normal
 
 
 @pytest.mark.parametrize("had_active", [False, True])

@@ -1942,14 +1942,11 @@ class ProductionWorkflowExecutor:
             return {}
         result = {}
         for node_id in node_ids:
-            key = self.store.efa_traffic_state_key(
-                incident.cluster_id,
-                node_id,
-                incident.job_id,
-                incident.attempt_id,
-            )
+            key = self.store.efa_traffic_state_key(incident.cluster_id, node_id)
             try:
-                state = self.store.get_efa_traffic_state(key)
+                state = self.store.get_efa_traffic_state(
+                    key, job_id=incident.job_id, attempt_id=incident.attempt_id
+                )
             except NotFoundError:
                 continue
             if state.zero_since is not None:

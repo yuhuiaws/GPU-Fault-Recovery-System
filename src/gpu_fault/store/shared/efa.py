@@ -3,6 +3,7 @@ key/value templates that persist their result."""
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from datetime import datetime
 from typing import Callable
 
@@ -11,6 +12,10 @@ from gpu_fault.efa_traffic_state import (
 )
 from gpu_fault.efa_traffic_state import (
     efa_traffic_admin_decision_id as _efa_decision_id,
+)
+from gpu_fault.efa_traffic_state import (
+    efa_state_belongs_to,
+    legacy_efa_traffic_state_key,
 )
 from gpu_fault.efa_traffic_state import (
     efa_traffic_state_key as _efa_state_key,
@@ -23,8 +28,9 @@ from gpu_fault.models import (
     EfaTrafficAdminDecision,
     EfaTrafficState,
 )
-from gpu_fault.store.shared.errors import NotFoundError
+from gpu_fault.store.shared.errors import EfaTrafficAdminConflict, NotFoundError
 from gpu_fault.store.shared.primitives import (
+    DeleteRecord,
     GetOptionalRecord,
     PutRecord,
     StatementGuard,
@@ -40,17 +46,21 @@ class SharedEfaTrafficRulesMixin:
     _apply_efa_traffic_admin_action = staticmethod(_apply_efa_action)
 
     @staticmethod
-    def efa_traffic_state_key(
-        cluster_id: str,
-        node_id: str,
-        job_id: str,
-        attempt_id: str,
-    ) -> str:
-        return str(_efa_state_key(cluster_id, node_id, job_id, attempt_id))
+    def efa_traffic_state_key(cluster_id: str, node_id: str) -> str:
+        return str(_efa_state_key(cluster_id, node_id))
 
 
 class SharedEfaTrafficMixin:
-    """The rules applied to one persisted row; the key/value stores."""
+    """The rules applied to one persisted row; the key/value stores.
+
+    One row per node (``cluster/node``) holds the state of the attempt that
+    owns it. A release before batch 145 kept a row per attempt
+    (``cluster/node/job/attempt``); an attempt the node row does not carry yet
+    continues from that row, read and deleted under its own lock -- a writer
+    of the older release still runs it during a rolling upgrade -- so an
+    upgrade neither restarts a running attempt at WARMUP nor leaves the row
+    behind for a rollback to resume from.
+    """
 
     # Attributes supplied by the composed concrete implementation.
     _apply_efa_traffic_admin_action: Callable[
@@ -59,6 +69,7 @@ class SharedEfaTrafficMixin:
     _efa_traffic_admin_decision_id: Callable[[str, EfaTrafficAdminAction], str]
     _next_efa_traffic_state: Callable[..., tuple[EfaTrafficState, bool]]
 
+    _delete: DeleteRecord
     _get_optional: GetOptionalRecord
     _put: PutRecord
     _state_transaction: StateTransaction
@@ -66,16 +77,62 @@ class SharedEfaTrafficMixin:
 
     def observe_efa_traffic(self, **parameters):
         state_key = parameters["state_key"]
+        owner = (parameters["job_id"], parameters["attempt_id"])
         with self._state_transaction(f"efa_traffic_state/{state_key}"):
             previous = self._get_optional("efa_traffic_state", state_key)
-            state, emit = self._next_efa_traffic_state(previous, **parameters)
-            if state is not previous:
-                self._put("efa_traffic_state", state_key, state)
-            return state, emit
+            # Not the row's attempt, and newer than the row's last sample (an
+            # older one is dropped as a replay, whichever attempt it names):
+            # the attempt may still have the row of the release before.
+            legacy_key = (
+                legacy_efa_traffic_state_key(state_key, *owner)
+                if previous is None
+                or (
+                    not efa_state_belongs_to(previous, *owner)
+                    and parameters["observed_at"] > previous.observed_at
+                )
+                else None
+            )
+            with (
+                nullcontext()
+                if legacy_key is None
+                else self._state_transaction(f"efa_traffic_state/{legacy_key}")
+            ):
+                legacy = (
+                    None
+                    if legacy_key is None
+                    else self._get_optional("efa_traffic_state", legacy_key)
+                )
+                if legacy is not None:
+                    previous = legacy
+                state, emit = self._next_efa_traffic_state(previous, **parameters)
+                if state is not previous:
+                    self._put("efa_traffic_state", state_key, state)
+                    if legacy_key is not None and legacy is not None:
+                        self._delete("efa_traffic_state", legacy_key)
+                return state, emit
 
-    def get_efa_traffic_state(self, state_key: str) -> EfaTrafficState:
+    def get_efa_traffic_state(
+        self,
+        state_key: str,
+        *,
+        job_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> EfaTrafficState:
+        """The node's row; with ``job_id``/``attempt_id``, only that attempt's.
+
+        A node row another attempt took over is not the named attempt's state
+        (``NotFoundError``); before the attempt's first sample under this
+        release its state may still sit in its per-attempt row.
+        """
+
         with self._statement_guard():
             state = self._get_optional("efa_traffic_state", state_key)
+            if job_id is not None and attempt_id is not None:
+                if state is None or not efa_state_belongs_to(state, job_id, attempt_id):
+                    state = self._get_optional(
+                        "efa_traffic_state",
+                        legacy_efa_traffic_state_key(state_key, job_id, attempt_id),
+                    )
             if state is None:
                 raise NotFoundError(state_key)
             return state
@@ -89,13 +146,47 @@ class SharedEfaTrafficMixin:
         operator: str,
         reason: str,
         decided_at: datetime,
+        job_id: str | None = None,
+        attempt_id: str | None = None,
     ) -> EfaTrafficAdminDecision:
+        """Apply an administrator's SPIKE decision to the named attempt's state.
+
+        With ``job_id``/``attempt_id`` the state must be that attempt's: a node
+        row another attempt took over is a conflict (the spike's attempt is
+        gone), and a state still in its per-attempt row moves to the node row
+        with the decision.
+        """
+
         decision_id = self._efa_traffic_admin_decision_id(event_id, action)
-        with self._state_transaction(f"efa_traffic_state/{state_key}"):
+        legacy_key = (
+            legacy_efa_traffic_state_key(state_key, job_id, attempt_id)
+            if job_id is not None and attempt_id is not None
+            else None
+        )
+        with (
+            self._state_transaction(f"efa_traffic_state/{state_key}"),
+            nullcontext()
+            if legacy_key is None
+            else self._state_transaction(f"efa_traffic_state/{legacy_key}"),
+        ):
             existing = self._get_optional("efa_traffic_admin_decision", decision_id)
             if existing is not None:
                 return existing
             state = self._get_optional("efa_traffic_state", state_key)
+            if legacy_key is not None and (
+                state is None or not efa_state_belongs_to(state, job_id, attempt_id)
+            ):
+                legacy = self._get_optional("efa_traffic_state", legacy_key)
+                if legacy is None and state is not None:
+                    raise EfaTrafficAdminConflict(
+                        "the node's EFA traffic state now belongs to attempt "
+                        f"{state.job_id}/{state.attempt_id}"
+                    )
+                state = (
+                    None
+                    if legacy is None
+                    else legacy.model_copy(update={"state_key": state_key})
+                )
             if state is None:
                 raise NotFoundError(state_key)
             updated, decision = self._apply_efa_traffic_admin_action(
@@ -106,6 +197,8 @@ class SharedEfaTrafficMixin:
                 reason=reason,
                 decided_at=decided_at,
             )
+            if legacy_key is not None:
+                self._delete("efa_traffic_state", legacy_key)
             self._put("efa_traffic_state", state_key, updated)
             self._put(
                 "efa_traffic_admin_decision",

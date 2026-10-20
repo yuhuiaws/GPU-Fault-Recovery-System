@@ -1050,15 +1050,16 @@ class CompletionStore(Protocol):
         self, cluster_id: str
     ) -> WorkloadCoverageHeartbeat | None: ...
 
-    def get_efa_traffic_state(self, state_key: str) -> EfaTrafficState: ...
+    def get_efa_traffic_state(
+        self,
+        state_key: str,
+        *,
+        job_id: str | None = None,
+        attempt_id: str | None = None,
+    ) -> EfaTrafficState: ...
 
     @staticmethod
-    def efa_traffic_state_key(
-        cluster_id: str,
-        node_id: str,
-        job_id: str,
-        attempt_id: str,
-    ) -> str: ...
+    def efa_traffic_state_key(cluster_id: str, node_id: str) -> str: ...
 
 
 @runtime_checkable

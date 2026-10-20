@@ -162,7 +162,7 @@ def test_xid_metric_clear_rearms_a_transition_without_replaying_stale_data(
 
 def traffic(store, *, seconds=0, bps=1000):
     return store.observe_efa_traffic(
-        state_key="cluster/node/job/attempt",
+        state_key="cluster/node",
         cluster_id="cluster",
         node_id="node",
         job_id="job",
@@ -193,7 +193,7 @@ def test_efa_admin_decision_is_persisted_and_replay_keeps_the_original_actor(
 ):
     store = compat_store
     with pytest.raises(NotFoundError):
-        store.get_efa_traffic_state("cluster/node/job/attempt")
+        store.get_efa_traffic_state("cluster/node")
     traffic(store)
     state, emitted = traffic(store, seconds=40, bps=3000)
     assert emitted is True

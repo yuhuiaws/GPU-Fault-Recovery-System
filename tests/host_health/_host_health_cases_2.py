@@ -392,7 +392,7 @@ def test_admin_can_acknowledge_transient_efa_spike(monkeypatch) -> None:
         assert first.json()["resulting_baseline_bytes_per_second"] == 1_000
 
     asyncio.run(scenario())
-    state = context.store.get_efa_traffic_state("cluster-a/node-a/job-a/attempt-a")
+    state = context.store.get_efa_traffic_state("cluster-a/node-a")
     assert state.signal.value == "SPIKE"
     assert state.spike_acknowledged_by == "admin@example.com"
     assert state.spike_acknowledgement_reason == "Expected checkpoint traffic burst"
@@ -477,7 +477,7 @@ def test_admin_can_accept_new_efa_baseline_and_stale_event_is_rejected(
         assert "active SPIKE transition" in stale.json()["detail"]
 
     asyncio.run(scenario())
-    state = context.store.get_efa_traffic_state("cluster-a/node-a/job-a/attempt-a")
+    state = context.store.get_efa_traffic_state("cluster-a/node-a")
     assert state.signal.value == "SPIKE"
     assert state.baseline_bytes_per_second == 3_060
     assert state.active_spike_event_id == "efa-rebase-second-spike-efa-traffic-spike"
@@ -497,7 +497,7 @@ def test_efa_rebaseline_is_durable_and_idempotent_in_sqlite(
         efa_telemetry("sqlite-efa-spike", 3_000, NOW + timedelta(seconds=15))
     )[0]
     decision = first.apply_efa_traffic_admin_action(
-        state_key="cluster-a/node-a/job-a/attempt-a",
+        state_key="cluster-a/node-a",
         event_id=finding.event_id,
         action=EfaTrafficAdminAction.ACCEPT_NEW_BASELINE,
         operator="admin@example.com",
@@ -508,9 +508,9 @@ def test_efa_rebaseline_is_durable_and_idempotent_in_sqlite(
 
     second = SqliteStore(str(path))
     try:
-        state = second.get_efa_traffic_state("cluster-a/node-a/job-a/attempt-a")
+        state = second.get_efa_traffic_state("cluster-a/node-a")
         duplicate = second.apply_efa_traffic_admin_action(
-            state_key="cluster-a/node-a/job-a/attempt-a",
+            state_key="cluster-a/node-a",
             event_id=finding.event_id,
             action=EfaTrafficAdminAction.ACCEPT_NEW_BASELINE,
             operator="admin@example.com",

@@ -1149,12 +1149,7 @@ class NodeHealthPolicy:
             ],
             default=None,
         )
-        state_key = self.store.efa_traffic_state_key(
-            batch.cluster_id,
-            batch.node_id,
-            observation.job_id,
-            observation.attempt_id,
-        )
+        state_key = self.store.efa_traffic_state_key(batch.cluster_id, batch.node_id)
         state, emit = self.store.observe_efa_traffic(
             state_key=state_key,
             cluster_id=batch.cluster_id,

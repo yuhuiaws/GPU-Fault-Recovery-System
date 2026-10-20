@@ -297,14 +297,11 @@ def main() -> int:
         )
         validate_hung_workflow(hung_workflow)
         report["hung_workflow"] = hung_workflow
-        state_key = store.efa_traffic_state_key(
-            CLUSTER_ID,
-            NODE_ID,
-            JOB_ID,
-            ATTEMPT_ID,
-        )
+        state_key = store.efa_traffic_state_key(CLUSTER_ID, NODE_ID)
         report["efa_traffic_state"] = [
-            store.get_efa_traffic_state(state_key).model_dump(mode="json")
+            store.get_efa_traffic_state(
+                state_key, job_id=JOB_ID, attempt_id=ATTEMPT_ID
+            ).model_dump(mode="json")
         ]
         report["verdict"] = "PASS"
         report["status"] = "PASSED"

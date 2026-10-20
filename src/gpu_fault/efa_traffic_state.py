@@ -166,8 +166,19 @@ def next_efa_traffic_state(
     progress_observed_at: datetime | None = None,
     progress_suppression_max_seconds: float | None = None,
 ) -> tuple[EfaTrafficState, bool]:
+    """Advance the node's state by one sample of ``job_id``/``attempt_id``.
+
+    The row is the node's and the state is the attempt's: a sample not newer
+    than the row's last one is a replay or arrived out of order and changes
+    nothing, whichever attempt it names; a newer sample of another attempt
+    starts that attempt at WARMUP and never inherits the previous attempt's
+    baseline, zero streak or spike acknowledgement.
+    """
+
     if previous is not None and observed_at <= previous.observed_at:
         return previous, False
+    if previous is not None and not efa_state_belongs_to(previous, job_id, attempt_id):
+        previous = None
     working = _EfaWorkingState.from_previous(previous, observed_at)
     if bytes_per_second <= zero_bps:
         signal = _zero_traffic_signal(
@@ -235,13 +246,35 @@ def next_efa_traffic_state(
     return state, emit
 
 
-def efa_traffic_state_key(
-    cluster_id: str,
-    node_id: str,
-    job_id: str,
-    attempt_id: str,
-) -> str:
-    return "/".join([cluster_id, node_id, job_id, attempt_id])
+def efa_traffic_state_key(cluster_id: str, node_id: str) -> str:
+    """The node's one EFA traffic row: ``cluster/node``.
+
+    ``efa_traffic_bytes_per_second`` is a node-wide aggregate and the rule runs
+    only while exactly one managed attempt resolves on the node, so one row per
+    node carries the state of the attempt that owns it (``job_id`` and
+    ``attempt_id`` in the payload). It used to be one row per attempt, never
+    removed (batch 145).
+    """
+
+    return "/".join([cluster_id, node_id])
+
+
+def legacy_efa_traffic_state_key(node_key: str, job_id: str, attempt_id: str) -> str:
+    """Where a release before batch 145 kept one attempt's state on a node.
+
+    ``cluster/node/job/attempt``: read once, under its own lock, as the state an
+    attempt carries over an upgrade, then deleted (``SharedEfaTrafficMixin``).
+    """
+
+    return "/".join([node_key, job_id, attempt_id])
+
+
+def efa_state_belongs_to(
+    state: EfaTrafficState, job_id: str | None, attempt_id: str | None
+) -> bool:
+    """Whether ``state`` is the named attempt's (an unnamed one owns nothing)."""
+
+    return state.job_id == job_id and state.attempt_id == attempt_id
 
 
 def efa_traffic_admin_decision_id(event_id: str, action: EfaTrafficAdminAction) -> str:

@@ -559,14 +559,12 @@ async def apply_efa_traffic_admin_action(
             raise EfaTrafficAdminConflict(
                 "event_id is not the requested node's EFA traffic event"
             )
-        state_key = ctx.store.efa_traffic_state_key(
-            request.cluster_id,
-            request.node_id,
-            request.job_id,
-            request.attempt_id,
-        )
         decision = ctx.store.apply_efa_traffic_admin_action(
-            state_key=state_key,
+            state_key=ctx.store.efa_traffic_state_key(
+                request.cluster_id, request.node_id
+            ),
+            job_id=request.job_id,
+            attempt_id=request.attempt_id,
             event_id=request.event_id,
             action=request.action,
             operator=request.operator,
