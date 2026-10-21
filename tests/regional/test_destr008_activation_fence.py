@@ -20,9 +20,11 @@ from scripts.e2e.regional.destr008_admission import (
     FenceBinding,
     require_admission_api,
 )
+from scripts.e2e.regional.destr008_watchdog_control import MAX_RECEIPT_AGE
+from scripts.e2e.regional.probes import destr008_cancellation_protocol as wire
 from scripts.e2e.regional.regional_live_fixture import RegionalFixtureError
 from tests.regional._destr008_admission import build_harness
-from tests.regional._destr008_control import build_control
+from tests.regional._destr008_control import ControlHarness, build_control
 
 
 def test_activation_fence_has_independent_durable_ownership_and_ordered_cleanup(
@@ -710,6 +712,74 @@ def test_stale_full_receipt_needs_new_real_cleanup_observation_before_fence_clos
     saved = json.loads(fence.path.read_text())["retirement_receipt"]
     assert saved == fresh.model_dump(mode="json") and saved["case_failed"] is True
     assert not harness.objects, "fresh quiescence must retire both fence resources"
+
+
+def cleanup_completion(watchdog: ControlHarness) -> wire.Receipt:
+    """The terminal receipt of a cleanup observer that replaced a refused proof."""
+
+    watchdog.cleanup(attempt_id="cleanup-after-refusal", seconds=180)
+    assert watchdog.tick().state == "REVOKED", "the cleanup window opens first"
+    watchdog.clock.advance(wire.QUIET_SECONDS)
+    completed = watchdog.tick()
+    assert completed.state == "QUIESCENT" and completed.cleanup is not None, completed
+    return completed
+
+
+def test_certified_cleanup_completion_closes_the_fence_until_its_window_ends(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness = build_harness(tmp_path, monkeypatch)
+    fence = harness.fence()
+    fence.arm()
+    watchdog = harness.watchdog(fence)
+    fence.protect_action(watchdog.control)
+    watchdog.submit()
+    original = watchdog.finish()
+    watchdog.clock.advance(MAX_RECEIPT_AGE + 1)
+    with pytest.raises(RegionalFixtureError, match="cleanup observer completion"):
+        harness.fence().close(watchdog.control, cleanup=original)
+    completed = cleanup_completion(watchdog)
+    assert completed.cleanup is not None, completed
+    watchdog.clock.advance(completed.cleanup.deadline_at - 1 - watchdog.clock())
+    with pytest.raises(RegionalFixtureError, match="fresh complete"):
+        harness.fence().close(watchdog.control)
+    assert len(harness.objects) == 2, "both refusals must keep the fence"
+    harness.fence().close(watchdog.control, cleanup=completed)
+    saved = json.loads(fence.path.read_text())
+    assert saved["phase"] == "CLOSED", saved
+    assert saved["retirement_receipt"] == completed.model_dump(mode="json"), saved
+    assert not harness.objects, "the certified cleanup completion retires the fence"
+
+
+@pytest.mark.parametrize("change", ["unfinished", "rewritten", "window-ended"])
+def test_cleanup_completion_must_be_terminal_unchanged_and_inside_its_window(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, change: str
+) -> None:
+    harness = build_harness(tmp_path, monkeypatch)
+    fence = harness.fence()
+    fence.arm()
+    watchdog = harness.watchdog(fence)
+    fence.protect_action(watchdog.control)
+    watchdog.submit()
+    watchdog.finish()
+    if change == "unfinished":
+        watchdog.cleanup(attempt_id="cleanup-after-refusal", seconds=180)
+        claimed = watchdog.tick()
+        assert claimed.monitoring, "the cleanup observer has not completed"
+    else:
+        claimed = cleanup_completion(watchdog)
+        assert claimed.cleanup is not None, claimed
+        if change == "rewritten":
+            watchdog.clock.advance(1)
+            assert watchdog.tick() != claimed, "the certified receipt was replaced"
+        else:
+            watchdog.clock.advance(claimed.cleanup.deadline_at - watchdog.clock())
+    with pytest.raises(RegionalFixtureError, match="cleanup observer completion"):
+        harness.fence().close(watchdog.control, cleanup=claimed)
+    assert len(harness.objects) == 2, "an unproven completion must keep the fence"
+    assert not any(
+        row[0] == "kube" and row[1][0] == "delete" for row in harness.calls
+    ), "no cleanup mutation may precede a proven completion"
 
 
 def test_actual_leased_command_prevents_fence_cleanup(

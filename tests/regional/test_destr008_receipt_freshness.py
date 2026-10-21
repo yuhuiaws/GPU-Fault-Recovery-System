@@ -7,7 +7,8 @@ acceptance host's disk (1.6-5.8 s per call; ~1.2 s normally). The bound itself
 (``MAX_RECEIPT_AGE``) is unchanged: these tests charge every kubectl call a fixed
 latency and require that a fresh receipt is still certified, by the watchdog and
 again by the fence close, while a receipt that really aged past the bound is
-still refused.
+still refused. What either refusal leads to -- a cleanup observer, on whose
+certified completion the fence closes -- is in ``test_destr008_fence_refusal.py``.
 """
 
 from __future__ import annotations
@@ -228,20 +229,6 @@ def test_slow_kubectl_close_certifies_twice_and_retires_the_fence(
     assert h.gpu.objects == {} and h.cpu.journal()["closed"] is True, (
         "a fresh receipt must still retire the fence and the watchdog"
     )
-
-
-def test_fence_close_still_refuses_a_receipt_that_aged_after_the_wait(
-    h: CausalHarness, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    post(h)
-    ages = certifications(monkeypatch, h.cpu.clock.now)
-    slow_kubectl(monkeypatch, h.cpu.regional, h.cpu.clock, 5.5)
-    report = h.safety.finish()
-    assert len(ages) == 1 and ages[0] <= MAX_RECEIPT_AGE, ages
-    assert report["quiescent"] is False and report["retired"] is False, report
-    assert report["errors"] == ["quiescence: RegionalFixtureError: " + STALE], report
-    assert h.gpu.objects, "the fence must stay until a fresh receipt closes it"
-    assert h.cpu.journal()["closed"] is False, "the watchdog must not be retired"
 
 
 def test_original_completion_failure_keeps_only_the_class_of_foreign_errors(

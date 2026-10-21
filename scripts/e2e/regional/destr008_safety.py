@@ -192,10 +192,40 @@ class ShortageSafety:
             )
         return self.finish(cleanup_only=True)
 
+    def _original_completion(
+        self,
+        control: CancellationControl,
+        watchdog: CancellationWatchdog,
+        errors: list[str],
+    ) -> Receipt | None:
+        """The original observer's receipt, once the watchdog and the fence took it.
+
+        The watchdog certifies the terminal receipt and the fence close
+        certifies it again on its own a few reads later. If either step fails,
+        its reason is recorded and ``None`` returned, and ``finish`` replaces the
+        proof with a cleanup observer's -- after a fence refusal too, which used
+        to keep the fence and defer every cleanup until an operator acted.
+        """
+        try:
+            if control.read().control.producer.state != "SUBMITTING":
+                control.request_close()
+            receipt = watchdog.wait_quiescence()
+        except Exception as exc:
+            errors.append(failure("original watchdog completion", exc))
+            return None
+        try:
+            self.fence.close(control)
+        except Exception as exc:
+            errors.append(failure("original fence close", exc))
+            return None
+        return receipt
+
     def finish(self, *, cleanup_only: bool = False) -> dict[str, Any]:
         self.quiescent = False
         result: dict[str, Any] = {"quiescent": False, "retired": False, "errors": []}
         receipt: Receipt | None = None
+        # The step an exception below is reported under (``failure``).
+        stage = "quiescence"
         try:
             fence_closed = False
             if self.watchdog is not None:
@@ -214,20 +244,18 @@ class ShortageSafety:
                     self.watchdog.cleanup()
                     self.fence.close()
                 else:
+                    stage = "cleanup observer"
                     receipt = self.watchdog.resume_cleanup(seconds=180)
                     self.control = self.watchdog.control_client()
-                    self.fence.close(self.control)
+                    self.fence.close(self.control, cleanup=receipt)
             elif self.control is not None and self.watchdog is not None:
-                try:
-                    if self.control.read().control.producer.state != "SUBMITTING":
-                        self.control.request_close()
-                    receipt = self.watchdog.wait_quiescence()
-                except Exception as exc:
-                    result["errors"].append(
-                        failure("original watchdog completion", exc)
-                    )
+                receipt = self._original_completion(
+                    self.control, self.watchdog, result["errors"]
+                )
+                if receipt is None:
+                    stage = "cleanup observer"
                     receipt = self.watchdog.resume_cleanup(seconds=180)
-                self.fence.close(self.control)
+                    self.fence.close(self.control, cleanup=receipt)
             else:
                 if self.control is not None:
                     raise RegionalFixtureError(
@@ -250,7 +278,7 @@ class ShortageSafety:
                         "independent cancellation deadline elapsed before normal closure"
                     )
         except Exception as exc:
-            result["errors"].append(failure("quiescence", exc))
+            result["errors"].append(failure(stage, exc))
         if self.quiescent and self.watchdog is not None:
             try:
                 self.watchdog.cleanup()

@@ -474,6 +474,41 @@ class CancellationControl:
                 "fresh complete watchdog quiescence is unavailable"
             ) from None
 
+    def cleanup_completion(self, completed: Receipt, *, timeout: float = 30) -> Receipt:
+        """``completed``, re-read unchanged before its cleanup deadline.
+
+        After a refusal has already failed the case, ``ShortageSafety.finish``
+        starts a fresh cleanup observer, the watchdog certifies its terminal
+        receipt (``MAX_RECEIPT_AGE``; Job and Pod completed, supporting resources
+        verified) and the fence closes on it through this read. The receipt is
+        written once, so the fence's re-read three round trips later is only
+        older: at ~5.5 s per kubectl call it is past ``MAX_RECEIPT_AGE`` even when
+        the watchdog's certification was not, and the fence stayed until an
+        operator acted. This read is bound instead by the cleanup attempt's own
+        deadline, where the observer itself stops proving anything. Any other or
+        changed receipt, or one not terminal, is refused.
+        """
+        try:
+            snapshot = self.read(timeout=timeout)
+            current = snapshot.receipt
+            if (
+                current is None
+                or current != completed
+                or current.state != "QUIESCENT"
+                or current.monitoring
+                or current.cleanup is None
+                or not current.case_failed
+                or snapshot.control.revocation is None
+                or current.producer != snapshot.control.producer
+                or self._now() >= current.cleanup.deadline_at
+            ):
+                raise ValueError("cleanup completion not proven")
+            return current
+        except Exception:
+            raise RegionalFixtureError(
+                "certified cleanup observer completion is unavailable"
+            ) from None
+
     def wait_quiescence(
         self, *, seconds: int = 180, sleep: Callable[[float], None] = time.sleep
     ) -> Receipt:

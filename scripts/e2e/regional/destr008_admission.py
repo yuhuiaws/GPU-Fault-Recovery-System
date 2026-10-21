@@ -20,6 +20,7 @@ from scripts.e2e.regional.probes.destr008_admission_probe import (
     DENIAL_PREFIX,
     validate_identity,
 )
+from scripts.e2e.regional.probes.destr008_cancellation_protocol import Receipt
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalFixtureError,
     RegionalLiveFixture,
@@ -540,11 +541,27 @@ class ActivationFence:
         self.record["action_started"] = True
         self.save()
 
-    def close(self, control: CancellationControl | None = None) -> None:
-        with self.operation():
-            self._close(control)
+    def close(
+        self,
+        control: CancellationControl | None = None,
+        *,
+        cleanup: Receipt | None = None,
+    ) -> None:
+        """Remove the fence on a fresh quiescence, or on ``cleanup``.
 
-    def _close(self, control: CancellationControl | None = None) -> None:
+        ``cleanup`` is the certified terminal receipt of the cleanup observer
+        that replaced a refused completion (the case has already failed);
+        ``CancellationControl.cleanup_completion`` re-reads it unchanged.
+        """
+        with self.operation():
+            self._close(control, cleanup=cleanup)
+
+    def _close(
+        self,
+        control: CancellationControl | None = None,
+        *,
+        cleanup: Receipt | None = None,
+    ) -> None:
         if self.record["phase"] == "CLOSED":
             if any(self.read(kind) is not None for kind in RESOURCES):
                 raise RegionalFixtureError(
@@ -553,7 +570,12 @@ class ActivationFence:
             return
         receipt = None
         if self.record["action_started"] or self.record.get("watchdog") is not None:
-            receipt = self.require_watchdog(control).quiescence()
+            bound = self.require_watchdog(control)
+            receipt = (
+                bound.quiescence()
+                if cleanup is None
+                else bound.cleanup_completion(cleanup)
+            )
             if (
                 receipt.run_id != self.binding.run_id
                 or receipt.fence.model_dump(mode="json") != self.identity()
