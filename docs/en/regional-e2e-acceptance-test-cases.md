@@ -15993,8 +15993,9 @@ constitute an atomic mutual exclusion against external writers.
    ```
    (The PCI address is the GPU BDF of the killed Pod: the GPU UUIDs come from the RUNNING
    observation before the kill, the one in which the watcher read them; a terminated
-   container keeps that reading, and is empty when the watcher never read it; if missing,
-   the node's first GPU.)
+   container keeps that reading (also across a watcher restart before the terminal: the
+   persisted record lives until the terminal), and is empty when the watcher never read
+   it; if missing, the node's first GPU.)
 5. **Active-side verdict**: `wait_for_workflow` cannot be used (it waits for a workflow
    and would spin until timeout); use `wait_for_decision` instead, polling until the
    policy has recorded a decision (the marker-scoped `observed_after` is widened by the

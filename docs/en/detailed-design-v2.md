@@ -602,10 +602,27 @@ A few points that must be remembered:
   active record (which already stores each Pod's `gpu_uuids`), so a rank that died while the watcher was down keeps its GPUs too,
   and so does a running container whose exec fails after the restart. A container never read with UUIDs (exited the first time it
   was seen, or its exec failed for as long as it ran) keeps none and its allocation stays INCOMPLETE -- nothing is guessed -- and a
-  replacement Pod has a new UID and is read from its own Pod. Limit: a FAILED reading is not an active one, so publishing it deletes
-  the persisted record; a watcher that restarts after that and before the terminal re-reads the exited rank from its Pod and cannot
-  know its GPUs (it reports INCOMPLETE). The containment incident still follows the first process's failure event (delivered, or
-  replayed from the outbox, where the first record written for a key is kept).
+  replacement Pod has a new UID and is read from its own Pod. A FAILED reading is not an active one, but
+  publishing it no longer deletes the persisted record: the record of the last active reading is kept until the attempt's terminal
+  reading is published (`terminal` of `completion_attempt_state.publish_attempt_observation`; the outbox replay of a non-active
+  observation no longer deletes it either, since only the watcher knows which reading is the terminal one). Before, the record went
+  with the first FAILED reading: a watcher that restarted after that and before the terminal re-read the exited rank from its Pod
+  without its GPUs (INCOMPLETE), the terminal allocation and the recovery incident compiled from it lacked them, and so did the
+  VALIDATE_GPU the recovery path scopes by the incident's GPUs; when STOP_WORKLOADS had deleted the Pods while the watcher was
+  down, the new process knew nothing of the attempt and its terminal was never sent. Now the restarted process restores the
+  attempt from the kept record: with the Pods still listed the dead rank keeps the record's UUIDs, and the failure event it sends
+  again (same key; the containment incident still follows the first process's event), the TIMED_OUT/FAILED terminal allocation
+  and the recovery incident name every GPU; with the Pods gone it takes the existing path of a restored attempt whose Pods are
+  missing (F7): when our own stop suspended and annotated the workload object, the `STOPPED` terminal naming that containment
+  incident is sent at once, its allocation comes from the record with every GPU, and the control plane decides the recovery as
+  for its passive containment's stop (the record predates the death, so this terminal carries no rank exit; the plan is the
+  same). When that first read proves neither our stop nor the object's absence (the read fails, or something else removed
+  the Pods), the restored attempt waits out the missing grace like any restored attempt, republishing its last RUNNING
+  reading with a fresh instant -- for that time the control plane reads the attempt as RUNNING again, the fail-closed cost of
+  not knowing -- and the read at the end of the grace decides the terminal (our stop's initiator, or the object's verdict);
+  before, no terminal was ever sent. A container never read with UUIDs stays empty and INCOMPLETE across the restart, and a
+  replacement Pod is still read from its own Pod. Not covered: UUIDs first read in a non-active reading (a container whose exec
+  answered only after another rank had failed) are not in the record.
   The complete list also exposed a gap in the scope by the incident's GPUs: the escalation successor narrows the nodes to the
   failed ones, and when the source workflow had not recorded which GPU sits on which node it inherited every GPU of the source --
   on one node of a two-node attempt a single-node VALIDATE_GPU named the other node's 8 GPUs, which a healthy node can never
@@ -622,7 +639,7 @@ A few points that must be remembered:
   and each Pod stores only its attribution identity (uid/rank/node/`gpu_uuids`/`container_id`/`cgroup_path`/
   `host_pid`, about 833 B/Pod), so the normal 3-second refresh does not write the ConfigMap; after a Watcher restart it restores
   spec/allocation and rebuilds the remaining fields from live Pods; when Pods are missing beyond the cleanup timeout it sends `STOPPED` and clears
-  the persisted state. The WAL depth is tracked in-process; when known to be empty, replay no longer GETs, and ConfigMap reads on a healthy cluster
+  the persisted state; the record lives until the attempt's terminal reading is published, a FAILED reading does not delete it. The WAL depth is tracked in-process; when known to be empty, replay no longer GETs, and ConfigMap reads on a healthy cluster
   are close to zero. A release rollout preserves the two existing state ConfigMaps and does not replay default empty data. After a terminal event is produced, both the Watcher and the Store map the Observation monotonically to the terminal state; the Store
   rejects a later-arriving active Observation in the same attempt transaction, and cleanup repairs historical contradictions. Persistent delivery
   failure may still produce a stale warning; a database TTL cannot replace the terminal Observation.

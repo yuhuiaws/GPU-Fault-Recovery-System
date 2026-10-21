@@ -2133,7 +2133,8 @@ managed training containers it runs a fixed-argument `nvidia-smi` UUID query via
 Pod UID. This query requires `pods/exec get/create` RBAC; on failure the allocation remains incomplete and the
 restart guard must block automatic restart. An exited container cannot be exec'd: a container a pass reads without UUIDs
 keeps the ones the previous reading held for the same Pod UID, container and rank (after a watcher restart, the persisted
-active record; `completion_observation.keep_known_gpu_uuids`), so the GPUs of a rank that died still appear in the failure
+active record, which lives until the attempt's terminal reading is published, so a restart after the FAILED reading still
+has it; `completion_observation.keep_known_gpu_uuids`), so the GPUs of a rank that died still appear in the failure
 event, the attempt-failure incident and the terminal allocation; a container never read with UUIDs keeps none, and a
 replacement Pod (new UID) is read from its own Pod.
 
