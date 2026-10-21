@@ -20,8 +20,10 @@ snapshot and its restart count, ~1 KB per rank. That cost the watcher twice
 
 So what is persisted is the identity of the attempt (its spec) and the identity
 of each Pod -- including the fields a fault is attributed by, see
-``POD_FIELDS``. What is dropped is what the next pass re-reads from the live Pod
-and no restart needs: the log snapshot, the restart count, the exit signal, the
+``POD_FIELDS`` -- and every Pod fact a failure or terminal decision reads: the
+exit, and whether the Pod's deletion had been requested (``TRUE_ONLY_POD_KEYS``).
+What is dropped is what the next pass re-reads from the live Pod and no restart
+or verdict needs: the log snapshot, the restart count, the exit signal, the
 fabric partition. On restore the observation is rebuilt from these records and
 the very next reconcile pass replaces each container with the live Pod's full
 observation, keyed by ``pod_uid/container_name``; a Pod that is gone takes the
@@ -57,7 +59,9 @@ SPEC_FIELDS: tuple[str, ...] = (
 #: ``container`` are the observation key the next pass replaces; ``rank`` and
 #: ``critical`` are what a terminal decision counts (an attempt is complete when
 #: it has ``expected_critical_ranks`` critical ranks); the exit fields keep a
-#: rank that already finished from reading as still running.
+#: rank that already finished from reading as still running, and ``deleting``
+#: keeps a non-zero exit that its Pod's deletion request excuses from reading as
+#: a training failure (``TRUE_ONLY_POD_KEYS``).
 #:
 #: The rest is the *attribution identity*, and it is why this list is not
 #: shorter. A fault arrives naming a GPU UUID -- or a cgroup path, a container
@@ -86,7 +90,27 @@ POD_FIELDS: tuple[tuple[str, str], ...] = (
     ("terminated", "terminated"),
     ("exit_code", "exit_code"),
     ("finished_at", "finished_at"),
+    ("deleting", "deletion_requested"),
 )
+
+#: Record keys written only while true and restored only from a literal
+#: ``true``. ``deleting`` is ``deletion_requested``: the Pod carried
+#: ``metadata.deletionTimestamp`` when it was read -- a graceful delete, an
+#: eviction -- and its rank's non-zero exit is then a stop, not a training
+#: failure. The record used to drop it, so a watcher restarted after such a
+#: reading restored the rank as an unexcused non-zero exit: the watcher core
+#: recorded a failure no event ever reported, and the attempt ended with a
+#: failure terminal -- TIMED_OUT at the cleanup deadline while its other ranks,
+#: or the replacement Pod, still ran -- which the control plane answers by
+#: opening the attempt's containment (FREEZE_EVIDENCE, STOP_WORKLOADS) and
+#: planning a restart: a healthy job stopped. The flag is false on every Pod
+#: nobody asked to remove, so writing it only while true leaves the record of an
+#: attempt nobody is deleting byte for byte -- digest for digest, so an upgrade
+#: rewrites nothing -- what an earlier release wrote. An earlier release keeps
+#: only the keys it knows and reads a record carrying this one as before; a
+#: record without it, which is every record an earlier release wrote, restores
+#: the flag false: a deletion is read, never inferred.
+TRUE_ONLY_POD_KEYS: frozenset[str] = frozenset({"deleting"})
 
 #: Key under which the Pod list is stored. Named so that a legacy record (which
 #: has ``containers``) is told apart from a compact one without a version field.
@@ -97,9 +121,10 @@ def attempt_state_record(payload: dict[str, Any]) -> dict[str, Any]:
     """The compact record to persist for a published observation payload.
 
     ``payload`` is an ``AttemptObservation.model_dump(mode="json")``, so every
-    value here is already JSON. A value that is ``None`` is dropped and nothing
-    else is: this document is bounded in bytes, and the model's own default
-    (``None``, or the empty list of ``gpu_uuids``) comes back on restore.
+    value here is already JSON. A value that is ``None`` is dropped, and so is a
+    ``TRUE_ONLY_POD_KEYS`` flag that is not true; nothing else is: this document
+    is bounded in bytes, and the model's own default (``None``, ``False``, or the
+    empty list of ``gpu_uuids``) comes back on restore.
     """
 
     record: dict[str, Any] = {
@@ -111,6 +136,7 @@ def attempt_state_record(payload: dict[str, Any]) -> dict[str, Any]:
             key: container[field]
             for key, field in POD_FIELDS
             if container.get(field) is not None
+            and (key not in TRUE_ONLY_POD_KEYS or container[field] is True)
         }
         pods.append(pod)
     record[PODS_KEY] = pods
@@ -122,7 +148,9 @@ def attempt_observation_payload(record: dict[str, Any]) -> dict[str, Any]:
 
     A record written by an earlier release carries ``containers`` verbatim and is
     returned as it is, so an upgrade restores the attempts that were running
-    when the old process stopped.
+    when the old process stopped. A ``TRUE_ONLY_POD_KEYS`` flag comes back only
+    from a literal ``true``; a missing key or any other value is the model's
+    ``False``.
     """
 
     if PODS_KEY not in record:
@@ -132,7 +160,11 @@ def attempt_observation_payload(record: dict[str, Any]) -> dict[str, Any]:
     for pod in record.get(PODS_KEY) or []:
         if not isinstance(pod, dict):
             continue
-        container = {field: pod[key] for key, field in POD_FIELDS if key in pod}
+        container = {
+            field: pod[key]
+            for key, field in POD_FIELDS
+            if key in pod and (key not in TRUE_ONLY_POD_KEYS or pod[key] is True)
+        }
         containers.append(container)
     payload["containers"] = containers
     return payload
