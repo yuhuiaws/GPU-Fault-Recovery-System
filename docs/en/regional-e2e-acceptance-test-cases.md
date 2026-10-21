@@ -14259,10 +14259,22 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
      The load is constrained by an exclusive systemd cgroup and a timeout with a hard-kill bound, and
      must end before the recovery deadline.
      Before handing over to the load command, the node writes a non-overwritable start receipt bound to
-     run, boot, GPU, change digest and UTC/monotonic time; the reporting latency is measured from that
-     moment. The remote request and safety-preparation durations are recorded separately; preparation
-     time must not be counted as Collector response time, and a later sample time must not be used to
-     backfill the starting point.
+     run, boot, GPU, change digest and UTC/monotonic time. After that receipt the probe reads the loaded
+     GPU read-only with `nvidia-smi` (the same NVML power average and utilization DCGM samples) until one
+     read reaches both of the collector's `power_limit_correlation` thresholds (80 % utilization, power at
+     0.95 x the cap), for at most the receipt's own 30-second wait, and returns `load_onset`: the moment
+     the last read still below the thresholds started (`idle_read_at`; empty when the first read after
+     the receipt already reached them) and the moment the first read at both ended (`loaded_read_at`).
+     The reporting latency is measured from that idle read (from the receipt when it is empty): NVML,
+     and so DCGM and the Collector, crossed the thresholds between the two reads; before them lies
+     `dcgmproftester`'s own start-up (exec, an embedded DCGM over every GPU, a forked CUDA worker that
+     creates its context and loads its PTX module and cuBLAS, and only then its GEMMs), which is not the
+     product's path. Without those reads (an older probe, a failed read, a load that never reached the
+     thresholds within the wait, reads out of order) the latency is measured from the receipt, and
+     `allowed_latency_breakdown.load_onset.detail` says why. The remote request and safety-preparation
+     durations are recorded separately; preparation time must not be counted as Collector response
+     time, and a later sample time **showing the load** must not be used to backfill the starting point
+     -- only the last read in which the load had not yet appeared may move it.
   3. Poll the GPU chain's `observed_at` once per collection cycle (written to
      `timeline.json` each time) until it changes or the load ends. From the second cycle on, while the
      chain has not delivered, the runner also reads the loaded GPU through the host snapshot
@@ -14296,13 +14308,16 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
      of files still on the node (see the cleanup entry under Safety notes), never a path or message.
 - Verdict (PASS only if all hold):
   - a new `observed_at` appears after injection;
-  - the delivery latency is ≤ the sum of the sampling stages
+  - the delivery latency, measured from the load's onset (the idle read of step 2,
+    `allowed_latency_breakdown.load_onset`), is ≤ the sum of the sampling stages
     (`scripts/e2e/regional/collect002_latency_bound.py::allowed_latency`, every component written to
     the result's `allowed_latency_breakdown`): NVML's 1-second power average + the exporter collect
     period (the target node's exporter Pod `-c`/`--collect-interval`, i.e. the DCGM watch period) +
     one `interval` + `(EDGE_CONFIRMATION_SAMPLES - 1) x interval` + the collector loop overrun measured
     in this window + the confirming batch's delivery time
     (in production 1 + 15 + 15 + 30 + about 1.6 + about 1 ≈ 63 seconds, far below the 300-second summary);
+    onset reads more than NVML's 1 second apart add their excess as the measured
+    `load_onset_excess_seconds`;
   - the confirming batch's delivery from its sample stamp `observed_at` to the Store's `ingested_at` is
     ≤ one `interval`; beyond that it is named as a slow or retried delivery, not counted as sampling;
   - within the window a `GPU_METRICS` evidence record exists whose `edge_filter_reasons` contains
@@ -14328,14 +14343,14 @@ collection cycle, and it left nothing for NVML's averaging window, the collector
 the delivery: with the DCGM and collector phases both near their worst, a healthy node also exceeds
 60 seconds (host DCGM mode failed at 61.3 seconds; the same node passed at 46.6 seconds on the rerun).
 
-The stages between the load-start receipt and the Store's `ingested_at`, read off the pinned
+The stages between the load's onset and the Store's `ingested_at`, read off the pinned
 dcgm-exporter `4.6.1-4.8.4`, its go-dcgm `v1.4611.2` and DCGM 4.6.1 (the exporter's embedded engine,
 and the public source nearest the nodes' host engines), are the same in the embedded and the
 host hostengine (`DCGM_REMOTE_HOSTENGINE_INFO`) modes; the mode is recorded, never priced.
 
 | Stage | Mechanism | Bound component |
 | --- | --- | --- |
-| NVML | DCGM reads the power through `nvmlDeviceGetPowerUsage`, a 1-second average on Ampere and newer; utilization samples over at most 1 second | `nvml_average_seconds` = 1 |
+| NVML | DCGM reads the power through `nvmlDeviceGetPowerUsage`, a 1-second average on Ampere and newer; utilization samples over at most 1 second. Measured from the onset read, the same values cross the thresholds before the first read at them ends: reads up to 1 second apart are covered by that second, a wider gap adds only its excess | `nvml_average_seconds` = 1; `load_onset_excess_seconds` = the read gap beyond 1 second (measured) |
 | DCGM watch | the exporter watches every field at `updateFreq = -c x 1000 us` with `maxKeepAge` 600 seconds; the cache manager samples a field only once its age reaches that period (`ActuallyUpdateAllFields`); a host engine samples at the shortest period of all its watchers, never longer. The lowered `DCGM_FI_DEV_POWER_MGMT_LIMIT` is polled on the same watch timer: DCGM appends a limit on change only when the limit is set through DCGM itself, and `nvidia-smi -pl` does not go through it | `dcgm_watch_seconds` = the exporter collect period |
 | exporter | no sampler of its own: `/metrics` runs `Gather` per request (overlapping scrapes are coalesced into one `Gather`) and reads DCGM's cached latest values (`dcgmEntityGetLatestValues`, no live flag, no field update; only a profiling-watch re-arm forces one, and the product exports no profiling field); the product's counters contain no `DCGM_EXP_*` field, the only collectors that call `UpdateAllFields`, and that call updates only due fields anyway | 0 |
 | collector phase | one scrape per tick; the loop sleeps a full `interval` after each tick's work, so ticks are `interval` plus that tick's work apart; the cadence jitter moves the health summary, the inventory and the start-up only, not this tick | `collector_phase_seconds` = `interval` |
@@ -14352,12 +14367,24 @@ the physical change to the first collector sample carrying it is about 1 + 15 + 
 16 seconds typically; with the confirmation, the loop overrun and the delivery the bound is about
 63 seconds.
 
-The one stage without a component is `dcgmproftester`'s start-up between the receipt and its first
-kernel (it first starts its own embedded DCGM and a CUDA worker): no source bounds it and the case cannot
-observe it, so it is not priced; the result lists it under `stages_without_allowance`, and only the
-window's surplus tick work covers it. With both phases at their worst and a start-up well above one
-second a false failure remains possible; such a failure shows in `allowed_latency_breakdown` as normal
-measured components and an excess smaller than the start-up.
+No source bounds `dcgmproftester`'s start-up between the receipt and its first kernel, and it is not
+the product's path, so the latency is measured from the onset read of step 2, which leaves it out,
+rather than giving it a guessed component. Measured from the receipt, both phases near their worst and a
+start-up of a second or two push a healthy node over the bound: in one live execution every product
+stage was nominal (ticks 15.088 seconds apart, the confirming sample two ticks after the first anomalous
+one, 0.087 seconds to the Store), yet the first anomalous sample came 33.1 seconds after the receipt
+while NVML, the DCGM watch and one collection cycle allow 31, so the receipt-based latency was 63.4
+seconds against the 61.6-second bound. The tick before the first anomalous sample read a DCGM sample at
+most one 15-second watch period old that did not carry the load yet, so NVML crossed the thresholds no
+earlier than 3 seconds after the receipt. The data the case already had cannot place that onset:
+`dcgmproftester` writes its progress lines to a fully buffered stdout (journal timestamps are buffer
+flush times, and its log file at the default warning level has none of them), the exporter's
+`/metrics` and the stored samples carry no DCGM sample timestamps, and `DCGM_FI_DEV_POWER_VIOLATION`
+advances on the capped idle GPUs too, so it cannot date the load either; hence the probe reads it right
+after the receipt. Without onset reads the start-up stays under `stages_without_allowance`, the latency
+runs from the receipt, and the false failure above remains possible. A genuinely slower chain still
+fails: a first anomalous sample two ticks late takes about 91 seconds against a bound of about 62, and a
+delivery beyond one `interval` is named as a slow delivery.
 
 #### ⚠ The P0 caught on the first live execution of this case: the duty-cycle counter suppressed the very fault it was meant to expose
 
