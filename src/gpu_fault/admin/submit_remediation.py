@@ -105,6 +105,7 @@ from gpu_fault.admin.remediation_plans import (
     RestorePlan,
     build_confirm_node_action_plan,
     build_restore_plan,
+    restore_step_drift,
 )
 from gpu_fault.admin.remediation_departures import node_departures
 from gpu_fault.admin.remediation_script import REMEDIATION_SCRIPT
@@ -698,6 +699,9 @@ def submit_restore(
     ``node_ids`` names the nodes the plan found still isolated by the incident;
     ``expected.node_ids`` still binds the incident's whole node set, so a node
     added to the incident since the plan refuses the write.
+    ``release_only_node_ids`` are the restored nodes the plan releases without
+    validating (quiesce taint only): the Pod's builder takes them as the plan's
+    did, or the created restore validated them anyway (batch 155).
     """
 
     return run_control_plane_script(
@@ -712,6 +716,7 @@ def submit_restore(
                 "node_ids": sorted(plan.node_ids),
             },
             "node_ids": list(plan.restore_node_ids) or None,
+            "release_only_node_ids": list(plan.release_only_node_ids),
             "operator": operator,
             "reference": reference,
             # The cluster's own profile version on a mixed-provider site: the
@@ -792,11 +797,19 @@ def _submit_restore(
             f"incident {plan.incident_id}; nothing to do" + suspended
         )
     else:
+        # The deployed image built the steps; say so when they are not the plan's.
+        drift = restore_step_drift(plan, workflow)
         result.message = (
             f"workflow {workflow.get('request_id')} (fencing token "
             f"{workflow.get('fencing_token')}, {workflow.get('status')}) runs "
             f"{operations} on {targets}; incident {plan.incident_id} is now "
-            f"{(submission.get('incident') or {}).get('state')}" + suspended
+            f"{(submission.get('incident') or {}).get('state')}"
+            + (
+                f"; the created workflow's steps differ from the plan: {drift}"
+                if drift
+                else ""
+            )
+            + suspended
         )
     record_submission(site, result, now=stamp)
     return result

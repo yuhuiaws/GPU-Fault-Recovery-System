@@ -117,7 +117,10 @@ class RestorePlan:
 
     ``steps`` are the exact steps the product builder yields (operation,
     owner, nodes, GPU scope) for ``restore_node_ids`` -- the nodes still
-    isolated by this incident; ``node_decisions`` says, per incident node,
+    isolated by this incident -- with ``release_only_node_ids`` (the restored
+    nodes whose only isolation of it is the quiesce taint) released but not
+    validated; the Pod's builder is handed the same two lists, so the workflow
+    it writes is this one. ``node_decisions`` says, per incident node,
     whether it is restored or skipped and why. The request id is minted in the
     Pod at submit time. ``existing_restore_workflow_id`` is set when such a
     workflow is already PENDING/RUNNING under the incident: the rerun is a
@@ -137,6 +140,7 @@ class RestorePlan:
     warnings: tuple[str, ...] = ()
     disposition: str = DISPOSITION_RESTORE
     restore_node_ids: tuple[str, ...] = ()
+    release_only_node_ids: tuple[str, ...] = ()
     node_decisions: tuple[dict[str, Any], ...] = ()
     # Workloads a STOP of the incident's records suspended and nothing
     # restarted (``suspended_workloads``); the restore leaves them stopped.
@@ -149,6 +153,7 @@ class RestorePlan:
             "disposition": self.disposition,
             "node_ids": list(self.node_ids),
             "restore_node_ids": list(self.restore_node_ids),
+            "release_only_node_ids": list(self.release_only_node_ids),
             "node_decisions": [dict(item) for item in self.node_decisions],
             "suspended_workloads": [dict(item) for item in self.suspended_workloads],
             "gpu_uuids": list(self.gpu_uuids),
@@ -551,6 +556,7 @@ def build_restore_plan(
     # readmitted by this restore (another incident's cordon stays), so it is
     # not validated either: VALIDATE_GPU would wait on an exporter the very
     # taint evicts, and validating a node that stays cordoned proves nothing.
+    # ``submit_restore`` hands the Pod's builder the same list (batch 155).
     release_only = tuple(
         str(item["node_id"])
         for item in decisions
@@ -598,8 +604,43 @@ def build_restore_plan(
         existing_restore_workflow_id=existing,
         warnings=warnings,
         restore_node_ids=restore_nodes,
+        release_only_node_ids=release_only,
         node_decisions=tuple(decisions),
         suspended_workloads=tuple(suspended),
+    )
+
+
+def _step_rows(steps: Any) -> list[dict[str, Any]]:
+    return [
+        {
+            "operation": str(step.get("operation")),
+            "execution_owner": str(step.get("execution_owner")),
+            "node_ids": [str(item) for item in step.get("node_ids") or []],
+            "gpu_uuids": [str(item) for item in step.get("gpu_uuids") or []],
+        }
+        for step in steps
+        if isinstance(step, Mapping)
+    ]
+
+
+def restore_step_drift(plan: RestorePlan, workflow: Mapping[str, Any]) -> str | None:
+    """The written restore's steps when they are not ``plan.steps``, else None.
+
+    The Pod builds the workflow on the deployed image from the inventories it
+    reads when it writes: an older image's builder, or an inventory that
+    changed after the inspection, can build other steps than the plan showed.
+    """
+
+    steps = workflow.get("official_steps")
+    if not isinstance(steps, list):
+        return None
+    created = _step_rows(steps)
+    if created == _step_rows(plan.steps):
+        return None
+    return " -> ".join(
+        f"{row['operation']} on {', '.join(row['node_ids'])}"
+        + (f" ({', '.join(row['gpu_uuids'])})" if row["gpu_uuids"] else "")
+        for row in created
     )
 
 

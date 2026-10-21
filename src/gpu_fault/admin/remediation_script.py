@@ -13,9 +13,11 @@ One script, four modes, chosen by ``payload["mode"]`` on stdin:
     the validated restore of a QUARANTINED incident -- or of an ESCALATED one
     whose workflows have all ended, judged on the admin side -- for the nodes
     the admin side found still isolated by it (``node_ids``; default: every
-    node). The script binds the state it inspected (``expected``) and refuses
-    open workflows; it does not re-judge the state, so the deployed image
-    needs no change for the ESCALATED exit.
+    node), releasing ``release_only_node_ids`` (quiesce taint only) without
+    validating them, exactly as the plan's preview built it. The script binds
+    the state it inspected (``expected``) and refuses open workflows; it does
+    not re-judge the state, so the deployed image needs no change for the
+    ESCALATED exit.
 ``submit``
     a CHECK_MECHANICALS hardware disposition: the operator marker and the
     terminal trigger, through the completion service.
@@ -48,6 +50,9 @@ since before ``confirm-node-action`` existed: ``store.get_incident`` /
 ``escalation.escalation_origin``. Nothing here
 imports a module added together with the disposition, so the lever works on
 the release whose parked records block the very deploy that would ship it.
+The builder's ``release_only_node_ids`` is newer: it is passed only when the
+plan has such nodes, and an image whose builder lacks it refuses that restore
+(nothing written) rather than build one the plan did not show.
 """
 
 from __future__ import annotations
@@ -450,6 +455,17 @@ elif payload["mode"] == "restore":
                 + (", ".join(unknown) if unknown else "nothing")
                 + f" -- not nodes of incident {incident.incident_id}"
             )
+    # The restored nodes the plan releases without validating them (only the
+    # incident's quiesce taint holds them): the builder takes them as the
+    # plan's preview did, so the workflow written is the one the operator saw.
+    release_only = sorted(payload.get("release_only_node_ids") or [])
+    targets = sorted(restore_nodes or incident.node_ids)
+    stray = sorted(set(release_only) - set(targets))
+    if stray:
+        refuse(
+            "release-only node " + ", ".join(stray) + " is not restored by this "
+            f"request (restore targets: {', '.join(targets)})"
+        )
     still_open = open_workflows(incident)
     existing = [
         item for item in still_open if is_validated_restore_workflow(item.request_id)
@@ -462,6 +478,24 @@ elif payload["mode"] == "restore":
             + ", ".join(f"{item.request_id} ({item.status.value})" for item in still_open)
         )
     else:
+        options = {}
+        if release_only:
+            from inspect import signature
+
+            # An image whose builder predates the keyword validates every node it
+            # restores, and its RESTORE_SCHEDULING cannot strip a quiesce taint
+            # under another incident's cordon (both came in the same release).
+            if "release_only_node_ids" not in signature(
+                build_validated_restore_workflow
+            ).parameters:
+                refuse(
+                    "the deployed image's validated restore validates every node it "
+                    f"restores and cannot release {', '.join(release_only)} "
+                    "unvalidated, as the plan does (only this incident's quiesce "
+                    "taint holds it there); deploy a release that builds release-only "
+                    "restores, then plan again"
+                )
+            options["release_only_node_ids"] = release_only
         updated, created = build_validated_restore_workflow(
             incident,
             operator=payload["operator"],
@@ -470,6 +504,7 @@ elif payload["mode"] == "restore":
             node_ids=restore_nodes,
             runtime_profile_version=payload.get("runtime_profile_version"),
             node_gpu_uuids=node_inventory(incident),
+            **options,
         )
         store.save_incident_and_workflow(updated, created)
         context.dispatcher.wake()
