@@ -1250,10 +1250,9 @@ class KubernetesCompletionOutbox:
                     _log_quarantine(key, fields, exc)
                 self._update(key, **fields)
                 continue
-            if path == WORKLOAD_OBSERVATION_PATH and str(
-                payload.get("workload_phase") or ""
-            ) not in {"PENDING", "RUNNING"}:
-                self.remove_attempt_observation(payload)
+            # A replayed observation leaves the attempt state alone: a FAILED
+            # reading may still precede the terminal one, which only the
+            # watcher can tell, and it drops the record with the terminal.
             self._remove(key)
             drained.add(key)
             replayed += 1

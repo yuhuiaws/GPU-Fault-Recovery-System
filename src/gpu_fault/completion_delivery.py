@@ -90,7 +90,12 @@ class CompletionDeliveryMixin:
             log_reconcile_failure(self, attempt_id, exc)
             return
         if self.publish_observations:
-            publish_attempt_observation(self, observation, attempt_id)
+            publish_attempt_observation(
+                self,
+                observation,
+                attempt_id,
+                terminal=result.terminal_event is not None,
+            )
         synthesized = attempt_id in self._synthesized_verdicts
         if result.failure_detected is not None and not synthesized:
             failure_event = result.failure_detected

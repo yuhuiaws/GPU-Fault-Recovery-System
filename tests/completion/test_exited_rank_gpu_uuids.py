@@ -13,12 +13,19 @@ The Pods below have the shape the submit CLI and the PyTorchJob operator give
 them (rank from ``rank-offset`` + replica index, ``nvidia.com/gpu: 8``, no GPU
 annotation), and the exec double answers per Pod UID, so a UUID that shows up
 under another Pod would be visible.
+
+Batch 154 closes the window batch 146 left open: publishing the FAILED reading
+used to drop the persisted record, so a watcher restarted between that reading
+and the terminal one read the dead rank without GPUs -- or, when the stop had
+already deleted the Pods, never reported the attempt's terminal at all. The
+record of the last active reading is now kept until the terminal reading.
 """
 
 from __future__ import annotations
 
 import json
 from datetime import timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -40,7 +47,7 @@ PROFILE = "simulated-v1"
 FAILURE_PATH = "/v1/attempts/failure-detected"
 TERMINAL_PATH = "/v1/attempts/terminal"
 OBSERVATION_PATH = "/v1/workload-observations"
-PASSIVE_INCIDENT, _ = failure_containment_ids(
+PASSIVE_INCIDENT, PASSIVE_WORKFLOW = failure_containment_ids(
     f"{CLUSTER}/{ATTEMPT}/TrainingAttemptFailureDetected"
 )
 PROVIDERS = [
@@ -152,7 +159,13 @@ class Exec:
 
 
 def watcher(
-    core: FakeCoreApi, sink: Any, environment: Environment, clock: Clock, resolver: Exec
+    core: FakeCoreApi,
+    sink: Any,
+    environment: Environment,
+    clock: Clock,
+    resolver: Exec,
+    *,
+    stopper: Any = None,
 ) -> KubernetesCompletionController:
     return KubernetesCompletionController(
         core,
@@ -163,6 +176,7 @@ def watcher(
         now=clock,
         publish_observations=True,
         gpu_uuid_resolver=resolver,
+        workload_stopper=stopper,
     )
 
 
@@ -180,6 +194,49 @@ def control_plane() -> tuple[ApplicationContext, CompletionService]:
     context = ApplicationContext()
     return context, CompletionService(
         context.store, workflow_compiler=PassiveWorkflowCompiler(context.store)
+    )
+
+
+def persisted(core: FakeCoreApi) -> dict[str, Any]:
+    """The attempt's persisted record: its phase and each rank's GPU UUIDs."""
+
+    records = json.loads(core.config_map_data["active-attempts.json"])
+    if not records:
+        return {}
+    [record] = records.values()
+    return {
+        "phase": record["workload_phase"],
+        "gpus": {pod["rank"]: sorted(pod.get("uuids") or []) for pod in record["pods"]},
+    }
+
+
+def control_plane_verdict(
+    failures: list[dict[str, Any]], terminal: dict[str, Any]
+) -> tuple[list[str], list[str], int]:
+    """Feed the delivered events to the control plane in order: the containment
+    incident's GPUs, the recovery incident's GPUs and the restart's
+    ``source_gpu_count``. A re-sent failure event is the same incident."""
+
+    context, completion = control_plane()
+    for failure in failures:
+        containment = completion.handle_failure_detected(
+            FailureDetectedEvent.model_validate(failure)
+        )
+        assert containment.incident_id == PASSIVE_INCIDENT, containment
+    decision = completion.handle_terminal(TerminalEvent.model_validate(terminal))
+    plan = context.store.get_plan(str(decision.recovery_plan_id))
+    recovery = context.store.get_incident(plan.incident_id)
+    assert recovery.event_type == "TRAINING_ATTEMPT_TERMINAL", recovery.event_type
+    restart = context.store.get_workflow(str(plan.workflow_request_id))
+    [source_count] = [
+        step.parameters["source_gpu_count"]
+        for step in restart.official_steps
+        if step.operation is WorkflowOperation.RESTART_WORKLOAD
+    ]
+    return (
+        context.store.get_incident(PASSIVE_INCIDENT).gpu_uuids,
+        recovery.gpu_uuids,
+        source_count,
     )
 
 
@@ -416,30 +473,278 @@ def test_a_running_rank_keeps_its_restored_gpus_while_exec_fails() -> None:
     )
 
 
-def test_a_restart_after_the_failed_reading_reads_the_dead_rank_fresh() -> None:
-    """The limit of the restart support: a FAILED reading is not an active one,
-    so publishing it drops the persisted record. A watcher that restarts after
-    that and still finds the exited Pod knows nothing of its GPUs; it reports
-    them missing (INCOMPLETE) instead of guessing. The containment incident is
-    the first process's event, delivered with every GPU."""
+class SuspendedPyTorchJob:
+    """The PyTorchJob as the containment's STOP_WORKLOADS leaves it: annotated
+    with the initiator and its step key, and suspended."""
 
-    clock = Clock()
-    core = FakeCoreApi([training_pod(0, "node-a"), training_pod(1, "node-b")])
-    delivered = FakeSink()
+    def get_namespaced_custom_object(
+        self, group: str, version: str, namespace: str, plural: str, name: str, **_: Any
+    ) -> dict[str, Any]:
+        assert (group, plural, namespace, name) == (
+            "kubeflow.org",
+            "pytorchjobs",
+            NAMESPACE,
+            f"gpu-fault-{JOB}",
+        ), (group, version, namespace, plural, name)
+        return {
+            "metadata": {
+                "name": name,
+                "namespace": namespace,
+                "annotations": {
+                    "gpu-fault.io/termination-initiator-incident-id": PASSIVE_INCIDENT,
+                    "gpu-fault.io/operation-id": f"{PASSIVE_WORKFLOW}/1/STOP_WORKLOADS",
+                },
+            },
+            "spec": {"runPolicy": {"suspend": True}},
+        }
+
+
+class StopNotYetReadable(SuspendedPyTorchJob):
+    """The first read of the PyTorchJob times out; later reads see our stop."""
+
+    def __init__(self) -> None:
+        self.reads = 0
+
+    def get_namespaced_custom_object(self, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        self.reads += 1
+        if self.reads == 1:
+            raise TimeoutError("read timed out")
+        return super().get_namespaced_custom_object(*args, **kwargs)
+
+
+class RefusesTheFirstFailedReading(FakeSink):
+    """A control plane that refuses one FAILED workload observation, once."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.refused = False
+
+    def post(self, path: str, payload: dict[str, Any]) -> dict[str, Any]:
+        if (
+            path == OBSERVATION_PATH
+            and payload["workload_phase"] == "FAILED"
+            and not self.refused
+        ):
+            self.refused = True
+            raise RuntimeError("control plane unavailable")
+        return super().post(path, payload)
+
+
+def failed_attempt(
+    environment: Environment,
+    nodes: tuple[str, str],
+    *,
+    delivered: FakeSink,
+    clock: Clock,
+    resolver: Exec | None = None,
+) -> tuple[FakeCoreApi, KubernetesCompletionController]:
+    """A first watcher process that saw both ranks run and then published the
+    FAILED reading of rank 0's SIGKILL (exit 137)."""
+
+    core = FakeCoreApi([training_pod(0, nodes[0]), training_pod(1, nodes[1])])
     first = watcher(
         core,
         KubernetesCompletionOutbox(core, delivered),
-        Environment.EKS,
+        environment,
         clock,
-        Exec(),
+        resolver or Exec(),
     )
     first.run_once()
     clock.value += timedelta(seconds=5)
-    core.pods = [training_pod(0, "node-a", exit_code=137), training_pod(1, "node-b")]
+    core.pods = [training_pod(0, nodes[0], exit_code=137), training_pod(1, nodes[1])]
     first.run_once()
-    assert json.loads(core.config_map_data["active-attempts.json"]) == {}, (
-        "the FAILED reading should have dropped the persisted record"
+    return core, first
+
+
+@pytest.mark.parametrize(("environment", "nodes"), PROVIDERS)
+def test_a_restart_after_the_failed_reading_keeps_the_dead_ranks_gpus(
+    environment: Environment, nodes: tuple[str, str]
+) -> None:
+    """The window batch 146 left open: the watcher restarts after it published
+    the FAILED reading and before the terminal one, while the containment is
+    still stopping the Pods. The record of the last RUNNING reading is kept
+    until the terminal reading, so the restarted process -- which never exec'd
+    the dead rank -- still knows its GPUs: the failure event it sends again,
+    the TIMED_OUT terminal allocation and the recovery incident compiled from
+    it name all 16. Publishing the terminal reading drops the record."""
+
+    clock = Clock()
+    delivered = FakeSink()
+    core, _first = failed_attempt(environment, nodes, delivered=delivered, clock=clock)
+    after_failed_reading = persisted(core)
+
+    clock.value += timedelta(seconds=5)
+    resolver = Exec()
+    restarted = watcher(
+        core, KubernetesCompletionOutbox(core, delivered), environment, clock, resolver
     )
+    restarted.run_once()
+    clock.value += timedelta(seconds=1)
+    core.pods = [
+        training_pod(0, nodes[0], exit_code=137, initiator=PASSIVE_INCIDENT),
+        training_pod(1, nodes[1], initiator=PASSIVE_INCIDENT),
+    ]
+    restarted.run_once()
+    clock.value += timedelta(seconds=1)
+    core.pods = [training_pod(1, nodes[1], initiator=PASSIVE_INCIDENT)]
+    restarted.run_once()
+    clock.value += timedelta(seconds=30)
+    core.pods = []
+    restarted.run_once()
+
+    expected = {0: gpus(uid(0)), 1: gpus(uid(1))}
+    every_gpu = sorted(expected[0] + expected[1])
+    assert resolver.calls == [(uid(1), True)], (
+        f"the restarted watcher execs the running survivor only: {resolver.calls}"
+    )
+    first_failure, second_failure = posted(delivered, FAILURE_PATH)
+    assert first_failure["gpu_uuids"] == every_gpu, first_failure["gpu_uuids"]
+    assert second_failure["gpu_uuids"] == every_gpu, (
+        f"the restart lost the dead rank's GPUs: {second_failure['gpu_uuids']}"
+    )
+    assert second_failure["allocation_completeness"] == "COMPLETE", second_failure
+    [terminal] = posted(delivered, TERMINAL_PATH)
+    assert terminal["terminal_status"] == "TIMED_OUT", terminal
+    assert rank_gpus(terminal["allocation"]) == expected, terminal["allocation"]
+    containment, recovery, source_count = control_plane_verdict(
+        [first_failure, second_failure], terminal
+    )
+    assert containment == every_gpu, f"the containment names {len(containment)} GPUs"
+    assert recovery == every_gpu, (
+        f"the recovery incident names {len(recovery)} of 16 GPUs"
+    )
+    assert source_count == 16, source_count
+    assert after_failed_reading == {"phase": "RUNNING", "gpus": expected}, (
+        f"the FAILED reading must keep the last RUNNING record: {after_failed_reading}"
+    )
+    assert persisted(core) == {}, "the terminal reading must drop the record"
+
+
+@pytest.mark.parametrize(("environment", "nodes"), PROVIDERS)
+def test_a_restart_after_the_stop_deleted_the_pods_still_reports_every_gpu(
+    environment: Environment, nodes: tuple[str, str]
+) -> None:
+    """The same window when the containment's STOP_WORKLOADS deleted both Pods
+    while the watcher was down. With the record dropped the restarted process
+    knew nothing of the attempt and never sent its terminal. Restored from the
+    kept record, the attempt takes the path of a restored attempt whose Pods are
+    gone (F7): our own stop suspended the PyTorchJob, so the STOPPED terminal
+    naming the containment incident is sent at once, and its allocation and the
+    recovery incident carry all 16 GPUs."""
+
+    clock = Clock()
+    delivered = FakeSink()
+    core, _first = failed_attempt(environment, nodes, delivered=delivered, clock=clock)
+
+    clock.value += timedelta(seconds=20)
+    core.pods = []
+    resolver = Exec()
+    restarted = watcher(
+        core,
+        KubernetesCompletionOutbox(core, delivered),
+        environment,
+        clock,
+        resolver,
+        stopper=SimpleNamespace(custom=SuspendedPyTorchJob(), batch=None),
+    )
+    restarted.run_once()
+
+    expected = {0: gpus(uid(0)), 1: gpus(uid(1))}
+    every_gpu = sorted(expected[0] + expected[1])
+    assert resolver.calls == [], resolver.calls
+    terminals = posted(delivered, TERMINAL_PATH)
+    assert len(terminals) == 1, f"the restarted watcher sent {len(terminals)} terminals"
+    [terminal] = terminals
+    assert (
+        terminal["terminal_status"],
+        terminal["termination_initiator_incident_id"],
+    ) == ("STOPPED", PASSIVE_INCIDENT), terminal
+    assert rank_gpus(terminal["allocation"]) == expected, terminal["allocation"]
+    [failure] = posted(delivered, FAILURE_PATH)
+    containment, recovery, source_count = control_plane_verdict([failure], terminal)
+    assert containment == every_gpu, f"the containment names {len(containment)} GPUs"
+    assert recovery == every_gpu, (
+        f"the recovery incident names {len(recovery)} of 16 GPUs"
+    )
+    assert source_count == 16, source_count
+    assert persisted(core) == {}, "the terminal reading must drop the record"
+
+
+@pytest.mark.parametrize(("environment", "nodes"), PROVIDERS)
+def test_a_restart_with_the_stop_unproven_waits_out_the_grace_then_reports_every_gpu(
+    environment: Environment, nodes: tuple[str, str]
+) -> None:
+    """The rare branch of the same window: the Pods are gone and the first read
+    of the workload object does not prove our stop (here it times out). The
+    restored attempt then takes the missing grace like any restored attempt
+    (F7): its last RUNNING reading is republished with a fresh instant -- the
+    control plane reads the attempt as RUNNING again until the grace ends, the
+    fail-closed cost of not knowing -- and the fresh read at the end of the
+    grace finds our stop, so the STOPPED terminal names the containment
+    incident and every GPU. Before, no terminal was ever sent."""
+
+    clock = Clock()
+    delivered = FakeSink()
+    core, _first = failed_attempt(environment, nodes, delivered=delivered, clock=clock)
+    workload = StopNotYetReadable()
+    clock.value += timedelta(seconds=20)
+    core.pods = []
+    restarted = watcher(
+        core,
+        KubernetesCompletionOutbox(core, delivered),
+        environment,
+        clock,
+        Exec(),
+        stopper=SimpleNamespace(custom=workload, batch=None),
+    )
+    before = len(posted(delivered, OBSERVATION_PATH))
+    restarted.run_once()
+    clock.value += timedelta(seconds=5)
+    restarted.run_once()
+    clock.value += timedelta(seconds=300)
+    restarted.run_once()
+
+    expected = {0: gpus(uid(0)), 1: gpus(uid(1))}
+    every_gpu = sorted(expected[0] + expected[1])
+    readings = posted(delivered, OBSERVATION_PATH)[before:]
+    assert [item["workload_phase"] for item in readings] == [
+        "RUNNING",
+        "RUNNING",
+        "STOPPED",
+    ], readings
+    assert rank_gpus(readings[0]["containers"]) == expected, readings[0]
+    assert workload.reads == 2, "one read at the first missing pass, one at the end"
+    [terminal] = posted(delivered, TERMINAL_PATH)
+    assert (
+        terminal["terminal_status"],
+        terminal["termination_initiator_incident_id"],
+    ) == ("STOPPED", PASSIVE_INCIDENT), terminal
+    assert rank_gpus(terminal["allocation"]) == expected, terminal["allocation"]
+    [failure] = posted(delivered, FAILURE_PATH)
+    _containment, recovery, source_count = control_plane_verdict([failure], terminal)
+    assert recovery == every_gpu, (
+        f"the recovery incident names {len(recovery)} of 16 GPUs"
+    )
+    assert source_count == 16, source_count
+    assert persisted(core) == {}, "the terminal reading must drop the record"
+
+
+def test_a_replayed_failed_reading_keeps_the_record_for_a_restart() -> None:
+    """The outbox replay dropped the persisted record too, for any non-active
+    reading it delivered: a FAILED reading the control plane refused once and
+    the next pass replayed reopened the same window. Only the watcher knows
+    which reading is the terminal one, so only it drops the record."""
+
+    clock = Clock()
+    delivered = RefusesTheFirstFailedReading()
+    nodes = ("node-a", "node-b")
+    core, first = failed_attempt(
+        Environment.EKS, nodes, delivered=delivered, clock=clock
+    )
+    assert delivered.refused, "the FAILED reading should have been refused once"
+    clock.value += timedelta(seconds=5)
+    first.run_once()
+    assert first.sink.last_replay["replayed"] == 1, first.sink.last_replay
 
     clock.value += timedelta(seconds=5)
     restarted = watcher(
@@ -452,6 +757,63 @@ def test_a_restart_after_the_failed_reading_reads_the_dead_rank_fresh() -> None:
     restarted.run_once()
 
     first_failure, second_failure = posted(delivered, FAILURE_PATH)
-    assert first_failure["gpu_uuids"] == sorted(gpus(uid(0)) + gpus(uid(1)))
-    assert second_failure["gpu_uuids"] == gpus(uid(1)), second_failure["gpu_uuids"]
-    assert second_failure["allocation_completeness"] == "INCOMPLETE", second_failure
+    every_gpu = sorted(gpus(uid(0)) + gpus(uid(1)))
+    assert first_failure["gpu_uuids"] == every_gpu, first_failure["gpu_uuids"]
+    assert second_failure["gpu_uuids"] == every_gpu, (
+        f"the replay dropped the record of the dead rank's GPUs: "
+        f"{second_failure['gpu_uuids']}"
+    )
+    assert second_failure["allocation_completeness"] == "COMPLETE", second_failure
+
+
+@pytest.mark.parametrize("case", ["never-read", "replacement"])
+def test_a_restart_in_the_failure_window_invents_no_gpu(case: str) -> None:
+    """The kept record hands over only what was read for the same Pod UID,
+    container and rank: a rank whose exec never answered while it ran has no
+    GPU after the restart either, and a replacement Pod is read from its own
+    Pod, never given the GPUs its predecessor's record holds. Both allocations
+    stay visibly INCOMPLETE."""
+
+    clock = Clock()
+    nodes = ("node-a", "node-b")
+    delivered = FakeSink()
+    core, _first = failed_attempt(
+        Environment.HYPERPOD_EKS,
+        nodes,
+        delivered=delivered,
+        clock=clock,
+        resolver=Exec(
+            failing=frozenset({uid(0)}) if case == "never-read" else frozenset()
+        ),
+    )
+    dead = training_pod(
+        0,
+        nodes[0],
+        pod_uid=uid(0) if case == "never-read" else "uid-master-0-replacement",
+        exit_code=137 if case == "never-read" else 1,
+    )
+    clock.value += timedelta(seconds=5)
+    core.pods = [dead, training_pod(1, nodes[1])]
+    restarted = watcher(
+        core,
+        KubernetesCompletionOutbox(core, delivered),
+        Environment.HYPERPOD_EKS,
+        clock,
+        Exec(),
+    )
+    restarted.run_once()
+    clock.value += timedelta(seconds=5)
+    core.pods = [dead, training_pod(1, nodes[1], exit_code=137)]
+    restarted.run_once()
+
+    failure = posted(delivered, FAILURE_PATH)[-1]
+    assert failure["gpu_uuids"] == gpus(uid(1)), (
+        f"only the survivor's GPUs are known: {failure['gpu_uuids']}"
+    )
+    assert failure["allocation_completeness"] == "INCOMPLETE", failure
+    [terminal] = posted(delivered, TERMINAL_PATH)
+    assert terminal["terminal_status"] == "FAILED", terminal
+    assert {
+        item["rank"]: (item["gpu_count"], item["gpu_uuids"])
+        for item in terminal["allocation"]
+    } == {0: (8, []), 1: (8, gpus(uid(1)))}, terminal["allocation"]

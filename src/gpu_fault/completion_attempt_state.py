@@ -413,7 +413,22 @@ def publish_attempt_observation(
     controller: Any,
     observation: AttemptObservation,
     attempt_id: str,
+    *,
+    terminal: bool,
 ) -> None:
+    """Post one reading; persist it while active, drop the record at the terminal.
+
+    ``terminal`` is whether this is the attempt's terminal reading, and only
+    that one drops the persisted record. The FAILED readings before it are not
+    active either, and dropping the record at the first of them left a watcher
+    restarted inside the failure window with nothing to restore: the exited
+    rank's GPU UUIDs, read while it ran, were gone (``keep_known_gpu_uuids``),
+    and when the stop had already deleted the Pods the attempt was gone too and
+    its terminal was never sent. The record of the last active reading is
+    therefore kept until the terminal reading is published; the cached terminal
+    reading is published again every pass, so a removal that failed is retried.
+    """
+
     payload = observation.model_dump(mode="json")
     # What is persisted is the compact record -- the spec plus each Pod's
     # attribution identity, without the log tail and the other fields the next
@@ -445,7 +460,7 @@ def publish_attempt_observation(
             attempt_id,
         )
         return
-    if observation.workload_phase in ACTIVE_PHASES:
+    if observation.workload_phase in ACTIVE_PHASES or not terminal:
         return
     remove = getattr(controller.sink, "remove_attempt_observation", None)
     if remove is not None:

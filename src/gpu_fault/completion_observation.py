@@ -578,10 +578,12 @@ def keep_known_gpu_uuids(
     container its devices once for the life of its Pod (a restart in place
     reuses them), so what the previous reading held for the same Pod UID,
     container and rank is still this container's; after a watcher restart the
-    previous reading is the persisted record, which keeps the UUIDs. A running
-    container whose exec fails keeps them the same way. A container never read
-    with GPUs keeps none, so its allocation stays INCOMPLETE instead of
-    invented, and a replacement Pod has a new UID and is read fresh.
+    previous reading is the persisted record, which keeps the UUIDs and lives
+    until the terminal reading, so a restart after the FAILED reading still has
+    them. A running container whose exec fails keeps them the same way. A
+    container never read with GPUs keeps none, so its allocation stays
+    INCOMPLETE instead of invented, and a replacement Pod has a new UID and is
+    read fresh.
     """
 
     previous = controller._last_observations.get(attempt_id)

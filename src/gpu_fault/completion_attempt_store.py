@@ -1,7 +1,11 @@
 """What the Completion Watcher persists about a running attempt, and no more.
 
 The watcher keeps one record per active attempt in the ``<name>-active``
-ConfigMap so that a restart still knows which attempts it was watching. The
+ConfigMap so that a restart still knows which attempts it was watching. It is
+written while the attempt is PENDING or RUNNING and dropped when the attempt's
+terminal reading is published -- not at a FAILED reading before it, so a restart
+inside the failure window restores the attempt from its last active reading,
+the GPU UUIDs of a rank that has since died included. The
 record used to be the whole published observation: every container with its log
 snapshot and its restart count, ~1 KB per rank. That cost the watcher twice
 (F6):
