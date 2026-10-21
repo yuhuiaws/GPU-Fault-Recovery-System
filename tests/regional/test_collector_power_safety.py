@@ -90,6 +90,9 @@ class PowerHost:
     def execv(self, executable: str, argv: list[str]) -> None:
         assert executable == str(probe.POWER_TIMEOUT)
         self.executions.append(argv)
+        # The load reaches its GPU at once: power_load_onset's first read sees it.
+        gpu = self.gpus[int(argv[-1])]
+        gpu.update(utilization_percent=99.0, power_draw_w=gpu["power_min_limit_w"] + 5)
 
     def units(self) -> tuple[str, str, str]:
         unit = probe.power_limit_restore_unit(self.arguments().run_id)
@@ -810,9 +813,12 @@ def test_load_start_is_durable_and_bound_immediately_before_exec(
     probe.throttle_gpu(host.arguments(gpu_index=1))
     assert host.emitted[-1]["load_start"] == receipts[0]
     assert receipts[0]["started_monotonic"] == host.now - 3
-    assert not any(
-        call[0] == str(probe.POWER_SMI) for call in host.calls[calls_at_exec[0] :]
-    ), "the handoff must not come from a later observed-busy sample"
+    # The handoff is the pre-exec receipt above, never a later observed-busy
+    # sample; the reads after it are the read-only onset reads, reported apart.
+    assert not any("-pl" in call for call in host.calls[calls_at_exec[0] :]), (
+        "only read-only onset queries follow the handoff"
+    )
+    assert host.emitted[-1]["load_onset"]["idle_read_at"] is None, "loaded at once"
 
 
 def test_load_start_receipt_is_never_overwritten_or_backdated(

@@ -109,23 +109,10 @@ FM_RECEIPT_COUNTERS = (
     "omitted_receipts_total",
 )
 FM_RECEIPT_KEYS = frozenset(
-    {
-        "schema_version",
-        "producer_invocation_id",
-        "systemd_invocation_id",
-        "pid",
-        "stage",
-        "outcome",
-        "source",
-        "record_id_sha256",
-        "cluster_id_sha256",
-        "node_id_sha256",
-        "boot_id_sha256",
-        "source_config_sha256",
-        "counter_exhausted",
-        *FM_RECEIPT_COUNTERS,
-    }
-)
+    "schema_version producer_invocation_id systemd_invocation_id pid stage outcome "
+    "source record_id_sha256 cluster_id_sha256 node_id_sha256 boot_id_sha256 "
+    "source_config_sha256 counter_exhausted".split()
+).union(FM_RECEIPT_COUNTERS)
 FM_JOURNAL_LIMIT = 2048
 # Unit lines read for the un-anchored tail: the collector's plain log lines
 # share the unit, so more than the 16 receipts the anchor needs are read.
@@ -758,19 +745,10 @@ def power_require_load_time(record: dict[str, Any]) -> None:
 
 def power_intent_digest(record: dict[str, Any]) -> str:
     immutable = (
-        "schema_version",
-        "run_id",
-        "boot_id",
-        "baseline",
-        "gpu_index",
-        "load_seconds",
-        "restore_seconds",
-        "restore_deadline_monotonic",
-        "load_hard_deadline_monotonic",
-        "python",
-        "load_binary",
-        "probe_sha256",
-    )
+        "schema_version run_id boot_id baseline gpu_index load_seconds restore_seconds "
+        "restore_deadline_monotonic load_hard_deadline_monotonic python load_binary "
+        "probe_sha256"
+    ).split()
     body = json.dumps(
         {key: record.get(key) for key in immutable}, sort_keys=True, allow_nan=False
     ).encode()
@@ -1057,16 +1035,10 @@ def power_wait_load_start(
             if remaining > 0:
                 time.sleep(min(0.1, remaining))
             continue
-        if not isinstance(receipt, dict) or set(receipt) != {
-            "run_id",
-            "boot_id",
-            "intent_sha256",
-            "gpu_index",
-            "gpu_uuid",
-            "pid",
-            "started_at",
-            "started_monotonic",
-        }:
+        if not isinstance(receipt, dict) or set(receipt) != set(
+            "run_id boot_id intent_sha256 gpu_index gpu_uuid pid started_at "
+            "started_monotonic".split()
+        ):
             raise ProbeError("GPU load start receipt has an invalid shape")
         gpu = next(
             item for item in record["baseline"] if item["index"] == record["gpu_index"]
@@ -1145,6 +1117,30 @@ def power_load_only(arguments: argparse.Namespace) -> None:
             str(record["gpu_index"]),
         ],
     )
+
+
+def power_load_onset(record: dict[str, Any]) -> dict[str, Any]:
+    """Read-only (COLLECT-002): the start of the last nvidia-smi read of the loaded
+    GPU below the collector's power_limit_correlation defaults (80 % and 0.95 x
+    the cap), the end of the first at both; for the receipt's wait, never raising."""
+
+    onset: dict[str, Any] = {"idle_read_at": None, "loaded_read_at": None}
+    deadline = time.monotonic() + POWER_LOAD_START_WAIT_SECONDS
+    while onset["loaded_read_at"] is None and time.monotonic() < deadline:
+        issued = datetime.now(timezone.utc).isoformat()
+        try:
+            state = {item["index"]: item for item in gpu_power_state(strict=True)}
+            gpu = state[record["gpu_index"]]
+        except Exception as exc:  # noqa: BLE001 - only an observation; the load runs on
+            onset["error"] = f"{type(exc).__name__}: {exc}"[:200]
+            break
+        draw, cap = gpu["power_draw_w"], gpu["power_limit_w"]
+        if gpu["utilization_percent"] < 80 or draw < 0.95 * cap:
+            onset["idle_read_at"] = issued
+            time.sleep(0.1)
+        else:
+            onset["loaded_read_at"] = datetime.now(timezone.utc).isoformat()
+    return onset
 
 
 def throttle_gpu(arguments: argparse.Namespace) -> None:
@@ -1264,6 +1260,7 @@ def throttle_gpu(arguments: argparse.Namespace) -> None:
                 "restore_unit": f"{unit}.timer",
                 "load_unit_active": True,
                 "load_start": load_start,
+                "load_onset": power_load_onset(record),
                 "cleanup_verified": False,
             }
         )

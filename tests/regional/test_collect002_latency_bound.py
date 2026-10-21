@@ -283,7 +283,7 @@ def test_a_late_anomaly_names_every_component_of_the_bound() -> None:
     assert errors == [
         "the anomaly took 78.0s to deliver, more than the 63.6s bound "
         "(nvml_average 1s, dcgm_watch 15s, collector_phase 15s, confirmation 30s, "
-        "collector_tick_overrun 1.59s, delivery 0.98s)"
+        "collector_tick_overrun 1.59s, delivery 0.98s), measured from the receipt"
     ]
     assert bound.latency_errors(-1.0, result, interval=15), "a negative latency fails"
 

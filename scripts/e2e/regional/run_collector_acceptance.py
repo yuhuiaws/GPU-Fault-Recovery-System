@@ -765,8 +765,9 @@ def run_collect002(
         observed_until=datetime.now(timezone.utc),
     )
     delivered_at = delivery["delivered_at"]
+    onset = latency_bound.load_onset(injection, started_at)
     bound = latency_bound.allowed_latency(
-        interval, confirmation, exporter, quiet_stamp, records, delivery
+        interval, confirmation, exporter, quiet_stamp, records, delivery, onset
     )
     errors = list(window["errors"])
     errors.extend(delivery["errors"])
@@ -779,19 +780,14 @@ def run_collect002(
             f"lowered power limit for {load_seconds}s"
         )
     else:
-        latency = (parse_stamp(delivered_at) - started_at).total_seconds()
+        latency = latency_bound.measured_latency(delivered_at, bound)
         errors.extend(latency_bound.latency_errors(latency, bound, interval=interval))
     if not candidate:
         errors.append("no delivered evidence names a candidate or threshold reason")
     after = fixture.snapshot()
-    defaults = {
-        item["power_default_limit_w"] for item in after.get("gpu_power") or [{}]
-    }
-    if (
-        len(defaults) != 1
-        or {item["power_limit_w"] for item in after.get("gpu_power") or [{}]}
-        != defaults
-    ):
+    powers = after.get("gpu_power") or [{}]
+    defaults = {item["power_default_limit_w"] for item in powers}
+    if len(defaults) != 1 or {item["power_limit_w"] for item in powers} != defaults:
         errors.append("GPU power limits did not return to the driver default")
     return {
         "verdict": "PASS" if not errors else "FAIL",

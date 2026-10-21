@@ -1,16 +1,31 @@
 """COLLECT-002's latency bound: one term per stage between the load and the Store.
 
-The case measures from the load-start receipt the probe writes right before it
-execs ``dcgmproftester`` to the Store's ``ingested_at`` of the first accepted
-power candidate. The stages in between, read off the pinned sources --
-dcgm-exporter ``4.6.1-4.8.4``, its go-dcgm ``v1.4611.2`` and DCGM 4.6.1 (the
-exporter's embedded engine, and the nearest public source of the node host
-engines) -- are the same in the exporter's embedded and host
+The case measures to the Store's ``ingested_at`` of the first accepted power
+candidate from the load's observed onset (:func:`load_onset`): after the
+load-start receipt the throttle probe reads the loaded GPU (read-only
+``nvidia-smi``, the NVML values DCGM samples) until one read reaches the
+collector's ``power_limit_correlation`` thresholds, and the latency runs from
+the start of the last read still below them. ``dcgmproftester``'s own start-up
+between the receipt and its first kernel -- it execs, starts an embedded DCGM
+over every GPU, forks a CUDA worker that creates its context, loads its PTX
+module and cuBLAS, and only then runs its GEMMs -- lies before that read: no
+source bounds it, and it is not part of the product's path. Live on a healthy
+H200 node the first anomalous sample came 33.1 s after the receipt against the
+31 s the sampling allows, every product stage after it nominal. Without the
+onset reads (an older probe, a failed read, a load that never reached the
+thresholds) the latency runs from the receipt and the start-up is listed as
+the one stage without an allowance. The stages after the onset, read off the
+pinned sources -- dcgm-exporter ``4.6.1-4.8.4``, its go-dcgm ``v1.4611.2`` and
+DCGM 4.6.1 (the exporter's embedded engine, and the nearest public source of
+the node host engines) -- are the same in the exporter's embedded and host
 (``DCGM_REMOTE_HOSTENGINE_INFO``) modes:
 
 1. NVML. DCGM reads the power through ``nvmlDeviceGetPowerUsage``, a 1-s average
    on Ampere and newer, and the utilization over a sample period of at most
-   1 s: a reading trails the load by up to a second.
+   1 s: a reading trails the load by up to a second. Measured from the onset
+   read the same values cross the thresholds before the first read at them
+   ends: the second covers that gap up to 1 s, and a wider gap adds its excess
+   (``load_onset_excess_seconds``).
 2. DCGM watch. The exporter watches its fields every collect interval
    (``updateFreq = -c x 1000`` us, ``maxKeepAge`` 600 s) and the cache manager
    samples a field only once its age reaches that period; a host engine with
@@ -30,11 +45,8 @@ engines) -- are the same in the exporter's embedded and host
    ``confirmation - 1`` ticks to the sample that confirms it.
 5. Delivery: the confirming tick's own work from its sample stamp to the Store.
 
-The sampling terms come from the live configuration; the ticks' work and the
-delivery are measured in the case itself. ``dcgmproftester``'s own start-up
-between the receipt and its first kernel (it starts an embedded DCGM and a CUDA
-worker first) has no source bound and is not observable, so it gets no
-allowance.
+The sampling terms come from the live configuration; the onset gap, the ticks'
+work and the delivery are measured in the case itself.
 """
 
 from __future__ import annotations
@@ -62,12 +74,15 @@ REMOTE_FLAGS = frozenset(
     {"-r", "--r", "-remote-hostengine-info", "--remote-hostengine-info"}
 )
 REMOTE_ENV = "DCGM_REMOTE_HOSTENGINE_INFO"
-#: The one stage between the two stamps the bound has no term for.
+#: Without the probe's onset reads, the one stage between the receipt and the
+#: Store the bound has no term for.
 WITHOUT_ALLOWANCE = (
     "dcgmproftester start-up between the receipt and its first kernel "
-    "(embedded DCGM and CUDA worker start): no source bounds it and the case "
-    "cannot observe it"
+    "(embedded DCGM, CUDA worker and cuBLAS start): no source bounds it and, "
+    "without the probe's onset reads, the case cannot observe it"
 )
+ONSET = "load-onset"
+RECEIPT = "load-start-receipt"
 
 
 def _flag_value(tokens: Sequence[str], names: frozenset[str]) -> str | None:
@@ -201,6 +216,56 @@ def _stamp(value: object) -> datetime | None:
     return stamp if stamp.tzinfo is not None else None
 
 
+def load_onset(injection: Mapping[str, Any], started_at: datetime) -> dict[str, Any]:
+    """Where the latency is measured from: the probe's onset reads, else the receipt.
+
+    ``injection["load_onset"]`` holds the start of the last read of the loaded
+    GPU still below the correlation thresholds (``idle_read_at``; ``None`` when
+    the first read after the receipt already reached them) and the end of the
+    first read at both (``loaded_read_at``). NVML -- and so DCGM and the
+    collector -- crossed the thresholds between the two, so the latency runs
+    from the idle read (else the receipt) and their gap is the first stage's
+    width. Reads that are missing, never reached the thresholds or are out of
+    order leave the receipt as the reference, and the start-up unpriced.
+    """
+
+    reads = injection.get("load_onset")
+    receipt: dict[str, Any] = {
+        "source": RECEIPT,
+        "measured_from": started_at.isoformat(),
+        "window_seconds": None,
+        "excluded_seconds": 0.0,
+        "reads": reads,
+    }
+    if not isinstance(reads, Mapping):
+        return {**receipt, "detail": "the throttle receipt carries no onset reads"}
+    idle_read, loaded_read = reads.get("idle_read_at"), reads.get("loaded_read_at")
+    if loaded_read is None:
+        why = reads.get("error") or "the probe's wait ended first"
+        return {**receipt, "detail": f"no read reached the thresholds: {why}"}
+    idle = started_at if idle_read is None else _stamp(idle_read)
+    loaded = _stamp(loaded_read)
+    if idle is None or loaded is None or not started_at <= idle < loaded:
+        return {**receipt, "detail": "the onset reads are malformed or out of order"}
+    return {
+        "source": ONSET,
+        "measured_from": idle.isoformat(),
+        "window_seconds": round((loaded - idle).total_seconds(), 3),
+        "excluded_seconds": round((idle - started_at).total_seconds(), 3),
+        "reads": dict(reads),
+    }
+
+
+def measured_latency(delivered_at: str, bound: Mapping[str, Any]) -> float:
+    """Seconds from the bound's reference (onset read or receipt) to the Store."""
+
+    start = _stamp(bound["load_onset"]["measured_from"])
+    end = _stamp(delivered_at)
+    if start is None or end is None:
+        raise ValueError("the latency's reference or delivery stamp is invalid")
+    return (end - start).total_seconds()
+
+
 def collector_window(
     quiet_stamp: str, confirming_at: datetime | None, interval: int
 ) -> dict[str, Any]:
@@ -236,12 +301,14 @@ def allowed_latency(
     quiet_stamp: str,
     records: Iterable[Any],
     delivery: Mapping[str, Any],
+    onset: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """The bound, its components in seconds and what each was read from.
 
     ``exporter`` is :func:`read_exporter`'s answer, ``quiet_stamp`` the
     collector's last delivery before the load, ``records`` the window's raw
-    evidence and ``delivery`` its ``collector_power_delivery.delivery_evidence``.
+    evidence, ``delivery`` its ``collector_power_delivery.delivery_evidence``
+    and ``onset`` :func:`load_onset`'s reference (the receipt when absent).
     """
 
     record_ids = list(delivery.get("record_ids") or [])
@@ -269,6 +336,11 @@ def allowed_latency(
         "collector_tick_overrun_seconds": float(window["overrun_seconds"]),
         "delivery_seconds": transport,
     }
+    observed = False
+    if onset is not None and onset.get("source") == ONSET:
+        observed = True
+        excess = float(onset["window_seconds"]) - NVML_AVERAGE_SECONDS
+        components["load_onset_excess_seconds"] = round(max(0.0, excess), 3)
     return {
         "total_seconds": round(sum(components.values()), 3),
         "components": components,
@@ -278,7 +350,8 @@ def allowed_latency(
             "confirmation_samples": confirmation,
             "window": window,
         },
-        "stages_without_allowance": [WITHOUT_ALLOWANCE],
+        "load_onset": dict(onset) if onset is not None else None,
+        "stages_without_allowance": [] if observed else [WITHOUT_ALLOWANCE],
     }
 
 
@@ -296,6 +369,8 @@ def latency_errors(
             "interval: a slow or retried delivery, not sampling"
         )
     if not 0 <= latency <= bound["total_seconds"]:
+        onset = bound.get("load_onset") or {}
+        reference = {ONSET: "load onset read"}.get(onset.get("source"), "receipt")
         errors.append(
             f"the anomaly took {latency:.1f}s to deliver, more than the "
             f"{bound['total_seconds']:.1f}s bound ("
@@ -303,6 +378,6 @@ def latency_errors(
                 f"{name.removesuffix('_seconds')} {value:g}s"
                 for name, value in components.items()
             )
-            + ")"
+            + f"), measured from the {reference}"
         )
     return errors
