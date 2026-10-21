@@ -99,6 +99,13 @@ next attempt in the same run directory starts a fresh execution, and the case
 result records the archived lineage as `retired_execution`. Only an unfinished
 execution keeps routing to cleanup-only recovery.
 
+A refusal of the original completion, by the watchdog's freshness certification
+or by the fence close's own, starts a replacement cleanup observer in the same
+run. The fence then closes only on that observer's completion as the watchdog
+certified it: the fence's own read must find exactly that terminal receipt,
+unchanged, before the cleanup attempt's deadline. Its receipt marks the case
+failed; an observer that cannot complete keeps the fence.
+
 Unresolved journals, source/identity drift, or unproven command quiescence require
 operator reconciliation. Interrupted metadata-only variants do not reconstruct
 their original mutation baseline from current labels. Independent service

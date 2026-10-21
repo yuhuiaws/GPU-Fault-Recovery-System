@@ -10349,7 +10349,8 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   means the customer's nodes would be destroyed without authorization. **Blocks go-live.**
 - Cleanup: first withdraw the producer, prove that the original POST source has completed, that no records are pending creation, and that every
   workflow/command of this run is silent, then close the GPU fence, retire the CPU watchdog, and finally restore the fixtures and
-  workload. If the POST/creation ACK is unknown, QUIESCENT is stale, or commands are still active, keep the protection in place and FAIL.
+  workload. If the POST/creation ACK is unknown or commands are still active, keep the protection in place and FAIL; a stale
+  QUIESCENT is first re-established by a cleanup observer (below), and if that fails the protection likewise stays and the case FAILs.
   The last scenario must likewise have complete cleanup proof; its `verdict=PASS` alone does not complete the matrix.
   Only ownership/reservation written by this workflow may be deleted; installer annotations must not be wildcard-deleted.
   "Stale" counts from the moment the observer writes its terminal receipt: the receipt is written once, the 30-second
@@ -10362,11 +10363,23 @@ aws cloudtrail lookup-events --region "${AWS_REGION}" \
   re-read sequentially on every pass, about 22 sequential reads between the close request and the certification: at
   about 1.2 s per kubectl call, and 2-6 s while parallel test suites saturate the acceptance host's disk I/O, the
   receipt was 36 s old when certified, so only a cleanup observer could re-establish the proof and the case FAILed. A
-  receipt that really exceeds the bound is still refused: a refusal by the watchdog falls back to a cleanup observer and
-  FAILs, a refusal by the fence keeps the protection, defers cleanup and FAILs. `finish()` errors keep the harness's own
-  fixed reason (the `RegionalFixtureError` text, kubectl output already redacted; any other exception keeps only its
-  class), and the scenario result's `errors` carries them with an `independent safety: ` prefix. Verdicts:
-  `tests/regional/test_destr008_receipt_freshness.py`.
+  receipt that really exceeds the bound is still refused, and both refusals recover the same way: a refusal by the
+  watchdog's certification (`original watchdog completion: …`) or by the fence's own re-certification
+  (`original fence close: …`) starts a fresh cleanup observer at once. The watchdog certifies that observer's terminal
+  receipt against the same 30-second bound (Job complete, Pod Succeeded, supporting resources re-verified); the fence
+  then reads the control itself and closes on it only when it finds exactly that receipt, unchanged, before the cleanup
+  attempt's own deadline (`cleanup.deadline_at`, at most 180 s; `CancellationControl.cleanup_completion`). The fence's
+  read comes three round trips after the watchdog's, so at about 5.5 s per kubectl call it is past 30 s even when the
+  watchdog's certification was fresh. The fence used to keep the protection and defer every cleanup until an operator
+  acted, and under the same load the cleanup observer's receipt after a watchdog refusal stalled at the fence the same
+  way. The cleanup observer's receipt carries `case_failed` and the scenario adds `independent watchdog rejected this
+  case`, so the case FAILs and never turns into a PASS; the matrix proceeds as after a watchdog refusal: a scenario with
+  complete cleanup proof is recorded as cleaned and the matrix stops at this FAILed scenario. A cleanup observer that
+  cannot complete (no terminal receipt, a receipt the watchdog also finds stale, or one the fence finds rewritten or past
+  its deadline) keeps the protection, defers cleanup and FAILs with `cleanup observer: …`. `finish()` errors keep the
+  harness's own fixed reason (the `RegionalFixtureError` text, kubectl output already redacted; any other exception
+  keeps only its class), and the scenario result's `errors` carries them with an `independent safety: ` prefix.
+  Verdicts: `tests/regional/test_destr008_receipt_freshness.py` and `tests/regional/test_destr008_fence_refusal.py`.
 - An existing run only enters cleanup resumption; it does not re-send the POST, re-create the workload or stop a service again; the original
   attempt, Plan and deadlines are kept, and a successful cleanup does not turn the original failure into a PASS. A metadata-only interruption
   whose original modification baseline was not preserved cannot guess recovery from the current labels and must be reconciled by hand. A completed and fully cleaned
