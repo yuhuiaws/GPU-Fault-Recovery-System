@@ -29,7 +29,7 @@ from gpu_fault.models import (
     bounded_reasons,
     resolved_step_indexes,
 )
-from gpu_fault.orchestration.arbitration import RecoveryArbiter
+from gpu_fault.orchestration.arbitration import RecoveryArbiter, gpu_shares_unknown
 from gpu_fault.orchestration.dag_branching import DagBrancher
 from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
 from gpu_fault.orchestration.reset_window import fixed_scope_step_indexes
@@ -126,14 +126,20 @@ def merge_sxid_step_scope(
             steps.append(step)
             continue
         parameters = dict(step.parameters)
-        gpu_mapping = {
-            str(node_id): list(values)
-            for node_id, values in (parameters.get("gpu_uuids_by_node", {})).items()
-            if isinstance(values, list)
-        }
-        gpu_mapping[event.node_id] = sorted(
-            set(gpu_mapping.get(event.node_id, [])) | set(event.participating_gpu_uuids)
-        )
+        # A shared step whose GPUs the workflow cannot place stays unmapped:
+        # this node's entry alone, and the other node's at the next SXID, made
+        # a complete mapping without the unplaced GPUs (batch 155).
+        if not gpu_shares_unknown(workflow, step):
+            gpu_mapping = {
+                str(node_id): list(values)
+                for node_id, values in (parameters.get("gpu_uuids_by_node", {})).items()
+                if isinstance(values, list)
+            }
+            gpu_mapping[event.node_id] = sorted(
+                set(gpu_mapping.get(event.node_id, []))
+                | set(event.participating_gpu_uuids)
+            )
+            parameters["gpu_uuids_by_node"] = gpu_mapping
         sxid_mapping = {
             str(node_id): list(values)
             for node_id, values in (parameters.get("sxids_by_node", {})).items()
@@ -147,7 +153,6 @@ def merge_sxid_step_scope(
             partition_mapping[event.node_id] = event.fabric_partition
         parameters.update(
             {
-                "gpu_uuids_by_node": gpu_mapping,
                 "sxids_by_node": sxid_mapping,
                 "fabric_partitions_by_node": (partition_mapping),
             }

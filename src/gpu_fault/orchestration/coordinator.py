@@ -1432,10 +1432,10 @@ class IncidentOrchestrator:
         barrier hands every agent exactly its entry, and the whole GPU
         list of a shared step on each of its nodes sent a sibling's GPU
         to this node's agent (batch 155). A multi-node step without its
-        own mapping whose GPUs the workflow cannot place gets no entry
-        for any of its nodes -- a partial one would drop the unplaced GPU
-        from the reset unseen -- and the adapter refuses it before any
-        command is sent.
+        own mapping whose GPUs the workflow cannot place stays without
+        one (``arbitration.gpu_shares_unknown``): any entry could drop
+        the unplaced GPU unseen, and the barrier refuses the unmapped
+        reset before any command is sent.
 
         Steps that neither touch the host nor a workload -- cordon,
         validate, uncordon, node reboot -- take the wider ``node_ids``
@@ -1475,12 +1475,12 @@ class IncidentOrchestrator:
             }
             if step.operation in self._NODE_ACTION_OPERATIONS:
                 widened["node_ids"] = sorted(set(step.node_ids) | set(gpu_nodes))
-                widened["parameters"] = {
-                    **step.parameters,
-                    "gpu_uuids_by_node": widened_gpu_mapping(
-                        workflow, step, gpu_uuids_by_node
-                    ),
-                }
+                mapping = widened_gpu_mapping(workflow, step, gpu_uuids_by_node)
+                if mapping is not None:
+                    widened["parameters"] = {
+                        **step.parameters,
+                        "gpu_uuids_by_node": mapping,
+                    }
             steps.append(step.model_copy(update=widened))
         return workflow.model_copy(update={"official_steps": steps})
 

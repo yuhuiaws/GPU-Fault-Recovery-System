@@ -120,26 +120,47 @@ def step_gpu_shares(
     return shares
 
 
+def gpu_shares_unknown(workflow: WorkflowRequest, step: WorkflowStepSpec) -> bool:
+    """A multi-node step without its own ``gpu_uuids_by_node`` whose GPUs the
+    workflow cannot place on its nodes (``step_gpu_shares`` is ``None``).
+
+    A merge leaves such a step without a mapping. Any per-node entry could
+    drop the unplaced GPU from the action unseen, and a withheld mapping
+    written as a partial dict does not stay withheld: ``widen_in_place``,
+    the DAG twin and ``merge_sxid_step_scope`` add the event node's entry to
+    any dict, so two or three merges completed it without the unplaced GPUs
+    (batch 155). Left unmapped, the next merge reads the step as unplaced
+    again and maps it once the workflow places every GPU; until then the
+    multi-node reset barrier refuses it before any command is sent
+    ("multi-node GPU reset requires parameters.gpu_uuids_by_node"), and any
+    other node action sends its flat list per node as an unmerged step does.
+    """
+
+    return (
+        not isinstance(step.parameters.get("gpu_uuids_by_node"), dict)
+        and len(step.node_ids) > 1
+        and step_gpu_shares(workflow, step) is None
+    )
+
+
 def widened_gpu_mapping(
     workflow: WorkflowRequest,
     step: WorkflowStepSpec,
     gpu_uuids_by_node: Mapping[str, Collection[str]],
-) -> dict[str, list[str]]:
+) -> dict[str, list[str]] | None:
     """The ``gpu_uuids_by_node`` a merge writes on a pending node-action step.
 
     The step's own mapping plus every node of the merged scope
     (``RecoveryArbiter.merged_gpu_scope``) that carries GPUs; a node without
     GPU identity joins host-level steps only, as the node-action adapter
-    refuses a GPU action on a node whose list is empty (P0-57C). A multi-node
-    step without its own mapping whose GPUs ``step_gpu_shares`` cannot place
-    gets no entry for any of its own nodes, whatever the scope holds for them:
-    any of them may hold the unplaced GPU, and a partial entry would drop it
-    from the action unseen. With the entry missing, the adapter refuses the
-    step before any command is sent ("missing explicit GPU UUIDs for <node>").
+    refuses a GPU action on a node whose list is empty (P0-57C). ``None`` for
+    a step whose GPU shares are unknown (``gpu_shares_unknown``): the merge
+    writes no mapping on it.
     """
 
+    if gpu_shares_unknown(workflow, step):
+        return None
     merged: dict[str, set[str]] = {}
-    withheld: set[str] = set()
     raw = step.parameters.get("gpu_uuids_by_node")
     if isinstance(raw, dict):
         for node_id, values in raw.items():
@@ -147,10 +168,8 @@ def widened_gpu_mapping(
                 merged.setdefault(str(node_id), set()).update(
                     str(value) for value in values
                 )
-    elif step_gpu_shares(workflow, step) is None:
-        withheld = set(step.node_ids)
     for node_id, values in gpu_uuids_by_node.items():
-        if values and node_id not in withheld:
+        if values:
             merged.setdefault(node_id, set()).update(values)
     return {node_id: sorted(values) for node_id, values in sorted(merged.items())}
 
