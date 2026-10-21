@@ -14246,14 +14246,21 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
 - Formal entry: `scripts/e2e/regional/run_collector_acceptance.py --case GF-REGIONAL-COLLECT-002`.
 - Purpose: `COLLECT-001` proved "steady-state suppression",
   but excessive suppression would **suppress real faults**. This case proves the other half.
-- Injection method: **lower the enforced power limit of every GPU on the node to the driver minimum
-  (200W on H200, default 700W), then apply load to one of them with
-  `dcgmproftester13 -t 1004`**,
+- Injection method: **lower the enforced power limit of the loaded GPU only to the driver minimum
+  (200W on H200, default 700W), then apply load to it with
+  `dcgmproftester13 -t 1004`; every other GPU keeps its default limit**,
   so that this GPU's actual power draw sticks to and exceeds the lowered limit,
   `DCGM_FI_DEV_POWER_VIOLATION` really starts accumulating,
   the `power/limit` ratio crosses `power_limit_ratio` (0.95),
   utilisation crosses `power_correlation_min_utilization_percent` (80),
   forming a **real, decidable** `{device}/power_limit_correlation` candidate.
+  The other GPUs are not capped: on a capped idle GPU `DCGM_FI_DEV_POWER_VIOLATION` advances at about
+  one second per second too and confirms that GPU's own duty-cycle candidate on the loaded GPU's
+  confirming tick or one tick from it (one tick later on plain EKS, the same tick on HyperPod); a DCGM
+  batch carries the whole node's samples and one batch-level `candidate-confirmed` that does not say
+  which key confirmed, so an idle GPU's confirmation could be timed as the load's delivery -- which only
+  makes a slow chain look faster, a false PASS. The case's anomaly is the loaded GPU's correlated
+  throttle alone; capping the other GPUs adds nothing to it.
 - Steps:
   1. First take the latest `observed_at` of the GPU chain from the collector status with the `dcgm-`
      prefix and wait for it to change once, obtaining a "just reported" starting point (`quiet_stamp`);
@@ -14262,13 +14269,23 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
      with an unknown starting point there is no latency to speak of. Before that, the running
      `gpu-fault-dcgm-exporter` Pod on the target node is read once, read-only, for its collect period
      and DCGM mode (see the bound below); a failed read does not block the case.
+     After the starting point and before the cap, the runner reads once, read-only through the CPU
+     cluster, the Store's latest violation counters, pending/failure flags and XID of every GPU of the
+     node (`list_gpu_metrics_latest`, which the health summaries update too;
+     `collector_power_delivery.power_reference`) as the pre-cap reference of step 3's attribution, and
+     takes `GPU_FAULT_DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD` from the node's `collector.env` (the
+     collector's 0.05 when unset); a failed read does not block the case and its reason is written to
+     `delivery_evidence.attribution.reference.error`.
   2. The `throttle-gpu` probe first confirms the complete GPU UUID/index set, finite power values and
      the default power baseline, generates an independent run identity from this evidence directory and
      attempt, and saves the node-exclusive change intent and recovery record.
      The recovery script is stored independently in a protected state directory and does not depend
      on the ephemeral HostProbe staying alive.
      Only after verifying the recovery timer's actual command, state and fixed deadline does it lower
-     the power per UUID.
+     the power of the loaded GPU, by its UUID; on read-back the loaded GPU must be at its minimum and
+     every other GPU still at its baseline limit, or no load starts
+     (`cap readback does not match the owned target`), and the load process checks again before it
+     hands over to the load command (`GPU load requires the verified power cap`).
      The load is constrained by an exclusive systemd cgroup and a timeout with a hard-kill bound, and
      must end before the recovery deadline.
      Before handing over to the load command, the node writes a non-overwritable start receipt bound to
@@ -14300,15 +14317,31 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
      Seventh plain-EKS round: `dcgmproftester12` ran as an active unit for the whole window while the
      loaded GPU stayed at 0 %/76 W under its 200 W cap, so no `power_limit_correlation` candidate
      could exist; the one batch confirmed in the window came from the violation counters of the capped
-     idle GPUs and the runner rightly rejected it. Neither the collector's duty-cycle write-off (a
-     violation counter advancing faster than wall clock is refused as "not a duration", by design) nor
-     the exporter's 15-s period decided that case; the load did.
+     idle GPUs (every GPU was capped then) and the runner rightly rejected it. Neither the collector's
+     duty-cycle write-off (a violation counter advancing faster than wall clock is refused as "not a
+     duration", by design) nor the exporter's 15-s period decided that case; the load did.
      `collector_status` is an overwritable latest state; the polled values serve only as auxiliary
      observation. The anomaly latency is taken from the `ingested_at` of the earliest matching
-     persistent DCGM candidate batch in this window, validating cluster/node, batch/record ID, the
-     UUID/index of the loaded GPU, the power/utilisation conditions and the collection/ingestion time
-     order. Later overwritten states are not treated as the first delivery, and records for unrelated
-     GPUs, malformed records or records with future timestamps are not used.
+     persistent DCGM candidate batch in this window that is attributed to the loaded GPU, validating
+     cluster/node, batch/record ID, the UUID/index of the loaded GPU, the power/utilisation conditions
+     and the collection/ingestion time order. Later overwritten states are not treated as the first
+     delivery, and records for unrelated GPUs, malformed records or records with future timestamps are
+     not used.
+     Attribution (`collector_power_delivery.delivery_evidence`): the batch-level `candidate-confirmed`
+     does not say whose candidate confirmed, and a key confirms only on a tick it breaches, so any other
+     GPU of the same batch could own the confirmation when it meets one of these: its draw is
+     correlated with its own limit (both `power_limit_correlation` thresholds); a violation counter
+     advanced since its latest earlier reading (step 1's pre-cap reference, or an earlier DCGM batch of
+     this window) by at least the collector's duty-cycle threshold x one collection interval (by default
+     0.05 x 15 s = 0.75 s; the counters only grow, so that advance bounds a single tick's, and a healthy
+     GPU's microsecond creep stays below it; with no valid threshold on the node any advance counts), or
+     the counter fell (a reset, which cannot be bounded); a pending/failure flag or XID newly set or
+     changed; a nonzero value without an earlier reading. Such a batch is not timed; it is written to
+     `delivery_evidence.attribution.ignored` with the GPUs it names (index, UUID, limit) and why. The
+     latency is timed from the first batch attributed to the loaded GPU (`attribution.record_id`); a
+     later batch can only make the latency larger, never a false PASS. Without an attributable batch in
+     the window the case fails (fail closed) and the error names those GPUs. Temperature and Fabric
+     Manager candidates are outside the attribution.
   4. Regardless of the outcome, request `restore-gpu-power-limit`. Without this run's change intent no
      GPU is written, and a rejected custom power limit is not reset to the default. For an existing
      change, first prove that the owning load/cgroup has stopped, then restore the saved baseline over
@@ -14335,6 +14368,9 @@ and only a real recovery from a persistent mismatch reports `recovered:`.
     ≤ one `interval`; beyond that it is named as a slow or retried delivery, not counted as sampling;
   - within the window a `GPU_METRICS` evidence record exists whose `edge_filter_reasons` contains
     candidate / threshold;
+  - the timed confirming batch is attributed to the loaded GPU: no other GPU in it carries a candidate
+    of its own (`delivery_evidence.attribution`; the batches not timed and the GPUs they name are listed
+    under `ignored`);
   - at wrap-up every GPU's `power.limit` equals `power.default_limit`.
   - the power-lowering receipt explicitly proves that the change, timer and load were established; the
     normal wrap-up receipt explicitly proves that the load stopped, the baseline was restored, the
@@ -14430,6 +14466,9 @@ the same time, and adding the gate there would discard true positives.
 
 - Lowering the enforced power limit is **reducing heat and power**, not overclocking;
   there is no hardware damage risk; `nvidia-smi -pl` is a reversible operation supported by the driver.
+- Only the loaded GPU is capped and no other GPU is written; the recovery paths are unchanged: the
+  restore, the deadman timer, the confirmation after a reboot and the cleanup tool return any GPU off
+  its recorded baseline and verify every GPU, so a record left by the all-GPU design recovers as well.
 - The load duration and the deadman restore duration are validated by the runner:
   `load_seconds > restore_seconds` raises `ProbeError` outright
   (the load must end before the restore, otherwise the restore lands in the middle of the load).
