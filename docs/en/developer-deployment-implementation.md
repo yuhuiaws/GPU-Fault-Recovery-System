@@ -876,7 +876,8 @@ must first be written to the former, then sent to the control plane and deleted 
 only on failure are they written latest-wins by `cluster_id + attempt_id` into the same WAL and replayed in the next round, so that a brief control-plane
 write failure does not leave the CPU-side Observation permanently in `RUNNING`. The `active-attempts.json` in the `-active` object
 only saves active Observations when an attempt structure first appears or changes, and for each Pod stores only the attribution identity outside the spec
-(uid/rank/node plus `gpu_uuids`, `container_id`, `cgroup_path`, `host_pid`, about 833 B/Pod;
+(uid/rank/node plus `gpu_uuids`, `container_id`, `cgroup_path`, `host_pid`, the exit fields and, only while true,
+the deletion request `deleting`; about 833 B/Pod;
 the 900 KB ceiling holds about 1080 managed Pods, and attempts beyond that only lose restart memory without affecting delivery); after a Watcher
 restart the remaining fields are rebuilt from live Pods, and when a Pod has already disappeared `STOPPED` is published per the cleanup timeout. The reason for the split is
 the 1 MiB ceiling of a ConfigMap: when the steady-state state and the WAL share one object, observations of thousands of Pods squeeze terminal-event

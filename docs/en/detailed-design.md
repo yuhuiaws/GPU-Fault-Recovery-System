@@ -2153,7 +2153,10 @@ keeps the ones the previous reading held for the same Pod UID, container and ran
 active record, which lives until the attempt's terminal reading is published, so a restart after the FAILED reading still
 has it; `completion_observation.keep_known_gpu_uuids`), so the GPUs of a rank that died still appear in the failure
 event, the attempt-failure incident and the terminal allocation; a container never read with UUIDs keeps none, and a
-replacement Pod (new UID) is read from its own Pod.
+replacement Pod (new UID) is read from its own Pod. The same record keeps whether the Pod's deletion had been requested
+(`deleting`, written only while true), so a rank that exited non-zero after a graceful delete or an eviction is still a stop
+after a watcher restart, not a training failure (before, the restored attempt ended TIMED_OUT and the control plane opened a
+containment that stopped the running job).
 
 The Dispatcher scans at most 100 entries every 5 seconds by default. A single failure is isolated and does not block the other workflows in the same batch.
 

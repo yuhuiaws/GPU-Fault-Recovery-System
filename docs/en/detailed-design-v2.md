@@ -571,6 +571,18 @@ A few points that must be remembered:
   A non-zero exit while the Pod carries `metadata.deletionTimestamp` is likewise read as STOPPED (`deletion_requested`):
   a user/operator `kubectl delete` of the job first makes torchrun receive SIGTERM and exit with 1 and then makes the Pod disappear;
   this is not a training failure, no failure-detected is sent, no restart budget is consumed, no escalation.
+  The persisted active record keeps the request (`deleting`, written only while true), so the verdict survives a watcher
+  restart -- also for a single Pod that is deleted or evicted (Eviction API: a drain, a consolidation) while the job goes on with
+  the controller's replacement Pod. Before, the record kept the exit and dropped the request: a watcher restarted after such a
+  reading restored the rank as an unexcused non-zero exit, the watcher core held a failure no failure-detected ever reported,
+  and the attempt -- still running on its other ranks and on the replacement -- ended TIMED_OUT at the cleanup deadline, which
+  the control plane answers with the attempt's containment (FREEZE_EVIDENCE, STOP_WORKLOADS of the healthy job) and a
+  RESTART_WORKLOAD plan; a job the user had deleted, restored past the cleanup deadline (30 s in the shipped manifest), got a
+  containment and a restart instead of the user stop. A Pod nobody asked to remove carries no such key, so its record is byte for
+  byte the earlier release's and the upgrade rewrites nothing; an earlier watcher (a rollback) keeps only the keys it knows and
+  reads the record as it always did. A record without the key -- every record an earlier watcher wrote -- restores no deletion: a
+  deletion is read, never inferred, so a watcher upgraded inside that narrow window (the deleted rank's exit read, its Pod not
+  yet removed) still restores that exit as a failure once.
   Once an attempt's failure is detected, the passive containment's STOP_WORKLOADS annotates its Pods and then deletes them with
   zero grace, one after another; a pass that lands between two of those deletes lists only the surviving Pods. That pass keeps the
   exits of the ranks the previous pass saw terminated (`completion_observation.carry_vanished_failed_ranks`): the observation stays
@@ -637,7 +649,8 @@ A few points that must be remembered:
   write-ahead. `active-attempts.json` lives in the separate `-active` ConfigMap (the WAL and steady state are
   separate; no amount of steady state can crowd out terminal events), storing active attempts by a structural digest that ignores `observed_at`,
   and each Pod stores only its attribution identity (uid/rank/node/`gpu_uuids`/`container_id`/`cgroup_path`/
-  `host_pid`, about 833 B/Pod), so the normal 3-second refresh does not write the ConfigMap; after a Watcher restart it restores
+  `host_pid`, about 833 B/Pod) plus its exit fields and, only while true, its deletion request (`deleting`), so the normal
+  3-second refresh does not write the ConfigMap; after a Watcher restart it restores
   spec/allocation and rebuilds the remaining fields from live Pods; when Pods are missing beyond the cleanup timeout it sends `STOPPED` and clears
   the persisted state; the record lives until the attempt's terminal reading is published, a FAILED reading does not delete it. The WAL depth is tracked in-process; when known to be empty, replay no longer GETs, and ConfigMap reads on a healthy cluster
   are close to zero. A release rollout preserves the two existing state ConfigMaps and does not replay default empty data. After a terminal event is produced, both the Watcher and the Store map the Observation monotonically to the terminal state; the Store

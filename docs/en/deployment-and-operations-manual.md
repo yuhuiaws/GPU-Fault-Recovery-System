@@ -8100,7 +8100,10 @@ Ordinary `/v1/workload-observations` are sent directly first; only on send failu
 `gpu-fault-completion-watcher-outbox`, and the next reconcile replays first, so the healthy path adds no
 ConfigMap write amplification. The steady state lives in another object, `gpu-fault-completion-watcher-outbox-active`:
 `active-attempts.json` saves state only when the attempt structure changes (about 833 B per Pod, within about 1080 managed Pods),
-the Watcher can recover after a restart and publish `STOPPED` for disappeared Pods; a rolling upgrade does not overwrite the two existing
+the Watcher can recover after a restart and publish `STOPPED` for disappeared Pods; the record also keeps a Pod's deletion request (`deleting`,
+written only while true), so a graceful delete or an eviction (a non-zero exit after `deletionTimestamp`) still reads as a stop, not a
+training failure, after a restart -- a record without deletions is byte for byte the previous release's, so upgrading rewrites nothing,
+and a rolled-back watcher ignores the key; a rolling upgrade does not overwrite the two existing
 ConfigMaps, and when upgrading to this version the attempt state in the old object is migrated once when the Watcher first reads it; the migration is one-way
 (the `attempt:*` keys in the old object are deleted), and after rolling back to the previous watcher there is no restart memory and it can only be rebuilt from live Pods. The Role's
 `resourceNames` must list both objects; when `-active` reads 403/404 the Watcher runs degraded and sets
