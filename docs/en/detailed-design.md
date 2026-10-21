@@ -1715,6 +1715,12 @@ inventory instead (`scope_validation_steps`) -- every GPU the node reports must 
 validated node-wide (fresh node telemetry, every finding on the node). Such a GPU was never reported by any node of the scope, so
 the failed node gives up no evidence it could have produced. Node-action steps carry `gpu_uuids_by_node` only when every failed
 node holds a share and every source GPU is placed; when the store cannot be read, the workflow's own lists decide, as before.
+The operator's validated restore (`orchestration/validated_restore.py`) takes an incident GPU off a restored node's validation
+only on positive evidence that it sits elsewhere: the inventory of a release-only node (one held only by this incident's
+quiesce taint, released and not validated) or, for an escalation successor, of a node on its lineage lists it and no restored
+node's inventory does. The admin side's `--plan` preview and the in-Pod write call the same builder with the same inputs
+(restored nodes, release-only nodes, inventories), so the workflow written is the one previewed; a deployed image whose builder
+cannot take release-only nodes refuses the write.
 
 `KernelLogCollector` is the current production primary collector for SXIDs. NVIDIA's official documentation states that NVSwitch runtime
 errors are written by the driver to the OS kernel/event log; the Collector reads the
@@ -1915,7 +1921,18 @@ SUCCEEDED for two GPUs while the node reset one. When a multi-node step widens (
 `gpu_uuids_by_node` entry), the widened node's entry takes only its own GPUs (the new event's, and those of the candidate's
 single-node step on that node), as `DagBrancher.widen_parallel_job_branch` does; `disposition.widen_in_place` used to add the
 step's whole GPU list to that entry, so the barrier sent a sibling's GPU to this node's Agent and the reset failed on a UUID it
-does not have. Arbitration compares not only rank but also uses explicit
+does not have. The orchestrator's merge widening holds a node-action step without its own `gpu_uuids_by_node` to the same
+rule: `RecoveryArbiter.merged_gpu_scope` places such a multi-node step's GPUs with the workflow's own per-node lists
+(`arbitration.step_gpu_shares` over `gpu_placement.workflow_gpu_placement`: explicit mappings, single-node steps) and gives each
+node only the GPUs placed there -- it used to give every node of the step the whole list, which the widened mapping would have
+handed to each node's Agent. When those lists cannot place every GPU of the step, none of them is attributed, and
+`IncidentOrchestrator._widen_node_action_scope` (through `arbitration.widened_gpu_mapping`) widens the step's nodes and flat GPU
+list but writes no mapping on it. A multi-node reset without a mapping is refused before any command is sent (`multi-node GPU
+reset requires parameters.gpu_uuids_by_node`) and the ladder takes over; other node actions hand each node the step's list, as for
+a step no merge touched, and an Agent refuses a GPU it does not have. The step stays unmapped through later merges -- the other
+widening passes only edit an existing mapping, and `merge_sxid_step_scope` (`ingest/sxid.py`) no longer starts one on such a step --
+so no later merge completes a partial mapping that would drop the unplaced GPU from the reset unseen. The merged scope still names
+the faulted nodes only; a workload participant never enters isolation. Arbitration compares not only rank but also uses explicit
 operation dominance: `RESTART_NODE` covers reset/reset-all/fabric-manager restart,
 `REPLACE_NODE` covers node lifecycle and GPU runtime repair; quarantine, mechanical checks and support escalation
 are not treated as having repaired other fault domains.

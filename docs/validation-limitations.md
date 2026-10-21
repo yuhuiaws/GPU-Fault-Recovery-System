@@ -85,13 +85,33 @@ its escalation lineage lists it and no restored node's inventory does. That
 lineage reading is the authoritative reconciliation above; absence alone still
 removes nothing. Residuals: with every store read failing, the workflow's own
 per-node lists decide alone, so a step narrowed to one node that kept the union of
-GPUs still reads as that node's; `RecoveryArbiter.merged_gpu_scope` still gives
-each node of a multi-node node-action step without `gpu_uuids_by_node` the whole
-GPU list when it widens (no current producer builds such a RESET step); the
-restore preview passes release-only nodes to the builder while the executed
-restore never receives them, so for that shape the preview's scope can differ
-from the created workflow. Local tests use the in-memory store and fake
-inventories; they do not measure a live escalation.
+GPUs still reads as that node's.
+
+A merge that widens a multi-node node-action step without `gpu_uuids_by_node`
+places that step's GPUs by the workflow's own per-node lists only
+(`RecoveryArbiter.merged_gpu_scope`, `arbitration.step_gpu_shares`; no store
+read), so a single-node step that kept the union of GPUs can still mislead it; a
+GPU those lists put on two of the step's nodes counts as unplaced, and one they
+put on the wrong node reaches an Agent that refuses it, as before. When the
+lists cannot say which node holds each GPU, the step stays without a mapping
+through every later merge: a multi-node reset is then refused before any send,
+while the other node actions still hand each node the step's whole list, as they
+do for an unmerged step, and rely on the Agent refusing a GPU it does not have.
+None of such a step's GPUs reaches other steps through the merged scope, and a
+later fault on one of its nodes whose GPU its flat list names counts as covered
+(`fault_scope_covered`) and is absorbed into a step that will be refused, so the
+ladder, not that step, repairs it. Mappings an earlier release's widen already
+wrote are explicit and kept. No current producer builds such a RESET step; local
+tests construct one.
+
+The restore's `--plan` preview and the in-Pod write call the builder with the
+same restored and release-only nodes. The Pod re-reads the inventories when it
+writes, so an inventory that changes between the inspection and the write can
+still build other steps: the result names them (`the created workflow's steps
+differ from the plan`) and does not refuse. A deployed image whose builder
+predates release-only restores refuses those restores, writing nothing, until the
+release is deployed. Local tests use the in-memory store and fake inventories;
+they do not measure a live escalation or a live restore.
 
 Collector acceptance waits account for the leased metrics census and preceding
 attempt-missing grace. They are bounded by the existing operation and maintenance

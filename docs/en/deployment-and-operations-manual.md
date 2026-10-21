@@ -9113,8 +9113,13 @@ needs `--node`, see item 9).
    reads the inventories of the nodes on the successor's escalation lineage (the `--plan` inspection lists them in
    `node_gpu_uuids`), and that is the checked reconciliation: a GPU another lineage node's inventory reports and no restored node's
    inventory claims is no longer named on the restored node's validation -- the restore of a successor an earlier release built
-   with all 16 GPUs of a two-node attempt on one node no longer waits on the other node's 8; in the `--plan` preview the inventory
-   of a release-only (quiesce-taint-only) node does the same. A missing inventory still drops no GPU, and an unrelated node's
+   with all 16 GPUs of a two-node attempt on one node no longer waits on the other node's 8; the inventory of a release-only
+   (quiesce-taint-only) node does the same, and such a node is released without being validated (`release_only_node_ids` of
+   `--plan`). The CLI hands the Pod's builder the preview's restored and release-only nodes, so the workflow written is the one
+   `--plan` printed (it used to validate the release-only node too, waiting on the exporter its taint evicts until the step cap
+   failed the restore); a deployed image whose builder predates release-only restores refuses such a restore and writes
+   nothing, and the result names any step that still differs from the plan (`the created workflow's steps differ from the
+   plan: ...`, e.g. an inventory that changed after the inspection). A missing inventory still drops no GPU, and an unrelated node's
    inventory never removes an original incident's GPU. When only
    some nodes of the incident are restored (`restore_node_ids` is a proper subset of `node_ids`), the steps do not carry the incident's GPU scope but do full per-node
    validation: the GPUs named by the incident may be on already restored sibling nodes. The restore does not restart a job a
