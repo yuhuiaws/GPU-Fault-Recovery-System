@@ -10,7 +10,7 @@
     "src/gpu_fault/host_health.py:NodeHealthPolicy": 980,
     "src/gpu_fault/node_agent/quiesce.py:GpuServiceQuiesceManager": 848,
     "src/gpu_fault/notification_service.py:AdvisoryNotificationService": 1030,
-    "src/gpu_fault/orchestration/coordinator.py:IncidentOrchestrator": 1805,
+    "src/gpu_fault/orchestration/coordinator.py:IncidentOrchestrator": 1804,
     "src/gpu_fault/policy/engine.py:GpuFaultPolicyEngine": 1412,
     "src/gpu_fault/processor/coordinator.py:ProcessorCoordinator": 1701,
     "src/gpu_fault/store/memory/workflows.py:MemoryWorkflowMixin": 911,

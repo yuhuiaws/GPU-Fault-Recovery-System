@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Collection, Iterable, Mapping
 
 from gpu_fault.models import (
     WorkflowOperation,
@@ -18,6 +18,7 @@ from gpu_fault.operation_registry import (
     WORKLOAD_SCOPED_OPERATIONS,
     ZERO_RANK_ACTION_OPERATIONS,
 )
+from gpu_fault.orchestration.gpu_placement import workflow_gpu_placement
 from gpu_fault.workflow_quarantine import terminal_quarantine_covered
 
 # GPU-scoped recovery actions. A fault that names no GPU yet asks for one of
@@ -87,6 +88,71 @@ def fault_scope_covered(
         else:
             covered.update(step.gpu_uuids)
     return gpu_uuids <= covered
+
+
+def step_gpu_shares(
+    workflow: WorkflowRequest, step: WorkflowStepSpec
+) -> dict[str, list[str]] | None:
+    """Which of a node-action step's nodes holds which of its GPUs.
+
+    For a step without its own ``gpu_uuids_by_node`` (a caller reads an
+    explicit mapping itself). A single-node step's GPUs are its node's. A
+    multi-node step's flat list does not say which node holds which GPU, so
+    each GPU is placed with the workflow's own per-node lists
+    (``gpu_placement.workflow_gpu_placement``: explicit mappings, single-node
+    steps) restricted to the step's nodes. The shares are returned only when
+    every GPU of the step lands on exactly one of its nodes; ``None`` --
+    unknown -- when one lands on none of them (nothing places it, or only a
+    node outside the step) or on two.
+    """
+
+    if len(step.node_ids) <= 1:
+        return {
+            node_id: list(dict.fromkeys(step.gpu_uuids)) for node_id in step.node_ids
+        }
+    placement = workflow_gpu_placement(workflow)
+    shares: dict[str, list[str]] = {node_id: [] for node_id in step.node_ids}
+    for gpu in dict.fromkeys(step.gpu_uuids):
+        holders = [node_id for node_id in shares if gpu in placement.get(node_id, ())]
+        if len(holders) != 1:
+            return None
+        shares[holders[0]].append(gpu)
+    return shares
+
+
+def widened_gpu_mapping(
+    workflow: WorkflowRequest,
+    step: WorkflowStepSpec,
+    gpu_uuids_by_node: Mapping[str, Collection[str]],
+) -> dict[str, list[str]]:
+    """The ``gpu_uuids_by_node`` a merge writes on a pending node-action step.
+
+    The step's own mapping plus every node of the merged scope
+    (``RecoveryArbiter.merged_gpu_scope``) that carries GPUs; a node without
+    GPU identity joins host-level steps only, as the node-action adapter
+    refuses a GPU action on a node whose list is empty (P0-57C). A multi-node
+    step without its own mapping whose GPUs ``step_gpu_shares`` cannot place
+    gets no entry for any of its own nodes, whatever the scope holds for them:
+    any of them may hold the unplaced GPU, and a partial entry would drop it
+    from the action unseen. With the entry missing, the adapter refuses the
+    step before any command is sent ("missing explicit GPU UUIDs for <node>").
+    """
+
+    merged: dict[str, set[str]] = {}
+    withheld: set[str] = set()
+    raw = step.parameters.get("gpu_uuids_by_node")
+    if isinstance(raw, dict):
+        for node_id, values in raw.items():
+            if isinstance(values, list):
+                merged.setdefault(str(node_id), set()).update(
+                    str(value) for value in values
+                )
+    elif step_gpu_shares(workflow, step) is None:
+        withheld = set(step.node_ids)
+    for node_id, values in gpu_uuids_by_node.items():
+        if values and node_id not in withheld:
+            merged.setdefault(node_id, set()).update(values)
+    return {node_id: sorted(values) for node_id, values in sorted(merged.items())}
 
 
 class RecoveryArbiter:
@@ -219,6 +285,15 @@ class RecoveryArbiter:
         node_id: str,
         gpu_uuids: set[str],
     ) -> dict[str, list[str]]:
+        """Per node, the GPUs a merge widens the pending node actions to.
+
+        A node-action step's own ``gpu_uuids_by_node`` says where its GPUs
+        are; without one, ``step_gpu_shares`` places them. Giving every node
+        of a multi-node step the step's whole list sent a sibling's GPU to
+        this node's agent (batch 155): when such a step's GPUs cannot all be
+        placed, none of them is attributed to a node (fail closed, never
+        guess), and its nodes still join the scope.
+        """
         mapping: dict[str, set[str]] = {}
         if existing_workflow is not None:
             for step in existing_workflow.official_steps:
@@ -232,8 +307,11 @@ class RecoveryArbiter:
                                 str(value) for value in values
                             )
                     continue
+                shares = step_gpu_shares(existing_workflow, step) or {}
                 for existing_node in step.node_ids:
-                    mapping.setdefault(existing_node, set()).update(step.gpu_uuids)
+                    mapping.setdefault(existing_node, set()).update(
+                        shares.get(existing_node, ())
+                    )
         # A node with no GPU identity stays in scope with an empty list so
         # host-level steps still widen onto it (F-B6); GPU actions skip
         # such nodes because the agent refuses a node without GPUs.

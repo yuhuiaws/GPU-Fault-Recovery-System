@@ -46,6 +46,7 @@ from gpu_fault.orchestration import (
     SxidIngestionService,
     WorkflowBuilder,
 )
+from gpu_fault.orchestration.arbitration import widened_gpu_mapping
 from gpu_fault.orchestration.families.conflicts import NodeConflictService
 from gpu_fault.orchestration.families.drain import (
     DrainOperationCallbacks,
@@ -1426,6 +1427,16 @@ class IncidentOrchestrator:
         is missing from the mapping, so the mapping and ``node_ids`` are
         written together.
 
+        Each node's entry names only the GPUs placed on that node
+        (``arbitration.widened_gpu_mapping``): the multi-node reset
+        barrier hands every agent exactly its entry, and the whole GPU
+        list of a shared step on each of its nodes sent a sibling's GPU
+        to this node's agent (batch 155). A multi-node step without its
+        own mapping whose GPUs the workflow cannot place gets no entry
+        for any of its nodes -- a partial one would drop the unplaced GPU
+        from the reset unseen -- and the adapter refuses it before any
+        command is sent.
+
         Steps that neither touch the host nor a workload -- cordon,
         validate, uncordon, node reboot -- take the wider ``node_ids``
         without a GPU mapping, matching what the grouped SXID path
@@ -1464,22 +1475,11 @@ class IncidentOrchestrator:
             }
             if step.operation in self._NODE_ACTION_OPERATIONS:
                 widened["node_ids"] = sorted(set(step.node_ids) | set(gpu_nodes))
-                merged: dict[str, set[str]] = {}
-                raw = step.parameters.get("gpu_uuids_by_node")
-                if isinstance(raw, dict):
-                    for node, values in raw.items():
-                        if isinstance(values, list):
-                            merged.setdefault(str(node), set()).update(
-                                str(value) for value in values
-                            )
-                for node, values in gpu_uuids_by_node.items():
-                    if values:
-                        merged.setdefault(node, set()).update(values)
                 widened["parameters"] = {
                     **step.parameters,
-                    "gpu_uuids_by_node": {
-                        node: sorted(values) for node, values in sorted(merged.items())
-                    },
+                    "gpu_uuids_by_node": widened_gpu_mapping(
+                        workflow, step, gpu_uuids_by_node
+                    ),
                 }
             steps.append(step.model_copy(update=widened))
         return workflow.model_copy(update={"official_steps": steps})
