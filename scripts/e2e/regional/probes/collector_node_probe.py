@@ -46,8 +46,8 @@ ENV_KEYS = {
     "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES",
     "GPU_FAULT_DCGM_EDGE_FILTER_ENABLED",
     "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS",
-    # The metrics sampling interval; not `GPU_FAULT_DCGM_INTERVAL_SECONDS`, a
-    # key neither the installer writes nor `collectors_cli` reads (a silent hole).
+    "GPU_FAULT_DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD",
+    # The metrics interval, not GPU_FAULT_DCGM_INTERVAL_SECONDS (nothing writes it).
     "GPU_FAULT_METRICS_INTERVAL_SECONDS",
     "GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT",
     "GPU_FAULT_EXPECTED_GPU_COUNT",
@@ -943,6 +943,12 @@ def power_set_limit(gpu: dict[str, Any], key: str) -> None:
     run([str(POWER_SMI), "-i", gpu["uuid"], "-pl", str(gpu[key])], timeout=10)
 
 
+def power_caps(record: dict[str, Any]) -> list[float]:
+    """Held limits: the loaded GPU's minimum, the others' baseline (COLLECT-002)."""
+    keys = {record["gpu_index"]: "power_min_limit_w"}
+    return [gpu[keys.get(gpu["index"], "power_limit_w")] for gpu in record["baseline"]]
+
+
 def power_check_limits(
     record: dict[str, Any], state: list[dict[str, Any]], *, restored: bool = False
 ) -> None:
@@ -1096,7 +1102,7 @@ def power_load_only(arguments: argparse.Namespace) -> None:
     if record is None or not record["load_intended"] or record["load_closed"]:
         raise ProbeError("GPU load no longer has an owned start intent")
     state = checked_power_state(record["baseline"])
-    if any(item["power_limit_w"] != item["power_min_limit_w"] for item in state):
+    if [item["power_limit_w"] for item in state] != power_caps(record):
         raise ProbeError("GPU load requires the verified power cap")
     power_require_load_time(record)
     power_create_load_start(record)
@@ -1144,7 +1150,7 @@ def power_load_onset(record: dict[str, Any]) -> dict[str, Any]:
 
 
 def throttle_gpu(arguments: argparse.Namespace) -> None:
-    """Cap the complete, default-power GPU set under an owned recovery intent."""
+    """Cap the loaded GPU of a complete, default-power set under an owned intent."""
     if getattr(arguments, "load_only", False):
         power_load_only(arguments)
         return
@@ -1167,10 +1173,7 @@ def throttle_gpu(arguments: argparse.Namespace) -> None:
         if receipt_path.exists() or receipt_path.is_symlink():
             raise ProbeError("power load start receipt already exists; cleanup only")
         for directory in (SYSTEMD_UNIT_DIR, POWER_TRANSIENT_UNIT_DIR):
-            if (
-                next(directory.glob("gpu-fault-power-limit-restore-*"), None)
-                is not None
-            ):
+            if any(directory.glob("gpu-fault-power-limit-restore-*")):
                 raise ProbeError("another power recovery unit already exists")
         baseline = checked_power_state()
         if arguments.gpu_index not in {item["index"] for item in baseline}:
@@ -1212,9 +1215,8 @@ def throttle_gpu(arguments: argparse.Namespace) -> None:
         record["intent_sha256"] = power_intent_digest(record)
         units = power_unit_contents(record)
         for name in units:
-            if (SYSTEMD_UNIT_DIR / name).exists() or (
-                SYSTEMD_UNIT_DIR / name
-            ).is_symlink():
+            unit_file = SYSTEMD_UNIT_DIR / name
+            if unit_file.exists() or unit_file.is_symlink():
                 raise ProbeError("power recovery unit file already exists")
             if power_unit_state(name)["LoadState"] != "not-found":
                 raise ProbeError("power recovery unit already exists")
@@ -1233,13 +1235,11 @@ def throttle_gpu(arguments: argparse.Namespace) -> None:
         record["phase"] = "MUTATING"
         record["mutation_started"] = True
         power_write_json(path, record)
-        for original in baseline:
-            state = checked_power_state(baseline)
-            power_check_limits(record, state)
-            power_require_load_time(record)
-            power_set_limit(original, "power_min_limit_w")
+        power_check_limits(record, checked_power_state(baseline))
+        power_require_load_time(record)
+        power_set_limit(baseline[arguments.gpu_index], "power_min_limit_w")
         state = checked_power_state(baseline)
-        if any(item["power_limit_w"] != item["power_min_limit_w"] for item in state):
+        if [item["power_limit_w"] for item in state] != power_caps(record):
             raise ProbeError("GPU cap readback does not match the owned target")
         timer = power_verify_timer(record)
         record["load_intended"] = True

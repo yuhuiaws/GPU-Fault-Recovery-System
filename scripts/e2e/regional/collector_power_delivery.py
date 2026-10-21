@@ -1,4 +1,12 @@
-"""Pure, identity-bound delivery evidence for the COLLECT-002 power window."""
+"""Identity-bound, attributed delivery evidence for the COLLECT-002 power window.
+
+A confirmed DCGM batch carries every GPU of the node and one batch-level
+``candidate-confirmed``: it does not say whose candidate confirmed. The case
+credits a batch to the loaded GPU only when no other GPU in it carries a
+candidate of its own (:func:`delivery_evidence`); the runner reads the Store's
+latest values before the cap (:func:`power_reference`) so a counter can be
+proven unchanged.
+"""
 
 from __future__ import annotations
 
@@ -16,11 +24,54 @@ class DeliveryEvidence(TypedDict):
     delivered_at: str | None
     record_ids: list[str]
     errors: list[str]
+    attribution: dict[str, Any] | None
 
 
 _POWER_METRICS = frozenset(
     {"power_limit_w", "power_usage_w", "gpu_utilization_percent"}
 )
+#: The fields whose candidate the DCGM edge filter raises from the value alone
+#: (``DcgmMetricsCollector._candidate_keys``): a duty-cycle counter breaches on
+#: a tick whose advance over at least one interval reaches the duty-cycle
+#: threshold, a pending/failure flag or the last XID while it is nonzero, and
+#: a key confirms only on a tick it breaches.
+_DUTY_SUFFIX = "_violation_total_us"
+_FLAGS = frozenset(
+    {
+        "retired_pages_pending",
+        "row_remap_failure",
+        "row_remap_pending",
+        "xid_last_error",
+    }
+)
+#: The collector's duty-cycle threshold in ``collector.env``, and its default.
+DUTY_CYCLE_KEY = "GPU_FAULT_DCGM_VIOLATION_DUTY_CYCLE_THRESHOLD"
+DUTY_CYCLE_DEFAULT = 0.05
+#: Read-only, in a CPU-cluster Pod: the Store's latest value of those fields for
+#: every GPU of the node. Every ingested batch updates it, the health summaries
+#: too, so read after the quiet delivery it holds the values from before the cap.
+POWER_REFERENCE = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+
+cluster_id, node_id, suffix, *flags = sys.argv[1:]
+store = ApplicationContext.from_environment().store
+samples = []
+for item in store.list_gpu_metrics_latest(cluster_id, node_id):
+    value = item.model_dump(mode="json")
+    sample = value["sample"]
+    name = sample["canonical_name"]
+    if name.endswith(suffix) or name in flags:
+        samples.append({
+            "observed_at": value["observed_at"],
+            "source": value["source"],
+            **{key: sample.get(key) for key in ("canonical_name", "gpu_uuid")},
+            **{key: sample.get(key) for key in ("gpu_index", "value")},
+        })
+print(json.dumps({"samples": samples}, sort_keys=True))
+"""
 _CANDIDATE_REASONS = frozenset({"candidate-confirmed", "threshold"})
 _OTHER_REASONS = frozenset(
     {
@@ -227,6 +278,141 @@ def _candidate(
     )
 
 
+def _watched(sample: object) -> tuple[str, str, float] | None:
+    """``(GPU UUID, field, value)`` of a finite duty-cycle counter or flag sample."""
+
+    if not isinstance(sample, Mapping):
+        return None
+    name, uuid = sample.get("canonical_name"), sample.get("gpu_uuid")
+    value = _finite(sample.get("value"))
+    if (
+        not isinstance(name, str)
+        or not (name.endswith(_DUTY_SUFFIX) or name in _FLAGS)
+        or not isinstance(uuid, str)
+        or not uuid
+        or value is None
+    ):
+        return None
+    return uuid, name, value
+
+
+def _readings(
+    records: list[object], reference: list[object], *, cluster_id: str, node_id: str
+) -> dict[tuple[str, str], list[tuple[datetime, float]]]:
+    """Every value of a watched field per ``(GPU UUID, field)`` and when it was
+    sampled: the Store's latest values before the cap and this node's DCGM
+    batches in the window, accepted or not."""
+
+    sources: list[tuple[object, list[object]]] = [
+        (item.get("observed_at"), [item])
+        for item in reference
+        if isinstance(item, Mapping) and item.get("source") == "DCGM_EXPORTER"
+    ]
+    for record in records:
+        payload = record.get("payload") if isinstance(record, Mapping) else None
+        if (
+            isinstance(payload, Mapping)
+            and payload.get("source") == "DCGM_EXPORTER"
+            and payload.get("cluster_id") == cluster_id
+            and payload.get("node_id") == node_id
+            and isinstance(payload.get("samples"), list)
+        ):
+            sources.append((payload.get("observed_at"), payload["samples"]))
+    readings: dict[tuple[str, str], list[tuple[datetime, float]]] = {}
+    for stamp, samples in sources:
+        try:
+            observed = _timestamp(stamp, "reading")
+        except ValueError:
+            continue
+        for sample in samples:
+            watched = _watched(sample)
+            if watched is not None:
+                uuid, name, value = watched
+                readings.setdefault((uuid, name), []).append((observed, value))
+    return readings
+
+
+def _other_candidates(
+    payload: Mapping[str, Any],
+    observed: datetime,
+    gpu_uuid: str,
+    readings: Mapping[tuple[str, str], list[tuple[datetime, float]]],
+    floor: float,
+) -> list[dict[str, Any]]:
+    """The other GPUs of a confirmed batch that carry a candidate of their own.
+
+    A key confirms only on a tick it breaches. A duty-cycle counter breaches
+    when its advance since the previous tick, over the time since that value
+    was first seen (at least one interval), reaches the threshold. The counters
+    only grow, so that advance is at most the one since any earlier reading:
+    one below ``floor`` (threshold x interval, in microseconds) cannot have
+    breached -- a counter creeping by microseconds on a healthy GPU stays out,
+    a capped idle GPU's fifteen seconds per tick does not. A pending/failure
+    flag or XID that was set and is unchanged had its own confirmation before
+    the window. Another GPU is out of the delivery when its draw is not
+    correlated with its limit and no watched field breached; a nonzero field
+    without an earlier reading, or one that fell (a reset), cannot be bounded
+    and names its GPU. The batch's samples are mappings (``_power_samples``).
+    """
+
+    thresholds = GpuMetricsThresholds()
+    indexes: dict[str, object] = {}
+    gpus: dict[str, dict[str, object]] = {}
+    for sample in payload["samples"]:
+        uuid = sample.get("gpu_uuid")
+        if isinstance(uuid, str) and uuid and uuid != gpu_uuid:
+            indexes.setdefault(uuid, sample.get("gpu_index"))
+            name = str(sample.get("canonical_name"))
+            gpus.setdefault(uuid, {})[name] = sample.get("value")
+    named = []
+    for uuid, gpu in gpus.items():
+        usage, limit, utilization = (
+            _finite(gpu.get(name))
+            for name in ("power_usage_w", "power_limit_w", "gpu_utilization_percent")
+        )
+        reasons = []
+        if (
+            usage is not None
+            and limit is not None
+            and limit > 0
+            and utilization is not None
+            and usage >= thresholds.power_limit_ratio * limit
+            and utilization >= thresholds.power_correlation_min_utilization_percent
+        ):
+            reasons.append(
+                f"power_limit_correlation: {usage:g} W at a {limit:g} W limit, "
+                f"{utilization:g}% utilization"
+            )
+        for name, value in gpu.items():
+            watched = _watched(
+                {"canonical_name": name, "gpu_uuid": uuid, "value": value}
+            )
+            if watched is None or not watched[2]:
+                continue
+            earlier = max(
+                (item for item in readings.get((uuid, name), []) if item[0] < observed),
+                default=None,
+            )
+            if earlier is None:
+                reasons.append(f"{name} {watched[2]!r} with no earlier reading")
+                continue
+            advance = watched[2] - earlier[1]
+            if advance < 0:
+                reasons.append(f"{name} fell from {earlier[1]!r} to {watched[2]!r}")
+            elif advance and (name in _FLAGS or advance >= floor):
+                reasons.append(f"{name} {earlier[1]!r} -> {watched[2]!r}")
+        if reasons:
+            named.append(
+                {
+                    "gpu_index": indexes[uuid],
+                    "gpu_uuid": uuid,
+                    "power_limit_w": limit,
+                    "candidates": reasons,
+                }
+            )
+    return named
+
+
 def delivery_evidence(
     records: Iterable[object],
     *,
@@ -235,16 +421,27 @@ def delivery_evidence(
     load_start: dict[str, Any],
     expected_power_limit_w: float,
     observed_until: datetime,
+    reference: Mapping[str, Any] | None = None,
 ) -> DeliveryEvidence:
-    """Select the first accepted raw DCGM power candidate, never a status row.
+    """Select the first raw DCGM power candidate credited to the loaded GPU.
 
-    Pass the validated ``injection["load_start"]``, the recorded cap for that GPU
-    and the end of the captured load window. No clock or I/O is consulted.
-    ``delivered_at`` is the earliest payload ingestion time, normalized to UTC;
-    ``record_ids`` are unique qualifying IDs in delivery order. Any ``errors``
-    veto acceptance, even when another record supplies a valid timestamp.
+    Pass the validated ``injection["load_start"]``, the recorded cap for that GPU,
+    the end of the captured load window and :func:`power_reference`'s answer. No
+    clock or I/O is consulted. A batch qualifies when it is the loaded GPU's
+    correlated power candidate (never a status row); it is credited when no
+    other GPU in it carries a candidate of its own (:func:`_other_candidates`),
+    and otherwise listed under ``attribution["ignored"]`` with those GPUs: the
+    batch's ``candidate-confirmed`` could be theirs. ``delivered_at`` is the
+    earliest credited payload ingestion time, normalized to UTC; ``record_ids``
+    are the unique credited IDs in delivery order. Any ``errors`` veto
+    acceptance, even when another record supplies a valid timestamp.
     """
-    result: DeliveryEvidence = {"delivered_at": None, "record_ids": [], "errors": []}
+    result: DeliveryEvidence = {
+        "delivered_at": None,
+        "record_ids": [],
+        "errors": [],
+        "attribution": None,
+    }
     try:
         if (
             not isinstance(cluster_id, str)
@@ -265,8 +462,10 @@ def delivery_evidence(
     except ValueError as exc:
         result["errors"].append(str(exc))
         return result
+    records = list(records)
     accepted: dict[str, datetime] = {}
     signatures: dict[str, tuple[datetime, datetime, float, float, float]] = {}
+    batches: dict[str, Mapping[str, Any]] = {}
     for position, record in enumerate(records):
         try:
             if not isinstance(record, Mapping):
@@ -306,12 +505,55 @@ def delivery_evidence(
                 )
             signatures[record_id] = signature
             accepted[record_id] = min(received, accepted.get(record_id, received))
+            batches.setdefault(record_id, record["payload"])
         except ValueError as exc:
             result["errors"].append(f"record[{position}]: {exc}")
     ordered = sorted(accepted, key=lambda record_id: (accepted[record_id], record_id))
-    result["record_ids"] = ordered
-    if ordered:
-        result["delivered_at"] = accepted[ordered[0]].isoformat()
+    stored = reference if isinstance(reference, Mapping) else {}
+    samples = stored.get("samples")
+    samples = samples if isinstance(samples, list) else []
+    readings = _readings(records, samples, cluster_id=cluster_id, node_id=node_id)
+    floor = max(0.0, _finite(stored.get("breach_floor_us")) or 0.0)
+    ignored: list[dict[str, Any]] = []
+    for record_id in ordered:
+        others = _other_candidates(
+            batches[record_id], signatures[record_id][0], gpu_uuid, readings, floor
+        )
+        if not others:
+            result["record_ids"].append(record_id)
+            continue
+        ignored.append(
+            {
+                "record_id": record_id,
+                "delivered_at": accepted[record_id].isoformat(),
+                "other_gpus": others,
+            }
+        )
+    credited = result["record_ids"][0] if result["record_ids"] else None
+    result["attribution"] = {
+        "gpu_index": int(gpu_index),
+        "gpu_uuid": gpu_uuid,
+        "record_id": credited,
+        "ignored": ignored,
+        "reference": {
+            "readings": len(samples),
+            "breach_floor_us": floor,
+            "error": stored.get("error") if reference is not None else "not read",
+        },
+    }
+    if credited is not None:
+        result["delivered_at"] = accepted[credited].isoformat()
+    elif ordered:
+        named = sorted(
+            {str(gpu["gpu_index"]) for item in ignored for gpu in item["other_gpus"]},
+            key=lambda index: (len(index), index),
+        )
+        result["errors"].append(
+            "no confirmed DCGM power candidate in the load window can be credited to "
+            f"the loaded GPU {gpu_index}: every one also carries another GPU's "
+            f"candidate (GPU {', '.join(named)}), which could be its confirmation "
+            "(delivery_evidence.attribution.ignored)"
+        )
     else:
         result["errors"].append(
             "no valid accepted DCGM power candidate in the load window"
@@ -319,14 +561,64 @@ def delivery_evidence(
     return result
 
 
+def candidate_records(records: Iterable[Any]) -> list[Any]:
+    """The window's GPU evidence whose edge reasons name a candidate or threshold."""
+
+    return [
+        item
+        for item in records
+        if any(
+            "candidate" in str(reason).lower() or "threshold" in str(reason).lower()
+            for reason in item.get("payload", {}).get("edge_filter_reasons") or []
+        )
+    ]
+
+
+def power_reference(
+    fixture: Any, env: Mapping[str, str], interval: float
+) -> dict[str, Any]:
+    """The Store's latest violation counters and flags of every GPU, before the cap,
+    and the smallest advance the node's collector grades as a candidate in one
+    tick (``breach_floor_us``: its duty-cycle threshold x ``interval``; 0, so
+    any advance counts, when ``collector.env`` holds no valid threshold).
+
+    Read-only (:data:`POWER_REFERENCE` in a CPU-cluster Pod) and never fatal: a
+    failed read is recorded, and another GPU's nonzero field in a confirmed
+    batch then has no earlier reading that bounds it.
+    """
+
+    try:
+        threshold = float(env.get(DUTY_CYCLE_KEY, DUTY_CYCLE_DEFAULT))
+    except (TypeError, ValueError):
+        threshold = 0.0
+    floor = threshold * interval * 1_000_000 if 0 < threshold <= 1 else 0.0
+    grading = {"duty_cycle_threshold": threshold, "breach_floor_us": max(0.0, floor)}
+    try:
+        value = fixture.regional.cpu_python(
+            POWER_REFERENCE,
+            fixture.regional.settings.cluster_id,
+            fixture.node,
+            _DUTY_SUFFIX,
+            *sorted(_FLAGS),
+        )
+        samples = value.get("samples") if isinstance(value, Mapping) else None
+        if not isinstance(samples, list):
+            raise ValueError("the Store's answer has no samples")
+    except Exception as exc:  # noqa: BLE001 - recorded; attribution fails closed
+        return {"samples": [], "error": f"{type(exc).__name__}: {exc}"[:300], **grading}
+    return {"samples": samples, "error": None, **grading}
+
+
 def _finite(value: object) -> float | None:
-    return (
-        float(value)
-        if isinstance(value, (int, float))
-        and not isinstance(value, bool)
-        and math.isfinite(value)
-        else None
-    )
+    """A finite float, or None: never raises (an int beyond float range is None)."""
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    try:
+        result = float(value)
+    except OverflowError:
+        return None
+    return result if math.isfinite(result) else None
 
 
 def load_generator_failure(

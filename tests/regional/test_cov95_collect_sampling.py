@@ -135,6 +135,8 @@ def test_power_edge_case_observes_real_sampling_bounds_and_always_restores(
 
     def read(script: str, *args: str) -> dict[str, Any]:
         nonlocal status_reads
+        if script == runner.power.POWER_REFERENCE:
+            return {"samples": []}
         if len(args) == 3:
             return {
                 "records": []

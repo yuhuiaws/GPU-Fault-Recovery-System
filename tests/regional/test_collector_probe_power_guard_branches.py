@@ -341,6 +341,7 @@ def test_load_only_requires_the_verified_power_cap(
             "run_id": run_id,
             "load_intended": True,
             "load_closed": False,
+            "gpu_index": 0,
             "baseline": baseline,
         },
     )
@@ -386,7 +387,7 @@ def test_throttle_refuses_a_cap_the_gpus_did_not_take(power_host: PowerHost) -> 
     host.ignore_writes = True
     with pytest.raises(probe.ProbeError, match="cap readback does not match"):
         probe.throttle_gpu(host.arguments())
-    assert [call[-1] for call in host.power_writes()] == ["200.0", "250.0"]
+    assert [call[-1] for call in host.power_writes()] == ["200.0"], "loaded GPU only"
     assert host.record()["mutation_started"] is True
     assert host.record()["load_intended"] is False
 

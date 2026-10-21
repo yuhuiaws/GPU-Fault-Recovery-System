@@ -650,6 +650,7 @@ def run_collect002(
             )
         time.sleep(interval)
     quiet_stamp: str = current
+    reference = power.power_reference(fixture, env, interval)
     load_seconds = interval * (confirmation + 6)
     requested_at = datetime.now(timezone.utc)
     started_at = requested_at
@@ -741,15 +742,7 @@ def run_collect002(
         node=fixture.node,
         observed_after=started_at,
     )
-    gpu = evidence_kinds(records).get("GPU_METRICS", [])
-    candidate = [
-        item
-        for item in gpu
-        if any(
-            "candidate" in str(reason).lower() or "threshold" in str(reason).lower()
-            for reason in item.get("payload", {}).get("edge_filter_reasons") or []
-        )
-    ]
+    candidate = power.candidate_records(evidence_kinds(records).get("GPU_METRICS", []))
     sampled_status_at = delivered_at
     target = next(
         item
@@ -763,6 +756,7 @@ def run_collect002(
         load_start=injection["load_start"],
         expected_power_limit_w=float(target["power_min_limit_w"]),
         observed_until=datetime.now(timezone.utc),
+        reference=reference,
     )
     delivered_at = delivery["delivered_at"]
     onset = latency_bound.load_onset(injection, started_at)
@@ -774,14 +768,14 @@ def run_collect002(
     if cleanup_error:
         errors.append(f"GPU power limit restore failed: {cleanup_error}")
     latency: float | None = None
-    if delivered_at is None:
+    if delivered_at is not None:
+        latency = latency_bound.measured_latency(delivered_at, bound)
+        errors.extend(latency_bound.latency_errors(latency, bound, interval=interval))
+    elif not (delivery["attribution"] or {}).get("ignored"):
         errors.append(
             "GPU metrics chain delivered nothing while the GPU was pinned at a "
             f"lowered power limit for {load_seconds}s"
         )
-    else:
-        latency = latency_bound.measured_latency(delivered_at, bound)
-        errors.extend(latency_bound.latency_errors(latency, bound, interval=interval))
     if not candidate:
         errors.append("no delivered evidence names a candidate or threshold reason")
     after = fixture.snapshot()
@@ -1636,8 +1630,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "mutation": {
             "GF-REGIONAL-COLLECT-001": "read evidence history for two summary cycles",
             "GF-REGIONAL-COLLECT-002": (
-                "lower every GPU's enforced power limit to the driver minimum "
-                "and load one GPU against it, with a deadman restore"
+                "lower one GPU's enforced power limit to the driver minimum "
+                "and load that GPU against it, with a deadman restore"
             ),
             "GF-REGIONAL-COLLECT-003": "read live GPU/EFA inventory and env",
             "GF-REGIONAL-COLLECT-005": "append one unknown non-fatal SXID and restart collector",

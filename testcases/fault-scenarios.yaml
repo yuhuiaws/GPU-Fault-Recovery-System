@@ -6851,8 +6851,9 @@ test_cases:
   problem: >-
     稳态抑制若过度就会把真实故障一起压掉，等满health-summary周期才上报属于P0。
   injection: >-
-    先按dcgm-前缀的collector status等GPU链投递一次得到已知静默起点，再把节点上每张GPU的
-    enforced power limit降到驱动最小值并对其中一张跑dcgmproftester -t 1004施加负载，
+    先按dcgm-前缀的collector status等GPU链投递一次得到已知静默起点，并只读Store里每张GPU
+    降限前最新的violation计数器与pending/failure标志，再只把被加载那张GPU的enforced power
+    limit降到驱动最小值并对它跑dcgmproftester -t 1004施加负载（其余GPU保持默认上限），
     形成真实的power_limit_correlation candidate；降限前先用systemd-run布好deadman还原，
     收尾无条件还原并逐卡校验power.limit回到power.default_limit。
   expected:
@@ -6860,6 +6861,7 @@ test_cases:
   - 投递延迟自负载起点起算（启动回执之后探针对被加载GPU最后一次仍低于power_limit_correlation阈值的只读nvidia-smi读数；没有这组读数时自启动回执起算），不超过逐级采样之和：NVML 1秒功耗平均窗口（起点读数间隔超过1秒时另计超出部分load_onset_excess_seconds），加节点exporter Pod的采集周期（-c/--collect-interval，即DCGM watch周期，嵌入式与主机hostengine模式相同；读不到exporter Pod时按dcgm-exporter自身默认30秒），加一个METRICS_INTERVAL_SECONDS，加(DCGM_EDGE_CONFIRMATION_SAMPLES-1)个METRICS_INTERVAL_SECONDS，再加本窗口实测的采集循环超出与确认批次的投递耗时；各分量写入allowed_latency_breakdown
   - 确认批次从采样到写入Store的投递耗时不超过一个METRICS_INTERVAL_SECONDS
   - 窗口内存在edge_filter_reasons含candidate或threshold的GPU_METRICS证据
+  - 计时的确认批次归属于被加载GPU：同一批次里其余GPU没有自己的candidate（功耗与自身上限相关、violation计数器自更早读数以来的前进达到占空比阈值乘一个METRICS_INTERVAL_SECONDS或变小、pending/failure标志或XID新置位、非零而无更早读数）；这样的批次不计时并写入delivery_evidence.attribution.ignored，没有可归属批次时判失败
   - 不需要等满配置的health-summary周期
   - 收尾时每张GPU的power.limit都等于power.default_limit
   evidence:

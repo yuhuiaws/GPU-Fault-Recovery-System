@@ -90,6 +90,7 @@ def test_earliest_raw_delivery_survives_later_status_overwrite_and_reordering() 
     }
     for records in permutations([early, late, deepcopy(early)]):
         result = evidence([status, *records])
+        assert result.pop("attribution")["record_id"] == early["record_id"]
         assert result == {
             "delivered_at": "2026-09-17T08:25:47.684496+00:00",
             "record_ids": [early["record_id"], late["record_id"]],
@@ -493,7 +494,9 @@ def test_unrelated_non_dcgm_records_do_not_supply_or_poison_delivery() -> None:
 
 
 def test_empty_input_has_explicit_no_candidate_error() -> None:
-    assert evidence([]) == {
+    result = evidence([])
+    assert result.pop("attribution")["ignored"] == []
+    assert result == {
         "delivered_at": None,
         "record_ids": [],
         "errors": ["no valid accepted DCGM power candidate in the load window"],

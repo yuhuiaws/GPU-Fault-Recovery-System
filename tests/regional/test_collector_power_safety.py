@@ -316,7 +316,7 @@ def test_owned_power_cycle_is_per_gpu_and_verifies_cleanup(
 ) -> None:
     host = power_host
     probe.throttle_gpu(host.arguments())
-    assert [call[-1] for call in host.power_writes()] == ["200.0", "250.0"]
+    assert [call[-1] for call in host.power_writes()] == ["200.0"], "loaded GPU only"
     assert host.emitted[-1]["timer_proof"]["armed"]
     assert host.emitted[-1]["load_unit_active"]
     receipt_path = probe.power_load_start_path(host.arguments().run_id)
@@ -1311,7 +1311,7 @@ def test_a_confirmed_reboot_refuses_limits_off_the_recorded_baseline(
     host = power_host
     probe.throttle_gpu(host.arguments())
     probe.BOOT_ID_FILE.write_text(NEW_BOOT)
-    host.gpus[0]["power_limit_w"] = 700.0  # GPU 1 still reads its capped 250 W
+    # the loaded GPU still reads its 200 W cap, though a boot resets every limit
     host.calls.clear()
     with pytest.raises(
         probe.PowerRecoveryIdentityError, match="differ from the baseline"
