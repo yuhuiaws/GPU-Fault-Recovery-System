@@ -7596,6 +7596,7 @@ test_cases:
   expected:
   - 正式前置 COLLECT-015 通过，release 与集群身份一致；目标是站点纳管的 eks-managed 成员，节点组的节点未被产品占用
   - 每个节点组 verdict 为 COMPLIANT、没有步骤、node auto repair 为 disabled、带本站点归属标签、updateStrategy 为 MINIMAL，托管 user data 部分恰有一个且手写部分无矛盾行
+  - updateStrategy 没有 finding；唯一例外是单节点组（desiredSize 1）的整组滚动 finding，无论 maxUnavailable 取何值都无法避免，按计划字段判断后记入 limitations 而不判 FAIL；两个及以上节点的整组 finding 仍判 FAIL
   - host 模式下 DCGM 钉选与产品 exporter 的 DCGM 客户端为 paired，计划带 nvidia-dcgm 重启 drop-in
   - SSM 清点 outcome 为 passed，每台节点每项检查 ok、无节点或机群 finding，清点的实例恰为该组运行中的实例与 Kubernetes Node，数量等于 desiredSize
   - Kubernetes finding 可读：允许的工作负载命名空间齐全，NVIDIA 与 EFA device plugin 运行，没有容忍 quiesce 污点的 GPU DaemonSet
@@ -7619,7 +7620,7 @@ test_cases:
     在维护窗口内、节点组没有业务负载与产品动作时，以让计划滚动该组的目标配置（首次准备、新的托管部分、另一 DCGM 钉选或
     采纳手写部分）运行 prepare-eks-nodegroup --apply --confirm PREPARE_EKS_NODEGROUP；EKS 逐台终止并替换该组的每台 GPU 节点。
   expected:
-  - 正式前置 BOOT-036 通过；目标配置的只读计划为 CHANGES 且含 roll，updateStrategy 计划为 MINIMAL，host 模式钉选为 paired
+  - 正式前置 BOOT-036 通过；目标配置的只读计划为 CHANGES 且含 roll，updateStrategy 计划为 MINIMAL，host 模式钉选为 paired；两个及以上节点的组若会被整组同时滚下线（整组 finding）即拒绝，单节点组的整组滚动记入 limitations
   - 执行前每台节点 Ready、可调度、无隔离污点，无业务负载与绑定的 attempt，集群无活动 incident 与可执行 workflow，每台节点的 Agent 为 ACTIVE，维护窗口覆盖滚动与全部有界等待
   - apply 为 COMPLETED：roll 更新为 Successful，工具自己的 SSM 核对为 passed
   - 离场 Node 全部消失，替换 Node 数等于 desiredSize 且 Ready，带本站点归属标签，host 模式另带 gpu-fault.io/dcgm-hostengine=host

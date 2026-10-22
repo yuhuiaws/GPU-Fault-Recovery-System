@@ -155,6 +155,111 @@ def test_an_embedded_group_needs_no_dcgm(site: Site) -> None:
     assert errors == []
 
 
+# --- the update strategy of a single-node group ------------------------------------
+
+#: The finding of the deploy-host tool before the single-node remedy: the
+#: verdict must read the plan's fields, not these words.
+OLD_TOOL_FINDING = (
+    "updateStrategy MINIMAL with maxUnavailable 1: a roll takes 1 of 1 GPU node "
+    "(the whole group) out at a time; lower maxUnavailable below the group size to "
+    "keep GPU nodes up during a roll"
+)
+
+
+def single_node_facts(site: Site) -> dict[str, verdicts.GroupFacts]:
+    instances = tuple(site.world.instances[GPU_GROUP])
+    return {GPU_GROUP: verdicts.GroupFacts(instances, instances, 1)}
+
+
+@pytest.mark.parametrize("finding", [None, OLD_TOOL_FINDING], ids=["tool", "old-tool"])
+def test_a_single_node_groups_whole_group_roll_is_a_limitation(
+    site: Site, finding: str | None
+) -> None:
+    site.scale_in(1)
+    document = plan(site)
+    strategy = group(document)["update_strategy"]
+    assert "a single-node group keeps no GPU node up" in strategy["finding"], strategy
+    if finding is not None:
+        strategy["finding"] = finding
+
+    errors = verdicts.compliant_plan_errors(
+        document,
+        target=target(site),
+        facts=single_node_facts(site),
+        mode="host",
+        pin="4.6.1-1",
+    )
+
+    assert errors == [], "no maxUnavailable avoids it: not a failure"
+    (note,) = verdicts.strategy_limitations(document)
+    assert note.startswith(
+        f"{GPU_GROUP} runs a single node (desiredSize 1): a MINIMAL roll takes its "
+        "only GPU node out until the replacement joins"
+    ), note
+    assert note.endswith(f"(the tool's finding: {strategy['finding']})"), note
+
+
+@pytest.mark.parametrize(
+    ("change", "reason", "noted"),
+    [
+        ({"current": "DEFAULT"}, "updateStrategy DEFAULT, planned MINIMAL", True),
+        ({"planned": "DEFAULT"}, "updateStrategy MINIMAL, planned DEFAULT", False),
+        ({"kept": True}, "updateStrategy MINIMAL (kept)", False),
+    ],
+    ids=["current", "planned", "kept"],
+)
+def test_a_single_node_group_off_minimal_still_fails(
+    site: Site, change: dict[str, Any], reason: str, noted: bool
+) -> None:
+    site.scale_in(1)
+    document = plan(site)
+    group(document)["update_strategy"].update(change)
+
+    errors = verdicts.compliant_plan_errors(
+        document, target=target(site), facts=single_node_facts(site), mode="host"
+    )
+
+    assert any(reason in item for item in errors), errors
+    assert bool(verdicts.strategy_limitations(document)) is noted, (
+        "the note follows the planned roll: MINIMAL and not kept"
+    )
+
+
+def test_a_whole_group_roll_of_two_nodes_still_fails(site: Site) -> None:
+    site.world.nodegroups[GPU_GROUP]["updateConfig"] = {
+        "maxUnavailable": 2,
+        "updateStrategy": "MINIMAL",
+    }
+    document = plan(site)
+
+    errors = verdicts.compliant_plan_errors(
+        document, target=target(site), facts=facts(site), mode="host"
+    )
+
+    assert errors == [
+        f"{GPU_GROUP}: updateStrategy MINIMAL (updateStrategy MINIMAL with "
+        "maxUnavailable 2: a roll takes 2 of 2 GPU nodes (the whole group) out at a "
+        "time; lower maxUnavailable below the group size to keep GPU nodes up during "
+        "a roll)"
+    ], "a lower maxUnavailable fixes it: still a failure"
+
+
+def test_only_a_minimal_roll_of_exactly_one_node_is_the_limitation() -> None:
+    def shaped(desired: object, **strategy: object) -> dict[str, Any]:
+        return {
+            "scaling": {"desiredSize": desired},
+            "update_strategy": {"planned": "MINIMAL", "kept": False, **strategy},
+        }
+
+    assert verdicts.single_node_roll(shaped(1)) is True
+    assert not verdicts.single_node_roll(shaped(2)), "two nodes can keep one up"
+    assert not verdicts.single_node_roll(shaped(True)), "a bool is no node count"
+    assert not verdicts.single_node_roll(shaped(None)), "an unknown size is not one"
+    assert not verdicts.single_node_roll(shaped(1, planned="DEFAULT")), "surge"
+    assert not verdicts.single_node_roll(shaped(1, kept=True)), "a kept strategy"
+    assert not verdicts.single_node_roll({}), "no fields, no limitation"
+
+
 @pytest.mark.parametrize(
     ("path", "value", "reason"),
     [
@@ -372,6 +477,29 @@ def test_each_unsafe_roll_field_is_named(
     errors = roll_errors(site, bent(document, path, value))
 
     assert any(reason in item for item in errors), errors
+
+
+def test_a_roll_taking_two_nodes_out_at_once_is_refused(site: Site) -> None:
+    site.world.nodegroups[GPU_GROUP]["updateConfig"] = {
+        "maxUnavailable": 2,
+        "updateStrategy": "MINIMAL",
+    }
+    document = plan(site, "--dcgm-hostengine", "host", "--dcgm-version", "4.6.1")
+
+    errors = roll_errors(site, document)
+
+    assert errors == [f"{GPU_GROUP}: {group(document)['update_strategy']['finding']}"]
+    assert "lower maxUnavailable below the group size" in errors[0], (
+        "the replan after it would fail the BOOT-036 verdict on the same finding"
+    )
+
+
+def test_a_single_node_roll_is_not_refused_for_taking_its_node_out(site: Site) -> None:
+    site.scale_in(1)
+    document = plan(site, "--dcgm-hostengine", "host", "--dcgm-version", "4.6.1")
+    assert group(document)["update_strategy"]["finding"], "the tool names it"
+
+    assert roll_errors(site, document, desired=1) == []
 
 
 def apply_document(**apply: Any) -> str:

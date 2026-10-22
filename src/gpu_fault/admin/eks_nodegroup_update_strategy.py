@@ -8,7 +8,9 @@ spare capacity of the instance type, which GPU node groups rarely have even on
 demand (the live Spot p5en group failed the roll with ``NodeCreationFailure``
 after about 17 minutes, two attempts of three). ``MINIMAL`` terminates first
 and launches after: no extra instance, the group is short by
-``maxUnavailable`` nodes while the replacements join.
+``maxUnavailable`` nodes while the replacements join. A single-node group has
+no GPU node then, whatever ``maxUnavailable`` says (it is at least 1): only
+more nodes, or a window that accepts the outage, keep the roll harmless.
 
 ``MINIMAL`` is the product standard for ``eks-managed`` GPU node groups:
 ``prepare-eks-nodegroup`` sets it before any roll, keeping the group's own
@@ -33,11 +35,13 @@ __all__ = [
     "capacity_effect",
     "minimal_update_config",
     "nodes_out",
+    "single_node",
     "takes_whole_group",
     "unavailable_setting",
     "unavailable_text",
     "update_strategy",
     "update_strategy_findings",
+    "whole_group_remedy",
 ]
 
 UPDATE_STRATEGY_DEFAULT = "DEFAULT"
@@ -94,14 +98,46 @@ def _desired(nodegroup: Mapping[str, Any]) -> int | None:
     return _count(scaling.get("desiredSize")) if isinstance(scaling, Mapping) else None
 
 
+def single_node(nodegroup: Mapping[str, Any]) -> bool:
+    """Whether the group runs exactly one node (``desiredSize`` 1)."""
+
+    return _desired(nodegroup) == 1
+
+
 def takes_whole_group(nodegroup: Mapping[str, Any]) -> bool:
-    """Whether a MINIMAL roll terminates every node of the group at once."""
+    """Whether a MINIMAL roll terminates every node of the group at once.
+
+    Always for a single node: the roll replaces it and MINIMAL terminates
+    before it launches, whatever the unavailability says. Never without nodes.
+    """
 
     setting = unavailable_setting(nodegroup)
     desired = _desired(nodegroup)
+    if desired is not None and desired <= 1:
+        return desired == 1
     if "maxUnavailable" in setting:
         return desired is not None and setting["maxUnavailable"] >= desired
     return setting.get("maxUnavailablePercentage", 0) >= 100
+
+
+def whole_group_remedy(nodegroup: Mapping[str, Any]) -> str:
+    """How to keep GPU nodes up during a MINIMAL roll of the whole group.
+
+    A single-node group cannot lower ``maxUnavailable`` below its size (the
+    least is 1): it needs a second node first, or a window for the outage.
+    """
+
+    if single_node(nodegroup):
+        return (
+            "a single-node group keeps no GPU node up with any maxUnavailable: "
+            "before a roll scale it to at least 2 nodes with maxUnavailable below "
+            "the new size (one more GPU instance of the type; MINIMAL then keeps "
+            "the others up), or roll in a maintenance window that accepts no GPU "
+            "node until the replacement joins"
+        )
+    return (
+        "lower maxUnavailable below the group size to keep GPU nodes up during a roll"
+    )
 
 
 def nodes_out(nodegroup: Mapping[str, Any]) -> str:

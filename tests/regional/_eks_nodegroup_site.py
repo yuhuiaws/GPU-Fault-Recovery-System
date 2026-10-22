@@ -279,6 +279,19 @@ class Site:
         self.world.calls.clear()
         return run
 
+    def scale_in(self, desired: int) -> None:
+        """The group scaled in to ``desired`` nodes after it was prepared, the
+        way the live Spot group ran one node of two (desired 1, max 2)."""
+
+        group = self.world.nodegroups[GPU_GROUP]
+        scaling = group["scalingConfig"]
+        group["scalingConfig"] = {
+            **scaling,
+            "minSize": min(scaling["minSize"], desired),
+            "desiredSize": desired,
+        }
+        self.world.instances[GPU_GROUP] = self.world.instances[GPU_GROUP][:desired]
+
     # --- Kubernetes ----------------------------------------------------------
 
     def nodes(self, group: str) -> list[dict[str, Any]]:

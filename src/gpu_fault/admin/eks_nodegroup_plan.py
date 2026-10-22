@@ -61,6 +61,7 @@ from gpu_fault.admin.eks_nodegroup_update_strategy import (
     unavailable_setting,
     unavailable_text,
     update_strategy,
+    whole_group_remedy,
 )
 from gpu_fault.admin.eks_nodegroup_user_data import (
     DCGM_HOSTENGINE_EMBEDDED,
@@ -331,11 +332,12 @@ def _roll_note(
     note: dict[str, Any] = {"needed": needed}
     spot = str(document.get("capacityType") or "") == "SPOT"
     if needed and strategy == UPDATE_STRATEGY_MINIMAL:
+        short = "without a GPU node" if takes_whole_group(document) else "short"
         note["caveat"] = (
             f"updateStrategy {strategy}: {capacity_effect(document, strategy)}"
             + "; a replacement that cannot launch ("
             + ("Spot capacity" if spot else "capacity")
-            + ") leaves the group short until one does, and the roll stops "
+            + f") leaves the group {short} until one does, and the roll stops "
             "ROLL_FAILED or ROLL_IN_PROGRESS -- rerun later"
         )
     elif needed:
@@ -375,8 +377,7 @@ def _strategy(document: Mapping[str, Any], *, keep: bool) -> dict[str, Any]:
     elif takes_whole_group(document):
         report["finding"] = (
             f"updateStrategy MINIMAL with {unavailable_text(document)}: a roll takes "
-            f"{nodes_out(document)}; lower maxUnavailable below the group size to "
-            "keep GPU nodes up during a roll"
+            f"{nodes_out(document)}; {whole_group_remedy(document)}"
         )
     return report
 

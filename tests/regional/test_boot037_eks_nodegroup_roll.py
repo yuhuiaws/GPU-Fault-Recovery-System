@@ -268,6 +268,21 @@ def test_a_window_long_enough_is_accepted(
     assert boot037.window_errors(settings) == []
 
 
+def test_preflight_refuses_a_roll_taking_both_nodes_out_at_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = prepared_site(tmp_path)
+    site.world.nodegroups[GPU_GROUP]["updateConfig"] = {
+        "maxUnavailable": 2,
+        "updateStrategy": "MINIMAL",
+    }
+    settings = settings_for(tmp_path, site, monkeypatch)
+
+    errors = boot037.read_only_preflight(settings, tmp_path)["errors"]
+
+    assert any("2 of 2 GPU nodes (the whole group)" in item for item in errors), errors
+
+
 def test_preflight_names_an_earlier_update_in_progress(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -393,6 +408,32 @@ def test_a_drifted_group_rolls_and_every_replacement_is_adopted(
         case_dir / "tool-plan-after.json"
     ).is_file(), "both tool documents are kept"
     assert result["agents"]["agents_active_after_seconds"] == 0.0
+    assert result["limitations"] == boot037.LIMITATIONS, "two nodes: nothing to note"
+
+
+def test_a_single_node_group_rolls_with_its_outage_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The only GPU node is out during the roll whatever maxUnavailable says:
+    a limitation, and the plan after the roll passes BOOT-036's verdict."""
+
+    site = prepared_site(tmp_path)
+    site.scale_in(1)
+    replacement = new_nodes(site)[:1]
+    settings = settings_for(tmp_path, site, monkeypatch)
+    run_dir = tmp_path / "run"
+    planned(settings, run_dir)
+
+    assert boot037.execute_case(settings, run_dir, 1, DEADLINE) == 0
+
+    result = evidence(run_dir)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["stages"]["replan"] == [], "the same finding is no failure after"
+    assert [item["name"] for item in result["replacement_nodes"]] == replacement
+    static = len(boot037.LIMITATIONS)
+    assert result["limitations"][:static] == boot037.LIMITATIONS
+    (note,) = result["limitations"][static:]
+    assert note.startswith(f"{GPU_GROUP} runs a single node (desiredSize 1)"), note
 
 
 def test_a_roll_short_of_capacity_fails_with_the_rerun_exit(

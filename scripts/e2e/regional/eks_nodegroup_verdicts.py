@@ -9,7 +9,9 @@ reasons the evidence is not the expected shape; an empty list is a pass.
   step, node auto repair off, the ownership label, ``updateStrategy`` MINIMAL,
   the managed user data part in place, in host mode the paired DCGM pin with
   the restart drop-in -- and its read-only node inventory passes every check
-  on exactly the group's running instances, with no finding;
+  on exactly the group's running instances, with no finding; the one strategy
+  finding no setting avoids, a single-node group's whole-group roll, is
+  recorded instead (``strategy_limitations``);
 * ``refusal_errors``: a refused target stops before anything is changed and
   names the fact (an unknown group, a cluster that is not plain EKS, an
   adoption reference naming no part, a group the verb cannot prepare);
@@ -64,8 +66,10 @@ __all__ = [
     "refusal_errors",
     "replacement_errors",
     "roll_plan_errors",
+    "single_node_roll",
     "snapshot_drift",
     "stability_errors",
+    "strategy_limitations",
 ]
 
 HOST = "host"
@@ -256,6 +260,46 @@ def _user_data_errors(name: str, group: Mapping[str, Any]) -> list[str]:
     return errors
 
 
+def single_node_roll(group: Mapping[str, Any]) -> bool:
+    """The plan rolls a group of exactly one node with MINIMAL, not kept.
+
+    Such a roll takes the group's only GPU node out whatever its
+    unavailability (``maxUnavailable`` is at least 1), so its whole-group
+    finding names a limit, not a fix. Decided from the plan's structured
+    fields (``scaling.desiredSize``, ``update_strategy``), never from the
+    finding's words: tool versions word it differently.
+    """
+
+    desired = _mapping(group.get("scaling")).get("desiredSize")
+    strategy = _mapping(group.get("update_strategy"))
+    return (
+        isinstance(desired, int)
+        and not isinstance(desired, bool)
+        and desired == 1
+        and strategy.get("planned") == UPDATE_STRATEGY_MINIMAL
+        and not strategy.get("kept")
+    )
+
+
+def strategy_limitations(document: Mapping[str, Any] | None) -> list[str]:
+    """What the verdicts record instead of judging: per single-node group of
+    the plan, that no setting keeps a GPU node up during its roll."""
+
+    notes = []
+    for name, group in sorted(groups_by_name(document).items()):
+        if not single_node_roll(group):
+            continue
+        finding = _mapping(group.get("update_strategy")).get("finding")
+        notes.append(
+            f"{name} runs a single node (desiredSize 1): a MINIMAL roll takes its "
+            "only GPU node out until the replacement joins, whatever maxUnavailable "
+            "says; keeping one up needs a second node, so the case records this "
+            "instead of failing on it"
+            + (f" (the tool's finding: {finding})" if finding else "")
+        )
+    return notes
+
+
 def compliant_group_errors(
     name: str,
     group: Mapping[str, Any],
@@ -282,10 +326,19 @@ def compliant_group_errors(
             f"{name}: the group is not labelled {OWNERSHIP_LABEL}={target.site_id}"
         )
     strategy = _mapping(group.get("update_strategy"))
-    if strategy.get("current") != UPDATE_STRATEGY_MINIMAL or strategy.get("finding"):
+    finding = strategy.get("finding")
+    planned = strategy.get("planned")
+    if (
+        strategy.get("current") != UPDATE_STRATEGY_MINIMAL
+        or planned != UPDATE_STRATEGY_MINIMAL
+        or strategy.get("kept")
+        or (finding and not single_node_roll(group))
+    ):
         errors.append(
             f"{name}: updateStrategy {strategy.get('current')}"
-            + (f" ({strategy.get('finding')})" if strategy.get("finding") else "")
+            + (f", planned {planned}" if planned != strategy.get("current") else "")
+            + (" (kept)" if strategy.get("kept") else "")
+            + (f" ({finding})" if finding else "")
         )
     if _mapping(group.get("roll")).get("needed") is not False:
         errors.append(f"{name}: the plan still needs a roll")
@@ -487,6 +540,9 @@ def roll_plan_errors(
         errors.append(
             f"{nodegroup}: the roll would use updateStrategy {strategy.get('planned')}"
         )
+    elif strategy.get("finding") and not single_node_roll(group):
+        # The replan after the roll would fail the BOOT-036 verdict on it.
+        errors.append(f"{nodegroup}: {strategy.get('finding')}")
     dcgm = _mapping(group.get("dcgm_hostengine"))
     if dcgm.get("mode") != mode:
         errors.append(f"{nodegroup}: DCGM mode {dcgm.get('mode')}, expected {mode}")

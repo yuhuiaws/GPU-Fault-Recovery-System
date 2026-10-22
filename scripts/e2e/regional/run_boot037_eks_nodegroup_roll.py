@@ -12,7 +12,9 @@ proves the whole path on a site-managed group:
 
 * the read-only plan of the target configuration rolls the group with MINIMAL
   (a first preparation, a new managed part, another DCGM pin or an adopted
-  hand-written part; a group that already runs the target is refused here);
+  hand-written part; a group that already runs the target is refused here, as
+  is a roll taking a group of two or more nodes out at once -- a single-node
+  group's roll always does, and joins the result's ``limitations``);
 * nothing else holds the group: every node Ready and schedulable without an
   isolating taint, no business workload and no attempt the control plane binds
   to a node, no active incident or executable workflow on the cluster, every
@@ -345,6 +347,7 @@ def read_only_preflight(settings: Settings, case_dir: Path) -> dict[str, Any]:
         case.record_run(case_dir, "tool-plan-before", plan)
         summary = plan_summary(plan, settings.nodegroup)
         result["tool_plan"] = summary
+        result["limitations"] = verdicts.strategy_limitations(plan.document)
         errors += verdicts.roll_plan_errors(
             plan.document,
             target=target,
@@ -555,6 +558,7 @@ def roll(
     case.verify_plan_identity(case_dir, CASE_ID, plan_identity(preflight))
     result.update(preflight["identity"])
     result["predecessor"] = preflight["predecessor"]
+    result["limitations"] = [*LIMITATIONS, *preflight.get("limitations", ())]
     remaining = (deadline - CLOCK.now()).total_seconds()
     if remaining < settings.required_window_seconds():
         raise RegionalFixtureError(
@@ -723,7 +727,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "stop_conditions": [
             "formal predecessor evidence (BOOT-036) is not PASS",
             "the plan of the target configuration does not roll the group with "
-            "MINIMAL (already compliant, refused, an earlier update in progress)",
+            "MINIMAL (already compliant, refused, an earlier update in progress), "
+            "or its roll takes a group of two or more nodes out at once",
             "a node is held, runs a business workload or is bound to an attempt",
             "an active incident or executable workflow on the cluster, or a "
             "node's Agent not ACTIVE",
