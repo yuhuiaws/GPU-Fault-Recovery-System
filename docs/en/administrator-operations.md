@@ -2130,7 +2130,11 @@ Once the user data is in the node group's launch template, the nodes still have 
   why step 4 sets `MINIMAL`: the roll then terminates one node before it launches its replacement, needs no spare
   instance, and the group is one GPU node short (1 of 2 out at a time) until each replacement joins (the join window
   paragraph above); a replacement that cannot launch (Spot capacity) leaves the group short until one does.
-  Keep `maxUnavailable` below the group size: at or above it a `MINIMAL` roll takes the whole group out at once.
+  Keep `maxUnavailable` below the group size: at or above it a `MINIMAL` roll takes the whole group out at once. A
+  single-node group (`desiredSize` 1) has no such value -- `maxUnavailable` is at least 1 -- and its roll leaves it
+  without a GPU node until the replacement joins (on Spot, until one can launch): scale it to at least 2 nodes first,
+  with `maxUnavailable` below the new size (the extra node needs one more instance of the type), or roll in a
+  maintenance window that accepts the outage; `MINIMAL` stays the standard either way.
   Never start a roll while `gpu-fault-admin config`/`deploy` may run -- the `regional_contexts` preflight fails closed
   while the node group is UPDATING. After a successful roll follow the replacement-node join window paragraph above
   (`--retire-departed-agents` → the reconciler installs the new nodes), and confirm the packages on a new node before
@@ -2464,11 +2468,17 @@ waited for (at most 15 minutes), and the group must be ACTIVE again before the n
 is compliant, so a rerun changes nothing. The plan JSON has per group `update_strategy`: `current` (`DEFAULT`/`MINIMAL`),
 `planned` (the strategy the roll uses: `MINIMAL` unless kept), `kept`, `unavailable` (the group's
 `maxUnavailable`/`maxUnavailablePercentage` as set), `capacity_effect` and, when there is one, `finding`; `roll.caveat`
-describes the `MINIMAL` roll (a replacement that cannot launch -- Spot capacity -- leaves the group short until one
-does, and the roll stops `ROLL_FAILED` or `ROLL_IN_PROGRESS`: rerun later). A `MINIMAL` roll that would take the whole
-group out at once (`maxUnavailable` at or above the group's `desiredSize`, or `maxUnavailablePercentage` 100) keeps the
-value as set and adds the finding `<node group>: updateStrategy MINIMAL with maxUnavailable 2: a roll takes 2 of 2 GPU
-nodes (the whole group) out at a time; lower maxUnavailable below the group size to keep GPU nodes up during a roll`.
+describes the `MINIMAL` roll (a replacement that cannot launch -- Spot capacity -- leaves the group short, or without a
+GPU node when the roll takes the whole group, until one does, and the roll stops `ROLL_FAILED` or `ROLL_IN_PROGRESS`:
+rerun later). A `MINIMAL` roll that would take the whole group out at once (`maxUnavailable` at or above the group's
+`desiredSize`, or `maxUnavailablePercentage` 100; a single-node group always) keeps the value as set and adds the
+finding `<node group>: updateStrategy MINIMAL with maxUnavailable 2: a roll takes 2 of 2 GPU nodes (the whole group) out
+at a time; lower maxUnavailable below the group size to keep GPU nodes up during a roll`. A single-node group cannot
+lower it (the least is 1), so its finding names the ways out instead (§5.0.1): `<node group>: updateStrategy MINIMAL
+with maxUnavailable 1: a roll takes 1 of 1 GPU node (the whole group) out at a time; a single-node group keeps no GPU
+node up with any maxUnavailable: before a roll scale it to at least 2 nodes with maxUnavailable below the new size (one
+more GPU instance of the type; MINIMAL then keeps the others up), or roll in a maintenance window that accepts no GPU
+node until the replacement joins`. A group without nodes (`desiredSize` 0) gets no whole-group finding.
 `--keep-update-strategy` is for an operator who deliberately keeps `DEFAULT` (for example a group with spare capacity
 that must not lose a node during the roll): no `update-config` step; the plan records the finding
 `<node group>: updateStrategy DEFAULT kept (--keep-update-strategy): a roll launches a replacement before it terminates

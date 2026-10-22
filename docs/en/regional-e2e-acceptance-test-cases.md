@@ -3865,7 +3865,8 @@ release_id and the remedy: run `gpu-fault-admin deploy` of the site's own releas
 ##### Verdict
 
 - The main plan is `COMPLIANT`: every group's verdict `COMPLIANT`, no step, `node_repair` `disabled`, this site's ownership
-  label, `update_strategy.current` `MINIMAL` without a finding, `roll.needed` false; user data `action` `keep` with exactly
+  label, `update_strategy.current` and `planned` `MINIMAL`, not `kept`, without a finding (one exception below),
+  `roll.needed` false; user data `action` `keep` with exactly
   one managed part and no contradicting line in a hand-written part; the DCGM mode equals the site's recorded
   `dcgmHostEngine`, and in host mode the group carries `gpu-fault.io/dcgm-hostengine=host`, the pin is `paired` with the
   DCGM client of the product's exporter and the plan carries the restart drop-in; `current_nodes.outcome` is `passed`,
@@ -3873,6 +3874,11 @@ release_id and the remedy: run `gpu-fault-admin deploy` of the site's own releas
   the group's running instances and its Kubernetes Nodes' instances, as many as `desiredSize`; the Kubernetes findings are
   readable, the allowed workload namespaces exist, the NVIDIA and EFA device plugins run and no GPU DaemonSet tolerates the
   quiesce taint.
+- The exception: a group of exactly one node (`scaling.desiredSize` 1) whose roll is `MINIMAL` and not kept. Its roll
+  takes the only GPU node out whatever `maxUnavailable` says (the least is 1), so its whole-group finding fails nothing:
+  the result's `limitations` get one entry for the group, with the tool's finding. The case decides it from these
+  fields, never from the finding's words. For two or more nodes a whole-group finding (`maxUnavailable` at or above
+  `desiredSize`, or `maxUnavailablePercentage` 100) still fails the case: a lower `maxUnavailable` fixes it.
 - Every refusal probe ends as expected: the cluster-level refusals (CPU control plane, HyperPod, HyperPod-orchestrated EKS)
   exit 2 without printing a plan and without any `eks list-nodegroups`/`eks describe-nodegroup`/`ec2 describe-instances`/
   `ssm send-command` among the provider calls they echo; the absent group is refused with exit 2 before any node is read;
@@ -3887,7 +3893,8 @@ release_id and the remedy: run `gpu-fault-admin deploy` of the site's own releas
 ##### Evidence
 
 `cases/GF-REGIONAL-BOOT-036/`: `GF-REGIONAL-BOOT-036.json` (release and cluster identity, the errors of every stage, each
-probe's expectation and outcome), `preflight.json`, `tool-plan.json` and `tool-plan.stderr.log` (the main plan document and
+probe's expectation and outcome, `limitations` with an entry per single-node group), `preflight.json`, `tool-plan.json`
+and `tool-plan.stderr.log` (the main plan document and
 the CLI output with credential lines removed), `tool-refusal-<name>.*` per refusal probe,
 `snapshot-before.json`/`snapshot-after.json`, `store-after.json`.
 
@@ -3897,6 +3904,8 @@ the CLI output with credential lines removed), `tool-refusal-<name>.*` per refus
   Nodes the inventory must cover, it does not repeat each check's reading.
 - The unsupported-group refusal runs only where the cluster has such a group; the HyperPod-orchestrated EKS refusal only on
   a site with a HyperPod member.
+- A single-node group's whole-group roll is recorded, not judged (verdict above): keeping a GPU node up during its roll
+  needs a second node first (Administrator Operations §5.0.1).
 
 ### GF-REGIONAL-BOOT-037
 
@@ -3938,7 +3947,10 @@ the CLI output with credential lines removed), `tool-refusal-<name>.*` per refus
 2. The read-only plan of the target configuration must roll the group: status `CHANGES`, steps only out of
    launch-template-version/node-repair/labels/update-config/roll and including roll, `update_strategy.planned` `MINIMAL`
    (the runner never passes `--keep-update-strategy`), in host mode a `paired` pin, current nodes readable and as many as
-   `desiredSize`. A group already on the target configuration (`COMPLIANT`), a refused one (`REFUSED`) or an earlier
+   `desiredSize`. A roll taking a group of two or more nodes out at once (a whole-group `update_strategy.finding`) is
+   refused too, since the plan after it would fail the verdict of `BOOT-036`; a single-node group's roll always takes
+   its only GPU node out and gets an entry in the result's `limitations`, as in `BOOT-036`. A group already on the
+   target configuration (`COMPLIANT`), a refused one (`REFUSED`) or an earlier
    apply's update still running (`IN_PROGRESS`: rerun that apply first, it resumes the journaled update) is refused at
    preflight. What makes the plan roll: a first preparation, a new managed part after the product's paired DCGM version
    moved, `--adopt-user-data-part`; when none applies, the acceptance alternates between the two spellings of a pin of the
@@ -4017,6 +4029,8 @@ the errors of every stage, `departed_nodes`, `replacement_nodes`, `node_renames`
 - A replacement keeps no identity; pairing departed and replacement nodes in name order is a convention.
 - Proves the replacements this roll produced only; whether a later AMI release or an EKS-initiated replacement prepares
   nodes the same way is outside this case.
+- On a single-node group the roll leaves the group without a GPU node from the termination until the replacement joins
+  (on Spot, until one can launch); the result records it in `limitations`.
 
 ### GF-REGIONAL-BOOT-024
 
