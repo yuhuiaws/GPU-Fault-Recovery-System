@@ -353,6 +353,54 @@ def test_a_prepared_site_passes_every_stage(
     assert json.loads((case_dir / "plan.json").read_text())["details"]["tool_runs"], (
         "the approved plan is not overwritten by the tool's"
     )
+    assert result["limitations"] == boot036.LIMITATIONS, "two nodes: nothing to note"
+
+
+def test_a_single_node_group_passes_with_its_whole_group_roll_recorded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The live Spot group at desired 1: its MINIMAL roll takes the only GPU
+    node out whatever maxUnavailable says -- a limitation, not a failure."""
+
+    site = prepared_site(tmp_path)
+    site.scale_in(1)
+    settings = settings_for(tmp_path, site, monkeypatch)
+    run_dir = tmp_path / "run"
+    planned(settings, run_dir)
+
+    assert boot036.execute_case(settings, run_dir, 1, DEADLINE) == 0
+
+    result = evidence(run_dir)
+    assert result["verdict"] == "PASS", result["errors"]
+    static = len(boot036.LIMITATIONS)
+    assert result["limitations"][:static] == boot036.LIMITATIONS
+    (note,) = result["limitations"][static:]
+    assert note.startswith(f"{GPU_GROUP} runs a single node (desiredSize 1)"), note
+    assert "scale it to at least 2 nodes" in note, "with the tool's own remedy"
+
+
+def test_a_two_node_group_rolled_whole_still_fails_on_the_finding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    site = prepared_site(tmp_path)
+    site.world.nodegroups[GPU_GROUP]["updateConfig"] = {
+        "maxUnavailable": 2,
+        "updateStrategy": "MINIMAL",
+    }
+    settings = settings_for(tmp_path, site, monkeypatch)
+    run_dir = tmp_path / "run"
+    planned(settings, run_dir)
+
+    assert boot036.execute_case(settings, run_dir, 1, DEADLINE) == 1
+
+    result = evidence(run_dir)
+    assert result["stages"]["main_plan"] == [
+        f"{GPU_GROUP}: updateStrategy MINIMAL (updateStrategy MINIMAL with "
+        "maxUnavailable 2: a roll takes 2 of 2 GPU nodes (the whole group) out at a "
+        "time; lower maxUnavailable below the group size to keep GPU nodes up "
+        "during a roll)"
+    ], "a lower maxUnavailable fixes it"
+    assert result["limitations"] == boot036.LIMITATIONS, "and nothing is noted"
 
 
 def test_the_plan_lists_every_tool_run_it_will_make(

@@ -11,7 +11,9 @@ case proves on the live site, read-only, that the site's groups stay prepared:
 * the read-only plan of every group the site labels is COMPLIANT -- no step --
   and its SSM inventory passes every node check on exactly the group's running
   instances, with the DCGM pin paired with the product's exporter and no
-  finding (``eks_nodegroup_verdicts.compliant_plan_errors``);
+  finding (``eks_nodegroup_verdicts.compliant_plan_errors``) -- except that a
+  single-node group's MINIMAL roll takes its only GPU node out whatever
+  ``maxUnavailable`` says: that finding joins the result's ``limitations``;
 * the refusals a plan must show stop before anything is read or changed: the
   CPU control plane, a HyperPod cluster and a HyperPod-orchestrated EKS cluster
   as the GPU cluster, an unknown node group, an ``--adopt-user-data-part``
@@ -78,6 +80,9 @@ LIMITATIONS = [
     "refuses instead.",
     "The unsupported-group refusal runs only where the cluster has such a group, "
     "the HyperPod-orchestrated EKS refusal only on a site with a HyperPod member.",
+    "A single-node group's whole-group roll is a limitation, not a failure: no "
+    "maxUnavailable keeps its only GPU node up, so each such group gets an entry "
+    "of its own in this list; for two or more nodes the finding fails the case.",
 ]
 
 
@@ -483,6 +488,10 @@ def audit(
         main_arguments(settings, target, groups), timeout=case.PLAN_TIMEOUT_SECONDS
     )
     result["main_plan"] = case.record_run(case_dir, "tool-plan", main)
+    result["limitations"] = [
+        *LIMITATIONS,
+        *verdicts.strategy_limitations(main.document),
+    ]
     stages: dict[str, list[str]] = {
         "main_plan": verdicts.compliant_plan_errors(
             main.document,

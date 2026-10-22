@@ -6,7 +6,10 @@ one more GPU instance of the type -- on the live Spot p5en group it failed with
 therefore sets MINIMAL (keeping the group's own ``maxUnavailable``) before any
 roll, ``--keep-update-strategy`` keeps DEFAULT with a finding, and the
 ``regional_contexts`` facts behind ``status --full`` advise on a selected GPU
-group that is not MINIMAL without changing any verdict. The world is
+group that is not MINIMAL without changing any verdict. A MINIMAL roll that
+takes the whole group out at once is a finding with a remedy the group can
+follow: a lower maxUnavailable, or -- for a single node, where none is lower
+than 1 -- a second node first or a window that accepts the outage. The world is
 ``_eks_nodegroup_world``: the live group's ``updateConfig`` is
 ``{"maxUnavailable": 1}`` (no strategy, i.e. DEFAULT), two nodes, Spot.
 """
@@ -168,6 +171,112 @@ def test_the_minimal_payload_keeps_the_groups_own_unavailability(
         "maxUnavailable below the group size"
     )
     assert (whole in err) is ("whole group" in out), "the whole-group roll is named"
+
+
+SINGLE_NODE_REMEDY = (
+    "a single-node group keeps no GPU node up with any maxUnavailable: before a roll "
+    "scale it to at least 2 nodes with maxUnavailable below the new size (one more "
+    "GPU instance of the type; MINIMAL then keeps the others up), or roll in a "
+    "maintenance window that accepts no GPU node until the replacement joins"
+)
+SIZE_REMEDY = (
+    "lower maxUnavailable below the group size to keep GPU nodes up during a roll"
+)
+
+
+@pytest.mark.parametrize(
+    ("config", "desired", "finding"),
+    [
+        (
+            {"maxUnavailable": 1},
+            1,
+            "updateStrategy MINIMAL with maxUnavailable 1: a roll takes 1 of 1 GPU "
+            f"node (the whole group) out at a time; {SINGLE_NODE_REMEDY}",
+        ),
+        (
+            {"maxUnavailablePercentage": 50},
+            1,
+            "updateStrategy MINIMAL with maxUnavailablePercentage 50: a roll takes "
+            f"50% of 1 GPU node (the whole group) out at a time; {SINGLE_NODE_REMEDY}",
+        ),
+        (
+            {},
+            1,
+            "updateStrategy MINIMAL with the EKS default maxUnavailable: a roll takes "
+            "the EKS default maxUnavailable of 1 GPU node (the whole group) out at a "
+            f"time; {SINGLE_NODE_REMEDY}",
+        ),
+        (
+            {"maxUnavailable": 2},
+            2,
+            "updateStrategy MINIMAL with maxUnavailable 2: a roll takes 2 of 2 GPU "
+            f"nodes (the whole group) out at a time; {SIZE_REMEDY}",
+        ),
+        ({"maxUnavailable": 1}, 2, None),
+        ({"maxUnavailable": 1}, 0, None),
+    ],
+    ids=[
+        "single-node",
+        "single-node-percentage",
+        "single-node-eks-default",
+        "two-nodes-whole-group",
+        "two-nodes-one-out",
+        "no-node",
+    ],
+)
+def test_a_whole_group_roll_names_a_remedy_the_group_can_follow(
+    capsys: pytest.CaptureFixture[str],
+    config: dict[str, Any],
+    desired: int,
+    finding: str | None,
+) -> None:
+    """maxUnavailable cannot go below 1: a single-node group is told to scale
+    up or accept the outage; a larger group still to lower maxUnavailable."""
+
+    world = World()
+    _prepared_but_default(world)
+    group = world.nodegroups[GPU_GROUP]
+    group["updateConfig"] = {**config, "updateStrategy": "MINIMAL"}
+    group["scalingConfig"] = {"minSize": 0, "maxSize": 2, "desiredSize": desired}
+    world.instances[GPU_GROUP] = world.instances[GPU_GROUP][:desired]
+
+    code, document, err = _run(world, capsys)
+
+    assert code == 0, err
+    planned = _group(document)
+    assert (planned["verdict"], planned["steps"]) == ("COMPLIANT", []), planned
+    assert planned["update_strategy"].get("finding") == finding
+    lines = [
+        line for line in err.splitlines() if "finding: " in line and "MINIMAL" in line
+    ]
+    assert lines == (
+        [f"gpu-fault-admin prepare-eks-nodegroup: finding: {GPU_GROUP}: {finding}"]
+        if finding
+        else []
+    ), "the console prints the plan's finding as it is"
+
+
+@pytest.mark.parametrize(
+    ("desired", "short"),
+    [(1, "without a GPU node"), (2, "short")],
+    ids=["single-node", "two-nodes"],
+)
+def test_the_roll_caveat_says_when_a_stuck_replacement_leaves_no_gpu_node(
+    capsys: pytest.CaptureFixture[str], desired: int, short: str
+) -> None:
+    world = World(user_data=site_user_data())
+    world.nodegroups[GPU_GROUP]["scalingConfig"] = {
+        "minSize": 1,
+        "maxSize": 2,
+        "desiredSize": desired,
+    }
+    world.instances[GPU_GROUP] = world.instances[GPU_GROUP][:desired]
+
+    code, document, err = _run(world, capsys)
+
+    assert code == 0, err
+    caveat = _group(document)["roll"]["caveat"]
+    assert f"(Spot capacity) leaves the group {short} until one does" in caveat, caveat
 
 
 # --- plan --------------------------------------------------------------------

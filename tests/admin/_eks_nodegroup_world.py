@@ -278,7 +278,9 @@ class World:
             if entry["kind"] == "VersionUpdate" and entry["final"] == "Successful":
                 document["launchTemplate"]["version"] = entry["version"]
                 self.rolls += 1
-                fresh = [f"i-new{self.rolls}a", f"i-new{self.rolls}b"]
+                # As many replacements as the group's desiredSize: a, b, ...
+                size = (document.get("scalingConfig") or {}).get("desiredSize", 2)
+                fresh = [f"i-new{self.rolls}{chr(97 + index)}" for index in range(size)]
                 self.instances[entry["group"]] = fresh
                 booted = booted_node(self.template_user_data(int(entry["version"])))
                 for instance in fresh:
