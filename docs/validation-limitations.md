@@ -1066,9 +1066,9 @@ accepts either two fresh delivered samples below the threshold or the
 recovered edge's fresh sample together with the product's cleared health
 signal for the metric (host CPU/load, storage and host memory alike), read
 from the moment the stop was requested because that edge is often delivered
-while the stop is still in progress; the host-memory variants wait for the
-allocator to reach the threshold (up to 18 minutes on a 2 TiB host) before
-timing detection; and the
+while the stop is still in progress; the host-memory variants (002 and 003
+`low_available_memory`) wait for the allocator to reach the threshold (up to
+18 minutes on a 2 TiB host) before timing detection; and the
 GPU environment runner
 treats a collector unit that carries no endpoint override after the restore as
 restored to `collector.env`'s endpoint, the state its repoint started from.

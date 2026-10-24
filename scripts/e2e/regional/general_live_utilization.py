@@ -250,6 +250,10 @@ def rank_cpu_idle(ctx: VariantContext) -> dict[str, Any]:
     return _result(stages, extra={"attempt": identity})
 
 
+#: How long the memory allocator may take to bring MemAvailable to the threshold.
+MEMORY_RAMP_BUDGET = 1080
+
+
 def low_available_memory(ctx: VariantContext) -> dict[str, Any]:
     survey = run_survey(ctx)
     require_tools(survey, "systemd-run")
@@ -259,17 +263,36 @@ def low_available_memory(ctx: VariantContext) -> dict[str, Any]:
         )
     started = utc_now()
     hold = MEMORY_DURATION + 300 + 120
+    # The allocator touches memory at a fixed pace: on a 2 TiB host it needs
+    # about 14 minutes to reach the threshold (live 2026-10-24: MemAvailable
+    # still 36 % when the detection budget ran out), so the load is held, and
+    # detection timed, from the moment the oracle reads the threshold.
+    ramp = MEMORY_RAMP_BUDGET
     oracle = Oracle(ctx, "mem")
-    oracle.start(hold + 120, interval=5, meminfo=True)
+    oracle.start(ramp + hold + 120, interval=5, meminfo=True)
     ctx.node(
         "memory-start",
         "--target-used-percent",
         "96.5",
         "--seconds",
-        str(hold + 120),
+        str(ramp + hold + 120),
         "--approved",
     )
     ctx.cleanup.push("memory", lambda: ctx.node("memory-stop"))
+
+    def ramped() -> bool | None:
+        oracle.read()
+        values = oracle_values(
+            oracle.records, lambda record: record.get("memory_available_percent")
+        )
+        return True if values and values[-1] <= 5.0 else None
+
+    if not ctx.wait_until(
+        ramped, timeout_seconds=ramp, poll_seconds=15, name="low-mem-ramp"
+    ):
+        raise VariantInconclusive(
+            f"the allocator did not bring MemAvailable to 5 % within {ramp} s"
+        )
     detection = wait_for_incident(
         ctx,
         started,
@@ -648,6 +671,7 @@ VARIANTS = [
         low_available_memory,
         risk="H",
         approvals=("HOST_MEMORY_PRESSURE",),
+        max_minutes=45,
     ),
     _spec(
         "high_page_cache",
