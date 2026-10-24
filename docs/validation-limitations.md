@@ -932,8 +932,11 @@ approval not arranged this phase (watcher network isolation, control-plane
 restart). The implemented verdicts record the known product gaps the spec
 expects to FAIL (capacity-only `statvfs` for the read-only and vanished-mount
 variants, the weighted-time disk await, the empty required-interface list)
-rather than masking them. Inode exhaustion is no longer a product gap: the
-product grades `filesystem_inodes_used_percent` like capacity.
+rather than masking them. Inode exhaustion is no longer one of them: the
+product grades `filesystem_inodes_used_percent` like capacity, so 004
+`inode_full` now expects the full MARK_UNSCHEDULABLE/QUARANTINE chain on the
+inode signal and readmits the node through the validated restore, exactly as
+`capacity_full` does.
 
 ## GF-GENERAL-LIVE host/device categories (phase 2)
 

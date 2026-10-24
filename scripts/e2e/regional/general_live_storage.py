@@ -9,9 +9,11 @@ system disk, ``/var`` and the log disk are never touched.
 004 ``filesystem_used_percent`` >= 98 is CRITICAL QUARANTINE (immediate):
 MARK_UNSCHEDULABLE then QUARANTINE, no STOP (no ``stop_on_isolation``), the
 incident ends QUARANTINED and the node is returned through the product's
-validated restore. The product reads only ``f_blocks/f_bavail/f_frsize``, so
-the inode, read-only, vanished-mount and probe-error variants are the spec's
-expected FAILs. 006 ``disk_io_util_percent``/``disk_io_await_ms`` are WARNING
+validated restore. ``filesystem_inodes_used_percent`` (``f_files/f_ffree``) is
+graded the same way, so ``inode_full`` runs that chain on the inode signal. The
+product grades only ``statvfs`` capacity, so the read-only, vanished-mount and
+probe-error variants are the spec's expected FAILs. 006
+``disk_io_util_percent``/``disk_io_await_ms`` are WARNING
 RUN_DIAGNOSTICS with a 120 s sustain; the oracle's own ``/proc/diskstats`` read
 computes the standard await to compare with the product's weighted-time one.
 """
@@ -242,10 +244,10 @@ def duplicate(ctx: VariantContext) -> dict[str, Any]:
 
 
 def _expected_fail_capacity(ctx: VariantContext, *, variant: str) -> dict[str, Any]:
-    """The four spec-FAIL boundaries the byte-only product never reads.
+    """The spec-FAIL boundaries a capacity-only product never reads.
 
-    Each makes the test file system unusable in a way ``statvfs`` on
-    ``f_blocks/f_bavail`` does not report, then checks the product minted no
+    Each makes the test file system unusable in a way ``statvfs`` capacity
+    (blocks and inodes) does not report, then checks the product minted no
     ``filesystem_used_percent`` finding. The effective injection with no
     detection is the FAIL the case exists to record.
     """
@@ -253,16 +255,11 @@ def _expected_fail_capacity(ctx: VariantContext, *, variant: str) -> dict[str, A
     survey = run_survey(ctx)
     require_tools(survey, "losetup", "mkfs.ext4", "mount", "fallocate")
     mount = _fs_mount(ctx)
-    inodes = 256 if variant == "inode_full" else 0
-    _create_fs(ctx, inodes=inodes)
+    _create_fs(ctx)
     _declare_fs(ctx)
     started = utc_now()
     injected: dict[str, Any] = {}
-    if variant == "inode_full":
-        injected = ctx.storage("fs-inodes", "--name", TEST_FS, timeout=300)
-        if not injected.get("enospc"):
-            raise VariantInconclusive("inode exhaustion did not reach ENOSPC")
-    elif variant == "read_only":
+    if variant == "read_only":
         injected = ctx.storage("fs-remount", "--name", TEST_FS, "--mode", "ro")
         if not (injected.get("statvfs") or {}).get("read_only"):
             raise VariantInconclusive("the remount did not report read-only")
@@ -298,7 +295,7 @@ def _expected_fail_capacity(ctx: VariantContext, *, variant: str) -> dict[str, A
         if detected
         else [
             f"{variant}: the product never detected the unusable test file system "
-            f"(byte-only statvfs reads f_blocks/f_bavail only)"
+            f"(statvfs capacity only: blocks and inodes)"
         ]
     }
     # expected_outcome=FAIL: a passing chain stage means the gap was NOT exposed,
@@ -306,8 +303,75 @@ def _expected_fail_capacity(ctx: VariantContext, *, variant: str) -> dict[str, A
     return _result(stages, extra={"detected": detected, "injection": injected})
 
 
+INODE_METRIC = "filesystem_inodes_used_percent"
+
+
 def inode_full(ctx: VariantContext) -> dict[str, Any]:
-    return _expected_fail_capacity(ctx, variant="inode_full")
+    """Inodes exhausted while bytes stay free: the inode signal quarantines.
+
+    ``filesystem_inodes_used_percent`` >= 98 is graded like capacity: CRITICAL
+    QUARANTINE, MARK_UNSCHEDULABLE then QUARANTINE, no STOP, the incident
+    QUARANTINED. The byte signal must not be what fired -- the bytes stay
+    below 5 % -- and the node is readmitted through the validated restore
+    once ``fs-unfill`` has deleted the files, so no quarantine outlives the
+    variant.
+    """
+
+    _create_fs(ctx, inodes=256)
+    _declare_fs(ctx)
+    mount = _fs_mount(ctx)
+    started = utc_now()
+    injected = ctx.storage("fs-inodes", "--name", TEST_FS, timeout=300)
+    ctx.evidence.write("injection", injected)
+    if not injected.get("enospc"):
+        raise VariantInconclusive("inode exhaustion did not reach ENOSPC")
+    detection = wait_for_incident(
+        ctx,
+        started,
+        INODE_METRIC,
+        device=mount,
+        timeout_seconds=QUARANTINE_BUDGET,
+        metrics={INODE_METRIC, "filesystem_used_percent"},
+        name="inode-quarantine",
+    )
+    incidents = finding_incidents(detection, INODE_METRIC, device=mount)
+    stages = {
+        "chain": chain_errors(
+            detection,
+            ChainExpectation(
+                metric=INODE_METRIC,
+                device=mount,
+                operations=("MARK_UNSCHEDULABLE", "QUARANTINE"),
+                forbidden=frozenset({"STOP_WORKLOADS"}) | hardware_only(),
+                incident_states=frozenset({"QUARANTINED"}),
+            ),
+        ),
+        "bytes_not_graded": chain_errors(
+            detection,
+            ChainExpectation(
+                metric="filesystem_used_percent", device=mount, present=False
+            ),
+        ),
+    }
+    settled = wait_settled(
+        ctx,
+        started,
+        [item["incident_id"] for item in incidents],
+        timeout_seconds=QUARANTINE_BUDGET,
+        metrics={INODE_METRIC},
+        name="inode-settled",
+    )
+    # Delete the files, close the window, then readmit through validated restore.
+    ctx.storage("fs-unfill", "--name", TEST_FS)
+    close_window(ctx)
+    ctx.cleanup.discard("collector-window")
+    restored = restore_incidents(
+        ctx, incidents, reason="GF-GENERAL-LIVE-004 inode_full restore"
+    )
+    stages["restore"] = (
+        [] if restored or not incidents else ["validated restore ran no workflow"]
+    )
+    return _result(stages, extra={"injection": injected, "settled": _statuses(settled)})
 
 
 def read_only(ctx: VariantContext) -> dict[str, Any]:
@@ -766,7 +830,11 @@ def _io_spec(
     )
 
 
-BYTE_ONLY_GAP = "the host collector reads only f_blocks/f_bavail/f_frsize (system_metrics.py:377-378)"
+BYTE_ONLY_GAP = (
+    "the host collector grades only statvfs capacity (f_blocks/f_bavail and "
+    "f_files/f_ffree in _filesystems): it reads no ST_RDONLY, no write probe, "
+    "and skips a configured mount whose statvfs fails"
+)
 
 VARIANTS = [
     _fs_spec(
@@ -786,11 +854,11 @@ VARIANTS = [
     _fs_spec(
         "inode_full",
         "exhaust inodes with -N 256 while bytes stay < 5 %",
-        "the product never reads f_files/f_ffree -> no detection (spec FAIL)",
-        "remove the files",
+        "filesystem_inodes_used_percent >= 98 -> MARK_UNSCHEDULABLE, QUARANTINE; "
+        "no STOP; no filesystem_used_percent finding; incident QUARANTINED; "
+        "validated restore",
+        "remove the files, close the window, validated restore",
         inode_full,
-        outcome="FAIL",
-        gap=BYTE_ONLY_GAP,
     ),
     _fs_spec(
         "read_only",

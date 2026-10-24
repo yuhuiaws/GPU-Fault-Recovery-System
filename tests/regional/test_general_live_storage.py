@@ -109,13 +109,11 @@ def node_probe(survey_value: dict[str, Any], **extra: Any) -> FakeProbe:
     return FakeProbe(script)
 
 
-def quarantine_activity(mount: str) -> dict[str, Any]:
+def quarantine_activity(
+    mount: str, metric: str = "filesystem_used_percent"
+) -> dict[str, Any]:
     inc = incident(
-        "inc-fs",
-        "filesystem_used_percent",
-        device=mount,
-        state="QUARANTINED",
-        workflow="wf-fs",
+        "inc-fs", metric, device=mount, state="QUARANTINED", workflow="wf-fs"
     )
     wf = workflow(
         "wf-fs",
@@ -127,12 +125,7 @@ def quarantine_activity(mount: str) -> dict[str, Any]:
         "incidents": [inc],
         "workflows": [wf],
         "batches": [
-            host_batch(
-                "2026-10-24T00:02:00+00:00",
-                "filesystem_used_percent",
-                99.0,
-                device=mount,
-            )
+            host_batch("2026-10-24T00:02:00+00:00", metric, 99.0, device=mount)
         ],
         "markers": [],
         "commands": [],
@@ -212,9 +205,7 @@ def test_below_threshold_passes_without_quarantine(tmp_path: Path) -> None:
     assert result["verdict"] == "PASS", result["errors"]
 
 
-@pytest.mark.parametrize(
-    "variant", ["inode_full", "read_only", "required_mount_missing"]
-)
+@pytest.mark.parametrize("variant", ["read_only", "required_mount_missing"])
 def test_byte_only_gap_is_fail_when_undetected(tmp_path: Path, variant: str) -> None:
     spec = SPECS[variant]
     empty = {
@@ -239,8 +230,28 @@ def test_byte_only_gap_is_fail_when_undetected(tmp_path: Path, variant: str) -> 
     assert result["detected"] is False
 
 
-def test_inode_variant_passes_if_product_detects(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    ("fired", "verdict"),
+    [
+        ("filesystem_inodes_used_percent", "PASS"),
+        ("filesystem_used_percent", "FAIL"),
+        (None, "FAIL"),
+    ],
+    ids=["inode-signal", "bytes-signal", "undetected"],
+)
+def test_inode_full_passes_only_on_the_inode_quarantine_and_restores_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, fired: str | None, verdict: str
+) -> None:
+    restored: list[Any] = []
+    monkeypatch.setattr(
+        storage,
+        "restore_incidents",
+        lambda ctx, incidents, reason: restored.append(incidents)
+        or [{"status": "SUCCEEDED"}],
+    )
     spec = SPECS["inode_full"]
+    assert spec.expected_outcome == "PASS" and not spec.product_gap, spec
+    assert storage.INODE_METRIC == "filesystem_inodes_used_percent", spec
     regional = FakeRegional(cpu_python=store_script({"activity": None}))
     ctx = make_context(
         spec,
@@ -249,11 +260,26 @@ def test_inode_variant_passes_if_product_detects(tmp_path: Path) -> None:
         probes=probes(node_probe(survey()), storage_probe(), window_probe()),
     )
     mount = storage._fs_mount(ctx)
-    regional.cpu_python_responder = store_script(
-        {"activity": quarantine_activity(mount)}
+    activity = (
+        quarantine_activity(mount, fired)
+        if fired
+        else {
+            "incidents": [],
+            "workflows": [],
+            "batches": [],
+            "markers": [],
+            "commands": [],
+            "health_signals": {},
+            "notifications": [],
+        }
     )
+    regional.cpu_python_responder = store_script({"activity": activity})
     result = spec.execute(ctx)
-    assert result["verdict"] == "PASS"  # a fixed product (detection) passes
+    assert result["verdict"] == verdict, result["errors"]
+    if fired == storage.INODE_METRIC:
+        assert [item["incident_id"] for item in restored[0]] == ["inc-fs"], (
+            "the inode quarantine must be restored before the variant ends"
+        )
 
 
 def test_sustained_util_passes(tmp_path: Path) -> None:
