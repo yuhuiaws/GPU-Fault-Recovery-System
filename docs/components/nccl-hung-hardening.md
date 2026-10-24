@@ -402,7 +402,7 @@ subreaper guard 回收整个工具子树；父进程超时可返回部分证据�
 `OPERATOR_REVIEW`，每个 workflow 一封），不是硬件升级邮件：后者写「hardware taken out of service」、节点
 「unschedulable and quarantined」，对只读 hung 诊断都不成立。通知按各步骤自己的记录
 （`execution/hung_handoff_evidence.py`）写出：只读声明、job/attempt 与节点、每步结果与记录键、summary/triage
-文档 sha256、诊断包归档引用与 sha256、FAILED 步骤的 error 与被退役步骤依赖的失败步骤、任务端口 Fabric 结论
+文档 sha256、诊断包归档引用与 sha256、FAILED 步骤的 error 与被退役步骤依赖的失败步骤（超过执行期限未启动的步骤写明期限）、任务端口 Fabric 结论
 （UNKNOWN 或 `PARTIAL_TASK_SCOPE` 时逐节点 `reason` 与复查 summary 的自述）以及运维下一步；缺失或畸形字段读作
 UNKNOWN/未记录，每步最多列 8 个节点、其余计数。`ESCALATE_SUPPORT` 的 details 为
 `support_disposition=READ_ONLY_HUNG_DIAGNOSTIC`、`nodes_isolated=false`、`workloads_stopped=false`、

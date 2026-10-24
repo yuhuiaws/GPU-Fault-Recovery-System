@@ -3515,7 +3515,7 @@ taken out of service" and that the nodes stay unschedulable and quarantined -- u
 diagnostic is read-only (it did not cordon, drain, quarantine, reset or reboot any node, and did not stop, suspend or restart any workload),
 the job/attempt and nodes, each evidence step's result as its own record has it (the step record key `<workflow>/<index>/<operation>`, the
 sha256 of the summary/triage documents, the diagnostic bundle archive references with their sha256; a FAILED step carries its error, a
-retired step names the failed step it needed), the task-port fabric verdict (for an UNKNOWN or partial scope each node's `reason` and its
+retired step names the failed step it needed, a step that never started because the execution deadline passed says so), the task-port fabric verdict (for an UNKNOWN or partial scope each node's `reason` and its
 recheck summary's `scope_basis`/`scope_reason`/`scope_source`/process coverage) and the operator's next steps; the support case draft's
 Disposition is `READ_ONLY_HUNG_DIAGNOSTIC`. A missing or malformed field reads UNKNOWN or "not recorded", never healthy; only a
 VALIDATE_FABRIC that SUCCEEDED without a `fabric_status` of its own reads PASSED (still a telemetry check that does not prove NCCL

@@ -626,6 +626,44 @@ def test_an_attempt_that_ended_during_the_diagnostic_is_named():
     ) in body, body
 
 
+def test_steps_retired_past_the_execution_deadline_are_not_called_dependents():
+    """Past the deadline ``support_handoff`` retires every step that has not
+    started, whether or not it needs the failed step's output."""
+
+    steps = hung_steps()
+    deadline = workflow_step_execution(
+        3,
+        OP.COLLECT_HUNG_TRIAGE,
+        WorkflowStepStatus.FAILED,
+        phase="official",
+        error="workflow execution deadline exceeded",
+        details={"workflow_execution_deadline": "2026-10-24T14:00:00+00:00"},
+    )
+    workflow = hung_record(
+        steps, records(steps, {3: deadline, 4: None, 5: None, 6: None})
+    )
+    continued = support_handoff(
+        workflow,
+        3,
+        WorkflowStepOutcome.failed(
+            "workflow execution deadline exceeded",
+            details={"workflow_execution_deadline": "2026-10-24T14:00:00+00:00"},
+        ),
+    )
+    assert continued is not None, "the hand-off is owed past the deadline"
+    _, notification = hand_off(continued.workflow)
+
+    evidence = section(notification.body_text, 3)
+    for label in ("4 COLLECT_HUNG_TRIAGE (wave 2)", "5 COLLECT_DIAGNOSTIC_BUNDLE"):
+        assert (
+            f"- Step {label}: NOT RUN -- retired: it needs the output of failed step 3"
+        ) in evidence, evidence
+    assert (
+        "- Step 6 VALIDATE_FABRIC: NOT RUN -- not started: the execution deadline "
+        "passed (step 3 failed on it)"
+    ) in evidence, evidence
+
+
 def test_a_step_superseded_without_a_failure_claims_no_failed_workflow():
     steps = hung_steps()
     workflow = hung_record(

@@ -21,7 +21,10 @@ import re
 from collections.abc import Mapping
 from typing import Any
 
-from gpu_fault.execution.hung_handoff import HUNG_SUPPORT_HANDOFF
+from gpu_fault.execution.hung_handoff import (
+    HUNG_SUPPORT_HANDOFF,
+    dependent_step_indexes,
+)
 from gpu_fault.fabric_scope import reported_evidence
 from gpu_fault.models import WorkflowEventKind
 from gpu_fault.models import WorkflowOperation as Op
@@ -145,10 +148,28 @@ def _retired_by(workflow: WorkflowRequest) -> dict[int, int]:
     return retired
 
 
-def _not_run(index: int, retired_by: Mapping[int, int], superseded: set[int]) -> str:
-    if index in retired_by:
-        return f"retired: it needs the output of failed step {retired_by[index]}"
-    return "superseded" if index in superseded else "no execution record"
+def _not_run(
+    workflow: WorkflowRequest,
+    index: int,
+    records: Mapping[int, WorkflowStepExecution],
+    retired_by: Mapping[int, int],
+) -> str:
+    """Why a step without a record never ran. ``hung_handoff.support_handoff``
+    retires the steps that need the failed step's output -- and past the
+    execution deadline every step that had not started."""
+
+    failed = retired_by.get(index)
+    if failed is None:
+        superseded = index in workflow.superseded_step_indexes
+        return "superseded" if superseded else "no execution record"
+    if index in dependent_step_indexes(workflow.official_steps, failed):
+        return f"retired: it needs the output of failed step {failed}"
+    record = records.get(failed)
+    if record is not None and "workflow_execution_deadline" in _mapping(record.details):
+        return (
+            f"not started: the execution deadline passed (step {failed} failed on it)"
+        )
+    return f"retired when step {failed} failed"
 
 
 def _label(step: WorkflowStepSpec) -> str:
@@ -322,7 +343,7 @@ def _fabric(
     index = indexes[-1]
     record = records.get(index)
     if record is None:
-        why = _not_run(index, retired_by, set(workflow.superseded_step_indexes))
+        why = _not_run(workflow, index, records, retired_by)
         return index, HungFabricResult(
             FABRIC_NOT_RUN, summary=f"{why}; the task's ports were not checked"
         )
@@ -403,27 +424,26 @@ def _read(
 
 
 def _step_result(
+    workflow: WorkflowRequest,
     index: int,
-    step: WorkflowStepSpec,
-    record: WorkflowStepExecution | None,
+    records: Mapping[int, WorkflowStepExecution],
     *,
-    workflow_id: str,
     retired_by: Mapping[int, int],
-    superseded: set[int],
     rank_nodes: Mapping[str, str],
     fabric: tuple[int | None, HungFabricResult],
 ) -> HungStepResult:
+    step = workflow.official_steps[index]
     label = _label(step)
+    record = records.get(index)
     if record is None:
-        return HungStepResult(
-            index, label, NOT_RUN, _not_run(index, retired_by, superseded)
-        )
+        why = _not_run(workflow, index, records, retired_by)
+        return HungStepResult(index, label, NOT_RUN, why)
     details = _mapping(record.details)
     # The step's own key (the executor's idempotency key): a FAILED or skipped
     # record carries no adapter operation id.
     record_id = (
         _text(record.adapter_operation_id, 256)
-        or f"{workflow_id}/{index}/{step.operation.value}"
+        or f"{workflow.request_id}/{index}/{step.operation.value}"
     )
     if record.status is WorkflowStepStatus.SUCCEEDED and details.get("skipped"):
         owner = details.get("recovery_owner")
@@ -501,19 +521,16 @@ def handoff_evidence(
     retired_by = _retired_by(workflow)
     fabric = _fabric(workflow, records, retired_by)
     rank_nodes = _rank_nodes(records)
-    superseded = set(workflow.superseded_step_indexes)
     steps = tuple(
         _step_result(
+            workflow,
             index,
-            step,
-            records.get(index),
-            workflow_id=workflow.request_id,
+            records,
             retired_by=retired_by,
-            superseded=superseded,
             rank_nodes=rank_nodes,
             fabric=fabric,
         )
-        for index, step in enumerate(workflow.official_steps)
+        for index in range(len(workflow.official_steps))
         if index != handoff_index
     )
     return HungHandoffEvidence(

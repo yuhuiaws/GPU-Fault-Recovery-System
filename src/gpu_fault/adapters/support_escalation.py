@@ -158,7 +158,7 @@ class SupportEscalationAdapter:
             event_id=incident.event_id,
             job_id=incident.job_id or evidence.job_id,
             attempt_id=incident.attempt_id or evidence.attempt_id,
-            node_ids=context.step.node_ids,
+            node_ids=context.step.node_ids or incident.node_ids,
             workload_ids=context.step.workload_ids,
             reasons=incident.reasons,
             policy_source=incident.policy_source,
