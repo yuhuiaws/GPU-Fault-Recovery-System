@@ -97,6 +97,33 @@ APPROVALS: dict[str, str] = {
         "delete the GPU or EFA device-plugin Pod on the test node so kubelet "
         "de-registers its allocatable, then let the DaemonSet re-register it"
     ),
+    "GPU_RESET": (
+        "let the product's RESET_GPU chain (quiesce, verify no GPU clients, one "
+        "nvidia-smi --gpu-reset of the target GPU, restore GPU services, "
+        "validate) run on the idle test node for a replayed row-remap-pending "
+        "reading"
+    ),
+    "GPU_FULL_FABRIC_RESET": (
+        "let the product's RESET_ALL_GPUS_NVSWITCHES chain (quiesce incl. Fabric "
+        "Manager, one reset of every GPU and NVSwitch, Fabric Manager restart, "
+        "GPU and fabric validation) run on the exclusive test node for a "
+        "replayed NVLink fabric state"
+    ),
+    "NODE_REBOOT": (
+        "let the product's post-validation-failure ladder reboot the exclusive "
+        "test node through the provider (RESTART_NODE) after a failed "
+        "post-reset fabric validation"
+    ),
+    "GPU_FIELD_DIAGNOSTIC": (
+        "let the product run the node's configured NVIDIA memory field "
+        "diagnostic on the drained test GPU (only when the Node Agent allows "
+        "RUN_FIELD_DIAGNOSTIC)"
+    ),
+    "DCGM_XID_GAUGE": (
+        "replay the DCGM last-XID gauge (DCGM_FI_DEV_XID_ERRORS) as XID 32 "
+        "(catalog RESTART_APP, monitor-only on an idle node) on one test GPU; "
+        "the product turns it into a trusted XID event"
+    ),
 }
 
 #: Workflow operations a diagnostic-only chain must never contain.
@@ -230,13 +257,42 @@ CATEGORY_MODULES = (
     "scripts.e2e.regional.general_live_applogs",
     "scripts.e2e.regional.general_live_unknown",
     "scripts.e2e.regional.general_live_inventory",
+    "scripts.e2e.regional.general_live_gpu_memory",
+    "scripts.e2e.regional.general_live_gpu_links",
+    "scripts.e2e.regional.general_live_gpu_fabric",
+    "scripts.e2e.regional.general_live_gpu_composite",
+    "scripts.e2e.regional.general_live_gpu_fields",
+    "scripts.e2e.regional.general_live_gpu_identity",
 )
 #: The categories phase 1 implements (``cases`` rows of the coverage file).
 PHASE_ONE_CATEGORIES = (1, 3, 4, 6, 8, 9, 25, 28, 29, 31)
 #: The categories phase 2 adds: 002 memory, 005 shared storage, 007/010/012/015
 #: devices, 011 NCCL hung, 013/014 EFA and allocatable inventory, 016 kernel log,
-#: 017 application logs, 027 training progress, 030 warm spare, 032 unknown error.
-PHASE_TWO_CATEGORIES = (2, 5, 7, 10, 11, 12, 13, 14, 15, 16, 17, 27, 30, 32)
+#: 017 application logs, 019-022/024/026 DCGM field and GPU inventory replay
+#: (025's field variants live in general_live_gpu_fields), 027 training
+#: progress, 030 warm spare, 032 unknown error.
+PHASE_TWO_CATEGORIES = (
+    2,
+    5,
+    7,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    19,
+    20,
+    21,
+    22,
+    24,
+    26,
+    27,
+    30,
+    32,
+)
 
 
 def coverage_rows(path: Path = COVERAGE_PATH) -> dict[str, list[str]]:

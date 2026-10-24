@@ -111,7 +111,7 @@ def test_select_and_coverage_rows() -> None:
 def test_full_registry_matches_coverage() -> None:
     registry = reg.load_registry()
     rows = reg.coverage_rows()
-    for number in reg.PHASE_ONE_CATEGORIES:
+    for number in reg.PHASE_ONE_CATEGORIES + reg.PHASE_TWO_CATEGORIES:
         case = f"GF-GENERAL-LIVE-{number:03d}"
         for variant in rows[case]:
             assert f"{case}.{variant}" in registry
