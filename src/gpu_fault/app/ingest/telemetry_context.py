@@ -6,7 +6,7 @@ from typing import Literal
 
 from gpu_fault.app.ingest.node_health import NodeHealthIngestionService
 from gpu_fault.fleet import AgentLifecycleState
-from gpu_fault.gpu_composites import pci_bdf_matches, pci_bdf_parses
+from gpu_fault.gpu_composites import pci_bdf_matches
 from gpu_fault.gpu_metrics import GpuInventorySnapshot
 from gpu_fault.host_health import (
     NodeHealthCategory,
@@ -42,7 +42,12 @@ def _pci_bdf_moved(before: str, after: str) -> bool:
 
     if before.strip().lower() == after.strip().lower():
         return False
-    if not (pci_bdf_parses(before) and pci_bdf_parses(after)):
+    # ``pci_bdf_matches`` answers False for an unparsable side, which would
+    # read as "another address"; an address matches itself exactly when it
+    # parses, so that is asked first. (The check stays here rather than as a
+    # helper in ``gpu_composites``: that module is in the node runtime and
+    # executor closures, and this rule is the control plane's alone.)
+    if not (pci_bdf_matches(before, before) and pci_bdf_matches(after, after)):
         return False
     return not pci_bdf_matches(before, after)
 

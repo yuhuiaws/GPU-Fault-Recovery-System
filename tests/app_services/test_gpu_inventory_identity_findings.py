@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from gpu_fault.app.ingest.telemetry_context import (
     GPU_EXPECTED_COUNT_UNKNOWN_METRIC,
     GPU_IDENTITY_CHANGED_METRIC,
@@ -264,32 +266,39 @@ def test_moved_pci_bus_ids_with_the_same_uuids_open_a_critical_finding() -> None
     )
 
 
-def test_pci_bus_id_spelling_alone_is_not_an_identity_change() -> None:
-    """A 4- vs 8-digit domain or the hex case is the same bus address."""
+@pytest.mark.parametrize(
+    ("before", "after"),
+    [
+        (["00000000:59:00.0", "0000:5a:00.0"], ["0000:59:00.0", "00000000:5A:00.0"]),
+        (["[N/A]", "0000:5a:00.0"], ["0000:59:00.0", "0000:5a:00.0"]),
+    ],
+    ids=["domain_width_and_hex_case", "unreadable_bus_id"],
+)
+def test_a_respelt_or_unreadable_bus_id_is_not_a_move(
+    before: list[str], after: list[str]
+) -> None:
+    """A 4- vs 8-digit domain or the hex case is the same bus address, and a
+    bus id that does not parse is unknown -- not evidence the GPU moved."""
 
     context = build_context()
     codes = _post_all(
         context,
         [
             _snapshot(
-                "inv-1",
-                ["GPU-a", "GPU-b"],
-                observed_at=NOW,
-                expected=2,
-                bdfs=["00000000:59:00.0", "0000:5a:00.0"],
+                "inv-1", ["GPU-a", "GPU-b"], observed_at=NOW, expected=2, bdfs=before
             ),
             _snapshot(
                 "inv-2",
                 ["GPU-a", "GPU-b"],
                 observed_at=NOW + timedelta(minutes=1),
                 expected=2,
-                bdfs=["0000:59:00.0", "00000000:5A:00.0"],
+                bdfs=after,
             ),
         ],
     )
     assert codes == [200, 200], codes
     assert _incident(context, "inv-2", GPU_IDENTITY_CHANGED_METRIC) is None, (
-        "a re-spelt bus id was reported as a moved GPU"
+        f"a bus id read as {before} then {after} was reported as a moved GPU"
     )
 
 
