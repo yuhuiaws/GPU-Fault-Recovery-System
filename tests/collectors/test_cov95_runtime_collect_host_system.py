@@ -99,7 +99,13 @@ def test_zero_capacity_or_absent_mounts_do_not_create_usage_percent(host_case, s
             ("shared_filesystem_unavailable", "/missing"): 1,
         }
     else:
-        assert batch.samples == []
+        # No usage percent (zero capacity, no inode table), but the mounts are
+        # still graded for availability: ``/zero`` answers statvfs read-write
+        # (available), ``/missing`` raises and is unusable (004 probe_error).
+        assert support.values(batch) == {
+            ("filesystem_unavailable", "/zero"): 0,
+            ("filesystem_unavailable", "/missing"): 1,
+        }
 
 
 def test_absent_mountinfo_and_short_diskstats_are_ignored(host_case):

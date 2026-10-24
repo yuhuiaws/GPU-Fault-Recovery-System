@@ -139,6 +139,7 @@ def validate_host_metrics(
         "swap_used_percent": 80,
         "filesystem_used_percent": 98,
         "filesystem_inodes_used_percent": 98,
+        "filesystem_unavailable": 1,
         "shared_filesystem_unavailable": 1,
         "shared_filesystem_used_percent": 98,
         "disk_io_util_percent": 98,

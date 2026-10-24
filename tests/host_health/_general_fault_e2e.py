@@ -108,6 +108,7 @@ class HostFaultRig:
                 f_bavail=1 if self.broken and kind != "inode" else 80,
                 f_files=1000,
                 f_ffree=10 if self.broken and kind == "inode" else 800,
+                f_flag=0,
             ),
             # Only the GPU inventory case configures an invariant; its
             # ``/proc/driver/nvidia/gpus`` does not exist under ``proc``.

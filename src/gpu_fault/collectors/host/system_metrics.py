@@ -390,10 +390,35 @@ class HostSystemMetricsMixin:
                     self._sample("shared_filesystem_unavailable", 1, None, mount)
                 )
                 continue
-            except OSError:
-                # A configured mount that this node does not have is not a
-                # fault; it was skipped before this guard existed too.
+            except OSError as error:
+                # A configured mount whose ``statvfs`` fails is unusable, not
+                # absent-and-fine: ENOENT is a required mount that vanished
+                # (GF-GENERAL-LIVE-004 ``required_mount_missing``), and any
+                # other error -- EIO, EACCES, ESTALE -- a mount whose status
+                # cannot be read (``probe_error``). Reported, never skipped: an
+                # unreadable status reads unusable (UNKNOWN), never healthy.
+                # Before this branch existed the mount was dropped from the
+                # batch, so a required mount that had gone looked exactly like
+                # one the node was never meant to have.
+                result.append(
+                    self._filesystem_unavailable(
+                        mount,
+                        "MOUNT_MISSING"
+                        if isinstance(error, FileNotFoundError)
+                        else "PROBE_FAILED",
+                    )
+                )
                 continue
+            # A read-only remount keeps its blocks and inodes, so the capacity
+            # signals below read healthy while the mount refuses every write:
+            # ``ST_RDONLY`` is its own "not usable" signal (004 ``read_only``),
+            # and the gauge reports 0 for a usable read-write mount so the
+            # signal clears when the mount is remounted read-write.
+            result.append(
+                self._filesystem_unavailable(
+                    mount, "READ_ONLY" if stat.f_flag & os.ST_RDONLY else None
+                )
+            )
             total = stat.f_blocks * stat.f_frsize
             available = stat.f_bavail * stat.f_frsize
             if total:
@@ -442,6 +467,28 @@ class HostSystemMetricsMixin:
                     )
                 )
         return result
+
+    @staticmethod
+    def _filesystem_unavailable(
+        mount: str, failure_mode: str | None
+    ) -> HostMetricSample:
+        """Availability gauge for one configured mount (GF-GENERAL-LIVE-004).
+
+        ``failure_mode`` is None for a usable read-write mount (value 0) and
+        the reason otherwise (value 1): ``READ_ONLY`` for an ``ST_RDONLY``
+        remount, ``MOUNT_MISSING`` for a configured mount whose ``statvfs`` is
+        ENOENT, ``PROBE_FAILED`` for one whose ``statvfs`` raised any other
+        error. Kept distinct from ``filesystem_used_percent``: free bytes say
+        nothing about a mount that is read-only, gone, or unreadable, so the
+        capacity reading must not be read as proof the mount is healthy.
+        """
+
+        return HostMetricSample(
+            name="filesystem_unavailable",
+            value=0.0 if failure_mode is None else 1.0,
+            device=mount,
+            labels={} if failure_mode is None else {"failure_mode": failure_mode},
+        )
 
     @staticmethod
     def _filesystem_type(path: str) -> str | None:

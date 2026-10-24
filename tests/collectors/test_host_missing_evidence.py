@@ -520,7 +520,7 @@ def test_an_unknown_gpu_inventory_neither_confirms_nor_clears_the_missing_streak
 # --------------------------------------------------------------------------- #
 # 004 local disk inodes
 # --------------------------------------------------------------------------- #
-def statvfs(*, blocks_free: int, files: int, files_free: int):
+def statvfs(*, blocks_free: int, files: int, files_free: int, flag: int = 0):
     return lambda path: os.statvfs_result(
         (
             4096,
@@ -531,7 +531,7 @@ def statvfs(*, blocks_free: int, files: int, files_free: int):
             files,
             files_free,
             files_free,
-            0,
+            flag,
             255,
         )
     )
@@ -599,3 +599,152 @@ def test_inode_usage_below_the_threshold_or_untracked_is_not_graded(
     values = support.values(batch)
     assert values.get(("filesystem_inodes_used_percent", mount)) == expected, values
     assert graded(batch) == [], "inode usage below 98 % is not a storage fault"
+
+
+# --------------------------------------------------------------------------- #
+# 004 read-only / vanished / unreadable configured mount
+# --------------------------------------------------------------------------- #
+def _host_baseline(host_case):
+    """The rest of VALIDATE_HOST's required baseline, read healthy."""
+
+    support.write_file(host_case.roots.proc / "stat", "cpu 100 0 0 800 0 0 0 0\n")
+    support.write_file(host_case.roots.proc / "loadavg", "0.1 0.1 0.1 1/10 123\n")
+    support.write_file(
+        host_case.roots.proc / "meminfo",
+        "MemTotal: 1000 kB\nMemAvailable: 800 kB\nMemFree: 700 kB\n",
+    )
+
+
+def test_a_read_only_configured_mount_is_unusable_with_free_capacity(host_case):
+    """ST_RDONLY is unusable even when the capacity reading is healthy (004 read_only).
+
+    The spec forbids judging such a mount by its remaining bytes: a remount
+    read-only keeps its blocks and inodes, so the capacity signals read fine
+    while the mount refuses every write.
+    """
+
+    mount = str(host_case.roots.mount)
+    _host_baseline(host_case)
+    collector = host_case.build(
+        "_cpu",
+        "_memory",
+        "_filesystems",
+        edge_filter_enabled=True,
+        statvfs=statvfs(blocks_free=90, files=1000, files_free=900, flag=os.ST_RDONLY),
+    )
+
+    batch = collector.collect_once()
+
+    values = support.values(batch)
+    assert values[("filesystem_used_percent", mount)] == 10, values
+    assert values[("filesystem_unavailable", mount)] == 1, values
+    marker = next(
+        sample for sample in batch.samples if sample.name == "filesystem_unavailable"
+    )
+    assert marker.labels == {"failure_mode": "READ_ONLY"}, marker
+    assert "threshold:filesystem_unavailable" in batch.edge_filter_reasons, (
+        batch.edge_filter_reasons
+    )
+    store = build_store()
+    findings = NodeHealthPolicy(store).evaluate_metrics(batch)
+    assert [(item.metric_name, item.device) for item in findings] == [
+        ("filesystem_unavailable", mount)
+    ], findings
+    finding = findings[0]
+    assert finding.severity is Severity.CRITICAL, finding
+    # VALIDATE_HOST-style: a diagnostic, never a reset/reboot or quarantine (004).
+    assert finding.recommended_action is RecoveryAction.RUN_DIAGNOSTICS, finding
+    assert finding.diagnostic_parameters.get("failure_mode") == "READ_ONLY", finding
+    latest = store.list_telemetry_metrics_latest(batch.cluster_id, batch.node_id)
+    failures: dict[str, list[str]] = {}
+    assert validate_host_metrics(latest, batch.node_id, failures) is None, latest
+    assert failures == {batch.node_id: ["filesystem_unavailable"]}, (
+        f"VALIDATE_HOST must keep refusing the node while the mount is read-only, "
+        f"from the persisted latest value: {failures}"
+    )
+
+
+def _selective_statvfs(bad: str, error: OSError):
+    healthy = os.statvfs_result((4096, 4096, 100, 90, 90, 1000, 900, 900, 0, 255))
+
+    def probe(path):
+        if path == bad:
+            raise error
+        return healthy
+
+    return probe
+
+
+@pytest.mark.parametrize(
+    ("error", "failure_mode"),
+    [
+        (FileNotFoundError(2, "No such file or directory"), "MOUNT_MISSING"),
+        (OSError(5, "Input/output error"), "PROBE_FAILED"),
+        (PermissionError(13, "Permission denied"), "PROBE_FAILED"),
+    ],
+    ids=["vanished", "eio", "eacces"],
+)
+def test_a_configured_mount_whose_statvfs_fails_is_unusable_not_skipped(
+    host_case, error, failure_mode
+):
+    """ENOENT/EIO/EACCES on a configured mount is unusable, never silently skipped.
+
+    A configured mount that vanished (``required_mount_missing``) or whose
+    ``statvfs`` raises (``probe_error``) used to fall through the ``except
+    OSError`` guard and be dropped from the batch; its unreadable status now
+    reads unusable (UNKNOWN), never healthy. The healthy mount alongside it
+    still reports available, so the signal has a value to clear to.
+    """
+
+    healthy = str(host_case.roots.mount)
+    bad = "/mnt/gfrs-test-mount"
+    _host_baseline(host_case)
+    collector = host_case.build(
+        "_cpu",
+        "_memory",
+        "_filesystems",
+        filesystems=[bad, healthy],
+        statvfs=_selective_statvfs(bad, error),
+    )
+
+    batch = collector.collect_once()
+
+    values = support.values(batch)
+    assert values[("filesystem_unavailable", bad)] == 1, values
+    assert values[("filesystem_unavailable", healthy)] == 0, values
+    assert values[("filesystem_used_percent", healthy)] == 10, values
+    marker = next(
+        sample
+        for sample in batch.samples
+        if sample.name == "filesystem_unavailable" and sample.device == bad
+    )
+    assert marker.labels == {"failure_mode": failure_mode}, marker
+    # Unusable, not an unreadable-source collection error that only holds grading.
+    assert batch.collection_errors == [], batch.collection_errors
+    store = build_store()
+    findings = NodeHealthPolicy(store).evaluate_metrics(batch)
+    assert [(item.metric_name, item.device) for item in findings] == [
+        ("filesystem_unavailable", bad)
+    ], findings
+    assert findings[0].recommended_action is RecoveryAction.RUN_DIAGNOSTICS, findings
+    assert findings[0].diagnostic_parameters.get("failure_mode") == failure_mode
+    latest = store.list_telemetry_metrics_latest(batch.cluster_id, batch.node_id)
+    failures: dict[str, list[str]] = {}
+    assert validate_host_metrics(latest, batch.node_id, failures) is None, latest
+    assert failures == {batch.node_id: ["filesystem_unavailable"]}, failures
+
+
+def test_a_usable_read_write_mount_reports_available_and_is_not_graded(host_case):
+    """A usable read-write mount reports available (value 0), never a fault."""
+
+    mount = str(host_case.roots.mount)
+    collector = host_case.build(
+        "_filesystems",
+        statvfs=statvfs(blocks_free=90, files=1000, files_free=900),
+    )
+
+    batch = collector.collect_once()
+
+    values = support.values(batch)
+    assert values[("filesystem_unavailable", mount)] == 0, values
+    assert graded(batch) == [], "a usable read-write mount is not a storage fault"

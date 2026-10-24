@@ -356,6 +356,7 @@ _HOST_VALIDATION_LATEST_METRICS = {
     "page_cache_percent",
     "filesystem_used_percent",
     "filesystem_inodes_used_percent",
+    "filesystem_unavailable",
     "local_filesystem_used_percent",
     "shared_filesystem_unavailable",
     "shared_filesystem_used_percent",
@@ -569,6 +570,20 @@ class NodeHealthPolicy:
             "host swap pressure",
         ),
         **_FILESYSTEM_EXHAUSTION_RULES,
+        # A configured mount that is read-only, gone, or whose ``statvfs``
+        # cannot be read is unusable regardless of its free bytes
+        # (GF-GENERAL-LIVE-004 ``read_only``/``required_mount_missing``/
+        # ``probe_error``). Diagnostic, not quarantine: VALIDATE_HOST re-reads
+        # the gauge and holds the node while it stays 1, closing the incident
+        # ``diagnostic inconclusive`` once it clears -- an unreadable status
+        # must never widen to a reset, reboot or quarantine.
+        "filesystem_unavailable": (
+            1.0,
+            NodeHealthCategory.STORAGE,
+            Severity.CRITICAL,
+            RecoveryAction.RUN_DIAGNOSTICS,
+            "configured filesystem is not usable",
+        ),
         "shared_filesystem_unavailable": (
             1.0,
             NodeHealthCategory.STORAGE,
