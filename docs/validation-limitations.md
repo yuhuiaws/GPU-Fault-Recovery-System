@@ -940,13 +940,18 @@ capability-absent variants (no SR-IOV VF netdev, no inactive cluster, no safe
 way to fail the live SES channel) and the dangerous branches that need an
 approval not arranged this phase (watcher network isolation, control-plane
 restart). The implemented verdicts record the known product gaps the spec
-expects to FAIL (capacity-only `statvfs` for the read-only and vanished-mount
-variants, the weighted-time disk await, the empty required-interface list)
-rather than masking them. Inode exhaustion is no longer one of them: the
+expects to FAIL (the weighted-time disk await and the empty required-interface
+list) rather than masking them. Inode exhaustion is no longer one of them: the
 product grades `filesystem_inodes_used_percent` like capacity, so 004
 `inode_full` now expects the full MARK_UNSCHEDULABLE/QUARANTINE chain on the
 inode signal and readmits the node through the validated restore, exactly as
-`capacity_full` does.
+`capacity_full` does. Nor is the capacity-only reading of a read-only, vanished
+or unreadable configured mount: batch 163 reports each as
+`filesystem_unavailable` (READ_ONLY / MOUNT_MISSING / PROBE_FAILED), a
+VALIDATE_HOST diagnostic that holds the node while the mount stays unusable and
+never resets, reboots or quarantines, so 004 `read_only` and
+`required_mount_missing` now expect that chain and readmit the node once the
+mount is restored and the signal clears.
 
 The native storage variants (003 `scratch_full`, 004
 `capacity_full`/`duplicate`/`below_threshold`/`inode_full`, and the 006 disk
@@ -1146,7 +1151,9 @@ tree), the catalog/authority-bound 032 variants (a genuinely unknown product
 needs other hardware; `observe_profile` / `permitted_isolation` need a Runtime
 Profile authority the site does not configure, AUTH-015), the 017 attribution
 variants (a managed attempt with CRI Pod logs, lane N territory), and 004
-`probe_error` (a `statvfs` error cannot be produced by a read-only file bind).
+`probe_error` (the product reports a `statvfs` error as `filesystem_unavailable`
+since batch 163, but injecting a real one needs a faulting test mount -- a
+read-only file bind cannot, statvfs resolving the mount, not the bound file).
 
 The first live pass corrected three runner judgments that contradicted the
 product's documented behavior, not the product: a diagnostic-only chain

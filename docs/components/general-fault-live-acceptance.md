@@ -137,7 +137,12 @@ collector和原任务均存活，保存内存/cgroup证据；不能用重启掩�
 98%容量越界后验证真实cordon/taint和QUARANTINED，按当前契约不停止现有任务；
 阈值下方不误报，重复采样不重复建链，其他owner的taint保留。
 inode耗尽、只读、必需挂载消失、EIO/EACCES分别验，不能用剩余字节判断健康。
-这些变体当前可能暴露缺口，应FAIL而非取消测试。释放文件/还原挂载后验证再受控解隔离。
+只读、消失或statvfs失败的配置挂载按 `filesystem_unavailable`
+（READ_ONLY/MOUNT_MISSING/PROBE_FAILED）报为不可用并走 VALIDATE_HOST 诊断：不产生
+容量 finding，不 reset/reboot/隔离，不可读状态记为不可用（UNKNOWN）而非健康，挂载
+不可用期间 hold 节点、还原后随信号清零受控接纳（批次163修复，此前按 capacity-only
+缺口记 FAIL；probe_error 仍因缺故障挂载夹具而 live 延后）。释放文件/还原挂载后验证再
+受控解隔离。
 
 ### GF-GENERAL-LIVE-005
 
