@@ -207,9 +207,7 @@ def recovery(ctx: VariantContext) -> dict[str, Any]:
     stages = {"recovery": recovered["errors"], "hardware": hardware_errors(detection)}
     if not incidents:
         stages["recovery"].append("no memory finding to recover from")
-    return _result(
-        stages, extra={"recovery": recovered, "settled": _statuses(settled)}
-    )
+    return _result(stages, extra={"recovery": recovered, "settled": _statuses(settled)})
 
 
 def no_swap(ctx: VariantContext) -> dict[str, Any]:

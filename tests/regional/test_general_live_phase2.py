@@ -41,9 +41,7 @@ def test_every_lane_variant_is_in_the_registry_denominator() -> None:
     for number in LANE_CATEGORIES:
         case = f"GF-GENERAL-LIVE-{number:03d}"
         expected = set(rows[case])
-        present = {
-            spec.variant for spec in registry.values() if spec.case_id == case
-        }
+        present = {spec.variant for spec in registry.values() if spec.case_id == case}
         assert present == expected, f"{case}: {present ^ expected}"
 
 
@@ -122,13 +120,17 @@ def _healthy_activity(*, failed: bool = False) -> dict[str, Any]:
     }
     if failed:
         document["incidents"] = [
-            incident("inc-s", "smart_health_failed", device="/dev/nvme0", state="QUARANTINED")
+            incident(
+                "inc-s", "smart_health_failed", device="/dev/nvme0", state="QUARANTINED"
+            )
         ]
         document["workflows"] = []
     return document
 
 
-def _devices_context(case_id: str, variant: str, tmp_path: Path, document: dict[str, Any]):
+def _devices_context(
+    case_id: str, variant: str, tmp_path: Path, document: dict[str, Any]
+):
     spec = next(
         item
         for item in devices.VARIANTS
@@ -151,15 +153,19 @@ def _devices_context(case_id: str, variant: str, tmp_path: Path, document: dict[
 
 
 def test_smart_healthy_passes_when_no_finding(tmp_path: Path) -> None:
-    spec, ctx = _devices_context("GF-GENERAL-LIVE-007", "healthy", tmp_path, _healthy_activity())
+    spec, ctx = _devices_context(
+        "GF-GENERAL-LIVE-007", "healthy", tmp_path, _healthy_activity()
+    )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
 
 
 def test_smart_healthy_fails_when_a_smart_finding_exists(tmp_path: Path) -> None:
-    spec, ctx = _devices_context("GF-GENERAL-LIVE-007", "healthy", tmp_path, _healthy_activity(failed=True))
+    spec, ctx = _devices_context(
+        "GF-GENERAL-LIVE-007", "healthy", tmp_path, _healthy_activity(failed=True)
+    )
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
-    assert any("smart_health_failed" in error for error in result["errors"]), (
-        result["errors"]
-    )
+    assert any("smart_health_failed" in error for error in result["errors"]), result[
+        "errors"
+    ]

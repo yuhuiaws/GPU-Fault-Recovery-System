@@ -98,9 +98,7 @@ def chain_activity(metric: str = "memory_used_percent") -> dict[str, Any]:
 
 def test_memory_pressure_passes_the_diagnostic_chain(tmp_path: Path) -> None:
     spec = SPECS["memory_pressure"]
-    regional = FakeRegional(
-        cpu_python=store_script({"activity": chain_activity()})
-    )
+    regional = FakeRegional(cpu_python=store_script({"activity": chain_activity()}))
     ctx = make_context(
         spec,
         tmp_path=tmp_path,
