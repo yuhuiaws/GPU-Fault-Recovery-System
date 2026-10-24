@@ -612,6 +612,43 @@ rules:
       - GF-REGIONAL-BOOT-036..037
     counts_as_domain: false
 
+  - id: general-fault-live-acceptance
+    description: >-
+      The GF-GENERAL-LIVE live acceptance runner, its per-category injector and
+      verdict modules, the stdlib host/storage/network probes and the
+      collector-window list extension, with their fakes-based module tests and
+      the coverage/spec bindings. Phase-1 categories 001/003/004/006/008/009/
+      025/028/029/031; plan-only against the live site, so no regional case is
+      executed by a code change here.
+    paths:
+      - scripts/e2e/regional/general_live_*.py
+      - scripts/e2e/regional/run_general_live.py
+      - scripts/e2e/regional/probes/general_live_node_probe.py
+      - scripts/e2e/regional/probes/general_live_storage_probe.py
+      - scripts/e2e/regional/probes/general_live_net_probe.py
+      - scripts/e2e/regional/probes/collector_window_probe.py
+      - tests/regional/_general_live_fakes.py
+      - tests/regional/test_general_live_*.py
+      - testcases/general-live-coverage.yaml
+      - docs/components/general-fault-live-acceptance.md
+      - docs/components/en/general-fault-live-acceptance.md
+    pytest:
+      - tests/regional/test_general_live_host.py
+      - tests/regional/test_general_live_storage.py
+      - tests/regional/test_general_live_network.py
+      - tests/regional/test_general_live_utilization.py
+      - tests/regional/test_general_live_collectors.py
+      - tests/regional/test_general_live_attempts.py
+      - tests/regional/test_general_live_framework.py
+      - tests/regional/test_general_live_runner.py
+      - tests/regional/test_general_live_jobs.py
+      - tests/regional/test_general_live_edges.py
+      - tests/regional/test_general_live_edges2.py
+      - tests/regional/test_general_live_edges3.py
+      - tests/test_general_fault_live_coverage.py
+    regional_cases: []
+    counts_as_domain: false
+
   - id: store-processor
     description: Store implementations, Processor queues, concurrency, and counters.
     paths:

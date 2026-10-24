@@ -43,6 +43,7 @@ test_cases:
   expected: [真实主机指标跨过运行窗口才触发, 实际验证原指标且恢复后任务继续推进, 无reset或reboot并清理负载]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-001
+  related_pytest: tests/regional/test_general_live_host.py::test_cpu_busy_passes_the_diagnostic_chain
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-002
   title: 真机内存和swap检测不混淆cgroup耗尽
@@ -65,6 +66,7 @@ test_cases:
   expected: [只评估正确attempt和已分配GPU, 实际绑定指标诊断而不盲目升级硬件, 恢复后原rank进度有效且无错误作用域]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-003
+  related_pytest: tests/regional/test_general_live_utilization.py::test_gpu_idle_passes
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-004
   title: 真机专用文件系统容量与不可观测边界
@@ -76,6 +78,7 @@ test_cases:
   expected: [容量故障执行真实隔离且保留其他owner状态, 未覆盖的inode或读取故障记录FAIL而非健康, 清理卷并验证后受控接纳]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-004
+  related_pytest: tests/regional/test_general_live_storage.py::test_capacity_full_quarantines_and_restores
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-005
   title: 真机共享存储故障与跨节点故障域
@@ -98,6 +101,7 @@ test_cases:
   expected: [短突发与持续窗口区分, await口径偏差和零分母不得当通过, 实际验证恢复且不升级硬件]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-006
+  related_pytest: tests/regional/test_general_live_storage.py::test_sustained_util_passes
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-007
   title: 真机SMART失败与扫描查询失败区分
@@ -120,6 +124,7 @@ test_cases:
   expected: [确认down或缺失执行隔离, 读取错误不冒充down且已有链路证据不丢失, 恢复原配置与通信并保留正确隔离owner]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-008
+  related_pytest: tests/regional/test_general_live_network.py::test_required_link_down_quarantines
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-009
   title: 真机网卡错误丢包与TCP重传分离
@@ -131,6 +136,7 @@ test_cases:
   expected: [errors和持续drops按独立窗口判定, 实际验证目标接口且TCP重传不触发硬件恢复, 以新增量与通信证据证明恢复]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-009
+  related_pytest: tests/regional/test_general_live_network.py::test_sustained_drops_passes
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-010
   title: 真机EFA计数器能力与错误分类
@@ -285,6 +291,7 @@ test_cases:
   expected: [持续UNKNOWN仅触发有界snapshot和观测验证, 逐GPU完整性不能被其他GPU替代, 新完整数据才能完成且无硬件升级]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-025
+  related_pytest: tests/regional/test_general_live_collectors.py::test_exporter_timeout_passes
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-026
   title: 真机GPU身份变化与期望数量未知
@@ -318,6 +325,7 @@ test_cases:
   expected: [真实日志STOP terminal与一次恢复顺序可追踪, 无allocation或旧attempt不得控制新任务, 新UID有效进度预算及orphan清理均有证据]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-028
+  related_pytest: tests/regional/test_general_live_attempts.py::test_nonzero_exit_passes
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-029
   title: 真机预算耗尽继续硬件恢复但扣住任务重启
@@ -329,6 +337,7 @@ test_cases:
   expected: [除RESTART_WORKLOAD外必要步骤真实执行, 不再建任务或重复扣减释放预算, 最终状态隔离和单次通知一致且不修改业务预算清理]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-029
+  related_pytest: tests/regional/test_general_live_attempts.py::test_restart_withheld_passes
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-030
   title: 真机热备准入硬件依据与保留竞争
@@ -351,6 +360,7 @@ test_cases:
   expected: [按通道阈值和扫描周期记录UNKNOWN, 有界刷新与通知去重且不任意重启服务, 新成功后退出静默并验证逐通道覆盖]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-031
+  related_pytest: tests/regional/test_general_live_collectors.py::test_logs_silent_passes_with_approval
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-032
   title: 真机未知错误缺证据与Profile安全门禁
