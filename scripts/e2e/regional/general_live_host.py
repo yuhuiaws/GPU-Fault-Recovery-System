@@ -483,7 +483,9 @@ def invalid_delta(ctx: VariantContext) -> dict[str, Any]:
     cpu_samples = samples(observed, "cpu_usage_percent")
     stages = {
         "no_busy_sample": (
-            [f"{len(cpu_samples)} cpu_usage_percent samples emitted on a non-positive delta"]
+            [
+                f"{len(cpu_samples)} cpu_usage_percent samples emitted on a non-positive delta"
+            ]
             if cpu_samples
             else []
         ),
@@ -494,7 +496,9 @@ def invalid_delta(ctx: VariantContext) -> dict[str, Any]:
     }
     return _result(
         stages,
-        notes=["a static /proc/stat makes the total delta <= 0; no busy sample is emitted"],
+        notes=[
+            "a static /proc/stat makes the total delta <= 0; no busy sample is emitted"
+        ],
         extra={"proof_scope": "live-replay"},
     )
 

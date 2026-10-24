@@ -31,7 +31,10 @@ def _spec(variant: str) -> object:
 def _host_script() -> dict[str, object]:
     return {
         "install-records": {"records": 1},
-        "open-window": {"after": {"ActiveState": "active"}, "proof_scope": "live-replay"},
+        "open-window": {
+            "after": {"ActiveState": "active"},
+            "proof_scope": "live-replay",
+        },
         "arm": {"armed": True},
         "status": {"injected": {"emission_counts": {"0": 2}}},
         "close-window": {"clean": True},
@@ -123,14 +126,18 @@ def _isolated_node(isolated: bool) -> dict[str, object]:
         "ready": "True",
         "unschedulable": isolated,
         "taints": [{"key": "gpu-fault.io/quarantine"}] if isolated else [],
-        "ownership_annotations": {"gpu-fault.io/incident-id": "inc-log-1"} if isolated else {},
+        "ownership_annotations": {"gpu-fault.io/incident-id": "inc-log-1"}
+        if isolated
+        else {},
     }
 
 
 def test_rdma_fatal_quarantines_and_notifies(tmp_path: Path) -> None:
     activity = _activity(
         incidents=[_log_incident()],
-        workflows=[_log_workflow(["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"])],
+        workflows=[
+            _log_workflow(["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"])
+        ],
         notifications=[_notification()],
     )
     regional = FakeRegional(
@@ -147,7 +154,9 @@ def test_quarantine_fails_when_workflow_plans_hardware(tmp_path: Path) -> None:
     activity = _activity(
         incidents=[_log_incident()],
         workflows=[
-            _log_workflow(["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE", "RESET_GPU"])
+            _log_workflow(
+                ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE", "RESET_GPU"]
+            )
         ],
         notifications=[_notification()],
     )
@@ -169,7 +178,9 @@ def test_inconclusive_when_nothing_was_ingested(tmp_path: Path) -> None:
         node_snapshot=_isolated_node(False),
     )
     spec = _spec("rdma_fatal")
-    fake = FakeProbe({**_host_script(), "status": {"injected": {"emission_counts": {}}}})
+    fake = FakeProbe(
+        {**_host_script(), "status": {"injected": {"emission_counts": {}}}}
+    )
     ctx = make_context(
         spec,
         tmp_path=tmp_path,
@@ -190,7 +201,9 @@ def test_corrected_mce_is_diagnostic_not_isolation(tmp_path: Path) -> None:
     activity = _activity(
         incidents=[
             _log_incident(
-                policy_source="SITE_APPLICATION_LOG", action="RUN_DIAGNOSTICS", state="ACTION_PENDING"
+                policy_source="SITE_APPLICATION_LOG",
+                action="RUN_DIAGNOSTICS",
+                state="ACTION_PENDING",
             )
         ],
         workflows=[_log_workflow(["FREEZE_EVIDENCE", "VALIDATE_HOST"])],
@@ -231,7 +244,9 @@ def test_user_text_fails_if_it_isolates(tmp_path: Path) -> None:
 def test_unknown_attempt_isolates_without_stop(tmp_path: Path) -> None:
     activity = _activity(
         incidents=[_log_incident()],
-        workflows=[_log_workflow(["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"])],
+        workflows=[
+            _log_workflow(["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"])
+        ],
     )
     regional = FakeRegional(
         cpu_python=store_script({"activity": activity}),
@@ -245,7 +260,9 @@ def test_unknown_attempt_isolates_without_stop(tmp_path: Path) -> None:
 def test_unknown_attempt_fails_if_it_stops_a_workload(tmp_path: Path) -> None:
     activity = _activity(
         incidents=[_log_incident()],
-        workflows=[_log_workflow(["MARK_UNSCHEDULABLE", "STOP_WORKLOADS", "QUARANTINE"])],
+        workflows=[
+            _log_workflow(["MARK_UNSCHEDULABLE", "STOP_WORKLOADS", "QUARANTINE"])
+        ],
     )
     regional = FakeRegional(
         cpu_python=store_script({"activity": activity}),
@@ -254,22 +271,30 @@ def test_unknown_attempt_fails_if_it_stops_a_workload(tmp_path: Path) -> None:
     ctx, _ = _ctx("unknown_attempt", regional=regional, tmp_path=tmp_path)
     result = mod.unknown_attempt(ctx)
     assert result["verdict"] == "FAIL", result
-    assert any("stopped a workload" in error for error in result["errors"]), result["errors"]
+    assert any("stopped a workload" in error for error in result["errors"]), result[
+        "errors"
+    ]
 
 
 def test_cursor_pagination_requires_every_record(tmp_path: Path) -> None:
     incidents = [
-        _log_incident(incident_id=f"inc-log-{i}", event_id=f"log-c-{i}", workflow=f"wf-{i}")
+        _log_incident(
+            incident_id=f"inc-log-{i}", event_id=f"log-c-{i}", workflow=f"wf-{i}"
+        )
         for i in range(3)
     ]
     workflows = [
         _log_workflow(
-            ["MARK_UNSCHEDULABLE", "QUARANTINE"], incident_id=f"inc-log-{i}", request_id=f"wf-{i}"
+            ["MARK_UNSCHEDULABLE", "QUARANTINE"],
+            incident_id=f"inc-log-{i}",
+            request_id=f"wf-{i}",
         )
         for i in range(3)
     ]
     regional = FakeRegional(
-        cpu_python=store_script({"activity": _activity(incidents=incidents, workflows=workflows)}),
+        cpu_python=store_script(
+            {"activity": _activity(incidents=incidents, workflows=workflows)}
+        ),
         node_snapshot=_isolated_node(True),
     )
     ctx, _ = _ctx("cursor_pagination", regional=regional, tmp_path=tmp_path)
@@ -280,5 +305,9 @@ def test_cursor_pagination_requires_every_record(tmp_path: Path) -> None:
 
 def test_variants_match_the_coverage_row() -> None:
     expected = set(coverage_rows()["GF-GENERAL-LIVE-016"])
-    assert {item.variant for item in mod.VARIANTS} == expected, "016 registers every coverage variant"
-    assert all(item.proof_mode == "live-replay" for item in mod.VARIANTS), "016 is live-replay"
+    assert {item.variant for item in mod.VARIANTS} == expected, (
+        "016 registers every coverage variant"
+    )
+    assert all(item.proof_mode == "live-replay" for item in mod.VARIANTS), (
+        "016 is live-replay"
+    )

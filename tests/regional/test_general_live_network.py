@@ -477,6 +477,7 @@ def test_deferred_and_capability_variants() -> None:
         "SPECS['bond_vf'].deferred.startswith('CAPABILITY_ABSENT')"
     )
 
+
 # --------------------------------------------------------------------------- #
 # 008 statistics_failed / 009 errors_delta: host-collector statistics bind
 # (lane K live-replay). A source-replay FakeProbe stands in for the bind host.
@@ -484,7 +485,10 @@ def test_deferred_and_capability_variants() -> None:
 def source_probe(**extra: Any) -> FakeProbe:
     script = {
         "install-source": {"name": "rx-errors"},
-        "open-window": {"after": {"ActiveState": "active"}, "proof_scope": "live-replay"},
+        "open-window": {
+            "after": {"ActiveState": "active"},
+            "proof_scope": "live-replay",
+        },
         "set-value": {"value": "5000"},
         "status": {"fixtures": {"rx-errors": "5000"}},
         "close-window": {"clean": True},
@@ -493,7 +497,9 @@ def source_probe(**extra: Any) -> FakeProbe:
     return FakeProbe(script)
 
 
-def probes5(node: FakeProbe, netp: FakeProbe, win: FakeProbe, src: FakeProbe) -> dict[str, FakeProbe]:
+def probes5(
+    node: FakeProbe, netp: FakeProbe, win: FakeProbe, src: FakeProbe
+) -> dict[str, FakeProbe]:
     return {
         f"node@{NODE}": node,
         f"net@{NODE}": netp,
@@ -503,11 +509,25 @@ def probes5(node: FakeProbe, netp: FakeProbe, win: FakeProbe, src: FakeProbe) ->
 
 
 def _errors_doc(device: str) -> dict[str, Any]:
-    inc = incident("inc-e", "network_errors_delta", device=device, state="ACTION_PENDING", workflow="wf-e")
-    wf = workflow("wf-e", "inc-e", ["FREEZE_EVIDENCE", "VALIDATE_FABRIC"], status="RUNNING")
+    inc = incident(
+        "inc-e",
+        "network_errors_delta",
+        device=device,
+        state="ACTION_PENDING",
+        workflow="wf-e",
+    )
+    wf = workflow(
+        "wf-e", "inc-e", ["FREEZE_EVIDENCE", "VALIDATE_FABRIC"], status="RUNNING"
+    )
     return {
-        "incidents": [inc], "workflows": [wf], "batches": [], "markers": [],
-        "commands": [], "health_signals": {}, "notifications": [], "collector_statuses": [],
+        "incidents": [inc],
+        "workflows": [wf],
+        "batches": [],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+        "collector_statuses": [],
     }
 
 
@@ -515,8 +535,12 @@ def test_errors_delta_steps_a_bound_counter(tmp_path: Path) -> None:
     spec = SPECS["errors_delta"]
     regional = FakeRegional(cpu_python=store_script({"activity": _errors_doc(IFA)}))
     ctx = make_context(
-        spec, tmp_path=tmp_path, regional=regional,
-        probes=probes5(node_probe(survey()), net_probe(), window_probe(), source_probe()),
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes5(
+            node_probe(survey()), net_probe(), window_probe(), source_probe()
+        ),
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
@@ -526,14 +550,25 @@ def test_errors_delta_steps_a_bound_counter(tmp_path: Path) -> None:
 def test_statistics_failed_keeps_link_sample(tmp_path: Path) -> None:
     spec = SPECS["statistics_failed"]
     doc = {
-        "incidents": [], "workflows": [],
-        "batches": [host_batch("2026-10-24T00:03:00+00:00", "network_link_up", 1, device=IFA)],
-        "markers": [], "commands": [], "health_signals": {}, "notifications": [], "collector_statuses": [],
+        "incidents": [],
+        "workflows": [],
+        "batches": [
+            host_batch("2026-10-24T00:03:00+00:00", "network_link_up", 1, device=IFA)
+        ],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+        "collector_statuses": [],
     }
     regional = FakeRegional(cpu_python=store_script({"activity": doc}))
     ctx = make_context(
-        spec, tmp_path=tmp_path, regional=regional,
-        probes=probes5(node_probe(survey()), net_probe(), window_probe(), source_probe()),
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes5(
+            node_probe(survey()), net_probe(), window_probe(), source_probe()
+        ),
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
@@ -542,13 +577,23 @@ def test_statistics_failed_keeps_link_sample(tmp_path: Path) -> None:
 def test_statistics_failed_flags_a_dropped_link_sample(tmp_path: Path) -> None:
     spec = SPECS["statistics_failed"]
     doc = {
-        "incidents": [], "workflows": [], "batches": [],
-        "markers": [], "commands": [], "health_signals": {}, "notifications": [], "collector_statuses": [],
+        "incidents": [],
+        "workflows": [],
+        "batches": [],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+        "collector_statuses": [],
     }
     regional = FakeRegional(cpu_python=store_script({"activity": doc}))
     ctx = make_context(
-        spec, tmp_path=tmp_path, regional=regional,
-        probes=probes5(node_probe(survey()), net_probe(), window_probe(), source_probe()),
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes5(
+            node_probe(survey()), net_probe(), window_probe(), source_probe()
+        ),
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL", result

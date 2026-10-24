@@ -65,9 +65,16 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
-def run(command: list[str], *, check: bool = True, timeout: int = 120) -> subprocess.CompletedProcess[str]:
+def run(
+    command: list[str], *, check: bool = True, timeout: int = 120
+) -> subprocess.CompletedProcess[str]:
     completed = subprocess.run(
-        command, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=timeout, check=False
+        command,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        timeout=timeout,
+        check=False,
     )
     if check and completed.returncode:
         raise ProbeError(
@@ -92,7 +99,11 @@ def state_dir(run_id: str) -> Path:
 
 
 def dropin_path(run_id: str) -> Path:
-    return DROPIN_ROOT / f"{HOST_UNIT}.d" / f"gpu-fault-source-replay-{digest(run_id)}.conf"
+    return (
+        DROPIN_ROOT
+        / f"{HOST_UNIT}.d"
+        / f"gpu-fault-source-replay-{digest(run_id)}.conf"
+    )
 
 
 def deadman_unit(run_id: str) -> str:
@@ -107,14 +118,24 @@ def checked_bind_dest(dest: str) -> str:
 
 def checked_restore_seconds(value: int) -> int:
     if not MIN_RESTORE_SECONDS <= int(value) <= MAX_RESTORE_SECONDS:
-        raise ProbeError(f"restore seconds is outside {MIN_RESTORE_SECONDS}..{MAX_RESTORE_SECONDS}")
+        raise ProbeError(
+            f"restore seconds is outside {MIN_RESTORE_SECONDS}..{MAX_RESTORE_SECONDS}"
+        )
     return int(value)
 
 
 def unit_state(unit: str) -> dict[str, str]:
     completed = run(
-        ["systemctl", "show", unit, "--property=LoadState", "--property=ActiveState",
-         "--property=SubState", "--property=MainPID", "--property=NRestarts"],
+        [
+            "systemctl",
+            "show",
+            unit,
+            "--property=LoadState",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=MainPID",
+            "--property=NRestarts",
+        ],
         check=False,
     )
     values: dict[str, str] = {}
@@ -198,7 +219,9 @@ def build_pci_fixture(arguments: argparse.Namespace) -> None:
         shutil.rmtree(root)
     root.mkdir(mode=0o755, parents=True, exist_ok=True)
     # A couple of plausible non-EFA devices so the tree is realistic.
-    for index, (vendor, device) in enumerate((("0x10de", "0x2330"), ("0x1d0f", "0x8061"))):
+    for index, (vendor, device) in enumerate(
+        (("0x10de", "0x2330"), ("0x1d0f", "0x8061"))
+    ):
         slot = root / f"0000:00:{index:02x}.0"
         slot.mkdir(mode=0o755)
         (slot / "vendor").write_text(vendor + "\n", encoding="ascii")
@@ -239,10 +262,20 @@ def arm_deadman(run_id: str, seconds: int) -> str:
     run(["systemctl", "stop", f"{name}.timer"], check=False)
     run(["systemctl", "reset-failed", f"{name}.service"], check=False)
     run(
-        ["systemd-run", f"--unit={name}", f"--on-active={int(seconds)}s",
-         "--timer-property=AccuracySec=1s", "--property=Restart=on-failure",
-         "--property=RestartSec=30s", "--property=StartLimitIntervalSec=0",
-         sys.executable, str(probe_copy(run_id)), "close-window", "--run-id", run_id],
+        [
+            "systemd-run",
+            f"--unit={name}",
+            f"--on-active={int(seconds)}s",
+            "--timer-property=AccuracySec=1s",
+            "--property=Restart=on-failure",
+            "--property=RestartSec=30s",
+            "--property=StartLimitIntervalSec=0",
+            sys.executable,
+            str(probe_copy(run_id)),
+            "close-window",
+            "--run-id",
+            run_id,
+        ],
     )
     if unit_state(f"{name}.timer").get("ActiveState") != "active":
         raise ProbeError("source replay deadman timer is not active")
@@ -348,8 +381,17 @@ def status(arguments: argparse.Namespace) -> None:
     if directory.is_dir():
         for item in sorted(directory.iterdir()):
             if item.is_file():
-                fixtures[item.name] = item.read_text(encoding="utf-8", errors="replace")[:64]
-    emit({"run_id": run_id, "mode": state["mode"], "unit": unit_state(HOST_UNIT), "fixtures": fixtures})
+                fixtures[item.name] = item.read_text(
+                    encoding="utf-8", errors="replace"
+                )[:64]
+    emit(
+        {
+            "run_id": run_id,
+            "mode": state["mode"],
+            "unit": unit_state(HOST_UNIT),
+            "fixtures": fixtures,
+        }
+    )
 
 
 def close_window(arguments: argparse.Namespace) -> None:
@@ -371,11 +413,19 @@ def close_window(arguments: argparse.Namespace) -> None:
     disarm_deadman(run_id)
     residue = {
         "dropin": dropin.exists(),
-        "deadman": unit_state(f"{deadman_unit(run_id)}.timer").get("ActiveState") == "active",
+        "deadman": unit_state(f"{deadman_unit(run_id)}.timer").get("ActiveState")
+        == "active",
     }
     if state_dir(run_id).is_dir():
         shutil.rmtree(state_dir(run_id))
-    emit({"run_id": run_id, "after": after, "residue": residue, "clean": not any(residue.values())})
+    emit(
+        {
+            "run_id": run_id,
+            "after": after,
+            "residue": residue,
+            "clean": not any(residue.values()),
+        }
+    )
 
 
 def snapshot(arguments: argparse.Namespace) -> None:
@@ -386,7 +436,8 @@ def snapshot(arguments: argparse.Namespace) -> None:
             "run_id": run_id,
             "window_open": bool(state),
             "dropin": dropin_path(run_id).exists(),
-            "deadman": unit_state(f"{deadman_unit(run_id)}.timer").get("ActiveState") == "active",
+            "deadman": unit_state(f"{deadman_unit(run_id)}.timer").get("ActiveState")
+            == "active",
         }
     )
 
@@ -442,7 +493,13 @@ def main(argv: list[str] | None = None) -> int:
     try:
         arguments.handler(arguments)
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
-        emit({"error": type(exc).__name__, "error_kind": "probe", "command": getattr(arguments, "command", None)})
+        emit(
+            {
+                "error": type(exc).__name__,
+                "error_kind": "probe",
+                "command": getattr(arguments, "command", None),
+            }
+        )
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     return 0

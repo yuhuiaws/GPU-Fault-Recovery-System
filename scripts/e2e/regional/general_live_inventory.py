@@ -43,7 +43,11 @@ from scripts.e2e.regional.general_live_verdicts import (
 CASE_013 = "GF-GENERAL-LIVE-013"
 CASE_014 = "GF-GENERAL-LIVE-014"
 DETECTION_BUDGET = 420
-EFA_METRICS = {"efa_inventory_mismatch", "efa_inventory_active_count", "efa_inventory_expected_count"}
+EFA_METRICS = {
+    "efa_inventory_mismatch",
+    "efa_inventory_active_count",
+    "efa_inventory_expected_count",
+}
 
 
 def unreadable_state(ctx: VariantContext) -> dict[str, Any]:
@@ -71,7 +75,9 @@ def unreadable_state(ctx: VariantContext) -> dict[str, Any]:
     stages = {
         "unknown_observed": []
         if collection_errors
-        else ["no 'EFA inventory observation unavailable' collection error was recorded"],
+        else [
+            "no 'EFA inventory observation unavailable' collection error was recorded"
+        ],
         "no_missing_finding": [
             f"a malformed reading minted an efa_inventory_mismatch incident: {item['incident_id']}"
             for item in missing_findings
@@ -83,7 +89,9 @@ def unreadable_state(ctx: VariantContext) -> dict[str, Any]:
     }
     return _result(
         stages,
-        notes=["a malformed PCI vendor/device makes the EFA inventory UNAVAILABLE (UNKNOWN), not zero"],
+        notes=[
+            "a malformed PCI vendor/device makes the EFA inventory UNAVAILABLE (UNKNOWN), not zero"
+        ],
         extra={"collection_errors": collection_errors, "proof_scope": "live-replay"},
     )
 

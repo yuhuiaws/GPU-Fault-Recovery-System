@@ -613,7 +613,10 @@ def status(arguments: argparse.Namespace) -> None:
     state = load_state(run_id)
     if not state:
         raise ProbeError("no kernel replay window is open for this run")
-    injected: dict[str, Any] = {"mode": state["mode"], "armed": armed_path(run_id).is_file()}
+    injected: dict[str, Any] = {
+        "mode": state["mode"],
+        "armed": armed_path(run_id).is_file(),
+    }
     if state["mode"] == "journal":
         log = emission_log_path(run_id)
         injected["emission_counts"] = (

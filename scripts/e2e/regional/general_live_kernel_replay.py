@@ -52,7 +52,9 @@ from scripts.e2e.regional.host_probe_fixture import HostProbeFixture, HostProbeS
 if TYPE_CHECKING:
     from scripts.e2e.regional.general_live_fixture import VariantContext
 
-PROBE_SCRIPT = Path(__file__).with_name("probes") / "general_live_kernel_source_probe.py"
+PROBE_SCRIPT = (
+    Path(__file__).with_name("probes") / "general_live_kernel_source_probe.py"
+)
 PROOF_SCOPE = "live-replay"
 MODES = ("journal", "kmsg")
 
@@ -157,7 +159,9 @@ class KernelLogReplay:
         )
         return receipt
 
-    def open(self, *, restore_seconds: int = 900, approved: bool = False) -> dict[str, Any]:
+    def open(
+        self, *, restore_seconds: int = 900, approved: bool = False
+    ) -> dict[str, Any]:
         self.create()
         require_action_time(180)
         arguments = [

@@ -24,9 +24,11 @@ from scripts.e2e.regional.general_live_fixture import (
     VariantInconclusive,
     utc_now,
 )
-from scripts.e2e.regional.general_live_kernel_replay import kernel_replay, reviewed_record
+from scripts.e2e.regional.general_live_kernel_replay import (
+    kernel_replay,
+    reviewed_record,
+)
 from scripts.e2e.regional.general_live_registry import (
-    CAPABILITY,
     LIVE_REPLAY,
     VariantSpec,
     deferred_variant,
@@ -102,7 +104,9 @@ def _drive_kmsg(ctx: VariantContext, message: str) -> Any:
     return started
 
 
-def _wait_decisions(ctx: VariantContext, since: Any, *, xid: int, name: str) -> list[dict[str, Any]]:
+def _wait_decisions(
+    ctx: VariantContext, since: Any, *, xid: int, name: str
+) -> list[dict[str, Any]]:
     last: list[dict[str, Any]] = []
 
     def accept() -> list[dict[str, Any]] | None:
@@ -117,7 +121,9 @@ def _wait_decisions(ctx: VariantContext, since: Any, *, xid: int, name: str) -> 
 
 
 def unknown_xid(ctx: VariantContext) -> dict[str, Any]:
-    message = f"NVRM: Xid (PCI:0000:53:00): {UNKNOWN_XID}, acceptance unknown-code replay"
+    message = (
+        f"NVRM: Xid (PCI:0000:53:00): {UNKNOWN_XID}, acceptance unknown-code replay"
+    )
     started = _drive_kmsg(ctx, message)
     decisions = _wait_decisions(ctx, started, xid=UNKNOWN_XID, name="unknown-xid")
     from scripts.e2e.regional.general_live_common import activity
@@ -171,7 +177,9 @@ def duplicate(ctx: VariantContext) -> dict[str, Any]:
     }
     return _result(
         stages,
-        notes=["the same reviewed event re-posted across polls must dedup to one isolation"],
+        notes=[
+            "the same reviewed event re-posted across polls must dedup to one isolation"
+        ],
         extra={"decisions": decisions},
     )
 
@@ -194,7 +202,9 @@ def _result(
     }
 
 
-def _implemented(variant: str, injection: str, expected: str, execute: Any) -> VariantSpec:
+def _implemented(
+    variant: str, injection: str, expected: str, execute: Any
+) -> VariantSpec:
     return VariantSpec(
         case_id=CASE,
         variant=variant,

@@ -31,7 +31,9 @@ def _host_script() -> dict[str, object]:
     }
 
 
-def _incident(action: str, *, incident_id: str = "inc-log-1", workflow: str = "wf-1") -> dict[str, object]:
+def _incident(
+    action: str, *, incident_id: str = "inc-log-1", workflow: str = "wf-1"
+) -> dict[str, object]:
     return {
         "incident_id": incident_id,
         "event_id": "log-gpu-eks-cluster-node-abc",
@@ -45,7 +47,9 @@ def _incident(action: str, *, incident_id: str = "inc-log-1", workflow: str = "w
     }
 
 
-def _workflow(ops: list[str], *, incident_id: str = "inc-log-1", request_id: str = "wf-1") -> dict[str, object]:
+def _workflow(
+    ops: list[str], *, incident_id: str = "inc-log-1", request_id: str = "wf-1"
+) -> dict[str, object]:
     return {
         "request_id": request_id,
         "incident_id": incident_id,
@@ -56,7 +60,9 @@ def _workflow(ops: list[str], *, incident_id: str = "inc-log-1", request_id: str
     }
 
 
-def _activity(incidents: list[dict[str, object]], workflows: list[dict[str, object]]) -> dict[str, object]:
+def _activity(
+    incidents: list[dict[str, object]], workflows: list[dict[str, object]]
+) -> dict[str, object]:
     return {
         "incidents": incidents,
         "workflows": workflows,
@@ -81,7 +87,9 @@ def _node(isolated: bool) -> dict[str, object]:
 def _ctx(variant: str, *, activity: dict[str, object], isolated: bool, tmp_path: Path):
     spec = _spec(variant)
     fake = FakeProbe(_host_script())
-    regional = FakeRegional(cpu_python=store_script({"activity": activity}), node_snapshot=_node(isolated))
+    regional = FakeRegional(
+        cpu_python=store_script({"activity": activity}), node_snapshot=_node(isolated)
+    )
     return make_context(
         spec,
         tmp_path=tmp_path,
@@ -93,18 +101,26 @@ def _ctx(variant: str, *, activity: dict[str, object], isolated: bool, tmp_path:
 
 
 def test_cgroup_oom_is_a_diagnostic(tmp_path: Path) -> None:
-    activity = _activity([_incident("RUN_DIAGNOSTICS")], [_workflow(["FREEZE_EVIDENCE", "VALIDATE_HOST"])])
+    activity = _activity(
+        [_incident("RUN_DIAGNOSTICS")],
+        [_workflow(["FREEZE_EVIDENCE", "VALIDATE_HOST"])],
+    )
     ctx = _ctx("cgroup_oom", activity=activity, isolated=False, tmp_path=tmp_path)
     result = mod.cgroup_oom(ctx)
     assert result["verdict"] == "PASS", result["errors"]
 
 
 def test_cgroup_oom_fails_if_it_stops_a_workload(tmp_path: Path) -> None:
-    activity = _activity([_incident("RUN_DIAGNOSTICS")], [_workflow(["FREEZE_EVIDENCE", "STOP_WORKLOADS"])])
+    activity = _activity(
+        [_incident("RUN_DIAGNOSTICS")],
+        [_workflow(["FREEZE_EVIDENCE", "STOP_WORKLOADS"])],
+    )
     ctx = _ctx("cgroup_oom", activity=activity, isolated=False, tmp_path=tmp_path)
     result = mod.cgroup_oom(ctx)
     assert result["verdict"] == "FAIL", result
-    assert any("stopped a workload" in error for error in result["errors"]), result["errors"]
+    assert any("stopped a workload" in error for error in result["errors"]), result[
+        "errors"
+    ]
 
 
 def test_nccl_error_is_evidence_only(tmp_path: Path) -> None:
@@ -115,11 +131,16 @@ def test_nccl_error_is_evidence_only(tmp_path: Path) -> None:
 
 
 def test_nccl_error_fails_on_a_diagnostic_workflow(tmp_path: Path) -> None:
-    activity = _activity([_incident("NO_ACTION")], [_workflow(["FREEZE_EVIDENCE", "COLLECT_DIAGNOSTIC_BUNDLE"])])
+    activity = _activity(
+        [_incident("NO_ACTION")],
+        [_workflow(["FREEZE_EVIDENCE", "COLLECT_DIAGNOSTIC_BUNDLE"])],
+    )
     ctx = _ctx("nccl_error", activity=activity, isolated=False, tmp_path=tmp_path)
     result = mod.nccl_error(ctx)
     assert result["verdict"] == "FAIL", result
-    assert any("diagnostic workflow" in error for error in result["errors"]), result["errors"]
+    assert any("diagnostic workflow" in error for error in result["errors"]), result[
+        "errors"
+    ]
 
 
 def test_distributed_error_fails_if_it_isolates(tmp_path: Path) -> None:
@@ -131,6 +152,8 @@ def test_distributed_error_fails_if_it_isolates(tmp_path: Path) -> None:
 
 def test_variants_match_the_coverage_row() -> None:
     expected = set(coverage_rows()["GF-GENERAL-LIVE-017"])
-    assert {item.variant for item in mod.VARIANTS} == expected, "017 registers every coverage variant"
+    assert {item.variant for item in mod.VARIANTS} == expected, (
+        "017 registers every coverage variant"
+    )
     implemented = {item.variant for item in mod.VARIANTS if item.execute is not None}
     assert implemented == {"cgroup_oom", "nccl_error", "distributed_error"}, implemented

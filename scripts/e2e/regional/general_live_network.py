@@ -749,7 +749,9 @@ def errors_delta(ctx: VariantContext) -> dict[str, Any]:
         stages["chain"].append("no network_errors_delta finding reached an incident")
     return _result(
         stages,
-        notes=["the bound rx_errors counter stepped up; the delta is a WARNING fabric diagnostic"],
+        notes=[
+            "the bound rx_errors counter stepped up; the delta is a WARNING fabric diagnostic"
+        ],
         extra={"device": a, "proof_scope": "live-replay"},
     )
 

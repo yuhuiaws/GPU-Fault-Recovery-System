@@ -28,20 +28,27 @@ def _source_probe() -> FakeProbe:
     return FakeProbe(
         {
             "build-pci-fixture": {"efa_devices": 16, "malformed": True},
-            "open-window": {"after": {"ActiveState": "active"}, "proof_scope": "live-replay"},
+            "open-window": {
+                "after": {"ActiveState": "active"},
+                "proof_scope": "live-replay",
+            },
             "status": {"fixtures": {}},
             "close-window": {"clean": True},
         }
     )
 
 
-def _doc(*, collection_error: bool, incidents=None, workflows=None) -> dict[str, object]:
+def _doc(
+    *, collection_error: bool, incidents=None, workflows=None
+) -> dict[str, object]:
     batch = {
         "observed_at": "2026-10-24T00:03:00+00:00",
         "batch_id": "host-1",
         "edge_filter_reasons": [],
         "collection_errors": (
-            ["EFA inventory observation unavailable: invalid PCI device ID"] if collection_error else []
+            ["EFA inventory observation unavailable: invalid PCI device ID"]
+            if collection_error
+            else []
         ),
         "samples": [],
     }
@@ -58,7 +65,9 @@ def _doc(*, collection_error: bool, incidents=None, workflows=None) -> dict[str,
 
 def _ctx(variant: str, *, doc: dict[str, object], node_snapshot=None, tmp_path: Path):
     spec = SPECS[variant]
-    regional = FakeRegional(cpu_python=store_script({"activity": doc}), node_snapshot=node_snapshot)
+    regional = FakeRegional(
+        cpu_python=store_script({"activity": doc}), node_snapshot=node_snapshot
+    )
     return make_context(
         spec,
         tmp_path=tmp_path,
@@ -80,7 +89,9 @@ def test_unreadable_state_fails_without_an_unknown_marker(tmp_path: Path) -> Non
     ctx = _ctx("unreadable_state", doc=_doc(collection_error=False), tmp_path=tmp_path)
     result = mod.unreadable_state(ctx)
     assert result["verdict"] == "FAIL", result
-    assert any("collection error" in error for error in result["errors"]), result["errors"]
+    assert any("collection error" in error for error in result["errors"]), result[
+        "errors"
+    ]
 
 
 def test_unreadable_state_fails_on_a_reboot(tmp_path: Path) -> None:
@@ -110,7 +121,10 @@ def test_unreadable_state_fails_on_a_reboot(tmp_path: Path) -> None:
     ctx = _ctx("unreadable_state", doc=doc, tmp_path=tmp_path)
     result = mod.unreadable_state(ctx)
     assert result["verdict"] == "FAIL", result
-    assert any("RESTART_NODE" in error or "efa_inventory_mismatch" in error for error in result["errors"]), result["errors"]
+    assert any(
+        "RESTART_NODE" in error or "efa_inventory_mismatch" in error
+        for error in result["errors"]
+    ), result["errors"]
 
 
 def test_013_and_014_cover_every_variant() -> None:
@@ -120,6 +134,6 @@ def test_013_and_014_cover_every_variant() -> None:
         assert got == expected, f"{case} registers every coverage variant"
     implemented = {item.variant for item in mod.VARIANTS if item.execute is not None}
     assert implemented == {"unreadable_state"}, implemented
-    assert all(item.deferred for item in mod.VARIANTS if item.case_id == "GF-GENERAL-LIVE-014"), (
-        "014 has no valid replay path; every variant is NOT_RUN"
-    )
+    assert all(
+        item.deferred for item in mod.VARIANTS if item.case_id == "GF-GENERAL-LIVE-014"
+    ), "014 has no valid replay path; every variant is NOT_RUN"

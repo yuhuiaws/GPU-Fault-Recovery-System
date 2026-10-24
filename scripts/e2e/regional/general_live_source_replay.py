@@ -80,16 +80,31 @@ class HostSourceReplay:
 
     def build_pci(self, *, efa_count: int, malformed: bool = False) -> dict[str, Any]:
         self.create()
-        arguments = ["build-pci-fixture", "--run-id", self.run_id, "--efa-count", str(int(efa_count))]
+        arguments = [
+            "build-pci-fixture",
+            "--run-id",
+            self.run_id,
+            "--efa-count",
+            str(int(efa_count)),
+        ]
         if malformed:
             arguments.append("--malformed")
         return self.host.execute(*arguments, timeout=120)
 
-    def open_bind(self, binds: list[tuple[str, str]], *, restore_seconds: int = 900) -> dict[str, Any]:
+    def open_bind(
+        self, binds: list[tuple[str, str]], *, restore_seconds: int = 900
+    ) -> dict[str, Any]:
         self.create()
         require_action_time(180)
-        arguments = ["open-window", "--run-id", self.run_id, "--mode", "bind",
-                     "--restore-seconds", str(int(restore_seconds))]
+        arguments = [
+            "open-window",
+            "--run-id",
+            self.run_id,
+            "--mode",
+            "bind",
+            "--restore-seconds",
+            str(int(restore_seconds)),
+        ]
         for name, dest in binds:
             arguments += ["--bind", f"{name}:{dest}"]
         receipt = self.host.execute(*arguments, timeout=150)
@@ -100,8 +115,14 @@ class HostSourceReplay:
         self.create()
         require_action_time(180)
         receipt = self.host.execute(
-            "open-window", "--run-id", self.run_id, "--mode", "pci-root",
-            "--restore-seconds", str(int(restore_seconds)), timeout=150,
+            "open-window",
+            "--run-id",
+            self.run_id,
+            "--mode",
+            "pci-root",
+            "--restore-seconds",
+            str(int(restore_seconds)),
+            timeout=150,
         )
         self._opened = True
         return receipt
@@ -109,14 +130,23 @@ class HostSourceReplay:
     def set_value(self, name: str, value: int | str) -> dict[str, Any]:
         require_action_time(60)
         return self.host.execute(
-            "set-value", "--run-id", self.run_id, "--name", name, "--value", str(value), timeout=60
+            "set-value",
+            "--run-id",
+            self.run_id,
+            "--name",
+            name,
+            "--value",
+            str(value),
+            timeout=60,
         )
 
     def status(self) -> dict[str, Any]:
         return self.host.execute("status", "--run-id", self.run_id, timeout=60)
 
     def close(self) -> dict[str, Any]:
-        receipt = self.host.execute("close-window", "--run-id", self.run_id, timeout=150)
+        receipt = self.host.execute(
+            "close-window", "--run-id", self.run_id, timeout=150
+        )
         self._opened = False
         return receipt
 
@@ -125,10 +155,14 @@ class HostSourceReplay:
         if self._opened:
             receipts["close"] = self.close()
             if not receipts["close"].get("clean", True):
-                raise RuntimeError(f"host source window did not close clean: {receipts['close']}")
+                raise RuntimeError(
+                    f"host source window did not close clean: {receipts['close']}"
+                )
         receipts["probe_residuals"] = self.host.cleanup()
         if any(receipts["probe_residuals"].values()):
-            raise RuntimeError(f"host source probe left residue: {receipts['probe_residuals']}")
+            raise RuntimeError(
+                f"host source probe left residue: {receipts['probe_residuals']}"
+            )
         return receipts
 
 

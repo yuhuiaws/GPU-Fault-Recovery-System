@@ -99,7 +99,10 @@ def test_unknown_xid_fails_if_it_earns_an_nvidia_action(tmp_path: Path) -> None:
     )
     result = mod.unknown_xid(ctx)
     assert result["verdict"] == "FAIL", result
-    assert any("recovery action" in error or "SITE_SAFETY" in error for error in result["errors"]), result["errors"]
+    assert any(
+        "recovery action" in error or "SITE_SAFETY" in error
+        for error in result["errors"]
+    ), result["errors"]
 
 
 def test_unknown_xid_inconclusive_without_injection(tmp_path: Path) -> None:
@@ -147,8 +150,14 @@ def test_duplicate_fails_on_second_isolation(tmp_path: Path) -> None:
 
 def test_variants_match_the_coverage_row() -> None:
     expected = set(coverage_rows()["GF-GENERAL-LIVE-032"])
-    assert {item.variant for item in mod.VARIANTS} == expected, "032 registers every coverage variant"
+    assert {item.variant for item in mod.VARIANTS} == expected, (
+        "032 registers every coverage variant"
+    )
     implemented = {item.variant for item in mod.VARIANTS if item.execute is not None}
-    assert implemented == {"unknown_xid", "duplicate"}, "032 implements the reachable kmsg variants"
+    assert implemented == {"unknown_xid", "duplicate"}, (
+        "032 implements the reachable kmsg variants"
+    )
     deferred = [item for item in mod.VARIANTS if item.deferred]
-    assert len(deferred) == 6, "the other six 032 variants stay in the denominator as NOT_RUN"
+    assert len(deferred) == 6, (
+        "the other six 032 variants stay in the denominator as NOT_RUN"
+    )

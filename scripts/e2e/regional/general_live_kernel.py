@@ -27,7 +27,10 @@ from scripts.e2e.regional.general_live_fixture import (
     VariantInconclusive,
     utc_now,
 )
-from scripts.e2e.regional.general_live_kernel_replay import kernel_replay, reviewed_record
+from scripts.e2e.regional.general_live_kernel_replay import (
+    kernel_replay,
+    reviewed_record,
+)
 from scripts.e2e.regional.general_live_registry import (
     LIVE_REPLAY,
     VariantSpec,
@@ -54,7 +57,9 @@ ISOLATION_OPERATIONS = ("MARK_UNSCHEDULABLE", "QUARANTINE")
 # --------------------------------------------------------------------------- #
 # reviewed record sets (one node/boot)
 # --------------------------------------------------------------------------- #
-def _severe(message: str, *, boot_id: str = "", transport: str = "kernel") -> list[dict[str, Any]]:
+def _severe(
+    message: str, *, boot_id: str = "", transport: str = "kernel"
+) -> list[dict[str, Any]]:
     return [reviewed_record(message, transport=transport, priority=2, boot_id=boot_id)]
 
 
@@ -113,7 +118,12 @@ def _log_incidents(
 
 
 def _wait_log_incident(
-    ctx: VariantContext, since: Any, *, policy_source: str | None, minimum: int, name: str
+    ctx: VariantContext,
+    since: Any,
+    *,
+    policy_source: str | None,
+    minimum: int,
+    name: str,
 ) -> dict[str, Any]:
     last: dict[str, Any] = {}
 
@@ -133,7 +143,11 @@ def _quarantine_variant(ctx: VariantContext, variant: str) -> dict[str, Any]:
     records = _severe(SEVERE_MESSAGES[variant])
     started, oracle = _drive(ctx, records, restore_seconds=ctx.spec.max_minutes * 60)
     observed = _wait_log_incident(
-        ctx, started, policy_source="SITE_KERNEL_LOG", minimum=1, name=f"{variant}-detect"
+        ctx,
+        started,
+        policy_source="SITE_KERNEL_LOG",
+        minimum=1,
+        name=f"{variant}-detect",
     )
     incidents = _log_incidents(observed, policy_source="SITE_KERNEL_LOG")
     stages = {
@@ -144,7 +158,9 @@ def _quarantine_variant(ctx: VariantContext, variant: str) -> dict[str, Any]:
             observed, incident_ids=[item["incident_id"] for item in incidents]
         ),
     }
-    return _result(ctx, stages, extra={"incidents": [item["incident_id"] for item in incidents]})
+    return _result(
+        ctx, stages, extra={"incidents": [item["incident_id"] for item in incidents]}
+    )
 
 
 def _quarantine_chain_errors(
@@ -171,7 +187,9 @@ def _quarantine_chain_errors(
     return errors
 
 
-def _isolated_errors(ctx: VariantContext, activity_document: dict[str, Any]) -> list[str]:
+def _isolated_errors(
+    ctx: VariantContext, activity_document: dict[str, Any]
+) -> list[str]:
     node = ctx.regional.node_snapshot(ctx.settings.node)
     if not node_isolated(node):
         return ["the node was not isolated after a severe kernel-log finding"]
@@ -197,10 +215,18 @@ def kernel_lockup(ctx: VariantContext) -> dict[str, Any]:
 def corrected_mce(ctx: VariantContext) -> dict[str, Any]:
     """A corrected MCE must be a diagnostic, never isolation."""
 
-    message = "mce: [Hardware Error]: Machine check events logged: corrected error CPU 1"
-    started, _ = _drive(ctx, _severe(message), restore_seconds=ctx.spec.max_minutes * 60)
+    message = (
+        "mce: [Hardware Error]: Machine check events logged: corrected error CPU 1"
+    )
+    started, _ = _drive(
+        ctx, _severe(message), restore_seconds=ctx.spec.max_minutes * 60
+    )
     observed = _wait_log_incident(
-        ctx, started, policy_source="SITE_APPLICATION_LOG", minimum=1, name="corrected-detect"
+        ctx,
+        started,
+        policy_source="SITE_APPLICATION_LOG",
+        minimum=1,
+        name="corrected-detect",
     )
     incidents = _log_incidents(observed)
     quarantine = [
@@ -219,10 +245,14 @@ def corrected_mce(ctx: VariantContext) -> dict[str, Any]:
         else [],
         "hardware": hardware_errors(observed),
     }
-    return _result(ctx, stages, notes=["corrected MCE is graded WARNING/RUN_DIAGNOSTICS"])
+    return _result(
+        ctx, stages, notes=["corrected MCE is graded WARNING/RUN_DIAGNOSTICS"]
+    )
 
 
-def _negative_variant(ctx: VariantContext, records: list[dict[str, Any]], note: str) -> dict[str, Any]:
+def _negative_variant(
+    ctx: VariantContext, records: list[dict[str, Any]], note: str
+) -> dict[str, Any]:
     """A reviewed record that the trust/boot gate must drop: no isolation."""
 
     started, _ = _drive(ctx, records, restore_seconds=ctx.spec.max_minutes * 60)
@@ -247,14 +277,21 @@ def _negative_variant(ctx: VariantContext, records: list[dict[str, Any]], note: 
 def user_text(ctx: VariantContext) -> dict[str, Any]:
     records = _severe(SEVERE_MESSAGES["uncorrectable_mce"], transport="syslog")
     return _negative_variant(
-        ctx, records, "a user-space (journal, non-kernel transport) line is never trusted"
+        ctx,
+        records,
+        "a user-space (journal, non-kernel transport) line is never trusted",
     )
 
 
 def old_boot(ctx: VariantContext) -> dict[str, Any]:
-    records = _severe(SEVERE_MESSAGES["uncorrectable_mce"], boot_id="00000000-0000-0000-0000-0000deadbeef")
+    records = _severe(
+        SEVERE_MESSAGES["uncorrectable_mce"],
+        boot_id="00000000-0000-0000-0000-0000deadbeef",
+    )
     return _negative_variant(
-        ctx, records, "a kernel line from a prior boot must not isolate the current boot"
+        ctx,
+        records,
+        "a kernel line from a prior boot must not isolate the current boot",
     )
 
 
@@ -274,7 +311,9 @@ def unknown_attempt(ctx: VariantContext) -> dict[str, Any]:
         "hardware": hardware_errors(observed),
     }
     return _result(
-        ctx, stages, notes=["no managed attempt: the node is isolated but no workload is stopped"]
+        ctx,
+        stages,
+        notes=["no managed attempt: the node is isolated but no workload is stopped"],
     )
 
 
@@ -297,12 +336,18 @@ def cursor_pagination(ctx: VariantContext) -> dict[str, Any]:
 
     records = [
         reviewed_record(SEVERE_MESSAGES["uncorrectable_mce"], priority=2, label="mce"),
-        reviewed_record(SEVERE_MESSAGES["readonly_storage"], priority=2, label="storage"),
+        reviewed_record(
+            SEVERE_MESSAGES["readonly_storage"], priority=2, label="storage"
+        ),
         reviewed_record(SEVERE_MESSAGES["kernel_lockup"], priority=2, label="lockup"),
     ]
     started, _ = _drive(ctx, records, restore_seconds=ctx.spec.max_minutes * 60)
     observed = _wait_log_incident(
-        ctx, started, policy_source="SITE_KERNEL_LOG", minimum=len(records), name="pagination"
+        ctx,
+        started,
+        policy_source="SITE_KERNEL_LOG",
+        minimum=len(records),
+        name="pagination",
     )
     incidents = _log_incidents(observed, policy_source="SITE_KERNEL_LOG")
     stages = {
@@ -344,7 +389,9 @@ def _result(
     }
 
 
-def _spec(variant: str, injection: str, expected: str, execute: Any, *, risk: str = "M") -> VariantSpec:
+def _spec(
+    variant: str, injection: str, expected: str, execute: Any, *, risk: str = "M"
+) -> VariantSpec:
     return VariantSpec(
         case_id=CASE,
         variant=variant,

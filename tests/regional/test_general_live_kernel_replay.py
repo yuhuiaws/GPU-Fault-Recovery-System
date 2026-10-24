@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import subprocess
 import sys
 from pathlib import Path
@@ -29,7 +28,9 @@ from tests.regional._general_live_fakes import FakeProbe
 # --------------------------------------------------------------------------- #
 def test_reviewed_record_defaults_and_digest() -> None:
     record = helper.reviewed_record("NVRM: Xid (PCI:0000:53:00): 79, fell off the bus")
-    assert record["transport"] == "kernel", "a reviewed record defaults to the trusted kernel transport"
+    assert record["transport"] == "kernel", (
+        "a reviewed record defaults to the trusted kernel transport"
+    )
     assert record["emissions"] == 4, record
     first = helper.records_sha256([record])
     second = helper.records_sha256([dict(record)])
@@ -73,7 +74,9 @@ def test_validate_records_bounds_count_and_size() -> None:
 
 def test_probe_digest_is_stable_and_rejects_unsafe_ids() -> None:
     first = probe.digest("gl016-uncorrectable-mce-a1-deadbeef")
-    assert first == probe.digest("gl016-uncorrectable-mce-a1-deadbeef"), "digest is stable"
+    assert first == probe.digest("gl016-uncorrectable-mce-a1-deadbeef"), (
+        "digest is stable"
+    )
     assert len(first) == 16, "the window digest is 16 hex chars"
     with pytest.raises(probe.ProbeError, match="unsafe run ID"):
         probe.safe_id("bad id; rm -rf /")
@@ -86,7 +89,9 @@ def _records() -> list[dict[str, object]]:
     return [helper.reviewed_record("NVRM: Xid 79", emissions=3)]
 
 
-def _controller(tmp_path: Path, script: dict[str, object], mode: str = "journal") -> tuple[helper.KernelLogReplay, FakeProbe]:
+def _controller(
+    tmp_path: Path, script: dict[str, object], mode: str = "journal"
+) -> tuple[helper.KernelLogReplay, FakeProbe]:
     fake = FakeProbe(script)
 
     class _Regional:
@@ -114,15 +119,22 @@ def test_controller_install_sends_sha256_and_base64(tmp_path: Path) -> None:
     controller.install(records)
     call = next(item for item in fake.calls if item[0] == "install-records")
     flags = dict(zip(call[1::2], call[2::2]))
-    assert flags["--sha256"] == helper.records_sha256(records), "install carries the record-set digest"
+    assert flags["--sha256"] == helper.records_sha256(records), (
+        "install carries the record-set digest"
+    )
     decoded = base64.b64decode(flags["--b64"])
-    assert json.loads(decoded) == records, "install carries the reviewed records verbatim"
+    assert json.loads(decoded) == records, (
+        "install carries the reviewed records verbatim"
+    )
 
 
 def test_controller_open_arm_readback_and_cleanup(tmp_path: Path) -> None:
     script = {
         "install-records": {"records": 1},
-        "open-window": {"after": {"ActiveState": "active"}, "proof_scope": "live-replay"},
+        "open-window": {
+            "after": {"ActiveState": "active"},
+            "proof_scope": "live-replay",
+        },
         "arm": {"armed": True},
         "status": {"injected": {"emission_counts": {"0": 2}}},
         "close-window": {"clean": True},
@@ -131,15 +143,26 @@ def test_controller_open_arm_readback_and_cleanup(tmp_path: Path) -> None:
     controller.install(_records())
     controller.open(approved=True)
     opened = next(item for item in fake.calls if item[0] == "open-window")
-    assert "--approved" in opened, "journal mode passes the approval through to the probe"
-    assert ("--mode", "journal") == (opened[opened.index("--mode")], opened[opened.index("--mode") + 1]), opened
+    assert "--approved" in opened, (
+        "journal mode passes the approval through to the probe"
+    )
+    assert ("--mode", "journal") == (
+        opened[opened.index("--mode")],
+        opened[opened.index("--mode") + 1],
+    ), opened
     controller.arm()
     ingested = controller.read_back()
-    assert ingested["injected"]["emission_counts"] == {"0": 2}, "read_back returns the probe's injection oracle"
+    assert ingested["injected"]["emission_counts"] == {"0": 2}, (
+        "read_back returns the probe's injection oracle"
+    )
     receipts = controller.cleanup()
     assert receipts["close"]["clean"] is True, receipts
-    assert not any(receipts["probe_residuals"].values()), "a clean probe leaves no residue"
-    assert helper.PROOF_SCOPE == "live-replay", "a replay only ever claims the live-replay scope"
+    assert not any(receipts["probe_residuals"].values()), (
+        "a clean probe leaves no residue"
+    )
+    assert helper.PROOF_SCOPE == "live-replay", (
+        "a replay only ever claims the live-replay scope"
+    )
 
 
 def test_controller_cleanup_raises_when_window_will_not_close(tmp_path: Path) -> None:
@@ -184,7 +207,11 @@ def _render_wrapper(tmp_path: Path, *, armed: bool) -> tuple[Path, Path]:
     records = tmp_path / "records.json"
     records.write_text(
         json.dumps(
-            [helper.reviewed_record("machine check: uncorrected", priority=2, emissions=2)]
+            [
+                helper.reviewed_record(
+                    "machine check: uncorrected", priority=2, emissions=2
+                )
+            ]
         ),
         encoding="utf-8",
     )
@@ -231,11 +258,19 @@ def test_wrapper_appends_reviewed_records_when_armed(tmp_path: Path) -> None:
     lines = _run_wrapper(wrapper, "--output=json", "--since", "@1", "--until", "@2")
     messages = [item["MESSAGE"] for item in lines]
     assert "real kernel line" in messages, "the real line is still forwarded first"
-    assert "machine check: uncorrected" in messages, "the reviewed record is appended when armed"
-    reviewed = next(item for item in lines if item["MESSAGE"].startswith("machine check"))
-    assert reviewed["_TRANSPORT"] == "kernel", "a kernel-transport record keeps its trusted origin"
+    assert "machine check: uncorrected" in messages, (
+        "the reviewed record is appended when armed"
+    )
+    reviewed = next(
+        item for item in lines if item["MESSAGE"].startswith("machine check")
+    )
+    assert reviewed["_TRANSPORT"] == "kernel", (
+        "a kernel-transport record keeps its trusted origin"
+    )
     assert reviewed["_BOOT_ID"] == "boot-xyz", reviewed
-    assert reviewed["__CURSOR"].startswith("gfrs-replay-"), "injected records carry a replay cursor"
+    assert reviewed["__CURSOR"].startswith("gfrs-replay-"), (
+        "injected records carry a replay cursor"
+    )
 
 
 def test_wrapper_bounds_emissions(tmp_path: Path) -> None:
@@ -267,8 +302,8 @@ def test_wrapper_never_forwards_its_own_cursor(tmp_path: Path) -> None:
 
 def test_wrapper_passes_a_real_cursor_through(tmp_path: Path) -> None:
     wrapper, argv_log = _render_wrapper(tmp_path, armed=True)
-    _run_wrapper(
-        wrapper, "--output=json", "--after-cursor", "s=real-journal-cursor"
-    )
+    _run_wrapper(wrapper, "--output=json", "--after-cursor", "s=real-journal-cursor")
     forwarded = json.loads(argv_log.read_text(encoding="utf-8"))
-    assert "s=real-journal-cursor" in forwarded, "a real journal cursor is forwarded untouched"
+    assert "s=real-journal-cursor" in forwarded, (
+        "a real journal cursor is forwarded untouched"
+    )

@@ -26,7 +26,10 @@ from scripts.e2e.regional.general_live_fixture import (
     VariantInconclusive,
     utc_now,
 )
-from scripts.e2e.regional.general_live_kernel_replay import kernel_replay, reviewed_record
+from scripts.e2e.regional.general_live_kernel_replay import (
+    kernel_replay,
+    reviewed_record,
+)
 from scripts.e2e.regional.general_live_registry import (
     LIVE_REPLAY,
     VariantSpec,
@@ -72,7 +75,9 @@ def _drive(ctx: VariantContext, records: list[dict[str, Any]]) -> Any:
     oracle = replay.read_back()
     ctx.evidence.append_oracle([{"injected": oracle.get("injected")}], source="applog")
     if not (oracle.get("injected") or {}).get("emission_counts"):
-        raise VariantInconclusive("the journal wrapper reported no application records ingested")
+        raise VariantInconclusive(
+            "the journal wrapper reported no application records ingested"
+        )
     return started
 
 
@@ -107,11 +112,19 @@ def cgroup_oom(ctx: VariantContext) -> dict[str, Any]:
         "no_stop": _no_stop(observed, incidents),
         "hardware": hardware_errors(observed),
     }
-    return _result(ctx, stages, notes=["out-of-memory is a WARNING diagnostic; no STOP without attribution"])
+    return _result(
+        ctx,
+        stages,
+        notes=["out-of-memory is a WARNING diagnostic; no STOP without attribution"],
+    )
 
 
-def _evidence_only_variant(ctx: VariantContext, message: str, note: str) -> dict[str, Any]:
-    started = _drive(ctx, [reviewed_record(message, transport="stdout", unit="train-app.service")])
+def _evidence_only_variant(
+    ctx: VariantContext, message: str, note: str
+) -> dict[str, Any]:
+    started = _drive(
+        ctx, [reviewed_record(message, transport="stdout", unit="train-app.service")]
+    )
     observed = _wait_incident(ctx, started, "evidence-detect")
     incidents = _log_incidents(observed)
     stages = {
@@ -145,7 +158,9 @@ def distributed_error(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
-def _no_stop(activity_document: dict[str, Any], incidents: list[dict[str, Any]]) -> list[str]:
+def _no_stop(
+    activity_document: dict[str, Any], incidents: list[dict[str, Any]]
+) -> list[str]:
     errors = []
     for incident in incidents:
         for workflow in workflows_of(activity_document, str(incident["incident_id"])):
