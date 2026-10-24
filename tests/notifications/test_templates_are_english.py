@@ -37,11 +37,27 @@ NOTIFICATION_MODULES = sorted(
         "gpu_fault.store.shared.notification_helpers",
     ]
 )
-TEMPLATES = {
-    name: value
-    for name, value in vars(common).items()
-    if name.endswith("_EMAIL_TEMPLATE") and isinstance(value, str)
-}
+TEMPLATE_MODULES = [
+    importlib.import_module(name)
+    for name in NOTIFICATION_MODULES
+    if name.startswith("gpu_fault.notifications.")
+]
+
+
+def _constants(suffix: str) -> dict[str, str]:
+    """Every ``*<suffix>`` string of the notifications package. Most live in
+    ``common``; a control-plane-only notice keeps its own template in its
+    module (``hung_support``: ``common`` also ships in the executor wheel)."""
+
+    return {
+        name: value
+        for module in TEMPLATE_MODULES
+        for name, value in vars(module).items()
+        if name.endswith(suffix) and isinstance(value, str)
+    }
+
+
+TEMPLATES = _constants("_EMAIL_TEMPLATE")
 
 
 def test_every_shared_template_is_english_and_names_its_version() -> None:
@@ -89,10 +105,8 @@ def test_template_version_tags_are_unchanged_dedup_key_material() -> None:
     """A retag would change the deduplication keys that embed the tag and
     re-notify every open incident once; wording changes never bump them."""
 
-    versions = {
-        name: value
-        for name, value in vars(common).items()
-        if name.endswith("_TEMPLATE_VERSION") and isinstance(value, str)
-    }
+    versions = _constants("_TEMPLATE_VERSION")
     assert len(versions) >= 18, sorted(versions)
+    assert "HUNG_SUPPORT_HANDOFF_TEMPLATE_VERSION" in versions, sorted(versions)
+    assert "HUNG_SUPPORT_HANDOFF_EMAIL_TEMPLATE" in TEMPLATES, sorted(TEMPLATES)
     assert all("-zh-v" in value for value in versions.values()), versions

@@ -20,6 +20,9 @@ from gpu_fault.notifications.hardware_inventory import (
 from gpu_fault.notifications.host_resource import (
     HostResourceEventEmailBuilder,
 )
+from gpu_fault.notifications.hung_support import (
+    HungSupportHandoffEmailBuilder,
+)
 from gpu_fault.notifications.hyperpod_advisory import (
     HyperPodAdvisoryEmailBuilder,
 )
@@ -60,6 +63,7 @@ class NotificationKind(StrEnum):
     DCGM_DIAGNOSTIC = "DCGM_DIAGNOSTIC"
     DIAGNOSTIC_INCONCLUSIVE = "DIAGNOSTIC_INCONCLUSIVE"
     HARDWARE_ESCALATION = "HARDWARE_ESCALATION"
+    HUNG_SUPPORT_HANDOFF = "HUNG_SUPPORT_HANDOFF"
     NVLINK74_SUPPORT = "NVLINK74_SUPPORT"
     NVLINK74_MECHANICAL = "NVLINK74_MECHANICAL"
     WARM_SPARE_REPLACEMENT = "WARM_SPARE_REPLACEMENT"
@@ -123,6 +127,9 @@ NOTIFICATION_REGISTRY = {
     ),
     NotificationKind.HARDWARE_ESCALATION: NotificationDefinition(
         HardwareEscalationEmailBuilder
+    ),
+    NotificationKind.HUNG_SUPPORT_HANDOFF: NotificationDefinition(
+        HungSupportHandoffEmailBuilder
     ),
     NotificationKind.NVLINK74_SUPPORT: NotificationDefinition(
         Nvlink74SupportEmailBuilder
