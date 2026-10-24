@@ -644,6 +644,7 @@ rules:
       - tests/regional/test_general_live_edges.py
       - tests/regional/test_general_live_edges2.py
       - tests/regional/test_general_live_edges3.py
+      - tests/regional/test_general_live_probes.py
       - tests/test_general_fault_live_coverage.py
     regional_cases: []
     counts_as_domain: false
