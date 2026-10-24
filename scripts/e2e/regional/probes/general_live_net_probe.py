@@ -15,9 +15,9 @@ a real NIC can never be taken down. A ``veth`` pair carries a drop generator (a
 raw-socket sender of oversized frames behind a small-MTU peer), a ``dummy``
 interface reads ``operstate=unknown``, and a netns peer carries a TCP flow with
 ``tc netem`` loss for the TCP-only negative. Every interface is created with a
-``systemd-run --on-active`` deadman that deletes it, and the before/after link
-and address digest of every non-test interface is recorded so an untouched
-management plane is provable.
+``systemd-run --on-active`` deadman that deletes it, and the before/after
+configuration digest of every real (addressed or device-backed) non-test
+interface is recorded so an untouched management plane is provable.
 """
 
 from __future__ import annotations
@@ -47,6 +47,15 @@ MAX_DEADMAN_SECONDS = 5400
 MAX_SECONDS = 1800
 OVERSIZE_MTU = 576
 FRAME_BYTES = 1214
+#: Interface-link fields that move on their own on a live node and so must never
+#: enter the management-plane digest. Packet/error/drop counters step up on
+#: every active real interface between any two reads -- the management ENI alone
+#: carries the probe's own ``kubectl exec`` stream and all of the node's
+#: control-plane traffic -- so hashing them made the before/after equality in
+#: ``create_veth`` fail on ordinary traffic rather than on a real change (the
+#: 2026-10-24 live finding: 008/009 ``ProbeError`` before any product evidence).
+#: They are still reported verbatim for the *test* interfaces.
+VOLATILE_LINK_FIELDS = ("counters",)
 
 
 class ProbeError(RuntimeError):
@@ -244,22 +253,48 @@ def real_interfaces(run_id: str) -> list[str]:
     return result
 
 
-def management_digest(run_id: str) -> dict[str, Any]:
-    """A digest of every non-test interface's link and addresses.
+def management_plane(run_id: str) -> dict[str, Any]:
+    """The stable configuration of every interface the probe must not touch.
 
-    The before/after comparison proves the management plane was untouched.
+    The management plane is exactly the set ``forbid_real`` protects: a non-test
+    interface that carries an address or a sysfs ``device`` link (the management
+    ENI, the VPC-CNI ENI and the EFA netdevs). Ephemeral pod veths -- no address
+    and no ``device`` link, created and torn down as Pods churn -- are not part
+    of it and are left out, as are ``VOLATILE_LINK_FIELDS`` and the per-Pod CNI
+    route table: the digest proves the management plane's *configuration* is
+    untouched (no real interface downed, re-addressed or renumbered by creating
+    a test interface), not that no packet moved on it.
     """
 
-    snapshot = {
-        name: {"link": interface_link(name), "addresses": interface_addresses(name)}
-        for name in real_interfaces(run_id)
-    }
-    routes = run(["ip", "-j", "route", "show"], check=False).stdout
-    canonical = json.dumps(
-        {"interfaces": snapshot, "routes": routes}, sort_keys=True, default=str
-    )
+    plane: dict[str, Any] = {}
+    for name in real_interfaces(run_id):
+        link = interface_link(name)
+        addresses = interface_addresses(name)
+        if not (link.get("has_device") or addresses):
+            continue
+        plane[name] = {
+            "link": {
+                field: value
+                for field, value in link.items()
+                if field not in VOLATILE_LINK_FIELDS
+            },
+            "addresses": addresses,
+        }
+    return plane
+
+
+def management_digest(run_id: str) -> dict[str, Any]:
+    """A digest of the management plane's stable configuration.
+
+    The before/after comparison proves creating a test interface left every
+    real (addressed or device-backed) interface untouched. See
+    ``management_plane`` for what is -- and deliberately is not -- hashed.
+    """
+
+    plane = management_plane(run_id)
+    canonical = json.dumps(plane, sort_keys=True, default=str)
     return {
-        "interfaces": sorted(snapshot),
+        "interfaces": sorted(plane),
         "sha256": hashlib.sha256(canonical.encode()).hexdigest(),
     }
 

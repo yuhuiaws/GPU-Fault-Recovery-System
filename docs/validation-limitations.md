@@ -986,6 +986,43 @@ unverifiable device-mapper fix; the delay-free 006 variants (`short_flush`,
 `zero_completed_io`, `counter_reset`, `recovery`) are recovered by the
 propagation fix alone.
 
+The native network variants (008 NIC link down, 009 NIC errors/drops) build
+host-local `gfrs<digest><slot>` test interfaces (a `veth` pair, a `dummy`) with
+`general_live_net_probe.py` and declare them required to the host collector
+through a `GPU_FAULT_REQUIRED_INTERFACES` window drop-in; the collector reads
+them from `/sys/class/net`. Unlike the storage mount-namespace bug this has no
+network-namespace analogue: the host probe Pod already runs `hostNetwork: true`,
+so `ip link add` creates the test interface in the host network namespace where
+the installed collector reads it -- visibility was never the defect. The defect
+was that `create_veth`'s before/after "management plane untouched" digest hashed
+each real interface's per-interface statistics counters (`rx_packets`,
+`tx_packets`, `rx_errors`, `tx_errors`, `rx_dropped`, `tx_dropped`), the full
+`ip route` table and every pod veth. Those move on their own on a live node --
+the management ENI alone carries the probe's own `kubectl exec` stream and the
+node's control-plane traffic -- so the before/after equality tripped on ordinary
+traffic and the probe raised `ProbeError("creating the test veth changed a real
+interface digest")`, surfaced as `HostProbeError: host probe failed (exit 1;
+error ProbeError)` before any product evidence (the 2026-10-24 live finding on
+008 `required_link_down`). The digest now hashes only the *stable configuration*
+(`operstate`, hardware `address`, `mtu`, `carrier`, `ifindex`, `flags` and the
+assigned addresses) of the real interfaces the probe already refuses to touch --
+the addressed or `device`-backed management plane (the management ENI, the
+VPC-CNI ENI, the EFA netdevs) -- dropping the volatile counters, the per-Pod CNI
+route table and the ephemeral pod veths. It still changes when a real interface
+is downed, re-addressed or renumbered (the safety property the comparison exists
+for), so this only widens the tolerance to normal traffic, touches no product
+code and does not change which interfaces the probe operates on (still only
+`gfrs*`). Every 008/009 variant that creates a `veth` is recovered by it: 008
+`required_link_down`, `interface_missing`, `optional_interface`, `recovery` and
+the live-replay `statistics_failed`, and 009 `errors_delta`, `sustained_drops`,
+`short_drops`, `counter_reset`, `wrong_interface` and `recovery`. 008
+`unknown_state` (a `dummy`, which never computes the digest) and the
+observation/capability variants (`empty_required_list`, `bond_vf`) were never
+affected. 009 `tcp_only` is recovered from the `ProbeError` but stays
+`INCONCLUSIVE`: its `tc netem` TCP-loss flow in a test netns is not yet wired as
+a probe command, so the oracle sees no RetransSegs rise -- a separate harness
+gap left open, independent of interface visibility.
+
 ## GF-GENERAL-LIVE host/device categories (phase 2)
 
 Phase 2 adds the host/device categories 002 memory/swap, 005 shared storage,

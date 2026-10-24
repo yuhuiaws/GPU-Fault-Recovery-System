@@ -8,7 +8,10 @@ touch and whether a run left the node clean.
 
 from __future__ import annotations
 
+import argparse
+import subprocess
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -201,6 +204,188 @@ def test_net_state_and_residue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert not netp.residue_is_clean(
         {"interfaces": ["x"], "generators": [], "netns": []}
     ), "not netp.residue_is_clean( {'interfaces': ['x'], 'generators': [], 'ne"
+
+
+# --------------------------------------------------------------------------- #
+# net probe: management-plane digest (GF-GENERAL-LIVE-008/009 create-veth gate)
+#
+# The before/after digest in create_veth proves creating a gfrs test interface
+# left the management plane untouched. On a live node the management ENI carries
+# traffic (the probe's own kubectl-exec stream, the node control plane), so the
+# digest must ignore the per-interface packet/error/drop counters -- hashing
+# them made create_veth raise ProbeError on ordinary traffic before any product
+# evidence (the 2026-10-24 live finding). It must still catch a real change.
+# --------------------------------------------------------------------------- #
+def _mgmt_link(**over: Any) -> dict[str, Any]:
+    link: dict[str, Any] = {
+        "present": True,
+        "operstate": "up",
+        "address": "02:aa:bb:cc:dd:ee",
+        "mtu": "9001",
+        "carrier": "1",
+        "ifindex": "2",
+        "flags": "0x11043",
+        "has_device": True,
+        "counters": {
+            "rx_errors": 0,
+            "tx_errors": 0,
+            "rx_dropped": 0,
+            "tx_dropped": 0,
+            "rx_packets": 0,
+            "tx_packets": 0,
+        },
+    }
+    link.update(over)
+    return link
+
+
+def test_net_management_digest_ignores_traffic_and_pod_churn(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "gl8-link-a1-deadbeef"
+    moved = {"n": 0}
+
+    def interface_link(name: str) -> dict[str, Any]:
+        if name == "enp71s0":  # a real management interface carrying traffic
+            moved["n"] += 1
+            return _mgmt_link(
+                counters={
+                    "rx_errors": 0,
+                    "tx_errors": 0,
+                    "rx_dropped": 0,
+                    "tx_dropped": 0,
+                    "rx_packets": 1000 * moved["n"],
+                    "tx_packets": 900 * moved["n"],
+                }
+            )
+        return _mgmt_link(has_device=False, address=None, ifindex="57")  # pod veth
+
+    monkeypatch.setattr(netp, "real_interfaces", lambda rid: ["cali9f0", "enp71s0"])
+    monkeypatch.setattr(netp, "interface_link", interface_link)
+    monkeypatch.setattr(
+        netp,
+        "interface_addresses",
+        lambda name: ["10.0.0.5/24"] if name == "enp71s0" else [],
+    )
+
+    first = netp.management_digest(run_id)
+    second = netp.management_digest(run_id)
+    assert first["sha256"] == second["sha256"]
+    # Only the addressed/device-backed interface is part of the plane; the pod
+    # veth (no address, no device link) is excluded so its churn never trips it.
+    assert first["interfaces"] == ["enp71s0"]
+
+
+def test_net_management_digest_flags_a_real_config_change(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "gl8-link-a1-deadbeef"
+    monkeypatch.setattr(netp, "real_interfaces", lambda rid: ["enp71s0"])
+    monkeypatch.setattr(netp, "interface_addresses", lambda name: ["10.0.0.5/24"])
+
+    monkeypatch.setattr(netp, "interface_link", lambda name: _mgmt_link())
+    healthy = netp.management_digest(run_id)["sha256"]
+    # The same interface taken down must change the digest: that real change is
+    # exactly what the before/after comparison exists to catch.
+    monkeypatch.setattr(
+        netp, "interface_link", lambda name: _mgmt_link(operstate="down", carrier="0")
+    )
+    assert netp.management_digest(run_id)["sha256"] != healthy
+    # A re-addressed interface (new hardware address) is caught too.
+    monkeypatch.setattr(
+        netp, "interface_link", lambda name: _mgmt_link(address="02:ff:ff:ff:ff:ff")
+    )
+    assert netp.management_digest(run_id)["sha256"] != healthy
+
+
+def test_net_create_veth_survives_live_counter_movement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(netp, "STATE_ROOT", tmp_path / "state")
+    run_id = "gl8-link-a1-deadbeef"
+    a = netp.interface_name(run_id, "a")
+    b = netp.interface_name(run_id, "b")
+    reads = {"n": 0}
+
+    def interface_link(name: str) -> dict[str, Any]:
+        if name in (a, b):
+            return {"present": False}
+        reads["n"] += 1  # the ENI counters step up between the two digest reads
+        return _mgmt_link(
+            counters={
+                "rx_errors": 0,
+                "tx_errors": 0,
+                "rx_dropped": 0,
+                "tx_dropped": 0,
+                "rx_packets": 1000 * reads["n"],
+                "tx_packets": 900 * reads["n"],
+            }
+        )
+
+    monkeypatch.setattr(netp, "real_interfaces", lambda rid: ["enp71s0"])
+    monkeypatch.setattr(netp, "interface_link", interface_link)
+    monkeypatch.setattr(
+        netp,
+        "interface_addresses",
+        lambda name: ["10.0.0.5/24"] if name not in (a, b) else [],
+    )
+    monkeypatch.setattr(netp, "arm_deadman", lambda rid, kind, seconds: "gfrs-deadman")
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(command)
+        return subprocess.CompletedProcess(command, 0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(netp, "run", fake_run)
+    emitted: dict[str, Any] = {}
+    monkeypatch.setattr(netp, "emit", lambda value: emitted.update(value))
+
+    args = argparse.Namespace(
+        run_id=run_id, slot="a", peer_slot="b", deadman_seconds=1680
+    )
+    netp.create_veth(args)  # must not raise although the ENI counters moved
+    assert emitted["a"] == a
+    assert emitted["b"] == b
+    assert ["ip", "link", "add", a, "type", "veth", "peer", "name", b] in commands
+
+
+def test_net_create_veth_still_refuses_a_real_interface_change(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(netp, "STATE_ROOT", tmp_path / "state")
+    run_id = "gl8-link-a1-deadbeef"
+    a = netp.interface_name(run_id, "a")
+    b = netp.interface_name(run_id, "b")
+    reads = {"n": 0}
+
+    def interface_link(name: str) -> dict[str, Any]:
+        if name in (a, b):
+            return {"present": False}
+        reads["n"] += 1  # up in the "before" read, down by the "after" read
+        return _mgmt_link(operstate="up" if reads["n"] == 1 else "down")
+
+    monkeypatch.setattr(netp, "real_interfaces", lambda rid: ["enp71s0"])
+    monkeypatch.setattr(netp, "interface_link", interface_link)
+    monkeypatch.setattr(
+        netp,
+        "interface_addresses",
+        lambda name: ["10.0.0.5/24"] if name not in (a, b) else [],
+    )
+    monkeypatch.setattr(netp, "arm_deadman", lambda rid, kind, seconds: "gfrs-deadman")
+    monkeypatch.setattr(
+        netp,
+        "run",
+        lambda command, **kwargs: subprocess.CompletedProcess(
+            command, 0, stdout="[]", stderr=""
+        ),
+    )
+    monkeypatch.setattr(netp, "emit", lambda value: None)
+
+    args = argparse.Namespace(
+        run_id=run_id, slot="a", peer_slot="b", deadman_seconds=1680
+    )
+    with pytest.raises(netp.ProbeError, match="changed a real interface digest"):
+        netp.create_veth(args)
 
 
 # --------------------------------------------------------------------------- #
