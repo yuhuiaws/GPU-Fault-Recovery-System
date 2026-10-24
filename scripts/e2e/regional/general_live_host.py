@@ -27,10 +27,11 @@ from scripts.e2e.regional.general_live_fixture import (
     utc_now,
 )
 from scripts.e2e.regional.general_live_registry import (
+    LIVE_REPLAY,
     NATIVE,
     VariantSpec,
-    deferred_variant,
 )
+from scripts.e2e.regional.general_live_source_replay import host_source_replay
 from scripts.e2e.regional.general_live_verdicts import (
     ChainExpectation,
     chain_errors,
@@ -441,6 +442,63 @@ def _result(
     }
 
 
+#: A reviewed static ``/proc/stat``: the busy counters never advance, so the
+#: collector's ``total > previous_total`` guard emits no ``cpu_usage_percent``
+#: sample (``collectors/host/system_metrics.py`` ``_cpu``).
+STATIC_PROC_STAT = (
+    b"cpu  100 0 50 1000 0 0 0 0 0 0\n"
+    b"cpu0 100 0 50 1000 0 0 0 0 0 0\n"
+    b"intr 0\nctxt 0\nbtime 0\nprocesses 0\nprocs_running 1\nprocs_blocked 0\n"
+)
+
+
+def invalid_delta(ctx: VariantContext) -> dict[str, Any]:
+    """Live-replay: a non-positive ``/proc/stat`` delta yields no busy sample.
+
+    The reviewed static snapshot is bound over ``/proc/stat`` in the host
+    collector unit's own mount namespace; parsing, batching and grading stay
+    real. The runner wrote the fixture, so the non-positive total delta is the
+    raw-source oracle; the product must emit no ``cpu_usage_percent`` sample and
+    no finding.
+    """
+
+    ctx_survey(ctx)
+    replay = host_source_replay(ctx)
+    replay.create()
+    replay.install("proc-stat", STATIC_PROC_STAT)
+    opened = replay.open_bind(
+        [("proc-stat", "/proc/stat")], restore_seconds=ctx.spec.max_minutes * 60
+    )
+    ctx.evidence.write("source-open", opened)
+    started = utc_now()
+    status = replay.status()
+    ctx.evidence.append_oracle(
+        [{"proc_stat_fixture": (status.get("fixtures") or {}).get("proc-stat")}],
+        source="proc-stat",
+    )
+    # Let the collector poll the static file past its baseline, then confirm no
+    # busy sample and no finding across a negative window.
+    ctx.hold(ctx.host_interval * 4 + 30, name="static-delta")
+    observed = _watch_for_no_finding(ctx, started, "cpu_usage_percent", NEGATIVE_WINDOW)
+    cpu_samples = samples(observed, "cpu_usage_percent")
+    stages = {
+        "no_busy_sample": (
+            [f"{len(cpu_samples)} cpu_usage_percent samples emitted on a non-positive delta"]
+            if cpu_samples
+            else []
+        ),
+        "no_finding": chain_errors(
+            observed, ChainExpectation(metric="cpu_usage_percent", present=False)
+        ),
+        "hardware": hardware_errors(observed),
+    }
+    return _result(
+        stages,
+        notes=["a static /proc/stat makes the total delta <= 0; no busy sample is emitted"],
+        extra={"proof_scope": "live-replay"},
+    )
+
+
 VARIANTS = [
     VariantSpec(
         case_id=CASE,
@@ -494,13 +552,18 @@ VARIANTS = [
         max_minutes=20,
         execute=recovery,
     ),
-    deferred_variant(
-        CASE,
-        "invalid_delta",
-        proof_mode="live-replay",
-        reason="FIXTURE_NOT_READY: a /proc/stat Delta<=0 read needs a GPU_FAULT_HOST_PROC_ROOT product fixture",
-        lanes=("eks",),
-        expected="no busy sample on a non-positive total delta; no finding",
+    VariantSpec(
+        case_id=CASE,
+        variant="invalid_delta",
+        proof_mode=LIVE_REPLAY,
+        lanes=("eks", "hp"),
+        risk="L",
+        flags="S",
+        injection="bind a reviewed static /proc/stat into the host collector's mount namespace",
+        expected="total delta <= 0 -> no cpu_usage_percent sample and no finding",
+        cleanup="close the /proc/stat bind window; confirm clean",
+        max_minutes=14,
+        execute=invalid_delta,
     ),
     VariantSpec(
         case_id=CASE,

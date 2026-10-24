@@ -38,17 +38,20 @@ from scripts.e2e.regional.general_live_fixture import (
 )
 from scripts.e2e.regional.general_live_registry import (
     CAPABILITY,
+    LIVE_REPLAY,
     NATIVE,
     OBSERVATION,
     VariantSpec,
-    deferred_variant,
 )
+from scripts.e2e.regional.general_live_source_replay import host_source_replay
 from scripts.e2e.regional.general_live_verdicts import (
     ChainExpectation,
     chain_errors,
     finding_incidents,
     hardware_errors,
+    node_isolated,
     oracle_values,
+    samples,
     verdict,
 )
 
@@ -690,6 +693,105 @@ def _result(
     }
 
 
+def _bind_statistics(
+    ctx: VariantContext, interface: str, name: str, content: bytes
+) -> Any:
+    """Bind a reviewed statistics counter of one gfrs test interface (live-replay)."""
+
+    replay = host_source_replay(ctx)
+    replay.create()
+    replay.install(name, content)
+    dest = f"/sys/class/net/{interface}/statistics/rx_errors"
+    opened = replay.open_bind([(name, dest)], restore_seconds=ctx.spec.max_minutes * 60)
+    ctx.evidence.write("statistics-bind", opened)
+    return replay
+
+
+def errors_delta(ctx: VariantContext) -> dict[str, Any]:
+    """Live-replay: a reviewed rx_errors counter stepped up -> WARNING + fabric diagnostic."""
+
+    created = _veth(ctx)
+    a = created["a"]
+    _declare_required(ctx, a)
+    ctx.hold(ctx.host_interval * 3, name="healthy-samples")
+    replay = _bind_statistics(ctx, a, "rx-errors", b"0\n")
+    # One poll at zero establishes the error-delta baseline, then step it up.
+    ctx.hold(ctx.host_interval * 2 + 10, name="errors-baseline")
+    started = utc_now()
+    replay.set_value("rx-errors", 5000)
+    detection = wait_for_incident(
+        ctx,
+        started,
+        "network_errors_delta",
+        device=a,
+        timeout_seconds=QUARANTINE_BUDGET,
+        metrics={"network_errors_delta"},
+        name="errors-delta",
+    )
+    status = replay.status()
+    ctx.evidence.append_oracle(
+        [{"rx_errors_fixture": (status.get("fixtures") or {}).get("rx-errors")}],
+        source="rx-errors",
+    )
+    incidents = finding_incidents(detection, "network_errors_delta", device=a)
+    stages = {
+        "chain": chain_errors(
+            detection,
+            ChainExpectation(
+                metric="network_errors_delta",
+                device=a,
+                operations=("FREEZE_EVIDENCE", "VALIDATE_FABRIC"),
+            ),
+        ),
+        "hardware": hardware_errors(detection),
+    }
+    if not incidents:
+        stages["chain"].append("no network_errors_delta finding reached an incident")
+    return _result(
+        stages,
+        notes=["the bound rx_errors counter stepped up; the delta is a WARNING fabric diagnostic"],
+        extra={"device": a, "proof_scope": "live-replay"},
+    )
+
+
+def statistics_failed(ctx: VariantContext) -> dict[str, Any]:
+    """Live-replay: an unreadable rx_errors counter keeps the link sample, not 'down'."""
+
+    created = _veth(ctx)
+    a = created["a"]
+    _declare_required(ctx, a)
+    ctx.hold(ctx.host_interval * 3, name="healthy-samples")
+    started = utc_now()
+    _bind_statistics(ctx, a, "rx-errors", b"not-a-number\n")
+    ctx.hold(ctx.host_interval * 4 + 20, name="stats-failed")
+    observed = activity(
+        ctx,
+        started,
+        metrics={"network_link_up", "network_errors_delta", "network_drops_delta"},
+        kinds=("HOST_TELEMETRY",),
+    )
+    link = samples(observed, "network_link_up", device=a)
+    stages = {
+        "link_kept": []
+        if link
+        else ["the link sample was dropped when the statistics read failed"],
+        "no_false_fault": [
+            f"a statistics read failure produced a {metric} finding on {a}"
+            for metric in ("network_errors_delta", "network_drops_delta")
+            if finding_incidents(observed, metric, device=a)
+        ],
+        "not_isolated": ["node isolated on a statistics read failure"]
+        if node_isolated(ctx.regional.node_snapshot(ctx.settings.node))
+        else [],
+        "hardware": hardware_errors(observed),
+    }
+    return _result(
+        stages,
+        notes=["an unreadable counter is UNKNOWN; the link state is still reported"],
+        extra={"device": a, "proof_scope": "live-replay"},
+    )
+
+
 def _spec(
     case: str,
     variant: str,
@@ -750,13 +852,16 @@ VARIANTS = [
         risk="L",
         approvals=("KERNEL_MODULE_LOAD",),
     ),
-    deferred_variant(
+    _spec(
         CASE_008,
         "statistics_failed",
-        proof_mode="live-replay",
-        reason="FIXTURE_NOT_READY: an unreadable statistics read needs a net_class_root product fixture",
-        lanes=("eks",),
-        expected="the link sample is kept; a known down state is not swallowed by the stats error",
+        "bind a non-numeric rx_errors over a required gfrs test interface",
+        "the link sample is kept and reported UNKNOWN; no false errors/drops finding, no isolation",
+        statistics_failed,
+        risk="L",
+        max_minutes=14,
+        proof=LIVE_REPLAY,
+        approvals=("KERNEL_MODULE_LOAD",),
     ),
     _spec(
         CASE_008,
@@ -800,13 +905,16 @@ VARIANTS = [
         link_recovery,
         approvals=("KERNEL_MODULE_LOAD",),
     ),
-    deferred_variant(
+    _spec(
         CASE_009,
         "errors_delta",
-        proof_mode="live-replay",
-        reason="FIXTURE_NOT_READY: a veth never counts errors; needs a net_class_root product fixture",
-        lanes=("eks",),
-        expected="immediate WARNING -> VALIDATE_FABRIC on that interface",
+        "bind a reviewed rx_errors counter on a required gfrs test interface and step it up",
+        "immediate WARNING network_errors_delta -> VALIDATE_FABRIC on that interface; no hardware recovery",
+        errors_delta,
+        risk="L",
+        max_minutes=16,
+        proof=LIVE_REPLAY,
+        approvals=("KERNEL_MODULE_LOAD",),
     ),
     _spec(
         CASE_009,

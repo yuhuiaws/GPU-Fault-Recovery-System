@@ -836,7 +836,11 @@ VARIANTS = [
         CASE_004,
         "probe_error",
         proof_mode="live-replay",
-        reason="FIXTURE_NOT_READY: an EIO/EACCES statvfs read needs a GPU_FAULT_HOST_PROC_ROOT product fixture",
+        reason=(
+            "FIXTURE_NOT_READY: a statvfs EIO/EACCES cannot be produced by a read-only file "
+            "bind (statvfs resolves the mount, not the bound file); it needs a real faulting "
+            "test mount (FUSE/dm-error), which is not built this phase"
+        ),
         lanes=("eks",),
         expected="the except branch silently skips the mount (spec FAIL)",
     ),

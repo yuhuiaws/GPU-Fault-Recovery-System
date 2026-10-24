@@ -271,8 +271,8 @@ VARIANTS = [
         "missing_flight_recorder",
         proof_mode=LIVE_REPLAY,
         reason=(
-            "FIXTURE_NOT_READY/SCALE: the independent low-RDMA hung trigger needs a running "
-            "managed NCCL attempt (lane N territory), not a log replay"
+            "FIXTURE_NOT_READY: the independent low-RDMA hung trigger needs a running managed "
+            "NCCL attempt (lane N territory), not a log replay"
         ),
         lanes=("eks", "hp"),
         expected="a live, non-exited process with sustained low RDMA raises the independent hung trigger",
