@@ -6,6 +6,9 @@ decisions / evidence, the node snapshot, the collector statuses, the replay
 audit) and returns the concrete reasons a case failed, or ``[]``. The replay
 tool never declares a LIVE PASS; these functions turn the product's workflow
 evidence into the verdict, and a missing receipt is a failure, not a pass.
+What could not be observed at all -- a replay the collector never consumed, a
+reading no accepted record shows -- is INCONCLUSIVE (``case_verdict``), never a
+PASS; ``env_live_judges`` decides which is which on the polled records.
 
 The workflow shapes they check come from ``orchestration.families.health``: a
 severe environment finding compiles the ENVIRONMENT_REVIEW chain
@@ -118,11 +121,13 @@ def baseline_errors(
     source_boot_id: str | None,
     collector_mode: str | None,
     new_environment_actions: Iterable[str],
-    task_progressed: bool,
+    task_progressed: bool | None,
 ) -> list[str]:
     """001: every required field has a reading or an explicit unsupported record,
     at least three fresh samples were accepted, no environment action fired and
-    the original task kept moving while the proxy was armed-but-passthrough."""
+    the original task kept moving while the proxy was armed-but-passthrough.
+    ``task_progressed=None`` means the node runs no test task; the caller
+    records that gap in its evidence instead of asserting progress."""
 
     errors: list[str] = []
     for gpu, readings in sorted(per_gpu_readings.items()):
@@ -155,7 +160,7 @@ def baseline_errors(
     actions = sorted(set(new_environment_actions))
     if actions:
         errors.append(f"baseline created environment actions: {actions}")
-    if not task_progressed:
+    if task_progressed is False:
         errors.append("the original training step did not advance during baseline")
     return errors
 
@@ -225,13 +230,14 @@ def read_only_diagnostic_errors(
     workflow: dict[str, Any] | None,
     incident_state: str | None,
     node_isolated: bool,
-    task_progressed: bool,
+    task_progressed: bool | None,
     label: str,
 ) -> list[str]:
     """A warning / duration / composite signal is diagnosed, never escalated.
 
     No isolating operation, the node stays schedulable, the task keeps moving,
-    and any workflow carries only diagnostic operations.
+    and any workflow carries only diagnostic operations. ``task_progressed``
+    is ``None`` when no test task exists to measure (recorded by the caller).
     """
 
     errors: list[str] = []
@@ -244,7 +250,7 @@ def read_only_diagnostic_errors(
         errors.append(f"{label}: workflow carried non-diagnostic steps {stray}")
     if node_isolated:
         errors.append(f"{label}: node was isolated for a read-only signal")
-    if not task_progressed:
+    if task_progressed is False:
         errors.append(f"{label}: the training task stopped on a read-only signal")
     if incident_state in {"QUARANTINED", "ESCALATED"}:
         errors.append(f"{label}: incident escalated to {incident_state}")
@@ -527,7 +533,13 @@ def cleanup_errors(
     return errors
 
 
-def case_verdict(error_groups: dict[str, list[str]]) -> str:
-    """PASS only when no stage reported an error; otherwise FAIL."""
+def case_verdict(
+    error_groups: dict[str, list[str]], inconclusive: Iterable[str] = ()
+) -> str:
+    """FAIL on any stage error (a failed cleanup included); INCONCLUSIVE when
+    nothing failed but the replay or its ingestion could not be shown; PASS
+    only when every stage held on positive evidence."""
 
-    return "PASS" if not any(error_groups.values()) else "FAIL"
+    if any(error_groups.values()):
+        return "FAIL"
+    return "INCONCLUSIVE" if list(inconclusive) else "PASS"

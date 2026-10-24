@@ -75,6 +75,16 @@ others NOT_RUN rather than fabricating a scale: on a T.Limit-only p5en H200 the
 absolute-core and absolute-shutdown (GF-ENV-LIVE-011) variants are NOT_RUN,
 GF-ENV-LIVE-002 reuses GF-REGIONAL-COLLECT-002's controlled power path, and
 GF-ENV-LIVE-010 needs a second multi-GPU node and a control task.
+After arming, the runner polls the proxy status and the product's records within
+a deadline derived from the node's collector interval, the confirmation, cooldown
+and VALIDATE_GPU windows and a scan margin, capped by the proxy's replay window
+and the collector deadman. A replay that was not consumed or whose ingestion no
+accepted record shows is INCONCLUSIVE, never PASS; a reaction the product needs
+longer than that window for is INCONCLUSIVE as well. Non-brake bits and unusable
+fields are no edge-filter delivery edge, so they reach the control plane only when
+a health summary falls inside their short plans. GF-ENV-LIVE-009 is BLOCKED: the
+runner has no controlled collection pause. The preflight admits only a node without
+business workloads, so task progress and suspension are reported as not measured.
 
 AUTH-016 follows the real administrator rotation contract using controlled I/O.
 Same-release Node key activation tests bind durable progress, projected key

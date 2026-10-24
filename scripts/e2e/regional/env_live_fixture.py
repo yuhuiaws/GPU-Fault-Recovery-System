@@ -8,7 +8,8 @@ plans come from the live device's own limits (``env_live_plans``); the verdicts
 come from the product's workflow records (``env_live_verdicts``). This module
 owns the read-only preflight, the device-limit read, the proxy lifecycle and the
 control-plane reads the cases share; each case's orchestration lives in the
-runner, and no function here decides a verdict.
+runner, the bounded wait in ``env_live_watch`` and the per-case judgement in
+``env_live_judges``, and no function here decides a verdict.
 
 Nothing here declares a LIVE PASS. The replay tool only serves telemetry; the
 incident, workflow, notification and cleanup receipts the control plane writes
@@ -43,6 +44,10 @@ from scripts.e2e.regional.collector_action_guard import (  # noqa: E402
     finite_seconds,
     require_action_time,
 )
+from scripts.e2e.regional.general_live_gpu_store import (  # noqa: E402
+    GPU_STATE_PROBE,
+)
+from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE  # noqa: E402
 from scripts.e2e.regional.host_probe_fixture import (  # noqa: E402
     HostProbeFixture,
     HostProbeSettings,
@@ -53,6 +58,7 @@ from scripts.e2e.regional.regional_live_fixture import (  # noqa: E402
     RegionalLiveFixture,
     RegionalLiveSettings,
     predecessor_evidence,
+    project_node_snapshot,
     required,
     settings_from_arguments,
 )
@@ -67,6 +73,12 @@ EXPORTER_POD_PREFIX = "gpu-fault-dcgm-exporter"
 #: The live T.Limit reading must be at least this far above zero before the run
 #: arms, so the device is plainly in a safe state (the tool aborts at <= 0).
 SAFE_TLIMIT_MARGIN_C = 10.0
+#: One read of the observation loop. A slow API Pod costs one poll, never the
+#: replay window: ``pod_python`` never retries a timeout, and the second attempt
+#: only covers an exec kubectl refused before the script ran.
+READ_TIMEOUT_SECONDS = 45
+READ_ATTEMPTS = 2
+NODE_READ_TIMEOUT_SECONDS = 30
 
 
 def utc_now() -> datetime:
@@ -563,15 +575,77 @@ def write_plan_file(case_dir: Path, name: str, plan: dict[str, Any]) -> Path:
     return path
 
 
-def node_activity(
+def gpu_records(
+    regional: RegionalLiveFixture,
+    node: str,
+    since: datetime,
+    names: tuple[str, ...] | list[str],
+) -> dict[str, Any]:
+    """The node's GPU telemetry records since ``since`` (read-only).
+
+    The accepted GPU_METRICS batches with the samples of ``names``, the latest
+    accepted reading per GPU and field, the node's GPU findings (active and
+    activated since) and the GPU collector status -- the reads the
+    GF-GENERAL-LIVE DCGM categories judge on (``general_live_gpu_store``).
+    """
+
+    wanted = sorted(set(names))
+    if any(not item or "," in item for item in wanted):
+        raise ValueError("GPU state filters must be non-empty, no comma")
+    return regional.cpu_python(
+        GPU_STATE_PROBE,
+        regional.settings.cluster_id,
+        node,
+        since.isoformat(),
+        ",".join(wanted),
+        timeout=READ_TIMEOUT_SECONDS,
+        attempts=READ_ATTEMPTS,
+    )
+
+
+def node_records(
     regional: RegionalLiveFixture,
     node: str,
     since: datetime,
 ) -> dict[str, Any]:
-    """The incident / workflow / notifications the control plane grew for the
-    node since ``since`` (the shared Store snapshot, newest first)."""
+    """The incidents, workflows (with step executions), remote commands and
+    notifications the control plane recorded for the node since ``since``.
 
-    return regional.store_snapshot(node=node, observed_after=since)
+    ``RegionalLiveFixture.store_snapshot`` cannot answer this: it is keyed on
+    an XID event, and a GPU environment finding is a NODE_HEALTH incident
+    (``inc-gpu-<finding id>``) that no XID event names, so the snapshot never
+    returned the workflow an armed replay produced.
+    """
+
+    return regional.cpu_python(
+        ACTIVITY_PROBE,
+        regional.settings.cluster_id,
+        node,
+        since.isoformat(),
+        "collector_observation_valid",
+        "",
+        "GPU_METRICS",
+        timeout=READ_TIMEOUT_SECONDS,
+        attempts=READ_ATTEMPTS,
+    )
+
+
+def node_state(regional: RegionalLiveFixture, node: str) -> dict[str, Any]:
+    """The runner's view of the Node (``project_node_snapshot``), bounded."""
+
+    return project_node_snapshot(
+        json.loads(
+            regional.kubectl(
+                "gpu",
+                "get",
+                "node",
+                node,
+                "-o",
+                "json",
+                timeout=NODE_READ_TIMEOUT_SECONDS,
+            )
+        )
+    )
 
 
 def replay_tool_sha256() -> str:

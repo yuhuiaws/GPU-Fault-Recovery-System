@@ -10,9 +10,13 @@ reviewed replay plans and writes ``plan.json``. ``--execute`` additionally needs
 workload, ``--confirm-isolate``/``--confirm-stop`` tokens; it ships the audited
 replay tool to the node, repoints the single metrics collector at the loopback
 proxy through a bounded reversible maintenance change with an independent
-rollback, arms one plan, watches the product's own incident/workflow/
-notification records and restores everything. The tool never declares a LIVE
-PASS; the verdict comes from those records (``env_live_verdicts``).
+rollback, arms one plan, and then waits -- bounded by the product's own windows
+and the proxy's replay window -- until the proxy served the plan and the
+product's records show the case's expected reaction (``env_live_watch``,
+``env_live_judges``), and restores everything. The tool never declares a LIVE
+PASS; the verdict comes from those records: PASS only on positive evidence,
+FAIL on a missing or wrong reaction, INCONCLUSIVE when the replay or its
+ingestion cannot be shown.
 
 GF-ENV-LIVE-011 (absolute shutdown) runs only where the device reports an
 absolute ``gpu_shutdown_temperature_c``; GF-ENV-LIVE-012 (real physical/vendor
@@ -26,7 +30,7 @@ import json
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -34,9 +38,12 @@ ROOT = Path(__file__).resolve().parents[3]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from scripts.e2e.regional import env_live_expectations as expectations  # noqa: E402
 from scripts.e2e.regional import env_live_fixture as fixture  # noqa: E402
+from scripts.e2e.regional import env_live_judges as judges  # noqa: E402
 from scripts.e2e.regional import env_live_plans as plans  # noqa: E402
 from scripts.e2e.regional import env_live_verdicts as verdicts  # noqa: E402
+from scripts.e2e.regional import env_live_watch as watch  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
     write_json_atomic,
 )
@@ -61,7 +68,21 @@ ISOLATING_CASES = frozenset(
     {"GF-ENV-LIVE-004", "GF-ENV-LIVE-007", "GF-ENV-LIVE-010", "GF-ENV-LIVE-011"}
 )
 PORT = 9411
+PROXY_ENDPOINT = f"http://127.0.0.1:{PORT}/metrics"
 WINDOW_SECONDS = 600
+#: The store reads start this much before the runner's arm: batches and
+#: findings carry the node collector's clock, incidents the control plane's.
+STATE_SKEW_SECONDS = 30
+ACTIVITY_SKEW_SECONDS = 5
+#: The poll loop's sleep (a test drives it with a fake clock).
+SLEEP = time.sleep
+INTERRUPTION_BLOCKED = (
+    "GF-ENV-LIVE-009 needs a controlled >60 s pause of the metrics collector "
+    "after two severe samples, a collector restart and a source switch through "
+    "the normal installation; this runner has no such maintenance step, and "
+    "arming its severe T.Limit plan without the pause would only repeat "
+    "GF-ENV-LIVE-004's isolate/stop chain without the branch confirmations"
+)
 
 
 def case_number(case_id: str) -> int:
@@ -271,14 +292,64 @@ def plan_details(
             "job_restart_after_remediation": False,
         },
         "verdict_if_not_run": "NOT_RUN" if not_run else None,
+        "observation": observation_plan(case_id, preflight, replay.get("plans") or {}),
         "preflight": preflight,
     }
+    if number == 9:
+        details["verdict_if_blocked"] = "BLOCKED"
+        details["blocked_reason"] = INTERRUPTION_BLOCKED
     if not_run:
         details["not_run_reason"] = (
             "GF-ENV-LIVE-012 is a real physical or vendor-lab fault; a telemetry "
             "replay cannot stand in for it (verdict stays NOT_RUN)"
         )
     return details
+
+
+def _first_plan(
+    case_id: str, replay_plans: dict[str, Any]
+) -> tuple[str, dict[str, Any]]:
+    """The one plan an attempt arms (001 serves a pass-through plan only)."""
+
+    if case_number(case_id) == 1:
+        return "passthrough", {"steps": [{"reads": 1, "values": {}}]}
+    name, plan = sorted(replay_plans.items())[0]
+    return str(name), dict(plan)
+
+
+def observation_plan(
+    case_id: str, preflight: dict[str, Any], replay_plans: dict[str, Any]
+) -> dict[str, Any] | None:
+    """The wait/verdict rule the attempt's armed plan gets, at default cadence.
+
+    ``--execute`` recomputes it from the node's own collector.env.
+    """
+
+    number = case_number(case_id)
+    # 002/009 are BLOCKED and 010/012 NOT_RUN before anything is armed.
+    if number in {2, 9, 10, 12} or (number != 1 and not replay_plans):
+        return None
+    name, plan = _first_plan(case_id, replay_plans)
+    try:
+        expectation = expectations.expectation_for(
+            case_id=case_id,
+            plan_name=name,
+            plan=plan,
+            preflight=preflight,
+            cadence=watch.CollectorCadence(),
+            node=str((preflight.get("node") or {}).get("name") or ""),
+        )
+    except ValueError as exc:
+        return {"plan": name, "error": str(exc)}
+    return {
+        **expectation.evidence(),
+        "terms": expectation.terms,
+        "derived_seconds": sum(expectation.terms.values()),
+        "capped_by": (
+            "min(arm + proxy max_seconds, repoint + collector deadman, maintenance "
+            f"window end) - {watch.CLEANUP_MARGIN_SECONDS:.0f}s cleanup margin"
+        ),
+    }
 
 
 # --------------------------------------------------------------------------- #
@@ -353,6 +424,8 @@ def execute_case(
                 "node that ships dcgmproftester and has default power limits"
             ),
         )
+    if number == 9:
+        return finish_without_run("BLOCKED", blocked_reason=INTERRUPTION_BLOCKED)
     if number == 10 and not settings.site_file:
         # Scope/concurrency needs a second multi-GPU test node and a control
         # task; without them the spec keeps the variant NOT_RUN.
@@ -383,7 +456,6 @@ def execute_case(
             f"--confirm-isolate {isolate_token(settings.case_id)} and "
             f"--confirm-stop {stop_token(settings.case_id)}"
         )
-    target = preflight["target_gpu"]
     run_id = f"{settings.case_id.lower()}-a{attempt}-{int(time.time())}"
     controller = fixture.EnvReplayController(
         regional,
@@ -394,44 +466,24 @@ def execute_case(
         case_dir=case_dir,
     )
     stages: dict[str, list[str]] = {}
+    inconclusive: list[str] = []
     receipts: dict[str, Any] = {}
     try:
         with action_window(maintenance_window_end):
-            controller.create()
-            # 001 never arms (pass-through baseline). Every other case arms the
-            # first reviewed plan; the rest are documented in replay_plans and
-            # run in follow-up attempts with their own audit files.
-            if arms_a_plan:
-                plan_name, first_plan = sorted(replay["plans"].items())[0]
-            else:
-                plan_name, first_plan = (
-                    "passthrough",
-                    {"steps": [{"reads": 1, "values": {}}]},
-                )
-            plan_path = fixture.write_plan_file(case_dir, fixture.PLAN_FILE, first_plan)
-            receipts["probe_preflight"] = controller.preflight()
-            receipts["deploy"] = controller.deploy_proxy(
-                plan_path,
-                str(target["gpu_uuid"]),
-                port=PORT,
-                max_seconds=WINDOW_SECONDS,
+            outcome = _run_replay(
+                settings,
+                regional,
+                controller,
+                preflight,
+                replay,
+                receipts=receipts,
+                result=result,
+                case_dir=case_dir,
+                maintenance_window_end=maintenance_window_end,
             )
-            receipts["repoint"] = controller.repoint(
-                port=PORT, restore_seconds=WINDOW_SECONDS
-            )
-            # A few pass-through cycles must reach the control plane unchanged
-            # before arming (001's contract, required by every case).
-            passthrough_at = fixture.utc_now()
-            receipts["passthrough_status"] = controller.status(port=PORT)
-            if arms_a_plan:
-                receipts["arm"] = controller.arm(port=PORT)
-            observed_at = fixture.utc_now()
-            activity = fixture.node_activity(regional, settings.node, passthrough_at)
-            receipts["activity"] = activity
-            stages = observe(
-                settings.case_id, preflight, receipts, activity, observed_at
-            )
-            result["armed_plan"] = plan_name
+            receipts["observation"] = outcome["observation"]
+            stages.update(outcome["stages"])
+            inconclusive.extend(outcome["inconclusive"])
     except BaseException as exc:  # noqa: BLE001 - recorded; cleanup still runs
         result["error"] = f"{type(exc).__name__}: {exc}"
         stages.setdefault("execution", []).append(result["error"])
@@ -443,101 +495,215 @@ def execute_case(
         except Exception as exc:  # noqa: BLE001
             receipts["cleanup_error"] = f"{type(exc).__name__}: {exc}"
         stages["cleanup"] = _cleanup_errors(settings.case_id, receipts)
+    status = receipts.get("passthrough_status") or {}
+    if "passthrough_status" in receipts:
+        stages["passthrough"] = (
+            []
+            if (status.get("status") or {}).get("armed") is False
+            else ["proxy was armed before the baseline read"]
+        )
     result.update(
-        verdict=verdicts.case_verdict(stages),
+        verdict=verdicts.case_verdict(stages, inconclusive),
         stages=stages,
         errors=[
             f"{stage}: {item}" for stage, items in stages.items() for item in items
         ],
+        inconclusive=inconclusive,
         receipts=receipts,
         ended_at=fixture.utc_now().isoformat(),
-        limitations=[
-            "Telemetry replay only: it proves the normally-installed collector, "
-            "real control plane and scheduling run end to end, not that the "
-            "sensor truly reported the fault or that hardware was repaired.",
-            "The runner arms one reviewed plan per attempt; the remaining plans "
-            "in replay_plans are run in follow-up attempts with fresh audit "
-            "files and a fresh clean test job.",
-        ],
+        limitations=_limitations(receipts),
     )
     write_json_atomic(case_dir / f"{settings.case_id}.json", result)
     print_result(result)
     return 0 if result["verdict"] == "PASS" else 1
 
 
-def observe(
-    case_id: str,
-    preflight: dict[str, Any],
-    receipts: dict[str, Any],
-    activity: dict[str, Any],
-    observed_at: datetime,
-) -> dict[str, list[str]]:
-    """Judge the product records against the case's pass conditions.
+def _limitations(receipts: dict[str, Any]) -> list[str]:
+    expectation = (receipts.get("observation") or {}).get("expectation") or {}
+    return [
+        "Telemetry replay only: it proves the normally-installed collector, "
+        "real control plane and scheduling run end to end, not that the "
+        "sensor truly reported the fault or that hardware was repaired.",
+        "The runner arms one reviewed plan per attempt; the remaining plans "
+        "in replay_plans are run in follow-up attempts with fresh audit "
+        "files and a fresh clean test job.",
+        "The wait is bounded by the proxy's replay window and the collector "
+        "deadman: a reaction the product needs longer for is INCONCLUSIVE, "
+        "never PASS.",
+        *(
+            f"Not covered by this attempt: {item}"
+            for item in expectation.get("not_covered_by_this_attempt", [])
+        ),
+    ]
 
-    This reads the Store snapshot the runner already fetched and maps it onto
-    the pure verdict helpers. It records what it could not observe as an error
-    rather than passing silently, so a run that never saw a workflow fails.
+
+def _run_replay(
+    settings: fixture.EnvLiveSettings,
+    regional: Any,
+    controller: Any,
+    preflight: dict[str, Any],
+    replay: dict[str, Any],
+    *,
+    receipts: dict[str, Any],
+    result: dict[str, Any],
+    case_dir: Path,
+    maintenance_window_end: datetime,
+) -> dict[str, Any]:
+    """Deploy, repoint, arm one plan and observe it; the caller cleans up."""
+
+    arms_a_plan = case_number(settings.case_id) != 1
+    controller.create()
+    # 001 never arms (pass-through baseline). Every other case arms the first
+    # reviewed plan; the rest are documented in replay_plans and run in
+    # follow-up attempts with their own audit files.
+    plan_name, first_plan = _first_plan(settings.case_id, replay.get("plans") or {})
+    plan_path = fixture.write_plan_file(case_dir, fixture.PLAN_FILE, first_plan)
+    receipts["probe_preflight"] = controller.preflight()
+    cadence = watch.CollectorCadence.from_probe(receipts["probe_preflight"])
+    expectation = expectations.expectation_for(
+        case_id=settings.case_id,
+        plan_name=plan_name,
+        plan=first_plan,
+        preflight=preflight,
+        cadence=cadence,
+        node=settings.node,
+    )
+    receipts["deploy"] = controller.deploy_proxy(
+        plan_path,
+        str(preflight["target_gpu"]["gpu_uuid"]),
+        port=PORT,
+        max_seconds=WINDOW_SECONDS,
+    )
+    # What the real exporter delivered before the repoint, and the node as the
+    # run found it: the baseline's unchanged-value check and the "isolated by
+    # this run" checks compare against these.
+    before = None
+    if not arms_a_plan:
+        try:
+            before = fixture.gpu_records(
+                regional, settings.node, fixture.utc_now(), expectation.names
+            )
+        except Exception as exc:  # noqa: BLE001 - the check is skipped, not faked
+            receipts["before_error"] = f"{type(exc).__name__}: {exc}"
+    receipts["node_before"] = regional.node_snapshot(settings.node)
+    repoint_at = fixture.utc_now()
+    receipts["repoint"] = controller.repoint(port=PORT, restore_seconds=WINDOW_SECONDS)
+    # A few pass-through cycles must reach the control plane unchanged before
+    # arming (001's contract, required by every case).
+    passthrough_at = fixture.utc_now()
+    receipts["passthrough_status"] = controller.status(port=PORT)
+    progress = watch.ReplayProgress(
+        planned_reads=expectation.planned_reads,
+        armed=arms_a_plan,
+        proxy_endpoint=PROXY_ENDPOINT,
+    )
+    if arms_a_plan:
+        start = fixture.utc_now()
+        receipts["arm"] = controller.arm(port=PORT)
+        progress.begin(receipts["arm"], start)
+    else:
+        start = repoint_at
+        progress.begin(receipts["passthrough_status"], passthrough_at)
+    result["armed_plan"] = plan_name
+    return _observe(
+        settings,
+        regional,
+        controller,
+        expectation,
+        progress,
+        cadence=cadence,
+        start=start,
+        repoint_at=repoint_at,
+        before=before,
+        node_before=receipts["node_before"],
+        maintenance_window_end=maintenance_window_end,
+        case_dir=case_dir,
+    )
+
+
+def _observe(
+    settings: fixture.EnvLiveSettings,
+    regional: Any,
+    controller: Any,
+    expectation: expectations.Expectation,
+    progress: watch.ReplayProgress,
+    *,
+    cadence: watch.CollectorCadence,
+    start: datetime,
+    repoint_at: datetime,
+    before: dict[str, Any] | None,
+    node_before: dict[str, Any] | None,
+    maintenance_window_end: datetime,
+    case_dir: Path,
+) -> dict[str, Any]:
+    """Poll the proxy, the store and the node until the case is decided.
+
+    The deadline is the expectation's product-derived terms from ``start``
+    (arm, or the repoint for the pass-through baseline), never past the
+    proxy's replay window, the collector deadman or the maintenance window.
     """
 
-    status = receipts.get("passthrough_status") or {}
-    passthrough_clean = (status.get("status") or {}).get("armed") is False
-    stages: dict[str, list[str]] = {}
-    incident = activity.get("incident") or {}
-    workflow = activity.get("workflow")
-    incident_state = incident.get("state") if incident else None
-    stages["passthrough"] = (
-        [] if passthrough_clean else ["proxy was armed before the baseline read"]
+    window = watch.observation_window(
+        started_at=start,
+        terms=expectation.terms,
+        replay_end=(
+            start + timedelta(seconds=WINDOW_SECONDS) if progress.armed else None
+        ),
+        deadman_at=repoint_at + timedelta(seconds=WINDOW_SECONDS),
+        maintenance_end=maintenance_window_end,
     )
-    number = case_number(case_id)
-    if number == 1:
-        stages["baseline"] = _baseline_stage(preflight, activity)
-    elif number in {3, 6}:
-        stages["read_only"] = verdicts.read_only_diagnostic_errors(
-            workflow=workflow,
-            incident_state=incident_state,
-            node_isolated=bool((incident or {}).get("node_ids")),
-            task_progressed=True,
-            label=case_id,
-        )
-    elif number in {4, 7, 11}:
-        stages["review"] = verdicts.forbidden_operation_errors(workflow, label=case_id)
-        if workflow is None:
-            stages["review"].append(f"{case_id}: no workflow was observed after arming")
-    elif number in {5, 8, 9, 10}:
-        stages["observation"] = (
-            []
-            if workflow is None
-            else verdicts.forbidden_operation_errors(workflow, label=case_id)
-        )
-    return stages
-
-
-def _baseline_stage(preflight: dict[str, Any], activity: dict[str, Any]) -> list[str]:
-    statuses = ((preflight.get("store") or {}).get("collector_statuses")) or []
-    gpu_status = next(
-        (item for item in statuses if "GPU" in str(item.get("collector"))), {}
+    judge = judges.judge_for(
+        expectation,
+        repoint_at=repoint_at,
+        before=before,
+        collector_mode=cadence.metrics_mode,
+        node_before=node_before,
     )
-    return verdicts.baseline_errors(
-        per_gpu_readings={
-            str((preflight.get("target_gpu") or {}).get("gpu_uuid") or "gpu"): set(
-                (preflight.get("target_gpu") or {}).get("limits") or {}
-            )
-            | {
-                "gpu_temperature_c",
-                "power_usage_w",
-                "power_limit_w",
-                "clock_throttle_reasons",
-            }
+    state_since = start - timedelta(seconds=STATE_SKEW_SECONDS)
+    activity_since = start - timedelta(seconds=ACTIVITY_SKEW_SECONDS)
+    reads = watch.WatchReads(
+        status=lambda: controller.status(port=PORT),
+        gpu_state=lambda: fixture.gpu_records(
+            regional, settings.node, state_since, expectation.names
+        ),
+        activity=lambda: fixture.node_records(regional, settings.node, activity_since),
+        node=lambda: fixture.node_state(regional, settings.node),
+    )
+    outcome = watch.watch(
+        judge,
+        progress,
+        reads,
+        window,
+        poll_seconds=cadence.poll_seconds,
+        clock=fixture.utc_now,
+        sleep=SLEEP,
+    )
+    final = outcome.final_snapshot
+    if final is not None:
+        write_json_atomic(
+            case_dir / "observation-final.json",
+            {
+                "at": final.at.isoformat(),
+                "gpu_state": final.gpu_state,
+                "activity": final.activity,
+                "node": final.node,
+            },
+        )
+    judgement = outcome.judgement
+    return {
+        "stages": judgement.stages,
+        "inconclusive": judgement.inconclusive,
+        "observation": {
+            "outcome": judgement.outcome,
+            "cadence": cadence.evidence(),
+            "window": window.evidence(),
+            "polls": outcome.polls,
+            "ended_at": outcome.ended_at.isoformat(),
+            "read_errors": outcome.read_errors,
+            "timeline": outcome.timeline,
+            **judgement.evidence,
         },
-        unsupported={},
-        valid_sample_count=int(gpu_status.get("sample_count") or 0) or 3,
-        source_boot_id=str((preflight.get("node") or {}).get("boot_id") or ""),
-        collector_mode=str((preflight.get("store") or {}).get("agent_state") or "DCGM"),
-        new_environment_actions=[]
-        if not activity.get("incident")
-        else ["an incident appeared while the proxy was pass-through"],
-        task_progressed=True,
-    )
+    }
 
 
 def _cleanup_errors(case_id: str, receipts: dict[str, Any]) -> list[str]:

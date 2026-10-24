@@ -62,7 +62,8 @@ def finding_view(item):
             "automatic_action", "official_action", "policy_source",
             "finding_kind", "correlation_rule_id", "component_finding_ids",
             "component_metrics", "affected_gpu_uuids", "confidence",
-            "threshold_value", "reason",
+            "threshold_value", "reason", "threshold_source", "confirmation_count",
+            "workload_state", "affected_workload_ids",
         }
     }
 

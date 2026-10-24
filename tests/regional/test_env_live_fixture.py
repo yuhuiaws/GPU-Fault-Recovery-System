@@ -255,15 +255,70 @@ def test_controller_cleanup_restores_endpoint_before_stopping_proxy(
     assert controller.host.cleaned, controller.host.calls
 
 
-def test_node_activity_reads_the_store_snapshot(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_control_plane_reads_use_the_general_live_probes() -> None:
+    """The node's GPU records and NODE_HEALTH activity, not the XID snapshot.
+
+    ``store_snapshot`` is keyed on an XID event; a GPU environment finding's
+    incident is ``inc-gpu-<finding id>``, which it never returned (live
+    GF-ENV-LIVE-004 "no workflow was observed").
+    """
+
     import datetime as dt
 
-    regional = FakeRegional(device_xml=H200_XML)
-    out = fixture.node_activity(regional, "node-a", dt.datetime.now(dt.timezone.utc))
-    assert out == {
-        "agent": {"lifecycle_state": "ACTIVE"},
-        "collector_statuses": [{"collector": "GPU_METRICS", "sample_count": 5}],
-        "incident": None,
-    }
+    from scripts.e2e.regional.general_live_gpu_store import GPU_STATE_PROBE
+    from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE
+
+    calls: list[tuple[str, tuple[str, ...]]] = []
+
+    class Recording(FakeRegional):
+        def cpu_python(self, script: str, *arguments: str, **_: Any) -> Any:
+            calls.append((script, arguments))
+            return {"probe": "gpu" if script is GPU_STATE_PROBE else "activity"}
+
+        def store_snapshot(self, **_options: Any) -> dict[str, Any]:
+            raise AssertionError("the XID-keyed snapshot must not be read")
+
+    regional = Recording(device_xml=H200_XML)
+    since = dt.datetime(2031, 1, 1, tzinfo=dt.timezone.utc)
+    names = ("gpu_tlimit_c", "gpu_temperature_c")
+    assert fixture.gpu_records(regional, "node-a", since, names) == {"probe": "gpu"}
+    assert fixture.node_records(regional, "node-a", since) == {"probe": "activity"}
+    (gpu_script, gpu_args), (activity_script, activity_args) = calls
+    assert gpu_script is GPU_STATE_PROBE and activity_script is ACTIVITY_PROBE
+    assert gpu_args == (
+        "c",
+        "node-a",
+        since.isoformat(),
+        "gpu_temperature_c,gpu_tlimit_c",
+    )
+    assert activity_args[:3] == ("c", "node-a", since.isoformat())
+    assert activity_args[-1] == "GPU_METRICS"
+    # The finding view carries what the judges grade on.
+    for key in ("confirmation_count", "threshold_source", "workload_state"):
+        assert f'"{key}"' in GPU_STATE_PROBE, key
+
+
+def test_node_state_projects_one_bounded_node_read() -> None:
+    seen: list[tuple[tuple[str, ...], dict[str, Any]]] = []
+
+    class Nodes(FakeRegional):
+        def kubectl(self, plane: str, *args: str, **kwargs: Any) -> str:
+            seen.append((args, kwargs))
+            return json.dumps(
+                {
+                    "metadata": {"name": "node-a", "uid": "u", "annotations": {}},
+                    "spec": {
+                        "unschedulable": True,
+                        "taints": [
+                            {"key": "gpu-fault.io/quarantined", "effect": "NoSchedule"}
+                        ],
+                    },
+                    "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+                }
+            )
+
+    node = fixture.node_state(Nodes(device_xml=H200_XML), "node-a")
+    assert node["unschedulable"] is True
+    assert [item["key"] for item in node["taints"]] == ["gpu-fault.io/quarantined"]
+    assert seen[0][0] == ("get", "node", "node-a", "-o", "json")
+    assert seen[0][1]["timeout"] == fixture.NODE_READ_TIMEOUT_SECONDS

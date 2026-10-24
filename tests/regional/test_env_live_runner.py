@@ -1,4 +1,10 @@
-"""run_env_live plan/execute branches, driven with fakes (no cluster)."""
+"""run_env_live plan/execute branches, driven with fakes (no cluster).
+
+The execute tests run the real bounded observation against a scripted world
+(``_env_live_world``): a fake clock the poll loop's sleep advances, a proxy
+whose reads advance one per collector interval, and product records that
+appear at scripted offsets from the arm.
+"""
 
 from __future__ import annotations
 
@@ -11,19 +17,25 @@ import pytest
 from scripts.e2e.regional import env_live_fixture as fixture
 from scripts.e2e.regional import run_env_live as runner
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
+from tests.regional._env_live_world import (
+    H200_LIMITS,
+    World,
+    baseline_values,
+    h200_preflight,
+    review_chain,
+)
 
 H200_TARGET = {
     "gpu_uuid": "GPU-aaaa",
     "gpu_index": "0",
     "product": "NVIDIA H200",
     "pci_bdf": "59:00",
-    "limits": {
-        "gpu_tlimit_c": 59.0,
-        "gpu_shutdown_tlimit_c": -8.0,
-        "gpu_slowdown_tlimit_c": -2.0,
-        "gpu_max_operating_tlimit_c": 0.0,
-        "memory_max_operating_tlimit_c": 0.0,
-    },
+    "limits": dict(H200_LIMITS),
+}
+COLLECTOR_ENV = {
+    "GPU_FAULT_METRICS_INTERVAL_SECONDS": "15",
+    "GPU_FAULT_DCGM_EDGE_CONFIRMATION_SAMPLES": "3",
+    "GPU_FAULT_DCGM_HEALTH_SUMMARY_SECONDS": "300",
 }
 
 
@@ -55,31 +67,22 @@ def _settings(case_id: str, **overrides: Any) -> fixture.EnvLiveSettings:
 def _preflight(
     target: dict[str, Any] | None = H200_TARGET, errors: list[str] | None = None
 ) -> dict[str, Any]:
-    return {
-        "release_id": "rel-1",
-        "cluster_id": "gpu-eks-cluster",
-        "node": {"name": "ip-10-0-43-5", "boot_id": "boot-1"},
-        "store": {"agent_state": "ACTIVE", "collector_statuses": [], "incident": None},
-        "workloads": [],
-        "predecessor": {"valid": True, "verdict": "NOT_REQUIRED", "case_id": None},
-        "cpu_blast": {},
-        "devices": [target] if target else [],
-        "device_plans": {},
-        "target_gpu": target or {},
-        "confirmation_samples": 3,
-        "errors": errors or [],
-    }
+    return h200_preflight(
+        devices=[target] if target else [], target_gpu=target or {}, errors=errors or []
+    )
 
 
 class FakeRegional:
+    world: World
+
     def __init__(self, settings: Any) -> None:
         self.settings = settings
 
     def evidence_identity(self) -> dict[str, str]:
         return {"release_id": "rel-1", "cluster_id": "gpu-eks-cluster"}
 
-    def store_snapshot(self, **_options: Any) -> dict[str, Any]:
-        return {"incident": None, "workflow": None, "notifications": []}
+    def node_snapshot(self, node: str) -> dict[str, Any]:
+        return self.world.node_snapshot()
 
 
 class RecordingController:
@@ -88,6 +91,7 @@ class RecordingController:
     instances: list["RecordingController"] = []
     restored_endpoint: str | None = None
     after_state = "active"
+    world: World
 
     def __init__(self, regional: Any, **options: Any) -> None:
         self.options = options
@@ -99,7 +103,10 @@ class RecordingController:
 
     def preflight(self) -> dict[str, Any]:
         self.calls.append("preflight")
-        return {"metrics_unit": {"ActiveState": "active"}}
+        return {
+            "metrics_unit": {"ActiveState": "active"},
+            "collector_env": COLLECTOR_ENV,
+        }
 
     def deploy_proxy(
         self, plan_path: Path, gpu_uuid: str, **options: Any
@@ -110,15 +117,15 @@ class RecordingController:
 
     def repoint(self, **options: Any) -> dict[str, Any]:
         self.calls.append("repoint")
-        return {"proxy_endpoint": "http://127.0.0.1:9411/metrics"}
+        return self.world.repoint()
 
     def status(self, **options: Any) -> dict[str, Any]:
         self.calls.append("status")
-        return {"status": {"armed": False}}
+        return self.world.status()
 
     def arm(self, **options: Any) -> dict[str, Any]:
         self.calls.append("arm")
-        return {"armed": True}
+        return self.world.arm()
 
     def cleanup(self) -> dict[str, Any]:
         self.calls.append("cleanup")
@@ -137,13 +144,26 @@ class RecordingController:
 
 
 @pytest.fixture(autouse=True)
-def _wire(monkeypatch: pytest.MonkeyPatch) -> None:
+def world(monkeypatch: pytest.MonkeyPatch) -> World:
+    """A fresh scripted world per test, its clock starting at the real now."""
+
+    value = World(start=datetime.now(timezone.utc))
     RecordingController.instances = []
+    monkeypatch.setattr(RecordingController, "world", value, raising=False)
+    monkeypatch.setattr(FakeRegional, "world", value, raising=False)
     monkeypatch.setattr(runner, "RegionalLiveFixture", FakeRegional)
     monkeypatch.setattr(fixture, "EnvReplayController", RecordingController)
+    monkeypatch.setattr(fixture, "gpu_records", value.gpu_state)
+    monkeypatch.setattr(fixture, "node_records", value.activity)
+    monkeypatch.setattr(
+        fixture, "node_state", lambda regional, node: value.node_snapshot()
+    )
+    monkeypatch.setattr(fixture, "utc_now", value.clock)
+    monkeypatch.setattr(runner, "SLEEP", value.sleep)
     monkeypatch.setattr(
         runner, "read_only_preflight", lambda settings, case_dir: _preflight()
     )
+    return value
 
 
 def _window() -> datetime:
@@ -241,10 +261,41 @@ def test_execute_001_runs_passthrough_without_arming(tmp_path: Path) -> None:
     assert controller.calls[-1] == "cleanup"
     result = _read_case(tmp_path, "GF-ENV-LIVE-001")
     assert result["proof_scope"] == "live-telemetry-replay"
-    assert result["verdict"] in {"PASS", "FAIL"}
+    # No batch of the repointed collector reached the (scripted) store: the
+    # preflight's collector statuses are no evidence of the pass-through.
+    assert result["verdict"] == "INCONCLUSIVE", result["stages"]
+    assert any("repointed collector" in item for item in result["inconclusive"]), (
+        result["inconclusive"]
+    )
     # Live 2026-10-24: a restore that left no override was judged "collector
     # endpoint was not restored" although the unit was back on collector.env.
     assert result["stages"]["cleanup"] == [], result["stages"]["cleanup"]
+
+
+def test_execute_001_passes_on_the_repointed_collectors_batches(
+    tmp_path: Path, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    before = {
+        "latest": [
+            {"gpu": "GPU-aaaa", "name": name, "value": value}
+            for name, value in baseline_values().items()
+        ]
+    }
+    calls: list[str] = []
+
+    def records(regional: Any, node: str, since: datetime, names: Any) -> Any:
+        calls.append(since.isoformat())
+        return before if world.repoint_at is None else world.gpu_state()
+
+    monkeypatch.setattr(fixture, "gpu_records", records)
+    world.accept(15, baseline_values(), reasons=("initial-baseline",))
+    code = runner.execute_case(_settings("GF-ENV-LIVE-001"), tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-001")
+    assert code == 0 and result["verdict"] == "PASS", result["stages"]
+    observation = result["receipts"]["observation"]
+    assert observation["passthrough_reads"] >= 3
+    assert observation["fresh_batch"]["edge_filter_reasons"] == ["initial-baseline"]
+    assert observation["task"]["measured"] is False
 
 
 @pytest.mark.parametrize(
@@ -316,15 +367,74 @@ def test_replay_plans_report_no_target_uuid() -> None:
     assert out["plans"] == {} and "no target GPU UUID" in out["error"]
 
 
-def test_observe_flags_missing_workflow_for_a_review_case() -> None:
-    stages = runner.observe(
-        "GF-ENV-LIVE-004",
-        _preflight(),
-        {"passthrough_status": {"status": {"armed": False}}},
-        {"incident": None, "workflow": None},
-        datetime.now(timezone.utc),
+def test_execute_004_without_a_product_reaction_is_not_a_verdict(
+    tmp_path: Path, world: World
+) -> None:
+    # The live defect: one snapshot right after /arm. Now the runner waits the
+    # derived window, the proxy serves the plan, and with no accepted record
+    # the case is INCONCLUSIVE -- neither the old "no workflow" FAIL nor a PASS.
+    code = runner.execute_case(_settings("GF-ENV-LIVE-004"), tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-004")
+    assert code == 1 and result["verdict"] == "INCONCLUSIVE", result["stages"]
+    observation = result["receipts"]["observation"]
+    assert observation["replay"]["consumed_at"] and observation["polls"] > 10
+    assert observation["window"]["terms"]["cooldown_hold"] == 315
+    calls = RecordingController.instances[0].calls
+    assert calls.index("arm") < calls.index("cleanup") == len(calls) - 1
+    assert calls.count("status") > 3, "the proxy was polled until consumed"
+    assert world.sleeps and all(item <= 15 for item in world.sleeps)
+
+
+def test_execute_004_waits_for_the_review_chain_and_passes(
+    tmp_path: Path, world: World
+) -> None:
+    review_chain(world)
+    code = runner.execute_case(_settings("GF-ENV-LIVE-004"), tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-004")
+    assert code == 0 and result["verdict"] == "PASS", (
+        result["stages"],
+        result["inconclusive"],
     )
-    assert any("no workflow" in item for item in stages["review"]), stages
+    observation = result["receipts"]["observation"]
+    assert observation["review_workflow"] == "wf-review"
+    assert observation["hold"]["held"] is True
+    assert (
+        tmp_path / "cases" / "GF-ENV-LIVE-004" / "observation-final.json"
+    ).is_file(), "the final poll's records are kept as evidence"
+    assert RecordingController.instances[0].calls[-1] == "cleanup"
+
+
+def test_execute_004_cleanup_failure_fails_even_a_good_chain(
+    tmp_path: Path, world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    review_chain(world)
+    monkeypatch.setattr(RecordingController, "after_state", "failed")
+    runner.execute_case(_settings("GF-ENV-LIVE-004"), tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-004")
+    assert result["verdict"] == "FAIL" and result["stages"]["cleanup"]
+
+
+def test_execute_009_is_blocked_and_never_arms(tmp_path: Path) -> None:
+    code = runner.execute_case(_settings("GF-ENV-LIVE-009"), tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-009")
+    assert code == 0 and result["verdict"] == "BLOCKED"
+    assert ">60 s pause" in result["blocked_reason"]
+    assert RecordingController.instances == []
+    details = runner.plan_details(_settings("GF-ENV-LIVE-009"), _preflight())
+    assert details["verdict_if_blocked"] == "BLOCKED"
+
+
+def test_plan_details_names_the_observation_rule() -> None:
+    details = runner.plan_details(_settings("GF-ENV-LIVE-004"), _preflight())
+    observation = details["observation"]
+    assert (
+        observation["kind"] == "review" and observation["plan"] == "core_tlimit/severe"
+    )
+    assert observation["derived_seconds"] == sum(observation["terms"].values())
+    assert (
+        runner.plan_details(_settings("GF-ENV-LIVE-012"), _preflight())["observation"]
+        is None
+    )
 
 
 def _read_case(run_dir: Path, case_id: str) -> dict[str, Any]:

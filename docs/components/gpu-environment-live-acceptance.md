@@ -286,10 +286,66 @@ GF-ENV-LIVE-001..011（012 始终 NOT_RUN）。默认只计划，不动集群。
 - **判据** 由 `scripts/e2e/regional/env_live_verdicts.py` 依据控制面真实
   incident/workflow/notification/证据记录给出；工具从不输出 LIVE PASS。
 - **特殊用例**：002 复用 `GF-REGIONAL-COLLECT-002` 的受控功率与 dcgmproftester
-  负载及其 deadman 还原（本运行器对 002 记 BLOCKED 并指向该运行器）；010 需要第二个
-  多 GPU 测试节点与对照任务，未配置则 NOT_RUN；012 为真实物理/厂商实验室故障，
-  始终 NOT_RUN。
+  负载及其 deadman 还原（本运行器对 002 记 BLOCKED 并指向该运行器）；009 需要在
+  两个严重样本后受控暂停采集 >60 秒、重启 collector 与切换来源，本运行器没有这一
+  维护步骤，而不暂停就 arm 其严重 T.Limit 计划只会重复 004 的隔离/停训链且缺少分支
+  确认，因此 009 记 BLOCKED、不 arm；010 需要第二个多 GPU 测试节点与对照任务，
+  未配置则 NOT_RUN；012 为真实物理/厂商实验室故障，始终 NOT_RUN。
+
+### arm 之后的观察与判据
+
+arm 只是实验开始：正常安装的 collector 每个采集周期经代理读取一次，edge filter
+决定哪些读取被投递，控制面对投递的批次分级，节点健康路径再编排并执行工作流。
+运行器不再在 arm 后立即取一次快照判定，而是有界轮询
+（`scripts/e2e/regional/env_live_watch.py`），按用例期望判定
+（`scripts/e2e/regional/env_live_expectations.py`、
+`scripts/e2e/regional/env_live_judges.py`）：
+
+- **读取**：代理 `/status` 的 `reads`/`next_values`/`armed`/`aborted`（不消耗步骤），
+  直到计划读完；控制面已接受的 GPU_METRICS 批次（含被回放字段的样本）、各 GPU
+  最新读数、GPU finding（含 `confirmation_count` 与 `threshold_source`）；该节点的
+  NODE_HEALTH incident、工作流及其步骤执行、通知；以及 Node 对象。共享的
+  `store_snapshot` 以 XID 事件为键，看不到 `inc-gpu-<finding>` 环境 incident，
+  因此不再使用。每次读取有超时，失败只记一次轮询的读错误。
+- **截止时间**：自 arm（001 为 repoint）起，计划读数 × 节点 `collector.env` 中的
+  采集周期，加一个周期与 30 秒处理余量，再加用例项：严重确认类加旧冷却 300 秒
+  （`COOLDOWN_SECONDS`）+ 一个周期 + 30 秒派发；warning/duration 加
+  max(3 × 周期 + 30 秒保持, VALIDATE_GPU 热告警宽限 120 秒 + 30 秒)；瞬时、非 brake
+  位与不可用字段加 3 × 周期 + 30 秒保持；001 为启动错峰 15 秒 + 一个周期 + 3 个
+  透传周期 + 30 秒。上限是 arm + 代理 `max_seconds`、repoint + collector deadman
+  与维护窗口结束三者最早者减 90 秒清理余量；必需工作流仍在其自身 execution
+  deadline 内运行、或保持期未满时，等待可延长到该上限，绝不超过。清理顺序与
+  deadman 不变。
+- **判定**：计划未读完、代理因真实安全读数中止、collector 不再读代理、或没有任何
+  已接受记录证明回放值进入控制面并被分级，为 INCONCLUSIVE，绝不 PASS；值已进入但
+  预期反应缺失或错误（只读信号出现隔离/禁止步骤、GPU/节点作用域错误、规格要求的
+  工作流缺失、已确认 finding 没有 ENVIRONMENT_REVIEW 链与回执），为 FAIL；只有正向
+  证据才 PASS。清理失败仍使整项 FAIL。
+- **各用例**：
+  - 004/011 与 007 的持续/混合 mask：已接受的连续严重样本（≤60 秒间隔，011 为 1 个）
+    → CRITICAL finding（同刻度阈值来源；007 为供电检查）→ 目标 GPU/节点作用域的
+    ENVIRONMENT_REVIEW 工作流 SUCCEEDED 且 MARK_UNSCHEDULABLE、QUARANTINE、诊断包、
+    snapshot、ESCALATE_SUPPORT 回执齐全 → incident ESCALATED、通知已发送、节点
+    cordon 并带 `gpu-fault.io/quarantined` taint；确认前的 WARNING 工作流不得有隔离
+    步骤；计划读完且降温读数被接受后再保持 315 秒，节点仍隔离。
+  - 003：同刻度 WARNING finding，T.Limit 生效时没有绝对 fallback finding，只读诊断
+    工作流（FREEZE_EVIDENCE、VALIDATE_GPU）SUCCEEDED，保持期内无隔离/STOP。
+  - 005 与 007 瞬时 brake：确认计数不超过实际送出的严重样本数且从不 CRITICAL，
+    清除读数被接受（穿过 edge filter）且 finding 失效。
+  - 006：热原因位或 duration（或 THERMAL_STRESS）WARNING，只读诊断工作流完成。
+  - 007 非 brake 位：该位被接受且没有任何该字段 finding。
+  - 008：有 collection error/UNKNOWN 记录点名该字段；若已接受的批次缺该 GPU 的字段
+    却无人报告 UNKNOWN（多 GPU 时按批次字段集合判完整），判 FAIL。
+  - 001：repoint 后 collector 的 `initial-baseline` 批次带目标 GPU 的必需字段、
+    `source_boot_id` 与节点 boot 一致、静态值（功率上限、阈值）与 repoint 前相同、
+    代理至少 3 次透传读取、没有新的 GPU 环境 incident；只有 preflight 数据为
+    INCONCLUSIVE。
+- **已知局限**：非 brake 位与不可用字段不是 edge filter 的投递边沿，只有健康汇总
+  （默认 300 秒）恰好落在短计划内才会进入控制面，否则为 INCONCLUSIVE；preflight 只
+  接受无业务负载的节点，因此通常没有归属测试任务，证据中写明任务进度/挂起未测量
+  （STOP_WORKLOADS 只对 ACTIVE attempt 编排）；产品在 600 秒回放窗口内来不及完成的
+  反应记为 INCONCLUSIVE。
 
 单元测试（`tests/regional/test_env_live_*.py`、`tests/regional/test_env_replay_proxy_probe.py`）
-用替身覆盖计划、判据、运行器分支与代理控制器，不触及集群；它们是支持性逻辑覆盖，
-不把任何用例改写为 LIVE PASS。
+用替身覆盖计划、判据、运行器分支、有界观察与代理控制器，不触及集群；它们是支持性
+逻辑覆盖，不把任何用例改写为 LIVE PASS。
