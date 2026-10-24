@@ -251,9 +251,21 @@ def test_efa_harness_accepts_actual_active_hung_triage_dag(api) -> None:
     assert workflow["step_executions"] == []
 
 
+# Steps that must not attach to the training processes: both passive survey
+# passes and the bundle. The two COLLECT_HUNG_TRIAGE waves (3, 4) do capture.
+NON_CAPTURING_STEPS = {"recapture-baseline": 1, "recapture-recheck": 2, "recapture": 5}
+
+
 @pytest.mark.parametrize(
     "damage",
-    ["old-sequence", "dependency", "blocked", "foreign-node", "recapture", "executed"],
+    [
+        "old-sequence",
+        "dependency",
+        "blocked",
+        "foreign-node",
+        *NON_CAPTURING_STEPS,
+        "executed",
+    ],
 )
 def test_efa_harness_rejects_missing_triage_or_unsafe_dag_evidence(api, damage) -> None:
     workflow = deepcopy(hung_workflow(api))
@@ -265,8 +277,10 @@ def test_efa_harness_rejects_missing_triage_or_unsafe_dag_evidence(api, damage) 
         workflow["blocked_reasons"] = ["required capability not owned"]
     elif damage == "foreign-node":
         workflow["official_steps"][1]["node_ids"] = ["foreign-node"]
-    elif damage == "recapture":
-        workflow["official_steps"][4]["parameters"]["capture_process_state"] = True
+    elif damage in NON_CAPTURING_STEPS:
+        step = workflow["official_steps"][NON_CAPTURING_STEPS[damage]]
+        assert step["parameters"]["capture_process_state"] is False, step
+        step["parameters"]["capture_process_state"] = True
     else:
         workflow["step_executions"] = [{"operation": "COLLECT_HUNG_TRIAGE"}]
     with pytest.raises(AssertionError):
