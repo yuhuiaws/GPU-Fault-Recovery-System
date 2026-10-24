@@ -398,6 +398,15 @@ subreaper guard 回收整个工具子树；父进程超时可返回部分证据�
 操作（合并后的复位/重启等），仍走原失败语义。普通只读诊断（详细设计 §6.3）不变。
 （HyperPod 真机 GF-GENERAL-LIVE-011：VALIDATE_FABRIC 等满 600 s 后 FAILED，
 `ESCALATE_SUPPORT` 从未执行，没有工单也没有通知。）
+交接通知是专用的 `hung-support-handoff-zh-v1`（`notifications/hung_support.py`，category
+`OPERATOR_REVIEW`，每个 workflow 一封），不是硬件升级邮件：后者写「hardware taken out of service」、节点
+「unschedulable and quarantined」，对只读 hung 诊断都不成立。通知按各步骤自己的记录
+（`execution/hung_handoff_evidence.py`）写出：只读声明、job/attempt 与节点、每步结果与记录键、summary/triage
+文档 sha256、诊断包归档引用与 sha256、FAILED 步骤的 error 与被退役步骤依赖的失败步骤、任务端口 Fabric 结论
+（UNKNOWN 或 `PARTIAL_TASK_SCOPE` 时逐节点 `reason` 与复查 summary 的自述）以及运维下一步；缺失或畸形字段读作
+UNKNOWN/未记录，每步最多列 8 个节点、其余计数。`ESCALATE_SUPPORT` 的 details 为
+`support_disposition=READ_ONLY_HUNG_DIAGNOSTIC`、`nodes_isolated=false`、`workloads_stopped=false`、
+`fabric_verdict`，不再写 `hardware_disposition=OFFLINE_QUARANTINED`。
 NCCL 流程结束只表示取证完成/转人工，不表示训练已恢复。Fabric 验证是
 相关节点已有遥测验证，不是新启动跨节点 NCCL benchmark，也不等待 step 推进。
 新 hung 流程要求 `training_fabric_by_node` 中来自可信任务设备绑定的

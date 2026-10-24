@@ -2128,12 +2128,16 @@ PagerDuty, Slack or webhook integration (§11).
 **② Inputs and outputs**: in: notification records produced by orchestration and periodic tasks. Out: SNS publishes or SES emails; the database keeps the notification
 records and their delivery status.
 
-**③ Internal components**: `src/gpu_fault/notifications/registry.py` registers **20** notification template kinds
+**③ Internal components**: `src/gpu_fault/notifications/registry.py` registers **21** notification template kinds
 (XID investigation, SXID events, DCGM diagnostics, EFA/RDMA, NVLink7.4 mechanical parts and support, hardware upgrade and inventory,
 host resources, HyperPod advisory, warm spare, reboot guard, not-applicable notes, and so on, plus `DIAGNOSTIC_INCONCLUSIVE`, added by the control-plane review of 2026-09-08:
 template `diagnostic-inconclusive-zh-v1`, category `ADVISORY`,
-emitted when a workflow containing only forensic/diagnostic/validation steps ends FAILED, see §6.3);
+emitted when a workflow containing only forensic/diagnostic/validation steps ends FAILED, see §6.3; and `HUNG_SUPPORT_HANDOFF`: template
+`hung-support-handoff-zh-v1`, category `OPERATOR_REVIEW`, emitted by the `ESCALATE_SUPPORT` of the read-only NCCL/EFA hung diagnostic DAG
+in place of the hardware-escalation mail it used to send by mistake, see §6.3);
 `channel.py` selects the channel, `sns.py` / `ses.py` perform delivery, and `common.py` handles convergence and deduplication.
+The `HUNG_SUPPORT_HANDOFF` template and version live in `notifications/hung_support.py` rather than `common.py`: `common.py` also ships in the
+cluster executor wheel, and this notice is built and sent by the control plane alone.
 
 **④ Thread/coroutine model**: the `gpu-fault-notification-dispatcher` thread delivers asynchronously;
 `GPU_FAULT_PROCESSOR_NOTIFICATION_SHARDS=24` shards,
@@ -2198,7 +2202,7 @@ and are not resent. Previously the collection-silence scan repeated `send` on th
 incremented `dead_lettered_total` by 1 every minute. When the TTL is overridden per category, `ADVISORY` uses
 `GPU_FAULT_NOTIFICATION_TTL_SECONDS_ADVISORY`; otherwise the global TTL applies.
 
-**⑫ Unit test scope**: each of the 20 template kinds renders its required fields (including the synthesised ticket number format);
+**⑫ Unit test scope**: each of the 21 template kinds renders its required fields (including the synthesised ticket number format);
 deduplication and cooldown windows; stable shard routing; persist-only behaviour when `GPU_FAULT_NOTIFICATION_DISPATCHER_ENABLED=false` in asynchronous mode;
 retirement without delivery when the TTL expires; the loop does not crash when there are no recipients.
 
@@ -3504,6 +3508,21 @@ The exception does not apply to the read-only NCCL/EFA hung diagnostic DAG (step
 steps that need its output are retired (`PLAN_REWRITE` event `HUNG_SUPPORT_HANDOFF`), the remaining evidence and `ESCALATE_SUPPORT` still run, the
 workflow ends FAILED with that failure and the incident `ESCALATED`; a VALIDATE_FABRIC whose task port scope cannot be determined ends with an
 explicit `fabric_status=UNKNOWN` instead of waiting (`components/nccl-hung-hardening.md`).
+
+That DAG's `ESCALATE_SUPPORT` sends the `HUNG_SUPPORT_HANDOFF` notice (`hung-support-handoff-zh-v1`, category `OPERATOR_REVIEW`,
+deduplication key `<cluster>/<incident>/hung-support-handoff/<workflow>`) and no longer the hardware-escalation mail, which says "hardware
+taken out of service" and that the nodes stay unschedulable and quarantined -- untrue for a hung diagnostic. The body states that the
+diagnostic is read-only (it did not cordon, drain, quarantine, reset or reboot any node, and did not stop, suspend or restart any workload),
+the job/attempt and nodes, each evidence step's result as its own record has it (the step record key `<workflow>/<index>/<operation>`, the
+sha256 of the summary/triage documents, the diagnostic bundle archive references with their sha256; a FAILED step carries its error, a
+retired step names the failed step it needed), the task-port fabric verdict (for an UNKNOWN or partial scope each node's `reason` and its
+recheck summary's `scope_basis`/`scope_reason`/`scope_source`/process coverage) and the operator's next steps; the support case draft's
+Disposition is `READ_ONLY_HUNG_DIAGNOSTIC`. A missing or malformed field reads UNKNOWN or "not recorded", never healthy; only a
+VALIDATE_FABRIC that SUCCEEDED without a `fabric_status` of its own reads PASSED (still a telemetry check that does not prove NCCL
+recovery). The step details are `support_disposition=READ_ONLY_HUNG_DIAGNOSTIC`, `nodes_isolated=false`, `workloads_stopped=false` and
+`fabric_verdict` (`PASSED`/`UNKNOWN`/`FAILED`/`NOT RUN`/`NOT PLANNED`); `hardware_disposition=OFFLINE_QUARANTINED` is no longer written.
+The selection is exactly `hung_handoff.hung_handoff_workflow`; every other `ESCALATE_SUPPORT` (hardware escalation, XID 74, a plan that
+touched a node, the operator hand-off after a spent lifetime) is unchanged.
 
 ### 6.4 Transition-by-Transition Table
 

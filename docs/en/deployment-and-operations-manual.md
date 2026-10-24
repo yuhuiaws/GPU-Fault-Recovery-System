@@ -8626,7 +8626,13 @@ RebootInstances on the managed node group instance`, `EKS operation` and each no
 instance state the EKS adapter reads back). When a workflow containing only forensic/diagnostic/validation steps
 FAILs (the diagnostic reached no conclusion, the incident turns `RECOVERED` rather than `ESCALATED`, and the reason contains
 `diagnostic inconclusive`) it uses `diagnostic-inconclusive-zh-v1`, category `ADVISORY`,
-with deduplication key `<cluster>/<incident>/diagnostic-inconclusive/<workflow>`. The regional executor only executes actions and writes the
+with deduplication key `<cluster>/<incident>/diagnostic-inconclusive/<workflow>`. The support hand-off (`ESCALATE_SUPPORT`) of the read-only
+NCCL/EFA hung diagnostic DAG uses `hung-support-handoff-zh-v1`, category `OPERATOR_REVIEW`, subject
+`[GPU FAULT][training hung: read-only hand-off] <cluster> <job>/<attempt>: <nodes>`, deduplication key
+`<cluster>/<incident>/hung-support-handoff/<workflow>`: the body states that the diagnostic is read-only (nothing cordoned, quarantined,
+stopped, reset or rebooted), lists each evidence step's result with its record key, the diagnostic bundle archive references with their
+sha256, the task-port fabric verdict (each node's reason for an UNKNOWN or partial scope) and the operator's next steps; every other support
+escalation still uses `hardware-escalation-zh-v3`, and XID 74 `xid74-support-zh-v3`. The regional executor only executes actions and writes the
 notification ID/action result back to Aurora; notifications are always sent by the regional control-plane dispatcher, and the GPU
 cluster executor needs no SNS or SES permission.
 
