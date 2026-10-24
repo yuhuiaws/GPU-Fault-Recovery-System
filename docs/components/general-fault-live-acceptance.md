@@ -709,6 +709,7 @@ gauge 回放为 XID 32（`--approve DCGM_XID_GAUGE`）；019 `remap_failure` 的
 `observe_profile`（无 OBSERVE reset Profile）记 `CAPABILITY_ABSENT`。
 
 规格明示、注入有效但产品不足的按 `expected_outcome="FAIL"` + `product_gap` 记录，不
-掩盖：025 `one_gpu_missing`（完整性按全批 union 计算，漏查单卡）、022 `expired_xid`
-（PCIe↔XID gauge 回退无时效检查）、026 `bdf_changed`（身份只比 UUID 集）、026
-`stale_boot`（库存基线不比 source_boot_id）。
+掩盖。首批记为预期 FAIL 的四个产品缺口——025 `one_gpu_missing`（完整性按全批 union
+计算，漏查单卡）、022 `expired_xid`（PCIe↔XID gauge 回退无时效检查）、026
+`bdf_changed`（身份只比 UUID 集）、026 `stale_boot`（库存基线不比 source_boot_id）
+——已由批次 160 修复，对应变体改为预期 PASS；产品回退时这些变体判 FAIL。

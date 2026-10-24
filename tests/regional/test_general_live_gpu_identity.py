@@ -71,12 +71,13 @@ def _notification(incident_id: str) -> dict[str, Any]:
     }
 
 
-def test_registry_covers_026_with_two_expected_fails() -> None:
+def test_registry_covers_026_and_expects_every_variant_to_pass() -> None:
     from scripts.e2e.regional import general_live_registry as reg
 
     assert set(SPECS) == set(reg.coverage_rows()["GF-GENERAL-LIVE-026"])
+    # Batch 160 closed the bdf_changed and stale_boot product gaps.
     fails = {v for v, s in SPECS.items() if s.expected_outcome == "FAIL"}
-    assert fails == {"bdf_changed", "stale_boot"}, fails
+    assert fails == set(), fails
 
 
 def test_uuid_changed_is_a_read_only_identity_diagnostic(tmp_path: Path) -> None:
@@ -109,14 +110,15 @@ def test_uuid_changed_fails_on_a_reset(tmp_path: Path) -> None:
     assert out["verdict"] == "FAIL" and any("RESTART_NODE" in e for e in out["errors"])
 
 
-def test_bdf_changed_is_expected_fail_when_undiagnosed(tmp_path: Path) -> None:
-    assert "UUID set is unchanged" in SPECS["bdf_changed"].product_gap
+def test_bdf_changed_fails_when_undiagnosed(tmp_path: Path) -> None:
+    # Batch 160 diagnoses a BDF change; a product that still did not would FAIL.
+    assert not SPECS["bdf_changed"].product_gap
     cpu = gpu_cpu_python(activity=_activity([]))  # no finding -> gap present
     out = ident.bdf_changed(_ctx(tmp_path, "bdf_changed", probe=_probe(), cpu=cpu))
     assert out["verdict"] == "FAIL" and "UUIDs" in out["errors"][0]
 
 
-def test_stale_boot_is_expected_fail_when_acted_on(tmp_path: Path) -> None:
+def test_stale_boot_fails_when_acted_on(tmp_path: Path) -> None:
     inc = {
         "incident_id": "inc",
         "event_id": "snap-2-gpu_inventory_identity_changed",

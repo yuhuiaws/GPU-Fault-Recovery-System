@@ -271,15 +271,10 @@ VARIANTS = [
         CASE,
         "one_gpu_missing",
         "omit a required field from one GPU only",
-        "per-GPU completeness must flag the omission; the whole-batch check hides it (spec FAIL)",
+        "per-GPU completeness flags the omission and names the GPU and field group "
+        "(batch 160: completeness is judged per GPU; another GPU's field no longer hides it)",
         one_gpu_missing,
         max_minutes=14,
-        expected_outcome="FAIL",
-        product_gap="src/gpu_fault/collectors/gpu/dcgm.py DcgmMetricsCollector.collect_text computes "
-        "observed_fields = {sample.canonical_name for sample in samples} over ALL GPUs and passes it "
-        "to src/gpu_fault/dcgm_fields.py missing_dcgm_metric_groups, so a field present on any GPU "
-        "hides its absence on another GPU; there is no per-GPU completeness check in the metrics "
-        "ingestion path (VALIDATE_GPU checks per-GPU presence only during a workflow, not here)",
     ),
     gpu_spec(
         CASE,

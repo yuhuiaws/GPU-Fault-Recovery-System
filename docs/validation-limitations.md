@@ -1090,9 +1090,10 @@ XID/SXid source (020 `independent_fatal_event`, 024 `independent_xid`) are
 `NOT_RUN(FIXTURE_NOT_READY)` pending lane K's kernel-source replay; 024's
 thermal/power composite components reuse the GF-ENV-LIVE environment replay;
 019 `pending_unsupported` (no legacy GPU) and `observe_profile` (no OBSERVE
-reset profile) are `CAPABILITY_ABSENT`. The implemented verdicts record the
-product gaps the spec expects to FAIL rather than masking them: the whole-batch
-(not per-GPU) DCGM completeness check (025 `one_gpu_missing`), the PCIe<->XID
-gauge join with no age check (022 `expired_xid`), the UUID-set-only identity
-comparison (026 `bdf_changed`) and the inventory baseline that never compares
-the source boot id (026 `stale_boot`).
+reset profile) are `CAPABILITY_ABSENT`. The four product gaps these variants
+first recorded as expected FAIL -- the whole-batch (not per-GPU) DCGM
+completeness check (025 `one_gpu_missing`), the PCIe<->XID gauge join with no
+age check (022 `expired_xid`), the UUID-set-only identity comparison (026
+`bdf_changed`) and the inventory baseline that never compared the source boot
+id (026 `stale_boot`) -- are fixed by batch 160, so the variants now expect
+PASS; a product that regressed would FAIL them.

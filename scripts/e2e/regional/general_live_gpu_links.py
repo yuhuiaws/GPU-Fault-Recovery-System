@@ -715,15 +715,13 @@ VARIANTS = [
         CASE_022,
         "expired_xid",
         "drive PCIe rate against a stale XID 32 gauge from an earlier window",
-        "an expired XID must not join the PCIe rate into a CRITICAL DRAIN composite",
+        "an expired XID must not join the PCIe rate into a CRITICAL DRAIN composite "
+        "(batch 160: the last-XID gauge is dated by its change and must fall inside the "
+        "correlation window)",
         expired_xid,
         risk="M",
         max_minutes=22,
         approvals=("DCGM_XID_GAUGE",),
-        expected_outcome="FAIL",
-        product_gap="src/gpu_fault/gpu_composites.py pcie_xid_link_failure gauge fallback (metrics.get('xid_last_error') in {32,79}) "
-        "has no age check: a DCGM last-XID gauge that stays at 32/79 keeps re-arming the PCIE_XID_LINK_FAILURE "
-        "CRITICAL DRAIN composite on every new PCIe replay-rate breach, so an expired XID joins",
     ),
     gpu_spec(
         CASE_022,

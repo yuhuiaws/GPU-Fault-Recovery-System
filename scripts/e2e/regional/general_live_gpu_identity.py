@@ -400,13 +400,10 @@ VARIANTS = [
         CASE,
         "bdf_changed",
         "two GPU rows swap PCI bus ids (UUIDs unchanged)",
-        "a BDF change must be diagnosed; today the identity check compares UUID sets only (spec FAIL)",
+        "a BDF change is diagnosed read-only (batch 160: the identity is the UUID set plus each "
+        "UUID's PCI address)",
         bdf_changed,
         max_minutes=16,
-        expected_outcome="FAIL",
-        product_gap="src/gpu_fault/app/ingest/telemetry_context.py _identity_changed_finding returns None when the "
-        "UUID set is unchanged (before == after), so a BDF-only change produces no finding, incident "
-        "or notification -- only evidence; the spec requires diagnosing a UUID or BDF change",
     ),
     gpu_spec(
         CASE,
@@ -430,14 +427,10 @@ VARIANTS = [
         CASE,
         "stale_boot",
         "an identity change carried on an old boot id",
-        "old-boot inventory must not override the current one; today the boot id is not compared at ingest (spec FAIL)",
+        "old-boot inventory does not override the current one (batch 160: a snapshot from a boot "
+        "the node's Agent is not running keeps the baseline and is not graded)",
         stale_boot,
         max_minutes=18,
-        expected_outcome="FAIL",
-        product_gap="src/gpu_fault/app/ingest/telemetry_context.py _ingest_gpu_inventory_batch keys the baseline on "
-        "(cluster_id, node_id) and store.observe_gpu_inventory_snapshots only rejects an older-or-equal "
-        "observed_at; source_boot_id is recorded but never compared, so a snapshot from an old boot with "
-        "a fresh observed_at is accepted as the new baseline and acted on",
     ),
     gpu_spec(
         CASE,

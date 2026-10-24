@@ -102,12 +102,11 @@ def test_missing_field_fails_when_not_reported(tmp_path: Path) -> None:
     assert out["verdict"] == "FAIL", out
 
 
-def test_one_gpu_missing_is_expected_fail(tmp_path: Path) -> None:
+def test_one_gpu_missing_fails_when_the_omission_stays_hidden(tmp_path: Path) -> None:
+    # Batch 160 judges completeness per GPU, so the variant expects PASS live;
+    # a product that still hid the omission makes the runner FAIL it.
     spec = SPECS["one_gpu_missing"]
-    assert (
-        spec.expected_outcome == "FAIL"
-        and "per-GPU completeness check" in spec.product_gap
-    )
+    assert spec.expected_outcome == "PASS" and not spec.product_gap, spec
     served = audit_records({f"{G1}/pcie_replay_total": "omitted"})
     # The batch union still has pcie_replay_total (from G0), so no error fires.
     state = _state(

@@ -181,9 +181,11 @@ def test_wrong_gpu_xid_fails_if_the_composite_forms(tmp_path: Path) -> None:
     assert out["verdict"] == "FAIL" and any("different GPU" in e for e in out["errors"])
 
 
-def test_expired_xid_is_expected_fail_while_the_composite_joins(tmp_path: Path) -> None:
+def test_expired_xid_fails_while_the_composite_joins(tmp_path: Path) -> None:
+    # Batch 160 dates the gauge by its change, so the variant expects PASS live;
+    # a composite that still joined an expired XID makes the runner FAIL it.
     spec = SPECS["expired_xid"]
-    assert spec.expected_outcome == "FAIL" and "gauge fallback" in spec.product_gap
+    assert spec.expected_outcome == "PASS" and not spec.product_gap, spec
     comp = gpu_incident(
         "inc-c",
         f"b-{G1}-composite-PCIE_XID_LINK_FAILURE",
