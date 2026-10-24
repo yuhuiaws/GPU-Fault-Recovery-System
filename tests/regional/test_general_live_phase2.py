@@ -1,0 +1,165 @@
+"""Lane N1 phase-2 denominator and the 007 healthy observation.
+
+Every required variant of the host/device categories 002/005/007/010/012/015
+must be in the registry -- implemented, or NOT_RUN with a reviewed reason --
+so none silently drops out of the coverage denominator. The one read-only
+observation (007 healthy) is exercised here against scripted product records.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any
+
+import pytest
+
+from scripts.e2e.regional import general_live_devices as devices
+from scripts.e2e.regional import general_live_registry as reg
+from tests.regional._general_live_fakes import (
+    FakeProbe,
+    FakeRegional,
+    host_batch,
+    incident,
+    make_context,
+    store_script,
+)
+
+LANE_CATEGORIES = (2, 5, 7, 10, 12, 15)
+NODE = "ip-10-0-43-5.us-west-2.compute.internal"
+
+
+def test_phase_two_categories_are_exactly_lane_n1() -> None:
+    assert reg.PHASE_TWO_CATEGORIES == LANE_CATEGORIES, reg.PHASE_TWO_CATEGORIES
+    assert set(reg.PHASE_ONE_CATEGORIES).isdisjoint(reg.PHASE_TWO_CATEGORIES), (
+        "phase-2 categories must not overlap phase 1"
+    )
+
+
+def test_every_lane_variant_is_in_the_registry_denominator() -> None:
+    registry = reg.load_registry()
+    rows = reg.coverage_rows()
+    for number in LANE_CATEGORIES:
+        case = f"GF-GENERAL-LIVE-{number:03d}"
+        expected = set(rows[case])
+        present = {
+            spec.variant for spec in registry.values() if spec.case_id == case
+        }
+        assert present == expected, f"{case}: {present ^ expected}"
+
+
+def test_deferred_lane_variants_carry_a_reviewed_reason() -> None:
+    registry = reg.load_registry()
+    for spec in registry.values():
+        if spec.number not in LANE_CATEGORIES or spec.implemented:
+            continue
+        reason = spec.deferred.split(":", 1)[0]
+        assert reason in reg.NOT_RUN_REASONS, (spec.key, spec.deferred)
+        assert len(spec.deferred.split(":", 1)[1].strip()) >= 12, (
+            f"{spec.key}: a deferred reason must explain itself"
+        )
+
+
+def test_live_replay_executable_is_now_allowed_but_vendor_lab_is_not() -> None:
+    base = dict(
+        case_id="GF-GENERAL-LIVE-007",
+        variant="probe",
+        lanes=("eks",),
+        risk="L",
+        injection="i",
+        expected="e",
+        cleanup="c",
+        max_minutes=5,
+        execute=lambda ctx: {"verdict": "PASS"},
+    )
+    reg.validate_spec(reg.VariantSpec(proof_mode=reg.LIVE_REPLAY, **base))
+    with pytest.raises(reg.RegistryError, match="only native, observation and live"):
+        reg.validate_spec(reg.VariantSpec(proof_mode=reg.VENDOR_LAB, **base))
+
+
+def test_only_the_native_and_observation_variants_execute() -> None:
+    registry = reg.load_registry()
+    implemented = sorted(
+        spec.key
+        for spec in registry.values()
+        if spec.number in LANE_CATEGORIES and spec.implemented
+    )
+    assert implemented == [
+        "GF-GENERAL-LIVE-002.memory_pressure",
+        "GF-GENERAL-LIVE-002.no_swap",
+        "GF-GENERAL-LIVE-002.recovery",
+        "GF-GENERAL-LIVE-007.healthy",
+    ], implemented
+
+
+# --------------------------------------------------------------------------- #
+# 007 healthy (read-only observation)
+# --------------------------------------------------------------------------- #
+def _healthy_activity(*, failed: bool = False) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "incidents": [],
+        "workflows": [],
+        "batches": [
+            host_batch(
+                "2026-10-24T00:02:00+00:00",
+                "smart_health_failed",
+                1.0 if failed else 0.0,
+                device="/dev/nvme0",
+            )
+        ],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+        "metric_latest": [
+            {
+                "name": "smart_health_failed",
+                "device": "/dev/nvme0",
+                "value": 1.0 if failed else 0.0,
+                "observed_at": "2026-10-24T00:02:00+00:00",
+                "labels": {},
+            }
+        ],
+    }
+    if failed:
+        document["incidents"] = [
+            incident("inc-s", "smart_health_failed", device="/dev/nvme0", state="QUARANTINED")
+        ]
+        document["workflows"] = []
+    return document
+
+
+def _devices_context(case_id: str, variant: str, tmp_path: Path, document: dict[str, Any]):
+    spec = next(
+        item
+        for item in devices.VARIANTS
+        if item.case_id == case_id and item.variant == variant
+    )
+    regional = FakeRegional(cpu_python=store_script({"activity": document}))
+    probe = FakeProbe(
+        {
+            "survey": {
+                "tools": {},
+                "modules": {},
+                "backing": [],
+                "residue": {"units": [], "paused_units": {}, "paused_processes": {}},
+            }
+        }
+    )
+    return spec, make_context(
+        spec, tmp_path=tmp_path, regional=regional, probes={f"node@{NODE}": probe}
+    )
+
+
+def test_smart_healthy_passes_when_no_finding(tmp_path: Path) -> None:
+    spec, ctx = _devices_context("GF-GENERAL-LIVE-007", "healthy", tmp_path, _healthy_activity())
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+
+
+def test_smart_healthy_fails_when_a_smart_finding_exists(tmp_path: Path) -> None:
+    spec, ctx = _devices_context("GF-GENERAL-LIVE-007", "healthy", tmp_path, _healthy_activity(failed=True))
+    result = spec.execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any("smart_health_failed" in error for error in result["errors"]), (
+        result["errors"]
+    )
