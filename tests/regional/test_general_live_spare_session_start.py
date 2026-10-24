@@ -38,9 +38,11 @@ import pytest
 from gpu_fault.admin import operator_identity, warm_spare
 from scripts.e2e.regional import general_live_spares as sp
 from scripts.e2e.regional import run_general_live as runner
+from scripts.e2e.regional import warm_spare_fixture as wsf
 from scripts.e2e.regional.general_live_fixture import GeneralLiveSettings, ProbeHandle
 from scripts.e2e.regional.general_live_registry import VariantSpec
 from scripts.e2e.regional.host_probe_fixture import HostProbeFixture
+from scripts.e2e.regional.probes import warm_spare_node_probe as probe
 from scripts.e2e.regional.regional_case_contract import case_evidence_path
 from scripts.e2e.regional.regional_live_fixture import RegionalLiveFixture
 from scripts.e2e.regional.site_profile import SITE_PROFILE_ENV
@@ -425,3 +427,68 @@ def test_spare_session_node_snapshot_is_callable_not_a_shadowed_string(
     assert session.node == NODE, "the spare node name stays a plain string"
     snapshot = session.node_snapshot()
     assert snapshot["name"] == NODE and snapshot["uid"] == NODE_UID, snapshot
+
+
+def _valid_binding(case_id: str) -> dict[str, Any]:
+    """A service-window host binding complete for ``probe.binding_key``."""
+
+    return {
+        "case_id": case_id,
+        "run_id": "gl030-not-ready-a1-deadbeef",
+        "owner": "0" * 32,
+        "cluster_id": CLUSTER,
+        "node": NODE,
+        "node_uid": NODE_UID,
+        "agent_identity": NODE_UID,
+        "release_id": "rel-test",
+        "plan_sha256": "a" * 64,
+        "helper_sha256": "b" * 64,
+        "baseline_sha256": "c" * 64,
+        "host_sha256": "d" * 64,
+        "boot_id": "boot-1",
+        "service": "kubelet.service",
+        "restore_at": 1000,
+        "expires_at": 1000 + probe.RECOVERY_SECONDS,
+        "stop_delay_seconds": 15,
+    }
+
+
+def test_on_node_probe_grants_the_window_only_to_the_destr008_fixture_identity() -> (
+    None
+):
+    """The constraint the live rerun hit: the host probe honours a service
+    window only for the DESTR-008 fixture identity. This pins the harness
+    constant to the probe's literal so the two cannot drift."""
+
+    probe.binding_key(_valid_binding(sp.SERVICE_WINDOW_FIXTURE_CASE_ID))
+    with pytest.raises(
+        probe.ProbeError, match="service window is not a DESTR008 fixture"
+    ):
+        probe.binding_key(_valid_binding("GF-GENERAL-LIVE-030.not_ready"))
+
+
+def test_not_ready_opens_the_service_window_as_the_destr008_fixture(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """not_ready must stamp the window with the DESTR-008 fixture identity the
+    probe trusts -- not its own running-case key, which it did before."""
+
+    spec = SPECS["not_ready"]
+    settings, run_dir = configured(tmp_path, monkeypatch, spec)
+    cluster = SpareCluster()
+    install_fakes(monkeypatch, cluster)
+    captured: dict[str, Any] = {}
+    real_cls = wsf.WarmSpareServiceFixture
+
+    def capturing(*args: Any, **kwargs: Any) -> Any:
+        captured["case_id"] = kwargs.get("case_id")
+        return real_cls(*args, **kwargs)
+
+    monkeypatch.setattr(wsf, "WarmSpareServiceFixture", capturing)
+
+    result = run_variant(spec, settings, run_dir)
+
+    assert "object is not callable" not in (result.get("error") or "")
+    assert captured.get("case_id") == sp.SERVICE_WINDOW_FIXTURE_CASE_ID, captured
+    # The identity the fixture stamped is exactly the one the probe grants.
+    probe.binding_key(_valid_binding(captured["case_id"]))

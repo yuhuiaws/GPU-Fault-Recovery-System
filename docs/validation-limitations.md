@@ -1111,12 +1111,22 @@ receipt: the release cleanup is registered before the declaration can change the
 cluster, reads the on-disk record to decide whether anything was in fact
 declared, and the receipt records `released`/`restored` and the declared-spare
 set the node is now out of; a declare refused before any cluster change cleans
-up as "nothing declared" and leaves the node untouched.
+up as "nothing declared" and leaves the node untouched. Driving `not_ready`
+through the real host path then exposed one more layer: the on-node service
+window that stops kubelet (with an independent restart timer, exactly what
+`SPARE_KUBELET_STOP` authorises) is granted by `warm_spare_node_probe` only to
+the DESTR-008 service-window fixture identity (`case_id` `GF-REGIONAL-DESTR-008`,
+the shared fixture DESTR-008 introduced). `stop_kubelet` had stamped the window
+with its own running-case key, which the probe rejects as "service window is not
+a DESTR008 fixture"; it now opens the window under that fixture identity (the
+acceptance evidence still records the running 030 case, and `run_id` keeps this
+run's window and journals distinct from a real DESTR-008 run on the same node).
 `tests/regional/test_general_live_spare_session_start.py` drives all four
 executable 030 variants with the runner's own objects -- only the kubectl
 subprocess, `cpu_python` and the host probes are fakes, and the warm-spare node
 patches apply in memory so a spare is really declared and released -- up to the
-first host-probe mutation, and asserts the release bookkeeping.
+first host-probe mutation, asserts the release bookkeeping, and pins the window
+to the fixture identity `warm_spare_node_probe.binding_key` grants.
 
 ## GF-GENERAL-LIVE DCGM / GPU-inventory replay (phase 2)
 

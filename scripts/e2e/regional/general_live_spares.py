@@ -45,6 +45,15 @@ from scripts.e2e.regional.general_live_registry import (
 from scripts.e2e.regional.general_live_verdicts import operations, verdict
 
 CASE = "GF-GENERAL-LIVE-030"
+#: The on-node service-window helper (``warm_spare_node_probe``) honours a
+#: kubelet/agent stop with an independent restart timer only for one fixture
+#: identity -- the DESTR-008 service-window fixture. ``SPARE_KUBELET_STOP``
+#: authorises 030 to reuse exactly that mechanism ("stop kubelet ... with a
+#: host-side automatic restart timer"), so ``not_ready`` opens the window under
+#: this fixture identity, not under its own running-case key (which the probe
+#: rejects as "service window is not a DESTR008 fixture"). The acceptance
+#: evidence still records the running case; only the on-node fixture is shared.
+SERVICE_WINDOW_FIXTURE_CASE_ID = "GF-REGIONAL-DESTR-008"
 SPARE_LABEL = "gpu-fault.io/spare"
 HYPERPOD_HEALTH_LABEL = "sagemaker.amazonaws.com/node-health-status"
 RESERVATION_ANNOTATION = "gpu-fault.io/spare-reservation"
@@ -295,7 +304,10 @@ class SpareSession:
             self.warm,
             node=self.node,
             image=self.ctx.settings.host_probe_image,
-            case_id=self.ctx.spec.key,
+            # The on-node probe trusts only the DESTR-008 service-window fixture
+            # identity, not the running case; run_id keeps this run's window and
+            # journals distinct from a real DESTR-008 run on the same node.
+            case_id=SERVICE_WINDOW_FIXTURE_CASE_ID,
             run_id=self.ctx.run_id,
             state_directory=self.ctx.case_dir / "spare-service",
             node_uid=self.node_snapshot().get("uid", ""),
