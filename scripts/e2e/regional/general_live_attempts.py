@@ -42,8 +42,9 @@ class ManagedFailJob:
 
     ``mode`` is baked into the rendered command: ``exit:<code>`` exits the code
     after a short run, ``stop`` waits for a delete/suspend, ``hang`` ignores the
-    terminal signal so the cleanup window times out. Tests monkeypatch this
-    class, so only its shape matters here.
+    terminal signal so the cleanup window times out. The verdict tests
+    monkeypatch this class; test_general_live_managed_job_start.py runs its
+    start with the real fixtures.
     """
 
     def __init__(
@@ -80,6 +81,7 @@ class ManagedFailJob:
         )
         rendered.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
         self.name = name
+        self.node = ctx.settings.node
         self.attempt_id = f"{name}-a001"
         self.restart_budget = restart_budget
         self.prewarm = ImagePrewarmFixture(
@@ -103,12 +105,15 @@ class ManagedFailJob:
         )
 
     def start(self) -> dict[str, Any]:
-        self.prewarm.create([self.fixture.regional.settings.cluster_id])
+        # The node the manifest is pinned to, never the cluster id: a prewarm
+        # Pod bound to a node that does not exist never runs.
+        self.prewarm.create([self.node])
         return self.fixture.submit()
 
-    def delete(self) -> None:
-        self.fixture.delete()
-        self.prewarm.cleanup()
+    def delete(self) -> dict[str, Any]:
+        from scripts.e2e.regional.managed_workload_fixture import remove_managed_job
+
+        return remove_managed_job(self.fixture, self.prewarm)
 
 
 def _apply_mode(document: dict[str, Any], mode: str) -> None:

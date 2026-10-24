@@ -1077,6 +1077,25 @@ A failed validation also counts as judging the held fault when its
 product sets `host_diagnostic_failure` only on health contracts that forbid
 hardware escalation, and the load-average validation runs on another one.
 
+The managed test jobs of 003, 011, 027, 028 and 029 are thin wrappers over
+the image prewarm and the managed workload fixture, and the variant tests
+replace both with fakes, so the live pass was the first to start one: 003
+handed the prewarm its regional settings object instead of the node name (the
+Pod intent was journaled, then could not be serialized, and cleanup refused
+"creation outcome is unknown" for a Pod that was never sent), 028/029 handed
+it the cluster id, and 027's reporter sidecars made the Pod template
+multi-container, which `gpu-training-submit` refuses without
+`--training-container`. The wrappers now pass the target nodes and 027 names
+its `pytorch` container. The prewarm refuses a node that is not a name or not
+a node of the GPU cluster, and both fixtures serialize the request before they
+journal its intent, so a failed preparation leaves a journal that proves
+nothing was created and its cleanup reports `nothing created`; a create whose
+acknowledgement is lost still refuses.
+`tests/regional/test_general_live_managed_job_start.py` starts every
+managed-job variant with the runner's own settings, fixtures and journals --
+only the kubectl subprocess, the store read and the host probes are fakes --
+up to its first cluster mutation.
+
 ## GF-GENERAL-LIVE DCGM / GPU-inventory replay (phase 2)
 
 Phase 2 adds the DCGM-field and GPU-inventory categories (019 ECC/row remap/

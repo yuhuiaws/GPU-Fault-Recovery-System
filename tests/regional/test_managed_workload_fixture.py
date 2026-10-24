@@ -60,6 +60,8 @@ class Kubernetes:
         self.fail_delete_ack = False
         self.fail_reads = False
         self.replace_before_delete = False
+        #: The GPU cluster's nodes; an image prewarm refuses any other target.
+        self.nodes = ["node-a"]
 
     def add(self, document: dict[str, Any]) -> dict[str, Any]:
         value = copy.deepcopy(document)
@@ -101,7 +103,8 @@ class Kubernetes:
                 output = json.dumps(
                     {
                         "items": [
-                            {"metadata": {"name": "node-a"}, "status": {"images": []}}
+                            {"metadata": {"name": node}, "status": {"images": []}}
+                            for node in self.nodes
                         ]
                     }
                 )

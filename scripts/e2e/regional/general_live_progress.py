@@ -191,7 +191,8 @@ class ManagedProgressJob:
     The test application's progress is controlled by the runner, which writes
     the per-rank JSON into the shared volume with an atomic ``rank_progress``
     write from inside the trainer container -- the enabled-reporter source path.
-    Tests monkeypatch this class, so only its shape matters here.
+    The verdict tests monkeypatch this class; test_general_live_managed_job_start.py
+    runs its start with the real fixtures.
     """
 
     REPORTER_IMAGE_ENV = "GPU_FAULT_TRAINING_PROGRESS_FILE"
@@ -252,6 +253,9 @@ class ManagedProgressJob:
                 restart_budget=0,
                 expected_pods=1,
                 expected_gpu_count=gpu_count,
+                # The reporter sidecars make the template multi-container;
+                # gpu-training-submit refuses one without its training container.
+                training_container="pytorch",
             ),
             state_path=ctx.case_dir / f"{name}.ownership.json",
         )
@@ -311,9 +315,10 @@ class ManagedProgressJob:
             "kill -STOP 1 || true",
         )
 
-    def delete(self) -> None:
-        self.fixture.delete()
-        self.prewarm.cleanup()
+    def delete(self) -> dict[str, Any]:
+        from scripts.e2e.regional.managed_workload_fixture import remove_managed_job
+
+        return remove_managed_job(self.fixture, self.prewarm)
 
 
 def _install_reporter(

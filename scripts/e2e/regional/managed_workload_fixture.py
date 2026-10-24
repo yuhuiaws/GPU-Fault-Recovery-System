@@ -251,6 +251,10 @@ class ManagedWorkloadSettings:
     #: The Runtime Profile version to stamp on the workload: the target
     #: cluster's own pin on a mixed site. ``None`` leaves the site's version.
     runtime_profile_version: str | None = None
+    #: The training container of Pod templates that also run sidecars
+    #: (``gpu-training-submit --training-container``); ``None`` leaves a
+    #: single-container template's only container, as the CLI does.
+    training_container: str | None = None
 
     def __post_init__(self) -> None:
         if not self.manifest.is_file():
@@ -263,6 +267,25 @@ class ManagedWorkloadSettings:
             raise ValueError("restart budget cannot be negative")
         if self.expected_pods < 1 or self.expected_gpu_count < 1:
             raise ValueError("managed workload expectations must be positive")
+
+
+def prewarm_node_names(nodes: object) -> list[str]:
+    """The node names an image prewarm may pin Pods to, checked before any read.
+
+    A name is a non-empty string; a settings object, a list nested in the list
+    or a lone string are refused by type rather than serialized into a Pod.
+    """
+
+    if isinstance(nodes, (str, bytes)) or not isinstance(nodes, (list, tuple)):
+        raise RegionalFixtureError("image prewarm nodes must be a list of node names")
+    wrong = sorted({type(node).__name__ for node in nodes if not isinstance(node, str)})
+    if wrong:
+        raise RegionalFixtureError(
+            "image prewarm node names must be strings, not " + ", ".join(wrong)
+        )
+    if not nodes or len(set(nodes)) != len(nodes) or any(not node for node in nodes):
+        raise RegionalFixtureError("image prewarm requires a nonempty unique node set")
+    return list(nodes)
 
 
 class ImagePrewarmFixture:
@@ -352,26 +375,33 @@ class ImagePrewarmFixture:
         pull was the whole point, and the prewarm Pod's schedule/pull/exit
         cycle is the slowest step of the case when it runs on every candidate.
         Returns which nodes were skipped and which received a Pod.
+
+        Every refusal -- a node that is not a name, or not a node of the GPU
+        cluster, a Pod that cannot be serialized -- comes before the intent is
+        journaled, so a failed preparation leaves a journal that proves nothing
+        was created (live 2026-10-24: a settings object passed as the node was
+        journaled, then failed ``json.dumps``, and cleanup refused "creation
+        outcome is unknown" for a Pod that was never sent).
         """
 
+        names = prewarm_node_names(nodes)
         if self.ownership is not None:
             self.ownership.begin()
         if self.pods:
             raise RegionalFixtureError("image prewarm fixture is already created")
-        if (
-            not nodes
-            or len(set(nodes)) != len(nodes)
-            or any(not node for node in nodes)
-        ):
+        images = self.node_images()
+        foreign = [node for node in names if node not in images]
+        if foreign:
             raise RegionalFixtureError(
-                "image prewarm requires a nonempty unique node set"
+                "image prewarm nodes are not nodes of the GPU cluster: "
+                + ", ".join(foreign)
             )
-        cached = set(self.cached_nodes())
-        skipped = [node for node in nodes if node in cached]
-        pending = [node for node in nodes if node not in cached]
+        skipped = [node for node in names if images[node]]
+        pending = [node for node in names if not images[node]]
         for index, node in enumerate(pending):
             manifest = self.manifest(node, index)
             name = manifest["metadata"]["name"]
+            body = json.dumps(manifest, allow_nan=False)
             if read_resource(self.regional, "pod", name) is not None:
                 raise RegionalFixtureError("image prewarm name is already occupied")
             self.expected[name] = manifest
@@ -386,7 +416,7 @@ class ImagePrewarmFixture:
                 "-f",
                 "-",
                 *(("-o", "json") if self.ownership is not None else ()),
-                input_text=json.dumps(manifest),
+                input_text=body,
             )
             if self.ownership is not None:
                 self.created[name] = self.ownership.acknowledge(
@@ -408,19 +438,35 @@ class ImagePrewarmFixture:
         return {"skipped": skipped, "created": pending}
 
     def cached_nodes(self) -> list[str]:
+        return sorted(node for node, cached in self.node_images().items() if cached)
+
+    def node_images(self) -> dict[str, bool]:
+        """Every node of the GPU cluster, and whether it already holds the image."""
+
         value = json.loads(self.regional.kubectl("gpu", "get", "node", "-o", "json"))
         if not isinstance(value, dict) or not isinstance(value.get("items"), list):
             raise RegionalFixtureError("image prewarm node inventory is incomplete")
         digest = self.image.rsplit("@", 1)[-1]
-        return sorted(
-            item["metadata"]["name"]
-            for item in value.get("items", [])
-            if any(
+        return {
+            item["metadata"]["name"]: any(
                 str(name).rsplit("@", 1)[-1] == digest
                 for image in item.get("status", {}).get("images", [])
                 for name in image.get("names", [])
             )
-        )
+            for item in value.get("items", [])
+        }
+
+    def nothing_created(self) -> bool:
+        """This fixture's own state proves it never intended a Pod.
+
+        The journal records every intent before its create is sent, so a
+        journal without one is that proof; without a journal it is the
+        in-memory registration, which also precedes every create.
+        """
+
+        if self.ownership is not None:
+            return self.ownership.nothing_intended()
+        return not self.created
 
     def owned_pod(self, document: dict[str, Any]) -> str:
         _kind, name, uid = resource_identity(self.regional, document)
@@ -575,6 +621,17 @@ class ManagedWorkloadFixture:
     @property
     def resource(self) -> str:
         return self.kind.lower()
+
+    def nothing_created(self) -> bool:
+        """This fixture's own state proves its workload was never submitted.
+
+        The journal records the intent before the create is sent, and
+        ``submission_started`` is set before it too; either missing is proof.
+        """
+
+        if self.ownership is not None:
+            return self.ownership.nothing_intended()
+        return not self.submission_started
 
     def deletion_only(self, document: dict[str, Any]) -> bool:
         if self.ownership is not None:
@@ -919,6 +976,14 @@ class ManagedWorkloadFixture:
                     mark(child)
 
         mark(document)
+        # Serialized before the journal starts: a document that cannot be sent
+        # is a preparation failure, and its cleanup must find nothing intended.
+        try:
+            body = json.dumps(document, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise RegionalFixtureError(
+                f"rendered workload is not a JSON document: {exc}"
+            ) from None
         if self.ownership is not None:
             self.ownership.begin()
             self.ownership.intend(document)
@@ -929,7 +994,7 @@ class ManagedWorkloadFixture:
             "-f",
             "-",
             *(("-o", "json") if self.ownership is not None else ()),
-            input_text=json.dumps(document),
+            input_text=body,
             timeout=300,
         )
         if self.ownership is not None:
@@ -970,6 +1035,8 @@ class ManagedWorkloadFixture:
                 "--runtime-profile-version",
                 self.settings.runtime_profile_version,
             ]
+        if self.settings.training_container:
+            arguments += ["--training-container", self.settings.training_container]
         submission: dict[str, Any] = {}
 
         def create_only(
@@ -1226,3 +1293,28 @@ class ManagedWorkloadFixture:
                 raise RegionalFixtureError("managed workload Pod UIDs changed")
             time.sleep(5)
         return last
+
+
+NOTHING_CREATED = "nothing created"
+
+
+def remove_managed_job(
+    workload: ManagedWorkloadFixture, prewarm: ImagePrewarmFixture
+) -> dict[str, Any]:
+    """Remove one managed test job: its workload, then its image prewarm Pods.
+
+    Each part reports ``"nothing created"`` when its own state proves it never
+    sent a create -- what a failed preparation leaves, since both fixtures
+    refuse before they journal an intent -- and otherwise what its cleanup
+    did. A part that did send a create keeps the strict rule: a create without
+    its acknowledgement still refuses as "creation outcome is unknown".
+    """
+
+    workload_created = not workload.nothing_created()
+    workload.delete()
+    prewarm_created = not prewarm.nothing_created()
+    residuals = prewarm.cleanup()
+    return {
+        "workload": "removed" if workload_created else NOTHING_CREATED,
+        "prewarm": residuals if prewarm_created else NOTHING_CREATED,
+    }

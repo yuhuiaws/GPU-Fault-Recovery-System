@@ -267,6 +267,16 @@ class FixtureOwnership:
             self._save()
 
     def intend(self, document: dict[str, Any]) -> None:
+        # Only a document that can be sent is journaled. ``model_dump`` would
+        # quietly turn a dataclass into a mapping, so the journal could hold an
+        # intent no request ever carried, and cleanup would then refuse
+        # "creation outcome is unknown" for a create that was never sent.
+        try:
+            json.dumps(document, allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise RegionalFixtureError(
+                f"fixture creation is not a JSON document: {exc}"
+            ) from None
         with self.operation():
             key = (
                 str(document["kind"]).lower() + "/" + str(document["metadata"]["name"])
@@ -311,6 +321,17 @@ class FixtureOwnership:
             creation.approved = True
             self._save()
             return uid
+
+    def nothing_intended(self) -> bool:
+        """No creation was ever journaled, so nothing of this fixture can exist.
+
+        Every create is preceded by its journaled intent; a journal with none is
+        the proof a failed preparation leaves, and its cleanup has nothing to
+        adopt or delete.
+        """
+
+        with self.operation():
+            return not self.record.creations
 
     def require_acknowledged(self) -> None:
         with self.operation():

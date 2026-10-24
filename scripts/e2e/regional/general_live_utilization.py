@@ -57,7 +57,8 @@ SINGLE_NODE_MANIFEST = "single-node-warm-spare-pytorchjob.yaml"
 
 # The managed idle job is a thin wrapper over the proven ManagedWorkloadFixture
 # and ImagePrewarmFixture; tests monkeypatch ``ManagedIdleJob`` so the verdict
-# logic runs over scripted findings without a cluster.
+# logic runs over scripted findings without a cluster, and
+# test_general_live_managed_job_start.py runs its start with the real fixtures.
 class ManagedIdleJob:
     def __init__(self, ctx: VariantContext, *, name: str, gpu_count: int = 8) -> None:
         from pathlib import Path
@@ -90,6 +91,7 @@ class ManagedIdleJob:
         )
         rendered.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
         self.name = name
+        self.node = ctx.settings.node
         self.prewarm = ImagePrewarmFixture(
             ctx.regional,
             case_id=ctx.spec.key,
@@ -111,7 +113,10 @@ class ManagedIdleJob:
         )
 
     def start(self) -> dict[str, Any]:
-        self.prewarm.create([self._node()])
+        # The node the manifest is pinned to. This used to pass
+        # ``self.fixture.regional.settings`` -- the RegionalLiveSettings -- and
+        # the prewarm failed serializing it (live 2026-10-24, 003.gpu_idle).
+        self.prewarm.create([self.node])
         self.fixture.submit()
         return self.fixture.wait_running(timeout_seconds=900)
 
@@ -126,12 +131,10 @@ class ManagedIdleJob:
             "pods": pods,
         }
 
-    def cleanup(self) -> None:
-        self.fixture.delete()
-        self.prewarm.cleanup()
+    def cleanup(self) -> dict[str, Any]:
+        from scripts.e2e.regional.managed_workload_fixture import remove_managed_job
 
-    def _node(self) -> str:
-        return self.fixture.regional.settings  # type: ignore[attr-defined]
+        return remove_managed_job(self.fixture, self.prewarm)
 
 
 def _request_gpus(document: dict[str, Any], gpu_count: int) -> None:

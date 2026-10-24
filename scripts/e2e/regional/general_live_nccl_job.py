@@ -482,8 +482,9 @@ class ManagedNcclJob:
 
     ``stall`` creates the pause file in the Master Pod; ``release`` creates the
     release file in both Pods (the held ranks of each Pod watch their own);
-    ``alive`` says whether both Pods still run as started. Tests monkeypatch
-    this class, so only its shape matters to the variant tests.
+    ``alive`` says whether both Pods still run as started. The variant tests
+    monkeypatch this class; test_general_live_managed_job_start.py runs its
+    start with the real fixtures.
     """
 
     PAUSE_DIR = PAUSE_DIR
@@ -635,6 +636,7 @@ class ManagedNcclJob:
             ]
         return events
 
-    def delete(self) -> None:
-        self.fixture.delete()
-        self.prewarm.cleanup()
+    def delete(self) -> dict[str, Any]:
+        from scripts.e2e.regional.managed_workload_fixture import remove_managed_job
+
+        return remove_managed_job(self.fixture, self.prewarm)

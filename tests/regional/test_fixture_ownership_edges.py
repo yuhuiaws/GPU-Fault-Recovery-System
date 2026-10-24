@@ -645,6 +645,7 @@ def test_prewarm_validates_all_approved_and_delete_only_targets_before_deleting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, drift: str
 ) -> None:
     fixture, api, _, _ = managed_harness(tmp_path, monkeypatch)
+    api.nodes = ["node-a", "node-b"]  # both prewarm targets are cluster nodes
     path = tmp_path / "prewarm.json"
     prewarm = managed.ImagePrewarmFixture(
         fixture.regional, case_id="case", run_id="run", state_path=path
