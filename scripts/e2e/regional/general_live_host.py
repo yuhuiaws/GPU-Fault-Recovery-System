@@ -32,6 +32,7 @@ from scripts.e2e.regional.general_live_registry import (
     deferred_variant,
 )
 from scripts.e2e.regional.general_live_verdicts import (
+    DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
     chain_errors,
     finding_incidents,
@@ -129,7 +130,7 @@ def cpu_busy(ctx: VariantContext) -> dict[str, Any]:
                 validation="VALIDATE_HOST",
                 validation_must_fail=True,
                 probe_metric="cpu_usage_percent",
-                incident_states=frozenset({"ACTION_PENDING", "ESCALATED"}),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
         "hardware": hardware_errors(observed),
@@ -194,7 +195,7 @@ def load_average(ctx: VariantContext) -> dict[str, Any]:
                 validation_must_fail=True,
                 probe_metric="load1_per_cpu",
                 single=False,
-                incident_states=frozenset({"ACTION_PENDING", "ESCALATED"}),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
         "hardware": hardware_errors(detection),
@@ -353,7 +354,14 @@ def ctx_survey(ctx: VariantContext) -> dict[str, Any]:
 
 
 def _await_recovery(ctx: VariantContext, metric: str, oracle: Oracle) -> dict[str, Any]:
-    """Three fresh below-threshold samples of ``metric`` after the load stops."""
+    """Two fresh below-threshold samples of ``metric`` after the load stops.
+
+    The host collector delivers a batch only on an edge or its periodic health
+    summary (``GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS``): after the load the
+    product receives the ``recovered`` edge and then one summary per period, so
+    the wait spans two summary periods (live 2026-10-24: one summary period was
+    too short for three samples).
+    """
 
     started = utc_now()
     threshold = CPU_THRESHOLD if metric == "cpu_usage_percent" else LOAD_THRESHOLD
@@ -366,17 +374,17 @@ def _await_recovery(ctx: VariantContext, metric: str, oracle: Oracle) -> dict[st
             if isinstance(sample.get("value"), (int, float))
             and sample["value"] < threshold
         ]
-        return {"samples": fresh, "activity": current} if len(fresh) >= 3 else None
+        return {"samples": fresh, "activity": current} if len(fresh) >= 2 else None
 
     value = ctx.wait_until(
         accept,
-        timeout_seconds=ctx.host_summary + ctx.host_interval * 6,
+        timeout_seconds=ctx.host_summary * 2 + ctx.host_interval * 6,
         poll_seconds=ctx.host_interval,
         name=f"{metric}-recovery",
     )
     oracle.read()
     if value is None:
-        return {"errors": [f"{metric} did not report 3 fresh samples below threshold"]}
+        return {"errors": [f"{metric} did not report 2 fresh samples below threshold"]}
     return {"errors": [], "fresh_samples": value["samples"]}
 
 

@@ -44,6 +44,7 @@ from scripts.e2e.regional.general_live_registry import (
     deferred_variant,
 )
 from scripts.e2e.regional.general_live_verdicts import (
+    DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
     chain_errors,
     finding_incidents,
@@ -344,7 +345,7 @@ def sustained_drops(ctx: VariantContext) -> dict[str, Any]:
                 operations=("FREEZE_EVIDENCE", "VALIDATE_FABRIC"),
                 validation="VALIDATE_FABRIC",
                 validation_must_fail=True,
-                incident_states=frozenset({"ACTION_PENDING", "ESCALATED"}),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
         "hardware": hardware_errors(detection),

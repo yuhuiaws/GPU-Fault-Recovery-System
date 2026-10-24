@@ -164,6 +164,16 @@ class ChainExpectation:
     notes: list[str] = field(default_factory=list)
 
 
+#: Terminal states of an incident whose workflow only collects evidence and
+#: validates (docs/详细设计-v2.md §6.3): RECOVERED once the workflow ended --
+#: a failed validation closes it RECOVERED with reason "diagnostic
+#: inconclusive" and a DIAGNOSTIC_INCONCLUSIVE notice, never ESCALATED (that
+#: would hold the job's restart for nothing) -- or ACTION_PENDING while the
+#: workflow still runs.
+DIAGNOSTIC_ONLY_STATES = frozenset({"ACTION_PENDING", "RECOVERED"})
+DIAGNOSTIC_INCONCLUSIVE = "diagnostic inconclusive"
+
+
 def subsequence(wanted: Sequence[str], actual: Sequence[str]) -> bool:
     iterator = iter(actual)
     return all(item in iterator for item in wanted)
@@ -250,6 +260,18 @@ def chain_errors(activity: dict[str, Any], expectation: ChainExpectation) -> lis
         errors.append(
             f"{label} incident is {incident.get('state')}, expected one of "
             f"{sorted(expectation.incident_states)}"
+        )
+    elif (
+        expectation.validation_must_fail
+        and incident.get("state") == "RECOVERED"
+        and not any(
+            DIAGNOSTIC_INCONCLUSIVE in str(reason)
+            for reason in incident.get("reasons") or []
+        )
+    ):
+        errors.append(
+            f"{label} incident is RECOVERED while the fault was held, without "
+            f"the {DIAGNOSTIC_INCONCLUSIVE!r} reason"
         )
     return errors
 

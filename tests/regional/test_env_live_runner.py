@@ -86,6 +86,8 @@ class RecordingController:
     """Stands in for EnvReplayController; records the proxy lifecycle order."""
 
     instances: list["RecordingController"] = []
+    restored_endpoint: str | None = None
+    after_state = "active"
 
     def __init__(self, regional: Any, **options: Any) -> None:
         self.options = options
@@ -120,10 +122,14 @@ class RecordingController:
 
     def cleanup(self) -> dict[str, Any]:
         self.calls.append("cleanup")
+        # The live probe's shape: no endpoint override is left on the unit
+        # (None), so the collector runs with collector.env's endpoint again.
         return {
             "restore": {
-                "restored_endpoint": "http://127.0.0.1:9400/metrics",
+                "restored_endpoint": self.restored_endpoint,
                 "original_endpoint": "http://127.0.0.1:9400/metrics",
+                "after": {"ActiveState": self.after_state},
+                "dropin_removed": True,
             },
             "stop_proxy": {"ok": True},
             "probe_residuals": {"pod": False, "configmap": False},
@@ -236,6 +242,27 @@ def test_execute_001_runs_passthrough_without_arming(tmp_path: Path) -> None:
     result = _read_case(tmp_path, "GF-ENV-LIVE-001")
     assert result["proof_scope"] == "live-telemetry-replay"
     assert result["verdict"] in {"PASS", "FAIL"}
+    # Live 2026-10-24: a restore that left no override was judged "collector
+    # endpoint was not restored" although the unit was back on collector.env.
+    assert result["stages"]["cleanup"] == [], result["stages"]["cleanup"]
+
+
+@pytest.mark.parametrize(
+    ("endpoint", "state"),
+    [("http://127.0.0.1:9411/metrics", "active"), (None, "failed")],
+)
+def test_execute_001_flags_a_collector_that_did_not_come_back(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, endpoint: str | None, state: str
+) -> None:
+    monkeypatch.setattr(RecordingController, "restored_endpoint", endpoint)
+    monkeypatch.setattr(RecordingController, "after_state", state)
+    runner.execute_case(_settings("GF-ENV-LIVE-001"), tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-001")
+    assert result["verdict"] == "FAIL", result["verdict"]
+    assert any(
+        "collector endpoint was not restored" in item
+        for item in result["stages"]["cleanup"]
+    ), result["stages"]["cleanup"]
 
 
 def test_execute_004_arms_and_restores_in_order(tmp_path: Path) -> None:

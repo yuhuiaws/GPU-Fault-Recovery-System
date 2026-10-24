@@ -33,6 +33,7 @@ from scripts.e2e.regional.general_live_registry import (
     deferred_variant,
 )
 from scripts.e2e.regional.general_live_verdicts import (
+    DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
     chain_errors,
     finding_incidents,
@@ -107,7 +108,7 @@ def exporter_timeout(ctx: VariantContext) -> dict[str, Any]:
                 operations=("TRIGGER_HEALTH_SNAPSHOT", "VALIDATE_HOST"),
                 validation="VALIDATE_HOST",
                 forbidden=_hardware() | {"RUN_DCGM_DIAGNOSTIC"},
-                incident_states=frozenset({"ACTION_PENDING", "ESCALATED"}),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
         "hardware": hardware_errors(detection),

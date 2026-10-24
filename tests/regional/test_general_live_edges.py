@@ -183,8 +183,8 @@ def test_host_await_recovery_timeout(tmp_path: Path) -> None:
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
-    assert any("3 fresh samples below threshold" in e for e in result["errors"]), (
-        "any('3 fresh samples below threshold' in e for e in result['errors'])"
+    assert any("2 fresh samples below threshold" in e for e in result["errors"]), (
+        "any('2 fresh samples below threshold' in e for e in result['errors'])"
     )
 
 

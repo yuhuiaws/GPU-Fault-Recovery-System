@@ -932,3 +932,15 @@ approval not arranged this phase (watcher network isolation, control-plane
 restart). The implemented verdicts record the known product gaps the spec
 expects to FAIL (byte-only `statvfs`, the weighted-time disk await, the empty
 required-interface list) rather than masking them.
+
+The first live pass corrected three runner judgments that contradicted the
+product's documented behavior, not the product: a diagnostic-only chain
+(evidence collection plus a validation) whose validation fails while the
+fault is held ends `RECOVERED` with reason `diagnostic inconclusive`
+(detailed design §6.3), so the runners accept `ACTION_PENDING` (still running)
+or that `RECOVERED` and flag `ESCALATED` or a `RECOVERED` without the reason;
+the host collector delivers an unchanged reading only once per health summary
+(`GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS`), so a recovery wait now spans two
+summary periods for its two fresh samples; and the GPU environment runner
+treats a collector unit that carries no endpoint override after the restore as
+restored to `collector.env`'s endpoint, the state its repoint started from.
