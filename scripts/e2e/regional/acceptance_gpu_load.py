@@ -60,6 +60,10 @@ Inventory: every GPU workload the regional harness submits.
   ``xid11-single-node-job.yaml`` (DESTR-012 group D; one GPU, so the node's
   seven other GPUs stay idle -- the product grades only the GPUs an attempt
   holds, so they are not graded).
+* GPU-active, this snippet composed in at render time (no file of its own):
+  GF-GENERAL-LIVE-011's two-node NCCL stall job, rendered by
+  ``general_live_nccl_job.render_nccl_manifest`` from the Pod templates of
+  ``two-node-replace-pytorchjob.yaml`` with its own all-reduce loop.
 * Short-lived, unchanged: ``three-node-managed-pytorchjob.yaml`` and
   ``examples/hyperpod/three-node-pytorchjob.yaml`` (three DDP steps, done in
   seconds; WORKLOAD-001/002's baseline).

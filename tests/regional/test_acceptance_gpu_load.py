@@ -26,6 +26,7 @@ import yaml
 
 from scripts.e2e.regional import acceptance_gpu_load as load
 from scripts.e2e.regional import (
+    general_live_nccl_job,
     late_ownership_resources,
     notify005_checks,
     run_collector_destructive,
@@ -769,6 +770,20 @@ def test_the_renderers_keep_the_load_and_its_env(tmp_path: Path) -> None:
         TRAINING / "xid11-single-node-job.yaml", tmp_path / "single.yaml", node="a"
     )
     assert_loaded(single, 1)
+    stall = tmp_path / "gl011-stall.yaml"
+    stall.write_text(
+        yaml.safe_dump(
+            general_live_nccl_job.render_nccl_manifest(
+                documents(TRAINING / "two-node-replace-pytorchjob.yaml")[0],
+                node="a",
+                peer="b",
+                name="gl11-unit",
+                attempt_id="gl11-unit-a001",
+            )
+        ),
+        encoding="utf-8",
+    )
+    assert_loaded(stall, 2)
 
 
 def test_a_case_can_opt_out_of_the_load() -> None:
