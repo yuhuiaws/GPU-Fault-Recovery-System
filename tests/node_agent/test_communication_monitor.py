@@ -177,6 +177,82 @@ def test_live_qps_bind_task_nic_and_missing_participants_remain_unknown(tmp_path
     assert task_rdma_bindings(agent, rows, ["/training/job"])["basis"] == "UNKNOWN"
 
 
+def _qp(pid, lqpn, ifname="rdmap16s27"):
+    """One ``rdma -j resource show qp`` row (iproute2 ``res_qp_line`` keys)."""
+
+    return {
+        "ifindex": 2,
+        "ifname": ifname,
+        "port": 1,
+        "lqpn": lqpn,
+        "type": "DRIVER",
+        "state": "RTS",
+        "pid": pid,
+        "comm": "pt_nccl_proxy",
+    }
+
+
+def _thread_agent(tmp_path, resources):
+    rank = process(tmp_path / "proc", 100)
+    (rank / "stat").write_text(proc_stat(100, 0))
+    for thread in (100, 131):
+        (rank / "task" / str(thread)).mkdir(parents=True)
+    other = process(tmp_path / "proc", 900, cgroup="/other-job")
+    (other / "stat").write_text(proc_stat(900, 0))
+    (other / "task/905").mkdir(parents=True)
+    (tmp_path / "ib/rdmap16s27/ports/1").mkdir(parents=True)
+    return SimpleNamespace(
+        proc_root=tmp_path / "proc",
+        infiniband_root=tmp_path / "ib",
+        runner=lambda argv, **kwargs: CompletedProcess(
+            argv, 0, json.dumps(resources), ""
+        ),
+    )
+
+
+RANK_ROWS = [
+    {
+        "pid": 100,
+        "gpu_uuids": ["GPU-a"],
+        "process_identity": {"verified": True, "start_time_ticks": 1000},
+    }
+]
+
+
+def test_a_qp_created_by_a_rank_thread_binds_that_rank(tmp_path):
+    """The kernel names the thread that created a QP, never its process.
+
+    ``rdma resource show qp`` prints ``task_pid_vnr(res->task)`` and a user QP's
+    restrack task is ``current`` at ``ibv_create_qp`` time; NCCL runs the net
+    plugin's listen/connect -- where aws-ofi-nccl creates its per-thread
+    endpoints and libfabric's EFA QPs -- on the rank's proxy thread. Live
+    (HyperPod, GF-GENERAL-LIVE-011): every QP named a proxy TID, no rank PID
+    matched, and the hung VALIDATE_FABRIC waited for a scope that never came.
+    """
+
+    agent = _thread_agent(
+        tmp_path,
+        [
+            _qp(131, 7),
+            # A thread of another job's process on the same port is not ours.
+            _qp(905, 8),
+            {**_qp(None, 1), "type": "GSI", "comm": "[ib_core]"},
+        ],
+    )
+    result = task_rdma_bindings(agent, RANK_ROWS, ["/training/job"])
+    assert result["basis"] == "TASK_DEVICE_BINDING", result
+    assert result["rdma_ports"] == ["rdmap16s27/1"], result
+    assert result["covered_pids"] == [100] and result["coverage_complete"], result
+
+
+def test_only_a_foreign_thread_on_the_port_leaves_the_rank_unknown(tmp_path):
+    agent = _thread_agent(tmp_path, [_qp(905, 8), _qp(4242, 9)])
+    result = task_rdma_bindings(agent, RANK_ROWS, ["/training/job"])
+    assert result["basis"] == "UNKNOWN", result
+    assert result["reason"] == "TASK_RDMA_COVERAGE_INCOMPLETE", result
+    assert result["rdma_ports"] == [] and result["covered_pids"] == [], result
+
+
 def test_service_resource_envelope_requires_real_finite_limits(tmp_path):
     (tmp_path / "proc/self").mkdir(parents=True)
     (tmp_path / "proc/self/cgroup").write_text("0::/agent\n")

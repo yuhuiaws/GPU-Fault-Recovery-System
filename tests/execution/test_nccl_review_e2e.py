@@ -101,6 +101,14 @@ def test_missing_clock_bound_cannot_authorize_cross_node_targeted_capture(chain)
     assert group["time_reason"] == "MISSING_CLOCK_BOUND_OR_INVALID_WINDOW", group
 
 
+def validation_record(workflow):
+    return next(
+        item
+        for item in workflow.step_executions
+        if item.operation is Op.VALIDATE_FABRIC
+    )
+
+
 def test_management_link_is_not_a_substitute_for_task_nic_binding(chain):
     rig = chain()
     rig.fabric_scope_known = False
@@ -116,6 +124,30 @@ def test_management_link_is_not_a_substitute_for_task_nic_binding(chain):
         item["reason"] == "TASK_NIC_PORT_SCOPE_UNAVAILABLE"
         for item in validation.details["node_pending"].values()
     ), validation
+
+
+def test_rank_thread_owned_qps_bind_the_task_ports_end_to_end(chain):
+    """The summary's own QP evidence binds the scope; no binding is injected."""
+
+    rig = chain()
+    rig.fabric_scope_known = False
+    rig.qp_owner_thread = 131
+    workflow = rig.trigger()
+    rig.healthy()
+    saved = settled(rig, workflow)
+    step = next(
+        item for item in saved.official_steps if item.operation is Op.VALIDATE_FABRIC
+    )
+    assert {
+        node: (scope["basis"], scope["rdma_ports"])
+        for node, scope in step.parameters["training_fabric_by_node"].items()
+    } == {node: ("TASK_DEVICE_BINDING", ["efa0/1"]) for node in rig.nodes}, step
+    validation = validation_record(saved)
+    assert validation.details["validated_nodes"] == rig.nodes, validation
+    assert validation.details["fabric_evidence_scope"] == "SCOPED_TELEMETRY_ONLY", (
+        validation
+    )
+    assert "fabric_status" not in validation.details, validation
 
 
 @pytest.mark.parametrize(

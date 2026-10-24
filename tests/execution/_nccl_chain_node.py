@@ -222,6 +222,15 @@ class ChainNode:
                 self.rig.node_clock.sleep(0.5)
             extra = ",0x0,H100" if "clocks_throttle" in query else ""
             return CompletedProcess(argv, 0, f"{self.gpu},60,20{extra}\n", "")
+        thread = self.rig.qp_owner_thread
+        if argv[:2] == ["rdma", "-j"] and thread is not None:
+            # The rank's NCCL proxy thread created the EFA QP; the kernel
+            # reports that thread's id (see network_bindings).
+            task = self.proc / "task" / str(thread)
+            task.mkdir(exist_ok=True)
+            (task / "stat").write_text(proc_stat(thread, 0))
+            row = {"ifname": "efa0", "port": 1, "state": "RTS", "pid": thread}
+            return CompletedProcess(argv, 0, json.dumps([row]), "")
         if argv[0] == "/unit/py-spy":
             assert argv[-1] == "100", "must not attach to another workload"
             function = (

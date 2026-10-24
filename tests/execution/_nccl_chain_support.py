@@ -92,6 +92,9 @@ class NcclChain(RawHealthRig):
         self.mode = mode
         self.survey_passes = set()
         self.fabric_scope_known = True
+        # A thread id makes every node answer ``rdma -j resource show qp`` with
+        # an EFA QP owned by that thread of its rank process.
+        self.qp_owner_thread = None
         self.clock_bound_known = True
         self.lock = Lock()
         rig = self
