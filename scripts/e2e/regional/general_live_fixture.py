@@ -53,6 +53,7 @@ NODE_PROBE = PROBES / "general_live_node_probe.py"
 STORAGE_PROBE = PROBES / "general_live_storage_probe.py"
 NET_PROBE = PROBES / "general_live_net_probe.py"
 WINDOW_PROBE = PROBES / "collector_window_probe.py"
+DCGM_PROBE = PROBES / "general_live_dcgm_probe.py"
 HOST_UNIT = "gpu-fault-host-collector.service"
 #: The channels a host variant needs fresh before it starts; the node's own
 #: collector status is the product's record, not the runner's oracle.
@@ -441,13 +442,14 @@ class VariantContext:
     sleep: Callable[[float], None] = time.sleep
 
     def probe(self, name: str, *, node: str | None = None) -> ProbeHandle:
-        """The probe Pod running ``name`` (node, storage, net, window)."""
+        """The probe Pod running ``name`` (node, storage, net, window, dcgm)."""
 
         script = {
             "node": NODE_PROBE,
             "storage": STORAGE_PROBE,
             "net": NET_PROBE,
             "window": WINDOW_PROBE,
+            "dcgm": DCGM_PROBE,
         }[name]
         target = node or self.settings.node
         handle_key = f"{name}@{target}"
@@ -483,6 +485,13 @@ class VariantContext:
 
     def window(self, *arguments: str, timeout: int = 300) -> dict[str, Any]:
         return self.probe("window").execute(*arguments, timeout=timeout)
+
+    def dcgm(self, *arguments: str, timeout: int = 180) -> dict[str, Any]:
+        """The DCGM field / inventory replay controller (``--run-id`` added)."""
+
+        return self.probe("dcgm").execute(
+            *arguments, "--run-id", self.run_id, timeout=timeout
+        )
 
     def collector_env(self) -> dict[str, Any]:
         return dict(self.survey.get("collector_env") or {})
