@@ -69,7 +69,14 @@ def _gpu_batch(
 def _critical_gpu_batch(
     batch_id: str = "gpu-hot", *, node_id: str = "worker-1"
 ) -> GpuMetricBatch:
-    return _gpu_batch(batch_id, [_sample("gpu_temperature_c", 91)], node_id=node_id)
+    # A single sample is CRITICAL only at the device's absolute shutdown
+    # temperature; a breach of a configured or slowdown threshold needs three
+    # comparable observations first (gpu_environment_policy confirmation).
+    return _gpu_batch(
+        batch_id,
+        [_sample("gpu_shutdown_temperature_c", 90), _sample("gpu_temperature_c", 91)],
+        node_id=node_id,
+    )
 
 
 def _critical_host_batch(batch_id: str = "host-link-down") -> HostTelemetryBatch:
