@@ -212,6 +212,66 @@ def test_chain_errors_present_and_absent() -> None:
     ), "v.chain_errors( doc, v.ChainExpectation(metric='cpu_usage_percent', pr"
 
 
+def _held_cpu_fault(state: str, reasons: list[str]) -> dict:
+    incident = {**_incident("cpu_usage_percent", state=state), "reasons": reasons}
+    return {
+        "incidents": [incident],
+        "workflows": [
+            _wf(
+                "inc-cpu_usage_percent",
+                ["FREEZE_EVIDENCE", "VALIDATE_HOST"],
+                status="FAILED",
+                execs=[
+                    {
+                        "operation": "VALIDATE_HOST",
+                        "status": "FAILED",
+                        "details": {"host_diagnostic_failure": True},
+                    }
+                ],
+                probe="cpu_usage_percent",
+            )
+        ],
+    }
+
+
+HELD_CPU = v.ChainExpectation(
+    metric="cpu_usage_percent",
+    operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
+    validation="VALIDATE_HOST",
+    validation_must_fail=True,
+    probe_metric="cpu_usage_percent",
+    incident_states=v.DIAGNOSTIC_ONLY_STATES,
+)
+
+
+def test_a_failed_diagnostic_only_chain_closes_recovered_inconclusive() -> None:
+    # Live 2026-10-24 GF-GENERAL-LIVE-001.cpu_busy: the product closes a failed
+    # evidence/validation-only workflow RECOVERED with "diagnostic
+    # inconclusive" (detailed design 6.3); the runner expected ESCALATED.
+    doc = _held_cpu_fault(
+        "RECOVERED",
+        [
+            "CPU saturation threshold exceeded",
+            "diagnostic inconclusive: validation failed",
+        ],
+    )
+    assert v.chain_errors(doc, HELD_CPU) == []
+
+
+@pytest.mark.parametrize(
+    ("state", "reasons", "fragment"),
+    [
+        ("ESCALATED", ["diagnostic inconclusive"], "incident is ESCALATED"),
+        ("RECOVERED", ["CPU saturation threshold exceeded"], "without the"),
+    ],
+)
+def test_a_held_fault_is_never_escalated_or_silently_recovered(
+    state: str, reasons: list[str], fragment: str
+) -> None:
+    errors = v.chain_errors(_held_cpu_fault(state, reasons), HELD_CPU)
+    assert any(fragment in item for item in errors), errors
+
+
 def test_chain_errors_detects_every_shape() -> None:
     doc = {
         "incidents": [_incident("m", state="RECOVERED"), _incident("m")],

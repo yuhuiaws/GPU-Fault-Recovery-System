@@ -34,6 +34,7 @@ from scripts.e2e.regional.general_live_fixture import (
 )
 from scripts.e2e.regional.general_live_registry import NATIVE, VariantSpec
 from scripts.e2e.regional.general_live_verdicts import (
+    DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
     chain_errors,
     finding_incidents,
@@ -180,7 +181,7 @@ def gpu_idle(ctx: VariantContext) -> dict[str, Any]:
                 validation="VALIDATE_GPU",
                 forbidden=_hardware() | {"RUN_DCGM_DIAGNOSTIC"},
                 single=False,
-                incident_states=frozenset({"ACTION_PENDING", "ESCALATED"}),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
         "attribution": _attribution_errors(
@@ -227,7 +228,7 @@ def rank_cpu_idle(ctx: VariantContext) -> dict[str, Any]:
                 operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
                 validation="VALIDATE_HOST",
                 single=False,
-                incident_states=frozenset({"ACTION_PENDING", "ESCALATED"}),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
         "attribution": _attribution_errors(
@@ -292,7 +293,7 @@ def low_available_memory(ctx: VariantContext) -> dict[str, Any]:
                 validation="VALIDATE_HOST",
                 validation_must_fail=True,
                 probe_metric="memory_available_percent",
-                incident_states=frozenset({"ACTION_PENDING", "ESCALATED"}),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
         "hardware": hardware_errors(detection),
@@ -344,7 +345,7 @@ def high_page_cache(ctx: VariantContext) -> dict[str, Any]:
                 validation="VALIDATE_HOST",
                 validation_must_fail=True,
                 probe_metric="page_cache_percent",
-                incident_states=frozenset({"ACTION_PENDING", "ESCALATED"}),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
         "hardware": hardware_errors(detection),
@@ -410,7 +411,7 @@ def scratch_full(ctx: VariantContext) -> dict[str, Any]:
                 validation_must_fail=True,
                 probe_metric="local_filesystem_used_percent",
                 forbidden=_hardware() | {"QUARANTINE"},
-                incident_states=frozenset({"ACTION_PENDING", "ESCALATED"}),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
         "no_quarantine": []

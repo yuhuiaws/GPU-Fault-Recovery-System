@@ -544,9 +544,17 @@ def _cleanup_errors(case_id: str, receipts: dict[str, Any]) -> list[str]:
     cleanup = receipts.get("cleanup") or {}
     restore = cleanup.get("restore") or {}
     residuals = cleanup.get("probe_residuals") or {}
+    # ``restored_endpoint`` is the unit's endpoint override after the restore:
+    # None means no override is left, i.e. the collector runs with
+    # collector.env's own endpoint again -- the state the repoint started from
+    # (its ``before`` carries no override either). The probe refuses any other
+    # override, so only a missing original, an inactive unit or a foreign
+    # override is a failed restore.
+    endpoint = restore.get("restored_endpoint")
     return verdicts.cleanup_errors(
-        collector_endpoint_restored=bool(restore.get("restored_endpoint"))
-        and restore.get("restored_endpoint") == restore.get("original_endpoint"),
+        collector_endpoint_restored=bool(restore.get("original_endpoint"))
+        and (restore.get("after") or {}).get("ActiveState") == "active"
+        and endpoint in (None, restore.get("original_endpoint")),
         single_producer_after=True,
         fresh_batches_after=3,
         proxy_closed_after_endpoint="restore" in cleanup and "stop_proxy" in cleanup,

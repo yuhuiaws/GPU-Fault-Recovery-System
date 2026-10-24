@@ -44,6 +44,7 @@ from scripts.e2e.regional.general_live_registry import (
     deferred_variant,
 )
 from scripts.e2e.regional.general_live_verdicts import (
+    DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
     chain_errors,
     finding_incidents,
@@ -416,7 +417,7 @@ def _io_metric_variant(
                 validation="VALIDATE_HOST",
                 validation_must_fail=True,
                 probe_metric=metric,
-                incident_states=frozenset({"ACTION_PENDING", "ESCALATED"}),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
         "hardware": hardware_errors(detection),
@@ -668,9 +669,10 @@ def _await_io_recovery(
         ]
         return {"samples": fresh} if len(fresh) >= 2 else None
 
+    # The recovered edge plus one health summary (see general_live_host).
     value = ctx.wait_until(
         accept,
-        timeout_seconds=ctx.host_summary + ctx.host_interval * 6,
+        timeout_seconds=ctx.host_summary * 2 + ctx.host_interval * 6,
         poll_seconds=ctx.host_interval,
         name=f"{metric}-recovery",
     )

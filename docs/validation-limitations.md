@@ -1023,3 +1023,15 @@ needs other hardware; `observe_profile` / `permitted_isolation` need a Runtime
 Profile authority the site does not configure, AUTH-015), the 017 attribution
 variants (a managed attempt with CRI Pod logs, lane N territory), and 004
 `probe_error` (a `statvfs` error cannot be produced by a read-only file bind).
+
+The first live pass corrected three runner judgments that contradicted the
+product's documented behavior, not the product: a diagnostic-only chain
+(evidence collection plus a validation) whose validation fails while the
+fault is held ends `RECOVERED` with reason `diagnostic inconclusive`
+(detailed design §6.3), so the runners accept `ACTION_PENDING` (still running)
+or that `RECOVERED` and flag `ESCALATED` or a `RECOVERED` without the reason;
+the host collector delivers an unchanged reading only once per health summary
+(`GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS`), so a recovery wait now spans two
+summary periods for its two fresh samples; and the GPU environment runner
+treats a collector unit that carries no endpoint override after the restore as
+restored to `collector.env`'s endpoint, the state its repoint started from.
