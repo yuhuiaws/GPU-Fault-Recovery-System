@@ -1225,7 +1225,7 @@ The translation **only decodes and attributes; it makes no remediation decisions
 |---|---|---|---|
 | `/v1/collector-events/nvidia-kernel` | `/dev/kmsg` + journald | `XidEvent` (with `xid`, `pci_bdfs`, `gpu_uuid`, raw line) | FAULT (0) |
 | `/v1/collector-events/fabric-manager` | FM log + offset file | `SxidEvent` (`sxid`, `nvswitch`, `port`, `error_status`) | FAULT (0) |
-| `/v1/collector-events/gpu-inventory` | `nvidia-smi --query-gpu=index,uuid,name` | device inventory (with product) | ROUTINE (100) |
+| `/v1/collector-events/gpu-inventory` | `nvidia-smi --query-gpu=index,uuid,pci.bus_id,name` | device inventory (UUID, PCI BDF, product, with `source_boot_id`) | ROUTINE (100) |
 | `/v1/collector-events/gpu-metrics` | dcgm-exporter `127.0.0.1:9400` or `nvidia-smi` | counter samples + `edge_filter_reasons` | EDGE_FILTERED (50/100) |
 | `/v1/collector-events/host-telemetry` | `gpu-fault-collector host` (one shared `nvidia-smi` per round, 15 s timeout, 3 consecutive timed-out rounds open a 4-round circuit breaker) | host/storage/network samples + `collection_errors` + `edge_filter_reasons` (`collection-error:<contributor>`, `threshold:*`, `sustained:*`, a standalone `nvidia-smi-breaker-open` in the round that opens the breaker, since otherwise its contributor set would be identical to the timed-out round and get filtered out), `producer` | EDGE_FILTERED |
 
@@ -1346,6 +1346,28 @@ the chain absorbs is the finding that escalates while it runs.)
 **⑧ Idempotency and concurrency control**: XID/SXID events carry an `event_id`; the control plane deduplicates by `event_id`.
 The inventory and metrics channels are `latest_wins=True`, so a newer sample from the same node overwrites the older one,
 and resubmitting an old sample does not pollute the current decision.
+
+The GPU inventory baseline is kept per (cluster, node), and the Store only refuses a snapshot whose `observed_at` is not
+newer; on top of that `src/gpu_fault/app/ingest/telemetry_context.py` compares `source_boot_id` (GF-GENERAL-LIVE-026
+`stale_boot`). A snapshot from another boot than the baseline's claims the node rebooted, and it replaces the baseline
+only when it is the boot the node's Agent currently reports (an ACTIVE Agent within its heartbeat lease that reported a
+boot id -- the record the coordinator's generation fence trusts). Inventory from any other boot -- a previous boot's
+collector or outbox replay, a boot id that never existed -- is refused however fresh its timestamp: the baseline stays,
+the response returns the kept baseline, no identity is graded, and the GPU_INVENTORY channel status records one error
+(naming the snapshot's boot, the current boot and the baseline's boot), so the channel reads erroring rather than healthy.
+The inventory of a reboot the Agent has not re-registered yet is accepted once the Agent's next heartbeat reports the new
+boot. With the node's current boot unknown (no Agent record, no boot id reported, a lapsed lease, an Agent not ACTIVE)
+`observed_at` ordering alone decides, as before; so it does for a node's first baseline and for a newer snapshot of the
+baseline's own boot. Several snapshots of one node in one batch are judged in order, each against the baseline the ones
+before it leave.
+
+The identity comparison is the UUID set plus each UUID's PCI address (BDF): the same UUID on another BDF (same count
+included, `bdf_changed`) opens the CRITICAL `gpu_inventory_identity_changed` like a UUID that left or joined
+(`RUN_DIAGNOSTICS`: read-only FREEZE_EVIDENCE + VALIDATE_GPU and an operator-review notification, no reset/reboot); the
+reason carries `pci_bdf_changed=[...]` and `diagnostic_parameters.pci_bdf_changes` lists each move with its previous and
+observed BDF. Another spelling of one address (4- or 8-digit domain, hex case) is not a move, and a BDF that does not
+parse on either side is unknown, not changed. The next matching snapshot clears the signal, so a new identity after
+legitimate maintenance is reported once and becomes the baseline.
 
 **⑨ Configuration parameters**: all DCGM decision thresholds can be overridden via env; production values are in the
 `gpu-fault-control-worker-config-telemetry` ConfigMap, for example
