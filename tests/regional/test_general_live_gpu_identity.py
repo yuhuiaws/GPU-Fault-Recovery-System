@@ -112,7 +112,7 @@ def test_uuid_changed_fails_on_a_reset(tmp_path: Path) -> None:
 
 def test_bdf_changed_fails_when_undiagnosed(tmp_path: Path) -> None:
     # Batch 160 diagnoses a BDF change; a product that still did not would FAIL.
-    assert not SPECS["bdf_changed"].product_gap
+    assert not SPECS["bdf_changed"].product_gap, SPECS["bdf_changed"].product_gap
     cpu = gpu_cpu_python(activity=_activity([]))  # no finding -> gap present
     out = ident.bdf_changed(_ctx(tmp_path, "bdf_changed", probe=_probe(), cpu=cpu))
     assert out["verdict"] == "FAIL" and "UUIDs" in out["errors"][0]
