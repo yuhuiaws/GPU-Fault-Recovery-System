@@ -48,6 +48,12 @@ class HostProbeMissingResponseError(HostProbeError):
 POD_DELETE_WAIT_SECONDS = 120
 POD_FORCE_DELETE_WAIT_SECONDS = 30
 PROBE_KEY = "probe.py"
+#: Kubernetes mount-propagation modes for the ``/host`` hostPath. ``None`` is
+#: rprivate (the probe's own mounts stay inside its Pod mount namespace),
+#: ``HostToContainer`` is rslave (host mounts flow in only), ``Bidirectional``
+#: is rshared (the probe's mounts also propagate out to the host root mount
+#: namespace -- the privileged node-plugin pattern).
+MOUNT_PROPAGATION_MODES = ("None", "HostToContainer", "Bidirectional")
 
 
 @dataclass(frozen=True)
@@ -62,6 +68,15 @@ class HostProbeSettings:
     probe_script: Path
     state_directory: Path
     active_deadline_seconds: int = 1800
+    #: Mount propagation for the ``/host`` hostPath. The default ``None``
+    #: (rprivate) keeps every mount a probe makes inside its own Pod mount
+    #: namespace -- read-only probes want exactly that. A probe that creates a
+    #: *new* test mount the installed collector must read (the storage probe's
+    #: loop/dm filesystem) asks for ``Bidirectional`` so that mount propagates
+    #: to the host root mount namespace, where the systemd-managed collector it
+    #: restarts -- and the ``systemd-run`` writer units it starts -- live. See
+    #: ``MOUNT_PROPAGATION_MODES``.
+    host_root_propagation: str = "None"
 
     def __post_init__(self) -> None:
         if not self.kubeconfig.is_file():
@@ -81,6 +96,10 @@ class HostProbeSettings:
             raise ValueError("host probe script does not exist")
         if not 60 <= self.active_deadline_seconds <= 7200:
             raise ValueError("host probe active deadline is outside 60..7200 seconds")
+        if self.host_root_propagation not in MOUNT_PROPAGATION_MODES:
+            raise ValueError(
+                "host probe host-root propagation is not a Kubernetes mode"
+            )
 
 
 class HostProbeFixture:
@@ -398,6 +417,16 @@ class HostProbeFixture:
             },
             "data": {PROBE_KEY: self._script},
         }
+        host_root_mount: dict[str, Any] = {"name": "host-root", "mountPath": "/host"}
+        if self.settings.host_root_propagation != "None":
+            # Make the mounts this privileged probe creates under ``/host``
+            # propagate back to the host root mount namespace (the CSI
+            # node-plugin pattern). The storage probe's loop/dm test filesystem
+            # is otherwise confined to this Pod's own mount namespace, so the
+            # systemd-run writer units and the collector restarted by the window
+            # -- both of which run in the host root namespace -- would statvfs
+            # the parent (root) filesystem at the appended path instead.
+            host_root_mount["mountPropagation"] = self.settings.host_root_propagation
         pod = {
             "apiVersion": "v1",
             "kind": "Pod",
@@ -428,7 +457,7 @@ class HostProbeFixture:
                         "command": ["/bin/bash", "-ceu"],
                         "args": ["trap : TERM INT; sleep 7200 & wait"],
                         "volumeMounts": [
-                            {"name": "host-root", "mountPath": "/host"},
+                            host_root_mount,
                             {
                                 "name": "probe-script",
                                 "mountPath": "/probe",

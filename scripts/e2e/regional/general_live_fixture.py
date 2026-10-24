@@ -54,6 +54,13 @@ STORAGE_PROBE = PROBES / "general_live_storage_probe.py"
 NET_PROBE = PROBES / "general_live_net_probe.py"
 WINDOW_PROBE = PROBES / "collector_window_probe.py"
 DCGM_PROBE = PROBES / "general_live_dcgm_probe.py"
+#: Mount propagation for each probe's ``/host`` hostPath. Only the storage
+#: probe creates a test loop/dm filesystem that the installed host collector
+#: must statvfs and the ``systemd-run`` I/O writer must write to; both run in
+#: the host root mount namespace, so that Pod propagates its mounts out of its
+#: own namespace (``Bidirectional``). Every other probe only reads and keeps
+#: the default private propagation, so its manifest is unchanged.
+PROBE_HOST_ROOT_PROPAGATION = {"storage": "Bidirectional"}
 HOST_UNIT = "gpu-fault-host-collector.service"
 #: The channels a host variant needs fresh before it starts; the node's own
 #: collector status is the product's record, not the runner's oracle.
@@ -391,6 +398,7 @@ class ProbeHandle:
         run_id: str,
         case_dir: Path,
         deadline_seconds: int,
+        host_root_propagation: str = "None",
     ) -> None:
         self.script = script
         self.fixture = HostProbeFixture(
@@ -405,6 +413,7 @@ class ProbeHandle:
                 probe_script=script,
                 state_directory=case_dir / "host-probes",
                 active_deadline_seconds=max(600, min(7200, deadline_seconds)),
+                host_root_propagation=host_root_propagation,
             )
         )
         self.created = False
@@ -464,6 +473,7 @@ class VariantContext:
                 run_id=self.run_id,
                 case_dir=self.case_dir,
                 deadline_seconds=self.spec.max_minutes * 60 + 1200,
+                host_root_propagation=PROBE_HOST_ROOT_PROPAGATION.get(name, "None"),
             )
             self.probes[handle_key] = handle
         return handle
