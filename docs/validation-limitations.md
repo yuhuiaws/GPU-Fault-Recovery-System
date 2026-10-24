@@ -995,9 +995,17 @@ still plan-only by default and change no cluster state until an operator runs
 `--execute`; the module tests exercise only the injection/verdict logic against
 scripted product records and are not proof of a physical experiment.
 
-011 and 030 run on the HyperPod lane (011 needs `--node-b`, a two-node NCCL job
-genuinely stalled at a recoverable barrier until its EFA RX/TX pair, read from
-`/sys/class/infiniband` as the independent oracle, falls to zero; 030 declares
+011 and 030 run on the HyperPod lane (011 needs `--node-b`: a dedicated
+two-node NCCL job, rendered from the two-node replace fixture's Pod templates,
+all-reduces 1.5 MiB every 2 s, sized to 1-4 MiB/s per node from the product's
+1 MiB/s active threshold and 4x spike ratio, and on the runner's pause file one
+rank enters an extra collective while the others hold before it until a release
+file or a bounded in-Pod watchdog. The runner's own `/sys/class/infiniband`
+counter reads must show the pair at or above the active threshold before the
+stall and at or below the zero threshold for at least 600 s after it, on both
+nodes and with the job alive, or the variant is INCONCLUSIVE; the source
+fixture's own trainer moved about 74 KB per node over a whole live case, so a
+FAIL against it measured an injection that never happened; 030 declares
 one warm spare through the admin CLI under `DECLARE_WARM_SPARE` and always
 releases it). 027 enables the optional reporter only for its disposable test
 job (a Pod-local `training-progress` sidecar) and triggers a single per-cluster

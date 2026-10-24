@@ -588,15 +588,35 @@ netdev 写进安装器/管理配置的 `GPU_FAULT_REQUIRED_INTERFACES`（默认�
 DAG、027 读 `SITE_TRAINING_HEALTH` incident/决策、030 读热备分级与注解），永不
 POST 预制 finding。类别模块 `general_live_nccl`/`_progress`/`_spares`。
 
-- **011（仅 HyperPod 车道，需 `--node-b`）**：受管两节点 NCCL 任务先达 active
-  基线，再在可恢复 barrier 处让 collective 停滞、EFA 收发对落零（节点探针新增
-  `efa-traffic` 只读 `/sys/class/infiniband` hw_counters 作为独立 oracle；未落零记
-  `INCONCLUSIVE`）。60/600 秒越过后产品出 `ZERO_WARNING→HUNG_SUSPECTED`，合并同波
-  为一个工作流，编译只读诊断 DAG `FREEZE_EVIDENCE→COLLECT_HUNG_SUMMARY×2→
-  COLLECT_HUNG_TRIAGE×2→COLLECT_DIAGNOSTIC_BUNDLE→VALIDATE_FABRIC→ESCALATE_SUPPORT`
-  收尾 `ESCALATED`，全程不 cordon/停任务/reset/reboot。native 实测：`active_to_zero`、
-  `always_low`、`write_progress`、`phase_progress`、`fr_enabled`、`fr_disabled`、
-  `simultaneous_nodes`。延后留分母：规模类 `large_job`/`no_step_no_rank`/
+- **011（仅 HyperPod 车道，需 `--node-b`）**：专用受管两节点 NCCL 测试任务
+  （`scripts/e2e/regional/general_live_nccl_job.py`，由
+  `two-node-replace-pytorchjob.yaml` 的 Pod 模板渲染，
+  保留镜像、`FI_PROVIDER=efa`、`FI_EFA_USE_DEVICE_RDMA`、`FI_EFA_FORK_SAFE`、GPU duty
+  和每 Pod 8 GPU/16 `vpc.amazonaws.com/efa`，Master/Worker 分别钉到 `--fault-node`/
+  `--node-b`）每 2 秒 all-reduce 1.5 MiB fp32。流量按产品规则取每节点 1～4 MiB/s：
+  active 阈值 1 MiB/s、零阈值 1 B/s，SPIKE 为基线 4 倍且 SPIKE 不更新基线，低于
+  4 MiB/s 时首个只含部分流量的采样不会把基线压低成持续 SPIKE；两节点树/环算法约
+  1.5/2.8 MiB/s。原夹具每 2 秒只归约一个数值，整例每节点 EFA 仅约 74 KB，产品不可能
+  建立 active 基线。运行器在 Master Pod 建暂停文件后，全局 rank 0 经 heartbeat
+  all-reduce 投票，进入其他 rank 未发起的额外 collective 并阻塞；其余 rank 停在其前、
+  GPU 维持验收 duty，见到本 Pod 新的 release 文件或有界 watchdog（2700 秒，长于运行器
+  最长等待，进程组超时再加 900 秒）后加入，额外 collective 完成、训练继续。有效性
+  oracle 是节点探针 `efa-traffic`（只读 `/sys/class/infiniband` hw_counters）每 30 秒
+  对两节点收发对的读数：停滞前在 startup grace 内至少 3 个区间全部不低于 active 阈值，
+  停滞后至少 600 秒内全部不高于零阈值，且两 Pod 存活、训练程序日志确认按所需方式停滞；
+  任一不满足记 `INCONCLUSIVE`，不判 FAIL。产品须在两节点各出 `ZERO_WARNING`（不早于
+  60 秒），再出 `HUNG_SUSPECTED`（不早于 600 秒），合并同波为一个工作流，编译只读诊断
+  DAG `FREEZE_EVIDENCE→COLLECT_HUNG_SUMMARY×2→COLLECT_HUNG_TRIAGE×2→
+  COLLECT_DIAGNOSTIC_BUNDLE→VALIDATE_FABRIC→ESCALATE_SUPPORT`，每步实际执行成功，收尾
+  `ESCALATED`（`QUARANTINED` 为 FAIL），全程不 cordon/停任务/reset/reboot；释放后两节点
+  流量须恢复。native 实测：`active_to_zero`、`always_low`（只归约 heartbeat、从未达
+  1 MiB/s，再静默整个 hung 窗口，不得出 warning/hung）、`write_progress`（被停 rank 每秒
+  在 `/dev/shm` 重写 4 MiB）、`phase_progress`（各 rank 在自己的
+  `GPU_FAULT_RANK_PROGRESS_FILE` 写 `rank-progress/v1`，停滞中 step 增长、phase 每 30 秒
+  切换）、`fr_enabled`（按运维手册注入 trace buffer/pipe/dump-on-timeout，至少一个 PID
+  两次真实 dump 为 `PAIRED`）、`fr_disabled`（trace buffer 为 0，只能 `not_configured`）、
+  `simultaneous_nodes`（合并 incident 须含两节点各自的 hung 证据）。
+  延后留分母：规模类 `large_job`/`no_step_no_rank`/
   `active_window_resume`（`SCALE`，本站无 128 节点任务）、需审查测试 FR dump 响应器
   的 `fr_temporal_completion`/`fr_second_missing`/`fr_whole_group`/`few_candidates`/
   `ambiguous_candidates`/`different_process_groups`/`fr_plus_process`、需 py-spy 故障

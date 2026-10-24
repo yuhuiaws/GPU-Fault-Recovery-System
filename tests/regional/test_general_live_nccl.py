@@ -1,7 +1,16 @@
-"""GF-GENERAL-LIVE-011 EFA/NCCL-hung injector/verdict contract over fakes."""
+"""GF-GENERAL-LIVE-011 EFA/NCCL-hung injector/verdict contract over fakes.
+
+The node probes' ``efa-traffic`` counters follow the fake job: they climb at
+the job's rate while it runs and stop while it is stalled, so the runner's own
+baseline/drop oracle is exercised end to end next to the scripted product
+records (the grouped hung incident, the per-node warnings, the workflow plan
+and its step executions).
+"""
 
 from __future__ import annotations
 
+import itertools
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -9,6 +18,7 @@ import pytest
 
 from scripts.e2e.regional import general_live_nccl as nc
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+from scripts.e2e.regional.general_live_nccl_job import STALL_MAX_SECONDS
 from scripts.e2e.regional.general_live_registry import build_registry, coverage_rows
 from tests.regional._general_live_fakes import (
     FakeProbe,
@@ -25,10 +35,37 @@ CLEAN_SURVEY = {
     "collector_env": {"GPU_FAULT_HOST_INTERVAL_SECONDS": "15"},
     "tools": {},
 }
+ACTIVE_BPS = 2 * 1024 * 1024
+LOW_BPS = 60.0
+HUNG_REASON = (
+    "EFA/RDMA traffic remains at zero long enough to suspect a hung training attempt"
+)
+
+
+class Traffic:
+    """What the fake EFA counters do: the job's rate, or the stalled rate."""
+
+    def __init__(self) -> None:
+        self.active = ACTIVE_BPS
+        self.low = LOW_BPS
+        self.stalled = 0.0
+        self.resumed: float | None = None
+        self.state = "idle"
+
+    def rate(self, keep_active: bool) -> float:
+        running = self.active if keep_active else self.low
+        if self.state == "stalled":
+            return self.stalled
+        if self.state == "released":
+            return running if self.resumed is None else self.resumed
+        return running if self.state == "running" else 0.0
 
 
 class FakeNcclJob:
     instances: list["FakeNcclJob"] = []
+    traffic = Traffic()
+    alive_value = True
+    events: dict[str, list[str]] | None = None
 
     def __init__(
         self,
@@ -37,17 +74,20 @@ class FakeNcclJob:
         name: str,
         flight_recorder: bool = False,
         keep_active: bool = True,
+        stall_mode: str = "quiet",
     ) -> None:
         self.ctx = ctx
         self.name = name
         self.attempt_id = f"{name}-a001"
         self.flight_recorder = flight_recorder
         self.keep_active = keep_active
+        self.stall_mode = stall_mode
         self.stalled = False
-        self.released = False
+        self.released = 0
         FakeNcclJob.instances.append(self)
 
     def start(self) -> dict[str, Any]:
+        self.traffic.state = "running"
         return {}
 
     def identity(self) -> dict[str, Any]:
@@ -55,15 +95,36 @@ class FakeNcclJob:
             "job_id": self.name,
             "attempt_id": self.attempt_id,
             "nodes": [NODE, PEER],
+            "stall_mode": self.stall_mode,
+            "keep_active": self.keep_active,
         }
 
     def stall(self) -> dict[str, Any]:
         self.stalled = True
-        return {}
+        self.traffic.state = "stalled"
+        return {"pod": "master"}
 
     def release(self) -> dict[str, Any]:
-        self.released = True
-        return {}
+        self.released += 1
+        self.traffic.state = "released"
+        return {"released": ["master", "worker"]}
+
+    def alive(self) -> dict[str, Any]:
+        return {"alive": self.alive_value}
+
+    def trainer_events(self) -> dict[str, list[str]]:
+        if FakeNcclJob.events is not None:
+            return FakeNcclJob.events
+        mode = self.stall_mode
+        return {
+            "master": [
+                "STALL step=40 entered=extra_all_reduce watchdog_seconds=2700 rank=0",
+                f"STALL step=40 held=before_extra_all_reduce mode={mode} rank=1",
+            ],
+            "worker": [
+                f"STALL step=40 held=before_extra_all_reduce mode={mode} rank=8"
+            ],
+        }
 
     def delete(self) -> None:
         pass
@@ -72,31 +133,103 @@ class FakeNcclJob:
 @pytest.fixture(autouse=True)
 def _patch_job(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeNcclJob.instances = []
+    FakeNcclJob.traffic = Traffic()
+    FakeNcclJob.alive_value = True
+    FakeNcclJob.events = None
     monkeypatch.setattr(nc, "ManagedNcclJob", FakeNcclJob)
 
 
-def _hung_records(
-    *, state="ESCALATED", ops=nc.DIAGNOSTIC_DAG, nodes=(NODE, PEER), count=1
-):
+def efa_probe(node: str, *, survey: bool = False) -> FakeProbe:
+    """A node probe whose counter pair moves at the fake job's current rate."""
+
+    clock = itertools.count()
+    state = {"total": 10_000_000.0}
+
+    def reading(arguments: tuple[str, ...]) -> dict[str, Any]:
+        tick = next(clock)
+        job = FakeNcclJob.instances[-1] if FakeNcclJob.instances else None
+        rate = FakeNcclJob.traffic.rate(job.keep_active if job else True)
+        state["total"] += rate * 30 if tick else 0
+        return {
+            "observed_at": 1_800_000_000.0 + 30 * tick,
+            "pair_bytes_total": int(state["total"]),
+            "port_count": 16,
+            "complete_pairs": True,
+            "node": node,
+        }
+
+    script: dict[str, Any] = {"efa-traffic": reading}
+    if survey:
+        script["survey"] = CLEAN_SURVEY
+    return FakeProbe(script)
+
+
+def hung_records(
+    since: str,
+    *,
+    state: str = "ESCALATED",
+    ops: tuple[str, ...] = nc.DIAGNOSTIC_DAG,
+    failed: dict[int, str] | None = None,
+    reporters: tuple[str, ...] = (NODE, PEER),
+    count: int = 1,
+    warnings: tuple[str, ...] = (NODE, PEER),
+    warning_after: float = 300,
+    hung_after: float = 750,
+    ranks: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    started = datetime.fromisoformat(since)
     incidents = [
         {
-            "incident_id": f"inc-{i}",
-            "event_id": f"batch{i}-efa-traffic-hung_suspected",
+            "incident_id": f"inc-hung-{index}",
+            "event_id": f"host-{reporters[0]}-{1000 + index}{nc.HUNG_SUFFIX}",
             "event_type": "GPU_FAULT_GROUP",
             "state": state,
-            "attempt_id": "a",
-            "job_id": "j",
-            "node_ids": list(nodes),
+            "node_ids": [NODE, PEER],
+            "reasons": [HUNG_REASON]
+            + [f"{node}{nc.CONCURRENT}{HUNG_REASON}" for node in reporters[1:]],
             "workflow_request_id": "wf",
+            "created_at": (started + timedelta(seconds=hung_after + index)).isoformat(),
         }
-        for i in range(count)
+        for index in range(count)
+    ] + [
+        {
+            "incident_id": f"inc-warning-{node}",
+            "event_id": f"host-{node}-99{nc.WARNING_SUFFIX}",
+            "event_type": "NODE_HEALTH",
+            "state": "RECOVERED",
+            "node_ids": [node],
+            "reasons": [
+                "EFA/RDMA traffic remains at zero for an active training attempt"
+            ],
+            "workflow_request_id": f"wf-{node}",
+            "created_at": (started + timedelta(seconds=warning_after)).isoformat(),
+        }
+        for node in warnings
     ]
+    executions = []
+    for index, operation in enumerate(ops):
+        details: dict[str, Any] = {}
+        if operation == "COLLECT_HUNG_TRIAGE":
+            # Wave 1 samples the reporting node; wave 2 found nothing to add.
+            first = index == ops.index("COLLECT_HUNG_TRIAGE")
+            details = {"node_results": {NODE: {"ranks": ranks or []}} if first else {}}
+        executions.append(
+            {
+                "step_index": index,
+                "operation": operation,
+                "status": (failed or {}).get(index, "SUCCEEDED"),
+                "error": "agent unreachable" if index in (failed or {}) else None,
+                "details": details,
+                "updated_at": (started + timedelta(seconds=800 + index)).isoformat(),
+            }
+        )
     return {
         "incidents": incidents,
         "workflows": {
             "wf": {
                 "official_steps": [{"operation": op, "parameters": {}} for op in ops],
-                "step_executions": [],
+                "step_executions": executions,
+                "status": "SUCCEEDED",
             }
         },
     }
@@ -104,33 +237,57 @@ def _hung_records(
 
 def _settings(spec: Any, tmp_path: Path):
     base = make_settings(spec, node=NODE, peer=PEER)
+    tmp_path.mkdir(parents=True, exist_ok=True)
     (tmp_path / "site.yaml").write_text("site: test\n")
     return type(base)(**{**base.__dict__, "site_file": tmp_path / "site.yaml"})
 
 
-def _ctx(
-    spec: Any,
-    tmp_path: Path,
-    doc: dict[str, Any],
-    *,
-    node_moves=(0, 0),
-    peer_moves=(0, 0),
-):
-    regional = FakeRegional(cpu_python=lambda script, *a: doc)
+def _ctx(spec: Any, tmp_path: Path, *, none: bool = False, **records: Any):
+    """A context whose product records are ``hung_records`` (or none at all)."""
+
+    calls: list[tuple[str, ...]] = []
+
+    def respond(script: str, *arguments: str) -> dict[str, Any]:
+        calls.append(arguments)
+        if none:
+            return {"incidents": [], "workflows": {}}
+        return hung_records(arguments[-1], **records)
+
     ctx = make_context(
         spec,
         tmp_path=tmp_path,
-        regional=regional,
+        regional=FakeRegional(cpu_python=respond),
         probes={},
         settings=_settings(spec, tmp_path),
     )
-    node_efa = [{"pair_bytes_total": v} for v in node_moves]
-    peer_efa = [{"pair_bytes_total": v} for v in peer_moves]
-    ctx.probes[f"node@{NODE}"] = FakeProbe(
-        {"survey": CLEAN_SURVEY, "efa-traffic": node_efa}
-    )  # type: ignore[assignment]
-    ctx.probes[f"node@{PEER}"] = FakeProbe({"efa-traffic": peer_efa})  # type: ignore[assignment]
-    return ctx
+    start = datetime(2026, 10, 24, tzinfo=timezone.utc)
+    ticks = itertools.count()
+    ctx.clock = lambda: start + timedelta(seconds=15 * next(ticks))
+    ctx.probes[f"node@{NODE}"] = efa_probe(NODE, survey=True)  # type: ignore[assignment]
+    ctx.probes[f"node@{PEER}"] = efa_probe(PEER)  # type: ignore[assignment]
+    return ctx, calls
+
+
+def _run(variant: str, tmp_path: Path, **records: Any) -> dict[str, Any]:
+    ctx, _calls = _ctx(SPECS[variant], tmp_path, **records)
+    return SPECS[variant].execute(ctx)
+
+
+def _window(rates: list[float], *, start: float = 1_000.0) -> list[dict[str, Any]]:
+    total = 5_000.0
+    readings = []
+    for index in range(len(rates) + 1):
+        if index:
+            total += rates[index - 1] * 30
+        readings.append(
+            {
+                "observed_at": start + 30 * index,
+                "pair_bytes_total": int(total),
+                "port_count": 16,
+                "complete_pairs": True,
+            }
+        )
+    return readings
 
 
 # --------------------------------------------------------------------------- #
@@ -163,157 +320,312 @@ def test_registry_covers_every_011_variant() -> None:
             }, spec.variant
 
 
+def test_the_in_pod_watchdog_outlasts_the_runners_longest_wait() -> None:
+    assert nc.RUNNER_STALL_SECONDS < STALL_MAX_SECONDS, (
+        "a held rank must not release the stall while the runner still waits"
+    )
+
+
 # --------------------------------------------------------------------------- #
-# pure verdict helpers
+# the EFA counter oracle
 # --------------------------------------------------------------------------- #
-def test_dag_errors_detects_order_and_forbidden() -> None:
-    assert nc._dag_errors(_hung_records()) == []
-    assert nc._dag_errors({"incidents": [], "workflows": {}}) == [
+def test_efa_rates_drop_incomplete_reset_and_errored_intervals() -> None:
+    readings = _window([ACTIVE_BPS, ACTIVE_BPS, ACTIVE_BPS, ACTIVE_BPS])
+    assert nc.efa_rates(readings) == [pytest.approx(ACTIVE_BPS, rel=1e-6)] * 4
+    readings[1] = {**readings[1], "complete_pairs": False}
+    readings[3] = {**readings[3], "pair_bytes_total": 0}
+    readings[4] = {"error": "OSError", "error_kind": "probe"}
+    assert nc.efa_rates(readings) == [None, None, None, None]
+    assert nc.efa_rates(_window([5.0])[::-1]) == [None], "time running backwards"
+
+
+def test_an_inactive_or_too_short_baseline_is_not_an_active_one() -> None:
+    minimum = nc.MIN_ACTIVE_BPS
+    active = {NODE: _window([ACTIVE_BPS] * 4), PEER: _window([ACTIVE_BPS] * 4)}
+    assert nc.baseline_errors(active, minimum_bps=minimum) == []
+    dipped = {**active, PEER: _window([ACTIVE_BPS, 200_000, ACTIVE_BPS, ACTIVE_BPS])}
+    [error] = nc.baseline_errors(dipped, minimum_bps=minimum)
+    assert error.startswith(PEER) and "under the product's 1048576 B/s" in error
+    short = {NODE: _window([ACTIVE_BPS, ACTIVE_BPS]), PEER: active[PEER]}
+    assert nc.baseline_errors(short, minimum_bps=minimum) == [
+        f"{NODE}: 2 usable EFA interval(s), need 3"
+    ]
+    low = {NODE: _window([LOW_BPS] * 4), PEER: _window([LOW_BPS] * 4)}
+    assert nc.baseline_errors(low, minimum_bps=minimum, active=False) == []
+    [error] = nc.baseline_errors(
+        active | {PEER: low[PEER]}, minimum_bps=minimum, active=False
+    )
+    assert error.startswith(NODE) and "at or over" in error
+
+
+def test_the_drop_must_reach_zero_on_both_nodes_for_the_hung_threshold() -> None:
+    zero = {NODE: _window([0.0] * 25), PEER: _window([0.0] * 25)}
+    assert nc.drop_errors(zero, zero_bps=1) == []
+    moving = {**zero, PEER: _window([0.0] * 12 + [40.0] + [0.0] * 12)}
+    [error] = nc.drop_errors(moving, zero_bps=1)
+    assert error.startswith(PEER) and "kept moving at up to 40.0 B/s" in error
+    brief = {NODE: _window([0.0] * 10), PEER: zero[PEER]}
+    [error] = nc.drop_errors(brief, zero_bps=1)
+    assert "covers 300 s, under the 600 s hung threshold" in error
+
+
+def test_the_resume_reads_the_last_interval_against_the_floor() -> None:
+    back = {NODE: _window([0.0, ACTIVE_BPS]), PEER: _window([ACTIVE_BPS] * 2)}
+    assert nc.resume_errors(back, floor_bps=nc.MIN_ACTIVE_BPS) == []
+    [error] = nc.resume_errors(
+        {**back, PEER: _window([ACTIVE_BPS, 0.0])}, floor_bps=nc.MIN_ACTIVE_BPS
+    )
+    assert error.startswith(PEER) and "did not resume" in error
+
+
+def test_the_trainer_account_must_show_the_requested_stall() -> None:
+    good = FakeNcclJob(None, name="n", stall_mode="write").trainer_events()
+    assert nc.stall_event_errors(good, "write") == []
+    assert nc.stall_event_errors(good, "phase") == [
+        "master: no rank reports holding before it in mode phase",
+        "worker: no rank reports holding before it in mode phase",
+    ]
+    broken = {
+        **good,
+        "worker": good["worker"]
+        + [
+            "[default1]:STALL-ACTIVITY-ERROR mode=write error=OSError rank=9",
+            "[default1]:RESUMED step=40 reason=watchdog",
+        ],
+    }
+    errors = nc.stall_event_errors(broken, "write")
+    assert any("activity failed" in item for item in errors), errors
+    assert any("ended before" in item for item in errors), errors
+    assert nc.stall_event_errors({"master": []}, "quiet")[0] == (
+        "no rank reports entering the extra collective"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# the verdict over product records
+# --------------------------------------------------------------------------- #
+SINCE = "2026-10-24T00:00:00+00:00"
+STARTED = datetime.fromisoformat(SINCE)
+
+
+def test_dag_and_execution_errors_read_the_plan_and_every_step() -> None:
+    assert nc.dag_errors(hung_records(SINCE)) == []
+    assert nc.dag_errors({"incidents": [], "workflows": {}}) == [
         "no EFA hung_suspected finding reached an incident"
     ]
-    wrong = _hung_records(ops=("FREEZE_EVIDENCE", "VALIDATE_FABRIC"))
-    assert any("diagnostic DAG" in item for item in nc._dag_errors(wrong)), wrong
-    forbidden = _hung_records(ops=(*nc.DIAGNOSTIC_DAG, "STOP_WORKLOADS"))
-    assert any("forbidden" in item for item in nc._dag_errors(forbidden)), forbidden
+    wrong = hung_records(SINCE, ops=("FREEZE_EVIDENCE", "VALIDATE_FABRIC"))
+    assert any("diagnostic DAG" in item for item in nc.dag_errors(wrong)), wrong
+    forbidden = hung_records(SINCE, ops=(*nc.DIAGNOSTIC_DAG, "STOP_WORKLOADS"))
+    assert any("forbidden" in item for item in nc.dag_errors(forbidden)), forbidden
+    assert nc.execution_errors(hung_records(SINCE)) == []
+    failed = hung_records(SINCE, failed={5: "FAILED"})
+    assert nc.execution_errors(failed) == [
+        "step 5 COLLECT_DIAGNOSTIC_BUNDLE ended FAILED: agent unreachable"
+    ]
+    planned_only = hung_records(SINCE)
+    planned_only["workflows"]["wf"]["step_executions"].pop(3)
+    assert nc.execution_errors(planned_only) == [
+        "step 3 COLLECT_HUNG_TRIAGE never executed"
+    ]
 
 
-def test_escalated_and_grouped_and_coverage() -> None:
-    assert nc._escalated_errors(_hung_records(state="ESCALATED")) == []
-    assert nc._escalated_errors(_hung_records(state="ACTION_PENDING")), (
-        "a non-ESCALATED hung incident is a failure"
-    )
-    assert nc._grouped_errors(_hung_records(count=2), expect_single=True), (
+def test_escalated_grouped_and_both_nodes() -> None:
+    assert nc.escalated_errors(hung_records(SINCE)) == []
+    for state in ("ACTION_PENDING", "QUARANTINED"):
+        assert nc.escalated_errors(hung_records(SINCE, state=state)) == [
+            f"hung incident is {state}, expected ESCALATED"
+        ]
+    assert nc.grouped_errors(hung_records(SINCE, count=2), expect_single=True), (
         "two hung incidents for one stall wave must fail the merge check"
     )
-    assert nc._grouped_errors(_hung_records(count=1), expect_single=True) == []
+    assert nc.grouped_errors(hung_records(SINCE), expect_single=True) == []
+    merged = nc.hung_incident(hung_records(SINCE))
+    assert merged is not None and nc.reported_nodes(merged) == {NODE, PEER}
+    assert nc.both_nodes_errors(hung_records(SINCE), [NODE, PEER]) == []
+    alone = hung_records(SINCE, reporters=(PEER,))
+    assert nc.both_nodes_errors(alone, [NODE, PEER]) == [
+        f"no hung evidence from {[NODE]} reached the merged incident"
+    ]
 
-    class Ctx:
-        class settings:
-            node = NODE
-            peer_node = PEER
 
-    assert nc._covers_both_nodes(_hung_records(nodes=(NODE, PEER)), Ctx) is True
-    assert nc._covers_both_nodes(_hung_records(nodes=(NODE,)), Ctx) is False
+def test_timing_needs_a_warning_per_node_after_60_s_and_hung_after_600_s() -> None:
+    nodes = [NODE, PEER]
+    assert nc.timing_errors(hung_records(SINCE), STARTED, nodes) == []
+    early = hung_records(SINCE, hung_after=420)
+    assert nc.timing_errors(early, STARTED, nodes) == [
+        "HUNG_SUSPECTED 420 s after the stall, before the 600 s hung threshold"
+    ]
+    one = hung_records(SINCE, warnings=(NODE,))
+    assert nc.timing_errors(one, STARTED, nodes) == [
+        f"{PEER}: no ZERO_WARNING incident for the stall"
+    ]
+    rushed = nc.timing_errors(hung_records(SINCE, warning_after=20), STARTED, nodes)
+    assert len(rushed) == 2 and all("warning threshold" in item for item in rushed)
+    late = nc.timing_errors(hung_records(SINCE, warning_after=900), STARTED, nodes)
+    assert late == [f"{node}: ZERO_WARNING only after HUNG_SUSPECTED" for node in nodes]
 
 
-def test_fr_errors_read_triage_dump_status() -> None:
-    def triage(status):
-        return {
-            "incidents": [
-                {
-                    "event_id": "b-efa-traffic-hung_suspected",
-                    "state": "ESCALATED",
-                    "workflow_request_id": "wf",
-                }
-            ],
-            "workflows": {
-                "wf": {
-                    "official_steps": [],
-                    "step_executions": [
-                        {
-                            "operation": "COLLECT_HUNG_TRIAGE",
-                            "details": {
-                                "node_results": {
-                                    NODE: {
-                                        "data": {
-                                            "ranks": [
-                                                {"flight_recorder": {"status": status}}
-                                            ]
-                                        }
-                                    }
-                                }
-                            },
-                        }
-                    ],
-                }
-            },
-        }
+def test_fr_errors_read_the_triage_ranks() -> None:
+    def triage(*rows: dict[str, Any]) -> dict[str, Any]:
+        return hung_records(SINCE, ranks=list(rows))
 
-    assert nc._fr_errors(triage("not_configured"), expect_configured=False) == []
-    assert nc._fr_errors(triage("dumped"), expect_configured=False), (
+    paired = {
+        "flight_recorder": {"status": "dumped"},
+        "flight_recorder_series": {"status": "PAIRED"},
+    }
+    off = {"flight_recorder": {"status": "not_configured"}}
+    assert nc.fr_errors(triage(paired, paired), expect_configured=True) == []
+    assert nc.fr_errors(triage(off, off), expect_configured=False) == []
+    assert nc.fr_errors(triage(off), expect_configured=True) == [
+        "FR was configured but 1 rank(s) read not_configured",
+        "no sampled rank got two real FR dumps (statuses ['not_configured'], series ['None'])",
+    ]
+    single = {
+        "flight_recorder": {"status": "dumped"},
+        "flight_recorder_series": {"status": "SECOND_UNAVAILABLE"},
+    }
+    assert nc.fr_errors(triage(single), expect_configured=True), "one dump is not two"
+    assert nc.fr_errors(triage(paired), expect_configured=False), (
         "a dump with FR off must be flagged"
     )
-    assert nc._fr_errors(triage("not_configured"), expect_configured=True), (
-        "FR configured but not_configured must be flagged"
-    )
-    assert nc._fr_errors(triage("dumped"), expect_configured=True) == []
+    assert nc.fr_errors(triage(), expect_configured=False) == [
+        "COLLECT_HUNG_TRIAGE sampled no rank process"
+    ]
 
 
 # --------------------------------------------------------------------------- #
 # execute paths
 # --------------------------------------------------------------------------- #
-def test_active_to_zero_passes(tmp_path: Path) -> None:
-    result = SPECS["active_to_zero"].execute(
-        _ctx(SPECS["active_to_zero"], tmp_path, _hung_records())
-    )
+def test_active_to_zero_passes_after_an_active_baseline_and_a_real_drop(
+    tmp_path: Path,
+) -> None:
+    ctx, calls = _ctx(SPECS["active_to_zero"], tmp_path)
+    result = SPECS["active_to_zero"].execute(ctx)
+
     assert result["verdict"] == "PASS", result["errors"]
-    assert FakeNcclJob.instances[-1].stalled, "the job must have been stalled"
+    job = FakeNcclJob.instances[-1]
+    assert job.stalled and job.released == 1, "stalled, then released once"
+    assert ctx.cleanup.pending() == ["job-" + job.name], "the release is done"
+    assert set(result["stages"]) == {
+        "chain",
+        "executed",
+        "escalated",
+        "timing",
+        "merged",
+        "resumed",
+    }
+    assert calls[-1][1] == f"{NODE},{PEER}", "both attempt nodes are read"
+    baseline = ctx.evidence.case_dir / "a2z-active-efa.json"
+    assert baseline.is_file() and (ctx.evidence.case_dir / "oracle.jsonl").is_file()
 
 
-def test_active_to_zero_inconclusive_if_traffic_keeps_moving(tmp_path: Path) -> None:
-    ctx = _ctx(
-        SPECS["active_to_zero"],
-        tmp_path,
-        _hung_records(),
-        node_moves=(0, 5_000_000_000),
-        peer_moves=(0, 0),
-    )
-    with pytest.raises(VariantInconclusive):
+def test_no_active_baseline_is_inconclusive_and_never_stalls(tmp_path: Path) -> None:
+    FakeNcclJob.traffic.active = 100_000.0
+    ctx, _calls = _ctx(SPECS["active_to_zero"], tmp_path)
+    with pytest.raises(VariantInconclusive, match="no active EFA baseline"):
+        SPECS["active_to_zero"].execute(ctx)
+    assert not FakeNcclJob.instances[-1].stalled, "no stall without a baseline"
+
+
+def test_traffic_that_keeps_moving_through_the_stall_is_inconclusive(
+    tmp_path: Path,
+) -> None:
+    FakeNcclJob.traffic.stalled = 500.0
+    ctx, calls = _ctx(SPECS["active_to_zero"], tmp_path)
+    with pytest.raises(VariantInconclusive, match="kept moving"):
+        SPECS["active_to_zero"].execute(ctx)
+    assert calls == [], "the product is not judged on an injection that did not happen"
+
+
+@pytest.mark.parametrize(
+    ("alive", "events", "message"),
+    [
+        (False, None, "did not stay alive"),
+        (True, {"master": [], "worker": []}, "extra collective"),
+    ],
+)
+def test_a_dead_job_or_a_trainer_that_never_stalled_is_inconclusive(
+    tmp_path: Path, alive: bool, events: dict[str, list[str]] | None, message: str
+) -> None:
+    FakeNcclJob.alive_value = alive
+    FakeNcclJob.events = events
+    ctx, _calls = _ctx(SPECS["active_to_zero"], tmp_path)
+    with pytest.raises(VariantInconclusive, match=message):
         SPECS["active_to_zero"].execute(ctx)
 
 
-def test_simultaneous_nodes_fails_when_not_merged(tmp_path: Path) -> None:
-    ctx = _ctx(SPECS["simultaneous_nodes"], tmp_path, _hung_records(count=2))
-    result = SPECS["simultaneous_nodes"].execute(ctx)
+def test_a_valid_injection_with_no_hung_incident_fails(tmp_path: Path) -> None:
+    result = _run("active_to_zero", tmp_path, none=True)
     assert result["verdict"] == "FAIL"
-    assert any(
-        "merged" in item or "one stall wave" in item for item in result["errors"]
-    ), result["errors"]
+    assert (
+        "chain: no EFA hung_suspected finding reached an incident" in result["errors"]
+    )
 
 
-def test_always_low_passes_when_no_hung(tmp_path: Path) -> None:
-    ctx = _ctx(SPECS["always_low"], tmp_path, {"incidents": [], "workflows": {}})
-    result = SPECS["always_low"].execute(ctx)
+def test_a_job_that_does_not_resume_fails(tmp_path: Path) -> None:
+    FakeNcclJob.traffic.resumed = 0.0
+    result = _run("active_to_zero", tmp_path)
+    assert result["verdict"] == "FAIL"
+    assert result["stages"]["resumed"], result["stages"]
+
+
+def test_simultaneous_nodes_waits_for_both_reporters_and_needs_one_incident(
+    tmp_path: Path,
+) -> None:
+    assert _run("simultaneous_nodes", tmp_path)["verdict"] == "PASS"
+    result = _run("simultaneous_nodes", tmp_path / "two", count=2)
+    assert result["verdict"] == "FAIL"
+    assert any("one stall wave" in item for item in result["errors"]), result["errors"]
+    alone = _run("simultaneous_nodes", tmp_path / "alone", reporters=(NODE,))
+    assert alone["verdict"] == "FAIL"
+    assert any("no hung evidence from" in item for item in alone["errors"]), alone
+
+
+@pytest.mark.parametrize(
+    ("variant", "mode"), [("write_progress", "write"), ("phase_progress", "phase")]
+)
+def test_progress_variants_stall_in_their_mode_and_still_need_the_chain(
+    tmp_path: Path, variant: str, mode: str
+) -> None:
+    result = _run(variant, tmp_path)
     assert result["verdict"] == "PASS", result["errors"]
+    assert FakeNcclJob.instances[-1].stall_mode == mode
+    assert result["attempt"]["stall_mode"] == mode
+    late = _run(variant, tmp_path / "early", hung_after=300)
+    assert late["verdict"] == "FAIL", "progress may not shorten or bend the hung clock"
 
 
-def test_fr_disabled_passes_with_not_configured(tmp_path: Path) -> None:
-    records = {
-        "incidents": [
-            {
-                "event_id": "b-efa-traffic-hung_suspected",
-                "state": "ESCALATED",
-                "workflow_request_id": "wf",
-                "node_ids": [NODE, PEER],
-            }
-        ],
-        "workflows": {
-            "wf": {
-                "official_steps": [
-                    {"operation": op, "parameters": {}} for op in nc.DIAGNOSTIC_DAG
-                ],
-                "step_executions": [
-                    {
-                        "operation": "COLLECT_HUNG_TRIAGE",
-                        "details": {
-                            "node_results": {
-                                NODE: {
-                                    "data": {
-                                        "ranks": [
-                                            {
-                                                "flight_recorder": {
-                                                    "status": "not_configured"
-                                                }
-                                            }
-                                        ]
-                                    }
-                                }
-                            }
-                        },
-                    }
-                ],
-            }
-        },
+def test_fr_variants_configure_the_job_and_read_the_dumps(tmp_path: Path) -> None:
+    paired = {
+        "flight_recorder": {"status": "dumped"},
+        "flight_recorder_series": {"status": "PAIRED"},
     }
-    result = SPECS["fr_disabled"].execute(_ctx(SPECS["fr_disabled"], tmp_path, records))
+    off = {"flight_recorder": {"status": "not_configured"}}
+    result = _run("fr_enabled", tmp_path, ranks=[paired])
     assert result["verdict"] == "PASS", result["errors"]
+    assert FakeNcclJob.instances[-1].flight_recorder is True
+    assert _run("fr_enabled", tmp_path / "off", ranks=[off])["verdict"] == "FAIL"
+    result = _run("fr_disabled", tmp_path / "disabled", ranks=[off])
+    assert result["verdict"] == "PASS", result["errors"]
+    assert FakeNcclJob.instances[-1].flight_recorder is False
+    assert _run("fr_disabled", tmp_path / "dumped", ranks=[paired])["verdict"] == "FAIL"
+
+
+def test_always_low_passes_on_a_quiet_job_with_no_suspicion(tmp_path: Path) -> None:
+    result = _run("always_low", tmp_path, none=True)
+    assert result["verdict"] == "PASS", result["errors"]
+    job = FakeNcclJob.instances[-1]
+    assert job.keep_active is False and job.stalled and job.released == 1
+
+
+def test_always_low_fails_on_a_warning_or_a_hung_suspicion(tmp_path: Path) -> None:
+    result = _run("always_low", tmp_path, reporters=(NODE,), count=1)
+    assert result["verdict"] == "FAIL"
+    assert any("zero-traffic suspicion" in item for item in result["errors"]), result
+
+
+def test_always_low_is_inconclusive_when_the_job_went_active(tmp_path: Path) -> None:
+    FakeNcclJob.traffic.low = 3_000_000.0
+    ctx, _calls = _ctx(SPECS["always_low"], tmp_path, none=True)
+    with pytest.raises(VariantInconclusive, match="always-low job reached the active"):
+        SPECS["always_low"].execute(ctx)

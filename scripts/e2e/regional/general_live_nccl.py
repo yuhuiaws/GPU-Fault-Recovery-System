@@ -2,42 +2,54 @@
 
 HyperPod lane only: a hung collective needs at least two nodes with EFA/RDMA
 between them, which the single plain-EKS node cannot provide (intra-node NCCL
-uses NVLink, not EFA). A disposable, owned two-node managed NCCL test job is
-brought up healthy (the product's ``had_active_traffic`` baseline is recorded),
-then stalled at a controllable, recoverable barrier so its collective genuinely
-stops making progress while the job stays alive and its EFA RX/TX pair falls to
-zero. The product's ``SITE_EFA_TRAFFIC`` rule reads that -- never the pause --
-as ``ZERO_WARNING`` (60 s) then ``HUNG_SUSPECTED`` (600 s), merges the stall
-wave into one grouped incident, and compiles the read-only diagnostic DAG
+uses NVLink, not EFA). A disposable, owned two-node managed NCCL test job
+(``general_live_nccl_job``: a 1.5 MiB all-reduce every 2 s, one rank entering an
+extra collective on the runner's pause file while the others hold before it,
+bounded by an in-Pod watchdog) is brought up healthy, then stalled so its
+collective genuinely stops while the job stays alive and its EFA RX/TX pair
+falls to zero. The product's ``SITE_EFA_TRAFFIC`` rule reads that -- never the
+pause -- as ``ZERO_WARNING`` (60 s) then ``HUNG_SUSPECTED`` (600 s), merges the
+stall wave into one grouped incident, and compiles the read-only diagnostic DAG
 ``FREEZE_EVIDENCE -> COLLECT_HUNG_SUMMARY x2 -> COLLECT_HUNG_TRIAGE x2 ->
 COLLECT_DIAGNOSTIC_BUNDLE -> VALIDATE_FABRIC -> ESCALATE_SUPPORT`` that ends
-ESCALATED. The verdict reads that workflow's step executions only and requires
-that nothing cordoned, stopped, reset or rebooted on suspicion.
+ESCALATED. The verdict reads that workflow's plan and step executions, the
+per-node ``ZERO_WARNING`` incidents and the detection times, requires that
+nothing cordoned, stopped, reset or rebooted on suspicion, and that the job's
+traffic resumes once the runner releases the stall.
 
 The effectiveness oracle is the runner's own raw EFA counter pair, read from
-``/sys/class/infiniband`` by the node probe's ``efa-traffic`` command on every
-attempt node: if the pair never approaches zero the variant is INCONCLUSIVE,
-because a paused program that kept communicating is not a triggered traffic
-rule. The deep triage/forensics variants (per-rank FR temporal completion, the
-second-dump-missing and whole-group cases, py-spy failure classification, role
-and thread/CPU comparison) need a reviewed test flight-recorder dump responder
-and a py-spy fault tool that are not wired this phase, and the 128-node/
-1024-process scale variants need a cluster this site does not have: each stays
-NOT_RUN with its reason, in the denominator.
+``/sys/class/infiniband`` by the node probe's ``efa-traffic`` command on both
+attempt nodes every 30 s: before the stall every interval must run at or above
+the product's active threshold (``GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS``,
+1 MiB/s) for at least three intervals, and through the stall every interval
+must stay at or below its zero threshold (``GPU_FAULT_EFA_TRAFFIC_ZERO_BPS``,
+1 B/s) for at least the 600 s hung threshold, with both Pods alive and the
+trainer reporting the stall. Without either the variant is INCONCLUSIVE, never
+FAIL: a job that never went active, or a pause that kept communicating, is not
+a triggered traffic rule. The deep triage/forensics variants (per-rank FR
+temporal completion, the second-dump-missing and whole-group cases, py-spy
+failure classification, role and thread/CPU comparison) need a reviewed test
+flight-recorder dump responder and a py-spy fault tool that are not wired this
+phase, and the 128-node/1024-process scale variants need a cluster this site
+does not have: each stays NOT_RUN with its reason, in the denominator.
 """
 
 from __future__ import annotations
 
+import math
+import re
+from collections.abc import Mapping, Sequence
+from datetime import datetime
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import run_survey
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
-    VariantNotRun,
     run_identity,
     utc_now,
 )
+from scripts.e2e.regional.general_live_nccl_job import MIN_ACTIVE_BPS, ManagedNcclJob
 from scripts.e2e.regional.general_live_registry import (
     HARDWARE_OPERATIONS,
     LIVE_REPLAY,
@@ -45,14 +57,37 @@ from scripts.e2e.regional.general_live_registry import (
     VariantSpec,
     deferred_variant,
 )
-from scripts.e2e.regional.general_live_verdicts import operations, verdict
+from scripts.e2e.regional.general_live_verdicts import operations, parse_time, verdict
 
 CASE = "GF-GENERAL-LIVE-011"
-TWO_NODE_MANIFEST = "two-node-replace-pytorchjob.yaml"
 ZERO_WARNING_SECONDS = 60
 ZERO_HUNG_SECONDS = 600
 STARTUP_GRACE = 120
 HUNG_BUDGET = ZERO_HUNG_SECONDS + 600 + 180
+#: The product's zero threshold (``MIN_ACTIVE_BPS`` is the active one); the
+#: node's collector environment overrides either.
+ZERO_BPS = 1
+#: The spec keeps at least three normal samples before an injection.
+BASELINE_INTERVALS = 3
+#: The step in flight finishes and every rank reaches the stall well inside it.
+STALL_SETTLE_SECONDS = 30
+RESUME_SECONDS = 60
+#: Skew allowed between the runner's clock and the control plane's.
+CLOCK_TOLERANCE_SECONDS = 5
+#: How long the runner keeps a job stalled at most: the settle, the drop window
+#: at the default 300 s health summary, the hung wait. The in-Pod watchdog
+#: (``general_live_nccl_job.STALL_MAX_SECONDS``) must outlast it.
+RUNNER_STALL_SECONDS = STALL_SETTLE_SECONDS + ZERO_HUNG_SECONDS + 300 + HUNG_BUDGET
+#: Incident states the hung chain does not leave on its own.
+SETTLED_STATES = frozenset({"ESCALATED", "RECOVERED", "QUARANTINED"})
+HUNG_SUFFIX = "-efa-traffic-hung_suspected"
+WARNING_SUFFIX = "-efa-traffic-zero_warning"
+#: ``<batch id>-efa-traffic-<signal>`` where the host batch id is
+#: ``host-<node>-<microseconds>`` (``collectors/host/collector.py``).
+CREATOR = re.compile(r"^host-(?P<node>.+)-\d+-efa-traffic-[a-z_]+$")
+#: The reason a peer node's hung finding leaves on the merged incident
+#: (``orchestration/families/grouped_health.py``).
+CONCURRENT = ": concurrent hung evidence: "
 #: The read-only diagnostic DAG a hung suspicion must compile to, in order.
 DIAGNOSTIC_DAG = (
     "FREEZE_EVIDENCE",
@@ -72,10 +107,12 @@ FORBIDDEN = HARDWARE_OPERATIONS | {
     "STOP_WORKLOADS",
     "RESTART_WORKLOAD",
 }
+#: What triage may report for a rank whose job configured no flight recorder.
+FR_OFF_STATUSES = frozenset({"not_configured", "BUDGET_EXHAUSTED", None})
 
-#: Read-only: the grouped SITE_EFA_TRAFFIC incident this attempt raised, its
-#: workflow (official steps, step executions with their details) and the
-#: per-node coverage the summary/triage/bundle recorded. Never writes.
+#: Read-only: this attempt's SITE_EFA_TRAFFIC incidents on either attempt node
+#: (the grouped hung incident and the per-node warnings), their workflows
+#: (official steps, step executions with their details). Never writes.
 HUNG_PROBE = r"""
 import json
 import sys
@@ -85,14 +122,15 @@ from gpu_fault.app import ApplicationContext
 from gpu_fault.models import IncidentState
 from gpu_fault.store import NotFoundError
 
-cluster_id, node_id, job_id, attempt_id, since_text = sys.argv[1:6]
+cluster_id, node_list, job_id, attempt_id, since_text = sys.argv[1:6]
+node_ids = {item for item in node_list.split(",") if item}
 since = datetime.fromisoformat(since_text.replace("Z", "+00:00"))
 store = ApplicationContext.from_environment().store
 
 incidents = []
 workflows = {}
 for incident in store.list_incidents_by_state(
-    cluster_id, list(IncidentState), node_ids={node_id}
+    cluster_id, list(IncidentState), node_ids=node_ids
 ):
     if incident.policy_source != "SITE_EFA_TRAFFIC":
         continue
@@ -110,6 +148,8 @@ for incident in store.list_incidents_by_state(
         "node_ids": list(incident.node_ids),
         "reasons": list(incident.reasons or []),
         "workflow_request_id": incident.workflow_request_id,
+        "created_at": incident.created_at.isoformat(),
+        "updated_at": incident.updated_at.isoformat(),
     })
     if incident.workflow_request_id and incident.workflow_request_id not in workflows:
         try:
@@ -126,277 +166,201 @@ print(json.dumps({
 """
 
 
-class ManagedNcclJob:
-    """A disposable two-node NCCL test job with a controllable barrier stall.
+# --------------------------------------------------------------------------- #
+# EFA counter oracle (pure)
+# --------------------------------------------------------------------------- #
+def _usable(reading: Mapping[str, Any]) -> tuple[float, int] | None:
+    """``(observed_at, pair bytes)`` of a complete probe reading, else None."""
 
-    A thin wrapper over ``ManagedWorkloadFixture``: it renders a copy of the
-    two-node training manifest pinned Master->node, Worker->peer, whose script
-    all-reduces (so ``wait_running`` sees the correct ``all_reduce`` value and
-    the GPUs stay active) until the runner creates a pause file inside the
-    trainer; one rank then blocks in an extra collective, the EFA pair on both
-    nodes falls to zero, and a bounded watchdog releases the barrier so the
-    collective recovers even if the runner, probe and control plane all vanish.
-    ``flight_recorder`` toggles the Torch FR pipe env. Tests monkeypatch this
-    class, so only its shape matters here.
+    observed = reading.get("observed_at")
+    total = reading.get("pair_bytes_total")
+    ports = reading.get("port_count")
+    if (
+        reading.get("error")
+        or reading.get("complete_pairs") is not True
+        or type(ports) is not int
+        or ports < 1
+        or not isinstance(observed, (int, float))
+        or not math.isfinite(observed)
+        or type(total) is not int
+        or total < 0
+    ):
+        return None
+    return float(observed), total
+
+
+def efa_rates(readings: Sequence[Mapping[str, Any]]) -> list[float | None]:
+    """RX+TX bytes per second between consecutive readings of one node.
+
+    ``None`` marks an interval that proves nothing: an incomplete counter pair
+    or a probe error at either end, no elapsed time, or a counter that went
+    backwards (a reset).
     """
 
-    PAUSE_DIR = "/var/run/gfrs-nccl"
-
-    def __init__(
-        self,
-        ctx: VariantContext,
-        *,
-        name: str,
-        flight_recorder: bool = False,
-        keep_active: bool = True,
-    ) -> None:
-        from pathlib import Path
-
-        from scripts.e2e.regional.managed_workload_fixture import (
-            ImagePrewarmFixture,
-            ManagedWorkloadFixture,
-            ManagedWorkloadSettings,
-        )
-
-        yaml = __import__("yaml")
-        if ctx.settings.site_file is None:
-            raise VariantNotRun(
-                "FIXTURE_NOT_READY", "a managed NCCL job needs --site-file"
-            )
-        if not ctx.settings.peer_node:
-            raise VariantNotRun(
-                "FIXTURE_NOT_READY", "a two-node NCCL job needs --node-b"
-            )
-        source = Path(__file__).with_name("manifests") / "training" / TWO_NODE_MANIFEST
-        document = yaml.safe_load(source.read_text(encoding="utf-8"))
-        _render_nccl(
-            document,
-            node=ctx.settings.node,
-            peer=ctx.settings.peer_node,
-            name=name,
-            flight_recorder=flight_recorder,
-            keep_active=keep_active,
-            pause_dir=self.PAUSE_DIR,
-        )
-        rendered = ctx.case_dir / f"{name}.source.yaml"
-        rendered.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        rendered.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
-        rendered.chmod(0o600)
-        self.ctx = ctx
-        self.name = name
-        self.attempt_id = f"{name}-a001"
-        self.flight_recorder = flight_recorder
-        self.prewarm = ImagePrewarmFixture(
-            ctx.regional,
-            case_id=ctx.spec.key,
-            run_id=f"{ctx.run_id}-{name}",
-            state_path=ctx.case_dir / f"{name}.prewarm.json",
-        )
-        self.fixture = ManagedWorkloadFixture(
-            ctx.regional,
-            ManagedWorkloadSettings(
-                manifest=rendered,
-                site_file=ctx.settings.site_file,
-                job_id=name,
-                attempt_id=self.attempt_id,
-                restart_budget=0,
-                expected_pods=2,
-                expected_gpu_count=16,
-            ),
-            state_path=ctx.case_dir / f"{name}.ownership.json",
-        )
-
-    def start(self) -> dict[str, Any]:
-        self.prewarm.create([self.ctx.settings.node, self.ctx.settings.peer_node])
-        self.fixture.submit()
-        return self.fixture.wait_running(timeout_seconds=1200)
-
-    def identity(self) -> dict[str, Any]:
-        return {
-            "job_id": self.name,
-            "attempt_id": self.attempt_id,
-            "nodes": [self.ctx.settings.node, self.ctx.settings.peer_node],
-            "flight_recorder": self.flight_recorder,
-        }
-
-    def stall(self) -> dict[str, Any]:
-        """Create the pause file on rank 0's node so the collective blocks."""
-
-        master = next(
-            item
-            for item in self.fixture.pods()
-            if item["node"] == self.ctx.settings.node
-        )
-        return self.ctx.regional.kubectl(
-            "gpu",
-            "exec",
-            master["name"],
-            "-c",
-            "pytorch",
-            "--",
-            "/bin/sh",
-            "-c",
-            f"mkdir -p {self.PAUSE_DIR} && touch {self.PAUSE_DIR}/pause",
-        )
-
-    def release(self) -> dict[str, Any]:
-        master = next(
-            (
-                item
-                for item in self.fixture.pods()
-                if item["node"] == self.ctx.settings.node
-            ),
-            None,
-        )
-        if master is None:
-            return {"released": False}
-        return self.ctx.regional.kubectl(
-            "gpu",
-            "exec",
-            master["name"],
-            "-c",
-            "pytorch",
-            "--",
-            "/bin/sh",
-            "-c",
-            f"touch {self.PAUSE_DIR}/release",
-        )
-
-    def delete(self) -> None:
-        self.fixture.delete()
-        self.prewarm.cleanup()
-
-
-def _render_nccl(
-    document: dict[str, Any],
-    *,
-    node: str,
-    peer: str,
-    name: str,
-    flight_recorder: bool,
-    keep_active: bool,
-    pause_dir: str,
-) -> None:
-    replicas = (document.get("spec") or {}).get("pytorchReplicaSpecs") or {}
-    document.setdefault("metadata", {}).setdefault("labels", {}).update(
-        {"gpu-fault.io/job-id": name, "gpu-fault.io/attempt-id": f"{name}-a001"}
-    )
-    for role, pinned in (("Master", node), ("Worker", peer)):
-        replica = replicas.get(role)
-        if not isinstance(replica, dict):
+    rates: list[float | None] = []
+    for before, after in zip(readings, readings[1:]):
+        first, second = _usable(before), _usable(after)
+        if first is None or second is None:
+            rates.append(None)
             continue
-        pod_spec = (replica.get("template") or {}).get("spec") or {}
-        pod_spec["nodeName"] = pinned
-        for container in pod_spec.get("containers") or []:
-            if not isinstance(container, dict):
-                continue
-            env = [
-                item
-                for item in container.get("env") or []
-                if item.get("name")
-                not in {"TORCH_NCCL_DEBUG_INFO_PIPE_FILE", "GFRS_KEEP_ACTIVE"}
-            ]
-            if flight_recorder:
-                env.append(
-                    {
-                        "name": "TORCH_NCCL_DEBUG_INFO_PIPE_FILE",
-                        "value": "/tmp/gfrs_nccl_pipe_",
-                    }
-                )
-            env.append(
-                {"name": "GFRS_KEEP_ACTIVE", "value": "1" if keep_active else "0"}
-            )
-            env.append({"name": "GFRS_PAUSE_DIR", "value": pause_dir})
-            container["env"] = env
+        elapsed = second[0] - first[0]
+        moved = second[1] - first[1]
+        rates.append(moved / elapsed if elapsed > 0 and moved >= 0 else None)
+    return rates
 
 
-# --------------------------------------------------------------------------- #
-# driver
-# --------------------------------------------------------------------------- #
-def _job(
-    ctx: VariantContext,
-    suffix: str,
-    *,
-    flight_recorder: bool = False,
-    keep_active: bool = True,
-) -> ManagedNcclJob:
-    name = run_identity(CASE, suffix, ctx.attempt, ctx.case_dir).replace(
-        "gl011", "gl11"
-    )
-    job = ManagedNcclJob(
-        ctx, name=name, flight_recorder=flight_recorder, keep_active=keep_active
-    )
-    ctx.cleanup.push(f"job-{name}", job.delete)
-    job.start()
-    return job
-
-
-def _efa_pair(ctx: VariantContext, node: str) -> int:
-    reading = ctx.probe("node", node=node).execute(
-        "efa-traffic", "--run-id", ctx.run_id
-    )
-    ctx.evidence.write(f"efa-{node}", reading)
-    value = reading.get("pair_bytes_total")
-    return int(value) if isinstance(value, (int, float)) else 0
-
-
-def _stalled_oracle(ctx: VariantContext, job: ManagedNcclJob) -> None:
-    """Confirm the EFA pair actually stopped moving on both attempt nodes."""
-
-    nodes = [ctx.settings.node, ctx.settings.peer_node]
-    before = {node: _efa_pair(ctx, node) for node in nodes}
-    ctx.hold(ZERO_HUNG_SECONDS + ctx.host_summary, name="hung-hold")
-    after = {node: _efa_pair(ctx, node) for node in nodes}
-    moved = {node: after[node] - before[node] for node in nodes}
-    ctx.evidence.write("efa-oracle", {"before": before, "after": after, "moved": moved})
-    # A collective stall must freeze the pair on at least the reporting node;
-    # steady unrelated traffic would keep it climbing.
-    if moved[ctx.settings.node] > ctx.setting(
-        "GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS", 1048576
-    ):
-        raise VariantInconclusive(f"the EFA pair kept moving during the stall: {moved}")
-
-
-def _hung(ctx: VariantContext, job: ManagedNcclJob, since: Any) -> dict[str, Any]:
-    last: dict[str, Any] = {}
-
-    def accept() -> dict[str, Any] | None:
-        nonlocal last
-        last = ctx.regional.cpu_python(
-            HUNG_PROBE,
-            ctx.settings.regional.cluster_id,
-            ctx.settings.node,
-            job.name,
-            job.attempt_id,
-            since.isoformat(),
-        )
-        return last if _hung_incident(last) else None
-
-    value = ctx.wait_until(
-        accept, timeout_seconds=HUNG_BUDGET, poll_seconds=20, name="hung"
-    )
-    records = value if value is not None else last
-    ctx.evidence.write("hung-records", records)
-    return records
-
-
-def _hung_incident(records: dict[str, Any]) -> dict[str, Any] | None:
-    hung = [
-        item
-        for item in records.get("incidents") or []
-        if str(item.get("event_id", "")).endswith("-efa-traffic-hung_suspected")
+def _unusable(node: str, rates: list[float | None]) -> list[str]:
+    missing = sum(rate is None for rate in rates)
+    if not missing:
+        return []
+    return [
+        f"{node}: {missing} of {len(rates)} EFA counter interval(s) unusable "
+        "(incomplete pair, probe error or counter reset)"
     ]
+
+
+def baseline_errors(
+    window: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    minimum_bps: float,
+    active: bool = True,
+    minimum_intervals: int = BASELINE_INTERVALS,
+) -> list[str]:
+    """Why ``window`` does not prove the pre-stall baseline on every node.
+
+    ``active``: every interval at or above the product's active threshold (the
+    attempt sets ``had_active``). ``active=False`` (always-low): every interval
+    below it, so the attempt never could.
+    """
+
+    errors: list[str] = []
+    for node, readings in window.items():
+        rates = efa_rates(readings)
+        usable = [rate for rate in rates if rate is not None]
+        errors.extend(_unusable(node, rates))
+        if len(usable) < minimum_intervals:
+            errors.append(
+                f"{node}: {len(usable)} usable EFA interval(s), need {minimum_intervals}"
+            )
+        if not usable:
+            continue
+        if active and min(usable) < minimum_bps:
+            errors.append(
+                f"{node}: the EFA pair fell to {min(usable):.0f} B/s, under the "
+                f"product's {minimum_bps:.0f} B/s active threshold"
+            )
+        if not active and max(usable) >= minimum_bps:
+            errors.append(
+                f"{node}: the EFA pair reached {max(usable):.0f} B/s, at or over the "
+                f"product's {minimum_bps:.0f} B/s active threshold"
+            )
+    return errors
+
+
+def drop_errors(
+    window: Mapping[str, Sequence[Mapping[str, Any]]],
+    *,
+    zero_bps: float,
+    minimum_seconds: float = ZERO_HUNG_SECONDS,
+) -> list[str]:
+    """Why ``window`` does not prove the pair stayed at zero on every node.
+
+    Every interval at or below the product's zero threshold, over at least the
+    hung threshold: the product needs that long a zero run to suspect a hang.
+    """
+
+    errors: list[str] = []
+    for node, readings in window.items():
+        rates = efa_rates(readings)
+        usable = [rate for rate in rates if rate is not None]
+        errors.extend(_unusable(node, rates))
+        times = [item[0] for item in map(_usable, readings) if item is not None]
+        span = times[-1] - times[0] if len(times) > 1 else 0.0
+        if span < minimum_seconds:
+            errors.append(
+                f"{node}: the stall window covers {span:.0f} s, under the "
+                f"{minimum_seconds:.0f} s hung threshold"
+            )
+        if usable and max(usable) > zero_bps:
+            errors.append(
+                f"{node}: the EFA pair kept moving at up to {max(usable):.1f} B/s "
+                f"during the stall (the product's zero is at most {zero_bps:g} B/s)"
+            )
+    return errors
+
+
+def resume_errors(
+    window: Mapping[str, Sequence[Mapping[str, Any]]], *, floor_bps: float
+) -> list[str]:
+    """Why the job's traffic did not come back on every node after the release."""
+
+    errors: list[str] = []
+    for node, readings in window.items():
+        rates = efa_rates(readings)
+        last = rates[-1] if rates else None
+        if last is None:
+            errors.append(f"{node}: no usable EFA interval after the release")
+        elif last < floor_bps:
+            errors.append(
+                f"{node}: the EFA pair moved {last:.0f} B/s after the release, "
+                f"under {floor_bps:.0f} B/s; the job did not resume"
+            )
+    return errors
+
+
+def stall_event_errors(events: Mapping[str, Sequence[str]], mode: str) -> list[str]:
+    """Why the trainer's own account does not show the stall it was asked for.
+
+    One rank entered the extra collective; every Pod has held ranks in the
+    requested mode; no side activity failed and nothing resumed yet.
+    """
+
+    lines = [line for items in events.values() for line in items]
+    errors: list[str] = []
+    if not any("entered=extra_all_reduce" in line for line in lines):
+        errors.append("no rank reports entering the extra collective")
+    for pod, items in sorted(events.items()):
+        if not any(f"held=before_extra_all_reduce mode={mode}" in i for i in items):
+            errors.append(f"{pod}: no rank reports holding before it in mode {mode}")
+    failed = [line for line in lines if "STALL-ACTIVITY-ERROR" in line]
+    if failed:
+        errors.append(f"the {mode} activity failed during the stall: {failed[0]}")
+    resumed = [line for line in lines if "RESUMED step=" in line]
+    if resumed:
+        errors.append(f"the stall ended before the product's window: {resumed[0]}")
+    return errors
+
+
+# --------------------------------------------------------------------------- #
+# Product records (pure)
+# --------------------------------------------------------------------------- #
+def _signal_incidents(records: dict[str, Any], suffix: str) -> list[dict[str, Any]]:
+    return sorted(
+        (
+            item
+            for item in records.get("incidents") or []
+            if str(item.get("event_id", "")).endswith(suffix)
+        ),
+        key=lambda item: str(item.get("created_at") or ""),
+    )
+
+
+def hung_incident(records: dict[str, Any]) -> dict[str, Any] | None:
+    hung = _signal_incidents(records, HUNG_SUFFIX)
     return hung[0] if hung else None
 
 
-def _dag_errors(records: dict[str, Any]) -> list[str]:
-    incident = _hung_incident(records)
-    if incident is None:
-        return ["no EFA hung_suspected finding reached an incident"]
-    workflow = (records.get("workflows") or {}).get(
+def _hung_workflow(records: dict[str, Any]) -> dict[str, Any]:
+    incident = hung_incident(records) or {}
+    return (records.get("workflows") or {}).get(
         str(incident.get("workflow_request_id"))
     ) or {}
-    ops = operations(workflow)
+
+
+def dag_errors(records: dict[str, Any]) -> list[str]:
+    if hung_incident(records) is None:
+        return ["no EFA hung_suspected finding reached an incident"]
+    ops = operations(_hung_workflow(records))
     errors: list[str] = []
     if ops != list(DIAGNOSTIC_DAG):
         errors.append(
@@ -408,212 +372,467 @@ def _dag_errors(records: dict[str, Any]) -> list[str]:
     return errors
 
 
-def _escalated_errors(records: dict[str, Any]) -> list[str]:
-    incident = _hung_incident(records)
+def execution_errors(records: dict[str, Any]) -> list[str]:
+    """Every planned step really ran and succeeded, not just the plan."""
+
+    if hung_incident(records) is None:
+        return []
+    workflow = _hung_workflow(records)
+    by_index: dict[int, list[dict[str, Any]]] = {}
+    for item in workflow.get("step_executions") or []:
+        if type(item.get("step_index")) is int:
+            by_index.setdefault(item["step_index"], []).append(item)
+    errors = []
+    for index, step in enumerate(workflow.get("official_steps") or []):
+        operation = step.get("operation")
+        runs = sorted(by_index.get(index, []), key=lambda e: str(e.get("updated_at")))
+        if not runs:
+            errors.append(f"step {index} {operation} never executed")
+        elif runs[-1].get("status") != "SUCCEEDED":
+            errors.append(
+                f"step {index} {operation} ended {runs[-1].get('status')}: "
+                f"{runs[-1].get('error')}"
+            )
+    return errors
+
+
+def escalated_errors(records: dict[str, Any]) -> list[str]:
+    incident = hung_incident(records)
     if incident is None:
         return []
-    if incident.get("state") not in {"ESCALATED", "QUARANTINED"}:
-        # QUARANTINED would itself be a failure; ESCALATED is the hung terminal.
+    if incident.get("state") != "ESCALATED":
+        # QUARANTINED would mean the product isolated a node on suspicion.
         return [f"hung incident is {incident.get('state')}, expected ESCALATED"]
     return []
 
 
-def _grouped_errors(records: dict[str, Any], *, expect_single: bool) -> list[str]:
-    incidents = records.get("incidents") or []
-    hung = [
-        i
-        for i in incidents
-        if str(i.get("event_id", "")).endswith("-efa-traffic-hung_suspected")
-    ]
+def grouped_errors(records: dict[str, Any], *, expect_single: bool) -> list[str]:
+    hung = _signal_incidents(records, HUNG_SUFFIX)
     if expect_single and len(hung) > 1:
         return [f"{len(hung)} hung incidents for one stall wave (expected one merged)"]
     return []
+
+
+def reported_nodes(incident: Mapping[str, Any]) -> set[str]:
+    """The nodes whose own hung finding reached ``incident``.
+
+    The first one created it (the host batch in its event id); a peer's finding
+    in the same wave only appends a concurrent-evidence reason. ``node_ids`` is
+    every attempt node from the start, so it cannot say who reported.
+    """
+
+    nodes = set()
+    match = CREATOR.match(str(incident.get("event_id", "")))
+    if match is not None:
+        nodes.add(match.group("node"))
+    for reason in incident.get("reasons") or []:
+        head, separator, _ = str(reason).partition(CONCURRENT)
+        if separator:
+            nodes.add(head)
+    return nodes
+
+
+def both_nodes_errors(records: dict[str, Any], nodes: Sequence[str]) -> list[str]:
+    incident = hung_incident(records)
+    if incident is None:
+        return ["no merged hung incident to cover the attempt nodes"]
+    errors = []
+    unnamed = sorted(set(nodes) - set(incident.get("node_ids") or []))
+    if unnamed:
+        errors.append(f"the merged hung incident does not name {unnamed}")
+    silent = sorted(set(nodes) - reported_nodes(incident))
+    if silent:
+        errors.append(f"no hung evidence from {silent} reached the merged incident")
+    return errors
+
+
+def timing_errors(
+    records: dict[str, Any], started: datetime, nodes: Sequence[str]
+) -> list[str]:
+    """ZERO_WARNING on every node after 60 s, then HUNG_SUSPECTED after 600 s."""
+
+    incident = hung_incident(records)
+    if incident is None:
+        return []
+    hung_at = parse_time(incident.get("created_at"))
+    if hung_at is None:
+        return ["the hung incident has no creation time"]
+    errors = []
+    waited = (hung_at - started).total_seconds()
+    if waited < ZERO_HUNG_SECONDS - CLOCK_TOLERANCE_SECONDS:
+        errors.append(
+            f"HUNG_SUSPECTED {waited:.0f} s after the stall, before the "
+            f"{ZERO_HUNG_SECONDS} s hung threshold"
+        )
+    warnings = _signal_incidents(records, WARNING_SUFFIX)
+    for node in nodes:
+        times = [
+            moment
+            for item in warnings
+            if item.get("node_ids") == [node]
+            and (moment := parse_time(item.get("created_at"))) is not None
+        ]
+        if not times:
+            errors.append(f"{node}: no ZERO_WARNING incident for the stall")
+            continue
+        offset = (min(times) - started).total_seconds()
+        if offset < ZERO_WARNING_SECONDS - CLOCK_TOLERANCE_SECONDS:
+            errors.append(
+                f"{node}: ZERO_WARNING {offset:.0f} s after the stall, before the "
+                f"{ZERO_WARNING_SECONDS} s warning threshold"
+            )
+        if min(times) > hung_at:
+            errors.append(f"{node}: ZERO_WARNING only after HUNG_SUSPECTED")
+    return errors
+
+
+def no_suspicion_errors(records: dict[str, Any]) -> list[str]:
+    raised = [
+        str(item.get("event_id"))
+        for suffix in (WARNING_SUFFIX, HUNG_SUFFIX)
+        for item in _signal_incidents(records, suffix)
+    ]
+    if raised:
+        return [f"a never-active job raised a zero-traffic suspicion: {raised}"]
+    return []
+
+
+def _triage_ranks(records: dict[str, Any]) -> list[dict[str, Any]] | None:
+    executions = [
+        item
+        for item in _hung_workflow(records).get("step_executions") or []
+        if item.get("operation") == "COLLECT_HUNG_TRIAGE"
+    ]
+    if not executions:
+        return None
+    rows: list[dict[str, Any]] = []
+    for execution in executions:
+        results = (execution.get("details") or {}).get("node_results") or {}
+        for value in results.values():
+            ranks = value.get("ranks") if isinstance(value, dict) else None
+            rows.extend(item for item in ranks or [] if isinstance(item, dict))
+    return rows
+
+
+def fr_errors(records: dict[str, Any], *, expect_configured: bool) -> list[str]:
+    """What COLLECT_HUNG_TRIAGE read from each rank's flight recorder.
+
+    Configured: no rank reads ``not_configured`` and at least one PID got two
+    real dumps (``flight_recorder_series`` PAIRED). Not configured: nothing but
+    ``not_configured`` (or an exhausted budget), and no dump series at all.
+    """
+
+    if hung_incident(records) is None:
+        return []
+    rows = _triage_ranks(records)
+    if rows is None:
+        return ["no COLLECT_HUNG_TRIAGE execution to read FR status from"]
+    if not rows:
+        return ["COLLECT_HUNG_TRIAGE sampled no rank process"]
+    statuses = [(row.get("flight_recorder") or {}).get("status") for row in rows]
+    series = [(row.get("flight_recorder_series") or {}).get("status") for row in rows]
+    if expect_configured:
+        errors = []
+        if "not_configured" in statuses:
+            errors.append(
+                f"FR was configured but {statuses.count('not_configured')} "
+                "rank(s) read not_configured"
+            )
+        if "PAIRED" not in series:
+            errors.append(
+                "no sampled rank got two real FR dumps (statuses "
+                f"{sorted({str(item) for item in statuses})}, series "
+                f"{sorted({str(item) for item in series})})"
+            )
+        return errors
+    unexpected = sorted({str(item) for item in statuses if item not in FR_OFF_STATUSES})
+    if unexpected or any(series):
+        return [f"FR was not configured yet triage reports {unexpected or series}"]
+    return []
+
+
+# --------------------------------------------------------------------------- #
+# driver
+# --------------------------------------------------------------------------- #
+def _job(
+    ctx: VariantContext,
+    suffix: str,
+    *,
+    flight_recorder: bool = False,
+    keep_active: bool = True,
+    stall_mode: str = "quiet",
+) -> ManagedNcclJob:
+    name = run_identity(CASE, suffix, ctx.attempt, ctx.case_dir).replace(
+        "gl011", "gl11"
+    )
+    job = ManagedNcclJob(
+        ctx,
+        name=name,
+        flight_recorder=flight_recorder,
+        keep_active=keep_active,
+        stall_mode=stall_mode,
+    )
+    ctx.cleanup.push(f"job-{name}", job.delete)
+    job.start()
+    ctx.evidence.write(f"{suffix}-job", job.identity())
+    return job
+
+
+def _nodes(ctx: VariantContext) -> list[str]:
+    return [ctx.settings.node, ctx.settings.peer_node]
+
+
+def _thresholds(ctx: VariantContext) -> tuple[float, float]:
+    """The product's active and zero thresholds as this node's collector runs."""
+
+    return (
+        float(ctx.setting("GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS", MIN_ACTIVE_BPS)),
+        float(ctx.setting("GPU_FAULT_EFA_TRAFFIC_ZERO_BPS", ZERO_BPS)),
+    )
+
+
+def _efa_window(
+    ctx: VariantContext, *, seconds: float, name: str
+) -> dict[str, list[dict[str, Any]]]:
+    """Both nodes' probe counter readings, now and every 30 s for ``seconds``."""
+
+    window: dict[str, list[dict[str, Any]]] = {node: [] for node in _nodes(ctx)}
+
+    def read() -> dict[str, Any]:
+        for node, readings in window.items():
+            reading = ctx.probe("node", node=node).execute(
+                "efa-traffic", "--run-id", ctx.run_id
+            )
+            readings.append(dict(reading))
+        return {
+            node: items[-1].get("pair_bytes_total") for node, items in window.items()
+        }
+
+    ctx.hold(seconds, name=name, check=read)
+    read()
+    rates = {node: efa_rates(items) for node, items in window.items()}
+    ctx.evidence.write(f"{name}-efa", {"readings": window, "rates_bps": rates})
+    ctx.evidence.append_oracle(
+        [
+            {
+                "window": name,
+                "node": node,
+                "observed_at": item.get("observed_at"),
+                "pair_bytes_total": item.get("pair_bytes_total"),
+                "port_count": item.get("port_count"),
+                "complete_pairs": item.get("complete_pairs"),
+            }
+            for node, items in window.items()
+            for item in items
+        ],
+        source="efa-traffic",
+    )
+    return window
+
+
+def _prove_baseline(ctx: VariantContext, *, name: str, active: bool = True) -> None:
+    """The pre-stall baseline, over the product's startup grace, on both nodes."""
+
+    minimum, _zero = _thresholds(ctx)
+    window = _efa_window(ctx, seconds=STARTUP_GRACE + ctx.host_interval * 3, name=name)
+    errors = baseline_errors(window, minimum_bps=minimum, active=active)
+    ctx.evidence.write(f"{name}-baseline", {"minimum_bps": minimum, "errors": errors})
+    if errors:
+        premise = (
+            "no active EFA baseline before the stall"
+            if active
+            else "the always-low job reached the active threshold"
+        )
+        raise VariantInconclusive(f"{premise}: " + "; ".join(errors))
+
+
+def _prove_stalled(ctx: VariantContext, job: ManagedNcclJob, *, name: str) -> None:
+    """Zero traffic for the hung threshold, a live job, the trainer's account."""
+
+    _minimum, zero = _thresholds(ctx)
+    ctx.hold(STALL_SETTLE_SECONDS, name=f"{name}-settle")
+    window = _efa_window(ctx, seconds=ZERO_HUNG_SECONDS + ctx.host_summary, name=name)
+    errors = drop_errors(window, zero_bps=zero)
+    liveness = job.alive()
+    events = job.trainer_events()
+    ctx.evidence.write(f"{name}-job", {"liveness": liveness, "trainer": events})
+    if not liveness.get("alive"):
+        errors.append("the job did not stay alive through the stall")
+    errors.extend(stall_event_errors(events, job.stall_mode))
+    if errors:
+        raise VariantInconclusive(
+            "the stall did not hold a live job at zero EFA traffic: "
+            + "; ".join(errors)
+        )
+
+
+def _records(ctx: VariantContext, job: ManagedNcclJob, since: datetime) -> Any:
+    return ctx.regional.cpu_python(
+        HUNG_PROBE,
+        ctx.settings.regional.cluster_id,
+        ",".join(_nodes(ctx)),
+        job.name,
+        job.attempt_id,
+        since.isoformat(),
+    )
+
+
+def _hung(
+    ctx: VariantContext,
+    job: ManagedNcclJob,
+    since: datetime,
+    *,
+    require_nodes: Sequence[str] = (),
+) -> dict[str, Any]:
+    """The records once the hung incident settled (and named its reporters)."""
+
+    last: dict[str, Any] = {}
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal last
+        last = _records(ctx, job, since)
+        incident = hung_incident(last)
+        if incident is None or incident.get("state") not in SETTLED_STATES:
+            return None
+        if not set(require_nodes) <= reported_nodes(incident):
+            return None
+        return last
+
+    value = ctx.wait_until(
+        accept, timeout_seconds=HUNG_BUDGET, poll_seconds=20, name="hung"
+    )
+    records = value if value is not None else last
+    ctx.evidence.write("hung-records", records)
+    return records
+
+
+def _release_and_resume(
+    ctx: VariantContext, job: ManagedNcclJob, *, name: str
+) -> list[str]:
+    """Release the stall and prove the job's own traffic came back."""
+
+    ctx.evidence.write(f"{name}-release", job.release())
+    ctx.cleanup.discard("release")
+    minimum, zero = _thresholds(ctx)
+    window = _efa_window(ctx, seconds=RESUME_SECONDS, name=f"{name}-resume")
+    return resume_errors(window, floor_bps=minimum if job.keep_active else 2 * zero)
+
+
+def _stalled_chain(
+    ctx: VariantContext,
+    suffix: str,
+    *,
+    stall_mode: str = "quiet",
+    flight_recorder: bool = False,
+    require_both: bool = False,
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, list[str]]]:
+    run_survey(ctx)
+    job = _job(ctx, suffix, flight_recorder=flight_recorder, stall_mode=stall_mode)
+    _prove_baseline(ctx, name=f"{suffix}-active")
+    started = utc_now()
+    ctx.cleanup.push("release", job.release)
+    ctx.evidence.write(f"{suffix}-stall", {"at": started.isoformat(), **job.stall()})
+    _prove_stalled(ctx, job, name=f"{suffix}-stalled")
+    nodes = _nodes(ctx)
+    records = _hung(ctx, job, started, require_nodes=nodes if require_both else ())
+    stages = {
+        "chain": dag_errors(records),
+        "executed": execution_errors(records),
+        "escalated": escalated_errors(records),
+        "timing": timing_errors(records, started, nodes),
+        "merged": grouped_errors(records, expect_single=True),
+        "resumed": _release_and_resume(ctx, job, name=suffix),
+    }
+    return job.identity(), records, stages
 
 
 # --------------------------------------------------------------------------- #
 # variants
 # --------------------------------------------------------------------------- #
 def active_to_zero(ctx: VariantContext) -> dict[str, Any]:
-    run_survey(ctx)
-    job = _job(ctx, "a2z")
-    identity = job.identity()
-    ctx.hold(STARTUP_GRACE + ctx.host_interval * 3, name="a2z-active")
-    started = utc_now()
-    job.stall()
-    ctx.cleanup.push("release", job.release)
-    _stalled_oracle(ctx, job)
-    records = _hung(ctx, job, started)
-    stages = {
-        "chain": _dag_errors(records),
-        "escalated": _escalated_errors(records),
-        "merged": _grouped_errors(records, expect_single=True),
-    }
+    identity, _, stages = _stalled_chain(ctx, "a2z")
     return _result(stages, extra={"attempt": identity})
 
 
 def always_low(ctx: VariantContext) -> dict[str, Any]:
     run_survey(ctx)
-    # A job that never reaches the active baseline: the EFA rule needs a prior
-    # had_active sample, so persistent low traffic alone must not fire.
+    # A job that never reaches the active threshold, then goes silent for the
+    # whole hung window: the EFA rule needs a prior had_active sample, so the
+    # zero run alone must not warn or suspect a hang.
     job = _job(ctx, "low", keep_active=False)
+    _prove_baseline(ctx, name="low-quiet", active=False)
     started = utc_now()
-    ctx.hold(ZERO_HUNG_SECONDS + ctx.host_summary, name="low-hold")
-    records = ctx.regional.cpu_python(
-        HUNG_PROBE,
-        ctx.settings.regional.cluster_id,
-        ctx.settings.node,
-        job.name,
-        job.attempt_id,
-        started.isoformat(),
-    )
+    ctx.cleanup.push("release", job.release)
+    ctx.evidence.write("low-stall", {"at": started.isoformat(), **job.stall()})
+    _prove_stalled(ctx, job, name="low-stalled")
+    records = _records(ctx, job, started)
     ctx.evidence.write("hung-records", records)
     stages = {
-        "no_hung": []
-        if _hung_incident(records) is None
-        else ["a never-active job raised a hung suspicion from low traffic alone"],
+        "no_suspicion": no_suspicion_errors(records),
+        "resumed": _release_and_resume(ctx, job, name="low"),
     }
     return _result(
-        stages, notes=["always-low is a suspicion signal, never a confirmed hang"]
+        stages,
+        notes=["always-low is a suspicion signal, never a confirmed hang"],
+        extra={"attempt": job.identity()},
     )
 
 
 def write_progress(ctx: VariantContext) -> dict[str, Any]:
-    return _stall_with_context(ctx, "wp", "write")
-
-
-def phase_progress(ctx: VariantContext) -> dict[str, Any]:
-    return _stall_with_context(ctx, "pp", "phase")
-
-
-def _stall_with_context(ctx: VariantContext, suffix: str, mode: str) -> dict[str, Any]:
-    run_survey(ctx)
-    job = _job(ctx, suffix)
-    ctx.hold(STARTUP_GRACE + ctx.host_interval * 3, name=f"{suffix}-active")
-    started = utc_now()
-    job.stall()  # the app keeps writing checkpoint I/O / advancing a phase
-    ctx.cleanup.push("release", job.release)
-    _stalled_oracle(ctx, job)
-    records = _hung(ctx, job, started)
-    stages = {
-        "chain": _dag_errors(records),
-        "escalated": _escalated_errors(records),
-    }
+    identity, _, stages = _stalled_chain(ctx, "wp", stall_mode="write")
     return _result(
         stages,
         notes=[
-            f"host {mode} activity during the stall does not delay the RDMA idle clock"
-            " (rank liveness is CONTEXT_ONLY)"
+            "held ranks rewrite 4 MiB/s of checkpoint I/O during the stall; host"
+            " writes do not delay the RDMA idle clock (rank liveness is CONTEXT_ONLY)"
         ],
+        extra={"attempt": identity},
+    )
+
+
+def phase_progress(ctx: VariantContext) -> dict[str, Any]:
+    identity, _, stages = _stalled_chain(ctx, "pp", stall_mode="phase")
+    return _result(
+        stages,
+        notes=[
+            "held ranks keep advancing the step and switching the phase of their"
+            " rank-progress/v1 snapshots; declared progress does not delay the"
+            " RDMA idle clock"
+        ],
+        extra={"attempt": identity},
     )
 
 
 def fr_enabled(ctx: VariantContext) -> dict[str, Any]:
-    run_survey(ctx)
-    job = _job(ctx, "fron", flight_recorder=True)
-    ctx.hold(STARTUP_GRACE + ctx.host_interval * 3, name="fron-active")
-    started = utc_now()
-    job.stall()
-    ctx.cleanup.push("release", job.release)
-    _stalled_oracle(ctx, job)
-    records = _hung(ctx, job, started)
-    stages = {
-        "chain": _dag_errors(records),
-        "escalated": _escalated_errors(records),
-        "fr_dumps": _fr_errors(records, expect_configured=True),
-    }
+    identity, records, stages = _stalled_chain(ctx, "fron", flight_recorder=True)
+    stages["fr_dumps"] = fr_errors(records, expect_configured=True)
     return _result(
-        stages, notes=["FR configured: triage must take two real dumps per PID"]
+        stages,
+        notes=["FR configured: triage must take two real dumps per PID"],
+        extra={"attempt": identity},
     )
 
 
 def fr_disabled(ctx: VariantContext) -> dict[str, Any]:
-    run_survey(ctx)
-    job = _job(ctx, "froff", flight_recorder=False)
-    ctx.hold(STARTUP_GRACE + ctx.host_interval * 3, name="froff-active")
-    started = utc_now()
-    job.stall()
-    ctx.cleanup.push("release", job.release)
-    _stalled_oracle(ctx, job)
-    records = _hung(ctx, job, started)
-    stages = {
-        "chain": _dag_errors(records),
-        "escalated": _escalated_errors(records),
-        "fr_dumps": _fr_errors(records, expect_configured=False),
-    }
+    identity, records, stages = _stalled_chain(ctx, "froff")
+    stages["fr_dumps"] = fr_errors(records, expect_configured=False)
     return _result(
         stages,
         notes=[
             "FR off: triage records not_configured and never fabricates a dump; still ESCALATED"
         ],
+        extra={"attempt": identity},
     )
 
 
 def simultaneous_nodes(ctx: VariantContext) -> dict[str, Any]:
-    run_survey(ctx)
-    job = _job(ctx, "sim")
-    ctx.hold(STARTUP_GRACE + ctx.host_interval * 3, name="sim-active")
-    started = utc_now()
-    job.stall()  # a collective stall idles the EFA pair on both nodes at once
-    ctx.cleanup.push("release", job.release)
-    _stalled_oracle(ctx, job)
-    records = _hung(ctx, job, started)
-    stages = {
-        "chain": _dag_errors(records),
-        "merged": _grouped_errors(records, expect_single=True),
-        "escalated": _escalated_errors(records),
-        "both_nodes": []
-        if _covers_both_nodes(records, ctx)
-        else ["the merged hung incident does not cover both attempt nodes"],
-    }
+    identity, records, stages = _stalled_chain(ctx, "sim", require_both=True)
+    stages["both_nodes"] = both_nodes_errors(records, _nodes(ctx))
     return _result(
         stages,
         notes=["two nodes in one stall wave merge into one workflow, not two"],
+        extra={"attempt": identity},
     )
-
-
-def _covers_both_nodes(records: dict[str, Any], ctx: VariantContext) -> bool:
-    incident = _hung_incident(records)
-    if incident is None:
-        return False
-    return {ctx.settings.node, ctx.settings.peer_node} <= set(
-        incident.get("node_ids") or []
-    )
-
-
-def _fr_errors(records: dict[str, Any], *, expect_configured: bool) -> list[str]:
-    incident = _hung_incident(records)
-    if incident is None:
-        return []
-    workflow = (records.get("workflows") or {}).get(
-        str(incident.get("workflow_request_id"))
-    ) or {}
-    triage = [
-        item
-        for item in workflow.get("step_executions") or []
-        if item.get("operation") == "COLLECT_HUNG_TRIAGE"
-    ]
-    if not triage:
-        return ["no COLLECT_HUNG_TRIAGE execution to read FR status from"]
-    statuses = _fr_statuses(triage)
-    if expect_configured:
-        if statuses and all(status == "not_configured" for status in statuses):
-            return ["FR was configured but every dump reads not_configured"]
-    else:
-        if any(status not in {"not_configured", None} for status in statuses):
-            return ["FR was not configured yet triage reports a dump"]
-    return []
-
-
-def _fr_statuses(triage: list[dict[str, Any]]) -> list[str | None]:
-    statuses: list[str | None] = []
-    for execution in triage:
-        node_results = (execution.get("details") or {}).get("node_results") or {}
-        for value in node_results.values():
-            data = value.get("data") if isinstance(value, dict) else None
-            for rank in (data or {}).get("ranks", []) if isinstance(data, dict) else []:
-                recorder = (rank or {}).get("flight_recorder") or {}
-                statuses.append(recorder.get("status"))
-    return statuses
 
 
 def _result(
@@ -640,8 +859,7 @@ def _spec(
     execute,
     *,
     risk: str = "M",
-    max_minutes: int = 45,
-    needs_peer: bool = True,
+    max_minutes: int = 65,
 ) -> VariantSpec:
     return VariantSpec(
         case_id=CASE,
@@ -652,7 +870,10 @@ def _spec(
         flags="S",
         injection=injection,
         expected=expected,
-        cleanup="release the barrier; delete the test Job; confirm no node was isolated/stopped/reset",
+        cleanup=(
+            "release the stall and prove the EFA pair resumes; delete the test Job; "
+            "confirm no node was isolated/stopped/reset"
+        ),
         max_minutes=max_minutes,
         execute=execute,
     )
@@ -680,46 +901,52 @@ _ROLE_FIXTURE = (
 VARIANTS = [
     _spec(
         "active_to_zero",
-        "a two-node NCCL job stalled at a barrier so the EFA pair falls to zero",
-        "ZERO_WARNING then HUNG_SUSPECTED -> the read-only diagnostic DAG -> ESCALATED; no STOP/reset/cordon",
+        "a two-node NCCL job at 1-4 MiB/s of EFA traffic per node, then one rank in"
+        " an extra collective so the EFA pair falls to zero",
+        "ZERO_WARNING (60 s) then HUNG_SUSPECTED (600 s) -> the read-only diagnostic"
+        " DAG, every step executed -> ESCALATED; no STOP/reset/cordon; traffic"
+        " resumes on release",
         active_to_zero,
     ),
     _spec(
         "always_low",
-        "a two-node job that never establishes an active EFA baseline",
-        "no hung suspicion from low traffic alone (the rule needs prior had_active)",
+        "a two-node job that only all-reduces its heartbeat (never 1 MiB/s), then"
+        " goes silent for the hung window",
+        "no ZERO_WARNING or hung suspicion from low/zero traffic alone (the rule"
+        " needs prior had_active)",
         always_low,
         risk="L",
-        max_minutes=25,
+        max_minutes=40,
     ),
     _spec(
         "write_progress",
-        "stall the collective while the app keeps writing checkpoint I/O",
+        "stall the collective while the held ranks keep writing checkpoint I/O",
         "host writes do not delay the RDMA idle clock; HUNG_SUSPECTED still fires -> ESCALATED",
         write_progress,
     ),
     _spec(
         "phase_progress",
-        "stall the collective while the app advances a declared phase",
-        "phase hints do not delay the RDMA idle clock; HUNG_SUSPECTED still fires -> ESCALATED",
+        "stall the collective while the held ranks keep advancing a declared"
+        " step/phase (rank-progress/v1)",
+        "declared progress does not delay the RDMA idle clock; HUNG_SUSPECTED still fires -> ESCALATED",
         phase_progress,
     ),
     _spec(
         "fr_enabled",
-        "the stalled job has TORCH_NCCL_DEBUG_INFO_PIPE_FILE configured",
+        "the stalled job runs the flight recorder (trace buffer + debug pipe)",
         "triage takes two real FR dumps per PID; chain -> ESCALATED",
         fr_enabled,
     ),
     _spec(
         "fr_disabled",
-        "the stalled job has no FR pipe configured",
+        "the stalled job has no FR pipe and a zero trace buffer",
         "triage records not_configured and fabricates no dump; chain -> ESCALATED with process evidence",
         fr_disabled,
     ),
     _spec(
         "simultaneous_nodes",
         "both nodes of the two-node job lose EFA in one stall wave (needs --node-b)",
-        "one merged grouped incident/workflow covering both nodes, not two",
+        "one merged grouped incident/workflow with both nodes' hung evidence, not two",
         simultaneous_nodes,
     ),
     _deferred(
