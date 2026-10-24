@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import logging
 from datetime import datetime, timezone
+from typing import Literal
 
 from gpu_fault.app.ingest.node_health import NodeHealthIngestionService
+from gpu_fault.fleet import AgentLifecycleState
 from gpu_fault.gpu_composites import pci_bdf_matches, pci_bdf_parses
 from gpu_fault.gpu_metrics import GpuInventorySnapshot
 from gpu_fault.host_health import (
@@ -12,6 +14,7 @@ from gpu_fault.host_health import (
     NodeHealthIngestionResult,
 )
 from gpu_fault.models import RecoveryAction, Severity, WorkloadState
+from gpu_fault.store.shared.errors import NotFoundError
 from gpu_fault.store.shared.health_signals import finding_health_signal_key
 from gpu_fault.telemetry import (
     CollectorKind,
@@ -162,13 +165,27 @@ class TelemetryContextService:
         finding_candidates: list[tuple[GpuInventorySnapshot, NodeHealthFinding]] = []
         clears: list[tuple[str, bool, datetime, float]] = []
         with self.context.store.processor_batch_transaction():
-            previous_values = self.context.store.observe_gpu_inventory_snapshots(
-                normalized
+            refusals = self._stale_boot_refusals(normalized, now)
+            accepted = iter(
+                self.context.store.observe_gpu_inventory_snapshots(
+                    [
+                        snapshot
+                        for snapshot, refusal in zip(normalized, refusals, strict=True)
+                        if refusal is None
+                    ]
+                )
             )
+            # A refused snapshot reads as one the store dropped (``False``):
+            # it is answered with the baseline it did not replace.
+            previous_values: list[GpuInventorySnapshot | Literal[False] | None] = [
+                False if refusal is not None else next(accepted) for refusal in refusals
+            ]
             statuses = []
             persisted_values = []
             evidence_candidates = []
-            for snapshot, previous in zip(normalized, previous_values, strict=True):
+            for snapshot, previous, refusal in zip(
+                normalized, previous_values, refusals, strict=True
+            ):
                 persisted = (
                     self.context.store.get_gpu_inventory_snapshot(
                         snapshot.cluster_id, snapshot.node_id
@@ -177,18 +194,7 @@ class TelemetryContextService:
                     else snapshot
                 )
                 persisted_values.append(persisted)
-                statuses.append(
-                    CollectorStatus(
-                        cluster_id=snapshot.cluster_id,
-                        node_id=snapshot.node_id,
-                        collector=CollectorKind.GPU_INVENTORY,
-                        observed_at=snapshot.observed_at,
-                        ingested_at=now,
-                        last_success_at=snapshot.observed_at,
-                        batch_id=snapshot.snapshot_id,
-                        sample_count=len(snapshot.devices),
-                    )
-                )
+                statuses.append(self._inventory_status(snapshot, now, refusal))
                 if previous is False:
                     continue
                 unknown = self._expected_count_unknown_finding(snapshot)
@@ -243,6 +249,122 @@ class TelemetryContextService:
         # workflow and marker writes are their own serialized unit.
         self._ingest_inventory_findings(finding_candidates, clears)
         return persisted_values
+
+    def _stale_boot_refusals(
+        self, snapshots: list[GpuInventorySnapshot], now: datetime
+    ) -> list[str | None]:
+        """Why each snapshot may not replace its node's baseline (``None``: it may).
+
+        A snapshot from another boot than the baseline's says the node
+        rebooted. That is believed of the node's current boot as its Agent
+        reports it, and of nothing else: inventory from any other boot -- a
+        previous boot's collector or outbox, a boot id that never existed --
+        is refused however fresh its timestamp (GF-GENERAL-LIVE-026
+        ``stale_boot``) and the baseline stays. A reboot the Agent has not
+        re-registered yet waits for its next heartbeat, as the coordinator's
+        generation fence does. With no current boot known (no Agent record,
+        none reported, a lapsed lease, an Agent not ACTIVE) observed_at
+        ordering alone decides, as before; so it does for a node's first
+        baseline and for a newer snapshot of the baseline's own boot. The
+        batch is walked in order, each snapshot judged against the baseline
+        the ones before it leave.
+        """
+
+        baselines: dict[tuple[str, str], GpuInventorySnapshot | None] = {}
+        current_boots: dict[tuple[str, str], str | None] = {}
+        refusals: list[str | None] = []
+        for snapshot in snapshots:
+            key = (snapshot.cluster_id, snapshot.node_id)
+            if key not in baselines:
+                baselines[key] = self.context.store.get_gpu_inventory_snapshot(*key)
+            baseline = baselines[key]
+            if baseline is None or snapshot.observed_at <= baseline.observed_at:
+                # A first baseline, or a stale snapshot / retry the store
+                # itself drops: nothing to judge here.
+                if baseline is None:
+                    baselines[key] = snapshot
+                refusals.append(None)
+                continue
+            refusal = None
+            if (
+                snapshot.source_boot_id
+                and baseline.source_boot_id
+                and snapshot.source_boot_id != baseline.source_boot_id
+            ):
+                if key not in current_boots:
+                    current_boots[key] = self._current_boot_id(*key, now=now)
+                current = current_boots[key]
+                if current is not None and snapshot.source_boot_id != current:
+                    refusal = (
+                        f"GPU inventory from boot {snapshot.source_boot_id} is not "
+                        f"the node's current boot {current} (Agent heartbeat); the "
+                        f"baseline from boot {baseline.source_boot_id} was kept"
+                    )
+                    LOGGER.warning(
+                        "GPU inventory %s on %s/%s carries boot %s but the node's "
+                        "Agent reports boot %s; baseline %s (boot %s) kept",
+                        snapshot.snapshot_id,
+                        snapshot.cluster_id,
+                        snapshot.node_id,
+                        snapshot.source_boot_id,
+                        current,
+                        baseline.snapshot_id,
+                        baseline.source_boot_id,
+                    )
+            if refusal is None:
+                baselines[key] = snapshot
+            refusals.append(refusal)
+        return refusals
+
+    def _current_boot_id(
+        self, cluster_id: str, node_id: str, *, now: datetime
+    ) -> str | None:
+        """The node's current boot as its Agent reports it; ``None``: unknown.
+
+        The authority the coordinator's generation fence trusts: an ACTIVE
+        Agent record with a boot id whose heartbeat lease has not lapsed.
+        """
+
+        try:
+            agent = self.context.store.get_agent(cluster_id, node_id)
+        except NotFoundError:
+            return None
+        lease = agent.lease_expires_at
+        if lease is not None and lease.tzinfo is None:
+            lease = lease.replace(tzinfo=timezone.utc)
+        if (
+            agent.lifecycle_state is not AgentLifecycleState.ACTIVE
+            or not agent.boot_id
+            or lease is None
+            or lease <= now
+        ):
+            return None
+        return str(agent.boot_id)
+
+    @staticmethod
+    def _inventory_status(
+        snapshot: GpuInventorySnapshot, now: datetime, refusal: str | None
+    ) -> CollectorStatus:
+        """The GPU_INVENTORY channel status one snapshot leaves.
+
+        A refused snapshot is a delivery whose newest state is a failure: the
+        collector answered, but not with the node's current inventory, so it
+        is no success -- the channel reads erroring with the reason (and, if
+        the node's boot never reports again, silent), not healthy.
+        """
+
+        return CollectorStatus(
+            cluster_id=snapshot.cluster_id,
+            node_id=snapshot.node_id,
+            collector=CollectorKind.GPU_INVENTORY,
+            observed_at=snapshot.observed_at,
+            ingested_at=now,
+            last_success_at=(snapshot.observed_at if refusal is None else None),
+            last_error_at=(snapshot.observed_at if refusal is not None else None),
+            batch_id=snapshot.snapshot_id,
+            sample_count=len(snapshot.devices),
+            errors=[] if refusal is None else [refusal],
+        )
 
     @staticmethod
     def _inventory_signal_key(snapshot: GpuInventorySnapshot, metric: str) -> str:
