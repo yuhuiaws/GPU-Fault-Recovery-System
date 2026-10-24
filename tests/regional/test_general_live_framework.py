@@ -65,7 +65,7 @@ def test_deferred_variant_is_not_implemented() -> None:
         ({"expected_outcome": "MAYBE"}, "expected outcome"),
         ({"expected_outcome": "FAIL"}, "must cite its product gap"),
         ({"max_minutes": 999}, "max_minutes is outside"),
-        ({"proof_mode": "live-replay"}, "only native and observation"),
+        ({"proof_mode": "vendor-lab"}, "only native, observation and live-replay"),
         ({"execute": None}, "needs execute"),
     ],
 )

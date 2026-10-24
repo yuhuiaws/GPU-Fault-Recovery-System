@@ -75,6 +75,14 @@ APPROVALS: dict[str, str] = {
         "delete one cluster-executor or completion-watcher Pod of the GPU "
         "cluster during an open restart claim (worker restart)"
     ),
+    "DECLARE_WARM_SPARE": (
+        "declare one warm spare GPU node through gpu-fault-admin config spare "
+        "(sets the spare label and cordons it); released and uncordoned in cleanup"
+    ),
+    "SPARE_KUBELET_STOP": (
+        "stop kubelet on the declared warm spare to drive it NotReady, with a "
+        "host-side automatic restart timer; restarted in cleanup"
+    ),
 }
 
 #: Workflow operations a diagnostic-only chain must never contain.
@@ -198,9 +206,15 @@ CATEGORY_MODULES = (
     "scripts.e2e.regional.general_live_utilization",
     "scripts.e2e.regional.general_live_attempts",
     "scripts.e2e.regional.general_live_collectors",
+    "scripts.e2e.regional.general_live_nccl",
+    "scripts.e2e.regional.general_live_progress",
+    "scripts.e2e.regional.general_live_spares",
 )
 #: The categories phase 1 implements (``cases`` rows of the coverage file).
 PHASE_ONE_CATEGORIES = (1, 3, 4, 6, 8, 9, 25, 28, 29, 31)
+#: The categories phase 2 adds (this lane: 011 NCCL hung, 027 training
+#: progress, 030 warm spare unhealthy).
+PHASE_TWO_CATEGORIES = (11, 27, 30)
 
 
 def coverage_rows(path: Path = COVERAGE_PATH) -> dict[str, list[str]]:
@@ -246,9 +260,9 @@ def validate_spec(spec: VariantSpec) -> None:
             raise RegistryError(f"{spec.key}: a deferred variant has no executor")
     elif spec.execute is None:
         raise RegistryError(f"{spec.key}: an executable variant needs execute()")
-    if spec.proof_mode not in {NATIVE, OBSERVATION} and not spec.deferred:
+    if spec.proof_mode not in {NATIVE, OBSERVATION, LIVE_REPLAY} and not spec.deferred:
         raise RegistryError(
-            f"{spec.key}: only native and observation variants run in phase 1"
+            f"{spec.key}: only native, observation and live-replay variants are executable"
         )
     if not 1 <= spec.max_minutes <= 180:
         raise RegistryError(f"{spec.key}: max_minutes is outside 1..180")
@@ -288,7 +302,7 @@ def load_registry() -> dict[str, VariantSpec]:
     for name in CATEGORY_MODULES:
         module = importlib.import_module(name)
         specs.extend(getattr(module, "VARIANTS"))
-    return build_registry(specs)
+    return build_registry(specs, categories=PHASE_ONE_CATEGORIES + PHASE_TWO_CATEGORIES)
 
 
 def select(
@@ -317,6 +331,7 @@ __all__ = [
     "NOT_RUN_REASONS",
     "OBSERVATION",
     "PHASE_ONE_CATEGORIES",
+    "PHASE_TWO_CATEGORIES",
     "RegistryError",
     "VENDOR_LAB",
     "VERDICTS",
