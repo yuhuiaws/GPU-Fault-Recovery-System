@@ -137,9 +137,10 @@ def cpu_busy(ctx: VariantContext) -> dict[str, Any]:
         ),
         "hardware": hardware_errors(observed),
     }
+    stopped_at = utc_now()
     ctx.node("cpu-stop")
     ctx.cleanup.discard("cpu-load")
-    recovered = _await_recovery(ctx, "cpu_usage_percent", oracle)
+    recovered = _await_recovery(ctx, "cpu_usage_percent", oracle, since=stopped_at)
     stages["recovery"] = recovered["errors"]
     settled = wait_settled(
         ctx,
@@ -203,9 +204,10 @@ def load_average(ctx: VariantContext) -> dict[str, Any]:
         "hardware": hardware_errors(detection),
         "distinct_signals": _distinct_signal_errors(detection),
     }
+    stopped_at = utc_now()
     ctx.node("cpu-stop")
     ctx.cleanup.discard("cpu-load")
-    recovered = _await_recovery(ctx, "load1_per_cpu", oracle)
+    recovered = _await_recovery(ctx, "load1_per_cpu", oracle, since=stopped_at)
     stages["recovery"] = recovered["errors"]
     wait_settled(
         ctx,
@@ -278,9 +280,10 @@ def recovery(ctx: VariantContext) -> dict[str, Any]:
     )
     _oracle_busy_each_tick(oracle, minimum=SUSTAIN_SECONDS // 5)
     incidents = finding_incidents(detection, "cpu_usage_percent")
+    stopped_at = utc_now()
     ctx.node("cpu-stop")
     ctx.cleanup.discard("cpu-load")
-    recovered = _await_recovery(ctx, "cpu_usage_percent", oracle)
+    recovered = _await_recovery(ctx, "cpu_usage_percent", oracle, since=stopped_at)
     settled = wait_settled(
         ctx,
         started_at,
@@ -323,9 +326,10 @@ def checkpoint_phase(ctx: VariantContext) -> dict[str, Any]:
         name="checkpoint-detection",
     )
     _oracle_busy_each_tick(oracle, minimum=SUSTAIN_SECONDS // 5)
+    stopped_at = utc_now()
     ctx.node("cpu-stop")
     ctx.cleanup.discard("cpu-load")
-    recovered = _await_recovery(ctx, "cpu_usage_percent", oracle)
+    recovered = _await_recovery(ctx, "cpu_usage_percent", oracle, since=stopped_at)
     stages = {
         "chain": chain_errors(
             detection,
@@ -355,11 +359,13 @@ def ctx_survey(ctx: VariantContext) -> dict[str, Any]:
     return run_survey(ctx)
 
 
-def _await_recovery(ctx: VariantContext, metric: str, oracle: Oracle) -> dict[str, Any]:
+def _await_recovery(
+    ctx: VariantContext, metric: str, oracle: Oracle, since: Any = None
+) -> dict[str, Any]:
     """Fresh evidence that ``metric`` recovered after the load stopped."""
 
     threshold = CPU_THRESHOLD if metric == "cpu_usage_percent" else LOAD_THRESHOLD
-    result = await_metric_recovery(ctx, metric, threshold)
+    result = await_metric_recovery(ctx, metric, threshold, since=since)
     oracle.read()
     return result
 

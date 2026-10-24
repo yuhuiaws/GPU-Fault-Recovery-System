@@ -12,7 +12,7 @@ hand.
 from __future__ import annotations
 
 from collections.abc import Iterable, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from scripts.e2e.regional.general_live_fixture import (
@@ -188,6 +188,7 @@ def await_metric_recovery(
     *,
     device: str | None = None,
     name: str | None = None,
+    since: datetime | None = None,
 ) -> dict[str, Any]:
     """Fresh product evidence that ``metric`` fell back below ``threshold``.
 
@@ -199,7 +200,11 @@ def await_metric_recovery(
     the recovery (live 2026-10-24: no second batch arrived within 14 minutes).
     """
 
-    started = utc_now()
+    # ``since`` is when the injection was told to stop: the recovered edge is
+    # often delivered while the stop is still in progress, before this wait
+    # starts (live 2026-10-24 001.cpu_busy: the edge came 8 s before the
+    # wait). Without it, look back two collector intervals.
+    started = since or (utc_now() - timedelta(seconds=ctx.host_interval * 2))
     key = signal_key(
         ctx.settings.regional.cluster_id, ctx.settings.node, metric, device
     )

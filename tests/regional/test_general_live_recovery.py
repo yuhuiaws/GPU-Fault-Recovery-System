@@ -81,3 +81,36 @@ def test_no_recovery_without_fresh_product_evidence(
 ) -> None:
     errors = _run(monkeypatch, batches, signal)["errors"]
     assert errors and "did not recover" in errors[0], errors
+
+
+def test_the_wait_reads_from_the_stop_request(monkeypatch: pytest.MonkeyPatch) -> None:
+    # Live 2026-10-24 001.cpu_busy (pass 3): the recovered edge was delivered
+    # 8 s before the wait began, while the load was stopping.
+    seen: list[Any] = []
+
+    def fake_activity(ctx: Any, since: Any, **_: Any) -> dict[str, Any]:
+        seen.append(since)
+        return {
+            "batches": [_batch(88.0)],
+            "health_signals": {KEY: {"active": False, "observed_at": LATER}},
+        }
+
+    monkeypatch.setattr(common, "activity", fake_activity)
+    stop = datetime(2026, 10, 24, 11, 13, 40, tzinfo=timezone.utc)
+    result = common.await_metric_recovery(_ctx(), "cpu_usage_percent", 98.0, since=stop)
+    assert result["errors"] == [] and seen == [stop], (result, seen)
+
+
+def test_without_a_stop_time_the_wait_looks_back_two_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[Any] = []
+    monkeypatch.setattr(
+        common,
+        "activity",
+        lambda ctx, since, **_: seen.append(since)
+        or {"batches": [], "health_signals": {}},
+    )
+    before = datetime.now(timezone.utc)
+    common.await_metric_recovery(_ctx(), "cpu_usage_percent", 98.0)
+    assert seen and seen[0] <= before - timedelta(seconds=29), seen

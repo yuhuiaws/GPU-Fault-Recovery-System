@@ -1064,7 +1064,9 @@ the host collector delivers an unchanged reading only once per health summary
 the stored evidence, so a recovery wait now spans two summary periods and
 accepts either two fresh delivered samples below the threshold or the
 recovered edge's fresh sample together with the product's cleared health
-signal for the metric (host CPU/load, storage and host memory alike); and the
+signal for the metric (host CPU/load, storage and host memory alike), read
+from the moment the stop was requested because that edge is often delivered
+while the stop is still in progress; and the
 GPU environment runner
 treats a collector unit that carries no endpoint override after the restore as
 restored to `collector.env`'s endpoint, the state its repoint started from.

@@ -159,9 +159,10 @@ def memory_pressure(ctx: VariantContext) -> dict[str, Any]:
         ),
         "hardware": hardware_errors(observed),
     }
+    stopped_at = utc_now()
     ctx.node("memory-stop")
     ctx.cleanup.discard("memory")
-    recovered = _await_recovery(ctx, oracle)
+    recovered = _await_recovery(ctx, oracle, since=stopped_at)
     stages["recovery"] = recovered["errors"]
     settled = wait_settled(
         ctx,
@@ -195,9 +196,10 @@ def recovery(ctx: VariantContext) -> dict[str, Any]:
     )
     _oracle_used_each_tick(oracle, minimum=SUSTAIN_SECONDS // 5)
     incidents = finding_incidents(detection, "memory_used_percent")
+    stopped_at = utc_now()
     ctx.node("memory-stop")
     ctx.cleanup.discard("memory")
-    recovered = _await_recovery(ctx, oracle)
+    recovered = _await_recovery(ctx, oracle, since=stopped_at)
     settled = wait_settled(
         ctx,
         started_at,
@@ -253,11 +255,13 @@ def no_swap(ctx: VariantContext) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # shared helpers
 # --------------------------------------------------------------------------- #
-def _await_recovery(ctx: VariantContext, oracle: Oracle) -> dict[str, Any]:
+def _await_recovery(
+    ctx: VariantContext, oracle: Oracle, since: Any = None
+) -> dict[str, Any]:
     """Fresh evidence that host memory use fell back below the threshold."""
 
     result = await_metric_recovery(
-        ctx, "memory_used_percent", USED_THRESHOLD, name="memory-recovery"
+        ctx, "memory_used_percent", USED_THRESHOLD, name="memory-recovery", since=since
     )
     oracle.read()
     return result
