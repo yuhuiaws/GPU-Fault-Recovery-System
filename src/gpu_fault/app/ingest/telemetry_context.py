@@ -4,6 +4,7 @@ import logging
 from datetime import datetime, timezone
 
 from gpu_fault.app.ingest.node_health import NodeHealthIngestionService
+from gpu_fault.gpu_composites import pci_bdf_matches, pci_bdf_parses
 from gpu_fault.gpu_metrics import GpuInventorySnapshot
 from gpu_fault.host_health import (
     NodeHealthCategory,
@@ -20,11 +21,27 @@ from gpu_fault.telemetry import (
 
 LOGGER = logging.getLogger(__name__)
 
-#: A GPU UUID left (or joined) the node's inventory between two snapshots.
+#: A GPU UUID left (or joined) the node's inventory between two snapshots, or
+#: a GPU that stayed answers on another PCI address.
 GPU_IDENTITY_CHANGED_METRIC = "gpu_inventory_identity_changed"
 #: The snapshot carries no expected GPU count, so a loss cannot be judged
 #: against the node's invariant; fail closed and say so, once per node.
 GPU_EXPECTED_COUNT_UNKNOWN_METRIC = "gpu_expected_count_unknown"
+
+
+def _pci_bdf_moved(before: str, after: str) -> bool:
+    """Whether a GPU answers on another PCI address than it did.
+
+    A 4- or 8-digit domain and the hex case are spellings of one address; a
+    value that does not parse as an address on either side is unknown, and
+    an unknown bus id is not evidence that the GPU moved.
+    """
+
+    if before.strip().lower() == after.strip().lower():
+        return False
+    if not (pci_bdf_parses(before) and pci_bdf_parses(after)):
+        return False
+    return not pci_bdf_matches(before, after)
 
 
 class TelemetryContextService:
@@ -236,7 +253,14 @@ class TelemetryContextService:
         previous: GpuInventorySnapshot,
         snapshot: GpuInventorySnapshot,
     ) -> NodeHealthFinding | None:
-        """A changed UUID set is a device lost or swapped, not just evidence.
+        """A changed GPU identity is a device lost, swapped or moved.
+
+        The identity is the UUID set and each UUID's PCI address: the
+        inventory's bus ids are what place an XID/SXID line or a PCIe metric
+        on a GPU, so the same UUIDs answering on other addresses (same count
+        included -- GF-GENERAL-LIVE-026 ``bdf_changed``) is a change, not only
+        evidence. Another spelling of one address is not a move, and a bus id
+        that does not parse on either side is unknown, not changed.
 
         Fail closed: the finding is CRITICAL whether or not an expected count
         is known, because the node the workload was scheduled on no longer
@@ -246,20 +270,34 @@ class TelemetryContextService:
         when a configured invariant is breached.
         """
 
-        before = {device.gpu_uuid for device in previous.devices}
-        after = {device.gpu_uuid for device in snapshot.devices}
-        if before == after:
+        before = {device.gpu_uuid: device.pci_bdf for device in previous.devices}
+        after = {device.gpu_uuid: device.pci_bdf for device in snapshot.devices}
+        removed = sorted(set(before) - set(after))
+        added = sorted(set(after) - set(before))
+        moved = [
+            {
+                "gpu_uuid": gpu_uuid,
+                "previous_pci_bdf": before[gpu_uuid],
+                "observed_pci_bdf": after[gpu_uuid],
+            }
+            for gpu_uuid in sorted(set(before) & set(after))
+            if _pci_bdf_moved(before[gpu_uuid], after[gpu_uuid])
+        ]
+        if not removed and not added and not moved:
             return None
-        removed = sorted(before - after)
-        added = sorted(after - before)
+        moved_text = [
+            f"{item['gpu_uuid']} {item['previous_pci_bdf']}->{item['observed_pci_bdf']}"
+            for item in moved
+        ]
         event_id = f"{snapshot.snapshot_id}-{GPU_IDENTITY_CHANGED_METRIC}"
         LOGGER.warning(
             "GPU inventory identity changed cluster=%s node=%s removed=%s added=%s "
-            "observed=%d expected=%s",
+            "pci_bdf_changed=%s observed=%d expected=%s",
             snapshot.cluster_id,
             snapshot.node_id,
             removed,
             added,
+            moved_text,
             len(after),
             snapshot.expected_gpu_count,
         )
@@ -274,17 +312,19 @@ class TelemetryContextService:
             reason=(
                 "GPU inventory identity changed between snapshots: "
                 f"removed={removed} added={added}"
+                + (f" pci_bdf_changed={moved_text}" if moved else "")
             ),
             recommended_action=RecoveryAction.RUN_DIAGNOSTICS,
             metric_name=GPU_IDENTITY_CHANGED_METRIC,
-            value=float(len(removed) + len(added)),
-            gpu_uuids=[*removed, *added],
+            value=float(len(removed) + len(added) + len(moved)),
+            gpu_uuids=[*removed, *added, *(item["gpu_uuid"] for item in moved)],
             evidence_ref=snapshot.evidence_ref
             or f"gpu-inventory://{snapshot.node_id}/{snapshot.snapshot_id}",
             runtime_profile_version=snapshot.runtime_profile_version,
             diagnostic_parameters={
                 "removed_gpu_uuids": removed,
                 "added_gpu_uuids": added,
+                "pci_bdf_changes": moved,
                 "previous_gpu_count": len(before),
                 "observed_gpu_count": len(after),
                 "expected_gpu_count": snapshot.expected_gpu_count,
@@ -292,7 +332,8 @@ class TelemetryContextService:
                 "previous_source_boot_id": previous.source_boot_id,
             },
             policy_reference=(
-                "a GPU that leaves the inventory is a fault, not only evidence"
+                "a GPU that leaves the inventory or answers on another PCI "
+                "address is a fault, not only evidence"
             ),
         )
 

@@ -170,6 +170,17 @@ def pci_bdf_matches(left: str, right: str) -> bool:
     return True
 
 
+def pci_bdf_parses(value: str) -> bool:
+    """Whether ``value`` spells a PCI address :func:`pci_bdf_matches` compares.
+
+    ``pci_bdf_matches`` answers False for an unparsable side, which reads as
+    "different"; a caller that must tell "another address" from "no usable
+    address" asks this first.
+    """
+
+    return _PCI_BDF.fullmatch(value.strip().lower()) is not None
+
+
 def is_pcie_kernel_xid(event: XidEvent) -> bool:
     return (
         event.event_source == "KERNEL_LOG"
