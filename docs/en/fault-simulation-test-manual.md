@@ -713,10 +713,17 @@ event is created."
 The HyperPod software harness uses the complete fake DCGM field set, duration counter inputs are in ns, and policy time
 advances in explicit 15-second samples; per-sample policy replay is reported separately from the sustained Collector
 edge-filter verification of `DCGM-E2E-013`, and the former must not be passed off as a confirmation/suppression test. The
-three-source harness first establishes an EOF baseline for the private FM log and then appends the SXID, binds responses by
-channel and batch, and does not read the host GPU inventory.
-The current DAG for EFA hung traffic is `FREEZE_EVIDENCE -> COLLECT_HUNG_TRIAGE ->
-{COLLECT_DIAGNOSTIC_BUNDLE, VALIDATE_FABRIC}`, which is not the removed completion-phase quick-triage.
+old and new exporter names of one field (`CLOCKS_EVENT_REASONS`/`CLOCK_THROTTLE_REASONS`,
+`GPU_TEMP_MARGIN_CELSIUS`/`GPU_TEMP_LIMIT`) carry the same value and the Collector keeps one sample. In `DCGM-E2E-013` a
+warning temperature still needs the three-sample edge confirmation; a critical temperature candidate is uploaded on every
+cycle and the control plane confirms it as CRITICAL on the third comparable sample, without re-alerting afterwards. Thermal,
+NVLink-counter and correctable-memory correlations only request diagnostics, and a cumulative counter that drops is not a
+recovery. The three-source harness first establishes an EOF baseline for the private FM log and then appends the SXID, binds
+responses by channel and batch, and does not read the host GPU inventory.
+The current DAG for EFA hung traffic is `FREEZE_EVIDENCE -> COLLECT_HUNG_SUMMARY(BASELINE) ->
+COLLECT_HUNG_SUMMARY(RECHECK) -> COLLECT_HUNG_TRIAGE(first wave) -> COLLECT_HUNG_TRIAGE(expansion) ->
+COLLECT_DIAGNOSTIC_BUNDLE`, with `VALIDATE_FABRIC` in parallel after RECHECK and `ESCALATE_SUPPORT` after both; only the two
+TRIAGE waves capture process state. It is not the removed completion-phase quick-triage.
 All of these verify only software inputs and an isolated control plane; they are not proof of hardware damage or
 real-hardware recovery.
 
