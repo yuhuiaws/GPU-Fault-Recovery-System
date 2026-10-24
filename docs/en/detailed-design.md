@@ -1063,13 +1063,39 @@ Collects and evaluates CPU/load, MCE, memory, OOM, file systems, Lustre, NIC, RD
 The host collector only reads InfiniBand devices whose driver is `efa`; mlx5 and other RDMA devices do not enter the EFA
 count, traffic or error baselines. The BMC status `nc` means non-critical and is not counted in
 `bmc_critical_sensor`; only `cr/critical/nr/non-recoverable` are counted. The SMART device scan ignores
-blank lines and records that are not `/dev/*`.
+blank lines and other records that are not `/dev/*`; `#` comment lines carry meaning (see below).
 
 SMART conclusions are cached per drive for 300 seconds, but `smartctl --scan-open` re-enumerates every cycle, so
-a swapped or newly attached disk does not have to wait for the cache to expire. The cache covers only queries that actually obtained a conclusion: when `smartctl -H` cannot run
-or its output cannot be parsed, this round emits `smart_health_failed=1` with `failure_mode=QUERY_FAILED`,
-does not open a cache window, and retries immediately in the next cycle; otherwise a single parse failure would freeze "this disk's health is unknown"
-for 300 seconds. A smartctl that returns normally but gives no PASSED/FAILED conclusion does not count as a failure and may be cached.
+a swapped or newly attached disk does not have to wait for the cache to expire. Only a JSON boolean
+`smart_status.passed` is a conclusion: `false` emits `smart_health_failed=1` (CRITICAL → `QUARANTINE`), `true` emits 0.
+When SMART gives no conclusion it is reported in one of two classes, neither of which is `smart_health_failed`
+(GF-GENERAL-LIVE-007):
+
+- UNKNOWN (a failed read): `smart_query_failed=1` plus a collection error. When `--scan-open` exits non-zero, times
+  out, or prints `# scan_smart_devices: <error>` (smartctl still exits 0 then), the drive set is unknown: it emits
+  `failure_mode=SCAN_FAILED` with no device and queries no drive this round -- it used to parse as "the node has no
+  drives", indistinguishable from healthy. A `# /dev/X -d ... open failed: <reason>` comment line in the scan emits
+  `OPEN_FAILED` for that drive instead of silently dropping it. When `smartctl -H` cannot run, times out, prints no
+  JSON, or `passed` is not a boolean, it emits `QUERY_FAILED` for that drive. A timeout affects only its own drive; the
+  other drives' conclusions (including one that just reported FAILED) are still reported. A failed query does not open a
+  cache window and is retried immediately in the next cycle; otherwise a single failure would freeze "this disk's health
+  is unknown" for 300 seconds. The collection error makes VALIDATE_HOST wait for a fresh successful observation and
+  infers no hardware failure.
+- NOT_SUPPORTED (a missing capability): `smart_status_unsupported=1` with `reason` `TOOL_MISSING` (no smartctl),
+  `NO_DEVICES` (the scan succeeded with no drive) or `NO_SMART_STATUS` (smartctl returns normally but gives no
+  PASSED/FAILED conclusion; cacheable). It is reported every cycle, with no collection error and no rule: the gap is
+  permanent, and recording it as a collection error would make every host validation of the node wait until its deadline.
+
+The `ethtool -S` counters of EFA netdevs (`efa_rnr_errors_delta`, `efa_retry_errors_delta`, `efa_cq_errors_delta`,
+`network_pfc_pause_delta`, `network_ecn_marks_delta`) report a delta only from a real reading (GF-GENERAL-LIVE-010).
+The first reading only sets the baseline; a counter that went backwards (a reset) reports no delta for its group that
+round and records a collection error, because a delta clamped to 0 would clear a signal that is still alarming; a value
+that is not a decimal integer leaves its group unknown too. When `ethtool -S` exits non-zero, times out or cannot run,
+that netdev records a collection error and emits no delta, while the other netdevs are still read. When the NIC has no
+counter for a group, or the driver exposes no statistics at all (`no stats available`, `Operation not supported`), it
+emits `efa_ethtool_counters_unsupported` (`value` is the number of missing groups, `labels.metrics` lists the missing
+delta names, `reason` is `MISSING_COUNTER` or `NO_STATISTICS`) instead of a 0, and records no collection error.
+All of these used to be reported as 0, which VALIDATE_FABRIC accepted as a clean link for counters it never measured.
 
 A single node log message can match several rules at once. The policy first picks the highest severity by `FATAL > CRITICAL > WARNING > INFO`,
 then picks the stronger action by the global RecoveryAction rank; on a complete tie it keeps the more specific rule that appears earlier in the rule table. Therefore a single line containing both OOM text and an EFA fatal is ultimately ruled an RDMA
@@ -3239,8 +3265,12 @@ The bottleneck where accepted stalled at 11k-13k in the load test is in this lay
 - `nvidia-smi --query-compute-apps=pid,gpu_uuid` plus each process's `/proc/<pid>/stat` to produce
   `training_rank_cpu_percent` per GPU UUID: the CPU the processes holding a compute context on that GPU used since the
   previous cycle, in percent of one core (the `top` %CPU convention; it can exceed 100);
-- `statvfs` on the mount points in `GPU_FAULT_FILESYSTEMS`, excluding NFS, Lustre, CIFS, Ceph, EFS and S3FS according to
-  `/proc/self/mountinfo`, to produce
+- `statvfs` on the mount points in `GPU_FAULT_FILESYSTEMS`: the blocks produce `filesystem_used_percent` and the
+  inodes (`f_files/f_ffree`) produce `filesystem_inodes_used_percent`; each is ruled CRITICAL `QUARANTINE` at ≥98% on
+  its own, and neither masks the other -- free bytes do not prove that the inodes are not exhausted
+  (GF-GENERAL-LIVE-004 `inode_full`); `f_files=0` (btrfs and most FUSE/NFS file systems, which keep no fixed inode
+  table) produces no inode sample. Excluding NFS, Lustre, CIFS, Ceph, EFS and S3FS according to
+  `/proc/self/mountinfo`, it then produces
   `local_filesystem_used_percent`.
 
 The control plane uses `HealthSignalState` in the Aurora/SQLite/in-memory Store to keep
@@ -3635,6 +3665,15 @@ The cost is that `gpu_inventory_active_count` in latest-metrics stays at the sta
 to read an NVML fault, look at `collection_errors` and the `DRIVER_QUERY_FAILED` samples, not at the ACTIVE
 count. Only when some GPUs fail to answer (a subset of UUIDs was still listed) are inventory samples produced as
 usual, additionally carrying the same `failure_mode=DRIVER_QUERY_FAILED` label.
+
+The kernel module creates `/proc/driver/nvidia/gpus/` when it loads, so only an empty directory is a real "0 bound";
+a directory that is missing or unreadable is not 0 but no reading at all. An NVML failure (not a single UUID listed)
+while that directory cannot be read either is two failed reads, not zero GPUs (GF-GENERAL-LIVE-012): that round
+emits only `gpu_inventory_expected_count` with `failure_mode=INVENTORY_UNAVAILABLE`, no discovered, active, missing or
+mismatch sample, the consecutive mismatch counter stays untouched as well, and the collection error names both failed
+reads. An unreadable directory used to count as 0, and the second such cycle minted `REBOOT_NODE`. When some GPUs
+fail to answer and the directory cannot be read, the inventory samples are produced as usual but without
+`gpu_inventory_discovered_count` and the `discovered_count` label, instead of reporting 0.
 
 #### 2.21.2 Debounce and metrics
 

@@ -33,7 +33,23 @@ training, thermal, spare-health or RMA policies from that review.
   collection error, not a healthy zero.
 - SMART query failures are `smart_query_failed` plus a collection error and
   are retried, rather than masquerading as `smart_health_failed` and causing
-  hardware quarantine. Genuine failed self-assessments remain unchanged.
+  hardware quarantine. Genuine failed self-assessments remain unchanged. A
+  `--scan-open` that fails (non-zero exit, timeout, or the
+  `# scan_smart_devices:` line smartctl prints before exiting 0) is
+  `SCAN_FAILED` rather than "no drives"; a drive the scan cannot open is
+  `OPEN_FAILED` rather than silently dropped; a hung or non-boolean `-H` is
+  `QUERY_FAILED` for that drive only. SMART the node cannot provide (no
+  smartctl, no drive, no SMART status) is `smart_status_unsupported`:
+  NOT_SUPPORTED, with no collection error.
+- EFA `ethtool -S` deltas come only from real readings: the first reading is a
+  baseline, a reset or an unparseable counter is unknown (collection error), a
+  failed or hung `ethtool` is a collection error for that netdev only, and a
+  counter the netdev lacks is `efa_ethtool_counters_unsupported` instead of 0.
+- An NVML failure while `/proc/driver/nvidia/gpus` is missing or unreadable is
+  `INVENTORY_UNAVAILABLE`: no GPU count, no mismatch, no streak advance -- two
+  failed reads are not zero GPUs. An unreadable directory used to count as 0.
+- Inode exhaustion is `filesystem_inodes_used_percent`, graded like capacity
+  (98 %, CRITICAL, QUARANTINE) and checked by VALIDATE_HOST.
 - Host metrics needed by verification are persisted. New diagnostic plans carry
   `host_diagnostic_probe`: metric, exact device, comparison, threshold and
   trigger time. Missing/stale target evidence waits; unrelated healthy devices

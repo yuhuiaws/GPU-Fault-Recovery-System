@@ -930,8 +930,10 @@ capability-absent variants (no SR-IOV VF netdev, no inactive cluster, no safe
 way to fail the live SES channel) and the dangerous branches that need an
 approval not arranged this phase (watcher network isolation, control-plane
 restart). The implemented verdicts record the known product gaps the spec
-expects to FAIL (byte-only `statvfs`, the weighted-time disk await, the empty
-required-interface list) rather than masking them.
+expects to FAIL (capacity-only `statvfs` for the read-only and vanished-mount
+variants, the weighted-time disk await, the empty required-interface list)
+rather than masking them. Inode exhaustion is no longer a product gap: the
+product grades `filesystem_inodes_used_percent` like capacity.
 
 ## GF-GENERAL-LIVE host/device categories (phase 2)
 
@@ -959,9 +961,15 @@ genuinely lacks the capability (no independent NFS/Lustre export, no non-EFA
 RDMA device, no BMC on EC2, no swap device); and `VENDOR_LAB_ONLY` for the
 012 variants that need a real GPU off the bus and an approved provider reboot
 (this lane never unbinds or removes a real GPU). The spec's expected product
-gaps (SMART scan-failure handling, EFA counters reported as zero, dual GPU
-read-failure treated as zero cards, statvfs-OK-but-I/O-fails shared storage)
-are recorded in the variants' reasons rather than hidden.
+gaps are recorded in the variants' reasons rather than hidden. Three of them
+are closed in the product and proven only by local software tests until the
+replay fixture exists: a failed SMART scan, an unopenable drive and a hung
+drive query read UNKNOWN (`smart_query_failed` plus a collection error), EFA
+`ethtool -S` deltas are reported only from real readings (failures and resets
+are UNKNOWN, missing counters `efa_ethtool_counters_unsupported`), and an NVML
+failure with an unreadable `/proc/driver/nvidia/gpus` is
+`INVENTORY_UNAVAILABLE` rather than zero GPUs. statvfs-OK-but-I/O-fails shared
+storage remains open.
 
 ## GF-GENERAL-LIVE live acceptance runner (phase 2)
 

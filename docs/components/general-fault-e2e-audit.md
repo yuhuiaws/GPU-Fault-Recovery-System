@@ -35,15 +35,15 @@
 | 001 | CPU 过载 | 部分 | GF-HOST-003 只到计划；新增 GF-GENERAL-SW-001 执行真实验证；应用阶段关联仍缺 |
 | 002 | 内存/交换耗尽 | 部分 | GF-HOST-OBS-001 验证 swap；GF-GENERAL-SW-001 扩展 memory；cgroup/任务归因仍缺 |
 | 003 | 低利用率/资源持续异常 (`SITE_HOST_RESOURCE_HEALTH`) | 部分 | 持续窗口、attempt 归属与诊断绑定有本地测试；应用阶段与 MIG 归因仍缺 |
-| 004 | 本地磁盘满 | 保留 | GF-HOST-001 只测策略；新增 GF-GENERAL-SW-002 执行隔离；inode/任务盘区分仍缺 |
+| 004 | 本地磁盘满 | 部分 | GF-HOST-001 只测策略；新增 GF-GENERAL-SW-002 执行隔离；inode 耗尽已按同一 98% 规则判定（`filesystem_inodes_used_percent`，SW-002 `inode` 变体执行真实隔离）；只读、挂载消失、EIO 与任务盘区分仍缺 |
 | 005 | 共享存储不可用/满 | 部分 | 有 statvfs 超时与策略测试；新诊断绑定；真实读写和跨节点故障域验收仍缺 |
 | 006 | 磁盘 IO 饱和 | 部分 | 有持续窗口与限时采集测试；新诊断绑定；与 checkpoint 关联仍缺 |
-| 007 | SMART 失败 | 部分 | GF-HOST-004 原为 API 到计划；新增 SW-002/003 分别执行隔离与拒绝误隔离；scan 失败仍待处理 |
+| 007 | SMART 失败 | 部分 | GF-HOST-004 原为 API 到计划；新增 SW-002/003 分别执行隔离与拒绝误隔离；scan 失败、盘无法打开、单盘超时为 UNKNOWN（`smart_query_failed` + collection error，SW-003 `smart-scan`），工具缺失/无盘/无结论为 NOT_SUPPORTED（`smart_status_unsupported`）；真机回放夹具仍缺 |
 | 008 | 网卡链路 down | 部分 | 新增 SW-002/003 覆盖接口消失/down/unknown；接口角色、bond 等场景仍缺 |
 | 009 | 网卡错误/丢包 | 部分 | 错误/丢包持续窗口有本地测试；新诊断绑定；错误率与业务关联仍缺 |
-| 010 | EFA/RDMA 计数错误 | 部分 | GF-HOST-002 只测策略；新诊断绑定；按驱动/计数器语义分级仍缺 |
+| 010 | EFA/RDMA 计数错误 | 部分 | GF-HOST-002 只测策略；新诊断绑定；`ethtool -S` 差值只来自真实读数（失败/重置为 UNKNOWN，缺失计数器为 `efa_ethtool_counters_unsupported`，不再报 0）；sysfs 计数器重置语义与按驱动/计数器语义分级仍缺 |
 | 011 | EFA 流量状态机 (`SITE_EFA_TRAFFIC`) | 部分 | GF-HOST-OBS-004 跑真实 main 但不执行 DAG；大规模挂起到证据闭环仍缺 |
-| 012 | GPU 掉卡 | 保留 | COLLECT-003/004 和采集超时测试；查询失败、真实掉卡、配置错配须分开验收 |
+| 012 | GPU 掉卡 | 部分 | COLLECT-003/004 和采集超时测试；NVML 失败且 `/proc/driver/nvidia/gpus` 不存在/不可读为 UNKNOWN（`INVENTORY_UNAVAILABLE`），不再生成 REBOOT_NODE（SW-003 `gpu-unknown`）；真实掉卡、配置错配仍须分开真机验收 |
 | 013 | EFA 掉卡 | 部分 | OBS-003 防读取失败误重启；COLLECT-017 只覆盖部分真实分层恢复；PCI/link 全分支仍缺 |
 | 014 | K8s allocatable 少报 | 保留 | COLLECT-017/DESTR-021 有 runner；MIG/time-slicing 与全部归因场景仍缺 |
 | 015 | BMC 传感器告警 | 部分 | 新增 SW-002/003 覆盖标准四列和失败查询；具体传感器影响级别仍缺 |
@@ -395,11 +395,12 @@ FAILED workflow；核对 STOP、日志证据、terminal event、marker 复用/�
 
 - `GF-GENERAL-SW-001`：原始 procfs -> collector -> ASGI API -> SQLite ->
   工作流执行器 -> 真实 GpuValidationAdapter，CPU/memory/swap 各两种结果。
-- `GF-GENERAL-SW-002`：filesystem/SMART/BMC/net missing/net down -> 同链 ->
+- `GF-GENERAL-SW-002`：filesystem/inode 耗尽/SMART/BMC/net missing/net down -> 同链 ->
   真实 KubernetesWorkflowAdapter。仅 Kubernetes 客户端是本地替身，断言实际 patch。
-- `GF-GENERAL-SW-003`：SMART 查询失败/BMC 查询失败/net unknown 经 API 后不产生隔离。
+- `GF-GENERAL-SW-003`：SMART 查询失败/SMART 扫描失败/BMC 查询失败/net unknown/
+  GPU 库存双读失败经 API 后不产生隔离或 REBOOT_NODE。
 
-这 14 个参数变体使用临时 OS 数据、命令 runner 与 Kubernetes 客户端，不访问真实
+这 17 个参数变体使用临时 OS 数据、命令 runner 与 Kubernetes 客户端，不访问真实
 GPU/NIC/Kubernetes/AWS。常规健康 Host 验证基线由 fixture 补齐；未宣称覆盖其他
 collector contributor。持续窗口在本地 API 模式使用显式虚拟 `received_at` 接收时钟，
 不通过缩短生产阈值或真实等待来加速。没有把 GPU reset、NCCL hung 或其他 32 类

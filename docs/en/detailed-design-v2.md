@@ -1395,6 +1395,8 @@ while the driver still has GPUs bound, only a context sample with `failure_mode=
 makes the whole fleet fail NVML at once, and ruling GPUs out on that basis would amount to a fleet-wide `REBOOT_NODE`. The side effect is that
 `gpu_inventory_active_count` in latest-metrics stays at its old value during an NVML outage; when interpreting,
 look at `collection_errors` and `DRIVER_QUERY_FAILED`; details in the v1 Detailed Design §2.21.1.
+When the driver's own `/proc/driver/nvidia/gpus` cannot be read either, nothing is ruled either: the sample carries
+`failure_mode=INVENTORY_UNAVAILABLE` and no count at all, because two failed reads are not zero GPUs.
 
 **⑫ Unit test scope**: decoding and action mapping for every rule in the XID catalog; NVLink5 sub-codes take
 the v1/v2 bit patterns on either side of `driverBoundary`; SXID classification into official/investigatory actions;
