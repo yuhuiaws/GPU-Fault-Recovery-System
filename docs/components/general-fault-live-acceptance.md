@@ -629,3 +629,48 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_progress`/`_spares`。
 计划/执行形如 `--case GF-GENERAL-LIVE-011 --variant active_to_zero --site-file <F>
 --node-b <N2> --hyperpod-cluster <HP>`（011/030 在 hp 车道，011/030 需 `--site-file`，
 011 需 `--node-b`，030 的热备节点用 `--fault-node`）。
+
+### phase 2 范围与前提（内核/应用日志、未知错误、EFA 库存）
+
+phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取路径注入：
+
+- 可复用的**内核日志源回放**
+  `scripts/e2e/regional/general_live_kernel_replay.py`（主机探针
+  `probes/general_live_kernel_source_probe.py`）为单节点/单 boot 安装一组经审查
+  的 kernel-transport 记录、arm、读回产品实际摄入内容、清理。两种模式：journal
+  模式在节点日志采集器的 PATH 前置一个 `journalctl` 透传包装（转发真实输出，仅在
+  arm 后追加经审查记录，有界 emissions、去重为一条 incident），kmsg 模式用 `/run`
+  drop-in 把内核采集器的 `GPU_FAULT_KMSG_PATH` 指到经审查夹具文件。`_TRANSPORT=kernel`
+  为可信 `dmesg` 来源，其它 transport 保持不可信 `journal` 来源——这正是信任门禁。
+  lane R 的“独立可信 XID”变体后续复用此助手。
+- 主机采集器**文件源回放** `general_live_source_replay.py`（探针
+  `probes/general_live_source_probe.py`）只在主机采集器自身 mount namespace 内用
+  `BindReadOnlyPaths` 替换一个允许列表内的 procfs/sysfs 文件（`/proc/stat` 或 gfrs
+  测试网卡的 statistics 计数器），或重指 `GPU_FAULT_PCI_DEVICES_ROOT`。
+- 所有回放都带 `systemd-run --on-active` deadman，证据标注 `proof_scope: live-replay`，
+  只证明处理链，不证明物理故障。
+
+已实现变体：016 严重内核日志（全部 9 个，含 user_text/old_boot/corrected_mce 的
+反向门禁）、017 应用错误日志（cgroup_oom 诊断与 nccl_error/distributed_error 仅证据）、
+032 `unknown_xid`（判为 SITE_SAFETY）与 `duplicate`、013 `unreadable_state`
+（UNKNOWN 而非零卡），以及 phase-1 文件源 001 `invalid_delta`、008 `statistics_failed`、
+009 `errors_delta`。
+
+计划/执行守卫键仍为 `<case>.<variant>`，确认串 `GENERALLIVE<NNN>_EXECUTE`。新 `--approve`
+令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`EFA_DRIVER_UNBIND`、
+`DEVICE_PLUGIN_RESTART`（013/014 的原生注入，本轮未执行）；016/017 的 journal 模式复用
+`ENABLE_NODE_LOG_COLLECTOR`（节点日志采集器生产默认禁用），008/009 复用
+`KERNEL_MODULE_LOAD`。每个 016/017/032/013 变体单独 plan/execute，与 phase-1 相同：
+
+```bash
+run_general_live.py --site-profile <profile> --run-dir <run> \
+  --case GF-GENERAL-LIVE-016 --variant rdma_fatal --execute \
+  --confirm GENERALLIVE016_EXECUTE --approve ENABLE_NODE_LOG_COLLECTOR \
+  --maintenance-window-end <UTC>
+```
+
+本轮保持 `NOT_RUN` 并留在分母：014 全部（伪造 allocatable/改 Node.status 不算证明，
+原生 plugin 故障需 `DEVICE_PLUGIN_RESTART`）、013 多数（唯一 EKS 节点上的 missing→reboot
+链、保留的原生解绑、不可重指的 `/sys/class/infiniband`）、032 的目录/版本/Profile 权限
+变体（AUTH-015 未配置）、017 的归属变体（需受管 attempt 与 CRI Pod 日志）、004 `probe_error`
+（`statvfs` 错误无法由只读文件 bind 产生）。

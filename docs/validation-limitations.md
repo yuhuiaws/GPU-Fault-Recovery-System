@@ -986,3 +986,40 @@ flight-recorder dump responder, a py-spy fault tool, a role-declaration job, a
 in this regional control plane, `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`)
 stay `NOT_RUN` with an explicit reason in the denominator rather than being
 dropped. No GF-GENERAL-LIVE case has live evidence yet.
+
+## GF-GENERAL-LIVE live acceptance runner (phase 2, lane K)
+
+Phase 2 adds reviewed `live-replay` categories that drive the product's own
+readers. The reusable kernel-log source replay
+(`scripts/e2e/regional/general_live_kernel_replay.py` and
+`probes/general_live_kernel_source_probe.py`) installs a reviewed set of
+kernel-transport records for one node and boot and reads back what the product
+ingested, two ways: a `journalctl` pass-through wrapper on the node log
+collector (journal mode) and a `GPU_FAULT_KMSG_PATH` repoint of the kernel
+collector (kmsg mode). A sibling host-collector source replay
+(`general_live_source_replay.py` / `probes/general_live_source_probe.py`)
+binds one reviewed procfs/sysfs file into the host collector's private mount
+namespace or repoints `GPU_FAULT_PCI_DEVICES_ROOT`. Every replay only replaces
+the raw reading; parsing, trust classification, grading, the database and the
+approved node actions stay real, so the evidence is always `proof_scope:
+live-replay` -- it proves the processing chain, never the physical fault.
+
+Implemented live-replay variants: 016 severe kernel log (all nine, including the
+trusted-source and current-boot gates that must *not* isolate on a user-space or
+old-boot line), 017 application error logs (the OOM diagnostic and the NCCL /
+distributed evidence-only paths), 032 unknown error (`unknown_xid` graded
+SITE_SAFETY and its dedup), 013 EFA inventory `unreadable_state` (UNKNOWN, not
+zero cards), and the phase-1 host file-source variants 001 `invalid_delta`,
+008 `statistics_failed` and 009 `errors_delta`.
+
+The variants that stay `NOT_RUN` on this single-node site keep their place in the
+denominator with an explicit reason: 014 Kubernetes allocatable (every variant --
+faking allocatable or patching `Node.status` is not valid proof, and the native
+device-plugin fault needs the reserved `DEVICE_PLUGIN_RESTART` approval), most of
+013 (the PCI-missing reboot chain on the only EKS GPU node, the reserved
+`EFA_DRIVER_UNBIND` native unbind, and the non-repointable `/sys/class/infiniband`
+tree), the catalog/authority-bound 032 variants (a genuinely unknown product
+needs other hardware; `observe_profile` / `permitted_isolation` need a Runtime
+Profile authority the site does not configure, AUTH-015), the 017 attribution
+variants (a managed attempt with CRI Pod logs, lane N territory), and 004
+`probe_error` (a `statvfs` error cannot be produced by a read-only file bind).
