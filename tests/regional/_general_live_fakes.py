@@ -259,7 +259,11 @@ def incident(
     state: str = "ACTION_PENDING",
     workflow: str = "wf-1",
 ) -> dict[str, Any]:
-    event = f"batch0-{metric}-{device}" + (f"-{rule_id.lower()}" if rule_id else "")
+    from scripts.e2e.regional.general_live_verdicts import safe_device
+
+    event = f"batch0-{metric}-{safe_device(device)}" + (
+        f"-{rule_id.lower()}" if rule_id else ""
+    )
     return {
         "incident_id": incident_id,
         "event_id": event,

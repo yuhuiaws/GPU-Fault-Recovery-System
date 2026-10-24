@@ -95,7 +95,10 @@ def plan_details(
 
 
 def evidence_skeleton(
-    spec: VariantSpec, settings: GeneralLiveSettings, attempt: int, identity: dict[str, Any]
+    spec: VariantSpec,
+    settings: GeneralLiveSettings,
+    attempt: int,
+    identity: dict[str, Any],
 ) -> dict[str, Any]:
     return {
         "schema_version": SCHEMA_VERSION,
@@ -114,7 +117,9 @@ def evidence_skeleton(
     }
 
 
-def not_run(result: dict[str, Any], reason: str, detail: str, status: str) -> dict[str, Any]:
+def not_run(
+    result: dict[str, Any], reason: str, detail: str, status: str
+) -> dict[str, Any]:
     result["verdict"] = status
     result["reason"] = reason
     result["detail"] = detail
@@ -137,11 +142,11 @@ def execute_variant(
     result = evidence_skeleton(spec, settings, attempt, identity)
     missing = [item for item in spec.approvals if item not in settings.approvals]
     if missing:
-        return not_run(result, "NOT_AUTHORIZED", f"missing approvals {missing}", "NOT_RUN")
-    if preflight.get("errors"):
         return not_run(
-            result, "BLOCKED", "; ".join(preflight["errors"]), "BLOCKED"
+            result, "NOT_AUTHORIZED", f"missing approvals {missing}", "NOT_RUN"
         )
+    if preflight.get("errors"):
+        return not_run(result, "BLOCKED", "; ".join(preflight["errors"]), "BLOCKED")
     ctx = VariantContext(
         spec=spec,
         settings=settings,
@@ -173,14 +178,13 @@ def execute_variant(
             write_json_atomic(case_evidence_path(run_dir, spec.key), result)
             raise
     _teardown(ctx, result)
-    if result["verdict"] == "PASS" and spec.expected_outcome == "FAIL":
-        # The spec marks this variant as exposing a product gap: an effective
-        # injection that nonetheless "passes" the chain is the FAIL the case
-        # exists to record, not a PASS.
-        result["verdict"] = "FAIL"
-        result.setdefault("errors", []).append(
-            f"effective injection did not expose the expected gap: {spec.product_gap}"
-        )
+    # An ``expected_outcome == "FAIL"`` variant computes its own verdict: FAIL
+    # while the product gap is present, PASS once the product is fixed. The
+    # verdict is not flipped here -- doing so would mask a fix -- but the plan
+    # records the expectation so a PASS on such a variant is read as "the gap
+    # named in product_gap is closed", not as an ordinary clean run.
+    if spec.expected_outcome == "FAIL":
+        result["expected_gap"] = spec.product_gap
     result["ended_at"] = utc_now().isoformat()
     write_json_atomic(case_evidence_path(run_dir, spec.key), result)
     return result
