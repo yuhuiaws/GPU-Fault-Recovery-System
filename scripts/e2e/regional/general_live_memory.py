@@ -49,6 +49,7 @@ from scripts.e2e.regional.general_live_registry import (
     deferred_variant,
 )
 from scripts.e2e.regional.general_live_verdicts import (
+    DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
     chain_errors,
     finding_incidents,
@@ -152,7 +153,7 @@ def memory_pressure(ctx: VariantContext) -> dict[str, Any]:
                 validation="VALIDATE_HOST",
                 validation_must_fail=True,
                 probe_metric="memory_used_percent",
-                incident_states=frozenset({"ACTION_PENDING", "ESCALATED"}),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
         "hardware": hardware_errors(observed),
@@ -262,17 +263,18 @@ def _await_recovery(ctx: VariantContext, oracle: Oracle) -> dict[str, Any]:
             if isinstance(sample.get("value"), (int, float))
             and sample["value"] < USED_THRESHOLD
         ]
-        return {"samples": fresh} if len(fresh) >= 3 else None
+        return {"samples": fresh} if len(fresh) >= 2 else None
 
+    # The recovered edge plus one health summary (see general_live_host).
     value = ctx.wait_until(
         accept,
-        timeout_seconds=ctx.host_summary + ctx.host_interval * 6,
+        timeout_seconds=ctx.host_summary * 2 + ctx.host_interval * 6,
         poll_seconds=ctx.host_interval,
         name="memory-recovery",
     )
     oracle.read()
     if value is None:
-        return {"errors": ["memory_used_percent did not report 3 fresh samples < 95 %"]}
+        return {"errors": ["memory_used_percent did not report 2 fresh samples < 95 %"]}
     return {"errors": [], "fresh_samples": value["samples"]}
 
 
@@ -310,7 +312,7 @@ VARIANTS = [
         flags="S",
         injection="hold host MemAvailable low (~96.5 % used) in a capped cgroup for > 120 s",
         expected="memory_used_percent >= 95 for 120 s -> VALIDATE_HOST probe fails while loaded; no reset/reboot",
-        cleanup="stop the allocator; 3 fresh samples below 95 %",
+        cleanup="stop the allocator; 2 fresh samples below 95 %",
         max_minutes=22,
         approvals=("HOST_MEMORY_PRESSURE",),
         execute=memory_pressure,
@@ -370,7 +372,7 @@ VARIANTS = [
         risk="M",
         flags="S",
         injection="drive memory_pressure to a finding, then stop the allocator",
-        expected="3 fresh samples below 95 % and the incident settles; no reboot masks the OOM",
+        expected="2 fresh samples below 95 % and the incident settles; no reboot masks the OOM",
         cleanup="none",
         max_minutes=22,
         approvals=("HOST_MEMORY_PRESSURE",),

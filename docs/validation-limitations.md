@@ -1032,6 +1032,7 @@ fault is held ends `RECOVERED` with reason `diagnostic inconclusive`
 or that `RECOVERED` and flag `ESCALATED` or a `RECOVERED` without the reason;
 the host collector delivers an unchanged reading only once per health summary
 (`GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS`), so a recovery wait now spans two
-summary periods for its two fresh samples; and the GPU environment runner
+summary periods for its two fresh samples (host CPU/load, storage and host
+memory alike); and the GPU environment runner
 treats a collector unit that carries no endpoint override after the restore as
 restored to `collector.env`'s endpoint, the state its repoint started from.

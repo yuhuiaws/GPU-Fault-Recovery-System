@@ -28,8 +28,14 @@ LANE_CATEGORIES = (2, 5, 7, 10, 12, 15)
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
 
 
-def test_phase_two_categories_are_exactly_lane_n1() -> None:
-    assert reg.PHASE_TWO_CATEGORIES == LANE_CATEGORIES, reg.PHASE_TWO_CATEGORIES
+def test_phase_two_categories_include_the_host_device_lane() -> None:
+    # The integrated registry unions every phase-2 lane's categories.
+    assert set(LANE_CATEGORIES) <= set(reg.PHASE_TWO_CATEGORIES), (
+        reg.PHASE_TWO_CATEGORIES
+    )
+    assert list(reg.PHASE_TWO_CATEGORIES) == sorted(set(reg.PHASE_TWO_CATEGORIES)), (
+        "phase-2 categories are listed once, in case order"
+    )
     assert set(reg.PHASE_ONE_CATEGORIES).isdisjoint(reg.PHASE_TWO_CATEGORIES), (
         "phase-2 categories must not overlap phase 1"
     )
