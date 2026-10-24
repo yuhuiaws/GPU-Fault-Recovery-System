@@ -59,12 +59,22 @@ DEFAULTS = {
     "DCGM_FI_DEV_XID_ERRORS": 0,
 }
 
+# Old and new exporter names of one DCGM field. A real exporter reports both
+# from the same field, so they carry the same value and the collector keeps one
+# sample; differing values are a conflict that stays UNKNOWN.
+ALIASES = {
+    "DCGM_FI_DEV_CLOCKS_EVENT_REASONS": "DCGM_FI_DEV_CLOCK_THROTTLE_REASONS",
+    "DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS": "DCGM_FI_DEV_GPU_TEMP_LIMIT",
+}
+
 COUNTERS = {
     name
     for name in DCGM_METRICS
     if name not in DEFAULTS
     and name
     not in {
+        *ALIASES,
+        *ALIASES.values(),
         "DCGM_FI_DEV_RETIRED_PENDING",
         "DCGM_FI_DEV_ROW_REMAP_FAILURE",
         "DCGM_FI_DEV_ROW_REMAP_PENDING",
@@ -163,13 +173,15 @@ class MetricSeries:
 
 
 POLICY_SERIES: dict[str, MetricSeries] = {}
+THERMAL_VIOLATION_FINAL_NS = 2_000_000_000
 
 
 def metric_text(values: dict[str, float], gpu: dict[str, str] = GPU0) -> str:
     labels = ",".join(f'{key}="{value}"' for key, value in gpu.items())
     lines = []
     for name in DCGM_METRICS:
-        value = values.get(name, DEFAULTS.get(name, 0))
+        source = ALIASES.get(name, name)
+        value = values.get(source, DEFAULTS.get(source, 0))
         metric_type = "counter" if name in COUNTERS else "gauge"
         lines.extend(
             [
@@ -207,7 +219,9 @@ def collect(
     return result
 
 
-def assert_rule(result: dict[str, Any], rule: str, severity: str) -> None:
+def assert_rule(
+    result: dict[str, Any], rule: str, severity: str, action: str | None = None
+) -> None:
     matches = [
         item
         for item in result["composite_findings"]
@@ -215,6 +229,8 @@ def assert_rule(result: dict[str, Any], rule: str, severity: str) -> None:
     ]
     assert matches, f"missing composite rule {rule}: {result}"
     assert matches[0]["severity"] == severity, matches[0]
+    if action is not None:
+        assert matches[0]["automatic_action"] == action, matches[0]
 
 
 def summarize(result: dict[str, Any]) -> dict[str, Any]:
@@ -258,7 +274,7 @@ def _baseline_and_limit_cases(cases: list[dict[str, Any]]) -> str:
     latest = get_json(f"/v1/gpu-metrics/{CLUSTER_ID}/dcgm-e2e-all-metrics/latest")
     observed = {item["sample"]["canonical_name"] for item in latest}
     assert expected == observed, sorted(expected - observed)
-    assert baseline["accepted_samples"] == len(DCGM_METRICS)
+    assert baseline["accepted_samples"] == len(DCGM_METRICS) - len(ALIASES)
     assert not baseline["new_findings"]
     cases.append(
         {
@@ -283,14 +299,16 @@ def _baseline_and_limit_cases(cases: list[dict[str, Any]]) -> str:
         "DCGM_FI_DEV_MEM_CLOCK": 1600,
     }
     first = collect(thermal_node, thermal_values)
-    thermal_values["DCGM_FI_DEV_THERMAL_VIOLATION"] = 2_000_000_000
+    thermal_values["DCGM_FI_DEV_THERMAL_VIOLATION"] = THERMAL_VIOLATION_FINAL_NS
     second = collect(thermal_node, thermal_values)
-    assert_rule(first, "THERMAL_STRESS", "WARNING")
-    assert_rule(second, "THERMAL_STRESS", "CRITICAL")
+    # A warning temperature with thermal limiting stays read-only diagnostics:
+    # a composite never exceeds its confirmed temperature component's action.
+    assert_rule(first, "THERMAL_STRESS", "WARNING", "RUN_DIAGNOSTICS")
+    assert_rule(second, "THERMAL_STRESS", "WARNING", "RUN_DIAGNOSTICS")
     cases.append(
         {
             "id": "DCGM-E2E-002",
-            "name": "thermal violation and thermal throttle correlation",
+            "name": "thermal violation and thermal throttle correlation stays diagnostic",
             "status": "PASSED",
             "first": summarize(first),
             "second": summarize(second),
@@ -334,8 +352,14 @@ def _memory_cases(cases: list[dict[str, Any]]) -> None:
             },
         )
         corrected_results.append(result)
-    assert_rule(corrected_results[0], "CORRECTABLE_MEMORY_DEGRADATION", "WARNING")
-    assert_rule(corrected_results[2], "CORRECTABLE_MEMORY_DEGRADATION", "CRITICAL")
+    # Correctable-only correlation escalates severity but never authorizes DRAIN.
+    for result, severity in (
+        (corrected_results[0], "WARNING"),
+        (corrected_results[2], "CRITICAL"),
+    ):
+        assert_rule(
+            result, "CORRECTABLE_MEMORY_DEGRADATION", severity, "RUN_DIAGNOSTICS"
+        )
     cases.append(
         {
             "id": "DCGM-E2E-004",
@@ -348,11 +372,13 @@ def _memory_cases(cases: list[dict[str, Any]]) -> None:
     retired = "dcgm-e2e-retired-dbe"
     collect(retired, {})
     retired_result = collect(retired, {"DCGM_FI_DEV_RETIRED_DBE": 1})
+    # A retirement increment is repair evidence: it requests diagnostics.
     assert any(
         item["canonical_name"] == "retired_pages_dbe_total"
-        and item["severity"] == "CRITICAL"
+        and item["severity"] == "WARNING"
+        and item["automatic_action"] == "RUN_DIAGNOSTICS"
         for item in retired_result["findings"]
-    )
+    ), retired_result["findings"]
     cases.append(
         {
             "id": "DCGM-E2E-005",
@@ -439,7 +465,8 @@ def _link_cases(cases: list[dict[str, Any]]) -> None:
             "DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL": 1,
         },
     )
-    assert_rule(nvlink, "NVLINK_LINK_DEGRADATION", "CRITICAL")
+    # NVLink counters alone request diagnostics, never DRAIN/RMA by themselves.
+    assert_rule(nvlink, "NVLINK_LINK_DEGRADATION", "WARNING", "RUN_DIAGNOSTICS")
     cases.append(
         {
             "id": "DCGM-E2E-009",
@@ -456,7 +483,8 @@ def _link_cases(cases: list[dict[str, Any]]) -> None:
         {"DCGM_FI_DEV_NVLINK_CRC_DATA_ERROR_COUNT_TOTAL": 1},
         second_gpu={"DCGM_FI_DEV_NVLINK_RECOVERY_ERROR_COUNT_TOTAL": 1},
     )
-    assert_rule(fabric, "MULTI_GPU_NVLINK_FABRIC_FAILURE", "CRITICAL")
+    # Multi-GPU counter correlation alone also stays diagnostic (no DRAIN/RMA).
+    assert_rule(fabric, "MULTI_GPU_NVLINK_FABRIC_FAILURE", "WARNING", "RUN_DIAGNOSTICS")
     cases.append(
         {
             "id": "DCGM-E2E-010",
@@ -476,7 +504,7 @@ def _link_cases(cases: list[dict[str, Any]]) -> None:
             "DCGM_FI_DEV_NVLINK_ERROR_DL_REPLAY": 1,
         },
     )
-    assert_rule(aggregate, "NVLINK_LINK_DEGRADATION", "CRITICAL")
+    assert_rule(aggregate, "NVLINK_LINK_DEGRADATION", "WARNING", "RUN_DIAGNOSTICS")
     cases.append(
         {
             "id": "DCGM-E2E-011",
@@ -491,7 +519,11 @@ def _recovery_case(
     cases: list[dict[str, Any]],
     thermal_node: str,
 ) -> None:
-    recovered = collect(thermal_node, {})
+    # Cooling ends new limiting but keeps the cumulative counter: a counter that
+    # drops (a reset) is not a healthy zero delta and cannot clear the finding.
+    recovered = collect(
+        thermal_node, {"DCGM_FI_DEV_THERMAL_VIOLATION": THERMAL_VIOLATION_FINAL_NS}
+    )
     active = get_json(f"/v1/gpu-health-findings/{CLUSTER_ID}/{thermal_node}")
     assert not active, active
     cases.append(
@@ -516,36 +548,61 @@ def run_cases() -> list[dict[str, Any]]:
     return cases
 
 
+def _temperature_action(result: dict[str, Any]) -> tuple[str, str, int]:
+    findings = [
+        item
+        for item in result["new_findings"]
+        if item["canonical_name"] == "gpu_temperature_c"
+    ]
+    assert len(findings) == 1, findings
+    finding = findings[0]
+    return (
+        finding["severity"],
+        finding["automatic_action"],
+        finding["confirmation_count"],
+    )
+
+
 def persistent_temperature_case(cases: list[dict[str, Any]]) -> None:
     series = MetricSeries("dcgm-e2e-persistent-temperature")
     baseline = series.collect({})
     assert baseline is not None and not baseline["new_findings"]
     transitions = []
-    for value, severity, action in (
-        (86, "WARNING", "RUN_DIAGNOSTICS"),
-        (91, "CRITICAL", "DRAIN"),
-    ):
-        values = {"DCGM_FI_DEV_GPU_TEMP": value}
-        assert series.collect(values) is None, "first sample is not confirmation"
-        assert series.collect(values) is None, "second sample is not confirmation"
-        result = series.collect(values)
-        assert result is not None, "confirmed temperature action was suppressed"
-        findings = [
-            item
-            for item in result["new_findings"]
-            if item["canonical_name"] == "gpu_temperature_c"
-        ]
-        assert len(findings) == 1, findings
-        assert (findings[0]["severity"], findings[0]["automatic_action"]) == (
-            severity,
-            action,
-        ), findings
-        assert result["collector_edge_filter_reasons"] == ["candidate-confirmed"]
-        assert series.collect(values) is None, "stable semantics must stay filtered"
-        transitions.append(summarize(result))
+    # A warning edge keeps the collector's three-sample debounce.
+    warning = {"DCGM_FI_DEV_GPU_TEMP": 86}
+    assert series.collect(warning) is None, "first sample is not confirmation"
+    assert series.collect(warning) is None, "second sample is not confirmation"
+    result = series.collect(warning)
+    assert result is not None, "confirmed temperature action was suppressed"
+    assert _temperature_action(result) == ("WARNING", "RUN_DIAGNOSTICS", 0), result
+    assert result["collector_edge_filter_reasons"] == ["candidate-confirmed"]
+    assert series.collect(warning) is None, "stable semantics must stay filtered"
+    transitions.append(summarize(result))
+    # A critical environmental candidate is uploaded on every cycle; the control
+    # plane, not the edge filter, confirms it on the third comparable sample.
+    critical = {"DCGM_FI_DEV_GPU_TEMP": 91}
+    for _ in range(2):
+        pending = series.collect(critical)
+        assert pending is not None, "an unconfirmed critical sample was filtered"
+        assert pending["collector_edge_filter_reasons"] == [
+            "environmental-observation"
+        ], pending
+        assert not pending["new_findings"], "an unconfirmed critical is not an action"
+    result = series.collect(critical)
+    assert result is not None, "confirmed temperature action was suppressed"
+    assert _temperature_action(result) == ("CRITICAL", "DRAIN", 3), result
+    assert result["collector_edge_filter_reasons"] == ["environmental-observation"]
+    stable = series.collect(critical)
+    assert stable is not None and not stable["new_findings"], (
+        "a confirmed critical state must not be re-alerted"
+    )
+    transitions.append(summarize(result))
     recovered = series.collect({})
     assert recovered is not None
-    assert recovered["collector_edge_filter_reasons"] == ["candidate-recovered"]
+    assert recovered["collector_edge_filter_reasons"] == [
+        "environmental-observation",
+        "candidate-recovered",
+    ], recovered
     assert not recovered["findings"], recovered
     cases.append(
         {
@@ -553,6 +610,7 @@ def persistent_temperature_case(cases: list[dict[str, Any]]) -> None:
             "name": "persistent temperature action edges and stable suppression",
             "status": "PASSED",
             "edge_confirmation_samples": 3,
+            "critical_confirmation_samples": 3,
             "transitions": transitions,
             "recovered": summarize(recovered),
         }
