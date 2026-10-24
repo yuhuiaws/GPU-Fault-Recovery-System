@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import logging
 import shutil
+import subprocess
+from collections.abc import Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
@@ -41,6 +43,23 @@ _ZERO_IS_A_READING: frozenset[str] = frozenset(
         "efa_cq_errors_delta",
     }
 )
+
+
+#: ``ethtool -S`` counter-name tokens and the delta each one feeds. A counter is
+#: assigned to the first group whose token its lower-cased name contains, so
+#: ``rnr_retry_err`` counts once, as RNR.
+_ETHTOOL_GROUPS: dict[str, str] = {
+    "rnr": "efa_rnr_errors_delta",
+    "retry": "efa_retry_errors_delta",
+    "cq_err": "efa_cq_errors_delta",
+    "pfc": "network_pfc_pause_delta",
+    "ecn": "network_ecn_marks_delta",
+}
+
+#: What ``ethtool -S`` prints for a driver that exposes no statistics at all:
+#: ``no stats available`` (exit 94), or EOPNOTSUPP from the string-set query.
+_ETHTOOL_NO_STATISTICS = ("no stats available", "Operation not supported")
+_ETHTOOL_NO_STATISTICS_EXIT = 94
 
 
 def _is_reportable(name: str, value: float) -> bool:
@@ -410,6 +429,20 @@ class HostNetworkMixin:
         return result
 
     def _efa_network(self, observed_at: datetime) -> list[HostMetricSample]:
+        """EFA congestion and error deltas from ``ethtool -S`` per EFA netdev.
+
+        A delta is reported only from a real reading (GF-GENERAL-LIVE-010).
+        Every group used to start at 0.0, so a counter the driver does not
+        expose, the first reading (no baseline yet) and a counter reset all
+        shipped as "0 errors" -- which ``VALIDATE_FABRIC`` accepts as a clean
+        link -- and a failed ``ethtool`` was skipped without a trace. Now a
+        failed or hung ``ethtool``, a reset and an unparseable counter are
+        UNKNOWN (a collection error, no delta), and a counter the netdev does
+        not have is NOT_SUPPORTED (``efa_ethtool_counters_unsupported``, no
+        collection error: the gap is permanent). One netdev's failure no
+        longer costs the others their readings.
+        """
+
         if not shutil.which("ethtool"):
             return []
         interfaces = set()
@@ -419,15 +452,23 @@ class HostNetworkMixin:
             interfaces.update(
                 item.name for item in (device / "device" / "net").glob("*")
             )
-        result = []
-        groups = {
-            "rnr": "efa_rnr_errors_delta",
-            "retry": "efa_retry_errors_delta",
-            "cq_err": "efa_cq_errors_delta",
-            "pfc": "network_pfc_pause_delta",
-            "ecn": "network_ecn_marks_delta",
-        }
-        for interface in interfaces:
+        result: list[HostMetricSample] = []
+        errors: list[str] = []
+        for interface in sorted(interfaces):
+            samples, error = self._ethtool_counters(interface, observed_at)
+            result.extend(samples)
+            if error is not None:
+                errors.append(f"{interface}: {error}")
+        if errors:
+            raise HostObservationError("; ".join(errors), result)
+        return result
+
+    def _ethtool_counters(
+        self, interface: str, observed_at: datetime
+    ) -> tuple[list[HostMetricSample], str | None]:
+        """One netdev's group deltas, and why some or all are unknown."""
+
+        try:
             completed = self.runner(
                 ["ethtool", "-S", interface],
                 capture_output=True,
@@ -435,33 +476,90 @@ class HostNetworkMixin:
                 timeout=10,
                 check=False,
             )
-            if completed.returncode != 0:
-                continue
-            counters = {name: 0.0 for name in groups.values()}
-            for line in completed.stdout.splitlines():
-                if ":" not in line:
-                    continue
-                name, raw = (item.strip() for item in line.split(":", 1))
-                try:
-                    value = float(raw)
-                except ValueError:
-                    continue
-                lowered = name.lower()
-                matched = next(
-                    (metric for token, metric in groups.items() if token in lowered),
-                    None,
-                )
-                if matched is not None:
-                    change = self._delta(
-                        f"ethtool/{interface}/{name}",
-                        value,
-                        observed_at,
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return [], f"ethtool -S failed: {type(exc).__name__}: {exc}"
+        if completed.returncode != 0:
+            output = f"{completed.stderr or ''} {completed.stdout or ''}".strip()
+            if completed.returncode == _ETHTOOL_NO_STATISTICS_EXIT or any(
+                text in output for text in _ETHTOOL_NO_STATISTICS
+            ):
+                return [
+                    self._ethtool_unsupported(
+                        interface, _ETHTOOL_GROUPS.values(), "NO_STATISTICS"
                     )
-                    if change:
-                        counters[matched] += change[0]
-            result.extend(
-                self._sample(metric, count, "events", interface)
-                for metric, count in counters.items()
-                if _is_reportable(metric, count)
+                ], None
+            return [], f"ethtool -S exited {completed.returncode}: {output[:200]}"
+        deltas: dict[str, float] = {}
+        matched: set[str] = set()
+        incomplete: set[str] = set()
+        problems: list[str] = []
+        for line in completed.stdout.splitlines():
+            if ":" not in line:
+                continue
+            name, raw = (item.strip() for item in line.split(":", 1))
+            lowered = name.lower()
+            metric = next(
+                (
+                    metric
+                    for token, metric in _ETHTOOL_GROUPS.items()
+                    if token in lowered
+                ),
+                None,
             )
-        return result
+            if metric is None:
+                continue
+            matched.add(metric)
+            if not (raw.isascii() and raw.isdigit()):
+                incomplete.add(metric)
+                problems.append(f"{name} is not a counter: {raw[:40]!r}")
+                continue
+            value = float(raw)
+            key = f"ethtool/{interface}/{name}"
+            before = self._previous.get(key)
+            change = self._delta(key, value, observed_at)
+            if before is not None and value < before[0]:
+                # ``_delta`` clamps a reset to 0; that zero would clear an
+                # active error signal although nothing was measured.
+                incomplete.add(metric)
+                problems.append(
+                    f"{name} reset ({before[0]:g} -> {value:g}); delta unknown"
+                )
+            elif change is None:
+                # First reading, or no time has passed: a baseline, no delta.
+                incomplete.add(metric)
+            else:
+                deltas[metric] = deltas.get(metric, 0.0) + change[0]
+        result = [
+            self._sample(metric, deltas[metric], "events", interface)
+            for metric in _ETHTOOL_GROUPS.values()
+            if metric in deltas
+            and metric not in incomplete
+            and _is_reportable(metric, deltas[metric])
+        ]
+        missing = [
+            metric for metric in _ETHTOOL_GROUPS.values() if metric not in matched
+        ]
+        if missing:
+            result.append(
+                self._ethtool_unsupported(interface, missing, "MISSING_COUNTER")
+            )
+        return result, "; ".join(problems) or None
+
+    @staticmethod
+    def _ethtool_unsupported(
+        interface: str, metrics: Iterable[str], reason: str
+    ) -> HostMetricSample:
+        """The deltas this netdev cannot provide, named instead of zeroed.
+
+        ``MISSING_COUNTER``: ``ethtool -S`` answered but has no counter for
+        them; ``NO_STATISTICS``: the driver exposes no statistics at all.
+        """
+
+        names = sorted(metrics)
+        return HostMetricSample(
+            name="efa_ethtool_counters_unsupported",
+            value=len(names),
+            unit="counters",
+            device=interface,
+            labels={"reason": reason, "metrics": ",".join(names)},
+        )

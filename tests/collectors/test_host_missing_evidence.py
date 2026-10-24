@@ -1,6 +1,6 @@
 """A host read that failed, or never existed, is missing evidence.
 
-GF-GENERAL-LIVE-007: an unreadable source must read UNKNOWN (a
+GF-GENERAL-LIVE-007/010: an unreadable source must read UNKNOWN (a
 collection error, so validation waits and nothing is graded), a source the
 node cannot provide must say NOT_SUPPORTED, and neither may be reported as a
 healthy reading or as a zero. Every case drives the real contributor through
@@ -203,4 +203,203 @@ def test_smart_the_node_cannot_provide_is_reported_not_supported(
     probes = [argv for argv, _ in host_case.commands if "-H" in argv]
     assert len(probes) == (1 if device else 0), (
         f"a verdict-less drive stays cacheable: {probes}"
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 010 EFA ethtool counters
+# --------------------------------------------------------------------------- #
+ETHTOOL_METRICS = {
+    "efa_rnr_errors_delta",
+    "efa_retry_errors_delta",
+    "efa_cq_errors_delta",
+    "network_pfc_pause_delta",
+    "network_ecn_marks_delta",
+}
+
+
+def efa_netdev(case, *interfaces: str) -> None:
+    device = case.roots.rdma / "rdmap0"
+    support.write_file(device / "device/uevent", "DRIVER=efa\n")
+    for interface in interfaces:
+        (device / "device/net" / interface).mkdir(parents=True)
+    support.enable_tools(case, "ethtool")
+
+
+def ethtool_stats(**counters: int) -> tuple[str, str, int]:
+    lines = "".join(f"     {name}: {value}\n" for name, value in counters.items())
+    return f"NIC statistics:\n{lines}", "", 0
+
+
+def counter_samples(batch) -> dict[tuple[str, str | None], float]:
+    return {
+        key: value
+        for key, value in support.values(batch).items()
+        if key[0] in ETHTOOL_METRICS
+    }
+
+
+def unsupported(batch) -> dict[str | None, dict[str, str]]:
+    return {
+        sample.device: sample.labels
+        for sample in batch.samples
+        if sample.name == "efa_ethtool_counters_unsupported"
+    }
+
+
+def test_the_first_ethtool_reading_is_a_baseline_not_a_zero(host_case):
+    """No previous reading means no delta yet, not "zero errors"."""
+
+    efa_netdev(host_case, "eth0")
+    host_case.outputs[("ethtool", "-S", "eth0")] = ethtool_stats(
+        rnr_naks=3, retry_count=4, cq_err=5, pfc_pause_tx=6, ecn_marked=7
+    )
+    collector = host_case.build("_efa_network")
+
+    first = collector.collect_once()
+    host_case.clock.sleep(15)
+    second = collector.collect_once()
+
+    assert counter_samples(first) == {}, (
+        f"a counter with no baseline reported a delta: {first.samples}"
+    )
+    assert first.collection_errors == [], first.collection_errors
+    assert counter_samples(second) == {
+        (metric, "eth0"): 0.0 for metric in ETHTOOL_METRICS
+    }, second.samples
+    assert unsupported(second) == {}, second.samples
+
+
+def test_a_missing_ethtool_counter_is_not_supported_not_zero(host_case):
+    """A counter the driver does not expose used to be reported as 0 errors.
+
+    ``VALIDATE_FABRIC`` reads a zero as a clean link, so a NIC without a
+    retry counter "passed" a retry check it never took.
+    """
+
+    efa_netdev(host_case, "eth0")
+    host_case.outputs[("ethtool", "-S", "eth0")] = ethtool_stats(rnr_naks=10)
+    collector = host_case.build("_efa_network")
+    collector.collect_once()
+    host_case.clock.sleep(15)
+    host_case.outputs[("ethtool", "-S", "eth0")] = ethtool_stats(rnr_naks=15)
+
+    batch = collector.collect_once()
+
+    assert counter_samples(batch) == {("efa_rnr_errors_delta", "eth0"): 5}, (
+        batch.samples
+    )
+    assert unsupported(batch) == {
+        "eth0": {
+            "reason": "MISSING_COUNTER",
+            "metrics": ",".join(sorted(ETHTOOL_METRICS - {"efa_rnr_errors_delta"})),
+        }
+    }, batch.samples
+    assert batch.collection_errors == [], (
+        "a counter the driver never had is a capability, not a read failure"
+    )
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        ("", "Cannot get stats information: Input/output error\n", 97),
+        subprocess.TimeoutExpired(["ethtool", "-S", "eth1"], 10),
+        FileNotFoundError(2, "No such file or directory", "ethtool"),
+    ],
+    ids=["exit-status", "timeout", "exec-failure"],
+)
+def test_a_failed_ethtool_is_unknown_not_zero(host_case, answer):
+    """A failed ``ethtool -S`` was skipped silently; a hang lost every netdev."""
+
+    efa_netdev(host_case, "eth0", "eth1")
+    host_case.outputs[("ethtool", "-S", "eth0")] = ethtool_stats(rnr_naks=1)
+    host_case.outputs[("ethtool", "-S", "eth1")] = ethtool_stats(rnr_naks=1)
+    collector = host_case.build("_efa_network")
+    collector.collect_once()
+    host_case.clock.sleep(15)
+    host_case.outputs[("ethtool", "-S", "eth1")] = answer
+
+    batch = collector.collect_once()
+
+    assert counter_samples(batch) == {("efa_rnr_errors_delta", "eth0"): 0}, (
+        f"the failed netdev reported counters, or the healthy one lost its: "
+        f"{batch.samples}"
+    )
+    assert any("eth1" in error for error in batch.collection_errors), (
+        f"a failed ethtool must invalidate the observation: {batch}"
+    )
+    assert graded(batch) == [], "an unreadable counter is not an RDMA fault"
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        ("", "no stats available\n", 94),
+        ("", "Cannot get stats strings information: Operation not supported\n", 96),
+    ],
+    ids=["no-stats", "not-supported"],
+)
+def test_a_netdev_without_ethtool_statistics_is_not_supported(host_case, answer):
+    efa_netdev(host_case, "eth0")
+    host_case.outputs[("ethtool", "-S", "eth0")] = answer
+    batch = host_case.build("_efa_network").collect_once()
+
+    assert counter_samples(batch) == {}, batch.samples
+    assert unsupported(batch) == {
+        "eth0": {
+            "reason": "NO_STATISTICS",
+            "metrics": ",".join(sorted(ETHTOOL_METRICS)),
+        }
+    }, batch.samples
+    assert batch.collection_errors == [], (
+        "a driver without statistics is a capability, not a read failure"
+    )
+
+
+def test_an_ethtool_counter_reset_is_unknown_not_a_recovery(host_case):
+    """A reset read as delta 0, which clears an active error signal."""
+
+    efa_netdev(host_case, "eth0")
+    collector = host_case.build("_efa_network")
+    readings = {}
+    for value in (10, 15, 2, 4):
+        host_case.outputs[("ethtool", "-S", "eth0")] = ethtool_stats(rnr_naks=value)
+        readings[value] = collector.collect_once()
+        host_case.clock.sleep(15)
+
+    assert counter_samples(readings[15]) == {("efa_rnr_errors_delta", "eth0"): 5}, (
+        readings[15].samples
+    )
+    assert counter_samples(readings[2]) == {}, (
+        f"a reset counter reported a delta: {readings[2].samples}"
+    )
+    assert any("reset" in error for error in readings[2].collection_errors), readings[
+        2
+    ].collection_errors
+    assert counter_samples(readings[4]) == {("efa_rnr_errors_delta", "eth0"): 2}, (
+        f"the reading after the reset is measured from the new baseline: "
+        f"{readings[4].samples}"
+    )
+
+
+def test_a_non_numeric_ethtool_counter_is_unknown_not_zero(host_case):
+    efa_netdev(host_case, "eth0")
+    collector = host_case.build("_efa_network")
+    host_case.outputs[("ethtool", "-S", "eth0")] = ethtool_stats(rnr_naks=1, cq_err=1)
+    collector.collect_once()
+    host_case.clock.sleep(15)
+    host_case.outputs[("ethtool", "-S", "eth0")] = (
+        "NIC statistics:\n     rnr_naks: 3\n     cq_err: N/A\n",
+        "",
+        0,
+    )
+
+    batch = collector.collect_once()
+
+    assert counter_samples(batch) == {("efa_rnr_errors_delta", "eth0"): 2}, (
+        batch.samples
+    )
+    assert any("cq_err" in error for error in batch.collection_errors), (
+        batch.collection_errors
     )

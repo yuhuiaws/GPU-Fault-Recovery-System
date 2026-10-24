@@ -195,10 +195,16 @@ def test_efa_network_counter_is_assigned_to_one_group(
 
     collector._efa_network(NOW)
     samples = collector._efa_network(NOW + timedelta(seconds=15))
-    by_name = {item.name: item.value for item in samples}
+    by_name = {item.name: item for item in samples}
 
-    assert by_name["efa_rnr_errors_delta"] == 5
-    assert by_name["efa_retry_errors_delta"] == 0
+    assert by_name["efa_rnr_errors_delta"].value == 5
+    assert "efa_retry_errors_delta" not in by_name, (
+        "rnr_retry_err counts once, as RNR; the retry group has no counter of "
+        "its own, which is NOT_SUPPORTED rather than zero retries"
+    )
+    assert "efa_retry_errors_delta" in (
+        by_name["efa_ethtool_counters_unsupported"].labels["metrics"].split(",")
+    ), by_name
 
 
 def test_host_collector_reports_memory_and_page_cache_percentages(

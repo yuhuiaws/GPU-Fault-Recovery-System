@@ -62,9 +62,16 @@ def test_rdma_reports_traffic_once_and_preserves_latest_zero_error_readings(
 
 
 @pytest.mark.parametrize("exit_code", [0, 1])
-def test_ethtool_skips_bad_counters_without_losing_congestion_zeroes(
+def test_ethtool_bad_counters_are_unknown_and_absent_ones_are_not_zeroes(
     host_case, exit_code
 ):
+    """A real reading keeps its zero; nothing else may ship one.
+
+    An unparseable counter leaves its group without a trustworthy delta, a
+    counter the netdev lacks is NOT_SUPPORTED, and a failed ``ethtool`` is a
+    collection error (GF-GENERAL-LIVE-010 missing_counter/ethtool_failed).
+    """
+
     support.enable_tools(host_case, "ethtool")
     device, _ = efa_port(host_case)
     (device / "device/net/ens1").mkdir(parents=True)
@@ -87,11 +94,22 @@ def test_ethtool_skips_bad_counters_without_losing_congestion_zeroes(
     batch = collector.collect_once()
     values = support.values(batch)
     if exit_code:
-        assert values == {}
+        assert values == {}, "a failed ethtool reports no counters at all"
+        assert any("ens1" in error for error in batch.collection_errors), (
+            f"a failed ethtool is unknown, not silent: {batch.collection_errors}"
+        )
     else:
-        assert values[("efa_rnr_errors_delta", "ens1")] == 7
+        assert ("efa_rnr_errors_delta", "ens1") not in values, (
+            "a group with an unparseable counter has no trustworthy delta"
+        )
+        assert any("rnr_bad" in error for error in batch.collection_errors), (
+            batch.collection_errors
+        )
         assert values[("network_pfc_pause_delta", "ens1")] == 0
-        assert values[("network_ecn_marks_delta", "ens1")] == 0
+        assert ("network_ecn_marks_delta", "ens1") not in values, (
+            "a counter the netdev does not have is not a zero"
+        )
+        assert values[("efa_ethtool_counters_unsupported", "ens1")] == 3, values
     assert all(options["timeout"] == 10 for _, options in host_case.commands), (
         "every fake ethtool request must carry the production timeout"
     )
