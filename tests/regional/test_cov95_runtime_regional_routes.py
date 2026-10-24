@@ -23,6 +23,7 @@ from tests.fleet._support import NOW
 from tests.regional._cov95_runtime_routes import HEADERS, Routes
 from tests.regional._cov95_runtime_routes import routes_fixture as routes_fixture
 from tests.regional._cov95_runtime_support import offline_runtime as offline_runtime
+from tests.regional._regional_support import fresh_gpu_observations
 
 
 @pytest.mark.parametrize("rotation", [False, True])
@@ -308,6 +309,8 @@ def test_spare_agent_health_does_not_accept_unavailable_or_ambiguous_membership(
     routes: Routes, defect: str
 ) -> None:
     aliases = ["node-a"]
+    # Fresh GPU observations, so the membership defect is the only reason.
+    fresh_gpu_observations(routes.context.store, "cluster-a", "node-a")
     if defect == "disabled":
         routes.context.fleet_registry = None
     elif defect == "missing":

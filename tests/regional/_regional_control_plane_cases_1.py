@@ -40,6 +40,7 @@ from tests.regional._regional_support import (
     TOKEN_A,
     TOKEN_B,
     RecordingNotifier,
+    fresh_gpu_observations,
     regional_environment,
     registration,
     remote_context,
@@ -172,15 +173,32 @@ def test_regional_spare_health_uses_fleet_registry() -> None:
 
     async def scenario() -> None:
         async with asgi_client(context) as client:
-            response = await client.post(
-                "/v1/regional/executors/spares/health",
-                headers={
-                    "Authorization": f"Bearer {TOKEN_A}",
-                    "X-GPU-Fault-Cluster-ID": "cluster-a",
-                },
-                json={"cluster_id": "cluster-a", "node_aliases": ["node-a"]},
-            )
 
+            async def health() -> httpx.Response:
+                return await client.post(
+                    "/v1/regional/executors/spares/health",
+                    headers={
+                        "Authorization": f"Bearer {TOKEN_A}",
+                        "X-GPU-Fault-Cluster-ID": "cluster-a",
+                    },
+                    json={"cluster_id": "cluster-a", "node_aliases": ["node-a"]},
+                )
+
+            # A fleet-ready agent alone is not admission: missing GPU
+            # inventory/metrics observations make the spare ineligible.
+            unobserved = await health()
+            fresh_gpu_observations(context.store, "cluster-a", "node-a")
+            response = await health()
+
+        assert unobserved.status_code == 200
+        assert unobserved.json() == {
+            "ready": False,
+            "reasons": [
+                "collector observation UNKNOWN: "
+                "GPU_INVENTORY/NO_SUCCESSFUL_OBSERVATION",
+                "collector observation UNKNOWN: GPU_METRICS/NO_SUCCESSFUL_OBSERVATION",
+            ],
+        }
         assert response.status_code == 200
         assert response.json() == {"ready": True, "reasons": []}
 

@@ -24,6 +24,7 @@ from gpu_fault.regional import (
     RemoteActionCommand,
     cluster_token_sha256,
 )
+from gpu_fault.telemetry import CollectorKind, CollectorStatus
 from tests._builders import copy_model, fault_incident, workflow_request, workflow_step
 
 NOW = datetime(2026, 7, 28, tzinfo=timezone.utc)
@@ -286,3 +287,24 @@ def spare_alert(cluster_id: str, incident_id: str = "inc-spare-1"):
         body_text=body,
         support_case_draft=body,
     )
+
+
+def fresh_gpu_observations(store, cluster_id: str, node_id: str) -> None:
+    """Spare admission requires a fresh GPU inventory and metrics success.
+
+    ``spare_fault_evidence.observation_reasons`` judges the canonical collector
+    status against the wall clock, so the success is stamped now.
+    """
+    now = datetime.now(timezone.utc)
+    for kind in (CollectorKind.GPU_INVENTORY, CollectorKind.GPU_METRICS):
+        store.save_collector_status(
+            CollectorStatus(
+                cluster_id=cluster_id,
+                node_id=node_id,
+                collector=kind,
+                observed_at=now,
+                ingested_at=now,
+                last_success_at=now,
+                sample_count=8,
+            )
+        )
