@@ -417,6 +417,8 @@ finding，其处置来自站点指标策略，不能冒充NVIDIA XID Immediate A
 上的相同 XID gauge 值不会在每次 scrape 时重复触发。由于该字段表示持久化的“最后一次
 XID”，collector 启动后的首个值仅建立 baseline；之后从 0 或其他 XID 发生变化时才
 生成事件。原始 `/dev/kmsg` 仍是捕获新事件及识别同一 XID 重复发生的主要事件源。
+PCIe 越界与该 gauge 的 XID 32/79 联合时，以这个变化事件的时刻计窗口：gauge 每次抓取都重读，停在 32/79
+的旧值不会在之后的 PCIe 越界时再联合出 CRITICAL `DRAIN`。
 
 `DCGM_FI_DEV_FABRIC_MANAGER_STATUS`（字段 170：0 NotSupported、1 NotStarted、2 InProgress、3 Success、4 Failure、
 5 Unrecognized、6 NvmlTooOld）映射为 `fabric_manager_status`，`DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE`（字段 171，已完成

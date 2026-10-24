@@ -418,6 +418,8 @@ A new non-zero `DCGM_FI_DEV_XID_ERRORS` state is converted to an `XidEvent` and 
 does not fire again on every scrape. Because the field represents a persisted "last
 XID", the first value after collector start-up only establishes a baseline; an event is generated only when it later changes from 0 or from another XID.
 Raw `/dev/kmsg` remains the primary event source for capturing new events and recognising repeated occurrences of the same XID.
+When a PCIe breach joins the gauge's XID 32/79, the window is measured from that change event: the gauge is re-read on
+every scrape, and an old value left at 32/79 does not join a later PCIe breach into a CRITICAL `DRAIN`.
 
 `DCGM_FI_DEV_FABRIC_MANAGER_STATUS` (field 170: 0 NotSupported, 1 NotStarted, 2 InProgress, 3 Success, 4 Failure, 5 Unrecognized,
 6 NvmlTooOld) maps to `fabric_manager_status`, `DCGM_FI_DEV_FABRIC_MANAGER_ERROR_CODE` (field 171, the DCGM return code of a completed

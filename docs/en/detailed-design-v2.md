@@ -3315,6 +3315,17 @@ Description text does not grant a trusted hardware subcategory. The PCIe joint r
 and a trusted kernel XID 32/79 within the window, supporting either arrival order, but a valid PCIe out-of-bounds sample must be present at the same time.
 Kernel evidence does not masquerade as a DCGM sample, and the independent XID policy continues to execute; XID history is not read when there is no real PCIe out-of-bounds sample,
 and multiple anomalous GPUs share one bounded node/time query.
+DCGM's `xid_last_error` is a "last XID" state that every scrape re-reads, so its latest sample is always as fresh as
+the batch and bounding its `observed_at` by the window bounded nothing: a gauge that went to 32/79 long before used to
+re-join a CRITICAL `DRAIN` composite on every later PCIe breach (GF-GENERAL-LIVE-022 `expired_xid`). The gauge is
+dated by the `XidEvent` its change produced (`GpuMetricsService._xid_event`, claimed once across replicas;
+`gpu_composites.link_xid_events` fetches the persisted changes with the same bounded query, and the batch's own changes
+come in through `ingest`) and judged by the kernel path's rules: same node and GPU, no further than
+`GPU_FAULT_DCGM_CORRELATION_WINDOW_SECONDS` (default 45, inclusive) from both the triggering batch and the PCIe finding,
+and newer than the composite's last clear (one XID joins one episode). A value first seen as a baseline has no change
+event, so its age is unknown and it joins nothing; an XID on another GPU or an expired one does not join, and the PCIe
+breach stays a read-only diagnostic. A joined composite names the change event in its reason and in
+`component_evidence_refs` (`xid-event://<event_id>`).
 
 ### 5.5 Attributing Application Faults vs Device Faults
 

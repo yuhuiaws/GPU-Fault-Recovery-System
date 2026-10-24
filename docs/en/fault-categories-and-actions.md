@@ -81,7 +81,9 @@ binds the original receipt moment and the remediation fingerprint; an old delive
 
 A correlated marker does not mean the old action suffices: a later XID/SXID must still verify the full action, GPU scope and attempt.
 GPU and memory temperature both belong to the thermal fault category; kernel XID 32/79 joins the combined rule only when a PCIe threshold breach
-on the same trusted device exists within the valid window; a kernel XID arriving alone still follows its independent policy.
+on the same trusted device exists within the valid window; a kernel XID arriving alone still follows its independent policy. The
+DCGM last-XID gauge is timed by its change to 32/79: a gauge left at an old value (expired) and an XID on another GPU do not
+join, and the PCIe breach stays a read-only diagnostic.
 Persistent isolation also differs from the temporary isolation in the reboot flow; after merging, the constrained faulty node must not be re-admitted;
 recovery of a healthy warm spare must target the node actually substituted.
 

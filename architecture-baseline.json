@@ -6,7 +6,7 @@
     "src/gpu_fault/adapters/kubernetes/restart_operations.py:KubernetesRestartOperationsMixin": 838,
     "src/gpu_fault/execution/dispatcher.py:WorkflowDispatcher": 1605,
     "src/gpu_fault/execution/executor.py:ProductionWorkflowExecutor": 2258,
-    "src/gpu_fault/gpu_metrics.py:GpuMetricsService": 1050,
+    "src/gpu_fault/gpu_metrics.py:GpuMetricsService": 1049,
     "src/gpu_fault/host_health.py:NodeHealthPolicy": 859,
     "src/gpu_fault/node_agent/quiesce.py:GpuServiceQuiesceManager": 848,
     "src/gpu_fault/notification_service.py:AdvisoryNotificationService": 1030,

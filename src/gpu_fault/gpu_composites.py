@@ -29,6 +29,9 @@ if TYPE_CHECKING:
 PCIE_XID_RULE = "PCIE_XID_LINK_FAILURE"
 GPU_COMPOSITE_TRANSACTION = "gpu-composite-correlation"
 SITE_CORRELATION_POLICY_VERSION = "site-dcgm-correlation/v3"
+#: ``GpuMetricSource.DCGM_EXPORTER``: the source of the XID event
+#: ``GpuMetricsService._xid_event`` makes of a change of the last-XID gauge.
+DCGM_XID_GAUGE_SOURCE = "DCGM_EXPORTER"
 _LINK_XIDS = frozenset({32, 79})
 _PCI_BDF = re.compile(
     r"(?:(?P<domain>[0-9a-f]{4}|[0-9a-f]{8}):)?"
@@ -175,6 +178,16 @@ def is_pcie_kernel_xid(event: XidEvent) -> bool:
     )
 
 
+def is_dcgm_link_xid(event: XidEvent) -> bool:
+    """A change of the DCGM last-XID gauge to XID 32/79."""
+
+    return (
+        event.event_source == DCGM_XID_GAUGE_SOURCE
+        and event.xid in _LINK_XIDS
+        and not event.synthetic
+    )
+
+
 def _pcie_threshold(finding: GpuHealthFinding, threshold: float) -> bool:
     return (
         finding.finding_kind == "METRIC"
@@ -185,11 +198,20 @@ def _pcie_threshold(finding: GpuHealthFinding, threshold: float) -> bool:
     )
 
 
-def kernel_xid_events(
+def link_xid_events(
     service: GpuMetricsService,
     batch: GpuMetricBatch,
     components: Sequence[GpuHealthFinding],
+    batch_gauge_changes: Sequence[XidEvent] = (),
 ) -> list[XidEvent]:
+    """The kernel XID 32/79 events and the last-XID gauge changes a PCIe
+    breach of ``components`` may join.
+
+    One bounded same-node query serves both, and only when a touched GPU
+    breaches the PCIe rate. ``batch_gauge_changes`` are the gauge changes this
+    batch itself made: the API persists them only after this evaluation.
+    """
+
     window = timedelta(seconds=service.thresholds.correlation_window_seconds)
     pcie = [
         finding
@@ -207,12 +229,19 @@ def kernel_xid_events(
         observed_after=batch.observed_at - window,
         observed_before=batch.observed_at + window,
     )
-    return [
-        event
-        for event in events
-        if is_pcie_kernel_xid(event)
-        and any(_same_device(event, finding) for finding in pcie)
+
+    def joinable(event: XidEvent) -> bool:
+        return any(_same_device(event, finding) for finding in pcie)
+
+    kernel = [
+        event for event in events if is_pcie_kernel_xid(event) and joinable(event)
     ]
+    gauge_changes = {
+        event.event_id: event
+        for event in (*events, *batch_gauge_changes)
+        if is_dcgm_link_xid(event) and joinable(event)
+    }
+    return [*kernel, *gauge_changes.values()]
 
 
 def _trusted_policy(event: XidEvent, decision: FaultPolicyDecision | None) -> bool:
@@ -314,6 +343,50 @@ def _unique_pci_device(
     return matches == {finding.gpu_uuid or finding.pci_bdf}
 
 
+def _gauge_change(
+    trigger: GpuMetricBatch,
+    pcie: GpuHealthFinding,
+    gauge: GpuMetricLatest,
+    previous: GpuFindingState | None,
+    xid_events: Sequence[XidEvent],
+    window: timedelta,
+) -> XidEvent | None:
+    """The change of the last-XID gauge to its current value, inside the window.
+
+    The gauge holds the last XID for as long as the driver stays loaded and
+    every scrape re-reads it, so its latest sample is always as fresh as the
+    batch: bounding *that* by the window bounded nothing, and a gauge that went
+    to 32/79 long before re-armed the CRITICAL DRAIN composite on every later
+    PCIe breach (GF-GENERAL-LIVE-022 ``expired_xid``). What dates the XID is
+    the event its change produced (``GpuMetricsService._xid_event``, claimed
+    once across replicas), held to the kernel path's rules: same node and GPU,
+    inside the window of both the trigger and the PCIe finding, and newer than
+    the composite's last clear. A value first seen as a baseline produced no
+    event, so its age is unknown and it joins nothing.
+    """
+
+    xid = int(gauge.sample.value)
+    for event in sorted(
+        xid_events, key=lambda item: (item.observed_at, item.event_id), reverse=True
+    ):
+        if (
+            is_dcgm_link_xid(event)
+            and event.xid == xid
+            and event.cluster_id == trigger.cluster_id
+            and event.node_id == trigger.node_id
+            and abs(event.observed_at - trigger.observed_at) <= window
+            and abs(event.observed_at - pcie.observed_at) <= window
+            and _same_device(event, pcie)
+            and not (
+                previous is not None
+                and previous.finding is None
+                and event.observed_at <= previous.observed_at
+            )
+        ):
+            return event
+    return None
+
+
 def pcie_xid_link_failure(
     service: GpuMetricsService,
     trigger: GpuMetricBatch | XidEvent,
@@ -321,8 +394,14 @@ def pcie_xid_link_failure(
     components: dict[str, GpuHealthFinding],
     metrics: dict[str, GpuMetricLatest],
     previous: GpuFindingState | None,
-    kernel_events: Sequence[XidEvent],
+    xid_events: Sequence[XidEvent],
 ) -> GpuHealthFinding | None:
+    """The CRITICAL DRAIN composite of a PCIe breach and a same-GPU XID 32/79.
+
+    ``xid_events`` are the window's candidates (:func:`link_xid_events`): a
+    trusted kernel event joins by its policy decision; failing one, the
+    last-XID gauge joins only through its change event (:func:`_gauge_change`).
+    """
     pcie = components.get("pcie_replay_total")
     metric = metrics.get("pcie_replay_total")
     window = timedelta(seconds=service.thresholds.correlation_window_seconds)
@@ -342,7 +421,7 @@ def pcie_xid_link_failure(
         return None
     kernel = None
     for event in sorted(
-        kernel_events, key=lambda item: (item.observed_at, item.event_id), reverse=True
+        xid_events, key=lambda item: (item.observed_at, item.event_id), reverse=True
     ):
         if (
             not is_pcie_kernel_xid(event)
@@ -386,7 +465,8 @@ def pcie_xid_link_failure(
             kernel = event
             break
     gauge = metrics.get("xid_last_error")
-    if kernel is None:
+    joined = kernel
+    if joined is None:
         if (
             isinstance(trigger, XidEvent)
             or gauge is None
@@ -395,9 +475,9 @@ def pcie_xid_link_failure(
             or abs(gauge.observed_at - pcie.observed_at) > window
         ):
             return None
-        xid = int(gauge.sample.value)
-    else:
-        xid = kernel.xid
+        joined = _gauge_change(trigger, pcie, gauge, previous, xid_events, window)
+        if joined is None:
+            return None
     finding = composite_finding(
         trigger,
         scope_key=gpu_key,
@@ -410,13 +490,30 @@ def pcie_xid_link_failure(
         severity=GpuHealthSeverity.CRITICAL,
         action=RecoveryAction.DRAIN,
         reason=(
-            f"PCIe replay threshold was correlated with XID {xid}"
-            + (f" from kernel event {kernel.event_id}" if kernel is not None else "")
+            f"PCIe replay threshold was correlated with XID {joined.xid}"
+            + (
+                f" from kernel event {joined.event_id}"
+                if kernel is not None
+                else f" from the DCGM last-XID gauge change {joined.event_id}"
+            )
         ),
         confidence="HIGH",
     )
     if kernel is None:
-        return finding
+        # The gauge change is this or an earlier batch: the trigger stays the
+        # composite's time; the change is named as its evidence.
+        return finding.model_copy(
+            update={
+                "component_evidence_refs": list(
+                    dict.fromkeys(
+                        [
+                            *finding.component_evidence_refs,
+                            f"xid-event://{joined.event_id}",
+                        ]
+                    )
+                ),
+            }
+        )
     return finding.model_copy(
         update={
             "observed_at": max(

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from collections import Counter
+from collections.abc import Sequence
 from datetime import datetime, timedelta
 from enum import StrEnum
 from threading import RLock
@@ -18,7 +19,7 @@ from gpu_fault.gpu_composites import (
     composite_finding,
     composite_update_time,
     correlate_kernel_xid,
-    kernel_xid_events,
+    link_xid_events,
     metric_counter_delta,
     pcie_xid_link_failure,
 )
@@ -554,10 +555,7 @@ class GpuMetricsService:
                 composite_findings,
                 new_composite_findings,
                 suppressed_finding_ids,
-            ) = self._evaluate_composite_findings(
-                batch,
-                touched_gpu_keys,
-            )
+            ) = self._evaluate_composite_findings(batch, touched_gpu_keys, xid_events)
             suppressed = set(suppressed_finding_ids)
             effective_new_findings = [
                 finding
@@ -607,6 +605,7 @@ class GpuMetricsService:
         self,
         batch: GpuMetricBatch,
         touched_gpu_keys: set[str],
+        gauge_changes: Sequence[XidEvent] = (),
     ) -> tuple[
         list[GpuHealthFinding],
         list[GpuHealthFinding],
@@ -689,7 +688,7 @@ class GpuMetricsService:
             gpu_key = metric_device_key(item.sample)
             latest_by_gpu.setdefault(gpu_key, {})[item.sample.canonical_name] = item
 
-        kernel_events = kernel_xid_events(
+        link_events = link_xid_events(
             self,
             batch,
             [
@@ -697,6 +696,7 @@ class GpuMetricsService:
                 for finding in active_components
                 if self._finding_gpu_key(finding) in pcie_gpu_keys
             ],
+            gauge_changes,
         )
         candidates: dict[tuple[str, str], GpuHealthFinding] = {}
         node_nvlink_components = [
@@ -737,7 +737,7 @@ class GpuMetricsService:
                 previous_composite_states,
                 nvlink_gpu_uuids,
                 candidates,
-                kernel_events,
+                link_events,
                 evaluate_pcie=gpu_key in pcie_gpu_keys,
             )
 
@@ -809,7 +809,7 @@ class GpuMetricsService:
         previous_composite_states,
         nvlink_gpu_uuids,
         candidates,
-        kernel_events,
+        link_events,
         *,
         evaluate_pcie: bool,
     ) -> None:
@@ -838,7 +838,7 @@ class GpuMetricsService:
                 previous_composite_states.get(
                     self._composite_key(batch, gpu_key, PCIE_XID_RULE)
                 ),
-                kernel_events,
+                link_events,
             )
             if pcie is not None:
                 candidates[(gpu_key, PCIE_XID_RULE)] = pcie
