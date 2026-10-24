@@ -466,3 +466,83 @@ Agent过期/非活跃集群单独处理，不伪造成同一种静默。恢复�
 
 `--include-manual` 的运行报告仍是 NOT_RUN，不是现场执行器。每类必须按映射文件逐变体
 归档源/配置身份、实际证明层次、完整回执和清理结果，才可讨论该版本的实际覆盖率。
+
+## GF-GENERAL-LIVE 运行器（phase 1）
+
+一个通用运行器 `scripts/e2e/regional/run_general_live.py`，按类别拆分注入/判定
+模块（`general_live_host`/`_utilization`/`_storage`/`_network`/`_collectors`/
+`_attempts`，共享 `general_live_registry`/`_fixture`/`_common`/`_store`/
+`_verdicts`）。主机探针为仅标准库的 `probes/general_live_node_probe.py`
+（CPU/内存/page cache 负载、oracle 采样、采集单元与 exporter 的限时 SIGSTOP、
+节点日志采集器的 runtime 启用）、`probes/general_live_storage_probe.py`
+（loop 文件系统与 loop+device-mapper 测试设备、O_DIRECT 写入）、
+`probes/general_live_net_probe.py`（host-local veth/dummy 测试接口、丢包生成器、
+netns+netem）。采集单元清单的只读扩展复用
+`probes/collector_window_probe.py`（仅对 host collector 追加一个测试挂载到
+`GPU_FAULT_FILESYSTEMS`、或把测试接口追加到 `GPU_FAULT_REQUIRED_INTERFACES`）。
+
+### 计划/执行
+
+每个变体单独 plan/execute，守卫键为 `<case>.<variant>`（例如
+`GF-GENERAL-LIVE-004.capacity_full`）：
+
+```bash
+run_general_live.py --site-profile <profile> --run-dir <run> \
+  --case GF-GENERAL-LIVE-001 --variant cpu_busy --plan
+run_general_live.py --site-profile <profile> --run-dir <run> \
+  --case GF-GENERAL-LIVE-001 --variant cpu_busy --execute \
+  --confirm GENERALLIVE001_EXECUTE --maintenance-window-end <UTC>
+```
+
+默认 `--plan` 为只读预检：确认目标节点（`--fault-node`，多节点变体另给
+`--node-b`）Ready、无 cordon/隔离注解/隔离 taint、无业务或占 GPU 的 Pod、
+Node Agent ACTIVE、无未关闭 incident/工作流、必需采集通道新鲜；HyperPod 另确认
+`NodeRecovery=None`。`--execute` 需精确确认串 `GENERALLIVE<NNN>_EXECUTE` 和
+未过期的维护窗口。危险分支另需 `--approve` 令牌（绑进 `plan.json`）：
+`HOST_MEMORY_PRESSURE`（主机内存压力）、`KERNEL_MODULE_LOAD`（加载 dm_delay/
+veth/dummy/sch_netem）、`ENABLE_NODE_LOG_COLLECTOR`（临时启用被禁用的节点日志
+采集器）、`WATCHER_NETWORK_ISOLATION`、`CONTROL_PLANE_RESTART`；缺令牌记
+`NOT_RUN(NOT_AUTHORIZED)`。
+
+### 安全
+
+每次主机变更先用 `systemd-run --on-active` 布置 deadman，在运行器、探针 Pod、
+控制面全部消失后仍把节点恢复基线；每个负载是带 `RuntimeMaxSec` 的瞬态单元；
+配置只经 `/run` drop-in 改，关闭即还原；测试卷只在 `/mnt/gfrs-live/<run>/` 下，
+backing 文件预分配且限容量上限（永不涨系统盘/`/var`/日志盘）；测试接口只操作
+`gfrs*`（拒绝有地址或 `device` 链接的真实网卡，记录前后非测试接口摘要）。
+运行器维护一个 LIFO 清理栈并独立还原；隔离类节点只经产品自身的验证式恢复
+（VALIDATE_GPU/HOST/FABRIC → RESTORE_SCHEDULING）接纳，不手删 taint。任何清理
+不能自证干净即整项 FAIL。
+
+### 证据与判定
+
+判定只读产品自己的记录（accepted batch、health-signal、latest metric、incident、
+marker、workflow 的 step execution、remote command、notification、completion
+decision、restart 预算账本），绝不 POST 预制 finding/workflow。运行器自带的
+原始源读数（`/proc/stat`、statvfs、`/proc/diskstats`、sysfs 计数器、exporter
+抓取等）作为有效性 oracle 存入 `cases/<key>/oracle.jsonl`；源没有真正变化时记
+`INCONCLUSIVE` 而非 PASS。每变体在 `cases/<case>.<variant>/` 下留 `plan.json`、
+`preflight.json`、`result.json`、各阶段 timeline 与 `<case>.<variant>.json`。
+判定：有效注入+完整规格链+干净清理为 `PASS`；判定/动作/作用域错误或清理失败为
+`FAIL`（规格明示的已知缺口在有效注入且未被检出时即记 `FAIL`）；缺令牌/能力/夹具
+为 `NOT_RUN(reason)`；站点前提缺失为 `BLOCKED`。
+
+### phase 1 范围与前提
+
+首批 native 变体：001 CPU 过载、003 低利用率/资源异常、004 本地盘满、
+006 磁盘 I/O、008 网卡链路 down、009 网卡错误/丢包、025 DCGM 采集不完整
+（native：exporter_timeout/sustained_unknown/post_refresh_success）、
+028 进程失败/终态、029 重启预算、031 采集器静默。延后变体留在分母并记
+`NOT_RUN`/`BLOCKED`：需产品侧读取夹具的 live-replay（004 probe_error、
+008 statistics_failed、009 errors_delta、025 的 5 个字段/别名/NaN 变体、
+029 concurrent_claim/missing_context/hardware_chain_continues）、
+本站能力缺失（008 bond_vf、031 inactive_cluster/notification_failure）、
+需未授批危险分支（028 api_unreachable、029 worker_restart）。
+
+需管理员安排的站点配置：008 `empty_required_list` 是站点 FAIL，修复需把主/EFA
+netdev 写进安装器/管理配置的 `GPU_FAULT_REQUIRED_INTERFACES`（默认空）；
+031 `logs_silent` 需按批准启用 `GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR`
+（生产默认 false）；002/003 的主机内存压力需 `HOST_MEMORY_PRESSURE` 审批；
+006 `sustained_latency`、008/009 的 veth/dummy/netem 需 `KERNEL_MODULE_LOAD`
+或预装内核模块。运行器只做只读 `--plan` 预检，`--execute` 由运维在授权窗口执行。

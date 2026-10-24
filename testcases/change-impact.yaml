@@ -631,7 +631,6 @@ rules:
       - tests/regional/test_general_live_*.py
       - testcases/general-live-coverage.yaml
       - docs/components/general-fault-live-acceptance.md
-      - docs/components/en/general-fault-live-acceptance.md
     pytest:
       - tests/regional/test_general_live_host.py
       - tests/regional/test_general_live_storage.py

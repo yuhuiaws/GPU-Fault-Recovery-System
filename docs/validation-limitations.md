@@ -908,3 +908,27 @@ https://docs.nvidia.com/deploy/xid-errors/analyzing-xid-catalog.html -- code
 45, Investigatory Action
 "Solo: RESTART_FM / Not Solo: IGNORE (follow other Xid)"; the pinned catalog
 data is unchanged, and A100 keeps RESTART_FM.
+
+## GF-GENERAL-LIVE live acceptance runner (phase 1)
+
+The generic `scripts/e2e/regional/run_general_live.py` runner and its
+per-category injector/verdict modules (`scripts/e2e/regional/general_live_*.py`,
+`probes/general_live_*_probe.py`) add live acceptance for the implemented
+phase-1 categories (001/003/004/006/008/009/025/028/029/031). They are
+plan-only by default and change no cluster state until an operator runs
+`--execute` with the case confirmation and, for a dangerous branch, its
+`--approve` token. No GF-GENERAL-LIVE case has live evidence yet: every case
+stays `manual` / `NOT_RUN` in `testcases/fault-scenarios.yaml`, and the
+module tests under `tests/regional/test_general_live_*.py` exercise only the
+injection/verdict logic against scripted product records with fakes for
+kubectl and the host probes -- they are not proof of a physical experiment.
+
+Deferred phase-1 variants remain in the denominator with an explicit reason:
+live-replay variants that need a product-owned read fixture (a
+`GPU_FAULT_HOST_PROC_ROOT` / net-class / exporter-scrape substitution), the
+capability-absent variants (no SR-IOV VF netdev, no inactive cluster, no safe
+way to fail the live SES channel) and the dangerous branches that need an
+approval not arranged this phase (watcher network isolation, control-plane
+restart). The implemented verdicts record the known product gaps the spec
+expects to FAIL (byte-only `statvfs`, the weighted-time disk await, the empty
+required-interface list) rather than masking them.
