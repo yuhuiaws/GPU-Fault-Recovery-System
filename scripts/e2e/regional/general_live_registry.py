@@ -206,15 +206,18 @@ CATEGORY_MODULES = (
     "scripts.e2e.regional.general_live_utilization",
     "scripts.e2e.regional.general_live_attempts",
     "scripts.e2e.regional.general_live_collectors",
+    "scripts.e2e.regional.general_live_memory",
+    "scripts.e2e.regional.general_live_shared",
+    "scripts.e2e.regional.general_live_devices",
     "scripts.e2e.regional.general_live_nccl",
     "scripts.e2e.regional.general_live_progress",
     "scripts.e2e.regional.general_live_spares",
 )
 #: The categories phase 1 implements (``cases`` rows of the coverage file).
 PHASE_ONE_CATEGORIES = (1, 3, 4, 6, 8, 9, 25, 28, 29, 31)
-#: The categories phase 2 adds (this lane: 011 NCCL hung, 027 training
-#: progress, 030 warm spare unhealthy).
-PHASE_TWO_CATEGORIES = (11, 27, 30)
+#: The categories phase 2 adds: 002 memory, 005 shared storage, 007/010/012/015
+#: devices, 011 NCCL hung, 027 training progress, 030 warm spare unhealthy.
+PHASE_TWO_CATEGORIES = (2, 5, 7, 10, 11, 12, 15, 27, 30)
 
 
 def coverage_rows(path: Path = COVERAGE_PATH) -> dict[str, list[str]]:
