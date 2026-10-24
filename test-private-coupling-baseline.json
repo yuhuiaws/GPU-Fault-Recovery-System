@@ -239,7 +239,7 @@
   "tests/regional/test_general_live_progress.py:pr._checkpoint_errors": 2,
   "tests/regional/test_general_live_progress.py:pr._incident": 2,
   "tests/regional/test_general_live_progress.py:pr._no_restart_errors": 1,
-  "tests/regional/test_general_live_storage.py:storage._fs_mount": 2,
+  "tests/regional/test_general_live_storage.py:storage._fs_mount": 3,
   "tests/regional/test_general_live_utilization.py:util._fs_mount": 1,
   "tests/regional/test_http_client.py:pool._cache": 1,
   "tests/regional/test_loopfs_visibility.py:reader._filesystems": 1,

@@ -739,8 +739,7 @@ def test_a_usable_read_write_mount_reports_available_and_is_not_graded(host_case
 
     mount = str(host_case.roots.mount)
     collector = host_case.build(
-        "_filesystems",
-        statvfs=statvfs(blocks_free=90, files=1000, files_free=900),
+        "_filesystems", statvfs=statvfs(blocks_free=90, files=1000, files_free=900)
     )
 
     batch = collector.collect_once()
