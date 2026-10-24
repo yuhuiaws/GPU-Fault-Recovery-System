@@ -205,8 +205,82 @@ def test_below_threshold_passes_without_quarantine(tmp_path: Path) -> None:
     assert result["verdict"] == "PASS", result["errors"]
 
 
+def unavailable_activity(mount: str) -> dict[str, Any]:
+    inc = incident(
+        "inc-fs",
+        "filesystem_unavailable",
+        device=mount,
+        state="ACTION_PENDING",
+        workflow="wf-fs",
+    )
+    wf = workflow(
+        "wf-fs",
+        "inc-fs",
+        ["FREEZE_EVIDENCE", "VALIDATE_HOST"],
+        status="FAILED",
+        probe_metric="filesystem_unavailable",
+        executions=[
+            {
+                "operation": "VALIDATE_HOST",
+                "status": "FAILED",
+                "details": {"host_diagnostic_failure": True},
+            }
+        ],
+    )
+    return {
+        "incidents": [inc],
+        "workflows": [wf],
+        "batches": [
+            host_batch(
+                "2026-10-24T00:02:00+00:00", "filesystem_unavailable", 1.0, device=mount
+            )
+        ]
+        + [
+            host_batch(
+                f"2026-10-24T00:2{i}:00+00:00",
+                "filesystem_unavailable",
+                0.0,
+                device=mount,
+            )
+            for i in range(3)
+        ],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+    }
+
+
 @pytest.mark.parametrize("variant", ["read_only", "required_mount_missing"])
-def test_byte_only_gap_is_fail_when_undetected(tmp_path: Path, variant: str) -> None:
+def test_unusable_filesystem_validates_and_readmits(
+    tmp_path: Path, variant: str
+) -> None:
+    # Batch 163 reports a read-only or vanished configured mount as
+    # filesystem_unavailable and runs the VALIDATE_HOST diagnostic, so both
+    # variants now expect PASS live.
+    spec = SPECS[variant]
+    assert spec.expected_outcome == "PASS" and not spec.product_gap, spec
+    regional = FakeRegional(cpu_python=store_script({"activity": None}))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(node_probe(survey()), storage_probe(), window_probe()),
+    )
+    mount = storage._fs_mount(ctx)
+    regional.cpu_python_responder = store_script(
+        {"activity": unavailable_activity(mount)}
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+
+
+@pytest.mark.parametrize("variant", ["read_only", "required_mount_missing"])
+def test_unusable_filesystem_fails_when_undetected(
+    tmp_path: Path, variant: str
+) -> None:
+    # A product that still skipped the unusable mount (no filesystem_unavailable
+    # finding) makes the runner FAIL the variant.
     spec = SPECS[variant]
     empty = {
         "incidents": [],
@@ -225,9 +299,8 @@ def test_byte_only_gap_is_fail_when_undetected(tmp_path: Path, variant: str) -> 
         probes=probes(node_probe(survey()), storage_probe(), window_probe()),
     )
     result = spec.execute(ctx)
-    assert spec.expected_outcome == "FAIL"
-    assert result["verdict"] == "FAIL"
-    assert result["detected"] is False
+    assert result["verdict"] == "FAIL", result
+    assert any("filesystem_unavailable" in error for error in result["errors"]), result
 
 
 @pytest.mark.parametrize(

@@ -10,9 +10,13 @@ system disk, ``/var`` and the log disk are never touched.
 MARK_UNSCHEDULABLE then QUARANTINE, no STOP (no ``stop_on_isolation``), the
 incident ends QUARANTINED and the node is returned through the product's
 validated restore. ``filesystem_inodes_used_percent`` (``f_files/f_ffree``) is
-graded the same way, so ``inode_full`` runs that chain on the inode signal. The
-product grades only ``statvfs`` capacity, so the read-only, vanished-mount and
-probe-error variants are the spec's expected FAILs. 006
+graded the same way, so ``inode_full`` runs that chain on the inode signal. A
+configured mount that is read-only, gone, or whose ``statvfs`` raises is
+``filesystem_unavailable`` (READ_ONLY / MOUNT_MISSING / PROBE_FAILED): a
+VALIDATE_HOST diagnostic with no capacity finding and no reset, reboot or
+quarantine (batch 163), the node held while it stays unusable and readmitted
+once the mount is restored; ``probe_error`` stays live-deferred for want of a
+faulting-mount fixture. 006
 ``disk_io_util_percent``/``disk_io_await_ms`` are WARNING
 RUN_DIAGNOSTICS with a 120 s sustain; the oracle's own ``/proc/diskstats`` read
 computes the standard await to compare with the product's weighted-time one.
@@ -260,13 +264,20 @@ def duplicate(ctx: VariantContext) -> dict[str, Any]:
     return _result(stages)
 
 
-def _expected_fail_capacity(ctx: VariantContext, *, variant: str) -> dict[str, Any]:
-    """The spec-FAIL boundaries a capacity-only product never reads.
+UNAVAILABLE_METRIC = "filesystem_unavailable"
 
-    Each makes the test file system unusable in a way ``statvfs`` capacity
-    (blocks and inodes) does not report, then checks the product minted no
-    ``filesystem_used_percent`` finding. The effective injection with no
-    detection is the FAIL the case exists to record.
+
+def _unusable_filesystem_variant(
+    ctx: VariantContext, *, variant: str
+) -> dict[str, Any]:
+    """A configured mount made unusable without touching its capacity.
+
+    Read-only, vanished, or an unreadable ``statvfs``: the product reads each as
+    ``filesystem_unavailable`` and runs the VALIDATE_HOST diagnostic -- never a
+    capacity finding (the free bytes are untouched), never a reset, reboot or
+    quarantine. The node is held while the mount stays unusable, and readmitted
+    once the injection is undone and the signal clears to 0 (batch 163 closed
+    the capacity-only gap these variants used to record as expected FAILs).
     """
 
     survey = run_survey(ctx)
@@ -275,7 +286,67 @@ def _expected_fail_capacity(ctx: VariantContext, *, variant: str) -> dict[str, A
     _create_fs(ctx)
     _declare_fs(ctx)
     started = utc_now()
-    injected: dict[str, Any] = {}
+    injected = _inject_unusable(ctx, variant)
+    ctx.evidence.write("injection", injected)
+    detection = wait_for_incident(
+        ctx,
+        started,
+        UNAVAILABLE_METRIC,
+        device=mount,
+        timeout_seconds=QUARANTINE_BUDGET,
+        metrics={UNAVAILABLE_METRIC, "filesystem_used_percent"},
+        name=f"{variant}-detection",
+    )
+    incidents = finding_incidents(detection, UNAVAILABLE_METRIC, device=mount)
+    stages = {
+        "chain": chain_errors(
+            detection,
+            ChainExpectation(
+                metric=UNAVAILABLE_METRIC,
+                device=mount,
+                operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
+                validation="VALIDATE_HOST",
+                validation_must_fail=True,
+                probe_metric=UNAVAILABLE_METRIC,
+                forbidden=frozenset(
+                    {"STOP_WORKLOADS", "MARK_UNSCHEDULABLE", "QUARANTINE"}
+                )
+                | hardware_only(),
+                incident_states=DIAGNOSTIC_ONLY_STATES,
+            ),
+        ),
+        # The free bytes are untouched: no capacity finding may stand in for the
+        # unusable-mount one (the spec's "cannot judge health by free bytes").
+        "bytes_not_graded": chain_errors(
+            detection,
+            ChainExpectation(
+                metric="filesystem_used_percent", device=mount, present=False
+            ),
+        ),
+        "hardware": hardware_errors(detection),
+    }
+    # Undo the injection, then readmit once the availability signal clears.
+    _restore_unusable(ctx, variant)
+    recovered = await_metric_recovery(ctx, UNAVAILABLE_METRIC, 1.0, device=mount)
+    stages["recovery"] = recovered["errors"]
+    if not incidents:
+        stages["recovery"].append("no filesystem_unavailable finding to recover from")
+    wait_settled(
+        ctx,
+        started,
+        [item["incident_id"] for item in incidents],
+        timeout_seconds=QUARANTINE_BUDGET,
+        metrics={UNAVAILABLE_METRIC},
+        name=f"{variant}-settled",
+    )
+    close_window(ctx)
+    ctx.cleanup.discard("collector-window")
+    return _result(stages, extra={"injection": injected, "recovery": recovered})
+
+
+def _inject_unusable(ctx: VariantContext, variant: str) -> dict[str, Any]:
+    """Make the test mount unusable and prove the injection with its statvfs."""
+
     if variant == "read_only":
         injected = ctx.storage("fs-remount", "--name", TEST_FS, "--mode", "ro")
         if not (injected.get("statvfs") or {}).get("read_only"):
@@ -284,40 +355,25 @@ def _expected_fail_capacity(ctx: VariantContext, *, variant: str) -> dict[str, A
             "fs-rw",
             lambda: ctx.storage("fs-remount", "--name", TEST_FS, "--mode", "rw"),
         )
-    elif variant == "required_mount_missing":
+        return injected
+    if variant == "required_mount_missing":
         injected = ctx.storage("fs-umount", "--name", TEST_FS, "--rmdir")
         if (injected.get("statvfs") or {}).get(
             "used_percent"
         ) is not None and injected.get("directory_present"):
             raise VariantInconclusive("the mount did not disappear")
         ctx.cleanup.push("fs-mount", lambda: ctx.storage("fs-mount", "--name", TEST_FS))
-    ctx.evidence.write("injection", injected)
-    observed = _watch_no_finding(
-        ctx, started, "filesystem_used_percent", QUARANTINE_BUDGET, device=mount
-    )
-    detected = bool(
-        finding_incidents(observed, "filesystem_used_percent", device=mount)
-    )
-    # Undo the injection before closing the window.
+        return injected
+    raise VariantInconclusive(f"unknown unusable-filesystem variant {variant!r}")
+
+
+def _restore_unusable(ctx: VariantContext, variant: str) -> None:
     if variant == "read_only":
         ctx.storage("fs-remount", "--name", TEST_FS, "--mode", "rw")
         ctx.cleanup.discard("fs-rw")
     elif variant == "required_mount_missing":
         ctx.storage("fs-mount", "--name", TEST_FS)
         ctx.cleanup.discard("fs-mount")
-    close_window(ctx)
-    ctx.cleanup.discard("collector-window")
-    stages = {
-        "gap": []
-        if detected
-        else [
-            f"{variant}: the product never detected the unusable test file system "
-            f"(statvfs capacity only: blocks and inodes)"
-        ]
-    }
-    # expected_outcome=FAIL: a passing chain stage means the gap was NOT exposed,
-    # which the runner flags; here we record the gap so verdict() is FAIL.
-    return _result(stages, extra={"detected": detected, "injection": injected})
 
 
 INODE_METRIC = "filesystem_inodes_used_percent"
@@ -392,11 +448,11 @@ def inode_full(ctx: VariantContext) -> dict[str, Any]:
 
 
 def read_only(ctx: VariantContext) -> dict[str, Any]:
-    return _expected_fail_capacity(ctx, variant="read_only")
+    return _unusable_filesystem_variant(ctx, variant="read_only")
 
 
 def required_mount_missing(ctx: VariantContext) -> dict[str, Any]:
-    return _expected_fail_capacity(ctx, variant="required_mount_missing")
+    return _unusable_filesystem_variant(ctx, variant="required_mount_missing")
 
 
 # --------------------------------------------------------------------------- #
@@ -854,12 +910,6 @@ def _io_spec(
     )
 
 
-BYTE_ONLY_GAP = (
-    "the host collector grades only statvfs capacity (f_blocks/f_bavail and "
-    "f_files/f_ffree in _filesystems): it reads no ST_RDONLY, no write probe, "
-    "and skips a configured mount whose statvfs fails"
-)
-
 VARIANTS = [
     _fs_spec(
         "capacity_full",
@@ -887,32 +937,37 @@ VARIANTS = [
     _fs_spec(
         "read_only",
         "remount the test fs read-only",
-        "ST_RDONLY is ignored, no write probe -> no detection (spec FAIL)",
+        "filesystem_unavailable (READ_ONLY) -> FREEZE_EVIDENCE, VALIDATE_HOST; no "
+        "capacity finding, no reset/reboot/quarantine (batch 163: ST_RDONLY is read "
+        "and graded); readmit on remount rw",
         "remount rw",
         read_only,
-        outcome="FAIL",
-        gap=BYTE_ONLY_GAP,
     ),
     _fs_spec(
         "required_mount_missing",
         "umount the declared test fs (and rmdir)",
-        "statvfs reports the parent or skips ENOENT -> no detection (spec FAIL)",
+        "statvfs ENOENT -> filesystem_unavailable (MOUNT_MISSING) -> VALIDATE_HOST; "
+        "no reset/reboot/quarantine (batch 163: a vanished configured mount is "
+        "reported, not skipped); readmit on remount",
         "remount",
         required_mount_missing,
-        outcome="FAIL",
-        gap=BYTE_ONLY_GAP,
     ),
     deferred_variant(
         CASE_004,
         "probe_error",
         proof_mode="live-replay",
         reason=(
-            "FIXTURE_NOT_READY: a statvfs EIO/EACCES cannot be produced by a read-only file "
-            "bind (statvfs resolves the mount, not the bound file); it needs a real faulting "
-            "test mount (FUSE/dm-error), which is not built this phase"
+            "FIXTURE_NOT_READY: the product reports a statvfs EIO/EACCES as "
+            "filesystem_unavailable (PROBE_FAILED) since batch 163, but injecting a "
+            "real one live needs a faulting test mount (FUSE/dm-error) not built this "
+            "phase; a read-only file bind cannot (statvfs resolves the mount, not the "
+            "bound file)"
         ),
         lanes=("eks",),
-        expected="the except branch silently skips the mount (spec FAIL)",
+        expected=(
+            "a configured mount whose statvfs raises is unusable -> "
+            "filesystem_unavailable (PROBE_FAILED) -> VALIDATE_HOST (batch 163)"
+        ),
     ),
     _fs_spec(
         "duplicate",
