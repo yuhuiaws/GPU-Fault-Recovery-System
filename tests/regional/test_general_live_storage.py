@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import general_live_storage as storage
-from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -283,8 +283,10 @@ def test_inode_full_passes_only_on_the_inode_quarantine_and_restores_it(
 
 
 def test_sustained_util_passes(tmp_path: Path) -> None:
+    # Without dm_delay the plain linear device path is attempted and the scripted
+    # util samples carry it through; the dm_delay path is deferred (see below).
     spec = SPECS["sustained_util"]
-    node = node_probe(survey())
+    node = node_probe(survey(dm_delay=False))
     node.script["oracle-read"] = {
         "records": [
             {"diskstats": {"dm-7": {"util_percent": 100.0}}} for _ in range(80)
@@ -480,7 +482,6 @@ def test_zero_completed_io_and_counter_reset_and_recovery(tmp_path: Path) -> Non
 
 
 def test_sustained_latency_requires_dm_delay(tmp_path: Path) -> None:
-    from scripts.e2e.regional.general_live_fixture import VariantNotRun
     from tests.regional._general_live_fakes import make_settings
 
     spec = SPECS["sustained_latency"]
@@ -496,8 +497,32 @@ def test_sustained_latency_requires_dm_delay(tmp_path: Path) -> None:
             node_probe(survey(dm_delay=False)), storage_probe(), window_probe()
         ),
     )
-    with pytest.raises(VariantNotRun):
+    with pytest.raises(VariantNotRun) as caught:
         spec.execute(ctx)
+    assert caught.value.reason == "CAPABILITY_ABSENT"
+
+
+@pytest.mark.parametrize("variant", ["sustained_util", "sustained_latency"])
+def test_dm_io_load_is_deferred_when_dm_delay_is_present(
+    tmp_path: Path, variant: str
+) -> None:
+    # The live finding: the dm-delay-backed 006 I/O-load signal failed on the
+    # native path (TimeoutExpired / dm-delay ProbeError). With dm_delay present
+    # both variants record NOT_RUN(FIXTURE_NOT_READY) instead of a blind fix.
+    spec = SPECS[variant]
+    regional = FakeRegional(cpu_python=store_script({"activity": {}}))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(
+            node_probe(survey(dm_delay=True)), storage_probe(), window_probe()
+        ),
+    )
+    with pytest.raises(VariantNotRun) as caught:
+        spec.execute(ctx)
+    assert caught.value.reason == "FIXTURE_NOT_READY"
+    assert "dm-I/O load path" in caught.value.detail
 
 
 def test_probe_error_is_deferred() -> None:

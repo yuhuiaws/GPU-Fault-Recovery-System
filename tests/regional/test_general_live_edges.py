@@ -289,6 +289,9 @@ def test_storage_required_mount_missing_gap_is_fail(tmp_path: Path) -> None:
 
 def test_storage_sustained_util_inconclusive(tmp_path: Path) -> None:
     probes = storage_probes(tmp_path)
+    # The inconclusive (oracle never sustains) path is only reached on the plain
+    # linear device; with dm_delay present the variant defers instead.
+    probes[f"node@{NODE}"].script["survey"]["modules"]["dm_delay"]["loaded"] = False
     probes[f"node@{NODE}"].script["oracle-read"] = {
         "records": [{"diskstats": {"dm-9": {"util_percent": 1.0}}} for _ in range(40)],
         "next_offset": 40,

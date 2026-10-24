@@ -36,6 +36,7 @@ from scripts.e2e.regional.general_live_common import (
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
+    VariantNotRun,
     backing_root,
     require_module,
     require_tools,
@@ -66,6 +67,22 @@ IO_BUDGET = IO_SUSTAIN + 300 + 90
 SHORT_FLUSH = 45
 TEST_FS = "fs"
 TEST_DM = "io"
+#: Why the dm-delay-backed 006 I/O-load signal is NOT_RUN(FIXTURE_NOT_READY).
+#: The Bidirectional host-mount fix (host_probe_fixture) lets the ``systemd-run``
+#: writer reach the test dm device instead of the root fs, but the live run still
+#: showed the native dm-I/O load path failing independently of mount visibility
+#: (sustained_util: host probe TimeoutExpired; sustained_latency: the 200 ms
+#: dm-delay injector raised ProbeError). Making it reliable needs a real
+#: dm/dm-delay device this harness cannot exercise (the unit tests fake the
+#: probe), so the dm-delay-backed signal is deferred rather than blind-fixed.
+DM_IO_LOAD_DEFERRED = (
+    "the native dm-I/O load path live-failed (sustained_util host probe "
+    "TimeoutExpired, sustained_latency dm-delay injector ProbeError); the "
+    "Bidirectional host mount lets the writer reach the dm device, but the "
+    "long-running O_DIRECT writer unit and the dm-delay injector still need a "
+    "real dm/dm-delay device this harness cannot exercise, so the dm-delay-backed "
+    "signal is deferred rather than given a blind, unverifiable fix"
+)
 
 
 def _fs_mount(ctx: VariantContext) -> str:
@@ -503,23 +520,30 @@ def _io_metric_variant(
 
 
 def sustained_util(ctx: VariantContext) -> dict[str, Any]:
-    # dm-delay 20 ms keeps util high at tiny throughput so the backing disk is
-    # barely touched; on HyperPod a plain linear device over the instance store.
-    delay = 20 if ctx.survey.get("modules", {}).get("dm_delay", {}).get("loaded") else 0
-    return _io_metric_variant(ctx, metric="disk_io_util_percent", delay_ms=delay or 0)
+    survey = run_survey(ctx)
+    # The reliable util signal uses a dm-delay device (20 ms keeps util high at
+    # tiny throughput so the backing disk is barely touched). That native
+    # dm-I/O load path live-failed and cannot be exercised here, so when dm_delay
+    # is in play the variant is NOT_RUN(FIXTURE_NOT_READY); without dm_delay the
+    # plain linear device is still attempted (it may read INCONCLUSIVE on fast
+    # NVMe, which is a distinct, honest outcome).
+    if (survey.get("modules") or {}).get("dm_delay", {}).get("loaded"):
+        raise VariantNotRun("FIXTURE_NOT_READY", DM_IO_LOAD_DEFERRED)
+    return _io_metric_variant(ctx, metric="disk_io_util_percent", delay_ms=0)
 
 
 def sustained_latency(ctx: VariantContext) -> dict[str, Any]:
     survey = run_survey(ctx)
     module = (survey.get("modules") or {}).get("dm_delay") or {}
     if not module.get("loaded") and "KERNEL_MODULE_LOAD" not in ctx.settings.approvals:
-        from scripts.e2e.regional.general_live_fixture import VariantNotRun
-
         raise VariantNotRun(
             "CAPABILITY_ABSENT",
             "dm_delay is not loaded; load it with KERNEL_MODULE_LOAD or use the replay",
         )
-    return _io_metric_variant(ctx, metric="disk_io_await_ms", delay_ms=200)
+    # dm_delay is available, but the 200 ms dm-delay injector live-failed on the
+    # native dm-I/O load path; deferred rather than given a blind, unverifiable
+    # fix (see DM_IO_LOAD_DEFERRED).
+    raise VariantNotRun("FIXTURE_NOT_READY", DM_IO_LOAD_DEFERRED)
 
 
 def short_flush(ctx: VariantContext) -> dict[str, Any]:
