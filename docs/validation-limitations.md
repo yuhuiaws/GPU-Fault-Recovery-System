@@ -1031,9 +1031,12 @@ fault is held ends `RECOVERED` with reason `diagnostic inconclusive`
 (detailed design §6.3), so the runners accept `ACTION_PENDING` (still running)
 or that `RECOVERED` and flag `ESCALATED` or a `RECOVERED` without the reason;
 the host collector delivers an unchanged reading only once per health summary
-(`GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS`), so a recovery wait now spans two
-summary periods for its two fresh samples (host CPU/load, storage and host
-memory alike); and the GPU environment runner
+(`GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS`) and keeps normal summaries out of
+the stored evidence, so a recovery wait now spans two summary periods and
+accepts either two fresh delivered samples below the threshold or the
+recovered edge's fresh sample together with the product's cleared health
+signal for the metric (host CPU/load, storage and host memory alike); and the
+GPU environment runner
 treats a collector unit that carries no endpoint override after the restore as
 restored to `collector.env`'s endpoint, the state its repoint started from.
 A failed validation also counts as judging the held fault when its

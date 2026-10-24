@@ -26,6 +26,7 @@ from __future__ import annotations
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import (
+    await_metric_recovery,
     Oracle,
     activity,
     run_survey,
@@ -253,29 +254,13 @@ def no_swap(ctx: VariantContext) -> dict[str, Any]:
 # shared helpers
 # --------------------------------------------------------------------------- #
 def _await_recovery(ctx: VariantContext, oracle: Oracle) -> dict[str, Any]:
-    started = utc_now()
+    """Fresh evidence that host memory use fell back below the threshold."""
 
-    def accept() -> dict[str, Any] | None:
-        current = activity(ctx, started, metrics={"memory_used_percent"})
-        fresh = [
-            sample
-            for sample in samples(current, "memory_used_percent")
-            if isinstance(sample.get("value"), (int, float))
-            and sample["value"] < USED_THRESHOLD
-        ]
-        return {"samples": fresh} if len(fresh) >= 2 else None
-
-    # The recovered edge plus one health summary (see general_live_host).
-    value = ctx.wait_until(
-        accept,
-        timeout_seconds=ctx.host_summary * 2 + ctx.host_interval * 6,
-        poll_seconds=ctx.host_interval,
-        name="memory-recovery",
+    result = await_metric_recovery(
+        ctx, "memory_used_percent", USED_THRESHOLD, name="memory-recovery"
     )
     oracle.read()
-    if value is None:
-        return {"errors": ["memory_used_percent did not report 2 fresh samples < 95 %"]}
-    return {"errors": [], "fresh_samples": value["samples"]}
+    return result
 
 
 def _statuses(activity_document: dict[str, Any]) -> list[dict[str, Any]]:

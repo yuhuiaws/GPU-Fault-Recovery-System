@@ -183,9 +183,7 @@ def test_host_await_recovery_timeout(tmp_path: Path) -> None:
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
-    assert any("2 fresh samples below threshold" in e for e in result["errors"]), (
-        "any('2 fresh samples below threshold' in e for e in result['errors'])"
-    )
+    assert any("did not recover" in e for e in result["errors"]), result["errors"]
 
 
 def storage_survey() -> dict[str, Any]:

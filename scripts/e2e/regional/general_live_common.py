@@ -19,12 +19,14 @@ from scripts.e2e.regional.general_live_fixture import (
     HOST_UNIT,
     VariantContext,
     VariantNotRun,
+    utc_now,
 )
-from scripts.e2e.regional.general_live_store import node_activity
+from scripts.e2e.regional.general_live_store import node_activity, signal_key
 from scripts.e2e.regional.general_live_verdicts import (
     TERMINAL_WORKFLOWS,
     finding_incidents,
     node_isolated,
+    samples,
     settled,
 )
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
@@ -170,6 +172,73 @@ def activity(
         signal_keys=signal_keys,
         kinds=kinds,
     )
+
+
+def _after(text: Any, moment: datetime) -> bool:
+    try:
+        return datetime.fromisoformat(str(text).replace("Z", "+00:00")) >= moment
+    except ValueError:
+        return False
+
+
+def await_metric_recovery(
+    ctx: VariantContext,
+    metric: str,
+    threshold: float,
+    *,
+    device: str | None = None,
+    name: str | None = None,
+) -> dict[str, Any]:
+    """Fresh product evidence that ``metric`` fell back below ``threshold``.
+
+    Waited for after the injection stopped, over two health-summary periods.
+    Either proof is accepted: two fresh delivered samples below the threshold,
+    or one (the recovered edge) whose health signal the product has cleared
+    since -- the host collector delivers an unchanged normal reading only once
+    per health summary, so the cleared signal is the product's own record of
+    the recovery (live 2026-10-24: no second batch arrived within 14 minutes).
+    """
+
+    started = utc_now()
+    key = signal_key(
+        ctx.settings.regional.cluster_id, ctx.settings.node, metric, device
+    )
+
+    def accept() -> dict[str, Any] | None:
+        current = activity(ctx, started, metrics={metric}, signal_keys=[key])
+        fresh = [
+            sample
+            for sample in samples(current, metric, device=device)
+            if isinstance(sample.get("value"), (int, float))
+            and sample["value"] < threshold
+        ]
+        signal = (current.get("health_signals") or {}).get(key) or {}
+        cleared = signal.get("active") is False and _after(
+            signal.get("observed_at"), started
+        )
+        if len(fresh) >= 2 or (fresh and cleared):
+            return {"samples": fresh, "health_signal": signal}
+        return None
+
+    value = ctx.wait_until(
+        accept,
+        timeout_seconds=ctx.host_summary * 2 + ctx.host_interval * 6,
+        poll_seconds=ctx.host_interval,
+        name=name or f"{metric}-recovery",
+    )
+    if value is None:
+        label = metric + (f" on {device}" if device is not None else "")
+        return {
+            "errors": [
+                f"{label} did not recover: no fresh sample below threshold with a "
+                "cleared health signal, nor two fresh samples"
+            ]
+        }
+    return {
+        "errors": [],
+        "fresh_samples": value["samples"],
+        "health_signal": value["health_signal"],
+    }
 
 
 def wait_for_incident(
@@ -336,6 +405,7 @@ def unsettled_workflows(activity_document: dict[str, Any]) -> list[str]:
 __all__ = [
     "Oracle",
     "activity",
+    "await_metric_recovery",
     "close_window",
     "open_incident_ids",
     "open_window",

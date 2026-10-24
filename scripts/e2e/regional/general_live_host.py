@@ -15,6 +15,7 @@ from __future__ import annotations
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import (
+    await_metric_recovery,
     Oracle,
     activity,
     wait_for_incident,
@@ -355,38 +356,12 @@ def ctx_survey(ctx: VariantContext) -> dict[str, Any]:
 
 
 def _await_recovery(ctx: VariantContext, metric: str, oracle: Oracle) -> dict[str, Any]:
-    """Two fresh below-threshold samples of ``metric`` after the load stops.
+    """Fresh evidence that ``metric`` recovered after the load stopped."""
 
-    The host collector delivers a batch only on an edge or its periodic health
-    summary (``GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS``): after the load the
-    product receives the ``recovered`` edge and then one summary per period, so
-    the wait spans two summary periods (live 2026-10-24: one summary period was
-    too short for three samples).
-    """
-
-    started = utc_now()
     threshold = CPU_THRESHOLD if metric == "cpu_usage_percent" else LOAD_THRESHOLD
-
-    def accept() -> dict[str, Any] | None:
-        current = activity(ctx, started, metrics={metric})
-        fresh = [
-            sample
-            for sample in samples(current, metric)
-            if isinstance(sample.get("value"), (int, float))
-            and sample["value"] < threshold
-        ]
-        return {"samples": fresh, "activity": current} if len(fresh) >= 2 else None
-
-    value = ctx.wait_until(
-        accept,
-        timeout_seconds=ctx.host_summary * 2 + ctx.host_interval * 6,
-        poll_seconds=ctx.host_interval,
-        name=f"{metric}-recovery",
-    )
+    result = await_metric_recovery(ctx, metric, threshold)
     oracle.read()
-    if value is None:
-        return {"errors": [f"{metric} did not report 2 fresh samples below threshold"]}
-    return {"errors": [], "fresh_samples": value["samples"]}
+    return result
 
 
 def _watch_for_no_finding(

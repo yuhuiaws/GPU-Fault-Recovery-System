@@ -21,6 +21,7 @@ from __future__ import annotations
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import (
+    await_metric_recovery,
     Oracle,
     activity,
     close_window,
@@ -657,32 +658,7 @@ def _await_divergence(product: list[float], standard: list[float]) -> bool:
 def _await_io_recovery(
     ctx: VariantContext, metric: str, device: str, threshold: float
 ) -> dict[str, Any]:
-    started = utc_now()
-
-    def accept() -> dict[str, Any] | None:
-        current = activity(ctx, started, metrics={metric})
-        fresh = [
-            sample
-            for sample in samples(current, metric, device=device)
-            if isinstance(sample.get("value"), (int, float))
-            and sample["value"] < threshold
-        ]
-        return {"samples": fresh} if len(fresh) >= 2 else None
-
-    # The recovered edge plus one health summary (see general_live_host).
-    value = ctx.wait_until(
-        accept,
-        timeout_seconds=ctx.host_summary * 2 + ctx.host_interval * 6,
-        poll_seconds=ctx.host_interval,
-        name=f"{metric}-recovery",
-    )
-    if value is None:
-        return {
-            "errors": [
-                f"{metric} on {device} did not report fresh samples below threshold"
-            ]
-        }
-    return {"errors": [], "fresh_samples": value["samples"]}
+    return await_metric_recovery(ctx, metric, threshold, device=device)
 
 
 def _watch_no_finding(
