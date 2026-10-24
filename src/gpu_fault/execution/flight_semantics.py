@@ -68,7 +68,9 @@ def flight_semantics(signals: list[dict[str, Any]]) -> dict[str, Any]:
             continue
         entries = [row["entry"] for row in rows]
         states = {match_collective(entries[0], entry, key[2]) for entry in entries[1:]}
-        issues = sorted(states - {"FULLY_MATCHED", "UNDECIDED", "COLLECTIVE_STATE_MISMATCH"})
+        issues = sorted(
+            states - {"FULLY_MATCHED", "UNDECIDED", "COLLECTIVE_STATE_MISMATCH"}
+        )
         if issues:
             findings.append(
                 {

@@ -3,8 +3,8 @@ from datetime import timedelta
 from gpu_fault.app import notify_silent_collectors
 from gpu_fault.collector_requirements import required_collectors_for_agent
 from gpu_fault.fleet import AgentRecord
-from gpu_fault.models import WorkflowStatus
 from gpu_fault.models import WorkflowOperation as Op
+from gpu_fault.models import WorkflowStatus
 from gpu_fault.regional import RegionalClusterRegistration
 from gpu_fault.telemetry import CollectorStatus
 from tests.execution._health_policy_e2e_support import HealthRig

@@ -5,8 +5,8 @@ from types import SimpleNamespace
 import pytest
 
 from gpu_fault.app.context import ApplicationContext
-from gpu_fault.node_agent.communication_runtime import CommunicationRuntime
 from gpu_fault.models import WorkflowOperation as Op
+from gpu_fault.node_agent.communication_runtime import CommunicationRuntime
 from tests._builders import (
     asgi_client,
     attempt_observation,

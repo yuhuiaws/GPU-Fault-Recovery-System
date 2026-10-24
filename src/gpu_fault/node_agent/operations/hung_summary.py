@@ -9,7 +9,10 @@ import time
 from typing import Any
 
 from gpu_fault.node_agent.diagnostic_process import run_probe
-from gpu_fault.node_agent.operations.collection_budget import collection_lease, publish_partial
+from gpu_fault.node_agent.operations.collection_budget import (
+    collection_lease,
+    publish_partial,
+)
 from gpu_fault.node_agent.operations.hung_summary_io import (
     SUMMARY_VERSION,
     application_sample,
@@ -104,7 +107,11 @@ def paired_rank(
         "pid": row["pid"],
         "rank": row["rank"],
         "world_size": row["world_size"],
-        "process_identity": {"verified": valid, "start_time_ticks": start, "namespace_pids": namespace_pids(agent.proc_root, row["pid"])},
+        "process_identity": {
+            "verified": valid,
+            "start_time_ticks": start,
+            "namespace_pids": namespace_pids(agent.proc_root, row["pid"]),
+        },
         "proc": {},
         "communication_status": "UNAVAILABLE",
         "communication": [],
@@ -227,7 +234,10 @@ def _collect_hung_summary(agent: Any, command: NodeActionCommand) -> dict[str, A
         )
         for row in rows
     ]
-    publish_partial(agent, {**base, **coverage, "status": "COLLECTING", "ranks": ranks, "groups": groups})
+    publish_partial(
+        agent,
+        {**base, **coverage, "status": "COLLECTING", "ranks": ranks, "groups": groups},
+    )
     gpu, gpu_by_pid = gpu_sample(agent)
     for row in ranks:
         identity = row["process_identity"]
@@ -284,7 +294,11 @@ def _collect_hung_summary(agent: Any, command: NodeActionCommand) -> dict[str, A
         "sample_interval_seconds": interval,
         "training_fabric_scope": task_rdma_bindings(agent, ranks, scope),
     }
-    from gpu_fault.node_agent.operations.communication_cache import cached_communication, apply_cached_flights
+    from gpu_fault.node_agent.operations.communication_cache import (
+        cached_communication,
+        apply_cached_flights,
+    )
+
     result.update(cached_communication(agent, command))
     apply_cached_flights(result)
     if len(json.dumps(result).encode()) > 1_048_576:

@@ -112,7 +112,14 @@ def after_summary(
                         bindings[node] = scope
                 except ValueError:
                     continue
-            steps[i] = item.model_copy(update={"parameters": {**item.parameters, "training_fabric_by_node": bindings}})
+            steps[i] = item.model_copy(
+                update={
+                    "parameters": {
+                        **item.parameters,
+                        "training_fabric_by_node": bindings,
+                    }
+                }
+            )
         if item.operation is Op.COLLECT_HUNG_TRIAGE:
             steps[i] = _target(
                 item,

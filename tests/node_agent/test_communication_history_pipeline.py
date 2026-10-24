@@ -1,26 +1,26 @@
+import json
 from copy import deepcopy
 from datetime import timedelta
 from types import SimpleNamespace
 
 import pytest
 
+from gpu_fault.models import WorkflowOperation as Op
 from gpu_fault.node_agent.communication_history import CommunicationHistory
 from gpu_fault.node_agent.observation_supervisor import ObservationSupervisor
+from gpu_fault.node_agent.observation_worker import ObservationAgent
 from gpu_fault.node_agent.operations.communication_cache import (
     cached_communication,
     cached_flight_pairs,
 )
-from gpu_fault.ras_survey import ras_survey
-from gpu_fault.models import WorkflowOperation as Op
-from tests.execution._flight_series_support import NOW
-from tests.node_agent._support import command
-from tests.node_agent.test_communication_monitor import ras_document
+from gpu_fault.node_agent.passive_communication import listening_owner
 from gpu_fault.ras_observation import parse_ras
 from gpu_fault.ras_progress import ras_progress
-from gpu_fault.node_agent.observation_worker import ObservationAgent
-from gpu_fault.node_agent.passive_communication import listening_owner
+from gpu_fault.ras_survey import ras_survey
+from tests.execution._flight_series_support import NOW
 from tests.node_agent._cov95_runtime_hung import process
-import json
+from tests.node_agent._support import command
+from tests.node_agent.test_communication_monitor import ras_document
 
 
 @pytest.mark.parametrize(

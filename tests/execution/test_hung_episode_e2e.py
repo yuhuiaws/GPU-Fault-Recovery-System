@@ -1,11 +1,13 @@
+from datetime import timedelta
+
+import pytest
+
 from gpu_fault.host_health import HostMetricSample, HostTelemetryBatch
 from gpu_fault.models import IncidentState, WorkflowStatus
 from gpu_fault.models import WorkflowOperation as Op
 from tests.execution._health_policy_e2e_support import JOB
-from tests.execution._raw_health_e2e_support import RawHealthRig
-import pytest
-from datetime import timedelta
 from tests.execution._nccl_chain_support import chain_fixture as chain_fixture
+from tests.execution._raw_health_e2e_support import RawHealthRig
 
 
 def traffic(rig, rate):
@@ -170,8 +172,9 @@ def test_raw_counter_recovery_with_default_edge_filter_rearms_without_extra_prob
 
 def test_recovered_first_reporter_allows_new_wave_on_a_different_node():
     from datetime import datetime, timedelta, timezone
-    from gpu_fault.host_health import NodeHealthPolicy
+
     from gpu_fault.health_recovery_contract import is_hung_finding
+    from gpu_fault.host_health import NodeHealthPolicy
     from tests._builders import build_context
     from tests.host_health._support import efa_telemetry, observe_running_attempt
 

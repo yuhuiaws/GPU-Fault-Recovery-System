@@ -6,9 +6,8 @@ from types import SimpleNamespace
 import pytest
 
 from gpu_fault.app import default_simulated_profile
-from gpu_fault.host_health import NodeHealthCategory
 from gpu_fault.gpu_metrics import GpuHealthFinding, GpuHealthSeverity
-from gpu_fault.telemetry import CollectorKind, CollectorStatus
+from gpu_fault.host_health import NodeHealthCategory
 from gpu_fault.hyperpod import HyperPodNode
 from gpu_fault.hyperpod_spares import (
     SPARE_POOL_STATE_ANNOTATION,
@@ -35,6 +34,7 @@ from gpu_fault.spare_health import (
     HyperPodSpareHealthController,
     SpareHealthState,
 )
+from gpu_fault.telemetry import CollectorKind, CollectorStatus
 from tests._builders import build_store, copy_model, node_health_finding
 
 

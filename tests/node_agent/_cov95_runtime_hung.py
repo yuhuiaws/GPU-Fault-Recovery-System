@@ -11,9 +11,7 @@ from gpu_fault.node_agent import NodeActionExecutor, NodeActionStatus
 from tests.node_agent._support import command, envelope
 
 COMPUTE_QUERY = "--query-compute-apps=pid,gpu_uuid,process_name"
-GPU_QUERY = (
-    "--query-gpu=uuid,utilization.gpu,utilization.memory,clocks_throttle_reasons.active,name"
-)
+GPU_QUERY = "--query-gpu=uuid,utilization.gpu,utilization.memory,clocks_throttle_reasons.active,name"
 
 
 def process(

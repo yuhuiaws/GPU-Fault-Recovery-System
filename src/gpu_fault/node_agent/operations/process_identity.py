@@ -22,7 +22,9 @@ def namespace_pids(proc_root: Path, pid: int) -> list[int]:
         with (proc_root / str(pid) / "status").open() as stream:
             for line in stream.read(65536).splitlines():
                 if line.startswith("NSpid:"):
-                    values.update(int(value) for value in line.split()[1:] if value.isdecimal())
+                    values.update(
+                        int(value) for value in line.split()[1:] if value.isdecimal()
+                    )
     except OSError:
         pass
     return sorted(values)

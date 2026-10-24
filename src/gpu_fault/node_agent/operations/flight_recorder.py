@@ -43,7 +43,9 @@ def decode_flight_dump(raw: bytes) -> Any:
     try:
         return FlightRecorderUnpickler(io.BytesIO(raw)).load()
     except Exception as exc:
-        raise ValueError(f"unparsable flight recorder dump: {type(exc).__name__}: {exc}") from exc
+        raise ValueError(
+            f"unparsable flight recorder dump: {type(exc).__name__}: {exc}"
+        ) from exc
 
 
 class FlightRecorderOperationsMixin:
