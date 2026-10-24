@@ -79,14 +79,21 @@ def test_zero_traffic_cannot_signal_hang_before_active_history_and_startup_grace
 
 
 def test_zero_traffic_moves_through_thresholds_and_recovery_once() -> None:
-    state, _ = sample()
+    # One active sample before the stall is not a trusted baseline, so the
+    # default recovery policy uses its 1 MiB/s absolute fallback threshold.
+    rate = 2_000_000
+    state, _ = sample(bps=rate)
     expected = [
         (30, 0, EfaTrafficSignal.ZERO_PENDING, False, 1),
         (50, 0, EfaTrafficSignal.ZERO_WARNING, True, 2),
         (51, 0, EfaTrafficSignal.ZERO_WARNING, False, 3),
         (90, 0, EfaTrafficSignal.HUNG_SUSPECTED, True, 4),
-        (91, 1000, EfaTrafficSignal.RECOVERED, True, 0),
-        (92, 1000, EfaTrafficSignal.NORMAL, False, 0),
+        # Returning traffic breaks the zero timer at once, but the stall
+        # episode ends only after 3 samples over 120 s with gaps <= 60 s.
+        (91, rate, EfaTrafficSignal.NORMAL, False, 0),
+        (151, rate, EfaTrafficSignal.NORMAL, False, 0),
+        (211, rate, EfaTrafficSignal.RECOVERED, True, 0),
+        (212, rate, EfaTrafficSignal.NORMAL, False, 0),
     ]
     for seconds, bps, signal, expected_emit, count in expected:
         state, emit = sample(state, seconds=seconds, bps=bps)
@@ -95,8 +102,10 @@ def test_zero_traffic_moves_through_thresholds_and_recovery_once() -> None:
             expected_emit,
             count,
         ), state
+        assert (state.stall_episode is None) == (seconds >= 211), state
+    assert state.last_stable_traffic_at == NOW + timedelta(seconds=211), state
     assert state.zero_since is state.zero_first_seen_at is None, state
-    assert state.baseline_bytes_per_second == 1000, state
+    assert state.baseline_bytes_per_second == rate, state
 
 
 @pytest.mark.parametrize(
