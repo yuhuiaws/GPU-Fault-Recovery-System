@@ -83,6 +83,20 @@ APPROVALS: dict[str, str] = {
         "stop kubelet on the declared warm spare to drive it NotReady, with a "
         "host-side automatic restart timer; restarted in cleanup"
     ),
+    # Lane K (phase 2) kernel-log source replay and EFA inventory.
+    "KERNEL_SOURCE_REPLAY": (
+        "repoint the kernel collector's GPU_FAULT_KMSG_PATH at a reviewed "
+        "fixture file for a bounded window (it stops reading real /dev/kmsg "
+        "meanwhile); restored by cleanup and a deadman"
+    ),
+    "EFA_DRIVER_UNBIND": (
+        "unbind the driver of one allow-listed EFA data function on a dedicated "
+        "node and rebind it, with an independent rebind deadman"
+    ),
+    "DEVICE_PLUGIN_RESTART": (
+        "delete the GPU or EFA device-plugin Pod on the test node so kubelet "
+        "de-registers its allocatable, then let the DaemonSet re-register it"
+    ),
 }
 
 #: Workflow operations a diagnostic-only chain must never contain.
