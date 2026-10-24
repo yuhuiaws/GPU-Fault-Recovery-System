@@ -201,3 +201,44 @@ def test_net_state_and_residue(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert not netp.residue_is_clean(
         {"interfaces": ["x"], "generators": [], "netns": []}
     ), "not netp.residue_is_clean( {'interfaces': ['x'], 'generators': [], 'ne"
+
+
+# --------------------------------------------------------------------------- #
+# node probe: EFA traffic oracle (GF-GENERAL-LIVE-011)
+# --------------------------------------------------------------------------- #
+def _efa_port(
+    root: Path, device: str, port: str, counters: dict[str, int], *, efa: bool = True
+) -> None:
+    device_dir = root / device / "device"
+    device_dir.mkdir(parents=True, exist_ok=True)
+    (device_dir / "uevent").write_text(f"DRIVER={'efa' if efa else 'other'}\n")
+    hw = root / device / "ports" / port / "hw_counters"
+    hw.mkdir(parents=True, exist_ok=True)
+    for name, value in counters.items():
+        (hw / name).write_text(str(value))
+
+
+def test_efa_traffic_reading_sums_the_pair(tmp_path: Path) -> None:
+    _efa_port(tmp_path, "rdmap0", "1", {"rx_bytes": 100, "tx_bytes": 40, "rx_pkts": 7})
+    _efa_port(tmp_path, "rdmap1", "1", {"rx_bytes": 1000, "tx_bytes": 600})
+    reading = nodep.efa_traffic_reading(tmp_path)
+    assert reading["rx_bytes_total"] == 1100
+    assert reading["tx_bytes_total"] == 640
+    assert reading["pair_bytes_total"] == 1740
+    assert reading["port_count"] == 2 and reading["complete_pairs"] is True
+
+
+def test_efa_traffic_reading_ignores_non_efa_and_marks_incomplete(
+    tmp_path: Path,
+) -> None:
+    _efa_port(tmp_path, "mlx0", "1", {"rx_bytes": 9, "tx_bytes": 9}, efa=False)
+    _efa_port(tmp_path, "rdmap0", "1", {"only_one": 5})  # no complete pair
+    reading = nodep.efa_traffic_reading(tmp_path)
+    assert reading["pair_bytes_total"] == 0
+    assert reading["port_count"] == 1 and reading["complete_pairs"] is False
+
+
+def test_efa_traffic_reading_falls_back_to_send_recv(tmp_path: Path) -> None:
+    _efa_port(tmp_path, "rdmap0", "1", {"send_bytes": 300, "recv_bytes": 200})
+    reading = nodep.efa_traffic_reading(tmp_path)
+    assert reading["pair_bytes_total"] == 500 and reading["complete_pairs"] is True
