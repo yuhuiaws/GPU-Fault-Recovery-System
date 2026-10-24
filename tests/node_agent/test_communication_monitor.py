@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+import gpu_fault
 from gpu_fault.communication_monitoring import observation_plan
 from gpu_fault.node_agent.communication_history import CommunicationHistory
 from gpu_fault.node_agent.observation_limits import service_limits
@@ -20,6 +21,15 @@ from tests._builders import attempt_observation, container_observation
 from tests.execution._flight_series_support import NOW
 from tests.node_agent._cov95_runtime_hung import process
 from tests.node_agent.test_process_diagnostics_e2e import proc_stat
+
+
+def use_imported_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Let the supervisor's child processes import the gpu_fault this test imported.
+
+    The deploy's release gate runs pytest with the deploy-host venv, whose installed gpu_fault has
+    no node_agent; the test reaches the source tree through sys.path, which a child does not inherit.
+    """
+    monkeypatch.setenv("PYTHONPATH", str(Path(gpu_fault.__file__).resolve().parents[1]))
 
 
 def ras_document():
@@ -275,6 +285,7 @@ def test_owned_worker_returns_partial_at_deadline(tmp_path, monkeypatch):
     )
     tool.chmod(0o700)
     monkeypatch.setenv("PATH", str(tmp_path))
+    use_imported_package(monkeypatch)
     supervisor = ObservationSupervisor()
     released = threading.Event()
     started = time.monotonic()

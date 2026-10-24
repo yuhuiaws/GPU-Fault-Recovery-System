@@ -20,7 +20,10 @@ from gpu_fault.ras_survey import ras_survey
 from tests.execution._flight_series_support import NOW
 from tests.node_agent._cov95_runtime_hung import process
 from tests.node_agent._support import command
-from tests.node_agent.test_communication_monitor import ras_document
+from tests.node_agent.test_communication_monitor import (
+    ras_document,
+    use_imported_package,
+)
 
 
 @pytest.mark.parametrize(
@@ -165,6 +168,7 @@ def test_real_readonly_worker_handles_all_three_evidence_operations(
     root = tmp_path / "proc"
     root.mkdir()
     monkeypatch.setenv("PATH", str(tmp_path))
+    use_imported_package(monkeypatch)
     request = command(
         operation,
         parameters={
