@@ -11,7 +11,13 @@ from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
-from gpu_fault.fabric_scope import validate_task_fabric, validation_evidence
+from gpu_fault.execution.hung_handoff import support_handoff_follows
+from gpu_fault.fabric_scope import (
+    requires_task_scope,
+    unknown_task_fabric,
+    validate_task_fabric,
+    validation_evidence,
+)
 from gpu_fault.gpu_fabric_manager import fabric_validation
 from gpu_fault.gpu_fabric_window import fabric_state_loss
 from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
@@ -238,7 +244,7 @@ class GpuValidationAdapter:
                 continue
             if operation is WorkflowOperation.VALIDATE_FABRIC:
                 fabric_pending = self._validate_fabric_metrics(
-                    host_latest, node_id, failures, context.step.parameters
+                    host_latest, node_id, failures, context
                 )
                 if fabric_pending is not None:
                     pending[node_id] = fabric_pending
@@ -256,6 +262,7 @@ class GpuValidationAdapter:
             if finding_pending is not None:
                 pending[node_id] = finding_pending
         diagnostic_details = diagnostic_failure_details(probe, pending, failures)
+        diagnostic_details.update(unknown_task_fabric_details(context))
         reset_unproven_cooldown(self.store, context, now, pending, failures)
         if prevents_hardware_escalation(context.step.parameters):
             diagnostic_details["host_diagnostic_failure"] = True
@@ -292,7 +299,7 @@ class GpuValidationAdapter:
         cooling = thermal_cooldown(context, self.metrics, now, self._node_gpu_targets)
         if cooling is not None:
             return cooling
-        return validation_success(context, **validation_evidence(operation, clamped))
+        return validation_success(context, **success_evidence(context, clamped))
 
     def _restore_collectors_dark(
         self,
@@ -638,14 +645,16 @@ class GpuValidationAdapter:
             }
         return [gpu_uuid for gpu_uuid in targets if gpu_uuid in owned]
 
-    def _validate_fabric_metrics(self, latest, node_id, failures, parameters=None):
-        parameters = parameters or {}
-        if parameters.get("require_task_fabric_scope") or parameters.get(
-            "diagnostic_reason"
-        ) in {"EFA_TRAFFIC_HUNG_SUSPECTED", "TRAINING_HUNG", "APPLICATION_NCCL_ERROR"}:
-            pending, failed = validate_task_fabric(
-                latest, parameters.get("training_fabric_by_node", {}).get(node_id)
-            )
+    def _validate_fabric_metrics(self, latest, node_id, failures, context=None):
+        parameters = context.step.parameters if context is not None else {}
+        if requires_task_scope(parameters):
+            if context is not None and node_id in resolved_unknown_task_fabric(context):
+                # Resolved: the step reports this node UNKNOWN, it does not
+                # wait for a scope nothing will fill in.
+                return None
+            bindings = parameters.get("training_fabric_by_node")
+            scope = bindings.get(node_id) if isinstance(bindings, dict) else None
+            pending, failed = validate_task_fabric(latest, scope)
             if failed:
                 failures.setdefault(node_id, []).extend(failed)
             return pending
@@ -841,6 +850,43 @@ class GpuValidationAdapter:
         if node_findings is not None:
             node_findings[node_id] = [finding_summary(item) for item in findings]
         return None
+
+
+def resolved_unknown_task_fabric(
+    context: WorkflowStepContext,
+) -> dict[str, dict[str, Any]]:
+    """The nodes whose task NIC/port scope cannot be determined, as the
+    explicit UNKNOWN verdicts this step resolves to (``unknown_task_fabric``).
+
+    Only when a support hand-off of this workflow runs after the step: the hung
+    DAG's ESCALATE_SUPPORT takes the verdict to a human and ends the incident
+    ESCALATED. Without one an UNKNOWN must not complete the step -- a SUCCEEDED
+    diagnostic would close the incident RECOVERED -- so the node keeps waiting
+    as before. Live (HyperPod, GF-GENERAL-LIVE-011): no node could bind its
+    ranks to EFA ports, VALIDATE_FABRIC waited for a scope nothing would fill
+    until the 600 s per-step cap, and the workflow ended FAILED before
+    ESCALATE_SUPPORT ran.
+    """
+
+    if not support_handoff_follows(context.workflow, context.step_index):
+        return {}
+    return unknown_task_fabric(context.step)
+
+
+def unknown_task_fabric_details(context: WorkflowStepContext) -> dict[str, Any]:
+    unknown = resolved_unknown_task_fabric(context)
+    return {"task_fabric_unknown_nodes": unknown} if unknown else {}
+
+
+def success_evidence(
+    context: WorkflowStepContext, clamped: dict[str, Any]
+) -> dict[str, Any]:
+    return validation_evidence(
+        context.step.operation,
+        clamped,
+        resolved_unknown_task_fabric(context),
+        context.step.node_ids,
+    )
 
 
 #: How many findings the failure text spells out per node; the rest are counted

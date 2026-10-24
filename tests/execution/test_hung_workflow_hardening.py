@@ -18,8 +18,9 @@ from tests.execution._health_policy_e2e_support import JOB
 from tests.execution._raw_health_e2e_support import RawHealthRig
 
 
+@pytest.mark.parametrize("bound", [False, True], ids=["unbound", "task-bound"])
 def test_efa_detection_to_evidence_and_operator_review_never_recovers_on_fabric_alone(
-    tmp_path, monkeypatch
+    tmp_path, monkeypatch, bound
 ):
     rig = RawHealthRig(tmp_path, monkeypatch)
     try:
@@ -65,19 +66,30 @@ def test_efa_detection_to_evidence_and_operator_review_never_recovers_on_fabric_
         )
         rig.host()
         rig.gpu({"gpu_temperature_c": 40})
+        if bound:
+            rig.bind_task_fabric(workflow)
         for _ in range(5):
             rig.execute(workflow)
-        saved = rig.store.get_workflow(workflow.request_id)
-        assert saved.status is WorkflowStatus.RUNNING, (
-            "unscoped network telemetry is insufficient"
-        )
-        rig.bind_task_fabric(workflow)
-        rig.execute(workflow)
         saved = rig.store.get_workflow(workflow.request_id)
         assert saved.status is WorkflowStatus.SUCCEEDED, saved.step_executions
         incident = rig.store.get_incident(saved.incident_id)
         assert incident.state is IncidentState.ESCALATED, incident
         assert Op.ESCALATE_SUPPORT in rig.boundary.calls, rig.boundary.calls
+        validation = next(
+            item
+            for item in saved.step_executions
+            if item.operation is Op.VALIDATE_FABRIC
+        )
+        # Unscoped network telemetry is insufficient: without a task binding the
+        # node is UNKNOWN, never validated by its healthy management link.
+        assert validation.details["validated_nodes"] == (["node-a"] if bound else []), (
+            validation
+        )
+        assert ("fabric_status" in validation.details) is not bound, validation
+        if not bound:
+            assert validation.details["task_fabric_unknown_nodes"]["node-a"][
+                "reason"
+            ] == ("TASK_NIC_PORT_SCOPE_UNAVAILABLE"), validation
         assert not {
             Op.STOP_WORKLOADS,
             Op.RESET_GPU,

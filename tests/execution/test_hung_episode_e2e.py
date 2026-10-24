@@ -3,7 +3,7 @@ from datetime import timedelta
 import pytest
 
 from gpu_fault.host_health import HostMetricSample, HostTelemetryBatch
-from gpu_fault.models import IncidentState, WorkflowStatus
+from gpu_fault.models import IncidentState, WorkflowStatus, workflow_is_open
 from gpu_fault.models import WorkflowOperation as Op
 from tests.execution._health_policy_e2e_support import JOB
 from tests.execution._nccl_chain_support import chain_fixture as chain_fixture
@@ -123,9 +123,14 @@ def test_api_sqlite_noise_dedup_stable_rearm_and_second_evidence_round(
         rig.host()
         rig.gpu({"gpu_temperature_c": 40})
         if not finish_first:
-            waiting = rig.execute(second)
-            assert waiting.status is not WorkflowStatus.SUCCEEDED, (
-                "the predecessor must finish first"
+            # The predecessor must finish first: the dispatcher holds a
+            # successor while ``workflow_is_open`` says its predecessor is
+            # (``held("predecessor")``, test_dispatcher_single_instance). The
+            # executor does not gate on it; an executor call that stood here
+            # was held only by the unbound-scope VALIDATE_FABRIC wait.
+            predecessor = rig.store.get_workflow(first.request_id)
+            assert workflow_is_open(predecessor.status, predecessor.blocked_kind), (
+                predecessor
             )
             for _ in range(8):
                 rig.execute(first)

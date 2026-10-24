@@ -5,7 +5,6 @@ import pytest
 
 from gpu_fault.hung_summary_codec import decode_summary
 from gpu_fault.models import WorkflowOperation as Op
-from gpu_fault.models import WorkflowStatus
 from tests.execution._nccl_chain_support import chain_fixture as chain_fixture
 from tests.execution.test_nccl_continuous_e2e import decision, settled
 from tests.node_agent._cov95_runtime_hung import process
@@ -110,20 +109,42 @@ def validation_record(workflow):
 
 
 def test_management_link_is_not_a_substitute_for_task_nic_binding(chain):
+    """An unknowable task scope is an explicit UNKNOWN verdict, not a wait.
+
+    Live (HyperPod, GF-GENERAL-LIVE-011.active_to_zero): no node could bind its
+    rank processes to EFA ports, VALIDATE_FABRIC stayed WAITING on
+    ``TASK_NIC_PORT_SCOPE_UNAVAILABLE`` until the 600 s per-step cap, and the
+    workflow ended FAILED before ESCALATE_SUPPORT ran. Nothing can fill the
+    scope in later -- the recheck summary that binds it has already run -- so
+    the step resolves at once: UNKNOWN for every node, nothing validated by the
+    healthy management link, and the evidence goes on to the support hand-off.
+    """
+
     rig = chain()
     rig.fabric_scope_known = False
     workflow = rig.trigger()
     rig.healthy()
-    result = rig.run(workflow)
-    assert result.status is WorkflowStatus.RUNNING, result
-    saved = rig.store.get_workflow(workflow.request_id)
-    validation = next(
-        item for item in saved.step_executions if item.operation is Op.VALIDATE_FABRIC
+    saved = settled(rig, workflow)
+    validation = validation_record(saved)
+    assert validation.details["fabric_status"] == "UNKNOWN", validation
+    assert validation.details["fabric_evidence_scope"] == "TASK_SCOPE_UNAVAILABLE", (
+        validation
     )
-    assert all(
-        item["reason"] == "TASK_NIC_PORT_SCOPE_UNAVAILABLE"
-        for item in validation.details["node_pending"].values()
-    ), validation
+    assert validation.details["validated_nodes"] == [], (
+        "a healthy management link validates nothing"
+    )
+    assert validation.details["nccl_recovery_proven"] is False, validation
+    unknown = validation.details["task_fabric_unknown_nodes"]
+    assert set(unknown) == set(rig.nodes), validation
+    assert {item["reason"] for item in unknown.values()} == {
+        "TASK_NIC_PORT_SCOPE_UNAVAILABLE"
+    }, unknown
+    # Why the scope is unknown comes from each node's own survey answer: the
+    # fixture's rdma tool prints no QP table.
+    assert {item["scope_reason"] for item in unknown.values()} == {
+        "TASK_RDMA_RESOURCES_UNAVAILABLE"
+    }, unknown
+    assert "step_waiting_seconds" not in validation.details, validation
 
 
 def test_rank_thread_owned_qps_bind_the_task_ports_end_to_end(chain):

@@ -7,6 +7,7 @@ from typing import Any
 
 from gpu_fault.execution.hung_bundle import bind_hung_bundle
 from gpu_fault.execution.hung_classification import classify_hung_signals
+from gpu_fault.fabric_scope import UNAVAILABLE_SCOPES, scope_evidence
 from gpu_fault.hung_summary_codec import MAX_SURVEY_RAW_BYTES, decode_summary
 from gpu_fault.hung_survey_analysis import survey_analysis
 from gpu_fault.hung_survey_series import recheck_details
@@ -105,18 +106,26 @@ def after_summary(
     for i, item in enumerate(steps):
         if item.operation is Op.VALIDATE_FABRIC:
             bindings = dict(item.parameters.get("training_fabric_by_node") or {})
+            unbound: dict[str, Any] = {}
             for node, encoded in (details.get("node_results") or {}).items():
                 try:
                     scope = decode_summary(encoded).get("training_fabric_scope", {})
-                    if scope.get("basis") == "TASK_DEVICE_BINDING":
-                        bindings[node] = scope
                 except ValueError:
                     continue
+                if not isinstance(scope, dict):
+                    scope = {}
+                if scope.get("basis") == "TASK_DEVICE_BINDING":
+                    bindings[node] = scope
+                elif node not in bindings:
+                    # Why this node has no task scope, in its own words: the
+                    # VALIDATE_FABRIC UNKNOWN verdict carries it.
+                    unbound[node] = scope_evidence(scope)
             steps[i] = item.model_copy(
                 update={
                     "parameters": {
                         **item.parameters,
                         "training_fabric_by_node": bindings,
+                        **({UNAVAILABLE_SCOPES: unbound} if unbound else {}),
                     }
                 }
             )
