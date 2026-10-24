@@ -62,6 +62,20 @@ a polling reader cannot recover an undetectable truncate/rewrite between reads.
 DCGM thermal tests exercise persistent warning-to-critical delivery with actual
 collector/ingestion logic, not physical overheating.
 
+The GF-ENV-LIVE acceptance runner (`scripts/e2e/regional/run_env_live.py`) drives
+the audited loopback replay proxy and repoints only the single metrics collector
+through a bounded, deadman-restored maintenance change; it proves the
+normally-installed collector, real control plane and scheduling run end to end,
+never that a sensor truly reported the fault or that hardware was repaired. Its
+unit tests use fakes for the device, Kubernetes and systemd I/O. Every
+GF-ENV-LIVE case stays manual/NOT_RUN until run live; a passing unit test is
+supporting logic coverage, not a LIVE PASS. The runner decides per device which
+severe-temperature variant can run on the real same-scale limits and leaves the
+others NOT_RUN rather than fabricating a scale: on a T.Limit-only p5en H200 the
+absolute-core and absolute-shutdown (GF-ENV-LIVE-011) variants are NOT_RUN,
+GF-ENV-LIVE-002 reuses GF-REGIONAL-COLLECT-002's controlled power path, and
+GF-ENV-LIVE-010 needs a second multi-GPU node and a control task.
+
 AUTH-016 follows the real administrator rotation contract using controlled I/O.
 Same-release Node key activation tests bind durable progress, projected key
 ordering and actual local Agent/FleetRegistry behavior. They are not deployed

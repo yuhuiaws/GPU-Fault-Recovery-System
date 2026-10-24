@@ -393,6 +393,7 @@ test_cases:
   expected: [逐GPU核对身份单位新鲜度与能力, 原任务持续前进且无环境恢复动作, 记录缺失字段而不当健康]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-001
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_001_baseline_requires_readings_samples_and_no_action
   evidence: {verdict: NOT_RUN}
 - id: GF-ENV-LIVE-002
   title: 真机正常power cap完整诊断与还原
@@ -404,6 +405,7 @@ test_cases:
   expected: [形成候选后实际仅只读诊断, 原任务身份不变且无隔离停训重启, 逐GPU证明恢复原功率上限]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-002
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_002_forbidden_operations_and_diagnostic_only
   evidence: {verdict: NOT_RUN}
 - id: GF-ENV-LIVE-003
   title: 真机遥测回放验证warning与两种温标
@@ -415,6 +417,7 @@ test_cases:
   expected: [实际只读诊断完成, TLimit有效时无重复绝对fallback故障, 无STOP隔离且缺型号变体明确未执行]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-003
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_003_warning_stays_read_only
   evidence: {verdict: NOT_RUN}
 - id: GF-ENV-LIVE-004
   title: 真机遥测回放持续严重温度到人工复核
@@ -426,6 +429,7 @@ test_cases:
   expected: [前两次不STOP第三次确认, 实际cordon停正确任务quarantine取证及通知, 冷却超过300秒仍隔离且无自动reset或reboot]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-004
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_004_severe_review_full_chain
   evidence: {verdict: NOT_RUN}
 - id: GF-ENV-LIVE-005
   title: 真机遥测回放瞬时异常与重复记录
@@ -437,6 +441,7 @@ test_cases:
   expected: [清除穿过边缘过滤, 重复记录与warning历史不推进严重确认, 无停训且再次持续异常仍能触发]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-005
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_005_transient_and_repeat_do_not_confirm
   evidence: {verdict: NOT_RUN}
 - id: GF-ENV-LIVE-006
   title: 真机遥测回放热duration和复合warning
@@ -448,6 +453,7 @@ test_cases:
   expected: [实际只读诊断, 没有STOP压测reset或reboot, 停止增量后验证完成且不要求累计计数归零]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-006
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_006_duration_stays_read_only
   evidence: {verdict: NOT_RUN}
 - id: GF-ENV-LIVE-007
   title: 真机遥测回放Power Brake持续确认和供电复核
@@ -459,6 +465,7 @@ test_cases:
   expected: [瞬时与普通位不误判, 持续0x80触发真实隔离停训及供电检查通知, 无reboot或自动接纳且热warning不能降级brake]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-007
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_007_power_brake_discrimination
   evidence: {verdict: NOT_RUN}
 - id: GF-ENV-LIVE-008
   title: 真机字段不可用和新旧别名
@@ -470,6 +477,7 @@ test_cases:
   expected: [缺失或非法值报告UNKNOWN, 不生成虚假隔离或STOP, 未具备的版本或冲突变体明确NOT_RUN]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-008
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_008_unknown_not_fabricated_brake
   evidence: {verdict: NOT_RUN}
 - id: GF-ENV-LIVE-009
   title: 真机采集间断重启和来源切换
@@ -481,6 +489,7 @@ test_cases:
   expected: [重新计算有效确认, 始终只有一个producer且缺测不是健康, 记录跨boot未执行边界而不主动重启节点]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-009
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_009_interruption_recounts
   evidence: {verdict: NOT_RUN}
 - id: GF-ENV-LIVE-010
   title: 多GPU真机作用域并发与通知去重
@@ -492,6 +501,7 @@ test_cases:
   expected: [对照指标未改且独立任务不受影响, 合法停止覆盖受影响分布式任务而非只停单rank, 工作流和通知去重并记录完整回执]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-010
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_010_scope_and_dedup
   evidence: {verdict: NOT_RUN}
 - id: GF-ENV-LIVE-011
   title: 真机遥测回放绝对关机温度单样本保护
@@ -503,6 +513,7 @@ test_cases:
   expected: [一个有效样本进入保护, 真实隔离停训取证人工复核, 不用TLimit offset替代且不宣称完成物理关机试验]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-011
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_011_shutdown_one_sample_review
   evidence: {verdict: NOT_RUN}
 - id: GF-ENV-LIVE-012
   title: 自然或厂商实验室物理环境故障验证
@@ -514,6 +525,7 @@ test_cases:
   expected: [未经修改的多来源证据确认真实故障, 实际隔离停训及通知, 厂商修复后授权负载验证和人工接纳且无条件则NOT_RUN]
   automation: manual
   procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-012
+  related_pytest: tests/regional/test_env_live_verdicts.py::test_case_012_is_not_run_physical
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-FIX-016
   title: 严重内核日志停止归属任务后隔离

@@ -78,10 +78,10 @@ requirements:
     conditions: [normal, repeat, timeout, restart, failure, safety]
     assertions: [Real collector and execution receipts are required, Physical faults and telemetry replay are separate proof scopes, Missing variants and cleanup failures cannot pass]
     cases: [GF-ENV-LIVE-001, GF-ENV-LIVE-002, GF-ENV-LIVE-003, GF-ENV-LIVE-004, GF-ENV-LIVE-005, GF-ENV-LIVE-006, GF-ENV-LIVE-007, GF-ENV-LIVE-008, GF-ENV-LIVE-009, GF-ENV-LIVE-010, GF-ENV-LIVE-011, GF-ENV-LIVE-012]
-    runners: [tools/gpu_environment_replay.py]
+    runners: [tools/gpu_environment_replay.py, scripts/e2e/regional/run_env_live.py]
     level: regional
     critical: true
-    gap: All twelve live specifications are NOT_RUN; the replay helper does not orchestrate deployment or certify physical faults, and OEM laboratory conditions are not available in software tests.
+    gap: All twelve live specifications are NOT_RUN; run_env_live.py drives the proxy and collector repoint but no case has been executed live, on the H200 site the absolute-core and absolute-shutdown (011) variants are NOT_RUN for lack of the scale, 002 reuses COLLECT-002 and 010 needs a second multi-GPU node, and OEM laboratory conditions for 012 are not available in software tests.
   - id: GF-REQ-GENERAL-FIX-016
     family: fault-policy
     title: Trusted fatal logs stop only a freshly attributed attempt

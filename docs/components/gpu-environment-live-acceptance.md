@@ -246,3 +246,50 @@ T.Limit 的 shutdown offset 不是同一证据，只有该 offset 的设备不�
 ```bash
 .venv/bin/python tools/run_fault_test_cases.py --category gpu-environment-live --include-manual --list
 ```
+
+## 验收运行器 `run_env_live.py`
+
+`scripts/e2e/regional/run_env_live.py` 把本规格落成一个受保护的运行器，覆盖
+GF-ENV-LIVE-001..011（012 始终 NOT_RUN）。默认只计划，不动集群。
+
+```bash
+# 只读计划：读节点与设备真实限值，决定每个变体能否在该硬件上运行，写 plan.json
+.venv/bin/python scripts/e2e/regional/run_env_live.py \
+  --site-profile "$PROFILE" --run-dir "$RUN_DIR" \
+  --case GF-ENV-LIVE-004 --plan
+
+# 真机执行（我稍后在维护窗口内运行）：需要逐案确认串，隔离/停训分支另需分支确认串
+.venv/bin/python scripts/e2e/regional/run_env_live.py \
+  --site-profile "$PROFILE" --run-dir "$RUN_DIR" \
+  --case GF-ENV-LIVE-004 --execute --confirm ENVLIVE004_EXECUTE \
+  --confirm-isolate ENVLIVE004_ISOLATE --confirm-stop ENVLIVE004_STOP \
+  --maintenance-window-end "$WINDOW_END"
+```
+
+- **逐案确认串** `ENVLIVE<NNN>_EXECUTE`；会 cordon/quarantine 并停训的用例
+  （004/007/010/011）另需 `--confirm-isolate ENVLIVE<NNN>_ISOLATE` 与
+  `--confirm-stop ENVLIVE<NNN>_STOP`。本链从不重启训练任务。
+- **设备能力判定**：运行器在只读 preflight 用产品自身的 XML 解析读该节点逐 GPU
+  的同刻度限值（`scripts/e2e/regional/env_live_plans.py`），据此判定每个严重温度
+  变体 RUN/NOT_RUN，并由真实限值（而非 `tlimit-example.json`）生成回放计划。
+  p5en H200 现场只报 T.Limit 刻度（shutdown −8、slowdown −2、max-operating 0），
+  因此绝对核心温度变体与 011（绝对关机温度）在该站 NOT_RUN，T.Limit 变体与
+  按配置 fallback 的显存变体运行。
+- **代理接线**：`scripts/e2e/regional/probes/env_replay_proxy.py` 作为特权 host
+  探针，把 `tools/gpu_environment_replay.py` 原样投到节点（base64 + sha256 校验，
+  `-I` 运行）用 `systemd-run` 瞬态单元 `--serve`，再**只**对
+  `gpu-fault-metrics-collector.service` 下 drop-in 把 `GPU_FAULT_DCGM_METRICS_URL`
+  指向 `http://127.0.0.1:9411/metrics`。不改真实 exporter、不改 `collector.env`、
+  不起第二个同身份 producer。`systemd-run` deadman 与运行器 finally 两路恢复原
+  endpoint；代理只在 endpoint 恢复后关闭。真实上游出现 HW thermal/Power Brake、
+  T.Limit≤0、GPU≥80 C 或显存≥85 C 时工具永久中止并透传真实读数。
+- **判据** 由 `scripts/e2e/regional/env_live_verdicts.py` 依据控制面真实
+  incident/workflow/notification/证据记录给出；工具从不输出 LIVE PASS。
+- **特殊用例**：002 复用 `GF-REGIONAL-COLLECT-002` 的受控功率与 dcgmproftester
+  负载及其 deadman 还原（本运行器对 002 记 BLOCKED 并指向该运行器）；010 需要第二个
+  多 GPU 测试节点与对照任务，未配置则 NOT_RUN；012 为真实物理/厂商实验室故障，
+  始终 NOT_RUN。
+
+单元测试（`tests/regional/test_env_live_*.py`、`tests/regional/test_env_replay_proxy_probe.py`）
+用替身覆盖计划、判据、运行器分支与代理控制器，不触及集群；它们是支持性逻辑覆盖，
+不把任何用例改写为 LIVE PASS。

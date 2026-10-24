@@ -553,6 +553,39 @@ rules:
       - GF-REGIONAL-DESTR-026
     counts_as_domain: false
 
+  - id: gpu-environment-live-acceptance
+    description: >-
+      The GF-ENV-LIVE live acceptance runner and its reviewed replay plans:
+      run_env_live.py, the device-limit/plan/verdict helpers, the host
+      controller probe that drives tools/gpu_environment_replay.py and repoints
+      the single metrics collector, and their fakes-based tests. The ENV-LIVE
+      cases stay manual/NOT_RUN, so there are no regional_cases to schedule.
+    paths:
+      - scripts/e2e/regional/run_env_live.py
+      - scripts/e2e/regional/env_live_fixture.py
+      - scripts/e2e/regional/env_live_plans.py
+      - scripts/e2e/regional/env_live_verdicts.py
+      - scripts/e2e/regional/probes/env_replay_proxy.py
+      - tools/gpu_environment_replay.py
+      - tests/regional/test_env_live_plans.py
+      - tests/regional/test_env_live_verdicts.py
+      - tests/regional/test_env_live_runner.py
+      - tests/regional/test_env_live_fixture.py
+      - tests/regional/test_env_replay_proxy_probe.py
+      - tests/test_gpu_environment_replay.py
+      - tests/test_gpu_environment_live_cases.py
+      - docs/components/gpu-environment-live-acceptance.md
+    pytest:
+      - tests/regional/test_env_live_plans.py
+      - tests/regional/test_env_live_verdicts.py
+      - tests/regional/test_env_live_runner.py
+      - tests/regional/test_env_live_fixture.py
+      - tests/regional/test_env_replay_proxy_probe.py
+      - tests/test_gpu_environment_replay.py
+      - tests/test_gpu_environment_live_cases.py
+    regional_cases: []
+    counts_as_domain: false
+
   - id: eks-nodegroup-preparation-acceptance
     description: >-
       The plain EKS node-group preparation cases: GF-REGIONAL-BOOT-036 audits

@@ -1,0 +1,519 @@
+"""Reviewed replay plans for GF-ENV-LIVE, built from one device's live limits.
+
+The replay tool (:mod:`tools.gpu_environment_replay`) changes only fields a GPU
+already reports and refuses to invent a limit. So the per-case plan this module
+builds is decided by what the *live* device publishes on ``nvidia-smi -q -x``,
+read on the target node at preflight -- never by the ``tlimit-example.json``
+numbers, which the spec warns are a single device's values.
+
+Two temperature scales, never mixed (``gpu_temperature_policy``): the absolute
+Celsius thresholds a GPU without the T.Limit sensor prints, and the signed
+T.Limit margins (count down to 0) a GPU with it prints. A p5en H200 publishes
+only the T.Limit scale (live 2026-10-24: shutdown ``-8``, slowdown ``-2``, GPU
+and memory max operating ``0``), so the absolute-core and absolute-shutdown
+variants are NOT_RUN there and the T.Limit variant runs. This module decides
+that per GPU and names the reason; it never fabricates the missing scale.
+
+Everything here is pure: the device limits come in as a mapping, the plan goes
+out as the ``{"steps": [...]}`` object the tool validates. No network, no
+device, no clock.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from typing import Any
+
+from gpu_fault.gpu_metrics import GpuMetricsThresholds
+from gpu_fault.gpu_temperature_policy import (
+    ABSOLUTE_TEMPERATURE_LIMITS,
+    TLIMIT_GPU_THRESHOLDS,
+    plausible_tlimit,
+    tlimit_grades_gpu,
+)
+
+#: The three severe-temperature variants of GF-ENV-LIVE-003/004. Each is run
+#: only when the device reports the scale it grades on.
+CORE_ABSOLUTE = "core_absolute"
+CORE_TLIMIT = "core_tlimit"
+MEMORY_ABSOLUTE = "memory_absolute"
+TEMPERATURE_VARIANTS = (CORE_ABSOLUTE, CORE_TLIMIT, MEMORY_ABSOLUTE)
+
+#: The Power Brake and thermal clock bits (``gpu_environment_policy``), kept
+#: here so a plan names them without importing the mask constants twice.
+POWER_BRAKE_BIT = 0x80
+SW_THERMAL_BIT = 0x20
+HW_THERMAL_BIT = 0x40
+#: Non-brake clock reasons 007 proves are not read as a brake; each is a single
+#: bit the policy maps to WARNING/NONE, never ``0x80``.
+NON_BRAKE_BITS = (0x04, 0x08, 0x10, 0x100)
+#: Mixed masks that still carry ``0x80`` and must still read as a brake.
+BRAKE_MIXED_MASKS = (0x84, 0xC0, 0x180)
+
+
+class EnvLivePlanError(ValueError):
+    """A reviewed plan cannot be built from the device's live limits."""
+
+
+@dataclass(frozen=True)
+class VariantDecision:
+    """Whether one severe-temperature variant runs on this device, and why."""
+
+    variant: str
+    runnable: bool
+    reason: str
+    scale: str | None = None
+    threshold_source: str | None = None
+    critical_value: float | None = None
+    warning_value: float | None = None
+
+
+@dataclass(frozen=True)
+class DevicePlan:
+    """The reviewed plans for one physical GPU, with the limits they came from."""
+
+    gpu_uuid: str
+    gpu_index: str | None
+    product: str | None
+    limits: dict[str, float]
+    tlimit_reading: float | None
+    decisions: dict[str, VariantDecision]
+    plans: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def runnable_variants(self) -> list[str]:
+        return [name for name, item in self.decisions.items() if item.runnable]
+
+
+def _finite_limit(value: Any) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if number == number and abs(number) != float("inf") else None
+
+
+def normalize_device_limits(raw: dict[str, Any]) -> dict[str, float]:
+    """Keep only the finite numeric temperature limits the policy reads.
+
+    Absolute limits must be positive (a non-positive absolute threshold is a
+    sentinel); T.Limit margins may be zero or negative, bounded by the same
+    plausibility window the policy uses. ``gpu_tlimit_c`` (the reading) is kept.
+    """
+
+    result: dict[str, float] = {}
+    for name, value in raw.items():
+        number = _finite_limit(value)
+        if number is None:
+            continue
+        if name in ABSOLUTE_TEMPERATURE_LIMITS:
+            if number > 0:
+                result[name] = number
+        elif name == "gpu_tlimit_c" or name.endswith("_tlimit_c"):
+            if plausible_tlimit(number) is not None:
+                result[name] = number
+        elif name in {"memory_temperature_c", "gpu_temperature_c"}:
+            result[name] = number
+    return result
+
+
+def _tlimit_boundaries(
+    thresholds: GpuMetricsThresholds, limits: dict[str, float]
+) -> tuple[float | None, float] | None:
+    slowdown = plausible_tlimit(limits.get("gpu_slowdown_tlimit_c"))
+    maximum = plausible_tlimit(limits.get("gpu_max_operating_tlimit_c"))
+    shutdown = plausible_tlimit(limits.get("gpu_shutdown_tlimit_c"))
+    memory = plausible_tlimit(limits.get("memory_max_operating_tlimit_c"))
+    if slowdown is not None:
+        critical: float | None = slowdown
+    elif shutdown is not None:
+        critical = shutdown + thresholds.gpu_temperature_shutdown_margin_c
+    elif maximum is not None:
+        return None, maximum
+    else:
+        return None
+    warning = max(
+        (
+            critical + thresholds.gpu_temperature_warning_margin_c,
+            *(point for point in (maximum, memory) if point is not None),
+        )
+    )
+    return critical, warning
+
+
+def core_tlimit_decision(
+    thresholds: GpuMetricsThresholds, limits: dict[str, float]
+) -> VariantDecision:
+    reading = plausible_tlimit(limits.get("gpu_tlimit_c"))
+    if reading is None:
+        return VariantDecision(
+            CORE_TLIMIT,
+            False,
+            "device publishes no plausible T.Limit reading (field 153)",
+        )
+    if not tlimit_grades_gpu(limits):
+        return VariantDecision(
+            CORE_TLIMIT,
+            False,
+            "device publishes no GPU T.Limit threshold "
+            f"({sorted(TLIMIT_GPU_THRESHOLDS)})",
+        )
+    boundaries = _tlimit_boundaries(thresholds, limits)
+    if boundaries is None or boundaries[0] is None:
+        return VariantDecision(
+            CORE_TLIMIT,
+            False,
+            "device has only a max-operating T.Limit threshold; software "
+            "limiting warns but there is no HW slowdown critical boundary",
+            scale="tlimit",
+        )
+    critical, warning = boundaries
+    return VariantDecision(
+        CORE_TLIMIT,
+        True,
+        "GPU core graded on the T.Limit scale against its own slowdown margin",
+        scale="tlimit",
+        threshold_source="NVIDIA_DEVICE_TLIMIT",
+        critical_value=critical,
+        warning_value=warning,
+    )
+
+
+def core_absolute_decision(
+    thresholds: GpuMetricsThresholds, limits: dict[str, float]
+) -> VariantDecision:
+    if tlimit_grades_gpu(limits):
+        return VariantDecision(
+            CORE_ABSOLUTE,
+            False,
+            "device grades the GPU core on the T.Limit scale; the absolute "
+            "reading is not graded a second time against a fallback",
+            scale="tlimit",
+        )
+    slowdown = limits.get("gpu_slowdown_temperature_c")
+    shutdown = limits.get("gpu_shutdown_temperature_c")
+    maximum = limits.get("gpu_max_operating_temperature_c")
+    critical = slowdown or (
+        shutdown - thresholds.gpu_temperature_shutdown_margin_c
+        if shutdown is not None
+        else None
+    )
+    if critical is None and maximum is None:
+        return VariantDecision(
+            CORE_ABSOLUTE,
+            False,
+            "device publishes no absolute GPU temperature threshold",
+            scale="absolute",
+        )
+    if critical is None:
+        return VariantDecision(
+            CORE_ABSOLUTE,
+            False,
+            "device publishes only an absolute max-operating temperature "
+            "(software limiting warns; no HW slowdown critical boundary)",
+            scale="absolute",
+        )
+    warning = min(
+        critical - thresholds.gpu_temperature_warning_margin_c,
+        maximum if maximum is not None else critical,
+    )
+    return VariantDecision(
+        CORE_ABSOLUTE,
+        True,
+        "GPU core graded on the absolute Celsius scale against its slowdown threshold",
+        scale="absolute",
+        threshold_source="NVIDIA_DEVICE_LIMIT",
+        critical_value=critical,
+        warning_value=warning,
+    )
+
+
+def memory_decision(
+    thresholds: GpuMetricsThresholds,
+    limits: dict[str, float],
+    *,
+    allow_fallback: bool,
+) -> VariantDecision:
+    maximum = limits.get("memory_max_operating_temperature_c")
+    if maximum is not None:
+        warning = min(maximum - thresholds.memory_temperature_warning_margin_c, maximum)
+        return VariantDecision(
+            MEMORY_ABSOLUTE,
+            True,
+            "GPU memory graded on the absolute device memory limit",
+            scale="absolute",
+            threshold_source="NVIDIA_DEVICE_LIMIT",
+            critical_value=maximum,
+            warning_value=warning,
+        )
+    if not allow_fallback:
+        return VariantDecision(
+            MEMORY_ABSOLUTE,
+            False,
+            "device publishes no absolute memory temperature limit and the "
+            "configured memory fallback was not approved for this run",
+            scale="absolute",
+        )
+    return VariantDecision(
+        MEMORY_ABSOLUTE,
+        True,
+        "GPU memory graded on the site configured absolute fallback (device "
+        "publishes no absolute memory limit); recorded as CONFIGURED_FALLBACK",
+        scale="absolute",
+        threshold_source="CONFIGURED_FALLBACK",
+        critical_value=thresholds.memory_temperature_critical_c,
+        warning_value=thresholds.memory_temperature_warning_c,
+    )
+
+
+def _reads(count: int, values: dict[str, float | None]) -> dict[str, Any]:
+    if count < 1:
+        raise EnvLivePlanError("a replay step needs at least one read")
+    return {"reads": count, "values": values}
+
+
+def _temperature_field(variant: str) -> str:
+    if variant == MEMORY_ABSOLUTE:
+        return "memory_temperature_c"
+    if variant == CORE_TLIMIT:
+        return "gpu_tlimit_c"
+    return "gpu_temperature_c"
+
+
+def _severe_value(decision: VariantDecision) -> float:
+    """A reading one step past the critical boundary, on the right scale.
+
+    The T.Limit scale counts down, so "more severe" is below critical; the
+    absolute scales count up, so it is above. The step stays well inside the
+    tool's own safety stops (it injects the transformed value; the real reading
+    is what the tool guards)."""
+
+    assert decision.critical_value is not None, decision
+    return (
+        decision.critical_value - 1.0
+        if decision.scale == "tlimit"
+        else decision.critical_value + 1.0
+    )
+
+
+def _warning_value(decision: VariantDecision) -> float:
+    assert decision.warning_value is not None, decision
+    if decision.scale == "tlimit":
+        # Warning band is critical < T <= warning; a value strictly inside it.
+        assert decision.critical_value is not None, decision
+        return min(
+            decision.warning_value,
+            (decision.critical_value + decision.warning_value) / 2,
+        )
+    return decision.warning_value
+
+
+def confirmation_plan(
+    decision: VariantDecision, *, confirmation_samples: int, warmup_reads: int = 2
+) -> dict[str, Any]:
+    """GF-ENV-LIVE-004: warm up healthy, then N severe reads to confirm.
+
+    The first ``confirmation_samples - 1`` severe reads must not STOP; the Nth
+    crosses the confirmation count. A final healthy block proves the cooled
+    reading passes the edge filter and the node stays isolated regardless.
+    """
+
+    field = _temperature_field(decision.variant)
+    severe = _severe_value(decision)
+    steps = [_reads(max(1, warmup_reads), {})]
+    steps.append(_reads(confirmation_samples, {field: severe}))
+    return {"steps": steps}
+
+
+def warning_plan(
+    decision: VariantDecision, *, confirmation_samples: int, warmup_reads: int = 2
+) -> dict[str, Any]:
+    """GF-ENV-LIVE-003: warm up healthy, then sustained warning-band reads.
+
+    Warning stays read-only diagnostic; no sample may STOP. The reads outlast a
+    confirmation window so a mistaken escalation would show.
+    """
+
+    field = _temperature_field(decision.variant)
+    warning = _warning_value(decision)
+    return {
+        "steps": [
+            _reads(max(1, warmup_reads), {}),
+            _reads(confirmation_samples + 2, {field: warning}),
+        ]
+    }
+
+
+def shutdown_plan(limits: dict[str, float]) -> dict[str, Any]:
+    """GF-ENV-LIVE-011: one read at absolute shutdown + 1 C.
+
+    Requires the device to publish an absolute ``gpu_shutdown_temperature_c``;
+    one accepted sample triggers protection without waiting for three. The
+    T.Limit shutdown offset is a different scale and is not a substitute, so a
+    device without the absolute threshold is NOT_RUN for this case.
+    """
+
+    shutdown = limits.get("gpu_shutdown_temperature_c")
+    if shutdown is None:
+        raise EnvLivePlanError(
+            "device publishes no absolute gpu_shutdown_temperature_c; "
+            "GF-ENV-LIVE-011 is NOT_RUN (the T.Limit offset is a different scale)"
+        )
+    return {"steps": [_reads(1, {"gpu_temperature_c": shutdown + 1.0})]}
+
+
+def transient_plans(
+    decision: VariantDecision, *, confirmation_samples: int
+) -> dict[str, dict[str, Any]]:
+    """GF-ENV-LIVE-005: one-then-clear, two-then-clear, warning-then-severe.
+
+    None may confirm: a cleared severe sample resets the count, and warning
+    history never counts toward critical. Each clears to healthy and observes.
+    """
+
+    field = _temperature_field(decision.variant)
+    severe = _severe_value(decision)
+    warning = _warning_value(decision)
+    clear = max(3, confirmation_samples)
+    return {
+        "once_then_clear": {"steps": [_reads(1, {field: severe}), _reads(clear, {})]},
+        "twice_then_clear": {"steps": [_reads(2, {field: severe}), _reads(clear, {})]},
+        "warning_then_severe": {
+            "steps": [
+                _reads(2, {field: warning}),
+                _reads(1, {field: severe}),
+                _reads(clear, {}),
+            ]
+        },
+    }
+
+
+def thermal_duration_plan(
+    *, baseline_us: float = 0.0, increments: int = 4, step_us: float = 1_000_000.0
+) -> dict[str, dict[str, Any]]:
+    """GF-ENV-LIVE-006: a rising thermal-violation duration under 0x20 / 0x40.
+
+    Durations are plan micro-seconds; the tool converts them to the exporter's
+    nanosecond wire units. The core temperature stays healthy (only the field
+    the device already reports is changed), so this exercises the duration /
+    composite path, which must stay read-only diagnostic and never DRAIN.
+    """
+
+    result: dict[str, dict[str, Any]] = {}
+    for label, bit in (("sw_thermal", SW_THERMAL_BIT), ("hw_thermal", HW_THERMAL_BIT)):
+        steps = [
+            _reads(
+                1,
+                {
+                    "thermal_violation_total_us": baseline_us + index * step_us,
+                    "clock_throttle_reasons": bit,
+                },
+            )
+            for index in range(increments)
+        ]
+        steps.append(
+            _reads(
+                3,
+                {
+                    "thermal_violation_total_us": baseline_us
+                    + (increments - 1) * step_us,
+                    "clock_throttle_reasons": 0,
+                },
+            )
+        )
+        result[label] = {"steps": steps}
+    return result
+
+
+def power_brake_plans(*, confirmation_samples: int) -> dict[str, dict[str, Any]]:
+    """GF-ENV-LIVE-007: the ``0x80`` brake, non-brake bits and mixed masks.
+
+    ``transient`` is one brake then clear (no isolation); ``sustained`` is N
+    brake samples (the same human-review chain as 004); ``non_brake`` and
+    ``mixed`` prove the ``mask & 0x80`` discrimination. The temperature stays
+    healthy so a thermal warning cannot be read into the brake decision.
+    """
+
+    clear = max(3, confirmation_samples)
+    plans: dict[str, dict[str, Any]] = {
+        "transient": {
+            "steps": [
+                _reads(1, {"clock_throttle_reasons": POWER_BRAKE_BIT}),
+                _reads(clear, {"clock_throttle_reasons": 0}),
+            ]
+        },
+        "sustained": {
+            "steps": [
+                _reads(
+                    confirmation_samples, {"clock_throttle_reasons": POWER_BRAKE_BIT}
+                )
+            ]
+        },
+    }
+    for bit in NON_BRAKE_BITS:
+        plans[f"non_brake_{bit:#x}"] = {
+            "steps": [_reads(clear, {"clock_throttle_reasons": bit})]
+        }
+    for mask in BRAKE_MIXED_MASKS:
+        plans[f"mixed_{mask:#x}"] = {
+            "steps": [_reads(confirmation_samples, {"clock_throttle_reasons": mask})]
+        }
+    return plans
+
+
+def unavailable_field_plans(
+    decision: VariantDecision,
+) -> dict[str, dict[str, Any]]:
+    """GF-ENV-LIVE-008: omit the reason bit (null), a non-integer mask, a blank.
+
+    ``null`` omits the field from the target GPU; a non-integer mask and a
+    not-a-number value must read as UNKNOWN / collection error, never as a
+    fabricated brake or a healthy sample. The DCGM blank sentinel (>= 9e18)
+    is what the collector drops, so it is sent as a large magnitude.
+    """
+
+    return {
+        "omit_reason": {"steps": [_reads(3, {"clock_throttle_reasons": None})]},
+        "non_integer_mask": {"steps": [_reads(3, {"clock_throttle_reasons": 128.5})]},
+        "dcgm_blank": {"steps": [_reads(3, {"clock_throttle_reasons": 9.0e18})]},
+    }
+
+
+def build_device_plan(
+    *,
+    gpu_uuid: str,
+    gpu_index: str | None,
+    product: str | None,
+    raw_limits: dict[str, Any],
+    thresholds: GpuMetricsThresholds | None = None,
+    confirmation_samples: int = 3,
+    allow_memory_fallback: bool = True,
+) -> DevicePlan:
+    """Decide every severe-temperature variant for one GPU and build its plans."""
+
+    thresholds = thresholds or GpuMetricsThresholds()
+    limits = normalize_device_limits(raw_limits)
+    decisions = {
+        CORE_TLIMIT: core_tlimit_decision(thresholds, limits),
+        CORE_ABSOLUTE: core_absolute_decision(thresholds, limits),
+        MEMORY_ABSOLUTE: memory_decision(
+            thresholds, limits, allow_fallback=allow_memory_fallback
+        ),
+    }
+    plans: dict[str, dict[str, Any]] = {}
+    for name, decision in decisions.items():
+        if not decision.runnable:
+            continue
+        plans[f"{name}/severe"] = confirmation_plan(
+            decision, confirmation_samples=confirmation_samples
+        )
+        plans[f"{name}/warning"] = warning_plan(
+            decision, confirmation_samples=confirmation_samples
+        )
+    return DevicePlan(
+        gpu_uuid=gpu_uuid,
+        gpu_index=gpu_index,
+        product=product,
+        limits=limits,
+        tlimit_reading=limits.get("gpu_tlimit_c"),
+        decisions=decisions,
+        plans=plans,
+    )
