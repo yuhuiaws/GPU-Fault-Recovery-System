@@ -40,12 +40,18 @@ def _patch_workload(monkeypatch) -> None:
 def _ctx(spec, tmp_path: Path):
     regional = FakeRegional(cpu_python=store_script({"activity": {}}))
     settings = make_settings(spec, node=NODE)
-    settings = type(settings)(**{**settings.__dict__, "site_file": tmp_path / "site.yaml"})
+    settings = type(settings)(
+        **{**settings.__dict__, "site_file": tmp_path / "site.yaml"}
+    )
     (tmp_path / "site.yaml").write_text("site: test\n")
-    return make_context(spec, tmp_path=tmp_path, regional=regional, probes={}, settings=settings)
+    return make_context(
+        spec, tmp_path=tmp_path, regional=regional, probes={}, settings=settings
+    )
 
 
-def test_managed_idle_job_renders_idle_and_requested_gpus(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_managed_idle_job_renders_idle_and_requested_gpus(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _patch_workload(monkeypatch)
     spec = next(s for s in util.VARIANTS if s.variant == "ambiguous_ownership")
     ctx = _ctx(spec, tmp_path)
@@ -61,16 +67,18 @@ def test_managed_idle_job_renders_idle_and_requested_gpus(tmp_path: Path, monkey
         and env.get("value") == "0"
         for container in containers
         for env in container.get("env", [])
-    )
+    ), "any( env.get('name') == 'GPU_FAULT_ACCEPTANCE_GPU_DUTY_PERCENT' and en"
     assert all(
         container["resources"]["requests"]["nvidia.com/gpu"] == "4"
         for container in containers
         if "nvidia.com/gpu" in container["resources"]["requests"]
-    )
+    ), "all( container['resources']['requests']['nvidia.com/gpu'] == '4' for c"
     assert job.name == "gl3-amb"
 
 
-def test_managed_idle_job_requires_site_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_managed_idle_job_requires_site_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _patch_workload(monkeypatch)
     spec = next(s for s in util.VARIANTS if s.variant == "gpu_idle")
     regional = FakeRegional(cpu_python=store_script({"activity": {}}))
@@ -86,7 +94,9 @@ def test_managed_idle_job_requires_site_file(tmp_path: Path, monkeypatch: pytest
     "mode,needle",
     [("exit:7", "exit ${CODE:-1}"), ("stop", "exit 143"), ("hang", "trap '' TERM")],
 )
-def test_managed_fail_job_applies_mode(tmp_path: Path, mode: str, needle: str, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_managed_fail_job_applies_mode(
+    tmp_path: Path, mode: str, needle: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
     _patch_workload(monkeypatch)
     spec = next(s for s in att.VARIANTS if s.variant == "nonzero_exit")
     ctx = _ctx(spec, tmp_path)
@@ -97,7 +107,9 @@ def test_managed_fail_job_applies_mode(tmp_path: Path, mode: str, needle: str, m
         for replica in document["spec"]["pytorchReplicaSpecs"].values()
         for container in replica["template"]["spec"]["containers"]
     ]
-    assert any(needle in command for command in commands)
+    assert any(needle in command for command in commands), (
+        "any(needle in command for command in commands)"
+    )
     assert job.attempt_id == "gl28x-a001"
 
 
@@ -246,7 +258,7 @@ def test_main_deferred_execute_records_not_run(
         / "GF-GENERAL-LIVE-001.invalid_delta"
         / "GF-GENERAL-LIVE-001.invalid_delta.json"
     )
-    assert evidence.is_file()
+    assert evidence.is_file(), "evidence.is_file()"
     import json
 
     assert json.loads(evidence.read_text())["verdict"] == "NOT_RUN"

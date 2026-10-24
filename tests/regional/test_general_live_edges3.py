@@ -48,17 +48,21 @@ def _obs(channel: str, state: str) -> dict[str, Any]:
 
 
 def test_collector_observation_helpers() -> None:
-    assert col._observation_unknown({"metric_latest": []}, "GPU_METRICS")
+    assert col._observation_unknown({"metric_latest": []}, "GPU_METRICS"), (
+        "col._observation_unknown({'metric_latest': []}, 'GPU_METRICS')"
+    )
     assert col._observation_unknown(
         {"metric_latest": [_obs("GPU_METRICS", "HEALTHY")]}, "GPU_METRICS"
-    )
+    ), "col._observation_unknown( {'metric_latest': [_obs('GPU_METRICS', 'HEAL"
     assert (
         col._observation_unknown(
             {"metric_latest": [_obs("GPU_METRICS", "UNKNOWN")]}, "GPU_METRICS"
         )
         == []
     )
-    assert col._snapshot_only({"workflows": [workflow("w", "i", ["RESET_GPU"])]})
+    assert col._snapshot_only({"workflows": [workflow("w", "i", ["RESET_GPU"])]}), (
+        "col._snapshot_only({'workflows': [workflow('w', 'i', ['RESET_GPU'])]})"
+    )
     assert (
         col._snapshot_only(
             {"workflows": [workflow("w", "i", ["TRIGGER_HEALTH_SNAPSHOT"])]}
@@ -71,14 +75,16 @@ def test_collector_observation_helpers() -> None:
             workflow("b", "i", ["TRIGGER_HEALTH_SNAPSHOT"]),
         ]
     }
-    assert col._one_snapshot_per_hour(many)
+    assert col._one_snapshot_per_hour(many), "col._one_snapshot_per_hour(many)"
     assert (
         col._one_snapshot_per_hour(
             {"workflows": [workflow("a", "i", ["TRIGGER_HEALTH_SNAPSHOT"])]}
         )
         == []
     )
-    assert col._silent_advisory({"notifications": []}, "GPU_METRICS")
+    assert col._silent_advisory({"notifications": []}, "GPU_METRICS"), (
+        "col._silent_advisory({'notifications': []}, 'GPU_METRICS')"
+    )
     assert (
         col._silent_advisory(
             {
@@ -119,7 +125,7 @@ def test_collector_cleared_error_and_channel_success(tmp_path: Path) -> None:
         __import__("datetime").datetime(
             2026, 10, 24, tzinfo=__import__("datetime").timezone.utc
         ),
-    )
+    ), "col._cleared_error( ctx, __import__('datetime').datetime( 2026, 10, 24"
 
 
 def test_post_refresh_without_sustained_error_fails(tmp_path: Path) -> None:
@@ -162,7 +168,9 @@ def test_post_refresh_without_sustained_error_fails(tmp_path: Path) -> None:
     result = spec.execute(ctx)
     # No sustained collection error was ever observed -> the no_stale_pass stage fails.
     assert result["verdict"] == "FAIL"
-    assert any("no sustained collection error" in e for e in result["errors"])
+    assert any("no sustained collection error" in e for e in result["errors"]), (
+        "any('no sustained collection error' in e for e in result['errors'])"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -172,10 +180,12 @@ def test_utilization_helpers() -> None:
     assert util._attribution_errors([], {}, "a1") == [
         "no low-utilisation finding reached an incident"
     ]
-    assert util._attribution_errors([{"attempt_id": "other"}], {}, "a1")
+    assert util._attribution_errors([{"attempt_id": "other"}], {}, "a1"), (
+        "util._attribution_errors([{'attempt_id': 'other'}], {}, 'a1')"
+    )
     assert util._attribution_errors([{"attempt_id": None}], {}, "a1") == []
     hot = {"batches": [host_batch("t", "memory_used_percent", 96.0)]}
-    assert util._memory_used_low(hot)
+    assert util._memory_used_low(hot), "util._memory_used_low(hot)"
     cool = {"batches": [host_batch("t", "memory_used_percent", 10.0)]}
     assert util._memory_used_low(cool) == []
 

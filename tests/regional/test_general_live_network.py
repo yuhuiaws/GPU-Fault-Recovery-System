@@ -466,6 +466,12 @@ def test_optional_interface_passes(tmp_path: Path) -> None:
 
 
 def test_deferred_and_capability_variants() -> None:
-    assert SPECS["statistics_failed"].deferred.startswith("FIXTURE_NOT_READY")
-    assert SPECS["errors_delta"].deferred.startswith("FIXTURE_NOT_READY")
-    assert SPECS["bond_vf"].deferred.startswith("CAPABILITY_ABSENT")
+    assert SPECS["statistics_failed"].deferred.startswith("FIXTURE_NOT_READY"), (
+        "SPECS['statistics_failed'].deferred.startswith('FIXTURE_NOT_READY')"
+    )
+    assert SPECS["errors_delta"].deferred.startswith("FIXTURE_NOT_READY"), (
+        "SPECS['errors_delta'].deferred.startswith('FIXTURE_NOT_READY')"
+    )
+    assert SPECS["bond_vf"].deferred.startswith("CAPABILITY_ABSENT"), (
+        "SPECS['bond_vf'].deferred.startswith('CAPABILITY_ABSENT')"
+    )

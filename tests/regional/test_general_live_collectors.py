@@ -352,8 +352,12 @@ def test_disabled_unit_and_expired_agent_and_new_success(tmp_path: Path) -> None
 
 
 def test_capability_and_replay_variants_are_deferred() -> None:
-    assert SPECS["inactive_cluster"].deferred.startswith("CAPABILITY_ABSENT")
-    assert SPECS["notification_failure"].deferred.startswith("CAPABILITY_ABSENT")
+    assert SPECS["inactive_cluster"].deferred.startswith("CAPABILITY_ABSENT"), (
+        "SPECS['inactive_cluster'].deferred.startswith('CAPABILITY_ABSENT')"
+    )
+    assert SPECS["notification_failure"].deferred.startswith("CAPABILITY_ABSENT"), (
+        "SPECS['notification_failure'].deferred.startswith('CAPABILITY_ABSENT')"
+    )
     for variant in (
         "missing_field",
         "one_gpu_missing",
@@ -361,4 +365,6 @@ def test_capability_and_replay_variants_are_deferred() -> None:
         "nan_negative",
         "duplicate_slot",
     ):
-        assert SPECS[variant].deferred.startswith("FIXTURE_NOT_READY")
+        assert SPECS[variant].deferred.startswith("FIXTURE_NOT_READY"), (
+            "SPECS[variant].deferred.startswith('FIXTURE_NOT_READY')"
+        )

@@ -86,15 +86,15 @@ class FakeRegional:
             cluster_id=cluster_id,
             region="us-west-2",
         )
-        self._node_snapshot = node_snapshot or _default_node()
+        self.node_snapshot_value = node_snapshot or _default_node()
         self._node_metadata = node_metadata or {
-            "name": self._node_snapshot["name"],
+            "name": self.node_snapshot_value["name"],
             "labels": {"eks.amazonaws.com/nodegroup": "gpu-p5en-efa-spot-node-group"},
         }
         self._business = list(business)
         self._gpu_pods = list(gpu_pods)
         self._release_id = release_id
-        self._cpu_python = cpu_python
+        self.cpu_python_responder = cpu_python
         self._run_output = run_output
 
     def evidence_identity(self, **_: Any) -> dict[str, str]:
@@ -104,7 +104,7 @@ class FakeRegional:
         return self._release_id
 
     def node_snapshot(self, node: str) -> dict[str, Any]:
-        return dict(self._node_snapshot)
+        return dict(self.node_snapshot_value)
 
     def node_metadata(self, node: str) -> dict[str, Any]:
         return dict(self._node_metadata)
@@ -116,9 +116,9 @@ class FakeRegional:
         return list(self._gpu_pods)
 
     def cpu_python(self, script: str, *arguments: str, **_: Any) -> dict[str, Any]:
-        if self._cpu_python is None:
+        if self.cpu_python_responder is None:
             raise AssertionError("cpu_python was called without a script")
-        return self._cpu_python(script, *arguments)
+        return self.cpu_python_responder(script, *arguments)
 
     def run(self, command: list[str], **_: Any) -> Any:
         output = self._run_output(command) if self._run_output else "null"

@@ -141,7 +141,9 @@ def test_host_recovery_without_incident_fails(tmp_path: Path) -> None:
     # reports "no cpu finding to recover from".
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
-    assert any("recover from" in e for e in result["errors"])
+    assert any("recover from" in e for e in result["errors"]), (
+        "any('recover from' in e for e in result['errors'])"
+    )
 
 
 def test_host_await_recovery_timeout(tmp_path: Path) -> None:
@@ -181,7 +183,9 @@ def test_host_await_recovery_timeout(tmp_path: Path) -> None:
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
-    assert any("3 fresh samples below threshold" in e for e in result["errors"])
+    assert any("3 fresh samples below threshold" in e for e in result["errors"]), (
+        "any('3 fresh samples below threshold' in e for e in result['errors'])"
+    )
 
 
 def storage_survey() -> dict[str, Any]:
@@ -318,7 +322,9 @@ def test_storage_zero_completed_io_flags_pseudo_rate(tmp_path: Path) -> None:
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
-    assert any("await sample was emitted" in e for e in result["errors"])
+    assert any("await sample was emitted" in e for e in result["errors"]), (
+        "any('await sample was emitted' in e for e in result['errors'])"
+    )
 
 
 def net_survey() -> dict[str, Any]:
@@ -366,7 +372,9 @@ def test_network_unknown_state_without_error_fails(tmp_path: Path) -> None:
     result = spec.execute(ctx)
     # No collection error observed -> the collection_error stage fails.
     assert result["verdict"] == "FAIL"
-    assert any("collection error" in e for e in result["errors"])
+    assert any("collection error" in e for e in result["errors"]), (
+        "any('collection error' in e for e in result['errors'])"
+    )
 
 
 def test_network_unknown_state_inconclusive_if_not_unknown(tmp_path: Path) -> None:

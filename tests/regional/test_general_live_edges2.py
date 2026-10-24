@@ -78,7 +78,7 @@ def test_attempts_withheld_and_budget_helpers() -> None:
             }
         ]
     }
-    assert att._withheld_errors(bad_reason)
+    assert att._withheld_errors(bad_reason), "att._withheld_errors(bad_reason)"
     waiting = {
         "recovery": [
             {
@@ -99,15 +99,17 @@ def test_attempts_withheld_and_budget_helpers() -> None:
     }
     assert att._withheld_errors(waiting) == []
     assert att._withheld_errors({"recovery": []}) == []
-    assert att._budget_errors({"restart_budget": None}, consumed=1)
+    assert att._budget_errors({"restart_budget": None}, consumed=1), (
+        "att._budget_errors({'restart_budget': None}, consumed=1)"
+    )
     assert att._budget_errors({"restart_budget": None}, consumed=0) == []
     assert att._budget_errors(
         {"restart_budget": {"restart_count": 2, "reservation_ids": ["a"]}}, consumed=1
-    )
+    ), "att._budget_errors( {'restart_budget': {'restart_count': 2, 'reservati"
     assert att._budget_errors(
         {"restart_budget": {"restart_count": 3, "reservation_ids": ["a", "b", "c"]}},
         consumed=1,
-    )
+    ), "att._budget_errors( {'restart_budget': {'restart_count': 3, 'reservati"
     assert (
         att._budget_errors(
             {"restart_budget": {"restart_count": 1, "reservation_ids": ["a"]}},
@@ -125,16 +127,18 @@ def test_attempts_created_job_and_escalated() -> None:
     assert att._created_new_training_job(records, job) is True
     records2 = {"attempts": {"a1": {"recovery": [{"incident": {"job_id": "mine"}}]}}}
     assert att._created_new_training_job(records2, job) is False
-    assert att._escalated({"containment_incident": {"state": "ESCALATED"}})
+    assert att._escalated({"containment_incident": {"state": "ESCALATED"}}), (
+        "att._escalated({'containment_incident': {'state': 'ESCALATED'}})"
+    )
     assert att._escalated(
         {
             "containment_incident": {"state": "ACTION_PENDING"},
             "recovery": [{"incident": {"state": "QUARANTINED"}}],
         }
-    )
+    ), "att._escalated( { 'containment_incident': {'state': 'ACTION_PENDING'},"
     assert not att._escalated(
         {"containment_incident": {"state": "ACTION_PENDING"}, "recovery": []}
-    )
+    ), "not att._escalated( {'containment_incident': {'state': 'ACTION_PENDING"
 
 
 def test_attempts_stop_then_restart_errors() -> None:
@@ -152,7 +156,7 @@ def test_attempts_stop_then_restart_errors() -> None:
     assert any(
         "did not plan RESTART_WORKLOAD" in e
         for e in att._stop_then_restart_errors(recovery_no_restart)
-    )
+    ), "any( 'did not plan RESTART_WORKLOAD' in e for e in att._stop_then_rest"
 
 
 # --------------------------------------------------------------------------- #
@@ -243,7 +247,9 @@ def test_restore_incidents_orders_owner_and_skips_recovered(
     results = common.restore_incidents(
         ctx, [{"incident_id": "inc-owner"}, {"incident_id": "inc-2"}], reason="r"
     )
-    assert any(r["incident_id"] == "inc-owner" for r in results)
+    assert any(r["incident_id"] == "inc-owner" for r in results), (
+        "any(r['incident_id'] == 'inc-owner' for r in results)"
+    )
 
 
 def test_restore_incidents_raises_when_still_isolated(
@@ -541,7 +547,7 @@ def test_storage_duplicate_and_inode_detected(
     )
     mount = storage._fs_mount(ctx)
     inc = incident("fs", "filesystem_used_percent", device=mount, state="QUARANTINED")
-    regional._cpu_python = store_script(
+    regional.cpu_python_responder = store_script(
         {
             "activity": {
                 **EMPTY,

@@ -159,10 +159,18 @@ def test_finding_incidents_device_and_rule() -> None:
             _incident("load1_per_cpu", rule="LOW"),
         ]
     }
-    assert v.finding_incidents(doc, "cpu_usage_percent")
-    assert v.finding_incidents(doc, "load1_per_cpu", rule_id="LOW")
-    assert not v.finding_incidents(doc, "load1_per_cpu", rule_id="OTHER")
-    assert not v.finding_incidents(doc, "cpu_usage_percent", device="dm-7")
+    assert v.finding_incidents(doc, "cpu_usage_percent"), (
+        "v.finding_incidents(doc, 'cpu_usage_percent')"
+    )
+    assert v.finding_incidents(doc, "load1_per_cpu", rule_id="LOW"), (
+        "v.finding_incidents(doc, 'load1_per_cpu', rule_id='LOW')"
+    )
+    assert not v.finding_incidents(doc, "load1_per_cpu", rule_id="OTHER"), (
+        "not v.finding_incidents(doc, 'load1_per_cpu', rule_id='OTHER')"
+    )
+    assert not v.finding_incidents(doc, "cpu_usage_percent", device="dm-7"), (
+        "not v.finding_incidents(doc, 'cpu_usage_percent', device='dm-7')"
+    )
 
 
 def test_chain_errors_present_and_absent() -> None:
@@ -198,10 +206,10 @@ def test_chain_errors_present_and_absent() -> None:
     assert errors == []
     assert v.chain_errors(
         {"incidents": []}, v.ChainExpectation(metric="cpu_usage_percent")
-    )
+    ), "v.chain_errors( {'incidents': []}, v.ChainExpectation(metric='cpu_usag"
     assert v.chain_errors(
         doc, v.ChainExpectation(metric="cpu_usage_percent", present=False)
-    )
+    ), "v.chain_errors( doc, v.ChainExpectation(metric='cpu_usage_percent', pr"
 
 
 def test_chain_errors_detects_every_shape() -> None:
@@ -294,14 +302,18 @@ def test_hardware_isolation_settled_detection_notifications() -> None:
             )
         ]
     }
-    assert v.hardware_errors(doc)
+    assert v.hardware_errors(doc), "v.hardware_errors(doc)"
     assert v.hardware_errors(doc, allowed={"RESET_GPU"}) == []
     assert set(x.split(":")[1] for x in v.isolation_operations(doc)) == {
         "MARK_UNSCHEDULABLE",
         "STOP_WORKLOADS",
     }
-    assert v.settled({"workflows": [_wf("i", ["x"], status="SUCCEEDED")]}, ["i"])
-    assert not v.settled({"workflows": [_wf("i", ["x"], status="RUNNING")]}, ["i"])
+    assert v.settled({"workflows": [_wf("i", ["x"], status="SUCCEEDED")]}, ["i"]), (
+        "v.settled({'workflows': [_wf('i', ['x'], status='SUCCEEDED')]}, ['i'])"
+    )
+    assert not v.settled({"workflows": [_wf("i", ["x"], status="RUNNING")]}, ["i"]), (
+        "not v.settled({'workflows': [_wf('i', ['x'], status='RUNNING')]}, ['i'"
+    )
     assert (
         v.detection_seconds(
             {}, _incident("m"), datetime(2026, 10, 24, tzinfo=timezone.utc)
@@ -311,7 +323,7 @@ def test_hardware_isolation_settled_detection_notifications() -> None:
     assert v.notification_errors(
         {"notifications": [{"incident_id": "i"}, {"incident_id": "i"}]},
         incident_ids=["i"],
-    )
+    ), "v.notification_errors( {'notifications': [{'incident_id': 'i'}, {'inci"
     assert (
         v.notification_errors(
             {"notifications": [{"incident_id": "i"}]}, incident_ids=["i"]
@@ -324,13 +336,21 @@ def test_oracle_and_sustained_and_node_isolated() -> None:
     assert v.oracle_values(
         [{"a": 1.0}, {"a": "x"}, {"a": float("nan")}], lambda r: r.get("a")
     ) == [1.0]
-    assert v.sustained([1, 1, 1], lambda x: x >= 1, 3)
-    assert not v.sustained([1, 0, 1], lambda x: x >= 1, 2)
-    assert v.node_isolated({"unschedulable": True})
-    assert v.node_isolated({"taints": [{"key": "gpu-fault.io/quarantined"}]})
+    assert v.sustained([1, 1, 1], lambda x: x >= 1, 3), (
+        "v.sustained([1, 1, 1], lambda x: x >= 1, 3)"
+    )
+    assert not v.sustained([1, 0, 1], lambda x: x >= 1, 2), (
+        "not v.sustained([1, 0, 1], lambda x: x >= 1, 2)"
+    )
+    assert v.node_isolated({"unschedulable": True}), (
+        "v.node_isolated({'unschedulable': True})"
+    )
+    assert v.node_isolated({"taints": [{"key": "gpu-fault.io/quarantined"}]}), (
+        "v.node_isolated({'taints': [{'key': 'gpu-fault.io/quarantined'}]})"
+    )
     assert not v.node_isolated(
         {"unschedulable": False, "taints": [], "ownership_annotations": {}}
-    )
+    ), "not v.node_isolated( {'unschedulable': False, 'taints': [], 'ownership"
     assert v.verdict({"a": []}) == "PASS"
     assert v.verdict({"a": ["x"]}) == "FAIL"
     assert v.verdict({"a": []}, inconclusive=["y"]) == "INCONCLUSIVE"
@@ -347,16 +367,24 @@ def test_samples_breaching_steps_and_subsequence() -> None:
         ]
     }
     assert v.samples(doc, "m", device="d")[0]["value"] == 5.0
-    assert v.breaching({"value": 99.0}, 98.0)
-    assert v.breaching({"value": 1.0}, 2.0, "lte")
-    assert not v.breaching({"value": float("inf")}, 1.0)
+    assert v.breaching({"value": 99.0}, 98.0), "v.breaching({'value': 99.0}, 98.0)"
+    assert v.breaching({"value": 1.0}, 2.0, "lte"), (
+        "v.breaching({'value': 1.0}, 2.0, 'lte')"
+    )
+    assert not v.breaching({"value": float("inf")}, 1.0), (
+        "not v.breaching({'value': float('inf')}, 1.0)"
+    )
     wf = _wf("i", ["VALIDATE_HOST"], probe="m")
     assert (
         v.step_parameters(wf, "VALIDATE_HOST")[0]["host_diagnostic_probe"]["metric"]
         == "m"
     )
-    assert v.subsequence(["a", "c"], ["a", "b", "c"])
-    assert not v.subsequence(["c", "a"], ["a", "b", "c"])
+    assert v.subsequence(["a", "c"], ["a", "b", "c"]), (
+        "v.subsequence(['a', 'c'], ['a', 'b', 'c'])"
+    )
+    assert not v.subsequence(["c", "a"], ["a", "b", "c"]), (
+        "not v.subsequence(['c', 'a'], ['a', 'b', 'c'])"
+    )
     assert (
         v.final_execution(
             _wf("i", ["X"], execs=[{"operation": "X", "status": "WAITING"}]), "X"

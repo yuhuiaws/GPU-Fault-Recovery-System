@@ -113,7 +113,9 @@ def test_cpu_busy_passes_the_diagnostic_chain(tmp_path: Path) -> None:
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
-    assert (ctx.case_dir / "oracle.jsonl").is_file()
+    assert (ctx.case_dir / "oracle.jsonl").is_file(), (
+        "(ctx.case_dir / 'oracle.jsonl').is_file()"
+    )
 
 
 def test_cpu_busy_is_inconclusive_when_the_oracle_never_crossed(tmp_path: Path) -> None:
@@ -145,7 +147,9 @@ def test_cpu_busy_fails_when_a_hardware_step_is_planned(tmp_path: Path) -> None:
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
-    assert any("RESET_GPU" in error for error in result["errors"])
+    assert any("RESET_GPU" in error for error in result["errors"]), (
+        "any('RESET_GPU' in error for error in result['errors'])"
+    )
 
 
 def test_cpu_busy_fails_when_validate_host_succeeded_while_loaded(
@@ -165,7 +169,9 @@ def test_cpu_busy_fails_when_validate_host_succeeded_while_loaded(
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL"
-    assert any("succeeded while the fault" in error for error in result["errors"])
+    assert any("succeeded while the fault" in error for error in result["errors"]), (
+        "any('succeeded while the fault' in error for error in result['errors']"
+    )
 
 
 def test_load_average_passes_and_binds_its_own_signal(tmp_path: Path) -> None:
@@ -233,10 +239,14 @@ def test_recovery_and_checkpoint_phase_pass(tmp_path: Path) -> None:
         )
         result = spec.execute(ctx)
         assert result["verdict"] == "PASS", (variant, result["errors"])
-    assert any("phase correlation" in note for note in result["notes"])
+    assert any("phase correlation" in note for note in result["notes"]), (
+        "any('phase correlation' in note for note in result['notes'])"
+    )
 
 
 def test_invalid_delta_is_a_deferred_live_replay_variant() -> None:
     spec = SPECS["invalid_delta"]
-    assert spec.deferred.startswith("FIXTURE_NOT_READY")
+    assert spec.deferred.startswith("FIXTURE_NOT_READY"), (
+        "spec.deferred.startswith('FIXTURE_NOT_READY')"
+    )
     assert spec.execute is None

@@ -163,7 +163,7 @@ def test_nonzero_exit_passes(tmp_path: Path) -> None:
         attempt_id = a[2]
         return attempt_doc(attempt_id)
 
-    ctx.regional._cpu_python = responder
+    ctx.regional.cpu_python_responder = responder
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
 
@@ -331,8 +331,18 @@ def test_duplicate_event_and_single_notification(tmp_path: Path) -> None:
 
 
 def test_deferred_variants() -> None:
-    assert SPECS["api_unreachable"].deferred.startswith("NOT_AUTHORIZED")
-    assert SPECS["worker_restart"].deferred.startswith("NOT_AUTHORIZED")
-    assert SPECS["hardware_chain_continues"].deferred.startswith("FIXTURE_NOT_READY")
-    assert SPECS["concurrent_claim"].deferred.startswith("FIXTURE_NOT_READY")
-    assert SPECS["missing_context"].deferred.startswith("FIXTURE_NOT_READY")
+    assert SPECS["api_unreachable"].deferred.startswith("NOT_AUTHORIZED"), (
+        "SPECS['api_unreachable'].deferred.startswith('NOT_AUTHORIZED')"
+    )
+    assert SPECS["worker_restart"].deferred.startswith("NOT_AUTHORIZED"), (
+        "SPECS['worker_restart'].deferred.startswith('NOT_AUTHORIZED')"
+    )
+    assert SPECS["hardware_chain_continues"].deferred.startswith("FIXTURE_NOT_READY"), (
+        "SPECS['hardware_chain_continues'].deferred.startswith('FIXTURE_NOT_REA"
+    )
+    assert SPECS["concurrent_claim"].deferred.startswith("FIXTURE_NOT_READY"), (
+        "SPECS['concurrent_claim'].deferred.startswith('FIXTURE_NOT_READY')"
+    )
+    assert SPECS["missing_context"].deferred.startswith("FIXTURE_NOT_READY"), (
+        "SPECS['missing_context'].deferred.startswith('FIXTURE_NOT_READY')"
+    )

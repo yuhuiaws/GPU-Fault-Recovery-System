@@ -168,7 +168,9 @@ def test_capacity_full_quarantines_and_restores(
         probes=probes(node_probe(survey()), storage_probe(), window_probe()),
     )
     mount = storage._fs_mount(ctx)
-    regional._cpu_python = store_script({"activity": quarantine_activity(mount)})
+    regional.cpu_python_responder = store_script(
+        {"activity": quarantine_activity(mount)}
+    )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
 
@@ -247,7 +249,9 @@ def test_inode_variant_passes_if_product_detects(tmp_path: Path) -> None:
         probes=probes(node_probe(survey()), storage_probe(), window_probe()),
     )
     mount = storage._fs_mount(ctx)
-    regional._cpu_python = store_script({"activity": quarantine_activity(mount)})
+    regional.cpu_python_responder = store_script(
+        {"activity": quarantine_activity(mount)}
+    )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS"  # a fixed product (detection) passes
 
@@ -472,4 +476,6 @@ def test_sustained_latency_requires_dm_delay(tmp_path: Path) -> None:
 
 
 def test_probe_error_is_deferred() -> None:
-    assert SPECS["probe_error"].deferred.startswith("FIXTURE_NOT_READY")
+    assert SPECS["probe_error"].deferred.startswith("FIXTURE_NOT_READY"), (
+        "SPECS['probe_error'].deferred.startswith('FIXTURE_NOT_READY')"
+    )

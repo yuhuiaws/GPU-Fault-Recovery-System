@@ -75,8 +75,10 @@ def test_evidence_writes(tmp_path: Path) -> None:
     ev = fx.Evidence(tmp_path / "cases" / "x")
     ev.write("doc", {"a": 1})
     ev.append_oracle([{"t": 1}], source="cpu")
-    assert (ev.case_dir / "doc.json").is_file()
-    assert (ev.case_dir / "oracle.jsonl").read_text().strip()
+    assert (ev.case_dir / "doc.json").is_file(), "(ev.case_dir / 'doc.json').is_file()"
+    assert (ev.case_dir / "oracle.jsonl").read_text().strip(), (
+        "(ev.case_dir / 'oracle.jsonl').read_text().strip()"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -133,7 +135,7 @@ def test_node_provider_and_channel_errors() -> None:
     assert any("GPU_INVENTORY" in e for e in errors) and any(
         "GPU_METRICS" in e for e in errors
     )
-    assert fx.channel_errors([], now)  # all missing
+    assert fx.channel_errors([], now), "fx.channel_errors([], now)"  # all missing
 
 
 # --------------------------------------------------------------------------- #
@@ -194,7 +196,9 @@ def test_read_only_preflight_deferred_and_unauthorized() -> None:
     )
     settings = make_settings(deferred, node=NODE)
     result = fx.read_only_preflight(settings, deferred, _preflight_regional())
-    assert result["planned_verdict"].startswith("NOT_RUN")
+    assert result["planned_verdict"].startswith("NOT_RUN"), (
+        "result['planned_verdict'].startswith('NOT_RUN')"
+    )
     gated = _spec(variant="cpu_busy", approvals=("HOST_MEMORY_PRESSURE",))
     settings = make_settings(gated, node=NODE)
     settings = type(settings)(**{**settings.__dict__, "approvals": ()})
@@ -257,7 +261,9 @@ def test_read_only_preflight_hyperpod_node_recovery() -> None:
         run_output=lambda cmd: '"Automatic"',
     )
     result = fx.read_only_preflight(settings, spec, regional)
-    assert any("NodeRecovery" in e for e in result["errors"])
+    assert any("NodeRecovery" in e for e in result["errors"]), (
+        "any('NodeRecovery' in e for e in result['errors'])"
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -315,7 +321,7 @@ def test_variant_context_helpers(tmp_path: Path) -> None:
     assert ctx.remaining_seconds() > 0
     polls = []
     ctx.hold(2, name="h", check=lambda: polls.append(1))
-    assert polls
+    assert polls, "polls"
     value = ctx.wait_until(lambda: None, timeout_seconds=1, poll_seconds=0.1, name="w")
     assert value is None
 
@@ -487,7 +493,7 @@ def test_restore_incidents(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> N
             {"preflight": {"agent": {"runtime_profile_version": "eks-v1"}}}
         )
     )
-    regional._node_snapshot = {
+    regional.node_snapshot_value = {
         "name": NODE,
         "uid": "u",
         "ready": "True",
@@ -521,6 +527,7 @@ def test_open_incident_ids_and_unsettled() -> None:
 # run_general_live execute_variant
 # --------------------------------------------------------------------------- #
 
+
 def _patch_runner(monkeypatch, store_doc=None):
     from scripts.e2e.regional import run_general_live as runner
 
@@ -529,6 +536,7 @@ def _patch_runner(monkeypatch, store_doc=None):
 
     monkeypatch.setattr(runner, "RegionalLiveFixture", factory)
     return runner
+
 
 def test_execute_variant_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     runner = _patch_runner(monkeypatch)
@@ -560,7 +568,9 @@ def test_execute_variant_paths(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) 
     assert result["verdict"] == "NOT_RUN"
 
 
-def test_execute_variant_classifies_exceptions(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_execute_variant_classifies_exceptions(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     runner = _patch_runner(monkeypatch)
 
     def boom(ctx):
@@ -594,7 +604,9 @@ def test_execute_variant_classifies_exceptions(tmp_path: Path, monkeypatch: pyte
     assert result["verdict"] == "FAIL" and "bang" in result["error"]
 
 
-def test_teardown_downgrades_on_dirty_cleanup(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_teardown_downgrades_on_dirty_cleanup(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     runner = _patch_runner(monkeypatch)
 
     def dirty(ctx):
@@ -615,4 +627,6 @@ def test_teardown_downgrades_on_dirty_cleanup(tmp_path: Path, monkeypatch: pytes
         {"errors": [], "release_id": "r", "cluster_id": "c"},
     )
     assert result["verdict"] == "FAIL"
-    assert any("cleanup did not prove" in e for e in result["errors"])
+    assert any("cleanup did not prove" in e for e in result["errors"]), (
+        "any('cleanup did not prove' in e for e in result['errors'])"
+    )
