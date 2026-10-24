@@ -455,7 +455,6 @@ def test_zero_completed_io_and_counter_reset_and_recovery(tmp_path: Path) -> Non
 
 def test_sustained_latency_requires_dm_delay(tmp_path: Path) -> None:
     from scripts.e2e.regional.general_live_fixture import VariantNotRun
-
     from tests.regional._general_live_fakes import make_settings
 
     spec = SPECS["sustained_latency"]
