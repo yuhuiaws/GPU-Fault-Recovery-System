@@ -355,6 +355,7 @@ _HOST_VALIDATION_LATEST_METRICS = {
     "swap_used_percent",
     "page_cache_percent",
     "filesystem_used_percent",
+    "filesystem_inodes_used_percent",
     "local_filesystem_used_percent",
     "shared_filesystem_unavailable",
     "shared_filesystem_used_percent",
@@ -365,6 +366,29 @@ _HOST_VALIDATION_LATEST_METRICS = {
     "bmc_critical_sensor",
     "training_rank_cpu_percent",
     "host_gpu_utilization_percent",
+}
+
+
+#: A configured mount is unusable when either its blocks or its inodes run out:
+#: both refuse new files with ENOSPC, and free bytes say nothing about an
+#: exhausted inode table. They grade alike -- 98 %, CRITICAL, QUARANTINE, no
+#: STOP (GF-GENERAL-LIVE-004 ``capacity_full`` and ``inode_full``) -- as two
+#: signals per mount, so one can neither clear nor mask the other.
+_FILESYSTEM_EXHAUSTION_RULES = {
+    "filesystem_used_percent": (
+        98.0,
+        NodeHealthCategory.STORAGE,
+        Severity.CRITICAL,
+        RecoveryAction.QUARANTINE,
+        "filesystem capacity exhausted",
+    ),
+    "filesystem_inodes_used_percent": (
+        98.0,
+        NodeHealthCategory.STORAGE,
+        Severity.CRITICAL,
+        RecoveryAction.QUARANTINE,
+        "filesystem inodes exhausted",
+    ),
 }
 
 
@@ -544,13 +568,7 @@ class NodeHealthPolicy:
             RecoveryAction.RUN_DIAGNOSTICS,
             "host swap pressure",
         ),
-        "filesystem_used_percent": (
-            98.0,
-            NodeHealthCategory.STORAGE,
-            Severity.CRITICAL,
-            RecoveryAction.QUARANTINE,
-            "filesystem capacity exhausted",
-        ),
+        **_FILESYSTEM_EXHAUSTION_RULES,
         "shared_filesystem_unavailable": (
             1.0,
             NodeHealthCategory.STORAGE,

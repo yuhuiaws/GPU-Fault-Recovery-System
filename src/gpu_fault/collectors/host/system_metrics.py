@@ -425,6 +425,22 @@ class HostSystemMetricsMixin:
                             mount,
                         )
                     )
+            # Inodes run out independently of bytes: a table of small files
+            # refuses every new file with ENOSPC while ``f_bavail`` still
+            # shows free space, so the byte reading alone read such a mount as
+            # healthy (GF-GENERAL-LIVE-004 inode_full). ``f_files == 0`` is a
+            # filesystem that keeps no fixed inode table (btrfs, many FUSE
+            # and NFS exports) -- not graded, rather than 0 % or 100 %.
+            if stat.f_files:
+                inodes_used = 100 * (stat.f_files - stat.f_ffree) / stat.f_files
+                result.append(
+                    self._sample(
+                        "filesystem_inodes_used_percent",
+                        max(0.0, min(100.0, inodes_used)),
+                        "percent",
+                        mount,
+                    )
+                )
         return result
 
     @staticmethod

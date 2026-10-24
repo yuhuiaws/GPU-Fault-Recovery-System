@@ -1,6 +1,6 @@
 """A host read that failed, or never existed, is missing evidence.
 
-GF-GENERAL-LIVE-007/010/012: an unreadable source must read UNKNOWN (a
+GF-GENERAL-LIVE-004/007/010/012: an unreadable source must read UNKNOWN (a
 collection error, so validation waits and nothing is graded), a source the
 node cannot provide must say NOT_SUPPORTED, and neither may be reported as a
 healthy reading or as a zero. Every case drives the real contributor through
@@ -11,12 +11,14 @@ healthy reading or as a zero. Every case drives the real contributor through
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 
 import pytest
 
+from gpu_fault.host_diagnostics import validate_host_metrics
 from gpu_fault.host_health import NodeHealthPolicy
-from gpu_fault.models import RecoveryAction
+from gpu_fault.models import RecoveryAction, Severity
 from tests._builders import build_store
 from tests.collectors import _cov95_runtime_collect as common
 from tests.collectors import _cov95_runtime_collect_host as support
@@ -513,3 +515,87 @@ def test_an_unknown_gpu_inventory_neither_confirms_nor_clears_the_missing_streak
     assert confirmed[("gpu_inventory_mismatch", None)] == 1, (
         f"two valid missing readings confirm the loss: {confirmed}"
     )
+
+
+# --------------------------------------------------------------------------- #
+# 004 local disk inodes
+# --------------------------------------------------------------------------- #
+def statvfs(*, blocks_free: int, files: int, files_free: int):
+    return lambda path: os.statvfs_result(
+        (
+            4096,
+            4096,
+            100,
+            blocks_free,
+            blocks_free,
+            files,
+            files_free,
+            files_free,
+            0,
+            255,
+        )
+    )
+
+
+def test_inode_exhaustion_is_graded_like_capacity_exhaustion(host_case):
+    """Free bytes say nothing about an exhausted inode table (004 inode_full)."""
+
+    mount = str(host_case.roots.mount)
+    # The rest of VALIDATE_HOST's required baseline, read healthy.
+    support.write_file(host_case.roots.proc / "stat", "cpu 100 0 0 800 0 0 0 0\n")
+    support.write_file(host_case.roots.proc / "loadavg", "0.1 0.1 0.1 1/10 123\n")
+    support.write_file(
+        host_case.roots.proc / "meminfo",
+        "MemTotal: 1000 kB\nMemAvailable: 800 kB\nMemFree: 700 kB\n",
+    )
+    collector = host_case.build(
+        "_cpu",
+        "_memory",
+        "_filesystems",
+        edge_filter_enabled=True,
+        statvfs=statvfs(blocks_free=90, files=1000, files_free=10),
+    )
+
+    batch = collector.collect_once()
+
+    values = support.values(batch)
+    assert values[("filesystem_used_percent", mount)] == 10, values
+    assert values[("filesystem_inodes_used_percent", mount)] == 99, values
+    assert "threshold:filesystem_inodes_used_percent" in batch.edge_filter_reasons, (
+        batch.edge_filter_reasons
+    )
+    store = build_store()
+    findings = NodeHealthPolicy(store).evaluate_metrics(batch)
+    assert [(item.metric_name, item.device) for item in findings] == [
+        ("filesystem_inodes_used_percent", mount)
+    ], findings
+    assert findings[0].severity is Severity.CRITICAL, findings
+    assert findings[0].recommended_action is RecoveryAction.QUARANTINE, findings
+    latest = store.list_telemetry_metrics_latest(batch.cluster_id, batch.node_id)
+    failures: dict[str, list[str]] = {}
+    assert validate_host_metrics(latest, batch.node_id, failures) is None, latest
+    assert failures == {batch.node_id: ["filesystem_inodes_used_percent"]}, (
+        f"VALIDATE_HOST must keep refusing the node while its inodes are "
+        f"exhausted, from the persisted latest value: {failures}"
+    )
+
+
+@pytest.mark.parametrize(
+    ("files", "files_free", "expected"),
+    [(1000, 30, 97), (1000, 1000, 0), (0, 0, None), (1000, 2000, 0)],
+    ids=["below-threshold", "empty", "no-inode-table", "free-exceeds-total"],
+)
+def test_inode_usage_below_the_threshold_or_untracked_is_not_graded(
+    host_case, files, files_free, expected
+):
+    mount = str(host_case.roots.mount)
+    collector = host_case.build(
+        "_filesystems",
+        statvfs=statvfs(blocks_free=90, files=files, files_free=files_free),
+    )
+
+    batch = collector.collect_once()
+
+    values = support.values(batch)
+    assert values.get(("filesystem_inodes_used_percent", mount)) == expected, values
+    assert graded(batch) == [], "inode usage below 98 % is not a storage fault"

@@ -36,6 +36,7 @@ CONTRIBUTORS = {
     "memory": "_memory",
     "swap": "_memory",
     "filesystem": "_filesystems",
+    "inode": "_filesystems",
     "smart": "_smart",
     "smart-query": "_smart",
     "smart-scan": "_smart",
@@ -102,7 +103,11 @@ class HostFaultRig:
             infiniband_root=str(directory / "ib"),
             runner=self.command,
             statvfs=lambda _: SimpleNamespace(
-                f_blocks=100, f_frsize=4096, f_bavail=1 if self.broken else 80
+                f_blocks=100,
+                f_frsize=4096,
+                f_bavail=1 if self.broken and kind != "inode" else 80,
+                f_files=1000,
+                f_ffree=10 if self.broken and kind == "inode" else 800,
             ),
             # Only the GPU inventory case configures an invariant; its
             # ``/proc/driver/nvidia/gpus`` does not exist under ``proc``.
@@ -244,7 +249,12 @@ class HostFaultRig:
                     for path in root.rglob("*")
                     if path.is_file()
                 },
-                "simulated_statvfs_bavail": 1 if self.broken else 80,
+                "simulated_statvfs_bavail": (
+                    1 if self.broken and self.kind != "inode" else 80
+                ),
+                "simulated_statvfs_ffree": (
+                    10 if self.broken and self.kind == "inode" else 800
+                ),
                 "injected_kind": self.kind,
                 "batch": batch.model_dump(mode="json"),
                 "decision": response.json(),

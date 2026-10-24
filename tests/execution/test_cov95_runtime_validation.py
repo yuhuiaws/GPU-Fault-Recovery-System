@@ -52,6 +52,7 @@ def test_validation_adapter_matches_both_owner_and_registered_operation() -> Non
         ("memory_used_percent", 95),
         ("swap_used_percent", 80),
         ("filesystem_used_percent", 98),
+        ("filesystem_inodes_used_percent", 98),
         ("shared_filesystem_unavailable", 1),
         ("shared_filesystem_used_percent", 98),
         ("disk_io_util_percent", 98),

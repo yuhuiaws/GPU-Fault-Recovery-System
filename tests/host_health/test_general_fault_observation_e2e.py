@@ -74,7 +74,7 @@ def test_resource_fault_reaches_real_validation(tmp_path, monkeypatch, kind, rec
 
 
 @pytest.mark.parametrize(
-    "kind", ["filesystem", "smart", "bmc", "net-missing", "net-down"]
+    "kind", ["filesystem", "inode", "smart", "bmc", "net-missing", "net-down"]
 )
 def test_hardware_fault_reaches_real_quarantine_adapter(tmp_path, monkeypatch, kind):
     rig = HostFaultRig(tmp_path, monkeypatch, kind)

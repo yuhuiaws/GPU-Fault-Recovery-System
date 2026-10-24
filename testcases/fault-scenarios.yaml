@@ -714,9 +714,9 @@ test_cases:
   level: end-to-end
   risk: non-destructive
   problem: 分类或计划测试不能证明实际 cordon 和 taint。
-  injection: 临时 statvfs、SMART/BMC 输出和 net sysfs 进入真实 collector、API、executor 和 Kubernetes adapter。
+  injection: 临时 statvfs（块与 inode）、SMART/BMC 输出和 net sysfs 进入真实 collector、API、executor 和 Kubernetes adapter。
   expected:
-  - 五种输入均生成并执行隔离链，最终 incident QUARANTINED
+  - 六种输入（含 inode 耗尽而字节充足）均生成并执行隔离链，最终 incident QUARANTINED
   - 实际适配器修改本地客户端节点状态，并保留 provider taint
   - 重复采样不重复建链，不执行真实 Kubernetes 或 GPU 操作
   automation: pytest
