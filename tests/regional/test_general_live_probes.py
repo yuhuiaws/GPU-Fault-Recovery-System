@@ -9,6 +9,7 @@ touch and whether a run left the node clean.
 from __future__ import annotations
 
 import argparse
+import json
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -265,7 +266,7 @@ def test_net_management_digest_ignores_traffic_and_pod_churn(
     monkeypatch.setattr(
         netp,
         "interface_addresses",
-        lambda name: ["10.0.0.5/24"] if name == "enp71s0" else [],
+        lambda name, **_kw: ["10.0.0.5/24"] if name == "enp71s0" else [],
     )
 
     first = netp.management_digest(run_id)
@@ -281,7 +282,9 @@ def test_net_management_digest_flags_a_real_config_change(
 ) -> None:
     run_id = "gl8-link-a1-deadbeef"
     monkeypatch.setattr(netp, "real_interfaces", lambda rid: ["enp71s0"])
-    monkeypatch.setattr(netp, "interface_addresses", lambda name: ["10.0.0.5/24"])
+    monkeypatch.setattr(
+        netp, "interface_addresses", lambda name, **_kw: ["10.0.0.5/24"]
+    )
 
     monkeypatch.setattr(netp, "interface_link", lambda name: _mgmt_link())
     healthy = netp.management_digest(run_id)["sha256"]
@@ -327,7 +330,7 @@ def test_net_create_veth_survives_live_counter_movement(
     monkeypatch.setattr(
         netp,
         "interface_addresses",
-        lambda name: ["10.0.0.5/24"] if name not in (a, b) else [],
+        lambda name, **_kw: ["10.0.0.5/24"] if name not in (a, b) else [],
     )
     monkeypatch.setattr(netp, "arm_deadman", lambda rid, kind, seconds: "gfrs-deadman")
     commands: list[list[str]] = []
@@ -369,7 +372,7 @@ def test_net_create_veth_still_refuses_a_real_interface_change(
     monkeypatch.setattr(
         netp,
         "interface_addresses",
-        lambda name: ["10.0.0.5/24"] if name not in (a, b) else [],
+        lambda name, **_kw: ["10.0.0.5/24"] if name not in (a, b) else [],
     )
     monkeypatch.setattr(netp, "arm_deadman", lambda rid, kind, seconds: "gfrs-deadman")
     monkeypatch.setattr(
@@ -386,6 +389,107 @@ def test_net_create_veth_still_refuses_a_real_interface_change(
     )
     with pytest.raises(netp.ProbeError, match="changed a real interface digest"):
         netp.create_veth(args)
+
+
+# --------------------------------------------------------------------------- #
+# net probe: a kernel link-local is not a real-device address
+#
+# Bringing a veth up auto-assigns an IPv6 link-local (fe80::, scope link). The
+# residual 008 ProbeError after the digest fix was forbid_real (via set-link
+# down) treating the test veth's own link-local as a colliding real device, and
+# management_plane letting link-local-only pod veths back into the digest.
+# --------------------------------------------------------------------------- #
+def _addr_show(pairs: list[tuple[str, str]]) -> str:
+    """An `ip -j -o addr show` document for the given (scope, local) pairs."""
+    return json.dumps(
+        [
+            {
+                "addr_info": [
+                    {
+                        "family": "inet6" if ":" in local else "inet",
+                        "local": local,
+                        "prefixlen": 64 if ":" in local else 24,
+                        "scope": scope,
+                    }
+                    for scope, local in pairs
+                ]
+            }
+        ]
+    )
+
+
+def _run_returning(addresses: dict[str, list[tuple[str, str]]]) -> Any:
+    def runner(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        if command[:3] == ["ip", "-j", "-o"] and "addr" in command:
+            name = command[-1]
+            return subprocess.CompletedProcess(
+                command, 0, stdout=_addr_show(addresses.get(name, [])), stderr=""
+            )
+        return subprocess.CompletedProcess(command, 0, stdout="[]", stderr="")
+
+    return runner
+
+
+def test_net_forbid_real_ignores_the_veths_own_link_local(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "gl8-link-a1-deadbeef"
+    name = netp.interface_name(run_id, "a")
+    monkeypatch.setattr(
+        netp, "interface_link", lambda n: {"present": True, "has_device": False}
+    )
+    # An up veth carries only the kernel IPv6 link-local -> not a real device.
+    monkeypatch.setattr(netp, "run", _run_returning({name: [("link", "fe80::a")]}))
+    netp.forbid_real(run_id, name)  # must not raise
+    # A routable (global) address still marks a real device and is refused.
+    monkeypatch.setattr(
+        netp,
+        "run",
+        _run_returning({name: [("link", "fe80::a"), ("global", "10.1.2.3")]}),
+    )
+    with pytest.raises(netp.ProbeError, match="collides with a real device"):
+        netp.forbid_real(run_id, name)
+
+
+def test_net_set_link_down_does_not_refuse_its_own_interface(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "gl8-link-a1-deadbeef"
+    c = netp.interface_name(run_id, "c")
+    monkeypatch.setattr(
+        netp,
+        "interface_link",
+        lambda n: {"present": True, "has_device": False, "operstate": "up"},
+    )
+    monkeypatch.setattr(netp, "run", _run_returning({c: [("link", "fe80::c")]}))
+    emitted: dict[str, Any] = {}
+    monkeypatch.setattr(netp, "emit", lambda value: emitted.update(value))
+    netp.set_link(argparse.Namespace(run_id=run_id, slot="c", state="down"))
+    assert emitted["name"] == c
+    assert emitted["state"] == "down"
+
+
+def test_net_management_plane_excludes_link_local_only_interfaces(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run_id = "gl8-link-a1-deadbeef"
+    monkeypatch.setattr(netp, "real_interfaces", lambda rid: ["enica11b0ad", "enp71s0"])
+    monkeypatch.setattr(
+        netp, "interface_link", lambda n: _mgmt_link(has_device=(n == "enp71s0"))
+    )
+    monkeypatch.setattr(
+        netp,
+        "run",
+        _run_returning(
+            {
+                "enp71s0": [("global", "10.0.0.5")],
+                "enica11b0ad": [("link", "fe80::1")],  # pod veth: link-local only
+            }
+        ),
+    )
+    # Only the routably-addressed management interface is in the plane; the pod
+    # veth (link-local only, no device link) is excluded so its churn is ignored.
+    assert sorted(netp.management_plane(run_id)) == ["enp71s0"]
 
 
 # --------------------------------------------------------------------------- #

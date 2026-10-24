@@ -1023,6 +1023,24 @@ affected. 009 `tcp_only` is recovered from the `ProbeError` but stays
 a probe command, so the oracle sees no RetransSegs rise -- a separate harness
 gap left open, independent of interface visibility.
 
+A second `ProbeError` on the veth path survived that digest change and was caught
+live on 008 `optional_interface` (2026-10-24, after the digest fix shipped):
+`forbid_real` -- the guard the probe runs before `set-link down` so it never
+downs a real NIC -- rejected the test veth as colliding with a real device.
+Bringing a `veth` up makes the kernel auto-assign it an IPv6 link-local
+(`fe80::`, `scope link`), and `interface_addresses` counted that as a real-device
+address, so `set-link down` on the probe's own interface refused itself. The same
+link-local also let the host-side pod veths (which carry only a link-local on the
+host side) back into `management_plane`, re-exposing the digest to Pod churn.
+`interface_addresses(..., include_link_local=False)` now drops `scope link`
+addresses from both the `forbid_real` collision test and the management-plane
+membership/digest, so the probe tolerates its own and the pod veths' kernel
+link-locals while a routable (global) address or a `device` link still marks a
+real device. This recovers the three `set-link down` variants (008
+`required_link_down`, `optional_interface`, `recovery`); the other veth variants
+never call `set-link down` and were already recovered by the digest fix. Only 009
+`tcp_only` remains `INCONCLUSIVE`, for the unrelated netem gap above.
+
 ## GF-GENERAL-LIVE host/device categories (phase 2)
 
 Phase 2 adds the host/device categories 002 memory/swap, 005 shared storage,

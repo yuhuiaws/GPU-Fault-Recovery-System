@@ -8,10 +8,13 @@ last stdout line.
 It only ever creates and drives *test* interfaces named ``gfrs<digest><slot>``
 (``gfrs`` + 6 hex of the run id digest + one letter), declared required to the
 host collector by a ``collector_window_probe.py`` window the runner opens
-separately. It refuses to touch any interface that carries an address or has a
-``device`` link in sysfs -- the management ENI (``enp71s0``), the VPC-CNI ENI
-(``enp72s0``), pod veths and the EFA netdevs are all excluded by that rule -- so
-a real NIC can never be taken down. A ``veth`` pair carries a drop generator (a
+separately. It only ever operates on ``gfrs*`` test names, and even then refuses
+any that carries a routable (non-link-local) address or has a ``device`` link in
+sysfs -- the management ENI (``enp71s0``), the VPC-CNI ENI (``enp72s0``) and the
+EFA netdevs can never be taken down. The IPv6 link-local (``fe80::``) the kernel
+auto-assigns every interface as it comes up -- the probe's own test ``veth`` ends
+and host-side pod veths included -- is not a real-device address. A ``veth`` pair
+carries a drop generator (a
 raw-socket sender of oversized frames behind a small-MTU peer), a ``dummy``
 interface reads ``operstate=unknown``, and a netns peer carries a TCP flow with
 ``tc netem`` loss for the TCP-only negative. Every interface is created with a
@@ -230,7 +233,16 @@ def interface_link(name: str) -> dict[str, Any]:
     return info
 
 
-def interface_addresses(name: str) -> list[str]:
+def interface_addresses(name: str, *, include_link_local: bool = True) -> list[str]:
+    """Addresses assigned to ``name``.
+
+    ``include_link_local=False`` drops the kernel-assigned link-local addresses
+    (``scope link``: IPv6 ``fe80::/10``, IPv4 ``169.254/16``) that appear on
+    every interface the moment it is brought up -- the probe's own test ``veth``
+    ends and every host-side pod veth included -- so they are never mistaken for
+    a real device's address.
+    """
+
     completed = run(["ip", "-j", "-o", "addr", "show", "dev", name], check=False)
     try:
         documents = json.loads(completed.stdout or "[]")
@@ -240,7 +252,7 @@ def interface_addresses(name: str) -> list[str]:
         f"{addr.get('local')}/{addr.get('prefixlen')}"
         for item in documents
         for addr in item.get("addr_info", [])
-        if addr.get("local")
+        if addr.get("local") and (include_link_local or addr.get("scope") != "link")
     )
 
 
@@ -257,10 +269,11 @@ def management_plane(run_id: str) -> dict[str, Any]:
     """The stable configuration of every interface the probe must not touch.
 
     The management plane is exactly the set ``forbid_real`` protects: a non-test
-    interface that carries an address or a sysfs ``device`` link (the management
-    ENI, the VPC-CNI ENI and the EFA netdevs). Ephemeral pod veths -- no address
-    and no ``device`` link, created and torn down as Pods churn -- are not part
-    of it and are left out, as are ``VOLATILE_LINK_FIELDS`` and the per-Pod CNI
+    interface that carries a routable (non-link-local) address or a sysfs
+    ``device`` link (the management ENI, the VPC-CNI ENI and the EFA netdevs).
+    Ephemeral pod veths -- only a kernel link-local and no ``device`` link,
+    created and torn down as Pods churn -- are not part of it and are left out,
+    as are ``VOLATILE_LINK_FIELDS`` and the per-Pod CNI
     route table: the digest proves the management plane's *configuration* is
     untouched (no real interface downed, re-addressed or renumbered by creating
     a test interface), not that no packet moved on it.
@@ -269,7 +282,7 @@ def management_plane(run_id: str) -> dict[str, Any]:
     plane: dict[str, Any] = {}
     for name in real_interfaces(run_id):
         link = interface_link(name)
-        addresses = interface_addresses(name)
+        addresses = interface_addresses(name, include_link_local=False)
         if not (link.get("has_device") or addresses):
             continue
         plane[name] = {
@@ -303,7 +316,13 @@ def forbid_real(run_id: str, name: str) -> None:
     if not is_test_interface(run_id, name):
         raise ProbeError("refusing to operate on a non-test interface")
     link = interface_link(name)
-    if link.get("present") and (link.get("has_device") or interface_addresses(name)):
+    # A routable address or a sysfs ``device`` link marks a pre-existing real
+    # device. The IPv6 link-local the kernel assigns the test veth the moment it
+    # comes up must not count, or ``set-link down`` on our own interface would
+    # refuse itself (the 2026-10-24 residual 008 ProbeError after the digest fix).
+    if link.get("present") and (
+        link.get("has_device") or interface_addresses(name, include_link_local=False)
+    ):
         raise ProbeError("test interface name collides with a real device")
 
 
