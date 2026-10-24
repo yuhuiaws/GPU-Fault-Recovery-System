@@ -358,6 +358,8 @@ def test_capability_and_replay_variants_are_deferred() -> None:
     assert SPECS["notification_failure"].deferred.startswith("CAPABILITY_ABSENT"), (
         "SPECS['notification_failure'].deferred.startswith('CAPABILITY_ABSENT')"
     )
+    # The five DCGM field variants moved to the reviewed field replay
+    # (general_live_gpu_fields); this module no longer carries them.
     for variant in (
         "missing_field",
         "one_gpu_missing",
@@ -365,6 +367,4 @@ def test_capability_and_replay_variants_are_deferred() -> None:
         "nan_negative",
         "duplicate_slot",
     ):
-        assert SPECS[variant].deferred.startswith("FIXTURE_NOT_READY"), (
-            "SPECS[variant].deferred.startswith('FIXTURE_NOT_READY')"
-        )
+        assert variant not in SPECS, variant
