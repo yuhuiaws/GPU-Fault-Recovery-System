@@ -309,9 +309,12 @@ class SemanticSignalContract:
             }
         )
         (first,) = policy.evaluate_metrics(implicit)
-        assert first.diagnostic_parameters["failure_mode"] == "PCI_DEVICE_MISSING"
+        # Without a failure_mode label there is no PCI evidence: the resolved
+        # default is INVENTORY_UNAVAILABLE, which diagnoses and never reboots.
+        assert first.diagnostic_parameters["failure_mode"] == "INVENTORY_UNAVAILABLE"
+        assert first.recommended_action is RecoveryAction.RUN_DIAGNOSTICS
         acknowledge_finding(store, first, 0)
-        assert policy.evaluate_metrics(host_batch("PCI_DEVICE_MISSING", 1)) == []
+        assert policy.evaluate_metrics(host_batch("INVENTORY_UNAVAILABLE", 1)) == []
 
     @pytest.mark.parametrize("changed_field", ["severity", "action"])
     def test_host_reemits_for_changed_meaning_not_values_or_incidental_labels(
