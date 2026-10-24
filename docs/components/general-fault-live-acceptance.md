@@ -674,3 +674,41 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
 链、保留的原生解绑、不可重指的 `/sys/class/infiniband`）、032 的目录/版本/Profile 权限
 变体（AUTH-015 未配置）、017 的归属变体（需受管 attempt 与 CRI Pod 日志）、004 `probe_error`
 （`statvfs` 错误无法由只读文件 bind 产生）。
+
+### phase 2 范围与前提（DCGM 字段 / GPU 库存回放）
+
+第二批覆盖按 DCGM 字段和 GPU 库存判定的类别：019 ECC/行重映射/页退役、
+020 NVLink 错误计数、021 NVLink fabric 未训练、022 PCIe replay、024 DCGM 复合、
+026 GPU 身份/期望数，以及 phase 1 延后的 025 五个字段变体
+（missing_field/one_gpu_missing/conflicting_alias/nan_negative/duplicate_slot）。
+注入一律 `live-replay`：只替换单个原始读数，collector 解析、传输、判定、数据库、
+调度与已批准的节点动作均真实。
+
+机制（无产品代码改动）：经审查的 DCGM 字段回放工具
+`tools/gpu_dcgm_field_replay.py` 带自己的**按类别字段白名单**（与环境工具的
+`ALLOWED_FIELDS` 分离，不拓宽），以及经审查的 `nvidia-smi` 透传包装器
+`tools/nvidia_smi_inventory_replay.py`（026 身份/BDF/期望数）。两者由主机控制器
+`probes/general_live_dcgm_probe.py` 以 base64+sha256 装入 `/run/gfrs-live/<digest>/`，
+工具在 loopback 端口 `--serve`（装入即透传，`arm` 前不改任何字节），包装器仅排在
+目标单元 PATH 首位；只对一个被允许的采集单元
+`gpu-fault-metrics-collector.service` 用 `/run` drop-in（`EnvironmentFile=-`，
+覆盖 `GPU_FAULT_DCGM_METRICS_URL` / PATH / 旧 boot / 期望数），并先布置
+`systemd-run` deadman 还原；Node Agent 永不在白名单内。计数类故障只能靠产品新采的
+零增量批次清除（回退计数是 invalid delta，会保留 finding），故回放在产品接受干净
+批次前一直保持抬升值再 disarm。判定只读产品自己的记录
+（`general_live_gpu_store`/`general_live_gpu_verdicts`），绝不 POST 预制 finding。
+
+需审批与独占节点的变体：019 `pending_supported`/`post_reset` 单卡 service-window
+reset 需 `--approve GPU_RESET`；021 任一 finding 都驱动全 GPU+NVSwitch reset，故
+该类变体需 `--approve GPU_FULL_FABRIC_RESET`（`recovery_failure` 另需
+`NODE_REBOOT`）并只在 HyperPod 独占节点跑；022 的 XID 联合变体只把 DCGM last-XID
+gauge 回放为 XID 32（`--approve DCGM_XID_GAUGE`）；019 `remap_failure` 的 RMA 现场
+诊断需 `GPU_FIELD_DIAGNOSTIC`。延后：020 `independent_fatal_event`、024
+`independent_xid` 需 K 车道的可信内核 XID/SXid 源，记 `NOT_RUN(FIXTURE_NOT_READY)`；
+024 热/功耗复合复用 GF-ENV-LIVE 环境回放；019 `pending_unsupported`（无旧架构卡）、
+`observe_profile`（无 OBSERVE reset Profile）记 `CAPABILITY_ABSENT`。
+
+规格明示、注入有效但产品不足的按 `expected_outcome="FAIL"` + `product_gap` 记录，不
+掩盖：025 `one_gpu_missing`（完整性按全批 union 计算，漏查单卡）、022 `expired_xid`
+（PCIe↔XID gauge 回退无时效检查）、026 `bdf_changed`（身份只比 UUID 集）、026
+`stale_boot`（库存基线不比 source_boot_id）。

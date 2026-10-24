@@ -1036,3 +1036,45 @@ summary periods for its two fresh samples (host CPU/load, storage and host
 memory alike); and the GPU environment runner
 treats a collector unit that carries no endpoint override after the restore as
 restored to `collector.env`'s endpoint, the state its repoint started from.
+
+## GF-GENERAL-LIVE DCGM / GPU-inventory replay (phase 2)
+
+Phase 2 adds the DCGM-field and GPU-inventory categories (019 ECC/row remap/
+page retirement, 020 NVLink counters, 021 NVLink fabric state, 022 PCIe
+replay, 024 composites, 026 GPU identity, and the five 025 field variants
+phase 1 left `FIXTURE_NOT_READY`). The injection is `live-replay` only: one
+raw reading changes and the real collector parser, transport, grading,
+database, scheduling and approved node actions stay real. It is driven by a
+reviewed DCGM-field replay tool (`tools/gpu_dcgm_field_replay.py`, its own
+per-category field allow-lists, separate from the environment tool's) and a
+reviewed `nvidia-smi` inventory pass-through wrapper
+(`tools/nvidia_smi_inventory_replay.py`), both installed under `/run` with a
+sha256 check and run loopback-only / first-on-PATH by one host controller
+(`probes/general_live_dcgm_probe.py`) that repoints the single metrics
+collector through a `/run` drop-in with a deadman restore. A replay only
+proves the processing chain, never the physical fault, so every verdict is
+`proof_scope: live-replay` and the module tests
+(`tests/regional/test_general_live_gpu_*.py`, `tests/test_gpu_dcgm_field_replay.py`,
+`tests/test_nvidia_smi_inventory_replay.py`) run the verdict logic over
+scripted product records with fakes -- they are not proof of a physical
+experiment. No case has live evidence yet; every case stays `manual` /
+`NOT_RUN`.
+
+The reset-driving variants need an explicit approval and an exclusive node:
+019 `pending_supported` / `post_reset` need `--approve GPU_RESET` (a
+single-GPU service-window reset); every 021 finding drives a full GPU +
+NVSwitch reset, so those variants need `--approve GPU_FULL_FABRIC_RESET` (and
+`NODE_REBOOT` for `recovery_failure`) and run only on the HyperPod lane's
+exclusive node. 022's XID-join variants replay the DCGM last-XID gauge only as
+XID 32 (`--approve DCGM_XID_GAUGE`); 019 `remap_failure` needs
+`GPU_FIELD_DIAGNOSTIC`. Variants that need a trusted independent kernel
+XID/SXid source (020 `independent_fatal_event`, 024 `independent_xid`) are
+`NOT_RUN(FIXTURE_NOT_READY)` pending lane K's kernel-source replay; 024's
+thermal/power composite components reuse the GF-ENV-LIVE environment replay;
+019 `pending_unsupported` (no legacy GPU) and `observe_profile` (no OBSERVE
+reset profile) are `CAPABILITY_ABSENT`. The implemented verdicts record the
+product gaps the spec expects to FAIL rather than masking them: the whole-batch
+(not per-GPU) DCGM completeness check (025 `one_gpu_missing`), the PCIe<->XID
+gauge join with no age check (022 `expired_xid`), the UUID-set-only identity
+comparison (026 `bdf_changed`) and the inventory baseline that never compares
+the source boot id (026 `stale_boot`).
