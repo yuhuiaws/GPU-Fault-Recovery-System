@@ -9,6 +9,9 @@ join is re-wired to wait for it, and the sibling branches keep repairing.
 A branch that exhausts the ladder is marked exhausted; the join must not run
 and the workflow ends FAILED, which hands the outcome to the existing
 whole-workflow escalation (support / drain).
+
+A failed step of the read-only hung diagnostic DAG takes no rung: it goes on
+to its support hand-off instead (``hung_handoff.support_handoff``).
 """
 
 from __future__ import annotations
@@ -69,7 +72,8 @@ CompileSteps = Callable[
 @dataclass(frozen=True)
 class BranchEscalation:
     workflow: WorkflowRequest
-    outcome: str  # "escalated" | "exhausted"
+    # "escalated" | "exhausted" | "handoff" (``hung_handoff.support_handoff``)
+    outcome: str
     node_id: str
     branch_id: str
     next_operation: WorkflowOperation | None

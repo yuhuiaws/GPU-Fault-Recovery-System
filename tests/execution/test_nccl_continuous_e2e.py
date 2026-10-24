@@ -228,11 +228,18 @@ def test_bundle_failure_cannot_be_reported_as_training_recovered(chain):
     workflow = rig.trigger()
     rig.healthy()
     rig.bundle_unreachable = "node-b"
-    rig.run(workflow)
+    result = rig.run(workflow)
     saved = rig.store.get_workflow(workflow.request_id)
     assert rig.store.get_incident(saved.incident_id).state is IncidentState.ESCALATED, (
         saved
     )
+    # The partial bundle is evidence, not the end: the hand-off still runs and
+    # the record keeps the bundle's failure as its verdict.
+    assert result.status is WorkflowStatus.FAILED, result
+    assert Op.ESCALATE_SUPPORT in rig.boundary.calls, rig.boundary.calls
+    assert saved.terminal_failure_reason and "node-b" in (
+        saved.terminal_failure_reason
+    ), saved
     assert not FORBIDDEN & {step.operation for step in saved.official_steps}, saved
     receipts = [
         item

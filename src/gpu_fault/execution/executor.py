@@ -14,7 +14,7 @@ from pydantic import ValidationError
 
 import gpu_fault.execution.restart_budget_preflight as restart_preflight
 import gpu_fault.execution.step_bounds as step_bounds
-from gpu_fault.execution import node_rebinding, terminal_state
+from gpu_fault.execution import hung_handoff, node_rebinding, terminal_state
 from gpu_fault.execution.branch_escalation import (
     BranchEscalation,
     BranchEscalator,
@@ -615,14 +615,12 @@ class ProductionWorkflowExecutor:
                         # the batch keeps running -- a sibling node's repair
                         # is still wanted -- and the first failure is the one
                         # reported when the batch ends.
-                        batch_failure = batch_failure or (
-                            index,
-                            outcome,
-                        )
+                        batch_failure = batch_failure or (index, outcome)
                         self._save_leased(workflow, execution_epoch)
                         continue
-                    # F-N1: only this node's branch failed. It was rewritten
-                    # (next rung appended, or marked exhausted); the loop
+                    # F-N1: only this node's branch failed and was rewritten
+                    # (next rung appended, or marked exhausted), or a hung
+                    # diagnostic goes on to its support hand-off; the loop
                     # re-reads the DAG on its next pass.
                     workflow = escalation.workflow
                     steps = (
@@ -829,6 +827,8 @@ class ProductionWorkflowExecutor:
         index: int,
         outcome: WorkflowStepOutcome,
     ) -> BranchEscalation | None:
+        if handoff := hung_handoff.support_handoff(workflow, index, outcome):
+            return handoff  # a read-only hung diagnostic goes on to its hand-off
         if self.branch_escalator is None:
             return None
         if workflow.pending_failure_step_index is not None:
@@ -2208,7 +2208,7 @@ class ProductionWorkflowExecutor:
         the one enforcing the workflow deadline is in ``step_bounds``.
         """
 
-        expired = step_bounds.workflow_deadline_failure(self, workflow, step, index)
+        expired = hung_handoff.deadline_failure(self, workflow, step, index)
         if expired is not None:
             return expired
         outcome = self._dispatch_step(workflow, incident, request, step, index)
