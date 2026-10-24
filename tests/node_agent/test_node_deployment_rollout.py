@@ -677,7 +677,7 @@ def test_deploy_digest_operations_mirror_the_installer_default(tmp_path: Path) -
     the HyperPod canary wave stopped at "agents did not converge".
     """
 
-    from gpu_fault.admin.bootstrap_common import NODE_ALLOWED_OPERATIONS
+    from gpu_fault.admin.node_allowed_operations import NODE_ALLOWED_OPERATIONS
 
     _allowed, operations = _installer_efa_switch(tmp_path)
     assert sorted(operations) == sorted(NODE_ALLOWED_OPERATIONS.split(",")), (

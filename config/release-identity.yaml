@@ -45,6 +45,7 @@ renderer_inputs:
   - src/gpu_fault_release/regional_release_images.py
   - src/gpu_fault_release/regional_node_batch.py
   - src/gpu_fault/node_installer_rendering.py
+  - src/gpu_fault/admin/node_allowed_operations.py
   - deploy/node/deploy-node-installer-reconciler.sh
   - scripts/build-release-artifacts.py
   - scripts/component_wheels.py
@@ -99,6 +100,8 @@ component_inputs:
     - deploy/control-plane/tools/apply_control_plane_deployment.py
     - deploy/control-plane/tools/render-control-plane-role-split.sh
     - deploy/control-plane/tools/render_control_plane_role_split.py
+    # The Agent config digest the control plane requires is computed with this list.
+    - src/gpu_fault/admin/node_allowed_operations.py
   cpu_ingress:
     - deploy/control-plane/regional/generated/gpu-fault-api-ha-*.yaml
   cpu_worker:

@@ -175,6 +175,23 @@ def test_application_release_identity_excludes_deploy_host_inputs() -> None:
     assert "src/gpu_fault_release/rollout.py" not in config["renderer_inputs"]
 
 
+def test_the_agent_digest_operations_list_moves_the_release_id() -> None:
+    """The control plane pins the Agent config digest computed with
+    ``node_allowed_operations.NODE_ALLOWED_OPERATIONS``, so the list must be a
+    renderer and ``cpu`` input. R13 (2026-10-24): a corrected list rendered new
+    manifests under the paused release's id, and neither a resume (approved
+    manifest pin) nor ``--supersede-failed-transaction`` (same release id) could
+    apply the fix.
+    """
+
+    config = yaml.safe_load(
+        (ROOT / "config/release-identity.yaml").read_text(encoding="utf-8")
+    )
+    path = "src/gpu_fault/admin/node_allowed_operations.py"
+    assert path in config["renderer_inputs"], config["renderer_inputs"]
+    assert path in config["component_inputs"]["cpu"], config["component_inputs"]["cpu"]
+
+
 def test_refresher_manifest_has_an_independent_delivery_identity(
     tmp_path: Path,
 ) -> None:

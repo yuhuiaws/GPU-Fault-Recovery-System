@@ -332,6 +332,7 @@ rules:
     description: Bootstrap, join/remove, cleanup registry, and installation resources.
     paths:
       - src/gpu_fault/admin/bootstrap*.py
+      - src/gpu_fault/admin/node_allowed_operations.py
       - src/gpu_fault/admin/source_deploy.py
       - src/gpu_fault/admin/cluster_*.py
       - src/gpu_fault/admin/uninstall.py
