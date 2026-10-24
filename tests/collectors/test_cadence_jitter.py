@@ -213,9 +213,21 @@ def test_the_dcgm_edge_filter_summarises_once_per_phase_with_the_jitter_on(
         now=lambda: next(ticks),
         health_summary_seconds=300,
     )
-    text = (
-        'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 70\n'
-        'DCGM_FI_DEV_ECC_DBE_VOL_TOTAL{gpu="0",UUID="GPU-a"} 0\n'
+    # A complete scrape: an incomplete one is also sent once at the sustain
+    # window, which is not a summary.
+    text = 'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 70\n' + "".join(
+        f'{name}{{gpu="0",UUID="GPU-a"}} {value}\n'
+        for name, value in (
+            ("DCGM_FI_DEV_ECC_DBE_VOL_TOTAL", 0),
+            ("DCGM_FI_DEV_ROW_REMAP_FAILURE", 0),
+            ("DCGM_FI_DEV_ROW_REMAP_PENDING", 0),
+            ("DCGM_FI_DEV_PCIE_REPLAY_COUNTER", 0),
+            ("DCGM_FI_DEV_CLOCK_THROTTLE_REASONS", 0),
+            ("DCGM_FI_DEV_POWER_MGMT_LIMIT", 700),
+            ("DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL", 0),
+            ("DCGM_FI_DEV_NVLINK_RECOVERY_ERROR_COUNT_TOTAL", 0),
+            ("DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL", 0),
+        )
     )
     for _ in range(80):
         collector.collect_text(text)

@@ -352,12 +352,30 @@ DCGM_LOGGER = "gpu_fault.collectors.gpu.dcgm"
 NVIDIA_SMI_LOGGER = "gpu_fault.collectors.gpu.nvidia_smi"
 
 
+#: The rest of a complete scrape, at healthy unchanging values: an incomplete
+#: one is a delivery edge of its own once it has lasted the sustain window.
+_REQUIRED_FIELDS_TEXT = "".join(
+    f'{name}{{gpu="0",UUID="GPU-a"}} {value}\n'
+    for name, value in (
+        ("DCGM_FI_DEV_ECC_DBE_VOL_TOTAL", 0),
+        ("DCGM_FI_DEV_ROW_REMAP_FAILURE", 0),
+        ("DCGM_FI_DEV_ROW_REMAP_PENDING", 0),
+        ("DCGM_FI_DEV_PCIE_REPLAY_COUNTER", 0),
+        ("DCGM_FI_DEV_CLOCK_THROTTLE_REASONS", 0),
+        ("DCGM_FI_DEV_POWER_MGMT_LIMIT", 700),
+        ("DCGM_FI_DEV_NVLINK_CRC_FLIT_ERROR_COUNT_TOTAL", 0),
+        ("DCGM_FI_DEV_NVLINK_RECOVERY_ERROR_COUNT_TOTAL", 0),
+        ("DCGM_FI_DEV_NVLINK_REPLAY_ERROR_COUNT_TOTAL", 0),
+    )
+)
+
+
 def _power_violation_text(nanoseconds: int) -> str:
     return (
         'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 70\n'
         "DCGM_FI_DEV_POWER_VIOLATION"
         f'{{gpu="0",UUID="GPU-a"}} {nanoseconds}\n'
-    )
+    ) + _REQUIRED_FIELDS_TEXT
 
 
 def _duty_cycle_warnings(caplog: pytest.LogCaptureFixture) -> list[str]:

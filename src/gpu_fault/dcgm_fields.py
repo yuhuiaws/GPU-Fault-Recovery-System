@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from collections.abc import Mapping, Set
+
 DCGM_FABRIC_CANONICAL_GROUPS = {
     "nvlink_crc": frozenset(
         {
@@ -71,6 +73,36 @@ def missing_dcgm_metric_groups(
     missing = sorted(DCGM_CORE_CANONICAL_FIELDS - observed)
     missing.extend(missing_fabric_metric_groups(observed))
     return missing
+
+
+def missing_dcgm_metric_groups_by_gpu(
+    observed_by_gpu: Mapping[str, Set[str]],
+) -> tuple[list[str], dict[str, list[str]]]:
+    """The required groups no GPU reports, and per GPU those only it lacks.
+
+    Completeness is judged GPU by GPU: a field a sibling still reports never
+    stands in for one this GPU stopped reporting (GF-GENERAL-LIVE-025
+    ``one_gpu_missing``). The list holds the groups missing on every GPU -- a
+    scrape-wide gap such as an exporter or counters change; the mapping, in GPU
+    order, holds what each GPU lacks beyond that list. Both keep the order of
+    :func:`missing_dcgm_metric_groups`.
+    """
+
+    by_gpu = {
+        gpu: missing_dcgm_metric_groups(set(names))
+        for gpu, names in sorted(observed_by_gpu.items())
+    }
+    if not by_gpu:
+        return [], {}
+    first, *others = by_gpu.values()
+    everywhere = [
+        group for group in first if all(group in missing for missing in others)
+    ]
+    own = {
+        gpu: [group for group in missing if group not in everywhere]
+        for gpu, missing in by_gpu.items()
+    }
+    return everywhere, {gpu: groups for gpu, groups in own.items() if groups}
 
 
 def dcgm_exporter_required_expression() -> str:

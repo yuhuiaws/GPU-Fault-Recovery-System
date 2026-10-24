@@ -602,7 +602,13 @@ GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS=180
 A failed scrape is delivered as a sample-less batch carrying `collection_errors`; the control plane books it as the
 node-level WARNING `dcgm_field_completeness` (NO_ACTION, no incident) and opens the diagnostic incident only once the
 node's error batches have lasted `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` (default 180 s) back to back; the
-next clean scrape clears it.
+next clean scrape clears it. Required fields are checked per GPU: a field another GPU still reports never stands in for
+the GPU that lacks it; a group no GPU reports is `DCGM exporter is missing required fields: <groups>`, a group only some
+GPUs lack is `DCGM exporter is missing required fields on <GPU UUID>: <groups>` (a blank or non-finite value counts as
+missing). A changed gap is delivered at once (`fields-incomplete`), so is the first clean scrape after erroring batches
+(`collection-recovered`), and an unchanged gap once more when it has lasted that window since its first delivery
+(`fields-incomplete-sustained`, read from the same variable in the node's environment) -- none of them waits for a
+health summary.
 
 ## HMA Forwarding Retirement
 

@@ -1313,6 +1313,27 @@ later was clean, yet the old logic opened the diagnostic incident at once; its `
 batch cleared the finding and refused, the DRAIN successor quarantined a healthy node, and its WAITING
 diagnostic-bundle command failed the release's `rollout_wave_safety` probe and forced a rollback whose own exporter
 re-render repeated the sequence.
+**Completeness is judged GPU by GPU**: the collector's required-field check runs per GPU
+(`collectors/gpu/completeness.completeness_errors`, `dcgm_fields.missing_dcgm_metric_groups_by_gpu`) over what the
+exporter actually served and the parser kept -- a blank or non-finite slot is already gone, so it counts as
+missing, never as a healthy reading -- and a field another GPU still reports never stands in for the GPU that
+lacks it (GF-GENERAL-LIVE-025 `one_gpu_missing`; the check used to run over the union of the whole batch's
+fields, which hid the gap). A group no GPU reports keeps the old message
+`DCGM exporter is missing required fields: <groups>`; a group only some GPUs lack is reported per GPU as
+`DCGM exporter is missing required fields on <GPU UUID>: <groups>`, so the finding's reason names the GPU and the
+field group. The nvidia-smi temperature limits, cached for the process's life, are not judged, so a replaced
+GPU's old UUID is not taken for a GPU missing its fields. A change of completeness is itself a delivery edge
+(`collectors/gpu/completeness.CollectionErrorEdges`):
+errors that differ from the last delivered batch's are delivered at once (`fields-incomplete`), the first clean
+scrape after erroring batches (failed-scrape error batches included) is delivered at once
+(`collection-recovered`), and an unchanged gap is delivered once more when it has lasted
+`GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS` since its first delivery (the collecting node's own environment,
+default 180 like the control plane's) unless another delivery already covered the window
+(`fields-incomplete-sustained`), so a persisting gap opens its one diagnostic at the window at the cost of one or
+two extra deliveries, not one per tick. Before, a batch with missing fields reached the control plane only with the
+next health summary: the finding opened late, the clean batch after the recovery was filtered as an unchanged
+healthy batch so the finding cleared only at the following summary, and a persisting gap escalated only when two
+summaries both happened to be incomplete.
 Raised while a RUNNING node-exclusive chain quiesces, resets or reboots the node (the eks-managed quiesce taint evicted
 the exporter and the collector's scrape failed before the quiesce stopped it), the finding is that chain's own side
 effect and is linked to the chain's incident without a workflow of its own

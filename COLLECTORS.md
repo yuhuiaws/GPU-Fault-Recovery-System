@@ -600,6 +600,11 @@ GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS=180
 抓取失败时collector投递带`collection_errors`的空批次；控制面把它记为节点级WARNING
 `dcgm_field_completeness`（NO_ACTION，不开incident），同一节点的错误批次连续满
 `GPU_FAULT_DCGM_COLLECTION_ERROR_SUSTAIN_SECONDS`（默认180 s）才开诊断incident，下一批干净抓取即清除。
+必需字段逐GPU核对：其他GPU仍上报的同名字段不能替缺它的GPU补位；所有GPU都缺的组报
+`DCGM exporter is missing required fields: <组>`，只有部分GPU缺的组报
+`DCGM exporter is missing required fields on <GPU UUID>: <组>`（空值、非有限值按缺失计）。缺口变化即投递
+（`fields-incomplete`），错误批次后的第一批干净抓取即投递（`collection-recovered`），不变的缺口在首次投递满
+该窗口时再投递一次（`fields-incomplete-sustained`，读本节点环境中的同一变量），不必等health summary。
 
 ## HMA 转发退役
 

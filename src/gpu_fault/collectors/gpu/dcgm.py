@@ -26,7 +26,10 @@ from gpu_fault.collectors.sinks import (
     EventSink,
     deliver_or_raise,
 )
-from gpu_fault.dcgm_fields import missing_dcgm_metric_groups
+from gpu_fault.collectors.gpu.completeness import (
+    CollectionErrorEdges,
+    completeness_errors,
+)
 from gpu_fault.env import env_bool
 from gpu_fault.gpu_fabric_manager import (
     FABRIC_MANAGER_ERROR_CODE,
@@ -534,6 +537,9 @@ class DcgmMetricsCollector:
         )
         self._previous_devices: set[str] | None = None
         self._consecutive_failures = 0
+        self._collection_errors = CollectionErrorEdges(
+            self.thresholds.collection_error_sustain_seconds
+        )
 
     def collect_text(
         self,
@@ -544,6 +550,10 @@ class DcgmMetricsCollector:
     ) -> GpuMetricBatch:
         samples = parse_dcgm_samples(text)
         dcgm_sample_count = len(samples)
+        # Judged on what the exporter served: the cached nvidia-smi limits
+        # below would otherwise count a replaced GPU's old UUID as a GPU that
+        # stopped reporting every DCGM field.
+        missing_fields = completeness_errors(samples) if samples else []
         timestamp = observed_at or self.now()
         samples.extend(held_samples(samples, self._value_first_seen, timestamp))
         samples.extend(extra_samples or [])
@@ -559,8 +569,6 @@ class DcgmMetricsCollector:
                 "verify deploy/dataplane/dcgm-counters.csv and "
                 "exporter target"
             )
-        observed_fields = {sample.canonical_name for sample in samples}
-        missing_fields = missing_dcgm_metric_groups(observed_fields)
         batch = GpuMetricBatch(
             batch_id=(f"dcgm-{self.node_id}-{int(timestamp.timestamp() * 1_000_000)}"),
             cluster_id=self.context.cluster_id,
@@ -569,14 +577,7 @@ class DcgmMetricsCollector:
             collected_at=timestamp,
             source=GpuMetricSource.DCGM_EXPORTER,
             samples=samples,
-            collection_errors=(
-                [
-                    "DCGM exporter is missing required fields: "
-                    + ",".join(missing_fields)
-                ]
-                if missing_fields
-                else []
-            ),
+            collection_errors=missing_fields,
             runtime_profile_version=(self.context.runtime_profile_version),
             product=self.context.product,
             driver_branch=self.context.driver_branch,
@@ -604,6 +605,7 @@ class DcgmMetricsCollector:
             # BUFFERED exactly as for DELIVERED; only a batch that went nowhere
             # keeps the edge open (ARCH-G3).
             self._last_delivered_at = timestamp
+            self._collection_errors.delivered(batch.collection_errors, timestamp)
             self._delivered_candidate_semantics = {
                 key: (
                     self._candidate_semantics[key]
@@ -904,6 +906,9 @@ class DcgmMetricsCollector:
             >= self.health_summary_seconds
         ):
             reasons.append("health-summary")
+        if self._last_delivered_at is not None:
+            # The baseline is delivered regardless and says what it carries.
+            reasons.extend(self._collection_errors.changed(batch.collection_errors))
 
         candidates, carried_over = self._candidate_keys(batch)
         # The control plane confirms sustained environmental faults. Suppressing
@@ -969,6 +974,10 @@ class DcgmMetricsCollector:
                 and sample.value != previous
             ):
                 reasons.append(STATE_CHANGE_REASONS[sample.canonical_name])
+        if not reasons and self._collection_errors.sustained(
+            batch.collection_errors, batch.observed_at
+        ):
+            reasons.append("fields-incomplete-sustained")
         return bool(reasons), list(dict.fromkeys(reasons))
 
     def _remember_value(
@@ -1058,6 +1067,10 @@ class DcgmMetricsCollector:
             )
         except Exception:
             LOGGER.exception("DCGM collection error report was not delivered")
+        else:
+            # The scrape that ends the failure must be an edge, or the node's
+            # finding outlives the outage until the next health summary.
+            self._collection_errors.delivered(batch.collection_errors, timestamp)
 
     def next_interval_seconds(self) -> float:
         """The sleep before the next tick: the interval, doubled while failing.
