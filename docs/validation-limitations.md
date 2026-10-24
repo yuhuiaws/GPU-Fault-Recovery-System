@@ -948,6 +948,44 @@ product grades `filesystem_inodes_used_percent` like capacity, so 004
 inode signal and readmits the node through the validated restore, exactly as
 `capacity_full` does.
 
+The native storage variants (003 `scratch_full`, 004
+`capacity_full`/`duplicate`/`below_threshold`/`inode_full`, and the 006 disk
+I/O writers) build a dedicated loop or device-mapper test filesystem under
+`/mnt/gfrs-live/<digest>/<name>` and declare it to the host collector through a
+`GPU_FAULT_FILESYSTEMS` window drop-in. That mount is only useful if the
+*installed* collector can see it: the collector is a systemd unit whose mount
+namespace is cloned from the host root namespace at each (re)start, and the
+006 I/O writer runs as a `systemd-run` unit in that same host root namespace,
+while the storage probe runs in its own privileged Pod mount namespace. A plain
+`mount` in the probe therefore stayed invisible to both, and the collector's
+`statvfs` of the appended path resolved to the parent (root) filesystem -- the
+2026-10-24 live finding where the reading read ~6 % used / ~0.1 % inodes
+instead of the filled loop fs, so the variants could not fire. The storage
+probe's Pod now mounts the host root with `Bidirectional` mount propagation
+(the standard privileged node-plugin mechanism), so the test mount propagates
+out of the Pod into the host root namespace and is present when the collector
+restart clones its namespace and when the writer unit opens its files. This
+needs the privileged probe container (already set) and a node whose `/` is
+shared, which the systemd-managed EKS/AL2023 GPU nodes provide; it changes no
+product code and leaves the collector unit's own sandbox
+(`ProtectSystem=strict`, `PrivateTmp=true`) untouched. Only the storage probe
+asks for propagation; every read-only probe keeps its Pod-private default.
+
+The 006 disk-I/O variants share this probe and mechanism (a loop + device-mapper
+device mounted under the same digest directory, with a `systemd-run` O_DIRECT
+writer), so the propagation fix is a prerequisite for them too -- the writer now
+reaches the test `dm-N` device instead of the root filesystem, and
+`/proc/diskstats` (which the collector reads globally) carries that device's
+load. It is not sufficient on its own: the live run showed the native dm-I/O
+load path failing independently of mount visibility (`sustained_util` host probe
+`TimeoutExpired`, `sustained_latency` 200 ms dm-delay injector `ProbeError`).
+Making the dm-delay-backed signal reliable needs a real dm/dm-delay device this
+harness cannot exercise, so when `dm_delay` is in play `sustained_util` and
+`sustained_latency` record `NOT_RUN(FIXTURE_NOT_READY)` rather than a blind,
+unverifiable device-mapper fix; the delay-free 006 variants (`short_flush`,
+`zero_completed_io`, `counter_reset`, `recovery`) are recovered by the
+propagation fix alone.
+
 ## GF-GENERAL-LIVE host/device categories (phase 2)
 
 Phase 2 adds the host/device categories 002 memory/swap, 005 shared storage,
