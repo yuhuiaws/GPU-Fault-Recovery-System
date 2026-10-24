@@ -501,8 +501,10 @@ Node Agent ACTIVE、无未关闭 incident/工作流、必需采集通道新鲜�
 未过期的维护窗口。危险分支另需 `--approve` 令牌（绑进 `plan.json`）：
 `HOST_MEMORY_PRESSURE`（主机内存压力）、`KERNEL_MODULE_LOAD`（加载 dm_delay/
 veth/dummy/sch_netem）、`ENABLE_NODE_LOG_COLLECTOR`（临时启用被禁用的节点日志
-采集器）、`WATCHER_NETWORK_ISOLATION`、`CONTROL_PLANE_RESTART`；缺令牌记
-`NOT_RUN(NOT_AUTHORIZED)`。
+采集器）、`WATCHER_NETWORK_ISOLATION`、`CONTROL_PLANE_RESTART`、
+`DECLARE_WARM_SPARE`（经 admin CLI 声明一台热备并 cordon，清理时释放/解除 cordon）、
+`SPARE_KUBELET_STOP`（停热备上的 kubelet 使其 NotReady，带宿主机自动重启定时器）；
+缺令牌记 `NOT_RUN(NOT_AUTHORIZED)`。
 
 ### 安全
 
@@ -546,3 +548,52 @@ netdev 写进安装器/管理配置的 `GPU_FAULT_REQUIRED_INTERFACES`（默认�
 （生产默认 false）；002/003 的主机内存压力需 `HOST_MEMORY_PRESSURE` 审批；
 006 `sustained_latency`、008/009 的 veth/dummy/netem 需 `KERNEL_MODULE_LOAD`
 或预装内核模块。运行器只做只读 `--plan` 预检，`--execute` 由运维在授权窗口执行。
+
+### phase 2 范围与前提（工作负载/热备类）
+
+第二批补 011 EFA 流量停滞/NCCL hung、027 训练进度、030 热备不健康；均用受管的
+可丢弃测试任务，判定只读产品记录（011 读分组 `SITE_EFA_TRAFFIC` incident 的诊断
+DAG、027 读 `SITE_TRAINING_HEALTH` incident/决策、030 读热备分级与注解），永不
+POST 预制 finding。类别模块 `general_live_nccl`/`_progress`/`_spares`。
+
+- **011（仅 HyperPod 车道，需 `--node-b`）**：受管两节点 NCCL 任务先达 active
+  基线，再在可恢复 barrier 处让 collective 停滞、EFA 收发对落零（节点探针新增
+  `efa-traffic` 只读 `/sys/class/infiniband` hw_counters 作为独立 oracle；未落零记
+  `INCONCLUSIVE`）。60/600 秒越过后产品出 `ZERO_WARNING→HUNG_SUSPECTED`，合并同波
+  为一个工作流，编译只读诊断 DAG `FREEZE_EVIDENCE→COLLECT_HUNG_SUMMARY×2→
+  COLLECT_HUNG_TRIAGE×2→COLLECT_DIAGNOSTIC_BUNDLE→VALIDATE_FABRIC→ESCALATE_SUPPORT`
+  收尾 `ESCALATED`，全程不 cordon/停任务/reset/reboot。native 实测：`active_to_zero`、
+  `always_low`、`write_progress`、`phase_progress`、`fr_enabled`、`fr_disabled`、
+  `simultaneous_nodes`。延后留分母：规模类 `large_job`/`no_step_no_rank`/
+  `active_window_resume`（`SCALE`，本站无 128 节点任务）、需审查测试 FR dump 响应器
+  的 `fr_temporal_completion`/`fr_second_missing`/`fr_whole_group`/`few_candidates`/
+  `ambiguous_candidates`/`different_process_groups`/`fr_plus_process`、需 py-spy 故障
+  工具的 `pyspy_nonzero`、需角色声明测试任务的 `role_mismatch`/`tid_namespace`/
+  `wchan_zero`/`cpu_interval`（均 `FIXTURE_NOT_READY`）、`broken_pair`（需 sysfs 读取
+  夹具）、`attempt_change`（需可控换 attempt）、`unreachable_node`（隔离 Agent 通道
+  未授批，`NOT_AUTHORIZED`）。
+- **027（eks 或 hp 车道）**：产品训练进度 reporter 默认关闭、全局周期 monitor 必须
+  保持关闭；仅测试任务 Pod 内以 `gpu-fault-collector training-progress` sidecar 启用
+  reporter，读测试应用原子写的进度文件（启用 reporter 的源路径）。扫描类信号用
+  execution-token 的 `POST /v1/training-health/<cluster>/scan`（本集群一次），因此执行
+  前须确认该测试任务是集群内唯一 RUNNING 受管 attempt（否则整集群扫描会误报正常
+  任务 reporter 静默）。native 实测全部 9 个：`nan`（只停归属 attempt+ESCALATE，不
+  重启不 cordon，checkpoint 只作证据）、`stalled_step`、`reporter_silent`、
+  `step_regression`、`straggler_group`（同 `progress_group`）、`bounded_phase`、
+  `old_attempt`、`checkpoint_unverified`、`resumed_progress`（原 rank 新有效进度才
+  RECOVERED）。
+- **030（仅 HyperPod 车道，`--fault-node` 指向待声明热备）**：经 admin CLI 声明一台
+  空闲热备（`DECLARE_WARM_SPARE`），清理必定释放；每个阻断类变体只让该热备对分配
+  不合格一种方式，读取产品自身的分级（`HyperPodSpareCoordinator.health_reasons`
+  的分配门）并断言按正确 reason class 拒绝、且未产生任何 provider 恢复。native 实测：
+  `not_ready`（停 kubelet，需 `SPARE_KUBELET_STOP`）、`stale_metrics`（暂停 metrics
+  采集器）、`configuration_error`（注入非 AVAILABLE pool state）、`reserved_spare`
+  （注入他 incident 的 reservation，验证不被他任务复用）。本站为区域/多集群控制面
+  （`GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`），周期性 `HyperPodSpareHealth
+  Controller` 不运行，故 `confirmed_hardware`/`repair_failure`/`bounded_recheck` 记
+  `NOT_RUN(CAPABILITY_ABSENT)`；`no_spare`（无热备不回落 provider 替换）只在危险的
+  REPLACE_NODE 失败转路径可见，记 `NOT_RUN(NOT_AUTHORIZED)`。
+
+计划/执行形如 `--case GF-GENERAL-LIVE-011 --variant active_to_zero --site-file <F>
+--node-b <N2> --hyperpod-cluster <HP>`（011/030 在 hp 车道，011/030 需 `--site-file`，
+011 需 `--node-b`，030 的热备节点用 `--fault-node`）。

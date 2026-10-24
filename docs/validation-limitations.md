@@ -932,3 +932,27 @@ approval not arranged this phase (watcher network isolation, control-plane
 restart). The implemented verdicts record the known product gaps the spec
 expects to FAIL (byte-only `statvfs`, the weighted-time disk await, the empty
 required-interface list) rather than masking them.
+
+## GF-GENERAL-LIVE live acceptance runner (phase 2)
+
+Phase 2 adds the workload- and spare-centred categories through
+`general_live_nccl` (011 EFA stall / NCCL hung), `general_live_progress` (027
+training progress) and `general_live_spares` (030 warm spare unhealthy), with
+fakes-based module tests under `tests/regional/test_general_live_{nccl,progress,
+spares}.py` and an `efa-traffic` read-only command on the node probe. These are
+still plan-only by default and change no cluster state until an operator runs
+`--execute`; the module tests exercise only the injection/verdict logic against
+scripted product records and are not proof of a physical experiment.
+
+011 and 030 run on the HyperPod lane (011 needs `--node-b`, a two-node NCCL job
+genuinely stalled at a recoverable barrier until its EFA RX/TX pair, read from
+`/sys/class/infiniband` as the independent oracle, falls to zero; 030 declares
+one warm spare through the admin CLI under `DECLARE_WARM_SPARE` and always
+releases it). 027 enables the optional reporter only for its disposable test
+job (a Pod-local `training-progress` sidecar) and triggers a single per-cluster
+scan, never the global monitor. Variants that need a reviewed test
+flight-recorder dump responder, a py-spy fault tool, a role-declaration job, a
+128-node/1024-process scale, or the HyperPod spare-health controller (disabled
+in this regional control plane, `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`)
+stay `NOT_RUN` with an explicit reason in the denominator rather than being
+dropped. No GF-GENERAL-LIVE case has live evidence yet.
