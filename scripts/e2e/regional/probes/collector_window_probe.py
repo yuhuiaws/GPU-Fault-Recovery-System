@@ -78,6 +78,19 @@ OUTBOX_COLLECTORS = ("kernel", "dcgm", "host", "fabric-manager")
 WRONG_TOKEN_MARKER = "@invalid"
 OVERRIDABLE = {"GPU_FAULT_CONTROL_PLANE_TOKEN": {WRONG_TOKEN_MARKER}}
 UNSETTABLE = {"GPU_FAULT_EXPECTED_GPU_COUNT"}
+#: Lists a window may *extend* (never replace) on the host collector only, for
+#: GF-GENERAL-LIVE: one test mount of ``general_live_storage_probe.py`` and the
+#: host-local veth/dummy test interfaces of ``general_live_net_probe.py``. The
+#: node's own entries are kept in front, so the window only adds a test object.
+APPENDABLE_UNIT = "gpu-fault-host-collector.service"
+APPENDABLE = {
+    "GPU_FAULT_FILESYSTEMS": (
+        re.compile(r"^/mnt/gfrs-live/[0-9a-f]{12}/[a-z]{1,8}$"),
+        "/,/var,/tmp",
+    ),
+    "GPU_FAULT_REQUIRED_INTERFACES": (re.compile(r"^gfrs[0-9a-f]{6}[a-z]$"), ""),
+}
+MAX_APPENDED_ITEMS = 4
 #: Keys ``snapshot`` reads back from collector.env. The token is reported as a
 #: presence flag only.
 ENV_KEYS = (
@@ -506,6 +519,38 @@ def write_shadow(paths: dict[str, Path], mode: tuple[str, str, str]) -> str:
     return str(shadow_dir)
 
 
+def appended_settings(unit: str, pairs: list[str]) -> dict[str, dict[str, Any]]:
+    """The node's own list plus allow-listed test entries, per ``NAME=item``."""
+
+    items: dict[str, list[str]] = {}
+    for pair in pairs:
+        name, separator, value = pair.partition("=")
+        if not separator or name not in APPENDABLE:
+            raise ProbeError(f"{name!r} is not an appendable collector setting")
+        if unit != APPENDABLE_UNIT:
+            raise ProbeError("only the host collector's lists may be extended")
+        if APPENDABLE[name][0].fullmatch(value) is None:
+            raise ProbeError(f"{name} accepts only a test entry")
+        items.setdefault(name, [])
+        if value not in items[name]:
+            items[name].append(value)
+    result: dict[str, dict[str, Any]] = {}
+    current = parse_env() if items else {}
+    for name, values in items.items():
+        if len(values) > MAX_APPENDED_ITEMS:
+            raise ProbeError(
+                f"{name} accepts at most {MAX_APPENDED_ITEMS} test entries"
+            )
+        base = [
+            item for item in current.get(name, APPENDABLE[name][1]).split(",") if item
+        ]
+        result[name] = {
+            "items": values,
+            "value": ",".join([*base, *[item for item in values if item not in base]]),
+        }
+    return result
+
+
 def dropin_path(unit: str, run_id: str) -> Path:
     return Path("/run/systemd/system") / f"{unit}.d" / dropin_name(run_id)
 
@@ -535,6 +580,8 @@ def _open_window(arguments: argparse.Namespace) -> None:
         if (arguments.shadow_nvidia_smi)
         else None
     )
+    appended = appended_settings(unit, list(getattr(arguments, "append_env", [])))
+    overrides.update({name: value["value"] for name, value in appended.items()})
     if not overrides and not unset and shadow is None:
         raise ProbeError("a window must override, unset or shadow something")
     before = unit_state(unit)
@@ -552,6 +599,7 @@ def _open_window(arguments: argparse.Namespace) -> None:
         "unit": unit,
         "opened_at": datetime.now(timezone.utc).isoformat(),
         "overrides": sorted(overrides),
+        "appended": {name: value["items"] for name, value in appended.items()},
         "unset": unset,
         "shadow": list(shadow) if shadow is not None else None,
         "dropin": str(dropin),
@@ -1176,6 +1224,7 @@ def parser() -> argparse.ArgumentParser:
     opened.add_argument("--env", action="append", default=[])
     opened.add_argument("--unset", action="append", default=[])
     opened.add_argument("--shadow-nvidia-smi", default="")
+    opened.add_argument("--append-env", action="append", default=[])
     opened.add_argument("--restore-seconds", type=int, default=600)
     opened.set_defaults(handler=open_window)
 

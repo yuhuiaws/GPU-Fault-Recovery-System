@@ -1,0 +1,349 @@
+"""Read-only control-plane reads of the GF-GENERAL-LIVE runner.
+
+Verdicts read only the product's own records -- accepted host/GPU batches,
+health-signal states, latest metrics, incidents, markers, workflows with their
+step executions, remote commands, notifications, completion decisions and the
+restart-budget ledger -- through ``RegionalLiveFixture.cpu_python`` (the
+installed control-plane interpreter inside an API Pod). Nothing here writes to
+the store; the runner never posts a prefabricated finding or workflow.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Iterable, Sequence
+from datetime import datetime
+from typing import Any, Protocol
+
+
+class CpuPython(Protocol):
+    def cpu_python(
+        self, script: str, *arguments: str, **options: Any
+    ) -> dict[str, Any]: ...
+
+
+#: What a variant may start from: no open incident or workflow on the node,
+#: a current Agent, fresh collector channels.
+PREFLIGHT_PROBE = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.models import IncidentState
+from gpu_fault.store import NotFoundError
+
+cluster_id, node_id = sys.argv[1:]
+store = ApplicationContext.from_environment().store
+try:
+    agent = store.get_agent(cluster_id, node_id).model_dump(mode="json")
+except NotFoundError:
+    agent = None
+try:
+    registration = store.get_regional_cluster(cluster_id).model_dump(mode="json")
+except NotFoundError:
+    registration = None
+open_states = [
+    IncidentState.DETECTED,
+    IncidentState.ACTION_PENDING,
+    IncidentState.SAFETY_PENDING,
+    IncidentState.ESCALATED,
+    IncidentState.QUARANTINED,
+]
+incidents = [
+    {
+        "incident_id": item.incident_id,
+        "state": item.state.value,
+        "event_type": item.event_type,
+        "created_at": item.created_at.isoformat(),
+        "workflow_request_id": item.workflow_request_id,
+    }
+    for item in store.list_incidents_by_state(
+        cluster_id, open_states, node_ids={node_id}
+    )
+]
+active = [
+    {"incident_id": incident.incident_id, "request_id": workflow.request_id,
+     "status": workflow.status.value}
+    for incident, workflow in store.list_active_workflow_incidents(
+        cluster_id, node_ids={node_id}
+    )
+]
+statuses = [
+    item.model_dump(mode="json")
+    for item in store.list_collector_statuses(cluster_id, node_id)
+]
+print(json.dumps({
+    "agent": agent,
+    "registration": {
+        key: (registration or {}).get(key)
+        for key in (
+            "cluster_id", "provider", "lifecycle_state", "enabled", "runtime_profile_version"
+        )
+    } if registration else None,
+    "open_incidents": incidents,
+    "active_workflows": active,
+    "collector_statuses": statuses,
+}, sort_keys=True, default=str))
+"""
+
+#: Everything the product recorded about one node since a moment.
+ACTIVITY_PROBE = r"""
+import json
+import sys
+from datetime import datetime
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.models import IncidentState
+from gpu_fault.store import NotFoundError
+from gpu_fault.telemetry import EvidenceKind
+
+cluster_id, node_id, since_text, metrics_text, signals_text, kinds_text = sys.argv[1:7]
+since = datetime.fromisoformat(since_text.replace("Z", "+00:00"))
+metrics = {item for item in metrics_text.split(",") if item}
+signals = [item for item in signals_text.split(",") if item]
+kinds = [item for item in kinds_text.split(",") if item]
+store = ApplicationContext.from_environment().store
+
+
+def batch_view(item):
+    payload = item.payload if isinstance(item.payload, dict) else {}
+    samples = payload.get("samples") or []
+    return {
+        "record_id": item.record_id,
+        "kind": str(item.kind),
+        "observed_at": item.observed_at.isoformat(),
+        "batch_id": payload.get("batch_id"),
+        "received_at": payload.get("received_at"),
+        "edge_filter_reasons": payload.get("edge_filter_reasons") or [],
+        "collection_errors": payload.get("collection_errors") or [],
+        "sample_count": len(samples),
+        "samples": [
+            {
+                "name": sample.get("name"),
+                "device": sample.get("device"),
+                "value": sample.get("value"),
+                "labels": sample.get("labels") or {},
+            }
+            for sample in samples
+            if isinstance(sample, dict) and sample.get("name") in metrics
+        ],
+    }
+
+
+batches = []
+for kind in kinds:
+    for item in store.list_raw_evidence(
+        cluster_id, node_id=node_id, kind=EvidenceKind(kind), limit=2000
+    ):
+        if item.observed_at >= since:
+            batches.append(batch_view(item))
+batches.sort(key=lambda item: item["observed_at"])
+incidents = {}
+for incident in store.list_incidents_by_state(
+    cluster_id, list(IncidentState), node_ids={node_id}
+):
+    if incident.created_at >= since:
+        incidents[incident.incident_id] = incident
+workflows = {}
+for workflow in store.list_workflows(limit=500, newest_first=True):
+    if workflow.created_at < since:
+        continue
+    if workflow.incident_id in incidents:
+        workflows[workflow.request_id] = workflow
+        continue
+    try:
+        incident = store.get_incident(workflow.incident_id)
+    except NotFoundError:
+        continue
+    if incident.cluster_id == cluster_id and node_id in incident.node_ids:
+        incidents[incident.incident_id] = incident
+        workflows[workflow.request_id] = workflow
+for incident in incidents.values():
+    if incident.workflow_request_id and incident.workflow_request_id not in workflows:
+        try:
+            workflows[incident.workflow_request_id] = store.get_workflow(
+                incident.workflow_request_id
+            )
+        except NotFoundError:
+            pass
+markers = []
+for incident_id in incidents:
+    markers.extend(
+        item.model_dump(mode="json") for item in store.list_markers_for_incident(incident_id)
+    )
+commands = (
+    [
+        item.model_dump(mode="json", exclude={"lease_token"})
+        for item in store.list_remote_commands(workflow_request_ids=list(workflows))
+    ]
+    if workflows
+    else []
+)
+health = {}
+for key in signals:
+    state = store.get_health_signal_state(key)
+    health[key] = state.model_dump(mode="json") if state is not None else None
+latest = [
+    {
+        "name": item.name,
+        "device": item.device,
+        "value": item.value,
+        "observed_at": item.observed_at.isoformat(),
+        "labels": item.labels,
+    }
+    for item in store.list_telemetry_metrics_latest(cluster_id, node_id)
+    if not metrics or item.name in metrics or item.name == "collector_observation_valid"
+]
+notifications = []
+for notification in store.list_notifications(limit=500, newest_first=True):
+    if notification.created_at < since:
+        continue
+    text = "\n".join(
+        (notification.deduplication_key, notification.subject, notification.body_text)
+    )
+    if node_id not in text:
+        continue
+    result = store.get_notification_result(notification.notification_id)
+    notifications.append({
+        "notification_id": notification.notification_id,
+        "incident_id": notification.incident_id,
+        "category": notification.category,
+        "deduplication_key": notification.deduplication_key,
+        "created_at": notification.created_at.isoformat(),
+        "subject": notification.subject,
+        "status": result.status.value if result else None,
+    })
+try:
+    agent = store.get_agent(cluster_id, node_id).model_dump(mode="json")
+except NotFoundError:
+    agent = None
+print(json.dumps({
+    "since": since.isoformat(),
+    "batches": batches,
+    "incidents": [item.model_dump(mode="json") for item in incidents.values()],
+    "workflows": [item.model_dump(mode="json") for item in workflows.values()],
+    "markers": markers,
+    "commands": commands,
+    "health_signals": health,
+    "metric_latest": latest,
+    "collector_statuses": [
+        item.model_dump(mode="json")
+        for item in store.list_collector_statuses(cluster_id, node_id)
+    ],
+    "notifications": notifications,
+    "agent": agent,
+}, sort_keys=True, default=str))
+"""
+
+#: One training attempt's completion records and its job's restart ledger.
+ATTEMPT_PROBE = r"""
+import json
+import sys
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.store import NotFoundError
+
+cluster_id, job_id, *attempt_ids = sys.argv[1:]
+store = ApplicationContext.from_environment().store
+attempts = {}
+for attempt_id in attempt_ids:
+    entry = {}
+    try:
+        entry["event"] = store.get_event_by_attempt(cluster_id, attempt_id).model_dump(mode="json")
+    except NotFoundError:
+        entry["event"] = None
+    try:
+        entry["decision"] = store.get_decision_by_attempt(cluster_id, attempt_id).model_dump(mode="json")
+    except NotFoundError:
+        entry["decision"] = None
+    containment = store.get_incident_by_event(
+        f"{cluster_id}/{attempt_id}/TrainingAttemptFailureDetected"
+    )
+    entry["containment_incident"] = (
+        containment.model_dump(mode="json") if containment is not None else None
+    )
+    recovery = []
+    for incident, workflow in store.list_job_recovery_workflow_incidents(
+        cluster_id, job_id, attempt_id, include_terminal=True
+    ):
+        recovery.append({
+            "incident": incident.model_dump(mode="json"),
+            "workflow": workflow.model_dump(mode="json"),
+        })
+    entry["recovery"] = recovery
+    workflows = []
+    if containment is not None and containment.workflow_request_id:
+        try:
+            workflows.append(store.get_workflow(containment.workflow_request_id).model_dump(mode="json"))
+        except NotFoundError:
+            pass
+    entry["containment_workflows"] = workflows
+    attempts[attempt_id] = entry
+try:
+    budget = store.get_restart_budget(cluster_id, job_id).model_dump(mode="json")
+except NotFoundError:
+    budget = None
+print(json.dumps({"attempts": attempts, "restart_budget": budget}, sort_keys=True, default=str))
+"""
+
+
+def preflight_state(regional: CpuPython, cluster_id: str, node: str) -> dict[str, Any]:
+    return regional.cpu_python(PREFLIGHT_PROBE, cluster_id, node)
+
+
+def node_activity(
+    regional: CpuPython,
+    cluster_id: str,
+    node: str,
+    since: datetime,
+    *,
+    metrics: Iterable[str] = (),
+    signal_keys: Iterable[str] = (),
+    kinds: Sequence[str] = ("HOST_TELEMETRY",),
+) -> dict[str, Any]:
+    for value in (*metrics, *signal_keys, *kinds):
+        if "," in value or not value:
+            raise ValueError("activity probe filters must be non-empty, no comma")
+    return regional.cpu_python(
+        ACTIVITY_PROBE,
+        cluster_id,
+        node,
+        since.isoformat(),
+        ",".join(sorted(set(metrics))),
+        ",".join(signal_keys),
+        ",".join(kinds),
+        timeout=240,
+    )
+
+
+def attempt_records(
+    regional: CpuPython, cluster_id: str, job_id: str, attempt_ids: Sequence[str]
+) -> dict[str, Any]:
+    if not attempt_ids or any("," in item or not item for item in attempt_ids):
+        raise ValueError("attempt ids must be non-empty")
+    return regional.cpu_python(ATTEMPT_PROBE, cluster_id, job_id, *attempt_ids)
+
+
+def signal_key(
+    cluster_id: str,
+    node: str,
+    metric: str,
+    device: str | None = None,
+    rule_id: str | None = None,
+) -> str:
+    """``health_signal_key`` of ``gpu_fault.store.shared.health_signals``."""
+
+    parts = [cluster_id, node, metric, device or "node"]
+    if rule_id:
+        parts.append(rule_id)
+    return "/".join(parts)
+
+
+__all__ = [
+    "ACTIVITY_PROBE",
+    "ATTEMPT_PROBE",
+    "PREFLIGHT_PROBE",
+    "attempt_records",
+    "node_activity",
+    "preflight_state",
+    "signal_key",
+]

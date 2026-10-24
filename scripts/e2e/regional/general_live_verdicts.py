@@ -1,0 +1,389 @@
+"""Chain checks shared by the GF-GENERAL-LIVE category modules.
+
+Every function reads documents ``general_live_store.node_activity`` returned --
+the product's accepted batches, incidents, markers, workflows with their step
+executions, health signals and notifications -- or the runner's own oracle
+records, and answers with a list of human-readable errors (empty means the
+check holds). The verdict of a variant is ``PASS`` only when every stage list
+is empty; ``INCONCLUSIVE`` is reserved for an injection the oracle did not see.
+"""
+
+from __future__ import annotations
+
+import math
+import re
+from collections.abc import Callable, Iterable, Sequence
+from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Any
+
+from scripts.e2e.regional.general_live_registry import HARDWARE_OPERATIONS
+
+TERMINAL_WORKFLOWS = frozenset({"SUCCEEDED", "FAILED", "BLOCKED", "SUPERSEDED"})
+VALIDATIONS = frozenset({"VALIDATE_GPU", "VALIDATE_HOST", "VALIDATE_FABRIC"})
+HOST_DIAGNOSTIC_FAILURE = "host_diagnostic_failure"
+
+
+def parse_time(value: Any) -> datetime | None:
+    if not isinstance(value, str) or not value:
+        return None
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def safe_device(value: str | None) -> str:
+    """``NodeHealthPolicy._safe`` -- the device segment of a finding's event id."""
+
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", value or "node")[:160]
+
+
+def finding_incidents(
+    activity: dict[str, Any],
+    metric: str,
+    *,
+    device: str | None = None,
+    rule_id: str | None = None,
+) -> list[dict[str, Any]]:
+    """NODE_HEALTH incidents minted by ``metric`` (on ``device``) since the read.
+
+    A metric finding's event id is ``<batch>-<metric>-<device|node>`` and a
+    sustained finding's adds ``-<rule id lower>`` (``host_health.py``); the
+    incident id is ``inc-<event id>``.
+    """
+
+    suffix = f"-{metric}-{safe_device(device)}" if device is not None else f"-{metric}-"
+    result = []
+    for incident in activity.get("incidents") or []:
+        if incident.get("event_type") != "NODE_HEALTH":
+            continue
+        event_id = str(incident.get("event_id") or "")
+        if rule_id is not None:
+            if not event_id.endswith(f"-{rule_id.lower()}"):
+                continue
+            event_id = event_id[: -len(rule_id) - 1]
+        if device is not None and not event_id.endswith(suffix):
+            continue
+        if device is None and suffix not in event_id + "-":
+            continue
+        result.append(incident)
+    return sorted(result, key=lambda item: str(item.get("created_at")))
+
+
+def workflows_of(activity: dict[str, Any], incident_id: str) -> list[dict[str, Any]]:
+    return sorted(
+        (
+            item
+            for item in activity.get("workflows") or []
+            if item.get("incident_id") == incident_id
+        ),
+        key=lambda item: str(item.get("created_at")),
+    )
+
+
+def operations(workflow: dict[str, Any]) -> list[str]:
+    return [str(step.get("operation")) for step in workflow.get("official_steps") or []]
+
+
+def executions(workflow: dict[str, Any], operation: str) -> list[dict[str, Any]]:
+    return [
+        item
+        for item in workflow.get("step_executions") or []
+        if item.get("operation") == operation
+    ]
+
+
+def final_execution(workflow: dict[str, Any], operation: str) -> dict[str, Any] | None:
+    items = executions(workflow, operation)
+    terminal = [item for item in items if item.get("status") in {"SUCCEEDED", "FAILED"}]
+    if terminal:
+        return sorted(terminal, key=lambda item: str(item.get("updated_at")))[-1]
+    return items[-1] if items else None
+
+
+def step_parameters(workflow: dict[str, Any], operation: str) -> list[dict[str, Any]]:
+    return [
+        dict(step.get("parameters") or {})
+        for step in workflow.get("official_steps") or []
+        if step.get("operation") == operation
+    ]
+
+
+def samples(
+    activity: dict[str, Any],
+    metric: str,
+    *,
+    device: str | None = None,
+) -> list[dict[str, Any]]:
+    """Every accepted batch sample of ``metric`` with its batch's time."""
+
+    result = []
+    for batch in activity.get("batches") or []:
+        for sample in batch.get("samples") or []:
+            if sample.get("name") != metric:
+                continue
+            if device is not None and sample.get("device") != device:
+                continue
+            result.append(
+                {
+                    **sample,
+                    "observed_at": batch.get("observed_at"),
+                    "batch_id": batch.get("batch_id"),
+                    "edge_filter_reasons": batch.get("edge_filter_reasons") or [],
+                }
+            )
+    return sorted(result, key=lambda item: str(item["observed_at"]))
+
+
+def breaching(
+    sample: dict[str, Any], threshold: float, comparison: str = "gte"
+) -> bool:
+    value = sample.get("value")
+    if not isinstance(value, (int, float)) or not math.isfinite(value):
+        return False
+    return value >= threshold if comparison == "gte" else value <= threshold
+
+
+@dataclass
+class ChainExpectation:
+    """What the product must have done for one finding (or must not have)."""
+
+    metric: str
+    device: str | None = None
+    rule_id: str | None = None
+    present: bool = True
+    #: Operations that must appear, in this order, in the incident's workflow.
+    operations: tuple[str, ...] = ()
+    #: The validation that must have run, and whether it may succeed.
+    validation: str | None = None
+    validation_must_fail: bool = False
+    #: Terminal incident states accepted for the incident.
+    incident_states: frozenset[str] = frozenset()
+    #: Operations that must not appear anywhere in the incident's workflows.
+    forbidden: frozenset[str] = HARDWARE_OPERATIONS
+    single: bool = True
+    probe_metric: str | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+def subsequence(wanted: Sequence[str], actual: Sequence[str]) -> bool:
+    iterator = iter(actual)
+    return all(item in iterator for item in wanted)
+
+
+def chain_errors(activity: dict[str, Any], expectation: ChainExpectation) -> list[str]:
+    """The finding -> incident -> workflow -> step trace of one expectation."""
+
+    incidents = finding_incidents(
+        activity,
+        expectation.metric,
+        device=expectation.device,
+        rule_id=expectation.rule_id,
+    )
+    label = expectation.metric + (
+        f" on {expectation.device}" if expectation.device is not None else ""
+    )
+    if not expectation.present:
+        return [
+            f"unexpected {label} incident {item['incident_id']}" for item in incidents
+        ]
+    if not incidents:
+        return [f"no {label} finding reached an incident"]
+    errors = []
+    if expectation.single and len(incidents) > 1:
+        errors.append(
+            f"{len(incidents)} {label} incidents (expected one): "
+            + ", ".join(str(item["incident_id"]) for item in incidents)
+        )
+    incident = incidents[0]
+    workflows = workflows_of(activity, str(incident["incident_id"]))
+    if not workflows:
+        return [*errors, f"{label} incident {incident['incident_id']} has no workflow"]
+    workflow = workflows[0]
+    if expectation.single and len(workflows) > 1:
+        errors.append(f"{label} incident has {len(workflows)} workflows")
+    steps = operations(workflow)
+    if expectation.operations and not subsequence(expectation.operations, steps):
+        errors.append(
+            f"{label} workflow steps {steps} lack {list(expectation.operations)}"
+        )
+    for item in workflows:
+        found = sorted(set(operations(item)) & set(expectation.forbidden))
+        if found:
+            errors.append(f"{label} workflow {item['request_id']} plans {found}")
+    if expectation.validation is not None:
+        execution = final_execution(workflow, expectation.validation)
+        if execution is None:
+            errors.append(f"{label} workflow never executed {expectation.validation}")
+        elif expectation.validation_must_fail:
+            if execution.get("status") == "SUCCEEDED":
+                errors.append(
+                    f"{expectation.validation} succeeded while the fault was still held"
+                )
+            elif execution.get("status") == "FAILED" and not (
+                execution.get("details") or {}
+            ).get(HOST_DIAGNOSTIC_FAILURE):
+                errors.append(
+                    f"{expectation.validation} failed without host_diagnostic_failure"
+                )
+        elif execution.get("status") != "SUCCEEDED":
+            errors.append(
+                f"{expectation.validation} ended {execution.get('status')}: "
+                f"{str(execution.get('error') or '')[:200]}"
+            )
+    if expectation.probe_metric is not None:
+        probes = [
+            parameters.get("host_diagnostic_probe")
+            for name in VALIDATIONS
+            for parameters in step_parameters(workflow, name)
+        ]
+        if not any(
+            isinstance(probe, dict) and probe.get("metric") == expectation.probe_metric
+            for probe in probes
+        ):
+            errors.append(
+                f"no validation step carries a host_diagnostic_probe on "
+                f"{expectation.probe_metric}"
+            )
+    if (
+        expectation.incident_states
+        and incident.get("state") not in expectation.incident_states
+    ):
+        errors.append(
+            f"{label} incident is {incident.get('state')}, expected one of "
+            f"{sorted(expectation.incident_states)}"
+        )
+    return errors
+
+
+def hardware_errors(
+    activity: dict[str, Any], *, allowed: Iterable[str] = ()
+) -> list[str]:
+    """No workflow on the node planned a hardware operation."""
+
+    permitted = set(allowed)
+    errors = []
+    for workflow in activity.get("workflows") or []:
+        found = sorted((set(operations(workflow)) & HARDWARE_OPERATIONS) - permitted)
+        if found:
+            errors.append(f"workflow {workflow.get('request_id')} plans {found}")
+    return errors
+
+
+def isolation_operations(activity: dict[str, Any]) -> list[str]:
+    found = []
+    for workflow in activity.get("workflows") or []:
+        for operation in operations(workflow):
+            if operation in {"MARK_UNSCHEDULABLE", "QUARANTINE", "STOP_WORKLOADS"}:
+                found.append(f"{workflow.get('request_id')}:{operation}")
+    return found
+
+
+def settled(activity: dict[str, Any], incident_ids: Iterable[str]) -> bool:
+    """Every workflow of ``incident_ids`` has reached a terminal status."""
+
+    wanted = set(incident_ids)
+    workflows = [
+        item
+        for item in activity.get("workflows") or []
+        if item.get("incident_id") in wanted
+    ]
+    return bool(workflows) and all(
+        str(item.get("status")) in TERMINAL_WORKFLOWS for item in workflows
+    )
+
+
+def detection_seconds(
+    activity: dict[str, Any], incident: dict[str, Any], started: datetime
+) -> float | None:
+    created = parse_time(incident.get("created_at"))
+    return (created - started).total_seconds() if created is not None else None
+
+
+def oracle_values(
+    records: Sequence[dict[str, Any]], getter: Callable[[dict[str, Any]], Any]
+) -> list[float]:
+    values = []
+    for record in records:
+        value = getter(record)
+        if isinstance(value, (int, float)) and math.isfinite(value):
+            values.append(float(value))
+    return values
+
+
+def sustained(
+    values: Sequence[float], predicate: Callable[[float], bool], minimum: int
+) -> bool:
+    """At least ``minimum`` consecutive readings satisfy ``predicate``."""
+
+    run = 0
+    for value in values:
+        run = run + 1 if predicate(value) else 0
+        if run >= minimum:
+            return True
+    return False
+
+
+def notification_errors(
+    activity: dict[str, Any],
+    *,
+    incident_ids: Iterable[str],
+    expected_at_most: int = 1,
+) -> list[str]:
+    wanted = set(incident_ids)
+    mails = [
+        item
+        for item in activity.get("notifications") or []
+        if item.get("incident_id") in wanted
+    ]
+    if len(mails) > expected_at_most:
+        return [
+            f"{len(mails)} notifications for one incident (expected at most {expected_at_most})"
+        ]
+    return []
+
+
+def node_isolated(node: dict[str, Any]) -> bool:
+    return bool(
+        node.get("unschedulable")
+        or node.get("ownership_annotations")
+        or [
+            item
+            for item in node.get("taints") or []
+            if str(item.get("key", "")).startswith("gpu-fault.io/")
+        ]
+    )
+
+
+def verdict(
+    stages: dict[str, list[str]], *, inconclusive: list[str] | None = None
+) -> str:
+    if inconclusive:
+        return "INCONCLUSIVE"
+    return "PASS" if not any(stages.values()) else "FAIL"
+
+
+__all__ = [
+    "ChainExpectation",
+    "HOST_DIAGNOSTIC_FAILURE",
+    "TERMINAL_WORKFLOWS",
+    "breaching",
+    "chain_errors",
+    "detection_seconds",
+    "executions",
+    "final_execution",
+    "finding_incidents",
+    "hardware_errors",
+    "isolation_operations",
+    "node_isolated",
+    "notification_errors",
+    "operations",
+    "oracle_values",
+    "parse_time",
+    "safe_device",
+    "samples",
+    "settled",
+    "step_parameters",
+    "subsequence",
+    "sustained",
+    "verdict",
+    "workflows_of",
+]
