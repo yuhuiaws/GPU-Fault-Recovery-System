@@ -1,0 +1,132 @@
+schema_version: 1
+scope: general-fault-categories-32
+execution_verdict: NOT_RUN
+rows:
+  - number: 1
+    cases: [GF-GENERAL-LIVE-001]
+    proof_modes: [native, live-replay]
+    variants: [cpu_busy, load_average, short_burst, recovery, invalid_delta, checkpoint_phase]
+  - number: 2
+    cases: [GF-GENERAL-LIVE-002]
+    proof_modes: [native, live-replay]
+    variants: [memory_pressure, swap_pressure, no_swap, cgroup_only, read_failure, recovery]
+  - number: 3
+    cases: [GF-GENERAL-LIVE-003]
+    proof_modes: [native, live-replay]
+    variants: [gpu_idle, rank_cpu_idle, low_available_memory, high_page_cache, scratch_full, idle_node, attempt_change, ambiguous_ownership]
+  - number: 4
+    cases: [GF-GENERAL-LIVE-004]
+    proof_modes: [native, live-replay]
+    variants: [capacity_full, below_threshold, inode_full, read_only, required_mount_missing, probe_error, duplicate]
+  - number: 5
+    cases: [GF-GENERAL-LIVE-005]
+    proof_modes: [native, live-replay]
+    variants: [stat_timeout, capacity_full, mount_disappears, io_only_failure, healthy_other_mount, shared_failure_domain, recovery]
+  - number: 6
+    cases: [GF-GENERAL-LIVE-006]
+    proof_modes: [native, live-replay]
+    variants: [sustained_util, sustained_latency, short_flush, zero_completed_io, counter_reset, reference_iostat, recovery]
+  - number: 7
+    cases: [GF-GENERAL-LIVE-007]
+    proof_modes: [live-replay, vendor-lab]
+    variants: [health_failed, query_failed, scan_failed, malformed_json, tool_missing, unsupported_device, healthy]
+  - number: 8
+    cases: [GF-GENERAL-LIVE-008]
+    proof_modes: [native, live-replay]
+    variants: [required_link_down, interface_missing, unknown_state, statistics_failed, optional_interface, empty_required_list, bond_vf, recovery]
+  - number: 9
+    cases: [GF-GENERAL-LIVE-009]
+    proof_modes: [native, live-replay]
+    variants: [errors_delta, sustained_drops, short_drops, tcp_only, counter_reset, wrong_interface, recovery]
+  - number: 10
+    cases: [GF-GENERAL-LIVE-010]
+    proof_modes: [live-replay, vendor-lab]
+    variants: [rdma_error, link_inactive, rnr, retry, cq_error, missing_counter, ethtool_failed, non_efa, counter_reset]
+  - number: 11
+    cases: [GF-GENERAL-LIVE-011]
+    proof_modes: [native, live-replay]
+    variants: [active_to_zero, always_low, write_progress, phase_progress, broken_pair, attempt_change, fr_enabled, fr_disabled, simultaneous_nodes, unreachable_node, large_job, few_candidates, ambiguous_candidates, different_process_groups, no_step_no_rank, active_window_resume, fr_temporal_completion, fr_second_missing, fr_whole_group, pyspy_nonzero, role_mismatch, tid_namespace, wchan_zero, cpu_interval, fr_plus_process]
+  - number: 12
+    cases: [GF-GENERAL-LIVE-012]
+    proof_modes: [live-replay, vendor-lab]
+    variants: [confirmed_missing, single_sample, query_failed, proc_unreadable, expectation_wrong, reboot_verified, post_reboot_failure]
+  - number: 13
+    cases: [GF-GENERAL-LIVE-013]
+    proof_modes: [native, live-replay, vendor-lab]
+    variants: [pci_missing, driver_unbound, link_inactive, excess_device, unknown_inventory, unreadable_state, bind_failure, post_repair_failure]
+  - number: 14
+    cases: [GF-GENERAL-LIVE-014]
+    proof_modes: [native, live-replay]
+    variants: [gpu_plugin, efa_plugin, one_sample, replacement_uid, expected_unknown, mig_timeslicing, validation_failure, running_training]
+  - number: 15
+    cases: [GF-GENERAL-LIVE-015]
+    proof_modes: [live-replay, vendor-lab]
+    variants: [critical, nonrecoverable, healthy, wrong_column, unavailable_sensor, command_failure, unsupported_bmc]
+  - number: 16
+    cases: [GF-GENERAL-LIVE-016]
+    proof_modes: [live-replay, vendor-lab]
+    variants: [uncorrectable_mce, corrected_mce, readonly_storage, rdma_fatal, kernel_lockup, user_text, old_boot, cursor_pagination, unknown_attempt]
+  - number: 17
+    cases: [GF-GENERAL-LIVE-017]
+    proof_modes: [native, live-replay]
+    variants: [cgroup_oom, nccl_error, distributed_error, live_pid, exited_pid, old_pod, cri_partial_rotation, missing_flight_recorder]
+  - number: 18
+    cases: [GF-ENV-LIVE-001, GF-ENV-LIVE-003, GF-ENV-LIVE-004, GF-ENV-LIVE-005, GF-ENV-LIVE-008, GF-ENV-LIVE-009, GF-ENV-LIVE-010, GF-ENV-LIVE-011, GF-ENV-LIVE-012]
+    proof_modes: [native, live-replay, vendor-lab]
+    variants: [absolute, tlimit, memory, warning, critical_confirmation, transient, unknown, shutdown_exception, retained_isolation, physical_cooling]
+  - number: 19
+    cases: [GF-GENERAL-LIVE-019]
+    proof_modes: [live-replay, vendor-lab]
+    variants: [volatile_dbe, corrected_ecc, aggregate_dbe, retired_delta, pending_supported, pending_unsupported, remap_failure, observe_profile, post_reset]
+  - number: 20
+    cases: [GF-GENERAL-LIVE-020]
+    proof_modes: [live-replay, vendor-lab]
+    variants: [crc, replay, recovery_counter, multiple_gpus, counter_reset, stale_sample, independent_fatal_event, recovered]
+  - number: 21
+    cases: [GF-GENERAL-LIVE-021]
+    proof_modes: [native, live-replay]
+    variants: [not_started, in_progress, failed, before_window, ungraded_product, monitor_restart, full_reset, every_gpu_success, recovery_failure]
+  - number: 22
+    cases: [GF-GENERAL-LIVE-022]
+    proof_modes: [live-replay, vendor-lab]
+    variants: [at_rate_limit, over_rate_limit, counter_reset, source_boot_change, same_gpu_xid, wrong_gpu_xid, expired_xid, recovery_evidence]
+  - number: 23
+    cases: [GF-ENV-LIVE-001, GF-ENV-LIVE-002, GF-ENV-LIVE-005, GF-ENV-LIVE-006, GF-ENV-LIVE-007, GF-ENV-LIVE-008, GF-ENV-LIVE-009, GF-ENV-LIVE-010, GF-ENV-LIVE-012]
+    proof_modes: [native, live-replay, vendor-lab]
+    variants: [real_power_cap, thermal_duration, noise, impossible_duration, power_brake, other_reason_bits, mixed_bits, unknown, physical_power_delivery]
+  - number: 24
+    cases: [GF-GENERAL-LIVE-024]
+    proof_modes: [live-replay]
+    variants: [thermal_warning, power_performance, corrected_memory, memory_failure, nvlink_multiple_gpus, fresh_components, reused_components, wrong_scope_source, independent_xid]
+  - number: 25
+    cases: [GF-GENERAL-LIVE-025]
+    proof_modes: [native, live-replay]
+    variants: [exporter_timeout, missing_field, one_gpu_missing, conflicting_alias, nan_negative, duplicate_slot, sustained_unknown, post_refresh_success]
+  - number: 26
+    cases: [GF-GENERAL-LIVE-026]
+    proof_modes: [live-replay, vendor-lab]
+    variants: [uuid_changed, bdf_changed, count_unchanged, unknown_expected_count, stale_boot, approved_rebaseline, no_unapproved_reset]
+  - number: 27
+    cases: [GF-GENERAL-LIVE-027]
+    proof_modes: [native]
+    variants: [nan, stalled_step, reporter_silent, step_regression, straggler_group, bounded_phase, old_attempt, checkpoint_unverified, resumed_progress]
+  - number: 28
+    cases: [GF-GENERAL-LIVE-028]
+    proof_modes: [native]
+    variants: [nonzero_exit, cleanup_timeout, one_restart, user_stop, controller_stop, missing_allocation, old_terminal, api_unreachable]
+  - number: 29
+    cases: [GF-GENERAL-LIVE-029]
+    proof_modes: [native, live-replay]
+    variants: [budget_consumed, hardware_chain_continues, restart_withheld, concurrent_claim, worker_restart, duplicate_event, missing_context, single_notification]
+  - number: 30
+    cases: [GF-GENERAL-LIVE-030]
+    proof_modes: [native, live-replay]
+    variants: [not_ready, stale_metrics, configuration_error, confirmed_hardware, reserved_spare, no_spare, repair_failure, bounded_recheck]
+  - number: 31
+    cases: [GF-GENERAL-LIVE-031]
+    proof_modes: [native]
+    variants: [inventory_silent, metrics_silent, host_silent, logs_silent, disabled_unit, expired_agent, inactive_cluster, notification_failure, new_success]
+  - number: 32
+    cases: [GF-GENERAL-LIVE-032]
+    proof_modes: [live-replay]
+    variants: [unknown_xid, unknown_product, missing_topology, missing_version, observe_profile, permitted_isolation, known_old_driver, duplicate]

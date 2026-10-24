@@ -110,7 +110,9 @@ def test_network_listing_failure_does_not_synthesize_link_down(
     monkeypatch.setattr(type(host_case.roots.net), "iterdir", fail)
     batch = host_case.build("_network", required_interfaces=["ens1"]).collect_once()
     assert batch.samples == []
-    assert "interface listing unavailable" in caplog.text
+    assert any(
+        "interface listing unavailable" in error for error in batch.collection_errors
+    ), batch
 
 
 @pytest.mark.parametrize("present", [False, True])

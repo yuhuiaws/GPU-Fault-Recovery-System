@@ -41,6 +41,7 @@ from tests._builders import (
 )
 from tests.hyperpod.test_hyperpod_spares import (
     coordinator,
+    hardware_evidence,
     hyperpod_node,
     kubernetes_node,
 )
@@ -135,6 +136,7 @@ def test_spare_health_retires_the_incident_markers_once_the_spare_is_healthy() -
     nodes = [hyperpod_node("worker-spare", "i-spare1", spare=True)]
     core_nodes = {"hyperpod-i-spare1": kubernetes_node(ready=False)}
     coordinator_service, store = coordinator(nodes, core_nodes)
+    hardware_evidence(store)
     store.save_profile(default_simulated_profile())
     controller = HyperPodSpareHealthController(
         coordinator_service, IncidentOrchestrator(store), store, failure_threshold=2
@@ -159,6 +161,7 @@ def test_spare_health_retires_the_incident_markers_once_the_spare_is_healthy() -
     )
     workflow = store.get_workflow(incident.workflow_request_id)
     core_nodes["hyperpod-i-spare1"]["status"]["conditions"][0]["status"] = "True"
+    hardware_evidence(store, active=False)
     store.save_workflow(copy_model(workflow, status=WorkflowStatus.SUCCEEDED))
 
     controller.scan()

@@ -261,4 +261,9 @@ def test_a_resume_inside_an_unfinished_line_is_not_reported_on_every_poll(
     assert len(warnings) == 1, (
         f"the same stalled line was reported on every poll: {len(warnings)}"
     )
-    assert _stored(state)[str(log)]["offset"] == resume
+    pending = json.loads(state.read_text())["training_log_pending"][str(log)][
+        "physical"
+    ]
+    assert pending["start"] == resume and pending["discard"], (
+        "a bounded resynchronization retains its original start until LF arrives"
+    )

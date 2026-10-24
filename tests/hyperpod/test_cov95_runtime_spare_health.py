@@ -12,6 +12,7 @@ from gpu_fault.spare_health import (
     UNAVAILABLE_AT_ANNOTATION,
 )
 from tests.hyperpod._cov95_runtime_spare_health import NODE, HealthHarness
+from tests.hyperpod.test_hyperpod_spares import hardware_evidence
 
 
 @pytest.mark.parametrize(
@@ -74,6 +75,7 @@ def test_recheck_requires_consecutive_hardware_failures_even_after_invalid_count
 ) -> None:
     h = HealthHarness(ready=False, failure_threshold=2)
     h.incident(WorkflowStatus.SUCCEEDED)
+    hardware_evidence(h.store, NODE)
     h.annotations.update(
         {HEALTH_ANNOTATION: "RECHECKING", FAILURES_ANNOTATION: counter}
     )

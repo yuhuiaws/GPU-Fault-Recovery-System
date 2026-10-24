@@ -45,6 +45,9 @@ from gpu_fault.node_agent.operations import (
 )
 from gpu_fault.node_agent.operations.clients import GpuClientsActive
 from gpu_fault.node_agent.operations.collector_outbox import CollectorOutboxRefused
+from gpu_fault.node_agent.operations.drain_p2p import recover_drain_p2p
+from gpu_fault.node_agent.operations.hung_summary import collect_hung_summary
+from gpu_fault.node_agent.observation_supervisor import ObservationIncomplete
 from gpu_fault.node_agent.operations.remediation import InstallOutcomeUnknownError
 from gpu_fault.node_agent.operations.reset import ResetProgressError
 from gpu_fault.node_agent.operations.registry import (
@@ -138,6 +141,7 @@ class NodeActionExecutor(
     #: Where the DRM devices a busy reset's display-stack release must bring
     #: back are read (``operations.display_stack``); tests point it elsewhere.
     drm_class_root: Path | None = Path("/sys/class/drm")
+    observation_runtime: Any = None
 
     def __init__(
         self,
@@ -640,6 +644,7 @@ class NodeActionExecutor(
                             OwnershipRefused,
                             GpuClientsActive,
                             GpuActivityOverlapped,
+                            ObservationIncomplete,
                         ),
                     )
                     else {}
@@ -772,6 +777,15 @@ class NodeActionExecutor(
 
     def _execute_health_snapshot(self, _command: NodeActionCommand) -> dict[str, Any]:
         return self._trigger_health_snapshot()
+
+    def _collect_hung_summary(self, command: NodeActionCommand) -> dict[str, Any]:
+        if self.observation_runtime is not None:
+            return dict(self.observation_runtime.run_command("summary", command))
+        return collect_hung_summary(self, command)
+
+    @final_ownership_boundary
+    def _recover_drain_p2p(self, command: NodeActionCommand) -> dict[str, Any]:
+        return recover_drain_p2p(self, command)
 
     @final_ownership_boundary
     def _execute_reset_gpu(self, command: NodeActionCommand) -> dict[str, Any]:

@@ -129,10 +129,10 @@ It is not a binary choice between "fully automatic" and "alert only", but graded
 | Level | Actions | Status |
 |---|---|---|
 | Alert only | AdvisoryNotification + site notification channel (`GPU_FAULT_NOTIFICATION_CHANNEL`, rendered from `spec.notifications.channel`: new sites default to `sns`, publishing to the site SNS topic; `ses` email is opt-in, and old sites with an existing SES sender keep SES; `disabled` only writes to the outbox) | Implemented, the common foundation of all levels; a persisted notification does not mean it has been sent out |
-| Evidence preservation | `FREEZE_EVIDENCE`, `COLLECT_DIAGNOSTIC_BUNDLE`, `COLLECT_HUNG_TRIAGE`, `RUN_DCGM_DIAGNOSTIC` | Implemented |
+| Evidence preservation | `FREEZE_EVIDENCE`, `COLLECT_HUNG_SUMMARY`, `COLLECT_DIAGNOSTIC_BUNDLE`, `COLLECT_HUNG_TRIAGE`, `RUN_DCGM_DIAGNOSTIC` | Implemented; full-task passive survey and bounded active diagnosis are separate stages |
 | Isolation | `MARK_UNSCHEDULABLE`, `QUARANTINE`, `RESTORE_SCHEDULING` | Implemented |
 | Stop/resume training | `STOP_WORKLOADS`, `RESTART_WORKLOAD`, `CHECKPOINT_WORKLOADS` | Implemented (Job / PyTorchJob / JobSet) |
-| Device-level repair | `RESET_GPU`, `RESET_ALL_GPUS_NVSWITCHES`, `QUIESCE_GPU_SERVICES`, `RESTORE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS` | Implemented, dispatched signed; the installer's bare default disables reset, the current HyperPod production installation enables it explicitly |
+| Device-level repair | `RESET_GPU`, `RECOVER_DRAIN_P2P`, `RESET_ALL_GPUS_NVSWITCHES`, `QUIESCE_GPU_SERVICES`, `RESTORE_GPU_SERVICES`, `VERIFY_NO_GPU_CLIENTS` | Implemented, dispatched signed; the installer's bare default disables reset, the current HyperPod production installation enables it explicitly |
 | Fabric Manager repair | `RESTART_FABRIC_MANAGER` | Implemented; the node side has an independent switch, the current HyperPod production installation enables it explicitly, and it verifies no compute client before execution and that the service is active after execution. On a graded NVSwitch node (Hopper SXM, HGX B200/B300) a restart alone loses the fabric state: a solo XID 45 is observe-only there by default (NVIDIA's GPU debug guidelines read it as informational, except on A100; the incident and the investigatory notification are recorded, the node is not touched or cordoned), and with `GPU_FAULT_XID45_SOLO_NVSWITCH_RESTART_FM=true` its `RESTART_FM` compiles to the full GPU + NVSwitch reset chain; an ungraded node (A100 included) keeps the Fabric Manager restart; a per-GPU reset's quiesce window keeps Fabric Manager running |
 | Node-level repair | `RESTART_NODE` (HyperPod `BatchRebootClusterNodes`) | Implemented, controlled by `ALLOW_HYPERPOD_REBOOT`; the current regional data-plane production manifest sets it to true |
 | Software-plane repair | `REMEDIATE_EFA_DRIVER`, `RESTART_EFA_DEVICE_PLUGIN`, `RESTART_GPU_DEVICE_PLUGIN` | Implemented; the Node installer allows EFA driver remediation by default, and an explicit `--disable-efa-driver-remediation` both disables the permission and removes its operation; does not bypass the Profile, signature and workload-stop gates |
@@ -142,11 +142,11 @@ It is not a binary choice between "fully automatic" and "alert only", but graded
 | Node replacement | `REPLACE_NODE` | **Warm spare only**; never calls `BatchReplaceClusterNodes` (v1 §2.1 constraint 2) |
 | Planning placeholder | `RESTART_VM` | Not in the production allowlist; HyperPod EKS converts NVIDIA `RESTART_VM` to `RESTART_NODE` only when the controlled mapping holds |
 
-`WorkflowOperation` in `src/gpu_fault/models.py` has 33 values in total; the production control-plane
-`GPU_FAULT_ALLOWED_OPERATIONS` allowlist admits 32 (see
+`WorkflowOperation` in `src/gpu_fault/models.py` has 35 values in total; the production control-plane
+`GPU_FAULT_ALLOWED_OPERATIONS` allowlist admits 34 (see
 `deploy/control-plane/regional/generated/`); the node-side
 application's bare default `GPU_FAULT_NODE_ALLOWED_OPERATIONS` contains only `VERIFY_NO_GPU_CLIENTS`;
-the node install script writes 11 base operations when the Agent is enabled, then appends by EFA, Field Diagnostic,
+the node install script writes 13 base operations when the Agent is enabled, then appends by EFA, Field Diagnostic,
 driver and firmware capability. The production HyperPod installation additionally enables GPU reset, fabric reset,
 service quiesce and Fabric Manager restart explicitly.
 **Present in the allowlist ≠ can actually execute**: the capability must also have a unique executable owner (§7.1).
@@ -664,7 +664,7 @@ Correspondingly:
 
 | Gate | Implementation |
 |---|---|
-| Automatic action allowlist | Control-plane `GPU_FAULT_ALLOWED_OPERATIONS` (32 items in production) + node `GPU_FAULT_NODE_ALLOWED_OPERATIONS` (bare application default 1 item; the installer writes an 11-item base list and appends by capability). Not on both allowlists → not executed |
+| Automatic action allowlist | Control-plane `GPU_FAULT_ALLOWED_OPERATIONS` (34 items in production) + node `GPU_FAULT_NODE_ALLOWED_OPERATIONS` (bare application default 1 item; the installer writes a 13-item base list and appends by capability). Not on both allowlists → not executed |
 | High-risk actions | The application/installer bare defaults turn off GPU reset and HyperPod mutation; the current HyperPod production installation explicitly enables GPU reset, fabric reset, Fabric Manager restart and `RESTART_NODE`. `ALLOW_HYPERPOD_REPLACE` and `ALLOW_WITH_AUTOMATIC_NODE_RECOVERY` are **always false** (an invariant, not a default) |
 | Manual approval | A **GPU count change** must be explicitly approved by an administrator with an exact annotation, otherwise `RESTART_WORKLOAD` waits; EFA traffic baseline changes are confirmed by the administrator via `ACCEPT_NEW_BASELINE`/`ACKNOWLEDGE_TRANSIENT` |
 | Maintenance window | There is no general "maintenance window" concept. The only similar mechanism is allowing a pinned agent generation to continue within the window during an SXID quiesce |

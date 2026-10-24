@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.spare_fault_evidence import HARDWARE_PREFIX
+
 import logging
 from datetime import datetime, timezone
 from enum import StrEnum
@@ -376,14 +378,6 @@ class HyperPodSpareHealthController:
                 incident_id=None,
             )
             return self._result(node_name, SpareHealthState.SUSPECT, reasons)
-        if not self._hardware_reasons(reasons):
-            return self._defer_non_hardware(
-                node_name,
-                reasons,
-                failures=failures,
-                incident_id=None,
-            )
-
         existing_incident = self._active_remediation(node)
         if existing_incident is not None:
             self._patch(
@@ -399,6 +393,13 @@ class HyperPodSpareHealthController:
                 existing_incident.incident_id,
             )
 
+        if not self._hardware_reasons(reasons):
+            return self._defer_non_hardware(
+                node_name,
+                reasons,
+                failures=failures,
+                incident_id=None,
+            )
         agent = self._matching_agent(node)
         incarnation = (
             getattr(agent, "agent_incarnation_id", None)
@@ -473,21 +474,10 @@ class HyperPodSpareHealthController:
             )
         ):
             return SpareHealthReasonClass.CONFIGURATION
-        if normalized.startswith(
-            (
-                "kubernetes node is not ready",
-                "hyperpod status is ",
-                "active trusted node fault marker exists",
-                "active gpu health finding exists",
-            )
-        ):
+        if normalized.startswith((HARDWARE_PREFIX,)):
             return SpareHealthReasonClass.HARDWARE
         if normalized.startswith("hyperpod node health is "):
-            return (
-                SpareHealthReasonClass.OBSERVATION
-                if normalized.endswith("unknown")
-                else SpareHealthReasonClass.HARDWARE
-            )
+            return SpareHealthReasonClass.OBSERVATION
         return SpareHealthReasonClass.OBSERVATION
 
     @classmethod

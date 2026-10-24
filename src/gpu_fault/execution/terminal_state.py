@@ -77,6 +77,12 @@ def failure_incident_state(workflow: WorkflowRequest) -> IncidentState:
         # holds those nodes: the record says QUARANTINED so the operator exit
         # is the validated restore, not a close that orphans the isolation.
         return IncidentState.QUARANTINED
+    if any(
+        step.parameters.get("health_recovery_contract", {}).get("mode")
+        in {"TRAINING", "HUNG_DIAGNOSTIC"}
+        for step in workflow.official_steps
+    ):
+        return IncidentState.ESCALATED
     if diagnostic_only(workflow):
         return IncidentState.RECOVERED
     return IncidentState.ESCALATED

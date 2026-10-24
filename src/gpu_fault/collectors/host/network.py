@@ -9,6 +9,8 @@ from typing import Any, Callable
 from gpu_fault.host_health import (
     HostMetricSample,
 )
+from gpu_fault.collectors.host.observation import HostObservationError, read_counter
+from gpu_fault.collectors.host.rdma_traffic import port_traffic
 
 LOGGER = logging.getLogger(__name__)
 
@@ -81,11 +83,23 @@ class HostNetworkMixin:
 
         result: list[HostMetricSample] = []
         seen: set[str] = set()
+        errors: list[str] = []
         try:
             interfaces = sorted(self.net_class_root.iterdir())
         except OSError as exc:
-            LOGGER.warning("cannot list %s: %s", self.net_class_root, exc)
-            return result
+            raise HostObservationError(
+                f"cannot list {self.net_class_root}: {exc}", []
+            ) from exc
+        missing = self.required_interfaces - {
+            interface.name for interface in interfaces
+        }
+        for name in sorted(missing):
+            result.extend(
+                [
+                    self._sample("network_link_up", 0, None, name),
+                    self._sample("network_link_down", 1, None, name),
+                ]
+            )
         for interface in interfaces:
             name = interface.name
             if name == "lo":
@@ -94,7 +108,7 @@ class HostNetworkMixin:
                 if not self._is_reported_interface(interface):
                     continue
                 samples = self._interface_samples(interface, observed_at)
-            except (OSError, ValueError):
+            except (OSError, ValueError, HostObservationError) as exc:
                 # Two different failures with two different answers. A veth
                 # deleted between ``iterdir`` and the read is gone, so its
                 # baseline may be pruned. A counter that reads back empty or
@@ -106,10 +120,15 @@ class HostNetworkMixin:
                 # never report ``network_errors_delta`` again.
                 if interface.exists():
                     seen.add(name)
+                if isinstance(exc, HostObservationError):
+                    result.extend(exc.samples)
+                errors.append(f"{name}: {exc}")
                 continue
             seen.add(name)
             result.extend(samples)
         self._prune_interface_counters(seen)
+        if errors:
+            raise HostObservationError("; ".join(errors), result)
         return result
 
     def _is_reported_interface(self, interface: Path) -> bool:
@@ -126,29 +145,25 @@ class HostNetworkMixin:
     def _interface_samples(
         self, interface: Path, observed_at: datetime
     ) -> list[HostMetricSample]:
-        """Every sample for one interface, or nothing if any read fails.
-
-        Built as a unit so a half-read interface contributes nothing rather
-        than a link state without its counters. Raises ``OSError`` if the
-        interface disappears and ``ValueError`` if a counter reads back
-        unparseable; the caller tells those two apart.
-        """
+        """Keep link evidence even when the atomic counter snapshot fails."""
 
         name = interface.name
         state = (interface / "operstate").read_text().strip()
+        if state not in {
+            "up",
+            "down",
+            "lowerlayerdown",
+            "notpresent",
+            "dormant",
+            "testing",
+        }:
+            raise HostObservationError(f"link state is unknown: {state!r}", [])
         # Read and parse every counter *before* any baseline moves. ``_delta``
         # advances the baseline as it reads it, so computing the error delta
         # before the drop counters had even been parsed let an unparseable drop
         # counter silently consume the error interval: the next tick then
         # reported two intervals of errors as one, halving the rate the
         # consumer's error-rate rule computes.
-        totals = {
-            metric: sum(
-                float((interface / "statistics" / filename).read_text())
-                for filename in files
-            )
-            for metric, files in _COUNTER_FILES.items()
-        }
         result = [
             self._sample(
                 "network_link_up",
@@ -166,6 +181,18 @@ class HostNetworkMixin:
                     name,
                 )
             )
+        try:
+            totals = {
+                metric: sum(
+                    read_counter(interface / "statistics" / filename)
+                    for filename in files
+                )
+                for metric, files in _COUNTER_FILES.items()
+            }
+        except (OSError, ValueError) as exc:
+            raise HostObservationError(
+                f"statistics unavailable: {exc}", result
+            ) from exc
         for metric, total in totals.items():
             change = self._delta(
                 f"net/{name}/{metric}",
@@ -229,10 +256,14 @@ class HostNetworkMixin:
     def _rdma(self, observed_at: datetime) -> list[HostMetricSample]:
         result = []
         aggregate_traffic_delta = 0.0
-        aggregate_interval = 0.0
+        aggregate_rate = 0.0
+        traffic_complete = True
+        device_count = 0
+        port_count = 0
+        errors = []
         root = self.infiniband_root
         if not root.exists():
-            return result
+            return [self._sample("efa_traffic_observation_valid", 0)]
         counter_names = {
             "symbol_error",
             "link_error_recovery",
@@ -254,46 +285,16 @@ class HostNetworkMixin:
             "send_queue_overflow",
             "tx_drops",
         }
-        traffic_counters = {
-            "rdma_read_wrs": (
-                "efa_rdma_read_ops_delta",
-                "operations",
-            ),
-            "rdma_read_bytes": (
-                "efa_rdma_read_bytes_delta",
-                "bytes",
-            ),
-            "rdma_write_wrs": (
-                "efa_rdma_write_ops_delta",
-                "operations",
-            ),
-            "rdma_write_bytes": (
-                "efa_rdma_write_bytes_delta",
-                "bytes",
-            ),
-            "rdma_write_recv_bytes": (
-                "efa_rdma_write_recv_bytes_delta",
-                "bytes",
-            ),
-            "send_wrs": (
-                "efa_send_ops_delta",
-                "operations",
-            ),
-            "send_bytes": ("efa_send_bytes_delta", "bytes"),
-            "recv_wrs": (
-                "efa_recv_ops_delta",
-                "operations",
-            ),
-            "recv_bytes": ("efa_recv_bytes_delta", "bytes"),
-            "rx_bytes": ("efa_rx_bytes_delta", "bytes"),
-            "tx_bytes": ("efa_tx_bytes_delta", "bytes"),
-            "rx_pkts": ("efa_rx_packets_delta", "packets"),
-            "tx_pkts": ("efa_tx_packets_delta", "packets"),
-        }
         for device in root.iterdir():
             if not self._is_efa_device(device):
                 continue
-            for port in (device / "ports").glob("*"):
+            device_count += 1
+            ports = list((device / "ports").iterdir())
+            if not ports:
+                traffic_complete = False
+                errors.append(f"{device.name}: no observable RDMA ports")
+            for port in ports:
+                port_count += 1
                 state_path = port / "state"
                 physical_path = port / "phys_state"
                 if state_path.exists():
@@ -356,48 +357,20 @@ class HostNetworkMixin:
                                         (f"{device.name}/{port.name}"),
                                     )
                                 )
-                port_traffic_delta = 0.0
-                port_interval = 0.0
-                has_rx_tx = all(
-                    (port / "hw_counters" / name).exists()
-                    for name in ("rx_bytes", "tx_bytes")
-                )
-                for counter, (
-                    metric,
-                    unit,
-                ) in traffic_counters.items():
-                    path = port / "hw_counters" / counter
-                    if not path.exists():
-                        continue
-                    raw = path.read_text().strip()
-                    if not raw.isdigit():
-                        continue
-                    change = self._delta(
-                        (f"rdma-traffic/{device.name}/{port.name}/{counter}"),
-                        float(raw),
-                        observed_at,
+                try:
+                    traffic_samples, traffic, error = port_traffic(
+                        port, observed_at, self._previous, self._delta
                     )
-                    if change is None:
-                        continue
-                    if _is_reportable(metric, change[0]):
-                        result.append(
-                            self._sample(
-                                metric,
-                                change[0],
-                                unit,
-                                f"{device.name}/{port.name}",
-                            )
-                        )
-                    # The aggregate is accumulated whether or not the per-port
-                    # sample ships: zero traffic is the EFA signal, and the
-                    # traffic state machine reads only the aggregate.
-                    if (has_rx_tx and counter in {"rx_bytes", "tx_bytes"}) or (
-                        not has_rx_tx and counter in {"send_bytes", "recv_bytes"}
-                    ):
-                        port_traffic_delta += change[0]
-                        port_interval = max(port_interval, change[1])
-                aggregate_traffic_delta += port_traffic_delta
-                aggregate_interval = max(aggregate_interval, port_interval)
+                except OSError as exc:
+                    traffic_samples, traffic, error = [], None, str(exc)
+                result.extend(traffic_samples)
+                if error:
+                    errors.append(error)
+                if traffic is None:
+                    traffic_complete = False
+                else:
+                    aggregate_traffic_delta += traffic[0]
+                    aggregate_rate += traffic[0] / traffic[1]
                 key = f"rdma/{device.name}/{port.name}"
                 change = self._delta(key, total, observed_at)
                 if change:
@@ -409,7 +382,15 @@ class HostNetworkMixin:
                             f"{device.name}/{port.name}",
                         )
                     )
-        if aggregate_interval > 0:
+        expected = getattr(self, "expected_efa_device_count", None)
+        if expected is not None and device_count != expected:
+            traffic_complete = False
+            errors.append(
+                f"incomplete EFA traffic coverage: {device_count}/{expected} devices"
+            )
+        valid = traffic_complete and port_count > 0
+        result.append(self._sample("efa_traffic_observation_valid", int(valid)))
+        if valid:
             result.extend(
                 [
                     self._sample(
@@ -419,11 +400,13 @@ class HostNetworkMixin:
                     ),
                     self._sample(
                         "efa_traffic_bytes_per_second",
-                        aggregate_traffic_delta / aggregate_interval,
+                        aggregate_rate,
                         "bytes/second",
                     ),
                 ]
             )
+        if errors:
+            raise HostObservationError("; ".join(errors), result)
         return result
 
     def _efa_network(self, observed_at: datetime) -> list[HostMetricSample]:

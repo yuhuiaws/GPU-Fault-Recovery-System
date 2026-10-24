@@ -45,6 +45,14 @@ complete verification evidence.
 
 ## Independent Requirements
 
+The [general-fault audit](general-fault-e2e-audit.md) maps all 32 rows of the
+general fault table to individual `GF-GENERAL-E2E-*` cases and independent
+`GF-REQ-GENERAL-*` requirements. These manual, unexecuted specifications retain
+explicit gaps; adding their documentation does not raise implemented or verified
+coverage. `GF-GENERAL-SW-*` separately binds the real host collector/API/executor
+software tests with fixture-owned OS and Kubernetes boundaries. The completeness
+test only checks traceability and cannot serve as execution evidence.
+
 [`testcases/scenario-requirements.yaml`](../../testcases/scenario-requirements.yaml)
 is the reviewed mechanism inventory. Each requirement names implementation
 sources, triggering conditions, expected assertions, canonical cases and exact

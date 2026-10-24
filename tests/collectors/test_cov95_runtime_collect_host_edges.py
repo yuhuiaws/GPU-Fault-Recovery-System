@@ -39,8 +39,8 @@ def add_efa(case, index, *, active=True, pci=True, driver=True):
         support.write_file(device / "device/uevent", "DRIVER=other")
     port = device / "ports/1"
     port.mkdir(parents=True)
-    if active:
-        (port / "state").write_text("4: ACTIVE")
+    (port / "state").write_text("4: ACTIVE" if active else "1: DOWN")
+    (port / "phys_state").write_text("5: LinkUp" if active else "3: Disabled")
     if pci:
         support.write_file(case.roots.pci / str(index) / "vendor", "0x1d0f")
         support.write_file(case.roots.pci / str(index) / "device", "0xefa0")

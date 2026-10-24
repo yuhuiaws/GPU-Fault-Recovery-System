@@ -642,14 +642,13 @@ done
     printf 'ERROR: GPU_FAULT_HUNG_PYSPY_TIMEOUT_SECONDS must be an integer from 1 to 60\n' >&2
     exit 2
 }
-# 0 disables the cap. Anything from 1 to 3 nodes leaves the comparative
-# rank diagnosis without a majority to compare against, so the lower
-# bound is 4 and the practical default is 8.
+# Active hung attachments are capped at 32. Legacy 0 and larger values
+# are clamped by the planner; one node is allowed for evidence-only triage.
 { [[ "${HUNG_TRIAGE_MAX_NODES}" =~ ^[0-9]+$ ]] &&
     (( HUNG_TRIAGE_MAX_NODES == 0 ||
-       ( HUNG_TRIAGE_MAX_NODES >= 4 &&
+       ( HUNG_TRIAGE_MAX_NODES >= 1 &&
          HUNG_TRIAGE_MAX_NODES <= 1024 ) )); } || {
-    printf 'ERROR: GPU_FAULT_HUNG_TRIAGE_MAX_NODES must be 0 or an integer from 4 to 1024\n' >&2
+    printf 'ERROR: GPU_FAULT_HUNG_TRIAGE_MAX_NODES must be 0 or an integer from 1 to 1024 (effective cap: 32)\n' >&2
     exit 2
 }
 { [[ "${NODE_ACTION_MAX_PARALLEL}" =~ ^[0-9]+$ ]] &&
@@ -1501,10 +1500,10 @@ RESTORE_SETTLE_SECONDS="${GPU_FAULT_RESTORE_SETTLE_SECONDS:-30}"
 # Same operation list the installer writes into node-agent.env.
 node_allowed_operations() {
     local operations
-    operations="COLLECT_HUNG_TRIAGE,COLLECT_DIAGNOSTIC_BUNDLE"
+    operations="COLLECT_HUNG_TRIAGE,COLLECT_HUNG_SUMMARY,COLLECT_DIAGNOSTIC_BUNDLE"
     operations+=",RUN_DCGM_DIAGNOSTIC"
     operations+=",QUIESCE_GPU_SERVICES,VERIFY_NO_GPU_CLIENTS"
-    operations+=",TRIGGER_HEALTH_SNAPSHOT,RESET_GPU"
+    operations+=",TRIGGER_HEALTH_SNAPSHOT,RESET_GPU,RECOVER_DRAIN_P2P"
     operations+=",RESET_ALL_GPUS_NVSWITCHES,RESTORE_GPU_SERVICES"
     operations+=",RESTART_FABRIC_MANAGER"
     operations+=",REMEDIATE_EFA_DRIVER"

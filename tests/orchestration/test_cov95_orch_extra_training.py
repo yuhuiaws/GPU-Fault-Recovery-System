@@ -31,12 +31,13 @@ def heartbeat(rank=0, **updates):
             "observed_at": NOW,
             "step": 100,
             "loss": 1.0,
+            "labels": {"progress_group": "data-parallel"},
             **updates,
         }
     )
 
 
-def test_progress_enrichment_uses_the_matching_allocation_and_preserves_explicit_fields():
+def test_progress_enrichment_uses_matching_allocation_and_rejects_forged_identity():
     store = memory_store()
     store.save_attempt_observation(observation(attempt_id="other-attempt"))
     allocated = observation()
@@ -56,8 +57,9 @@ def test_progress_enrichment_uses_the_matching_allocation_and_preserves_explicit
         pod_uid="explicit-pod",
         container_name="explicit-container",
     )
-    assert service.ingest(explicit).accepted is True
-    assert store.list_training_progress("cluster-a") == [explicit]
+    with pytest.raises(ValueError, match="identity does not match allocation"):
+        service.ingest(explicit)
+    assert store.list_training_progress("cluster-a") == [saved]
 
 
 def test_wrong_node_heartbeat_cannot_write_progress_or_emit_findings():
@@ -78,9 +80,11 @@ def test_wrong_node_heartbeat_cannot_write_progress_or_emit_findings():
 @pytest.mark.parametrize("age", [0, -1])
 def test_old_or_equal_progress_is_rejected_without_replacing_the_current_sample(age):
     store = memory_store()
+    store.save_attempt_observation(observation())
     service = TrainingHealthService(store)
     current = heartbeat()
-    service.ingest(current)
+    assert service.ingest(current).accepted is True
+    saved = store.list_training_progress("cluster-a")
     rejected = heartbeat(
         observed_at=NOW + timedelta(seconds=age), step=1, numerical_error=True
     )
@@ -88,20 +92,22 @@ def test_old_or_equal_progress_is_rejected_without_replacing_the_current_sample(
     assert result.accepted is False
     assert result.heartbeat_id == rejected.heartbeat_id
     assert result.findings == []
-    assert store.list_training_progress("cluster-a") == [current]
+    assert store.list_training_progress("cluster-a") == saved
 
 
 @pytest.mark.parametrize("loss", [float("nan"), float("inf"), float("-inf")])
 def test_nonfinite_loss_latches_only_after_notification_and_rearms_after_recovery(loss):
     store = memory_store()
+    allocated = observation()
+    store.save_attempt_observation(allocated)
     service = TrainingHealthService(store)
     first = service.ingest(heartbeat(loss=loss))
     assert len(first.findings) == 1
     emitted = first.findings[0]
     assert emitted.metric_name == "training_nonfinite-loss"
-    assert emitted.node_id == "UNKNOWN"
-    assert emitted.runtime_profile_version is None
-    assert emitted.affected_workload_ids == []
+    assert emitted.node_id == "node-0"
+    assert emitted.runtime_profile_version == allocated.runtime_profile_version
+    assert emitted.affected_workload_ids == allocated.workload_ids
     key = training_health_signal_key(emitted)
     assert key == "cluster-a/unit-attempt/rank-0/training-nonfinite-loss"
     assert store.get_health_signal_state(key).notified is False
@@ -118,6 +124,7 @@ def test_nonfinite_loss_latches_only_after_notification_and_rearms_after_recover
 
 def test_step_regression_is_owed_until_latched_and_rearms_after_progress():
     store = memory_store()
+    store.save_attempt_observation(observation())
     service = TrainingHealthService(store)
     service.ingest(heartbeat(step=100))
     regressed = service.ingest(
@@ -170,7 +177,9 @@ def test_startup_grace_uses_first_observation_and_does_not_require_a_first_heart
     )
     assert service.scan_all(now=NOW + timedelta(seconds=30)).findings == []
     result = service.scan_all(now=NOW + timedelta(seconds=31))
-    assert {item.metric_name for item in result.findings} == {"training_hang"}
+    assert {item.metric_name for item in result.findings} == {
+        "training_reporter-silent"
+    }
     assert {item.node_id for item in result.findings} == {"node-0", "node-1"}
     assert {item.runtime_profile_version for item in result.findings} == {
         "simulated-v1"

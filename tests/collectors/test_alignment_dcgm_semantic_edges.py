@@ -100,16 +100,26 @@ class Series:
         self, values: dict[str, float], *, limits: list[GpuMetricSample] | None = None
     ) -> None:
         before = len(self.sink.batches)
+        environmental = False
         for _ in range(2):
-            self.tick(values, limits=limits)
-            assert len(self.sink.batches) == before, (
-                "a new action must not borrow the preceding action's confirmations"
-            )
+            batch = self.tick(values, limits=limits)
+            environmental = "environmental-observation" in batch.edge_filter_reasons
+            if environmental:
+                assert all(
+                    item.automatic_action != "DRAIN"
+                    for item in self.sink.results[-1].new_findings
+                ), "raw environmental samples must be confirmed by the consumer"
+            else:
+                assert len(self.sink.batches) == before, (
+                    "ordinary warning edges stay filtered"
+                )
         self.tick(values, limits=limits)
-        assert len(self.sink.batches) == before + 1, (
+        assert len(self.sink.batches) == before + (3 if environmental else 1), (
             "a confirmed semantic transition must reach the control plane"
         )
-        assert self.sink.batches[-1].edge_filter_reasons == ["candidate-confirmed"]
+        assert self.sink.batches[-1].edge_filter_reasons == [
+            "environmental-observation" if environmental else "candidate-confirmed"
+        ]
 
 
 @pytest.mark.parametrize(
@@ -136,9 +146,11 @@ def test_persistent_warning_then_critical_delivers_each_action_once(
     ]
     for _ in range(4):
         series.tick({metric: critical + 0.1})
-    assert len(series.sink.batches) == 3, "stable critical findings must not flood"
+    assert len(series.sink.batches) == 9, (
+        "critical observations remain sampled at the configured cadence"
+    )
     series.tick({})
-    assert series.sink.batches[-1].edge_filter_reasons == ["candidate-recovered"]
+    assert "candidate-recovered" in series.sink.batches[-1].edge_filter_reasons
     assert series.sink.service.findings(CLUSTER, NODE) == []
 
 
@@ -146,7 +158,7 @@ def test_persistent_warning_then_critical_delivers_each_action_once(
     "metric,limits,warning,critical",
     [
         ("gpu_temperature_c", [limit("gpu_slowdown_temperature_c", 70)], 65, 70),
-        ("gpu_temperature_c", [limit("gpu_max_operating_temperature_c", 72)], 67, 72),
+        ("gpu_temperature_c", [limit("gpu_max_operating_temperature_c", 72)], 72, None),
         ("gpu_temperature_c", [limit("gpu_shutdown_temperature_c", 78)], 70, 75),
         (
             "gpu_temperature_c",
@@ -179,6 +191,15 @@ def test_device_thresholds_below_fallback_share_producer_and_ingestion_actions(
         warning,
     )
     assert finding.threshold_source == "NVIDIA_DEVICE_LIMIT"
+    if critical is None:
+        for _ in range(3):
+            series.tick({metric: warning + 1}, limits=limits)
+        assert all(
+            item.automatic_action != "DRAIN"
+            for result in series.sink.results
+            for item in result.findings
+        ), "a software operating limit is not a hardware slowdown threshold"
+        return
     series.confirm({metric: critical}, limits=limits)
     finding = series.sink.results[-1].new_findings[0]
     assert (finding.severity, finding.automatic_action, finding.threshold_value) == (
@@ -201,7 +222,7 @@ def test_device_limits_cannot_bleed_into_another_gpu() -> None:
             limits=limits,
             other_devices={"GPU-b": {"gpu_temperature_c": 76}},
         )
-    assert len(series.sink.batches) == 2
+    assert len(series.sink.batches) == 4
     assert [
         (item.gpu_uuid, item.severity, item.automatic_action)
         for item in series.sink.results[-1].new_findings
@@ -226,12 +247,16 @@ def test_brief_critical_transition_is_not_confirmation_or_false_recovery() -> No
     series.confirm({"gpu_temperature_c": 86})
     series.tick({"gpu_temperature_c": 91})
     series.tick({"gpu_temperature_c": 86})
-    assert len(series.sink.batches) == 2, "a one-scrape action change is not confirmed"
+    assert all(
+        item.automatic_action != "DRAIN"
+        for result in series.sink.results
+        for item in result.new_findings
+    ), "a one-scrape critical excursion is not confirmed"
     series.tick({})
-    assert len(series.sink.batches) == 3, (
+    assert len(series.sink.batches) == 5, (
         "an unconfirmed transition must not erase the last delivered warning"
     )
-    assert series.sink.batches[-1].edge_filter_reasons == ["candidate-recovered"]
+    assert "candidate-recovered" in series.sink.batches[-1].edge_filter_reasons
     assert series.sink.service.findings(CLUSTER, NODE) == []
 
 
@@ -245,7 +270,7 @@ def test_warning_samples_cannot_confirm_a_subsequent_critical_action() -> None:
         item.automatic_action
         for result in series.sink.results
         for item in result.new_findings
-    ] == ["DRAIN"]
+    ] == ["RUN_DIAGNOSTICS", "DRAIN"]
 
 
 @pytest.mark.parametrize("transition", ["critical", "recovered"])
@@ -262,10 +287,14 @@ def test_rejected_semantic_edge_is_retried_on_the_next_unchanged_scrape(
     series.sink.rejection = CollectorError("private sink rejected the test batch")
     with pytest.raises(CollectorError):
         series.tick(values)
-    assert len(series.sink.batches) == 2
+    assert len(series.sink.batches) == (4 if transition == "critical" else 2)
     series.sink.rejection = None
     series.tick(values)
-    assert len(series.sink.batches) == 3, "unaccepted semantic edges must remain open"
+    assert len(series.sink.batches) == (5 if transition == "critical" else 3), (
+        "unaccepted semantic edges must remain open"
+    )
     assert series.sink.batches[-1].edge_filter_reasons == [
-        "candidate-confirmed" if transition == "critical" else "candidate-recovered"
+        "environmental-observation"
+        if transition == "critical"
+        else "candidate-recovered"
     ]

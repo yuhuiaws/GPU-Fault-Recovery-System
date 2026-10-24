@@ -962,20 +962,21 @@ def test_wide_attempt_hung_triage_samples_representative_nodes(
     # The incident still owns the whole attempt: only the py-spy sweep
     # is narrowed, not the blast radius of the recovery.
     assert incident.node_ids == node_ids
-    triage = workflow.official_steps[1]
-    assert len(triage.node_ids) == 4
-    # The node whose fabric went quiet and the node holding rank 0.
-    assert "node-09" in triage.node_ids
-    assert "node-05" in triage.node_ids
+    survey = workflow.official_steps[1]
+    assert survey.node_ids == node_ids
+    triage = workflow.official_steps[3]
+    assert triage.parameters["hung_diagnostic_node_budget"] == 4
+    assert triage.parameters["hung_target_pending"] is True
     assert triage.parameters["attempt_node_ids"] == node_ids
-    assert sorted(triage.node_ids + triage.parameters["not_sampled_nodes"]) == node_ids
     assert all(
         step.node_ids == node_ids
         for index, step in enumerate(workflow.official_steps)
-        if index != 1
-    ), (
-        "expected all( step.node_ids == node_ids for index, step in enumerate(workflow.official_steps) if index != 1 ) to be truthy"
-    )
+        if step.operation
+        not in {
+            WorkflowOperation.COLLECT_HUNG_TRIAGE,
+            WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+        }
+    ), "only active triage and diagnostic bundles are sampled"
 
 
 def test_hung_triage_node_cap_can_be_disabled(

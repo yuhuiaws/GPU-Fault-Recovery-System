@@ -42,6 +42,12 @@ from gpu_fault.gpu_metrics import (
     GpuMetricsThresholds,
 )
 from gpu_fault.gpu_temperature_policy import TLIMIT_READING, temperature_decision
+from gpu_fault.gpu_environment_policy import (
+    clock_reason_decision,
+    deduplicate_dcgm_aliases,
+    environmental_semantics,
+)
+from gpu_fault.collectors.gpu.discovery import read_host_boot_id
 from gpu_fault.transport.http_client import urlopen
 
 LOGGER = logging.getLogger(__name__)
@@ -95,6 +101,7 @@ DCGM_METRICS: dict[str, tuple[str, str | None]] = {
     # (v1.4611.2) resolves as a deprecated alias and renders unchanged.
     # Exported, never required.
     "DCGM_FI_DEV_GPU_TEMP_LIMIT": (TLIMIT_READING, "celsius"),
+    "DCGM_FI_DEV_GPU_TEMP_MARGIN_CELSIUS": (TLIMIT_READING, "celsius"),
     "DCGM_FI_DEV_MEMORY_TEMP": (
         "memory_temperature_c",
         "celsius",
@@ -117,6 +124,7 @@ DCGM_METRICS: dict[str, tuple[str, str | None]] = {
         "clock_throttle_reasons",
         "bitmask",
     ),
+    "DCGM_FI_DEV_CLOCKS_EVENT_REASONS": ("clock_throttle_reasons", "bitmask"),
     "DCGM_FI_DEV_XID_ERRORS": ("xid_last_error", None),
     # dcgmFabricManagerStatus_t / the DCGM return code of a completed NVLink
     # fabric registration (gpu_fault.gpu_fabric_manager).
@@ -322,6 +330,45 @@ def _merged_candidate_streaks(
     return dict(list(merged.items())[-max_keys:]), confirmed
 
 
+def parse_dcgm_samples(text: str) -> list[GpuMetricSample]:
+    """Normalize exporter aliases and units before stateful edge evaluation."""
+    try:
+        from prometheus_client.parser import text_string_to_metric_families
+    except ImportError as exc:
+        raise CollectorError(
+            "install gpu-fault-control-plane[collectors] for DCGM Prometheus parsing"
+        ) from exc
+    samples = []
+    for family in text_string_to_metric_families(text):
+        for item in family.samples:
+            mapping = DCGM_METRICS.get(item.name)
+            if mapping is None and item.name.endswith("_total"):
+                mapping = DCGM_METRICS.get(item.name[:-6])
+            if (
+                mapping is None
+                or not math.isfinite(item.value)
+                or abs(item.value) >= DCGM_BLANK_MAGNITUDE
+            ):
+                continue
+            labels = {str(key): str(value) for key, value in item.labels.items()}
+            value = float(item.value)
+            if mapping[0] in DCGM_NANOSECOND_DURATION_FIELDS:
+                value /= 1000.0
+            samples.append(
+                GpuMetricSample(
+                    metric_name=item.name,
+                    canonical_name=mapping[0],
+                    value=value,
+                    unit=mapping[1],
+                    gpu_index=labels.get("gpu"),
+                    gpu_uuid=labels.get("UUID") or labels.get("uuid"),
+                    pci_bdf=labels.get("pci_bus_id") or labels.get("pciBusId"),
+                    labels=labels,
+                )
+            )
+    return deduplicate_dcgm_aliases(samples)
+
+
 class DcgmMetricsCollector:
     def __init__(
         self,
@@ -349,6 +396,7 @@ class DcgmMetricsCollector:
         self.sink = sink
         self.context = context
         self.node_id = node_id
+        self._boot_id = read_host_boot_id()
         self.metrics_url = metrics_url
         self.interval_seconds = interval_seconds
         self.now = now or (lambda: datetime.now(timezone.utc))
@@ -494,48 +542,17 @@ class DcgmMetricsCollector:
         observed_at: datetime | None = None,
         extra_samples: list[GpuMetricSample] | None = None,
     ) -> GpuMetricBatch:
-        try:
-            from prometheus_client.parser import (
-                text_string_to_metric_families,
-            )
-        except ImportError as exc:
-            raise CollectorError(
-                "install gpu-fault-control-plane[collectors] "
-                "for DCGM Prometheus parsing"
-            ) from exc
-
-        samples = []
-        for family in text_string_to_metric_families(text):
-            for item in family.samples:
-                mapping = DCGM_METRICS.get(item.name)
-                if mapping is None and item.name.endswith("_total"):
-                    mapping = DCGM_METRICS.get(item.name[:-6])
-                if (
-                    mapping is None
-                    or not math.isfinite(item.value)
-                    or abs(item.value) >= DCGM_BLANK_MAGNITUDE
-                ):
-                    continue
-                labels = {str(key): str(value) for key, value in item.labels.items()}
-                value = float(item.value)
-                if mapping[0] in DCGM_NANOSECOND_DURATION_FIELDS:
-                    value /= 1000.0
-                samples.append(
-                    GpuMetricSample(
-                        metric_name=item.name,
-                        canonical_name=mapping[0],
-                        value=value,
-                        unit=mapping[1],
-                        gpu_index=labels.get("gpu"),
-                        gpu_uuid=labels.get("UUID") or labels.get("uuid"),
-                        pci_bdf=labels.get("pci_bus_id") or labels.get("pciBusId"),
-                        labels=labels,
-                    )
-                )
+        samples = parse_dcgm_samples(text)
         dcgm_sample_count = len(samples)
         timestamp = observed_at or self.now()
         samples.extend(held_samples(samples, self._value_first_seen, timestamp))
         samples.extend(extra_samples or [])
+        samples = [
+            sample.model_copy(
+                update={"labels": {**sample.labels, "source_boot_id": self._boot_id}}
+            )
+            for sample in samples
+        ]
         if dcgm_sample_count == 0:
             raise CollectorError(
                 "DCGM scrape contained no supported GPU metrics; "
@@ -591,11 +608,13 @@ class DcgmMetricsCollector:
                 key: (
                     self._candidate_semantics[key]
                     if streak >= self.edge_confirmation_samples
+                    or environmental_semantics(self._candidate_semantics[key])
                     else self._delivered_candidate_semantics[key]
                 )
                 for key, streak in self._candidate_streaks.items()
                 if streak >= self.edge_confirmation_samples
                 or key in self._delivered_candidate_semantics
+                or environmental_semantics(self._candidate_semantics[key])
             }
             if (
                 self._next_health_summary_at is None
@@ -804,6 +823,7 @@ class DcgmMetricsCollector:
                 name == FABRIC_MANAGER_HELD_SECONDS
                 and sample.value >= FABRIC_MANAGER_UNSETTLED_WINDOW_SECONDS
             )
+            clock = clock_reason_decision(sample)
             duty_cycle, no_new_value = self._grade_duty_cycle(sample, batch.observed_at)
             if no_new_value:
                 carried_over.add(self._sample_key(sample))
@@ -815,6 +835,8 @@ class DcgmMetricsCollector:
                 candidates[self._sample_key(sample)] = (
                     f"{temperature['severity']}:{temperature['automatic_action']}"
                 )
+            elif clock is not None:
+                candidates[self._sample_key(sample)] = str(clock["threshold_source"])
             elif breached:
                 candidates[self._sample_key(sample)] = "breached"
         for device, values in values_by_device.items():
@@ -884,6 +906,13 @@ class DcgmMetricsCollector:
             reasons.append("health-summary")
 
         candidates, carried_over = self._candidate_keys(batch)
+        # The control plane confirms sustained environmental faults. Suppressing
+        # unchanged hot/braked samples here would prevent that confirmation.
+        if any(environmental_semantics(value) for value in candidates.values()) or any(
+            environmental_semantics(value) and candidates.get(key) != value
+            for key, value in self._delivered_candidate_semantics.items()
+        ):
+            reasons.append("environmental-observation")
         recovered = {
             key
             for key in self._delivered_candidate_semantics.keys()

@@ -7,7 +7,7 @@ from pydantic import Field
 
 from gpu_fault.models import StrictModel, WorkloadState
 
-SITE_METRIC_POLICY_VERSION = "site-dcgm-metric-policy/v3"
+SITE_METRIC_POLICY_VERSION = "site-dcgm-metric-policy/v5"
 
 
 class GpuHealthSeverity(StrEnum):
@@ -46,6 +46,7 @@ class GpuHealthFinding(StrictModel):
     component_evidence_refs: list[str] = Field(default_factory=list)
     affected_gpu_uuids: list[str] = Field(default_factory=list)
     confidence: str | None = None
+    confirmation_count: int = Field(default=0, ge=0)
 
 
 class GpuFindingState(StrictModel):

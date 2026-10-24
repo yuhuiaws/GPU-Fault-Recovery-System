@@ -247,7 +247,7 @@ def hung_workflow(api) -> dict:
 def test_efa_harness_accepts_actual_active_hung_triage_dag(api) -> None:
     workflow = hung_workflow(api)
     efa.validate_hung_workflow(workflow)
-    assert workflow["official_steps"][1]["operation"] == "COLLECT_HUNG_TRIAGE"
+    assert workflow["official_steps"][1]["operation"] == "COLLECT_HUNG_SUMMARY"
     assert workflow["step_executions"] == []
 
 
@@ -266,7 +266,7 @@ def test_efa_harness_rejects_missing_triage_or_unsafe_dag_evidence(api, damage) 
     elif damage == "foreign-node":
         workflow["official_steps"][1]["node_ids"] = ["foreign-node"]
     elif damage == "recapture":
-        workflow["official_steps"][2]["parameters"]["capture_process_state"] = True
+        workflow["official_steps"][4]["parameters"]["capture_process_state"] = True
     else:
         workflow["step_executions"] = [{"operation": "COLLECT_HUNG_TRIAGE"}]
     with pytest.raises(AssertionError):
@@ -318,7 +318,9 @@ def test_efa_harness_cleanup_precedes_report_io_failure(
     stopped.assert_called_once_with(api)
     assert operations == {
         "FREEZE_EVIDENCE",
+        "COLLECT_HUNG_SUMMARY",
         "COLLECT_HUNG_TRIAGE",
         "COLLECT_DIAGNOSTIC_BUNDLE",
         "VALIDATE_FABRIC",
+        "ESCALATE_SUPPORT",
     }

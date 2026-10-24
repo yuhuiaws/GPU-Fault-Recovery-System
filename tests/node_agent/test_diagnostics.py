@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.node_agent.operations.stack_samples import stack_summary
+
 from ._support import (
     NOW,
     CompletedProcess,
@@ -339,7 +341,7 @@ def test_hung_diagnostic_bundle_captures_gpu_process_state(tmp_path) -> None:
     assert ["ethtool", "-S", "eth0"] in calls
     assert f"diagnostics/proc-{pid}-status.txt" in names
     assert manifest["strace_sampling"] == {
-        "sample_count": 3,
+        "sample_count": 0,
         "duration_seconds_per_sample": 1,
         "interval_seconds": 0,
         "process_count": 1,
@@ -357,23 +359,9 @@ def test_hung_diagnostic_bundle_captures_gpu_process_state(tmp_path) -> None:
         for item in manifest["captures"]
         if item["file"].startswith(f"strace-{pid}-sample-")
     ]
-    assert len(traces) == 3
-    assert [item["sample_index"] for item in traces] == [1, 2, 3]
-    assert all(item["sample_count"] == 3 for item in traces), (
-        'expected all(item["sample_count"] == 3 for item in traces) to be truthy'
-    )
-    assert all(item["started_at"] for item in traces), (
-        'expected all(item["started_at"] for item in traces) to be truthy'
-    )
-    assert all(item["completed_at"] for item in traces), (
-        'expected all(item["completed_at"] for item in traces) to be truthy'
-    )
-    for sample_index in range(1, 4):
-        suffix = f"sample-{sample_index:02d}.txt"
-        assert f"diagnostics/proc-{pid}-stack-{suffix}" in names
-        assert f"diagnostics/proc-{pid}-wchan-{suffix}" in names
+    assert traces == [], "hung diagnostics must not attach strace"
     strace_calls = [argv for argv in calls if "strace" in argv]
-    assert len(strace_calls) == 3
+    assert strace_calls == [], "hung diagnostics must not attach strace"
     python_stack_captures = [
         item for item in manifest["captures"] if item.get("tool") == "py-spy"
     ]
@@ -401,11 +389,13 @@ def test_hung_triage_collects_bounded_read_only_rank_signals(
     (proc_dir / "wchan").write_text("futex_wait\n")
     (proc_dir / "status").write_text("voluntary_ctxt_switches:\t10\n")
     (proc_dir / "comm").write_text("python\n")
+    (proc_dir / "cgroup").write_text("0::/training/job\n")
 
     def write_proc_state(cpu_ticks: int, switches: int) -> None:
         fields = ["S", *(["0"] * 50)]
         fields[11] = str(cpu_ticks)
         fields[12] = "0"
+        fields[19] = "1000"
         stat_line = f"{pid} (python) " + " ".join(fields) + "\n"
         (proc_dir / "stat").write_text(stat_line)
         (task_dir / "stat").write_text(stat_line)
@@ -431,7 +421,7 @@ def test_hung_triage_collects_bounded_read_only_rank_signals(
                     argv, 0, stdout=f"{pid}, GPU-a, python\n", stderr=""
                 )
             if (
-                "--query-gpu=uuid,utilization.gpu,utilization.memory,clocks_throttle_reasons.active"
+                "--query-gpu=uuid,utilization.gpu,utilization.memory,clocks_throttle_reasons.active,name"
                 in argv
             ):
                 return CompletedProcess(argv, 0, stdout="GPU-a, 0, 0, 0x0\n", stderr="")
@@ -439,9 +429,21 @@ def test_hung_triage_collects_bounded_read_only_rank_signals(
                 return CompletedProcess(
                     argv,
                     0,
-                    stdout=(
-                        "all_reduce (/workspace/train.py:42)\n"
-                        "wait (/torch/distributed_c10d.py:100)\n"
+                    stdout=json.dumps(
+                        [
+                            {
+                                "pid": pid,
+                                "thread_id": pid + 1000,
+                                "os_thread_id": pid,
+                                "frames": [
+                                    {
+                                        "name": "all_reduce",
+                                        "filename": "/workspace/train.py",
+                                        "line": 42,
+                                    }
+                                ],
+                            }
+                        ]
                     ),
                     stderr="",
                 )
@@ -482,7 +484,10 @@ def test_hung_triage_collects_bounded_read_only_rank_signals(
         envelope(
             command(
                 WorkflowOperation.COLLECT_HUNG_TRIAGE,
-                parameters={"triage_timeout_seconds": 10},
+                parameters={
+                    "triage_timeout_seconds": 10,
+                    "workload_cgroup_paths_by_node": {"node-a": ["/training/job"]},
+                },
             )
         )
     )
@@ -494,8 +499,15 @@ def test_hung_triage_collects_bounded_read_only_rank_signals(
     assert rank["rank"] == 7
     assert rank["flight_recorder"]["last_entry"]["collective_seq_id"] == 12
     assert rank["python_stack"]["signature"]
-    assert rank["python_stack"]["frames"][0] == ("/workspace/train.py:all_reduce")
-    assert rank["proc"]["cpu_ticks_delta"] == 15
+    assert rank["python_stack"]["frames"][0] == {
+        "file": "/workspace/train.py",
+        "function": "all_reduce",
+        "line": 42,
+    }
+    assert [item["cpu_ticks_delta"] for item in rank["process_series"]["windows"]] == [
+        15,
+        0,
+    ]
     assert result.details["efa"]["total_delta"] == 50
 
 
@@ -592,30 +604,21 @@ def test_flight_recorder_dump_cannot_execute_planted_code(tmp_path) -> None:
 
 
 def test_stack_summary_drops_pyspy_banners_and_sees_device_sync() -> None:
-    dump = (
-        "Process 1394129: /opt/venv/bin/python3 -u train.py\n"
-        "Python v3.12.13 (/usr/bin/python3.12)\n"
-        "\n"
-        'Thread 1394129 (idle): "MainThread"\n'
-        "    synchronize (torch/cuda/__init__.py:1064)\n"
-        "    <module> (/opt/gpu-fault-test/train.py:63)\n"
-    )
-    other_rank = dump.replace("1394129", "1394131")
-
-    summary = NodeActionExecutor._stack_summary(dump)
-
-    assert summary["frames"] == [
-        "torch/cuda/__init__.py:synchronize",
-        "/opt/gpu-fault-test/train.py:<module>",
+    frames = [
+        {"name": "synchronize", "filename": "torch/cuda/__init__.py", "line": 1064},
+        {"name": "<module>", "filename": "/opt/gpu-fault-test/train.py", "line": 63},
     ]
-    # A rank blocked in the device sync of an unfinished collective is a
-    # collective hang, and the pid in the py-spy banner must not make
-    # every rank's signature unique.
-    assert summary["collective_frames"] is True
-    assert (
-        NodeActionExecutor._stack_summary(other_rank)["signature"]
-        == summary["signature"]
-    )
+
+    def dump(pid):
+        return json.dumps(
+            [{"pid": pid, "thread_id": pid, "os_thread_id": pid, "frames": frames}]
+        )
+
+    summary = stack_summary(dump(1394129), 1394129)
+    assert summary["frames"][0]["function"] == "synchronize", summary
+    # A generic CUDA synchronize is not proof of collective communication.
+    assert summary["collective_frames"] is False
+    assert stack_summary(dump(1394131), 1394131)["signature"] == summary["signature"]
 
 
 def test_hung_bundle_prefers_exact_target_pids(tmp_path) -> None:

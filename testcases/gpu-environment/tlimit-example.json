@@ -1,0 +1,8 @@
+{
+  "steps": [
+    {"reads": 2, "values": {}},
+    {"reads": 3, "values": {"gpu_tlimit_c": 1}},
+    {"reads": 3, "values": {"gpu_tlimit_c": -3}},
+    {"reads": 3, "values": {"gpu_tlimit_c": 25}}
+  ]
+}

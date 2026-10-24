@@ -87,6 +87,8 @@ def agent_config_payload(
         "ledger_retention_seconds": (executor.ledger.retention_seconds),
         "ledger_max_results": executor.ledger.max_results,
     }
+    if WorkflowOperation.COLLECT_HUNG_SUMMARY in executor.allowed_operations:
+        payload["communication_monitor_version"] = "communication-monitor/v1"
     if executor.quiesce_manager is not None:
         payload["quiesce"] = {
             "services": executor.quiesce_manager.services,

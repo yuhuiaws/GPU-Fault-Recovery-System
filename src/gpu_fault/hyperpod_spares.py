@@ -14,7 +14,6 @@ from gpu_fault.hyperpod import (
 )
 from gpu_fault.markers import (
     blocking_spare_markers,
-    describe_blocking_marker,
 )
 from gpu_fault.models import AdvisoryNotification
 from gpu_fault.node_provider import (
@@ -24,6 +23,7 @@ from gpu_fault.node_provider import (
     parse_provider_id,
 )
 from gpu_fault.regional_compatibility import ACTIVATION_INHIBITION_VERSION
+from gpu_fault.spare_fault_evidence import fault_reasons, observation_reasons
 
 LOGGER = logging.getLogger(__name__)
 
@@ -556,13 +556,6 @@ class HyperPodSpareCoordinator:
             cluster_id=cluster_id,
             observed_after=observed_after,
         )
-        if active_markers:
-            reasons.append(
-                "active trusted node fault marker exists: "
-                + ", ".join(
-                    describe_blocking_marker(marker) for marker in active_markers
-                )
-            )
         findings = [
             finding
             for alias in node.aliases
@@ -571,8 +564,12 @@ class HyperPodSpareCoordinator:
             )
             if (observed_after is None or finding.observed_at > observed_after)
         ]
-        if findings:
-            reasons.append("active GPU health finding exists")
+        reasons.extend(fault_reasons(active_markers, findings))
+        reasons.extend(
+            observation_reasons(
+                self.store, cluster_id, agent.node_id, datetime.now(timezone.utc)
+            )
+        )
         return reasons
 
     def _reserve_and_activate(

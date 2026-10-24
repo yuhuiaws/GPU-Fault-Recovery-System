@@ -285,7 +285,9 @@ class WorkflowBuilder:
             not isinstance(event, SxidEvent) or not event.participating_gpu_uuids
         ):
             errors.append("full fabric reset requires complete node GPU inventory")
-        if WorkflowOperation.RESET_GPU in operations and (
+        if set(operations).intersection(
+            {WorkflowOperation.RESET_GPU, WorkflowOperation.RECOVER_DRAIN_P2P}
+        ) and (
             (isinstance(event, XidEvent) and not event.gpu_uuid)
             or (isinstance(event, SxidEvent) and not event.participating_gpu_uuids)
         ):
@@ -632,6 +634,24 @@ class WorkflowBuilder:
             # workload. Any later reset/reboot is a separate explicit,
             # fenced workflow.
             operations.append(WorkflowOperation.CHECK_MECHANICALS)
+            return operations
+        if decision.official_action == "DRAIN_P2P":
+            operations.append(WorkflowOperation.MARK_UNSCHEDULABLE)
+            if event.workload_state is WorkloadState.ACTIVE:
+                operations.append(WorkflowOperation.STOP_WORKLOADS)
+            operations.extend(
+                [
+                    WorkflowOperation.QUIESCE_GPU_SERVICES,
+                    WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
+                    WorkflowOperation.RECOVER_DRAIN_P2P,
+                    WorkflowOperation.RESTORE_GPU_SERVICES,
+                    WorkflowOperation.VALIDATE_GPU,
+                    WorkflowOperation.VALIDATE_FABRIC,
+                    WorkflowOperation.RESTORE_SCHEDULING,
+                ]
+            )
+            if event.affected_workload_ids:
+                operations.append(WorkflowOperation.RESTART_WORKLOAD)
             return operations
         if decision.official_action == "UPDATE_SWFW":
             operations.append(WorkflowOperation.MARK_UNSCHEDULABLE)

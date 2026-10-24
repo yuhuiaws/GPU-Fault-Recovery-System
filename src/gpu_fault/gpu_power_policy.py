@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from gpu_fault.gpu_metric_models import (
@@ -21,11 +22,14 @@ def power_violation_decision(
     sample: Any,
     delta: float | None,
     gpu_key: str,
+    rate_per_minute: float | None = None,
 ) -> dict | None:
     if (
         sample.canonical_name != "power_violation_total_us"
         or delta is None
         or delta < thresholds.power_violation_delta_warning_us
+        or rate_per_minute is None
+        or not 60_000 <= rate_per_minute <= 63_000_000
     ):
         return None
     peers = {
@@ -43,12 +47,10 @@ def power_violation_decision(
         or power / limit < thresholds.power_limit_ratio
         or utilization is None
         or utilization < thresholds.power_correlation_min_utilization_percent
+        or not all(math.isfinite(value) for value in (power, limit, utilization))
     ):
         return None
     threshold = thresholds.power_violation_delta_warning_us
-    source = (
-        "NVIDIA_DCGM_HEALTH" if threshold == 1 else "SITE_OVERRIDE_NVIDIA_DCGM_HEALTH"
-    )
     return {
         "severity": GpuHealthSeverity.WARNING,
         "reason": (
@@ -58,12 +60,7 @@ def power_violation_decision(
         "automatic_action": RecoveryAction.RUN_DIAGNOSTICS.value,
         "threshold_value": threshold,
         "threshold_source": "CORRELATED_POWER_LIMIT",
-        "policy_source": source,
-        "policy_version": (
-            NVIDIA_DCGM_POLICY_VERSION
-            if source == "NVIDIA_DCGM_HEALTH"
-            else SITE_METRIC_POLICY_VERSION
-        ),
+        "policy_source": "SITE_GPU_POWER_PERFORMANCE",
+        "policy_version": SITE_METRIC_POLICY_VERSION,
         "policy_reference": NVIDIA_DCGM_HEALTH_REFERENCE,
-        "official_action": "EXAMINE_GPU_HEALTH",
     }

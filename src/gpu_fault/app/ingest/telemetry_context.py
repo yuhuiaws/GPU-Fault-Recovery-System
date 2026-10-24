@@ -76,21 +76,24 @@ class TelemetryContextService:
         errors: list[str] | None = None,
     ) -> None:
         now = datetime.now(timezone.utc)
-        collection_errors = errors or []
-        self.context.store.save_collector_status(
-            CollectorStatus(
-                cluster_id=cluster_id,
-                node_id=node_id,
-                collector=collector,
-                observed_at=observed_at,
-                ingested_at=now,
-                last_success_at=(observed_at if not collection_errors else None),
-                last_error_at=(observed_at if collection_errors else None),
-                batch_id=batch_id,
-                sample_count=sample_count,
-                errors=collection_errors,
-            )
+        collection_errors = list(errors or [])
+        if collector in {CollectorKind.GPU_METRICS, CollectorKind.GPU_INVENTORY} and (
+            sample_count == 0 and not collection_errors
+        ):
+            collection_errors.append("empty GPU observation cannot establish health")
+        status = CollectorStatus(
+            cluster_id=cluster_id,
+            node_id=node_id,
+            collector=collector,
+            observed_at=observed_at,
+            ingested_at=now,
+            last_success_at=(observed_at if not collection_errors else None),
+            last_error_at=(observed_at if collection_errors else None),
+            batch_id=batch_id,
+            sample_count=sample_count,
+            errors=collection_errors,
         )
+        self.context.store.save_collector_status(status)
 
     def _capture_evidence(
         self,

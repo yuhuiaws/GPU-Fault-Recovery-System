@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 
 PCIE_XID_RULE = "PCIE_XID_LINK_FAILURE"
 GPU_COMPOSITE_TRANSACTION = "gpu-composite-correlation"
-SITE_CORRELATION_POLICY_VERSION = "site-dcgm-correlation/v1"
+SITE_CORRELATION_POLICY_VERSION = "site-dcgm-correlation/v3"
 _LINK_XIDS = frozenset({32, 79})
 _PCI_BDF = re.compile(
     r"(?:(?P<domain>[0-9a-f]{4}|[0-9a-f]{8}):)?"
@@ -84,6 +84,14 @@ def composite_finding(
         if len(evidence_refs) == 1
         else batch.evidence_ref,
         automatic_action=action.value,
+        official_action=next(
+            (
+                item.official_action
+                for item in components
+                if item.automatic_action == action.value and item.official_action
+            ),
+            None,
+        ),
         policy_source="SITE_DCGM_CORRELATION",
         policy_version=SITE_CORRELATION_POLICY_VERSION,
         policy_reference=NVIDIA_DCGM_HEALTH_REFERENCE,
@@ -129,16 +137,22 @@ def metric_counter_delta(
 ) -> float | None:
     if previous is None or not is_counter:
         return None
-    if sample.canonical_name == "pcie_replay_total":
-        boots = {
-            value
-            for labels in (sample.labels, previous.sample.labels)
-            for name in ("source_boot_id", "boot_id")
-            if (value := labels.get(name))
-        }
-        if len(boots) > 1 or min(sample.value, previous.sample.value) < 0:
-            return None
-    return max(0.0, sample.value - previous.sample.value)
+    boots = {
+        value
+        for labels in (sample.labels, previous.sample.labels)
+        for name in ("source_boot_id", "boot_id")
+        if (value := labels.get(name))
+    }
+    if (
+        len(boots) > 1
+        or min(sample.value, previous.sample.value) < 0
+        or not math.isfinite(previous.sample.value)
+        or sample.value < previous.sample.value
+        or sample.gpu_uuid != previous.sample.gpu_uuid
+        or sample.pci_bdf != previous.sample.pci_bdf
+    ):
+        return None
+    return sample.value - previous.sample.value
 
 
 def pci_bdf_matches(left: str, right: str) -> bool:

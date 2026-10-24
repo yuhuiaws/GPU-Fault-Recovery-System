@@ -14,13 +14,14 @@ from tests.execution._cov95_runtime_handoff import (
 )
 
 
-def test_reset_successor_inherits_quiesce_proof_without_replaying_the_mutation() -> (
-    None
-):
-    h = handoff_harness([QUIESCE, RESET, RESTORE])
+@pytest.mark.parametrize("reset", [RESET, WorkflowOperation.RECOVER_DRAIN_P2P])
+def test_reset_successor_inherits_quiesce_proof_without_replaying_the_mutation(
+    reset: WorkflowOperation,
+) -> None:
+    h = handoff_harness([QUIESCE, reset, RESTORE])
     result = h.execute()
     assert result.status is WorkflowStatus.SUCCEEDED, result
-    assert [call.step.operation for call in h.adapter.calls] == [RESET, RESTORE], (
+    assert [call.step.operation for call in h.adapter.calls] == [reset, RESTORE], (
         h.adapter.calls
     )
     saved = h.store.get_workflow(h.workflow.request_id)
@@ -149,11 +150,12 @@ def test_quiesce_handoff_preserves_node_scope_and_cleanup_requirements(
 
 
 @pytest.mark.parametrize("settling_operation", [RESTORE, REBOOT])
+@pytest.mark.parametrize("reset", [RESET, WorkflowOperation.RECOVER_DRAIN_P2P])
 def test_reset_successor_requiesces_after_predecessor_already_settled_quiesce(
-    settling_operation: WorkflowOperation,
+    settling_operation: WorkflowOperation, reset: WorkflowOperation
 ) -> None:
     h = handoff_harness(
-        [QUIESCE, RESET, RESTORE],
+        [QUIESCE, reset, RESTORE],
         predecessor_updates={
             "official_steps": [
                 workflow_step(QUIESCE),
@@ -173,7 +175,7 @@ def test_reset_successor_requiesces_after_predecessor_already_settled_quiesce(
     assert result.status is WorkflowStatus.SUCCEEDED, result
     assert [call.step.operation for call in h.adapter.calls] == [
         QUIESCE,
-        RESET,
+        reset,
         RESTORE,
     ], (
         "a restored or rebooted predecessor no longer proves that GPU services are quiesced",

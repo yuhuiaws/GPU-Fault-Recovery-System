@@ -7,7 +7,7 @@ from gpu_fault.host_health import (
     NodeHealthFinding,
     NodeHealthIngestionResult,
 )
-from gpu_fault.models import AdvisoryNotification
+from gpu_fault.models import AdvisoryNotification, RecoveryAction
 
 #: Findings that exist to put a human in the loop rather than to drive a
 #: recovery: an unparsable fault line, a GPU whose identity changed under the
@@ -80,6 +80,13 @@ class NodeHealthIngestionService:
         notifications = []
         host_resource_notification_groups = {}
         for finding in findings:
+            # Log evidence is already durably captured by the ingest transaction.
+            # Workload errors are not hardware markers or a second recovery owner.
+            if (
+                finding.policy_source == "SITE_APPLICATION_LOG"
+                and finding.recommended_action is RecoveryAction.NO_ACTION
+            ):
+                continue
             # The marker is built before ingestion picks an incident, so it
             # cannot know the pointer: grouping and merging route a finding
             # into an incident that already owns the attempt or the node, and

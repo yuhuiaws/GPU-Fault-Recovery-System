@@ -301,6 +301,11 @@ def heartbeat_reporter_from_environment(
         node_instance_id=node_instance_id,
         agent_incarnation_id=agent_incarnation_id,
         generation_sink=executor.set_agent_generation,
+        communication_plan_sink=(
+            executor.observation_runtime.accept_plan
+            if executor.observation_runtime is not None
+            else None
+        ),
         bearer_token=(
             os.getenv("GPU_FAULT_NODE_CONTROL_PLANE_TOKEN")
             or os.getenv("GPU_FAULT_CONTROL_PLANE_TOKEN")
@@ -357,6 +362,7 @@ class AgentHeartbeatReporter:
         node_instance_id: str | None = None,
         agent_incarnation_id: str | None = None,
         generation_sink=None,
+        communication_plan_sink=None,
         interval_seconds: float = 30,
         bearer_token: str | None = None,
         sender=None,
@@ -388,6 +394,7 @@ class AgentHeartbeatReporter:
         self.node_instance_id = node_instance_id
         self.agent_incarnation_id = agent_incarnation_id
         self.generation_sink = generation_sink
+        self.communication_plan_sink = communication_plan_sink
         self.interval_seconds = interval_seconds
         # The wait between heartbeats moves by +-ratio of the interval so a
         # fleet restarted together does not beat in step; the first heartbeat
@@ -449,6 +456,9 @@ class AgentHeartbeatReporter:
                 )
             )
         heartbeat = AgentHeartbeat(
+            communication_monitor_version="communication-monitor/v1"
+            if self.communication_plan_sink is not None
+            else None,
             cluster_id=self.cluster_id,
             node_id=self.node_id,
             endpoint=self.endpoint,
@@ -496,6 +506,14 @@ class AgentHeartbeatReporter:
             and isinstance(response.get("generation"), int)
         ):
             self.generation_sink(response["generation"])
+        if self.communication_plan_sink is not None and isinstance(response, dict):
+            plan = response.get("communication_plan")
+            if plan is not None and (
+                plan.get("cluster_id") != self.cluster_id
+                or plan.get("node_id") != self.node_id
+            ):
+                raise ValueError("communication plan belongs to a different agent")
+            self.communication_plan_sink(plan)
         return response
 
     def run(self, stop: Event) -> None:

@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
+from gpu_fault.spare_fault_evidence import fault_reasons, observation_reasons
+
 import hmac
 import logging
 import secrets
@@ -25,7 +29,6 @@ from gpu_fault.fleet import AgentRecord, AgentTransitionRequest
 from gpu_fault.hyperpod import HyperPodSubmissionRecord
 from gpu_fault.markers import (
     blocking_spare_markers,
-    describe_blocking_marker,
 )
 from gpu_fault.models import (
     AdvisoryNotification,
@@ -1026,11 +1029,6 @@ async def regional_spare_health(
             cluster_id=cluster_id,
             observed_after=health.observed_after,
         )
-        if markers:
-            reasons.append(
-                "active trusted node fault marker exists: "
-                + ", ".join(describe_blocking_marker(marker) for marker in markers)
-            )
         findings = [
             finding
             for alias in aliases
@@ -1042,8 +1040,16 @@ async def regional_spare_health(
                 or finding.observed_at > health.observed_after
             )
         ]
-        if findings:
-            reasons.append("active GPU health finding exists")
+        reasons.extend(fault_reasons(markers, findings))
+        if len(agents) == 1:
+            reasons.extend(
+                observation_reasons(
+                    ctx.store,
+                    health.cluster_id,
+                    agents[0].node_id,
+                    datetime.now(timezone.utc),
+                )
+            )
         return RemoteSpareHealthReport(ready=not reasons, reasons=reasons)
 
     return await _store_call(dependencies, evaluate)

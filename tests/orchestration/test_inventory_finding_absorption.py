@@ -71,8 +71,8 @@ LIVE_RESET_CHAIN = [
 DCGM_EVENT = "gpu-batch-1-dcgm-fields"
 DIAGNOSTIC_PLAN = [
     WorkflowOperation.FREEZE_EVIDENCE,
-    WorkflowOperation.RUN_DCGM_DIAGNOSTIC,
-    WorkflowOperation.VALIDATE_GPU,
+    WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT,
+    WorkflowOperation.VALIDATE_HOST,
 ]
 
 

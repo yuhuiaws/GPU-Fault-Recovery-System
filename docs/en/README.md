@@ -19,6 +19,7 @@ headings are the alert names.
 |---|---|---|
 | [Documentation Index](README.md) | [文档索引](../README.md) | This index: entry points by task, authoritative documents, acceptance, generated files, conventions |
 | [Regional E2E Acceptance Test Cases](regional-e2e-acceptance-test-cases.md) | [区域模式端到端验收测试用例](../区域模式端到端验收测试用例.md) | The acceptance specification: every regional case, its preconditions, steps and verdict rules |
+| [Xid Recovery E2E](components/xid154-recovery-e2e.md) | [Xid linkage 与 Drain P2P 端到端测试](../components/xid154-recovery-e2e.md) | Software E2E cases, separate live acceptance and the UVM implementation gap |
 | [Regional Case Index](regional-case-index.md) | [区域用例索引](../区域用例索引.md) | Generated execution order and entry anchors of the regional cases |
 | [Performance Acceptance Plan](performance-acceptance-plan.md) | [性能压测验收方案](../性能压测验收方案.md) | Capacity model, thresholds and evidence format of the performance acceptance |
 | [Fault Simulation Test Manual](fault-simulation-test-manual.md) | [故障模拟测试手册](../故障模拟测试手册.md) | How to inject each fault class and what the system must do |
@@ -93,6 +94,7 @@ single-cluster all-in-one content is used only for migration and compatibility v
 | Document | Type | Maintenance rule |
 |---|---|---|
 | [Regional E2E Acceptance Test Cases](regional-e2e-acceptance-test-cases.md) | Specification | Revised with the current implementation; case IDs and title anchors stay stable |
+| [Xid Recovery E2E](components/xid154-recovery-e2e.md) | Focused regression | Software, physical acceptance and UVM implementation gaps are recorded separately |
 | [Regional Case Index](regional-case-index.md) | Generated artifact | Shows only the execution order and specification entry points, without internal execution state |
 | [Change Impact and Test Selection](change-impact-and-test-selection.md) | Development gate | Selects pytest and affected regional cases backwards from code paths |
 | [Coverage and Scenario Requirement Matrix](../components/scenario-coverage.md) | Quality statistics | Measures statements, branches, mechanism requirements and real-machine verification separately; keeps unimplemented items |

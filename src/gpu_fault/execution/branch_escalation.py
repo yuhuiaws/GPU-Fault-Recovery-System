@@ -31,6 +31,7 @@ from gpu_fault.models import (
     resolved_step_indexes,
 )
 from gpu_fault.execution.node_action_uncertainty import UNRESOLVED_NODE_ACTION
+from gpu_fault.health_recovery_contract import failed_step_is_diagnostic
 from gpu_fault.orchestration.dag_branching import branch_node_ids
 from gpu_fault.orchestration.escalation import (
     executor_rejected_failure,
@@ -113,6 +114,8 @@ class BranchEscalator:
 
         if not 0 <= failed_index < len(workflow.official_steps):
             return None
+        if failed_step_is_diagnostic(workflow, failed_index, details):
+            return None
         if not workflow.dag_enabled:
             adopted = self._adopt_single_node_plan(workflow, failed_index, details)
             if adopted is None:
@@ -155,7 +158,7 @@ class BranchEscalator:
         rung = (
             None
             if unknown or rejected or refused or unobserved
-            else next_rung(step.operation, recovery_context)
+            else next_rung(step.operation, recovery_context, details)
         )
         taken = workflow.branch_escalation_counts.get(lineage_node, 0)
         if rung is None or taken >= self.max_rungs:
@@ -322,7 +325,7 @@ class BranchEscalator:
         recovery_context = self._recovery_context(
             workflow, set(range(len(workflow.official_steps)))
         )
-        if next_rung(step.operation, recovery_context) is None:
+        if next_rung(step.operation, recovery_context, details) is None:
             return None
         return self.brancher.adopt_linear_plan(workflow)
 

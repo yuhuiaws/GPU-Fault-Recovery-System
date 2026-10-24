@@ -11,6 +11,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
+from gpu_fault.collectors.host.observation import HostObservationError
 from gpu_fault.host_health import (
     HostMetricSample,
 )
@@ -603,6 +604,8 @@ class HostSystemMetricsMixin:
         self._smart_health = _SmartHealth(
             observed_at if answered else None, devices, tuple(samples)
         )
+        if not answered:
+            raise HostObservationError("one or more SMART queries failed", samples)
         return samples
 
     def _smart_devices(self) -> tuple[str, ...]:
@@ -625,11 +628,9 @@ class HostSystemMetricsMixin:
     def _smart_verdict(self, device: str) -> tuple[list[HostMetricSample], bool]:
         """One drive's verdict, and whether the query itself answered.
 
-        A drive that has begun refusing SMART queries is a real dying-NVMe
-        failure mode, and it used to read exactly like a healthy one: no
-        sample at all. It is now reported as a failure of its own, tagged
-        ``failure_mode=QUERY_FAILED`` so an operator can tell it from a drive
-        whose own self-assessment failed, and the caller does not cache it.
+        A refused query is unknown, not a failed device self-assessment.
+        Report ``smart_query_failed`` plus a collection error, and retry next
+        cycle instead of caching it or authorizing hardware quarantine.
 
         A verdict-less answer from a *clean* ``smartctl`` is a different thing:
         that is a device ``--scan-open`` can open but which implements no SMART
@@ -674,14 +675,12 @@ class HostSystemMetricsMixin:
     def _smart_query_failed(device: str) -> HostMetricSample:
         """The marker for a drive whose SMART query could not be answered.
 
-        Same metric as a failed self-assessment -- a drive that cannot be
-        asked is not a drive that is known good -- with the reason in the
-        labels, which the consumer carries into the finding's diagnostic
-        parameters.
+        Kept separate from ``smart_health_failed``: unreadable health is not
+        proof of either a healthy drive or a hardware failure.
         """
 
         return HostMetricSample(
-            name="smart_health_failed",
+            name="smart_query_failed",
             value=1,
             device=device,
             labels={"failure_mode": "QUERY_FAILED"},
@@ -698,11 +697,15 @@ class HostSystemMetricsMixin:
             check=False,
         )
         if completed.returncode != 0:
-            return []
+            raise HostObservationError("BMC sensor query failed", [])
         critical = 0
+        observed = 0
         for line in completed.stdout.splitlines():
             columns = [item.strip().lower() for item in line.split("|")]
-            status = columns[2] if len(columns) > 2 else ""
+            if len(columns) < 4:
+                continue
+            observed += 1
+            status = columns[3]
             if status in {
                 "cr",
                 "critical",
@@ -710,4 +713,8 @@ class HostSystemMetricsMixin:
                 "non-recoverable",
             }:
                 critical += 1
+        if not observed:
+            raise HostObservationError(
+                "BMC sensor query returned no valid sensor rows", []
+            )
         return [self._sample("bmc_critical_sensor", critical, "sensors")]

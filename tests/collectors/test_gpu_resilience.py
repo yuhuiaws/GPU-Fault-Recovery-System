@@ -744,8 +744,8 @@ def test_a_carried_over_streak_is_dropped_before_a_real_candidate() -> None:
         # cannot starve them; the violation counter is last in the text, so it
         # is one of the two that survives and can be graded.
         return (
-            'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 95\n'
-            'DCGM_FI_DEV_GPU_TEMP{gpu="1",UUID="GPU-b"} 95\n'
+            'DCGM_FI_DEV_GPU_TEMP{gpu="0",UUID="GPU-a"} 86\n'
+            'DCGM_FI_DEV_GPU_TEMP{gpu="1",UUID="GPU-b"} 86\n'
             "DCGM_FI_DEV_POWER_VIOLATION"
             f'{{gpu="2",UUID="GPU-c"}} {violation}\n'
         )

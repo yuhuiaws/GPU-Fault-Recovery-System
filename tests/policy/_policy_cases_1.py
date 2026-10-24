@@ -723,13 +723,14 @@ def test_check_uvm_requires_evidence_and_follows_official_branch() -> None:
     assert used.action is RecoveryAction.RESET_GPU
 
 
-def test_catalog_minimum_version_is_enforced() -> None:
+def test_xid154_linkage_does_not_disable_older_driver_faults() -> None:
     decision = GpuFaultPolicyEngine().evaluate_xid(
         xid(95, event_id="old-driver", driver_branch=550, cuda_version="12.6")
     )
 
-    assert decision.action is None
-    assert decision.disposition is ActionDisposition.NOT_APPLICABLE
+    assert decision.action is RecoveryAction.RESET_GPU
+    assert decision.disposition is ActionDisposition.EXECUTABLE
+    assert decision.safety_action is None
 
 
 def test_all_direct_catalog_actions_are_exactly_normalized() -> None:

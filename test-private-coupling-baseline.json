@@ -124,7 +124,6 @@
   "tests/metrics/test_xid_correlation.py:engine._cached": 2,
   "tests/metrics/test_xid_correlation.py:engine._decisions": 1,
   "tests/node_agent/test_diagnostics.py:NodeActionExecutor._dcgm_diagnostic_statuses": 1,
-  "tests/node_agent/test_diagnostics.py:NodeActionExecutor._stack_summary": 2,
   "tests/node_agent/test_diagnostics.py:agent._await_flight_dumps": 2,
   "tests/node_agent/test_diagnostics.py:agent._capture_hung_process_state": 2,
   "tests/node_agent/test_diagnostics.py:agent._cleanup_diagnostic_archives": 1,

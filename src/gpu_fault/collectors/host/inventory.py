@@ -6,6 +6,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from gpu_fault.collectors.sinks import CollectorError
+from gpu_fault.collectors.host.observation import (
+    efa_inventory_counts,
+    is_efa_device,
+    is_efa_pci_device,
+)
 from gpu_fault.host_health import (
     HostMetricSample,
 )
@@ -261,50 +266,26 @@ class HostInventoryMixin:
     def _efa_inventory(self, _: datetime) -> list[HostMetricSample]:
         samples = []
         if self.expected_efa_device_count is not None:
-            devices = (
-                [
-                    device
-                    for device in self.infiniband_root.iterdir()
-                    if device.is_dir() and self._is_efa_device(device)
-                ]
-                if self.infiniband_root.exists()
-                else []
-            )
-            pci_devices = (
-                [
-                    device
-                    for device in self.pci_devices_root.iterdir()
-                    if device.is_dir() and self._is_efa_pci_device(device)
-                ]
-                if (
-                    self.pci_devices_root is not None and self.pci_devices_root.exists()
+            try:
+                pci_discovered, driver_bound, active_devices = efa_inventory_counts(
+                    self.infiniband_root, self.pci_devices_root
                 )
-                else []
-            )
-            pci_discovered = (
-                len(pci_devices) if self.pci_devices_root is not None else len(devices)
-            )
-            driver_bound = len(devices)
-            active_devices = 0
-            for device in devices:
-                active = False
-                for port in (device / "ports").glob("*"):
-                    state_path = port / "state"
-                    physical_path = port / "phys_state"
-                    if not state_path.exists():
-                        continue
-                    state = state_path.read_text().strip().split(":", 1)[0]
-                    physical = (
-                        physical_path.read_text().strip().split(":", 1)[0]
-                        if physical_path.exists()
-                        else "5"
-                    )
-                    if state == "4" and physical == "5":
-                        active = True
-                        break
-                if active:
-                    active_devices += 1
-            if pci_discovered < self.expected_efa_device_count:
+            except (OSError, ValueError) as exc:
+                self._inventory_mismatch_counts["efa"] = 0
+                raise CollectorError(
+                    f"EFA inventory observation unavailable: {exc}"
+                ) from exc
+            if pci_discovered is None:
+                failure_mode = (
+                    "INVENTORY_UNAVAILABLE"
+                    if driver_bound < self.expected_efa_device_count
+                    else "LINK_INACTIVE"
+                    if active_devices < self.expected_efa_device_count
+                    else "EXCESS_DEVICE"
+                    if active_devices > self.expected_efa_device_count
+                    else "HEALTHY"
+                )
+            elif pci_discovered < self.expected_efa_device_count:
                 failure_mode = "PCI_DEVICE_MISSING"
             elif driver_bound < self.expected_efa_device_count:
                 failure_mode = "DRIVER_UNBOUND"
@@ -319,7 +300,9 @@ class HostInventoryMixin:
                     resource="efa",
                     expected=self.expected_efa_device_count,
                     observed=active_devices,
-                    discovered=pci_discovered,
+                    discovered=pci_discovered
+                    if pci_discovered is not None
+                    else driver_bound,
                     inventory_details={
                         "driver_bound_count": driver_bound,
                     },
@@ -330,26 +313,8 @@ class HostInventoryMixin:
 
     @staticmethod
     def _is_efa_pci_device(device: Path) -> bool:
-        try:
-            vendor = (device / "vendor").read_text().strip().lower()
-            device_id = (device / "device").read_text().strip().lower()
-        except OSError:
-            return False
-        return vendor == "0x1d0f" and device_id.startswith("0xefa")
+        return is_efa_pci_device(device)
 
     @staticmethod
     def _is_efa_device(device: Path) -> bool:
-        driver_path = device / "device" / "driver"
-        try:
-            if driver_path.resolve(strict=True).name == "efa":
-                return True
-        except OSError:
-            pass
-        uevent_path = device / "device" / "uevent"
-        try:
-            return any(
-                line.strip() == "DRIVER=efa"
-                for line in uevent_path.read_text().splitlines()
-            )
-        except OSError:
-            return False
+        return is_efa_device(device)

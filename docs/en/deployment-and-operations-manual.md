@@ -10211,9 +10211,9 @@ export GPU_FAULT_EFA_TRAFFIC_STARTUP_GRACE_SECONDS=120
 | `GPU_FAULT_EFA_TRAFFIC_ZERO_BPS` | 1 | At or below this value counts as zero traffic |
 | `GPU_FAULT_EFA_TRAFFIC_ZERO_WARNING_SECONDS` | 60 | Continuous zero-traffic warning time |
 | `GPU_FAULT_EFA_TRAFFIC_ZERO_HUNG_SECONDS` | 600 | Continuous zero-traffic suspected-hung time |
-| `GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_ENABLED` | true | While training progress is still advancing (step growing or a checkpoint being written), resets the zero-traffic timer to the last progress instant. Depends on application instrumentation; without instrumentation it degrades automatically to no suppression |
-| `GPU_FAULT_EFA_TRAFFIC_RANK_LIVENESS_ENABLED` | true | Adopts the node-reported per-rank liveness (`training_rank_*`) to reset the zero-traffic timer. Depends on no application instrumentation |
-| `GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS` | 1800 | Suppression budget: from the first zero traffic the timer can be pushed back by at most this long; beyond it, escalation proceeds as usual regardless of "progress" |
+| `GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_ENABLED` | true | Deprecated compatibility setting; the NCCL pipeline does not read training step/phase or suppress on progress |
+| `GPU_FAULT_EFA_TRAFFIC_RANK_LIVENESS_ENABLED` | true | Retain node `training_rank_*` activity as context only; does not reset the RDMA idle clock |
+| `GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS` | 1800 | Deprecated compatibility setting; CPU, writes and training progress no longer postpone NCCL suspicion |
 | `GPU_FAULT_EFA_TRAFFIC_BASELINE_ALPHA` | 0.2 | EWMA new-sample weight, range `(0,1]` |
 | `GPU_FAULT_EFA_TRAFFIC_STARTUP_GRACE_SECONDS` | 120 | No zero-traffic judgement in the attempt's initial phase |
 
@@ -10229,7 +10229,7 @@ node row left before the rollback; after a rollback the older release does not f
 attempts start at WARMUP, and zero-traffic detection waits for a valid sample and `STARTUP_GRACE_SECONDS` -- no false
 alarm.
 
-### Per-Rank Liveness Decision Before Escalation (Independent of Application Instrumentation)
+### Per-Rank Activity Context (Not an NCCL Decision Gate)
 
 Zero traffic alone cannot distinguish a wedged collective from checkpoint writing or graph compilation, and
 `TrainingProgressCollector` requires the training script itself to write the progress file -- in multi-node torchrun jobs
@@ -10246,32 +10246,32 @@ and the node side directly answers "how long ago was rank progress last seen":
 | `GPU_FAULT_RANK_PROGRESS_MIN_CPU_CORES` | 0.5 | While the GPU is idle, host CPU usage reaching this many cores counts as advancing |
 | `GPU_FAULT_RANK_PROGRESS_GPU_IDLE_PERCENT` | 5 | The GPU counts as idle only when the node's maximum GPU utilisation does not exceed this value |
 
-Basis of the criteria:
+These are host activity hints, not communication progress:
 
 - **checkpoint**: `write_bytes` counts only block device writes; writing to FSx / streaming upload to S3 shows only in
-  `wchar`, so the larger of the two is taken. Log flushing is orders of magnitude below 1 MiB/s and is not misjudged.
-- **graph compilation / dataloader stall**: host CPU saturated while the GPU is idle. A stuck collective cannot
-  look like this -- its spin kernel occupies the SMs and GPU utilisation is non-zero.
+  `wchar`, so the larger is taken. Logging or background I/O can also exceed this threshold and cannot exclude a hang.
+- **graph compilation / dataloader stall**: host CPU can be saturated while the GPU is idle, but this
+  also cannot exclude a rank failing to enter a collective or a different hung communication group.
 - **CPU busy alone does not count as progress**: NCCL waiting itself spins, so the CPU criterion must hold
   together with GPU idle.
 - The reported `training_rank_write_syscalls_delta` and
   `training_rank_voluntary_ctxt_switches_delta` serve only as evidence and take no part in the decision: during a hang
   watchdog logging drives them up too.
 
-The control plane converts the node-reported `training_rank_seconds_since_progress` into a measured progress instant
-and resets the zero-traffic timer from it; the
-`diagnostic_parameters.rank_liveness.status` of a `HUNG_SUSPECTED` finding records the decision source of this escalation:
+The control plane retains host activity timestamps without resetting the zero-traffic clock.
+`diagnostic_parameters.rank_liveness.use=CONTEXT_ONLY`; `status` describes only the host probe:
 
 | status | Meaning |
 | --- | --- |
-| `stalled` | The node confirmed no rank is advancing; the escalation was confirmed by the probe |
-| `advancing` | Some rank is advancing (usually no escalation at this point, unless the suppression budget is exhausted) |
+| `stalled` | No host activity met the probe threshold; not proof of NCCL hung |
+| `advancing` | Host activity met the threshold; not proof of collective progress and does not suppress suspicion |
 | `unavailable` | The node reported nothing (no GPU process / no nvidia-smi / no baseline in the first collection period); **escalates as usual**, never silenced by a missing probe |
 | `disabled` | Turned off with `RANK_LIVENESS_ENABLED=false` |
 
-Suppression must have a budget: `PROGRESS_SUPPRESSION_MAX_SECONDS` guarantees that even if some signal "looks like
-progress" for a long time (for example a rank keeps spinning while the GPU is idle), escalation happens at the latest at
-`first zero traffic + 1800 s + ZERO_HUNG_SECONDS`, so the detector is never permanently muted.
+The new detector has no progress-suppression budget: same-attempt prior activity and valid sustained low RDMA
+trigger evidence collection, regardless of step/phase, writes or CPU activity. A long checkpoint may still
+trigger suspicion, so the workflow collects evidence for operator review, never automatically restarts training
+or uses train-step progress to decide completion.
 
 ## Configuring Host Resource Persistent Hazard Monitoring
 
@@ -10424,40 +10424,48 @@ env:
 already contains this configuration, but the Runtime Profile is a placeholder; it must first be rendered with
 `scripts/e2e/render_manifest.py --runtime-profile "${RUNTIME_PROFILE_VERSION}"`
 before applying. Without these variables,
-`COLLECT_HUNG_TRIAGE` does not fail but degrades from the flight recorder rules to a single round of py-spy and
-`/proc` behaviour judgement. The Node Agent allowlist must contain `COLLECT_HUNG_TRIAGE`; that operation is
+`COLLECT_HUNG_TRIAGE` still retains up to three py-spy JSON and proc observations.
+Without declared comparable roles it does not infer cross-process outliers; unknown ranks still yield
+node/PID evidence, and failed captures never produce valid signatures.
+The Node Agent allowlist must contain `COLLECT_HUNG_TRIAGE`; that operation is
 read-only and does not require enabling GPU reset, driver remediation or firmware update.
 
 The `HUNG_SUSPECTED` workflow is fixed as:
 
 ```text
 FREEZE_EVIDENCE
-  └─ COLLECT_HUNG_TRIAGE (all attempt nodes, <=10s)
-       ├─ COLLECT_DIAGNOSTIC_BUNDLE (culprit nodes/PIDs only)
+  └─ COLLECT_HUNG_SUMMARY (all attempt nodes)
+       ├─ COLLECT_HUNG_TRIAGE (first <=4 nodes, two FR snapshots/PID)
+       │    └─ COLLECT_HUNG_TRIAGE (bounded expansion, two FR snapshots/PID)
+       │         └─ COLLECT_DIAGNOSTIC_BUNDLE (bounded nodes or verified PIDs)
        └─ VALIDATE_FABRIC (all attempt nodes)
+            → ESCALATE_SUPPORT after bundle and validation
 ```
 
 When inspecting the workflow you must confirm:
 
 - `dag_enabled=true`, and `dag_revision=1` when the triage is created;
-- Both the bundle and fabric validation depend on the triage, and fabric validation does not depend on the bundle;
-- `dag_revision` increments after the triage completes;
-- The bundle parameters contain an exact `target_pids_by_node`, with
+- Fabric validation depends on the all-task summary, not active triage or the bundle;
+- `dag_revision` increments when summary/triage results rewrite targets;
+- New plans use a 20-second node sampling budget and at least two seconds between fresh, process-bound FR observations;
+- Only paired temporal evidence, complete group membership and verified process identities permit exact `target_pids_by_node`, with
   `expand_python_cgroup_processes=false`;
 - Unreachable nodes are recorded in `undetermined_nodes` and do not block the triage completing as a whole.
 
 Diagnostic bundles live by default in `/var/lib/gpu-fault/diagnostics`; after configuring
 `GPU_FAULT_DIAGNOSTIC_S3_URI=s3://<bucket>/<prefix>` they are uploaded to S3. Check that
 `fault_context.diagnostic_reason` in `manifest.json` is
-`EFA_TRAFFIC_HUNG_SUSPECTED`, and confirm the presence of `gpu_processes`,
-`proc-*-stack-sample-NN.txt`, `python-stack-*-sample-NN.txt` and
-`strace-*-sample-NN*`. Every associated Python PID should have three Python stacks `sample-01/02/03`;
-Python launchers such as `torchrun` that hold no CUDA context are associated through the same
-container cgroup as the GPU PID. When `py-spy` or `strace` fails on ptrace permission, the manifest records the
-error and the workflow
+`EFA_TRAFFIC_HUNG_SUSPECTED`. Without eligible candidates, the bounded passive bundle need not contain
+process stacks; eligible targeted bundles attach only to verified PIDs. Hung bundles omit strace,
+DCGM diag and bug-report. Per-process `flight_recorder_series` retains two compact summaries and
+explicit timing/gaps; the application may overwrite the same raw dump file on the second request.
+Completion is assessed separately from enqueue, and persistent-pending duration is an observation
+lower bound, not proof of a 600-second stall. See [NCCL hung hardening](../components/nccl-hung-hardening.md).
+
+Generic process collection outside the default hung path
 still keeps the NVIDIA, DCGM, kernel and network evidence.
 
-Every GPU compute process is sampled 3 times by default, rather than one 10-second collection:
+The following three-sample settings apply to generic/later process collection, not to the two FR observations in hung triage:
 
 ```bash
 export GPU_FAULT_HUNG_STRACE_SAMPLE_COUNT=3
@@ -10499,7 +10507,7 @@ export GPU_FAULT_NODE_ACTION_MAX_PARALLEL=16
 
 | Parameter | Default | Meaning |
 | --- | ---: | --- |
-| `GPU_FAULT_HUNG_TRIAGE_MAX_NODES` | 8 | Maximum number of nodes attached in one hung triage; `0` means unlimited |
+| `GPU_FAULT_HUNG_TRIAGE_MAX_NODES` | 8 | Combined budget for two active FR/stack waves, explicitly configurable up to 256; legacy `0` remains 32. A 128-node job can use 128, independently of MAX_PARALLEL and the 32 in-flight cap. Does not cap all-task summary; the later untargeted bundle stays at most 32 nodes |
 | `GPU_FAULT_NODE_ACTION_MAX_PARALLEL` | 16 | Node-level concurrency cap of `COLLECT_HUNG_TRIAGE` / `COLLECT_DIAGNOSTIC_BUNDLE` |
 
 The triage reads the flight recorder on every node and takes one py-spy sample per rank, briefly

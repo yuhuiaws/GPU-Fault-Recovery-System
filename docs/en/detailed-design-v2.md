@@ -1333,7 +1333,7 @@ and resubmitting an old sample does not pollute the current decision.
 `GPU_FAULT_DCGM_POWER_LIMIT_RATIO=0.95` with
 `GPU_FAULT_DCGM_POWER_CORRELATION_MIN_UTILIZATION_PERCENT=80` (power pegged at the cap under low utilization
 does not count as an anomaly), `GPU_FAULT_DCGM_RETIRED_PAGES_DBE_DELTA_CRITICAL=1`. The metric policy version
-`site-dcgm-metric-policy/v3` is defined in `src/gpu_fault/gpu_metric_models.py`, increments with decision-semantics
+`site-dcgm-metric-policy/v4` is defined in `src/gpu_fault/gpu_metric_models.py`, increments with decision-semantics
 changes, and is carried in events; **interpreting historical events must start with this version number**.
 
 **⑩ Logs/metrics/alerts**: every sample logs `node_id`, `channel`, `sample_count`,
@@ -1568,7 +1568,7 @@ Incident, generate the Recovery Plan, generate the Workflow and step sequence, a
 
 **② Inputs and outputs** — inputs `FaultPolicyDecision` and external operations requests (`/simulate`,
 recovery-plan class interfaces). Outputs Incident (`IncidentState`, 6 states), Workflow
-(`WorkflowStatus`, 7 states), step list (`WorkflowOperation`, **33** kinds),
+(`WorkflowStatus`, 7 states), step list (`WorkflowOperation`, **35** kinds),
 the audit facts distributed across `WorkflowStepExecution`, remote command, processor replay and raw evidence,
 and notification triggers.
 
@@ -3241,7 +3241,7 @@ rule file can express them all at once:
 | `match.driver` | Only one place, NVLink5: `nvlink5Policy.driverBoundary: 575` | No generic driver matching (§11) |
 | `decision.severity` / `scope` | `FaultPolicyDecision.severity` / `containment` computed at decision time | Not hard-coded in the rule |
 | `decision.action` | `immediateAction` / `investigatoryAction` (vendor wording) → mapped to `RecoveryAction`(17) | Original text kept for reconciliation against vendor docs |
-| `workflow.steps` | `src/gpu_fault/orchestration/workflow_builder.py` generates the `WorkflowOperation`(33) sequence from action and capabilities | **Not a hand-written step list in the rule** |
+| `workflow.steps` | `src/gpu_fault/orchestration/workflow_builder.py` generates the `WorkflowOperation`(35) sequence from action and capabilities | **Not a hand-written step list in the rule** |
 | `approval` | **Does not exist**. The gate for destructive actions is the fleet consistency preflight (§3.7 ⑪), not approval | §8.6, §11 |
 | `cooldown` | `defaults.markerTtlSeconds: 3600` + notification cooldown 3600s | Implemented via markers, not a rule field |
 | `maxAttempts` | Restart budget (`src/gpu_fault/execution/restart_budget_preflight.py`) + ladder escalation | Not a rule field |

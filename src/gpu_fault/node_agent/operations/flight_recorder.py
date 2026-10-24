@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import os
@@ -8,6 +9,10 @@ import stat
 import time
 from pathlib import Path
 from typing import Any, Callable
+
+from gpu_fault.flight_progress import apply_pg_status, completed, group_progress
+from gpu_fault.node_agent.operations.collection_budget import bounded_read
+from gpu_fault.node_agent.operations.flight_evidence import preserve_dump
 
 
 class FlightRecorderUnpickler(pickle.Unpickler):
@@ -24,6 +29,21 @@ class FlightRecorderUnpickler(pickle.Unpickler):
         raise pickle.UnpicklingError(
             f"refusing to resolve {module}.{name} from a flight recorder dump"
         )
+
+
+def decode_flight_dump(raw: bytes) -> Any:
+    if len(raw) > 64 * 1024 * 1024:
+        raise ValueError("flight recorder dump exceeds 64 MiB")
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except RecursionError as exc:
+        raise ValueError("flight recorder nesting exceeds parser limit") from exc
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        pass
+    try:
+        return FlightRecorderUnpickler(io.BytesIO(raw)).load()
+    except Exception as exc:
+        raise ValueError(f"unparsable flight recorder dump: {type(exc).__name__}: {exc}") from exc
 
 
 class FlightRecorderOperationsMixin:
@@ -44,16 +64,18 @@ class FlightRecorderOperationsMixin:
         PyTorch writes the dump from its own monitor thread once that
         thread notices the pipe write, which on a real 24-rank p5en hang
         took 3.4s. The single check done while assembling the ranks
-        therefore always reported ``dump_missing`` and the classifier
-        lost the only signal that can yield a CONFIRMED verdict, so keep
-        polling the candidates with whatever budget is left.
+        therefore reported ``dump_missing``. Retry missing or partially written
+        files within the budget; neither absence nor a snapshot confirms a cause.
         """
 
         pending = [
             row
             for row in ranks
-            if (row.get("flight_recorder") or {}).get("status") == "dump_missing"
-            and (requests.get(row.get("pid")) or {}).get("status") == "triggered"
+            if (
+                (row.get("flight_recorder") or {}).get("status") == "dump_missing"
+                or (row.get("flight_recorder") or {}).get("parse_error")
+            )
+            and (requests.get(row["pid"]) or {}).get("status") == "triggered"
         ]
         waiting_since = time.monotonic()
         while pending:
@@ -63,17 +85,21 @@ class FlightRecorderOperationsMixin:
             self.sleep(min(interval, remaining))
             still_pending = []
             for row in pending:
+                if time.monotonic() >= deadline:
+                    return round(time.monotonic() - waiting_since, 6)
                 finished = self._finish_flight_recorder(requests.get(row["pid"]) or {})
-                if finished.get("status") == "dump_missing":
+                row["flight_recorder"] = finished
+                if finished.get("status") == "dump_missing" or finished.get(
+                    "parse_error"
+                ):
                     still_pending.append(row)
-                else:
-                    row["flight_recorder"] = finished
             pending = still_pending
         return round(time.monotonic() - waiting_since, 6)
 
     def _process_environment(self, pid: int) -> dict[str, str]:
         try:
-            raw = (self.proc_root / str(pid) / "environ").read_bytes()[:1_048_576]
+            with (self.proc_root / str(pid) / "environ").open("rb") as stream:
+                raw = stream.read(1_048_576)
         except OSError:
             return {}
         values = {}
@@ -280,8 +306,26 @@ class FlightRecorderOperationsMixin:
         }
         try:
             summary.update(
-                self._flight_recorder_summary(self._load_flight_dump(dump_path))
+                bounded_read(
+                    lambda: self._flight_recorder_summary(
+                        self._load_flight_dump(dump_path)
+                    ),
+                    2,
+                )
             )
+            after = self._dump_file_stat(dump_path)
+            if after is None or (after.st_ino, after.st_size, after.st_mtime_ns) != (
+                dump_stat.st_ino,
+                dump_stat.st_size,
+                dump_stat.st_mtime_ns,
+            ):
+                summary["parse_error"] = "dump changed while being read"
+            elif request.get("evidence_path"):
+                summary["raw_evidence"] = bounded_read(
+                    lambda: preserve_dump(
+                        dump_path, Path(request["evidence_path"]), dump_stat
+                    )
+                )
         except (OSError, ValueError) as exc:
             summary["parse_error"] = f"{type(exc).__name__}: {exc}"
         return summary
@@ -295,20 +339,13 @@ class FlightRecorderOperationsMixin:
         ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE`` - a real p5en dump starts
         with ``\\x80\\x02}``, not ``{``. Parsing JSON only meant every
         production dump ended as ``parse_error`` and the flight-recorder
-        evidence (the only path to a CONFIRMED verdict) was thrown away.
+        evidence was thrown away.
         """
 
-        raw = path.read_bytes()[: 64 * 1024 * 1024]
-        try:
-            return json.loads(raw.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
-            pass
-        try:
-            return FlightRecorderUnpickler(io.BytesIO(raw)).load()
-        except Exception as exc:  # unpickling raises many types
-            raise ValueError(
-                f"unparsable flight recorder dump: {type(exc).__name__}: {exc}"
-            ) from exc
+        limit = 64 * 1024 * 1024
+        with path.open("rb") as stream:
+            raw = stream.read(limit + 1)
+        return decode_flight_dump(raw)
 
     @classmethod
     def _flight_recorder_summary(cls, payload: Any) -> dict[str, Any]:
@@ -317,9 +354,59 @@ class FlightRecorderOperationsMixin:
         summaries = [item for item in summaries if item]
         if not summaries:
             return {"entry_count": 0}
-        unfinished = [
-            item for item in summaries if not item.get("time_discovered_completed")
-        ]
+        config = payload.get("pg_config", {}) if isinstance(payload, dict) else {}
+        by_pg: dict[str, dict[str, Any]] = {}
+        entries_by_pg: dict[str, list[dict[str, Any]]] = {}
+        for item in summaries:
+            name = item["pg_name"]
+            if not name or name == ":":
+                continue
+            entries_by_pg.setdefault(name, []).append(item)
+            current = by_pg.get(name)
+            if current is None or (
+                item["collective_seq_id"],
+                str(item.get("time_created") or ""),
+            ) > (current["collective_seq_id"], str(current.get("time_created") or "")):
+                by_pg[name] = item
+        for name, item in by_pg.items():
+            semantic_entries = [
+                dict(entry)
+                for entry in sorted(
+                    entries_by_pg[name],
+                    key=lambda entry: (completed(entry), entry["collective_seq_id"]),
+                )[:64]
+            ]
+            item["progress"] = apply_pg_status(
+                group_progress(entries_by_pg[name]), payload, item.get("pg_id")
+            )
+            item["semantic_entries"] = semantic_entries
+            group = (
+                config.get(item.get("pg_config_key", name), {})
+                if isinstance(config, dict)
+                else {}
+            )
+            members = group.get("ranks") if isinstance(group, dict) else None
+            if isinstance(members, str):
+                try:
+                    members = json.loads(members)
+                except ValueError:
+                    members = None
+            if (
+                isinstance(members, list)
+                and members
+                and all(type(rank) is int and rank >= 0 for rank in members)
+            ):
+                ordered = sorted(set(members))
+                item["pg_member_count"] = len(ordered)
+                item["pg_membership_sha256"] = hashlib.sha256(
+                    json.dumps(ordered, separators=(",", ":")).encode()
+                ).hexdigest()
+                if len(ordered) <= 256:
+                    item["pg_members"] = ordered
+                    item["pg_rank_order"] = members
+                else:
+                    item["pg_members_compacted"] = True
+        unfinished = [item for item in summaries if not completed(item)]
         last = max(
             summaries,
             key=lambda item: (
@@ -332,6 +419,8 @@ class FlightRecorderOperationsMixin:
         return {
             "entry_count": len(summaries),
             "last_entry": last,
+            "last_entries_by_pg": [by_pg[name] for name in sorted(by_pg)[:64]],
+            "process_groups_truncated": len(by_pg) > 64,
             "unfinished_entry_count": len(unfinished),
             "unfinished_entries": selected[1:65],
             "unfinished_entries_truncated": len(selected) > 65,
@@ -339,46 +428,40 @@ class FlightRecorderOperationsMixin:
 
     @classmethod
     def _flight_entries(cls, value: Any) -> list[dict[str, Any]]:
-        if isinstance(value, list):
-            direct = [item for item in value if isinstance(item, dict)]
-            if direct and any(
+        pending = [value]
+        visited: set[int] = set()
+        result = []
+        while pending:
+            item = pending.pop()
+            if not isinstance(item, (dict, list, tuple)) or id(item) in visited:
+                continue
+            visited.add(id(item))
+            if len(visited) > 100_000:
+                raise ValueError("flight recorder structure exceeds traversal limit")
+            if isinstance(item, dict) and (
                 "collective_seq_id" in item or "collective_seq_id_" in item
-                for item in direct
             ):
-                return direct
-            result = []
-            for item in value:
-                result.extend(cls._flight_entries(item))
-            return result
-        if isinstance(value, dict):
-            for key in (
-                "entries",
-                "trace",
-                "records",
-                "flight_recorder",
-            ):
-                if key in value:
-                    result = cls._flight_entries(value[key])
-                    if result:
-                        return result
-            result = []
-            for item in value.values():
-                result.extend(cls._flight_entries(item))
-            return result
-        return []
+                result.append(item)
+            else:
+                pending.extend(item.values() if isinstance(item, dict) else item)
+                if len(pending) > 100_000:
+                    raise ValueError(
+                        "flight recorder structure exceeds traversal limit"
+                    )
+        return result
 
     @staticmethod
     def _flight_entry_summary(
         entry: dict[str, Any],
     ) -> dict[str, Any]:
-        def value(*names):
+        def value(*names: str) -> Any:
             for name in names:
                 if name in entry:
                     return entry[name]
             return None
 
         seq = value("collective_seq_id", "collective_seq_id_")
-        if seq is None:
+        if seq is None or isinstance(seq, bool):
             return {}
         try:
             seq = int(seq)
@@ -387,6 +470,9 @@ class FlightRecorderOperationsMixin:
         group_name = value("group_name", "group_name_")
         group_desc = value("group_desc", "group_desc_")
         pg_name = value("pg_name", "pg_name_")
+        if isinstance(pg_name, (list, tuple)):
+            group_name = str(pg_name[0]) if pg_name else None
+            pg_name = ":".join(str(part) for part in pg_name[:2])
         if pg_name is None:
             # torch 2.10 records the group as
             # ``process_group: (uid, desc)`` and has neither pg_name nor
@@ -404,7 +490,11 @@ class FlightRecorderOperationsMixin:
             pg_name = f"{group_name or ''}:{group_desc or ''}"
         return {
             "pg_name": str(pg_name),
+            "pg_id": value("pg_id", "pg_id_"),
+            "pg_config_key": str(group_name if group_name is not None else pg_name),
             "collective_seq_id": seq,
+            "record_id": value("record_id", "record_id_"),
+            "is_p2p": value("is_p2p", "is_p2p_"),
             "state": value("state", "state_"),
             "p2p_seq_id": value("p2p_seq_id", "p2p_seq_id_"),
             "op_id": value("op_id", "op_id_"),

@@ -165,6 +165,13 @@ def test_hung_triage_rewrites_bundle_to_culprit_and_control() -> None:
         },
         "undetermined_nodes": [],
     }
+    for node_result in details["node_results"].values():
+        for row in node_result["ranks"]:
+            row["process_identity"] = {"verified": True, "start_time_ticks": 1000}
+            row["flight_recorder"]["last_entry"]["pg_members"] = [0, 1, 2]
+            from tests.execution._flight_series_support import add_series
+
+            add_series(row)
 
     rewritten = executor._rewrite_hung_triage_bundle(
         workflow, incident, triage_index=1, triage_details=details
@@ -181,7 +188,7 @@ def test_hung_triage_rewrites_bundle_to_culprit_and_control() -> None:
         "node-b": [200],
     }
     assert bundle.parameters["max_processes"] == 2
-    assert bundle.parameters["hung_triage_decision"]["classification"] == "CONFIRMED"
+    assert bundle.parameters["hung_triage_decision"]["classification"] == "PLAUSIBLE"
     assert "not_sampled_nodes" not in bundle.parameters["hung_triage_decision"]
 
     partial = executor._rewrite_hung_triage_bundle(
@@ -198,7 +205,7 @@ def test_hung_triage_rewrites_bundle_to_culprit_and_control() -> None:
     ] == ["node-d", "node-e"]
 
 
-def test_hung_triage_many_lagging_ranks_marks_fabric_suspected() -> None:
+def test_hung_triage_many_lagging_ranks_does_not_prove_fabric_failure() -> None:
     signals = [
         {
             "rank": rank,
@@ -218,28 +225,21 @@ def test_hung_triage_many_lagging_ranks_marks_fabric_suspected() -> None:
         signals, undetermined_nodes=[]
     )
 
-    assert decision["classification"] == "FABRIC_SUSPECTED"
-    assert decision["culprit_ranks"] == []
+    assert decision["classification"] == "PLAUSIBLE"
+    assert decision["culprit_ranks"] == [0, 1]
+    assert decision["root_cause_confirmed"] is False
 
 
 def test_hung_triage_orders_weak_candidates_by_efa_zero_time() -> None:
+    from tests.execution._process_evidence_support import process_signal
+
     signals = [
-        {
-            "rank": rank,
-            "node_id": f"node-{rank}",
-            "flight_recorder": {
-                "last_entry": {
-                    "pg_name": "default",
-                    "collective_seq_id": 10,
-                    "time_discovered_started": "t",
-                }
-            },
-            "proc": {
-                "cpu_ticks_delta": 10,
-                "thread_states": {"D": 1 if rank < 2 else 0},
-            },
-            "gpu": {"utilization_gpu_percent": 80},
-        }
+        process_signal(
+            rank,
+            rank=rank,
+            state="D" if rank < 2 else "R",
+            wchan="io_schedule" if rank < 2 else "0",
+        )
         for rank in range(4)
     ]
 
@@ -253,7 +253,9 @@ def test_hung_triage_orders_weak_candidates_by_efa_zero_time() -> None:
     )
 
     assert decision["classification"] == "WEAK"
-    assert decision["culprit_ranks"][:2] == [1, 0]
+    assert [item["rank"] for item in decision["candidate_processes"]][:2] == [1, 0], (
+        decision
+    )
 
 
 def test_hung_triage_confirms_the_rank_that_stopped_enqueueing() -> None:
@@ -267,7 +269,7 @@ def test_hung_triage_confirms_the_rank_that_stopped_enqueueing() -> None:
         signals, undetermined_nodes=[]
     )
 
-    assert decision["classification"] == "CONFIRMED"
+    assert decision["classification"] == "PLAUSIBLE"
     assert decision["culprit_ranks"] == [0]
     assert decision["mode_collective_seq_id"] == 21
     assert decision["pg_name"] == "0:default_pg"
@@ -289,15 +291,22 @@ def test_hung_triage_ignores_missing_start_times_shared_by_all() -> None:
         signals, undetermined_nodes=[]
     )
 
-    # No rank lags the sequence, so the verdict must come from the
-    # CPU/GPU evidence rather than declaring the whole fabric suspect.
-    assert decision["classification"] == "WEAK"
-    assert decision["culprit_ranks"] == [0]
+    # Untimed legacy behavior is not a substitute for repeated observations.
+    assert decision["classification"] == "UNDETERMINED"
+    assert decision["culprit_ranks"] == []
 
 
 def test_hung_triage_without_dumps_falls_through_to_cpu_gpu() -> None:
+    from tests.execution._process_evidence_support import process_signal
+
     signals = [
-        _hung_signal_without_dump(rank, spinning=rank != 0) for rank in range(24)
+        process_signal(
+            rank,
+            rank=rank,
+            state="D" if rank == 0 else "R",
+            wchan="io_schedule" if rank == 0 else "0",
+        )
+        for rank in range(24)
     ]
 
     decision = ProductionWorkflowExecutor._classify_hung_signals(
@@ -305,9 +314,12 @@ def test_hung_triage_without_dumps_falls_through_to_cpu_gpu() -> None:
     )
 
     assert decision["classification"] == "WEAK"
-    assert decision["culprit_ranks"] == [0]
+    assert decision["culprit_ranks"] == []
+    assert [item["rank"] for item in decision["candidate_processes"]] == [0], decision
     assert decision["flight_recorder_unavailable"] is True
-    assert decision["control_ranks"] and decision["control_ranks"] != [0]
+    assert decision["control_ranks"] == [], (
+        "no comparable role metadata justifies a control rank"
+    )
 
 
 def test_hung_triage_weak_ignores_traits_shared_by_every_rank() -> None:
@@ -320,7 +332,12 @@ def test_hung_triage_weak_ignores_traits_shared_by_every_rank() -> None:
     assert decision["classification"] == "UNDETERMINED"
     assert decision["culprit_ranks"] == []
     assert decision["flight_recorder_unavailable"] is True
-    assert "no rank stood out" in decision["reason"]
+    assert (
+        decision["evidence_branches"]["process_observations"][
+            "identity_unavailable_count"
+        ]
+        == 24
+    ), decision
 
 
 @pytest.mark.parametrize("graded_by_node_agent", [True, False])

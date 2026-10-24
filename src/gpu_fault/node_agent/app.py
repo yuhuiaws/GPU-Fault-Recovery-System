@@ -5,9 +5,8 @@ import logging
 import os
 import socket
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
-from threading import Event, RLock, Thread
+from threading import RLock
 from typing import Any
 
 from fastapi import FastAPI, HTTPException
@@ -17,6 +16,11 @@ from gpu_fault.env import env_bool
 from gpu_fault.env_validation import validate_gpu_fault_environment
 from gpu_fault.logging_setup import configure_logging
 from gpu_fault.node_agent.config import executor_from_environment
+from gpu_fault.node_agent.communication_runtime import (
+    CommunicationRuntime,
+    agent_lifespan,
+)
+from gpu_fault.models import WorkflowOperation
 from gpu_fault.node_agent.gpu_activity import WINDOW_OPEN_REFUSAL
 from gpu_fault.node_agent.executor import (
     UNPERSISTED_RESULT_ERROR,
@@ -260,8 +264,18 @@ def _reconciled_agent(executor: NodeActionExecutor | None) -> NodeActionExecutor
 def create_node_agent_app(
     executor: NodeActionExecutor | None = None,
     heartbeat_reporter: AgentHeartbeatReporter | None = None,
+    communication_observer: CommunicationRuntime | None = None,
 ) -> FastAPI:
     agent = _reconciled_agent(executor)
+    observer = communication_observer
+    if (
+        observer is None
+        and executor is None
+        and WorkflowOperation.COLLECT_HUNG_SUMMARY in agent.allowed_operations
+    ):
+        observer = CommunicationRuntime(agent)
+    if observer is not None:
+        agent.observation_runtime = observer
     ownership_gate = getattr(agent, "ownership_gate", None)
     reporter = (
         heartbeat_reporter
@@ -448,31 +462,9 @@ def create_node_agent_app(
         finally:
             drop_future(command_id, future)
 
-    @asynccontextmanager
-    async def lifespan(_):
-        stop = Event()
-        worker = None
-        if reporter is not None:
-            worker = Thread(
-                target=reporter.run,
-                args=(stop,),
-                name="gpu-fault-agent-heartbeat",
-                daemon=True,
-            )
-            worker.start()
-        try:
-            yield
-        finally:
-            stop.set()
-            if ownership_gate is not None:
-                ownership_gate.cancel_all()
-            if worker is not None:
-                worker.join(timeout=reporter.interval_seconds + 2)
-            action_pool.shutdown(wait=False, cancel_futures=False)
-
     app = FastAPI(
         title="GPU Fault Node Action Agent",
-        lifespan=lifespan,
+        lifespan=agent_lifespan(reporter, observer, ownership_gate, action_pool),
     )
 
     @app.get("/healthz")
@@ -508,6 +500,9 @@ def create_node_agent_app(
         counters = getattr(agent, "counters_snapshot", None)
         payload["counters"] = counters() if callable(counters) else {}
         payload["transport"] = transport_stats()
+        payload["communication_observation"] = (
+            observer.health() if observer is not None else {"enabled": False}
+        )
         return JSONResponse(status_code=status_code, content=payload)
 
     @app.post(

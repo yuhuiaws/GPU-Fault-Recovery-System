@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
 import os
 import re
@@ -17,11 +15,19 @@ from pydantic import (
     model_serializer,
 )
 
+from gpu_fault.efa_traffic_state import traffic_observation
 from gpu_fault.env import env_bool
+from gpu_fault.efa_stall_episode import episode_parameters
 from gpu_fault.host_low_utilization import (
     BatchManagedAttempt,
     UnresolvedAllocationWarnings,
     resolve_managed_attempt,
+)
+from gpu_fault.hung_lifecycle import cleanup_reason
+from gpu_fault.log_recovery_context import (
+    log_context,
+    log_event_id,
+    log_rule_decision,
 )
 from gpu_fault.log_rules import NODE_LOG_RULES
 from gpu_fault.models import (
@@ -143,9 +149,9 @@ _GPU_METRIC_FAULT_CLASSES = {
     "gpu_max_operating_tlimit_c": "GPU_THERMAL",
     "memory_max_operating_tlimit_c": "GPU_THERMAL",
     "thermal_violation_total_us": "GPU_THERMAL",
-    "power_violation_total_us": "GPU_THERMAL",
-    "power_usage_w": "GPU_THERMAL",
-    "power_limit_w": "GPU_THERMAL",
+    "power_violation_total_us": "GPU",
+    "power_usage_w": "GPU",
+    "power_limit_w": "GPU",
     "ecc_sbe_volatile_total": "GPU_MEMORY",
     "ecc_dbe_volatile_total": "GPU_MEMORY",
     "ecc_sbe_aggregate_total": "GPU_MEMORY",
@@ -177,7 +183,7 @@ _GPU_METRIC_FAULT_CLASSES = {
 }
 _GPU_COMPOSITE_FAULT_CLASSES = {
     "THERMAL_STRESS": "GPU_THERMAL",
-    "POWER_LIMIT_THROTTLING": "GPU_THERMAL",
+    "POWER_LIMIT_THROTTLING": "GPU",
     "GPU_MEMORY_DEGRADATION": "GPU_MEMORY",
     "CORRECTABLE_MEMORY_DEGRADATION": "GPU_MEMORY",
     "NVLINK_LINK_DEGRADATION": "GPU_FABRIC",
@@ -342,9 +348,23 @@ class SyntheticNodeReplacementRequest(StrictModel):
 
 
 _HOST_VALIDATION_LATEST_METRICS = {
+    "cpu_usage_percent",
     "load1_per_cpu",
     "memory_used_percent",
+    "memory_available_percent",
+    "swap_used_percent",
+    "page_cache_percent",
     "filesystem_used_percent",
+    "local_filesystem_used_percent",
+    "shared_filesystem_unavailable",
+    "shared_filesystem_used_percent",
+    "disk_io_util_percent",
+    "disk_io_await_ms",
+    "smart_health_failed",
+    "network_link_down",
+    "bmc_critical_sensor",
+    "training_rank_cpu_percent",
+    "host_gpu_utilization_percent",
 }
 
 
@@ -358,7 +378,7 @@ def efa_inventory_rule(
     str,
 ]:
     """Resolve EFA recovery semantics without policy state or Store access."""
-    failure_mode = sample.labels.get("failure_mode", "PCI_DEVICE_MISSING")
+    failure_mode = sample.labels.get("failure_mode", "INVENTORY_UNAVAILABLE")
     action, reason = {
         "DRIVER_UNBOUND": (
             RecoveryAction.REMEDIATE_EFA_DRIVER,
@@ -379,8 +399,8 @@ def efa_inventory_rule(
     }.get(
         failure_mode,
         (
-            RecoveryAction.REBOOT_NODE,
-            "active EFA inventory mismatch has an unknown failure mode",
+            RecoveryAction.RUN_DIAGNOSTICS,
+            "EFA inventory observation or failure mode is unknown",
         ),
     )
     return (
@@ -675,7 +695,10 @@ class NodeHealthPolicy:
     LOG_RULES = NODE_LOG_RULES
 
     def __init__(self, store) -> None:
+        from gpu_fault.efa_stall_episode import EfaRecoveryPolicy
+
         self.store = store
+        self.efa_recovery_policy = EfaRecoveryPolicy.from_env()
         self.unresolved_gpu_allocations = UnresolvedAllocationWarnings()
         self.efa_minimum_active_bps = float(
             os.getenv("GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS", "1048576")
@@ -690,25 +713,17 @@ class NodeHealthPolicy:
         self.efa_zero_warning_seconds = float(
             os.getenv("GPU_FAULT_EFA_TRAFFIC_ZERO_WARNING_SECONDS", "60")
         )
-        # A quiet fabric is not by itself a hang: checkpoint writes and
-        # graph compilation routinely idle the network for minutes on a
-        # healthy attempt. The threshold is deliberately longer than the
-        # longest of those phases, and progress suppression below
-        # restarts the clock whenever the attempt is still stepping.
+        # Quiet RDMA is a suspicion, not a diagnosis: long checkpoint or compute
+        # intervals can exceed this site threshold without a communication hang.
         self.efa_zero_hung_seconds = float(
             os.getenv("GPU_FAULT_EFA_TRAFFIC_ZERO_HUNG_SECONDS", "600")
         )
-        self.efa_progress_suppression_enabled = env_bool(
-            "GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_ENABLED", True
-        )
+        # Deprecated configuration remains accepted for rolling upgrades only.
+        from gpu_fault.hung_progress import validate_legacy_progress_configuration
+
+        validate_legacy_progress_configuration()
         self.efa_rank_liveness_enabled = env_bool(
             "GPU_FAULT_EFA_TRAFFIC_RANK_LIVENESS_ENABLED", True
-        )
-        self.efa_progress_suppression_max_seconds = float(
-            os.getenv(
-                ("GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS"),
-                "1800",
-            )
         )
         self.efa_baseline_alpha = float(
             os.getenv("GPU_FAULT_EFA_TRAFFIC_BASELINE_ALPHA", "0.2")
@@ -826,11 +841,6 @@ class NodeHealthPolicy:
             raise ValueError("GPU_FAULT_EFA_TRAFFIC_SPIKE_RATIO must be greater than 1")
         if self.efa_zero_hung_seconds < self.efa_zero_warning_seconds:
             raise ValueError("EFA zero hung threshold must not precede warning")
-        if self.efa_progress_suppression_max_seconds <= 0:
-            raise ValueError(
-                "GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_MAX_SECONDS "
-                "must be positive"
-            )
 
     def evaluate_metrics(self, batch: HostTelemetryBatch) -> list[NodeHealthFinding]:
         from gpu_fault.telemetry import TelemetryMetricLatest
@@ -894,7 +904,7 @@ class NodeHealthPolicy:
             )
             parameters = dict(sample.labels)
             if sample.name == "efa_inventory_mismatch":
-                parameters.setdefault("failure_mode", "PCI_DEVICE_MISSING")
+                parameters.setdefault("failure_mode", "INVENTORY_UNAVAILABLE")
             transition_findings.append(
                 NodeHealthFinding(
                     finding_id=f"finding-{event_id}",
@@ -1036,119 +1046,31 @@ class NodeHealthPolicy:
     def _active_attempt(self, batch: HostTelemetryBatch):
         return resolve_managed_attempt(self.store, batch)
 
-    def _training_progress_at(
-        self, cluster_id: str, attempt_id: str
-    ) -> datetime | None:
-        """Most recent evidence that the attempt is still advancing.
-
-        A rank whose step counter moved, or that is reporting an active
-        checkpoint, proves the attempt is not wedged even while the
-        fabric is idle. Absent instrumentation this returns ``None`` and
-        zero-traffic detection behaves exactly as before.
-        """
-
-        if not self.efa_progress_suppression_enabled:
-            return None
-        lister = getattr(self.store, "list_training_progress_states", None)
-        if lister is None:
-            return None
-        try:
-            states = lister(cluster_id, attempt_id)
-        except Exception:
-            LOGGER.exception(
-                "cannot read training progress for attempt %s",
-                attempt_id,
-            )
-            return None
-        timestamps = []
-        for state in states:
-            timestamps.append(state.last_progress_at)
-            if state.heartbeat.checkpoint_ref:
-                timestamps.append(state.heartbeat.observed_at)
-        return max(timestamps) if timestamps else None
-
     def _rank_liveness(self, batch: HostTelemetryBatch) -> dict[str, Any]:
-        """Read the node's own per-rank liveness verdict from the batch.
+        from gpu_fault.hung_progress import rank_liveness_evidence
 
-        The node samples ``/proc/<pid>/{io,stat}`` and GPU utilization for
-        every rank on every collection cycle and reports how long ago it
-        last saw one advance. That is the pre-escalation check for a hang:
-        a quiet fabric plus a rank that is still writing bytes or still
-        burning host CPU with idle GPUs is a checkpoint or a compile, not
-        a wedged collective. When the node reports nothing the result is
-        ``unavailable`` and escalation proceeds exactly as before, so a
-        broken probe cannot silence hang detection.
-        """
-
-        values = {
-            sample.name: sample.value
-            for sample in batch.samples
-            if sample.device is None and sample.name.startswith("training_rank_")
-        }
-        process_count = values.get("training_rank_process_count")
-        seconds = values.get("training_rank_seconds_since_progress")
-        evidence: dict[str, Any] = {
-            "process_count": process_count,
-            "advancing_count": values.get("training_rank_advancing_count"),
-            "seconds_since_progress": seconds,
-            "write_bytes_delta": values.get("training_rank_write_bytes_delta"),
-            "write_chars_delta": values.get("training_rank_write_chars_delta"),
-            "cpu_ticks_delta": values.get("training_rank_cpu_ticks_delta"),
-        }
-        if not self.efa_rank_liveness_enabled:
-            return {**evidence, "status": "disabled"}
-        if not process_count:
-            return {**evidence, "status": "unavailable"}
-        if seconds is None or seconds < 0 or seconds > 86400:
-            return {**evidence, "status": "unavailable"}
-        progress_at = batch.observed_at - timedelta(seconds=seconds)
-        return {
-            **evidence,
-            "status": (
-                "advancing"
-                if values.get("training_rank_advancing_count")
-                else "stalled"
-            ),
-            "progress_observed_at": progress_at.isoformat(),
-            "_progress_at": progress_at,
-        }
+        return rank_liveness_evidence(batch, self.efa_rank_liveness_enabled)
 
     def _evaluate_efa_traffic(
         self,
         batch: HostTelemetryBatch,
         managed_attempt: BatchManagedAttempt | None = None,
     ) -> list[NodeHealthFinding]:
-        samples = [
-            item
-            for item in batch.samples
-            if item.name == "efa_traffic_bytes_per_second" and item.device is None
-        ]
-        if len(samples) != 1:
+        reading = traffic_observation(batch.samples)
+        if reading is None:
             return []
+        bytes_per_second, observation_valid = reading
         observation = (
             managed_attempt.resolve()
             if managed_attempt is not None
             else self._active_attempt(batch)
         )
-        if observation is None:
+        if observation is None or cleanup_reason(observation, [batch.node_id]):
             return []
-        sample = samples[0]
         rank_liveness = self._rank_liveness(batch)
-        rank_progress_at = rank_liveness.pop("_progress_at", None)
-        instrumented_progress_at = self._training_progress_at(
-            batch.cluster_id, observation.attempt_id
-        )
-        progress_observed_at = max(
-            [
-                item
-                for item in (
-                    rank_progress_at,
-                    instrumented_progress_at,
-                )
-                if item is not None
-            ],
-            default=None,
-        )
+        # CPU/writes can continue during a collective hang. Neither these hints
+        # nor application step/phase reports reset the communication idle clock.
+        rank_liveness["use"] = "CONTEXT_ONLY"
         state_key = self.store.efa_traffic_state_key(batch.cluster_id, batch.node_id)
         state, emit = self.store.observe_efa_traffic(
             state_key=state_key,
@@ -1157,7 +1079,8 @@ class NodeHealthPolicy:
             job_id=observation.job_id,
             attempt_id=observation.attempt_id,
             observed_at=batch.observed_at,
-            bytes_per_second=max(0.0, sample.value),
+            bytes_per_second=bytes_per_second,
+            observation_valid=observation_valid,
             minimum_active_bps=self.efa_minimum_active_bps,
             spike_ratio=self.efa_spike_ratio,
             drop_ratio=self.efa_drop_ratio,
@@ -1166,11 +1089,9 @@ class NodeHealthPolicy:
             zero_hung_seconds=self.efa_zero_hung_seconds,
             baseline_alpha=self.efa_baseline_alpha,
             startup_grace_seconds=self.efa_startup_grace_seconds,
-            progress_observed_at=progress_observed_at,
-            progress_suppression_max_seconds=(
-                self.efa_progress_suppression_max_seconds
-            ),
+            progress_observed_at=None,
             spike_event_id=(f"{batch.batch_id}-efa-traffic-spike"),
+            recovery_policy=self.efa_recovery_policy,
         )
         actionable = {
             EfaTrafficSignal.SPIKE: (
@@ -1239,7 +1160,7 @@ class NodeHealthPolicy:
             "workload_ids": observation.workload_ids,
             "attempt_node_ids": attempt_node_ids,
             "baseline_bytes_per_second": (state.baseline_bytes_per_second),
-            "observed_bytes_per_second": sample.value,
+            "observed_bytes_per_second": bytes_per_second,
             "zero_duration_seconds": zero_duration,
             "efa_zero_since": (
                 state.zero_since.isoformat() if state.zero_since is not None else None
@@ -1249,15 +1170,10 @@ class NodeHealthPolicy:
                 if state.zero_first_seen_at is not None
                 else None
             ),
-            # Why the escalation was not suppressed. ``unavailable``
-            # means the node published no per-rank evidence and the
-            # decision rests on the zero-traffic clock alone.
             "rank_liveness": rank_liveness,
-            "training_progress_at": (
-                instrumented_progress_at.isoformat()
-                if instrumented_progress_at is not None
-                else None
-            ),
+            "detection_basis": "ATTEMPT_SCOPED_RDMA_IDLE",
+            "root_cause_confirmed": False,
+            **episode_parameters(state),
         }
         if capture_process_state and complete_gpu_mapping:
             diagnostic_parameters["gpu_uuids_by_node"] = gpu_uuids_by_node
@@ -1272,15 +1188,15 @@ class NodeHealthPolicy:
                 severity=severity,
                 reason=reason,
                 recommended_action=RecoveryAction.RUN_DIAGNOSTICS,
-                metric_name=sample.name,
-                value=sample.value,
+                metric_name="efa_traffic_bytes_per_second",
+                value=bytes_per_second,
                 evidence_ref=batch.evidence_ref,
                 runtime_profile_version=(batch.runtime_profile_version),
                 workload_state=batch.workload_state,
                 affected_workload_ids=(batch.affected_workload_ids),
                 job_id=observation.job_id,
                 attempt_id=observation.attempt_id,
-                policy_version="site-efa-traffic-policy/v1",
+                policy_version="site-efa-traffic-policy/v2",
                 policy_source="SITE_EFA_TRAFFIC",
                 diagnostic_parameters=diagnostic_parameters,
             )
@@ -1306,11 +1222,13 @@ class NodeHealthPolicy:
                 # can never produce a trusted isolation/quarantine marker.
                 if not rule.allows(entry_source):
                     continue
+                decision = log_rule_decision(self.store, batch, entry, rule)
+                if decision is None:
+                    continue
                 matches.append(
                     (
                         NodeHealthCategory(rule.category.value),
-                        rule.severity,
-                        rule.action,
+                        *decision,
                         rule.reason,
                         rule_index,
                     )
@@ -1326,6 +1244,7 @@ class NodeHealthPolicy:
                 ),
             )
             event_id = self._log_event_id(batch, entry)
+            context = log_context(self.store, batch, entry, action)
             findings.append(
                 NodeHealthFinding(
                     finding_id=f"finding-{event_id}",
@@ -1340,34 +1259,14 @@ class NodeHealthPolicy:
                     raw_message=entry.message,
                     evidence_ref=(f"{entry.source}://{batch.node_id}/{entry.entry_id}"),
                     runtime_profile_version=(batch.runtime_profile_version),
-                    workload_state=batch.workload_state,
-                    affected_workload_ids=(batch.affected_workload_ids),
+                    **context,
                 )
             )
         return findings
 
     @classmethod
     def _log_event_id(cls, batch: NodeLogBatch, entry: NodeLogEntry) -> str:
-        """The identity of one node-log finding, decided here and not on the node.
-
-        ``log-<entry_id>`` trusted the collector's id for the whole identity. A
-        training-log entry was ``sha256(path:offset)`` and every rank of a
-        distributed job writes the same path on its own node, so two nodes'
-        faults at the same offset were one event: the second node hit the first
-        node's incident in the duplicate fast path and never got a workflow
-        (P0-38A). The cluster and node are part of the digest, and the readable
-        prefix is for operators only -- ``_safe`` folds separators, so the
-        prefix alone could spell ``a-b``/``c`` and ``a``/``b-c`` the same way.
-        """
-
-        digest = hashlib.sha256(
-            json.dumps(
-                [batch.cluster_id, batch.node_id, entry.entry_id],
-                ensure_ascii=True,
-                separators=(",", ":"),
-            ).encode("utf-8")
-        ).hexdigest()[:32]
-        return f"log-{cls._safe(batch.cluster_id)}-{cls._safe(batch.node_id)}-{digest}"
+        return log_event_id(batch, entry, cls._safe)
 
     @staticmethod
     def _safe(value: str) -> str:

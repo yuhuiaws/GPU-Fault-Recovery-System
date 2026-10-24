@@ -1,5 +1,40 @@
 # Validation limitations
 
+## Host observation and targeted validation
+
+The [host hardening batch](components/host-observation-hardening.md) separates
+unreadable EFA/SMART/BMC data from hardware faults and binds new host diagnostic
+plans to their triggering metric/device. Local proc/sys fixtures and a loopback
+API verify software behavior only. Physical PCI loss, real driver behavior,
+storage probes and production recovery remain separate acceptance work.
+The broader thermal/RMA and application-fault policy recommendations are not
+claimed as completed by this batch.
+
+## Xid linkage and Drain P2P recovery
+
+Xid 154 linkage versions are reporting metadata, not applicability gates for
+the original Xid. NVLink5 still needs its version-specific decode evidence.
+Drain P2P now uses `RECOVER_DRAIN_P2P` after cordon, workload stop, service
+quiesce and GPU-client verification. It requires an explicit disabled
+persistence reading and an identifiable recovery-action report for every target.
+Unknown or unsupported reports fail closed; an explicit reboot request or
+a known failed reset authorizes the next reboot rung. A failed post-recovery
+validation follows the existing reset-validation escalation path. The operation
+reuses the single-reset quiesce claim and ledger, and keeps Fabric Manager running.
+
+These changes require matched control-plane, executor and Node Runtime releases
+and the updated operation allowlists. Old agents reject the new operation.
+Drain pending new-operation workflows before rollback to an older release.
+Local tests use synthetic driver XML, fake system commands and real local
+ledgers/quiesce files. They do not establish physical UVM persistence release,
+driver XML compatibility on every supported GPU, or live reset/reboot recovery.
+Independent UVM persistence detection/release is not implemented, rather than
+merely untested. The [software E2E specification](components/xid154-recovery-e2e.md)
+registers this as a separate BLOCKED requirement. Its automated chain uses real
+API/correlation/executor/agent logic with local SQLite and scripted external I/O.
+Terminal reset-timeout compensation can restore services under existing policy;
+scheduling and training remain held and the workflow requires confirmation.
+
 Deployment regression tests use fake AWS/Kubernetes runners, plus real local
 Python virtual environments for node-slot integrity checks. They cover unhealthy
 status diagnostics, fail-closed CronJob reads, full Aurora refresher snapshots and

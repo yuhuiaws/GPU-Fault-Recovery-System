@@ -157,11 +157,15 @@ def test_hung_diagnostic_without_observation_accepts_only_a_complete_reporter_sn
         [],
         [0],
         [1],
-        [1],
+        [2],
+        [3],
+        [3, 4],
+        [2],
+        [5, 6],
     ]
     assert workflow.official_steps[1].node_ids == nodes
-    assert workflow.official_steps[1].parameters["triage_timeout_seconds"] == 10
-    assert workflow.official_steps[2].parameters["capture_process_state"] is False
+    assert workflow.official_steps[3].parameters["triage_timeout_seconds"] == 20
+    assert workflow.official_steps[5].parameters["capture_process_state"] is False
 
 
 @pytest.mark.parametrize("case", ["complete", "missing-gpu", "no-pids"])
@@ -278,7 +282,6 @@ def test_legacy_unusable_resource_count_keeps_the_documented_minimum_validation(
         if step.operation is WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN
     )
     assert plugin.parameters["expected_count"] == 1
-    assert (
-        plugin.parameters["failure_escalation_action"]
-        == RecoveryAction.REBOOT_NODE.value
+    assert "failure_escalation_action" not in plugin.parameters, (
+        "an unknown inventory cause cannot authorize reboot"
     )

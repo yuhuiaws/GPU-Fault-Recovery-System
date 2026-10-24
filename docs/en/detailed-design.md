@@ -402,8 +402,8 @@ XID decision order:
 
 1. Check whether the XID exists in the pinned Catalog.
 2. Check the GPU product family.
-3. Check the minimum driver branch and the reported CUDA version.
-4. Prefer the XID 154 dynamic recovery action.
+3. Preserve the `Xid 154 linkage` version information without treating it as a minimum version for the original Xid. NVLink5 decoding still requires the driver branch.
+4. Prefer the XID 154 dynamic recovery action. `DRAIN_P2P` cordons, stops workloads, quiesces services and verifies GPU clients before `RECOVER_DRAIN_P2P` confirms persistence release and reads the current driver recovery action. `None` skips reset; `Reset`, `Drain and Reset`, and a remaining `Drain P2P` reset only the necessary GPUs. `Reboot` uses the existing node-reboot path. Missing or unknown readings require operator review. Restore scheduling and workloads only after service restoration and GPU/fabric validation.
 5. Decode IntrInfo/Error Status for XID 144-150.
 6. Handle special semantics such as the XID 45 companion, XID 48/63/64, and 94/95.
 7. Map to `NO_ACTION/RESTART_WORKLOAD/RESET_GPU/REBOOT_NODE` or the official workflow.
@@ -3450,41 +3450,66 @@ Persistent zero traffic first enters `ZERO_PENDING`; after exceeding the warning
 after exceeding the hung threshold it enters `HUNG_SUSPECTED`, and the workflow is:
 
 ```text
-0 FREEZE_EVIDENCE             all attempt nodes
-1 COLLECT_HUNG_TRIAGE         all attempt nodes, depends_on=[0]
-2 COLLECT_DIAGNOSTIC_BUNDLE  selected nodes/PIDs, depends_on=[1]
-3 VALIDATE_FABRIC             all attempt nodes, depends_on=[1]
+0 FREEZE_EVIDENCE             stored whole-task summary, no node attachment
+1 COLLECT_HUNG_SUMMARY        all attempt nodes, bounded concurrency, depends_on=[0]
+2 COLLECT_HUNG_TRIAGE         first active wave, at most 4 nodes, depends_on=[1]
+3 COLLECT_HUNG_TRIAGE         evidence-driven expansion, depends_on=[2]
+4 COLLECT_DIAGNOSTIC_BUNDLE   bounded nodes / identity-verified PIDs, depends_on=[2,3]
+5 VALIDATE_FABRIC             all attempt nodes, depends_on=[1]
+6 ESCALATE_SUPPORT            EFA/log-triggered suspicion, depends_on=[4,5]
 ```
 
 The `HUNG_SUSPECTED` finding freezes, from the corresponding `AttemptObservation`, the nodes of all non-exited training containers,
-their ranks, host PIDs and per-node GPU UUIDs. `COLLECT_HUNG_TRIAGE` is an independently permitted read-only
-Node Agent operation; it does not stop services, modify drivers, or reboot nodes. Within at most 10 seconds per node it
-completes the following lightweight collection:
+their ranks, host PIDs and per-node GPU UUIDs. `COLLECT_HUNG_SUMMARY` visits all nodes with bounded concurrency,
+enumerates workload-cgroup processes even without RANK/WORLD_SIZE, reads two proc/optional communication snapshots and per-device
+GPU/RDMA data, and never triggers FR or attaches a stack tool. Resumed surveys reuse completed node results.
+Missing data, byte limits and timing skew are explicit; this is not a continuous all-rank watchdog.
+The two active diagnostic waves share a default budget of 8 nodes, explicitly configurable up to 256;
+legacy zero remains 32. A resumable sliding window allows at most 32 nodes in flight, independent of the total budget.
+For 1024 GPUs on 128 nodes, an explicit budget of 128 permits full-node expansion, not guaranteed diagnosis.
+The budget does not limit survey targets.
+`COLLECT_HUNG_TRIAGE` is an independently permitted read-only
+Node Agent operation; it does not stop services, modify drivers, or reboot nodes. New plans use a 20-second per-node sampling budget,
+not a strict wall-clock bound on thread shutdown or kernel/file I/O:
 
-- filters `nvidia-smi --query-compute-apps` results by the attempt's GPU UUIDs;
-- triggers the PyTorch NCCL flight recorder dump, returning only a structured digest of the last entry and the unfinished entries;
-- runs one round of `py-spy dump --nonblocking` in parallel on every GPU compute PID; the stack signature ignores
-  line numbers and arguments;
-- samples `/proc/<pid>/{stat,wchan,status,task/*/stat}` twice, one second apart;
-- collects GPU utilization/throttle and EFA hardware counter deltas at the same time.
+- filters compute processes by GPU UUID, then verifies workload cgroup and process starttime before attachment;
+- obtains two fresh dumps through an already configured FR FIFO, at least two seconds apart by default;
+  returns per-group enqueue/start/completion watermarks and the oldest pending operation; unavailable second dumps remain missing evidence;
+- samples up to three rounds of `py-spy dump --json --nonblocking` and proc state within the first half of the node budget;
+  preserves threads, validates exit status/format, and binds native IDs through NSpid and thread start times;
+- normalizes CPU ticks by SC_CLK_TCK and actual elapsed time; zero/unknown wchan values are not waits;
+- retains GPU utilization as device-level context with range checks, before/after PID mapping and explicit sharing/coverage.
 
 A single unreachable node, an unconfigured pipe, or a py-spy failure only marks that node/rank as `undetermined` and does not leave
-the triage step stuck in `WAITING`. `VALIDATE_FABRIC` depends only on step 1, so the fabric conclusion can still be obtained in parallel
+the triage step waiting indefinitely: each node has a 30-second wait and each wave at most 540 seconds.
+Failures count as missing coverage. `VALIDATE_FABRIC` depends only on step 1, so the fabric conclusion can still be obtained in parallel
 when the deep-forensics node is unreachable.
 
-The executor compares the collective sequences within the same process group. A minority of lagging ranks, or ranks at the majority
-sequence whose kernel never started, are ruled `CONFIRMED`; a minority with a missing flight recorder or a Python stack
-in the minority are ruled `PLAUSIBLE`; inverted CPU/GPU behavior is ruled `WEAK`. When more than 5% of ranks lag at the same time it is ruled
-`FABRIC_SUSPECTED`, and when most stacks contain no collective-communication frames it is ruled `NOT_COLLECTIVE_HANG`. Multiple candidates are ordered by
-the time the corresponding node first entered `ZERO_PENDING`.
+The executor compares groups by name and membership, requiring at least three valid samples and a strict majority.
+A single snapshot yields at most `PLAUSIBLE` progress outliers, never confirmed root cause.
+Targeted collection additionally requires process-bound paired dumps and overlapping cross-rank observation
+windows. Persistent pending operations and completion/start/enqueue lag are assessed separately;
+complete groups with persistent pending work are reported without inventing an isolated culprit.
+Pending duration is a lower bound within this observation window, not an inferred enqueue age or the
+600-second EFA interval. P2P peer matching is not implemented.
+Stack/CPU/GPU differences are `WEAK`; missing dumps and unreadable counters are not faulty ranks or zero activity.
+Stack/process branches use node/PID/starttime without requiring rank. All evidence branches run independently;
+the four-item score is removed. Cross-process comparisons require declared equivalent group/role/PP stage/
+EP role/code/hardware and intersecting windows. Unknown roles permit local observations only.
+An inconclusive sample is `UNDETERMINED`, not proof of a fabric fault or absence of a collective hang.
 
-The triage step execution and the rewrite of step 2 are persisted in the same Store save by the executor holding the workflow lease.
-`dag_revision` must be incremented on rewrite. `CONFIRMED/PLAUSIBLE/WEAK` selects at most 3
-culprit ranks plus 1 majority rank as a control, sets an exact
-`target_pids_by_node`, and forbids cgroup expansion. Other conclusions use the lightweight bundle and are marked as requiring administrator escalation.
-Under no circumstances does it fall back to a full-node full strace.
+Survey/triage results, adaptive targets and the rewrite of step 4 share one leased Store save.
+`dag_revision` increments on rewrite. Only 1-3 temporally supported plausible candidates with complete group membership,
+no unreachable nodes or identity conflicts, and verified process identities permit targeted collection plus at most one control.
+Otherwise the bundle stays on at most 32 triage nodes; all returned survey and active-wave evidence stays in the workflow.
+Hung bundles omit DCGM diag, bug-report and strace.
+EFA/log suspicion goes to operator review; healthy fabric is not application recovery.
+The NCCL pipeline never uses training step/phase, including detection, target selection and completion.
+CPU/write activity does not reset the RDMA idle clock. The independent training-health monitor uses
+`TRAINING_PROGRESS_STALL` and does not enter the NCCL survey/triage pipeline.
+See [NCCL hung hardening](../components/nccl-hung-hardening.md) for limits and test coverage.
 
-For training Python processes, the Agent also reads `/proc/<pid>/cgroup` of the confirmed GPU PIDs and enumerates the other Python PIDs in the same
+The following generic process-diagnostic capabilities are not the default bounded hung path. For training Python processes, the Agent also reads `/proc/<pid>/cgroup` of the confirmed GPU PIDs and enumerates the other Python PIDs in the same
 non-root container cgroup. Thus the
 `torchrun` launcher, which holds no CUDA context, is also included, but Python services in other pods/cgroups are not scanned.
 Python stack and `strace` use mutually independent sampling phases. The Agent runs 3 rounds of Python

@@ -187,8 +187,12 @@ def test_field_diagnostic_executes_rendered_target_only_after_client_validation(
 
 
 @pytest.mark.parametrize("mode", ["plain", "gzip", "stdout", "timeout", "missing"])
+@pytest.mark.parametrize("hung", [False, True])
 def test_bundle_keeps_partial_capture_evidence_and_cleans_its_staging_directory(
-    node_factory: Callable[..., NodeActionExecutor], tmp_path: Path, mode: str
+    node_factory: Callable[..., NodeActionExecutor],
+    tmp_path: Path,
+    mode: str,
+    hung: bool,
 ) -> None:
     requests = []
 
@@ -215,7 +219,11 @@ def test_bundle_keeps_partial_capture_evidence_and_cleans_its_staging_directory(
 
     request = command(
         WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
-        parameters={"diagnostic_reason": "EFA_TRAFFIC_HUNG_SUSPECTED"},
+        parameters={
+            "diagnostic_reason": "EFA_TRAFFIC_HUNG_SUSPECTED"
+            if hung
+            else "OPERATOR_DIAGNOSTIC"
+        },
     )
     key = hashlib.sha256(request.command_id.encode()).hexdigest()[:24]
     old = tmp_path / "diagnostics" / key
@@ -234,10 +242,23 @@ def test_bundle_keeps_partial_capture_evidence_and_cleans_its_staging_directory(
         stream = bundle.extractfile("diagnostics/manifest.json")
         assert stream is not None
         manifest = json.load(stream)
+        if hung:
+            assert "diagnostics/nvidia-bug-report.log.gz" not in names, names
+            assert "diagnostics/dcgm-diag.json" not in names, names
+            assert len(manifest["captures"]) == 7, manifest
+            assert result.details["manifest_summary"]["failed_capture_count"] == 1, (
+                result
+            )
+            assert ["rdma", "link", "show"] in requests, requests
+            assert all(
+                arguments[0] not in {"/usr/bin/nvidia-bug-report.sh", "dcgmi"}
+                for arguments in requests
+            ), requests
+            return
         report = bundle.extractfile("diagnostics/nvidia-bug-report.log.gz")
         assert report is not None
         text = gzip.decompress(report.read()).decode()
-    assert len(manifest["captures"]) == 9
+    assert len(manifest["captures"]) == 8
     assert result.details["manifest_summary"]["failed_capture_count"] == (
         2 if mode in {"timeout", "missing"} else 1
     )
@@ -248,7 +269,7 @@ def test_bundle_keeps_partial_capture_evidence_and_cleans_its_staging_directory(
         if mode == "missing"
         else "unit bug report" in text
     )
-    assert ["rdma", "link", "show"] in requests
+    assert ["rdma", "link", "show"] not in requests
 
 
 @pytest.mark.parametrize(

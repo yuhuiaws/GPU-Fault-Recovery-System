@@ -682,7 +682,7 @@ def test_dcgm_edge_filter_emits_counter_delta_and_candidate_recovery():
     collector.collect_text(text(91, 1), observed_at=NOW + timedelta(seconds=45))
     collector.collect_text(text(70, 1), observed_at=NOW + timedelta(seconds=60))
 
-    assert len(sink.requests) == 4
+    assert len(sink.requests) == 5
     assert sink.requests[1][1]["context_history"] == []
     assert sink.requests[-1][1]["context_history"] == []
 
@@ -720,7 +720,8 @@ def test_dcgm_batch_carries_edge_filter_reasons_to_control_plane():
     assert reasons == [
         ["initial-baseline"],
         ["health-summary"],
-        ["candidate-confirmed"],
+        ["environmental-observation"],
+        ["environmental-observation"],
     ]
 
 
@@ -737,7 +738,7 @@ def test_dcgm_transient_candidate_is_fully_suppressed() -> None:
     collector.collect_text(text(91), observed_at=NOW + timedelta(seconds=15))
     collector.collect_text(text(70), observed_at=NOW + timedelta(seconds=30))
 
-    assert len(sink.requests) == 1
+    assert len(sink.requests) == 3
     assert sink.requests[0][1]["edge_filter_reasons"] == ["initial-baseline"]
 
 
@@ -1217,8 +1218,8 @@ def test_nvidia_smi_round_splits_the_query_only_when_a_field_is_refused(
         "a refused optional field blanked an unrelated optional group"
     )
     assert "retired_pages_pending" not in canonical, canonical
-    assert len([item for item in queries if "--query-gpu=" in item]) == 5, (
-        f"the refused merged query must split into the four groups: {queries}"
+    assert len([item for item in queries if "--query-gpu=" in item]) == 8, (
+        f"the refused merged query must split core and optional environment fields: {queries}"
     )
 
 

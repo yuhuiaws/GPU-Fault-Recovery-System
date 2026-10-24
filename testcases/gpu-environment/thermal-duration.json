@@ -1,0 +1,9 @@
+{
+  "steps": [
+    {"reads": 1, "values": {"thermal_violation_total_us": 0, "clock_throttle_reasons": 32}},
+    {"reads": 1, "values": {"thermal_violation_total_us": 1000000, "clock_throttle_reasons": 32}},
+    {"reads": 1, "values": {"thermal_violation_total_us": 2000000, "clock_throttle_reasons": 32}},
+    {"reads": 1, "values": {"thermal_violation_total_us": 3000000, "clock_throttle_reasons": 32}},
+    {"reads": 3, "values": {"thermal_violation_total_us": 3000000, "clock_throttle_reasons": 0}}
+  ]
+}

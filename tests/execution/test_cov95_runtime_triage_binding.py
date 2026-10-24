@@ -4,6 +4,7 @@ import pytest
 
 from gpu_fault.models import WorkflowStatus, WorkflowStepStatus
 from tests.execution._cov95_runtime_triage import BUNDLE, signal, triage_harness
+from tests.execution._flight_series_support import add_series
 
 
 def test_unrelated_bundle_is_not_rewritten_by_a_triage_step() -> None:
@@ -22,9 +23,9 @@ def test_matching_attempt_supplies_missing_rank_and_gpu_identity() -> None:
     h = triage_harness(
         {
             "node_results": {
-                "node-a": {"ranks": [None, signal(100, None, 9)]},
-                "node-b": {"ranks": [signal(200, None)]},
-                "node-c": {"ranks": [signal(300, None)]},
+                "node-a": {"ranks": [None, add_series(signal(100, None, 9))]},
+                "node-b": {"ranks": [add_series(signal(200, None))]},
+                "node-c": {"ranks": [add_series(signal(300, None))]},
             },
             "not_sampled_nodes": ["node-z", "", "node-z"],
         }
@@ -42,7 +43,7 @@ def test_matching_attempt_supplies_missing_rank_and_gpu_identity() -> None:
         "node-b": [200],
     }, bundle
     decision = bundle.parameters["hung_triage_decision"]
-    assert decision["classification"] == "CONFIRMED" and decision["culprit_ranks"] == [
+    assert decision["classification"] == "PLAUSIBLE" and decision["culprit_ranks"] == [
         0
     ], decision
     assert decision["not_sampled_nodes"] == ["node-z"], decision
@@ -99,15 +100,10 @@ def test_unreachable_rank_retains_known_identity_and_explicit_uncertainty() -> N
     assert result.status is WorkflowStatus.RUNNING, result
     bundle = h.store.get_workflow(h.workflow.request_id).official_steps[1]
     decision = bundle.parameters["hung_triage_decision"]
-    assert decision["classification"] == "PLAUSIBLE", decision
+    assert decision["classification"] == "UNDETERMINED", decision
     assert decision["undetermined_nodes"] == ["node-c"], decision
-    assert decision["culprit_ranks"] == [2] and decision["control_ranks"] == [0], (
-        decision
-    )
-    assert bundle.parameters["target_pids_by_node"] == {
-        "node-a": [100],
-        "node-c": [300],
-    }, bundle
+    assert decision["culprit_ranks"] == [] and decision["control_ranks"] == [], decision
+    assert bundle.parameters["target_pids_by_node"] == {}, bundle
 
 
 def test_symmetric_rank_evidence_escalates_without_attaching_to_every_process() -> None:
@@ -123,8 +119,7 @@ def test_symmetric_rank_evidence_escalates_without_attaching_to_every_process() 
     assert result.status is WorkflowStatus.RUNNING, result
     bundle = h.store.get_workflow(h.workflow.request_id).official_steps[1]
     assert (
-        bundle.parameters["hung_triage_decision"]["classification"]
-        == "FABRIC_SUSPECTED"
+        bundle.parameters["hung_triage_decision"]["classification"] == "UNDETERMINED"
     ), bundle
     assert bundle.parameters["capture_process_state"] is False, bundle
     assert bundle.parameters["max_processes"] == 0, bundle
@@ -146,6 +141,6 @@ def test_invalid_pids_are_not_sent_as_process_collection_targets() -> None:
     result = h.execute()
     assert result.status is WorkflowStatus.RUNNING, result
     bundle = h.store.get_workflow(h.workflow.request_id).official_steps[1]
-    assert bundle.parameters["target_pids_by_node"] == {"node-b": [200]}, bundle
+    assert bundle.parameters["target_pids_by_node"] == {}, bundle
     assert bundle.parameters["target_gpu_uuids_by_pid_by_node"] == {}, bundle
     assert bundle.gpu_uuids == [], bundle

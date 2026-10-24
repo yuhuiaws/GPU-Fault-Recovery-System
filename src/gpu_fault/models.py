@@ -17,6 +17,7 @@ from pydantic import (
 from pydantic_core import CoreSchema, core_schema
 
 from gpu_fault.restart_containment import RestartContainmentProof
+from gpu_fault.operation_names import WorkflowOperation as WorkflowOperation
 
 
 def datetime_json_text(value: datetime) -> str:
@@ -223,6 +224,17 @@ class EfaTrafficAdminAction(StrEnum):
     ACCEPT_NEW_BASELINE = "ACCEPT_NEW_BASELINE"
 
 
+class EfaStallEpisode(StrictModel):
+    episode_id: str
+    started_at: datetime
+    baseline_bytes_per_second: float | None = Field(default=None, ge=0)
+    recovery_threshold_bps: float = Field(gt=0)
+    recovery_threshold_source: str
+    recovery_since: datetime | None = None
+    recovery_samples: int = Field(default=0, ge=0)
+    hung_reported: bool = False
+
+
 class EfaTrafficState(StrictModel):
     state_key: str
     cluster_id: str
@@ -234,6 +246,9 @@ class EfaTrafficState(StrictModel):
     baseline_bytes_per_second: float | None = Field(default=None, ge=0)
     last_bytes_per_second: float = Field(ge=0)
     had_active_traffic: bool = False
+    active_baseline_samples: int = Field(default=0, ge=0)
+    stall_episode: EfaStallEpisode | None = None
+    last_stable_traffic_at: datetime | None = None
     zero_since: datetime | None = None
     zero_first_seen_at: datetime | None = None
     consecutive_zero_samples: int = Field(default=0, ge=0)
@@ -341,42 +356,6 @@ class WorkflowStepStatus(StrEnum):
     SUCCEEDED = "SUCCEEDED"
     WAITING = "WAITING"
     FAILED = "FAILED"
-
-
-class WorkflowOperation(StrEnum):
-    FREEZE_EVIDENCE = "FREEZE_EVIDENCE"
-    COLLECT_HUNG_TRIAGE = "COLLECT_HUNG_TRIAGE"
-    COLLECT_DIAGNOSTIC_BUNDLE = "COLLECT_DIAGNOSTIC_BUNDLE"
-    RUN_DCGM_DIAGNOSTIC = "RUN_DCGM_DIAGNOSTIC"
-    MARK_UNSCHEDULABLE = "MARK_UNSCHEDULABLE"
-    CHECKPOINT_WORKLOADS = "CHECKPOINT_WORKLOADS"
-    STOP_WORKLOADS = "STOP_WORKLOADS"
-    QUIESCE_GPU_SERVICES = "QUIESCE_GPU_SERVICES"
-    VERIFY_NO_GPU_CLIENTS = "VERIFY_NO_GPU_CLIENTS"
-    TRIGGER_HEALTH_SNAPSHOT = "TRIGGER_HEALTH_SNAPSHOT"
-    RESET_GPU = "RESET_GPU"
-    RESTORE_GPU_SERVICES = "RESTORE_GPU_SERVICES"
-    RESTART_NODE = "RESTART_NODE"
-    REPLACE_NODE = "REPLACE_NODE"
-    RESTART_VM = "RESTART_VM"
-    RESTART_FABRIC_MANAGER = "RESTART_FABRIC_MANAGER"
-    REMEDIATE_EFA_DRIVER = "REMEDIATE_EFA_DRIVER"
-    RESTART_EFA_DEVICE_PLUGIN = "RESTART_EFA_DEVICE_PLUGIN"
-    RESTART_GPU_DEVICE_PLUGIN = "RESTART_GPU_DEVICE_PLUGIN"
-    RUN_FIELD_DIAGNOSTIC = "RUN_FIELD_DIAGNOSTIC"
-    RUN_NVLINK74_WORKFLOW = "RUN_NVLINK74_WORKFLOW"
-    RESET_ALL_GPUS_NVSWITCHES = "RESET_ALL_GPUS_NVSWITCHES"
-    CHECK_MECHANICALS = "CHECK_MECHANICALS"
-    REMEDIATE_DRIVER = "REMEDIATE_DRIVER"
-    UPDATE_SOFTWARE_FIRMWARE = "UPDATE_SOFTWARE_FIRMWARE"
-    ESCALATE_SUPPORT = "ESCALATE_SUPPORT"
-    VALIDATE_GPU = "VALIDATE_GPU"
-    VALIDATE_HOST = "VALIDATE_HOST"
-    VALIDATE_FABRIC = "VALIDATE_FABRIC"
-    RESTORE_SCHEDULING = "RESTORE_SCHEDULING"
-    RESTART_WORKLOAD = "RESTART_WORKLOAD"
-    QUARANTINE = "QUARANTINE"
-    COLLECTOR_OUTBOX_MAINTENANCE = "COLLECTOR_OUTBOX_MAINTENANCE"
 
 
 class CapabilityMode(StrEnum):

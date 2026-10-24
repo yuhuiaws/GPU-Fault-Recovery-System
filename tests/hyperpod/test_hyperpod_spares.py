@@ -7,6 +7,8 @@ import pytest
 
 from gpu_fault.app import default_simulated_profile
 from gpu_fault.host_health import NodeHealthCategory
+from gpu_fault.gpu_metrics import GpuHealthFinding, GpuHealthSeverity
+from gpu_fault.telemetry import CollectorKind, CollectorStatus
 from gpu_fault.hyperpod import HyperPodNode
 from gpu_fault.hyperpod_spares import (
     SPARE_POOL_STATE_ANNOTATION,
@@ -142,6 +144,44 @@ def kubernetes_node(*, ready=True, unschedulable=True, hyperpod_health="Schedula
     }
 
 
+def healthy_telemetry(store, node_id, cluster_id="hp-cluster"):
+    now = datetime.now(timezone.utc)
+    for kind in (CollectorKind.GPU_INVENTORY, CollectorKind.GPU_METRICS):
+        store.save_collector_status(
+            CollectorStatus(
+                cluster_id=cluster_id,
+                node_id=node_id,
+                collector=kind,
+                observed_at=now,
+                ingested_at=now,
+                last_success_at=now,
+                sample_count=8,
+            )
+        )
+
+
+def hardware_evidence(store, node_id="hyperpod-i-spare1", *, active=True):
+    now = datetime.now(timezone.utc)
+    finding = (
+        GpuHealthFinding(
+            finding_id=f"hardware-{node_id}",
+            cluster_id="hp-cluster",
+            node_id=node_id,
+            observed_at=now,
+            severity=GpuHealthSeverity.CRITICAL,
+            reason="row remap failure",
+            canonical_name="row_remap_failure",
+            value=1,
+            automatic_action="DRAIN",
+        )
+        if active
+        else None
+    )
+    store.update_gpu_finding(
+        ("hp-cluster", node_id, "GPU-a", "row_remap_failure"), finding, now
+    )
+
+
 def coordinator(nodes, core_nodes, sent=None, *, core=None):
     store = build_store()
     for node in nodes:
@@ -153,6 +193,7 @@ def coordinator(nodes, core_nodes, sent=None, *, core=None):
                     runtime_profile_version="simulated-v1",
                 )
             )
+            healthy_telemetry(store, node.kubernetes_labels["kubernetes.io/hostname"])
     return (
         HyperPodSpareCoordinator(
             FakeLifecycle(nodes),
@@ -662,6 +703,7 @@ def test_discovers_spare_from_kubernetes_when_provider_label_missing():
             runtime_profile_version="simulated-v1",
         )
     )
+    healthy_telemetry(store, "hyperpod-i-spare1")
     service = HyperPodSpareCoordinator(
         FakeLifecycle([fault, spare]),
         store,
@@ -683,6 +725,7 @@ def test_spare_health_reboots_after_consecutive_failures_then_recovers():
     nodes = [hyperpod_node("worker-spare", "i-spare1", spare=True)]
     core_nodes = {"hyperpod-i-spare1": kubernetes_node(ready=False)}
     coordinator_service, store = coordinator(nodes, core_nodes)
+    hardware_evidence(store)
     store.save_profile(default_simulated_profile())
     controller = HyperPodSpareHealthController(
         coordinator_service, IncidentOrchestrator(store), store, failure_threshold=2
@@ -700,6 +743,7 @@ def test_spare_health_reboots_after_consecutive_failures_then_recovers():
     }
 
     core_nodes["hyperpod-i-spare1"]["status"]["conditions"][0]["status"] = "True"
+    hardware_evidence(store, active=False)
     store.save_workflow(copy_model(workflow, status=WorkflowStatus.SUCCEEDED))
     rechecking = controller.scan()[0]
     recovered = controller.scan()[0]
@@ -763,6 +807,7 @@ def test_spare_health_marks_unavailable_and_alerts_after_reboot_failure():
     core_nodes = {"hyperpod-i-spare1": kubernetes_node(ready=False)}
     sent = []
     coordinator_service, store = coordinator(nodes, core_nodes)
+    hardware_evidence(store)
     store.save_profile(default_simulated_profile())
     controller = HyperPodSpareHealthController(
         coordinator_service,
@@ -797,6 +842,7 @@ def test_spare_health_rechecks_unavailable_and_recovers() -> None:
     core_nodes = {"hyperpod-i-spare1": kubernetes_node(ready=False)}
     clock = MutableClock(datetime(2026, 8, 13, 12, tzinfo=timezone.utc))
     coordinator_service, store = coordinator(nodes, core_nodes)
+    hardware_evidence(store)
     store.save_profile(default_simulated_profile())
     controller = HyperPodSpareHealthController(
         coordinator_service,
@@ -815,6 +861,7 @@ def test_spare_health_rechecks_unavailable_and_recovers() -> None:
     assert unavailable["state"] == SpareHealthState.UNAVAILABLE.value
 
     core_nodes["hyperpod-i-spare1"]["status"]["conditions"][0]["status"] = "True"
+    hardware_evidence(store, active=False)
     clock.advance(hours=1, seconds=1)
     rechecking = controller.scan()[0]
     recovered = controller.scan()[0]
@@ -832,6 +879,7 @@ def test_spare_health_repeats_unavailable_alert_by_interval() -> None:
     sent = []
     clock = MutableClock(datetime(2026, 8, 13, 12, tzinfo=timezone.utc))
     coordinator_service, store = coordinator(nodes, core_nodes)
+    hardware_evidence(store)
     store.save_profile(default_simulated_profile())
     controller = HyperPodSpareHealthController(
         coordinator_service,

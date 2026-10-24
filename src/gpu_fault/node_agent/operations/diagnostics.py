@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import tarfile
 from datetime import datetime, timedelta
+from functools import partial
 from pathlib import Path
 from typing import Any, Callable
 
@@ -20,7 +21,13 @@ from gpu_fault.dcgm_diagnostic_analysis import (
     normalize_dcgm_status,
 )
 from gpu_fault.models import WorkflowOperation
+from gpu_fault.node_agent.diagnostic_process import run_probe
 from gpu_fault.node_agent.gpu_activity import GpuActivityGate
+from gpu_fault.node_agent.operations.collection_budget import (
+    collection_lease,
+    publish_partial,
+)
+from gpu_fault.node_agent.operations.existing_flight import prepare_flight_manifest
 from gpu_fault.node_agent.operations.hostengine_recovery import recover_host_engine
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
@@ -53,7 +60,58 @@ BENIGN_DIAGNOSTIC_COUNT_PATTERN = re.compile(
 DIAGNOSTIC_EVIDENCE_PATTERNS = (
     "gpu-diagnostic-*.tar.gz",
     "dcgm-quick-diagnostic-*.json",
+    "nccl-flight-*.dump",
 )
+HUNG_DIAGNOSTIC_REASONS = frozenset(
+    {
+        "EFA_TRAFFIC_HUNG_SUSPECTED",
+        "TRAINING_HUNG",
+        "APPLICATION_NCCL_ERROR",
+    }
+)
+
+
+def diagnostic_captures() -> list[tuple[str, list[str], int]]:
+    return [
+        ("nvidia-smi-q.txt", ["nvidia-smi", "-q"], 60),
+        ("nvidia-smi-nvlink.txt", ["nvidia-smi", "nvlink", "--status"], 60),
+        # nvidia-smi exposes --errorcounters, not --errors.
+        (
+            "nvidia-smi-nvlink-errors.txt",
+            ["nvidia-smi", "nvlink", "--errorcounters"],
+            60,
+        ),
+        ("nvidia-smi-topology.txt", ["nvidia-smi", "topo", "--matrix"], 60),
+        ("dcgm-diag.json", ["dcgmi", "diag", "-r", "1", "-j"], 300),
+        (
+            "fabric-manager-journal.txt",
+            [
+                "journalctl",
+                "-u",
+                "nvidia-fabricmanager",
+                "--since",
+                "-30 minutes",
+                "--no-pager",
+            ],
+            60,
+        ),
+        (
+            "kernel-nvidia.txt",
+            ["journalctl", "-k", "--since", "-30 minutes", "--no-pager"],
+            60,
+        ),
+        ("nvidia-bug-report.log.gz", ["/usr/bin/nvidia-bug-report.sh"], 600),
+    ]
+
+
+def passive_hung_captures(
+    captures: list[tuple[str, list[str], int]],
+) -> list[tuple[str, list[str], int]]:
+    return [
+        (filename, argv, min(timeout, 10))
+        for filename, argv, timeout in captures
+        if filename not in {"dcgm-diag.json", "nvidia-bug-report.log.gz"}
+    ] + [("rdma-link-show.txt", ["rdma", "link", "show"], 10)]
 
 
 #: ``DCGM_ST_CONNECTION_NOT_VALID`` (-30) as the exit status dcgmi returns when
@@ -285,6 +343,22 @@ class DiagnosticOperationsMixin:
         return bool(FIELD_DIAGNOSTIC_FAILURE_PATTERN.search(remainder))
 
     def _collect_diagnostic_bundle(self, command: NodeActionCommand) -> dict[str, Any]:
+        runtime = getattr(self, "observation_runtime", None)
+        if (
+            runtime is not None
+            and command.parameters.get("diagnostic_reason") in HUNG_DIAGNOSTIC_REASONS
+        ):
+            return dict(runtime.run_command("bundle", command))
+        if command.parameters.get("diagnostic_reason") not in HUNG_DIAGNOSTIC_REASONS:
+            return self._collect_diagnostic_bundle_admitted(command)
+        with collection_lease(self, command) as refused:
+            if refused:
+                raise RuntimeError(refused)
+            return self._collect_diagnostic_bundle_admitted(command)
+
+    def _collect_diagnostic_bundle_admitted(
+        self, command: NodeActionCommand
+    ) -> dict[str, Any]:
         self._cleanup_diagnostic_archives()
         bundle_key = hashlib.sha256(command.command_id.encode()).hexdigest()[:24]
         work_dir = self.diagnostic_output_dir / bundle_key
@@ -294,73 +368,15 @@ class DiagnosticOperationsMixin:
         if work_dir.exists():
             shutil.rmtree(work_dir)
         work_dir.mkdir(mode=0o700, exist_ok=True)
-        captures = [
-            (
-                "nvidia-smi-q.txt",
-                ["nvidia-smi", "-q"],
-                60,
-            ),
-            (
-                "nvidia-smi-nvlink.txt",
-                ["nvidia-smi", "nvlink", "--status"],
-                60,
-            ),
-            (
-                "nvidia-smi-nvlink-errors.txt",
-                # nvidia-smi has no --errors option; the error counters
-                # live behind --errorcounters. The old spelling exited 2
-                # with "Option --errors is not recognized" on every
-                # driver, so NVLink error counters never reached a bundle.
-                ["nvidia-smi", "nvlink", "--errorcounters"],
-                60,
-            ),
-            (
-                "nvidia-smi-topology.txt",
-                ["nvidia-smi", "topo", "--matrix"],
-                60,
-            ),
-            (
-                "dcgm-diag.json",
-                ["dcgmi", "diag", "-r", "1", "-j"],
-                300,
-            ),
-            (
-                "fabric-manager-journal.txt",
-                [
-                    "journalctl",
-                    "-u",
-                    "nvidia-fabricmanager",
-                    "--since",
-                    "-30 minutes",
-                    "--no-pager",
-                ],
-                60,
-            ),
-            (
-                "kernel-nvidia.txt",
-                [
-                    "journalctl",
-                    "-k",
-                    "--since",
-                    "-30 minutes",
-                    "--no-pager",
-                ],
-                60,
-            ),
-            (
-                "nvidia-bug-report.log.gz",
-                ["/usr/bin/nvidia-bug-report.sh"],
-                600,
-            ),
-        ]
-        if command.parameters.get("diagnostic_reason") == "EFA_TRAFFIC_HUNG_SUSPECTED":
-            captures.append(
-                (
-                    "rdma-link-show.txt",
-                    ["rdma", "link", "show"],
-                    60,
-                )
-            )
+        captures = diagnostic_captures()
+        passive_hung = (
+            command.parameters.get("diagnostic_reason") in HUNG_DIAGNOSTIC_REASONS
+        )
+        if passive_hung:
+            captures = passive_hung_captures(captures)
+        capture_runner = (
+            partial(run_probe, self.runner) if passive_hung else self.runner
+        )
         manifest = {
             "command_id": command.command_id,
             "workflow_request_id": command.workflow_request_id,
@@ -369,8 +385,12 @@ class DiagnosticOperationsMixin:
             "collected_at": self.now().isoformat(),
             "fault_context": command.parameters,
             "captures": [],
+            "omitted_intrusive_tools": (
+                ["dcgmi diag", "nvidia-bug-report.sh", "strace"] if passive_hung else []
+            ),
         }
         try:
+            prepare_flight_manifest(self, command, work_dir, manifest)
             for filename, argv, timeout in captures:
                 output_path = work_dir / filename
                 if argv[0] == "/usr/bin/nvidia-bug-report.sh":
@@ -385,7 +405,7 @@ class DiagnosticOperationsMixin:
                         str(script_output_path),
                     ]
                 try:
-                    completed = self.runner(
+                    completed = capture_runner(
                         argv,
                         check=False,
                         capture_output=True,
@@ -425,6 +445,7 @@ class DiagnosticOperationsMixin:
                     error = None
                 except (
                     OSError,
+                    ValueError,
                     subprocess.TimeoutExpired,
                 ) as exc:
                     returncode = None
@@ -447,6 +468,15 @@ class DiagnosticOperationsMixin:
                 if error:
                     capture["error"] = error
                 manifest["captures"].append(capture)
+                if passive_hung:
+                    publish_partial(
+                        self,
+                        {
+                            "status": "COLLECTING",
+                            "manifest": manifest,
+                            "evidence_complete": False,
+                        },
+                    )
             if command.parameters.get("capture_process_state"):
                 self._capture_efa_rdma_state(work_dir, command, manifest)
                 self._capture_hung_process_state(work_dir, command, manifest)
@@ -543,8 +573,12 @@ class DiagnosticOperationsMixin:
             candidates.append((modified, archive.name, archive))
         candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
         removed = []
+        # A triage command may preserve two dumps for each of 32 processes.
+        maximum = self.diagnostic_max_archives * (
+            64 if pattern == "nccl-flight-*.dump" else 1
+        )
         for index, (modified, name, archive) in enumerate(candidates):
-            if index >= self.diagnostic_max_archives or modified < cutoff:
+            if index >= maximum or modified < cutoff:
                 archive.unlink(missing_ok=True)
                 removed.append(name)
         return removed

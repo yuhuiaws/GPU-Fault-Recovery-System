@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import math
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta
+from typing import TYPE_CHECKING
 
 from gpu_fault.models import (
     EfaTrafficAdminAction,
@@ -10,6 +13,35 @@ from gpu_fault.models import (
     EfaTrafficState,
 )
 from gpu_fault.store.shared.errors import EfaTrafficAdminConflict
+from gpu_fault.efa_stall_episode import EfaRecoveryPolicy, advance_episode
+
+if TYPE_CHECKING:
+    from gpu_fault.host_health import HostMetricSample
+
+
+def traffic_observation(
+    samples: Iterable[HostMetricSample],
+) -> tuple[float, bool] | None:
+    items = list(samples)
+    rates = [
+        sample.value
+        for sample in items
+        if sample.name == "efa_traffic_bytes_per_second" and sample.device is None
+    ]
+    validity = [
+        sample.value
+        for sample in items
+        if sample.name == "efa_traffic_observation_valid" and sample.device is None
+    ]
+    if not rates and not validity:
+        return None
+    valid = (
+        len(rates) == 1
+        and validity in ([], [1])
+        and math.isfinite(rates[0])
+        and rates[0] >= 0
+    )
+    return (rates[0], True) if valid else (0.0, False)
 
 
 @dataclass
@@ -165,6 +197,8 @@ def next_efa_traffic_state(
     spike_event_id: str,
     progress_observed_at: datetime | None = None,
     progress_suppression_max_seconds: float | None = None,
+    observation_valid: bool = True,
+    recovery_policy: EfaRecoveryPolicy | None = None,
 ) -> tuple[EfaTrafficState, bool]:
     """Advance the node's state by one sample of ``job_id``/``attempt_id``.
 
@@ -180,7 +214,20 @@ def next_efa_traffic_state(
     if previous is not None and not efa_state_belongs_to(previous, job_id, attempt_id):
         previous = None
     working = _EfaWorkingState.from_previous(previous, observed_at)
-    if bytes_per_second <= zero_bps:
+    # The edge collector can coalesce steady samples for a few minutes. Beyond
+    # that allowance, elapsed wall time is not continuous zero-traffic evidence.
+    if previous is not None and (
+        observed_at - previous.observed_at
+    ).total_seconds() > max(360.0, zero_warning_seconds):
+        working.zero_since = None
+        working.zero_first_seen_at = None
+        working.zero_samples = 0
+    if not observation_valid:
+        working.zero_since = None
+        working.zero_first_seen_at = None
+        working.zero_samples = 0
+        signal = EfaTrafficSignal.WARMUP
+    elif bytes_per_second <= zero_bps:
         signal = _zero_traffic_signal(
             working,
             observed_at=observed_at,
@@ -232,6 +279,15 @@ def next_efa_traffic_state(
         spike_acknowledged_by=working.spike_acknowledged_by,
         spike_acknowledgement_reason=(working.spike_acknowledgement_reason),
     )
+    state, suppress_hung = advance_episode(
+        previous,
+        state,
+        recovery_policy or EfaRecoveryPolicy(),
+        valid=observation_valid,
+        minimum_active_bps=minimum_active_bps,
+        zero_bps=zero_bps,
+    )
+    signal = state.signal
     emit = (
         signal
         in {
@@ -242,6 +298,7 @@ def next_efa_traffic_state(
             EfaTrafficSignal.RECOVERED,
         }
         and signal != working.old_signal
+        and not suppress_hung
     )
     return state, emit
 

@@ -112,7 +112,7 @@ def test_the_live_580_limits_grade_the_margin_at_or_below(
 @pytest.mark.parametrize(
     "thresholds,critical,warning",
     [
-        ({"gpu_max_operating_tlimit_c": 0.0}, 0.0, 5.0),
+        ({"gpu_max_operating_tlimit_c": 0.0}, None, 0.0),
         ({"gpu_shutdown_tlimit_c": -8.0}, -5.0, 0.0),
         ({"gpu_slowdown_tlimit_c": -2.0, "gpu_max_operating_tlimit_c": 5.0}, -2, 5),
         ({"gpu_slowdown_tlimit_c": -2.0, "memory_max_operating_tlimit_c": 4.0}, -2, 4),
@@ -139,7 +139,13 @@ def test_a_missing_tlimit_threshold_falls_back_like_the_absolute_rule(
     def grade(reading: float):
         return decide("gpu_tlimit_c", reading, {**thresholds, "gpu_tlimit_c": reading})
 
-    assert grade(critical) == ("CRITICAL", "DRAIN", critical, "NVIDIA_DEVICE_TLIMIT")
+    if critical is not None:
+        assert grade(critical) == (
+            "CRITICAL",
+            "DRAIN",
+            critical,
+            "NVIDIA_DEVICE_TLIMIT",
+        )
     assert grade(warning) == (
         "WARNING",
         "RUN_DIAGNOSTICS",
@@ -210,17 +216,19 @@ def test_each_scale_names_its_own_vendor_reference() -> None:
 def test_ingestion_raises_one_tlimit_finding_and_no_fallback_one() -> None:
     service = GpuMetricsService()
 
-    result = service.ingest(
-        batch(
-            "tlimit-critical",
-            [
-                *limits(),
-                sample("gpu_tlimit_c", -3),
-                sample("gpu_temperature_c", 91),
-                sample("memory_temperature_c", 40),
-            ],
+    for seconds in (0, 15, 30):
+        result = service.ingest(
+            batch(
+                f"tlimit-critical-{seconds}",
+                [
+                    *limits(),
+                    sample("gpu_tlimit_c", -3),
+                    sample("gpu_temperature_c", 91),
+                    sample("memory_temperature_c", 40),
+                ],
+                seconds=seconds,
+            )
         )
-    )
 
     assert [
         (
@@ -259,10 +267,10 @@ def test_a_tlimit_finding_is_the_temperature_of_the_thermal_composite() -> None:
     service.ingest(batch("thermal-warning", thermal))
     critical = service.ingest(batch("thermal-critical", thermal, seconds=15))
 
-    (composite,) = critical.new_composite_findings
+    (composite,) = critical.composite_findings
     assert (composite.correlation_rule_id, composite.severity) == (
         "THERMAL_STRESS",
-        "CRITICAL",
+        "WARNING",
     )
     assert {"gpu_tlimit_c", "clock_throttle_reasons"} <= set(
         composite.component_metrics
@@ -282,7 +290,7 @@ def test_a_tlimit_finding_explains_a_power_violation(
             [
                 *limits(),
                 sample("gpu_tlimit_c", reading),
-                sample("power_violation_total_us", 1),
+                sample("power_violation_total_us", 1_000_000),
                 sample("power_usage_w", 680),
                 sample("power_limit_w", 700),
                 sample("gpu_utilization_percent", 95),
@@ -337,4 +345,4 @@ def test_validation_text_shows_a_margin_breach_as_at_or_below() -> None:
         {"tlimit-node": [finding_summary(finding)]},
     )
 
-    assert "gpu_tlimit_c CRITICAL -3<=-2 GPU-a" in text, text
+    assert "gpu_tlimit_c WARNING -3<=-2 GPU-a" in text, text

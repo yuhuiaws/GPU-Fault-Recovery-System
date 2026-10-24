@@ -28,6 +28,25 @@ from tests.store._cov95_runtime_postgres import peer_store
 pg_store = postgres.pg_store
 
 
+def test_missing_step_never_advances_native_or_legacy_progress(pg_store):
+    first = progress(0, step=10)
+    pg_store.observe_training_progress(first)
+    pg_store.observe_training_progress(progress(1, step=None))
+    state = pg_store.list_training_progress_states(CLUSTER)[0]
+    assert state.last_progress_at == first.observed_at, state
+    pg_store.observe_training_progress(progress(2, step=10))
+    assert (
+        pg_store.list_training_progress_states(CLUSTER)[0].last_progress_at
+        == first.observed_at
+    )
+    advanced = progress(3, step=11)
+    pg_store.observe_training_progress(advanced)
+    assert (
+        pg_store.list_training_progress_states(CLUSTER)[0].last_progress_at
+        == advanced.observed_at
+    )
+
+
 def test_gpu_batch_result_is_immutable_on_duplicate_retry(pg_store):
     key = (CLUSTER, NODE, "batch-example")
     original = ingestion()

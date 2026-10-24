@@ -53,6 +53,9 @@ from gpu_fault.node_agent.protocol import (
 #: What a window may hold beside its per-GPU resets and still keep Fabric
 #: Manager running: the client check only reads.
 FABRIC_NEUTRAL_OPERATIONS = frozenset({WorkflowOperation.VERIFY_NO_GPU_CLIENTS})
+PER_GPU_RESET_OPERATIONS = frozenset(
+    {WorkflowOperation.RESET_GPU, WorkflowOperation.RECOVER_DRAIN_P2P}
+)
 #: The node actions that bring every GPU back into a fresh fabric: the full GPU
 #: + NVSwitch reset (inside a window that stops Fabric Manager), a reboot, a
 #: replacement.
@@ -108,9 +111,9 @@ def fabric_manager_policy(
     """
 
     operations = window_operations(steps, quiesce_index)
-    if not operations or WorkflowOperation.RESET_GPU not in operations:
+    if not operations or not PER_GPU_RESET_OPERATIONS.intersection(operations):
         return None
-    allowed = FABRIC_NEUTRAL_OPERATIONS | {WorkflowOperation.RESET_GPU}
+    allowed = FABRIC_NEUTRAL_OPERATIONS | PER_GPU_RESET_OPERATIONS
     return QUIESCE_FABRIC_MANAGER_KEEP if set(operations) <= allowed else None
 
 
@@ -183,7 +186,8 @@ def _acted_on(
         or execution.phase == "safety"
         or execution.operation
         not in FABRIC_REREGISTRATION_OPERATIONS
-        | {WorkflowOperation.QUIESCE_GPU_SERVICES, WorkflowOperation.RESET_GPU}
+        | PER_GPU_RESET_OPERATIONS
+        | {WorkflowOperation.QUIESCE_GPU_SERVICES}
         or not 0 <= execution.step_index < len(steps)
     ):
         return False
@@ -215,7 +219,7 @@ def fabric_state_loss(workflow: WorkflowRequest, node_id: str) -> str | None:
         if execution.operation is WorkflowOperation.QUIESCE_GPU_SERVICES:
             stopped = fabric_manager_stopped(execution.details, node_id)
             stopped_at = execution.step_index if stopped else None
-        elif execution.operation is WorkflowOperation.RESET_GPU:
+        elif execution.operation in PER_GPU_RESET_OPERATIONS:
             if stopped_at is not None:
                 lost = (
                     f"{FABRIC_STATE_LOST}(step {stopped_at} stopped "

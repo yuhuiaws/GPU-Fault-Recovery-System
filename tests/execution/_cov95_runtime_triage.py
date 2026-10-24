@@ -21,8 +21,10 @@ def signal(pid: Any, rank: Any, sequence: int = 10, **updates: Any) -> dict[str,
                 "pg_name": "default",
                 "collective_seq_id": sequence,
                 "state": "started",
+                "pg_members": [0, 1, 2],
             }
         },
+        "process_identity": {"verified": True, "start_time_ticks": 1000},
         **updates,
     }
 
@@ -43,7 +45,9 @@ def triage_harness(
     h.amend(
         dag_enabled=True,
         official_steps=[
-            h.workflow.official_steps[0],
+            h.workflow.official_steps[0].model_copy(
+                update={"node_ids": ["node-a", "node-b", "node-c"]}
+            ),
             h.workflow.official_steps[1].model_copy(
                 update={
                     "node_ids": ["node-a", "node-b", "node-c"],

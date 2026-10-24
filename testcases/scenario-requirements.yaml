@@ -1,19 +1,574 @@
 schema_version: 1
 requirements:
+  - id: GF-REQ-OP-HUNG-SURVEY
+    family: operation
+    title: Full-task passive rank survey and bounded adaptive diagnosis
+    source: [src/gpu_fault/node_agent/operations/hung_summary.py, src/gpu_fault/adapters/node_action/hung_survey.py, src/gpu_fault/hung_survey_analysis.py, src/gpu_fault/node_agent/operations/flight_series.py, src/gpu_fault/flight_progress.py, src/gpu_fault/execution/flight_temporal.py, src/gpu_fault/node_agent/operations/stack_samples.py, src/gpu_fault/node_agent/operations/process_samples.py, src/gpu_fault/execution/process_diagnosis.py, src/gpu_fault/execution/process_cohorts.py]
+    covers: [operation:COLLECT_HUNG_SUMMARY]
+    conditions: [normal, repeat, failure, timeout, safety]
+    assertions:
+      - Every task node is a survey target; concurrency limits do not silently reduce the denominator.
+      - Passive collection never attaches a stack tool or triggers Flight Recorder.
+      - Rank identity coverage process groups timing gaps and unavailable observations remain explicit.
+      - Resumed surveys retain successful nodes and evidence decoding is bounded and lossless.
+      - Active diagnosis expands only within its two-wave budget and failed training diagnosis cannot claim recovery.
+      - Training step and phase never gate NCCL detection sampling or completion; unranked processes remain evidence with unknown rank coverage.
+      - Targeted FR capture requires two fresh process-bound observations; enqueue movement is not completion and missing dumps are not stalls.
+      - Thread-structured repeated captures validate exit codes and identity; comparable roles and windows are required for peer comparison.
+      - CPU uses elapsed time normalization; missing GPU data and rank IDs never discard independent process evidence.
+    cases: [GF-GENERAL-LIVE-011]
+    checks:
+      - nodeid: tests/execution/test_full_hung_survey.py::test_ten_thousand_ranks_are_all_visited_with_bounded_inflight_and_scoped_commands
+        expected: 2
+      - nodeid: tests/execution/test_full_hung_survey.py::test_resume_keeps_completed_nodes_and_expires_only_the_timed_out_pending_node
+      - nodeid: tests/execution/test_hung_survey_pipeline.py::test_real_node_summary_drives_two_disjoint_active_waves_and_bounded_bundle
+        expected: 3
+      - nodeid: tests/execution/test_nccl_step_independence.py::test_legacy_application_step_fields_do_not_skip_nccl_diagnostics
+      - nodeid: tests/execution/test_nccl_step_independence.py::test_first_wave_fr_members_choose_unsampled_peer_before_generic_expansion
+      - nodeid: tests/node_agent/test_flight_temporal_collection.py::test_real_fifo_temporal_evidence_drives_persisted_targeted_bundle
+      - nodeid: tests/node_agent/test_flight_temporal_collection.py::test_two_real_fifo_requests_are_fresh_process_bound_and_time_bounded
+        expected: 5
+      - nodeid: tests/execution/test_flight_temporal.py::test_same_enqueue_sequence_can_hide_persistent_completion_lag
+      - nodeid: tests/execution/test_flight_temporal.py::test_every_member_stalled_is_reported_without_inventing_a_culprit
+      - nodeid: tests/node_agent/test_process_diagnostics_e2e.py::test_real_capture_checks_exit_code_json_shape_and_does_not_parse_error_text
+        expected: 3
+      - nodeid: tests/node_agent/test_process_diagnostics_e2e.py::test_unknown_rank_storage_wait_reaches_workflow_without_strong_attribution
+      - nodeid: tests/execution/test_process_diagnosis.py::test_legitimate_role_or_window_differences_are_not_peer_outliers
+        expected: 7
+      - nodeid: tests/execution/test_process_diagnosis.py::test_fr_completion_progress_does_not_silence_process_io_evidence
+      - nodeid: tests/node_agent/test_stack_samples.py::test_container_native_tid_is_bound_to_host_tid_using_namespace_identity
+      - nodeid: tests/execution/test_hung_summary_codec.py::test_small_compressed_input_cannot_expand_past_the_node_limit
+    runners: [scripts/e2e/run_general_fault_injections.py]
+    critical: true
+    level: regional
+    gap: Live GPU/EFA timing, application integration and thousand-GPU workload impact are NOT_RUN; software scale fixtures are not physical recovery evidence.
+  - id: GF-REQ-GENERAL-LIVE
+    family: fault-policy
+    title: All 32 general fault categories retain explicit live acceptance variants
+    source: [docs/components/general-fault-live-acceptance.md, testcases/general-live-coverage.yaml]
+    covers: [fault:general-live-001, fault:general-live-002, fault:general-live-003, fault:general-live-004, fault:general-live-005, fault:general-live-006, fault:general-live-007, fault:general-live-008, fault:general-live-009, fault:general-live-010, fault:general-live-011, fault:general-live-012, fault:general-live-013, fault:general-live-014, fault:general-live-015, fault:general-live-016, fault:general-live-017, fault:general-live-018, fault:general-live-019, fault:general-live-020, fault:general-live-021, fault:general-live-022, fault:general-live-023, fault:general-live-024, fault:general-live-025, fault:general-live-026, fault:general-live-027, fault:general-live-028, fault:general-live-029, fault:general-live-030, fault:general-live-031, fault:general-live-032]
+    conditions: [normal, repeat, timeout, restart, failure, safety]
+    assertions:
+      - Every category maps to live procedures and mandatory positive negative recovery and scope variants.
+      - Native system changes source replay and vendor physical faults are separate proof scopes.
+      - Acceptance requires original source through real execution and cleanup receipts; plans and old unrelated runs cannot substitute.
+      - Missing fixtures and unexecuted variants remain explicit gaps; implemented safety or measurement defects fail acceptance.
+    cases: [GF-GENERAL-LIVE-001, GF-GENERAL-LIVE-002, GF-GENERAL-LIVE-003, GF-GENERAL-LIVE-004, GF-GENERAL-LIVE-005, GF-GENERAL-LIVE-006, GF-GENERAL-LIVE-007, GF-GENERAL-LIVE-008, GF-GENERAL-LIVE-009, GF-GENERAL-LIVE-010, GF-GENERAL-LIVE-011, GF-GENERAL-LIVE-012, GF-GENERAL-LIVE-013, GF-GENERAL-LIVE-014, GF-GENERAL-LIVE-015, GF-GENERAL-LIVE-016, GF-GENERAL-LIVE-017, GF-GENERAL-LIVE-019, GF-GENERAL-LIVE-020, GF-GENERAL-LIVE-021, GF-GENERAL-LIVE-022, GF-GENERAL-LIVE-024, GF-GENERAL-LIVE-025, GF-GENERAL-LIVE-026, GF-GENERAL-LIVE-027, GF-GENERAL-LIVE-028, GF-GENERAL-LIVE-029, GF-GENERAL-LIVE-030, GF-GENERAL-LIVE-031, GF-GENERAL-LIVE-032, GF-ENV-LIVE-001, GF-ENV-LIVE-002, GF-ENV-LIVE-003, GF-ENV-LIVE-004, GF-ENV-LIVE-005, GF-ENV-LIVE-006, GF-ENV-LIVE-007, GF-ENV-LIVE-008, GF-ENV-LIVE-009, GF-ENV-LIVE-010, GF-ENV-LIVE-011, GF-ENV-LIVE-012]
+    level: regional
+    critical: true
+    gap: All live specifications are NOT_RUN. Complete source fixtures for Host journal non-environment DCGM and inventory, required hardware scale and OEM fault facilities are not all available. Existing implementation defects remain acceptance failures, not completed repairs.
+  - id: GF-REQ-ENV-SOFTWARE
+    family: fault-policy
+    title: Device-scale thermal containment and read-only thermal performance workflows
+    source: [src/gpu_fault/gpu_environment_policy.py, src/gpu_fault/gpu_temperature_policy.py, src/gpu_fault/orchestration/families/health.py]
+    covers: [fault:environment-device-limits, fault:environment-warning-workflow]
+    conditions: [normal, repeat, failure, safety]
+    assertions: [Raw XML limits and exporter samples reach real execution, Warning correlation cannot dispatch mutations, Shutdown protection does not wait for three samples]
+    cases: [GF-ENV-SW-001, GF-ENV-SW-002]
+    checks:
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_device_temperature_limits_reach_real_containment
+        expected: 4
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_thermal_warning_and_duration_execute_only_read_only_diagnostics
+    critical: true
+  - id: GF-REQ-ENV-LIVE
+    family: fault-policy
+    title: Live environmental detection containment evidence and controlled readmission
+    source: [docs/components/gpu-environment-live-acceptance.md, src/gpu_fault/gpu_environment_policy.py]
+    covers: [fault:environment-live-baseline, fault:environment-live-power-cap, fault:environment-live-warning, fault:environment-live-temperature, fault:environment-live-transient, fault:environment-live-duration, fault:environment-live-brake, fault:environment-live-unknown, fault:environment-live-source, fault:environment-live-scope, fault:environment-live-shutdown, fault:environment-physical]
+    conditions: [normal, repeat, timeout, restart, failure, safety]
+    assertions: [Real collector and execution receipts are required, Physical faults and telemetry replay are separate proof scopes, Missing variants and cleanup failures cannot pass]
+    cases: [GF-ENV-LIVE-001, GF-ENV-LIVE-002, GF-ENV-LIVE-003, GF-ENV-LIVE-004, GF-ENV-LIVE-005, GF-ENV-LIVE-006, GF-ENV-LIVE-007, GF-ENV-LIVE-008, GF-ENV-LIVE-009, GF-ENV-LIVE-010, GF-ENV-LIVE-011, GF-ENV-LIVE-012]
+    runners: [tools/gpu_environment_replay.py]
+    level: regional
+    critical: true
+    gap: All twelve live specifications are NOT_RUN; the replay helper does not orchestrate deployment or certify physical faults, and OEM laboratory conditions are not available in software tests.
+  - id: GF-REQ-GENERAL-FIX-016
+    family: fault-policy
+    title: Trusted fatal logs stop only a freshly attributed attempt
+    source: [src/gpu_fault/log_recovery_context.py, src/gpu_fault/host_health.py, src/gpu_fault/orchestration/families/health.py]
+    covers: [fault:general-fix-016]
+    conditions: [normal, failure, safety]
+    assertions: [Kernel authority and fresh ownership precede stop, Unknown or workload-controlled text cannot authorize stop]
+    cases: [GF-GENERAL-FIX-016]
+    checks:
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_fatal_host_log_stops_the_owned_attempt_before_quarantine
+        expected: 4
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_untrusted_fatal_text_cannot_stop_training
+        expected: 2
+    critical: true
+  - id: GF-REQ-GENERAL-FIX-017
+    family: fault-policy
+    title: Application log attribution and evidence do not claim application repair
+    source: [src/gpu_fault/log_recovery_context.py, src/gpu_fault/collectors/logs/node.py]
+    covers: [fault:general-fix-017]
+    conditions: [normal, failure, safety]
+    assertions: [Preserve observed PID and container state, Ordinary errors create no competing diagnostic chain and exits remain watcher owned]
+    cases: [GF-GENERAL-FIX-017]
+    checks:
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_application_log_preserves_attribution_and_watcher_ownership
+  - id: GF-REQ-GENERAL-FIX-018
+    family: fault-policy
+    title: Sustained thermal confirmation and operator-reviewed readmission
+    source: [src/gpu_fault/health_recovery_contract.py, src/gpu_fault/health_evidence_validation.py]
+    covers: [fault:general-fix-018]
+    conditions: [normal, repeat, failure, safety]
+    assertions: [Three valid severe observations confirm the fault, UNKNOWN interrupts confirmation, Idle cooling does not authorize readmission or hardware escalation]
+    cases: [GF-GENERAL-FIX-018, GF-GENERAL-FIX-018-UNKNOWN]
+    checks:
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_confirmed_thermal_fault_requires_review_after_cooling
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_unknown_observation_breaks_thermal_confirmation
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_temperature_without_gpu_identity_contains_without_readmission
+    critical: true
+  - id: GF-REQ-GENERAL-FIX-019
+    family: fault-policy
+    title: Memory evidence uses architecture-aware repair instead of blanket RMA
+    source: [src/gpu_fault/gpu_memory_policy.py]
+    covers: [fault:general-fix-019]
+    conditions: [normal, failure, safety]
+    assertions: [DBE stops for analysis, Unknown architectures do not blindly reset, Only supported failed repair enters field-diagnostic review]
+    cases: [GF-GENERAL-FIX-019]
+    checks:
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_uncorrectable_ecc_stops_for_analysis_without_automatic_rma
+      - nodeid: tests/metrics/test_general_health_policy_boundaries.py::test_memory_actions_require_the_matching_architecture
+        expected: 7
+    critical: true
+  - id: GF-REQ-GENERAL-FIX-020
+    family: fault-policy
+    title: NVLink counter evidence alone is diagnostic
+    source: [src/gpu_fault/gpu_metrics.py]
+    covers: [fault:general-fix-020]
+    conditions: [normal, failure, safety]
+    assertions: [Counter-only diagnostics do not dispatch stress tests or hardware recovery]
+    cases: [GF-GENERAL-FIX-020]
+    checks:
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_counter_diagnostics_never_dispatch_hardware_recovery[nvlink]
+  - id: GF-REQ-GENERAL-FIX-022
+    family: fault-policy
+    title: PCIe diagnostic execution and invalid-delta protection
+    source: [src/gpu_fault/gpu_composites.py, src/gpu_fault/gpu_observation.py]
+    covers: [fault:general-fix-022]
+    conditions: [normal, restart, failure, safety]
+    assertions: [Discontinuities do not become valid error or healthy deltas, A replay rate alone does not authorize reboot]
+    cases: [GF-GENERAL-FIX-022]
+    checks:
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_counter_diagnostics_never_dispatch_hardware_recovery[pcie]
+      - nodeid: tests/metrics/test_general_health_policy_boundaries.py::test_counter_discontinuity_is_not_a_fresh_error_or_healthy_delta
+        expected: 4
+  - id: GF-REQ-GENERAL-FIX-023
+    family: fault-policy
+    title: Meaningful duty-cycle evidence without thermal misclassification
+    source: [src/gpu_fault/gpu_power_policy.py, src/gpu_fault/gpu_metrics.py]
+    covers: [fault:general-fix-023]
+    conditions: [normal, repeat, safety]
+    assertions: [Microsecond creep does not request recovery, Power limiting remains a performance diagnostic]
+    cases: [GF-GENERAL-FIX-023, GF-GENERAL-FIX-023-BRAKE]
+    checks:
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_counter_diagnostics_never_dispatch_hardware_recovery[power]
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_power_brake_is_not_power_cap_and_never_reboots_the_node
+      - nodeid: tests/metrics/test_general_health_policy_boundaries.py::test_microsecond_noise_cannot_request_recovery
+        expected: 2
+  - id: GF-REQ-GENERAL-FIX-024
+    family: fault-policy
+    title: Composite evidence advances only with new relevant observations
+    source: [src/gpu_fault/gpu_metrics.py, src/gpu_fault/gpu_composites.py]
+    covers: [fault:general-fix-024]
+    conditions: [normal, repeat, safety]
+    assertions: [Repeated component evidence does not advance escalation, Correctable-only correlation stays diagnostic]
+    cases: [GF-GENERAL-FIX-024]
+    checks:
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_counter_diagnostics_never_dispatch_hardware_recovery[correctable-composite]
+      - nodeid: tests/metrics/test_general_health_policy_boundaries.py::test_unrelated_samples_do_not_advance_composite_consecutive_count
+  - id: GF-REQ-GENERAL-FIX-025
+    family: fault-policy
+    title: Incomplete GPU observations refresh without the hardware ladder
+    source: [src/gpu_fault/gpu_observation.py, src/gpu_fault/health_evidence_validation.py]
+    covers: [fault:general-fix-025]
+    conditions: [normal, repeat, failure, safety]
+    assertions: [Invalid or ambiguous slots are UNKNOWN, A fresh successful observation is required after refresh]
+    cases: [GF-GENERAL-FIX-025]
+    checks:
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_incomplete_gpu_collection_refreshes_observation_without_hardware_ladder
+      - nodeid: tests/metrics/test_general_health_policy_boundaries.py::test_duplicate_metric_slots_are_unknown_not_arbitrarily_selected
+    critical: true
+  - id: GF-REQ-GENERAL-FIX-027
+    family: fault-policy
+    title: Attributed numerical failure and bounded application phases
+    source: [src/gpu_fault/training_health.py, src/gpu_fault/training_phase.py]
+    covers: [fault:general-fix-027]
+    conditions: [normal, restart, timeout, safety]
+    assertions: [NaN stops only the observed attempt without trusting a checkpoint, Missing reporters are not confirmed NCCL hangs, Pause phases cannot suppress forever]
+    cases: [GF-GENERAL-FIX-027, GF-GENERAL-FIX-027-HUNG]
+    checks:
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_nonfinite_loss_stops_only_its_attempt_and_does_not_restart_bad_checkpoint
+      - nodeid: tests/execution/test_general_health_policy_e2e.py::test_hung_validation_requires_new_application_progress_not_healthy_fabric
+      - nodeid: tests/completion/test_training_phase_recovery.py::test_live_phase_pause_is_bounded
+        expected: 4
+      - nodeid: tests/completion/test_training_phase_recovery.py::test_stale_heartbeat_is_reporter_silence_not_confirmed_nccl_hang
+      - nodeid: tests/completion/test_training_phase_recovery.py::test_checkpoint_restore_can_regress_step_only_inside_the_bounded_phase
+      - nodeid: tests/completion/test_training_phase_recovery.py::test_unknown_or_old_attempt_cannot_stop_current_training
+      - nodeid: tests/completion/test_training_phase_recovery.py::test_forged_progress_identity_has_no_stop_authority
+        expected: 3
+    critical: true
+  - id: GF-REQ-GENERAL-FIX-030
+    family: fault-policy
+    title: Spare readiness loss alone does not authorize hardware reboot
+    source: [src/gpu_fault/spare_fault_evidence.py, src/gpu_fault/spare_health.py]
+    covers: [fault:general-fix-030]
+    conditions: [normal, repeat, safety]
+    assertions: [NotReady and missing observation keep a spare ineligible without inventing hardware recovery]
+    cases: [GF-GENERAL-FIX-030]
+    checks:
+      - nodeid: tests/execution/test_observation_recovery_e2e.py::test_not_ready_spare_does_not_invent_hardware_reboot
+    critical: true
+  - id: GF-REQ-GENERAL-FIX-031
+    family: fault-policy
+    title: Bounded collector refresh and shared UNKNOWN interpretation
+    source: [src/gpu_fault/observation_health.py, src/gpu_fault/app/collector_silence.py]
+    covers: [fault:general-fix-031]
+    conditions: [normal, repeat, timeout, safety]
+    assertions: [Repeated scans create one refresh per node/hour, Fresh success is required without node isolation]
+    cases: [GF-GENERAL-FIX-031]
+    checks:
+      - nodeid: tests/execution/test_observation_recovery_e2e.py::test_silent_collector_refresh_is_bounded_and_requires_fresh_success
+    critical: true
+  - id: GF-REQ-GENERAL-HOST-SOFTWARE
+    family: ingestion
+    title: Raw host observations through API and actual validation or isolation adapters
+    source: [src/gpu_fault/collectors/host/collector.py, src/gpu_fault/adapters/gpu_validation.py, src/gpu_fault/adapters/kubernetes/adapter.py]
+    covers: [fault:general-host-software]
+    conditions: [normal, repeat, failure, safety]
+    assertions:
+      - CPU, memory and swap observations reach the real validation adapter with unhealthy and recovered outcomes.
+      - Filesystem, SMART, BMC and required-interface faults execute the actual isolation adapter against a local client.
+      - Query failures retain observation errors without manufacturing hardware workflows.
+      - All OS and Kubernetes effects remain fixture-owned; this is not physical acceptance.
+    cases: [GF-GENERAL-SW-001, GF-GENERAL-SW-002, GF-GENERAL-SW-003]
+    checks:
+      - nodeid: tests/host_health/test_general_fault_observation_e2e.py::test_resource_fault_reaches_real_validation
+        expected: 6
+      - nodeid: tests/host_health/test_general_fault_observation_e2e.py::test_hardware_fault_reaches_real_quarantine_adapter
+        expected: 5
+      - nodeid: tests/host_health/test_general_fault_observation_e2e.py::test_observation_failure_does_not_isolate_node
+        expected: 3
+  - id: GF-REQ-GENERAL-001
+    family: fault-policy
+    title: CPU saturation complete acceptance
+    source: [src/gpu_fault/host_health.py]
+    covers: [fault:general-001]
+    conditions: [normal, failure, safety]
+    assertions: [Sustained CPU and load breaches reach validation without hardware escalation.]
+    cases: [GF-GENERAL-E2E-001]
+    gap: Full acceptance is manual and unexecuted; application-phase and cgroup attribution remain incomplete.
+  - id: GF-REQ-GENERAL-002
+    family: fault-policy
+    title: Memory and swap complete acceptance
+    source: [src/gpu_fault/host_health.py]
+    covers: [fault:general-002]
+    conditions: [normal, failure, safety]
+    assertions: [Memory and swap retain distinct timers and verification of the original metric.]
+    cases: [GF-GENERAL-E2E-002]
+    gap: Full acceptance is manual and unexecuted; task memory and checkpoint attribution remain incomplete.
+  - id: GF-REQ-GENERAL-003
+    family: fault-policy
+    title: Sustained resource risk complete acceptance
+    source: [src/gpu_fault/host_low_utilization.py, src/gpu_fault/host_health.py]
+    covers: [fault:general-003]
+    conditions: [normal, restart, safety]
+    assertions: [All five resource variants preserve attempt and allocated GPU scope through execution.]
+    cases: [GF-GENERAL-E2E-003]
+    gap: Full acceptance is manual and unexecuted; phase-aware and shared-GPU diagnosis remain incomplete.
+  - id: GF-REQ-GENERAL-004
+    family: fault-policy
+    title: Local disk capacity complete acceptance
+    source: [src/gpu_fault/collectors/host/system_metrics.py, src/gpu_fault/host_health.py]
+    covers: [fault:general-004]
+    conditions: [normal, repeat, safety]
+    assertions: [Capacity exhaustion executes isolation and preserves foreign taints.]
+    cases: [GF-GENERAL-E2E-004]
+    gap: Full acceptance is manual and unexecuted; inode exhaustion and task-versus-host storage classification remain incomplete.
+  - id: GF-REQ-GENERAL-005
+    family: fault-policy
+    title: Shared filesystem complete acceptance
+    source: [src/gpu_fault/collectors/host/system_metrics.py]
+    covers: [fault:general-005]
+    conditions: [normal, timeout, safety]
+    assertions: [Unresponsive mounts cannot block collection or be cleared by another healthy mount.]
+    cases: [GF-GENERAL-E2E-005]
+    gap: Full acceptance is manual and unexecuted; real read-write probes and shared failure-domain correlation remain incomplete.
+  - id: GF-REQ-GENERAL-006
+    family: fault-policy
+    title: Disk IO saturation complete acceptance
+    source: [src/gpu_fault/collectors/host/system_metrics.py, src/gpu_fault/host_health.py]
+    covers: [fault:general-006]
+    conditions: [normal, repeat, safety]
+    assertions: [Saturation uses valid deltas and a sustained window before targeted diagnostics.]
+    cases: [GF-GENERAL-E2E-006]
+    gap: Full acceptance is manual and unexecuted; device normalization and checkpoint-aware interpretation remain incomplete.
+  - id: GF-REQ-GENERAL-007
+    family: fault-policy
+    title: SMART complete acceptance
+    source: [src/gpu_fault/collectors/host/system_metrics.py]
+    covers: [fault:general-007]
+    conditions: [normal, failure, safety]
+    assertions: [Self-assessment failure and observation failure retain different handling through execution.]
+    cases: [GF-GENERAL-E2E-007]
+    gap: Full acceptance is manual and unexecuted; SMART discovery-command failure and device impact classification remain incomplete.
+  - id: GF-REQ-GENERAL-008
+    family: fault-policy
+    title: Required network link complete acceptance
+    source: [src/gpu_fault/collectors/host/network.py]
+    covers: [fault:general-008]
+    conditions: [normal, failure, safety]
+    assertions: [Required interface absence and down are distinct from unreadable or unknown state.]
+    cases: [GF-GENERAL-E2E-008]
+    gap: Full acceptance is manual and unexecuted; bond, VF and interface-role variants remain incomplete.
+  - id: GF-REQ-GENERAL-009
+    family: fault-policy
+    title: Network errors and drops complete acceptance
+    source: [src/gpu_fault/collectors/host/network.py, src/gpu_fault/host_health.py]
+    covers: [fault:general-009]
+    conditions: [normal, repeat, safety]
+    assertions: [Real error deltas and sustained drops reach fabric verification without treating TCP retransmits as hardware failures.]
+    cases: [GF-GENERAL-E2E-009]
+    gap: Full acceptance is manual and unexecuted; rate-based and application-aware grading remain incomplete.
+  - id: GF-REQ-GENERAL-010
+    family: fault-policy
+    title: EFA and RDMA error complete acceptance
+    source: [src/gpu_fault/collectors/host/network.py, src/gpu_fault/host_health.py]
+    covers: [fault:general-010]
+    conditions: [normal, failure, safety]
+    assertions: [Each error family is exercised from counter input through fabric validation.]
+    cases: [GF-GENERAL-E2E-010]
+    gap: Full acceptance is manual and unexecuted; driver-specific congestion and hardware error grading remain incomplete.
+  - id: GF-REQ-GENERAL-011
+    family: fault-policy
+    title: EFA hung detection and evidence complete acceptance
+    source: [src/gpu_fault/efa_traffic_state.py, src/gpu_fault/orchestration/families/health.py]
+    covers: [fault:general-011]
+    conditions: [normal, repeat, timeout, safety]
+    assertions: [Raw counters reach real API and node handlers then persisted archives and fabric validation, Disabled or incomplete evidence never mutates the job, Restart and response loss preserve successful collections]
+    cases: [GF-GENERAL-E2E-011]
+    checks:
+      - nodeid: tests/execution/test_nccl_continuous_e2e.py::test_raw_rdma_to_real_collection_archive_and_operator_handoff
+        expected: 14
+      - nodeid: tests/execution/test_nccl_continuous_e2e.py::test_partial_evidence_still_reaches_review_without_claiming_coverage
+        expected: 4
+      - nodeid: tests/execution/test_nccl_continuous_e2e.py::test_raw_counter_negative_paths_do_not_start_hung_collection
+        expected: 4
+      - nodeid: tests/execution/test_nccl_continuous_e2e.py::test_executor_restart_retains_completed_nodes_and_pending_deadlines
+        expected: 2
+      - nodeid: tests/execution/test_nccl_continuous_e2e.py::test_lost_response_and_agent_restart_replay_without_recapturing
+        expected: 2
+      - nodeid: tests/execution/test_nccl_continuous_e2e.py::test_whole_task_communication_summary_prioritizes_an_unsampled_lagging_node
+      - nodeid: tests/execution/test_nccl_continuous_e2e.py::test_summary_byte_budget_exhaustion_is_unknown_not_full_coverage
+    runners: [scripts/e2e/run_general_fault_injections.py]
+    gap: Continuous local software coverage uses owned proc/sysfs/FIFO and device-response fixtures. Live thousand-GPU overhead, native NCCL hangs, real transport and PostgreSQL HA are NOT_RUN.
+  - id: GF-REQ-GENERAL-012
+    family: fault-policy
+    title: GPU loss complete acceptance
+    source: [src/gpu_fault/collectors/host/inventory.py, src/gpu_fault/host_health.py]
+    covers: [fault:general-012]
+    conditions: [normal, failure, timeout, safety]
+    assertions: [Confirmed missing inventory is distinguished from query failure before recovery and readmission.]
+    cases: [GF-GENERAL-E2E-012]
+    gap: Full acceptance is manual and unexecuted; query-failure and configured-expectation variants are not all proven end to end.
+  - id: GF-REQ-GENERAL-013
+    family: fault-policy
+    title: EFA inventory complete acceptance
+    source: [src/gpu_fault/collectors/host/inventory.py, src/gpu_fault/collectors/host/observation.py]
+    covers: [fault:general-013]
+    conditions: [normal, failure, timeout, safety]
+    assertions: [PCI loss, unbound driver, inactive link and unavailable evidence retain distinct executable paths.]
+    cases: [GF-GENERAL-E2E-013]
+    gap: Full acceptance is manual and unexecuted; existing unbind recovery cannot establish every PCI and link-loss variant.
+  - id: GF-REQ-GENERAL-014
+    family: fault-policy
+    title: Accelerator allocatable complete acceptance
+    source: [src/gpu_fault/adapters/kubernetes/node_operations.py]
+    covers: [fault:general-014]
+    conditions: [normal, failure, safety]
+    assertions: [Plugin recovery verifies expected resources and ongoing training before declaring success.]
+    cases: [GF-GENERAL-E2E-014]
+    gap: Full acceptance is manual and unexecuted; MIG and shared-resource accounting variants remain incomplete.
+  - id: GF-REQ-GENERAL-015
+    family: fault-policy
+    title: BMC sensor complete acceptance
+    source: [src/gpu_fault/collectors/host/system_metrics.py]
+    covers: [fault:general-015]
+    conditions: [normal, failure, safety]
+    assertions: [Real-format status columns trigger isolation while unavailable observations do not fabricate health.]
+    cases: [GF-GENERAL-E2E-015]
+    gap: Full acceptance is manual and unexecuted; sensor-specific impact grading remains incomplete.
+  - id: GF-REQ-GENERAL-016
+    family: fault-policy
+    title: Fatal host log complete acceptance
+    source: [src/gpu_fault/collectors/logs/node.py, src/gpu_fault/host_health.py]
+    covers: [fault:general-016]
+    conditions: [normal, repeat, safety]
+    assertions: [Trusted fatal host logs execute isolation without granting the same authority to application text.]
+    cases: [GF-GENERAL-E2E-016]
+    gap: Software stop and attribution policy is implemented; full isolated hardware acceptance remains manual and unexecuted.
+  - id: GF-REQ-GENERAL-017
+    family: fault-policy
+    title: Application error log complete acceptance
+    source: [src/gpu_fault/collectors/logs/node.py, src/gpu_fault/host_health.py]
+    covers: [fault:general-017]
+    conditions: [normal, failure, safety]
+    assertions: [OOM and distributed errors retain attempt scope and distinguish exited from stalled processes.]
+    cases: [GF-GENERAL-E2E-017]
+    gap: Software attribution and review flow is implemented; complete live application evidence acceptance remains unexecuted.
+  - id: GF-REQ-GENERAL-018
+    family: fault-policy
+    title: Temperature complete acceptance
+    source: [src/gpu_fault/gpu_metrics.py, src/gpu_fault/gpu_temperature_policy.py]
+    covers: [fault:general-018]
+    conditions: [normal, failure, safety]
+    assertions: [Absolute and signed T.Limit readings retain their scales through actual recovery decisions.]
+    cases: [GF-GENERAL-E2E-018]
+    gap: Software cooldown and validated readmission is implemented; physical cooling acceptance remains manual and unexecuted.
+  - id: GF-REQ-GENERAL-019
+    family: fault-policy
+    title: GPU memory error complete acceptance
+    source: [src/gpu_fault/gpu_metrics.py]
+    covers: [fault:general-019]
+    conditions: [normal, repeat, failure, safety]
+    assertions: [ECC and retirement variants execute only their authorized architecture-appropriate recovery.]
+    cases: [GF-GENERAL-E2E-019]
+    gap: Architecture-aware software grading is implemented; actual device repair and fresh driver-action acceptance remain unexecuted.
+  - id: GF-REQ-GENERAL-020
+    family: fault-policy
+    title: NVLink counter complete acceptance
+    source: [src/gpu_fault/gpu_metrics.py]
+    covers: [fault:general-020]
+    conditions: [normal, repeat, safety]
+    assertions: [Counter resets and stale samples do not repeat or widen the actual recovery scope.]
+    cases: [GF-GENERAL-E2E-020]
+    gap: Counter-only software diagnostics are implemented; physical link and fatal Xid/SXid combined acceptance remains unexecuted.
+  - id: GF-REQ-GENERAL-021
+    family: fault-policy
+    title: Untrained fabric complete acceptance
+    source: [src/gpu_fault/gpu_fabric_window.py, src/gpu_fault/orchestration/families/health.py]
+    covers: [fault:general-021]
+    conditions: [normal, restart, failure, safety]
+    assertions: [A held fabric-status finding executes full reset and checks every GPU before readmission.]
+    cases: [GF-GENERAL-E2E-021]
+    gap: Full status-triggered execution across the supported model matrix is not established by a Xid45-triggered runner.
+  - id: GF-REQ-GENERAL-022
+    family: fault-policy
+    title: PCIe replay complete acceptance
+    source: [src/gpu_fault/gpu_metrics.py]
+    covers: [fault:general-022]
+    conditions: [normal, failure, safety]
+    assertions: [Only trusted same-device in-window Xid evidence can form the stronger PCIe composite.]
+    cases: [GF-GENERAL-E2E-022]
+    gap: Invalid-delta protections are implemented; physical PCIe topology and traffic-sensitive acceptance remain manual and unexecuted.
+  - id: GF-REQ-GENERAL-023
+    family: fault-policy
+    title: Throttling and power complete acceptance
+    source: [src/gpu_fault/collectors/gpu/dcgm.py, src/gpu_fault/gpu_metrics.py]
+    covers: [fault:general-023]
+    conditions: [normal, repeat, failure, safety]
+    assertions: [Collector duty-cycle filtering and control-plane grading remain distinct from normal power limiting.]
+    cases: [GF-GENERAL-E2E-023]
+    gap: Duty-cycle and thermal/RMA separation are implemented; physical performance-impact acceptance remains unexecuted.
+  - id: GF-REQ-GENERAL-024
+    family: fault-policy
+    title: DCGM composite complete acceptance
+    source: [src/gpu_fault/gpu_metrics.py]
+    covers: [fault:general-024]
+    conditions: [normal, repeat, restart, safety]
+    assertions: [Composite windows preserve device identity and suppress duplicate component execution.]
+    cases: [GF-GENERAL-E2E-024]
+    gap: Software evidence-window and repeat protections are implemented; physical causality and all combined failure acceptance remain unexecuted.
+  - id: GF-REQ-GENERAL-025
+    family: fault-policy
+    title: Incomplete DCGM observations complete acceptance
+    source: [src/gpu_fault/collectors/gpu/dcgm.py, src/gpu_fault/gpu_metrics.py]
+    covers: [fault:general-025]
+    conditions: [normal, failure, timeout, safety]
+    assertions: [Valid partial data survives errors and only fresh complete observations clear unavailable health.]
+    cases: [GF-GENERAL-E2E-025]
+    gap: Shared UNKNOWN and bounded snapshot refresh are implemented; live monitoring failure acceptance remains unexecuted.
+  - id: GF-REQ-GENERAL-026
+    family: fault-policy
+    title: GPU identity and unknown expectation complete acceptance
+    source: [src/gpu_fault/gpu_metrics.py, src/gpu_fault/collectors/host/inventory.py]
+    covers: [fault:general-026]
+    conditions: [normal, restart, safety]
+    assertions: [Identity changes and unknown expected counts retain different actions without invented inventory.]
+    cases: [GF-GENERAL-E2E-026]
+    gap: Full acceptance is manual and unexecuted; both branches and authorized baseline changes require separate evidence.
+  - id: GF-REQ-GENERAL-027
+    family: fault-policy
+    title: Training progress complete acceptance
+    source: [src/gpu_fault/training_health.py]
+    covers: [fault:general-027]
+    conditions: [normal, failure, timeout, safety]
+    assertions: [Nonfinite loss and stalled progress preserve attempt scope and cannot be declared repaired by healthy fabric alone.]
+    cases: [GF-GENERAL-E2E-027]
+    gap: Attributed stop, bounded phases and progress validation are implemented; checkpoint contents still require application validation and full live acceptance is unexecuted.
+  - id: GF-REQ-GENERAL-028
+    family: fault-policy
+    title: Process exit and attempt termination complete acceptance
+    source: [src/gpu_fault/completion_controller.py, src/gpu_fault/app/routes/completion.py]
+    covers: [fault:general-028]
+    conditions: [normal, repeat, restart, safety]
+    assertions: [Actual watcher-observed exits preserve logs and cannot recursively restart or affect a newer attempt.]
+    cases: [GF-GENERAL-E2E-028]
+    gap: Full acceptance is manual and unexecuted; natural-exit variants cannot all be inferred from Xid-triggered recovery.
+  - id: GF-REQ-GENERAL-029
+    family: fault-policy
+    title: Exhausted restart budget complete acceptance
+    source: [src/gpu_fault/execution/restart_budget_preflight.py]
+    covers: [fault:general-029]
+    conditions: [normal, repeat, restart, safety]
+    assertions: [Budget exhaustion withholds only job restart while required remediation continues and notification is deduplicated.]
+    cases: [GF-GENERAL-E2E-029]
+    gap: Full fault-to-execution acceptance is manual and unexecuted; existing executor-level tests are not physical recovery proof.
+  - id: GF-REQ-GENERAL-030
+    family: fault-policy
+    title: Unhealthy warm spare complete acceptance
+    source: [src/gpu_fault/spare_health.py]
+    covers: [fault:general-030]
+    conditions: [normal, repeat, failure, safety]
+    assertions: [Only justified hardware failure can authorize spare reboot and failed recovery retains unavailability.]
+    cases: [GF-GENERAL-E2E-030]
+    gap: Software evidence classification is implemented; actual provider reboot and warm-spare recovery acceptance remain unexecuted.
+  - id: GF-REQ-GENERAL-031
+    family: fault-policy
+    title: Collector silence complete acceptance
+    source: [src/gpu_fault/app/collector_silence.py]
+    covers: [fault:general-031]
+    conditions: [normal, repeat, timeout, safety]
+    assertions: [A missing required channel under a valid agent lease produces deduplicated delivery and recovers on fresh reporting.]
+    cases: [GF-GENERAL-E2E-031]
+    gap: Shared UNKNOWN and bounded refresh are implemented; service restart remains existing supervisor/operator authority and full live acceptance is unexecuted.
+  - id: GF-REQ-GENERAL-032
+    family: fault-policy
+    title: Unknown errors and missing evidence complete acceptance
+    source: [src/gpu_fault/policy/engine.py]
+    covers: [fault:general-032]
+    conditions: [normal, failure, safety]
+    assertions: [Unknown recovery semantics cannot authorize reset while known Xids are not blocked by linkage reporting versions.]
+    cases: [GF-GENERAL-E2E-032]
+    gap: Full acceptance is manual and unexecuted; missing-information versus confirmed-fatal handling requires separate policy review.
   - id: GF-REQ-POLICY-CATALOG
     family: fault-policy
-    title: Pinned catalog, product applicability and driver-version gates
+    title: Pinned catalog, product applicability and Xid 154 linkage semantics
     source: [src/gpu_fault/policy/catalog.py]
     covers: [fault:xid-catalog, fault:product, fault:driver-version]
     conditions: [normal, safety]
     assertions:
       - Every pinned rule and product family has its exact official decision.
-      - Unknown products and insufficient versions cannot authorize a mutation.
-    cases: [GF-REGIONAL-COLLECT-007, GF-POL-011]
+      - Unknown products cannot authorize a mutation; linkage reporting versions do not gate the original Xid.
+      - Genuine NVLink decoding requirements remain independent of reporting linkage.
+    cases: [GF-REGIONAL-COLLECT-007, GF-POL-011, GF-E2E-XID-LINKAGE-001]
     checks:
       - nodeid: tests/policy/test_policy.py::test_every_catalog_rule_resolves_as_the_catalog_says
         expected: 688
-      - nodeid: tests/policy/test_policy.py::test_catalog_minimum_version_is_enforced
+      - nodeid: tests/policy/test_policy.py::test_xid154_linkage_does_not_disable_older_driver_faults
+      - nodeid: tests/execution/test_xid_recovery_e2e.py::test_linkage_does_not_block_original_xid_recovery
+        expected: 4
     critical: true
   - id: GF-REQ-POLICY-CORRELATION
     family: fault-policy
@@ -113,6 +668,40 @@ requirements:
       - nodeid: tests/regional/test_independent_recovery_safety.py::test_cpu_cancellation_refresh_never_substitutes_for_actual_completion
         expected: 4
     critical: true
+  - id: GF-REQ-OP-DRAIN-P2P
+    family: operation
+    title: Drain P2P release, fresh driver decision and guarded recovery
+    source: [src/gpu_fault/node_agent/operations/drain_p2p.py, src/gpu_fault/orchestration/workflow_builder.py]
+    covers: [operation:RECOVER_DRAIN_P2P]
+    conditions: [normal, repeat, failure, timeout, safety]
+    assertions:
+      - The API parses the raw Xid 154 label and closes correlation before dispatch.
+      - Stop and persistence release precede the fresh recovery query.
+      - None skips reset; reset actions target the GPU; Reboot uses the existing escalation.
+      - Duplicate delivery cannot repeat reset; unknown outcomes retain the hold.
+      - GPU and fabric validation precede scheduling and workload readmission.
+    cases: [GF-E2E-DRAIN-P2P-001, GF-E2E-DRAIN-P2P-002, GF-E2E-DRAIN-P2P-003, GF-E2E-DRAIN-P2P-004, GF-E2E-DRAIN-P2P-005]
+    checks:
+      - nodeid: tests/execution/test_xid_recovery_e2e.py::test_drain_p2p_orders_release_query_recovery_and_readmission
+        expected: 4
+      - nodeid: tests/execution/test_xid_recovery_e2e.py::test_drain_p2p_reboot_is_escalated_without_gpu_reset
+      - nodeid: tests/execution/test_xid_recovery_e2e.py::test_drain_p2p_unproven_recovery_never_restarts_training
+        expected: 5
+      - nodeid: tests/execution/test_xid_recovery_e2e.py::test_drain_p2p_idle_node_has_no_workload_stop_or_restart
+      - nodeid: tests/execution/test_xid_recovery_e2e.py::test_drain_p2p_unsupported_agent_operation_fails_closed
+    critical: true
+  - id: GF-REQ-DRAIN-P2P-UVM
+    family: recovery
+    title: Independent UVM persistence release and live driver recovery
+    source: [src/gpu_fault/node_agent/operations/drain_p2p.py, src/gpu_fault/node_agent/quiesce_persistence.py]
+    covers: [fault:uvm-persistence-release]
+    conditions: [normal, failure, safety]
+    assertions:
+      - Ordinary persistence Disabled is not proof of UVM persistence release.
+      - Driver XML and actual recovery require a separate hardware acceptance window.
+    cases: [GF-E2E-DRAIN-P2P-UVM]
+    critical: true
+    gap: Independent UVM persistence detection and release are not implemented; synthetic software E2E cannot establish live GPU recovery.
   - id: GF-REQ-OP-FABRIC
     family: operation
     title: Full fabric reset and Fabric Manager recovery
@@ -381,12 +970,18 @@ requirements:
       - Active filesystem, SMART and RDMA failures choose scoped recovery.
       - MCE and NCCL log classification remains distinct from routine telemetry.
       - Chunked training logs are not lost at payload boundaries.
-    cases: [GF-HOST-001, GF-HOST-002, GF-HOST-004, GF-HOST-005]
+    cases: [GF-HOST-001, GF-HOST-002, GF-HOST-004, GF-HOST-005, GF-HOST-OBS-001, GF-HOST-OBS-002, GF-HOST-OBS-003, GF-HOST-OBS-004]
     checks:
       - nodeid: tests/host_health/test_host_health.py::test_metric_policy_emits_only_active_transition
       - nodeid: tests/host_health/test_host_health.py::test_rdma_link_down_requests_fabric_diagnostics
       - nodeid: tests/host_health/test_host_health.py::test_node_log_endpoint_classifies_mce_and_nccl
       - nodeid: tests/collectors/test_logs.py::test_node_log_collector_chunks_training_log_without_loss
+      - nodeid: tests/host_health/test_host_diagnostic_e2e.py::test_swap_fault_from_collector_to_api_and_real_validation
+        expected: 2
+      - nodeid: tests/collectors/test_host_observation_validity.py::test_incomplete_traffic_pair_is_unknown_not_zero
+        expected: 3
+      - nodeid: tests/collectors/test_host_observation_validity.py::test_unreadable_efa_identity_never_authorizes_reboot
+      - nodeid: tests/regional/test_efa_traffic_harness_main.py::test_efa_counter_harness_runs_its_real_main_with_isolated_api
   - id: GF-REQ-INGEST-HEALTH
     family: ingestion
     title: Collector errors versus successful health summaries

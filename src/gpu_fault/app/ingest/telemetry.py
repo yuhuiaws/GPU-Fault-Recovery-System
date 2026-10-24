@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.gpu_observation import normalize_gpu_observation
+
 import logging
 from contextlib import nullcontext
 from datetime import datetime, timezone
@@ -137,6 +139,7 @@ class TelemetryIngestionService:
         )
         if batch.ingested_at is None:
             batch = batch.model_copy(update={"ingested_at": datetime.now(timezone.utc)})
+        batch = normalize_gpu_observation(batch)
         result = self.context.gpu_metrics.ingest(batch)
         self.telemetry_context._record_collector_status(
             CollectorKind.GPU_METRICS,

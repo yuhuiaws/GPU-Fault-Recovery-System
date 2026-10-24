@@ -148,6 +148,10 @@ def test_smart_reports_query_failure_separately_from_health_verdict(
     else:
         assert first.samples[0].value == expected
         assert ("failure_mode" in first.samples[0].labels) is query_failed
+        assert first.samples[0].name == (
+            "smart_query_failed" if query_failed else "smart_health_failed"
+        )
+    assert bool(first.collection_errors) is query_failed
     probes = [argv for argv, _ in host_case.commands if "-H" in argv]
     assert len(probes) == (2 if query_failed else 1)
 
@@ -158,7 +162,7 @@ def test_bmc_probe_distinguishes_unavailable_from_critical_sensors(
 ):
     support.enable_tools(host_case, "ipmitool")
     host_case.outputs[("ipmitool", "sensor")] = (
-        "short\nTemp | 60 | OK\nFan | 0 | cr\nPower | 0 | non-recoverable\n",
+        "short\nTemp | 60 | degrees C | OK\nFan | 0 | RPM | cr\nPower | 0 | Watts | non-recoverable\n",
         "",
         returncode,
     )

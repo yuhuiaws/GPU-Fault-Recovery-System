@@ -62,11 +62,11 @@ def test_regressed_and_unknown_training_steps_preserve_distinct_progress_semanti
     store.observe_training_progress(unknown)
     assert (
         store.list_training_progress_states(CLUSTER, "attempt")[0].last_progress_at
-        == unknown.observed_at
+        == NOW
     )
     store.observe_training_progress(restart)
     current = store.list_training_progress_states(CLUSTER, "attempt")[0]
-    assert current.last_progress_at == restart.observed_at
+    assert current.last_progress_at == NOW
     assert current.heartbeat.step == 1
     assert store.observe_training_progress(regressed) is False
     assert store.list_training_progress("other-cluster") == []

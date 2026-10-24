@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.collectors.host.observation import HostObservationError
+
 from ._support import (
     NOW,
     BufferingSink,
@@ -377,7 +379,7 @@ def test_host_collector_collects_efa_traffic_rate(tmp_path) -> None:
     assert by_name["efa_traffic_bytes_per_second"].value == 300
 
 
-def test_host_collector_treats_efa_counter_reset_as_zero(tmp_path) -> None:
+def test_host_collector_treats_efa_counter_reset_as_unknown(tmp_path) -> None:
     counters = tmp_path / "rdmap0" / "ports" / "1" / "hw_counters"
     counters.mkdir(parents=True)
     device = counters.parents[2] / "device"
@@ -392,10 +394,18 @@ def test_host_collector_treats_efa_counter_reset_as_zero(tmp_path) -> None:
     (counters / "rx_bytes").write_text("10")
     (counters / "tx_bytes").write_text("20")
 
-    samples = collector._rdma(NOW + timedelta(seconds=15))
-
+    with pytest.raises(HostObservationError, match="counter reset") as caught:
+        collector._rdma(NOW + timedelta(seconds=15))
+    samples = caught.value.samples
+    assert not any(item.name == "efa_traffic_bytes_per_second" for item in samples), (
+        samples
+    )
     assert (
-        next(item.value for item in samples if item.name == "efa_traffic_bytes_delta")
+        next(
+            item.value
+            for item in samples
+            if item.name == "efa_traffic_observation_valid"
+        )
         == 0
     )
 
@@ -476,7 +486,7 @@ def test_rdma_counters_ignore_non_efa_devices(tmp_path) -> None:
     samples = collector._rdma(NOW)
 
     assert samples
-    assert {item.device for item in samples} == {"rdmap0/1"}
+    assert {item.device for item in samples if item.device} == {"rdmap0/1"}
 
 
 def test_bmc_non_critical_status_is_not_counted(
@@ -491,7 +501,9 @@ def test_bmc_non_critical_status_is_not_counted(
         return subprocess.CompletedProcess(
             argv,
             0,
-            stdout=("Temp | 32 | nc\nFan | 0 | cr\nPower | 1 | ok\n"),
+            stdout=(
+                "Temp | 32 | degrees C | nc\nFan | 0 | RPM | cr\nPower | 1 | Watts | ok\n"
+            ),
             stderr="",
         )
 
@@ -863,6 +875,7 @@ def test_a_quiet_tick_ships_no_zero_valued_per_port_deltas(
         "rdma_link_down",
         "efa_traffic_bytes_delta",
         "efa_traffic_bytes_per_second",
+        "efa_traffic_observation_valid",
     }, names
     still_reported = {
         item.name: item.value
@@ -995,9 +1008,10 @@ def test_a_failed_smart_query_is_not_cached_as_a_healthy_drive(
     assert [
         (item.name, item.value, item.labels.get("failure_mode"))
         for item in failed.samples
-    ] == [("smart_health_failed", 1, "QUERY_FAILED")], (
+    ] == [("smart_query_failed", 1, "QUERY_FAILED")], (
         f"a refused SMART query must be reported, not read as healthy: {failed.samples}"
     )
+    assert failed.collection_errors, "query failures must invalidate collector health"
     assert len(_health_checks(calls)) == 2, (
         f"the failed query started a 300 s cache window: {calls}"
     )

@@ -10,6 +10,9 @@ rendering and target-node instructions before applying anything.
   regional-only manifests.
 - `hyperpod/`: focused HyperPod data-plane scenario runners.
 - `isolated_api.py` and `render_manifest.py`: shared utilities.
+- `run_general_fault_injections.py`: cross-domain software injection runner;
+  it does not execute the manual live acceptance specifications. See
+  [general live acceptance](../../docs/components/general-fault-live-acceptance.md).
 
 ## Audit probes
 

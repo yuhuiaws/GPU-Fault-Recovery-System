@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import os
 from collections import Counter
 from datetime import datetime, timedelta
@@ -31,6 +30,8 @@ from gpu_fault.gpu_metric_models import (
     SITE_METRIC_POLICY_VERSION,
     GpuHealthSeverity,
 )
+from gpu_fault.gpu_memory_policy import MEMORY_METRICS, memory_decision
+from gpu_fault.gpu_observation import metric_device_key, normalize_gpu_observation
 from gpu_fault.gpu_metric_models import (
     GpuFindingState as GpuFindingState,
 )
@@ -41,6 +42,11 @@ from gpu_fault.gpu_power_policy import (
     NVIDIA_DCGM_HEALTH_REFERENCE,
     NVIDIA_DCGM_POLICY_VERSION,
     power_violation_decision,
+)
+from gpu_fault.gpu_environment_policy import (
+    clock_reason_decision,
+    confirm_environment_decision,
+    thermal_duration_decision,
 )
 from gpu_fault.gpu_temperature_policy import (
     TEMPERATURE_FINDING_NAMES,
@@ -162,8 +168,8 @@ class GpuMetricsThresholds(StrictModel):
     memory_temperature_warning_margin_c: float = Field(default=5, gt=0)
     pcie_replay_rate_warning_per_minute: float = Field(default=8, ge=0)
     nvlink_error_delta_critical: float = Field(default=1, gt=0)
-    power_violation_delta_warning_us: float = Field(default=1, gt=0)
-    thermal_violation_delta_warning_us: float = Field(default=1, gt=0)
+    power_violation_delta_warning_us: float = Field(default=10000, gt=0)
+    thermal_violation_delta_warning_us: float = Field(default=10000, gt=0)
     thermal_violation_drain_consecutive_samples: int = Field(default=2, ge=2)
     # How long a collection-error streak lasts before it asks for diagnostics
     # (gpu_collection_errors): the 6th consecutive failure of the 15 s scrape.
@@ -360,7 +366,26 @@ class GpuMetricsService:
         # either becomes an incident or is counted here).
         self.findings_without_incident: Counter[str] = Counter()
 
+    @staticmethod
+    def _metric_candidates(
+        batch: GpuMetricBatch,
+    ) -> list[tuple[GpuMetricSample, str, tuple[str, str, str, str], GpuMetricLatest]]:
+        candidates = []
+        for sample in batch.samples:
+            gpu_key = sample.gpu_uuid or sample.pci_bdf or sample.gpu_index or "node"
+            key = (batch.cluster_id, batch.node_id, gpu_key, sample.canonical_name)
+            latest = GpuMetricLatest(
+                cluster_id=batch.cluster_id,
+                node_id=batch.node_id,
+                observed_at=batch.observed_at,
+                source=batch.source,
+                sample=sample,
+            )
+            candidates.append((sample, gpu_key, key, latest))
+        return candidates
+
     def ingest(self, batch: GpuMetricBatch) -> GpuMetricsIngestionResult:
+        batch = normalize_gpu_observation(batch)
         findings: list[GpuHealthFinding] = []
         new_findings: list[GpuHealthFinding] = []
         xid_events: list[XidEvent] = []
@@ -379,27 +404,7 @@ class GpuMetricsService:
             if existing is not None:
                 return existing.model_copy(update={"duplicate": True})
             temperature_limits = self._temperature_limits(batch)
-            candidates = []
-            for sample in batch.samples:
-                if not math.isfinite(sample.value):
-                    continue
-                gpu_key = (
-                    sample.gpu_uuid or sample.pci_bdf or sample.gpu_index or "node"
-                )
-                key = (
-                    batch.cluster_id,
-                    batch.node_id,
-                    gpu_key,
-                    sample.canonical_name,
-                )
-                latest = GpuMetricLatest(
-                    cluster_id=batch.cluster_id,
-                    node_id=batch.node_id,
-                    observed_at=batch.observed_at,
-                    source=batch.source,
-                    sample=sample,
-                )
-                candidates.append((sample, gpu_key, key, latest))
+            candidates = self._metric_candidates(batch)
             previous_latest_values = self.store.observe_gpu_metrics(
                 [(key, latest) for _, _, key, latest in candidates]
             )
@@ -475,6 +480,11 @@ class GpuMetricsService:
                     previous_latest,
                     is_counter=sample.canonical_name in self._COUNTERS,
                 )
+                if (
+                    isinstance(previous_latest, GpuMetricLatest)
+                    and previous_latest.source != batch.source
+                ):
+                    delta = None
                 rate_per_minute = (
                     delta * 60.0 / elapsed_seconds
                     if delta is not None
@@ -491,12 +501,21 @@ class GpuMetricsService:
                     gpu_key,
                     temperature_limits.get(gpu_key, {}),
                     previous_finding_state,
+                    previous_latest,
+                    previous_completeness,
                 )
                 if finding is not None:
                     findings.append(finding)
+                invalid_delta = (
+                    sample.canonical_name in self._COUNTERS
+                    and previous_latest is not None
+                    and delta is None
+                    and sample.canonical_name != "ecc_dbe_volatile_total"
+                )
                 if finding is not None or (
                     previous_finding_state is not None
                     and previous_finding_state.finding is not None
+                    and not invalid_delta
                 ):
                     finding_updates.append((key, finding, batch.observed_at))
                     findings_by_update.append(finding)
@@ -623,15 +642,43 @@ class GpuMetricsService:
                 batch.node_id,
                 active_only=True,
             )
-            if finding.finding_kind == "METRIC" and finding.observed_at >= cutoff
+            if finding.finding_kind == "METRIC"
+            and cutoff <= finding.observed_at <= batch.observed_at
         ]
         latest = [
             item
             for item in self.store.list_gpu_metrics_latest(
                 batch.cluster_id, batch.node_id
             )
-            if item.observed_at >= cutoff
+            if cutoff <= item.observed_at <= batch.observed_at
+            and item.source == batch.source
         ]
+        current_evidence = {
+            (
+                item.sample.gpu_uuid
+                or item.sample.pci_bdf
+                or item.sample.gpu_index
+                or "node",
+                item.sample.canonical_name,
+                item.observed_at,
+            )
+            for item in latest
+        }
+        active_components = [
+            finding
+            for finding in active_components
+            if (
+                self._finding_gpu_key(finding),
+                finding.canonical_name,
+                finding.observed_at,
+            )
+            in current_evidence
+        ]
+        fresh_components = {
+            item.finding_id
+            for item in active_components
+            if item.observed_at == batch.observed_at
+        }
         findings_by_gpu: dict[str, dict[str, GpuHealthFinding]] = {}
         latest_by_gpu: dict[str, dict[str, GpuMetricLatest]] = {}
         for finding in active_components:
@@ -639,12 +686,7 @@ class GpuMetricsService:
                 finding.canonical_name
             ] = finding
         for item in latest:
-            gpu_key = (
-                item.sample.gpu_uuid
-                or item.sample.pci_bdf
-                or item.sample.gpu_index
-                or "node"
-            )
+            gpu_key = metric_device_key(item.sample)
             latest_by_gpu.setdefault(gpu_key, {})[item.sample.canonical_name] = item
 
         kernel_events = kernel_xid_events(
@@ -676,14 +718,14 @@ class GpuMetricsService:
                 component_metrics=sorted(
                     {finding.canonical_name for finding in node_nvlink_components}
                 ),
-                severity=GpuHealthSeverity.CRITICAL,
-                action=RecoveryAction.DRAIN,
+                severity=GpuHealthSeverity.WARNING,
+                action=RecoveryAction.RUN_DIAGNOSTICS,
                 reason=(
                     "correlated NVLink errors affected multiple GPUs; "
-                    "treat as a node fabric or NVSwitch failure"
+                    "inspect fabric topology; counters alone do not prove a fatal failure"
                 ),
                 affected_gpu_uuids=nvlink_gpu_uuids,
-                confidence="HIGH",
+                confidence="MEDIUM",
             )
 
         for gpu_key in sorted(touched_gpu_keys):
@@ -714,6 +756,16 @@ class GpuMetricsService:
                 key = self._composite_key(batch, scope_key, rule_id)
                 candidate = candidates.get((scope_key, rule_id))
                 previous = previous_composite_states.get(key)
+                if candidate is not None and previous is not None and previous.finding:
+                    if set(candidate.component_finding_ids) == set(
+                        previous.finding.component_finding_ids
+                    ) or (
+                        rule_id != PCIE_XID_RULE
+                        and not set(candidate.component_finding_ids) <= fresh_components
+                    ):
+                        composite_findings.append(previous.finding)
+                        suppressed_ids.update(previous.finding.component_finding_ids)
+                        continue
                 if candidate is None and (previous is None or previous.finding is None):
                     continue
                 observed_at = composite_update_time(
@@ -818,6 +870,11 @@ class GpuMetricsService:
         )
         thermal = components.get("thermal_violation_total_us")
         thermal_throttle = components.get("clock_throttle_reasons")
+        if (
+            thermal_throttle is not None
+            and thermal_throttle.threshold_source == "NVIDIA_HW_POWER_BRAKE"
+        ):
+            thermal_throttle = None
         thermal_signals = [
             signal for signal in [thermal, thermal_throttle] if signal is not None
         ]
@@ -830,7 +887,7 @@ class GpuMetricsService:
                 if previous is not None and previous.finding is not None
                 else 1
             )
-            critical = consecutive >= self.thresholds.composite_consecutive_samples
+            critical = temperature.severity is GpuHealthSeverity.CRITICAL
             candidates[(gpu_key, "THERMAL_STRESS")] = composite_finding(
                 batch,
                 scope_key=gpu_key,
@@ -926,8 +983,32 @@ class GpuMetricsService:
                         ]
                     }
                 ),
-                severity=GpuHealthSeverity.CRITICAL,
-                action=RecoveryAction.DRAIN,
+                severity=(
+                    GpuHealthSeverity.CRITICAL
+                    if any(
+                        item.severity is GpuHealthSeverity.CRITICAL
+                        for item in (*memory_errors, *memory_repair)
+                    )
+                    else GpuHealthSeverity.WARNING
+                ),
+                action=(
+                    RecoveryAction.DRAIN
+                    if any(
+                        item.automatic_action == RecoveryAction.DRAIN.value
+                        for item in memory_repair
+                    )
+                    else RecoveryAction.QUARANTINE
+                    if any(
+                        item.automatic_action == RecoveryAction.QUARANTINE.value
+                        for item in memory_errors
+                    )
+                    else RecoveryAction.RESET_GPU
+                    if any(
+                        item.automatic_action == RecoveryAction.RESET_GPU.value
+                        for item in memory_repair
+                    )
+                    else RecoveryAction.RUN_DIAGNOSTICS
+                ),
                 reason=(
                     "uncorrectable memory errors and pending or "
                     "failed memory repair were correlated"
@@ -980,9 +1061,7 @@ class GpuMetricsService:
                     if critical
                     else GpuHealthSeverity.WARNING
                 ),
-                action=(
-                    RecoveryAction.DRAIN if critical else RecoveryAction.RUN_DIAGNOSTICS
-                ),
+                action=RecoveryAction.RUN_DIAGNOSTICS,
                 reason=(
                     "multiple correctable memory degradation "
                     "signals increased for "
@@ -1069,10 +1148,10 @@ class GpuMetricsService:
                 component_metrics=sorted(
                     {finding.canonical_name for finding in nvlink}
                 ),
-                severity=GpuHealthSeverity.CRITICAL,
-                action=RecoveryAction.DRAIN,
+                severity=GpuHealthSeverity.WARNING,
+                action=RecoveryAction.RUN_DIAGNOSTICS,
                 reason=("multiple NVLink error classes increased on the same GPU"),
-                confidence="HIGH",
+                confidence="MEDIUM",
             )
 
     @staticmethod
@@ -1118,14 +1197,17 @@ class GpuMetricsService:
         gpu_key,
         temperature_limits,
         previous_finding_state,
+        previous_latest=None,
+        previous_completeness=None,
     ) -> GpuHealthFinding | None:
         decision = power_violation_decision(
-            self.thresholds, batch, sample, delta, gpu_key
+            self.thresholds, batch, sample, delta, gpu_key, rate_per_minute
         )
-        if sample.canonical_name != "power_violation_total_us":
+        if sample.canonical_name in MEMORY_METRICS:
+            decision = memory_decision(self.thresholds, sample, delta, batch.product)
+        elif sample.canonical_name != "power_violation_total_us":
             for resolver in (
                 self._temperature_decision,
-                self._memory_decision,
                 self._link_decision,
                 self._throttle_decision,
             ):
@@ -1140,6 +1222,18 @@ class GpuMetricsService:
                     break
         if decision is None:
             return None
+        if sample.canonical_name in TEMPERATURE_FINDING_NAMES | {
+            "clock_throttle_reasons"
+        }:
+            decision = confirm_environment_decision(
+                decision,
+                batch,
+                sample,
+                previous_finding_state,
+                previous_latest,
+                previous_completeness,
+                temperature_limits,
+            )
         return GpuHealthFinding(
             finding_id=f"{batch.batch_id}-{gpu_key}-{sample.canonical_name}",
             cluster_id=batch.cluster_id,
@@ -1164,137 +1258,14 @@ class GpuMetricsService:
             runtime_profile_version=batch.runtime_profile_version,
             workload_state=batch.workload_state,
             affected_workload_ids=batch.affected_workload_ids,
+            confirmation_count=decision.get("confirmation_count", 0),
         )
 
     def _temperature_decision(self, sample, _delta, _rate, limits, _previous):
         return temperature_decision(self.thresholds, sample, limits)
 
     def _memory_decision(self, sample, delta, _rate, _limits, _previous):
-        name = sample.canonical_name
-        warning = RecoveryAction.RUN_DIAGNOSTICS.value
-        cases = {
-            "ecc_sbe_volatile_total": (
-                delta is not None and delta >= self.thresholds.ecc_sbe_delta_warning,
-                GpuHealthSeverity.WARNING,
-                "correctable ECC counter increased",
-                warning,
-            ),
-            "ecc_sbe_aggregate_total": (
-                delta is not None and delta >= self.thresholds.ecc_sbe_delta_warning,
-                GpuHealthSeverity.WARNING,
-                "correctable ECC counter increased",
-                warning,
-            ),
-            "ecc_dbe_volatile_total": (
-                sample.value > 0,
-                GpuHealthSeverity.CRITICAL,
-                "uncorrectable ECC errors detected",
-                RecoveryAction.DRAIN.value,
-            ),
-            "ecc_dbe_aggregate_total": (
-                delta is not None and delta > 0,
-                GpuHealthSeverity.WARNING,
-                "aggregate uncorrectable ECC counter increased",
-                warning,
-            ),
-            "row_remap_failure": (
-                sample.value > 0,
-                GpuHealthSeverity.CRITICAL,
-                "GPU row remap failure reported",
-                RecoveryAction.DRAIN.value,
-            ),
-            "row_remap_uncorrectable_total": (
-                delta is not None and delta > 0,
-                GpuHealthSeverity.WARNING,
-                "uncorrectable GPU row remap errors detected",
-                warning,
-            ),
-            "row_remap_correctable_total": (
-                delta is not None
-                and delta >= self.thresholds.row_remap_correctable_delta_warning,
-                GpuHealthSeverity.WARNING,
-                "correctable GPU row remap counter increased",
-                warning,
-            ),
-            "retired_pages_sbe_total": (
-                delta is not None
-                and delta >= self.thresholds.retired_pages_sbe_delta_warning,
-                GpuHealthSeverity.WARNING,
-                "correctable ECC retired-page counter increased",
-                warning,
-            ),
-            "retired_pages_dbe_total": (
-                delta is not None
-                and delta >= self.thresholds.retired_pages_dbe_delta_critical,
-                GpuHealthSeverity.CRITICAL,
-                "uncorrectable ECC retired-page counter increased",
-                RecoveryAction.DRAIN.value,
-            ),
-            "row_remap_pending": (
-                sample.value > 0,
-                GpuHealthSeverity.WARNING,
-                "GPU memory repair is pending",
-                RecoveryAction.RESET_GPU.value,
-            ),
-            "retired_pages_pending": (
-                sample.value > 0,
-                GpuHealthSeverity.WARNING,
-                "GPU memory repair is pending",
-                RecoveryAction.RESET_GPU.value,
-            ),
-        }
-        case = cases.get(name)
-        if case is None or not case[0]:
-            return None
-        result = {
-            "severity": case[1],
-            "reason": case[2],
-            "automatic_action": case[3],
-        }
-        thresholds = {
-            "ecc_sbe_volatile_total": self.thresholds.ecc_sbe_delta_warning,
-            "ecc_sbe_aggregate_total": self.thresholds.ecc_sbe_delta_warning,
-            "row_remap_correctable_total": self.thresholds.row_remap_correctable_delta_warning,
-            "retired_pages_sbe_total": self.thresholds.retired_pages_sbe_delta_warning,
-            "retired_pages_dbe_total": self.thresholds.retired_pages_dbe_delta_critical,
-        }
-        if name in thresholds:
-            result.update(
-                threshold_value=thresholds[name],
-                threshold_source="CONFIGURED_DELTA",
-            )
-        if name == "ecc_dbe_volatile_total":
-            result.update(
-                policy_source="NVIDIA_DCGM_HEALTH",
-                policy_version=NVIDIA_DCGM_POLICY_VERSION,
-                policy_reference=NVIDIA_DCGM_HEALTH_REFERENCE,
-                official_action=("TERMINATE_JOB_AND_ANALYZE_GPU_HEALTH"),
-            )
-        if name == "row_remap_failure":
-            result.update(
-                policy_source=("NVIDIA_GPU_MEMORY_ERROR_MANAGEMENT"),
-                policy_version=NVIDIA_GPU_MEMORY_POLICY_VERSION,
-                policy_reference=NVIDIA_ROW_REMAP_RMA_REFERENCE,
-                official_action="RUN_FIELD_DIAGNOSTIC_FOR_RMA",
-            )
-        if name in {
-            "row_remap_pending",
-            "retired_pages_pending",
-        }:
-            result.update(
-                policy_source=("NVIDIA_GPU_MEMORY_ERROR_MANAGEMENT"),
-                policy_version=NVIDIA_GPU_MEMORY_POLICY_VERSION,
-                policy_reference=NVIDIA_ROW_REMAP_REFERENCE,
-                official_action="RESET_GPU_IN_SERVICE_WINDOW",
-            )
-        if name in {
-            "row_remap_correctable_total",
-            "retired_pages_sbe_total",
-        }:
-            result["policy_reference"] = NVIDIA_ROW_REMAP_REFERENCE
-        if name == "retired_pages_dbe_total":
-            result["policy_reference"] = NVIDIA_ROW_REMAP_RMA_REFERENCE
-        return result
+        return memory_decision(self.thresholds, sample, delta, None)
 
     def _link_decision(self, sample, delta, rate, _limits, _previous):
         name = sample.canonical_name
@@ -1331,80 +1302,22 @@ class GpuMetricsService:
                 else "SITE_OVERRIDE_NVIDIA_DCGM_HEALTH"
             )
             return {
-                "severity": GpuHealthSeverity.CRITICAL,
-                "reason": "NVLink error counter increased",
-                "automatic_action": RecoveryAction.DRAIN.value,
-                "policy_source": source,
+                "severity": GpuHealthSeverity.WARNING,
+                "reason": "NVLink error counter increased; diagnose link errors and rate",
+                "automatic_action": RecoveryAction.RUN_DIAGNOSTICS.value,
+                "policy_source": "SITE_NVLINK_COUNTER_EVIDENCE",
                 "policy_version": NVIDIA_DCGM_POLICY_VERSION
                 if source == "NVIDIA_DCGM_HEALTH"
                 else SITE_METRIC_POLICY_VERSION,
                 "policy_reference": NVIDIA_DCGM_HEALTH_REFERENCE,
-                "official_action": "TERMINATE_JOB_AND_ANALYZE_GPU_HEALTH",
+                "official_action": "EXAMINE_GPU_HEALTH",
             }
         return None
 
     def _throttle_decision(self, sample, delta, rate, _limits, previous):
-        name = sample.canonical_name
-        if (
-            name == "clock_throttle_reasons"
-            and int(sample.value) & THERMAL_CLOCK_THROTTLE_MASK
-        ):
-            return {
-                "severity": GpuHealthSeverity.WARNING,
-                "reason": "DCGM reports software or hardware thermal clock throttling",
-                "automatic_action": RecoveryAction.RUN_DIAGNOSTICS.value,
-                "threshold_value": float(THERMAL_CLOCK_THROTTLE_MASK),
-                "threshold_source": "NVIDIA_THROTTLE_REASON_BITMASK",
-                "policy_source": "SITE_NVIDIA_DEVICE_LIMIT_DERIVED",
-                "policy_reference": NVIDIA_DCGM_HEALTH_REFERENCE,
-                "official_action": "EXAMINE_GPU_HEALTH",
-            }
-        limits = {
-            "thermal_violation_total_us": self.thresholds.thermal_violation_delta_warning_us
-        }
-        if name not in limits or delta is None or delta < limits[name]:
-            return None
-        if rate is not None and rate > MAX_PLAUSIBLE_VIOLATION_US_PER_MINUTE:
-            # The counter claims more throttled time than has elapsed, so it is
-            # not microseconds on this device. Two consecutive breaches here
-            # escalate to DRAIN, so grading an impossible rate evicts healthy
-            # nodes on the strength of a counter nobody can interpret.
-            return None
-        threshold = limits[name]
-        severity, reason, action = (
-            GpuHealthSeverity.WARNING,
-            "GPU thermal violation duration increased",
-            RecoveryAction.RUN_DIAGNOSTICS.value,
+        return clock_reason_decision(sample) or thermal_duration_decision(
+            self.thresholds, sample, delta, rate
         )
-        breaches = (
-            previous.consecutive_breaches
-            if previous is not None and previous.finding is not None
-            else 0
-        ) + 1
-        if breaches >= self.thresholds.thermal_violation_drain_consecutive_samples:
-            severity, reason, action = (
-                GpuHealthSeverity.CRITICAL,
-                f"GPU thermal violation duration increased for {breaches} consecutive samples",
-                RecoveryAction.DRAIN.value,
-            )
-        source = (
-            "NVIDIA_DCGM_HEALTH"
-            if threshold == 1
-            else "SITE_OVERRIDE_NVIDIA_DCGM_HEALTH"
-        )
-        return {
-            "severity": severity,
-            "reason": reason,
-            "automatic_action": action,
-            "threshold_value": threshold,
-            "threshold_source": "CONFIGURED_DELTA",
-            "policy_source": source,
-            "policy_version": NVIDIA_DCGM_POLICY_VERSION
-            if source == "NVIDIA_DCGM_HEALTH"
-            else SITE_METRIC_POLICY_VERSION,
-            "policy_reference": NVIDIA_DCGM_HEALTH_REFERENCE,
-            "official_action": "EXAMINE_GPU_HEALTH",
-        }
 
     def _xid_event(
         self,

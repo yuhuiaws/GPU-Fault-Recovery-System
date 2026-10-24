@@ -29,7 +29,7 @@ from ._misc_cases_2 import (
     test_execute_api_requires_token,
     test_hung_triage_confirms_the_rank_that_stopped_enqueueing,
     test_hung_triage_ignores_missing_start_times_shared_by_all,
-    test_hung_triage_many_lagging_ranks_marks_fabric_suspected,
+    test_hung_triage_many_lagging_ranks_does_not_prove_fabric_failure,
     test_hung_triage_orders_weak_candidates_by_efa_zero_time,
     test_hung_triage_rewrites_bundle_to_culprit_and_control,
     test_hung_triage_weak_ignores_traits_shared_by_every_rank,

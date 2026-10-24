@@ -5,6 +5,8 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any, Callable
 
+from gpu_fault.node_agent.diagnostic_process import run_probe
+from gpu_fault.node_agent.operations.process_identity import target_identity_matches
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
@@ -41,11 +43,18 @@ class HungProcessOperationsMixin:
             settings["python_sample_interval"],
             settings["python_timeout"],
         )
+        disable_strace = command.parameters.get(
+            "disable_strace"
+        ) or command.parameters.get("diagnostic_reason") in {
+            "EFA_TRAFFIC_HUNG_SUSPECTED",
+            "TRAINING_HUNG",
+            "APPLICATION_NCCL_ERROR",
+        }
         self._capture_proc_samples(
             work_dir,
             manifest,
             process_rows,
-            settings["sample_count"],
+            0 if disable_strace else settings["sample_count"],
             settings["duration"],
             settings["sample_interval"],
         )
@@ -139,6 +148,20 @@ class HungProcessOperationsMixin:
                 if not str(raw_pid).isdigit():
                     continue
                 pid = int(raw_pid)
+                if command.parameters.get("require_process_start_identity"):
+                    expected = (
+                        command.parameters.get("target_start_ticks_by_pid_by_node", {})
+                        .get(command.node_id, {})
+                        .get(str(pid))
+                    )
+                    if not target_identity_matches(self.proc_root, pid, expected):
+                        manifest.setdefault("skipped_processes", []).append(
+                            {
+                                "pid": pid,
+                                "reason": "process_identity_changed_or_missing",
+                            }
+                        )
+                        continue
                 try:
                     process_name = (
                         (self.proc_root / str(pid) / "comm").read_text().strip()
@@ -297,7 +320,7 @@ class HungProcessOperationsMixin:
         }
         if python_process_rows and self.python_stack_tool:
             with ThreadPoolExecutor(
-                max_workers=len(python_process_rows),
+                max_workers=min(8, len(python_process_rows)),
                 thread_name_prefix="gpu-fault-pyspy",
             ) as executor:
                 for sample_index in range(1, python_sample_count + 1):
@@ -349,7 +372,9 @@ class HungProcessOperationsMixin:
         }
         for row in process_rows:
             self._capture_proc_metadata(work_dir, manifest, row["pid"])
-        if not process_rows:
+            if sample_count == 0:
+                self._capture_proc_stack_sample(work_dir, manifest, row["pid"], 1, 1)
+        if not process_rows or sample_count == 0:
             return
         with ThreadPoolExecutor(
             max_workers=len(process_rows),
@@ -548,8 +573,11 @@ class HungProcessOperationsMixin:
         sample_index: int,
         sample_count: int,
         timeout_seconds: int,
+        *,
+        structured: bool = False,
     ) -> dict[str, Any]:
-        target = work_dir / (f"python-stack-{pid}-sample-{sample_index:02d}.txt")
+        suffix = "json" if structured else "txt"
+        target = work_dir / (f"python-stack-{pid}-sample-{sample_index:02d}.{suffix}")
         argv = [
             self.python_stack_tool,
             "dump",
@@ -557,6 +585,8 @@ class HungProcessOperationsMixin:
             "--pid",
             str(pid),
         ]
+        if structured:
+            argv.insert(2, "--json")
         capture = {
             "file": target.name,
             "command": argv,
@@ -567,7 +597,8 @@ class HungProcessOperationsMixin:
             "tool": "py-spy",
         }
         try:
-            completed = self.runner(
+            completed = run_probe(
+                self.runner,
                 argv,
                 check=False,
                 capture_output=True,
@@ -575,17 +606,27 @@ class HungProcessOperationsMixin:
                 timeout=timeout_seconds,
             )
             output = completed.stdout or ""
-            if completed.stderr:
+            if structured and len(output.encode()) > 1_048_576:
+                output = ""
+                capture["error"] = "py-spy JSON exceeds 1 MiB"
+            if completed.stderr and not structured:
                 output += "\n[stderr]\n" + completed.stderr
+            if structured:
+                capture["stderr_tail"] = (completed.stderr or "")[-512:]
             target.write_text(
                 output,
                 encoding="utf-8",
                 errors="replace",
             )
             capture["returncode"] = completed.returncode
-        except (OSError, subprocess.TimeoutExpired) as exc:
+            if completed.returncode != 0:
+                capture["error"] = f"py-spy exited with status {completed.returncode}"
+        except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
             error = f"{type(exc).__name__}: {exc}"
-            target.write_text(error, encoding="utf-8")
+            try:
+                target.write_text(error, encoding="utf-8")
+            except OSError:
+                pass
             capture["returncode"] = None
             capture["error"] = error
         capture["completed_at"] = self.now().isoformat()

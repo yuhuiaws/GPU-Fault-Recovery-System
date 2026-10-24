@@ -138,7 +138,10 @@ class EvidenceOperationService:
         if maximum < 0:
             raise ValueError("GPU_FAULT_HUNG_TRIAGE_MAX_NODES must not be negative")
         ordered = sorted(set(attempt_node_ids))
-        if maximum == 0 or len(ordered) <= maximum:
+        # This is an evidence budget, not a coverage guarantee or concurrency
+        # setting. Preserve the legacy zero cap; larger budgets are explicit.
+        maximum = min(maximum or 32, 256)
+        if len(ordered) <= maximum:
             return ordered, []
         required = [
             node_id
@@ -155,7 +158,7 @@ class EvidenceOperationService:
             )
             if node_id in ordered
         ]
-        selected = list(dict.fromkeys(required))
+        selected = list(dict.fromkeys(required))[:maximum]
         remaining = [node_id for node_id in ordered if node_id not in set(selected)]
         budget = maximum - len(selected)
         if budget > 0 and remaining:

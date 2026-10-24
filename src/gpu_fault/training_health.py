@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+from gpu_fault.training_progress_state import last_valid_step
+
 import math
 import os
 from datetime import datetime, timedelta, timezone
 from statistics import median
+from typing import Any
 
 from pydantic import Field
 
@@ -15,7 +18,9 @@ from gpu_fault.models import (
     RecoveryAction,
     Severity,
     StrictModel,
+    WorkloadState,
 )
+from gpu_fault.training_phase import observe_phase, paused, phase
 from gpu_fault.orchestration.families.identity import derived_record_id
 from gpu_fault.store.shared.health_signals import (
     training_signal_key as _training_signal_key,
@@ -98,7 +103,7 @@ def training_health_signal_key(finding: NodeHealthFinding) -> str | None:
 
 
 class TrainingHealthService:
-    def __init__(self, store, policy: TrainingHealthPolicy | None = None) -> None:
+    def __init__(self, store: Any, policy: TrainingHealthPolicy | None = None) -> None:
         self.store = store
         self.policy = policy or TrainingHealthPolicy()
 
@@ -123,6 +128,18 @@ class TrainingHealthService:
             heartbeat.attempt_id,
             heartbeat.rank,
         )
+        if state is None or container is None or container.terminated:
+            return TrainingHealthResult(
+                heartbeat_id=heartbeat.heartbeat_id, accepted=False
+            )
+        if (
+            not -30
+            <= (heartbeat.observed_at - state.observation.observed_at).total_seconds()
+            <= 120
+        ):
+            return TrainingHealthResult(
+                heartbeat_id=heartbeat.heartbeat_id, accepted=False
+            )
         if container is not None:
             if (
                 heartbeat.node_id is not None
@@ -130,6 +147,23 @@ class TrainingHealthService:
                 and heartbeat.node_id != container.node_id
             ):
                 raise ValueError("training heartbeat node does not match allocation")
+            if (
+                (
+                    heartbeat.pod_uid is not None
+                    and heartbeat.pod_uid != container.pod_uid
+                )
+                or (
+                    heartbeat.container_name is not None
+                    and heartbeat.container_name != container.container_name
+                )
+                or (
+                    heartbeat.gpu_uuids
+                    and not set(heartbeat.gpu_uuids) <= set(container.gpu_uuids)
+                )
+            ):
+                raise ValueError(
+                    "training heartbeat identity does not match allocation"
+                )
             heartbeat = heartbeat.model_copy(
                 update={
                     "node_id": heartbeat.node_id or container.node_id,
@@ -148,13 +182,18 @@ class TrainingHealthService:
             )
 
         findings = []
-        self._claim(
-            heartbeat,
-            "hang",
-            False,
-            heartbeat.observed_at,
-            state,
+        old_step = last_valid_step(previous)
+        progressed = heartbeat.step is not None and (
+            old_step is None or heartbeat.step > old_step
         )
+        observe_phase(self.store, heartbeat, progressed=progressed)
+        if progressed:
+            self._claim(heartbeat, "hang", False, heartbeat.observed_at, state)
+        self._claim(heartbeat, "reporter-silent", False, heartbeat.observed_at, state)
+        if heartbeat.step is not None:
+            self._claim(
+                heartbeat, "progress-unavailable", False, heartbeat.observed_at, state
+            )
         if heartbeat.numerical_error or (
             heartbeat.loss is not None and not math.isfinite(heartbeat.loss)
         ):
@@ -183,6 +222,11 @@ class TrainingHealthService:
             and heartbeat.step is not None
             and previous.step is not None
             and heartbeat.step < previous.step
+            and not (
+                phase(heartbeat) in {"CHECKPOINT_LOAD", "RESTORING"}
+                and heartbeat.checkpoint_ref
+                and paused(self.store, heartbeat, heartbeat.observed_at)
+            )
         ):
             finding = self._claim(
                 heartbeat,
@@ -233,9 +277,18 @@ class TrainingHealthService:
                 progress_state = progress_states.get(
                     (observation.attempt_id, container.rank)
                 )
+                if progress_state is not None and (
+                    progress_state.heartbeat.node_id != container.node_id
+                    or progress_state.heartbeat.pod_uid != container.pod_uid
+                    or progress_state.heartbeat.container_name
+                    != container.container_name
+                ):
+                    progress_state = None
                 heartbeat = (
                     progress_state.heartbeat if progress_state is not None else None
                 )
+                if heartbeat is not None and heartbeat.observed_at > checked_at:
+                    continue
                 anchor = (
                     heartbeat.observed_at
                     if heartbeat is not None
@@ -247,6 +300,18 @@ class TrainingHealthService:
                     else self.policy.startup_grace_seconds
                 )
                 stale = checked_at - anchor > timedelta(seconds=timeout)
+                missing_progress = bool(
+                    heartbeat is not None
+                    and heartbeat.step is None
+                    and progress_state is not None
+                    and (checked_at - progress_state.last_progress_at).total_seconds()
+                    > (
+                        self.policy.heartbeat_timeout_seconds
+                        if last_valid_step(heartbeat) is not None
+                        else self.policy.startup_grace_seconds
+                    )
+                    and not paused(self.store, heartbeat, checked_at)
+                )
                 stalled = (
                     progress_state is not None
                     and heartbeat is not None
@@ -254,6 +319,12 @@ class TrainingHealthService:
                     and checked_at - progress_state.last_progress_at
                     > timedelta(seconds=(self.policy.heartbeat_timeout_seconds))
                 )
+                if (
+                    heartbeat is not None
+                    and not stale
+                    and paused(self.store, heartbeat, checked_at)
+                ):
+                    stalled = False
                 probe = heartbeat or TrainingProgressHeartbeat(
                     cluster_id=cluster_id,
                     attempt_id=observation.attempt_id,
@@ -266,16 +337,26 @@ class TrainingHealthService:
                 )
                 finding = self._claim(
                     probe,
-                    "hang",
-                    stale or stalled,
+                    "reporter-silent"
+                    if stale
+                    else "progress-unavailable"
+                    if heartbeat is not None and heartbeat.step is None
+                    else "hang",
+                    stale or stalled or missing_progress,
                     checked_at,
                     state,
                     reason=(
                         "training step stopped advancing"
                         if stalled and not stale
+                        else "training progress is unavailable; liveness is not step progress"
+                        if heartbeat is not None
+                        and heartbeat.step is None
+                        and not stale
                         else "training rank heartbeat timed out"
                     ),
-                    severity=Severity.CRITICAL,
+                    severity=Severity.WARNING
+                    if missing_progress and not stale
+                    else Severity.CRITICAL,
                 )
                 if finding is not None:
                     findings.append(finding)
@@ -296,7 +377,29 @@ class TrainingHealthService:
         ]
         return TrainingHealthResult(findings=findings)
 
-    def _stragglers(self, state, heartbeats, observed_at):
+    def _stragglers(
+        self,
+        state: Any,
+        heartbeats: list[TrainingProgressHeartbeat],
+        observed_at: datetime,
+    ) -> list[NodeHealthFinding]:
+        groups: dict[str, list[TrainingProgressHeartbeat]] = {}
+        for heartbeat in heartbeats:
+            group = heartbeat.labels.get("progress_group")
+            if group and phase(heartbeat) == "TRAINING":
+                groups.setdefault(group, []).append(heartbeat)
+        return [
+            finding
+            for grouped in groups.values()
+            for finding in self._group_stragglers(state, grouped, observed_at)
+        ]
+
+    def _group_stragglers(
+        self,
+        state: Any,
+        heartbeats: list[TrainingProgressHeartbeat],
+        observed_at: datetime,
+    ) -> list[NodeHealthFinding]:
         if len(heartbeats) < 2:
             return []
         steps = [item.step for item in heartbeats if item.step is not None]
@@ -334,9 +437,16 @@ class TrainingHealthService:
                 findings.append(finding)
         return findings
 
-    def _allocation(self, cluster_id, attempt_id, rank):
+    def _allocation(
+        self, cluster_id: str, attempt_id: str, rank: int
+    ) -> tuple[Any, Any]:
         for state in self.store.list_attempt_observation_states(cluster_id):
             if state.observation.attempt_id != attempt_id:
+                continue
+            if state.observation.workload_phase not in {
+                WorkloadPhase.RUNNING,
+                WorkloadPhase.PENDING,
+            }:
                 continue
             container = next(
                 (item for item in state.observation.containers if item.rank == rank),
@@ -347,15 +457,15 @@ class TrainingHealthService:
 
     def _claim(
         self,
-        heartbeat,
-        kind,
-        active,
-        observed_at,
-        state,
+        heartbeat: TrainingProgressHeartbeat,
+        kind: str,
+        active: bool,
+        observed_at: datetime,
+        state: Any,
         *,
-        reason=None,
-        severity=Severity.WARNING,
-    ):
+        reason: str | None = None,
+        severity: Severity = Severity.WARNING,
+    ) -> NodeHealthFinding | None:
         signal_key = _training_signal_key(
             heartbeat.cluster_id, heartbeat.attempt_id, heartbeat.rank, kind
         )
@@ -384,7 +494,11 @@ class TrainingHealthService:
             category=NodeHealthCategory.TRAINING,
             severity=severity,
             reason=reason or f"training {kind} detected",
-            recommended_action=RecoveryAction.RUN_DIAGNOSTICS,
+            recommended_action=(
+                RecoveryAction.STOP_WORKLOAD
+                if kind == "nonfinite-loss"
+                else RecoveryAction.RUN_DIAGNOSTICS
+            ),
             metric_name=f"training_{kind}",
             value=1,
             device=f"rank-{heartbeat.rank}",
@@ -397,4 +511,29 @@ class TrainingHealthService:
             affected_workload_ids=(
                 observation.workload_ids if observation is not None else []
             ),
+            job_id=observation.job_id if observation is not None else None,
+            attempt_id=heartbeat.attempt_id,
+            gpu_uuids=heartbeat.gpu_uuids,
+            workload_state=WorkloadState.ACTIVE,
+            policy_source="SITE_TRAINING_HEALTH",
+            diagnostic_parameters={
+                "diagnostic_reason": (
+                    "TRAINING_PROGRESS_STALL"
+                    if kind == "hang"
+                    else "TRAINING_REPORTER_SILENT"
+                    if kind == "reporter-silent"
+                    else "TRAINING_APPLICATION_ERROR"
+                ),
+                "capture_process_state": kind == "straggler",
+                "checkpoint_ref": heartbeat.checkpoint_ref,
+                "checkpoint_disposition": "REQUIRES_APPLICATION_VALIDATION",
+                "training_diagnostic": {
+                    "attempt_id": heartbeat.attempt_id,
+                    "rank": heartbeat.rank,
+                    "pod_uid": heartbeat.pod_uid,
+                    "step": heartbeat.step,
+                    "kind": kind,
+                    "phase": phase(heartbeat),
+                },
+            },
         )

@@ -184,10 +184,10 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
         """Resolve one XID into exactly one NVIDIA-sourced outcome.
 
         The guards run before any workflow and in a fixed order: an XID outside
-        the pinned catalog, one that does not apply to this product, and one
-        whose evidence does not meet the catalog's version linkage can never
-        reach a recovery action. Everything after them is dispatched by the
-        catalog's own Immediate Action text.
+        the pinned catalog and one that does not apply to this product can
+        never reach a recovery action. XID 154 linkage describes reporting
+        support, not the minimum version of the original fault. Workflow
+        decoders still require the version evidence their encoding needs.
         """
 
         correlation = _XidCorrelation(
@@ -211,10 +211,9 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
                 requires_operator=True,
             )
 
-        for gate in (self._product_gate, self._version_gate):
-            blocked = gate(event, rule)
-            if blocked is not None:
-                return blocked
+        blocked = self._product_gate(event, rule)
+        if blocked is not None:
+            return blocked
 
         official = rule.immediate_action
         # The annotated action overrides a *companion* event's own Immediate
@@ -339,62 +338,6 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
             family=self._product_families.family(event.product),
         )
 
-    def _version_gate(self, event: XidEvent, rule: CatalogRule) -> _Resolution | None:
-        linkage = rule.xid154_linkage or ""
-        driver_match = re.search(r"GPU driver R(\d+)", linkage)
-        cuda_match = re.search(r"CUDA (\d+\.\d+)", linkage)
-        missing = []
-        if driver_match and event.driver_branch is None:
-            missing.append("driver_branch")
-        if cuda_match and event.cuda_version is None:
-            missing.append("cuda_version")
-        if missing:
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=(ActionDisposition.BLOCKED_MISSING_EVIDENCE),
-                official_action=rule.immediate_action,
-                investigatory_action=rule.investigatory_action,
-                action=None,
-                containment=self._xid_containment(event.xid),
-                reasons=[
-                    "Catalog compatibility gate requires "
-                    + ", ".join(missing)
-                    + f" ({linkage})"
-                ],
-                requires_operator=True,
-            )
-        incompatible = []
-        if (
-            driver_match
-            and event.driver_branch is not None
-            and event.driver_branch < int(driver_match.group(1))
-        ):
-            incompatible.append(
-                f"driver R{event.driver_branch} < R{driver_match.group(1)}"
-            )
-        if cuda_match and event.cuda_version is not None:
-            actual_cuda = tuple(int(part) for part in event.cuda_version.split(".")[:2])
-            required_cuda = tuple(int(part) for part in cuda_match.group(1).split("."))
-            if actual_cuda < required_cuda:
-                incompatible.append(
-                    f"CUDA {event.cuda_version} < {cuda_match.group(1)}"
-                )
-        if incompatible:
-            return _Resolution(
-                source=ActionSource.NVIDIA_CATALOG,
-                disposition=ActionDisposition.NOT_APPLICABLE,
-                official_action=rule.immediate_action,
-                investigatory_action=rule.investigatory_action,
-                action=None,
-                containment=self._xid_containment(event.xid),
-                reasons=[
-                    "Catalog reporting compatibility is not satisfied: "
-                    + ", ".join(incompatible)
-                ],
-                requires_operator=True,
-            )
-        return None
-
     def _direct_resolution(
         self,
         official: str,
@@ -459,7 +402,10 @@ class GpuFaultPolicyEngine(ProductFamilyPolicyMixin):
                     "followed the driver-reported XID 154 Data Center "
                     "GPU Recovery Action DRAIN_P2P"
                 ],
-                pre_actions=[RecoveryAction.STOP_WORKLOAD],
+                pre_actions=[
+                    RecoveryAction.MARK_UNSCHEDULABLE,
+                    RecoveryAction.STOP_WORKLOAD,
+                ],
                 correlated_event_id=correlated_event_id,
             )
         mapped = (

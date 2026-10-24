@@ -1,12 +1,20 @@
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from threading import RLock
-from typing import Callable
+from typing import Any, Callable
 
+from gpu_fault.health_recovery_contract import (
+    COOLDOWN_TIMEOUT_SECONDS,
+    HEALTH_CONTRACT,
+    is_hung_finding,
+    recovery_contract,
+)
+from gpu_fault.host_diagnostics import HOST_DIAGNOSTIC_PROBE, diagnostic_probe
 from gpu_fault.host_health import NodeHealthFinding
+from gpu_fault.hung_task_summary import hung_task_summary
 from gpu_fault.models import (
     BlockedKind,
     FaultIncident,
@@ -109,6 +117,7 @@ class HealthBuildContext:
     diagnostic_parameters: dict
     hung_triage_requested: bool
     lowest_rank_by_node: dict[str, int]
+    task_summary: dict[str, Any] = field(default_factory=dict)
 
 
 class NodeHealthPlanBuilder:
@@ -182,10 +191,8 @@ class NodeHealthPlanBuilder:
     ) -> HealthBuildContext:
         target_node_ids = [finding.node_id]
         parameters = dict(finding.diagnostic_parameters)
-        hung = parameters.get(
-            "diagnostic_reason"
-        ) == "EFA_TRAFFIC_HUNG_SUSPECTED" and bool(
-            parameters.get("capture_process_state")
+        hung = bool(parameters.get("capture_process_state")) and is_hung_finding(
+            finding
         )
         lowest_rank_by_node: dict[str, int] = {}
         if not hung:
@@ -210,6 +217,7 @@ class NodeHealthPlanBuilder:
                 parameters,
                 True,
                 lowest_rank_by_node,
+                hung_task_summary(self.store, finding, None, target_node_ids),
             )
         active = [
             container
@@ -218,6 +226,29 @@ class NodeHealthPlanBuilder:
         ]
         target_node_ids = sorted({container.node_id for container in active})
         parameters["attempt_node_ids"] = target_node_ids
+        parameters.update(job_id=observation.job_id, attempt_id=observation.attempt_id)
+        parameters["fabric_partition_by_node"] = {
+            node: next(iter(values))
+            for node in target_node_ids
+            if len(
+                values := {
+                    item.fabric_partition
+                    for item in active
+                    if item.node_id == node and item.fabric_partition
+                }
+            )
+            == 1
+        }
+        parameters["workload_cgroup_paths_by_node"] = {
+            node: sorted(
+                {
+                    item.cgroup_path
+                    for item in active
+                    if item.node_id == node and item.cgroup_path
+                }
+            )
+            for node in target_node_ids
+        }
         self._add_gpu_and_rank_context(
             active,
             target_node_ids,
@@ -229,6 +260,7 @@ class NodeHealthPlanBuilder:
             parameters,
             True,
             lowest_rank_by_node,
+            hung_task_summary(self.store, finding, observation, target_node_ids),
         )
 
     @staticmethod
@@ -304,7 +336,37 @@ class NodeHealthPlanBuilder:
         action = finding.recommended_action
         active = finding.workload_state is WorkloadState.ACTIVE
         restart = bool(finding.affected_workload_ids)
-        if action is RecoveryAction.DRAIN:
+        contract = recovery_contract(finding) or {}
+        if contract.get("mode") in {"THERMAL_UNRESOLVED", "ENVIRONMENT_REVIEW"}:
+            operations += [WorkflowOperation.MARK_UNSCHEDULABLE]
+            if active:
+                operations += [WorkflowOperation.STOP_WORKLOADS]
+            operations += [
+                WorkflowOperation.QUARANTINE,
+                WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+                WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT,
+                WorkflowOperation.ESCALATE_SUPPORT,
+            ]
+        elif contract.get("mode") == "THERMAL_COOLDOWN":
+            operations += [WorkflowOperation.MARK_UNSCHEDULABLE]
+            if active:
+                operations += [WorkflowOperation.STOP_WORKLOADS]
+            operations += [
+                WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+                WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT,
+                WorkflowOperation.VALIDATE_GPU,
+                WorkflowOperation.RESTORE_SCHEDULING,
+            ]
+            if restart:
+                operations += [WorkflowOperation.RESTART_WORKLOAD]
+        elif action is RecoveryAction.STOP_WORKLOAD:
+            if active:
+                operations += [WorkflowOperation.STOP_WORKLOADS]
+            operations += [
+                WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+                WorkflowOperation.ESCALATE_SUPPORT,
+            ]
+        elif action is RecoveryAction.DRAIN:
             operations += [WorkflowOperation.MARK_UNSCHEDULABLE]
             if active:
                 operations += [WorkflowOperation.STOP_WORKLOADS]
@@ -327,10 +389,18 @@ class NodeHealthPlanBuilder:
                 WorkflowOperation.ESCALATE_SUPPORT,
             ]
         elif action is RecoveryAction.QUARANTINE:
-            operations += [
-                WorkflowOperation.MARK_UNSCHEDULABLE,
-                WorkflowOperation.QUARANTINE,
-            ]
+            operations += [WorkflowOperation.MARK_UNSCHEDULABLE]
+            if active and (
+                finding.diagnostic_parameters.get("stop_on_isolation")
+                or finding.metric_name
+                in {
+                    "ecc_dbe_volatile_total",
+                    "row_remap_failure",
+                    "composite:GPU_MEMORY_DEGRADATION",
+                }
+            ):
+                operations += [WorkflowOperation.STOP_WORKLOADS]
+            operations += [WorkflowOperation.QUARANTINE]
         elif action is RecoveryAction.REMEDIATE_EFA_DRIVER:
             operations += [WorkflowOperation.MARK_UNSCHEDULABLE]
             if active:
@@ -391,11 +461,23 @@ class NodeHealthPlanBuilder:
         finding: NodeHealthFinding,
         hung: bool,
     ) -> list[WorkflowOperation]:
+        contract = recovery_contract(finding) or {}
+        if contract.get("mode") == "OBSERVABILITY":
+            return [
+                WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT,
+                WorkflowOperation.VALIDATE_HOST,
+            ]
         if hung:
             return [
+                WorkflowOperation.COLLECT_HUNG_SUMMARY,
                 WorkflowOperation.COLLECT_HUNG_TRIAGE,
                 WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
                 WorkflowOperation.VALIDATE_FABRIC,
+                *(
+                    [WorkflowOperation.ESCALATE_SUPPORT]
+                    if contract.get("mode") == "HUNG_DIAGNOSTIC"
+                    else []
+                ),
             ]
         operations = []
         if finding.diagnostic_parameters.get("capture_process_state"):
@@ -408,14 +490,13 @@ class NodeHealthPlanBuilder:
         }:
             operations.append(WorkflowOperation.VALIDATE_FABRIC)
         elif finding.category.value == "GPU":
-            operations.extend(
-                [
-                    WorkflowOperation.RUN_DCGM_DIAGNOSTIC,
-                    WorkflowOperation.VALIDATE_GPU,
-                ]
-            )
+            if contract.get("mode") != "DIAGNOSTIC_ONLY":
+                operations.append(WorkflowOperation.RUN_DCGM_DIAGNOSTIC)
+            operations.append(WorkflowOperation.VALIDATE_GPU)
         else:
             operations.append(WorkflowOperation.VALIDATE_HOST)
+        if finding.policy_source == "SITE_APPLICATION_LOG":
+            operations.append(WorkflowOperation.ESCALATE_SUPPORT)
         return operations
 
     @staticmethod
@@ -509,6 +590,9 @@ class NodeHealthPlanBuilder:
             and not finding.gpu_uuids
         ):
             errors.append("RESET_GPU requires an explicit GPU UUID")
+        if (recovery_contract(finding) or {}).get("mode") == "THERMAL_COOLDOWN":
+            if not finding.gpu_uuids:
+                errors.append("thermal readmission requires explicit GPU UUIDs")
         # The finding's workload state reaches the shared gate: a plan that
         # mutates the node is refused while that state is UNKNOWN, the same
         # way the fault family refuses it (ARCH-B2). ``_operations`` only ever
@@ -631,7 +715,25 @@ class NodeHealthPlanBuilder:
                     **parameters,
                     "activation_forbidden": diagnostic["activation_forbidden"],
                 }
-        return step.model_copy(update={"parameters": parameters})
+        if (
+            step.operation
+            in {
+                WorkflowOperation.VALIDATE_HOST,
+                WorkflowOperation.VALIDATE_GPU,
+                WorkflowOperation.VALIDATE_FABRIC,
+            }
+            and (probe := diagnostic_probe(finding)) is not None
+        ):
+            parameters = {**parameters, HOST_DIAGNOSTIC_PROBE: probe}
+        updates = {}
+        if (contract := recovery_contract(finding)) is not None:
+            parameters = {**parameters, HEALTH_CONTRACT: contract}
+            if (
+                contract["mode"] == "THERMAL_COOLDOWN"
+                and step.operation is WorkflowOperation.VALIDATE_GPU
+            ):
+                updates["timeout_seconds"] = COOLDOWN_TIMEOUT_SECONDS
+        return step.model_copy(update={"parameters": parameters, **updates})
 
     def _hung_triage_dag(
         self,
@@ -639,65 +741,11 @@ class NodeHealthPlanBuilder:
         finding: NodeHealthFinding,
         context: HealthBuildContext,
     ) -> tuple[list, list[str]]:
-        by_operation = {step.operation: index for index, step in enumerate(steps)}
-        required = {
-            WorkflowOperation.FREEZE_EVIDENCE,
-            WorkflowOperation.COLLECT_HUNG_TRIAGE,
-            WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
-            WorkflowOperation.VALIDATE_FABRIC,
-        }
-        if not required <= by_operation.keys():
-            return steps, ["NCCL hung triage DAG is missing required steps"]
-        freeze = by_operation[WorkflowOperation.FREEZE_EVIDENCE]
-        triage = by_operation[WorkflowOperation.COLLECT_HUNG_TRIAGE]
-        bundle = by_operation[WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE]
-        validate = by_operation[WorkflowOperation.VALIDATE_FABRIC]
-        updated = list(steps)
-        updated[freeze] = updated[freeze].model_copy(
-            update={"depends_on_step_indexes": []}
+        from gpu_fault.orchestration.hung_dag import hung_dag
+
+        return hung_dag(
+            steps, finding, context, self.callbacks.sample_hung_triage_nodes
         )
-        targets, skipped = self.callbacks.sample_hung_triage_nodes(
-            context.target_node_ids,
-            reporting_node_id=finding.node_id,
-            lowest_rank_by_node=context.lowest_rank_by_node,
-        )
-        parameters = {
-            **updated[triage].parameters,
-            **context.diagnostic_parameters,
-            "triage_timeout_seconds": 10,
-            "expand_python_cgroup_processes": False,
-        }
-        if skipped:
-            parameters["not_sampled_nodes"] = skipped
-            LOGGER.info(
-                "hung triage for %s samples %d of %d attempt nodes; skipped %s",
-                finding.event_id,
-                len(targets),
-                len(context.target_node_ids),
-                ",".join(skipped),
-            )
-        updated[triage] = updated[triage].model_copy(
-            update={
-                "depends_on_step_indexes": [freeze],
-                "node_ids": targets,
-                "parameters": parameters,
-            }
-        )
-        updated[bundle] = updated[bundle].model_copy(
-            update={
-                "depends_on_step_indexes": [triage],
-                "parameters": {
-                    **updated[bundle].parameters,
-                    **context.diagnostic_parameters,
-                    "capture_process_state": False,
-                    "hung_triage_target_pending": True,
-                },
-            }
-        )
-        updated[validate] = updated[validate].model_copy(
-            update={"depends_on_step_indexes": [triage]}
-        )
-        return updated, []
 
     @staticmethod
     def _resource_escalation(
@@ -710,6 +758,10 @@ class NodeHealthPlanBuilder:
             "gpu_kubernetes_allocatable_mismatch",
         }:
             return steps
+        reboot_allowed = finding.metric_name != "efa_inventory_mismatch" or (
+            finding.diagnostic_parameters.get("failure_mode")
+            in {"PCI_DEVICE_MISSING", "DRIVER_UNBOUND", "LINK_INACTIVE"}
+        )
         raw_expected = finding.diagnostic_parameters.get(
             "expected_count",
             finding.diagnostic_parameters.get(
@@ -729,13 +781,12 @@ class NodeHealthPlanBuilder:
                 WorkflowOperation.RESTART_EFA_DEVICE_PLUGIN,
                 WorkflowOperation.RESTART_GPU_DEVICE_PLUGIN,
             }:
-                parameters.update(
-                    {
-                        "expected_count": expected,
-                        "failure_escalation_action": (RecoveryAction.REBOOT_NODE.value),
-                    }
-                )
-            if step.operation in {
+                parameters["expected_count"] = expected
+                if reboot_allowed:
+                    parameters["failure_escalation_action"] = (
+                        RecoveryAction.REBOOT_NODE.value
+                    )
+            if reboot_allowed and step.operation in {
                 WorkflowOperation.VALIDATE_FABRIC,
                 WorkflowOperation.VALIDATE_GPU,
             }:

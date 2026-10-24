@@ -272,8 +272,8 @@ def test_metrics_service_evaluates_absolute_health_rules() -> None:
     }
     actions = {item.canonical_name: item.automatic_action for item in result.findings}
     assert actions == {
-        "gpu_temperature_c": "DRAIN",
-        "ecc_dbe_volatile_total": "DRAIN",
+        "gpu_temperature_c": "RUN_DIAGNOSTICS",
+        "ecc_dbe_volatile_total": "QUARANTINE",
         "row_remap_failure": "DRAIN",
         "row_remap_pending": "RESET_GPU",
     }
@@ -361,13 +361,14 @@ def test_temperature_uses_device_limits_and_escalates() -> None:
     warning = service.ingest(
         batch("temperature-warning", [*limits, sample("gpu_temperature_c", 88)])
     )
-    critical = service.ingest(
-        batch(
-            "temperature-critical",
-            [*limits, sample("gpu_temperature_c", 93)],
-            observed_at=NOW + timedelta(seconds=15),
+    for seconds in (15, 30, 45):
+        critical = service.ingest(
+            batch(
+                f"temperature-critical-{seconds}",
+                [*limits, sample("gpu_temperature_c", 93)],
+                observed_at=NOW + timedelta(seconds=seconds),
+            )
         )
-    )
 
     warning_finding = warning.new_findings[0]
     assert warning_finding.severity == "WARNING"
@@ -383,15 +384,17 @@ def test_temperature_uses_device_limits_and_escalates() -> None:
 
 def test_memory_temperature_uses_device_limit() -> None:
     service = GpuMetricsService()
-    result = service.ingest(
-        batch(
-            "memory-temperature",
-            [
-                sample("memory_max_operating_temperature_c", 90),
-                sample("memory_temperature_c", 90),
-            ],
+    for seconds in (0, 15, 30):
+        result = service.ingest(
+            batch(
+                f"memory-temperature-{seconds}",
+                [
+                    sample("memory_max_operating_temperature_c", 90),
+                    sample("memory_temperature_c", 90),
+                ],
+                observed_at=NOW + timedelta(seconds=seconds),
+            )
         )
-    )
 
     finding = result.new_findings[0]
     assert finding.severity == "CRITICAL"
@@ -400,35 +403,38 @@ def test_memory_temperature_uses_device_limit() -> None:
     assert finding.threshold_source == "NVIDIA_DEVICE_LIMIT"
 
 
-def test_thermal_violation_escalates_after_consecutive_growth() -> None:
+def test_thermal_violation_stays_diagnostic_after_consecutive_growth() -> None:
     service = GpuMetricsService()
     service.ingest(batch("thermal-baseline", [sample("thermal_violation_total_us", 0)]))
     warning = service.ingest(
         batch(
             "thermal-warning",
-            [sample("thermal_violation_total_us", 1)],
+            [sample("thermal_violation_total_us", 1_000_000)],
             observed_at=NOW + timedelta(seconds=15),
         )
     )
     critical = service.ingest(
         batch(
             "thermal-critical",
-            [sample("thermal_violation_total_us", 2)],
+            [sample("thermal_violation_total_us", 2_000_000)],
             observed_at=NOW + timedelta(seconds=30),
         )
     )
     unchanged = service.ingest(
         batch(
             "thermal-unchanged",
-            [sample("thermal_violation_total_us", 2)],
+            [sample("thermal_violation_total_us", 2_000_000)],
             observed_at=NOW + timedelta(seconds=45),
         )
     )
 
     assert warning.new_findings[0].severity == "WARNING"
     assert warning.new_findings[0].automatic_action == ("RUN_DIAGNOSTICS")
-    assert critical.new_findings[0].severity == "CRITICAL"
-    assert critical.new_findings[0].automatic_action == "DRAIN"
+    assert critical.findings[0].severity == "WARNING"
+    assert critical.findings[0].automatic_action == "RUN_DIAGNOSTICS"
+    assert critical.new_findings == [], (
+        "unchanged performance evidence must not re-alert"
+    )
     assert not unchanged.findings, "expected unchanged.findings to be falsy"
 
 
@@ -459,7 +465,7 @@ def test_thermal_violation_faster_than_the_clock_is_not_graded() -> None:
     assert [result.new_findings for result in results] == [[], [], []]
 
 
-def test_thermal_clock_throttling_composite_escalates() -> None:
+def test_thermal_warning_composite_does_not_escalate() -> None:
     service = GpuMetricsService()
     thermal_samples = [
         sample("gpu_slowdown_temperature_c", 92),
@@ -480,14 +486,14 @@ def test_thermal_clock_throttling_composite_escalates() -> None:
     )
 
     first = warning.new_composite_findings[0]
-    second = critical.new_composite_findings[0]
+    second = critical.composite_findings[0]
     assert first.correlation_rule_id == "THERMAL_STRESS"
     assert first.severity == "WARNING"
     assert first.automatic_action == "RUN_DIAGNOSTICS"
     assert "sm_clock_mhz" in first.component_metrics
-    assert second.severity == "CRITICAL"
-    assert second.automatic_action == "DRAIN"
-    assert critical.new_findings == [second]
+    assert second.severity == "WARNING"
+    assert second.automatic_action == "RUN_DIAGNOSTICS"
+    assert critical.new_findings == []
     assert {"gpu_temperature_c", "clock_throttle_reasons"}.issubset(
         set(second.component_metrics)
     ), (
@@ -525,7 +531,7 @@ def test_power_limit_metrics_correlate_without_thermal_fault() -> None:
         batch(
             "power-correlated",
             [
-                sample("power_violation_total_us", 1),
+                sample("power_violation_total_us", 1_000_000),
                 sample("power_usage_w", 680),
                 sample("power_limit_w", 700),
                 sample("gpu_utilization_percent", 95),
@@ -629,7 +635,7 @@ def test_multi_gpu_nvlink_errors_create_one_fabric_composite() -> None:
     finding = result.new_composite_findings[0]
     assert finding.correlation_rule_id == ("MULTI_GPU_NVLINK_FABRIC_FAILURE")
     assert finding.affected_gpu_uuids == ["GPU-0", "GPU-1"]
-    assert finding.automatic_action == "DRAIN"
+    assert finding.automatic_action == "RUN_DIAGNOSTICS"
     assert result.new_findings == [finding]
 
 
@@ -657,7 +663,10 @@ def test_composite_state_survives_service_restart(tmp_path) -> None:
             )
         )
         assert first.new_composite_findings[0].severity == ("WARNING")
-        assert second.new_composite_findings[0].severity == ("CRITICAL")
+        assert second.composite_findings[0].severity == ("WARNING")
+        assert second.new_composite_findings == [], (
+            "restart must preserve deduplication"
+        )
     finally:
         second_store.close()
 
@@ -693,12 +702,12 @@ def test_correctable_memory_trend_escalates_after_three_samples() -> None:
     assert second.severity == "WARNING"
     assert not results[1].new_findings, "expected results[1].new_findings to be falsy"
     assert third.severity == "CRITICAL"
-    assert third.automatic_action == "DRAIN"
+    assert third.automatic_action == "RUN_DIAGNOSTICS"
     assert results[2].new_findings == [third]
     assert set(third.component_metrics) == set(names)
 
 
-def test_new_retired_dbe_page_is_critical() -> None:
+def test_new_retired_dbe_page_requests_diagnostics() -> None:
     service = GpuMetricsService()
     service.ingest(
         batch("retired-dbe-baseline", [sample("retired_pages_dbe_total", 4)])
@@ -714,13 +723,13 @@ def test_new_retired_dbe_page_is_critical() -> None:
 
     finding = result.new_findings[0]
     assert finding.canonical_name == "retired_pages_dbe_total"
-    assert finding.severity == "CRITICAL"
-    assert finding.automatic_action == "DRAIN"
+    assert finding.severity == "WARNING"
+    assert finding.automatic_action == "RUN_DIAGNOSTICS"
     assert finding.delta == 1
-    assert finding.policy_source == "SITE_DCGM_METRIC"
+    assert finding.policy_source == "SITE_GPU_MEMORY_EVIDENCE"
 
 
-def test_nvlink_error_uses_official_critical_health_response() -> None:
+def test_nvlink_counter_requests_diagnostics_without_rma() -> None:
     service = GpuMetricsService()
     service.ingest(
         batch("nvlink-baseline", [sample("nvlink_crc_aggregate_error_total", 0)])
@@ -734,10 +743,10 @@ def test_nvlink_error_uses_official_critical_health_response() -> None:
     )
 
     finding = result.findings[0]
-    assert finding.severity == "CRITICAL"
-    assert finding.automatic_action == "DRAIN"
-    assert finding.policy_source == "NVIDIA_DCGM_HEALTH"
-    assert finding.official_action == ("TERMINATE_JOB_AND_ANALYZE_GPU_HEALTH")
+    assert finding.severity == "WARNING"
+    assert finding.automatic_action == "RUN_DIAGNOSTICS"
+    assert finding.policy_source == "SITE_NVLINK_COUNTER_EVIDENCE"
+    assert finding.official_action == "EXAMINE_GPU_HEALTH"
 
 
 def test_xid_metric_emits_only_on_nonzero_state_change() -> None:
@@ -929,7 +938,7 @@ def test_gpu_metrics_endpoint_bridges_xid94_to_policy() -> None:
         assert response.status_code == 200
         body = response.json()
         assert body["accepted_samples"] == 2
-        assert body["findings"][0]["severity"] == "CRITICAL"
+        assert body["findings"][0]["severity"] == "WARNING"
         assert body["decisions"][0]["official_action"] == "RESTART_APP"
         assert body["decisions"][0]["containment"] == "APPLICATION"
         assert latest.status_code == 200
@@ -947,12 +956,15 @@ def test_non_xid_gpu_finding_creates_site_safety_workflow() -> None:
 
     async def scenario() -> None:
         async with asgi_client(context) as client:
-            response = await client.post(
-                "/v1/collector-events/gpu-metrics",
-                json=batch(
-                    "gpu-temperature-critical", [sample("gpu_temperature_c", 91)]
-                ).model_dump(mode="json"),
-            )
+            for seconds in (0, 15, 30):
+                response = await client.post(
+                    "/v1/collector-events/gpu-metrics",
+                    json=batch(
+                        f"gpu-temperature-critical-{seconds}",
+                        [sample("gpu_temperature_c", 91)],
+                        observed_at=NOW + timedelta(seconds=seconds),
+                    ).model_dump(mode="json"),
+                )
             statuses = await client.get(
                 "/v1/collector-status/hp-cluster", params={"node_id": "worker-1"}
             )
@@ -968,7 +980,7 @@ def test_non_xid_gpu_finding_creates_site_safety_workflow() -> None:
             "STOP_WORKLOADS",
             "QUARANTINE",
             "COLLECT_DIAGNOSTIC_BUNDLE",
-            "VALIDATE_GPU",
+            "TRIGGER_HEALTH_SNAPSHOT",
             "ESCALATE_SUPPORT",
         ]
         assert statuses.status_code == 200

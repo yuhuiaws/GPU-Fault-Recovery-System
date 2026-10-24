@@ -15,15 +15,17 @@ position nothing will skip.
 from __future__ import annotations
 
 import logging
+import copy
 import os
 import time
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
-from typing import Any, BinaryIO, Callable
+from typing import Any, Callable
 
 from gpu_fault.host_health import NodeLogEntry
 from gpu_fault.log_rules import matching_log_rules
+from .node_records import decode_record, pod_identity, read_line
 
 LOGGER = logging.getLogger(__name__)
 
@@ -107,9 +109,7 @@ class _ScanBudget:
     def account(self, raw_bytes: int, *, matched: bool) -> None:
         """Count one raw line that has been read, and what it costs the batch."""
 
-        if self._deadline is None:
-            self._deadline = self._monotonic() + self.max_seconds
-        self.bytes_read += raw_bytes
+        self.consume_bytes(raw_bytes)
         if matched:
             self.kept += 1 + min(self._leading, self.context_lines)
             self._leading = 0
@@ -122,6 +122,11 @@ class _ScanBudget:
             self._leading = 0
         else:
             self._leading = min(self._leading + 1, self.context_lines)
+
+    def consume_bytes(self, raw_bytes: int) -> None:
+        if self._deadline is None:
+            self._deadline = self._monotonic() + self.max_seconds
+        self.bytes_read += raw_bytes
 
     def spent(self) -> str | None:
         """Why the scan must stop, or ``None``.
@@ -169,6 +174,7 @@ class _TrainingLogs:
         entry_identity: Callable[..., str],
         record_discard: Callable[..., None],
         record_error: Callable[[str], None],
+        pod_log_root: str = "/var/log/pods",
     ) -> None:
         self.paths = paths
         self.initial_tail_bytes = initial_tail_bytes
@@ -177,6 +183,8 @@ class _TrainingLogs:
         self.entry_identity = entry_identity
         self.record_discard = record_discard
         self.record_error = record_error
+        self.pod_log_root = pod_log_root
+        self.pending: dict[str, dict[str, Any]] = {}
         # Per training log: `device`, `inode` and `offset` in bytes. The offset
         # alone was not enough -- a rotated file kept the old offset and the
         # collector read from the middle of the new one.
@@ -203,14 +211,25 @@ class _TrainingLogs:
         either way.
         """
 
-        ordered = list(
-            dict.fromkeys(
-                str(path)
-                for configured in self.paths
-                for path in sorted(Path("/").glob(configured.lstrip("/")))
-                if path.is_file()
-            )
-        )
+        found: dict[str, None] = {}
+        for configured in self.paths:
+            for path in Path("/").glob(configured.lstrip("/")):
+                if path.is_file():
+                    found[str(path)] = None
+                if len(found) > self.max_tracked_files:
+                    self.record_error(
+                        f"training log discovery exceeds {self.max_tracked_files} "
+                        "files; coverage is incomplete, narrow configured paths"
+                    )
+                    break
+            if len(found) > self.max_tracked_files:
+                break
+        # Prefer already tracked names so excess files cannot repeatedly reset
+        # a baseline. Discovery and state both have a hard cardinality bound.
+        ordered = sorted(found, key=lambda key: (key not in self.files, key))[
+            : self.max_tracked_files
+        ]
+        ordered.sort()
         if self.resume_after is None or self.resume_after not in ordered:
             return ordered
         cut = ordered.index(self.resume_after) + 1
@@ -377,6 +396,8 @@ class _TrainingLogs:
                 "inode": stat.st_ino,
                 "offset": offset,
             }
+            if other in self.pending:
+                self.pending[key] = self.pending.pop(other)
             LOGGER.warning(
                 "training log %s was rotated to %s; resuming its tail at byte %d "
                 "instead of baselining at the end",
@@ -409,7 +430,7 @@ class _TrainingLogs:
         surplus = len(self.files) - self.max_tracked_files
         if surplus <= 0:
             return
-        stale = [key for key in self.files if key not in visited][:surplus]
+        stale = sorted(self.files, key=lambda key: key in visited)[:surplus]
         for key in stale:
             del self.files[key]
         self.record_discard("forgotten-training-log-offsets", len(stale))
@@ -430,6 +451,15 @@ class _TrainingLogs:
         entries: list[NodeLogEntry] = []
         ordered = self._ordered_paths()
         plan = self._resume_plan(ordered)
+        for read in plan:
+            previous = self.files.get(read.key, {})
+            if (
+                previous.get("device") != read.stat.st_dev
+                or previous.get("inode") != read.stat.st_ino
+                or read.offset < int(previous.get("offset", 0))
+            ):
+                self.pending.pop(read.key, None)
+            self._remember(read, read.offset)
         if budget.spent() is not None:
             # The journal used what this poll had, on the entry axis or the
             # byte axis. Reading a line here would move an offset past an entry
@@ -461,6 +491,9 @@ class _TrainingLogs:
                 "after that one"
             )
         self._bound_tracked_files(set(visited))
+        self.pending = {
+            key: item for key, item in self.pending.items() if key in self.files
+        }
         return entries
 
     def _defer_reads(self, plan: list[_TrainingRead]) -> None:
@@ -518,6 +551,7 @@ class _TrainingLogs:
         """
 
         entries: list[NodeLogEntry] = []
+        pending_before = copy.deepcopy(self.pending.get(read.key, {}))
         try:
             return self._read_from_offset(read, observed_at, budget)
         except OSError as error:
@@ -534,6 +568,7 @@ class _TrainingLogs:
             # file new and baselining it at its larger size, which silently
             # skipped everything appended while it could not be read.
             self._remember(read, read.offset)
+            self.pending[read.key] = pending_before
             self.record_error(
                 f"{read.key} could not be read ({error}); its lines are not in "
                 "this batch and the next poll resumes at byte "
@@ -548,66 +583,61 @@ class _TrainingLogs:
 
         entries: list[NodeLogEntry] = []
         with Path(read.key).open("rb") as stream:
-            if not self._seek_to_a_line(read, stream):
-                # Nothing is readable yet, but where the file stands is still
-                # worth recording: that is what stops the next poll treating it
-                # as new (see `_remember`).
-                self._remember(read, read.offset)
-                return entries
+            pending = self.pending.setdefault(read.key, {})
+            physical = pending.setdefault("physical", {})
+            stream.seek(read.offset)
+            if not physical and read.offset:
+                stream.seek(read.offset - 1)
+                if stream.read(1) != b"\n":
+                    physical.update(start=read.offset, hex="", discard=True)
+                    self._warn_resumed_inside_a_line(read.key, read.offset)
             while True:
-                start = stream.tell()
-                raw = stream.readline()
-                if not raw:
+                discard = physical.get("discard", False)
+                line = read_line(stream, physical, budget, self.max_entry_bytes)
+                if line is None:
+                    if discard and not budget.spent():
+                        self._warn_resume_inside_an_unfinished_line(
+                            read.key, int(physical.get("start", read.offset))
+                        )
                     break
-                if not raw.endswith(b"\n"):
-                    # The job has not finished writing this line: the offset goes
-                    # back to `start` so the next poll reads it whole rather than
-                    # committing a position inside it and losing the half that
-                    # says which rank aborted.
-                    stream.seek(start)
-                    break
-                message = _bounded_message(
-                    raw.decode("utf-8", errors="replace").rstrip("\n"),
+                if discard:
+                    continue
+                start, raw = line
+                record = decode_record(
+                    raw,
+                    start,
+                    observed_at,
+                    pending.setdefault("cri", {}),
                     self.max_entry_bytes,
                 )
+                if record is None:
+                    if budget.spent():
+                        break
+                    continue
+                start, event_at, message, fields = record
+                if fields["timestamp_source"] == "cri":
+                    fields.update(pod_identity(read.key, self.pod_log_root))
                 entries.append(
                     NodeLogEntry(
                         entry_id=self.entry_identity(
                             read.stat.st_dev, read.stat.st_ino, read.key, start
                         ),
                         source="training-log",
-                        observed_at=observed_at,
+                        observed_at=event_at,
                         message=message,
-                        fields={"path": read.key},
+                        fields={"path": read.key, **fields},
                     )
                 )
-                budget.account(len(raw), matched=bool(matching_log_rules(message)))
+                budget.account(0, matched=bool(matching_log_rules(message)))
                 if budget.spent():
                     break
             self._remember(read, stream.tell())
+            if budget.spent() and stream.tell() < read.stat.st_size:
+                self.record_error(
+                    f"{read.key}: {budget.stop_reason} scan budget reached; "
+                    "unread bytes and partial records resume next poll"
+                )
         return entries
-
-    def _seek_to_a_line(self, read: _TrainingRead, stream: BinaryIO) -> bool:
-        """Position the stream on a line boundary, or report that it cannot be.
-
-        Returns ``False`` when the offset sits inside a line with no terminator
-        yet: nothing can be read from the file until it has one.
-        """
-
-        offset = read.offset
-        stream.seek(offset)
-        if offset <= 0:
-            return True
-        stream.seek(offset - 1)
-        boundary = stream.read(1)
-        if boundary == b"\n":
-            return True
-        skipped = stream.readline()
-        if not skipped.endswith(b"\n"):
-            self._warn_resume_inside_an_unfinished_line(read.key, offset)
-            return False
-        self._warn_resumed_inside_a_line(read.key, offset)
-        return True
 
     def _warn_resumed_inside_a_line(self, key: str, offset: int) -> None:
         """Say once that an offset did not land on a line boundary.
@@ -650,8 +680,8 @@ class _TrainingLogs:
         self._partial_resume_warned = (key, offset, now)
         LOGGER.warning(
             "training log %s resumed at byte %d, inside a line the job has not "
-            "finished writing; holding the offset there until the line is "
-            "complete (nothing is read from this file meanwhile)",
+            "finished writing; retaining a bounded continuation until the line "
+            "is complete (no record is emitted meanwhile)",
             key,
             offset,
         )

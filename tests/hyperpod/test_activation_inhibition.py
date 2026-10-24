@@ -18,6 +18,7 @@ from gpu_fault.models import WorkflowOperation, WorkflowStepStatus
 from tests.hyperpod._cov95_runtime_failover import FailoverHarness
 from tests.hyperpod.test_hyperpod_spares import (
     coordinator,
+    healthy_telemetry,
     hyperpod_node,
     kubernetes_node,
 )
@@ -197,6 +198,7 @@ def test_newly_declared_healthy_candidate_cannot_bypass_inhibition() -> None:
             runtime_profile_version="simulated-v1",
         )
     )
+    healthy_telemetry(store, "hyperpod-i-new")
     result = service.allocate(
         cluster_id="hp-cluster",
         incident_id="new-candidate",
@@ -251,6 +253,7 @@ def real_adapter(*, inhibited: bool = True) -> FailoverHarness:
             runtime_profile_version="simulated-v1",
         )
     )
+    healthy_telemetry(service.store, "spare-a", harness.context.incident.cluster_id)
     harness.adapter.spare_coordinator = service
     parameters = dict(harness.context.step.parameters)
     if inhibited:

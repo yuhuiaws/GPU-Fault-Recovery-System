@@ -99,6 +99,7 @@ from gpu_fault.installation_inventory import (
     resolve_agent_inventory,
 )
 from gpu_fault.models import StrictModel, WorkflowOperation
+from gpu_fault.communication_monitoring import CommunicationPlan
 from gpu_fault.node_action_keys import (
     derive_node_action_secret as derive_node_action_secret,
 )
@@ -137,6 +138,9 @@ def validate_node_identifier(value: str) -> str:
 
 
 class AgentHeartbeat(StrictModel):
+    communication_monitor_version: str | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     heartbeat_id: str = Field(default_factory=lambda: f"heartbeat-{uuid4()}")
     cluster_id: str
     node_id: str
@@ -238,8 +242,11 @@ class SignedAgentHeartbeat(StrictModel):
 
 
 def canonical_heartbeat(heartbeat: AgentHeartbeat) -> bytes:
+    payload = heartbeat.model_dump(mode="json")
+    if payload.get("communication_monitor_version") is None:
+        payload.pop("communication_monitor_version", None)
     return json.dumps(
-        heartbeat.model_dump(mode="json"),
+        payload,
         sort_keys=True,
         separators=(",", ":"),
     ).encode()
@@ -273,6 +280,9 @@ class AgentLifecycleState(StrEnum):
 
 
 class AgentRecord(StrictModel):
+    communication_plan: CommunicationPlan | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     cluster_id: str
     node_id: str
     endpoint: str

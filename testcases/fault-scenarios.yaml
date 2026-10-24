@@ -33,6 +33,1184 @@ generated_test_families:
     capture_processing_trace: true
     pytest_nodeid: "tests/collectors/test_xid_kmsg_catalog_replay.py::test_xid_kmsg_catalog_replay_b200[GF-XID-KMSG-B200-{value:03d}]"
 test_cases:
+- id: GF-GENERAL-LIVE-001
+  title: 真机CPU过载持续检测与原指标验证
+  category: general-fault-live
+  level: end-to-end
+  risk: live-node-mutation
+  problem: 主机CPU压力不能由容器内百分比或计划列表代替验证。
+  injection: 专属节点有界CPU负载或受检procfs读取夹具，分别覆盖busy和load以及短突发。
+  expected: [真实主机指标跨过运行窗口才触发, 实际验证原指标且恢复后任务继续推进, 无reset或reboot并清理负载]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-001
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-002
+  title: 真机内存和swap检测不混淆cgroup耗尽
+  category: general-fault-live
+  level: end-to-end
+  risk: live-node-mutation
+  problem: cgroup OOM不是主机内存耗尽，缺数据也不是健康。
+  injection: 隔离资源压力或原始meminfo夹具分别覆盖memory与swap及不可用数据。
+  expected: [按memory和swap各自规则触发, 实际验证原指标且读取失败保留UNKNOWN, 清理后主机与采集及原任务正常]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-002
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-003
+  title: 真机低利用率及资源异常的任务归属
+  category: general-fault-live
+  level: end-to-end
+  risk: live-node-mutation
+  problem: 低利用率不必然是硬件故障，持续窗口不能跨attempt。
+  injection: 受管测试程序等待阶段及原始资源夹具，包含空闲节点和归属歧义。
+  expected: [只评估正确attempt和已分配GPU, 实际绑定指标诊断而不盲目升级硬件, 恢复后原rank进度有效且无错误作用域]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-003
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-004
+  title: 真机专用文件系统容量与不可观测边界
+  category: general-fault-live
+  level: end-to-end
+  risk: live-node-mutation
+  problem: 字节容量不能替代inode只读和必需挂载健康。
+  injection: 专用有界测试卷容量耗尽，另测inode只读挂载消失与探测错误，不填系统盘。
+  expected: [容量故障执行真实隔离且保留其他owner状态, 未覆盖的inode或读取故障记录FAIL而非健康, 清理卷并验证后受控接纳]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-004
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-005
+  title: 真机共享存储故障与跨节点故障域
+  category: general-fault-live
+  level: end-to-end
+  risk: live-node-mutation
+  problem: statvfs可用不能证明checkpoint I/O可用。
+  injection: 独立NFS或Lustre export测试超时容量和I/O失败，并保留健康对照挂载。
+  expected: [采集有界且实际验证故障挂载, 另一挂载健康不掩盖原故障, 还原后新指标真实I/O与任务进度均验证]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-005
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-006
+  title: 真机磁盘I/O与独立await口径核对
+  category: general-fault-live
+  level: end-to-end
+  risk: live-node-mutation
+  problem: 系统自己的计算结果不能充当唯一正确性oracle。
+  injection: 专用测试文件有界I/O和原始diskstats夹具，与同区间iostat独立对照。
+  expected: [短突发与持续窗口区分, await口径偏差和零分母不得当通过, 实际验证恢复且不升级硬件]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-006
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-007
+  title: 真机SMART失败与扫描查询失败区分
+  category: general-fault-live
+  level: end-to-end
+  risk: live-isolation
+  problem: 空设备列表或不支持SMART不能默认为健康。
+  injection: 厂商支持证据或私有smartctl输出夹具分别覆盖设备失败和scan/query失败。
+  expected: [passed=false经真实解析到隔离回执, 扫描失败和能力缺失不伪装健康, 不损坏介质且清理后真实工具恢复]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-007
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-008
+  title: 真机必需网卡故障与角色隔离
+  category: general-fault-live
+  level: end-to-end
+  risk: live-node-mutation
+  problem: 管理接口和非必需接口不能被错误注入或判定。
+  injection: 仅操作有带外保护的专用数据接口，或受检sysfs源夹具，覆盖down缺失及unknown。
+  expected: [确认down或缺失执行隔离, 读取错误不冒充down且已有链路证据不丢失, 恢复原配置与通信并保留正确隔离owner]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-008
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-009
+  title: 真机网卡错误丢包与TCP重传分离
+  category: general-fault-live
+  level: end-to-end
+  risk: live-node-mutation
+  problem: netem或应用丢包不能冒充硬件错误计数增长。
+  injection: 验证实际目标counter增长的隔离流量实验或受检原始计数器夹具。
+  expected: [errors和持续drops按独立窗口判定, 实际验证目标接口且TCP重传不触发硬件恢复, 以新增量与通信证据证明恢复]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-009
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-010
+  title: 真机EFA计数器能力与错误分类
+  category: general-fault-live
+  level: end-to-end
+  risk: live-node-mutation
+  problem: 缺少EFA字段或ethtool命令失败不能报成零错误。
+  injection: 驱动版本绑定的源夹具或厂商实验分别注入RDMA RNR retry CQ和链路异常。
+  expected: [各字段有能力与有效性证明, 真实Fabric诊断不以拥塞直接判硬件坏, 缺字段报零等问题记录FAIL且不盲目reboot]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-010
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-011
+  title: 真机NCCL挂起取证范围并发与规模
+  category: general-fault-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: 低流量计划或小规模取证不证明全任务诊断可用。
+  injection: 受管NCCL测试程序可恢复等待，实测EFA活跃到零，分别覆盖FR开关并发节点和规模变体。
+  expected: [有效同attempt基线与计时且缺读数不当零, 实际triage bundle Fabric回执和采集分母完整, 不因疑似hung停训隔离或reset且原rank新进度证明恢复]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-011
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-012
+  title: 真机GPU缺失与双读取失败误判防护
+  category: general-fault-live
+  level: end-to-end
+  risk: destructive-provider-reboot
+  problem: NVML和procfs都不可读不能被当成确认零卡。
+  injection: 完整库存源少一个UUID或厂商掉卡证据，另测查询失败proc不可读和期望数错误。
+  expected: [只有确认缺失进入批准恢复链, 实际provider回执新boot和完整验证后才恢复任务, 双读取失败误重启记FAIL而不是以重启成功掩盖]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-012
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-013
+  title: 真机EFA缺失解绑链路和修复失败分支
+  category: general-fault-live
+  level: end-to-end
+  risk: destructive-provider-reboot
+  problem: 定向解绑不能替代真实PCI缺失，未知状态不得授权reboot。
+  injection: 有带外rebind保底的测试功能定向解绑，其他模式用受检源或厂商证据分别验证。
+  expected: [按failure_mode选择真实分层处置, 未知或超额不reboot且禁止全局卸载efa, bind与验证失败分别有回执并正确还原]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-013
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-014
+  title: 真机GPU和EFA设备插件注册恢复
+  category: general-fault-live
+  level: end-to-end
+  risk: destructive-provider-reboot
+  problem: 修改Node status不证明真实设备插件重新注册。
+  injection: 物理库存健康下的受检plugin注册故障，独立测试GPU和EFA。
+  expected: [两次确认后正确plugin原新UID和注册回执, 目标expected_count与原训练进度恢复, 未知数量和共享GPU语义不误判且失败升级单独授权]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-014
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-015
+  title: 真机BMC状态列和能力不可用
+  category: general-fault-live
+  level: end-to-end
+  risk: live-isolation
+  problem: 云节点没有BMC或查询失败不等于传感器健康。
+  injection: 厂商接口或私有输出夹具覆盖cr nr ok以及字段和命令错误，不制造过热。
+  expected: [第四列状态决定告警且保存传感器身份, 真实隔离与去重回执可追踪, 不支持和失败查询显式记录并安全清理]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-015
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-016
+  title: 真机严重内核日志可信来源和代际
+  category: general-fault-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: 用户态logger和旧boot日志不能授权当前节点硬件处置。
+  injection: 已启用NodeLogCollector的受检journal读取夹具或自然事件，覆盖四类故障及cursor重启。
+  expected: [可信严重日志停正确归属任务并隔离, corrected用户态和旧boot不误判, cursor分页不丢失且有真实执行通知和清理回执]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-016
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-017
+  title: 真机应用日志CRI归属取证与退出
+  category: general-fault-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: 日志报错rank不等同根因，旧Pod不能误归新任务。
+  injection: 测试程序日志或自身cgroup OOM经真实CRI采集，配合P/F分片轮转和存活退出变体。
+  expected: [身份时间与LIVE EXITED UNKNOWN正确, 实际只读取证转人工而不凭Fabric健康宣告修复, watcher退出恢复单独归因且不误停对照任务]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-017
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-019
+  title: 真机ECC重映射与页退役架构分级
+  category: general-fault-live
+  level: end-to-end
+  risk: destructive
+  problem: 计数器告警和需要复位的设备状态不能混用。
+  injection: 厂商或受检DCGM源逐项注入不同内存信号并绑定实际架构和Profile。
+  expected: [DBE隔离分析而普通增量只诊断, pending仅受支持且授权时执行真实reset, 无客户端和动作后新状态验证完整且不伪称完成RMA]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-019
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-020
+  title: 真机NVLink计数诊断与独立致命事件
+  category: general-fault-live
+  level: end-to-end
+  risk: destructive
+  problem: counter诊断不能越权也不能吸收丢失独立致命Xid。
+  injection: 受检链路计数源及独立原始致命事件分开进入真实控制面，危险分支单独审批。
+  expected: [单卡多卡计数仅只读诊断, 回退旧样本不制造新故障或恢复, 独立致命事件有自己处置回执并以新通信证据验收]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-020
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-021
+  title: 真机fabric状态触发全GPU及NVSwitch恢复
+  category: general-fault-live
+  level: end-to-end
+  risk: destructive-provider-reboot
+  problem: Xid触发或单独重启FM不能替代状态触发完整恢复验证。
+  injection: 受支持独占节点实测或回放DCGM状态1/2/4持续窗口，包含失败与未分级型号。
+  expected: [状态窗口和节点去重正确, 完整范围quiesce无客户端全reset及服务恢复回执, 每卡新Success和Fabric验证后接纳且失败保持隔离]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-021
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-022
+  title: 真机PCIe速率与同卡可信Xid联合
+  category: general-fault-live
+  level: end-to-end
+  risk: destructive-provider-reboot
+  problem: 错GPU或过期Xid不能扩大PCIe计数器的恢复权限。
+  injection: 受检原始计数构造8每分钟边界并与独立可信Xid按身份时间组合。
+  expected: [独立越界只诊断且重置不形成速率, 同卡可信联合和独立Xid各有可追踪授权, 实际新状态和通信验证而非清计数宣告恢复]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-022
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-024
+  title: 真机复合规则组件新鲜度权限与去重
+  category: general-fault-live
+  level: end-to-end
+  risk: destructive
+  problem: 相关性本身既不能升级权限也不能降级真实硬件故障。
+  injection: 按原始源回放热功耗内存NVLink及独立Xid的同卡异卡过窗重复组合。
+  expected: [组件与复合到实际工作流映射完整, 弱相关不独立授权更强动作或重复执行, 有依据的硬件组件和致命Xid不会被弱告警覆盖]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-024
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-025
+  title: 真机逐GPU采集不完整与新快照验证
+  category: general-fault-live
+  level: end-to-end
+  risk: live-service-action
+  problem: 批次有字段不代表每张GPU都完整，旧成功不能放行新缺测。
+  injection: 测试exporter暂停或受检源夹具省略字段冲突别名和非法数值，保留Agent在线。
+  expected: [持续UNKNOWN仅触发有界snapshot和观测验证, 逐GPU完整性不能被其他GPU替代, 新完整数据才能完成且无硬件升级]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-025
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-026
+  title: 真机GPU身份变化与期望数量未知
+  category: general-fault-live
+  level: end-to-end
+  risk: live-node-mutation
+  problem: 合法维护换卡和配置未知不等同设备损坏。
+  injection: 批准维护后的真实库存或受检inventory源，分别验证UUID BDF与未知期望数。
+  expected: [身份变化诊断而未知期望数取证, 旧boot不覆盖新库存且不猜数量reboot, 批准rebaseline及清理后真实GPU身份一致]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-026
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-027
+  title: 真机训练进度阶段与NaN恢复边界
+  category: general-fault-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: reporter存活或健康Fabric不能证明应用状态恢复。
+  injection: 测试训练程序更新真实进度文件或停止reporter，分别覆盖NaN挂起回退和phase。
+  expected: [NaN只停止正确attempt且不盲信checkpoint, 阶段有界且旧身份不能授权STOP, 原rank新有效进度证明恢复并清理测试任务]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-027
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-028
+  title: 真机容器失败到终态预算恢复闭环
+  category: general-fault-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: 手工写FAILED状态不能证明真实watcher退出观察链。
+  injection: 关键测试容器实际非零退出，另测用户停止控制面停止与受控API失联。
+  expected: [真实日志STOP terminal与一次恢复顺序可追踪, 无allocation或旧attempt不得控制新任务, 新UID有效进度预算及orphan清理均有证据]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-028
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-029
+  title: 真机预算耗尽继续硬件恢复但扣住任务重启
+  category: general-fault-live
+  level: end-to-end
+  risk: destructive-provider-reboot
+  problem: 耗尽重启预算不应跳过必要恢复或虚假释放预留。
+  injection: 合法失败恢复消耗预算后由原始故障触发批准的恢复链，覆盖并发和worker重建。
+  expected: [除RESTART_WORKLOAD外必要步骤真实执行, 不再建任务或重复扣减释放预算, 最终状态隔离和单次通知一致且不修改业务预算清理]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-029
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-030
+  title: 真机热备准入硬件依据与保留竞争
+  category: general-fault-live
+  level: end-to-end
+  risk: destructive-provider-reboot
+  problem: NotReady或缺测不能授权硬件恢复，已保留spare不能复用。
+  injection: 独立warm spare的Ready采集配置及可信原始硬件故障逐项验证。
+  expected: [普通不可用仅阻止分配且真实硬件证据才恢复, reservation与无spare不回落provider替换, 失败有界复查且健康验证后回AVAILABLE]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-030
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-031
+  title: 真机采集静默与通知去重恢复
+  category: general-fault-live
+  level: end-to-end
+  risk: live-service-action
+  problem: 停止上报与禁用采集器不同，进程running不能证明新成功。
+  injection: 已建立成功基线后仅暂停必需通道并保持Agent lease，另测disabled与通知失败。
+  expected: [按通道阈值和扫描周期记录UNKNOWN, 有界刷新与通知去重且不任意重启服务, 新成功后退出静默并验证逐通道覆盖]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-031
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-LIVE-032
+  title: 真机未知错误缺证据与Profile安全门禁
+  category: general-fault-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: 未知语义不得盲目恢复，linkage也不能误阻塞已知普通Xid。
+  injection: 受检kernel或inventory原始源构造未知代码产品和证据缺失，另用已知应用恢复变体。
+  expected: [实际BLOCKED和允许的安全隔离可追踪, 无授权不越权且未知不reset或reboot, 已知旧驱动动作保持正确并去重清理]
+  automation: manual
+  procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-032
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-SW-001
+  title: 设备绝对温标TLimit显存及关机温度的软件执行闭环
+  category: gpu-environment-software
+  level: end-to-end
+  risk: non-destructive
+  problem: 温标策略单测不能替代实际工作流执行。
+  injection: 原始nvidia-smi XML和DCGM文本贯通采集API策略执行器，设备和Kubernetes边界使用隔离替身。
+  expected: [普通严重温度三次确认且绝对关机温度一次保护, 实际执行隔离与停止归属任务, 人工复核且不自动恢复训练]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_device_temperature_limits_reach_real_containment
+- id: GF-ENV-SW-002
+  title: 热计数与温度warning相关不越权的软件执行闭环
+  category: gpu-environment-software
+  level: end-to-end
+  risk: non-destructive
+  problem: 多个性能告警不能单独授权停训或硬件操作。
+  injection: 原始DCGM文本回放持续thermal duration和warning温度，恢复后执行真实验证器。
+  expected: [只读诊断且恢复后完成, 无STOP压测或重启, 节点保持可调度]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_thermal_warning_and_duration_execute_only_read_only_diagnostics
+- id: GF-ENV-LIVE-001
+  title: 真机环境指标来源和健康基线
+  category: gpu-environment-live
+  level: end-to-end
+  risk: live-non-destructive
+  problem: 采集进程在线不代表每张GPU的必需字段都可用。
+  injection: 真机只读对比nvidia-smi XML和exporter与控制面，代理不arm时透传。
+  expected: [逐GPU核对身份单位新鲜度与能力, 原任务持续前进且无环境恢复动作, 记录缺失字段而不当健康]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-001
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-LIVE-002
+  title: 真机正常power cap完整诊断与还原
+  category: gpu-environment-live
+  level: end-to-end
+  risk: live-node-mutation
+  problem: 真实功率封顶不应触发硬件恢复，投递通过不证明动作正确。
+  injection: 经批准只降低一张GPU的功率上限并施加有界负载，复用COLLECT-002的先布还原保底机制，前提是原上限等于默认值。
+  expected: [形成候选后实际仅只读诊断, 原任务身份不变且无隔离停训重启, 逐GPU证明恢复原功率上限]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-002
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-LIVE-003
+  title: 真机遥测回放验证warning与两种温标
+  category: gpu-environment-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: TLimit和绝对温度不能混比，软件工作限值不等同硬件slowdown。
+  injection: 只覆盖测试GPU已有当前温度或余量字段，采用现场真实同刻度限值，不伪造硬件阈值。
+  expected: [实际只读诊断完成, TLimit有效时无重复绝对fallback故障, 无STOP隔离且缺型号变体明确未执行]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-003
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-LIVE-004
+  title: 真机遥测回放持续严重温度到人工复核
+  category: gpu-environment-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: 软件替身不能证明真实调度隔离和测试任务停止。
+  injection: 核心绝对温度TLimit和显存分别三次有效越界，真实GPU保持安全温度。
+  expected: [前两次不STOP第三次确认, 实际cordon停正确任务quarantine取证及通知, 冷却超过300秒仍隔离且无自动reset或reboot]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-004
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-LIVE-005
+  title: 真机遥测回放瞬时异常与重复记录
+  category: gpu-environment-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: 一次异常重复投递不能被算成三次确认。
+  injection: 回放一次或两次严重值后清除，并通过受检入口验证batch重试。
+  expected: [清除穿过边缘过滤, 重复记录与warning历史不推进严重确认, 无停训且再次持续异常仍能触发]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-005
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-LIVE-006
+  title: 真机遥测回放热duration和复合warning
+  category: gpu-environment-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: duration和降频位不能单独升级硬件动作。
+  injection: 在安全真实温度下回放有单位记录的duration与0x20或0x40，再叠加warning温度。
+  expected: [实际只读诊断, 没有STOP压测reset或reboot, 停止增量后验证完成且不要求累计计数归零]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-006
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-LIVE-007
+  title: 真机遥测回放Power Brake持续确认和供电复核
+  category: gpu-environment-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: 普通power cap与外部Power Brake不能混淆。
+  injection: 使用power-brake计划回放目标GPU原因位，另测普通位及混合位，不动电源。
+  expected: [瞬时与普通位不误判, 持续0x80触发真实隔离停训及供电检查通知, 无reboot或自动接纳且热warning不能降级brake]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-007
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-LIVE-008
+  title: 真机字段不可用和新旧别名
+  category: gpu-environment-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: blank或缺字段不能被解释为硬件brake或健康。
+  injection: 省略原因位或回放非整数和blank；不同实际exporter版本分别验证别名能力。
+  expected: [缺失或非法值报告UNKNOWN, 不生成虚假隔离或STOP, 未具备的版本或冲突变体明确NOT_RUN]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-008
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-LIVE-009
+  title: 真机采集间断重启和来源切换
+  category: gpu-environment-live
+  level: end-to-end
+  risk: live-service-action
+  problem: 数据间断和来源变化不能继承旧严重确认次数。
+  injection: 受检单节点维护暂停采集造成大于60秒间隔，另测collector重启和真实采集模式切换。
+  expected: [重新计算有效确认, 始终只有一个producer且缺测不是健康, 记录跨boot未执行边界而不主动重启节点]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-009
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-LIVE-010
+  title: 多GPU真机作用域并发与通知去重
+  category: gpu-environment-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: 单GPU异常不能停止无关任务或重复执行STOP。
+  injection: 多GPU和对照节点上只改变一个GPU的字段，并发投递同一故障。
+  expected: [对照指标未改且独立任务不受影响, 合法停止覆盖受影响分布式任务而非只停单rank, 工作流和通知去重并记录完整回执]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-010
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-LIVE-011
+  title: 真机遥测回放绝对关机温度单样本保护
+  category: gpu-environment-live
+  level: end-to-end
+  risk: live-workload-restart
+  problem: 绝对关机温度保护不应等待三次确认。
+  injection: 仅在真实XML支持绝对shutdown阈值的测试节点回放当前核心温度越界，禁止物理加热。
+  expected: [一个有效样本进入保护, 真实隔离停训取证人工复核, 不用TLimit offset替代且不宣称完成物理关机试验]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-011
+  evidence: {verdict: NOT_RUN}
+- id: GF-ENV-LIVE-012
+  title: 自然或厂商实验室物理环境故障验证
+  category: gpu-environment-live
+  level: end-to-end
+  risk: destructive
+  problem: 真机遥测回放不能证明物理传感器检测和根因修复。
+  injection: 仅消费自然故障或由厂商提供并批准的实验室注入，不提供破坏散热或供电的通用命令。
+  expected: [未经修改的多来源证据确认真实故障, 实际隔离停训及通知, 厂商修复后授权负载验证和人工接纳且无条件则NOT_RUN]
+  automation: manual
+  procedure: docs/components/gpu-environment-live-acceptance.md#gf-env-live-012
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-FIX-016
+  title: 严重内核日志停止归属任务后隔离
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 数据损坏风险的内核故障不能只禁止新调度而放任原任务继续。
+  injection: 软件 API 输入四类可信内核日志与新鲜 attempt 观察，运行真实执行器和隔离适配器。
+  expected: [STOP 的 workload scope 匹配归属任务, 随后实际隔离客户端节点, 不进行真实集群操作]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_fatal_host_log_stops_the_owned_attempt_before_quarantine
+- id: GF-GENERAL-FIX-017
+  title: 普通应用错误保留证据并由watcher处理退出
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 普通应用错误不能再建立一条与watcher竞争的诊断链。
+  injection: journal PID 匹配已观察容器，输入 NCCL 错误并验证仅保留日志证据。
+  expected: [保留 attempt 和进程状态, 不创建故障marker或诊断workflow, 退出处理归watcher]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_application_log_preserves_attribution_and_watcher_ownership
+- id: GF-GENERAL-FIX-018
+  title: 持续热故障隔离后人工验证冷却系统
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 停训后的空闲降温不能证明散热故障已经修复。
+  injection: 原始DCGM文本连续三次越界触发隔离，再提供多次冷却后的温度。
+  expected: [连续有效样本才确认, 降温后仍保留隔离并等待人工复核, 不自动reset或reboot或重启训练]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_confirmed_thermal_fault_requires_review_after_cooling
+- id: GF-GENERAL-FIX-018-UNKNOWN
+  title: 缺测打断持续热故障确认
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: UNKNOWN 不能算作连续异常的有效观测。
+  injection: 高温采样之间插入一次 exporter 缺字段，再恢复数据。
+  expected: [连续确认从新成功观测重新开始, 未确认前不停止训练, 不重启 GPU 或节点]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_unknown_observation_breaks_thermal_confirmation
+- id: GF-GENERAL-FIX-019
+  title: DBE 停训分析而非自动 RMA
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 单独 volatile DBE 不能自动宣告需要更换 GPU。
+  injection: GPU metrics API 上报 DBE，执行停止归属任务与节点隔离。
+  expected: [任务停止且保留隔离, 不盲目重新启动任务, 不将 DBE 单独转为 RMA]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_uncorrectable_ecc_stops_for_analysis_without_automatic_rma
+- id: GF-GENERAL-FIX-020
+  title: NVLink counter 诊断不自动恢复硬件
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 可恢复 counter 增量不等同物理链路损坏。
+  injection: 有效基线后增加 NVLink CRC 计数并运行诊断工作流。
+  expected: [真实执行验证器, 不调用 DCGM 压测或 reset, 保持原任务与调度状态]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_counter_diagnostics_never_dispatch_hardware_recovery[nvlink]
+- id: GF-GENERAL-FIX-022
+  title: PCIe replay 速率越界执行只读诊断
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: PCIe counter 单独越界没有授权硬件重启。
+  injection: 有效时间分母上的 replay 增量超过 8/min，运行真实验证器。
+  expected: [创建只读诊断链, 保留速率证据, 不升级硬件动作]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_counter_diagnostics_never_dispatch_hardware_recovery[pcie]
+- id: GF-GENERAL-FIX-023
+  title: 正常功率限制告警不误作热故障
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 高利用率贴近 power cap 不等于热损坏。
+  injection: 有效 violation 占空比、功率上限和高利用率，经 API 执行诊断。
+  expected: [形成性能诊断, 不进行热故障 DRAIN, 不停任务或复位硬件]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_counter_diagnostics_never_dispatch_hardware_recovery[power]
+- id: GF-GENERAL-FIX-023-BRAKE
+  title: 硬件Power Brake与普通功率限制分开处理
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 外部供电限制不能按普通power cap忽略，也不能以reboot修复。
+  injection: 原始DCGM文本依次注入0x04和三个0x80相关mask，执行真实工作流与隔离适配器。
+  expected: [普通power cap不隔离, 持续Power Brake隔离并人工复核供电, 不执行reset或reboot或恢复训练]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_power_brake_is_not_power_cap_and_never_reboots_the_node
+- id: GF-GENERAL-FIX-024
+  title: 可纠正内存复合信号不独立授权 DRAIN
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 多个可纠正计数器相关不证明坏卡。
+  injection: 同卡多个 corrected-memory counter 增长，运行复合诊断工作流。
+  expected: [保留复合证据, 只读验证不压测或重启, 不因诊断失败触发硬件阶梯]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_counter_diagnostics_never_dispatch_hardware_recovery[correctable-composite]
+- id: GF-GENERAL-FIX-025
+  title: DCGM 观测恢复闭环
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 采集不完整不能升级成 GPU 硬件故障。
+  injection: exporter 连续错误达到窗口，执行新快照请求，再恢复成功采样。
+  expected: [错误期间保持等待, 只触发一次快照命令, 新成功数据后完成且节点不隔离]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_incomplete_gpu_collection_refreshes_observation_without_hardware_ladder
+- id: GF-GENERAL-FIX-027
+  title: NaN 停止归属任务且不盲信 checkpoint
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 无效训练状态不能通过健康 Fabric 自动放行。
+  injection: 已归属 rank 报 numerical_error 和未验证 checkpoint 引用。
+  expected: [只停止正确 attempt, 取证并请求人工验证 checkpoint, 不自动重启或隔离 GPU 节点]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_nonfinite_loss_stops_only_its_attempt_and_does_not_restart_bad_checkpoint
+- id: GF-GENERAL-FIX-027-HUNG
+  title: hung 恢复必须看原 rank 新应用进度
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 健康 GPU/Fabric 不能替代停滞任务本身的恢复证据。
+  injection: 心跳继续而 step 停滞，经扫描 API 执行 triage，随后仅恢复该 rank 的 step。
+  expected: [无应用进度时持续等待, 原 attempt rank 新有效进度才完成, 全程不停任务]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_general_health_policy_e2e.py::test_hung_validation_requires_new_application_progress_not_healthy_fabric
+- id: GF-GENERAL-FIX-030
+  title: 热备 NotReady 只阻止分配而不推断硬件坏
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: readiness 失败可能由控制面或监控故障引起。
+  injection: 本地 Kubernetes provider 夹具连续报告 NotReady，运行真实热备控制器。
+  expected: [保持 SUSPECT 和不可调度, 不创建 reboot 工作流, 未捏造硬件证据]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_observation_recovery_e2e.py::test_not_ready_spare_does_not_invent_hardware_reboot
+- id: GF-GENERAL-FIX-031
+  title: 静默采集器有界刷新与新鲜成功确认
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 无成功上报不能被当作健康，重复扫描不能无限派发修复。
+  injection: 有效 Agent lease 下缺必需通道，重复扫描后执行刷新，再更新成功观测。
+  expected: [每节点小时一个工作流, 只派发一次快照请求, 所需通道新成功后才完成且不隔离]
+  automation: pytest
+  pytest_nodeid: tests/execution/test_observation_recovery_e2e.py::test_silent_collector_refresh_is_bounded_and_requires_fresh_success
+- id: GF-GENERAL-SW-001
+  title: CPU 内存和 swap 从原始采集到真实验证的软件端到端
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 计划正确不能证明原故障被复查，CPU 和 memory 还必须经过持续窗口。
+  injection: 临时 procfs 经真实 collector 和 API，保持异常或恢复后执行真实验证器。
+  expected:
+  - CPU 和 memory 在 120 秒前不因该规则生成 workflow，swap 按独立规则处理
+  - 三个指标各覆盖仍异常与恢复两种结果，不发生硬件升级
+  - SQLite 保存真实 step executions；OS 输入是 fixture，不宣称真机验收
+  automation: pytest
+  pytest_nodeid: tests/host_health/test_general_fault_observation_e2e.py::test_resource_fault_reaches_real_validation
+- id: GF-GENERAL-SW-002
+  title: 主机故障从采集到 Kubernetes 隔离适配器的软件端到端
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 分类或计划测试不能证明实际 cordon 和 taint。
+  injection: 临时 statvfs、SMART/BMC 输出和 net sysfs 进入真实 collector、API、executor 和 Kubernetes adapter。
+  expected:
+  - 五种输入均生成并执行隔离链，最终 incident QUARANTINED
+  - 实际适配器修改本地客户端节点状态，并保留 provider taint
+  - 重复采样不重复建链，不执行真实 Kubernetes 或 GPU 操作
+  automation: pytest
+  pytest_nodeid: tests/host_health/test_general_fault_observation_e2e.py::test_hardware_fault_reaches_real_quarantine_adapter
+- id: GF-GENERAL-SW-003
+  title: 主机查询失败从采集到 API 不误隔离的软件端到端
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 不能把采集器没有读到结果视为真实硬件故障。
+  injection: SMART 查询失败、BMC 查询失败和 net unknown 分别连续采样并送入 API。
+  expected:
+  - collection_errors 保留，不创建恢复 workflow，不隔离节点
+  - 不用预制 finding 或固定成功的验证函数代替真实链路
+  automation: pytest
+  pytest_nodeid: tests/host_health/test_general_fault_observation_e2e.py::test_observation_failure_does_not_isolate_node
+- id: GF-GENERAL-E2E-001
+  title: CPU 过载
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-non-destructive
+  problem: 核对持续检测到实际验证及应用阶段归因缺口。
+  injection: 原始 CPU 和 load 快照越界，分别保持不足和达到 120 秒。
+  expected: [真实验证区分持续异常与恢复, 短突发不触发该规则, 不升级硬件动作]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-001
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-002
+  title: 内存/交换耗尽
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-non-destructive
+  problem: memory 与 swap 的窗口和任务归因不能混用。
+  injection: 原始 meminfo 分别造成 memory 与 swap 压力并恢复。
+  expected: [按各自持续窗口检测, 实际复查原始指标, 缺 cgroup 归因保留整改缺口]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-002
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-003
+  title: 低利用率/资源持续异常
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-service-action
+  problem: 活跃 attempt 与 GPU 范围必须可信，低利用率不必然是硬件问题。
+  injection: 唯一受管 attempt 的五类持续异常和 IDLE、换 attempt、未分配 GPU 负向。
+  expected: [执行对应诊断, 窗口不跨 attempt, 阶段和共享 GPU 缺口不得标通过]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-003
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-004
+  title: 本地磁盘满
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-isolation
+  problem: 必须验实际隔离，字节容量不能证明 inode 健康。
+  injection: 独立测试挂载 statvfs 99% 与健康、重复、inode 变体。
+  expected: [执行 cordon 和 quarantine, 当前不停止原任务, 清理与验证后恢复]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-004
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-005
+  title: 共享存储不可用/满
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-non-destructive
+  problem: statvfs 可用不能证明 checkpoint 读写可用。
+  injection: 独立共享挂载超时、容量满、恢复及 statvfs 正常但 I/O 失败。
+  expected: [采集有界, 验证绑定故障挂载, 未实现真实 I/O 探针保留缺口]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-005
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-006
+  title: 磁盘 IO 饱和
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-non-destructive
+  problem: checkpoint 的短 flush 不等同磁盘故障。
+  injection: diskstats 基线和持续 120 秒的 util 或 await 异常。
+  expected: [不足窗口不触发, 实际验证正确设备, reset 和零 IO 分母不误报]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-006
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-007
+  title: SMART 失败
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-isolation
+  problem: 自检失败与查询失败、扫描失败需要不同判据。
+  injection: 原始 SMART JSON 自检失败、查询损坏、扫描失败和健康变体。
+  expected: [真实自检失败执行隔离, 查询失败不冒充硬件失败, scan 处理缺口单独记录]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-007
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-008
+  title: 网卡链路 down
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-isolation
+  problem: 接口缺失和读数不可得不能混为一谈。
+  injection: 必需网卡消失、down、unknown、统计损坏与目录读取失败。
+  expected: [确认 down 或消失后实际隔离, unknown 不隔离, 保留独立有效链路证据]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-008
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-009
+  title: 网卡错误/丢包
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-non-destructive
+  problem: 错误计数与正常 TCP 拥塞不能混用。
+  injection: errors 增量、持续 drops、仅 TCP 重传、counter reset。
+  expected: [按正确窗口诊断, 实际验证原接口, 不直接判硬件坏或 reboot]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-009
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-010
+  title: EFA/RDMA 计数错误
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-non-destructive
+  problem: RNR、retry、CQ 与链路错误的意义不相同。
+  injection: 各类真实格式计数器逐个增量及缺失、回退、恢复。
+  expected: [执行 Fabric 验证, 不以另一端口健康覆盖原问题, 语义分级缺口单列]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-010
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-011
+  title: EFA 流量状态机
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-non-destructive
+  problem: 生成 hung 计划不证明 triage、诊断包和 Fabric 分支已经执行。
+  injection: 活跃训练的完整计数器对持续低流量，附并发、多节点和 Flight Recorder 关闭变体。
+  expected: [真实执行取证分支, 记录全任务分母及实采数, 不隔离或重启训练, 缺数据不当零]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-011
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-012
+  title: GPU 掉卡
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive-provider-reboot
+  problem: 查询失败不等同完整枚举确认的 GPU 缺失。
+  injection: 完整 UUID 库存从期望数减少，另测超时、失败和期望数错配。
+  expected: [连续有效证据才确认, reboot 有 provider 和新 boot ID 证据, 验证后才能恢复]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-012
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-013
+  title: EFA 掉卡
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive-provider-reboot
+  problem: PCI、driver、link、unknown 的恢复路径必须分开。
+  injection: 各类 inventory 异常独立运行到执行段，读取失败单列。
+  expected: [按已知原因分层恢复, 未知和超额不授权 reboot, rebind 保底与恢复验证完整]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-013
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-014
+  title: K8s allocatable 少报
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive-provider-reboot
+  problem: plugin 资源注册故障不能直接归因物理设备消失。
+  injection: GPU/EFA 物理库存正常但 allocatable 不足，分别测恢复和验证失败。
+  expected: [先重启目标 plugin, 等待正确 expected_count, 原训练继续推进, 失败升级须有授权]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-014
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-015
+  title: BMC 传感器告警
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-isolation
+  problem: 状态列解析与不可读传感器不能产生假健康或假隔离。
+  injection: 四列标准输出 cr、nr、ok 以及查询失败和损坏行。
+  expected: [读第四列状态, 真告警执行隔离, 查询失败不等于健康, 传感器分级缺口保留]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-015
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-016
+  title: 日志 MCE 存储只读 RDMA 致命及内核 lockup
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-workload-restart
+  problem: 可信严重内核故障与应用仿冒日志不能共享硬件结论。
+  injection: journal 原始记录分别命中四类，再由训练 stdout 回放相同文本。
+  expected: [可信故障先停止归属任务再隔离, 不可信及旧boot来源不授权硬件动作, 未归属任务不猜测停止对象]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-016
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-017
+  title: 日志 OOM NCCL 及 torch.distributed 错误
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-non-destructive
+  problem: 报错 rank 不一定是根因，任务归属与进程状态要保留。
+  injection: 三类应用日志配合存活和退出两种状态、旧 attempt 负向。
+  expected: [真实执行只读诊断, 不因应用报错直接 reset, 应用证据缺口单列]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-017
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-018
+  title: GPU 温度
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive
+  problem: 正负 T.Limit、绝对温度及临时热故障不能混用。
+  injection: 原始 DCGM/XML 的 warning、critical、缺失温标及冷却恢复。
+  expected: [温标比较正确并要求连续严重样本确认, 验证实际诊断或隔离, 冷却不自动接纳而需人工检查散热]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-018
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-019
+  title: GPU ECC 行重映射及页退役
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive
+  problem: 不同 GPU 架构和错误类型不能共用未经验证的恢复结论。
+  injection: 每架构分别回放 ECC、retirement、pending 和 remap failure。
+  expected: [实际执行对应诊断或恢复, OBSERVE 拒绝未授权操作, reset 后重新查恢复状态]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-019
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-020
+  title: NVLink 错误计数
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive
+  problem: 单次可纠正错误与不可恢复链路故障需要分别验收。
+  injection: 各种 NVLink counter 增量、reset、陈旧批次和多卡同时异常。
+  expected: [counter独立触发只读诊断而非DRAIN, 致命Xid或SXid另按恢复策略, 不重复或扩大错误作用域]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-020
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-021
+  title: NVLink fabric 未训练及 Fabric Manager 失败
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive
+  problem: 状态触发的全 fabric reset 不能由 solo Xid45 测试代替。
+  injection: 受支持型号状态 1/2/4 持续到 300 秒及不受支持型号负向。
+  expected: [节点级去重, 完整 reset 和服务恢复, 每卡 Success 后才能恢复调度]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-021
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-022
+  title: PCIe replay
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive
+  problem: 速率门槛与 Xid 的设备及时间相关性必须完整验证。
+  injection: 8/min 边界和越界，叠加同卡或异卡、过期 Xid32/79。
+  expected: [单独越界只诊断, 可信同卡联合才升级, 保存 PCIe 与 AER 证据]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-022
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-023
+  title: 降频热违规及功耗
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive
+  problem: 正常 power cap、微小计数增长与热异常不能混为故障。
+  injection: 原始占空比、热 reason、power limit、非法超墙钟和 reset 变体。
+  expected: [分别验证采集过滤和控制面判断, 正常功率限制不误作热故障, 清理恢复默认 power limit]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-023
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-024
+  title: DCGM 复合规则
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive
+  problem: 相关性不能证明根因，component 不能重复派发。
+  injection: 各复合规则正向及异卡、过窗、乱序和 counter reset。
+  expected: [45 秒窗口与持续次数正确, 实际动作去重, 组件和复合恢复状态均可追踪]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-024
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-025
+  title: DCGM 采集不完整
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-service-action
+  problem: 缺观测不能被认为 GPU 健康或坏卡。
+  injection: 缺字段、抓取超时、部分 GPU 丢失和完整恢复批次。
+  expected: [有效数据和采集错误共存, 新完整数据才能清除错误, UNKNOWN 与监控修复缺口保留]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-025
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-026
+  title: GPU 身份变化及期望数未知
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-service-action
+  problem: 身份变化和未知期望值不是相同故障。
+  injection: 同数量更换 UUID/BDF、未知机型和旧 boot 的库存记录。
+  expected: [分别诊断或取证, 不猜测 expected_count, 不让旧 identity 覆盖当前库存]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-026
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-027
+  title: 训练进度
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-workload-restart
+  problem: NaN、应用挂起与 Fabric 故障不能共用修复证明。
+  injection: reporter 产生非有限 loss、心跳过期、步数停滞或回退及 straggler。
+  expected: [按 job 和 attempt 归属, 实际执行当前诊断, 应用级恢复未实现的目标保留 BLOCKED]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-027
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-028
+  title: 训练进程失败及 attempt 终态
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-workload-restart
+  problem: watcher 观察的自然退出不能由直接写入终态测试替代。
+  injection: 关键容器非零退出、用户停止、控制面停止和旧 attempt 事件。
+  expected: [实际停止与日志取证, 预算内只重启一次, 旧事件不影响新 attempt]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-028
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-029
+  title: 重启预算耗尽
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive
+  problem: 预算耗尽只能阻止任务重启，不能跳过必要硬件恢复。
+  injection: 消耗一次预算后触发带恢复与 restart 的真实故障链。
+  expected: [其他恢复步骤继续, RESTART_WORKLOAD 不执行, 一次通知且无虚假预算释放]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-029
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-030
+  title: 热备节点不健康
+  category: general-fault-e2e
+  level: end-to-end
+  risk: destructive-provider-reboot
+  problem: 配置或观测失败不应直接归因硬件坏。
+  injection: 独立 spare 的 Ready、硬件 marker、配置和遥测异常。
+  expected: [连续确认与 provider 回执完整, 失败后 UNAVAILABLE 和有界复查, 不触及别的任务保留节点]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-030
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-031
+  title: 采集器静默
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-service-action
+  problem: Agent 在线时单通道静默不能被认为健康。
+  injection: 仅停止必需通道上报，保持有效 lease，随后恢复。
+  expected: [通道阈值和扫描延迟明确, advisory 去重并真实发送, disabled 和过期 Agent 不误报]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-031
+  evidence: {verdict: NOT_RUN}
+- id: GF-GENERAL-E2E-032
+  title: 未知 XID 未知 GPU 产品及缺证据
+  category: general-fault-e2e
+  level: end-to-end
+  risk: live-isolation
+  problem: 未知恢复语义不授权硬件动作，普通 Xid 又不能被 linkage 版本误阻塞。
+  injection: kernel collector 原始未知错误、未知产品、缺拓扑与已知旧驱动变体。
+  expected: [按 Profile 执行安全隔离, 未知不 reset 或 reboot, 已知旧驱动保持原始动作]
+  automation: manual
+  procedure: docs/components/general-fault-e2e-audit.md#gf-general-e2e-032
+  evidence: {verdict: NOT_RUN}
+- id: GF-HOST-OBS-001
+  title: 主机内存采集到 API 和针对性验证的软件闭环
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: swap 等触发指标过去未持久化，其他主机指标健康可能掩盖原故障。
+  injection: 临时 meminfo 中设置高 swap 使用率，通过真实 collector、API 和工作流执行器，分别保持异常和恢复。
+  expected:
+  - 工作流绑定原始 swap 指标、节点、设备、阈值和事件时间
+  - 异常仍存在时验证失败，恢复后验证成功
+  - 不执行真实集群操作或硬件恢复
+  automation: pytest
+  pytest_nodeid: tests/host_health/test_host_diagnostic_e2e.py::test_swap_fault_from_collector_to_api_and_real_validation
+
+- id: GF-HOST-OBS-002
+  title: 无效或重置的 EFA 计数器不能变成零流量
+  category: host-health
+  level: integration
+  risk: non-destructive
+  problem: 部分方向不可读时，剩余有效方向不能证明节点流量为零。
+  injection: 在临时 sysfs 中依次使 RX 非数字、缺失或回退。
+  expected:
+  - efa_traffic_observation_valid 为零
+  - 不发布 efa_traffic_bytes_per_second
+  - collection_errors 保留读取或重置原因
+  automation: pytest
+  pytest_nodeid: tests/collectors/test_host_observation_validity.py::test_incomplete_traffic_pair_is_unknown_not_zero
+
+- id: GF-HOST-OBS-003
+  title: EFA PCI 标识读取失败不生成掉卡重启
+  category: host-health
+  level: integration
+  risk: non-destructive
+  problem: vendor/device 无法读取不能证明 PCI device missing。
+  injection: 临时 PCI 树上模拟 vendor 权限错误并连续采样。
+  expected:
+  - 不发布掉卡 mismatch，不建议 reboot
+  - 观测异常被记录且不能推进连续掉卡计数
+  automation: pytest
+  pytest_nodeid: tests/collectors/test_host_observation_validity.py::test_unreadable_efa_identity_never_authorizes_reboot
+
+- id: GF-HOST-OBS-004
+  title: EFA 流量脚本完整 main 入口生成真实诊断计划
+  category: closed-loop
+  level: integration
+  risk: non-destructive
+  problem: 仅验证预制 DAG 无法发现脚本启动配置和 EFA 设备夹具失效。
+  injection: 隔离环境启动脚本 main，以临时 EFA 计数器和 loopback API 完成所有流量阶段。
+  expected:
+  - SPIKE 和 HUNG 阶段实际产生 finding，脚本 PASS
+  - 工作流包含轻量诊断、诊断包和 Fabric 验证
+  - step_executions 为空，明确只证明检测和计划，不代表真机恢复
+  automation: pytest
+  pytest_nodeid: tests/regional/test_efa_traffic_harness_main.py::test_efa_counter_harness_runs_its_real_main_with_isolated_api
+
+- id: GF-E2E-XID-LINKAGE-001
+  title: 原始 Xid 在旧版或缺失 linkage 版本信息时仍完成恢复
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: Xid 154 linkage 曾被误作原始 Xid 的最低驱动和 CUDA 版本要求。
+  injection: 在隔离 SQLite 和模拟硬件边界中，经事件 API 提交 H100 Xid 95 的旧版、缺失版本、边界版本，以及旧版 Xid 48。
+  expected:
+  - 四个变体均为 EXECUTABLE，原始动作保持 RESET_GPU
+  - 真实工作流执行器经签名 Node Action 调用真实 Agent 和本地账本
+  - 停止任务并关闭目标 persistence 后才调用模拟 reset，恢复后 incident 为 RECOVERED
+  - 不连接真实集群，不执行真实 GPU reset
+  automation: pytest
+  pytest_nodeid: tests/execution/test_xid_recovery_e2e.py::test_linkage_does_not_block_original_xid_recovery
+
+- id: GF-E2E-DRAIN-P2P-001
+  title: Drain P2P 读回动作、恢复顺序与重复投递
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 停止 P2P 用户后必须重新查询驱动，且不能在验证完成前恢复训练。
+  injection: 经事件 API 提交原始 Xid 154 Drain P2P 日志；模拟驱动分别读回 None、Reset、Drain and Reset、Drain P2P。
+  expected:
+  - 原始日志由服务端解析，关联窗口关闭后才生成可执行工作流
+  - 任务停止前无节点动作，关闭 persistence 后才查询恢复动作
+  - None 不 reset，其他三个动作仅 reset 目标 GPU，Fabric Manager 保持运行
+  - 重复事件复用工作流，重复签名命令由真实账本返回且不重复查询或 reset
+  - GPU/Fabric 验证等待期间不恢复调度或任务，验证后仅重启一次任务
+  automation: pytest
+  pytest_nodeid: tests/execution/test_xid_recovery_e2e.py::test_drain_p2p_orders_release_query_recovery_and_readmission
+
+- id: GF-E2E-DRAIN-P2P-002
+  title: Drain P2P 读回 Reboot 后走节点重启升级路径
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 驱动要求节点重启时不能以 GPU reset 代替。
+  injection: 原始 Drain P2P 事件经 API 和关联窗口生成工作流，模拟驱动读回 Reboot。
+  expected:
+  - Agent 的 gpu_recovery_reboot_required 经过 adapter 回传并触发真实升级逻辑
+  - GPU reset 调用为零，模拟 provider 的 RESTART_NODE 调用一次
+  - 服务恢复和验证后才恢复任务；不执行真实节点重启
+  automation: pytest
+  pytest_nodeid: tests/execution/test_xid_recovery_e2e.py::test_drain_p2p_reboot_is_escalated_without_gpu_reset
+
+- id: GF-E2E-DRAIN-P2P-003
+  title: Drain P2P 证据缺失和超时不得误恢复训练
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 无效读回和未知 reset 结果不能授权节点重启或任务恢复。
+  injection: 在真实软件执行链的命令边界分别模拟 N/A、缺失目标 GPU、persistence 未关闭、查询超时和 reset 超时。
+  expected:
+  - 所有变体均不恢复调度、不重启训练、不自动重启节点
+  - 前四种情况没有 GPU reset 调用
+  - reset 超时仅调用一次并保留 outcome_unknown，工作流 BLOCKED；既有失败补偿允许恢复服务，但不解除调度隔离和人工确认要求
+  automation: pytest
+  pytest_nodeid: tests/execution/test_xid_recovery_e2e.py::test_drain_p2p_unproven_recovery_never_restarts_training
+
+- id: GF-E2E-DRAIN-P2P-004
+  title: 空闲节点执行 Drain P2P 时不虚构训练任务
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 空闲节点仍需查询恢复动作，但不应等待不存在的训练任务。
+  injection: 经 API 提交 workload_state=IDLE 的 Drain P2P 原始日志。
+  expected:
+  - 执行 persistence 释放和恢复动作查询
+  - 无 STOP_WORKLOADS 和 RESTART_WORKLOAD，软件工作流成功结束
+  automation: pytest
+  pytest_nodeid: tests/execution/test_xid_recovery_e2e.py::test_drain_p2p_idle_node_has_no_workload_stop_or_restart
+
+- id: GF-E2E-DRAIN-P2P-005
+  title: 未授权新 operation 的 Agent 拒绝 Drain P2P 恢复
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 混合版本或未更新允许操作清单不能静默退化为无条件 reset。
+  injection: 从隔离 Agent 的 allowed_operations 删除 RECOVER_DRAIN_P2P 后执行完整事件链。
+  expected:
+  - 软件工作流不得报告成功
+  - 不 reset、不自动重启节点、不恢复训练
+  - 此用例验证允许操作清单拒绝，不代表实际旧版本混部已经验证
+  automation: pytest
+  pytest_nodeid: tests/execution/test_xid_recovery_e2e.py::test_drain_p2p_unsupported_agent_operation_fails_closed
+
+- id: GF-E2E-DRAIN-P2P-UVM
+  title: 独立 UVM persistence 关闭及真机恢复验收缺口
+  category: closed-loop
+  level: end-to-end
+  risk: non-destructive
+  problem: 普通 persistence_mode=Disabled 不能证明 UVM persistence 已关闭。
+  injection: 不执行故障注入；独立 UVM persistence 检测和关闭尚未实现。
+  expected:
+  - 保留 BLOCKED，不用模拟 XML 或普通 persistence 读数作为 UVM 关闭证明
+  - 实现完成并具备隔离维护窗口后，另行审查破坏性风险和独立恢复方案
+  evidence:
+    verdict: BLOCKED
+  automation: manual
+  procedure: docs/components/xid154-recovery-e2e.md#uvm-persistence-gap
+
 - id: GF-POL-HYPERPOD-RESTART-VM-001
   title: HyperPod RESTART_VM 映射为节点 reboot
   category: xid-policy
@@ -893,17 +2071,17 @@ test_cases:
   pytest_nodeid: tests/policy/test_policy.py::test_check_uvm_requires_evidence_and_follows_official_branch
 
 - id: GF-POL-011
-  title: 驱动版本低于 Catalog 最低要求
+  title: Xid 154 linkage 不限制原始 Xid 的驱动版本
   category: xid-policy
   level: component
   risk: non-destructive
-  problem: 旧驱动和 CUDA 版本不能使用新 Catalog 动作。
+  problem: linkage 描述 Xid 154 报告关联，不能用来阻断原始 Xid。
   injection: 使用 driver 550 和 CUDA 12.6 注入 XID 95。
   expected:
-  - disposition 为 NOT_APPLICABLE
-  - 不执行恢复动作
+  - disposition 为 EXECUTABLE
+  - 原始 Xid 95 保持 RESET_GPU，不追加版本不满足隔离动作
   automation: pytest
-  pytest_nodeid: tests/policy/test_policy.py::test_catalog_minimum_version_is_enforced
+  pytest_nodeid: tests/policy/test_policy.py::test_xid154_linkage_does_not_disable_older_driver_faults
 
 - id: GF-XID-001
   title: NVIDIA 官方 kmsg 格式 XID 14 采集闭环
@@ -1113,7 +2291,7 @@ test_cases:
   pytest_nodeid: tests/metrics/test_gpu_metrics.py::test_temperature_uses_device_limits_and_escalates
 
 - id: GF-MET-008
-  title: Thermal violation连续增长升级
+  title: Thermal violation连续增长仍仅诊断
   category: gpu-metrics
   level: component
   risk: non-destructive
@@ -1121,10 +2299,10 @@ test_cases:
   injection: 建立counter baseline后连续两次增加，再注入不变值。
   expected:
   - 第一次增长运行诊断
-  - 第二次连续增长升级为DRAIN
+  - 连续增长不单独授权DRAIN
   - counter不再增长时清除活动finding
   automation: pytest
-  pytest_nodeid: tests/metrics/test_gpu_metrics.py::test_thermal_violation_escalates_after_consecutive_growth
+  pytest_nodeid: tests/metrics/test_gpu_metrics.py::test_thermal_violation_stays_diagnostic_after_consecutive_growth
 
 - id: GF-MET-009
   title: nvidia-smi XML温度限制解析
@@ -1226,7 +2404,7 @@ test_cases:
   pytest_nodeid: tests/execution/test_node_action.py::test_node_action_adapter_interprets_dcgm_diagnostic_outcome
 
 - id: GF-MET-016
-  title: 高温与thermal clock throttle联合升级
+  title: 温度warning与thermal throttle相关不越权升级
   category: gpu-metrics
   level: component
   risk: non-destructive
@@ -1236,10 +2414,10 @@ test_cases:
   - 首次生成THERMAL_STRESS warning并运行diagnostics
   - 保留SM/memory clock性能上下文
   - GPU validation在grace内等待全部thermal warning清除
-  - 默认连续第二次升级为DRAIN
+  - 连续相关仍只诊断，不能高于已确认温度组件的动作
   - 原始温度和throttle finding不重复触发workflow
   automation: pytest
-  pytest_nodeid: tests/metrics/test_gpu_metrics.py::test_thermal_clock_throttling_composite_escalates
+  pytest_nodeid: tests/metrics/test_gpu_metrics.py::test_thermal_warning_composite_does_not_escalate
 
 - id: GF-MET-017
   title: 低负载低主频不误报热故障
@@ -1332,7 +2510,7 @@ test_cases:
   expected:
   - 首次生成CORRECTABLE_MEMORY_DEGRADATION Warning
   - 第二次保持Warning且不重复触发workflow
-  - 默认第三次升级Critical/DRAIN
+  - 默认第三次升级Critical但仍为RUN_DIAGNOSTICS，不独立授权DRAIN
   - component finding保留但不单独触发workflow
   automation: pytest
   pytest_nodeid: tests/metrics/test_gpu_metrics.py::test_correctable_memory_trend_escalates_after_three_samples
@@ -1345,11 +2523,11 @@ test_cases:
   problem: retired DBE page counter新增表示发生不可纠正显存错误。
   injection: baseline后将retired_pages_dbe_total增加1。
   expected:
-  - 生成Critical finding
-  - action为DRAIN
+  - 生成Warning finding
+  - action为RUN_DIAGNOSTICS，不把新增退役页等同RMA
   - policy source明确为站点策略
   automation: pytest
-  pytest_nodeid: tests/metrics/test_gpu_metrics.py::test_new_retired_dbe_page_is_critical
+  pytest_nodeid: tests/metrics/test_gpu_metrics.py::test_new_retired_dbe_page_requests_diagnostics
 
 - id: GF-MET-025
   title: Corrected-memory Warning validation观察
@@ -6997,19 +8175,13 @@ test_cases:
   - 每例都断言 official_action、disposition 与 action 三元组
   - XID 不在目录判 SITE_SAFETY 加 QUARANTINE
   - 产品族不适用判 NOT_APPLICABLE 且 action 为空
-  - 版本门缺证据判 BLOCKED_MISSING_EVIDENCE，不满足判 NOT_APPLICABLE
-  - 版本门恰好等于边界必须放行，防止把边界写成小于等于
+  - linkage 中的 driver/CUDA 缺失或低于报告关联版本，不得阻断原始 Xid
+  - linkage 边界版本和更高版本保持原始处置，NVLink5 编码所需版本证据仍独立校验
   - immediateAction 为空判 MONITOR_ONLY 加 NO_ACTION
   - WORKFLOW_XID_45、WORKFLOW_XID_48、XID_154、CHECK_UVM 与 NVLINK_ERR 的全部分支各自覆盖
   - 未授权 workflow 判 BLOCKED_WORKFLOW 加 QUARANTINE
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: ae1d7d9a54e4f8f7e6d66f1dfb34344dc93d2c76e3c12ca64d0515511de91efa
-      components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+    verdict: NOT_RUN
   automation: command
   command:
   - python3
@@ -7017,7 +8189,7 @@ test_cases:
   - pytest
   - -q
   - tests/policy/test_policy.py::test_every_catalog_rule_resolves_as_the_catalog_says
-  - tests/policy/test_policy.py::test_version_gate_branches_are_exact
+  - tests/policy/test_policy.py::test_linkage_versions_do_not_gate_original_xid_actions
   - tests/policy/test_policy.py::test_xid_154_covers_every_official_recovery_action
   - tests/policy/test_policy.py::test_xid_154_is_routed_from_the_workflow_table
   - tests/policy/test_policy.py::test_xid_48_exact_workflow_handles_solo_and_63_companion

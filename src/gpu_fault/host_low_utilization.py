@@ -39,7 +39,7 @@ import logging
 import threading
 from collections import OrderedDict
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
 from gpu_fault.models import WorkloadState
 from gpu_fault.store.shared.health_signals import attempt_signal_key
@@ -127,8 +127,16 @@ def node_gpu_ownership(
     return GpuOwnership(listed, "gpu_uuid" if listed else "none", declared, unresolved)
 
 
+class ManagedAttemptScope(Protocol):
+    cluster_id: str
+    node_id: str
+    observed_at: datetime
+    workload_state: WorkloadState
+    affected_workload_ids: list[str]
+
+
 def resolve_managed_attempt(
-    store: Any, batch: HostTelemetryBatch
+    store: Any, batch: ManagedAttemptScope
 ) -> AttemptObservation | None:
     """The one managed attempt live on ``batch``'s node, or ``None``.
 

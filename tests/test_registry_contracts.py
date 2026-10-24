@@ -60,9 +60,11 @@ EXPECTED_CONTAINMENT_ONLY = {
     WorkflowOperation.RESTORE_SCHEDULING,
 }
 EXPECTED_HOST_PROC_ROOT = {
+    WorkflowOperation.COLLECT_HUNG_SUMMARY,
     WorkflowOperation.QUIESCE_GPU_SERVICES,
     WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
     WorkflowOperation.RESET_GPU,
+    WorkflowOperation.RECOVER_DRAIN_P2P,
     WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
     WorkflowOperation.REMEDIATE_DRIVER,
     WorkflowOperation.UPDATE_SOFTWARE_FIRMWARE,
@@ -70,6 +72,7 @@ EXPECTED_HOST_PROC_ROOT = {
 EXPECTED_MAINTENANCE_GENERATION = {
     WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
     WorkflowOperation.RESET_GPU,
+    WorkflowOperation.RECOVER_DRAIN_P2P,
     WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
     WorkflowOperation.RESTORE_GPU_SERVICES,
 }

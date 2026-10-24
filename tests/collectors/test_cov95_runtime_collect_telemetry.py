@@ -294,7 +294,14 @@ def test_nonfinite_metrics_are_ignored_and_collection_failure_clears_after_clean
         update={
             "batch_id": "clean-scrape",
             "observed_at": support.NOW + timedelta(seconds=1),
-            "samples": [],
+            "samples": [
+                GpuMetricSample(
+                    metric_name="temperature",
+                    canonical_name="gpu_temperature_c",
+                    value=40,
+                    gpu_uuid="GPU-a",
+                )
+            ],
             "collection_errors": [],
         }
     )

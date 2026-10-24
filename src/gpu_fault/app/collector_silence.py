@@ -10,6 +10,7 @@ from gpu_fault.collector_requirements import (
     required_collectors_for_agent,
 )
 from gpu_fault.models import AdvisoryNotification
+from gpu_fault.observation_health import record_observation, request_observation_refresh
 from gpu_fault.store import NotFoundError
 from gpu_fault.telemetry import CollectorKind, collector_producer
 
@@ -74,8 +75,24 @@ def notify_silent_collectors(
         for agent in context.store.list_agents(registration.cluster_id):
             if not agent_is_current(agent, observed_at=observed_at):
                 continue
+            unknown = []
             for collector in required_collectors_for_agent(agent):
                 status = statuses.get((agent.node_id, collector))
+                if not _still_watched(
+                    context, registration.cluster_id, agent.node_id, observed_at
+                ):
+                    break
+                reason = record_observation(
+                    context.store,
+                    registration.cluster_id,
+                    agent.node_id,
+                    collector,
+                    status,
+                    observed_at,
+                    thresholds[collector],
+                )
+                if reason:
+                    unknown.append(collector)
                 last_success = status.last_success_at if status is not None else None
                 if (
                     last_success is not None
@@ -124,4 +141,8 @@ def notify_silent_collectors(
                     continue
                 context.advisory_notifications.send(notification.notification_id)
                 sent += 1
+            if unknown and _still_watched(
+                context, registration.cluster_id, agent.node_id, observed_at
+            ):
+                request_observation_refresh(context, agent, unknown, observed_at)
     return sent

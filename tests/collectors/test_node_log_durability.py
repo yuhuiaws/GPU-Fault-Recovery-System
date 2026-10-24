@@ -415,8 +415,8 @@ def test_a_line_the_job_is_still_writing_is_not_delivered_half(
     assert [item.message for item in first.entries] == [f"{MATCHING} first"], (
         f"the unfinished line must wait for its terminator: {first.entries}"
     )
-    assert held == len(complete.encode("utf-8")), (
-        "the offset was committed inside a line nobody had finished writing"
+    assert held == log.stat().st_size - len("ritten later\n"), (
+        "bounded reading commits consumed bytes together with the pending fragment"
     )
     assert [item.message for item in second.entries] == [
         f"{MATCHING} second half written later"
@@ -450,9 +450,12 @@ def test_a_resume_offset_inside_an_unfinished_line_holds_and_says_so(
     assert "has not finished writing" in caplog.text, (
         "a file nothing can be read from has to be reported"
     )
-    assert json.loads(state.read_text())["training_log_files"][str(log)]["offset"] == (
-        resume
-    ), "the offset moved past a line that was never complete"
+    pending = json.loads(state.read_text())["training_log_pending"][str(log)][
+        "physical"
+    ]
+    assert pending["start"] == resume and pending["discard"], (
+        "resynchronization state must survive alongside the consumed-byte offset"
+    )
 
 
 def test_a_new_training_log_with_an_unfinished_tail_records_its_position(

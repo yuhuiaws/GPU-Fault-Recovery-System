@@ -33,6 +33,7 @@ from gpu_fault.gpu_metrics import (
     GpuMetricSource,
 )
 from gpu_fault.gpu_temperature_policy import TLIMIT_READING
+from gpu_fault.collectors.gpu.discovery import read_host_boot_id
 
 LOGGER = logging.getLogger(__name__)
 
@@ -98,6 +99,12 @@ NVIDIA_SMI_REMAP_FIELDS: dict[str, tuple[str, str | None]] = {
     ),
     "remapped_rows.pending": ("row_remap_pending", None),
     "remapped_rows.failure": ("row_remap_failure", None),
+}
+
+NVIDIA_SMI_ENVIRONMENT_FIELDS: dict[str, tuple[str, str | None]] = {
+    "clocks_event_reasons.active": ("clock_throttle_reasons", "bitmask"),
+    "power.limit": ("power_limit_w", "watts"),
+    "temperature.memory": ("memory_temperature_c", "celsius"),
 }
 
 
@@ -182,6 +189,7 @@ class NvidiaSmiMetricsCollector:
         self._consecutive_failures = 0
         self._merged_query_refusals = 0
         self._tlimit_refused = False
+        self._boot_id = read_host_boot_id()
 
     def collect_once(self) -> GpuMetricBatch:
         started_at = self.now()
@@ -195,6 +203,12 @@ class NvidiaSmiMetricsCollector:
         )
         samples = self._collect_samples()
         samples.extend(self._temperature_limits.refresh(started_at, self.runner))
+        samples = [
+            sample.model_copy(
+                update={"labels": {**sample.labels, "source_boot_id": self._boot_id}}
+            )
+            for sample in samples
+        ]
         # Stamped only now: with a slow driver the queries above can take most
         # of a minute, and an ``observed_at`` from the top of the round is the
         # spacing the control plane divides its counter rates by (F6).
@@ -344,6 +358,7 @@ class NvidiaSmiMetricsCollector:
             **NVIDIA_SMI_ECC_FIELDS,
             **NVIDIA_SMI_RETIRED_FIELDS,
             **NVIDIA_SMI_REMAP_FIELDS,
+            **NVIDIA_SMI_ENVIRONMENT_FIELDS,
             **tlimit,
         }
         query_fields = [*self._IDENTITY_FIELDS, *merged]
@@ -368,6 +383,13 @@ class NvidiaSmiMetricsCollector:
             samples.extend(self._query(optional_fields, required=False))
         if tlimit:
             samples.extend(self._query_tlimit())
+        for field, mapping in NVIDIA_SMI_ENVIRONMENT_FIELDS.items():
+            environment = self._query({field: mapping}, required=False)
+            if not environment and field == "clocks_event_reasons.active":
+                environment = self._query(
+                    {"clocks_throttle_reasons.active": mapping}, required=False
+                )
+            samples.extend(environment)
         return samples
 
     def _query_tlimit(self) -> list[GpuMetricSample]:
@@ -460,7 +482,14 @@ class NvidiaSmiMetricsCollector:
                         "no": 0.0,
                         "false": 0.0,
                     }.get(raw.lower())
-                    value = boolean if boolean is not None else float(raw)
+                    value = (
+                        float(int(raw, 16))
+                        if canonical == "clock_throttle_reasons"
+                        and raw.lower().startswith("0x")
+                        else boolean
+                        if boolean is not None
+                        else float(raw)
+                    )
                 except ValueError:
                     continue
                 samples.append(

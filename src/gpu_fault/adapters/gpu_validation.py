@@ -4,27 +4,47 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+from gpu_fault.adapters.common import quarantine_taint_value
 from gpu_fault.cluster_scope import FABRIC_MANAGER_UNIT
 from gpu_fault.dcgm_fields import missing_fabric_metric_groups
 from gpu_fault.execution import (
     WorkflowStepContext,
     WorkflowStepOutcome,
 )
+from gpu_fault.fabric_scope import validate_task_fabric, validation_evidence
 from gpu_fault.gpu_fabric_manager import fabric_validation
 from gpu_fault.gpu_fabric_window import fabric_state_loss
 from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.gpu_metrics import GpuMetricSource, GpuMetricsService
 from gpu_fault.gpu_temperature_policy import TLIMIT_READING
+from gpu_fault.health_evidence_validation import (
+    reset_cooldown,
+    reset_unproven_cooldown,
+    special_health_validation,
+    thermal_cooldown,
+    validation_success,
+)
+from gpu_fault.health_recovery_contract import (
+    HEALTH_CONTRACT,
+    THERMAL_NAMES,
+    prevents_hardware_escalation,
+)
+from gpu_fault.host_diagnostics import (
+    HOST_DIAGNOSTIC_PROBE,
+    apply_diagnostic_probe,
+    diagnostic_failure_details,
+    validate_host_metrics,
+)
 from gpu_fault.models import (
     WorkflowOperation,
     WorkflowStepSpec,
     WorkflowStepStatus,
 )
+from gpu_fault.observation_health import observation_reason
 from gpu_fault.operation_registry import (
     OperationAdapter,
     operations_for_adapter,
 )
-from gpu_fault.adapters.common import quarantine_taint_value
 from gpu_fault.orchestration.escalation import escalation_origin
 from gpu_fault.orchestration.validated_restore import is_validated_restore_workflow
 from gpu_fault.store.shared.errors import NotFoundError
@@ -77,6 +97,8 @@ class GpuValidationAdapter:
 
     def execute(self, context: WorkflowStepContext) -> WorkflowStepOutcome:
         now = datetime.now(timezone.utc)
+        if (special := special_health_validation(context, self.store, now)) is not None:
+            return special
         # DCGM omits XID_ERRORS on healthy GPUs on some driver/DCGM
         # combinations. Fresh temperature proves that GPU telemetry has
         # resumed; an XID series, when present, is still evaluated below.
@@ -86,6 +108,7 @@ class GpuValidationAdapter:
         node_findings: dict[str, list[dict[str, Any]]] = {}
         clamped: dict[str, dict[str, Any]] = {}
         operation = context.step.operation
+        probe = context.step.parameters.get(HOST_DIAGNOSTIC_PROBE)
         raw_inventory_requirements = context.step.parameters.get(
             "inventory_requirements_by_node", {}
         )
@@ -107,6 +130,7 @@ class GpuValidationAdapter:
         }
         telemetry_readiness_operations = {
             WorkflowOperation.RESET_GPU,
+            WorkflowOperation.RECOVER_DRAIN_P2P,
             WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
             WorkflowOperation.RESTART_FABRIC_MANAGER,
             WorkflowOperation.REMEDIATE_DRIVER,
@@ -159,7 +183,7 @@ class GpuValidationAdapter:
             required = set()
         else:
             required_collectors = {CollectorKind.GPU_METRICS}
-        if inventory_requirements or completed_node_recovery:
+        if inventory_requirements or completed_node_recovery or probe:
             required_collectors.add(CollectorKind.HOST_TELEMETRY)
         for node_id in context.step.node_ids:
             recent = self._recent_host_metrics(
@@ -179,6 +203,8 @@ class GpuValidationAdapter:
                 }
                 continue
             all_host_latest, host_latest = recent
+            if apply_diagnostic_probe(probe, host_latest, node_id, pending, failures):
+                continue
             inventory_pending = self._validate_inventory(
                 context,
                 node_id,
@@ -212,7 +238,7 @@ class GpuValidationAdapter:
                 continue
             if operation is WorkflowOperation.VALIDATE_FABRIC:
                 fabric_pending = self._validate_fabric_metrics(
-                    host_latest, node_id, failures
+                    host_latest, node_id, failures, context.step.parameters
                 )
                 if fabric_pending is not None:
                     pending[node_id] = fabric_pending
@@ -229,6 +255,10 @@ class GpuValidationAdapter:
             )
             if finding_pending is not None:
                 pending[node_id] = finding_pending
+        diagnostic_details = diagnostic_failure_details(probe, pending, failures)
+        reset_unproven_cooldown(self.store, context, now, pending, failures)
+        if prevents_hardware_escalation(context.step.parameters):
+            diagnostic_details["host_diagnostic_failure"] = True
         if pending:
             return WorkflowStepOutcome.waiting(
                 details={
@@ -236,6 +266,7 @@ class GpuValidationAdapter:
                     "node_pending": pending,
                     "failed_nodes_observed": sorted(failures),
                     "node_failures_observed": failures,
+                    **diagnostic_details,
                 }
             )
         if failures:
@@ -253,18 +284,15 @@ class GpuValidationAdapter:
                     "failed_nodes": failed_nodes,
                     "node_failures": failures,
                     "validation": operation.value,
+                    **diagnostic_details,
                     **({"node_findings": node_findings} if node_findings else {}),
                     **({"inventory_requirement_clamped": clamped} if clamped else {}),
                 },
             )
-        return WorkflowStepOutcome.succeeded(
-            operation_id=context.idempotency_key,
-            details={
-                "validated_nodes": context.step.node_ids,
-                "validation": context.step.operation.value,
-                **({"inventory_requirement_clamped": clamped} if clamped else {}),
-            },
-        )
+        cooling = thermal_cooldown(context, self.metrics, now, self._node_gpu_targets)
+        if cooling is not None:
+            return cooling
+        return validation_success(context, **validation_evidence(operation, clamped))
 
     def _restore_collectors_dark(
         self,
@@ -339,13 +367,13 @@ class GpuValidationAdapter:
         stale = sorted(
             collector.value
             for collector in required_collectors
-            if collector not in statuses
-            or statuses[collector].last_success_at is None
-            or now - statuses[collector].last_success_at > max_age
-            or (
-                readiness_after is not None
-                and statuses[collector].last_success_at <= readiness_after
+            if observation_reason(
+                statuses.get(collector),
+                now,
+                max_age.total_seconds(),
+                after=readiness_after,
             )
+            is not None
         )
         if stale:
             return {"missing_or_stale_collectors": stale}
@@ -507,41 +535,7 @@ class GpuValidationAdapter:
 
     @staticmethod
     def _validate_host_metrics(latest, node_id, failures):
-        names = {item.name for item in latest}
-        missing = sorted(
-            {
-                "load1_per_cpu",
-                "memory_used_percent",
-                "filesystem_used_percent",
-            }
-            - names
-        )
-        if missing:
-            return {"missing_recent_host_metrics": missing}
-        thresholds = {
-            "cpu_usage_percent": 98,
-            "load1_per_cpu": 2,
-            "memory_used_percent": 95,
-            "swap_used_percent": 80,
-            "filesystem_used_percent": 98,
-            "shared_filesystem_unavailable": 1,
-            "shared_filesystem_used_percent": 98,
-            "disk_io_util_percent": 98,
-            "disk_io_await_ms": 100,
-            "smart_health_failed": 1,
-            "network_link_down": 1,
-            "bmc_critical_sensor": 1,
-        }
-        unhealthy = sorted(
-            {
-                item.name
-                for item in latest
-                if item.name in thresholds and item.value >= thresholds[item.name]
-            }
-        )
-        if unhealthy:
-            failures.setdefault(node_id, []).extend(unhealthy)
-        return None
+        return validate_host_metrics(latest, node_id, failures)
 
     def _validate_gpu_metric_presence(
         self,
@@ -644,7 +638,17 @@ class GpuValidationAdapter:
             }
         return [gpu_uuid for gpu_uuid in targets if gpu_uuid in owned]
 
-    def _validate_fabric_metrics(self, latest, node_id, failures):
+    def _validate_fabric_metrics(self, latest, node_id, failures, parameters=None):
+        parameters = parameters or {}
+        if parameters.get("require_task_fabric_scope") or parameters.get(
+            "diagnostic_reason"
+        ) in {"EFA_TRAFFIC_HUNG_SUSPECTED", "TRAINING_HUNG", "APPLICATION_NCCL_ERROR"}:
+            pending, failed = validate_task_fabric(
+                latest, parameters.get("training_fabric_by_node", {}).get(node_id)
+            )
+            if failed:
+                failures.setdefault(node_id, []).extend(failed)
+            return pending
         link_states = [item.value for item in latest if item.name == "network_link_up"]
         if not link_states:
             return {"missing_recent_fabric_metrics": ["network_link_up"]}
@@ -670,7 +674,7 @@ class GpuValidationAdapter:
             }
             and item.value > 0
         ]
-        if not any(value >= 1 for value in link_states):
+        if not all(value == 1 for value in link_states):
             failed.append("network_link_up")
         if failed:
             failures.setdefault(node_id, []).extend(sorted(set(failed)))
@@ -791,6 +795,12 @@ class GpuValidationAdapter:
             ]
         if not findings:
             return None
+        contract = context.step.parameters.get(HEALTH_CONTRACT, {})
+        if contract.get("mode") == "THERMAL_COOLDOWN" and all(
+            item.canonical_name in THERMAL_NAMES for item in findings
+        ):
+            reset_cooldown(self.store, context, node_id, now)
+            return {"thermal_cooling": [item.finding_id for item in findings]}
         thermal_names = {
             "gpu_temperature_c",
             TLIMIT_READING,

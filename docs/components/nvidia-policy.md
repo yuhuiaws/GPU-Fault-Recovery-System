@@ -180,7 +180,8 @@ GB300 属于 GB200 列。
   `DRAIN_AND_RESET`。
 - XID 94/95：分别保存 application/all-applications containment；XID 95 在 reset
   前要求停止受影响工作负载。
-- XID 154：驱动报告动作优先并原样映射。
+- XID 154：驱动报告动作优先。Catalog 的 `Xid 154 linkage` 描述联动上报版本，不是原始 Xid 的最低支持版本；旧驱动或缺少版本信息不因此阻止 Xid 48/63/79/94/95 等原始规则。NVLink5 的 R575 位格式边界和必需解码证据仍保留。
+- `DRAIN_P2P`：禁止调度、停止关联任务、quiesce、确认无 GPU 客户端后，由独立 `RECOVER_DRAIN_P2P` operation 检查目标 GPU 的 persistence 已关闭并重读 GPU Recovery Action。`None` 不 reset；`Reset`、`Drain and Reset`、仍为 `Drain P2P` 时复用既有受保护的 GPU reset；任一目标要求 `Reboot` 时不先 reset 其他目标，转节点重启。未知动作、缺失/重复 GPU、persistence 未释放等不授权 reset/reboot，交人工处理。独立 operation 让旧 Agent 拒绝不认识的请求，不能静默退化为 `STOP_WORKLOADS` 或无条件 reset。
 - XID 159 `CHECK_UVM`：显式确认使用 UVM/vGPU 时 reset，否则 ignore；缺少证据阻塞。
 - XID 144-150：按驱动 R575 边界选择 V1/V2 `IntrInfo` pattern，同时匹配
   Error Status 和 Action 2。主动作与 Action 2 可以使用不同的位模式，分别匹配；

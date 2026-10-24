@@ -16,6 +16,7 @@ from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
 from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
 from gpu_fault.collectors.host.inventory import HostInventoryMixin
 from gpu_fault.collectors.host.network import HostNetworkMixin
+from gpu_fault.collectors.host.observation import HostObservationError
 from gpu_fault.collectors.host.system_metrics import (
     BoundedStatvfs,
     HostSystemMetricsMixin,
@@ -222,6 +223,9 @@ class HostTelemetryCollector(
         self._next_health_summary_at: datetime | None = None
         self._active_edge_reasons: set[str] = set()
         self._last_efa_rate: float | None = None
+        from gpu_fault.collectors.host.efa_recovery_sampling import EfaRecoverySampling
+
+        self._efa_recovery_sampling = EfaRecoverySampling()
         self._last_gpu_utilization_percent: float | None = None
         self._rank_progress_at: datetime | None = None
         self._rank_liveness_warned = False
@@ -506,8 +510,13 @@ class HostTelemetryCollector(
             collector = getattr(self, name)
             try:
                 samples.extend(collector(observed_at))
+            except HostObservationError as exc:
+                samples.extend(exc.samples)
+                errors.append(f"{name}: {type(exc).__name__}: {exc}")
             except Exception as exc:
                 errors.append(f"{name}: {type(exc).__name__}: {exc}")
+                if name == "_rdma":
+                    samples.append(self._sample("efa_traffic_observation_valid", 0))
             if heartbeat is not None:
                 heartbeat()
             # A contributor that fails *after* it has something the consumer
@@ -549,6 +558,8 @@ class HostTelemetryCollector(
             delivery_reasons.add("baseline")
         if self._active_edge_reasons - reasons:
             delivery_reasons.add("recovered")
+        if self._efa_recovery_sampling.due(batch, self._last_delivered_at):
+            delivery_reasons.add("efa-traffic-recovery-window")
         if self._last_delivered_at is not None and (
             (
                 self._next_health_summary_at is not None
@@ -669,18 +680,21 @@ class HostTelemetryCollector(
                 and sample.value <= self.low_utilization_threshold_percent
             ):
                 reasons.add(f"sustained:{sample.name}:{sample.device or 'node'}")
+            if sample.name == "efa_traffic_observation_valid" and sample.value == 0:
+                self._last_efa_rate = None
             if sample.name == "efa_traffic_bytes_per_second":
                 previous = self._last_efa_rate
-                if (
-                    batch.workload_state is WorkloadState.ACTIVE
-                    and previous is not None
-                    and previous >= self.efa_minimum_active_bps
-                ):
-                    ratio = sample.value / previous
-                    if ratio <= self.efa_drop_ratio:
-                        reasons.add("efa-traffic-drop")
-                    if ratio >= self.efa_spike_ratio:
-                        reasons.add("efa-traffic-spike")
+                if batch.workload_state is not WorkloadState.IDLE:
+                    if sample.value >= self.efa_minimum_active_bps and (
+                        previous is None or previous < self.efa_minimum_active_bps
+                    ):
+                        reasons.add("efa-traffic-active")
+                    if previous is not None and previous >= self.efa_minimum_active_bps:
+                        ratio = sample.value / previous
+                        if ratio <= self.efa_drop_ratio:
+                            reasons.add("efa-traffic-drop")
+                        if ratio >= self.efa_spike_ratio:
+                            reasons.add("efa-traffic-spike")
                 self._last_efa_rate = sample.value
         return reasons
 

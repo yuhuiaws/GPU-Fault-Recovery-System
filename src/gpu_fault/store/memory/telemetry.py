@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.training_progress_state import next_progress_state
+
 from contextlib import contextmanager
 from datetime import datetime
 from typing import Any, Iterator, Literal, Sequence
@@ -424,20 +426,7 @@ class MemoryTelemetryMixin(MemoryAttemptEventState):
                 and progress.observed_at <= previous.heartbeat.observed_at
             ):
                 return False
-            advanced = (
-                previous is None
-                or progress.step is None
-                or previous.heartbeat.step is None
-                or progress.step > previous.heartbeat.step
-            )
-            self._training_progress[key] = TrainingProgressState(
-                heartbeat=progress,
-                last_progress_at=(
-                    progress.observed_at
-                    if previous is None or advanced
-                    else previous.last_progress_at
-                ),
-            )
+            self._training_progress[key] = next_progress_state(previous, progress)
             return previous.heartbeat if previous is not None else None
 
     def list_training_progress(

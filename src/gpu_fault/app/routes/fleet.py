@@ -24,6 +24,7 @@ from gpu_fault.fleet import (
     SignedAgentHeartbeat,
 )
 from gpu_fault.store import NotFoundError
+from gpu_fault.communication_monitoring import observation_plan
 
 
 @dataclass(frozen=True)
@@ -80,7 +81,18 @@ async def register_agent(
             detail="agent registry is disabled",
         )
     try:
-        return await _store_call(dependencies, registry.register, envelope)
+        record: AgentRecord = await _store_call(
+            dependencies, registry.register, envelope
+        )
+        if (
+            envelope.heartbeat.communication_monitor_version
+            == "communication-monitor/v1"
+        ):
+            plan = await _store_call(
+                dependencies, observation_plan, dependencies.context.store, record
+            )
+            return record.model_copy(update={"communication_plan": plan})
+        return record
     except ValueError as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 

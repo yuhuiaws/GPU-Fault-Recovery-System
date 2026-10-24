@@ -152,7 +152,7 @@ def test_gpu_validation_ignores_findings_outside_reset_scope() -> None:
 
 
 def test_gpu_validation_waits_for_post_action_telemetry() -> None:
-    action_completed_at = datetime.now(timezone.utc)
+    action_completed_at = datetime.now(timezone.utc) - timedelta(seconds=10)
 
     class ValidationStore:
         sample_at = action_completed_at - timedelta(seconds=1)
@@ -231,7 +231,7 @@ def test_gpu_validation_waits_for_post_action_telemetry() -> None:
 
 
 def test_host_validation_waits_for_post_reboot_telemetry() -> None:
-    rebooted_at = datetime.now(timezone.utc)
+    rebooted_at = datetime.now(timezone.utc) - timedelta(seconds=10)
 
     class ValidationStore:
         sample_at = rebooted_at - timedelta(seconds=1)

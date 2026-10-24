@@ -500,15 +500,17 @@ Service. Samples are not a source of production parameters.
 
 ## Configuring EFA/RDMA Traffic and Hung Diagnostics
 
-- Configures the EFA traffic baseline, SPIKE/DROP/ZERO/HUNG thresholds and the suppression budget.
-- Hung diagnostics collect GPU processes, Python stacks, `/proc`, strace, RDMA counters,
+- Configures the EFA traffic baseline, SPIKE/DROP/ZERO/HUNG thresholds and bounded evidence budgets.
+- Hung diagnostics collect GPU processes, Python stacks, `/proc`, RDMA counters,
   ethtool and log snapshots.
-- A real hang versus checkpoint/graph compilation must be distinguished with training progress and per-rank liveness combined.
+- The NCCL pipeline never depends on training step/phase. Low RDMA produces suspicion, not automatic
+  workload termination or reboot. Whole-task passive evidence precedes bounded active expansion;
+  missing evidence requires operator review. Hung bundles omit strace, DCGM diag and nvidia-bug-report.
 
-### Per-Rank Liveness Decision Before Escalation (Independent of Application Instrumentation)
+### Per-Rank Activity Context (Not an NCCL Decision Gate)
 
-The Host Collector judges whether a rank is advancing from each GPU process's write rate, CPU activity and GPU idleness.
-Missing signals are not silent; suppression has a maximum budget to avoid permanently masking a hang.
+Host write rate, CPU activity and GPU idleness are context only. Logging or checkpoint I/O never
+resets the RDMA idle clock; legacy suppression switches remain for configuration compatibility only.
 
 ## Configuring Host Resource Persistent Hazard Monitoring
 

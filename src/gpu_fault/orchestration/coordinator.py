@@ -124,7 +124,7 @@ OFFICIAL_WORKFLOW_OPERATION = {
     "CONTACT_SUPPORT": WorkflowOperation.ESCALATE_SUPPORT,
     "CHECK_UVM": WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
     "XID_154": WorkflowOperation.ESCALATE_SUPPORT,
-    "DRAIN_P2P": WorkflowOperation.STOP_WORKLOADS,
+    "DRAIN_P2P": WorkflowOperation.RECOVER_DRAIN_P2P,
 }
 
 

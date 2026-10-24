@@ -165,6 +165,23 @@ class NodeActionExecutionService:
         self,
         context: WorkflowStepContext,
     ) -> WorkflowStepOutcome:
+        if (
+            context.step.operation is WorkflowOperation.COLLECT_HUNG_TRIAGE
+            and context.step.parameters.get("hung_target_pending")
+        ):
+            return WorkflowStepOutcome.failed(
+                "hung triage targets have not been bound to survey evidence"
+            )
+        if context.step.operation in {
+            WorkflowOperation.COLLECT_HUNG_TRIAGE,
+            WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+        } and context.step.parameters.get("hung_skip_reason"):
+            return WorkflowStepOutcome.succeeded(
+                details={
+                    "node_results": {},
+                    "skipped": context.step.parameters["hung_skip_reason"],
+                }
+            )
         # A QUIESCE says what its window does with Fabric Manager; derived from
         # the persisted plan, so every send of the command carries one body.
         parameters = quiesce_command_parameters(
@@ -283,7 +300,10 @@ class NodeActionExecutionService:
         readiness = self.adapter._readiness(context)
         if not isinstance(readiness, WorkflowStepOutcome):
             return readiness
-        if context.step.operation is WorkflowOperation.COLLECT_HUNG_TRIAGE:
+        if context.step.operation in {
+            WorkflowOperation.COLLECT_HUNG_TRIAGE,
+            WorkflowOperation.COLLECT_HUNG_SUMMARY,
+        }:
             return {}
         if (
             context.step.operation in MULTI_NODE_BARRIER_OPERATIONS
@@ -329,6 +349,13 @@ class NodeActionExecutionService:
         context: WorkflowStepContext,
         state: NodeActionBatchState,
     ) -> WorkflowStepOutcome | None:
+        if context.step.operation is WorkflowOperation.COLLECT_HUNG_SUMMARY or (
+            context.step.operation is WorkflowOperation.COLLECT_HUNG_TRIAGE
+            and context.step.parameters.get("hung_wave")
+        ):
+            from gpu_fault.adapters.node_action.hung_survey import execute_hung_survey
+
+            return execute_hung_survey(self.adapter, context)
         gpu_map = self._gpu_map(context)
         if isinstance(gpu_map, WorkflowStepOutcome):
             return gpu_map
@@ -454,6 +481,13 @@ class NodeActionExecutionService:
         if result.status is not NodeActionStatus.FAILED:
             state.node_results[node_id] = result.details
             return None
+        if result.details.get(
+            "evidence_complete"
+        ) is False and context.step.operation in {
+            WorkflowOperation.COLLECT_HUNG_TRIAGE,
+            WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+        }:
+            state.node_results[node_id] = result.details
         if context.step.operation is WorkflowOperation.COLLECT_HUNG_TRIAGE:
             state.triage_failures[node_id] = result.error or "hung triage failed"
             return None
@@ -504,6 +538,8 @@ class NodeActionExecutionService:
             **{
                 key: result.details[key]
                 for key in (
+                    "gpu_recovery_actions",
+                    "gpu_recovery_reboot_required",
                     "reset_completed",
                     "reset_outcome_unknown",
                     "reset_failed",

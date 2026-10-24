@@ -143,6 +143,7 @@ def test_an_upgrade_carries_a_running_attempts_state_over_from_its_row(store) ->
     its baseline and zero streak, and that row is gone afterwards."""
 
     before = _hung_streak(store, state_key=LEGACY)
+    before, _ = efa(store, "node-a", _at(500), state_key=LEGACY, bps=0)
     assert store.get_efa_traffic_state(LEGACY) == before
 
     state, emitted = efa(store, "node-a", _at(800), bps=0)
@@ -169,15 +170,15 @@ def test_a_rollback_finds_no_per_attempt_row_and_starts_at_warmup(store) -> None
 
 
 def test_a_surviving_per_attempt_row_is_what_a_rollback_would_resume(store) -> None:
-    """Why the retention removes superseded rows: the older release resumes a
-    zero streak recorded hours ago and escalates on its first zero sample."""
+    """A resumed legacy row preserves its baseline but not an unobserved gap."""
 
     _hung_streak(store, state_key=LEGACY)
     stale = efa(store, "node-a", _at(230), state_key=LEGACY, bps=0)[0]
     assert stale.zero_since == _at(150)
 
     resumed, emitted = efa(store, "node-a", NOW, state_key=LEGACY, bps=0)
-    assert (resumed.signal, emitted) == (EfaTrafficSignal.HUNG_SUSPECTED, True)
+    assert (resumed.signal, emitted) == (EfaTrafficSignal.ZERO_PENDING, False)
+    assert resumed.zero_since == NOW, resumed
 
 
 def test_the_hung_triage_reads_only_the_incidents_attempt(store) -> None:

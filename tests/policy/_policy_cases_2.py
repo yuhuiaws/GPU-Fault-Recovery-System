@@ -367,17 +367,10 @@ def test_every_catalog_rule_resolves_as_the_catalog_says(rule, family: str) -> N
 
 
 @pytest.mark.parametrize(("rule", "min_driver", "min_cuda"), _version_gated_rules())
-def test_version_gate_branches_are_exact(
+def test_linkage_versions_do_not_gate_original_xid_actions(
     rule, min_driver: int | None, min_cuda: str | None
 ) -> None:
-    """Every reporting-compatibility gate, in both directions.
-
-    The last assertion is the important one: a gate written with ``<=``
-    instead of ``<`` would reject a *real* fault reported by a driver
-    that exactly meets the documented minimum, and silently drop it as
-    NOT_APPLICABLE. Asserting only "older is rejected" would pass for
-    the buggy comparison too.
-    """
+    """Linkage versions describe XID 154 reporting, not fault applicability."""
 
     engine = _engine()
     family = rule.products[0]
@@ -398,28 +391,28 @@ def test_version_gate_branches_are_exact(
             )
         )
 
+    baseline = evaluate("baseline", driver_branch=999, cuda_version="99.9")
+
+    def unchanged(decision):
+        assert decision.disposition is baseline.disposition
+        assert decision.action is baseline.action
+        assert decision.official_action == baseline.official_action
+        assert decision.safety_action is baseline.safety_action
+
     if min_driver is not None:
         missing_driver = evaluate("no-driver", driver_branch=None)
-        assert missing_driver.disposition is (
-            ActionDisposition.BLOCKED_MISSING_EVIDENCE
-        )
-        assert missing_driver.requires_operator
+        unchanged(missing_driver)
         older_driver = evaluate("old-driver", driver_branch=min_driver - 1)
-        assert older_driver.disposition is (ActionDisposition.NOT_APPLICABLE)
-        assert older_driver.action is None
+        unchanged(older_driver)
 
     if min_cuda is not None:
         missing_cuda = evaluate("no-cuda", cuda_version=None)
-        assert missing_cuda.disposition is (ActionDisposition.BLOCKED_MISSING_EVIDENCE)
+        unchanged(missing_cuda)
         major, minor = (int(part) for part in min_cuda.split("."))
         older_cuda = f"{major}.{minor - 1}" if minor > 0 else f"{major - 1}.9"
-        assert (
-            evaluate("old-cuda", cuda_version=older_cuda).disposition
-            is ActionDisposition.NOT_APPLICABLE
-        )
+        unchanged(evaluate("old-cuda", cuda_version=older_cuda))
 
-    at_boundary = evaluate("boundary")
-    assert at_boundary.disposition is not (ActionDisposition.NOT_APPLICABLE)
+    unchanged(evaluate("boundary"))
 
 
 def test_xid_154_covers_every_official_recovery_action() -> None:
@@ -437,7 +430,7 @@ def test_xid_154_covers_every_official_recovery_action() -> None:
             ActionDisposition.EXECUTABLE,
             RecoveryAction.STOP_WORKLOAD,
             Containment.ALL_APPLICATIONS,
-            [RecoveryAction.STOP_WORKLOAD],
+            [RecoveryAction.MARK_UNSCHEDULABLE, RecoveryAction.STOP_WORKLOAD],
         ),
         DynamicRecoveryAction.DRAIN_AND_RESET: (
             ActionDisposition.EXECUTABLE,

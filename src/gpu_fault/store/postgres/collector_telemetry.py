@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from gpu_fault.training_progress_state import next_progress_state
+
 import logging
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -19,7 +21,6 @@ from gpu_fault.telemetry import merge_collector_status
 from gpu_fault.telemetry_models import (
     WorkloadObservationState,
 )
-from gpu_fault.training_models import TrainingProgressState
 
 LOGGER = logging.getLogger(__name__)
 
@@ -355,18 +356,7 @@ class PostgresCollectorTelemetryMixin:
                 and progress.observed_at <= previous.heartbeat.observed_at
             ):
                 return False
-            advanced = (
-                previous is None
-                or progress.step is None
-                or previous.heartbeat.step is None
-                or progress.step > previous.heartbeat.step
-            )
-            state = TrainingProgressState(
-                heartbeat=progress,
-                last_progress_at=(
-                    progress.observed_at if advanced else previous.last_progress_at
-                ),
-            )
+            state = next_progress_state(previous, progress)
             with self._db.cursor() as cursor:
                 cursor.execute(
                     """

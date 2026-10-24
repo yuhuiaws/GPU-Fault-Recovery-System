@@ -27,7 +27,7 @@ KERNEL_LOG_SOURCES: frozenset[str] = frozenset({"dmesg", "journal"})
 
 #: Origins that a workload can influence -- the training log is a file the job
 #: writes (``collectors/logs/node.py`` tags it ``training-log``). Only
-#: observational rules (``RUN_DIAGNOSTICS``) may match from here, so a job
+#: observational rules (``NO_ACTION`` / ``RUN_DIAGNOSTICS``) may match from here, so a job
 #: cannot manufacture a trusted quarantine by printing an ``NVRM: Xid`` line.
 WORKLOAD_LOG_SOURCES: frozenset[str] = frozenset({"training-log"})
 
@@ -93,7 +93,7 @@ NODE_LOG_RULES = (
         re.compile(r"\b(nccl).*(error|timeout|unhandled|abort)", re.I),
         LogHealthCategory.NCCL,
         Severity.WARNING,
-        RecoveryAction.RUN_DIAGNOSTICS,
+        RecoveryAction.NO_ACTION,
         "NCCL collective failure",
         ALL_LOG_SOURCES,
     ),
@@ -105,7 +105,7 @@ NODE_LOG_RULES = (
         ),
         LogHealthCategory.TRAINING,
         Severity.WARNING,
-        RecoveryAction.RUN_DIAGNOSTICS,
+        RecoveryAction.NO_ACTION,
         "distributed training failure",
         ALL_LOG_SOURCES,
     ),

@@ -144,9 +144,13 @@ def validate_hung_workflow(workflow: dict[str, Any]) -> None:
     steps = workflow["official_steps"]
     assert [step["operation"] for step in steps] == [
         "FREEZE_EVIDENCE",
+        "COLLECT_HUNG_SUMMARY",
+        "COLLECT_HUNG_SUMMARY",
+        "COLLECT_HUNG_TRIAGE",
         "COLLECT_HUNG_TRIAGE",
         "COLLECT_DIAGNOSTIC_BUNDLE",
         "VALIDATE_FABRIC",
+        "ESCALATE_SUPPORT",
     ], "active hung-traffic recovery requires the current read-only triage DAG"
     assert workflow["dag_enabled"] is True
     assert workflow["blocked_reasons"] == [], "fixture allowlist must admit the plan"
@@ -154,14 +158,23 @@ def validate_hung_workflow(workflow: dict[str, Any]) -> None:
         [],
         [0],
         [1],
-        [1],
+        [2],
+        [3],
+        [3, 4],
+        [2],
+        [5, 6],
     ], "bundle and validation must wait for the triage result"
-    for step in steps[1:3]:
+    for step in steps[1:4]:
         assert step["parameters"]["diagnostic_reason"] == "EFA_TRAFFIC_HUNG_SUSPECTED"
         assert step["node_ids"] == [NODE_ID]
-    assert steps[1]["parameters"]["capture_process_state"] is True
+    assert steps[1]["parameters"]["capture_process_state"] is False
     assert steps[2]["parameters"]["capture_process_state"] is False
-    assert steps[2]["parameters"]["hung_triage_target_pending"] is True
+    assert steps[1]["parameters"]["survey_pass"] == "BASELINE"
+    assert steps[2]["parameters"]["survey_pass"] == "RECHECK"
+    assert steps[3]["parameters"]["capture_process_state"] is True
+    assert steps[5]["parameters"]["capture_process_state"] is False
+    assert steps[5]["parameters"]["hung_triage_target_pending"] is True
+    assert steps[6]["parameters"]["require_task_fabric_scope"] is True
     assert workflow["step_executions"] == [], "this fixture does not execute actions"
 
 
@@ -169,15 +182,22 @@ def main() -> int:
     global API_URL
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     REPORT_PATH.parent.mkdir(parents=True, exist_ok=True)
-    env = os.environ.copy()
+    env = {
+        name: value
+        for name, value in os.environ.items()
+        if not name.startswith("GPU_FAULT_")
+    }
     env.update(
         {
+            "GPU_FAULT_ALLOW_SINGLE_CLUSTER": "true",
+            "GPU_FAULT_ACKNOWLEDGE_NO_ALERT_CHANNEL": "true",
+            "GPU_FAULT_CLUSTER_ID": CLUSTER_ID,
             "GPU_FAULT_EXECUTOR_MODE": "active",
             "GPU_FAULT_STORE_URL": f"sqlite:///{DB_PATH}",
             "GPU_FAULT_EXECUTION_TOKEN": random_execution_token(),
             "GPU_FAULT_ALLOWED_OPERATIONS": (
-                "FREEZE_EVIDENCE,COLLECT_HUNG_TRIAGE,"
-                "COLLECT_DIAGNOSTIC_BUNDLE,VALIDATE_FABRIC"
+                "FREEZE_EVIDENCE,COLLECT_HUNG_SUMMARY,COLLECT_HUNG_TRIAGE,"
+                "COLLECT_DIAGNOSTIC_BUNDLE,VALIDATE_FABRIC,ESCALATE_SUPPORT"
             ),
             "GPU_FAULT_ENABLE_WORKFLOW_DISPATCHER": "false",
             "GPU_FAULT_ENABLE_KUBERNETES_ADAPTER": "false",
@@ -219,6 +239,9 @@ def main() -> int:
         with tempfile.TemporaryDirectory() as root:
             counters = Path(root) / "rdmap0" / "ports" / "1" / "hw_counters"
             counters.mkdir(parents=True)
+            device = counters.parents[2] / "device"
+            device.mkdir()
+            (device / "uevent").write_text("DRIVER=efa\n")
             (counters / "rx_bytes").write_text("0")
             (counters / "tx_bytes").write_text("0")
             sink = RecordingSink()

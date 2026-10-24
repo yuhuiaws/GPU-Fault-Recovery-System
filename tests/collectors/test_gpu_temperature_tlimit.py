@@ -372,7 +372,7 @@ def test_dcgm_grades_the_margin_on_both_sides_and_not_the_fallback() -> None:
         ("gpu_tlimit_c", "WARNING", "RUN_DIAGNOSTICS", 3.0, "NVIDIA_DEVICE_TLIMIT"),
         ("gpu_tlimit_c", "CRITICAL", "DRAIN", -2.0, "NVIDIA_DEVICE_TLIMIT"),
     ], "slowdown -2 C is critical, 5 C before it (and max operating 0 C) warns"
-    assert len(sink.results) == 3, "baseline plus one delivery per confirmed action"
+    assert len(sink.results) == 5, "critical samples must reach the control-plane confirmation"
 
 
 def fallback_runner(xml: str, *, refuse_tlimit: bool = False):

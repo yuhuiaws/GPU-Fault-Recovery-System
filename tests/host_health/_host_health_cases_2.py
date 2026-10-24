@@ -618,16 +618,14 @@ def test_node_log_endpoint_classifies_mce_and_nccl() -> None:
         assert {item["category"] for item in body["findings"]} == {"MCE", "NCCL"}
         assert {item["recommended_action"] for item in body["findings"]} == {
             "QUARANTINE",
-            "RUN_DIAGNOSTICS",
+            "NO_ACTION",
         }
         nccl = next(item for item in body["findings"] if item["category"] == "NCCL")
         incident = context.store.get_incident_by_event(nccl["event_id"])
-        assert incident is not None
-        workflow = context.store.get_workflow(incident.workflow_request_id)
-        assert [item.operation.value for item in workflow.official_steps] == [
-            "FREEZE_EVIDENCE",
-            "VALIDATE_FABRIC",
-        ]
+        assert incident is None, (
+            "ordinary NCCL log must not create a competing incident"
+        )
+        assert len(body["marker_ids"]) == 1, "only the MCE is a hardware marker"
 
     asyncio.run(scenario())
 

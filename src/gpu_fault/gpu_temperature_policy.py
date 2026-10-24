@@ -146,14 +146,12 @@ def tlimit_grades_gpu(limits: Mapping[str, float]) -> bool:
 
 def _tlimit_boundaries(
     thresholds: GpuMetricsThresholds, limits: Mapping[str, float]
-) -> tuple[float, float] | None:
+) -> tuple[float | None, float] | None:
     """(critical, warning) on the T.Limit scale, mirroring the absolute rule.
 
-    Critical is the HW slowdown threshold, else the max operating one, else
-    the shutdown threshold plus the shutdown margin; warning is the warning
-    margin before critical, or a SW slowdown point (GPU or memory max
-    operating) when that comes first. The scale counts down, so "before" means
-    a larger value.
+    Critical is the HW slowdown threshold or a site margin before shutdown.
+    A max-operating threshold alone only warns: it describes software limiting.
+    The scale counts down, so a warning before critical has a larger value.
     """
 
     slowdown = plausible_tlimit(limits.get("gpu_slowdown_tlimit_c"))
@@ -162,10 +160,10 @@ def _tlimit_boundaries(
     memory = plausible_tlimit(limits.get("memory_max_operating_tlimit_c"))
     if slowdown is not None:
         critical = slowdown
-    elif maximum is not None:
-        critical = maximum
     elif shutdown is not None:
         critical = shutdown + thresholds.gpu_temperature_shutdown_margin_c
+    elif maximum is not None:
+        return None, maximum
     else:
         return None
     warning = max(
@@ -214,7 +212,7 @@ def _tlimit_decision(
     if reading is None or boundaries is None:
         return None
     critical, warning = boundaries
-    if reading <= critical:
+    if critical is not None and reading <= critical:
         severity, threshold = GpuHealthSeverity.CRITICAL, critical
     elif reading <= warning:
         severity, threshold = GpuHealthSeverity.WARNING, warning
@@ -236,30 +234,51 @@ def temperature_decision(
     """Use the same device-derived action boundaries before and after delivery."""
 
     name = sample.canonical_name
+    limits = {
+        key: value
+        for key, value in limits.items()
+        if key not in ABSOLUTE_TEMPERATURE_LIMITS
+        or math.isfinite(value)
+        and 0 < value <= TLIMIT_PLAUSIBLE_MAGNITUDE_C
+    }
     if name == TLIMIT_READING:
         return _tlimit_decision(thresholds, sample, limits)
     if name == "gpu_temperature_c":
+        shutdown = limits.get("gpu_shutdown_temperature_c")
+        if shutdown is not None and sample.value >= shutdown:
+            return _decision(
+                GpuHealthSeverity.CRITICAL,
+                "GPU reached its absolute shutdown temperature",
+                shutdown,
+                "NVIDIA_DEVICE_LIMIT",
+            )
         if tlimit_grades_gpu(limits):
             # Judged on its own T.Limit sample; grading the absolute reading
             # against the configured fallback too would report one condition
             # twice, on a boundary that is not the GPU's.
             return None
         slowdown = limits.get("gpu_slowdown_temperature_c")
-        shutdown = limits.get("gpu_shutdown_temperature_c")
         maximum = limits.get("gpu_max_operating_temperature_c")
-        critical = (
-            slowdown
-            or maximum
-            or (
-                shutdown - thresholds.gpu_temperature_shutdown_margin_c
-                if shutdown is not None
-                else None
-            )
+        critical = slowdown or (
+            shutdown - thresholds.gpu_temperature_shutdown_margin_c
+            if shutdown is not None
+            else None
         )
         fallback_warning = thresholds.gpu_temperature_warning_c
         fallback_critical = thresholds.gpu_temperature_critical_c
         margin = thresholds.gpu_temperature_warning_margin_c
         label = "GPU"
+        if critical is None and maximum is not None:
+            return (
+                _decision(
+                    GpuHealthSeverity.WARNING,
+                    "GPU reached its software thermal operating limit",
+                    maximum,
+                    "NVIDIA_DEVICE_LIMIT",
+                )
+                if sample.value >= maximum
+                else None
+            )
     elif name == "memory_temperature_c":
         maximum = limits.get("memory_max_operating_temperature_c")
         critical = maximum

@@ -35,6 +35,7 @@ from ._support import (
 
 EXPECTED_NODE_ACTION_OPERATIONS = {
     WorkflowOperation.COLLECT_HUNG_TRIAGE,
+    WorkflowOperation.COLLECT_HUNG_SUMMARY,
     WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
     WorkflowOperation.RUN_DCGM_DIAGNOSTIC,
     WorkflowOperation.RUN_FIELD_DIAGNOSTIC,
@@ -43,6 +44,7 @@ EXPECTED_NODE_ACTION_OPERATIONS = {
     WorkflowOperation.VERIFY_NO_GPU_CLIENTS,
     WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT,
     WorkflowOperation.RESET_GPU,
+    WorkflowOperation.RECOVER_DRAIN_P2P,
     WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
     WorkflowOperation.RESTORE_GPU_SERVICES,
     WorkflowOperation.REMEDIATE_EFA_DRIVER,

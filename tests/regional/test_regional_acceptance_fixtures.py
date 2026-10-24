@@ -266,6 +266,7 @@ def test_regional_fixture_layout_has_no_legacy_scattered_directories() -> None:
         "__init__.py",
         "isolated_api.py",
         "render_manifest.py",
+        "run_general_fault_injections.py",
     }
 
 

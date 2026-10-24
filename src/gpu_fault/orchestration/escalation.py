@@ -18,6 +18,7 @@ from gpu_fault.models import (
     bounded_reasons,
 )
 from gpu_fault.notifications import HardwareEscalationEmailBuilder
+from gpu_fault.health_recovery_contract import diagnostic_workflow_failures
 from gpu_fault.operation_registry import (
     HARDWARE_ESCALATION_RELEVANT_OPERATIONS,
     NODE_ACTION_SCOPE_OPERATIONS,
@@ -43,6 +44,7 @@ _RESET_OPERATIONS = frozenset(
     {
         WorkflowOperation.RESET_GPU,
         WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
+        WorkflowOperation.RECOVER_DRAIN_P2P,
     }
 )
 _VALIDATION_OPERATIONS = frozenset(
@@ -504,6 +506,7 @@ def _refused_containment(
 def next_rung(
     failed_operation: WorkflowOperation,
     recovery_context: set[WorkflowOperation] | frozenset[WorkflowOperation],
+    details: Mapping[str, Any] | None = None,
 ) -> WorkflowOperation | None:
     """The next hardware-recovery rung after ``failed_operation`` failed.
 
@@ -516,6 +519,13 @@ def next_rung(
     on the branch; it decides what a failed *validation* escalates from.
     """
 
+    if failed_operation is WorkflowOperation.RECOVER_DRAIN_P2P:
+        evidence = details or {}
+        if evidence.get("gpu_recovery_reboot_required") is True or evidence.get(
+            "reset_failed"
+        ):
+            return WorkflowOperation.RESTART_NODE
+        return None
     if failed_operation in _RESET_OPERATIONS:
         return WorkflowOperation.RESTART_NODE
     if failed_operation is WorkflowOperation.RESTART_NODE:
@@ -781,17 +791,15 @@ class HardwareEscalationService:
             for execution in workflow.step_executions
             if execution.status is WorkflowStepStatus.FAILED
         ]
+        if diagnostic_workflow_failures(workflow, failed_executions):
+            return None
         handled, verdict = _pre_action_classification(failed_executions)
         if handled:
             return verdict
         hand_off = _no_verdict_classification(workflow.step_executions)
         if hand_off is not None:
             return hand_off
-        failed_operation_set = {
-            execution.operation
-            for execution in workflow.step_executions
-            if execution.status is WorkflowStepStatus.FAILED
-        }
+        failed_operation_set = {execution.operation for execution in failed_executions}
         successful_operation_set = set(workflow.completed_operations) | {
             execution.operation
             for execution in workflow.step_executions
@@ -843,6 +851,25 @@ class HardwareEscalationService:
             failed_stage = "efa_recovery"
             next_action = RecoveryAction.REBOOT_NODE
             next_operation = WorkflowOperation.RESTART_NODE
+        elif WorkflowOperation.RECOVER_DRAIN_P2P in failed_operation_set:
+            failed_stage = "drain_p2p_recovery"
+            reboot = any(
+                execution.operation is WorkflowOperation.RECOVER_DRAIN_P2P
+                and execution.status is WorkflowStepStatus.FAILED
+                and next_rung(execution.operation, set(), execution.details)
+                is WorkflowOperation.RESTART_NODE
+                for execution in workflow.step_executions
+            )
+            next_action = (
+                RecoveryAction.REBOOT_NODE
+                if reboot
+                else RecoveryAction.ESCALATE_OPERATOR
+            )
+            next_operation = (
+                WorkflowOperation.RESTART_NODE
+                if reboot
+                else WorkflowOperation.ESCALATE_SUPPORT
+            )
         elif WorkflowOperation.RUN_DCGM_DIAGNOSTIC in (failed_operation_set):
             failed_stage = "temperature_diagnostic"
             next_action = RecoveryAction.DRAIN
@@ -891,12 +918,7 @@ class HardwareEscalationService:
                 failed_stage = "reboot_validation"
                 next_action = RecoveryAction.REPLACE_NODE
                 next_operation = WorkflowOperation.REPLACE_NODE
-            elif recovery_context_operations.intersection(
-                {
-                    WorkflowOperation.RESET_GPU,
-                    WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
-                }
-            ):
+            elif recovery_context_operations.intersection(_RESET_OPERATIONS):
                 failed_stage = "reset_validation"
                 next_action = RecoveryAction.REBOOT_NODE
                 next_operation = WorkflowOperation.RESTART_NODE

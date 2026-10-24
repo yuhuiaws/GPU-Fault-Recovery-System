@@ -103,22 +103,25 @@ def zero_traffic_with_progress(
     monkeypatch.setenv("GPU_FAULT_EFA_TRAFFIC_ZERO_HUNG_SECONDS", "30")
     store = build_store()
     policy = NodeHealthPolicy(store)
-    for step, offset in enumerate(progress_at):
-        store.observe_training_progress(
-            TrainingProgressHeartbeat(
-                cluster_id="cluster-a",
-                attempt_id="attempt-a",
-                rank=0,
-                node_id="node-a",
-                observed_at=NOW + timedelta(seconds=offset),
-                step=step + 1,
-                checkpoint_ref=f"s3://ckpt/{step}",
-            )
-        )
     signals = []
     for index, offset in enumerate(samples):
         observed_at = NOW + timedelta(seconds=offset)
         observe_running_attempt(store, observed_at)
+        for step, progress_offset in enumerate(progress_at):
+            if (samples[index - 1] if index else -1) < progress_offset <= offset:
+                store.observe_training_progress(
+                    TrainingProgressHeartbeat(
+                        cluster_id="cluster-a",
+                        attempt_id="attempt-a",
+                        rank=0,
+                        node_id="node-a",
+                        pod_uid="pod-0",
+                        container_name="trainer",
+                        observed_at=NOW + timedelta(seconds=progress_offset),
+                        step=step + 1,
+                        checkpoint_ref=f"s3://ckpt/{step}",
+                    )
+                )
         for finding in policy.evaluate_metrics(
             efa_telemetry(f"zero-{index}", 1_000 if index == 0 else 0, observed_at)
         ):

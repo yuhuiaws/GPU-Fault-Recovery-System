@@ -16,11 +16,12 @@ import subprocess
 import threading
 from typing import Callable
 
-
 LOGGER = logging.getLogger(__name__)
 
 
-def _reap_abandoned_process(argv: list[str], process: subprocess.Popen[str]) -> None:
+def _reap_abandoned_process(
+    argv: list[str], process: subprocess.Popen[str] | subprocess.Popen[bytes]
+) -> None:
     """Wait out a killed child that has not left the kernel yet.
 
     Runs on a daemon thread and touches nothing but its own child: the circuit
@@ -97,7 +98,9 @@ class BoundedProcessRunner:
             completed.check_returncode()
         return completed
 
-    def _abandon(self, argv: list[str], process: subprocess.Popen[str]) -> None:
+    def _abandon(
+        self, argv: list[str], process: subprocess.Popen[str] | subprocess.Popen[bytes]
+    ) -> None:
         with contextlib.suppress(OSError):
             process.kill()
         try:

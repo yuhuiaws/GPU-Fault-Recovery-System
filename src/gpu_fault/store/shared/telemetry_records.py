@@ -11,6 +11,8 @@ inventory snapshot are read this way on both backends.
 
 from __future__ import annotations
 
+from gpu_fault.training_progress_state import next_progress_state
+
 from typing import Literal, Sequence, cast
 
 from pydantic import ValidationError
@@ -331,23 +333,10 @@ class SharedTelemetryRecordMixin:
                 and progress.observed_at <= previous.heartbeat.observed_at
             ):
                 return False
-            advanced = (
-                previous is None
-                or progress.step is None
-                or previous.heartbeat.step is None
-                or progress.step > previous.heartbeat.step
-            )
             self._put(
                 "training_progress",
                 storage_key,
-                TrainingProgressState(
-                    heartbeat=progress,
-                    last_progress_at=(
-                        progress.observed_at
-                        if previous is None or advanced
-                        else previous.last_progress_at
-                    ),
-                ),
+                next_progress_state(previous, progress),
             )
             return previous.heartbeat if previous is not None else None
 

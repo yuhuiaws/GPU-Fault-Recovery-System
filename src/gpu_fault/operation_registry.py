@@ -99,6 +99,15 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         safe_remote_waiting_preempt=True,
         hardware_escalation_relevant=False,
     ),
+    WorkflowOperation.COLLECT_HUNG_SUMMARY: _semantics(
+        CapabilityName.DIAGNOSTIC_BUNDLE_CAPTURE,
+        OperationScope.NODE,
+        OperationAdapter.NODE_ACTION,
+        zero_rank_action=True,
+        safe_remote_waiting_preempt=True,
+        hardware_escalation_relevant=False,
+        host_proc_root_dependent=True,
+    ),
     WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE: _semantics(
         CapabilityName.DIAGNOSTIC_BUNDLE_CAPTURE,
         OperationScope.NODE,
@@ -201,6 +210,20 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         resource_claims=frozenset({OperationResourceClaim.GPU_RUNTIME_MUTATION}),
         maintenance_generation_scoped=True,
     ),
+    WorkflowOperation.RECOVER_DRAIN_P2P: _semantics(
+        CapabilityName.GPU_RESET,
+        OperationScope.GPU,
+        OperationAdapter.NODE_ACTION,
+        destructive=True,
+        recovery_rank=30,
+        merge_intent=True,
+        node_action_scope=True,
+        node_exclusive=True,
+        hardware_escalation_relevant=True,
+        resource_claims=frozenset({OperationResourceClaim.GPU_RUNTIME_MUTATION}),
+        host_proc_root_dependent=True,
+        maintenance_generation_scoped=True,
+    ),
     WorkflowOperation.RESTART_NODE: _semantics(
         CapabilityName.NODE_REBOOT,
         OperationScope.NODE,
@@ -217,6 +240,7 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         dominates=frozenset(
             {
                 WorkflowOperation.RESET_GPU,
+                WorkflowOperation.RECOVER_DRAIN_P2P,
                 WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
                 WorkflowOperation.RESTART_FABRIC_MANAGER,
                 WorkflowOperation.REMEDIATE_EFA_DRIVER,
@@ -242,6 +266,7 @@ OPERATION_REGISTRY: dict[WorkflowOperation, OperationSemantics] = {
         dominates=frozenset(
             {
                 WorkflowOperation.RESET_GPU,
+                WorkflowOperation.RECOVER_DRAIN_P2P,
                 WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
                 WorkflowOperation.RESTART_FABRIC_MANAGER,
                 WorkflowOperation.RESTART_NODE,

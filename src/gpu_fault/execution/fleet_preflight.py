@@ -19,7 +19,7 @@ from gpu_fault.operation_registry import (
 
 _PREFLIGHTED_NODE_ACTION_OPERATIONS = operations_for_adapter(
     OperationAdapter.NODE_ACTION
-) - {WorkflowOperation.COLLECT_HUNG_TRIAGE}
+) - {WorkflowOperation.COLLECT_HUNG_TRIAGE, WorkflowOperation.COLLECT_HUNG_SUMMARY}
 LOGGER = logging.getLogger(__name__)
 
 

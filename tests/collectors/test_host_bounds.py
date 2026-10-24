@@ -437,7 +437,7 @@ def test_network_survives_a_vanishing_interface_and_ignores_virtual_ones(
         "the required interface's link state was lost with the vanished one"
     )
     assert devices == {"eth0"}, devices
-    assert batch.collection_errors == [], batch.collection_errors
+    assert any("vanishing0" in error for error in batch.collection_errors), batch
 
 
 def test_network_prunes_counters_of_departed_interfaces(
@@ -1046,7 +1046,7 @@ def test_an_unreadable_counter_does_not_cost_the_interface_its_baseline(
     assert ("network_errors_delta", "eth0") in second_names, (
         "one unreadable counter discarded the whole tick"
     )
-    assert second.collection_errors == [], second.collection_errors
+    assert any("eth1" in error for error in second.collection_errors), second
     assert ("network_errors_delta", "eth1") in third_names, (
         "the repaired interface lost the baseline it needs to report a delta"
     )
@@ -1085,9 +1085,9 @@ def test_an_unreadable_drop_counter_does_not_eat_the_error_interval(
     _set_counters(eth0, 9)
     third = collector.collect_once()
 
-    assert [item.name for item in second.samples if item.device == "eth0"] == [], (
-        "a half-read interface must contribute nothing"
-    )
+    assert [item.name for item in second.samples if item.device == "eth0"] == [
+        "network_link_up"
+    ], "a statistics failure must not discard independently read link state"
     errors = [
         item.value
         for item in third.samples

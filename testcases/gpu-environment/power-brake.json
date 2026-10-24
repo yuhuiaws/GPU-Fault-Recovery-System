@@ -1,0 +1,9 @@
+{
+  "steps": [
+    {"reads": 2, "values": {}},
+    {"reads": 1, "values": {"clock_throttle_reasons": 128}},
+    {"reads": 1, "values": {"clock_throttle_reasons": 0}},
+    {"reads": 3, "values": {"clock_throttle_reasons": 128}},
+    {"reads": 3, "values": {"clock_throttle_reasons": 0}}
+  ]
+}

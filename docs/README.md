@@ -64,6 +64,16 @@ links point at `docs/en/administrator-operations.md`.
 | 文档 | 类型 | 维护规则 |
 |---|---|---|
 | [区域模式端到端验收测试用例](区域模式端到端验收测试用例.md) | 规格 | 随当前实现修订；用例 ID 和标题锚点保持稳定 |
+| [Xid linkage 与 Drain P2P 端到端测试](components/xid154-recovery-e2e.md) | 专项回归 | 本地软件链、真机验收和 UVM 实现缺口分别记录 |
+| [通用故障逐项验收概要](components/general-fault-e2e-audit.md) | 规格与缺口 | 32类概要、整改状态与未执行项 |
+| [通用故障真机验收补充](components/general-fault-live-acceptance.md) | 真机规格 | 30类新增规格与温度/功耗复用映射；设计覆盖不等于真机通过 |
+| [32类软件注入运行器](components/general-fault-injection-runner.md) | 软件验证 | 连续主场景与分段检查分别报告 |
+| [Host观测有效性修正](components/host-observation-hardening.md) | 实现说明 | 不可读数据、故障分类和验证绑定 |
+| [NCCL hung 改进与验证](components/nccl-hung-hardening.md) | 实现与验收 | 任务摘要、采样上限、证据边界、并发合并与恢复判定 |
+| [NCCL hung 端到端覆盖审计](components/nccl-hung-e2e-coverage.md) | 测试覆盖 | 连续软件链、场景矩阵、代码覆盖统计与真机缺口 |
+| [通用健康策略修改](components/health-policy-hardening.md) | 实现说明 | 十二类策略及软件验证边界 |
+| [GPU环境策略复核](components/gpu-environment-policy-review.md) | 专项评估 | NVIDIA/NVSentinel依据、环境故障判定与人工复核 |
+| [GPU环境真机验收](components/gpu-environment-live-acceptance.md) | 真机规格 | 真实功率实验、遥测回放和物理故障证明分开 |
 | [区域用例索引](区域用例索引.md) | 生成物 | 只展示执行顺序与规格入口，不包含内部执行状态 |
 | [变更影响与测试选择](变更影响与测试选择.md) | 开发门禁 | 从代码路径反向选择pytest和受影响区域用例 |
 | [覆盖率与场景需求矩阵](components/scenario-coverage.md) | 质量统计 | 分开度量语句、分支、机制需求与真机验证；保留未实现项 |

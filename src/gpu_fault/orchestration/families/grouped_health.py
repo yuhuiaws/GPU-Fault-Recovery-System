@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from gpu_fault.health_recovery_contract import is_hung_finding
+from gpu_fault.models import IncidentState
+
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable
@@ -15,6 +18,7 @@ from gpu_fault.models import (
 )
 from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
+from gpu_fault.orchestration.hung_episode import diagnostic_only_hung, new_hung_episode
 
 
 @dataclass(frozen=True)
@@ -99,6 +103,7 @@ class GroupedHealthService:
     ) -> GroupedHealthContext | None:
         if (
             self.aggregation_window_seconds == 0
+            and not is_hung_finding(finding)
             or finding.workload_state is not WorkloadState.ACTIVE
             or not finding.affected_workload_ids
         ):
@@ -141,7 +146,9 @@ class GroupedHealthService:
         finding: NodeHealthFinding,
         observation,
     ) -> bool:
-        if self.callbacks.is_attempt_grouped_health_finding(finding):
+        if is_hung_finding(finding) or self.callbacks.is_attempt_grouped_health_finding(
+            finding
+        ):
             return True
         if finding.recommended_action is not RecoveryAction.RUN_DIAGNOSTICS:
             return False
@@ -159,6 +166,34 @@ class GroupedHealthService:
         existing_workflow: WorkflowRequest | None,
     ) -> tuple[FaultIncident, WorkflowRequest]:
         now = datetime.now(timezone.utc)
+        if (
+            existing_workflow is not None
+            and is_hung_finding(context.finding)
+            and new_hung_episode(self.store, context.finding, existing_workflow)
+        ):
+            candidate, candidate_workflow = self._candidate(context)
+            candidate, candidate_workflow = self._new_workflow(
+                candidate, candidate_workflow, now
+            )
+            candidate_workflow = candidate_workflow.model_copy(
+                update={"predecessor_workflow_id": existing_workflow.request_id}
+            )
+            return self._finalize(context, candidate, candidate_workflow, None, now)
+        if (
+            is_hung_finding(context.finding)
+            and existing_incident is not None
+            and existing_workflow is not None
+            and existing_incident.state
+            in {IncidentState.ACTION_PENDING, IncidentState.ESCALATED}
+            and existing_incident.attempt_id == context.observation.attempt_id
+            and diagnostic_only_hung(existing_workflow)
+        ):
+            reason = f"{context.finding.node_id}: concurrent hung evidence: {context.finding.reason}"
+            return existing_incident.model_copy(
+                update={
+                    "reasons": bounded_reasons([*existing_incident.reasons, reason]),
+                }
+            ), existing_workflow
         existing_incident, existing_workflow = self.callbacks.reopen_if_terminal(
             existing_incident,
             existing_workflow,

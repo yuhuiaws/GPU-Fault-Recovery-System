@@ -14827,9 +14827,9 @@ otherwise a machine with a non-EFA RDMA card mixed in would reach a false "consi
   |---|------|---------|-------------|
   | 1 | XID not in catalog → `SITE_SAFETY` + `QUARANTINE` | `:786` | single case (xid 999) |
   | 2 | product family not applicable → `NOT_APPLICABLE`, `action=None` | `:802` | **347** cases in the matrix |
-  | 3 | version gate missing evidence → `BLOCKED_MISSING_EVIDENCE` | `:1189` | 24 gated rules × missing driver / missing cuda |
-  | 4 | version gate not satisfied → `NOT_APPLICABLE` | `:1239` | 24 rules × driver-1 / cuda-1 |
-  | 5 | version gate exactly at the boundary → **must pass** | same as above | 24 rules (guards against "writing the boundary as `<=`") |
+  | 3 | missing linkage versions cannot block the original Xid | `policy/engine.py` | linkage-bearing rules with missing driver / cuda |
+  | 4 | versions below linkage reporting support keep the original action | `policy/engine.py` | driver-1 / cuda-1 compared with a high-version baseline |
+  | 5 | linkage boundary values do not change the original action | same as above | compare with the baseline; keep separate NVLink5 decoding evidence requirements |
   | 6 | `immediateAction` empty → `MONITOR_ONLY` + `NO_ACTION` | `:836` | 30 cases in the matrix |
   | 7 | exact mapping of the four direct actions | `:853` `DIRECT_ACTION_MAP` | 278 matrix cases |
   | 8 | `WORKFLOW_XID_45` three branches | `:1380` | solo / with companion / window not closed |
@@ -14849,13 +14849,13 @@ otherwise a machine with a non-EFA RDMA card mixed in would reach a false "consi
   "the set of actions without an executor is exactly `{RESTART_VM}`" -- when a catalog upgrade introduces a new workflow
   it must be triaged, rather than discovering in production that some class of XID can from then on only be handled manually.
 
-  ⚠ **Item 5 (boundary pass-through) is a deliberately added reverse assertion.**
-  The version gate compares with `<`; writing it as `<=` would judge a real fault where
-  "the driver just barely meets the minimum requirement" as `NOT_APPLICABLE` and silently discard it.
-  Asserting only "lower versions are rejected" is **not enough** -- that assertion holds for `<=` too.
+  **Items 3 through 5 prove linkage is not a version gate for the original Xid.**
+  The old lower-version-refusal expectation no longer applies. Missing, old and
+  boundary versions cannot block an original Xid merely because of Xid 154 reporting
+  linkage. See the [software E2E cases](components/xid154-recovery-e2e.md).
 - Verdict: 172 rules × 4 product families, 688 cases in total; each case's
   `(official_action, disposition, action)` triple equals the **independently recomputed** expected value;
-  the 14 branches in the table above are each covered; three mutations -- version gate `<` changed to `<=`,
+  the 14 branches in the table above are each covered; three mutations -- reintroducing linkage as a version gate,
   product-family membership check removed, `_xid_containment` simplified to always return `GPU` --
   must each turn the cases red, otherwise this batch of cases is not considered to bite.
 

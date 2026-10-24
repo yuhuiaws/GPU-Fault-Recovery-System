@@ -25,12 +25,11 @@ from gpu_fault.execution.config import (
     ProductionExecutorConfig,
 )
 from gpu_fault.execution.flat_step_failure import fail_flat_step
-from gpu_fault.execution.fleet_preflight import (
-    held_workflow_result,
-)
+from gpu_fault.execution.fleet_preflight import held_workflow_result
 from gpu_fault.execution.hung_classification import (
     classify_hung_signals,
 )
+from gpu_fault.execution.hung_lifecycle import skip_inactive_hung
 from gpu_fault.execution.invariants import check_workflow_invariants
 from gpu_fault.execution.models import (
     WorkflowExecutionError,
@@ -51,12 +50,12 @@ from gpu_fault.execution.node_action_uncertainty import (
     with_compensation_step,
 )
 from gpu_fault.execution.remediation_budget import escalation_budget_claims
+from gpu_fault.execution.terminal_state import (
+    DIAGNOSTIC_INCONCLUSIVE_REASON as DIAGNOSTIC_INCONCLUSIVE_REASON,
+)
 from gpu_fault.execution.transient_errors import (
     retryable_adapter_error,
     transient_store_error,
-)
-from gpu_fault.execution.terminal_state import (
-    DIAGNOSTIC_INCONCLUSIVE_REASON as DIAGNOSTIC_INCONCLUSIVE_REASON,
 )
 from gpu_fault.execution.workflow_notifications import (
     NotificationSender,
@@ -496,9 +495,8 @@ class ProductionWorkflowExecutor:
                     workflow = trimmed
                     self._save_leased(workflow, execution_epoch)
             resolved = set(resolved_step_indexes(workflow))
-            # Set coverage, not a count: an index outside the step list (a
-            # stale entry after a DAG rewrite) must not end the workflow with
-            # a real step still pending (P0-65B).
+            # Stale indexes left by a rewrite cannot stand in for pending
+            # steps: completion requires coverage of the actual index set.
             if resolved >= set(range(len(steps))):
                 if workflow.pending_failure_step_index is not None:
                     # The in-flight siblings a job-level failure waited for
@@ -588,17 +586,18 @@ class ProductionWorkflowExecutor:
                 workflow = step_bounds.record_attempt(workflow, step, index, outcome)
                 if (
                     outcome.status is WorkflowStepStatus.SUCCEEDED
-                    and step.operation is WorkflowOperation.COLLECT_HUNG_TRIAGE
+                    and step.operation
+                    in {
+                        WorkflowOperation.COLLECT_HUNG_TRIAGE,
+                        WorkflowOperation.COLLECT_HUNG_SUMMARY,
+                    }
                 ):
-                    # Keep the triage execution record and the DAG
-                    # rewrite in memory until the single leased save
-                    # below. That transaction is the serialization
-                    # point across control-plane replicas.
+                    # Evidence and its adaptive DAG rewrite share one leased save.
                     workflow = self._rewrite_hung_triage_bundle(
                         workflow,
                         incident,
                         triage_index=index,
-                        triage_details=outcome.details,
+                        triage_details=outcome.details or {},
                     )
                     steps = (
                         workflow.safety_steps if is_safety else workflow.official_steps
@@ -1453,18 +1452,17 @@ class ProductionWorkflowExecutor:
         _, quiesce_step, _ = evidence
         successor_operations = {step.operation for step in successor.official_steps}
         if successor_operations.intersection(
-            {WorkflowOperation.RESET_GPU, WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES}
+            {
+                WorkflowOperation.RESET_GPU,
+                WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
+                WorkflowOperation.RECOVER_DRAIN_P2P,
+            }
         ):
-            successor_quiesce = next(
-                (
-                    (index, step)
-                    for index, step in enumerate(successor.official_steps)
-                    if step.operation is WorkflowOperation.QUIESCE_GPU_SERVICES
-                    and set(step.node_ids) <= set(quiesce_step.node_ids)
-                ),
-                None,
+            return any(
+                step.operation is WorkflowOperation.QUIESCE_GPU_SERVICES
+                and set(step.node_ids) <= set(quiesce_step.node_ids)
+                for step in successor.official_steps
             )
-            return successor_quiesce is not None
         if WorkflowOperation.RESTART_NODE not in successor_operations:
             return False
         restart_index = next(
@@ -1475,17 +1473,10 @@ class ProductionWorkflowExecutor:
         restart_step = successor.official_steps[restart_index]
         if not set(restart_step.node_ids) <= set(quiesce_step.node_ids):
             return False
-        restore_step = next(
-            (
-                step
-                for step in workflow.official_steps
-                if step.operation is WorkflowOperation.RESTORE_GPU_SERVICES
-            ),
-            None,
+        return any(
+            step.operation is WorkflowOperation.RESTORE_GPU_SERVICES
+            for step in workflow.official_steps
         )
-        if restore_step is None:
-            return False
-        return True
 
     def _adopt_quiesce_handoff_from_predecessor(
         self,
@@ -1509,7 +1500,11 @@ class ProductionWorkflowExecutor:
             return workflow
         operations = {step.operation for step in workflow.official_steps}
         reset = operations.intersection(
-            {WorkflowOperation.RESET_GPU, WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES}
+            {
+                WorkflowOperation.RESET_GPU,
+                WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES,
+                WorkflowOperation.RECOVER_DRAIN_P2P,
+            }
         )
         # Reset needs live quiesce; reboot retains its post-reboot restore.
         evidence = self._quiesce_handoff_evidence(
@@ -1728,6 +1723,17 @@ class ProductionWorkflowExecutor:
         triage_index: int,
         triage_details: dict[str, Any],
     ) -> WorkflowRequest:
+        if (
+            workflow.official_steps[triage_index].operation
+            is WorkflowOperation.COLLECT_HUNG_SUMMARY
+        ):
+            from gpu_fault.execution.hung_survey import after_summary
+
+            return after_summary(workflow, triage_index, triage_details)
+        if workflow.official_steps[triage_index].parameters.get("hung_wave"):
+            from gpu_fault.execution.hung_survey import after_triage
+
+            return after_triage(workflow, triage_index, triage_details)
         bundle_index = next(
             (
                 index
@@ -1756,31 +1762,6 @@ class ProductionWorkflowExecutor:
                         signal[key] = context[key]
                 signals.append(signal)
         undetermined_nodes = sorted(set(triage_details.get("undetermined_nodes") or []))
-        observed_ranks = {
-            signal.get("rank")
-            for signal in signals
-            if isinstance(signal.get("rank"), int)
-        }
-        for (node_id, pid), context in rank_context.items():
-            rank = context.get("rank")
-            if (
-                node_id not in undetermined_nodes
-                or not isinstance(rank, int)
-                or rank in observed_ranks
-            ):
-                continue
-            signals.append(
-                {
-                    "node_id": node_id,
-                    "pid": pid,
-                    "rank": rank,
-                    "gpu_uuid": context.get("gpu_uuid"),
-                    "flight_recorder": {"status": "node_unavailable"},
-                    "python_stack": {},
-                    "proc": {},
-                    "gpu": {},
-                }
-            )
         decision = self._classify_hung_signals(
             signals,
             undetermined_nodes=undetermined_nodes,
@@ -1811,77 +1792,19 @@ class ProductionWorkflowExecutor:
                 **decision,
                 "not_sampled_nodes": not_sampled_nodes,
             }
-        selected_ranks = set(decision.get("culprit_ranks") or [])
-        control_ranks = set(decision.get("control_ranks") or [])
-        selected = [
-            signal
-            for signal in signals
-            if signal.get("rank") in selected_ranks | control_ranks
-        ]
+        from gpu_fault.execution.hung_bundle import bind_hung_bundle
+
         steps = list(workflow.official_steps)
-        bundle = steps[bundle_index]
-        actionable = (
-            decision["classification"] in {"CONFIRMED", "PLAUSIBLE", "WEAK"}
-            and 0 < len(selected_ranks) <= 3
-        )
-        parameters = {
-            **bundle.parameters,
-            "hung_triage_decision": decision,
-            "hung_triage_target_pending": False,
+        sampled_nodes = steps[triage_index].node_ids
+        decision["coverage"] = {
+            "requested_node_count": len(sampled_nodes),
+            "responding_node_count": len(triage_details.get("node_results") or {}),
+            "not_sampled_node_count": len(not_sampled_nodes),
+            "rank_inventory_complete": False,
         }
-        if actionable:
-            target_pids_by_node: dict[str, list[int]] = {}
-            target_gpu_uuids_by_pid_by_node: dict[str, dict[str, str]] = {}
-            gpu_uuids = []
-            for signal in selected:
-                pid = signal.get("pid")
-                node_id = signal.get("node_id")
-                if isinstance(pid, int) and isinstance(node_id, str):
-                    target_pids_by_node.setdefault(node_id, []).append(pid)
-                    if signal.get("gpu_uuid"):
-                        target_gpu_uuids_by_pid_by_node.setdefault(node_id, {})[
-                            str(pid)
-                        ] = str(signal["gpu_uuid"])
-                if signal.get("gpu_uuid"):
-                    gpu_uuids.append(str(signal["gpu_uuid"]))
-            node_ids = sorted(target_pids_by_node)
-            parameters.update(
-                {
-                    "capture_process_state": True,
-                    "target_pids_by_node": {
-                        node_id: sorted(set(pids))
-                        for node_id, pids in target_pids_by_node.items()
-                    },
-                    "target_gpu_uuids_by_pid_by_node": (
-                        target_gpu_uuids_by_pid_by_node
-                    ),
-                    "max_processes": len(selected),
-                    "expand_python_cgroup_processes": False,
-                    "strace_sample_count": (
-                        1 if decision["classification"] == "WEAK" else 3
-                    ),
-                }
-            )
-            steps[bundle_index] = bundle.model_copy(
-                update={
-                    "node_ids": node_ids,
-                    "gpu_uuids": sorted(set(gpu_uuids)),
-                    "parameters": parameters,
-                }
-            )
-        else:
-            parameters.update(
-                {
-                    "capture_process_state": False,
-                    "target_pids_by_node": {},
-                    "target_gpu_uuids_by_pid_by_node": {},
-                    "max_processes": 0,
-                    "expand_python_cgroup_processes": False,
-                    "strace_sample_count": 0,
-                    "operator_escalation_required": True,
-                }
-            )
-            steps[bundle_index] = bundle.model_copy(update={"parameters": parameters})
+        steps[bundle_index] = bind_hung_bundle(
+            steps[bundle_index], decision, signals, sampled_nodes
+        )
         executions = [
             execution.model_copy(
                 update={
@@ -2345,7 +2268,7 @@ class ProductionWorkflowExecutor:
         )
         adapter = matches[0]
         try:
-            return adapter.execute(context)
+            return skip_inactive_hung(self.store, context) or adapter.execute(context)
         except Exception as exc:
             if transient_store_error(exc):
                 # A store hiccup inside the adapter says nothing about the

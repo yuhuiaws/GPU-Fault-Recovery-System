@@ -60,6 +60,7 @@ def heartbeat(
         samples_per_second=100,
         loss=loss,
         numerical_error=numerical_error,
+        labels={"progress_group": "data-parallel"},
     )
 
 
@@ -95,7 +96,7 @@ def test_topology_survives_sqlite_restart(tmp_path) -> None:
         second.close()
 
 
-def test_training_health_detects_straggler_and_hang() -> None:
+def test_training_health_distinguishes_straggler_and_reporter_silence() -> None:
     store = build_store()
     store.save_attempt_observation(observation())
     service = TrainingHealthService(
@@ -115,7 +116,7 @@ def test_training_health_detects_straggler_and_hang() -> None:
 
     assert {item.metric_name for item in straggler.findings} == {"training_straggler"}
     assert straggler.findings[0].node_id == "node-1"
-    assert {item.metric_name for item in hung.findings} == {"training_hang"}
+    assert {item.metric_name for item in hung.findings} == {"training_reporter-silent"}
     assert {item.node_id for item in hung.findings} == {"node-0", "node-1"}
 
 

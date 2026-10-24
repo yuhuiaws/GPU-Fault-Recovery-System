@@ -572,8 +572,14 @@ def test_replacement_findings_for_different_attempts_do_not_merge(
 
 
 def test_efa_hung_finding_requests_process_diagnostic_bundle(
-    context: ApplicationContext,
+    context: ApplicationContext, monkeypatch
 ) -> None:
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(
+        "gpu_fault.orchestration.hung_dag.time",
+        SimpleNamespace(time=lambda: NOW.timestamp()),
+    )
     context.store.save_attempt_observation(
         attempt_observation(
             "job-a",
@@ -637,9 +643,13 @@ def test_efa_hung_finding_requests_process_diagnostic_bundle(
     assert incident.node_ids == ["node-a", "node-b"]
     assert [step.operation for step in workflow.official_steps] == [
         WorkflowOperation.FREEZE_EVIDENCE,
+        WorkflowOperation.COLLECT_HUNG_SUMMARY,
+        WorkflowOperation.COLLECT_HUNG_SUMMARY,
+        WorkflowOperation.COLLECT_HUNG_TRIAGE,
         WorkflowOperation.COLLECT_HUNG_TRIAGE,
         WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
         WorkflowOperation.VALIDATE_FABRIC,
+        WorkflowOperation.ESCALATE_SUPPORT,
     ]
     assert workflow.dag_enabled, "a two-node hung triage compiles as a DAG"
     assert workflow.dag_revision == 1
@@ -647,20 +657,44 @@ def test_efa_hung_finding_requests_process_diagnostic_bundle(
         [],
         [0],
         [1],
-        [1],
+        [2],
+        [3],
+        [3, 4],
+        [2],
+        [5, 6],
     ]
     assert all(
-        step.node_ids == ["node-a", "node-b"] for step in workflow.official_steps
+        step.node_ids == ["node-a", "node-b"]
+        for step in workflow.official_steps
+        if step.operation is not WorkflowOperation.COLLECT_HUNG_TRIAGE
     ), [step.node_ids for step in workflow.official_steps]
-    triage = workflow.official_steps[1]
+    triage = workflow.official_steps[3]
     assert triage.parameters == {
         **parameters,
         "attempt_node_ids": ["node-a", "node-b"],
         "gpu_uuids_by_node": {"node-a": ["GPU-a"], "node-b": ["GPU-b"]},
-        "triage_timeout_seconds": 10,
+        "triage_timeout_seconds": 20,
+        "triage_fr_sample_interval_seconds": 2,
         "expand_python_cgroup_processes": False,
+        "require_workload_identity": True,
+        "workload_cgroup_paths_by_node": {"node-a": [], "node-b": []},
+        "fabric_partition_by_node": {},
+        "health_recovery_contract": {
+            "mode": "HUNG_DIAGNOSTIC",
+            "metric": "",
+            "detected_at": NOW.isoformat(),
+        },
+        "communication_history_epochs": [
+            int(NOW.timestamp() // 30) - 2,
+            int(NOW.timestamp() // 30) - 1,
+        ],
+        "snapshot_epoch": finding.event_id,
+        "hung_diagnostic_node_budget": 2,
+        "reporting_node_id": "node-a",
+        "hung_wave": 1,
+        "hung_target_pending": True,
     }
-    bundle = workflow.official_steps[2]
+    bundle = workflow.official_steps[5]
     assert bundle.parameters["capture_process_state"] is False
     assert bundle.parameters["hung_triage_target_pending"] is True
 

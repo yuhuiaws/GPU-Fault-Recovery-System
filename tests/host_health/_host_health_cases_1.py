@@ -141,17 +141,14 @@ def test_sustained_zero_efa_traffic_captures_hung_context(monkeypatch) -> None:
 
 
 def test_checkpoint_progress_defers_zero_traffic_escalation(monkeypatch) -> None:
-    # Progress at t=20 and t=35 restarts the hang clock, so the fabric
-    # being idle from t=15 to t=45 — a checkpoint write or a graph
-    # compile — raises nothing. Once progress stops, the clock runs from
-    # the last step (t=35) and the attempt still escalates.
+    # Legacy step hints no longer postpone communication suspicion.
     signals = zero_traffic_with_progress(
         monkeypatch, progress_at=(20, 35), samples=(0, 15, 30, 45, 60, 75)
     )
 
     assert signals == [
-        (60, "EFA_TRAFFIC_ZERO_WARNING"),
-        (75, "EFA_TRAFFIC_HUNG_SUSPECTED"),
+        (30, "EFA_TRAFFIC_ZERO_WARNING"),
+        (45, "EFA_TRAFFIC_HUNG_SUSPECTED"),
     ]
 
 
@@ -159,7 +156,7 @@ def test_checkpoint_progress_defers_zero_traffic_escalation(monkeypatch) -> None
 def test_zero_traffic_progress_suppression_accepts_every_enabled_token(
     monkeypatch, token: str
 ) -> None:
-    """A default-on switch spelled ``=1`` used to switch the suppression off."""
+    """Legacy tokens remain accepted but no longer change the NCCL clock."""
 
     monkeypatch.setenv("GPU_FAULT_EFA_TRAFFIC_PROGRESS_SUPPRESSION_ENABLED", token)
 
@@ -168,8 +165,8 @@ def test_zero_traffic_progress_suppression_accepts_every_enabled_token(
     )
 
     assert signals == [
-        (60, "EFA_TRAFFIC_ZERO_WARNING"),
-        (75, "EFA_TRAFFIC_HUNG_SUSPECTED"),
+        (30, "EFA_TRAFFIC_ZERO_WARNING"),
+        (45, "EFA_TRAFFIC_HUNG_SUSPECTED"),
     ]
 
 
@@ -187,19 +184,17 @@ def test_zero_traffic_progress_suppression_can_be_disabled(monkeypatch) -> None:
 
 
 def test_rank_liveness_defers_zero_traffic_escalation(monkeypatch) -> None:
-    # No application instrumentation at all: the node itself measured
-    # that a rank advanced until t=35, so the hang clock runs from
-    # there instead of from the last packet at t=15.
+    # Host writes are context, not proof of collective progress.
     emitted = zero_traffic_with_liveness(
         monkeypatch, samples=(0, 15, 30, 45, 60, 75), progress_until=35
     )
 
     assert [(item[0], item[1]) for item in emitted] == [
-        (60, "EFA_TRAFFIC_ZERO_WARNING"),
-        (75, "EFA_TRAFFIC_HUNG_SUSPECTED"),
+        (30, "EFA_TRAFFIC_ZERO_WARNING"),
+        (45, "EFA_TRAFFIC_HUNG_SUSPECTED"),
     ]
     assert emitted[-1][2]["status"] == "stalled"
-    assert emitted[-1][2]["seconds_since_progress"] == 40
+    assert emitted[-1][2]["seconds_since_progress"] == 10
 
 
 def test_stalled_ranks_still_escalate_to_hung(monkeypatch) -> None:
@@ -231,19 +226,19 @@ def test_missing_rank_liveness_does_not_suppress_escalation(monkeypatch) -> None
 
 
 def test_continuous_rank_progress_suppresses_within_budget(monkeypatch) -> None:
-    # Every sample reports progress, so nothing escalates while the
-    # suppression budget lasts.
+    # Continuous host-side activity cannot suppress NCCL suspicion.
     emitted = zero_traffic_with_liveness(
         monkeypatch, samples=(0, 15, 30, 45, 60, 75, 90), progress_until=10_000
     )
 
-    assert emitted == []
+    assert [(item[0], item[1]) for item in emitted] == [
+        (30, "EFA_TRAFFIC_ZERO_WARNING"),
+        (45, "EFA_TRAFFIC_HUNG_SUSPECTED"),
+    ]
 
 
 def test_progress_suppression_is_bounded(monkeypatch) -> None:
-    # Same input, but suppression is capped at 30 s past the first zero
-    # sample: a signal that always looks like progress cannot silence
-    # the detector forever.
+    # The legacy suppression budget no longer affects the detector.
     emitted = zero_traffic_with_liveness(
         monkeypatch,
         samples=(0, 15, 30, 45, 60, 75, 90),
@@ -252,8 +247,8 @@ def test_progress_suppression_is_bounded(monkeypatch) -> None:
     )
 
     assert [(item[0], item[1]) for item in emitted] == [
-        (60, "EFA_TRAFFIC_ZERO_WARNING"),
-        (75, "EFA_TRAFFIC_HUNG_SUSPECTED"),
+        (30, "EFA_TRAFFIC_ZERO_WARNING"),
+        (45, "EFA_TRAFFIC_HUNG_SUSPECTED"),
     ]
 
 
@@ -470,6 +465,7 @@ def test_host_policy_persists_only_metrics_consumed_by_validation() -> None:
     policy.evaluate_metrics(batch)
 
     assert store.persisted == [
+        "cpu_usage_percent",
         "gpu_inventory_expected_count",
         "gpu_inventory_active_count",
         "nvswitch_port_topology",
@@ -596,7 +592,7 @@ def test_node_log_uses_highest_severity_matching_rule() -> None:
             entries=[
                 NodeLogEntry(
                     entry_id="multi-rule",
-                    source="journal",
+                    source="dmesg",
                     observed_at=NOW,
                     message=(
                         "out of memory while EFA RDMA link down reported fatal error"
@@ -842,6 +838,7 @@ def test_inventory_card_loss_reboots_then_escalates_to_replacement(
                     "node_instance_type": "ml.p5en.48xlarge",
                     "expected_gpu_count": "8",
                     "expected_efa_device_count": "16",
+                    "failure_mode": "PCI_DEVICE_MISSING",
                 },
             )
         ],

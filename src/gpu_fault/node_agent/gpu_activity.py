@@ -33,6 +33,7 @@ The rules here make the window exclusive against the Agent's own GPU work:
 
 from __future__ import annotations
 
+import subprocess
 import threading
 import time
 from collections.abc import Callable, Iterator
@@ -53,6 +54,7 @@ GPU_ACTIVITY_OPERATIONS = frozenset(
         WorkflowOperation.RUN_DCGM_DIAGNOSTIC,
         WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
         WorkflowOperation.COLLECT_HUNG_TRIAGE,
+        WorkflowOperation.COLLECT_HUNG_SUMMARY,
         WorkflowOperation.RUN_FIELD_DIAGNOSTIC,
         WorkflowOperation.RUN_NVLINK74_WORKFLOW,
         WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT,
@@ -318,3 +320,14 @@ class CheckpointedRunner:
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self._runner, name)
+
+    def diagnostic(self, argv: list[str], **kwargs: Any) -> Any:
+        from gpu_fault.node_agent.diagnostic_process import DiagnosticProcessRunner
+
+        self._gate.checkpoint()
+        runner = (
+            DiagnosticProcessRunner(kill_grace_seconds=0.2)
+            if self._runner is subprocess.run
+            else self._runner
+        )
+        return runner(argv, **kwargs)

@@ -11,7 +11,7 @@ this guide does not repeat them.
 
 ## 1. Adding a Workflow Operation
 
-1. Add an enum member to `models.WorkflowOperation`.
+1. Add an enum member to `operation_names.WorkflowOperation`; `models.WorkflowOperation` remains a compatible re-export.
 2. Add a complete semantic row to `operation_registry.OPERATION_REGISTRY`:
    capability, scope, destructive, rank, adapter, resource locks, DAG, preempt
    and barrier; plus the following decision fields:

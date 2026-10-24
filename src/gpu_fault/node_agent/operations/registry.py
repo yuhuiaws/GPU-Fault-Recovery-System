@@ -7,6 +7,7 @@ from gpu_fault.operation_registry import (
 
 OPERATION_HANDLERS: dict[WorkflowOperation, str] = {
     WorkflowOperation.COLLECT_HUNG_TRIAGE: "_collect_hung_triage",
+    WorkflowOperation.COLLECT_HUNG_SUMMARY: "_collect_hung_summary",
     WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE: ("_collect_diagnostic_bundle"),
     WorkflowOperation.RUN_DCGM_DIAGNOSTIC: "_run_dcgm_diagnostic",
     WorkflowOperation.RUN_FIELD_DIAGNOSTIC: "_run_field_diagnostic",
@@ -15,6 +16,7 @@ OPERATION_HANDLERS: dict[WorkflowOperation, str] = {
     WorkflowOperation.VERIFY_NO_GPU_CLIENTS: ("_execute_verify_no_clients"),
     WorkflowOperation.TRIGGER_HEALTH_SNAPSHOT: ("_execute_health_snapshot"),
     WorkflowOperation.RESET_GPU: "_execute_reset_gpu",
+    WorkflowOperation.RECOVER_DRAIN_P2P: "_recover_drain_p2p",
     WorkflowOperation.RESET_ALL_GPUS_NVSWITCHES: ("_execute_reset_all"),
     WorkflowOperation.RESTORE_GPU_SERVICES: "_execute_restore",
     WorkflowOperation.REMEDIATE_EFA_DRIVER: "_remediate_efa_driver",

@@ -35,5 +35,10 @@ class ControlPlaneEvidenceAdapter:
                 "policy_version": context.incident.policy_version,
                 "official_action": context.incident.official_action,
                 "captured_at": datetime.now(timezone.utc).isoformat(),
+                **(
+                    {"hung_task_summary": context.step.parameters["hung_task_summary"]}
+                    if "hung_task_summary" in context.step.parameters
+                    else {}
+                ),
             },
         )
