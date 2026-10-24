@@ -668,6 +668,25 @@ def test_efa_driver_remediation_is_on_by_default_and_switchable_off(
     assert "REMEDIATE_EFA_DRIVER" in operations
 
 
+def test_deploy_digest_operations_mirror_the_installer_default(tmp_path: Path) -> None:
+    """The deploy computes the expected Agent config digest with
+    ``bootstrap_common.NODE_ALLOWED_OPERATIONS``; the digest payload carries the
+    sorted allowed operations, so that list must be exactly what a default node
+    install grants. R13 (2026-10-24): the installer gained RECOVER_DRAIN_P2P, the
+    mirror did not, every upgraded Agent reported a different config digest and
+    the HyperPod canary wave stopped at "agents did not converge".
+    """
+
+    from gpu_fault.admin.bootstrap_common import NODE_ALLOWED_OPERATIONS
+
+    _allowed, operations = _installer_efa_switch(tmp_path)
+    assert sorted(operations) == sorted(NODE_ALLOWED_OPERATIONS.split(",")), (
+        "deploy digest mirror differs from the installer default: "
+        f"only installer {sorted(set(operations) - set(NODE_ALLOWED_OPERATIONS.split(',')))}, "
+        f"only mirror {sorted(set(NODE_ALLOWED_OPERATIONS.split(',')) - set(operations))}"
+    )
+
+
 def test_installer_job_forwards_the_efa_remediation_switch() -> None:
     """A false GPU_FAULT_ENABLE_NODE_EFA_DRIVER_REMEDIATION must reach the node.
 
