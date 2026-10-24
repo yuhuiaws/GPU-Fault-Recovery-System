@@ -933,6 +933,36 @@ restart). The implemented verdicts record the known product gaps the spec
 expects to FAIL (byte-only `statvfs`, the weighted-time disk await, the empty
 required-interface list) rather than masking them.
 
+## GF-GENERAL-LIVE host/device categories (phase 2)
+
+Phase 2 adds the host/device categories 002 memory/swap, 005 shared storage,
+007 SMART, 010 EFA/RDMA counters, 012 GPU missing and 015 BMC
+(`scripts/e2e/regional/general_live_memory.py`, `general_live_shared.py`,
+`general_live_devices.py`). Every required variant is in the registry so none
+drops out of the denominator, but only the variants that need no raw-source
+replay fixture are executable on this site: 002 `memory_pressure`/`recovery`
+(native host memory pressure in a capped cgroup, behind `HOST_MEMORY_PRESSURE`)
+and `no_swap`, plus 007 `healthy` (a read-only observation that the real SMART
+reading mints no finding). Their module tests under
+`tests/regional/test_general_live_memory.py` and
+`tests/regional/test_general_live_phase2.py` run the verdict logic against
+scripted product records with fakes; they are not proof of a physical fault.
+
+The rest stay `NOT_RUN`: `FIXTURE_NOT_READY` for 007/010/012/015 and a few
+002/005 variants, which need the targeted command/file reading
+(`smartctl`/`ipmitool`/`ethtool`/`nvidia-smi` output, `/proc/meminfo`, the EFA
+`hw_counters`/`state` sysfs, `/proc/driver/nvidia`) replaced only inside the
+one host-collector unit's private environment -- a shared raw-source replay
+helper that phase 2 does not build and leaves to central review, never
+replacing a host binary or a global mount; `CAPABILITY_ABSENT` where the site
+genuinely lacks the capability (no independent NFS/Lustre export, no non-EFA
+RDMA device, no BMC on EC2, no swap device); and `VENDOR_LAB_ONLY` for the
+012 variants that need a real GPU off the bus and an approved provider reboot
+(this lane never unbinds or removes a real GPU). The spec's expected product
+gaps (SMART scan-failure handling, EFA counters reported as zero, dual GPU
+read-failure treated as zero cards, statvfs-OK-but-I/O-fails shared storage)
+are recorded in the variants' reasons rather than hidden.
+
 ## GF-GENERAL-LIVE live acceptance runner (phase 2)
 
 Phase 2 adds the workload- and spare-centred categories through

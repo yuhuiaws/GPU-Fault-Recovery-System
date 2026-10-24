@@ -549,6 +549,38 @@ netdev 写进安装器/管理配置的 `GPU_FAULT_REQUIRED_INTERFACES`（默认�
 006 `sustained_latency`、008/009 的 veth/dummy/netem 需 `KERNEL_MODULE_LOAD`
 或预装内核模块。运行器只做只读 `--plan` 预检，`--execute` 由运维在授权窗口执行。
 
+### phase 2 范围（host/device 扩展）
+
+第二批补充 host/device 类别 002 内存/交换、005 共享存储、007 SMART、
+010 EFA/RDMA 计数、012 GPU 掉卡、015 BMC（模块
+`general_live_memory`/`general_live_shared`/`general_live_devices`，每个必测变体
+都在注册表里）。可在本站真机执行的只有不需要原始源回放夹具的变体：
+
+- 002 `memory_pressure`、`recovery`（native，复用节点探针 `memory-start` 的受限
+  cgroup 压力和 meminfo oracle，需 `HOST_MEMORY_PRESSURE`；`memory_used_percent`
+  ≥95% 持续 120 秒 → VALIDATE_HOST 探针在加载期间失败，无 reset/reboot）；
+  `no_swap`（observation：确认 `SwapTotal=0` 时 swap 规则天然不触发）。
+- 007 `healthy`（observation：只读确认真实 SMART 判定健康且不产生存储 finding，
+  作为失败变体的对照基线）。
+
+其余变体按映射文件留在分母并记 `NOT_RUN`，原因精确可查：
+
+- `FIXTURE_NOT_READY`：007/010/012/015 以及 002 `read_failure`、005 `stat_timeout`
+  /`io_only_failure` 需要把 `smartctl`/`ipmitool`/`ethtool`/`nvidia-smi` 的输出或
+  `/proc/meminfo`、EFA `hw_counters`/`state`、`/proc/driver/nvidia` 的读取**只在
+  host collector 单元私有环境里**替换的共享原始源回放夹具。本阶段不构建该通用
+  回放器（由协调方集中审查后统一提供）；不替换宿主二进制、不写全局挂载。
+- `CAPABILITY_ABSENT`：005 的共享存储变体（本站无可扰动的独立 NFS/Lustre export）、
+  010 `non_efa`（本站只有 EFA RDMA 设备）、015 `healthy`/`unsupported_bmc`
+  （EC2 无 BMC）、002 `swap_pressure`（无 swap 且不得为测试开 swap）。
+- `VENDOR_LAB_ONLY`：012 `confirmed_missing`/`reboot_verified`/`post_reboot_failure`
+  需要真实掉卡与已批准的 provider reboot；本 lane 绝不解绑或移除真实 GPU。
+- `cgroup_only`（002）需要一个有界的自身 cgroup OOM 注入模式，节点探针尚未提供。
+
+现有的 `probes/collector_window_probe.py` 的 nvidia-smi shadow 只匹配库存快照查询
+（026 身份路径），不覆盖 host collector 的 `uuid,utilization.gpu` 查询，故 012
+`single_sample` 仍记 `FIXTURE_NOT_READY` 等待 host 查询 shadow。
+
 ### phase 2 范围与前提（工作负载/热备类）
 
 第二批补 011 EFA 流量停滞/NCCL hung、027 训练进度、030 热备不健康；均用受管的

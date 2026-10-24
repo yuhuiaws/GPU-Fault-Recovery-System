@@ -55,6 +55,7 @@ test_cases:
   expected: [按memory和swap各自规则触发, 实际验证原指标且读取失败保留UNKNOWN, 清理后主机与采集及原任务正常]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-002
+  related_pytest: tests/regional/test_general_live_memory.py::test_memory_pressure_passes_the_diagnostic_chain
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-003
   title: 真机低利用率及资源异常的任务归属
@@ -113,6 +114,7 @@ test_cases:
   expected: [passed=false经真实解析到隔离回执, 扫描失败和能力缺失不伪装健康, 不损坏介质且清理后真实工具恢复]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-007
+  related_pytest: tests/regional/test_general_live_phase2.py::test_smart_healthy_passes_when_no_finding
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-008
   title: 真机必需网卡故障与角色隔离
