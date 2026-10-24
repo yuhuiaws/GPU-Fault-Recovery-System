@@ -240,7 +240,7 @@ requirements:
     assertions:
       - CPU, memory and swap observations reach the real validation adapter with unhealthy and recovered outcomes.
       - Filesystem, SMART, BMC and required-interface faults execute the actual isolation adapter against a local client.
-      - Query and scan failures, including a SMART scan failure, retain observation errors without manufacturing hardware workflows.
+      - Query and scan failures, including a SMART scan failure and a GPU inventory whose NVML and procfs reads both failed, retain observation errors without manufacturing hardware workflows.
       - All OS and Kubernetes effects remain fixture-owned; this is not physical acceptance.
     cases: [GF-GENERAL-SW-001, GF-GENERAL-SW-002, GF-GENERAL-SW-003]
     checks:
@@ -249,7 +249,7 @@ requirements:
       - nodeid: tests/host_health/test_general_fault_observation_e2e.py::test_hardware_fault_reaches_real_quarantine_adapter
         expected: 5
       - nodeid: tests/host_health/test_general_fault_observation_e2e.py::test_observation_failure_does_not_isolate_node
-        expected: 4
+        expected: 5
   - id: GF-REQ-GENERAL-001
     family: fault-policy
     title: CPU saturation complete acceptance

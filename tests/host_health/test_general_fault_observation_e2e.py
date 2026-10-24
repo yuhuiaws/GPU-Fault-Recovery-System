@@ -113,7 +113,7 @@ def test_hardware_fault_reaches_real_quarantine_adapter(tmp_path, monkeypatch, k
 
 
 @pytest.mark.parametrize(
-    "kind", ["smart-query", "smart-scan", "bmc-query", "net-unknown"]
+    "kind", ["smart-query", "smart-scan", "bmc-query", "net-unknown", "gpu-unknown"]
 )
 def test_observation_failure_does_not_isolate_node(tmp_path, monkeypatch, kind):
     rig = HostFaultRig(tmp_path, monkeypatch, kind)

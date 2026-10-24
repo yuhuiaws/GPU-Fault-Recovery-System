@@ -76,7 +76,7 @@ def test_software_cases_have_separate_exact_behavioral_checks():
         "GF-GENERAL-SW-002",
         "GF-GENERAL-SW-003",
     ]
-    assert [check.expected for check in requirement.checks] == [6, 5, 4]
+    assert [check.expected for check in requirement.checks] == [6, 5, 5]
     assert [CATALOG[case]["pytest_nodeid"] for case in requirement.cases] == [
         check.nodeid for check in requirement.checks
     ]

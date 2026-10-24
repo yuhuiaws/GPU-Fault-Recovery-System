@@ -39,6 +39,7 @@ CONTRIBUTORS = {
     "smart": "_smart",
     "smart-query": "_smart",
     "smart-scan": "_smart",
+    "gpu-unknown": "_gpu_inventory",
     "bmc": "_bmc",
     "bmc-query": "_bmc",
     "net-missing": "_network",
@@ -103,6 +104,9 @@ class HostFaultRig:
             statvfs=lambda _: SimpleNamespace(
                 f_blocks=100, f_frsize=4096, f_bavail=1 if self.broken else 80
             ),
+            # Only the GPU inventory case configures an invariant; its
+            # ``/proc/driver/nvidia/gpus`` does not exist under ``proc``.
+            expected_gpu_count=8 if kind == "gpu-unknown" else None,
             edge_filter_enabled=False,
             now=lambda: self.clock,
         )
@@ -194,6 +198,10 @@ class HostFaultRig:
                     argv, 0, "# scan_smart_devices: glob(3) aborted\n", ""
                 )
             return CompletedProcess(argv, 0, "/dev/test -d scsi\n", "")
+        if argv[0] == "nvidia-smi" and self.kind == "gpu-unknown":
+            return CompletedProcess(
+                argv, 255, "", "Failed to initialize NVML: Unknown Error"
+            )
         if argv == ["smartctl", "-H", "-j", "/dev/test"]:
             if self.kind == "smart-query":
                 return CompletedProcess(argv, 2, "not-json", "query failed")

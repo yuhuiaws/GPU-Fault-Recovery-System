@@ -1,6 +1,6 @@
 """A host read that failed, or never existed, is missing evidence.
 
-GF-GENERAL-LIVE-007/010: an unreadable source must read UNKNOWN (a
+GF-GENERAL-LIVE-007/010/012: an unreadable source must read UNKNOWN (a
 collection error, so validation waits and nothing is graded), a source the
 node cannot provide must say NOT_SUPPORTED, and neither may be reported as a
 healthy reading or as a zero. Every case drives the real contributor through
@@ -402,4 +402,114 @@ def test_a_non_numeric_ethtool_counter_is_unknown_not_zero(host_case):
     )
     assert any("cq_err" in error for error in batch.collection_errors), (
         batch.collection_errors
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 012 GPU inventory
+# --------------------------------------------------------------------------- #
+NVML_FAILURE = ("", "Failed to initialize NVML: Unknown Error\n", 255)
+
+
+def gpu_collector(case, *, procfs: str):
+    gpus = case.roots.proc / "driver/nvidia/gpus"
+    if procfs == "unreadable":
+        support.write_file(gpus, "not a directory\n")
+    collector = case.build(
+        "_gpu_inventory",
+        expected_gpu_count=8,
+        inventory_mismatch_consecutive_samples=2,
+        node_instance_type="ml.p5.48xlarge",
+    )
+    return collector
+
+
+@pytest.mark.parametrize("procfs", ["absent", "unreadable"])
+def test_two_failed_gpu_inventory_reads_are_unknown_not_zero_gpus(host_case, procfs):
+    """NVML failed and ``/proc/driver/nvidia/gpus`` could not be read.
+
+    The procfs fallback returned 0 for an unreadable directory, so two failed
+    reads became "0 of 8 GPUs" and, on the second tick, a CRITICAL
+    REBOOT_NODE finding (GF-GENERAL-LIVE-012 ``query_failed`` /
+    ``proc_unreadable``).
+    """
+
+    collector = gpu_collector(host_case, procfs=procfs)
+    host_case.outputs[tuple(collector.GPU_QUERY_ARGV)] = NVML_FAILURE
+    policy = NodeHealthPolicy(build_store())
+
+    for _ in range(3):
+        batch = collector.collect_once()
+        names = {sample.name for sample in batch.samples}
+        assert names == {"gpu_inventory_expected_count"}, (
+            f"an unknown inventory reported a count: {batch.samples}"
+        )
+        (sample,) = batch.samples
+        assert sample.labels["failure_mode"] == "INVENTORY_UNAVAILABLE", sample
+        assert "discovered_count" not in sample.labels, sample
+        assert any(
+            "NVML" in error and "/proc/driver/nvidia/gpus" in error
+            for error in batch.collection_errors
+        ), batch.collection_errors
+        assert policy.evaluate_metrics(batch) == [], (
+            "two failed reads must never mint a missing-GPU REBOOT_NODE"
+        )
+        host_case.clock.sleep(15)
+
+
+def test_a_partial_gpu_listing_never_reports_a_fabricated_discovered_count(host_case):
+    """Seven listed GPUs plus an error line is still evidence of a missing GPU,
+    but an unreadable procfs is no evidence of "zero bound GPUs"."""
+
+    collector = gpu_collector(host_case, procfs="absent")
+    host_case.outputs[tuple(collector.GPU_QUERY_ARGV)] = (
+        "".join(f"GPU-{index}, 10\n" for index in range(7))
+        + "Unable to determine the device handle for GPU 0000:07:00.0: Unknown Error\n",
+        "Unable to determine the device handle for GPU 0000:07:00.0\n",
+        255,
+    )
+
+    collector.collect_once()
+    host_case.clock.sleep(15)
+    batch = collector.collect_once()
+
+    samples = {sample.name: sample for sample in batch.samples}
+    assert "gpu_inventory_discovered_count" not in samples, batch.samples
+    assert samples["gpu_inventory_active_count"].value == 7, samples
+    assert samples["gpu_inventory_mismatch"].value == 1, (
+        "the listed shortfall is still graded on its own evidence"
+    )
+    assert "discovered_count" not in samples["gpu_inventory_mismatch"].labels, samples
+    assert samples["gpu_inventory_mismatch"].labels["failure_mode"] == (
+        "DRIVER_QUERY_FAILED"
+    ), samples
+
+
+def test_an_unknown_gpu_inventory_neither_confirms_nor_clears_the_missing_streak(
+    host_case,
+):
+    """Only valid samples count toward the consecutive-mismatch confirmation.
+
+    The unknown tick between two valid "7 of 8" readings used to be a third
+    "missing" reading of its own (0 of 8) and confirmed the loss by itself;
+    it now leaves the streak where the last valid reading put it, as the
+    NVML-failure path with a readable procfs already did.
+    """
+
+    collector = gpu_collector(host_case, procfs="absent")
+    argv = tuple(collector.GPU_QUERY_ARGV)
+    listed = ("".join(f"GPU-{index}, 10\n" for index in range(7)), "", 0)
+    readings = []
+    for answer in (listed, NVML_FAILURE, listed):
+        host_case.outputs[argv] = answer
+        readings.append(support.values(collector.collect_once()))
+        host_case.clock.sleep(15)
+
+    first, unknown, confirmed = readings
+    assert first[("gpu_inventory_mismatch", None)] == 0, "one sample is not a loss"
+    assert ("gpu_inventory_mismatch", None) not in unknown, (
+        f"the unknown tick graded the inventory: {unknown}"
+    )
+    assert confirmed[("gpu_inventory_mismatch", None)] == 1, (
+        f"two valid missing readings confirm the loss: {confirmed}"
     )

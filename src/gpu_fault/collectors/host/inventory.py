@@ -156,8 +156,13 @@ class HostInventoryMixin:
                 # rule the query exists to feed could not fire (F-H6). The
                 # samples ride out on ``_partial_samples`` and the error still
                 # names the contributor.
-                discovered = self._discovered_gpu_count()
-                if not gpu_uuids and discovered > 0:
+                discovered, unreadable = self._discovered_gpu_count()
+                failure = "GPU inventory query failed: " + completed.stderr.strip()
+                if unreadable is not None:
+                    failure += (
+                        f"; {unreadable}, so the bound GPU count is unknown as well"
+                    )
+                if not gpu_uuids and (discovered is None or discovered > 0):
                     # Not one GPU listed while the driver has several bound is
                     # not "every GPU vanished", it is one broken userspace
                     # query -- "Failed to initialize NVML: Driver/library
@@ -165,7 +170,11 @@ class HostInventoryMixin:
                     # reboot, which lands on every node of the fleet at once.
                     # A mismatch here would mean fleet-wide REBOOT_NODE, so
                     # only the context ships and the streak counter is left
-                    # alone.
+                    # alone. Not one GPU listed while the driver's own list
+                    # could not be read either is two failed reads, not zero
+                    # GPUs (GF-GENERAL-LIVE-012): the procfs fallback used to
+                    # report an unreadable directory as 0 bound, and the
+                    # second such tick minted REBOOT_NODE.
                     self._partial_samples.extend(
                         self._driver_query_failure_samples(
                             expected=self.expected_gpu_count,
@@ -182,9 +191,7 @@ class HostInventoryMixin:
                             extra_labels={"failure_mode": "DRIVER_QUERY_FAILED"},
                         )
                     )
-                raise CollectorError(
-                    "GPU inventory query failed: " + completed.stderr.strip()
-                )
+                raise CollectorError(failure)
             samples.extend(
                 self._inventory_samples(
                     resource="gpu",
@@ -215,53 +222,64 @@ class HostInventoryMixin:
         return uuids
 
     def _driver_query_failure_samples(
-        self, *, expected: int, discovered: int
+        self, *, expected: int, discovered: int | None
     ) -> list[HostMetricSample]:
         """Context for a driver query that listed nothing, minus any verdict.
 
         The consumer's inventory rule reads ``gpu_inventory_mismatch``; these
         samples deliberately do not carry it, so the operator sees the node and
         the failure mode without a destructive action being derived from a
-        number ``nvidia-smi`` never produced.
+        number ``nvidia-smi`` never produced. ``discovered`` is None when the
+        driver's own list could not be read either: the inventory is then
+        ``INVENTORY_UNAVAILABLE`` and no count of any kind is reported.
         """
 
         labels = {
             "resource": "GPU",
             "expected_count": str(expected),
-            "discovered_count": str(discovered),
-            "failure_mode": "DRIVER_QUERY_FAILED",
+            "failure_mode": "DRIVER_QUERY_FAILED"
+            if discovered is not None
+            else "INVENTORY_UNAVAILABLE",
         }
+        if discovered is not None:
+            labels["discovered_count"] = str(discovered)
         if self.node_instance_type:
             labels["node_instance_type"] = self.node_instance_type
-        return [
+        samples = [
             HostMetricSample(
                 name="gpu_inventory_expected_count",
                 value=expected,
                 unit="gpus",
                 labels=labels,
-            ),
-            HostMetricSample(
-                name="gpu_inventory_discovered_count",
-                value=discovered,
-                unit="gpus",
-                labels=labels,
-            ),
+            )
         ]
+        if discovered is not None:
+            samples.append(
+                HostMetricSample(
+                    name="gpu_inventory_discovered_count",
+                    value=discovered,
+                    unit="gpus",
+                    labels=labels,
+                )
+            )
+        return samples
 
-    def _discovered_gpu_count(self) -> int:
+    def _discovered_gpu_count(self) -> tuple[int | None, str | None]:
         """GPUs the driver has bound, counted without ``nvidia-smi``.
 
         ``/proc/driver/nvidia/gpus/<pci-address>`` is one directory per GPU the
         kernel module attached, which is the same role ``pci_devices_root``
         plays for EFA: it separates "the device is gone" from "the userspace
-        query failed".
+        query failed". The module creates the directory when it loads, so an
+        empty one is a real "no GPU bound"; one that is missing or unreadable
+        is no reading at all and returns ``(None, why)`` -- never 0.
         """
 
         root = self.proc_root / "driver" / "nvidia" / "gpus"
         try:
-            return sum(1 for entry in root.iterdir() if entry.is_dir())
-        except OSError:
-            return 0
+            return sum(1 for entry in root.iterdir() if entry.is_dir()), None
+        except OSError as exc:
+            return None, f"{root} could not be read ({exc.strerror or exc})"
 
     def _efa_inventory(self, _: datetime) -> list[HostMetricSample]:
         samples = []
