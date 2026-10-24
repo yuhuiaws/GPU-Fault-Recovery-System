@@ -61,7 +61,7 @@ class FakeSpareSession:
         self.declared = True
         return {"refusals": []}
 
-    def node(self) -> dict[str, Any]:
+    def node_snapshot(self) -> dict[str, Any]:
         return self._node
 
     def grade(self) -> dict[str, Any]:

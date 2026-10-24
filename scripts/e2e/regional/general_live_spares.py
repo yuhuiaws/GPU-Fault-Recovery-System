@@ -156,6 +156,11 @@ class SpareSession:
     def declare(self) -> dict[str, Any]:
         from gpu_fault.admin import warm_spare
 
+        # Register the release before the declaration can touch the cluster, so
+        # a node that was labelled/cordoned is always put back even if the
+        # declare raises after it mutated. ``release`` reads the on-disk record
+        # to decide whether anything was in fact declared.
+        self.ctx.cleanup.push("warm-spare", self.release)
         report = warm_spare.perform_warm_spare(
             self._node_api(),
             warm_spare.WarmSpareRequest(
@@ -172,7 +177,6 @@ class SpareSession:
             agent_lookup=self._agent_lookup(),
         )
         self._declared = True
-        self.ctx.cleanup.push("warm-spare", self.release)
         self.ctx.evidence.write("spare-declare", report)
         if report.get("refusals"):
             raise VariantInconclusive(
@@ -183,10 +187,29 @@ class SpareSession:
     def release(self) -> dict[str, Any]:
         from gpu_fault.admin import warm_spare
 
-        if not self._declared:
-            return {"released": False}
+        # The on-disk record is the proof of what reached the cluster: the admin
+        # declare writes ``declared_state`` only after it has verified the node
+        # is labelled and cordoned. Without such an unreleased record -- a
+        # declare refused or failed before its patch, or one already released --
+        # there is nothing of ours to put back, so cleanup is "nothing declared"
+        # and must leave the node exactly as it was found.
+        record = warm_spare.read_record(self.record)
+        self._declared = False
+        if (
+            record is None
+            or record.get("released_at")
+            or "declared_state" not in record
+        ):
+            receipt: dict[str, Any] = {
+                "released": False,
+                "restored": None,
+                "declared_spares": [],
+            }
+            self.ctx.evidence.write("spare-release", receipt)
+            return receipt
+        api = self._node_api()
         report = warm_spare.perform_warm_spare(
-            self._node_api(),
+            api,
             warm_spare.WarmSpareRequest(
                 state_dir=self.record.parent,
                 node=self.node,
@@ -200,8 +223,17 @@ class SpareSession:
             record=self.record,
             agent_lookup=self._agent_lookup(),
         )
-        self._declared = False
-        return report
+        # The receipt proves the release: the restored node state the admin
+        # verified, and the declared-spare set the released node is now out of.
+        document = report.get("release") or {}
+        receipt = {
+            "released": True,
+            "restored": document.get("restored_state"),
+            "declared_spares": warm_spare.declared_spares(api),
+            "report": report,
+        }
+        self.ctx.evidence.write("spare-release", receipt)
+        return receipt
 
     def _node_api(self) -> Any:
         from scripts.e2e.regional.declare_warm_spare import node_api
@@ -213,7 +245,10 @@ class SpareSession:
 
         return store_agent_lookup(self.warm)
 
-    def node(self) -> dict[str, Any]:
+    def node_snapshot(self) -> dict[str, Any]:
+        # Not ``node``: that name holds the spare node *name* (a string). An
+        # accessor sharing it would shadow the string and be uncallable
+        # (TypeError: 'str' object is not callable; live 2026-10-24).
         value = self.warm.node_snapshot(
             self.node,
             extra_annotation_keys=(
@@ -233,8 +268,29 @@ class SpareSession:
         return store
 
     def stop_kubelet(self) -> dict[str, Any]:
+        import hashlib
+        import json
+
         from scripts.e2e.regional.warm_spare_fixture import WarmSpareServiceFixture
 
+        # The service window binds an independent on-node restore to an approved
+        # plan digest (64 hex) and an absolute, timezone-aware expiry. This stop
+        # carries no remediation Plan, so the digest is over the approved action
+        # itself; the expiry is the variant's own maintenance deadline (a
+        # ``datetime``, not its ISO string -- the window reads ``.timestamp()``).
+        plan_sha256 = hashlib.sha256(
+            json.dumps(
+                {
+                    "case": self.ctx.spec.key,
+                    "run_id": self.ctx.run_id,
+                    "node": self.node,
+                    "service": "kubelet.service",
+                    "intent": "warm-spare-unhealthy-not-ready",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         service = WarmSpareServiceFixture(
             self.warm,
             node=self.node,
@@ -242,10 +298,10 @@ class SpareSession:
             case_id=self.ctx.spec.key,
             run_id=self.ctx.run_id,
             state_directory=self.ctx.case_dir / "spare-service",
-            node_uid=self.node().get("uid", ""),
-            plan_sha256="",
+            node_uid=self.node_snapshot().get("uid", ""),
+            plan_sha256=plan_sha256,
             release_id=self.ctx.regional.release_id(),
-            maintenance_expires_at=self.ctx.deadline.isoformat(),
+            maintenance_expires_at=self.ctx.deadline,
         )
         service.create()
         self.ctx.cleanup.push("spare-kubelet", service.cleanup)
@@ -410,7 +466,7 @@ def block_only_verdict(
 def not_ready(ctx: VariantContext) -> dict[str, Any]:
     session = _declared(ctx)
     stopped = session.stop_kubelet()
-    node = session.node()
+    node = session.node_snapshot()
     oracle_ok = node.get("ready") not in ("True", None)
     return block_only_verdict(
         node,
@@ -430,7 +486,7 @@ def stale_metrics(ctx: VariantContext) -> dict[str, Any]:
     store = session.grade()
     observation = store.get("observation_reasons") or []
     return block_only_verdict(
-        session.node(),
+        session.node_snapshot(),
         store,
         expected_class=OBSERVATION,
         expected_fragment="collector observation UNKNOWN",
@@ -443,7 +499,7 @@ def stale_metrics(ctx: VariantContext) -> dict[str, Any]:
 def configuration_error(ctx: VariantContext) -> dict[str, Any]:
     session = _declared(ctx)
     session.mutate({POOL_STATE_ANNOTATION: "UNAVAILABLE"})
-    node = session.node()
+    node = session.node_snapshot()
     oracle_ok = (node.get("annotations") or {}).get(
         POOL_STATE_ANNOTATION
     ) == "UNAVAILABLE"
@@ -470,7 +526,7 @@ def reserved_spare(ctx: VariantContext) -> dict[str, Any]:
             POOL_STATE_ANNOTATION: "ALLOCATED",
         }
     )
-    node = session.node()
+    node = session.node_snapshot()
     store = session.grade()
     oracle_ok = (node.get("annotations") or {}).get(RESERVATION_ANNOTATION) == foreign
     # Grade for a DIFFERENT incident than the reservation holder: the reserved

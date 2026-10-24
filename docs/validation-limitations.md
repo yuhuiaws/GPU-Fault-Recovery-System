@@ -1098,6 +1098,26 @@ managed-job variant with the runner's own settings, fixtures and journals --
 only the kubectl subprocess, the store read and the host probes are fakes --
 up to its first cluster mutation.
 
+GF-GENERAL-LIVE-030 (warm spare unhealthy) is the same story on the HyperPod
+lane: its `SpareSession` keeps the spare node *name* in `self.node` and also
+defined a `node()` accessor, so the instance attribute shadowed the method and
+every `session.node()` / `self.node()` tried to call a string (live 2026-10-24,
+`not_ready` and `stale_metrics`, `TypeError: 'str' object is not callable`). The
+accessor is now `node_snapshot()`; `stop_kubelet` also passed the deadline as an
+ISO string and an empty plan digest to the service window, both of which the
+rename then exposed, and now passes the deadline `datetime` and a real digest of
+the approved stop. The declared spare is always released with an auditable
+receipt: the release cleanup is registered before the declaration can change the
+cluster, reads the on-disk record to decide whether anything was in fact
+declared, and the receipt records `released`/`restored` and the declared-spare
+set the node is now out of; a declare refused before any cluster change cleans
+up as "nothing declared" and leaves the node untouched.
+`tests/regional/test_general_live_spare_session_start.py` drives all four
+executable 030 variants with the runner's own objects -- only the kubectl
+subprocess, `cpu_python` and the host probes are fakes, and the warm-spare node
+patches apply in memory so a spare is really declared and released -- up to the
+first host-probe mutation, and asserts the release bookkeeping.
+
 ## GF-GENERAL-LIVE DCGM / GPU-inventory replay (phase 2)
 
 Phase 2 adds the DCGM-field and GPU-inventory categories (019 ECC/row remap/
