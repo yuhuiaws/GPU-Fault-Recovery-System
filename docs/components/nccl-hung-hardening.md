@@ -388,15 +388,45 @@ subreaper guard 回收整个工具子树；父进程超时可返回部分证据�
 硬件故障仍由既有硬件恢复优先级处理，不能由 hung 证据授权重启。
 `TRAINING/HUNG_DIAGNOSTIC` 步骤失败以 `ESCALATED` 收尾，而不是通用只读诊断的
 `RECOVERED`，避免把未取到证据当成训练恢复。
+只读 hung DAG 总会走到 `ESCALATE_SUPPORT`：某个取证/验证步骤 FAILED（含 600 s
+单步上限）时，该步骤保留 FAILED 记录并与依赖它输出的步骤一起退役
+（`superseded_step_indexes`，`PLAN_REWRITE` 事件 code `HUNG_SUPPORT_HANDOFF`），
+不依赖它的取证继续执行，`ESCALATE_SUPPORT` 在依赖解决后照常运行；workflow 以
+该失败为 `terminal_failure_reason` 结束为 FAILED，incident 为 `ESCALATED`，从不写
+`diagnostic inconclusive`。超过执行期限后不再启动新步骤，只有交接仍运行；
+超过 lifetime 则按既有路径交给 `ESCALATE_OPERATOR`。计划里一旦含任何改动节点的
+操作（合并后的复位/重启等），仍走原失败语义。普通只读诊断（详细设计 §6.3）不变。
+（HyperPod 真机 GF-GENERAL-LIVE-011：VALIDATE_FABRIC 等满 600 s 后 FAILED，
+`ESCALATE_SUPPORT` 从未执行，没有工单也没有通知。）
 NCCL 流程结束只表示取证完成/转人工，不表示训练已恢复。Fabric 验证是
 相关节点已有遥测验证，不是新启动跨节点 NCCL benchmark，也不等待 step 推进。
 新 hung 流程要求 `training_fabric_by_node` 中来自可信任务设备绑定的
 `basis=TASK_DEVICE_BINDING`、`network_interfaces`、`rdma_ports`。
 只验证这些设备，逐端口缺项返回 UNKNOWN；只有管理网卡正常不能通过训练网络检查。
-未显式绑定时，summary 可通过 `rdma -j resource show qp` 中任务 GPU PID 的活跃
+未显式绑定时，summary 可通过 `rdma -j resource show qp` 中任务 GPU 进程的活跃
 RTR/RTS QP 自动建立绑定，复查 PID/starttime/cgroup 和 sysfs 端口存在性；
 任何参与者缺映射仍 UNKNOWN。它证明任务进程使用这些 RDMA 资源，不证明资源只用于
 NCCL；不能从管理网卡或 RAS bootstrap 地址猜训练数据端口。
+该表的 `pid` 是**创建 QP 的线程**而不是进程：内核 `fill_res_name_pid` 输出
+`task_pid_vnr(res->task)`，用户态 QP 的 restrack task 是创建时的 `current`
+（torvalds/linux `drivers/infiniband/core/nldev.c`、`restrack.c`、`verbs.c`）；
+NCCL 在 proxy 线程调用网络插件的 listen/connect/accept（`src/transport/net.cc`
+的 `recvProxySetup`、`sendProxyConnect`、`recvProxyConnect`），aws-ofi-nccl 按
+调用线程创建 endpoint（`get_ep(domain_key, nccl_net_ofi_gettid())`），EFA QP 随之
+建在 proxy 线程上。Agent 因此把 QP 的线程号经 `/proc/<pid>/task/<tid>` 归到所属
+rank 进程；归不到参与者的线程（其他作业、内核 QP）不计入。早于此修复的 Agent
+在真实 NCCL/EFA 任务上从来匹配不到 rank PID，绑定总是 UNKNOWN
+（`reason=TASK_RDMA_COVERAGE_INCOMPLETE` 为参与者未全覆盖）。
+任务端口范围无法确定时（未绑定或绑定无效），只要本 workflow 之后有
+`ESCALATE_SUPPORT`，VALIDATE_FABRIC 立即以显式 UNKNOWN 结束：步骤 SUCCEEDED，
+`details.fabric_status=UNKNOWN`、`fabric_evidence_scope=TASK_SCOPE_UNAVAILABLE`
+（部分节点已绑定时为 `PARTIAL_TASK_SCOPE`）、`validated_nodes` 不含这些节点、
+`unvalidated_nodes`，`task_fabric_unknown_nodes.<node>` 带 `reason`
+（`TASK_NIC_PORT_SCOPE_UNAVAILABLE`/`INVALID_TASK_DEVICE_BINDING`）以及该节点复查
+summary 自报的 `scope_basis`、`scope_reason`、`scope_source`、进程覆盖计数
+（未回报时 `scope_basis=NOT_REPORTED`）。复查 summary 已经跑过，之后没有任何东西
+会再填这个范围，等待只会耗尽单步上限。后面没有交接的 workflow 仍等待，
+不让 UNKNOWN 以 SUCCEEDED 结束成 `RECOVERED`。
 带宽、邻接、GPU P2P 实测需另行协调暂停或终止训练，本流程不自动执行。
 
 ### 千卡配置和边界

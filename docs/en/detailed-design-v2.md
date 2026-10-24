@@ -3499,6 +3499,12 @@ the TERMINAL event carries `details.diagnostic_inconclusive=true`, the incident'
 keeps the job from restarting for an hour": the diagnostic workflow never repaired anything, yet it parked the incident in ESCALATED holding
 job recovery hostage. A `VALIDATE_HOST` acting as a gate (followed by a restart) does not count as diagnostics; its failure still escalates.
 
+The exception does not apply to the read-only NCCL/EFA hung diagnostic DAG (steps carry the `HUNG_DIAGNOSTIC` contract and it ends with
+`ESCALATE_SUPPORT`): the training may still be hung and the verdict belongs to a human. When one of its evidence/validation steps fails only the
+steps that need its output are retired (`PLAN_REWRITE` event `HUNG_SUPPORT_HANDOFF`), the remaining evidence and `ESCALATE_SUPPORT` still run, the
+workflow ends FAILED with that failure and the incident `ESCALATED`; a VALIDATE_FABRIC whose task port scope cannot be determined ends with an
+explicit `fabric_status=UNKNOWN` instead of waiting (`components/nccl-hung-hardening.md`).
+
 ### 6.4 Transition-by-Transition Table
 
 The 7 values of `ActionDisposition` are the basis for branching at entry: `PENDING_CORRELATION` (waiting for the window),
