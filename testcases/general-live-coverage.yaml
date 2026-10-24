@@ -45,7 +45,7 @@ rows:
   - number: 11
     cases: [GF-GENERAL-LIVE-011]
     proof_modes: [native, live-replay]
-    variants: [active_to_zero, always_low, write_progress, phase_progress, broken_pair, attempt_change, fr_enabled, fr_disabled, simultaneous_nodes, unreachable_node, large_job, few_candidates, ambiguous_candidates, different_process_groups, no_step_no_rank, active_window_resume, fr_temporal_completion, fr_second_missing, fr_whole_group, pyspy_nonzero, role_mismatch, tid_namespace, wchan_zero, cpu_interval, fr_plus_process]
+    variants: [active_to_zero, always_low, write_progress, phase_progress, broken_pair, attempt_change, fr_enabled, fr_disabled, simultaneous_nodes, repeat_after_recovery, unreachable_node, large_job, few_candidates, ambiguous_candidates, different_process_groups, no_step_no_rank, active_window_resume, fr_temporal_completion, fr_second_missing, fr_whole_group, pyspy_nonzero, role_mismatch, tid_namespace, wchan_zero, cpu_interval, fr_plus_process]
   - number: 12
     cases: [GF-GENERAL-LIVE-012]
     proof_modes: [live-replay, vendor-lab]

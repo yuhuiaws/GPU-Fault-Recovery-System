@@ -1005,7 +1005,9 @@ counter reads must show the pair at or above the active threshold before the
 stall and at or below the zero threshold for at least 600 s after it, on both
 nodes and with the job alive, or the variant is INCONCLUSIVE; the source
 fixture's own trainer moved about 74 KB per node over a whole live case, so a
-FAIL against it measured an injection that never happened; 030 declares
+FAIL against it measured an injection that never happened;
+`repeat_after_recovery` also needs the pair active between its two stalls for
+the product's rearm window; 030 declares
 one warm spare through the admin CLI under `DECLARE_WARM_SPARE` and always
 releases it). 027 enables the optional reporter only for its disposable test
 job (a Pod-local `training-progress` sidecar) and triggers a single per-cluster

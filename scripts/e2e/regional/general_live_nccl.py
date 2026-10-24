@@ -26,7 +26,12 @@ must stay at or below its zero threshold (``GPU_FAULT_EFA_TRAFFIC_ZERO_BPS``,
 1 B/s) for at least the 600 s hung threshold, with both Pods alive and the
 trainer reporting the stall. Without either the variant is INCONCLUSIVE, never
 FAIL: a job that never went active, or a pause that kept communicating, is not
-a triggered traffic rule. The deep triage/forensics variants (per-rank FR
+a triggered traffic rule. ``repeat_after_recovery`` stalls the job twice; in
+between its pair must stay active past the product's rearm window (a stall
+episode closes only after three samples over 120 s, which the host collector
+sends every 30 s for 180 s once traffic is back) or it is INCONCLUSIVE, and the
+second stall must open its own incident and workflow, chained to the first's
+(``hung_episode.py``). The deep triage/forensics variants (per-rank FR
 temporal completion, the second-dump-missing and whole-group cases, py-spy
 failure classification, role and thread/CPU comparison) need a reviewed test
 flight-recorder dump responder and a py-spy fault tool that are not wired this
@@ -39,7 +44,7 @@ from __future__ import annotations
 import math
 import re
 from collections.abc import Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import run_survey
@@ -47,7 +52,6 @@ from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
     run_identity,
-    utc_now,
 )
 from scripts.e2e.regional.general_live_nccl_job import MIN_ACTIVE_BPS, ManagedNcclJob
 from scripts.e2e.regional.general_live_registry import (
@@ -78,6 +82,20 @@ CLOCK_TOLERANCE_SECONDS = 5
 #: at the default 300 s health summary, the hung wait. The in-Pod watchdog
 #: (``general_live_nccl_job.STALL_MAX_SECONDS``) must outlast it.
 RUNNER_STALL_SECONDS = STALL_SETTLE_SECONDS + ZERO_HUNG_SECONDS + 300 + HUNG_BUDGET
+#: A stall episode closes, and a later stall can be a new one, only after
+#: sustained recovery (``efa_stall_episode.EfaRecoveryPolicy``): three delivered
+#: samples at or above its recovery threshold over 120 s, at most 60 s apart.
+#: The host collector delivers one every min(30, gap / 2) s for max(120 + 2
+#: spacings, 3 spacings) = 180 s once the pair is back over its noise floor
+#: (``collectors/host/efa_recovery_sampling.py``); later ones come 300 s apart.
+RECOVERY_SECONDS = 120
+RECOVERY_MIN_SAMPLES = 3
+RECOVERY_MAX_GAP_SECONDS = 60
+#: The recovery threshold without a trusted pre-stall baseline; with one it is a
+#: quarter of that baseline, under the active threshold for this job (< 4x it).
+RECOVERY_FALLBACK_BPS = 1048576
+#: The step a trainer line is about (``STALL step=``, ``RESUMED step=``).
+STEP = re.compile(r"\bstep=(\d+)")
 #: Incident states the hung chain does not leave on its own.
 SETTLED_STATES = frozenset({"ESCALATED", "RECOVERED", "QUARANTINED"})
 HUNG_SUFFIX = "-efa-traffic-hung_suspected"
@@ -331,6 +349,36 @@ def stall_event_errors(events: Mapping[str, Sequence[str]], mode: str) -> list[s
     return errors
 
 
+def stall_step(events: Mapping[str, Sequence[str]]) -> int | None:
+    """The step the trainer last reports stalling at."""
+
+    steps = [
+        int(match.group(1))
+        for lines in events.values()
+        for line in lines
+        if "STALL step=" in line and (match := STEP.search(line)) is not None
+    ]
+    return max(steps, default=None)
+
+
+def events_after(
+    events: Mapping[str, Sequence[str]], step: int
+) -> dict[str, list[str]]:
+    """Each Pod's trainer lines of a later stall: about a step after ``step``.
+
+    The log still holds the earlier stall and its ``RESUMED`` lines; a line
+    that names no step (an activity error) is kept.
+    """
+
+    def later(line: str) -> bool:
+        match = STEP.search(line)
+        return match is None or int(match.group(1)) > step
+
+    return {
+        pod: [line for line in lines if later(line)] for pod, lines in events.items()
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Product records (pure)
 # --------------------------------------------------------------------------- #
@@ -348,6 +396,29 @@ def _signal_incidents(records: dict[str, Any], suffix: str) -> list[dict[str, An
 def hung_incident(records: dict[str, Any]) -> dict[str, Any] | None:
     hung = _signal_incidents(records, HUNG_SUFFIX)
     return hung[0] if hung else None
+
+
+def episode(
+    records: dict[str, Any], started: datetime, until: datetime | None = None
+) -> dict[str, Any]:
+    """``records`` with only the incidents one stall raised.
+
+    Created from ``started`` and, with ``until``, before the next stall (both
+    less the clock tolerance); the workflows stay as read.
+    """
+
+    slack = timedelta(seconds=CLOCK_TOLERANCE_SECONDS)
+
+    def raised(item: Mapping[str, Any]) -> bool:
+        created = parse_time(item.get("created_at"))
+        return (
+            created is not None
+            and created >= started - slack
+            and (until is None or created < until - slack)
+        )
+
+    incidents = [item for item in records.get("incidents") or [] if raised(item)]
+    return {**records, "incidents": incidents}
 
 
 def _hung_workflow(records: dict[str, Any]) -> dict[str, Any]:
@@ -486,6 +557,68 @@ def timing_errors(
     return errors
 
 
+def episode_stages(
+    records: dict[str, Any], started: datetime, nodes: Sequence[str]
+) -> dict[str, list[str]]:
+    """The checks one stall wave's records must pass."""
+
+    return {
+        "chain": dag_errors(records),
+        "executed": execution_errors(records),
+        "escalated": escalated_errors(records),
+        "timing": timing_errors(records, started, nodes),
+        "merged": grouped_errors(records, expect_single=True),
+    }
+
+
+def repeat_errors(
+    first: dict[str, Any], second: dict[str, Any], before: dict[str, Any]
+) -> list[str]:
+    """The second stall opened its own hung incident and workflow.
+
+    After a rearm the product opens a new incident whose workflow names the
+    first one as its predecessor (``hung_episode.new_hung_episode``,
+    ``families/grouped_health.py``); otherwise the finding is only concurrent
+    evidence on the first incident. ``first``/``second``: each stall's records;
+    ``before``: the first stall's, read just before the second.
+    """
+
+    one = hung_incident(first)
+    if one is None:
+        return ["no first hung incident to repeat after"]
+    errors = []
+    earlier = hung_incident(before)
+    if earlier is not None:
+        known = set(earlier.get("reasons") or [])
+        absorbed = [
+            reason
+            for reason in one.get("reasons") or []
+            if CONCURRENT in str(reason) and reason not in known
+        ]
+        if absorbed:
+            errors.append(
+                f"the first hung incident {one.get('incident_id')} absorbed the "
+                f"second stall's evidence: {absorbed}"
+            )
+    two = hung_incident(second)
+    if two is None:
+        return [*errors, "the second stall raised no hung incident of its own"]
+    workflow, origin = two.get("workflow_request_id"), one.get("workflow_request_id")
+    if not workflow or workflow == origin:
+        return [
+            *errors,
+            f"the second hung incident has no workflow of its own: {workflow}",
+        ]
+    follows = ((second.get("workflows") or {}).get(workflow) or {}).get(
+        "predecessor_workflow_id"
+    )
+    if follows != origin:
+        errors.append(
+            f"the second hung workflow {workflow} follows {follows}, not the first {origin}"
+        )
+    return errors
+
+
 def no_suspicion_errors(records: dict[str, Any]) -> list[str]:
     raised = [
         str(item.get("event_id"))
@@ -591,6 +724,25 @@ def _thresholds(ctx: VariantContext) -> tuple[float, float]:
     )
 
 
+def rearm_seconds(ctx: VariantContext) -> int:
+    """How long the job must communicate normally before a second stall.
+
+    The collector's recovery delivery window, inside which the product closes
+    the first episode or not at all, plus three collector intervals of margin.
+    """
+
+    sustained = ctx.setting("GPU_FAULT_EFA_TRAFFIC_RECOVERY_SECONDS", RECOVERY_SECONDS)
+    samples = ctx.setting(
+        "GPU_FAULT_EFA_TRAFFIC_RECOVERY_MIN_SAMPLES", RECOVERY_MIN_SAMPLES
+    )
+    gap = ctx.setting(
+        "GPU_FAULT_EFA_TRAFFIC_RECOVERY_MAX_GAP_SECONDS", RECOVERY_MAX_GAP_SECONDS
+    )
+    spacing = min(30.0, gap / 2)
+    window = max(sustained + 2 * spacing, samples * spacing)
+    return math.ceil(window) + 3 * ctx.host_interval
+
+
 def _efa_window(
     ctx: VariantContext, *, seconds: float, name: str
 ) -> dict[str, list[dict[str, Any]]]:
@@ -646,8 +798,17 @@ def _prove_baseline(ctx: VariantContext, *, name: str, active: bool = True) -> N
         raise VariantInconclusive(f"{premise}: " + "; ".join(errors))
 
 
-def _prove_stalled(ctx: VariantContext, job: ManagedNcclJob, *, name: str) -> None:
-    """Zero traffic for the hung threshold, a live job, the trainer's account."""
+def _prove_stalled(
+    ctx: VariantContext,
+    job: ManagedNcclJob,
+    *,
+    name: str,
+    after_step: int | None = None,
+) -> dict[str, list[str]]:
+    """Zero traffic for the hung threshold, a live job, the trainer's account.
+
+    ``after_step``: an earlier stall's step; only later lines tell of this one.
+    """
 
     _minimum, zero = _thresholds(ctx)
     ctx.hold(STALL_SETTLE_SECONDS, name=f"{name}-settle")
@@ -658,12 +819,30 @@ def _prove_stalled(ctx: VariantContext, job: ManagedNcclJob, *, name: str) -> No
     ctx.evidence.write(f"{name}-job", {"liveness": liveness, "trainer": events})
     if not liveness.get("alive"):
         errors.append("the job did not stay alive through the stall")
-    errors.extend(stall_event_errors(events, job.stall_mode))
+    current = events if after_step is None else events_after(events, after_step)
+    errors.extend(stall_event_errors(current, job.stall_mode))
     if errors:
         raise VariantInconclusive(
             "the stall did not hold a live job at zero EFA traffic: "
             + "; ".join(errors)
         )
+    return events
+
+
+def _stall(
+    ctx: VariantContext,
+    job: ManagedNcclJob,
+    *,
+    name: str,
+    after_step: int | None = None,
+) -> tuple[datetime, dict[str, list[str]]]:
+    """Stall the job and prove it: ``(when, the trainer's account)``."""
+
+    started = ctx.clock()
+    ctx.cleanup.push("release", job.release)
+    ctx.evidence.write(f"{name}-stall", {"at": started.isoformat(), **job.stall()})
+    events = _prove_stalled(ctx, job, name=f"{name}-stalled", after_step=after_step)
+    return started, events
 
 
 def _records(ctx: VariantContext, job: ManagedNcclJob, since: datetime) -> Any:
@@ -683,15 +862,22 @@ def _hung(
     since: datetime,
     *,
     require_nodes: Sequence[str] = (),
+    created_since: datetime | None = None,
+    name: str = "hung",
 ) -> dict[str, Any]:
-    """The records once the hung incident settled (and named its reporters)."""
+    """The records once the hung incident settled (and named its reporters).
+
+    ``created_since``: wait for a later stall's incident; the records still
+    cover everything since ``since``.
+    """
 
     last: dict[str, Any] = {}
 
     def accept() -> dict[str, Any] | None:
         nonlocal last
         last = _records(ctx, job, since)
-        incident = hung_incident(last)
+        view = last if created_since is None else episode(last, created_since)
+        incident = hung_incident(view)
         if incident is None or incident.get("state") not in SETTLED_STATES:
             return None
         if not set(require_nodes) <= reported_nodes(incident):
@@ -699,10 +885,10 @@ def _hung(
         return last
 
     value = ctx.wait_until(
-        accept, timeout_seconds=HUNG_BUDGET, poll_seconds=20, name="hung"
+        accept, timeout_seconds=HUNG_BUDGET, poll_seconds=20, name=name
     )
     records = value if value is not None else last
-    ctx.evidence.write("hung-records", records)
+    ctx.evidence.write(f"{name}-records", records)
     return records
 
 
@@ -718,6 +904,32 @@ def _release_and_resume(
     return resume_errors(window, floor_bps=minimum if job.keep_active else 2 * zero)
 
 
+def _prove_recovered(ctx: VariantContext, job: ManagedNcclJob, *, name: str) -> None:
+    """Release the stall; the job's own pair stays active past the rearm window."""
+
+    errors = _release_and_resume(ctx, job, name=name)
+    if not errors:
+        minimum, _zero = _thresholds(ctx)
+        floor = max(
+            minimum,
+            ctx.setting(
+                "GPU_FAULT_EFA_TRAFFIC_RECOVERY_FALLBACK_BPS", RECOVERY_FALLBACK_BPS
+            ),
+        )
+        seconds = rearm_seconds(ctx)
+        window = _efa_window(ctx, seconds=seconds, name=f"{name}-recovered")
+        errors = baseline_errors(window, minimum_bps=floor)
+        ctx.evidence.write(
+            f"{name}-recovered-baseline",
+            {"minimum_bps": floor, "seconds": seconds, "errors": errors},
+        )
+    if errors:
+        raise VariantInconclusive(
+            "the job did not communicate normally through the product's rearm "
+            "window: " + "; ".join(errors)
+        )
+
+
 def _stalled_chain(
     ctx: VariantContext,
     suffix: str,
@@ -729,18 +941,11 @@ def _stalled_chain(
     run_survey(ctx)
     job = _job(ctx, suffix, flight_recorder=flight_recorder, stall_mode=stall_mode)
     _prove_baseline(ctx, name=f"{suffix}-active")
-    started = utc_now()
-    ctx.cleanup.push("release", job.release)
-    ctx.evidence.write(f"{suffix}-stall", {"at": started.isoformat(), **job.stall()})
-    _prove_stalled(ctx, job, name=f"{suffix}-stalled")
+    started, _events = _stall(ctx, job, name=suffix)
     nodes = _nodes(ctx)
     records = _hung(ctx, job, started, require_nodes=nodes if require_both else ())
     stages = {
-        "chain": dag_errors(records),
-        "executed": execution_errors(records),
-        "escalated": escalated_errors(records),
-        "timing": timing_errors(records, started, nodes),
-        "merged": grouped_errors(records, expect_single=True),
+        **episode_stages(records, started, nodes),
         "resumed": _release_and_resume(ctx, job, name=suffix),
     }
     return job.identity(), records, stages
@@ -761,10 +966,7 @@ def always_low(ctx: VariantContext) -> dict[str, Any]:
     # zero run alone must not warn or suspect a hang.
     job = _job(ctx, "low", keep_active=False)
     _prove_baseline(ctx, name="low-quiet", active=False)
-    started = utc_now()
-    ctx.cleanup.push("release", job.release)
-    ctx.evidence.write("low-stall", {"at": started.isoformat(), **job.stall()})
-    _prove_stalled(ctx, job, name="low-stalled")
+    started, _events = _stall(ctx, job, name="low")
     records = _records(ctx, job, started)
     ctx.evidence.write("hung-records", records)
     stages = {
@@ -832,6 +1034,41 @@ def simultaneous_nodes(ctx: VariantContext) -> dict[str, Any]:
         stages,
         notes=["two nodes in one stall wave merge into one workflow, not two"],
         extra={"attempt": identity},
+    )
+
+
+def repeat_after_recovery(ctx: VariantContext) -> dict[str, Any]:
+    run_survey(ctx)
+    job = _job(ctx, "rar")
+    nodes = _nodes(ctx)
+    _prove_baseline(ctx, name="rar-active")
+    first_at, events = _stall(ctx, job, name="rar")
+    first = episode(_hung(ctx, job, first_at), first_at)
+    stages = episode_stages(first, first_at, nodes)
+    if any(stages.values()):
+        # Without a first episode the product handled there is nothing to repeat.
+        stages["resumed"] = _release_and_resume(ctx, job, name="rar")
+        stages["repeat"] = ["not attempted: the first stall's hung chain failed"]
+        return _result(stages, extra={"attempt": job.identity()})
+    _prove_recovered(ctx, job, name="rar")
+    before = episode(_records(ctx, job, first_at), first_at)
+    ctx.evidence.write("hung-before-repeat", before)
+    second_at, _ = _stall(ctx, job, name="rar2", after_step=stall_step(events))
+    records = _hung(ctx, job, first_at, created_since=second_at, name="hung2")
+    first, second = episode(records, first_at, second_at), episode(records, second_at)
+    stages = {
+        **episode_stages(first, first_at, nodes),
+        "repeat": repeat_errors(first, second, before),
+        **{
+            f"repeat_{key}": value
+            for key, value in episode_stages(second, second_at, nodes).items()
+        },
+        "resumed": _release_and_resume(ctx, job, name="rar2"),
+    }
+    return _result(
+        stages,
+        notes=["a stall after a proven recovery is a new episode, not the old one"],
+        extra={"attempt": job.identity(), "rearm_seconds": rearm_seconds(ctx)},
     )
 
 
@@ -948,6 +1185,16 @@ VARIANTS = [
         "both nodes of the two-node job lose EFA in one stall wave (needs --node-b)",
         "one merged grouped incident/workflow with both nodes' hung evidence, not two",
         simultaneous_nodes,
+    ),
+    _spec(
+        "repeat_after_recovery",
+        "stall the job, release it once the hung chain settled, keep its own EFA"
+        " traffic active past the product's rearm window, then stall it again",
+        "each stall: ZERO_WARNING then HUNG_SUSPECTED -> its own incident and"
+        " read-only DAG, every step executed -> ESCALATED; the second workflow"
+        " follows the first; nothing suppressed, merged or duplicated",
+        repeat_after_recovery,
+        max_minutes=120,
     ),
     _deferred(
         "broken_pair",

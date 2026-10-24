@@ -10,6 +10,7 @@ and its step executions).
 from __future__ import annotations
 
 import itertools
+import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -50,6 +51,9 @@ class Traffic:
         self.low = LOW_BPS
         self.stalled = 0.0
         self.resumed: float | None = None
+        #: Released readings (both nodes) before the resumed pair falls to zero.
+        self.fades_after: int | None = None
+        self.released_reads = 0
         self.state = "idle"
 
     def rate(self, keep_active: bool) -> float:
@@ -57,6 +61,9 @@ class Traffic:
         if self.state == "stalled":
             return self.stalled
         if self.state == "released":
+            self.released_reads += 1
+            if self.fades_after is not None and self.released_reads > self.fades_after:
+                return 0.0
             return running if self.resumed is None else self.resumed
         return running if self.state == "running" else 0.0
 
@@ -83,6 +90,7 @@ class FakeNcclJob:
         self.keep_active = keep_active
         self.stall_mode = stall_mode
         self.stalled = False
+        self.stall_times: list[datetime] = []
         self.released = 0
         FakeNcclJob.instances.append(self)
 
@@ -101,6 +109,7 @@ class FakeNcclJob:
 
     def stall(self) -> dict[str, Any]:
         self.stalled = True
+        self.stall_times.append(self.ctx.clock())
         self.traffic.state = "stalled"
         return {"pod": "master"}
 
@@ -113,18 +122,27 @@ class FakeNcclJob:
         return {"alive": self.alive_value}
 
     def trainer_events(self) -> dict[str, list[str]]:
+        """The trainer's log: every stall so far, each released one resumed."""
+
         if FakeNcclJob.events is not None:
             return FakeNcclJob.events
         mode = self.stall_mode
-        return {
-            "master": [
-                "STALL step=40 entered=extra_all_reduce watchdog_seconds=2700 rank=0",
-                f"STALL step=40 held=before_extra_all_reduce mode={mode} rank=1",
-            ],
-            "worker": [
-                f"STALL step=40 held=before_extra_all_reduce mode={mode} rank=8"
-            ],
-        }
+        events: dict[str, list[str]] = {"master": [], "worker": []}
+        for index in range(max(1, len(self.stall_times))):
+            step = 40 + 100 * index
+            events["master"] += [
+                f"STALL step={step} entered=extra_all_reduce watchdog_seconds=2700 rank=0",
+                f"STALL step={step} held=before_extra_all_reduce mode={mode} rank=1",
+            ]
+            events["worker"].append(
+                f"STALL step={step} held=before_extra_all_reduce mode={mode} rank=8"
+            )
+            if index < self.released:
+                for pod, rank in (("master", 1), ("worker", 8)):
+                    events[pod].append(
+                        f"RESUMED step={step} reason=release held_seconds=900 rank={rank}"
+                    )
+        return events
 
     def delete(self) -> None:
         pass
@@ -176,32 +194,37 @@ def hung_records(
     warning_after: float = 300,
     hung_after: float = 750,
     ranks: list[dict[str, Any]] | None = None,
+    tag: str = "",
+    workflow: str = "wf",
+    predecessor: str | None = None,
 ) -> dict[str, Any]:
+    """One stall wave's records; ``tag`` keeps a later wave's ids apart."""
+
     started = datetime.fromisoformat(since)
     incidents = [
         {
-            "incident_id": f"inc-hung-{index}",
-            "event_id": f"host-{reporters[0]}-{1000 + index}{nc.HUNG_SUFFIX}",
+            "incident_id": f"inc-hung{tag}-{index}",
+            "event_id": f"host-{reporters[0]}-{tag}{1000 + index}{nc.HUNG_SUFFIX}",
             "event_type": "GPU_FAULT_GROUP",
             "state": state,
             "node_ids": [NODE, PEER],
             "reasons": [HUNG_REASON]
             + [f"{node}{nc.CONCURRENT}{HUNG_REASON}" for node in reporters[1:]],
-            "workflow_request_id": "wf",
+            "workflow_request_id": workflow,
             "created_at": (started + timedelta(seconds=hung_after + index)).isoformat(),
         }
         for index in range(count)
     ] + [
         {
-            "incident_id": f"inc-warning-{node}",
-            "event_id": f"host-{node}-99{nc.WARNING_SUFFIX}",
+            "incident_id": f"inc-warning{tag}-{node}",
+            "event_id": f"host-{node}-{tag}99{nc.WARNING_SUFFIX}",
             "event_type": "NODE_HEALTH",
             "state": "RECOVERED",
             "node_ids": [node],
             "reasons": [
                 "EFA/RDMA traffic remains at zero for an active training attempt"
             ],
-            "workflow_request_id": f"wf-{node}",
+            "workflow_request_id": f"wf{tag}-{node}",
             "created_at": (started + timedelta(seconds=warning_after)).isoformat(),
         }
         for node in warnings
@@ -226,10 +249,11 @@ def hung_records(
     return {
         "incidents": incidents,
         "workflows": {
-            "wf": {
+            workflow: {
                 "official_steps": [{"operation": op, "parameters": {}} for op in ops],
                 "step_executions": executions,
                 "status": "SUCCEEDED",
+                "predecessor_workflow_id": predecessor,
             }
         },
     }
@@ -306,6 +330,7 @@ def test_registry_covers_every_011_variant() -> None:
         "fr_enabled",
         "fr_disabled",
         "simultaneous_nodes",
+        "repeat_after_recovery",
     }
     assert all(lane == "hp" for spec in nc.VARIANTS for lane in spec.lanes), (
         "011 runs only on the HyperPod lane"
@@ -629,3 +654,208 @@ def test_always_low_is_inconclusive_when_the_job_went_active(tmp_path: Path) -> 
     ctx, _calls = _ctx(SPECS["always_low"], tmp_path, none=True)
     with pytest.raises(VariantInconclusive, match="always-low job reached the active"):
         SPECS["always_low"].execute(ctx)
+
+
+# --------------------------------------------------------------------------- #
+# repeat_after_recovery
+# --------------------------------------------------------------------------- #
+REPEAT = SPECS["repeat_after_recovery"]
+REPEAT_STAGES = [
+    "chain",
+    "executed",
+    "escalated",
+    "timing",
+    "merged",
+    "repeat",
+    "repeat_chain",
+    "repeat_executed",
+    "repeat_escalated",
+    "repeat_timing",
+    "repeat_merged",
+    "resumed",
+]
+
+
+class RepeatProduct:
+    """The product's records over the repeat variant's two stalls.
+
+    The first stall gets the usual grouped incident and warnings; once the fake
+    job stalled again the second gets what ``second`` names: ``own`` (its own
+    incident and workflow, after the first's), ``missing``, ``merged`` (only
+    concurrent evidence on the first incident), ``duplicate``, ``shared`` (on
+    the first workflow) or ``unchained`` (no predecessor).
+    """
+
+    def __init__(self, second: str = "own", *, first: bool = True) -> None:
+        self.second = second
+        self.first = first
+
+    def __call__(self, script: str, *arguments: str) -> dict[str, Any]:
+        stalls = FakeNcclJob.instances[-1].stall_times
+        if not self.first:
+            return {"incidents": [], "workflows": {}}
+        records = hung_records(stalls[0].isoformat())
+        if len(stalls) < 2 or self.second == "missing":
+            return records
+        if self.second == "merged":
+            records["incidents"][0]["reasons"].append(
+                f"{NODE}{nc.CONCURRENT}{HUNG_REASON}"
+            )
+            return records
+        later = hung_records(
+            stalls[1].isoformat(),
+            tag="2",
+            workflow="wf" if self.second == "shared" else "wf-2",
+            predecessor=None if self.second == "unchained" else "wf",
+            count=2 if self.second == "duplicate" else 1,
+        )
+        return {
+            "incidents": records["incidents"] + later["incidents"],
+            "workflows": {**later["workflows"], **records["workflows"]},
+        }
+
+
+def _repeat(tmp_path: Path, product: RepeatProduct | None = None) -> Any:
+    ctx, _calls = _ctx(REPEAT, tmp_path)
+    ctx.regional.cpu_python_responder = product or RepeatProduct()
+    return ctx
+
+
+def test_the_rearm_window_is_the_collectors_recovery_window_plus_margin(
+    tmp_path: Path,
+) -> None:
+    ctx = _repeat(tmp_path)
+    ctx.survey = CLEAN_SURVEY
+    assert nc.rearm_seconds(ctx) == 180 + 3 * 15, "120 s + two 30 s spacings"
+    prefix = "GPU_FAULT_EFA_TRAFFIC_RECOVERY_"
+    ctx.survey = {
+        "collector_env": {
+            "GPU_FAULT_HOST_INTERVAL_SECONDS": "10",
+            f"{prefix}SECONDS": "300",
+            f"{prefix}MAX_GAP_SECONDS": "20",
+        }
+    }
+    assert nc.rearm_seconds(ctx) == 300 + 2 * 10 + 3 * 10, "spacing is half the gap"
+    ctx.survey = {"collector_env": {f"{prefix}MIN_SAMPLES": "10"}}
+    assert nc.rearm_seconds(ctx) == 10 * 30 + 3 * 15, "or more samples, if longer"
+
+
+def test_a_later_stall_reads_only_its_own_trainer_lines() -> None:
+    job = FakeNcclJob(None, name="n")
+    job.stall_times = [STARTED, STARTED + timedelta(seconds=1500)]
+    job.released = 1
+    events = job.trainer_events()
+    assert nc.stall_step(events) == 140
+    assert nc.stall_step({"master": []}) is None
+    assert any(
+        "ended before" in item for item in nc.stall_event_errors(events, "quiet")
+    ), "unfiltered, the first stall's RESUMED lines would end the second"
+    assert nc.stall_event_errors(nc.events_after(events, 40), "quiet") == []
+    stepless = {"master": ["STALL-ACTIVITY-ERROR mode=write error=OSError rank=1"]}
+    assert nc.events_after(stepless, 40) == stepless
+
+
+def test_episode_keeps_each_stall_waves_own_incidents() -> None:
+    second_at = STARTED + timedelta(seconds=1500)
+    later = hung_records(second_at.isoformat(), tag="2", workflow="wf-2")
+    records = hung_records(SINCE)
+    records["incidents"] += later["incidents"]
+    first = nc.episode(records, STARTED, second_at)
+    second = nc.episode(records, second_at)
+    assert {item["incident_id"] for item in first["incidents"]} == {
+        "inc-hung-0",
+        f"inc-warning-{NODE}",
+        f"inc-warning-{PEER}",
+    }
+    assert {item["incident_id"] for item in second["incidents"]} == {
+        "inc-hung2-0",
+        f"inc-warning2-{NODE}",
+        f"inc-warning2-{PEER}",
+    }
+    assert first["workflows"] == records["workflows"], "workflows stay as read"
+
+
+def test_repeat_errors_need_a_first_incident_and_judge_absorption_against_it() -> None:
+    empty: dict[str, Any] = {"incidents": [], "workflows": {}}
+    assert nc.repeat_errors(empty, empty, empty) == [
+        "no first hung incident to repeat after"
+    ]
+    first = hung_records(SINCE)
+    # Its own first-wave peer evidence is not the second stall's.
+    assert nc.repeat_errors(first, empty, first) == [
+        "the second stall raised no hung incident of its own"
+    ]
+
+
+def test_repeat_after_recovery_passes_with_a_second_collection_of_its_own(
+    tmp_path: Path,
+) -> None:
+    ctx = _repeat(tmp_path)
+    result = REPEAT.execute(ctx)
+
+    assert result["verdict"] == "PASS", result["errors"]
+    assert list(result["stages"]) == REPEAT_STAGES
+    job = FakeNcclJob.instances[-1]
+    assert len(job.stall_times) == 2 and job.released == 2, "two stalls, both released"
+    assert ctx.cleanup.pending() == ["job-" + job.name], "every release is done"
+    assert result["rearm_seconds"] == 225
+    case = ctx.evidence.case_dir
+    recovered = json.loads((case / "rar-recovered-baseline.json").read_text())
+    assert recovered == {"minimum_bps": nc.MIN_ACTIVE_BPS, "seconds": 225, "errors": []}
+    gap = (job.stall_times[1] - job.stall_times[0]).total_seconds()
+    assert gap > nc.ZERO_HUNG_SECONDS + nc.RESUME_SECONDS + 225, gap
+    trainer = json.loads((case / "rar2-stalled-job.json").read_text())["trainer"]
+    assert any("RESUMED step=40" in line for line in trainer["master"]), (
+        "the second stall was judged on a log that still holds the first"
+    )
+    for name in ("hung-records", "hung-before-repeat", "hung2-records"):
+        assert (case / f"{name}.json").is_file(), name
+
+
+@pytest.mark.parametrize(
+    ("second", "message"),
+    [
+        ("missing", "repeat: the second stall raised no hung incident of its own"),
+        (
+            "merged",
+            "repeat: the first hung incident inc-hung-0 absorbed the second stall's",
+        ),
+        ("duplicate", "repeat_merged: 2 hung incidents for one stall wave"),
+        ("shared", "repeat: the second hung incident has no workflow of its own: wf"),
+        ("unchained", "repeat: the second hung workflow wf-2 follows None, not"),
+    ],
+)
+def test_a_suppressed_merged_or_duplicated_second_episode_fails(
+    tmp_path: Path, second: str, message: str
+) -> None:
+    result = REPEAT.execute(_repeat(tmp_path, RepeatProduct(second)))
+    assert result["verdict"] == "FAIL"
+    assert any(item.startswith(message) for item in result["errors"]), result["errors"]
+    assert len(FakeNcclJob.instances[-1].stall_times) == 2
+
+
+@pytest.mark.parametrize(
+    ("resumed", "fades_after", "message"),
+    [(300_000.0, None, "did not resume"), (None, 10, "fell to 0 B/s")],
+)
+def test_a_recovery_that_is_not_proven_is_inconclusive_and_never_stalls_again(
+    tmp_path: Path, resumed: float | None, fades_after: int | None, message: str
+) -> None:
+    FakeNcclJob.traffic.resumed = resumed
+    FakeNcclJob.traffic.fades_after = fades_after
+    ctx = _repeat(tmp_path)
+    with pytest.raises(VariantInconclusive, match=f"rearm window: .*{message}"):
+        REPEAT.execute(ctx)
+    job = FakeNcclJob.instances[-1]
+    assert len(job.stall_times) == 1 and job.released == 1, "no second stall"
+
+
+def test_a_failed_first_episode_fails_without_a_second_stall(tmp_path: Path) -> None:
+    result = REPEAT.execute(_repeat(tmp_path, RepeatProduct(first=False)))
+    assert result["verdict"] == "FAIL"
+    assert (
+        "repeat: not attempted: the first stall's hung chain failed"
+        in (result["errors"])
+    )
+    job = FakeNcclJob.instances[-1]
+    assert len(job.stall_times) == 1 and job.released == 1, "released, not repeated"

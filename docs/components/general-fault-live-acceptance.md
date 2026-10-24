@@ -202,7 +202,7 @@ counter确实增长才算原生正向；tc/netem的丢包或应用超时不能�
 ### GF-GENERAL-LIVE-011
 
 必测：`active_to_zero`、`always_low`、`write_progress`、`phase_progress`、`broken_pair`、
-`attempt_change`、`fr_enabled`、`fr_disabled`、`simultaneous_nodes`、
+`attempt_change`、`fr_enabled`、`fr_disabled`、`simultaneous_nodes`、`repeat_after_recovery`、
 `unreachable_node`、`large_job`、`few_candidates`、`ambiguous_candidates`、
 `different_process_groups`、`no_step_no_rank`、`active_window_resume`、
 `fr_temporal_completion`、`fr_second_missing`、`fr_whole_group`、
@@ -211,6 +211,8 @@ counter确实增长才算原生正向；tc/netem的丢包或应用超时不能�
 测试程序的可恢复barrier/暂停点让通信停滞，保留带外恢复手段；不得操作无关PID。
 必须实际观察完整EFA计数对接近零，否则不能把程序暂停当作流量规则已触发。
 默认60/600秒分别核对warning/hung；始终低流量、坏计数对和换attempt为负向。
+`repeat_after_recovery` 在首轮取证收尾、释放后任务自身流量持续越过产品重新布防窗口时
+再次停滞，第二轮须有自己的incident与工作流（前驱为首轮）并完整执行，不被抑制、合并或重复。
 `write_progress/phase_progress` 现在验证持续写入、step增长或phase切换均不延后RDMA时钟；
 长checkpoint可能进入怀疑流程，但不能自动停训。`no_step_no_rank` 在128节点/1024进程
 测试任务中关闭step reporter和FR，不导出RANK，仍需保留全部可发现进程证据并标记rank未知。
