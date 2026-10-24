@@ -513,34 +513,43 @@ class VariantContext:
         poll_seconds: float,
         name: str,
     ) -> Any:
-        """Poll ``accept`` until it returns a value that is not ``None``."""
+        """Poll ``accept`` until it returns a value that is not ``None``.
 
-        deadline = time.monotonic() + finite_seconds(timeout_seconds)
+        The deadline runs on ``self.clock`` so a test with a stubbed ``sleep``
+        and a virtual clock terminates after one or two polls instead of
+        busy-spinning for the real timeout; in production the clock is the wall
+        clock, which is the same deadline the operator's window imposes.
+        """
+
+        start = self.clock()
+        budget = finite_seconds(timeout_seconds)
         finite_seconds(poll_seconds, label="poll interval")
         timeline: list[dict[str, Any]] = []
         while True:
             value = accept()
+            now = self.clock()
             timeline.append(
-                {"observed_at": self.clock().isoformat(), "accepted": value is not None}
+                {"observed_at": now.isoformat(), "accepted": value is not None}
             )
             self.evidence.write(f"{name}-timeline", {"entries": timeline})
-            if value is not None or time.monotonic() >= deadline:
+            if value is not None or (now - start).total_seconds() >= budget:
                 return value
             self.sleep(poll_seconds)
 
     def hold(
         self, seconds: float, *, name: str, check: Callable[[], Any] | None = None
     ) -> list[Any]:
-        """Sleep ``seconds`` in ``poll`` steps, calling ``check`` at each step."""
+        """Sleep ``seconds`` in poll steps on ``self.clock``, calling ``check``."""
 
-        deadline = time.monotonic() + finite_seconds(seconds)
+        start = self.clock()
+        budget = finite_seconds(seconds)
         observations: list[Any] = []
-        while time.monotonic() < deadline:
+        while (self.clock() - start).total_seconds() < budget:
             require_action_time(60)
             if check is not None:
                 observations.append(check())
                 self.evidence.write(f"{name}-hold", {"observations": observations})
-            self.sleep(min(30.0, max(1.0, deadline - time.monotonic())))
+            self.sleep(min(30.0, budget))
         return observations
 
 
