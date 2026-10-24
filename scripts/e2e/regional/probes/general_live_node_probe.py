@@ -617,6 +617,90 @@ def netdev_reading(name: str) -> dict[str, Any]:
     return result
 
 
+def efa_traffic_reading(root: Path = Path("/sys/class/infiniband")) -> dict[str, Any]:
+    """The runner's own raw EFA RX/TX byte totals, summed over EFA ports.
+
+    An independent oracle for GF-GENERAL-LIVE-011: a hung collective must be
+    confirmed by the EFA counter pair itself going to zero, not by the pause.
+    This reads ``/sys/class/infiniband/<dev>/ports/<p>/hw_counters`` directly
+    and sums the same pair the host collector's rate uses (``rx_bytes`` and
+    ``tx_bytes``, else ``send_bytes`` and ``recv_bytes``) across EFA devices,
+    so two readings bracketing the stall show whether traffic actually stopped.
+    It never writes a counter.
+    """
+
+    ports: list[dict[str, Any]] = []
+    rx_total = 0
+    tx_total = 0
+    complete = True
+    for device in sorted(p.name for p in root.glob("*")) if root.exists() else []:
+        driver = root / device / "device" / "driver"
+        try:
+            is_efa = driver.resolve().name == "efa"
+        except OSError:
+            is_efa = False
+        if not is_efa:
+            try:
+                uevent = (root / device / "device" / "uevent").read_text()
+                is_efa = any(
+                    line.strip() == "DRIVER=efa" for line in uevent.splitlines()
+                )
+            except OSError:
+                is_efa = False
+        if not is_efa:
+            continue
+        for port in sorted(p.name for p in (root / device / "ports").glob("*")):
+            counters = root / device / "ports" / port / "hw_counters"
+            names = (
+                {item.name for item in counters.iterdir()}
+                if counters.exists()
+                else set()
+            )
+            pair = (
+                ("rx_bytes", "tx_bytes")
+                if {"rx_bytes", "tx_bytes"} <= names
+                else ("send_bytes", "recv_bytes")
+                if {"send_bytes", "recv_bytes"} <= names
+                else None
+            )
+            if pair is None:
+                complete = False
+                ports.append({"device": f"{device}/{port}", "pair": None})
+                continue
+            try:
+                first = int((counters / pair[0]).read_text().strip())
+                second = int((counters / pair[1]).read_text().strip())
+            except (OSError, ValueError):
+                complete = False
+                ports.append(
+                    {"device": f"{device}/{port}", "pair": pair, "error": True}
+                )
+                continue
+            rx_total += first
+            tx_total += second
+            ports.append(
+                {
+                    "device": f"{device}/{port}",
+                    "pair": pair,
+                    pair[0]: first,
+                    pair[1]: second,
+                }
+            )
+    return {
+        "observed_at": time.time(),
+        "rx_bytes_total": rx_total,
+        "tx_bytes_total": tx_total,
+        "pair_bytes_total": rx_total + tx_total,
+        "port_count": len(ports),
+        "complete_pairs": complete,
+        "ports": ports,
+    }
+
+
+def efa_traffic(arguments: argparse.Namespace) -> None:
+    emit(efa_traffic_reading())
+
+
 def tcp_retransmits() -> int | None:
     lines = Path("/proc/net/snmp").read_text().splitlines()
     for header, values in zip(lines, lines[1:]):
@@ -1340,6 +1424,7 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--seconds", type=int, required=True)
     item.add_argument("--approved", action="store_true")
     command("log-collector-disable", log_collector_disable)
+    command("efa-traffic", efa_traffic)
     return value
 
 

@@ -55,6 +55,7 @@ test_cases:
   expected: [按memory和swap各自规则触发, 实际验证原指标且读取失败保留UNKNOWN, 清理后主机与采集及原任务正常]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-002
+  related_pytest: tests/regional/test_general_live_memory.py::test_memory_pressure_passes_the_diagnostic_chain
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-003
   title: 真机低利用率及资源异常的任务归属
@@ -113,6 +114,7 @@ test_cases:
   expected: [passed=false经真实解析到隔离回执, 扫描失败和能力缺失不伪装健康, 不损坏介质且清理后真实工具恢复]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-007
+  related_pytest: tests/regional/test_general_live_phase2.py::test_smart_healthy_passes_when_no_finding
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-008
   title: 真机必需网卡故障与角色隔离
@@ -236,6 +238,7 @@ test_cases:
   expected: [DBE隔离分析而普通增量只诊断, pending仅受支持且授权时执行真实reset, 无客户端和动作后新状态验证完整且不伪称完成RMA]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-019
+  related_pytest: tests/regional/test_general_live_gpu_memory.py::test_corrected_ecc_is_a_clean_diagnostic_chain
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-020
   title: 真机NVLink计数诊断与独立致命事件
@@ -247,6 +250,7 @@ test_cases:
   expected: [单卡多卡计数仅只读诊断, 回退旧样本不制造新故障或恢复, 独立致命事件有自己处置回执并以新通信证据验收]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-020
+  related_pytest: tests/regional/test_general_live_gpu_links.py::test_crc_is_a_clean_nvlink_diagnostic
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-021
   title: 真机fabric状态触发全GPU及NVSwitch恢复
@@ -258,6 +262,7 @@ test_cases:
   expected: [状态窗口和节点去重正确, 完整范围quiesce无客户端全reset及服务恢复回执, 每卡新Success和Fabric验证后接纳且失败保持隔离]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-021
+  related_pytest: tests/regional/test_general_live_gpu_fabric.py::test_full_reset_requires_the_full_fabric_chain
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-022
   title: 真机PCIe速率与同卡可信Xid联合
@@ -269,6 +274,7 @@ test_cases:
   expected: [独立越界只诊断且重置不形成速率, 同卡可信联合和独立Xid各有可追踪授权, 实际新状态和通信验证而非清计数宣告恢复]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-022
+  related_pytest: tests/regional/test_general_live_gpu_links.py::test_at_rate_limit_passes_when_no_finding
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-024
   title: 真机复合规则组件新鲜度权限与去重
@@ -280,6 +286,7 @@ test_cases:
   expected: [组件与复合到实际工作流映射完整, 弱相关不独立授权更强动作或重复执行, 有依据的硬件组件和致命Xid不会被弱告警覆盖]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-024
+  related_pytest: tests/regional/test_general_live_gpu_composite.py::test_corrected_memory_forms_a_diagnostic_composite
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-025
   title: 真机逐GPU采集不完整与新快照验证
@@ -303,6 +310,7 @@ test_cases:
   expected: [身份变化诊断而未知期望数取证, 旧boot不覆盖新库存且不猜数量reboot, 批准rebaseline及清理后真实GPU身份一致]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-026
+  related_pytest: tests/regional/test_general_live_gpu_identity.py::test_uuid_changed_is_a_read_only_identity_diagnostic
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-027
   title: 真机训练进度阶段与NaN恢复边界

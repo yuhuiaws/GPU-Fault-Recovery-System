@@ -618,7 +618,9 @@ rules:
       verdict modules, the stdlib host/storage/network probes and the
       collector-window list extension, with their fakes-based module tests and
       the coverage/spec bindings. Phase-1 categories 001/003/004/006/008/009/
-      025/028/029/031; plan-only against the live site, so no regional case is
+      025/028/029/031 and phase-2 DCGM/GPU-inventory replay categories
+      019/020/021/022/024/026 (its field/inventory replay tools and host
+      controller); plan-only against the live site, so no regional case is
       executed by a code change here.
     paths:
       - scripts/e2e/regional/general_live_*.py
@@ -626,9 +628,15 @@ rules:
       - scripts/e2e/regional/probes/general_live_node_probe.py
       - scripts/e2e/regional/probes/general_live_storage_probe.py
       - scripts/e2e/regional/probes/general_live_net_probe.py
+      - scripts/e2e/regional/probes/general_live_dcgm_probe.py
       - scripts/e2e/regional/probes/collector_window_probe.py
+      - tools/gpu_dcgm_field_replay.py
+      - tools/nvidia_smi_inventory_replay.py
       - tests/regional/_general_live_fakes.py
+      - tests/regional/_general_live_gpu_fakes.py
       - tests/regional/test_general_live_*.py
+      - tests/test_gpu_dcgm_field_replay.py
+      - tests/test_nvidia_smi_inventory_replay.py
       - testcases/general-live-coverage.yaml
       - docs/components/general-fault-live-acceptance.md
     pytest:
@@ -645,6 +653,17 @@ rules:
       - tests/regional/test_general_live_edges2.py
       - tests/regional/test_general_live_edges3.py
       - tests/regional/test_general_live_probes.py
+      - tests/regional/test_general_live_memory.py
+      - tests/regional/test_general_live_phase2.py
+      - tests/regional/test_general_live_gpu_memory.py
+      - tests/regional/test_general_live_gpu_links.py
+      - tests/regional/test_general_live_gpu_fabric.py
+      - tests/regional/test_general_live_gpu_composite.py
+      - tests/regional/test_general_live_gpu_fields.py
+      - tests/regional/test_general_live_gpu_identity.py
+      - tests/regional/test_general_live_gpu_probe.py
+      - tests/test_gpu_dcgm_field_replay.py
+      - tests/test_nvidia_smi_inventory_replay.py
       - tests/test_general_fault_live_coverage.py
     regional_cases: []
     counts_as_domain: false

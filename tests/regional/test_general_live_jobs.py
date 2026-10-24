@@ -238,25 +238,48 @@ def test_main_deferred_execute_records_not_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     runner = _patch_main(monkeypatch)
+    # invalid_delta is implemented now (lane K); 004 probe_error is still a
+    # deferred live-replay variant, so --execute records NOT_RUN without acting.
+    kc = tmp_path / "kc"
+    kc.write_text("apiVersion: v1\n")
     monkeypatch.setattr(
         "sys.argv",
-        _argv(
-            tmp_path,
-            "invalid_delta",
+        [
+            "run_general_live.py",
+            "--run-dir",
+            str(tmp_path / "run"),
+            "--case",
+            "GF-GENERAL-LIVE-004",
+            "--variant",
+            "probe_error",
+            "--cpu-kubeconfig",
+            str(kc),
+            "--gpu-kubeconfig",
+            str(kc),
+            "--gpu-context",
+            "ctx",
+            "--cluster-id",
+            "gpu-eks-cluster",
+            "--region",
+            "us-west-2",
+            "--fault-node",
+            NODE,
+            "--host-probe-image",
+            "a@sha256:" + "0" * 64,
             "--execute",
             "--confirm",
-            "GENERALLIVE001_EXECUTE",
+            "GENERALLIVE004_EXECUTE",
             "--maintenance-window-end",
             "2026-11-07T00:00:00Z",
-        ),
+        ],
     )
     assert runner.main() == 0
     evidence = (
         tmp_path
         / "run"
         / "cases"
-        / "GF-GENERAL-LIVE-001.invalid_delta"
-        / "GF-GENERAL-LIVE-001.invalid_delta.json"
+        / "GF-GENERAL-LIVE-004.probe_error"
+        / "GF-GENERAL-LIVE-004.probe_error.json"
     )
     assert evidence.is_file(), "evidence.is_file()"
     import json

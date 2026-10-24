@@ -933,6 +933,97 @@ restart). The implemented verdicts record the known product gaps the spec
 expects to FAIL (byte-only `statvfs`, the weighted-time disk await, the empty
 required-interface list) rather than masking them.
 
+## GF-GENERAL-LIVE host/device categories (phase 2)
+
+Phase 2 adds the host/device categories 002 memory/swap, 005 shared storage,
+007 SMART, 010 EFA/RDMA counters, 012 GPU missing and 015 BMC
+(`scripts/e2e/regional/general_live_memory.py`, `general_live_shared.py`,
+`general_live_devices.py`). Every required variant is in the registry so none
+drops out of the denominator, but only the variants that need no raw-source
+replay fixture are executable on this site: 002 `memory_pressure`/`recovery`
+(native host memory pressure in a capped cgroup, behind `HOST_MEMORY_PRESSURE`)
+and `no_swap`, plus 007 `healthy` (a read-only observation that the real SMART
+reading mints no finding). Their module tests under
+`tests/regional/test_general_live_memory.py` and
+`tests/regional/test_general_live_phase2.py` run the verdict logic against
+scripted product records with fakes; they are not proof of a physical fault.
+
+The rest stay `NOT_RUN`: `FIXTURE_NOT_READY` for 007/010/012/015 and a few
+002/005 variants, which need the targeted command/file reading
+(`smartctl`/`ipmitool`/`ethtool`/`nvidia-smi` output, `/proc/meminfo`, the EFA
+`hw_counters`/`state` sysfs, `/proc/driver/nvidia`) replaced only inside the
+one host-collector unit's private environment -- a shared raw-source replay
+helper that phase 2 does not build and leaves to central review, never
+replacing a host binary or a global mount; `CAPABILITY_ABSENT` where the site
+genuinely lacks the capability (no independent NFS/Lustre export, no non-EFA
+RDMA device, no BMC on EC2, no swap device); and `VENDOR_LAB_ONLY` for the
+012 variants that need a real GPU off the bus and an approved provider reboot
+(this lane never unbinds or removes a real GPU). The spec's expected product
+gaps (SMART scan-failure handling, EFA counters reported as zero, dual GPU
+read-failure treated as zero cards, statvfs-OK-but-I/O-fails shared storage)
+are recorded in the variants' reasons rather than hidden.
+
+## GF-GENERAL-LIVE live acceptance runner (phase 2)
+
+Phase 2 adds the workload- and spare-centred categories through
+`general_live_nccl` (011 EFA stall / NCCL hung), `general_live_progress` (027
+training progress) and `general_live_spares` (030 warm spare unhealthy), with
+fakes-based module tests under `tests/regional/test_general_live_{nccl,progress,
+spares}.py` and an `efa-traffic` read-only command on the node probe. These are
+still plan-only by default and change no cluster state until an operator runs
+`--execute`; the module tests exercise only the injection/verdict logic against
+scripted product records and are not proof of a physical experiment.
+
+011 and 030 run on the HyperPod lane (011 needs `--node-b`, a two-node NCCL job
+genuinely stalled at a recoverable barrier until its EFA RX/TX pair, read from
+`/sys/class/infiniband` as the independent oracle, falls to zero; 030 declares
+one warm spare through the admin CLI under `DECLARE_WARM_SPARE` and always
+releases it). 027 enables the optional reporter only for its disposable test
+job (a Pod-local `training-progress` sidecar) and triggers a single per-cluster
+scan, never the global monitor. Variants that need a reviewed test
+flight-recorder dump responder, a py-spy fault tool, a role-declaration job, a
+128-node/1024-process scale, or the HyperPod spare-health controller (disabled
+in this regional control plane, `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`)
+stay `NOT_RUN` with an explicit reason in the denominator rather than being
+dropped. No GF-GENERAL-LIVE case has live evidence yet.
+
+## GF-GENERAL-LIVE live acceptance runner (phase 2, lane K)
+
+Phase 2 adds reviewed `live-replay` categories that drive the product's own
+readers. The reusable kernel-log source replay
+(`scripts/e2e/regional/general_live_kernel_replay.py` and
+`probes/general_live_kernel_source_probe.py`) installs a reviewed set of
+kernel-transport records for one node and boot and reads back what the product
+ingested, two ways: a `journalctl` pass-through wrapper on the node log
+collector (journal mode) and a `GPU_FAULT_KMSG_PATH` repoint of the kernel
+collector (kmsg mode). A sibling host-collector source replay
+(`general_live_source_replay.py` / `probes/general_live_source_probe.py`)
+binds one reviewed procfs/sysfs file into the host collector's private mount
+namespace or repoints `GPU_FAULT_PCI_DEVICES_ROOT`. Every replay only replaces
+the raw reading; parsing, trust classification, grading, the database and the
+approved node actions stay real, so the evidence is always `proof_scope:
+live-replay` -- it proves the processing chain, never the physical fault.
+
+Implemented live-replay variants: 016 severe kernel log (all nine, including the
+trusted-source and current-boot gates that must *not* isolate on a user-space or
+old-boot line), 017 application error logs (the OOM diagnostic and the NCCL /
+distributed evidence-only paths), 032 unknown error (`unknown_xid` graded
+SITE_SAFETY and its dedup), 013 EFA inventory `unreadable_state` (UNKNOWN, not
+zero cards), and the phase-1 host file-source variants 001 `invalid_delta`,
+008 `statistics_failed` and 009 `errors_delta`.
+
+The variants that stay `NOT_RUN` on this single-node site keep their place in the
+denominator with an explicit reason: 014 Kubernetes allocatable (every variant --
+faking allocatable or patching `Node.status` is not valid proof, and the native
+device-plugin fault needs the reserved `DEVICE_PLUGIN_RESTART` approval), most of
+013 (the PCI-missing reboot chain on the only EKS GPU node, the reserved
+`EFA_DRIVER_UNBIND` native unbind, and the non-repointable `/sys/class/infiniband`
+tree), the catalog/authority-bound 032 variants (a genuinely unknown product
+needs other hardware; `observe_profile` / `permitted_isolation` need a Runtime
+Profile authority the site does not configure, AUTH-015), the 017 attribution
+variants (a managed attempt with CRI Pod logs, lane N territory), and 004
+`probe_error` (a `statvfs` error cannot be produced by a read-only file bind).
+
 The first live pass corrected three runner judgments that contradicted the
 product's documented behavior, not the product: a diagnostic-only chain
 (evidence collection plus a validation) whose validation fails while the
@@ -941,6 +1032,49 @@ fault is held ends `RECOVERED` with reason `diagnostic inconclusive`
 or that `RECOVERED` and flag `ESCALATED` or a `RECOVERED` without the reason;
 the host collector delivers an unchanged reading only once per health summary
 (`GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS`), so a recovery wait now spans two
-summary periods for its two fresh samples; and the GPU environment runner
+summary periods for its two fresh samples (host CPU/load, storage and host
+memory alike); and the GPU environment runner
 treats a collector unit that carries no endpoint override after the restore as
 restored to `collector.env`'s endpoint, the state its repoint started from.
+
+## GF-GENERAL-LIVE DCGM / GPU-inventory replay (phase 2)
+
+Phase 2 adds the DCGM-field and GPU-inventory categories (019 ECC/row remap/
+page retirement, 020 NVLink counters, 021 NVLink fabric state, 022 PCIe
+replay, 024 composites, 026 GPU identity, and the five 025 field variants
+phase 1 left `FIXTURE_NOT_READY`). The injection is `live-replay` only: one
+raw reading changes and the real collector parser, transport, grading,
+database, scheduling and approved node actions stay real. It is driven by a
+reviewed DCGM-field replay tool (`tools/gpu_dcgm_field_replay.py`, its own
+per-category field allow-lists, separate from the environment tool's) and a
+reviewed `nvidia-smi` inventory pass-through wrapper
+(`tools/nvidia_smi_inventory_replay.py`), both installed under `/run` with a
+sha256 check and run loopback-only / first-on-PATH by one host controller
+(`probes/general_live_dcgm_probe.py`) that repoints the single metrics
+collector through a `/run` drop-in with a deadman restore. A replay only
+proves the processing chain, never the physical fault, so every verdict is
+`proof_scope: live-replay` and the module tests
+(`tests/regional/test_general_live_gpu_*.py`, `tests/test_gpu_dcgm_field_replay.py`,
+`tests/test_nvidia_smi_inventory_replay.py`) run the verdict logic over
+scripted product records with fakes -- they are not proof of a physical
+experiment. No case has live evidence yet; every case stays `manual` /
+`NOT_RUN`.
+
+The reset-driving variants need an explicit approval and an exclusive node:
+019 `pending_supported` / `post_reset` need `--approve GPU_RESET` (a
+single-GPU service-window reset); every 021 finding drives a full GPU +
+NVSwitch reset, so those variants need `--approve GPU_FULL_FABRIC_RESET` (and
+`NODE_REBOOT` for `recovery_failure`) and run only on the HyperPod lane's
+exclusive node. 022's XID-join variants replay the DCGM last-XID gauge only as
+XID 32 (`--approve DCGM_XID_GAUGE`); 019 `remap_failure` needs
+`GPU_FIELD_DIAGNOSTIC`. Variants that need a trusted independent kernel
+XID/SXid source (020 `independent_fatal_event`, 024 `independent_xid`) are
+`NOT_RUN(FIXTURE_NOT_READY)` pending lane K's kernel-source replay; 024's
+thermal/power composite components reuse the GF-ENV-LIVE environment replay;
+019 `pending_unsupported` (no legacy GPU) and `observe_profile` (no OBSERVE
+reset profile) are `CAPABILITY_ABSENT`. The implemented verdicts record the
+product gaps the spec expects to FAIL rather than masking them: the whole-batch
+(not per-GPU) DCGM completeness check (025 `one_gpu_missing`), the PCIe<->XID
+gauge join with no age check (022 `expired_xid`), the UUID-set-only identity
+comparison (026 `bdf_changed`) and the inventory baseline that never compares
+the source boot id (026 `stale_boot`).

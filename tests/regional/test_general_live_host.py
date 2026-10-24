@@ -244,9 +244,76 @@ def test_recovery_and_checkpoint_phase_pass(tmp_path: Path) -> None:
     )
 
 
-def test_invalid_delta_is_a_deferred_live_replay_variant() -> None:
+def test_invalid_delta_is_an_implemented_live_replay_variant() -> None:
     spec = SPECS["invalid_delta"]
-    assert spec.deferred.startswith("FIXTURE_NOT_READY"), (
-        "spec.deferred.startswith('FIXTURE_NOT_READY')"
+    assert spec.proof_mode == "live-replay", "invalid_delta is a live-replay variant"
+    assert spec.implemented, (
+        "invalid_delta is now implemented by the /proc/stat source bind"
     )
-    assert spec.execute is None
+
+
+# --------------------------------------------------------------------------- #
+# 001 invalid_delta: a reviewed static /proc/stat bind -> no busy sample
+# (lane K live-replay). A source-replay FakeProbe stands in for the bind host.
+# --------------------------------------------------------------------------- #
+def _source_probe() -> FakeProbe:
+    return FakeProbe(
+        {
+            "install-source": {"name": "proc-stat"},
+            "open-window": {
+                "after": {"ActiveState": "active"},
+                "proof_scope": "live-replay",
+            },
+            "status": {"fixtures": {"proc-stat": "cpu  100 0 50 1000 0 0 0 0 0 0"}},
+            "close-window": {"clean": True},
+        }
+    )
+
+
+def _invalid_delta_probes() -> dict[str, FakeProbe]:
+    return {
+        f"node@{NODE}": FakeProbe({"survey": survey_response()}),
+        f"source-replay@{NODE}": _source_probe(),
+    }
+
+
+def _empty_doc() -> dict[str, Any]:
+    return {
+        "incidents": [],
+        "workflows": [],
+        "batches": [],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "metric_latest": [],
+        "notifications": [],
+        "collector_statuses": [],
+    }
+
+
+def test_invalid_delta_emits_no_busy_sample(tmp_path: Path) -> None:
+    spec = SPECS["invalid_delta"]
+    regional = FakeRegional(cpu_python=store_script({"activity": _empty_doc()}))
+    ctx = make_context(
+        spec, tmp_path=tmp_path, regional=regional, probes=_invalid_delta_probes()
+    )
+    result = host.invalid_delta(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["proof_scope"] == "live-replay", result
+
+
+def test_invalid_delta_fails_if_a_busy_sample_appears(tmp_path: Path) -> None:
+    spec = SPECS["invalid_delta"]
+    doc = _empty_doc()
+    doc["batches"] = [
+        host_batch("2026-10-24T00:03:00+00:00", "cpu_usage_percent", 99.0)
+    ]
+    regional = FakeRegional(cpu_python=store_script({"activity": doc}))
+    ctx = make_context(
+        spec, tmp_path=tmp_path, regional=regional, probes=_invalid_delta_probes()
+    )
+    result = host.invalid_delta(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any("cpu_usage_percent samples" in error for error in result["errors"]), (
+        result["errors"]
+    )

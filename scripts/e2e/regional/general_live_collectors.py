@@ -30,7 +30,6 @@ from scripts.e2e.regional.general_live_registry import (
     CAPABILITY,
     NATIVE,
     VariantSpec,
-    deferred_variant,
 )
 from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
@@ -525,8 +524,6 @@ def _spec(
     )
 
 
-DCGM_REPLAY = "FIXTURE_NOT_READY: a DCGM field/alias/NaN source replay needs a reviewed exporter-scrape fixture"
-
 VARIANTS = [
     _spec(
         CASE_025,
@@ -535,46 +532,6 @@ VARIANTS = [
         "sustained dcgm_field_completeness error -> one bounded TRIGGER_HEALTH_SNAPSHOT + VALIDATE_HOST; no reset",
         exporter_timeout,
         max_minutes=18,
-    ),
-    deferred_variant(
-        CASE_025,
-        "missing_field",
-        proof_mode="live-replay",
-        reason=DCGM_REPLAY,
-        lanes=("eks",),
-        expected="a missing required field -> incomplete observation; other GPUs' fields do not cover it",
-    ),
-    deferred_variant(
-        CASE_025,
-        "one_gpu_missing",
-        proof_mode="live-replay",
-        reason=DCGM_REPLAY,
-        lanes=("eks",),
-        expected="one GPU absent from the scrape -> per-GPU completeness; the whole-batch check must not hide it (spec FAIL)",
-    ),
-    deferred_variant(
-        CASE_025,
-        "conflicting_alias",
-        proof_mode="live-replay",
-        reason=DCGM_REPLAY,
-        lanes=("eks",),
-        expected="a conflicting field alias -> incomplete observation, not a silent overwrite",
-    ),
-    deferred_variant(
-        CASE_025,
-        "nan_negative",
-        proof_mode="live-replay",
-        reason=DCGM_REPLAY,
-        lanes=("eks",),
-        expected="NaN/negative slots become incomplete observations, never a healthy zero",
-    ),
-    deferred_variant(
-        CASE_025,
-        "duplicate_slot",
-        proof_mode="live-replay",
-        reason=DCGM_REPLAY,
-        lanes=("eks",),
-        expected="a duplicate slot is an incomplete observation; valid independent samples stay usable",
     ),
     _spec(
         CASE_025,

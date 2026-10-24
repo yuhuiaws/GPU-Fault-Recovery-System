@@ -501,8 +501,10 @@ Node Agent ACTIVE、无未关闭 incident/工作流、必需采集通道新鲜�
 未过期的维护窗口。危险分支另需 `--approve` 令牌（绑进 `plan.json`）：
 `HOST_MEMORY_PRESSURE`（主机内存压力）、`KERNEL_MODULE_LOAD`（加载 dm_delay/
 veth/dummy/sch_netem）、`ENABLE_NODE_LOG_COLLECTOR`（临时启用被禁用的节点日志
-采集器）、`WATCHER_NETWORK_ISOLATION`、`CONTROL_PLANE_RESTART`；缺令牌记
-`NOT_RUN(NOT_AUTHORIZED)`。
+采集器）、`WATCHER_NETWORK_ISOLATION`、`CONTROL_PLANE_RESTART`、
+`DECLARE_WARM_SPARE`（经 admin CLI 声明一台热备并 cordon，清理时释放/解除 cordon）、
+`SPARE_KUBELET_STOP`（停热备上的 kubelet 使其 NotReady，带宿主机自动重启定时器）；
+缺令牌记 `NOT_RUN(NOT_AUTHORIZED)`。
 
 ### 安全
 
@@ -546,3 +548,167 @@ netdev 写进安装器/管理配置的 `GPU_FAULT_REQUIRED_INTERFACES`（默认�
 （生产默认 false）；002/003 的主机内存压力需 `HOST_MEMORY_PRESSURE` 审批；
 006 `sustained_latency`、008/009 的 veth/dummy/netem 需 `KERNEL_MODULE_LOAD`
 或预装内核模块。运行器只做只读 `--plan` 预检，`--execute` 由运维在授权窗口执行。
+
+### phase 2 范围（host/device 扩展）
+
+第二批补充 host/device 类别 002 内存/交换、005 共享存储、007 SMART、
+010 EFA/RDMA 计数、012 GPU 掉卡、015 BMC（模块
+`general_live_memory`/`general_live_shared`/`general_live_devices`，每个必测变体
+都在注册表里）。可在本站真机执行的只有不需要原始源回放夹具的变体：
+
+- 002 `memory_pressure`、`recovery`（native，复用节点探针 `memory-start` 的受限
+  cgroup 压力和 meminfo oracle，需 `HOST_MEMORY_PRESSURE`；`memory_used_percent`
+  ≥95% 持续 120 秒 → VALIDATE_HOST 探针在加载期间失败，无 reset/reboot）；
+  `no_swap`（observation：确认 `SwapTotal=0` 时 swap 规则天然不触发）。
+- 007 `healthy`（observation：只读确认真实 SMART 判定健康且不产生存储 finding，
+  作为失败变体的对照基线）。
+
+其余变体按映射文件留在分母并记 `NOT_RUN`，原因精确可查：
+
+- `FIXTURE_NOT_READY`：007/010/012/015 以及 002 `read_failure`、005 `stat_timeout`
+  /`io_only_failure` 需要把 `smartctl`/`ipmitool`/`ethtool`/`nvidia-smi` 的输出或
+  `/proc/meminfo`、EFA `hw_counters`/`state`、`/proc/driver/nvidia` 的读取**只在
+  host collector 单元私有环境里**替换的共享原始源回放夹具。本阶段不构建该通用
+  回放器（由协调方集中审查后统一提供）；不替换宿主二进制、不写全局挂载。
+- `CAPABILITY_ABSENT`：005 的共享存储变体（本站无可扰动的独立 NFS/Lustre export）、
+  010 `non_efa`（本站只有 EFA RDMA 设备）、015 `healthy`/`unsupported_bmc`
+  （EC2 无 BMC）、002 `swap_pressure`（无 swap 且不得为测试开 swap）。
+- `VENDOR_LAB_ONLY`：012 `confirmed_missing`/`reboot_verified`/`post_reboot_failure`
+  需要真实掉卡与已批准的 provider reboot；本 lane 绝不解绑或移除真实 GPU。
+- `cgroup_only`（002）需要一个有界的自身 cgroup OOM 注入模式，节点探针尚未提供。
+
+现有的 `probes/collector_window_probe.py` 的 nvidia-smi shadow 只匹配库存快照查询
+（026 身份路径），不覆盖 host collector 的 `uuid,utilization.gpu` 查询，故 012
+`single_sample` 仍记 `FIXTURE_NOT_READY` 等待 host 查询 shadow。
+
+### phase 2 范围与前提（工作负载/热备类）
+
+第二批补 011 EFA 流量停滞/NCCL hung、027 训练进度、030 热备不健康；均用受管的
+可丢弃测试任务，判定只读产品记录（011 读分组 `SITE_EFA_TRAFFIC` incident 的诊断
+DAG、027 读 `SITE_TRAINING_HEALTH` incident/决策、030 读热备分级与注解），永不
+POST 预制 finding。类别模块 `general_live_nccl`/`_progress`/`_spares`。
+
+- **011（仅 HyperPod 车道，需 `--node-b`）**：受管两节点 NCCL 任务先达 active
+  基线，再在可恢复 barrier 处让 collective 停滞、EFA 收发对落零（节点探针新增
+  `efa-traffic` 只读 `/sys/class/infiniband` hw_counters 作为独立 oracle；未落零记
+  `INCONCLUSIVE`）。60/600 秒越过后产品出 `ZERO_WARNING→HUNG_SUSPECTED`，合并同波
+  为一个工作流，编译只读诊断 DAG `FREEZE_EVIDENCE→COLLECT_HUNG_SUMMARY×2→
+  COLLECT_HUNG_TRIAGE×2→COLLECT_DIAGNOSTIC_BUNDLE→VALIDATE_FABRIC→ESCALATE_SUPPORT`
+  收尾 `ESCALATED`，全程不 cordon/停任务/reset/reboot。native 实测：`active_to_zero`、
+  `always_low`、`write_progress`、`phase_progress`、`fr_enabled`、`fr_disabled`、
+  `simultaneous_nodes`。延后留分母：规模类 `large_job`/`no_step_no_rank`/
+  `active_window_resume`（`SCALE`，本站无 128 节点任务）、需审查测试 FR dump 响应器
+  的 `fr_temporal_completion`/`fr_second_missing`/`fr_whole_group`/`few_candidates`/
+  `ambiguous_candidates`/`different_process_groups`/`fr_plus_process`、需 py-spy 故障
+  工具的 `pyspy_nonzero`、需角色声明测试任务的 `role_mismatch`/`tid_namespace`/
+  `wchan_zero`/`cpu_interval`（均 `FIXTURE_NOT_READY`）、`broken_pair`（需 sysfs 读取
+  夹具）、`attempt_change`（需可控换 attempt）、`unreachable_node`（隔离 Agent 通道
+  未授批，`NOT_AUTHORIZED`）。
+- **027（eks 或 hp 车道）**：产品训练进度 reporter 默认关闭、全局周期 monitor 必须
+  保持关闭；仅测试任务 Pod 内以 `gpu-fault-collector training-progress` sidecar 启用
+  reporter，读测试应用原子写的进度文件（启用 reporter 的源路径）。扫描类信号用
+  execution-token 的 `POST /v1/training-health/<cluster>/scan`（本集群一次），因此执行
+  前须确认该测试任务是集群内唯一 RUNNING 受管 attempt（否则整集群扫描会误报正常
+  任务 reporter 静默）。native 实测全部 9 个：`nan`（只停归属 attempt+ESCALATE，不
+  重启不 cordon，checkpoint 只作证据）、`stalled_step`、`reporter_silent`、
+  `step_regression`、`straggler_group`（同 `progress_group`）、`bounded_phase`、
+  `old_attempt`、`checkpoint_unverified`、`resumed_progress`（原 rank 新有效进度才
+  RECOVERED）。
+- **030（仅 HyperPod 车道，`--fault-node` 指向待声明热备）**：经 admin CLI 声明一台
+  空闲热备（`DECLARE_WARM_SPARE`），清理必定释放；每个阻断类变体只让该热备对分配
+  不合格一种方式，读取产品自身的分级（`HyperPodSpareCoordinator.health_reasons`
+  的分配门）并断言按正确 reason class 拒绝、且未产生任何 provider 恢复。native 实测：
+  `not_ready`（停 kubelet，需 `SPARE_KUBELET_STOP`）、`stale_metrics`（暂停 metrics
+  采集器）、`configuration_error`（注入非 AVAILABLE pool state）、`reserved_spare`
+  （注入他 incident 的 reservation，验证不被他任务复用）。本站为区域/多集群控制面
+  （`GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`），周期性 `HyperPodSpareHealth
+  Controller` 不运行，故 `confirmed_hardware`/`repair_failure`/`bounded_recheck` 记
+  `NOT_RUN(CAPABILITY_ABSENT)`；`no_spare`（无热备不回落 provider 替换）只在危险的
+  REPLACE_NODE 失败转路径可见，记 `NOT_RUN(NOT_AUTHORIZED)`。
+
+计划/执行形如 `--case GF-GENERAL-LIVE-011 --variant active_to_zero --site-file <F>
+--node-b <N2> --hyperpod-cluster <HP>`（011/030 在 hp 车道，011/030 需 `--site-file`，
+011 需 `--node-b`，030 的热备节点用 `--fault-node`）。
+
+### phase 2 范围与前提（内核/应用日志、未知错误、EFA 库存）
+
+phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取路径注入：
+
+- 可复用的**内核日志源回放**
+  `scripts/e2e/regional/general_live_kernel_replay.py`（主机探针
+  `probes/general_live_kernel_source_probe.py`）为单节点/单 boot 安装一组经审查
+  的 kernel-transport 记录、arm、读回产品实际摄入内容、清理。两种模式：journal
+  模式在节点日志采集器的 PATH 前置一个 `journalctl` 透传包装（转发真实输出，仅在
+  arm 后追加经审查记录，有界 emissions、去重为一条 incident），kmsg 模式用 `/run`
+  drop-in 把内核采集器的 `GPU_FAULT_KMSG_PATH` 指到经审查夹具文件。`_TRANSPORT=kernel`
+  为可信 `dmesg` 来源，其它 transport 保持不可信 `journal` 来源——这正是信任门禁。
+  lane R 的“独立可信 XID”变体后续复用此助手。
+- 主机采集器**文件源回放** `general_live_source_replay.py`（探针
+  `probes/general_live_source_probe.py`）只在主机采集器自身 mount namespace 内用
+  `BindReadOnlyPaths` 替换一个允许列表内的 procfs/sysfs 文件（`/proc/stat` 或 gfrs
+  测试网卡的 statistics 计数器），或重指 `GPU_FAULT_PCI_DEVICES_ROOT`。
+- 所有回放都带 `systemd-run --on-active` deadman，证据标注 `proof_scope: live-replay`，
+  只证明处理链，不证明物理故障。
+
+已实现变体：016 严重内核日志（全部 9 个，含 user_text/old_boot/corrected_mce 的
+反向门禁）、017 应用错误日志（cgroup_oom 诊断与 nccl_error/distributed_error 仅证据）、
+032 `unknown_xid`（判为 SITE_SAFETY）与 `duplicate`、013 `unreadable_state`
+（UNKNOWN 而非零卡），以及 phase-1 文件源 001 `invalid_delta`、008 `statistics_failed`、
+009 `errors_delta`。
+
+计划/执行守卫键仍为 `<case>.<variant>`，确认串 `GENERALLIVE<NNN>_EXECUTE`。新 `--approve`
+令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`EFA_DRIVER_UNBIND`、
+`DEVICE_PLUGIN_RESTART`（013/014 的原生注入，本轮未执行）；016/017 的 journal 模式复用
+`ENABLE_NODE_LOG_COLLECTOR`（节点日志采集器生产默认禁用），008/009 复用
+`KERNEL_MODULE_LOAD`。每个 016/017/032/013 变体单独 plan/execute，与 phase-1 相同：
+
+```bash
+run_general_live.py --site-profile <profile> --run-dir <run> \
+  --case GF-GENERAL-LIVE-016 --variant rdma_fatal --execute \
+  --confirm GENERALLIVE016_EXECUTE --approve ENABLE_NODE_LOG_COLLECTOR \
+  --maintenance-window-end <UTC>
+```
+
+本轮保持 `NOT_RUN` 并留在分母：014 全部（伪造 allocatable/改 Node.status 不算证明，
+原生 plugin 故障需 `DEVICE_PLUGIN_RESTART`）、013 多数（唯一 EKS 节点上的 missing→reboot
+链、保留的原生解绑、不可重指的 `/sys/class/infiniband`）、032 的目录/版本/Profile 权限
+变体（AUTH-015 未配置）、017 的归属变体（需受管 attempt 与 CRI Pod 日志）、004 `probe_error`
+（`statvfs` 错误无法由只读文件 bind 产生）。
+
+### phase 2 范围与前提（DCGM 字段 / GPU 库存回放）
+
+第二批覆盖按 DCGM 字段和 GPU 库存判定的类别：019 ECC/行重映射/页退役、
+020 NVLink 错误计数、021 NVLink fabric 未训练、022 PCIe replay、024 DCGM 复合、
+026 GPU 身份/期望数，以及 phase 1 延后的 025 五个字段变体
+（missing_field/one_gpu_missing/conflicting_alias/nan_negative/duplicate_slot）。
+注入一律 `live-replay`：只替换单个原始读数，collector 解析、传输、判定、数据库、
+调度与已批准的节点动作均真实。
+
+机制（无产品代码改动）：经审查的 DCGM 字段回放工具
+`tools/gpu_dcgm_field_replay.py` 带自己的**按类别字段白名单**（与环境工具的
+`ALLOWED_FIELDS` 分离，不拓宽），以及经审查的 `nvidia-smi` 透传包装器
+`tools/nvidia_smi_inventory_replay.py`（026 身份/BDF/期望数）。两者由主机控制器
+`probes/general_live_dcgm_probe.py` 以 base64+sha256 装入 `/run/gfrs-live/<digest>/`，
+工具在 loopback 端口 `--serve`（装入即透传，`arm` 前不改任何字节），包装器仅排在
+目标单元 PATH 首位；只对一个被允许的采集单元
+`gpu-fault-metrics-collector.service` 用 `/run` drop-in（`EnvironmentFile=-`，
+覆盖 `GPU_FAULT_DCGM_METRICS_URL` / PATH / 旧 boot / 期望数），并先布置
+`systemd-run` deadman 还原；Node Agent 永不在白名单内。计数类故障只能靠产品新采的
+零增量批次清除（回退计数是 invalid delta，会保留 finding），故回放在产品接受干净
+批次前一直保持抬升值再 disarm。判定只读产品自己的记录
+（`general_live_gpu_store`/`general_live_gpu_verdicts`），绝不 POST 预制 finding。
+
+需审批与独占节点的变体：019 `pending_supported`/`post_reset` 单卡 service-window
+reset 需 `--approve GPU_RESET`；021 任一 finding 都驱动全 GPU+NVSwitch reset，故
+该类变体需 `--approve GPU_FULL_FABRIC_RESET`（`recovery_failure` 另需
+`NODE_REBOOT`）并只在 HyperPod 独占节点跑；022 的 XID 联合变体只把 DCGM last-XID
+gauge 回放为 XID 32（`--approve DCGM_XID_GAUGE`）；019 `remap_failure` 的 RMA 现场
+诊断需 `GPU_FIELD_DIAGNOSTIC`。延后：020 `independent_fatal_event`、024
+`independent_xid` 需 K 车道的可信内核 XID/SXid 源，记 `NOT_RUN(FIXTURE_NOT_READY)`；
+024 热/功耗复合复用 GF-ENV-LIVE 环境回放；019 `pending_unsupported`（无旧架构卡）、
+`observe_profile`（无 OBSERVE reset Profile）记 `CAPABILITY_ABSENT`。
+
+规格明示、注入有效但产品不足的按 `expected_outcome="FAIL"` + `product_gap` 记录，不
+掩盖：025 `one_gpu_missing`（完整性按全批 union 计算，漏查单卡）、022 `expired_xid`
+（PCIe↔XID gauge 回退无时效检查）、026 `bdf_changed`（身份只比 UUID 集）、026
+`stale_boot`（库存基线不比 source_boot_id）。

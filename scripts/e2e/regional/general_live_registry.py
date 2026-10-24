@@ -75,6 +75,55 @@ APPROVALS: dict[str, str] = {
         "delete one cluster-executor or completion-watcher Pod of the GPU "
         "cluster during an open restart claim (worker restart)"
     ),
+    "DECLARE_WARM_SPARE": (
+        "declare one warm spare GPU node through gpu-fault-admin config spare "
+        "(sets the spare label and cordons it); released and uncordoned in cleanup"
+    ),
+    "SPARE_KUBELET_STOP": (
+        "stop kubelet on the declared warm spare to drive it NotReady, with a "
+        "host-side automatic restart timer; restarted in cleanup"
+    ),
+    # Lane K (phase 2) kernel-log source replay and EFA inventory.
+    "KERNEL_SOURCE_REPLAY": (
+        "repoint the kernel collector's GPU_FAULT_KMSG_PATH at a reviewed "
+        "fixture file for a bounded window (it stops reading real /dev/kmsg "
+        "meanwhile); restored by cleanup and a deadman"
+    ),
+    "EFA_DRIVER_UNBIND": (
+        "unbind the driver of one allow-listed EFA data function on a dedicated "
+        "node and rebind it, with an independent rebind deadman"
+    ),
+    "DEVICE_PLUGIN_RESTART": (
+        "delete the GPU or EFA device-plugin Pod on the test node so kubelet "
+        "de-registers its allocatable, then let the DaemonSet re-register it"
+    ),
+    "GPU_RESET": (
+        "let the product's RESET_GPU chain (quiesce, verify no GPU clients, one "
+        "nvidia-smi --gpu-reset of the target GPU, restore GPU services, "
+        "validate) run on the idle test node for a replayed row-remap-pending "
+        "reading"
+    ),
+    "GPU_FULL_FABRIC_RESET": (
+        "let the product's RESET_ALL_GPUS_NVSWITCHES chain (quiesce incl. Fabric "
+        "Manager, one reset of every GPU and NVSwitch, Fabric Manager restart, "
+        "GPU and fabric validation) run on the exclusive test node for a "
+        "replayed NVLink fabric state"
+    ),
+    "NODE_REBOOT": (
+        "let the product's post-validation-failure ladder reboot the exclusive "
+        "test node through the provider (RESTART_NODE) after a failed "
+        "post-reset fabric validation"
+    ),
+    "GPU_FIELD_DIAGNOSTIC": (
+        "let the product run the node's configured NVIDIA memory field "
+        "diagnostic on the drained test GPU (only when the Node Agent allows "
+        "RUN_FIELD_DIAGNOSTIC)"
+    ),
+    "DCGM_XID_GAUGE": (
+        "replay the DCGM last-XID gauge (DCGM_FI_DEV_XID_ERRORS) as XID 32 "
+        "(catalog RESTART_APP, monitor-only on an idle node) on one test GPU; "
+        "the product turns it into a trusted XID event"
+    ),
 }
 
 #: Workflow operations a diagnostic-only chain must never contain.
@@ -198,9 +247,52 @@ CATEGORY_MODULES = (
     "scripts.e2e.regional.general_live_utilization",
     "scripts.e2e.regional.general_live_attempts",
     "scripts.e2e.regional.general_live_collectors",
+    "scripts.e2e.regional.general_live_memory",
+    "scripts.e2e.regional.general_live_shared",
+    "scripts.e2e.regional.general_live_devices",
+    "scripts.e2e.regional.general_live_nccl",
+    "scripts.e2e.regional.general_live_progress",
+    "scripts.e2e.regional.general_live_spares",
+    "scripts.e2e.regional.general_live_kernel",
+    "scripts.e2e.regional.general_live_applogs",
+    "scripts.e2e.regional.general_live_unknown",
+    "scripts.e2e.regional.general_live_inventory",
+    "scripts.e2e.regional.general_live_gpu_memory",
+    "scripts.e2e.regional.general_live_gpu_links",
+    "scripts.e2e.regional.general_live_gpu_fabric",
+    "scripts.e2e.regional.general_live_gpu_composite",
+    "scripts.e2e.regional.general_live_gpu_fields",
+    "scripts.e2e.regional.general_live_gpu_identity",
 )
 #: The categories phase 1 implements (``cases`` rows of the coverage file).
 PHASE_ONE_CATEGORIES = (1, 3, 4, 6, 8, 9, 25, 28, 29, 31)
+#: The categories phase 2 adds: 002 memory, 005 shared storage, 007/010/012/015
+#: devices, 011 NCCL hung, 013/014 EFA and allocatable inventory, 016 kernel log,
+#: 017 application logs, 019-022/024/026 DCGM field and GPU inventory replay
+#: (025's field variants live in general_live_gpu_fields), 027 training
+#: progress, 030 warm spare, 032 unknown error.
+PHASE_TWO_CATEGORIES = (
+    2,
+    5,
+    7,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15,
+    16,
+    17,
+    19,
+    20,
+    21,
+    22,
+    24,
+    26,
+    27,
+    30,
+    32,
+)
 
 
 def coverage_rows(path: Path = COVERAGE_PATH) -> dict[str, list[str]]:
@@ -246,9 +338,9 @@ def validate_spec(spec: VariantSpec) -> None:
             raise RegistryError(f"{spec.key}: a deferred variant has no executor")
     elif spec.execute is None:
         raise RegistryError(f"{spec.key}: an executable variant needs execute()")
-    if spec.proof_mode not in {NATIVE, OBSERVATION} and not spec.deferred:
+    if spec.proof_mode not in {NATIVE, OBSERVATION, LIVE_REPLAY} and not spec.deferred:
         raise RegistryError(
-            f"{spec.key}: only native and observation variants run in phase 1"
+            f"{spec.key}: only native, observation and live-replay variants are executable"
         )
     if not 1 <= spec.max_minutes <= 180:
         raise RegistryError(f"{spec.key}: max_minutes is outside 1..180")
@@ -288,7 +380,7 @@ def load_registry() -> dict[str, VariantSpec]:
     for name in CATEGORY_MODULES:
         module = importlib.import_module(name)
         specs.extend(getattr(module, "VARIANTS"))
-    return build_registry(specs)
+    return build_registry(specs, categories=PHASE_ONE_CATEGORIES + PHASE_TWO_CATEGORIES)
 
 
 def select(
@@ -317,6 +409,7 @@ __all__ = [
     "NOT_RUN_REASONS",
     "OBSERVATION",
     "PHASE_ONE_CATEGORIES",
+    "PHASE_TWO_CATEGORIES",
     "RegistryError",
     "VENDOR_LAB",
     "VERDICTS",

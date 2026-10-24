@@ -65,7 +65,7 @@ def test_deferred_variant_is_not_implemented() -> None:
         ({"expected_outcome": "MAYBE"}, "expected outcome"),
         ({"expected_outcome": "FAIL"}, "must cite its product gap"),
         ({"max_minutes": 999}, "max_minutes is outside"),
-        ({"proof_mode": "live-replay"}, "only native and observation"),
+        ({"proof_mode": "vendor-lab"}, "only native, observation and live-replay"),
         ({"execute": None}, "needs execute"),
     ],
 )
@@ -111,7 +111,7 @@ def test_select_and_coverage_rows() -> None:
 def test_full_registry_matches_coverage() -> None:
     registry = reg.load_registry()
     rows = reg.coverage_rows()
-    for number in reg.PHASE_ONE_CATEGORIES:
+    for number in reg.PHASE_ONE_CATEGORIES + reg.PHASE_TWO_CATEGORIES:
         case = f"GF-GENERAL-LIVE-{number:03d}"
         for variant in rows[case]:
             assert f"{case}.{variant}" in registry
