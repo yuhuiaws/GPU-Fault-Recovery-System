@@ -5,6 +5,7 @@ import logging
 import os
 import queue
 import shutil
+import subprocess
 import threading
 import time
 from datetime import datetime
@@ -44,6 +45,25 @@ class _SmartHealth(NamedTuple):
 
 
 _NO_SMART_HEALTH = _SmartHealth(None, (), ())
+
+
+class _SmartScan(NamedTuple):
+    """What ``smartctl --scan-open`` could and could not enumerate.
+
+    ``failure`` set means the scan itself did not answer, so the drive set is
+    unknown -- which is not the same as a node without drives.
+    """
+
+    devices: tuple[str, ...]
+    unopened: tuple[tuple[str, str], ...]
+    failure: str | None = None
+
+
+#: smartctl's ``--scan-open`` prints a platform scan failure as this comment on
+#: stdout and still exits 0, so the exit status alone cannot tell it from a
+#: node with no drives.
+_SMART_SCAN_ERROR = "scan_smart_devices:"
+_SMART_OPEN_FAILED = "open failed"
 
 
 class _InFlightProbe:
@@ -577,11 +597,48 @@ class HostSystemMetricsMixin:
         every tick: the consumer reads ``smart_health_failed`` as a latest
         value, so a tick that omitted it would read as a drive that stopped
         being watched.
+
+        What SMART could not say is reported as such, never as a verdict
+        (GF-GENERAL-LIVE-007). A scan or a drive query that did not answer --
+        a non-zero ``--scan-open`` or its ``scan_smart_devices`` error line, a
+        drive the scan could not open, a ``-H`` that timed out or returned no
+        usable verdict -- is UNKNOWN: ``smart_query_failed`` plus a collection
+        error, which holds host validation and grades nothing. A failed scan
+        used to parse as an empty drive set, i.e. a node with nothing to
+        check. SMART the node cannot provide -- no ``smartctl``, no drive, a
+        drive without a SMART status -- is NOT_SUPPORTED:
+        ``smart_status_unsupported`` on every tick and no collection error,
+        because the gap is permanent and an error would hold every host
+        validation of the node until its deadline. Neither one is a passed
+        drive, and neither quarantines one.
         """
 
         if not shutil.which("smartctl"):
-            return []
-        devices = self._smart_devices()
+            return [self._smart_unsupported(None, "TOOL_MISSING")]
+        scan = self._smart_devices()
+        if scan.failure is not None:
+            raise HostObservationError(
+                "smartctl --scan-open failed, so the drive set is unknown: "
+                + scan.failure,
+                [self._smart_query_failed(None, "SCAN_FAILED")],
+            )
+        if not scan.devices and not scan.unopened:
+            return [self._smart_unsupported(None, "NO_DEVICES")]
+        samples, failures = self._smart_verdicts(observed_at, scan.devices)
+        for device, reason in scan.unopened:
+            samples.append(self._smart_query_failed(device, "OPEN_FAILED"))
+            failures.append(f"{device}: open failed: {reason}")
+        if failures:
+            raise HostObservationError(
+                "SMART health is unknown for " + "; ".join(failures), samples
+            )
+        return samples
+
+    def _smart_verdicts(
+        self, observed_at: datetime, devices: tuple[str, ...]
+    ) -> tuple[list[HostMetricSample], list[str]]:
+        """The ``-H`` answers for ``devices``, and the drives that gave none."""
+
         cached = self._smart_health
         if (
             cached.observed_at is not None
@@ -589,69 +646,112 @@ class HostSystemMetricsMixin:
             and (observed_at - cached.observed_at).total_seconds()
             < _SMART_CACHE_SECONDS
         ):
-            return list(cached.samples)
+            return list(cached.samples), []
         samples: list[HostMetricSample] = []
-        answered = True
+        failures: list[str] = []
         for device in devices:
-            verdict, queried = self._smart_verdict(device)
+            verdict, failure = self._smart_verdict(device)
             samples.extend(verdict)
-            answered = answered and queried
+            if failure is not None:
+                failures.append(f"{device}: {failure}")
         # A failed query must not start a cache window. Caching it the way a
         # verdict is cached would hide a drive that has begun refusing SMART
         # queries -- a real dying-NVMe failure mode -- for a whole period,
         # which is exactly what the cache may not do to a health change. With
         # no timestamp the next tick is a miss and re-queries.
         self._smart_health = _SmartHealth(
-            observed_at if answered else None, devices, tuple(samples)
+            None if failures else observed_at, devices, tuple(samples)
         )
-        if not answered:
-            raise HostObservationError("one or more SMART queries failed", samples)
-        return samples
+        return samples, failures
 
-    def _smart_devices(self) -> tuple[str, ...]:
-        """The drives ``smartctl`` can open, sorted so the key is stable."""
+    def _smart_devices(self) -> _SmartScan:
+        """The drives ``smartctl`` can open, sorted so the key is stable.
 
-        scan = self.runner(
-            ["smartctl", "--scan-open"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-        devices = set()
-        for line in scan.stdout.splitlines():
+        ``--scan-open`` lists a drive it could not open only as a comment,
+        ``# /dev/nvme1 -d nvme # /dev/nvme1, NVMe device open failed: <why>``,
+        which used to drop the drive from the set silently. It is kept as
+        unopened. A scan that did not answer at all -- an exit status, a
+        timeout, or the ``# scan_smart_devices: <error>`` line smartctl prints
+        before exiting 0 -- returns ``failure`` and no drives.
+        """
+
+        try:
+            scan = self.runner(
+                ["smartctl", "--scan-open"],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return _SmartScan((), (), f"{type(exc).__name__}: {exc}")
+        output = scan.stdout or ""
+        if scan.returncode != 0:
+            detail = (scan.stderr or output).strip()[:200]
+            return _SmartScan((), (), f"exit status {scan.returncode}: {detail}")
+        devices: set[str] = set()
+        unopened: dict[str, str] = {}
+        for line in output.splitlines():
             fields = line.split(maxsplit=1)
             if fields and fields[0].startswith("/dev/"):
                 devices.add(fields[0])
-        return tuple(sorted(devices))
+                continue
+            comment = line.strip()
+            if not comment.startswith("#"):
+                continue
+            body = comment.lstrip("#").strip()
+            if body.startswith(_SMART_SCAN_ERROR):
+                return _SmartScan((), (), body[:200])
+            named = body.split(maxsplit=1)
+            if named and named[0].startswith("/dev/") and _SMART_OPEN_FAILED in body:
+                reason = body.split(_SMART_OPEN_FAILED, 1)[1].lstrip(": ")
+                unopened[named[0]] = reason.strip()[:200]
+        return _SmartScan(
+            tuple(sorted(devices)),
+            tuple(
+                sorted(
+                    (device, reason)
+                    for device, reason in unopened.items()
+                    if device not in devices
+                )
+            ),
+        )
 
-    def _smart_verdict(self, device: str) -> tuple[list[HostMetricSample], bool]:
-        """One drive's verdict, and whether the query itself answered.
+    def _smart_verdict(self, device: str) -> tuple[list[HostMetricSample], str | None]:
+        """One drive's verdict, and why the query gave none if it did not.
 
-        A refused query is unknown, not a failed device self-assessment.
-        Report ``smart_query_failed`` plus a collection error, and retry next
-        cycle instead of caching it or authorizing hardware quarantine.
+        A refused, hung or malformed query is unknown, not a failed device
+        self-assessment: report ``smart_query_failed`` plus a collection
+        error, and retry next cycle instead of caching it or authorizing
+        hardware quarantine. A hung query is caught here, per drive: raised,
+        it discarded the verdicts of every other drive in the tick, including
+        one that had just reported FAILED.
 
         A verdict-less answer from a *clean* ``smartctl`` is a different thing:
         that is a device ``--scan-open`` can open but which implements no SMART
         status at all. It has no health to report and is not a failure, so it
-        stays cacheable -- calling it failed would quarantine every node that
-        carries such a device.
+        is NOT_SUPPORTED and stays cacheable -- calling it failed would hold
+        every node that carries such a device in an observation error.
         """
 
-        check = self.runner(
-            ["smartctl", "-H", "-j", device],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
+        try:
+            check = self.runner(
+                ["smartctl", "-H", "-j", device],
+                capture_output=True,
+                text=True,
+                timeout=20,
+                check=False,
+            )
+        except (subprocess.TimeoutExpired, OSError) as exc:
+            return [self._smart_query_failed(device)], f"{type(exc).__name__}: {exc}"
         try:
             payload = json.loads(check.stdout)
         except json.JSONDecodeError:
-            return [self._smart_query_failed(device)], False
+            return [self._smart_query_failed(device)], (
+                f"exit status {check.returncode}, output is not JSON"
+            )
         if not isinstance(payload, dict):
-            return [self._smart_query_failed(device)], False
+            return [self._smart_query_failed(device)], "output is not a JSON object"
         status = payload.get("smart_status")
         passed = status.get("passed") if isinstance(status, dict) else None
         if passed is None:
@@ -660,8 +760,16 @@ class HostSystemMetricsMixin:
                 reported.get("exit_status", 0) if isinstance(reported, dict) else 0
             )
             if check.returncode or exit_status:
-                return [self._smart_query_failed(device)], False
-            return [], True
+                return [self._smart_query_failed(device)], (
+                    f"no verdict, exit status {check.returncode or exit_status}"
+                )
+            return [self._smart_unsupported(device, "NO_SMART_STATUS")], None
+        if not isinstance(passed, bool):
+            # ``"false"`` is truthy and ``0`` falsy: either would have been read
+            # as a verdict the drive never gave.
+            return [self._smart_query_failed(device)], (
+                f"smart_status.passed is not a boolean: {passed!r}"
+            )
         return [
             self._sample(
                 "smart_health_failed",
@@ -669,21 +777,42 @@ class HostSystemMetricsMixin:
                 None,
                 device,
             )
-        ], True
+        ], None
 
     @staticmethod
-    def _smart_query_failed(device: str) -> HostMetricSample:
+    def _smart_query_failed(
+        device: str | None, failure_mode: str = "QUERY_FAILED"
+    ) -> HostMetricSample:
         """The marker for a drive whose SMART query could not be answered.
 
         Kept separate from ``smart_health_failed``: unreadable health is not
-        proof of either a healthy drive or a hardware failure.
+        proof of either a healthy drive or a hardware failure. ``device`` is
+        None for a scan that failed (``SCAN_FAILED``) and so names no drive;
+        ``OPEN_FAILED`` is a drive the scan listed but could not open.
         """
 
         return HostMetricSample(
             name="smart_query_failed",
             value=1,
             device=device,
-            labels={"failure_mode": "QUERY_FAILED"},
+            labels={"failure_mode": failure_mode},
+        )
+
+    @staticmethod
+    def _smart_unsupported(device: str | None, reason: str) -> HostMetricSample:
+        """The marker for SMART this node or drive cannot provide.
+
+        ``TOOL_MISSING`` and ``NO_DEVICES`` name no drive; ``NO_SMART_STATUS``
+        is a drive that answers cleanly with no PASSED/FAILED verdict. Not a
+        rule input and not a collection error: a capability gap is neither a
+        healthy scan nor an unknown one.
+        """
+
+        return HostMetricSample(
+            name="smart_status_unsupported",
+            value=1,
+            device=device,
+            labels={"reason": reason},
         )
 
     def _bmc(self, _: datetime) -> list[HostMetricSample]:

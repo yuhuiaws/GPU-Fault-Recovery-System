@@ -38,6 +38,7 @@ CONTRIBUTORS = {
     "filesystem": "_filesystems",
     "smart": "_smart",
     "smart-query": "_smart",
+    "smart-scan": "_smart",
     "bmc": "_bmc",
     "bmc-query": "_bmc",
     "net-missing": "_network",
@@ -187,6 +188,11 @@ class HostFaultRig:
 
     def command(self, argv, **_):
         if argv == ["smartctl", "--scan-open"]:
+            if self.kind == "smart-scan":
+                # smartctl reports a failed platform scan on stdout, exit 0.
+                return CompletedProcess(
+                    argv, 0, "# scan_smart_devices: glob(3) aborted\n", ""
+                )
             return CompletedProcess(argv, 0, "/dev/test -d scsi\n", "")
         if argv == ["smartctl", "-H", "-j", "/dev/test"]:
             if self.kind == "smart-query":

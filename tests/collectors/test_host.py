@@ -1032,8 +1032,9 @@ def test_a_drive_without_smart_status_is_not_a_failed_query(
     """``--scan-open`` lists devices that implement no SMART status at all.
 
     Those answer cleanly with no verdict. Reporting that as a query failure
-    would quarantine every node carrying such a device, so it stays a
-    cacheable "nothing to report".
+    would hold every node carrying such a device in an observation error, so
+    it stays a cacheable NOT_SUPPORTED marker -- reported, but neither a
+    verdict nor a collection error (GF-GENERAL-LIVE-007 unsupported_device).
     """
 
     calls: list[list[str]] = []
@@ -1047,12 +1048,17 @@ def test_a_drive_without_smart_status_is_not_a_failed_query(
     first = collector.collect_once()
     second = collector.collect_once()
 
-    assert [item.name for item in first.samples] == [], (
-        f"a device with no SMART status has no health to report: {first.samples}"
-    )
-    assert [item.name for item in second.samples] == [], (
-        f"the second tick invented a verdict: {second.samples}"
-    )
+    for batch in (first, second):
+        assert [
+            (item.name, item.device, item.labels.get("reason"))
+            for item in batch.samples
+        ] == [("smart_status_unsupported", "/dev/nvme0", "NO_SMART_STATUS")], (
+            f"a device with no SMART status reports the gap, not a verdict: "
+            f"{batch.samples}"
+        )
+        assert batch.collection_errors == [], (
+            f"missing SMART support is not a failed query: {batch.collection_errors}"
+        )
     assert len(_health_checks(calls)) == 1, (
         f"a clean verdict-less answer must stay cacheable: {calls}"
     )

@@ -727,7 +727,7 @@ test_cases:
   level: end-to-end
   risk: non-destructive
   problem: 不能把采集器没有读到结果视为真实硬件故障。
-  injection: SMART 查询失败、BMC 查询失败和 net unknown 分别连续采样并送入 API。
+  injection: SMART 查询失败、SMART 扫描失败、BMC 查询失败和 net unknown 分别连续采样并送入 API。
   expected:
   - collection_errors 保留，不创建恢复 workflow，不隔离节点
   - 不用预制 finding 或固定成功的验证函数代替真实链路

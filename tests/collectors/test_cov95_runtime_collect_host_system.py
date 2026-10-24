@@ -144,7 +144,9 @@ def test_smart_reports_query_failure_separately_from_health_verdict(
 
     assert first.samples == second.samples
     if expected is None:
-        assert first.samples == []
+        assert [(item.name, item.labels) for item in first.samples] == [
+            ("smart_status_unsupported", {"reason": "NO_SMART_STATUS"})
+        ], "a verdict-less drive is reported NOT_SUPPORTED, not as a verdict"
     else:
         assert first.samples[0].value == expected
         assert ("failure_mode" in first.samples[0].labels) is query_failed
