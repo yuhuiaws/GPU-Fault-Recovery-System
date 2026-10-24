@@ -138,7 +138,9 @@ def test_memory_pressure_is_inconclusive_when_the_oracle_never_crossed(
     ctx = make_context(
         spec, tmp_path=tmp_path, regional=regional, probes={f"node@{NODE}": probe}
     )
-    with pytest.raises(VariantInconclusive):
+    # Live 2026-10-24: a 2 TiB host was still at 76 % when detection timed
+    # out; the ramp is now waited for (and named) before detection is timed.
+    with pytest.raises(VariantInconclusive, match="did not raise memory_used"):
         spec.execute(ctx)
 
 

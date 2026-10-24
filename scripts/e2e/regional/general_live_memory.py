@@ -70,6 +70,10 @@ SUSTAIN_SECONDS = 120
 DETECTION_BUDGET = SUSTAIN_SECONDS + 300 + 120
 #: Hold host memory_used at about this percentage; below the probe's 97 % cap.
 TARGET_USED_PERCENT = 96.5
+#: How long the allocator may take to reach the threshold before detection is
+#: timed: it touches memory at a fixed pace, so a 2 TiB p5en host needs about
+#: 14 minutes (live 2026-10-24: 76 % after the 9-minute detection budget).
+RAMP_BUDGET = 1080
 
 
 def _require_memory_approval(ctx: VariantContext) -> None:
@@ -95,6 +99,25 @@ def _run_memory_load(ctx: VariantContext, hold_seconds: int) -> Oracle:
     return oracle
 
 
+def _await_ramp(ctx: VariantContext, oracle: Oracle) -> None:
+    """Wait until the oracle reads the threshold; detection is timed from there."""
+
+    def reached() -> bool | None:
+        oracle.read()
+        values = oracle_values(
+            oracle.records, lambda record: record.get("memory_used_percent")
+        )
+        return True if values and values[-1] >= USED_THRESHOLD else None
+
+    if not ctx.wait_until(
+        reached, timeout_seconds=RAMP_BUDGET, poll_seconds=15, name="memory-ramp"
+    ):
+        raise VariantInconclusive(
+            f"the allocator did not raise memory_used to {USED_THRESHOLD}% within "
+            f"{RAMP_BUDGET} s"
+        )
+
+
 def _oracle_used_each_tick(oracle: Oracle, minimum: int) -> None:
     oracle.read()
     values = oracle_values(
@@ -112,8 +135,9 @@ def memory_pressure(ctx: VariantContext) -> dict[str, Any]:
     require_tools(survey, "systemd-run")
     _require_memory_approval(ctx)
     started_at = utc_now()
-    hold = DETECTION_BUDGET + 240
+    hold = RAMP_BUDGET + DETECTION_BUDGET + 240
     oracle = _run_memory_load(ctx, hold)
+    _await_ramp(ctx, oracle)
     detection = wait_for_incident(
         ctx,
         started_at,
@@ -184,8 +208,9 @@ def recovery(ctx: VariantContext) -> dict[str, Any]:
     require_tools(survey, "systemd-run")
     _require_memory_approval(ctx)
     started_at = utc_now()
-    hold = DETECTION_BUDGET + 60
+    hold = RAMP_BUDGET + DETECTION_BUDGET + 60
     oracle = _run_memory_load(ctx, hold)
+    _await_ramp(ctx, oracle)
     detection = wait_for_incident(
         ctx,
         started_at,
@@ -302,7 +327,7 @@ VARIANTS = [
         injection="hold host MemAvailable low (~96.5 % used) in a capped cgroup for > 120 s",
         expected="memory_used_percent >= 95 for 120 s -> VALIDATE_HOST probe fails while loaded; no reset/reboot",
         cleanup="stop the allocator; 2 fresh samples below 95 %",
-        max_minutes=22,
+        max_minutes=45,
         approvals=("HOST_MEMORY_PRESSURE",),
         execute=memory_pressure,
     ),
@@ -363,7 +388,7 @@ VARIANTS = [
         injection="drive memory_pressure to a finding, then stop the allocator",
         expected="2 fresh samples below 95 % and the incident settles; no reboot masks the OOM",
         cleanup="none",
-        max_minutes=22,
+        max_minutes=45,
         approvals=("HOST_MEMORY_PRESSURE",),
         execute=recovery,
     ),
