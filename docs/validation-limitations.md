@@ -1036,6 +1036,10 @@ summary periods for its two fresh samples (host CPU/load, storage and host
 memory alike); and the GPU environment runner
 treats a collector unit that carries no endpoint override after the restore as
 restored to `collector.env`'s endpoint, the state its repoint started from.
+A failed validation also counts as judging the held fault when its
+`node_failures` name the metric or its `host_diagnostic:<metric>` probe: the
+product sets `host_diagnostic_failure` only on health contracts that forbid
+hardware escalation, and the load-average validation runs on another one.
 
 ## GF-GENERAL-LIVE DCGM / GPU-inventory replay (phase 2)
 

@@ -320,7 +320,7 @@ def test_validation_missing_and_failed_without_marker() -> None:
             )
         ],
     }
-    assert "without host_diagnostic_failure" in " ".join(
+    assert "without naming the held fault" in " ".join(
         v.chain_errors(
             doc,
             v.ChainExpectation(
@@ -328,6 +328,43 @@ def test_validation_missing_and_failed_without_marker() -> None:
             ),
         )
     )
+    # Live 2026-10-24 GF-GENERAL-LIVE-001.load_average: no marker on that
+    # contract, but node_failures names the held metric's probe -- accepted.
+    named = {
+        "incidents": [_incident("load1_per_cpu")],
+        "workflows": [
+            _wf(
+                "inc-load1_per_cpu",
+                ["VALIDATE_HOST"],
+                execs=[
+                    {
+                        "operation": "VALIDATE_HOST",
+                        "status": "FAILED",
+                        "details": {
+                            "node_failures": {
+                                "node-a": [
+                                    "cpu_usage_percent",
+                                    "host_diagnostic:load1_per_cpu",
+                                    "load1_per_cpu",
+                                ]
+                            }
+                        },
+                    }
+                ],
+            )
+        ],
+    }
+    assert not any(
+        "held fault" in item
+        for item in v.chain_errors(
+            named,
+            v.ChainExpectation(
+                metric="load1_per_cpu",
+                validation="VALIDATE_HOST",
+                validation_must_fail=True,
+            ),
+        )
+    ), "a failure naming host_diagnostic:load1_per_cpu judged the held fault"
     doc2 = {
         "incidents": [_incident("m")],
         "workflows": [_wf("inc-m", ["FREEZE_EVIDENCE"])],

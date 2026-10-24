@@ -174,6 +174,26 @@ DIAGNOSTIC_ONLY_STATES = frozenset({"ACTION_PENDING", "RECOVERED"})
 DIAGNOSTIC_INCONCLUSIVE = "diagnostic inconclusive"
 
 
+def _names_held_fault(details: dict[str, Any], metric: str) -> bool:
+    """A failed validation that judged the held fault, not something else.
+
+    The product marks ``host_diagnostic_failure`` only for steps whose health
+    contract forbids hardware escalation; a diagnostic-only VALIDATE_HOST on
+    another contract (live 2026-10-24: load1_per_cpu) still names the metric
+    or its ``host_diagnostic:<metric>`` probe in ``node_failures``.
+    """
+
+    if details.get(HOST_DIAGNOSTIC_FAILURE) is True:
+        return True
+    wanted = {metric, f"host_diagnostic:{metric}"}
+    return any(
+        reason in wanted
+        for reasons in (details.get("node_failures") or {}).values()
+        if isinstance(reasons, list)
+        for reason in reasons
+    )
+
+
 def subsequence(wanted: Sequence[str], actual: Sequence[str]) -> bool:
     iterator = iter(actual)
     return all(item in iterator for item in wanted)
@@ -228,11 +248,12 @@ def chain_errors(activity: dict[str, Any], expectation: ChainExpectation) -> lis
                 errors.append(
                     f"{expectation.validation} succeeded while the fault was still held"
                 )
-            elif execution.get("status") == "FAILED" and not (
-                execution.get("details") or {}
-            ).get(HOST_DIAGNOSTIC_FAILURE):
+            elif execution.get("status") == "FAILED" and not _names_held_fault(
+                execution.get("details") or {},
+                expectation.probe_metric or expectation.metric,
+            ):
                 errors.append(
-                    f"{expectation.validation} failed without host_diagnostic_failure"
+                    f"{expectation.validation} failed without naming the held fault"
                 )
         elif execution.get("status") != "SUCCEEDED":
             errors.append(
