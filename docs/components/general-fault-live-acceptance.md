@@ -1468,6 +1468,24 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
   夹具都不会跨重启存在，deadman 在关机期间最多失败一次 `systemctl restart`，残留由新 boot 上的
   `snapshot` 证伪。Spot 回收导致 Node UID 变化记 INCONCLUSIVE；链结束后节点仍被隔离时清理走
   产品的 validated restore。需要 ≥ 70 分钟剩余维护窗；EKS 先跑，HyperPod 需 `NodeRecovery=None`。
+- 013 原生 EFA 驱动解绑 `bind_failure`、`post_repair_failure`（`native`，`risk H`，
+  `X`，`--approve EFA_DRIVER_UNBIND NODE_REBOOT`，两个集群，模块
+  `general_live_efa_driver.py` + 探针 `probes/general_live_efa_probe.py`，车道最后执行）：
+  复用 COLLECT-017 A / DESTR-021 对**一个**允许列表内 EFA 数据功能的真实解绑
+  （`/sys/bus/pci/drivers/efa/unbind`）与 `systemd-run --on-active` 重绑保底，另加两个负向分支。
+  `bind_failure`：先把该功能的 `driver_override` 置为无模块提供的名字（`gfrs-live-hold`），
+  使内核对**这一个功能**到 `efa` 的每次 bind 返回 ENODEV，再解绑；产品判 DRIVER_UNBOUND →
+  `REMEDIATE_EFA_DRIVER`（`modprobe efa` + 逐 BDF `printf BDF > .../efa/bind`）对该 BDF 的
+  bind 失败并记入独立 `bind_errors` 回执。该步骤带 `failure_escalation_action=REBOOT_NODE`，
+  产品升级到 `RESTART_NODE`——这是“bind 确实绑不上”的已批准分支，重启也顺带清掉逐设备
+  override；全程**不做**全局 `efa` 卸载（模块保持加载、其余功能保持绑定）。`post_repair_failure`：
+  不设 override，解绑后由一个有界一次性 trap 在产品 bind 回执**之后**几秒再次解绑，于是
+  `REMEDIATE_EFA_DRIVER` 记 SUCCEEDED（`rebound_pci_bdfs=[BDF]`）而其后的
+  `RESTART_EFA_DEVICE_PLUGIN`/`VALIDATE_FABRIC` 在新鲜证据上独立 FAILED，升级到
+  `RESTART_NODE`——即动作成功但动作后验证失败所要求的独立回执与升级。两者只按
+  `driver_override` 一次写入或重启即可还原、仅作用于一个功能、由保底独立重绑，判定只读产品
+  记录（incident 原因、步骤回执、allocatable、boot id、无越界隔离），清理循环把功能绑回
+  `efa`、清掉 override，否则大声失败。
 
 计划/执行守卫键仍为 `<case>.<variant>`，确认串 `GENERALLIVE<NNN>_EXECUTE`。新 `--approve`
 令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`KERNEL_COLLECTOR_SOURCE_REPLAY`（内核采集器
@@ -1487,9 +1505,7 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
 原生 plugin 故障需 `DEVICE_PLUGIN_RESTART`；其中 `running_training` 的断言——受管训练
 任务下移除 EFA 设备插件、Pod UID 集合与训练进度保持、无 STOP/RESTART_WORKLOAD——已由
 GF-REGIONAL-COLLECT-017 stage C 在本站真机做过（hp PASS 2026-10-22），记
-`NOT_RUN(COVERED_BY_REGIONAL: GF-REGIONAL-COLLECT-017 stage C)`）、013
-`bind_failure`/`post_repair_failure`（保留的原生解绑；`pci_missing` 已由上文的 missing→reboot
-链覆盖）与 `driver_unbound`（同一 BDF 的真实 `efa` 解绑与同一
+`NOT_RUN(COVERED_BY_REGIONAL: GF-REGIONAL-COLLECT-017 stage C)`）、013 `driver_unbound`（`pci_missing`、`bind_failure`、`post_repair_failure` 已由上文的变体实现；同一 BDF 的真实 `efa` 解绑与同一
 REMEDIATE_EFA_DRIVER 7 步链断言已由 GF-REGIONAL-DESTR-021（eks PASS 2026-10-22）、
 GF-REGIONAL-COLLECT-017 stage A（hp PASS 2026-10-22）、GF-REGIONAL-NET-007（eks PASS）
 做过，记 `NOT_RUN(COVERED_BY_REGIONAL: ...)`，注册项的 `EFA_DRIVER_UNBIND` 归属与车道

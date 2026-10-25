@@ -1900,10 +1900,36 @@ gate is reachable only on a Blackwell node, where the same code runs for real.
 The variants that stay `NOT_RUN` on this single-node site keep their place in the
 denominator with an explicit reason: the 014 `expected_unknown` / `mig_timeslicing`
 (no instance type outside `INSTANCE_ACCELERATOR_COUNTS`, no MIG/time-slicing; `running_training`
-is `COVERED_BY_REGIONAL`, and 014's native device-plugin freezes are implemented, see above), the
-013 `bind_failure` / `post_repair_failure` driver-binding variants (the reserved `EFA_DRIVER_UNBIND`
-native unbind; `pci_missing` is implemented above and `driver_unbound` is `COVERED_BY_REGIONAL`),
-the catalog/authority-bound 032 variants (a genuinely unknown product
+is `COVERED_BY_REGIONAL`, and 014's native device-plugin freezes are implemented, see above), (013 `pci_missing`, `bind_failure` and `post_repair_failure` are implemented above;
+`driver_unbound` is `COVERED_BY_REGIONAL`), the catalog/authority-bound 032 variants (a genuinely unknown product
+
+The two native 013 EFA driver-binding negatives are implemented (not a replay):
+`bind_failure` and `post_repair_failure` (`general_live_efa_driver.py` with the
+on-node `probes/general_live_efa_probe.py`, `EFA_DRIVER_UNBIND` + `NODE_REBOOT`,
+flag X, both clusters, run last). Both reuse the COLLECT-017 A / DESTR-021 real
+unbind of one allow-listed EFA data function and its `systemd-run --on-active`
+rebind deadman. `bind_failure` holds that one function un-rebindable (its
+`driver_override` set to a name no module provides, so the kernel refuses every
+bind of it to `efa` with ENODEV) and unbinds it: the product's
+`REMEDIATE_EFA_DRIVER` records an independent FAILED bind receipt naming the
+BDF, and -- the step carrying `failure_escalation_action=REBOOT_NODE` for a
+DRIVER_UNBOUND finding -- escalates to RESTART_NODE, the approved branch for a
+bind that will not take (and the one that clears the per-device override). No
+global `efa` unload ever happens: the module stays loaded and every other
+function keeps its binding. `post_repair_failure` uses no override; a bounded
+one-shot trap re-unbinds the function a few seconds after the product's bind, so
+`REMEDIATE_EFA_DRIVER` records SUCCEEDED (`rebound_pci_bdfs=[BDF]`) and a later
+post-repair step (`RESTART_EFA_DEVICE_PLUGIN` or `VALIDATE_FABRIC`)
+independently FAILS on fresh evidence and escalates to the same reboot -- the
+independent failure receipt and the escalation the spec requires. Both grade
+only on the product's own records (the incident reasons, the step receipts, the
+EFA inventory, a changed boot id, no isolation beyond the remediation chain's
+own cordon), are scoped to one function, node-reversible (one write to
+`driver_override`, or a reboot) and deadman-restorable, and their cleanup binds
+the function back to `efa` or fails loudly. 032 `missing_version` stays
+`FIXTURE_NOT_READY`: the NVLink5 decoder gates on the `driver_branch` the
+*kernel collector's* own CollectorContext stamps on the XID event, and the host
+source replay is allow-listed for `gpu-fault-host-collector.service` only.
 needs other hardware; `observe_profile` / `permitted_isolation` need a Runtime
 Profile authority the site does not configure, AUTH-015), the 017 attribution
 variants (a managed attempt with CRI Pod logs, lane N territory), and 004
