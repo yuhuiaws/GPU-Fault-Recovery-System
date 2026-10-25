@@ -29,7 +29,6 @@
     "deploy/node/install-gpu-fault-collector.sh": 1827,
     "scripts/e2e/regional/audit_regional_command_protocol_live.py": 2192,
     "scripts/e2e/regional/probes/collector_node_probe.py": 4003,
-    "scripts/e2e/regional/probes/general_live_source_probe.py": 1553,
     "scripts/e2e/regional/run_collector_acceptance.py": 1822,
     "scripts/e2e/regional/run_collector_destructive.py": 1562,
     "scripts/e2e/regional/run_ha001_control_plane_failover.py": 1554,

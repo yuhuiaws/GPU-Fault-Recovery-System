@@ -25,6 +25,7 @@ from scripts.e2e.regional.general_live_registry import (
     VariantSpec,
     validate_spec,
 )
+from scripts.e2e.regional.probes import general_live_source_probe as probe
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -551,3 +552,32 @@ def test_build_meminfo_sends_allow_listed_fields_only(tmp_path: Path) -> None:
         unapproved.build_meminfo(SwapTotal=1)
     assert helper.MEMINFO_FIXTURE == "meminfo"
     assert helper.MEMINFO_FIELDS == ("MemFree", "MemAvailable", "SwapTotal", "SwapFree")
+
+
+def test_build_commands_ship_the_builders_once_before_the_first_build(
+    tmp_path: Path,
+) -> None:
+    controller, fake = _controller(tmp_path)
+    controller.inventory()
+    controller.read_back("/proc/meminfo")
+    controller.build_meminfo(SwapTotal=8388608, SwapFree=1048576)
+    controller.build_infiniband(drop=["rdmap80s0"])
+    controller.build_pci(efa_count=2)
+    assert [call[0] for call in fake.calls] == [
+        "inventory",
+        "read-source",
+        "install-source",
+        "build-meminfo-fixture",
+        "build-infiniband-fixture",
+        "build-pci-fixture",
+    ], "read-only commands need no builders; one install precedes the first build"
+    shipped = fake.calls[2]
+    content = helper.BUILDERS_MODULE.read_bytes()
+    assert shipped[shipped.index("--name") + 1] == probe.BUILDERS_NAME, shipped
+    assert (
+        shipped[shipped.index("--sha256") + 1] == hashlib.sha256(content).hexdigest()
+    ), "the builders are sha256-checked like the wrapper"
+    assert base64.b64decode(shipped[shipped.index("--b64") + 1]) == content, (
+        "the checkout's module is what ships"
+    )
+    assert helper.BUILDERS_MODULE.name == probe.BUILDERS_NAME, helper.BUILDERS_MODULE

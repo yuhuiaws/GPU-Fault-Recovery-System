@@ -1547,8 +1547,12 @@ ingested, two ways: a `journalctl` pass-through wrapper on the node log
 collector (journal mode) and a `GPU_FAULT_KMSG_PATH` repoint of the kernel
 collector (kmsg mode). A sibling host-collector source replay
 (`general_live_source_replay.py` / `probes/general_live_source_probe.py`,
-command wrapper `tools/host_command_replay.py`) is the shared raw-source
-fixture of the host/device categories (002/007/010/011/012/013/015/032). It
+command wrapper `tools/host_command_replay.py`, fixture builders
+`probes/general_live_source_builders.py` -- a probe ships as one file, so the
+controller installs the builders through `install-source`, sha256-checked like
+the wrapper, before the first `build-*` and the probe imports that copy; the
+window, deadman and cleanup commands need only the probe) is the shared
+raw-source fixture of the host/device categories (002/007/010/011/012/013/015/032). It
 changes only the private environment of `gpu-fault-host-collector.service`
 through one `/run` drop-in that cleanup and a deadman (armed before the drop-in)
 remove, with fixture content installed base64 + sha256 under

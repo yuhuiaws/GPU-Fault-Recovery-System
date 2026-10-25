@@ -1,8 +1,10 @@
 """Runner-side controller for the host-collector source replay (shared fixture).
 
-Owns the host probe (``probes/general_live_source_probe.py``) that replaces
-allow-listed raw readings in the host collector unit's private environment and
-nothing else: a procfs/sysfs *file* bound read-only into the unit's mount
+Owns the host probe (``probes/general_live_source_probe.py``; its fixture
+builders ``probes/general_live_source_builders.py`` are installed sha256-checked
+through ``install-source`` before the first build, like the command wrapper)
+that replaces allow-listed raw readings in the host collector unit's private
+environment and nothing else: a procfs/sysfs *file* bound read-only into the unit's mount
 namespace (001 invalid_delta, 008 statistics_failed, 009 errors_delta, 002
 meminfo -- ``build_meminfo`` copies the real file with reviewed swap/available
 fields --, 010/011 EFA counters, 032 driver version), a whole reviewed *tree*
@@ -53,6 +55,8 @@ if TYPE_CHECKING:
 
 PROBE_SCRIPT = Path(__file__).with_name("probes") / "general_live_source_probe.py"
 WRAPPER_TOOL = Path(__file__).resolve().parents[3] / "tools" / "host_command_replay.py"
+#: The probe's fixture builders, shipped like the wrapper (``install-source``).
+BUILDERS_MODULE = Path(__file__).with_name("probes") / "general_live_source_builders.py"
 PROOF_SCOPE = "live-replay"
 #: The ``--approve`` token the extended modes need (``general_live_registry.APPROVALS``).
 HOST_SOURCE_REPLAY = "HOST_SOURCE_REPLAY"
@@ -129,6 +133,7 @@ class HostSourceReplay:
         self.approvals = frozenset(approvals)
         self._opened = False
         self._wrapper_installed = False
+        self._builders_installed = False
         self.host = host or HostProbeFixture(
             HostProbeSettings(
                 kubeconfig=regional.settings.gpu_kubeconfig,
@@ -179,8 +184,20 @@ class HostSourceReplay:
             timeout=120,
         )
 
+    def _install_builders(self) -> None:
+        """Ship the sha256-checked fixture builders once per run, before a build.
+
+        A probe is one self-contained file on the node, so the builders travel
+        as a second installed file that the probe imports by path; the window,
+        deadman and cleanup commands never need it.
+        """
+
+        if not self._builders_installed:
+            self.install(probe.BUILDERS_NAME, BUILDERS_MODULE.read_bytes())
+            self._builders_installed = True
+
     def build_pci(self, *, efa_count: int, malformed: bool = False) -> dict[str, Any]:
-        self.create()
+        self._install_builders()
         arguments = ["build-pci-fixture", "--efa-count", str(int(efa_count))]
         if malformed:
             arguments.append("--malformed")
@@ -211,7 +228,7 @@ class HostSourceReplay:
         """
 
         self._require_approval("an infiniband tree replay")
-        self.create()
+        self._install_builders()
         arguments = ["build-infiniband-fixture", "--source", source]
         for device in drop:
             arguments += ["--drop", device]
@@ -265,7 +282,7 @@ class HostSourceReplay:
         """Copy ``/proc/driver/nvidia`` with reviewed gaps (``--tree nvidia-proc:...``)."""
 
         self._require_approval("a /proc/driver/nvidia tree replay")
-        self.create()
+        self._install_builders()
         arguments = ["build-nvidia-proc-fixture", "--source", source]
         if omit_version:
             arguments.append("--omit-version")
@@ -295,7 +312,7 @@ class HostSourceReplay:
                 f"meminfo fields must be one or more of {list(MEMINFO_FIELDS)}; "
                 f"got {sorted(fields_kb)}"
             )
-        self.create()
+        self._install_builders()
         arguments = ["build-meminfo-fixture", "--source", source]
         for name in MEMINFO_FIELDS:
             if name in fields_kb:

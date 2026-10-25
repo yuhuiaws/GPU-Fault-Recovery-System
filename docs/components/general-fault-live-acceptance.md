@@ -927,8 +927,10 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
 #### 共享主机原始源回放夹具（HOST_SOURCE_REPLAY）
 
 `scripts/e2e/regional/general_live_source_replay.py`（主机探针
-`probes/general_live_source_probe.py`，命令包装器 `tools/host_command_replay.py`）
-是 007/010/011/012/013/015/002/032 共用的原始源回放器。只改动一个允许列表内的
+`probes/general_live_source_probe.py`，夹具构建器 `probes/general_live_source_builders.py`
+——与命令包装器 `tools/host_command_replay.py` 一样，由控制端在首次 `build-*` 前经
+`install-source` 以 sha256 校验装入节点、探针按路径导入；探针自身是单文件，开关窗与
+deadman 不依赖它）是 007/010/011/012/013/015/002/032 共用的原始源回放器。只改动一个允许列表内的
 采集单元 `gpu-fault-host-collector.service` 的私有环境：一个 `/run` systemd drop-in，
 由清理和 `systemd-run --on-active` deadman（先于 drop-in 布置）移除；夹具内容以
 base64 + sha256 装入 `/run/gfrs-live/source-<digest>/`（tmpfs）；Node Agent 永不在

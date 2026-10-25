@@ -28,6 +28,7 @@ from typing import Any
 import pytest
 
 from gpu_fault.collectors.host.observation import efa_inventory_counts
+from scripts.e2e.regional.probes import general_live_source_builders as builders
 from scripts.e2e.regional.probes import general_live_source_probe as probe
 from tools import host_command_replay as wrapper
 
@@ -1301,3 +1302,64 @@ def test_an_inaccessible_file_is_verified_unreadable_in_the_unit(
     assert listings == [], "a non-directory is never judged by its listing"
     code, closed = _main("close-window", "--run-id", RUN, capsys=capsys)
     assert code == 0 and closed["clean"] is True
+
+
+# --------------------------------------------------------------------------- #
+# the fixture builders travel as a second installed file (node path)
+# --------------------------------------------------------------------------- #
+def test_builders_run_from_the_installed_copy_when_there_is_no_checkout(
+    host: FakeHost,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    # A node has no ``scripts`` checkout: the sibling import must not answer.
+    monkeypatch.setitem(
+        sys.modules, "scripts.e2e.regional.probes.general_live_source_builders", None
+    )
+    code = probe.main(["build-pci-fixture", "--run-id", RUN, "--efa-count", "2"])
+    captured = capsys.readouterr()
+    assert (
+        code == 1 and json.loads(captured.out.splitlines()[-1])["error"] == "ProbeError"
+    )
+    assert f"install {probe.BUILDERS_NAME} before building" in captured.err
+    assert not (probe.fixtures_dir(RUN) / "pci").exists(), "nothing half-built"
+    # close-window and the deadman's path need the probe alone.
+    code, closed = _main("close-window", "--run-id", RUN, capsys=capsys)
+    assert code == 0 and closed["clean"] is True, closed
+    # The controller ships the builders sha256-checked like the wrapper tool.
+    content = Path(builders.__file__).read_bytes()
+    receipt = _install(probe.BUILDERS_NAME, content, capsys)
+    assert receipt["path"] == str(probe.fixtures_dir(RUN) / probe.BUILDERS_NAME), (
+        receipt
+    )
+    module = probe.load_builders_module(RUN)
+    assert module.__file__ == receipt["path"], "the installed copy is what runs"
+    assert sys.modules[probe.PROBE_ALIAS] is probe, "the builders see this probe"
+    assert module.DEVICE_NAME is probe.DEVICE_NAME, "one allow-list, owned by the probe"
+    code, built = _main(
+        "build-pci-fixture", "--run-id", RUN, "--efa-count", "2", capsys=capsys
+    )
+    assert code == 0 and built["efa_devices"] == 2, built
+    assert (probe.fixtures_dir(RUN) / "pci" / "0000:53:01.0" / "vendor").is_file(), (
+        "the installed builders built the tree"
+    )
+
+
+def test_builders_module_is_no_probe_and_owns_no_allow_list() -> None:
+    text = Path(builders.__file__).read_text(encoding="utf-8")
+    assert not text.startswith("#!"), "a module, not a probe: it is never run directly"
+    assert "re.compile(" not in text, "allow-lists stay in the probe"
+    for name in (
+        "build_pci_fixture",
+        "build_infiniband_fixture",
+        "build_nvidia_proc_fixture",
+        "build_meminfo_fixture",
+    ):
+        assert callable(getattr(builders, name)), name
+        assert not hasattr(probe, name), f"{name} lives in the builders module only"
+    assert (
+        len(text.splitlines())
+        + len(Path(probe.__file__).read_text(encoding="utf-8").splitlines())
+        > 1500
+    ), "the split is what keeps the probe under the architecture limit"
