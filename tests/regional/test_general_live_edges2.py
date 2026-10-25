@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -11,6 +12,7 @@ from scripts.e2e.regional import general_live_attempts as att
 from scripts.e2e.regional import general_live_common as common
 from scripts.e2e.regional import general_live_network as net
 from scripts.e2e.regional import general_live_storage as storage
+from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -443,17 +445,45 @@ def test_network_drops_recovery_and_counter_reset_and_wrong(tmp_path: Path) -> N
             for i in range(2)
         ],
     }
-    for variant in ("recovery", "counter_reset"):
+    # counter_reset (batch 173 grading): the reset tick is a ``_network``
+    # collection error naming the recreated interface and its counter, with no
+    # network_drops_delta reading for it in that batch; the batches postdate the
+    # runner's real-clock recreate.
+    reset_error = (
+        "_network: HostObservationError: gfrsaaaaaaa: rx_dropped reset (400 -> 0); "
+        "delta unknown"
+    )
+
+    def soon(seconds: float) -> str:
+        return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+    def drops(at: str, value: float) -> dict[str, Any]:
+        return host_batch(at, "network_drops_delta", value, device="gfrsaaaaaaa")
+
+    reset_doc = {
+        **EMPTY,
+        "batches": [
+            drops(soon(30), 400.0),
+            {
+                "observed_at": soon(60),
+                "batch_id": "host-reset",
+                "edge_filter_reasons": [],
+                "collection_errors": [reset_error],
+                "samples": [],
+            },
+            drops(soon(90), 0.0),
+        ],
+    }
+    # The old clamp: the recreated counter shipped as a 0 delta, no reset error.
+    clamp_doc = {**EMPTY, "batches": [drops(soon(30), 400.0), drops(soon(60), 0.0)]}
+
+    def run(variant: str, activity: dict[str, Any]) -> dict[str, Any]:
         spec = next(
             s
             for s in net.VARIANTS
             if s.case_id == "GF-GENERAL-LIVE-009" and s.variant == variant
         )
-        regional = FakeRegional(
-            cpu_python=store_script(
-                {"activity": drops_doc if variant == "recovery" else EMPTY}
-            )
-        )
+        regional = FakeRegional(cpu_python=store_script({"activity": activity}))
         settings = make_settings(spec, node=NODE)
         settings = type(settings)(
             **{**settings.__dict__, "approvals": ("KERNEL_MODULE_LOAD",)}
@@ -465,8 +495,16 @@ def test_network_drops_recovery_and_counter_reset_and_wrong(tmp_path: Path) -> N
             probes=net_probes(oracle),
             settings=settings,
         )
-        result = spec.execute(ctx)
+        return spec.execute(ctx)
+
+    for variant, activity in (("recovery", drops_doc), ("counter_reset", reset_doc)):
+        result = run(variant, activity)
         assert result["verdict"] == "PASS", (variant, result["errors"])
+    result = run("counter_reset", clamp_doc)
+    assert result["verdict"] == "FAIL", result
+    assert any("old clamp" in error for error in result["errors"]), result["errors"]
+    with pytest.raises(VariantInconclusive, match="surviving baseline"):
+        run("counter_reset", EMPTY)
 
 
 # --------------------------------------------------------------------------- #
