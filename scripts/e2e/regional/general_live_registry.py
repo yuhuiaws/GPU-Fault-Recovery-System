@@ -180,13 +180,18 @@ APPROVALS: dict[str, str] = {
         "real binary by cleanup and a deadman; the host collector and the "
         "Node Agent are never touched by this token"
     ),
-    # GF-GENERAL-LIVE-009 tcp_only: the AL2023 EKS node image ships no tc.
+    # GF-GENERAL-LIVE-009 tcp_only, the 007 SMART replay variants and 004
+    # probe_error: the AL2023 EKS node image ships no tc, smartctl or mkfs.vfat.
     "TEMP_TEST_PACKAGE_INSTALL": (
-        "install, for this run only, a test package the node lacks with dnf: "
-        "iproute-tc when tc is absent, kernel-modules-extra-$(uname -r) (the "
-        "running kernel's module package) when sch_netem cannot be loaded; "
-        "refused unless the previewed dnf transaction installs exactly those "
-        "packages (no kernel, upgrade, downgrade, removal or other dependency); "
+        "install, for this run only, a test package the node lacks with dnf, "
+        "from the reviewed allow-list of general_live_deps_probe.py: iproute-tc "
+        "when tc is absent (009 tcp_only), smartmontools when smartctl is absent "
+        "(the 007 SMART replay variants), dosfstools when mkfs.vfat is absent "
+        "(004 probe_error), kernel-modules-extra-$(uname -r) (the running "
+        "kernel's module package) when sch_netem cannot be loaded; refused "
+        "unless the previewed dnf transaction installs exactly those packages "
+        "(no kernel, upgrade, downgrade, removal or other dependency); the "
+        "collectors are not restarted for it (they look a tool up every tick); "
         "cleanup and a deadman dnf-remove exactly the packages this run "
         "installed and nothing else"
     ),

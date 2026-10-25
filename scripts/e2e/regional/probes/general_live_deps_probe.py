@@ -7,8 +7,11 @@ last stdout line.
 
 Some variants need a host tool or kernel module the node image does not ship:
 GF-GENERAL-LIVE-009 ``tcp_only`` needs ``tc`` (the AL2023 EKS AMI has no
-``iproute-tc``) and the ``sch_netem`` qdisc. ``ensure`` makes exactly those
-usable and changes nothing that is already there:
+``iproute-tc``) and the ``sch_netem`` qdisc, the 007 SMART replay variants
+need ``smartctl`` (``smartmontools``) and 004 ``probe_error`` needs
+``mkfs.vfat`` (``dosfstools``). ``ensure`` makes exactly those usable and
+changes nothing that is already there (the runner-side step is
+``general_live_deps.ensure_dependencies``):
 
 * a missing tool or a module the running kernel cannot load is installed with
   ``dnf`` (``--allow-install``) -- only the reviewed package of
@@ -52,8 +55,14 @@ UNIT_PREFIX = "gfrs-"
 SAFE_RUN_ID = re.compile(r"^[a-z0-9][a-z0-9-]{2,62}$")
 MIN_DEADMAN_SECONDS = 60
 MAX_DEADMAN_SECONDS = 5400
-#: The only tools this probe may install a package for, and that package.
-TOOL_PACKAGES = {"tc": "iproute-tc"}
+#: The only tools this probe may install a package for, and that package: the
+#: package must be the one AL2023 ships the tool in, with no dependency of its
+#: own beyond the base image (a transaction that pulls more is refused).
+TOOL_PACKAGES = {
+    "tc": "iproute-tc",
+    "smartctl": "smartmontools",
+    "mkfs.vfat": "dosfstools",
+}
 #: The only modules this probe may load, and the package that carries each when
 #: the running kernel cannot load it -- installed as ``<package>-<uname -r>``.
 MODULE_PACKAGES = {"sch_netem": "kernel-modules-extra"}

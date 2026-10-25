@@ -42,7 +42,6 @@ from collections.abc import Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
-from scripts.e2e.regional.collector_action_guard import require_action_time
 from scripts.e2e.regional.general_live_common import (
     Oracle,
     activity,
@@ -50,15 +49,22 @@ from scripts.e2e.regional.general_live_common import (
     open_window,
     run_survey,
 )
+from scripts.e2e.regional.general_live_deps import (
+    DEPS_TIMEOUT,
+    PACKAGE_APPROVAL,
+    checked_cleanup,
+    dependency_summary,
+    deps_deadman_seconds,
+    ensure_dependencies as ensure_test_dependencies,
+    not_run,
+)
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
-    VariantNotRun,
     require_module,
     require_tools,
     utc_now,
 )
-from scripts.e2e.regional.general_live_registry import NOT_RUN_REASONS
 from scripts.e2e.regional.general_live_verdicts import (
     ChainExpectation,
     chain_errors,
@@ -72,15 +78,11 @@ from scripts.e2e.regional.general_live_verdicts import (
 )
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
-PACKAGE_APPROVAL = "TEMP_TEST_PACKAGE_INSTALL"
-MODULE_APPROVAL = "KERNEL_MODULE_LOAD"
 LOSS_PERCENT = 5
 RATE_KBPS = 8000
 MIN_RETRANSMITS = 20
 MIN_FLOW_SECONDS = 60
 TAIL_SECONDS = 120
-DEPS_TIMEOUT = 900
-DEPS_CLEANUP_TIMEOUT = 600
 NIC_METRICS = ("network_errors_delta", "network_drops_delta", "network_link_down")
 TCP_METRIC = "tcp_retransmits_delta"
 #: Counters that must not move: every counter of the test veth (netem drops in
@@ -114,78 +116,30 @@ def tcp_timing(ctx: VariantContext) -> dict[str, int]:
         "oracle_seconds": flow_seconds + 60,
         "restore_seconds": restore,
         "fixture_deadman": fixture_deadman,
-        "deps_deadman": min(5400, fixture_deadman + DEPS_TIMEOUT + 300),
+        "deps_deadman": deps_deadman_seconds(fixture_deadman),
     }
-
-
-def checked_cleanup(ctx: VariantContext, probe: str, *arguments: str) -> Any:
-    """Run a probe cleanup and fail the cleanup stack unless it proved clean."""
-
-    timeout = DEPS_CLEANUP_TIMEOUT if probe == "deps" else 180
-    value = getattr(ctx, probe)("cleanup", *arguments, timeout=timeout)
-    if value.get("clean") is not True:
-        raise RegionalFixtureError(
-            f"the {probe} cleanup left residue: {value.get('residue')}"
-        )
-    return value
-
-
-def not_run(refused: dict[str, Any], default: str) -> VariantNotRun:
-    reason = str(refused.get("reason") or "")
-    return VariantNotRun(
-        reason if reason in NOT_RUN_REASONS else "FIXTURE_NOT_READY",
-        str(refused.get("detail") or default),
-    )
 
 
 def ensure_dependencies(
     ctx: VariantContext, survey: dict[str, Any], timing: dict[str, int]
 ) -> dict[str, Any]:
-    """``tc`` and a loaded ``sch_netem``: as found, or for this run only."""
+    """``tc`` and a loaded ``sch_netem``: as found, or for this run only.
 
-    tools = survey.get("tools") or {}
-    module = (survey.get("modules") or {}).get("sch_netem") or {}
-    approvals = ctx.settings.approvals
-    may_install = PACKAGE_APPROVAL in approvals
-    need_tool = not tools.get("tc")
-    need_module = not module.get("loaded")
-    if need_tool and not may_install:
-        raise VariantNotRun(
-            "CAPABILITY_ABSENT",
-            f"the node lacks tc ({PACKAGE_APPROVAL} installs iproute-tc for one run)",
-        )
-    if need_module and not module.get("available") and not may_install:
-        raise VariantNotRun(
-            "CAPABILITY_ABSENT",
-            "kernel module sch_netem is not available "
-            f"({PACKAGE_APPROVAL} installs the running kernel's module package)",
-        )
-    if need_module and MODULE_APPROVAL not in approvals:
-        raise VariantNotRun(
-            "NOT_AUTHORIZED",
-            "kernel module sch_netem is not loaded; needs KERNEL_MODULE_LOAD",
-        )
-    if not (need_tool or need_module):
-        return {"changed": False, "installed": [], "modules_loaded_by_run": []}
-    arguments = ["ensure", "--tool", "tc", "--module", "sch_netem"]
-    arguments += ["--deadman-seconds", str(timing["deps_deadman"])]
-    if may_install:
-        arguments.append("--allow-install")
-    if MODULE_APPROVAL in approvals:
-        arguments.append("--allow-module-load")
-    require_action_time(DEPS_TIMEOUT)
-    # Registered before the change: a half-finished install is undone too.
-    ctx.cleanup.push("deps", lambda: checked_cleanup(ctx, "deps"))
-    result = ctx.deps(*arguments, timeout=DEPS_TIMEOUT)
-    ctx.evidence.write("tcp-dependencies", result)
-    if result.get("refused"):
-        raise not_run(result["refused"], "the dependency step refused")
-    netem = (result.get("modules") or {}).get("sch_netem") or {}
-    if not (result.get("tools") or {}).get("tc") or not (
-        netem.get("loaded") or netem.get("builtin")
-    ):
-        raise RegionalFixtureError(f"tc/sch_netem still unusable: {result}")
-    return {"changed": True, **result}
+    The shared temporary-package step (``general_live_deps``): without
+    ``TEMP_TEST_PACKAGE_INSTALL`` a missing ``tc`` stays
+    NOT_RUN(CAPABILITY_ABSENT), a module that is not loaded needs
+    ``KERNEL_MODULE_LOAD``, and the probe's cleanup is on the LIFO stack before
+    the install so the package goes after the fixture.
+    """
+
+    return ensure_test_dependencies(
+        ctx,
+        survey,
+        tools=("tc",),
+        modules=("sch_netem",),
+        deadman_seconds=timing["deps_deadman"],
+        evidence="tcp-dependencies",
+    )
 
 
 def create_fixture(ctx: VariantContext, timing: dict[str, int]) -> dict[str, Any]:
@@ -481,19 +435,18 @@ def tcp_only(ctx: VariantContext) -> dict[str, Any]:
         "device": interface,
         "oracle": {key: value for key, value in reading.items() if key != "errors"},
         "product_retransmits": seen[:5],
-        "dependencies": {
-            key: dependencies.get(key)
-            for key in ("changed", "installed", "modules_loaded_by_run", "transaction")
-        },
+        "dependencies": dependency_summary(dependencies),
         "proof_scope": "native",
     }
 
 
 __all__ = [
+    "DEPS_TIMEOUT",
     "PACKAGE_APPROVAL",
     "checked_cleanup",
     "create_fixture",
     "ensure_dependencies",
+    "not_run",
     "product_retransmits",
     "product_stages",
     "tcp_findings",

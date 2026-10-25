@@ -1,11 +1,12 @@
-"""The temporary test package probe (GF-GENERAL-LIVE-009 tcp_only dependencies).
+"""The temporary test package probe (TEMP_TEST_PACKAGE_INSTALL).
 
 A recording fake node stands in for dnf, rpm, modprobe and systemd: the tests
-prove the probe installs only what is missing, refuses any dnf transaction that
-would pull more than the reviewed package for the running kernel, records what
-it installed and loaded before doing it, and that its cleanup (also the
-deadman's command) removes and unloads exactly that -- never a package or a
-module the run found on the node.
+prove the probe installs only what is missing (009 ``tc`` -> ``iproute-tc``,
+007 ``smartctl`` -> ``smartmontools``, 004 ``mkfs.vfat`` -> ``dosfstools``),
+refuses any dnf transaction that would pull more than the reviewed package for
+the running kernel, records what it installed and loaded before doing it, and
+that its cleanup (also the deadman's command) removes and unloads exactly that
+-- never a package or a module the run found on the node.
 """
 
 from __future__ import annotations
@@ -26,6 +27,10 @@ TC_ROW = ("iproute-tc", "x86_64", "5.10.0-2.amzn2023.0.5", "amazonlinux")
 TC_NEVRA = "iproute-tc-5.10.0-2.amzn2023.0.5.x86_64"
 KMOD_ROW = ("kernel-modules-extra", "x86_64", "6.1.100-100.100.amzn2023", "amazonlinux")
 KMOD_NEVRA = f"kernel-modules-extra-{KERNEL}"
+SMART_ROW = ("smartmontools", "x86_64", "1:7.3-1.amzn2023.0.2", "amazonlinux")
+SMART_NEVRA = "smartmontools-1:7.3-1.amzn2023.0.2.x86_64"
+DOSFS_ROW = ("dosfstools", "x86_64", "4.2-3.amzn2023.0.2", "amazonlinux")
+DOSFS_NEVRA = "dosfstools-4.2-3.amzn2023.0.2.x86_64"
 #: Packages the node already has: the probe must never touch them.
 BASELINE = {
     "iproute-5.10.0-2.amzn2023.0.5.x86_64": ("iproute", "5.10.0", "2.amzn2023.0.5"),
@@ -88,7 +93,7 @@ class FakeNode:
         self.loadable = set(loadable)
         #: The package whose install makes the module loadable.
         self.module_files_from = module_files_from
-        self.repo = {TC_ROW[0]: TC_ROW, KMOD_ROW[0]: KMOD_ROW}
+        self.repo = {row[0]: row for row in (TC_ROW, KMOD_ROW, SMART_ROW, DOSFS_ROW)}
         self.install_preview: dict[str, list[tuple[str, str, str, str]]] | None = None
         self.remove_preview: dict[str, list[tuple[str, str, str, str]]] | None = None
         self.unmatched: list[str] = []
@@ -103,8 +108,9 @@ class FakeNode:
         (self.sys_module / name / "refcnt").write_text("0\n")
 
     def tool(self, name: str) -> bool:
-        if name == "tc":
-            return any(item["name"] == "iproute-tc" for item in self.packages.values())
+        package = deps.TOOL_PACKAGES.get(name)
+        if package is not None:
+            return any(item["name"] == package for item in self.packages.values())
         return name in {"dnf", "rpm", "modprobe", "systemd-run", "systemctl"}
 
     def _done(
@@ -539,5 +545,94 @@ def test_parse_dnf_transaction_rows_and_leftovers() -> None:
 def test_ensure_rejects_a_tool_outside_the_allow_list(node_factory) -> None:
     node, emitted = node_factory()
     with pytest.raises(deps.ProbeError, match="allow-list"):
-        deps.ensure(ensure_args(tool=["smartctl"]))
+        deps.ensure(ensure_args(tool=["ipmitool"]))
     assert node.calls == []
+
+
+# --------------------------------------------------------------------------- #
+# the 007 / 004 packages: the same mechanism, one package each
+# --------------------------------------------------------------------------- #
+def test_the_allow_list_names_the_al2023_package_of_each_tool() -> None:
+    assert deps.TOOL_PACKAGES == {
+        "tc": "iproute-tc",
+        "smartctl": "smartmontools",
+        "mkfs.vfat": "dosfstools",
+    }
+    assert "ipmitool" not in deps.TOOL_PACKAGES, (
+        "015 serves ipmitool from the wrapper (allow_missing_real); no package"
+    )
+
+
+@pytest.mark.parametrize(
+    ("tool", "package", "nevra"),
+    [
+        ("smartctl", "smartmontools", SMART_NEVRA),
+        ("mkfs.vfat", "dosfstools", DOSFS_NEVRA),
+    ],
+)
+def test_ensure_installs_exactly_the_tools_package_and_cleanup_removes_it(
+    node_factory, tool: str, package: str, nevra: str
+) -> None:
+    node, emitted = node_factory()
+    deps.ensure(ensure_args(tool=[tool], module=[]))
+    result = emitted[-1]
+    assert result["refused"] is None, result
+    assert result["installed"] == [nevra]
+    assert result["tools"] == {tool: True}
+    assert result["modules_loaded_by_run"] == [] and result["modules"] == {}
+    preview, install = node.ran("dnf", "--assumeno"), node.ran("dnf", "-y")
+    assert preview[0][-2:] == ["install", package], preview
+    assert install[0][-2:] == ["install", nevra], install
+    assert result["deadman"] == deps.deadman_unit(RUN_ID)
+    assert recorded()["installed"] == [nevra] and recorded()["pending"] == []
+    assert node.tool(tool) is True, "the tool is usable after the install"
+
+    emitted.clear()
+    deps.cleanup(argparse.Namespace(run_id=RUN_ID))
+    report = emitted[-1]
+    assert report["clean"] is True, report
+    assert report["report"]["removed"] == [nevra]
+    remove = node.ran("dnf", "-y", *deps.DNF_REMOVE_OPTIONS, "remove")
+    assert remove == [["dnf", "-y", *deps.DNF_REMOVE_OPTIONS, "remove", nevra]]
+    assert node.tool(tool) is False, "the package this run installed is gone"
+    assert set(node.packages) == set(BASELINE), "the node's own packages stay"
+    assert recorded()["installed"] == []
+
+
+def test_ensure_without_the_approval_names_the_tools_package(node_factory) -> None:
+    node, emitted = node_factory()
+    deps.ensure(ensure_args(tool=["smartctl"], module=[], allow_install=False))
+    refused = emitted[-1]["refused"]
+    assert refused["reason"] == "CAPABILITY_ABSENT", refused
+    assert refused["detail"] == (
+        "the node lacks smartctl; installing smartmontools needs "
+        "TEMP_TEST_PACKAGE_INSTALL"
+    )
+    assert not node.ran("dnf") and not node.ran("systemd-run")
+
+
+def test_ensure_refuses_a_dependency_pulled_by_the_tools_package(node_factory) -> None:
+    node, emitted = node_factory()
+    node.install_preview = {
+        "Installing": [SMART_ROW],
+        "Installing dependencies": [
+            ("mailx", "x86_64", "12.5-30.amzn2023", "amazonlinux")
+        ],
+    }
+    deps.ensure(ensure_args(tool=["smartctl"], module=[]))
+    refused = emitted[-1]["refused"]
+    assert refused["reason"] == "FIXTURE_NOT_READY", refused
+    assert "installing dependencies mailx-12.5-30.amzn2023.x86_64" in refused["detail"]
+    assert not node.ran("dnf", "-y"), "a refused transaction never runs"
+    assert emitted[-1]["transaction"][0]["name"] == "smartmontools"
+
+
+def test_ensure_touches_nothing_when_the_tool_is_there(node_factory) -> None:
+    node, emitted = node_factory(
+        installed={**BASELINE, DOSFS_NEVRA: ("dosfstools", "4.2", "3.amzn2023.0.2")}
+    )
+    deps.ensure(ensure_args(tool=["mkfs.vfat"], module=[]))
+    result = emitted[-1]
+    assert result["refused"] is None and result["installed"] == []
+    assert not node.ran("dnf") and not node.ran("systemd-run")
+    assert recorded()["installed"] == [], "nothing recorded, so cleanup removes nothing"
