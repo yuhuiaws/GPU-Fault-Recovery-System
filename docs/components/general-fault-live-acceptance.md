@@ -134,6 +134,10 @@ collector和原任务均存活，保存内存/cgroup证据；不能用重启掩�
 incident 常在两次轮询之间就以 `diagnostic inconclusive` 关闭为 `RECOVERED`，
 任何状态都算；但只认本次读取起点之后、本节点本集群创建的 incident，后来的 workflow
 （如 validated restore）带进读取结果的旧 incident 不算本次 finding。
+`high_page_cache` 以运行器自带的 meminfo oracle（产品公式
+(Cached+SReclaimable−Shmem)/MemTotal）确认条件：`page_cache_percent` 未在 300 秒
+持续窗口内一直 ≥90% 即 `INCONCLUSIVE`（condition not established），只有条件成立
+而产品没有 finding 才记 `FAIL`。
 
 ### GF-GENERAL-LIVE-004
 

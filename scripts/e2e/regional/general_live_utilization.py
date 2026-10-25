@@ -69,6 +69,12 @@ LOW_DURATION = 300
 LOW_BUDGET = LOW_DURATION + 300 + 120
 MEMORY_DURATION = 60
 PAGE_CACHE_DURATION = 300
+#: HIGH_PAGE_CACHE's condition (``host_health.py``): ``page_cache_percent`` --
+#: (Cached + SReclaimable - Shmem) / MemTotal, the node probe oracle's formula
+#: -- at or above ``GPU_FAULT_PAGE_CACHE_WARNING_PERCENT`` (deployed 90) on
+#: every sample for PAGE_CACHE_DURATION.
+PAGE_CACHE_THRESHOLD = 90.0
+PAGE_CACHE_ORACLE_INTERVAL = 5
 LOCAL_FS_DURATION = 60
 TEST_FS = "fs"
 SINGLE_NODE_MANIFEST = "single-node-warm-spare-pytorchjob.yaml"
@@ -358,6 +364,12 @@ def high_page_cache(ctx: VariantContext) -> dict[str, Any]:
     root = backing_root(survey)
     started = utc_now()
     hold = PAGE_CACHE_DURATION + 300 + 120
+    # The runner's own /proc/meminfo reading decides whether the condition
+    # existed at all (live 2026-10-25: the sparse read on a 2 TiB host opened
+    # no incident in the window and the variant read FAIL with no proof the
+    # cache was ever high). It only measures; the fill below is unchanged.
+    oracle = Oracle(ctx, "cache")
+    oracle.start(hold + 120, interval=PAGE_CACHE_ORACLE_INTERVAL, meminfo=True)
     opened = ctx.node(
         "page-cache-start",
         "--fraction",
@@ -378,6 +390,7 @@ def high_page_cache(ctx: VariantContext) -> dict[str, Any]:
         metrics={"page_cache_percent", "memory_used_percent"},
         name="page-cache",
     )
+    _page_cache_established(oracle)
     incidents = finding_incidents(
         detection, "page_cache_percent", rule_id=HIGH_PAGE_CACHE
     )
@@ -613,6 +626,30 @@ def _attribution_errors(
                 f"finding attempt {incident.get('attempt_id')} != {attempt_id}"
             )
     return errors
+
+
+def _page_cache_established(oracle: Oracle) -> None:
+    """INCONCLUSIVE unless the oracle held HIGH_PAGE_CACHE's condition.
+
+    Only a condition the runner saw held -- ``page_cache_percent`` at or above
+    the threshold for the whole sustain window -- can make a missing finding
+    the product's FAIL; a cache that never got there (or not for long enough)
+    proves nothing about the product, whatever its records say.
+    """
+
+    oracle.read()
+    values = oracle_values(
+        oracle.records, lambda record: record.get("page_cache_percent")
+    )
+    readings = PAGE_CACHE_DURATION // PAGE_CACHE_ORACLE_INTERVAL
+    if sustained(values, lambda value: value >= PAGE_CACHE_THRESHOLD, readings):
+        return
+    peak = f"{max(values):.1f} %" if values else "no reading"
+    raise VariantInconclusive(
+        f"condition not established: page_cache_percent never stayed >= "
+        f"{PAGE_CACHE_THRESHOLD:g} % for {PAGE_CACHE_DURATION} s (peak {peak}, "
+        f"last {[round(value, 1) for value in values[-6:]]})"
+    )
 
 
 def _memory_used_low(detection: dict[str, Any]) -> list[str]:

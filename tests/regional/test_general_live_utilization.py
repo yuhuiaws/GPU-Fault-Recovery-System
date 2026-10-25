@@ -308,23 +308,82 @@ def test_low_available_memory_passes(tmp_path: Path) -> None:
     assert result["verdict"] == "PASS", result["errors"]
 
 
-def test_high_page_cache_passes(tmp_path: Path) -> None:
+def poll_clock(ctx: Any) -> Any:
+    """One store poll per clock reading, as live: a read every 20 s.
+
+    The default fake clock moves 1 s per reading, so a wait that runs out its
+    budget polls hundreds of times; the timelines it writes grow with it.
+    """
+
+    ticks = itertools.count()
+    start = datetime(2026, 10, 25, 3, 19, 46, tzinfo=timezone.utc)
+    ctx.clock = lambda: start + timedelta(seconds=STORE_POLL_SECONDS * next(ticks))
+    return ctx
+
+
+def cache_oracle(*values: float) -> dict[str, Any]:
+    """The node probe's meminfo oracle: one ``page_cache_percent`` per 5 s."""
+
+    records = [{"page_cache_percent": value} for value in values]
+    return {"records": records, "next_offset": len(records), "total": len(records)}
+
+
+#: Five minutes at or above HIGH_PAGE_CACHE's 90 % (60 readings 5 s apart).
+CACHE_HELD = cache_oracle(*([40.0] * 20 + [91.5] * 60))
+
+
+def page_cache_run(
+    tmp_path: Path, oracle: dict[str, Any], activity: dict[str, Any]
+) -> dict[str, Any]:
     spec = SPECS["high_page_cache"]
-    settings = _settings(spec, tmp_path)
-    regional = FakeRegional(
-        cpu_python=store_script(
-            {
-                "activity": low_doc(
-                    "page_cache_percent", "VALIDATE_HOST", probe="page_cache_percent"
-                )
-            }
-        )
-    )
     ctx = make_context(
-        spec, tmp_path=tmp_path, regional=regional, probes=probes(), settings=settings
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=store_script({"activity": activity})),
+        probes=probes(oracle),
+        settings=_settings(spec, tmp_path),
     )
-    result = spec.execute(ctx)
+    return spec.execute(poll_clock(ctx))
+
+
+def page_cache_doc() -> dict[str, Any]:
+    return low_doc("page_cache_percent", "VALIDATE_HOST", probe="page_cache_percent")
+
+
+def test_high_page_cache_passes(tmp_path: Path) -> None:
+    result = page_cache_run(tmp_path, CACHE_HELD, page_cache_doc())
     assert result["verdict"] == "PASS", result["errors"]
+
+
+def test_high_page_cache_fails_only_on_an_established_condition(tmp_path: Path) -> None:
+    result = page_cache_run(tmp_path, CACHE_HELD, empty())
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["chain"] == [
+        "no page_cache_percent finding reached an incident"
+    ], result["stages"]
+
+
+@pytest.mark.parametrize(
+    "oracle",
+    [
+        # Live 2026-10-25 shape: the cache never got near the threshold.
+        cache_oracle(*[20.0 + index * 0.5 for index in range(80)]),
+        # Reached it, but not for the 300-s sustain window.
+        cache_oracle(*([40.0] * 20 + [91.5] * 59 + [89.0])),
+        # No reading at all.
+        cache_oracle(),
+    ],
+    ids=["never-high", "not-held", "no-reading"],
+)
+@pytest.mark.parametrize("activity", ["empty", "incident"])
+def test_high_page_cache_is_inconclusive_without_the_condition(
+    tmp_path: Path, oracle: dict[str, Any], activity: str
+) -> None:
+    # Never FAIL (nor PASS) on a condition the runner did not see held,
+    # whatever the product recorded.
+    document = page_cache_doc() if activity == "incident" else empty()
+    with pytest.raises(VariantInconclusive, match="condition not established"):
+        page_cache_run(tmp_path, oracle, document)
 
 
 def test_scratch_full_passes(tmp_path: Path) -> None:
@@ -612,11 +671,7 @@ def low_memory_run(tmp_path: Path, replay: ReplayedStore) -> dict[str, Any]:
         probes=probes(oracle),
         settings=settings,
     )
-    # One store poll per clock reading, as live: a read every 20 s.
-    ticks = itertools.count()
-    start = datetime(2026, 10, 25, 3, 19, 46, tzinfo=timezone.utc)
-    ctx.clock = lambda: start + timedelta(seconds=STORE_POLL_SECONDS * next(ticks))
-    return spec.execute(ctx)
+    return spec.execute(poll_clock(ctx))
 
 
 def test_low_available_memory_takes_the_incident_recovered_between_reads(

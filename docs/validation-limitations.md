@@ -1261,6 +1261,28 @@ earlier run's pair pulled in by a restore, the pair on another node, or only
 other metrics' incidents leave it failing "no memory_available_percent
 finding reached an incident".
 
+003 `high_page_cache` read FAIL in that pass with nothing to show the page
+cache had ever been high, and the product opened no incident in the window.
+The variant had no oracle: the "accepted" flag of its detection timeline is
+the incident match (which the threshold-family rule id above also made
+impossible), and the settled wait after it can never accept without an
+incident, so it ran out its 12 minutes as well. The variant now samples
+`/proc/meminfo` with the node probe's oracle, using the product's formula
+`page_cache_percent` = (Cached + SReclaimable - Shmem) / MemTotal. It is
+`INCONCLUSIVE` "condition not established" unless that reading held at or
+above HIGH_PAGE_CACHE's 90 % for the whole 300-s sustain window; only then
+is a missing finding the product's FAIL. The fill itself is unchanged, and
+on a 2 TiB host it is unlikely to establish the condition. The sparse file
+is 0.92 x MemTotal (1.98 TB), so at least 97.8 % of it must stay cached at
+once, and everything else in memory must fit in the remaining 8 %. One
+`cat` reads holes CPU-bound at a few GB/s (2.4 GB/s measured
+single-threaded on an ext4 host), about 13 to 14 minutes for the 1.93 TB the
+threshold needs. Detection stops 720 s after the fill starts and needs 300 s
+of that above the threshold. A fixture that can establish the condition
+needs three things: a ramp wait timed from the oracle's crossing, as
+`low_available_memory` has; parallel readers over disjoint ranges; and a
+size computed from MemAvailable with headroom above the threshold.
+
 The managed test jobs of 003, 011, 027, 028 and 029 are thin wrappers over
 the image prewarm and the managed workload fixture, and the variant tests
 replace both with fakes, so the live pass was the first to start one: 003
