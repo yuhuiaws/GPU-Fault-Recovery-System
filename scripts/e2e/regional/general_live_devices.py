@@ -1,39 +1,31 @@
-"""GF-GENERAL-LIVE device-signal cases: 010 EFA/RDMA and 012 GPU missing.
+"""GF-GENERAL-LIVE device-signal cases: 012 GPU missing / fallen off the bus.
 
-These two categories are, by the coverage matrix, ``live-replay`` or
-``vendor-lab`` only: the product grades them from a raw reading (the EFA
-``hw_counters``/``counters`` sysfs and ``ethtool -S``, the ``nvidia-smi`` GPU
-inventory and ``/proc/driver/nvidia``), and proving the processing chain means
-replacing exactly that targeted reading in the one host-collector unit's
-private environment, or inducing a real hardware fault in a vendor lab.
+010 EFA/RDMA counters live in ``general_live_efa.py`` (wired on the shared host
+source replay); the sibling SMART (007) and BMC (015) categories live in
+``general_live_smart.py`` and ``general_live_bmc.py``. The GPU inventory
+category is, by the coverage matrix, ``live-replay`` or ``vendor-lab`` only:
+the product grades it from a raw reading (the ``nvidia-smi`` GPU inventory and
+``/proc/driver/nvidia``), and proving the processing chain means replacing
+exactly that targeted reading in the one host-collector unit's private
+environment, or inducing a real hardware fault in a vendor lab.
 
-This site has no vendor lab and must never unbind or remove a real GPU or
-disconnect a real EFA link, so the vendor-lab variants stay
-NOT_RUN(VENDOR_LAB_ONLY). The remaining variants need the shared host source
-replay (``general_live_source_replay.py``, approval ``HOST_SOURCE_REPLAY``)
-wired for their reader; until a lane wires them they stay
-NOT_RUN(FIXTURE_NOT_READY) with the exact reader and field each needs. Where
-the site genuinely lacks the capability (no non-EFA RDMA device) the reason is
-CAPABILITY_ABSENT. The sibling SMART (007) and BMC (015) categories live in
-``general_live_smart.py`` and ``general_live_bmc.py``.
+This site has no vendor lab and must never unbind or remove a real GPU, so the
+vendor-lab variants stay NOT_RUN(VENDOR_LAB_ONLY). The remaining variants need
+the shared host source replay (``general_live_source_replay.py``, approval
+``HOST_SOURCE_REPLAY``) wired for their reader; until a lane wires them they
+stay NOT_RUN(FIXTURE_NOT_READY) with the exact reader and field each needs.
 """
 
 from __future__ import annotations
 
 from scripts.e2e.regional.general_live_registry import (
-    CAPABILITY,
     LIVE_REPLAY,
     VENDOR_LAB,
     deferred_variant,
 )
 
-CASE_010 = "GF-GENERAL-LIVE-010"
 CASE_012 = "GF-GENERAL-LIVE-012"
 
-EFA_REPLAY = (
-    "FIXTURE_NOT_READY: an EFA hw_counters/counters sysfs file replay in the host "
-    "collector unit's private mount namespace (the shared replay helper) is not built"
-)
 GPU_REPLAY = (
     "FIXTURE_NOT_READY: an nvidia-smi / NVML / /proc/driver/nvidia read replay in the "
     "host collector unit's private environment (the shared replay helper) is not built"
@@ -41,90 +33,6 @@ GPU_REPLAY = (
 
 
 VARIANTS = [
-    # ----------------------------------------------------------------------- #
-    # 010 EFA / RDMA error counters
-    # ----------------------------------------------------------------------- #
-    deferred_variant(
-        CASE_010,
-        "rdma_error",
-        proof_mode=LIVE_REPLAY,
-        reason=EFA_REPLAY,
-        lanes=("eks", "hp"),
-        expected="a target counter delta -> rdma_errors_delta WARNING -> VALIDATE_FABRIC (vendor-lab for a real fault)",
-    ),
-    deferred_variant(
-        CASE_010,
-        "link_inactive",
-        proof_mode=LIVE_REPLAY,
-        reason=(
-            "FIXTURE_NOT_READY: an EFA port state/phys_state sysfs replay (the shared "
-            "replay helper) is not built; the physical path is vendor-lab only"
-        ),
-        lanes=("eks", "hp"),
-        expected="state != ACTIVE/LinkUp -> rdma_link_down=1",
-    ),
-    deferred_variant(
-        CASE_010,
-        "rnr",
-        proof_mode=LIVE_REPLAY,
-        reason=EFA_REPLAY,
-        lanes=("eks", "hp"),
-        expected="efa_rnr_errors_delta is diagnosed as congestion, not a bad card",
-    ),
-    deferred_variant(
-        CASE_010,
-        "retry",
-        proof_mode=LIVE_REPLAY,
-        reason=EFA_REPLAY,
-        lanes=("eks", "hp"),
-        expected="efa_retry_errors_delta -> diagnostic only, no hardware escalation",
-    ),
-    deferred_variant(
-        CASE_010,
-        "cq_error",
-        proof_mode=LIVE_REPLAY,
-        reason=EFA_REPLAY,
-        lanes=("eks", "hp"),
-        expected="efa_cq_errors_delta -> WARNING -> VALIDATE_FABRIC",
-    ),
-    deferred_variant(
-        CASE_010,
-        "missing_counter",
-        proof_mode=LIVE_REPLAY,
-        reason=EFA_REPLAY,
-        lanes=("eks", "hp"),
-        expected="a missing field is UNKNOWN/NOT_SUPPORTED, never a reported zero (spec FAIL risk)",
-    ),
-    deferred_variant(
-        CASE_010,
-        "ethtool_failed",
-        proof_mode=LIVE_REPLAY,
-        reason=(
-            "FIXTURE_NOT_READY: an ethtool -S failure replay (the shared replay helper) "
-            "is not built; a failed ethtool must not read as zero errors (spec FAIL risk)"
-        ),
-        lanes=("eks", "hp"),
-        expected="a failed ethtool is UNKNOWN, not zero congestion counters",
-    ),
-    deferred_variant(
-        CASE_010,
-        "non_efa",
-        proof_mode=CAPABILITY,
-        reason=(
-            "CAPABILITY_ABSENT: this site has only EFA RDMA devices; there is no "
-            "IB-only device whose counters could be mistaken for EFA readings"
-        ),
-        lanes=("eks", "hp"),
-        expected="an IB-only counter is not treated as a valid EFA reading",
-    ),
-    deferred_variant(
-        CASE_010,
-        "counter_reset",
-        proof_mode=LIVE_REPLAY,
-        reason=EFA_REPLAY,
-        lanes=("eks", "hp"),
-        expected="a counter reset is not a new fault and not a recovery",
-    ),
     # ----------------------------------------------------------------------- #
     # 012 GPU missing / fallen off the bus
     # ----------------------------------------------------------------------- #

@@ -283,6 +283,7 @@ CATEGORY_MODULES = (
     "scripts.e2e.regional.general_live_devices",
     "scripts.e2e.regional.general_live_smart",
     "scripts.e2e.regional.general_live_bmc",
+    "scripts.e2e.regional.general_live_efa",
     "scripts.e2e.regional.general_live_nccl",
     "scripts.e2e.regional.general_live_nccl_fr",
     "scripts.e2e.regional.general_live_progress",
