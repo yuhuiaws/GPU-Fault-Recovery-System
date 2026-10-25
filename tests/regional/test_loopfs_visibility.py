@@ -141,11 +141,17 @@ class _FilesystemReader(HostSystemMetricsMixin):
         return {"name": name, "value": value, "device": device}
 
 
+def _field(sample: object, key: str) -> object:
+    # ``_sample`` above yields dicts; the availability gauge is built as a real
+    # HostMetricSample by the product (GF-GENERAL-LIVE-004), so read both shapes.
+    return sample[key] if isinstance(sample, dict) else getattr(sample, key)
+
+
 def _read(mount: str, reading: os.statvfs_result) -> dict[tuple[str, str], float]:
     reader = _FilesystemReader(mount, reading)
     now = datetime(2026, 10, 24, tzinfo=timezone.utc)
     return {
-        (sample["name"], sample["device"]): sample["value"]
+        (_field(sample, "name"), _field(sample, "device")): _field(sample, "value")
         for sample in reader._filesystems(now)
     }
 

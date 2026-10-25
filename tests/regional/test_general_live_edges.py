@@ -267,12 +267,14 @@ def storage_probes(tmp_path: Path, **fs_overrides: Any) -> dict[str, FakeProbe]:
     }
 
 
-def test_storage_read_only_gap_is_fail(tmp_path: Path) -> None:
+def test_storage_read_only_undetected_is_fail(tmp_path: Path) -> None:
+    # The product detects a read-only mount (filesystem_unavailable); with no
+    # product records at all the variant still fails rather than passing.
     spec, ctx = ctx_for(
         storage, "read_only", tmp_path, probes=storage_probes(tmp_path), activity=EMPTY
     )
     result = spec.execute(ctx)
-    assert result["verdict"] == "FAIL" and result["detected"] is False
+    assert result["verdict"] == "FAIL", result
 
 
 def test_storage_required_mount_missing_gap_is_fail(tmp_path: Path) -> None:
