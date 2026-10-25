@@ -27,10 +27,14 @@ from scripts.e2e.regional.general_live_common import (
     Oracle,
     activity,
     await_metric_recovery,
+    await_oracle_crossing,
+    cadence_record,
     close_window,
     open_window,
     restore_incidents,
     run_survey,
+    sustained_detection_budget,
+    sustained_negative_window,
     wait_for_incident,
     wait_settled,
 )
@@ -51,6 +55,7 @@ from scripts.e2e.regional.general_live_registry import (
 )
 from scripts.e2e.regional.general_live_source_replay import host_source_replay
 from scripts.e2e.regional.general_live_tcp import PACKAGE_APPROVAL, tcp_only
+from scripts.e2e.regional.probes.collector_window_probe import MAX_RESTORE_SECONDS
 from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
@@ -68,13 +73,61 @@ from scripts.e2e.regional.general_live_verdicts import (
 CASE_008 = "GF-GENERAL-LIVE-008"
 CASE_009 = "GF-GENERAL-LIVE-009"
 QUARANTINE_BUDGET = 420
+#: ``host_health.py`` NETWORK_DROPS_SUSTAIN_SECONDS: the drops rule's minimum
+#: active time. ``network_drops_delta`` is a per-tick delta, so the generator
+#: must keep dropping on every collector tick for the whole budget.
 DROPS_SUSTAIN = 60
-DROPS_BUDGET = DROPS_SUSTAIN + 300 + 90
+#: How long the generator may take to move the drop counters on the oracle:
+#: a few 5-s oracle ticks (it drops from its first frame).
+DROPS_RAMP_BUDGET = 90
 SHORT_DROPS = 30
-NEGATIVE_WINDOW = DROPS_SUSTAIN + 420
 #: Node and control-plane clocks may differ by a few seconds when a batch is
 #: placed before or after the runner's recreate of the drop interface.
 RESET_CLOCK_TOLERANCE_SECONDS = 5
+
+
+def drops_budget(ctx: VariantContext) -> int:
+    """The drops detection budget from the oracle's crossing, on the product's cadence.
+
+    ``threshold:network_drops_delta`` is shipped once, as the crossing's edge,
+    then only on health summaries; the finding needs a later active sample at
+    least 60 s after the first and VALIDATE_FABRIC one more summary: 60 s +
+    2 x GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS + GPU_FAULT_HOST_INTERVAL_SECONDS
+    + the chain margin (855 s on a 300-s/15-s site; the fixed 450-s budget
+    before it, counted from the generator's start, could not reach the
+    validation's summary).
+    """
+
+    return sustained_detection_budget(ctx, DROPS_SUSTAIN)
+
+
+def drops_quiet_window(ctx: VariantContext) -> int:
+    """The negative watch after a burst shorter than the sustain: the sustain
+    plus one health summary plus a collector interval and the margin (555 s on
+    a 300-s/15-s site)."""
+
+    return sustained_negative_window(ctx, DROPS_SUSTAIN)
+
+
+def link_quiet_window(ctx: VariantContext) -> int:
+    """The negative watch for an interface the collector must not even sample:
+    one health summary (the batch that would carry the sample) plus a
+    collector interval and the margin (495 s on a 300-s/15-s site)."""
+
+    return sustained_negative_window(ctx, 0)
+
+
+def window_restore_seconds(ctx: VariantContext) -> int:
+    """How long the required-interface drop-in may stay open before its deadman.
+
+    The window must outlive the whole variant -- the drops budget is timed
+    from the oracle's crossing and the recovery waits two more summaries --
+    never less than the link variants' quarantine budget plus its old margin,
+    and never more than the window probe's own cap.
+    """
+
+    wanted = max(QUARANTINE_BUDGET + 600, ctx.spec.max_minutes * 60 + 600)
+    return min(MAX_RESTORE_SECONDS, wanted)
 
 
 def _veth(ctx: VariantContext, *, a: str = "a", b: str = "b") -> dict[str, Any]:
@@ -97,7 +150,7 @@ def _veth(ctx: VariantContext, *, a: str = "a", b: str = "b") -> dict[str, Any]:
 
 def _declare_required(ctx: VariantContext, *names: str) -> None:
     pairs = [f"GPU_FAULT_REQUIRED_INTERFACES={name}" for name in names]
-    open_window(ctx, *pairs, restore_seconds=QUARANTINE_BUDGET + 600)
+    open_window(ctx, *pairs, restore_seconds=window_restore_seconds(ctx))
 
 
 def _link_incidents(
@@ -352,7 +405,7 @@ def optional_interface(ctx: VariantContext) -> dict[str, Any]:
     started = utc_now()
     ctx.net("set-link", "--slot", "c", "--state", "down")
     observed = _watch_no_finding(
-        ctx, started, "network_link_down", NEGATIVE_WINDOW, device=c
+        ctx, started, "network_link_down", link_quiet_window(ctx), device=c
     )
     stages = {
         "no_finding": chain_errors(
@@ -499,6 +552,58 @@ def _drops_oracle(ctx: VariantContext, a: str, b: str, seconds: int) -> Oracle:
     return oracle
 
 
+def _dropped_frames(a: str, b: str) -> Any:
+    """One oracle record's drop count: ``a``'s tx_dropped plus ``b``'s rx_dropped."""
+
+    def read(record: dict[str, Any]) -> Any:
+        netdev = record.get("netdev") or {}
+        counters = [
+            (netdev.get(a) or {}).get("tx_dropped"),
+            (netdev.get(b) or {}).get("rx_dropped"),
+        ]
+        values = [value for value in counters if isinstance(value, (int, float))]
+        return sum(values) if values else None
+
+    return read
+
+
+def _await_drops_crossing(ctx: VariantContext, oracle: Oracle, a: str, b: str) -> None:
+    """Detection is timed from the oracle's first rise of the drop counters."""
+
+    await_oracle_crossing(
+        ctx,
+        oracle,
+        _dropped_frames(a, b),
+        lambda values: len(values) >= 2 and values[-1] > values[0],
+        timeout_seconds=DROPS_RAMP_BUDGET,
+        name="drops-ramp",
+        condition=f"the generator did not move the drop counters of {a}/{b}",
+    )
+
+
+def _start_drops(
+    ctx: VariantContext, slot: str, seconds: int, *, budget_seconds: int
+) -> None:
+    """Start the drop generator; ``drops-start.json`` records the budgets."""
+
+    started = ctx.net(
+        "start-drops", "--slot", slot, "--rate", "10", "--seconds", str(seconds)
+    )
+    ctx.cleanup.push("net-drops", lambda: ctx.net("stop-drops"))
+    ctx.evidence.write(
+        "drops-start",
+        {
+            **started,
+            **cadence_record(
+                ctx,
+                sustain_seconds=DROPS_SUSTAIN,
+                detection_budget_seconds=budget_seconds,
+                ramp_budget_seconds=DROPS_RAMP_BUDGET,
+            ),
+        },
+    )
+
+
 def _assert_drops_moved(oracle: Oracle, a: str, b: str) -> None:
     oracle.read()
     tx = oracle_values(
@@ -523,10 +628,13 @@ def sustained_drops(ctx: VariantContext) -> dict[str, Any]:
     _declare_required(ctx, a, b)
     ctx.hold(ctx.host_interval * 3, name="healthy-samples")
     started = utc_now()
-    hold = DROPS_BUDGET + 120
+    budget = drops_budget(ctx)
+    # The generator outlives the ramp, the detection budget and the chain's
+    # grading: VALIDATE_FABRIC must still find the interface dropping.
+    hold = DROPS_RAMP_BUDGET + budget + 120
     oracle = _drops_oracle(ctx, a, b, hold)
-    ctx.net("start-drops", "--slot", "a", "--rate", "10", "--seconds", str(hold))
-    ctx.cleanup.push("net-drops", lambda: ctx.net("stop-drops"))
+    _start_drops(ctx, "a", hold, budget_seconds=budget)
+    _await_drops_crossing(ctx, oracle, a, b)
     detection = _wait_drops_finding(ctx, started, (a, b), validation="VALIDATE_FABRIC")
     _assert_drops_moved(oracle, a, b)
     device = _drops_device(detection, (a, b))
@@ -553,7 +661,7 @@ def sustained_drops(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started,
         [item["incident_id"] for item in incidents],
-        timeout_seconds=DROPS_BUDGET,
+        timeout_seconds=budget,
         metrics={"network_drops_delta"},
         name="drops-settled",
     )
@@ -572,7 +680,10 @@ def short_drops(ctx: VariantContext) -> dict[str, Any]:
     ctx.net("stop-drops")
     ctx.cleanup.discard("net-drops")
     _assert_drops_moved(oracle, a, b)
-    observed = _watch_no_finding(ctx, started, "network_drops_delta", NEGATIVE_WINDOW)
+    # The burst's end is a recovered edge; the watch outlasts the sustain plus
+    # the next health summary, the only later batch that could carry a delta.
+    window = drops_quiet_window(ctx)
+    observed = _watch_no_finding(ctx, started, "network_drops_delta", window)
     stages = {
         "no_finding": chain_errors(
             observed, ChainExpectation(metric="network_drops_delta", present=False)
@@ -580,7 +691,14 @@ def short_drops(ctx: VariantContext) -> dict[str, Any]:
     }
     close_window(ctx)
     ctx.cleanup.discard("collector-window")
-    return _result(stages)
+    return _result(
+        stages,
+        extra={
+            "negative_window_seconds": window,
+            "host_summary_seconds": ctx.host_summary,
+            "host_interval_seconds": ctx.host_interval,
+        },
+    )
 
 
 def reset_evidence(
@@ -715,16 +833,11 @@ def wrong_interface(ctx: VariantContext) -> dict[str, Any]:
     _declare_required(ctx, a, b, c, d)
     ctx.hold(ctx.host_interval * 3, name="healthy-samples")
     started = utc_now()
-    ctx.net(
-        "start-drops",
-        "--slot",
-        "c",
-        "--rate",
-        "10",
-        "--seconds",
-        str(DROPS_BUDGET + 60),
-    )
-    ctx.cleanup.push("net-drops", lambda: ctx.net("stop-drops"))
+    budget = drops_budget(ctx)
+    # No oracle here: the generator drops from its first frame, so the edge is
+    # within one collector tick of the start; the budget still covers the two
+    # summaries the finding needs after it.
+    _start_drops(ctx, "c", DROPS_RAMP_BUDGET + budget + 60, budget_seconds=budget)
     detection = _wait_drops_finding(ctx, started, (c, d))
     device = _drops_device(detection, (c, d))
     on_a = finding_incidents(detection, "network_drops_delta", device=a)
@@ -756,17 +869,11 @@ def drops_recovery(ctx: VariantContext) -> dict[str, Any]:
     _declare_required(ctx, a, b)
     ctx.hold(ctx.host_interval * 3, name="healthy-samples")
     started = utc_now()
-    _drops_oracle(ctx, a, b, DROPS_BUDGET + 60)
-    ctx.net(
-        "start-drops",
-        "--slot",
-        "a",
-        "--rate",
-        "10",
-        "--seconds",
-        str(DROPS_BUDGET + 60),
-    )
-    ctx.cleanup.push("net-drops", lambda: ctx.net("stop-drops"))
+    budget = drops_budget(ctx)
+    hold = DROPS_RAMP_BUDGET + budget + 60
+    oracle = _drops_oracle(ctx, a, b, hold)
+    _start_drops(ctx, "a", hold, budget_seconds=budget)
+    _await_drops_crossing(ctx, oracle, a, b)
     detection = _wait_drops_finding(ctx, started, (a, b))
     device = _drops_device(detection, (a, b))
     incidents = finding_incidents(detection, "network_drops_delta", device=device)
@@ -777,7 +884,7 @@ def drops_recovery(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started,
         [item["incident_id"] for item in incidents],
-        timeout_seconds=DROPS_BUDGET,
+        timeout_seconds=budget,
         metrics={"network_drops_delta"},
         name="drops-recovery-settled",
     )
@@ -828,7 +935,7 @@ def _wait_drops_finding(
 
     value = ctx.wait_until(
         accept,
-        timeout_seconds=DROPS_BUDGET,
+        timeout_seconds=drops_budget(ctx),
         poll_seconds=ctx.host_interval,
         name="drops-detection",
     )
@@ -1178,21 +1285,24 @@ VARIANTS = [
     _spec(
         CASE_009,
         "sustained_drops",
-        "oversized AF_PACKET frames behind a 576-MTU peer for >= 7 min",
-        "drops sustained 60 s -> WARNING -> VALIDATE_FABRIC; no hardware recovery",
+        "oversized AF_PACKET frames behind a 576-MTU peer through the ramp plus the "
+        "cadence budget timed from the oracle's crossing (~18 min on a 300-s cadence)",
+        "drops sustained 60 s -> WARNING -> VALIDATE_FABRIC over two host health "
+        "summaries; no hardware recovery",
         sustained_drops,
         risk="L",
-        max_minutes=20,
+        max_minutes=30,
         approvals=("KERNEL_MODULE_LOAD",),
     ),
     _spec(
         CASE_009,
         "short_drops",
         "30 s drop burst",
-        "no finding",
+        "no finding across the sustain plus one health summary after the burst "
+        "(555 s on a 300-s cadence)",
         short_drops,
         risk="L",
-        max_minutes=14,
+        max_minutes=16,
         approvals=("KERNEL_MODULE_LOAD",),
     ),
     _spec(
@@ -1232,7 +1342,7 @@ VARIANTS = [
         "finding device = B, never A; the generic VALIDATE_FABRIC is node-wide",
         wrong_interface,
         risk="L",
-        max_minutes=20,
+        max_minutes=25,
         approvals=("KERNEL_MODULE_LOAD",),
     ),
     _spec(
@@ -1242,7 +1352,7 @@ VARIANTS = [
         "new zero deltas and a communication check; no NIC reset, no DB cleanup to zero",
         drops_recovery,
         risk="L",
-        max_minutes=20,
+        max_minutes=25,
         approvals=("KERNEL_MODULE_LOAD",),
     ),
 ]

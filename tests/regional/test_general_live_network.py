@@ -9,9 +9,11 @@ real node-activity read.
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -19,9 +21,11 @@ import pytest
 from gpu_fault.app import ApplicationContext
 from gpu_fault.collectors import CollectorContext, HostTelemetryCollector
 from gpu_fault.execution.models import WorkflowStepOutcome
+from gpu_fault.host_health import NodeHealthPolicy
 from gpu_fault.models import WorkflowOperation, WorkflowStatus
 from gpu_fault.store import InMemoryStore
 from scripts.e2e.regional import general_live_network as net
+from scripts.e2e.regional.general_live_common import STORE_POLL_SECONDS
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE
 from tests._builders import active_workflow_executor, asgi_client, execute_workflow
@@ -32,6 +36,7 @@ from tests.regional._general_live_fakes import (
     host_batch,
     incident,
     make_context,
+    store_poll_clock,
     store_script,
     workflow,
 )
@@ -1245,3 +1250,205 @@ def test_link_down_over_the_real_product(
         ended = world.context.store.get_incident(previous)
         assert ended.event_type == "NODE_HEALTH_GROUP", ended
         assert ended.state.value == "QUARANTINED", ended
+
+
+# --------------------------------------------------------------------------- #
+# 009 drops: detection timed from the oracle's crossing over two host health
+# summaries (the 003 high_page_cache lesson of 2026-10-25, 60-s drops rule)
+# --------------------------------------------------------------------------- #
+SITE = SimpleNamespace(host_summary=300, host_interval=15)
+
+
+def drops_reads(*phases: list[int]) -> list[dict[str, Any]]:
+    """One ``oracle-read`` answer per phase: the pair's drop counters since the last read."""
+
+    entries: list[dict[str, Any]] = []
+    total = 0
+    for values in phases:
+        total += len(values)
+        entries.append(
+            {
+                "records": [
+                    {"netdev": {IFA: {"tx_dropped": value}, IFB: {"rx_dropped": value}}}
+                    for value in values
+                ],
+                "next_offset": total,
+                "total": total,
+            }
+        )
+    return entries
+
+
+#: The counters are flat on the first oracle read and rise on the second; the
+#: product's records -- the finding and its executed VALIDATE_FABRIC -- appear
+#: 40 store polls (800 s) after the crossing: the edge, the first summary at
+#: least 60 s later that mints the finding, the next summary the validation is
+#: judged on. The old 450-s budget, counted from the generator's start, could
+#: not reach that second summary.
+DROPS_RAMP_READS = drops_reads(
+    [0, 0], [100, 200, 300], [400 + 100 * i for i in range(60)]
+)
+MINTED_AT_POLL = 40
+
+
+def drops_ramp_run(
+    tmp_path: Path,
+    variant: str,
+    oracle: list[dict[str, Any]],
+    minted_at_poll: int | None,
+) -> tuple[dict[str, Any], Any, dict[str, FakeProbe]]:
+    spec = SPECS[variant]
+    polls = itertools.count(1)
+    empty = {
+        "incidents": [],
+        "workflows": [],
+        "batches": [],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+        "collector_statuses": [],
+    }
+
+    def product(_script: str, *_arguments: str, **_: Any) -> dict[str, Any]:
+        poll = next(polls)
+        if minted_at_poll is not None and poll >= minted_at_poll:
+            return drops_doc(IFA)
+        return empty
+
+    node = FakeProbe(
+        {
+            "survey": survey(),
+            "oracle-start": {"unit": "oracle"},
+            "oracle-stop": {},
+            "oracle-read": oracle,
+        }
+    )
+    probe_set = probes(node, net_probe(), window_probe())
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=product),
+        probes=probe_set,
+    )
+    result = spec.execute(store_poll_clock(ctx))
+    return result, ctx, probe_set
+
+
+@pytest.mark.parametrize("variant", ["sustained_drops", "recovery"])
+def test_drops_variants_time_detection_from_the_oracles_crossing(
+    tmp_path: Path, variant: str
+) -> None:
+    result, ctx, probe_set = drops_ramp_run(
+        tmp_path, variant, DROPS_RAMP_READS, MINTED_AT_POLL
+    )
+    assert result["verdict"] == "PASS", (variant, result["errors"])
+    ramp = json.loads((ctx.case_dir / "drops-ramp-timeline.json").read_text())
+    assert [entry["accepted"] for entry in ramp["entries"]] == [False, True]
+    started = json.loads((ctx.case_dir / "drops-start.json").read_text())
+    assert started["detection_budget_seconds"] == net.drops_budget(ctx) == 855
+    assert started["ramp_budget_seconds"] == net.DROPS_RAMP_BUDGET
+    assert started["sustain_seconds"] == net.DROPS_SUSTAIN
+    assert started["host_summary_seconds"] == 300
+    # The generator and the oracle outlive the ramp and the detection budget.
+    netp = probe_set[f"net@{NODE}"]
+    start = next(call for call in netp.calls if call[0] == "start-drops")
+    seconds = int(start[start.index("--seconds") + 1])
+    assert seconds >= net.DROPS_RAMP_BUDGET + net.drops_budget(ctx), seconds
+    oracle = next(
+        call for call in probe_set[f"node@{NODE}"].calls if call[0] == "oracle-start"
+    )
+    assert int(oracle[oracle.index("--seconds") + 1]) >= seconds, oracle
+    # The required-interface window outlives the variant (the probe's cap).
+    opened = next(
+        call for call in probe_set[f"window@{NODE}"].calls if call[0] == "open-window"
+    )
+    restore = int(opened[opened.index("--restore-seconds") + 1])
+    assert restore == net.window_restore_seconds(ctx) == 1800, opened
+    assert restore >= 3 * 15 + net.DROPS_RAMP_BUDGET + net.drops_budget(ctx) + (
+        300 + 6 * 15
+    ), "the window must outlast ramp, detection and the recovery wait"
+
+
+def test_sustained_drops_fails_when_the_product_misses_two_summaries(
+    tmp_path: Path,
+) -> None:
+    late = net.drops_budget(SITE) // STORE_POLL_SECONDS + 3
+    result, _ctx, _probes = drops_ramp_run(
+        tmp_path, "sustained_drops", DROPS_RAMP_READS, late
+    )
+    assert result["verdict"] == "FAIL", result
+    assert any(
+        "no network_drops_delta finding reached an incident" in error
+        for error in result["errors"]
+    ), result["errors"]
+
+
+def test_sustained_drops_is_inconclusive_when_the_counters_never_move(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(VariantInconclusive, match="condition not established"):
+        drops_ramp_run(tmp_path, "sustained_drops", drops_reads([0, 0], [0, 0]), None)
+
+
+def test_short_drops_watches_the_sustain_plus_one_summary_after_the_burst(
+    tmp_path: Path,
+) -> None:
+    oracle = drops_reads([100 * i for i in range(1, 8)])
+    empty = {
+        "incidents": [],
+        "workflows": [],
+        "batches": [],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+        "collector_statuses": [],
+    }
+    spec = SPECS["short_drops"]
+    regional = FakeRegional(cpu_python=store_script({"activity": empty}))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(node_probe(survey(), oracle[0]), net_probe(), window_probe()),
+    )
+    result = spec.execute(store_poll_clock(ctx))
+    assert result["verdict"] == "PASS", result["errors"]
+    window = net.drops_quiet_window(ctx)
+    assert result["negative_window_seconds"] == window == 60 + 300 + 15 + 180
+    watched = json.loads((ctx.case_dir / "negative-window-timeline.json").read_text())
+    assert len(watched["entries"]) >= window // STORE_POLL_SECONDS, len(
+        watched["entries"]
+    )
+
+
+def test_drops_budgets_follow_the_products_rule_and_fit_the_variant_windows() -> None:
+    assert net.DROPS_SUSTAIN == NodeHealthPolicy.NETWORK_DROPS_SUSTAIN_SECONDS
+    budget = net.drops_budget(SITE)
+    assert budget == net.DROPS_SUSTAIN + 2 * 300 + 15 + 180 == 855
+    assert budget > 60 + 300 + 90, "the fixed budget before the cadence rule"
+    assert net.drops_quiet_window(SITE) == 555
+    assert net.link_quiet_window(SITE) == 300 + 15 + 180
+    healthy = 3 * SITE.host_interval
+    zero_drops = SITE.host_summary + 6 * SITE.host_interval
+    for variant, tail in (
+        ("sustained_drops", 120 + zero_drops),
+        ("recovery", 60 + zero_drops),
+    ):
+        assert SPECS[variant].max_minutes * 60 >= (
+            healthy + net.DROPS_RAMP_BUDGET + budget + tail
+        ), (variant, SPECS[variant].max_minutes)
+    assert SPECS["wrong_interface"].max_minutes * 60 >= (
+        healthy + net.DROPS_RAMP_BUDGET + budget + 60
+    )
+    assert SPECS["short_drops"].max_minutes * 60 >= (
+        net.SHORT_DROPS + 10 + net.drops_quiet_window(SITE) + 120
+    )
+    # The window probe caps a drop-in's deadman; every variant's window asks for
+    # at most that and at least the old fixed value.
+    for spec in SPECS.values():
+        ctx = SimpleNamespace(spec=spec)
+        assert 1020 <= net.window_restore_seconds(ctx) <= net.MAX_RESTORE_SECONDS, (
+            spec.variant
+        )
