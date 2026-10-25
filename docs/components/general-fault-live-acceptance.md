@@ -177,7 +177,10 @@ FAT16（`dm-create --fstype vfat`），`dm-retarget --target error` 先重新挂
 EIO 即 `INCONCLUSIVE`，缓存命中时从新挂载重试最多 3 次）。交换前先 sync，不向 error 表写入
 （写失败会记 `Buffer I/O error`，节点日志采集器 `log_rules.py` 的存储规则会把它判成
 QUARANTINE），因此节点日志采集器处于 active 时记 `NOT_RUN(FIXTURE_NOT_READY)`；缺 `vfat`
-模块时在 `KERNEL_MODULE_LOAD` 下加载并在清理时卸载，节点需有 `mkfs.vfat`（dosfstools）。
+模块时在 `KERNEL_MODULE_LOAD` 下加载并在清理时卸载；节点需有 `mkfs.vfat`（dosfstools），缺它时记
+`NOT_RUN(CAPABILITY_ABSENT)` 并提示令牌，给可选令牌 `TEMP_TEST_PACKAGE_INSTALL` 则由共享的临时测试包
+步骤（`general_live_deps.ensure_dependencies`）在建设备前只安装 `dosfstools`，设备销毁后作为最后一步
+LIFO 清理卸载（包 deadman 晚于设备 deadman）。
 三个不可用变体另核对 `filesystem_unavailable` 采样的 `failure_mode` 标签（有标签而不符即
 FAIL）。只读以宿主 `/proc/1/mountinfo`
 中承载该路径挂载的 per-mount/超级块 `ro` 为准，不取 collector 沙箱（`ProtectSystem=strict`
@@ -325,6 +328,13 @@ latency门槛且跨越默认120秒，另测短flush。用同一设备/同一时�
 down/完整枚举后的缺失应执行隔离；unknown或目录不可读不应当down。down同时统计坏
 不能吞掉已知链路证据；非必需接口不隔离。bond/VF语义按实际拓扑独立验证。
 恢复原接口配置、地址/路由、RDMA和训练连通性，再按owner受控接纳；不关闭管理链路。
+本站实现：`empty_required_list` 先读网络探针只读 `inventory`（每个真实 netdev 的 sysfs `device`
+链接、驱动、RDMA 设备、全局地址、是否承载主表默认路由、哪些策略路由表经它默认出站），按通用规则分
+角色：承载默认路由的=管理面；有 device 链接、是某策略表默认路由且无 RDMA 的=Pod 网络二级 ENI（VPC
+CNI 每个二级 ENI 一张表）；无 device 链接的=虚拟/容器接口（宿主侧 Pod veth、bridge、dummy）；其余有
+device 链接的=可声明的专用数据 NIC。列表为空且无专用数据 NIC 时记 `NOT_RUN(CAPABILITY_ABSENT)`——
+空列表即正确配置（本站 p5en：主 ENA + VPC-CNI 二级 ENI + 仅 EFA 的 rdmap 设备，用户 2026-10-25
+决定）；有专用数据 netdev 而列表为空仍为站点 FAIL（注册的预期 FAIL 不变）。
 
 ### GF-GENERAL-LIVE-009
 
@@ -597,6 +607,15 @@ allocation 来自每个已终止关键容器的 `spec.nodeName`（`completion_po
 并发claim、worker重建和重复事件不重复扣减/虚假释放，不创建新训练任务；
 缺restart context仍须预检拒绝。保存一次通知和最终ESCALATED/QUARANTINED一致性，
 不通过给业务job增加预算来清理现场。
+本站实现（`general_live_attempts.py` + `general_live_terminal_replay.py`）：`duplicate_event` 用 028
+`old_terminal` 的 `TERMINAL_REPLAY_PROBE` 让产品收到**同一**终态两次——受管任务 `exit_once` 首个
+attempt 失败，待产品决策、RESTART_WORKLOAD 记下 `restart_attempt_id` 并经过一个 watcher 周期（首投
+已沉淀、重启副本持续运行）后，在 API Pod 内读出产品自己记录的 TerminalEvent 再经
+`CompletionService.handle_terminal` 重投（只对 `gl28`/`gl29` 前缀的测试 attempt）。PASS 要求：重投返回
+原决策（status/recovery_plan_id/event_key 相同）且 `duplicate=true`；再过一个 watcher 周期后该 attempt
+的决策行不变（未被改写成 duplicate）、恰一个 RESTART_WORKLOAD 工作流、预算账本 `restart_count` 1 且
+reservation id 不变、该 attempt 事件（containment + recovery）的通知无新增——一次决策、一次扣减、一次
+通知；重启副本无自己的 terminal/decision/containment。无决策、无重启副本或无已记录终态记 INCONCLUSIVE。
 
 ### GF-GENERAL-LIVE-030
 
@@ -717,12 +736,17 @@ INPUT REJECT 其 Node Agent 监听端口——执行器下发节点动作的通�
 `SPARE_KUBELET_STOP`（停热备上的 kubelet 使其 NotReady，带宿主机自动重启定时器）；
 缺令牌记 `NOT_RUN(NOT_AUTHORIZED)`。可选令牌只解锁一个附加分支、不影响变体本身是否
 可执行（计划里列为 `approvals_optional`，同样经 `--approve` 绑进 `plan.json`，
-plan 与 execute 必须给出同一组令牌）：`TEMP_TEST_PACKAGE_INSTALL`（009 `tcp_only`：
-节点缺 `tc` 时为本次运行用 dnf 安装 `iproute-tc`，`sch_netem` 无法为运行内核加载时
-安装 `kernel-modules-extra-$(uname -r)`；dnf 预演事务必须恰好只安装这些包，不得拉入
-内核、升级、降级、删除或其他依赖，否则 `NOT_RUN(FIXTURE_NOT_READY)`；清理与 deadman
-只 dnf 卸载本次运行记录在案安装的包）。不给该令牌时节点缺 `tc` 仍记
-`NOT_RUN(CAPABILITY_ABSENT)`。
+plan 与 execute 必须给出同一组令牌）：`TEMP_TEST_PACKAGE_INSTALL`（临时测试包，共享步骤
+`general_live_deps.ensure_dependencies` 经 `general_live_deps_probe.py` 的审查允许表：009 `tcp_only`
+节点缺 `tc` 时为本次运行用 dnf 安装 `iproute-tc`，`sch_netem` 无法为运行内核加载时安装
+`kernel-modules-extra-$(uname -r)`；007 六个 SMART 回放变体缺 `smartctl` 时安装 `smartmontools`；
+004 `probe_error` 缺 `mkfs.vfat` 时安装 `dosfstools`。dnf 预演事务必须恰好只安装这些包，不得拉入
+内核、升级、降级、删除或其他依赖，否则 `NOT_RUN(FIXTURE_NOT_READY)`；采集器不为此重启（每个 tick
+重新查找工具）；清理与 deadman 只 dnf 卸载本次运行记录在案安装的包，且在用到该工具的夹具之后
+（LIFO）。不给该令牌时节点缺该工具仍记 `NOT_RUN(CAPABILITY_ABSENT)`，detail 指出令牌与包名。
+`ipmitool` 不在允许表内：015 由 shim（`--allow-missing-real`）回答，不需要真实工具；005 的
+`nfs-utils` 也不在（其事务拉入 rpcbind/libtirpc/gssproxy 等依赖，与“只装这一个包”规则冲突，放宽需
+另行审查）。
 
 ### 安全
 
@@ -774,8 +798,9 @@ decision、restart 预算账本），绝不 POST 预制 finding/workflow。运�
 `api_unreachable` 与 029 `worker_restart` 原为未授批危险分支，现已实现为带令牌的
 native 变体（见下文"watcher 失联与重建"）。
 
-需管理员安排的站点配置：008 `empty_required_list` 是站点 FAIL，修复需把主/EFA
-netdev 写进安装器/管理配置的 `GPU_FAULT_REQUIRED_INTERFACES`（默认空）；
+需管理员安排的站点配置：008 `empty_required_list` 在节点有专用数据 netdev 时是站点 FAIL，修复需把
+该 netdev（及站点有的主/EFA netdev）写进安装器/管理配置的 `GPU_FAULT_REQUIRED_INTERFACES`（默认空）；
+节点没有专用数据 NIC 时由网络探针 `inventory` 判定并记 `NOT_RUN(CAPABILITY_ABSENT)`（见 008 节）；
 031 `logs_silent` 需按批准启用 `GPU_FAULT_ENABLE_NODE_LOG_COLLECTOR`
 （生产默认 false）；002/003 的主机内存压力需 `HOST_MEMORY_PRESSURE` 审批；
 006 `sustained_latency`、008/009 的 veth/dummy/netem 需 `KERNEL_MODULE_LOAD`
@@ -1050,6 +1075,13 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   `unsupported_device` 须是 `smart_status_unsupported`（TOOL_MISSING/NO_SMART_STATUS）且无
   采集错误、不记健康盘。包装器日志（`audit-read`）是“产品确实问过且规则已生效”的 oracle，
   否则 `INCONCLUSIVE`；每个变体关窗后都要读到真实 `smartctl` 的新鲜判定且无 `_smart` 错误。
+  节点缺 `smartctl`（AL2023 EKS GPU AMI）时六个回放变体记 `NOT_RUN(CAPABILITY_ABSENT)` 并提示令牌；
+  给可选令牌 `TEMP_TEST_PACKAGE_INSTALL` 则先由共享临时测试包步骤只安装 `smartmontools`（会拉入其他
+  包的事务被拒为 `NOT_RUN(FIXTURE_NOT_READY)`）。采集器无需重启：`_smart` 每个 tick 都
+  `shutil.which("smartctl")`，主机采集器单元不设自己的 PATH 且 `ProtectSystem=strict` 是实时 `/usr`
+  的只读视图，下一个 tick 即扫描并判定各盘；运行器等待最多一个健康汇总加 6 个 tick 读到产品首个
+  `smart_health_failed` 读数（`smart_devices(fresh=True)`）作为目标盘，之后开窗/关窗照常重启单元；
+  关窗后作为最后一步 LIFO 清理卸载该包，产品随后恢复上报 `smart_status_unsupported` TOOL_MISSING。
 - 015 BMC 的回放变体 `critical`/`nonrecoverable`/`wrong_column`/`unavailable_sensor`/
   `command_failure`（live-replay，模块 `general_live_bmc`，两条车道，需 `HOST_SOURCE_REPLAY`；
   `install-wrapper --allow-missing-real`：EC2 无 BMC 也无 `ipmitool`，shim 只按计划回答

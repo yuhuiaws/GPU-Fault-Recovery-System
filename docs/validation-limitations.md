@@ -1153,6 +1153,22 @@ affected. 009 `tcp_only` was recovered from the `ProbeError` but stayed
 probe command, so the oracle saw no RetransSegs rise -- a separate harness gap,
 independent of interface visibility, closed by the fixture described below.
 
+008 `empty_required_list` decides from the node whether an empty
+`GPU_FAULT_REQUIRED_INTERFACES` is a site FAIL at all. The net probe's read-only
+`inventory` lists every real netdev (not `lo`, not the run's test interfaces)
+with its sysfs `device` link, driver, RDMA device, global addresses, whether it
+carries the main table's default route and which policy routing tables default
+through it; `interface_roles` then classifies generically: the default-route
+interface is the management plane, a device-backed netdev that is the default
+route of a policy table (the pod network's secondary ENIs -- the VPC CNI keeps
+one table each) belongs to the CNI, a netdev without a device link is a
+container/virtual interface, and every other device-backed netdev is a
+dedicated data NIC the list could name. A node without one (this site's p5en:
+primary ENA, VPC-CNI secondary ENIs, EFA-only `rdmap` devices with no netdev)
+records NOT_RUN(CAPABILITY_ABSENT) -- an empty list is the correct
+configuration there (user decision 2026-10-25) -- while a node with a dedicated
+data netdev keeps the registered expected FAIL naming that netdev.
+
 A second `ProbeError` on the veth path survived that digest change and was caught
 live on 008 `optional_interface` (2026-10-24, after the digest fix shipped):
 `forbid_real` -- the guard the probe runs before `set-link down` so it never
@@ -1292,6 +1308,24 @@ if it is not loaded (`KERNEL_MODULE_LOAD`). Its limits are deliberate:
   cleanup. A node reboot before either runs loses the `/run` record and the
   timers; the installed NEVRAs stay in the case evidence for a manual removal.
 
+The same step is shared -- `general_live_deps.ensure_dependencies`, one helper
+over the same probe, never a copy per category -- by the six 007 SMART replay
+variants (`smartctl` -> `smartmontools`) and 004 `probe_error` (`mkfs.vfat` ->
+`dosfstools`), the two other tools the AL2023 EKS GPU AMI lacks (pass 5 recorded
+all of them NOT_RUN(CAPABILITY_ABSENT)). Without the optional token the NOT_RUN
+stays and its detail names the token and the package; with it exactly that
+package is installed before the fixture that needs the tool and removed as the
+last LIFO cleanup after that fixture is gone (the package deadman is timed
+after the fixture's). The allow-list is the probe's `TOOL_PACKAGES`. `ipmitool`
+is deliberately not on it: 015 serves it from the wrapper with
+`--allow-missing-real`, so no real tool is needed on this BMC-less site.
+`nfs-utils` for 005 is not either: its transaction pulls rpcbind, libtirpc,
+gssproxy and more, which the exact-package rule refuses; widening the rule to
+a reviewed dependency list is a separate review. No collector is restarted for
+an install: `_smart` and `_bmc` run `shutil.which` on every tick, the host
+collector unit sets no PATH of its own and its `ProtectSystem=strict` is a
+read-only view of the live `/usr`.
+
 ## GF-GENERAL-LIVE host/device categories (phase 2)
 
 Phase 2 adds the host/device categories 002 memory/swap, 005 shared storage,
@@ -1346,8 +1380,16 @@ UNKNOWN, marker without error for NOT_SUPPORTED, `MARK_UNSCHEDULABLE` +
 `QUARANTINE` and the validated restore for `health_failed` / `critical` /
 `nonrecoverable`, zero critical for `wrong_column` / `unavailable_sensor`), the
 wrapper journal is the oracle that the product asked (otherwise INCONCLUSIVE),
-and every variant closes its window and proves the real tool answers again. A
-replay proves the processing chain only -- no drive fails and no BMC exists, so
+and every variant closes its window and proves the real tool answers again. On
+a node without `smartctl` the six 007 replay variants are
+NOT_RUN(CAPABILITY_ABSENT) naming `TEMP_TEST_PACKAGE_INSTALL`; with that
+optional token `smartmontools` is installed first (exactly that package), the
+runner waits up to one health summary plus six ticks for the product's first
+`smart_health_failed` reading -- the host collector finds the tool on its next
+tick, no restart -- and names that drive, the window then restarts the unit on
+open and close as always, and the package is removed as the last LIFO cleanup
+after the window closed, so the product reports `smart_status_unsupported`
+TOOL_MISSING again. A replay proves the processing chain only -- no drive fails and no BMC exists, so
 `proof_scope` is `live-replay`; the OPEN_FAILED drive and a hung `-H` query stay
 software-tested; 015 `unavailable_sensor` uses one `na` row among healthy ones
 (a table of only `na` rows is UNKNOWN in the product -- a `_bmc` collection
@@ -1573,7 +1615,11 @@ the oracle (no EIO is `INCONCLUSIVE`). The swap is made with nothing dirty so
 the error table is never written -- a failed write would log `Buffer I/O
 error`, which the node log collector's storage rule grades QUARANTINE -- and
 the variant refuses to run while that collector is active. It needs
-`mkfs.vfat` on the node and `KERNEL_MODULE_LOAD` for a missing `vfat`.
+`KERNEL_MODULE_LOAD` for a missing `vfat` and `mkfs.vfat` on the node; without
+the tool it is NOT_RUN(CAPABILITY_ABSENT) unless the optional
+`TEMP_TEST_PACKAGE_INSTALL` is given, which installs exactly `dosfstools` for
+the run before the device is built and removes it as the last LIFO cleanup
+after the device is destroyed.
 
 ## GF-GENERAL-LIVE 029 store-level restart-budget variants
 
@@ -2372,6 +2418,23 @@ terminal always carries an allocation, and only a hand-made TerminalEvent
 posted to `/v1/attempts/terminal` could lack one -- which the spec (watcher-
 observed terminals only) and the lane rules forbid. The product path
 (`service._decide` -> `planner.from_missing_allocation`) stays software-tested.
+
+029 `duplicate_event` is the same redelivery against the SAME attempt, so the
+product receives one terminal twice: the job runs in `exit_once` mode, the
+runner waits for the decision, the recorded `restart_attempt_id` and one
+watcher pass (the first delivery settled, the restart copy keeps running so
+nothing else moves the records), then `TERMINAL_REPLAY_PROBE` (now in
+`general_live_terminal_replay.py`, shared with 028, `gl28`/`gl29` test
+attempts only) hands the stored TerminalEvent to
+`CompletionService.handle_terminal` again. The verdict reads the attempt's
+records before and after: the answer is the original decision with
+`duplicate=true`; the stored decision row is unchanged and not rewritten as a
+duplicate; exactly one RESTART_WORKLOAD workflow; the restart ledger at one
+deduction with the same reservation ids; no new notification for the
+attempt's incidents (the attempt probe now returns the notifications of the
+attempt's containment and recovery incidents, read-only); the restart copy
+untouched -- one decision, one deduction, one notification. Before this the
+variant passed without any redelivery.
 
 GF-GENERAL-LIVE-030 (warm spare unhealthy) is the same story on the HyperPod
 lane: its `SpareSession` keeps the spare node *name* in `self.node` and also
