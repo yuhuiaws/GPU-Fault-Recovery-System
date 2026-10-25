@@ -378,6 +378,128 @@ def test_wrong_interface_binds_to_b(tmp_path: Path) -> None:
     assert result["device"] == IFC
 
 
+RESET_ERROR = (
+    f"_network: HostObservationError: {IFA}: rx_dropped reset (400 -> 0); delta unknown"
+)
+
+
+def _soon(seconds: float) -> str:
+    """Batches must postdate the runner's real-clock recreate of the interface."""
+
+    from datetime import datetime, timedelta, timezone
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+def _reset_batch(
+    seconds: float, samples: list[dict[str, Any]], errors: tuple[str, ...] = ()
+) -> dict[str, Any]:
+    at = _soon(seconds)
+    return {
+        "observed_at": at,
+        "batch_id": f"host-{at}",
+        "edge_filter_reasons": [],
+        "collection_errors": list(errors),
+        "samples": samples,
+    }
+
+
+def _drops(value: float, device: str = IFA) -> dict[str, Any]:
+    return {
+        "name": "network_drops_delta",
+        "device": device,
+        "value": value,
+        "labels": {},
+    }
+
+
+def reset_doc(*, marked: bool, reset_tick_reading: bool = False) -> dict[str, Any]:
+    """Ramp, the reset tick, a normal tick after it.
+
+    ``marked``: the reset tick carries the ``_network`` reset error and no drops
+    reading for the interface (batch 173); otherwise the old clamp shipped a 0.
+    ``reset_tick_reading`` puts a drops reading into the marked reset tick.
+    """
+
+    reset_tick = (
+        [_drops(0.0)] if (not marked or reset_tick_reading) else [_drops(7.0, IFB)]
+    )
+    return {
+        "incidents": [],
+        "workflows": [],
+        "batches": [
+            _reset_batch(30, [_drops(400.0)]),
+            _reset_batch(60, reset_tick, errors=(RESET_ERROR,) if marked else ()),
+            _reset_batch(90, [_drops(0.0)]),
+        ],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+        "collector_statuses": [],
+    }
+
+
+def _run_counter_reset(tmp_path: Path, document: dict[str, Any]) -> dict[str, Any]:
+    spec = SPECS["counter_reset"]
+    regional = FakeRegional(cpu_python=store_script({"activity": document}))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(node_probe(survey()), net_probe(), window_probe()),
+    )
+    return spec.execute(ctx)
+
+
+def test_counter_reset_reads_the_reset_tick_as_unknown(tmp_path: Path) -> None:
+    result = _run_counter_reset(tmp_path, reset_doc(marked=True))
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["stages"]["reset_unknown"] == []
+    spec = SPECS["counter_reset"]
+    assert spec.expected_outcome == "PASS" and spec.proof_mode == "native"
+    assert "delta unknown" in spec.expected and "clamped" in spec.expected
+
+
+def test_counter_reset_fails_on_the_old_clamp(tmp_path: Path) -> None:
+    result = _run_counter_reset(tmp_path, reset_doc(marked=False))
+    assert result["verdict"] == "FAIL", result
+    assert any(
+        "old clamp" in error and "delta unknown" in error for error in result["errors"]
+    ), result["errors"]
+
+
+def test_counter_reset_fails_on_a_reading_in_the_reset_tick(tmp_path: Path) -> None:
+    result = _run_counter_reset(
+        tmp_path, reset_doc(marked=True, reset_tick_reading=True)
+    )
+    assert result["verdict"] == "FAIL", result
+    assert any("in the reset tick" in error for error in result["errors"]), result[
+        "errors"
+    ]
+
+
+def test_counter_reset_is_inconclusive_without_evidence(tmp_path: Path) -> None:
+    empty = reset_doc(marked=True)
+    empty["batches"] = []
+    with pytest.raises(VariantInconclusive, match="surviving baseline"):
+        _run_counter_reset(tmp_path, empty)
+
+
+def test_reset_evidence_keeps_only_the_interfaces_own_records() -> None:
+    from datetime import datetime, timedelta, timezone
+
+    since = datetime.now(timezone.utc) - timedelta(seconds=5)
+    document = reset_doc(marked=True)
+    evidence = net.reset_evidence(document, IFA, since)
+    assert evidence["errors"] == [RESET_ERROR]
+    assert evidence["reset_tick"] == [], "the peer's reading is not the interface's"
+    assert [item["value"] for item in evidence["readings"]] == [400.0, 0.0]
+    assert net.reset_evidence(document, IFB, since)["errors"] == [], (
+        "an error naming another interface does not count"
+    )
+
+
 def test_short_drops_counter_reset_and_recovery(tmp_path: Path) -> None:
     oracle = {
         "records": [
@@ -397,17 +519,16 @@ def test_short_drops_counter_reset_and_recovery(tmp_path: Path) -> None:
         "notifications": [],
         "collector_statuses": [],
     }
-    for variant in ("short_drops", "counter_reset"):
-        spec = SPECS[variant]
-        regional = FakeRegional(cpu_python=store_script({"activity": empty}))
-        ctx = make_context(
-            spec,
-            tmp_path=tmp_path,
-            regional=regional,
-            probes=probes(node_probe(survey(), oracle), net_probe(), window_probe()),
-        )
-        result = spec.execute(ctx)
-        assert result["verdict"] == "PASS", (variant, result["errors"])
+    spec = SPECS["short_drops"]
+    regional = FakeRegional(cpu_python=store_script({"activity": empty}))
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes=probes(node_probe(survey(), oracle), net_probe(), window_probe()),
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
     # recovery: a finding then fresh zeros
     spec = SPECS["recovery"]
     zero = drops_doc(IFA)

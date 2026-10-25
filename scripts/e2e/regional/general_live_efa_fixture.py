@@ -443,6 +443,38 @@ def negative_readings(
     ]
 
 
+def reset_tick_readings(
+    document: Mapping[str, Any],
+    needles: Iterable[str],
+    metrics: Iterable[str],
+    device: str,
+) -> list[str]:
+    """Readings of ``metrics`` on ``device`` shipped in a reset tick.
+
+    A reset tick is a batch whose collection errors carry every needle (the
+    reader, the device, ``reset``, ``delta unknown``); the product's rule for
+    it is *no delta at all* for the counter that reset and for the aggregate it
+    feeds (``collectors/host/network.py`` ``_monotonic_delta``), so any sample
+    of those metrics on the device in that very batch is the old clamp -- a 0
+    that clears the signal, or a delta measured against a stale baseline.
+    """
+
+    wanted = list(needles)
+    found = []
+    for batch in document.get("batches") or []:
+        errors = [str(error) for error in batch.get("collection_errors") or []]
+        if not any(all(needle in error for needle in wanted) for error in errors):
+            continue
+        for sample in batch.get("samples") or []:
+            if sample.get("name") in set(metrics) and sample.get("device") == device:
+                found.append(
+                    f"{sample.get('name')}={sample.get('value')} shipped for {device} "
+                    f"in the reset tick batch {batch.get('batch_id')} "
+                    f"(observed {batch.get('observed_at')})"
+                )
+    return found
+
+
 def unsupported_markers(
     document: Mapping[str, Any], interface: str, metric: str, reason: str
 ) -> list[dict[str, Any]]:
@@ -543,6 +575,7 @@ __all__ = [
     "netdev_target",
     "pair_target",
     "real_counter",
+    "reset_tick_readings",
     "served_errors",
     "state_target",
     "unsupported_markers",

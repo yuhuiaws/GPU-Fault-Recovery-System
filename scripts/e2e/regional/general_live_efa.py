@@ -29,11 +29,15 @@ closes the window and ``read-source`` proves the unit reads the real sysfs value
 again. A reusable :class:`EfaSourceFixture` carries the same steps for other
 categories (011 ``broken_pair`` breaks the traffic pair with it).
 
-``counter_reset`` is an expected FAIL: ``_rdma`` clamps a counter that fell
-below its baseline to a 0 delta and ships ``rdma_errors_delta=0`` as a reading,
-which clears the active signal and re-mints a continuing fault as a new
-incident, while ``_ethtool_counters`` marks the same case UNKNOWN. ``non_efa``
-stays CAPABILITY_ABSENT: the site has no IB-only RDMA device.
+``counter_reset`` judges the one reset rule the three readers share since
+batch 173 (``HostNetworkMixin._monotonic_delta`` / ``_reset_problem``): a
+counter below its own baseline is missing evidence for that tick -- a
+collection error naming the reader, the port or netdev and the counter
+(``<counter> reset (<before> -> <value>); delta unknown``), no delta for the
+counter nor for the aggregate it feeds, the baseline re-armed from the new
+value -- never the clamped ``rdma_errors_delta=0`` that cleared the signal and
+let the continuing increase mint the same fault again. ``non_efa`` stays
+CAPABILITY_ABSENT: the site has no IB-only RDMA device.
 """
 
 from __future__ import annotations
@@ -73,6 +77,7 @@ from scripts.e2e.regional.general_live_efa_fixture import (
     negative_readings,
     netdev_target,
     real_counter,
+    reset_tick_readings,
     served_errors,
     state_target,
     unsupported_markers,
@@ -717,8 +722,10 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
     """A ramping counter reset below its baseline: not a decrement, not a new fault.
 
     Both readers ramp until their deltas mint one incident each, then fall to 1
-    and ramp on. The ethtool reader marks the reset UNKNOWN; the sysfs reader
-    clamps it to a 0 reading (the product gap this variant is expected to FAIL on).
+    and ramp on. The reset tick must read UNKNOWN on both: a ``_rdma`` /
+    ``_efa_network`` collection error naming the port or netdev, the counter
+    and ``delta unknown``, and no delta of the counter or its aggregate in
+    that batch -- the clamped 0 reading of the old ``_rdma`` is the FAIL.
     """
 
     run_survey(ctx)
@@ -802,6 +809,13 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
     ctx.hold(ctx.host_interval + 5, name="reset-settle")
     after = activity(ctx, started, metrics=metrics)
     sysfs_incidents = finding_incidents(after, ERRORS_METRIC, device=target.port_device)
+    sysfs_needles = (
+        "_rdma",
+        target.port_device,
+        str(target.counter),
+        "reset",
+        "delta unknown",
+    )
     stages: dict[str, list[str]] = {
         "fault_seen": []
         if finding_incidents(before, ERRORS_METRIC, device=target.port_device)
@@ -819,11 +833,18 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
         ],
         "sysfs_reset_unknown": (
             []
-            if collection_errors(after, target.port_device, "reset")
+            if collection_errors(after, *sysfs_needles)
             else [
-                f"no collection error names the {target.port_device} counter reset: "
-                "the sysfs reader did not mark the reset UNKNOWN"
+                f"no _rdma collection error names the {target.port_device} "
+                f"{target.counter} reset with 'delta unknown': the sysfs reader did "
+                "not mark the reset UNKNOWN"
             ]
+        )
+        + reset_tick_readings(
+            after,
+            sysfs_needles,
+            (ERRORS_METRIC, target.counter_metric),
+            target.port_device,
         )
         + [
             f"{ERRORS_METRIC}=0 shipped for {target.port_device} at the reset "
@@ -850,14 +871,29 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
                 f"the reset re-minted the fault: {len(ethtool_incidents)} {metric} incidents"
             ]
         )
+        ethtool_needles = (
+            "_efa_network",
+            interface,
+            ethtool[1],
+            "reset",
+            "delta unknown",
+        )
         stages["ethtool_reset_unknown"] = (
-            []
-            if collection_errors(after, "_efa_network", interface, "reset")
-            else [f"no collection error names the {interface} ethtool counter reset"]
-        ) + [
-            f"{metric}=0 shipped for {interface} at the reset (observed {item['observed_at']})"
-            for item in zero_readings(after, metric, interface, after=reset_at)
-        ]
+            (
+                []
+                if collection_errors(after, *ethtool_needles)
+                else [
+                    f"no _efa_network collection error names the {interface} "
+                    f"{ethtool[1]} reset with 'delta unknown'"
+                ]
+            )
+            + reset_tick_readings(after, ethtool_needles, (metric,), interface)
+            + [
+                f"{metric}=0 shipped for {interface} at the reset "
+                f"(observed {item['observed_at']})"
+                for item in zero_readings(after, metric, interface, after=reset_at)
+            ]
+        )
         stages["no_decrement"] += negative_readings(after, (metric,), interface)
     minted_incidents = list(sysfs_incidents)
     if ethtool is not None:
@@ -920,15 +956,6 @@ def _spec(
     )
 
 
-RESET_GAP = (
-    "src/gpu_fault/collectors/host/network.py HostNetworkMixin._rdma: a port counter "
-    "that falls below its baseline (a reset) is clamped by _delta to a 0 delta and "
-    "shipped as rdma_errors_delta=0 -- a reading that clears the active RDMA error "
-    "signal, that VALIDATE_FABRIC accepts as a clean port, and after which the next "
-    "real increase re-mints the same fault as a new incident; _ethtool_counters marks "
-    "the same case UNKNOWN (a collection error, no delta) and the sysfs reader must too"
-)
-
 VARIANTS = [
     _spec(
         "rdma_error",
@@ -989,13 +1016,14 @@ VARIANTS = [
         "counter_reset",
         "ramp the bound port counter and the ethtool group counter until each mints its "
         "WARNING, reset both to 1 and ramp on",
-        "no negative delta, one incident per reader (a reset is not a new fault), the reset "
-        "tick UNKNOWN (a collection error, no 0 reading that clears the signal); no hardware",
+        "no negative delta, one incident per reader (a reset is not a new fault); the reset "
+        "tick is UNKNOWN on both readers: a _rdma / _efa_network collection error naming "
+        "the port or netdev, the counter and 'delta unknown', with no rdma_errors_delta, "
+        "rdma_<counter>_delta or efa_*_errors_delta reading in that batch and never a "
+        "clamped 0; the ramp is measured from the new baseline afterwards; no hardware",
         counter_reset,
         risk="M",
         max_minutes=30,
-        outcome="FAIL",
-        gap=RESET_GAP,
     ),
     deferred_variant(
         CASE,
@@ -1012,7 +1040,6 @@ VARIANTS = [
 
 __all__ = [
     "CASE",
-    "RESET_GAP",
     "VARIANTS",
     "cq_error",
     "counter_reset",

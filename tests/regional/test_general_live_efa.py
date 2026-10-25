@@ -307,16 +307,16 @@ def test_registry_covers_every_010_variant() -> None:
         )
 
         assert spec.flags == "S", spec.key
-    reset = SPECS["counter_reset"]
-    assert reset.expected_outcome == "FAIL"
-    assert "_rdma" in reset.product_gap and "_ethtool_counters" in reset.product_gap
-    assert all(
-        (
-            spec.expected_outcome == "PASS"
-            for spec in efa.VARIANTS
-            if spec.variant != "counter_reset"
-        )
-    ), "every variant but counter_reset is expected to PASS"
+    # Batch 173 closed the sysfs/netdev counter-reset gap: counter_reset reads
+    # the shared reset rule on the product's records and expects PASS like the
+    # rest; no 010 variant names a product gap any more.
+    assert all(spec.expected_outcome == "PASS" for spec in efa.VARIANTS), (
+        "every 010 variant is expected to PASS"
+    )
+    assert all(spec.product_gap == "" for spec in efa.VARIANTS), (
+        "no 010 variant carries a product gap"
+    )
+    assert "delta unknown" in SPECS["counter_reset"].expected
 
 
 # --------------------------------------------------------------------------- #
@@ -1002,51 +1002,69 @@ def test_missing_counter_withdraws_a_real_counter_and_reads_not_supported(
 # --------------------------------------------------------------------------- #
 # counter reset
 # --------------------------------------------------------------------------- #
-def _reset_doc(*, fixed: bool, with_ethtool: bool = True) -> dict[str, Any]:
+SYSFS_RESET_ERROR = (
+    f"_rdma: HostObservationError: {PORT_DEVICE}: rx_drops reset (5007 -> 1); "
+    "delta unknown"
+)
+ETHTOOL_RESET_ERROR = (
+    f"_efa_network: HostObservationError: {IFACE}: gfrs_rnr_err reset (5000 -> 1); "
+    "delta unknown"
+)
+
+
+def _reset_doc(
+    *, fixed: bool, with_ethtool: bool = True, reset_tick_reading: bool = False
+) -> dict[str, Any]:
+    """The product's records of a ramp -> reset -> ramp on both readers.
+
+    ``fixed``: the reset tick is a batch carrying only the two readers'
+    collection errors (batch 173); the ramp batches before and after carry
+    the deltas. Otherwise the old ``_rdma`` clamp: no sysfs error, a
+    ``rdma_errors_delta=0`` reading at the reset and the fault minted again.
+    ``reset_tick_reading`` puts a port delta into the fixed reset tick batch --
+    a delta measured against a stale baseline, which the rule forbids.
+    """
+
     inc, wf = diagnostic(fx.ERRORS_METRIC, PORT_DEVICE, tag="r")
     incidents, workflows = [inc], [wf]
     if with_ethtool:
         einc, ewf = diagnostic("efa_rnr_errors_delta", IFACE, tag="e")
         incidents.append(einc)
         workflows.append(ewf)
-    errors: list[str] = []
-    samples = [
+    ramp = [
         sample(fx.ERRORS_METRIC, 1000, PORT_DEVICE),
         sample("rdma_rx_drops_delta", 1000, PORT_DEVICE),
         sample("efa_rnr_errors_delta", 1000, IFACE),
     ]
+    batches = [batch(list(ramp), observed_at=future(30))]
     if fixed:
-        errors = [
-            f"_rdma: HostObservationError: {PORT_DEVICE}: rx_drops reset (5007 -> 1); delta unknown",
-            f"_efa_network: HostObservationError: {IFACE}: gfrs_rnr_err reset (5000 -> 1); delta unknown",
-        ]
+        errors = [SYSFS_RESET_ERROR] + ([ETHTOOL_RESET_ERROR] if with_ethtool else [])
+        reset_tick = (
+            [sample("rdma_rx_drops_delta", 5, PORT_DEVICE)]
+            if reset_tick_reading
+            else []
+        )
+        batches.append(batch(reset_tick, errors=tuple(errors), observed_at=future(60)))
     else:
-        samples.append(sample(fx.ERRORS_METRIC, 0, PORT_DEVICE))
         second, second_wf = diagnostic(fx.ERRORS_METRIC, PORT_DEVICE, tag="r2")
         incidents.append(second)
         workflows.append(second_wf)
-        errors = [
-            f"_efa_network: HostObservationError: {IFACE}: gfrs_rnr_err reset (5000 -> 1); delta unknown"
-        ]
-    return doc(
-        incidents=incidents,
-        workflows=workflows,
-        batches=[batch(samples, errors=tuple(errors))],
-    )
+        batches.append(
+            batch(
+                [sample(fx.ERRORS_METRIC, 0, PORT_DEVICE)],
+                errors=(ETHTOOL_RESET_ERROR,) if with_ethtool else (),
+                observed_at=future(60),
+            )
+        )
+    batches.append(batch(list(ramp), observed_at=future(90)))
+    return doc(incidents=incidents, workflows=workflows, batches=batches)
 
 
-def test_counter_reset_shows_the_sysfs_clamp_gap_and_passes_once_fixed(
+def test_counter_reset_passes_on_the_reset_rule_and_fails_on_the_old_clamp(
     tmp_path: Path,
 ) -> None:
-    result, source = run("counter_reset", tmp_path, records=_reset_doc(fixed=False))
-    assert result["verdict"] == "FAIL", result
-    stages = result["stages"]
-    assert stages["sysfs_reset_unknown"] and stages["sysfs_single_incident"], stages
-    assert (
-        stages["ethtool_reset_unknown"] == []
-        and stages["ethtool_single_incident"] == []
-    )
-    assert stages["no_decrement"] == [] and stages["fault_seen"] == []
+    result, source = run("counter_reset", tmp_path, records=_reset_doc(fixed=True))
+    assert result["verdict"] == "PASS", result["errors"]
     values = [call[call.index("--value") + 1] for call in calls(source, "set-value")]
     assert "1" in values and values.index("1") > 0, (
         "the counter is reset to 1 after ramping"
@@ -1058,11 +1076,48 @@ def test_counter_reset_shows_the_sysfs_clamp_gap_and_passes_once_fixed(
     assert all((int(value) >= 1 for value in values)), (
         "the ramp never writes a value below 1"
     )
-    result, _source = run("counter_reset", tmp_path, records=_reset_doc(fixed=True))
-    assert result["verdict"] == "PASS", result["errors"]
-    assert SPECS["counter_reset"].expected_outcome == "FAIL", (
-        "a PASS here means the product gap named in the registry is closed"
+    # The old sysfs clamp: no _rdma reset error, a 0 reading, the fault re-minted.
+    result, _source = run("counter_reset", tmp_path, records=_reset_doc(fixed=False))
+    assert result["verdict"] == "FAIL", result
+    stages = result["stages"]
+    assert stages["sysfs_reset_unknown"] and stages["sysfs_single_incident"], stages
+    joined = "\n".join(stages["sysfs_reset_unknown"])
+    assert "did not mark the reset UNKNOWN" in joined and "=0 shipped" in joined
+    assert (
+        stages["ethtool_reset_unknown"] == []
+        and stages["ethtool_single_incident"] == []
     )
+    assert stages["no_decrement"] == [] and stages["fault_seen"] == []
+
+
+def test_counter_reset_fails_on_a_delta_shipped_in_the_reset_tick(
+    tmp_path: Path,
+) -> None:
+    result, _source = run(
+        "counter_reset",
+        tmp_path,
+        records=_reset_doc(fixed=True, reset_tick_reading=True),
+    )
+    assert result["verdict"] == "FAIL", result
+    assert any(
+        "rdma_rx_drops_delta=5" in error and "reset tick batch" in error
+        for error in result["stages"]["sysfs_reset_unknown"]
+    ), result["stages"]
+
+
+def test_counter_reset_needs_the_error_to_name_the_counter(tmp_path: Path) -> None:
+    records = _reset_doc(fixed=True)
+    for item in records["batches"]:
+        item["collection_errors"] = [
+            error.replace("rx_drops reset", "error counter total reset")
+            for error in item["collection_errors"]
+        ]
+    result, _source = run("counter_reset", tmp_path, records=records)
+    assert result["verdict"] == "FAIL", result
+    assert any(
+        "rx_drops reset with 'delta unknown'" in error
+        for error in result["stages"]["sysfs_reset_unknown"]
+    ), result["stages"]
 
 
 def test_counter_reset_skips_the_ethtool_half_without_a_netdev(tmp_path: Path) -> None:
