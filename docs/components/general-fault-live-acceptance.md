@@ -219,13 +219,23 @@ FAIL）：两节点仍各自产出诊断链（FREEZE_EVIDENCE → VALIDATE_HOST�
 QUARANTINE、MOUNT_MISSING）判定，把共享存储状况变成坏节点结论并掩盖 005 要揭示的缺口。
 测试 export 由 `shared_export_fixture.py` 提供：每个 export 一个 Pod
 （`gfrs-export-<digest>-<a|b>`，用户态 NFSv4 服务 NFS-Ganesha / VFS FSAL，导出一个 256 MiB 的
-内存 `emptyDir`——其 `sizeLimit` 即全部容量，`Root_Squash` + 1777 目录，`activeDeadlineSeconds`
-为集群侧 deadman，按 UID 前提删除，调度到客户端节点之外或由 `--export-node` 指定）加其
-`ganesha.conf` ConfigMap。客户端由 `probes/general_live_shared_probe.py` 在 PID 1 的挂载命名空间
-以 `vers=4.1,soft,timeo=100,retrans=2,actimeo=2` 挂到 `/mnt/gfrs-live/<digest>/shared`：
+内存 `emptyDir`——其 `sizeLimit` 即全部容量，`Root_Squash` + `chmod 1777` **且** `chown 65534:65534`
+的 export 根目录（镜像实测：`fs.protected_regular>=1` 下被 squash 的 root 对 root 属主 sticky 目录的
+`open(O_WRONLY|O_CREAT)` 在客户端即被拒 EACCES，只留下 0 字节文件），`Attr_Expiration_Time = 1` 写在
+EXPORT 块（NFS-Ganesha 4.3 在 MDCACHE 块报 Unknown parameter），`NFS_KRB5 { Active_krb5 = false; }`
+消去启动 CRIT；`activeDeadlineSeconds` 为集群侧 deadman，按 UID 前提删除，调度到客户端节点之外或由
+`--export-node` 指定）加其 `ganesha.conf` ConfigMap。本站镜像：
+`514385905925.dkr.ecr.us-west-2.amazonaws.com/gfrs-test/nfs-ganesha@sha256:d354efdc8364e4ba17b83c4aa27cdef4001a474fc950b07547e7fcf9d1e14d7f`
+（Ubuntu 24.04 + NFS-Ganesha 4.3：`/usr/bin/ganesha.nfsd`、`/usr/lib/x86_64-linux-gnu/ganesha/libfsalvfs.so`，
+`/bin/sh` 为 dash，入口脚本按 POSIX sh 书写）。客户端由 `probes/general_live_shared_probe.py` 在
+PID 1 的挂载命名空间以 `vers=4.1,soft,timeo=100,retrans=2,actimeo=2` 挂到
+`/mnt/gfrs-live/<digest>/shared`（节点作用域；清理 `umount` **并** `rmdir`，产品据此遗忘该挂载）：
 deadman 与记录先于挂载，`systemd-run --on-active` deadman 级联 `umount`/`-f`/`-l`，有界
-`statvfs`、写/fsync/回读证明与填充读数都经 `nsenter` 在宿主命名空间执行。挂起 = 对 ganesha
-子进程 `SIGSTOP`（内核仍接受 TCP 而无应答，statvfs 超时），`SIGCONT` 以同一组文件句柄恢复、
+`statvfs`、写/fsync/回读证明与填充读数都经 `nsenter` 在宿主命名空间执行。注意 `soft` 选项**不是**
+读数的上界：镜像实测挂起的 export 在 185 s 内未让 statvfs 失败、125 s 内未让写失败（NFSv4.1
+会话持续重试），真正限定每次读数的是读取方自己的线程 deadline（产品每次调用 5 s、探针的工作线程
+`timed_out`），`soft` 只保证彻底消失的 export 不会永久挂住线程。挂起 = 对 ganesha
+子进程 `SIGSTOP`（内核仍接受 TCP 而无应答，statvfs 不返回），`SIGCONT` 以同一组文件句柄恢复、
 无需重挂（内核 nfsd 无法这样挂起，故用用户态服务）。判定只读产品记录：
 `stat_timeout`/`healthy_other_mount`/`recovery`（`shared_filesystem_unavailable`=1 →
 FREEZE_EVIDENCE、VALIDATE_HOST 在该指标上失败、无隔离/硬件步骤；挂起期间其他主机指标仍到达
@@ -236,9 +246,13 @@ FREEZE_EVIDENCE、VALIDATE_HOST 在该指标上失败、无隔离/硬件步骤�
 `shared_filesystem_unavailable`=1 `failure_mode=MOUNT_MISSING` 且 `source` 指向测试 export，诊断链后
 `nfs-remount` 清零；清理时 `cleanup --kind nfs-shared` 删除目录使产品遗忘）与 `io_only_failure`
 （服务端 `chmod 000` export 根：statvfs 正常而 open/read/fsync EACCES，产品的目录项读取报
-`IO_ERROR`+errno 或 `IO_TIMEOUT`，`chmod 1777` 后清零）预期 PASS；`shared_failure_domain`（两节点各自成
-独立 NODE_HEALTH incident，无记录把同一 export 关联为共同故障域）仍按产品缺口注册
-`expected_outcome=FAIL`，产品补齐后自动转 PASS。全部变体需
+`IO_ERROR`+errno 或 `IO_TIMEOUT`，`chmod 1777` 后清零）预期 PASS；`shared_failure_domain`（批次 177 后
+预期 PASS，原产品缺口已关闭）：挂起前两客户端的基线样本必须带同一个 `source`（缺标签或两节点
+`source` 不同记 `NOT_RUN(FIXTURE_NOT_READY)`，无从关联）；两节点都出 finding 后重读两节点记录，要求
+恰有一条 `event_type=SHARED_STORAGE_FAILURE_DOMAIN` incident（`policy_reference=shared-filesystem:<source>`，
+`node_ids` 含两节点，无 workflow/`effective_action`，首条 reason 写明 export 与两节点、每节点一行
+`member <node>: incident <id>`），两节点 incident 各带 `common failure domain <id>:` 回指 reason，恰一封
+`SHARED_STORAGE_FAILURE_DOMAIN` 通知；两节点诊断链仍只诊断；恢复后该记录须 `RECOVERED`。全部变体需
 `--approve KERNEL_MODULE_LOAD`（缺 `nfsv4` 时加载并在清理时卸载）；`shared_failure_domain`
 标志 `X` 并要求 `--node-b`（EKS 的两个 GPU 节点同时作客户端，export 调度到两者之外）。
 站点前提：`--export-image` 或 `GPU_FAULT_GENERAL_LIVE_EXPORT_IMAGE` 指向带 `ganesha.nfsd` 与
@@ -518,6 +532,20 @@ NaN只停止匹配attempt并要求人工验证checkpoint，不自动恢复不可
 新旧Pod UID、有效训练进度和预算记录。用户/本系统停止不可递归自动重启。
 缺allocation和旧attempt终态不能控制新任务。控制面失联变体只阻断测试watcher的目标
 访问且有恢复保底，验证紧急停止/重试无重复动作；清理orphan Pod和测试网络隔离。
+本站实现（`general_live_attempts.py`）：`old_terminal` 用受管任务模式 `exit_once`——首个 attempt
+30 s 后非零退出，产品 RESTART_WORKLOAD 复制出的新任务其 Pod 经 downward API 读自己的
+`gpu-fault.io/attempt-id` 标签（产品派生的 `-r-` id）而持续运行；待产品的 RESTART_WORKLOAD 执行记下
+`restart_attempt_id` 并经过一个 watcher 周期后，`TERMINAL_REPLAY_PROBE` 在 API Pod 内读出产品**自己
+记录**的旧 attempt TerminalEvent 并经 `CompletionService.handle_terminal`（`/v1/attempts/terminal`
+路由同一入口）重投（不手造任何终态，只对 `gl28` 前缀的测试 attempt）。PASS 要求：重投返回原决策
+（status/recovery_plan_id/event_key 相同）且 `duplicate=true`；旧 attempt 恰一个 RESTART_WORKLOAD
+工作流、预算只扣一次；新 attempt 无 terminal、decision 与 containment。无决策、无新 attempt 或无已记录
+终态记 INCONCLUSIVE。`missing_allocation` 记 `NOT_RUN(FIXTURE_NOT_READY)`：Kubernetes 上 watcher 的
+allocation 来自每个已终止关键容器的 `spec.nodeName`（`completion_pod_parsing` →
+`watcher._terminal_event`），已终止的容器必有节点，无 Pod 的 FAILED 工作负载到不了终态，故 watcher 观察
+到的终态必带 allocation；只有手造 TerminalEvent POST 到 `/v1/attempts/terminal` 才可能缺它，而规格与
+本 lane 规则都禁止手造终态；产品路径（`service._decide` → `planner.from_missing_allocation`）由软件测试
+覆盖。
 
 ### GF-GENERAL-LIVE-029
 
@@ -883,8 +911,8 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   任何 STOP 或隔离为 FAIL。
 - 005 全部七个变体（native）：自带的测试 NFSv4 export 夹具（`shared_export_fixture.py`
   服务端 Pod + `probes/general_live_shared_probe.py` 客户端挂载），需
-  `KERNEL_MODULE_LOAD`；`mount_disappears`/`io_only_failure`/`shared_failure_domain` 按产品
-  缺口预期 FAIL，详见 GF-GENERAL-LIVE-005 节。
+  `KERNEL_MODULE_LOAD`；七个变体均预期 PASS（`mount_disappears`/`io_only_failure` 由批次 176、
+  `shared_failure_domain` 由批次 177 关闭缺口），详见 GF-GENERAL-LIVE-005 节。
 - 007 `healthy`（observation：只读确认真实 SMART 判定健康且不产生存储 finding，
   作为失败变体的对照基线）。
 - 007 SMART 的回放变体 `health_failed`/`query_failed`/`scan_failed`/`malformed_json`/
@@ -937,10 +965,16 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   host collector 单元后加 5000，产品记录须出现同端口 `rdma_errors_delta` 与
   `rdma_<counter>_delta` ≥ 5000（计数器在产品读数里确实增长才算正向）→ WARNING
   RUN_DIAGNOSTICS → FREEZE_EVIDENCE + VALIDATE_FABRIC 实际执行（失败须点名该指标）、端口仍被
-  观察、无硬件动作/隔离；`link_inactive` bind 端口 `state` 为 `1: DOWN`（phys_state 真实）→
-  `rdma_link_down=1` → VALIDATE_FABRIC 在故障持有期间必须失败并点名该指标，共现的
-  `efa_inventory_mismatch` 只允许 `LINK_INACTIVE`（只诊断不 reboot），关窗后须有新的
-  `rdma_link_down=0` 读数且 incident 收敛；`rnr`/`retry`/`cq_error` 让经审查的 `ethtool`
+  观察、无硬件动作/隔离；`link_inactive` bind 端口 `state` 为 `1: DOWN`（phys_state 真实），且只
+  持有一个**有界曝光期**——窗口自己的 deadman 在开窗后 1.7 个采集周期（15 s 周期为 26 s，
+  `general_live_source_replay.bounded_exposure_seconds`）关窗：第一拍出 `rdma_link_down` WARNING，
+  第二拍是其 VALIDATE_FABRIC 判定的新鲜读数（在持有的端口上 FAILED，并点名该指标）同时确认共现的
+  `efa_inventory_mismatch` `LINK_INACTIVE`，第三拍已读回真实树。批次 175 起该共现项的诊断按新鲜读数
+  判定、对仍不活动的端口按设计升级 REBOOT_NODE，故曝光期把它只留给已恢复的端口：其 VALIDATE_FABRIC
+  须 SUCCEEDED、incident RECOVERED、不得等待 `missing_inventory_action_completion`、无 RESTART_NODE；
+  产品在恢复后才判定链路（SUCCEEDED 时间晚于恢复）、恢复后仍有不活动读数（上界未守住）或窗口内无
+  `rdma_link_down` 样本记 INCONCLUSIVE；关窗后须有新的 `rdma_link_down=0` 读数且 incident 收敛；
+  `rnr`/`retry`/`cq_error` 让经审查的 `ethtool`
   透传包装器对 EFA 设备所属 netdev 的 `-S` 输出先以 0 再以 5000 提供一个带对应 token 的
   计数器（真实同 token 计数器优先，否则测试名 `gfrs_<token>_err`），
   `efa_<group>_errors_delta` → WARNING → 只诊断、不推导坏卡；`missing_counter` 先提供后撤回
@@ -950,10 +984,14 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   采集错误（UNKNOWN）、无零 delta、不误判 NO_STATISTICS、无 finding，包装器审计日志证明产品
   确实发出该查询并得到该失败；`counter_reset` 在同一窗口让 sysfs 计数器与 ethtool 计数器每半个
   采集周期递增直到各自出 WARNING，再归 1 继续递增：无负 delta、每个读取器只有一个 incident
-  （重置不是新故障）、重置那一拍记 UNKNOWN 而不是会清除信号的 0 读数。`counter_reset`
-  登记为 expected FAIL（product_gap）：`collectors/host/network.py` `_rdma` 把低于基线的
-  计数器夹成 0 delta 并作为 `rdma_errors_delta=0` 读数上报，`_ethtool_counters` 对同一情形
-  记 UNKNOWN。若节点上没有任何 EFA 功能拥有 netdev，夹具树给第一个 EFA 设备附上节点一个真实
+  （重置不是新故障）、重置那一拍记 UNKNOWN 而不是会清除信号的 0 读数。批次 173 后三个计数读取器
+  共用一条重置规则（`collectors/host/network.py` `_monotonic_delta`/`_reset_problem`），`counter_reset`
+  预期 PASS 并据此判定：每个读取器一条采集错误点名读取器（`_rdma`/`_efa_network`）、端口或 netdev、
+  下降的计数器名与 `delta unknown`，且该拍的 batch 里没有该计数器 delta 及其聚合
+  （`rdma_errors_delta`/`rdma_<counter>_delta`/`efa_<group>_errors_delta`）的任何读数，之后从新基线
+  续测；旧的夹成 0 读数即 FAIL。009 `counter_reset`（重建丢包接口）同样要求 `_network` 采集错误点名
+  接口、计数器与 `delta unknown`、该拍无 `network_drops_delta` 读数、无 finding；接口重建跨越了一拍
+  致基线被清（既无错误也无读数）记 INCONCLUSIVE。若节点上没有任何 EFA 功能拥有 netdev，夹具树给第一个 EFA 设备附上节点一个真实
   物理 netdev（`build-infiniband-fixture --netdev`，netdev 本身不改动）以便产品的 ethtool
   路径有读数可回放，证据记 `netdev_source: fixture`。清理关窗后用只读 `read-source` 核对
   单元与 PID 1 读到同一真实 sysfs 值且不等于夹具值。`non_efa` 仍为 CAPABILITY_ABSENT。
@@ -996,13 +1034,16 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   （两次读取都失败，规格标注的已知风险）。PASS：collection error 含
   `could not be read` 与 `unknown as well`；`failure_mode=INVENTORY_UNAVAILABLE` 且
   **无** `discovered_count`、无 `gpu_inventory_discovered_count` 样本；其余同上。
-- 012 `expectation_wrong`（`risk H`，`X`，另需 `--approve NODE_REBOOT`，
-  `expected_outcome=FAIL`）：在单元环境把 `GPU_FAULT_EXPECTED_GPU_COUNT` 覆盖为产品记录的
-  期望数 +1；产品记录两次该期望或产出 finding 后立刻关窗。规格要求把它当期望（配置）
-  问题而非真掉卡；当前产品在两个 tick 后产出 `gpu_inventory_mismatch` CRITICAL
-  REBOOT_NODE 且无任何控制面路径用 `node_instance_type`/`gpu_inventory_discovered_count`
-  复核 `expected_count`，故该变体在缺口修复前记 FAIL，且其 REBOOT 链会真实重启节点
-  （运行器只等待其结束，不取消；放在车道最后执行）。
+- 012 `expectation_wrong`（`risk M`，`S`，仅需 `HOST_SOURCE_REPLAY`，预期 PASS——批次 174 关闭了
+  原缺口，不再需要 `NODE_REBOOT`）：在单元环境把 `GPU_FAULT_EXPECTED_GPU_COUNT` 覆盖为产品记录的
+  期望数 +1；产品对该覆盖产出 finding（矛盾项，或旧行为的 mismatch）或记录两次后立刻关窗。
+  控制面 `host_health.gpu_inventory_verdicts` 先按实例类型清单复核：清单内机型、节点列出的 GPU 数等于
+  机型数且驱动绑定数一致时，mismatch 复读为 0，另记 `gpu_expected_count_contradicted` WARNING /
+  COLLECT_EVIDENCE。PASS 要求：无 `gpu_inventory_mismatch` incident；恰一条
+  `gpu_expected_count_contradicted` incident，`effective_action=COLLECT_EVIDENCE`、工作流只有
+  FREEZE_EVIDENCE，reason 写明配置数、实例类型及其 GPU 数、列出数与驱动绑定数；恰一封
+  `OPERATOR_REVIEW` 通知；无 RESTART_NODE/隔离；关窗后真实期望数读回。产品从未记录该覆盖记
+  INCONCLUSIVE。
 - `VENDOR_LAB_ONLY`：012 `confirmed_missing`/`reboot_verified`/`post_reboot_failure`
   需要真实掉卡与已批准的 provider reboot；本 lane 绝不解绑或移除真实 GPU。
 
@@ -1307,19 +1348,24 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
   `EFA inventory observation unavailable: missing or ambiguous RDMA driver identity`，
   无任何 EFA 计数/mismatch 样本、无 finding、无 reboot、无隔离。`excess_device`：复制该设备
   为 `gfrs-excess0` → `failure_mode=EXCESS_DEVICE` → RUN_DIAGNOSTICS（FREEZE_EVIDENCE +
-  VALIDATE_FABRIC）；finding 出现后立刻关窗，PASS 要求验证器确实执行、无硬件/隔离步骤、
-  恢复满数；该诊断链的 VALIDATE_FABRIC 带 `inventory_requirements_by_node` 却没有前置
-  恢复动作，只能 `missing_inventory_action_completion` 等到步骤 deadline
-  （`GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS`，默认 600 s）后 FAILED、incident 记
-  diagnostic inconclusive，EXCESS_DEVICE 无升级。`link_inactive`（`risk H`，`X`，另需
-  `--approve NODE_REBOOT`，`expected_outcome=FAIL`）：该设备一个端口 `state`/`phys_state`
-  改为 `1: DOWN`/`3: Disabled` → `failure_mode=LINK_INACTIVE` → RUN_DIAGNOSTICS，finding
-  出现后立刻关窗恢复链路；PASS 要求先诊断（首个工作流只有 VALIDATE_FABRIC、无硬件/隔离）、
-  诊断在恢复后的链路上得出 SUCCEEDED、无 RESTART_NODE。当前产品把该 VALIDATE_FABRIC 标为
-  `failure_escalation_action=REBOOT_NODE`（按设计“先诊断再升级”），但同一步骤因上述
-  `missing_inventory_action_completion` 永不重读端口状态、deadline 后 FAILED 即升级到
-  RESTART_NODE——端口已 ACTIVE 仍会重启，故记为产品缺口；运行器等待该链结束（含重启），
-  放在车道最后执行。
+  VALIDATE_FABRIC）；finding 出现后立刻关窗。批次 175 起诊断链的 VALIDATE_FABRIC 按链到达该步后的
+  新鲜库存读数判定并把所依据的读数写进 `details.inventory_evidence`：读到恢复后的满数即 SUCCEEDED，
+  仍读到多余设备即 FAILED（EXCESS_DEVICE 无升级，`escalate_failed_hardware_remediation` 不规划任何
+  步骤，incident 记 diagnostic inconclusive 后 RECOVERED）；PASS 接受两种已结论的判定，并要求
+  `inventory_evidence` 在、任何验证不得等待 `missing_inventory_action_completion`、无硬件/隔离步骤、
+  incident RECOVERED、恢复满数。`link_inactive`（`risk M`，`S`，仅需 `HOST_SOURCE_REPLAY`，预期
+  PASS——原缺口已由批次 175 关闭，不再需要 `NODE_REBOOT`）：该设备一个端口 `state`/`phys_state`
+  改为 `1: DOWN`/`3: Disabled` → `failure_mode=LINK_INACTIVE` → RUN_DIAGNOSTICS。因该链的
+  VALIDATE_FABRIC 对仍不活动的端口按设计升级 REBOOT_NODE，端口只曝光一个**有界曝光期**：树窗口
+  自己的 deadman 在开窗后 1.7 个采集周期（15 s 周期为 26 s）关窗——在确认缺口、产出 finding 的
+  第二拍之后、第三拍之前——使诊断只读到恢复后的端口，而不靠运行器轮询（20 s 存储轮询加两次探针
+  往返追不上 15 s 的拍）；运行器随后的关窗只是确认（`closed_by: deadman`，deadman 迟到则自己关并
+  记 `runner`）。PASS 要求先诊断（首个工作流只有 FREEZE_EVIDENCE + VALIDATE_FABRIC、无硬件/隔离）、
+  该 VALIDATE_FABRIC SUCCEEDED 且 `details.inventory_evidence[<node>][efa_inventory_active_count]`
+  为恢复后观测到的满数、无验证等待 `missing_inventory_action_completion`、incident RECOVERED、
+  无 RESTART_NODE、恢复满数。曝光期内未出 finding（两拍未都落在窗口内），或恢复后仍记录到
+  `efa_inventory_missing_count>=1`（上界未守住，此时产品对新鲜不活动证据的升级是设计所为）记
+  INCONCLUSIVE，不是对产品的判定。
 - 013 `pci_missing`（`risk H`，`X`，两个集群，`--approve HOST_SOURCE_REPLAY NODE_REBOOT`，
   模块 `general_live_efa_pci.py`，`expected_outcome=PASS`）：先做规格要求的反向阶段——
   `build-pci-fixture --unreadable` 把夹具路径建成普通文件并以 `pci-root` 重指入 host collector

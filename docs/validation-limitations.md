@@ -1335,8 +1335,17 @@ inventory (the probe's read-only `inventory`: driver identity, owned netdevs,
 port states, every `counters`/`hw_counters` file, the real `ethtool -S` names)
 and replaces exactly one reading inside the host collector unit: a real port
 counter file bound at its real value and stepped (`rdma_error`), the port
-`state` bound to `1: DOWN` (`link_inactive`: VALIDATE_FABRIC must fail on the
-held port, an `efa_inventory_mismatch` co-finding may only be LINK_INACTIVE),
+`state` bound to `1: DOWN` for a bounded exposure (`link_inactive`: the
+window's own deadman closes it 1.7 collector intervals after it opened --
+`general_live_source_replay.bounded_exposure_seconds`, 26 s at 15 s ticks --
+so the first tick mints the `rdma_link_down` WARNING, the second is the fresh
+reading its VALIDATE_FABRIC must fail on and the one that confirms the
+`efa_inventory_mismatch` LINK_INACTIVE co-finding, and no third tick sees the
+port down; since batch 175 the co-finding's diagnostic judges fresh readings
+and would escalate a port still inactive to REBOOT_NODE by design, so it only
+ever sees the restored port: SUCCEEDED, RECOVERED, no RESTART_NODE; a link
+verdict reached after the restore, an inactive reading after it or no
+`rdma_link_down` sample inside the window are INCONCLUSIVE),
 or the reviewed `ethtool` wrapper serving, withdrawing or failing a group
 counter on the netdev an EFA function owns (`rnr`/`retry`/`cq_error`,
 `missing_counter` -> `efa_ethtool_counters_unsupported` MISSING_COUNTER,
@@ -1346,10 +1355,16 @@ an EFA device (`netdev_source: fixture`) so the product's ethtool path has a
 reading to replay; the netdev itself is untouched. Cleanup closes the window
 and `read-source` proves the unit reads the real sysfs value again.
 `counter_reset` ramps both readers past their WARNING, resets them below the
-baseline and ramps on; it is an expected FAIL: `HostNetworkMixin._rdma` clamps
-a counter that fell below its baseline to a 0 delta and ships
-`rdma_errors_delta=0` as a reading (clearing the signal, re-minting a
-continuing fault), while `_ethtool_counters` marks the same case UNKNOWN. 011
+baseline and ramps on; since batch 173 (one reset rule for the three readers,
+`HostNetworkMixin._monotonic_delta` / `_reset_problem`) it expects PASS and
+asserts the rule: per reader a collection error naming the reader (`_rdma` /
+`_efa_network`), the port or netdev, the counter that fell and `delta unknown`,
+no reading of that counter's delta or its aggregate (`rdma_errors_delta`,
+`rdma_<counter>_delta`, `efa_<group>_errors_delta`) in that batch, one incident
+per reader, no negative delta and never a clamped 0 after the reset. 009
+`counter_reset` (the drop interface deleted and recreated) grades the same way
+on `_network` and `network_drops_delta`, and is INCONCLUSIVE when the recreate
+straddled a tick and the baseline was pruned (neither an error nor a reading). 011
 `broken_pair` (`general_live_nccl_pair.py`, HyperPod lane) uses the same bind
 on one port's `hw_counters/tx_bytes` around a real two-node stall: while broken
 the product must record `efa_traffic_observation_valid=0` with no rate and
@@ -1380,11 +1395,18 @@ be enabled for a test); each is judged on the product's own records --
 failure-mode context and a collection error, never a zero count, a healthy
 value, a finding or a hardware step -- with the wrapper's journal as the
 raw-source oracle. `expectation_wrong` (the recorded expected GPU count plus
-one in the unit's environment) is registered `expected_outcome=FAIL`: the
-product grades a wrong expectation as a missing GPU (CRITICAL REBOOT_NODE
-after two ticks) with no reconciliation against `node_instance_type` or the
-driver's bound count, so it needs `NODE_REBOOT` and really reboots the node
-while the gap is present. The spec's other expected product gaps are recorded
+one in the unit's environment) expects PASS since batch 174 and needs
+`HOST_SOURCE_REPLAY` alone (`S`, risk M): the control plane re-reads every
+`gpu_inventory_mismatch` against its instance table and, with the node listing
+exactly the type's GPUs and the driver-bound count agreeing, grades the
+configured count as a `gpu_expected_count_contradicted` WARNING /
+COLLECT_EVIDENCE. The window closes as soon as the product minted a finding on
+the override; PASS is no `gpu_inventory_mismatch` incident, one contradiction
+incident with a FREEZE_EVIDENCE-only workflow and `effective_action`
+COLLECT_EVIDENCE whose reason names the configured count, the instance type and
+its count, the listed and the bound count, exactly one OPERATOR_REVIEW
+notification, no RESTART_NODE or isolation, and the real expectation read back;
+an override the product never recorded is INCONCLUSIVE. The spec's other expected product gaps are recorded
 in the variants' reasons rather than hidden. Of the three closed in the product,
 the failed SMART scan and the failed drive query are now proven live by 007
 `scan_failed` / `query_failed` (`smart_query_failed` plus a collection error,
@@ -1401,11 +1423,27 @@ unopenable drive and a hung drive query stay software-tested.
 brings a disposable test export (`shared_export_fixture.py`: one Pod per export
 running a userspace NFSv4 server, NFS-Ganesha over a 256 MiB memory-backed
 `emptyDir` whose `sizeLimit` is the whole capacity, `activeDeadlineSeconds` as
-the cluster-side deadman, deleted by UID precondition) and mounts it `soft` on
-the client node in PID 1's mount namespace through
+the cluster-side deadman, deleted by UID precondition; the export root is
+`chmod 1777` and `chown 65534:65534` -- with `fs.protected_regular >= 1` a
+squashed root's `open(O_WRONLY|O_CREAT)` in a root-owned sticky directory is
+refused EACCES client-side, leaving 0-byte files, the image smoke test's first
+symptom -- `Attr_Expiration_Time` sits in the EXPORT block, which NFS-Ganesha
+4.3 reads it from, and `NFS_KRB5 { Active_krb5 = false; }` silences the
+start-up CRIT; the site image is
+`514385905925.dkr.ecr.us-west-2.amazonaws.com/gfrs-test/nfs-ganesha@sha256:d354efdc8364e4ba17b83c4aa27cdef4001a474fc950b07547e7fcf9d1e14d7f`,
+Ubuntu 24.04 with NFS-Ganesha 4.3, `/usr/bin/ganesha.nfsd`,
+`/usr/lib/x86_64-linux-gnu/ganesha/libfsalvfs.so` and dash as `/bin/sh`) and
+mounts it `soft` on the client node in PID 1's mount namespace through
 `probes/general_live_shared_probe.py` (record and `systemd-run --on-active`
 deadman before the mount, `umount`/`-f`/`-l` cascade, bounded `statvfs` and
-write/fsync/read-back readings in the host namespace). The product has no
+write/fsync/read-back readings in the host namespace; the mount is
+node-scoped under `/mnt/gfrs-live/<digest>/` and its cleanup unmounts and
+removes the directory, which makes the product forget it). The `soft` option
+is not what bounds a reading: the smoke test saw a paused export fail neither
+`statvfs` within 185 s nor writes within 125 s under `soft,timeo=100,retrans=2`
+(the NFSv4.1 session keeps retrying), so the reader's own thread deadline --
+the product's 5 s per call, the probe's worker -- is the bound, and the option
+only keeps a dead export from parking threads forever. The product has no
 shared-filesystem setting -- the host collector discovers `nfs`/`nfs4`/`lustre`
 mounts by type from its own mount table -- so the export is deliberately not
 added to `GPU_FAULT_FILESYSTEMS` (that would grade it under the local-disk
@@ -1427,10 +1465,17 @@ restarts, until it is remounted or its mount point directory is removed (a
 teardown -- which is why the fixture's `nfs-umount` keeps the directory for
 the injection and its cleanup removes it). Pod volumes and autofs children
 are sampled while present but never remembered. `shared_failure_domain`
-stays the registered expected FAIL (two nodes on one hung export mint two
-unrelated node incidents; nothing names the common failure domain) until a
-control-plane correlation lands; the unavailable and used-percent samples
-now name the export in their `source` label for it. All need
+expects PASS since batch 177 (the correlation that was its product gap): both
+clients' baselines must carry one and the same `source` label for the mount
+(a missing label or two different sources is NOT_RUN(FIXTURE_NOT_READY) --
+nothing to correlate), and after both per-node findings both nodes are read
+again for exactly one `event_type=SHARED_STORAGE_FAILURE_DOMAIN` incident
+(`policy_reference=shared-filesystem:<source>`, both nodes in `node_ids`, no
+workflow or action, a first reason naming the export and the nodes, a
+`member <node>: incident <id>` line per node), a `common failure domain <id>:`
+reason back on each per-node incident, exactly one
+`SHARED_STORAGE_FAILURE_DOMAIN` notification, both per-node chains still
+diagnostic-only, and the record `RECOVERED` after the resume. All need
 `KERNEL_MODULE_LOAD` (a missing `nfsv4` is loaded and
 unloaded), `shared_failure_domain` holds both EKS lane locks (`X`) and needs
 `--node-b`. Live prerequisites: an immutable-digest server image shipping
@@ -1665,17 +1710,30 @@ site-safety quarantine is handed back through the validated restore), 013 EFA
 inventory `unreadable_state` (UNKNOWN, not zero cards) plus the whole-tree
 `/sys/class/infiniband` replays `unknown_inventory` (an ambiguous driver
 identity is UNAVAILABLE, no count), `excess_device` (a duplicated real device
-is EXCESS_DEVICE, RUN_DIAGNOSTICS with VALIDATE_FABRIC executed, no reboot or
+is EXCESS_DEVICE, RUN_DIAGNOSTICS whose VALIDATE_FABRIC concludes on fresh
+evidence -- SUCCEEDED on the restored count or FAILED on a fresh excess reading
+with nothing escalated -- with `details.inventory_evidence` recorded, never the
+stale `missing_inventory_action_completion` wait, RECOVERED, no reboot or
 isolation) and `link_inactive` (one real port DOWN/Disabled is LINK_INACTIVE,
 diagnose first), and the phase-1 host file-source variants 001 `invalid_delta`,
-008 `statistics_failed` and 009 `errors_delta`. `link_inactive` is registered
-`expected_outcome=FAIL` and needs `NODE_REBOOT`: the diagnostic VALIDATE_FABRIC
-of an `efa_inventory_mismatch` finding carries `inventory_requirements_by_node`
-that only a completed EFA recovery operation can satisfy, so it never re-reads
-the port, waits out `GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS` (600 s), fails,
-and -- tagged `failure_escalation_action=REBOOT_NODE` for LINK_INACTIVE --
-escalates to RESTART_NODE even though the port is ACTIVE again (the runner
-restores the link the moment the finding exists). 013 `pci_missing`
+008 `statistics_failed` and 009 `errors_delta`. `link_inactive` expects PASS
+since batch 175 under `HOST_SOURCE_REPLAY` alone (`S`, risk M; the old
+deadline-then-RESTART_NODE gap and the `NODE_REBOOT` token are gone): because
+the diagnostic now judges fresh readings and a port still inactive is the
+designed REBOOT_NODE, the inactive port is shown for a bounded exposure only --
+the tree window's own deadman closes it 1.7 collector intervals (26 s) after it
+opened, after the second tick that confirms the shortfall and mints the finding
+and before a third could be read, which the runner's own polling (20 s store
+polls plus two probe round trips against a 15 s tick) could not guarantee; the
+runner's later close only confirms it (`closed_by`). PASS is a first workflow
+that diagnoses (FREEZE_EVIDENCE + VALIDATE_FABRIC, no hardware or isolation
+step), its VALIDATE_FABRIC SUCCEEDED with
+`details.inventory_evidence[node][efa_inventory_active_count]` at the restored
+count observed after the restore, no stale gate, the incident RECOVERED, no
+RESTART_NODE and the healthy count read back; no finding inside the exposure,
+or a shortfall reading recorded after the restore (the bound did not hold and
+the designed escalation applies), is INCONCLUSIVE rather than a verdict on the
+product. 013 `pci_missing`
 (`scripts/e2e/regional/general_live_efa_pci.py`, both clusters, risk H, every
 lock, `--approve HOST_SOURCE_REPLAY NODE_REBOOT`, expected PASS) is the
 PCI_DEVICE_MISSING reboot chain on a live-replay: first the spec's negative
@@ -2031,6 +2089,33 @@ Neither variant proves what the product does with a stop its own control
 plane initiates; that is the containment path of the node-fault categories.
 The two-rank and suspend injections run through the real wrappers and
 fixtures in the fake namespace.
+
+Two more 028 variants passed vacuously and were given their stimulus or
+deferred. `old_terminal` runs the managed job in the `exit_once` mode: the
+first attempt exits non-zero after 30 s, and the product's RESTART_WORKLOAD
+copy -- whose Pod template the product relabels with the `-r-` attempt id it
+derives -- reads that id through the downward API (`GFRS_ATTEMPT_ID` from
+`metadata.labels['gpu-fault.io/attempt-id']`) and keeps running. Once the
+product's RESTART_WORKLOAD execution recorded `restart_attempt_id` and a
+watcher pass has observed the copy, `TERMINAL_REPLAY_PROBE` (an API Pod probe
+like the 029 ledger harness, `gl28` test attempts only) reads the product's
+own stored TerminalEvent of the old attempt and redelivers it through
+`CompletionService.handle_terminal`, the entry the `/v1/attempts/terminal`
+route calls for the watcher -- nothing hand-made. The verdict wants the
+original decision back with `duplicate=true` (same status, recovery plan and
+event key), exactly one RESTART_WORKLOAD workflow and one budget deduction for
+the old attempt, and the new attempt without a terminal, a decision or a
+containment of its own; no decision, no restart copy or no recorded terminal is
+INCONCLUSIVE, and the existing managed-job cleanup removes the running copy.
+`missing_allocation` is `NOT_RUN(FIXTURE_NOT_READY)`: on Kubernetes the watcher
+builds a terminal's allocation from `spec.nodeName` of every terminated
+critical container (`completion_pod_parsing.observe_containers` ->
+`watcher._terminal_event`); a terminated container always has a node and a
+workload FAILED without Pods never reaches a terminal, so a watcher-observed
+terminal always carries an allocation, and only a hand-made TerminalEvent
+posted to `/v1/attempts/terminal` could lack one -- which the spec (watcher-
+observed terminals only) and the lane rules forbid. The product path
+(`service._decide` -> `planner.from_missing_allocation`) stays software-tested.
 
 GF-GENERAL-LIVE-030 (warm spare unhealthy) is the same story on the HyperPod
 lane: its `SpareSession` keeps the spare node *name* in `self.node` and also
