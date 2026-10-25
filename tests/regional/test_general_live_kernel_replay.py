@@ -307,3 +307,24 @@ def test_wrapper_passes_a_real_cursor_through(tmp_path: Path) -> None:
     assert "s=real-journal-cursor" in forwarded, (
         "a real journal cursor is forwarded untouched"
     )
+
+
+# --------------------------------------------------------------------------- #
+# the probe's per-run kmsg sequence band
+# --------------------------------------------------------------------------- #
+RUN_ID = "gl020-independent-fatal-event-a1-deadbeef"
+
+
+def test_kmsg_sequence_is_stable_per_run_and_distinct_across_runs() -> None:
+    first = probe.kmsg_sequence(RUN_ID, 0)
+    assert first == probe.kmsg_sequence(RUN_ID, 0)
+    assert probe.kmsg_sequence(RUN_ID, 1) == first + 1
+    assert first >= probe.KMSG_SEQUENCE_BASE
+    assert probe.kmsg_sequence(RUN_ID, probe.KMSG_SEQUENCE_STRIDE - 1) < 2**31
+    assert probe.kmsg_sequence("gl020-independent-fatal-event-a2-deadbeef", 0) != first
+    assert probe.kmsg_sequence("gl024-independent-xid-a1-deadbeef", 0) != first
+    assert probe.KMSG_SEQUENCE_STRIDE >= probe.MAX_RECORDS, (
+        "a run's records never spill into the next band"
+    )
+    with pytest.raises(probe.ProbeError):
+        probe.kmsg_sequence(RUN_ID, probe.KMSG_SEQUENCE_STRIDE)

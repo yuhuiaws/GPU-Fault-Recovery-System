@@ -551,13 +551,36 @@ def open_window(arguments: argparse.Namespace) -> None:
     )
 
 
-def _kmsg_line(index: int, record: dict[str, Any]) -> str:
+#: Reviewed kmsg records carry sequence numbers far above anything a real boot
+#: reaches, in a band of its own per run: the kernel collector's record id is
+#: ``kmsg-<boot id>-<sequence>`` and the control plane dedups the XID event id
+#: derived from it, so two runs on one boot that reused the same sequence made
+#: the second run's event a duplicate of the first run's (never a fresh
+#: decision). The band is stable within a run (copies of one record still dedup
+#: to one event) and ``KMSG_SEQUENCE_STRIDE`` keeps a run's records apart.
+KMSG_SEQUENCE_BASE = 900_000_000
+KMSG_SEQUENCE_STRIDE = 64
+KMSG_SEQUENCE_SLOTS = 1_000_000
+
+
+def kmsg_sequence(run_id: str, index: int) -> int:
+    """The /dev/kmsg sequence number of reviewed record ``index`` of ``run_id``."""
+
+    if not 0 <= index < KMSG_SEQUENCE_STRIDE:
+        raise ProbeError("reviewed record index is outside the sequence stride")
+    slot = int(digest(run_id)[:6], 16) % KMSG_SEQUENCE_SLOTS
+    return KMSG_SEQUENCE_BASE + slot * KMSG_SEQUENCE_STRIDE + index
+
+
+def _kmsg_line(index: int, record: dict[str, Any], run_id: str) -> str:
     """One reviewed record in /dev/kmsg syntax: prio,seq,monotonic,flags;message."""
 
     monotonic_us = int(time.monotonic() * 1_000_000)
     priority = int(record.get("priority", 3))
-    sequence = 900_000_000 + index
-    return f"{priority},{sequence},{monotonic_us},-;{record['message']}\n"
+    return (
+        f"{priority},{kmsg_sequence(run_id, index)},{monotonic_us},-;"
+        f"{record['message']}\n"
+    )
 
 
 def arm(arguments: argparse.Namespace) -> None:
@@ -580,15 +603,16 @@ def arm(arguments: argparse.Namespace) -> None:
         return
     # kmsg mode: append the reviewed records to the fixture the collector tails.
     # The kernel collector reopens at the live tail on EOF, so each record is
-    # appended a bounded number of times; a stable sequence number makes the
-    # parser dedup them to one event however many copies it reads.
+    # appended a bounded number of times; a sequence number stable within the
+    # run makes the parser dedup them to one event however many copies it
+    # reads, and distinct from every other run's (``kmsg_sequence``).
     fixture = kmsg_fixture_path(run_id)
     passes = max(int(record.get("emissions", 4)) for record in records)
     written = 0
     for _attempt in range(passes):
         with fixture.open("a", encoding="utf-8") as handle:
             for index, record in enumerate(records):
-                handle.write(_kmsg_line(index, record))
+                handle.write(_kmsg_line(index, record, run_id))
                 written += 1
             handle.flush()
             os.fsync(handle.fileno())
