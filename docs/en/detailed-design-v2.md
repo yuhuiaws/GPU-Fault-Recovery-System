@@ -1876,7 +1876,16 @@ volumes but no hostPath at the kubelet `device-plugins` directory is not a devic
 chart's gpu-feature-discovery/mps-control-daemon carry the plugin's labels and no component label; on a plain EKS cluster
 this FAILED "expected at most one device plugin Pod, found 2"): the restart deletes only the plugin Pod, counts only the
 plugin's new Pod as its replacement, and records the ignored companions as `companion_pods`
-(`node_operations.companion_pod`).
+(`node_operations.companion_pod`). The restart step's record says per node (`details.node_results[<node>]`) what was
+deleted and what replaced it: the delete attempt's receipt carries `deleted_pod` (namespace/name) and
+`deleted_pod_uid`; every later WAITING (`waiting_for_replacement_pod`), the confirmed SUCCEEDED and the timed-out
+FAILED record keep `deleted_pod_uid` (read from the node's own `gpu-fault.io/<gpu|efa>-plugin-restart-pod-uid`
+annotation, the product's authority on which Pod went) and carry the `deleted_pod` of this step's earlier receipt,
+and the SUCCEEDED record adds `replacement_pod_uids` (the UIDs of the newly Ready plugin Pods); a record with
+`already_healthy: true`, or a restart that deleted nothing and only waited for the DaemonSet
+(`waiting_for_daemonset_pod`), records no `deleted_pod_uid` (`node_operations.deleted_plugin_pod_receipt`). Before,
+the terminal record held only `replacement_pod_uids` and the deleted Pod's UID vanished with the replaced WAITING
+record, so the product's own record could not prove which Pod had been restarted (GF-GENERAL-LIVE-014).
 
 **⑫ Unit test scope**: idempotency of cordon+taint; lifting isolation must clear both cordon and taint;
 node disappearing during isolation → FAILED (`safety_rejection`/`absent`) while 404 when lifting isolation → no-op; RBAC 403 is non-retryable and lands on `executor-internal-error`; `STOP_WORKLOADS` covers the three carriers Job/PyTorchJob/

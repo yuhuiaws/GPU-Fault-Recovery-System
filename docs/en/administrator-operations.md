@@ -1498,7 +1498,11 @@ Semantics and boundaries of `eks-managed`:
   the EFA plugin (`aws-efa-k8s-device-plugin` chart) takes `OnDelete` in its values the same way. The product has no
   reason against it: `RESTART_GPU_DEVICE_PLUGIN` only deletes the plugin Pod and lets the DaemonSet recreate it,
   independent of the update strategy; of the chart's three identically labelled DaemonSets only the one mounting the
-  kubelet `device-plugins` directory is the plugin (GFD and MPS are companions).
+  kubelet `device-plugins` directory is the plugin (GFD and MPS are companions). Which Pod was restarted is read from
+  the product's own step record: every record after the delete (`details.node_results[<node>]` of the WAITING, the
+  confirmed SUCCEEDED and the timed-out FAILED record) carries the deleted Pod's `deleted_pod_uid` (and the
+  `deleted_pod` of this step's earlier receipt), and the SUCCEEDED record adds the new Pod's `replacement_pod_uids`; a
+  record with `already_healthy: true` deleted nothing.
 - DCGM: the HyperPod AMI runs DCGM as a host service and the exporter DaemonSet dials the node's nv-hostengine at
   `127.0.0.1:5555`; the plain EKS AL2023 NVIDIA AMI has no host nv-hostengine (a `dcgmi` binary may still be present,
   from the image or installed by hand), so in the default embedded mode an `eks-managed` cluster's
