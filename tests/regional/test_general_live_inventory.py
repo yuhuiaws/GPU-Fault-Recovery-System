@@ -2,8 +2,10 @@
 
 013 unreadable_state drives the host-collector PCI-root repoint (a source-replay
 FakeProbe) and reads the host telemetry back: a malformed reading is UNKNOWN,
-never a missing-device finding or a reboot. Every 014 variant (and the rest of
-013) stays NOT_RUN with its reason -- those are asserted to keep the denominator.
+never a missing-device finding or a reboot. The capability/scale-blocked 014
+variants (and the rest of 013) stay NOT_RUN with their reason here -- those are
+asserted to keep the denominator; 014's native faults live in
+``general_live_device_plugin``.
 """
 
 from __future__ import annotations
@@ -145,14 +147,14 @@ def test_unreadable_state_fails_on_a_reboot(tmp_path: Path) -> None:
 
 
 def test_013_and_014_cover_every_variant() -> None:
+    from scripts.e2e.regional.general_live_registry import load_registry
+
+    registry = load_registry()
+    # 014's native variants live in general_live_device_plugin.py, so coverage is
+    # checked against the whole registry; 013 is this module's own.
     for case in ("GF-GENERAL-LIVE-013", "GF-GENERAL-LIVE-014"):
         expected = set(coverage_rows()[case])
-        # 013 pci_missing (the reboot chain) is registered by general_live_efa_pci.
-        got = {
-            item.variant
-            for item in (*mod.VARIANTS, *pci_mod.VARIANTS)
-            if item.case_id == case
-        }
+        got = {key.split(".", 1)[1] for key in registry if key.startswith(case + ".")}
         assert got == expected, f"{case} registers every coverage variant"
     implemented = {item.variant for item in mod.VARIANTS if item.execute is not None}
     assert implemented == {
@@ -161,9 +163,19 @@ def test_013_and_014_cover_every_variant() -> None:
         "excess_device",
         "link_inactive",
     }, implemented
-    assert all(
-        item.deferred for item in mod.VARIANTS if item.case_id == "GF-GENERAL-LIVE-014"
-    ), "014 has no valid replay path; every variant is NOT_RUN"
+    # Only the capability/scale-blocked 014 variants stay deferred in this
+    # module; the native registration faults moved to general_live_device_plugin.
+    inventory_014 = {
+        item.variant: item.deferred
+        for item in mod.VARIANTS
+        if item.case_id == "GF-GENERAL-LIVE-014"
+    }
+    assert set(inventory_014) == {
+        "expected_unknown",
+        "mig_timeslicing",
+        "running_training",
+    }, inventory_014
+    assert all(inventory_014.values()), inventory_014
     for name in ("unknown_inventory", "excess_device", "link_inactive"):
         spec = SPECS[name]
         assert spec.lanes == ("eks", "hp") and spec.proof_mode == "live-replay"
