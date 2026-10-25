@@ -402,6 +402,23 @@ link inactive先诊断；excess/unknown/不可读不能授权reboot。
 未知期望值、MIG/time-slicing不能直接按物理卡少报处理。恢复原插件配置并确认资源注册，
 不能用手工修Node.status掩盖注册链仍坏。
 
+夹具（`scripts/e2e/regional/general_live_device_plugin.py` +
+`probes/general_live_device_plugin_probe.py`，审批 `DEVICE_PLUGIN_RESTART`）：不移除
+DaemonSet、不改 `Node.status`，而是对 plugin 容器自身进程发 SIGSTOP（仅签名匹配该
+plugin Pod UID 且基名在允许清单内的进程，deadman 用 SIGCONT 兜底），冻结后 plugin 不再
+应答 kubelet 的 `ListAndWatch`，kubelet 注销资源、allocatable 下降而 Pod 仍 Running，由
+产品自己删除并替换 Pod。`gpu_plugin`/`efa_plugin` 判 `RESTART_*_DEVICE_PLUGIN` +
+`TRIGGER_HEALTH_SNAPSHOT` + `VALIDATE_{GPU,FABRIC}` 均 SUCCEEDED、`replacement_pod_uids`
+为新 Ready Pod、allocatable 回基线、incident RECOVERED、无 reboot；`one_sample` 在产品记录
+一次失配后立即 SIGCONT，验证两次确认规则不成 finding/不动作；`replacement_uid` 验证新 UID
+被记录、异于被删 UID 且不被二次删除；`validation_failure` 跨替换持续冻结使重启的 allocatable
+快照不达标，`RESTART_*_DEVICE_PLUGIN` 失败并经 `failure_escalation_action=REBOOT_NODE`
+升级到 `RESTART_NODE`（单独 `NODE_REBOOT` 审批，X 标志）。观察到的产品不足：最终步骤回执只
+持久化 `replacement_pod_uids`，被删 Pod 的 `deleted_pod_uid` 只在删除那次尝试的瞬时回执里
+（`node_operations._restart_device_plugin_node` 终态分支不再带它），故原 UID 需实时抓取或由
+Pod 普查（原 Pod 已消失 + 新 Ready Pod）佐证。`expected_unknown`/`mig_timeslicing`
+（CAPABILITY_ABSENT）与 `running_training`（FIXTURE_NOT_READY，lane N）保持 NOT_RUN。
+
 ### GF-GENERAL-LIVE-015
 
 必测：`critical`、`nonrecoverable`、`healthy`、`wrong_column`、

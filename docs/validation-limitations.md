@@ -1655,6 +1655,48 @@ in this regional control plane, `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`
 stay `NOT_RUN` with an explicit reason in the denominator rather than being
 dropped. No GF-GENERAL-LIVE case has live evidence yet.
 
+## GF-GENERAL-LIVE-014 Kubernetes allocatable (native device-plugin freeze)
+
+The five native 014 variants (`gpu_plugin`, `efa_plugin`, `one_sample`,
+`replacement_uid`, `validation_failure`) are implemented in
+`scripts/e2e/regional/general_live_device_plugin.py` with the probe
+`probes/general_live_device_plugin_probe.py` and the `DEVICE_PLUGIN_RESTART`
+approval. The spec forbids patching `Node.status` or faking allocatable, and the
+COLLECT-017 B/C fixture excludes the DaemonSet by affinity and restores it
+*before* the product acts (so the product takes the `already_healthy` branch and
+never deletes a Pod); neither reaches the product's own pod-delete/re-register
+path. The injection instead SIGSTOPs the plugin container's own process -- only
+a process whose cgroup names the plugin Pod UID *and* whose argv basename is
+allow-listed, deadman-backed with SIGCONT -- so the plugin stops answering
+kubelet's `ListAndWatch`, kubelet de-registers the resource, allocatable decays
+while the Pod stays `Running`, and the product must delete and replace the Pod
+itself. `gpu_plugin`/`efa_plugin` grade the full `RESTART_*_DEVICE_PLUGIN` +
+`TRIGGER_HEALTH_SNAPSHOT` + `VALIDATE_{GPU,FABRIC}` chain SUCCEEDED, a new Ready
+`replacement_pod_uids` different from the deleted Pod, allocatable back to
+baseline, incident RECOVERED and no reboot; `one_sample` resumes the plugin after
+one mismatch sample to prove the `required_consecutive_samples=2` rule leaves no
+finding; `replacement_uid` grades the new UID is recorded, differs from the
+deleted one and is not re-deleted; `validation_failure` keeps the registration
+broken across the replacement (re-freezing each new Pod) so the restart's own
+allocatable snapshot never confirms, the step fails at `restart_timeout_seconds`
+and -- tagged `failure_escalation_action=REBOOT_NODE` by
+`orchestration/families/health._resource_escalation` -- escalates to
+`RESTART_NODE` under the separate `NODE_REBOOT` authorization (flag `X`). The
+effectiveness oracle is the raw kubelet allocatable reading: a freeze that does
+not reduce it is `INCONCLUSIVE`, not a pass. Cleanup resumes any still-frozen
+process and proves allocatable back to baseline with exactly one plugin Pod on
+the node. Observed product gap: the final `RESTART_*_DEVICE_PLUGIN` step receipt
+persists only `replacement_pod_uids`; the deleted Pod's `deleted_pod_uid` lives
+only in the transient delete-attempt receipt
+(`node_operations._restart_device_plugin_node`'s terminal branch drops it and it
+is not in `step_bounds.ATTEMPT_DETAIL_KEYS`), so the runner grades the deleted
+UID from the live-captured receipt when caught and otherwise from the Pod census
+(the original Pod gone, a new Ready Pod present). `expected_unknown` /
+`mig_timeslicing` (CAPABILITY_ABSENT) and `running_training` (FIXTURE_NOT_READY,
+a managed scale attempt, lane N) stay `NOT_RUN` in the denominator. These run on
+EKS first (no SageMaker health-monitoring agent) and on HyperPod with
+`NodeRecovery=None`; no live evidence yet.
+
 ## GF-GENERAL-LIVE live acceptance runner (phase 2, lane K)
 
 Phase 2 adds reviewed `live-replay` categories that drive the product's own
@@ -1797,12 +1839,12 @@ whatever the branch (verified with the real parser and engine) -- the version
 gate is reachable only on a Blackwell node, where the same code runs for real.
 
 The variants that stay `NOT_RUN` on this single-node site keep their place in the
-denominator with an explicit reason: 014 Kubernetes allocatable (every variant --
-faking allocatable or patching `Node.status` is not valid proof, and the native
-device-plugin fault needs the reserved `DEVICE_PLUGIN_RESTART` approval), the 013
-driver-binding variants (`driver_unbound`, `bind_failure`, `post_repair_failure`:
-the reserved `EFA_DRIVER_UNBIND` native unbind), the catalog/authority-bound 032
-variants (a genuinely unknown product
+denominator with an explicit reason: the 014 `expected_unknown` / `mig_timeslicing`
+(no instance type outside `INSTANCE_ACCELERATOR_COUNTS`, no MIG/time-slicing; `running_training`
+is `COVERED_BY_REGIONAL`, and 014's native device-plugin freezes are implemented, see above), the
+013 `bind_failure` / `post_repair_failure` driver-binding variants (the reserved `EFA_DRIVER_UNBIND`
+native unbind; `pci_missing` is implemented above and `driver_unbound` is `COVERED_BY_REGIONAL`),
+the catalog/authority-bound 032 variants (a genuinely unknown product
 needs other hardware; `observe_profile` / `permitted_isolation` need a Runtime
 Profile authority the site does not configure, AUTH-015), the 017 attribution
 variants (a managed attempt with CRI Pod logs, lane N territory), and 004
