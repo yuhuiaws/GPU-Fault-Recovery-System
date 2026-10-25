@@ -30,12 +30,16 @@ into the counter/composite incident, not a component of the composite) and
 the concurrent diagnosis is undisturbed. What it does not prove: that a
 *fatal-grade* dispatch (RESET/QUARANTINE) survives the concurrent diagnostic
 workflow -- that branch needs the reset approvals and is run by the dangerous
-kmsg-XID lanes, never here.
+kmsg-XID lanes, never here. The one such lane in this runner is 029
+``hardware_chain_continues`` (``general_live_attempt_hardware.py``): it reuses
+``inject_kernel_xid`` with its own reset-grade catalog gate (``require=``),
+under ``GPU_RESET`` and ``KERNEL_SOURCE_REPLAY``.
 """
 
 from __future__ import annotations
 
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any
@@ -300,15 +304,18 @@ def inject_kernel_xid(
     label: str,
     emissions: int = EMISSIONS,
     settle_seconds: int = SETTLE_SECONDS,
+    require: Callable[[int], CatalogEntry] = require_monitor_grade,
 ) -> KernelXidInjection:
-    """Deliver one reviewed monitor-grade XID through the kernel source.
+    """Deliver one reviewed XID through the kernel source.
 
-    Refuses (NOT_RUN) a code the pinned catalog does not grade monitor-only
-    before touching the node; INCONCLUSIVE when the fixture file received no
-    reviewed line. The window's cleanup is on ``ctx.cleanup``.
+    ``require`` is the catalog gate, judged before the node is touched: the
+    default accepts only a monitor-grade code (NOT_RUN otherwise); the 029
+    hardware-chain lane passes its reset-grade gate instead, under its own
+    approvals. INCONCLUSIVE when the fixture file received no reviewed line.
+    The window's cleanup is on ``ctx.cleanup``.
     """
 
-    require_monitor_grade(xid)
+    require(xid)
     message = xid_message(xid, pci_bdf, run_id=ctx.run_id, label=label)
     return inject_reviewed_kernel_line(
         ctx,

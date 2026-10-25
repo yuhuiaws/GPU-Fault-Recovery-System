@@ -789,14 +789,8 @@ VARIANTS = [
         "the durable ledger records the consumption; restart_count matches the reservations",
         budget_consumed,
     ),
-    deferred_variant(
-        CASE_029,
-        "hardware_chain_continues",
-        proof_mode=NATIVE,
-        reason="FIXTURE_NOT_READY: needs a trusted hardware fault (kmsg XID) injected alongside the exhausted budget, which is a DESTR-path fixture not wired into this runner yet",
-        lanes=("eks", "hp"),
-        expected="the hardware chain runs STOP/reset/validation with real receipts; only RESTART_WORKLOAD is withheld",
-    ),
+    # 029 hardware_chain_continues lives in general_live_attempt_hardware.py
+    # (a reviewed kernel XID beside an exhausted budget, under GPU_RESET).
     _spec(
         CASE_029,
         "restart_withheld",

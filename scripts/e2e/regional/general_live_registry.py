@@ -105,7 +105,9 @@ APPROVALS: dict[str, str] = {
         "let the product's RESET_GPU chain (quiesce, verify no GPU clients, one "
         "nvidia-smi --gpu-reset of the target GPU, restore GPU services, "
         "validate) run on the idle test node for a replayed row-remap-pending "
-        "reading"
+        "reading, or -- 029 hardware_chain_continues -- on the test node running "
+        "the managed test job for a reviewed kernel XID 46 (the product cordons "
+        "and stops that job first; its restart budget is already exhausted)"
     ),
     "GPU_FULL_FABRIC_RESET": (
         "let the product's RESET_ALL_GPUS_NVSWITCHES chain (quiesce incl. Fabric "
@@ -322,6 +324,7 @@ CATEGORY_MODULES = (
     "scripts.e2e.regional.general_live_gpu_environment",
     "scripts.e2e.regional.general_live_gpu_fields",
     "scripts.e2e.regional.general_live_gpu_identity",
+    "scripts.e2e.regional.general_live_attempt_hardware",
 )
 #: The categories phase 1 implements (``cases`` rows of the coverage file).
 PHASE_ONE_CATEGORIES = (1, 3, 4, 6, 8, 9, 25, 28, 29, 31)

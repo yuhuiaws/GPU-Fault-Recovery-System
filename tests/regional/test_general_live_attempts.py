@@ -405,8 +405,9 @@ def test_deferred_variants() -> None:
     assert SPECS["worker_restart"].deferred.startswith("NOT_AUTHORIZED"), (
         "SPECS['worker_restart'].deferred.startswith('NOT_AUTHORIZED')"
     )
-    assert SPECS["hardware_chain_continues"].deferred.startswith("FIXTURE_NOT_READY"), (
-        "SPECS['hardware_chain_continues'].deferred.startswith('FIXTURE_NOT_REA"
+    # 029 hardware_chain_continues moved to general_live_attempt_hardware.py.
+    assert "hardware_chain_continues" not in SPECS, (
+        "the hardware chain is implemented in its own module, not deferred here"
     )
 
 
