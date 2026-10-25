@@ -1,8 +1,82 @@
 """Bound the second-stage diagnostic and bind it to observed process identities."""
 
+import hashlib
+import json
+from collections.abc import Mapping
 from typing import Any
 
-from gpu_fault.models import WorkflowStepSpec
+from gpu_fault.models import WorkflowOperation, WorkflowStepSpec
+
+#: The part of a triage decision a node never reads: every sampled process's
+#: thread stacks and wait observations.
+WIRE_OMITTED_PATH = "evidence_branches.process_observations.processes"
+WIRE_RECORDED_IN = "workflow step parameters and COLLECT_HUNG_TRIAGE details"
+
+
+def wire_decision(decision: Mapping[str, Any]) -> dict[str, Any]:
+    """The triage decision a bundle command carries to a node.
+
+    The verdict, the candidate processes, the coverage and the flight-recorder
+    branches stay. The per-process observations -- one stack and one wait row
+    per thread of every sampled process, ~15 KB a process, bounded only at 256
+    processes -- become their count, and ``wire_form`` records what was left
+    out with the size and SHA-256 of the full decision, which the workflow
+    record keeps in the bundle step's parameters and the triage step's
+    execution details. The node only copies the decision into the bundle
+    manifest's ``fault_context``; live, sixteen processes made it 259 KB and
+    the node's 256 KiB observation request budget refused the whole bundle.
+    A decision without process observations is returned as it is, so the
+    wire form is its own fixed point.
+    """
+
+    branches = decision.get("evidence_branches")
+    if not isinstance(branches, Mapping):
+        return dict(decision)
+    observations = branches.get("process_observations")
+    if not isinstance(observations, Mapping) or "processes" not in observations:
+        return dict(decision)
+    encoded = json.dumps(
+        decision, sort_keys=True, separators=(",", ":"), default=str
+    ).encode()
+    processes = observations["processes"]
+    return {
+        **decision,
+        "evidence_branches": {
+            **branches,
+            "process_observations": {
+                **{
+                    key: value
+                    for key, value in observations.items()
+                    if key != "processes"
+                },
+                "processes_omitted": len(processes)
+                if isinstance(processes, (list, tuple))
+                else 1,
+            },
+        },
+        "wire_form": {
+            "omitted": [WIRE_OMITTED_PATH],
+            "full_bytes": len(encoded),
+            "full_sha256": hashlib.sha256(encoded).hexdigest(),
+            "recorded_in": WIRE_RECORDED_IN,
+        },
+    }
+
+
+def wire_parameters(
+    operation: WorkflowOperation, parameters: Mapping[str, Any]
+) -> dict[str, Any]:
+    """The parameters a node command for ``operation`` carries: the step's own,
+    with a hung bundle's ``hung_triage_decision`` in its wire form. Any other
+    operation's parameters are returned unchanged."""
+
+    result = dict(parameters)
+    decision = result.get("hung_triage_decision")
+    if operation is WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE and isinstance(
+        decision, Mapping
+    ):
+        result["hung_triage_decision"] = wire_decision(decision)
+    return result
 
 
 def bind_hung_bundle(

@@ -1,5 +1,6 @@
 import pytest
 
+from gpu_fault.execution.hung_bundle import wire_decision
 from gpu_fault.hung_summary_codec import decode_summary
 from gpu_fault.models import IncidentState, WorkflowStatus
 from gpu_fault.models import WorkflowOperation as Op
@@ -129,9 +130,20 @@ def test_raw_rdma_to_real_collection_archive_and_operator_handoff(chain, mode):
         for item in saved.step_executions
         if item.operation is Op.COLLECT_DIAGNOSTIC_BUNDLE
     ).details["node_results"]
+    # The step record keeps the full decision; the command and the manifest
+    # carry its wire form -- the verdict without every process's threads.
+    assert "processes" in report["evidence_branches"]["process_observations"], report
+    sent = [
+        item.parameters["hung_triage_decision"]
+        for item in rig.commands
+        if item.operation is Op.COLLECT_DIAGNOSTIC_BUNDLE
+    ]
+    assert sent and all(item == wire_decision(report) for item in sent), sent
     for node, (manifest, digest) in archives.items():
         assert receipts[node]["sha256"] == digest, receipts
-        assert manifest["fault_context"]["hung_triage_decision"] == report, manifest
+        assert manifest["fault_context"]["hung_triage_decision"] == wire_decision(
+            report
+        ), manifest
         assert "strace" in manifest["omitted_intrusive_tools"], manifest
     if mode == "pid-reuse":
         manifest = archives["node-a"][0]

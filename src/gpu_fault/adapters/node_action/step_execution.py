@@ -20,6 +20,7 @@ from gpu_fault.adapters.node_action.verification_continuation import (
     VERIFY_EVIDENCE_KEYS,
 )
 from gpu_fault.execution import WorkflowStepContext, WorkflowStepOutcome
+from gpu_fault.execution.hung_bundle import wire_parameters
 from gpu_fault.execution.node_action_uncertainty import unresolved_node_action
 from gpu_fault.gpu_fabric_window import quiesce_command_parameters
 from gpu_fault.models import (
@@ -187,6 +188,11 @@ class NodeActionExecutionService:
         parameters = quiesce_command_parameters(
             context.workflow, context.step_index, context.step
         )
+        # A hung bundle carries its triage decision in the wire form -- the
+        # verdict, not every sampled process's threads; the step record keeps
+        # the full decision (live: 259 KB of it refused the whole bundle at
+        # the node's observation request budget).
+        parameters = wire_parameters(context.step.operation, parameters)
         if parameters != context.step.parameters:
             context = replace(
                 context,
