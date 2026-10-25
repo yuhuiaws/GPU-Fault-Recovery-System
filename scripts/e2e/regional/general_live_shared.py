@@ -61,7 +61,10 @@ from collections.abc import Callable, Iterable
 from datetime import datetime
 from typing import Any
 
-from scripts.e2e.regional.general_live_common import run_survey
+from scripts.e2e.regional.general_live_common import (
+    run_survey,
+    sustained_detection_budget,
+)
 from scripts.e2e.regional.general_live_fixture import (
     GeneralLiveSettings,
     VariantContext,
@@ -83,6 +86,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
     chain_errors,
+    chain_judgeable,
     finding_incidents,
     hardware_errors,
     parse_time,
@@ -397,13 +401,22 @@ def wait_finding(
     *,
     timeout_seconds: float,
     name: str,
+    validation: str | None = None,
 ) -> dict[str, Any]:
+    """The incident ``metric`` minted on ``mount``; with ``validation``, until
+    that step of its chain can be judged (terminal, not WAITING for the next
+    health summary's evidence)."""
+
     last: dict[str, Any] = {}
 
     def accept() -> dict[str, Any] | None:
         nonlocal last
         last = _activity(ctx, node, since, mount=mount)
-        return last if finding_incidents(last, metric, device=mount) else None
+        if validation is not None:
+            ready = chain_judgeable(last, metric, device=mount, validation=validation)
+        else:
+            ready = bool(finding_incidents(last, metric, device=mount))
+        return last if ready else None
 
     value = ctx.wait_until(
         accept,
@@ -875,14 +888,19 @@ def capacity_full(ctx: VariantContext) -> dict[str, Any]:
     used = (filled.get("statvfs") or {}).get("used_percent")
     if not isinstance(used, (int, float)) or used < 98:
         raise VariantInconclusive(f"the test export only reached {used}% used")
+    # The 98 % rule has no sustain: the fill's edge batch mints the finding, and
+    # VALIDATE_HOST is judged on the health summary after it -- wait for that
+    # step to be terminal before grading the chain (one summary, not the first
+    # snapshot that shows the incident).
     detection = wait_finding(
         ctx,
         node,
         started,
         USED,
         mount,
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=sustained_detection_budget(ctx, 0, summaries=1),
         name="full-detection",
+        validation="VALIDATE_HOST",
     )
     stages = {
         "chain": diagnostic_chain(detection, USED, mount),

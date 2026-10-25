@@ -14,9 +14,11 @@ product records what the spec asks for.
 from __future__ import annotations
 
 import dataclasses
+import itertools
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -1131,3 +1133,55 @@ def test_a_failed_client_mount_keeps_the_server_log_and_names_the_cause(
     assert ctx.cleanup.pending() == ["export-a", f"mount-shared@{NODE}"], (
         "the unmount and the delete are still on the stack for the runner"
     )
+
+
+def waiting_full_activity(mount: str) -> dict[str, Any]:
+    """The first snapshots after the fill: the incident is minted (the 98 %
+    rule has no sustain) but VALIDATE_HOST still waits for the health summary
+    after it -- the evidence newer than itself that it is judged on."""
+
+    doc = full_activity(mount)
+    doc["workflows"][0]["status"] = "RUNNING"
+    doc["workflows"][0]["step_executions"] = [
+        {
+            "operation": "VALIDATE_HOST",
+            "status": "WAITING",
+            "details": {"node_pending": {NODE: ["host_diagnostic_probe"]}},
+        }
+    ]
+    return doc
+
+
+def test_capacity_full_waits_for_validate_host_to_be_judgeable(tmp_path: Path) -> None:
+    ctx = context("capacity_full", tmp_path, activity=None)
+    mount = shared.mount_path(ctx, shared.PRIMARY)
+    probe = ctx.probes[f"shared@{NODE}"]
+    after_fill = itertools.count()
+
+    def product(_script: str, *_arguments: str, **_: Any) -> dict[str, Any]:
+        filled = any(call[0] == "nfs-fill" for call in probe.calls)
+        if filled and next(after_fill) < 3:
+            return waiting_full_activity(mount)
+        return full_activity(mount)
+
+    ctx.regional.cpu_python_responder = product
+    result = SPECS["capacity_full"].execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    detection = json.loads((ctx.case_dir / "full-detection-timeline.json").read_text())
+    assert [entry["accepted"] for entry in detection["entries"]] == [
+        False,
+        False,
+        False,
+        True,
+    ], "the chain is graded on the terminal validation, not the first snapshot"
+
+
+def test_capacity_full_detection_budget_covers_the_validations_summary() -> None:
+    # No sustain on the 98 % rule: the fill's edge mints the finding and only
+    # VALIDATE_HOST's summary is still ahead -- one summary, the interval and
+    # the margin, read from the node's cadence rather than a fixed 420 s.
+    from scripts.e2e.regional.general_live_common import sustained_detection_budget
+
+    site = SimpleNamespace(host_summary=300, host_interval=15)
+    assert sustained_detection_budget(site, 0, summaries=1) == 300 + 15 + 180
+    assert sustained_detection_budget(site, 0, summaries=1) > shared.DETECTION_BUDGET
