@@ -36,6 +36,13 @@ unit and then **verifies** through ``nsenter`` that every replacement is visible
 in the unit's mount namespace / process environment and *not* in PID 1's.
 The Node Agent is never touched; no global mount is made and no real
 ``/proc``/sysfs file is written. ``proof_scope`` is always ``live-replay``.
+
+Two read-only commands serve the variants' oracle: ``inventory`` lists the
+node's RDMA tree as the product reads it (driver identity, owned netdevs, port
+``state``/``phys_state``, every ``counters``/``hw_counters`` file with its value,
+the names ``ethtool -S`` prints per netdev), and ``read-source --path`` shows
+one allow-listed source file as the unit sees it next to what PID 1 sees, so a
+closed window can prove the real value is read again.
 """
 
 from __future__ import annotations
@@ -97,6 +104,13 @@ MIN_RESTORE_SECONDS = 60
 MAX_RESTORE_SECONDS = 5400
 MAX_TREE_DEVICES = 64
 MAX_AUDIT_LINES = 400
+#: Bounds of the read-only ``inventory``: counter files per port group, counter
+#: names per ``ethtool -S`` listing (an ENA netdev prints ~45 per queue).
+MAX_INVENTORY_COUNTERS = 128
+MAX_ETHTOOL_NAMES = 2048
+MAX_SOURCE_VALUE_CHARS = 256
+NETDEV_ROOT = "/sys/class/net"
+NETDEV_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,15}$")
 DEVICE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,31}$")
 PORT_NAME = re.compile(r"^[0-9]{1,2}$")
 PORT_STATE = re.compile(r"^[0-9]{1,2}: [A-Za-z][A-Za-z_ -]{0,30}$")
@@ -186,6 +200,19 @@ def checked_tree_dest(dest: str) -> str:
     if dest in TREE_DESTS:
         return dest
     raise ProbeError(f"tree destination {dest!r} is not allow-listed")
+
+
+def checked_source_path(path: str) -> str:
+    """A readable source: an allow-listed bind file, or a file of a tree dest."""
+
+    if ".." in path.split("/") or not path.startswith("/"):
+        raise ProbeError(f"source path {path!r} is not absolute and plain")
+    try:
+        return checked_bind_dest(path)
+    except ProbeError:
+        if any(path == dest or path.startswith(dest + "/") for dest in TREE_DESTS):
+            return path
+        raise ProbeError(f"source path {path!r} is not allow-listed") from None
 
 
 def tool_locations(tool: str) -> list[str]:
@@ -594,6 +621,24 @@ def build_infiniband_fixture(arguments: argparse.Namespace) -> None:
         shutil.rmtree(ports)
         ports.mkdir(mode=0o755)
         mutations.append(f"{device}/ports (emptied)")
+    for item in arguments.netdev:
+        # 010: the host collector runs ``ethtool -S`` only on the netdevs an
+        # EFA function owns (``device/net/*``); on a node whose EFA functions
+        # own none, a real physical netdev of the node is attached to one so
+        # the ethtool reading can be replayed. The netdev itself is untouched.
+        device, iface = _split(item, ":", 2, "--netdev")
+        if (
+            NETDEV_NAME.fullmatch(iface) is None
+            or not (Path(arguments.netdev_root) / iface / "device").exists()
+        ):
+            raise ProbeError(
+                f"--netdev names no physical netdev of {arguments.netdev_root}: {iface!r}"
+            )
+        (_device_dir(root, device) / "device" / "net" / iface).mkdir(
+            mode=0o755, parents=True, exist_ok=True
+        )
+        devices[device]["netdevs"] = sorted({*devices[device]["netdevs"], iface})
+        mutations.append(f"{device}/device/net/{iface} (attached)")
     summary = {
         "run_id": run_id,
         "path": str(root),
@@ -659,6 +704,155 @@ def build_nvidia_proc_fixture(arguments: argparse.Namespace) -> None:
             "version": version.strip()[:120] if version is not None else None,
             "gpus": gpus,
             "omit_gpus": bool(arguments.omit_gpus),
+        }
+    )
+
+
+def _text(path: Path, limit: int = MAX_SOURCE_VALUE_CHARS) -> str | None:
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").strip()[:limit]
+    except OSError:
+        return None
+
+
+def _rdma_driver(device: Path) -> tuple[str | None, list[str]]:
+    """``(resolved driver, uevent DRIVER= values)`` the way ``is_efa_device`` reads them."""
+
+    try:
+        resolved: str | None = (device / "device" / "driver").resolve(strict=True).name
+    except OSError:
+        resolved = None
+    uevent = _text(device / "device" / "uevent", 4096) or ""
+    drivers = [
+        line[len("DRIVER=") :]
+        for line in uevent.splitlines()
+        if line.startswith("DRIVER=")
+    ]
+    return resolved, drivers
+
+
+def rdma_inventory(root: Path, netdev_root: Path) -> dict[str, Any]:
+    """The node's RDMA devices as the host collector reads them (read-only)."""
+
+    devices: dict[str, Any] = {}
+    for device in sorted(root.iterdir()) if root.is_dir() else []:
+        if DEVICE_NAME.fullmatch(device.name) is None:
+            continue
+        driver, uevent_drivers = _rdma_driver(device)
+        net = device / "device" / "net"
+        ports: dict[str, Any] = {}
+        ports_dir = device / "ports"
+        for port in sorted(ports_dir.iterdir()) if ports_dir.is_dir() else []:
+            if PORT_NAME.fullmatch(port.name) is None:
+                continue
+            entry: dict[str, Any] = {
+                "state": _text(port / "state"),
+                "phys_state": _text(port / "phys_state"),
+            }
+            for group in ("counters", "hw_counters"):
+                values: dict[str, str | None] = {}
+                group_dir = port / group
+                names = sorted(group_dir.iterdir()) if group_dir.is_dir() else []
+                for counter in names[:MAX_INVENTORY_COUNTERS]:
+                    if counter.is_file() and COUNTER_NAME.fullmatch(counter.name):
+                        values[counter.name] = _text(counter, 64)
+                entry[group] = values
+            ports[port.name] = entry
+        devices[device.name] = {
+            "driver": driver,
+            "uevent_drivers": uevent_drivers,
+            "efa": driver == "efa" or (driver is None and uevent_drivers == ["efa"]),
+            "netdevs": sorted(item.name for item in net.iterdir())
+            if net.is_dir()
+            else [],
+            "ports": ports,
+        }
+    physical = (
+        sorted(
+            item.name
+            for item in netdev_root.iterdir()
+            if (item / "device").exists() and NETDEV_NAME.fullmatch(item.name)
+        )
+        if netdev_root.is_dir()
+        else []
+    )
+    return {"root": str(root), "devices": devices, "physical_netdevs": physical}
+
+
+def ethtool_names(interfaces: list[str]) -> dict[str, Any]:
+    """What the real ``ethtool -S`` prints for each netdev: counter names only."""
+
+    path = shutil.which("ethtool", path=STANDARD_PATH)
+    result: dict[str, Any] = {"path": path, "statistics": {}}
+    if path is None:
+        return result
+    for interface in interfaces:
+        completed = run([path, "-S", interface], check=False, timeout=30)
+        names = []
+        for line in completed.stdout.splitlines():
+            name, separator, value = line.partition(":")
+            # ``NIC statistics:`` heads the listing; a counter line has a value.
+            if separator and name.strip() and value.strip():
+                names.append(name.strip())
+        result["statistics"][interface] = {
+            "returncode": completed.returncode,
+            "counters": names[:MAX_ETHTOOL_NAMES],
+            "truncated": len(names) > MAX_ETHTOOL_NAMES,
+            "stderr": completed.stderr.strip()[:200],
+        }
+    return result
+
+
+def inventory(arguments: argparse.Namespace) -> None:
+    run_id = safe_id(arguments.run_id)
+    value = rdma_inventory(Path(arguments.source), Path(arguments.netdev_root))
+    owned = {
+        name
+        for device in value["devices"].values()
+        if device["efa"]
+        for name in device["netdevs"]
+    }
+    value["ethtool"] = ethtool_names(sorted(owned | set(value["physical_netdevs"])))
+    emit({"run_id": run_id, "captured_at": utc_now(), **value})
+
+
+def view_text(pid: str, path: str) -> dict[str, Any]:
+    """What ``pid``'s mount namespace reads at ``path``: the text and its device."""
+
+    read = nsenter(pid, ["/usr/bin/cat", path])
+    stat = nsenter(pid, ["/usr/bin/stat", "-L", "-c", "%d", path])
+    return {
+        "readable": read.returncode == 0,
+        "value": read.stdout.strip()[:MAX_SOURCE_VALUE_CHARS]
+        if read.returncode == 0
+        else None,
+        "device": stat.stdout.strip() if stat.returncode == 0 else None,
+    }
+
+
+def read_source(arguments: argparse.Namespace) -> None:
+    """One allow-listed source as the unit reads it, next to PID 1's view."""
+
+    run_id = safe_id(arguments.run_id)
+    path = checked_source_path(arguments.path)
+    pid = unit_state(HOST_UNIT).get("MainPID", "0")
+    if not pid.isdigit() or pid == "0":
+        raise ProbeError(f"{HOST_UNIT} has no main process to read through")
+    unit, host = view_text(pid, path), view_text("1", path)
+    emit(
+        {
+            "run_id": run_id,
+            "path": path,
+            "main_pid": pid,
+            "unit": unit,
+            "host": host,
+            "same": bool(
+                unit["readable"]
+                and host["readable"]
+                and unit["value"] == host["value"]
+                and unit["device"] == host["device"]
+            ),
+            "window_open": bool(load_state(run_id)),
         }
     )
 
@@ -1221,7 +1415,16 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--set", action="append", default=[])
     item.add_argument("--remove-counter", action="append", default=[])
     item.add_argument("--no-ports", action="append", default=[])
+    item.add_argument("--netdev", action="append", default=[])
+    item.add_argument("--netdev-root", default=NETDEV_ROOT)
     item.add_argument("--allow-empty", action="store_true")
+
+    item = command("inventory", inventory)
+    item.add_argument("--source", default="/sys/class/infiniband")
+    item.add_argument("--netdev-root", default=NETDEV_ROOT)
+
+    item = command("read-source", read_source)
+    item.add_argument("--path", required=True)
 
     item = command("build-nvidia-proc-fixture", build_nvidia_proc_fixture)
     item.add_argument("--source", default="/proc/driver/nvidia")

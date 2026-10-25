@@ -193,6 +193,7 @@ class HostSourceReplay:
         counters: Iterable[tuple[str, str, str, str]] = (),
         remove_counters: Iterable[tuple[str, str, str]] = (),
         no_ports: Iterable[str] = (),
+        netdev: Iterable[tuple[str, str]] = (),
         source: str = "/sys/class/infiniband",
     ) -> dict[str, Any]:
         """Copy the node's RDMA tree with reviewed mutations (``--tree infiniband:...``).
@@ -200,7 +201,9 @@ class HostSourceReplay:
         ``duplicate=[(new, origin)]``, ``port_state=[(dev, port, "1: DOWN")]``,
         ``phys_state=[(dev, port, "3: Disabled")]``, ``driver=[(dev, "none" |
         "ambiguous" | <name>)]``, ``counters=[(dev, port, "hw_counters/rx_drops",
-        "5000")]``, ``remove_counters=[(dev, port, "hw_counters/tx_pkts")]``.
+        "5000")]``, ``remove_counters=[(dev, port, "hw_counters/tx_pkts")]``,
+        ``netdev=[(dev, <physical netdev>)]`` (010: an EFA function that owns
+        no netdev is given one so ``ethtool -S`` is run for it).
         """
 
         self._require_approval("an infiniband tree replay")
@@ -222,7 +225,29 @@ class HostSourceReplay:
             arguments += ["--remove-counter", f"{device}:{port}:{counter}"]
         for device in no_ports:
             arguments += ["--no-ports", device]
+        for device, interface in netdev:
+            arguments += ["--netdev", f"{device}:{interface}"]
         return self._execute(*arguments, timeout=180)
+
+    # ---------------------------------------------------------------- read-only
+    def inventory(self, *, source: str = "/sys/class/infiniband") -> dict[str, Any]:
+        """The node's RDMA tree as the product reads it (no window, no approval)."""
+
+        self.create()
+        return self._execute("inventory", "--source", source, timeout=120)
+
+    def read_back(self, dest: str) -> dict[str, Any]:
+        """``dest`` as the unit reads it next to PID 1's view (``same`` when equal).
+
+        After ``close`` this is the proof that the real source is read again.
+        """
+
+        try:
+            probe.checked_source_path(dest)
+        except probe.ProbeError as error:
+            raise HostSourceReplayError(str(error)) from error
+        self.create()
+        return self._execute("read-source", "--path", dest, timeout=60)
 
     def build_nvidia_proc(
         self,

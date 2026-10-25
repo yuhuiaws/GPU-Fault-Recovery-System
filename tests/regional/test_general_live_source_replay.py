@@ -493,3 +493,36 @@ def test_host_source_replay_from_a_variant_context(tmp_path: Path) -> None:
         settings=dataclasses.replace(settings, approvals=()),
     )
     assert helper.host_source_replay(unapproved).approved is False
+
+
+# --------------------------------------------------------------------------- #
+# read-only inventory / read-back and the netdev tree mutation (010, 011)
+# --------------------------------------------------------------------------- #
+def test_inventory_and_read_back_need_no_token(tmp_path: Path) -> None:
+    controller, fake = _controller(
+        tmp_path,
+        approvals=(),
+        inventory={"devices": {"rdmap79s0": {"efa": True}}},
+        **{
+            "read-source": {
+                "path": "/sys/class/infiniband/rdmap79s0/ports/1/state",
+                "same": True,
+            }
+        },
+    )
+    assert controller.inventory()["devices"] == {"rdmap79s0": {"efa": True}}
+    dest = "/sys/class/infiniband/rdmap79s0/ports/1/state"
+    assert controller.read_back(dest)["same"] is True
+    assert fake.calls[0][:3] == ("inventory", "--source", "/sys/class/infiniband")
+    assert fake.calls[1][:3] == ("read-source", "--path", dest)
+    with pytest.raises(helper.HostSourceReplayError, match="not allow-listed"):
+        controller.read_back("/etc/passwd")
+
+
+def test_build_infiniband_attaches_a_netdev(tmp_path: Path) -> None:
+    controller, fake = _controller(tmp_path)
+    controller.build_infiniband(netdev=[("rdmap79s0", "ens5")], drop=["rdmap80s0"])
+    call = fake.calls[-1]
+    assert call[0] == "build-infiniband-fixture"
+    assert "--netdev" in call and call[call.index("--netdev") + 1] == "rdmap79s0:ens5"
+    assert call[call.index("--drop") + 1] == "rdmap80s0"
