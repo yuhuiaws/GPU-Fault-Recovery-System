@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -804,7 +805,8 @@ def test_unusable_filesystem_wrong_failure_mode_label_fails(
         regional=regional,
         probes=probes(node_probe(survey()), storage_probe(), window_probe()),
     )
-    mount = storage._fs_mount(ctx)
+    digest = hashlib.sha256(ctx.run_id.encode()).hexdigest()[:12]
+    mount = f"/mnt/gfrs-live/{digest}/{storage.TEST_FS}"
     regional.cpu_python_responder = store_script(
         {"activity": unavailable_activity(mount, "PROBE_FAILED")}
     )

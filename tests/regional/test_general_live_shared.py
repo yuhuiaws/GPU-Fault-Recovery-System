@@ -334,7 +334,7 @@ def test_every_005_variant_is_native_both_lanes_behind_kernel_module_load() -> N
         spec.flags == "S"
         for name, spec in SPECS.items()
         if name != "shared_failure_domain"
-    )
+    ), "single-node variants hold the lane and site locks only"
 
 
 def test_preflight_needs_an_immutable_export_image_and_node_b_for_the_pair() -> None:
@@ -350,7 +350,9 @@ def test_preflight_needs_an_immutable_export_image_and_node_b_for_the_pair() -> 
     assert spec.preflight(settings) == []
     pair = SPECS["shared_failure_domain"]
     assert pair.preflight is not None
-    assert any("--node-b" in item for item in pair.preflight(settings))
+    assert any("--node-b" in item for item in pair.preflight(settings)), (
+        "the pair variant must demand --node-b"
+    )
     assert pair.preflight(dataclasses.replace(settings, peer_node=PEER)) == []
 
 
@@ -392,7 +394,7 @@ def test_stat_timeout_fails_when_the_product_misses_the_hang(tmp_path: Path) -> 
     assert result["verdict"] == "FAIL", result
     assert any(
         "no shared_filesystem_unavailable" in error for error in result["errors"]
-    )
+    ), result["errors"]
     assert servers_by_suffix()["a"].paused is False, "resumed before the verdict"
 
 
@@ -635,7 +637,7 @@ def test_shared_failure_domain_needs_two_clients_and_records_the_gap(
     assert any(
         "common failure" in error or "two unrelated" in error
         for error in result["errors"]
-    )
+    ), result["errors"]
     server = servers_by_suffix()["a"]
     assert server.settings.avoid_nodes == (NODE, PEER), server.settings
     assert server.calls == ["create", "wait_ready", "pause", "resume"], server.calls
@@ -707,7 +709,11 @@ def test_healthy_other_mount_fails_when_the_healthy_mount_is_graded_or_dropped(
     document = hang_activity(mount)
     document["batches"].insert(
         0,
-        batch(-120, sample(shared.UNAVAILABLE, other, 0.0), sample(shared.USED, other, 2.0)),
+        batch(
+            -120,
+            sample(shared.UNAVAILABLE, other, 0.0),
+            sample(shared.USED, other, 2.0),
+        ),
     )
     ctx.regional.cpu_python_responder = store_script({"activity": document})
     result = SPECS["healthy_other_mount"].execute(ctx)

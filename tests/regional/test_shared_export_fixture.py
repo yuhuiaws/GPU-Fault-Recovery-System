@@ -233,7 +233,9 @@ def test_create_wait_pause_resume_delete(tmp_path: Path) -> None:
         "the ConfigMap exists before the Pod references it"
     )
     assert created["configmap"] == "uid-101" and created["pod"] == "uid-102"
-    assert all(plane == "gpu" for plane, _args, _text in regional.calls)
+    assert all(plane == "gpu" for plane, _args, _text in regional.calls), (
+        "every call went to the GPU plane"
+    )
     journal = json.loads((tmp_path / "export-a.json").read_text())
     assert journal["created"] == {"configmap": "uid-101", "pod": "uid-102"}
     regional.phases = [{"phase": "Pending"}, running()]

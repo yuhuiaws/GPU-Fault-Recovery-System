@@ -229,7 +229,7 @@ def test_mount_arms_the_deadman_records_then_mounts_soft_in_the_host_namespace(
     ], mounted
     state = sharedp.load_state(RUN_ID)
     assert state["mounts"]["shared"]["mounted"] is True and state["modules"] == []
-    assert Path(target()).is_dir()
+    assert Path(target()).is_dir(), "the mount point directory exists"
 
 
 @pytest.mark.parametrize(
@@ -267,7 +267,9 @@ def test_mount_loads_nfsv4_only_under_the_flag_and_cleanup_unloads_it(
     result = host.emitted[-1]
     assert result["clean"] is True, result["residue"]
     assert {"modules_unloaded": ["nfsv4"]} in result["actions"], result["actions"]
-    assert not (host.sys_module / "nfsv4").exists()
+    assert not (host.sys_module / "nfsv4").exists(), (
+        "(host.sys_module / 'nfsv4').exists() is still present"
+    )
 
 
 def test_umount_cascades_to_force_and_lazy_and_forget_removes_the_record(
@@ -302,7 +304,9 @@ def test_cleanup_unmounts_everything_and_disarms_an_unrecorded_deadman(
     result = host.emitted[-1]
     assert result["clean"] is True, result["residue"]
     assert host.mounts == {} and host.timers == set()
-    assert not (sharedp.MOUNT_ROOT / DIGEST).exists()
+    assert not (sharedp.MOUNT_ROOT / DIGEST).exists(), (
+        "(sharedp.MOUNT_ROOT / DIGEST).exists() is still present"
+    )
     assert sharedp.main(call("residue")) == 0 and host.emitted[-1]["clean"] is True
 
 
@@ -394,4 +398,6 @@ def test_fill_and_unfill_snippets_are_statvfs_driven(tmp_path: Path) -> None:
     (tmp_path / "gfrs-io" / "proof-1.bin").write_bytes(b"x")
     cleaned = snippet(sharedp.UNFILL_SNIPPET, str(tmp_path))
     assert cleaned["removed"] == 2 and not (tmp_path / "gfrs-io").exists()
-    assert not (tmp_path / "gfrs-fill.bin").exists()
+    assert not (tmp_path / "gfrs-fill.bin").exists(), (
+        "(tmp_path / 'gfrs-fill.bin').exists() is still present"
+    )
