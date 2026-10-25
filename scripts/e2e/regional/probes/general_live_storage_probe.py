@@ -121,10 +121,21 @@ CALL_BUDGET_SECONDS = {
     "io-stop": 120,
     "cleanup": 600,
 }
+#: What ``unit_state`` reads back from ``systemctl show``.
+UNIT_PROPERTIES = (
+    "LoadState",
+    "ActiveState",
+    "SubState",
+    "UnitFileState",
+    "MainPID",
+    "NRestarts",
+    "InvocationID",
+    "ExecMainStartTimestamp",
+)
 #: The deadline of the running call (``time.monotonic``), empty when unbudgeted.
 DEADLINE: list[float] = []
 #: Command helpers every step goes through; an error's site is the caller.
-HELPER_FRAMES = frozenset({"run", "clamp", "host_command", "dmsetup"})
+HELPER_FRAMES = frozenset({"run", "clamp", "host_command", "dmsetup", "systemctl"})
 RUNNING_STATES = frozenset({"active", "activating", "deactivating", "reloading"})
 BACKING_ROOTS = (
     Path("/var/lib/gpu-fault-acceptance"),
@@ -306,23 +317,17 @@ def probe_copy(run_id: str) -> Path:
     return target
 
 
+def systemctl(
+    *arguments: str, timeout: int = QUICK_SECONDS
+) -> subprocess.CompletedProcess[str]:
+    """``systemctl <arguments>``, never raising: unit state is read back instead."""
+
+    return run(["systemctl", *arguments], check=False, timeout=timeout)
+
+
 def unit_state(unit: str) -> dict[str, str]:
-    completed = run(
-        [
-            "systemctl",
-            "show",
-            unit,
-            "--property=LoadState",
-            "--property=ActiveState",
-            "--property=SubState",
-            "--property=UnitFileState",
-            "--property=MainPID",
-            "--property=NRestarts",
-            "--property=InvocationID",
-            "--property=ExecMainStartTimestamp",
-        ],
-        check=False,
-        timeout=QUICK_SECONDS,
+    completed = systemctl(
+        "show", unit, *(f"--property={key}" for key in UNIT_PROPERTIES)
     )
     values: dict[str, str] = {}
     for line in completed.stdout.splitlines():
@@ -338,12 +343,8 @@ def arm_deadman(run_id: str, kind: str, seconds: int) -> str:
 
     bounded(seconds, MIN_DEADMAN_SECONDS, MAX_DEADMAN_SECONDS, "deadman seconds")
     name = unit_name(run_id, f"{DEADMAN_PREFIX}-{kind}")
-    run(["systemctl", "stop", f"{name}.timer"], check=False, timeout=QUICK_SECONDS)
-    run(
-        ["systemctl", "reset-failed", f"{name}.service"],
-        check=False,
-        timeout=QUICK_SECONDS,
-    )
+    systemctl("stop", f"{name}.timer")
+    systemctl("reset-failed", f"{name}.service")
     run(
         [
             "systemd-run",
@@ -371,18 +372,10 @@ def arm_deadman(run_id: str, kind: str, seconds: int) -> str:
 
 def disarm_deadman(run_id: str, kind: str) -> None:
     name = unit_name(run_id, f"{DEADMAN_PREFIX}-{kind}")
-    run(["systemctl", "stop", f"{name}.timer"], check=False, timeout=QUICK_SECONDS)
+    systemctl("stop", f"{name}.timer")
     if unit_state(f"{name}.service").get("MainPID") != str(os.getpid()):
-        run(
-            ["systemctl", "stop", f"{name}.service"],
-            check=False,
-            timeout=UNIT_STOP_SECONDS,
-        )
-    run(
-        ["systemctl", "reset-failed", f"{name}.service", f"{name}.timer"],
-        check=False,
-        timeout=QUICK_SECONDS,
-    )
+        systemctl("stop", f"{name}.service", timeout=UNIT_STOP_SECONDS)
+    systemctl("reset-failed", f"{name}.service", f"{name}.timer")
 
 
 def start_unit(
@@ -401,16 +394,8 @@ def start_unit(
     if name not in state["units"]:
         state["units"].append(name)
         save_state(run_id, state)
-    run(
-        ["systemctl", "stop", f"{name}.service"],
-        check=False,
-        timeout=UNIT_STOP_SECONDS,
-    )
-    run(
-        ["systemctl", "reset-failed", f"{name}.service"],
-        check=False,
-        timeout=QUICK_SECONDS,
-    )
+    systemctl("stop", f"{name}.service", timeout=UNIT_STOP_SECONDS)
+    systemctl("reset-failed", f"{name}.service")
     run(
         [
             "systemd-run",
@@ -428,16 +413,8 @@ def start_unit(
 
 def stop_unit(run_id: str, kind: str) -> dict[str, str]:
     name = unit_name(run_id, kind)
-    run(
-        ["systemctl", "stop", f"{name}.service"],
-        check=False,
-        timeout=UNIT_STOP_SECONDS,
-    )
-    run(
-        ["systemctl", "reset-failed", f"{name}.service"],
-        check=False,
-        timeout=QUICK_SECONDS,
-    )
+    systemctl("stop", f"{name}.service", timeout=UNIT_STOP_SECONDS)
+    systemctl("reset-failed", f"{name}.service")
     return unit_state(f"{name}.service")
 
 
@@ -1333,22 +1310,10 @@ def residue(run_id: str) -> dict[str, Any]:
         for root in BACKING_ROOTS
         for path in (root / f"gfrs-live-{digest}").glob("*.img")
     )
-    units = [
-        line.split()[0]
-        for line in run(
-            [
-                "systemctl",
-                "list-units",
-                "--all",
-                "--no-legend",
-                "--plain",
-                f"{UNIT_PREFIX}{digest}-io-*",
-            ],
-            check=False,
-            timeout=QUICK_SECONDS,
-        ).stdout.splitlines()
-        if line.strip()
-    ]
+    listed = systemctl(
+        "list-units", "--all", "--no-legend", "--plain", f"{UNIT_PREFIX}{digest}-io-*"
+    )
+    units = [line.split()[0] for line in listed.stdout.splitlines() if line.strip()]
     modules = [name for name in load_state(run_id)["modules"] if module_loaded(name)]
     return {
         "mounts": own_mounts,
@@ -1424,16 +1389,19 @@ def parser() -> argparse.ArgumentParser:
     value = argparse.ArgumentParser()
     commands = value.add_subparsers(dest="command", required=True)
 
-    def command(name: str, handler: Any) -> argparse.ArgumentParser:
+    def command(
+        name: str, handler: Any, *, named: bool = True
+    ) -> argparse.ArgumentParser:
         item = commands.add_parser(name)
         item.add_argument("--run-id", required=True)
+        if named:
+            item.add_argument("--name", required=True)
         item.set_defaults(handler=handler)
         return item
 
-    command("residue", show_residue)
-    command("cleanup", cleanup).add_argument("--kind", default="all")
+    command("residue", show_residue, named=False)
+    command("cleanup", cleanup, named=False).add_argument("--kind", default="all")
     item = command("fs-create", fs_create)
-    item.add_argument("--name", required=True)
     item.add_argument("--size-mib", type=int, default=2048)
     item.add_argument("--inodes", type=int, default=0)
     item.add_argument("--backing", required=True)
@@ -1450,32 +1418,22 @@ def parser() -> argparse.ArgumentParser:
         ("dm-status", dm_status),
         ("io-stop", io_stop),
     ):
-        command(name, handler).add_argument("--name", required=True)
-    item = command("fs-fill", fs_fill)
-    item.add_argument("--name", required=True)
-    item.add_argument("--percent", type=float, required=True)
-    item = command("fs-remount", fs_remount)
-    item.add_argument("--name", required=True)
-    item.add_argument("--mode", required=True)
-    item = command("fs-umount", fs_umount)
-    item.add_argument("--name", required=True)
-    item.add_argument("--rmdir", action="store_true")
+        command(name, handler)
+    command("fs-fill", fs_fill).add_argument("--percent", type=float, required=True)
+    command("fs-remount", fs_remount).add_argument("--mode", required=True)
+    command("fs-umount", fs_umount).add_argument("--rmdir", action="store_true")
     item = command("dm-create", dm_create)
-    item.add_argument("--name", required=True)
     item.add_argument("--size-mib", type=int, default=2048)
     item.add_argument("--delay-ms", type=int, default=0)
     item.add_argument("--backing", required=True)
     item.add_argument("--deadman-seconds", type=int, required=True)
     item.add_argument("--load-module", action="store_true")
     item.add_argument("--fstype", default="ext4", choices=sorted(MKFS))
-    item = command("dm-retarget", dm_retarget)
-    item.add_argument("--name", required=True)
-    item.add_argument("--target", required=True, choices=("data", "error"))
-    item = command("dm-suspend", dm_suspend)
-    item.add_argument("--name", required=True)
-    item.add_argument("--seconds", type=int, required=True)
+    command("dm-retarget", dm_retarget).add_argument(
+        "--target", required=True, choices=("data", "error")
+    )
+    command("dm-suspend", dm_suspend).add_argument("--seconds", type=int, required=True)
     item = command("io-start", io_start)
-    item.add_argument("--name", required=True)
     item.add_argument("--threads", type=int, default=16)
     item.add_argument("--block-kib", type=int, default=64)
     item.add_argument("--seconds", type=int, required=True)

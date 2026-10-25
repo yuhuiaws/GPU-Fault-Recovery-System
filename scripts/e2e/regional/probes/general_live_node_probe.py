@@ -97,42 +97,12 @@ ENV_KEYS = (
     "GPU_FAULT_METRICS_MODE",
     "GPU_FAULT_DCGM_METRICS_URL",
 )
-TOOLS = (
-    "systemd-run",
-    "systemctl",
-    "losetup",
-    "mkfs.ext4",
-    "mount",
-    "umount",
-    "dmsetup",
-    "fallocate",
-    "blockdev",
-    "ip",
-    "tc",
-    "iptables",
-    "smartctl",
-    "ipmitool",
-    "ethtool",
-    "iostat",
-    "modprobe",
-    "lsblk",
-    "nvidia-smi",
-    "nsenter",
-    "dnf",
-    "rpm",
-    "mkfs.vfat",
-    "mount.nfs4",
+TOOLS = tuple(
+    "systemd-run systemctl losetup mkfs.ext4 mount umount dmsetup fallocate "
+    "blockdev ip tc iptables smartctl ipmitool ethtool iostat modprobe lsblk "
+    "nvidia-smi nsenter dnf rpm mkfs.vfat mount.nfs4".split()
 )
-MODULES = (
-    "dm_mod",
-    "dm_delay",
-    "loop",
-    "veth",
-    "dummy",
-    "sch_netem",
-    "nfsv4",
-    "vfat",
-)
+MODULES = ("dm_mod", "dm_delay", "loop", "veth", "dummy", "sch_netem", "nfsv4", "vfat")
 #: The exporter process a pause may stop: the dcgm-exporter binary of the
 #: product's exporter (DaemonSet Pod or systemd container), never the host
 #: engine.

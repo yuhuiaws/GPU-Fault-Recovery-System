@@ -108,6 +108,7 @@ EFA_VENDOR = "0x1d0f"
 MEMINFO_FIELDS = ("MemFree", "MemAvailable", "SwapTotal", "SwapFree")
 MEMINFO_FIXTURE = "meminfo"
 MAX_MEMINFO_KB = 1 << 50
+WINDOW_MODES = ("bind", "pci-root", "command", "tree", "mixed")
 MIN_RESTORE_SECONDS = 60
 MAX_RESTORE_SECONDS = 5400
 MAX_TREE_DEVICES = 64
@@ -275,17 +276,9 @@ def checked_name(name: str) -> str:
 
 
 def unit_state(unit: str) -> dict[str, str]:
+    properties = ("LoadState", "ActiveState", "SubState", "MainPID", "NRestarts")
     completed = run(
-        [
-            "systemctl",
-            "show",
-            unit,
-            "--property=LoadState",
-            "--property=ActiveState",
-            "--property=SubState",
-            "--property=MainPID",
-            "--property=NRestarts",
-        ],
+        ["systemctl", "show", unit, *(f"--property={key}" for key in properties)],
         check=False,
     )
     values: dict[str, str] = {}
@@ -824,20 +817,6 @@ def inventory(arguments: argparse.Namespace) -> None:
     emit({"run_id": run_id, "captured_at": utc_now(), **value})
 
 
-def view_text(pid: str, path: str) -> dict[str, Any]:
-    """What ``pid``'s mount namespace reads at ``path``: the text and its device."""
-
-    read = nsenter(pid, ["/usr/bin/cat", path])
-    stat = nsenter(pid, ["/usr/bin/stat", "-L", "-c", "%d", path])
-    return {
-        "readable": read.returncode == 0,
-        "value": read.stdout.strip()[:MAX_SOURCE_VALUE_CHARS]
-        if read.returncode == 0
-        else None,
-        "device": stat.stdout.strip() if stat.returncode == 0 else None,
-    }
-
-
 def read_source(arguments: argparse.Namespace) -> None:
     """One allow-listed source as the unit reads it, next to PID 1's view."""
 
@@ -846,7 +825,8 @@ def read_source(arguments: argparse.Namespace) -> None:
     pid = unit_state(HOST_UNIT).get("MainPID", "0")
     if not pid.isdigit() or pid == "0":
         raise ProbeError(f"{HOST_UNIT} has no main process to read through")
-    unit, host = view_text(pid, path), view_text("1", path)
+    unit, host = view_path(pid, path), view_path("1", path)
+    same = unit["readable"] and host["readable"] and unit["sha256"] == host["sha256"]
     emit(
         {
             "run_id": run_id,
@@ -854,12 +834,7 @@ def read_source(arguments: argparse.Namespace) -> None:
             "main_pid": pid,
             "unit": unit,
             "host": host,
-            "same": bool(
-                unit["readable"]
-                and host["readable"]
-                and unit["value"] == host["value"]
-                and unit["device"] == host["device"]
-            ),
+            "same": bool(same and unit["device"] == host["device"]),
             "window_open": bool(load_state(run_id)),
         }
     )
@@ -1123,7 +1098,7 @@ def nsenter(pid: str, command: list[str]) -> subprocess.CompletedProcess[str]:
 
 
 def view_path(pid: str, path: str) -> dict[str, Any]:
-    """What ``pid``'s mount namespace sees at ``path``: readable, sha256, device."""
+    """What ``pid``'s mount namespace sees at ``path``: readable, sha256, device, text."""
 
     read = nsenter(pid, ["/usr/bin/cat", path])
     if read.returncode == 0:
@@ -1145,6 +1120,7 @@ def view_path(pid: str, path: str) -> dict[str, Any]:
         "kind": kind,
         "sha256": hashlib.sha256(content.encode("utf-8", "replace")).hexdigest(),
         "device": stat.stdout.strip() if stat.returncode == 0 else None,
+        "value": content.strip()[:MAX_SOURCE_VALUE_CHARS] if kind == "file" else None,
     }
 
 
@@ -1497,81 +1473,62 @@ def parser() -> argparse.ArgumentParser:
         item.set_defaults(handler=handler)
         return item
 
+    def add(item: argparse.ArgumentParser, flags: str, **options: Any) -> None:
+        """The space-separated ``flags``, all with the same ``options``."""
+
+        for flag in flags.split():
+            item.add_argument(flag, **options)
+
+    many: dict[str, Any] = {"action": "append", "default": []}
+    switch: dict[str, Any] = {"action": "store_true"}
     commands.add_parser("preflight").set_defaults(handler=preflight)
-
-    item = command("install-source", install_source)
-    item.add_argument("--name", required=True)
-    item.add_argument("--sha256", required=True)
-    item.add_argument("--b64", required=True)
-
+    add(
+        command("install-source", install_source),
+        "--name --sha256 --b64",
+        required=True,
+    )
     item = command("build-pci-fixture", build_pci_fixture)
     item.add_argument("--efa-count", type=int, required=True)
-    item.add_argument("--malformed", action="store_true")
-
+    add(item, "--malformed", **switch)
     item = command("build-infiniband-fixture", build_infiniband_fixture)
     item.add_argument("--source", default="/sys/class/infiniband")
-    item.add_argument("--drop", action="append", default=[])
-    item.add_argument("--duplicate", action="append", default=[])
-    item.add_argument("--port-state", action="append", default=[])
-    item.add_argument("--phys-state", action="append", default=[])
-    item.add_argument("--driver", action="append", default=[])
-    item.add_argument("--set", action="append", default=[])
-    item.add_argument("--remove-counter", action="append", default=[])
-    item.add_argument("--no-ports", action="append", default=[])
-    item.add_argument("--netdev", action="append", default=[])
     item.add_argument("--netdev-root", default=NETDEV_ROOT)
-    item.add_argument("--allow-empty", action="store_true")
-
+    add(item, "--drop --duplicate --port-state --phys-state --driver --set", **many)
+    add(item, "--remove-counter --no-ports --netdev", **many)
+    add(item, "--allow-empty", **switch)
     item = command("inventory", inventory)
     item.add_argument("--source", default="/sys/class/infiniband")
     item.add_argument("--netdev-root", default=NETDEV_ROOT)
-
-    item = command("read-source", read_source)
-    item.add_argument("--path", required=True)
-
+    command("read-source", read_source).add_argument("--path", required=True)
     item = command("build-nvidia-proc-fixture", build_nvidia_proc_fixture)
     item.add_argument("--source", default="/proc/driver/nvidia")
-    item.add_argument("--omit-version", action="store_true")
     item.add_argument("--version-text")
     item.add_argument("--gpu-count", type=int)
-    item.add_argument("--omit-gpus", action="store_true")
-
+    add(item, "--omit-version --omit-gpus", **switch)
     item = command("build-meminfo-fixture", build_meminfo_fixture)
     item.add_argument("--source", default="/proc/meminfo")
-    item.add_argument("--set", action="append", default=[])
-
+    add(item, "--set", **many)
     item = command("install-wrapper", install_wrapper)
     item.add_argument("--tool", required=True)
-    item.add_argument("--allow-missing-real", action="store_true")
-
+    add(item, "--allow-missing-real", **switch)
     item = command("open-window", open_window)
-    item.add_argument(
-        "--mode",
-        choices=("bind", "pci-root", "command", "tree", "mixed"),
-        required=True,
-    )
-    item.add_argument("--bind", action="append", default=[])
-    item.add_argument("--tree", action="append", default=[])
-    item.add_argument("--wrapper", action="append", default=[])
-    item.add_argument("--inaccessible", action="append", default=[])
-    item.add_argument("--env", action="append", default=[])
-    item.add_argument("--pci-root", action="store_true")
+    item.add_argument("--mode", choices=WINDOW_MODES, required=True)
+    add(item, "--bind --tree --wrapper --inaccessible --env", **many)
+    add(item, "--pci-root --skip-verify", **switch)
     item.add_argument("--restore-seconds", type=int, default=900)
-    item.add_argument("--skip-verify", action="store_true")
-
     item = command("set-value", apply_value)
-    item.add_argument("--name", required=True)
+    add(item, "--name --value", required=True)
     item.add_argument("--path")
-    item.add_argument("--value", required=True)
-
     item = command("audit-read", audit_read)
     item.add_argument("--tool", required=True)
     item.add_argument("--tail", type=int, default=100)
-
-    command("status", status)
-    command("verify", verify)
-    command("close-window", close_window)
-    command("snapshot", snapshot)
+    for name, handler in (
+        ("status", status),
+        ("verify", verify),
+        ("close-window", close_window),
+        ("snapshot", snapshot),
+    ):
+        command(name, handler)
     return value
 
 
