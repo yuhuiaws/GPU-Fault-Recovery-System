@@ -8,18 +8,24 @@ repeated event are checked on the product's own ``FaultPolicyDecision`` shape.
 
 from __future__ import annotations
 
+import base64
+import json
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from scripts.e2e.regional import general_live_unknown as mod
 from scripts.e2e.regional.general_live_registry import coverage_rows
+from scripts.e2e.regional.general_live_source_replay import KERNEL_UNIT
+from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
     make_context,
     make_settings,
 )
+from tests.regional._general_live_gpu_fakes import survey as gpu_survey
 
 NODE = "ip-10-0-43-5.us-west-2.compute.internal"
 
@@ -163,19 +169,29 @@ def test_variants_match_the_coverage_row() -> None:
         "032 registers every coverage variant"
     )
     implemented = {item.variant for item in mod.VARIANTS if item.execute is not None}
-    assert implemented == {"unknown_xid", "duplicate", "missing_topology"}, (
-        "032 implements the reachable kmsg variants"
-    )
+    assert implemented == {
+        "unknown_xid",
+        "duplicate",
+        "missing_topology",
+        "missing_version",
+    }, "032 implements the kmsg variants and the kernel-collector version replay"
     deferred = [item for item in mod.VARIANTS if item.deferred]
-    assert len(deferred) == 5, (
-        "the other five 032 variants stay in the denominator as NOT_RUN"
+    assert len(deferred) == 4, (
+        "the other four 032 variants stay in the denominator as NOT_RUN"
     )
     version = _spec("missing_version")
-    assert version.deferred.startswith("FIXTURE_NOT_READY") and (
-        "kernel collector" in version.deferred
-        and "gpu-fault-host-collector.service only" in version.deferred
-    ), "missing_version names the unit whose driver-version query matters"
-    assert version.lanes == ("eks", "hp")
+    assert version.implemented and version.approvals == (
+        "KERNEL_COLLECTOR_SOURCE_REPLAY",
+        mod.KERNEL_SOURCE_REPLAY,
+    ), "missing_version needs the kernel collector window and the kmsg replay"
+    assert version.lanes == ("eks", "hp") and (version.flags, version.risk) == (
+        "S",
+        "M",
+    )
+    assert (
+        "CAPABILITY_ABSENT" in version.expected and "product gate" in version.expected
+    )
+    assert version.expected_outcome == "PASS"
     topology = _spec("missing_topology")
     assert topology.lanes == ("eks", "hp") and topology.approvals == (
         mod.KERNEL_SOURCE_REPLAY,
@@ -401,3 +417,436 @@ def test_the_reviewed_sxid_line_is_blocked_by_the_real_parser_and_engine() -> No
     ), (
         "a line naming a link would get ACCESS from the H200 invariant: the replay must not name one"
     )
+
+
+# --------------------------------------------------------------------------- #
+# missing_version: the kernel collector's version withheld, XID 149 replayed
+# --------------------------------------------------------------------------- #
+#: The GPU fake's first GPU: exporter BDF ``00000000:01:00.0`` -> kernel form.
+VERSION_PCI = "0000:01:00"
+VERSION_REASON_TEXT = "NVLink5 decode requires driver branch, IntrInfo and Error Status"
+
+
+def _version_decision(**overrides: Any) -> dict[str, Any]:
+    base: dict[str, Any] = {
+        "event_id": "kernel-log-r1-xid-149",
+        "xid": mod.MISSING_VERSION_XID,
+        "product": "NVIDIA B200",
+        "driver_branch": None,
+        "intr_info": mod.MISSING_VERSION_INTR_INFO,
+        "error_status": mod.MISSING_VERSION_ERROR_STATUS,
+        "gpu_uuid": "GPU-00000000-0000-4000-8000-000000000000",
+        "pci_bdf": VERSION_PCI,
+        "event_source": "KERNEL_LOG",
+        "observed_at": "2026-10-24T00:00:10+00:00",
+        "decision": True,
+        "disposition": "BLOCKED_MISSING_EVIDENCE",
+        "official_action": "WORKFLOW_NVLINK5_ERR",
+        "investigatory_action": "WORKFLOW_NVLINK5_ERR",
+        "action": None,
+        "safety_action": "QUARANTINE",
+        "pre_actions": ["MARK_UNSCHEDULABLE", "STOP_WORKLOAD"],
+        "requires_operator": True,
+        "incident_id": "inc-149",
+        "incident_state": "QUARANTINED",
+        "workflow_request_id": "wf-149",
+        "duplicate": False,
+        "decoded_subcode": None,
+        "matched_decode_rules": [],
+        "reasons": [VERSION_REASON_TEXT],
+    }
+    base.update(overrides)
+    return base
+
+
+def _version_workflow(*operations: str) -> dict[str, Any]:
+    return {
+        "request_id": "wf-149",
+        "incident_id": "inc-149",
+        "status": "SUCCEEDED",
+        "created_at": "2026-10-24T00:00:30+00:00",
+        "official_steps": [
+            {"operation": item, "parameters": {}} for item in operations
+        ],
+        "step_executions": [],
+    }
+
+
+QUARANTINE_STEPS = (
+    "FREEZE_EVIDENCE",
+    "COLLECT_DIAGNOSTIC_BUNDLE",
+    "MARK_UNSCHEDULABLE",
+    "QUARANTINE",
+)
+UNAVAILABLE_LINE = (
+    "nvidia-smi software version discovery unavailable; using configured "
+    "driver/CUDA versions"
+)
+
+
+def _kernel_window_script(
+    *, served: int = 1, journal_lines: list[str] | None = None
+) -> dict[str, Any]:
+    return {
+        "install-source": {"bytes": 1},
+        "install-wrapper": {
+            "shim": "/run/gfrs-live/source-x/bin/nvidia-smi",
+            "unit": KERNEL_UNIT,
+        },
+        "open-window": {
+            "after": {"ActiveState": "active"},
+            "unit": KERNEL_UNIT,
+            "proof_scope": "live-replay",
+        },
+        "audit-read": {
+            "entries": [
+                {
+                    "query": "driver_version",
+                    "applied_rules": [0],
+                    "served_returncode": 1,
+                }
+            ]
+            * served,
+            "calls": {"nvidia-smi/0": served},
+        },
+        "journal-read": {
+            "lines": [UNAVAILABLE_LINE] if journal_lines is None else journal_lines
+        },
+        "close-window": {"clean": True},
+    }
+
+
+def _version_ctx(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    decisions: list[dict[str, Any]],
+    workflows: list[dict[str, Any]] | None = None,
+    model: str = "NVIDIA B200",
+    served: int = 1,
+    journal_lines: list[str] | None = None,
+) -> tuple[Any, dict[str, Any]]:
+    spec = _spec("missing_version")
+    fakes = {
+        "node": FakeProbe({"survey": {"residue": {}}}),
+        "dcgm": FakeProbe({"survey": gpu_survey(model=model)}),
+        "kernel_window": FakeProbe(
+            _kernel_window_script(served=served, journal_lines=journal_lines)
+        ),
+        "kmsg": FakeProbe(_host_script()),
+    }
+
+    def responder(script: str, *arguments: str) -> dict[str, Any]:
+        if script == mod.VERSION_DECISION_PROBE:
+            assert arguments[3] == str(mod.MISSING_VERSION_XID)
+            return {"decisions": decisions}
+        if script == ACTIVITY_PROBE:
+            return {
+                "incidents": [],
+                "workflows": list(workflows or []),
+                "markers": [],
+                "notifications": [],
+                "batches": [],
+                "metric_latest": [],
+                "collector_statuses": [],
+            }
+        raise AssertionError(f"unexpected probe script: {script[:80]}")
+
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=responder),
+        probes={
+            f"node@{NODE}": fakes["node"],
+            f"dcgm@{NODE}": fakes["dcgm"],
+            f"kernel-collector-replay@{NODE}": fakes["kernel_window"],
+            f"kernel-replay-kmsg@{NODE}": fakes["kmsg"],
+        },
+        settings=make_settings(spec, node=NODE),
+        window_minutes=60,
+    )
+    restored: list[list[dict[str, Any]]] = []
+
+    def restore(
+        context: Any, incidents: list[dict[str, Any]], *, reason: str
+    ) -> list[dict[str, Any]]:
+        restored.append(list(incidents))
+        return [
+            {"incident_id": item["incident_id"], "status": "SUCCEEDED"}
+            for item in incidents
+        ]
+
+    monkeypatch.setattr(mod, "restore_incidents", restore)
+    fakes["restored"] = restored
+    return ctx, fakes
+
+
+def _b64_payload(call: tuple[str, ...]) -> Any:
+    return json.loads(base64.b64decode(call[call.index("--b64") + 1]))
+
+
+def test_missing_version_is_capability_absent_on_an_h200_before_any_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This site: the product gate answers before the decoder asks for the version."""
+
+    ctx, fakes = _version_ctx(tmp_path, monkeypatch, decisions=[], model="NVIDIA H200")
+    from scripts.e2e.regional.general_live_fixture import VariantNotRun
+
+    with pytest.raises(VariantNotRun) as info:
+        mod.missing_version(ctx)
+    assert info.value.reason == "CAPABILITY_ABSENT"
+    assert "product gate" in info.value.detail and "NVIDIA H200" in info.value.detail
+    assert "B100/GB200" in info.value.detail
+    assert fakes["kernel_window"].calls == [] and fakes["kmsg"].calls == [], (
+        "nothing was installed, opened or injected"
+    )
+    assert fakes["restored"] == []
+    assert mod.version_gate_errors("NVIDIA B200") == []
+    assert mod.version_gate_errors("NVIDIA GB200") == []
+    assert mod.version_gate_errors(None) and mod.version_gate_errors("NVIDIA A100")
+    assert mod.version_gate_errors("NVIDIA B200", xid=79), (
+        "an XID without the NVLink5 workflow has no version gate"
+    )
+
+
+def test_missing_version_blocks_for_the_driver_branch_on_a_blackwell_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx, fakes = _version_ctx(
+        tmp_path,
+        monkeypatch,
+        decisions=[_version_decision()],
+        workflows=[_version_workflow(*QUARANTINE_STEPS)],
+    )
+    result = mod.missing_version(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["proof_scope"] == "live-replay" and result["product"] == "NVIDIA B200"
+    assert result["incidents"] == ["inc-149"] and fakes["restored"] == [
+        [{"incident_id": "inc-149"}]
+    ], "the quarantine is handed back"
+    assert result["window"]["driver_version_calls_served"] == 1
+    assert result["window"]["journal_unavailable_lines"] == 1
+    assert result["xid_line"].startswith(
+        f"NVRM: Xid (PCI:{VERSION_PCI}): 149, pid=0, name=gfrs-live, NETIR_LINK_EVT "
+        "Fatal XC0 i0 Link 08 (0x004505c6 0x00000000)"
+    ), result["xid_line"]
+    window_calls = fakes["kernel_window"].calls
+    assert [call[0] for call in window_calls] == [
+        "install-source",
+        "install-source",
+        "install-wrapper",
+        "open-window",
+        "audit-read",
+        "journal-read",
+    ], window_calls
+    plan = _b64_payload(
+        next(
+            call
+            for call in window_calls
+            if call[0] == "install-source" and "plan-nvidia-smi.json" in call
+        )
+    )
+    assert plan["rules"] == [
+        {
+            "query": "driver_version",
+            "action": "exit",
+            "exit_code": mod.VERSION_WITHHELD_EXIT,
+            "stderr": mod.VERSION_WITHHELD_STDERR,
+        }
+    ], "the one reviewed rule: the driver-version query fails"
+    installed = next(call for call in window_calls if call[0] == "install-wrapper")
+    assert ("--unit", KERNEL_UNIT) == installed[installed.index("--unit") :][:2]
+    opened = next(call for call in window_calls if call[0] == "open-window")
+    assert "--mode" in opened and opened[opened.index("--mode") + 1] == "command"
+    assert opened[opened.index("--unit") + 1] == KERNEL_UNIT
+    assert "--bind" not in opened and "--env" not in opened
+    kmsg_calls = fakes["kmsg"].calls
+    assert [call[0] for call in kmsg_calls] == [
+        "install-records",
+        "open-window",
+        "arm",
+        "status",
+    ], "the window is proven before the line is injected"
+    records = _b64_payload(kmsg_calls[0])
+    assert records[0]["message"] == result["xid_line"]
+    assert records[0]["transport"] == "kernel"
+    assert "kernel-collector-replay" in ctx.cleanup.pending()
+    assert "kernel-replay-kmsg" in ctx.cleanup.pending()
+
+
+def test_missing_version_fails_when_the_decoder_acted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    acted = _version_decision(
+        disposition="EXECUTABLE",
+        action="RESET_GPU",
+        safety_action=None,
+        pre_actions=[],
+        requires_operator=False,
+        reasons=[
+            "matched the pinned official XID 144-150 decode table: "
+            "NETIR_LINK_EVT/NETIR_LINK_DOWN"
+        ],
+    )
+    ctx, fakes = _version_ctx(
+        tmp_path,
+        monkeypatch,
+        decisions=[acted],
+        workflows=[_version_workflow("FREEZE_EVIDENCE", "RESET_GPU")],
+    )
+    result = mod.missing_version(ctx)
+    assert result["verdict"] == "FAIL", result
+    joined = "\n".join(result["errors"])
+    assert "expected BLOCKED_MISSING_EVIDENCE" in joined
+    assert (
+        "earned action RESET_GPU" in joined and "did not require an operator" in joined
+    )
+    assert "does not name the missing driver branch" in joined
+    assert "plans ['RESET_GPU']" in joined
+    assert fakes["restored"] == [[{"incident_id": "inc-149"}]]
+
+
+def test_missing_version_errors_pin_the_registers_and_the_reason() -> None:
+    assert mod.missing_version_errors([]) == [
+        "the reviewed XID 149 line did not reach a FaultPolicyDecision"
+    ]
+    assert mod.missing_version_errors([_version_decision()]) == []
+    errors = mod.missing_version_errors(
+        [_version_decision(intr_info=None, error_status=None)]
+    )
+    assert errors and "not for the version" in errors[0], errors
+    duplicate_only = _version_decision(duplicate=True, disposition="SITE_SAFETY")
+    assert mod.missing_version_errors([duplicate_only]), (
+        "a duplicate-only read is still graded rather than passed"
+    )
+    assert mod.version_stamped(
+        [_version_decision(), _version_decision(driver_branch=580)]
+    ) == [_version_decision(driver_branch=580)]
+
+
+def test_missing_version_is_inconclusive_when_the_collector_never_asked(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+
+    ctx, fakes = _version_ctx(tmp_path, monkeypatch, decisions=[], served=0)
+    with pytest.raises(VariantInconclusive, match="never took effect"):
+        mod.missing_version(ctx)
+    assert fakes["kmsg"].calls == [], "no XID line is injected without the proof"
+    assert [call[0] for call in fakes["kernel_window"].calls][-2:] == [
+        "audit-read",
+        "journal-read",
+    ]
+
+
+def test_missing_version_is_inconclusive_when_the_journal_found_a_branch(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+
+    ctx, fakes = _version_ctx(
+        tmp_path,
+        monkeypatch,
+        decisions=[],
+        journal_lines=["discovered NVIDIA driver branch 580 and CUDA version 12.8"],
+    )
+    with pytest.raises(VariantInconclusive, match="discovered driver branch"):
+        mod.missing_version(ctx)
+    assert fakes["kmsg"].calls == []
+
+
+def test_missing_version_is_inconclusive_when_a_branch_was_stamped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from scripts.e2e.regional.general_live_fixture import VariantInconclusive
+
+    stamped = _version_decision(
+        driver_branch=580,
+        reasons=[
+            "IntrInfo/Error Status has no match in the pinned official XID 144-150 "
+            "decode table"
+        ],
+    )
+    ctx, fakes = _version_ctx(tmp_path, monkeypatch, decisions=[stamped])
+    with pytest.raises(VariantInconclusive, match="driver_branch=580"):
+        mod.missing_version(ctx)
+    assert fakes["restored"] == [[{"incident_id": "inc-149"}]], (
+        "an ineffective window still hands the quarantine back"
+    )
+
+
+def test_the_reviewed_xid149_line_through_the_real_parser_and_engine() -> None:
+    """kmsg line -> nvidia_logs parser -> policy engine, per product and branch.
+
+    Pins the site finding (H200: NOT_APPLICABLE before the decoder) and the
+    Blackwell outcomes the variant grades and guards against.
+    """
+
+    from datetime import datetime, timezone
+
+    from gpu_fault.models import RecoveryAction
+    from gpu_fault.nvidia_logs import NvidiaKernelLogEvent, NvidiaLogNormalizer
+    from gpu_fault.policy.engine import GpuFaultPolicyEngine
+    from gpu_fault.policy.models import ActionDisposition
+
+    line = mod.missing_version_line(VERSION_PCI, "gl032-missing-version-a1-deadbeef")
+
+    def decide(product: str, branch: int | None) -> tuple[Any, Any]:
+        source = NvidiaKernelLogEvent(
+            cluster_id="gpu-eks-cluster",
+            node_id=NODE,
+            record_id="r1",
+            observed_at=datetime(2026, 10, 24, tzinfo=timezone.utc),
+            message=line,
+            product=product,
+            driver_branch=branch,
+            runtime_profile_version="simulated-v1",
+        )
+        (event,) = NvidiaLogNormalizer().normalize_kernel(source).xid_events
+        assert event.xid == mod.MISSING_VERSION_XID
+        assert event.intr_info == mod.MISSING_VERSION_INTR_INFO
+        assert event.error_status == mod.MISSING_VERSION_ERROR_STATUS
+        assert event.pci_bdf == VERSION_PCI
+        return event, GpuFaultPolicyEngine().evaluate_xid(event)
+
+    # This site: every WORKFLOW_NVLINK5_ERR XID is NOT_APPLICABLE on an H200,
+    # with or without a branch -- the version gate is never reached.
+    for branch in (None, 580):
+        _event, decision = decide("NVIDIA H200", branch)
+        assert decision.disposition is ActionDisposition.NOT_APPLICABLE
+        assert "not applicable to product NVIDIA H200" in decision.reasons[0]
+    assert mod.version_gate_errors("NVIDIA H200"), (
+        "the variant records CAPABILITY_ABSENT"
+    )
+    # A Blackwell node with no branch stamped: the decoder blocks for the version.
+    event, decision = decide("NVIDIA B200", None)
+    assert decision.disposition is ActionDisposition.BLOCKED_MISSING_EVIDENCE
+    assert decision.reasons == [VERSION_REASON_TEXT]
+    assert decision.official_action == "WORKFLOW_NVLINK5_ERR"
+    assert decision.action is None and decision.requires_operator
+    assert decision.safety_action is RecoveryAction.QUARANTINE
+    view = {
+        **_version_decision(),
+        "driver_branch": event.driver_branch,
+        "intr_info": event.intr_info,
+        "error_status": event.error_status,
+        "disposition": decision.disposition.value,
+        "official_action": decision.official_action,
+        "action": None,
+        "requires_operator": decision.requires_operator,
+        "reasons": list(decision.reasons),
+    }
+    assert (
+        mod.missing_version_errors([view]) == [] and mod.version_stamped([view]) == []
+    )
+    # The same line with the branch stamped: this site's R580 (V2) matches no
+    # rule and is still blocked; a V1 driver would decode it to RESET_GPU --
+    # which is why the window is proven effective before the line is injected.
+    _event, v2 = decide("NVIDIA B200", 580)
+    assert v2.disposition is ActionDisposition.BLOCKED_MISSING_EVIDENCE
+    assert "no match" in v2.reasons[0]
+    _event, v1 = decide("NVIDIA B200", 570)
+    assert v1.disposition is ActionDisposition.EXECUTABLE
+    assert v1.action is RecoveryAction.RESET_GPU
+    assert "NETIR_LINK_EVT/NETIR_LINK_DOWN" in v1.reasons[0]

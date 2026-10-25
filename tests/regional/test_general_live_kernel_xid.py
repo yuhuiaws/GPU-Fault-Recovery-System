@@ -269,6 +269,42 @@ def test_inject_refuses_a_non_monitor_grade_code_before_touching_the_node(
     assert fake.calls == [], "nothing reached the node"
 
 
+def test_inject_reviewed_kernel_line_sends_the_message_as_given(tmp_path: Path) -> None:
+    """The caller owns the live-safety argument; the line travels unchanged."""
+
+    fake = FakeProbe(_host_script())
+    ctx = _ctx(tmp_path, lambda *_: {"decisions": []}, fake)
+    message = (
+        "NVRM: Xid (PCI:0000:1b:00): 149, pid=0, name=gfrs-live, "
+        "NETIR_LINK_EVT Fatal XC0 i0 Link 08 (0x004505c6 0x00000000)"
+    )
+    injection = kx.inject_reviewed_kernel_line(
+        ctx, xid=149, pci_bdf="0000:1b:00", message=message, label="032"
+    )
+    assert injection.message == message and injection.xid == 149
+    assert [call[0] for call in fake.calls] == [
+        "install-records",
+        "open-window",
+        "arm",
+        "status",
+    ]
+    assert injection.records_sha256 == kx.records_sha256(
+        [
+            kx.reviewed_record(
+                message, transport="kernel", emissions=kx.EMISSIONS, label="032"
+            )
+        ]
+    ), "the installed record is the given line, kernel transport"
+    with pytest.raises(ValueError, match="does not carry XID 150"):
+        kx.inject_reviewed_kernel_line(
+            ctx, xid=150, pci_bdf="0000:1b:00", message=message, label="032"
+        )
+    with pytest.raises(ValueError, match="PCI BDF"):
+        kx.inject_reviewed_kernel_line(
+            ctx, xid=149, pci_bdf="nope", message=message, label="032"
+        )
+
+
 def test_wait_xid_decisions_filters_the_code_and_records_evidence(
     tmp_path: Path,
 ) -> None:

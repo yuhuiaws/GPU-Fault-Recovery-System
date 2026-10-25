@@ -310,6 +310,41 @@ def inject_kernel_xid(
 
     require_monitor_grade(xid)
     message = xid_message(xid, pci_bdf, run_id=ctx.run_id, label=label)
+    return inject_reviewed_kernel_line(
+        ctx,
+        xid=xid,
+        pci_bdf=pci_bdf,
+        message=message,
+        label=label,
+        emissions=emissions,
+        settle_seconds=settle_seconds,
+    )
+
+
+def inject_reviewed_kernel_line(
+    ctx: VariantContext,
+    *,
+    xid: int,
+    pci_bdf: str,
+    message: str,
+    label: str,
+    emissions: int = EMISSIONS,
+    settle_seconds: int = SETTLE_SECONDS,
+) -> KernelXidInjection:
+    """Deliver one reviewed kernel line, exactly as given, through the kernel source.
+
+    No catalog grade is checked here: the caller owns the live-safety argument
+    for ``message``. ``inject_kernel_xid`` is the monitor-grade caller; 032
+    ``missing_version`` first proves the decoder's version evidence is withheld
+    inside the kernel collector, so its WORKFLOW_NVLINK5_ERR line can only be
+    BLOCKED. INCONCLUSIVE when the fixture file received no reviewed line. The
+    window's cleanup is on ``ctx.cleanup``.
+    """
+
+    if ":" not in pci_bdf:
+        raise ValueError("a kernel XID line needs the GPU's PCI BDF")
+    if f": {xid}," not in message:
+        raise ValueError(f"the reviewed line does not carry XID {xid}")
     records = [
         reviewed_record(message, transport="kernel", emissions=emissions, label=label)
     ]
@@ -527,6 +562,7 @@ __all__ = [
     "catalog_entry",
     "independence_errors",
     "inject_kernel_xid",
+    "inject_reviewed_kernel_line",
     "isolating_decisions",
     "kmsg_pci_bdf",
     "monitor_grade_errors",
