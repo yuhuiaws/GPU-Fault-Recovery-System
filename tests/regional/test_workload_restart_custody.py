@@ -451,7 +451,8 @@ def test_cleanup_still_refuses_what_is_not_this_fixtures_restart(
     elif defect == "no-restart-operation":
         restarted["metadata"]["annotations"].pop("gpu-fault.io/operation-id")
     else:
-        fixture.ownership = SimpleNamespace()
+        # A journal a later process reopened: only what it recorded is deleted.
+        fixture.ownership = SimpleNamespace(resuming=True)
         with pytest.raises(WorkloadOwnershipError):
             fixture.adopt_for_cleanup(restarted)
         return

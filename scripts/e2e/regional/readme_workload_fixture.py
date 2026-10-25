@@ -18,6 +18,7 @@ from scripts.e2e.regional.managed_workload_fixture import (
     ManagedWorkloadFixture,
     ManagedWorkloadSettings,
     read_resource,
+    require_unoccupied,
 )
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalFixtureError,
@@ -114,13 +115,7 @@ class ReadmeWorkloadFixture(ManagedWorkloadFixture):
     def require_empty(self) -> None:
         if self.submission_started:
             raise RegionalFixtureError("managed workload submission already started")
-        if (
-            read_resource(self.regional, self.resource, self.name) is not None
-            or self.inventory()
-        ):
-            raise RegionalFixtureError(
-                "managed workload name or job identity already exists"
-            )
+        require_unoccupied(self)
 
     def run_submission(
         self, command: list[str], *, stage: str

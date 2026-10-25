@@ -546,7 +546,14 @@ backing 文件预分配且限容量上限（永不涨系统盘/`/var`/日志盘�
 `gfrs*`（拒绝有地址或 `device` 链接的真实网卡，记录前后非测试接口摘要）。
 运行器维护一个 LIFO 清理栈并独立还原；隔离类节点只经产品自身的验证式恢复
 （VALIDATE_GPU/HOST/FABRIC → RESTORE_SCHEDULING）接纳，不手删 taint。任何清理
-不能自证干净即整项 FAIL。
+不能自证干净即整项 FAIL。受管测试任务的工作负载名为 manifest 名加 job id 的
+sha256 前 10 位（不超过 43 字符，产品 `-r-<8位>` 重启副本与训练 operator 的
+`-master-0` 副本名仍是合法 DNS-1035 名称），状态读取、Pod/Service 选择和清理都用
+该名；清理按重启血缘（本夹具的 owner nonce 与 job id、由本 attempt 派生的 attempt、
+链到本夹具创建的 UID 或 RESTART_WORKLOAD 副本）一并删除产品原地重启或复制出的
+工作负载并记入日志，清理记录列出删除的每个对象；工作负载与预热 Pod 两部分清理
+总是都执行。创建前名称或 job id 已被占用时拒绝，并逐个列出占用者（kind/name、
+UID、job id、attempt、owner、状态，是否为其他验收运行的遗留），绝不自动删除。
 
 ### 证据与判定
 

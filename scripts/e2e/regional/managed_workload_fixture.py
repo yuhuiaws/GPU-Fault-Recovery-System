@@ -39,6 +39,8 @@ from scripts.e2e.regional.fixture_ownership import (  # noqa: E402
     verify_cleanup_custody,
 )
 from scripts.e2e.regional.workload_restart_custody import (  # noqa: E402
+    ATTEMPT_LABEL,
+    JOB_LABEL,
     RestartCustody,
     WorkloadOwnershipError,
     unbound_restart_root,
@@ -57,6 +59,7 @@ HEARTBEAT_LOG_MARKERS = ("HEARTBEAT", "SUCCESS", "loss=")
 ALL_REDUCE_PATTERN = re.compile(r"all_reduce=([-+0-9.eE]+)")
 SUCCESS_RANK_PATTERN = re.compile(r"SUCCESS rank=(\d+)/(\d+)")
 OWNER_LABEL = "gpu-fault.io/acceptance-owner"
+MANAGED_LABEL = "gpu-fault.io/managed"
 RESOURCE_APIS = {
     "pod": ("api/v1", "pods"),
     "job": ("apis/batch/v1", "jobs"),
@@ -237,6 +240,88 @@ def render_node_pinned_manifest(
     )
     destination.chmod(0o600)
     return destination
+
+
+#: The training operator names a PyTorchJob's replica Pods and Services
+#: ``<job>-master-0`` and the product names a terminal restart copy
+#: ``<job[:52]>-r-<8 hex>``; a 43-character workload name keeps both inside the
+#: 63-character DNS-1035 label they must be.
+WORKLOAD_NAME_LIMIT = 43
+WORKLOAD_NAME_DIGEST = 10
+DNS_1035_LABEL = re.compile(r"[a-z]([-a-z0-9]*[a-z0-9])?")
+
+
+def managed_workload_name(base: str, job_id: str) -> str:
+    """``<base>-<sha256(job id), 10 hex>``: the name of one job's managed workload.
+
+    The GF-GENERAL-LIVE managed jobs kept their manifest's fixed name, so one
+    leftover refused every later job whatever its job id (live 2026-10-25: a
+    Suspended ``gpu-fault-single-node-warm-spare`` of 028.nonzero_exit failed
+    003 and 027 with "managed workload name or job identity already exists",
+    and 003.ambiguous_ownership could never submit its second job). The base
+    keeps the name recognisable; the digest makes it the job's own and is valid
+    for job ids a label takes but a name does not (``gl3-attA-1``).
+    """
+
+    digest = hashlib.sha256(job_id.encode()).hexdigest()[:WORKLOAD_NAME_DIGEST]
+    stem = base[: WORKLOAD_NAME_LIMIT - WORKLOAD_NAME_DIGEST - 1].rstrip("-")
+    name = f"{stem}-{digest}"
+    if not job_id or DNS_1035_LABEL.fullmatch(name) is None:
+        raise ValueError(f"cannot name a managed workload {base!r} for {job_id!r}")
+    return name
+
+
+def name_managed_workload(document: dict[str, Any], job_id: str) -> str:
+    """Rename a rendered managed workload after its job id, in place."""
+
+    metadata = document.setdefault("metadata", {})
+    metadata["name"] = managed_workload_name(str(metadata.get("name") or ""), job_id)
+    return str(metadata["name"])
+
+
+def occupant(document: dict[str, Any], *, owner: str, namespace: str) -> str:
+    """One object holding a managed workload's name or job id, for the operator.
+
+    Its identity, labels and state, and whose it is: this fixture's (the
+    nonce it writes), another acceptance run's (``gpu-fault.io/managed`` and
+    another nonce: a leftover unless that run still runs), or nobody's the
+    harness knows. Nothing is deleted on any of these grounds.
+    """
+
+    metadata = document.get("metadata") or {}
+    labels = metadata.get("labels") or {}
+    spec = document.get("spec") or {}
+    status = document.get("status") or {}
+    kind, name = str(document.get("kind") or "").lower(), metadata.get("name")
+    conditions = [
+        str(item.get("type"))
+        for item in status.get("conditions") or []
+        if isinstance(item, dict) and str(item.get("status")).lower() == "true"
+    ]
+    suspended = spec.get("suspend") is True or (
+        (spec.get("runPolicy") or {}).get("suspend") is True
+    )
+    if kind == "pod":
+        state = str(status.get("phase") or "unknown")
+    elif suspended:
+        state = "Suspended"
+    else:
+        state = conditions[-1] if conditions else "no condition"
+    theirs = labels.get(OWNER_LABEL)
+    identity = (
+        f"{kind}/{name} (uid {metadata.get('uid')}, job-id {labels.get(JOB_LABEL)}, "
+        f"attempt-id {labels.get(ATTEMPT_LABEL)}, {OWNER_LABEL} {theirs}, {state})"
+    )
+    if theirs == owner:
+        return f"{identity} is this fixture's own submission"
+    if theirs and labels.get(MANAGED_LABEL) == "true":
+        return (
+            f"{identity} is another acceptance run's managed workload, left over "
+            "unless that run still runs; it is never deleted automatically -- "
+            f"check it and remove it by hand: kubectl -n {namespace} delete "
+            f"{kind} {name}"
+        )
+    return f"{identity} is not an acceptance-managed workload and is left alone"
 
 
 @dataclass(frozen=True)
@@ -562,6 +647,8 @@ class ManagedWorkloadFixture:
         self.retired_pod_uids: set[str] = set()
         #: Product restarts no custody bound that ``delete`` still removed.
         self.unbound_restart_resources: set[str] = set()
+        #: ``kind/name`` -> UID of every object ``delete`` removed, as it goes.
+        self.deleted: dict[str, str] = {}
         self.cleanup_snapshots: dict[tuple[str, str], CleanupCustody] = {}
         self.ownership: FixtureOwnership | None = None
         if state_path is not None:
@@ -648,19 +735,21 @@ class ManagedWorkloadFixture:
         )
         return True
 
-    def delete(self) -> None:
+    def delete(self) -> dict[str, str]:
+        """Remove everything this fixture's submission led to; what it removed."""
+
         if not getattr(self, "kind_served", True):
-            return  # never created: the cluster does not serve the kind
+            return {}  # never created: the cluster does not serve the kind
         if self.ownership is not None:
             self.ownership.require_acknowledged()
         if not self.submission_started:
-            return
+            return {}
         if self.ownership is not None:
             # A rejected controller ACK grants rollback, not descendant adoption.
             for rejected in self.ownership.rejected_resources(
                 lambda kind, name: read_resource(self.regional, kind, name)
             ):
-                delete_resource(self.regional, rejected)
+                self._remove(rejected)
         documents = self.inventory()
         source = read_resource(self.regional, self.resource, self.name)
         if source is not None and source not in documents:
@@ -725,6 +814,12 @@ class ManagedWorkloadFixture:
             self._delete_controller_service(service)
         if self.ownership is not None:
             self.ownership.complete()
+        return dict(self.deleted)
+
+    def _remove(self, document: dict[str, Any], **options: Any) -> None:
+        kind, name, uid = resource_identity(self.regional, document)
+        delete_resource(self.regional, document, **options)
+        self.deleted[f"{kind}/{name}"] = uid
 
     def _controller_services(
         self, controllers: list[dict[str, Any]]
@@ -767,7 +862,7 @@ class ManagedWorkloadFixture:
             return
         if resource_identity(self.regional, current)[2] != uid:
             raise RegionalFixtureError("controller Service UID changed before deletion")
-        delete_resource(self.regional, current)
+        self._remove(current)
 
     def _delete_owned_resource(self, document: dict[str, Any]) -> None:
         kind, name, uid = resource_identity(self.regional, document)
@@ -782,8 +877,7 @@ class ManagedWorkloadFixture:
             if not self.deletion_only(current):
                 self.adopt_for_cleanup(current)
             try:
-                delete_resource(
-                    self.regional,
+                self._remove(
                     current,
                     propagation_policy="Foreground" if kind == "pod" else "Orphan",
                 )
@@ -791,6 +885,7 @@ class ManagedWorkloadFixture:
             except RegionalCommandFailed:
                 latest = read_resource(self.regional, kind, name)
                 if latest is None:
+                    self.deleted[f"{kind}/{name}"] = uid
                     return
                 if resource_identity(self.regional, latest)[2] != uid:
                     raise RegionalFixtureError(
@@ -880,14 +975,19 @@ class ManagedWorkloadFixture:
 
         A case that failed before ``authorize_restart`` still has to remove the
         copy the product's RESTART_WORKLOAD made of its workload; the lineage
-        rule is ``unbound_restart_root``. A resumable fixture keeps the strict
-        rule: its journal records what it created, never a product copy.
+        rule is ``unbound_restart_root``. A journaled fixture can bind no
+        restart at all, so it takes the same rule and journals each such object
+        (``observe_for_cleanup``): live 2026-10-25 the product restarted
+        028.nonzero_exit's PyTorchJob in place (same UID, attempt
+        ``<source>-r-8856497f``) and ``delete`` refused it ("managed workload
+        ownership or UID changed") before deleting anything, so it stayed. A
+        journal a later process reopened keeps the strict rule.
         """
 
         try:
             self.adopt(document)
         except WorkloadOwnershipError as strict:
-            if self.ownership is not None:
+            if self.ownership is not None and self.ownership.resuming:
                 raise
             kind, name, uid = resource_identity(self.regional, document)
             try:
@@ -903,6 +1003,8 @@ class ManagedWorkloadFixture:
                 )
             except WorkloadOwnershipError as refused:
                 raise WorkloadOwnershipError(f"{strict}; {refused}") from refused
+            if self.ownership is not None:
+                self.ownership.observe_for_cleanup(document)
             previous = self.owned_uids.get((kind, name))
             if kind == "pod" and previous not in (None, uid):
                 self.retired_pod_uids.add(str(previous))
@@ -940,13 +1042,7 @@ class ManagedWorkloadFixture:
         if self.submission_started:
             raise RegionalFixtureError("managed workload submission already started")
         self.require_served_kind()
-        if (
-            read_resource(self.regional, self.resource, self.name) is not None
-            or self.inventory()
-        ):
-            raise RegionalFixtureError(
-                "managed workload name or job identity already exists"
-            )
+        require_unoccupied(self)
         document = yaml.safe_load(rendered)
         metadata = document.get("metadata") if isinstance(document, dict) else None
         if (
@@ -1298,6 +1394,46 @@ class ManagedWorkloadFixture:
 NOTHING_CREATED = "nothing created"
 
 
+def require_unoccupied(workload: ManagedWorkloadFixture) -> None:
+    """Refuse a create whose name or job id is taken, naming every holder.
+
+    Nothing found here is adopted or deleted, a leftover of another acceptance
+    run included (live 2026-10-25 the refusal named nothing and the 028
+    leftover had to be found by hand). The fixture's own workload is never in
+    the way: a second submission refuses before this, and a reopened journal
+    is cleanup-only.
+    """
+
+    named = read_resource(workload.regional, workload.resource, workload.name)
+    found = {
+        (
+            str(item.get("kind")).lower(),
+            str((item.get("metadata") or {}).get("name")),
+        ): item
+        for item in [*([named] if named is not None else []), *workload.inventory()]
+    }
+    if found:
+        namespace = workload.regional.settings.namespace
+        raise RegionalFixtureError(
+            "managed workload name or job identity already exists: "
+            + "; ".join(
+                occupant(item, owner=workload.owner, namespace=namespace)
+                for item in found.values()
+            )
+        )
+
+
+class ManagedJobCleanupError(RegionalFixtureError):
+    """A managed job cleanup with an unproven part; ``record`` is what each did."""
+
+    def __init__(self, record: dict[str, Any]) -> None:
+        super().__init__(
+            "managed job cleanup is unproven: "
+            + json.dumps(record, sort_keys=True, default=str)
+        )
+        self.record = record
+
+
 def remove_managed_job(
     workload: ManagedWorkloadFixture, prewarm: ImagePrewarmFixture
 ) -> dict[str, Any]:
@@ -1306,15 +1442,40 @@ def remove_managed_job(
     Each part reports ``"nothing created"`` when its own state proves it never
     sent a create -- what a failed preparation leaves, since both fixtures
     refuse before they journal an intent -- and otherwise what its cleanup
-    did. A part that did send a create keeps the strict rule: a create without
-    its acknowledgement still refuses as "creation outcome is unknown".
+    deleted (``product_restarts``: what it removed as the product's restart of
+    the job). A part that did send a create keeps the strict rule: a create
+    without its acknowledgement still refuses as "creation outcome is unknown".
+    Both parts always run, and a failed one raises ``ManagedJobCleanupError``
+    with both records: a refused workload cleanup used to skip the prewarm
+    Pods and record nothing of what it had already deleted.
     """
 
-    workload_created = not workload.nothing_created()
-    workload.delete()
-    prewarm_created = not prewarm.nothing_created()
-    residuals = prewarm.cleanup()
-    return {
-        "workload": "removed" if workload_created else NOTHING_CREATED,
-        "prewarm": residuals if prewarm_created else NOTHING_CREATED,
-    }
+    record: dict[str, Any] = {}
+    failed = False
+    try:
+        created = not workload.nothing_created()
+        deleted = workload.delete()
+        record["workload"] = (
+            {
+                "deleted": deleted,
+                "product_restarts": sorted(workload.unbound_restart_resources),
+            }
+            if created
+            else NOTHING_CREATED
+        )
+    except Exception as exc:  # noqa: BLE001 - recorded; the prewarm still runs
+        failed = True
+        record["workload"] = {
+            "error": f"{type(exc).__name__}: {exc}",
+            "deleted": dict(workload.deleted),
+        }
+    try:
+        created = not prewarm.nothing_created()
+        residuals = prewarm.cleanup()
+        record["prewarm"] = residuals if created else NOTHING_CREATED
+    except Exception as exc:  # noqa: BLE001 - recorded with the workload's part
+        failed = True
+        record["prewarm"] = {"error": f"{type(exc).__name__}: {exc}"}
+    if failed:
+        raise ManagedJobCleanupError(record)
+    return record

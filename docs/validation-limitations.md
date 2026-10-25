@@ -1355,6 +1355,39 @@ Not covered offline: whether a GPU node can pull the runtime image (the
 executor's Pods may run elsewhere), and the product-side outcome of each 027
 variant.
 
+Every managed job also rendered its manifest's fixed name
+(`gpu-fault-single-node-warm-spare`, `gpu-fault-two-node-replace`), so one
+leftover refused all later jobs whatever their job id: live 2026-10-25 every
+003 managed-job variant failed before any fault with "managed workload name or
+job identity already exists", and 003 `ambiguous_ownership`, which runs two
+jobs at once, could never have submitted its second. The leftover was the
+Suspended PyTorchJob of an earlier 028 `nonzero_exit`. The product had
+restarted that job in place (same UID, attempt id `<source>-r-<8 hex>`), and
+the case's cleanup refused it ("managed workload ownership or UID changed")
+before deleting anything: a journaled fixture can bind no restart, and its
+cleanup kept the strict adoption rule. A managed workload is now named
+`<manifest name>-<sha256(job id), 10 hex>`, at most 43 characters so the
+product's `-r-<8 hex>` restart copy and the training operator's `-master-0`
+replica names stay DNS-1035 labels, and every lookup (status reads, the job-id
+Pod selector, the `training.kubeflow.org/job-name` Service selector, cleanup)
+follows from that name. A journaled cleanup now deletes what the product
+restarted of its own submission under the restart-lineage rule the unjournaled
+cleanup already had (this fixture's owner nonce and job id, an attempt id
+derived from its own, a chain to a UID it created or to a RESTART_WORKLOAD
+copy) and journals each such object; a journal a later process reopened keeps
+the strict rule. Both halves of a job's cleanup always run, its record lists
+every object deleted and which of them were the product's restart, and a
+failure carries both halves' records. A create whose name or job id is still
+held refuses and names each holder (kind and name, UID, job id, attempt id,
+owner nonce, state, and whether it is another acceptance run's leftover);
+nothing is deleted on that ground. 003's job ids (`gl3-<variant>-<attempt>`)
+repeat every pass, so a leftover of the same 003 job still refuses a later
+pass, now by name. `tests/regional/test_general_live_managed_job_cleanup.py`
+runs the wrappers, fixtures, journals and runner against an in-memory
+namespace with a training operator and the product's in-place and copy
+restarts; on the old code all of its cases fail, the in-place restart with the
+live cleanup record.
+
 GF-GENERAL-LIVE-030 (warm spare unhealthy) is the same story on the HyperPod
 lane: its `SpareSession` keeps the spare node *name* in `self.node` and also
 defined a `node()` accessor, so the instance attribute shadowed the method and

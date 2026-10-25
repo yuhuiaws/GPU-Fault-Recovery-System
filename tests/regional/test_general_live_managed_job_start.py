@@ -47,6 +47,7 @@ from scripts.e2e.regional.managed_workload_fixture import (
     ImagePrewarmFixture,
     ManagedWorkloadFixture,
     ManagedWorkloadSettings,
+    managed_workload_name,
     prewarm_node_names,
 )
 from scripts.e2e.regional.regional_live_fixture import (
@@ -419,6 +420,14 @@ def test_every_managed_job_reaches_its_first_mutation_pinned_to_the_target_node(
     assert labels[OWNER_LABEL] == workload["owner"], (labels, workload["owner"])
     assert workload["started"] is True, workload
     assert list(workload["creations"]) == [f"pytorchjob/{metadata['name']}"]
+    # The job's own name, never the manifest's: one leftover of another job no
+    # longer holds every later job's name (live 2026-10-25).
+    base = (
+        "gpu-fault-two-node-replace"
+        if spec.case_id == "GF-GENERAL-LIVE-011"
+        else "gpu-fault-single-node-warm-spare"
+    )
+    assert metadata["name"] == managed_workload_name(base, job_id), metadata["name"]
 
 
 @pytest.mark.parametrize("key", ONE_PER_CASE)

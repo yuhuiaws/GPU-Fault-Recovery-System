@@ -93,6 +93,7 @@ class ManagedIdleJob:
             ImagePrewarmFixture,
             ManagedWorkloadFixture,
             ManagedWorkloadSettings,
+            name_managed_workload,
             render_node_pinned_manifest,
         )
 
@@ -108,6 +109,7 @@ class ManagedIdleJob:
             source, ctx.case_dir / f"{name}.source.yaml", node=ctx.settings.node
         )
         document = yaml.safe_load(rendered.read_text(encoding="utf-8"))
+        name_managed_workload(document, name)
         set_gpu_duty_percent(document, 0)
         _request_gpus(document, gpu_count)
         document.setdefault("metadata", {}).setdefault("labels", {})

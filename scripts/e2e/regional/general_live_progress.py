@@ -267,6 +267,7 @@ class ManagedProgressJob:
             ImagePrewarmFixture,
             ManagedWorkloadFixture,
             ManagedWorkloadSettings,
+            name_managed_workload,
             render_node_pinned_manifest,
         )
 
@@ -285,6 +286,7 @@ class ManagedProgressJob:
             source, ctx.case_dir / f"{name}.source.yaml", node=ctx.settings.node
         )
         document = yaml.safe_load(rendered.read_text(encoding="utf-8"))
+        name_managed_workload(document, name)
         self.ranks = tuple(sorted(set(ranks)))
         _install_reporter(document, name, self.ranks, self.reporter_image)
         document.setdefault("metadata", {}).setdefault("labels", {}).update(

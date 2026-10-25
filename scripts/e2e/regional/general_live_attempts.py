@@ -62,6 +62,7 @@ class ManagedFailJob:
             ImagePrewarmFixture,
             ManagedWorkloadFixture,
             ManagedWorkloadSettings,
+            name_managed_workload,
             render_node_pinned_manifest,
         )
 
@@ -75,6 +76,7 @@ class ManagedFailJob:
             source, ctx.case_dir / f"{name}.source.yaml", node=ctx.settings.node
         )
         document = yaml.safe_load(rendered.read_text(encoding="utf-8"))
+        name_managed_workload(document, name)
         _apply_mode(document, mode)
         document.setdefault("metadata", {}).setdefault("labels", {}).update(
             {"gpu-fault.io/job-id": name, "gpu-fault.io/attempt-id": f"{name}-a001"}

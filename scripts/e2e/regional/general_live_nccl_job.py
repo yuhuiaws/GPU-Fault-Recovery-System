@@ -502,6 +502,7 @@ class ManagedNcclJob:
             ImagePrewarmFixture,
             ManagedWorkloadFixture,
             ManagedWorkloadSettings,
+            name_managed_workload,
         )
 
         yaml = __import__("yaml")
@@ -526,6 +527,7 @@ class ManagedNcclJob:
             stall_mode=stall_mode,
             flight_recorder=flight_recorder,
         )
+        name_managed_workload(document, name)
         rendered = ctx.case_dir / f"{name}.source.yaml"
         rendered.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         rendered.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")

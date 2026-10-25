@@ -414,6 +414,36 @@ class FixtureOwnership:
             self.record.cleanup_custody[key] = capture_cleanup_custody(document)
             self._save()
 
+    def observe_for_cleanup(self, document: dict[str, Any]) -> None:
+        """Journal a product restart of this fixture's workload, for cleanup only.
+
+        ``observe`` adopts only what keeps its declared intent. The product's
+        RESTART_WORKLOAD relabels the creation in place (a new attempt id on
+        the same UID) or copies it, and the controller makes new Pods; none
+        keeps the intent, all are this fixture's to delete. The caller proved
+        the lineage (``unbound_restart_root``); the observed UID lets
+        ``retain_for_cleanup`` hold the object across the orphan delete. A
+        controller keeps its UID under its name; a Pod that replaced an
+        observed one of the same name supersedes it. A reopened journal
+        records nothing new.
+        """
+
+        with self.operation():
+            self.require_acknowledged()
+            kind, name, uid = _identity(document)
+            key = kind + "/" + name
+            if (
+                self.resuming
+                or self.record.completed
+                or document["metadata"].get("namespace") != self.binding["namespace"]
+                or (kind != "pod" and self.record.observed.get(key, uid) != uid)
+            ):
+                raise RegionalFixtureError(
+                    "fixture restart lineage cannot be journaled"
+                )
+            self.record.observed[key] = uid
+            self._save()
+
     def observe(
         self,
         document: dict[str, Any],
