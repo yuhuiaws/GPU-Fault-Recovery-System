@@ -22,6 +22,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import struct
 import subprocess
 import sys
 import types
@@ -63,6 +64,9 @@ class FakeClock:
     def monotonic(self) -> float:
         return self.now
 
+    def sleep(self, seconds: float) -> None:
+        self.now += seconds
+
 
 class FakeDmHost:
     """One node's device tools, answered at the probe's ``subprocess`` boundary."""
@@ -88,6 +92,11 @@ class FakeDmHost:
         self.seconds_per_command = 0.0
         self.emitted: list[dict[str, Any]] = []
         self.minor = 6
+        #: stdin of the command being answered (a multi-segment ``dmsetup
+        #: reload`` table arrives there) and the ``open_count`` answers of
+        #: ``dmsetup info -c`` per mapping, the last one repeating.
+        self.stdin: str | None = None
+        self.open_counts: dict[str, list[int]] = {}
 
     def write_mountinfo(self) -> None:
         lines = ["22 1 259:1 / / rw,relatime shared:1 - xfs /dev/nvme0n1p1 rw"]
@@ -99,11 +108,12 @@ class FakeDmHost:
         self.mountinfo.write_text("\n".join(lines) + "\n")
 
     def run(
-        self, command: list[str], *, timeout: float, **_: Any
+        self, command: list[str], *, timeout: float, input: str | None = None, **_: Any
     ) -> subprocess.CompletedProcess[str]:
         command = list(command)
         self.calls.append(command)
         self.timeouts.append(timeout)
+        self.stdin = input
         hosted = command[: len(NS)] == NS
         inner = command[len(NS) :] if hosted else command
         stuck = inner[0] in self.hang or (
@@ -133,7 +143,7 @@ class FakeDmHost:
         if tool == "losetup":
             return self.losetup(args)
         if tool == "blockdev":
-            return 0, "4194304\n"
+            return (0, "") if args[0] == "--flushbufs" else (0, "4194304\n")
         if tool == "fallocate":
             Path(args[-1]).write_bytes(b"")
             return 0, ""
@@ -189,9 +199,19 @@ class FakeDmHost:
         verb, name = args[0], args[-1]
         if verb == "reload":
             name = args[1]
-            assert args[2] == "--table", args
-            self.tables[name] = args[3]
+            if args[2:3] == ["--table"]:
+                self.tables[name] = args[3]
+            else:
+                # ``dmsetup reload NAME`` without ``--table`` reads stdin: the
+                # only way to load a table of more than one segment.
+                assert self.stdin, args
+                self.tables[name] = self.stdin.rstrip("\n")
             return 0, ""
+        if verb == "info" and "-o" in args:
+            if name not in self.mappings:
+                return 1, ""
+            answers = self.open_counts.get(name) or [0]
+            return 0, f"{answers.pop(0) if len(answers) > 1 else answers[0]}\n"
         if verb == "create":
             name = args[1]
             assert args[2] == "--table", args
@@ -255,6 +275,8 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeDmHost:
     monkeypatch.setattr(storep, "DEADLINE", [])
     monkeypatch.setattr(storep, "tool_present", lambda name: True)
     monkeypatch.setattr(storep, "emit", fake.emitted.append)
+    # The fake device node cannot be read: the FAT16 geometry is pinned.
+    monkeypatch.setattr(storep, "fat_region", lambda device: list(FAT_SECTORS))
     monkeypatch.setattr(
         storep,
         "subprocess",
@@ -266,7 +288,9 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeDmHost:
         ),
     )
     monkeypatch.setattr(
-        storep, "time", types.SimpleNamespace(monotonic=clock.monotonic)
+        storep,
+        "time",
+        types.SimpleNamespace(monotonic=clock.monotonic, sleep=clock.sleep),
     )
     return fake
 
@@ -607,11 +631,20 @@ def test_the_probe_copy_follows_the_current_script(host: FakeDmHost) -> None:
 # --------------------------------------------------------------------------- #
 # 004 probe_error: FAT16 carrier and the error-table swap
 # --------------------------------------------------------------------------- #
+#: The FAT region ``mkfs.vfat -F 16`` leaves on the 256 MiB carrier (8 reserved
+#: sectors, two FATs of 256 sectors), as ``fat_region`` reads it from the boot
+#: sector -- the fake device node cannot be read, so the tests pin the value.
+FAT_SECTORS = [8, 520]
+FAT_ERROR_TABLE = (
+    "0 8 linear /dev/loop0 0\n8 512 error\n520 4193784 linear /dev/loop0 520"
+)
+
+
 def table_statvfs(host: FakeDmHost) -> Any:
-    """A ``statvfs_reading`` that fails EIO while the mapping is on ``error``."""
+    """A ``statvfs_reading`` that fails EIO while a FAT read hits ``error``."""
 
     def reading(path: str) -> dict[str, Any]:
-        if host.tables.get(DM, "").endswith("error"):
+        if " error" in host.tables.get(DM, ""):
             return {"path": path, "error": "OSError: 5"}
         return {"path": path, "used_percent": 1.0, "read_only": False}
 
@@ -621,11 +654,25 @@ def table_statvfs(host: FakeDmHost) -> Any:
 def build_vfat(host: FakeDmHost, monkeypatch: pytest.MonkeyPatch) -> list[str]:
     synced: list[str] = []
     monkeypatch.setattr(storep, "statvfs_reading", table_statvfs(host))
+    monkeypatch.setattr(storep, "fat_region", lambda device: list(FAT_SECTORS))
     monkeypatch.setattr(storep.os, "sync", lambda: synced.append("sync"))
     (host.sys_module / storep.VFAT_MODULE).mkdir(exist_ok=True)  # already loaded
     assert storep.main(create("--fstype", "vfat")) == 0, host.emitted[-1]
     assert storep.main(call("dm-setup", "--name", "io")) == 0, host.emitted[-1]
     return synced
+
+
+def boot_sector(
+    *, bytes_per_sector: int = 512, reserved: int = 8, fats: int = 2, per_fat: int = 256
+) -> bytes:
+    """A FAT16 BIOS parameter block with the given geometry."""
+
+    sector = bytearray(512)
+    sector[11:24] = struct.pack(
+        "<HBHBHHBH", bytes_per_sector, 8, reserved, fats, 512, 0, 0xF8, per_fat
+    )
+    sector[54:62] = b"FAT16   "
+    return bytes(sector)
 
 
 def test_a_vfat_device_is_formatted_fat16_and_mounted_with_errors_continue(
@@ -635,6 +682,7 @@ def test_a_vfat_device_is_formatted_fat16_and_mounted_with_errors_continue(
     ready = host.emitted[-1]
     assert ready["fstype"] == "vfat" and device()["fstype"] == "vfat", ready
     assert device()["target"] == "data", device()
+    assert ready["fat_sectors"] == FAT_SECTORS == device()["fat_sectors"], ready
     mkfs = next(call for call in host.calls if call[0] == "mkfs.vfat")
     assert mkfs[1:4] == ["-F", "16", "-n"] and mkfs[4] == "GFRSIO", mkfs
     mount = next(call for call in host.device_calls() if tool_of(call) == "mount")
@@ -647,29 +695,57 @@ def test_a_vfat_device_is_formatted_fat16_and_mounted_with_errors_continue(
     ], mount
 
 
-def test_retarget_error_remounts_syncs_swaps_and_data_restores(
+def test_retarget_error_swaps_the_fat_segment_before_a_fresh_mount_and_data_restores(
     host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """The 2026-10-25 live run: the whole-device error table was loaded under a
+    mount whose free-cluster count something had already read, and three
+    attempts later statvfs still answered. The FAT segment now turns to
+    ``error`` while the carrier is unmounted, the device's page cache is
+    dropped and the mount comes up over an unreadable FAT -- there is no
+    window in which a statfs could warm the count, so one attempt is the
+    whole injection and the probe's own reading is the proof."""
+
     synced = build_vfat(host, monkeypatch)
     host.calls.clear()
     assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 0
     faulted = host.emitted[-1]
     assert faulted["faulted"] is True and faulted["attempts"] == 1, faulted
     assert faulted["statvfs"]["error"] == "OSError: 5" and faulted["mounted_on_host"]
-    assert host.tables[DM] == "0 4194304 error", host.tables
+    assert faulted["fat_sectors"] == FAT_SECTORS, faulted
+    assert host.tables[DM] == FAT_ERROR_TABLE, host.tables
     assert device()["target"] == "error", device()
-    assert synced == ["sync"], "the fresh mount's dirty boot sector is synced"
+    assert synced == [], "nothing to sync: the carrier is unmounted for the swap"
     steps = [
         call[len(NS) :][:2] if call[: len(NS)] == NS else call[:2]
         for call in host.device_calls()
     ]
     assert steps == [
         ["umount", device()["mountpoint"]],
-        ["mount", "-t"],
         ["dmsetup", "suspend"],
         ["dmsetup", "reload"],
         ["dmsetup", "resume"],
+        ["blockdev", "--flushbufs"],
+        ["mount", "-t"],
     ], steps
+    reload = next(
+        call
+        for call in host.calls
+        if call[len(NS) : len(NS) + 2] == ["dmsetup", "reload"]
+    )
+    assert "--table" not in reload, (
+        "a three-segment table cannot go on the command line"
+    )
+    flush = next(call for call in host.device_calls() if tool_of(call) == "blockdev")
+    assert flush[len(NS) :] == ["blockdev", "--flushbufs", device()["dm_path"]], flush
+    mount = next(call for call in host.device_calls() if tool_of(call) == "mount")
+    assert mount[len(NS) :][:5] == [
+        "mount",
+        "-t",
+        "vfat",
+        "-o",
+        "errors=continue,noatime",
+    ]
     assert all(call[: len(NS)] == NS for call in host.device_calls()), (
         "every device command joins the host namespaces"
     )
@@ -677,51 +753,83 @@ def test_retarget_error_remounts_syncs_swaps_and_data_restores(
     assert storep.main(call("dm-retarget", "--name", "io", "--target", "data")) == 0
     restored = host.emitted[-1]
     assert restored["faulted"] is False and "error" not in restored["statvfs"]
-    assert host.tables[DM].startswith("0 4194304 linear"), host.tables
+    assert host.tables[DM] == "0 4194304 linear /dev/loop0 0", host.tables
     assert device()["target"] == "data", device()
     tools = [tool_of(call) for call in host.device_calls()]
     assert tools == ["dmsetup", "dmsetup", "dmsetup"], "no remount on the way back"
 
 
-def test_retarget_retries_from_a_fresh_mount_when_the_count_was_cached(
+def test_retarget_reports_a_reading_that_still_answers_after_its_one_attempt(
     host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    build_vfat(host, monkeypatch)
-    answers = iter([False, True])  # first error-table reading still cached, then EIO
-    base = table_statvfs(host)
+    """No retry loop is left: a statvfs that answers over the FAT-error table
+    is reported ``faulted: false`` (the runner's INCONCLUSIVE), not masked by
+    another unmount/mount cycle."""
 
-    def cached(path: str) -> dict[str, Any]:
-        if host.tables.get(DM, "").endswith("error") and not next(answers):
-            return {"path": path, "used_percent": 1.0}
-        return base(path)
-
-    monkeypatch.setattr(storep, "statvfs_reading", cached)
-    assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 0
-    result = host.emitted[-1]
-    assert result["faulted"] is True and result["attempts"] == 2, result
-    reloads = [
-        call[len(NS) + 4]
-        for call in host.calls
-        if tool_of(call) == "dmsetup" and call[len(NS) + 1] == "reload"
-    ]
-    assert reloads == [
-        "0 4194304 error",
-        "0 4194304 linear /dev/loop0 0",
-        "0 4194304 error",
-    ]
-
-
-def test_retarget_gives_up_after_its_attempts(
-    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
-) -> None:
     build_vfat(host, monkeypatch)
     monkeypatch.setattr(
         storep, "statvfs_reading", lambda path: {"path": path, "used_percent": 1.0}
     )
+    host.calls.clear()
     assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 0
     result = host.emitted[-1]
-    assert result["faulted"] is False
-    assert result["attempts"] == storep.RETARGET_ATTEMPTS, result
+    assert result["faulted"] is False and result["attempts"] == 1, result
+    reloads = [
+        call
+        for call in host.calls
+        if call[len(NS) : len(NS) + 2] == ["dmsetup", "reload"]
+    ]
+    assert len(reloads) == 1, reloads
+    assert host.tables[DM] == FAT_ERROR_TABLE, host.tables
+
+
+def test_retarget_error_on_an_ext4_device_keeps_the_whole_device_table(
+    host: FakeDmHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    built(host)
+    monkeypatch.setattr(storep, "statvfs_reading", table_statvfs(host))
+    host.calls.clear()
+    assert storep.main(call("dm-retarget", "--name", "io", "--target", "error")) == 0
+    assert host.tables[DM] == "0 4194304 error", host.tables
+    tools = [tool_of(call) for call in host.device_calls()]
+    assert tools == ["dmsetup", "dmsetup", "dmsetup"], "no remount for ext4"
+
+
+def test_fat_region_reads_the_boot_sector_and_page_aligns_the_error_segment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(storep, "PAGE_SECTORS", 8)
+    monkeypatch.setattr(storep, "MIN_FAT_ERROR_SECTORS", 16)
+    device = tmp_path / "carrier"
+    device.write_bytes(boot_sector())
+    assert storep.fat_region(str(device)) == [8, 520], "mkfs.vfat 4.2 FAT16 on 256 MiB"
+    # One reserved sector: the segment starts at the next page so a user-space
+    # read of the boot sector's page never hits ``error``; the FAT tail that
+    # does not fill a page stays readable too (the count reads the first FAT).
+    device.write_bytes(boot_sector(reserved=1, per_fat=100))
+    assert storep.fat_region(str(device)) == [8, 200]
+    # 4 KiB sectors scale every offset to 512-byte sectors.
+    device.write_bytes(boot_sector(bytes_per_sector=4096, reserved=1, per_fat=32))
+    assert storep.fat_region(str(device)) == [8, 520]
+    device.write_bytes(boot_sector(per_fat=4))
+    with pytest.raises(storep.ProbeError, match="no error segment"):
+        storep.fat_region(str(device))
+    device.write_bytes(boot_sector()[:54] + b"FAT32   " + bytes(450))
+    with pytest.raises(storep.ProbeError, match="FAT16 boot sector"):
+        storep.fat_region(str(device))
+
+
+def test_dm_table_puts_only_the_fat_segment_on_error() -> None:
+    assert storep.dm_table(524288, "/dev/loop0", 0, error=True, fat=[8, 520]) == (
+        "0 8 linear /dev/loop0 0\n8 512 error\n520 523768 linear /dev/loop0 520"
+    )
+    assert storep.dm_table(1024, "/dev/loop0", 0, error=True, fat=[0, 1024]) == (
+        "0 1024 error"
+    )
+    assert storep.dm_table(1024, "/dev/loop0", 0, error=True) == "0 1024 error"
+    assert storep.dm_table(1024, "/dev/loop0", 0, fat=[8, 520]) == (
+        "0 1024 linear /dev/loop0 0"
+    ), "the FAT segment applies to the error table only"
 
 
 def test_retarget_refuses_a_running_writer_and_an_unfinished_device(
@@ -755,6 +863,45 @@ def test_cleanup_of_a_faulted_device_puts_the_data_table_back_first(
     umount_at = verbs.index(("umount", ""))
     assert reload_at < umount_at, verbs
     assert (host.mappings, host.loops, host.mounts) == ({}, {}, {})
+
+
+def test_destroy_waits_for_the_mappings_openers_before_the_remove(
+    host: FakeDmHost,
+) -> None:
+    """The 2026-10-25 live cleanup: ``dmsetup remove --retry`` right after the
+    unmount failed ``Device or resource busy`` (a lazily unmounted copy in
+    another mount namespace, udev's blkid). The destroy now polls the open
+    count for a bounded while and removes once it reaches 0."""
+
+    built(host)
+    host.open_counts[DM] = [2, 1, 0]
+    started = host.clock.now
+    host.calls.clear()
+    assert storep.main(call("cleanup", "--kind", "dm-io")) == 0, host.emitted[-1]
+    assert host.emitted[-1]["clean"] is True, host.emitted[-1]["residue"]
+    verbs = [
+        (tool_of(call), inner[1] if inner[0] == "dmsetup" else inner[-1])
+        for call in host.device_calls()
+        for inner in [call[len(NS) :] if call[: len(NS)] == NS else call]
+        if tool_of(call) == "dmsetup"
+    ]
+    assert verbs.count(("dmsetup", "info")) >= 3, verbs
+    assert verbs.index(("dmsetup", "remove")) > verbs.index(("dmsetup", "info"))
+    assert host.clock.now - started == 2 * storep.REMOVE_POLL_SECONDS
+    assert DM not in host.mappings
+
+
+def test_destroy_gives_up_on_a_mapping_that_stays_open(host: FakeDmHost) -> None:
+    built(host)
+    host.open_counts[DM] = [1]
+    started = host.clock.now
+    assert storep.main(call("dm-destroy", "--name", "io")) == 1
+    error = host.emitted[-1]
+    assert error["error_class"] == "ProbeError", error
+    assert error["error_site"].startswith("destroy_device:"), error
+    assert host.clock.now - started >= storep.REMOVE_WAIT_SECONDS
+    assert DM in host.mappings, "the mapping is left for the deadman's retry"
+    assert "io" in storep.load_state(RUN_ID)["devices"], "and stays recorded"
 
 
 def test_dm_create_loads_vfat_under_the_flag_and_cleanup_unloads_it(

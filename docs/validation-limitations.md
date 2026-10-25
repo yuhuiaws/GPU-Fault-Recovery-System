@@ -1627,21 +1627,36 @@ the FSAL/EXPORT/CONFIG CRIT/MAJ lines logged within eight lines before the marke
 (`preceded by: ...`), never the DBUS start-up noise.
 
 004 `probe_error` has its faulting mount: the storage probe's loop +
-device-mapper device carrying FAT16 (`dm-create --fstype vfat`) whose table
-`dm-retarget --target error` swaps to the `error` target built into `dm_mod`
-right after a fresh mount, so the mount stays, reads read-write in the host
-table, and every `statvfs` fails EIO (FAT counts its free clusters from the
-device at the first `statfs` after a mount; ext4 answers from memory and never
-notices dm-error); `--target data` restores it and the probe's own reading is
-the oracle (no EIO is `INCONCLUSIVE`). The swap is made with nothing dirty so
-the error table is never written -- a failed write would log `Buffer I/O
-error`, which the node log collector's storage rule grades QUARANTINE -- and
-the variant refuses to run while that collector is active. It needs
-`KERNEL_MODULE_LOAD` for a missing `vfat` and `mkfs.vfat` on the node; without
-the tool it is NOT_RUN(CAPABILITY_ABSENT) unless the optional
-`TEMP_TEST_PACKAGE_INSTALL` is given, which installs exactly `dosfstools` for
-the run before the device is built and removes it as the last LIFO cleanup
-after the device is destroyed.
+device-mapper device carrying FAT16 (`dm-create --fstype vfat`). `dm-retarget
+--target error` unmounts it, swaps its table to a three-segment one whose FAT
+segment is the `error` target built into `dm_mod` while the boot sector, root
+directory and data stay `linear` (the FAT region is read from the boot
+sector's BPB at build time, page-aligned inwards, and recorded as
+`fat_sectors`), drops the device's page cache (`blockdev --flushbufs`) and
+mounts the carrier afresh, so the mount stays, reads read-write in the host
+table, and every `statvfs` fails EIO. The mechanism: FAT counts its free
+clusters from the FAT on the device until one count succeeds, then answers
+from memory; the 2026-10-25 live run (hpb lane) swapped the whole device to
+`error` under a fresh mount and lost the race three times to a `statfs` made
+in between (the host collector's own reading of the declared mount, or any
+agent's), so every later statvfs answered from the cached count and the
+variant was INCONCLUSIVE. A FAT that is unreadable before the mount exists can
+never be counted, so there is no race to lose; ext4 answers from memory from
+the start and never notices dm-error. `--target data` restores the data table
+in place (the next count succeeds, no remount), and the probe's own reading is
+the oracle (no EIO on its one attempt is `INCONCLUSIVE`; the retry loop is
+gone). The error segment is neither written nor page-read from user space --
+a failed write would log `Buffer I/O error`, which the node log collector's
+storage rule grades QUARANTINE; the kernel only logs `FAT-fs: FAT read failed`
+lines, which that rule does not match -- and the variant still refuses to run
+while that collector is active. The destroy unmounts, then waits (bounded, 90
+s) for the mapping's `open_count` to reach 0 before `dmsetup remove`: the
+2026-10-25 live cleanup removed right after the unmount and failed `Device or
+resource busy`. It needs `KERNEL_MODULE_LOAD` for a missing `vfat` and
+`mkfs.vfat` on the node; without the tool it is NOT_RUN(CAPABILITY_ABSENT)
+unless the optional `TEMP_TEST_PACKAGE_INSTALL` is given, which installs
+exactly `dosfstools` for the run before the device is built and removes it as
+the last LIFO cleanup after the device is destroyed.
 
 ## GF-GENERAL-LIVE 029 store-level restart-budget variants
 

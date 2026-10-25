@@ -16,14 +16,19 @@ VALIDATE_HOST diagnostic with no capacity finding and no reset, reboot or
 quarantine (batch 163), the node held while it stays unusable and readmitted
 once the mount is restored. ``probe_error``'s faulting mount is the storage
 probe's loop + device-mapper device carrying FAT16 (``dm-create --fstype
-vfat``): ``dm-retarget --target error`` swaps its table to the ``error``
-target built into ``dm_mod`` under a fresh mount, so the mount stays, reads
-read-write in the host table, and every ``statvfs`` fails EIO (FAT counts its
-free clusters from the device at the first ``statfs`` after a mount; ext4
-answers from memory). ``--target data`` restores it. The node log collector
-must be inactive (its storage rule grades a ``Buffer I/O error`` line
-QUARANTINE; the swap is made with nothing dirty so no such line is written,
-but an active collector would make the chain ambiguous). A node without
+vfat``): ``dm-retarget --target error`` unmounts it, swaps its table to one
+whose FAT segment is the ``error`` target built into ``dm_mod`` (boot sector,
+root directory and data stay ``linear``), drops the device's page cache and
+mounts it afresh, so the mount stays, reads read-write in the host table, and
+every ``statvfs`` fails EIO: FAT counts its free clusters from the FAT on the
+device until one count succeeds and then answers from memory (the 2026-10-25
+live run lost that race three times to a statfs made between the fresh mount
+and the whole-device swap), while a FAT unreadable before the mount exists
+can never be counted; ext4 answers from memory from the start. ``--target
+data`` restores it in place. The node log collector must be inactive (its
+storage rule grades a ``Buffer I/O error`` line QUARANTINE; the error segment
+is never written or page-read, so no such line is written, but an active
+collector would make the chain ambiguous). A node without
 ``mkfs.vfat`` (the AL2023 EKS GPU AMI) keeps ``probe_error``
 NOT_RUN(CAPABILITY_ABSENT) unless the optional ``TEMP_TEST_PACKAGE_INSTALL`` is
 given; then the shared temporary-package step (``general_live_deps``) installs
@@ -465,13 +470,15 @@ def _inject_unusable(ctx: VariantContext, variant: str) -> dict[str, Any]:
         return injected
     if variant == "probe_error":
         # Registered before the swap: a lost answer still puts the data table
-        # back before the device is destroyed (LIFO).
+        # back before the device is destroyed (LIFO). The probe's own statvfs
+        # over the FAT-error table is the oracle; it answers in one attempt or
+        # the injection is not what the variant describes.
         ctx.cleanup.push("dm-data", lambda: _retarget(ctx, "data"))
         injected = _retarget(ctx, "error")
         if not injected.get("faulted") or not injected.get("mounted_on_host", True):
             raise VariantInconclusive(
-                "the error-table swap left the mount's statvfs answering "
-                f"(attempts {injected.get('attempts')}); no EIO to inject"
+                "the FAT-segment error table left the fresh mount's statvfs "
+                f"answering (attempts {injected.get('attempts')}); no EIO to inject"
             )
         return injected
     raise VariantInconclusive(f"unknown unusable-filesystem variant {variant!r}")
@@ -653,16 +660,20 @@ VARIANTS = [
     ),
     _fs_spec(
         "probe_error",
-        "a declared FAT16 test mount over loop + dm whose table is swapped to the "
-        "dm_mod error target under a fresh mount: statvfs EIO while mounted rw "
-        "(KERNEL_MODULE_LOAD loads a missing vfat; the optional "
-        "TEMP_TEST_PACKAGE_INSTALL installs a missing mkfs.vfat as dosfstools for "
-        "the run; the node log collector must be off)",
+        "a declared FAT16 test mount over loop + dm, unmounted, its table swapped "
+        "to one whose FAT segment is the dm_mod error target (boot sector, root "
+        "directory and data stay linear), the device's page cache dropped and the "
+        "carrier mounted afresh: every statvfs EIO while mounted rw, the FAT "
+        "unreadable before any statfs could count and cache it (KERNEL_MODULE_LOAD "
+        "loads a missing vfat; the optional TEMP_TEST_PACKAGE_INSTALL installs a "
+        "missing mkfs.vfat as dosfstools for the run; the node log collector must "
+        "be off)",
         "filesystem_unavailable (PROBE_FAILED) -> FREEZE_EVIDENCE, VALIDATE_HOST; "
         "no capacity finding, no reset/reboot/quarantine (batch 163: an "
         "unreadable status is unusable, never healthy); readmit once the data "
         "table is back",
-        "data table back, close the window, destroy the device, unload vfat if loaded "
+        "data table back in place, close the window, destroy the device (unmount, "
+        "wait for the mapping's openers, remove, detach), unload vfat if loaded "
         "here, remove dosfstools if installed here",
         probe_error,
         approvals=("KERNEL_MODULE_LOAD",),

@@ -201,13 +201,20 @@ inode耗尽、只读、必需挂载消失、EIO/EACCES分别验，不能用剩�
 容量 finding，不 reset/reboot/隔离，不可读状态记为不可用（UNKNOWN）而非健康，挂载
 不可用期间 hold 节点、还原后随信号清零受控接纳（批次163修复，此前按 capacity-only
 缺口记 FAIL）。`probe_error` 的故障挂载夹具：存储探针的 loop + device-mapper 测试设备改载
-FAT16（`dm-create --fstype vfat`），`dm-retarget --target error` 先重新挂载再把表换成 `dm_mod`
-内建的 `error` 目标——挂载仍在（非 MOUNT_MISSING）、宿主表为 rw（非 READ_ONLY），而每次
-`statvfs` 都返回 EIO（FAT 在挂载后首次 `statfs` 时才从设备读 FAT 计数空簇，ext4 全在内存，
-对 dm-error 无感）→ PROBE_FAILED；`--target data` 还原，探针自身读数是有效性 oracle（未读到
-EIO 即 `INCONCLUSIVE`，缓存命中时从新挂载重试最多 3 次）。交换前先 sync，不向 error 表写入
-（写失败会记 `Buffer I/O error`，节点日志采集器 `log_rules.py` 的存储规则会把它判成
-QUARANTINE），因此节点日志采集器处于 active 时记 `NOT_RUN(FIXTURE_NOT_READY)`；缺 `vfat`
+FAT16（`dm-create --fstype vfat`），`dm-retarget --target error` 先卸载，再把表换成"仅 FAT
+区段为 `dm_mod` 内建 `error` 目标、引导扇区/根目录/数据区仍为 `linear`"的三段表（FAT 区段按
+引导扇区 BPB 计算并向内对齐到页边界，建设备时记入 `fat_sectors`），`blockdev --flushbufs`
+丢弃设备页缓存后重新挂载——挂载仍在（非 MOUNT_MISSING）、宿主表为 rw（非 READ_ONLY），而每次
+`statvfs` 都返回 EIO → PROBE_FAILED。原理：FAT 的 `statfs` 从设备读 FAT 计数空簇，但一旦某次计数
+成功就改为从内存应答；2026-10-25 live 曾在"新挂载→整盘 error 表"之间被别的 `statfs`（宿主采集器等）
+抢先计数，三次重试全部命中缓存而 INCONCLUSIVE；现在 FAT 在挂载存在之前就已不可读，任何 `statfs`
+都无法计数成功，不存在可输的竞态（ext4 自始至终在内存中应答，对 dm-error 无感）。`--target data`
+原地还原（无需重挂载，下一次计数即成功），探针自身读数是有效性 oracle（一次尝试未读到 EIO 即
+`INCONCLUSIVE`，不再重试）。error 区段既不被写入也不被用户态按页读取（写失败会记
+`Buffer I/O error`，节点日志采集器 `log_rules.py` 的存储规则会把它判成 QUARANTINE；内核只打
+`FAT-fs: FAT read failed` 行，不匹配该规则），但节点日志采集器处于 active 时仍记
+`NOT_RUN(FIXTURE_NOT_READY)`；销毁设备时先卸载，再轮询映射的 open_count 归零（最多 90 s，
+2026-10-25 live 清理曾在卸载后立刻 `dmsetup remove` 得 EBUSY）后 remove、detach；缺 `vfat`
 模块时在 `KERNEL_MODULE_LOAD` 下加载并在清理时卸载；节点需有 `mkfs.vfat`（dosfstools），缺它时记
 `NOT_RUN(CAPABILITY_ABSENT)` 并提示令牌，给可选令牌 `TEMP_TEST_PACKAGE_INSTALL` 则由共享的临时测试包
 步骤（`general_live_deps.ensure_dependencies`）在建设备前只安装 `dosfstools`，设备销毁后作为最后一步

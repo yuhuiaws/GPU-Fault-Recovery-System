@@ -4,37 +4,31 @@
 Runs on the target node through ``host_probe_fixture.py`` (chroot into the
 host, the node's own Python), standard library only, one JSON object on the
 last stdout line -- the sibling of ``general_live_node_probe.py``, split off
-because one file may not exceed the repository's size limit.
-
-Everything it creates is test-only and named after a digest of the run id:
+because one file may not exceed the repository's size limit. Everything it
+creates is test-only and named after a digest of the run id:
 
 * a loop file system (``fallocate``-preallocated backing file, ``mkfs.ext4 -m
   0``) or a loop + device-mapper ``linear``/``delay`` device mounted under
   ``/mnt/gfrs-live/<digest>/<name>``; the backing file lives only under an
-  allow-listed directory and is refused if its file system would end above
-  80 % used, so filling the *test* file system never grows the system disk;
+  allow-listed directory whose file system may not end above 80 % used;
 * a bounded O_DIRECT writer unit that writes only files inside that mount;
 * the 004 ``probe_error`` faulting mount: the same device carrying FAT16
-  (``--fstype vfat``) whose table ``dm-retarget`` swaps to the ``error``
-  target built into ``dm_mod`` -- a configured mount whose ``statvfs`` fails
-  EIO while it stays mounted -- and back to its data table.
+  (``--fstype vfat``) whose table ``dm-retarget`` swaps, under a fresh mount,
+  to one whose FAT segment is the ``error`` target built into ``dm_mod`` -- a
+  configured mount whose ``statvfs`` fails EIO every time while it stays
+  mounted read-write -- and back to its data table.
 
-Every creation is recorded in ``storage-state.json`` before it happens and is
-preceded by a ``systemd-run --on-active`` deadman that unmounts, detaches and
-deletes it from a copy of this file; the run's own backing directory and mount
-root go with its last file system or device (``prune_run_directories``), and
-``residue`` names any of them still present. No raw disk, real mount, system or
-log disk is ever opened.
-
-The device-mapper device lives entirely in the host's namespaces: ``dmsetup``
-blocks create/resume/remove until the host udevd completes a libdevmapper
-cookie (a SysV semaphore, per IPC namespace), which never reaches the probe
-Pod's own IPC namespace -- the 2026-10-25 live ``dm-create`` ``TimeoutExpired``
-on both EKS nodes. So the setup runs as a bounded transient unit (``dm-create``
-returns at once; the runner polls ``dm-status``) and every other ``dmsetup``,
-``mount``, ``umount`` joins PID 1's IPC and mount namespaces (``host_command``).
-Each subcommand has a wall-clock budget (``CALL_BUDGET_SECONDS``) that ``run``
-clamps every command to, so a call answers before the runner's exec timeout.
+Every creation is recorded in ``storage-state.json`` first and preceded by a
+``systemd-run --on-active`` deadman that undoes it from a copy of this file;
+``residue`` names whatever is still present. No raw disk, real mount, system
+or log disk is ever opened. ``dmsetup`` create/resume/remove block until the
+host udevd completes a libdevmapper cookie (a SysV semaphore, per IPC
+namespace) that never reaches the Pod's own IPC namespace (the 2026-10-25 live
+``dm-create`` ``TimeoutExpired``), so the setup runs as a bounded transient
+unit (``dm-create`` returns at once; the runner polls ``dm-status``) and every
+other device command joins PID 1's IPC and mount namespaces
+(``host_command``). Each subcommand has a wall-clock budget
+(``CALL_BUDGET_SECONDS``) that ``run`` clamps every command to.
 """
 
 from __future__ import annotations
@@ -46,6 +40,7 @@ import os
 import re
 import shlex
 import shutil
+import struct
 import subprocess
 import sys
 import time
@@ -66,17 +61,21 @@ DELAY_MODULE = "dm_delay"
 VFAT_MODULE = "vfat"
 LOADABLE_MODULES = (DELAY_MODULE, VFAT_MODULE)
 #: File systems a test device may carry. FAT16 is the 004 ``probe_error``
-#: carrier: its ``statfs`` reads the FAT on the device at the first call after
-#: a mount (ext4 answers from memory), so a fresh mount swapped to ``error``
-#: fails EIO; ``errors=continue`` keeps FAT from remounting read-only.
+#: carrier: ``statfs`` counts its free clusters from the FAT on the device
+#: until one count succeeds, then answers from memory (``retarget_once``);
+#: ext4 answers from memory from the start. ``errors=continue`` keeps FAT
+#: from remounting read-only.
 MKFS = {
     "ext4": ("mkfs.ext4", "-q", "-F", "-m", "0", "-L"),
     "vfat": ("mkfs.vfat", "-F", "16", "-n"),
 }
 MOUNT_OPTIONS = {"ext4": (), "vfat": ("-o", "errors=continue,noatime")}
-#: How often ``dm-retarget --target error`` re-mounts and swaps when something
-#: read the fresh mount's ``statfs`` first and cached the count.
-RETARGET_ATTEMPTS = 3
+#: The FAT16 carrier's error segment is page-aligned (sectors per page), so a
+#: user-space page read of the boot sector or root directory never touches it
+#: (no ``Buffer I/O error`` in the kernel log); the FAT must keep at least
+#: ``MIN_FAT_ERROR_SECTORS`` inside it.
+PAGE_SECTORS = os.sysconf("SC_PAGE_SIZE") // 512
+MIN_FAT_ERROR_SECTORS = 2 * PAGE_SECTORS
 #: Device commands run in PID 1's IPC namespace (udev completes the dmsetup
 #: cookie there) and mount namespace (the collector and the writer see it).
 HOST_NAMESPACES = ("nsenter", "--target", "1", "--ipc", "--mount", "--")
@@ -90,6 +89,10 @@ UNIT_TIMEOUT_STOP_SECONDS = 20
 UNIT_STOP_SECONDS = 2 * UNIT_TIMEOUT_STOP_SECONDS + 20
 MOUNT_SECONDS = 60
 UMOUNT_SECONDS = 120
+#: How long ``destroy_device`` waits for the mapping's openers to go after
+#: the unmount before ``dmsetup remove``; polled every ``REMOVE_POLL_SECONDS``.
+REMOVE_WAIT_SECONDS = 90
+REMOVE_POLL_SECONDS = 3
 #: The setup unit's steps and their timeouts. Its ``RuntimeMaxSec`` adds
 #: ``SETUP_RECORD_SECONDS`` so the worker records a failed step before
 #: systemd would kill it.
@@ -105,9 +108,8 @@ SETUP_RECORD_SECONDS = 30
 SETUP_MAX_SECONDS = sum(SETUP_STEP_SECONDS.values()) + SETUP_RECORD_SECONDS
 #: Worst-case wall time of one call (seconds), per subcommand: ``main`` arms
 #: the deadline and ``run`` clamps every command to what is left, so a call
-#: ends (with its JSON error) inside the runner's exec timeout (budget plus
-#: transport margin); ``cleanup``/``dm-destroy`` are cut at theirs and the
-#: deadman finishes. Unlisted subcommands keep per-command timeouts only.
+#: ends (with its JSON error) inside the runner's exec timeout; unlisted
+#: subcommands keep per-command timeouts only.
 CALL_BUDGET_SECONDS = {
     "dm-create": 300,
     "dm-status": 60,
@@ -123,15 +125,9 @@ CALL_BUDGET_SECONDS = {
 }
 #: What ``unit_state`` reads back from ``systemctl show``.
 UNIT_PROPERTIES = (
-    "LoadState",
-    "ActiveState",
-    "SubState",
-    "UnitFileState",
-    "MainPID",
-    "NRestarts",
-    "InvocationID",
-    "ExecMainStartTimestamp",
-)
+    "LoadState ActiveState SubState UnitFileState MainPID NRestarts InvocationID "
+    "ExecMainStartTimestamp"
+).split()
 #: The deadline of the running call (``time.monotonic``), empty when unbudgeted.
 DEADLINE: list[float] = []
 #: Command helpers every step goes through; an error's site is the caller.
@@ -211,23 +207,23 @@ def tool_present(name: str) -> bool:
 
 
 def host_command(
-    command: list[str], *, check: bool = True, timeout: float = QUICK_SECONDS
+    command: list[str], *, timeout: float = QUICK_SECONDS, **options: Any
 ) -> subprocess.CompletedProcess[str]:
     """``command`` in PID 1's IPC and mount namespaces (the Pod is hostPID).
 
     Only there does the host udevd's ``dmsetup udevcomplete`` wake a ``dmsetup``,
     and a mount made there is the one the collector and the writer unit see.
+    ``options`` are ``run``'s (``check``, ``input_text`` -- a multi-segment
+    ``dmsetup reload`` table goes in on stdin; ``--table`` takes one line).
     """
 
     if not tool_present("nsenter"):
         raise ProbeError("nsenter is missing: device commands cannot reach the host")
-    return run([*HOST_NAMESPACES, *command], check=check, timeout=timeout)
+    return run([*HOST_NAMESPACES, *command], timeout=timeout, **options)
 
 
-def dmsetup(
-    *arguments: str, check: bool = True, timeout: float = QUICK_SECONDS
-) -> subprocess.CompletedProcess[str]:
-    return host_command(["dmsetup", *arguments], check=check, timeout=timeout)
+def dmsetup(*arguments: str, **options: Any) -> subprocess.CompletedProcess[str]:
+    return host_command(["dmsetup", *arguments], **options)
 
 
 def checked_run_id(value: str) -> str:
@@ -247,6 +243,10 @@ def bounded(value: int, low: int, high: int, label: str) -> int:
     if not low <= number <= high:
         raise ProbeError(f"{label} is outside {low}..{high}")
     return number
+
+
+def deadman_seconds(value: int) -> int:
+    return bounded(value, MIN_DEADMAN_SECONDS, MAX_DEADMAN_SECONDS, "deadman seconds")
 
 
 def run_digest(run_id: str) -> str:
@@ -341,7 +341,7 @@ def unit_state(unit: str) -> dict[str, str]:
 def arm_deadman(run_id: str, kind: str, seconds: int) -> str:
     """Arm ``cleanup --kind <kind>`` after ``seconds``; raise if it is not armed."""
 
-    bounded(seconds, MIN_DEADMAN_SECONDS, MAX_DEADMAN_SECONDS, "deadman seconds")
+    deadman_seconds(seconds)
     name = unit_name(run_id, f"{DEADMAN_PREFIX}-{kind}")
     systemctl("stop", f"{name}.timer")
     systemctl("reset-failed", f"{name}.service")
@@ -425,12 +425,11 @@ def statvfs_reading(path: str) -> dict[str, Any]:
         return {"path": path, "error": f"{type(exc).__name__}: {exc.errno}"}
     total = stat.f_blocks * stat.f_frsize
     available = stat.f_bavail * stat.f_frsize
+    files = stat.f_files
     return {
         "path": path,
         "used_percent": 100 * (total - available) / total if total else None,
-        "inodes_used_percent": (
-            100 * (stat.f_files - stat.f_ffree) / stat.f_files if stat.f_files else None
-        ),
+        "inodes_used_percent": 100 * (files - stat.f_ffree) / files if files else None,
         "read_only": bool(stat.f_flag & os.ST_RDONLY),
         "total_bytes": total,
         "available_bytes": available,
@@ -495,8 +494,8 @@ def run_backing_dir(run_id: str, root: Path) -> Path:
 
 
 def run_directories(run_id: str) -> list[Path]:
-    """The run's own directories: its backing directory under each allow-listed
-    root and its mount root ``/mnt/gfrs-live/<digest>`` (made on demand)."""
+    """The run's backing directory under each allow-listed root and its mount
+    root ``/mnt/gfrs-live/<digest>`` (made on demand)."""
 
     digest = run_digest(run_id)
     backing = [root / f"gfrs-live-{digest}" for root in BACKING_ROOTS]
@@ -504,9 +503,8 @@ def run_directories(run_id: str) -> list[Path]:
 
 
 def prune_run_directories(run_id: str) -> list[str]:
-    """Remove the run's directories once it holds no test file system or
-    device and they are empty (every destroy and ``cleanup`` end here); one
-    with content stays and ``residue`` names it."""
+    """Remove the run's directories once it holds no test file system or device
+    and they are empty (every destroy ends here); ``residue`` names the rest."""
 
     state = load_state(run_id)
     if state["devices"] or state["filesystems"]:
@@ -534,12 +532,7 @@ def fs_create(arguments: argparse.Namespace) -> None:
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
     size_mib = bounded(arguments.size_mib, MIN_FS_MIB, MAX_FS_MIB, "size MiB")
-    seconds = bounded(
-        arguments.deadman_seconds,
-        MIN_DEADMAN_SECONDS,
-        MAX_DEADMAN_SECONDS,
-        "deadman seconds",
-    )
+    seconds = deadman_seconds(arguments.deadman_seconds)
     state = load_state(run_id)
     if name in state["filesystems"] or name in state["devices"]:
         raise ProbeError("a test file system of this name already exists")
@@ -648,13 +641,8 @@ def fs_inodes(arguments: argparse.Namespace) -> None:
             break
         created += 1
     os.sync()
-    emit(
-        {
-            "created": created,
-            "enospc": exhausted,
-            "statvfs": statvfs_reading(str(target)),
-        }
-    )
+    reading = statvfs_reading(str(target))
+    emit({"created": created, "enospc": exhausted, "statvfs": reading})
 
 
 def fs_remount(arguments: argparse.Namespace) -> None:
@@ -675,15 +663,11 @@ def fs_umount(arguments: argparse.Namespace) -> None:
     bucket = "filesystems" if name in state["filesystems"] else "devices"
     state[bucket][name]["mounted"] = False
     save_state(run_id, state)
+    path = entry["mountpoint"]
     if arguments.rmdir:
-        Path(entry["mountpoint"]).rmdir()
-    emit(
-        {
-            "unmounted": entry["mountpoint"],
-            "directory_present": Path(entry["mountpoint"]).exists(),
-            "statvfs": statvfs_reading(entry["mountpoint"]),
-        }
-    )
+        Path(path).rmdir()
+    present, reading = Path(path).exists(), statvfs_reading(path)
+    emit({"unmounted": path, "directory_present": present, "statvfs": reading})
 
 
 def mount_command(fstype: str, source: str, target: str) -> list[str]:
@@ -703,12 +687,8 @@ def fs_mount(arguments: argparse.Namespace) -> None:
     bucket = "filesystems" if name in state["filesystems"] else "devices"
     state[bucket][name]["mounted"] = True
     save_state(run_id, state)
-    emit(
-        {
-            "mounted": entry["mountpoint"],
-            "statvfs": statvfs_reading(entry["mountpoint"]),
-        }
-    )
+    reading = statvfs_reading(entry["mountpoint"])
+    emit({"mounted": entry["mountpoint"], "statvfs": reading})
 
 
 def destroy_filesystem(run_id: str, name: str) -> dict[str, Any]:
@@ -740,12 +720,50 @@ def fs_destroy(arguments: argparse.Namespace) -> None:
     emit(result)
 
 
-def dm_table(sectors: int, loop: str, delay_ms: int, *, error: bool = False) -> str:
+def dm_table(
+    sectors: int,
+    loop: str,
+    delay_ms: int,
+    *,
+    error: bool = False,
+    fat: list[int] | None = None,
+) -> str:
+    """The data table (``linear``/``delay``), the whole device ``error``, or with
+    ``fat`` ``[start, end)`` only the FAT segment ``error`` -- boot sector, root
+    directory and data stay ``linear`` (mounts and lists; every FAT read fails)."""
+
+    if error and fat:
+        start, end = fat
+        segments = [f"0 {start} linear {loop} 0"] if start else []
+        segments.append(f"{start} {end - start} error")
+        if end < sectors:
+            segments.append(f"{end} {sectors - end} linear {loop} {end}")
+        return "\n".join(segments)
     if error:
         return f"0 {sectors} error"
     if delay_ms:
         return f"0 {sectors} delay {loop} 0 {delay_ms}"
     return f"0 {sectors} linear {loop} 0"
+
+
+def fat_region(device: str) -> list[int]:
+    """``[start, end)`` of the FAT16 carrier's FATs in 512-byte sectors, read
+    from its boot sector and rounded inwards to page boundaries."""
+
+    with open(device, "rb", buffering=0) as handle:
+        boot = handle.read(512)
+    if len(boot) < 512 or boot[54:62] != b"FAT16   ":
+        raise ProbeError("the test device does not carry a FAT16 boot sector")
+    # Bytes per sector, reserved sectors, FATs and sectors per FAT (BPB).
+    sector, _, reserved, fats, _, _, _, per_fat = struct.unpack_from(
+        "<HBHBHHBH", boot, 11
+    )
+    scale = sector // 512
+    start = -(-reserved * scale // PAGE_SECTORS) * PAGE_SECTORS
+    end = (reserved + fats * per_fat) * scale // PAGE_SECTORS * PAGE_SECTORS
+    if scale < 1 or not reserved or end - start < MIN_FAT_ERROR_SECTORS:
+        raise ProbeError("the FAT16 boot sector geometry leaves no error segment")
+    return [start, end]
 
 
 def dm_device_name(dm: str) -> str:
@@ -785,35 +803,22 @@ def update_device(run_id: str, name: str, **values: Any) -> dict[str, Any]:
 
 
 def dm_create(arguments: argparse.Namespace) -> None:
-    """Record the test device and start its bounded setup unit; return at once.
-
-    Deadman first, record second, so ``cleanup --kind dm-<name>`` undoes
-    whatever the setup reached. ``--load-module`` (KERNEL_MODULE_LOAD) loads a
-    missing ``dm_delay`` or ``vfat``, recorded before the load so ``cleanup``
-    unloads it. The runner polls ``dm-status`` until ``ready`` or ``failed``.
-    """
+    """Record the test device and start its bounded setup unit; return at once
+    (the runner polls ``dm-status``). Deadman first, record second, so
+    ``cleanup --kind dm-<name>`` undoes whatever the setup reached;
+    ``--load-module`` (KERNEL_MODULE_LOAD) loads a missing ``dm_delay`` or
+    ``vfat``, recorded before the load so ``cleanup`` unloads it."""
 
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
     size_mib = bounded(arguments.size_mib, MIN_FS_MIB, MAX_FS_MIB, "size MiB")
     delay_ms = bounded(arguments.delay_ms, 0, 1000, "delay ms")
-    seconds = bounded(
-        arguments.deadman_seconds,
-        MIN_DEADMAN_SECONDS,
-        MAX_DEADMAN_SECONDS,
-        "deadman seconds",
-    )
+    seconds = deadman_seconds(arguments.deadman_seconds)
     fstype = str(arguments.fstype)
     if fstype not in MKFS:
         raise ProbeError("unsupported test file system type")
-    load = [
-        module
-        for module, needed in (
-            (DELAY_MODULE, bool(delay_ms)),
-            (VFAT_MODULE, fstype == "vfat"),
-        )
-        if needed and not module_loaded(module)
-    ]
+    wanted = {DELAY_MODULE: bool(delay_ms), VFAT_MODULE: fstype == "vfat"}
+    load = [m for m, needed in wanted.items() if needed and not module_loaded(m)]
     if load and not arguments.load_module:
         raise ProbeError(f"{load[0]} is not loaded on this node")
     if not tool_present("nsenter"):
@@ -847,13 +852,8 @@ def dm_create(arguments: argparse.Namespace) -> None:
         run(["modprobe", module], check=False, timeout=QUICK_SECONDS)
         if not module_loaded(module):
             raise ProbeError(f"{module} could not be loaded")
-    command = [sys.executable, str(probe_copy(run_id)), "dm-setup"]
-    start_unit(
-        run_id,
-        setup_kind(name),
-        SETUP_MAX_SECONDS,
-        [*command, "--run-id", run_id, "--name", name],
-    )
+    command = [sys.executable, str(probe_copy(run_id)), "dm-setup", "--run-id", run_id]
+    start_unit(run_id, setup_kind(name), SETUP_MAX_SECONDS, [*command, "--name", name])
     emit(
         {
             "name": name,
@@ -872,11 +872,9 @@ def dm_create(arguments: argparse.Namespace) -> None:
 
 
 def dm_setup(arguments: argparse.Namespace) -> None:
-    """The setup unit's body (host namespaces): back, map, format, mount.
-
-    Each step is recorded before it runs; a failure records the step, error
-    class, message digest and site, and exits non-zero.
-    """
+    """The setup unit's body (host namespaces): back, map, format, mount. Each
+    step is recorded before it runs; a failure records the step, error class,
+    message digest and site, and exits non-zero."""
 
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
@@ -919,6 +917,8 @@ def build_device(run_id: str, name: str, entry: dict[str, Any]) -> dict[str, Any
     # A FAT label is at most 11 upper-case characters.
     label = f"gfrs-{name}" if fstype == "ext4" else f"GFRS{name.upper()}"[:11]
     run([*MKFS[fstype], label, entry["dm_path"]], timeout=step("mkfs"))
+    fat = fat_region(entry["dm_path"]) if fstype == "vfat" else None
+    update_device(run_id, name, fat_sectors=fat)
     timeout = step("mount")
     Path(entry["mountpoint"]).mkdir(mode=0o755, parents=True, exist_ok=True)
     host_command(
@@ -933,18 +933,16 @@ def build_device(run_id: str, name: str, entry: dict[str, Any]) -> dict[str, Any
         "loop": loop,
         "mountpoint": entry["mountpoint"],
         "fstype": fstype,
+        "fat_sectors": fat,
         "delay_ms": entry["delay_ms"],
     }
 
 
 def dm_status(arguments: argparse.Namespace) -> None:
-    """Where the device's setup stands: ``setup``, ``ready`` or ``failed``.
-
-    The unit is read before the record: a record still at ``setup`` behind a
-    unit that no longer runs means the worker died without a result --
-    ``failed`` at the step it had reached. No ``error`` key: the host fixture
-    would read the answer as a failed call.
-    """
+    """Where the device's setup stands: ``setup``, ``ready`` or ``failed`` (a
+    record still at ``setup`` behind a unit that no longer runs: the worker
+    died at the step it had reached). No ``error`` key: the host fixture would
+    read the answer as a failed call."""
 
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
@@ -953,15 +951,14 @@ def dm_status(arguments: argparse.Namespace) -> None:
     phase = str(entry.get("phase") or "ready")
     lost = phase == "setup" and unit.get("ActiveState") not in RUNNING_STATES
     failed = lost or phase == "failed"
+    error_class = "SetupUnitEnded" if lost else entry.get("setup_error_class")
     emit(
         {
             "name": name,
             "phase": "failed" if lost else phase,
             "step": entry.get("step"),
             "failed_step": (entry.get("step") or "start") if failed else None,
-            "setup_error_class": (
-                "SetupUnitEnded" if lost else entry.get("setup_error_class")
-            ),
+            "setup_error_class": error_class,
             "setup_error_code": entry.get("setup_error_code"),
             "setup_error_site": entry.get("setup_error_site"),
             "device": entry.get("device") if phase == "ready" else None,
@@ -970,7 +967,7 @@ def dm_status(arguments: argparse.Namespace) -> None:
             "mountpoint": entry.get("mountpoint"),
             "delay_ms": entry.get("delay_ms"),
             "setup_unit": {
-                key: unit.get(key) for key in ("LoadState", "ActiveState", "SubState")
+                k: unit.get(k) for k in ("LoadState", "ActiveState", "SubState")
             },
         }
     )
@@ -998,13 +995,8 @@ def dm_suspend(arguments: argparse.Namespace) -> None:
     seconds = bounded(arguments.seconds, MIN_DEADMAN_SECONDS, 180, "suspend seconds")
     deadman = arm_deadman(run_id, f"resume-{checked_name(arguments.name)}", seconds)
     dmsetup("suspend", "--nolockfs", "--noflush", entry["dm"])
-    emit(
-        {
-            "suspended": entry["dm"],
-            "deadman": deadman,
-            "info": dmsetup("info", entry["dm"], check=False).stdout[-400:],
-        }
-    )
+    info = dmsetup("info", entry["dm"], check=False).stdout[-400:]
+    emit({"suspended": entry["dm"], "deadman": deadman, "info": info})
 
 
 def dm_resume(arguments: argparse.Namespace) -> None:
@@ -1042,44 +1034,43 @@ def dm_recreate(arguments: argparse.Namespace) -> None:
 
 
 def retarget_once(entry: dict[str, Any], *, error: bool) -> dict[str, Any]:
-    """Load ``error`` or the data table under the mounted device; its statvfs.
+    """Load ``error`` or the data table under the test device; its statvfs.
 
-    For ``error`` a FAT16 carrier is re-mounted first (no free-cluster count in
-    memory) and synced before the swap, so nothing is written to the error
-    table: a failed write would log ``Buffer I/O error``, which the node log
-    collector's storage rule grades QUARANTINE -- not the fault under test.
+    ``error`` on the FAT16 carrier: unmount, load the table whose FAT segment
+    is ``error``, drop the device's page cache (``blockdev --flushbufs``: no
+    FAT block survives from before), mount afresh. The FAT is unreadable
+    before the mount exists, so no statfs -- the collector's, an agent's, this
+    probe's -- can ever count the free clusters and cache them: every
+    ``statvfs`` fails EIO until ``--target data`` puts the data table back (in
+    place; the next count succeeds). Boot sector, root directory and data stay
+    readable and nothing is written to the error segment (a failed write would
+    log ``Buffer I/O error``, which the node log collector's storage rule
+    grades QUARANTINE -- not the fault under test).
     """
 
-    fstype = str(entry.get("fstype") or "ext4")
+    fresh = error and str(entry.get("fstype") or "ext4") == "vfat"
     target = str(entry["mountpoint"])
-    if error and fstype == "vfat":
-        if mounted_on_host(target):
-            host_command(["umount", target], timeout=UMOUNT_SECONDS)
-        host_command(
-            mount_command(fstype, entry["dm_path"], target), timeout=MOUNT_SECONDS
-        )
-        os.sync()
-    table = dm_table(
-        int(entry["sectors"]), entry["loop"], int(entry["delay_ms"]), error=error
-    )
+    if fresh and mounted_on_host(target):
+        host_command(["umount", target], timeout=UMOUNT_SECONDS)
+    fat = entry.get("fat_sectors") if fresh else None
+    sectors, loop, delay = int(entry["sectors"]), entry["loop"], int(entry["delay_ms"])
+    table = dm_table(sectors, loop, delay, error=error, fat=fat)
     dmsetup("suspend", "--nolockfs", "--noflush", entry["dm"])
-    dmsetup("reload", entry["dm"], "--table", table)
+    dmsetup("reload", entry["dm"], input_text=table + "\n")
     dmsetup("resume", entry["dm"])
+    if fresh:
+        host_command(["blockdev", "--flushbufs", entry["dm_path"]])
+        mount = mount_command("vfat", entry["dm_path"], target)
+        host_command(mount, timeout=MOUNT_SECONDS)
     return statvfs_reading(target)
 
 
 def dm_retarget(arguments: argparse.Namespace) -> None:
-    """Swap the mounted test device between its data table and ``error``.
-
-    ``--target error`` is the 004 ``probe_error`` injection: the mount stays
-    (no MOUNT_MISSING), read-write in the host table (no READ_ONLY), and every
-    ``statvfs`` fails EIO until ``--target data`` puts the data table back.
-    When something read the fresh mount first and cached the count, the swap
-    is retried from a new mount; ``faulted`` says whether the probe's own
-    reading failed. ``--delay-ms`` gives the data table a new delay first --
-    0 takes the injected latency out in place (same dm-N, mount and files),
-    the 006 ``sustained_latency`` recovery proof.
-    """
+    """Swap the test device between its data table and ``error``: the 004
+    ``probe_error`` injection (the mount stays, read-write in the host table,
+    every ``statvfs`` EIO until ``--target data``; ``faulted`` is the probe's own
+    reading). ``--delay-ms`` gives the data table a new delay first -- 0 takes the
+    injected latency out in place, the 006 ``sustained_latency`` recovery proof."""
 
     run_id = checked_run_id(arguments.run_id)
     name = checked_name(arguments.name)
@@ -1095,12 +1086,7 @@ def dm_retarget(arguments: argparse.Namespace) -> None:
     if writer.get("ActiveState") in RUNNING_STATES:
         raise ProbeError("the writer still runs; stop it before the retarget")
     error = arguments.target == "error"
-    readings: list[dict[str, Any]] = []
-    for _attempt in range(RETARGET_ATTEMPTS if error else 1):
-        readings.append(retarget_once(entry, error=error))
-        if not error or "error" in readings[-1]:
-            break
-        retarget_once(entry, error=False)
+    reading = retarget_once(entry, error=error)
     update_device(run_id, name, target=arguments.target)
     emit(
         {
@@ -1108,9 +1094,10 @@ def dm_retarget(arguments: argparse.Namespace) -> None:
             "dm": entry["dm"],
             "target": arguments.target,
             "delay_ms": int(entry["delay_ms"]),
-            "attempts": len(readings),
-            "statvfs": readings[-1],
-            "faulted": error and "error" in readings[-1],
+            "fat_sectors": entry.get("fat_sectors"),
+            "attempts": 1,
+            "statvfs": reading,
+            "faulted": error and "error" in reading,
             "mounted_on_host": mounted_on_host(str(entry["mountpoint"])),
         }
     )
@@ -1128,8 +1115,7 @@ def loop_devices() -> list[dict[str, Any]]:
 
 
 def backing_loops(backing: str) -> list[str]:
-    """Loop devices backed by ``backing`` (also once it is deleted): only these
-    are ever detached, never a loop device that a recorded name now points at."""
+    """Loop devices backed by ``backing`` (also once deleted): the only ones detached."""
 
     names = {backing, f"{backing} (deleted)"}
     return sorted(
@@ -1139,18 +1125,25 @@ def backing_loops(backing: str) -> list[str]:
     )
 
 
+def open_count(dm: str) -> int:
+    """The mapping's openers (``dmsetup info -c -o open``; 0 when it is gone)."""
+
+    completed = dmsetup("info", "-c", "--noheadings", "-o", "open", dm, check=False)
+    count = completed.stdout.strip()
+    return int(count) if completed.returncode == 0 and count.isdigit() else 0
+
+
 def destroy_device(run_id: str, name: str) -> dict[str, Any]:
     state = load_state(run_id)
     entry = state["devices"].get(name)
     if entry is None:
         return {"name": name, "absent": True}
     dm = entry["dm"]
-    if tool_present("dmsetup"):
+    present = tool_present("dmsetup")
+    present = present and dmsetup("info", dm, check=False).returncode == 0
+    if present:
         dmsetup("resume", dm, check=False)
-        if (
-            entry.get("target") == "error"
-            and dmsetup("info", dm, check=False).returncode == 0
-        ):
+        if entry.get("target") == "error":
             # Back on the data table before the unmount writes its FAT flags.
             retarget_once(entry, error=False)
     target = entry["mountpoint"]
@@ -1158,7 +1151,14 @@ def destroy_device(run_id: str, name: str) -> dict[str, Any]:
         host_command(["umount", target], check=False, timeout=UMOUNT_SECONDS)
         if mounted_on_host(target):
             host_command(["umount", "-l", target], timeout=UMOUNT_SECONDS)
-    if tool_present("dmsetup") and dmsetup("info", dm, check=False).returncode == 0:
+    if present:
+        # A lazily unmounted copy in another mount namespace or udev's blkid
+        # keeps the mapping open a while (the 2026-10-25 live cleanup's EBUSY).
+        deadline = time.monotonic() + REMOVE_WAIT_SECONDS
+        while (openers := open_count(dm)) and time.monotonic() < deadline:
+            time.sleep(REMOVE_POLL_SECONDS)
+        if openers:
+            raise ProbeError(f"the test device is still open ({openers} openers)")
         dmsetup("remove", "--retry", dm)
     detached = backing_loops(entry["backing"])
     for loop in detached:
@@ -1455,8 +1455,7 @@ def error_code(exc: BaseException) -> str:
 
 
 def exception_site(exc: BaseException) -> str | None:
-    """The innermost ``function:line`` of this file on the exception's path,
-    above the command helpers -- the step that ran the failing command."""
+    """The innermost ``function:line`` of this file above the command helpers."""
 
     site = None
     frame = exc.__traceback__
