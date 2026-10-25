@@ -118,6 +118,21 @@ MUTATING_VERBS = frozenset(
     }
 )
 SURVEY = {"residue": {}, "tools": {}, "collector_env": {}}
+#: The GPU cluster's executor runs the release's runtime image; 027's progress
+#: reporter sidecars run the same image (``gpu-fault-collector`` is in it).
+RUNTIME_IMAGE = "111122223333.dkr.ecr.us-west-2.amazonaws.com/gpu-fault@sha256:" + (
+    "e" * 64
+)
+EXECUTOR = {
+    "apiVersion": "apps/v1",
+    "kind": "Deployment",
+    "metadata": {"name": "gpu-fault-cluster-executor", "namespace": NAMESPACE},
+    "spec": {
+        "template": {
+            "spec": {"containers": [{"name": "executor", "image": RUNTIME_IMAGE}]}
+        }
+    },
+}
 
 
 class FirstMutation(BaseException):
@@ -199,6 +214,8 @@ class ClusterApi:
             )
         if "-l" in arguments:
             return json.dumps({"items": []})
+        if arguments[1:] == ("deployment", "gpu-fault-cluster-executor", "-o", "json"):
+            return json.dumps(EXECUTOR)
         assert "--ignore-not-found" in arguments, f"unexpected read: {arguments}"
         return ""  # no such object yet
 
@@ -385,6 +402,15 @@ def test_every_managed_job_reaches_its_first_mutation_pinned_to_the_target_node(
         item["metadata"]["annotations"][TRAINING_CONTAINER_ANNOTATION]
         for item in templates(document)
     } == {"pytorch"}, "the trainer, never a sidecar, is the training container"
+    sidecars = [
+        container
+        for item in templates(document)
+        for container in item["spec"]["containers"]
+        if container["name"] != "pytorch"
+    ]
+    assert {container["image"] for container in sidecars} <= {RUNTIME_IMAGE}, (
+        "a sidecar runs the cluster's own runtime image, never the training image"
+    )
     labels = metadata["labels"]
     assert (labels["gpu-fault.io/job-id"], labels["gpu-fault.io/attempt-id"]) == (
         job_id,

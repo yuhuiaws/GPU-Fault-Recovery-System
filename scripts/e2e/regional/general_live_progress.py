@@ -26,6 +26,9 @@ GPU/fabric telemetry alone.
 
 from __future__ import annotations
 
+import json
+from pathlib import PurePosixPath
+import re
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import run_survey
@@ -42,11 +45,39 @@ from scripts.e2e.regional.general_live_registry import (
     VariantSpec,
 )
 from scripts.e2e.regional.general_live_verdicts import operations, verdict
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
+from scripts.e2e.regional.regional_live_fixture import component_python
 
 CASE = "GF-GENERAL-LIVE-027"
 SINGLE_NODE_MANIFEST = "single-node-warm-spare-pytorchjob.yaml"
 HEARTBEAT_TIMEOUT = 120
 STARTUP_GRACE = 300
+#: The reporter sidecar runs the product's own ``gpu-fault-collector`` from the
+#: GPU-side runtime image -- the image the release stamps on the executor, the
+#: completion watcher and the in-cluster collector, whose console scripts sit
+#: next to ``component_python("gpu")``. The training image ships no product:
+#: live 2026-10-24 the sidecar named the Node Agent's host install path
+#: (``/opt/gpu-fault/current``) inside it, never started, and every 027 Pod
+#: stayed Running/NotReady through the 900-s start wait.
+RUNTIME_DEPLOYMENT = "gpu-fault-cluster-executor"
+RUNTIME_CONTAINER = "executor"
+REPORTER_BIN = str(
+    PurePosixPath(component_python("gpu")).with_name("gpu-fault-collector")
+)
+DIGEST_PINNED = re.compile(r"[^\s@]+@sha256:[0-9a-f]{64}")
+#: The control-plane connection, read as the product's in-cluster collector
+#: reads it (``deploy/dataplane/kubernetes-node-resource-collector.yaml``):
+#: ``gpu-fault-collector`` refuses to start without the URL and cluster id, and
+#: ``POST /v1/training-progress`` takes the cluster token.
+CONNECTION_SECRET = "gpu-fault-regional-connection"
+CONNECTION_ENV = (
+    ("GPU_FAULT_CONTROL_PLANE_URL", "control-plane-url"),
+    ("GPU_FAULT_CLUSTER_ID", "cluster-id"),
+    ("GPU_FAULT_CONTROL_PLANE_TOKEN", "cluster-token"),
+)
+CA_DIR = "/etc/gpu-fault/tls"
+#: Writable state: the collector's durable outbox.
+STATE_DIR = "/var/lib/gpu-fault"
 #: Operations a training-progress chain must never contain: no hardware action,
 #: no node isolation, no automatic workload restart. STOP_WORKLOADS is allowed
 #: for the NaN/checkpoint branch only (and is asserted there explicitly).
@@ -181,21 +212,45 @@ print(json.dumps(result, sort_keys=True))
 """
 
 
+def reporter_image(regional: Any) -> str:
+    """The digest-pinned runtime image this GPU cluster's executor runs."""
+
+    deployment = json.loads(
+        regional.kubectl("gpu", "get", "deployment", RUNTIME_DEPLOYMENT, "-o", "json")
+    )
+    pod_spec: Any = deployment
+    for key in ("spec", "template", "spec"):
+        pod_spec = pod_spec.get(key) if isinstance(pod_spec, dict) else None
+    containers = pod_spec.get("containers") if isinstance(pod_spec, dict) else None
+    images = [
+        str(item.get("image") or "")
+        for item in (containers if isinstance(containers, list) else [])
+        if isinstance(item, dict) and item.get("name") == RUNTIME_CONTAINER
+    ]
+    if len(images) != 1 or DIGEST_PINNED.fullmatch(images[0]) is None:
+        raise RegionalFixtureError(
+            f"the {RUNTIME_DEPLOYMENT} Deployment has no digest-pinned "
+            f"{RUNTIME_CONTAINER} image for the progress reporter: {images}"
+        )
+    return images[0]
+
+
 class ManagedProgressJob:
     """A managed single-node test job that runs the training-progress reporter.
 
     A thin wrapper over ``ManagedWorkloadFixture``: it renders a copy of the
     warm-spare training manifest with a shared ``emptyDir`` for the progress
     file and a ``gpu-fault-collector training-progress`` sidecar per reported
-    rank (the reporter reports the training container's identity, not its own).
-    The test application's progress is controlled by the runner, which writes
-    the per-rank JSON into the shared volume with an atomic ``rank_progress``
-    write from inside the trainer container -- the enabled-reporter source path.
-    The verdict tests monkeypatch this class; test_general_live_managed_job_start.py
-    runs its start with the real fixtures.
+    rank (the reporter reports the training container's identity, not its own),
+    from the cluster's own runtime image and connection Secret. The test
+    application's progress is controlled by the runner, which writes the
+    per-rank JSON into the shared volume with an atomic rename from inside the
+    trainer container -- the enabled-reporter source path. The verdict tests
+    monkeypatch this class; test_general_live_managed_job_start.py runs its
+    start with the real fixtures and test_general_live_progress_job.py runs its
+    Pod and progress write.
     """
 
-    REPORTER_IMAGE_ENV = "GPU_FAULT_TRAINING_PROGRESS_FILE"
     PROGRESS_DIR = "/var/run/gpu-fault"
 
     def __init__(
@@ -220,6 +275,9 @@ class ManagedProgressJob:
             raise VariantNotRun(
                 "FIXTURE_NOT_READY", "a managed progress job needs --site-file"
             )
+        # Read before anything is rendered or journaled: a refusal here is a
+        # preparation failure that leaves nothing to clean up.
+        self.reporter_image = reporter_image(ctx.regional)
         source = (
             Path(__file__).with_name("manifests") / "training" / SINGLE_NODE_MANIFEST
         )
@@ -228,7 +286,7 @@ class ManagedProgressJob:
         )
         document = yaml.safe_load(rendered.read_text(encoding="utf-8"))
         self.ranks = tuple(sorted(set(ranks)))
-        _install_reporter(document, name, self.ranks, gpu_count)
+        _install_reporter(document, name, self.ranks, self.reporter_image)
         document.setdefault("metadata", {}).setdefault("labels", {}).update(
             {"gpu-fault.io/job-id": name, "gpu-fault.io/attempt-id": f"{name}-a001"}
         )
@@ -261,9 +319,59 @@ class ManagedProgressJob:
         )
 
     def start(self) -> dict[str, Any]:
+        from scripts.e2e.regional.workload_restart_custody import (
+            WorkloadOwnershipError,
+        )
+
         self.prewarm.create([self.ctx.settings.node])
         self.fixture.submit()
-        return self.fixture.wait_running(timeout_seconds=900)
+        try:
+            return self.fixture.wait_running(timeout_seconds=900)
+        except WorkloadOwnershipError:
+            raise
+        except RegionalFixtureError as exc:
+            # A Pod is Ready only when every container is; the wait's snapshot
+            # says "ready: False" and nothing about which container or why.
+            raise RegionalFixtureError(
+                f"{exc}; not ready: {self.unready_containers()}"
+            ) from exc
+
+    def unready_containers(self) -> dict[str, Any]:
+        """The kubelet's state for every container of the job that is not Ready."""
+
+        try:
+            pods = json.loads(
+                self.ctx.regional.kubectl(
+                    "gpu",
+                    "get",
+                    "pod",
+                    "-l",
+                    f"gpu-fault.io/job-id={self.name}",
+                    "-o",
+                    "json",
+                )
+            )["items"]
+        except Exception as exc:  # noqa: BLE001 - a diagnostic, never the verdict
+            return {"unreadable": f"{type(exc).__name__}: {exc}"}
+        result: dict[str, Any] = {}
+        for pod in pods if isinstance(pods, list) else []:
+            if not isinstance(pod, dict):
+                continue
+            name = (pod.get("metadata") or {}).get("name")
+            statuses = (pod.get("status") or {}).get("containerStatuses") or []
+            for status in statuses:
+                if not isinstance(status, dict) or status.get("ready") is True:
+                    continue
+                state = status.get("state") or {}
+                kind = next(iter(state), "unknown")
+                detail = state.get(kind) if isinstance(state.get(kind), dict) else {}
+                result[f"{name}/{status.get('name')}"] = {
+                    "state": kind,
+                    "reason": detail.get("reason"),
+                    "exit_code": detail.get("exitCode"),
+                    "message": str(detail.get("message") or "")[:300],
+                }
+        return result
 
     def identity(self) -> dict[str, Any]:
         return {
@@ -281,16 +389,17 @@ class ManagedProgressJob:
         ``checkpoint_ref`` and ``labels`` such as ``phase``/``progress_group``).
         """
 
-        import json
-
         payload = json.dumps(
             {key: value for key, value in fields.items() if value is not None}
         )
         pod = self.fixture.pods()[0]["name"]
         path = f"{self.PROGRESS_DIR}/rank-{rank}.json"
+        # ``-i``: kubectl forwards its stdin only when asked, and without it the
+        # ``cat`` read end-of-file and renamed an empty progress file in place.
         return self.ctx.regional.kubectl(
             "gpu",
             "exec",
+            "-i",
             pod,
             "-c",
             "pytorch",
@@ -322,7 +431,7 @@ class ManagedProgressJob:
 
 
 def _install_reporter(
-    document: dict[str, Any], name: str, ranks: tuple[int, ...], gpu_count: int
+    document: dict[str, Any], name: str, ranks: tuple[int, ...], image: str
 ) -> None:
     """Add the shared progress volume and one reporter sidecar per rank."""
 
@@ -336,25 +445,43 @@ def _install_reporter(
             continue
         volumes = template.setdefault("volumes", [])
         volumes.append({"name": "gfrs-progress", "emptyDir": {}})
+        volumes.append(
+            {
+                "name": "gfrs-control-plane-ca",
+                "secret": {
+                    "secretName": CONNECTION_SECRET,
+                    "items": [{"key": "ca.crt", "path": "ca.crt"}],
+                },
+            }
+        )
         mount = {"name": "gfrs-progress", "mountPath": ManagedProgressJob.PROGRESS_DIR}
         containers = template.setdefault("containers", [])
         for container in containers:
             if isinstance(container, dict):
-                container.setdefault("volumeMounts", []).append(mount)
+                container.setdefault("volumeMounts", []).append(dict(mount))
         for rank in ranks:
-            containers.append(_reporter_container(name, rank, mount))
+            # One outbox per reporter; a shared directory would
+            # make two reporters replay each other's buffered heartbeats.
+            for volume, limit in (("state", "64Mi"), ("tmp", "16Mi")):
+                volumes.append(
+                    {
+                        "name": f"gfrs-reporter-{rank}-{volume}",
+                        "emptyDir": {"sizeLimit": limit},
+                    }
+                )
+            containers.append(_reporter_container(name, rank, mount, image))
 
 
-def _reporter_container(name: str, rank: int, mount: dict[str, Any]) -> dict[str, Any]:
-    from scripts.e2e.regional.managed_workload_fixture import TRAINING_IMAGE
-
+def _reporter_container(
+    name: str, rank: int, mount: dict[str, Any], image: str
+) -> dict[str, Any]:
     progress_file = f"{ManagedProgressJob.PROGRESS_DIR}/rank-{rank}.json"
     return {
         "name": f"progress-reporter-{rank}",
-        "image": TRAINING_IMAGE,
+        "image": image,
         "imagePullPolicy": "IfNotPresent",
         "command": [
-            "/opt/gpu-fault/current/venv/bin/gpu-fault-collector",
+            REPORTER_BIN,
             "training-progress",
             "--attempt-id",
             f"{name}-a001",
@@ -364,6 +491,18 @@ def _reporter_container(name: str, rank: int, mount: dict[str, Any]) -> dict[str
             progress_file,
         ],
         "env": [
+            *(
+                {
+                    "name": variable,
+                    "valueFrom": {
+                        "secretKeyRef": {"name": CONNECTION_SECRET, "key": key}
+                    },
+                }
+                for variable, key in CONNECTION_ENV
+            ),
+            # The collector's HTTP client verifies TLS through the default
+            # context, which reads SSL_CERT_FILE (the private endpoint's CA).
+            {"name": "SSL_CERT_FILE", "value": f"{CA_DIR}/ca.crt"},
             # The reporter reports the TRAINING container's identity so the
             # control plane's allocation match accepts it (watcher check).
             {"name": "CONTAINER_NAME", "value": "pytorch"},
@@ -376,10 +515,24 @@ def _reporter_container(name: str, rank: int, mount: dict[str, Any]) -> dict[str
                 "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}},
             },
         ],
-        "volumeMounts": [mount],
+        "volumeMounts": [
+            dict(mount),
+            {"name": "gfrs-control-plane-ca", "mountPath": CA_DIR, "readOnly": True},
+            {"name": f"gfrs-reporter-{rank}-state", "mountPath": STATE_DIR},
+            # readOnlyRootFilesystem makes /tmp read-only too.
+            {"name": f"gfrs-reporter-{rank}-tmp", "mountPath": "/tmp"},
+        ],
         "resources": {
             "requests": {"cpu": "100m", "memory": "128Mi"},
             "limits": {"cpu": "500m", "memory": "256Mi"},
+        },
+        # The product's own in-cluster collector container, same image.
+        "securityContext": {
+            "allowPrivilegeEscalation": False,
+            "readOnlyRootFilesystem": True,
+            "runAsNonRoot": True,
+            "runAsUser": 65532,
+            "capabilities": {"drop": ["ALL"]},
         },
     }
 

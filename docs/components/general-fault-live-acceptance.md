@@ -633,7 +633,12 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_progress`/`_spares`。
   未授批，`NOT_AUTHORIZED`）。
 - **027（eks 或 hp 车道）**：产品训练进度 reporter 默认关闭、全局周期 monitor 必须
   保持关闭；仅测试任务 Pod 内以 `gpu-fault-collector training-progress` sidecar 启用
-  reporter，读测试应用原子写的进度文件（启用 reporter 的源路径）。扫描类信号用
+  reporter，读测试应用原子写的进度文件（启用 reporter 的源路径）。训练镜像不含产品，
+  sidecar 用本 GPU 集群自身的运行时镜像（取自 `gpu-fault-cluster-executor`
+  Deployment，须 digest 固定）运行 `/opt/gpu-fault/executor/bin/gpu-fault-collector`，
+  连接取自 `gpu-fault-regional-connection`（URL、cluster id、cluster token，CA 经
+  `SSL_CERT_FILE`），每个 reporter 有可写状态目录（outbox）；进度经
+  `kubectl exec -i` 写入。扫描类信号用
   execution-token 的 `POST /v1/training-health/<cluster>/scan`（本集群一次），因此执行
   前须确认该测试任务是集群内唯一 RUNNING 受管 attempt（否则整集群扫描会误报正常
   任务 reporter 静默）。native 实测全部 9 个：`nan`（只停归属 attempt+ESCALATE，不

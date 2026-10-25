@@ -1198,6 +1198,37 @@ managed-job variant with the runner's own settings, fixtures and journals --
 only the kubectl subprocess, the store read and the host probes are fakes --
 up to its first cluster mutation.
 
+Past that mutation, all nine executable 027 variants then failed before any
+fault (live 2026-10-24, plain-EKS lane): "managed workload did not become
+healthy", the job's only Pod Running and NotReady for the whole 900-s start
+wait while its trainer heartbeated. The progress-reporter sidecar ran the Node
+Agent's host install path (`/opt/gpu-fault/current/venv/bin/gpu-fault-collector`)
+inside the public PyTorch training image, which ships no product, so the
+container never started, `restartPolicy: Never` left it terminated, and a Pod
+is Ready only when every container is; it also lacked the control-plane
+connection `gpu-fault-collector` refuses to start without. The fixture's Ready
+requirement was right -- a Pod whose reporter is dead cannot run any 027
+variant. The sidecar now runs `/opt/gpu-fault/executor/bin/gpu-fault-collector`
+from the GPU cluster's own runtime image (read from the
+`gpu-fault-cluster-executor` Deployment and required to be digest-pinned) with
+the URL, cluster id and cluster token from `gpu-fault-regional-connection`, its
+CA through `SSL_CERT_FILE`, a writable per-reporter state directory for the
+durable outbox, and the in-cluster collector's security context. One more
+defect on the same path would have failed the variants next: the runner's
+progress write piped its JSON through `kubectl exec` without `-i`, so the
+trainer wrote empty progress files (the reporter reported only
+`progress_error=JSONDecodeError`). The write now passes `-i`. A start that
+still times out names each container that is not Ready with the kubelet's
+reason.
+`tests/regional/test_general_live_progress_job.py` starts the job with the
+runner's own objects against a kubectl fake whose kubelet starts a container
+only if its image ships the program it executes and the product CLI's own
+start-up accepts the rendered arguments and environment, then writes progress
+through the exec path and reads it back with the reporter that start-up built.
+Not covered offline: whether a GPU node can pull the runtime image (the
+executor's Pods may run elsewhere), and the product-side outcome of each 027
+variant.
+
 GF-GENERAL-LIVE-030 (warm spare unhealthy) is the same story on the HyperPod
 lane: its `SpareSession` keeps the spare node *name* in `self.node` and also
 defined a `node()` accessor, so the instance attribute shadowed the method and
