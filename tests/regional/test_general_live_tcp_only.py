@@ -6,12 +6,18 @@ product records: the temporary package step runs only when ``tc`` or
 it the old CAPABILITY_ABSENT path stays), a refused dnf transaction is
 NOT_RUN(FIXTURE_NOT_READY), only the host-side veth is declared required, and
 the verdict needs the oracle's retransmissions with flat NIC counters plus a
-product batch that actually carried them.
+*witness* that the product accepted a host batch inside the flow: the host
+collector status row or the veth's latest counter records moving inside the
+window (a summary-only batch leaves no raw evidence), or a stored batch that
+happens to carry the metric -- each confirmed by the oracle's RetransSegs rise
+over the collector interval that ended there.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import itertools
+import json
 from collections.abc import Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -41,6 +47,12 @@ IFB = "gfrsaaaaaab"
 REAL = "enp71s0"
 TC_NEVRA = "iproute-tc-5.10.0-2.amzn2023.0.5.x86_64"
 BOTH = ("KERNEL_MODULE_LOAD", "TEMP_TEST_PACKAGE_INSTALL")
+#: The wall clock the variant reads: the flow starts at T0 and stops at T0+600 s;
+#: the oracle's node clock and the product's ``observed_at`` are on it too.
+T0 = datetime(2026, 10, 25, 3, 0, tzinfo=timezone.utc)
+T0_EPOCH = T0.timestamp()
+#: 5-s oracle samples over the flow window.
+ORACLE_SAMPLES = 61
 
 
 def survey(*, tc: bool = True, loaded: bool = True, available: bool = True) -> dict:
@@ -69,14 +81,23 @@ def survey(*, tc: bool = True, loaded: bool = True, available: bool = True) -> d
 
 
 def records(
-    *, retrans_step: int = 50, real_errors_step: int = 0, veth_drop_step: int = 0
+    *,
+    retrans_step: int = 10,
+    real_errors_step: int = 0,
+    veth_drop_step: int = 0,
+    flat_after: int | None = None,
 ) -> list[dict[str, Any]]:
+    """The node oracle: RetransSegs rising ``retrans_step`` per 5-s sample
+    (flat from sample ``flat_after`` on), the veth and the real interface read
+    every sample."""
+
     result = []
-    for index in range(13):
+    for index in range(ORACLE_SAMPLES):
+        rising = index if flat_after is None else min(index, flat_after)
         result.append(
             {
-                "t": 1000.0 + 25 * index,
-                "tcp_retransmits": 100 + retrans_step * index,
+                "t": T0_EPOCH + 5 * index,
+                "tcp_retransmits": 100 + retrans_step * rising,
                 "netdev": {
                     IFA: {
                         "present": True,
@@ -107,66 +128,115 @@ def reading(t: float, drops: int, received: int | None) -> dict[str, Any]:
     }
 
 
-BEFORE = reading(1000.0, 0, None)
-AFTER = reading(1300.0, 40, 5_000_000)
-#: The wall clock the variant reads: the flow starts at T0 and stops at T0+600 s.
-T0 = datetime(2026, 10, 25, 3, 0, tzinfo=timezone.utc)
+BEFORE = reading(T0_EPOCH, 0, None)
+AFTER = reading(T0_EPOCH + 300, 40, 5_000_000)
 
 
 @pytest.fixture(autouse=True)
 def flow_clock(monkeypatch: pytest.MonkeyPatch) -> None:
-    moments = iter([T0, T0 + timedelta(seconds=600)])
-    monkeypatch.setattr(
-        tcp, "utc_now", lambda: next(moments, T0 + timedelta(seconds=600))
-    )
+    # Two readings per execute (the flow's start and stop); a test that runs
+    # the variant twice gets the same pair again.
+    moments = itertools.cycle([T0, T0 + timedelta(seconds=600)])
+    monkeypatch.setattr(tcp, "utc_now", lambda: next(moments))
+
+
+def at(offset: float) -> str:
+    return (T0 + timedelta(seconds=offset)).isoformat()
+
+
+def status_row(offset: float, *, prefix: str = "host-") -> dict[str, Any]:
+    """The HOST_TELEMETRY collector status: upserted for every accepted batch."""
+
+    return {
+        "cluster_id": "gpu-eks-cluster",
+        "node_id": NODE,
+        "collector": "HOST_TELEMETRY",
+        "observed_at": at(offset),
+        "ingested_at": at(offset + 1),
+        "last_success_at": at(offset),
+        "last_error_at": None,
+        "batch_id": f"{prefix}{NODE}-{int(T0_EPOCH + offset) * 1_000_000}",
+        "sample_count": 101,
+        "errors": [],
+    }
+
+
+def latest_row(name: str, value: float, offset: float) -> dict[str, Any]:
+    return {
+        "name": name,
+        "device": IFA,
+        "value": value,
+        "observed_at": at(offset),
+        "labels": {},
+    }
+
+
+def evidence_batch(
+    offset: float,
+    retrans: float,
+    *,
+    veth_errors: float = 0.0,
+    reasons: Sequence[str] = ("collection-error:_bmc",),
+) -> dict[str, Any]:
+    """A stored host batch (delivered on an edge) carrying the TCP metric."""
+
+    return {
+        "observed_at": at(offset),
+        "batch_id": f"host-{NODE}-{int(T0_EPOCH + offset) * 1_000_000}",
+        "edge_filter_reasons": list(reasons),
+        "collection_errors": [],
+        "samples": [
+            {
+                "name": "tcp_retransmits_delta",
+                "device": None,
+                "value": retrans,
+                "labels": {},
+            },
+            {
+                "name": "network_errors_delta",
+                "device": IFA,
+                "value": veth_errors,
+                "labels": {},
+            },
+            {"name": "network_drops_delta", "device": IFA, "value": 0.0, "labels": {}},
+        ],
+    }
 
 
 def activity(
     *,
-    retrans: float = 35.0,
-    veth_errors: float = 0.0,
-    offset: float = 90.0,
+    status_offset: float | None = 90.0,
+    status_prefix: str = "host-",
+    latest_offset: float | None = 90.0,
+    latest_values: tuple[float, float] = (0.0, 0.0),
+    batches: Sequence[dict[str, Any]] = (),
     incidents: Sequence[dict[str, Any]] = (),
     workflows: Sequence[dict[str, Any]] = (),
 ) -> Any:
+    """The product's records: by default the live shape -- no raw evidence,
+    the status row and the veth's latest records moved 90 s into the flow."""
+
     def document(_arguments: Any) -> dict[str, Any]:
-        observed = (T0 + timedelta(seconds=offset)).isoformat()
         return {
-            "incidents": list(incidents),
+            "since": T0.isoformat(),
+            # Minted inside the read: the live probe lists the node's incidents
+            # created since ``since`` and the verdicts take only those.
+            "incidents": [{**item, "created_at": at(100)} for item in incidents],
             "workflows": list(workflows),
-            "batches": [
-                {
-                    "observed_at": observed,
-                    "batch_id": "host-1",
-                    "edge_filter_reasons": ["health-summary"],
-                    "collection_errors": [],
-                    "samples": [
-                        {
-                            "name": "tcp_retransmits_delta",
-                            "device": None,
-                            "value": retrans,
-                            "labels": {},
-                        },
-                        {
-                            "name": "network_errors_delta",
-                            "device": IFA,
-                            "value": veth_errors,
-                            "labels": {},
-                        },
-                        {
-                            "name": "network_drops_delta",
-                            "device": IFA,
-                            "value": 0.0,
-                            "labels": {},
-                        },
-                    ],
-                }
-            ],
+            "batches": list(batches),
             "markers": [],
             "commands": [],
             "health_signals": {},
             "notifications": [],
-            "collector_statuses": [],
+            "metric_latest": []
+            if latest_offset is None
+            else [
+                latest_row("network_errors_delta", latest_values[0], latest_offset),
+                latest_row("network_drops_delta", latest_values[1], latest_offset),
+            ],
+            "collector_statuses": []
+            if status_offset is None
+            else [status_row(status_offset, prefix=status_prefix)],
         }
 
     return document
@@ -262,6 +332,10 @@ def context(
 
 def subcommands(probe: FakeProbe) -> list[str]:
     return [call[0] for call in probe.calls]
+
+
+def sources(result: dict[str, Any]) -> list[str]:
+    return [item["source"] for item in result["witnesses"]["confirmed"]]
 
 
 # --------------------------------------------------------------------------- #
@@ -390,7 +464,7 @@ def test_a_fixture_on_a_non_test_interface_is_refused(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# oracle and verdicts
+# the stimulus oracle
 # --------------------------------------------------------------------------- #
 def test_tcp_oracle_math() -> None:
     good = tcp.tcp_oracle(
@@ -404,13 +478,13 @@ def test_tcp_oracle_math() -> None:
     )
     assert good["real_interfaces"][REAL] == {"rx_errors": 0.0, "tx_errors": 0.0}
     flat = tcp.tcp_oracle(
-        records(retrans_step=1),
+        records(retrans_step=0),
         interface=IFA,
         real_interfaces=[REAL],
         before=BEFORE,
         after=AFTER,
     )
-    assert any("rose by 12.0 (< 20)" in error for error in flat["errors"]), flat
+    assert any("rose by 0.0 (< 20)" in error for error in flat["errors"]), flat
     reset = records()
     reset[5]["tcp_retransmits"] = 0
     backwards = tcp.tcp_oracle(
@@ -420,7 +494,7 @@ def test_tcp_oracle_math() -> None:
         "any(('went backwards' in error for error in backwards['errors']))"
     )
     # Samples outside the flow window never count.
-    late = records() + [{"t": 9999.0, "tcp_retransmits": 1, "netdev": {}}]
+    late = records() + [{"t": T0_EPOCH + 9999.0, "tcp_retransmits": 1, "netdev": {}}]
     assert (
         tcp.tcp_oracle(
             late, interface=IFA, real_interfaces=[REAL], before=BEFORE, after=AFTER
@@ -449,15 +523,25 @@ def test_tcp_oracle_needs_flat_nic_counters_and_a_working_flow() -> None:
         "was not read throughout" in e for e in errors(records(), real=["ens9"])
     ), "any(('was not read throughout' in e for e in errors(records(), real=['"
     assert any(
-        "netem dropped 0" in e for e in errors(records(), after=reading(1300.0, 0, 9))
+        "netem dropped 0" in e
+        for e in errors(records(), after=reading(T0_EPOCH + 300, 0, 9))
     ), "any(('netem dropped 0' in e for e in errors(records(), after=reading(1"
     assert any(
         "no TCP data reached" in e
-        for e in errors(records(), after=reading(1300.0, 9, 0))
+        for e in errors(records(), after=reading(T0_EPOCH + 300, 9, 0))
     ), "any(('no TCP data reached' in e for e in errors(records(), after=readi"
     assert any("0 sample(s)" in e for e in errors([])), (
         "any(('0 sample(s)' in e for e in errors([])))"
     )
+
+
+def test_oracle_retransmits_reads_the_collector_interval_ending_at_a_batch() -> None:
+    rows = records()
+    moment = T0 + timedelta(seconds=90)
+    # [90 - 15 - 5, 90 + 5] holds the samples at 70..95: 10 per 5 s -> 50.
+    assert tcp.oracle_retransmits(rows, moment, 15) == 50.0
+    assert tcp.oracle_retransmits(records(flat_after=12), moment, 15) == 0.0
+    assert tcp.oracle_retransmits(rows[:2], moment, 15) is None, "no samples there"
 
 
 def test_inconclusive_when_a_real_interface_counts_errors(tmp_path: Path) -> None:
@@ -467,21 +551,154 @@ def test_inconclusive_when_a_real_interface_counts_errors(tmp_path: Path) -> Non
 
 
 def test_inconclusive_when_netem_drops_nothing(tmp_path: Path) -> None:
-    probes = Probes(survey(), after=reading(1300.0, 0, 5_000_000))
+    probes = Probes(survey(), after=reading(T0_EPOCH + 300, 0, 5_000_000))
     with pytest.raises(VariantInconclusive, match="netem dropped"):
         SPEC.execute(context(tmp_path, probes))
 
 
+def test_inconclusive_when_the_flow_produced_no_retransmits(tmp_path: Path) -> None:
+    probes = Probes(survey(), oracle=records(retrans_step=0))
+    with pytest.raises(VariantInconclusive, match="rose by 0.0 .* ineffective"):
+        SPEC.execute(context(tmp_path, probes))
+    # The stimulus failed, so the product's records were never judged.
+    assert "tcp-window.json" not in {path.name for path in tmp_path.rglob("*.json")}
+
+
+# --------------------------------------------------------------------------- #
+# the witness: the product accepted a host batch inside the flow
+# --------------------------------------------------------------------------- #
+def test_passes_on_the_collector_status_witness_alone(tmp_path: Path) -> None:
+    document = activity(latest_offset=None)
+    result = SPEC.execute(context(tmp_path, Probes(survey()), document=document))
+    assert result["verdict"] == "PASS", result["errors"]
+    assert sources(result) == ["collector_status"]
+    witness = result["witnesses"]["confirmed"][0]
+    assert witness["observed_at"] == at(90) and witness["oracle_retransmits"] == 50.0
+    assert witness["batch_id"].startswith(f"host-{NODE}-")
+    assert result["product_retransmits"] == [], "no raw evidence was needed"
+
+
+def test_passes_on_the_veth_latest_records_alone(tmp_path: Path) -> None:
+    document = activity(status_offset=None)
+    result = SPEC.execute(context(tmp_path, Probes(survey()), document=document))
+    assert result["verdict"] == "PASS", result["errors"]
+    assert sources(result) == ["metric_latest", "metric_latest"]
+    assert {item["name"] for item in result["witnesses"]["confirmed"]} == {
+        "network_errors_delta",
+        "network_drops_delta",
+    }
+
+
+def test_passes_on_a_stored_batch_that_carries_the_metric(tmp_path: Path) -> None:
+    document = activity(
+        status_offset=None, latest_offset=None, batches=[evidence_batch(90, 35.0)]
+    )
+    result = SPEC.execute(context(tmp_path, Probes(survey()), document=document))
+    assert result["verdict"] == "PASS", result["errors"]
+    assert sources(result) == ["evidence"]
+    assert [item["value"] for item in result["product_retransmits"]] == [35.0]
+
+
+def test_the_window_evidence_names_the_witnesses(tmp_path: Path) -> None:
+    ctx = context(tmp_path, Probes(survey()))
+    result = SPEC.execute(ctx)
+    assert sources(result) == ["collector_status", "metric_latest", "metric_latest"]
+    window = json.loads((ctx.case_dir / "tcp-window.json").read_text())
+    assert (window["since"], window["stopped"]) == (at(15), at(600))
+    assert window["batches"] == [] and window["witnesses"] == result["witnesses"]
+    assert window["host_collector"][0]["last_success_at"] == at(90)
+    assert [item["name"] for item in window["metric_latest"]] == [
+        "network_errors_delta",
+        "network_drops_delta",
+    ]
+    assert any(
+        "summary-only batch leaves no raw evidence" in n for n in result["notes"]
+    ), result["notes"]
+
+
+@pytest.mark.parametrize(
+    "document,needle",
+    [
+        pytest.param(
+            activity(status_offset=5.0, latest_offset=-100.0),
+            "host collector last success " + at(5),
+            id="before-one-interval",
+        ),
+        pytest.param(
+            activity(status_offset=900.0, latest_offset=900.0),
+            "proves nothing",
+            id="after-the-stop",
+        ),
+        pytest.param(
+            activity(status_prefix="k8s-efa-", latest_offset=None),
+            "host collector last success none",
+            id="allocatable-reader-not-the-host-collector",
+        ),
+        pytest.param(
+            activity(status_offset=None, latest_offset=None),
+            "latest gfrsaaaaaaa counter record observed never",
+            id="nothing-at-all",
+        ),
+    ],
+)
+def test_no_witness_inside_the_window_is_inconclusive(
+    tmp_path: Path, document: Any, needle: str
+) -> None:
+    with pytest.raises(VariantInconclusive, match="silent channel") as caught:
+        SPEC.execute(context(tmp_path, Probes(survey()), document=document))
+    assert needle in str(caught.value), str(caught.value)
+
+
+def test_a_witness_the_oracle_cannot_confirm_is_inconclusive(tmp_path: Path) -> None:
+    # RetransSegs rose 120 in the first minute (the stimulus oracle is content)
+    # and not at all over the interval ending at the status row's batch.
+    probes = Probes(survey(), oracle=records(flat_after=12))
+    with pytest.raises(VariantInconclusive, match="silent channel") as caught:
+        SPEC.execute(context(tmp_path, probes, document=activity(latest_offset=None)))
+    assert "1 candidate(s) the oracle could not confirm" in str(caught.value)
+
+
+def test_a_stored_batch_with_zero_retransmits_is_no_witness(tmp_path: Path) -> None:
+    document = activity(
+        status_offset=None, latest_offset=None, batches=[evidence_batch(90, 0.0)]
+    )
+    with pytest.raises(VariantInconclusive, match="proves nothing"):
+        SPEC.execute(context(tmp_path, Probes(survey()), document=document))
+
+
+# --------------------------------------------------------------------------- #
+# the negative: anything the product minted from the loss fails
+# --------------------------------------------------------------------------- #
 def test_a_nic_finding_from_tcp_loss_fails(tmp_path: Path) -> None:
     found = incident("inc-e", "network_errors_delta", device=IFA, workflow="wf-e")
     steps = workflow("wf-e", "inc-e", ["FREEZE_EVIDENCE", "VALIDATE_FABRIC"])
-    probes = Probes(survey())
     document = activity(incidents=[found], workflows=[steps])
-    result = SPEC.execute(context(tmp_path, probes, document=document))
+    result = SPEC.execute(context(tmp_path, Probes(survey()), document=document))
     assert result["verdict"] == "FAIL"
     assert any(error.startswith("no_nic_finding:") for error in result["errors"]), (
         "any((error.startswith('no_nic_finding:') for error in result['errors']"
     )
+
+
+def test_an_rdma_finding_from_tcp_loss_fails(tmp_path: Path) -> None:
+    found = incident("inc-r", "rdma_errors_delta", device="rdmap0s29", workflow="wf-r")
+    steps = workflow("wf-r", "inc-r", ["FREEZE_EVIDENCE", "VALIDATE_FABRIC"])
+    document = activity(incidents=[found], workflows=[steps])
+    result = SPEC.execute(context(tmp_path, Probes(survey()), document=document))
+    assert result["verdict"] == "FAIL"
+    assert any(error.startswith("no_rdma_finding:") for error in result["errors"]), (
+        result["errors"]
+    )
+
+
+def test_a_finding_fails_even_without_a_witness(tmp_path: Path) -> None:
+    found = incident("inc-d", "network_drops_delta", device=IFA, workflow="wf-d")
+    steps = workflow("wf-d", "inc-d", ["FREEZE_EVIDENCE", "VALIDATE_FABRIC"])
+    document = activity(
+        status_offset=None, latest_offset=None, incidents=[found], workflows=[steps]
+    )
+    result = SPEC.execute(context(tmp_path, Probes(survey()), document=document))
+    assert result["verdict"] == "FAIL", "a minted finding is never INCONCLUSIVE"
 
 
 def test_a_hardware_plan_fails(tmp_path: Path) -> None:
@@ -496,26 +713,39 @@ def test_a_hardware_plan_fails(tmp_path: Path) -> None:
 
 
 def test_nonzero_product_counters_on_the_test_veth_fail(tmp_path: Path) -> None:
-    document = activity(veth_errors=3.0)
-    result = SPEC.execute(context(tmp_path, Probes(survey()), document=document))
+    stored = activity(batches=[evidence_batch(90, 35.0, veth_errors=3.0)])
+    result = SPEC.execute(context(tmp_path, Probes(survey()), document=stored))
     assert result["verdict"] == "FAIL"
     assert any(
-        error.startswith("test_interface_zero:") for error in result["errors"]
-    ), "any((error.startswith('test_interface_zero:') for error in result['err"
+        error.startswith("test_interface_zero:")
+        and "read network_errors_delta=3.0" in error
+        for error in result["errors"]
+    ), result["errors"]
+    latest = activity(latest_values=(0.0, 2.0))
+    result = SPEC.execute(context(tmp_path, Probes(survey()), document=latest))
+    assert result["verdict"] == "FAIL"
+    assert any(
+        error.startswith("test_interface_zero:")
+        and "latest network_drops_delta" in error
+        for error in result["errors"]
+    ), result["errors"]
 
 
-@pytest.mark.parametrize(
-    "retrans,offset",
-    [(0.0, 90.0), (35.0, 5.0), (35.0, 900.0)],
-    ids=["zero", "before-one-interval", "after-the-stop"],
-)
-def test_no_product_batch_with_retransmits_is_inconclusive(
-    tmp_path: Path, retrans: float, offset: float
-) -> None:
-    probes = Probes(survey())
-    document = activity(retrans=retrans, offset=offset)
-    with pytest.raises(VariantInconclusive, match="proves nothing"):
-        SPEC.execute(context(tmp_path, probes, document=document))
+def test_a_stored_batch_on_a_nic_or_fabric_edge_fails(tmp_path: Path) -> None:
+    for reason in ("threshold:network_drops_delta", "threshold:efa_rnr_errors_delta"):
+        document = activity(batches=[evidence_batch(90, 35.0, reasons=(reason,))])
+        result = SPEC.execute(context(tmp_path, Probes(survey()), document=document))
+        assert result["verdict"] == "FAIL", reason
+        assert any(
+            error.startswith("no_fabric_edge:") and reason in error
+            for error in result["errors"]
+        ), result["errors"]
+    # The edges a quiet node delivers on are no fault: baseline, summary, a
+    # collection error elsewhere, a recovered reason.
+    for reason in ("baseline", "health-summary", "collection-error:_bmc", "recovered"):
+        document = activity(batches=[evidence_batch(90, 35.0, reasons=(reason,))])
+        result = SPEC.execute(context(tmp_path, Probes(survey()), document=document))
+        assert result["verdict"] == "PASS", (reason, result["errors"])
 
 
 def test_timing_keeps_the_deadmen_in_order(tmp_path: Path) -> None:
@@ -546,6 +776,8 @@ def test_the_approval_token_and_the_spec() -> None:
     assert SPEC.optional_approvals == ("TEMP_TEST_PACKAGE_INSTALL",)
     assert SPEC.describe()["optional_approvals"] == ["TEMP_TEST_PACKAGE_INSTALL"]
     assert SPEC.proof_mode == reg.NATIVE and SPEC.implemented
+    for needle in ("collector status", "latest counter records", "RetransSegs rise"):
+        assert needle in SPEC.expected, needle
 
 
 @pytest.mark.parametrize(

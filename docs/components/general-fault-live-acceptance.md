@@ -998,9 +998,22 @@ deadman 在运行器失联时删除流、qdisc、netns 与 veth（临时包由�
 必需接口缺失 → `network_link_down` → QUARANTINE）。有效性 oracle：流窗口内主机
 `RetransSegs` 增量 ≥ 20、netem 丢包 > 0、接收端收到数据，同时测试 veth 的错误/丢包计数
 与每个真实接口（管理/VPC-CNI/EFA netdev）的错误计数增量都为 0，否则 `INCONCLUSIVE`。
-产品须在流窗口内接收至少一批带正 `tcp_retransmits_delta` 的主机 batch（该指标无规则，
-只采集），否则“无 finding”不构成证明，同记 `INCONCLUSIVE`；任何 NIC/TCP finding、硬件
-恢复步骤或隔离为 `FAIL`。计划/执行形如（节点缺 `tc` 时）：
+负例的判定只取产品在**安静窗口**里确实会产生的记录：`tcp_retransmits_delta` 无规则，
+带它的 batch 永远不是沿（`collectors/host/collector.py` `_edge_reasons`），流窗口内主机采集器
+只按 health summary 投递，而 `app/ingest/telemetry.py` 对无 finding、无采集错误的 summary
+不写 raw evidence——2026-10-25 两个 lane（13daa08b2227 / d5d7610460e0）各 2.3 万次重传、16 次
+轮询、零条 stored batch，旧 oracle 等的正是产品按设计不写的东西。每批被接收的 batch 留下的是
+HOST_TELEMETRY collector status 行（`_record_collector_status`，`host-<node>-<observed_at 微秒>`，
+每批 upsert）和必需测试 veth 的 `network_errors_delta`/`network_drops_delta` latest 记录
+（`evaluate_metrics` 对 `LATEST_METRICS_REQUIRED` 每批 upsert，零值照常投递）。**见证**即落在流窗口
+`[start+interval, stop]` 内的这类记录，并经运行器自己的 RetransSegs 采样确认：以其 `observed_at`
+结尾的那个采集周期内重传确实上升，于是该 batch 必带正 `tcp_retransmits_delta`（`_tcp` 有基线后
+无条件产出）且已被控制面评估；偶然落入窗口的 raw evidence 若带正值亦可为见证。status/latest 都是
+latest-wins，运行器在流进行中每 2 个周期轮询并累积见过的记录（`tcp-window.json`）。PASS 要求有
+见证且无 NIC/TCP/RDMA finding、无以 NIC 或 fabric `threshold:` 沿投递的 stored batch、产品自己
+读到的 veth 计数为 0、无硬件步骤、无隔离；任一不满足为 `FAIL`（有 finding 时即使无见证也 FAIL）。
+`INCONCLUSIVE` 只剩两种：刺激失败（oracle 校验），或窗口内产品未接收任何主机 batch（静默通道）。
+计划/执行形如（节点缺 `tc` 时）：
 
 ```bash
 run_general_live.py --site-profile <profile> --run-dir <run> \

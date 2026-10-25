@@ -1312,8 +1312,11 @@ VARIANTS = [
         "veth pair, tc netem loss 5 % on the host-side veth egress; tc/sch_netem "
         "installed or loaded for this run only when missing",
         "host RetransSegs rises while the test veth and every real interface "
-        "count no errors; the product collects tcp_retransmits_delta but mints no "
-        "finding: no NIC finding, no fabric hardware path, no isolation",
+        "count no errors; the product accepts host batches inside the flow (its "
+        "collector status / the veth's latest counter records move, confirmed by "
+        "the oracle's RetransSegs rise in that interval) and mints nothing: no "
+        "NIC/TCP/RDMA finding, no NIC or fabric threshold edge stored, no fabric "
+        "hardware path, no isolation",
         tcp_only,
         risk="L",
         max_minutes=30,

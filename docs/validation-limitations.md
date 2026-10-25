@@ -1276,10 +1276,33 @@ to the host collector, and declaring it would read as a missing required
 interface (`network_link_down`, QUARANTINE). The oracle needs the host
 `RetransSegs` to rise by at least 20, netem to drop packets and the receiver to
 get data, while the test veth's error and drop counters and every real
-interface's error counters stay flat (`INCONCLUSIVE` otherwise); the product
-must also have accepted a host batch with a positive `tcp_retransmits_delta`
-from inside the flow, because that metric deliberately has no rule and a "no
-finding" the product never had the data for proves nothing.
+interface's error counters stay flat (`INCONCLUSIVE` otherwise). The negative
+itself is decided on records the product produces for a *quiet* window.
+`tcp_retransmits_delta` has no rule, so a batch carrying it is never an edge
+(`collectors/host/collector.py` `_edge_reasons`): inside the flow the host
+collector delivers only its health summaries, and `app/ingest/telemetry.py`
+keeps a summary with no finding and no collection error as no raw evidence.
+Live 2026-10-25, both lanes (releases 13daa08b2227 and d5d7610460e0): 22952 and
+23608 retransmissions, 16 polls, not one stored batch -- the previous oracle
+waited for raw evidence the product by design never writes for this metric.
+What every accepted batch does leave is the `HOST_TELEMETRY` collector status
+row (`_record_collector_status`: `host-<node>-<observed_at us>`, upserted per
+accepted batch) and the latest-wins records of the required test veth's
+`network_errors_delta`/`network_drops_delta` (`evaluate_metrics` over
+`LATEST_METRICS_REQUIRED`; a zero ships for them). A *witness* is such a record
+observed inside the flow window `[start + interval, stop]`, confirmed against
+the runner's own RetransSegs samples: the collector interval that ended at its
+`observed_at` counted retransmissions, so the batch it stands for carried a
+positive `tcp_retransmits_delta` (`_tcp` emits it unconditionally once it has
+a baseline) and the control plane graded it; a raw-evidence batch that happens
+to fall inside the flow with a positive value counts too. Both records are
+latest-wins, so the runner polls every two collector intervals while the flow
+runs and keeps every record it saw (`tcp-window.json`). PASS needs a witness
+and none of: a NIC/TCP/RDMA finding, a stored batch delivered on a NIC or
+fabric `threshold:` edge, a non-zero veth counter in the product's own
+readings, a hardware step, an isolation; any of those is FAIL (a finding fails
+even without a witness). `INCONCLUSIVE` is left to a failed stimulus or to a
+window in which the product accepted no host batch at all (a silent channel).
 
 `tc` and `sch_netem` are used as the node has them. Without the optional
 `TEMP_TEST_PACKAGE_INSTALL` approval a missing `tc` keeps the pass-3
