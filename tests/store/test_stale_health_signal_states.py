@@ -67,7 +67,7 @@ def test_only_rows_of_the_exact_prefix_older_than_the_bound_are_returned(store):
         "exact prefix, mount-point device included, fresh row and other "
         "nodes/clusters excluded"
     )
-    assert all(state.active for state in stale)
+    assert all(state.active for state in stale), "seeded active, never cleared"
 
 
 def test_the_bound_is_the_control_plane_clock_of_the_last_claim(store):

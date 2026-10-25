@@ -12,6 +12,7 @@ from gpu_fault.collectors.host import collector as host_module
 from gpu_fault.collectors.host import system_metrics
 from gpu_fault.collectors.host.system_metrics import BoundedStatvfs
 from gpu_fault.collectors.sinks import CollectorError
+from gpu_fault.host_device_signals import device_gone
 from tests.collectors import _cov95_runtime_collect as common
 from tests.collectors import _cov95_runtime_collect_host as support
 
@@ -182,9 +183,16 @@ def test_disk_counters_that_restart_are_rebaselined_not_rated(host_case):
         ],
     )
     assert before.samples == []
-    assert restarted.samples == [], (
+    assert [item for item in restarted.samples if not device_gone(item)] == [], (
         "the interval spanning a counter restart is not a rate"
     )
+    # The restarted counters are a new device instance under the old name: the
+    # previous instance is reported gone, so its latched signals clear and the
+    # successor's own sustained breach is a new episode (batch 160).
+    assert [(item.name, item.device, item.labels) for item in restarted.samples] == [
+        ("disk_io_util_percent", "dm-0", {"device_state": "GONE"}),
+        ("disk_io_await_ms", "dm-0", {"device_state": "GONE"}),
+    ]
     assert support.values(after) == {
         ("disk_io_util_percent", "dm-0"): 10.0,
         ("disk_io_await_ms", "dm-0"): 10.0,

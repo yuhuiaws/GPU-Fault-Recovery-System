@@ -18,6 +18,7 @@ from gpu_fault.collectors.host.mount_table import (
     read_mount_table,
 )
 from gpu_fault.collectors.host.observation import HostObservationError
+from gpu_fault.host_device_signals import DEVICE_STATE_GONE, DEVICE_STATE_LABEL
 from gpu_fault.host_health import (
     HostMetricSample,
 )
@@ -326,6 +327,8 @@ class HostSystemMetricsMixin:
     statvfs_timeout_seconds: float
 
     _delta: Callable[..., Any]
+    _diskstats_devices: set[str]
+    _diskstats_gone: set[str]
     _previous: Any
     _sample: Callable[..., Any]
     _statvfs_probe: BoundedStatvfs
@@ -779,9 +782,16 @@ class HostSystemMetricsMixin:
         on the next tick. Clamping each counter's delta to zero on its own, as
         before, mixed a clamped numerator with a live denominator (or the
         reverse) into an await of 0 ms, or of hundreds, that no request had.
+
+        A device that left ``/proc/diskstats`` since the previous read, and a
+        restarted one (a new device instance under the old name), are reported
+        as ``device_state=GONE`` for both metrics until a batch is delivered
+        (:meth:`_device_gone_samples`), and a vanished device's baseline is
+        forgotten so a same-named successor is rated from its own first read.
         """
 
         result = []
+        present: set[str] = set()
         for line in Path("/proc/diskstats").read_text().splitlines():
             fields = line.split()
             if len(fields) < 14:
@@ -789,6 +799,7 @@ class HostSystemMetricsMixin:
             device = fields[2]
             if device.startswith(("loop", "ram")):
                 continue
+            present.add(device)
             restarted = False
             deltas: dict[str, float] = {}
             elapsed = 0.0
@@ -801,6 +812,10 @@ class HostSystemMetricsMixin:
                 change = self._delta(key, value, observed_at)
                 if change is not None:
                     deltas[name], elapsed = change
+            if restarted:
+                # The device instance the control plane knew is gone and this
+                # is its successor; the new baseline is already recorded.
+                self._diskstats_gone.add(device)
             if restarted or len(deltas) < len(_DISK_COUNTER_FIELDS) or elapsed <= 0:
                 continue
             result.append(
@@ -821,7 +836,43 @@ class HostSystemMetricsMixin:
                         device,
                     )
                 )
-        return result
+        for device in self._diskstats_devices - present:
+            self._diskstats_gone.add(device)
+            for name in _DISK_COUNTER_FIELDS:
+                self._previous.pop(f"disk/{device}/{name}", None)
+        self._diskstats_devices = present
+        return [*self._device_gone_samples(), *result]
+
+    def _device_gone_samples(self) -> list[HostMetricSample]:
+        """One ``device_state=GONE`` sample per ``disk_io_*`` metric for every
+        block device that left ``/proc/diskstats`` (or restarted its counters)
+        since the last delivered batch (batch 160).
+
+        The control plane grades such a sample as a clear of the device's
+        signals and never as a reading (``host_device_signals.device_gone``):
+        a device that is not there can neither sustain a fault nor measure
+        0 ms. Without it the latched ``disk_io_await_ms`` signal of a torn-down
+        dm device stayed notified and silenced a same-named successor
+        (GF-GENERAL-LIVE-006, live 2026-10-25). The samples come first in the
+        tick, so a successor rated in the same tick is judged after the clear
+        and opens a new episode. They are repeated every tick until a batch is
+        delivered (``collect_once`` empties the set then): the tick a device
+        vanishes is usually an edge of its own -- its threshold reason drops
+        out, ``recovered`` -- and otherwise the next health summary carries
+        them.
+        """
+
+        labels = {DEVICE_STATE_LABEL: DEVICE_STATE_GONE}
+        return [
+            HostMetricSample(
+                name=name, value=0.0, unit=unit, device=device, labels=labels
+            )
+            for device in sorted(self._diskstats_gone)
+            for name, unit in (
+                ("disk_io_util_percent", "percent"),
+                ("disk_io_await_ms", "milliseconds"),
+            )
+        ]
 
     def _smart(self, observed_at: datetime) -> list[HostMetricSample]:
         """SMART health per drive, re-read at most once per cache period.

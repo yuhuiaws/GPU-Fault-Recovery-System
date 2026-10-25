@@ -37,6 +37,7 @@ from gpu_fault.collectors.sinks import (
     deliver_or_raise,
 )
 from gpu_fault.env import env_bool
+from gpu_fault.host_device_signals import device_gone
 from gpu_fault.host_health import (
     HostMetricSample,
     HostTelemetryBatch,
@@ -262,6 +263,12 @@ class HostTelemetryCollector(
         )
         self._configure_edge_thresholds()
         self._clock_ticks = float(os.sysconf("SC_CLK_TCK") or 100)
+        # Block devices seen on the previous ``/proc/diskstats`` read, and the
+        # ones that left (or restarted) since the last delivered batch: each
+        # reports ``device_state=GONE`` until a batch carries it
+        # (``HostSystemMetricsMixin._device_gone_samples``).
+        self._diskstats_devices: set[str] = set()
+        self._diskstats_gone: set[str] = set()
         self._last_delivered_at: datetime | None = None
         self._next_health_summary_at: datetime | None = None
         self._active_edge_reasons: set[str] = set()
@@ -636,6 +643,8 @@ class HostTelemetryCollector(
             # batch_id until the outbox evicted. Only a batch that went nowhere
             # keeps the edge open.
             self._last_delivered_at = observed_at
+            # The GONE samples this batch carried have reached the control plane.
+            self._diskstats_gone.clear()
             if (
                 self._next_health_summary_at is None
                 or observed_at >= self._next_health_summary_at
@@ -702,6 +711,8 @@ class HostTelemetryCollector(
             else LOW_UTILIZATION_METRICS
         )
         for sample in batch.samples:
+            if device_gone(sample):
+                continue  # a clear, not a reading: never an edge of its own
             immediate = NodeHealthPolicy.METRIC_RULES.get(sample.name)
             if immediate is not None and sample.value >= immediate[0]:
                 reason = f"threshold:{sample.name}"
