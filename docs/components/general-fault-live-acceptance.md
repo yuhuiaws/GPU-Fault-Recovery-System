@@ -128,6 +128,12 @@ collector和原任务均存活，保存内存/cgroup证据；不能用重启掩�
 低可用内存/本地盘为60秒。空闲节点、未分配GPU、多个attempt不应猜测任务归属。
 旧attempt窗口不能在新attempt继续累计。执行绑定原GPU/指标的诊断，不因低利用率
 盲目reset/reboot或未经授权压测。清理等待/压力，核对原rank真实进度；MIG另列能力缺口。
+判定按产品规则 id 认持续 finding 的 incident（事件 id 以
+`-low_memory_available`/`-high_page_cache`/`-high_local_filesystem_usage` 等小写
+规则 id 结尾），不是阈值族名 `memory`/`page_cache`/`local_filesystem`。诊断型
+incident 常在两次轮询之间就以 `diagnostic inconclusive` 关闭为 `RECOVERED`，
+任何状态都算；但只认本次读取起点之后、本节点本集群创建的 incident，后来的 workflow
+（如 validated restore）带进读取结果的旧 incident 不算本次 finding。
 
 ### GF-GENERAL-LIVE-004
 

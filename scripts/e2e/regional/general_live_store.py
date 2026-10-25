@@ -85,7 +85,12 @@ print(json.dumps({
 }, sort_keys=True, default=str))
 """
 
-#: Everything the product recorded about one node since a moment.
+#: Everything the product recorded about one node since a moment. Incidents
+#: are listed in every state (a diagnostic-only one is often RECOVERED before
+#: the next poll), plus the incident of any workflow created since, however
+#: old; the document names its own ``since``, cluster and node so a verdict
+#: can tell this read's findings from such older ones
+#: (``general_live_verdicts.minted_in_read``).
 ACTIVITY_PROBE = r"""
 import json
 import sys
@@ -218,6 +223,8 @@ except NotFoundError:
     agent = None
 print(json.dumps({
     "since": since.isoformat(),
+    "cluster_id": cluster_id,
+    "node_id": node_id,
     "batches": batches,
     "incidents": [item.model_dump(mode="json") for item in incidents.values()],
     "workflows": [item.model_dump(mode="json") for item in workflows.values()],

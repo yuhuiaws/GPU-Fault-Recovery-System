@@ -14,7 +14,7 @@ import math
 import re
 from collections.abc import Callable, Iterable, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 
 from scripts.e2e.regional.general_live_registry import HARDWARE_OPERATIONS
@@ -36,6 +36,41 @@ def safe_device(value: str | None) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "-", value or "node")[:160]
 
 
+def _moment(value: Any) -> datetime | None:
+    try:
+        moment = parse_time(value)
+    except ValueError:
+        return None
+    if moment is not None and moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment
+
+
+def minted_in_read(activity: dict[str, Any], incident: dict[str, Any]) -> bool:
+    """Whether ``incident`` is one the activity read itself was asked for.
+
+    ``general_live_store.ACTIVITY_PROBE`` lists the node's incidents created
+    since the read's ``since`` in every state, but it also adds the incident
+    of any workflow created since, however old that incident is (a validated
+    restore, a re-dispatch). The read names its ``since``, ``cluster_id`` and
+    ``node_id``: an incident created before that moment, or not naming that
+    node and cluster, is not the finding a variant caused. The state never
+    counts -- a diagnostic-only incident is often RECOVERED before the next
+    poll. A scripted document that names none of the three is taken as it is.
+    """
+
+    since = _moment(activity.get("since"))
+    if since is not None:
+        created = _moment(incident.get("created_at"))
+        if created is None or created < since:
+            return False
+    node = activity.get("node_id")
+    if node and node not in (incident.get("node_ids") or []):
+        return False
+    cluster = activity.get("cluster_id")
+    return not cluster or incident.get("cluster_id") == cluster
+
+
 def finding_incidents(
     activity: dict[str, Any],
     metric: str,
@@ -47,13 +82,20 @@ def finding_incidents(
 
     A metric finding's event id is ``<batch>-<metric>-<device|node>`` and a
     sustained finding's adds ``-<rule id lower>`` (``host_health.py``); the
-    incident id is ``inc-<event id>``.
+    incident id is ``inc-<event id>``. ``rule_id`` is the product's rule id
+    (``LOW_MEMORY_AVAILABLE``), never its threshold family (``memory``): the
+    runner matched on the family and never saw the LOW_MEMORY_AVAILABLE
+    incident the product opened and closed RECOVERED (live 2026-10-25).
+    Incidents of any state count; ``minted_in_read`` keeps out the ones the
+    read did not select for itself.
     """
 
     suffix = f"-{metric}-{safe_device(device)}" if device is not None else f"-{metric}-"
     result = []
     for incident in activity.get("incidents") or []:
         if incident.get("event_type") != "NODE_HEALTH":
+            continue
+        if not minted_in_read(activity, incident):
             continue
         event_id = str(incident.get("event_id") or "")
         if rule_id is not None:
@@ -416,6 +458,7 @@ __all__ = [
     "finding_incidents",
     "hardware_errors",
     "isolation_operations",
+    "minted_in_read",
     "node_isolated",
     "notification_errors",
     "operations",

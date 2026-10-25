@@ -6,16 +6,24 @@ answers the read-only store/kubectl reads the runner makes, and
 ``make_context`` wires them into a real ``VariantContext`` with a real
 ``Evidence`` under ``tmp_path`` and a no-op sleep. A test scripts the product's
 records (accepted batches, incidents, workflows with step executions, health
-signals) so the verdict helpers run over realistic documents.
+signals) so the verdict helpers run over realistic documents; ``activity_read``
+runs the real node-activity probe over an in-memory store when a test must
+know what that probe lists rather than script it.
 """
 
 from __future__ import annotations
 
+import contextlib
+import io
 import itertools
+import json
+import sys
+import types
 from collections.abc import Callable, Sequence
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
+from unittest import mock
 
 from scripts.e2e.regional.general_live_fixture import (
     Evidence,
@@ -236,6 +244,114 @@ def store_script(responses: dict[str, Any]) -> Callable[..., dict[str, Any]]:
         return dict(value)
 
     return dispatch
+
+
+ACTIVITY_CODE = compile(ACTIVITY_PROBE, "<general-live-activity-probe>", "exec")
+
+
+def activity_read(store: Any, arguments: Sequence[str]) -> dict[str, Any]:
+    """Run the real ``ACTIVITY_PROBE`` in-process over ``store``.
+
+    ``arguments`` are what ``general_live_store.node_activity`` passes the
+    probe in the API Pod; the probe reads ``store`` through the product's
+    own store API and prints the document a variant receives. A test that
+    needs to know what the probe lists (every incident state, the older
+    incident a later workflow pulls in) runs it instead of scripting it.
+    """
+
+    from gpu_fault.app import ApplicationContext
+
+    output = io.StringIO()
+    context = types.SimpleNamespace(store=store)
+    with (
+        mock.patch.object(ApplicationContext, "from_environment", lambda: context),
+        mock.patch.object(sys, "argv", ["activity-probe", *arguments]),
+        contextlib.redirect_stdout(output),
+    ):
+        exec(ACTIVITY_CODE, {"__name__": "__main__"})
+    return json.loads(output.getvalue())
+
+
+def save_diagnostic_incident(
+    store: Any,
+    event_id: str,
+    metric: str,
+    *,
+    cluster_id: str,
+    node: str,
+    created: datetime,
+    reason: str,
+) -> str:
+    """Store a diagnostic-only NODE_HEALTH incident as the product leaves it.
+
+    ``inc-<event id>`` closed RECOVERED "diagnostic inconclusive" behind a
+    FAILED FREEZE_EVIDENCE + VALIDATE_HOST workflow whose validation failed
+    on ``metric``'s host diagnostic probe, all written at ``created``
+    (detailed design 6.3; live 2026-10-25: LOW_MEMORY_AVAILABLE and the
+    co-firing memory_used_percent, created and RECOVERED within one second).
+    Returns the incident id.
+    """
+
+    from gpu_fault.models import (
+        IncidentState,
+        RecoveryAction,
+        WorkflowOperation,
+        WorkflowStatus,
+        WorkflowStepStatus,
+    )
+    from tests._builders import (
+        fault_incident,
+        workflow_request,
+        workflow_step,
+        workflow_step_execution,
+    )
+
+    incident_id = f"inc-{event_id}"
+    request_id = f"wf-{event_id}"
+    probe = {"metric": metric, "node_id": node, "device": None}
+    store.save_incident_and_workflow(
+        fault_incident(
+            incident_id,
+            event_id,
+            "NODE_HEALTH",
+            cluster_id,
+            node_ids=[node],
+            policy_source="SITE_HOST_RESOURCE_HEALTH",
+            effective_action=RecoveryAction.RUN_DIAGNOSTICS,
+            state=IncidentState.RECOVERED,
+            workflow_request_id=request_id,
+            reasons=[reason, "diagnostic inconclusive: validation failed"],
+            created_at=created,
+            updated_at=created,
+        ),
+        workflow_request(
+            request_id,
+            incident_id,
+            WorkflowStatus.FAILED,
+            official_steps=[
+                workflow_step(WorkflowOperation.FREEZE_EVIDENCE, node_ids=[node]),
+                workflow_step(
+                    WorkflowOperation.VALIDATE_HOST,
+                    node_ids=[node],
+                    parameters={"host_diagnostic_probe": probe},
+                ),
+            ],
+            step_executions=[
+                workflow_step_execution(
+                    1,
+                    WorkflowOperation.VALIDATE_HOST,
+                    WorkflowStepStatus.FAILED,
+                    details={
+                        "host_diagnostic_failure": True,
+                        "node_failures": {node: [f"host_diagnostic:{metric}"]},
+                    },
+                )
+            ],
+            created_at=created,
+            updated_at=created,
+        ),
+    )
+    return incident_id
 
 
 def host_batch(

@@ -217,7 +217,7 @@ def test_low_available_memory_inconclusive(tmp_path: Path) -> None:
             },
         }
     )
-    inc = incident("m", "memory_available_percent", rule_id="memory")
+    inc = incident("m", "memory_available_percent", rule_id="LOW_MEMORY_AVAILABLE")
     doc = {
         **EMPTY,
         "incidents": [inc],

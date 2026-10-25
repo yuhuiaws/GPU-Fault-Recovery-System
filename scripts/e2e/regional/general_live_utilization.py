@@ -46,6 +46,25 @@ from scripts.e2e.regional.general_live_verdicts import (
 )
 
 CASE = "GF-GENERAL-LIVE-003"
+#: The product's rule id of each sustained metric (``host_health.py``
+#: ``SUSTAINED_METRIC_RULES``, element 0): a sustained finding's event id ends
+#: ``-<rule id lower>``. The threshold family (element 7: ``memory``,
+#: ``page_cache``, ``local_filesystem``) only picks the threshold and duration
+#: knobs; matching on it missed the LOW_MEMORY_AVAILABLE incident the product
+#: opened and closed RECOVERED (live 2026-10-25). Pinned to the product table
+#: by test_general_live_utilization.py.
+SUSTAINED_RULES = {
+    "training_rank_cpu_percent": "LOW_CPU_UTILIZATION",
+    "host_gpu_utilization_percent": "LOW_GPU_UTILIZATION",
+    "memory_available_percent": "LOW_MEMORY_AVAILABLE",
+    "page_cache_percent": "HIGH_PAGE_CACHE",
+    "local_filesystem_used_percent": "HIGH_LOCAL_FILESYSTEM_USAGE",
+}
+LOW_GPU = SUSTAINED_RULES["host_gpu_utilization_percent"]
+LOW_CPU = SUSTAINED_RULES["training_rank_cpu_percent"]
+LOW_MEMORY = SUSTAINED_RULES["memory_available_percent"]
+HIGH_PAGE_CACHE = SUSTAINED_RULES["page_cache_percent"]
+HIGH_LOCAL_FS = SUSTAINED_RULES["local_filesystem_used_percent"]
 LOW_DURATION = 300
 LOW_BUDGET = LOW_DURATION + 300 + 120
 MEMORY_DURATION = 60
@@ -165,20 +184,20 @@ def gpu_idle(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started,
         "host_gpu_utilization_percent",
-        rule_id="LOW_GPU_UTILIZATION",
+        rule_id=LOW_GPU,
         timeout_seconds=LOW_BUDGET,
         metrics={"host_gpu_utilization_percent"},
         name="gpu-idle",
     )
     incidents = finding_incidents(
-        detection, "host_gpu_utilization_percent", rule_id="LOW_GPU_UTILIZATION"
+        detection, "host_gpu_utilization_percent", rule_id=LOW_GPU
     )
     stages = {
         "chain": chain_errors(
             detection,
             ChainExpectation(
                 metric="host_gpu_utilization_percent",
-                rule_id="LOW_GPU_UTILIZATION",
+                rule_id=LOW_GPU,
                 device=None,
                 operations=("FREEZE_EVIDENCE", "VALIDATE_GPU"),
                 validation="VALIDATE_GPU",
@@ -213,20 +232,20 @@ def rank_cpu_idle(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started,
         "training_rank_cpu_percent",
-        rule_id="LOW_CPU_UTILIZATION",
+        rule_id=LOW_CPU,
         timeout_seconds=LOW_BUDGET,
         metrics={"training_rank_cpu_percent"},
         name="rank-cpu",
     )
     incidents = finding_incidents(
-        detection, "training_rank_cpu_percent", rule_id="LOW_CPU_UTILIZATION"
+        detection, "training_rank_cpu_percent", rule_id=LOW_CPU
     )
     stages = {
         "chain": chain_errors(
             detection,
             ChainExpectation(
                 metric="training_rank_cpu_percent",
-                rule_id="LOW_CPU_UTILIZATION",
+                rule_id=LOW_CPU,
                 device=None,
                 operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
                 validation="VALIDATE_HOST",
@@ -297,7 +316,7 @@ def low_available_memory(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started,
         "memory_available_percent",
-        rule_id="memory",
+        rule_id=LOW_MEMORY,
         timeout_seconds=hold,
         metrics={"memory_available_percent", "memory_used_percent"},
         name="low-mem",
@@ -313,7 +332,7 @@ def low_available_memory(ctx: VariantContext) -> dict[str, Any]:
             detection,
             ChainExpectation(
                 metric="memory_available_percent",
-                rule_id="memory",
+                rule_id=LOW_MEMORY,
                 device=None,
                 operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
                 validation="VALIDATE_HOST",
@@ -354,18 +373,20 @@ def high_page_cache(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started,
         "page_cache_percent",
-        rule_id="page_cache",
+        rule_id=HIGH_PAGE_CACHE,
         timeout_seconds=hold,
         metrics={"page_cache_percent", "memory_used_percent"},
         name="page-cache",
     )
-    incidents = finding_incidents(detection, "page_cache_percent", rule_id="page_cache")
+    incidents = finding_incidents(
+        detection, "page_cache_percent", rule_id=HIGH_PAGE_CACHE
+    )
     stages = {
         "chain": chain_errors(
             detection,
             ChainExpectation(
                 metric="page_cache_percent",
-                rule_id="page_cache",
+                rule_id=HIGH_PAGE_CACHE,
                 device=None,
                 operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
                 validation="VALIDATE_HOST",
@@ -420,7 +441,7 @@ def scratch_full(ctx: VariantContext) -> dict[str, Any]:
         started,
         "local_filesystem_used_percent",
         device=_fs_mount(ctx),
-        rule_id="local_filesystem",
+        rule_id=HIGH_LOCAL_FS,
         timeout_seconds=LOW_BUDGET,
         metrics={"local_filesystem_used_percent", "filesystem_used_percent"},
         name="scratch",
@@ -431,7 +452,7 @@ def scratch_full(ctx: VariantContext) -> dict[str, Any]:
             ChainExpectation(
                 metric="local_filesystem_used_percent",
                 device=_fs_mount(ctx),
-                rule_id="local_filesystem",
+                rule_id=HIGH_LOCAL_FS,
                 operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
                 validation="VALIDATE_HOST",
                 validation_must_fail=True,
@@ -468,7 +489,7 @@ def idle_node(ctx: VariantContext) -> dict[str, Any]:
             observed,
             ChainExpectation(
                 metric="host_gpu_utilization_percent",
-                rule_id="LOW_GPU_UTILIZATION",
+                rule_id=LOW_GPU,
                 present=False,
             ),
         ),
@@ -476,7 +497,7 @@ def idle_node(ctx: VariantContext) -> dict[str, Any]:
             observed,
             ChainExpectation(
                 metric="training_rank_cpu_percent",
-                rule_id="LOW_CPU_UTILIZATION",
+                rule_id=LOW_CPU,
                 present=False,
             ),
         ),
@@ -503,13 +524,13 @@ def attempt_change(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started_b,
         "host_gpu_utilization_percent",
-        rule_id="LOW_GPU_UTILIZATION",
+        rule_id=LOW_GPU,
         timeout_seconds=LOW_BUDGET,
         metrics={"host_gpu_utilization_percent"},
         name="attempt-change",
     )
     incidents = finding_incidents(
-        detection, "host_gpu_utilization_percent", rule_id="LOW_GPU_UTILIZATION"
+        detection, "host_gpu_utilization_percent", rule_id=LOW_GPU
     )
     stages = {
         "attributed_to_b": _attribution_errors(
@@ -550,7 +571,7 @@ def ambiguous_ownership(ctx: VariantContext) -> dict[str, Any]:
             observed,
             ChainExpectation(
                 metric="host_gpu_utilization_percent",
-                rule_id="LOW_GPU_UTILIZATION",
+                rule_id=LOW_GPU,
                 present=False,
             ),
         ),

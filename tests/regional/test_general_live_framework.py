@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
+from gpu_fault.models import WorkflowStatus
 from scripts.e2e.regional import general_live_registry as reg
 from scripts.e2e.regional import general_live_store as store
 from scripts.e2e.regional import general_live_verdicts as v
+from tests._builders import build_store, workflow_request
+from tests.regional._general_live_fakes import activity_read, save_diagnostic_incident
 
 
 def spec(**overrides):
@@ -171,6 +174,64 @@ def test_finding_incidents_device_and_rule() -> None:
     assert not v.finding_incidents(doc, "cpu_usage_percent", device="dm-7"), (
         "not v.finding_incidents(doc, 'cpu_usage_percent', device='dm-7')"
     )
+
+
+#: What ``ACTIVITY_PROBE`` names about its own read.
+READ = {"since": "2026-10-25T03:19:46+00:00", "cluster_id": "c", "node_id": "node-a"}
+
+
+def _minted(**changes) -> dict:
+    """A LOW_MEMORY_AVAILABLE incident as the probe prints it (UTC ``Z``)."""
+
+    incident = {
+        **_incident("memory_available_percent", rule="LOW_MEMORY_AVAILABLE"),
+        "cluster_id": "c",
+        "node_ids": ["node-a"],
+        "created_at": "2026-10-25T03:37:50.000000Z",
+    }
+    return {**incident, **changes}
+
+
+def _low_memory(doc: dict) -> list:
+    return v.finding_incidents(
+        doc, "memory_available_percent", rule_id="LOW_MEMORY_AVAILABLE"
+    )
+
+
+@pytest.mark.parametrize(
+    "state", ["DETECTED", "ACTION_PENDING", "RECOVERED", "ESCALATED", "QUARANTINED"]
+)
+def test_finding_incidents_takes_the_reads_incident_in_any_state(state: str) -> None:
+    assert _low_memory({**READ, "incidents": [_minted(state=state)]}), state
+
+
+def test_finding_incidents_reads_a_zoneless_creation_time_as_utc() -> None:
+    doc = {**READ, "incidents": [_minted(created_at="2026-10-25T03:19:46")]}
+    assert _low_memory(doc), "created at the read's since, written without a zone"
+
+
+@pytest.mark.parametrize(
+    ("changes", "why"),
+    [
+        ({"created_at": "2026-10-25T03:19:45+00:00"}, "created before the read"),
+        ({"created_at": "not-a-time"}, "no readable creation time"),
+        ({"created_at": None}, "no creation time"),
+        ({"node_ids": ["node-b"]}, "another node's incident"),
+        ({"cluster_id": "other"}, "another cluster's incident"),
+        ({"event_id": "b-memory_used_percent-node"}, "another metric's finding"),
+        ({"event_id": "b-memory_available_percent-node-memory"}, "threshold family"),
+    ],
+)
+def test_finding_incidents_refuses_what_the_read_did_not_mint(
+    changes: dict, why: str
+) -> None:
+    assert not _low_memory({**READ, "incidents": [_minted(**changes)]}), why
+
+
+def test_finding_incidents_takes_a_scripted_document_as_it_is() -> None:
+    # No since/cluster/node: the document is all the matcher has to go on.
+    doc = {"incidents": [_minted(created_at="2026-01-01T00:00:00+00:00")]}
+    assert _low_memory(doc), "a scripted document names no read"
 
 
 def test_chain_errors_present_and_absent() -> None:
@@ -500,6 +561,57 @@ class Recorder:
     def cpu_python(self, script, *arguments, **_):
         self.calls.append((script, arguments))
         return {"ok": True}
+
+
+def test_activity_probe_lists_every_state_and_workflow_pulled_incidents() -> None:
+    """The real probe over a store: it hides no state, and names its read.
+
+    Live 2026-10-25 the variant missed a RECOVERED LOW_MEMORY_AVAILABLE
+    incident; the probe did list it -- the runner's rule id was wrong. The
+    probe also adds an older incident that a later workflow names, which only
+    the matcher's ``minted_in_read`` keeps out.
+    """
+
+    since = datetime(2026, 10, 25, 3, 19, 46, tzinfo=timezone.utc)
+    created = since + timedelta(seconds=1084)
+    low = "memory_available_percent-node-low_memory_available"
+    records = build_store()
+
+    def save(batch: str, node: str, at: datetime) -> str:
+        return save_diagnostic_incident(
+            records,
+            f"{batch}-{low}",
+            "memory_available_percent",
+            cluster_id="c",
+            node=node,
+            created=at,
+            reason="available host memory remained below the warning threshold",
+        )
+
+    fresh = save("b2", "node-a", created)
+    older = save("b1", "node-a", since - timedelta(hours=1))
+    other_node = save("b3", "node-b", created)
+    records.save_workflow(
+        workflow_request(
+            "wf-restore",
+            older,
+            WorkflowStatus.SUCCEEDED,
+            created_at=created,
+            updated_at=created,
+        )
+    )
+    doc = activity_read(
+        records, ["c", "node-a", since.isoformat(), "", "", "HOST_TELEMETRY"]
+    )
+    listed = {item["incident_id"]: item["state"] for item in doc["incidents"]}
+    assert listed == {fresh: "RECOVERED", older: "RECOVERED"}, listed
+    assert other_node not in listed, "the probe reads one node"
+    assert {key: doc[key] for key in READ} == {
+        "since": since.isoformat(),
+        "cluster_id": "c",
+        "node_id": "node-a",
+    }
+    assert [item["incident_id"] for item in _low_memory(doc)] == [fresh]
 
 
 def test_store_read_helpers_pass_through_and_validate() -> None:

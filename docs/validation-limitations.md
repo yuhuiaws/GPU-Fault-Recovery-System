@@ -1235,6 +1235,32 @@ A failed validation also counts as judging the held fault when its
 product sets `host_diagnostic_failure` only on health contracts that forbid
 hardware escalation, and the load-average validation runs on another one.
 
+A later pass (2026-10-25, 003 `low_available_memory`) failed "no
+memory_available_percent finding reached an incident" while the product had
+opened LOW_MEMORY_AVAILABLE, and the co-firing `memory_used_percent`
+incident, and closed both `RECOVERED` "diagnostic inconclusive" within the
+same second, exactly the diagnostic-only chain the variant expects. The node
+activity read lists incidents in every state; the runner's matcher did not
+take it. A sustained finding's event id ends with the product's rule id
+(`-low_memory_available`), and the runner looked for the rule's threshold
+family (`-memory`); `high_page_cache` (`page_cache` for HIGH_PAGE_CACHE) and
+`scratch_full` (`local_filesystem` for HIGH_LOCAL_FILESYSTEM_USAGE) could
+not match either, while the low-utilisation variants already named their
+rule. The fakes built the event id from the runner's own argument, so the
+variant tests agreed with the runner. The 003 variants now name the product's
+rule ids, and a test pins them to `host_health.py`'s sustained rule table and
+selects the incident of each sustained finding the product's own policy
+mints. The matcher still takes an incident in any state, but only one the read
+selected itself: created at or after the read's start, on the read's node and
+cluster. The read also adds the incident of any workflow created since its
+start however old that incident is (a validated restore names one), and such
+an incident is no finding of the run. The regression test replays the live
+failure through the real activity read over an in-memory store: the pair
+appears already `RECOVERED` on the third poll and the variant passes; an
+earlier run's pair pulled in by a restore, the pair on another node, or only
+other metrics' incidents leave it failing "no memory_available_percent
+finding reached an incident".
+
 The managed test jobs of 003, 011, 027, 028 and 029 are thin wrappers over
 the image prewarm and the managed workload fixture, and the variant tests
 replace both with fakes, so the live pass was the first to start one: 003
