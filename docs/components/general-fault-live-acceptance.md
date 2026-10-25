@@ -495,8 +495,9 @@ Agent过期/非活跃集群单独处理，不伪造成同一种静默。恢复�
 模块（`general_live_host`/`_utilization`/`_storage`/`_network`/`_collectors`/
 `_attempts`，共享 `general_live_registry`/`_fixture`/`_common`/`_store`/
 `_verdicts`）。主机探针为仅标准库的 `probes/general_live_node_probe.py`
-（CPU/内存/page cache 负载、oracle 采样、采集单元与 exporter 的限时 SIGSTOP、
-节点日志采集器的 runtime 启用）、`probes/general_live_storage_probe.py`
+（CPU/内存/page cache 负载、小容量测试 cgroup 的自身 OOM（`memory-start
+--cgroup-oom-bytes` 与 `memory-status`）、oracle 采样、采集单元与 exporter 的限时
+SIGSTOP、节点日志采集器的 runtime 启用）、`probes/general_live_storage_probe.py`
 （loop 文件系统与 loop+device-mapper 测试设备、O_DIRECT 写入）、
 `probes/general_live_net_probe.py`（host-local veth/dummy 测试接口、丢包生成器、
 009 `tcp_only` 的测试 netns+netem TCP 夹具）、`probes/general_live_deps_probe.py`
@@ -523,7 +524,8 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
 Node Agent ACTIVE、无未关闭 incident/工作流、必需采集通道新鲜；HyperPod 另确认
 `NodeRecovery=None`。`--execute` 需精确确认串 `GENERALLIVE<NNN>_EXECUTE` 和
 未过期的维护窗口。危险分支另需 `--approve` 令牌（绑进 `plan.json`）：
-`HOST_MEMORY_PRESSURE`（主机内存压力）、`KERNEL_MODULE_LOAD`（加载 dm_delay/
+`HOST_MEMORY_PRESSURE`（主机内存压力，以及 002 `cgroup_only` 的小容量自身 cgroup
+OOM）、`KERNEL_MODULE_LOAD`（加载 dm_delay/
 veth/dummy/sch_netem）、`ENABLE_NODE_LOG_COLLECTOR`（临时启用被禁用的节点日志
 采集器）、`WATCHER_NETWORK_ISOLATION`、`CONTROL_PLANE_RESTART`、
 `DECLARE_WARM_SPARE`（经 admin CLI 声明一台热备并 cordon，清理时释放/解除 cordon）、
@@ -576,7 +578,7 @@ decision、restart 预算账本），绝不 POST 预制 finding/workflow。运�
 028 进程失败/终态、029 重启预算、031 采集器静默。延后变体留在分母并记
 `NOT_RUN`/`BLOCKED`：需产品侧读取夹具的 live-replay（004 probe_error、
 008 statistics_failed、009 errors_delta、025 的 5 个字段/别名/NaN 变体、
-029 concurrent_claim/missing_context/hardware_chain_continues）、
+029 hardware_chain_continues）、
 本站能力缺失（008 bond_vf、031 inactive_cluster/notification_failure）、
 需未授批危险分支（028 api_unreachable、029 worker_restart）。
 
@@ -586,6 +588,26 @@ netdev 写进安装器/管理配置的 `GPU_FAULT_REQUIRED_INTERFACES`（默认�
 （生产默认 false）；002/003 的主机内存压力需 `HOST_MEMORY_PRESSURE` 审批；
 006 `sustained_latency`、008/009 的 veth/dummy/netem 需 `KERNEL_MODULE_LOAD`
 或预装内核模块。运行器只做只读 `--plan` 预检，`--execute` 由运维在授权窗口执行。
+
+029 `concurrent_claim`/`missing_context`（native，store 层）：不起受管任务，而是由
+`general_live_restart_budget.py` 的 `BUDGET_PROBE` 在 API Pod 内（`cpu_python`，写入调用
+`attempts=1` 不重试）用产品自身的接口操作一个**测试 job id**（`gl29cc-…`/`gl29mc-…`，由
+run id 与 attempt 派生）的重启预算账本。`concurrent_claim`：4 个 claimer 经 `Barrier` 同时对
+同一个 RESTART_WORKLOAD reservation 调用 `store.reserve_job_restart`（预算 1），再让另一步的
+reservation 同时争抢最后一个名额，再并发 release 同一 reservation，最后 release 从未持有的
+id；判定只读产品账本：恰好一个 reservation 且 `restart_count` 等于 reservation 数、争抢者全部
+被拒、release 恰好释放一次、未持有的 release 不改变账本、计数从不为负、不创建任何训练任务。
+`missing_context`：把一个只存在于内存、从不保存的 incident/workflow（RESTART_WORKLOAD 步骤缺
+`source_gpu_count`）交给产品的 claim 预检 `reserve_restart_budgets` 与适配器侧门禁
+`issue_restart_authorization`：预检须以 `RESTART_SAFETY_CONTEXT_MISSING` 拒绝并点名缺失参数，
+拒绝前后账本行都不存在（预算读写之前即拒绝）；补全上下文但无 reservation 的步骤在门禁
+fail-closed（`RESTART_RESERVATION_MISSING`）；对照组：同一步骤补全上下文后被预留并获授权。
+两者都不 POST finding/workflow/命令。清理先经产品 API 释放本次运行的 reservation，再用 store
+自身的 `_delete` 原语删除已清空的测试行（产品不提供账本删除接口；与
+`command_protocol_probes.cleanup_audit_records` 处理 `restart_budget` 行的做法相同）；仍持有
+他人 reservation 的行保留并记为清理失败，非 `gl29` 前缀的 job id 一律拒绝，已有账本行时记
+`NOT_RUN(FIXTURE_NOT_READY)` 并由清理移除本次运行的残留。标志 `P`（仅 lane 锁），无需
+`--approve`；`--fault-node` 仍是预检要求，但变体本身不触碰节点。
 
 009 `tcp_only`（native 负例：TCP 重传不是网卡错误，`general_live_tcp.py`）：网卡探针
 建 `gfrs<digest>ns` 测试 netns 与一对 gfrs veth（复用 gfrs-only 建接口与真实网卡守卫，
@@ -654,6 +676,18 @@ IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，cre
   cgroup 压力和 meminfo oracle，需 `HOST_MEMORY_PRESSURE`；`memory_used_percent`
   ≥95% 持续 120 秒 → VALIDATE_HOST 探针在加载期间失败，无 reset/reboot）；
   `no_swap`（observation：确认 `SwapTotal=0` 时 swap 规则天然不触发）。
+- 002 `cgroup_only`（native 负例，复用 `HOST_MEMORY_PRESSURE`）：节点探针
+  `memory-start --cgroup-oom-bytes 2147483648` 把分配器放进一个上限 2 GiB（探针拒绝超过
+  MemTotal 的 1 % 或超过主机在 95 % 规则下余量的上限）、无 swap、`OOMPolicy=kill` 的测试
+  cgroup，分配器在 cgroup 内被内核 OOM killer 杀死；该单元不 `--collect`，`memory-status`
+  读 systemd 的 `Result=oom-kill`/`ExecMainStatus=9` 作为“OOM 发生在 cgroup 内”的证据，随后
+  `memory-stop` 复位单元并撤销 deadman。在长于 120 秒持续窗口加一个 health summary 的窗口内
+  重复 3 次；meminfo oracle 读到的主机 `memory_used_percent` 须全程低于 95%（越过即
+  `INCONCLUSIVE`：主机本身有压力），窗口内产品须至少接收一个主机内存样本（否则
+  `INCONCLUSIVE`：静默通道无法证明判定）。PASS 要求无 `memory_used_percent`/
+  `memory_available_percent` finding、无硬件步骤、无 STOP/cordon/隔离、节点仍可调度；若节点
+  日志采集器被启用而把 OOM 行判为 finding，只接受 RUN_DIAGNOSTICS 诊断（`log_rules.py`），
+  任何 STOP 或隔离为 FAIL。
 - 007 `healthy`（observation：只读确认真实 SMART 判定健康且不产生存储 finding，
   作为失败变体的对照基线）。
 
@@ -669,7 +703,6 @@ IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，cre
   （EC2 无 BMC）、002 `swap_pressure`（无 swap 且不得为测试开 swap）。
 - `VENDOR_LAB_ONLY`：012 `confirmed_missing`/`reboot_verified`/`post_reboot_failure`
   需要真实掉卡与已批准的 provider reboot；本 lane 绝不解绑或移除真实 GPU。
-- `cgroup_only`（002）需要一个有界的自身 cgroup OOM 注入模式，节点探针尚未提供。
 
 现有的 `probes/collector_window_probe.py` 的 nvidia-smi shadow 只匹配库存快照查询
 （026 身份路径），不覆盖 host collector 的 `uuid,utilization.gpu` 查询，故 012
