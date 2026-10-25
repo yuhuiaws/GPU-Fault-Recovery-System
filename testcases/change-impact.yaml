@@ -659,6 +659,7 @@ rules:
     pytest:
       - tests/regional/test_general_live_host.py
       - tests/regional/test_general_live_storage.py
+      - tests/regional/test_general_live_storage_io.py
       - tests/regional/test_general_live_network.py
       - tests/regional/test_general_live_tcp_only.py
       - tests/regional/test_general_live_tcp_fixture.py

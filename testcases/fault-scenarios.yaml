@@ -102,7 +102,7 @@ test_cases:
   expected: [短突发与持续窗口区分, await口径偏差和零分母不得当通过, 实际验证恢复且不升级硬件]
   automation: manual
   procedure: docs/components/general-fault-live-acceptance.md#gf-general-live-006
-  related_pytest: tests/regional/test_general_live_storage.py::test_sustained_util_passes
+  related_pytest: tests/regional/test_general_live_storage_io.py::test_sustained_util_passes
   evidence: {verdict: NOT_RUN}
 - id: GF-GENERAL-LIVE-007
   title: 真机SMART失败与扫描查询失败区分
