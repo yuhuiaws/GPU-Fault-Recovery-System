@@ -14,6 +14,7 @@ chain checks.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
 import json
 import os
@@ -51,6 +52,9 @@ from scripts.e2e.regional.regional_live_fixture import (
 
 PROBES = Path(__file__).with_name("probes")
 NODE_PROBE = PROBES / "general_live_node_probe.py"
+#: The node probe's second file: the pause commands, shipped through its
+#: ``install-source`` (sha256-checked) once per run and node before the first pause.
+PAUSE_MODULE = PROBES / "general_live_node_pause.py"
 STORAGE_PROBE = PROBES / "general_live_storage_probe.py"
 NET_PROBE = PROBES / "general_live_net_probe.py"
 WINDOW_PROBE = PROBES / "collector_window_probe.py"
@@ -474,6 +478,8 @@ class VariantContext:
     cleanup: CleanupStack = field(default_factory=CleanupStack)
     probes: dict[str, ProbeHandle] = field(default_factory=dict)
     survey: dict[str, Any] = field(default_factory=dict)
+    #: ``<file>@<node>`` of every second node-side file installed in this run.
+    shipped: set[str] = field(default_factory=set)
     clock: Callable[[], datetime] = utc_now
     sleep: Callable[[float], None] = time.sleep
 
@@ -512,6 +518,36 @@ class VariantContext:
         return self.probe("node").execute(
             *arguments, "--run-id", self.run_id, timeout=timeout
         )
+
+    def pause(
+        self, *arguments: str, node: str | None = None, timeout: int = 180
+    ) -> dict[str, Any]:
+        """A producer-pause command on ``node`` (``unit-pause``,
+        ``exporter-pause``, ``log-collector-enable``).
+
+        Their arm side is the node probe's second file (a probe ships as one
+        file): it is installed sha256-checked once per run and node before the
+        first pause; the resumes, ``residue`` and ``cleanup`` need no shipping.
+        """
+
+        handle = self.probe("node", node=node)
+        key = f"{PAUSE_MODULE.name}@{node or self.settings.node}"
+        if key not in self.shipped:
+            content = PAUSE_MODULE.read_bytes()
+            handle.execute(
+                "install-source",
+                "--name",
+                PAUSE_MODULE.name,
+                "--sha256",
+                hashlib.sha256(content).hexdigest(),
+                "--b64",
+                base64.b64encode(content).decode("ascii"),
+                "--run-id",
+                self.run_id,
+                timeout=120,
+            )
+            self.shipped.add(key)
+        return handle.execute(*arguments, "--run-id", self.run_id, timeout=timeout)
 
     def storage(self, *arguments: str, timeout: int = 300) -> dict[str, Any]:
         return self.probe("storage").execute(

@@ -15,8 +15,12 @@ run id and recorded in ``/run/gpu-fault-acceptance/general/<digest>/state.json``
 * transient systemd units ``gfrs-<digest>-<kind>`` (CPU burners, a page-cache
   reader of a *sparse* file, an oracle sampler, a capped memory allocator) --
   every one with ``RuntimeMaxSec`` so it stops itself;
-* a SIGSTOP of one allow-listed collector unit, or of the node's DCGM
-  exporter process, resumed by a deadman;
+* a SIGSTOP of one allow-listed collector unit (a ``/run`` drop-in re-stops a
+  main process the product restarts), or of the node's DCGM exporter process,
+  resumed by a deadman -- the pause/resume *commands* are the second node-side
+  file ``general_live_node_pause.py`` (``install-source``, sha256-checked, once
+  per run); ``residue`` and ``cleanup`` stay here, so the deadman needs this
+  file alone;
 * a runtime-only (``/run``) enable of the installed but disabled node log
   collector, behind an explicit approval.
 
@@ -30,7 +34,10 @@ the system or log disk, or a network interface.
 from __future__ import annotations
 
 import argparse
+import base64
 import hashlib
+import importlib
+import importlib.util
 import json
 import os
 import re
@@ -76,17 +83,15 @@ PAUSABLE_UNITS = (
     "gpu-fault-log-collector.service",
 )
 LOG_COLLECTOR_UNIT = "gpu-fault-log-collector.service"
-#: A pause must outlive the product's own restart of the unit. The Node Agent's
-#: TRIGGER_HEALTH_SNAPSHOT step (``node_agent/operations/diagnostics.py``)
-#: runs ``systemctl restart`` on the metrics and host collectors; systemd
-#: follows SIGTERM with SIGCONT, so a bare SIGSTOP ends with the old process
-#: and the new one posts freely. Live 2026-10-25 the GPU inventory channel
-#: (180 s, same unit) tripped that refresh 183 s into a GPU_METRICS pause
-#: (420 s): the restarted collector kept GPU_METRICS FRESH_SUCCESS. A drop-in
-#: under this root stops every new main process; ``unit-resume`` and the
-#: deadman remove it (and reload) before SIGCONT, and a leftover is residue.
+#: The pause drop-in (``ExecStartPost`` re-stops a main process the product
+#: restarted) that ``unit-resume`` and the deadman remove before SIGCONT.
 PAUSE_DROPIN_ROOT = Path("/run/systemd/system")
 PAUSE_DROPIN_PREFIX = "90-gfrs-pause-"
+#: The pause/resume commands, installed through ``install-source``, and the
+#: ``sys.modules`` name this probe registers itself under for them.
+PAUSE_NAME = "general_live_node_pause.py"
+PROBE_ALIAS = "gfrs_general_live_node_probe"
+MAX_SOURCE_BYTES = 256 * 1024
 PRODUCT_UNITS = (
     *PAUSABLE_UNITS,
     "gpu-fault-node-agent.service",
@@ -1128,32 +1133,6 @@ def pause_dropin_path(run_id: str, unit: str) -> Path:
     )
 
 
-def install_pause_dropin(run_id: str, unit: str) -> dict[str, Any]:
-    """Load a drop-in that SIGSTOPs every new main process of ``unit``.
-
-    ``ExecStartPost`` runs once the main process is forked (``Type=simple``),
-    before the collector has discovered a GPU or posted anything, so a product
-    restart during the pause leaves the channel silent instead of fresh.
-    """
-
-    kill = shutil.which("kill") or "/usr/bin/kill"
-    if not Path(kill).is_file():
-        raise ProbeError("no kill binary for the pause drop-in")
-    path = pause_dropin_path(run_id, unit)
-    created_dir = not path.parent.is_dir()
-    path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
-    path.write_text(
-        f"# gpu-fault acceptance pause of run {run_id}: a restarted main process\n"
-        "# is stopped again; removed by unit-resume and by the run's deadman.\n"
-        "[Service]\n"
-        f"ExecStartPost={kill} -STOP $MAINPID\n",
-        encoding="utf-8",
-    )
-    path.chmod(0o644)
-    run(["systemctl", "daemon-reload"])
-    return {"path": str(path), "created_dir": created_dir}
-
-
 def remove_pause_dropin(run_id: str, unit: str, created_dir: bool) -> dict[str, Any]:
     """Unload the pause drop-in; a reload that fails is reported, not hidden."""
 
@@ -1164,140 +1143,95 @@ def remove_pause_dropin(run_id: str, unit: str, created_dir: bool) -> dict[str, 
     if created_dir and path.parent.is_dir() and not any(path.parent.iterdir()):
         path.parent.rmdir()
     reloaded = run(["systemctl", "daemon-reload"], check=False) if removed else None
-    return {
-        "path": str(path),
-        "removed": removed,
-        "reload_failed": bool(reloaded is not None and reloaded.returncode),
-    }
+    failed = bool(reloaded is not None and reloaded.returncode)
+    return {"path": str(path), "removed": removed, "reload_failed": failed}
 
 
 def leftover_pause_dropins(run_id: str) -> list[Path]:
     """This run's pause drop-ins still on disk, whatever the state file says."""
 
-    if not PAUSE_DROPIN_ROOT.is_dir():
-        return []
-    return sorted(
-        PAUSE_DROPIN_ROOT.glob(f"*.d/{PAUSE_DROPIN_PREFIX}{run_digest(run_id)}.conf")
-    )
+    pattern = f"*.d/{PAUSE_DROPIN_PREFIX}{run_digest(run_id)}.conf"
+    return sorted(PAUSE_DROPIN_ROOT.glob(pattern))
 
 
 def loaded_pause_hooks() -> list[str]:
     """Pausable units whose loaded ``ExecStartPost`` still stops the main process."""
 
+    shown = ["systemctl", "show", "--property=ExecStartPost"]
     return [
         unit
         for unit in PAUSABLE_UNITS
-        if "-STOP $MAINPID"
-        in run(
-            ["systemctl", "show", unit, "--property=ExecStartPost"], check=False
-        ).stdout
+        if "-STOP $MAINPID" in run([*shown, unit], check=False).stdout
     ]
 
 
-def unit_pause(arguments: argparse.Namespace) -> None:
-    """SIGSTOP every process of one collector unit; the unit stays active.
+def load_pause_module(run_id: str) -> Any:
+    """The installed, sha256-checked pause module, else the checkout's sibling;
+    registered under ``PROBE_ALIAS`` first so the module finds this probe."""
 
-    A pause is not a disable: systemd keeps the unit ``active`` and the Agent
-    keeps reporting it enabled, which is what the silence scanner must see.
-    The pause drop-in (``PAUSE_DROPIN_ROOT``) is loaded before the SIGSTOP so
-    that a product restart of the unit re-stops the new main process.
-    """
+    sys.modules.setdefault(PROBE_ALIAS, sys.modules[__name__])
+    path = state_dir(run_id) / PAUSE_NAME
+    if not path.is_file():
+        try:
+            return importlib.import_module(
+                "scripts.e2e.regional.probes.general_live_node_pause"
+            )
+        except ImportError:
+            raise ProbeError(f"install {PAUSE_NAME} before a pause") from None
+    spec = importlib.util.spec_from_file_location("gfrs_general_live_node_pause", path)
+    if spec is None or spec.loader is None:
+        raise ProbeError("the installed pause module cannot be loaded")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _shipped(name: str) -> Any:
+    """The handler ``name`` of the pause module, loaded per call."""
+
+    return lambda a: getattr(load_pause_module(checked_run_id(a.run_id)), name)(a)
+
+
+def install_source(arguments: argparse.Namespace) -> None:
+    """Install one sha256-checked file under the run's state directory."""
 
     run_id = checked_run_id(arguments.run_id)
-    unit = checked_pausable(arguments.unit)
-    seconds = bounded(arguments.seconds, MIN_DEADMAN_SECONDS, 1500, "pause seconds")
-    before = unit_state(unit)
-    if before.get("ActiveState") != "active":
-        raise ProbeError(f"{unit} is not active at baseline")
-    kind = f"resume-{unit.split('.')[0].removeprefix('gpu-fault-')}"
-    state = load_state(run_id)
-    state["paused_units"][unit] = {
-        "paused_at": utc_now(),
-        "before": before,
-        "kind": kind,
-    }
-    save_state(run_id, state)
-    deadman = arm_deadman(run_id, kind, seconds, "--unit", unit)
-    try:
-        dropin = install_pause_dropin(run_id, unit)
-        state = load_state(run_id)
-        state["paused_units"][unit]["dropin"] = dropin
-        save_state(run_id, state)
-        run(["systemctl", "kill", "--kill-whom=all", "--signal=SIGSTOP", unit])
-    except Exception:
-        resume_unit(run_id, unit)
-        raise
-    emit(
-        {
-            "unit": unit,
-            "before": before,
-            "after": unit_state(unit),
-            "stopped": unit_is_stopped(unit),
-            "deadman": deadman,
-            "dropin": dropin["path"],
-            "resume_after_seconds": seconds,
-        }
-    )
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,63}\.py", arguments.name) is None:
+        raise ProbeError("unsafe source name")
+    if re.fullmatch(r"[0-9a-f]{64}", arguments.sha256) is None:
+        raise ProbeError("a sha256 is required for every installed source")
+    content = base64.b64decode(arguments.b64, validate=True)
+    if len(content) > MAX_SOURCE_BYTES:
+        raise ProbeError("installed source exceeds its size bound")
+    if hashlib.sha256(content).hexdigest() != arguments.sha256:
+        raise ProbeError("installed source sha256 does not match")
+    directory = state_dir(run_id)
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    target = directory / arguments.name
+    temporary = target.with_suffix(".tmp")
+    temporary.write_bytes(content)
+    temporary.chmod(0o600)
+    os.replace(temporary, target)
+    emit({"name": arguments.name, "path": str(target), "bytes": len(content)})
 
 
 def resume_unit(run_id: str, unit: str) -> dict[str, Any]:
-    """Unload the pause drop-in, then SIGCONT; the order keeps a restart that
-    races the resume from stopping the process again."""
+    """Unload the pause drop-in, then SIGCONT (a restart racing the resume must
+    not stop the process again); the deadman and ``cleanup`` need only this file."""
 
     state = load_state(run_id)
-    info = state["paused_units"].get(unit)
-    dropin = remove_pause_dropin(
-        run_id, unit, bool(((info or {}).get("dropin") or {}).get("created_dir"))
-    )
+    info = state["paused_units"].get(unit) or {}
+    created_dir = bool((info.get("dropin") or {}).get("created_dir"))
+    dropin = remove_pause_dropin(run_id, unit, created_dir)
     run(["systemctl", "kill", "--kill-whom=all", "--signal=SIGCONT", unit], check=False)
     state["paused_units"].pop(unit, None)
     save_state(run_id, state)
-    if info is not None:
+    if info:
         disarm_deadman(run_id, info["kind"])
     if dropin["reload_failed"]:
         raise ProbeError(f"systemd did not reload after removing {dropin['path']}")
-    return {
-        "unit": unit,
-        "after": unit_state(unit),
-        "stopped": unit_is_stopped(unit),
-        "dropin": dropin,
-    }
-
-
-def unit_resume(arguments: argparse.Namespace) -> None:
-    emit(
-        resume_unit(checked_run_id(arguments.run_id), checked_pausable(arguments.unit))
-    )
-
-
-def exporter_pause(arguments: argparse.Namespace) -> None:
-    """SIGSTOP the node's dcgm-exporter process: its scrape port stops answering."""
-
-    run_id = checked_run_id(arguments.run_id)
-    seconds = bounded(arguments.seconds, MIN_DEADMAN_SECONDS, 1500, "pause seconds")
-    processes = exporter_processes()
-    if len(processes) != 1:
-        raise ProbeError(
-            f"expected exactly one {EXPORTER_BINARY} process, found {len(processes)}"
-        )
-    target = processes[0]
-    state = load_state(run_id)
-    state["paused_processes"][str(target["pid"])] = {
-        "start_ticks": target["start_ticks"],
-        "paused_at": utc_now(),
-        "binary": EXPORTER_BINARY,
-    }
-    save_state(run_id, state)
-    deadman = arm_deadman(run_id, "resume-exporter", seconds)
-    os.kill(int(target["pid"]), signal.SIGSTOP)
-    emit(
-        {
-            "pid": target["pid"],
-            "stopped": process_is_stopped(int(target["pid"]), target["start_ticks"]),
-            "deadman": deadman,
-            "resume_after_seconds": seconds,
-        }
-    )
+    after = {"after": unit_state(unit), "stopped": unit_is_stopped(unit)}
+    return {"unit": unit, "dropin": dropin, **after}
 
 
 def resume_processes(run_id: str) -> list[dict[str, Any]]:
@@ -1319,40 +1253,6 @@ def resume_processes(run_id: str) -> list[dict[str, Any]]:
     save_state(run_id, state)
     disarm_deadman(run_id, "resume-exporter")
     return result
-
-
-def exporter_resume(arguments: argparse.Namespace) -> None:
-    emit({"processes": resume_processes(checked_run_id(arguments.run_id))})
-
-
-def log_collector_enable(arguments: argparse.Namespace) -> None:
-    """Runtime-enable and start the disabled node log collector (needs approval).
-
-    ``enable --runtime`` writes the link under ``/run`` only, so a reboot (or
-    the deadman) returns the unit to its installed, disabled state.
-    """
-
-    if not arguments.approved:
-        raise ProbeError(
-            "starting the node log collector requires the runner's approval"
-        )
-    run_id = checked_run_id(arguments.run_id)
-    seconds = bounded(
-        arguments.seconds, MIN_DEADMAN_SECONDS, MAX_DEADMAN_SECONDS, "seconds"
-    )
-    before = unit_state(LOG_COLLECTOR_UNIT)
-    if before.get("LoadState") != "loaded":
-        raise ProbeError("the node log collector unit is not installed")
-    if before.get("ActiveState") == "active":
-        raise ProbeError("the node log collector is already running")
-    state = load_state(run_id)
-    state["log_collector"] = {"before": before, "enabled_at": utc_now()}
-    save_state(run_id, state)
-    deadman = arm_deadman(run_id, "logcollector", seconds)
-    run(["systemctl", "enable", "--runtime", "--now", LOG_COLLECTOR_UNIT], timeout=120)
-    emit(
-        {"before": before, "after": unit_state(LOG_COLLECTOR_UNIT), "deadman": deadman}
-    )
 
 
 def restore_log_collector(run_id: str) -> dict[str, Any]:
@@ -1381,13 +1281,6 @@ def restore_log_collector(run_id: str) -> dict[str, Any]:
     return {"restored": True, "after": unit_state(LOG_COLLECTOR_UNIT)}
 
 
-def log_collector_disable(arguments: argparse.Namespace) -> None:
-    emit(restore_log_collector(checked_run_id(arguments.run_id)))
-
-
-# --------------------------------------------------------------------------- #
-# Cleanup (the deadman's entry point, and the runner's finally)
-# --------------------------------------------------------------------------- #
 def cleanup_kind(run_id: str, kind: str, unit: str | None) -> list[dict[str, Any]]:
     """Undo what ``kind`` names (``all``: everything the run recorded)."""
 
@@ -1409,13 +1302,9 @@ def cleanup_kind(run_id: str, kind: str, unit: str | None) -> list[dict[str, Any
             run(["systemctl", "stop", f"{name}.service"], check=False)
     paused = list(state["paused_units"]) if everything else [unit] if unit else []
     if everything:
-        # A drop-in the state file no longer names (a lost state write) would
-        # otherwise stop the collector at its next product restart for good.
-        paused.extend(
-            path.parent.name.removesuffix(".d")
-            for path in leftover_pause_dropins(run_id)
-            if path.parent.name.removesuffix(".d") not in paused
-        )
+        # A drop-in the state file lost would stop the collector for good.
+        leftovers = leftover_pause_dropins(run_id)
+        paused.extend(path.parent.name.removesuffix(".d") for path in leftovers)
     for item in paused:
         if item in PAUSABLE_UNITS:
             actions.append({"resumed": resume_unit(run_id, item)})
@@ -1476,16 +1365,8 @@ def cleanup(arguments: argparse.Namespace) -> None:
 
 
 def residue_is_clean(value: dict[str, Any]) -> bool:
-    if any(
-        value.get(key)
-        for key in (
-            "page_cache_files",
-            "paused_units",
-            "paused_processes",
-            "pause_dropins",
-            "pause_hooks",
-        )
-    ):
+    held = ("page_cache_files", "paused_units", "paused_processes", "pause_dropins")
+    if any(value.get(key) for key in (*held, "pause_hooks")):
         return False
     if value.get("log_collector_enabled_by_run"):
         return False
@@ -1552,18 +1433,22 @@ def parser() -> argparse.ArgumentParser:
     command("memory-status", memory_status)
     command("memory-stop", memory_stop)
 
-    item = command("unit-pause", unit_pause)
+    item = command("install-source", install_source)
+    for flag in ("--name", "--sha256", "--b64"):
+        item.add_argument(flag, required=True)
+    item = command("unit-pause", _shipped("unit_pause"))
     item.add_argument("--unit", required=True)
     item.add_argument("--seconds", type=int, required=True)
-    command("unit-resume", unit_resume).add_argument("--unit", required=True)
-    command("exporter-pause", exporter_pause).add_argument(
+    item = command("unit-resume", _shipped("unit_resume"))
+    item.add_argument("--unit", required=True)
+    command("exporter-pause", _shipped("exporter_pause")).add_argument(
         "--seconds", type=int, required=True
     )
-    command("exporter-resume", exporter_resume)
-    item = command("log-collector-enable", log_collector_enable)
+    command("exporter-resume", _shipped("exporter_resume"))
+    item = command("log-collector-enable", _shipped("log_collector_enable"))
     item.add_argument("--seconds", type=int, required=True)
     item.add_argument("--approved", action="store_true")
-    command("log-collector-disable", log_collector_disable)
+    command("log-collector-disable", _shipped("log_collector_disable"))
     command("efa-traffic", efa_traffic)
     return value
 

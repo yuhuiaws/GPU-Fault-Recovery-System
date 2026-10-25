@@ -597,7 +597,11 @@ notes；恢复判定以恢复前的成功时间为基线，要求之后出现新
 SIGSTOP（采集单元的暂停同时装载一个 `/run/systemd/system/<unit>.d/` drop-in，用
 `ExecStartPost` 再次停住被产品自身 TRIGGER_HEALTH_SNAPSHOT 重启出来的新主进程；
 `unit-resume` 与 deadman 先移除并 reload 再 SIGCONT，遗留的 drop-in 或已装载的钩子
-计为残留）、节点日志采集器的 runtime 启用）、`probes/general_live_storage_probe.py`
+计为残留）、节点日志采集器的 runtime 启用；三条暂停命令 `unit-pause`/`exporter-pause`/
+`log-collector-enable` 本身位于第二个节点侧文件 `probes/general_live_node_pause.py`
+——探针是单文件装入节点，运行器在每次运行首次暂停前经探针的 `install-source` 以
+sha256 校验装入该模块、探针按路径导入；恢复、`residue` 与 `cleanup` 仍在探针内，
+deadman 只需探针本身）、`probes/general_live_storage_probe.py`
 （loop 文件系统与 loop+device-mapper 测试设备、O_DIRECT 写入）、
 `probes/general_live_net_probe.py`（host-local veth/dummy 测试接口、丢包生成器、
 009 `tcp_only` 的测试 netns+netem TCP 夹具）、`probes/general_live_deps_probe.py`

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+import hashlib
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -12,7 +14,7 @@ from gpu_fault.app.ingest.gpu_findings import gpu_node_health_findings
 from gpu_fault.gpu_collection_errors import collection_error_finding
 from gpu_fault.gpu_metrics import GpuMetricBatch, GpuMetricSource, GpuMetricsThresholds
 from scripts.e2e.regional import general_live_collectors as col
-from scripts.e2e.regional.general_live_fixture import VariantNotRun
+from scripts.e2e.regional.general_live_fixture import PAUSE_MODULE, VariantNotRun
 from scripts.e2e.regional.general_live_verdicts import finding_incidents
 from tests.regional._general_live_fakes import (
     FakeProbe,
@@ -490,3 +492,40 @@ def test_silence_accepts_the_hours_deduplicated_advisory(tmp_path: Path) -> None
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
     assert any("deduplicated" in note for note in result["notes"]), result["notes"]
+
+
+def test_pause_commands_ship_the_pause_module_once_before_the_first_pause(
+    tmp_path: Path,
+) -> None:
+    """A probe ships as one file: the pause commands' module is installed
+    sha256-checked once per run before the first pause (logs_silent: the log
+    collector enable), never again for the unit pause that follows."""
+
+    spec = SPECS["logs_silent"]
+    ctx = context(
+        spec,
+        tmp_path,
+        [
+            silence_doc("NODE_LOGS"),
+            silence_doc("NODE_LOGS"),
+            fresh_success_doc("NODE_LOGS"),
+        ],
+        approvals=("ENABLE_NODE_LOG_COLLECTOR",),
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    node = ctx.probes[f"node@{NODE}"]
+    names = [call[0] for call in node.calls]
+    assert names.count("install-source") == 1, names
+    assert names.index("install-source") < names.index("log-collector-enable"), names
+    assert names.index("log-collector-enable") < names.index("unit-pause"), names
+    shipped = next(call for call in node.calls if call[0] == "install-source")
+    content = PAUSE_MODULE.read_bytes()
+    assert shipped[shipped.index("--name") + 1] == PAUSE_MODULE.name, shipped
+    assert (
+        shipped[shipped.index("--sha256") + 1] == hashlib.sha256(content).hexdigest()
+    ), "the module is sha256-checked like the source replay's builders"
+    assert base64.b64decode(shipped[shipped.index("--b64") + 1]) == content, (
+        "the checkout's module is what ships"
+    )
+    assert "--run-id" in shipped, shipped

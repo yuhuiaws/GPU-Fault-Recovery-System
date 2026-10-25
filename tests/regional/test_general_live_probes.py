@@ -9,14 +9,18 @@ touch and whether a run left the node clean.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
 import json
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from scripts.e2e.regional.probes import general_live_net_probe as netp
+from scripts.e2e.regional.probes import general_live_node_pause as pausep
 from scripts.e2e.regional.probes import general_live_node_probe as nodep
 from scripts.e2e.regional.probes import general_live_storage_probe as storep
 
@@ -789,4 +793,88 @@ def test_node_unit_pause_survives_a_product_restart(
     assert nodep.residue_is_clean(cleared), cleared
     assert not nodep.residue_is_clean({**cleared, "pause_hooks": [unit]}), (
         "a loaded pause hook is residue"
+    )
+
+
+def _pause_shaped(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> tuple[Any, Any]:
+    calls, emitted = _node_probe_runner(monkeypatch, tmp_path)
+    monkeypatch.setattr(nodep, "PAUSE_DROPIN_ROOT", tmp_path / "run-systemd")
+    monkeypatch.setattr(
+        nodep, "unit_state", lambda unit: {"ActiveState": "active", "MainPID": "7"}
+    )
+    monkeypatch.setattr(nodep, "unit_is_stopped", lambda unit: True)
+    monkeypatch.setattr(nodep, "disarm_deadman", lambda run_id, kind: None)
+    monkeypatch.setattr(nodep.shutil, "which", lambda name: "/usr/bin/kill")
+    return calls, emitted
+
+
+def _probe_command(*argv: str) -> None:
+    arguments = nodep.parser().parse_args([*argv, "--run-id", RUN])
+    arguments.handler(arguments)
+
+
+def test_node_pause_commands_run_from_the_installed_copy_without_a_checkout(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The pause commands are the probe's second node-side file.
+
+    A node has no ``scripts`` checkout: until the runner installs the module
+    (``install-source``, sha256-checked, under the run's state directory) a
+    pause is refused by name and nothing is stopped; residue and ``cleanup``
+    never need it. The installed copy is what runs, bound to this probe.
+    """
+
+    calls, emitted = _pause_shaped(monkeypatch, tmp_path)
+    monkeypatch.setitem(
+        sys.modules, "scripts.e2e.regional.probes.general_live_node_pause", None
+    )
+    unit = "gpu-fault-metrics-collector.service"
+    with pytest.raises(nodep.ProbeError, match=f"install {nodep.PAUSE_NAME}"):
+        _probe_command("unit-pause", "--unit", unit, "--seconds", "840")
+    assert not any("--signal=SIGSTOP" in call for call in calls), calls
+    assert nodep.residue_is_clean(nodep.residue(RUN)), "nothing was paused"
+    assert nodep.cleanup_kind(RUN, "all", None), "cleanup needs the probe alone"
+
+    content = Path(pausep.__file__).read_bytes()
+    _probe_command(
+        "install-source",
+        "--name",
+        nodep.PAUSE_NAME,
+        "--sha256",
+        hashlib.sha256(content).hexdigest(),
+        "--b64",
+        base64.b64encode(content).decode("ascii"),
+    )
+    receipt = emitted[-1]
+    assert receipt["path"] == str(nodep.state_dir(RUN) / nodep.PAUSE_NAME), receipt
+    module = nodep.load_pause_module(RUN)
+    assert module.__file__ == receipt["path"], "the installed copy is what runs"
+    assert sys.modules[nodep.PROBE_ALIAS] is nodep, "the module sees this probe"
+    assert module.probe is nodep, "state, bounds and allow-lists stay the probe's"
+    _probe_command("unit-pause", "--unit", unit, "--seconds", "840")
+    assert emitted[-1]["stopped"] is True, emitted[-1]
+    dropin = Path(emitted[-1]["dropin"])
+    assert dropin.is_file(), "the installed copy loaded the pause drop-in"
+
+    # The deadman's entry point resumes and unloads with the probe alone.
+    monkeypatch.setitem(sys.modules, "gfrs_general_live_node_pause", None)
+    actions = nodep.cleanup_kind(RUN, "all", None)
+    assert any("resumed" in action for action in actions), actions
+    assert not dropin.exists(), "cleanup removed the drop-in"
+    assert nodep.residue_is_clean(nodep.residue(RUN)), nodep.residue(RUN)
+
+
+def test_node_pause_module_is_no_probe_and_keeps_the_probe_under_the_limit() -> None:
+    probe_text = Path(nodep.__file__).read_text(encoding="utf-8")
+    module_text = Path(pausep.__file__).read_text(encoding="utf-8")
+    assert not module_text.startswith("#!"), "a module, not a probe: never run directly"
+    for name in ("unit_pause", "exporter_pause", "log_collector_enable"):
+        assert callable(getattr(pausep, name)), name
+        assert not hasattr(nodep, name), f"{name} lives in the pause module only"
+    for name in ("resume_unit", "resume_processes", "restore_log_collector"):
+        assert callable(getattr(nodep, name)), f"{name} stays in the probe (cleanup)"
+    probe_lines = len(probe_text.splitlines())
+    assert probe_lines <= 1500, f"the probe is {probe_lines} lines"
+    assert probe_lines + len(module_text.splitlines()) > 1500, (
+        "the split is what keeps the probe under the architecture limit"
     )

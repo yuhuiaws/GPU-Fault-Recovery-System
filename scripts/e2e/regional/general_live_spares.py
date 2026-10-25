@@ -323,14 +323,13 @@ class SpareSession:
 
     def pause_metrics(self) -> dict[str, Any]:
         probe = self.ctx.probe("node", node=self.node)
-        paused = probe.execute(
+        paused = self.ctx.pause(
             "unit-pause",
             "--unit",
             "gpu-fault-metrics-collector.service",
             "--seconds",
             str(self.ctx.spec.max_minutes * 60),
-            "--run-id",
-            self.ctx.run_id,
+            node=self.node,
         )
         self.ctx.cleanup.push(
             "spare-metrics",

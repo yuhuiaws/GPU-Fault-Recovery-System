@@ -81,7 +81,7 @@ def _pause_exporter(ctx: VariantContext, seconds: int) -> dict[str, Any]:
             "FIXTURE_NOT_READY",
             f"expected exactly one dcgm-exporter process, found {len(processes)}",
         )
-    paused = ctx.node("exporter-pause", "--seconds", str(seconds))
+    paused = ctx.pause("exporter-pause", "--seconds", str(seconds))
     ctx.cleanup.push("exporter", lambda: ctx.node("exporter-resume"))
     ctx.evidence.write("exporter-pause", paused)
     if not paused.get("stopped"):
@@ -210,7 +210,7 @@ def _silence_variant(ctx: VariantContext, variant: str) -> dict[str, Any]:
                 "NOT_AUTHORIZED",
                 "the node log collector is disabled in production; needs ENABLE_NODE_LOG_COLLECTOR",
             )
-        enabled = ctx.node(
+        enabled = ctx.pause(
             "log-collector-enable",
             "--seconds",
             str(ctx.spec.max_minutes * 60 + 300),
@@ -221,7 +221,7 @@ def _silence_variant(ctx: VariantContext, variant: str) -> dict[str, Any]:
         ctx.hold(threshold, name="log-first-success")
     started = utc_now()
     hold = threshold + SILENCE_SCAN_MARGIN + 300
-    paused = ctx.node("unit-pause", "--unit", unit, "--seconds", str(hold))
+    paused = ctx.pause("unit-pause", "--unit", unit, "--seconds", str(hold))
     ctx.cleanup.push("pause", lambda: ctx.node("unit-resume", "--unit", unit))
     ctx.evidence.write("unit-pause", paused)
     if not paused.get("stopped"):
@@ -352,7 +352,7 @@ def new_success(ctx: VariantContext) -> dict[str, Any]:
     run_survey(ctx)
     started = utc_now()
     before = _channel_success(ctx, started, channel)
-    paused = ctx.node("unit-pause", "--unit", unit, "--seconds", str(threshold + 300))
+    paused = ctx.pause("unit-pause", "--unit", unit, "--seconds", str(threshold + 300))
     ctx.cleanup.push("pause", lambda: ctx.node("unit-resume", "--unit", unit))
     if not paused.get("stopped"):
         raise VariantInconclusive(f"{unit} did not stop")
