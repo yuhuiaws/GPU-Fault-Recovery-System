@@ -928,7 +928,16 @@ ip-10-0-32-162 07:38/07:44/07:49Z，各对应一次 loop 附加），随后每�
 （2026-10-25）：`sustained_util`、`reference_iostat`、`counter_reset`（ip-10-0-43-5）
 与 `short_flush`、`zero_completed_io`、`recovery`（ip-10-0-32-162）PASS，setup 单元
 约 14 s 建成 `dm-0`；`sustained_latency` 已带 `KERNEL_MODULE_LOAD` 登记为可执行，
-等待一次无未关闭 incident 的窗口。`reference_iostat` 另可选 `--approve KERNEL_MODULE_LOAD`：
+等待一次无未关闭 incident 的窗口。该窗口 2026-10-25 14:47Z（R13e）的首次真机运行在恢复阶段
+FAIL（"no fresh sample below threshold"）：`io-stop` 之后 dm-delay 设备再无完成的 I/O
+（oracle 从 14:53:55Z 到 15:05Z 的每个 2 s 样本 util 0、await 空），产品按零完成 I/O 规则
+不产出 `disk_io_await_ms` 样本，信号只能停在 active；而 200 ms 的 delay 表仍在，任何 I/O 的
+await 都 ≥ 200 ms——夹具的结构性缺口，不是产品缺口，也与 300 s 健康摘要节拍无关（等待
+690 s ≥ 两个摘要周期），设备也是等待结束后才拆除。现在 await 的恢复证明先经 `dm-retarget
+--target data --delay-ms 0` 把数据表原地换回 linear（同一 dm-N、挂载与文件不变），再启动
+单线程、每 100 ms 一次 64 KiB O_DIRECT 写的节拍写入单元（util 远低于 1 %），让产品在同一
+设备上采到阈值以下的新鲜 await 样本，等待结束后停掉它；util 变体无需这些（空闲设备的
+field 10 读数即 0 %）。`reference_iostat` 另可选 `--approve KERNEL_MODULE_LOAD`：
 测试设备用 200 ms dm-delay 表（`dm_delay` 已加载，或为本次运行加载并在清理卸载），把
 await 抬到 5 ms 容差底线之上——无 dm-delay 的线性设备在 NVMe 上 await 不到 1 ms，任何
 口径差异都显不出来（2026-10-25 ip-10-0-43-5：产品 0.30–0.44 ms 对 oracle 0.33–0.76 ms，

@@ -1055,7 +1055,21 @@ the fixed code (2026-10-25) passed: `sustained_util`, `reference_iostat` and
 `counter_reset` on ip-10-0-43-5, `short_flush`, `zero_completed_io` and
 `recovery` on ip-10-0-32-162, the setup unit building `dm-0` in about 14 s;
 `sustained_latency` is registered as runnable with `KERNEL_MODULE_LOAD` and
-waits for a window without open incidents on the node. `reference_iostat`
+waits for a window without open incidents on the node. Its first live run in
+that window (2026-10-25 14:47Z, R13e) failed at the recovery stage ("no fresh
+sample below threshold"): after `io-stop` the dm-delay device completed no I/O
+for the whole 690 s wait (the oracle's 2 s samples from 14:53:55Z to 15:05Z
+read util 0 and no await), so the product -- by its zero-completed-I/O rule --
+emitted no `disk_io_await_ms` sample and the signal could only stay active;
+with the 200 ms table still loaded, any I/O would have read >= 200 ms. A
+structural fixture gap, not a product gap, and not the 300 s health-summary
+cadence (the wait covers two summaries); the device was torn down only after
+the wait. The await recovery proof now swaps the data table back to linear in
+place (`dm-retarget --target data --delay-ms 0`: same dm-N, mount and files)
+and keeps a paced single writer (one 64 KiB O_DIRECT write every 100 ms, far
+below 1 % util) on the device so the product samples a below-threshold await
+there, stopping it after the wait; the util variant needs neither (an idle
+device reads 0 % from field 10 over elapsed time). `reference_iostat`
 takes an optional `--approve KERNEL_MODULE_LOAD`: its device gets the 200 ms
 dm-delay table (a loaded `dm_delay`, or one loaded for the run and unloaded in
 cleanup) so the awaits sit above the 5 ms tolerance floor -- a linear device on
