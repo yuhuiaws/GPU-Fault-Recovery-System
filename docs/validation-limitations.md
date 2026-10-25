@@ -1051,8 +1051,15 @@ the fixed code (2026-10-25) passed: `sustained_util`, `reference_iostat` and
 `counter_reset` on ip-10-0-43-5, `short_flush`, `zero_completed_io` and
 `recovery` on ip-10-0-32-162, the setup unit building `dm-0` in about 14 s;
 `sustained_latency` is registered as runnable with `KERNEL_MODULE_LOAD` and
-waits for a window without open incidents on the node. Two follow-ups from
-those runs: the runner reads a `HostProbeError`/`RegionalFixtureError` raised
+waits for a window without open incidents on the node. `reference_iostat`
+takes an optional `--approve KERNEL_MODULE_LOAD`: its device gets the 200 ms
+dm-delay table (a loaded `dm_delay`, or one loaded for the run and unloaded in
+cleanup) so the awaits sit above the 5 ms tolerance floor -- a linear device on
+NVMe reads sub-millisecond awaits that no formula difference can lift past it
+(2026-10-25 on ip-10-0-43-5 the product's 0.30-0.44 ms against the oracle's
+0.33-0.76 ms read PASS on this expected-FAIL variant); such readings, and a run
+with no await samples to compare, are `INCONCLUSIVE` now. Two more follow-ups
+from those runs: the runner reads a `HostProbeError`/`RegionalFixtureError` raised
 by its own fixture as `INCONCLUSIVE` (`detail: harness fixture failed: ...`),
 no longer as `FAIL` -- the pre-fix `reference_iostat` on ip-10-0-32-162, an
 expected-FAIL variant, had been shown as its registered product gap with an

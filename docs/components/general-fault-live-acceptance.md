@@ -741,7 +741,12 @@ ip-10-0-32-162 07:38/07:44/07:49Z，各对应一次 loop 附加），随后每�
 （2026-10-25）：`sustained_util`、`reference_iostat`、`counter_reset`（ip-10-0-43-5）
 与 `short_flush`、`zero_completed_io`、`recovery`（ip-10-0-32-162）PASS，setup 单元
 约 14 s 建成 `dm-0`；`sustained_latency` 已带 `KERNEL_MODULE_LOAD` 登记为可执行，
-等待一次无未关闭 incident 的窗口。`cleanup`/`dm-destroy`/`fs-destroy` 现在也删除本次
+等待一次无未关闭 incident 的窗口。`reference_iostat` 另可选 `--approve KERNEL_MODULE_LOAD`：
+测试设备用 200 ms dm-delay 表（`dm_delay` 已加载，或为本次运行加载并在清理卸载），把
+await 抬到 5 ms 容差底线之上——无 dm-delay 的线性设备在 NVMe 上 await 不到 1 ms，任何
+口径差异都显不出来（2026-10-25 ip-10-0-43-5：产品 0.30–0.44 ms 对 oracle 0.33–0.76 ms，
+expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可比的运行现在记 `INCONCLUSIVE`。
+`cleanup`/`dm-destroy`/`fs-destroy` 现在也删除本次
 运行已空的后端目录与挂载根目录（`residue.directories` 列出仍存在者）：之前只有无人
 调用的 `--kind all` 会删，两节点各留下数十个空的 `gfrs-live-<digest>` 目录。
 
