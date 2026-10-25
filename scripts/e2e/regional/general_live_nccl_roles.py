@@ -851,14 +851,14 @@ def cohort_errors(
                 errors.append(
                     f"{label(row)}: {code} cites a cohort the process is not in"
                 )
-            if (
-                not decl.declared
-                or (cohort or {}).get("definition", {}).get("pipeline_stage")
-                != decl.stage
-            ):
+            definition = (cohort or {}).get("definition") or {}
+            if not decl.declared or (
+                definition.get("pipeline_stage"),
+                definition.get("expert_role"),
+            ) != (decl.stage, decl.expert):
+                # A lead inside the process's own role cohort is legitimate;
+                # one measured against another role's peers is the defect.
                 errors.append(f"{label(row)}: {code} attributed across roles")
-            if code == "ROLE_COHORT_CPU_DIFFERENCE":
-                errors.append(f"{label(row)}: a uniform cohort produced {code}")
     return errors
 
 
