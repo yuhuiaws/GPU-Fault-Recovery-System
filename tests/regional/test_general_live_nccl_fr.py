@@ -30,6 +30,7 @@ from scripts.e2e.regional import general_live_nccl as nc
 from scripts.e2e.regional import general_live_nccl_fr as nf
 from scripts.e2e.regional import general_live_nccl_job as nj
 from scripts.e2e.regional import general_live_nccl_pair as pair
+from scripts.e2e.regional import general_live_nccl_roles as roles
 from scripts.e2e.regional import managed_workload_fixture as mwf
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_registry import (
@@ -192,7 +193,7 @@ CHECKS: dict[str, dict[str, Any]] = {
 # --------------------------------------------------------------------------- #
 def test_the_seven_variants_complete_the_011_registry_as_live_replay() -> None:
     registry = build_registry(
-        [*nc.VARIANTS, *nf.VARIANTS, *pair.VARIANTS],
+        [*nc.VARIANTS, *nf.VARIANTS, *pair.VARIANTS, *roles.VARIANTS],
         rows=coverage_rows(),
         categories=[11],
     )

@@ -287,6 +287,7 @@ CATEGORY_MODULES = (
     "scripts.e2e.regional.general_live_nccl",
     "scripts.e2e.regional.general_live_nccl_fr",
     "scripts.e2e.regional.general_live_nccl_pair",
+    "scripts.e2e.regional.general_live_nccl_roles",
     "scripts.e2e.regional.general_live_progress",
     "scripts.e2e.regional.general_live_spares",
     "scripts.e2e.regional.general_live_kernel",

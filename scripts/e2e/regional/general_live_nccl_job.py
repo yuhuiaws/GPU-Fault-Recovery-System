@@ -57,6 +57,15 @@ PyTorch's recorder off and runs the test dump responder in each Pod instead
 (``probes/general_live_fr_responder.py``, written by the container command next
 to the trainer and started before ``exec torchrun``): the product's triage then
 reads dumps of that shape through its own FIFO protocol -- live-replay.
+
+The role, thread and process modes (``roles``, ``threads``, ``wchan``, ``cpu``,
+``pyspy``) are the ``general_live_nccl_role_trainer`` extension rendered into
+the same trainer: each rank declares PP/EP roles and thread roles through its
+snapshot's ``diagnostic_context`` (a keeper thread keeps it fresh while the rank
+is held or blocked), runs the mode's helper threads from the start and switches
+them to their stall behaviour with the stall; ``cpu`` adds an unranked GPU
+sharer process and ``pyspy`` a non-Python CUDA holder. The ``ROLES``/``SHARER``
+/``HOLDER`` lines they print are the runner's record of what was declared.
 """
 
 from __future__ import annotations
@@ -73,6 +82,10 @@ from scripts.e2e.regional.general_live_fr_replay import (
     FlightRecorderReplay,
     responder_environment,
     responder_launch,
+)
+from scripts.e2e.regional.general_live_nccl_role_trainer import (
+    ROLE_MODES,
+    ROLE_TRAINER,
 )
 
 TWO_NODE_MANIFEST = "two-node-replace-pytorchjob.yaml"
@@ -93,7 +106,11 @@ PAYLOAD_ELEMENTS = PAYLOAD_BYTES // 4
 #: the hung budget) so the product samples a job that is still stalled.
 STALL_MAX_SECONDS = 2700
 PG_TIMEOUT_MARGIN_SECONDS = 900
-STALL_MODES = ("quiet", "write", "phase")
+#: ``quiet``/``write``/``phase`` (above) and the role, thread and process modes
+#: of ``general_live_nccl_role_trainer`` (``roles``, ``threads``, ``wchan``,
+#: ``cpu``, ``pyspy``), which all declare a ``rank-progress/v1`` snapshot.
+STALL_MODES = ("quiet", "write", "phase", *ROLE_MODES)
+PROGRESS_MODES = ("phase", *ROLE_MODES)
 WRITE_BYTES_PER_SECOND = 4 * 1024 * 1024
 TRAINER_STEPS = 3600
 #: ``docs/部署和运维手册.md``: what a training container injects for NCCL hung
@@ -178,8 +195,11 @@ STEP_SECONDS = 2.0
 POLL_SECONDS = 1.0
 PHASE_SECONDS = 30.0
 PHASES = ("CHECKPOINT_SAVE", "TRAINING")
-if STALL_MODE not in ("quiet", "write", "phase"):
-    raise SystemExit(f"GFRS_STALL_MODE must be quiet, write or phase, not {STALL_MODE!r}")
+if STALL_MODE not in ("quiet", "write", "phase", *ROLE_MODES):
+    raise SystemExit(
+        f"GFRS_STALL_MODE must be quiet, write, phase or one of {ROLE_MODES}, "
+        f"not {STALL_MODE!r}"
+    )
 if not 0 < STALL_MAX_SECONDS <= 7200:
     raise SystemExit("GFRS_STALL_MAX_SECONDS must be above 0 and at most 7200")
 
@@ -200,6 +220,13 @@ payload = (
 )
 started = time.time()
 activity_failed = False
+# A role mode's declarations, helper threads and child processes (the
+# extension above); None in the quiet/write/phase modes.
+ROLE_FIXTURE = (
+    RoleFixture(STALL_MODE, rank, world_size, local_rank, device)
+    if STALL_MODE in ROLE_MODES
+    else None
+)
 
 
 def say(text):
@@ -231,7 +258,8 @@ def pause_vote():
     return 1.0
 
 
-def declare_progress(step, phase):
+def declare_progress(step, phase, context=None):
+    # ``context``: a role mode's diagnostic_context (PP/EP roles, thread roles).
     path = os.environ.get("GPU_FAULT_RANK_PROGRESS_FILE")
     if not path:
         return
@@ -250,6 +278,8 @@ def declare_progress(step, phase):
         "phase": phase,
         "process_groups": [],
     }
+    if context is not None:
+        document["diagnostic_context"] = context
     os.makedirs(os.path.dirname(path), exist_ok=True)
     temporary = path + ".tmp"
     with open(temporary, "w", encoding="utf-8") as stream:
@@ -318,6 +348,9 @@ def stall(step):
     )
 
 
+if ROLE_FIXTURE is not None:
+    ROLE_FIXTURE.start()
+
 for step in range(STEPS):
     if payload is not None:
         dist.all_reduce(payload)
@@ -336,10 +369,20 @@ for step in range(STEPS):
         )
     if STALL_MODE == "phase":
         guarded(declare_progress, step, "TRAINING")
+    if ROLE_FIXTURE is not None:
+        ROLE_FIXTURE.step(step)
     gpu_busy_until(time.monotonic() + STEP_SECONDS, device)
     if votes:
+        # Every rank's helpers switch to their stall behaviour, the blocked
+        # rank 0's included, so a role cohort stays uniform.
+        if ROLE_FIXTURE is not None:
+            ROLE_FIXTURE.stall_begin()
         stall(step)
+        if ROLE_FIXTURE is not None:
+            ROLE_FIXTURE.stall_end()
 
+if ROLE_FIXTURE is not None:
+    ROLE_FIXTURE.finish()
 dist.barrier()
 print(
     f"SUCCESS rank={rank}/{world_size} "
@@ -357,7 +400,7 @@ def trainer_script() -> str:
     cannot drift from the copies the other training fixtures carry.
     """
 
-    script = TRAINER_HEAD + GPU_LOAD_SNIPPET + TRAINER_BODY
+    script = TRAINER_HEAD + GPU_LOAD_SNIPPET + ROLE_TRAINER + TRAINER_BODY
     if any(line == "PY" for line in script.splitlines()):
         raise ValueError("the trainer would end its own heredoc")
     return script
@@ -509,7 +552,7 @@ def _env(
         "GFRS_WRITE_BYTES_PER_SECOND": str(WRITE_BYTES_PER_SECOND),
         **recorder,
     }
-    if stall_mode == "phase":
+    if stall_mode in PROGRESS_MODES:
         values["GFRS_RANK_PROGRESS_DIR"] = RANK_PROGRESS_DIR
     return [{"name": key, "value": value} for key, value in values.items()]
 
@@ -526,6 +569,10 @@ class ManagedNcclJob:
     """
 
     PAUSE_DIR = PAUSE_DIR
+    #: The attempt this job runs as: ``<job id>-a<nnn>``. A subclass running
+    #: as 2 is the same job's fresh attempt after the first was deleted
+    #: (011 attempt_change); its journals and rendered manifest are its own.
+    attempt_number = 1
 
     def __init__(
         self,
@@ -554,7 +601,10 @@ class ManagedNcclJob:
             )
         source = Path(__file__).with_name("manifests") / "training" / TWO_NODE_MANIFEST
         document = yaml.safe_load(source.read_text(encoding="utf-8"))
-        self.attempt_id = f"{name}-a001"
+        if type(self.attempt_number) is not int or self.attempt_number < 1:
+            raise ValueError("the attempt number must be a positive integer")
+        self.attempt_id = f"{name}-a{self.attempt_number:03d}"
+        stem = name if self.attempt_number == 1 else self.attempt_id
         render_nccl_manifest(
             document,
             node=ctx.settings.node,
@@ -566,7 +616,7 @@ class ManagedNcclJob:
             flight_recorder=flight_recorder,
         )
         name_managed_workload(document, name)
-        rendered = ctx.case_dir / f"{name}.source.yaml"
+        rendered = ctx.case_dir / f"{stem}.source.yaml"
         rendered.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         rendered.write_text(yaml.safe_dump(document, sort_keys=False), encoding="utf-8")
         rendered.chmod(0o600)
@@ -584,8 +634,8 @@ class ManagedNcclJob:
         self.prewarm = ImagePrewarmFixture(
             ctx.regional,
             case_id=ctx.spec.key,
-            run_id=f"{ctx.run_id}-{name}",
-            state_path=ctx.case_dir / f"{name}.prewarm.json",
+            run_id=f"{ctx.run_id}-{stem}",
+            state_path=ctx.case_dir / f"{stem}.prewarm.json",
         )
         self.fixture = ManagedWorkloadFixture(
             ctx.regional,
@@ -598,7 +648,7 @@ class ManagedNcclJob:
                 expected_pods=2,
                 expected_gpu_count=16,
             ),
-            state_path=ctx.case_dir / f"{name}.ownership.json",
+            state_path=ctx.case_dir / f"{stem}.ownership.json",
         )
 
     def start(self) -> dict[str, Any]:

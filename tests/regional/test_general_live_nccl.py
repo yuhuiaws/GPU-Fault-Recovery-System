@@ -21,6 +21,7 @@ from gpu_fault.hung_summary_codec import encode_summary
 from scripts.e2e.regional import general_live_nccl as nc
 from scripts.e2e.regional import general_live_nccl_fr as nf
 from scripts.e2e.regional import general_live_nccl_pair as pair
+from scripts.e2e.regional import general_live_nccl_roles as roles
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_nccl_job import STALL_MAX_SECONDS
 from scripts.e2e.regional.general_live_registry import build_registry, coverage_rows
@@ -337,7 +338,7 @@ def _window(rates: list[float], *, start: float = 1_000.0) -> list[dict[str, Any
 # --------------------------------------------------------------------------- #
 def test_registry_covers_every_011_variant() -> None:
     rows = coverage_rows()
-    variants = [*nc.VARIANTS, *nf.VARIANTS, *pair.VARIANTS]
+    variants = [*nc.VARIANTS, *nf.VARIANTS, *pair.VARIANTS, *roles.VARIANTS]
     build_registry(variants, rows=rows, categories=[11])
     assert {s.variant for s in variants} == set(rows["GF-GENERAL-LIVE-011"])
     assert {s.variant for s in nf.VARIANTS} == {
@@ -369,8 +370,22 @@ def test_registry_covers_every_011_variant() -> None:
     assert pair_spec.approvals == ("HOST_SOURCE_REPLAY",), (
         "broken_pair replays the pair inside the host collector under the token"
     )
-    assert all(lane == "hp" for spec in variants for lane in spec.lanes), (
-        "011 runs only on the HyperPod lane"
+    assert {s.variant for s in roles.VARIANTS} == {
+        "role_mismatch",
+        "tid_namespace",
+        "wchan_zero",
+        "cpu_interval",
+        "pyspy_nonzero",
+        "attempt_change",
+    }
+    assert all(spec.implemented for spec in roles.VARIANTS)
+    assert all(
+        lane == "hp"
+        for spec in [*nc.VARIANTS, *nf.VARIANTS, *pair.VARIANTS]
+        for lane in spec.lanes
+    ), "the stall variants and their FR/pair modules run on the HyperPod lane"
+    assert all(spec.lanes == ("eks", "hp") for spec in roles.VARIANTS), (
+        "the role/attempt variants run on both clusters (two EFA nodes each)"
     )
     # Every deferred variant keeps an explicit NOT_RUN reason in the denominator.
     for spec in nc.VARIANTS:

@@ -36,9 +36,10 @@ temporal completion, the second-dump-missing, whole-group, few/ambiguous
 candidate and separate-process-group cases) live in ``general_live_nccl_fr``:
 they stall the same job while the reviewed test dump responder of
 ``general_live_fr_replay`` answers the product's dump requests with shaped
-dumps (live-replay). The py-spy failure classification and the role and
-thread/CPU comparison variants need a py-spy fault tool and a role-declaring
-test job that are not wired this phase, and the 128-node/1024-process scale
+dumps (live-replay). The role, thread, process and attempt-change variants
+(``role_mismatch``, ``tid_namespace``, ``wchan_zero``, ``cpu_interval``,
+``pyspy_nonzero``, ``attempt_change``) live in ``general_live_nccl_roles``: the
+same stall on the trainer's role modes. The 128-node/1024-process scale
 variants need a cluster this site does not have: each stays NOT_RUN with its
 reason, in the denominator.
 """
@@ -1170,10 +1171,6 @@ def _deferred(
 
 
 _SCALE = "SCALE: needs a 128-node/1024-process task; this site has one 4-node HyperPod cluster"
-_ROLE_FIXTURE = (
-    "FIXTURE_NOT_READY: needs a mixed-parallelism test job that declares PP/EP roles "
-    "and thread roles through the rank-progress diagnostic_context, not wired this phase"
-)
 
 
 VARIANTS = [
@@ -1238,12 +1235,6 @@ VARIANTS = [
         max_minutes=120,
     ),
     _deferred(
-        "attempt_change",
-        "FIXTURE_NOT_READY: a controllable attempt change on a stalled two-node NCCL job (A warned, then a fresh attempt B) is not wired this phase",
-        "a new attempt starts at WARMUP and never inherits the previous attempt's zero streak",
-        proof=NATIVE,
-    ),
-    _deferred(
         "unreachable_node",
         "NOT_AUTHORIZED: isolating one node's Agent command channel needs a net block (WATCHER_NETWORK_ISOLATION-class) not arranged this phase",
         "the unreachable node is recorded as missing coverage, never a fabricated zero; still ESCALATED",
@@ -1267,29 +1258,14 @@ VARIANTS = [
         "unfinished commands hold the concurrency window; resume does not re-sample completed nodes",
         proof=NATIVE,
     ),
-    _deferred(
-        "pyspy_nonzero",
-        "FIXTURE_NOT_READY: needs a test py-spy tool returning non-zero exit / error text / bad JSON on the node PATH, not wired this phase",
-        "a py-spy failure is classified as a failed stack sample, no signature, other evidence kept",
-    ),
-    _deferred(
-        "role_mismatch",
-        _ROLE_FIXTURE,
-        "different PP stages / EP roles are never attributed to one another",
-    ),
-    _deferred(
-        "tid_namespace",
-        _ROLE_FIXTURE,
-        "container native TID, host NSpid and thread starttime are reconciled across samples",
-    ),
-    _deferred(
-        "wchan_zero",
-        _ROLE_FIXTURE,
-        "a 0/empty wait channel is not a wait location; CPU is normalized by SC_CLK_TCK and elapsed seconds",
-    ),
-    _deferred(
-        "cpu_interval",
-        _ROLE_FIXTURE,
-        "CPU cores use delta ticks over actual elapsed, a shared GPU is not claimed as the PID's utilization",
-    ),
 ]
+
+# The stall chain pieces the role, thread, process and attempt-change variants
+# of ``general_live_nccl_roles`` drive with their own jobs and graders.
+prove_baseline = _prove_baseline
+stall_job = _stall
+hung_records = _hung
+release_and_resume = _release_and_resume
+read_records = _records
+efa_window = _efa_window
+thresholds = _thresholds
