@@ -79,8 +79,16 @@ APPROVALS: dict[str, str] = {
         "log collector for the silence variant; disabled again in cleanup"
     ),
     "WATCHER_NETWORK_ISOLATION": (
-        "reject the completion watcher Pod's TCP/443 to the control plane on its "
-        "host with an automatic rollback timer"
+        "reject the completion watcher Pod's TCP to the control-plane endpoint "
+        "on its host (FORWARD rules matching that Pod's IP only, tcp-reset) with "
+        "an automatic rollback timer under the 600 s coverage horizon"
+    ),
+    "NODE_AGENT_NETWORK_ISOLATION": (
+        "reject TCP to one GPU node's Node Agent listening port on that host "
+        "(the channel the executor pushes node actions to; heartbeats, "
+        "collectors and kubelet untouched) with an automatic rollback timer, so "
+        "the hung-triage evidence workflow meets an unreachable node (011 "
+        "unreachable_node)"
     ),
     "CONTROL_PLANE_RESTART": (
         "delete one cluster-executor or completion-watcher Pod of the GPU "
