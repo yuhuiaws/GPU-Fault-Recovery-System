@@ -639,12 +639,12 @@ def test_duplicate_event_and_single_notification(tmp_path: Path) -> None:
 
 
 def test_deferred_variants() -> None:
-    assert SPECS["api_unreachable"].deferred.startswith("NOT_AUTHORIZED"), (
-        "SPECS['api_unreachable'].deferred.startswith('NOT_AUTHORIZED')"
-    )
-    assert SPECS["worker_restart"].deferred.startswith("NOT_AUTHORIZED"), (
-        "SPECS['worker_restart'].deferred.startswith('NOT_AUTHORIZED')"
-    )
+    # The two dangerous watcher variants are executable behind their tokens
+    # (test_general_live_network_isolation / test_general_live_watcher_restart).
+    assert SPECS["api_unreachable"].implemented, "api_unreachable is implemented"
+    assert SPECS["api_unreachable"].approvals == ("WATCHER_NETWORK_ISOLATION",)
+    assert SPECS["worker_restart"].implemented, "worker_restart is implemented"
+    assert SPECS["worker_restart"].approvals == ("CONTROL_PLANE_RESTART",)
     # 029 hardware_chain_continues moved to general_live_attempt_hardware.py.
     assert "hardware_chain_continues" not in SPECS, (
         "the hardware chain is implemented in its own module, not deferred here"

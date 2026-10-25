@@ -32,14 +32,24 @@ from the Pod's ``spec.nodeName`` of every terminated critical container
 (``completion_pod_parsing`` -> ``watcher._terminal_event``), so a
 watcher-observed terminal always carries one; only a hand-made terminal POST
 could lack it, which the spec and the lane rules forbid.
+
+028 ``api_unreachable`` cuts the one completion-watcher Pod off from the
+control plane on its node (``general_live_network_isolation``, tagged FORWARD
+REJECT with a deadman) while a managed job fails, and 029 ``worker_restart``
+deletes that Pod, UID-fenced, while a restart claim is open
+(``general_live_watcher_restart``); both grade the same completion records for
+every action happening exactly once.
 """
 
 from __future__ import annotations
 
 import json
 from collections.abc import Mapping
+from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
+from scripts.e2e.regional import general_live_network_isolation as isolation
+from scripts.e2e.regional import general_live_watcher_restart as watcher_restart
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
@@ -60,6 +70,7 @@ from scripts.e2e.regional.general_live_restart_budget import (
 )
 from scripts.e2e.regional.general_live_store import attempt_records
 from scripts.e2e.regional.general_live_verdicts import operations, verdict
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 if TYPE_CHECKING:
     from scripts.e2e.regional.managed_workload_fixture import ManagedWorkloadFixture
@@ -226,6 +237,9 @@ def suspend_workload(fixture: ManagedWorkloadFixture) -> None:
 #: container can tell the first attempt from a restart.
 ATTEMPT_ID_ENV = "GFRS_ATTEMPT_ID"
 ATTEMPT_ID_LABEL = "gpu-fault.io/attempt-id"
+#: ``trigger:<code>`` exits the code once the runner creates this file in the
+#: container (028 api_unreachable: the exit must happen under the block).
+EXIT_TRIGGER_PATH = "/tmp/gfrs-live-exit"
 MODE_COMMANDS = {
     "exit": "sleep 30; exit ${CODE:-1}",
     "stop": "trap 'exit 143' TERM; sleep 3600",
@@ -237,6 +251,7 @@ MODE_COMMANDS = {
         f"case \"${{{ATTEMPT_ID_ENV}:-}}\" in *-r-*) trap 'exit 143' TERM; sleep 3600;; "
         "*) sleep 30; exit ${CODE:-1};; esac"
     ),
+    "trigger": f"while [ ! -e {EXIT_TRIGGER_PATH} ]; do sleep 1; done; exit ${{CODE:-1}}",
 }
 #: Modes whose ``:<code>`` suffix is the exit code.
 EXIT_MODES = frozenset({"exit", "exit_once"})
@@ -277,7 +292,7 @@ def _apply_mode(document: dict[str, Any], mode: str | Mapping[str, str]) -> None
         script = MODE_COMMANDS.get(kind, MODE_COMMANDS["exit"])
         code = (
             role_mode.split(":", 1)[1]
-            if ":" in role_mode and kind in EXIT_MODES
+            if ":" in role_mode and (kind in EXIT_MODES or kind == "trigger")
             else "1"
         )
         identity = (
@@ -668,6 +683,233 @@ def old_terminal(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+#: The block holds at least this long after it is proven, so a coverage
+#: heartbeat that did not advance (posted every 120 s at most) is an oracle.
+API_BLOCK_SETTLE_SECONDS = 150
+#: The watcher's emergency fallback arms 30 s after its first failed POST and
+#: fires on a later pass; the operator then deletes the suspended job's Pods.
+EMERGENCY_WAIT_SECONDS = 240
+PODS_GONE_WAIT_SECONDS = 240
+RUNNING_WAIT_SECONDS = 900
+HEARTBEAT_WAIT_SECONDS = 300
+
+
+def api_unreachable(ctx: VariantContext) -> dict[str, Any]:
+    """028: the watcher loses the control plane while the attempt fails.
+
+    The one completion-watcher Pod's TCP to the control-plane endpoint is
+    rejected on its own node (source = its Pod IP, tcp-reset, deadman <=
+    ``WATCHER_BLOCK_SECONDS``), the managed job is then made to exit non-zero,
+    the watcher's emergency fallback has to suspend the workload itself and
+    the attempt ends under the block; after the restore the buffered failure
+    and terminal are delivered and everything must be recorded exactly once.
+    """
+
+    cluster_id = ctx.settings.regional.cluster_id
+    watcher = isolation.watcher_pod(ctx.regional)
+    host, port = isolation.control_plane_endpoint(ctx.regional)
+    job = _job(ctx, "gl28au-" + _suffix(ctx), "trigger:1", restart_budget=1)
+    running = _wait_running_observed(ctx, job)
+    block = isolation.HostNetworkIsolation(
+        ctx,
+        node=str(watcher["node"]),
+        kind=isolation.POD_EGRESS,
+        pod_ip=str(watcher["pod_ip"]),
+        host=host,
+        port=port,
+        deadman_seconds=isolation.block_budget(ctx, isolation.WATCHER_BLOCK_SECONDS),
+    )
+    block.block()
+    blocked_at = block.blocked_at or ctx.clock()
+    _trigger_exit(ctx, job, running["pods"])
+    workload = _wait_emergency_stop(ctx, job)
+    pods_left = _wait_pods_gone(ctx, job)
+    elapsed = (ctx.clock() - blocked_at).total_seconds()
+    if elapsed < API_BLOCK_SETTLE_SECONDS:
+        ctx.hold(API_BLOCK_SETTLE_SECONDS - elapsed, name="api-blocked")
+    during = isolation.isolation_records(ctx.regional, cluster_id, job_id=job.name)
+    during_entry = _attempt(_records(ctx, job), job.attempt_id)
+    ctx.evidence.write("api-blocked-records", {**during, "attempt": during_entry})
+    ineffective = isolation.ineffective_block_reasons(
+        during, during_entry, blocked_at=blocked_at
+    )
+    block.restore()
+    ctx.cleanup.discard(block.cleanup_name)
+    restored_at = block.restored_at or ctx.clock()
+    if ineffective:
+        raise VariantInconclusive(
+            "the watcher block did not cut the control-plane access: "
+            + "; ".join(ineffective)
+        )
+    records = _wait_decision(ctx, job, name="api-unreachable")
+    entry = _attempt(records, job.attempt_id)
+    after = _wait_heartbeat_after(ctx, job, entry, since=restored_at)
+    decision = entry.get("decision") or {}
+    containment_id = (entry.get("containment_incident") or {}).get("incident_id")
+    stages = {
+        "emergency_stop": isolation.emergency_stop_errors(
+            workload, incident_id=containment_id
+        ),
+        "terminal_once": []
+        if entry.get("event") and decision
+        else [
+            "the attempt's terminal and decision were not recorded after the restore"
+        ],
+        "decision": []
+        if decision.get("status") == "PLAN_CREATED"
+        else [
+            f"terminal decision was {decision.get('status')}, expected one budgeted "
+            "restart after the product's own emergency stop"
+        ],
+        "single_action": isolation.single_action_errors(entry, records),
+        "notifications": isolation.duplicate_notification_errors(
+            after.get("notifications") or []
+        ),
+        "watcher_restored": isolation.restored_heartbeat_errors(
+            after, restored_at=restored_at
+        ),
+    }
+    return _result(
+        stages,
+        notes=[
+            "only the watcher Pod's TCP to the control-plane endpoint was rejected, on "
+            "its node, with a systemd deadman; the terminal reached the control plane "
+            "once connectivity returned",
+            "the emergency fallback's STOPPED terminal names the passive containment "
+            "incident, so the product restarts once within the budget",
+        ],
+        extra={
+            "attempt": job.attempt_id,
+            "watcher": {k: watcher[k] for k in ("name", "uid", "node", "pod_ip")},
+            "endpoint": {"host": host, "port": port},
+            "blocked_at": blocked_at.isoformat(),
+            "restored_at": restored_at.isoformat(),
+            "block_seconds": (restored_at - blocked_at).total_seconds(),
+            "pods_left_under_block": pods_left,
+            "decision": decision.get("status"),
+        },
+    )
+
+
+def _wait_running_observed(ctx: VariantContext, job: ManagedFailJob) -> dict[str, Any]:
+    """Every Pod Running and Ready, and the watcher's RUNNING observation of
+    the attempt published to the control plane (its own record)."""
+
+    cluster_id = ctx.settings.regional.cluster_id
+    last: dict[str, Any] = {}
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal last
+        pods = job.fixture.pods()
+        records = isolation.isolation_records(ctx.regional, cluster_id, job_id=job.name)
+        observation = isolation.observed_running(records, job.attempt_id)
+        last = {"pods": pods, "observation": observation}
+        if job.fixture.pods_healthy(pods) and observation is not None:
+            return last
+        return None
+
+    value = ctx.wait_until(
+        accept, timeout_seconds=RUNNING_WAIT_SECONDS, poll_seconds=15, name="running"
+    )
+    if value is None:
+        raise RegionalFixtureError(
+            f"the managed job did not run with a watcher observation: {last}"
+        )
+    return value
+
+
+def _trigger_exit(
+    ctx: VariantContext, job: ManagedFailJob, pods: list[dict[str, Any]]
+) -> None:
+    for pod in pods:
+        if pod.get("phase") != "Running":
+            continue
+        ctx.regional.kubectl(
+            "gpu",
+            "exec",
+            str(pod["name"]),
+            "-c",
+            "pytorch",
+            "--",
+            "/bin/sh",
+            "-c",
+            f"touch {EXIT_TRIGGER_PATH}",
+        )
+
+
+def _wait_emergency_stop(ctx: VariantContext, job: ManagedFailJob) -> dict[str, Any]:
+    """The workload once the watcher's emergency fallback annotated it (or the
+    last read: the grader reports what is missing)."""
+
+    last: dict[str, Any] = {}
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal last
+        last = job.fixture.workload()
+        return last if not isolation.emergency_stop_errors(last) else None
+
+    value = ctx.wait_until(
+        accept,
+        timeout_seconds=EMERGENCY_WAIT_SECONDS,
+        poll_seconds=10,
+        name="emergency-stop",
+    )
+    return value if value is not None else last
+
+
+def _wait_pods_gone(ctx: VariantContext, job: ManagedFailJob) -> list[dict[str, Any]]:
+    """The attempt's Pods after the suspend took effect (ideally none)."""
+
+    last: list[dict[str, Any]] = []
+
+    def accept() -> list[dict[str, Any]] | None:
+        nonlocal last
+        last = [
+            item
+            for item in job.fixture.pods()
+            if item.get("phase") in {"Running", "Pending"}
+        ]
+        return [] if not last else None
+
+    value = ctx.wait_until(
+        accept,
+        timeout_seconds=PODS_GONE_WAIT_SECONDS,
+        poll_seconds=10,
+        name="pods-gone",
+    )
+    return value if value is not None else last
+
+
+def _wait_heartbeat_after(
+    ctx: VariantContext, job: ManagedFailJob, entry: dict[str, Any], *, since: Any
+) -> dict[str, Any]:
+    """The isolation records once the watcher's coverage heartbeat postdates
+    ``since`` (or the last read, which the grader then fails)."""
+
+    cluster_id = ctx.settings.regional.cluster_id
+    incident_ids = isolation.attempt_incident_ids(entry)
+    last: dict[str, Any] = {}
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal last
+        last = isolation.isolation_records(
+            ctx.regional, cluster_id, job_id=job.name, incident_ids=incident_ids
+        )
+        return (
+            last
+            if not isolation.restored_heartbeat_errors(last, restored_at=since)
+            else None
+        )
+
+    value = ctx.wait_until(
+        accept,
+        timeout_seconds=HEARTBEAT_WAIT_SECONDS,
+        poll_seconds=20,
+        name="heartbeat",
+    )
+    return value if value is not None else last
+
+
 # --------------------------------------------------------------------------- #
 # 029 restart budget
 # --------------------------------------------------------------------------- #
@@ -784,6 +1026,85 @@ def missing_context(ctx: VariantContext) -> dict[str, Any]:
             "cleanup_receipt": cleaned,
         },
     )
+
+
+def worker_restart(ctx: VariantContext) -> dict[str, Any]:
+    """029: the completion watcher is replaced while a restart claim is open.
+
+    A managed job fails within budget; once the executor has reserved the
+    recovery workflow's RESTART_WORKLOAD and the step has not ended, the one
+    completion-watcher Pod is deleted (UID-fenced, no grace) and the Deployment
+    replaces it. The replacement must not re-decide, re-reserve or re-send:
+    the ledger keeps exactly the one reservation of the recovery workflow,
+    one RESTART_WORKLOAD succeeds, one STOP_WORKLOADS, one decision, one
+    restart attempt observed, no notification twice.
+    """
+
+    isolation.watcher_pod(ctx.regional)
+    job = _job(ctx, "gl29wr-" + _suffix(ctx), "exit:1", restart_budget=1)
+    opened = watcher_restart.wait_open_claim(
+        ctx,
+        lambda: _records(ctx, job),
+        job.attempt_id,
+        timeout_seconds=ATTEMPT_BUDGET,
+    )
+    ctx.evidence.write("open-claim-records", opened)
+    restarted = watcher_restart.restart_watcher(ctx)
+    records = _wait_recovery_settled(ctx, job)
+    entry = _attempt(records, job.attempt_id)
+    ready_at = datetime.fromisoformat(str(restarted["ready_at"]))
+    after = _wait_heartbeat_after(ctx, job, entry, since=ready_at)
+    stages = {
+        "watcher_replaced": watcher_restart.replacement_errors(restarted),
+        "single_restart": watcher_restart.worker_restart_errors(entry, records),
+        "attempt_once": watcher_restart.attempt_once_errors(
+            after.get("observations") or [],
+            job_id=job.name,
+            source_attempt_id=job.attempt_id,
+        ),
+        "notifications": isolation.duplicate_notification_errors(
+            after.get("notifications") or []
+        ),
+        "watcher_restored": isolation.restored_heartbeat_errors(
+            after, restored_at=ready_at
+        ),
+    }
+    return _result(
+        stages,
+        notes=[
+            "the watcher Pod was deleted fenced on its UID/resourceVersion while the "
+            "recovery workflow's RESTART_WORKLOAD reservation was open; the replacement "
+            "restored its state from the product's own ConfigMaps",
+            "a reservation that survives the restart as the consumed budget is the "
+            "product's record of no double decrement and no lost claim",
+        ],
+        extra={
+            "attempt": job.attempt_id,
+            "watcher": {
+                "deleted": (restarted.get("deleted") or {}).get("uid"),
+                "replacement": (restarted.get("replacement") or {}).get("uid"),
+                "node": (restarted.get("replacement") or {}).get("node"),
+            },
+            "claim_state_at_delete": watcher_restart.claim_state(
+                opened, job.attempt_id
+            ),
+            "restart_budget": records.get("restart_budget"),
+        },
+    )
+
+
+def _wait_recovery_settled(ctx: VariantContext, job: ManagedFailJob) -> dict[str, Any]:
+    last: dict[str, Any] = {}
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal last
+        last = _records(ctx, job)
+        return last if watcher_restart.recovery_settled(last, job.attempt_id) else None
+
+    value = ctx.wait_until(
+        accept, timeout_seconds=ATTEMPT_BUDGET, poll_seconds=20, name="recovery-settled"
+    )
+    return value if value is not None else last
 
 
 # --------------------------------------------------------------------------- #
@@ -991,13 +1312,35 @@ VARIANTS = [
         risk="L",
         max_minutes=30,
     ),
-    deferred_variant(
-        CASE_028,
-        "api_unreachable",
+    VariantSpec(
+        case_id=CASE_028,
+        variant="api_unreachable",
         proof_mode=NATIVE,
-        reason="NOT_AUTHORIZED: blocking the completion watcher's control-plane access needs WATCHER_NETWORK_ISOLATION and a watcher-host net block not arranged this phase",
         lanes=("eks", "hp"),
-        expected="only the test watcher's target access is blocked with a rollback timer; emergency stop/retry with no duplicate action",
+        risk="H",
+        flags="X",
+        injection=(
+            "on the node of the one completion-watcher Pod, FORWARD rules reject TCP "
+            "from that Pod's IP to the control-plane endpoint (tcp-reset; systemd "
+            "deadman <= 540 s); a managed job's critical container then exits "
+            "non-zero under the block"
+        ),
+        expected=(
+            "the watcher's emergency fallback suspends the workload itself "
+            "(emergency-fallback annotation naming the containment incident); nothing "
+            "reaches the control plane while blocked; after the restore the failure "
+            "and terminal are delivered once: one containment with one STOP_WORKLOADS, "
+            "one decision (PLAN_CREATED), at most one RESTART_WORKLOAD, the budget "
+            "consumed once, no duplicate notification, a coverage heartbeat after the "
+            "restore"
+        ),
+        cleanup=(
+            "delete the tagged rules and the deadman, prove the chain clean and a "
+            "watcher heartbeat after the restore; delete the test job and its restart"
+        ),
+        max_minutes=45,
+        approvals=("WATCHER_NETWORK_ISOLATION",),
+        execute=api_unreachable,
     ),
     _spec(
         CASE_029,
@@ -1039,13 +1382,33 @@ VARIANTS = [
         max_minutes=10,
         execute=concurrent_claim,
     ),
-    deferred_variant(
-        CASE_029,
-        "worker_restart",
+    VariantSpec(
+        case_id=CASE_029,
+        variant="worker_restart",
         proof_mode=NATIVE,
-        reason="NOT_AUTHORIZED: deleting a completion-watcher Pod during an open claim needs CONTROL_PLANE_RESTART, a dangerous branch not approved this phase",
         lanes=("eks", "hp"),
-        expected="a watcher restart does not double-count or lose the restart reservation",
+        risk="H",
+        flags="X",
+        injection=(
+            "while the recovery workflow's RESTART_WORKLOAD reservation is open "
+            "(reserved on the ledger, step not yet ended), the one completion-watcher "
+            "Pod is deleted fenced on its UID/resourceVersion with no grace, so the "
+            "Deployment replaces it"
+        ),
+        expected=(
+            "the replacement re-posts nothing that counts: restart_count 1 == the one "
+            "reservation of the recovery workflow (not lost, not doubled), one "
+            "RESTART_WORKLOAD SUCCEEDED, one STOP_WORKLOADS, one decision, exactly one "
+            "restart attempt observed, no notification twice, a coverage heartbeat from "
+            "the replacement"
+        ),
+        cleanup=(
+            "delete the test job and its restart replica; the watcher Deployment has "
+            "already replaced its Pod (proven Ready)"
+        ),
+        max_minutes=45,
+        approvals=("CONTROL_PLANE_RESTART",),
+        execute=worker_restart,
     ),
     _spec(
         CASE_029,

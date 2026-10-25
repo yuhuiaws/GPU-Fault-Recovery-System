@@ -22,6 +22,7 @@ from scripts.e2e.regional import general_live_nccl as nc
 from scripts.e2e.regional import general_live_nccl_fr as nf
 from scripts.e2e.regional import general_live_nccl_pair as pair
 from scripts.e2e.regional import general_live_nccl_roles as roles
+from scripts.e2e.regional import general_live_network_isolation as iso
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_nccl_job import STALL_MAX_SECONDS
 from scripts.e2e.regional.general_live_registry import build_registry, coverage_rows
@@ -363,6 +364,7 @@ def test_registry_covers_every_011_variant() -> None:
         "fr_disabled",
         "simultaneous_nodes",
         "repeat_after_recovery",
+        "unreachable_node",
         "broken_pair",
     }
     pair_spec = SPECS["broken_pair"]
@@ -384,8 +386,12 @@ def test_registry_covers_every_011_variant() -> None:
     assert all(
         lane == "hp"
         for spec in [*nc.VARIANTS, *nf.VARIANTS, *pair.VARIANTS]
+        if spec.variant != "unreachable_node"
         for lane in spec.lanes
     ), "the stall variants and their FR/pair modules run on the HyperPod lane"
+    assert SPECS["unreachable_node"].lanes == ("eks", "hp"), (
+        "the Agent-channel variant runs on both clusters (two EFA nodes each)"
+    )
     assert all(spec.lanes == ("eks", "hp") for spec in roles.VARIANTS), (
         "the role/attempt variants run on both clusters (two EFA nodes each)"
     )
@@ -676,6 +682,145 @@ def test_a_job_that_does_not_resume_fails(tmp_path: Path) -> None:
     result = _run("active_to_zero", tmp_path)
     assert result["verdict"] == "FAIL"
     assert result["stages"]["resumed"], result["stages"]
+
+
+def _unreachable_ctx(
+    tmp_path: Path, *, gap: bool = True, fabricated: bool = False
+) -> tuple[Any, dict[str, Any], FakeProbe]:
+    """A context whose peer Agent block is a fake probe and whose hung records
+    carry (or lack) the product's coverage-gap record for the peer."""
+
+    spec = SPECS["unreachable_node"]
+    start = datetime(2026, 10, 24, tzinfo=timezone.utc)
+    marks: dict[str, Any] = {"restored": False}
+
+    def respond(script: str, *arguments: str) -> dict[str, Any]:
+        if script == iso.ISOLATION_RECORDS_PROBE:
+            seen = start + timedelta(days=1) if marks["restored"] else start
+            return {
+                "heartbeat": None,
+                "observations": [],
+                "notifications": [],
+                "agent": {
+                    "node_id": PEER,
+                    "endpoint": f"https://{PEER}:9099",
+                    "last_seen_at": seen.isoformat(),
+                    "lifecycle_state": "ACTIVE",
+                    "lease_expires_at": None,
+                },
+            }
+        records = hung_records(arguments[-1])
+        for item in records["workflows"]["wf"]["step_executions"]:
+            if item["operation"] != "COLLECT_HUNG_SUMMARY" or item["step_index"] != 1:
+                continue
+            results = {NODE: encode_summary({"node_id": NODE, "ranks": []})}
+            if fabricated:
+                results[PEER] = encode_summary({"node_id": PEER, "ranks": []})
+            item["details"] = {"node_results": results}
+            if gap:
+                item["details"]["undetermined_nodes"] = [PEER]
+                item["details"]["node_failures"] = {
+                    PEER: "temporary transport failure: [Errno 111] Connection refused"
+                }
+        return records
+
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=respond),
+        probes={},
+        settings=_settings(spec, tmp_path),
+    )
+    ticks = itertools.count()
+    ctx.clock = lambda: start + timedelta(seconds=15 * next(ticks))
+    ctx.probes[f"node@{NODE}"] = efa_probe(NODE, survey=True)  # type: ignore[assignment]
+    ctx.probes[f"node@{PEER}"] = efa_probe(PEER)  # type: ignore[assignment]
+
+    def block(arguments: tuple[str, ...]) -> dict[str, Any]:
+        marks["blocked_at"] = ctx.clock()
+        marks["block_arguments"] = arguments
+        return {
+            "rules": ["-A INPUT -p tcp --dport 9099 -m comment --comment t -j REJECT"],
+            "deadman": {"timer": {"ActiveState": "active"}},
+            "connectivity": False,
+        }
+
+    def cleanup(_arguments: tuple[str, ...]) -> dict[str, Any]:
+        marks["restored"] = True
+        marks["restored_at"] = ctx.clock()
+        return {
+            "clean": True,
+            "kinds": {
+                "agent-ingress": {
+                    "remaining": [],
+                    "timer": {"ActiveState": "inactive"},
+                    "connectivity": True,
+                }
+            },
+        }
+
+    fake = FakeProbe({"block": block, "cleanup": cleanup})
+    ctx.probes[f"isolation@{PEER}"] = fake  # type: ignore[assignment]
+    return ctx, marks, fake
+
+
+def test_unreachable_node_blocks_the_peer_agent_before_the_stall_and_passes_on_a_recorded_gap(
+    tmp_path: Path,
+) -> None:
+    spec = SPECS["unreachable_node"]
+    assert spec.approvals == ("NODE_AGENT_NETWORK_ISOLATION",)
+    assert spec.flags == "X" and spec.risk == "H"
+    ctx, marks, fake = _unreachable_ctx(tmp_path)
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert set(result["stages"]) == {
+        "chain",
+        "escalated",
+        "timing",
+        "coverage_gap",
+        "no_isolation",
+        "channel_restored",
+        "resumed",
+    }
+    job = FakeNcclJob.instances[-1]
+    assert marks["blocked_at"] < job.stall_times[0], "the block precedes the stall"
+    assert marks["block_arguments"][:7] == (
+        "block", "--kind", "agent-ingress", "--deadman-seconds",
+        str(iso.AGENT_BLOCK_SECONDS), "--unit", iso.AGENT_UNIT,
+    )  # fmt: skip
+    assert "--port" in marks["block_arguments"] and "9099" in marks["block_arguments"]
+    assert [call[0] for call in fake.calls] == ["block", "cleanup"]
+    assert job.released == 1 and ctx.cleanup.pending() == ["job-" + job.name]
+    assert result["unreachable_node"] == PEER
+    assert result["later_steps"] == {
+        "COLLECT_DIAGNOSTIC_BUNDLE": "SUCCEEDED",
+        "VALIDATE_FABRIC": "SUCCEEDED",
+        "ESCALATE_SUPPORT": "SUCCEEDED",
+    }
+    assert (ctx.evidence.case_dir / "unr-evidence-records.json").is_file(), (
+        "the evidence-phase records are kept"
+    )
+    assert (ctx.evidence.case_dir / "isolation-agent-ingress-cleanup.json").is_file(), (
+        "the probe's cleanup document is kept"
+    )
+
+
+@pytest.mark.parametrize(
+    ("options", "needle"),
+    [
+        ({"gap": False}, "coverage gap is not recorded"),
+        ({"fabricated": True}, "fabricated reading"),
+    ],
+    ids=["no-gap", "fabricated"],
+)
+def test_unreachable_node_fails_without_the_gap_record_or_with_a_fabricated_reading(
+    tmp_path: Path, options: dict[str, bool], needle: str
+) -> None:
+    ctx, _marks, fake = _unreachable_ctx(tmp_path, **options)
+    result = SPECS["unreachable_node"].execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any(needle in item for item in result["stages"]["coverage_gap"]), result
+    assert [call[0] for call in fake.calls] == ["block", "cleanup"], "restored anyway"
 
 
 def test_simultaneous_nodes_waits_for_both_reporters_and_needs_one_incident(

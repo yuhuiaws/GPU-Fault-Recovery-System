@@ -39,9 +39,14 @@ they stall the same job while the reviewed test dump responder of
 dumps (live-replay). The role, thread, process and attempt-change variants
 (``role_mismatch``, ``tid_namespace``, ``wchan_zero``, ``cpu_interval``,
 ``pyspy_nonzero``, ``attempt_change``) live in ``general_live_nccl_roles``: the
-same stall on the trainer's role modes. The 128-node/1024-process scale
-variants need a cluster this site does not have: each stays NOT_RUN with its
-reason, in the denominator.
+same stall on the trainer's role modes. ``unreachable_node`` is the same stall
+while the second node's Node Agent port is rejected on that host
+(``general_live_network_isolation``, INPUT REJECT with a deadman): the
+executor cannot push the hung summary/triage to it, the product has to record
+the gap and still escalate, and the channel is restored once the evidence
+steps are recorded. The 128-node/1024-process scale variants need a cluster
+this site does not have: each stays NOT_RUN with its reason, in the
+denominator.
 """
 
 from __future__ import annotations
@@ -53,6 +58,7 @@ from datetime import datetime, timedelta
 from typing import Any
 
 from gpu_fault.hung_summary_codec import decode_summary
+from scripts.e2e.regional import general_live_network_isolation as isolation
 from scripts.e2e.regional.general_live_common import run_survey
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
@@ -1115,6 +1121,125 @@ def repeat_after_recovery(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+AGENT_SEEN_WAIT_SECONDS = 300
+
+
+def unreachable_node(ctx: VariantContext) -> dict[str, Any]:
+    """011: the second node's Agent channel is unreachable during the evidence steps.
+
+    The INPUT block on ``--node-b`` goes up before the stall and holds until the
+    hung chain's summary/triage executions are recorded, so every node action
+    the executor pushes to that node in the evidence phase is refused; the
+    host collector's EFA readings (outbound) still drive the hung suspicion on
+    both nodes. The product must record the node as a coverage gap, keep the
+    reachable node's evidence and still escalate; after the restore the port
+    accepts again and the Agent's heartbeat keeps advancing.
+    """
+
+    run_survey(ctx)
+    cluster_id = ctx.settings.regional.cluster_id
+    peer = ctx.settings.peer_node
+    nodes = attempt_nodes(ctx)
+    job = _job(ctx, "unr")
+    _prove_baseline(ctx, name="unr-active")
+    agent_before = isolation.isolation_records(ctx.regional, cluster_id, node=peer).get(
+        "agent"
+    )
+    block = isolation.HostNetworkIsolation(
+        ctx,
+        node=peer,
+        kind=isolation.AGENT_INGRESS,
+        port=isolation.agent_port(agent_before),
+        deadman_seconds=isolation.block_budget(ctx, isolation.AGENT_BLOCK_SECONDS),
+    )
+    block.block()
+    started, _events = _stall(ctx, job, name="unr")
+    _wait_hung_evidence(ctx, job, started)
+    block.restore()
+    ctx.cleanup.discard(block.cleanup_name)
+    restored_at = block.restored_at or ctx.clock()
+    records = _hung(ctx, job, started, name="unr-hung")
+    agent_after = _wait_agent_seen(ctx, peer, since=restored_at)
+    workflow = hung_workflow(records)
+    stages = {
+        "chain": dag_errors(records),
+        "escalated": escalated_errors(records),
+        "timing": timing_errors(records, started, nodes),
+        "coverage_gap": isolation.coverage_gap_errors(
+            workflow, node=peer, peer=ctx.settings.node
+        ),
+        "no_isolation": isolation.no_isolation_errors(
+            workflow, ctx.regional.node_snapshot(peer)
+        ),
+        "channel_restored": isolation.channel_restored_errors(
+            block.restored or {}, agent_before, agent_after, restored_at=restored_at
+        ),
+        "resumed": _release_and_resume(ctx, job, name="unr"),
+    }
+    return variant_result(
+        stages,
+        notes=[
+            "only the Agent's listening port on the second node was rejected (its "
+            "heartbeats, the collectors and kubelet kept working); the gap is the "
+            "product's own undetermined/not-responding record, never a fabricated zero",
+            "the channel was restored once the evidence steps were recorded, so the "
+            "chain's later steps and the escalation ran against a reachable node",
+        ],
+        extra={
+            "attempt": job.identity(),
+            "unreachable_node": peer,
+            "blocked_at": block.blocked_at.isoformat() if block.blocked_at else None,
+            "restored_at": restored_at.isoformat(),
+            "later_steps": isolation.later_step_statuses(workflow),
+        },
+    )
+
+
+def _wait_hung_evidence(
+    ctx: VariantContext, job: ManagedNcclJob, since: datetime
+) -> dict[str, Any]:
+    """The records once the hung chain's summary/triage executions are recorded."""
+
+    last: dict[str, Any] = {}
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal last
+        last = _records(ctx, job, since)
+        return last if isolation.evidence_recorded(hung_workflow(last)) else None
+
+    value = ctx.wait_until(
+        accept, timeout_seconds=HUNG_BUDGET, poll_seconds=20, name="unr-evidence"
+    )
+    records = value if value is not None else last
+    ctx.evidence.write("unr-evidence-records", records)
+    return records
+
+
+def _wait_agent_seen(
+    ctx: VariantContext, node: str, *, since: datetime
+) -> dict[str, Any] | None:
+    """The node's Agent record once its heartbeat postdates ``since``."""
+
+    cluster_id = ctx.settings.regional.cluster_id
+    last: dict[str, Any] | None = None
+
+    def accept() -> dict[str, Any] | None:
+        nonlocal last
+        last = isolation.isolation_records(ctx.regional, cluster_id, node=node).get(
+            "agent"
+        )
+        seen = parse_time((last or {}).get("last_seen_at"))
+        return last if seen is not None and seen >= since else None
+
+    value = ctx.wait_until(
+        accept,
+        timeout_seconds=AGENT_SEEN_WAIT_SECONDS,
+        poll_seconds=20,
+        name="unr-agent",
+    )
+    return value if value is not None else last
+
+
 def variant_result(
     stages: dict[str, list[str]],
     *,
@@ -1234,11 +1359,34 @@ VARIANTS = [
         repeat_after_recovery,
         max_minutes=120,
     ),
-    _deferred(
-        "unreachable_node",
-        "NOT_AUTHORIZED: isolating one node's Agent command channel needs a net block (WATCHER_NETWORK_ISOLATION-class) not arranged this phase",
-        "the unreachable node is recorded as missing coverage, never a fabricated zero; still ESCALATED",
-        proof=NATIVE,
+    VariantSpec(
+        case_id=CASE,
+        variant="unreachable_node",
+        proof_mode=NATIVE,
+        lanes=("eks", "hp"),
+        risk="H",
+        flags="X",
+        injection=(
+            "the two-node job stalls while the second node's Node Agent port is "
+            "rejected on that host (INPUT REJECT tcp-reset, systemd deadman): the "
+            "executor cannot push COLLECT_HUNG_SUMMARY/TRIAGE to it; the channel is "
+            "restored once the evidence steps are recorded"
+        ),
+        expected=(
+            "the hung chain compiles; the summary/triage records name the node as "
+            "undetermined/not responding and carry no reading for it (never a "
+            "fabricated zero), the reachable node's evidence is kept, the incident "
+            "still ends ESCALATED; nothing cordoned/stopped/reset; the Agent port "
+            "accepts again and its heartbeat keeps advancing"
+        ),
+        cleanup=(
+            "delete the tagged INPUT rule and its deadman, prove the port accepts and "
+            "the Agent heartbeats; release the stall and prove the EFA pair resumes; "
+            "delete the test Job"
+        ),
+        max_minutes=90,
+        approvals=("NODE_AGENT_NETWORK_ISOLATION",),
+        execute=unreachable_node,
     ),
     _deferred(
         "large_job",
