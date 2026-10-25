@@ -49,6 +49,7 @@ from gpu_fault.node_agent.operations.drain_p2p import recover_drain_p2p
 from gpu_fault.node_agent.operations.hung_summary import collect_hung_summary
 from gpu_fault.node_agent.observation_supervisor import ObservationIncomplete
 from gpu_fault.node_agent.operations.remediation import InstallOutcomeUnknownError
+from gpu_fault.node_agent.operations.workload_scope import quiesce_workload_scope
 from gpu_fault.node_agent.operations.reset import ResetProgressError
 from gpu_fault.node_agent.operations.registry import (
     OPERATION_HANDLERS,
@@ -737,6 +738,11 @@ class NodeActionExecutor(
         # A value this Agent does not know is refused before anything stops.
         keep = fabric_manager_kept(command.parameters)
         target_device_paths, workload_cgroup_paths = self._quiesce_scope(command)
+        # A managed Pod names no cgroup; the attempt's runtime container ids
+        # name its containers' here (a value not understood refuses now).
+        workload_cgroup_paths, workload_scope = quiesce_workload_scope(
+            self.proc_root, command, workload_cgroup_paths
+        )
         # Read right after the scope: the bus ids come from the very report its
         # device nodes were resolved from (an empty target list is every GPU).
         whole_node = not command.gpu_uuids
@@ -758,6 +764,8 @@ class NodeActionExecutor(
             )
         finally:
             self.gpu_activity.close_opening(command.incident_id)
+        if not result.get("already_quiesced"):
+            result = {**result, "workload_scope": workload_scope}
         return {**result, **drained}
 
     def _open_quiesce_windows(self) -> list[dict[str, Any]]:

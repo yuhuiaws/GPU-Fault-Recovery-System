@@ -11,6 +11,7 @@ every later identity check (survey, triage, FR series) reads one scope.
 from __future__ import annotations
 
 import errno
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -85,6 +86,46 @@ def container_cgroups(
     return found, complete or len(found) == len(container_ids)
 
 
+def scope_without_container_ids(explicit: Any) -> dict[str, Any]:
+    """The evidence of a scope no runtime container id contributed to."""
+
+    if explicit:
+        return {"basis": "EXPLICIT_CGROUP_PATHS"}
+    return {"basis": "UNAVAILABLE", "reason": "NO_CGROUP_PATH_OR_CONTAINER_ID"}
+
+
+def resolve_container_ids(
+    proc_root: Path, identifiers: Sequence[str], explicit: Any = ()
+) -> tuple[list[str], dict[str, Any]]:
+    """The cgroups of ``identifiers`` on this node, and how far they resolved.
+
+    ``identifiers`` are valid runtime ids, unique and sorted. An id with no
+    process here resolves to nothing; the evidence counts it (and names up to
+    :data:`REPORTED_UNRESOLVED_IDS`) so a missing container never reads as an
+    empty one. ``explicit`` are the command's own cgroup paths, only counted.
+    """
+
+    found, complete = container_cgroups(proc_root, set(identifiers))
+    resolved = sorted({path for paths in found.values() for path in paths})
+    unresolved = [identifier for identifier in identifiers if identifier not in found]
+    evidence: dict[str, Any] = {
+        "basis": "RUNTIME_CONTAINER_ID",
+        "container_count": len(identifiers),
+        "resolved_container_count": len(found),
+        "unresolved_container_count": len(unresolved),
+        "unresolved_container_ids": unresolved[:REPORTED_UNRESOLVED_IDS],
+        "cgroup_path_count": len(resolved),
+        "complete": not unresolved,
+    }
+    if unresolved:
+        evidence["reason"] = (
+            "CONTAINER_CGROUP_NOT_FOUND" if complete else "PROCESS_SCAN_INCOMPLETE"
+        )
+    if explicit:
+        evidence["explicit_cgroup_path_count"] = len(explicit)
+    return resolved, evidence
+
+
 def resolve_workload_scope(
     proc_root: Path, command: NodeActionCommand
 ) -> tuple[NodeActionCommand, dict[str, Any]]:
@@ -112,30 +153,8 @@ def resolve_workload_scope(
         }
     )
     if not identifiers:
-        if explicit:
-            return command, {"basis": "EXPLICIT_CGROUP_PATHS"}
-        return command, {
-            "basis": "UNAVAILABLE",
-            "reason": "NO_CGROUP_PATH_OR_CONTAINER_ID",
-        }
-    found, complete = container_cgroups(proc_root, set(identifiers))
-    resolved = sorted({path for paths in found.values() for path in paths})
-    unresolved = [identifier for identifier in identifiers if identifier not in found]
-    evidence: dict[str, Any] = {
-        "basis": "RUNTIME_CONTAINER_ID",
-        "container_count": len(identifiers),
-        "resolved_container_count": len(found),
-        "unresolved_container_count": len(unresolved),
-        "unresolved_container_ids": unresolved[:REPORTED_UNRESOLVED_IDS],
-        "cgroup_path_count": len(resolved),
-        "complete": not unresolved,
-    }
-    if unresolved:
-        evidence["reason"] = (
-            "CONTAINER_CGROUP_NOT_FOUND" if complete else "PROCESS_SCAN_INCOMPLETE"
-        )
-    if explicit:
-        evidence["explicit_cgroup_path_count"] = len(explicit)
+        return command, scope_without_container_ids(explicit)
+    resolved, evidence = resolve_container_ids(proc_root, identifiers, explicit)
     if not resolved or not isinstance(explicit, list):
         return command, evidence
     scope = list(dict.fromkeys([*explicit, *resolved]))
@@ -151,3 +170,50 @@ def resolve_workload_scope(
         }
     )
     return updated, evidence
+
+
+def quiesce_workload_scope(
+    proc_root: Path, command: NodeActionCommand, explicit: set[str]
+) -> tuple[set[str], dict[str, Any]]:
+    """The QUIESCE device sweep's workload cgroups here, and their evidence.
+
+    The sweep TERM/KILLs a holder of the target GPU that runs in one of these
+    cgroups, so the attempt's runtime ids are read more strictly than the
+    read-only hung chain reads them: a value this Agent cannot read in full
+    refuses the quiesce before anything stops, as a malformed explicit path
+    does (``_quiesce_scope``). An id with no process here adds nothing -- after
+    STOP_WORKLOADS that is the normal case, the container has nothing left to
+    sweep -- and a scan cut short adds only the containers it saw. A holder
+    left outside the scope stays alive, and VERIFY_NO_GPU_CLIENTS, the
+    authority on survivors, refuses the reset on it. Nothing outside the
+    attempt's own containers enters the scope.
+    """
+
+    by_node = command.parameters.get(WORKLOAD_CONTAINER_IDS)
+    if by_node is None:
+        return explicit, scope_without_container_ids(explicit)
+    if not isinstance(by_node, dict):
+        raise RuntimeError(
+            f"{WORKLOAD_CONTAINER_IDS} must map node ids to lists of runtime "
+            "container ids"
+        )
+    requested = by_node.get(command.node_id)
+    requested = [] if requested is None else requested
+    if not isinstance(requested, list) or len(requested) > MAX_NODE_CONTAINER_IDS:
+        raise RuntimeError(
+            f"{WORKLOAD_CONTAINER_IDS} of {command.node_id} must be a list of at "
+            f"most {MAX_NODE_CONTAINER_IDS} runtime container ids"
+        )
+    identifiers: set[str] = set()
+    for value in requested:
+        identifier = runtime_container_id(value)
+        if identifier is None:
+            raise RuntimeError(
+                f"{WORKLOAD_CONTAINER_IDS} of {command.node_id} holds a value "
+                "that is not a 64-hex runtime container id"
+            )
+        identifiers.add(identifier)
+    if not identifiers:
+        return explicit, scope_without_container_ids(explicit)
+    resolved, evidence = resolve_container_ids(proc_root, sorted(identifiers), explicit)
+    return explicit | set(resolved), evidence
