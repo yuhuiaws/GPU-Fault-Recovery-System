@@ -218,7 +218,48 @@ class ManagedApplogJob:
 
     # -- reads ----------------------------------------------------------- #
     def pods(self) -> list[dict[str, Any]]:
-        return self.fixture.pods()
+        """The job's Pods, the product's restart copies included.
+
+        ``ManagedWorkloadFixture.pods`` adopts every Pod it lists and refuses
+        one whose attempt label is not the source attempt's unless restart
+        custody is bound -- and a journaled fixture can bind none. The Pods the
+        product's RESTART_WORKLOAD made (``fail_once``) are therefore listed
+        here without adoption; only the source attempt's Pods are adopted into
+        the journal. Cleanup still removes the copies through the restart
+        lineage rule (``adopt_for_cleanup``).
+        """
+
+        from scripts.e2e.regional.regional_pod_inventory import ready_pod_records
+
+        value = json.loads(
+            self.ctx.regional.kubectl(
+                "gpu",
+                "get",
+                "pod",
+                "-l",
+                f"gpu-fault.io/job-id={self.name}",
+                "-o",
+                "json",
+            )
+        )
+        ready = {item["uid"] for item in ready_pod_records(value)}
+        result = []
+        for item in value.get("items") or []:
+            metadata = item.get("metadata") or {}
+            labels = metadata.get("labels") or {}
+            if labels.get(ATTEMPT_LABEL) == self.attempt_id:
+                self.fixture.adopt(item)
+            result.append(
+                {
+                    "name": metadata.get("name"),
+                    "uid": metadata.get("uid"),
+                    "node": (item.get("spec") or {}).get("nodeName"),
+                    "phase": (item.get("status") or {}).get("phase"),
+                    "ready": metadata.get("uid") in ready,
+                    "attempt_id": labels.get(ATTEMPT_LABEL),
+                }
+            )
+        return sorted(result, key=lambda item: str(item["name"]))
 
     def pod_detail(self, pod_name: str) -> dict[str, Any]:
         """The Pod's UID, phase, attempt label and its training container's id."""

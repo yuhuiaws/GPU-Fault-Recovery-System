@@ -382,3 +382,73 @@ def test_managed_job_renders_mode_labels_and_identity(tmp_path: Path) -> None:
         job.request_exit("pod")
     with pytest.raises(ValueError, match="positive"):
         job.annotate_host_pid("pod", 0)
+
+
+def _pod(name: str, uid: str, attempt: str, *, owner: str, job: str) -> dict[str, Any]:
+    return {
+        "metadata": {
+            "name": name,
+            "uid": uid,
+            "labels": {
+                "gpu-fault.io/job-id": job,
+                job_module.ATTEMPT_LABEL: attempt,
+                "gpu-fault.io/acceptance-owner": owner,
+            },
+        },
+        "spec": {"nodeName": NODE, "containers": [{"name": "pytorch"}]},
+        "status": {
+            "phase": "Running",
+            "conditions": [{"type": "Ready", "status": "True"}],
+            "containerStatuses": [
+                {
+                    "name": "pytorch",
+                    "ready": True,
+                    "started": True,
+                    "state": {"running": {}},
+                }
+            ],
+        },
+    }
+
+
+@pytest.mark.usefixtures("private_umask")
+def test_pods_lists_the_products_restart_copy_without_adopting_it(
+    tmp_path: Path,
+) -> None:
+    spec = next(item for item in mod.VARIANTS if item.variant == "old_pod")
+    base = make_context(spec, tmp_path=tmp_path, regional=FakeRegional(), probes={})
+    (tmp_path / "site.yaml").write_text("site: test\n")
+    base.settings = GeneralLiveSettings(
+        **{**base.settings.__dict__, "site_file": tmp_path / "site.yaml"}
+    )
+    job = job_module.ManagedApplogJob(
+        base, name="gl17-op-a1-cafebabe", mode="fail_once"
+    )
+    adopted: list[str] = []
+    job.fixture.adopt = lambda document: adopted.append(document["metadata"]["uid"])  # type: ignore[method-assign]
+    payload = {
+        "items": [
+            _pod(
+                "w-master-0",
+                "uid-new",
+                "gl17-op-a1-cafebabe-a001-r-0badcafe",
+                owner="o",
+                job=job.name,
+            ),
+            _pod(
+                "w-master-0-old",
+                "uid-old",
+                "gl17-op-a1-cafebabe-a001",
+                owner="o",
+                job=job.name,
+            ),
+        ]
+    }
+    base.regional.kubectl = lambda plane, *arguments, **_: json.dumps(payload)  # type: ignore[attr-defined]
+    pods = job.pods()
+    assert [item["uid"] for item in pods] == ["uid-new", "uid-old"], pods
+    assert adopted == ["uid-old"], "only the source attempt's Pod is adopted"
+    assert pods[0]["attempt_id"].endswith("-r-0badcafe") and pods[0]["ready"] is True
+    replaced = job.wait_replaced({"uid-old"}, timeout_seconds=60, name="replaced")
+    assert {item["uid"] for item in replaced} == {"uid-new", "uid-old"}
+    assert job.alive()["alive"] is False, "two Pods for a one-Pod job are not healthy"
