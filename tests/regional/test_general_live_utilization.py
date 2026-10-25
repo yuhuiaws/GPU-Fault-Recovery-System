@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import json
 from collections.abc import Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -398,6 +399,141 @@ def test_high_page_cache_is_inconclusive_without_the_condition(
     document = page_cache_doc() if activity == "incident" else empty()
     with pytest.raises(VariantInconclusive, match="condition not established"):
         page_cache_run(tmp_path, oracle, document)
+
+
+def oracle_reads(*phases: list[float]) -> list[dict[str, Any]]:
+    """The oracle as the runner reads it live: every ``oracle-read`` serves
+    the ``page_cache_percent`` readings taken since the previous read, one
+    ``phases`` entry per read (the last repeats)."""
+
+    entries: list[dict[str, Any]] = []
+    total = 0
+    for values in phases:
+        total += len(values)
+        entries.append(
+            {
+                "records": [{"page_cache_percent": value} for value in values],
+                "next_offset": total,
+                "total": total,
+            }
+        )
+    return entries
+
+
+#: Live 2026-10-25 (release 13daa08b2227, attempt 5) as the runner's polls saw
+#: it: the sparse read brought the cache from 0.15 % to 90 % in 277 s, the
+#: product shipped that crossing once (the edge batch, 92.15 %) and then only
+#: health summaries 300 s apart; the finding needs an active sample >= 300 s
+#: after the first, so its earliest summary came up to 630 s after the edge --
+#: here 40 store polls (800 s) after the crossing -- and VALIDATE_HOST is judged
+#: on the summary after that. The runner's 720-s budget, counted from before
+#: the ramp, ended 482 s after the edge.
+RAMP_READS = oracle_reads([0.15] * 3, [45.3] * 3, [90.2, 92.1, 92.15], [92.15] * 60)
+MINTED_AT_POLL = 40
+
+
+def page_cache_ramp_run(
+    tmp_path: Path, oracle: Any, minted_at_poll: int | None
+) -> tuple[dict[str, Any], Any, list[tuple[str, ...]]]:
+    spec = SPECS["high_page_cache"]
+    polls = itertools.count(1)
+
+    def product(_script: str, *_arguments: str, **_: Any) -> dict[str, Any]:
+        poll = next(polls)
+        if minted_at_poll is not None and poll >= minted_at_poll:
+            return page_cache_doc()
+        return empty()
+
+    probe_set = probes(oracle)
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=product),
+        probes=probe_set,
+        settings=_settings(spec, tmp_path),
+    )
+    result = spec.execute(poll_clock(ctx))
+    return result, ctx, probe_set[f"node@{NODE}"].calls
+
+
+def test_high_page_cache_times_detection_from_the_oracles_crossing(
+    tmp_path: Path,
+) -> None:
+    result, ctx, calls = page_cache_ramp_run(tmp_path, RAMP_READS, MINTED_AT_POLL)
+    assert result["verdict"] == "PASS", result["errors"]
+    ramp = json.loads((ctx.case_dir / "page-cache-ramp-timeline.json").read_text())
+    assert [entry["accepted"] for entry in ramp["entries"]] == [False, False, True]
+    opened = json.loads((ctx.case_dir / "page-cache-start.json").read_text())
+    assert opened["ramp_budget_seconds"] == util.PAGE_CACHE_RAMP_BUDGET
+    assert opened["detection_budget_seconds"] == util.page_cache_hold(ctx)
+    # The fill and the oracle outlive the ramp and the detection budget.
+    for subcommand in ("page-cache-start", "oracle-start"):
+        call = next(item for item in calls if item[0] == subcommand)
+        seconds = int(call[call.index("--seconds") + 1])
+        assert seconds >= util.PAGE_CACHE_RAMP_BUDGET + util.page_cache_hold(ctx), (
+            subcommand,
+            seconds,
+        )
+
+
+def test_high_page_cache_fails_when_the_product_misses_two_summaries(
+    tmp_path: Path,
+) -> None:
+    # Minted only after the cadence-sized budget (the fake survey's 300-s
+    # summaries, 15-s interval): the product's FAIL, not the runner's budget.
+    budget = util.PAGE_CACHE_DURATION + 2 * 300 + 15 + 180
+    late = budget // STORE_POLL_SECONDS + 3
+    result, _ctx, _calls = page_cache_ramp_run(tmp_path, RAMP_READS, late)
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["chain"] == [
+        "no page_cache_percent finding reached an incident"
+    ], result["stages"]
+
+
+def test_high_page_cache_is_inconclusive_when_the_ramp_runs_out(tmp_path: Path) -> None:
+    with pytest.raises(VariantInconclusive, match="condition not established"):
+        page_cache_ramp_run(tmp_path, oracle_reads([0.15] * 3, [45.3] * 3), None)
+
+
+def test_page_cache_hold_covers_the_products_two_summaries(tmp_path: Path) -> None:
+    """The budget is the product's cadence, read from the node's collector env.
+
+    The host collector ships a sustained breach once (its edge) and then only
+    on health summaries; the finding needs a second active sample at least the
+    rule's duration after the first (``store/shared/xid.py``), and VALIDATE_HOST
+    is judged on evidence newer than itself: duration + two summaries + one
+    collector interval + the ingest/dispatch margin.
+    """
+
+    spec = SPECS["high_page_cache"]
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=store_script({"activity": empty()})),
+        probes=probes(),
+        settings=_settings(spec, tmp_path),
+    )
+    ctx.survey = survey()
+    duration = NodeHealthPolicy(build_store()).page_cache_duration_seconds
+    assert util.PAGE_CACHE_DURATION == duration
+    assert util.page_cache_hold(ctx) == duration + 2 * 300 + 15 + 180
+    assert util.page_cache_hold(ctx) > 720, (
+        "the live budget that ended before the edge's second summary"
+    )
+    assert spec.max_minutes * 60 >= (
+        util.PAGE_CACHE_RAMP_BUDGET + util.page_cache_hold(ctx) + 240
+    ), "the variant budget covers the ramp, the detection and the cleanup"
+
+
+def test_high_page_cache_without_an_incident_does_not_wait_to_settle(
+    tmp_path: Path,
+) -> None:
+    # Live 2026-10-25: the settled wait after a FAIL with no incident could
+    # never accept and ran out its whole budget (12 min of polls).
+    result, ctx, _calls = page_cache_ramp_run(tmp_path, RAMP_READS, None)
+    assert result["verdict"] == "FAIL", result
+    settled = ctx.case_dir / "page-cache-settled-timeline.json"
+    assert not settled.exists(), "nothing to settle must not poll the store"
 
 
 def test_scratch_full_passes(tmp_path: Path) -> None:

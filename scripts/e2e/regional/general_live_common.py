@@ -319,14 +319,23 @@ def wait_settled(
     metrics: Iterable[str] = (),
     name: str = "settled",
 ) -> dict[str, Any]:
-    """Poll until every workflow of ``incident_ids`` is terminal."""
+    """Poll until every workflow of ``incident_ids`` is terminal.
 
+    No incident is nothing to settle: one read, not a wait. ``settled`` needs
+    a workflow to judge, so an empty id list could never accept and a variant
+    that had already failed "no finding reached an incident" ran out the whole
+    settle budget on top (live 2026-10-25, 003 high_page_cache: 12 minutes).
+    """
+
+    wanted = [str(item) for item in incident_ids]
+    if not wanted:
+        return activity(ctx, since, metrics=metrics)
     last: dict[str, Any] = {}
 
     def accept() -> dict[str, Any] | None:
         nonlocal last
         last = activity(ctx, since, metrics=metrics)
-        return last if settled(last, incident_ids) else None
+        return last if settled(last, wanted) else None
 
     value = ctx.wait_until(
         accept,

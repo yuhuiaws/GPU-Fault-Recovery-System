@@ -2053,6 +2053,47 @@ needs three things: a ramp wait timed from the oracle's crossing, as
 `low_available_memory` has; parallel readers over disjoint ranges; and a
 size computed from MemAvailable with headroom above the threshold.
 
+The next pass with the oracle (2026-10-25, release 13daa08b2227, attempt 5
+on the plain-EKS p5en) showed the fill is not the weak layer: one `cat` read
+the holes at about 7.5 GB/s and the oracle went from 0.15 % to 90.2 % in 277
+s, then held 92.15 % for 505 s, so the condition was established and the
+variant read FAIL "no page_cache_percent finding reached an incident". The
+product's own records explain the missing finding, and it is the runner's
+budget, not the product. The host collector's edge filter ships a sustained
+breach once, as the crossing's edge (`sustained:page_cache_percent`, a
+reason that stays in `_active_edge_reasons` while the breach holds), and
+after that only on its health summaries, 300 s apart with +-5 % jitter
+(`collectors/host/collector.py`, `collect_once`); a summary-only batch with
+no finding is evaluated but not kept as raw evidence
+(`app/ingest/telemetry.py`, `_persist_host_telemetry`). The control plane
+mints a sustained finding on the first *later* active sample at least the
+rule's 300 s after the first (`store/shared/xid.py`,
+`_next_health_signal_state`: `duration >= minimum_active_seconds`), so
+HIGH_PAGE_CACHE can only come from the first summary 300 s or more after the
+edge, up to about 630 s after it, and VALIDATE_HOST is then judged on
+evidence newer than itself, one more summary. The store holds exactly one
+active batch for the window, the 15:57:53 edge at 92.15 %, then the 16:06:19
+`recovered` batch at 0.15 %: the runner's 720-s budget was counted from
+before the ramp, ended 16:05:55 (482 s after the edge), and the fill was
+stopped at 16:06:12, which reset the signal before the summary that could
+have claimed it. The pass-4 reading of the timelines, "never accepted a
+reading", was a misreading: the timeline's `accepted` is whether that poll
+found the chain judgeable, not a reading's acceptance.
+
+The variant now waits for its own oracle to read the threshold (a ramp budget
+of 1080 s, `INCONCLUSIVE` "condition not established" if the read never gets
+there) and only then times detection, over a budget sized from the node's
+collector environment: the 300-s duration plus two host health summaries plus
+one collector interval plus a 180-s margin for jitter, ingest and dispatch
+(1095 s on this site). The fill and the oracle outlive ramp and detection,
+`page-cache-start.json` records both budgets and the cadence they came from,
+and the variant's window is 45 minutes. The settle wait after a verdict with
+no incident is now one read, for every variant: `settled` needs a workflow to
+judge, so an empty incident list could never accept and burned its whole
+budget. The tests replay the live shape -- the oracle crossing on the third
+read, the product's records appearing 40 polls (800 s) after it -- and pin
+the budget to the product's rule duration and the fake survey's cadence.
+
 The same review of every diagnostic-only verdict found one more incident
 the matcher could not see: 025 `exporter_timeout`, `sustained_unknown` and
 `post_refresh_success` waited for a `dcgm_field_completeness` incident with

@@ -75,6 +75,12 @@ PAGE_CACHE_DURATION = 300
 #: every sample for PAGE_CACHE_DURATION.
 PAGE_CACHE_THRESHOLD = 90.0
 PAGE_CACHE_ORACLE_INTERVAL = 5
+#: How long the sparse read may take to bring the page cache to the threshold
+#: (live 2026-10-25 on a 2 TiB host: 0.15 % to 90 % in 277 s at ~7.5 GB/s; the
+#: single-threaded floor measured on ext4 is 2.4 GB/s, about 14 minutes).
+PAGE_CACHE_RAMP_BUDGET = 1080
+#: Ingest, dispatch and the +-5 % summary jitter on top of the cadence terms.
+PAGE_CACHE_CHAIN_MARGIN = 180
 LOCAL_FS_DURATION = 60
 TEST_FS = "fs"
 SINGLE_NODE_MANIFEST = "single-node-warm-spare-pytorchjob.yaml"
@@ -366,29 +372,87 @@ def low_available_memory(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+def page_cache_hold(ctx: VariantContext) -> int:
+    """The detection budget from the oracle's crossing, on the product's cadence.
+
+    The host collector ships a sustained breach once, as the crossing's edge
+    (``collectors/host/collector.py`` ``_edge_reasons``/``collect_once``:
+    ``sustained:page_cache_percent`` leaves ``delivery_reasons`` while it
+    stays active), then only on its health summaries
+    (``GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS``, +-5 % jitter). The control
+    plane mints the finding on the first *later* active sample at least the
+    rule's duration after the first (``store/shared/xid.py``
+    ``_next_health_signal_state``): up to duration + one summary after the
+    edge. VALIDATE_HOST is then judged on evidence newer than itself: one more
+    summary. Live 2026-10-25 (release 13daa08b2227, attempt 5): edge batch
+    15:57:53 at 92.15 %, the 720-s budget -- counted from before a 277-s ramp
+    -- ended 16:05:55, the fill stopped 16:06:12 and the product's only other
+    batch was the 16:06:19 ``recovered`` one: its window was reset before the
+    summary that could have claimed it.
+    """
+
+    return (
+        PAGE_CACHE_DURATION
+        + 2 * ctx.host_summary
+        + ctx.host_interval
+        + PAGE_CACHE_CHAIN_MARGIN
+    )
+
+
 def high_page_cache(ctx: VariantContext) -> dict[str, Any]:
     survey = run_survey(ctx)
     require_tools(survey, "systemd-run")
     root = backing_root(survey)
     started = utc_now()
-    hold = PAGE_CACHE_DURATION + 300 + 120
+    ramp = PAGE_CACHE_RAMP_BUDGET
+    hold = page_cache_hold(ctx)
     # The runner's own /proc/meminfo reading decides whether the condition
     # existed at all (live 2026-10-25: the sparse read on a 2 TiB host opened
     # no incident in the window and the variant read FAIL with no proof the
-    # cache was ever high). It only measures; the fill below is unchanged.
+    # cache was ever high) and when it began: the fill ramps for minutes on a
+    # 2 TiB host, so the load is held, and detection timed, from the moment the
+    # oracle reads the threshold, as ``low_available_memory`` does.
     oracle = Oracle(ctx, "cache")
-    oracle.start(hold + 120, interval=PAGE_CACHE_ORACLE_INTERVAL, meminfo=True)
+    oracle.start(ramp + hold + 120, interval=PAGE_CACHE_ORACLE_INTERVAL, meminfo=True)
     opened = ctx.node(
         "page-cache-start",
         "--fraction",
         "0.92",
         "--seconds",
-        str(hold + 120),
+        str(ramp + hold + 120),
         "--backing",
         root,
     )
     ctx.cleanup.push("page-cache", lambda: ctx.node("page-cache-stop"))
-    ctx.evidence.write("page-cache-start", opened)
+    ctx.evidence.write(
+        "page-cache-start",
+        {
+            **opened,
+            "ramp_budget_seconds": ramp,
+            "detection_budget_seconds": hold,
+            "host_summary_seconds": ctx.host_summary,
+            "host_interval_seconds": ctx.host_interval,
+        },
+    )
+
+    def ramped() -> bool | None:
+        oracle.read()
+        values = oracle_values(
+            oracle.records, lambda record: record.get("page_cache_percent")
+        )
+        return True if values and values[-1] >= PAGE_CACHE_THRESHOLD else None
+
+    if not ctx.wait_until(
+        ramped, timeout_seconds=ramp, poll_seconds=15, name="page-cache-ramp"
+    ):
+        values = oracle_values(
+            oracle.records, lambda record: record.get("page_cache_percent")
+        )
+        raise VariantInconclusive(
+            f"condition not established: the sparse read did not bring "
+            f"page_cache_percent to {PAGE_CACHE_THRESHOLD:g} % within {ramp} s "
+            f"(last {[round(value, 1) for value in values[-6:]]})"
+        )
     detection = wait_for_incident(
         ctx,
         started,
@@ -747,10 +811,12 @@ VARIANTS = [
     ),
     _spec(
         "high_page_cache",
-        "read a sparse file so page cache stays >= 90 % for 300 s",
+        "read a sparse file so page cache stays >= 90 %; detection is timed from the "
+        "oracle's crossing over two host health summaries",
         "HIGH_PAGE_CACHE -> VALIDATE_HOST; memory_used stays low (cache is reclaimable)",
         high_page_cache,
         risk="M",
+        max_minutes=45,
     ),
     _spec(
         "scratch_full",

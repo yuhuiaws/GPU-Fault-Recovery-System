@@ -142,7 +142,13 @@ incident 常在两次轮询之间就以 `diagnostic inconclusive` 关闭为 `REC
 `high_page_cache` 以运行器自带的 meminfo oracle（产品公式
 (Cached+SReclaimable−Shmem)/MemTotal）确认条件：`page_cache_percent` 未在 300 秒
 持续窗口内一直 ≥90% 即 `INCONCLUSIVE`（condition not established），只有条件成立
-而产品没有 finding 才记 `FAIL`。
+而产品没有 finding 才记 `FAIL`。检测计时从 oracle 首次读到阈值起算（填充的 ramp
+另有预算，超时同样 `INCONCLUSIVE`），预算按产品节奏取自节点的采集器环境：主机
+collector 对持续类越界只在越界边沿投递一次，之后只随健康摘要
+（`GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS`）投递，控制面要在首个活跃样本之后至少
+300 秒的又一个活跃样本上才铸造 finding，VALIDATE_HOST 再等一次更新的证据，故预算 =
+300 秒 + 2×摘要周期 + 采集间隔 + 余量；填充与 oracle 的存活时间覆盖 ramp 与检测。
+任何变体在没有 incident 时不做 settled 等待（只读一次）。
 `gpu_idle`/`rank_cpu_idle` 断言产品对空闲 attempt 的处置：FREEZE_EVIDENCE 后
 VALIDATE_GPU/VALIDATE_HOST 携带绑定指标的 `host_diagnostic_probe`（≤5%），attempt
 仍空闲时探针必须失败并指出 `host_diagnostic:<指标>`，workflow FAILED，incident 以
