@@ -46,7 +46,7 @@
 | 012 | GPU 掉卡 | 部分 | COLLECT-003/004 和采集超时测试；NVML 失败且 `/proc/driver/nvidia/gpus` 不存在/不可读为 UNKNOWN（`INVENTORY_UNAVAILABLE`），不再生成 REBOOT_NODE（SW-003 `gpu-unknown`）；真实掉卡、配置错配仍须分开真机验收 |
 | 013 | EFA 掉卡 | 部分 | OBS-003 防读取失败误重启；COLLECT-017 只覆盖部分真实分层恢复；PCI/link 全分支仍缺 |
 | 014 | K8s allocatable 少报 | 保留 | COLLECT-017/DESTR-021 有 runner；MIG/time-slicing 与全部归因场景仍缺 |
-| 015 | BMC 传感器告警 | 部分 | 新增 SW-002/003 覆盖标准四列和失败查询；具体传感器影响级别仍缺 |
+| 015 | BMC 传感器告警 | 部分 | 新增 SW-002/003 覆盖标准四列和失败查询；告警传感器的名称/读数/阈值随样本标签进入 finding reason、incident、marker 与邮件，全 `na` 表为 UNKNOWN，无 `ipmitool`/无 IPMI 设备为 `bmc_status_unsupported`；具体传感器影响级别仍缺 |
 | 016 | 日志：MCE / 存储只读 / RDMA 致命 / 内核 lockup | 已改/待真机 | FIX-016：可信内核来源与新鲜任务归属后先停任务再隔离；未归属不猜测停训对象 |
 | 017 | 日志：OOM / NCCL / torch.distributed 错误 | 已改/待真机 | FIX-017：保留 PID/容器元数据，区分 LIVE/EXITED/UNKNOWN；取证后人工复核，不以 Fabric 健康宣告应用修复 |
 | 018 | GPU 温度 | 已改/待真机 | FIX-018：连续三个有效严重样本后隔离/停任务/人工复核，绝对关机温度越界立即保护；空闲降温不自动接纳 |

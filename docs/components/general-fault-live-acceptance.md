@@ -809,17 +809,27 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   `command_failure`（live-replay，模块 `general_live_bmc`，两条车道，需 `HOST_SOURCE_REPLAY`；
   `install-wrapper --allow-missing-real`：EC2 无 BMC 也无 `ipmitool`，shim 只按计划回答
   `ipmitool sensor` 的整段输出/退出码，其他调用一律 command not found，绝不编造 BMC）：
-  `critical`（两行 cr）/`nonrecoverable`（一行 nr）→ `bmc_critical_sensor` = cr/nr 行数 →
-  MARK_UNSCHEDULABLE + QUARANTINE 一条 incident，随后同一包装器改供健康表、产品读到 0
-  （recovered），再关窗、受控恢复；`wrong_column`（cr/nr 出现在名称/值/单位列、三列残行）与
-  `unavailable_sensor`（一行 na/na）须是 `bmc_critical_sensor=0`、无采集错误、无 finding、
-  无隔离；`command_failure`（退出码 1 “Could not open device”）须是 `_bmc` 采集错误且无样本。
-  `critical` 登记为预期 FAIL：产品的 `bmc_critical_sensor` 只是计数，告警不带传感器名称与
-  阈值范围（`product_gap` 指向 `collectors/host/system_metrics.py _bmc`；产品修复后该变体自然
-  转 PASS）。`unsupported_bmc` 是只读 observation（如 002 `no_swap`）：记录 `ipmitool` 是否
-  安装、产品在窗口内无 BMC 样本与 finding 即为能力记录；若 `ipmitool` 存在而无 BMC 导致每 tick
-  `_bmc` 采集错误记 FAIL（永久能力缺口不应是采集错误）；若节点真的有 BMC 应答则 BLOCKED
-  （该变体不适用）。`healthy` 仍 `NOT_RUN(CAPABILITY_ABSENT)`。
+  `critical`（两行 cr）/`nonrecoverable`（一行 nr）→ `bmc_critical_sensor` = 处于 cr/nr 的
+  传感器数（同名重复行只计一次）→ MARK_UNSCHEDULABLE + QUARANTINE 一条 incident，随后同一
+  包装器改供健康表、产品读到 0（recovered），再关窗、受控恢复。`sensor_identity` 阶段要求每个
+  告警传感器的名称出现在三处：样本标签 `sensors`（`sensor_alerts` 另带读数、单位、状态和
+  ipmitool 打印的阈值列）、该 finding 所开 incident 的 `reasons`（即 QUARANTINE 步骤硬件升级
+  邮件所列文字，形如 `BMC reports 2 critical sensors: CPU1 Temp=96.000 degrees C [cr; unc
+  90.000, ucr 95.000, unr 100.000]; Fan1=...`）和该 incident marker 的 `raw_reason`；
+  旧的裸计数在三处都不命名传感器，即为 FAIL。`wrong_column`（cr/nr 出现在名称/值/单位列、
+  三列残行）与 `unavailable_sensor`（一行 na/na）须是 `bmc_critical_sensor=0`、无标签、无采集
+  错误、无 finding、无隔离（全部行均为 na 的表在产品里是 UNKNOWN——`_bmc` 采集错误且无样本，
+  软件测试覆盖）。`command_failure` 分两段：先让 `ipmitool sensor` 以 BMC 无应答的方式退出
+  （退出码 1 “Get Device ID command failed”）→ 须是含 “BMC sensor query failed” 的 `_bmc`
+  采集错误、无样本、无 `bmc_status_unsupported`、无 finding；再 replan 为无 IPMI 设备节点
+  的退出（退出码 1 “Could not open device at /dev/ipmi0 ...: No such file or directory”，
+  即 EC2 上已安装 `ipmitool` 的真实输出）→ 须读到 `bmc_status_unsupported`（`reason=NO_DEVICE`）
+  且采集错误停止、仍无样本无 finding。`unsupported_bmc` 是只读 observation（如 002
+  `no_swap`）：记录 `ipmitool` 是否安装，等待一个 health summary 周期读产品自己的能力标记——
+  无 `ipmitool` 须为 `bmc_status_unsupported` TOOL_MISSING，有 `ipmitool` 无 BMC 须为
+  NO_DEVICE——且无 BMC 样本、无 `_bmc` 采集错误、无 finding；缺标记或仍每 tick `_bmc`
+  采集错误记 FAIL（永久能力缺口不是采集错误）；若节点真的有 BMC 应答则 BLOCKED（该变体
+  不适用）。`healthy` 仍 `NOT_RUN(CAPABILITY_ABSENT)`。
 
 - 010 EFA/RDMA 计数（模块 `general_live_efa`，复用夹具 `general_live_efa_fixture`，8 个变体
   全部 `live-replay`，需 `HOST_SOURCE_REPLAY`，eks/hp 两车道）。每个变体先用共享回放器的

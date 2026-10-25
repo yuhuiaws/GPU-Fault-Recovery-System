@@ -29,8 +29,17 @@ training, thermal, spare-health or RMA policies from that review.
   as well as ACTIVE contexts. The control plane still requires one fresh,
   authoritative managed attempt; an explicit IDLE collector remains excluded.
 - BMC parsing uses the fourth `ipmitool sensor` column (status), not the third
-  column (units). A failed query or a response without sensor rows is a
-  collection error, not a healthy zero.
+  column (units). A failed query, a response without sensor rows or a table
+  whose every status is `na` is a collection error, not a healthy zero. A
+  count ≥1 names the alerting sensors on the sample (`sensors`,
+  `sensor_alerts`: reading, units, status, the threshold columns printed), and
+  `bmc_critical_sensor_rule` writes them into the finding reason, so the
+  incident reasons, the marker and the hardware escalation mail name them
+  instead of a bare "2". BMC the node cannot provide -- no `ipmitool`, or an
+  `ipmitool` that finds no IPMI device node and none exists (EC2) -- is
+  `bmc_status_unsupported` (TOOL_MISSING / NO_DEVICE) with no collection
+  error, like SMART's; it used to be a `_bmc` error on every tick that held
+  host validation forever.
 - SMART query failures are `smart_query_failed` plus a collection error and
   are retried, rather than masquerading as `smart_health_failed` and causing
   hardware quarantine. Genuine failed self-assessments remain unchanged. A

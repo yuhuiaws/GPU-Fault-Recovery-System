@@ -1307,12 +1307,25 @@ and every variant closes its window and proves the real tool answers again. A
 replay proves the processing chain only -- no drive fails and no BMC exists, so
 `proof_scope` is `live-replay`; the OPEN_FAILED drive and a hung `-H` query stay
 software-tested; 015 `unavailable_sensor` uses one `na` row among healthy ones
-(a table of only `na` rows reads 0 in the product; not exercised). 015 `critical`
-is registered as an expected FAIL: `_bmc` reports a bare count, so the alert
-never names the critical sensors or their thresholds (spec 015). 015
-`unsupported_bmc` is the read-only capability record of the BMC-less site (like
-002 `no_swap`): FAIL only if an installed `ipmitool` without a BMC makes the
-product report a permanent `_bmc` collection error, BLOCKED if a BMC answers.
+(a table of only `na` rows is UNKNOWN in the product -- a `_bmc` collection
+error and no sample -- and stays software-tested). 015 `critical` and
+`nonrecoverable` demand the sensors' identity where the product keeps it: the
+`bmc_critical_sensor` sample's `sensors` / `sensor_alerts` labels (name,
+reading, units, status and the threshold columns ipmitool printed), the
+incident `reasons` (`BMC reports 2 critical sensors: CPU1 Temp=96.000 degrees C
+[cr; unc 90.000, ucr 95.000, unr 100.000]; Fan1=...`, the text the QUARANTINE
+step's hardware escalation mail lists) and the marker `raw_reason`; the bare
+count the collector used to post names nothing and was the registered gap. 015
+`command_failure` serves two exits in turn: a BMC that does not answer (`Get
+Device ID command failed`) must be a `_bmc` collection error with no sample, a
+host without an IPMI device node (`Could not open device at /dev/ipmi0 ...: No
+such file or directory`, what an installed `ipmitool` prints on EC2) must be
+`bmc_status_unsupported` NO_DEVICE with the error gone. 015 `unsupported_bmc` is
+the read-only capability record of the BMC-less site (like 002 `no_swap`): the
+product must mark the node `bmc_status_unsupported` TOOL_MISSING (no
+`ipmitool`) or NO_DEVICE (`ipmitool`, no BMC) on its routine host batches with
+no `_bmc` collection error; FAIL without the marker or with the permanent
+error, BLOCKED if a BMC answers.
 
 The 010 EFA/RDMA counter variants are wired on the shared host source replay
 (`scripts/e2e/regional/general_live_efa.py` on the reusable
