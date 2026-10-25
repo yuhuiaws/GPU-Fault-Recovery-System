@@ -51,7 +51,15 @@ def override_environment(tmp_path: Path) -> dict[str, str]:
                 elif kind == "configmap" and name == "old-bundle":
                     print(json.dumps({"binaryData": {"gpu-fault-node-installer-0.10.0.tar.gz": ""}}))
                 elif kind == "configmap" and name == "old-wheel":
-                    print(json.dumps({"binaryData": {"executor.whl": ""}}))
+                    if os.environ.get("TEST_WHEEL_LAYOUT") == "chunked":
+                        # A wheel past the 1 MiB ceiling: the named ConfigMap
+                        # holds only the manifest of its chunked set.
+                        print(json.dumps({"data": {"artifact.json": json.dumps({
+                            "schema_version": 1, "artifact": "executor.whl",
+                            "parts": [{"config_map": "old-wheel-part-0"}],
+                        })}}))
+                    else:
+                        print(json.dumps({"binaryData": {"executor.whl": ""}}))
                 elif kind == "secret":
                     if name == "gpu-fault-node-action-keys":
                         data = {"node-a": "fixture-key-material-not-used-by-any-service"}
@@ -336,4 +344,24 @@ def test_restore_preserves_the_old_pin_and_actual_dependency_identity(
     assert (
         records(tmp_path, "admissions.jsonl")[0]["text"]
         == (tmp_path / "selected.yaml").read_bytes().decode()
+    )
+
+
+def test_a_chunked_executor_wheel_set_passes_the_candidate_wheel_check(
+    override_environment: dict[str, str], tmp_path: Path
+) -> None:
+    """A wheel past the 1 MiB ConfigMap ceiling leaves only ``artifact.json`` in
+    the named ConfigMap; the script must recognise the wheel through the
+    manifest instead of demanding a ``<wheel>`` or ``<wheel>.xz`` key."""
+    result = run_override(
+        {
+            **override_environment,
+            "GPU_FAULT_RECONCILER_PREFLIGHT_ONLY": "true",
+            "TEST_WHEEL_LAYOUT": "chunked",
+        }
+    )
+    assert result.returncode == 0, result.stderr
+    assert "missing the candidate Executor wheel" not in result.stderr
+    assert (tmp_path / "batch.json").exists(), (
+        "the preflight did not reach the node batch"
     )

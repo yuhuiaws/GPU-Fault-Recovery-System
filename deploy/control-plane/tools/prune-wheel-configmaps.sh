@@ -79,9 +79,16 @@ protected_explicit = {
     if item.strip()
 }
 
-# Only the shape deploy.sh generates. Anything else was pinned by hand.
+# Only the shape deploy.sh and the release engine generate. Anything else was
+# pinned by hand. A wheel whose xz stream outgrew the 1 MiB ConfigMap ceiling
+# ships as a chunked set: the named ConfigMap carries artifact.json and the
+# slices live in <name>-part-<k> (gpu_fault.admin.artifact_configmaps). A part
+# is never mounted by a workload, so it is judged with its set: kept while the
+# named ConfigMap is kept, pruned with it, and pruned when the named ConfigMap
+# is already gone (an upload interrupted before its manifest).
 generated = re.compile(
-    r"^gpu-fault-(?:control-plane|executor)-wheel-[0-9a-z]+-[0-9a-f]{12}$"
+    r"^(?P<primary>gpu-fault-(?:control-plane|executor)-wheel-[0-9a-z]+-[0-9a-f]{12})"
+    r"(?:-part-[0-9]+)?$"
 )
 
 with open(f"{work_dir}/configmaps.json") as handle:
@@ -128,6 +135,8 @@ for workload in workloads:
 
 candidates = []
 protected_manual = []
+# Parts by the named ConfigMap they belong to, whether or not it still exists.
+parts_of = {}
 for config_map in configmaps:
     name = config_map["metadata"]["name"]
     if not any(
@@ -135,12 +144,23 @@ for config_map in configmaps:
         for marker in ("control-plane-wheel", "executor-wheel")
     ):
         continue
-    if not generated.match(name):
+    match = generated.match(name)
+    if match is None:
         protected_manual.append(name)
         continue
-    candidates.append(
-        (config_map["metadata"]["creationTimestamp"], name)
-    )
+    created = config_map["metadata"]["creationTimestamp"]
+    if match.group("primary") != name:
+        parts_of.setdefault(match.group("primary"), []).append((created, name))
+        continue
+    candidates.append((created, name))
+
+# A set whose named ConfigMap is gone has no holder and no manifest: it is a
+# candidate in its own right so its parts are reclaimed, ranked by its oldest
+# part so a fresh interrupted upload still counts as recent.
+named = {name for _, name in candidates}
+for primary, parts in parts_of.items():
+    if primary not in named:
+        candidates.append((min(parts)[0], primary))
 
 candidates.sort()
 recent = {name for _, name in candidates[-keep_recent:]}
@@ -149,24 +169,36 @@ lines = []
 kept = []
 for created, name in candidates:
     holders = sorted(referenced.get(name, ()))
+    parts = sorted(part for _, part in parts_of.get(name, ()))
     if name in protected_explicit:
-        kept.append((name, created, "explicitly protected"))
+        reason = "explicitly protected"
     elif holders:
-        kept.append((name, created, "referenced by " + ", ".join(holders)))
+        reason = "referenced by " + ", ".join(holders)
     elif name in recent:
-        kept.append((name, created, f"within newest {keep_recent}"))
+        reason = f"within newest {keep_recent}"
     else:
-        lines.append(name)
+        reason = None
+    if reason is None:
+        if name in named:
+            lines.append(name)
+        lines.extend(parts)
+        continue
+    if name in named:
+        kept.append((name, created, reason))
+    for part in parts:
+        kept.append((part, created, f"part of {name}"))
 
-print(f"namespace wheel ConfigMaps: {len(candidates)} generated, "
+print(f"namespace wheel ConfigMaps: {len(named)} generated, "
+      f"{sum(len(parts) for parts in parts_of.values())} parts, "
       f"{len(protected_manual)} hand-pinned (never pruned)")
 print(f"keep: {len(kept)}")
 for name, created, reason in kept:
     print(f"  KEEP   {name}  {created}  ({reason})")
 print(f"prune: {len(lines)}")
 for created, name in candidates:
-    if name in lines:
-        print(f"  PRUNE  {name}  {created}")
+    for item in [name] + sorted(part for _, part in parts_of.get(name, ())):
+        if item in lines:
+            print(f"  PRUNE  {item}  {created}")
 
 with open(os.environ["PLAN"], "w") as handle:
     handle.write("\n".join(lines))

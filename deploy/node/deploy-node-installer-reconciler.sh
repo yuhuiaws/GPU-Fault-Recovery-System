@@ -327,10 +327,26 @@ import json
 import sys
 
 document = json.load(sys.stdin)
-keys = set((document.get("data") or {})) | set(document.get("binaryData") or {})
-# The release engine stores wheels xz-compressed (<wheel>.xz) to stay under the
-# 1 MiB ConfigMap ceiling; older ConfigMaps hold the raw wheel under its name.
-if sys.argv[1] not in keys and sys.argv[1] + ".xz" not in keys:
+data = document.get("data") or {}
+keys = set(data) | set(document.get("binaryData") or {})
+# The release engine stores a wheel xz-compressed (<wheel>.xz) while that fits
+# the 1 MiB ConfigMap ceiling and as a chunked set past it: the named ConfigMap
+# then carries only artifact.json, whose "artifact" field names the wheel and
+# whose parts live in <name>-part-<k> (gpu_fault.admin.artifact_configmaps).
+# Older ConfigMaps hold the raw wheel under its name.
+manifest = {}
+if isinstance(data.get("artifact.json"), str):
+    try:
+        manifest = json.loads(data["artifact.json"])
+    except ValueError:
+        raise SystemExit("wheel ConfigMap artifact.json is not JSON")
+    if not isinstance(manifest, dict):
+        raise SystemExit("wheel ConfigMap artifact.json is not an object")
+if (
+    sys.argv[1] not in keys
+    and sys.argv[1] + ".xz" not in keys
+    and manifest.get("artifact") != sys.argv[1]
+):
     raise SystemExit("wheel ConfigMap is missing the candidate Executor wheel")
 ' "${EXECUTOR_WHEEL_FILENAME}"
 kubectl_context -n "${NAMESPACE}" get secret \
