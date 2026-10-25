@@ -8,6 +8,7 @@ from gpu_fault.host_health import (
     NodeHealthIngestionResult,
 )
 from gpu_fault.models import AdvisoryNotification, RecoveryAction
+from gpu_fault.shared_storage_failure_domain import SHARED_FILESYSTEM_METRIC
 
 #: Findings that exist to put a human in the loop rather than to drive a
 #: recovery: an unparsable fault line, a GPU whose identity changed under the
@@ -107,6 +108,17 @@ class NodeHealthIngestionService:
             incidents.append(incident.incident_id)
             if workflow is not None:
                 workflows.append(workflow.request_id)
+            if finding.metric_name == SHARED_FILESYSTEM_METRIC:
+                # Additive: the per-node chain above is untouched; this only
+                # records the export's common failure domain when peers
+                # report the same export unavailable (one notification).
+                correlator = getattr(self.context, "shared_storage_domains", None)
+                if correlator is not None:
+                    _domain, notification_id = correlator.observe_finding(
+                        finding, incident
+                    )
+                    if notification_id is not None:
+                        notifications.append(notification_id)
             if finding.metric_name in {
                 "gpu_inventory_mismatch",
                 "efa_inventory_mismatch",

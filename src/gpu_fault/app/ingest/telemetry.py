@@ -250,7 +250,23 @@ class TelemetryIngestionService:
                 payload=batch.model_dump(mode="json"),
                 observations=observations,
             )
-        return batch, self.node_health.ingest(batch.batch_id, findings)
+        result = self.node_health.ingest(batch.batch_id, findings)
+        # Shared-storage failure domains are kept in the same transaction: a
+        # reading of "available" settles the record this node belongs to, a
+        # repeated "unavailable" re-checks for peers (shared_storage_failure_domain).
+        correlator = getattr(self.context, "shared_storage_domains", None)
+        if correlator is not None:
+            domain_notifications = correlator.observe_batch(batch, findings)
+            if domain_notifications:
+                result = result.model_copy(
+                    update={
+                        "notification_ids": [
+                            *result.notification_ids,
+                            *domain_notifications,
+                        ]
+                    }
+                )
+        return batch, result
 
     def _finish_host_telemetry(
         self, batch: HostTelemetryBatch, result: NodeHealthIngestionResult

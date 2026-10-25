@@ -79,6 +79,9 @@ from gpu_fault.orchestration.incident_closure import IncidentClosureService
 from gpu_fault.passive import PassiveWorkflowCompiler
 from gpu_fault.policy import GpuFaultPolicyEngine
 from gpu_fault.regional import RegionalRemoteWorkflowAdapter
+from gpu_fault.shared_storage_failure_domain import (
+    SharedStorageFailureDomainCorrelator,
+)
 from gpu_fault.remote_step_batching import RemoteStepBatchingPolicy
 from gpu_fault.regional_registry import (
     configured_regional_registrations,
@@ -474,6 +477,9 @@ class ApplicationContext:
         self.advisory_notifications = AdvisoryNotificationService(
             self.store,
             notification_notifier or notification_notifier_from_environment(),
+        )
+        self.shared_storage_domains = SharedStorageFailureDomainCorrelator(
+            self.store, self.advisory_notifications.send
         )
         if not self.production_executor_config.enabled:
             self.store.save_profile(default_simulated_profile())

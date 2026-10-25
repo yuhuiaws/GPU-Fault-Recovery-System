@@ -1343,4 +1343,17 @@ class NodeHealthPolicy:
 
     @staticmethod
     def _safe(value: str) -> str:
-        return re.sub(r"[^a-zA-Z0-9_.-]+", "-", value)[:160]
+        return event_id_component(value)
+
+
+def event_id_component(value: str) -> str:
+    """One ``-``-joined component of a metric finding's event id.
+
+    ``<batch>-<metric>-<device|node>`` is the shape every metric rule mints;
+    the device (a mount point, an interface) is reduced to this alphabet so a
+    reader that has the device in hand can recognise the incident the rule
+    opened for it (``shared_storage_failure_domain`` matches the per-node
+    ``shared_filesystem_unavailable`` incidents of a peer this way).
+    """
+
+    return re.sub(r"[^a-zA-Z0-9_.-]+", "-", value)[:160]
