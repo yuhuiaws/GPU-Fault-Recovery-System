@@ -18,6 +18,7 @@ from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
 from gpu_fault.collectors.host.inventory import HostInventoryMixin
 from gpu_fault.collectors.host.network import HostNetworkMixin
 from gpu_fault.collectors.host.observation import HostObservationError
+from gpu_fault.collectors.host.shared_filesystems import HostSharedFilesystemsMixin
 from gpu_fault.collectors.host.shared_mounts import (
     SharedMountMemory,
     read_directory_entry,
@@ -101,6 +102,7 @@ class HostTelemetryCollector(
     HostGpuRankMixin,
     HostInventoryMixin,
     HostNetworkMixin,
+    HostSharedFilesystemsMixin,
     HostSystemMetricsMixin,
     HostBmcMixin,
 ):
