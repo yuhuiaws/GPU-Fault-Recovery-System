@@ -401,3 +401,83 @@ def test_fill_and_unfill_snippets_are_statvfs_driven(tmp_path: Path) -> None:
     assert not (tmp_path / "gfrs-fill.bin").exists(), (
         "(tmp_path / 'gfrs-fill.bin').exists() is still present"
     )
+
+
+# --------------------------------------------------------------------------- #
+# mount failures (live attempt 5: every variant stopped on a withheld message)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    ("stderr", "needle"),
+    [
+        (
+            "mount.nfs4: mounting 10.0.9.7:/a failed, reason given by server: "
+            "No such file or directory",
+            "ENOENT",
+        ),
+        ("mount.nfs4: access denied by server while mounting 10.0.9.7:/a", "denied"),
+        ("mount.nfs4: Connection refused", "refused"),
+        ("mount.nfs4: Connection timed out", "timed out"),
+        ("mount.nfs4: No route to host", "route"),
+        ("mount.nfs4: Operation not permitted", "privilege"),
+        ("mount: /mnt/x: unknown filesystem type 'nfs4'.", "nfsv4 module"),
+        ("mount.nfs4: Protocol not supported", "not supported"),
+        ("mount.nfs4: an incorrect mount option was specified", "options"),
+        ("something new from /secret/path token=abc", "unclassified"),
+    ],
+    ids=[
+        "enoent",
+        "denied",
+        "refused",
+        "timeout",
+        "route",
+        "eperm",
+        "fstype",
+        "proto",
+        "options",
+        "unknown",
+    ],
+)
+def test_a_failed_mount_names_its_cause_in_a_constant_sentence(
+    host: FakeHost, stderr: str, needle: str
+) -> None:
+    """The mount helper's stderr never leaves the node; the probe classifies it
+    into one constant sentence (``error_kind: nfs_mount``) the runner may show,
+    so a verdict reads e.g. "export server answered ENOENT" instead of a digest.
+    """
+
+    def failing(inner: list[str]) -> tuple[int, str, str]:
+        if inner[0] == "mount":
+            return 32, "", stderr
+        code, out = host.answer(inner)
+        return code, out, ""
+
+    def run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        command = list(command)
+        host.calls.append(command)
+        inner = command[len(NS) :] if command[: len(NS)] == NS else command
+        code, out, err = failing(inner)
+        return subprocess.CompletedProcess(command, code, stdout=out, stderr=err)
+
+    sharedp.subprocess.run = run  # type: ignore[attr-defined]
+    assert sharedp.main(mount()) == 1, host.emitted[-1]
+    result = host.emitted[-1]
+    assert result["error_kind"] == "nfs_mount", result
+    assert result["error_class"] == "MountError", result
+    message = result["message"]
+    assert needle.casefold() in message.casefold(), (message, stderr)
+    assert message == sharedp.classify_mount_failure(stderr), (message, stderr)
+    assert sharedp.CONSTANT_MESSAGE.fullmatch(message), message
+    for secret in ("10.0.9.7", "/mnt", "/secret", "token"):
+        assert secret not in message, message
+    assert result["error_site"].startswith("nfs_mount:"), result
+    state = sharedp.load_state(RUN_ID)
+    assert state["mounts"]["shared"]["mounted"] is False, "recorded, never mounted"
+    assert DEADMAN in host.timers, "the deadman stays armed until cleanup"
+
+
+def test_every_mount_failure_sentence_is_constant_and_distinct() -> None:
+    sentences = [sentence for _needles, sentence in sharedp.MOUNT_FAILURE_REASONS]
+    sentences.append(sharedp.MOUNT_FAILURE_UNCLASSIFIED)
+    assert len(set(sentences)) == len(sentences), sentences
+    for sentence in sentences:
+        assert sharedp.CONSTANT_MESSAGE.fullmatch(sentence), sentence

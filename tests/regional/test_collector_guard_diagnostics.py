@@ -223,3 +223,49 @@ def test_host_failure_surfaces_sanitized_probe_class_code_and_site(
         assert ("fm_delivery_evidence:1509" in message) is (problem != "site"), message
     assert not isinstance(caught.value, host.HostProbeMissingResponseError), message
     assert not any(fixture.cleanup().values()), "cleanup must still remove the probe"
+
+
+@pytest.mark.parametrize(
+    ("message", "exposed"),
+    [
+        (
+            "export server answered ENOENT for the export path (export not initialised or hidden)",
+            True,
+        ),
+        ("TCP/2049 connection to the export server timed out", True),
+        ("mount.nfs4: mounting 10.0.9.7:/a failed=1", False),
+        ("two\nlines", False),
+        ("x" * 161, False),
+    ],
+)
+def test_nfs_mount_sentence_is_surfaced_only_in_its_constant_shape(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, message: str, exposed: bool
+) -> None:
+    """The shared-storage probe classifies a failed ``mount -t nfs4`` into a
+    constant sentence (``error_kind: nfs_mount``); live GF-GENERAL-LIVE-005
+    attempt 5 stopped six variants on a bare digest because the mount helper's
+    reason stayed withheld. Same shape rule as the recovery refusals."""
+
+    api = ProbeApi()
+    monkeypatch.setattr(host, "run_fixture_command", api.run)
+    fixture = host_probe(tmp_path)
+    fixture.create()
+    api.probe_returncode = 1
+    api.probe_stdout = json.dumps(
+        {
+            "error": "MountError",
+            "error_kind": "nfs_mount",
+            "error_class": "MountError",
+            "error_code": "0" * 16,
+            "error_site": "nfs_mount:560",
+            "message": message,
+            "command": "nfs-mount",
+        }
+    )
+    with pytest.raises(host.HostProbeError) as caught:
+        fixture.execute("nfs-mount")
+    text = str(caught.value)
+    assert text.endswith("; output withheld"), text
+    assert (f"; nfs mount failed: {message}" in text) is exposed, text
+    if not exposed:
+        assert "nfs mount failed" not in text and message[:5] not in text, text

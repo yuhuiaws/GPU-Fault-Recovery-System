@@ -29,6 +29,14 @@ HOST_PROBE_AGENT_PYTHON = "/opt/gpu-fault/current/venv/bin/python"
 HOST_PROBE_SYSTEM_PYTHON = "/usr/bin/python3"
 
 
+#: Probe error kinds whose ``message`` is one constant sentence (no path, no
+#: credential) and the label the diagnostic shows it under.
+CONSTANT_MESSAGE_LABELS = {
+    "recovery": "recovery refused",
+    "nfs_mount": "nfs mount failed",
+}
+
+
 class HostProbeError(RuntimeError):
     pass
 
@@ -644,14 +652,16 @@ class HostProbeFixture:
                     diagnostic += f" at {site}"
             message = payload.get("message")
             if (
-                kind == "recovery"
+                kind in CONSTANT_MESSAGE_LABELS
                 and isinstance(message, str)
                 and re.fullmatch(r"[A-Za-z0-9 ,;:'()./_-]{1,160}", message)
             ):
-                # The recovery probe's refusals are constant sentences (its
-                # RecoveryError messages); a message in this shape names the
-                # refused condition and carries no path or credential.
-                diagnostic += f"; recovery refused: {message}"
+                # The recovery probe's refusals and the shared-storage probe's
+                # mount-failure classes are constant sentences; a message in
+                # this shape names the condition and carries no path or
+                # credential (the mount helper's stderr itself never leaves
+                # the node).
+                diagnostic += f"; {CONSTANT_MESSAGE_LABELS[kind]}: {message}"
             if kind == "power_identity":
                 # A power restore refused after a reboot (exit 78): the digest
                 # and site as above, plus the *kinds* of files the operation

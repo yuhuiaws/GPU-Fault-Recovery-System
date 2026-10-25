@@ -92,6 +92,80 @@ class ProbeError(RuntimeError):
     pass
 
 
+class MountError(ProbeError):
+    """``mount -t nfs4`` failed; ``reason`` is one constant sentence below."""
+
+    def __init__(self, message: str, reason: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+#: The shape the runner lets through for ``error_kind: nfs_mount`` (the same
+#: rule as the recovery probe's refusals): no '=', no newline, <= 160 chars.
+CONSTANT_MESSAGE = re.compile(r"[A-Za-z0-9 ,;:'()./_-]{1,160}")
+#: ``mount.nfs(8)`` stderr fragments -> the one constant sentence the runner
+#: shows. The stderr itself (server address, mount point) never leaves the node.
+#: Live GF-GENERAL-LIVE-005 attempt 5 stopped six variants on a bare digest; the
+#: first entry is what it hid: the server answered the path walk of the export
+#: with NFS4ERR_NOENT, which NFS-Ganesha returns for a pseudo path whose export
+#: root never initialised or that the client may not see.
+MOUNT_FAILURE_REASONS: tuple[tuple[tuple[str, ...], str], ...] = (
+    (
+        ("reason given by server: no such file or directory",),
+        "export server answered ENOENT for the export path "
+        "(export not initialised or hidden; read the export Pod log)",
+    ),
+    (
+        ("access denied by server", "permission denied"),
+        "export server denied access to the export path",
+    ),
+    (
+        ("connection refused",),
+        "TCP/2049 connection refused at the export server address",
+    ),
+    (
+        ("connection timed out", "timed out"),
+        "TCP/2049 connection to the export server timed out "
+        "(security group or network policy)",
+    ),
+    (
+        ("no route to host", "network is unreachable"),
+        "no route from the node to the export server address",
+    ),
+    (
+        ("operation not permitted",),
+        "mount(2) refused: the probe lacks mount privileges in the host namespace",
+    ),
+    (
+        ("unknown filesystem type", "wrong fs type", "no such device"),
+        "nfs4 filesystem type unavailable: nfsv4 module or mount helper missing",
+    ),
+    (
+        ("protocol not supported", "not supported"),
+        "NFSv4.1 over TCP is not supported by the export server",
+    ),
+    (
+        ("incorrect mount option", "bad option"),
+        "mount options rejected by the kernel NFS client",
+    ),
+    (
+        ("stale file handle",),
+        "export server answered a stale file handle for the export path",
+    ),
+)
+MOUNT_FAILURE_UNCLASSIFIED = "mount.nfs4 failed for an unclassified reason"
+
+
+def classify_mount_failure(stderr: str) -> str:
+    """The constant sentence for a ``mount.nfs4`` stderr; never its text."""
+
+    text = " ".join(stderr.casefold().split())
+    for needles, sentence in MOUNT_FAILURE_REASONS:
+        if any(needle in text for needle in needles):
+            return sentence
+    return MOUNT_FAILURE_UNCLASSIFIED
+
+
 def utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -555,10 +629,15 @@ def nfs_mount(arguments: argparse.Namespace) -> None:
         if not module_loaded(NFS_MODULE):
             raise ProbeError(f"{NFS_MODULE} could not be loaded")
     target.mkdir(mode=0o755, parents=True, exist_ok=True)
-    host_command(
-        ["mount", "-t", "nfs4", "-o", options, f"{server}:{export}", str(target)],
-        timeout=MOUNT_SECONDS,
-    )
+    command = ["mount", "-t", "nfs4", "-o", options, f"{server}:{export}", str(target)]
+    completed = host_command(command, check=False, timeout=MOUNT_SECONDS)
+    if completed.returncode:
+        stderr = completed.stderr.strip()
+        raise MountError(
+            f"command failed ({completed.returncode}): "
+            f"{shlex.join([*HOST_NAMESPACES, *command])}: {stderr[:300]}",
+            classify_mount_failure(stderr),
+        )
     entry = host_mount_entry(str(target))
     if entry is None or not entry["fstype"].startswith("nfs"):
         raise ProbeError("the export is not mounted in the host mount table")
@@ -878,16 +957,19 @@ def main(argv: list[str] | None = None) -> int:
     try:
         arguments.handler(arguments)
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
-        emit(
-            {
-                "error": type(exc).__name__,
-                "error_kind": "probe",
-                "error_class": type(exc).__name__,
-                "error_code": error_code(exc),
-                "error_site": exception_site(exc),
-                "command": arguments.command,
-            }
-        )
+        report: dict[str, Any] = {
+            "error": type(exc).__name__,
+            "error_kind": "probe",
+            "error_class": type(exc).__name__,
+            "error_code": error_code(exc),
+            "error_site": exception_site(exc),
+            "command": arguments.command,
+        }
+        if isinstance(exc, MountError):
+            # A classified mount failure: the constant sentence may be shown.
+            report["error_kind"] = "nfs_mount"
+            report["message"] = exc.reason
+        emit(report)
         print(f"{type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
     return 0
