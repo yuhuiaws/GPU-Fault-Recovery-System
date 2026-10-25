@@ -60,7 +60,10 @@ from scripts.e2e.regional.general_live_common import (
     await_metric_recovery,
     Oracle,
     activity,
+    await_oracle_crossing,
+    cadence_record,
     run_survey,
+    sustained_detection_budget,
     wait_for_incident,
     wait_settled,
 )
@@ -109,10 +112,8 @@ from scripts.e2e.regional.general_live_verdicts import (
 CASE = "GF-GENERAL-LIVE-002"
 USED_THRESHOLD = 95.0
 SWAP_THRESHOLD = 80.0
+#: ``host_health.py`` HOST_RESOURCE_SUSTAIN_SECONDS for memory_used_percent.
 SUSTAIN_SECONDS = 120
-#: window + summary + a few ticks, as 001: detection lands on the next
-#: delivered sample after the sustain window, up to a health-summary later.
-DETECTION_BUDGET = SUSTAIN_SECONDS + 300 + 120
 #: Hold host memory_used at about this percentage; below the probe's 97 % cap.
 TARGET_USED_PERCENT = 96.5
 #: How long the allocator may take to reach the threshold before detection is
@@ -135,10 +136,28 @@ MEMORY_METRICS = frozenset(
 #: the 80 % rule; every other meminfo line stays the node's real reading.
 SWAP_TOTAL_KB = 8 << 20
 SWAP_FREE_KB = 1 << 20
-#: The swap rule has no sustain: the first delivered breach (the baseline tick
-#: after the unit restart) mints the finding; the budget still allows a health
-#: summary for the validation to execute.
-SWAP_DETECTION_BUDGET = 300 + 120
+
+
+def detection_budget(ctx: VariantContext) -> int:
+    """The detection budget from the oracle's crossing, on the product's cadence.
+
+    ``threshold:memory_used_percent`` is shipped once, as the crossing's edge,
+    then only on health summaries; the finding needs a later active sample at
+    least 120 s after the first and VALIDATE_HOST one more summary: 120 s +
+    2 x GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS + GPU_FAULT_HOST_INTERVAL_SECONDS
+    + the chain margin (915 s on a 300-s/15-s site; the fixed 540-s budget
+    before it had no room for the validation's summary).
+    """
+
+    return sustained_detection_budget(ctx, SUSTAIN_SECONDS)
+
+
+def swap_detection_budget(ctx: VariantContext) -> int:
+    """The swap rule has no sustain: the first delivered breach (the baseline
+    tick after the unit restart) mints the finding, and only VALIDATE_HOST still
+    needs a health summary newer than itself (one summary, not two)."""
+
+    return sustained_detection_budget(ctx, 0, summaries=1)
 
 
 def _require_memory_approval(ctx: VariantContext) -> None:
@@ -168,7 +187,12 @@ def _probe_seconds(hold_seconds: int) -> int:
     return seconds
 
 
-def _run_memory_load(ctx: VariantContext, hold_seconds: int) -> Oracle:
+def _run_memory_load(
+    ctx: VariantContext, hold_seconds: int, *, budget_seconds: int
+) -> Oracle:
+    """Start the oracle and the allocator; ``memory-start.json`` records the
+    ramp and detection budgets and the cadence they came from."""
+
     seconds = _probe_seconds(hold_seconds)
     oracle = Oracle(ctx, "mem")
     oracle.start(seconds, interval=5, meminfo=True)
@@ -181,27 +205,33 @@ def _run_memory_load(ctx: VariantContext, hold_seconds: int) -> Oracle:
         "--approved",
     )
     ctx.cleanup.push("memory", lambda: ctx.node("memory-stop"))
-    ctx.evidence.write("memory-start", started)
+    ctx.evidence.write(
+        "memory-start",
+        {
+            **started,
+            **cadence_record(
+                ctx,
+                sustain_seconds=SUSTAIN_SECONDS,
+                detection_budget_seconds=budget_seconds,
+                ramp_budget_seconds=RAMP_BUDGET,
+            ),
+        },
+    )
     return oracle
 
 
 def _await_ramp(ctx: VariantContext, oracle: Oracle) -> None:
     """Wait until the oracle reads the threshold; detection is timed from there."""
 
-    def reached() -> bool | None:
-        oracle.read()
-        values = oracle_values(
-            oracle.records, lambda record: record.get("memory_used_percent")
-        )
-        return True if values and values[-1] >= USED_THRESHOLD else None
-
-    if not ctx.wait_until(
-        reached, timeout_seconds=RAMP_BUDGET, poll_seconds=15, name="memory-ramp"
-    ):
-        raise VariantInconclusive(
-            f"the allocator did not raise memory_used to {USED_THRESHOLD}% within "
-            f"{RAMP_BUDGET} s"
-        )
+    await_oracle_crossing(
+        ctx,
+        oracle,
+        lambda record: record.get("memory_used_percent"),
+        lambda values: bool(values) and values[-1] >= USED_THRESHOLD,
+        timeout_seconds=RAMP_BUDGET,
+        name="memory-ramp",
+        condition=f"the allocator did not raise memory_used to {USED_THRESHOLD:g}%",
+    )
 
 
 def _oracle_used_each_tick(oracle: Oracle, minimum: int) -> None:
@@ -221,25 +251,29 @@ def memory_pressure(ctx: VariantContext) -> dict[str, Any]:
     require_tools(survey, "systemd-run")
     _require_memory_approval(ctx)
     started_at = utc_now()
-    hold = RAMP_BUDGET + DETECTION_BUDGET + 240
-    oracle = _run_memory_load(ctx, hold)
+    budget = detection_budget(ctx)
+    # The allocator outlives the ramp, the detection budget and the chain's
+    # grading: VALIDATE_HOST must still find the host under pressure.
+    hold = RAMP_BUDGET + budget + 240
+    oracle = _run_memory_load(ctx, hold, budget_seconds=budget)
     _await_ramp(ctx, oracle)
+    # One wait for the finding and its VALIDATE_HOST to be judgeable, timed
+    # from the oracle's crossing: the validation waits for evidence newer than
+    # itself, one more health summary.
     detection = wait_for_incident(
         ctx,
         started_at,
         "memory_used_percent",
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=budget,
         metrics={"memory_used_percent", "memory_available_percent"},
+        validation="VALIDATE_HOST",
         name="memory-detection",
     )
     _oracle_used_each_tick(oracle, minimum=SUSTAIN_SECONDS // 5)
     incidents = finding_incidents(detection, "memory_used_percent")
-    observed = _await_validate_host(
-        ctx, started_at, "memory_used_percent", name="memory-validate"
-    )
     stages = {
         "chain": chain_errors(
-            observed,
+            detection,
             ChainExpectation(
                 metric="memory_used_percent",
                 operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
@@ -249,7 +283,7 @@ def memory_pressure(ctx: VariantContext) -> dict[str, Any]:
                 incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
-        "hardware": hardware_errors(observed),
+        "hardware": hardware_errors(detection),
     }
     stopped_at = utc_now()
     ctx.node("memory-stop")
@@ -260,7 +294,7 @@ def memory_pressure(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started_at,
         [item["incident_id"] for item in incidents],
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=budget,
         metrics={"memory_used_percent"},
         name="memory-settled",
     )
@@ -276,14 +310,15 @@ def recovery(ctx: VariantContext) -> dict[str, Any]:
     require_tools(survey, "systemd-run")
     _require_memory_approval(ctx)
     started_at = utc_now()
-    hold = RAMP_BUDGET + DETECTION_BUDGET + 60
-    oracle = _run_memory_load(ctx, hold)
+    budget = detection_budget(ctx)
+    hold = RAMP_BUDGET + budget + 60
+    oracle = _run_memory_load(ctx, hold, budget_seconds=budget)
     _await_ramp(ctx, oracle)
     detection = wait_for_incident(
         ctx,
         started_at,
         "memory_used_percent",
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=budget,
         metrics={"memory_used_percent"},
         name="recovery-detection",
     )
@@ -297,7 +332,7 @@ def recovery(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started_at,
         [item["incident_id"] for item in incidents],
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=budget,
         metrics={"memory_used_percent"},
         name="recovery-settled",
     )
@@ -766,12 +801,15 @@ def swap_pressure(ctx: VariantContext) -> dict[str, Any]:
         [(MEMINFO_FIXTURE, "/proc/meminfo")], restore_seconds=ctx.spec.max_minutes * 60
     )
     ctx.evidence.write("source-window-open", opened)
+    # The finding is the restarted collector's first (baseline) batch; the one
+    # wait also covers VALIDATE_HOST, judged on the health summary after it.
     detection = wait_for_incident(
         ctx,
         started_at,
         "swap_used_percent",
-        timeout_seconds=SWAP_DETECTION_BUDGET,
+        timeout_seconds=swap_detection_budget(ctx),
         metrics=MEMORY_METRICS,
+        validation="VALIDATE_HOST",
         name="swap-detection",
     )
     swap_samples = [
@@ -791,12 +829,9 @@ def swap_pressure(ctx: VariantContext) -> dict[str, Any]:
         source="meminfo",
     )
     incidents = finding_incidents(detection, "swap_used_percent")
-    observed = _await_validate_host(
-        ctx, started_at, "swap_used_percent", name="swap-validate"
-    )
     stages = {
         "chain": chain_errors(
-            observed,
+            detection,
             ChainExpectation(
                 metric="swap_used_percent",
                 operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
@@ -807,9 +842,9 @@ def swap_pressure(ctx: VariantContext) -> dict[str, Any]:
             ),
         ),
         "no_memory_finding": chain_errors(
-            observed, ChainExpectation(metric="memory_used_percent", present=False)
+            detection, ChainExpectation(metric="memory_used_percent", present=False)
         ),
-        "hardware": hardware_errors(observed),
+        "hardware": hardware_errors(detection),
     }
     stopped_at = utc_now()
     ctx.evidence.write("source-window-close", replay.close())
@@ -821,7 +856,7 @@ def swap_pressure(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started_at,
         [item["incident_id"] for item in incidents],
-        timeout_seconds=SWAP_DETECTION_BUDGET,
+        timeout_seconds=swap_detection_budget(ctx),
         metrics=MEMORY_METRICS,
         name="swap-settled",
     )
@@ -844,30 +879,6 @@ def swap_pressure(ctx: VariantContext) -> dict[str, Any]:
 # --------------------------------------------------------------------------- #
 # shared helpers
 # --------------------------------------------------------------------------- #
-def _await_validate_host(
-    ctx: VariantContext, since: datetime, metric: str, *, name: str
-) -> dict[str, Any]:
-    """The activity once ``metric``'s incident executed VALIDATE_HOST (or the budget)."""
-
-    def validated() -> dict[str, Any] | None:
-        current = activity(ctx, since, metrics={metric})
-        for inc in finding_incidents(current, metric):
-            for workflow in current.get("workflows") or []:
-                if workflow.get("incident_id") != inc["incident_id"]:
-                    continue
-                if any(
-                    step.get("operation") == "VALIDATE_HOST"
-                    and step.get("status") in {"SUCCEEDED", "FAILED"}
-                    for step in workflow.get("step_executions") or []
-                ):
-                    return current
-        return None
-
-    return ctx.wait_until(
-        validated, timeout_seconds=DETECTION_BUDGET, poll_seconds=20, name=name
-    ) or activity(ctx, since, metrics={metric})
-
-
 def _await_recovery(
     ctx: VariantContext, oracle: Oracle, since: Any = None
 ) -> dict[str, Any]:
@@ -912,10 +923,16 @@ VARIANTS = [
         lanes=("eks", "hp"),
         risk="H",
         flags="S",
-        injection="hold host MemAvailable low (~96.5 % used) in a capped cgroup for > 120 s",
-        expected="memory_used_percent >= 95 for 120 s -> VALIDATE_HOST probe fails while loaded; no reset/reboot",
+        injection=(
+            "hold host MemAvailable low (~96.5 % used) in a capped cgroup through the "
+            "ramp plus the cadence budget timed from the oracle's crossing"
+        ),
+        expected=(
+            "memory_used_percent >= 95 for 120 s -> VALIDATE_HOST probe fails while "
+            "loaded; no reset/reboot; detection over two host health summaries"
+        ),
         cleanup="stop the allocator; 2 fresh samples below 95 %",
-        max_minutes=45,
+        max_minutes=55,
         approvals=("HOST_MEMORY_PRESSURE",),
         execute=memory_pressure,
     ),
@@ -937,7 +954,7 @@ VARIANTS = [
             "the bind is held; no memory finding; no reset/reboot; recovery once closed"
         ),
         cleanup="close the meminfo bind window (deadman-backed); 2 fresh samples below 80 %",
-        max_minutes=20,
+        max_minutes=25,
         approvals=(HOST_SOURCE_REPLAY,),
         execute=swap_pressure,
     ),
@@ -1016,7 +1033,7 @@ VARIANTS = [
         injection="drive memory_pressure to a finding, then stop the allocator",
         expected="2 fresh samples below 95 % and the incident settles; no reboot masks the OOM",
         cleanup="none",
-        max_minutes=45,
+        max_minutes=50,
         approvals=("HOST_MEMORY_PRESSURE",),
         execute=recovery,
     ),

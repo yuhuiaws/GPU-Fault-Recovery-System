@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -17,6 +19,7 @@ from gpu_fault.host_health import HostMetricSample, HostTelemetryBatch, NodeHeal
 from gpu_fault.models import RecoveryAction, Severity, WorkloadState
 from gpu_fault.store import InMemoryStore
 from scripts.e2e.regional import general_live_memory as mem
+from scripts.e2e.regional.general_live_common import STORE_POLL_SECONDS
 from scripts.e2e.regional.general_live_fixture import (
     VariantBlocked,
     VariantInconclusive,
@@ -40,6 +43,7 @@ from tests.regional._general_live_fakes import (
     incident,
     make_context,
     make_settings,
+    store_poll_clock,
     store_script,
     workflow,
 )
@@ -720,10 +724,13 @@ def test_memory_variants_ask_the_real_probe_for_an_accepted_hold(
     assert starts, "the variant started the memory unit through the real probe"
     seconds = [int(call[call.index("--seconds") + 1]) for call in starts]
     assert all(value <= mem.PROBE_MAX_SECONDS for value in seconds), seconds
+    # The 14-minute ramp, the cadence-sized detection budget (915 s on the fake
+    # survey's 300-s/15-s cadence), the grading tail and the probe's margin.
+    budget = mem.detection_budget(ctx)
     if variant == "memory_pressure":
-        assert seconds == [1980], "the 14-minute ramp plus detection hold"
+        assert seconds == [mem.RAMP_BUDGET + budget + 240 + 120] == [2355], seconds
     if variant == "recovery":
-        assert seconds == [1800], "exactly the old cap: recovery never failed live"
+        assert seconds == [mem.RAMP_BUDGET + budget + 60 + 120] == [2175], seconds
 
 
 def test_memory_pressure_fails_fast_when_the_hold_exceeds_the_probe_cap(
@@ -740,8 +747,9 @@ def test_memory_pressure_fails_fast_when_the_hold_exceeds_the_probe_cap(
         regional=regional,
         probes={f"node@{NODE}": probe},
     )
+    requested = mem.RAMP_BUDGET + mem.detection_budget(ctx) + 240 + 120
     with pytest.raises(
-        RegionalFixtureError, match="1980 s memory hold exceeds .* 1800 s"
+        RegionalFixtureError, match=f"{requested} s memory hold exceeds .* 1800 s"
     ):
         SPECS["memory_pressure"].execute(ctx)
     assert [call[0] for call in probe.calls] == ["survey"], (
@@ -1133,3 +1141,147 @@ def test_the_real_memory_contributor_reads_the_probe_built_meminfo(
     assert values[("memory_used_percent", None)] < mem.USED_THRESHOLD
     graded = NodeHealthPolicy(build_store()).evaluate_metrics(batch)
     assert [item.metric_name for item in graded] == ["swap_used_percent"], graded
+
+
+# --------------------------------------------------------------------------- #
+# Detection timed from the oracle's crossing over two host health summaries
+# (the 003 high_page_cache lesson of 2026-10-25, applied to the 120-s memory rule)
+# --------------------------------------------------------------------------- #
+SITE = SimpleNamespace(host_summary=300, host_interval=15)
+
+
+def memory_reads(*phases: list[float]) -> list[dict[str, Any]]:
+    """One ``oracle-read`` answer per phase: the readings since the last read."""
+
+    entries: list[dict[str, Any]] = []
+    total = 0
+    for values in phases:
+        total += len(values)
+        entries.append(
+            {
+                "records": [{"memory_used_percent": value} for value in values],
+                "next_offset": total,
+                "total": total,
+            }
+        )
+    return entries
+
+
+#: The 2 TiB host's allocator ramps for two polls before the oracle reads the
+#: 95 % threshold; the product's records -- the finding and its executed
+#: VALIDATE_HOST -- appear 40 store polls (800 s) after the crossing: the edge,
+#: the first summary at least 120 s later that mints the finding, the next
+#: summary the validation is judged on.
+MEMORY_RAMP_READS = memory_reads([40.0] * 3, [76.0] * 3, [96.6] * 24, [96.6] * 60)
+MINTED_AT_POLL = 40
+
+
+def memory_ramp_run(
+    tmp_path: Path,
+    variant: str,
+    oracle: list[dict[str, Any]],
+    minted_at_poll: int | None,
+) -> tuple[dict[str, Any], Any, list[tuple[str, ...]]]:
+    spec = SPECS[variant]
+    polls = itertools.count(1)
+
+    def product(_script: str, *_arguments: str, **_: Any) -> dict[str, Any]:
+        poll = next(polls)
+        if minted_at_poll is not None and poll >= minted_at_poll:
+            return chain_activity()
+        return _empty_doc()
+
+    probe = mem_node_probe()
+    probe.script["oracle-read"] = oracle
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=product),
+        probes={f"node@{NODE}": probe},
+    )
+    result = spec.execute(store_poll_clock(ctx))
+    return result, ctx, probe.calls
+
+
+@pytest.mark.parametrize("variant", ["memory_pressure", "recovery"])
+def test_memory_variants_time_detection_from_the_oracles_crossing(
+    tmp_path: Path, variant: str
+) -> None:
+    result, ctx, calls = memory_ramp_run(
+        tmp_path, variant, MEMORY_RAMP_READS, MINTED_AT_POLL
+    )
+    assert result["verdict"] == "PASS", (variant, result["errors"])
+    ramp = json.loads((ctx.case_dir / "memory-ramp-timeline.json").read_text())
+    assert [entry["accepted"] for entry in ramp["entries"]] == [False, False, True]
+    started = json.loads((ctx.case_dir / "memory-start.json").read_text())
+    assert started["detection_budget_seconds"] == mem.detection_budget(ctx) == 915
+    assert started["ramp_budget_seconds"] == mem.RAMP_BUDGET
+    assert started["sustain_seconds"] == mem.SUSTAIN_SECONDS
+    assert started["host_summary_seconds"] == 300
+    # The allocator and the oracle outlive the ramp and the detection budget.
+    for subcommand in ("memory-start", "oracle-start"):
+        call = next(item for item in calls if item[0] == subcommand)
+        seconds = int(call[call.index("--seconds") + 1])
+        assert seconds >= mem.RAMP_BUDGET + mem.detection_budget(ctx), (
+            subcommand,
+            seconds,
+        )
+
+
+def test_memory_pressure_fails_when_the_product_misses_two_summaries(
+    tmp_path: Path,
+) -> None:
+    late = mem.detection_budget(SITE) // STORE_POLL_SECONDS + 3
+    result, _ctx, _calls = memory_ramp_run(
+        tmp_path, "memory_pressure", MEMORY_RAMP_READS, late
+    )
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["chain"] == [
+        "no memory_used_percent finding reached an incident"
+    ], result["stages"]
+
+
+def test_memory_pressure_is_inconclusive_when_the_ramp_runs_out(tmp_path: Path) -> None:
+    with pytest.raises(VariantInconclusive, match="did not raise memory_used"):
+        memory_ramp_run(tmp_path, "memory_pressure", memory_reads([40.0] * 3), None)
+
+
+def test_swap_pressure_waits_for_validate_host_to_be_judgeable(tmp_path: Path) -> None:
+    # The swap finding is minted on the restarted collector's first batch;
+    # VALIDATE_HOST then waits for the health summary after it. The first polls
+    # show the step WAITING: no verdict is read off them.
+    waiting = _swap_docs(validation_status="WAITING")[0]
+    waiting["workflows"][0]["status"] = "RUNNING"
+    docs = [waiting, waiting, waiting, *_swap_docs()]
+    replay = _replay_probe()
+    ctx = _replay_ctx("swap_pressure", docs=docs, tmp_path=tmp_path, replay=replay)
+    result = mem.swap_pressure(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    detection = json.loads((ctx.case_dir / "swap-detection-timeline.json").read_text())
+    assert [entry["accepted"] for entry in detection["entries"]] == [
+        False,
+        False,
+        False,
+        True,
+    ]
+
+
+def test_memory_budgets_follow_the_products_rule_and_fit_the_probe_cap() -> None:
+    rules = NodeHealthPolicy.METRIC_RULE_SUSTAIN_SECONDS
+    assert mem.SUSTAIN_SECONDS == rules["memory_used_percent"]
+    budget = mem.detection_budget(SITE)
+    assert budget == mem.SUSTAIN_SECONDS + 2 * 300 + 15 + 180 == 915
+    assert budget > 120 + 300 + 120, "the fixed budget before the cadence rule"
+    # No sustain on the swap rule: the edge mints, one summary for the validation.
+    assert "swap_used_percent" not in rules
+    assert mem.swap_detection_budget(SITE) == 300 + 15 + 180
+    # The hold the probe is asked for stays under its unit cap.
+    assert mem.RAMP_BUDGET + budget + 240 + 120 <= mem.PROBE_MAX_SECONDS
+    recovery = 2 * SITE.host_summary + 6 * SITE.host_interval
+    for variant, tail in (("memory_pressure", 240), ("recovery", 60)):
+        assert SPECS[variant].max_minutes * 60 >= (
+            mem.RAMP_BUDGET + budget + recovery + tail
+        ), (variant, SPECS[variant].max_minutes)
+    assert SPECS["swap_pressure"].max_minutes * 60 >= (
+        mem.swap_detection_budget(SITE) + recovery + 120
+    )
