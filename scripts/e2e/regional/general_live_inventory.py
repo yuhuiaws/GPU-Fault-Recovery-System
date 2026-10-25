@@ -47,10 +47,12 @@ concluded diagnostic that recorded its evidence, RECOVERED, no reboot.
 014: a Kubernetes allocatable shortfall must come from a *real* device-plugin
 registration fault (``collectors/cloud/kubernetes``); the spec is explicit that
 patching Node.status or faking allocatable is not valid proof, so there is no
-live-replay path. The native device-plugin fault needs the DEVICE_PLUGIN_RESTART
-approval and a plugin pod-delete/re-register injection with new-Pod-UID
-verification, not built this phase -- every 014 variant stays NOT_RUN with its
-reason. The denominator keeps them all.
+live-replay path. The native device-plugin faults (``gpu_plugin``, ``efa_plugin``,
+``one_sample``, ``replacement_uid``, ``validation_failure``) -- a SIGSTOP of the
+plugin container's process under ``DEVICE_PLUGIN_RESTART`` -- live in
+``general_live_device_plugin.py``. Only ``expected_unknown`` / ``mig_timeslicing``
+(CAPABILITY_ABSENT) and ``running_training`` (FIXTURE_NOT_READY, lane N) stay
+deferred here; the denominator keeps all three.
 """
 
 from __future__ import annotations
@@ -798,13 +800,6 @@ def _tree_variant(
     )
 
 
-_PLUGIN_NATIVE = (
-    "NOT_AUTHORIZED: a real kubelet device-plugin registration fault needs the "
-    "DEVICE_PLUGIN_RESTART approval and a plugin pod-delete/re-register injection with "
-    "new-Pod-UID verification; patching Node.status or faking allocatable is not valid "
-    "proof (spec 014). Not built in this lane."
-)
-
 VARIANTS = [
     # --- 013 EFA inventory --- #
     VariantSpec(
@@ -912,39 +907,11 @@ VARIANTS = [
         lanes=("eks",),
         expected="action succeeds but post-action validation fails -> independent receipt and escalation",
     ),
-    # --- 014 Kubernetes allocatable under-report (no valid replay) --- #
-    deferred_variant(
-        CASE_014,
-        "gpu_plugin",
-        proof_mode=LIVE_REPLAY,
-        reason=_PLUGIN_NATIVE,
-        lanes=("eks", "hp"),
-        expected="a real GPU device-plugin registration shortfall -> restart the correct plugin; new Pod UID; resources re-registered",
-    ),
-    deferred_variant(
-        CASE_014,
-        "efa_plugin",
-        proof_mode=LIVE_REPLAY,
-        reason=_PLUGIN_NATIVE,
-        lanes=("eks", "hp"),
-        expected="a real EFA device-plugin registration shortfall -> restart the correct plugin",
-    ),
-    deferred_variant(
-        CASE_014,
-        "one_sample",
-        proof_mode=LIVE_REPLAY,
-        reason=_PLUGIN_NATIVE,
-        lanes=("eks",),
-        expected="a single allocatable mismatch is not confirmed into an action",
-    ),
-    deferred_variant(
-        CASE_014,
-        "replacement_uid",
-        proof_mode=LIVE_REPLAY,
-        reason=_PLUGIN_NATIVE,
-        lanes=("eks",),
-        expected="after the plugin restart the new Pod UID and re-Ready are verified",
-    ),
+    # --- 014 Kubernetes allocatable under-report --- #
+    # The native device-plugin registration faults (gpu_plugin, efa_plugin,
+    # one_sample, replacement_uid, validation_failure) are implemented in
+    # general_live_device_plugin.py; only the capability/scale-blocked variants
+    # stay deferred here.
     deferred_variant(
         CASE_014,
         "expected_unknown",
@@ -963,14 +930,6 @@ VARIANTS = [
         reason="CAPABILITY_ABSENT: MIG / time-slicing is not configured on this site",
         lanes=("eks",),
         expected="MIG/time-slicing allocatable is not treated as a physical card shortfall",
-    ),
-    deferred_variant(
-        CASE_014,
-        "validation_failure",
-        proof_mode=LIVE_REPLAY,
-        reason=_PLUGIN_NATIVE,
-        lanes=("eks",),
-        expected="a post-restart validation failure escalates to reboot under a separate authorization",
     ),
     deferred_variant(
         CASE_014,
