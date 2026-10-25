@@ -1588,6 +1588,19 @@ Semantics and boundaries of `eks-managed`:
   classifies as the `validation_unobserved` stage: the hand-off (`support-after-<workflow>`) plans FREEZE_EVIDENCE
   and ESCALATE_SUPPORT only -- no quarantine, no reboot or replace successor -- and the incident's reasons carry the
   node's pending reason and its exit (the restore of §9.2).
+  **A validation without evidence fires no planned escalation**: the EFA driver, device-plugin and diagnostic
+  chains carry `failure_escalation_action=REBOOT_NODE` on their VALIDATE_FABRIC/VALIDATE_GPU; when that validation
+  is FAILED by the 600 s per-step cap or the execution deadline with no node observed failing
+  (`node_failures_observed` empty, `node_pending` holding only missing evidence such as
+  `missing_or_stale_collectors` or `missing_fresh_inventory_metric`), the request is withheld, no RESTART_NODE is
+  opened, and the record classifies as the `validation_evidence_missing` stage: the hand-off again plans
+  FREEZE_EVIDENCE and ESCALATE_SUPPORT only, without isolation, and the reasons name the missing evidence per node
+  (`node-a: missing_or_stale_collectors: GPU_METRICS, HOST_TELEMETRY`) plus one line `requested escalation
+  REBOOT_NODE withheld: ...` naming the withheld request and the bound that failed the step; the operator checks
+  the node's gpu-fault DaemonSets/collectors first, then reruns the diagnostic or acts by hand. A validation that
+  had observed the node failing before the cap, or whose verdict is the adapter's own, escalates as designed.
+  (2026-10-25, plain EKS, GF-GENERAL-LIVE-013 `link_inactive`: with the collectors dark the validation waited out
+  the cap and the REBOOT_NODE request rebooted a node nothing had been learned about.)
   **A workload restart waits for device-plugin health first**: before it creates the new attempt, RESTART_WORKLOAD
   reads, for every target node (the nodes the Pod templates pin with `nodeName`/`kubernetes.io/hostname`, plus the
   nodes this workflow repaired, minus `avoid_node_ids`), the `nvidia.com/gpu` `capacity` and `allocatable`, the

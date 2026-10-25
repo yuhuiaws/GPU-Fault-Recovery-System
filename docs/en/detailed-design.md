@@ -3918,7 +3918,19 @@ reached the validation -- after the previous step completed, never earlier than 
 the expected count is `SUCCEEDED` and the incident `RECOVERED`; with no such sample yet the step is `WAITING` only
 until the next host sample; only a fresh sample that still disagrees is `FAILED`, and then `LINK_INACTIVE` escalates
 to `REBOOT_NODE` through the `failure_escalation_action` the plan carries while excess/unknown authorizes no reboot
-and goes to an operator. The samples that raised the finding predate that moment and are not diagnostic evidence.
+and goes to an operator. That escalation follows an **observed** failure only. When the validation is FAILED by
+the 600 s per-step cap or the workflow execution deadline with no node observed failing --
+`node_failures_observed` empty, `node_pending` holding nothing but missing evidence (`missing_or_stale_collectors`
+for collectors that stopped reporting, `missing_fresh_inventory_metric` while no new sample has arrived, ...) --
+the `failure_escalation_action` the plan carries is withheld and no RESTART_NODE is opened: the record classifies
+as the `validation_evidence_missing` stage, the hand-off (`support-after-<workflow>`) plans FREEZE_EVIDENCE and
+ESCALATE_SUPPORT only, without isolation, and the incident reasons name the missing evidence per node and which
+request was withheld by which bound (`requested escalation REBOOT_NODE withheld: ...`). A validation that had
+observed the node failing before the cap (`node_failures_observed` non-empty), or whose verdict is the adapter's
+own (`failed_nodes`), escalates as designed; so does a plugin/driver recovery chain whose action itself failed.
+Before this the request applied to any FAILED validation, and with the collectors dark the cap's failure rebooted
+a node nothing had been learned about (GF-GENERAL-LIVE-013 `link_inactive`, live). The samples that raised the
+finding predate that moment and are not diagnostic evidence.
 Both modes record the reading each verdict rests on in the step record's `inventory_evidence` (node → metric →
 `value`/`expected`/`observed_at`). Before this, the validation waited for an action completion no step in the plan
 would produce, failed at the 600 s per-step cap, and the cap's failure escalated a node whose port had long been
