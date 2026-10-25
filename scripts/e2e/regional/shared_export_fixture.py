@@ -12,11 +12,26 @@ collector then discovers the ``nfs4`` mount from its own mount table
 
 Why userspace: a hung export is produced by ``SIGSTOP`` on the server process
 (``pause``) -- the kernel still accepts the client's TCP segments, nothing
-answers, every ``statvfs`` blocks until the client's ``soft`` timeout -- and
-``SIGCONT`` (``resume``) restores it with the same file handles, so recovery
-needs no remount. A kernel ``nfsd`` cannot be paused that way. Ganesha runs as
-a child of the container's ``sh`` (not PID 1: a PID namespace's init ignores
-SIGSTOP sent from inside it), so ``kubectl exec`` can stop and continue it.
+answers, every ``statvfs`` and write blocks -- and ``SIGCONT`` (``resume``)
+restores it with the same file handles, so recovery needs no remount. A kernel
+``nfsd`` cannot be paused that way. Ganesha runs as a child of the container's
+``sh`` (not PID 1: a PID namespace's init ignores SIGSTOP sent from inside it),
+so ``kubectl exec`` can stop and continue it. The client mounts ``soft,
+timeo=100,retrans=2``, but the live smoke test of the image showed a paused
+export failing neither ``statvfs`` within 185 s nor writes within 125 s under
+those options (the NFSv4.1 session keeps retrying its slot); what bounds every
+reading -- the product's (5 s per call) and the probe's -- is the reader's own
+thread deadline, never the mount option. The soft option stays so an export
+that is gone for good does not park threads forever.
+
+The export directory is ``chmod 1777`` *and* ``chown 65534:65534``: Ganesha
+squashes the client's root to ``nobody``, and with ``fs.protected_regular >= 1``
+(the default on the node kernels) a squashed ``open(O_WRONLY|O_CREAT)`` of a
+file in a root-owned sticky directory is refused client-side with EACCES,
+leaving 0-byte files -- the live smoke test's first symptom. The attribute
+cache (``Attr_Expiration_Time``) is an EXPORT-block parameter in NFS-Ganesha
+4.3 (an "Unknown parameter" in MDCACHE), and ``NFS_KRB5 { Active_krb5 = false; }``
+silences a CRIT line at start-up on an image without Kerberos.
 
 Bounded and gfrs-only: a bare Pod (``restartPolicy: Never``) with
 ``activeDeadlineSeconds`` as the cluster-side deadman, labelled with the
@@ -26,7 +41,12 @@ clients first (the probe's deadman does the same), then deletes the Pod.
 
 Live prerequisites (the coordinator arranges them): the image (``--export-image``
 or ``GPU_FAULT_GENERAL_LIVE_EXPORT_IMAGE``, an immutable digest) must ship
-``ganesha.nfsd`` and ``/bin/sh``; the client nodes' AMI needs ``nfs-utils``
+``ganesha.nfsd`` and ``/bin/sh`` -- the site's image is the account's ECR
+``gfrs-test/nfs-ganesha@sha256:d354efdc8364e4ba17b83c4aa27cdef4001a474fc950b07547e7fcf9d1e14d7f``
+(full reference in the GF-GENERAL-LIVE-005 spec; Ubuntu 24.04, NFS-Ganesha
+4.3: ``/usr/bin/ganesha.nfsd``, ``/usr/lib/x86_64-linux-gnu/ganesha/libfsalvfs.so``,
+``/bin/sh`` is dash, which the entry script is written for); the client nodes'
+AMI needs ``nfs-utils``
 (``mount.nfs4``) and the ``nfsv4`` module (loaded under KERNEL_MODULE_LOAD when
 missing); TCP/2049 from the node to the Pod IP must be allowed (in the GPU
 cluster the VPC CNI gives Pods node ENI addresses, so the node security group's
@@ -71,11 +91,17 @@ RESUME_SCRIPT = (
     f'pid="$(cat {PID_FILE})" && kill -CONT "$pid" && sleep 0.3 && '
     'grep -E "^State:" "/proc/$pid/status"'
 )
-#: The container's entry: export directory, writable ganesha dirs, ganesha as a
-#: *child* of this shell (pausable from an exec), pid recorded, then wait.
+#: The squashed client identity (``Anonymous_Uid``/``Anonymous_Gid`` below);
+#: the export directory is owned by it so ``fs.protected_regular`` lets the
+#: squashed client create files in the sticky directory.
+ANONYMOUS_ID = 65534
+#: The container's entry: export directory (world-writable, sticky, owned by
+#: the squashed identity), writable ganesha dirs, ganesha as a *child* of this
+#: shell (pausable from an exec), pid recorded, then wait. POSIX sh (dash).
 ENTRY_SCRIPT = f"""set -eu
 mkdir -p {EXPORT_PATH} /var/run/ganesha /var/lib/nfs/ganesha /run/gfrs
 chmod 1777 {EXPORT_PATH}
+chown {ANONYMOUS_ID}:{ANONYMOUS_ID} {EXPORT_PATH}
 GANESHA="$(command -v ganesha.nfsd || echo /usr/bin/ganesha.nfsd)"
 "$GANESHA" -F -L /dev/stderr -N NIV_EVENT -f /etc/ganesha/ganesha.conf &
 echo $! > {PID_FILE}
@@ -86,11 +112,14 @@ wait
 def ganesha_config() -> str:
     """One NFSv4-only, TCP-only, root-squashed read-write VFS export.
 
-    ``Root_Squash`` with a ``1777`` export directory lets the client (root on
-    the node) write as ``nobody`` -- so a server-side ``chmod 000`` denies its
-    I/O while ``statvfs`` keeps answering (``io_only_failure``). The attribute
-    cache expires in 1 s so such a change is seen at once; ``Graceless`` lets a
-    resumed/restarted server answer without a grace period.
+    ``Root_Squash`` with a ``1777`` export directory owned by the anonymous
+    identity lets the client (root on the node) write as ``nobody`` -- so a
+    server-side ``chmod 000`` denies its I/O while ``statvfs`` keeps answering
+    (``io_only_failure``). The attribute cache expires in 1 s so such a change
+    is seen at once (``Attr_Expiration_Time`` belongs to the EXPORT block in
+    NFS-Ganesha 4.3; in MDCACHE it is an "Unknown parameter"); ``Graceless``
+    lets a resumed/restarted server answer without a grace period;
+    ``Active_krb5 = false`` silences the start-up CRIT about a missing keytab.
     """
 
     return f"""NFS_CORE_PARAM {{
@@ -107,8 +136,8 @@ NFSV4 {{
     Allow_Numeric_Owners = true;
     Only_Numeric_Owners = true;
 }}
-MDCACHE {{
-    Attr_Expiration_Time = 1;
+NFS_KRB5 {{
+    Active_krb5 = false;
 }}
 EXPORT {{
     Export_Id = 1;
@@ -116,8 +145,9 @@ EXPORT {{
     Pseudo = {PSEUDO_PATH};
     Access_Type = RW;
     Squash = Root_Squash;
-    Anonymous_Uid = 65534;
-    Anonymous_Gid = 65534;
+    Anonymous_Uid = {ANONYMOUS_ID};
+    Anonymous_Gid = {ANONYMOUS_ID};
+    Attr_Expiration_Time = 1;
     Protocols = 4;
     Transports = TCP;
     SecType = sys;
@@ -557,6 +587,7 @@ def _now() -> str:
 
 
 __all__ = [
+    "ANONYMOUS_ID",
     "APP_LABEL",
     "DEFAULT_SIZE_MIB",
     "ENTRY_SCRIPT",

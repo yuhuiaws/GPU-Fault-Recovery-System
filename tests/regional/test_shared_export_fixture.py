@@ -140,6 +140,8 @@ def test_manifests_are_a_bounded_unprivileged_tmpfs_backed_nfs_server() -> None:
         "Graceless = true;",
         "Attr_Expiration_Time = 1;",
         "Name = VFS;",
+        f"Anonymous_Uid = {export.ANONYMOUS_ID};",
+        "Active_krb5 = false;",
     ):
         assert expected in config, expected
     spec = pod["spec"]
@@ -188,6 +190,52 @@ def test_entry_script_runs_ganesha_as_a_pausable_child() -> None:
         "root-squashed clients must write"
     )
     assert "-STOP" in export.PAUSE_SCRIPT and "-CONT" in export.RESUME_SCRIPT
+
+
+def test_entry_script_hands_the_sticky_export_root_to_the_squashed_identity() -> None:
+    """Live smoke test of the image: with fs.protected_regular >= 1 a squashed
+    root's open(O_WRONLY|O_CREAT) in a root-owned 1777 directory is refused
+    EACCES client-side and leaves 0-byte files; the directory must be owned by
+    the anonymous identity Ganesha squashes to, right after the chmod."""
+
+    lines = [line.strip() for line in export.ENTRY_SCRIPT.splitlines()]
+    chmod = lines.index(f"chmod 1777 {export.EXPORT_PATH}")
+    chown = lines.index(
+        f"chown {export.ANONYMOUS_ID}:{export.ANONYMOUS_ID} {export.EXPORT_PATH}"
+    )
+    assert chown == chmod + 1, lines
+    assert export.ANONYMOUS_ID == 65534, "nobody/nogroup, the squash identity"
+    assert lines[0] == "set -eu" and "[[" not in export.ENTRY_SCRIPT, (
+        "POSIX sh: the image's /bin/sh is dash"
+    )
+
+
+def test_ganesha_config_places_each_parameter_in_the_block_4_3_reads() -> None:
+    """NFS-Ganesha 4.3 reports Attr_Expiration_Time as an unknown MDCACHE
+    parameter; it belongs to the EXPORT block. Active_krb5 = false silences
+    the start-up CRIT on an image without a keytab."""
+
+    config = export.ganesha_config()
+    blocks: dict[str, str] = {}
+    name, depth, body = None, 0, []
+    for line in config.splitlines():
+        stripped = line.strip()
+        if depth == 0 and stripped.endswith("{"):
+            name, body = stripped[:-1].strip(), []
+            depth = 1
+            continue
+        if depth:
+            depth += stripped.count("{") - stripped.count("}")
+            if depth == 0:
+                blocks[str(name)] = "\n".join(body)
+            else:
+                body.append(stripped)
+    assert "Attr_Expiration_Time = 1;" in blocks["EXPORT"], blocks["EXPORT"]
+    assert "MDCACHE" not in blocks, (
+        "no MDCACHE block: 4.3 knows no such parameter there"
+    )
+    assert blocks["NFS_KRB5"] == "Active_krb5 = false;", blocks
+    assert f"Anonymous_Uid = {export.ANONYMOUS_ID};" in blocks["EXPORT"]
 
 
 def test_a_pinned_node_replaces_the_anti_affinity() -> None:

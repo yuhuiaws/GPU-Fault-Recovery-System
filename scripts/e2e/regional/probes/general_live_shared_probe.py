@@ -20,8 +20,13 @@ Every mount is recorded in ``shared-state.json`` before it is made and
 preceded by a ``systemd-run --on-active`` deadman that unmounts it (``umount``,
 then ``-f``, then ``-l``) from a copy of this file. Only an IPv4 literal server
 and an export path of the test shape are mounted, always ``soft`` with a short
-``timeo`` so a dead export answers EIO instead of parking threads forever, and
-nothing outside ``/mnt/gfrs-live/<digest>/`` is touched. ``--load-module``
+``timeo``, and nothing outside ``/mnt/gfrs-live/<digest>/`` is touched. The
+soft option is not what bounds a reading: the live smoke test saw a paused
+export fail neither ``statvfs`` within 185 s nor writes within 125 s under
+``soft,timeo=100,retrans=2`` (the NFSv4.1 session keeps retrying), so every
+reading here runs on a worker thread with its own deadline and reports
+``timed_out`` -- like the product's own 5 s bound -- and the option only keeps
+an export that is gone for good from parking threads forever. ``--load-module``
 (the KERNEL_MODULE_LOAD approval) loads a missing ``nfsv4``, recorded first so
 ``cleanup`` unloads it once no mount of the run is left.
 """
@@ -49,9 +54,11 @@ SYS_MODULE = Path("/sys/module")
 NFS_MODULE = "nfsv4"
 #: Mount and readings happen in PID 1's mount (and network) namespaces.
 HOST_NAMESPACES = ("nsenter", "--target", "1", "--mount", "--net", "--")
-#: Soft, short-timeout NFSv4.1 over TCP: a paused or dead export fails a call
-#: after about ``timeo`` x ``retrans`` deciseconds instead of hanging forever,
-#: and attributes expire in 2 s so a server-side change is seen promptly.
+#: Soft, short-timeout NFSv4.1 over TCP. ``soft``/``timeo``/``retrans`` keep a
+#: dead export from parking threads forever; they do *not* bound a reading
+#: against a paused export (live: no EIO within 185 s) -- the readers' own
+#: deadlines do. Attributes expire in 2 s so a server-side change is seen
+#: promptly.
 DEFAULT_OPTIONS = (
     "vers=4.1,proto=tcp,port=2049,soft,timeo=100,retrans=2,actimeo=2,"
     "noatime,nosuid,nodev,noexec"

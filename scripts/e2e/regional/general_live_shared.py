@@ -25,8 +25,13 @@ The fixture (``shared_export_fixture.TestExportServer`` + the node probe
 a userspace server Pod over a size-limited tmpfs -- and mounts it ``soft`` under
 ``/mnt/gfrs-live/<digest>/<name>`` in the client node's host mount namespace;
 ``SIGSTOP`` on the server hangs every call, ``SIGCONT`` restores the same file
-handles. Verdicts read only the product's records; the probe's bounded
-``statvfs``/I/O readings are the oracle.
+handles. Verdicts read only the product's records; the probe's deadline-bounded
+``statvfs``/I/O readings are the oracle (the soft mount option bounds nothing
+against a paused export -- live, no EIO within 185 s; the reader's thread
+deadline does). The mount stays node-scoped under ``/mnt/gfrs-live/<digest>/``
+and its cleanup unmounts *and* removes the directory, which is what makes the
+product forget the test mount (batch 176 remembers a vanished shared mount
+whose directory remains).
 
 ``mount_disappears`` unmounts the export with ``nfs-umount`` *without*
 ``--forget``: the mount point directory stays, which is exactly the condition
