@@ -4,7 +4,8 @@ Owns the host probe (``probes/general_live_source_probe.py``) that replaces
 allow-listed raw readings in the host collector unit's private environment and
 nothing else: a procfs/sysfs *file* bound read-only into the unit's mount
 namespace (001 invalid_delta, 008 statistics_failed, 009 errors_delta, 002
-meminfo, 010/011 EFA counters, 032 driver version), a whole reviewed *tree*
+meminfo -- ``build_meminfo`` copies the real file with reviewed swap/available
+fields --, 010/011 EFA counters, 032 driver version), a whole reviewed *tree*
 (``/sys/class/infiniband`` for the 013 inventory variants, ``/proc/driver/
 nvidia`` for 012/032), a reviewed pass-through *command wrapper* first on the
 unit's PATH (``tools/host_command_replay.py``: smartctl 007, ipmitool 015,
@@ -60,6 +61,9 @@ LEGACY_BIND_DESTS = ("/proc/stat",)
 #: Fixture tree names the builders produce (``--tree <name>:<dest>``).
 INFINIBAND_TREE = "infiniband"
 NVIDIA_PROC_TREE = "nvidia-proc"
+#: The fixture file ``build_meminfo`` writes (``--bind meminfo:/proc/meminfo``).
+MEMINFO_FIXTURE = probe.MEMINFO_FIXTURE
+MEMINFO_FIELDS = probe.MEMINFO_FIELDS
 TREE_DESTS = probe.TREE_DESTS
 TOOLS = tuple(wrapper.TOOLS)
 DEFAULT_PLAN_SECONDS = 3600
@@ -271,6 +275,31 @@ class HostSourceReplay:
             arguments += ["--gpu-count", str(int(gpu_count))]
         if omit_gpus:
             arguments.append("--omit-gpus")
+        return self._execute(*arguments, timeout=120)
+
+    def build_meminfo(
+        self, *, source: str = "/proc/meminfo", **fields_kb: int
+    ) -> dict[str, Any]:
+        """Copy the node's ``/proc/meminfo`` with reviewed fields rewritten (kB).
+
+        ``fields_kb`` names ``MEMINFO_FIELDS`` only (``SwapTotal=8388608,
+        SwapFree=1048576`` for 002 ``swap_pressure``); the receipt carries the
+        resulting ``swap_used_percent`` / ``memory_used_percent`` as the oracle
+        of what the product's ``_memory`` contributor will compute.
+        """
+
+        self._require_approval("a /proc/meminfo replay")
+        unknown = sorted(set(fields_kb) - set(MEMINFO_FIELDS))
+        if unknown or not fields_kb:
+            raise HostSourceReplayError(
+                f"meminfo fields must be one or more of {list(MEMINFO_FIELDS)}; "
+                f"got {sorted(fields_kb)}"
+            )
+        self.create()
+        arguments = ["build-meminfo-fixture", "--source", source]
+        for name in MEMINFO_FIELDS:
+            if name in fields_kb:
+                arguments += ["--set", f"{name}={int(fields_kb[name])}"]
         return self._execute(*arguments, timeout=120)
 
     # ---------------------------------------------------------------- wrappers
@@ -534,6 +563,8 @@ __all__ = [
     "DEFAULT_PLAN_SECONDS",
     "HOST_SOURCE_REPLAY",
     "INFINIBAND_TREE",
+    "MEMINFO_FIELDS",
+    "MEMINFO_FIXTURE",
     "NVIDIA_PROC_TREE",
     "PROOF_SCOPE",
     "TOOLS",

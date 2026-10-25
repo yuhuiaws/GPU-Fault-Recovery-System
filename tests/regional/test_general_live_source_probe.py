@@ -18,6 +18,7 @@ import filecmp
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -97,7 +98,8 @@ class FakeHost:
                     command, 0, f"{os.stat(real).st_dev}\n", ""
                 )
             if command[0] == "/usr/bin/test":
-                ok = os.access(real, os.X_OK)
+                flag = command[1]
+                ok = os.path.isdir(real) if flag == "-d" else os.access(real, os.X_OK)
                 return subprocess.CompletedProcess(command, 0 if ok else 1, "", "")
         except OSError as error:
             return subprocess.CompletedProcess(command, 1, "", str(error))
@@ -1169,3 +1171,133 @@ def test_netdev_mutation_attaches_a_physical_netdev_only(
     assert built["devices"]["rdmap0s0"]["netdevs"] == ["ens5", "eth0"]
     assert "rdmap0s0/device/net/ens5 (attached)" in built["mutations"]
     assert not (net_root / "ens5" / "net").exists(), "the real netdev is untouched"
+
+
+# --------------------------------------------------------------------------- #
+# meminfo fixture (002 swap_pressure) and the inaccessible-file verification
+# --------------------------------------------------------------------------- #
+MEMINFO = (
+    "MemTotal:       2113929216 kB\n"
+    "MemFree:        2000000000 kB\n"
+    "MemAvailable:   2050000000 kB\n"
+    "Cached:           40000000 kB\n"
+    "SwapTotal:               0 kB\n"
+    "SwapFree:                0 kB\n"
+    "Shmem:              500000 kB\n"
+    "SReclaimable:      2000000 kB\n"
+    "HugePages_Total:         0\n"
+)
+
+
+def test_meminfo_fixture_rewrites_only_the_allow_listed_fields(
+    host: FakeHost, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    source = tmp_path / "host" / "proc" / "meminfo"
+    source.parent.mkdir(parents=True)
+    source.write_text(MEMINFO)
+    code, built = _main(
+        "build-meminfo-fixture",
+        "--run-id",
+        RUN,
+        "--source",
+        str(source),
+        "--set",
+        "SwapTotal=8388608",
+        "--set",
+        "SwapFree=1048576",
+        capsys=capsys,
+    )
+    assert code == 0, built
+    text = Path(built["path"]).read_text()
+    assert (
+        built["name"] == "meminfo" and Path(built["path"]).name == probe.MEMINFO_FIXTURE
+    )
+    assert re.search(r"^SwapTotal:\s+8388608 kB$", text, re.M) and re.search(
+        r"^SwapFree:\s+1048576 kB$", text, re.M
+    ), text
+    assert (
+        "MemTotal:       2113929216 kB\n" in text
+        and "HugePages_Total:         0\n" in text
+    )
+    assert text.count("\n") == MEMINFO.count("\n"), (
+        "every other line is the real reading"
+    )
+    assert built["swap_used_percent"] == 87.5 and built["overrides_kb"] == {
+        "SwapTotal": 8388608,
+        "SwapFree": 1048576,
+    }
+    assert 3.0 < built["memory_used_percent"] < 3.1
+    for bad in (("--set", "MemTotal=1"), ("--set", "SwapFree=abc"), ()):
+        code, error = _main(
+            "build-meminfo-fixture",
+            "--run-id",
+            RUN,
+            "--source",
+            str(source),
+            *bad,
+            capsys=capsys,
+        )
+        assert code == 1 and error["error"] == "ProbeError", (bad, error)
+    code, opened = _main(
+        "open-window",
+        "--run-id",
+        RUN,
+        "--mode",
+        "bind",
+        "--bind",
+        "meminfo:/proc/meminfo",
+        capsys=capsys,
+    )
+    assert code == 0, opened
+    assert probe.dropin_path(RUN).read_text(encoding="utf-8").splitlines() == [
+        "[Service]",
+        f"BindReadOnlyPaths={built['path']}:/proc/meminfo",
+    ]
+    assert opened["verification"]["ok"] is True
+    code, closed = _main("close-window", "--run-id", RUN, capsys=capsys)
+    assert code == 0 and closed["clean"] is True
+
+
+def test_an_inaccessible_file_is_verified_unreadable_in_the_unit(
+    host: FakeHost, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``ls`` of an inaccessible regular node succeeds on the name alone.
+
+    The verification used to judge any unreadable path by its ``ls``, which
+    reads a mode-0000 *file* as accessible; now only a directory is judged by
+    its listing, so 002 ``read_failure`` (``/proc/meminfo``) verifies.
+    """
+
+    listings: list[list[str]] = []
+    real_nsenter = host.nsenter
+
+    def nsenter(pid: str, command: list[str]) -> subprocess.CompletedProcess[str]:
+        target = command[-1]
+        if (
+            pid == MAIN_PID
+            and host.unit_view(target) is None
+            and command[0] == "/usr/bin/env"
+        ):
+            # Like the real ``ls -1 <file>`` on an InaccessiblePaths= regular node.
+            listings.append(command)
+            if Path(target).is_file():
+                return subprocess.CompletedProcess(command, 0, f"{target}\n", "")
+        return real_nsenter(pid, command)
+
+    monkeypatch.setattr(host, "nsenter", nsenter)
+    code, opened = _main(
+        "open-window",
+        "--run-id",
+        RUN,
+        "--mode",
+        "mixed",
+        "--inaccessible",
+        "/proc/meminfo",
+        capsys=capsys,
+    )
+    assert code == 0, opened
+    (check,) = opened["verification"]["checks"]
+    assert check["unit_readable"] is False and check["host_readable"] is True, check
+    assert listings == [], "a non-directory is never judged by its listing"
+    code, closed = _main("close-window", "--run-id", RUN, capsys=capsys)
+    assert code == 0 and closed["clean"] is True

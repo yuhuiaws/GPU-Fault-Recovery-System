@@ -526,3 +526,28 @@ def test_build_infiniband_attaches_a_netdev(tmp_path: Path) -> None:
     assert call[0] == "build-infiniband-fixture"
     assert "--netdev" in call and call[call.index("--netdev") + 1] == "rdmap79s0:ens5"
     assert call[call.index("--drop") + 1] == "rdmap80s0"
+
+
+def test_build_meminfo_sends_allow_listed_fields_only(tmp_path: Path) -> None:
+    controller, fake = _controller(tmp_path)
+    controller.build_meminfo(SwapTotal=8388608, SwapFree=1048576)
+    built = next(call for call in fake.calls if call[0] == "build-meminfo-fixture")
+    assert built[1:] == (
+        "--source",
+        "/proc/meminfo",
+        "--set",
+        "SwapTotal=8388608",
+        "--set",
+        "SwapFree=1048576",
+        "--run-id",
+        controller.run_id,
+    ), built
+    with pytest.raises(helper.HostSourceReplayError, match="meminfo fields"):
+        controller.build_meminfo(MemTotal=1)
+    with pytest.raises(helper.HostSourceReplayError, match="meminfo fields"):
+        controller.build_meminfo()
+    unapproved, _fake = _controller(tmp_path / "b", approvals=())
+    with pytest.raises(helper.HostSourceReplayError, match=TOKEN):
+        unapproved.build_meminfo(SwapTotal=1)
+    assert helper.MEMINFO_FIXTURE == "meminfo"
+    assert helper.MEMINFO_FIELDS == ("MemFree", "MemAvailable", "SwapTotal", "SwapFree")

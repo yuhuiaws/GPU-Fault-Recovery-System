@@ -19,7 +19,9 @@ combinable in one window:
   (013 inventory variants need every device's ports; a single-file bind cannot
   express one missing, extra or inactive device) or ``/proc/driver/nvidia``
   (012/032). ``build-infiniband-fixture`` / ``build-nvidia-proc-fixture`` copy
-  the real tree and apply reviewed mutations.
+  the real tree and apply reviewed mutations; ``build-meminfo-fixture`` copies
+  the real ``/proc/meminfo`` and rewrites only the allow-listed memory/swap
+  fields (002 ``swap_pressure``) for the ``meminfo`` bind.
 * **command** -- a reviewed pass-through wrapper (``tools/host_command_replay.py``,
   installed with its sha256) first on the unit's PATH for ``smartctl``,
   ``ipmitool``, ``ethtool`` or the host collector's ``nvidia-smi`` queries. It
@@ -100,6 +102,12 @@ ENV_OVERRIDES = {
     "GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT": re.compile(r"^([0-9]|[1-5][0-9]|6[0-4])?$"),
 }
 EFA_VENDOR = "0x1d0f"
+#: ``/proc/meminfo`` fields a meminfo fixture may rewrite: the inputs of the
+#: host collector's memory and swap rules (``system_metrics._memory``). Values
+#: are kB like the file itself.
+MEMINFO_FIELDS = ("MemFree", "MemAvailable", "SwapTotal", "SwapFree")
+MEMINFO_FIXTURE = "meminfo"
+MAX_MEMINFO_KB = 1 << 50
 MIN_RESTORE_SECONDS = 60
 MAX_RESTORE_SECONDS = 5400
 MAX_TREE_DEVICES = 64
@@ -857,6 +865,96 @@ def read_source(arguments: argparse.Namespace) -> None:
     )
 
 
+def _meminfo_kb(values: dict[str, float], key: str) -> float:
+    return float(values.get(key, 0.0))
+
+
+def meminfo_percentages(values: dict[str, float]) -> dict[str, float | None]:
+    """The two 002 rule inputs as the host collector computes them (percent)."""
+
+    total = _meminfo_kb(values, "MemTotal")
+    swap_total = _meminfo_kb(values, "SwapTotal")
+    available = values.get("MemAvailable", values.get("MemFree", 0.0))
+    return {
+        "memory_used_percent": (
+            100.0 * (total - float(available)) / total if total else None
+        ),
+        "swap_used_percent": (
+            100.0 * (swap_total - _meminfo_kb(values, "SwapFree")) / swap_total
+            if swap_total
+            else 0.0
+        ),
+    }
+
+
+def build_meminfo_fixture(arguments: argparse.Namespace) -> None:
+    """A copy of ``/proc/meminfo`` with reviewed memory/swap fields rewritten.
+
+    Every other line is the node's real reading at build time, so the memory,
+    page-cache and available-memory rules keep seeing the host as it is; only
+    ``--set FIELD=KB`` for ``MEMINFO_FIELDS`` changes. ``SwapTotal`` may be set
+    on a swapless node: the product then grades ``swap_used_percent`` from the
+    replayed pair exactly as it would from a real swap device.
+    """
+
+    run_id = safe_id(arguments.run_id)
+    source = Path(arguments.source)
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines()
+    except OSError as error:
+        raise ProbeError(f"{source} is unreadable: {error}") from error
+    overrides: dict[str, int] = {}
+    for item in arguments.set:
+        key, _, raw = item.partition("=")
+        if key not in MEMINFO_FIELDS:
+            raise ProbeError(f"meminfo field {key!r} is not allow-listed")
+        if not raw.isdigit() or int(raw) > MAX_MEMINFO_KB:
+            raise ProbeError(f"meminfo value for {key} must be an integer in kB")
+        overrides[key] = int(raw)
+    if not overrides:
+        raise ProbeError("a meminfo fixture needs at least one --set FIELD=KB")
+    rewritten: list[str] = []
+    values: dict[str, float] = {}
+    seen: set[str] = set()
+    for line in lines:
+        key, separator, rest = line.partition(":")
+        if not separator or not rest.strip():
+            rewritten.append(line)
+            continue
+        key = key.strip()
+        if key in overrides:
+            line = f"{key}:{overrides[key]:>15} kB"
+        seen.add(key)
+        try:
+            values[key] = float(line.split(":", 1)[1].strip().split()[0])
+        except (IndexError, ValueError):
+            pass
+        rewritten.append(line)
+    for key in MEMINFO_FIELDS:
+        if key in overrides and key not in seen:
+            # A swapless kernel still prints SwapTotal/SwapFree as 0, but a
+            # field the source lacks is appended rather than silently dropped.
+            rewritten.append(f"{key}:{overrides[key]:>15} kB")
+            values[key] = float(overrides[key])
+    directory = fixtures_dir(run_id)
+    directory.mkdir(mode=0o755, parents=True, exist_ok=True)
+    target = directory / MEMINFO_FIXTURE
+    if target.is_dir():
+        raise ProbeError("a fixture tree of that name exists")
+    write_atomic(target, ("\n".join(rewritten) + "\n").encode("utf-8"), 0o644)
+    emit(
+        {
+            "run_id": run_id,
+            "name": MEMINFO_FIXTURE,
+            "path": str(target),
+            "source": str(source),
+            "overrides_kb": overrides,
+            "values_kb": {key: values[key] for key in sorted(values)},
+            **meminfo_percentages(values),
+        }
+    )
+
+
 def set_value(arguments: argparse.Namespace) -> None:
     """Rewrite a fixture's backing file in place (same inode: a bind follows it)."""
 
@@ -1028,14 +1126,19 @@ def view_path(pid: str, path: str) -> dict[str, Any]:
     """What ``pid``'s mount namespace sees at ``path``: readable, sha256, device."""
 
     read = nsenter(pid, ["/usr/bin/cat", path])
-    if read.returncode != 0:
-        # Byte order like ``sorted(os.listdir())`` in ``local_view``.
+    if read.returncode == 0:
+        readable, content, kind = True, read.stdout, "file"
+    elif nsenter(pid, ["/usr/bin/test", "-d", path]).returncode == 0:
+        # Byte order like ``sorted(os.listdir())`` in ``local_view``. Only a
+        # directory is judged by its listing: ``ls`` of an unreadable *file*
+        # (an ``InaccessiblePaths=`` regular node, mode 0000) succeeds on the
+        # name alone and would read as accessible (002 ``read_failure``).
         listing = nsenter(pid, ["/usr/bin/env", "LC_ALL=C", "/usr/bin/ls", "-1", path])
         readable = listing.returncode == 0
         content = listing.stdout if readable else ""
         kind = "dir" if readable else "unreadable"
     else:
-        readable, content, kind = True, read.stdout, "file"
+        readable, content, kind = False, "", "unreadable"
     stat = nsenter(pid, ["/usr/bin/stat", "-L", "-c", "%d", path])
     return {
         "readable": readable,
@@ -1432,6 +1535,10 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--version-text")
     item.add_argument("--gpu-count", type=int)
     item.add_argument("--omit-gpus", action="store_true")
+
+    item = command("build-meminfo-fixture", build_meminfo_fixture)
+    item.add_argument("--source", default="/proc/meminfo")
+    item.add_argument("--set", action="append", default=[])
 
     item = command("install-wrapper", install_wrapper)
     item.add_argument("--tool", required=True)
