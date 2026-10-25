@@ -1218,13 +1218,13 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   1 MiB/s，再静默整个 hung 窗口，不得出 warning/hung）、`write_progress`（被停 rank 每秒
   在 `/dev/shm` 重写 4 MiB）、`phase_progress`（各 rank 在自己的
   `GPU_FAULT_RANK_PROGRESS_FILE` 写 `rank-progress/v1`，停滞中 step 增长、phase 每 30 秒
-  切换）、`fr_enabled`（按运维手册注入 trace buffer/pipe/dump-on-timeout，至少一个 PID
+  切换）、`fr_enabled`（按运维手册注入 trace buffer/pipe/dump 文件前缀/dump-on-timeout，至少一个 PID
   两次真实 dump 为 `PAIRED`；现按产品缺口登记为 `expected_outcome="FAIL"`：DLC 镜像的
   PyTorch 2.9 把未钉 `TORCH_NCCL_DEBUG_INFO_TEMP_FILE` 时的默认 dump 文件从
   `/tmp/nccl_trace_rank_<rank>` 移到 `$HOME/.cache/torch/comm_lib_trace_rank_<rank>`
   并优先读 `TORCH_FR_DUMP_TEMP_FILE`，而产品 `flight_recorder.py` 的读取器只认旧变量名与
   旧默认位置，手册的注入又不钉 dump 位置，于是 FIFO 找到、写入成功但全部 rank
-  `dump_missing`、无 `PAIRED`；运行器在释放前把两 Pod 内三处候选位置的 `stat` 清单与
+  `dump_missing`、无 `PAIRED`（批次 182 让读取器认两代变量与两个默认目录、手册钉住 dump 前缀，随其上线翻回 PASS）；运行器在释放前把两 Pod 内三处候选位置的 `stat` 清单与
   PyTorch 自己的 FR 日志行写入 `<suffix>-fr-forensics.json`，`fr_dumps` 判定指出 dump
   实际所在——写在 2.9 默认位置、写在产品读取位置但读取过早、或根本未写）、
   `fr_disabled`（trace buffer 为 0，只能 `not_configured`；同样留存 forensics 证据）、

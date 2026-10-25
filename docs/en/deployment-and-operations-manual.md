@@ -10412,7 +10412,8 @@ for f in /sys/class/infiniband/*/ports/1/hw_counters/{rx_bytes,tx_bytes}; do
 done
 ```
 
-If a training job needs fast NCCL hang localisation, the training container must inject:
+If a training job needs fast NCCL hang localisation, the training container must inject (both
+PyTorch variable generations, with the dump file pinned explicitly):
 
 ```yaml
 env:
@@ -10420,9 +10421,67 @@ env:
   value: "20000"
 - name: TORCH_NCCL_DEBUG_INFO_PIPE_FILE
   value: /tmp/torch_nccl_debug_pipe_
+- name: TORCH_FR_DUMP_TEMP_FILE
+  value: /tmp/nccl_trace_rank_
+- name: TORCH_NCCL_DEBUG_INFO_TEMP_FILE
+  value: /tmp/nccl_trace_rank_
 - name: TORCH_NCCL_DUMP_ON_TIMEOUT
   value: "1"
 ```
+
+PyTorch 2.9 renamed the flight recorder knobs: the ring buffer size is `TORCH_FR_BUFFER_SIZE`
+(`TORCH_NCCL_TRACE_BUFFER_SIZE` in 2.8 and older, still read), the dump file prefix is
+`TORCH_FR_DUMP_TEMP_FILE` (the old `TORCH_NCCL_DEBUG_INFO_TEMP_FILE` is still read; the new name
+wins when both are set), the debug pipe's `TORCH_NCCL_DEBUG_INFO_PIPE_FILE` kept its name, and the
+default dump location without a prefix variable moved from `/tmp/nccl_trace_rank_<rank>` to
+`$HOME/.cache/torch/comm_lib_trace_rank_<rank>`. The product reads both generations: the Node Agent
+resolves the dump location from the rank process's own environment (`/proc/<pid>/environ`, paths
+mapped into that process's mount namespace) with PyTorch's precedence -- `TORCH_FR_DUMP_TEMP_FILE`
+first, then `TORCH_NCCL_DEBUG_INFO_TEMP_FILE` -- and, when neither is set, waits on all three default
+generations at once: `$XDG_CACHE_HOME/torch/comm_lib_trace_rank_<rank>` (PyTorch main),
+`$HOME/.cache/torch/comm_lib_trace_rank_<rank>` (2.9.0; `/tmp/.cache/torch/...` when HOME is unset)
+and `/tmp/nccl_trace_rank_<rank>` (2.8 and older). The block above pins the dump file to
+`/tmp/nccl_trace_rank_` so 2.8 and 2.9 write the same path. Do not replace
+`TORCH_NCCL_TRACE_BUFFER_SIZE` with `TORCH_FR_BUFFER_SIZE` alone: whatever the PyTorch version, the
+debug pipe is created only when `TORCH_NCCL_TRACE_BUFFER_SIZE > 0` and
+`TORCH_NCCL_DEBUG_INFO_PIPE_FILE` is set (2.9.0 prints one deprecation warning for the old name,
+harmless); with the new name alone the triage records `pipe_missing` for the rank and its `hint`
+says why.
+
+Evidence (upstream sources, checked line by line; the tutorial's default sentence is stale -- do not
+"correct" the product's default candidates back to `/tmp/nccl_trace_rank_` alone on its strength):
+
+- `https://github.com/pytorch/pytorch/blob/v2.9.0/torch/csrc/distributed/c10d/FlightRecorder.cpp`
+  `DebugInfoWriter::getWriter`: `auto homeDir = getCvarString({"HOME"}, "/tmp");`,
+  `auto defaultLocation = cacheDirPath / "comm_lib_trace_rank_";`,
+  `std::string fileNamePrefix = getCvarString({"TORCH_FR_DUMP_TEMP_FILE", "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"}, defaultLocation.string().c_str());`
+  -- the file is the prefix with the rank appended, no extension (`FlightRecorder.hpp`, the
+  `DebugInfoWriter` constructor: `filename_ = c10::str(namePrefix, rank);`; same file,
+  `FlightRecorder()`: `max_entries_ = getCvarInt({"TORCH_FR_BUFFER_SIZE", "TORCH_NCCL_TRACE_BUFFER_SIZE"}, 0);`).
+- `https://github.com/pytorch/pytorch/blob/v2.9.0/torch/csrc/distributed/c10d/ProcessGroupNCCL.hpp`
+  `DumpPipe(int rank)`: `std::string fileStem = getCvarString({"TORCH_NCCL_DEBUG_INFO_PIPE_FILE"}, "");`,
+  `if (fileStem.empty() || getCvarInt({"TORCH_NCCL_TRACE_BUFFER_SIZE"}, 0) <= 0) { return; }`,
+  `std::string filename = c10::str(fileStem, rank, ".pipe");`; on main
+  `DumpPipe(rank, fileStem, traceBufferSize)` is still fed from `TORCH_NCCL_DEBUG_INFO_PIPE_FILE`
+  and `TORCH_NCCL_TRACE_BUFFER_SIZE`.
+- `https://github.com/pytorch/pytorch/blob/main/torch/csrc/distributed/c10d/FlightRecorder.cpp`
+  `DebugInfoWriter::getWriter`: the cache root is `XDG_CACHE_HOME` when set, else
+  `getCvarString({"HOME"}, "/tmp") + "/.cache"`, then `/torch`; the file stays
+  `comm_lib_trace_rank_` and both prefix variable names are unchanged.
+- The official tutorial `https://docs.pytorch.org/tutorials/unstable/flight_recorder_tutorial.html`
+  says of `TORCH_FR_DUMP_TEMP_FILE` "The default value is /tmp/nccl_trace_rank_", which is stale
+  against the 2.9.0 code (the default is `$HOME/.cache/torch/comm_lib_trace_rank_`); its example
+  still sets the old `TORCH_NCCL_DEBUG_INFO_TEMP_FILE`, it documents `TORCH_NCCL_TRACE_BUFFER_SIZE`
+  and `TORCH_NCCL_DUMP_ON_TIMEOUT` only, and it does not document the pipe variable.
+
+In the triage result each rank's `flight_recorder` reads: for a found dump `dump_file` is the path
+that matched and `dump_source` names the rule that produced it (`TORCH_FR_DUMP_TEMP_FILE`,
+`TORCH_NCCL_DEBUG_INFO_TEMP_FILE`, `pipe_sibling`, `torch_xdg_cache_default`,
+`torch_home_cache_default`, `legacy_tmp_default`); `dump_missing` carries every path that was waited
+on in `dump_candidates` and the prefix variable honoured in `dump_prefix_variable` (null means the
+defaults); `not_configured`/`pipe_missing` carry `trace_buffer` (the buffer variable read, by either
+name, its value, `enabled`, and the `pipe_enabled` the 2.9.0 DumpPipe sees). All of these are new
+optional fields; older records load as before.
 
 `scripts/e2e/regional/manifests/training/three-node-managed-pytorchjob.yaml`
 already contains this configuration, but the Runtime Profile is a placeholder; it must first be rendered with

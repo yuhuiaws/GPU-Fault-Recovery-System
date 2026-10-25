@@ -231,3 +231,71 @@ def test_dropping_the_xid45_evidence_from_the_policy_is_reported(
 
     assert len(failures) == 4, failures
     assert all("the GPU debug guidelines URL" in item for item in failures), failures
+
+
+FR_FACTS = tuple(
+    f"fr-dump-evidence-{label}{suffix}"
+    for suffix in ("", "-en")
+    for label in (
+        "url",
+        "quote",
+        "pipe-quote",
+        "url-main",
+        "tutorial-url",
+        "tutorial-stale-default",
+    )
+)
+FR_READER = "src/gpu_fault/node_agent/operations/flight_recorder.py"
+OPERATIONS_MANUAL = "docs/部署和运维手册.md"
+OPERATIONS_MANUAL_EN = "docs/en/deployment-and-operations-manual.md"
+
+
+def test_the_flight_recorder_evidence_is_cited_by_the_reader_and_both_manuals(
+    tmp_path: Path,
+) -> None:
+    """Batch 182: PyTorch 2.9 renamed the flight recorder knobs and moved the
+    default dump to ``$HOME/.cache/torch/comm_lib_trace_rank_<rank>``; the Node
+    Agent's reader and both language editions of the operations manual carry the
+    v2.9.0 and main source URLs, the quoted lines and the tutorial's stale
+    default sentence, so nobody "corrects" the default list back to
+    ``/tmp/nccl_trace_rank_`` alone."""
+
+    for relative in (OPERATIONS_MANUAL, OPERATIONS_MANUAL_EN):
+        _copy_doc(tmp_path, relative, None)
+    _copy_source(tmp_path, FR_READER, None)
+
+    assert MODULE.check_facts(tmp_path, _facts(*FR_FACTS)) == []
+
+
+def test_dropping_the_flight_recorder_citation_from_a_manual_is_reported(
+    tmp_path: Path,
+) -> None:
+    _copy_doc(tmp_path, OPERATIONS_MANUAL, None)
+    _copy_doc(
+        tmp_path,
+        OPERATIONS_MANUAL_EN,
+        (MODULE.FR_TUTORIAL_STALE_DEFAULT, "(stale note removed)"),
+    )
+    _copy_source(tmp_path, FR_READER, None)
+
+    failures = MODULE.check_facts(tmp_path, _facts(*FR_FACTS))
+
+    assert len(failures) == 1, failures
+    assert OPERATIONS_MANUAL_EN in failures[0] and "statement not found" in failures[0]
+
+
+def test_dropping_the_flight_recorder_default_from_the_reader_is_reported(
+    tmp_path: Path,
+) -> None:
+    for relative in (OPERATIONS_MANUAL, OPERATIONS_MANUAL_EN):
+        _copy_doc(tmp_path, relative, None)
+    _copy_source(
+        tmp_path,
+        FR_READER,
+        ('CACHE_DUMP_NAME = "comm_lib_trace_rank_"', 'CACHE_DUMP_NAME = "nccl_trace_"'),
+    )
+
+    failures = MODULE.check_facts(tmp_path, _facts(*FR_FACTS))
+
+    assert len(failures) == len(FR_FACTS), failures
+    assert all("the 2.9 default dump name" in item for item in failures), failures

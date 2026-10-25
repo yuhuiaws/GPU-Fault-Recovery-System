@@ -52,6 +52,32 @@ XID45_EVIDENCE_QUOTE = (
     "the GPU. Otherwise, this error is safe to ignore as an informational "
     "message."
 )
+# The PyTorch evidence for the flight recorder dump locations (batch 182): the
+# Node Agent's reader records it, and both language editions of the operations
+# manual cite it -- the v2.9.0 and main sources with the quoted lines, and the
+# official tutorial whose default sentence is stale against the 2.9.0 code.
+FLIGHT_RECORDER_READER = "src/gpu_fault/node_agent/operations/flight_recorder.py"
+OPERATIONS_MANUAL = "docs/部署和运维手册.md"
+OPERATIONS_MANUAL_EN = "docs/en/deployment-and-operations-manual.md"
+FR_EVIDENCE_URL = (
+    "https://github.com/pytorch/pytorch/blob/v2.9.0/"
+    "torch/csrc/distributed/c10d/FlightRecorder.cpp"
+)
+FR_EVIDENCE_MAIN_URL = (
+    "https://github.com/pytorch/pytorch/blob/main/"
+    "torch/csrc/distributed/c10d/FlightRecorder.cpp"
+)
+FR_TUTORIAL_URL = (
+    "https://docs.pytorch.org/tutorials/unstable/flight_recorder_tutorial.html"
+)
+FR_PREFIX_QUOTE = (
+    'getCvarString({"TORCH_FR_DUMP_TEMP_FILE", "TORCH_NCCL_DEBUG_INFO_TEMP_FILE"}, '
+    "defaultLocation.string().c_str())"
+)
+FR_PIPE_QUOTE = (
+    'if (fileStem.empty() || getCvarInt({"TORCH_NCCL_TRACE_BUFFER_SIZE"}, 0) <= 0)'
+)
+FR_TUTORIAL_STALE_DEFAULT = "The default value is /tmp/nccl_trace_rank_"
 
 Predicate = Callable[[Path], str | None]
 
@@ -188,6 +214,54 @@ def xid45_policy_records_the_evidence(root: Path) -> str | None:
     return None
 
 
+def flight_recorder_reader_records_the_evidence(root: Path) -> str | None:
+    """The reader carries PyTorch's URLs, the quoted lines and both defaults."""
+
+    tree = _parse(root, FLIGHT_RECORDER_READER)
+    if tree is None:
+        return f"{FLIGHT_RECORDER_READER} is missing"
+    missing = [
+        label
+        for label, text in (
+            ("the v2.9.0 FlightRecorder.cpp URL", FR_EVIDENCE_URL),
+            ("the main FlightRecorder.cpp URL", FR_EVIDENCE_MAIN_URL),
+            ("the tutorial URL", FR_TUTORIAL_URL),
+            ("the quoted dump-prefix resolution", FR_PREFIX_QUOTE),
+            ("the quoted DumpPipe gate", FR_PIPE_QUOTE),
+            ("the tutorial's stale default sentence", FR_TUTORIAL_STALE_DEFAULT),
+            ("the 2.9 default dump name", "comm_lib_trace_rank_"),
+            ("the legacy default dump prefix", "/tmp/nccl_trace_rank_"),
+            ("the new dump prefix variable", "TORCH_FR_DUMP_TEMP_FILE"),
+            ("the new buffer variable", "TORCH_FR_BUFFER_SIZE"),
+        )
+        if not _has_string(tree, text)
+    ]
+    if missing:
+        return f"{FLIGHT_RECORDER_READER} no longer records " + ", ".join(missing)
+    return None
+
+
+def _flight_recorder_statements() -> tuple[Statement, ...]:
+    phrases = (
+        ("url", FR_EVIDENCE_URL),
+        ("quote", FR_PREFIX_QUOTE),
+        ("pipe-quote", FR_PIPE_QUOTE),
+        ("url-main", FR_EVIDENCE_MAIN_URL),
+        ("tutorial-url", FR_TUTORIAL_URL),
+        ("tutorial-stale-default", FR_TUTORIAL_STALE_DEFAULT),
+    )
+    return tuple(
+        Statement(
+            id=f"fr-dump-evidence-{label}{suffix}",
+            document=document,
+            phrase=phrase,
+            truth=flight_recorder_reader_records_the_evidence,
+        )
+        for document, suffix in ((OPERATIONS_MANUAL, ""), (OPERATIONS_MANUAL_EN, "-en"))
+        for label, phrase in phrases
+    )
+
+
 FACTS: tuple[Fact, ...] = (
     Forbidden(
         id="test-file-count-not-literal",
@@ -261,6 +335,7 @@ FACTS: tuple[Fact, ...] = (
         phrase=XID45_EVIDENCE_QUOTE,
         truth=xid45_policy_records_the_evidence,
     ),
+    *_flight_recorder_statements(),
 )
 
 
