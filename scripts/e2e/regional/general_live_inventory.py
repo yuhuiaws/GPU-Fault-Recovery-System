@@ -100,6 +100,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     workflows_of,
 )
 
+NODE_REBOOT = "NODE_REBOOT"  # approval name the reboot-class variants of other modules import
 CASE_013 = "GF-GENERAL-LIVE-013"
 CASE_014 = "GF-GENERAL-LIVE-014"
 DETECTION_BUDGET = 420
