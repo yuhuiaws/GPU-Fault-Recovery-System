@@ -15,10 +15,21 @@ sampler is the effectiveness oracle; a tick that never crossed 95 % used makes
 the variant INCONCLUSIVE rather than PASS, and a cgroup OOM that never moved the
 host number would never be mistaken for host pressure.
 
-The spec's swap, read-failure and own-cgroup-OOM variants need either a swap
-device this site does not run (the spec forbids enabling business swap) or a
-unit-private ``/proc/meminfo`` / own-cgroup-OOM fixture that is not built in
-this phase; they stay in the denominator as NOT_RUN with their reason.
+``cgroup_only`` is the negative control, from the same probe's own-cgroup OOM
+mode (``memory-start --cgroup-oom-bytes``): a test cgroup capped far below the
+host (2 GiB; the probe refuses more than 1 % of MemTotal or the host's headroom
+under the rule) is exhausted so the kernel OOM-kills the allocator *inside*
+it -- systemd keeps the failed unit and ``memory-status`` reads its
+``Result=oom-kill`` -- while host ``memory_used_percent`` never moves.
+Repeated across a window longer than the rule's sustain plus a health summary,
+the product must mint no memory finding; an OOM line the (disabled by default)
+node log collector grades is a RUN_DIAGNOSTICS diagnostic at most, never a
+STOP, isolation or hardware step (``log_rules.py``).
+
+The spec's swap and read-failure variants need either a swap device this site
+does not run (the spec forbids enabling business swap) or a unit-private
+``/proc/meminfo`` replay that is not built in this phase; they stay in the
+denominator as NOT_RUN with their reason.
 """
 
 from __future__ import annotations
@@ -55,10 +66,15 @@ from scripts.e2e.regional.general_live_verdicts import (
     chain_errors,
     finding_incidents,
     hardware_errors,
+    isolation_operations,
+    minted_in_read,
+    node_isolated,
+    operations,
     oracle_values,
     samples,
     sustained,
     verdict,
+    workflows_of,
 )
 
 CASE = "GF-GENERAL-LIVE-002"
@@ -74,6 +90,13 @@ TARGET_USED_PERCENT = 96.5
 #: timed: it touches memory at a fixed pace, so a 2 TiB p5en host needs about
 #: 14 minutes (live 2026-10-24: 76 % after the 9-minute detection budget).
 RAMP_BUDGET = 1080
+#: cgroup_only: the test cgroup's cap, 0.1 % of a 2 TiB host (the probe refuses
+#: more than 1 % of MemTotal, or more than the host's headroom under the rule).
+CGROUP_OOM_CAP_BYTES = 2 << 30
+#: How long one allocator may take to be OOM-killed inside its cgroup.
+CGROUP_OOM_BUDGET = 300
+#: How many times the cgroup is exhausted across the negative window.
+CGROUP_OOM_REPEATS = 3
 
 
 def _require_memory_approval(ctx: VariantContext) -> None:
@@ -278,6 +301,199 @@ def no_swap(ctx: VariantContext) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# cgroup_only: an OOM inside a small test cgroup is not host pressure
+# --------------------------------------------------------------------------- #
+def _oom_cycle(ctx: VariantContext, cycle: int) -> dict[str, Any]:
+    """One bounded own-cgroup OOM: start, await systemd's oom-kill result, reset.
+
+    The allocator runs in a transient unit capped at ``CGROUP_OOM_CAP_BYTES``
+    with no swap and ``OOMPolicy=kill``; the kernel's cgroup OOM killer ends it
+    and systemd records ``Result=oom-kill`` on the (uncollected) failed unit,
+    which ``memory-stop`` then resets. Anything but that result -- the unit ran
+    out its RuntimeMaxSec, exited, or never ended within the budget -- means the
+    cgroup was not exhausted, so the variant is INCONCLUSIVE, never PASS.
+    """
+
+    started = ctx.node(
+        "memory-start",
+        "--cgroup-oom-bytes",
+        str(CGROUP_OOM_CAP_BYTES),
+        "--seconds",
+        str(CGROUP_OOM_BUDGET),
+        "--approved",
+    )
+    ctx.cleanup.push("memory", lambda: ctx.node("memory-stop"))
+    ctx.evidence.write(f"cgroup-oom-start-{cycle}", started)
+
+    def ended() -> dict[str, Any] | None:
+        status = ctx.node("memory-status")
+        unit = status.get("unit") or {}
+        if unit.get("Result") == "oom-kill" or unit.get("ActiveState") in {
+            "failed",
+            "inactive",
+        }:
+            return status
+        return None
+
+    status = ctx.wait_until(
+        ended,
+        timeout_seconds=CGROUP_OOM_BUDGET,
+        poll_seconds=5,
+        name=f"cgroup-oom-{cycle}",
+    )
+    stopped = ctx.node("memory-stop")
+    ctx.cleanup.discard("memory")
+    ctx.evidence.write(f"cgroup-oom-stop-{cycle}", stopped)
+    if status is None:
+        raise VariantInconclusive(
+            f"cycle {cycle}: the allocator was still running after "
+            f"{CGROUP_OOM_BUDGET} s; the cgroup cap was never reached"
+        )
+    unit = status.get("unit") or {}
+    if unit.get("Result") != "oom-kill":
+        raise VariantInconclusive(
+            f"cycle {cycle}: the allocator ended {unit.get('ActiveState')}/"
+            f"{unit.get('Result')} instead of oom-kill inside its cgroup"
+        )
+    record = {
+        "cycle": cycle,
+        "result": unit.get("Result"),
+        "exec_main_code": unit.get("ExecMainCode"),
+        "exec_main_status": unit.get("ExecMainStatus"),
+        "memory_max_bytes": started.get("memory_max_bytes"),
+        **dict((status or {}).get("memory") or {}),
+    }
+    ctx.evidence.append_oracle([record], source="cgroup-oom")
+    return record
+
+
+def _log_grading_errors(observed: dict[str, Any]) -> list[str]:
+    """An OOM log finding, if any, is a RUN_DIAGNOSTICS diagnostic, never a STOP.
+
+    The node log collector (disabled by default) grades ``out of memory`` /
+    ``killed process`` lines WARNING RUN_DIAGNOSTICS from any origin
+    (``log_rules.py``); the kernel collector only extracts XID/SXID records.
+    """
+
+    errors = []
+    for item in observed.get("incidents") or []:
+        event_id = str(item.get("event_id") or "")
+        if item.get("event_type") != "NODE_HEALTH" or not event_id.startswith("log-"):
+            continue
+        if not minted_in_read(observed, item):
+            continue
+        action = item.get("effective_action")
+        if action != "RUN_DIAGNOSTICS":
+            errors.append(
+                f"OOM log incident {item['incident_id']} was graded {action}, "
+                "not RUN_DIAGNOSTICS"
+            )
+        for workflow in workflows_of(observed, str(item["incident_id"])):
+            if "STOP_WORKLOADS" in operations(workflow):
+                errors.append(
+                    f"workflow {workflow.get('request_id')} stopped a workload "
+                    "for a cgroup OOM line"
+                )
+    return errors
+
+
+def cgroup_only(ctx: VariantContext) -> dict[str, Any]:
+    """A cgroup-local OOM is not host pressure: no memory finding, no isolation."""
+
+    survey = run_survey(ctx)
+    require_tools(survey, "systemd-run")
+    _require_memory_approval(ctx)
+    total = float((survey.get("memory") or {}).get("MemTotal") or 0)
+    started_at = utc_now()
+    # A finding mis-graded from the OOM would have to show inside the rule's
+    # sustain plus one health summary; the window outlasts both.
+    window = SUSTAIN_SECONDS + ctx.host_summary + ctx.host_interval * 4
+    oracle = Oracle(ctx, "cgroup")
+    oracle.start(
+        window + CGROUP_OOM_REPEATS * CGROUP_OOM_BUDGET + 120, interval=5, meminfo=True
+    )
+    kills = []
+    for cycle in range(CGROUP_OOM_REPEATS):
+        kills.append(_oom_cycle(ctx, cycle))
+        ctx.hold(window / CGROUP_OOM_REPEATS, name=f"cgroup-window-{cycle}")
+    oracle.read()
+    host_used = oracle_values(
+        oracle.records, lambda record: record.get("memory_used_percent")
+    )
+    if not host_used:
+        raise VariantInconclusive("the meminfo oracle recorded no host reading")
+    if max(host_used) >= USED_THRESHOLD:
+        raise VariantInconclusive(
+            f"host memory_used reached {max(host_used):.1f}% during the window: the "
+            "host itself was under pressure, so a cgroup-local OOM cannot be told apart"
+        )
+    observed = activity(
+        ctx,
+        started_at,
+        metrics={"memory_used_percent", "memory_available_percent"},
+        kinds=("HOST_TELEMETRY", "NODE_LOGS"),
+    )
+    host_samples = [
+        item
+        for item in samples(observed, "memory_used_percent")
+        if isinstance(item.get("value"), (int, float))
+    ]
+    if not host_samples:
+        raise VariantInconclusive(
+            "no accepted host memory sample reached the product during the window; "
+            "a silent channel cannot prove how the OOM was graded"
+        )
+    isolation = isolation_operations(observed)
+    node = ctx.regional.node_snapshot(ctx.settings.node)
+    stages = {
+        "no_host_pressure_finding": chain_errors(
+            observed, ChainExpectation(metric="memory_used_percent", present=False)
+        ),
+        "no_low_memory_finding": chain_errors(
+            observed,
+            ChainExpectation(metric="memory_available_percent", present=False),
+        ),
+        "host_samples_normal": [
+            f"the product accepted memory_used_percent {item['value']} at "
+            f"{item['observed_at']}"
+            for item in host_samples
+            if item["value"] >= USED_THRESHOLD
+        ],
+        "log_grading": _log_grading_errors(observed),
+        "hardware": hardware_errors(observed),
+        "no_isolation": (
+            [f"isolation operations planned: {isolation}"] if isolation else []
+        )
+        + (
+            ["the node is isolated after a cgroup-local OOM"]
+            if node_isolated(node)
+            else []
+        ),
+    }
+    return _result(
+        stages,
+        notes=[
+            "a cgroup-local OOM proves cgroup exhaustion only, never host "
+            "memory_used >= 95 %",
+            "an OOM log line, when the node log collector is enabled, is a "
+            "RUN_DIAGNOSTICS diagnostic at most",
+        ],
+        extra={
+            "cgroup_oom_kills": kills,
+            "cgroup_cap_percent_of_host": (
+                100 * CGROUP_OOM_CAP_BYTES / total if total else None
+            ),
+            "host_used_percent": {
+                "min": min(host_used),
+                "max": max(host_used),
+                "ticks": len(host_used),
+            },
+            "host_samples": host_samples[-3:],
+        },
+    )
+
+
+# --------------------------------------------------------------------------- #
 # shared helpers
 # --------------------------------------------------------------------------- #
 def _await_recovery(
@@ -355,17 +571,31 @@ VARIANTS = [
         max_minutes=8,
         execute=no_swap,
     ),
-    deferred_variant(
-        CASE,
-        "cgroup_only",
+    VariantSpec(
+        case_id=CASE,
+        variant="cgroup_only",
         proof_mode=NATIVE,
-        reason=(
-            "FIXTURE_NOT_READY: a container OOM that does not move host "
-            "memory_used needs a bounded own-cgroup OOM injection mode the node "
-            "probe does not have yet"
-        ),
         lanes=("eks", "hp"),
-        expected="a cgroup OOM is not host pressure: no memory_used_percent finding",
+        risk="M",
+        flags="S",
+        injection=(
+            "exhaust a 2 GiB test cgroup (MemoryMax, no swap, OOMPolicy=kill) 3 times "
+            "across a window longer than the memory rule's sustain plus a health "
+            "summary; the kernel OOM-kills the allocator inside the cgroup and host "
+            "memory_used stays normal"
+        ),
+        expected=(
+            "no memory_used_percent / memory_available_percent finding; an OOM log "
+            "line is RUN_DIAGNOSTICS at most; no STOP, isolation or hardware step; "
+            "the node stays schedulable"
+        ),
+        cleanup=(
+            "reset the OOM-killed test unit after each cycle, disarm its deadman, "
+            "stop the oracle"
+        ),
+        max_minutes=30,
+        approvals=("HOST_MEMORY_PRESSURE",),
+        execute=cgroup_only,
     ),
     deferred_variant(
         CASE,

@@ -227,3 +227,222 @@ def test_no_swap_blocks_when_the_node_has_swap(tmp_path: Path) -> None:
     )
     with pytest.raises(VariantBlocked, match="swapless"):
         spec.execute(ctx)
+
+
+# --------------------------------------------------------------------------- #
+# cgroup_only: an OOM inside a small test cgroup is not host pressure
+# --------------------------------------------------------------------------- #
+def oom_status(
+    result: str = "oom-kill", state: str = "failed", used: float = 60.0
+) -> dict[str, Any]:
+    return {
+        "unit": {
+            "ActiveState": state,
+            "Result": result,
+            "ExecMainCode": "killed",
+            "ExecMainStatus": "9",
+        },
+        "memory": {"memory_used_percent": used},
+    }
+
+
+def cgroup_node_probe(
+    statuses: list[dict[str, Any]] | None = None, used: float = 60.0
+) -> FakeProbe:
+    return FakeProbe(
+        {
+            "survey": survey_response(),
+            "memory-start": {
+                "unit": "gfrs-x-memory",
+                "memory_max_bytes": 2 << 30,
+                "cgroup_oom": True,
+            },
+            "memory-status": statuses or [oom_status("", "active"), oom_status()],
+            "memory-stop": {"stopped": {"ActiveState": "inactive"}},
+            "oracle-start": {"unit": "gfrs-x-oracle"},
+            "oracle-stop": {"stopped": {}},
+            "oracle-read": [
+                oracle_records(used),
+                {"records": [], "next_offset": 40, "total": 40},
+            ],
+        }
+    )
+
+
+def quiet_activity(
+    used: float = 60.0,
+    incidents: list[dict[str, Any]] | None = None,
+    workflows: list[dict[str, Any]] | None = None,
+    batches: int = 3,
+) -> dict[str, Any]:
+    return {
+        "incidents": incidents or [],
+        "workflows": workflows or [],
+        "batches": [
+            host_batch(f"2026-10-24T00:0{index}:00+00:00", "memory_used_percent", used)
+            for index in range(batches)
+        ],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+        "metric_latest": [],
+    }
+
+
+def log_incident(action: str, workflow_id: str = "wf-log") -> dict[str, Any]:
+    return {
+        "incident_id": "inc-log",
+        "event_id": "log-oom-abc",
+        "event_type": "NODE_HEALTH",
+        "state": "ACTION_PENDING",
+        "effective_action": action,
+        "created_at": "2026-10-24T00:03:00+00:00",
+        "workflow_request_id": workflow_id,
+        "node_ids": [NODE],
+    }
+
+
+def cgroup_context(
+    tmp_path: Path, document: dict[str, Any], probe: FakeProbe | None = None
+) -> Any:
+    spec = SPECS["cgroup_only"]
+    regional = FakeRegional(cpu_python=store_script({"activity": document}))
+    return make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes={f"node@{NODE}": probe or cgroup_node_probe()},
+    )
+
+
+def test_cgroup_only_passes_without_a_memory_finding(tmp_path: Path) -> None:
+    probe = cgroup_node_probe()
+    ctx = cgroup_context(tmp_path, quiet_activity(), probe)
+    result = SPECS["cgroup_only"].execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    starts = [call for call in probe.calls if call[0] == "memory-start"]
+    assert len(starts) == mem.CGROUP_OOM_REPEATS
+    assert all(
+        "--cgroup-oom-bytes" in call and "--approved" in call for call in starts
+    ), starts
+    assert all(
+        call[call.index("--cgroup-oom-bytes") + 1] == str(mem.CGROUP_OOM_CAP_BYTES)
+        for call in starts
+    ), "all((call[call.index('--cgroup-oom-bytes') + 1] == str(mem.CGROUP_OOM_"
+    assert "--target-used-percent" not in starts[0]
+    stops = [call for call in probe.calls if call[0] == "memory-stop"]
+    assert len(stops) == mem.CGROUP_OOM_REPEATS, "every OOM-killed unit is reset"
+    assert "memory" not in ctx.cleanup.pending()
+    assert len(result["cgroup_oom_kills"]) == mem.CGROUP_OOM_REPEATS
+    assert all(item["result"] == "oom-kill" for item in result["cgroup_oom_kills"]), (
+        "all((item['result'] == 'oom-kill' for item in result['cgroup_oom_kills"
+    )
+    assert result["host_used_percent"]["max"] < mem.USED_THRESHOLD
+    assert round(result["cgroup_cap_percent_of_host"], 2) == 0.11
+    assert (ctx.case_dir / "oracle.jsonl").is_file(), "oracle evidence written"
+
+
+def test_cgroup_only_needs_the_approval(tmp_path: Path) -> None:
+    spec = SPECS["cgroup_only"]
+    settings = make_settings(spec, node=NODE)
+    object.__setattr__(settings, "approvals", ())
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=store_script({"activity": quiet_activity()})),
+        probes={f"node@{NODE}": cgroup_node_probe()},
+        settings=settings,
+    )
+    with pytest.raises(VariantNotRun, match="HOST_MEMORY_PRESSURE"):
+        spec.execute(ctx)
+
+
+def test_cgroup_only_is_inconclusive_when_the_unit_was_not_oom_killed(
+    tmp_path: Path,
+) -> None:
+    probe = cgroup_node_probe(statuses=[oom_status("success", "inactive")])
+    ctx = cgroup_context(tmp_path, quiet_activity(), probe)
+    with pytest.raises(VariantInconclusive, match="instead of oom-kill"):
+        SPECS["cgroup_only"].execute(ctx)
+    assert [call[0] for call in probe.calls if call[0] == "memory-stop"] == [
+        "memory-stop"
+    ], "the unit is reset before the verdict is abandoned"
+    assert "memory" not in ctx.cleanup.pending()
+
+
+def test_cgroup_only_is_inconclusive_when_the_unit_never_ended(tmp_path: Path) -> None:
+    probe = cgroup_node_probe(statuses=[oom_status("", "active")])
+    ctx = cgroup_context(tmp_path, quiet_activity(), probe)
+    with pytest.raises(VariantInconclusive, match="still running"):
+        SPECS["cgroup_only"].execute(ctx)
+
+
+def test_cgroup_only_is_inconclusive_when_the_host_itself_was_under_pressure(
+    tmp_path: Path,
+) -> None:
+    ctx = cgroup_context(tmp_path, quiet_activity(), cgroup_node_probe(used=96.0))
+    with pytest.raises(VariantInconclusive, match="under pressure"):
+        SPECS["cgroup_only"].execute(ctx)
+
+
+def test_cgroup_only_is_inconclusive_without_a_fresh_host_sample(
+    tmp_path: Path,
+) -> None:
+    ctx = cgroup_context(tmp_path, quiet_activity(batches=0))
+    with pytest.raises(VariantInconclusive, match="silent channel"):
+        SPECS["cgroup_only"].execute(ctx)
+
+
+def test_cgroup_only_fails_when_the_product_minted_a_memory_finding(
+    tmp_path: Path,
+) -> None:
+    ctx = cgroup_context(tmp_path, chain_activity())
+    result = SPECS["cgroup_only"].execute(ctx)
+    assert result["verdict"] == "FAIL"
+    assert any(
+        "unexpected memory_used_percent incident" in e for e in result["errors"]
+    ), result["errors"]
+
+
+def test_cgroup_only_fails_when_an_oom_log_line_isolated_the_node(
+    tmp_path: Path,
+) -> None:
+    document = quiet_activity(
+        incidents=[log_incident("QUARANTINE")],
+        workflows=[
+            workflow(
+                "wf-log",
+                "inc-log",
+                ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"],
+            )
+        ],
+    )
+    result = SPECS["cgroup_only"].execute(cgroup_context(tmp_path, document))
+    assert result["verdict"] == "FAIL"
+    assert any("graded QUARANTINE" in e for e in result["errors"]), result["errors"]
+    assert any("isolation operations" in e for e in result["errors"]), result["errors"]
+
+
+def test_cgroup_only_accepts_a_diagnostic_only_oom_log_finding(tmp_path: Path) -> None:
+    document = quiet_activity(
+        incidents=[log_incident("RUN_DIAGNOSTICS")],
+        workflows=[workflow("wf-log", "inc-log", ["FREEZE_EVIDENCE", "VALIDATE_HOST"])],
+    )
+    result = SPECS["cgroup_only"].execute(cgroup_context(tmp_path, document))
+    assert result["verdict"] == "PASS", result["errors"]
+    stopped = quiet_activity(
+        incidents=[log_incident("RUN_DIAGNOSTICS")],
+        workflows=[
+            workflow("wf-log", "inc-log", ["FREEZE_EVIDENCE", "STOP_WORKLOADS"])
+        ],
+    )
+    result = SPECS["cgroup_only"].execute(cgroup_context(tmp_path, stopped))
+    assert result["verdict"] == "FAIL"
+    assert any("stopped a workload" in e for e in result["errors"]), result["errors"]
+
+
+def test_cgroup_only_spec_reuses_the_memory_approval() -> None:
+    spec = SPECS["cgroup_only"]
+    assert spec.implemented and spec.approvals == ("HOST_MEMORY_PRESSURE",)
+    assert spec.lanes == ("eks", "hp") and spec.proof_mode == "native"

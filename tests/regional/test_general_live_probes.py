@@ -531,3 +531,145 @@ def test_efa_traffic_reading_falls_back_to_send_recv(tmp_path: Path) -> None:
     _efa_port(tmp_path, "rdmap0", "1", {"send_bytes": 300, "recv_bytes": 200})
     reading = nodep.efa_traffic_reading(tmp_path)
     assert reading["pair_bytes_total"] == 500 and reading["complete_pairs"] is True
+
+
+# --------------------------------------------------------------------------- #
+# node probe: own-cgroup OOM mode of memory-start, memory-status
+# --------------------------------------------------------------------------- #
+RUN = "gl2-cgroup-only-a1-deadbeef"
+GIB = 1024**3
+
+
+def _node_probe_runner(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    *,
+    total_gib: int = 2000,
+    available_gib: int = 1200,
+) -> tuple[list[list[str]], list[dict[str, Any]]]:
+    calls: list[list[str]] = []
+    emitted: list[dict[str, Any]] = []
+    monkeypatch.setattr(nodep, "STATE_ROOT", tmp_path / "state")
+
+    def fake_run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        calls.append(list(command))
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    monkeypatch.setattr(nodep, "run", fake_run)
+    monkeypatch.setattr(
+        nodep, "arm_deadman", lambda run_id, kind, seconds, *a: f"deadman-{kind}"
+    )
+    monkeypatch.setattr(
+        nodep,
+        "meminfo",
+        lambda: {"MemTotal": total_gib * GIB, "MemAvailable": available_gib * GIB},
+    )
+    monkeypatch.setattr(nodep, "emit", emitted.append)
+    return calls, emitted
+
+
+def _memory_start(*argv: str) -> None:
+    arguments = nodep.parser().parse_args(["memory-start", "--run-id", RUN, *argv])
+    arguments.handler(arguments)
+
+
+def test_node_memory_start_cgroup_oom_mode(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls, emitted = _node_probe_runner(monkeypatch, tmp_path)
+    _memory_start("--cgroup-oom-bytes", str(2 * GIB), "--seconds", "300", "--approved")
+    unit = next(call for call in calls if call[0] == "systemd-run")
+    assert "--collect" not in unit, "the failed unit is kept for memory-status"
+    assert f"--property=MemoryMax={2 * GIB}" in unit
+    assert "--property=MemorySwapMax=0" in unit and "--property=OOMPolicy=kill" in unit
+    assert "--property=RuntimeMaxSec=300" in unit
+    assert nodep.CGROUP_OOM_ALLOCATOR in unit and nodep.MEMORY_ALLOCATOR not in unit
+    assert unit[unit.index(nodep.CGROUP_OOM_ALLOCATOR) + 2] == "300", (
+        "argv[2] = seconds"
+    )
+    assert emitted[-1]["cgroup_oom"] is True
+    assert emitted[-1]["memory_max_bytes"] == 2 * GIB
+    assert emitted[-1]["target_used_percent"] is None
+    assert emitted[-1]["deadman"] == "deadman-memory"
+
+
+def test_node_memory_start_host_mode_is_unchanged(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls, emitted = _node_probe_runner(monkeypatch, tmp_path)
+    _memory_start("--target-used-percent", "96.5", "--seconds", "300", "--approved")
+    unit = next(call for call in calls if call[0] == "systemd-run")
+    assert "--collect" in unit
+    assert nodep.MEMORY_ALLOCATOR in unit and nodep.CGROUP_OOM_ALLOCATOR not in unit
+    assert emitted[-1]["cgroup_oom"] is False
+    assert emitted[-1]["target_used_percent"] == 96.5
+    assert emitted[-1]["memory_max_bytes"] == int(2000 * GIB * 97.5 / 100)
+
+
+def test_node_memory_start_cgroup_oom_bounds(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _node_probe_runner(monkeypatch, tmp_path)
+    with pytest.raises(nodep.ProbeError, match="outside"):
+        _memory_start(
+            "--cgroup-oom-bytes", str(GIB // 1024), "--seconds", "300", "--approved"
+        )
+    with pytest.raises(nodep.ProbeError, match="memory target"):
+        _memory_start("--seconds", "300", "--approved")
+    with pytest.raises(nodep.ProbeError, match="approval"):
+        _memory_start("--cgroup-oom-bytes", str(2 * GIB), "--seconds", "300")
+    # 2 GiB of a 100 GiB host is 2 %: more than the 1 % the mode allows.
+    _node_probe_runner(monkeypatch, tmp_path, total_gib=100, available_gib=60)
+    with pytest.raises(nodep.ProbeError, match="1 % of MemTotal or host headroom"):
+        _memory_start(
+            "--cgroup-oom-bytes", str(2 * GIB), "--seconds", "300", "--approved"
+        )
+    # A host already at 92.5 % used has no headroom under the 95 % rule.
+    _node_probe_runner(monkeypatch, tmp_path, total_gib=2000, available_gib=150)
+    with pytest.raises(nodep.ProbeError, match="host headroom"):
+        _memory_start(
+            "--cgroup-oom-bytes", str(2 * GIB), "--seconds", "300", "--approved"
+        )
+
+
+def test_node_memory_status_reads_the_unit_result(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _, emitted = _node_probe_runner(monkeypatch, tmp_path)
+    seen: list[str] = []
+
+    def fake_unit_state(unit: str) -> dict[str, str]:
+        seen.append(unit)
+        return {"ActiveState": "failed", "Result": "oom-kill", "ExecMainStatus": "9"}
+
+    monkeypatch.setattr(nodep, "unit_state", fake_unit_state)
+    arguments = nodep.parser().parse_args(["memory-status", "--run-id", RUN])
+    arguments.handler(arguments)
+    assert seen == [f"{nodep.unit_name(RUN, 'memory')}.service"]
+    assert emitted[-1]["unit"]["Result"] == "oom-kill"
+    assert "memory_used_percent" in emitted[-1]["memory"]
+
+
+def test_node_unit_state_includes_the_oom_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    commands: list[list[str]] = []
+
+    def fake_run(command: list[str], **_: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(list(command))
+        return subprocess.CompletedProcess(
+            command,
+            0,
+            "LoadState=loaded\nActiveState=failed\nResult=oom-kill\nExecMainStatus=9\n",
+            "",
+        )
+
+    monkeypatch.setattr(nodep, "run", fake_run)
+    state = nodep.unit_state("gfrs-x-memory.service")
+    assert state["Result"] == "oom-kill" and state["ExecMainStatus"] == "9"
+    assert state["ActiveState"] == "failed" and state["returncode"] == "0"
+    properties = [item for item in commands[0] if item.startswith("--property=")]
+    assert len(properties) == 1
+    assert {"Result", "ExecMainCode", "ExecMainStatus", "ActiveState"} <= set(
+        properties[0].removeprefix("--property=").split(",")
+    )

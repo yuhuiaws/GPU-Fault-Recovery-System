@@ -244,14 +244,9 @@ def unit_state(unit: str) -> dict[str, str]:
             "systemctl",
             "show",
             unit,
-            "--property=LoadState",
-            "--property=ActiveState",
-            "--property=SubState",
-            "--property=UnitFileState",
-            "--property=MainPID",
-            "--property=NRestarts",
-            "--property=InvocationID",
-            "--property=ExecMainStartTimestamp",
+            "--property=LoadState,ActiveState,SubState,UnitFileState,MainPID,"
+            "NRestarts,InvocationID,ExecMainStartTimestamp,Result,ExecMainCode,"
+            "ExecMainStatus",
         ],
         check=False,
     )
@@ -312,6 +307,7 @@ def start_unit(
     seconds: int,
     command: list[str],
     *properties: str,
+    collect: bool = True,
 ) -> str:
     """A transient unit that stops itself after ``seconds`` (``RuntimeMaxSec``)."""
 
@@ -327,7 +323,7 @@ def start_unit(
         [
             "systemd-run",
             f"--unit={name}",
-            "--collect",
+            *(["--collect"] if collect else []),
             f"--property=RuntimeMaxSec={int(seconds)}",
             *[f"--property={item}" for item in properties],
             *command,
@@ -1031,38 +1027,74 @@ while time.monotonic() < deadline:
     time.sleep(1)
 """
 
+#: Exhausts its own cgroup: touches anonymous memory until the kernel's cgroup
+#: OOM killer ends it (same argv as MEMORY_ALLOCATOR; only the seconds count).
+CGROUP_OOM_ALLOCATOR = r"""
+import mmap, sys, time
+deadline, step, chunks = time.monotonic() + float(sys.argv[2]), 64 << 20, []
+while time.monotonic() < deadline:
+    chunk = mmap.mmap(-1, step, flags=mmap.MAP_PRIVATE | mmap.MAP_ANONYMOUS)
+    for offset in range(0, step, 4096):
+        chunk[offset] = 1
+    chunks.append(chunk)
+"""
+
 
 def memory_start(arguments: argparse.Namespace) -> None:
-    """Host memory pressure inside its own capped cgroup (needs approval)."""
+    """Host memory pressure inside its own capped cgroup (needs approval).
+
+    ``--cgroup-oom-bytes`` caps the cgroup far below the host instead (at most
+    1 % of MemTotal and within the host's headroom under the 95 % rule) and the
+    allocator is OOM-killed inside it; that unit is kept, not collected, so
+    ``memory-status`` can report its ``Result=oom-kill``.
+    """
 
     if not arguments.approved:
         raise ProbeError("host memory pressure requires the runner's approval")
     run_id = checked_run_id(arguments.run_id)
-    target = float(arguments.target_used_percent)
-    if not 50.0 <= target <= MAX_MEMORY_USED_PERCENT:
-        raise ProbeError("memory target is outside 50..97 percent")
     seconds = bounded(arguments.seconds, 60, 1800, "seconds")
     total = meminfo()["MemTotal"]
-    cap = int(total * (MAX_MEMORY_USED_PERCENT + 0.5) / 100)
+    oom_bytes = int(arguments.cgroup_oom_bytes or 0)
+    target = arguments.target_used_percent
+    if oom_bytes:
+        cap = bounded(oom_bytes, 256 << 20, 64 << 30, "cgroup OOM cap bytes")
+        used = memory_percentages(meminfo())["memory_used_percent"]
+        if 100 * cap / total > min(1.0, MAX_MEMORY_USED_PERCENT - 7 - used):
+            raise ProbeError("cgroup OOM cap exceeds 1 % of MemTotal or host headroom")
+    elif target is None or not 50.0 <= target <= MAX_MEMORY_USED_PERCENT:
+        raise ProbeError("memory target is outside 50..97 percent")
+    else:
+        cap = int(total * (MAX_MEMORY_USED_PERCENT + 0.5) / 100)
+    script = CGROUP_OOM_ALLOCATOR if oom_bytes else MEMORY_ALLOCATOR
     deadman = arm_deadman(run_id, "memory", seconds + 120)
     unit = start_unit(
         run_id,
         "memory",
         seconds,
-        [sys.executable, "-c", MEMORY_ALLOCATOR, str(target), str(seconds), "2.5"],
+        [sys.executable, "-c", script, str(target), str(seconds), "2.5"],
         f"MemoryMax={cap}",
         "MemorySwapMax=0",
         "OOMPolicy=kill",
         "Nice=19",
+        collect=not oom_bytes,
     )
     emit(
         {
             "unit": unit,
             "target_used_percent": target,
             "memory_max_bytes": cap,
+            "cgroup_oom": bool(oom_bytes),
             "deadman": deadman,
         }
     )
+
+
+def memory_status(arguments: argparse.Namespace) -> None:
+    """The memory unit's systemd record (``Result=oom-kill`` after a cgroup OOM)."""
+
+    run_id = checked_run_id(arguments.run_id)
+    unit = f"{unit_name(run_id, 'memory')}.service"
+    emit({"unit": unit_state(unit), "memory": memory_percentages(meminfo())})
 
 
 def memory_stop(arguments: argparse.Namespace) -> None:
@@ -1410,9 +1442,11 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--backing", required=True)
     command("page-cache-stop", page_cache_stop)
     item = command("memory-start", memory_start)
-    item.add_argument("--target-used-percent", type=float, required=True)
+    item.add_argument("--target-used-percent", type=float, default=None)
+    item.add_argument("--cgroup-oom-bytes", type=int, default=0)
     item.add_argument("--seconds", type=int, required=True)
     item.add_argument("--approved", action="store_true")
+    command("memory-status", memory_status)
     command("memory-stop", memory_stop)
 
     item = command("unit-pause", unit_pause)

@@ -57,7 +57,9 @@ NOT_RUN_REASONS = (
 APPROVALS: dict[str, str] = {
     "HOST_MEMORY_PRESSURE": (
         "hold host memory use at about 96 % in a capped test cgroup "
-        "(MemoryMax, no swap, OOMPolicy=kill)"
+        "(MemoryMax, no swap, OOMPolicy=kill), or exhaust a small capped test "
+        "cgroup (at most 1 % of MemTotal) so the kernel OOM-kills the allocator "
+        "inside it while host memory use stays normal (002 cgroup_only)"
     ),
     "KERNEL_MODULE_LOAD": (
         "load a kernel module the node does not have loaded (dm_delay, veth, "

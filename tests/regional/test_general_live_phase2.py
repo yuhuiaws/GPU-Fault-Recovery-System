@@ -88,6 +88,7 @@ def test_only_the_native_and_observation_variants_execute() -> None:
         if spec.number in LANE_CATEGORIES and spec.implemented
     )
     assert implemented == [
+        "GF-GENERAL-LIVE-002.cgroup_only",
         "GF-GENERAL-LIVE-002.memory_pressure",
         "GF-GENERAL-LIVE-002.no_swap",
         "GF-GENERAL-LIVE-002.recovery",
