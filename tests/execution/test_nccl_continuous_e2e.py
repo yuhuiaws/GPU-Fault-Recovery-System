@@ -4,6 +4,7 @@ from gpu_fault.hung_summary_codec import decode_summary
 from gpu_fault.models import IncidentState, WorkflowStatus
 from gpu_fault.models import WorkflowOperation as Op
 from gpu_fault.watcher import WorkloadPhase
+from scripts.e2e.regional import general_live_nccl as nccl_case
 from tests.execution._nccl_chain_support import chain_fixture as chain_fixture
 
 FORBIDDEN = {
@@ -406,6 +407,70 @@ def test_missing_workload_scope_skips_attachments_and_requires_operator_review(c
     assert {item.operation for item in rig.commands} == {Op.COLLECT_HUNG_SUMMARY}, (
         rig.commands
     )
+
+
+@pytest.mark.parametrize(
+    "flight_recorder", [True, False], ids=["fr_enabled", "fr_disabled"]
+)
+def test_a_live_managed_job_is_scoped_by_its_runtime_container_ids(
+    chain, flight_recorder
+):
+    """GF-GENERAL-LIVE-011.fr_enabled / fr_disabled, HyperPod R13d (2026-10-25).
+
+    Two nodes, no cgroup annotation on the Pods -- what the live job looked
+    like. Both recorded triage decisions requested no node at all
+    (``active_requested_node_count`` 0, both nodes ``not_sampled_nodes``,
+    ``NO_VALID_SURVEY``) with a node budget of 2, FR on or off: every summary
+    was ``SCOPE_UNKNOWN``. With the kubelet's container ids each node resolves
+    its container cgroup, both nodes are surveyed and sampled, and the runner's
+    own ``fr_dumps`` oracle passes on the records as its live probe dumps them.
+    """
+
+    rig = chain(nodes=2, mode="fr-lag" if flight_recorder else "normal")
+    rig.use_runtime_container_ids()
+    workflow = rig.trigger()
+    rig.healthy()
+    saved = settled(rig, workflow)
+    surveys = [
+        item
+        for item in saved.step_executions
+        if item.operation is Op.COLLECT_HUNG_SUMMARY
+    ]
+    for survey in surveys:
+        assert survey.details["hung_survey"]["responding_node_count"] == 2, survey
+    _, report = decision(saved)
+    assert report["active_requested_node_count"] == 2, report
+    assert report["not_sampled_nodes"] == [], report
+    triage = [
+        decode_summary(value)
+        for item in saved.step_executions
+        if item.operation is Op.COLLECT_HUNG_TRIAGE
+        for value in item.details["node_results"].values()
+    ]
+    assert len(triage) == 2, triage
+    for document in triage:
+        assert document["workload_scope"]["resolved_container_count"] == 1, document
+        [row] = document["ranks"]
+        assert row["process_identity"]["verified"] is True, row
+        if flight_recorder:
+            assert row["flight_recorder_series"]["status"] == "PAIRED", row
+        else:
+            assert row["flight_recorder"]["status"] == "not_configured", row
+    incident = rig.store.get_incident(saved.incident_id)
+    records = {
+        "incidents": [
+            {
+                "incident_id": incident.incident_id,
+                "event_id": incident.event_id,
+                "state": incident.state.value,
+                "workflow_request_id": incident.workflow_request_id,
+                "created_at": incident.created_at.isoformat(),
+            }
+        ],
+        "workflows": {saved.request_id: saved.model_dump(mode="json")},
+    }
+    assert nccl_case.hung_incident(records) is not None, records["incidents"]
+    assert nccl_case.fr_errors(records, expect_configured=flight_recorder) == []
 
 
 def test_whole_task_communication_summary_prioritizes_an_unsampled_lagging_node(chain):

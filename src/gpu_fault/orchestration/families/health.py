@@ -34,6 +34,10 @@ from gpu_fault.workflow_quarantine import (
     TERMINAL_QUARANTINE_NODES,
     inherit_terminal_quarantine,
 )
+from gpu_fault.workload_container_scope import (
+    WORKLOAD_CONTAINER_IDS,
+    container_ids_by_node,
+)
 
 LOGGER = logging.getLogger(__name__)
 
@@ -249,6 +253,11 @@ class NodeHealthPlanBuilder:
             )
             for node in target_node_ids
         }
+        # A managed Pod names no cgroup (nothing sets the annotation); the node
+        # finds the cgroup its runtime named after the kubelet's container id.
+        container_ids = container_ids_by_node(active, target_node_ids)
+        if any(container_ids.values()):
+            parameters[WORKLOAD_CONTAINER_IDS] = container_ids
         self._add_gpu_and_rank_context(
             active,
             target_node_ids,

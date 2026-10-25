@@ -699,6 +699,107 @@ def test_efa_hung_finding_requests_process_diagnostic_bundle(
     assert bundle.parameters["hung_triage_target_pending"] is True
 
 
+def test_efa_hung_dag_sends_the_runtime_container_ids_a_node_resolves(
+    context: ApplicationContext,
+) -> None:
+    """A live managed Pod has a runtime container id and no cgroup path.
+
+    HyperPod GF-GENERAL-LIVE-011 (2026-10-24/25): ``{node: []}`` was all the
+    hung DAG ever sent, so no node could scope a process. The container id the
+    kubelet reports is the scope a node can resolve; an annotated container
+    keeps its explicit path and an id no node could match is not sent.
+    """
+
+    first, second, annotated = ("a1" * 32, "b2" * 32, "c3" * 32)
+    context.store.save_attempt_observation(
+        attempt_observation(
+            "job-a",
+            "attempt-a",
+            NOW,
+            expected_critical_ranks=4,
+            containers=[
+                container_observation(
+                    "pod-a",
+                    "master-0",
+                    0,
+                    "node-a",
+                    gpu_uuids=["GPU-a"],
+                    container_id=f"containerd://{first}",
+                ),
+                container_observation(
+                    "pod-b",
+                    "worker-0",
+                    1,
+                    "node-b",
+                    gpu_uuids=["GPU-b"],
+                    container_id=f"containerd://{second}",
+                ),
+                container_observation(
+                    "pod-c",
+                    "worker-1",
+                    2,
+                    "node-b",
+                    gpu_uuids=["GPU-c"],
+                    container_id=f"containerd://{annotated}",
+                    cgroup_path="/training/worker-1",
+                ),
+                container_observation(
+                    "pod-d",
+                    "worker-2",
+                    3,
+                    "node-a",
+                    gpu_uuids=["GPU-d"],
+                    container_id="containerd://not-a-runtime-id",
+                ),
+            ],
+            workload_ids=["training/job/job-a"],
+        )
+    )
+    finding = node_health_finding(
+        "finding-efa-hung",
+        "efa-hung",
+        observed_at=NOW,
+        category=NodeHealthCategory.RDMA,
+        severity="critical",
+        reason="EFA traffic remains at zero",
+        recommended_action=RecoveryAction.RUN_DIAGNOSTICS,
+        runtime_profile_version="simulated-v1",
+        workload_state=WorkloadState.ACTIVE,
+        affected_workload_ids=["training/job/job-a"],
+        job_id="job-a",
+        attempt_id="attempt-a",
+        diagnostic_parameters={
+            "diagnostic_reason": "EFA_TRAFFIC_HUNG_SUSPECTED",
+            "capture_process_state": True,
+            "job_id": "job-a",
+            "attempt_id": "attempt-a",
+        },
+    )
+
+    _, workflow = context.orchestrator.ingest_node_health(finding)
+
+    assert workflow is not None
+    scoped = [
+        step
+        for step in workflow.official_steps
+        if step.operation
+        in {
+            WorkflowOperation.COLLECT_HUNG_SUMMARY,
+            WorkflowOperation.COLLECT_HUNG_TRIAGE,
+        }
+    ]
+    assert len(scoped) == 4, workflow.official_steps
+    for step in scoped:
+        assert step.parameters["workload_container_ids_by_node"] == {
+            "node-a": [first],
+            "node-b": [second],
+        }, step
+        assert step.parameters["workload_cgroup_paths_by_node"] == {
+            "node-a": [],
+            "node-b": ["/training/worker-1"],
+        }, step
+
+
 def test_node_health_without_ingested_at_matches_running_attempt(
     context: ApplicationContext,
 ) -> None:

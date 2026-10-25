@@ -114,6 +114,31 @@ def test_ten_thousand_ranks_are_all_visited_with_bounded_inflight_and_scoped_com
     ), "FR disabled is missing evidence, not fabricated communication progress"
 
 
+def test_a_node_receives_only_its_own_runtime_container_ids():
+    from gpu_fault.adapters.node_action.hung_survey import scoped_context
+
+    ctx = context(["node-a", "node-b", "node-c"])
+    step = ctx.step.model_copy(
+        update={
+            "parameters": {
+                **ctx.step.parameters,
+                "workload_container_ids_by_node": {
+                    "node-a": ["a1" * 32],
+                    "node-b": ["b2" * 32],
+                },
+            }
+        }
+    )
+    ctx = replace(ctx, step=step)
+    scoped = {
+        node: scoped_context(ctx, node).step.parameters[
+            "workload_container_ids_by_node"
+        ]
+        for node in ("node-b", "node-c")
+    }
+    assert scoped == {"node-b": {"node-b": ["b2" * 32]}, "node-c": {"node-c": []}}
+
+
 @pytest.mark.parametrize(
     "defect",
     [

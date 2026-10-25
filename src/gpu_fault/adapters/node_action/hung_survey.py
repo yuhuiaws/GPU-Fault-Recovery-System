@@ -25,6 +25,7 @@ def scoped_context(context: WorkflowStepContext, node: str) -> WorkflowStepConte
     parameters = dict(context.step.parameters)
     for key in (
         "workload_cgroup_paths_by_node",
+        "workload_container_ids_by_node",
         "gpu_uuids_by_node",
         "rank_by_pid_by_node",
         "target_pids_by_node",

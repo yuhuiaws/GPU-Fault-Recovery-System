@@ -73,12 +73,19 @@ def chain_fixture(tmp_path, monkeypatch):
         rig.close()
 
 
+def runtime_container_id(node):
+    return hashlib.sha256(f"trainer-container/{node}".encode()).hexdigest()
+
+
 class NcclChain(RawHealthRig):
     def __init__(self, path, monkeypatch, *, nodes=3, mode="normal"):
         self.nodes = [f"node-{chr(97 + index)}" for index in range(nodes)]
         self.gpus = [f"GPU-{chr(97 + index)}" for index in range(nodes)]
         self.attempt = "attempt-a"
         self.scope_known = True
+        # "annotation": the Pod names its cgroup (fixtures only); "runtime-id":
+        # the watcher knows only the kubelet's container id, as on a live site.
+        self.container_scope = "annotation"
         super().__init__(path, monkeypatch)
         self.node_clock = NodeClock()
         self.actors = [ChainNode(self, index, mode) for index in range(nodes)]
@@ -194,13 +201,34 @@ class NcclChain(RawHealthRig):
                         "trainer",
                         index,
                         node,
-                        cgroup_path="/training/job" if self.scope_known else None,
+                        cgroup_path="/training/job"
+                        if self.scope_known and self.container_scope == "annotation"
+                        else None,
+                        container_id=f"containerd://{runtime_container_id(node)}"
+                        if self.container_scope == "runtime-id"
+                        else None,
                         gpu_uuids=[self.gpus[index]],
                     )
                     for index, node in enumerate(self.nodes)
                 ],
             )
         )
+
+    def use_runtime_container_ids(self):
+        """A live managed Pod: no cgroup annotation, only the runtime's id.
+
+        Each node's rank then runs in the cgroup containerd's systemd driver
+        names after that id (cgroup v2), as on the HyperPod/EKS nodes.
+        """
+
+        self.container_scope = "runtime-id"
+        for actor in self.actors:
+            cgroup = (
+                "/kubepods.slice/kubepods-burstable.slice/kubepods-burstable-pod"
+                f"{actor.index:08d}_0000_0000_0000_000000000000.slice/"
+                f"cri-containerd-{runtime_container_id(actor.name)}.scope"
+            )
+            (actor.proc / "cgroup").write_text(f"0::{cgroup}\n")
 
     def node_now(self):
         return self.clock + timedelta(seconds=self.node_clock.value)
