@@ -18,9 +18,17 @@ PASS; the verdict comes from those records: PASS only on positive evidence,
 FAIL on a missing or wrong reaction, INCONCLUSIVE when the replay or its
 ingestion cannot be shown.
 
-GF-ENV-LIVE-011 (absolute shutdown) runs only where the device reports an
-absolute ``gpu_shutdown_temperature_c``; GF-ENV-LIVE-012 (real physical/vendor
--lab fault) is always NOT_RUN here. The user runs ``--execute`` live later.
+GF-ENV-LIVE-009 pauses the metrics collector read-synchronously after two
+severe samples (``probes/env_replay_proxy.py pause-collector``, a deadman
+resumes it), resumes it past the policy's 60 s confirmation gap and restarts
+it once at a normal temperature (``env_live_interruption``). GF-ENV-LIVE-010
+runs the 004 chain on one GPU of the target node while an independent control
+task runs on the control node (``--node-b``; ``env_live_scope``); without a
+control node it is NOT_RUN. Both run on plain EKS and HyperPod: a host-mode
+node without an exporter Pod has its device limits read by a transient host
+probe. GF-ENV-LIVE-011 (absolute shutdown) runs only where the device reports
+an absolute ``gpu_shutdown_temperature_c``; GF-ENV-LIVE-012 (real physical /
+vendor-lab fault) is always NOT_RUN here. The user runs ``--execute`` live later.
 """
 
 from __future__ import annotations
@@ -30,6 +38,7 @@ import json
 import re
 import sys
 import time
+from collections.abc import Callable
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -40,8 +49,10 @@ if str(ROOT) not in sys.path:
 
 from scripts.e2e.regional import env_live_expectations as expectations  # noqa: E402
 from scripts.e2e.regional import env_live_fixture as fixture  # noqa: E402
+from scripts.e2e.regional import env_live_interruption as interruption  # noqa: E402
 from scripts.e2e.regional import env_live_judges as judges  # noqa: E402
 from scripts.e2e.regional import env_live_plans as plans  # noqa: E402
+from scripts.e2e.regional import env_live_scope as scope  # noqa: E402
 from scripts.e2e.regional import env_live_verdicts as verdicts  # noqa: E402
 from scripts.e2e.regional import env_live_watch as watch  # noqa: E402
 from scripts.e2e.regional.acceptance_runner_common import (  # noqa: E402
@@ -76,13 +87,22 @@ STATE_SKEW_SECONDS = 30
 ACTIVITY_SKEW_SECONDS = 5
 #: The poll loop's sleep (a test drives it with a fake clock).
 SLEEP = time.sleep
-INTERRUPTION_BLOCKED = (
-    "GF-ENV-LIVE-009 needs a controlled >60 s pause of the metrics collector "
-    "after two severe samples, a collector restart and a source switch through "
-    "the normal installation; this runner has no such maintenance step, and "
-    "arming its severe T.Limit plan without the pause would only repeat "
-    "GF-ENV-LIVE-004's isolate/stop chain without the branch confirmations"
+#: GF-ENV-LIVE-009: the on-node pause waiter gives up this long after the
+#: pause read was due (collector ticks after the arm plus a margin).
+PAUSE_WAIT_EXTRA_READS = 2
+PAUSE_WAIT_MARGIN_SECONDS = 60
+#: GF-ENV-LIVE-010 is NOT_RUN without these.
+SCOPE_NEEDS = (
+    "GF-ENV-LIVE-010 needs a second GPU test node (--node-b, the site profile's "
+    "node-b) for the independent control task, --site-file to submit it, and a "
+    "target node with at least two GPUs"
 )
+
+
+class PauseNotTaken(RegionalFixtureError):
+    """GF-ENV-LIVE-009's collection pause could not be scheduled: the case is
+    INCONCLUSIVE (nothing was shown) and the cleanup restores the endpoint
+    before the severe block can be served."""
 
 
 def case_number(case_id: str) -> int:
@@ -143,6 +163,23 @@ def _target_plan(preflight: dict[str, Any]) -> dict[str, Any] | None:
     return reports.get(uuid) if uuid else None
 
 
+def scope_not_run_reason(
+    settings: fixture.EnvLiveSettings, preflight: dict[str, Any]
+) -> str | None:
+    """Why GF-ENV-LIVE-010 cannot run here, or ``None`` when it can."""
+
+    missing: list[str] = []
+    if not settings.control_node:
+        missing.append("no control node (--node-b)")
+    if settings.site_file is None:
+        missing.append("no --site-file for the control task")
+    if len(preflight.get("devices") or []) < 2:
+        missing.append("the target node reports fewer than two GPUs")
+    if not missing:
+        return None
+    return f"{SCOPE_NEEDS}; here: {', '.join(missing)}"
+
+
 def replay_plans_for_case(case_id: str, preflight: dict[str, Any]) -> dict[str, Any]:
     """Build the concrete replay plans this case would arm, from live limits.
 
@@ -179,7 +216,9 @@ def replay_plans_for_case(case_id: str, preflight: dict[str, Any]) -> dict[str, 
                     )
                 else:
                     not_run[variant] = decision.reason
-        elif number in {4}:
+        elif number in {4, 10}:
+            # 010 replays the same severe plan on one GPU of a multi-GPU node;
+            # the control node, task and scope checks are the runner's.
             for variant, decision in built.decisions.items():
                 if decision.runnable:
                     runnable[f"{variant}/severe"] = plans.confirmation_plan(
@@ -212,12 +251,12 @@ def replay_plans_for_case(case_id: str, preflight: dict[str, Any]) -> dict[str, 
                         )
                         break
         elif number == 9:
-            # Interruption / source switch arms a severe T.Limit run; the >60s
-            # collection gap, the collector restart and the source switch are
-            # driven by maintenance of the one metrics unit.
+            # Interruption / source switch: two severe reads, the read-
+            # synchronous collection pause (>60 s), one more severe read that
+            # must count 1/N again, a clear; then one collector restart.
             decision = built.decisions[plans.CORE_TLIMIT]
             if decision.runnable:
-                runnable["core_tlimit/severe"] = plans.confirmation_plan(
+                runnable["core_tlimit/interruption"] = plans.interruption_plan(
                     decision, confirmation_samples=samples
                 )
             else:
@@ -253,9 +292,16 @@ def plan_details(
         "case_id": case_id,
         "risk": "live-non-destructive"
         if number in {1, 3, 6}
-        else ("not-applicable" if not_run else "live-workload-restart"),
+        else (
+            "not-applicable"
+            if not_run
+            else (
+                "live-collector-maintenance" if number == 9 else "live-workload-restart"
+            )
+        ),
         "target_node": settings.node,
         "target_gpu": (preflight.get("target_gpu") or {}).get("gpu_uuid"),
+        "device_limits_source": preflight.get("device_limits_source"),
         "predecessor": preflight["predecessor"],
         "device_plans": preflight.get("device_plans"),
         "proxy_mechanism": {
@@ -266,6 +312,11 @@ def plan_details(
                 "systemd drop-in on gpu-fault-metrics-collector.service only, "
                 "GPU_FAULT_DCGM_METRICS_URL -> http://127.0.0.1:9411/metrics; the "
                 "real exporter and collector.env are untouched; one producer"
+            ),
+            "device_limits": (
+                "nvidia-smi -q -x through the product parser: in the node's "
+                "exporter Pod where the exporter is a DaemonSet, else (host-mode "
+                "exporter, plain EKS) by a transient host probe that is deleted again"
             ),
             "max_window_seconds": WINDOW_SECONDS,
         },
@@ -296,14 +347,57 @@ def plan_details(
         "preflight": preflight,
     }
     if number == 9:
-        details["verdict_if_blocked"] = "BLOCKED"
-        details["blocked_reason"] = INTERRUPTION_BLOCKED
+        details["interruption"] = interruption_details(replay.get("plans") or {})
+    if number == 10:
+        reason = scope_not_run_reason(settings, preflight)
+        details["scope"] = {
+            "control_node": settings.control_node or None,
+            "control_task": (
+                f"{scope.CONTROL_TASK_MANIFEST} pinned to the control node, idle GPU "
+                "duty, submitted through gpu-training-submit and removed in cleanup"
+            ),
+            "locks": (
+                "the two-node run holds the target and the control node (both "
+                "EKS lane locks on plain EKS; flag X)"
+            ),
+            "not_run_reason": reason,
+        }
+        if reason is not None:
+            details["verdict_if_not_run"] = "NOT_RUN"
+            details["not_run_reason"] = reason
     if not_run:
         details["not_run_reason"] = (
             "GF-ENV-LIVE-012 is a real physical or vendor-lab fault; a telemetry "
             "replay cannot stand in for it (verdict stays NOT_RUN)"
         )
     return details
+
+
+def interruption_details(replay_plans: dict[str, Any]) -> dict[str, Any]:
+    """How GF-ENV-LIVE-009 pauses, resumes and restarts the collector."""
+
+    plan = replay_plans.get("core_tlimit/interruption")
+    pause_seconds = (
+        verdicts.CONFIRMATION_MAX_GAP_SECONDS + expectations.PAUSE_MARGIN_SECONDS
+    )
+    return {
+        "pause_after_reads": plans.pause_read_index(plan) if plan else None,
+        "pause_seconds": pause_seconds,
+        "pause_deadman_seconds": pause_seconds
+        + expectations.PAUSE_DEADMAN_MARGIN_SECONDS,
+        "mechanism": (
+            "env_replay_proxy.py pause-collector: a transient waiter unit on the "
+            "node polls the proxy /status and SIGSTOPs gpu-fault-metrics-collector"
+            ".service the moment the pause read is served (the same systemctl kill "
+            "pause as general_live_node_probe unit-pause); a systemd-run deadman "
+            "resumes it; the runner resumes it after the pause and restarts it "
+            "once (restart-collector) after the clear at a normal temperature"
+        ),
+        "not_driven": [
+            "DCGM -> nvidia-smi source switch (normal installation only)",
+            "cross-boot re-confirmation (needs an approved node maintenance reboot)",
+        ],
+    }
 
 
 def _first_plan(
@@ -326,8 +420,8 @@ def observation_plan(
     """
 
     number = case_number(case_id)
-    # 002/009 are BLOCKED and 010/012 NOT_RUN before anything is armed.
-    if number in {2, 9, 10, 12} or (number != 1 and not replay_plans):
+    # 002 is BLOCKED and 012 NOT_RUN before anything is armed.
+    if number in {2, 12} or (number != 1 and not replay_plans):
         return None
     name, plan = _first_plan(case_id, replay_plans)
     try:
@@ -424,18 +518,11 @@ def execute_case(
                 "node that ships dcgmproftester and has default power limits"
             ),
         )
-    if number == 9:
-        return finish_without_run("BLOCKED", blocked_reason=INTERRUPTION_BLOCKED)
-    if number == 10 and not settings.site_file:
-        # Scope/concurrency needs a second multi-GPU test node and a control
-        # task; without them the spec keeps the variant NOT_RUN.
-        return finish_without_run(
-            "NOT_RUN",
-            not_run_reason=(
-                "GF-ENV-LIVE-010 needs a second multi-GPU test node and an "
-                "independent control task; neither is configured for this run"
-            ),
-        )
+    if number == 10:
+        reason = scope_not_run_reason(settings, preflight)
+        if reason is not None:
+            return finish_without_run("NOT_RUN", not_run_reason=reason)
+        result["control_node"] = settings.control_node
     replay = replay_plans_for_case(settings.case_id, preflight)
     arms_a_plan = number != 1
     if arms_a_plan and not replay.get("plans"):
@@ -468,6 +555,9 @@ def execute_case(
     stages: dict[str, list[str]] = {}
     inconclusive: list[str] = []
     receipts: dict[str, Any] = {}
+    #: Fixtures beyond the controller the run creates (the 010 control task);
+    #: removed after the controller's own cleanup, in reverse order.
+    fixtures: list[tuple[str, Callable[[], Any]]] = []
     try:
         with action_window(maintenance_window_end):
             outcome = _run_replay(
@@ -480,10 +570,15 @@ def execute_case(
                 result=result,
                 case_dir=case_dir,
                 maintenance_window_end=maintenance_window_end,
+                run_id=run_id,
+                fixtures=fixtures,
             )
             receipts["observation"] = outcome["observation"]
             stages.update(outcome["stages"])
             inconclusive.extend(outcome["inconclusive"])
+    except PauseNotTaken as exc:
+        result["error"] = f"{type(exc).__name__}: {exc}"
+        inconclusive.append(f"{settings.case_id}: {exc}")
     except BaseException as exc:  # noqa: BLE001 - recorded; cleanup still runs
         result["error"] = f"{type(exc).__name__}: {exc}"
         stages.setdefault("execution", []).append(result["error"])
@@ -494,6 +589,11 @@ def execute_case(
             receipts["cleanup"] = controller.cleanup()
         except Exception as exc:  # noqa: BLE001
             receipts["cleanup_error"] = f"{type(exc).__name__}: {exc}"
+        for name, action in reversed(fixtures):
+            try:
+                receipts[f"{name}_cleanup"] = action()
+            except Exception as exc:  # noqa: BLE001 - recorded; fails the case
+                receipts[f"{name}_cleanup_error"] = f"{type(exc).__name__}: {exc}"
         stages["cleanup"] = _cleanup_errors(settings.case_id, receipts)
     status = receipts.get("passthrough_status") or {}
     if "passthrough_status" in receipts:
@@ -537,6 +637,44 @@ def _limitations(receipts: dict[str, Any]) -> list[str]:
     ]
 
 
+def _control_fixtures(
+    settings: fixture.EnvLiveSettings,
+    regional: Any,
+    *,
+    case_dir: Path,
+    run_id: str,
+    receipts: dict[str, Any],
+    fixtures: list[tuple[str, Callable[[], Any]]],
+) -> dict[str, Any]:
+    """GF-ENV-LIVE-010: start the control task on the control node first.
+
+    Its Pods and the control node's state before the arm are what the scope
+    judge compares against; the task is removed after the controller cleanup.
+    """
+
+    assert settings.site_file is not None, "010 runs only with --site-file"
+    task = scope.ControlTask(
+        regional,
+        site_file=settings.site_file,
+        case_dir=case_dir,
+        case_id=settings.case_id,
+        run_id=run_id,
+        node=settings.control_node,
+    )
+    fixtures.append(("control_task", task.cleanup))
+    receipts["control_task_start"] = task.start()
+    before = task.snapshot()
+    receipts["control_task_before"] = before
+    receipts["control_node_before"] = fixture.node_state(
+        regional, settings.control_node
+    )
+    return {
+        "task": task,
+        "task_before": before,
+        "control_before": receipts["control_node_before"],
+    }
+
+
 def _run_replay(
     settings: fixture.EnvLiveSettings,
     regional: Any,
@@ -548,10 +686,23 @@ def _run_replay(
     result: dict[str, Any],
     case_dir: Path,
     maintenance_window_end: datetime,
+    run_id: str = "",
+    fixtures: list[tuple[str, Callable[[], Any]]] | None = None,
 ) -> dict[str, Any]:
     """Deploy, repoint, arm one plan and observe it; the caller cleans up."""
 
-    arms_a_plan = case_number(settings.case_id) != 1
+    number = case_number(settings.case_id)
+    arms_a_plan = number != 1
+    control: dict[str, Any] = {}
+    if number == 10:
+        control = _control_fixtures(
+            settings,
+            regional,
+            case_dir=case_dir,
+            run_id=run_id,
+            receipts=receipts,
+            fixtures=fixtures if fixtures is not None else [],
+        )
     controller.create()
     # 001 never arms (pass-through baseline). Every other case arms the first
     # reviewed plan; the rest are documented in replay_plans and run in
@@ -605,19 +756,135 @@ def _run_replay(
         start = repoint_at
         progress.begin(receipts["passthrough_status"], passthrough_at)
     result["armed_plan"] = plan_name
+    if number == 9:
+        receipts["pause_schedule"] = _schedule_pause(
+            controller, expectation, progress, cadence
+        )
+    judge, extra = _judge_and_extra(
+        settings,
+        regional,
+        controller,
+        expectation,
+        cadence=cadence,
+        repoint_at=repoint_at,
+        before=before,
+        node_before=receipts["node_before"],
+        control=control,
+        start=start,
+    )
     return _observe(
         settings,
         regional,
         controller,
         expectation,
         progress,
+        judge=judge,
+        extra=extra,
         cadence=cadence,
         start=start,
         repoint_at=repoint_at,
-        before=before,
-        node_before=receipts["node_before"],
         maintenance_window_end=maintenance_window_end,
         case_dir=case_dir,
+    )
+
+
+def _schedule_pause(
+    controller: Any,
+    expectation: expectations.Expectation,
+    progress: watch.ReplayProgress,
+    cadence: watch.CollectorCadence,
+) -> dict[str, Any]:
+    """GF-ENV-LIVE-009: schedule the read-synchronous pause right after the arm.
+
+    The waiter counts the proxy's absolute reads, so the target is the arm's
+    read count plus the plan's pause read; it is scheduled before the first
+    severe read can be served, and a schedule that does not come back with an
+    active waiter refuses the case (the caller's cleanup restores the endpoint
+    before the severe block starts).
+    """
+
+    if progress.start_reads is None:
+        raise PauseNotTaken(
+            "the arm receipt carried no proxy read count; the pause point is unknown"
+        )
+    target = int(progress.start_reads) + int(expectation.pause_after_reads)
+    wait = int(
+        (expectation.pause_after_reads + PAUSE_WAIT_EXTRA_READS)
+        * cadence.interval_seconds
+        + watch.STARTUP_SPREAD_SECONDS
+        + PAUSE_WAIT_MARGIN_SECONDS
+    )
+    receipt = controller.pause_collector(
+        after_reads=target,
+        seconds=int(
+            expectation.pause_seconds + expectations.PAUSE_DEADMAN_MARGIN_SECONDS
+        ),
+        wait_seconds=wait,
+        port=PORT,
+    )
+    state = str((receipt.get("waiter") or {}).get("ActiveState") or "")
+    if state not in {"active", "activating"}:
+        raise PauseNotTaken(
+            f"the collection pause waiter is not running ({state or 'unknown'}); "
+            "refusing to serve the severe block without the pause"
+        )
+    return receipt
+
+
+def _judge_and_extra(
+    settings: fixture.EnvLiveSettings,
+    regional: Any,
+    controller: Any,
+    expectation: expectations.Expectation,
+    *,
+    cadence: watch.CollectorCadence,
+    repoint_at: datetime,
+    before: dict[str, Any] | None,
+    node_before: dict[str, Any] | None,
+    control: dict[str, Any],
+    start: datetime,
+) -> tuple[Any, Callable[[], dict[str, Any]] | None]:
+    """The case's judge and, for 009 / 010, the poll's fifth read."""
+
+    if expectation.kind == "interruption":
+        judge = interruption.InterruptionJudge(
+            expectation,
+            steps=interruption.InterruptionSteps(
+                resume=controller.resume_collector,
+                restart=controller.restart_collector,
+            ),
+            interval_seconds=cadence.interval_seconds,
+            node_before=node_before,
+        )
+        return judge, controller.pause_status
+    if control:
+        task = control["task"]
+        control_node = settings.control_node
+        since = start - timedelta(seconds=ACTIVITY_SKEW_SECONDS)
+
+        def control_read() -> dict[str, Any]:
+            return {
+                "node": fixture.node_state(regional, control_node),
+                "activity": fixture.node_records(regional, control_node, since),
+                "task": task.snapshot(),
+            }
+
+        judge = scope.ScopeJudge(
+            expectation,
+            task_before=control["task_before"],
+            control_before=control["control_before"],
+            node_before=node_before,
+        )
+        return judge, control_read
+    return (
+        judges.judge_for(
+            expectation,
+            repoint_at=repoint_at,
+            before=before,
+            collector_mode=cadence.metrics_mode,
+            node_before=node_before,
+        ),
+        None,
     )
 
 
@@ -628,11 +895,11 @@ def _observe(
     expectation: expectations.Expectation,
     progress: watch.ReplayProgress,
     *,
+    judge: Any,
+    extra: Callable[[], dict[str, Any]] | None,
     cadence: watch.CollectorCadence,
     start: datetime,
     repoint_at: datetime,
-    before: dict[str, Any] | None,
-    node_before: dict[str, Any] | None,
     maintenance_window_end: datetime,
     case_dir: Path,
 ) -> dict[str, Any]:
@@ -652,13 +919,6 @@ def _observe(
         deadman_at=repoint_at + timedelta(seconds=WINDOW_SECONDS),
         maintenance_end=maintenance_window_end,
     )
-    judge = judges.judge_for(
-        expectation,
-        repoint_at=repoint_at,
-        before=before,
-        collector_mode=cadence.metrics_mode,
-        node_before=node_before,
-    )
     state_since = start - timedelta(seconds=STATE_SKEW_SECONDS)
     activity_since = start - timedelta(seconds=ACTIVITY_SKEW_SECONDS)
     reads = watch.WatchReads(
@@ -668,6 +928,7 @@ def _observe(
         ),
         activity=lambda: fixture.node_records(regional, settings.node, activity_since),
         node=lambda: fixture.node_state(regional, settings.node),
+        extra=extra,
     )
     outcome = watch.watch(
         judge,
@@ -687,6 +948,7 @@ def _observe(
                 "gpu_state": final.gpu_state,
                 "activity": final.activity,
                 "node": final.node,
+                "extra": final.extra,
             },
         )
     judgement = outcome.judgement
@@ -717,7 +979,7 @@ def _cleanup_errors(case_id: str, receipts: dict[str, Any]) -> list[str]:
     # override, so only a missing original, an inactive unit or a foreign
     # override is a failed restore.
     endpoint = restore.get("restored_endpoint")
-    return verdicts.cleanup_errors(
+    errors = verdicts.cleanup_errors(
         collector_endpoint_restored=bool(restore.get("original_endpoint"))
         and (restore.get("after") or {}).get("ActiveState") == "active"
         and endpoint in (None, restore.get("original_endpoint")),
@@ -728,6 +990,23 @@ def _cleanup_errors(case_id: str, receipts: dict[str, Any]) -> list[str]:
         and all(value is False for value in residuals.values()),
         label=case_id,
     )
+    # A paused collector that could not be resumed, or a control task that
+    # could not be removed, is a failed cleanup like a leftover probe.
+    if cleanup.get("resume_error"):
+        errors.append(
+            f"{case_id}: the paused collector was not resumed: "
+            f"{cleanup['resume_error']}"
+        )
+    if (cleanup.get("resume") or {}).get("stopped") is True:
+        errors.append(
+            f"{case_id}: the metrics collector is still stopped after cleanup"
+        )
+    for key, value in sorted(receipts.items()):
+        if key.endswith("_cleanup_error"):
+            errors.append(
+                f"{case_id}: {key.removesuffix('_cleanup_error')} cleanup: {value}"
+            )
+    return errors
 
 
 def print_result(result: dict[str, Any]) -> None:

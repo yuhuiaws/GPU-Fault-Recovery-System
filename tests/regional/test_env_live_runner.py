@@ -358,7 +358,9 @@ def test_replay_plans_cover_the_specific_families() -> None:
     unknown = runner.replay_plans_for_case("GF-ENV-LIVE-008", pre)["plans"]
     assert "omit_reason" in unknown
     nine = runner.replay_plans_for_case("GF-ENV-LIVE-009", pre)["plans"]
-    assert "core_tlimit/severe" in nine
+    assert "core_tlimit/interruption" in nine
+    ten = runner.replay_plans_for_case("GF-ENV-LIVE-010", pre)["plans"]
+    assert "core_tlimit/severe" in ten
 
 
 def test_replay_plans_report_no_target_uuid() -> None:
@@ -414,14 +416,18 @@ def test_execute_004_cleanup_failure_fails_even_a_good_chain(
     assert result["verdict"] == "FAIL" and result["stages"]["cleanup"]
 
 
-def test_execute_009_is_blocked_and_never_arms(tmp_path: Path) -> None:
-    code = runner.execute_case(_settings("GF-ENV-LIVE-009"), tmp_path, 1, _window())
-    result = _read_case(tmp_path, "GF-ENV-LIVE-009")
-    assert code == 0 and result["verdict"] == "BLOCKED"
-    assert ">60 s pause" in result["blocked_reason"]
+def test_execute_010_is_not_run_without_a_second_gpu_or_site_file(
+    tmp_path: Path,
+) -> None:
+    # A control node alone is not enough: the control task needs --site-file
+    # and the scope needs a multi-GPU target node (the preflight lists one GPU).
+    settings = _settings("GF-ENV-LIVE-010", control_node="ip-10-0-32-162")
+    code = runner.execute_case(settings, tmp_path, 1, _window())
+    result = _read_case(tmp_path, "GF-ENV-LIVE-010")
+    assert code == 0 and result["verdict"] == "NOT_RUN"
+    assert "--site-file" in result["not_run_reason"]
+    assert "fewer than two GPUs" in result["not_run_reason"]
     assert RecordingController.instances == []
-    details = runner.plan_details(_settings("GF-ENV-LIVE-009"), _preflight())
-    assert details["verdict_if_blocked"] == "BLOCKED"
 
 
 def test_plan_details_names_the_observation_rule() -> None:
