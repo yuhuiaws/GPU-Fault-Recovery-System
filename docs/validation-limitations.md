@@ -2199,6 +2199,65 @@ budget. The tests replay the live shape -- the oracle crossing on the third
 read, the product's records appearing 40 polls (800 s) after it -- and pin
 the budget to the product's rule duration and the fake survey's cadence.
 
+The same cadence rule holds for every variant whose PASS depends on a
+sustained host rule, and an audit of the harness on 2026-10-25 found the
+other budgets sized the way 003's had been: from fixed numbers (the rule's
+sustain plus 300 s plus a few ticks) and counted from the load's start. 001
+`cpu_busy`/`recovery`/`checkpoint_phase` (the 120-s `cpu_usage_percent`
+rule) had 510 s, the load held for 750 s and VALIDATE_HOST waited for in a
+second 510-s wait after the finding, so the validation's summary could fall
+after the load had been stopped -- read as "succeeded while the fault was
+still held", or as no finding at all; `load_average` had 930 s including
+load1's roughly three-minute convergence. 002 `memory_pressure`/`recovery`
+already timed detection from the oracle's crossing but with 540 s, and the
+allocator's hold (ramp 1080 + 540 + 240) could end before the validation's
+summary. 009 `sustained_drops`/`wrong_interface`/`recovery` (the 60-s
+`network_drops_delta` rule) had 450 s from the generator's start, and the
+required-interface drop-in's deadman (1020 s) was shorter than a full run.
+005 `capacity_full` (98 % `shared_filesystem_used_percent`, no sustain)
+graded VALIDATE_HOST on the first snapshot that showed the incident, while
+the step was still WAITING for the summary after it.
+
+They now share one helper, `general_live_common.sustained_detection_budget`
+-- sustain + 2 x `GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS` +
+`GPU_FAULT_HOST_INTERVAL_SECONDS` + a 180-s margin, read from the node's
+collector environment: 915 s for the 120-s rules, 855 s for the 60-s drops
+rule, 1095 s for 003's 300-s rule, and with `summaries=1` 495 s for a rule
+with no sustain, whose finding is the edge batch itself -- and one crossing
+wait, `await_oracle_crossing`, that times detection from the runner's own
+oracle and makes the variant INCONCLUSIVE "condition not established" when
+the oracle never crosses within the ramp budget (120 s for the CPU loop,
+600 s for load1, 1080 s for the allocator, 90 s for the drop generator). The
+stimulus and the oracle outlive ramp + budget + the grading tail, one wait
+covers the finding and the terminal validation (`wait_for_incident(...,
+validation=...)`), and the injection's `*-start.json` records the budgets
+and the cadence they came from. The negative variants (001 `short_burst`
+and `invalid_delta`, 009 `short_drops`, 008 `optional_interface`) watch
+`sustained_negative_window` after the burst ended -- sustain + one summary +
+interval + margin, 615 / 555 / 495 s here, bounded and recorded in the
+result -- so the recovered edge and at least one summary after it have been
+seen before the negative verdict is read. 005 `capacity_full` waits for
+VALIDATE_HOST to be terminal (one summary) before grading its chain. The
+variant windows grew with the budgets: 001 cpu_busy, recovery and
+checkpoint_phase 35 min, load_average 45, short_burst and invalid_delta 16;
+002 memory_pressure 55, recovery 50, swap_pressure 25 (the allocator's hold
+is 2355 s, under the node probe's 3600-s unit cap); 009 sustained_drops 30,
+wrong_interface and recovery 25, short_drops 16; the required-interface
+window's deadman is max_minutes x 60 + 600, capped at the window probe's
+1800 s. The tests replay the live shape for each -- the oracle crossing on a
+later read, the product's records 40 store polls (800 s) after it, a PASS
+inside the new budget and a FAIL only past it -- and pin every budget to the
+product's rule table and the fake survey's cadence. Not changed here, with
+the same exposure, are 003 `low_available_memory` (480 s from the crossing
+for a 60-s rule plus VALIDATE_HOST; 855 s needed), `scratch_full` (720 s
+from the fill for the 60-s local filesystem rule plus the validation) and
+`gpu_idle`/`rank_cpu_idle` (300-s rules: a 345-s hold, then 720 s), 006
+`sustained_util`/`sustained_latency` (510 s from the load's start for the
+120-s disk I/O rules; being moved to the same helper) and 004's
+unusable-filesystem diagnostics (420 s for a no-sustain rule plus the
+validation's summary, 90 s of slack). Their pass-5 FAIL or INCONCLUSIVE
+verdicts may be these budgets rather than the product.
+
 The same review of every diagnostic-only verdict found one more incident
 the matcher could not see: 025 `exporter_timeout`, `sustained_unknown` and
 `post_refresh_success` waited for a `dcgm_field_completeness` incident with

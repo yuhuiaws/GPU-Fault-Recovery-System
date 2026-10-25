@@ -91,6 +91,23 @@ GF-REGIONAL 用例已在本站真机 PASS，且其注入与断言正是该变体
 5. 阈值、确认窗口和采集/扫描周期以运行配置和代码为准；文中默认值只用来复核。
    记录预计/实测检测时间、每步 deadline、聚合/队列延迟。不得伪造 live 时钟或将
    提前缩短生产阈值的实验当作默认策略验证。
+   持续类主机规则（`host_health.py` METRIC_RULE_SUSTAIN_SECONDS /
+   SUSTAINED_METRIC_RULES）的检测预算统一按产品节奏计算
+   （`general_live_common.sustained_detection_budget`）：主机 collector 对越界只在
+   越界边沿投递一次（`collectors/host/collector.py` `_edge_reasons`/
+   `delivery_reasons`），之后只随健康摘要（`GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS`，
+   ±5 % 抖动）投递，纯摘要批次不留原始证据；控制面要在首个活跃样本之后至少 sustain
+   秒的又一个活跃样本上才铸造 finding（`store/shared/xid.py`
+   `_next_health_signal_state`），验证步骤再等一次更新的证据。因此预算 = sustain +
+   2×摘要周期 + 采集间隔 + 180 秒余量，从运行器自带 oracle 首次读到阈值起算（不是从
+   负载启动起算；oracle 在 ramp 预算内未越界即 `INCONCLUSIVE` "condition not
+   established"，`await_oracle_crossing`），刺激与 oracle 的存活时间覆盖 ramp + 预算 +
+   判定余量，一次等待同时等到 finding 与验证步骤终态，预算与节奏写入注入证据
+   （`*-start.json`）。无 sustain 的规则在边沿批次即铸造 finding，只为验证步骤再留
+   一次摘要（summaries=1）。反向变体（短突发）在突发结束后至少观察 sustain + 一次
+   摘要 + 采集间隔 + 余量（`sustained_negative_window`），窗口有界且写入结果。本站
+   （300 秒摘要/15 秒间隔）：120 秒规则 915 秒、60 秒规则 855 秒、300 秒规则 1095
+   秒、无 sustain 495 秒；反向窗口 615/555/495 秒。
 6. 同时检查无错误作用域、无未授权硬件动作、无重复 STOP/预算扣减。控制面仍处于
    RUNNING/WAITING、只返回 202、只看到命令 exit 0，均不代表完整 PASS。
 7. 清理先结束注入并恢复采集/驱动/接口/原配置，再验证新鲜健康证据。只读诊断类
@@ -114,6 +131,14 @@ GF-REGIONAL 用例已在本站真机 PASS，且其注入与断言正是该变体
 执行 VALIDATE_HOST：持续异常不能因其他指标正常而通过；负载释放后原指标新样本
 才证明恢复。短突发/零delta不触发持续故障；checkpoint负载与硬件故障不得混淆。
 保存CPU计数/分母、时间、任务进度和诊断回执；清理负载，禁止reset/reboot升级。
+`cpu_busy`/`recovery`/`checkpoint_phase` 的检测从 CPU oracle 首次读到 ≥98% 起算
+（ramp 预算 120 秒），`load_average` 从 load1_per_cpu ≥2.0 起算（load1 是一分钟
+指数平均，2.1×vCPU 线程约 183 秒收敛，ramp 预算 600 秒）；预算均为 120 秒规则的
+915 秒（本站），负载保持 ramp + 预算 + 判定余量；`cpu_busy`/`load_average`/
+`checkpoint_phase` 一次等待同时等到 finding 与 VALIDATE_HOST 终态，`recovery`
+只等 finding。`short_burst` 的反向窗口为突发结束后 615 秒，`invalid_delta` 同样
+观察 615 秒。变体窗口：cpu_busy/recovery/checkpoint_phase 35 分、load_average
+45 分、short_burst/invalid_delta 16 分。
 
 ### GF-GENERAL-LIVE-002
 
@@ -123,6 +148,12 @@ OOM 仅证明 cgroup 耗尽，不等于主机 memory_used≥95%。没有swap的�
 不得动态开启业务swap来凑测试。memory持续默认120秒，swap按其独立规则。
 实际验证原指标；读取失败应UNKNOWN而非健康/硬件故障。释放测试分配后核对主机、
 collector和原任务均存活，保存内存/cgroup证据；不能用重启掩盖OOM失控。
+`memory_pressure`/`recovery` 的检测从 meminfo oracle 首次读到 memory_used ≥95%
+起算（ramp 预算 1080 秒），预算为 120 秒规则的 915 秒（本站），分配器保持
+1080 + 915 + 240 秒（探针请求 2355 秒，低于 3600 秒单元上限），`memory_pressure`
+一次等待同时等到 finding 与 VALIDATE_HOST 终态；`swap_pressure` 无 sustain，
+finding 在重启后的基线批次铸造，只为 VALIDATE_HOST 再留一次摘要（495 秒）。
+变体窗口：memory_pressure 55 分、recovery 50 分、swap_pressure 25 分。
 
 ### GF-GENERAL-LIVE-003
 
@@ -194,6 +225,10 @@ FAIL）。只读以宿主 `/proc/1/mountinfo`
 仅使用独立NFS/Lustre export和测试挂载。限制测试服务或测试路径连通性，覆盖statvfs
 超时；另用有限测试容量到98%，及statvfs可返回但读写/fsync失败的情形。
 确认collector有界返回且其他指标仍上报，VALIDATE_HOST不能用另一个挂载的健康代替。
+`capacity_full` 的 98% 规则无 sustain：填充的边沿批次即铸造 finding，但 VALIDATE_HOST
+要在其后的健康摘要上才能判定，判定前先等到该步骤终态（`wait_finding(...,
+validation="VALIDATE_HOST")`，预算 = 一次摘要 + 采集间隔 + 余量，本站 495 秒），
+不在首个出现 incident 的快照上判链。
 两个任务节点访问同一export时记录共同故障域，不把每节点都误作坏硬件。
 当前若未检测实际I/O或挂载消失，记录FAIL。还原export/连接后验证新采样、真实I/O和任务进度。
 产品行为（批次176）：共享挂载从宿主挂载表 `/proc/1/mountinfo` 发现（沙箱遮住的不上报）；每个挂载在
@@ -345,6 +380,13 @@ counter确实增长才算原生正向；tc/netem的丢包或应用超时不能�
 没有可控counter时需受检读取夹具。errors增量和drops默认60秒规则分别验。
 执行原接口Fabric验证，TCP重传/短drops/计数重置不误触硬件恢复。恢复后用新零增量
 和通信结果确认，而不是清数据库或重置网卡让累计值归零。
+`sustained_drops`/`recovery` 的检测从 netdev oracle 首次读到丢包计数上升起算
+（ramp 预算 90 秒），预算为 60 秒规则的 855 秒（本站），发包器保持 ramp + 预算 +
+判定余量；`network_drops_delta` 是逐 tick 增量，发包必须覆盖每个采集 tick。
+`wrong_interface` 无 oracle（发包器首帧即丢包，边沿在一个采集 tick 内），预算同为
+855 秒。`short_drops` 的反向窗口为突发结束后 555 秒。声明必需接口的 collector 窗口
+drop-in 的 deadman 取 max_minutes×60+600（下限 1020 秒，上限为窗口探针的 1800 秒）。
+变体窗口：sustained_drops 30 分、wrong_interface/recovery 25 分、short_drops 16 分。
 
 ### GF-GENERAL-LIVE-010
 
