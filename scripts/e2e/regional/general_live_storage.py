@@ -27,7 +27,9 @@ QUARANTINE; the swap is made with nothing dirty so no such line is written,
 but an active collector would make the chain ambiguous). 006
 ``disk_io_util_percent``/``disk_io_await_ms`` are WARNING
 RUN_DIAGNOSTICS with a 120 s sustain; the oracle's own ``/proc/diskstats`` read
-computes the standard await to compare with the product's weighted-time one.
+computes the standard await (fields 4+8 over 1+5) to compare with the product's,
+which has used the same definition since batch 172 (``reference_iostat`` expects
+PASS).
 
 The 006 test device is built by a bounded transient setup unit on the node:
 ``dm-create`` only starts it and ``_await_dm_setup`` polls ``dm-status`` on the
@@ -730,7 +732,7 @@ def _io_metric_variant(
         name=f"{metric}-detection",
     )
     oracle.read()
-    key = "util_percent" if metric == "disk_io_util_percent" else "weighted_await_ms"
+    key = "util_percent" if metric == "disk_io_util_percent" else "standard_await_ms"
     threshold = 98.0 if metric == "disk_io_util_percent" else 100.0
     values = oracle_values(
         [record.get("diskstats", {}).get(device, {}) for record in oracle.records],
@@ -878,12 +880,14 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
     observed = activity(
         ctx, started, metrics={"disk_io_util_percent", "disk_io_await_ms"}
     )
-    # The negative delta is clamped to 0; no pseudo-rate and no hardware recovery.
+    # The interval spanning the restart is re-baselined (no sample, batch 172);
+    # no pseudo-rate and no hardware recovery.
     stages = {"hardware": hardware_errors(observed)}
     return _result(
         stages,
         notes=[
-            "counter reset is invisible after the clamp (X5); recorded as an observation"
+            "the interval spanning the counter restart produces no sample (batch 172 "
+            "re-baselines); recorded as an observation"
         ],
         extra={"device_before": device_before, "recreated": recreated},
     )
@@ -896,7 +900,12 @@ AWAIT_TOLERANCE_FLOOR_MS = 5.0
 
 
 def reference_iostat(ctx: VariantContext) -> dict[str, Any]:
-    """Compare the product's weighted await with the standard await (spec FAIL).
+    """Compare the product's await with the standard await of the same interval.
+
+    The oracle reads ``/proc/diskstats`` itself and computes iostat's await
+    (fields 4+8 over 1+5); a divergence beyond 10 % or 5 ms is the spec FAIL.
+    Expected PASS since batch 172, when the product stopped dividing the
+    weighted field 11 by the completions.
 
     The comparison needs awaits above the 5 ms tolerance floor, so the test
     device gets the 200 ms dm-delay table -- with a loaded ``dm_delay``, or one
@@ -953,8 +962,8 @@ def reference_iostat(ctx: VariantContext) -> dict[str, Any]:
     diverged = _await_divergence(product, standard)
     stages = {
         "await_definition": [
-            "the product's weighted await diverges from the standard await beyond "
-            "tolerance (weighted in-flight time / ios, not (ms_read+ms_write)/ios)"
+            "the product's await diverges from the standard await of the same "
+            "device and interval beyond tolerance ((ms_read+ms_write)/ios)"
         ]
         if diverged
         else []
@@ -1248,7 +1257,8 @@ VARIANTS = [
     _io_spec(
         "counter_reset",
         "dmsetup remove and recreate under the same name/minor",
-        "the negative delta is clamped to 0; no pseudo-rate, no hardware recovery",
+        "the interval spanning the restart produces no sample (re-baselined); no "
+        "pseudo-rate, no hardware recovery",
         counter_reset,
         max_minutes=10,
     ),
@@ -1256,13 +1266,12 @@ VARIANTS = [
         "reference_iostat",
         "dm-delay 200 ms (dm_delay loaded, or loaded for the run under the optional "
         "KERNEL_MODULE_LOAD); sample /proc/diskstats at 1 s and compute the standard "
-        "await vs the product's weighted await",
-        "the product uses weighted time / ios; a divergence > 10 % or 5 ms is the spec "
+        "await vs the product's await",
+        "the product's await is iostat's await (fields 4+8 over 1+5, batch 172) and "
+        "agrees with the oracle within 10 % / 5 ms; a divergence beyond that is the spec "
         "FAIL; awaits under the 5 ms tolerance floor (no dm-delay) are INCONCLUSIVE",
         reference_iostat,
         max_minutes=20,
-        outcome="FAIL",
-        gap="disk_io_await_ms uses the weighted in-flight time (field 11) / ios, not the standard await",
         optional_approvals=("KERNEL_MODULE_LOAD",),
     ),
     _io_spec(

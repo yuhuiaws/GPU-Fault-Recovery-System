@@ -482,12 +482,13 @@ def test_short_flush_passes(tmp_path: Path) -> None:
     assert result["verdict"] == "PASS", result["errors"]
 
 
-def test_reference_iostat_fails_on_divergent_await(tmp_path: Path) -> None:
+def _reference_iostat_result(tmp_path: Path, standard_await_ms: float):
     spec = SPECS["reference_iostat"]
     node = node_probe(survey())
     node.script["oracle-read"] = {
         "records": [
-            {"diskstats": {"dm-7": {"standard_await_ms": 10.0}}} for _ in range(30)
+            {"diskstats": {"dm-7": {"standard_await_ms": standard_await_ms}}}
+            for _ in range(30)
         ],
         "next_offset": 30,
         "total": 30,
@@ -523,9 +524,28 @@ def test_reference_iostat_fails_on_divergent_await(tmp_path: Path) -> None:
         regional=regional,
         probes=probes(node, storage_probe(), window_probe()),
     )
-    result = spec.execute(ctx)
+    return spec, spec.execute(ctx)
+
+
+def test_reference_iostat_fails_on_divergent_await(tmp_path: Path) -> None:
+    # The product reports 200 ms while the oracle's standard await of the same
+    # device and interval is 10 ms: the spec FAIL, whatever the registry expects.
+    spec, result = _reference_iostat_result(tmp_path, standard_await_ms=10.0)
     assert result["verdict"] == "FAIL"
     assert result["diverged"] is True
+
+
+def test_reference_iostat_expects_pass_and_passes_on_matching_await(
+    tmp_path: Path,
+) -> None:
+    # Batch 172: the host collector reports iostat's await (fields 4+8 over
+    # 1+5), so the registry no longer carries the weighted-await product gap and
+    # a product value within 10 % / 5 ms of the oracle's is the expected PASS.
+    spec, result = _reference_iostat_result(tmp_path, standard_await_ms=198.0)
+    assert spec.expected_outcome == "PASS" and not spec.product_gap, spec
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["diverged"] is False
+    assert result["product_await_ms"] == [200.0] * 4
 
 
 def test_zero_completed_io_and_counter_reset_and_recovery(tmp_path: Path) -> None:

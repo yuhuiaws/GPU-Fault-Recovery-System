@@ -727,8 +727,9 @@ def oracle_sample(spec: dict[str, Any], previous: dict[str, Any]) -> dict[str, A
                 else None
             )
             # The standard await (iostat r_await/w_await combined): read and
-            # write milliseconds over completed reads and writes. The product
-            # divides the *weighted* in-flight time instead.
+            # write milliseconds over completed reads and writes -- what the
+            # product reports since batch 172. The weighted ratio (field 11 /
+            # ios, the product's earlier quantity) stays as an observation.
             entry["standard_await_ms"] = (
                 ((fields[3] - old[3]) + (fields[7] - old[7])) / ios if ios > 0 else None
             )
