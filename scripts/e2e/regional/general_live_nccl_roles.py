@@ -998,12 +998,15 @@ def _job(
     suffix: str,
     *,
     stall_mode: str,
-    job_class: Callable[..., ManagedNcclJob] = ManagedNcclJob,
+    job_class: Callable[..., ManagedNcclJob] | None = None,
 ) -> ManagedNcclJob:
+    """Start the managed job (``job_class``: the module's ``ManagedNcclJob``
+    unless a second attempt is asked for) and push its deletion."""
+
     name = run_identity(CASE, suffix, ctx.attempt, ctx.case_dir).replace(
         "gl011", "gl11"
     )
-    job = job_class(ctx, name=name, stall_mode=stall_mode)
+    job = (job_class or ManagedNcclJob)(ctx, name=name, stall_mode=stall_mode)
     ctx.cleanup.push(f"job-{job.attempt_id}", job.delete)
     job.start()
     ctx.evidence.write(f"{suffix}-{job.attempt_id}-job", job.identity())
