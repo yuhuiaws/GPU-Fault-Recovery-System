@@ -396,6 +396,96 @@ def test_net_create_veth_still_refuses_a_real_interface_change(
 
 
 # --------------------------------------------------------------------------- #
+# net probe: recreate-veth (009 counter_reset) is one process, one gap
+#
+# The host collector keys counter baselines by interface name and reads a
+# required name a tick does not list as CRITICAL link-down; two probe round
+# trips left the pair missing for 10-15 s live. The recreate therefore runs
+# ``ip link del`` and ``ip link add`` back to back in one process.
+# --------------------------------------------------------------------------- #
+def test_net_recreate_veth_deletes_and_adds_in_one_process(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(netp, "STATE_ROOT", tmp_path / "state")
+    run_id = "gl009-counter-reset-a1-deadbeef"
+    a = netp.interface_name(run_id, "a")
+    b = netp.interface_name(run_id, "b")
+    commands: list[list[str]] = []
+    add = ["ip", "link", "add", a, "type", "veth", "peer", "name", b]
+
+    def interface_link(name: str) -> dict[str, Any]:
+        recreated = add in commands  # the index changes once the add ran
+        if name == a:
+            return {"present": True, "ifindex": "33" if recreated else "31"}
+        if name == b:
+            return {"present": True, "ifindex": "32" if recreated else "30"}
+        return _mgmt_link()
+
+    def fake_run(command: list[str], **kwargs: Any) -> subprocess.CompletedProcess[str]:
+        commands.append(list(command))
+        return subprocess.CompletedProcess(command, 0, stdout="[]", stderr="")
+
+    monkeypatch.setattr(netp, "real_interfaces", lambda rid: ["enp71s0"])
+    monkeypatch.setattr(netp, "interface_link", interface_link)
+    monkeypatch.setattr(
+        netp,
+        "interface_addresses",
+        lambda name, **_kw: ["10.0.0.5/24"] if name not in (a, b) else [],
+    )
+    armed: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        netp,
+        "arm_deadman",
+        lambda rid, kind, seconds: armed.append((kind, seconds)) or "gfrs-deadman",
+    )
+    monkeypatch.setattr(netp, "run", fake_run)
+    emitted: dict[str, Any] = {}
+    monkeypatch.setattr(netp, "emit", lambda value: emitted.update(value))
+
+    netp.recreate_veth(
+        argparse.Namespace(run_id=run_id, slot="a", peer_slot="b", deadman_seconds=2100)
+    )
+    assert commands == [
+        ["ip", "link", "del", a],
+        add,
+        ["ip", "link", "set", b, "mtu", "576"],
+        ["ip", "link", "set", a, "up"],
+        ["ip", "link", "set", b, "up"],
+    ], "nothing runs between the delete and the add"
+    assert armed == [("interfaces", 2100)], "the deadman is re-armed before the change"
+    assert (emitted["before"]["a"]["ifindex"], emitted["link_a"]["ifindex"]) == (
+        "31",
+        "33",
+    )
+    assert emitted["gap_ms"] >= 0 and emitted["delete_ms"] >= 0
+    assert emitted["recreated_at"].endswith("+00:00"), "the node's clock, ISO 8601"
+    assert emitted["management_digest"] == netp.management_digest(run_id)["sha256"]
+    assert netp.load_state(run_id)["interfaces"] == [a, b]
+
+
+def test_net_recreate_veth_refuses_a_missing_interface(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(netp, "STATE_ROOT", tmp_path / "state")
+    run_id = "gl009-counter-reset-a1-deadbeef"
+    monkeypatch.setattr(netp, "interface_link", lambda name: {"present": False})
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        netp,
+        "run",
+        lambda command, **kwargs: commands.append(list(command))
+        or subprocess.CompletedProcess(command, 0, stdout="[]", stderr=""),
+    )
+    with pytest.raises(netp.ProbeError, match="not present"):
+        netp.recreate_veth(
+            argparse.Namespace(
+                run_id=run_id, slot="a", peer_slot="b", deadman_seconds=2100
+            )
+        )
+    assert commands == [], "refused before any command ran"
+
+
+# --------------------------------------------------------------------------- #
 # net probe: a kernel link-local is not a real-device address
 #
 # Bringing a veth up auto-assigns an IPv6 link-local (fe80::, scope link). The

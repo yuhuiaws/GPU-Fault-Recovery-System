@@ -1235,9 +1235,22 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   预期 PASS 并据此判定：每个读取器一条采集错误点名读取器（`_rdma`/`_efa_network`）、端口或 netdev、
   下降的计数器名与 `delta unknown`，且该拍的 batch 里没有该计数器 delta 及其聚合
   （`rdma_errors_delta`/`rdma_<counter>_delta`/`efa_<group>_errors_delta`）的任何读数，之后从新基线
-  续测；旧的夹成 0 读数即 FAIL。009 `counter_reset`（重建丢包接口）同样要求 `_network` 采集错误点名
-  接口、计数器与 `delta unknown`、该拍无 `network_drops_delta` 读数、无 finding；接口重建跨越了一拍
-  致基线被清（既无错误也无读数）记 INCONCLUSIVE。若节点上没有任何 EFA 功能拥有 netdev，夹具树给第一个 EFA 设备附上节点一个真实
+  续测；旧的夹成 0 读数即 FAIL。009 `counter_reset`（`general_live_network_reset.py`，重建丢包接口）同样要求
+  `_network` 采集错误点名接口、计数器与 `delta unknown`、该拍无 `network_drops_delta` 读数、无
+  finding，并且依赖投递契约而非运气：采集错误是沿，重置那一拍必被投递并存为 raw evidence；重建后再
+  来一段短丢包，其第一拍是 `threshold:network_drops_delta` 沿，带从新基线起算的正 delta（`rearmed`
+  阶段：为正、不为负、不超过 oracle 在新接口上数到的帧数，随后归零）；旧的夹 0 由此可见——重建后有
+  读数却从未点名重置即 FAIL。采集器按接口**名**存基线、一拍没列出的名字即清基线且必需名缺失即
+  CRITICAL `network_link_down`，所以重建改为网卡探针的一条命令 `recreate-veth`（同一进程里
+  `ip link del` 紧接 `ip link add`，间隙以毫秒计并随 `recreated_at` 节点时钟上报），而不是两次
+  探针往返（真机每次约 15 s，一拍很可能落入间隙）。若仍有一拍看到接口缺失，产品自己的
+  `network_link_down` incident 就是见证：先等两端 link 读数恢复、关窗、走产品的 validated restore
+  读回节点，再记 INCONCLUSIVE（不是对重置规则的判定）。刺激由 netdev oracle 见证（重建前丢包计数上升、
+  探针输出的 ifindex 变化、重建后再次上升），产品侧每一步都按节奏预算轮询（6 个周期 + 60 s），而不是
+  固定等待后只读一次。2026-10-25 HyperPod lane（d5d7610460e0，harness 26f860e4）的 INCONCLUSIVE
+  正是旧做法：两次往返重建、重建后 60 s 单次读取，既无错误也无读数，也没有任何采集器行为的记录；
+  2026-10-24 EKS 的 PASS（bf1bb0037847）出自更早的 oracle，只判无硬件步骤并把夹 0 记为观察，
+  并未检验重置规则，也就谈不上时机运气。若节点上没有任何 EFA 功能拥有 netdev，夹具树给第一个 EFA 设备附上节点一个真实
   物理 netdev（`build-infiniband-fixture --netdev`，netdev 本身不改动）以便产品的 ethtool
   路径有读数可回放，证据记 `netdev_source: fixture`。清理关窗后用只读 `read-source` 核对
   单元与 PID 1 读到同一真实 sysfs 值且不等于夹具值。`non_efa` 仍为 CAPABILITY_ABSENT。

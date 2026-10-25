@@ -14,13 +14,13 @@ VALIDATE_FABRIC. The oracle reads the sysfs counters itself; a drop generator
 that never moves the counters, or a ``tc netem`` flow that moves NIC counters,
 is INCONCLUSIVE rather than a native pass. 009 ``tcp_only`` (its netns + netem
 fixture, the temporary ``tc`` dependency and its oracle) is
-``general_live_tcp.py``.
+``general_live_tcp.py``; 009 ``counter_reset`` (the one-process recreate of the
+drop pair and its reset-tick oracle) is ``general_live_network_reset.py``.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
-from datetime import timedelta
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import (
@@ -55,6 +55,7 @@ from scripts.e2e.regional.general_live_registry import (
 )
 from scripts.e2e.regional.general_live_source_replay import host_source_replay
 from scripts.e2e.regional.general_live_tcp import PACKAGE_APPROVAL, tcp_only
+from scripts.e2e.regional.general_live_network_reset import counter_reset
 from scripts.e2e.regional.probes.collector_window_probe import MAX_RESTORE_SECONDS
 from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
@@ -65,7 +66,6 @@ from scripts.e2e.regional.general_live_verdicts import (
     hardware_errors,
     node_isolated,
     oracle_values,
-    parse_time,
     samples,
     verdict,
 )
@@ -81,9 +81,6 @@ DROPS_SUSTAIN = 60
 #: a few 5-s oracle ticks (it drops from its first frame).
 DROPS_RAMP_BUDGET = 90
 SHORT_DROPS = 30
-#: Node and control-plane clocks may differ by a few seconds when a batch is
-#: placed before or after the runner's recreate of the drop interface.
-RESET_CLOCK_TOLERANCE_SECONDS = 5
 
 
 def drops_budget(ctx: VariantContext) -> int:
@@ -701,123 +698,6 @@ def short_drops(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
-def reset_evidence(
-    observed: dict[str, Any], device: str, since: Any
-) -> dict[str, list[Any]]:
-    """What the product recorded about ``device`` after a counter reset.
-
-    ``errors``: the ``_network`` collection errors naming the interface, a
-    counter ``reset`` and ``delta unknown`` (``collectors/host/network.py``
-    ``_reset_problem``) in batches observed since ``since``; ``reset_tick``:
-    ``network_drops_delta`` samples of the interface shipped in those very
-    batches (the rule is no delta for that tick); ``readings``: every drops
-    sample of the interface since ``since``.
-    """
-
-    errors: list[str] = []
-    reset_tick: list[dict[str, Any]] = []
-    readings: list[dict[str, Any]] = []
-    for batch in observed.get("batches") or []:
-        moment = parse_time(batch.get("observed_at"))
-        if moment is None or moment < since:
-            continue
-        drops = [
-            {**sample, "observed_at": batch.get("observed_at")}
-            for sample in batch.get("samples") or []
-            if sample.get("name") == "network_drops_delta"
-            and sample.get("device") == device
-        ]
-        readings.extend(drops)
-        named = [
-            str(error)
-            for error in batch.get("collection_errors") or []
-            if "_network" in str(error)
-            and f"{device}:" in str(error)
-            and "reset" in str(error)
-            and "delta unknown" in str(error)
-        ]
-        if named:
-            errors.extend(named)
-            reset_tick.extend(drops)
-    return {"errors": errors, "reset_tick": reset_tick, "readings": readings}
-
-
-def counter_reset(ctx: VariantContext) -> dict[str, Any]:
-    """The drop interface is deleted and recreated between ticks: its counters
-    fall below the collector's baseline.
-
-    Since batch 173 the netdev reader treats a counter below its own baseline
-    as missing evidence for that tick: a ``_network`` collection error naming
-    the interface, the counter and ``delta unknown``, no
-    ``network_drops_delta`` for the interface in that batch, the baseline
-    re-armed from the new value -- never the clamped 0 that read as a recovery
-    while the drops were active. No evidence either way (the recreate
-    straddled a tick and the baseline was pruned) is INCONCLUSIVE.
-    """
-
-    created = _veth(ctx)
-    a, b = created["a"], created["b"]
-    _declare_required(ctx, a, b)
-    started = utc_now()
-    ctx.net("start-drops", "--slot", "a", "--rate", "10", "--seconds", "60")
-    ctx.cleanup.push("net-drops", lambda: ctx.net("stop-drops"))
-    ctx.hold(40, name="pre-reset")
-    ctx.net("stop-drops")
-    ctx.cleanup.discard("net-drops")
-    reset_at = utc_now()
-    recreated = ctx.net("delete-interface", "--slot", "a")
-    ctx.net(
-        "create-veth",
-        "--slot",
-        "a",
-        "--peer-slot",
-        "b",
-        "--deadman-seconds",
-        str(ctx.spec.max_minutes * 60 + 600),
-    )
-    ctx.hold(ctx.host_interval * 3, name="post-reset")
-    observed = activity(ctx, started, metrics={"network_drops_delta"})
-    evidence = reset_evidence(
-        observed, a, reset_at - timedelta(seconds=RESET_CLOCK_TOLERANCE_SECONDS)
-    )
-    ctx.evidence.write("reset-evidence", {"reset_at": reset_at.isoformat(), **evidence})
-    close_window(ctx)
-    ctx.cleanup.discard("collector-window")
-    if not evidence["errors"] and not evidence["readings"]:
-        raise VariantInconclusive(
-            f"the product recorded neither a _network reset error nor a "
-            f"network_drops_delta reading for {a} after the recreate: the collector "
-            "did not read the recreated interface against a surviving baseline"
-        )
-    stages = {
-        "reset_unknown": []
-        if evidence["errors"]
-        else [
-            f"no _network collection error names a {a} counter reset with 'delta "
-            f"unknown' while {len(evidence['readings'])} network_drops_delta "
-            f"reading(s) were shipped after the recreate: the old clamp"
-        ],
-        "no_reading_in_reset_tick": [
-            f"network_drops_delta={item.get('value')} shipped for {a} in the reset "
-            f"tick (observed {item.get('observed_at')})"
-            for item in evidence["reset_tick"]
-        ],
-        "no_finding": chain_errors(
-            observed,
-            ChainExpectation(metric="network_drops_delta", device=a, present=False),
-        ),
-        "hardware": hardware_errors(observed),
-    }
-    return _result(
-        stages,
-        notes=[
-            "a counter below its baseline is unknown for that tick (collection error, "
-            "no delta), not a decrement, not a recovery and not a new fault"
-        ],
-        extra={"recreated": recreated, "reset_at": reset_at.isoformat()},
-    )
-
-
 def wrong_interface(ctx: VariantContext) -> dict[str, Any]:
     first = _veth(ctx, a="a", b="b")
     second = ctx.net(
@@ -1329,13 +1209,17 @@ VARIANTS = [
     _spec(
         CASE_009,
         "counter_reset",
-        "atomic delete+add of the drop interface between ticks",
+        "a short drop burst, then the pair deleted and re-added in one probe "
+        "process (recreate-veth, a millisecond gap: no tick sees the required pair "
+        "missing), then a second burst on the recreated pair",
         "the reset tick is a _network collection error naming the interface, the "
         "counter and 'delta unknown' with no network_drops_delta reading in that "
-        "batch (never a clamped 0 or a pseudo-rate); no finding, no hardware recovery",
+        "batch (never a clamped 0 or a pseudo-rate), delivered as an edge; the "
+        "second burst ships a positive delta from the new baseline; no finding, no "
+        "hardware recovery, no isolation",
         counter_reset,
         risk="L",
-        max_minutes=10,
+        max_minutes=25,
         approvals=("KERNEL_MODULE_LOAD",),
     ),
     _spec(

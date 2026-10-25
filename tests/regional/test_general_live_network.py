@@ -12,6 +12,7 @@ import asyncio
 import itertools
 import json
 import shutil
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -25,9 +26,11 @@ from gpu_fault.host_health import NodeHealthPolicy
 from gpu_fault.models import WorkflowOperation, WorkflowStatus
 from gpu_fault.store import InMemoryStore
 from scripts.e2e.regional import general_live_network as net
+from scripts.e2e.regional import general_live_network_reset as reset
 from scripts.e2e.regional.general_live_common import STORE_POLL_SECONDS
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from scripts.e2e.regional.general_live_store import ACTIVITY_PROBE
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from tests._builders import active_workflow_executor, asgi_client, execute_workflow
 from tests.regional._general_live_fakes import (
     FakeProbe,
@@ -132,6 +135,7 @@ def net_probe(down: str | None = None, **extra: Any) -> FakeProbe:
             "link": {"operstate": args[-1]},
         },
         "delete-interface": {"deleted": IFA, "present": False},
+        "recreate-veth": recreate_output(),
         "start-drops": {"unit": "gfrs-x-drops"},
         "stop-drops": {"stopped": "gfrs-x-drops"},
         "reading": {
@@ -516,24 +520,36 @@ def test_wrong_interface_binds_to_b(tmp_path: Path) -> None:
 RESET_ERROR = (
     f"_network: HostObservationError: {IFA}: rx_dropped reset (400 -> 0); delta unknown"
 )
+#: The variant's own clock (``general_live_network_reset.utc_now``): the first
+#: burst starts at R0, the recreate is asked at R0+120 s, later readings 60 s
+#: apart. The oracle's node clock and the product's ``observed_at`` are on it.
+R0 = datetime(2026, 10, 25, 21, 53, tzinfo=timezone.utc)
+R0_EPOCH = R0.timestamp()
+#: The probe dates the recreate on the node's clock.
+RECREATED_AT = 125.0
 
 
-def _soon(seconds: float) -> str:
-    """Batches must postdate the runner's real-clock recreate of the interface."""
+@pytest.fixture
+def reset_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    moments = (R0 + timedelta(seconds=60 * step) for step in itertools.count())
+    monkeypatch.setattr(reset, "utc_now", lambda: next(moments))
 
-    from datetime import datetime, timedelta, timezone
 
-    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+def _at(seconds: float) -> str:
+    return (R0 + timedelta(seconds=seconds)).isoformat()
 
 
 def _reset_batch(
-    seconds: float, samples: list[dict[str, Any]], errors: tuple[str, ...] = ()
+    seconds: float,
+    samples: list[dict[str, Any]],
+    *,
+    errors: tuple[str, ...] = (),
+    reasons: tuple[str, ...] = ("threshold:network_drops_delta",),
 ) -> dict[str, Any]:
-    at = _soon(seconds)
     return {
-        "observed_at": at,
-        "batch_id": f"host-{at}",
-        "edge_filter_reasons": [],
+        "observed_at": _at(seconds),
+        "batch_id": f"host-{NODE}-{int(seconds)}",
+        "edge_filter_reasons": list(reasons),
         "collection_errors": list(errors),
         "samples": samples,
     }
@@ -548,65 +564,233 @@ def _drops(value: float, device: str = IFA) -> dict[str, Any]:
     }
 
 
-def reset_doc(*, marked: bool, reset_tick_reading: bool = False) -> dict[str, Any]:
-    """Ramp, the reset tick, a normal tick after it.
+def _link_down(value: float, device: str) -> dict[str, Any]:
+    return {"name": "network_link_down", "device": device, "value": value, "labels": {}}
 
-    ``marked``: the reset tick carries the ``_network`` reset error and no drops
-    reading for the interface (batch 173); otherwise the old clamp shipped a 0.
-    ``reset_tick_reading`` puts a drops reading into the marked reset tick.
+
+def reset_status(seconds: float) -> dict[str, Any]:
+    """The HOST_TELEMETRY status row: upserted for every accepted batch."""
+
+    return {
+        "cluster_id": "gpu-eks-cluster",
+        "node_id": NODE,
+        "collector": "HOST_TELEMETRY",
+        "observed_at": _at(seconds),
+        "ingested_at": _at(seconds + 1),
+        "last_success_at": _at(seconds),
+        "last_error_at": None,
+        "batch_id": f"host-{NODE}-{int(seconds)}",
+        "sample_count": 101,
+        "errors": [],
+    }
+
+
+def reset_doc(
+    *,
+    marked: bool = True,
+    reset_tick_reading: bool = False,
+    burst: bool = True,
+    burst_zero: bool = True,
+    ramp: bool = True,
+    zero_after: bool = True,
+    status_at: float | None = None,
+    incidents: list[dict[str, Any]] | None = None,
+    workflows: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    """The product's stored edges around the recreate.
+
+    The first burst's threshold edge (R0+20 s) and recovered edge (R0+50 s);
+    ``marked``: the reset tick (R0+130 s) carries the ``_network`` reset error
+    and no drops reading for the interface (batch 173), ``reset_tick_reading``
+    puts one in; ``ramp``: the second burst's edge from the new baseline
+    (R0+200 s) and its recovered edge (R0+230 s). The status row sits on the
+    newest batch unless ``status_at`` says otherwise.
     """
 
-    reset_tick = (
-        [_drops(0.0)] if (not marked or reset_tick_reading) else [_drops(7.0, IFB)]
-    )
+    batches = []
+    if burst:
+        batches.append(_reset_batch(20, [_drops(400.0), _drops(400.0, IFB)]))
+        if burst_zero:
+            batches.append(
+                _reset_batch(
+                    50, [_drops(0.0), _drops(0.0, IFB)], reasons=("recovered",)
+                )
+            )
+    if marked:
+        tick = [_drops(0.0)] if reset_tick_reading else []
+        batches.append(
+            _reset_batch(
+                130, tick, errors=(RESET_ERROR,), reasons=("collection-error:_network",)
+            )
+        )
+    if ramp:
+        batches.append(_reset_batch(200, [_drops(150.0), _drops(150.0, IFB)]))
+        if zero_after:
+            batches.append(
+                _reset_batch(
+                    230, [_drops(0.0), _drops(0.0, IFB)], reasons=("recovered",)
+                )
+            )
+    newest = max([20.0, *(130.0 if marked else 20.0,), *(200.0 if ramp else 20.0,)])
     return {
-        "incidents": [],
-        "workflows": [],
-        "batches": [
-            _reset_batch(30, [_drops(400.0)]),
-            _reset_batch(60, reset_tick, errors=(RESET_ERROR,) if marked else ()),
-            _reset_batch(90, [_drops(0.0)]),
-        ],
+        "incidents": list(incidents or []),
+        "workflows": list(workflows or []),
+        "batches": batches,
         "markers": [],
         "commands": [],
         "health_signals": {},
         "notifications": [],
-        "collector_statuses": [],
+        "metric_latest": [],
+        "collector_statuses": [
+            reset_status(newest if status_at is None else status_at)
+        ],
     }
 
 
-def _run_counter_reset(tmp_path: Path, document: dict[str, Any]) -> dict[str, Any]:
+def reset_oracle(*, rise: bool = True, recreate: bool = True) -> list[dict[str, Any]]:
+    """The netdev oracle, 5-s samples over 300 s: the pair's drops rise to 400
+    before the recreate (node clock R0+125 s), the index changes and the
+    counters restart, the second burst counts 150 from R0+180 s."""
+
+    rows = []
+    for index in range(61):
+        moment = R0_EPOCH + 5 * index
+        if moment < R0_EPOCH + RECREATED_AT:
+            drops = min(400, 20 * index) if rise else 0
+            ifindex = 31
+        else:
+            ramp = int(moment - (R0_EPOCH + 180)) * 10
+            drops = max(0, min(150, ramp)) if rise else 0
+            ifindex = 33 if recreate else 31
+        rows.append(
+            {
+                "t": moment,
+                "at": datetime.fromtimestamp(moment, timezone.utc).isoformat(),
+                "netdev": {
+                    IFA: {
+                        "present": True,
+                        "ifindex": ifindex,
+                        "operstate": "up",
+                        "rx_errors": 0,
+                        "tx_errors": 0,
+                        "rx_dropped": 0,
+                        "tx_dropped": drops,
+                    },
+                    IFB: {
+                        "present": True,
+                        "ifindex": ifindex - 1,
+                        "operstate": "up",
+                        "rx_errors": 0,
+                        "tx_errors": 0,
+                        "rx_dropped": drops,
+                        "tx_dropped": 0,
+                    },
+                },
+            }
+        )
+    done = {"records": [], "next_offset": len(rows), "total": len(rows)}
+    return [{"records": rows, "next_offset": len(rows), "total": len(rows)}, done]
+
+
+def recreate_output(*, new_index: str = "33") -> dict[str, Any]:
+    """What ``recreate-veth`` prints: the pair before and after, the gap."""
+
+    return {
+        "a": IFA,
+        "b": IFB,
+        "deadman": "gfrs-aaaaaa-ndeadman-interfaces",
+        "before": {
+            "a": {"present": True, "ifindex": "31", "operstate": "up"},
+            "b": {"present": True, "ifindex": "30", "operstate": "up"},
+        },
+        "link_a": {"present": True, "ifindex": new_index, "operstate": "up"},
+        "link_b": {
+            "present": True,
+            "ifindex": str(int(new_index) - 1),
+            "operstate": "up",
+        },
+        "delete_ms": 3.1,
+        "gap_ms": 2.4,
+        "recreated_at": _at(RECREATED_AT),
+        "management_digest": "d" * 64,
+    }
+
+
+def _run_counter_reset(
+    tmp_path: Path,
+    document: dict[str, Any],
+    *,
+    oracle: list[dict[str, Any]] | None = None,
+    net_extra: dict[str, Any] | None = None,
+) -> tuple[dict[str, Any], Any, FakeProbe]:
     spec = SPECS["counter_reset"]
     regional = FakeRegional(cpu_python=store_script({"activity": document}))
+    net_fake = net_probe(**(net_extra or {}))
     ctx = make_context(
         spec,
         tmp_path=tmp_path,
         regional=regional,
-        probes=probes(node_probe(survey()), net_probe(), window_probe()),
+        probes=probes(
+            node_probe(survey(), oracle or reset_oracle()), net_fake, window_probe()
+        ),
     )
-    return spec.execute(ctx)
+    return spec.execute(ctx), ctx, net_fake
 
 
+@pytest.mark.usefixtures("reset_clock")
 def test_counter_reset_reads_the_reset_tick_as_unknown(tmp_path: Path) -> None:
-    result = _run_counter_reset(tmp_path, reset_doc(marked=True))
+    result, ctx, net_fake = _run_counter_reset(tmp_path, reset_doc())
     assert result["verdict"] == "PASS", result["errors"]
-    assert result["stages"]["reset_unknown"] == []
+    assert result["stages"]["reset_unknown"] == [] and result["stages"]["rearmed"] == []
+    assert (result["oracle"]["ifindex_before"], result["oracle"]["ifindex_after"]) == (
+        ["31"],
+        ["33"],
+    )
+    assert (
+        result["oracle"]["pre_reset_drops"],
+        result["oracle"]["post_reset_drops"],
+    ) == (800.0, 300.0)
+    # One burst, the one-process recreate, a second burst on the new pair.
+    assert [call[0] for call in net_fake.calls] == [
+        "create-veth",
+        "start-drops",
+        "stop-drops",
+        "recreate-veth",
+        "start-drops",
+        "stop-drops",
+    ]
+    recreate = next(call for call in net_fake.calls if call[0] == "recreate-veth")
+    assert recreate[:5] == ("recreate-veth", "--slot", "a", "--peer-slot", "b")
+    evidence = json.loads((ctx.case_dir / "reset-evidence.json").read_text())
+    assert evidence["errors"] == [RESET_ERROR] and evidence["reset_tick"] == []
+    assert [item["value"] for item in evidence["readings"]] == [150.0, 0.0]
+    assert (evidence["gap_ms"], evidence["recreated_at"]) == (2.4, _at(RECREATED_AT))
+    assert evidence["anchor"] == _at(RECREATED_AT - 15), (
+        "one interval before the recreate"
+    )
+    for name in ("reset-edge", "reset-quiet", "reset-tick", "reset-rearmed"):
+        assert (ctx.case_dir / f"{name}-timeline.json").is_file(), name
     spec = SPECS["counter_reset"]
     assert spec.expected_outcome == "PASS" and spec.proof_mode == "native"
     assert "delta unknown" in spec.expected and "clamped" in spec.expected
+    assert "recreate-veth" in spec.injection and spec.max_minutes == 25
 
 
+@pytest.mark.usefixtures("reset_clock")
 def test_counter_reset_fails_on_the_old_clamp(tmp_path: Path) -> None:
-    result = _run_counter_reset(tmp_path, reset_doc(marked=False))
+    # The old product's trace: no reset error ever named, the recreated pair's
+    # first delta the first record after the recreate.
+    result, _ctx, _net = _run_counter_reset(tmp_path, reset_doc(marked=False))
     assert result["verdict"] == "FAIL", result
     assert any(
         "old clamp" in error and "delta unknown" in error for error in result["errors"]
     ), result["errors"]
 
 
+@pytest.mark.usefixtures("reset_clock")
 def test_counter_reset_fails_on_a_reading_in_the_reset_tick(tmp_path: Path) -> None:
-    result = _run_counter_reset(
-        tmp_path, reset_doc(marked=True, reset_tick_reading=True)
+    result, _ctx, _net = _run_counter_reset(
+        tmp_path, reset_doc(reset_tick_reading=True)
     )
     assert result["verdict"] == "FAIL", result
     assert any("in the reset tick" in error for error in result["errors"]), result[
@@ -614,25 +798,152 @@ def test_counter_reset_fails_on_a_reading_in_the_reset_tick(tmp_path: Path) -> N
     ]
 
 
-def test_counter_reset_is_inconclusive_without_evidence(tmp_path: Path) -> None:
-    empty = reset_doc(marked=True)
-    empty["batches"] = []
-    with pytest.raises(VariantInconclusive, match="surviving baseline"):
-        _run_counter_reset(tmp_path, empty)
+@pytest.mark.usefixtures("reset_clock")
+def test_counter_reset_fails_when_the_recreated_pair_never_counts_again(
+    tmp_path: Path,
+) -> None:
+    # The reset error came, but no delta from the new baseline followed the
+    # second burst although the oracle counted frames on the new pair.
+    result, _ctx, _net = _run_counter_reset(tmp_path, reset_doc(ramp=False))
+    assert result["verdict"] == "FAIL", result
+    assert any(
+        error.startswith("rearmed:") and "no positive network_drops_delta" in error
+        for error in result["errors"]
+    ), result["errors"]
+
+
+@pytest.mark.usefixtures("reset_clock")
+def test_counter_reset_fails_when_batches_arrive_without_the_interface(
+    tmp_path: Path,
+) -> None:
+    # The host collector delivered after the recreate (its status row moved)
+    # but neither named the reset nor read the pair again.
+    document = reset_doc(marked=False, ramp=False, status_at=200.0)
+    result, _ctx, _net = _run_counter_reset(tmp_path, document)
+    assert result["verdict"] == "FAIL", result
+    assert any(
+        "recorded neither a reset error" in error for error in result["errors"]
+    ), result["errors"]
+
+
+@pytest.mark.usefixtures("reset_clock")
+def test_counter_reset_fails_on_a_drops_finding(tmp_path: Path) -> None:
+    found = incident("inc-d", "network_drops_delta", device=IFB, workflow="wf-d")
+    steps = workflow("wf-d", "inc-d", ["FREEZE_EVIDENCE", "VALIDATE_FABRIC"])
+    document = reset_doc(incidents=[found], workflows=[steps])
+    result, _ctx, _net = _run_counter_reset(tmp_path, document)
+    assert result["verdict"] == "FAIL", result
+    assert any(error.startswith("no_finding:") for error in result["errors"]), result[
+        "errors"
+    ]
+
+
+@pytest.mark.usefixtures("reset_clock")
+def test_counter_reset_is_inconclusive_when_the_burst_never_reached_the_product(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(VariantInconclusive, match="baseline the recreate must fall"):
+        _run_counter_reset(tmp_path, reset_doc(burst=False, marked=False, ramp=False))
+
+
+@pytest.mark.usefixtures("reset_clock")
+def test_counter_reset_is_inconclusive_when_the_counters_never_rose(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(VariantInconclusive, match="did not move the drop counters"):
+        _run_counter_reset(tmp_path, reset_doc(), oracle=reset_oracle(rise=False))
+
+
+@pytest.mark.usefixtures("reset_clock")
+def test_counter_reset_is_inconclusive_without_the_bursts_recovered_edge(
+    tmp_path: Path,
+) -> None:
+    document = reset_doc(burst_zero=False, marked=False, ramp=False)
+    with pytest.raises(VariantInconclusive, match="recovered edge"):
+        _run_counter_reset(tmp_path, document)
+
+
+@pytest.mark.usefixtures("reset_clock")
+def test_counter_reset_is_inconclusive_on_a_silent_channel_after_the_recreate(
+    tmp_path: Path,
+) -> None:
+    document = reset_doc(marked=False, ramp=False, status_at=20.0)
+    with pytest.raises(VariantInconclusive, match="silent channel"):
+        _run_counter_reset(tmp_path, document)
+
+
+@pytest.mark.usefixtures("reset_clock")
+def test_counter_reset_refuses_a_recreate_that_kept_the_interface(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(RegionalFixtureError, match="did not replace the interface"):
+        _run_counter_reset(
+            tmp_path,
+            reset_doc(),
+            net_extra={"recreate-veth": recreate_output(new_index="31")},
+        )
+
+
+@pytest.mark.usefixtures("reset_clock")
+def test_counter_reset_readmits_the_node_when_a_tick_saw_the_pair_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    gap = incident(
+        "inc-gap",
+        "network_link_down",
+        device=IFA,
+        state="QUARANTINED",
+        workflow="wf-gap",
+    )
+    steps = workflow(
+        "wf-gap",
+        "inc-gap",
+        ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"],
+        status="SUCCEEDED",
+    )
+    document = reset_doc(marked=False, ramp=False, incidents=[gap], workflows=[steps])
+    # The pair is back up: fresh link readings of both ends after the recreate.
+    for seconds in (140, 160):
+        document["batches"].append(
+            _reset_batch(
+                seconds,
+                [_link_down(0.0, IFA), _link_down(0.0, IFB)],
+                reasons=("recovered",),
+            )
+        )
+    restored: list[tuple[list[str], str]] = []
+
+    def fake_restore(ctx: Any, incidents: Any, *, reason: str) -> list[dict[str, Any]]:
+        restored.append(([item["incident_id"] for item in incidents], reason))
+        return [{"incident_id": "inc-gap"}]
+
+    monkeypatch.setattr(reset, "restore_incidents", fake_restore)
+    with pytest.raises(
+        VariantInconclusive, match="straddled a collector tick"
+    ) as caught:
+        _run_counter_reset(tmp_path, document)
+    assert "2.4 ms" in str(caught.value) and "not a verdict" in str(caught.value)
+    assert restored == [
+        (["inc-gap"], "GF-GENERAL-LIVE-009 counter_reset straddled recreate")
+    ]
 
 
 def test_reset_evidence_keeps_only_the_interfaces_own_records() -> None:
-    from datetime import datetime, timedelta, timezone
-
-    since = datetime.now(timezone.utc) - timedelta(seconds=5)
-    document = reset_doc(marked=True)
-    evidence = net.reset_evidence(document, IFA, since)
+    document = reset_doc()
+    since = R0 + timedelta(seconds=110)
+    evidence = reset.reset_evidence(document, IFA, since)
     assert evidence["errors"] == [RESET_ERROR]
-    assert evidence["reset_tick"] == [], "the peer's reading is not the interface's"
-    assert [item["value"] for item in evidence["readings"]] == [400.0, 0.0]
-    assert net.reset_evidence(document, IFB, since)["errors"] == [], (
+    assert evidence["reset_tick"] == [], "the reset tick carries no reading"
+    assert [item["value"] for item in evidence["readings"]] == [150.0, 0.0]
+    assert reset.reset_evidence(document, IFB, since)["errors"] == [], (
         "an error naming another interface does not count"
     )
+    # Before the anchor nothing counts: the first burst is not the reset's.
+    assert reset.reset_evidence(document, IFA, R0 + timedelta(seconds=300)) == {
+        "errors": [],
+        "reset_tick": [],
+        "readings": [],
+    }
 
 
 def test_short_drops_counter_reset_and_recovery(tmp_path: Path) -> None:

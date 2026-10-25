@@ -1496,9 +1496,34 @@ runner step slower than the tick ships a legitimate 0 reading that ends an
 episode and the next step opens one; the first live run read those as clamps
 and four incidents per reader as re-minted while the reset tick was UNKNOWN on
 both readers), no negative delta and no reading in the reset tick's batch. 009
-`counter_reset` (the drop interface deleted and recreated) grades the same way
-on `_network` and `network_drops_delta`, and is INCONCLUSIVE when the recreate
-straddled a tick and the baseline was pruned (neither an error nor a reading). 011
+`counter_reset` (`general_live_network_reset.py`, the drop interface deleted
+and recreated) grades the same way on `_network` and `network_drops_delta`, and
+relies on the delivery contract rather than on timing: a collection error is
+an edge, so the reset tick is delivered and stored as raw evidence; a second
+short burst on the recreated pair ships a `threshold:network_drops_delta` edge
+whose delta counts from the new baseline (the `rearmed` stage: positive, never
+negative, never more than the oracle counted on the new pair, then a zero), so
+the old clamp is observable as readings after the recreate with no reset error
+ever named (FAIL). The host collector keys baselines by interface *name*, prunes
+the baseline of a name a tick does not list and reads a missing required name
+as CRITICAL `network_link_down`, so the recreate is one net-probe command
+(`recreate-veth`: `ip link del` then `ip link add` in the same process, the gap
+reported in milliseconds with the recreate's node-clock `recreated_at`) rather
+than two probe round trips (about 15 s each live, most of a collector
+interval). Should a tick still see the pair missing, the product's own
+`network_link_down` incident is the witness: the variant waits for both ends'
+link readings to recover, closes the window, readmits the node through the
+validated restore and is INCONCLUSIVE ("straddled a collector tick"), never
+FAIL. The stimulus is the runner's netdev oracle (drops rising before the
+recreate, the probe's ifindex change, drops rising again on the new pair) and
+every product-side step is polled on a cadence budget (six intervals plus
+60 s), never read once after a fixed hold. The 2026-10-25 HyperPod
+INCONCLUSIVE (release d5d7610460e0, harness 26f860e4) was the earlier shape:
+two round trips, one read 60 s after the recreate, neither an error nor a
+reading and no record of what the collector or the counters did; the EKS PASS
+of 2026-10-24 (release bf1bb0037847) came from the older oracle that graded no
+hardware step only and noted the clamp as an observation -- it did not test
+the reset rule, so timing luck played no part in it either. 011
 `broken_pair` (`general_live_nccl_pair.py`, HyperPod lane) uses the same bind
 on one port's `hw_counters/tx_bytes` around a real two-node stall: while broken
 the product must record `efa_traffic_observation_valid=0` with no rate and

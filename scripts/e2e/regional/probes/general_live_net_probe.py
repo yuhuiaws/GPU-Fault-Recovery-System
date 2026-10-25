@@ -17,7 +17,11 @@ and host-side pod veths included -- is not a real-device address. A ``veth`` pai
 carries a drop generator (a
 raw-socket sender of oversized frames behind a small-MTU peer), a ``dummy``
 interface reads ``operstate=unknown``, and a netns peer carries a TCP flow with
-``tc netem`` loss for the TCP-only negative. Every interface is created with a
+``tc netem`` loss for the TCP-only negative. ``recreate-veth`` deletes and
+re-adds the pair in one process (009 ``counter_reset``): the host collector
+keys its counter baselines by interface name and reads a required name a tick
+does not list as CRITICAL link-down, so the pair is never absent for the
+10-15 s two probe round trips take live. Every interface is created with a
 ``systemd-run --on-active`` deadman that deletes it, and the before/after
 configuration digest of every real (addressed or device-backed) non-test
 interface is recorded so an untouched management plane is provable.
@@ -526,6 +530,66 @@ def delete_interface(arguments: argparse.Namespace) -> None:
         state["interfaces"].remove(name)
     save_state(run_id, state)
     emit({"deleted": name, "present": interface_link(name).get("present", False)})
+
+
+def recreate_veth(arguments: argparse.Namespace) -> None:
+    """Delete and re-add this run's veth pair in one process (009 ``counter_reset``).
+
+    The host collector keys its counter baselines by interface *name* and
+    prunes the baseline of every name a tick does not list; a required name a
+    tick does not list is also a CRITICAL ``network_link_down``. Two probe
+    round trips (``delete-interface`` then ``create-veth``) left the pair
+    missing for 10-15 s live, most of a collector interval, so a tick in the
+    gap would have quarantined the node and turned the reset into a brand-new
+    interface. Here the guards, the digest, the deadman and the state are
+    settled first and ``ip link del`` is followed by ``ip link add`` with
+    nothing in between; the measured gap and the recreate's node-clock time
+    are reported so the runner can date the product's batches against them.
+    """
+
+    run_id = checked_run_id(arguments.run_id)
+    a = checked_test_interface(run_id, interface_name(run_id, arguments.slot))
+    b = checked_test_interface(run_id, interface_name(run_id, arguments.peer_slot))
+    seconds = bounded(
+        arguments.deadman_seconds, MIN_DEADMAN_SECONDS, MAX_DEADMAN_SECONDS, "deadman"
+    )
+    old = {"a": interface_link(a), "b": interface_link(b)}
+    if not old["a"].get("present"):
+        raise ProbeError("the interface to recreate is not present")
+    forbid_real(run_id, a)
+    forbid_real(run_id, b)
+    before = management_digest(run_id)
+    deadman = arm_deadman(run_id, "interfaces", seconds)
+    state = load_state(run_id)
+    for name in (a, b):
+        if name not in state["interfaces"]:
+            state["interfaces"].append(name)
+    save_state(run_id, state)
+    delete_started = time.monotonic()
+    run(["ip", "link", "del", a], check=False)
+    gap_started = time.monotonic()
+    run(["ip", "link", "add", a, "type", "veth", "peer", "name", b])
+    gap_ended = time.monotonic()
+    run(["ip", "link", "set", b, "mtu", str(OVERSIZE_MTU)])
+    run(["ip", "link", "set", a, "up"])
+    run(["ip", "link", "set", b, "up"])
+    after = management_digest(run_id)
+    if after["sha256"] != before["sha256"]:
+        raise ProbeError("recreating the test veth changed a real interface digest")
+    emit(
+        {
+            "a": a,
+            "b": b,
+            "deadman": deadman,
+            "before": old,
+            "link_a": interface_link(a),
+            "link_b": interface_link(b),
+            "delete_ms": round((gap_started - delete_started) * 1000, 1),
+            "gap_ms": round((gap_ended - gap_started) * 1000, 1),
+            "recreated_at": utc_now(),
+            "management_digest": before["sha256"],
+        }
+    )
 
 
 DROP_GENERATOR = r"""
@@ -1209,6 +1273,10 @@ def parser() -> argparse.ArgumentParser:
     item.add_argument("--slot", required=True)
     item.add_argument("--state", required=True)
     command("delete-interface", delete_interface).add_argument("--slot", required=True)
+    item = command("recreate-veth", recreate_veth)
+    item.add_argument("--slot", default="a")
+    item.add_argument("--peer-slot", default="b")
+    item.add_argument("--deadman-seconds", type=int, required=True)
     item = command("start-drops", start_drops)
     item.add_argument("--slot", default="a")
     item.add_argument("--rate", type=int, default=10)
