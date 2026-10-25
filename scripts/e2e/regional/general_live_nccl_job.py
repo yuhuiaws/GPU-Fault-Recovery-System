@@ -51,16 +51,29 @@ snapshot, the product's application progress protocol, at its own
 its phase every 30 s). ``keep_active=False`` drops the payload: the always-low
 job only all-reduces its heartbeat and never reaches 1 MiB/s. The flight
 recorder is on only with ``flight_recorder=True``, with the variables the
-operations manual prescribes; otherwise its buffer is 0.
+operations manual prescribes; otherwise its buffer is 0. A
+``general_live_fr_replay.FlightRecorderReplay`` as ``flight_recorder`` keeps
+PyTorch's recorder off and runs the test dump responder in each Pod instead
+(``probes/general_live_fr_responder.py``, written by the container command next
+to the trainer and started before ``exec torchrun``): the product's triage then
+reads dumps of that shape through its own FIFO protocol -- live-replay.
 """
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 from scripts.e2e.regional.acceptance_gpu_load import GPU_LOAD_SNIPPET
 from scripts.e2e.regional.general_live_fixture import VariantContext, VariantNotRun
+from scripts.e2e.regional.general_live_fr_replay import (
+    LEDGER_PATH,
+    SHAPE_ENV,
+    FlightRecorderReplay,
+    responder_environment,
+    responder_launch,
+)
 
 TWO_NODE_MANIFEST = "two-node-replace-pytorchjob.yaml"
 TRAINER_PATH = "/tmp/gfrs_nccl_stall.py"
@@ -95,6 +108,8 @@ FLIGHT_RECORDER_OFF_ENV = {"TORCH_NCCL_TRACE_BUFFER_SIZE": "0"}
 MANAGED_ENV = frozenset(
     {
         *FLIGHT_RECORDER_ENV,
+        "TORCH_NCCL_DEBUG_INFO_TEMP_FILE",
+        SHAPE_ENV,
         "GPU_FAULT_RANK_PROGRESS_FILE",
         "GFRS_ATTEMPT_ID",
         "GFRS_JOB_ID",
@@ -348,11 +363,19 @@ def trainer_script() -> str:
     return script
 
 
-def trainer_command(nproc_per_node: int) -> list[str]:
+def trainer_command(
+    nproc_per_node: int, *, replay: FlightRecorderReplay | None = None
+) -> list[str]:
+    """The container command: the trainer heredoc, (the responder,) torchrun."""
+
+    responder = (
+        responder_launch(procs_per_node=nproc_per_node) if replay is not None else ""
+    )
     return [
         "/bin/bash",
         "-lc",
         f"cat >{TRAINER_PATH} <<'PY'\n{trainer_script()}PY\n"
+        f"{responder}"
         "exec torchrun \\\n"
         '  --nnodes="${WORLD_SIZE}" \\\n'
         f"  --nproc-per-node={nproc_per_node} \\\n"
@@ -372,7 +395,7 @@ def render_nccl_manifest(
     attempt_id: str,
     keep_active: bool = True,
     stall_mode: str = "quiet",
-    flight_recorder: bool = False,
+    flight_recorder: bool | FlightRecorderReplay = False,
     pause_dir: str = PAUSE_DIR,
     stall_max_seconds: int = STALL_MAX_SECONDS,
 ) -> dict[str, Any]:
@@ -380,6 +403,8 @@ def render_nccl_manifest(
 
     Refuses a source whose Pod templates are not one EFA ``pytorch`` container
     each: rendering the trainer onto anything else would not be this experiment.
+    ``flight_recorder`` is PyTorch's own recorder (``True``), none (``False``)
+    or a :class:`FlightRecorderReplay` the test responder serves instead.
     """
 
     if stall_mode not in STALL_MODES:
@@ -407,7 +432,13 @@ def render_nccl_manifest(
             raise ValueError(f"the {role} Pod needs exactly one pytorch container")
         container = trainers[0]
         _require_efa(role, container)
-        container["command"] = trainer_command(_gpus_per_pod(role, container))
+        replay = (
+            flight_recorder
+            if isinstance(flight_recorder, FlightRecorderReplay)
+            else None
+        )
+        gpus = _gpus_per_pod(role, container)
+        container["command"] = trainer_command(gpus, replay=replay)
         container.pop("args", None)
         container["env"] = [
             item
@@ -421,6 +452,7 @@ def render_nccl_manifest(
             flight_recorder=flight_recorder,
             pause_dir=pause_dir,
             stall_max_seconds=stall_max_seconds,
+            procs_per_node=gpus,
         )
     return document
 
@@ -456,10 +488,15 @@ def _env(
     attempt_id: str,
     keep_active: bool,
     stall_mode: str,
-    flight_recorder: bool,
+    flight_recorder: bool | FlightRecorderReplay,
     pause_dir: str,
     stall_max_seconds: int,
+    procs_per_node: int,
 ) -> list[dict[str, str]]:
+    if isinstance(flight_recorder, FlightRecorderReplay):
+        recorder = responder_environment(flight_recorder, procs_per_node=procs_per_node)
+    else:
+        recorder = FLIGHT_RECORDER_ENV if flight_recorder else FLIGHT_RECORDER_OFF_ENV
     values = {
         "GFRS_JOB_ID": name,
         "GFRS_ATTEMPT_ID": attempt_id,
@@ -470,7 +507,7 @@ def _env(
         "GFRS_STALL_MAX_SECONDS": str(stall_max_seconds),
         "GFRS_STEPS": str(TRAINER_STEPS),
         "GFRS_WRITE_BYTES_PER_SECOND": str(WRITE_BYTES_PER_SECOND),
-        **(FLIGHT_RECORDER_ENV if flight_recorder else FLIGHT_RECORDER_OFF_ENV),
+        **recorder,
     }
     if stall_mode == "phase":
         values["GFRS_RANK_PROGRESS_DIR"] = RANK_PROGRESS_DIR
@@ -482,9 +519,10 @@ class ManagedNcclJob:
 
     ``stall`` creates the pause file in the Master Pod; ``release`` creates the
     release file in both Pods (the held ranks of each Pod watch their own);
-    ``alive`` says whether both Pods still run as started. The variant tests
-    monkeypatch this class; test_general_live_managed_job_start.py runs its
-    start with the real fixtures.
+    ``alive`` says whether both Pods still run as started; ``flight_ledgers``
+    reads the test dump responders' ledgers of a replayed recorder. The variant
+    tests monkeypatch this class; test_general_live_managed_job_start.py runs
+    its start with the real fixtures.
     """
 
     PAUSE_DIR = PAUSE_DIR
@@ -494,7 +532,7 @@ class ManagedNcclJob:
         ctx: VariantContext,
         *,
         name: str,
-        flight_recorder: bool = False,
+        flight_recorder: bool | FlightRecorderReplay = False,
         keep_active: bool = True,
         stall_mode: str = "quiet",
     ) -> None:
@@ -534,7 +572,12 @@ class ManagedNcclJob:
         rendered.chmod(0o600)
         self.ctx = ctx
         self.name = name
-        self.flight_recorder = flight_recorder
+        self.replay = (
+            flight_recorder
+            if isinstance(flight_recorder, FlightRecorderReplay)
+            else None
+        )
+        self.flight_recorder = bool(flight_recorder)
         self.keep_active = keep_active
         self.stall_mode = stall_mode
         self.started_pods: dict[str, str] = {}
@@ -573,6 +616,7 @@ class ManagedNcclJob:
             "attempt_id": self.attempt_id,
             "nodes": [self.ctx.settings.node, self.ctx.settings.peer_node],
             "flight_recorder": self.flight_recorder,
+            "flight_recorder_replay": self.replay.name if self.replay else None,
             "keep_active": self.keep_active,
             "stall_mode": self.stall_mode,
             "payload_bytes": PAYLOAD_BYTES if self.keep_active else 0,
@@ -621,6 +665,22 @@ class ManagedNcclJob:
             "pods": pods,
             "started": self.started_pods,
         }
+
+    def flight_ledgers(self) -> dict[str, Any]:
+        """Each Pod's test dump responder ledger (its own account of requests).
+
+        A Pod whose ledger cannot be read or parsed maps to ``{"error": ...}``:
+        the replay oracle then says the fixture did not hold, never the product.
+        """
+
+        ledgers: dict[str, Any] = {}
+        for item in self.fixture.pods():
+            pod = str(item["name"])
+            try:
+                ledgers[pod] = json.loads(self._exec(pod, f"cat {LEDGER_PATH}"))
+            except (OSError, RuntimeError, ValueError) as exc:
+                ledgers[pod] = {"error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        return ledgers
 
     def trainer_events(self) -> dict[str, list[str]]:
         """The trainer's STALL / RESUMED lines per Pod (its own account)."""
