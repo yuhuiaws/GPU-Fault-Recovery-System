@@ -716,6 +716,139 @@ def test_an_unknown_gpu_inventory_neither_confirms_nor_clears_the_missing_streak
     )
 
 
+def listing(count: int) -> tuple[str, str, int]:
+    return "".join(f"GPU-{index}, 10\n" for index in range(count)), "", 0
+
+
+def bound_gpu_collector(case, *, expected: int, bound: int, instance_type: str):
+    """A host collector on a node whose driver has ``bound`` GPUs attached."""
+
+    gpus = case.roots.proc / "driver/nvidia/gpus"
+    for index in range(bound):
+        (gpus / f"0000:0{index}:00.0").mkdir(parents=True)
+    return case.build(
+        "_gpu_inventory",
+        expected_gpu_count=expected,
+        inventory_mismatch_consecutive_samples=2,
+        node_instance_type=instance_type,
+    )
+
+
+def graded_ticks(case, collector, ticks: int = 3):
+    """The findings of ``ticks`` collector rounds graded by one policy over one
+    store, plus the ``gpu_inventory_mismatch`` sample of every round.
+
+    Every emitted finding is latched as notified, as the ingestion that carries
+    it into an incident does; an un-notified active signal re-emits by design.
+    """
+
+    store = build_store()
+    policy = NodeHealthPolicy(store)
+    findings, mismatches = [], []
+    for _ in range(ticks):
+        batch = collector.collect_once()
+        mismatches.append(
+            next(
+                item for item in batch.samples if item.name == "gpu_inventory_mismatch"
+            )
+        )
+        emitted = policy.evaluate_metrics(batch)
+        for finding in emitted:
+            store.mark_health_signal_notified(
+                finding_health_signal_key(finding),
+                notified_at=batch.observed_at,
+                semantic_fingerprint=finding_health_signal_fingerprint(finding),
+            )
+        findings.extend(emitted)
+        case.clock.sleep(15)
+    return findings, mismatches
+
+
+@pytest.mark.parametrize("explicit", [9, 7], ids=["above-the-type", "below-the-type"])
+def test_an_expectation_the_instance_type_and_the_node_both_contradict_never_reboots(
+    host_case, explicit
+):
+    """GF-GENERAL-LIVE-012 ``expectation_wrong``: a mistyped
+    ``GPU_FAULT_EXPECTED_GPU_COUNT`` on a p5.48xlarge that lists its eight GPUs,
+    eight bound, used to be graded as a lost GPU -- CRITICAL REBOOT_NODE on the
+    second tick. The configured count is the one reading out of three that
+    disagrees: a configuration finding (WARNING, evidence only), never a reboot.
+    """
+
+    collector = bound_gpu_collector(
+        host_case, expected=explicit, bound=8, instance_type="ml.p5.48xlarge"
+    )
+    host_case.outputs[tuple(collector.GPU_QUERY_ARGV)] = listing(8)
+
+    findings, mismatches = graded_ticks(host_case, collector)
+
+    for sample in mismatches:
+        assert sample.labels["instance_type_gpu_count"] == "8", sample.labels
+        assert sample.labels["discovered_count"] == "8", sample.labels
+        assert sample.labels["expected_count"] == str(explicit), sample.labels
+    assert [item.recommended_action for item in findings] == [
+        RecoveryAction.COLLECT_EVIDENCE
+    ], f"a configuration typo was graded as hardware: {findings}"
+    (finding,) = findings
+    assert finding.metric_name == "gpu_expected_count_contradicted"
+    assert finding.severity is Severity.WARNING
+    for named in (str(explicit), "8", "ml.p5.48xlarge"):
+        assert named in finding.reason, finding.reason
+    assert finding.diagnostic_parameters["observed_count"] == "8"
+    assert finding.diagnostic_parameters["instance_type_gpu_count"] == "8"
+
+
+@pytest.mark.parametrize(
+    ("listed", "bound"),
+    [(7, 7), (8, 7)],
+    ids=["short-of-the-type", "driver-bound-disagrees"],
+)
+def test_a_real_shortfall_under_a_wrong_expectation_still_reboots(
+    host_case, listed, bound
+):
+    """Conservative: a node short of its instance type's own GPU count, or whose
+    driver-bound count disagrees with the listing, grades exactly as before
+    (CRITICAL REBOOT_NODE on the second valid sample) however wrong the
+    configured count also is."""
+
+    collector = bound_gpu_collector(
+        host_case, expected=9, bound=bound, instance_type="ml.p5.48xlarge"
+    )
+    host_case.outputs[tuple(collector.GPU_QUERY_ARGV)] = listing(listed)
+
+    findings, mismatches = graded_ticks(host_case, collector, ticks=2)
+
+    assert [item.value for item in mismatches] == [0, 1], "two ticks confirm"
+    reboots = [
+        item
+        for item in findings
+        if item.recommended_action is RecoveryAction.REBOOT_NODE
+    ]
+    assert len(reboots) == 1, f"the real shortfall was not graded: {findings}"
+    assert reboots[0].metric_name == "gpu_inventory_mismatch"
+    assert reboots[0].severity is Severity.CRITICAL
+    assert reboots[0].diagnostic_parameters["instance_type_gpu_count"] == "8"
+
+
+def test_an_instance_type_the_table_does_not_know_keeps_the_explicit_expectation(
+    host_case,
+):
+    """Without platform knowledge the explicit setting keeps its documented
+    meaning: nine expected, eight listed is a mismatch and reboots as before."""
+
+    collector = bound_gpu_collector(
+        host_case, expected=9, bound=8, instance_type="ml.p5test.48xlarge"
+    )
+    host_case.outputs[tuple(collector.GPU_QUERY_ARGV)] = listing(8)
+
+    findings, mismatches = graded_ticks(host_case, collector, ticks=2)
+
+    assert "instance_type_gpu_count" not in mismatches[-1].labels, mismatches[-1]
+    assert [(item.metric_name, item.recommended_action) for item in findings] == [
+        ("gpu_inventory_mismatch", RecoveryAction.REBOOT_NODE)
+    ], findings
+
+
 # --------------------------------------------------------------------------- #
 # 004 local disk inodes
 # --------------------------------------------------------------------------- #

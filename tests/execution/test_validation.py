@@ -1175,3 +1175,117 @@ def test_post_reboot_inventory_requirement_is_bounded_by_the_instance_type(
             "gpu_inventory_active_count=7,expected=8"
             in (outcome.details["node_failures"]["node-a"])
         )
+
+
+@pytest.mark.parametrize(
+    ("active_count", "expected_status"),
+    [(8, WorkflowStepStatus.SUCCEEDED), (7, WorkflowStepStatus.FAILED)],
+)
+def test_post_reboot_fallback_expected_count_is_bounded_by_the_rows_instance_type(
+    active_count, expected_status
+) -> None:
+    """A reboot planned by something other than an inventory finding (an XID)
+    validates against the node's latest ``gpu_inventory_expected_count``. That
+    row carries the collector's configured count -- ``expected=9`` on an 8-GPU
+    p5en (GF-GENERAL-LIVE-012 ``expectation_wrong``) -- and validated literally
+    it failed every reboot of a healthy node and escalated the typo into
+    REPLACE_NODE. The row's own ``node_instance_type`` label caps it at the
+    type's physical count, as a plan-frozen requirement already is; a real loss
+    (7 of 8) still fails."""
+
+    now = datetime.now(timezone.utc)
+    rebooted_at = now - timedelta(seconds=5)
+
+    class ValidationStore:
+        def list_collector_statuses(self, cluster_id, node_id):
+            return [
+                CollectorStatus(
+                    cluster_id=cluster_id,
+                    node_id=node_id,
+                    collector=collector,
+                    observed_at=now,
+                    ingested_at=now,
+                    last_success_at=now,
+                )
+                for collector in {
+                    CollectorKind.GPU_METRICS,
+                    CollectorKind.HOST_TELEMETRY,
+                }
+            ]
+
+        def list_telemetry_metrics_latest(self, cluster_id, node_id):
+            return [
+                SimpleNamespace(
+                    name="gpu_inventory_active_count",
+                    value=active_count,
+                    observed_at=now,
+                    labels={"node_instance_type": "ml.p5en.48xlarge"},
+                ),
+                SimpleNamespace(
+                    name="gpu_inventory_expected_count",
+                    value=9,
+                    observed_at=now - timedelta(minutes=10),
+                    labels={"node_instance_type": "ml.p5en.48xlarge"},
+                ),
+            ]
+
+    class ValidationMetrics:
+        store = ValidationStore()
+
+        def latest(self, cluster_id, node_id):
+            return [
+                SimpleNamespace(
+                    observed_at=now,
+                    sample=SimpleNamespace(canonical_name="gpu_temperature_c"),
+                )
+            ]
+
+        def findings(self, cluster_id, node_id):
+            return []
+
+    store = build_store()
+    incident, workflow = workflow_state(
+        store, [WorkflowOperation.RESTART_NODE, WorkflowOperation.VALIDATE_GPU]
+    )
+    validation_step = copy_model(
+        workflow.official_steps[1], execution_owner="gpu-fault-validation-adapter"
+    )
+    workflow = copy_model(
+        workflow,
+        official_steps=[workflow.official_steps[0], validation_step],
+        step_executions=[
+            workflow_step_execution(
+                0, WorkflowOperation.RESTART_NODE, updated_at=rebooted_at
+            )
+        ],
+    )
+
+    outcome = GpuValidationAdapter(
+        ValidationMetrics(), store=ValidationMetrics.store
+    ).execute(
+        WorkflowStepContext(
+            workflow=workflow,
+            incident=incident,
+            step=validation_step,
+            step_index=1,
+            request=WorkflowExecutionRequest(expected_fencing_token=3),
+            idempotency_key="validation/post-reboot-fallback-bounded",
+        )
+    )
+
+    assert outcome.status is expected_status, outcome.details
+    if expected_status is WorkflowStepStatus.SUCCEEDED:
+        assert outcome.details["inventory_requirement_clamped"] == {
+            "node-a": {
+                "gpu_inventory_active_count": {
+                    "configured": 9,
+                    "physical": 8,
+                    "instance_type": "ml.p5en.48xlarge",
+                }
+            }
+        }, "the cap must be visible on the step, not silent"
+    else:
+        assert (
+            "gpu_inventory_active_count=7,expected=8"
+            in (outcome.details["node_failures"]["node-a"])
+        ), outcome.details

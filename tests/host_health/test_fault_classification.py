@@ -67,6 +67,7 @@ def finding(
         ("gpu_inventory_mismatch", "GPU_INVENTORY"),
         ("gpu_inventory_identity_changed", "GPU_INVENTORY"),
         ("gpu_expected_count_unknown", "GPU_INVENTORY"),
+        ("gpu_expected_count_contradicted", "GPU_INVENTORY"),
         ("gpu_kubernetes_allocatable_mismatch", "GPU_INVENTORY"),
         ("pcie_replay_total", "GPU"),
         ("dcgm_field_completeness", "GPU"),

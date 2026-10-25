@@ -131,6 +131,26 @@ def current_interface_readings(
     ]
 
 
+def latest_inventory_requirement(row: Any, active_name: str) -> dict[str, Any]:
+    """The inventory requirement of a reboot that no inventory finding planned.
+
+    It validates against the node's latest ``*_inventory_expected_count`` row,
+    which is the collector's *configured* count. The row's own
+    ``node_instance_type`` label travels with it so that
+    ``_bound_by_instance_inventory`` caps a count above the type's physical one
+    exactly as a plan-frozen requirement is capped (GF-GENERAL-LIVE-012
+    ``expectation_wrong``: ``expected=9`` on an 8-GPU node failed every
+    reboot's validation and escalated the typo into REPLACE_NODE). A row
+    without the label is validated as configured, as before.
+    """
+
+    requirement: dict[str, Any] = {"metrics": {active_name: row.value}}
+    instance_type = (getattr(row, "labels", None) or {}).get("node_instance_type")
+    if instance_type:
+        requirement["node_instance_type"] = instance_type
+    return requirement
+
+
 class GpuValidationAdapter:
     OPERATIONS = operations_for_adapter(OperationAdapter.GPU_VALIDATION)
 
@@ -492,7 +512,7 @@ class GpuValidationAdapter:
             )
             expected = [item for item in all_latest if item.name == expected_name]
             if expected:
-                requirement = {"metrics": {active_name: expected[-1].value}}
+                requirement = latest_inventory_requirement(expected[-1], active_name)
         if not isinstance(requirement, dict):
             return None
         required = self._required_inventory_metrics(requirement, operation)

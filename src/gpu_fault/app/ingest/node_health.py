@@ -26,6 +26,11 @@ OPERATOR_REVIEW_METRICS = frozenset(
         "hma_unschedulable_without_code",
         "gpu_inventory_identity_changed",
         "gpu_expected_count_unknown",
+        # host_health.gpu_inventory_verdicts: the configured expected GPU count
+        # contradicts the instance type while the node lists that type's count
+        # (GF-GENERAL-LIVE-012 expectation_wrong) -- a configuration error
+        # for a human, graded WARNING / evidence only, never a reboot.
+        "gpu_expected_count_contradicted",
     }
 )
 

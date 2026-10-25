@@ -5,6 +5,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
+from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
 from gpu_fault.collectors.sinks import CollectorError
 from gpu_fault.collectors.host.observation import (
     efa_inventory_counts,
@@ -40,9 +41,24 @@ class HostInventoryMixin:
         expected: int,
         observed: int,
         discovered: int | None = None,
+        discovered_sample: bool = True,
+        instance_type_count: int | None = None,
         inventory_details: dict[str, int] | None = None,
         extra_labels: dict[str, str] | None = None,
     ) -> list[HostMetricSample]:
+        """The inventory samples of one resource, verdict included.
+
+        The verdict (``*_mismatch`` after the configured consecutive samples) is
+        the node's: the configured count against what it lists. ``discovered``
+        and ``instance_type_count`` ride along as labels (``discovered_count``,
+        ``instance_type_<resource>_count``) so the control plane can re-read a
+        mismatch against the platform's own count for the instance type and
+        the driver's own bound count before it grades (GF-GENERAL-LIVE-012
+        ``expectation_wrong``: a mistyped expected count is not a lost GPU).
+        ``discovered_sample=False`` keeps the bound count label-only, so the
+        sample set of a tick whose query answered is unchanged.
+        """
+
         missing = max(0, expected - observed)
         excess = max(0, observed - expected)
         mismatch = missing > 0 or excess > 0
@@ -76,6 +92,8 @@ class HostInventoryMixin:
             labels["expected_efa_device_count"] = str(self.expected_efa_device_count)
         if discovered is not None:
             labels["discovered_count"] = str(discovered)
+        if instance_type_count is not None:
+            labels[f"instance_type_{resource}_count"] = str(instance_type_count)
         details = inventory_details or {}
         labels.update({name: str(value) for name, value in details.items()})
         labels.update(extra_labels or {})
@@ -111,7 +129,7 @@ class HostInventoryMixin:
                 labels=labels,
             ),
         ]
-        if discovered is not None:
+        if discovered is not None and discovered_sample:
             samples.append(
                 HostMetricSample(
                     name=f"{prefix}_discovered_count",
@@ -188,18 +206,38 @@ class HostInventoryMixin:
                             expected=self.expected_gpu_count,
                             observed=len(gpu_uuids),
                             discovered=discovered,
+                            instance_type_count=self._instance_type_gpu_count(),
                             extra_labels={"failure_mode": "DRIVER_QUERY_FAILED"},
                         )
                     )
                 raise CollectorError(failure)
+            # The driver's own bound count and the instance type's count ride
+            # along as labels: a configured count that both contradict while
+            # the listing agrees with them is a configuration finding on the
+            # control plane, not a lost GPU (GF-GENERAL-LIVE-012
+            # ``expectation_wrong``). The verdict here stays the node's own --
+            # configured against listed -- and an unreadable procfs is no
+            # label at all rather than a 0.
+            discovered, _ = self._discovered_gpu_count()
             samples.extend(
                 self._inventory_samples(
                     resource="gpu",
                     expected=self.expected_gpu_count,
                     observed=len(gpu_uuids),
+                    discovered=discovered,
+                    discovered_sample=False,
+                    instance_type_count=self._instance_type_gpu_count(),
                 )
             )
         return samples
+
+    def _instance_type_gpu_count(self) -> int | None:
+        """The GPU count the node's instance type is built with, or ``None``
+        for a type the table does not know (then the explicit setting is the
+        only knowledge there is and keeps its documented meaning)."""
+
+        counts = expected_accelerator_counts(self.node_instance_type)
+        return counts["gpu"] if counts is not None else None
 
     @staticmethod
     def _parse_gpu_uuids(stdout: str) -> set[str]:
@@ -245,6 +283,9 @@ class HostInventoryMixin:
             labels["discovered_count"] = str(discovered)
         if self.node_instance_type:
             labels["node_instance_type"] = self.node_instance_type
+        instance_type_count = self._instance_type_gpu_count()
+        if instance_type_count is not None:
+            labels["instance_type_gpu_count"] = str(instance_type_count)
         samples = [
             HostMetricSample(
                 name="gpu_inventory_expected_count",

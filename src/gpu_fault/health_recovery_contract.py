@@ -77,6 +77,7 @@ def recovery_contract(finding: Any) -> dict[str, Any] | None:
                 "host_gpu_utilization_percent",
                 "gpu_inventory_identity_changed",
                 "gpu_expected_count_unknown",
+                "gpu_expected_count_contradicted",
             }
             or name.startswith("composite:")
             or name.startswith("nvlink_")

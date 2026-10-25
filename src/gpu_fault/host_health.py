@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import os
 import re
+from collections.abc import Mapping
 from datetime import datetime, timedelta
 from enum import StrEnum
 from typing import Any, Literal
@@ -18,6 +19,7 @@ from pydantic import (
 from gpu_fault.efa_traffic_state import traffic_observation
 from gpu_fault.env import env_bool
 from gpu_fault.efa_stall_episode import episode_parameters
+from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
 from gpu_fault.host_low_utilization import (
     BatchManagedAttempt,
     UnresolvedAllocationWarnings,
@@ -174,6 +176,7 @@ _GPU_METRIC_FAULT_CLASSES = {
     "gpu_inventory_mismatch": "GPU_INVENTORY",
     "gpu_inventory_identity_changed": "GPU_INVENTORY",
     "gpu_expected_count_unknown": "GPU_INVENTORY",
+    "gpu_expected_count_contradicted": "GPU_INVENTORY",
     "gpu_kubernetes_allocatable_mismatch": "GPU_INVENTORY",
     # These signals do not establish a narrower hardware failure domain.
     "dcgm_field_completeness": "GPU",
@@ -480,6 +483,147 @@ def bmc_critical_sensor_rule(
     return threshold, category, severity, action, reason
 
 
+#: The host collector's ``gpu_inventory_mismatch`` re-read against the control
+#: plane's own instance-type table (GF-GENERAL-LIVE-012 ``expectation_wrong``).
+#: ``GPU_FAULT_EXPECTED_GPU_COUNT`` is a node-level setting the installer writes
+#: from the instance type; typed by hand it can contradict that type (live:
+#: ``expected=9`` on an 8-GPU p5en). The collector compares the listed UUIDs
+#: with the configured count alone, so the typo read as a lost GPU and, on the
+#: second tick, as CRITICAL REBOOT_NODE for a healthy node. When the type is
+#: known here, the node lists exactly the GPUs the type is built with and the
+#: driver's own bound count (when the batch carries it) agrees, the configured
+#: count is the one reading out of three that disagrees: a configuration
+#: finding -- WARNING, evidence only, operator review -- never a reboot. A node
+#: short of the type's own count, a bound count that disagrees with the
+#: listing, an unknown type or a batch without the labels grade as before.
+GPU_EXPECTED_COUNT_CONTRADICTED_METRIC = "gpu_expected_count_contradicted"
+_GPU_EXPECTED_COUNT_CONTRADICTED_RULE = (
+    1.0,
+    NodeHealthCategory.GPU,
+    Severity.WARNING,
+    RecoveryAction.COLLECT_EVIDENCE,
+    "the configured expected GPU count contradicts the instance type's own count",
+)
+
+
+def _count_label(labels: Mapping[str, str], name: str) -> int | None:
+    try:
+        return int(labels[name])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _instance_type_gpu_count(labels: Mapping[str, str]) -> int | None:
+    instance_type = labels.get("node_instance_type")
+    if not instance_type:
+        return None
+    try:
+        return gpu_instance_inventory(instance_type)[0]
+    except ValueError:
+        return None
+
+
+def gpu_inventory_verdicts(samples: list[HostMetricSample]) -> list[HostMetricSample]:
+    """``samples`` with the GPU inventory verdict re-read against the instance type.
+
+    For every ``gpu_inventory_mismatch`` sample whose labels name an instance
+    type the table knows and integer ``expected_count`` / ``observed_count``:
+    a configured count that differs from the type's GPU count appends a
+    ``gpu_expected_count_contradicted`` sample at 1 (0 when they agree, so a
+    corrected configuration closes the episode), and a mismatch raised while
+    the node lists exactly the type's count -- with the driver-bound
+    ``discovered_count`` agreeing whenever the collector reported one -- is
+    re-read as 0, because the configured count is the odd reading out, not
+    the node. Samples without those labels, on unknown types or of other
+    resources are returned as they are; nothing is mutated. A batch that
+    already carries the contradiction metric was judged by its producer.
+    """
+
+    names = {sample.name for sample in samples}
+    if (
+        "gpu_inventory_mismatch" not in names
+        or GPU_EXPECTED_COUNT_CONTRADICTED_METRIC in names
+    ):
+        return samples
+    verdicts: list[HostMetricSample] = []
+    contradictions: list[HostMetricSample] = []
+    for sample in samples:
+        type_count = _instance_type_gpu_count(sample.labels)
+        expected = _count_label(sample.labels, "expected_count")
+        observed = _count_label(sample.labels, "observed_count")
+        if (
+            sample.name != "gpu_inventory_mismatch"
+            or type_count is None
+            or expected is None
+            or observed is None
+        ):
+            verdicts.append(sample)
+            continue
+        bound = sample.labels.get("discovered_count")
+        complete = observed == type_count and (
+            bound is None or _count_label(sample.labels, "discovered_count") == observed
+        )
+        contradicted = expected != type_count
+        labels = {**sample.labels, "instance_type_gpu_count": str(type_count)}
+        verdicts.append(
+            sample.model_copy(
+                update={
+                    "labels": labels,
+                    "value": 0.0 if contradicted and complete else sample.value,
+                }
+            )
+        )
+        contradictions.append(
+            HostMetricSample(
+                name=GPU_EXPECTED_COUNT_CONTRADICTED_METRIC,
+                value=1.0 if contradicted else 0.0,
+                device=sample.device,
+                labels=labels,
+            )
+        )
+    return [*verdicts, *contradictions]
+
+
+def gpu_expected_count_contradicted_rule(
+    sample: HostMetricSample,
+) -> tuple[float, NodeHealthCategory, Severity, RecoveryAction, str]:
+    """The contradiction rule with the three counts named in its reason: the
+    operator-review notification carries the reason, not the labels."""
+
+    labels = sample.labels
+    bound = labels.get("discovered_count")
+    reason = (
+        f"configured expected GPU count {labels.get('expected_count', 'UNKNOWN')} "
+        f"(the node's collector.env) contradicts instance type "
+        f"{labels.get('node_instance_type', 'UNKNOWN')}, which carries "
+        f"{labels.get('instance_type_gpu_count', 'UNKNOWN')} GPUs; the node lists "
+        f"{labels.get('observed_count', 'UNKNOWN')}"
+        + (f" and the driver has {bound} bound" if bound is not None else "")
+        + ". This is a configuration error to correct on the node, not a lost "
+        "GPU: no reboot or isolation is derived from it"
+    )
+    return (*_GPU_EXPECTED_COUNT_CONTRADICTED_RULE[:4], reason)
+
+
+def metric_rule(
+    sample: HostMetricSample,
+    rules: Mapping[
+        str, tuple[float, NodeHealthCategory, Severity, RecoveryAction, str]
+    ],
+) -> tuple[float, NodeHealthCategory, Severity, RecoveryAction, str] | None:
+    """The rule a sample is graded by: the label-driven rules (EFA inventory
+    failure mode, BMC sensor names, the GPU expected-count contradiction)
+    first, the static table otherwise."""
+
+    if sample.name == "efa_inventory_mismatch":
+        return efa_inventory_rule(sample)
+    if sample.name == "bmc_critical_sensor":
+        return bmc_critical_sensor_rule(sample)
+    if sample.name == GPU_EXPECTED_COUNT_CONTRADICTED_METRIC:
+        return gpu_expected_count_contradicted_rule(sample)
+    return rules.get(sample.name)
+
+
 class NodeHealthPolicy:
     LATEST_METRICS_REQUIRED = _HOST_VALIDATION_LATEST_METRICS | {
         "gpu_inventory_expected_count",
@@ -738,6 +882,7 @@ class NodeHealthPolicy:
             RecoveryAction.REBOOT_NODE,
             "active GPU inventory does not match the configured node invariant",
         ),
+        GPU_EXPECTED_COUNT_CONTRADICTED_METRIC: _GPU_EXPECTED_COUNT_CONTRADICTED_RULE,
         "efa_inventory_mismatch": (
             1.0,
             NodeHealthCategory.RDMA,
@@ -916,12 +1061,13 @@ class NodeHealthPolicy:
         from gpu_fault.telemetry import TelemetryMetricLatest
 
         findings = []
-        related_metrics = {sample.name: sample.value for sample in batch.samples}
+        samples = gpu_inventory_verdicts(batch.samples)
+        related_metrics = {sample.name: sample.value for sample in samples}
         managed_attempt = BatchManagedAttempt(self, batch)
         latest_metrics = []
         transitions = []
         transition_findings = []
-        for sample in batch.samples:
+        for sample in samples:
             if sample.name in self.LATEST_METRICS_REQUIRED:
                 latest_metrics.append(
                     TelemetryMetricLatest(
@@ -946,13 +1092,7 @@ class NodeHealthPolicy:
                 )
                 transitions.append(transition)
                 transition_findings.append(finding)
-            rule = (
-                self._efa_inventory_rule(sample)
-                if sample.name == "efa_inventory_mismatch"
-                else self._bmc_critical_sensor_rule(sample)
-                if sample.name == "bmc_critical_sensor"
-                else self.METRIC_RULES.get(sample.name)
-            )
+            rule = metric_rule(sample, self.METRIC_RULES)
             if rule is None:
                 continue
             threshold, category, severity, action, reason = rule
@@ -1010,9 +1150,6 @@ class NodeHealthPolicy:
         )
         findings.extend(self._evaluate_efa_traffic(batch, managed_attempt))
         return findings
-
-    _efa_inventory_rule = staticmethod(efa_inventory_rule)
-    _bmc_critical_sensor_rule = staticmethod(bmc_critical_sensor_rule)
 
     def _prepare_sustained_metric(
         self,
