@@ -20,6 +20,11 @@ from gpu_fault.efa_traffic_state import traffic_observation
 from gpu_fault.env import env_bool
 from gpu_fault.efa_stall_episode import episode_parameters
 from gpu_fault.gpu_instance_inventory import gpu_instance_inventory
+from gpu_fault.host_device_signals import (
+    age_out_vanished_device_signals,
+    device_gone,
+    device_signal_age_out_seconds,
+)
 from gpu_fault.host_low_utilization import (
     BatchManagedAttempt,
     UnresolvedAllocationWarnings,
@@ -915,6 +920,9 @@ class NodeHealthPolicy:
         self.store = store
         self.efa_recovery_policy = EfaRecoveryPolicy.from_env()
         self.unresolved_gpu_allocations = UnresolvedAllocationWarnings()
+        # Device signals whose device stopped reporting (host_device_signals.py).
+        self.device_signal_age_out_seconds = device_signal_age_out_seconds()
+        self.device_signal_age_outs_total = 0
         self.efa_minimum_active_bps = float(
             os.getenv("GPU_FAULT_EFA_TRAFFIC_MIN_ACTIVE_BPS", "1048576")
         )
@@ -1068,7 +1076,9 @@ class NodeHealthPolicy:
         transitions = []
         transition_findings = []
         for sample in samples:
-            if sample.name in self.LATEST_METRICS_REQUIRED:
+            # ``device_state=GONE``: a clear, never a reading (host_device_signals).
+            gone = device_gone(sample)
+            if sample.name in self.LATEST_METRICS_REQUIRED and not gone:
                 latest_metrics.append(
                     TelemetryMetricLatest(
                         cluster_id=batch.cluster_id,
@@ -1096,21 +1106,12 @@ class NodeHealthPolicy:
             if rule is None:
                 continue
             threshold, category, severity, action, reason = rule
-            minimum_active_seconds = self.METRIC_RULE_SUSTAIN_SECONDS.get(
-                sample.name, 0.0
+            sustain = self.METRIC_RULE_SUSTAIN_SECONDS.get(sample.name, 0.0)
+            active = not gone and sample.value >= threshold
+            signal_key = health_signal_key(
+                batch.cluster_id, batch.node_id, sample.name, sample.device
             )
-            active = sample.value >= threshold
-            signal_key = "/".join(
-                [
-                    batch.cluster_id,
-                    batch.node_id,
-                    sample.name,
-                    sample.device or "node",
-                ]
-            )
-            transitions.append(
-                (signal_key, active, batch.observed_at, minimum_active_seconds)
-            )
+            transitions.append((signal_key, active, batch.observed_at, sustain))
             event_id = (
                 f"{batch.batch_id}-{sample.name}-{self._safe(sample.device or 'node')}"
             )
@@ -1143,6 +1144,7 @@ class NodeHealthPolicy:
             transitions,
             [finding_health_signal_fingerprint(item) for item in transition_findings],
         )
+        age_out_vanished_device_signals(self, batch, transitions)
         findings.extend(
             finding
             for finding, emit in zip(transition_findings, emitted, strict=True)
@@ -1188,7 +1190,7 @@ class NodeHealthPolicy:
             ),
         }
         threshold, duration = thresholds[threshold_group]
-        active = (
+        active = not device_gone(sample) and (
             sample.value <= threshold
             if comparison == "lte"
             else sample.value >= threshold

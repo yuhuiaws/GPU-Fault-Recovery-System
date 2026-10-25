@@ -240,6 +240,7 @@ validates them (integers/numbers must parse, booleans must be `0/1/true/false/ye
 | `GPU_FAULT_GPU_TEMP_WARNING_MARGIN_C` | Telemetry | text | `<implicit>` | `gpu_fault.gpu_metrics` |
 | `GPU_FAULT_GPU_UUIDS` | Telemetry | text | `''` | `gpu_fault.collectors.training_progress` |
 | `GPU_FAULT_GROUP` | Core/Other | text | `<implicit>` | `gpu_fault.orchestration.families.faults`<br>`gpu_fault.orchestration.families.grouped_faults`<br>`gpu_fault.orchestration.families.grouped_health`<br>`gpu_fault.orchestration.ingest.sxid` |
+| `GPU_FAULT_HEALTH_SIGNAL_DEVICE_AGE_OUT_SUMMARIES` | Core/Other | integer | `'3'` | `gpu_fault.host_device_signals` |
 | `GPU_FAULT_HEALTH_SIGNAL_GRACE_SECONDS` | Core/Other | number | `'86400'` | `gpu_fault.app.periodic_services` |
 | `GPU_FAULT_HEALTH_SIGNAL_RETENTION_SECONDS` | Core/Other | number | `'2592000'` | `gpu_fault.app.periodic_services` |
 | `GPU_FAULT_HEALTH_SNAPSHOT_REQUEST_DIR` | Core/Other | text | `'/var/lib/gpu-fault/health-snapshot'` | `gpu_fault.node_agent.config` |
