@@ -101,6 +101,16 @@ def test_hardware_fault_reaches_real_quarantine_adapter(tmp_path, monkeypatch, k
             }, taints
             incident = rig.store.get_incident(workflow.incident_id)
             assert incident.state is IncidentState.QUARANTINED, incident
+            if kind == "bmc":
+                # The alerting sensor is named end to end (GF-GENERAL-LIVE-015):
+                # the collector's labels -> the finding reason -> the incident
+                # reasons the escalation mail lists -> the marker.
+                expected = (
+                    "BMC reports 1 critical sensor: CPU Temp=95.000 degrees C [cr]"
+                )
+                assert incident.reasons == [expected], incident.reasons
+                markers = rig.store.list_markers_for_incident(incident.incident_id)
+                assert [item.raw_reason for item in markers] == [expected], markers
             _, replay = await rig.publish(client)
             assert replay["workflow_request_ids"] == [], replay
             assert len(rig.store.list_workflows()) == 1, "no duplicate workflow"

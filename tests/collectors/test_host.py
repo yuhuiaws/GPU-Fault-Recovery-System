@@ -524,6 +524,9 @@ def test_bmc_non_critical_status_is_not_counted(
 
     assert len(samples) == 1
     assert samples[0].value == 1
+    assert samples[0].labels == {"sensors": "Fan", "sensor_alerts": "Fan=0 RPM [cr]"}, (
+        "the one critical sensor is named; nc is not an alert"
+    )
 
 
 def test_smart_scan_ignores_blank_lines(monkeypatch: pytest.MonkeyPatch) -> None:

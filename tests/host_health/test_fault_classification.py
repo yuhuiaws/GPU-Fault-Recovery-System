@@ -8,6 +8,8 @@ from gpu_fault.host_health import (
     HostMetricSample,
     NodeHealthCategory,
     NodeHealthFinding,
+    NodeHealthPolicy,
+    bmc_critical_sensor_rule,
     efa_inventory_rule,
 )
 from gpu_fault.models import RecoveryAction, Severity
@@ -186,3 +188,46 @@ def test_efa_inventory_rule_resolves_without_mutating_the_sample(
     )
     assert reason, "a resolved recovery rule must retain its diagnostic reason"
     assert sample == before, "pure rule resolution must not change evidence or labels"
+
+
+def test_bmc_critical_sensor_rule_names_the_sensors_without_mutating_the_sample():
+    """The rule's reason carries the labelled sensors (GF-GENERAL-LIVE-015).
+
+    The reason is the one text the incident (``reasons``), the marker
+    (``raw_reason``) and the QUARANTINE step's hardware escalation mail keep,
+    so a multi-sensor alert names its sensors there; a bare count from an
+    older collector keeps the table's fixed text.
+    """
+
+    alerts = (
+        "CPU1 Temp=96.000 degrees C [cr; ucr 95.000]; Fan1=0.000 RPM [cr; lcr 300.000]"
+    )
+    sample = HostMetricSample(
+        name="bmc_critical_sensor",
+        value=2,
+        unit="sensors",
+        labels={"sensors": "CPU1 Temp, Fan1", "sensor_alerts": alerts},
+    )
+    before = sample.model_copy(deep=True)
+
+    threshold, category, severity, action, reason = bmc_critical_sensor_rule(sample)
+
+    assert (threshold, category, severity, action) == (
+        1.0,
+        NodeHealthCategory.BMC,
+        Severity.CRITICAL,
+        RecoveryAction.QUARANTINE,
+    )
+    assert reason == f"BMC reports 2 critical sensors: {alerts}"
+    assert sample == before, "pure rule resolution must not change evidence or labels"
+    assert (threshold, category, severity, action) == NodeHealthPolicy.METRIC_RULES[
+        "bmc_critical_sensor"
+    ][:4], "the edge filter and the rule table share the BMC rule"
+
+    bare = HostMetricSample(name="bmc_critical_sensor", value=1, unit="sensors")
+    assert (
+        bmc_critical_sensor_rule(bare)
+        == NodeHealthPolicy.METRIC_RULES["bmc_critical_sensor"]
+    ), "an unlabelled count reads exactly as before"
+    one = sample.model_copy(update={"value": 1.0, "labels": {"sensors": "Fan1"}})
+    assert bmc_critical_sensor_rule(one)[4] == "BMC reports 1 critical sensor: Fan1"

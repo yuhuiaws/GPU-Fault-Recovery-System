@@ -9,10 +9,11 @@ import subprocess
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Sequence
 
 from gpu_fault.channel_registry import HOST_TELEMETRY_PATH
 from gpu_fault.collectors.gpu.discovery import expected_accelerator_counts
+from gpu_fault.collectors.host.bmc import IPMI_DEVICE_NODES, HostBmcMixin
 from gpu_fault.collectors.host.gpu_rank import HostGpuRankMixin
 from gpu_fault.collectors.host.inventory import HostInventoryMixin
 from gpu_fault.collectors.host.network import HostNetworkMixin
@@ -97,6 +98,7 @@ class HostTelemetryCollector(
     HostInventoryMixin,
     HostNetworkMixin,
     HostSystemMetricsMixin,
+    HostBmcMixin,
 ):
     """Collects host, storage, network, RDMA, SMART and BMC signals."""
 
@@ -131,6 +133,7 @@ class HostTelemetryCollector(
         nvidia_smi_timeout_seconds: float = 15,
         nvidia_smi_breaker_rounds: int = 3,
         nvidia_smi_breaker_cooldown_rounds: int = 4,
+        ipmi_device_nodes: Sequence[str] | None = None,
     ) -> None:
         self.sink = sink
         self.context = context
@@ -191,6 +194,13 @@ class HostTelemetryCollector(
         # The default runner bounds its own kill path; ``subprocess.run`` does
         # not, and a D-state nvidia-smi wedged the whole collector in it.
         self.runner = runner if runner is not None else BoundedProcessRunner()
+        # The IPMI device nodes a failed ``ipmitool sensor`` is checked against
+        # before the node is read as BMC-less (``HostBmcMixin._bmc``).
+        self.ipmi_device_nodes = (
+            tuple(ipmi_device_nodes)
+            if ipmi_device_nodes is not None
+            else IPMI_DEVICE_NODES
+        )
         if statvfs_timeout_seconds <= 0:
             raise ValueError("statvfs timeout must be positive")
         if statvfs_budget_seconds <= 0:

@@ -1,6 +1,6 @@
 """A host read that failed, or never existed, is missing evidence.
 
-GF-GENERAL-LIVE-004/007/010/012: an unreadable source must read UNKNOWN (a
+GF-GENERAL-LIVE-004/007/010/012/015: an unreadable source must read UNKNOWN (a
 collection error, so validation waits and nothing is graded), a source the
 node cannot provide must say NOT_SUPPORTED, and neither may be reported as a
 healthy reading or as a zero. Every case drives the real contributor through
@@ -17,8 +17,9 @@ import subprocess
 import pytest
 
 from gpu_fault.host_diagnostics import validate_host_metrics
-from gpu_fault.host_health import NodeHealthPolicy
+from gpu_fault.host_health import HostMetricSample, HostTelemetryBatch, NodeHealthPolicy
 from gpu_fault.models import RecoveryAction, Severity
+from scripts.e2e.regional import general_live_bmc as bmc
 from tests._builders import build_store
 from tests.collectors import _cov95_runtime_collect as common
 from tests.collectors import _cov95_runtime_collect_host as support
@@ -767,3 +768,266 @@ def test_a_usable_read_write_mount_reports_available_and_is_not_graded(host_case
     values = support.values(batch)
     assert values[("filesystem_unavailable", mount)] == 0, values
     assert graded(batch) == [], "a usable read-write mount is not a storage fault"
+
+
+# --------------------------------------------------------------------------- #
+# 015 BMC
+# --------------------------------------------------------------------------- #
+SENSOR = ("ipmitool", "sensor")
+CPU1_ALERT = "CPU1 Temp=96.000 degrees C [cr; unc 90.000, ucr 95.000, unr 100.000]"
+FAN1_ALERT = "Fan1=0.000 RPM [cr; lcr 300.000, lnc 500.000]"
+
+
+def bmc_markers(batch) -> list[tuple[str, str | None, float, dict[str, str]]]:
+    return [
+        (sample.name, sample.device, sample.value, sample.labels)
+        for sample in batch.samples
+        if sample.name.startswith("bmc_")
+    ]
+
+
+def bmc_collector(host_case, answer, **kwargs):
+    support.enable_tools(host_case, "ipmitool")
+    host_case.outputs[SENSOR] = answer
+    return host_case.build("_bmc", **kwargs)
+
+
+def sensor_queries(host_case) -> int:
+    return sum(1 for argv, _ in host_case.commands if tuple(argv) == SENSOR)
+
+
+def test_critical_sensors_are_named_with_reading_status_and_thresholds(host_case):
+    """Two ``cr`` rows: the count sample carries both sensors' identity.
+
+    ``bmc_critical_sensor`` used to be a bare count (unit ``sensors``, no
+    labels), so the names, readings and thresholds of the alerting rows never
+    reached the finding, the incident reasons, the marker or the hardware
+    escalation mail: with two critical sensors the operator saw "2". The
+    count stays (one finding, one QUARANTINE), and the labels name the
+    sensors in table order with the status, reading, units and the threshold
+    columns ipmitool printed (GF-GENERAL-LIVE-015 ``critical``).
+    """
+
+    collector = bmc_collector(host_case, (bmc.CRITICAL_TABLE, "", 0))
+
+    batch = collector.collect_once()
+
+    assert bmc_markers(batch) == [
+        (
+            "bmc_critical_sensor",
+            None,
+            2,
+            {
+                "sensors": "CPU1 Temp, Fan1",
+                "sensor_alerts": f"{CPU1_ALERT}; {FAN1_ALERT}",
+            },
+        )
+    ], batch.samples
+    assert batch.samples[0].unit == "sensors", "the count keeps its unit"
+    assert batch.collection_errors == [], batch.collection_errors
+    findings = graded(batch)
+    assert [
+        (item.metric_name, item.device, item.value, item.recommended_action)
+        for item in findings
+    ] == [("bmc_critical_sensor", None, 2, RecoveryAction.QUARANTINE)], findings
+    assert findings[0].reason == (
+        f"BMC reports 2 critical sensors: {CPU1_ALERT}; {FAN1_ALERT}"
+    ), "the reason is what the incident, the marker and the escalation mail keep"
+    assert findings[0].diagnostic_parameters == {
+        "sensors": "CPU1 Temp, Fan1",
+        "sensor_alerts": f"{CPU1_ALERT}; {FAN1_ALERT}",
+    }, findings[0].diagnostic_parameters
+    assert findings[0].marker().raw_reason == findings[0].reason, (
+        "the marker names the sensors through the finding's reason"
+    )
+
+
+def test_a_non_recoverable_sensor_is_named_with_its_status(host_case):
+    collector = bmc_collector(host_case, (bmc.NONRECOVERABLE_TABLE, "", 0))
+
+    batch = collector.collect_once()
+
+    alert = "CPU1 Temp=104.000 degrees C [nr; unc 90.000, ucr 95.000, unr 100.000]"
+    assert bmc_markers(batch) == [
+        (
+            "bmc_critical_sensor",
+            None,
+            1,
+            {"sensors": "CPU1 Temp", "sensor_alerts": alert},
+        )
+    ], batch.samples
+    findings = graded(batch)
+    assert [item.reason for item in findings] == [
+        f"BMC reports 1 critical sensor: {alert}"
+    ], findings
+
+
+def test_a_sensor_listed_twice_is_one_critical_sensor(host_case):
+    """A BMC that repeats an SDR record names the sensor once (spec 015: 去重)."""
+
+    table = bmc.CRITICAL_TABLE + bmc.CRITICAL_TABLE.splitlines()[1] + "\n"
+    collector = bmc_collector(host_case, (table, "", 0))
+
+    batch = collector.collect_once()
+
+    assert support.values(batch) == {("bmc_critical_sensor", None): 2}, batch.samples
+    assert batch.samples[0].labels["sensors"] == "CPU1 Temp, Fan1", batch.samples
+
+
+@pytest.mark.parametrize(
+    "table",
+    [bmc.HEALTHY_TABLE, bmc.WRONG_COLUMN_TABLE, bmc.UNAVAILABLE_TABLE],
+    ids=["healthy", "wrong-column", "one-unavailable-sensor"],
+)
+def test_a_table_without_an_alert_is_a_plain_zero(host_case, table):
+    """Status words outside the 4th column, a 3-column row and one ``na``
+    sensor among readings are no alert: value 0, no labels, no error, no
+    finding -- the sample an older control plane already understands."""
+
+    collector = bmc_collector(host_case, (table, "", 0))
+
+    batch = collector.collect_once()
+
+    assert bmc_markers(batch) == [("bmc_critical_sensor", None, 0, {})], batch.samples
+    assert batch.collection_errors == [], batch.collection_errors
+    assert graded(batch) == [], "a table with no cr/nr status is not a BMC fault"
+
+
+def test_a_table_of_only_unavailable_sensors_is_unknown_not_zero(host_case):
+    """Every status ``na`` is a BMC that answered with no reading at all.
+
+    It used to parse as ``bmc_critical_sensor=0`` -- an all-unavailable BMC
+    read as healthy. It is missing evidence: a ``_bmc`` collection error, no
+    sample, nothing graded.
+    """
+
+    rows = [
+        tuple("na" if index not in (0, 2) else value for index, value in enumerate(row))
+        for row in (
+            ("Inlet Temp", "na", "degrees C", "na", "na", "na", "na", "na", "na", "na"),
+            ("Fan1", "na", "RPM", "na", "na", "na", "na", "na", "na", "na"),
+        )
+    ]
+    collector = bmc_collector(host_case, (bmc.sensor_table(rows), "", 0))
+
+    for _ in range(2):
+        batch = collector.collect_once()
+        assert bmc_markers(batch) == [], batch.samples
+        assert any(
+            error.startswith("_bmc:") and "no sensor reading" in error
+            for error in batch.collection_errors
+        ), f"an all-na table must invalidate the observation: {batch.collection_errors}"
+        assert graded(batch) == [], "an unreadable sensor table is not a BMC fault"
+        host_case.clock.sleep(15)
+
+
+def test_bmc_without_ipmitool_is_reported_not_supported(host_case):
+    """No ``ipmitool``: a capability gap, said so on every tick, never an error."""
+
+    collector = host_case.build("_bmc")
+
+    for _ in range(2):
+        batch = collector.collect_once()
+        assert bmc_markers(batch) == [
+            ("bmc_status_unsupported", None, 1, {"reason": "TOOL_MISSING"})
+        ], batch.samples
+        assert batch.collection_errors == [], batch.collection_errors
+        assert graded(batch) == [], "a missing ipmitool is not a BMC fault"
+        host_case.clock.sleep(15)
+    assert sensor_queries(host_case) == 0, host_case.commands
+
+
+def test_a_host_without_an_ipmi_device_is_not_supported_not_an_error(host_case):
+    """``ipmitool`` installed, no BMC behind it (EC2): NOT_SUPPORTED.
+
+    ipmitool exits 1 with ``Could not open device at /dev/ipmi0 or ... : No
+    such file or directory`` on every tick, and that used to be a ``_bmc``
+    collection error every tick -- a permanent capability gap graded as
+    missing evidence, which held every host validation of the node forever.
+    Like SMART's ``NO_DEVICES`` it is ``bmc_status_unsupported`` NO_DEVICE
+    with no error. The query is still made every tick: the gap is read from
+    the tool's answer, never assumed.
+    """
+
+    collector = bmc_collector(
+        host_case,
+        ("", bmc.IPMI_NO_DEVICE_STDERR, 1),
+        ipmi_device_nodes=[str(host_case.tmp_path / "dev" / "ipmi0")],
+    )
+
+    for _ in range(2):
+        batch = collector.collect_once()
+        assert bmc_markers(batch) == [
+            ("bmc_status_unsupported", None, 1, {"reason": "NO_DEVICE"})
+        ], batch.samples
+        assert batch.collection_errors == [], batch.collection_errors
+        assert graded(batch) == [], "a BMC-less host is not a BMC fault"
+        host_case.clock.sleep(15)
+    assert sensor_queries(host_case) == 2, host_case.commands
+
+
+@pytest.mark.parametrize(
+    "answer",
+    [
+        ("", bmc.IPMI_TRANSIENT_STDERR, 1),
+        ("", "", 1),
+        subprocess.TimeoutExpired(list(SENSOR), 20),
+        OSError(5, "Input/output error"),
+    ],
+    ids=["bmc-not-answering", "silent-exit-status", "timeout", "exec-error"],
+)
+def test_a_failed_sensor_query_is_unknown_not_zero_and_not_unsupported(
+    host_case, answer
+):
+    """A BMC that is there but does not answer is UNKNOWN, as before."""
+
+    collector = bmc_collector(
+        host_case, answer, ipmi_device_nodes=[str(host_case.tmp_path / "dev" / "ipmi0")]
+    )
+
+    batch = collector.collect_once()
+
+    assert bmc_markers(batch) == [], batch.samples
+    assert any(
+        error.startswith("_bmc:") and bmc.BMC_QUERY_FAILED in error
+        for error in batch.collection_errors
+    ), f"a failed query must invalidate the observation: {batch.collection_errors}"
+    assert graded(batch) == [], "a failed sensor query is not a BMC fault"
+
+
+def test_the_no_device_answer_with_a_device_node_present_stays_unknown(host_case):
+    """The NOT_SUPPORTED verdict needs both facts: ipmitool's ENOENT text and
+    no IPMI device node on the host. A device node that exists while the tool
+    cannot open it is not a BMC-less host; it is a failure to read one."""
+
+    node = host_case.tmp_path / "dev" / "ipmi0"
+    node.parent.mkdir(parents=True)
+    node.write_text("")
+    collector = bmc_collector(
+        host_case, ("", bmc.IPMI_NO_DEVICE_STDERR, 1), ipmi_device_nodes=[str(node)]
+    )
+
+    batch = collector.collect_once()
+
+    assert bmc_markers(batch) == [], batch.samples
+    assert any(bmc.BMC_QUERY_FAILED in error for error in batch.collection_errors), (
+        batch.collection_errors
+    )
+
+
+def test_a_bare_count_from_an_older_collector_keeps_the_fixed_reason():
+    """Wire compatibility: a not-yet-upgraded node posts the unlabelled count."""
+
+    batch = HostTelemetryBatch(
+        cluster_id="cluster-a",
+        node_id="node-a",
+        observed_at=common.Clock().now(),
+        samples=[HostMetricSample(name="bmc_critical_sensor", value=2, unit="sensors")],
+    )
+
+    findings = graded(batch)
+
+    assert [(item.reason, item.recommended_action) for item in findings] == [
+        ("BMC reports a critical sensor", RecoveryAction.QUARANTINE)
+    ], findings
+    assert findings[0].diagnostic_parameters == {}, findings[0].diagnostic_parameters

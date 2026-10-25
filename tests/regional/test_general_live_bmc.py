@@ -5,9 +5,10 @@ No cluster, no node: a scripted source-replay ``FakeProbe`` receives the
 answers the wrapper journal; a scripted store plays the product's records in
 three phases -- the replayed table, the healthy table after the replan, and
 after the window closes. The tests pin the reviewed tables, the QUARANTINE
-chain and its recovery/restore order, the zero-critical and UNKNOWN gradings,
-the ``critical`` variant's expected FAIL on sensor identity (the registered
-product gap), and the read-only capability record of ``unsupported_bmc``.
+chain and its recovery/restore order, the sensor identity the ``critical``
+variant demands of the sample labels, the incident reasons and the marker,
+the zero-critical, UNKNOWN and NOT_SUPPORTED gradings, and the read-only
+capability record of ``unsupported_bmc``.
 """
 
 from __future__ import annotations
@@ -53,6 +54,33 @@ T3 = "2026-10-24T00:04:00+00:00"
 # --------------------------------------------------------------------------- #
 def reading(value: float, **labels: str) -> dict[str, Any]:
     return {"name": bmc.METRIC, "device": None, "value": value, "labels": labels}
+
+
+def unsupported(reason: str) -> dict[str, Any]:
+    return {
+        "name": bmc.UNSUPPORTED,
+        "device": None,
+        "value": 1.0,
+        "labels": {"reason": reason},
+    }
+
+
+SENSOR_ALERTS = (
+    "CPU1 Temp=96.000 degrees C [cr; unc 90.000, ucr 95.000, unr 100.000]; "
+    "Fan1=0.000 RPM [cr; lcr 300.000, lnc 500.000]"
+)
+NAMED_REASON = f"BMC reports 2 critical sensors: {SENSOR_ALERTS}"
+BARE_REASON = "BMC reports a critical sensor"
+
+
+def marker(incident_id: str, raw_reason: str) -> dict[str, Any]:
+    return {
+        "marker_id": f"marker-{incident_id}",
+        "incident_id": incident_id,
+        "raw_reason": raw_reason,
+        "severity": "critical",
+        "recommended_action": "QUARANTINE",
+    }
 
 
 def batch(
@@ -227,9 +255,12 @@ def test_every_015_variant_is_registered_on_both_lanes() -> None:
         else:
             assert spec.proof_mode == LIVE_REPLAY and spec.implemented, spec.key
             assert spec.approvals == (HOST_SOURCE_REPLAY,), spec.key
-    assert SPECS["critical"].expected_outcome == "FAIL"
-    assert "_bmc" in SPECS["critical"].product_gap
-    assert SPECS["nonrecoverable"].expected_outcome == "PASS"
+    assert all(spec.expected_outcome == "PASS" for spec in bmc.VARIANTS), [
+        (spec.variant, spec.expected_outcome) for spec in bmc.VARIANTS
+    ]
+    assert all(not spec.product_gap for spec in bmc.VARIANTS), (
+        "the sensor identity gap is closed in the product; no variant cites one"
+    )
 
 
 def statuses(table: str) -> list[str]:
@@ -265,24 +296,52 @@ def test_tables_carry_the_intended_fourth_column_statuses() -> None:
     ):
         wrapper.build_plan("ipmitool", bmc.table_rules(table), not_after=10.0)
     wrapper.build_plan("ipmitool", bmc.command_failure_rules(), not_after=10.0)
+    wrapper.build_plan("ipmitool", bmc.no_device_rules(), not_after=10.0)
+    assert bmc.command_failure_rules()[0]["stderr"] == bmc.IPMI_TRANSIENT_STDERR
+    assert bmc.no_device_rules()[0]["stderr"] == bmc.IPMI_NO_DEVICE_STDERR
+    assert "Could not open device" in bmc.IPMI_NO_DEVICE_STDERR
+    assert "Could not open device" not in bmc.IPMI_TRANSIENT_STDERR
 
 
 # --------------------------------------------------------------------------- #
 # critical / nonrecoverable: QUARANTINE, healthy table, close, restore
 # --------------------------------------------------------------------------- #
-def quarantine_doc(count: float) -> dict[str, Any]:
+def quarantine_doc(
+    count: float,
+    *,
+    labels: dict[str, str] | None = None,
+    reason: str = NAMED_REASON,
+    marker_reason: str | None = None,
+) -> dict[str, Any]:
+    """The product's records for a critical table: by default the sample labels,
+    the incident reason and the marker all name the sensors (the fixed product)."""
+
     inc = incident("inc-b", bmc.METRIC, state="QUARANTINED", workflow="wf-b")
+    inc["reasons"] = [reason]
     wf = workflow(
         "wf-b",
         "inc-b",
         ["FREEZE_EVIDENCE", "MARK_UNSCHEDULABLE", "QUARANTINE"],
         status="SUCCEEDED",
     )
-    return doc(batch(T1, reading(count)), incidents=[inc], workflows=[wf])
+    sample = reading(
+        count,
+        **(
+            {"sensors": "CPU1 Temp, Fan1", "sensor_alerts": SENSOR_ALERTS}
+            if labels is None
+            else labels
+        ),
+    )
+    return doc(
+        batch(T1, sample),
+        incidents=[inc],
+        workflows=[wf],
+        markers=[marker("inc-b", reason if marker_reason is None else marker_reason)],
+    )
 
 
-def recovered_doc(count: float) -> dict[str, Any]:
-    document = quarantine_doc(count)
+def recovered_doc(count: float, **named: Any) -> dict[str, Any]:
+    document = quarantine_doc(count, **named)
     document["batches"] += [batch(T2, reading(0.0)), batch(T3, reading(0.0))]
     return document
 
@@ -290,7 +349,14 @@ def recovered_doc(count: float) -> dict[str, Any]:
 def test_nonrecoverable_quarantines_recovers_on_the_healthy_table_then_restores(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    scenario = Scenario(quarantine_doc(1.0), recovered_doc(1.0))
+    nr_reason = (
+        "BMC reports 1 critical sensor: CPU1 Temp=104.000 degrees C "
+        "[nr; unc 90.000, ucr 95.000, unr 100.000]"
+    )
+    scenario = Scenario(
+        quarantine_doc(1.0, labels={"sensors": "CPU1 Temp"}, reason=nr_reason),
+        recovered_doc(1.0, labels={"sensors": "CPU1 Temp"}, reason=nr_reason),
+    )
     restored = restore_recorder(monkeypatch, scenario)
     result, source = run("nonrecoverable", scenario, tmp_path)
     assert result["verdict"] == "PASS", result["errors"]
@@ -315,34 +381,62 @@ def test_nonrecoverable_quarantines_recovers_on_the_healthy_table_then_restores(
     assert result["proof_scope"] == "live-replay" and result["counts"] == [1.0]
 
 
-def test_critical_is_the_registered_sensor_identity_gap(
+def test_critical_passes_when_labels_reasons_and_marker_name_the_sensors(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     scenario = Scenario(quarantine_doc(2.0), recovered_doc(2.0))
     restore_recorder(monkeypatch, scenario)
     result, source = run("critical", scenario, tmp_path)
-    assert result["verdict"] == "FAIL"
-    assert [error.split(":", 1)[0] for error in result["errors"]] == [
-        "sensor_identity",
-        "sensor_identity",
-    ], result["errors"]
-    assert all(
-        not result["stages"][stage]
-        for stage in ("chain", "count", "recovered", "window_closed")
-    ), result["stages"]
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["stages"]["sensor_identity"] == []
     assert sent_plans(source)[0]["rules"][0]["stdout"] == bmc.CRITICAL_TABLE
     assert scenario.events == ["replan", "close-window", "restore"]
 
 
-def test_critical_passes_once_the_product_names_the_sensors(
+def test_critical_fails_where_a_sensor_goes_unnamed(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    during = quarantine_doc(2.0)
-    during["batches"][0]["samples"][0]["labels"] = {"sensors": "CPU1 Temp,Fan1"}
-    scenario = Scenario(during, recovered_doc(2.0))
-    restore_recorder(monkeypatch, scenario)
-    result, _source = run("critical", scenario, tmp_path)
-    assert result["verdict"] == "PASS", result["errors"]
+    """A bare count (the old product) fails sensor_identity in all three places;
+    a label without the reason, or a reason without the marker, fails that place."""
+
+    bare = Scenario(
+        quarantine_doc(2.0, labels={}, reason=BARE_REASON),
+        recovered_doc(2.0, labels={}, reason=BARE_REASON),
+    )
+    restore_recorder(monkeypatch, bare)
+    result, _source = run("critical", bare, tmp_path)
+    assert result["verdict"] == "FAIL"
+    assert [error.split(":", 1)[0] for error in result["errors"]] == [
+        "sensor_identity"
+    ] * 6, result["errors"]
+    assert sum("'CPU1 Temp'" in error for error in result["errors"]) == 3
+    assert sum("'Fan1'" in error for error in result["errors"]) == 3
+    assert all(
+        not result["stages"][stage]
+        for stage in ("chain", "count", "recovered", "window_closed")
+    ), result["stages"]
+
+    unreasoned = Scenario(
+        quarantine_doc(2.0, reason=BARE_REASON, marker_reason=NAMED_REASON),
+        recovered_doc(2.0, reason=BARE_REASON, marker_reason=NAMED_REASON),
+    )
+    restore_recorder(monkeypatch, unreasoned)
+    result, _source = run("critical", unreasoned, tmp_path / "b")
+    assert [error.split(":", 1)[0] for error in result["errors"]] == [
+        "sensor_identity"
+    ] * 2, result["errors"]
+    assert all("reasons of its incident" in error for error in result["errors"]), (
+        result["errors"]
+    )
+
+    unmarked = Scenario(
+        quarantine_doc(2.0, marker_reason=BARE_REASON),
+        recovered_doc(2.0, marker_reason=BARE_REASON),
+    )
+    restore_recorder(monkeypatch, unmarked)
+    result, _source = run("critical", unmarked, tmp_path / "c")
+    assert all("marker" in error for error in result["errors"]), result["errors"]
+    assert len(result["errors"]) == 2, result["errors"]
 
 
 def test_isolation_fails_on_a_wrong_count_or_a_lingering_critical_reading(
@@ -406,20 +500,48 @@ def test_a_zero_table_graded_critical_or_unknown_fails(tmp_path: Path) -> None:
     assert {"sample_present", "no_error"} <= stages, result["errors"]
 
 
-def test_command_failure_is_unknown_without_a_sample(tmp_path: Path) -> None:
-    during = doc(
-        batch(T1, errors=("_bmc: HostObservationError: BMC sensor query failed",))
-    )
-    result, source = run("command_failure", Scenario(during), tmp_path)
+UNKNOWN_BATCH = batch(
+    T1, errors=("_bmc: HostObservationError: BMC sensor query failed",)
+)
+
+
+def no_device_doc(*extra_batches: dict[str, Any]) -> dict[str, Any]:
+    """After the no-device replan: the NO_DEVICE marker, the error gone."""
+
+    return doc(UNKNOWN_BATCH, batch(T2, unsupported("NO_DEVICE")), *extra_batches)
+
+
+def test_command_failure_is_unknown_then_a_missing_device_is_not_supported(
+    tmp_path: Path,
+) -> None:
+    scenario = Scenario(doc(UNKNOWN_BATCH), no_device_doc())
+    result, source = run("command_failure", scenario, tmp_path)
     assert result["verdict"] == "PASS", result["errors"]
-    assert sent_plans(source)[0]["rules"] == [
-        {
-            "query": "sensor",
-            "action": "exit",
-            "exit_code": 1,
-            "stderr": bmc.IPMI_NO_DEVICE_STDERR,
-        }
-    ]
+    assert [plan["rules"] for plan in sent_plans(source)] == [
+        [
+            {
+                "query": "sensor",
+                "action": "exit",
+                "exit_code": 1,
+                "stderr": bmc.IPMI_TRANSIENT_STDERR,
+            }
+        ],
+        [
+            {
+                "query": "sensor",
+                "action": "exit",
+                "exit_code": 1,
+                "stderr": bmc.IPMI_NO_DEVICE_STDERR,
+            }
+        ],
+    ], "the BMC that does not answer first, the BMC-less host second"
+    assert scenario.events == ["replan", "close-window"], scenario.events
+    assert result["no_device_markers"][-1]["labels"] == {"reason": "NO_DEVICE"}
+
+
+def test_command_failure_fails_on_a_sample_a_missing_error_or_an_unsupported_marker(
+    tmp_path: Path,
+) -> None:
     faked = doc(
         batch(
             T1,
@@ -427,23 +549,72 @@ def test_command_failure_is_unknown_without_a_sample(tmp_path: Path) -> None:
             errors=("_bmc: HostObservationError: BMC sensor query failed",),
         )
     )
-    result, _source = run("command_failure", Scenario(faked), tmp_path / "b")
+    result, _source = run("command_failure", Scenario(faked, no_device_doc()), tmp_path)
     assert any(error.startswith("no_sample:") for error in result["errors"]), result
     healthy = doc(batch(T1, reading(0.0)))
-    result, _source = run("command_failure", Scenario(healthy), tmp_path / "c")
+    result, _source = run(
+        "command_failure", Scenario(healthy, no_device_doc()), tmp_path / "b"
+    )
     assert any(error.startswith("unknown_error:") for error in result["errors"]), result
+    unsupported_instead = doc(batch(T1, unsupported("NO_DEVICE")))
+    result, _source = run(
+        "command_failure",
+        Scenario(unsupported_instead, no_device_doc()),
+        tmp_path / "c",
+    )
+    stages = {error.split(":", 1)[0] for error in result["errors"]}
+    assert {"unknown_error", "not_unsupported"} <= stages, result["errors"]
+
+
+def test_command_failure_fails_when_the_missing_device_stays_an_error(
+    tmp_path: Path,
+) -> None:
+    """The old product: ipmitool's 'Could not open device' every tick was a
+    permanent _bmc collection error and never a capability marker."""
+
+    permanent = doc(UNKNOWN_BATCH, batch(T2, errors=UNKNOWN_BATCH["collection_errors"]))
+    result, _source = run(
+        "command_failure", Scenario(doc(UNKNOWN_BATCH), permanent), tmp_path
+    )
+    assert result["verdict"] == "FAIL"
+    stages = {error.split(":", 1)[0] for error in result["errors"]}
+    assert {"no_device_unsupported", "no_device_no_error"} <= stages, result["errors"]
+
+    marked_but_erroring = doc(
+        UNKNOWN_BATCH,
+        batch(T2, unsupported("NO_DEVICE"), errors=UNKNOWN_BATCH["collection_errors"]),
+    )
+    result, _source = run(
+        "command_failure",
+        Scenario(doc(UNKNOWN_BATCH), marked_but_erroring),
+        tmp_path / "b",
+    )
+    assert any(error.startswith("no_device_no_error:") for error in result["errors"]), (
+        result["errors"]
+    )
+    graded_zero = no_device_doc(batch(T3, reading(0.0)))
+    result, _source = run(
+        "command_failure", Scenario(doc(UNKNOWN_BATCH), graded_zero), tmp_path / "c"
+    )
+    assert any(
+        error.startswith("no_device_no_sample:") for error in result["errors"]
+    ), result["errors"]
 
 
 # --------------------------------------------------------------------------- #
 # unsupported_bmc: the read-only capability record
 # --------------------------------------------------------------------------- #
-def test_unsupported_bmc_records_the_capability_gap(tmp_path: Path) -> None:
-    result, source = run("unsupported_bmc", Scenario(silent()), tmp_path)
+def test_unsupported_bmc_records_the_product_capability_marker(tmp_path: Path) -> None:
+    """No ipmitool: the product says TOOL_MISSING on its host batches, nothing else."""
+
+    recorded = doc(batch(T1, unsupported("TOOL_MISSING")))
+    result, source = run("unsupported_bmc", Scenario(recorded), tmp_path)
     assert result["verdict"] == "PASS", result["errors"]
     assert result["capability"] == {
         "ipmitool_installed": False,
         "bmc_samples": 0,
         "bmc_collection_errors": 0,
+        "unsupported_reasons": ["TOOL_MISSING"],
         "batches": 1,
     }
     assert any("capability record" in note for note in result["notes"]), result["notes"]
@@ -452,36 +623,110 @@ def test_unsupported_bmc_records_the_capability_gap(tmp_path: Path) -> None:
         tmp_path / "cases" / SPECS["unsupported_bmc"].key / "bmc-capability.json"
     ).is_file(), "the capability record is kept as evidence"
 
+    with_tool = doc(batch(T1, unsupported("NO_DEVICE")))
+    result, _source = run(
+        "unsupported_bmc", Scenario(with_tool), tmp_path / "b", ipmitool=True
+    )
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["capability"]["unsupported_reasons"] == ["NO_DEVICE"]
 
-def test_unsupported_bmc_fails_on_a_permanent_error_and_blocks_on_a_real_bmc(
+
+def test_unsupported_bmc_fails_without_the_marker_or_with_a_permanent_error(
     tmp_path: Path,
 ) -> None:
+    """A silent product (no marker at all), the wrong marker for the node, or
+    the old per-tick collection error each fail the capability record."""
+
+    result, _source = run("unsupported_bmc", Scenario(silent()), tmp_path)
+    assert result["verdict"] == "FAIL"
+    assert [error.split(":", 1)[0] for error in result["errors"]] == [
+        "capability_marker"
+    ], result["errors"]
+    assert "reason=TOOL_MISSING" in result["errors"][0]
+
+    wrong_reason = doc(batch(T1, unsupported("TOOL_MISSING")))
+    result, _source = run(
+        "unsupported_bmc", Scenario(wrong_reason), tmp_path / "b", ipmitool=True
+    )
+    assert any("reason=NO_DEVICE" in error for error in result["errors"]), result
+
     erroring = doc(
         batch(T1, errors=("_bmc: HostObservationError: BMC sensor query failed",))
     )
     result, _source = run(
-        "unsupported_bmc", Scenario(erroring), tmp_path, ipmitool=True
+        "unsupported_bmc", Scenario(erroring), tmp_path / "c", ipmitool=True
     )
     assert result["verdict"] == "FAIL"
-    assert any(error.startswith("no_permanent_error:") for error in result["errors"]), (
-        result
-    )
+    stages = {error.split(":", 1)[0] for error in result["errors"]}
+    assert {"no_permanent_error", "capability_marker"} <= stages, result["errors"]
+
+
+def test_unsupported_bmc_blocks_on_a_real_bmc(tmp_path: Path) -> None:
     with pytest.raises(VariantBlocked, match="answers ipmitool sensor"):
         run(
             "unsupported_bmc",
             Scenario(doc(batch(T1, reading(0.0)))),
-            tmp_path / "b",
+            tmp_path,
             ipmitool=True,
         )
 
 
-def test_sensor_identity_looks_in_labels_incidents_markers_and_mail() -> None:
-    bare = doc(batch(T1, reading(2.0)))
-    assert len(bmc.sensor_identity(bare, ("CPU1 Temp", "Fan1"))) == 2
-    named = doc(
-        batch(T1, reading(2.0)), markers=[{"text": "critical sensors: CPU1 Temp, Fan1"}]
+def test_unsupported_bmc_waits_one_summary_period_for_the_steady_marker(
+    tmp_path: Path,
+) -> None:
+    """The marker rides the routine health summary: no edge announces it."""
+
+    scenario = Scenario(doc(batch(T1, unsupported("TOOL_MISSING"))))
+    spec = SPECS["unsupported_bmc"]
+    node = FakeProbe({"survey": survey(False)})
+    regional = FakeRegional(cpu_python=scenario.activity)
+    waits: list[tuple[str, float]] = []
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes={f"node@{NODE}": node},
+        settings=make_settings(spec, node=NODE),
     )
-    assert bmc.sensor_identity(named, ("CPU1 Temp", "Fan1")) == []
+    original = ctx.wait_until
+
+    def recording(
+        accept: Any, *, timeout_seconds: float, poll_seconds: float, name: str
+    ):
+        waits.append((name, timeout_seconds))
+        return original(
+            accept,
+            timeout_seconds=timeout_seconds,
+            poll_seconds=poll_seconds,
+            name=name,
+        )
+
+    ctx.wait_until = recording  # type: ignore[method-assign]
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert waits == [("bmc-capability", ctx.host_summary + ctx.host_interval * 8 + 60)]
+    assert spec.max_minutes * 60 > waits[0][1], "the variant budget covers the wait"
+
+
+def test_sensor_identity_checks_labels_incident_reasons_and_marker() -> None:
+    bare = doc(batch(T1, reading(2.0)))
+    assert len(bmc.sensor_identity(bare, ("CPU1 Temp", "Fan1"))) == 6, (
+        "no incident and a bare count: every place misses every sensor"
+    )
+    assert bmc.sensor_identity(quarantine_doc(2.0), ("CPU1 Temp", "Fan1")) == []
+    zero_only = doc(batch(T1, reading(0.0, sensors="CPU1 Temp, Fan1")))
+    assert any(
+        "sensors label" in error for error in bmc.sensor_identity(zero_only, ("Fan1",))
+    ), "a zero reading's labels do not name a critical sensor"
+    foreign = quarantine_doc(2.0)
+    foreign["markers"] = [marker("inc-other", NAMED_REASON)]
+    assert [
+        error for error in bmc.sensor_identity(foreign, ("Fan1",)) if "marker" in error
+    ], "a marker of another incident does not name this finding's sensors"
     assert bmc.bmc_errors(
         {"batches": [{"collection_errors": ["_smart: x", "_bmc: y"]}]}
     ) == ["_bmc: y"]
+    assert bmc.unsupported_markers(
+        doc(batch(T1, unsupported("NO_DEVICE"), unsupported("TOOL_MISSING"))),
+        "NO_DEVICE",
+    )[0]["labels"] == {"reason": "NO_DEVICE"}

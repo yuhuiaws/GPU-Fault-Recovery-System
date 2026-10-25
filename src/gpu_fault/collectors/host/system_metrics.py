@@ -1036,36 +1036,3 @@ class HostSystemMetricsMixin:
             device=device,
             labels={"reason": reason},
         )
-
-    def _bmc(self, _: datetime) -> list[HostMetricSample]:
-        if not shutil.which("ipmitool"):
-            return []
-        completed = self.runner(
-            ["ipmitool", "sensor"],
-            capture_output=True,
-            text=True,
-            timeout=20,
-            check=False,
-        )
-        if completed.returncode != 0:
-            raise HostObservationError("BMC sensor query failed", [])
-        critical = 0
-        observed = 0
-        for line in completed.stdout.splitlines():
-            columns = [item.strip().lower() for item in line.split("|")]
-            if len(columns) < 4:
-                continue
-            observed += 1
-            status = columns[3]
-            if status in {
-                "cr",
-                "critical",
-                "nr",
-                "non-recoverable",
-            }:
-                critical += 1
-        if not observed:
-            raise HostObservationError(
-                "BMC sensor query returned no valid sensor rows", []
-            )
-        return [self._sample("bmc_critical_sensor", critical, "sensors")]

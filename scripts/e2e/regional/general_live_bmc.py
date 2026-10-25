@@ -1,12 +1,20 @@
 """GF-GENERAL-LIVE-015: BMC sensor alerts through the product's own ``ipmitool`` reader.
 
 The host collector (``collectors/host/system_metrics.py`` ``_bmc``) runs
-``ipmitool sensor`` every tick when the tool is on its PATH, grades the fourth
-``|`` column of every row (``cr``/``critical``/``nr``/``non-recoverable`` count,
-rows with fewer than four columns are skipped) into ``bmc_critical_sensor``
-(``>= 1`` is CRITICAL QUARANTINE, ``host_health.py``), and reports a non-zero
-exit or a table without a single valid row as UNKNOWN (a ``_bmc`` collection
-error, no sample). Without ``ipmitool`` it reports nothing.
+``ipmitool sensor`` every tick when the tool is on its PATH and grades the
+fourth ``|`` column of every row (rows with fewer than four columns are
+skipped): ``bmc_critical_sensor`` is the number of distinct sensors reading
+``cr``/``critical``/``nr``/``non-recoverable`` (``>= 1`` is CRITICAL QUARANTINE,
+``host_health.py``), and a count ``>= 1`` carries the alerting sensors on its
+labels -- ``sensors`` (names) and ``sensor_alerts`` (name, reading, units,
+status, the threshold columns ipmitool printed) -- which the grader writes
+into the finding's reason, so the incident reasons, the marker and the
+QUARANTINE step's hardware escalation mail name them. A non-zero exit, a hung
+tool, a table without a valid row and a table whose every status is ``na`` are
+UNKNOWN (a ``_bmc`` collection error, no sample). BMC the node cannot provide
+is NOT_SUPPORTED: ``bmc_status_unsupported`` ``TOOL_MISSING`` without
+``ipmitool``, ``NO_DEVICE`` when ipmitool reports no IPMI device node and none
+exists -- no collection error, nothing graded.
 
 EC2 instances expose no BMC and the AMIs carry no ``ipmitool``, so the grading
 chain is reachable only as ``live-replay``: the shared host source replay
@@ -24,7 +32,6 @@ closes and the validated restore runs. ``proof_scope`` is ``live-replay``.
 
 from __future__ import annotations
 
-import json
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from typing import Any
 
@@ -78,12 +85,19 @@ MARKER_TICKS = 8
 SETTLE_TICKS = 2
 AUDIT_TAIL = 400
 ISOLATION_FORBIDDEN = HARDWARE_OPERATIONS | {"STOP_WORKLOADS"}
-#: What ``ipmitool`` prints on a host without a BMC device.
+#: What ``ipmitool`` prints on a host without an IPMI device node (``open.c``,
+#: ``strerror(ENOENT)``): the product reads NOT_SUPPORTED (``NO_DEVICE``).
 IPMI_NO_DEVICE_STDERR = (
     "Could not open device at /dev/ipmi0 or /dev/ipmi/0 or /dev/ipmidev/0: "
     "No such file or directory\n"
 )
+#: A BMC that is there but does not answer (``ipmi_sdr.c``): UNKNOWN.
+IPMI_TRANSIENT_STDERR = "Get Device ID command failed\nUnable to open SDR for reading\n"
 IPMI_FAILED_EXIT = 1
+#: The product's capability marker for BMC it cannot read (TOOL_MISSING / NO_DEVICE).
+UNSUPPORTED = "bmc_status_unsupported"
+#: Every BMC sample the activity reads keep.
+METRICS = frozenset({METRIC, UNSUPPORTED})
 
 #: Sensor rows in ``ipmitool sensor`` shape:
 #: ``name | value | units | status | lnr | lcr | lnc | unc | ucr | unr``.
@@ -186,6 +200,16 @@ def table_rules(table: str) -> list[dict[str, Any]]:
 
 
 def command_failure_rules() -> list[dict[str, Any]]:
+    """``ipmitool sensor`` fails the way a BMC that does not answer makes it fail."""
+
+    return [
+        rule("sensor", "exit", exit_code=IPMI_FAILED_EXIT, stderr=IPMI_TRANSIENT_STDERR)
+    ]
+
+
+def no_device_rules() -> list[dict[str, Any]]:
+    """``ipmitool sensor`` fails the way it does on a host without an IPMI device."""
+
     return [
         rule("sensor", "exit", exit_code=IPMI_FAILED_EXIT, stderr=IPMI_NO_DEVICE_STDERR)
     ]
@@ -268,7 +292,7 @@ def await_bmc(
 
     def poll() -> dict[str, Any] | None:
         nonlocal last
-        last = activity(ctx, since, metrics={METRIC})
+        last = activity(ctx, since, metrics=METRICS)
         return last if accept(last) else None
 
     value = ctx.wait_until(
@@ -289,7 +313,19 @@ def settled_read(
 ) -> dict[str, Any]:
     await_bmc(ctx, since, accept, name=name)
     ctx.hold(ctx.host_interval * SETTLE_TICKS + 30, name=f"{name}-settle")
-    return activity(ctx, since, metrics={METRIC})
+    return activity(ctx, since, metrics=METRICS)
+
+
+def unsupported_markers(
+    observed: Mapping[str, Any], reason: str
+) -> list[dict[str, Any]]:
+    """The ``bmc_status_unsupported`` samples whose ``reason`` label is ``reason``."""
+
+    return [
+        sample
+        for sample in samples(dict(observed), UNSUPPORTED)
+        if (sample.get("labels") or {}).get("reason") == reason
+    ]
 
 
 def close_bmc_window(ctx: VariantContext, replay: HostSourceReplay) -> list[str]:
@@ -357,27 +393,43 @@ def _result(
 
 
 def sensor_identity(observed: Mapping[str, Any], sensors: Iterable[str]) -> list[str]:
-    """Each alerting sensor's name reaches the product's records (spec 015).
+    """Each alerting sensor is named where the product keeps it (spec 015).
 
-    Looked for in the ``bmc_critical_sensor`` sample labels, the minted
-    incidents, their markers and notifications -- wherever a fix lands it.
+    Three places, each checked: the ``sensors`` label of the critical
+    ``bmc_critical_sensor`` sample (the collector's record), the reasons of
+    the incident the finding minted (the text the QUARANTINE step's hardware
+    escalation mail lists), and the ``raw_reason`` of that incident's marker.
+    A bare count names nothing anywhere, and that was the registered gap.
     """
 
-    text = json.dumps(
-        {
-            "labels": [
-                sample.get("labels") for sample in samples(dict(observed), METRIC)
-            ],
-            "incidents": finding_incidents(dict(observed), METRIC),
-            "markers": observed.get("markers") or [],
-            "notifications": observed.get("notifications") or [],
-        },
-        default=str,
+    activity = dict(observed)
+    labelled = [
+        str((sample.get("labels") or {}).get("sensors") or "")
+        for sample in samples(activity, METRIC)
+        if isinstance(sample.get("value"), (int, float)) and sample["value"] >= 1
+    ]
+    incidents = finding_incidents(activity, METRIC)
+    reasons = [
+        str(reason)
+        for incident in incidents
+        for reason in incident.get("reasons") or []
+    ]
+    incident_ids = {str(incident.get("incident_id")) for incident in incidents}
+    markers = [
+        str(marker.get("raw_reason") or "")
+        for marker in activity.get("markers") or []
+        if isinstance(marker, dict) and str(marker.get("incident_id")) in incident_ids
+    ]
+    places = (
+        ("the sensors label of the critical bmc_critical_sensor sample", labelled),
+        ("the reasons of its incident", reasons),
+        ("the raw_reason of its incident's marker", markers),
     )
     return [
-        f"the critical sensor {name!r} is named nowhere in the product's records"
+        f"the critical sensor {name!r} is not named in {place}: {texts[-2:]}"
         for name in sensors
-        if name not in text
+        for place, texts in places
+        if not any(name in text for text in texts)
     ]
 
 
@@ -405,7 +457,7 @@ def _isolation_variant(
         started,
         METRIC,
         timeout_seconds=QUARANTINE_BUDGET,
-        metrics={METRIC},
+        metrics=METRICS,
         name=f"bmc-{status}-quarantine",
     )
     require_served(ctx, replay)
@@ -416,7 +468,7 @@ def _isolation_variant(
             started,
             [item["incident_id"] for item in incidents],
             timeout_seconds=QUARANTINE_BUDGET,
-            metrics={METRIC},
+            metrics=METRICS,
             name=f"bmc-{status}-settled",
         )
         if incidents
@@ -443,6 +495,7 @@ def _isolation_variant(
             f"a parseable table was graded as a collection error: {error[:120]}"
             for error in bmc_errors(settled)
         ],
+        "sensor_identity": sensor_identity(settled, sensors),
     }
     # Recovery: the same wrapper now serves a healthy table, the product reads
     # zero critical sensors (its own recovery record), then the window closes
@@ -474,20 +527,20 @@ def _isolation_variant(
 def critical(ctx: VariantContext) -> dict[str, Any]:
     """Live-replay: two ``cr`` rows -> one QUARANTINE incident naming both sensors."""
 
-    stages, settled, extra = _isolation_variant(
+    stages, _settled, extra = _isolation_variant(
         ctx,
         table=CRITICAL_TABLE,
         sensors=CRITICAL_SENSORS,
         status="cr",
         reason="GF-GENERAL-LIVE-015 critical restore",
     )
-    stages["sensor_identity"] = sensor_identity(settled, CRITICAL_SENSORS)
     return _result(
         stages,
         notes=[
             "two cr rows in the 4th column -> bmc_critical_sensor=2 -> MARK_UNSCHEDULABLE "
-            "+ QUARANTINE (one incident); the spec also wants the alert to carry the "
-            "sensor names and ranges (sensor_identity stage)"
+            "+ QUARANTINE (one incident); the sample labels, the incident reasons and "
+            "the marker name both sensors with reading, status and thresholds "
+            "(sensor_identity stage)"
         ],
         extra=extra,
     )
@@ -507,7 +560,8 @@ def nonrecoverable(ctx: VariantContext) -> dict[str, Any]:
         stages,
         notes=[
             "an nr status in the 4th column -> bmc_critical_sensor=1 -> MARK_UNSCHEDULABLE "
-            "+ QUARANTINE; healthy table read as the recovery; validated restore"
+            "+ QUARANTINE, the sensor named; healthy table read as the recovery; "
+            "validated restore"
         ],
         extra=extra,
     )
@@ -581,8 +635,8 @@ def unavailable_sensor(ctx: VariantContext) -> dict[str, Any]:
         name="bmc-unavailable",
         note=(
             f"{UNAVAILABLE_SENSOR} reads na/na: not counted critical, not an error, "
-            "no finding, no isolation; the product keeps no per-sensor "
-            "unavailability marker (a table of only na rows would read 0; not exercised)"
+            "no finding, no isolation; a table of only na rows is UNKNOWN in the "
+            "product (a _bmc collection error, no sample; software-tested)"
         ),
         why="an unavailable BMC sensor",
     )
@@ -590,8 +644,31 @@ def unavailable_sensor(ctx: VariantContext) -> dict[str, Any]:
     return result
 
 
+def _no_bmc_batches(observed: Mapping[str, Any]) -> list[dict[str, Any]]:
+    """The batches carrying the NO_DEVICE capability marker."""
+
+    wanted = {
+        sample.get("batch_id") for sample in unsupported_markers(observed, "NO_DEVICE")
+    }
+    return [
+        batch
+        for batch in observed.get("batches") or []
+        if isinstance(batch, dict) and batch.get("batch_id") in wanted
+    ]
+
+
 def command_failure(ctx: VariantContext) -> dict[str, Any]:
-    """Live-replay: ``ipmitool sensor`` exits 1 -> UNKNOWN (error, no sample), no finding."""
+    """Live-replay: a failing ``ipmitool sensor`` is UNKNOWN; a missing IPMI device is NOT_SUPPORTED.
+
+    Two answers from the same wrapper, in sequence. First the exit of a BMC
+    that does not answer (``Get Device ID command failed``): a ``_bmc``
+    collection error, no sample, no finding, no isolation. Then the exit of a
+    host without an IPMI device node (``Could not open device at /dev/ipmi0
+    ...: No such file or directory``, which is what an installed ipmitool
+    prints on EC2): ``bmc_status_unsupported`` NO_DEVICE and the collection
+    error stops -- a permanent capability gap is recorded, not graded as
+    missing evidence every tick, and still never a healthy zero.
+    """
 
     run_survey(ctx)
     replay, _opened = open_bmc_window(ctx, command_failure_rules())
@@ -599,7 +676,11 @@ def command_failure(ctx: VariantContext) -> dict[str, Any]:
     observed = settled_read(
         ctx,
         started,
-        lambda current: bool(bmc_errors(current) or samples(current, METRIC)),
+        lambda current: bool(
+            bmc_errors(current)
+            or samples(current, METRIC)
+            or samples(current, UNSUPPORTED)
+        ),
         "bmc-command-failure",
     )
     require_served(ctx, replay)
@@ -616,42 +697,128 @@ def command_failure(ctx: VariantContext) -> dict[str, Any]:
             f"{sample.get('value')}"
             for sample in samples(observed, METRIC)
         ],
+        "not_unsupported": [
+            f"a BMC that does not answer was recorded as {UNSUPPORTED} "
+            f"{sample.get('labels')}"
+            for sample in samples(observed, UNSUPPORTED)
+        ],
         "no_finding": chain_errors(
             observed, ChainExpectation(metric=METRIC, present=False)
         ),
         "hardware": hardware_errors(observed),
         "not_isolated": not_isolated(ctx, "a failed BMC query"),
-        "window_closed": close_bmc_window(ctx, replay),
     }
+    replay.replan(
+        TOOL,
+        command_plan(
+            TOOL, no_device_rules(), not_after_seconds=ctx.spec.max_minutes * 60
+        ),
+    )
+    # Read from after the plan landed: a tick served the previous rule in the
+    # seconds the install took would otherwise count as a lingering error.
+    no_device_at = utc_now()
+    unsupported = settled_read(
+        ctx,
+        no_device_at,
+        lambda current: bool(
+            samples(current, UNSUPPORTED)
+            or samples(current, METRIC)
+            or bmc_errors(current)
+        ),
+        "bmc-no-device",
+    )
+    marked = _no_bmc_batches(unsupported)
+    batches = [
+        batch for batch in unsupported.get("batches") or [] if isinstance(batch, dict)
+    ]
+    last = batches[-1] if batches else {}
+    stages["no_device_unsupported"] = (
+        []
+        if marked
+        else [
+            f"no {UNSUPPORTED} sample with reason=NO_DEVICE after ipmitool answered "
+            f"'Could not open device'; errors: {[e[:120] for e in bmc_errors(unsupported)][-3:]}"
+        ]
+    )
+    stages["no_device_no_error"] = [
+        f"a missing IPMI device was graded as a collection error: {str(error)[:120]}"
+        for batch in marked
+        for error in batch.get("collection_errors") or []
+        if str(error).startswith(BMC_CONTRIBUTOR)
+    ] + (
+        [
+            "the last host batch after the no-device replan still carries a _bmc "
+            f"collection error: {[str(e)[:120] for e in last.get('collection_errors') or []][-2:]}"
+        ]
+        if any(
+            str(e).startswith(BMC_CONTRIBUTOR)
+            for e in last.get("collection_errors") or []
+        )
+        else []
+    )
+    stages["no_device_no_sample"] = [
+        f"a host without an IPMI device was graded as bmc_critical_sensor="
+        f"{sample.get('value')}"
+        for sample in samples(unsupported, METRIC)
+    ]
+    stages["no_device_no_finding"] = chain_errors(
+        unsupported, ChainExpectation(metric=METRIC, present=False)
+    )
+    stages["window_closed"] = close_bmc_window(ctx, replay)
     return _result(
         stages,
         notes=[
-            "ipmitool sensor exit 1 ('Could not open device') is a _bmc collection "
-            "error (UNKNOWN), never a healthy zero and never an isolation"
+            "ipmitool sensor exit 1 ('Get Device ID command failed') is a _bmc "
+            "collection error (UNKNOWN), never a healthy zero and never an isolation; "
+            "exit 1 ('Could not open device at /dev/ipmi0 ...: No such file or "
+            "directory') on this BMC-less host is bmc_status_unsupported NO_DEVICE "
+            "with no collection error"
         ],
-        extra={"collection_errors": errors, **replay.evidence(tool=TOOL)},
+        extra={
+            "collection_errors": errors,
+            "no_device_markers": unsupported_markers(unsupported, "NO_DEVICE")[-2:],
+            **replay.evidence(tool=TOOL),
+        },
     )
 
 
 def unsupported_bmc(ctx: VariantContext) -> dict[str, Any]:
-    """Read-only: record that this node has no BMC and the product stays silent on it.
+    """Read-only: record that this node has no BMC and the product says so.
 
     Like 002 ``no_swap``: nothing is injected. The survey says whether
-    ``ipmitool`` is installed; the product's records over a window say whether
-    the BMC contributor produced a reading (a BMC answered -- then this variant
-    does not apply), a ``_bmc`` collection error every tick (the tool is there,
-    no BMC behind it: a permanent capability gap graded as UNKNOWN, which holds
-    every host validation, unlike SMART's ``smart_status_unsupported``), or
-    nothing (no tool: the gap is recorded here, not by the product).
+    ``ipmitool`` is installed; the product's records over a window say how the
+    BMC contributor reads the node: ``bmc_status_unsupported`` TOOL_MISSING
+    without the tool, NO_DEVICE with the tool and no IPMI device behind it --
+    the capability gap recorded by the product, never a ``_bmc`` collection
+    error every tick (which held every host validation). A BMC that answers
+    (a ``bmc_critical_sensor`` reading, no error) means this variant does not
+    apply.
     """
 
     survey = run_survey(ctx)
     tool_present = bool((survey.get("tools") or {}).get(TOOL))
+    expected_reason = "NO_DEVICE" if tool_present else "TOOL_MISSING"
     started_at = utc_now()
-    ctx.hold(ctx.host_interval * 4 + 30, name="bmc-capability-hold")
-    observed = activity(ctx, started_at, metrics={METRIC})
+    # No edge ever fires here: a steady capability marker travels with the
+    # routine health summary, so the wait spans one summary period.
+    observed = await_bmc(
+        ctx,
+        started_at,
+        lambda current: bool(
+            samples(current, UNSUPPORTED)
+            or samples(current, METRIC)
+            or bmc_errors(current)
+        ),
+        name="bmc-capability",
+        timeout_seconds=ctx.host_summary + ctx.host_interval * MARKER_TICKS + 60,
+    )
     readings = samples(observed, METRIC)
     errors = bmc_errors(observed)
+    markers = samples(observed, UNSUPPORTED)
+    reasons = sorted(
+        {str((sample.get("labels") or {}).get("reason") or "") for sample in markers}
+        - {""}
+    )
     if readings and not errors:
         raise VariantBlocked(
             "CAPABILITY_ABSENT",
@@ -665,9 +832,17 @@ def unsupported_bmc(ctx: VariantContext) -> dict[str, Any]:
         "no_permanent_error": []
         if not errors
         else [
-            "ipmitool is installed but no BMC answers; the product grades that "
-            "permanent gap as a _bmc collection error every tick (holds host "
-            f"validation): {errors[-1][:120]}"
+            "ipmitool "
+            + ("is installed but no BMC answers" if tool_present else "is absent")
+            + "; the product grades that permanent gap as a _bmc collection error "
+            f"(holds host validation): {errors[-1][:120]}"
+        ],
+        "capability_marker": []
+        if expected_reason in reasons
+        else [
+            f"no {UNSUPPORTED} sample with reason={expected_reason} (ipmitool "
+            + ("installed" if tool_present else "absent")
+            + f"); reasons seen: {reasons}, batches: {len(observed.get('batches') or [])}"
         ],
         "hardware": hardware_errors(observed),
     }
@@ -675,6 +850,7 @@ def unsupported_bmc(ctx: VariantContext) -> dict[str, Any]:
         "ipmitool_installed": tool_present,
         "bmc_samples": len(readings),
         "bmc_collection_errors": len(errors),
+        "unsupported_reasons": reasons,
         "batches": len(observed.get("batches") or []),
     }
     ctx.evidence.write("bmc-capability", capability)
@@ -683,8 +859,9 @@ def unsupported_bmc(ctx: VariantContext) -> dict[str, Any]:
         notes=[
             "capability record: EC2 instance without a BMC"
             + (" and without ipmitool" if not tool_present else " (ipmitool installed)")
-            + "; the product emits no bmc_critical_sensor reading, so the BMC "
-            "variants needing a real BMC stay NOT_RUN(CAPABILITY_ABSENT)"
+            + f"; the product records bmc_status_unsupported {expected_reason} and "
+            "emits no bmc_critical_sensor reading, so the BMC variants needing a real "
+            "BMC stay NOT_RUN(CAPABILITY_ABSENT)"
         ],
         extra={"capability": capability},
     )
@@ -699,8 +876,6 @@ def _spec(
     risk: str = "L",
     max_minutes: int = 16,
     cleanup: str = "close the ipmitool window; confirm clean and no replayed reading after it",
-    expected_outcome: str = "PASS",
-    product_gap: str = "",
 ) -> VariantSpec:
     return VariantSpec(
         case_id=CASE,
@@ -714,39 +889,27 @@ def _spec(
         cleanup=cleanup,
         max_minutes=max_minutes,
         approvals=(HOST_SOURCE_REPLAY,),
-        expected_outcome=expected_outcome,
-        product_gap=product_gap,
         execute=execute,
     )
 
-
-SENSOR_IDENTITY_GAP = (
-    "collectors/host/system_metrics.py HostSystemMetricsMixin._bmc reports "
-    "bmc_critical_sensor as a bare count (unit 'sensors', no labels): the names, "
-    "readings and thresholds of the cr/nr rows never reach the finding, incident, "
-    "marker or notification, so a multi-sensor alert cannot name its sensors "
-    "(spec 015: 多传感器告警需保留名称及范围并去重)"
-)
 
 VARIANTS = [
     _spec(
         "critical",
         "wrapper serves an ipmitool sensor table with two cr rows (CPU1 Temp, Fan1)",
-        "bmc_critical_sensor=2 -> MARK_UNSCHEDULABLE + QUARANTINE, one incident; the "
-        "alert names both sensors (expected FAIL: names are dropped); healthy table -> "
-        "recovered; validated restore",
+        "bmc_critical_sensor=2 -> MARK_UNSCHEDULABLE + QUARANTINE, one incident whose "
+        "sample labels, reasons and marker name both sensors with reading, status and "
+        "thresholds; healthy table -> recovered; validated restore",
         critical,
         risk="M",
         max_minutes=32,
         cleanup="healthy table read, window closed, validated restore; node schedulable",
-        expected_outcome="FAIL",
-        product_gap=SENSOR_IDENTITY_GAP,
     ),
     _spec(
         "nonrecoverable",
         "wrapper serves an ipmitool sensor table with one nr row",
-        "bmc_critical_sensor=1 -> MARK_UNSCHEDULABLE + QUARANTINE (no STOP, no hardware); "
-        "healthy table -> recovered; validated restore",
+        "bmc_critical_sensor=1 -> MARK_UNSCHEDULABLE + QUARANTINE (no STOP, no hardware), "
+        "the sensor named; healthy table -> recovered; validated restore",
         nonrecoverable,
         risk="M",
         max_minutes=32,
@@ -778,9 +941,13 @@ VARIANTS = [
     ),
     _spec(
         "command_failure",
-        "wrapper makes ipmitool sensor exit 1 ('Could not open device at /dev/ipmi0')",
-        "_bmc collection error (UNKNOWN); no bmc_critical_sensor sample, no finding, no isolation",
+        "wrapper makes ipmitool sensor exit 1 ('Get Device ID command failed'), then exit 1 "
+        "('Could not open device at /dev/ipmi0 ...: No such file or directory')",
+        "first a _bmc collection error (UNKNOWN), no bmc_critical_sensor sample, no finding, "
+        "no isolation; then bmc_status_unsupported NO_DEVICE, the error stops, still no "
+        "sample and no finding",
         command_failure,
+        max_minutes=20,
     ),
     VariantSpec(
         case_id=CASE,
@@ -790,10 +957,12 @@ VARIANTS = [
         risk="L",
         flags="S",
         injection="none (read-only): survey ipmitool and watch the BMC contributor",
-        expected="no BMC reading and no finding; the capability gap is recorded (not a PASS "
-        "of any BMC grading); a permanent _bmc error on a BMC-less node is a FAIL",
+        expected="bmc_status_unsupported TOOL_MISSING (no ipmitool) or NO_DEVICE (ipmitool, "
+        "no BMC), no BMC reading, no _bmc collection error and no finding: the capability "
+        "gap is recorded by the product (not a PASS of any BMC grading); a permanent _bmc "
+        "error on a BMC-less node is a FAIL",
         cleanup="none",
-        max_minutes=8,
+        max_minutes=12,
         execute=unsupported_bmc,
     ),
 ]
@@ -803,19 +972,24 @@ __all__ = [
     "CRITICAL_SENSORS",
     "CRITICAL_TABLE",
     "HEALTHY_TABLE",
+    "IPMI_NO_DEVICE_STDERR",
+    "IPMI_TRANSIENT_STDERR",
     "METRIC",
+    "METRICS",
     "NONRECOVERABLE_TABLE",
-    "SENSOR_IDENTITY_GAP",
     "UNAVAILABLE_TABLE",
+    "UNSUPPORTED",
     "VARIANTS",
     "WRONG_COLUMN_TABLE",
     "bmc_errors",
     "close_bmc_window",
     "command_failure_rules",
+    "no_device_rules",
     "open_bmc_window",
     "require_served",
     "sensor_identity",
     "sensor_table",
     "served_calls",
     "table_rules",
+    "unsupported_markers",
 ]

@@ -437,6 +437,49 @@ def efa_inventory_rule(
     )
 
 
+#: ``bmc_critical_sensor`` >= 1: one or more ``ipmitool sensor`` rows in a
+#: critical or non-recoverable state (GF-GENERAL-LIVE-015). One rule for the
+#: table, the edge filter and ``bmc_critical_sensor_rule``.
+_BMC_CRITICAL_SENSOR_RULE = (
+    1.0,
+    NodeHealthCategory.BMC,
+    Severity.CRITICAL,
+    RecoveryAction.QUARANTINE,
+    "BMC reports a critical sensor",
+)
+
+
+def bmc_critical_sensor_rule(
+    sample: HostMetricSample,
+) -> tuple[
+    float,
+    NodeHealthCategory,
+    Severity,
+    RecoveryAction,
+    str,
+]:
+    """The BMC rule, with the alerting sensors named in its reason.
+
+    The reason is the one text the incident keeps (``reasons``), the marker
+    carries (``raw_reason``) and the QUARANTINE step's hardware escalation
+    mail lists, so this is where the names, readings, statuses and thresholds
+    the collector put in the sample's labels (``sensor_alerts``, or the bare
+    ``sensors`` names) reach the operator: a multi-sensor alert names its
+    sensors instead of reading "2". The labels themselves travel as the
+    finding's ``diagnostic_parameters``. A count without labels -- a node
+    whose collector predates them -- keeps the table's fixed text. Pure: the
+    sample is evidence and is not changed.
+    """
+
+    threshold, category, severity, action, reason = _BMC_CRITICAL_SENSOR_RULE
+    alerts = sample.labels.get("sensor_alerts") or sample.labels.get("sensors")
+    if alerts:
+        count = int(sample.value) if float(sample.value).is_integer() else sample.value
+        noun = "sensor" if count == 1 else "sensors"
+        reason = f"BMC reports {count} critical {noun}: {alerts}"
+    return threshold, category, severity, action, reason
+
+
 class NodeHealthPolicy:
     LATEST_METRICS_REQUIRED = _HOST_VALIDATION_LATEST_METRICS | {
         "gpu_inventory_expected_count",
@@ -716,13 +759,7 @@ class NodeHealthPolicy:
             RecoveryAction.RESTART_GPU_DEVICE_PLUGIN,
             "Kubernetes GPU allocatable does not match the host GPU inventory",
         ),
-        "bmc_critical_sensor": (
-            1.0,
-            NodeHealthCategory.BMC,
-            Severity.CRITICAL,
-            RecoveryAction.QUARANTINE,
-            "BMC reports a critical sensor",
-        ),
+        "bmc_critical_sensor": _BMC_CRITICAL_SENSOR_RULE,
     }
 
     LOG_RULES = NODE_LOG_RULES
@@ -912,6 +949,8 @@ class NodeHealthPolicy:
             rule = (
                 self._efa_inventory_rule(sample)
                 if sample.name == "efa_inventory_mismatch"
+                else self._bmc_critical_sensor_rule(sample)
+                if sample.name == "bmc_critical_sensor"
                 else self.METRIC_RULES.get(sample.name)
             )
             if rule is None:
@@ -973,6 +1012,7 @@ class NodeHealthPolicy:
         return findings
 
     _efa_inventory_rule = staticmethod(efa_inventory_rule)
+    _bmc_critical_sensor_rule = staticmethod(bmc_critical_sensor_rule)
 
     def _prepare_sustained_metric(
         self,
