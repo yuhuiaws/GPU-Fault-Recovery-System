@@ -241,7 +241,9 @@ print(json.dumps({
 }, sort_keys=True, default=str))
 """
 
-#: One training attempt's completion records and its job's restart ledger.
+#: One training attempt's completion records (terminal event, decision,
+#: containment incident and workflow, recovery incidents/workflows, the
+#: notifications of those incidents) and its job's restart ledger. Read-only.
 ATTEMPT_PROBE = r"""
 import json
 import sys
@@ -269,9 +271,13 @@ for attempt_id in attempt_ids:
         containment.model_dump(mode="json") if containment is not None else None
     )
     recovery = []
+    incident_ids = set()
+    if containment is not None:
+        incident_ids.add(containment.incident_id)
     for incident, workflow in store.list_job_recovery_workflow_incidents(
         cluster_id, job_id, attempt_id, include_terminal=True
     ):
+        incident_ids.add(incident.incident_id)
         recovery.append({
             "incident": incident.model_dump(mode="json"),
             "workflow": workflow.model_dump(mode="json"),
@@ -284,6 +290,20 @@ for attempt_id in attempt_ids:
         except NotFoundError:
             pass
     entry["containment_workflows"] = workflows
+    # The notifications of the attempt's own incidents (containment and
+    # recovery): what a redelivered terminal must not add to (029).
+    entry["notifications"] = [
+        {
+            "notification_id": notification.notification_id,
+            "incident_id": notification.incident_id,
+            "category": notification.category,
+            "deduplication_key": notification.deduplication_key,
+            "created_at": notification.created_at.isoformat(),
+            "subject": notification.subject,
+        }
+        for notification in store.list_notifications(limit=500, newest_first=True)
+        if notification.incident_id in incident_ids
+    ]
     attempts[attempt_id] = entry
 try:
     budget = store.get_restart_budget(cluster_id, job_id).model_dump(mode="json")

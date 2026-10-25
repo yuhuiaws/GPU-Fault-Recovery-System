@@ -10,6 +10,7 @@ import pytest
 
 from gpu_fault.store import NotFoundError
 from scripts.e2e.regional import general_live_attempts as att
+from scripts.e2e.regional import general_live_terminal_replay as replay
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_restart_budget import BUDGET_PROBE
 from tests.regional._general_live_fakes import (
@@ -96,10 +97,12 @@ def attempt_doc(
     restart_attempt_id: str | None = None,
     restarts: int = 1,
     extra_attempts: dict[str, dict[str, Any]] | None = None,
+    notifications: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     """One attempt's records. ``restart_attempt_id`` is what the product's
     RESTART_WORKLOAD execution recorded; ``restarts`` recovery workflows carry
-    it; ``extra_attempts`` are further attempt entries (a restart copy's)."""
+    it; ``extra_attempts`` are further attempt entries (a restart copy's);
+    ``notifications`` the attempt's incidents' notifications (one by default)."""
 
     reservations = (
         reservations
@@ -161,6 +164,9 @@ def attempt_doc(
                 },
                 "containment_workflows": [containment_wf],
                 "recovery": recovery,
+                "notifications": [notification("n-1")]
+                if notifications is None
+                else list(notifications),
             },
             **(extra_attempts or {}),
         },
@@ -169,6 +175,17 @@ def attempt_doc(
             "reservation_ids": reservations,
             "budget": max(restart_count, 1),
         },
+    }
+
+
+def notification(notification_id: str, incident_id: str = "inc-c") -> dict[str, Any]:
+    return {
+        "notification_id": notification_id,
+        "incident_id": incident_id,
+        "category": "INCIDENT",
+        "deduplication_key": f"{incident_id}/{notification_id}",
+        "created_at": "2026-10-25T00:00:00+00:00",
+        "subject": "s",
     }
 
 
@@ -352,6 +369,7 @@ def untouched() -> dict[str, Any]:
         "containment_incident": None,
         "containment_workflows": [],
         "recovery": [],
+        "notifications": [],
     }
 
 
@@ -385,7 +403,7 @@ def _run_old_terminal(
     calls: list[tuple[str, ...]] = []
 
     def responder(script: str, *a: str) -> dict[str, Any]:
-        if script == att.TERMINAL_REPLAY_PROBE:
+        if script == replay.TERMINAL_REPLAY_PROBE:
             calls.append(("replay", *a))
             if refused:
                 return {"attempt_id": a[1], "refused": "no recorded terminal event"}
@@ -500,7 +518,7 @@ def test_missing_allocation_is_deferred_with_the_watcher_reason() -> None:
     assert spec.lanes == ("eks", "hp")
 
 
-REPLAY_CODE = compile(att.TERMINAL_REPLAY_PROBE, "<terminal-replay-probe>", "exec")
+REPLAY_CODE = compile(replay.TERMINAL_REPLAY_PROBE, "<terminal-replay-probe>", "exec")
 
 
 def _replay_probe_run(context: Any, arguments: list[str]) -> dict[str, Any]:
@@ -576,8 +594,16 @@ def test_terminal_replay_probe_redelivers_the_stored_event_and_refuses_strangers
         "attempt_id": "gl28ot-y-a001",
         "refused": "no recorded terminal event",
     }
+    # 029 duplicate_event's jobs are gl29 test attempts: accepted, nothing else is.
+    assert _replay_probe_run(context, ["gpu-eks-cluster", "gl29de-y-a001"]) == {
+        "attempt_id": "gl29de-y-a001",
+        "refused": "no recorded terminal event",
+    }
+    assert replay.REPLAY_ATTEMPT_PREFIXES == ("gl28", "gl29")
     with pytest.raises(ValueError, match="outside the test prefix"):
         _replay_probe_run(context, ["gpu-eks-cluster", "train-123-a001"])
+    with pytest.raises(ValueError, match="outside the test prefix"):
+        _replay_probe_run(context, ["gpu-eks-cluster", "gl30x-a001"])
     assert len(handled) == 1, "a refused replay redelivers nothing"
 
 
@@ -613,15 +639,140 @@ def test_restart_withheld_fails_if_restart_succeeded(tmp_path: Path) -> None:
     assert result["verdict"] == "FAIL"
 
 
-def test_duplicate_event_and_single_notification(tmp_path: Path) -> None:
-    assert (
-        _run(
-            "duplicate_event",
-            tmp_path,
-            lambda aid: attempt_doc(aid, restart_count=1, duplicate=True),
-        )["verdict"]
-        == "PASS"
+# --------------------------------------------------------------------------- #
+# 029 duplicate_event: the same terminal delivered twice
+# --------------------------------------------------------------------------- #
+def _run_duplicate_event(
+    tmp_path: Path,
+    *,
+    after: dict[str, Any] | None = None,
+    duplicate: bool = True,
+    plan: str = "plan-1",
+    refused: bool = False,
+) -> tuple[dict[str, Any], list[tuple[str, ...]]]:
+    """``after`` overrides the attempt records read after the redelivery."""
+
+    spec = SPECS["duplicate_event"]
+    calls: list[tuple[str, ...]] = []
+    replayed_once = False
+
+    def responder(script: str, *a: str) -> dict[str, Any]:
+        nonlocal replayed_once
+        if script == replay.TERMINAL_REPLAY_PROBE:
+            calls.append(("replay", *a))
+            replayed_once = True
+            if refused:
+                return {"attempt_id": a[1], "refused": "no recorded terminal event"}
+            original = {
+                "cluster_id": a[0],
+                "attempt_id": a[1],
+                "event_key": f"{a[0]}/{a[1]}/TrainingAttemptFailureDetected",
+                "status": "PLAN_CREATED",
+                "reason": "r",
+                "duplicate": False,
+                "matched_marker_ids": [],
+                "recovery_plan_id": "plan-1",
+            }
+            return replayed(original, duplicate=duplicate, plan=plan)
+        calls.append(("attempt", *a))
+        attempt_id = a[2]
+        new_id = f"{attempt_id}-r-deadbeef"
+        fields: dict[str, Any] = {
+            "restart_attempt_id": new_id,
+            "extra_attempts": {new_id: untouched()},
+        }
+        if replayed_once and after:
+            fields.update(after)
+        return attempt_doc(attempt_id, **fields)
+
+    regional = FakeRegional(cpu_python=responder)
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        settings=settings(spec, tmp_path),
+        probes={},
     )
+    return spec.execute(ctx), calls
+
+
+def test_duplicate_event_redelivers_the_same_terminal_and_nothing_changes(
+    tmp_path: Path,
+) -> None:
+    result, calls = _run_duplicate_event(tmp_path)
+    assert result["verdict"] == "PASS", result["errors"]
+    (job,) = FakeJob.created
+    assert job.mode == "exit_once:1" and job.restart_budget == 1, job.mode
+    assert job.name.startswith("gl29de-"), job.name
+    replays = [call for call in calls if call[0] == "replay"]
+    assert replays == [("replay", "gpu-eks-cluster", job.attempt_id)], replays
+    # The redelivery came after the first delivery settled (decision read,
+    # restart copy recorded) and the last read is after it, for both attempts.
+    assert calls.index(replays[0]) > 1, calls
+    assert calls[-1][0] == "attempt" and calls[-1][-1] == result["new_attempt"]
+    assert result["replayed_decision"]["duplicate"] is True
+    assert result["notifications_before"] == 1
+    assert result["stages"]["unchanged"] == []
+    spec = SPECS["duplicate_event"]
+    assert "handle_terminal" in spec.injection and "duplicate=true" in spec.expected
+    assert spec.proof_mode == "native" and spec.approvals == ()
+
+
+@pytest.mark.parametrize(
+    ("overrides", "stage", "needle"),
+    [
+        ({"duplicate": False}, "replay_duplicate", "decided anew"),
+        ({"plan": "plan-2"}, "replay_duplicate", "recovery_plan_id"),
+        ({"after": {"restart_count": 2}}, "budget", "exceeds"),
+        ({"after": {"restart_count": 2}}, "unchanged", "restart_count changed"),
+        (
+            {"after": {"reservations": ["res-9"]}},
+            "unchanged",
+            "reservation_ids changed",
+        ),
+        ({"after": {"restarts": 2}}, "single_restart", "2 restart workflows"),
+        ({"after": {"restarts": 2}}, "unchanged", "RESTART_WORKLOAD workflows after"),
+        (
+            {"after": {"notifications": [notification("n-1"), notification("n-2")]}},
+            "unchanged",
+            "1 new notification(s)",
+        ),
+        ({"after": {"duplicate": True}}, "unchanged", "flagged duplicate"),
+        ({"after": {"decision": "NO_ACTION"}}, "unchanged", "status changed"),
+    ],
+)
+def test_duplicate_event_fails_when_the_redelivery_changed_anything(
+    tmp_path: Path, overrides: dict[str, Any], stage: str, needle: str
+) -> None:
+    result, _calls = _run_duplicate_event(tmp_path, **overrides)
+    assert result["verdict"] == "FAIL", result
+    assert any(needle in error for error in result["stages"][stage]), result["stages"]
+
+
+def test_duplicate_event_is_inconclusive_without_a_recorded_terminal(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(VariantInconclusive, match="could not be replayed"):
+        _run_duplicate_event(tmp_path, refused=True)
+
+
+def test_unchanged_errors_reads_only_the_attempts_own_records() -> None:
+    before = attempt_doc("gl29de-x-a001")
+    same = attempt_doc("gl29de-x-a001")
+    assert replay.unchanged_errors(before, same, "gl29de-x-a001") == []
+    # A notification of another incident is not the attempt's.
+    other = attempt_doc("gl29de-x-a001", notifications=[notification("n-1")])
+    other["attempts"]["gl29de-x-a001"]["notifications"].append(
+        notification("n-7", incident_id="inc-other")
+    )
+    errors = replay.unchanged_errors(before, other, "gl29de-x-a001")
+    assert errors == [
+        "the redelivery produced 1 new notification(s) for the attempt's "
+        "incidents: ['n-7']"
+    ], "the probe already filtered by the attempt's incidents; any new id counts"
+
+
+def test_single_notification(tmp_path: Path) -> None:
     result = _run(
         "single_notification",
         tmp_path,

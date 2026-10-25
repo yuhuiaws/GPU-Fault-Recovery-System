@@ -33,6 +33,13 @@ from the Pod's ``spec.nodeName`` of every terminated critical container
 watcher-observed terminal always carries one; only a hand-made terminal POST
 could lack it, which the spec and the lane rules forbid.
 
+029 ``duplicate_event`` is the same redelivery against the SAME attempt: the
+job fails once (``exit_once``), the product decides, restarts and settles, and
+the recorded terminal is handed to the completion service a second time; the
+product must answer with the original decision flagged ``duplicate=true`` and
+change nothing it keeps -- one decision row, one RESTART_WORKLOAD, one budget
+deduction, no new notification (``general_live_terminal_replay``).
+
 028 ``api_unreachable`` cuts the one completion-watcher Pod off from the
 control plane on its node (``general_live_network_isolation``, tagged FORWARD
 REJECT with a deadman) while a managed job fails, and 029 ``worker_restart``
@@ -69,6 +76,15 @@ from scripts.e2e.regional.general_live_restart_budget import (
     missing_context_errors,
 )
 from scripts.e2e.regional.general_live_store import attempt_records
+from scripts.e2e.regional.general_live_terminal_replay import (
+    WATCHER_PASS_SECONDS,
+    redeliver_terminal,
+    replay_errors,
+    restart_attempt_of,
+    restart_workflows,
+    unchanged_errors,
+    untouched_errors,
+)
 from scripts.e2e.regional.general_live_verdicts import operations, verdict
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
@@ -465,7 +481,7 @@ def user_stop(ctx: VariantContext) -> dict[str, Any]:
         if decision.get("status") == "NO_ACTION"
         else [f"a user stop produced {decision.get('status')}, expected NO_ACTION"],
         "no_recursion": []
-        if not _restart_workflows(entry)
+        if not restart_workflows(entry)
         else ["a restart workflow was created for a user stop"],
     }
     return _result(stages)
@@ -497,68 +513,6 @@ def controller_stop(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
-#: Runs in an API Pod under the product's interpreter: redeliver the product's
-#: own recorded TerminalEvent of a test attempt through the completion
-#: service, exactly as the ``/v1/attempts/terminal`` route does for the
-#: watcher. Refuses an attempt outside the test prefix and one with no
-#: recorded terminal (nothing to replay). One JSON object on the last line.
-TERMINAL_REPLAY_PROBE = r"""
-import json
-import sys
-
-from gpu_fault.app import ApplicationContext
-from gpu_fault.store import NotFoundError
-
-
-
-def main(argv):
-    cluster_id, attempt_id = argv[:2]
-    if not attempt_id.startswith("gl28"):
-        raise ValueError(
-            f"refusing to replay a terminal outside the test prefix: {attempt_id}"
-        )
-    context = ApplicationContext.from_environment()
-    store = context.store
-    try:
-        event = store.get_event_by_attempt(cluster_id, attempt_id)
-    except NotFoundError:
-        return {"attempt_id": attempt_id, "refused": "no recorded terminal event"}
-    before = store.get_decision_by_event(event.event_key)
-    decision = context.completion.handle_terminal(event)
-    return {
-        "attempt_id": attempt_id,
-        "event_key": event.event_key,
-        "terminal_status": event.terminal_status.value,
-        "ended_at": event.ended_at.isoformat(),
-        "before": before.model_dump(mode="json") if before is not None else None,
-        "decision": decision.model_dump(mode="json"),
-    }
-
-
-print(json.dumps(main(sys.argv[1:]), sort_keys=True, default=str))
-"""
-#: The replay probe's test-attempt prefix (every 028 job id starts with it).
-REPLAY_ATTEMPT_PREFIX = "gl28"
-#: One completion-watcher pass, so a restart copy is observed before and after.
-WATCHER_PASS_SECONDS = 60
-
-
-def restart_attempt_of(entry: dict[str, Any]) -> str | None:
-    """The new attempt id the product's RESTART_WORKLOAD recorded, if any."""
-
-    for item in entry.get("recovery") or []:
-        workflow = item.get("workflow") or {}
-        for execution in workflow.get("step_executions") or []:
-            if (
-                execution.get("operation") == "RESTART_WORKLOAD"
-                and execution.get("status") == "SUCCEEDED"
-            ):
-                value = (execution.get("details") or {}).get("restart_attempt_id")
-                if value:
-                    return str(value)
-    return None
-
-
 def _wait_restart_attempt(
     ctx: VariantContext, job: ManagedFailJob, *, name: str
 ) -> tuple[dict[str, Any], str | None]:
@@ -576,34 +530,35 @@ def _wait_restart_attempt(
     return records, restart_attempt_of(_attempt(records, job.attempt_id))
 
 
-def replay_errors(replay: dict[str, Any], original: dict[str, Any]) -> list[str]:
-    """The redelivered terminal came back as the original decision, flagged duplicate."""
+def _settled_first_delivery(
+    ctx: VariantContext, job: ManagedFailJob, *, name: str
+) -> tuple[dict[str, Any], dict[str, Any], str]:
+    """The first attempt's failure decided, restarted and quiet.
 
-    decision = replay.get("decision") or {}
-    errors = []
-    if decision.get("duplicate") is not True:
-        errors.append(
-            "the replayed terminal was decided anew (duplicate is not true): "
-            f"{decision.get('status')} {decision.get('reason')}"
+    Returns the product's records, a copy of the original decision and the
+    restart copy's attempt id once the product's RESTART_WORKLOAD execution
+    recorded it and one watcher pass has gone by -- the baseline a redelivery is
+    judged against. No decision or no restart copy is INCONCLUSIVE: there is
+    nothing to redeliver, or the first delivery has not settled.
+    """
+
+    records = _wait_decision(ctx, job, name=name)
+    original = (_attempt(records, job.attempt_id).get("decision") or {}).copy()
+    if not original:
+        raise VariantInconclusive(
+            "the product reached no decision on the first attempt's failure: "
+            "nothing to replay"
         )
-    for key in ("status", "recovery_plan_id", "event_key"):
-        if decision.get(key) != original.get(key):
-            errors.append(
-                f"the replayed decision's {key} is {decision.get(key)!r}, the "
-                f"original's {original.get(key)!r}"
-            )
-    return errors
-
-
-def untouched_errors(entry: dict[str, Any], attempt_id: str) -> list[str]:
-    """The new attempt has no terminal, decision or containment of its own."""
-
-    return [
-        f"the new attempt {attempt_id} has a {name} after the replay: "
-        f"{str(entry.get(name))[:160]}"
-        for name in ("event", "decision", "containment_incident")
-        if entry.get(name)
-    ]
+    records, new_attempt = _wait_restart_attempt(ctx, job, name=f"{name}-restart")
+    if new_attempt is None:
+        raise VariantInconclusive(
+            "the product's RESTART_WORKLOAD recorded no restart_attempt_id: the "
+            "first delivery has not settled, and there is no new attempt for the "
+            "replayed terminal to leave alone"
+        )
+    ctx.evidence.write("restart-attempt", {"old": job.attempt_id, "new": new_attempt})
+    ctx.hold(WATCHER_PASS_SECONDS, name="new-attempt-running")
+    return records, original, new_attempt
 
 
 def old_terminal(ctx: VariantContext) -> dict[str, Any]:
@@ -619,33 +574,10 @@ def old_terminal(ctx: VariantContext) -> dict[str, Any]:
     """
 
     job = _job(ctx, "gl28ot-" + _suffix(ctx), "exit_once:1", restart_budget=1)
-    records = _wait_decision(ctx, job, name="old-terminal")
-    original = (_attempt(records, job.attempt_id).get("decision") or {}).copy()
-    if not original:
-        raise VariantInconclusive(
-            "the product reached no decision on the first attempt's failure: "
-            "nothing to replay"
-        )
-    records, new_attempt = _wait_restart_attempt(ctx, job, name="old-terminal-restart")
-    if new_attempt is None:
-        raise VariantInconclusive(
-            "the product's RESTART_WORKLOAD recorded no restart_attempt_id: there is "
-            "no new attempt for the replayed terminal to leave alone"
-        )
-    ctx.evidence.write("restart-attempt", {"old": job.attempt_id, "new": new_attempt})
-    ctx.hold(WATCHER_PASS_SECONDS, name="new-attempt-running")
-    replay = ctx.regional.cpu_python(
-        TERMINAL_REPLAY_PROBE,
-        ctx.settings.regional.cluster_id,
-        job.attempt_id,
-        attempts=1,
-        timeout=240,
+    _records_before, original, new_attempt = _settled_first_delivery(
+        ctx, job, name="old-terminal"
     )
-    ctx.evidence.write("terminal-replay", replay)
-    if replay.get("refused"):
-        raise VariantInconclusive(
-            f"the terminal of {job.attempt_id} could not be replayed: {replay['refused']}"
-        )
+    replay = redeliver_terminal(ctx, job.attempt_id)
     ctx.hold(WATCHER_PASS_SECONDS, name="after-replay")
     after = attempt_records(
         ctx.regional,
@@ -657,9 +589,9 @@ def old_terminal(ctx: VariantContext) -> dict[str, Any]:
     stages = {
         "replay_duplicate": replay_errors(replay, original),
         "single_restart": []
-        if len(_restart_workflows(old_entry)) == 1
+        if len(restart_workflows(old_entry)) == 1
         else [
-            f"{len(_restart_workflows(old_entry))} restart workflows for the old "
+            f"{len(restart_workflows(old_entry))} restart workflows for the old "
             "attempt after the replay, expected exactly one"
         ],
         "budget": _budget_errors(after, consumed=1),
@@ -959,20 +891,64 @@ def restart_withheld(ctx: VariantContext) -> dict[str, Any]:
 
 
 def duplicate_event(ctx: VariantContext) -> dict[str, Any]:
-    job = _job(ctx, "gl29de-" + _suffix(ctx), "exit:1", restart_budget=1)
-    records = _wait_decision(ctx, job, name="duplicate-event")
-    # The completion decision is keyed by the event; a redelivery returns the
-    # same decision with duplicate=true and does not deduct again.
-    stages = {"budget": _budget_errors(records, consumed=1, non_negative=True)}
-    entry = _attempt(records, job.attempt_id)
-    decision = entry.get("decision") or {}
-    if decision and decision.get("duplicate") not in (None, False, True):
-        stages["duplicate_flag"] = ["decision duplicate flag is malformed"]
+    """The same terminal delivered twice: one decision, one deduction, one notice.
+
+    The job fails once (``exit_once``) and the product decides, restarts it and
+    settles (the restart copy keeps running, so nothing else moves the
+    records). The product's own recorded terminal of that attempt is then
+    handed to ``CompletionService.handle_terminal`` a second time. The
+    completion decision is keyed by the event, so the redelivery must come back
+    as the original decision flagged ``duplicate=true``, and one watcher pass
+    later the product's records must be what they were before it: the stored
+    decision row unchanged (not rewritten as a duplicate), exactly one
+    RESTART_WORKLOAD workflow, the budget ledger at one deduction with the same
+    reservation ids, and no new notification for the attempt's incidents.
+    """
+
+    job = _job(ctx, "gl29de-" + _suffix(ctx), "exit_once:1", restart_budget=1)
+    before, original, new_attempt = _settled_first_delivery(
+        ctx, job, name="duplicate-event"
+    )
+    replay = redeliver_terminal(ctx, job.attempt_id)
+    ctx.hold(WATCHER_PASS_SECONDS, name="after-redelivery")
+    after = attempt_records(
+        ctx.regional,
+        ctx.settings.regional.cluster_id,
+        job.name,
+        [job.attempt_id, new_attempt],
+    )
+    entry = _attempt(after, job.attempt_id)
+    stages = {
+        "replay_duplicate": replay_errors(replay, original),
+        "single_restart": []
+        if len(restart_workflows(entry)) == 1
+        else [
+            f"{len(restart_workflows(entry))} restart workflows for the attempt "
+            "after the redelivery, expected exactly one"
+        ],
+        "budget": _budget_errors(after, consumed=1, non_negative=True),
+        "unchanged": unchanged_errors(before, after, job.attempt_id),
+        "new_attempt_untouched": untouched_errors(
+            _attempt(after, new_attempt), new_attempt
+        ),
+    }
     return _result(
         stages,
         notes=[
-            "a redelivered terminal returns the same decision (duplicate=true), no second deduction"
+            "the product's own recorded terminal was redelivered through "
+            "CompletionService.handle_terminal after the first delivery settled; "
+            "the answer is the original decision with duplicate=true, and the "
+            "decision row, restart workflow, budget ledger and notifications are "
+            "unchanged (one decision, one deduction, one notification)"
         ],
+        extra={
+            "attempt": job.attempt_id,
+            "new_attempt": new_attempt,
+            "replayed_decision": replay.get("decision"),
+            "notifications_before": len(
+                _attempt(before, job.attempt_id).get("notifications") or []
+            ),
+        },
     )
 
 
@@ -1146,14 +1122,6 @@ def _stop_then_restart_errors(entry: dict[str, Any]) -> list[str]:
     if recovery and "RESTART_WORKLOAD" not in restart_ops:
         errors.append("the recovery workflow did not plan RESTART_WORKLOAD")
     return errors
-
-
-def _restart_workflows(entry: dict[str, Any]) -> list[dict[str, Any]]:
-    return [
-        item
-        for item in entry.get("recovery") or []
-        if "RESTART_WORKLOAD" in operations(item.get("workflow") or {})
-    ]
 
 
 def _withheld_errors(entry: dict[str, Any]) -> list[str]:
@@ -1431,9 +1399,18 @@ VARIANTS = [
     _spec(
         CASE_029,
         "duplicate_event",
-        "redeliver the same terminal event",
-        "the same decision is returned (duplicate=true); no second budget deduction",
+        "the job's first attempt exits non-zero (exit_once) and the product restarts "
+        "it once; after the restart copy is observed running, the product's recorded "
+        "terminal of that attempt is redelivered through "
+        "CompletionService.handle_terminal in an API Pod (the same terminal twice)",
+        "the redelivery is the original decision with duplicate=true; afterwards the "
+        "stored decision row, the one RESTART_WORKLOAD workflow, the budget ledger "
+        "(restart_count 1, same reservation ids) and the attempt's notifications are "
+        "unchanged: one decision, one deduction, one notification; the restart copy "
+        "is untouched",
         duplicate_event,
+        risk="L",
+        max_minutes=30,
     ),
     VariantSpec(
         case_id=CASE_029,
