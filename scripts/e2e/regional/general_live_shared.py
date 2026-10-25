@@ -32,10 +32,21 @@ handles. Verdicts read only the product's records; the probe's bounded
 ``--forget``: the mount point directory stays, which is exactly the condition
 the product must report; ``nfs-remount`` is the recovery, and the LIFO
 cleanup's ``cleanup --kind nfs-<name>`` removes the directory, so the product
-forgets the mount once the variant is over. The remaining expected FAIL
-(product gap, registered as such) is ``shared_failure_domain`` -- two nodes on
-one export mint two independent node incidents and nothing records the common
-failure domain.
+forgets the mount once the variant is over.
+
+``shared_failure_domain`` reads the record batch 177 added
+(``shared_storage_failure_domain.SharedStorageFailureDomainCorrelator``): when
+two nodes report the same export (the ``source`` label batch 176 put on every
+shared sample; the mount point is deliberately no identity) unavailable within
+600 s, the control plane records one cluster-scoped incident
+``event_type=SHARED_STORAGE_FAILURE_DOMAIN`` with
+``policy_reference=shared-filesystem:<export>``, both nodes in ``node_ids``,
+reasons naming the export, the nodes and every member's per-node incident, no
+workflow and no action; each per-node incident gains one ``common failure
+domain <id>`` reason, exactly one ``SHARED_STORAGE_FAILURE_DOMAIN`` notification
+goes out, both per-node chains stay diagnostic-only, and the record clears
+RECOVERED once both nodes report the export available again. Both clients must
+see the same export ``source`` before the hang, else the variant is NOT_READY.
 """
 
 from __future__ import annotations
@@ -72,6 +83,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     samples,
     settled,
     verdict,
+    workflows_of,
 )
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from scripts.e2e.regional.shared_export_fixture import (
@@ -98,13 +110,12 @@ FORBIDDEN = ISOLATION | HARDWARE_OPERATIONS
 #: The ``failure_mode`` label the product puts on each unavailable reading.
 MODE_MOUNT_MISSING = "MOUNT_MISSING"
 IO_MODES = frozenset({"IO_ERROR", "IO_TIMEOUT"})
-GAP_FAILURE_DOMAIN = (
-    "host_health.py grades each node's shared_filesystem_unavailable reading into "
-    "its own NODE_HEALTH incident; no component correlates the same export path "
-    "across nodes into a common failure-domain record (one incident naming both "
-    "nodes, or a marker/notification of the shared export), so two task nodes on "
-    "one hung export are two unrelated node diagnoses"
-)
+#: The cluster-scoped failure-domain record and its notification
+#: (``shared_storage_failure_domain.py``, batch 177).
+DOMAIN_EVENT_TYPE = "SHARED_STORAGE_FAILURE_DOMAIN"
+DOMAIN_NOTIFICATION_CATEGORY = "SHARED_STORAGE_FAILURE_DOMAIN"
+DOMAIN_REFERENCE_PREFIX = "shared-filesystem:"
+DOMAIN_BACK_REFERENCE = "common failure domain "
 
 
 # --------------------------------------------------------------------------- #
@@ -581,27 +592,161 @@ def export_source_errors(
     return []
 
 
-def common_domain_errors(
-    activities: dict[str, dict[str, Any]], nodes: tuple[str, str], mount: str
-) -> list[str]:
-    """Some product record ties both nodes' export failures together."""
+def export_sources(activity: dict[str, Any], mount: str) -> set[str]:
+    """The ``source`` labels the product's shared samples of ``mount`` carry."""
 
-    wanted = set(nodes)
+    return {
+        str(sample["labels"]["source"])
+        for sample in samples(activity, UNAVAILABLE, device=mount)
+        if isinstance(sample.get("labels"), dict) and sample["labels"].get("source")
+    }
+
+
+def require_same_export(baselines: dict[str, dict[str, Any]], mount: str) -> str:
+    """Both clients report one and the same export ``source``, or NOT_READY.
+
+    The failure-domain correlation keys on the collector's ``source`` label
+    (batch 176); a node whose samples carry none, or two nodes naming different
+    sources, cannot form a domain and the injection would prove nothing.
+    """
+
+    seen = {
+        node: export_sources(activity, mount) for node, activity in baselines.items()
+    }
+    missing = sorted(node for node, sources in seen.items() if not sources)
+    if missing:
+        raise VariantNotRun(
+            "FIXTURE_NOT_READY",
+            f"the shared samples of {mount} on {', '.join(missing)} carry no source "
+            "label; the control plane cannot correlate a failure domain without it",
+        )
+    common = set.intersection(*seen.values())
+    if len(common) != 1 or any(len(sources) != 1 for sources in seen.values()):
+        raise VariantNotRun(
+            "FIXTURE_NOT_READY",
+            f"the clients do not see one and the same export source for {mount}: "
+            + "; ".join(
+                f"{node} {sorted(sources)}" for node, sources in sorted(seen.items())
+            ),
+        )
+    return common.pop()
+
+
+def domain_records(
+    activities: dict[str, dict[str, Any]], export: str
+) -> list[dict[str, Any]]:
+    """The failure-domain incidents of ``export`` across the nodes' reads, once each."""
+
+    found: dict[str, dict[str, Any]] = {}
     for activity in activities.values():
         for incident in activity.get("incidents") or []:
-            if wanted <= set(incident.get("node_ids") or []):
-                return []
-        for record in [
-            *(activity.get("markers") or []),
-            *(activity.get("notifications") or []),
-        ]:
-            text = str(record)
-            if all(node in text for node in nodes) and mount in text:
-                return []
-    return [
-        f"no incident, marker or notification names both {nodes[0]} and {nodes[1]} "
-        f"for the shared export {mount}: two unrelated node diagnoses"
-    ]
+            if (
+                incident.get("event_type") == DOMAIN_EVENT_TYPE
+                and incident.get("policy_reference")
+                == f"{DOMAIN_REFERENCE_PREFIX}{export}"
+            ):
+                found[str(incident.get("incident_id"))] = incident
+    return [found[key] for key in sorted(found)]
+
+
+def failure_domain_errors(
+    activities: dict[str, dict[str, Any]],
+    nodes: tuple[str, str],
+    export: str,
+    node_incidents: dict[str, list[str]],
+) -> list[str]:
+    """One failure-domain record ties both nodes' export failures together.
+
+    ``node_incidents`` maps each node to the ids of its own
+    ``shared_filesystem_unavailable`` incidents. The record must name the
+    export (``policy_reference``), both nodes, every member's incident, carry
+    no workflow and no action; each per-node incident must point back at it;
+    and exactly one SHARED_STORAGE_FAILURE_DOMAIN notification must exist.
+    """
+
+    records = domain_records(activities, export)
+    if not records:
+        return [
+            f"no {DOMAIN_EVENT_TYPE} incident with policy_reference "
+            f"{DOMAIN_REFERENCE_PREFIX}{export} names the export: two unrelated node "
+            "diagnoses"
+        ]
+    errors: list[str] = []
+    if len(records) > 1:
+        errors.append(
+            f"{len(records)} {DOMAIN_EVENT_TYPE} records for {export}: "
+            + ", ".join(str(item.get("incident_id")) for item in records)
+        )
+    domain = records[0]
+    domain_id = str(domain.get("incident_id"))
+    members = set(domain.get("node_ids") or [])
+    absent = sorted(set(nodes) - members)
+    if absent:
+        errors.append(f"the failure-domain record {domain_id} does not name {absent}")
+    if domain.get("effective_action") or domain.get("workflow_request_id"):
+        errors.append(
+            f"the failure-domain record {domain_id} carries an action/workflow "
+            f"({domain.get('effective_action')} / {domain.get('workflow_request_id')}): "
+            "it must be a record, never a chain"
+        )
+    for activity in activities.values():
+        for workflow in workflows_of(activity, domain_id):
+            errors.append(
+                f"workflow {workflow.get('request_id')} planned on the failure-domain record"
+            )
+    reasons = [str(item) for item in domain.get("reasons") or []]
+    first = reasons[0] if reasons else ""
+    if export not in first or not all(node in first for node in nodes):
+        errors.append(
+            f"the first reason of {domain_id} does not name the export and both nodes: "
+            f"{first[:200]!r}"
+        )
+    joined = "\n".join(reasons)
+    for node in nodes:
+        ids = node_incidents.get(node) or []
+        if not ids:
+            errors.append(f"{node} has no {UNAVAILABLE} incident to be a member with")
+        elif not any(
+            f"member {node}: incident {incident_id}" in joined for incident_id in ids
+        ):
+            errors.append(
+                f"the record {domain_id} names no member line for {node} with its "
+                f"incident ({ids})"
+            )
+    for node in nodes:
+        activity = activities.get(node) or {}
+        for incident in activity.get("incidents") or []:
+            if str(incident.get("incident_id")) not in (node_incidents.get(node) or []):
+                continue
+            prefix = f"{DOMAIN_BACK_REFERENCE}{domain_id}:"
+            if not any(
+                str(item).startswith(prefix) for item in incident.get("reasons") or []
+            ):
+                errors.append(
+                    f"{node}'s incident {incident.get('incident_id')} carries no "
+                    f"'{prefix}' reason back to the record"
+                )
+    mails: dict[str, dict[str, Any]] = {}
+    for activity in activities.values():
+        for item in activity.get("notifications") or []:
+            if (
+                item.get("category") == DOMAIN_NOTIFICATION_CATEGORY
+                and item.get("incident_id") == domain_id
+            ):
+                mails[str(item.get("notification_id"))] = item
+    if len(mails) != 1:
+        errors.append(
+            f"{len(mails)} {DOMAIN_NOTIFICATION_CATEGORY} notification(s) for the record "
+            f"{domain_id}, expected exactly one"
+        )
+    return errors
+
+
+def domain_state(activity: dict[str, Any], domain_id: str) -> str | None:
+    for incident in activity.get("incidents") or []:
+        if str(incident.get("incident_id")) == domain_id:
+            return str(incident.get("state"))
+    return None
 
 
 def _incident_ids(activity: dict[str, Any], metric: str, mount: str) -> list[str]:
@@ -953,6 +1098,29 @@ def recovery(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+def _await_domain_recovered(
+    ctx: VariantContext, node: str, since: datetime, domain_id: str
+) -> list[str]:
+    """The failure-domain record cleared RECOVERED once both nodes reported 0."""
+
+    def accept() -> str | None:
+        state = domain_state(_activity(ctx, node, since), domain_id)
+        return state if state == "RECOVERED" else None
+
+    value = ctx.wait_until(
+        accept,
+        timeout_seconds=ctx.host_summary * 2 + ctx.host_interval * 6,
+        poll_seconds=ctx.host_interval,
+        name="domain-recovered",
+    )
+    if value is None:
+        return [
+            f"the failure-domain record {domain_id} did not clear RECOVERED after both "
+            "nodes reported the export available again"
+        ]
+    return []
+
+
 def shared_failure_domain(ctx: VariantContext) -> dict[str, Any]:
     node = ctx.settings.node
     peer = _require_peer(ctx)
@@ -963,10 +1131,12 @@ def shared_failure_domain(ctx: VariantContext) -> dict[str, Any]:
     mount_export(ctx, server, node, PRIMARY)
     mount_export(ctx, server, peer, PRIMARY)
     mount = mount_path(ctx, PRIMARY)
+    baselines = {}
     for client in (node, peer):
-        ctx.evidence.write(
-            f"baseline-{client}", await_baseline(ctx, client, mount, since)
-        )
+        baselines[client] = await_baseline(ctx, client, mount, since)
+        ctx.evidence.write(f"baseline-{client}", baselines[client])
+    export = require_same_export(baselines, mount)
+    ctx.evidence.write("export-identity", {"source": export, "mount": mount})
     started = utc_now()
     _pause(ctx, server, "a")
     readings = {client: _stat(ctx, client, PRIMARY) for client in (node, peer)}
@@ -975,8 +1145,8 @@ def shared_failure_domain(ctx: VariantContext) -> dict[str, Any]:
         raise VariantInconclusive(
             f"the paused export still answered on a client: {readings}"
         )
-    activities = {
-        client: wait_finding(
+    for client in (node, peer):
+        wait_finding(
             ctx,
             client,
             started,
@@ -985,24 +1155,49 @@ def shared_failure_domain(ctx: VariantContext) -> dict[str, Any]:
             timeout_seconds=DETECTION_BUDGET,
             name=f"domain-detection-{client}",
         )
-        for client in (node, peer)
+    # Both findings exist (or the budget ran out): read both nodes again so the
+    # record the second activation created is in both views.
+    activities = {
+        client: _activity(ctx, client, started, mount=mount) for client in (node, peer)
+    }
+    node_incidents = {
+        client: _incident_ids(activity, UNAVAILABLE, mount)
+        for client, activity in activities.items()
     }
     stages: dict[str, list[str]] = {}
     for client, activity in activities.items():
         stages[f"chain@{client}"] = diagnostic_chain(activity, UNAVAILABLE, mount)
         stages[f"hardware@{client}"] = hardware_errors(activity)
-    stages["common_failure_domain"] = common_domain_errors(
-        activities, (node, peer), mount
+    stages["common_failure_domain"] = failure_domain_errors(
+        activities, (node, peer), export, node_incidents
     )
+    records = domain_records(activities, export)
     _resume(ctx, server, "a")
     resumed_at = utc_now()
     for client, activity in activities.items():
         recovered = await_clear(ctx, client, mount, resumed_at)
         stages[f"recovery@{client}"] = list(recovered["errors"])
-        wait_all_settled(
-            ctx, client, started, _incident_ids(activity, UNAVAILABLE, mount)
-        )
-    return _result(stages, extra={"mount": mount, "nodes": [node, peer]})
+        wait_all_settled(ctx, client, started, node_incidents[client])
+    stages["domain_recovered"] = (
+        _await_domain_recovered(ctx, node, started, str(records[0]["incident_id"]))
+        if records
+        else []
+    )
+    return _result(
+        stages,
+        notes=[
+            "the per-node chains stay diagnostic-only; the cluster-scoped record names "
+            "the export, both nodes and their incidents, carries no action and clears "
+            "once both nodes report the export available",
+        ],
+        extra={
+            "mount": mount,
+            "export": export,
+            "nodes": [node, peer],
+            "domain_records": [str(item.get("incident_id")) for item in records],
+            "node_incidents": node_incidents,
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1112,15 +1307,17 @@ VARIANTS = [
     ),
     _spec(
         "shared_failure_domain",
-        "two task nodes (--fault-node, --node-b) mount one test export; SIGSTOP it",
-        "both nodes mint a diagnostic-only chain and a product record names the common "
-        "failure domain (one incident with both nodes, or a marker/notification of the "
-        "export); neither node is isolated or treated as bad hardware",
+        "two task nodes (--fault-node, --node-b) mount one test export whose source "
+        "both report alike; SIGSTOP it",
+        "both nodes mint a diagnostic-only chain; one cluster-scoped "
+        f"{DOMAIN_EVENT_TYPE} incident (policy_reference shared-filesystem:<export>, "
+        "both nodes, reasons naming the export, the nodes and each node's incident, no "
+        "workflow or action) with each per-node incident pointing back at it and exactly "
+        f"one {DOMAIN_NOTIFICATION_CATEGORY} notification; the record clears RECOVERED "
+        "once both nodes report 0; neither node is isolated or treated as bad hardware",
         shared_failure_domain,
         max_minutes=45,
         flags="X",
-        outcome="FAIL",
-        gap=GAP_FAILURE_DOMAIN,
         preflight=_pair_preflight,
         cleanup="resume, unmount both nodes, delete the export",
     ),

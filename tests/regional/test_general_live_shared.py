@@ -238,33 +238,46 @@ def hang_activity(
     companion: bool = True,
     node_ids: list[str] | None = None,
     labels: dict[str, str] | None = None,
+    source: str | None = None,
+    domain: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Baseline, the fault (two batches, ``labels`` on them), the recovery readings."""
+    """Baseline, the fault (two batches, ``labels`` on them), the recovery readings.
+
+    ``source`` puts the collector's export label on every shared sample of the
+    mount (batch 176); ``domain`` adds a failure-domain record as ``failure_domain``
+    builds it, its back-reference on the node's incident and its notification.
+    """
 
     companion_sample = (
         [sample(shared.COMPANION_METRIC, None, 40.0)] if companion else []
     )
     other_samples = [sample(shared.UNAVAILABLE, other, 0.0)] if other else []
+    identity = {"source": source, "fstype": "nfs4"} if source else {}
+    fault_labels = {**identity, **(labels or {})}
     batches = [
         batch(
-            0, sample(shared.UNAVAILABLE, mount, 0.0), sample(shared.USED, mount, 2.0)
+            0,
+            sample(shared.UNAVAILABLE, mount, 0.0, identity),
+            sample(shared.USED, mount, 2.0, identity),
         ),
         batch(
             2,
-            sample(shared.UNAVAILABLE, mount, 1.0, labels),
+            sample(shared.UNAVAILABLE, mount, 1.0, fault_labels),
             *companion_sample,
             *other_samples,
         ),
         batch(
             3,
-            sample(shared.UNAVAILABLE, mount, 1.0, labels),
+            sample(shared.UNAVAILABLE, mount, 1.0, fault_labels),
             *companion_sample,
             *other_samples,
         ),
         batch(
-            9, sample(shared.UNAVAILABLE, mount, 0.0), sample(shared.USED, mount, 2.0)
+            9,
+            sample(shared.UNAVAILABLE, mount, 0.0, identity),
+            sample(shared.USED, mount, 2.0, identity),
         ),
-        batch(10, sample(shared.UNAVAILABLE, mount, 0.0)),
+        batch(10, sample(shared.UNAVAILABLE, mount, 0.0, identity)),
     ]
     document: dict[str, Any] = {
         "incidents": [],
@@ -281,7 +294,87 @@ def hang_activity(
             chain["incident"]["node_ids"] = node_ids
         document["incidents"] = [chain["incident"]]
         document["workflows"] = [chain["workflow"]]
+        if domain is not None:
+            record = domain["record"]
+            if domain.get("back_reference", True):
+                chain["incident"]["reasons"].append(
+                    f"common failure domain {record['incident_id']}: shared filesystem "
+                    f"{domain['export']} is unavailable on other nodes as well "
+                    "(shared-storage outage, not a node fault)"
+                )
+            document["incidents"].append(record)
+            document["workflows"] += domain.get("workflows", [])
+            document["notifications"] = list(domain.get("notifications", []))
     return document
+
+
+def failure_domain(
+    export: str,
+    *,
+    nodes: tuple[str, ...] = (NODE, PEER),
+    state: str = "RECOVERED",
+    action: str | None = None,
+    workflow_id: str | None = None,
+    notifications: int = 1,
+    first_reason: str | None = None,
+    members: bool = True,
+    back_reference: bool = True,
+) -> dict[str, Any]:
+    """The record batch 177 writes for ``export`` on ``nodes``, and its mail."""
+
+    domain_id = "inc-domain-1"
+    reasons = [
+        first_reason
+        if first_reason is not None
+        else (
+            f"common failure domain: shared filesystem {export} unavailable on "
+            f"{len(nodes)} nodes ({', '.join(nodes)}); a shared-storage outage, not a "
+            "per-node hardware fault"
+        )
+    ]
+    if members:
+        reasons += [
+            f"member {node}: incident inc-{node[-3:]} ({shared.UNAVAILABLE} on /m, "
+            "observed 2026-10-25T00:00:00+00:00)"
+            for node in nodes
+        ]
+    record = {
+        "incident_id": domain_id,
+        "event_id": "shared-storage-failure-domain-x",
+        "event_type": shared.DOMAIN_EVENT_TYPE,
+        "event_source": shared.UNAVAILABLE,
+        "cluster_id": "gpu-eks-cluster",
+        "node_ids": list(nodes),
+        "policy_source": "SITE_SHARED_STORAGE_FAILURE_DOMAIN",
+        "policy_reference": f"shared-filesystem:{export}",
+        "effective_action": action,
+        "state": state,
+        "reasons": reasons,
+        "workflow_request_id": workflow_id,
+        "created_at": at(2.5),
+    }
+    workflows = (
+        [workflow(workflow_id, domain_id, ["FREEZE_EVIDENCE"])] if workflow_id else []
+    )
+    mails = [
+        {
+            "notification_id": f"ntf-domain-{index}",
+            "incident_id": domain_id,
+            "category": shared.DOMAIN_NOTIFICATION_CATEGORY,
+            "deduplication_key": f"shared-storage-failure-domain/{index}",
+            "created_at": at(2.5),
+            "subject": f"[GPU fault shared storage] {export} unavailable on 2 nodes",
+            "status": "SENT",
+        }
+        for index in range(notifications)
+    ]
+    return {
+        "record": record,
+        "export": export,
+        "workflows": workflows,
+        "notifications": mails,
+        "back_reference": back_reference,
+    }
 
 
 def quiet_activity(mount: str) -> dict[str, Any]:
@@ -347,13 +440,12 @@ def test_every_005_variant_is_native_both_lanes_behind_kernel_module_load() -> N
     gaps = {
         name: spec for name, spec in SPECS.items() if spec.expected_outcome == "FAIL"
     }
-    assert set(gaps) == {"shared_failure_domain"}, (
-        "mount_disappears and io_only_failure are closed in the product"
+    assert gaps == {}, "batches 176/177 closed every 005 product gap"
+    assert all(spec.product_gap == "" for spec in SPECS.values()), (
+        "no 005 variant carries a product gap"
     )
-    assert "host_health.py" in gaps["shared_failure_domain"].product_gap
-    for name in ("mount_disappears", "io_only_failure"):
-        assert SPECS[name].product_gap == "", name
     assert SPECS["shared_failure_domain"].flags == "X", "both lane locks on EKS"
+    assert shared.DOMAIN_EVENT_TYPE in SPECS["shared_failure_domain"].expected
     assert all(
         spec.flags == "S"
         for name, spec in SPECS.items()
@@ -735,30 +827,66 @@ def test_io_only_failure_is_inconclusive_when_io_still_works(tmp_path: Path) -> 
     assert servers_by_suffix()["a"].mode == "1777", "mode restored on the way out"
 
 
-def test_shared_failure_domain_needs_two_clients_and_records_the_gap(
+def _pair_context(tmp_path: Path, build) -> Any:
+    """A two-client context whose per-node reads come from ``build(node, mount)``."""
+
+    ctx = context("shared_failure_domain", tmp_path, activity=None, peer=PEER)
+    mount = shared.mount_path(ctx, shared.PRIMARY)
+
+    def per_node(arguments: tuple[str, ...]) -> dict[str, Any]:
+        return build(arguments[1], mount)
+
+    ctx.regional.cpu_python_responder = store_script({"activity": per_node})
+    return ctx
+
+
+def test_shared_failure_domain_needs_two_clients_with_one_export_source(
     tmp_path: Path,
 ) -> None:
     spec = SPECS["shared_failure_domain"]
     with pytest.raises(VariantNotRun, match="node-b"):
         spec.execute(context("shared_failure_domain", tmp_path, activity=None))
-    ctx = context("shared_failure_domain", tmp_path, activity=None, peer=PEER)
-    mount = shared.mount_path(ctx, shared.PRIMARY)
+    # No source label on the peer: nothing the control plane could correlate.
+    ctx = _pair_context(
+        tmp_path,
+        lambda node, mount: hang_activity(
+            mount, node=node, source=export_source() if node == NODE else None
+        ),
+    )
+    with pytest.raises(VariantNotRun, match="no source label"):
+        spec.execute(ctx)
+    # Two different sources: not one export.
+    ctx = _pair_context(
+        tmp_path,
+        lambda node, mount: hang_activity(
+            mount, node=node, source=f"10.0.9.{1 if node == NODE else 2}:/a"
+        ),
+    )
+    with pytest.raises(VariantNotRun, match="one and the same export source"):
+        spec.execute(ctx)
+    assert servers_by_suffix()["a"].calls == ["create", "wait_ready"], (
+        "refused before the export was paused"
+    )
 
-    def per_node(arguments: tuple[str, ...]) -> dict[str, Any]:
-        node = arguments[1]
-        return hang_activity(mount, node=node)
 
-    ctx.regional.cpu_python_responder = store_script({"activity": per_node})
+def test_shared_failure_domain_fails_on_two_unrelated_node_diagnoses(
+    tmp_path: Path,
+) -> None:
+    spec = SPECS["shared_failure_domain"]
+    ctx = _pair_context(
+        tmp_path,
+        lambda node, mount: hang_activity(mount, node=node, source=export_source()),
+    )
     result = spec.execute(ctx)
     assert result["verdict"] == "FAIL", result
     assert (
         result["stages"][f"chain@{NODE}"] == []
         and result["stages"][f"chain@{PEER}"] == []
     )
-    assert any(
-        "common failure" in error or "two unrelated" in error
-        for error in result["errors"]
-    ), result["errors"]
+    assert any("two unrelated node diagnoses" in error for error in result["errors"]), (
+        result["errors"]
+    )
+    assert result["export"] == export_source() and result["domain_records"] == []
     server = servers_by_suffix()["a"]
     assert server.settings.avoid_nodes == (NODE, PEER), server.settings
     assert server.calls == ["create", "wait_ready", "pause", "resume"], server.calls
@@ -772,18 +900,62 @@ def test_shared_failure_domain_needs_two_clients_and_records_the_gap(
     ], ctx.cleanup.pending()
 
 
-def test_shared_failure_domain_passes_when_one_incident_names_both_nodes(
-    tmp_path: Path,
-) -> None:
-    ctx = context("shared_failure_domain", tmp_path, activity=None, peer=PEER)
-    mount = shared.mount_path(ctx, shared.PRIMARY)
-
-    def per_node(arguments: tuple[str, ...]) -> dict[str, Any]:
-        return hang_activity(mount, node=arguments[1], node_ids=[NODE, PEER])
-
-    ctx.regional.cpu_python_responder = store_script({"activity": per_node})
-    result = SPECS["shared_failure_domain"].execute(ctx)
+def test_shared_failure_domain_passes_on_the_designed_record(tmp_path: Path) -> None:
+    spec = SPECS["shared_failure_domain"]
+    ctx = _pair_context(
+        tmp_path,
+        lambda node, mount: hang_activity(
+            mount,
+            node=node,
+            source=export_source(),
+            domain=failure_domain(export_source()),
+        ),
+    )
+    result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
+    assert result["domain_records"] == ["inc-domain-1"]
+    assert result["stages"]["domain_recovered"] == [], result["stages"]
+    assert spec.expected_outcome == "PASS" and spec.product_gap == ""
+
+
+@pytest.mark.parametrize(
+    ("domain", "needle"),
+    [
+        (lambda e: failure_domain(e, nodes=(NODE,)), "does not name"),
+        (lambda e: failure_domain(e, action="COLLECT_EVIDENCE"), "action/workflow"),
+        (
+            lambda e: failure_domain(e, workflow_id="wf-domain"),
+            "planned on the failure-domain",
+        ),
+        (lambda e: failure_domain(e, notifications=0), "expected exactly one"),
+        (lambda e: failure_domain(e, notifications=2), "expected exactly one"),
+        (
+            lambda e: failure_domain(e, first_reason="shared storage outage"),
+            "first reason",
+        ),
+        (lambda e: failure_domain(e, members=False), "no member line"),
+        (
+            lambda e: failure_domain(e, back_reference=False),
+            "reason back to the record",
+        ),
+        (lambda e: failure_domain(e, state="DETECTED"), "did not clear RECOVERED"),
+    ],
+)
+def test_shared_failure_domain_fails_when_the_record_is_not_the_designed_one(
+    tmp_path: Path, domain, needle: str
+) -> None:
+    ctx = _pair_context(
+        tmp_path,
+        lambda node, mount: hang_activity(
+            mount, node=node, source=export_source(), domain=domain(export_source())
+        ),
+    )
+    result = SPECS["shared_failure_domain"].execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any(needle in error for error in result["errors"]), (
+        needle,
+        result["errors"],
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -868,19 +1040,33 @@ def test_recovery_fails_without_real_io_after_the_resume(tmp_path: Path) -> None
 # --------------------------------------------------------------------------- #
 # verdict helpers
 # --------------------------------------------------------------------------- #
-def test_common_domain_errors_accepts_a_marker_naming_both_nodes_and_the_export() -> (
-    None
-):
+def test_failure_domain_errors_read_one_record_from_both_nodes_once() -> None:
+    export = "10.0.9.1:/a"
     mount = "/mnt/gfrs-live/abc/shared"
     activities = {
-        NODE: {"incidents": [], "markers": [{"text": f"{NODE} {PEER} {mount}"}]},
-        PEER: {"incidents": []},
+        node: hang_activity(
+            mount, node=node, source=export, domain=failure_domain(export)
+        )
+        for node in (NODE, PEER)
     }
-    assert shared.common_domain_errors(activities, (NODE, PEER), mount) == []
-    activities[NODE]["markers"] = [{"text": f"{NODE} only {mount}"}]
-    assert shared.common_domain_errors(activities, (NODE, PEER), mount), (
-        "one node is not a domain"
+    ids = {node: [f"inc-{node[-3:]}"] for node in (NODE, PEER)}
+    assert shared.failure_domain_errors(activities, (NODE, PEER), export, ids) == []
+    assert len(shared.domain_records(activities, export)) == 1, (
+        "the record both nodes list is counted once"
     )
+    assert shared.domain_records(activities, "10.0.9.2:/a") == [], (
+        "another export's record does not count"
+    )
+    missing = {NODE: [], PEER: ids[PEER]}
+    assert any(
+        "has no shared_filesystem_unavailable incident" in error
+        for error in shared.failure_domain_errors(
+            activities, (NODE, PEER), export, missing
+        )
+    ), "a node without its own incident cannot be a member"
+    assert shared.export_sources(activities[NODE], mount) == {export}
+    assert shared.require_same_export(activities, mount) == export
+    assert shared.domain_state(activities[NODE], "inc-domain-1") == "RECOVERED"
 
 
 def test_delivery_errors_need_two_batches_with_the_companion_metric() -> None:
