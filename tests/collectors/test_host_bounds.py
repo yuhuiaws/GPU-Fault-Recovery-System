@@ -143,10 +143,17 @@ def _blocking_statvfs(released: threading.Event):
 
 
 def _fake_mountinfo(monkeypatch: pytest.MonkeyPatch, text: str) -> None:
+    """The collector's mount table, and PID 1's: one namespace, so one table.
+
+    ``_filesystems`` compares its own table with the host's (PID 1's) to tell
+    a path its sandbox hides; faking only its own would leave the real host's
+    table to disagree with it.
+    """
+
     original_read_text = Path.read_text
 
     def read_text(path, *args, **kwargs):
-        if str(path) == "/proc/self/mountinfo":
+        if str(path) in {"/proc/self/mountinfo", "/proc/1/mountinfo"}:
             return text
         return original_read_text(path, *args, **kwargs)
 

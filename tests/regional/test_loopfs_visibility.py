@@ -18,6 +18,7 @@ from __future__ import annotations
 import os
 import types
 from datetime import datetime, timezone
+from pathlib import Path
 
 import pytest
 
@@ -126,6 +127,9 @@ class _FilesystemReader(HostSystemMetricsMixin):
 
     statvfs_budget_seconds = 15.0
     statvfs_timeout_seconds = 5.0
+    #: No PID 1 mount table under it: the host view is unreadable, so the
+    #: reading is the scripted ``statvfs`` alone, whatever host runs the test.
+    proc_root = Path("/nonexistent-gfrs-proc")
 
     def __init__(self, mount: str, reading: os.statvfs_result) -> None:
         self.filesystems = [mount]

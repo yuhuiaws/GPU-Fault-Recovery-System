@@ -615,8 +615,27 @@ def _host_baseline(host_case):
     )
 
 
+def _read_only_on_the_host(host_case, mount: str) -> None:
+    """``mount`` remounted read-only (superblock ``ro``), as both tables show it.
+
+    The collector's own table adds its ``ProtectSystem=strict`` read-only bind;
+    the read-only verdict is taken from the host's (PID 1's) table.
+    """
+
+    support.write_file(
+        host_case.roots.proc / "self/mountinfo",
+        "2177 76 259:1 / / ro,nosuid,relatime master:1 - ext4 /dev/root rw\n"
+        f"2260 2177 7:15 / {mount} ro,nosuid,relatime master:590 - ext4 /dev/loop15 ro\n",
+    )
+    support.write_file(
+        host_case.roots.proc / "1/mountinfo",
+        "28 1 259:1 / / rw,relatime shared:1 - ext4 /dev/root rw\n"
+        f"590 28 7:15 / {mount} rw,relatime shared:590 - ext4 /dev/loop15 ro\n",
+    )
+
+
 def test_a_read_only_configured_mount_is_unusable_with_free_capacity(host_case):
-    """ST_RDONLY is unusable even when the capacity reading is healthy (004 read_only).
+    """Read-only is unusable even when the capacity reading is healthy (004 read_only).
 
     The spec forbids judging such a mount by its remaining bytes: a remount
     read-only keeps its blocks and inodes, so the capacity signals read fine
@@ -625,6 +644,7 @@ def test_a_read_only_configured_mount_is_unusable_with_free_capacity(host_case):
 
     mount = str(host_case.roots.mount)
     _host_baseline(host_case)
+    _read_only_on_the_host(host_case, mount)
     collector = host_case.build(
         "_cpu",
         "_memory",

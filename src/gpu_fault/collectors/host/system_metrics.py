@@ -12,6 +12,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
+from gpu_fault.collectors.host.mount_table import host_mount, read_mount_table
 from gpu_fault.collectors.host.observation import HostObservationError
 from gpu_fault.host_health import (
     HostMetricSample,
@@ -45,6 +46,8 @@ class _SmartHealth(NamedTuple):
 
 
 _NO_SMART_HEALTH = _SmartHealth(None, (), ())
+
+_NO_FILESYSTEM_WARNINGS: frozenset[str] = frozenset()
 
 
 class _SmartScan(NamedTuple):
@@ -223,6 +226,7 @@ class BoundedStatvfs:
 class HostSystemMetricsMixin:
     # Attributes supplied by the composed concrete implementation.
     filesystems: Any
+    proc_root: Path
     statvfs_budget_seconds: float
     statvfs_timeout_seconds: float
 
@@ -239,6 +243,11 @@ class HostSystemMetricsMixin:
     #: here, so the SMART cache starts from an immutable module-level default
     #: owned by the code that reads it.
     _smart_health = _NO_SMART_HEALTH
+    #: The same for the conditions ``_filesystems`` has already logged: a
+    #: configured mount the collector's sandbox hides, or an unreadable host
+    #: mount table, stays so for as long as the configuration stands, and a
+    #: warning per tick would flood the journal.
+    _filesystem_warnings = _NO_FILESYSTEM_WARNINGS
 
     def _probe_mount(self, mount: str, observed_at: datetime) -> os.statvfs_result:
         """``statvfs`` with a deadline, at most once per mount per tick.
@@ -375,7 +384,34 @@ class HostSystemMetricsMixin:
 
     def _filesystems(self, observed_at: datetime) -> list[HostMetricSample]:
         result = []
+        # This process runs in its unit's sandbox (``mount_table``): its own
+        # ``statvfs`` flags call every healthy mount read-only, so the
+        # read-only verdict comes from PID 1's -- the host's -- mount table.
+        own = read_mount_table(Path("/proc/self/mountinfo"))
+        host_table = self.proc_root / "1" / "mountinfo"
+        host = read_mount_table(host_table)
+        if host is None:
+            self._warn_filesystems_once(
+                "\0host-mount-table",
+                "the host mount table %s cannot be read; a read-only configured "
+                "filesystem is not reported",
+                host_table,
+            )
         for mount in dict.fromkeys(self.filesystems):
+            view = host_mount(mount, own, host)
+            if not view.same_filesystem:
+                # ``ProtectHome=`` (or another sandbox mount) covers the path:
+                # ``statvfs`` here would read that mount, not the host's
+                # filesystem. A path the collector cannot observe is missing
+                # evidence -- never a usable, read-only or missing reading.
+                self._warn_filesystems_once(
+                    mount,
+                    "configured filesystem %s is hidden by the collector's sandbox "
+                    "(the host holds it on %s); it is not reported",
+                    mount,
+                    view.entry.mount_point if view.entry is not None else "?",
+                )
+                continue
             # No ``os.path.exists`` guard: ``stat`` blocks on a dead mount for
             # the same reason ``statvfs`` does, and ``statvfs`` already reports
             # a missing path as ENOENT.
@@ -391,6 +427,17 @@ class HostSystemMetricsMixin:
                 )
                 continue
             except OSError as error:
+                if isinstance(error, FileNotFoundError) and not view.same_directory:
+                    # Missing from the collector's private copy of the
+                    # directory (``PrivateTmp=``), which says nothing about
+                    # the host's: not a vanished mount.
+                    self._warn_filesystems_once(
+                        mount,
+                        "configured filesystem %s is under a directory private to "
+                        "the collector's sandbox; it is not reported",
+                        mount,
+                    )
+                    continue
                 # A configured mount whose ``statvfs`` fails is unusable, not
                 # absent-and-fine: ENOENT is a required mount that vanished
                 # (GF-GENERAL-LIVE-004 ``required_mount_missing``), and any
@@ -411,13 +458,16 @@ class HostSystemMetricsMixin:
                 continue
             # A read-only remount keeps its blocks and inodes, so the capacity
             # signals below read healthy while the mount refuses every write:
-            # ``ST_RDONLY`` is its own "not usable" signal (004 ``read_only``),
-            # and the gauge reports 0 for a usable read-write mount so the
-            # signal clears when the mount is remounted read-write.
+            # read-only is its own "not usable" signal (004 ``read_only``), and
+            # the gauge reports 0 for a usable read-write mount so the signal
+            # clears when the mount is remounted read-write. Read-only is the
+            # host mount's verdict, per mount or per superblock -- never this
+            # process's ``ST_RDONLY``, which ``ProtectSystem=strict`` sets on
+            # every healthy mount -- and an unreadable host table is no
+            # evidence of a read-only filesystem.
+            read_only = view.entry is not None and view.entry.read_only
             result.append(
-                self._filesystem_unavailable(
-                    mount, "READ_ONLY" if stat.f_flag & os.ST_RDONLY else None
-                )
+                self._filesystem_unavailable(mount, "READ_ONLY" if read_only else None)
             )
             total = stat.f_blocks * stat.f_frsize
             available = stat.f_bavail * stat.f_frsize
@@ -475,12 +525,13 @@ class HostSystemMetricsMixin:
         """Availability gauge for one configured mount (GF-GENERAL-LIVE-004).
 
         ``failure_mode`` is None for a usable read-write mount (value 0) and
-        the reason otherwise (value 1): ``READ_ONLY`` for an ``ST_RDONLY``
-        remount, ``MOUNT_MISSING`` for a configured mount whose ``statvfs`` is
-        ENOENT, ``PROBE_FAILED`` for one whose ``statvfs`` raised any other
-        error. Kept distinct from ``filesystem_used_percent``: free bytes say
-        nothing about a mount that is read-only, gone, or unreadable, so the
-        capacity reading must not be read as proof the mount is healthy.
+        the reason otherwise (value 1): ``READ_ONLY`` for a mount the host's
+        mount table shows read-only (per mount or per superblock),
+        ``MOUNT_MISSING`` for a configured mount whose ``statvfs`` is ENOENT,
+        ``PROBE_FAILED`` for one whose ``statvfs`` raised any other error.
+        Kept distinct from ``filesystem_used_percent``: free bytes say nothing
+        about a mount that is read-only, gone, or unreadable, so the capacity
+        reading must not be read as proof the mount is healthy.
         """
 
         return HostMetricSample(
@@ -489,6 +540,12 @@ class HostSystemMetricsMixin:
             device=mount,
             labels={} if failure_mode is None else {"failure_mode": failure_mode},
         )
+
+    def _warn_filesystems_once(self, key: str, message: str, *args: object) -> None:
+        if key in self._filesystem_warnings:
+            return
+        self._filesystem_warnings = self._filesystem_warnings | {key}
+        LOGGER.warning(message, *args)
 
     @staticmethod
     def _filesystem_type(path: str) -> str | None:
