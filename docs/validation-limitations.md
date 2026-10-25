@@ -1023,10 +1023,10 @@ the live-replay `statistics_failed`, and 009 `errors_delta`, `sustained_drops`,
 `short_drops`, `counter_reset`, `wrong_interface` and `recovery`. 008
 `unknown_state` (a `dummy`, which never computes the digest) and the
 observation/capability variants (`empty_required_list`, `bond_vf`) were never
-affected. 009 `tcp_only` is recovered from the `ProbeError` but stays
-`INCONCLUSIVE`: its `tc netem` TCP-loss flow in a test netns is not yet wired as
-a probe command, so the oracle sees no RetransSegs rise -- a separate harness
-gap left open, independent of interface visibility.
+affected. 009 `tcp_only` was recovered from the `ProbeError` but stayed
+`INCONCLUSIVE`: its `tc netem` TCP-loss flow in a test netns was not wired as a
+probe command, so the oracle saw no RetransSegs rise -- a separate harness gap,
+independent of interface visibility, closed by the fixture described below.
 
 A second `ProbeError` on the veth path survived that digest change and was caught
 live on 008 `optional_interface` (2026-10-24, after the digest fix shipped):
@@ -1044,7 +1044,63 @@ link-locals while a routable (global) address or a `device` link still marks a
 real device. This recovers the three `set-link down` variants (008
 `required_link_down`, `optional_interface`, `recovery`); the other veth variants
 never call `set-link down` and were already recovered by the digest fix. Only 009
-`tcp_only` remains `INCONCLUSIVE`, for the unrelated netem gap above.
+`tcp_only` remained `INCONCLUSIVE`, for the unrelated netem gap above.
+
+Once the veth path ran, live pass 3 recorded 009 `tcp_only` as
+`NOT_RUN(CAPABILITY_ABSENT)` "the node lacks tc": the AL2023 NVIDIA EKS AMI
+ships no `iproute-tc` (its survey showed `sch_netem` available but not loaded).
+The variant now has a real native fixture (`general_live_tcp.py`). The net
+probe's `tcp-setup` builds a `gfrs<digest>ns` test netns and a gfrs veth pair
+through the same guarded creation path as the other veth variants (test names
+only, refused when a name is a device-backed or routably addressed interface,
+management-plane digest before/after, deadman and state recorded first),
+creates the peer directly inside the netns, gives both ends static IPv6
+link-local test addresses -- no routable address and no route on any other
+interface -- and puts `tc netem loss 5%` on the host-side veth's egress only.
+`tcp-start` runs a bounded TCP sender in the host netns and a receiver in the
+test netns as `RuntimeMaxSec` transient units, so the retransmissions are
+counted in the host `/proc/net/snmp` the host collector reads. A named netns is
+a bind mount under `/run/netns`; the probe Pod's `/host` is not propagated, so a
+netns added from the chroot would be an empty file to the host's systemd (the
+network-namespace analogue of the storage mount-propagation finding) -- every
+netns command therefore runs in PID 1's mount namespace via `nsenter`, where
+the receiver unit and the `cleanup --kind tcp` deadman (flow, qdisc, netns,
+veth) see it. Only the host-side end is declared required: the peer is invisible
+to the host collector, and declaring it would read as a missing required
+interface (`network_link_down`, QUARANTINE). The oracle needs the host
+`RetransSegs` to rise by at least 20, netem to drop packets and the receiver to
+get data, while the test veth's error and drop counters and every real
+interface's error counters stay flat (`INCONCLUSIVE` otherwise); the product
+must also have accepted a host batch with a positive `tcp_retransmits_delta`
+from inside the flow, because that metric deliberately has no rule and a "no
+finding" the product never had the data for proves nothing.
+
+`tc` and `sch_netem` are used as the node has them. Without the optional
+`TEMP_TEST_PACKAGE_INSTALL` approval a missing `tc` keeps the pass-3
+`NOT_RUN(CAPABILITY_ABSENT)`. With it the separate
+`general_live_deps_probe.py` installs, for this run only, exactly `iproute-tc`
+(and `kernel-modules-extra-$(uname -r)` when `sch_netem` cannot be loaded for
+the running kernel) after a `dnf --assumeno` preview, and loads `sch_netem` only
+if it is not loaded (`KERNEL_MODULE_LOAD`). Its limits are deliberate:
+
+- The previewed transaction must consist of `Installing` rows of exactly those
+  packages. A kernel, an upgrade (for example an `iproute` bump that a newer
+  `iproute-tc` would require), a downgrade, a removal, an obsolete or any other
+  dependency makes the variant `NOT_RUN(FIXTURE_NOT_READY)` with the transaction
+  in `tcp-dependencies.json`; widening the allow-list is a separate review.
+- The module package is only the running kernel's `kernel-modules-extra`
+  build; a `kernel6.x` flavour would need `kernel6.x-modules-extra` and is
+  reported as "no package ... in the enabled repositories", never guessed.
+- What the run installs (NEVRAs from the rpm transaction that installed them)
+  and which module it loads are recorded on the node *before* the change, and
+  `cleanup` -- the runner's LIFO step after the fixture is gone, and a deadman
+  timed to fire after the fixture's even when the install took its whole
+  budget -- unloads only a module this run loaded once it is idle, and
+  `dnf remove`s exactly the recorded packages after a preview that
+  must remove nothing else (no dependent package, no "unused" dependency). A
+  cleanup that cannot finish keeps its deadman armed and fails the variant's
+  cleanup. A node reboot before either runs loses the `/run` record and the
+  timers; the installed NEVRAs stay in the case evidence for a manual removal.
 
 ## GF-GENERAL-LIVE host/device categories (phase 2)
 

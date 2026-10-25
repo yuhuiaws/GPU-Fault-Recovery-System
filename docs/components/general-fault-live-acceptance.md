@@ -484,7 +484,9 @@ Agent过期/非活跃集群单独处理，不伪造成同一种静默。恢复�
 节点日志采集器的 runtime 启用）、`probes/general_live_storage_probe.py`
 （loop 文件系统与 loop+device-mapper 测试设备、O_DIRECT 写入）、
 `probes/general_live_net_probe.py`（host-local veth/dummy 测试接口、丢包生成器、
-netns+netem）。采集单元清单的只读扩展复用
+009 `tcp_only` 的测试 netns+netem TCP 夹具）、`probes/general_live_deps_probe.py`
+（单次运行的临时测试包：仅在缺失时用 dnf 安装经审查的包、加载 `sch_netem`，
+并只撤销本次运行装/载的内容）。采集单元清单的只读扩展复用
 `probes/collector_window_probe.py`（仅对 host collector 追加一个测试挂载到
 `GPU_FAULT_FILESYSTEMS`、或把测试接口追加到 `GPU_FAULT_REQUIRED_INTERFACES`）。
 
@@ -511,7 +513,14 @@ veth/dummy/sch_netem）、`ENABLE_NODE_LOG_COLLECTOR`（临时启用被禁用的
 采集器）、`WATCHER_NETWORK_ISOLATION`、`CONTROL_PLANE_RESTART`、
 `DECLARE_WARM_SPARE`（经 admin CLI 声明一台热备并 cordon，清理时释放/解除 cordon）、
 `SPARE_KUBELET_STOP`（停热备上的 kubelet 使其 NotReady，带宿主机自动重启定时器）；
-缺令牌记 `NOT_RUN(NOT_AUTHORIZED)`。
+缺令牌记 `NOT_RUN(NOT_AUTHORIZED)`。可选令牌只解锁一个附加分支、不影响变体本身是否
+可执行（计划里列为 `approvals_optional`，同样经 `--approve` 绑进 `plan.json`，
+plan 与 execute 必须给出同一组令牌）：`TEMP_TEST_PACKAGE_INSTALL`（009 `tcp_only`：
+节点缺 `tc` 时为本次运行用 dnf 安装 `iproute-tc`，`sch_netem` 无法为运行内核加载时
+安装 `kernel-modules-extra-$(uname -r)`；dnf 预演事务必须恰好只安装这些包，不得拉入
+内核、升级、降级、删除或其他依赖，否则 `NOT_RUN(FIXTURE_NOT_READY)`；清理与 deadman
+只 dnf 卸载本次运行记录在案安装的包）。不给该令牌时节点缺 `tc` 仍记
+`NOT_RUN(CAPABILITY_ABSENT)`。
 
 ### 安全
 
@@ -555,6 +564,33 @@ netdev 写进安装器/管理配置的 `GPU_FAULT_REQUIRED_INTERFACES`（默认�
 （生产默认 false）；002/003 的主机内存压力需 `HOST_MEMORY_PRESSURE` 审批；
 006 `sustained_latency`、008/009 的 veth/dummy/netem 需 `KERNEL_MODULE_LOAD`
 或预装内核模块。运行器只做只读 `--plan` 预检，`--execute` 由运维在授权窗口执行。
+
+009 `tcp_only`（native 负例：TCP 重传不是网卡错误，`general_live_tcp.py`）：网卡探针
+建 `gfrs<digest>ns` 测试 netns 与一对 gfrs veth（复用 gfrs-only 建接口与真实网卡守卫，
+主机端 `a` 在主机 netns、对端 `b` 直接建在测试 netns 内），两端只配静态 IPv6
+link-local 测试地址（不加可路由地址、不改其他接口的路由），`tc netem loss 5%` 只挂在
+主机端 veth 的出口；有界 TCP 流的发送端在**主机** netns、接收端在测试 netns（均为带
+`RuntimeMaxSec` 的瞬态单元），因此重传计入产品采集器读取的主机 `/proc/net/snmp`。
+具名 netns 是 `/run/netns` 下的 bind mount，而探针 Pod 的 `/host` 不传播挂载，所以
+netns 相关命令都经 `nsenter` 在 PID 1 的挂载命名空间执行，瞬态单元与 deadman 才看得见；
+deadman 在运行器失联时删除流、qdisc、netns 与 veth（临时包由其后的独立 deadman 撤销）。
+只把主机端 veth 声明为必需接口（对端在测试 netns 中，主机采集器看不到，声明它会被读成
+必需接口缺失 → `network_link_down` → QUARANTINE）。有效性 oracle：流窗口内主机
+`RetransSegs` 增量 ≥ 20、netem 丢包 > 0、接收端收到数据，同时测试 veth 的错误/丢包计数
+与每个真实接口（管理/VPC-CNI/EFA netdev）的错误计数增量都为 0，否则 `INCONCLUSIVE`。
+产品须在流窗口内接收至少一批带正 `tcp_retransmits_delta` 的主机 batch（该指标无规则，
+只采集），否则“无 finding”不构成证明，同记 `INCONCLUSIVE`；任何 NIC/TCP finding、硬件
+恢复步骤或隔离为 `FAIL`。计划/执行形如（节点缺 `tc` 时）：
+
+```bash
+run_general_live.py --site-profile <profile> --run-dir <run> \
+  --case GF-GENERAL-LIVE-009 --variant tcp_only --fault-node <node> \
+  --approve KERNEL_MODULE_LOAD --approve TEMP_TEST_PACKAGE_INSTALL --plan
+run_general_live.py --site-profile <profile> --run-dir <run> \
+  --case GF-GENERAL-LIVE-009 --variant tcp_only --fault-node <node> \
+  --approve KERNEL_MODULE_LOAD --approve TEMP_TEST_PACKAGE_INSTALL --execute \
+  --confirm GENERALLIVE009_EXECUTE --maintenance-window-end <UTC>
+```
 
 ### phase 2 范围（host/device 扩展）
 
