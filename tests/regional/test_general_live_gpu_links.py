@@ -325,7 +325,9 @@ def test_independent_fatal_event_keeps_its_catalog_decision_beside_the_counter(
     dcgm = [call[0] for call in ctx.probes[f"dcgm@{ctx.settings.node}"].calls]
     # since the 019 cleanup fix the replay is released by one probe call that restores the endpoint, stops the
     # field tool and removes the run directory in order (close-run), instead of restore-collector + stop-proxy
-    assert "close-run" in dcgm, "the counter is released through the fixture's close-run"
+    assert "close-run" in dcgm, (
+        "the counter is released through the fixture's close-run"
+    )
 
 
 def test_independent_fatal_event_fails_when_the_counter_absorbs_the_xid(
