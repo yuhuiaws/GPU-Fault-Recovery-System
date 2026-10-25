@@ -17,6 +17,45 @@ from gpu_fault.orchestration.disposition import Disposition, DispositionApplier
 from gpu_fault.orchestration.workflow_merge import workflow_is_mutable
 
 
+#: Workflow statuses that still execute on their own.
+_EXECUTABLE_STATUSES = frozenset(
+    {
+        WorkflowStatus.PENDING,
+        WorkflowStatus.RUNNING,
+        WorkflowStatus.SAFETY_PENDING,
+    }
+)
+
+
+def live_group_pair(
+    existing_incident: FaultIncident | None,
+    existing_workflow: WorkflowRequest | None,
+) -> tuple[FaultIncident | None, WorkflowRequest | None]:
+    """The merge group's linked pair, or none once its workflow has ended.
+
+    ``merge_attempt_fault_workflow`` hands a builder whatever the group link
+    names, and the link is rewritten only by a merge that returns, so it
+    outlives the incident it names. An isolation opened on the normal health
+    path never writes the node group: after the node's first merged
+    isolation had ended the link still named that pair, and the next critical
+    quarantine that met a new isolation in flight was compared against the
+    dead pair and minted beside the incumbent -- two MARK_UNSCHEDULABLE +
+    QUARANTINE workflows on one node, the later one taking it over (live
+    2026-10-25, plain EKS, GF-GENERAL-LIVE-008 interface_missing). A pair
+    whose workflow no longer executes is no merge target here; the caller's
+    live incumbent is. A live pair is kept, wherever it holds (the node-scope
+    fault family drops an ended link the same way, ``reopen_if_terminal``).
+    """
+
+    if (
+        existing_incident is None
+        or existing_workflow is None
+        or existing_workflow.status not in _EXECUTABLE_STATUSES
+    ):
+        return None, None
+    return existing_incident, existing_workflow
+
+
 @dataclass(frozen=True)
 class DrainOperationCallbacks:
     active_node_exclusive_workflow: Callable[..., Any]
@@ -133,6 +172,9 @@ class DrainOperationService:
             existing_workflow: WorkflowRequest | None,
         ) -> tuple[FaultIncident, WorkflowRequest]:
             now = datetime.now(timezone.utc)
+            existing_incident, existing_workflow = live_group_pair(
+                existing_incident, existing_workflow
+            )
             target_incident = existing_incident or incumbent_incident
             target_workflow = existing_workflow or self.store.get_workflow(
                 incumbent.request_id
@@ -272,6 +314,9 @@ class DrainOperationService:
             existing_workflow: WorkflowRequest | None,
         ) -> tuple[FaultIncident, WorkflowRequest]:
             now = datetime.now(timezone.utc)
+            existing_incident, existing_workflow = live_group_pair(
+                existing_incident, existing_workflow
+            )
             target_incident = existing_incident or incumbent_incident
             target_workflow = existing_workflow or self.store.get_workflow(
                 incumbent.request_id

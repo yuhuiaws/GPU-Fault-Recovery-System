@@ -7,6 +7,7 @@ import pytest
 from gpu_fault.app import ApplicationContext
 from gpu_fault.host_health import NodeHealthCategory, NodeHealthFinding
 from gpu_fault.models import (
+    IncidentState,
     RecoveryAction,
     WorkflowOperation,
     WorkflowRequest,
@@ -218,6 +219,80 @@ def prove_reboot_preserves_quarantine(context: ApplicationContext) -> None:
 
 def test_later_reboot_cannot_undo_persistent_quarantine(health_context):
     prove_reboot_preserves_quarantine(health_context)
+
+
+def end_isolation(context: ApplicationContext, workflow: WorkflowRequest) -> None:
+    """What the executor leaves of a finished isolation: SUCCEEDED, QUARANTINED."""
+
+    stored = context.store.get_workflow(workflow.request_id)
+    context.store.save_workflow(
+        copy_model(
+            stored,
+            status=WorkflowStatus.SUCCEEDED,
+            completed_step_indexes=list(range(len(stored.official_steps))),
+        )
+    )
+    incident = context.store.get_incident(stored.incident_id)
+    context.store.save_incident(
+        copy_model(incident, state=IncidentState.QUARANTINED), expected=incident
+    )
+
+
+def active_isolations(context: ApplicationContext) -> list[str]:
+    return sorted(
+        workflow.request_id
+        for _, workflow in context.store.list_active_workflow_incidents(
+            "cluster-a", node_ids={"node-a"}
+        )
+    )
+
+
+def prove_a_later_isolation_absorbs_its_own_peer(context: ApplicationContext) -> None:
+    # The node's first isolation: a second critical quarantine (a veth peer,
+    # a second required NIC) joins it, and the node's merge group now names it.
+    first, first_workflow = context.orchestrator.ingest_node_health(
+        health_finding("link-a-first", RecoveryAction.QUARANTINE)
+    )
+    assert first_workflow is not None, first
+    joined, _ = context.orchestrator.ingest_node_health(
+        health_finding("link-b-first", RecoveryAction.QUARANTINE)
+    )
+    assert joined.incident_id == first.incident_id, joined
+    end_isolation(context, first_workflow)
+
+    # A later isolation of the same node, and its own peer finding.
+    second, second_workflow = context.orchestrator.ingest_node_health(
+        health_finding("link-a-second", RecoveryAction.QUARANTINE)
+    )
+    assert second_workflow is not None, second
+    peer, peer_workflow = context.orchestrator.ingest_node_health(
+        health_finding("link-b-second", RecoveryAction.QUARANTINE)
+    )
+
+    assert peer.incident_id == second.incident_id, (
+        f"the peer must join the node's in-flight isolation, not mint its own "
+        f"beside it because the merge group still names {first.incident_id}: "
+        f"{peer.incident_id}"
+    )
+    assert peer_workflow is not None, peer
+    assert peer_workflow.request_id == second_workflow.request_id, peer_workflow
+    linked = context.store.get_incident_by_event("link-b-second")
+    assert linked is not None and linked.incident_id == second.incident_id, linked
+    assert active_isolations(context) == [second_workflow.request_id], (
+        "one node, one isolation in flight"
+    )
+    stale = context.store.get_incident(first.incident_id)
+    assert stale.state is IncidentState.QUARANTINED, (
+        f"the ended isolation is left as it was: {stale}"
+    )
+
+
+def test_a_later_isolation_absorbs_its_own_peer(health_context):
+    # Live 2026-10-25 (plain EKS ip-10-0-43-5, GF-GENERAL-LIVE-008
+    # interface_missing): both ends of a required veth pair went missing in
+    # one tick; the second finding opened its own MARK_UNSCHEDULABLE +
+    # QUARANTINE beside the first one's, and that incident took the node.
+    prove_a_later_isolation_absorbs_its_own_peer(health_context)
 
 
 def merger() -> WorkflowMergeService:

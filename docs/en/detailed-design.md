@@ -2045,6 +2045,19 @@ explicit criteria are also needed, otherwise a new fault would be silently swall
   yet the incident and the step both claim to cover it, and the workflow continues to validate and uncordon.
   In that case likewise a new workflow is opened and serialized after the incumbent.
 
+Because the merge keys never expire and a key's link is rewritten only when a merge returns, the link outlives
+the incident it names. The node key is written only by the two drain routes (a critical QUARANTINE joining the
+node's incumbent isolation, a device-resource finding joining the incumbent, `orchestration/families/drain.py`);
+an isolation the health path opens normally never writes it. After the node's first merged isolation had ended
+the link still named that pair, and the next critical QUARANTINE that met a new isolation in flight was compared
+against the ended pair and opened an isolation of its own beside the incumbent, with no predecessor -- two
+concurrent MARK_UNSCHEDULABLE + QUARANTINE workflows on one node, the later one taking it over (live 2026-10-25,
+plain EKS, GF-GENERAL-LIVE-008 `interface_missing`: both ends of a veth pair went missing in one tick and the
+second end's finding opened its own isolation). The two routes now treat a linked pair whose workflow no longer
+executes (no longer PENDING/RUNNING/SAFETY_PENDING) as no link and merge into the incumbent the node exclusivity
+lookup found; a linked pair that still executes is preferred as before. The node-scope fault family already drops
+an ended link that way, through `reopen_if_terminal`.
+
 **Layer three: ownership annotations on the node object -- cross-process ownership decisions.**
 `src/gpu_fault/adapters/` writes ownership onto the Kubernetes node object:
 `gpu-fault.io/incident-id`, `gpu-fault.io/fencing-token`,
