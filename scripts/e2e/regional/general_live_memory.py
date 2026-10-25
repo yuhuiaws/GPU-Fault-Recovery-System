@@ -26,14 +26,23 @@ the product must mint no memory finding; an OOM line the (disabled by default)
 node log collector grades is a RUN_DIAGNOSTICS diagnostic at most, never a
 STOP, isolation or hardware step (``log_rules.py``).
 
-The spec's swap and read-failure variants need either a swap device this site
-does not run (the spec forbids enabling business swap) or a unit-private
-``/proc/meminfo`` replay that is not built in this phase; they stay in the
-denominator as NOT_RUN with their reason.
+The spec's swap and read-failure variants are raw ``/proc/meminfo`` replays on
+the shared host source replay (``general_live_source_replay.py``; the spec
+allows a raw meminfo replay where the node has no swap device and business swap
+must not be enabled): ``swap_pressure`` binds a copy of the node's real
+``/proc/meminfo`` with only ``SwapTotal``/``SwapFree`` rewritten into the host
+collector unit's mount namespace, so ``_memory`` computes ``swap_used_percent``
+from the replayed pair and the 80 % swap rule (no sustain) fires on its own
+while the memory metrics stay the node's real values; ``read_failure`` makes
+``/proc/meminfo`` ``InaccessiblePaths=`` inside that unit only, so the
+contributor fails and the tick carries a ``_memory`` collection error and no
+memory sample at all -- UNKNOWN, never a healthy value and never a hardware
+signal.
 """
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import (
@@ -53,12 +62,15 @@ from scripts.e2e.regional.general_live_fixture import (
     utc_now,
 )
 from scripts.e2e.regional.general_live_registry import (
-    CAPABILITY,
     LIVE_REPLAY,
     NATIVE,
     OBSERVATION,
     VariantSpec,
-    deferred_variant,
+)
+from scripts.e2e.regional.general_live_source_replay import (
+    HOST_SOURCE_REPLAY,
+    MEMINFO_FIXTURE,
+    host_source_replay,
 )
 from scripts.e2e.regional.probes.general_live_node_probe import (
     MAX_SECONDS as PROBE_MAX_SECONDS,
@@ -101,6 +113,19 @@ CGROUP_OOM_CAP_BYTES = 2 << 30
 CGROUP_OOM_BUDGET = 300
 #: How many times the cgroup is exhausted across the negative window.
 CGROUP_OOM_REPEATS = 3
+#: The memory metrics the host collector derives from ``/proc/meminfo``
+#: (``system_metrics._memory``) that carry a rule.
+MEMORY_METRICS = frozenset(
+    {"memory_used_percent", "memory_available_percent", "swap_used_percent"}
+)
+#: swap_pressure fixture: 8 GiB of swap with 1 GiB free -> 87.5 % used, above
+#: the 80 % rule; every other meminfo line stays the node's real reading.
+SWAP_TOTAL_KB = 8 << 20
+SWAP_FREE_KB = 1 << 20
+#: The swap rule has no sustain: the first delivered breach (the baseline tick
+#: after the unit restart) mints the finding; the budget still allows a health
+#: summary for the validation to execute.
+SWAP_DETECTION_BUDGET = 300 + 120
 
 
 def _require_memory_approval(ctx: VariantContext) -> None:
@@ -196,27 +221,9 @@ def memory_pressure(ctx: VariantContext) -> dict[str, Any]:
     )
     _oracle_used_each_tick(oracle, minimum=SUSTAIN_SECONDS // 5)
     incidents = finding_incidents(detection, "memory_used_percent")
-
-    def validated() -> dict[str, Any] | None:
-        current = activity(ctx, started_at, metrics={"memory_used_percent"})
-        for inc in finding_incidents(current, "memory_used_percent"):
-            for workflow in current.get("workflows") or []:
-                if workflow.get("incident_id") != inc["incident_id"]:
-                    continue
-                if any(
-                    step.get("operation") == "VALIDATE_HOST"
-                    and step.get("status") in {"SUCCEEDED", "FAILED"}
-                    for step in workflow.get("step_executions") or []
-                ):
-                    return current
-        return None
-
-    observed = ctx.wait_until(
-        validated,
-        timeout_seconds=DETECTION_BUDGET,
-        poll_seconds=20,
-        name="memory-validate",
-    ) or activity(ctx, started_at, metrics={"memory_used_percent"})
+    observed = _await_validate_host(
+        ctx, started_at, "memory_used_percent", name="memory-validate"
+    )
     stages = {
         "chain": chain_errors(
             observed,
@@ -519,8 +526,261 @@ def cgroup_only(ctx: VariantContext) -> dict[str, Any]:
 
 
 # --------------------------------------------------------------------------- #
+# read_failure / swap_pressure: raw /proc/meminfo replay in the host collector
+# unit's private mount namespace (HOST_SOURCE_REPLAY)
+# --------------------------------------------------------------------------- #
+def memory_samples(observed: dict[str, Any]) -> list[dict[str, Any]]:
+    return [
+        item
+        for metric in sorted(MEMORY_METRICS)
+        for item in samples(observed, metric)
+        if isinstance(item.get("value"), (int, float))
+    ]
+
+
+def contributor_error_errors(observed: dict[str, Any], contributor: str) -> list[str]:
+    """At least one delivered batch names the failed contributor."""
+
+    for batch in observed.get("batches") or []:
+        if any(
+            str(error).startswith(f"{contributor}:")
+            for error in batch.get("collection_errors") or []
+        ):
+            return []
+    return [f"no delivered batch carries a {contributor} collection error"]
+
+
+def _await_memory_sample(ctx: VariantContext, since: datetime) -> list[str]:
+    """Fresh evidence that the memory contributor reads ``/proc/meminfo`` again."""
+
+    def accept() -> dict[str, Any] | None:
+        current = activity(ctx, since, metrics={"memory_used_percent"})
+        fresh = [
+            item
+            for item in samples(current, "memory_used_percent")
+            if isinstance(item.get("value"), (int, float))
+        ]
+        return {"samples": fresh} if fresh else None
+
+    value = ctx.wait_until(
+        accept,
+        timeout_seconds=ctx.host_summary + ctx.host_interval * 6,
+        poll_seconds=ctx.host_interval,
+        name="meminfo-recovery",
+    )
+    if value is None:
+        return ["no memory_used_percent sample reached the product after the window"]
+    return []
+
+
+def read_failure(ctx: VariantContext) -> dict[str, Any]:
+    """An unreadable ``/proc/meminfo`` is UNKNOWN: no value, no finding, no step.
+
+    The probe verifies through ``nsenter`` that the unit cannot read the file
+    while PID 1 can (the runner's oracle); the product's records must then show
+    a ``_memory`` collection error and *no* memory sample for the window -- a
+    healthy value or a hardware/isolation step from a failed read is FAIL.
+    """
+
+    run_survey(ctx)
+    replay = host_source_replay(ctx)
+    started_at = utc_now()
+    opened = replay.open_window(
+        inaccessible=["/proc/meminfo"], restore_seconds=ctx.spec.max_minutes * 60
+    )
+    ctx.evidence.write("source-window-open", opened)
+    hidden = [
+        check
+        for check in (opened.get("verification") or {}).get("checks") or []
+        if check.get("kind") == "inaccessible" and check.get("dest") == "/proc/meminfo"
+    ]
+    if not hidden or not all(check.get("ok") for check in hidden):
+        raise VariantInconclusive(
+            "the probe did not verify that /proc/meminfo is unreadable inside the "
+            f"host collector unit only: {hidden}"
+        )
+    ctx.evidence.append_oracle(
+        [{"inaccessible_checks": hidden, **replay.evidence()}], source="meminfo"
+    )
+    ctx.hold(ctx.host_interval * 3 + 30, name="read-failure")
+    observed = activity(ctx, started_at, metrics=MEMORY_METRICS)
+    stages = {
+        "unknown_observed": contributor_error_errors(observed, "_memory"),
+        "no_healthy_value": [
+            f"{item['name']}={item['value']} was reported at {item['observed_at']} "
+            "while /proc/meminfo was unreadable"
+            for item in memory_samples(observed)
+        ],
+        "no_finding": [
+            error
+            for metric in sorted(MEMORY_METRICS)
+            for error in chain_errors(
+                observed, ChainExpectation(metric=metric, present=False)
+            )
+        ],
+        "hardware": hardware_errors(observed),
+        "no_isolation": (
+            [f"isolation operations planned: {isolation_operations(observed)}"]
+            if isolation_operations(observed)
+            else []
+        )
+        + (
+            ["the node is isolated after a meminfo read failure"]
+            if node_isolated(ctx.regional.node_snapshot(ctx.settings.node))
+            else []
+        ),
+    }
+    closed_at = utc_now()
+    ctx.evidence.write("source-window-close", replay.close())
+    stages["recovered"] = _await_memory_sample(ctx, closed_at)
+    return _result(
+        stages,
+        notes=[
+            "a failed /proc/meminfo read leaves a _memory collection error and no "
+            "memory sample: UNKNOWN, never a healthy or a hardware signal"
+        ],
+        extra={
+            "proof_scope": "live-replay",
+            "batches_in_window": len(observed.get("batches") or []),
+        },
+    )
+
+
+def swap_pressure(ctx: VariantContext) -> dict[str, Any]:
+    """A replayed SwapTotal/SwapFree pair drives the swap rule on its own.
+
+    The fixture is the node's real ``/proc/meminfo`` with only the swap pair
+    rewritten (8 GiB total, 1 GiB free = 87.5 %), so ``memory_used_percent``
+    and the page-cache rule keep their real inputs and only ``swap_used_percent``
+    crosses its 80 % rule (``host_health.py`` METRIC_RULES; no sustain). The
+    product must mint the swap finding alone, run FREEZE_EVIDENCE then
+    VALIDATE_HOST with a ``host_diagnostic_probe`` on ``swap_used_percent`` that
+    fails while the bind is held, and recover once the window closes.
+    """
+
+    run_survey(ctx)
+    replay = host_source_replay(ctx)
+    built = replay.build_meminfo(SwapTotal=SWAP_TOTAL_KB, SwapFree=SWAP_FREE_KB)
+    ctx.evidence.write("meminfo-fixture", built)
+    fixture_swap = built.get("swap_used_percent")
+    if not isinstance(fixture_swap, (int, float)) or fixture_swap < SWAP_THRESHOLD:
+        raise VariantInconclusive(
+            f"the meminfo fixture computes swap_used_percent={fixture_swap}, below "
+            f"the {SWAP_THRESHOLD}% rule"
+        )
+    fixture_memory = built.get("memory_used_percent")
+    if isinstance(fixture_memory, (int, float)) and fixture_memory >= USED_THRESHOLD:
+        raise VariantInconclusive(
+            f"the node's real memory use is {fixture_memory:.1f}%: the swap rule "
+            "cannot be isolated from the memory rule"
+        )
+    started_at = utc_now()
+    opened = replay.open_bind(
+        [(MEMINFO_FIXTURE, "/proc/meminfo")], restore_seconds=ctx.spec.max_minutes * 60
+    )
+    ctx.evidence.write("source-window-open", opened)
+    detection = wait_for_incident(
+        ctx,
+        started_at,
+        "swap_used_percent",
+        timeout_seconds=SWAP_DETECTION_BUDGET,
+        metrics=MEMORY_METRICS,
+        name="swap-detection",
+    )
+    swap_samples = [
+        item
+        for item in samples(detection, "swap_used_percent")
+        if isinstance(item.get("value"), (int, float))
+    ]
+    if not swap_samples:
+        raise VariantInconclusive("no swap_used_percent sample reached the product")
+    if not any(abs(item["value"] - fixture_swap) < 0.5 for item in swap_samples):
+        raise VariantInconclusive(
+            f"the product's swap_used_percent {[item['value'] for item in swap_samples]} "
+            f"never matched the fixture's {fixture_swap:.1f}"
+        )
+    ctx.evidence.append_oracle(
+        [{"fixture_swap_used_percent": fixture_swap, **replay.evidence()}],
+        source="meminfo",
+    )
+    incidents = finding_incidents(detection, "swap_used_percent")
+    observed = _await_validate_host(
+        ctx, started_at, "swap_used_percent", name="swap-validate"
+    )
+    stages = {
+        "chain": chain_errors(
+            observed,
+            ChainExpectation(
+                metric="swap_used_percent",
+                operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
+                validation="VALIDATE_HOST",
+                validation_must_fail=True,
+                probe_metric="swap_used_percent",
+                incident_states=DIAGNOSTIC_ONLY_STATES,
+            ),
+        ),
+        "no_memory_finding": chain_errors(
+            observed, ChainExpectation(metric="memory_used_percent", present=False)
+        ),
+        "hardware": hardware_errors(observed),
+    }
+    stopped_at = utc_now()
+    ctx.evidence.write("source-window-close", replay.close())
+    recovered = await_metric_recovery(
+        ctx, "swap_used_percent", SWAP_THRESHOLD, name="swap-recovery", since=stopped_at
+    )
+    stages["recovery"] = recovered["errors"]
+    settled = wait_settled(
+        ctx,
+        started_at,
+        [item["incident_id"] for item in incidents],
+        timeout_seconds=SWAP_DETECTION_BUDGET,
+        metrics=MEMORY_METRICS,
+        name="swap-settled",
+    )
+    return _result(
+        stages,
+        notes=[
+            "raw meminfo replay: only SwapTotal/SwapFree differ from the node's real "
+            "reading; the swap rule fires on its own rule with no sustain"
+        ],
+        extra={
+            "proof_scope": "live-replay",
+            "fixture_swap_used_percent": fixture_swap,
+            "swap_samples": swap_samples[-3:],
+            "recovery": recovered,
+            "settled": _statuses(settled),
+        },
+    )
+
+
+# --------------------------------------------------------------------------- #
 # shared helpers
 # --------------------------------------------------------------------------- #
+def _await_validate_host(
+    ctx: VariantContext, since: datetime, metric: str, *, name: str
+) -> dict[str, Any]:
+    """The activity once ``metric``'s incident executed VALIDATE_HOST (or the budget)."""
+
+    def validated() -> dict[str, Any] | None:
+        current = activity(ctx, since, metrics={metric})
+        for inc in finding_incidents(current, metric):
+            for workflow in current.get("workflows") or []:
+                if workflow.get("incident_id") != inc["incident_id"]:
+                    continue
+                if any(
+                    step.get("operation") == "VALIDATE_HOST"
+                    and step.get("status") in {"SUCCEEDED", "FAILED"}
+                    for step in workflow.get("step_executions") or []
+                ):
+                    return current
+        return None
+
+    return ctx.wait_until(
+        validated, timeout_seconds=DETECTION_BUDGET, poll_seconds=20, name=name
+    ) or activity(ctx, since, metrics={metric})
+
+
 def _await_recovery(
     ctx: VariantContext, oracle: Oracle, since: Any = None
 ) -> dict[str, Any]:
@@ -572,16 +832,27 @@ VARIANTS = [
         approvals=("HOST_MEMORY_PRESSURE",),
         execute=memory_pressure,
     ),
-    deferred_variant(
-        CASE,
-        "swap_pressure",
-        proof_mode=CAPABILITY,
-        reason=(
-            "CAPABILITY_ABSENT: the p5en/HyperPod nodes run no swap device and "
-            "the spec forbids enabling business swap for a test"
-        ),
+    VariantSpec(
+        case_id=CASE,
+        variant="swap_pressure",
+        proof_mode=LIVE_REPLAY,
         lanes=("eks", "hp"),
-        expected="swap_used_percent >= 80 -> VALIDATE_HOST on its own swap rule",
+        risk="L",
+        flags="S",
+        injection=(
+            "bind a copy of the node's real /proc/meminfo with SwapTotal=8 GiB, "
+            "SwapFree=1 GiB (87.5 % used) into the host collector unit's mount "
+            "namespace; no swap device is created"
+        ),
+        expected=(
+            "swap_used_percent >= 80 -> WARNING RUN_DIAGNOSTICS on its own rule (no "
+            "sustain): FREEZE_EVIDENCE then VALIDATE_HOST whose swap probe fails while "
+            "the bind is held; no memory finding; no reset/reboot; recovery once closed"
+        ),
+        cleanup="close the meminfo bind window (deadman-backed); 2 fresh samples below 80 %",
+        max_minutes=20,
+        approvals=(HOST_SOURCE_REPLAY,),
+        execute=swap_pressure,
     ),
     VariantSpec(
         case_id=CASE,
@@ -622,16 +893,26 @@ VARIANTS = [
         approvals=("HOST_MEMORY_PRESSURE",),
         execute=cgroup_only,
     ),
-    deferred_variant(
-        CASE,
-        "read_failure",
+    VariantSpec(
+        case_id=CASE,
+        variant="read_failure",
         proof_mode=LIVE_REPLAY,
-        reason=(
-            "FIXTURE_NOT_READY: a /proc/meminfo read failure needs a unit-private "
-            "meminfo replay (the shared raw-source replay helper, not built this phase)"
+        lanes=("eks", "hp"),
+        risk="L",
+        flags="S",
+        injection=(
+            "make /proc/meminfo InaccessiblePaths= inside the host collector unit only "
+            "(verified through nsenter: unreadable in the unit, readable by PID 1)"
         ),
-        lanes=("eks",),
-        expected="a meminfo read error is UNKNOWN, never a healthy or a hardware signal",
+        expected=(
+            "a _memory collection error and no memory sample in the window (UNKNOWN); "
+            "no memory/swap finding, no hardware step, no isolation; samples resume "
+            "after the window"
+        ),
+        cleanup="close the source window (deadman-backed); a fresh memory sample",
+        max_minutes=14,
+        approvals=(HOST_SOURCE_REPLAY,),
+        execute=read_failure,
     ),
     VariantSpec(
         case_id=CASE,

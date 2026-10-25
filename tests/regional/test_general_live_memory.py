@@ -2,17 +2,26 @@
 
 from __future__ import annotations
 
+import json
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from gpu_fault.host_diagnostics import diagnostic_probe
+from gpu_fault.host_health import HostMetricSample, NodeHealthPolicy
+from gpu_fault.models import RecoveryAction, Severity
 from scripts.e2e.regional import general_live_memory as mem
 from scripts.e2e.regional.general_live_fixture import (
     VariantBlocked,
     VariantInconclusive,
     VariantNotRun,
 )
+from scripts.e2e.regional.probes import general_live_source_probe as probe
+from tests._builders import build_store, host_telemetry_batch
+from tests.collectors import _cov95_runtime_collect as cov_support
+from tests.collectors import _cov95_runtime_collect_host as cov_host
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -538,3 +547,382 @@ def test_low_available_memory_hold_fits_the_probe_cap() -> None:
 
     requested = util.MEMORY_RAMP_BUDGET + (util.MEMORY_DURATION + 300 + 120) + 120
     assert requested <= mem.PROBE_MAX_SECONDS, requested
+
+
+# --------------------------------------------------------------------------- #
+# read_failure / swap_pressure: raw /proc/meminfo replay (HOST_SOURCE_REPLAY)
+# --------------------------------------------------------------------------- #
+
+isolated_runtime = cov_support.isolated_runtime
+host_case = cov_host.host_case
+
+SWAP_FIXTURE_PERCENT = (
+    100.0 * (mem.SWAP_TOTAL_KB - mem.SWAP_FREE_KB) / mem.SWAP_TOTAL_KB
+)
+MEMINFO_TEXT = (
+    "MemTotal:       2113929216 kB\n"
+    "MemFree:        2000000000 kB\n"
+    "MemAvailable:   2050000000 kB\n"
+    "Buffers:           1000000 kB\n"
+    "Cached:           40000000 kB\n"
+    "SwapCached:              0 kB\n"
+    "SwapTotal:               0 kB\n"
+    "SwapFree:                0 kB\n"
+    "Shmem:              500000 kB\n"
+    "SReclaimable:      2000000 kB\n"
+)
+
+
+def _replay_probe(**extra: Any) -> FakeProbe:
+    script: dict[str, Any] = {
+        "build-meminfo-fixture": {
+            "name": "meminfo",
+            "path": "/run/gfrs-live/source-x/fixtures/meminfo",
+            "swap_used_percent": SWAP_FIXTURE_PERCENT,
+            "memory_used_percent": 3.0,
+        },
+        "open-window": {
+            "after": {"ActiveState": "active"},
+            "proof_scope": "live-replay",
+            "verification": {
+                "ok": True,
+                "checks": [
+                    {
+                        "kind": "inaccessible",
+                        "dest": "/proc/meminfo",
+                        "unit_readable": False,
+                        "host_readable": True,
+                        "ok": True,
+                    }
+                ],
+            },
+        },
+        "status": {"fixtures": {}},
+        "close-window": {"clean": True},
+    }
+    script.update(extra)
+    return FakeProbe(script)
+
+
+def _replay_ctx(
+    variant: str,
+    *,
+    docs: list[dict[str, Any]],
+    tmp_path: Path,
+    replay: FakeProbe | None = None,
+) -> Any:
+    spec = SPECS[variant]
+    node = FakeProbe({"survey": survey_response()})
+    regional = FakeRegional(cpu_python=store_script({"activity": docs}))
+    return make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=regional,
+        probes={
+            f"source-replay@{NODE}": replay or _replay_probe(),
+            f"node@{NODE}": node,
+        },
+        settings=make_settings(spec, node=NODE),
+        window_minutes=60,
+    )
+
+
+def _empty_doc(**extra: Any) -> dict[str, Any]:
+    return {
+        "incidents": [],
+        "workflows": [],
+        "batches": [],
+        "markers": [],
+        "health_signals": {},
+        "metric_latest": [],
+        "notifications": [],
+        "collector_statuses": [],
+        **extra,
+    }
+
+
+def _unreadable_batch(
+    observed_at: str, samples: list[dict[str, Any]] = ()
+) -> dict[str, Any]:
+    return {
+        "observed_at": observed_at,
+        "batch_id": f"host-{observed_at}",
+        "edge_filter_reasons": ["baseline", "collection-error:_memory"],
+        "collection_errors": [
+            "_memory: PermissionError: [Errno 13] Permission denied: '/proc/meminfo'"
+        ],
+        "samples": list(samples),
+    }
+
+
+def test_read_failure_is_unknown_and_recovers(tmp_path: Path) -> None:
+    window = _empty_doc(batches=[_unreadable_batch("2026-10-24T00:00:20+00:00")])
+    recovered = _empty_doc(
+        batches=[host_batch("2026-10-24T00:04:00+00:00", "memory_used_percent", 3.0)]
+    )
+    replay = _replay_probe()
+    ctx = _replay_ctx(
+        "read_failure", docs=[window, recovered], tmp_path=tmp_path, replay=replay
+    )
+    result = mem.read_failure(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["proof_scope"] == "live-replay" and result["batches_in_window"] == 1
+    opened = next(call for call in replay.calls if call[0] == "open-window")
+    assert ("--inaccessible", "/proc/meminfo") == tuple(
+        opened[opened.index("--inaccessible") : opened.index("--inaccessible") + 2]
+    ), opened
+    assert "--bind" not in opened and "--wrapper" not in opened, opened
+    assert any(call[0] == "close-window" for call in replay.calls), replay.calls
+
+
+def test_read_failure_fails_on_a_healthy_value_or_a_hardware_step(
+    tmp_path: Path,
+) -> None:
+    sample = {"name": "memory_used_percent", "device": None, "value": 3.0, "labels": {}}
+    window = _empty_doc(
+        batches=[_unreadable_batch("2026-10-24T00:00:20+00:00", [sample])],
+        workflows=[
+            workflow(
+                "wf-x",
+                "inc-x",
+                ["MARK_UNSCHEDULABLE", "RESTART_NODE"],
+                status="RUNNING",
+            )
+        ],
+    )
+    ctx = _replay_ctx("read_failure", docs=[window, window], tmp_path=tmp_path)
+    result = mem.read_failure(ctx)
+    assert result["verdict"] == "FAIL", result
+    joined = "\n".join(result["errors"])
+    assert "memory_used_percent=3.0" in joined and "RESTART_NODE" in joined, joined
+
+
+def test_read_failure_is_inconclusive_when_the_unit_could_still_read(
+    tmp_path: Path,
+) -> None:
+    replay = _replay_probe(
+        **{
+            "open-window": {
+                "after": {"ActiveState": "active"},
+                "verification": {
+                    "ok": True,
+                    "checks": [
+                        {"kind": "inaccessible", "dest": "/proc/meminfo", "ok": False}
+                    ],
+                },
+            }
+        }
+    )
+    ctx = _replay_ctx(
+        "read_failure", docs=[_empty_doc()], tmp_path=tmp_path, replay=replay
+    )
+    with pytest.raises(
+        VariantInconclusive, match="unreadable inside the host collector unit"
+    ):
+        mem.read_failure(ctx)
+
+
+def _swap_docs(*, validation_status: str = "FAILED") -> list[dict[str, Any]]:
+    inc = incident("inc-swap", "swap_used_percent", state="RECOVERED")
+    inc["reasons"] = [
+        "host swap pressure",
+        "diagnostic inconclusive: validation failed",
+    ]
+    executions = [
+        {
+            "operation": "VALIDATE_HOST",
+            "status": validation_status,
+            "details": {
+                "host_diagnostic_failure": True,
+                "node_failures": {NODE: ["host_diagnostic:swap_used_percent"]},
+            }
+            if validation_status == "FAILED"
+            else {},
+        }
+    ]
+    wf = workflow(
+        "wf-swap",
+        "inc-swap",
+        ["FREEZE_EVIDENCE", "VALIDATE_HOST"],
+        status=validation_status,
+        probe_metric="swap_used_percent",
+        executions=executions,
+    )
+    detection = _empty_doc(
+        incidents=[inc],
+        workflows=[wf],
+        batches=[
+            host_batch(
+                "2026-10-24T00:00:20+00:00", "swap_used_percent", SWAP_FIXTURE_PERCENT
+            ),
+            host_batch("2026-10-24T00:00:20+00:00", "memory_used_percent", 3.0),
+        ],
+    )
+    recovery = _empty_doc(
+        incidents=[inc],
+        workflows=[wf],
+        batches=[
+            host_batch("2026-10-24T00:03:00+00:00", "swap_used_percent", 0.0),
+            host_batch("2026-10-24T00:03:15+00:00", "swap_used_percent", 0.0),
+        ],
+    )
+    return [detection, detection, recovery]
+
+
+def test_swap_pressure_passes_the_diagnostic_chain_from_a_raw_meminfo_replay(
+    tmp_path: Path,
+) -> None:
+    replay = _replay_probe()
+    ctx = _replay_ctx(
+        "swap_pressure", docs=_swap_docs(), tmp_path=tmp_path, replay=replay
+    )
+    result = mem.swap_pressure(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    built = next(call for call in replay.calls if call[0] == "build-meminfo-fixture")
+    assert built[1:] == (
+        "--source",
+        "/proc/meminfo",
+        "--set",
+        f"SwapTotal={mem.SWAP_TOTAL_KB}",
+        "--set",
+        f"SwapFree={mem.SWAP_FREE_KB}",
+        "--run-id",
+        ctx.run_id,
+    ), built
+    opened = next(call for call in replay.calls if call[0] == "open-window")
+    assert opened[1:7] == (
+        "--mode",
+        "bind",
+        "--restore-seconds",
+        str(SPECS["swap_pressure"].max_minutes * 60),
+        "--bind",
+        "meminfo:/proc/meminfo",
+    ), opened
+    assert result["fixture_swap_used_percent"] == SWAP_FIXTURE_PERCENT
+    assert result["recovery"]["errors"] == [] and result["proof_scope"] == "live-replay"
+
+
+def test_swap_pressure_fails_when_validate_host_succeeded_while_held(
+    tmp_path: Path,
+) -> None:
+    ctx = _replay_ctx(
+        "swap_pressure",
+        docs=_swap_docs(validation_status="SUCCEEDED"),
+        tmp_path=tmp_path,
+    )
+    result = mem.swap_pressure(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any(
+        "succeeded while the fault was still held" in e for e in result["errors"]
+    ), result["errors"]
+
+
+def test_swap_pressure_is_inconclusive_when_the_fixture_or_samples_do_not_match(
+    tmp_path: Path,
+) -> None:
+    low = _replay_probe(
+        **{
+            "build-meminfo-fixture": {
+                "swap_used_percent": 50.0,
+                "memory_used_percent": 3.0,
+            }
+        }
+    )
+    ctx = _replay_ctx("swap_pressure", docs=_swap_docs(), tmp_path=tmp_path, replay=low)
+    with pytest.raises(VariantInconclusive, match="below the 80.0% rule"):
+        mem.swap_pressure(ctx)
+    docs = _swap_docs()
+    for doc in docs:
+        for batch in doc["batches"]:
+            for sample in batch["samples"]:
+                if sample["name"] == "swap_used_percent" and sample["value"] > 80:
+                    sample["value"] = 99.0
+    ctx = _replay_ctx("swap_pressure", docs=docs, tmp_path=tmp_path)
+    with pytest.raises(VariantInconclusive, match="never matched the fixture"):
+        mem.swap_pressure(ctx)
+
+
+def test_read_failure_and_swap_pressure_specs() -> None:
+    for name in ("read_failure", "swap_pressure"):
+        spec = SPECS[name]
+        assert spec.implemented and spec.proof_mode == "live-replay"
+        assert spec.lanes == ("eks", "hp") and spec.approvals == ("HOST_SOURCE_REPLAY",)
+    assert mem.SWAP_THRESHOLD == NodeHealthPolicy.METRIC_RULES["swap_used_percent"][0]
+
+
+def test_swap_rule_is_pinned_against_the_product() -> None:
+    threshold, category, severity, action, _reason = NodeHealthPolicy.METRIC_RULES[
+        "swap_used_percent"
+    ]
+    assert (threshold, severity, action) == (
+        80.0,
+        Severity.WARNING,
+        RecoveryAction.RUN_DIAGNOSTICS,
+    )
+    assert category.value == "MEMORY"
+    assert "swap_used_percent" not in NodeHealthPolicy.METRIC_RULE_SUSTAIN_SECONDS, (
+        "swap has no sustain: the first delivered breach mints the finding"
+    )
+    batch = host_telemetry_batch(
+        "swap-1",
+        datetime(2026, 10, 24, tzinfo=timezone.utc),
+        [
+            HostMetricSample(
+                name="swap_used_percent", value=SWAP_FIXTURE_PERCENT, unit="percent"
+            )
+        ],
+        runtime_profile_version="simulated-v1",
+    )
+    (finding,) = NodeHealthPolicy(build_store()).evaluate_metrics(batch)
+    assert finding.recommended_action is RecoveryAction.RUN_DIAGNOSTICS
+    probe_parameters = diagnostic_probe(finding)
+    assert (
+        probe_parameters is not None
+        and probe_parameters["metric"] == "swap_used_percent"
+    )
+    assert (
+        probe_parameters["threshold"] == 80.0
+        and probe_parameters["comparison"] == "gte"
+    )
+
+
+def test_the_real_memory_contributor_reads_the_probe_built_meminfo(
+    host_case,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """``build-meminfo-fixture`` output -> ``system_metrics._memory`` -> swap 87.5 %."""
+
+    monkeypatch.setattr(probe, "STATE_ROOT", tmp_path / "run" / "gfrs-live")
+    source = tmp_path / "meminfo.real"
+    source.write_text(MEMINFO_TEXT)
+    code = probe.main(
+        [
+            "build-meminfo-fixture",
+            "--run-id",
+            "gl002-swap-pressure-a1-deadbeef",
+            "--source",
+            str(source),
+            "--set",
+            f"SwapTotal={mem.SWAP_TOTAL_KB}",
+            "--set",
+            f"SwapFree={mem.SWAP_FREE_KB}",
+        ]
+    )
+    receipt = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert code == 0, receipt
+    assert receipt["swap_used_percent"] == SWAP_FIXTURE_PERCENT
+    fixture = Path(receipt["path"]).read_text()
+    assert "SwapTotal:" in fixture and fixture.count("\n") == MEMINFO_TEXT.count("\n")
+    cov_host.write_file(host_case.roots.proc / "meminfo", fixture)
+    batch = host_case.build("_memory").collect_once()
+    values = cov_host.values(batch)
+    assert values[("swap_used_percent", None)] == SWAP_FIXTURE_PERCENT, values
+    assert (
+        abs(values[("memory_used_percent", None)] - receipt["memory_used_percent"])
+        < 1e-6
+    )
+    assert values[("memory_used_percent", None)] < mem.USED_THRESHOLD
+    graded = NodeHealthPolicy(build_store()).evaluate_metrics(batch)
+    assert [item.metric_name for item in graded] == ["swap_used_percent"], graded

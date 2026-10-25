@@ -93,7 +93,9 @@ def test_the_executable_lane_variants_are_the_wired_ones() -> None:
         "GF-GENERAL-LIVE-002.cgroup_only",
         "GF-GENERAL-LIVE-002.memory_pressure",
         "GF-GENERAL-LIVE-002.no_swap",
+        "GF-GENERAL-LIVE-002.read_failure",
         "GF-GENERAL-LIVE-002.recovery",
+        "GF-GENERAL-LIVE-002.swap_pressure",
         "GF-GENERAL-LIVE-007.health_failed",
         "GF-GENERAL-LIVE-007.healthy",
         "GF-GENERAL-LIVE-007.malformed_json",
@@ -110,6 +112,10 @@ def test_the_executable_lane_variants_are_the_wired_ones() -> None:
         "GF-GENERAL-LIVE-010.rdma_error",
         "GF-GENERAL-LIVE-010.retry",
         "GF-GENERAL-LIVE-010.rnr",
+        "GF-GENERAL-LIVE-012.expectation_wrong",
+        "GF-GENERAL-LIVE-012.proc_unreadable",
+        "GF-GENERAL-LIVE-012.query_failed",
+        "GF-GENERAL-LIVE-012.single_sample",
         "GF-GENERAL-LIVE-015.command_failure",
         "GF-GENERAL-LIVE-015.critical",
         "GF-GENERAL-LIVE-015.nonrecoverable",
@@ -117,6 +123,11 @@ def test_the_executable_lane_variants_are_the_wired_ones() -> None:
         "GF-GENERAL-LIVE-015.unsupported_bmc",
         "GF-GENERAL-LIVE-015.wrong_column",
     ], implemented
+    for key in implemented:
+        spec = registry[key]
+        if spec.proof_mode == reg.LIVE_REPLAY:
+            assert "HOST_SOURCE_REPLAY" in spec.approvals, key
+            assert spec.lanes == ("eks", "hp"), key
 
 
 # --------------------------------------------------------------------------- #
