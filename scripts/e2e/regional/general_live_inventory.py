@@ -668,19 +668,8 @@ VARIANTS = [
         approvals=("KERNEL_SOURCE_REPLAY",),
         execute=unreadable_state,
     ),
-    deferred_variant(
-        CASE_013,
-        "pci_missing",
-        proof_mode=LIVE_REPLAY,
-        reason=(
-            "NOT_AUTHORIZED: a PCI-root replay with fewer EFA functions drives the "
-            "PCI_DEVICE_MISSING -> REBOOT_NODE chain on the only EKS GPU node; needs a "
-            "reboot approval + maintenance window, and the known double-read-failure risk "
-            "must be reviewed before executing"
-        ),
-        lanes=("eks",),
-        expected="confirmed PCI_DEVICE_MISSING -> reboot chain with a new boot id (spec FAIL risk: two read failures must not reboot)",
-    ),
+    # 013 pci_missing (the PCI_DEVICE_MISSING -> REBOOT_NODE chain, with the
+    # unreadable-root negative stage) lives in general_live_efa_pci.py.
     deferred_variant(
         CASE_013,
         "driver_unbound",

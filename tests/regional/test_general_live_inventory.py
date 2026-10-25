@@ -16,6 +16,7 @@ import pytest
 
 from gpu_fault.host_health import HostMetricSample, efa_inventory_rule
 from gpu_fault.models import RecoveryAction, Severity
+from scripts.e2e.regional import general_live_efa_pci as pci_mod
 from scripts.e2e.regional import general_live_inventory as mod
 from scripts.e2e.regional.general_live_fixture import (
     VariantBlocked,
@@ -145,7 +146,12 @@ def test_unreadable_state_fails_on_a_reboot(tmp_path: Path) -> None:
 def test_013_and_014_cover_every_variant() -> None:
     for case in ("GF-GENERAL-LIVE-013", "GF-GENERAL-LIVE-014"):
         expected = set(coverage_rows()[case])
-        got = {item.variant for item in mod.VARIANTS if item.case_id == case}
+        # 013 pci_missing (the reboot chain) is registered by general_live_efa_pci.
+        got = {
+            item.variant
+            for item in (*mod.VARIANTS, *pci_mod.VARIANTS)
+            if item.case_id == case
+        }
         assert got == expected, f"{case} registers every coverage variant"
     implemented = {item.variant for item in mod.VARIANTS if item.execute is not None}
     assert implemented == {
