@@ -43,7 +43,7 @@ CAPABILITY_ABSENT: the site has no IB-only RDMA device.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import (
@@ -56,6 +56,7 @@ from scripts.e2e.regional.general_live_common import (
 )
 from scripts.e2e.regional.general_live_efa_fixture import (
     CASE,
+    CLOCK_TOLERANCE_SECONDS,
     DETECTION_BUDGET,
     ERRORS_METRIC,
     ETHTOOL_GROUPS,
@@ -63,6 +64,7 @@ from scripts.e2e.regional.general_live_efa_fixture import (
     INVENTORY_METRIC,
     LINK_DOWN_TEXT,
     LINK_METRIC,
+    MISSING_METRIC,
     PROOF_SCOPE,
     RAMP_STEP,
     REPLAY_COUNTERS,
@@ -86,6 +88,7 @@ from scripts.e2e.regional.general_live_efa_fixture import (
 )
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
+    VariantInconclusive,
     VariantNotRun,
     utc_now,
 )
@@ -97,17 +100,20 @@ from scripts.e2e.regional.general_live_registry import (
 )
 from scripts.e2e.regional.general_live_source_replay import (
     HOST_SOURCE_REPLAY,
+    bounded_exposure_seconds,
     rule,
 )
 from scripts.e2e.regional.general_live_verdicts import (
     ChainExpectation,
     DIAGNOSTIC_ONLY_STATES,
     chain_errors,
+    executions,
     final_execution,
     finding_incidents,
     hardware_errors,
     isolation_operations,
     node_isolated,
+    parse_time,
     samples,
     settled,
     verdict,
@@ -302,23 +308,55 @@ def rdma_error(ctx: VariantContext) -> dict[str, Any]:
     )
 
 
+def _late_readings(
+    document: Mapping[str, Any], metric: str, device: str | None, after: datetime
+) -> list[dict[str, Any]]:
+    """``metric`` readings >= 1 the product recorded after ``after`` (plus tolerance)."""
+
+    cutoff = after + timedelta(seconds=CLOCK_TOLERANCE_SECONDS)
+    return [
+        item
+        for item in samples(dict(document), metric, device=device)
+        if isinstance(item.get("value"), (int, float))
+        and item["value"] >= 1
+        and (moment := parse_time(item.get("observed_at"))) is not None
+        and moment > cutoff
+    ]
+
+
 def link_inactive(ctx: VariantContext) -> dict[str, Any]:
-    """A bound port state != ACTIVE -> rdma_link_down=1 -> fabric diagnostic, no reboot."""
+    """A bound port state != ACTIVE for a bounded exposure -> ``rdma_link_down=1``
+    -> the fabric diagnostic fails on the held port; the LINK_INACTIVE
+    co-finding diagnoses the restored port; nothing reboots.
+
+    The window's own deadman closes it :func:`bounded_exposure_seconds` after
+    it opened: after the collector's second tick -- which the ``rdma_link_down``
+    chain's VALIDATE_FABRIC judges (FAILED on the held port) and which confirms
+    the ``efa_inventory_mismatch`` LINK_INACTIVE co-finding -- and before a
+    third. The co-finding's diagnostic judges fresh readings (batch 175) and
+    would escalate a port still inactive to REBOOT_NODE by design, so it only
+    ever sees the restored port: SUCCEEDED, RECOVERED, no RESTART_NODE, under
+    HOST_SOURCE_REPLAY alone. A verdict the product reached on the restored
+    port, or an inactive reading after the restore, is INCONCLUSIVE (the bound
+    decided nothing about the product), never a verdict on it.
+    """
 
     run_survey(ctx)
     fixture = EfaSourceFixture(ctx)
     target = state_target(fixture.survey())
     ctx.evidence.write("efa-target", target.describe())
     fixture.bind("efa-state", target.dest("state"), LINK_DOWN_TEXT)
+    exposure = bounded_exposure_seconds(ctx.host_interval)
     started = utc_now()
-    fixture.open()
-    metrics = {LINK_METRIC, INVENTORY_METRIC}
+    fixture.open(restore_seconds=exposure)
+    restore_at = utc_now() + timedelta(seconds=exposure)
+    metrics = {LINK_METRIC, INVENTORY_METRIC, MISSING_METRIC}
     detection = wait_for_incident(
         ctx,
         started,
         LINK_METRIC,
         device=target.port_device,
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=exposure + ctx.host_interval * 3 + 60,
         metrics=metrics,
         name="link-inactive",
     )
@@ -328,6 +366,46 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         if incidents
         else detection
     )
+    remaining = (restore_at - utc_now()).total_seconds()
+    if remaining > 0:
+        ctx.hold(remaining + CLOCK_TOLERANCE_SECONDS, name="exposure")
+    closed = fixture.close()
+    closed_by = "deadman" if closed.get("already_closed") else "runner"
+    ctx.evidence.append_oracle(
+        [
+            {
+                "held_port": target.port_device,
+                "exposure_seconds": exposure,
+                "restore_at": restore_at.isoformat(),
+                "closed_by": closed_by,
+            }
+        ],
+        source="efa-state",
+    )
+    if not incidents and not metric_values(held, LINK_METRIC, target.port_device):
+        raise VariantInconclusive(
+            f"the bounded exposure ({exposure} s) ended before the product read "
+            f"{LINK_METRIC} on {target.port_device}: no sample, nothing to judge"
+        )
+    judged = (
+        final_execution(
+            workflows_of(held, str(incidents[0]["incident_id"]))[0], "VALIDATE_FABRIC"
+        )
+        if incidents and workflows_of(held, str(incidents[0]["incident_id"]))
+        else None
+    )
+    judged_at = parse_time((judged or {}).get("updated_at"))
+    if (
+        judged is not None
+        and judged.get("status") == "SUCCEEDED"
+        and judged_at is not None
+        and judged_at > restore_at - timedelta(seconds=CLOCK_TOLERANCE_SECONDS)
+    ):
+        raise VariantInconclusive(
+            "the fabric diagnostic judged the port after the bounded exposure ended "
+            f"({judged_at.isoformat()} > restore {restore_at.isoformat()}): its "
+            "SUCCEEDED is about the restored port, not the held one"
+        )
     inventory_samples = [
         item for item in samples(held, INVENTORY_METRIC) if item.get("value") == 1
     ]
@@ -357,8 +435,6 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         "hardware": hardware_errors(held),
         "not_isolated": _not_isolated(ctx, held),
     }
-    fixture.close()
-    closed_at = utc_now()
     stages["real_restored"] = fixture.restored_errors()
     recovered = await_metric_recovery(
         ctx,
@@ -366,24 +442,62 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         1.0,
         device=target.port_device,
         name="link-recovery",
-        since=closed_at,
+        since=restore_at,
     )
     stages["recovery"] = recovered["errors"]
-    stages["settled"] = _settle(
+    inventory_incidents = finding_incidents(held, INVENTORY_METRIC)
+    ids = [str(item["incident_id"]) for item in (*incidents, *inventory_incidents)]
+    final = wait_settled(
         ctx,
         started,
-        [*incidents, *finding_incidents(held, INVENTORY_METRIC)],
+        ids,
+        timeout_seconds=ctx.host_summary + 300,
         metrics=metrics,
         name="link-settled",
     )
+    late = _late_readings(final, MISSING_METRIC, None, restore_at)
+    if late:
+        raise VariantInconclusive(
+            f"the exposure bound did not hold: {len(late)} {MISSING_METRIC} reading(s) "
+            f"after the restore at {restore_at.isoformat()} (first "
+            f"{late[0]['observed_at']}); the designed escalation on fresh inactive "
+            "evidence applies and is not a verdict on the product"
+        )
+    stages["settled"] = (
+        [] if settled(final, ids) else [f"incidents did not settle: {ids}"]
+    )
+    stages["co_finding_diagnosed"] = [
+        f"the LINK_INACTIVE co-finding incident {item.get('incident_id')} is "
+        f"{item.get('state')}, not RECOVERED, after the port was restored"
+        for item in final.get("incidents") or []
+        if str(item.get("incident_id"))
+        in {str(inc["incident_id"]) for inc in inventory_incidents}
+        and item.get("state") != "RECOVERED"
+    ] + [
+        f"VALIDATE_FABRIC of the co-finding waited on missing_inventory_action_completion "
+        f"({workflow.get('request_id')})"
+        for inc in inventory_incidents
+        for workflow in workflows_of(final, str(inc["incident_id"]))
+        for item in executions(workflow, "VALIDATE_FABRIC")
+        if "missing_inventory_action_completion" in str(item.get("details") or "")
+    ]
+    stages["no_reboot_after_restore"] = hardware_errors(final)
     return _result(
         stages,
         notes=[
-            f"bound {target.dest('state')} = {LINK_DOWN_TEXT!r} (phys_state real); "
-            "VALIDATE_FABRIC must fail on the held port and nothing may reboot or cordon",
-            f"inventory co-finding samples: {len(inventory_samples)}",
+            f"bound {target.dest('state')} = {LINK_DOWN_TEXT!r} (phys_state real) for a "
+            f"bounded exposure of {exposure} s (closed by {closed_by}); VALIDATE_FABRIC "
+            "must fail on the held port and nothing may reboot or cordon",
+            f"inventory co-finding samples: {len(inventory_samples)}; the co-finding's "
+            "diagnostic judges the restored port",
         ],
-        extra={"target": target.describe(), "recovery": recovered},
+        extra={
+            "target": target.describe(),
+            "recovery": recovered,
+            "exposure_seconds": exposure,
+            "restore_at": restore_at.isoformat(),
+            "closed_by": closed_by,
+        },
     )
 
 
@@ -968,13 +1082,21 @@ VARIANTS = [
     ),
     _spec(
         "link_inactive",
-        f"bind the port's state file to {LINK_DOWN_TEXT!r} inside the unit (phys_state real)",
-        f"{LINK_METRIC}=1 on the port -> WARNING -> VALIDATE_FABRIC fails on the held port; "
-        "any efa_inventory_mismatch co-finding is LINK_INACTIVE (diagnose only); no reboot "
-        "or cordon; the link reads up again after the window closes",
+        f"bind the port's state file to {LINK_DOWN_TEXT!r} inside the unit (phys_state "
+        "real) for a bounded exposure: the window's deadman closes it 1.7 collector "
+        "intervals after it opened (two ticks, never a third)",
+        f"{LINK_METRIC}=1 on the port -> WARNING -> VALIDATE_FABRIC fails on the held port "
+        "(judged before the restore); the efa_inventory_mismatch co-finding is "
+        "LINK_INACTIVE and its diagnostic SUCCEEDS on the restored port (RECOVERED, never "
+        "missing_inventory_action_completion); no RESTART_NODE, no cordon; the link reads "
+        "up again after the window closes",
         link_inactive,
         risk="M",
         max_minutes=35,
+        cleanup=(
+            "the window closes itself at the exposure bound (deadman); the runner's close "
+            "confirms it and reads the real state back inside the unit"
+        ),
     ),
     _spec(
         "rnr",
