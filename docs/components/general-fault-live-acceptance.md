@@ -676,8 +676,9 @@ IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，cre
 
 第二批补充 host/device 类别 002 内存/交换、005 共享存储、007 SMART、
 010 EFA/RDMA 计数、012 GPU 掉卡、015 BMC（模块
-`general_live_memory`/`general_live_shared`/`general_live_devices`，每个必测变体
-都在注册表里）。可在本站真机执行的只有不需要原始源回放夹具的变体：
+`general_live_memory`/`general_live_shared`/`general_live_devices`（010/012）/
+`general_live_smart`（007）/`general_live_bmc`（015），每个必测变体都在注册表里）。
+可在本站真机执行的是不需要原始源回放夹具的变体，以及已在共享回放器上接线的 007/015：
 
 - 002 `memory_pressure`、`recovery`（native，复用节点探针 `memory-start` 的受限
   cgroup 压力和 meminfo oracle，需 `HOST_MEMORY_PRESSURE`；`memory_used_percent`
@@ -705,19 +706,50 @@ IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，cre
   任何 STOP 或隔离为 FAIL。
 - 007 `healthy`（observation：只读确认真实 SMART 判定健康且不产生存储 finding，
   作为失败变体的对照基线）。
+- 007 SMART 的回放变体 `health_failed`/`query_failed`/`scan_failed`/`malformed_json`/
+  `tool_missing`/`unsupported_device`（live-replay，模块 `general_live_smart`，两条车道，需
+  `HOST_SOURCE_REPLAY`）：在共享回放器的命令包装模式下只改写产品真实 `smartctl` 调用的一个
+  经审查字段——`-H -j <dev>` 的 `smart_status.passed=false`（health_failed）、删除
+  `smart_status` 对象（unsupported_device）、整段无判定 JSON + 退出码 2（query_failed）、
+  截断 JSON（malformed_json）、`--scan-open` 退出码 1（scan_failed），或只在单元内把
+  `smartctl` 设为不可访问（tool_missing）。目标盘取产品自己最新 `smart_health_failed`
+  读数的设备（只读产品记录；无判定盘即 `NOT_RUN(CAPABILITY_ABSENT)`）。判定只读产品记录：
+  `health_failed` 走 `smart_health_failed=1` → MARK_UNSCHEDULABLE + QUARANTINE（无 STOP/
+  硬件步骤）→ 关窗后真实工具重新判健康（recovered）→ 受控恢复；`query_failed`/
+  `malformed_json`/`scan_failed` 须是 `smart_query_failed`（`failure_mode`
+  QUERY_FAILED/SCAN_FAILED）加 `_smart` 采集错误、无该盘判定、其余盘判定保留、无 finding
+  无隔离，`scan_failed` 另禁止 `NO_DEVICES`（规格点名的 scan 退出码缺口）；`tool_missing`/
+  `unsupported_device` 须是 `smart_status_unsupported`（TOOL_MISSING/NO_SMART_STATUS）且无
+  采集错误、不记健康盘。包装器日志（`audit-read`）是“产品确实问过且规则已生效”的 oracle，
+  否则 `INCONCLUSIVE`；每个变体关窗后都要读到真实 `smartctl` 的新鲜判定且无 `_smart` 错误。
+- 015 BMC 的回放变体 `critical`/`nonrecoverable`/`wrong_column`/`unavailable_sensor`/
+  `command_failure`（live-replay，模块 `general_live_bmc`，两条车道，需 `HOST_SOURCE_REPLAY`；
+  `install-wrapper --allow-missing-real`：EC2 无 BMC 也无 `ipmitool`，shim 只按计划回答
+  `ipmitool sensor` 的整段输出/退出码，其他调用一律 command not found，绝不编造 BMC）：
+  `critical`（两行 cr）/`nonrecoverable`（一行 nr）→ `bmc_critical_sensor` = cr/nr 行数 →
+  MARK_UNSCHEDULABLE + QUARANTINE 一条 incident，随后同一包装器改供健康表、产品读到 0
+  （recovered），再关窗、受控恢复；`wrong_column`（cr/nr 出现在名称/值/单位列、三列残行）与
+  `unavailable_sensor`（一行 na/na）须是 `bmc_critical_sensor=0`、无采集错误、无 finding、
+  无隔离；`command_failure`（退出码 1 “Could not open device”）须是 `_bmc` 采集错误且无样本。
+  `critical` 登记为预期 FAIL：产品的 `bmc_critical_sensor` 只是计数，告警不带传感器名称与
+  阈值范围（`product_gap` 指向 `collectors/host/system_metrics.py _bmc`；产品修复后该变体自然
+  转 PASS）。`unsupported_bmc` 是只读 observation（如 002 `no_swap`）：记录 `ipmitool` 是否
+  安装、产品在窗口内无 BMC 样本与 finding 即为能力记录；若 `ipmitool` 存在而无 BMC 导致每 tick
+  `_bmc` 采集错误记 FAIL（永久能力缺口不应是采集错误）；若节点真的有 BMC 应答则 BLOCKED
+  （该变体不适用）。`healthy` 仍 `NOT_RUN(CAPABILITY_ABSENT)`。
 
 其余变体按映射文件留在分母并记 `NOT_RUN`，原因精确可查：
 
-- `FIXTURE_NOT_READY`：007/010/012/015 以及 002 `read_failure`、005 `stat_timeout`
-  /`io_only_failure` 需要把 `smartctl`/`ipmitool`/`ethtool`/`nvidia-smi` 的输出或
+- `FIXTURE_NOT_READY`：010/012 以及 002 `read_failure`、005 `stat_timeout`
+  /`io_only_failure` 需要把 `ethtool`/`nvidia-smi` 的输出或
   `/proc/meminfo`、EFA `hw_counters`/`state`、`/proc/driver/nvidia` 的读取**只在
   host collector 单元私有环境里**替换的共享原始源回放夹具。该通用回放器现已由
-  协调方集中审查提供（下文“共享主机原始源回放夹具”），各类别车道在其上接线；
-  接线前这些变体仍记 `FIXTURE_NOT_READY`。005 `stat_timeout`/`io_only_failure`
+  协调方集中审查提供（下文“共享主机原始源回放夹具”），各类别车道在其上接线（007/015
+  已接线，见上）；接线前这些变体仍记 `FIXTURE_NOT_READY`。005 `stat_timeout`/`io_only_failure`
   不是文件/命令读取，不在其范围内。
 - `CAPABILITY_ABSENT`：005 的共享存储变体（本站无可扰动的独立 NFS/Lustre export）、
-  010 `non_efa`（本站只有 EFA RDMA 设备）、015 `healthy`/`unsupported_bmc`
-  （EC2 无 BMC）、002 `swap_pressure`（无 swap 且不得为测试开 swap）。
+  010 `non_efa`（本站只有 EFA RDMA 设备）、015 `healthy`（EC2 无 BMC；`unsupported_bmc`
+  本身就是这条能力记录的只读 observation）、002 `swap_pressure`（无 swap 且不得为测试开 swap）。
 - `VENDOR_LAB_ONLY`：012 `confirmed_missing`/`reboot_verified`/`post_reboot_failure`
   需要真实掉卡与已批准的 provider reboot；本 lane 绝不解绑或移除真实 GPU。
 

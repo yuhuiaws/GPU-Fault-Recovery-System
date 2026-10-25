@@ -1211,9 +1211,10 @@ if it is not loaded (`KERNEL_MODULE_LOAD`). Its limits are deliberate:
 Phase 2 adds the host/device categories 002 memory/swap, 005 shared storage,
 007 SMART, 010 EFA/RDMA counters, 012 GPU missing and 015 BMC
 (`scripts/e2e/regional/general_live_memory.py`, `general_live_shared.py`,
-`general_live_devices.py`). Every required variant is in the registry so none
-drops out of the denominator, but only the variants that need no raw-source
-replay fixture are executable on this site: 002 `memory_pressure`/`recovery`
+`general_live_devices.py` for 010/012, `general_live_smart.py` for 007,
+`general_live_bmc.py` for 015). Every required variant is in the registry so none
+drops out of the denominator. Executable without any raw-source replay fixture
+are 002 `memory_pressure`/`recovery`
 (native host memory pressure in a capped cgroup, behind `HOST_MEMORY_PRESSURE`)
 and `no_swap`, 002 `cgroup_only` (the negative control: the node probe's
 `memory-start --cgroup-oom-bytes` exhausts a 2 GiB test cgroup -- no swap,
@@ -1243,24 +1244,50 @@ probe Pod touches the node, and a probe failure's JSON names its step
 (`error_code`/`error_site`), so the memory tests now also run the real
 `memory_start` over a p5en-shaped fake host to pin the accepted hold.
 
-The rest stay `NOT_RUN`: `FIXTURE_NOT_READY` for 007/010/012/015 and a few
-002/005 variants, which need the targeted command/file reading
-(`smartctl`/`ipmitool`/`ethtool`/`nvidia-smi` output, `/proc/meminfo`, the EFA
-`hw_counters`/`state` sysfs, `/proc/driver/nvidia`) replaced only inside the
-one host-collector unit's private environment -- a shared raw-source replay
-helper that phase 2 does not build and leaves to central review, never
+The 007 SMART and 015 BMC replay variants run on the shared host source replay
+(`general_live_source_replay.py`, `--approve HOST_SOURCE_REPLAY`, both lanes):
+the reviewed `smartctl` / `ipmitool` wrapper first on the host collector unit's
+PATH rewrites one allow-listed field of the product's own query (007
+`health_failed` `smart_status.passed=false`, `unsupported_device` without
+`smart_status`, `query_failed` a verdict-less JSON with exit 2, `malformed_json`
+truncated JSON, `scan_failed` a non-zero `--scan-open`) or hides `smartctl`
+inside the unit (`tool_missing`); 015 serves a reviewed `ipmitool sensor` table
+or exit status with `--allow-missing-real` (EC2 has neither a BMC nor
+`ipmitool`; everything but `sensor` answers "command not found"). The drive is
+the device of the product's latest `smart_health_failed` reading, the verdict
+reads only the product's records (marker + `_smart`/`_bmc` collection error for
+UNKNOWN, marker without error for NOT_SUPPORTED, `MARK_UNSCHEDULABLE` +
+`QUARANTINE` and the validated restore for `health_failed` / `critical` /
+`nonrecoverable`, zero critical for `wrong_column` / `unavailable_sensor`), the
+wrapper journal is the oracle that the product asked (otherwise INCONCLUSIVE),
+and every variant closes its window and proves the real tool answers again. A
+replay proves the processing chain only -- no drive fails and no BMC exists, so
+`proof_scope` is `live-replay`; the OPEN_FAILED drive and a hung `-H` query stay
+software-tested; 015 `unavailable_sensor` uses one `na` row among healthy ones
+(a table of only `na` rows reads 0 in the product; not exercised). 015 `critical`
+is registered as an expected FAIL: `_bmc` reports a bare count, so the alert
+never names the critical sensors or their thresholds (spec 015). 015
+`unsupported_bmc` is the read-only capability record of the BMC-less site (like
+002 `no_swap`): FAIL only if an installed `ipmitool` without a BMC makes the
+product report a permanent `_bmc` collection error, BLOCKED if a BMC answers.
+
+The rest stay `NOT_RUN`: `FIXTURE_NOT_READY` for 010/012 and a few 002/005
+variants, which need the targeted command/file reading (`ethtool`/`nvidia-smi`
+output, `/proc/meminfo`, the EFA `hw_counters`/`state` sysfs,
+`/proc/driver/nvidia`) wired onto the same shared replay by their lane, never
 replacing a host binary or a global mount; `CAPABILITY_ABSENT` where the site
 genuinely lacks the capability (no independent NFS/Lustre export, no non-EFA
-RDMA device, no BMC on EC2, no swap device); and `VENDOR_LAB_ONLY` for the
-012 variants that need a real GPU off the bus and an approved provider reboot
-(this lane never unbinds or removes a real GPU). The spec's expected product
-gaps are recorded in the variants' reasons rather than hidden. Three of them
-are closed in the product and proven only by local software tests until the
-replay fixture exists: a failed SMART scan, an unopenable drive and a hung
-drive query read UNKNOWN (`smart_query_failed` plus a collection error), EFA
-`ethtool -S` deltas are reported only from real readings (failures and resets
-are UNKNOWN, missing counters `efa_ethtool_counters_unsupported`), and an NVML
-failure with an unreadable `/proc/driver/nvidia/gpus` is
+RDMA device, no BMC on EC2 for 015 `healthy`, no swap device); and
+`VENDOR_LAB_ONLY` for the 012 variants that need a real GPU off the bus and an
+approved provider reboot (this lane never unbinds or removes a real GPU). The
+spec's expected product gaps are recorded in the variants' reasons rather than
+hidden. Of the three closed in the product, the failed SMART scan and the
+failed drive query are now proven live by 007 `scan_failed` / `query_failed`
+(`smart_query_failed` plus a collection error, never zero drives); an
+unopenable drive and a hung drive query stay software-tested, as do the EFA
+`ethtool -S` deltas reported only from real readings (failures and resets are
+UNKNOWN, missing counters `efa_ethtool_counters_unsupported`) and an NVML
+failure with an unreadable `/proc/driver/nvidia/gpus` being
 `INVENTORY_UNAVAILABLE` rather than zero GPUs. statvfs-OK-but-I/O-fails shared
 storage remains open.
 
