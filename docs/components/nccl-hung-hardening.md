@@ -310,6 +310,28 @@ RDMA 数值只引用触发节点，不能伪称已获取其他所有节点的流
 `RANK/WORLD_SIZE`（如果有），没有环境变量也保留 node/PID/starttime 及进程状态，
 不把一个容器的 watcher rank 当成它的全部 worker。无 rank 的 helper 进程也保留，
 不能由此声称所有训练 rank 都已被识别。
+
+workload cgroup 从哪里来。watcher 只从 Pod 注解 `gpu-fault.io/cgroup-path` 得到容器的 cgroup 路径，
+而这个路径含运行时容器 ID，容器启动前不存在，受管 YAML 契约和产品都不写它；于是每个真机受管任务的
+hung DAG 都只有 `workload_cgroup_paths_by_node={node: []}`。HyperPod GF-GENERAL-LIVE-011 live3/live4 全部变体
+（2026-10-24/25，含 b161 之前的 bf1bb0037847）：两节点的 summary 都是 `SCOPE_UNKNOWN`，`after_summary` 无可选节点，
+triage 以 `NO_VALID_SURVEY` 一个节点都不请求（`active_requested_node_count=0`、节点预算 2 未用），
+`fr_enabled` 与 `fr_disabled` 都报 "COLLECT_HUNG_TRIAGE sampled no rank process"；VALIDATE_FABRIC 的
+`scope_basis=NOT_REPORTED` 也出自同一原因（summary 在计算任务端口绑定之前就返回了）。
+现在控制面另按节点下发 kubelet 在 `containerStatuses[].containerID` 报告的容器 ID
+（`workload_container_ids_by_node`，只含没有显式路径的运行中容器，只接受 64 位小写十六进制，每节点最多 64 个；
+没有可用 ID 时不下发该参数）。Node Agent 在 summary 和 triage 开始时读本机 `/proc/<pid>/cgroup`，
+把以该 ID 命名的路径段（`cri-containerd-<id>.scope`、`crio-<id>.scope`、`docker-<id>.scope`、cgroupfs 的 `<id>`）
+截到该段为止作为容器 cgroup，与显式路径合并成本节点的 scope；`crio-conmon-<id>.scope` 是运行时监控进程，
+不属于容器，嵌套在容器 cgroup 下的子 cgroup 仍属于容器。之后的身份复核（summary、triage、FR 双快照）都读这一个 scope。
+结果的 `workload_scope` 记录 `basis`（`EXPLICIT_CGROUP_PATHS`/`RUNTIME_CONTAINER_ID`/`UNAVAILABLE`）、
+请求/解析/未解析容器数和最多 8 个未解析 ID；一个都找不到仍是 `SCOPE_UNKNOWN`
+（`reason=CONTAINER_CGROUP_NOT_FOUND`，扫描被截断时为 `PROCESS_SCAN_INCOMPLETE`），只找到部分时
+`scan_complete=false`。只读 `/proc`，不扩大 attach 范围：其他作业的容器、同一 GPU 上别的进程都不在 scope 内。
+旧 Agent 忽略该参数，行为同修复前；旧 workflow 没有该参数，也同修复前。
+被动通信监测（communication monitor）的目标仍只认显式路径，受管 Pod 上不分配目标；
+给 `CommunicationTarget` 加字段会让旧 Agent 拒收整个计划，需要按 Agent 能力分批下发，未在本批修改。
+
 每轮采两次 `stat/io/status/wchan`，不扫描所有线程，不读 Python 栈、不触发 FR，
 每节点每轮两次有 2 秒命令上限的 nvidia-smi 查询，两轮总计四次，GPU/NIC 信息按设备去重。
 进程退出、starttime 变化、坏 RDMA 计数对、counter reset 都记为不可用而非零。

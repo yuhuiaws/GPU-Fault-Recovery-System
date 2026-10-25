@@ -3507,6 +3507,16 @@ their ranks, host PIDs and per-node GPU UUIDs. `COLLECT_HUNG_SUMMARY` visits all
 enumerates workload-cgroup processes even without RANK/WORLD_SIZE, reads two proc/optional communication snapshots and per-device
 GPU/RDMA data, and never triggers FR or attaches a stack tool. Resumed surveys reuse completed node results.
 Missing data, byte limits and timing skew are explicit; this is not a continuous all-rank watchdog.
+Where the workload cgroup comes from: a Pod annotated `gpu-fault.io/cgroup-path` supplies that explicit path
+(`workload_cgroup_paths_by_node`). A managed Pod normally has none -- the path contains the runtime container id, unknown
+before the container starts, and the product does not write that annotation -- so the control plane sends, per node, the
+container ids the kubelet reports (the 64-hex part of `containerStatuses[].containerID`, `workload_container_ids_by_node`)
+and the Node Agent finds in its own `/proc/<pid>/cgroup` the container cgroup named after that id
+(`cri-containerd-<id>.scope`, `crio-<id>.scope`, `docker-<id>.scope` or the cgroupfs `<id>`; `crio-conmon-<id>.scope` is not
+part of it). Summary and triage results carry `workload_scope` (`basis`, resolved/unresolved container counts); no container
+found is still `SCOPE_UNKNOWN`, some containers found is `scan_complete=false`, never zero processes. Before this every live
+managed job planned `{node: []}`: every HyperPod GF-GENERAL-LIVE-011 variant's summary was `SCOPE_UNKNOWN` and the triage
+sampled no node (`NO_VALID_SURVEY`).
 The two active diagnostic waves share a default budget of 8 nodes, explicitly configurable up to 256;
 legacy zero remains 32. A resumable sliding window allows at most 32 nodes in flight, independent of the total budget.
 For 1024 GPUs on 128 nodes, an explicit budget of 128 permits full-node expansion, not guaranteed diagnosis.
