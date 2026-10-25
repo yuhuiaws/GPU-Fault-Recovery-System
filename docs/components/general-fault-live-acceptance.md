@@ -1079,8 +1079,12 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
 都运行；证据 `proof_scope: live-replay`，判定只读产品自身记录，包装器日志
 `audit-read` 为原始源 oracle）：
 
-- 002 `read_failure`：`InaccessiblePaths=/proc/meminfo` 只在 host collector 单元内生效
-  （探针经 `nsenter` 核验单元内不可读、PID 1 可读）。PASS 要求窗口内的 batch 带
+- 002 `read_failure`：把回放器的**不可打开节点**（无驱动的 0:0 字符设备、mode 0000，建在
+  本次运行的 `/run/gfrs-live/source-<digest>/` 下）以 `BindReadOnlyPaths` 只读绑定到 host
+  collector 单元内的 `/proc/meminfo` 上，单元内 `open()` 失败（EACCES/ENXIO，root 亦然）。
+  不用 `InaccessiblePaths=`：采集器单元以 root 运行，root 的 CAP_DAC_OVERRIDE 会把 systemd
+  绑定的 mode-0000 普通节点读成**空文件**——首次实跑时探针自身核验 `unit_readable` 仍为真，
+  按设计拒开窗并关窗。探针经 `nsenter` 核验单元内不可读、PID 1 可读。PASS 要求窗口内的 batch 带
   `_memory` collection error 且**没有任何**内存/交换样本（UNKNOWN，而不是健康值），
   无 memory/swap finding、无硬件步骤、无隔离；关窗后新样本恢复。
 - 002 `swap_pressure`：`build-meminfo-fixture` 复制节点真实 `/proc/meminfo`，只改写
@@ -1099,8 +1103,11 @@ expected FAIL 变体却 PASS），这种底线之下的读数以及无样本可�
   `failure_mode=DRIVER_QUERY_FAILED` 与驱动侧 `discovered_count`（真实绑定数）；**没有**
   `gpu_inventory_mismatch` 样本、没有 0 计数、无 finding、无 reboot；规则耗尽后恢复满数。
   日志少于两次失败读取为 INCONCLUSIVE（两次失败是规格的确认窗口）。
-- 012 `proc_unreadable`：同一失败查询 + `InaccessiblePaths=/proc/driver/nvidia/gpus`
-  （两次读取都失败，规格标注的已知风险）。PASS：collection error 含
+- 012 `proc_unreadable`：同一失败查询 + 单元内以 `build-nvidia-proc-fixture --omit-gpus`
+  复制的 `/proc/driver/nvidia` 整棵树（`version` 为真实值、**没有** `gpus`），产品列目录即
+  ENOENT——与不可读目录同一 `OSError` 分支（两次读取都失败，规格标注的已知风险）。不用
+  `InaccessiblePaths=/proc/driver/nvidia/gpus`：root 单元会把 mode-0000 目录列成**空目录**，
+  产品据此得到“绑定 0 卡”的计数而不是读取失败。PASS：collection error 含
   `could not be read` 与 `unknown as well`；`failure_mode=INVENTORY_UNAVAILABLE` 且
   **无** `discovered_count`、无 `gpu_inventory_discovered_count` 样本；其余同上。
 - 012 `expectation_wrong`（`risk M`，`S`，仅需 `HOST_SOURCE_REPLAY`，预期 PASS——批次 174 关闭了
@@ -1155,14 +1162,22 @@ base64 + sha256 装入 `/run/gfrs-live/source-<digest>/`（tmpfs）；Node Agent
   （`not_after` 后全部透传）、加有界延迟；真实查询失败时按失败透传，绝不编造成功；
   每次被编目的调用都记入 `audit/<工具>.jsonl`（真实/实际输出的 sha256），由
   `audit-read` 读回作为 oracle。`py-spy` 按名拒绝：它只由 Node Agent 以绝对路径运行。
-- **inaccessible**：`InaccessiblePaths=` 只在单元内隐藏允许列表内的路径或工具二进制
-  （002 `read_failure`、007 `tool_missing`、012 `proc_unreadable`）。
+- **inaccessible**：只在单元内把允许列表内的 procfs **文件**（`/proc/meminfo`、
+  `/proc/driver/nvidia/version`）或工具二进制设为不可打开：把本次运行的不可打开节点
+  （无驱动的 0:0 字符设备、mode 0000，`/run/gfrs-live/source-<digest>/unreadable`）
+  `BindReadOnlyPaths` 到该路径上，单元内 `open()`/`exec` 对 root 也失败、`shutil.which`
+  找不到工具（002 `read_failure`、007 `tool_missing`）。不用 systemd 的 `InaccessiblePaths=`：
+  采集器单元以 root 运行，CAP_DAC_OVERRIDE 把其 mode-0000 普通节点读成空文件、
+  CAP_DAC_READ_SEARCH 把其目录节点列成空目录——是“空读数”而非读取失败。同理目录不可能对
+  root 单元“不可读”，探针拒绝目录项；需要产品读目录失败时回放缺少该项的整棵树
+  （012 `proc_unreadable` 用 `--omit-gpus`）。
 - **env**：`GPU_FAULT_EXPECTED_GPU_COUNT`/`GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT`
   的 0..64 覆盖（012 `expectation_wrong`）；以及 phase-1 的 **pci-root** 重指。
 
 `open-window` 在重启单元后用 `nsenter` **核验**：每个替换在单元 mount namespace /
 进程环境里可见，而在 PID 1 的命名空间里不可见（文件内容 sha256 与所在设备号、
-`InaccessiblePaths` 的可读性、PATH 首位与 shim、环境变量），核验不过即关闭窗口并报错；
+不可打开节点下的可读性——单元内 `cat` 必须失败、PID 1 必须成功——、PATH 首位与 shim、
+环境变量），核验不过即关闭窗口并报错；
 核验结果写入回执。除 phase-1 的 `/proc/stat`、gfrs 统计计数器 bind 与 pci-root 外，
 其余模式都需要 `--approve HOST_SOURCE_REPLAY`（plan 与 execute 同时）。运行器 API：
 `host_source_replay(ctx)` → `install`/`install_wrapper(tool, plan)`/`replan`/
@@ -1369,7 +1384,7 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
 - 主机采集器**原始源回放** `general_live_source_replay.py`（探针
   `probes/general_live_source_probe.py`）只在主机采集器自身私有环境内替换：
   `BindReadOnlyPaths` 的允许列表 procfs/sysfs 文件或整棵树、PATH 首位的透传命令包装、
-  `InaccessiblePaths`、期望数环境覆盖，或重指 `GPU_FAULT_PCI_DEVICES_ROOT`（详见上文
+  不可打开节点绑定（inaccessible）、期望数环境覆盖，或重指 `GPU_FAULT_PCI_DEVICES_ROOT`（详见上文
   “共享主机原始源回放夹具”；phase-1 之外的模式需 `HOST_SOURCE_REPLAY`）。
 - 可复用的**CRI Pod 日志源夹具** `general_live_applog_fixture.py`（主机探针
   `probes/general_live_applog_probe.py`，受管归属目标 `general_live_applog_job.py`）：

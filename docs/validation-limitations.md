@@ -1401,8 +1401,11 @@ genuinely lacks the capability (no non-EFA RDMA device, no BMC on EC2 for 015
 variants are wired on that replay: `single_sample` (one real UUID dropped from
 exactly one `uuid,utilization.gpu` query), `query_failed` (an NVML
 initialisation failure for four ticks), `proc_unreadable` (the same failure
-with `/proc/driver/nvidia/gpus` hidden from the unit -- the two-read-failure
-case), `read_failure` (`/proc/meminfo` hidden from the unit) and
+while the unit reads a copy of `/proc/driver/nvidia` without `gpus`, so its
+listing fails -- the two-read-failure case), `read_failure` (an unopenable
+device node bound over `/proc/meminfo` inside the unit; systemd's
+`InaccessiblePaths=` is no read failure for a root unit, which reads its
+mode-0000 node as an empty file and lists its directory node as empty) and
 `swap_pressure` (the node's real `/proc/meminfo` with only `SwapTotal`/
 `SwapFree` rewritten, since the site runs no swap and business swap must not
 be enabled for a test); each is judged on the product's own records --

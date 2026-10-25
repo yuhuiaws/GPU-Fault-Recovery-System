@@ -20,6 +20,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from pathlib import Path
@@ -37,6 +38,21 @@ MAIN_PID = "4242"
 UNIT = probe.HOST_UNIT
 KERNEL_UNIT = probe.KERNEL_UNIT
 KERNEL_PID = "4343"
+#: What root sees at an ``InaccessiblePaths=`` path: systemd's mode-0000 node,
+#: which CAP_DAC_OVERRIDE / CAP_DAC_READ_SEARCH read as an *empty* file or list
+#: as an *empty* directory (the first live 002 ``read_failure`` run).
+EMPTY_NODE = "<inaccessible-node>"
+
+
+def unopenable_on_host(path: str) -> bool:
+    """A bind source nobody can ``open``: a 0:0 character device, or (the test
+    stand-in for it, created without CAP_MKNOD) a mode-0000 regular file."""
+
+    try:
+        mode = os.stat(path).st_mode
+    except OSError:
+        return False
+    return stat.S_ISCHR(mode) or (stat.S_ISREG(mode) and not mode & 0o777)
 
 
 class FakeHost:
@@ -44,7 +60,10 @@ class FakeHost:
 
     Two units exist: the host collector (``MAIN_PID``) and the kernel collector
     (``KERNEL_PID``), whose EnvironmentFile hands it a configured driver branch
-    that only an ``UnsetEnvironment=`` line of the window may remove.
+    that only an ``UnsetEnvironment=`` line of the window may remove. Both run
+    as root, like the real units: an ``InaccessiblePaths=`` node reads as an
+    empty file or directory (``EMPTY_NODE``), and only a bind of an unopenable
+    node (``unopenable_on_host``) makes a path fail to open.
     """
 
     def __init__(self, tmp_path: Path) -> None:
@@ -96,10 +115,14 @@ class FakeHost:
             self.binds, self.inaccessible = binds, inaccessible
 
     def unit_view(self, path: str) -> str | None:
-        """The path ``path`` resolves to inside the unit, or None if inaccessible."""
+        """The path ``path`` resolves to inside the unit: a bind source, the
+        real path, ``EMPTY_NODE`` at an ``InaccessiblePaths=`` path, or None
+        below one (root sees an empty directory there: ENOENT underneath)."""
 
         for hidden in self.inaccessible:
-            if path == hidden or path.startswith(hidden + "/"):
+            if path == hidden:
+                return EMPTY_NODE
+            if path.startswith(hidden + "/"):
                 return None
         for dest, source in self.binds.items():
             if path == dest:
@@ -112,6 +135,25 @@ class FakeHost:
         target = command[-1]
         real = self.unit_view(target) if pid == MAIN_PID else target
         if real is None:
+            return subprocess.CompletedProcess(
+                command, 1, "", "No such file or directory"
+            )
+        if real == EMPTY_NODE:
+            # Root on systemd's mode-0000 node: cat prints nothing, ls lists
+            # nothing, both exit 0; the node keeps the real path's type.
+            is_dir = os.path.isdir(target)
+            if command[0] == "/usr/bin/test":
+                ok = command[1] == "-d" and is_dir
+                return subprocess.CompletedProcess(command, 0 if ok else 1, "", "")
+            if command[0] == "/usr/bin/stat":
+                return subprocess.CompletedProcess(command, 0, "0\n", "")
+            if command[0] == "/usr/bin/cat" and is_dir:
+                return subprocess.CompletedProcess(command, 1, "", "Is a directory")
+            return subprocess.CompletedProcess(command, 0, "", "")
+        if unopenable_on_host(real) and command[0] != "/usr/bin/stat":
+            # The unopenable node: every open fails, root included.
+            if command[0] == "/usr/bin/test":
+                return subprocess.CompletedProcess(command, 1, "", "")
             return subprocess.CompletedProcess(command, 1, "", "Permission denied")
         try:
             if command[0] == "/usr/bin/cat":
@@ -188,6 +230,13 @@ class FakeHost:
         return {}
 
 
+def _mode_0000_file(path: Path) -> None:
+    """The test stand-in for the probe's 0:0 character device (needs CAP_MKNOD)."""
+
+    path.touch(mode=0o000)
+    path.chmod(0o000)
+
+
 @pytest.fixture
 def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHost:
     fake = FakeHost(tmp_path)
@@ -195,6 +244,7 @@ def host(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FakeHost:
     monkeypatch.setattr(probe, "DROPIN_ROOT", tmp_path / "run" / "systemd" / "system")
     monkeypatch.setattr(probe, "run", fake.run)
     monkeypatch.setattr(probe, "process_environment", fake.environment_of)
+    monkeypatch.setattr(probe, "make_unopenable_node", _mode_0000_file)
     return fake
 
 
@@ -269,10 +319,23 @@ def test_tree_inaccessible_env_and_unit_allow_lists() -> None:
     with pytest.raises(probe.ProbeError, match="not allow-listed"):
         probe.checked_tree_dest("/sys/class/net")
     assert probe.checked_inaccessible("/proc/meminfo") == ["/proc/meminfo"]
+    assert probe.checked_inaccessible("/proc/driver/nvidia/version") == [
+        "/proc/driver/nvidia/version"
+    ]
     with pytest.raises(probe.ProbeError, match="not allow-listed"):
         probe.checked_inaccessible("/etc")
     with pytest.raises(probe.ProbeError, match="not an allow-listed tool"):
         probe.checked_inaccessible("tool:py-spy")
+    # A root unit lists a mode-0000 directory as empty: "no GPUs bound", not a
+    # read failure. Directories are replayed as a tree without the entry.
+    for directory in (
+        "/proc/driver/nvidia/gpus",
+        "/proc/driver/nvidia",
+        "/sys/class/infiniband",
+    ):
+        with pytest.raises(probe.ProbeError, match="tree fixture without the entry"):
+            probe.checked_inaccessible(directory)
+    assert probe.INACCESSIBLE_PATHS == ("/proc/meminfo", "/proc/driver/nvidia/version")
     assert probe.checked_env_override("GPU_FAULT_EXPECTED_GPU_COUNT=7") == (
         "GPU_FAULT_EXPECTED_GPU_COUNT",
         "7",
@@ -841,7 +904,7 @@ def test_nvidia_proc_fixture_inaccessible_and_env_in_one_window(
     assert lines == [
         "[Service]",
         f"BindReadOnlyPaths={tree}:/proc/driver/nvidia",
-        "InaccessiblePaths=-/proc/meminfo",
+        f"BindReadOnlyPaths={probe.unreadable_node_path(RUN)}:/proc/meminfo",
         "Environment=GPU_FAULT_EXPECTED_GPU_COUNT=7",
     ], lines
     kinds = {check["kind"]: check for check in opened["verification"]["checks"]}
@@ -1229,7 +1292,8 @@ def test_netdev_mutation_attaches_a_physical_netdev_only(
 
 
 # --------------------------------------------------------------------------- #
-# meminfo fixture (002 swap_pressure) and the inaccessible-file verification
+# meminfo fixture (002 swap_pressure); the unopenable-node (inaccessible) tests
+# are in test_general_live_source_probe_unopenable.py
 # --------------------------------------------------------------------------- #
 MEMINFO = (
     "MemTotal:       2113929216 kB\n"
@@ -1309,51 +1373,6 @@ def test_meminfo_fixture_rewrites_only_the_allow_listed_fields(
         f"BindReadOnlyPaths={built['path']}:/proc/meminfo",
     ]
     assert opened["verification"]["ok"] is True
-    code, closed = _main("close-window", "--run-id", RUN, capsys=capsys)
-    assert code == 0 and closed["clean"] is True
-
-
-def test_an_inaccessible_file_is_verified_unreadable_in_the_unit(
-    host: FakeHost, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """``ls`` of an inaccessible regular node succeeds on the name alone.
-
-    The verification used to judge any unreadable path by its ``ls``, which
-    reads a mode-0000 *file* as accessible; now only a directory is judged by
-    its listing, so 002 ``read_failure`` (``/proc/meminfo``) verifies.
-    """
-
-    listings: list[list[str]] = []
-    real_nsenter = host.nsenter
-
-    def nsenter(pid: str, command: list[str]) -> subprocess.CompletedProcess[str]:
-        target = command[-1]
-        if (
-            pid == MAIN_PID
-            and host.unit_view(target) is None
-            and command[0] == "/usr/bin/env"
-        ):
-            # Like the real ``ls -1 <file>`` on an InaccessiblePaths= regular node.
-            listings.append(command)
-            if Path(target).is_file():
-                return subprocess.CompletedProcess(command, 0, f"{target}\n", "")
-        return real_nsenter(pid, command)
-
-    monkeypatch.setattr(host, "nsenter", nsenter)
-    code, opened = _main(
-        "open-window",
-        "--run-id",
-        RUN,
-        "--mode",
-        "mixed",
-        "--inaccessible",
-        "/proc/meminfo",
-        capsys=capsys,
-    )
-    assert code == 0, opened
-    (check,) = opened["verification"]["checks"]
-    assert check["unit_readable"] is False and check["host_readable"] is True, check
-    assert listings == [], "a non-directory is never judged by its listing"
     code, closed = _main("close-window", "--run-id", RUN, capsys=capsys)
     assert code == 0 and closed["clean"] is True
 

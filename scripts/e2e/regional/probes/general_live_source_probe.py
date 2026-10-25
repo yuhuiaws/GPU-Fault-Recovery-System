@@ -37,9 +37,19 @@ combinable in one window:
   ``CollectorContext`` asks the wrapper for the version, and
   ``GPU_FAULT_DRIVER_BRANCH`` is unset in that unit's environment so no
   configured branch stands in (GF-GENERAL-LIVE-032 ``missing_version``).
-* **inaccessible** -- ``InaccessiblePaths=`` for an allow-listed path or tool
-  binary inside the unit only (002 read_failure, 007 tool_missing, 012
-  proc_unreadable).
+* **inaccessible** -- an allow-listed procfs *file* or tool binary made
+  unopenable inside the unit only (002 read_failure, 007 tool_missing): the
+  run's ``unreadable`` node -- a driverless 0:0 character device, mode 0000,
+  under the state dir -- is ``BindReadOnlyPaths=`` over it. Not systemd's
+  ``InaccessiblePaths=``: the collector units run as root, and root's
+  CAP_DAC_OVERRIDE reads the mode-0000 regular node systemd binds there as an
+  *empty file* (CAP_DAC_READ_SEARCH lists its directory node as an *empty
+  directory*) -- a healthy-looking empty reading, never a read failure, which
+  the window verification refused on the first live 002 run. For the same
+  reason no directory can be made unreadable for these units: a directory the
+  product must fail to read is replayed as a tree without the entry
+  (``build-nvidia-proc-fixture --omit-gpus`` for 012 proc_unreadable, so the
+  listing of ``gpus`` fails with ENOENT on the unit's own copy).
 * **env** -- an allow-listed expected-count override (012 expectation_wrong).
 * **pci-root** -- ``Environment=GPU_FAULT_PCI_DEVICES_ROOT=<fixture tree>`` (013).
 
@@ -69,6 +79,7 @@ import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -119,14 +130,17 @@ EFA_PORT_FILE = re.compile(
 )
 #: Whole-tree bind destinations.
 TREE_DESTS = ("/sys/class/infiniband", "/proc/driver/nvidia")
-#: Paths a window may make inaccessible inside the unit (plus allow-listed tools).
-INACCESSIBLE_PATHS = (
-    "/proc/meminfo",
-    "/proc/driver/nvidia",
-    "/proc/driver/nvidia/gpus",
-    "/proc/driver/nvidia/version",
-    "/sys/class/infiniband",
-)
+#: Files a window may make unopenable inside the unit (plus allow-listed
+#: tools). Regular files only -- see the module docstring: for a root unit a
+#: directory can only be emptied, never made unreadable, and an empty
+#: ``gpus`` or ``infiniband`` is a zero-device reading the product must never
+#: be fed by a read-failure variant.
+INACCESSIBLE_PATHS = ("/proc/meminfo", "/proc/driver/nvidia/version")
+#: The node bound over an inaccessible file: a character device with major 0
+#: (no driver behind it: ENXIO) on the state dir's ``nodev`` tmpfs (EACCES),
+#: mode 0000 -- unopenable for every uid, like the ``chr`` node systemd itself
+#: keeps in /run/systemd/inaccessible for an inaccessible device file.
+UNREADABLE_NODE = "unreadable"
 WRAPPABLE_TOOLS = ("smartctl", "ipmitool", "ethtool", "nvidia-smi")
 #: Environment overrides and their value pattern (empty = unset the expectation).
 ENV_OVERRIDES = {
@@ -293,7 +307,8 @@ def tool_locations(tool: str) -> list[str]:
 
 
 def checked_inaccessible(item: str) -> list[str]:
-    """``InaccessiblePaths`` entries for an allow-listed path or ``tool:<name>``."""
+    """The files the unreadable node is bound over for an allow-listed path or
+    ``tool:<name>`` (every copy of the tool on the standard PATH)."""
 
     if item.startswith("tool:"):
         paths = tool_locations(item[len("tool:") :])
@@ -304,6 +319,12 @@ def checked_inaccessible(item: str) -> list[str]:
         return paths
     if item in INACCESSIBLE_PATHS:
         return [item]
+    if any(item == dest or item.startswith(dest + "/") for dest in TREE_DESTS):
+        raise ProbeError(
+            f"{item!r} is a directory: a root unit lists an InaccessiblePaths= "
+            "directory as empty (a zero-device reading, not a read failure); "
+            "replay a tree fixture without the entry instead"
+        )
     raise ProbeError(f"inaccessible path {item!r} is not allow-listed")
 
 
@@ -408,6 +429,26 @@ def write_atomic(path: Path, content: bytes, mode: int) -> None:
     temporary.write_bytes(content)
     temporary.chmod(mode)
     os.replace(temporary, path)
+
+
+def unreadable_node_path(run_id: str) -> Path:
+    return state_dir(run_id) / UNREADABLE_NODE
+
+
+def make_unopenable_node(path: Path) -> None:
+    """``mknod`` the driverless 0:0 character device nobody can open (CAP_MKNOD)."""
+
+    os.mknod(path, stat.S_IFCHR | 0o000, os.makedev(0, 0))
+
+
+def unreadable_node(run_id: str) -> Path:
+    """This run's unopenable node, created on first use (removed with the state dir)."""
+
+    path = unreadable_node_path(run_id)
+    if not path.exists():
+        path.parent.mkdir(mode=0o755, parents=True, exist_ok=True)
+        make_unopenable_node(path)
+    return path
 
 
 # --------------------------------------------------------------------------- #
@@ -816,9 +857,9 @@ def view_path(pid: str, path: str) -> dict[str, Any]:
         readable, content, kind = True, read.stdout, "file"
     elif nsenter(pid, ["/usr/bin/test", "-d", path]).returncode == 0:
         # Byte order like ``sorted(os.listdir())`` in ``local_view``. Only a
-        # directory is judged by its listing: ``ls`` of an unreadable *file*
-        # (an ``InaccessiblePaths=`` regular node, mode 0000) succeeds on the
-        # name alone and would read as accessible (002 ``read_failure``).
+        # directory is judged by its listing: ``ls`` of an unopenable *file*
+        # (the unreadable node bound over it) succeeds on the name alone and
+        # would read as accessible (002 ``read_failure``).
         listing = nsenter(pid, ["/usr/bin/env", "LC_ALL=C", "/usr/bin/ls", "-1", path])
         readable = listing.returncode == 0
         content = listing.stdout if readable else ""
@@ -880,6 +921,8 @@ def verify_window(run_id: str, state: dict[str, Any]) -> dict[str, Any]:
             }
         )
     for path in state.get("inaccessible", []):
+        # The unit's open() must fail (the unreadable node answers EACCES /
+        # ENXIO to root as well) while PID 1 reads the real file or binary.
         unit = view_path(pid, path)
         host = view_path("1", path)
         checks.append(
@@ -1002,9 +1045,14 @@ def dropin_lines(
         lines.append(f"ReadWritePaths={audit_dir(run_id)}")
         for name in state.get("unset_env") or []:
             lines.append(f"UnsetEnvironment={name}")
-    for item in arguments.inaccessible:
-        for path in checked_inaccessible(item):
-            lines.append(f"InaccessiblePaths=-{path}")
+    hidden = [
+        path for item in arguments.inaccessible for path in checked_inaccessible(item)
+    ]
+    if hidden:
+        # One node per run, created only once every item passed its allow-list.
+        node = unreadable_node(run_id)
+        for path in hidden:
+            lines.append(f"BindReadOnlyPaths={node}:{path}")
             state["inaccessible"].append(path)
     for pair in arguments.env:
         name, value = checked_env_override(pair)
@@ -1378,15 +1426,33 @@ def parser() -> argparse.ArgumentParser:
     return value
 
 
+def exception_site(exc: BaseException) -> str | None:
+    """The innermost ``function:line`` of this file on the exception's path."""
+
+    site = None
+    frame = exc.__traceback__
+    while frame is not None:
+        if frame.tb_frame.f_code.co_filename == __file__:
+            site = f"{frame.tb_frame.f_code.co_name}:{frame.tb_lineno}"
+        frame = frame.tb_next
+    return site
+
+
 def main(argv: list[str] | None = None) -> int:
     arguments = parser().parse_args(argv)
     try:
         arguments.handler(arguments)
     except Exception as exc:  # noqa: BLE001 - reported as the probe's JSON error
+        # The host fixture withholds this output and shows only the tokens it
+        # whitelists for ``error_kind: probe``: the class, a digest of the
+        # message and the site. The message itself never leaves the node.
         emit(
             {
                 "error": type(exc).__name__,
                 "error_kind": "probe",
+                "error_class": type(exc).__name__,
+                "error_code": hashlib.sha256(str(exc).encode()).hexdigest()[:16],
+                "error_site": exception_site(exc),
                 "command": getattr(arguments, "command", None),
             }
         )

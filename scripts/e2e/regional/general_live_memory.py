@@ -33,11 +33,12 @@ must not be enabled): ``swap_pressure`` binds a copy of the node's real
 ``/proc/meminfo`` with only ``SwapTotal``/``SwapFree`` rewritten into the host
 collector unit's mount namespace, so ``_memory`` computes ``swap_used_percent``
 from the replayed pair and the 80 % swap rule (no sustain) fires on its own
-while the memory metrics stay the node's real values; ``read_failure`` makes
-``/proc/meminfo`` ``InaccessiblePaths=`` inside that unit only, so the
-contributor fails and the tick carries a ``_memory`` collection error and no
-memory sample at all -- UNKNOWN, never a healthy value and never a hardware
-signal.
+while the memory metrics stay the node's real values; ``read_failure`` binds
+the replay's unopenable node over ``/proc/meminfo`` inside that unit only (not
+``InaccessiblePaths=``: the unit runs as root and reads systemd's mode-0000
+node as an *empty* file), so the contributor's ``open`` fails and the tick
+carries a ``_memory`` collection error and no memory sample at all -- UNKNOWN,
+never a healthy value and never a hardware signal.
 """
 
 from __future__ import annotations
@@ -901,8 +902,11 @@ VARIANTS = [
         risk="L",
         flags="S",
         injection=(
-            "make /proc/meminfo InaccessiblePaths= inside the host collector unit only "
-            "(verified through nsenter: unreadable in the unit, readable by PID 1)"
+            "bind an unopenable node (a driverless 0:0 character device) read-only "
+            "over /proc/meminfo inside the host collector unit only -- not "
+            "InaccessiblePaths=, whose mode-0000 node root reads as an empty file "
+            "(verified through nsenter: open fails in the unit, PID 1 reads the "
+            "real file)"
         ),
         expected=(
             "a _memory collection error and no memory sample in the window (UNKNOWN); "

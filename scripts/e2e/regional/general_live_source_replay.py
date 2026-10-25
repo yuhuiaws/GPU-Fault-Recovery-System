@@ -11,9 +11,11 @@ fields --, 010/011 EFA counters, 032 driver version), a whole reviewed *tree*
 (``/sys/class/infiniband`` for the 013 inventory variants, ``/proc/driver/
 nvidia`` for 012/032), a reviewed pass-through *command wrapper* first on the
 unit's PATH (``tools/host_command_replay.py``: smartctl 007, ipmitool 015,
-ethtool 010, the host collector's nvidia-smi queries 012), a path made
-*inaccessible* inside the unit, an allow-listed expected-count *environment*
-override, or the 013 PCI-root repoint. The API mirrors the kernel-log replay: a
+ethtool 010, the host collector's nvidia-smi queries 012), a procfs file or
+tool binary made *inaccessible* inside the unit (the probe's unopenable node
+bound over it: the unit runs as root, which reads an ``InaccessiblePaths=``
+node as an empty file -- 002 read_failure, 007 tool_missing), an allow-listed
+expected-count *environment* override, or the 013 PCI-root repoint. The API mirrors the kernel-log replay: a
 small install / build / open / (step) / read-back / cleanup surface, with the
 window on the variant's LIFO cleanup stack so a window that will not close
 clean fails the variant. ``proof_scope`` is always ``live-replay``.
@@ -506,8 +508,10 @@ class HostSourceReplay:
 
         ``binds``/``trees`` are ``(fixture name, destination)`` pairs,
         ``wrappers`` tool names already installed with ``install_wrapper``,
-        ``inaccessible`` allow-listed paths or ``tool:<name>``, ``env`` the
-        allow-listed expected-count overrides.
+        ``inaccessible`` allow-listed procfs files or ``tool:<name>`` (made
+        unopenable in the unit; never a directory -- replay a tree without the
+        entry, ``build_nvidia_proc(omit_gpus=True)``), ``env`` the allow-listed
+        expected-count overrides.
         """
 
         env_pairs = list(env.items()) if isinstance(env, Mapping) else list(env)
