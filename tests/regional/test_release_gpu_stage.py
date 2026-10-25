@@ -352,7 +352,7 @@ def test_join_upload_steps_carry_the_release_artifacts() -> None:
                 Path("/artifacts/executor.whl"),
                 "e" * 64,
             ),
-            {"compress": True},
+            {"compress": True, "splittable": True, "label": "Executor wheel"},
         ),
         (
             (
@@ -362,6 +362,6 @@ def test_join_upload_steps_carry_the_release_artifacts() -> None:
                 Path("/artifacts/bundle.tar.gz"),
                 "b" * 64,
             ),
-            {},
+            {"label": "node installer bundle"},
         ),
     ]
