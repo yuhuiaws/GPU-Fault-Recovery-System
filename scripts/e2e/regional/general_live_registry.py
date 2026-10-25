@@ -44,12 +44,19 @@ RISKS = ("L", "M", "H")
 FLAG_PATTERN = re.compile(r"^[PSX]Q?$")
 
 VERDICTS = ("PASS", "FAIL", "NOT_RUN", "BLOCKED", "INCONCLUSIVE")
+#: The ``deferred`` reason prefixes. ``COVERED_BY_REGIONAL: <case ids>`` names
+#: GF-REGIONAL cases that already PASSED live on this site with the very
+#: assertions the variant would make (the same injection on the same product
+#: path), so the variant gets no fixture of its own and stays NOT_RUN with the
+#: cross-reference; its registry entry keeps lanes and expectations so it can
+#: be re-enabled later.
 NOT_RUN_REASONS = (
     "VENDOR_LAB_ONLY",
     "CAPABILITY_ABSENT",
     "FIXTURE_NOT_READY",
     "NOT_AUTHORIZED",
     "SCALE",
+    "COVERED_BY_REGIONAL",
 )
 
 #: ``--approve`` tokens. Each names one dangerous branch; a variant that needs

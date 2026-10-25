@@ -118,10 +118,14 @@ def test_registry_covers_every_030_variant_and_tokens() -> None:
     }
     assert deferred == {
         "confirmed_hardware": "CAPABILITY_ABSENT",
-        "no_spare": "NOT_AUTHORIZED",
+        "no_spare": "COVERED_BY_REGIONAL",
         "repair_failure": "CAPABILITY_ABSENT",
         "bounded_recheck": "CAPABILITY_ABSENT",
     }
+    no_spare = next(s for s in sp.VARIANTS if s.variant == "no_spare")
+    assert "GF-REGIONAL-DESTR-008" in no_spare.deferred and no_spare.lanes == ("hp",), (
+        "the cross-reference names the regional case; lanes stay for re-enabling"
+    )
 
 
 # --------------------------------------------------------------------------- #

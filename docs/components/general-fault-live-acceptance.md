@@ -68,6 +68,11 @@ inventory 或 Host 指标。本文写到的其他原始源夹具是实施要求�
 COLLECT-020 的身份读取，以及 DESTR-001/002 的 reset/reboot 回执；
 必须把本次原始输入产生的 incident 接到它的实际工作流，不能拿另一次 Xid 链来拼接。
 缺夹具、缺设备能力、缺授权属于未执行；注入有效但判定/处置不正确属于 **FAIL**。
+未执行原因前缀为 `VENDOR_LAB_ONLY`、`CAPABILITY_ABSENT`、`FIXTURE_NOT_READY`、
+`NOT_AUTHORIZED`、`SCALE` 与 `COVERED_BY_REGIONAL: <用例号>`：最后一种指某个
+GF-REGIONAL 用例已在本站真机 PASS，且其注入与断言正是该变体要做的（同一真实注入、
+同一产品路径），故该变体不另建夹具、在计划/看板上记 `NOT_RUN(COVERED_BY_REGIONAL)`
+并带交叉引用；其注册项的车道、令牌与预期保持不变，日后可直接启用。
 
 ## 通用执行协议
 
@@ -1202,7 +1207,10 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   （`GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`），周期性 `HyperPodSpareHealth
   Controller` 不运行，故 `confirmed_hardware`/`repair_failure`/`bounded_recheck` 记
   `NOT_RUN(CAPABILITY_ABSENT)`；`no_spare`（无热备不回落 provider 替换）只在危险的
-  REPLACE_NODE 失败转路径可见，记 `NOT_RUN(NOT_AUTHORIZED)`。
+  REPLACE_NODE 失败转路径可见，其断言已由 GF-REGIONAL-DESTR-008 S1 在本站真机做过
+  （hp PASS 2026-10-22：移除全部热备标签后 REPLACE_NODE 以精确的 no-fallback 字面量
+  拒绝、CloudTrail 无 BatchReplaceClusterNodes），记
+  `NOT_RUN(COVERED_BY_REGIONAL: GF-REGIONAL-DESTR-008 S1)`，不另建夹具。
 
 计划/执行形如 `--case GF-GENERAL-LIVE-011 --variant active_to_zero --site-file <F>
 --node-b <N2> --hyperpod-cluster <HP>`（011/030 在 hp 车道，011/030 需 `--site-file`，
@@ -1355,9 +1363,16 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
 ```
 
 本轮保持 `NOT_RUN` 并留在分母：014 全部（伪造 allocatable/改 Node.status 不算证明，
-原生 plugin 故障需 `DEVICE_PLUGIN_RESTART`）、013 `driver_unbound`/
+原生 plugin 故障需 `DEVICE_PLUGIN_RESTART`；其中 `running_training` 的断言——受管训练
+任务下移除 EFA 设备插件、Pod UID 集合与训练进度保持、无 STOP/RESTART_WORKLOAD——已由
+GF-REGIONAL-COLLECT-017 stage C 在本站真机做过（hp PASS 2026-10-22），记
+`NOT_RUN(COVERED_BY_REGIONAL: GF-REGIONAL-COLLECT-017 stage C)`）、013
 `bind_failure`/`post_repair_failure`（保留的原生解绑；`pci_missing` 已由上文的 missing→reboot
-链覆盖）、032 的产品/Profile 权限变体（AUTH-015 未配置）与本站 H200 上的 `missing_version`
+链覆盖）与 `driver_unbound`（同一 BDF 的真实 `efa` 解绑与同一
+REMEDIATE_EFA_DRIVER 7 步链断言已由 GF-REGIONAL-DESTR-021（eks PASS 2026-10-22）、
+GF-REGIONAL-COLLECT-017 stage A（hp PASS 2026-10-22）、GF-REGIONAL-NET-007（eks PASS）
+做过，记 `NOT_RUN(COVERED_BY_REGIONAL: ...)`，注册项的 `EFA_DRIVER_UNBIND` 归属与车道
+保留）、032 的产品/Profile 权限变体（AUTH-015 未配置）与本站 H200 上的 `missing_version`
 （目录产品门禁先于 NVLink5 解码器，记 CAPABILITY_ABSENT；夹具已就绪，Blackwell 节点可执行）、
 004 `probe_error`（`statvfs` 错误无法由只读文件 bind 产生）。
 

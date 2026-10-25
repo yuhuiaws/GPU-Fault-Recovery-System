@@ -176,6 +176,21 @@ def test_013_and_014_cover_every_variant() -> None:
         SPECS["link_inactive"].risk == "M" and SPECS["link_inactive"].max_minutes <= 30
     )
     assert "bounded exposure" in SPECS["link_inactive"].injection
+    # Three variants whose assertions GF-REGIONAL cases already made live.
+    assert SPECS["driver_unbound"].deferred.startswith("COVERED_BY_REGIONAL: "), SPECS[
+        "driver_unbound"
+    ].deferred
+    for case in (
+        "GF-REGIONAL-DESTR-021",
+        "GF-REGIONAL-COLLECT-017",
+        "GF-REGIONAL-NET-007",
+    ):
+        assert case in SPECS["driver_unbound"].deferred, case
+    assert SPECS["driver_unbound"].lanes == ("eks",), "lanes kept for re-enabling"
+    assert SPECS["running_training"].deferred.startswith(
+        "COVERED_BY_REGIONAL: GF-REGIONAL-COLLECT-017"
+    ), SPECS["running_training"].deferred
+    assert SPECS["running_training"].lanes == ("eks", "hp")
 
 
 # --------------------------------------------------------------------------- #

@@ -23,8 +23,9 @@ plane sets ``GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false``, so the executor
 only grades a spare during an allocation and never autonomously reboots an idle
 spare. The hardware-reboot, repair-failure and bounded-recheck variants
 therefore stay NOT_RUN(CAPABILITY_ABSENT); ``no_spare`` (the no-provider-replace
-fallback) lives on the dangerous REPLACE_NODE failover branch and stays
-NOT_RUN(NOT_AUTHORIZED). Every required variant remains in the denominator.
+fallback) lives on the dangerous REPLACE_NODE failover branch, whose assertions
+GF-REGIONAL-DESTR-008 S1 already made live on this site, and stays
+NOT_RUN(COVERED_BY_REGIONAL). Every required variant remains in the denominator.
 """
 
 from __future__ import annotations
@@ -647,7 +648,13 @@ VARIANTS = [
         CASE,
         "no_spare",
         proof_mode=NATIVE,
-        reason="NOT_AUTHORIZED: the no-provider-replacement fallback is only observable on the dangerous REPLACE_NODE warm-spare failover branch (DESTR-008), not run this phase",
+        reason=(
+            "COVERED_BY_REGIONAL: GF-REGIONAL-DESTR-008 S1 (hp PASS 2026-10-22) -- every "
+            "spare label removed, REPLACE_NODE refused with the exact no-fallback literal, "
+            "no BatchReplaceClusterNodes in CloudTrail: the assertions this variant would "
+            "make on the REPLACE_NODE failover branch already passed live on this site; "
+            "no fixture of its own (WARM_SPARE_FAILOVER territory when re-enabled)"
+        ),
         lanes=("hp",),
         expected="no available spare fails the step with the no-fallback literal; provider replacement stays disabled",
     ),

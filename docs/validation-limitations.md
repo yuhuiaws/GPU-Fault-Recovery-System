@@ -1752,6 +1752,21 @@ variants (a managed attempt with CRI Pod logs, lane N territory), and 004
 since batch 163, but injecting a real one needs a faulting test mount -- a
 read-only file bind cannot, statvfs resolving the mount, not the bound file).
 
+A sixth deferral reason, `COVERED_BY_REGIONAL: <case ids>`, names GF-REGIONAL
+cases that already PASSED live on this site with the very injection and
+assertions the variant would make, so the variant gets no fixture of its own
+and stays `NOT_RUN` with the cross-reference (its registry entry keeps lanes,
+tokens and expectations for a later re-enable). Three variants carry it: 013
+`driver_unbound` -- the same real `efa` unbind of one BDF and the same
+REMEDIATE_EFA_DRIVER 7-step chain assertions passed as GF-REGIONAL-DESTR-021
+(eks, 2026-10-22), GF-REGIONAL-COLLECT-017 stage A (hp, 2026-10-22) and
+GF-REGIONAL-NET-007 (eks); 014 `running_training` -- GF-REGIONAL-COLLECT-017
+stage C (hp, 2026-10-22) removed the EFA device plugin under a managed training
+job and proved the Pod UID set and the progress preserved with no
+STOP/RESTART_WORKLOAD; 030 `no_spare` -- GF-REGIONAL-DESTR-008 S1 (hp,
+2026-10-22) removed every spare label and saw REPLACE_NODE refused with the
+exact no-fallback literal and no BatchReplaceClusterNodes in CloudTrail.
+
 The first live pass corrected three runner judgments that contradicted the
 product's documented behavior, not the product: a diagnostic-only chain
 (evidence collection plus a validation) whose validation fails while the

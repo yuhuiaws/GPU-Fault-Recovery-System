@@ -824,8 +824,11 @@ VARIANTS = [
         "driver_unbound",
         proof_mode=LIVE_REPLAY,
         reason=(
-            "NOT_AUTHORIZED: the reviewed targeted EFA driver unbind needs the reserved "
-            "EFA_DRIVER_UNBIND native probe and an independent rebind deadman, not built this phase"
+            "COVERED_BY_REGIONAL: GF-REGIONAL-DESTR-021 (eks PASS 2026-10-22), "
+            "GF-REGIONAL-COLLECT-017 stage A (hp PASS 2026-10-22), GF-REGIONAL-NET-007 "
+            "(eks PASS) -- the same real `efa` unbind of one BDF and the same "
+            "REMEDIATE_EFA_DRIVER 7-step chain assertions already passed live on this "
+            "site; no fixture of its own (EFA_DRIVER_UNBIND stays its token when re-enabled)"
         ),
         lanes=("eks",),
         expected="DRIVER_UNBOUND -> targeted bind + plugin restart + snapshot + validation; not a reboot",
@@ -970,8 +973,10 @@ VARIANTS = [
         "running_training",
         proof_mode=LIVE_REPLAY,
         reason=(
-            "FIXTURE_NOT_READY: an allocatable mismatch while training runs needs a managed (scale) "
-            "training attempt on the node (lane N territory), not built here"
+            "COVERED_BY_REGIONAL: GF-REGIONAL-COLLECT-017 stage C (hp PASS 2026-10-22) -- "
+            "the EFA device plugin removed under a managed training job, the Pod UID set "
+            "and the progress preserved, no STOP/RESTART_WORKLOAD: the assertions this "
+            "variant would make already passed live on this site; no fixture of its own"
         ),
         lanes=("eks", "hp"),
         expected="a mismatch while training runs keeps the training identity and valid progress",
