@@ -1,6 +1,7 @@
 from gpu_fault.notifications.common import (
     AdvisoryNotification,
     HyperPodRecoveryAdvisory,
+    render_evidence_refs,
 )
 
 
@@ -19,7 +20,11 @@ class HyperPodAdvisoryEmailBuilder:
     ) -> AdvisoryNotification:
         nodes = ", ".join(node_ids) if node_ids else "unknown"
         rationale = "\n".join(f"- {item}" for item in advisory.rationale)
-        evidence = "\n".join(f"- {item}" for item in advisory.evidence_refs) or "- none"
+        evidence = render_evidence_refs(
+            advisory.evidence_refs,
+            node_id=node_ids[0] if len(node_ids) == 1 else None,
+            empty="- none",
+        )
         location = f"{cluster_name} ({region_name})" if region_name else cluster_name
         case_draft = "\n".join(
             [

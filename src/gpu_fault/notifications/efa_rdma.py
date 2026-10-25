@@ -2,6 +2,7 @@ from gpu_fault.notifications.common import (
     EFA_RDMA_EVENT_EMAIL_TEMPLATE,
     EFA_RDMA_EVENT_TEMPLATE_VERSION,
     AdvisoryNotification,
+    render_evidence_refs,
 )
 
 
@@ -61,9 +62,7 @@ class EfaRdmaEventEmailBuilder:
             policy_source=policy_source,
             policy_version=policy_version,
             workflow_steps=(" -> ".join(workflow_steps) or "NONE"),
-            evidence_refs=(
-                "\n".join(f"- {item}" for item in evidence_refs) or "- NONE"
-            ),
+            evidence_refs=render_evidence_refs(evidence_refs, node_id=node_id),
             template_version=EFA_RDMA_EVENT_TEMPLATE_VERSION,
         )
         return AdvisoryNotification(

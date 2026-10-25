@@ -3,6 +3,7 @@ from gpu_fault.notifications.common import (
     DCGM_DIAGNOSTIC_TEMPLATE_VERSION,
     AdvisoryNotification,
     Any,
+    render_evidence_refs,
 )
 
 
@@ -24,6 +25,7 @@ class DcgmDiagnosticEmailBuilder:
         result_lines = []
         guidance_lines = []
         evidence_refs = []
+        evidence_lines = []
         outcomes = []
         for node_id in sorted(node_results):
             result = node_results[node_id]
@@ -79,6 +81,18 @@ class DcgmDiagnosticEmailBuilder:
             evidence_ref = result.get("evidence_ref")
             if isinstance(evidence_ref, str) and evidence_ref:
                 evidence_refs.append(evidence_ref)
+                upload_error = result.get("evidence_upload_error")
+                # Where the node left its output: the console link of an
+                # uploaded object, or "readable only on <node>" for a file.
+                evidence_lines.append(
+                    render_evidence_refs(
+                        [evidence_ref],
+                        node_id=node_id,
+                        upload_error=(
+                            upload_error if isinstance(upload_error, str) else None
+                        ),
+                    )
+                )
         outcome_rank = {
             "PASS": 0,
             "WARN": 1,
@@ -101,10 +115,7 @@ class DcgmDiagnosticEmailBuilder:
                 "\n".join(guidance_lines)
                 or "- No extra manual handling; continue the cool-down observation and GPU validation."
             ),
-            evidence_refs=(
-                "\n".join(f"- {evidence_ref}" for evidence_ref in evidence_refs)
-                or "- NONE"
-            ),
+            evidence_refs="\n".join(evidence_lines) or "- NONE",
             template_version=DCGM_DIAGNOSTIC_TEMPLATE_VERSION,
         )
         return AdvisoryNotification(

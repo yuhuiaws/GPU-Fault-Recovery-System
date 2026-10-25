@@ -2,6 +2,7 @@ from gpu_fault.notifications.common import (
     NOT_APPLICABLE_EMAIL_TEMPLATE,
     NOT_APPLICABLE_TEMPLATE_VERSION,
     AdvisoryNotification,
+    render_evidence_refs,
 )
 
 
@@ -58,9 +59,7 @@ class NotApplicableEmailBuilder:
             workflow_status=workflow_status,
             safety_steps=", ".join(safety_steps) or "NONE",
             official_steps=", ".join(official_steps) or "NONE",
-            evidence_refs=(
-                "\n".join(f"- {item}" for item in evidence_refs) or "- NONE"
-            ),
+            evidence_refs=render_evidence_refs(evidence_refs, node_id=node_id),
             template_version=NOT_APPLICABLE_TEMPLATE_VERSION,
         )
         return AdvisoryNotification(

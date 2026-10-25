@@ -326,6 +326,81 @@ def test_the_hung_hand_off_says_read_only_and_never_claims_isolation():
     }, outcome.details
 
 
+def test_node_local_archives_are_named_as_such_and_s3_archives_get_a_console_link(
+    monkeypatch,
+):
+    """Live 2026-10-25: every archive of a hung triage was a ``file://`` path on
+    the faulting node, listed as if an operator could open it. The hand-off now
+    says per archive where it can be read: a ``file://`` archive is readable only
+    on its node (the diagnostic S3 destination is not configured there, or the
+    upload failed -- the node's ``evidence_upload_error`` is quoted), an
+    ``s3://`` archive carries the console deep link."""
+
+    monkeypatch.setenv("AWS_REGION", "us-west-2")
+    steps = hung_steps()
+    details = bundle_details()
+    details["node_results"]["node-a"]["evidence_ref"] = (
+        "file:///var/lib/gpu-fault/diagnostics/gpu-diagnostic-node-a.tar.gz"
+    )
+    details["node_results"]["node-a"]["evidence_upload_error"] = (
+        "s3://evidence-bucket/diagnostics/node-a/bundle.tar.gz: PermissionError: "
+        "An error occurred (AccessDenied) when calling the PutObject operation"
+    )
+    executions = records(steps)
+    executions[5] = workflow_step_execution(
+        5,
+        steps[5].operation,
+        phase="official",
+        adapter_operation_id=f"{WORKFLOW}/5/{steps[5].operation.value}",
+        details=details,
+    )
+    _, notification = hand_off(hung_record(steps, executions=executions))
+
+    evidence = section(notification.body_text, 3)
+    assert (
+        "node-a: file:///var/lib/gpu-fault/diagnostics/gpu-diagnostic-node-a.tar.gz "
+        f"sha256 {digest('node-a', 'bundle')}"
+    ) in evidence, evidence
+    assert "readable only on node-a" in evidence, evidence
+    assert "AccessDenied" in evidence, evidence
+    assert "not configured" not in evidence, (
+        "the node reported the failed upload; the note must not blame the config"
+    )
+    assert (
+        "Console: https://us-west-2.console.aws.amazon.com/s3/object/evidence-bucket"
+        "?region=us-west-2&prefix=diagnostics/node-b/bundle.tar.gz"
+    ) in evidence, evidence
+    assert notification.evidence_refs == [
+        "file:///var/lib/gpu-fault/diagnostics/gpu-diagnostic-node-a.tar.gz",
+        "s3://evidence-bucket/diagnostics/node-b/bundle.tar.gz",
+    ], notification.evidence_refs
+
+
+def test_a_file_archive_without_an_upload_error_names_the_missing_configuration():
+    steps = hung_steps()
+    details = bundle_details()
+    for node in NODES:
+        details["node_results"][node]["evidence_ref"] = (
+            f"file:///var/lib/gpu-fault/diagnostics/gpu-diagnostic-{node}.tar.gz"
+        )
+    executions = records(steps)
+    executions[5] = workflow_step_execution(
+        5,
+        steps[5].operation,
+        phase="official",
+        adapter_operation_id=f"{WORKFLOW}/5/{steps[5].operation.value}",
+        details=details,
+    )
+    _, notification = hand_off(hung_record(steps, executions=executions))
+
+    evidence = section(notification.body_text, 3)
+    assert "readable only on node-a" in evidence and "readable only on node-b" in (
+        evidence
+    ), evidence
+    assert "diagnostic_s3_uri" in evidence and "not configured" in evidence, evidence
+    assert "Console:" not in evidence, evidence
+
+
 def test_every_evidence_step_is_reported_with_its_record_and_archives():
     steps = hung_steps()
     _, notification = hand_off(hung_record(steps))

@@ -738,3 +738,111 @@ GPU/NVSwitch reset completed automatically
 {display_stack}
 Template: {template_version}
 """
+
+
+# --- evidence references -----------------------------------------------------
+#
+# A node Agent's diagnostic archive is referenced as ``s3://bucket/key`` when
+# the node uploaded it (its diagnostic S3 destination, site.yaml
+# ``spec.diagnosticS3Uri``) and as ``file:///var/lib/gpu-fault/...`` when it
+# did not -- a path on the faulting node that nobody reading the mail can open
+# (live 2026-10-25: every hung-triage archive). The renderers below say which
+# it is: the node and "readable only there" for a file, the console deep link
+# for an object. Collector references of other schemes (``kmsg://``) render as
+# before, and ``AdvisoryNotification.evidence_refs`` keeps the raw references.
+
+S3_CONSOLE_HOST = "s3.console.aws.amazon.com"
+NODE_LOCAL_EVIDENCE_NOTE = (
+    "Node-local archive: readable only on {node} (no S3 copy -- "
+    "diagnostic_s3_uri, i.e. site.yaml spec.diagnosticS3Uri, is not configured "
+    "on that node, or the upload failed; see evidence_upload_error in the step "
+    "result)"
+)
+NODE_LOCAL_EVIDENCE_UPLOAD_FAILED_NOTE = (
+    "Node-local archive: readable only on {node}; the upload failed: {error}"
+)
+
+
+def console_region() -> str | None:
+    """The Region the control plane runs in, for console deep links."""
+
+    return os.getenv("AWS_REGION") or os.getenv("AWS_DEFAULT_REGION") or None
+
+
+def s3_console_url(ref: str, *, region: str | None = None) -> str | None:
+    """The S3 console deep link of an ``s3://bucket/key`` object, else None."""
+
+    from urllib.parse import quote
+
+    if not ref.startswith("s3://"):
+        return None
+    # Not urlsplit: an object key may carry ``#`` or ``?``, which a URL parser
+    # would read as a fragment or query and cut the key short.
+    bucket, _, key = ref[len("s3://") :].partition("/")
+    if not bucket or not key:
+        return None
+    region = region or console_region()
+    host = f"{region}.console.aws.amazon.com" if region else S3_CONSOLE_HOST
+    query = (f"region={region}&" if region else "") + f"prefix={quote(key, safe='/')}"
+    return f"https://{host}/s3/object/{bucket}?{query}"
+
+
+def evidence_ref_note(
+    ref: str,
+    *,
+    node_id: str | None = None,
+    upload_error: str | None = None,
+    region: str | None = None,
+) -> str | None:
+    """What an operator needs to know to open ``ref``: the console link of an
+    object, the "readable only on <node>" note of a node-local file, nothing
+    for other schemes."""
+
+    if ref.startswith("file://"):
+        node = node_id or "the faulting node"
+        if upload_error:
+            return NODE_LOCAL_EVIDENCE_UPLOAD_FAILED_NOTE.format(
+                node=node, error=" ".join(upload_error.split())
+            )
+        return NODE_LOCAL_EVIDENCE_NOTE.format(node=node)
+    if ref.startswith("s3://"):
+        url = s3_console_url(ref, region=region)
+        return f"Console: {url}" if url else None
+    return None
+
+
+def describe_evidence_ref(
+    ref: str,
+    *,
+    node_id: str | None = None,
+    upload_error: str | None = None,
+    region: str | None = None,
+) -> str:
+    """One line: the reference, with its note in parentheses when it has one."""
+
+    note = evidence_ref_note(
+        ref, node_id=node_id, upload_error=upload_error, region=region
+    )
+    return f"{ref} ({note})" if note else ref
+
+
+def render_evidence_refs(
+    refs: list[str] | tuple[str, ...],
+    *,
+    node_id: str | None = None,
+    upload_error: str | None = None,
+    region: str | None = None,
+    empty: str = "- NONE",
+) -> str:
+    """The ``- <ref>`` list of a mail's evidence section, each reference
+    followed by an indented note when it has one; ``empty`` when there is none."""
+
+    lines: list[str] = []
+    for ref in refs:
+        lines.append(f"- {ref}")
+        note = evidence_ref_note(
+            ref, node_id=node_id, upload_error=upload_error, region=region
+        )
+        if note:
+            lines.append(f"  {note}")
+    return "\n".join(lines) or empty

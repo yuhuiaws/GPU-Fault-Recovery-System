@@ -35,6 +35,7 @@ from gpu_fault.models import (
     WorkflowStepStatus,
     execution_matches_step,
 )
+from gpu_fault.notifications.common import evidence_ref_note
 from gpu_fault.notifications.hung_support import (
     FABRIC_FAILED,
     FABRIC_NOT_PLANNED,
@@ -278,9 +279,23 @@ def _bundle(step: WorkflowStepSpec, details: Mapping[str, Any]) -> _Read:
             if manifest
             else ""
         )
+        # Where the archive can be read: a file:// archive is on the node only
+        # (live 2026-10-25: every hung-triage archive, listed as if an operator
+        # could open it), an s3:// one gets its console link. On the node's own
+        # line, so the per-node bound still counts nodes.
+        note = (
+            evidence_ref_note(
+                ref,
+                node_id=_node(node),
+                upload_error=_text(value.get("evidence_upload_error")) or None,
+            )
+            if ref
+            else None
+        )
         nodes.append(
             f"{_node(node)}: {ref or 'archive reference not recorded'} sha256 "
             f"{digest} ({_count(value.get('size_bytes'))} bytes{captures})"
+            + (f" -- {note}" if note else "")
         )
         if ref:
             refs.append(ref)

@@ -2,6 +2,7 @@ from gpu_fault.notifications.common import (
     SXID_EVENT_EMAIL_TEMPLATE,
     SXID_EVENT_TEMPLATE_VERSION,
     AdvisoryNotification,
+    describe_evidence_ref,
 )
 
 
@@ -48,7 +49,11 @@ class SxidEventEmailBuilder:
             observed_at=observed_at,
             event_id=event_id,
             event_source=event_source or "UNKNOWN",
-            evidence_ref=evidence_ref or "NONE",
+            evidence_ref=(
+                describe_evidence_ref(evidence_ref, node_id=node_id)
+                if evidence_ref
+                else "NONE"
+            ),
             workload_state=workload_state,
             workloads=", ".join(workload_ids) or "NONE",
             classification=classification,

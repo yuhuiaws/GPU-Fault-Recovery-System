@@ -2,6 +2,7 @@ from gpu_fault.notifications.common import (
     HOST_RESOURCE_EVENT_EMAIL_TEMPLATE,
     HOST_RESOURCE_EVENT_TEMPLATE_VERSION,
     AdvisoryNotification,
+    render_evidence_refs,
 )
 
 
@@ -56,9 +57,7 @@ class HostResourceEventEmailBuilder:
             workflow_steps=" -> ".join(workflow_steps) or "NONE",
             policy_source=policy_source,
             policy_version=policy_version,
-            evidence_refs=(
-                "\n".join(f"- {item}" for item in evidence_refs) or "- NONE"
-            ),
+            evidence_refs=render_evidence_refs(evidence_refs, node_id=node_id),
             template_version=HOST_RESOURCE_EVENT_TEMPLATE_VERSION,
         )
         return AdvisoryNotification(
