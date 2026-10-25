@@ -769,16 +769,50 @@ IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，cre
 
 其余变体按映射文件留在分母并记 `NOT_RUN`，原因精确可查：
 
-- `FIXTURE_NOT_READY`：012 以及 002 `read_failure`、005 `stat_timeout`
-  /`io_only_failure` 需要把 `nvidia-smi` 的输出或 `/proc/meminfo`、
-  `/proc/driver/nvidia` 的读取**只在 host collector 单元私有环境里**替换的共享原始源
-  回放夹具。该通用回放器现已由协调方集中审查提供（下文“共享主机原始源回放夹具”），
-  各类别车道在其上接线（007/010/015 已接线，见上）；接线前这些变体仍记
-  `FIXTURE_NOT_READY`。005 `stat_timeout`/`io_only_failure`
+- `FIXTURE_NOT_READY`：005 `stat_timeout`/`io_only_failure`。007/010/015 的命令/文件回放与
+  002/012 的 `/proc/meminfo`、`nvidia-smi`、`/proc/driver/nvidia` 读取回放都已在协调方集中
+  审查提供的共享原始源回放夹具（下文“共享主机原始源回放夹具”）上接线（见上及下文）。
+  005 `stat_timeout`/`io_only_failure`
   不是文件/命令读取，不在其范围内。
 - `CAPABILITY_ABSENT`：005 的共享存储变体（本站无可扰动的独立 NFS/Lustre export）、
   010 `non_efa`（本站只有 EFA RDMA 设备）、015 `healthy`（EC2 无 BMC；`unsupported_bmc`
-  本身就是这条能力记录的只读 observation）、002 `swap_pressure`（无 swap 且不得为测试开 swap）。
+  本身就是这条能力记录的只读 observation）。
+
+已在共享回放器上接线的 002/012 变体（均需 `--approve HOST_SOURCE_REPLAY`，两个集群
+都运行；证据 `proof_scope: live-replay`，判定只读产品自身记录，包装器日志
+`audit-read` 为原始源 oracle）：
+
+- 002 `read_failure`：`InaccessiblePaths=/proc/meminfo` 只在 host collector 单元内生效
+  （探针经 `nsenter` 核验单元内不可读、PID 1 可读）。PASS 要求窗口内的 batch 带
+  `_memory` collection error 且**没有任何**内存/交换样本（UNKNOWN，而不是健康值），
+  无 memory/swap finding、无硬件步骤、无隔离；关窗后新样本恢复。
+- 002 `swap_pressure`：`build-meminfo-fixture` 复制节点真实 `/proc/meminfo`，只改写
+  `SwapTotal=8 GiB`/`SwapFree=1 GiB`（87.5 %），以 `meminfo` bind 进入单元；不建 swap
+  设备。规则无 sustain：首个投递 batch 即产出 `swap_used_percent` WARNING
+  RUN_DIAGNOSTICS → FREEZE_EVIDENCE + VALIDATE_HOST（`host_diagnostic_probe` 在
+  `swap_used_percent` 上，bind 持续期间必须失败）；`memory_used_percent` 保持真实值，不得
+  共振；关窗后 2 个新样本低于 80 %。产品样本值须与夹具计算值一致，否则 INCONCLUSIVE。
+- 012 `single_sample`：包装器从**一次** `uuid,utilization.gpu` 查询中删去一个真实 UUID
+  （`drop_row`，`max_calls=1`；真实 UUID 取自产品 `host_gpu_utilization_percent` latest
+  的 device）。PASS：`gpu_inventory_missing_count=1` 仅一次、`gpu_inventory_mismatch`
+  始终 0、无 finding、无 REBOOT_NODE、无隔离，随后恢复满数；日志必须恰好记录一次改写。
+- 012 `query_failed`：对该查询连续 4 个 tick 回放 NVML 初始化失败（stdout
+  `Failed to initialize NVML...`，exit 9）。PASS：collection error
+  `GPU inventory query failed`；`gpu_inventory_expected_count` 带
+  `failure_mode=DRIVER_QUERY_FAILED` 与驱动侧 `discovered_count`（真实绑定数）；**没有**
+  `gpu_inventory_mismatch` 样本、没有 0 计数、无 finding、无 reboot；规则耗尽后恢复满数。
+  日志少于两次失败读取为 INCONCLUSIVE（两次失败是规格的确认窗口）。
+- 012 `proc_unreadable`：同一失败查询 + `InaccessiblePaths=/proc/driver/nvidia/gpus`
+  （两次读取都失败，规格标注的已知风险）。PASS：collection error 含
+  `could not be read` 与 `unknown as well`；`failure_mode=INVENTORY_UNAVAILABLE` 且
+  **无** `discovered_count`、无 `gpu_inventory_discovered_count` 样本；其余同上。
+- 012 `expectation_wrong`（`risk H`，`X`，另需 `--approve NODE_REBOOT`，
+  `expected_outcome=FAIL`）：在单元环境把 `GPU_FAULT_EXPECTED_GPU_COUNT` 覆盖为产品记录的
+  期望数 +1；产品记录两次该期望或产出 finding 后立刻关窗。规格要求把它当期望（配置）
+  问题而非真掉卡；当前产品在两个 tick 后产出 `gpu_inventory_mismatch` CRITICAL
+  REBOOT_NODE 且无任何控制面路径用 `node_instance_type`/`gpu_inventory_discovered_count`
+  复核 `expected_count`，故该变体在缺口修复前记 FAIL，且其 REBOOT 链会真实重启节点
+  （运行器只等待其结束，不取消；放在车道最后执行）。
 - `VENDOR_LAB_ONLY`：012 `confirmed_missing`/`reboot_verified`/`post_reboot_failure`
   需要真实掉卡与已批准的 provider reboot；本 lane 绝不解绑或移除真实 GPU。
 
@@ -992,10 +1026,53 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
 诱发），均需 `--site-file`；native 的 `missing_flight_recorder` 复用 011 的两节点 NCCL 任务且
 无 flight recorder，需 `--site-file --node-b`，判定独立 RDMA 空闲触发
 `detection_basis: ATTEMPT_SCOPED_RDMA_IDLE` 与 triage 的 `not_configured`）、
-032 `unknown_xid`（判为 SITE_SAFETY）与 `duplicate`、013 `unreadable_state`
-（UNKNOWN 而非零卡），phase-1 文件源 001 `invalid_delta`、008 `statistics_failed`、
+032 `unknown_xid`（判为 SITE_SAFETY）、`duplicate` 与 `missing_topology`、013
+`unreadable_state`（UNKNOWN 而非零卡）与整树回放的 `unknown_inventory`/`excess_device`/
+`link_inactive`，phase-1 文件源 001 `invalid_delta`、008 `statistics_failed`、
 009 `errors_delta`，以及共享回放器上的 010 全部 8 个 EFA/RDMA 计数变体与 011 `broken_pair`
 （见 host/device 与工作负载两节）。
+
+- 032 `missing_topology`（kmsg 回放，`KERNEL_SOURCE_REPLAY`，两个集群）：经审查的
+  Fabric Manager 摘要行 `nvidia-nvswitch0: SXid (PCI:...): 11001, Fatal, ...`，**不写**
+  `Link N`。内核采集器只转发摘要行（`SXID_SUMMARY_PATTERN`），解析器把链路作用域留为
+  UNKNOWN，控制面只能从新鲜可信的 `nvswitch_port_topology`（host collector 的拓扑查询，
+  只在设置 `GPU_FAULT_NVSWITCH_TOPOLOGY_COMMAND` 时运行；节点安装器默认为空，本站两个
+  集群的部署都未设置）或 H100/H200 的“全 access”产品不变量（需要行内有端口号）解析。
+  因此本站的“缺拓扑”是真实状态而非伪造：11001 在固定目录里是 FATAL /
+  `SCOPE_DEPENDENT_RESET`，无可信作用域 → `BLOCKED_MISSING_EVIDENCE`
+  “requires a trusted access/trunk port-scope mapping”，operator-required，
+  RESET_ALL_GPUS_AND_NVSWITCHES 被扣留。PASS 要求 FaultPolicyDecision 正是如此且无任何
+  reset/reboot 步骤；产品按站点安全对该事件做 MARK_UNSCHEDULABLE + QUARANTINE，变体经
+  产品的 validated restore 把节点交回。决策通过节点新 incident 的 `event_id` 读
+  `get_xid_policy_decision`（SXID 决策同表）。
+- 032 `missing_version` 仍 `FIXTURE_NOT_READY`：解码器门禁（`_workflow_nvlink5` 的
+  `driver_branch is None` → BLOCKED_MISSING_EVIDENCE）读的是 XID 事件上由**内核采集器**
+  自身 CollectorContext（单元启动时的 `nvidia-smi --query-gpu=driver_version`）盖上的
+  版本，而非 host collector 或 `/proc/driver/nvidia/version`；共享回放器只允许
+  `gpu-fault-host-collector.service`，需要协调方审查后把包装器/探针的允许单元扩到
+  `gpu-fault-kernel-collector.service`（仅 `driver_version` 查询），再配合 kmsg 回放一条带
+  IntrInfo/Error Status 的 WORKFLOW_NVLINK5_ERR XID。
+- 013 整树回放（`HOST_SOURCE_REPLAY`，两个集群）：`build-infiniband-fixture` 先复制节点
+  真实 `/sys/class/infiniband`（选一个端口 ACTIVE/LinkUp 的真实设备），再施加一个经审查的
+  变异并以 `--tree` 绑入 host collector 单元；PCI 根保持真实，`pci_discovered` 不会下降，
+  故这些变体进不了 PCI_DEVICE_MISSING 的 reboot 链。`unknown_inventory`：该设备
+  `device/driver` 身份 ambiguous → collection error
+  `EFA inventory observation unavailable: missing or ambiguous RDMA driver identity`，
+  无任何 EFA 计数/mismatch 样本、无 finding、无 reboot、无隔离。`excess_device`：复制该设备
+  为 `gfrs-excess0` → `failure_mode=EXCESS_DEVICE` → RUN_DIAGNOSTICS（FREEZE_EVIDENCE +
+  VALIDATE_FABRIC）；finding 出现后立刻关窗，PASS 要求验证器确实执行、无硬件/隔离步骤、
+  恢复满数；该诊断链的 VALIDATE_FABRIC 带 `inventory_requirements_by_node` 却没有前置
+  恢复动作，只能 `missing_inventory_action_completion` 等到步骤 deadline
+  （`GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS`，默认 600 s）后 FAILED、incident 记
+  diagnostic inconclusive，EXCESS_DEVICE 无升级。`link_inactive`（`risk H`，`X`，另需
+  `--approve NODE_REBOOT`，`expected_outcome=FAIL`）：该设备一个端口 `state`/`phys_state`
+  改为 `1: DOWN`/`3: Disabled` → `failure_mode=LINK_INACTIVE` → RUN_DIAGNOSTICS，finding
+  出现后立刻关窗恢复链路；PASS 要求先诊断（首个工作流只有 VALIDATE_FABRIC、无硬件/隔离）、
+  诊断在恢复后的链路上得出 SUCCEEDED、无 RESTART_NODE。当前产品把该 VALIDATE_FABRIC 标为
+  `failure_escalation_action=REBOOT_NODE`（按设计“先诊断再升级”），但同一步骤因上述
+  `missing_inventory_action_completion` 永不重读端口状态、deadline 后 FAILED 即升级到
+  RESTART_NODE——端口已 ACTIVE 仍会重启，故记为产品缺口；运行器等待该链结束（含重启），
+  放在车道最后执行。
 
 计划/执行守卫键仍为 `<case>.<variant>`，确认串 `GENERALLIVE<NNN>_EXECUTE`。新 `--approve`
 令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`EFA_DRIVER_UNBIND`、
@@ -1011,9 +1088,10 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
 ```
 
 本轮保持 `NOT_RUN` 并留在分母：014 全部（伪造 allocatable/改 Node.status 不算证明，
-原生 plugin 故障需 `DEVICE_PLUGIN_RESTART`）、013 多数（唯一 EKS 节点上的 missing→reboot
-链、保留的原生解绑、不可重指的 `/sys/class/infiniband`）、032 的目录/版本/Profile 权限
-变体（AUTH-015 未配置）、004 `probe_error`（`statvfs` 错误无法由只读文件 bind 产生）。
+原生 plugin 故障需 `DEVICE_PLUGIN_RESTART`）、013 `pci_missing`/`driver_unbound`/
+`bind_failure`/`post_repair_failure`（唯一 EKS 节点上的 missing→reboot 链、保留的原生
+解绑）、032 的产品/版本/Profile 权限变体（`missing_version` 需内核采集器单元的回放；
+AUTH-015 未配置）、004 `probe_error`（`statvfs` 错误无法由只读文件 bind 产生）。
 
 ### phase 2 范围与前提（DCGM 字段 / GPU 库存回放）
 

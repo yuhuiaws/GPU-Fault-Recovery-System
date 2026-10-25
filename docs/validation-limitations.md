@@ -1318,25 +1318,42 @@ once the pair reads again the still-stalled job's ZERO_WARNING must come no
 earlier than the warning threshold after the restore. `non_efa` stays
 CAPABILITY_ABSENT (no IB-only RDMA device on this site).
 
-The rest stay `NOT_RUN`: `FIXTURE_NOT_READY` for 012 and a few 002/005
-variants, which need the targeted command/file reading (`nvidia-smi` output,
-`/proc/meminfo`, `/proc/driver/nvidia`) wired onto the same shared replay by
-their lane, never
+The rest stay `NOT_RUN`: `FIXTURE_NOT_READY` only for the 005
+`stat_timeout`/`io_only_failure` variants (not a file or command reading; the
+007/010/015 command replays and the 002/012 `/proc/meminfo` / `nvidia-smi` /
+`/proc/driver/nvidia` read replays are all wired on the shared raw-source
+replay described below), never
 replacing a host binary or a global mount; `CAPABILITY_ABSENT` where the site
 genuinely lacks the capability (no independent NFS/Lustre export, no non-EFA
-RDMA device, no BMC on EC2 for 015 `healthy`, no swap device); and
-`VENDOR_LAB_ONLY` for the 012 variants that need a real GPU off the bus and an
-approved provider reboot (this lane never unbinds or removes a real GPU). The
-spec's expected product gaps are recorded in the variants' reasons rather than
-hidden. Of the three closed in the product, the failed SMART scan and the
-failed drive query are now proven live by 007 `scan_failed` / `query_failed`
-(`smart_query_failed` plus a collection error, never zero drives); an
-unopenable drive and a hung drive query stay software-tested, as do the EFA
-`ethtool -S` deltas reported only from real readings (failures and resets are
-UNKNOWN, missing counters `efa_ethtool_counters_unsupported`) and an NVML
-failure with an unreadable `/proc/driver/nvidia/gpus` being
-`INVENTORY_UNAVAILABLE` rather than zero GPUs. statvfs-OK-but-I/O-fails shared
-storage remains open.
+RDMA device, no BMC on EC2 for 015 `healthy`); and `VENDOR_LAB_ONLY` for the
+012 variants that need a real GPU off the bus and an approved provider reboot
+(this lane never unbinds or removes a real GPU). The 012 read paths and the 002
+variants are wired on that replay: `single_sample` (one real UUID dropped from
+exactly one `uuid,utilization.gpu` query), `query_failed` (an NVML
+initialisation failure for four ticks), `proc_unreadable` (the same failure
+with `/proc/driver/nvidia/gpus` hidden from the unit -- the two-read-failure
+case), `read_failure` (`/proc/meminfo` hidden from the unit) and
+`swap_pressure` (the node's real `/proc/meminfo` with only `SwapTotal`/
+`SwapFree` rewritten, since the site runs no swap and business swap must not
+be enabled for a test); each is judged on the product's own records --
+failure-mode context and a collection error, never a zero count, a healthy
+value, a finding or a hardware step -- with the wrapper's journal as the
+raw-source oracle. `expectation_wrong` (the recorded expected GPU count plus
+one in the unit's environment) is registered `expected_outcome=FAIL`: the
+product grades a wrong expectation as a missing GPU (CRITICAL REBOOT_NODE
+after two ticks) with no reconciliation against `node_instance_type` or the
+driver's bound count, so it needs `NODE_REBOOT` and really reboots the node
+while the gap is present. The spec's other expected product gaps are recorded
+in the variants' reasons rather than hidden. Of the three closed in the product,
+the failed SMART scan and the failed drive query are now proven live by 007
+`scan_failed` / `query_failed` (`smart_query_failed` plus a collection error,
+never zero drives), the EFA `ethtool -S` deltas reported only from real readings
+(failures and resets are UNKNOWN, missing counters
+`efa_ethtool_counters_unsupported`) by 010 `ethtool_failed` / `missing_counter` /
+`counter_reset`, and an NVML failure with an unreadable `/proc/driver/nvidia/gpus`
+being `INVENTORY_UNAVAILABLE` rather than zero GPUs by 012 `proc_unreadable`; an
+unopenable drive and a hung drive query stay software-tested.
+statvfs-OK-but-I/O-fails shared storage remains open.
 
 ## GF-GENERAL-LIVE 029 store-level restart-budget variants
 
@@ -1453,9 +1470,30 @@ Implemented live-replay variants: 016 severe kernel log (all nine, including the
 trusted-source and current-boot gates that must *not* isolate on a user-space or
 old-boot line), 017 application error logs (the OOM diagnostic and the NCCL /
 distributed evidence-only paths), 032 unknown error (`unknown_xid` graded
-SITE_SAFETY and its dedup), 013 EFA inventory `unreadable_state` (UNKNOWN, not
-zero cards), and the phase-1 host file-source variants 001 `invalid_delta`,
-008 `statistics_failed` and 009 `errors_delta`.
+SITE_SAFETY, its dedup, and `missing_topology`: a reviewed fatal Fabric Manager
+SXID summary line naming no link on a node whose `GPU_FAULT_NVSWITCH_TOPOLOGY_
+COMMAND` is unset -- the installer default on both clusters -- so no trusted
+`nvswitch_port_topology` exists and the H200 access-only invariant cannot
+apply; the product must answer BLOCKED_MISSING_EVIDENCE "requires a trusted
+access/trunk port-scope mapping" with the full fabric reset withheld, and the
+site-safety quarantine is handed back through the validated restore), 013 EFA
+inventory `unreadable_state` (UNKNOWN, not zero cards) plus the whole-tree
+`/sys/class/infiniband` replays `unknown_inventory` (an ambiguous driver
+identity is UNAVAILABLE, no count), `excess_device` (a duplicated real device
+is EXCESS_DEVICE, RUN_DIAGNOSTICS with VALIDATE_FABRIC executed, no reboot or
+isolation) and `link_inactive` (one real port DOWN/Disabled is LINK_INACTIVE,
+diagnose first), and the phase-1 host file-source variants 001 `invalid_delta`,
+008 `statistics_failed` and 009 `errors_delta`. `link_inactive` is registered
+`expected_outcome=FAIL` and needs `NODE_REBOOT`: the diagnostic VALIDATE_FABRIC
+of an `efa_inventory_mismatch` finding carries `inventory_requirements_by_node`
+that only a completed EFA recovery operation can satisfy, so it never re-reads
+the port, waits out `GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS` (600 s), fails,
+and -- tagged `failure_escalation_action=REBOOT_NODE` for LINK_INACTIVE --
+escalates to RESTART_NODE even though the port is ACTIVE again (the runner
+restores the link the moment the finding exists). 032 `missing_version` stays
+`FIXTURE_NOT_READY`: the NVLink5 decoder gates on the `driver_branch` the
+*kernel collector's* own CollectorContext stamps on the XID event, and the host
+source replay is allow-listed for `gpu-fault-host-collector.service` only.
 
 The variants that stay `NOT_RUN` on this single-node site keep their place in the
 denominator with an explicit reason: 014 Kubernetes allocatable (every variant --
