@@ -3541,6 +3541,30 @@ recovery). The step details are `support_disposition=READ_ONLY_HUNG_DIAGNOSTIC`,
 The selection is exactly `hung_handoff.hung_handoff_workflow`; every other `ESCALATE_SUPPORT` (hardware escalation, XID 74, a plan that
 touched a node, the operator hand-off after a spent lifetime) is unchanged.
 
+**Shared-storage failure domain (a record-only incident).** `shared_filesystem_unavailable` is graded per node, so
+while an NFS server is down or a Lustre MDS is in recovery every node that loses the export opens its own CRITICAL
+`RUN_DIAGNOSTICS` NODE_HEALTH incident and VALIDATE_HOST chain -- N independent node faults to the eye.
+`shared_storage_failure_domain.py` adds a purely **additive** cross-node correlation on top: when ≥2 nodes report the
+same export unavailable within a 600 s window (node clocks), one more cluster-scoped incident is recorded --
+`event_type=SHARED_STORAGE_FAILURE_DOMAIN`, `event_source=shared_filesystem_unavailable`,
+`policy_source=SITE_SHARED_STORAGE_FAILURE_DOMAIN`, `policy_reference=shared-filesystem:<export>`, `node_ids` = the
+member nodes, `reasons[0]` naming the export and the nodes, then one line per member with its per-node incident id;
+`effective_action=None` and no workflow (a record, never dispatched). Every member's per-node incident gets one
+`common failure domain <id>: ...` reason pointing back; the node chain itself (action, state, steps) is untouched --
+nothing is isolated, no job is stopped. The whole domain mails once (`SHARED_STORAGE_FAILURE_DOMAIN`, deduplicated
+per cluster/export/record id); a node that joins later is added to `node_ids` and `reasons` without another mail. The
+export identity comes from the collector's sample label `source` (the mountinfo mount source, e.g. `10.0.0.5:/export`,
+`fs-0abc@tcp:/fsname`) or `server`+`export`; **a mount point is not an identity** (nodes may mount different exports at
+the same path), and no identity means UNKNOWN and no correlation. Record states: a member still has an "unavailable"
+reading inside the window → `DETECTED`; every member's latest reading is "available" → `RECOVERED` (closes by itself as
+the signals clear); no fresh "unavailable" reading but a silent member (last reading unavailable and older than the
+window, or no reading at all) → `ESCALATED` (silence is not recovery; the operator owns the close, and an "available"
+from the silent node later still closes it `RECOVERED`). Concurrent activations for one export may not see each other;
+every later "still unavailable" sample inside the window re-checks the node's membership and joins, and identical member
+sets derive identical record ids, so duplicate creation converges on one record. No store schema change (only the
+existing incident and notification records); the departed-node cleanup treats it like any multi-node incident -- a
+blocker while other members are alive, handed to the operator's `incident-close`.
+
 ### 6.4 Transition-by-Transition Table
 
 The 7 values of `ActionDisposition` are the basis for branching at entry: `PENDING_CORRELATION` (waiting for the window),

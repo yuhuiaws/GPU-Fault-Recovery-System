@@ -182,6 +182,18 @@ FAIL）。只读以宿主 `/proc/1/mountinfo`
 确认collector有界返回且其他指标仍上报，VALIDATE_HOST不能用另一个挂载的健康代替。
 两个任务节点访问同一export时记录共同故障域，不把每节点都误作坏硬件。
 当前若未检测实际I/O或挂载消失，记录FAIL。还原export/连接后验证新采样、真实I/O和任务进度。
+`shared_failure_domain` 的产品形态（批次177，此前因每节点各成一条 NODE_HEALTH incident、无共同记录而记
+FAIL）：两节点仍各自产出诊断链（FREEZE_EVIDENCE → VALIDATE_HOST，`RUN_DIAGNOSTICS`，不 cordon/taint、
+不停任务）；≥2 个节点在 600 s 内报同一 export 不可用时，控制面另记一条集群级
+`event_type=SHARED_STORAGE_FAILURE_DOMAIN` incident（`policy_reference=shared-filesystem:<export>`，
+`node_ids` 含两节点，reasons 第一条写明 export 与节点、随后每节点一行写其 incident id，无 workflow、
+`effective_action` 为空），两节点 incident 各追加一条 `common failure domain <id>` reason 回指，整个故障域
+只发一封 `SHARED_STORAGE_FAILURE_DOMAIN` 通知（正文列 export、节点与各节点 incident）；两节点样本都回 0 后
+该记录自动 `RECOVERED`，一节点回 0 而另一节点超过窗口无读数则转 `ESCALATED` 交运维。验收读
+`GET /v1/incidents?state=DETECTED,ESCALATED,RECOVERED`（`event_type`、`node_ids`、`first_reason`）与
+`GET /v1/incidents/<id>` 的 reasons。export 标识取采集器样本标签 `source`（mountinfo 挂载源）或
+`server`+`export`；节点侧采集器需随 `shared_filesystem_unavailable` 样本带该标签，否则标识为 UNKNOWN、
+不关联（挂载点不是标识），夹具应对两节点挂载源一致作 `NOT_READY` 前置检查。
 
 本站实现（`general_live_shared.py`）。产品没有共享存储配置项：host collector 的
 `_shared_filesystems` 每个采样周期从自身 `/proc/self/mountinfo` 按文件系统类型

@@ -36,7 +36,7 @@
 | 002 | 内存/交换耗尽 | 部分 | GF-HOST-OBS-001 验证 swap；GF-GENERAL-SW-001 扩展 memory；cgroup/任务归因仍缺 |
 | 003 | 低利用率/资源持续异常 (`SITE_HOST_RESOURCE_HEALTH`) | 部分 | 持续窗口、attempt 归属与诊断绑定有本地测试；应用阶段与 MIG 归因仍缺 |
 | 004 | 本地磁盘满 | 部分 | GF-HOST-001 只测策略；新增 GF-GENERAL-SW-002 执行隔离；inode 耗尽已按同一 98% 规则判定（`filesystem_inodes_used_percent`，SW-002 `inode` 变体执行真实隔离）；只读、挂载消失、EIO 与任务盘区分仍缺 |
-| 005 | 共享存储不可用/满 | 部分 | 有 statvfs 超时与策略测试；新诊断绑定；真实读写和跨节点故障域验收仍缺 |
+| 005 | 共享存储不可用/满 | 部分 | 有 statvfs 超时与策略测试；新诊断绑定；跨节点故障域记录已有控制面实现与软件测试（`SHARED_STORAGE_FAILURE_DOMAIN`）；真实读写与故障域真机验收仍缺 |
 | 006 | 磁盘 IO 饱和 | 部分 | 有持续窗口与限时采集测试；新诊断绑定；与 checkpoint 关联仍缺 |
 | 007 | SMART 失败 | 部分 | GF-HOST-004 原为 API 到计划；新增 SW-002/003 分别执行隔离与拒绝误隔离；scan 失败、盘无法打开、单盘超时为 UNKNOWN（`smart_query_failed` + collection error，SW-003 `smart-scan`），工具缺失/无盘/无结论为 NOT_SUPPORTED（`smart_status_unsupported`）；真机回放夹具仍缺 |
 | 008 | 网卡链路 down | 部分 | 新增 SW-002/003 覆盖接口消失/down/unknown；接口角色、bond 等场景仍缺 |
@@ -138,7 +138,10 @@ GPU/rank CPU ≤5% 持续 300 秒、可用内存 ≤5% 持续 60 秒、page cach
 另一正常挂载不能覆盖故障挂载；缺失新样本应等待，不得确认恢复。
 增加“statvfs 正常但读写/fsync 失败”变体作为整改验收，不伪称当前能检出。
 恢复服务器/挂载，读写探针和相关任务进度均通过后结束。
-整改缺口：真实有界 I/O 探针与共享存储故障域聚合。
+整改缺口：真实有界 I/O 探针。共享存储故障域聚合已由控制面实现（批次177：≥2 节点在 600 s 内报同一
+export 不可用时另记一条集群级 `SHARED_STORAGE_FAILURE_DOMAIN` incident 并只发一封通知，节点链不变；
+依赖采集器样本标签 `source`/`server`+`export` 给出 export 标识，见
+[真机验收 GF-GENERAL-LIVE-005](general-fault-live-acceptance.md#gf-general-live-005)），真机执行仍待证明。
 
 ### GF-GENERAL-E2E-006
 
