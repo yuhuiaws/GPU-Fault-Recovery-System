@@ -93,6 +93,11 @@ EXPORT_FAILURE_MARKERS = (
     "Config File (",
     "Could not create export",
 )
+#: The components whose CRIT/MAJ lines just before a failure marker are the
+#: cause worth naming (never the DBUS/NFS CB start-up noise), and how far back
+#: to look.
+CAUSE_COMPONENTS = (" :FSAL :", " :EXPORT :", " :CONFIG :")
+CAUSE_WINDOW_LINES = 8
 DEFAULT_SIZE_MIB = 256
 MIN_SIZE_MIB = 64
 MAX_SIZE_MIB = 2048
@@ -109,10 +114,21 @@ RESUME_SCRIPT = (
 #: the export directory is owned by it so ``fs.protected_regular`` lets the
 #: squashed client create files in the sticky directory.
 ANONYMOUS_ID = 65534
-#: The container's entry: export directory (world-writable, sticky, owned by
-#: the squashed identity), writable ganesha dirs, ganesha as a *child* of this
-#: shell (pausable from an exec), pid recorded, then wait. POSIX sh (dash).
+#: The mount table NFS-Ganesha's FSAL_VFS reads to find the export's file
+#: system (``setmntent(MOUNTED)``, glibc's ``/etc/mtab``). The Ubuntu image
+#: ships none: Docker synthesises ``/etc/mtab -> /proc/mounts`` in every
+#: container it creates (so the image's docker smoke test exported ``/a``),
+#: containerd/CRI does not, and without the file ``populate_posix_file_systems``
+#: fails with ENOENT and the export is never created -- the first live run
+#: (``Could not create export for (/a) to (/export/a)``, NFS4ERR_NOENT on the
+#: client). The entry script creates the link when the file is missing.
+MOUNT_TABLE_LINK = "test -e /etc/mtab || ln -sfn /proc/self/mounts /etc/mtab"
+#: The container's entry: mount table, export directory (world-writable,
+#: sticky, owned by the squashed identity), writable ganesha dirs, ganesha as
+#: a *child* of this shell (pausable from an exec), pid recorded, then wait.
+#: POSIX sh (dash).
 ENTRY_SCRIPT = f"""set -eu
+{MOUNT_TABLE_LINK}
 mkdir -p {EXPORT_PATH} /var/run/ganesha /var/lib/nfs/ganesha /run/gfrs
 chmod 1777 {EXPORT_PATH}
 chown {ANONYMOUS_ID}:{ANONYMOUS_ID} {EXPORT_PATH}
@@ -477,6 +493,9 @@ class TestExportServer:
                 log_tail = self.logs(200)
                 failed = self._export_failure(log_tail)
                 if failed is not None:
+                    # The Pod is deleted by the LIFO cleanup right after this;
+                    # the journal keeps the server's log with its reason.
+                    self._journal(export_failure=failed, log=log_tail)
                     raise RegionalFixtureError(
                         f"test export {self.name} never initialised export "
                         f"{PSEUDO_PATH}: {failed}"
@@ -494,6 +513,10 @@ class TestExportServer:
                     return dict(self.ready)
             if self.clock() - started >= timeout_seconds:
                 if phase == "Running" and ready:
+                    self._journal(
+                        export_failure=f"no '{EXPORT_CREATED_LINE}' line",
+                        log=log_tail,
+                    )
                     raise RegionalFixtureError(
                         f"test export {self.name} is Ready but its log never "
                         f"reported export {PSEUDO_PATH} created within "
@@ -507,11 +530,26 @@ class TestExportServer:
 
     @staticmethod
     def _export_failure(log_text: str) -> str | None:
-        """The first server log line proving the export cannot be served."""
+        """The first server log line proving the export cannot be served, with
+        the FSAL/EXPORT/CONFIG CRIT and MAJ lines logged just before it: the
+        server's own cause (``Error 2 in setmntent(/etc/mtab): No such file or
+        directory`` on the first live run), which the marker line alone hides.
+        """
 
-        for line in log_text.splitlines():
-            if any(marker in line for marker in EXPORT_FAILURE_MARKERS):
-                return line.strip()[-300:]
+        lines = log_text.splitlines()
+        for index, line in enumerate(lines):
+            if not any(marker in line for marker in EXPORT_FAILURE_MARKERS):
+                continue
+            causes = [
+                _log_message(earlier)
+                for earlier in lines[max(0, index - CAUSE_WINDOW_LINES) : index]
+                if any(component in earlier for component in CAUSE_COMPONENTS)
+                and (" :CRIT :" in earlier or " :MAJ :" in earlier)
+            ]
+            reason = line.strip()[-300:]
+            if causes:
+                reason += " (preceded by: " + "; ".join(causes) + ")"
+            return reason
         return None
 
     def logs(self, tail: int = 40) -> str:
@@ -630,6 +668,15 @@ class TestExportServer:
         }
 
 
+def _log_message(line: str) -> str:
+    """``function :COMPONENT :LEVEL :message`` of one NFS-Ganesha log line --
+    the ``date : epoch : host : ganesha.nfsd-<pid>[thread]`` prefix dropped --
+    bounded to 200 characters."""
+
+    _prefix, separator, message = line.partition("] ")
+    return (message if separator else line).strip()[:200]
+
+
 def _now() -> str:
     from datetime import datetime, timezone
 
@@ -645,6 +692,7 @@ __all__ = [
     "EXPORT_FAILURE_MARKERS",
     "EXPORT_PATH",
     "ExportServerSettings",
+    "MOUNT_TABLE_LINK",
     "NFS_PORT",
     "PSEUDO_PATH",
     "TestExportServer",

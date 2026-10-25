@@ -211,6 +211,27 @@ def test_entry_script_hands_the_sticky_export_root_to_the_squashed_identity() ->
     )
 
 
+def test_entry_script_gives_ganesha_its_mount_table_before_it_starts() -> None:
+    """First live run, reproduced in a local kind cluster: NFS-Ganesha's
+    FSAL_VFS locates the export's file system through ``setmntent`` on glibc's
+    ``MOUNTED`` (``/etc/mtab``); the Ubuntu image ships none, Docker synthesises
+    the link in every container (so the image's docker smoke test passed) and
+    containerd/CRI does not -- ENOENT, ``Could not create export``, NFS4ERR_NOENT
+    for every client. The entry creates the link, idempotently, before
+    ``ganesha.nfsd`` and under ``set -e`` (a failure ends the Pod, which
+    ``wait_ready`` reports with the log)."""
+
+    lines = [line.strip() for line in export.ENTRY_SCRIPT.splitlines()]
+    assert (
+        export.MOUNT_TABLE_LINK
+        == "test -e /etc/mtab || ln -sfn /proc/self/mounts /etc/mtab"
+    )
+    link = lines.index(export.MOUNT_TABLE_LINK)
+    ganesha = next(index for index, line in enumerate(lines) if "ganesha.conf" in line)
+    assert 0 < link < ganesha, lines
+    assert lines[0] == "set -eu"
+
+
 def test_ganesha_config_places_each_parameter_in_the_block_4_3_reads() -> None:
     """NFS-Ganesha 4.3 reports Attr_Expiration_Time as an unknown MDCACHE
     parameter; it belongs to the EXPORT block. Active_krb5 = false silences
@@ -440,3 +461,97 @@ def test_wait_ready_fails_with_the_servers_own_line_when_the_export_root_failed(
     regional.phases = [running()] * 5
     with pytest.raises(RegionalFixtureError, match="Config File"):
         fixture.wait_ready(timeout_seconds=600, poll_seconds=1)
+
+
+def test_wait_ready_names_the_servers_cause_when_the_export_was_not_created(
+    tmp_path: Path,
+) -> None:
+    """The second live run's line, with what a local kind cluster (containerd)
+    showed before it: no ``/etc/mtab`` -> ``setmntent`` ENOENT -> ``Could not
+    create export``. The error names both export paths and the FSAL's cause,
+    skips the DBUS start-up noise, and the journal keeps the whole log tail
+    (the Pod is deleted by the cleanup right after)."""
+
+    regional = FakeRegional()
+    fixture = export.TestExportServer(
+        regional,
+        settings(),
+        journal=tmp_path / "export-a.json",
+        clock=lambda: 0.0,
+        sleep=lambda _s: None,
+    )
+    fixture.create()
+    regional.phases = [running()] * 5
+    prefix = (
+        "25/10/2026 19:51:11 : epoch 6ade5daf : gfrs-export-9f9fc118a1-a : "
+        "ganesha.nfsd-11[main] "
+    )
+    regional.log_output = "".join(
+        prefix + line + "\n"
+        for line in (
+            "load_rados_config :CONFIG :WARN :Missing RADOS URLs backend library",
+            "populate_posix_file_systems :FSAL :CRIT :Error 2 in "
+            "setmntent(/etc/mtab): No such file or directory",
+            "resolve_posix_filesystem :FSAL :CRIT :populate_posix_file_systems "
+            "returned No such file or directory (2)",
+            "vfs_create_export :FSAL :CRIT :resolve_posix_filesystem(/export/a) "
+            "returned No such file or directory (2)",
+            "mdcache_fsal_create_export :FSAL :MAJ :Failed to call create_export "
+            "on underlying FSAL VFS",
+            "fsal_cfg_commit :CONFIG :CRIT :Could not create export for (/a) "
+            "to (/export/a)",
+            "config_errs_to_log :CONFIG :CRIT :Config File "
+            "(/etc/ganesha/ganesha.conf:31): 1 validation errors in block FSAL",
+            "gsh_dbus_pkginit :DBUS :CRIT :dbus_bus_get failed (Failed to connect "
+            "to socket /run/dbus/system_bus_socket: No such file or directory)",
+        )
+    )
+    with pytest.raises(
+        RegionalFixtureError, match="never initialised export /a"
+    ) as caught:
+        fixture.wait_ready(timeout_seconds=600, poll_seconds=1)
+    message = str(caught.value)
+    assert "Could not create export for (/a) to (/export/a)" in message, message
+    assert "Error 2 in setmntent(/etc/mtab): No such file or directory" in message
+    assert "Failed to call create_export on underlying FSAL VFS" in message
+    assert "preceded by: populate_posix_file_systems :FSAL :CRIT" in message, (
+        "the cause lines keep function, component and level, not the prefix"
+    )
+    assert "dbus" not in message and "RADOS" not in message, message
+    assert fixture.ready == {}, "a failed export is never reported ready"
+    journal = json.loads((tmp_path / "export-a.json").read_text())
+    assert journal["name"] == fixture.name
+    assert (
+        "Could not create export for (/a) to (/export/a)" in journal["export_failure"]
+    )
+    assert journal["log"] == regional.log_output, "the whole tail is kept"
+
+
+def test_wait_ready_journals_the_log_of_a_ready_pod_that_never_exported(
+    tmp_path: Path,
+) -> None:
+    regional = FakeRegional()
+    fixture = export.TestExportServer(
+        regional,
+        settings(),
+        journal=tmp_path / "export-a.json",
+        clock=lambda: 0.0,
+        sleep=lambda _s: None,
+    )
+    fixture.create()
+    regional.phases = [running()] * 50
+    regional.log_output = "ganesha.nfsd Starting: Ganesha Version 4.3\n"
+    clock = {"now": 0.0}
+
+    def tick() -> float:
+        clock["now"] += 1.0
+        return clock["now"]
+
+    fixture.clock = tick
+    with pytest.raises(RegionalFixtureError, match="never reported export /a"):
+        fixture.wait_ready(timeout_seconds=5, poll_seconds=1)
+    journal = json.loads((tmp_path / "export-a.json").read_text())
+    assert journal["export_failure"].startswith("no '" + export.EXPORT_CREATED_LINE), (
+        journal
+    )
+    assert journal["log"] == regional.log_output

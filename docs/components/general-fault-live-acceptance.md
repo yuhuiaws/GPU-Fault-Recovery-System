@@ -321,6 +321,18 @@ Pod，错误写明节点、服务端与文件；探针把 `mount.nfs4` 的 stder
 (security group or network policy)`），由宿主探针夹具以 `nfs mount failed:` 显示，stderr 原文（服务端地址、
 挂载点）仍不出节点。HyperPod 节点的客户端前提相同（`mount.nfs4`、可加载 `nfsv4`），其 005 将呈现同一服务端
 原因，需从保存的日志读取。
+第二次实况（`stat_timeout`）由该判定直接报出服务端行 `fsal_cfg_commit :CONFIG :CRIT :Could not create export
+for (/a) to (/export/a)`。在本机 kind 集群（containerd + kubelet）用同一镜像、同一 ConfigMap 与入口脚本复现，
+首因是其前一行 `populate_posix_file_systems :FSAL :CRIT :Error 2 in setmntent(/etc/mtab): No such file or
+directory`：NFS-Ganesha 的 FSAL_VFS 通过 glibc 的 `MOUNTED`（`/etc/mtab`）读挂载表来定位 export 所在文件系统，
+而 Ubuntu 24.04 镜像的两层都不含 `/etc/mtab`——Docker 在创建每个容器时自动生成 `/etc/mtab -> /proc/mounts`
+（镜像的 docker 冒烟因此导出成功），containerd/CRI 不生成，于是 export 从未创建，服务端对 `/a` 以 NFS4ERR_NOENT
+作答（首次实况六个变体的 `No such file or directory`）。修正在夹具入口脚本（镜像摘要不变）：
+`ganesha.nfsd` 之前先执行 `test -e /etc/mtab || ln -sfn /proc/self/mounts /etc/mtab`；kind 复现中修正后日志出现
+`Export 1 created at pseudo (/a) with path (/export/a)`，客户端以探针选项 `mount -t nfs4 <pod ip>:/a` 成功、
+`statvfs` 为 256 MiB、root 写入落为 65534:65534，而未修正的 Pod 仍答 `reason given by server: No such file or
+directory`。`wait_ready` 失败时把服务端日志尾部与原因写入 `export-<suffix>.json`（`export_failure`、`log`），
+错误行在标记行之后附带其前 8 行内的 FSAL/EXPORT/CONFIG CRIT/MAJ 行（`preceded by: ...`），DBUS 启动噪音不计。
 计划/执行形如：
 
 ```bash

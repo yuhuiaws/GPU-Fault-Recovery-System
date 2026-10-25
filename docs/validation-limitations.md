@@ -1604,6 +1604,28 @@ address, mount point) still never leaves the node. HyperPod nodes carry the same
 client prerequisites (`mount.nfs4`, a loadable `nfsv4`), so their 005 runs show
 the same server-side reason until it is read from the saved log.
 
+The second live run (`stat_timeout`) got that server line from the new readiness
+check: `fsal_cfg_commit :CONFIG :CRIT :Could not create export for (/a) to
+(/export/a)`. A local kind cluster (containerd + kubelet) with the same image,
+ConfigMap and entry script reproduced it and showed the line before it:
+`populate_posix_file_systems :FSAL :CRIT :Error 2 in setmntent(/etc/mtab): No
+such file or directory`. NFS-Ganesha's FSAL_VFS locates the export's file system
+by reading the mount table through glibc's `MOUNTED` (`/etc/mtab`); neither layer
+of the Ubuntu 24.04 image ships that file, Docker synthesises `/etc/mtab ->
+/proc/mounts` in every container it creates (which is why the image's docker
+smoke test exported `/a`), and containerd/CRI does not -- so the export was never
+created and the server answered the `/a` path walk with NFS4ERR_NOENT (the first
+run's `No such file or directory` on all six variants). The fix is in the
+fixture's entry script, the image digest unchanged: `test -e /etc/mtab || ln -sfn
+/proc/self/mounts /etc/mtab` before `ganesha.nfsd`. In the kind reproduction the
+fixed Pod logs `Export 1 created at pseudo (/a) with path (/export/a)`, a client
+mount with the probe's options succeeds (`statvfs` 256 MiB, a root write lands as
+65534:65534) while the unfixed Pod still answers `reason given by server: No such
+file or directory`. A failed `wait_ready` now journals the server's log tail and
+reason into `export-<suffix>.json` (`export_failure`, `log`), and the error carries
+the FSAL/EXPORT/CONFIG CRIT/MAJ lines logged within eight lines before the marker
+(`preceded by: ...`), never the DBUS start-up noise.
+
 004 `probe_error` has its faulting mount: the storage probe's loop +
 device-mapper device carrying FAT16 (`dm-create --fstype vfat`) whose table
 `dm-retarget --target error` swaps to the `error` target built into `dm_mod`
