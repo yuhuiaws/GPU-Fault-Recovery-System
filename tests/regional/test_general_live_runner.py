@@ -640,3 +640,87 @@ def test_teardown_downgrades_on_dirty_cleanup(
     assert result["cleanup"] == [
         {"name": "leftover", "ok": False, "error": "RuntimeError: stuck"}
     ]
+
+
+def test_execute_variant_reads_a_fixture_failure_as_inconclusive(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A probe or fixture failure graded nothing: INCONCLUSIVE, never FAIL.
+
+    2026-10-25 on the second EKS node ``reference_iostat`` (expected FAIL) hit
+    the probe's ``dm-create`` ``TimeoutExpired`` before any evidence and the
+    FAIL it was given read as its registered product gap, with an empty note.
+    """
+
+    from scripts.e2e.regional.host_probe_fixture import HostProbeError
+    from scripts.e2e.regional.regional_commands import RegionalFixtureError
+
+    runner = _patch_runner(monkeypatch)
+    deadline = datetime.now(timezone.utc) + timedelta(hours=1)
+    regional_ok = {"errors": [], "release_id": "r", "cluster_id": "c"}
+
+    def probe_timed_out(ctx):
+        raise HostProbeError(
+            "host probe failed (exit 1; error TimeoutExpired); output withheld"
+        )
+
+    spec = _spec(
+        variant="reference_iostat",
+        execute=probe_timed_out,
+        expected_outcome="FAIL",
+        product_gap="weighted await",
+    )
+    settings = make_settings(spec, node=NODE)
+    result = runner.execute_variant(spec, settings, tmp_path, 1, deadline, regional_ok)
+    assert result["verdict"] == "INCONCLUSIVE", result
+    assert result["reason"] == "INCONCLUSIVE"
+    assert result["detail"].startswith("harness fixture failed: HostProbeError: "), (
+        result["detail"]
+    )
+    assert "TimeoutExpired" in result["detail"]
+    assert result["error"].startswith("HostProbeError: "), result["error"]
+    assert result["expected_gap"] == "weighted await"
+
+    def setup_failed(ctx):
+        raise RegionalFixtureError("the test device setup failed at 'mkfs': ProbeError")
+
+    spec = _spec(execute=setup_failed)
+    result = runner.execute_variant(
+        spec, make_settings(spec, node=NODE), tmp_path, 1, deadline, regional_ok
+    )
+    assert result["verdict"] == "INCONCLUSIVE", result
+    assert "RegionalFixtureError" in result["detail"]
+
+
+def test_a_dirty_cleanup_after_a_fixture_failure_is_a_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The fixture failed after a mutation and the undo could not prove the
+    node clean: the spec's cleanup-failure FAIL outranks INCONCLUSIVE."""
+
+    from scripts.e2e.regional.host_probe_fixture import HostProbeError
+
+    runner = _patch_runner(monkeypatch)
+    deadline = datetime.now(timezone.utc) + timedelta(hours=1)
+
+    def half_built(ctx):
+        ctx.cleanup.push("dm", lambda: (_ for _ in ()).throw(RuntimeError("residue")))
+        raise HostProbeError(
+            "host probe failed (exit 1; error TimeoutExpired); output withheld"
+        )
+
+    spec = _spec(execute=half_built)
+    result = runner.execute_variant(
+        spec,
+        make_settings(spec, node=NODE),
+        tmp_path,
+        1,
+        deadline,
+        {"errors": [], "release_id": "r", "cluster_id": "c"},
+    )
+    assert result["verdict"] == "FAIL", result
+    assert result["error"].startswith("HostProbeError: "), result["error"]
+    assert any(
+        e.startswith("cleanup did not prove the node clean: dm: RuntimeError: residue")
+        for e in result["errors"]
+    ), result["errors"]

@@ -56,6 +56,7 @@ from scripts.e2e.regional.general_live_registry import (  # noqa: E402
     load_registry,
     select,
 )
+from scripts.e2e.regional.host_probe_fixture import HostProbeError  # noqa: E402
 from scripts.e2e.regional.live_driver_guard import (  # noqa: E402
     authorize_execution,
     build_plan,
@@ -174,6 +175,21 @@ def execute_variant(
         not_run(result, skipped.reason, skipped.detail, "NOT_RUN")
     except VariantInconclusive as inconclusive:
         not_run(result, "INCONCLUSIVE", str(inconclusive), "INCONCLUSIVE")
+    except (HostProbeError, RegionalFixtureError) as fixture_failure:
+        # The harness could not build, drive or read its own fixture (a probe
+        # call that failed or timed out, a setup unit that did not finish): the
+        # condition was never established and nothing about the product was
+        # graded. FAIL stays for the product's grading/action/scope errors and
+        # for an undo that cannot prove the node clean (``_teardown``). Graded
+        # FAIL, an ``expected_outcome == "FAIL"`` variant would read the
+        # harness failure as its registered product gap -- 2026-10-25 on the
+        # second EKS node, ``reference_iostat`` with the ``dm-create``
+        # ``TimeoutExpired`` and an empty note.
+        error = f"{type(fixture_failure).__name__}: {fixture_failure}"
+        not_run(
+            result, "INCONCLUSIVE", f"harness fixture failed: {error}", "INCONCLUSIVE"
+        )
+        result["error"] = error
     except BaseException as exc:  # noqa: BLE001 - recorded; cleanup still runs
         result["verdict"] = "FAIL"
         result["error"] = f"{type(exc).__name__}: {exc}"
@@ -215,7 +231,10 @@ def _teardown(ctx: VariantContext, result: dict[str, Any]) -> None:
             for value in residual.values()
         )
     )
-    if dirty and result["verdict"] in {"PASS", "FAIL"}:
+    # A mutation happened (PASS, FAIL, or a fixture failure or oracle that read
+    # INCONCLUSIVE after it) and the undo did not prove the node clean: the
+    # spec's cleanup-failure FAIL. NOT_RUN/BLOCKED never mutated.
+    if dirty and result["verdict"] in {"PASS", "FAIL", "INCONCLUSIVE"}:
         result["verdict"] = "FAIL"
         result.setdefault("errors", []).append(
             unclean_detail(ctx.cleanup.failed, ctx.cleanup.pending(), probe_residuals)

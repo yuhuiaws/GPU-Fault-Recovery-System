@@ -781,3 +781,61 @@ def test_dm_create_loads_vfat_under_the_flag_and_cleanup_unloads_it(
     assert {"modules_unloaded": [storep.VFAT_MODULE]} in result["actions"], result
     assert not (host.sys_module / storep.VFAT_MODULE).exists(), "unloaded again"
     assert ["modprobe", "-r", storep.VFAT_MODULE] in [call[:3] for call in host.calls]
+
+
+def run_directories() -> tuple[Path, Path]:
+    return storep.BACKING_ROOTS[0] / f"gfrs-live-{DIGEST}", storep.MOUNT_ROOT / DIGEST
+
+
+def test_cleanup_prunes_the_runs_empty_directories(host: FakeDmHost) -> None:
+    """The run's backing directory and mount root go with its last device.
+
+    ``cleanup --kind dm-io`` -- the runner's undo and the deadman's command --
+    pruned them only for ``--kind all``, which nothing calls: on 2026-10-25
+    both EKS nodes held one empty ``gfrs-live-<digest>`` backing directory and
+    one empty ``/mnt/gfrs-live/<digest>`` per finished 006 run.
+    """
+
+    built(host)
+    backing, mount_root = run_directories()
+    assert backing.is_dir() and mount_root.is_dir()
+    assert storep.main(call("cleanup", "--kind", "dm-io")) == 0, host.emitted[-1]
+    result = host.emitted[-1]
+    assert result["clean"] is True, result["residue"]
+    assert result["residue"]["directories"] == []
+    assert not backing.exists() and not mount_root.exists()
+
+
+def test_a_run_directory_with_content_is_residue(host: FakeDmHost) -> None:
+    built(host)
+    backing, mount_root = run_directories()
+    (backing / "stray.bin").write_bytes(b"x")
+    assert storep.main(call("cleanup", "--kind", "dm-io")) == 0, host.emitted[-1]
+    result = host.emitted[-1]
+    assert result["clean"] is False
+    assert result["residue"]["directories"] == [str(backing)]
+    assert not mount_root.exists(), "the empty mount root is still pruned"
+
+
+def test_dm_destroy_and_fs_destroy_prune_the_runs_directories(host: FakeDmHost) -> None:
+    built(host)
+    backing, mount_root = run_directories()
+    assert storep.main(call("dm-destroy", "--name", "io")) == 0, host.emitted[-1]
+    assert not backing.exists() and not mount_root.exists()
+    arguments = [
+        "fs-create",
+        "--run-id",
+        RUN_ID,
+        "--name",
+        "fs",
+        "--size-mib",
+        "512",
+        "--backing",
+        str(storep.BACKING_ROOTS[0]),
+        "--deadman-seconds",
+        "1440",
+    ]
+    assert storep.main(arguments) == 0, host.emitted[-1]
+    assert backing.is_dir() and (mount_root / "fs").is_dir()
+    assert storep.main(call("fs-destroy", "--name", "fs")) == 0, host.emitted[-1]
+    assert not backing.exists() and not mount_root.exists()

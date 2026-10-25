@@ -21,8 +21,10 @@ Everything it creates is test-only and named after a digest of the run id:
 
 Every creation is recorded in ``storage-state.json`` before it happens and is
 preceded by a ``systemd-run --on-active`` deadman that unmounts, detaches and
-deletes it from a copy of this file. No raw disk, real mount, system or log
-disk is ever opened.
+deletes it from a copy of this file; the run's own backing directory and mount
+root go with its last file system or device (``prune_run_directories``), and
+``residue`` names any of them still present. No raw disk, real mount, system or
+log disk is ever opened.
 
 The device-mapper device lives entirely in the host's namespaces: ``dmsetup``
 blocks create/resume/remove until the host udevd completes a libdevmapper
@@ -515,6 +517,36 @@ def run_backing_dir(run_id: str, root: Path) -> Path:
     return directory
 
 
+def run_directories(run_id: str) -> list[Path]:
+    """The run's own directories: its backing directory under each allow-listed
+    root and its mount root ``/mnt/gfrs-live/<digest>`` (made on demand)."""
+
+    digest = run_digest(run_id)
+    backing = [root / f"gfrs-live-{digest}" for root in BACKING_ROOTS]
+    return [*backing, MOUNT_ROOT / digest]
+
+
+def prune_run_directories(run_id: str) -> list[str]:
+    """Remove the run's directories once it holds no test file system or
+    device and they are empty; one with content stays and ``residue`` names it.
+
+    Every destroy and ``cleanup`` ends here. Before, only ``cleanup --kind
+    all`` -- which no caller used -- pruned them: on 2026-10-25 each finished
+    006 run left one empty backing directory and one empty mount root behind
+    on both EKS nodes.
+    """
+
+    state = load_state(run_id)
+    if state["devices"] or state["filesystems"]:
+        return []
+    removed: list[str] = []
+    for directory in run_directories(run_id):
+        if directory.is_dir() and not any(directory.iterdir()):
+            directory.rmdir()
+            removed.append(str(directory))
+    return removed
+
+
 # --------------------------------------------------------------------------- #
 # Test file systems and test block devices
 # --------------------------------------------------------------------------- #
@@ -732,6 +764,7 @@ def fs_destroy(arguments: argparse.Namespace) -> None:
     name = checked_name(arguments.name)
     result = destroy_filesystem(run_id, name)
     disarm_deadman(run_id, f"fs-{name}")
+    result["directories_removed"] = prune_run_directories(run_id)
     emit(result)
 
 
@@ -1198,6 +1231,7 @@ def dm_destroy(arguments: argparse.Namespace) -> None:
     name = checked_name(arguments.name)
     result = destroy_dm(run_id, name)
     result["modules_unloaded"] = unload_modules(run_id)
+    result["directories_removed"] = prune_run_directories(run_id)
     emit(result)
 
 
@@ -1323,6 +1357,9 @@ def residue(run_id: str) -> dict[str, Any]:
         "backing_files": files,
         "units": units,
         "modules_loaded_by_run": modules,
+        "directories": sorted(
+            str(path) for path in run_directories(run_id) if path.exists()
+        ),
     }
 
 
@@ -1363,14 +1400,9 @@ def cleanup(arguments: argparse.Namespace) -> None:
         unloaded = unload_modules(run_id)
         if unloaded:
             actions.append({"modules_unloaded": unloaded})
-    if kind == "all":
-        for root in BACKING_ROOTS:
-            directory = root / f"gfrs-live-{run_digest(run_id)}"
-            if directory.is_dir() and not any(directory.iterdir()):
-                directory.rmdir()
-        own = MOUNT_ROOT / run_digest(run_id)
-        if own.is_dir() and not any(own.iterdir()):
-            own.rmdir()
+    pruned = prune_run_directories(run_id)
+    if pruned:
+        actions.append({"directories_removed": pruned})
     remaining = residue(run_id)
     emit(
         {

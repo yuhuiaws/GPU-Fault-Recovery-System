@@ -808,7 +808,13 @@ def test_ambiguous_ownership_runs_two_four_gpu_jobs_on_one_node(
         for job in ("gl3-ambA-1", "gl3-ambB-1")
     }
     if not fitted:
-        assert result["verdict"] == "FAIL", result
+        # The harness's own job never came up: a fixture failure, graded
+        # nothing about the product -- INCONCLUSIVE with the error kept.
+        assert result["verdict"] == "INCONCLUSIVE", result
+        assert result["detail"].startswith(
+            "harness fixture failed: RegionalFixtureError: managed workload did "
+            "not become healthy: "
+        ), result["detail"]
         assert result["error"].startswith(
             "RegionalFixtureError: managed workload did not become healthy: "
             f"{{'workload': {{'kind': 'PyTorchJob', 'name': '{names['gl3-ambA-1']}'"
