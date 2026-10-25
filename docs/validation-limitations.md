@@ -1675,7 +1675,44 @@ that only a completed EFA recovery operation can satisfy, so it never re-reads
 the port, waits out `GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS` (600 s), fails,
 and -- tagged `failure_escalation_action=REBOOT_NODE` for LINK_INACTIVE --
 escalates to RESTART_NODE even though the port is ACTIVE again (the runner
-restores the link the moment the finding exists). 032 `missing_version` runs on
+restores the link the moment the finding exists). 013 `pci_missing`
+(`scripts/e2e/regional/general_live_efa_pci.py`, both clusters, risk H, every
+lock, `--approve HOST_SOURCE_REPLAY NODE_REBOOT`, expected PASS) is the
+PCI_DEVICE_MISSING reboot chain on a live-replay: first the spec's negative
+stage -- `build-pci-fixture --unreadable` makes the PCI-root fixture a regular
+file, so the product's listing fails (ENOTDIR) under any privilege, held for
+four host ticks (twice the two-sample confirmation window); the product must
+record `EFA inventory observation unavailable` and no count, mismatch, finding,
+hardware step or isolation (its error path also resets the confirmation streak,
+pinned by running the real collector over missing -> unreadable -> missing ->
+missing: only the fourth tick confirms); a finding from the unreadable root is
+FAIL, its chain is waited out and the positive stage is skipped. Then the node's
+real PCI root is copied without one real EFA function (`--source
+/sys/bus/pci/devices --drop <BDF>`, the BDF from the probe's `inventory`, which
+now names each RDMA device's PCI function) together with the real RDMA tree
+without that device, in one mixed window closed the moment the finding exists,
+so every read behind the reboot is real. The product's chain is MARK_UNSCHEDULABLE,
+QUARANTINE, one RESTART_NODE through the provider, VALIDATE_GPU/HOST/FABRIC on
+post-reboot evidence (`EFA_INVENTORY_RECOVERY_OPERATIONS` lists RESTART_NODE)
+and RESTORE_SCHEDULING; the runner waits for the reboot like COLLECT-004 (new
+boot id and Ready on the same Node UID, `wait_node_settled_after_reboot`),
+re-creates the probe Pod that died with the node and proves on the new boot
+that no drop-in, deadman, state directory or fixture PCI root survived
+(`snapshot`) and that the unit reads the real RDMA tree again (`read-source`).
+Graded on the product's records only: the confirmed sample's failure mode and
+counts, exactly one SUCCEEDED RESTART_NODE execution and node-scoped remote
+command, no REPLACE_NODE or second reboot, the incident RECOVERED, the node
+Ready and schedulable with the EFA and GPU allocatable at baseline, fresh
+post-reboot `efa_inventory_active_count`/`efa_inventory_mismatch`, the
+provider's CloudTrail reboot record (EC2 `RebootInstances`, SageMaker
+`BatchRebootClusterNodes`) naming this instance and no other, and `--node-b`
+untouched. Reboot safety: the close precedes RESTART_NODE; if the product is
+faster, nothing of the window lives outside `/run`, a deadman firing during
+shutdown can only fail a `systemctl restart` the shutdown kills, and the new
+boot's snapshot is the proof. A Node UID change during the wait (Spot reclaim)
+is INCONCLUSIVE; a node left isolated is handed back through the validated
+restore. It needs at least 70 minutes of maintenance window; run it on EKS
+first, on HyperPod only with `NodeRecovery=None`. 032 `missing_version` runs on
 the kernel collector's own command window (`--approve
 KERNEL_COLLECTOR_SOURCE_REPLAY` plus `KERNEL_SOURCE_REPLAY`, both lanes): the
 NVLink5 decoder gates on the `driver_branch` the *kernel collector's*
@@ -1704,10 +1741,10 @@ gate is reachable only on a Blackwell node, where the same code runs for real.
 The variants that stay `NOT_RUN` on this single-node site keep their place in the
 denominator with an explicit reason: 014 Kubernetes allocatable (every variant --
 faking allocatable or patching `Node.status` is not valid proof, and the native
-device-plugin fault needs the reserved `DEVICE_PLUGIN_RESTART` approval), most of
-013 (the PCI-missing reboot chain on the only EKS GPU node, the reserved
-`EFA_DRIVER_UNBIND` native unbind, and the non-repointable `/sys/class/infiniband`
-tree), the catalog/authority-bound 032 variants (a genuinely unknown product
+device-plugin fault needs the reserved `DEVICE_PLUGIN_RESTART` approval), the 013
+driver-binding variants (`driver_unbound`, `bind_failure`, `post_repair_failure`:
+the reserved `EFA_DRIVER_UNBIND` native unbind), the catalog/authority-bound 032
+variants (a genuinely unknown product
 needs other hardware; `observe_profile` / `permitted_isolation` need a Runtime
 Profile authority the site does not configure, AUTH-015), the 017 attribution
 variants (a managed attempt with CRI Pod logs, lane N territory), and 004

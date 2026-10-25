@@ -1296,6 +1296,33 @@ phase 2 新增经审查的 `live-replay` 类别，统一经产品自身的读取
   `missing_inventory_action_completion` 永不重读端口状态、deadline 后 FAILED 即升级到
   RESTART_NODE——端口已 ACTIVE 仍会重启，故记为产品缺口；运行器等待该链结束（含重启），
   放在车道最后执行。
+- 013 `pci_missing`（`risk H`，`X`，两个集群，`--approve HOST_SOURCE_REPLAY NODE_REBOOT`，
+  模块 `general_live_efa_pci.py`，`expected_outcome=PASS`）：先做规格要求的反向阶段——
+  `build-pci-fixture --unreadable` 把夹具路径建成普通文件并以 `pci-root` 重指入 host collector
+  单元（任何权限下列目录都 ENOTDIR），持续 4 个 tick（两倍于 2 样本确认窗）；PASS 要求 collection
+  error `EFA inventory observation unavailable`、**没有**任何 EFA 计数/mismatch 样本、无 finding、
+  无硬件步骤、无隔离（`_efa_inventory` 在该路径上还会清零确认计数；模块测试用真实采集器钉住
+  missing→不可读→missing→missing 只在第 4 个 tick 确认）。反向阶段若产出 finding 记 FAIL、等待
+  其链结束且不再执行正向阶段。正向阶段：`inventory` 选一个端口 ACTIVE 的真实 EFA 设备及其 PCI
+  功能（新增 `pci` 字段），`build-pci-fixture --source /sys/bus/pci/devices --drop <BDF>` 复制
+  节点真实 PCI 根但缺该功能，`build-infiniband-fixture --drop <dev>` 复制 RDMA 树但缺其设备，
+  以一个 mixed 窗口绑入单元；finding 出现即关窗（deadman 解除），之后产品的每次读取都是真实的。
+  产品链：`failure_mode=PCI_DEVICE_MISSING` 两个连续样本确认 → CRITICAL REBOOT_NODE →
+  MARK_UNSCHEDULABLE、QUARANTINE、RESTART_NODE（provider）、VALIDATE_GPU/HOST/FABRIC
+  （`EFA_INVENTORY_RECOVERY_OPERATIONS` 含 RESTART_NODE，验证只读重启之后的样本）、
+  RESTORE_SCHEDULING。运行器按 COLLECT-004 的方式等重启（`node_snapshot` 新 boot id + Ready、
+  Node UID 不变；`wait_node_settled_after_reboot`），再重建随节点一起死亡的探针 Pod，用
+  `snapshot` 证明新 boot 上没有 drop-in/deadman/state、单元的 `GPU_FAULT_PCI_DEVICES_ROOT`
+  不是夹具路径，`read-source` 证明读回真实 RDMA 树。判定只读产品记录：确认样本的 failure_mode
+  与 expected/observed/missing/discovered/driver_bound 计数、恰好一个 SUCCEEDED 的 RESTART_NODE
+  执行与节点范围的远程命令、无 REPLACE_NODE、无第二次重启、incident RECOVERED、节点 Ready 且
+  可调度、EFA/GPU allocatable 回到基线、重启后新鲜的 `efa_inventory_active_count=期望`/
+  `mismatch=0`、CloudTrail 中 provider 的重启回执（EKS `RebootInstances`/HyperPod
+  `BatchRebootClusterNodes`）只命名本实例，以及 `--node-b`（同车道另一节点）未被触及。重启安全：
+  关窗在 RESTART_NODE 之前完成；若产品比关窗更快，/run 下的 drop-in、deadman transient 单元与
+  夹具都不会跨重启存在，deadman 在关机期间最多失败一次 `systemctl restart`，残留由新 boot 上的
+  `snapshot` 证伪。Spot 回收导致 Node UID 变化记 INCONCLUSIVE；链结束后节点仍被隔离时清理走
+  产品的 validated restore。需要 ≥ 70 分钟剩余维护窗；EKS 先跑，HyperPod 需 `NodeRecovery=None`。
 
 计划/执行守卫键仍为 `<case>.<variant>`，确认串 `GENERALLIVE<NNN>_EXECUTE`。新 `--approve`
 令牌：`KERNEL_SOURCE_REPLAY`（kmsg 源重指，032）、`KERNEL_COLLECTOR_SOURCE_REPLAY`（内核采集器
@@ -1312,9 +1339,9 @@ run_general_live.py --site-profile <profile> --run-dir <run> \
 ```
 
 本轮保持 `NOT_RUN` 并留在分母：014 全部（伪造 allocatable/改 Node.status 不算证明，
-原生 plugin 故障需 `DEVICE_PLUGIN_RESTART`）、013 `pci_missing`/`driver_unbound`/
-`bind_failure`/`post_repair_failure`（唯一 EKS 节点上的 missing→reboot 链、保留的原生
-解绑）、032 的产品/Profile 权限变体（AUTH-015 未配置）与本站 H200 上的 `missing_version`
+原生 plugin 故障需 `DEVICE_PLUGIN_RESTART`）、013 `driver_unbound`/
+`bind_failure`/`post_repair_failure`（保留的原生解绑；`pci_missing` 已由上文的 missing→reboot
+链覆盖）、032 的产品/Profile 权限变体（AUTH-015 未配置）与本站 H200 上的 `missing_version`
 （目录产品门禁先于 NVLink5 解码器，记 CAPABILITY_ABSENT；夹具已就绪，Blackwell 节点可执行）、
 004 `probe_error`（`statvfs` 错误无法由只读文件 bind 产生）。
 
