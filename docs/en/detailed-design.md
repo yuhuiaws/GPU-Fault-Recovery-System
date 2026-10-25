@@ -1689,7 +1689,10 @@ NVLink status, DCGM level 1, the Fabric Manager journal, the kernel journal and
 `nvidia-bug-report.sh`, and produces a manifest with command return codes and a SHA-256 compressed archive. A single failed diagnostic
 command is recorded in the manifest and does not prevent the remaining evidence from being written. The archive is published atomically through a temporary file;
 the working directory is deleted afterwards. When S3 is not configured, a node-local `file://` reference is returned; production should configure
-`GPU_FAULT_DIAGNOSTIC_S3_URI` to form persistent evidence reachable by the control plane.
+`GPU_FAULT_DIAGNOSTIC_S3_URI` (managed site: `spec.diagnosticS3Uri` of `site.yaml`, rendered by the release engine into the node installer
+template and part of the Agent config digest) to form persistent evidence reachable by the control plane. A failed upload does not fail the
+diagnostic step: the result keeps the `file://` reference and records `evidence_upload_error`; a notification marks each reference with the
+`s3://` console link or as a `file://` readable only on that node.
 
 Driver and firmware remediation does not use a built-in SXID guess table and is not added to the workflow by default. Only after a site explicitly configures
 `GPU_FAULT_SXID_DRIVER_REMEDIATION_CODES` or

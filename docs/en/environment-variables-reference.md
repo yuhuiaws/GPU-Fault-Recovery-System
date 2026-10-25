@@ -145,7 +145,7 @@ validates them (integers/numbers must parse, booleans must be `0/1/true/false/ye
 | `GPU_FAULT_DIAGNOSTIC_MAX_ARCHIVES` | Core/Other | integer | `'20'` | `deploy/node/install-gpu-fault-collector.sh`<br>`gpu_fault.node_agent.config` |
 | `GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR` | Core/Other | text | `'/var/lib/gpu-fault/diagnostics'` | `deploy/node/install-gpu-fault-collector.sh`<br>`gpu_fault.node_agent.config` |
 | `GPU_FAULT_DIAGNOSTIC_RETENTION_SECONDS` | Core/Other | integer | `'604800'` | `deploy/node/install-gpu-fault-collector.sh`<br>`gpu_fault.node_agent.config` |
-| `GPU_FAULT_DIAGNOSTIC_S3_URI` | Core/Other | text | `<implicit>` | `deploy/node/install-gpu-fault-collector.sh`<br>`gpu_fault.node_agent.config` |
+| `GPU_FAULT_DIAGNOSTIC_S3_URI` | Core/Other | text | `<implicit>` | `deploy/node/install-gpu-fault-collector.sh`<br>`gpu_fault.admin.site_s3`<br>`gpu_fault.node_agent.config` |
 | `GPU_FAULT_DISCOVER_POD_GPU_UUIDS` | Core/Other | boolean | `True` | `gpu_fault.completion_controller`<br>`gpu_fault.host_low_utilization` |
 | `GPU_FAULT_DRIVER_BRANCH` | Core/Other | integer | `<implicit>` | `deploy/node/install-gpu-fault-collector.sh`<br>`gpu_fault.collectors.context` |
 | `GPU_FAULT_DRIVER_REMEDIATION_COMMAND` | Core/Other | text | `''` | `deploy/node/install-gpu-fault-collector.sh`<br>`gpu_fault.node_agent.config` |

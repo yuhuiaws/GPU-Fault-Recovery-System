@@ -7146,7 +7146,7 @@ these parameters do not replace the managed release, node identity or maintenanc
 | `--allow-service-quiesce` | No | false | Allows stopping/starting GPU base services; requires reset to be enabled at the same time |
 | `--allow-fabric-manager-restart` | No | false | Allows fenced Fabric Manager restart |
 | `--diagnostic-output-dir` | No | `/var/lib/gpu-fault/diagnostics` | Local diagnostic bundle directory |
-| `--diagnostic-s3-uri` | No | Empty | Optional S3 target for persisting diagnostic bundles |
+| `--diagnostic-s3-uri` | No | Empty | Optional S3 target for persisting diagnostic bundles; on a managed site supplied by the release engine from `spec.diagnosticS3Uri` of `site.yaml` |
 | `--diagnostic-retention-seconds` | No | 604800 | Local diagnostic bundle retention time |
 | `--diagnostic-max-archives` | No | 20 | Cap on the number of local diagnostic bundles |
 | `--allow-field-diagnostic` | No | false | Enables the pinned NVIDIA Field Diagnostic; must be given together with `--field-diagnostic-command` (absolute path; `{link_id}`/`{gpu_uuid}`/`{pci_bdf}` may be used) and `--field-diagnostic-sha256` |
@@ -7590,8 +7590,32 @@ The email does not use a large language model. Common action codes:
 | `DEEP_DIAGNOSTIC_REVIEW` | Unrecognised result; review the complete evidence and run deep diagnostics |
 | `DCGM_EXECUTION_REVIEW` | Inspect dcgmi/hostengine and stderr, then re-run the diagnostic |
 
-Production should configure `GPU_FAULT_DIAGNOSTIC_S3_URI`, otherwise the `file://` URIs in the email can only be read locally on the
-faulty node. The S3 bucket should have encryption, versioning, lifecycle and a bucket policy writable only by the control-plane/node roles.
+Production should configure an S3 destination for diagnostic evidence, otherwise the `file://` URIs in the email can only be read
+locally on the faulty node (the NCCL hung-triage hand-off mail of 2026-10-25 listed nothing but `file:///var/lib/gpu-fault/...`).
+A managed regional site declares it once in `site.yaml`; the release engine renders it into the node installer template and every
+GPU node's Node Agent gets `GPU_FAULT_DIAGNOSTIC_S3_URI`:
+
+```yaml
+spec:
+  diagnosticS3Uri: s3://<bucket>/<prefix>   # optional; must be s3://, bucket required, prefix optional
+```
+
+- The node uploads every diagnostic archive (bundle, DCGM quick-diagnostic output) to `<prefix>/<node>/<archive>`; the evidence
+  reference in the mail becomes the `s3://` object with its console link, while a `file://` reference is marked as readable only
+  on that node.
+- The value enters the Agent config digest (`spec.release.agentConfigDigest` is recomputed by deploy with the same value) and
+  changes the node installer template, so declaring or changing it triggers a node Agent wave (the node component), not a
+  control-plane-only release.
+- The deploy preflight `diagnostic_evidence_destination`: WARN when undeclared (the archives stay on the nodes); when declared,
+  the read-only `s3api get-bucket-location` proves the bucket exists, and a bucket outside the site Region is a WARN; it does not
+  inspect node roles.
+- The GPU nodes' IAM role (the HyperPod instance group execution role / the plain EKS node group role) must have `s3:PutObject`
+  on that prefix, granted by the administrator; a failed upload does not fail the diagnostic step -- the result keeps the `file://`
+  reference and records `evidence_upload_error`, which the mail quotes.
+- Do not edit `GPU_FAULT_DIAGNOSTIC_S3_URI` on a node by hand: the next release re-installs it from site.yaml, and an Agent config
+  digest that differs from the control plane's pin has node actions refused by the fleet consistency gate.
+
+The S3 bucket should have encryption, versioning, lifecycle and a bucket policy writable only by the control-plane/node roles.
 
 Correlated analysis requires the exporter to additionally expose:
 
@@ -8299,7 +8323,7 @@ The installation script generates these variables; when deploying the Agent by h
 | `GPU_FAULT_NODE_ALLOW_FABRIC_MANAGER_RESTART` | CLI false; regional production true | Separate master switch for Fabric Manager restart |
 | `GPU_FAULT_NODE_ALLOW_SERVICE_QUIESCE` | CLI false; regional production true | quiesce/restore master switch |
 | `GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR` | `/var/lib/gpu-fault/diagnostics` | root-only local diagnostic bundle directory |
-| `GPU_FAULT_DIAGNOSTIC_S3_URI` | Empty | Optional `s3://bucket/prefix` persistent evidence location |
+| `GPU_FAULT_DIAGNOSTIC_S3_URI` | Empty | Optional `s3://bucket[/prefix]` persistent evidence location; on a managed site from `spec.diagnosticS3Uri` of `site.yaml`, part of the Agent config digest |
 | `GPU_FAULT_NODE_ALLOW_DRIVER_REMEDIATION` | false | Node master switch for driver remediation |
 | `GPU_FAULT_DRIVER_REMEDIATION_COMMAND` | Empty | Absolute-path command; arguments may contain `{target}` |
 | `GPU_FAULT_DRIVER_REMEDIATION_SHA256` | Empty | SHA-256 of the driver remediation executable |
@@ -8423,7 +8447,9 @@ version 1 heartbeats before signature verification, and the NodeAction adapter a
 master. Only explicitly lowering the required pin to empty or `1` reopens the migration path; this must not be used
 as a routine fault workaround.
 When S3 upload is enabled, the node IAM role must have `s3:PutObject` on the target prefix; a local
-`file://` reference cannot be read directly by the control plane. Remediation commands must be pre-installed by the image or configuration management;
+`file://` reference cannot be read directly by the control plane. A failed upload (no permission, no boto3 in the node runtime,
+S3 unreachable) does not fail the diagnostic step: the evidence was collected, the result keeps the `file://` reference and
+records the target and error in `evidence_upload_error`, which the mail places next to the reference. Remediation commands must be pre-installed by the image or configuration management;
 event fields must not be assembled into shell commands, and the control plane must not distribute arbitrary commands.
 
 GPU node installation creates and enables:
@@ -10431,7 +10457,8 @@ When inspecting the workflow you must confirm:
 - Unreachable nodes are recorded in `undetermined_nodes` and do not block the triage completing as a whole.
 
 Diagnostic bundles live by default in `/var/lib/gpu-fault/diagnostics`; after configuring
-`GPU_FAULT_DIAGNOSTIC_S3_URI=s3://<bucket>/<prefix>` they are uploaded to S3. Check that
+`GPU_FAULT_DIAGNOSTIC_S3_URI=s3://<bucket>/<prefix>` (managed site: `spec.diagnosticS3Uri` of `site.yaml`) they are uploaded
+to S3, and the hand-off mail marks each archive with its `s3://` console link or as a `file://` readable only on that node. Check that
 `fault_context.diagnostic_reason` in `manifest.json` is
 `EFA_TRAFFIC_HUNG_SUSPECTED`. Without eligible candidates, the bounded passive bundle need not contain
 process stacks; eligible targeted bundles attach only to verified PIDs. Hung bundles omit strace,

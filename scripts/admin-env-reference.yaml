@@ -393,7 +393,8 @@ categories:
       - name: GPU_FAULT_DIAGNOSTIC_OUTPUT_DIR
         description: "节点诊断包和命令输出目录。"
       - name: GPU_FAULT_DIAGNOSTIC_S3_URI
-        description: "可选诊断对象存储前缀；为空时 file:// 证据只在故障节点本地可读。"
+        production: 由 site.yaml spec.diagnosticS3Uri 渲染进节点安装模板
+        description: "可选诊断对象存储前缀 `s3://bucket[/prefix]`，节点 Agent 把诊断包上传到 `<prefix>/<node>/<archive>`；受管站点在 site.yaml 声明 `spec.diagnosticS3Uri`（改动触发节点 Agent 波次并进入 Agent 配置摘要），不要在节点上手改。为空时 file:// 证据只在故障节点本地可读，deploy 预检 `diagnostic_evidence_destination` 为 WARN；上传失败不会让诊断步骤失败，结果保留 file:// 引用并记 `evidence_upload_error`。节点 IAM role 需要目标前缀的 `s3:PutObject`。"
       - name: GPU_FAULT_FIELD_DIAGNOSTIC_COMMAND
         description: "站点批准的 Field Diagnostic 绝对路径命令；为空表示禁用。"
       - name: GPU_FAULT_FIELD_DIAGNOSTIC_SHA256
