@@ -54,6 +54,14 @@ training, thermal, spare-health or RMA policies from that review.
   baseline, a reset or an unparseable counter is unknown (collection error), a
   failed or hung `ethtool` is a collection error for that netdev only, and a
   counter the netdev lacks is `efa_ethtool_counters_unsupported` instead of 0.
+- The sysfs RDMA port counters (`rdma_errors_delta`, `rdma_<counter>_delta`)
+  and the netdev `statistics` counters (`network_errors_delta`,
+  `network_drops_delta`) follow the same reset rule: a counter below its
+  baseline is unknown for that tick (a collection error naming the reader, the
+  device/port and the counter, in the `ethtool` wording), the baseline is
+  re-armed from the new value and no delta is shipped for it; counters that did
+  not reset still report. The clamped 0 used to clear the active signal and
+  let the continuing increase mint a second incident.
 - An NVML failure while `/proc/driver/nvidia/gpus` is missing or unreadable is
   `INVENTORY_UNAVAILABLE`: no GPU count, no mismatch, no streak advance -- two
   failed reads are not zero GPUs. An unreadable directory used to count as 0.

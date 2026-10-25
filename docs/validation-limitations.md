@@ -1391,7 +1391,9 @@ the failed SMART scan and the failed drive query are now proven live by 007
 never zero drives), the EFA `ethtool -S` deltas reported only from real readings
 (failures and resets are UNKNOWN, missing counters
 `efa_ethtool_counters_unsupported`) by 010 `ethtool_failed` / `missing_counter` /
-`counter_reset`, and an NVML failure with an unreadable `/proc/driver/nvidia/gpus`
+`counter_reset`, the same reset rule on the sysfs RDMA port counters and the netdev
+`statistics` counters (a counter below its baseline is a collection error for that
+tick, no `rdma_errors_delta` / `network_errors_delta` reading, never a clamped 0), and an NVML failure with an unreadable `/proc/driver/nvidia/gpus`
 being `INVENTORY_UNAVAILABLE` rather than zero GPUs by 012 `proc_unreadable`; an
 unopenable drive and a hung drive query stay software-tested.
 

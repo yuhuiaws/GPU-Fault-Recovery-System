@@ -1109,6 +1109,18 @@ emits `efa_ethtool_counters_unsupported` (`value` is the number of missing group
 delta names, `reason` is `MISSING_COUNTER` or `NO_STATISTICS`) instead of a 0, and records no collection error.
 All of these used to be reported as 0, which VALIDATE_FABRIC accepted as a clean link for counters it never measured.
 
+The sysfs RDMA error counters (`/sys/class/infiniband/<device>/ports/<port>/{counters,hw_counters}`, summed per port
+into `rdma_errors_delta`, each counter also reported as `rdma_<counter>_delta`) and the netdev `statistics` counters
+(`rx_errors`/`tx_errors` as `network_errors_delta`, `rx_dropped`/`tx_dropped` as `network_drops_delta`) handle a counter
+reset by the same rule (GF-GENERAL-LIVE-010 / 009 `counter_reset`): when any counter reads below its own baseline, the
+port's `rdma_errors_delta` (or the netdev's metric) ships no delta that round, the collection error names the reader, the
+device/port and the counter in the `ethtool` reader's wording (for example
+`_rdma: … rdmap0/1: symbol_error reset (10 -> 1); delta unknown`), the baseline is re-armed from the new value and the
+next round measures from it; a port's counter sum that falls although no counter went backwards (a counter file
+disappeared) is unknown too. Counters that did not reset, and the link state, are still reported. `_delta` used to clamp
+the fall to 0 and ship it as `rdma_errors_delta=0` / `network_errors_delta=0`: a reading that cleared the still-alarming
+signal, let VALIDATE_FABRIC accept the port as clean, and had the continuing increase minted again as a new incident.
+
 A single node log message can match several rules at once. The policy first picks the highest severity by `FATAL > CRITICAL > WARNING > INFO`,
 then picks the stronger action by the global RecoveryAction rank; on a complete tie it keeps the more specific rule that appears earlier in the rule table. Therefore a single line containing both OOM text and an EFA fatal is ultimately ruled an RDMA
 critical quarantine, not the memory warning that matched first.
@@ -3430,8 +3442,8 @@ state machine, whose state is one row per node and belongs to the attempt curren
 `/sys/class/infiniband/<device>/ports/<port>/hw_counters` every 15 seconds. The production implementation prefers
 `rx_bytes + tx_bytes` to compute the node's total traffic; when the device does not provide these two counters, it falls back to
 `send_bytes + recv_bytes`. The operation counts and byte counts of read/write/send/recv are still kept as independent telemetry per device and port.
-The Collector's first sample only establishes the counter baseline; counter resets or
-wraparounds are treated as a 0 increment.
+The Collector's first sample only establishes the counter baseline; a counter reset or
+wraparound, or a missing send/receive counter pair, marks the observation invalid rather than counting as 0 traffic.
 
 The control plane runs the state machine on a node's total throughput only when the following conditions are met:
 

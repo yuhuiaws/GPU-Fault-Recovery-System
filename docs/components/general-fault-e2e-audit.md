@@ -40,8 +40,8 @@
 | 006 | 磁盘 IO 饱和 | 部分 | 有持续窗口与限时采集测试；新诊断绑定；与 checkpoint 关联仍缺 |
 | 007 | SMART 失败 | 部分 | GF-HOST-004 原为 API 到计划；新增 SW-002/003 分别执行隔离与拒绝误隔离；scan 失败、盘无法打开、单盘超时为 UNKNOWN（`smart_query_failed` + collection error，SW-003 `smart-scan`），工具缺失/无盘/无结论为 NOT_SUPPORTED（`smart_status_unsupported`）；真机回放夹具仍缺 |
 | 008 | 网卡链路 down | 部分 | 新增 SW-002/003 覆盖接口消失/down/unknown；接口角色、bond 等场景仍缺 |
-| 009 | 网卡错误/丢包 | 部分 | 错误/丢包持续窗口有本地测试；新诊断绑定；错误率与业务关联仍缺 |
-| 010 | EFA/RDMA 计数错误 | 部分 | GF-HOST-002 只测策略；新诊断绑定；`ethtool -S` 差值只来自真实读数（失败/重置为 UNKNOWN，缺失计数器为 `efa_ethtool_counters_unsupported`，不再报 0）；sysfs 计数器重置语义与按驱动/计数器语义分级仍缺 |
+| 009 | 网卡错误/丢包 | 部分 | 错误/丢包持续窗口有本地测试；新诊断绑定；`statistics` 计数器回退为 UNKNOWN（本轮不发该指标，不再夹成 0 清掉信号）；错误率与业务关联仍缺 |
+| 010 | EFA/RDMA 计数错误 | 部分 | GF-HOST-002 只测策略；新诊断绑定；`ethtool -S` 差值只来自真实读数（失败/重置为 UNKNOWN，缺失计数器为 `efa_ethtool_counters_unsupported`，不再报 0）；sysfs 端口计数器回退同样为 UNKNOWN（本轮不发 `rdma_errors_delta`，collection error 点名端口与计数器，基线重建）；按驱动/计数器语义分级仍缺 |
 | 011 | EFA 流量状态机 (`SITE_EFA_TRAFFIC`) | 部分 | GF-HOST-OBS-004 跑真实 main 但不执行 DAG；大规模挂起到证据闭环仍缺 |
 | 012 | GPU 掉卡 | 部分 | COLLECT-003/004 和采集超时测试；NVML 失败且 `/proc/driver/nvidia/gpus` 不存在/不可读为 UNKNOWN（`INVENTORY_UNAVAILABLE`），不再生成 REBOOT_NODE（SW-003 `gpu-unknown`）；真实掉卡、配置错配仍须分开真机验收 |
 | 013 | EFA 掉卡 | 部分 | OBS-003 防读取失败误重启；COLLECT-017 只覆盖部分真实分层恢复；PCI/link 全分支仍缺 |
