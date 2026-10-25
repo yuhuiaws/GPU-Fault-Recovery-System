@@ -145,6 +145,10 @@ def join_gpu_upload_steps(
                 release.config.executor_wheel,
                 release.executor_wheel_sha,
                 compress=True,
+                # Nothing reads the wheel from its mount, so past the 1 MiB
+                # ConfigMap ceiling it ships as a chunked set.
+                splittable=True,
+                label="Executor wheel",
             ),
         ),
         GpuStageStep(
@@ -155,6 +159,8 @@ def join_gpu_upload_steps(
                 release.config.bundle.name,
                 release.config.bundle,
                 release.bundle_sha,
+                # The installer Job reads the bundle from its mount: one object.
+                label="node installer bundle",
             ),
         ),
     )

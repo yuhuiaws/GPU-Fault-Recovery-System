@@ -9,7 +9,6 @@ import shutil
 import tempfile
 from concurrent.futures import Future, ThreadPoolExecutor
 from contextlib import AbstractContextManager, nullcontext
-from dataclasses import dataclass
 from datetime import datetime, timezone
 from functools import partial
 from pathlib import Path
@@ -32,6 +31,8 @@ from gpu_fault_release.regional_aurora_credentials import (
     refresh_status_supersedes_failure,
 )
 from gpu_fault_release.regional_notifications import check_notification_channel
+from gpu_fault_release.regional_release_artifacts import check_artifact_config_maps
+from gpu_fault_release.regional_check_value import CheckValue as CheckValue
 from gpu_fault_release.regional_release_aurora_refresh import aurora_refresh_preflight
 from gpu_fault_release.regional_release_namespace import controller_check_value
 from gpu_fault_release.regional_release_config import CheckFailure, ReleaseError
@@ -55,10 +56,8 @@ from gpu_fault_release.regional_runtime_profile import verify_runtime_profile_ch
 from gpu_fault_release.regional_secret_checks import CPU_SECRET_NAMES, cpu_secret_shapes
 from gpu_fault_release.regional_validation_evidence import (
     QUICK_VALIDATION_EVIDENCE_ENV,
-    read_only_verifier_details,
-)
-from gpu_fault_release.regional_validation_evidence import (
     quick_validation_evidence as _quick_validation_evidence,
+    read_only_verifier_details,
 )
 
 ROOT = repository_root()
@@ -70,15 +69,6 @@ if TYPE_CHECKING:
 
 class CheckSkipped(RuntimeError):
     pass
-
-
-@dataclass(frozen=True)
-class CheckValue:
-    summary: str
-    details: Any = None
-    # ``WARN`` is a finding that does not fail the report: something the
-    # operator should read, not something the deploy should stop on.
-    status: str = "PASS"
 
 
 def _check(
@@ -1034,6 +1024,7 @@ def build_preflight_report(
     specifications = [
         ("tools", _check_tools),
         ("local_inputs", lambda: _check_local_inputs(release)),
+        ("artifact_config_maps", lambda: check_artifact_config_maps(release)),
         ("aws_identity", lambda: _check_aws_identity(release)),
         ("regional_contexts", lambda: _check_contexts(release)),
         ("cpu_capacity", lambda: _check_cpu_capacity(release)),

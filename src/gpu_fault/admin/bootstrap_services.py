@@ -15,8 +15,10 @@ if TYPE_CHECKING:
     from gpu_fault.admin.node_key_custody_admin_probe import AdminNodeKeyContext
 
 from gpu_fault.admin.artifact_configmaps import (
-    COMPRESSED_ARTIFACT_SUFFIX,
-    compress_artifact,
+    ArtifactLayoutError,
+    ArtifactTooLarge,
+    plan_artifact_config_maps,
+    write_artifact_object,
 )
 from gpu_fault.admin.bootstrap_common import (
     SITE_TAG_KEY,
@@ -1094,34 +1096,47 @@ def _upload_wheel_configmap(
 ) -> str:
     sha = hashlib.sha256(wheel.read_bytes()).hexdigest()
     name = f"gpu-fault-control-plane-wheel-0100-{sha[:12]}"
+    # The same layout the release engine writes (``regional_release_artifacts``):
+    # the xz stream in one object while it fits the 1 MiB ConfigMap ceiling, a
+    # chunked set past it. Nothing installs the wheel from the mount at runtime.
+    # ``upload_release`` reads every object back and re-hashes it at the first
+    # deploy, so this bootstrap copy only has to create what is missing.
     try:
-        runner.run(
-            [
-                "kubectl",
-                "--kubeconfig",
-                str(cpu_kubeconfig),
-                "-n",
-                namespace,
-                "get",
-                "configmap",
-                name,
-                "-o",
-                "name",
-            ]
+        plan = plan_artifact_config_maps(
+            wheel,
+            name=name,
+            key=wheel.name,
+            compress=True,
+            splittable=True,
+            label="control-plane wheel",
         )
-        exists = True
-    except BootstrapError as exc:
-        # Only NotFound means absent: an unreachable API server must not be
-        # answered with a `create configmap` that then fails on the existing one.
-        if "NotFound" not in str(exc):
-            raise
-        exists = False
-    if not exists:
-        # xz-compressed: the control-plane wheel outgrew the 1 MiB ConfigMap
-        # ceiling, and nothing installs it from the mount at runtime.
-        with tempfile.TemporaryDirectory(prefix="gpu-fault-wheel-") as scratch:
-            stored_key = f"{wheel.name}{COMPRESSED_ARTIFACT_SUFFIX}"
-            source = compress_artifact(wheel, Path(scratch) / stored_key)
+    except (ArtifactTooLarge, ArtifactLayoutError) as exc:
+        raise BootstrapError(str(exc)) from None
+    with tempfile.TemporaryDirectory(prefix="gpu-fault-wheel-") as scratch:
+        for item in plan.objects:
+            try:
+                runner.run(
+                    [
+                        "kubectl",
+                        "--kubeconfig",
+                        str(cpu_kubeconfig),
+                        "-n",
+                        namespace,
+                        "get",
+                        "configmap",
+                        item.name,
+                        "-o",
+                        "name",
+                    ]
+                )
+                continue
+            except BootstrapError as exc:
+                # Only NotFound means absent: an unreachable API server must
+                # not be answered with a `create configmap` that then fails on
+                # the existing one.
+                if "NotFound" not in str(exc):
+                    raise
+            source = write_artifact_object(item, Path(scratch))
             runner.run(
                 [
                     "kubectl",
@@ -1131,8 +1146,8 @@ def _upload_wheel_configmap(
                     namespace,
                     "create",
                     "configmap",
-                    name,
-                    f"--from-file={stored_key}={source}",
+                    item.name,
+                    f"--from-file={item.key}={source}",
                 ],
                 mutate=True,
                 capture=False,

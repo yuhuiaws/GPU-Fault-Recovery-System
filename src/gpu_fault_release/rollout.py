@@ -13,7 +13,6 @@ from pathlib import Path
 from typing import Any, Callable, Unpack
 
 from gpu_fault.admin.api_budget import ApiBudgetError, deployment_api_budget
-from gpu_fault.admin.artifact_configmaps import artifact_binary_sha
 from gpu_fault.admin.command_log import (
     child_failure,
     report_failure,
@@ -95,6 +94,7 @@ from gpu_fault_release.regional_observability_rollback import (
 from gpu_fault_release.regional_release_arguments import parser as parser
 from gpu_fault_release.regional_release_arguments import validate_cluster_arguments
 from gpu_fault_release.regional_release_artifacts import (
+    config_map_artifact_sha,
     require_cpu_secrets,
     upload_config_map,
     upload_release,
@@ -1089,13 +1089,9 @@ class RegionalRelease(RegistryDrainContext):
         name: str,
         preferred_key: str,
     ) -> str:
-        value = self._get_json(
-            kubectl + ["-n", self.config.namespace, "get", "configmap", name]
-        )
-        found = artifact_binary_sha(value.get("binaryData") or {}, preferred_key)
-        if found is None:
-            raise ReleaseError(f"{name} has no binaryData")
-        return found[1]
+        # Any layout the engine ever wrote: raw, xz, or a chunked set whose
+        # parts are fetched and re-hashed (regional_release_artifacts).
+        return config_map_artifact_sha(self, kubectl, name, preferred_key)
 
     def bootstrap(self) -> None:
         self._ensure_contexts()

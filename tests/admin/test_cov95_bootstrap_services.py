@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import lzma
+import os
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -327,3 +328,74 @@ def test_monitoring_installer_calls_fake_script_with_scoped_identity(tmp_path, c
     assert len(runner.mutations("install-amp-monitoring.sh")) == 1
     assert result["runtime_managed_by_release"] is False
     assert result["service_account"] == "gpu-fault-adot"
+
+
+class ChunkedRefreshAccount(RefreshAccount):
+    """A control-plane wheel whose xz stream is over the 1 MiB ConfigMap ceiling."""
+
+    def __init__(self, root):
+        super().__init__(root, exists=False)
+        self.wheel.write_bytes(os.urandom(1_048_576 + 4096))
+        digest = hashlib.sha256(self.wheel.read_bytes()).hexdigest()
+        self.configmap = "gpu-fault-control-plane-wheel-0100-" + digest[:12]
+        self.present = set()
+
+    def run(self, arguments, **options):
+        if arguments[0] == "kubectl" and "configmap" in arguments:
+            self.calls.append(list(arguments))
+            name = arguments[arguments.index("configmap") + 1]
+            if "get" in arguments:
+                if name not in self.present:
+                    raise BootstrapError("Error from server (NotFound)")
+                return name
+            assert "create" in arguments, "unexpected artifact ConfigMap operation"
+            source = next(item for item in arguments if item.startswith("--from-file="))
+            stored_key, path = source.removeprefix("--from-file=").split("=", 1)
+            payload = Path(path).read_bytes()
+            assert len(payload) <= 1_048_576, f"{name} exceeds the ConfigMap ceiling"
+            self.uploads.append((name, stored_key, payload))
+            self.present.add(name)
+            return ""
+        return super().run(arguments, **options)
+
+
+def test_refresh_installer_ships_an_oversized_wheel_as_a_chunked_set(tmp_path, cpu):
+    template = Path("deploy/control-plane/regional/aurora-credential-refresh.yaml")
+    destination = tmp_path / template
+    destination.parent.mkdir(parents=True)
+    destination.write_text(template.read_text())
+    runner = ChunkedRefreshAccount(tmp_path)
+    manifest = tmp_path / "release.json"
+    manifest.write_text(json.dumps({"wheel": "example.whl"}))
+    runtime_image = "example.invalid/runtime@sha256:" + "a" * 64
+    master = "arn:aws:secretsmanager:us-east-1:123456789012:secret:example"
+    runner.projections = {"image": runtime_image, "master": master}
+
+    result = services.install_aurora_refresh(
+        runner,
+        repository_root=tmp_path,
+        cpu=cpu,
+        cpu_kubeconfig=tmp_path / "cpu.kubeconfig",
+        namespace="gpu-fault-system",
+        site_id=SITE,
+        release_manifest=manifest,
+        runtime_image=runtime_image,
+        aurora={"master_secret_arn": master},
+    )
+
+    assert result["wheel_configmap"] == runner.configmap
+    names = [name for name, _key, _payload in runner.uploads]
+    assert names == [
+        runner.configmap + "-part-0",
+        runner.configmap + "-part-1",
+        runner.configmap,
+    ], "parts first, then the named ConfigMap with the manifest"
+    stream = b"".join(payload for _name, _key, payload in runner.uploads[:-1])
+    assert lzma.decompress(stream) == runner.wheel.read_bytes()
+    manifest_document = json.loads(runner.uploads[-1][2])
+    assert runner.uploads[-1][1] == "artifact.json"
+    assert manifest_document["artifact"] == "example.whl"
+    assert (
+        manifest_document["sha256"]
+        == hashlib.sha256(runner.wheel.read_bytes()).hexdigest()
+    )

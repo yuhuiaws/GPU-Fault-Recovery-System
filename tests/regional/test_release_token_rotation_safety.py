@@ -249,6 +249,7 @@ def test_build_preflight_report_fails_closed_on_an_unfinished_rotation(
     for name in (
         "_check_tools",
         "_check_local_inputs",
+        "check_artifact_config_maps",
         "_check_aws_identity",
         "_check_contexts",
         "_check_cpu_capacity",

@@ -23,6 +23,7 @@ from typing import Any, Callable
 
 import yaml  # type: ignore[import-untyped,unused-ignore]
 
+from gpu_fault.admin.artifact_configmaps import ArtifactLayoutError, stored_artifact_key
 from gpu_fault.admin.config import (
     AdminConfig,
 )
@@ -529,6 +530,10 @@ def config_map_binary_key(
     kubectl: list[str],
     name: str | None,
 ) -> str | None:
+    """The artifact file ConfigMap ``name`` stores: its sole ``binaryData`` key
+    (``<file>`` or ``<file>.xz``) or, for a chunked set, the file its manifest
+    names -- what a rollback re-pins the previous Executor wheel by."""
+
     if not name:
         return None
     value = release._get_json(
@@ -541,8 +546,10 @@ def config_map_binary_key(
             name,
         ]
     )
-    keys = sorted((value.get("binaryData") or {}).keys())
-    return keys[0] if len(keys) == 1 else None
+    try:
+        return stored_artifact_key(value)
+    except ArtifactLayoutError as exc:
+        raise ReleaseError(f"{name}: {exc}") from None
 
 
 CPU_PROFILE_ENV = "GPU_FAULT_REQUIRED_RUNTIME_PROFILE_VERSION"
