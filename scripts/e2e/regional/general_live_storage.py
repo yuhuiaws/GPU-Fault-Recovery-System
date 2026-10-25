@@ -85,7 +85,15 @@ CASE_004 = "GF-GENERAL-LIVE-004"
 CASE_006 = "GF-GENERAL-LIVE-006"
 QUARANTINE_BUDGET = 420
 IO_SUSTAIN = 120
+#: The sample window of ``reference_iostat`` and the settle budget: the
+#: detection budget of the sustained variants is ``io_detection_hold``.
 IO_BUDGET = IO_SUSTAIN + 300 + 90
+#: How long the writer may take to bring the oracle to the threshold: the
+#: dm-delay device reads its 200 ms from the first request, a linear device
+#: needs util to climb over the first collector intervals.
+IO_RAMP_BUDGET = 180
+#: Ingest, dispatch and the +-5 % summary jitter on top of the cadence terms.
+IO_CHAIN_MARGIN = 180
 SHORT_FLUSH = 45
 TEST_FS = "fs"
 TEST_DM = "io"
@@ -718,37 +726,110 @@ def _stop_io(ctx: VariantContext) -> dict[str, Any]:
     return stopped
 
 
+def io_detection_hold(ctx: VariantContext) -> int:
+    """The detection budget from the oracle's crossing, on the product's cadence.
+
+    The host collector ships a threshold breach once, as its edge
+    (``collectors/host/collector.py`` ``_edge_reasons``: ``threshold:<metric>``
+    stays in ``_active_edge_reasons`` while any device breaches), then only on
+    its health summaries (``GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS``, +-5 %
+    jitter). The control plane mints the finding on the first *later* active
+    sample at least the rule's sustain after the first
+    (``store/shared/xid.py`` ``_next_health_signal_state``): up to the sustain
+    plus one summary after the edge; VALIDATE_HOST is then judged on evidence
+    newer than itself, one more summary at worst. Live 2026-10-25 17:04Z (eksb,
+    R13e): await edge 17:04:25, util edge 17:05:11, the summary 17:08:30 minted
+    util 199 s after its edge; the 510-s budget from the load start was never
+    the blocker there (it ran to 17:13:01) but covers the worst case by seconds
+    only. Mirrors 003's ``page_cache_hold``.
+    """
+
+    return IO_SUSTAIN + 2 * ctx.host_summary + ctx.host_interval + IO_CHAIN_MARGIN
+
+
+def _await_crossing(
+    ctx: VariantContext,
+    oracle: Oracle,
+    *,
+    metric: str,
+    device: str,
+    key: str,
+    threshold: float,
+) -> dict[str, Any]:
+    """The oracle's first reading at or above ``threshold``: when the condition
+    began on the device, from which the detection budget is counted."""
+
+    crossing: dict[str, Any] = {}
+
+    def crossed() -> dict[str, Any] | None:
+        oracle.read()
+        for record in oracle.records:
+            value = record.get("diskstats", {}).get(device, {}).get(key)
+            if isinstance(value, (int, float)) and value >= threshold:
+                crossing.update({"at": record.get("at"), "value": float(value)})
+                return crossing
+        return None
+
+    if not ctx.wait_until(
+        crossed, timeout_seconds=IO_RAMP_BUDGET, poll_seconds=15, name=f"{metric}-ramp"
+    ):
+        values = oracle_values(
+            [record.get("diskstats", {}).get(device, {}) for record in oracle.records],
+            lambda record: record.get(key),
+        )
+        raise VariantInconclusive(
+            f"condition not established: the writer did not bring {key} on "
+            f"{device} to {threshold:g} within {IO_RAMP_BUDGET} s "
+            f"(last {[round(value, 1) for value in values[-6:]]})"
+        )
+    return crossing
+
+
 def _io_metric_variant(
     ctx: VariantContext, *, metric: str, delay_ms: int
 ) -> dict[str, Any]:
     created = _create_dm(ctx, delay_ms=delay_ms)
     device = _device_name(created)
     started = utc_now()
+    key = "util_percent" if metric == "disk_io_util_percent" else "standard_await_ms"
+    threshold = 98.0 if metric == "disk_io_util_percent" else 100.0
+    ramp = IO_RAMP_BUDGET
+    hold = io_detection_hold(ctx)
     oracle = Oracle(ctx, "disk")
-    oracle.start(IO_BUDGET + 120, interval=2, diskstats=[device])
-    hold = IO_BUDGET + 180
-    _run_io(ctx, hold)
+    oracle.start(ramp + hold + 240, interval=2, diskstats=[device])
+    load = _run_io(ctx, ramp + hold + 240)
+    ctx.evidence.write(
+        "io-load",
+        {
+            **load,
+            "ramp_budget_seconds": ramp,
+            "detection_budget_seconds": hold,
+            "host_summary_seconds": ctx.host_summary,
+            "host_interval_seconds": ctx.host_interval,
+        },
+    )
+    # Detection is timed from the moment the runner's own oracle reads the
+    # threshold on the device, not from the load start, over the product's
+    # cadence (``io_detection_hold``).
+    crossing = _await_crossing(
+        ctx, oracle, metric=metric, device=device, key=key, threshold=threshold
+    )
     detection = wait_for_incident(
         ctx,
         started,
         metric,
         device=device,
-        timeout_seconds=IO_BUDGET,
+        timeout_seconds=hold,
         metrics={metric},
         validation="VALIDATE_HOST",
         name=f"{metric}-detection",
     )
     oracle.read()
-    key = "util_percent" if metric == "disk_io_util_percent" else "standard_await_ms"
-    threshold = 98.0 if metric == "disk_io_util_percent" else 100.0
     values = oracle_values(
         [record.get("diskstats", {}).get(device, {}) for record in oracle.records],
         lambda record: record.get(key),
     )
-    if not sustained(values, lambda value: value >= threshold, IO_SUSTAIN // 2):
-        raise VariantInconclusive(
-            f"the {metric} oracle never sustained >= {threshold}: {values[-8:]}"
-        )
+    held = sustained(values, lambda value: value >= threshold, IO_SUSTAIN // 2)
     incidents = finding_incidents(detection, metric, device=device)
     stages = {
         "chain": chain_errors(
@@ -765,23 +846,41 @@ def _io_metric_variant(
         ),
         "hardware": hardware_errors(detection),
     }
+    # The recovery proof runs whatever the verdict so far: a device destroyed
+    # with its signal still active -- and notified once a finding was minted --
+    # keeps that state in the store, where the next run's active samples read
+    # as the same notified episode and mint nothing (live 2026-10-25 17:04Z on
+    # eksb: the 15:03Z reference_iostat await incident, no clearing sample,
+    # "no disk_io_await_ms on dm-0 finding reached an incident").
     _stop_io(ctx)
-    load = _recovery_load(ctx, metric, delay_ms)
+    recovery_load = _recovery_load(ctx, metric, delay_ms)
     recovered = _await_io_recovery(ctx, metric, device, threshold)
-    if load:
+    if recovery_load:
         _stop_io(ctx)
+    if not held:
+        raise VariantInconclusive(
+            f"the {metric} oracle never sustained >= {threshold}: {values[-8:]}"
+        )
     stages["recovery"] = recovered["errors"]
-    wait_settled(
-        ctx,
-        started,
-        [item["incident_id"] for item in incidents],
-        timeout_seconds=IO_BUDGET,
-        metrics={metric},
-        name=f"{metric}-settled",
-    )
+    if incidents:
+        # No incident is nothing to settle: a wait could never accept.
+        wait_settled(
+            ctx,
+            started,
+            [item["incident_id"] for item in incidents],
+            timeout_seconds=IO_BUDGET,
+            metrics={metric},
+            name=f"{metric}-settled",
+        )
     return _result(
         stages,
-        extra={"device": device, "recovery": recovered, "recovery_load": load},
+        extra={
+            "device": device,
+            "crossing": crossing,
+            "detection_budget_seconds": hold,
+            "recovery": recovered,
+            "recovery_load": recovery_load,
+        },
     )
 
 
@@ -994,6 +1093,16 @@ def reference_iostat(ctx: VariantContext) -> dict[str, Any]:
         lambda record: record.get("standard_await_ms"),
     )
     _stop_io(ctx)
+    # Before any verdict: the device's await signal is cleared with the delay
+    # out and a paced writer (``_recovery_load``). Live 2026-10-25 eksb this
+    # variant (14:56-15:05Z) minted an await incident at 15:03:10Z and tore
+    # the device down with no below-threshold sample ever delivered; the
+    # signal stayed active and notified until 17:14:22Z and the next
+    # sustained_latency on dm-0 had its finding withheld as the same notified
+    # episode (store/shared/xid.py _next_health_signal_state).
+    recovery_load = _recovery_load(ctx, "disk_io_await_ms", 200 if delayed else 0)
+    recovered = _await_io_recovery(ctx, "disk_io_await_ms", device, 100.0)
+    _stop_io(ctx)
     if not product or not standard:
         # Nothing to compare is not "no divergence": the oracle or the product
         # produced no await sample for the device.
@@ -1016,7 +1125,10 @@ def reference_iostat(ctx: VariantContext) -> dict[str, Any]:
             "device and interval beyond tolerance ((ms_read+ms_write)/ios)"
         ]
         if diverged
-        else []
+        else [],
+        # A signal the product does not clear on fresh below-threshold samples
+        # is its defect, and would mask the next run's finding on this node.
+        "signal_cleared": recovered["errors"],
     }
     return _result(
         stages,
@@ -1025,6 +1137,8 @@ def reference_iostat(ctx: VariantContext) -> dict[str, Any]:
             "product_await_ms": product[-5:],
             "standard_await_ms": standard[-5:],
             "diverged": diverged,
+            "recovery": recovered,
+            "recovery_load": recovery_load,
         },
     )
 
@@ -1033,33 +1147,61 @@ def io_recovery(ctx: VariantContext) -> dict[str, Any]:
     created = _create_dm(ctx)
     device = _device_name(created)
     started = utc_now()
+    hold = io_detection_hold(ctx)
     oracle = Oracle(ctx, "disk")
-    oracle.start(IO_BUDGET, interval=2, diskstats=[device])
-    _run_io(ctx, IO_BUDGET)
+    oracle.start(IO_RAMP_BUDGET + hold + 240, interval=2, diskstats=[device])
+    load = _run_io(ctx, IO_RAMP_BUDGET + hold + 240)
+    ctx.evidence.write(
+        "io-load",
+        {
+            **load,
+            "ramp_budget_seconds": IO_RAMP_BUDGET,
+            "detection_budget_seconds": hold,
+            "host_summary_seconds": ctx.host_summary,
+            "host_interval_seconds": ctx.host_interval,
+        },
+    )
+    crossing = _await_crossing(
+        ctx,
+        oracle,
+        metric="disk_io_util_percent",
+        device=device,
+        key="util_percent",
+        threshold=98.0,
+    )
     detection = wait_for_incident(
         ctx,
         started,
         "disk_io_util_percent",
         device=device,
-        timeout_seconds=IO_BUDGET,
+        timeout_seconds=hold,
         metrics={"disk_io_util_percent"},
         name="io-recovery-detection",
     )
     incidents = finding_incidents(detection, "disk_io_util_percent", device=device)
     _stop_io(ctx)
     recovered = _await_io_recovery(ctx, "disk_io_util_percent", device, 98.0)
-    wait_settled(
-        ctx,
-        started,
-        [item["incident_id"] for item in incidents],
-        timeout_seconds=IO_BUDGET,
-        metrics={"disk_io_util_percent"},
-        name="io-recovery-settled",
-    )
+    if incidents:
+        wait_settled(
+            ctx,
+            started,
+            [item["incident_id"] for item in incidents],
+            timeout_seconds=IO_BUDGET,
+            metrics={"disk_io_util_percent"},
+            name="io-recovery-settled",
+        )
     stages = {"recovery": recovered["errors"], "hardware": hardware_errors(detection)}
     if not incidents:
         stages["recovery"].append("no disk I/O finding to recover from")
-    return _result(stages, extra={"device": device, "recovery": recovered})
+    return _result(
+        stages,
+        extra={
+            "device": device,
+            "crossing": crossing,
+            "detection_budget_seconds": hold,
+            "recovery": recovered,
+        },
+    )
 
 
 # --------------------------------------------------------------------------- #
@@ -1276,18 +1418,22 @@ VARIANTS = [
     ),
     _io_spec(
         "sustained_util",
-        "dm-linear/dm-delay over a loop file, 16-32 O_DIRECT writers for >= 8 min",
-        "disk_io_util_percent >= 98 for 120 s -> VALIDATE_HOST on dm-N; no reset",
+        "dm-linear/dm-delay over a loop file, 16 O_DIRECT writers; detection is "
+        "timed from the oracle's crossing over two host health summaries",
+        "disk_io_util_percent >= 98 for 120 s -> VALIDATE_HOST on dm-N; no reset; "
+        "fresh samples below threshold once the writer stops",
         sustained_util,
-        max_minutes=20,
+        max_minutes=45,
     ),
     _io_spec(
         "sustained_latency",
-        "dm-delay 200 ms with queued writers",
+        "dm-delay 200 ms with queued writers; detection is timed from the oracle's "
+        "crossing over two host health summaries",
         "disk_io_await_ms >= 100 -> VALIDATE_HOST; a missing dm_delay is loaded "
-        "for the run (KERNEL_MODULE_LOAD) and unloaded in cleanup",
+        "for the run (KERNEL_MODULE_LOAD) and unloaded in cleanup; the delay is "
+        "taken out and a paced writer proves the await recovered on the device",
         sustained_latency,
-        max_minutes=20,
+        max_minutes=45,
         approvals=("KERNEL_MODULE_LOAD",),
     ),
     _io_spec(
@@ -1321,14 +1467,15 @@ VARIANTS = [
         "agrees with the oracle within 10 % / 5 ms; a divergence beyond that is the spec "
         "FAIL; awaits under the 5 ms tolerance floor (no dm-delay) are INCONCLUSIVE",
         reference_iostat,
-        max_minutes=20,
+        max_minutes=30,
         optional_approvals=("KERNEL_MODULE_LOAD",),
     ),
     _io_spec(
         "recovery",
-        "stop the writer",
+        "stop the writer (detection timed from the oracle's crossing over two "
+        "host health summaries)",
         "fresh samples below threshold; validation passes; data intact",
         io_recovery,
-        max_minutes=18,
+        max_minutes=45,
     ),
 ]

@@ -9,6 +9,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import general_live_storage as storage
+from scripts.e2e.regional.general_live_common import STORE_POLL_SECONDS
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from tests.regional._general_live_fakes import (
     FakeProbe,
@@ -517,7 +518,25 @@ def _reference_iostat_result(tmp_path: Path, standard_await_ms: float):
         "health_signals": {},
         "notifications": [],
     }
-    regional = FakeRegional(cpu_python=store_script({"activity": doc}))
+    # The detection poll reads the loaded records; once the writer stopped the
+    # product delivers the recovered edge (the signal-clearing proof).
+    import itertools
+
+    recovered = {
+        **doc,
+        "batches": [
+            host_batch(
+                f"2026-10-24T00:1{i}:00+00:00", "disk_io_await_ms", 0.3, device="dm-7"
+            )
+            for i in range(2)
+        ],
+    }
+    polls = itertools.count(1)
+
+    def product(_script: str, *_arguments: str, **_: Any) -> dict[str, Any]:
+        return doc if next(polls) == 1 else recovered
+
+    regional = FakeRegional(cpu_python=product)
     ctx = make_context(
         spec,
         tmp_path=tmp_path,
@@ -603,14 +622,24 @@ def test_zero_completed_io_and_counter_reset_and_recovery(tmp_path: Path) -> Non
         "notifications": [],
     }
     regional = FakeRegional(cpu_python=store_script({"activity": doc}))
+    # The recovery variant times its detection from the oracle's crossing.
+    node = node_probe(survey())
+    node.script["oracle-read"] = {
+        "records": [
+            {"diskstats": {"dm-7": {"util_percent": 100.0}}} for _ in range(80)
+        ],
+        "next_offset": 80,
+        "total": 80,
+    }
     ctx = make_context(
         spec,
         tmp_path=tmp_path,
         regional=regional,
-        probes=probes(node_probe(survey()), storage_probe(), window_probe()),
+        probes=probes(node, storage_probe(), window_probe()),
     )
     result = spec.execute(ctx)
     assert result["verdict"] == "PASS", result["errors"]
+    assert result["crossing"]["value"] == 100.0, result["crossing"]
 
 
 def test_sustained_latency_requires_dm_delay(tmp_path: Path) -> None:
@@ -1052,3 +1081,332 @@ def test_sustained_util_recovery_needs_no_verification_load(tmp_path: Path) -> N
     spec.execute(ctx)
     names = [call[0] for call in store.calls]
     assert "dm-retarget" not in names and names.count("io-start") == 1, names
+
+
+# --------------------------------------------------------------------------- #
+# 006 detection budget on the product's cadence (live 2026-10-25 17:04Z, eksb)
+# --------------------------------------------------------------------------- #
+def _poll_clock(ctx: Any) -> Any:
+    """One store poll per clock reading, as live (a read every 20 s)."""
+
+    import itertools
+    from datetime import datetime, timedelta, timezone
+
+    ticks = itertools.count()
+    start = datetime(2026, 10, 25, 17, 3, 12, tzinfo=timezone.utc)
+    ctx.clock = lambda: start + timedelta(seconds=STORE_POLL_SECONDS * next(ticks))
+    return ctx
+
+
+def _await_oracle_reads(*phases: list[float | None]) -> list[dict[str, Any]]:
+    """Every ``oracle-read`` serves the dm-7 readings since the previous read."""
+
+    entries: list[dict[str, Any]] = []
+    total = 0
+    for values in phases:
+        total += len(values)
+        entries.append(
+            {
+                "records": [
+                    {"diskstats": {"dm-7": {"standard_await_ms": value}}}
+                    for value in values
+                ],
+                "next_offset": total,
+                "total": total,
+            }
+        )
+    return entries
+
+
+#: The live shape: the writer's first interval has no completion yet, the
+#: crossing arrives on the second oracle read (210 ms, the dm-delay table) and
+#: holds; the product's finding needs an active sample >= 120 s after the
+#: first and comes with the first health summary after that -- up to 435 s
+#: after the edge -- which the old 510-s budget from the load start only just
+#: covered. Here the records arrive 30 store polls (600 s) after the crossing.
+AWAIT_READS = _await_oracle_reads([None] * 2, [210.0] * 80, [210.0] * 10)
+AWAIT_MINTED_AT_POLL = 30
+
+
+def _latency_doc() -> dict[str, Any]:
+    inc = incident(
+        "inc-io",
+        "disk_io_await_ms",
+        device="dm-7",
+        state="ACTION_PENDING",
+        workflow="wf-io",
+    )
+    wf = workflow(
+        "wf-io",
+        "inc-io",
+        ["FREEZE_EVIDENCE", "VALIDATE_HOST"],
+        status="FAILED",
+        probe_metric="disk_io_await_ms",
+        executions=[
+            {
+                "operation": "VALIDATE_HOST",
+                "status": "FAILED",
+                "details": {"host_diagnostic_failure": True},
+            }
+        ],
+    )
+    return {
+        "incidents": [inc],
+        "workflows": [wf],
+        "batches": [
+            host_batch(
+                "2026-10-25T17:08:30+00:00", "disk_io_await_ms", 210.5, device="dm-7"
+            )
+        ]
+        + [
+            host_batch(
+                f"2026-10-25T17:2{i}:00+00:00", "disk_io_await_ms", 0.2, device="dm-7"
+            )
+            for i in range(3)
+        ],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+    }
+
+
+def _empty_doc() -> dict[str, Any]:
+    return {
+        "incidents": [],
+        "workflows": [],
+        "batches": [
+            host_batch(
+                f"2026-10-25T17:2{i}:00+00:00", "disk_io_await_ms", 0.2, device="dm-7"
+            )
+            for i in range(3)
+        ],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+    }
+
+
+def _latency_cadence_run(
+    tmp_path: Path, reads: list[dict[str, Any]], minted_at_poll: int | None
+) -> tuple[dict[str, Any], Any, FakeProbe, FakeProbe]:
+    import itertools
+
+    spec = SPECS["sustained_latency"]
+    polls = itertools.count(1)
+
+    def product(_script: str, *_arguments: str, **_: Any) -> dict[str, Any]:
+        poll = next(polls)
+        if minted_at_poll is not None and poll >= minted_at_poll:
+            return _latency_doc()
+        return _empty_doc()
+
+    node = node_probe(survey(dm_delay=True))
+    node.script["oracle-read"] = reads
+    store = storage_probe()
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=product),
+        probes=probes(node, store, window_probe()),
+    )
+    result = spec.execute(_poll_clock(ctx))
+    return result, ctx, node, store
+
+
+def test_io_detection_hold_covers_the_products_two_summaries(tmp_path: Path) -> None:
+    """The budget is the product's cadence, read from the node's collector env:
+    the rule's sustain + two health summaries + one collector interval + the
+    ingest/dispatch/jitter margin, as 003's ``page_cache_hold``."""
+
+    from gpu_fault.host_health import NodeHealthPolicy
+
+    spec = SPECS["sustained_latency"]
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=store_script({"activity": _empty_doc()})),
+        probes=probes(node_probe(survey()), storage_probe(), window_probe()),
+    )
+    ctx.survey = survey()
+    assert storage.IO_SUSTAIN == NodeHealthPolicy.DISK_IO_SUSTAIN_SECONDS
+    assert storage.io_detection_hold(ctx) == 120 + 2 * 300 + 15 + 180
+    assert storage.io_detection_hold(ctx) > storage.IO_BUDGET, (
+        "the budget counted from the load start that the cadence can outrun"
+    )
+    for variant in ("sustained_util", "sustained_latency", "recovery"):
+        minutes = SPECS[variant].max_minutes
+        assert minutes * 60 >= (
+            storage.IO_RAMP_BUDGET
+            + storage.io_detection_hold(ctx)
+            + 2 * 300
+            + 6 * 15
+            + storage.IO_BUDGET
+            + 240
+        ), (variant, minutes)
+
+
+def test_sustained_latency_times_detection_from_the_oracles_crossing(
+    tmp_path: Path,
+) -> None:
+    result, ctx, node, store = _latency_cadence_run(
+        tmp_path, AWAIT_READS, AWAIT_MINTED_AT_POLL
+    )
+    assert result["verdict"] == "PASS", result["errors"]
+    import json
+
+    ramp = json.loads(
+        (ctx.case_dir / "disk_io_await_ms-ramp-timeline.json").read_text()
+    )
+    assert [entry["accepted"] for entry in ramp["entries"]] == [False, True]
+    load = json.loads((ctx.case_dir / "io-load.json").read_text())
+    assert load["detection_budget_seconds"] == storage.io_detection_hold(ctx)
+    assert load["ramp_budget_seconds"] == storage.IO_RAMP_BUDGET
+    assert result["crossing"]["value"] == 210.0, result["crossing"]
+    # The writer and the oracle outlive the ramp and the detection budget.
+    writer = next(call for call in store.calls if call[0] == "io-start")
+    assert int(writer[writer.index("--seconds") + 1]) >= (
+        storage.IO_RAMP_BUDGET + storage.io_detection_hold(ctx)
+    ), writer
+    oracle = next(call for call in node.calls if call[0] == "oracle-start")
+    assert int(oracle[oracle.index("--seconds") + 1]) >= (
+        storage.IO_RAMP_BUDGET + storage.io_detection_hold(ctx)
+    ), oracle
+
+
+def test_sustained_latency_fails_when_the_product_misses_two_summaries(
+    tmp_path: Path,
+) -> None:
+    budget = storage.IO_SUSTAIN + 2 * 300 + 15 + 180
+    late = budget // STORE_POLL_SECONDS + 4
+    result, ctx, _node, store = _latency_cadence_run(tmp_path, AWAIT_READS, late)
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["chain"] == [
+        "no disk_io_await_ms on dm-7 finding reached an incident"
+    ], result["stages"]
+    # Nothing to settle must not poll the store for another budget (live
+    # 2026-10-25: 8.5 minutes of settle polls after the chain FAIL), and the
+    # device's await signal is still given its recovery proof (hygiene: a
+    # signal left active and notified masks the next run's finding).
+    assert not (ctx.case_dir / "disk_io_await_ms-settled-timeline.json").exists(), (
+        "nothing to settle must not poll the store"
+    )
+    names = [call[0] for call in store.calls]
+    first_stop = names.index("io-stop")
+    assert names[first_stop:] == ["io-stop", "dm-retarget", "io-start", "io-stop"], (
+        names
+    )
+
+
+def test_sustained_latency_is_inconclusive_when_the_ramp_runs_out(
+    tmp_path: Path,
+) -> None:
+    with pytest.raises(VariantInconclusive, match="condition not established"):
+        _latency_cadence_run(tmp_path, _await_oracle_reads([None] * 3), None)
+
+
+def test_an_unsustained_oracle_is_inconclusive_only_after_the_signal_recovery(
+    tmp_path: Path,
+) -> None:
+    """The oracle crossed but did not hold: INCONCLUSIVE, raised after the
+    delay is out and the paced writer gave the product its recovery samples --
+    a device destroyed with an active, notified await signal poisons the next
+    run on the node (live 2026-10-25 17:04Z, eksb)."""
+
+    reads = _await_oracle_reads([None], [210.0] * 3 + [50.0] * 80, [50.0] * 10)
+    with pytest.raises(VariantInconclusive, match="never sustained"):
+        _latency_cadence_run(tmp_path, reads, AWAIT_MINTED_AT_POLL)
+
+
+def test_reference_iostat_clears_the_await_signal_before_teardown(
+    tmp_path: Path,
+) -> None:
+    """Live 2026-10-25 eksb: ``reference_iostat`` (14:56-15:05Z, dm-delay 200 ms)
+    minted an await incident at 15:03:10Z, stopped its writer and destroyed the
+    device with no below-threshold await sample ever delivered, so the
+    device-scoped signal stayed active and notified until 17:14:22Z; the next
+    ``sustained_latency`` on dm-0 (17:04Z) had its finding withheld by that
+    latch (store/shared/xid.py _next_health_signal_state: previously_notified)
+    -- "no disk_io_await_ms on dm-0 finding reached an incident". Every
+    await-breaching variant now leaves the signal cleared."""
+
+    spec = SPECS["reference_iostat"]
+    node = node_probe(survey())
+    node.script["oracle-read"] = {
+        "records": [
+            {"diskstats": {"dm-7": {"standard_await_ms": 212.0}}} for _ in range(30)
+        ],
+        "next_offset": 30,
+        "total": 30,
+    }
+    doc = {
+        "incidents": [incident("inc-io", "disk_io_await_ms", device="dm-7")],
+        "workflows": [],
+        "batches": [
+            host_batch(
+                "2026-10-25T15:03:09+00:00", "disk_io_await_ms", 212.6, device="dm-7"
+            )
+        ]
+        + [
+            host_batch(
+                f"2026-10-25T15:1{i}:00+00:00", "disk_io_await_ms", 0.3, device="dm-7"
+            )
+            for i in range(3)
+        ],
+        "markers": [],
+        "commands": [],
+        "health_signals": {},
+        "notifications": [],
+    }
+    import itertools
+
+    loaded = {**doc, "batches": doc["batches"][:1]}
+    recovered = {**doc, "batches": doc["batches"][1:]}
+    polls = itertools.count(1)
+
+    def product(_script: str, *_arguments: str, **_: Any) -> dict[str, Any]:
+        return loaded if next(polls) == 1 else recovered
+
+    store = storage_probe()
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=product),
+        probes=probes(node, store, window_probe()),
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert result["stages"]["signal_cleared"] == []
+    assert result["recovery"]["fresh_samples"], result["recovery"]
+    names = [call[0] for call in store.calls]
+    first_stop = names.index("io-stop")
+    assert names[first_stop:] == ["io-stop", "dm-retarget", "io-start", "io-stop"], (
+        names
+    )
+    retarget = store.calls[first_stop + 1]
+    assert retarget[retarget.index("--delay-ms") + 1] == "0", retarget
+
+
+def test_reference_iostat_clears_the_signal_before_an_inconclusive_reading(
+    tmp_path: Path,
+) -> None:
+    from tests.regional._general_live_fakes import make_settings
+
+    spec = SPECS["reference_iostat"]
+    store = storage_probe()
+    settings = make_settings(spec)
+    settings = type(settings)(**{**settings.__dict__, "approvals": ()})
+    ctx = make_context(
+        spec,
+        tmp_path=tmp_path,
+        regional=FakeRegional(cpu_python=store_script({"activity": _empty_doc()})),
+        settings=settings,
+        probes=probes(node_probe(survey(dm_delay=False)), store, window_probe()),
+    )
+    with pytest.raises(VariantInconclusive):
+        spec.execute(ctx)  # no await samples to compare
+    names = [call[0] for call in store.calls]
+    first_stop = names.index("io-stop")
+    # A linear device (delay 0) needs no table swap, only the paced writer.
+    assert names[first_stop:] == ["io-stop", "io-start", "io-stop"], names
