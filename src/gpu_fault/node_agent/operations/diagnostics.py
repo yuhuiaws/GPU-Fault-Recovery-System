@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import hmac
 import json
+import logging
 import os
 import re
 import shutil
@@ -32,6 +33,8 @@ from gpu_fault.node_agent.operations.hostengine_recovery import recover_host_eng
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
+
+LOGGER = logging.getLogger(__name__)
 
 FIELD_DIAGNOSTIC_FAILURE_PATTERN = re.compile(
     r"\b(?:FAIL|FAILED|FAILURE|FATAL|ERROR)\b",
@@ -496,28 +499,10 @@ class DiagnosticOperationsMixin:
             for chunk in iter(lambda: stream.read(1024 * 1024), b""):
                 digest_state.update(chunk)
         digest = digest_state.hexdigest()
-        evidence_ref = f"file://{archive}"
-        if self.diagnostic_s3_uri:
-            from urllib.parse import urlparse
-
-            import boto3
-
-            parsed = urlparse(self.diagnostic_s3_uri)
-            if parsed.scheme != "s3" or not parsed.netloc:
-                raise RuntimeError("invalid diagnostic S3 URI")
-            key = "/".join(
-                item
-                for item in [
-                    parsed.path.strip("/"),
-                    command.node_id,
-                    archive.name,
-                ]
-                if item
-            )
-            boto3.client("s3").upload_file(str(archive), parsed.netloc, key)
-            evidence_ref = f"s3://{parsed.netloc}/{key}"
+        evidence_ref, upload_error = self._publish_evidence(archive, command)
         result = {
             "evidence_ref": evidence_ref,
+            **({"evidence_upload_error": upload_error} if upload_error else {}),
             "sha256": digest,
             "size_bytes": archive.stat().st_size,
             "manifest_summary": {
@@ -535,6 +520,54 @@ class DiagnosticOperationsMixin:
         }
         self._cleanup_diagnostic_archives()
         return result
+
+    def _publish_evidence(
+        self, path: Path, command: NodeActionCommand
+    ) -> tuple[str, str | None]:
+        """Where the control plane may read ``path``: ``(evidence_ref, upload_error)``.
+
+        Without a diagnostic S3 destination the reference is the node-local
+        ``file://`` path, readable only on this node. With one, the archive is
+        uploaded to ``<prefix>/<node>/<name>`` and the ``s3://`` object is the
+        reference. A failed upload (no ``s3:PutObject`` on the node role, no
+        boto3 in the node runtime, S3 unreachable) does not fail the diagnostic
+        step: the evidence was collected and must not be lost, so the result
+        keeps the ``file://`` reference and names the failure in
+        ``evidence_upload_error`` -- what the notification renders next to the
+        reference. A destination that is not an ``s3://bucket`` URI is a
+        configuration error and still refuses the step, as it always did.
+        """
+
+        evidence_ref = f"file://{path}"
+        if not self.diagnostic_s3_uri:
+            return evidence_ref, None
+        from urllib.parse import urlparse
+
+        parsed = urlparse(self.diagnostic_s3_uri)
+        if parsed.scheme != "s3" or not parsed.netloc:
+            raise RuntimeError("invalid diagnostic S3 URI")
+        key = "/".join(
+            item
+            for item in [parsed.path.strip("/"), command.node_id, path.name]
+            if item
+        )
+        target = f"s3://{parsed.netloc}/{key}"
+        try:
+            import boto3
+
+            boto3.client("s3").upload_file(str(path), parsed.netloc, key)
+        except Exception as exc:  # noqa: BLE001 - collected evidence outlives the upload
+            message = " ".join(str(exc).split())[:500]
+            LOGGER.warning(
+                "diagnostic evidence upload to %s failed (%s: %s); the archive stays "
+                "on the node as %s",
+                target,
+                type(exc).__name__,
+                message,
+                evidence_ref,
+            )
+            return evidence_ref, f"{target}: {type(exc).__name__}: {message}"
+        return target, None
 
     def _cleanup_diagnostic_archives(self, now: datetime | None = None) -> list[str]:
         """Prune every family of diagnostic evidence this agent writes.
@@ -721,26 +754,7 @@ class DiagnosticOperationsMixin:
         self._cleanup_diagnostic_archives()
         output_path.write_text(output, encoding="utf-8", errors="replace")
         digest = hashlib.sha256(output_path.read_bytes()).hexdigest()
-        evidence_ref = f"file://{output_path}"
-        if self.diagnostic_s3_uri:
-            from urllib.parse import urlparse
-
-            import boto3
-
-            parsed = urlparse(self.diagnostic_s3_uri)
-            if parsed.scheme != "s3" or not parsed.netloc:
-                raise RuntimeError("invalid diagnostic S3 URI")
-            key = "/".join(
-                item
-                for item in [
-                    parsed.path.strip("/"),
-                    command.node_id,
-                    output_path.name,
-                ]
-                if item
-            )
-            boto3.client("s3").upload_file(str(output_path), parsed.netloc, key)
-            evidence_ref = f"s3://{parsed.netloc}/{key}"
+        evidence_ref, upload_error = self._publish_evidence(output_path, command)
 
         parse_error = None
         payload: Any = None
@@ -804,6 +818,8 @@ class DiagnosticOperationsMixin:
             "sha256": digest,
             "size_bytes": output_path.stat().st_size,
         }
+        if upload_error:
+            details["evidence_upload_error"] = upload_error
         if eks_managed:
             # Which grading applied; a HyperPod result stays exactly as it was.
             details["dcgm_hostengine"] = self.dcgm_hostengine

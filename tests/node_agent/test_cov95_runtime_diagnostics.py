@@ -4,6 +4,7 @@ import gzip
 import hashlib
 import json
 import subprocess
+import sys
 import tarfile
 from collections.abc import Callable
 from pathlib import Path
@@ -323,6 +324,86 @@ def test_diagnostic_upload_is_bound_to_valid_s3_bucket_and_node_path(
         assert result.status is NodeActionStatus.FAILED
         assert "invalid diagnostic S3 URI" in (result.error or "")
         assert uploads == []
+
+
+@pytest.mark.parametrize(
+    "operation",
+    [
+        WorkflowOperation.COLLECT_DIAGNOSTIC_BUNDLE,
+        WorkflowOperation.RUN_DCGM_DIAGNOSTIC,
+    ],
+)
+@pytest.mark.parametrize("failure", ["denied", "no-boto3"])
+def test_diagnostic_upload_failure_keeps_the_node_local_reference_with_an_error_note(
+    node_factory: Callable[..., NodeActionExecutor],
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    operation: WorkflowOperation,
+    failure: str,
+) -> None:
+    """The evidence was collected; a failed upload (no ``s3:PutObject`` on the
+    node role, no boto3 in the node runtime) must not fail the diagnostic step
+    and lose it. The result keeps the ``file://`` reference and says why there
+    is no S3 copy, so the notification can tell the operator."""
+
+    if failure == "denied":
+
+        def upload_file(*_args: object) -> None:
+            raise PermissionError(
+                "An error occurred (AccessDenied) when calling the PutObject operation"
+            )
+
+        monkeypatch.setattr(
+            boto3, "client", lambda service: SimpleNamespace(upload_file=upload_file)
+        )
+    else:
+        monkeypatch.setitem(sys.modules, "boto3", None)
+    agent = node_factory(
+        allowed_operations={operation},
+        diagnostic_s3_uri="s3://unit-bucket/prefix",
+        runner=lambda arguments, **kwargs: subprocess.CompletedProcess(
+            arguments, 0, '{"status":"PASS"}', ""
+        ),
+    )
+
+    result = agent.execute(envelope(command(operation)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED, result
+    reference = result.details["evidence_ref"]
+    assert reference.startswith("file://"), reference
+    archive = Path(reference[len("file://") :])
+    assert archive.parent == tmp_path / "diagnostics" and archive.is_file()
+    error = result.details["evidence_upload_error"]
+    assert error.startswith("s3://unit-bucket/prefix/node-a/"), error
+    if failure == "denied":
+        assert "PermissionError" in error and "AccessDenied" in error, error
+    else:
+        assert "boto3" in error, error
+        assert "ImportError" in error or "ModuleNotFoundError" in error, error
+    assert result.details["sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
+
+
+def test_a_successful_upload_records_no_upload_error(
+    node_factory: Callable[..., NodeActionExecutor], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(
+        boto3, "client", lambda service: SimpleNamespace(upload_file=lambda *args: None)
+    )
+    agent = node_factory(
+        allowed_operations={WorkflowOperation.RUN_DCGM_DIAGNOSTIC},
+        diagnostic_s3_uri="s3://unit-bucket",
+        runner=lambda arguments, **kwargs: subprocess.CompletedProcess(
+            arguments, 0, '{"status":"PASS"}', ""
+        ),
+    )
+
+    result = agent.execute(envelope(command(WorkflowOperation.RUN_DCGM_DIAGNOSTIC)))
+
+    assert result.status is NodeActionStatus.SUCCEEDED
+    assert result.details["evidence_ref"].startswith("s3://unit-bucket/node-a/"), (
+        result.details
+    )
+    assert "evidence_upload_error" not in result.details
 
 
 @pytest.mark.parametrize("output", [None, "not-json", "[]"])
