@@ -960,7 +960,25 @@ await 都 ≥ 200 ms——夹具的结构性缺口，不是产品缺口，也与
 --target data --delay-ms 0` 把数据表原地换回 linear（同一 dm-N、挂载与文件不变），再启动
 单线程、每 100 ms 一次 64 KiB O_DIRECT 写的节拍写入单元（util 远低于 1 %），让产品在同一
 设备上采到阈值以下的新鲜 await 样本，等待结束后停掉它；util 变体无需这些（空闲设备的
-field 10 读数即 0 %）。`reference_iostat` 另可选 `--approve KERNEL_MODULE_LOAD`：
+field 10 读数即 0 %）。带该恢复证明的第二次真机运行（2026-10-25 17:04Z，eksb，R13e）在检出阶段
+FAIL（"no disk_io_await_ms on dm-0 finding reached an incident"）。只读回放 `ACTIVITY_PROBE`
+给出的产品记录：边沿批 17:04:25Z（`threshold:disk_io_await_ms`，await 211 ms）、17:05:11Z
+（`threshold:disk_io_util_percent`）、健康摘要 17:08:30Z（util 100、await 210）——摘要只为
+util 铸出 finding（边沿后 199 s ≥ 120 s 持续期），await 没有，尽管它的首个活跃样本更早。原因
+是同一节点上 `reference_iostat`（14:56–15:05Z，dm-delay 200 ms）在 15:03:10Z 铸出的 await
+incident 已把设备级信号 `…/disk_io_await_ms/dm-0` 置为 active+notified，之后该变体停写入、
+拆设备，从未送出一个阈值以下的 await 样本（15:03:40Z 的 `recovered` 批只清了 util），信号就
+一直停在 active+notified 直到 17:14:22Z；新一轮的活跃样本在 `store/shared/xid.py`
+`_next_health_signal_state` 中读成同一已通知的 episode（`previously_notified` → 不铸出）。
+这是夹具卫生缺口：每个把 await 推过阈值的变体现在都在拆设备前清掉信号（`reference_iostat`
+同样去掉 delay、起节拍写入并等产品的恢复样本，`signal_cleared` 阶段不清即 FAIL；
+`_io_metric_variant` 的 INCONCLUSIVE 也在恢复证明之后才抛出）。产品侧值得记录的候选缺口：
+设备不再上报时，设备级信号的 notified 锁存永不复位，后续同键 episode 全被吞掉。检出预算
+同时改为与 003 一致的节拍模型：从 oracle 首次读到阈值起计 `持续期 + 2×健康摘要 + 采集间隔
++ 180 s`（本站 915 s；之前是从负载开始计的 510 s，边沿后最坏 ~435 s 才铸出 finding，只差
+几十秒），写入单元与 oracle 覆盖 ramp（180 s）+ 预算 + 240 s，`sustained_util`、
+`sustained_latency`、`recovery` 共用该预算（窗口 45 min）；无 incident 时不再等 settle。
+`reference_iostat` 另可选 `--approve KERNEL_MODULE_LOAD`：
 测试设备用 200 ms dm-delay 表（`dm_delay` 已加载，或为本次运行加载并在清理卸载），把
 await 抬到 5 ms 容差底线之上——无 dm-delay 的线性设备在 NVMe 上 await 不到 1 ms，任何
 口径差异都显不出来（2026-10-25 ip-10-0-43-5：产品 0.30–0.44 ms 对 oracle 0.33–0.76 ms，

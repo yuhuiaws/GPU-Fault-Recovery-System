@@ -1069,7 +1069,36 @@ place (`dm-retarget --target data --delay-ms 0`: same dm-N, mount and files)
 and keeps a paced single writer (one 64 KiB O_DIRECT write every 100 ms, far
 below 1 % util) on the device so the product samples a below-threshold await
 there, stopping it after the wait; the util variant needs neither (an idle
-device reads 0 % from field 10 over elapsed time). `reference_iostat`
+device reads 0 % from field 10 over elapsed time). The second live run, with
+that recovery proof (2026-10-25 17:04Z, eksb, R13e), failed at the detection
+stage ("no disk_io_await_ms on dm-0 finding reached an incident"). The
+product's records (read-only `ACTIVITY_PROBE` replay): the edge batch at
+17:04:25Z (`threshold:disk_io_await_ms`, await 211 ms), 17:05:11Z
+(`threshold:disk_io_util_percent`), the health summary at 17:08:30Z (util 100,
+await 210) -- which minted the util finding (199 s after its edge, past the
+120 s sustain) but not await, whose first active sample was earlier. The cause:
+`reference_iostat` on the same node (14:56-15:05Z, dm-delay 200 ms) had minted
+an await incident at 15:03:10Z, which set the device-scoped signal
+`.../disk_io_await_ms/dm-0` active and notified; it then stopped its writer and
+destroyed the device without one below-threshold await sample ever delivered
+(the 15:03:40Z `recovered` batch cleared util only), so the signal stayed
+active and notified until 17:14:22Z and the new run's active samples read as
+the same notified episode in `store/shared/xid.py` `_next_health_signal_state`
+(`previously_notified`: nothing minted). A fixture-hygiene gap: every variant
+that drives await over the threshold now clears the signal before teardown
+(`reference_iostat` takes the delay out, runs the paced writer and waits for
+the product's recovery samples; its `signal_cleared` stage fails when they do
+not clear it; `_io_metric_variant` raises its INCONCLUSIVE only after the
+recovery proof). Worth recording as a product-gap candidate: a device-scoped
+signal whose device stops reporting never resets its notified latch, and
+every later episode of that key is swallowed. The detection budget also moved
+to the cadence model 003 proved: from the oracle's first reading at the
+threshold, `sustain + 2 x health summary + collector interval + 180 s` (915 s
+on this site; before, 510 s from the load start, while a finding can take up
+to ~435 s after the edge -- tens of seconds of slack), with the writer and the
+oracle covering ramp (180 s) + budget + 240 s; `sustained_util`,
+`sustained_latency` and `recovery` share it (45-minute windows) and nothing is
+waited on to settle when no incident exists. `reference_iostat`
 takes an optional `--approve KERNEL_MODULE_LOAD`: its device gets the 200 ms
 dm-delay table (a loaded `dm_delay`, or one loaded for the run and unloaded in
 cleanup) so the awaits sit above the 5 ms tolerance floor -- a linear device on
