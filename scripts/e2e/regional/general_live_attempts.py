@@ -707,9 +707,9 @@ def api_unreachable(ctx: VariantContext) -> dict[str, Any]:
     """
 
     cluster_id = ctx.settings.regional.cluster_id
-    watcher = isolation.watcher_pod(ctx.regional)
-    host, port = isolation.control_plane_endpoint(ctx.regional)
     job = _job(ctx, "gl28au-" + _suffix(ctx), "trigger:1", restart_budget=1)
+    watcher = _watcher_singleton(ctx)
+    host, port = isolation.control_plane_endpoint(ctx.regional)
     running = _wait_running_observed(ctx, job)
     block = isolation.HostNetworkIsolation(
         ctx,
@@ -790,6 +790,23 @@ def api_unreachable(ctx: VariantContext) -> dict[str, Any]:
             "decision": decision.get("status"),
         },
     )
+
+
+def _watcher_singleton(ctx: VariantContext) -> dict[str, Any]:
+    """The one Ready completion-watcher Pod, looked up after the job started.
+
+    Every managed-job variant's first cluster mutation is its job (the prewarm
+    Pod or the PyTorchJob pinned to ``--fault-node``; test_general_live_
+    managed_job_start pins it), so the watcher is discovered afterwards. By
+    then a job exists: a watcher that is not a Ready singleton is a fixture
+    failure (INCONCLUSIVE, the job cleaned up), not a NOT_RUN before any
+    mutation.
+    """
+
+    try:
+        return isolation.watcher_pod(ctx.regional)
+    except VariantNotRun as exc:
+        raise RegionalFixtureError(exc.detail) from exc
 
 
 def _wait_running_observed(ctx: VariantContext, job: ManagedFailJob) -> dict[str, Any]:
@@ -1041,8 +1058,8 @@ def worker_restart(ctx: VariantContext) -> dict[str, Any]:
     restart attempt observed, no notification twice.
     """
 
-    isolation.watcher_pod(ctx.regional)
     job = _job(ctx, "gl29wr-" + _suffix(ctx), "exit:1", restart_budget=1)
+    _watcher_singleton(ctx)
     opened = watcher_restart.wait_open_claim(
         ctx,
         lambda: _records(ctx, job),

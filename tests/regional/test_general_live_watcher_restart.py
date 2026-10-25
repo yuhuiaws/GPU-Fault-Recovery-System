@@ -512,8 +512,31 @@ def _variant(
         store.phase = "closed"
 
     cluster.on_delete = on_delete
+    original = cluster.kubectl
+
+    def guarded(plane: str, arguments: tuple[str, ...], options: dict[str, Any]) -> str:
+        if arguments[:2] == ("get", "pod"):
+            # The job is every managed-job variant's first mutation
+            # (test_general_live_managed_job_start); the watcher comes after.
+            assert FakeFailJob.instances, "the watcher was looked up before the job"
+        return original(plane, arguments, options)
+
+    cluster.kubectl = guarded  # type: ignore[method-assign]
     ctx = _context(tmp_path, Regional(cluster, cpu_python=store.respond))
     return ctx
+
+
+def test_a_missing_watcher_after_the_job_started_is_a_fixture_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    store, cluster = Store(), Cluster()
+    cluster.pods = []
+    ctx = _variant(tmp_path, monkeypatch, store, cluster)
+    with pytest.raises(RegionalFixtureError, match="exactly one Ready"):
+        ctx.spec.execute(ctx)
+    (job,) = FakeFailJob.instances
+    assert ctx.cleanup.pending() == [f"job-{job.name}"], "the job's undo is registered"
+    assert cluster.deletes == [], "nothing is deleted without a watcher"
 
 
 def test_worker_restart_passes_when_the_claim_survives_the_replacement(

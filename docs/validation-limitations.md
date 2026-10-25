@@ -1649,6 +1649,14 @@ a coverage heartbeat follows from the replacement. The module tests drive the
 sequence over fakes (a phase-driven store, an inventory that flips on the fenced
 delete); the live run is the only proof of the real outbox replay.
 
+Both watcher variants start their managed job first -- every managed-job
+variant's first cluster mutation is the job pinned to `--fault-node` (the
+prewarm Pod or the PyTorchJob) -- and discover the completion-watcher Pod and
+the control-plane endpoint afterwards. A watcher that is then not a Ready
+singleton (none, two during a rollout, hostNetwork) is a fixture failure --
+INCONCLUSIVE, the job cleaned up -- rather than a NOT_RUN, because a mutation
+has already happened; the read-only `--plan` does not check the watcher.
+
 ## GF-GENERAL-LIVE live acceptance runner (phase 2)
 
 Phase 2 adds the workload- and spare-centred categories through

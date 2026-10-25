@@ -22,6 +22,7 @@ from scripts.e2e.regional import general_live_network_isolation as iso
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive
 from scripts.e2e.regional.general_live_registry import APPROVALS
 from scripts.e2e.regional.general_live_store import ATTEMPT_PROBE
+from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from tests.regional._general_live_fakes import FakeProbe
 from tests.regional._general_live_isolation_fakes import (
     NODE,
@@ -179,14 +180,23 @@ def _store(phases: Phases, job_name: str) -> Any:
     return respond
 
 
-def _variant_context(tmp_path: Path, phases: Phases, monkeypatch: pytest.MonkeyPatch):
+def _variant_context(
+    tmp_path: Path,
+    phases: Phases,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    inventory: dict[str, Any] | None = None,
+):
     FakeFailJob.instances = []
     FakeFailJob.phases = phases
     monkeypatch.setattr(att, "ManagedFailJob", FakeFailJob)
-    inventory = watcher_items({})
+    inventory = watcher_items({}) if inventory is None else inventory
 
     def kubectl(plane: str, arguments: tuple[str, ...], _options: Any) -> str:
         if arguments[:2] == ("get", "pod"):
+            # The job is every managed-job variant's first mutation
+            # (test_general_live_managed_job_start); the watcher comes after.
+            assert FakeFailJob.instances, "the watcher was looked up before the job"
             return json.dumps(inventory)
         if arguments[:2] == ("get", "secret"):
             return base64.b64encode(b"https://cp.example.internal/").decode()
@@ -218,6 +228,19 @@ def _variant_context(tmp_path: Path, phases: Phases, monkeypatch: pytest.MonkeyP
         tmp_path, regional, probes={f"isolation@{WATCHER_NODE}": fake}
     )
     return ctx, fake
+
+
+def test_a_missing_watcher_after_the_job_started_is_a_fixture_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    ctx, fake = _variant_context(
+        tmp_path, Phases(), monkeypatch, inventory={"items": []}
+    )
+    with pytest.raises(RegionalFixtureError, match="exactly one Ready"):
+        ctx.spec.execute(ctx)
+    (job,) = FakeFailJob.instances
+    assert ctx.cleanup.pending() == [f"job-{job.name}"], "the job's undo is registered"
+    assert fake.calls == [], "no block is attempted without a watcher"
 
 
 def test_api_unreachable_passes_when_every_action_happens_once(
@@ -347,7 +370,8 @@ def test_trigger_mode_renders_a_file_gated_exit_with_its_code() -> None:
     assert att.EXIT_TRIGGER_PATH.startswith("/tmp/"), (
         "the trigger lives in the container's /tmp"
     )
-    assert set(att.MODE_COMMANDS) == {"exit", "stop", "hang", "trigger"}
+    # Other lanes add modes of their own (029 exit_once); these four are ours.
+    assert {"exit", "stop", "hang", "trigger"} <= set(att.MODE_COMMANDS)
 
 
 def test_the_approval_tokens_describe_the_scoped_blocks() -> None:
