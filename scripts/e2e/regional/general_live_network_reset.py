@@ -464,19 +464,20 @@ def _recreate(ctx: VariantContext) -> dict[str, Any]:
     return recreated
 
 
-def counter_reset(ctx: VariantContext) -> dict[str, Any]:
-    """The drop interface is deleted and recreated between ticks: its counters
-    fall below the collector's baseline (see the module docstring)."""
+def _burst_phase(
+    ctx: VariantContext,
+    started: datetime,
+    a: str,
+    b: str,
+    oracle: Oracle,
+    *,
+    budget: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], datetime]:
+    """The first burst: the oracle sees the pair's counters rise, the product
+    ships the burst's edge and then its recovered zero. Returns the positive
+    samples, the zeros and the moment of the first zero (the signal is clear
+    from there, so the recreate cannot fall inside an active window)."""
 
-    net = _network()
-    created = net._veth(ctx)
-    a, b = str(created["a"]), str(created["b"])
-    net._declare_required(ctx, a, b)
-    ctx.hold(ctx.host_interval * 3, name="healthy-samples")
-    started = utc_now()
-    budget = edge_budget(ctx)
-    oracle = Oracle(ctx, "net")
-    oracle.start(oracle_seconds(ctx), interval=5, netdev=[a, b])
     _burst(ctx, BURST_SECONDS, "reset-burst")
     await_oracle_crossing(
         ctx,
@@ -524,26 +525,49 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
             f"{edge_at.isoformat()}; the signal state before the recreate is unknown"
         )
     zero_at = min(_moment(item["observed_at"]) or edge_at for item in zeros)
-    reset_at = utc_now()
-    recreated = _recreate(ctx)
+    return positives, zeros, zero_at
+
+
+def _anchor(
+    ctx: VariantContext,
+    recreated: dict[str, Any],
+    *,
+    reset_at: datetime,
+    zero_at: datetime,
+) -> tuple[datetime, float]:
+    """Where the product's post-recreate batches start, and where the oracle's do.
+
+    The reset tick postdates the recreate on the node's clock; a tick that
+    started just before the add and read the pair just after it is stamped up
+    to one interval earlier. Nothing between the burst's zero and the recreate
+    is stored, so the anchor loses nothing by reaching back. The oracle's own
+    samples split at the recreate itself: a pre-recreate sample inside the
+    reach-back still shows the old counters.
+    """
+
     node_clock = _moment(recreated.get("recreated_at"))
-    # The reset tick postdates the recreate on the node's clock; a tick that
-    # started just before the add and read the pair just after it is stamped
-    # up to one interval earlier. Nothing between the burst's zero and the
-    # recreate is stored, so the anchor loses nothing by reaching back.
     if node_clock is not None:
         anchor = max(zero_at, node_clock - timedelta(seconds=ctx.host_interval))
     else:
         anchor = max(zero_at, reset_at - timedelta(seconds=CLOCK_TOLERANCE_SECONDS))
-    # The oracle's own samples split at the recreate itself: a pre-recreate
-    # sample inside the anchor's reach-back still shows the old counters.
-    recreate_epoch = (node_clock or reset_at).timestamp()
-    waited = _await_reset(ctx, started, a, b, anchor=anchor, budget=budget)
-    straddled = link_down_incidents(waited, a, b)
-    if straddled:
-        raise _straddled(
-            ctx, straddled, a=a, b=b, since=reset_at, gap_ms=recreated.get("gap_ms")
-        )
+    return anchor, (node_clock or reset_at).timestamp()
+
+
+def _ramp_phase(
+    ctx: VariantContext,
+    started: datetime,
+    a: str,
+    b: str,
+    oracle: Oracle,
+    *,
+    anchor: datetime,
+    recreate_epoch: float,
+    budget: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """The second burst on the recreated pair: the oracle sees the new
+    counters rise, the product ships a positive delta from the new baseline
+    and, once the burst ended, a zero."""
+
     _burst(ctx, RAMP_SECONDS, "reset-ramp")
     await_oracle_crossing(
         ctx,
@@ -552,7 +576,9 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
         lambda values: len(values) >= 2 and values[-1] > values[0],
         timeout_seconds=RAMP_BUDGET_SECONDS,
         name="reset-ramp-ramp",
-        condition=f"the generator did not move the drop counters of the recreated {a}/{b}",
+        condition=(
+            f"the generator did not move the drop counters of the recreated {a}/{b}"
+        ),
     )
     _, rearmed = _await_samples(
         ctx,
@@ -576,6 +602,62 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
             budget=budget,
             name="reset-rearmed-quiet",
         )
+    return rearmed, zeros_after
+
+
+def _reset_unknown(
+    a: str, evidence: dict[str, list[Any]], delivery: dict[str, Any] | None
+) -> list[str]:
+    """The ``reset_unknown`` stage: the reset tick named, or what came instead."""
+
+    if evidence["errors"]:
+        return []
+    if evidence["readings"]:
+        return [
+            f"no _network collection error names a {a} counter reset with 'delta "
+            f"unknown' while {len(evidence['readings'])} {RESET_METRIC} reading(s) "
+            f"were shipped after the recreate: the old clamp"
+        ]
+    return [
+        f"the product accepted host batches after the recreate (last success "
+        f"{(delivery or {}).get('last_success_at')}) but recorded neither a reset "
+        f"error nor a {RESET_METRIC} reading for {a}"
+    ]
+
+
+def counter_reset(ctx: VariantContext) -> dict[str, Any]:
+    """The drop interface is deleted and recreated between ticks: its counters
+    fall below the collector's baseline (see the module docstring)."""
+
+    net = _network()
+    created = net._veth(ctx)
+    a, b = str(created["a"]), str(created["b"])
+    net._declare_required(ctx, a, b)
+    ctx.hold(ctx.host_interval * 3, name="healthy-samples")
+    started = utc_now()
+    budget = edge_budget(ctx)
+    oracle = Oracle(ctx, "net")
+    oracle.start(oracle_seconds(ctx), interval=5, netdev=[a, b])
+    positives, zeros, zero_at = _burst_phase(ctx, started, a, b, oracle, budget=budget)
+    reset_at = utc_now()
+    recreated = _recreate(ctx)
+    anchor, recreate_epoch = _anchor(ctx, recreated, reset_at=reset_at, zero_at=zero_at)
+    waited = _await_reset(ctx, started, a, b, anchor=anchor, budget=budget)
+    straddled = link_down_incidents(waited, a, b)
+    if straddled:
+        raise _straddled(
+            ctx, straddled, a=a, b=b, since=reset_at, gap_ms=recreated.get("gap_ms")
+        )
+    rearmed, zeros_after = _ramp_phase(
+        ctx,
+        started,
+        a,
+        b,
+        oracle,
+        anchor=anchor,
+        recreate_epoch=recreate_epoch,
+        budget=budget,
+    )
     observed = activity(ctx, started, metrics={RESET_METRIC, LINK_METRIC})
     evidence = reset_evidence(observed, a, anchor)
     delivery = host_delivery_after(observed, anchor)
@@ -605,27 +687,14 @@ def counter_reset(ctx: VariantContext) -> dict[str, Any]:
     close_window(ctx)
     ctx.cleanup.discard("collector-window")
     if not evidence["errors"] and not evidence["readings"] and delivery is None:
+        before = host_delivery_after(observed, started) or {}
         raise VariantInconclusive(
-            f"the host collector delivered nothing after the recreate within the "
-            f"waits (last success before it: {(host_delivery_after(observed, started) or {}).get('last_success_at') or 'none'}); "
+            "the host collector delivered nothing after the recreate within the "
+            f"waits (last success before it: {before.get('last_success_at') or 'none'}); "
             f"a silent channel cannot show how the recreated {a} was read"
         )
-    if evidence["errors"]:
-        reset_unknown: list[str] = []
-    elif evidence["readings"]:
-        reset_unknown = [
-            f"no _network collection error names a {a} counter reset with 'delta "
-            f"unknown' while {len(evidence['readings'])} {RESET_METRIC} reading(s) "
-            f"were shipped after the recreate: the old clamp"
-        ]
-    else:
-        reset_unknown = [
-            f"the product accepted host batches after the recreate (last success "
-            f"{(delivery or {}).get('last_success_at')}) but recorded neither a reset "
-            f"error nor a {RESET_METRIC} reading for {a}"
-        ]
     stages = {
-        "reset_unknown": reset_unknown,
+        "reset_unknown": _reset_unknown(a, evidence, delivery),
         "no_reading_in_reset_tick": [
             f"{RESET_METRIC}={item.get('value')} shipped for {a} in the reset tick "
             f"(observed {item.get('observed_at')})"

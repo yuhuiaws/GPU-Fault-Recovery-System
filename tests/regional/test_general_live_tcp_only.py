@@ -574,7 +574,9 @@ def test_passes_on_the_collector_status_witness_alone(tmp_path: Path) -> None:
     assert sources(result) == ["collector_status"]
     witness = result["witnesses"]["confirmed"][0]
     assert witness["observed_at"] == at(90) and witness["oracle_retransmits"] == 50.0
-    assert witness["batch_id"].startswith(f"host-{NODE}-")
+    assert witness["batch_id"].startswith(f"host-{NODE}-"), (
+        "the node's host collector, not the control plane's allocatable reader"
+    )
     assert result["product_retransmits"] == [], "no raw evidence was needed"
 
 
