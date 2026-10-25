@@ -51,6 +51,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import time
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
@@ -93,6 +94,15 @@ TOOLS = tuple(wrapper.TOOLS)
 DEFAULT_PLAN_SECONDS = 3600
 
 
+#: ``bounded_exposure_seconds``: close the window this many host collector
+#: intervals after it opened. open-window restarts the unit right after arming
+#: the deadman; the collector's first tick follows within a few seconds, the
+#: next every interval. 1.7 intervals is after the second tick (its start plus
+#: duration stays under 0.7 interval) and before the third (two intervals): the
+#: reading is confirmed on exactly two ticks, never seen on a third.
+EXPOSURE_INTERVALS = 1.7
+
+
 class HostSourceReplayError(RuntimeError):
     """A refused or malformed replay request (never a cluster error)."""
 
@@ -123,6 +133,24 @@ def command_plan(
         )
     except wrapper.PlanError as error:
         raise HostSourceReplayError(f"{tool} plan rejected: {error}") from error
+
+
+def bounded_exposure_seconds(interval: int) -> int:
+    """How long a replaced reading may stay visible so the host collector reads
+    it on exactly two ticks and never on a third.
+
+    The inventory rules confirm a shortfall on two consecutive samples; the
+    diagnostic chain they open judges the *fresh* readings observed after it
+    reached VALIDATE_FABRIC (``adapters/gpu_validation.py``, batch 175), and a
+    fresh reading still showing the fault is the designed escalation --
+    REBOOT_NODE for a LINK_INACTIVE port. A window the deadman closes at
+    :data:`EXPOSURE_INTERVALS` intervals (the unit restarts, the real tree is
+    read again) gives the detection its two ticks and the diagnostic only
+    restored readings, whatever the runner's own polling latency.
+    """
+
+    seconds = max(int(interval), 1) * EXPOSURE_INTERVALS
+    return max(probe.MIN_RESTORE_SECONDS, math.ceil(seconds))
 
 
 def legacy_bind(dest: str) -> bool:
@@ -730,6 +758,7 @@ def kernel_collector_source_replay(ctx: VariantContext) -> HostSourceReplay:
 
 __all__ = [
     "DEFAULT_PLAN_SECONDS",
+    "EXPOSURE_INTERVALS",
     "HOST_SOURCE_REPLAY",
     "HOST_UNIT",
     "INFINIBAND_TREE",
@@ -745,6 +774,7 @@ __all__ = [
     "UNIT_TOKENS",
     "HostSourceReplay",
     "HostSourceReplayError",
+    "bounded_exposure_seconds",
     "command_plan",
     "host_source_replay",
     "kernel_collector_source_replay",

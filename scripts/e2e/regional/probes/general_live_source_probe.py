@@ -141,7 +141,11 @@ MEMINFO_FIELDS = ("MemFree", "MemAvailable", "SwapTotal", "SwapFree")
 MEMINFO_FIXTURE = "meminfo"
 MAX_MEMINFO_KB = 1 << 50
 WINDOW_MODES = ("bind", "pci-root", "command", "tree", "mixed")
-MIN_RESTORE_SECONDS = 60
+#: The deadman's bounds. The floor admits a bounded exposure of one or two
+#: host collector ticks (``general_live_source_replay.bounded_exposure_seconds``:
+#: 1.7 intervals, 26 s at the default 15 s), which is how a replayed inactive
+#: port is confirmed on two ticks and never read on a third.
+MIN_RESTORE_SECONDS = 20
 MAX_RESTORE_SECONDS = 5400
 MAX_TREE_DEVICES = 64
 MAX_AUDIT_LINES = 400

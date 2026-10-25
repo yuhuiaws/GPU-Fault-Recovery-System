@@ -89,6 +89,9 @@ UNSUPPORTED_METRIC = "efa_ethtool_counters_unsupported"
 ERRORS_METRIC = "rdma_errors_delta"
 LINK_METRIC = "rdma_link_down"
 INVENTORY_METRIC = "efa_inventory_mismatch"
+#: The shortfall count behind an inventory mismatch; a reading >= 1 after a
+#: restore means the replayed inactive port was still being read.
+MISSING_METRIC = "efa_inventory_missing_count"
 LINK_DOWN_TEXT = "1: DOWN"
 FAILED_STDERR = "Cannot get device statistics: Input/output error"
 STEP = 5000
@@ -336,8 +339,21 @@ class EfaSourceFixture:
             "ethtool", command_plan("ethtool", rules, not_after_seconds=PLAN_SECONDS)
         )
 
-    def open(self) -> dict[str, Any]:
-        restore = min(5400, max(60, self.ctx.spec.max_minutes * 60 + 300))
+    def open(self, *, restore_seconds: int | None = None) -> dict[str, Any]:
+        """Open the window; its deadman fires after ``restore_seconds``.
+
+        The default outlasts the variant. A variant whose replaced reading must
+        be seen on exactly two collector ticks and never a third (010
+        ``link_inactive``: a fresh inactive port is the diagnostic's designed
+        REBOOT_NODE) passes ``general_live_source_replay.bounded_exposure_seconds``
+        and lets the deadman be the restore.
+        """
+
+        restore = (
+            min(5400, max(60, self.ctx.spec.max_minutes * 60 + 300))
+            if restore_seconds is None
+            else int(restore_seconds)
+        )
         self.opened = self.replay.open_window(
             binds=self.binds,
             trees=self.trees,
@@ -556,6 +572,7 @@ __all__ = [
     "INVENTORY_METRIC",
     "LINK_DOWN_TEXT",
     "LINK_METRIC",
+    "MISSING_METRIC",
     "PROOF_SCOPE",
     "RAMP_STEP",
     "RDMA_COUNTERS",

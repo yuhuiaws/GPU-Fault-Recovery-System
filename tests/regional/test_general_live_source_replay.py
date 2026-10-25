@@ -870,3 +870,20 @@ def test_snapshot_and_recreate_after_a_reboot(tmp_path: Path) -> None:
     controller.build_pci(efa_count=16)
     installs = [call for call in fake.calls if call[0] == "install-source"]
     assert len(installs) == 2, "the builders are shipped again after the reboot"
+
+
+def test_bounded_exposure_is_after_two_ticks_and_before_a_third() -> None:
+    """The deadman as the restore: the collector reads the replaced value on its
+    second tick and never on a third, whatever the runner's polling latency."""
+
+    for interval in (15, 30, 60):
+        exposure = helper.bounded_exposure_seconds(interval)
+        assert interval + 0.7 * interval <= exposure < 2 * interval, (
+            interval,
+            exposure,
+        )
+    assert helper.bounded_exposure_seconds(15) == 26, "the site's 15 s ticks"
+    assert helper.bounded_exposure_seconds(5) == probe.MIN_RESTORE_SECONDS, (
+        "never below the deadman floor"
+    )
+    assert probe.MIN_RESTORE_SECONDS == 20, "the floor admits the 15 s exposure"
