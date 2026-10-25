@@ -132,6 +132,11 @@ def age_out_vanished_device_signals(
     stale_after = policy.device_signal_age_out_seconds
     if stale_after <= 0 or batch.producer != "node":
         return []
+    # A store without the reader (a narrow double) ages nothing out, like the
+    # retention sweep's evidence readers.
+    stale_states = getattr(policy.store, "stale_health_signal_states", None)
+    if stale_states is None:
+        return []
     window = timedelta(seconds=stale_after)
     prefix = f"{batch.cluster_id}/{batch.node_id}/"
     claimed = {signal_key for signal_key, *_ in transitions}
@@ -140,7 +145,7 @@ def age_out_vanished_device_signals(
     cleared: list[Transition] = []
     # Inclusive: a device last heard from exactly one window ago has been
     # missing for the window (the store's bound is exclusive, like retention's).
-    for state in policy.store.stale_health_signal_states(
+    for state in stale_states(
         prefix, stale_before=received - window + timedelta(microseconds=1)
     ):
         if (
