@@ -18,6 +18,10 @@ from scripts.e2e.regional.general_live_common import (
     await_metric_recovery,
     Oracle,
     activity,
+    await_oracle_crossing,
+    cadence_record,
+    sustained_detection_budget,
+    sustained_negative_window,
     wait_for_incident,
     wait_settled,
 )
@@ -48,12 +52,42 @@ from scripts.e2e.regional.general_live_verdicts import (
 CASE = "GF-GENERAL-LIVE-001"
 CPU_THRESHOLD = 98.0
 LOAD_THRESHOLD = 2.0
+#: ``host_health.py`` HOST_RESOURCE_SUSTAIN_SECONDS, the minimum active time of
+#: the cpu_usage_percent and load1_per_cpu rules.
 SUSTAIN_SECONDS = 120
-#: window + summary + a few ticks: detection lands on the next delivered sample
-#: after the sustain window, up to one health-summary period later.
-DETECTION_BUDGET = SUSTAIN_SECONDS + 300 + 90
-NEGATIVE_WINDOW = SUSTAIN_SECONDS + 420
 SHORT_BURST_SECONDS = 60
+#: How long the SCHED_IDLE busy loop may take to read >= 98 % on the oracle: a
+#: few collector ticks on a node whose real workload leaves the idle class room.
+CPU_RAMP_BUDGET = 120
+#: load1 is a one-minute exponential average: 2.1 x vCPU runnable threads reach
+#: 2.0 per CPU after about 60 x ln(21) = 183 s; the budget leaves room for the
+#: threads to be scheduled and for a busy node's slower convergence.
+LOAD_RAMP_BUDGET = 600
+
+
+def detection_budget(ctx: VariantContext) -> int:
+    """The detection budget from the oracle's crossing, on the product's cadence.
+
+    The host collector ships ``threshold:cpu_usage_percent`` /
+    ``threshold:load1_per_cpu`` once, as the crossing's edge, then only on its
+    health summaries; the finding is minted on the first later active sample at
+    least 120 s after the first (up to the sustain plus one summary after the
+    edge) and VALIDATE_HOST is judged on one more summary: 120 s + 2 x
+    GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS + GPU_FAULT_HOST_INTERVAL_SECONDS +
+    the chain margin (915 s on a 300-s/15-s site). The 510-s budget before it
+    (120 + 300 + 90, counted from the load's start) left no room for the
+    validation's summary while the load was still held.
+    """
+
+    return sustained_detection_budget(ctx, SUSTAIN_SECONDS)
+
+
+def quiet_window(ctx: VariantContext) -> int:
+    """The negative watch after a burst shorter than the sustain ended: the
+    sustain plus one health summary plus a collector interval and the margin
+    (615 s on a 300-s/15-s site)."""
+
+    return sustained_negative_window(ctx, SUSTAIN_SECONDS)
 
 
 def _oracle_busy_each_tick(oracle: Oracle, minimum: int) -> None:
@@ -68,15 +102,67 @@ def _oracle_busy_each_tick(oracle: Oracle, minimum: int) -> None:
         )
 
 
-def _run_cpu_load(ctx: VariantContext, threads: int, hold_seconds: int) -> Oracle:
+def _run_cpu_load(
+    ctx: VariantContext,
+    threads: int,
+    hold_seconds: int,
+    *,
+    ramp_seconds: int,
+    budget_seconds: int,
+) -> Oracle:
+    """Start the oracle and the load; ``cpu-start.json`` records the budgets.
+
+    The load and the oracle outlive the ramp, the detection budget and the
+    chain's grading: VALIDATE_HOST must still find the node loaded.
+    """
+
     oracle = Oracle(ctx, "cpu")
     oracle.start(hold_seconds + 60, interval=5, cpu=True, loadavg=True)
     started = ctx.node(
         "cpu-start", "--threads", str(threads), "--seconds", str(hold_seconds)
     )
     ctx.cleanup.push("cpu-load", lambda: ctx.node("cpu-stop"))
-    ctx.evidence.write("cpu-start", started)
+    ctx.evidence.write(
+        "cpu-start",
+        {
+            **started,
+            **cadence_record(
+                ctx,
+                sustain_seconds=SUSTAIN_SECONDS,
+                detection_budget_seconds=budget_seconds,
+                ramp_budget_seconds=ramp_seconds,
+            ),
+        },
+    )
     return oracle
+
+
+def _await_cpu_crossing(ctx: VariantContext, oracle: Oracle) -> None:
+    """Detection is timed from the oracle's first >= 98 % reading."""
+
+    await_oracle_crossing(
+        ctx,
+        oracle,
+        lambda record: record.get("cpu_busy_percent"),
+        lambda values: bool(values) and values[-1] >= CPU_THRESHOLD,
+        timeout_seconds=CPU_RAMP_BUDGET,
+        name="cpu-ramp",
+        condition=f"the load did not bring cpu_busy_percent to {CPU_THRESHOLD:g} %",
+    )
+
+
+def _await_load_crossing(ctx: VariantContext, oracle: Oracle) -> None:
+    """Detection is timed from the oracle's first load1_per_cpu >= 2.0."""
+
+    await_oracle_crossing(
+        ctx,
+        oracle,
+        lambda record: record.get("load1_per_cpu"),
+        lambda values: bool(values) and values[-1] >= LOAD_THRESHOLD,
+        timeout_seconds=LOAD_RAMP_BUDGET,
+        name="load-ramp",
+        condition=f"the threads did not bring load1_per_cpu to {LOAD_THRESHOLD:g}",
+    )
 
 
 def cpu_busy(ctx: VariantContext) -> dict[str, Any]:
@@ -86,46 +172,29 @@ def cpu_busy(ctx: VariantContext) -> dict[str, Any]:
     if cpus < 1:
         raise VariantInconclusive("the node reports no CPUs")
     started_at = utc_now()
-    # Hold long enough for the finding, the workflow and its VALIDATE_HOST to run.
-    hold = DETECTION_BUDGET + 240
-    oracle = _run_cpu_load(ctx, cpus, hold)
+    budget = detection_budget(ctx)
+    hold = CPU_RAMP_BUDGET + budget + 240
+    oracle = _run_cpu_load(
+        ctx, cpus, hold, ramp_seconds=CPU_RAMP_BUDGET, budget_seconds=budget
+    )
+    _await_cpu_crossing(ctx, oracle)
+    # One wait for the finding and its VALIDATE_HOST to be judgeable: the
+    # validation waits for evidence newer than itself (one more summary), and
+    # the load is still held through the whole budget.
     detection = wait_for_incident(
         ctx,
         started_at,
         "cpu_usage_percent",
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=budget,
         metrics={"cpu_usage_percent", "load1_per_cpu"},
+        validation="VALIDATE_HOST",
         name="cpu-detection",
     )
     _oracle_busy_each_tick(oracle, minimum=SUSTAIN_SECONDS // 5)
     incidents = finding_incidents(detection, "cpu_usage_percent")
-
-    def validated() -> dict[str, Any] | None:
-        current = activity(ctx, started_at, metrics={"cpu_usage_percent"})
-        workflows = [
-            item
-            for inc in finding_incidents(current, "cpu_usage_percent")
-            for item in current.get("workflows") or []
-            if item.get("incident_id") == inc["incident_id"]
-        ]
-        for workflow in workflows:
-            if any(
-                step.get("operation") == "VALIDATE_HOST"
-                and step.get("status") in {"SUCCEEDED", "FAILED"}
-                for step in workflow.get("step_executions") or []
-            ):
-                return current
-        return None
-
-    observed = ctx.wait_until(
-        validated,
-        timeout_seconds=DETECTION_BUDGET,
-        poll_seconds=20,
-        name="cpu-validate",
-    ) or activity(ctx, started_at, metrics={"cpu_usage_percent"})
     stages = {
         "chain": chain_errors(
-            observed,
+            detection,
             ChainExpectation(
                 metric="cpu_usage_percent",
                 operations=("FREEZE_EVIDENCE", "VALIDATE_HOST"),
@@ -135,7 +204,7 @@ def cpu_busy(ctx: VariantContext) -> dict[str, Any]:
                 incident_states=DIAGNOSTIC_ONLY_STATES,
             ),
         ),
-        "hardware": hardware_errors(observed),
+        "hardware": hardware_errors(detection),
     }
     stopped_at = utc_now()
     ctx.node("cpu-stop")
@@ -146,7 +215,7 @@ def cpu_busy(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started_at,
         [item["incident_id"] for item in incidents],
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=budget,
         metrics={"cpu_usage_percent"},
         name="cpu-settled",
     )
@@ -170,14 +239,19 @@ def load_average(ctx: VariantContext) -> dict[str, Any]:
         raise VariantInconclusive("the node reports no CPUs")
     threads = int(cpus * 2.1) + 1
     started_at = utc_now()
-    # load1 converges over ~5 minutes; hold past that plus the sustain + summary.
-    hold = DETECTION_BUDGET + 420
-    oracle = _run_cpu_load(ctx, threads, hold)
+    budget = detection_budget(ctx)
+    # load1 converges over minutes (LOAD_RAMP_BUDGET); detection is timed from
+    # the oracle's crossing and the load is held through the whole budget.
+    hold = LOAD_RAMP_BUDGET + budget + 240
+    oracle = _run_cpu_load(
+        ctx, threads, hold, ramp_seconds=LOAD_RAMP_BUDGET, budget_seconds=budget
+    )
+    _await_load_crossing(ctx, oracle)
     detection = wait_for_incident(
         ctx,
         started_at,
         "load1_per_cpu",
-        timeout_seconds=hold,
+        timeout_seconds=budget,
         metrics={"cpu_usage_percent", "load1_per_cpu"},
         validation="VALIDATE_HOST",
         name="load-detection",
@@ -214,7 +288,7 @@ def load_average(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started_at,
         [item["incident_id"] for item in incidents],
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=budget,
         metrics={"load1_per_cpu"},
         name="load-settled",
     )
@@ -248,18 +322,25 @@ def short_burst(ctx: VariantContext) -> dict[str, Any]:
         raise VariantInconclusive(
             f"the burst never reached {CPU_THRESHOLD}%: {values[-6:]}"
         )
-    # A burst shorter than the sustain window must mint no finding across a long
-    # negative window; a below-threshold sample also produces a recovered batch.
-    observed = _watch_for_no_finding(
-        ctx, started_at, "cpu_usage_percent", NEGATIVE_WINDOW
-    )
+    # A burst shorter than the sustain window must mint no finding; the burst's
+    # end is a recovered edge, and the watch outlasts the sustain plus the next
+    # health summary (the only later batch that could carry an active sample).
+    window = quiet_window(ctx)
+    observed = _watch_for_no_finding(ctx, started_at, "cpu_usage_percent", window)
     stages = {
         "no_finding": chain_errors(
             observed, ChainExpectation(metric="cpu_usage_percent", present=False)
         ),
         "hardware": hardware_errors(observed),
     }
-    return _result(stages, extra={"negative_window_seconds": NEGATIVE_WINDOW})
+    return _result(
+        stages,
+        extra={
+            "negative_window_seconds": window,
+            "host_summary_seconds": ctx.host_summary,
+            "host_interval_seconds": ctx.host_interval,
+        },
+    )
 
 
 def recovery(ctx: VariantContext) -> dict[str, Any]:
@@ -269,13 +350,17 @@ def recovery(ctx: VariantContext) -> dict[str, Any]:
     require_tools(survey, "systemd-run")
     cpus = int(survey.get("cpu_count") or 0)
     started_at = utc_now()
-    hold = DETECTION_BUDGET + 60
-    oracle = _run_cpu_load(ctx, cpus, hold)
+    budget = detection_budget(ctx)
+    hold = CPU_RAMP_BUDGET + budget + 60
+    oracle = _run_cpu_load(
+        ctx, cpus, hold, ramp_seconds=CPU_RAMP_BUDGET, budget_seconds=budget
+    )
+    _await_cpu_crossing(ctx, oracle)
     detection = wait_for_incident(
         ctx,
         started_at,
         "cpu_usage_percent",
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=budget,
         metrics={"cpu_usage_percent"},
         name="recovery-detection",
     )
@@ -289,7 +374,7 @@ def recovery(ctx: VariantContext) -> dict[str, Any]:
         ctx,
         started_at,
         [item["incident_id"] for item in incidents],
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=budget,
         metrics={"cpu_usage_percent"},
         name="recovery-settled",
     )
@@ -316,13 +401,17 @@ def checkpoint_phase(ctx: VariantContext) -> dict[str, Any]:
     require_tools(survey, "systemd-run")
     cpus = int(survey.get("cpu_count") or 0)
     started_at = utc_now()
-    hold = DETECTION_BUDGET + 120
-    oracle = _run_cpu_load(ctx, cpus, hold)
+    budget = detection_budget(ctx)
+    hold = CPU_RAMP_BUDGET + budget + 120
+    oracle = _run_cpu_load(
+        ctx, cpus, hold, ramp_seconds=CPU_RAMP_BUDGET, budget_seconds=budget
+    )
+    _await_cpu_crossing(ctx, oracle)
     detection = wait_for_incident(
         ctx,
         started_at,
         "cpu_usage_percent",
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=budget,
         metrics={"cpu_usage_percent"},
         validation="VALIDATE_HOST",
         name="checkpoint-detection",
@@ -468,9 +557,12 @@ def invalid_delta(ctx: VariantContext) -> dict[str, Any]:
         source="proc-stat",
     )
     # Let the collector poll the static file past its baseline, then confirm no
-    # busy sample and no finding across a negative window.
+    # busy sample and no finding across a negative window that covers at least
+    # one health summary (the batch that would carry a sample if one existed).
     ctx.hold(ctx.host_interval * 4 + 30, name="static-delta")
-    observed = _watch_for_no_finding(ctx, started, "cpu_usage_percent", NEGATIVE_WINDOW)
+    observed = _watch_for_no_finding(
+        ctx, started, "cpu_usage_percent", quiet_window(ctx)
+    )
     cpu_samples = samples(observed, "cpu_usage_percent")
     stages = {
         "no_busy_sample": (
@@ -502,10 +594,17 @@ VARIANTS = [
         lanes=("eks", "hp"),
         risk="L",
         flags="S",
-        injection="SCHED_IDLE busy loop on every vCPU for ~15 min (transient unit, deadman)",
-        expected="cpu_usage_percent >= 98 for 120 s -> VALIDATE_HOST probe fails while loaded; no reset/reboot/DRAIN",
+        injection=(
+            "SCHED_IDLE busy loop on every vCPU for the ramp plus the cadence budget "
+            "(~21 min on a 300-s summary cadence; transient unit, deadman)"
+        ),
+        expected=(
+            "cpu_usage_percent >= 98 for 120 s -> VALIDATE_HOST probe fails while "
+            "loaded; no reset/reboot/DRAIN; detection timed from the oracle's "
+            "crossing over two host health summaries"
+        ),
         cleanup="stop the load; 2 fresh samples below 98 %",
-        max_minutes=20,
+        max_minutes=35,
         execute=cpu_busy,
     ),
     VariantSpec(
@@ -515,10 +614,13 @@ VARIANTS = [
         lanes=("eks", "hp"),
         risk="L",
         flags="S",
-        injection="2.1x vCPU runnable SCHED_IDLE threads held until load1 converges",
+        injection=(
+            "2.1x vCPU runnable SCHED_IDLE threads held until load1 converges, then "
+            "through the cadence budget timed from the oracle's crossing"
+        ),
         expected="load1_per_cpu >= 2.0 -> VALIDATE_HOST probe on load1_per_cpu; cpu_busy co-fires as its own signal",
         cleanup="stop the load; fresh samples below 2.0",
-        max_minutes=25,
+        max_minutes=45,
         execute=load_average,
     ),
     VariantSpec(
@@ -529,9 +631,12 @@ VARIANTS = [
         risk="L",
         flags="S",
         injection="busy for 60 s (< the 120 s sustain), then stop",
-        expected="an edge plus a recovered batch; no finding/incident/workflow in a >= 540 s window",
+        expected=(
+            "an edge plus a recovered batch; no finding/incident/workflow across the "
+            "sustain plus one health summary after the burst (615 s on a 300-s cadence)"
+        ),
         cleanup="none (the burst stopped itself)",
-        max_minutes=12,
+        max_minutes=16,
         execute=short_burst,
     ),
     VariantSpec(
@@ -544,7 +649,7 @@ VARIANTS = [
         injection="drive cpu_busy to a finding, then stop the load",
         expected="recovered health-signal transition and 2 fresh samples below 98 %; the incident settles",
         cleanup="none",
-        max_minutes=20,
+        max_minutes=35,
         execute=recovery,
     ),
     VariantSpec(
@@ -557,7 +662,7 @@ VARIANTS = [
         injection="bind a reviewed static /proc/stat into the host collector's mount namespace",
         expected="total delta <= 0 -> no cpu_usage_percent sample and no finding",
         cleanup="close the /proc/stat bind window; confirm clean",
-        max_minutes=14,
+        max_minutes=16,
         execute=invalid_delta,
     ),
     VariantSpec(
@@ -570,7 +675,7 @@ VARIANTS = [
         injection="cpu_busy while a managed attempt declares phase=CHECKPOINT_SAVE",
         expected="the finding stays the diagnostic cpu chain; phase correlation is absent (noted, not a FAIL)",
         cleanup="stop the job and the load",
-        max_minutes=22,
+        max_minutes=35,
         execute=checkpoint_phase,
     ),
 ]

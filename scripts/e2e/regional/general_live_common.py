@@ -11,13 +11,14 @@ hand.
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Sequence
+from collections.abc import Callable, Iterable, Sequence
 from datetime import datetime, timedelta
 from typing import Any
 
 from scripts.e2e.regional.general_live_fixture import (
     HOST_UNIT,
     VariantContext,
+    VariantInconclusive,
     VariantNotRun,
     utc_now,
 )
@@ -27,6 +28,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     chain_judgeable,
     finding_incidents,
     node_isolated,
+    oracle_values,
     samples,
     settled,
 )
@@ -35,6 +37,80 @@ from scripts.e2e.regional.warm_spare_fixture import WarmSpareLiveFixture
 
 ORACLE_POLL_SECONDS = 15
 STORE_POLL_SECONDS = 20
+#: Ingest, dispatch and the +-5 % health-summary jitter on top of a budget's
+#: cadence terms (the margin 003 high_page_cache settled on live, 2026-10-25).
+CHAIN_MARGIN_SECONDS = 180
+
+
+def sustained_detection_budget(
+    ctx: VariantContext,
+    sustain_seconds: float,
+    *,
+    summaries: int = 2,
+    margin: int = CHAIN_MARGIN_SECONDS,
+) -> int:
+    """How long the product may take, from the oracle's crossing, to a judgeable chain.
+
+    The host collector ships a breach once, as the crossing's edge
+    (``collectors/host/collector.py`` ``_edge_reasons``/``collect_once``: a
+    ``threshold:``/``sustained:`` reason stays in ``_active_edge_reasons`` while
+    the breach holds and leaves ``delivery_reasons``), then only on its health
+    summaries (``GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS``, +-5 % jitter), and a
+    summary-only batch with no finding is evaluated but kept as no raw
+    evidence. The control plane mints a finding on the first *later* active
+    sample at least the rule's sustain after the first
+    (``store/shared/xid.py`` ``_next_health_signal_state``): the first summary
+    at or past the sustain, up to sustain + one summary after the edge. The
+    chain's validation is then judged on evidence newer than itself: one more
+    summary. ``summaries`` is how many the chain still needs after the edge --
+    two for a sustained rule, one for a rule with no sustain, whose finding is
+    the edge batch itself. Live 2026-10-25 (003 high_page_cache, release
+    13daa08b2227): a 720-s budget counted from before the ramp ended 482 s
+    after the edge and the fill was stopped before the summary that could have
+    claimed the finding; this budget is 1095 s on that site's cadence.
+    """
+
+    return int(
+        sustain_seconds + summaries * ctx.host_summary + ctx.host_interval + margin
+    )
+
+
+def sustained_negative_window(
+    ctx: VariantContext,
+    sustain_seconds: float,
+    *,
+    margin: int = CHAIN_MARGIN_SECONDS,
+) -> int:
+    """The bounded "must not trigger" watch after a burst shorter than the sustain.
+
+    A finding the product must not mint could only come from an active sample
+    a health summary carries at least the sustain after the burst's edge; the
+    window covers the sustain, one summary with its jitter and the collector
+    interval, so the product has seen the burst's recovered edge and at least
+    one summary after it before the negative verdict is read.
+    """
+
+    return int(sustain_seconds + ctx.host_summary + ctx.host_interval + margin)
+
+
+def cadence_record(
+    ctx: VariantContext,
+    *,
+    sustain_seconds: float,
+    detection_budget_seconds: int,
+    ramp_budget_seconds: int | None = None,
+) -> dict[str, Any]:
+    """The budgets and the cadence they came from, for the injection's evidence."""
+
+    record: dict[str, Any] = {
+        "sustain_seconds": sustain_seconds,
+        "detection_budget_seconds": detection_budget_seconds,
+        "host_summary_seconds": ctx.host_summary,
+        "host_interval_seconds": ctx.host_interval,
+    }
+    if ramp_budget_seconds is not None:
+        record["ramp_budget_seconds"] = ramp_budget_seconds
+    return record
 
 
 def run_survey(ctx: VariantContext) -> dict[str, Any]:
@@ -131,6 +207,49 @@ class Oracle:
     def stop(self) -> dict[str, Any]:
         self.read()
         return self.ctx.node("oracle-stop", "--name", self.name)
+
+
+def await_oracle_crossing(
+    ctx: VariantContext,
+    oracle: Oracle,
+    getter: Callable[[dict[str, Any]], Any],
+    crossed: Callable[[Sequence[float]], bool],
+    *,
+    timeout_seconds: float,
+    name: str,
+    condition: str,
+) -> list[float]:
+    """Wait until the runner's own oracle establishes the condition.
+
+    Detection is timed from here, never from the load's start: a fill or an
+    allocator ramps for minutes on a 2 TiB host, and a budget counted from
+    before the ramp ran out before the product's second summary (live
+    2026-10-25, 003 high_page_cache). ``getter`` reads one value per oracle
+    record, ``crossed`` judges the values read so far. The variant is
+    INCONCLUSIVE "condition not established" -- never FAIL, whatever the
+    product recorded -- when the oracle does not cross within ``timeout_seconds``.
+    """
+
+    values: list[float] = []
+
+    def accept() -> bool | None:
+        nonlocal values
+        oracle.read()
+        values = oracle_values(oracle.records, getter)
+        return True if crossed(values) else None
+
+    reached = ctx.wait_until(
+        accept,
+        timeout_seconds=timeout_seconds,
+        poll_seconds=ORACLE_POLL_SECONDS,
+        name=name,
+    )
+    if reached is None:
+        raise VariantInconclusive(
+            f"condition not established: {condition} within {int(timeout_seconds)} s "
+            f"(last {[round(value, 1) for value in values[-6:]]})"
+        )
+    return values
 
 
 def open_window(
@@ -450,15 +569,20 @@ def unsettled_workflows(activity_document: dict[str, Any]) -> list[str]:
 
 
 __all__ = [
+    "CHAIN_MARGIN_SECONDS",
     "Oracle",
     "activity",
     "await_metric_recovery",
+    "await_oracle_crossing",
+    "cadence_record",
     "close_window",
     "open_incident_ids",
     "open_window",
     "restore_incidents",
     "run_survey",
     "runtime_profile_version",
+    "sustained_detection_budget",
+    "sustained_negative_window",
     "unsettled_workflows",
     "wait_for_incident",
     "wait_settled",

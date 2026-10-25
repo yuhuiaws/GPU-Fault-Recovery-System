@@ -475,3 +475,21 @@ def workflow(
         "official_steps": steps,
         "step_executions": list(executions),
     }
+
+
+def store_poll_clock(ctx: VariantContext, *, start: datetime | None = None) -> Any:
+    """One store poll per clock reading, as live: a read every STORE_POLL_SECONDS.
+
+    ``make_context``'s clock moves 1 s per reading, so a wait that runs out
+    its budget polls hundreds of times and the timelines it writes grow with
+    it. A budget test needs the live shape -- a store read every 20 s -- so
+    that "the product's records appear N polls after the crossing" is N x 20 s
+    of the variant's budget.
+    """
+
+    from scripts.e2e.regional.general_live_common import STORE_POLL_SECONDS
+
+    ticks = itertools.count()
+    origin = start or datetime(2026, 10, 25, 3, 19, 46, tzinfo=timezone.utc)
+    ctx.clock = lambda: origin + timedelta(seconds=STORE_POLL_SECONDS * next(ticks))
+    return ctx
