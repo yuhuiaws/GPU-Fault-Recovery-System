@@ -14,12 +14,57 @@ import time
 from typing import Any, Callable
 
 from gpu_fault.node_agent import observation_guard
+from gpu_fault.node_agent.observation_limits import OBSERVATION_REQUEST_BUDGET_BYTES
+
+#: ``failure_stage`` of a result the supervisor could not obtain: the worker was
+#: never started (the request itself was refused, or the process could not be
+#: spawned), or it ran and its output could not be used.
+WORKER_NOT_STARTED = "WORKER_NOT_STARTED"
+WORKER_OUTPUT = "WORKER_OUTPUT"
 
 
 class ObservationIncomplete(RuntimeError):
+    """A node action whose evidence is incomplete; ``action_details`` is the result.
+
+    The message carries the cause next to the status. Live, a bundle refused
+    before its worker started reached the workflow as the bare
+    ``ObservationIncomplete: UNAVAILABLE`` with ``error="ValueError"`` -- nobody
+    could tell a refused request from a crashed probe.
+    """
+
     def __init__(self, result: dict[str, Any]):
-        super().__init__(str(result.get("status", "INCOMPLETE")))
+        status = str(result.get("status", "INCOMPLETE"))
+        error = result.get("error")
+        super().__init__(
+            f"{status}: {error}" if isinstance(error, str) and error else status
+        )
         self.action_details = result
+
+
+def request_overflow(request: dict[str, Any], size: int) -> str:
+    """Why a request is refused: its size, the budget and what weighs most in it.
+
+    Only command parameters are weighed by name: that is the part of a request
+    the control plane composes (a hung bundle's ``hung_triage_decision`` ran to
+    259 KB live), and the name is what an operator needs to find the heavy
+    field in the workflow record.
+    """
+
+    command = request.get("command")
+    parameters = command.get("parameters") if isinstance(command, dict) else None
+    detail = ""
+    if isinstance(parameters, dict) and parameters:
+        weights = sorted(
+            ((len(json.dumps(value)), str(key)) for key, value in parameters.items()),
+            reverse=True,
+        )[:3]
+        detail = "; largest parameters: " + ", ".join(
+            f"{key}={weight} bytes" for weight, key in weights
+        )
+    return (
+        "observation input exceeds budget: "
+        f"{size} > {OBSERVATION_REQUEST_BUDGET_BYTES} bytes{detail}"
+    )
 
 
 class ObservationSupervisor:
@@ -48,8 +93,8 @@ class ObservationSupervisor:
             deadline = time.monotonic() + timeout
             with tempfile.TemporaryFile() as incoming:
                 raw = json.dumps(request).encode()
-                if len(raw) > 262144:
-                    raise ValueError("observation input exceeds budget")
+                if len(raw) > OBSERVATION_REQUEST_BUDGET_BYTES:
+                    raise ValueError(request_overflow(request, len(raw)))
                 incoming.write(raw)
                 incoming.seek(0)
                 process = subprocess.Popen(
@@ -112,8 +157,16 @@ class ObservationSupervisor:
             self.last_result = result
             return result
         except (OSError, ValueError, KeyError) as exc:
+            # The class alone said nothing (live: ``"error": "ValueError"`` for
+            # a request the budget refused in 5 ms). Carry the message, which
+            # component refused and whether a worker ever ran.
             result.update(
-                status="UNAVAILABLE", evidence_complete=False, error=type(exc).__name__
+                status="UNAVAILABLE",
+                evidence_complete=False,
+                error=f"{type(exc).__name__}: {str(exc)[:384]}",
+                failed_component="observation_supervisor",
+                failure_stage=WORKER_NOT_STARTED if process is None else WORKER_OUTPUT,
+                worker_started=process is not None,
             )
             self.last_result = result
             return result

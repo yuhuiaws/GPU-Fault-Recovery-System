@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -17,7 +19,62 @@ from gpu_fault.node_agent.observation_supervisor import (
     ObservationSupervisor,
 )
 from gpu_fault.node_agent.operations.hung_summary_io import read_bounded
-from gpu_fault.node_agent.observation_limits import service_limits
+from gpu_fault.node_agent.observation_limits import (
+    OBSERVATION_REQUEST_BUDGET_BYTES,
+    service_limits,
+)
+
+#: Command parameters the worker never reads. A hung bundle copies them into
+#: its manifest's ``fault_context`` and nothing else, so they are the only
+#: parameters a request over the budget may lose. Everything else -- the PIDs
+#: and start ticks the bundle attaches to, the raw flight recorder references,
+#: the cgroup scope -- steers the collection and is never touched.
+CONTEXT_ONLY_PARAMETERS = ("hung_triage_decision",)
+REQUEST_BUDGET_OMISSION = "OBSERVATION_REQUEST_BUDGET"
+
+
+def bounded_request(
+    request: dict[str, Any],
+) -> tuple[dict[str, Any], dict[str, dict[str, Any]]]:
+    """``request`` within the worker's budget, and what was taken out of it.
+
+    Live, the control plane bound a bundle to a 259 KB ``hung_triage_decision``
+    (sixteen processes' per-thread stacks and wait observations; a churn thread
+    added a few rows per process), the request weighed 264 KB against a 256 KiB
+    budget and the supervisor refused it before any worker ran -- the whole
+    bundle came back as ``ranks: []`` over a context field the node never
+    reads. Over budget, each context-only parameter is replaced by a stand-in
+    naming the omission, the byte count and the SHA-256 of what was omitted
+    (the full value stays in the workflow record: the bundle step's parameters
+    and the triage step's execution details), and the manifest lists the
+    omitted keys under ``observation_request_trimmed``. A request still over
+    budget after that is refused with its cause.
+    """
+
+    if len(json.dumps(request)) <= OBSERVATION_REQUEST_BUDGET_BYTES:
+        return request, {}
+    command = request.get("command")
+    if not isinstance(command, dict) or not isinstance(command.get("parameters"), dict):
+        return request, {}
+    trimmed: dict[str, dict[str, Any]] = {}
+    parameters = dict(command["parameters"])
+    for key in CONTEXT_ONLY_PARAMETERS:
+        if key not in parameters:
+            continue
+        encoded = json.dumps(
+            parameters[key], sort_keys=True, separators=(",", ":")
+        ).encode()
+        trimmed[key] = {
+            "omitted": REQUEST_BUDGET_OMISSION,
+            "bytes": len(encoded),
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+            "recorded_in": "workflow step parameters and COLLECT_HUNG_TRIAGE details",
+        }
+        parameters[key] = trimmed[key]
+    if not trimmed:
+        return request, {}
+    parameters["observation_request_trimmed"] = sorted(trimmed)
+    return {**request, "command": {**command, "parameters": parameters}}, trimmed
 
 
 class CommunicationRuntime:
@@ -87,15 +144,20 @@ class CommunicationRuntime:
         activity = self.agent.gpu_activity.admit(
             command.operation, command.command_id + "/worker", command.incident_id
         )
-        result = self.supervisor.run(
+        request, trimmed = bounded_request(
             {
                 "operation": operation,
                 "settings": self.settings,
                 "command": command.model_dump(mode="json"),
-            },
+            }
+        )
+        result = self.supervisor.run(
+            request,
             {"summary": 20, "triage": 28, "bundle": 120}[operation],
             release=lambda: self.agent.gpu_activity.release(activity),
         )
+        if trimmed:
+            result = {**result, "observation_request_trimmed": trimmed}
         if result.get("evidence_complete") is False or result.get("status") in {
             "UNAVAILABLE",
             "RESULT_SIZE_LIMIT",

@@ -12,6 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from gpu_fault.node_agent.diagnostic_process import DiagnosticProcessRunner
+from gpu_fault.node_agent.observation_limits import OBSERVATION_REQUEST_BUDGET_BYTES
 from gpu_fault.node_agent.operations.diagnostics import DiagnosticOperationsMixin
 from gpu_fault.node_agent.operations.efa import EfaOperationsMixin
 from gpu_fault.node_agent.operations.flight_recorder import (
@@ -102,9 +103,12 @@ def main() -> None:
     resource.setrlimit(resource.RLIMIT_CPU, (8, 9))
     resource.setrlimit(resource.RLIMIT_NOFILE, (128, 128))
     os.nice(10)
-    raw = sys.stdin.buffer.read(262145)
-    if len(raw) > 262144:
-        raise ValueError("observation request exceeds budget")
+    raw = sys.stdin.buffer.read(OBSERVATION_REQUEST_BUDGET_BYTES + 1)
+    if len(raw) > OBSERVATION_REQUEST_BUDGET_BYTES:
+        raise ValueError(
+            "observation request exceeds budget: more than "
+            f"{OBSERVATION_REQUEST_BUDGET_BYTES} bytes on stdin"
+        )
     request = json.loads(raw)
     publish({"status": "COLLECTING", "ranks": [], "read_only": True}, final=False)
     try:

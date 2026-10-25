@@ -26,3 +26,9 @@ def service_limits(
         }
     except (OSError, ValueError, StopIteration, ZeroDivisionError):
         return {"verified": False, "reason": "BOUNDED_CGROUP_V2_ENVELOPE_UNAVAILABLE"}
+
+
+#: What one observation request may weigh on the read-only worker's stdin. The
+#: supervisor refuses a larger request before it starts the worker, and the
+#: worker refuses it again on its own side of the pipe.
+OBSERVATION_REQUEST_BUDGET_BYTES = 262144
