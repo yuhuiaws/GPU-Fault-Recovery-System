@@ -1306,8 +1306,25 @@ the product's rearm window; 030 declares
 one warm spare through the admin CLI under `DECLARE_WARM_SPARE` and always
 releases it). 027 enables the optional reporter only for its disposable test
 job (a Pod-local `training-progress` sidecar) and triggers a single per-cluster
-scan, never the global monitor. Variants that need a reviewed test
-flight-recorder dump responder, a py-spy fault tool, a role-declaration job, a
+scan, never the global monitor. The flight-recorder forensics variants of 011
+(`general_live_nccl_fr`: `fr_temporal_completion`, `fr_second_missing`,
+`fr_whole_group`, `few_candidates`, `ambiguous_candidates`,
+`different_process_groups`, `fr_plus_process`) are live-replay: the stall job
+runs with PyTorch's recorder off and a reviewed test dump responder
+(`probes/general_live_fr_responder.py`, started inside each `pytorch`
+container before `torchrun`, bounded by its own `--max-seconds`, removing its
+FIFOs and dumps when it ends) answers the Node Agent's own FIFO requests with
+dumps of the variant's shape; the FIFO protocol, namespace mapping, parsing,
+two-dump series, classification and bundle binding are the product's, so these
+variants prove the processing chain and never PyTorch's recorder or an actual
+NCCL fault. Two limits follow from the product's own rules: the hung DAG of
+this site carries no `clock_uncertainty_seconds`, so a group spanning both
+nodes is never time-comparable and the groups that yield leads or a
+whole-group stall are node-local (eight ranks each; the cross-node default
+group is present and its per-rank watermarks are still read); and a D-state
+wait cannot be forced natively, so `fr_plus_process` keeps the write-mode
+checkpoint I/O (`HOST_WRITES_OBSERVED`) as its independent process evidence.
+Variants that need a py-spy fault tool, a role-declaration job, a
 128-node/1024-process scale, or the HyperPod spare-health controller (disabled
 in this regional control plane, `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`)
 stay `NOT_RUN` with an explicit reason in the denominator rather than being

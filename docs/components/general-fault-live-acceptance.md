@@ -764,7 +764,7 @@ inaccessible, env, pci_root)`/`open_command`/`open_tree`/`set_value`/`set_tree_v
 第二批补 011 EFA 流量停滞/NCCL hung、027 训练进度、030 热备不健康；均用受管的
 可丢弃测试任务，判定只读产品记录（011 读分组 `SITE_EFA_TRAFFIC` incident 的诊断
 DAG、027 读 `SITE_TRAINING_HEALTH` incident/决策、030 读热备分级与注解），永不
-POST 预制 finding。类别模块 `general_live_nccl`/`_progress`/`_spares`。
+POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_spares`。
 
 - **011（仅 HyperPod 车道，需 `--node-b`）**：专用受管两节点 NCCL 测试任务
   （`scripts/e2e/regional/general_live_nccl_job.py`，由
@@ -794,10 +794,42 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_progress`/`_spares`。
   切换）、`fr_enabled`（按运维手册注入 trace buffer/pipe/dump-on-timeout，至少一个 PID
   两次真实 dump 为 `PAIRED`）、`fr_disabled`（trace buffer 为 0，只能 `not_configured`）、
   `simultaneous_nodes`（合并 incident 须含两节点各自的 hung 证据）。
+  live-replay 实测（`general_live_nccl_fr`，经审查的测试 FR dump 响应器
+  `probes/general_live_fr_responder.py`，形状由 `general_live_fr_replay` 渲染）：同一
+  两节点停滞任务以 `TORCH_NCCL_TRACE_BUFFER_SIZE=0` 运行（PyTorch 不建 debug pipe、
+  不写 dump，`TORCH_NCCL_DEBUG_INFO_PIPE_FILE`/`TEMP_FILE` 仍在 rank 进程环境中，产品
+  正是从那里读名字）；容器命令在 `exec torchrun` 前把响应器写到
+  `/tmp/gfrs_fr_responder.py` 并在本容器内后台启动，它只拥有本 Pod 8 个 rank 的
+  `<pipe base><rank>.pipe` FIFO（路径已存在即拒绝，不与真实 recorder 争抢），对产品
+  每次写入的 `1\n` 以 pickle protocol 2（PyTorch 的落盘格式）回写
+  `<dump base><rank>`：按组 completion 推进（每份 +2）/ 同一 pending 操作持续 /
+  只 enqueue 不完成（每份 +1）/ 指定 rank 落后一个 collective / 第二份请求不回写；
+  `--max-seconds 7200` 到期自行退出并只删除自己建的 FIFO/dump（RuntimeMaxSec 的容器内
+  对应物，Pod 删除亦一并消失），账本 `/tmp/gfrs-fr-replay/ledger.json` 记录每次请求、
+  回写的水位与摘要。FIFO 协议、命名空间映射、解析、双 dump 配对、分类与 bundle 绑定
+  均为产品代码；只替换了原始读数，证据写 `proof_scope: live-replay`。判定只读
+  COLLECT_DIAGNOSTIC_BUNDLE 步骤绑定的 `hung_triage_decision` 与 bundle 作用域参数
+  （`bundle_scope`/`target_pids_by_node`/`max_processes`）、各 rank 的
+  `flight_recorder_series`，并以账本为夹具 oracle：账本缺失、响应器出错、FIFO 名字
+  不符记 `INCONCLUSIVE`；FIFO 在而产品未请求、未配对、漏报线索或 bundle 作用域错误记
+  FAIL。跨节点组的进度比较需要本站 hung DAG 不携带的 `clock_uncertainty_seconds`
+  （未知时钟不授权定向包，见 [NCCL hung 改进](nccl-hung-hardening.md)），因此产生
+  线索/整组停滞判断的组是节点内组（每节点 8 rank，如 TP 组，按本节点时钟比较），全局
+  默认组照样出现在每份 dump 中、其每 rank 水位差仍被读取；产品先采样上报节点，只有
+  第一轮证据不足时才采样对端，判定均按实际采样的 rank 表述。
+  `fr_temporal_completion`（默认组 +2/+2/+2，第二组只 enqueue +1/0/0 且 pending 持续，
+  每 PID 两份 dump 间隔 ≥2 s、PAIRED）、`fr_second_missing`（全部
+  `SECOND_UNAVAILABLE`，无 fr_temporal 判定、快照为准、不虚构停滞或线索、保守 bundle）、
+  `fr_whole_group`（节点组 `group_stall_observed`、`stalled_process_groups` 点名、
+  无 culprit、保守 bundle）、`few_candidates`（每节点 1 个 rank 落后：1-2 个可信候选，
+  `targeted_capture_eligible`，bundle `identity_bound_candidates` 恰好绑定 culprit 与
+  至多一个对照 rank 的 PID）、`ambiguous_candidates`（两个节点组各 2 个落后：单节点即
+  4 个线索，仍报告但 `bounded_triage_nodes`、不定向）、`different_process_groups`
+  （两节点组序号 1200/700 互不比较、成员不混、无 culprit）、`fr_plus_process`
+  （write 模式停滞 + completion 推进：`HOST_WRITES_OBSERVED` 与进程 I/O 窗口保留在
+  决策中，不被 FR 分支覆盖；D 状态等待无法原生制造）。
   延后留分母：规模类 `large_job`/`no_step_no_rank`/
-  `active_window_resume`（`SCALE`，本站无 128 节点任务）、需审查测试 FR dump 响应器
-  的 `fr_temporal_completion`/`fr_second_missing`/`fr_whole_group`/`few_candidates`/
-  `ambiguous_candidates`/`different_process_groups`/`fr_plus_process`、需 py-spy 故障
+  `active_window_resume`（`SCALE`，本站无 128 节点任务）、需 py-spy 故障
   工具的 `pyspy_nonzero`、需角色声明测试任务的 `role_mismatch`/`tid_namespace`/
   `wchan_zero`/`cpu_interval`（均 `FIXTURE_NOT_READY`）、`broken_pair`（需 sysfs 读取
   夹具）、`attempt_change`（需可控换 attempt）、`unreachable_node`（隔离 Agent 通道
