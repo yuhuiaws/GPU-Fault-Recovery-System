@@ -416,21 +416,88 @@ def test_failed_query_is_inconclusive_below_two_served_failures(tmp_path: Path) 
 
 
 # --------------------------------------------------------------------------- #
-# expectation_wrong (expected FAIL while the product gap is present)
+# expectation_wrong: a configuration finding, never a lost GPU (batch 174)
 # --------------------------------------------------------------------------- #
-def _wrong_docs(*, finding: bool) -> list[dict[str, Any]]:
-    wrong = EXPECTED + 1
+WRONG = EXPECTED + 1
+CONTRADICTION_REASON = (
+    f"configured expected GPU count {WRONG} (the node's collector.env) contradicts "
+    f"instance type p5en.48xlarge, which carries {EXPECTED} GPUs; the node lists "
+    f"{EXPECTED} and the driver has {EXPECTED} bound. This is a configuration error "
+    "to correct on the node, not a lost GPU: no reboot or isolation is derived from it"
+)
+
+
+def _override_batches() -> list[dict[str, Any]]:
     batches = [
         _batch(
-            "2026-10-24T00:00:20+00:00", _inventory(8, consecutive=1, expected=wrong)
+            "2026-10-24T00:00:20+00:00", _inventory(8, consecutive=1, expected=WRONG)
         ),
         _batch(
-            "2026-10-24T00:00:35+00:00", _inventory(8, consecutive=2, expected=wrong)
+            "2026-10-24T00:00:35+00:00", _inventory(8, consecutive=2, expected=WRONG)
         ),
     ]
-    extra: dict[str, Any] = {}
-    if finding:
-        extra["incidents"] = [
+    for item in batches:
+        for sample in item["samples"]:
+            sample["labels"]["discovered_count"] = str(EXPECTED)
+            sample["labels"]["instance_type_gpu_count"] = str(EXPECTED)
+    return batches
+
+
+def _contradiction(
+    *,
+    reason: str = CONTRADICTION_REASON,
+    operations: tuple[str, ...] = ("FREEZE_EVIDENCE",),
+    action: str = "COLLECT_EVIDENCE",
+    notified: bool = True,
+) -> dict[str, Any]:
+    return {
+        "incidents": [
+            {
+                "incident_id": "inc-contra",
+                "event_id": f"host-1-{mod.CONTRADICTION_METRIC}-node",
+                "event_type": "NODE_HEALTH",
+                "effective_action": action,
+                "state": "RECOVERED",
+                "created_at": "2026-10-24T00:00:21+00:00",
+                "workflow_request_id": "wf-contra",
+                "node_ids": [NODE],
+                "cluster_id": "gpu-eks-cluster",
+                "reasons": [reason],
+            }
+        ],
+        "workflows": [
+            {
+                "request_id": "wf-contra",
+                "incident_id": "inc-contra",
+                "status": "SUCCEEDED",
+                "created_at": "2026-10-24T00:00:21+00:00",
+                "official_steps": [
+                    {"operation": name, "parameters": {}} for name in operations
+                ],
+                "step_executions": [],
+            }
+        ],
+        "notifications": [
+            {
+                "notification_id": "ntf-contra",
+                "incident_id": "inc-contra",
+                "category": mod.OPERATOR_REVIEW_CATEGORY,
+                "deduplication_key": "operator-review/abc",
+                "created_at": "2026-10-24T00:00:21+00:00",
+                "subject": f"[GPU fault review] {NODE} {mod.CONTRADICTION_METRIC} (WARNING)",
+                "status": "SENT",
+            }
+        ]
+        if notified
+        else [],
+    }
+
+
+def _reboot_chain() -> dict[str, Any]:
+    """The old product: the mismatch confirmed on the second tick and rebooted."""
+
+    return {
+        "incidents": [
             {
                 "incident_id": "inc-exp",
                 "event_id": "host-2-gpu_inventory_mismatch-node",
@@ -442,8 +509,8 @@ def _wrong_docs(*, finding: bool) -> list[dict[str, Any]]:
                 "node_ids": [NODE],
                 "cluster_id": "gpu-eks-cluster",
             }
-        ]
-        extra["workflows"] = [
+        ],
+        "workflows": [
             {
                 "request_id": "wf-exp",
                 "incident_id": "inc-exp",
@@ -456,43 +523,97 @@ def _wrong_docs(*, finding: bool) -> list[dict[str, Any]]:
                 ],
                 "step_executions": [],
             }
-        ]
-    return [_doc([]), _doc(batches, **extra)]
+        ],
+    }
 
 
-def test_expectation_wrong_overrides_the_recorded_count_plus_one(
-    tmp_path: Path,
-) -> None:
+def _wrong_docs(records: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    """The reads of expectation_wrong: the baseline, then the override and
+    whatever ``records`` the product minted on it, then the recovery read."""
+
+    window = _doc(_override_batches(), **(records or {}))
+    settled = _doc(
+        [
+            *_override_batches(),
+            _batch("2026-10-24T00:02:00+00:00", _inventory(8, consecutive=0)),
+        ],
+        **(records or {}),
+    )
+    return [_doc([]), window, window, settled]
+
+
+def test_expectation_wrong_passes_on_the_contradiction_finding(tmp_path: Path) -> None:
     probe = _probe(0)
     ctx = _ctx(
         "expectation_wrong",
-        docs=_wrong_docs(finding=False),
+        docs=_wrong_docs(_contradiction()),
         tmp_path=tmp_path,
         probe=probe,
     )
     result = mod.gpu_expectation_wrong(ctx)
     assert result["verdict"] == "PASS", result["errors"]
     opened = _opened(probe)
-    assert ("--env", f"GPU_FAULT_EXPECTED_GPU_COUNT={EXPECTED + 1}") == tuple(
+    assert ("--env", f"GPU_FAULT_EXPECTED_GPU_COUNT={WRONG}") == tuple(
         opened[opened.index("--env") : opened.index("--env") + 2]
     ), opened
     assert any(call[0] == "close-window" for call in probe.calls), (
-        "the window is closed as soon as the product recorded the override"
+        "the window is closed as soon as the product minted the finding"
     )
-    assert result["recorded_expectations"][-1]["expected_count"] == str(EXPECTED + 1)
+    assert result["recorded_expectations"][-1]["expected_count"] == str(WRONG)
+    assert result["incidents"] == ["inc-contra"]
+    spec = SPECS["expectation_wrong"]
+    assert spec.expected_outcome == "PASS" and spec.product_gap == ""
+    assert spec.approvals == (mod.HOST_SOURCE_REPLAY,), (
+        "the fixed product never reboots on a mistyped expectation: no NODE_REBOOT"
+    )
+    assert spec.flags == "S" and spec.risk == "M"
 
 
-def test_expectation_wrong_fails_on_the_products_reboot_chain(tmp_path: Path) -> None:
-    ctx = _ctx("expectation_wrong", docs=_wrong_docs(finding=True), tmp_path=tmp_path)
+def test_expectation_wrong_fails_on_the_old_reboot_chain(tmp_path: Path) -> None:
+    ctx = _ctx(
+        "expectation_wrong", docs=_wrong_docs(_reboot_chain()), tmp_path=tmp_path
+    )
     result = mod.gpu_expectation_wrong(ctx)
     assert result["verdict"] == "FAIL", result
     joined = "\n".join(result["errors"])
     assert "inc-exp" in joined and "RESTART_NODE" in joined, joined
-    spec = SPECS["expectation_wrong"]
-    assert spec.expected_outcome == "FAIL" and "REBOOT_NODE" in spec.product_gap
-    assert spec.approvals == (mod.HOST_SOURCE_REPLAY, mod.NODE_REBOOT), (
-        "the product's chain reboots the node while the gap is present"
-    )
+    assert f"no {mod.CONTRADICTION_METRIC} finding" in joined, joined
+
+
+def test_expectation_wrong_fails_on_a_quiet_product(tmp_path: Path) -> None:
+    ctx = _ctx("expectation_wrong", docs=_wrong_docs(), tmp_path=tmp_path)
+    result = mod.gpu_expectation_wrong(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert result["stages"]["configuration_finding"], result["stages"]
+    assert result["stages"]["not_a_missing_gpu"] == [], result["stages"]
+
+
+@pytest.mark.parametrize(
+    ("records", "stage", "needle"),
+    [
+        (
+            _contradiction(
+                reason="the configured expected GPU count contradicts the type"
+            ),
+            "reason_names_the_counts",
+            "does not say",
+        ),
+        (_contradiction(notified=False), "operator_review", "no OPERATOR_REVIEW"),
+        (
+            _contradiction(operations=("MARK_UNSCHEDULABLE", "FREEZE_EVIDENCE")),
+            "evidence_only",
+            "more than FREEZE_EVIDENCE",
+        ),
+        (_contradiction(action="REBOOT_NODE"), "evidence_only", "not COLLECT_EVIDENCE"),
+    ],
+)
+def test_expectation_wrong_fails_when_the_finding_is_not_the_designed_one(
+    tmp_path: Path, records: dict[str, Any], stage: str, needle: str
+) -> None:
+    ctx = _ctx("expectation_wrong", docs=_wrong_docs(records), tmp_path=tmp_path)
+    result = mod.gpu_expectation_wrong(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any(needle in error for error in result["stages"][stage]), result["stages"]
 
 
 def test_expectation_wrong_blocks_without_a_recorded_expectation(
@@ -508,6 +629,32 @@ def test_expectation_wrong_blocks_without_a_recorded_expectation(
         mod.gpu_expectation_wrong(ctx)
 
 
+def test_expectation_wrong_is_inconclusive_when_the_override_was_never_read(
+    tmp_path: Path,
+) -> None:
+    ctx = _ctx("expectation_wrong", docs=[_doc([])], tmp_path=tmp_path)
+    with pytest.raises(VariantInconclusive, match="never recorded"):
+        mod.gpu_expectation_wrong(ctx)
+
+
+def test_contradiction_reason_errors_name_each_missing_count() -> None:
+    labels = {
+        "node_instance_type": "p5en.48xlarge",
+        "instance_type_gpu_count": "8",
+        "observed_count": "8",
+        "discovered_count": "8",
+    }
+    incident = {"incident_id": "inc-x", "reasons": [CONTRADICTION_REASON]}
+    assert mod.contradiction_reason_errors(incident, labels, wrong=WRONG) == []
+    short = {"incident_id": "inc-x", "reasons": ["configured expected GPU count 9"]}
+    errors = mod.contradiction_reason_errors(short, labels, wrong=WRONG)
+    assert len(errors) == 4, errors
+    assert any("driver has 8 bound" in error for error in errors), errors
+    without_bound = dict(labels)
+    without_bound.pop("discovered_count")
+    assert len(mod.contradiction_reason_errors(short, without_bound, wrong=WRONG)) == 3
+
+
 # --------------------------------------------------------------------------- #
 # the product's own collector and rule, pinned
 # --------------------------------------------------------------------------- #
@@ -521,13 +668,18 @@ def test_registry_shape_for_012() -> None:
         "proc_unreadable",
         "expectation_wrong",
     }, implemented
-    for name in ("single_sample", "query_failed", "proc_unreadable"):
+    for name in (
+        "single_sample",
+        "query_failed",
+        "proc_unreadable",
+        "expectation_wrong",
+    ):
         spec = SPECS[name]
         assert spec.lanes == ("eks", "hp") and spec.approvals == (
             mod.HOST_SOURCE_REPLAY,
         )
-        assert spec.expected_outcome == "PASS"
-    assert mod.NODE_REBOOT in APPROVALS and mod.HOST_SOURCE_REPLAY in APPROVALS
+        assert spec.expected_outcome == "PASS" and spec.product_gap == ""
+    assert mod.HOST_SOURCE_REPLAY in APPROVALS
     for name in ("confirmed_missing", "reboot_verified", "post_reboot_failure"):
         assert SPECS[name].deferred.startswith("VENDOR_LAB_ONLY"), SPECS[name].deferred
 

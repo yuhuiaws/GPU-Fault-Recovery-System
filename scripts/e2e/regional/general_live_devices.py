@@ -25,16 +25,29 @@ a few ticks (``query_failed``); ``proc_unreadable`` hides ``/proc/driver/nvidia/
 gpus`` from the unit while that query fails (the two-read-failure case the spec
 marks as the known risk); ``expectation_wrong`` overrides the expected count in
 the unit's environment. The product's own records decide: a ``gpu_inventory_
-mismatch`` sample at 1 is the CRITICAL REBOOT_NODE rule's input
-(``host_health.py`` METRIC_RULES), so none of these may ever carry it, mint a
-finding, plan a hardware step or isolate the node; a failed query must leave
-``failure_mode`` DRIVER_QUERY_FAILED / INVENTORY_UNAVAILABLE context, never a
-zero count. The wrapper's journal (``replay.audit``) is the raw-source oracle of
-what the product actually asked and was served.
+mismatch`` finding is the CRITICAL REBOOT_NODE rule's input (``host_health.py``
+METRIC_RULES), so none of these may ever mint one, plan a hardware step or
+isolate the node; a failed query must leave ``failure_mode`` DRIVER_QUERY_FAILED
+/ INVENTORY_UNAVAILABLE context, never a zero count. The wrapper's journal
+(``replay.audit``) is the raw-source oracle of what the product actually asked
+and was served.
+
+``expectation_wrong`` reads the configuration finding batch 174 introduced:
+``host_health.gpu_inventory_verdicts`` re-reads every ``gpu_inventory_mismatch``
+sample against the control plane's instance table before grading, and a
+configured count that contradicts the type while the node lists exactly the
+type's GPUs (the driver's bound count agreeing) is re-read as 0 -- no mismatch
+finding -- and graded as ``gpu_expected_count_contradicted`` WARNING /
+COLLECT_EVIDENCE: a FREEZE_EVIDENCE-only workflow, an OPERATOR_REVIEW
+notification, and an incident reason naming the configured count, the
+instance type and its count, the listed count and the bound count. The
+override is closed as soon as that finding exists; a corrected configuration
+reads the contradiction at 0 and the episode closes.
 """
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from datetime import datetime
 from typing import Any
 
@@ -50,6 +63,7 @@ from scripts.e2e.regional.general_live_fixture import (
     utc_now,
 )
 from scripts.e2e.regional.general_live_registry import (
+    HARDWARE_OPERATIONS,
     LIVE_REPLAY,
     VENDOR_LAB,
     VariantSpec,
@@ -69,14 +83,14 @@ from scripts.e2e.regional.general_live_verdicts import (
     hardware_errors,
     isolation_operations,
     node_isolated,
+    operations,
     samples,
     verdict,
+    workflows_of,
 )
 
 CASE_012 = "GF-GENERAL-LIVE-012"
 
-#: The dangerous-branch token the product's REBOOT_NODE chain needs on the plan.
-NODE_REBOOT = "NODE_REBOOT"
 #: The host collector's GPU inventory samples (``collectors/host/inventory.py``)
 #: plus the per-GPU utilization latest metric whose ``device`` is the UUID.
 GPU_METRICS = frozenset(
@@ -102,20 +116,18 @@ FAILED_TICKS = 4
 #: ``failure_mode`` labels the inventory contributor stamps on a failed read.
 DRIVER_QUERY_FAILED = "DRIVER_QUERY_FAILED"
 INVENTORY_UNAVAILABLE = "INVENTORY_UNAVAILABLE"
-#: How long the product's REBOOT_NODE chain may take to settle when the
-#: ``expectation_wrong`` gap is present (reboot, validations, restore).
+#: How long a chain the product minted on the override is waited to settle:
+#: the FREEZE_EVIDENCE-only review chain closes within a health summary; the
+#: budget still covers a regressed REBOOT_NODE chain so the FAIL is recorded on
+#: a settled record (reboot, validations, restore).
 REBOOT_SETTLE_BUDGET = 1800
-EXPECTATION_GAP = (
-    "collectors/host/inventory.py `_gpu_inventory`/`_inventory_samples` and "
-    "host_health.py METRIC_RULES['gpu_inventory_mismatch']: an explicit "
-    "GPU_FAULT_EXPECTED_GPU_COUNT that contradicts the instance type's known "
-    "accelerator count (collectors/gpu/discovery.py expected_accelerator_counts, "
-    "p5en.48xlarge = 8) and the driver's own bound-GPU list is graded as a "
-    "missing/excess GPU after two ticks -- CRITICAL REBOOT_NODE -- instead of "
-    "an expectation (configuration) problem; no control-plane path reconciles "
-    "the finding's expected_count against node_instance_type or "
-    "gpu_inventory_discovered_count before planning RESTART_NODE"
-)
+#: The configuration finding of a mistyped expected GPU count
+#: (``host_health.GPU_EXPECTED_COUNT_CONTRADICTED_METRIC``, batch 174) and the
+#: category of the notification it mails (``app/ingest/node_health.py``).
+CONTRADICTION_METRIC = "gpu_expected_count_contradicted"
+OPERATOR_REVIEW_CATEGORY = "OPERATOR_REVIEW"
+#: Steps a diagnostic-only or evidence-only chain must never contain.
+ISOLATION_OPERATIONS = frozenset({"MARK_UNSCHEDULABLE", "QUARANTINE", "STOP_WORKLOADS"})
 
 
 # --------------------------------------------------------------------------- #
@@ -467,14 +479,70 @@ def gpu_proc_unreadable(ctx: VariantContext) -> dict[str, Any]:
     return _failed_query(ctx, proc_unreadable=True)
 
 
+def contradiction_reason_errors(
+    incident: dict[str, Any], labels: Mapping[str, Any], *, wrong: int
+) -> list[str]:
+    """The incident's reason names the four counts the operator needs.
+
+    ``host_health.gpu_expected_count_contradicted_rule`` spells the configured
+    count (E), the instance type and its count (T), the listed count (O) and,
+    when the collector reported one, the driver's bound count (D); the
+    operator-review mail carries the reason, not the labels, so the words must
+    be there. ``labels`` are the product's own labels on the overridden
+    expectation sample (``node_instance_type``, ``observed_count``,
+    ``discovered_count``, ``instance_type_gpu_count``).
+    """
+
+    reasons = " ".join(str(item) for item in incident.get("reasons") or [])
+    wanted = [f"configured expected GPU count {wrong}"]
+    instance_type = labels.get("node_instance_type")
+    wanted.append(
+        f"contradicts instance type {instance_type}"
+        if instance_type
+        else "contradicts instance type"
+    )
+    type_count = labels.get("instance_type_gpu_count")
+    if type_count:
+        wanted.append(f"carries {type_count} GPUs")
+    observed = labels.get("observed_count")
+    wanted.append(f"the node lists {observed}" if observed else "the node lists")
+    bound = labels.get("discovered_count")
+    if bound:
+        wanted.append(f"driver has {bound} bound")
+    return [
+        f"the {CONTRADICTION_METRIC} incident {incident.get('incident_id')} reason "
+        f"does not say {text!r}: {reasons[:300]!r}"
+        for text in wanted
+        if text not in reasons
+    ]
+
+
+def operator_review_errors(observed: dict[str, Any], incident_id: str) -> list[str]:
+    mails = [
+        item
+        for item in observed.get("notifications") or []
+        if item.get("incident_id") == incident_id
+        and item.get("category") == OPERATOR_REVIEW_CATEGORY
+    ]
+    if not mails:
+        return [
+            f"no {OPERATOR_REVIEW_CATEGORY} notification names the "
+            f"{CONTRADICTION_METRIC} incident {incident_id}"
+        ]
+    if len(mails) > 1:
+        return [f"{len(mails)} operator-review notifications for one contradiction"]
+    return []
+
+
 def gpu_expectation_wrong(ctx: VariantContext) -> dict[str, Any]:
-    """A wrong expected count is an expectation problem, not a missing GPU.
+    """A wrong expected count is a configuration finding, not a missing GPU.
 
     The real count is read from the product (``gpu_inventory_expected_count``);
     the unit's environment gets that count plus one. The window is closed as
-    soon as the product has recorded the override twice (its confirmation
-    window) or minted a finding, so the exposure is the minimum the rule needs;
-    whatever chain the product then runs is its own and is waited to settle.
+    soon as the product has a finding on the override (the contradiction, or a
+    mismatch -- the old behaviour) or recorded it twice, so the exposure is
+    the minimum the rule needs; the chain the product then runs is its own
+    and is waited to settle before the records are judged.
     """
 
     run_survey(ctx)
@@ -493,21 +561,21 @@ def gpu_expectation_wrong(ctx: VariantContext) -> dict[str, Any]:
         restore_seconds=ctx.spec.max_minutes * 60,
     )
     ctx.evidence.write("source-window-open", opened)
+    metrics = GPU_METRICS | {CONTRADICTION_METRIC}
 
-    def reacted() -> dict[str, Any] | None:
-        current = activity(ctx, started, metrics=GPU_METRICS)
-        recorded = [
+    def overrides(document: dict[str, Any]) -> list[dict[str, Any]]:
+        return [
             item
-            for item in _inventory_samples(current, "gpu_inventory_expected_count")
+            for item in _inventory_samples(document, "gpu_inventory_expected_count")
             if item["value"] == wrong
         ]
+
+    def reacted() -> dict[str, Any] | None:
+        current = activity(ctx, started, metrics=metrics)
         if (
-            finding_incidents(current, "gpu_inventory_mismatch")
-            or any(
-                item["value"] >= 1
-                for item in _inventory_samples(current, "gpu_inventory_mismatch")
-            )
-            or len(recorded) >= 2
+            finding_incidents(current, CONTRADICTION_METRIC)
+            or finding_incidents(current, "gpu_inventory_mismatch")
+            or len(overrides(current)) >= 2
         ):
             return current
         return None
@@ -519,45 +587,86 @@ def gpu_expectation_wrong(ctx: VariantContext) -> dict[str, Any]:
         name="expectation-reaction",
     )
     ctx.evidence.write("source-window-close", replay.close())
-    observed = activity(ctx, started, metrics=GPU_METRICS)
+    closed_at = utc_now()
+    observed = activity(ctx, started, metrics=metrics)
     recorded = [
         {"observed_at": item["observed_at"], **(item.get("labels") or {})}
-        for item in _inventory_samples(observed, "gpu_inventory_expected_count")
-        if item["value"] == wrong
+        for item in overrides(observed)
     ]
     if not recorded:
         raise VariantInconclusive(
             f"the product never recorded the overridden expectation {wrong}"
         )
-    incidents = finding_incidents(observed, "gpu_inventory_mismatch")
-    if incidents:
+    contradictions = finding_incidents(observed, CONTRADICTION_METRIC)
+    mismatches = finding_incidents(observed, "gpu_inventory_mismatch")
+    if contradictions or mismatches:
         observed = wait_settled(
             ctx,
             started,
-            [str(item["incident_id"]) for item in incidents],
+            [str(item["incident_id"]) for item in (*contradictions, *mismatches)],
             timeout_seconds=REBOOT_SETTLE_BUDGET,
-            metrics=GPU_METRICS,
+            metrics=metrics,
             name="expectation-settled",
         )
+        contradictions = finding_incidents(observed, CONTRADICTION_METRIC)
+    recovered = _await_inventory_recovery(
+        ctx, closed_at, expected, name="expectation-recovery"
+    )
+    labels: dict[str, Any] = dict(recorded[-1])
     stages = {
         "not_a_missing_gpu": chain_errors(
             observed, ChainExpectation(metric="gpu_inventory_mismatch", present=False)
         ),
+        "configuration_finding": chain_errors(
+            observed,
+            ChainExpectation(
+                metric=CONTRADICTION_METRIC,
+                operations=("FREEZE_EVIDENCE",),
+                forbidden=HARDWARE_OPERATIONS | ISOLATION_OPERATIONS,
+            ),
+        ),
+        "evidence_only": [
+            f"the {CONTRADICTION_METRIC} incident {item['incident_id']} carries "
+            f"effective_action {item.get('effective_action')}, not COLLECT_EVIDENCE"
+            for item in contradictions
+            if item.get("effective_action") != "COLLECT_EVIDENCE"
+        ]
+        + [
+            f"the {CONTRADICTION_METRIC} workflow {workflow.get('request_id')} plans "
+            f"{operations(workflow)}: more than FREEZE_EVIDENCE"
+            for item in contradictions
+            for workflow in workflows_of(observed, str(item["incident_id"]))
+            if set(operations(workflow)) - {"FREEZE_EVIDENCE"}
+        ],
+        "reason_names_the_counts": [
+            error
+            for item in contradictions[:1]
+            for error in contradiction_reason_errors(item, labels, wrong=wrong)
+        ],
+        "operator_review": [
+            error
+            for item in contradictions[:1]
+            for error in operator_review_errors(observed, str(item["incident_id"]))
+        ],
         "no_reboot": hardware_errors(observed),
         "not_isolated": _isolation_errors(ctx, observed),
+        "recovered": recovered["errors"],
     }
     return _result_012(
         stages,
         notes=[
             f"expected count {expected} (product record) overridden to {wrong} in "
-            "the host collector unit only; the samples carry both counts and the "
-            "instance type, the evidence a configuration finding needs",
+            "the host collector unit only; the control plane re-reads the mismatch "
+            "against the instance type and grades the contradiction WARNING / "
+            "COLLECT_EVIDENCE for an operator, never a reboot",
         ],
         extra={
             "expected_count": expected,
             "overridden_count": wrong,
             "recorded_expectations": recorded[-3:],
-            "incidents": [str(item["incident_id"]) for item in incidents],
+            "incidents": [
+                str(item["incident_id"]) for item in (*contradictions, *mismatches)
+            ],
         },
     )
 
@@ -663,28 +772,29 @@ VARIANTS = [
         variant="expectation_wrong",
         proof_mode=LIVE_REPLAY,
         lanes=("eks", "hp"),
-        risk="H",
-        flags="X",
+        risk="M",
+        flags="S",
         injection=(
             "override GPU_FAULT_EXPECTED_GPU_COUNT in the host collector unit's "
             "environment to the product's recorded expected count plus one; the "
-            "window closes as soon as the product recorded the override twice or "
-            "minted a finding"
+            "window closes as soon as the product minted a finding on the override "
+            "or recorded it twice"
         ),
         expected=(
-            "the override is recorded as an expectation problem (expected_count vs "
-            "observed_count/node_instance_type on the samples); no gpu_inventory_mismatch "
-            "finding, no REBOOT_NODE, no isolation"
+            "no gpu_inventory_mismatch finding (the control plane re-reads the mismatch "
+            "against the instance type: listed == type count == driver-bound); one "
+            "gpu_expected_count_contradicted incident, WARNING / COLLECT_EVIDENCE, "
+            "FREEZE_EVIDENCE only, whose reason names the configured count, the "
+            "instance type and its count, the listed and the bound count; one "
+            "OPERATOR_REVIEW notification; no REBOOT_NODE / RESTART_NODE, no isolation; "
+            "the real expectation reads back after the window"
         ),
         cleanup=(
-            "close the env window (restores the real expectation); a REBOOT_NODE chain "
-            "the product minted meanwhile is its own and is waited to settle under "
-            "NODE_REBOOT -- the runner never cancels it"
+            "close the env window (restores the real expectation); the product's "
+            "evidence-only chain is waited to settle, never cancelled"
         ),
-        max_minutes=60,
-        approvals=(HOST_SOURCE_REPLAY, NODE_REBOOT),
-        expected_outcome="FAIL",
-        product_gap=EXPECTATION_GAP,
+        max_minutes=30,
+        approvals=(HOST_SOURCE_REPLAY,),
         execute=gpu_expectation_wrong,
     ),
     deferred_variant(
