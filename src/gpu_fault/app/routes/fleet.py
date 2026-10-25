@@ -24,7 +24,10 @@ from gpu_fault.fleet import (
     SignedAgentHeartbeat,
 )
 from gpu_fault.store import NotFoundError
-from gpu_fault.communication_monitoring import observation_plan
+from gpu_fault.communication_monitoring import (
+    COMMUNICATION_MONITOR_VERSIONS,
+    observation_plan,
+)
 
 
 @dataclass(frozen=True)
@@ -84,12 +87,16 @@ async def register_agent(
         record: AgentRecord = await _store_call(
             dependencies, registry.register, envelope
         )
-        if (
-            envelope.heartbeat.communication_monitor_version
-            == "communication-monitor/v1"
-        ):
+        # Each Agent gets the lease in the monitor version it speaks: a v1
+        # Agent refuses a plan with a field it does not know.
+        version = envelope.heartbeat.communication_monitor_version
+        if version in COMMUNICATION_MONITOR_VERSIONS:
             plan = await _store_call(
-                dependencies, observation_plan, dependencies.context.store, record
+                dependencies,
+                observation_plan,
+                dependencies.context.store,
+                record,
+                version=version,
             )
             return record.model_copy(update={"communication_plan": plan})
         return record

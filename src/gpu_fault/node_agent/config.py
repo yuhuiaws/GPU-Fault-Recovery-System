@@ -11,6 +11,7 @@ from pathlib import Path
 
 from gpu_fault.cluster_scope import DCGM_HOSTENGINE_ENV, ClusterProvider
 from gpu_fault.cluster_scope import dcgm_hostengine as parse_dcgm_hostengine
+from gpu_fault.communication_monitoring import COMMUNICATION_MONITOR_V1
 from gpu_fault.env import env_bool
 from gpu_fault.models import WorkflowOperation
 from gpu_fault.node_agent.common import (
@@ -88,7 +89,10 @@ def agent_config_payload(
         "ledger_max_results": executor.ledger.max_results,
     }
     if WorkflowOperation.COLLECT_HUNG_SUMMARY in executor.allowed_operations:
-        payload["communication_monitor_version"] = "communication-monitor/v1"
+        # That the passive monitor runs, not the protocol revision it speaks:
+        # that is code, negotiated per heartbeat (v2 reads container ids), so
+        # the Agent config digest stays where the control plane pins it.
+        payload["communication_monitor_version"] = COMMUNICATION_MONITOR_V1
     if executor.quiesce_manager is not None:
         payload["quiesce"] = {
             "services": executor.quiesce_manager.services,

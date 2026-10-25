@@ -22,6 +22,7 @@ from gpu_fault.node_agent.operations.process_identity import (
     process_start_ticks,
     workload_process,
 )
+from gpu_fault.node_agent.operations.workload_scope import target_workload_scope
 from gpu_fault.ras_observation import query_ras
 from gpu_fault.node_agent.operations.collection_budget import publish_partial
 
@@ -154,7 +155,24 @@ def sample_communication(
         CommunicationPlan.model_validate(raw_plan),
     )
     started = agent.now()
-    rows, coverage = discover(agent.proc_root, target.cgroup_paths)
+    # A managed Pod's target names its containers by runtime id (v2 lease).
+    paths, workload_scope = target_workload_scope(
+        agent.proc_root, target.cgroup_paths, target.container_ids
+    )
+    if not paths:
+        # No container found here: missing evidence, never an empty job.
+        return {
+            "status": "SCOPE_UNKNOWN",
+            "process_count": 0,
+            "observed_at": started.isoformat(),
+            "scan_complete": False,
+            "workload_scope": workload_scope,
+            "dump_triggers": 0,
+        }
+    rows, coverage = discover(agent.proc_root, paths)
+    if workload_scope.get("complete") is False:
+        # The processes of a container this node could not find are not here.
+        coverage["scan_complete"] = False
     devices, clients = gpu_sample(agent)
     command = SimpleNamespace(
         parameters={"job_id": target.job_id, "attempt_id": target.attempt_id}
@@ -180,15 +198,15 @@ def sample_communication(
         point["process_identity"]["verified"] = (
             valid
             and process_start_ticks(agent.proc_root, row["pid"]) == start
-            and workload_process(agent.proc_root, row["pid"], target.cgroup_paths)
+            and workload_process(agent.proc_root, row["pid"], paths)
         )
         samples.append(point)
-    bindings = task_rdma_bindings(agent, samples, target.cgroup_paths)
+    bindings = task_rdma_bindings(agent, samples, paths)
     publish_partial(
         agent,
         {"status": "COLLECTING", "processes": samples, "fabric_binding": bindings},
     )
-    ras = read_ras(agent, samples, target.ras_coordinator, target.cgroup_paths)
+    ras = read_ras(agent, samples, target.ras_coordinator, paths)
     document = {
         "version": "communication-sample/v1",
         "job_id": target.job_id,
@@ -207,6 +225,7 @@ def sample_communication(
         "fabric_binding": bindings,
         "ras": ras,
         **coverage,
+        "workload_scope": workload_scope,
         "participant_inventory_available": clients is not None,
     }
     history = CommunicationHistory(
@@ -225,5 +244,6 @@ def sample_communication(
         "ras_status": ras["status"],
         "fabric_binding_status": bindings["basis"],
         "scan_complete": coverage["scan_complete"],
+        "workload_scope": workload_scope,
         "dump_triggers": 0,
     }

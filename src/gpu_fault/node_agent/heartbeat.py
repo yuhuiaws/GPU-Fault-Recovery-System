@@ -22,6 +22,7 @@ from gpu_fault.collector_requirements import (
     CollectorActiveState,
     CollectorServiceState,
 )
+from gpu_fault.communication_monitoring import COMMUNICATION_MONITOR_V2
 from gpu_fault.dcgm_versions import (
     hostengine_version_from_dcgmi,
     hostengine_version_key,
@@ -456,7 +457,9 @@ class AgentHeartbeatReporter:
                 )
             )
         heartbeat = AgentHeartbeat(
-            communication_monitor_version="communication-monitor/v1"
+            # v2: this Agent reads container ids in a target; a control plane
+            # that knows only v1 sends it no lease (and a v1 Agent no ids).
+            communication_monitor_version=COMMUNICATION_MONITOR_V2
             if self.communication_plan_sink is not None
             else None,
             cluster_id=self.cluster_id,

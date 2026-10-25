@@ -217,3 +217,22 @@ def quiesce_workload_scope(
         return explicit, scope_without_container_ids(explicit)
     resolved, evidence = resolve_container_ids(proc_root, sorted(identifiers), explicit)
     return explicit | set(resolved), evidence
+
+
+def target_workload_scope(
+    proc_root: Path, cgroup_paths: Sequence[str], container_ids: Sequence[str]
+) -> tuple[list[str], dict[str, Any]]:
+    """A passive-monitor target's scope on this node, and its evidence.
+
+    The target's explicit cgroups first, then the cgroups of its containers
+    (``CommunicationTarget.container_ids``, validated runtime ids). Read-only:
+    the sampler reads ``/proc`` and attaches to nothing.
+    """
+
+    explicit = list(cgroup_paths)
+    if not container_ids:
+        return explicit, scope_without_container_ids(explicit)
+    resolved, evidence = resolve_container_ids(
+        proc_root, sorted(set(container_ids)), explicit
+    )
+    return list(dict.fromkeys([*explicit, *resolved])), evidence
