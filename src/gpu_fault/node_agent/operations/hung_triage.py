@@ -21,6 +21,7 @@ from gpu_fault.node_agent.operations.process_identity import (
     scoped_processes,
 )
 from gpu_fault.node_agent.operations.triage_samples import collect_process_series
+from gpu_fault.node_agent.operations.workload_scope import resolve_workload_scope
 from gpu_fault.node_agent.protocol import (
     NodeActionCommand,
 )
@@ -60,6 +61,8 @@ class HungTriageOperationsMixin:
         """Collect a bounded, read-only NCCL hang signal snapshot."""
 
         started = time.monotonic()
+        # The identity checks below all read this node's resolved scope.
+        command, workload_scope = resolve_workload_scope(self.proc_root, command)
         timeout_seconds = triage_timeout(command.parameters)
         errors: list[str] = []
         process_rows: list[dict[str, Any]] = []
@@ -196,6 +199,7 @@ class HungTriageOperationsMixin:
             "elapsed_seconds": round(time.monotonic() - started, 6),
             "flight_recorder_wait_seconds": flight_wait_seconds,
             "read_only": True,
+            "workload_scope": workload_scope,
             "process_coverage": {
                 "eligible": eligible_process_count,
                 "collected": len(ranks),

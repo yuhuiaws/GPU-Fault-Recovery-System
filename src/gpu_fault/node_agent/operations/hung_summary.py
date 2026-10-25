@@ -28,6 +28,7 @@ from gpu_fault.node_agent.operations.process_identity import (
 from gpu_fault.node_agent.operations.process_samples import wait_channel
 from gpu_fault.node_agent.protocol import NodeActionCommand
 from gpu_fault.node_agent.operations.network_bindings import task_rdma_bindings
+from gpu_fault.node_agent.operations.workload_scope import resolve_workload_scope
 
 
 def gpu_sample(
@@ -184,10 +185,14 @@ def collect_hung_summary(agent: Any, command: NodeActionCommand) -> dict[str, An
 
 def _collect_hung_summary(agent: Any, command: NodeActionCommand) -> dict[str, Any]:
     parameters = command.parameters
-    scope = parameters.get("workload_cgroup_paths_by_node", {}).get(command.node_id, [])
     epoch = parameters.get("snapshot_epoch")
     if not epoch or not parameters.get("job_id") or not parameters.get("attempt_id"):
         raise ValueError("hung summary requires an explicit snapshot epoch and attempt")
+    # A managed Pod names no cgroup: its runtime container ids are the scope.
+    command, workload_scope = resolve_workload_scope(agent.proc_root, command)
+    scope = command.parameters.get("workload_cgroup_paths_by_node", {}).get(
+        command.node_id, []
+    )
     base = {
         "summary_version": SUMMARY_VERSION,
         "snapshot_epoch": epoch,
@@ -200,6 +205,7 @@ def _collect_hung_summary(agent: Any, command: NodeActionCommand) -> dict[str, A
         "rdma": {},
         "read_only": True,
         "attachments": 0,
+        "workload_scope": workload_scope,
     }
     if not scope or not all(
         isinstance(path, str) and path.startswith("/") and path != "/" for path in scope
@@ -207,6 +213,9 @@ def _collect_hung_summary(agent: Any, command: NodeActionCommand) -> dict[str, A
         return {**base, "status": "SCOPE_UNKNOWN", "scan_complete": False}
     started = agent.now()
     rows, coverage = discover(agent.proc_root, scope)
+    if workload_scope.get("complete") is False:
+        # The ranks of a container this node could not find are not in rows.
+        coverage["scan_complete"] = False
     first = {row["pid"]: proc_sample(agent.proc_root, row["pid"]) for row in rows}
     application = {
         row["pid"]: application_sample(
