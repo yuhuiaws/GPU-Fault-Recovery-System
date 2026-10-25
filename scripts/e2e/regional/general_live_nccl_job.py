@@ -115,10 +115,17 @@ PROGRESS_MODES = ("phase", *ROLE_MODES)
 WRITE_BYTES_PER_SECOND = 4 * 1024 * 1024
 TRAINER_STEPS = 3600
 #: ``docs/部署和运维手册.md``: what a training container injects for NCCL hung
-#: forensics (the three-node managed fixture carries the same values).
+#: forensics (the three-node managed fixture carries the same values). The dump
+#: file is pinned under both PyTorch names: 2.9 reads ``TORCH_FR_DUMP_TEMP_FILE``
+#: first and would otherwise dump to ``$HOME/.cache/torch/comm_lib_trace_rank_``;
+#: 2.8 reads ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE`` only. The buffer keeps its old
+#: name because the debug pipe is created only when
+#: ``TORCH_NCCL_TRACE_BUFFER_SIZE`` > 0 (ProcessGroupNCCL.hpp ``DumpPipe``).
 FLIGHT_RECORDER_ENV = {
     "TORCH_NCCL_TRACE_BUFFER_SIZE": "20000",
     "TORCH_NCCL_DEBUG_INFO_PIPE_FILE": "/tmp/torch_nccl_debug_pipe_",
+    "TORCH_FR_DUMP_TEMP_FILE": "/tmp/nccl_trace_rank_",
+    "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": "/tmp/nccl_trace_rank_",
     "TORCH_NCCL_DUMP_ON_TIMEOUT": "1",
 }
 FLIGHT_RECORDER_OFF_ENV = {"TORCH_NCCL_TRACE_BUFFER_SIZE": "0"}
@@ -148,11 +155,12 @@ FR_LOG_MARKERS = (
 )
 FR_LOG_TAIL = 2000
 FR_DUMP_REQUEST_MARKER = FR_LOG_MARKERS[0]
-#: Variables the renderer owns; any copy in the source manifest is replaced.
+#: Variables the renderer owns; any copy in the source manifest is replaced
+#: (``TORCH_FR_BUFFER_SIZE`` too: 2.9 would read it before the ``0`` above).
 MANAGED_ENV = frozenset(
     {
         *FLIGHT_RECORDER_ENV,
-        "TORCH_NCCL_DEBUG_INFO_TEMP_FILE",
+        "TORCH_FR_BUFFER_SIZE",
         SHAPE_ENV,
         "GPU_FAULT_RANK_PROGRESS_FILE",
         "GFRS_ATTEMPT_ID",

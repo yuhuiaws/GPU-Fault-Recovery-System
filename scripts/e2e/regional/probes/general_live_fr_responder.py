@@ -376,7 +376,8 @@ class Responder:
         return f"{self.pipe_base}{rank}.pipe"
 
     def dump_path(self, rank: int) -> str:
-        # PyTorch's own dump name: ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE`` + rank.
+        # PyTorch's own dump name: the prefix (``TORCH_FR_DUMP_TEMP_FILE``, or
+        # the pre-2.9 ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE``) + rank, no extension.
         return f"{self.dump_base}{rank}"
 
     @property

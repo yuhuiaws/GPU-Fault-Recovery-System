@@ -218,6 +218,7 @@ def test_a_replayed_recorder_renders_the_responder_and_turns_pytorchs_off() -> N
         assert values["TORCH_NCCL_TRACE_BUFFER_SIZE"] == "0", role
         assert "TORCH_NCCL_DUMP_ON_TIMEOUT" not in values, role
         assert values["TORCH_NCCL_DEBUG_INFO_PIPE_FILE"] == replay.PIPE_BASE
+        assert values["TORCH_FR_DUMP_TEMP_FILE"] == replay.DUMP_BASE
         assert values["TORCH_NCCL_DEBUG_INFO_TEMP_FILE"] == replay.DUMP_BASE
         assert values[replay.SHAPE_ENV] == shape.shape_json(
             world_size=16, procs_per_node=8
@@ -262,9 +263,12 @@ def test_a_replayed_recorder_renders_the_responder_and_turns_pytorchs_off() -> N
         )
     assert script_of(document) == nj.trainer_script(), "the trainer itself is unchanged"
     plain = env(trainer(pods(render(flight_recorder=True))["Master"]))
-    assert (
-        replay.SHAPE_ENV not in plain and "TORCH_NCCL_DEBUG_INFO_TEMP_FILE" not in plain
-    )
+    assert replay.SHAPE_ENV not in plain
+    # The manual's own injection: PyTorch's recorder on, the dump file pinned
+    # under both PyTorch names to the same base the replay uses.
+    assert plain["TORCH_NCCL_TRACE_BUFFER_SIZE"] == "20000"
+    assert plain["TORCH_FR_DUMP_TEMP_FILE"] == replay.DUMP_BASE
+    assert plain["TORCH_NCCL_DEBUG_INFO_TEMP_FILE"] == replay.DUMP_BASE
     assert replay.HEREDOC not in trainer(pods(render())["Master"])["command"][-1]
     assert (
         replay.RESPONDER_MAX_SECONDS

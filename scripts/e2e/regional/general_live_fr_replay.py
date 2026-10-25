@@ -55,9 +55,11 @@ RESPONDER_PATH = "/tmp/gfrs_fr_responder.py"
 STATE_DIR = "/tmp/gfrs-fr-replay"
 LEDGER_PATH = f"{STATE_DIR}/ledger.json"
 LOG_PATH = f"{STATE_DIR}/responder.log"
-#: The pipe base the operations manual prescribes and the dump base PyTorch
-#: defaults ``TORCH_NCCL_DEBUG_INFO_TEMP_FILE`` to; both are set explicitly in
-#: the job's environment so the product and the responder read the same names.
+#: The pipe base and the dump base the operations manual prescribes (the dump
+#: base is PyTorch 2.8's default; 2.9 defaults to ``$HOME/.cache/torch/
+#: comm_lib_trace_rank_`` and reads ``TORCH_FR_DUMP_TEMP_FILE`` first); all are
+#: set explicitly in the job's environment, the dump base under both PyTorch
+#: names, so the product and the responder read the same names.
 PIPE_BASE = "/tmp/torch_nccl_debug_pipe_"
 DUMP_BASE = "/tmp/nccl_trace_rank_"
 SHAPE_ENV = "GFRS_FR_REPLAY_SHAPE"
@@ -390,6 +392,7 @@ def responder_environment(
     return {
         "TORCH_NCCL_TRACE_BUFFER_SIZE": "0",
         "TORCH_NCCL_DEBUG_INFO_PIPE_FILE": PIPE_BASE,
+        "TORCH_FR_DUMP_TEMP_FILE": DUMP_BASE,
         "TORCH_NCCL_DEBUG_INFO_TEMP_FILE": DUMP_BASE,
         SHAPE_ENV: replay.shape_json(
             world_size=NODES * procs_per_node, procs_per_node=procs_per_node

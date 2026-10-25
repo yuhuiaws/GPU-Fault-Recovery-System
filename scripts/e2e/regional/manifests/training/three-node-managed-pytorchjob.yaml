@@ -85,6 +85,10 @@ spec:
               value: '20000'
             - name: TORCH_NCCL_DEBUG_INFO_PIPE_FILE
               value: /tmp/torch_nccl_debug_pipe_
+            - name: TORCH_FR_DUMP_TEMP_FILE
+              value: /tmp/nccl_trace_rank_
+            - name: TORCH_NCCL_DEBUG_INFO_TEMP_FILE
+              value: /tmp/nccl_trace_rank_
             - name: TORCH_NCCL_DUMP_ON_TIMEOUT
               value: '1'
             - name: FI_PROVIDER
@@ -174,6 +178,10 @@ spec:
               value: '20000'
             - name: TORCH_NCCL_DEBUG_INFO_PIPE_FILE
               value: /tmp/torch_nccl_debug_pipe_
+            - name: TORCH_FR_DUMP_TEMP_FILE
+              value: /tmp/nccl_trace_rank_
+            - name: TORCH_NCCL_DEBUG_INFO_TEMP_FILE
+              value: /tmp/nccl_trace_rank_
             - name: TORCH_NCCL_DUMP_ON_TIMEOUT
               value: '1'
             - name: FI_PROVIDER
