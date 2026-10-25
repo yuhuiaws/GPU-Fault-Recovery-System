@@ -24,6 +24,19 @@ wrapper's journal (``replay.audit``) is the oracle that the product asked, and a
 variant whose rule was never served is INCONCLUSIVE, not PASS. Every variant
 closes its window and proves the real tool answers again before it ends;
 ``healthy`` is the read-only baseline. ``proof_scope`` is ``live-replay``.
+
+A node without ``smartctl`` (the AL2023 EKS GPU AMI) keeps the six replay
+variants NOT_RUN(CAPABILITY_ABSENT) unless ``TEMP_TEST_PACKAGE_INSTALL`` is
+given; then the shared temporary-package step (``general_live_deps``) installs
+exactly ``smartmontools`` for this run before anything else and removes it as
+the last LIFO cleanup, after the window closed. No collector restart is needed
+for the install: ``_smart`` runs ``shutil.which("smartctl")`` on every tick and
+the unit's ``ProtectSystem=strict`` is a read-only view of the live ``/usr``,
+so the next tick scans and grades the drives; the runner then waits up to one
+health summary plus a few ticks for the product's first ``smart_health_failed``
+reading (``smart_devices(fresh=True)``) -- that device is the variant's drive.
+The window itself restarts the unit on open and close as before, and after the
+removal the product reports ``smart_status_unsupported`` TOOL_MISSING again.
 """
 
 from __future__ import annotations
@@ -40,11 +53,16 @@ from scripts.e2e.regional.general_live_common import (
     wait_for_incident,
     wait_settled,
 )
+from scripts.e2e.regional.general_live_deps import (
+    PACKAGE_APPROVAL,
+    dependency_summary,
+    deps_deadman_seconds,
+    ensure_dependencies,
+)
 from scripts.e2e.regional.general_live_fixture import (
     VariantContext,
     VariantInconclusive,
     VariantNotRun,
-    require_tools,
     utc_now,
 )
 from scripts.e2e.regional.general_live_registry import (
@@ -85,6 +103,10 @@ QUARANTINE_BUDGET = 420
 #: ``baseline``, so the marker is normally in the first or second batch.
 MARKER_TICKS = 8
 SETTLE_TICKS = 2
+#: Ticks past one health summary allowed for the product's first verdict after
+#: ``smartctl`` was installed for this run: the collector finds the tool on its
+#: next tick (no restart), a healthy verdict travels with the next summary.
+FIRST_VERDICT_TICKS = 6
 #: Journal lines read back for the oracle (the probe caps at 400): one scan per
 #: tick plus one -H per drive per cache period, so this covers ~1.5 h.
 AUDIT_TAIL = 400
@@ -166,18 +188,28 @@ def unsupported_device_rules(device: str) -> list[dict[str, Any]]:
 
 
 # --------------------------------------------------------------------------- #
-# the product's drives, the window, the oracle
+# the tool, the product's drives, the window, the oracle
 # --------------------------------------------------------------------------- #
-def smart_devices(ctx: VariantContext) -> list[str]:
-    """The drives the product grades now: its latest ``smart_health_failed`` devices.
+def ensure_smartctl(ctx: VariantContext, survey: dict[str, Any]) -> dict[str, Any]:
+    """``smartctl`` as the node has it, or ``smartmontools`` for this run only.
 
-    Read-only, from the product's own records, so the device a variant names in
-    its plan is one the product's ``--scan-open`` lists and ``-H -j`` answers for
-    on this node. No verdict for any drive means SMART is not a capability here
-    (``smart_status_unsupported`` TOOL_MISSING / NO_DEVICES / NO_SMART_STATUS).
+    The shared temporary-package step: NOT_RUN(CAPABILITY_ABSENT) naming the
+    token without ``TEMP_TEST_PACKAGE_INSTALL``; with it the probe installs
+    exactly ``smartmontools`` (a transaction pulling anything else is refused)
+    and its removal is the last LIFO cleanup, after the window closed. The
+    package deadman is timed after the window's restore deadman.
     """
 
-    current = activity(ctx, utc_now(), metrics=SMART_METRICS)
+    return ensure_dependencies(
+        ctx,
+        survey,
+        tools=(TOOL,),
+        deadman_seconds=deps_deadman_seconds(ctx.spec.max_minutes * 60),
+        evidence="smart-dependencies",
+    )
+
+
+def _verdict_devices(current: Mapping[str, Any]) -> tuple[list[str], list[Any]]:
     latest = [
         item
         for item in current.get("metric_latest") or []
@@ -192,12 +224,52 @@ def smart_devices(ctx: VariantContext) -> list[str]:
             and wrapper.DEVICE_NODE.fullmatch(item["device"]) is not None
         }
     )
-    ctx.evidence.write("smart-baseline", {"devices": devices, "metric_latest": latest})
+    return devices, latest
+
+
+def smart_devices(ctx: VariantContext, *, fresh: bool = False) -> list[str]:
+    """The drives the product grades now: its latest ``smart_health_failed`` devices.
+
+    Read-only, from the product's own records, so the device a variant names in
+    its plan is one the product's ``--scan-open`` lists and ``-H -j`` answers for
+    on this node. No verdict for any drive means SMART is not a capability here
+    (``smart_status_unsupported`` TOOL_MISSING / NO_DEVICES / NO_SMART_STATUS).
+
+    ``fresh``: ``smartctl`` was installed for this run moments ago, so the
+    product's first verdict is still to come -- the host collector finds the
+    tool on its next tick (``shutil.which`` per tick, no restart) and a healthy
+    verdict travels with the next health summary -- so wait up to one summary
+    plus ``FIRST_VERDICT_TICKS`` ticks for it before deciding.
+    """
+
+    devices, latest = _verdict_devices(activity(ctx, utc_now(), metrics=SMART_METRICS))
+    if not devices and fresh:
+
+        def poll() -> list[str] | None:
+            nonlocal devices, latest
+            devices, latest = _verdict_devices(
+                activity(ctx, utc_now(), metrics=SMART_METRICS)
+            )
+            return devices or None
+
+        ctx.wait_until(
+            poll,
+            timeout_seconds=ctx.host_summary
+            + ctx.host_interval * FIRST_VERDICT_TICKS
+            + 60,
+            poll_seconds=ctx.host_interval,
+            name="smart-first-verdict",
+        )
+    ctx.evidence.write(
+        "smart-baseline",
+        {"devices": devices, "metric_latest": latest, "fresh_install": fresh},
+    )
     if not devices:
         raise VariantNotRun(
             "CAPABILITY_ABSENT",
             "the product reports no drive with a SMART verdict on this node "
-            f"(latest SMART markers: {[item.get('labels') for item in latest]})",
+            + ("after smartctl was installed for this run " if fresh else "")
+            + f"(latest SMART markers: {[item.get('labels') for item in latest]})",
         )
     return devices
 
@@ -514,8 +586,8 @@ def health_failed(ctx: VariantContext) -> dict[str, Any]:
     """Live-replay: ``smart_status.passed=false`` on one drive -> QUARANTINE -> restore."""
 
     survey = run_survey(ctx)
-    require_tools(survey, TOOL)
-    device = smart_devices(ctx)[0]
+    dependencies = ensure_smartctl(ctx, survey)
+    device = smart_devices(ctx, fresh=dependencies["changed"])[0]
     replay, _opened = open_smart_window(ctx, health_failed_rules(device))
     started = utc_now()
     # smart_health_failed is an immediate CRITICAL rule and the tick that reads
@@ -581,7 +653,12 @@ def health_failed(ctx: VariantContext) -> dict[str, Any]:
             "smartctl JSON parser; MARK_UNSCHEDULABLE + QUARANTINE, then the "
             "validated restore"
         ],
-        extra={"device": device, "recovery": recovered, **replay.evidence(tool=TOOL)},
+        extra={
+            "device": device,
+            "recovery": recovered,
+            "dependencies": dependency_summary(dependencies),
+            **replay.evidence(tool=TOOL),
+        },
     )
 
 
@@ -597,8 +674,8 @@ def _unknown_variant(
     """One drive's ``-H -j`` answer replaced -> UNKNOWN for that drive only."""
 
     survey = run_survey(ctx)
-    require_tools(survey, TOOL)
-    devices = smart_devices(ctx)
+    dependencies = ensure_smartctl(ctx, survey)
+    devices = smart_devices(ctx, fresh=dependencies["changed"])
     device = devices[0]
     replay, _opened = open_smart_window(ctx, rules(device))
     started = utc_now()
@@ -621,6 +698,7 @@ def _unknown_variant(
         extra={
             "device": device,
             "collection_errors": smart_errors(observed),
+            "dependencies": dependency_summary(dependencies),
             **replay.evidence(tool=TOOL),
         },
     )
@@ -662,8 +740,8 @@ def scan_failed(ctx: VariantContext) -> dict[str, Any]:
     """Live-replay: a non-zero ``--scan-open`` leaves the drive set UNKNOWN, not empty."""
 
     survey = run_survey(ctx)
-    require_tools(survey, TOOL)
-    smart_devices(ctx)
+    dependencies = ensure_smartctl(ctx, survey)
+    smart_devices(ctx, fresh=dependencies["changed"])
     replay, _opened = open_smart_window(ctx, scan_failed_rules())
     started = utc_now()
     observed = settled_read(
@@ -697,6 +775,7 @@ def scan_failed(ctx: VariantContext) -> dict[str, Any]:
         ],
         extra={
             "collection_errors": smart_errors(observed),
+            "dependencies": dependency_summary(dependencies),
             **replay.evidence(tool=TOOL),
         },
     )
@@ -706,8 +785,8 @@ def tool_missing(ctx: VariantContext) -> dict[str, Any]:
     """Live-replay: no ``smartctl`` inside the unit -> NOT_SUPPORTED, no error, no finding."""
 
     survey = run_survey(ctx)
-    require_tools(survey, TOOL)
-    smart_devices(ctx)
+    dependencies = ensure_smartctl(ctx, survey)
+    smart_devices(ctx, fresh=dependencies["changed"])
     replay, opened = open_smart_window(ctx, hide_tool=True)
     started = utc_now()
     observed = settled_read(
@@ -754,6 +833,7 @@ def tool_missing(ctx: VariantContext) -> dict[str, Any]:
         ],
         extra={
             "verification": opened.get("verification"),
+            "dependencies": dependency_summary(dependencies),
             **replay.evidence(tool=TOOL),
         },
     )
@@ -763,8 +843,8 @@ def unsupported_device(ctx: VariantContext) -> dict[str, Any]:
     """Live-replay: a drive without ``smart_status`` is NOT_SUPPORTED, not failed, not healthy."""
 
     survey = run_survey(ctx)
-    require_tools(survey, TOOL)
-    devices = smart_devices(ctx)
+    dependencies = ensure_smartctl(ctx, survey)
+    devices = smart_devices(ctx, fresh=dependencies["changed"])
     device = devices[0]
     replay, _opened = open_smart_window(ctx, unsupported_device_rules(device))
     started = utc_now()
@@ -809,7 +889,11 @@ def unsupported_device(ctx: VariantContext) -> dict[str, Any]:
             "smart_status_unsupported NO_SMART_STATUS, no error, no finding, "
             "never a passed drive"
         ],
-        extra={"device": device, **replay.evidence(tool=TOOL)},
+        extra={
+            "device": device,
+            "dependencies": dependency_summary(dependencies),
+            **replay.evidence(tool=TOOL),
+        },
     )
 
 
@@ -835,6 +919,9 @@ def _spec(
         cleanup=cleanup,
         max_minutes=max_minutes,
         approvals=(HOST_SOURCE_REPLAY,),
+        # Only unlocks the temporary smartmontools install on a node without
+        # smartctl; the variant runs without it wherever the tool exists.
+        optional_approvals=(PACKAGE_APPROVAL,),
         execute=execute,
     )
 
@@ -901,8 +988,10 @@ VARIANTS = [
 __all__ = [
     "AUDIT_TAIL",
     "CASE",
+    "FIRST_VERDICT_TICKS",
     "SMART_METRICS",
     "VARIANTS",
+    "ensure_smartctl",
     "failed_query_json",
     "health_failed_rules",
     "malformed_json_rules",

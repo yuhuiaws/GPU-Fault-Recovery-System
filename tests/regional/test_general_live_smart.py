@@ -8,12 +8,16 @@ what is sent (the reviewed rule per variant, ``--wrapper smartctl`` or
 records (marker + collection error for UNKNOWN, marker without error for
 NOT_SUPPORTED, the QUARANTINE chain and restore for a failed drive), that a rule
 the product never had served is INCONCLUSIVE, and that the real tool must answer
-again after the close.
+again after the close. A node without ``smartctl`` stays NOT_RUN(CAPABILITY_ABSENT)
+naming ``TEMP_TEST_PACKAGE_INSTALL``; with the token the shared dependency step
+installs ``smartmontools`` first, the runner waits for the product's first
+verdict, and the package removal is the last cleanup after the window closed.
 """
 
 from __future__ import annotations
 
 import base64
+import dataclasses
 import json
 from pathlib import Path
 from typing import Any
@@ -21,6 +25,7 @@ from typing import Any
 import pytest
 
 from scripts.e2e.regional import general_live_smart as smart
+from scripts.e2e.regional.general_live_deps import DEPS_TIMEOUT, PACKAGE_APPROVAL
 from scripts.e2e.regional.general_live_fixture import VariantInconclusive, VariantNotRun
 from scripts.e2e.regional.general_live_registry import (
     LIVE_REPLAY,
@@ -98,10 +103,14 @@ def healthy(*times: str) -> dict[str, Any]:
     )
 
 
+SMART_NEVRA = "smartmontools-1:7.3-1.amzn2023.0.2.x86_64"
+WITH_INSTALL = (HOST_SOURCE_REPLAY, PACKAGE_APPROVAL)
+
+
 def survey(smartctl: bool = True) -> dict[str, Any]:
     return {
         "cpu_count": 8,
-        "tools": {"smartctl": smartctl, "systemd-run": True},
+        "tools": {"smartctl": smartctl, "systemd-run": True, "dnf": True, "rpm": True},
         "modules": {},
         "backing": [],
         "collector_env": {
@@ -113,15 +122,30 @@ def survey(smartctl: bool = True) -> dict[str, Any]:
 
 
 class Scenario:
-    """The product's records before the window closes, and after."""
+    """The product's records before the window closes, and after.
 
-    def __init__(self, during: dict[str, Any], after: dict[str, Any] | None = None):
+    ``warmup`` documents are served first, one per read, before ``during``: the
+    product's records while a freshly installed ``smartctl`` has no verdict yet.
+    """
+
+    def __init__(
+        self,
+        during: dict[str, Any],
+        after: dict[str, Any] | None = None,
+        *,
+        warmup: list[dict[str, Any]] | None = None,
+    ):
         self.during = during
         self.after = healthy() if after is None else after
+        self.warmup = list(warmup or [])
         self.closed = False
         self.events: list[str] = []
+        self.reads = 0
 
     def activity(self, _script: str, *_arguments: str) -> dict[str, Any]:
+        self.reads += 1
+        if self.warmup and not self.closed:
+            return self.warmup.pop(0)
         return self.after if self.closed else self.during
 
     def close(self, _arguments: tuple[str, ...]) -> dict[str, Any]:
@@ -161,14 +185,32 @@ def source_probe(scenario: Scenario, entries: list[dict[str, Any]]) -> FakeProbe
     )
 
 
-def run(
+def deps_probe(**overrides: Any) -> FakeProbe:
+    """The dependency probe: ``smartmontools`` installed for the run, clean removal."""
+
+    ensure = {
+        "refused": None,
+        "tools": {"smartctl": True},
+        "modules": {},
+        "installed": [SMART_NEVRA],
+        "modules_loaded_by_run": [],
+        "transaction": [{"name": "smartmontools", "section": "Installing"}],
+        "deadman": "gfrs-abcdef-pdeadman",
+    }
+    ensure.update(overrides)
+    return FakeProbe({"ensure": ensure, "cleanup": {"clean": True}})
+
+
+def build(
     variant: str,
     scenario: Scenario,
     tmp_path: Path,
     *,
     entries: list[dict[str, Any]] | None = None,
     smartctl: bool = True,
-) -> tuple[dict[str, Any], FakeProbe, FakeProbe]:
+    approvals: tuple[str, ...] | None = None,
+    deps: FakeProbe | None = None,
+) -> tuple[Any, FakeProbe, FakeProbe, FakeProbe]:
     spec = SPECS[variant]
     if entries is None:
         entries = [
@@ -177,15 +219,45 @@ def run(
         ]
     node = FakeProbe({"survey": survey(smartctl)})
     source = source_probe(scenario, entries)
+    deps = deps or deps_probe()
     regional = FakeRegional(cpu_python=scenario.activity)
+    settings = make_settings(spec, node=NODE)
+    if approvals is not None:
+        settings = dataclasses.replace(settings, approvals=approvals)
     ctx = make_context(
         spec,
         tmp_path=tmp_path,
         regional=regional,
-        probes={f"node@{NODE}": node, f"source-replay@{NODE}": source},
-        settings=make_settings(spec, node=NODE),
+        probes={
+            f"node@{NODE}": node,
+            f"source-replay@{NODE}": source,
+            f"deps@{NODE}": deps,
+        },
+        settings=settings,
     )
-    return spec.execute(ctx), source, node
+    return ctx, source, node, deps
+
+
+def run(
+    variant: str,
+    scenario: Scenario,
+    tmp_path: Path,
+    *,
+    entries: list[dict[str, Any]] | None = None,
+    smartctl: bool = True,
+    approvals: tuple[str, ...] | None = None,
+    deps: FakeProbe | None = None,
+) -> tuple[dict[str, Any], FakeProbe, FakeProbe]:
+    ctx, source, node, _deps = build(
+        variant,
+        scenario,
+        tmp_path,
+        entries=entries,
+        smartctl=smartctl,
+        approvals=approvals,
+        deps=deps,
+    )
+    return ctx.spec.execute(ctx), source, node
 
 
 def sent_plan(source: FakeProbe) -> dict[str, Any]:
@@ -227,6 +299,7 @@ def test_every_007_variant_is_registered_on_both_lanes() -> None:
         else:
             assert spec.proof_mode == LIVE_REPLAY, spec.key
             assert spec.approvals == (HOST_SOURCE_REPLAY,), spec.key
+            assert spec.optional_approvals == (PACKAGE_APPROVAL,), spec.key
             assert spec.expected_outcome == "PASS", spec.key
 
 
@@ -355,6 +428,131 @@ def test_a_node_without_a_smart_verdict_is_not_run(tmp_path: Path) -> None:
         run("health_failed", scenario, tmp_path)
     with pytest.raises(VariantNotRun, match="lacks smartctl"):
         run("health_failed", Scenario(healthy()), tmp_path, smartctl=False)
+
+
+# --------------------------------------------------------------------------- #
+# smartmontools for one run (TEMP_TEST_PACKAGE_INSTALL)
+# --------------------------------------------------------------------------- #
+@pytest.mark.parametrize(
+    "variant",
+    ["health_failed", "query_failed", "scan_failed", "malformed_json", "tool_missing"],
+)
+def test_without_the_token_a_node_without_smartctl_names_the_install(
+    tmp_path: Path, variant: str
+) -> None:
+    ctx, source, _node, deps = build(
+        variant, Scenario(healthy()), tmp_path, smartctl=False
+    )
+    with pytest.raises(VariantNotRun) as raised:
+        ctx.spec.execute(ctx)
+    assert raised.value.reason == "CAPABILITY_ABSENT"
+    assert raised.value.detail == (
+        "the node lacks smartctl (TEMP_TEST_PACKAGE_INSTALL installs smartmontools "
+        "for one run)"
+    )
+    assert deps.calls == [] and source.calls == [], "nothing touched the node"
+    assert ctx.cleanup.pending() == []
+
+
+def test_with_the_token_smartmontools_is_installed_first_and_removed_last(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The product has no verdict while the tool is missing; after the install
+    # its first reading arrives (one summary later) and names the drive.
+    scenario = Scenario(
+        unknown_doc(DEV0, "QUERY_FAILED", "no verdict, exit status 2"),
+        warmup=[doc(metric_latest=[]), doc(metric_latest=[])],
+    )
+    ctx, source, _node, deps = build(
+        "query_failed", scenario, tmp_path, smartctl=False, approvals=WITH_INSTALL
+    )
+    result = ctx.spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert deps.calls == [
+        (
+            "ensure",
+            "--tool",
+            "smartctl",
+            "--deadman-seconds",
+            str(min(5400, ctx.spec.max_minutes * 60 + DEPS_TIMEOUT + 300)),
+            "--allow-install",
+            "--run-id",
+            ctx.run_id,
+        )
+    ]
+    assert result["dependencies"] == {
+        "changed": True,
+        "installed": [SMART_NEVRA],
+        "modules_loaded_by_run": [],
+        "transaction": [{"name": "smartmontools", "section": "Installing"}],
+    }
+    baseline = json.loads((ctx.case_dir / "smart-baseline.json").read_text())
+    assert baseline["fresh_install"] is True and baseline["devices"] == [DEV0, DEV1]
+    assert scenario.reads > 3, "the runner waited for the product's first verdict"
+    # The window came after the install and closed before the package goes:
+    # the dependency cleanup sits at the bottom of the LIFO stack.
+    assert source.calls[0][0] == "install-source", source.calls[:2]
+    assert ctx.cleanup.pending()[0] == "deps", ctx.cleanup.pending()
+    assert ctx.cleanup.run() and ctx.cleanup.failed == [], ctx.cleanup.results
+    assert deps.calls[-1] == ("cleanup", "--run-id", ctx.run_id)
+
+
+def test_a_node_with_smartctl_installs_nothing_even_with_the_token(
+    tmp_path: Path,
+) -> None:
+    ctx, _source, _node, deps = build(
+        "scan_failed",
+        Scenario(unknown_doc(None, "SCAN_FAILED", "smartctl --scan-open failed")),
+        tmp_path,
+        approvals=WITH_INSTALL,
+    )
+    result = ctx.spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert deps.calls == [] and result["dependencies"]["changed"] is False
+    assert "deps" not in ctx.cleanup.pending()
+
+
+def test_a_refused_install_is_fixture_not_ready_before_any_window(
+    tmp_path: Path,
+) -> None:
+    refused = {
+        "reason": "FIXTURE_NOT_READY",
+        "detail": "dnf would also installing dependencies mailx-12.5-30.amzn2023.x86_64",
+    }
+    ctx, source, _node, _deps = build(
+        "health_failed",
+        Scenario(healthy()),
+        tmp_path,
+        smartctl=False,
+        approvals=WITH_INSTALL,
+        deps=deps_probe(refused=refused, installed=[], tools={"smartctl": False}),
+    )
+    with pytest.raises(VariantNotRun) as raised:
+        ctx.spec.execute(ctx)
+    assert (raised.value.reason, raised.value.detail) == (
+        "FIXTURE_NOT_READY",
+        refused["detail"],
+    )
+    assert source.calls == [], "no window once the dependency step refused"
+    assert ctx.cleanup.pending() == ["deps"], "a half-finished install is undone"
+
+
+def test_no_verdict_after_the_install_is_capability_absent_after_the_wait(
+    tmp_path: Path,
+) -> None:
+    ctx, source, _node, _deps = build(
+        "unsupported_device",
+        Scenario(doc(metric_latest=[])),
+        tmp_path,
+        smartctl=False,
+        approvals=WITH_INSTALL,
+    )
+    with pytest.raises(VariantNotRun) as raised:
+        ctx.spec.execute(ctx)
+    assert raised.value.reason == "CAPABILITY_ABSENT"
+    assert "after smartctl was installed for this run" in raised.value.detail
+    assert source.calls == [], "no window without a drive to name"
+    assert ctx.cleanup.pending() == ["deps"], "the package is still removed"
 
 
 # --------------------------------------------------------------------------- #
