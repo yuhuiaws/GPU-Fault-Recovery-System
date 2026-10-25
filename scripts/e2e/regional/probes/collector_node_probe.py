@@ -58,6 +58,11 @@ ENV_KEYS = {
 }
 SAFE_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 INSTANCE_TYPE = re.compile(r"[A-Za-z0-9][A-Za-z0-9.\-]{0,63}")
+GPU_UUID = re.compile(r"GPU-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}")
+#: COLLECT-004's stimulus: one real GPU UUID dropped from the isolated
+#: collector's own nvidia-smi listing (the GF-GENERAL-LIVE-012 ``drop_row``
+#: idiom), the configured expected count untouched.
+LISTING_STIMULUS = "DROPPED_REAL_GPU_UUID"
 SAFE_BDF = re.compile(r"^0000:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$")
 
 
@@ -1722,6 +1727,74 @@ class InventorySampleSink:
         return {}
 
 
+class DroppedUuidListing:
+    """The GF-GENERAL-LIVE-012 ``drop_row`` idiom inside the isolated collector.
+
+    ``HostTelemetryCollector.runner`` with the ``BoundedProcessRunner`` call
+    shape: every command reaches the real binary through ``collector_runner``;
+    for the host collector's own GPU listing query (``GPU_QUERY_ARGV``) the one
+    row whose first column is ``uuid`` is removed from the real answer -- the
+    rewrite the reviewed host source replay wrapper applies as ``drop_row``
+    (``tools/host_command_replay.py``) -- so this collector lists exactly one
+    real GPU fewer than the configured count while the production collector,
+    its configuration and the node's listing stay untouched. The real listing
+    must carry the UUID and exactly ``expected`` distinct UUIDs on every tick:
+    a GPU that is really missing is never masked, and a drop that finds nothing
+    to drop is refused rather than passed through. Every tick is journaled
+    (real/served UUID counts and sha256) for the receipt.
+    """
+
+    def __init__(self, uuid: str, expected: int, query_argv: tuple[str, ...]) -> None:
+        self.uuid = uuid
+        self.expected = expected
+        self.query_argv = tuple(query_argv)
+        self.ticks: list[dict[str, Any]] = []
+
+    def __call__(
+        self,
+        argv: list[str],
+        *,
+        capture_output: bool = False,
+        text: bool = False,
+        timeout: float | None = None,
+        check: bool = False,
+    ) -> subprocess.CompletedProcess[str]:
+        completed = collector_runner(
+            argv, capture_output=capture_output, text=text, timeout=timeout, check=check
+        )
+        if tuple(argv) != self.query_argv:
+            return completed
+        if completed.returncode != 0:
+            raise ProbeError("isolated inventory listing query failed; nothing dropped")
+        rows = completed.stdout.splitlines()
+        listed = [row.split(",", 1)[0].strip() for row in rows]
+        uuids = [item for item in listed if item.startswith("GPU-")]
+        if (
+            len(uuids) != self.expected
+            or len(set(uuids)) != self.expected
+            or self.uuid not in uuids
+        ):
+            raise ProbeError(
+                "isolated inventory listing differs from the configured inventory; "
+                "nothing dropped"
+            )
+        kept = [row for row, item in zip(rows, listed) if item != self.uuid]
+        served = "\n".join(kept) + ("\n" if kept else "")
+        self.ticks.append(
+            {
+                "tick": len(self.ticks) + 1,
+                "real_uuid_count": len(uuids),
+                "served_uuid_count": len(uuids) - 1,
+                "real_sha256": hashlib.sha256(completed.stdout.encode()).hexdigest(),
+                "served_sha256": hashlib.sha256(served.encode()).hexdigest(),
+                "returncode": completed.returncode,
+            }
+        )
+        return subprocess.CompletedProcess(
+            completed.args, completed.returncode, served, completed.stderr
+        )
+
+
 def sample_gpu_inventory(arguments: argparse.Namespace) -> None:
     from gpu_fault.channel_registry import HOST_TELEMETRY_PATH
     from gpu_fault.collectors.host.collector import HostTelemetryCollector
@@ -1731,19 +1804,24 @@ def sample_gpu_inventory(arguments: argparse.Namespace) -> None:
     env = before["configuration"]["file_env"]
     interval = int(env["GPU_FAULT_HOST_INTERVAL_SECONDS"])
     expected = int(env["GPU_FAULT_EXPECTED_GPU_COUNT"])
+    dropped = arguments.drop_gpu_uuid
     if (
         safe_id(arguments.run_id, "inventory sample run") != arguments.run_id
         or arguments.cluster_id != before["cluster_id"]
         or arguments.node_id != before["node_id"]
         or arguments.expected_env_sha256 != before["configuration"]["file"]["sha256"]
         or arguments.expected_boot_id != before["boot_id"]
-        or type(arguments.expected_gpu_count) is not int
-        or arguments.expected_gpu_count != expected + 1
+        or not isinstance(dropped, str)
+        or GPU_UUID.fullmatch(dropped) is None
+        or expected < 2
         or not 1 <= interval <= 300
         or env["GPU_FAULT_INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES"] != "2"
     ):
         raise ProbeError("isolated inventory sampling scope differs from baseline")
     sink = InventorySampleSink(HOST_TELEMETRY_PATH)
+    listing = DroppedUuidListing(
+        dropped, expected, tuple(HostTelemetryCollector.GPU_QUERY_ARGV)
+    )
     collector = HostTelemetryCollector(
         sink,
         CollectorContext(
@@ -1752,7 +1830,7 @@ def sample_gpu_inventory(arguments: argparse.Namespace) -> None:
         ),
         node_id=before["node_id"],
         node_instance_type=before["node_instance_type"],
-        expected_gpu_count=arguments.expected_gpu_count,
+        expected_gpu_count=expected,
         expected_efa_device_count=int(env["GPU_FAULT_EXPECTED_EFA_DEVICE_COUNT"]),
         interval_seconds=interval,
         inventory_mismatch_consecutive_samples=2,
@@ -1761,7 +1839,7 @@ def sample_gpu_inventory(arguments: argparse.Namespace) -> None:
         health_summary_seconds=int(env["GPU_FAULT_HOST_HEALTH_SUMMARY_SECONDS"]),
         history_max_points=1,
         now=lambda: datetime.now(timezone.utc),
-        runner=collector_runner,
+        runner=listing,
     )
     # Exercise the real inventory counter and edge filter without a second
     # production producer or unrelated host-health signals.
@@ -1772,7 +1850,11 @@ def sample_gpu_inventory(arguments: argparse.Namespace) -> None:
         batch = collector.collect_once()
         if batch.collection_errors:
             raise ProbeError("isolated inventory collector could not read inventory")
-    if inventory_sampling_identity() != before or len(sink.batches) != 2:
+    if (
+        inventory_sampling_identity() != before
+        or len(sink.batches) != 2
+        or len(listing.ticks) != 2
+    ):
         raise ProbeError("inventory sampling changed identity or missed a delivery")
     receipt = {
         "schema_version": 1,
@@ -1780,7 +1862,10 @@ def sample_gpu_inventory(arguments: argparse.Namespace) -> None:
         "run_id": arguments.run_id,
         "identity": before,
         "interval_seconds": interval,
-        "expected_gpu_count": arguments.expected_gpu_count,
+        "expected_gpu_count": expected,
+        "stimulus": LISTING_STIMULUS,
+        "dropped_gpu_uuid": dropped,
+        "listing_replay": listing.ticks,
         "sampled_at": datetime.now(timezone.utc).isoformat(),
         "sampler_pid": os.getpid(),
         "publication_performed": False,
@@ -1788,6 +1873,29 @@ def sample_gpu_inventory(arguments: argparse.Namespace) -> None:
     }
     receipt["sha256"] = inventory_receipt_digest(receipt)
     emit(receipt)
+
+
+def listing_replay_valid(receipt: dict[str, Any], expected: int) -> bool:
+    """The receipt's stimulus is the dropped-UUID listing on both ticks."""
+
+    ticks = receipt.get("listing_replay")
+    dropped = receipt.get("dropped_gpu_uuid")
+    return (
+        receipt.get("stimulus") == LISTING_STIMULUS
+        and isinstance(dropped, str)
+        and GPU_UUID.fullmatch(dropped) is not None
+        and receipt.get("expected_gpu_count") == expected
+        and type(receipt.get("expected_gpu_count")) is int
+        and isinstance(ticks, list)
+        and len(ticks) == 2
+        and all(
+            isinstance(tick, dict)
+            and tick.get("real_uuid_count") == expected
+            and tick.get("served_uuid_count") == expected - 1
+            and tick.get("returncode") == 0
+            for tick in ticks
+        )
+    )
 
 
 def inventory_publication_batches(
@@ -1825,6 +1933,8 @@ def inventory_publication_batches(
     expected = int(
         identity["configuration"]["file_env"]["GPU_FAULT_EXPECTED_GPU_COUNT"]
     )
+    if not listing_replay_valid(receipt, expected):
+        raise ProbeError("inventory publication is not the dropped-UUID listing replay")
     names = {
         f"gpu_inventory_{suffix}"
         for suffix in (
@@ -1858,8 +1968,8 @@ def inventory_publication_batches(
         if (
             mismatch.value != index
             or mismatch.device is not None
-            or mismatch.labels.get("expected_count") != str(expected + 1)
-            or mismatch.labels.get("observed_count") != str(expected)
+            or mismatch.labels.get("expected_count") != str(expected)
+            or mismatch.labels.get("observed_count") != str(expected - 1)
             or mismatch.labels.get("required_consecutive_samples") != "2"
             or mismatch.labels.get("consecutive_mismatch_samples") != str(index + 1)
             or mismatch.labels.get("node_instance_type")
@@ -3848,7 +3958,7 @@ def parser() -> argparse.ArgumentParser:
     sample.add_argument("--node-id", required=True)
     sample.add_argument("--expected-env-sha256", required=True)
     sample.add_argument("--expected-boot-id", required=True)
-    sample.add_argument("--expected-gpu-count", type=int, required=True)
+    sample.add_argument("--drop-gpu-uuid", required=True)
     publish = command("publish-gpu-inventory", publish_gpu_inventory)
     publish.add_argument("--run-id", required=True)
     publish.add_argument("--expected-sha256", required=True)

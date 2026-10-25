@@ -232,7 +232,7 @@ def test_kernel_collector_refuses_everything_but_its_command_window(
     assert code == 1 and error["error"] == "ProbeError", error
     assert not any(
         probe.dropin_path(RUN, unit).exists() for unit in probe.ALLOWED_UNITS
-    )
+    ), "a refused window wrote no drop-in for either unit"
     assert host.restarted == [] and not host.timers, "a refused window touched nothing"
 
 
@@ -302,7 +302,7 @@ def test_kernel_collector_wrapper_takes_driver_version_plans_only(
     assert host.restarted == [] and not host.timers
     assert not any(
         probe.dropin_path(RUN, unit).exists() for unit in probe.ALLOWED_UNITS
-    )
+    ), "a host-unit wrapper never opens a kernel-unit drop-in"
 
 
 def test_journal_read_is_bounded_to_an_allow_listed_unit(
@@ -328,7 +328,9 @@ def test_journal_read_is_bounded_to_an_allow_listed_unit(
     assert (
         journal["unit"] == KERNEL_UNIT and journal["since"] == "2026-10-25 08:00:00 UTC"
     )
-    assert journal["lines"][0].startswith("nvidia-smi software version discovery")
+    assert journal["lines"][0].startswith("nvidia-smi software version discovery"), (
+        journal["lines"]
+    )
     assert len(journal["lines"][1]) == probe.MAX_JOURNAL_LINE_CHARS, "lines are bounded"
     assert journal["truncated"] is False and journal["window_open"] is False
     call = next(item for item in host.calls if item[0] == "journalctl")

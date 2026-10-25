@@ -43,6 +43,10 @@ from scripts.e2e.regional.host_probe_fixture import (
     HostProbeMissingResponseError,
     HostProbeTransportError,
 )
+from scripts.e2e.regional.probes.collector_node_probe import (
+    GPU_UUID,
+    LISTING_STIMULUS,
+)
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from scripts.e2e.regional.regional_live_fixture import (
     RegionalLiveFixture,
@@ -681,6 +685,35 @@ def require_idle_target(
         raise RegionalFixtureError("inventory reboot target is not idle and unchanged")
 
 
+def dropped_gpu_uuid(baseline: Mapping[str, Any], expected: int) -> str:
+    """The real GPU the isolated listing drops: the node's highest-indexed one.
+
+    The baseline snapshot lists the node's GPUs as ``nvidia-smi`` reports them.
+    It must carry exactly the configured count of distinct UUIDs -- a node
+    already short of a GPU is not a candidate for a replay, and the case never
+    masks a real loss -- and the highest index is dropped so the choice is the
+    same on every attempt (GF-GENERAL-LIVE-012 drops a real UUID the same way).
+    """
+
+    entries = baseline.get("gpu_inventory")
+    if not isinstance(entries, list) or len(entries) != expected:
+        raise RegionalFixtureError(
+            "baseline GPU listing does not carry the configured count; nothing to drop"
+        )
+    uuids = [str(item.get("uuid") or "") for item in entries]
+    if len(set(uuids)) != expected or any(
+        GPU_UUID.fullmatch(item) is None for item in uuids
+    ):
+        raise RegionalFixtureError("baseline GPU listing has no usable distinct UUIDs")
+    try:
+        ordered = sorted(entries, key=lambda item: int(str(item.get("index"))))
+    except (TypeError, ValueError):
+        raise RegionalFixtureError(
+            "baseline GPU listing has no usable indexes"
+        ) from None
+    return str(ordered[-1]["uuid"])
+
+
 def reboot_provider_events(
     regional: RegionalLiveFixture, scope: Mapping[str, Any], started_at: datetime
 ) -> tuple[datetime, list[dict[str, Any]]]:
@@ -740,6 +773,7 @@ def run_collect004(
         or required_samples != 2
     ):
         raise RegionalFixtureError("inventory baseline identity or debounce differs")
+    dropped = dropped_gpu_uuid(baseline, expected)
     require_action_time(2400)
     run_id, _legacy_nonce = create_operation(case_dir, attempt)
     started_at = datetime.now(timezone.utc)
@@ -750,7 +784,7 @@ def run_collect004(
         run_id,
         started_at,
         observed_after,
-        expected + 1,
+        expected,
         baseline_sha256,
         case_dir,
         attempt,
@@ -764,6 +798,13 @@ def run_collect004(
         "interval_seconds": interval,
         "required_consecutive_samples": required_samples,
         "sampling_mode": "isolated-collector",
+        "stimulus": {
+            "kind": LISTING_STIMULUS,
+            "gpu_uuid": dropped,
+            "expected_count": expected,
+            "listed_count": expected - 1,
+            "production_listing_untouched": True,
+        },
         "production_configuration_modified": False,
         "production_service_restarted_by_runner": False,
     }
@@ -793,8 +834,8 @@ def run_collect004(
             settings.regional.cluster_id,
             "--node-id",
             settings.node,
-            "--expected-gpu-count",
-            str(expected + 1),
+            "--drop-gpu-uuid",
+            dropped,
             timeout=interval + 90,
         )
         captured = isolated_inventory_records(
@@ -804,7 +845,8 @@ def run_collect004(
             node_id=settings.node,
             boot_id=scope["boot_id"],
             baseline_sha256=baseline_sha256,
-            expected_gpu_count=expected + 1,
+            expected_gpu_count=expected,
+            dropped_gpu_uuid=dropped,
             interval_seconds=interval,
             observed_after=observed_after,
             tolerance=settings.debounce_tolerance,
@@ -882,7 +924,7 @@ def run_collect004(
                 required_samples=required_samples,
                 started_at=started_at,
                 tolerance=settings.debounce_tolerance,
-                expected_count=expected + 1,
+                expected_count=expected,
             )
         )
         workflow = recovery.wait(terminal=False, timeout_seconds=600)

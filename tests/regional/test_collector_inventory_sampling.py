@@ -23,8 +23,14 @@ from scripts.e2e.regional.collector_inventory_sampling import (
 from scripts.e2e.regional.probes import collector_node_probe as probe
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 from tests.regional import test_collector_env_safety as env_safety
+from tools import host_command_replay as wrapper
 
 env_host = env_safety.env_host
+
+#: The fixture node's eight real GPUs; the case drops the highest-indexed one.
+UUIDS = [f"GPU-{index:08d}-0000-4000-8000-000000000000" for index in range(8)]
+DROPPED = UUIDS[7]
+LISTING = "\n".join(f"{uuid}, 0" for uuid in UUIDS)
 
 
 @pytest.fixture
@@ -67,9 +73,7 @@ def sampling_host(
         if command[0] == "nvidia-smi":
             assert tuple(command) == HostTelemetryCollector.GPU_QUERY_ARGV
             assert check is False and timeout > 0
-            return subprocess.CompletedProcess(
-                command, 0, "\n".join(f"GPU-{index}, 0" for index in range(8)), ""
-            )
+            return subprocess.CompletedProcess(command, 0, LISTING, "")
         return host.run(command, check=check, timeout=timeout)
 
     def sleep(seconds: float) -> None:
@@ -97,8 +101,8 @@ def sampling_arguments() -> argparse.Namespace:
             hashlib.sha256(probe.COLLECTOR_ENV.read_bytes()).hexdigest(),
             "--expected-boot-id",
             "boot-fixture-a",
-            "--expected-gpu-count",
-            "9",
+            "--drop-gpu-uuid",
+            DROPPED,
         ]
     )
 
@@ -117,7 +121,8 @@ def records(receipt: dict[str, Any]) -> list[dict[str, Any]]:
         node_id="node-fixture",
         boot_id="boot-fixture-a",
         baseline_sha256=receipt["identity"]["configuration"]["file"]["sha256"],
-        expected_gpu_count=9,
+        expected_gpu_count=8,
+        dropped_gpu_uuid=DROPPED,
         interval_seconds=15,
         observed_after=datetime.fromisoformat(receipt["batches"][0]["observed_at"]),
         tolerance=0.5,
@@ -156,6 +161,33 @@ def test_real_collector_debounce_never_posts_or_changes_production(
     assert len(captured) == 2
     assert [row["samples"][-1]["value"] for row in captured] == [0, 1]
     assert "baseline" in captured[0]["edge_filter_reasons"]
+    # The stimulus: the configured count stays 8 and one real UUID is dropped
+    # from the real listing on both ticks -- the reviewed wrapper's drop_row
+    # rewrite, applied inside the isolated collector's own runner.
+    assert receipt["expected_gpu_count"] == 8
+    assert receipt["stimulus"] == probe.LISTING_STIMULUS == "DROPPED_REAL_GPU_UUID"
+    assert receipt["dropped_gpu_uuid"] == DROPPED
+    served, _code, _err, reason = wrapper.apply_rule(
+        {"query": "utilization", "action": "drop_row", "uuid": DROPPED}, LISTING, 0, ""
+    )
+    assert reason is None
+    assert receipt["listing_replay"] == [
+        {
+            "tick": tick,
+            "real_uuid_count": 8,
+            "served_uuid_count": 7,
+            "real_sha256": hashlib.sha256(LISTING.encode()).hexdigest(),
+            "served_sha256": hashlib.sha256(served.encode()).hexdigest(),
+            "returncode": 0,
+        }
+        for tick in (1, 2)
+    ], "the served listing is exactly what the host source replay wrapper would serve"
+    for row in captured:
+        labels = row["samples"][-1]["labels"]
+        assert (labels["expected_count"], labels["observed_count"]) == ("8", "7")
+    assert "DROPPED" not in json.dumps(receipt["batches"]), (
+        "the batches carry the collector's own samples, not the stimulus"
+    )
     assert (
         datetime.fromisoformat(captured[1]["observed_at"])
         - datetime.fromisoformat(captured[0]["observed_at"])
@@ -177,9 +209,9 @@ def test_real_collector_debounce_never_posts_or_changes_production(
         ("node_id", "other"),
         ("expected_boot_id", "other"),
         ("expected_env_sha256", "0" * 64),
-        ("expected_gpu_count", 8),
-        ("expected_gpu_count", 10),
-        ("expected_gpu_count", True),
+        ("drop_gpu_uuid", "GPU-ffffffff-0000-4000-8000-000000000000"),
+        ("drop_gpu_uuid", "GPU-7"),
+        ("drop_gpu_uuid", True),
     ],
 )
 def test_sampling_scope_rejection_has_no_service_or_network_action(
@@ -191,6 +223,44 @@ def test_sampling_scope_rejection_has_no_service_or_network_action(
         probe.sample_gpu_inventory(arguments)
     assert sampling_host.mutations() == []
     assert sampling_host.emitted == []
+
+
+def test_a_really_missing_gpu_is_never_masked_by_the_replay(
+    sampling_host: env_safety.EnvHost, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Seven real GPUs listed against eight configured: refuse, drop nothing."""
+
+    short = "\n".join(f"{uuid}, 0" for uuid in UUIDS[:7])
+
+    def run(
+        command: list[str], *, check: bool = True, timeout: float = 180
+    ) -> subprocess.CompletedProcess[str]:
+        if command[0] == "nvidia-smi":
+            return subprocess.CompletedProcess(command, 0, short, "")
+        return sampling_host.run(command, check=check, timeout=timeout)
+
+    monkeypatch.setattr(probe, "run", run)
+    with pytest.raises(probe.ProbeError, match="could not read inventory"):
+        sample(sampling_host)
+    assert sampling_host.emitted == []
+    assert sampling_host.mutations() == []
+    listing = probe.DroppedUuidListing(
+        DROPPED, 8, HostTelemetryCollector.GPU_QUERY_ARGV
+    )
+    with pytest.raises(probe.ProbeError, match="nothing dropped"):
+        listing(
+            list(HostTelemetryCollector.GPU_QUERY_ARGV), capture_output=True, text=True
+        )
+    assert listing.ticks == []
+    other = probe.DroppedUuidListing(UUIDS[6], 7, HostTelemetryCollector.GPU_QUERY_ARGV)
+    completed = other(
+        list(HostTelemetryCollector.GPU_QUERY_ARGV), capture_output=True, text=True
+    )
+    assert completed.stdout.count("GPU-") == 6 and UUIDS[6] not in completed.stdout
+    assert other(["nvidia-smi"], capture_output=True, text=True).stdout == short, (
+        "a call outside the listing query passes through untouched"
+    )
+    assert len(other.ticks) == 1, "only the listing query is journaled"
 
 
 @pytest.mark.parametrize("drift", ["boot", "env", "process"])
@@ -370,6 +440,10 @@ def test_publisher_sends_only_the_two_original_batches_once(
         "early",
         "time",
         "stale",
+        "stimulus",
+        "dropped",
+        "ticks",
+        "count",
     ],
 )
 def test_publisher_refuses_drift_before_constructing_any_http_client(
@@ -378,6 +452,14 @@ def test_publisher_refuses_drift_before_constructing_any_http_client(
     receipt = sample(sampling_host)
     if drift == "digest":
         receipt["sha256"] = "0" * 64
+    elif drift == "stimulus":
+        receipt["stimulus"] = "EXPECTED_COUNT_OVERRIDE"
+    elif drift == "dropped":
+        receipt["dropped_gpu_uuid"] = "GPU-7"
+    elif drift == "ticks":
+        receipt["listing_replay"][1]["served_uuid_count"] = 8
+    elif drift == "count":
+        receipt["expected_gpu_count"] = 9
     elif drift == "run":
         receipt["run_id"] = "other-run"
     elif drift == "boot":

@@ -387,7 +387,7 @@ Regenerate: `python3 scripts/build-regional-case-index.py`.
 > - COLLECT-021 takes a COLLECT-016 PASS as its evidence predecessor: it reuses COLLECT-016's managed training fixture and host probe to verify that the race where the Pod dies first and the RESTART_APP XID arrives later is judged MONITOR_ONLY while the passive path still restarts; it is ordered after COLLECT-016.
 > - COLLECT-015 takes a COLLECT-017 PASS as its evidence predecessor (the run_collector_destructive.py chain); COLLECT-018..020 are ordered before it only so that the reboot happens last.
 > - The formal predecessor of COLLECT-009 is COLLECT-005: COLLECT-006/007 are pytest cases and produce no cases/<id>/<id>.json evidence.
-> - COLLECT-004's expected-count alternative path triggers a real HyperPod reboot and must run in a maintenance window.
+> - COLLECT-004 drops one real GPU UUID from the isolated collector instance's listing (expected count unchanged), which triggers a real provider reboot and must run in a maintenance window.
 > - The last six cases involve a reset, EFA mutation, workload restart or reboot and must run in a maintenance window.
 > - COLLECT-018/019/020 open a bounded collector window on one idle node (synthetic API injection, nvidia-smi shadow, drop-in environment) without touching the GPUs; COLLECT-020 cordons that node for DCGM diagnostics and then restores it through validation-first restore, needs a maintenance window, and is still ordered before COLLECT-015's reboot.
 

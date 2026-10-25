@@ -10,7 +10,10 @@ from scripts.e2e.regional.collector_inventory_evidence import (
     debounce_sample_errors,
     evidence_time,
 )
-from scripts.e2e.regional.probes.collector_node_probe import inventory_receipt_digest
+from scripts.e2e.regional.probes.collector_node_probe import (
+    inventory_receipt_digest,
+    listing_replay_valid,
+)
 from scripts.e2e.regional.regional_commands import RegionalFixtureError
 
 
@@ -23,11 +26,18 @@ def isolated_inventory_records(
     boot_id: str,
     baseline_sha256: str,
     expected_gpu_count: int,
+    dropped_gpu_uuid: str,
     interval_seconds: int,
     observed_after: datetime,
     tolerance: float,
 ) -> list[dict[str, Any]]:
-    """Accept the completed private sink, not a live-delivery or reboot claim."""
+    """Accept the completed private sink, not a live-delivery or reboot claim.
+
+    ``expected_gpu_count`` is the node's *configured* count, unchanged by the
+    case; the stimulus is ``dropped_gpu_uuid`` removed from the isolated
+    collector's real listing on both ticks (``listing_replay``), so every batch
+    lists ``expected - 1`` GPUs against the real expectation.
+    """
     identity = receipt.get("identity") or {}
     configuration = identity.get("configuration") or {}
     raw = receipt.get("batches")
@@ -41,7 +51,8 @@ def isolated_inventory_records(
         or receipt["sampler_pid"] <= 1
         or receipt["sampler_pid"] == configuration.get("pid")
         or receipt.get("interval_seconds") != interval_seconds
-        or receipt.get("expected_gpu_count") != expected_gpu_count
+        or not listing_replay_valid(dict(receipt), expected_gpu_count)
+        or receipt.get("dropped_gpu_uuid") != dropped_gpu_uuid
         or identity.get("cluster_id") != cluster_id
         or identity.get("node_id") != node_id
         or identity.get("boot_id") != boot_id
@@ -51,7 +62,7 @@ def isolated_inventory_records(
         or (configuration.get("file") or {}).get("sha256") != baseline_sha256
         or configuration.get("running_env") != configuration.get("file_env")
         or (configuration.get("file_env") or {}).get("GPU_FAULT_EXPECTED_GPU_COUNT")
-        != str(expected_gpu_count - 1)
+        != str(expected_gpu_count)
         or not isinstance(raw, list)
         or len(raw) != 2
         or receipt.get("sha256") != inventory_receipt_digest(dict(receipt))

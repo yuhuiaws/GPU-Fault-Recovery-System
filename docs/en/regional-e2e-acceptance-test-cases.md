@@ -14579,24 +14579,30 @@ otherwise a machine with a non-EFA RDMA card mixed in would reach a false "consi
   reported. Setting it to 1 turns transient jitter into an alert storm,
   setting it too high delays the discovery of a real drop-off.
 - Steps: in the **maintenance window** start an independent Host Collector sampling instance with only
-  the GPU inventory contributor enabled, using an expected count of `baseline+1`. This instance uses a
-  private sink with no network access and no outbox writes; the production `collector.env` and the
-  Host Collector service stay unchanged.
-  The same sampling process exits after completing two real sampling cycles; batch 1 must carry only
-  `consecutive_mismatch_samples=1` and produce no finding, batch 2 must be 2 and produce a finding.
+  the GPU inventory contributor enabled; its expected count **is the production setting**, unchanged.
+  The stimulus is the GF-GENERAL-LIVE-012 `drop_row` idiom: the instance's own `nvidia-smi` listing
+  query (`GPU_QUERY_ARGV`) goes through the probe's `DroppedUuidListing` runner to the real `nvidia-smi`
+  and the row of **one real GPU UUID** is removed from the answer (the runner takes the highest-indexed
+  GPU of the baseline snapshot; both ticks drop the same row), so the instance lists `expected-1` GPUs
+  -- on a type in the instance table that is exactly the product's definition of a lost GPU (listed
+  count differs from the type's count) and the control plane grades `gpu_inventory_mismatch` CRITICAL
+  REBOOT_NODE. The real listing must carry exactly the configured number of distinct UUIDs including
+  the dropped one, otherwise sampling is refused (a node really short of a GPU is no replay target;
+  the replay never masks a real loss). The instance uses a private sink with no network access and no
+  outbox writes; the production `collector.env`, the Host Collector service and the node's listing stay
+  unchanged. The same sampling process exits after completing two real sampling cycles; batch 1 must
+  carry only `consecutive_mismatch_samples=1` and produce no finding, batch 2 must be 2 and produce a
+  finding. The receipt records `stimulus=DROPPED_REAL_GPU_UUID`, `dropped_gpu_uuid` and the two ticks'
+  `listing_replay` (real/served UUID counts and sha256).
   The runner validates and saves the raw text of these two batches, binds the event IDs, and then
   delivers each once, in the original order, through the real `HttpEventSink` on the node. The control
   plane must persist the identical batches and then execute a real reboot workflow.
-  ⚠ Since the GF-GENERAL-LIVE-012 `expectation_wrong` fix the control plane re-reads the mismatch against
-  the instance-type table before grading: on a type in the table, a `baseline+1` expectation that
-  contradicts the count the node lists (bound count agreeing) only yields a WARNING
-  `gpu_expected_count_contradicted` (FREEZE_EVIDENCE only) and **no longer enters the reboot chain**.
-  This case's stimulus must become a reviewed `nvidia-smi` output replay with one real UUID fewer in the
-  full query (the GF-GENERAL-LIVE-012 `confirmed_missing` processing-chain replay); the changed-expectation
-  path is void as a reboot stimulus. Until the runner is reworked the case is recorded FAIL / not run; that
-  WARNING incident must not stand in for `RESTART_NODE` evidence.
   This is a controlled inventory-policy stimulus, not a real GPU drop-off; a successful isolated sample
   is not by itself a live case pass.
+  The former stimulus (a `baseline+1` expectation) has been removed from this case: since the
+  GF-GENERAL-LIVE-012 `expectation_wrong` fix it only yields a WARNING `gpu_expected_count_contradicted`
+  (FREEZE_EVIDENCE only) on a type in the table and no longer enters the reboot chain; that WARNING
+  incident must not stand in for `RESTART_NODE` evidence.
 - Verdict:
   - the first batch has mismatch value 0, counter 1 and the `baseline` of the restarted collector;
     only the threshold batch is 1, with the counter exactly the configured N. There are N-1 intervals
@@ -14604,7 +14610,8 @@ otherwise a machine with a non-EFA RDMA card mixed in would reach a false "consi
     the runner start/config change time cannot stand in for the first batch;
     startup spread, service restart and transport time are not part of this sampling interval;
   - the raw evidence is bounded by the host baseline time and matches the exact cluster/node, node
-    producer and this run's `expected=baseline+1`. A missing first batch, missing threshold, counter
+    producer, this run's `expected=<configured>` / `observed=expected-1`, the dropped real UUID and
+    the two ticks' listing-replay digests. A missing first batch, missing threshold, counter
     regression/restart, mismatched configuration or malformed times all fail;
   - after injection the node has **exactly one** workflow, and the `RESTART_NODE` workflow is `SUCCEEDED`;
   - the two raw batches in the isolated sink agree with the control plane's persistent evidence; the
@@ -16241,9 +16248,9 @@ hardware**. Available means, from least to most invasive:
 |------|-----------|--------|--------|
 | Write to `/dev/kmsg` | the full kernel-collector chain (verified by `DESTR-010`) | low | complete |
 | Append to the fabric manager log | fabric-manager collector (`COLLECT-005`) | low | complete |
-| Temporarily change the expected value in `collector.env` and restart the collector | the **false-positive direction** of `COLLECT-003`; for `COLLECT-004` on a type in the table it only reaches the WARNING `gpu_expected_count_contradicted`, no longer the reboot chain | medium | recovers when changed back |
+| Temporarily change the expected value in `collector.env` and restart the collector | the **false-positive direction** of `COLLECT-003`; on a type in the table it only reaches the WARNING `gpu_expected_count_contradicted` (GF-GENERAL-LIVE-012 `expectation_wrong`), no longer the reboot chain | medium | recovers when changed back |
 | `nvidia-smi -pm 0` / change clocks | changes in some DCGM metrics | medium | complete |
-| Reviewed `nvidia-smi` output replay: one real UUID fewer in the full query | the lost-GPU verdict chain of `COLLECT-004` / GF-GENERAL-LIVE-012 (processing-chain proof, not a physical loss) | medium | recovers when the window closes |
+| Reviewed `nvidia-smi` listing replay: one real UUID fewer in the full query -- `COLLECT-004` drops the row inside the isolated collector instance's own runner (production collector untouched), GF-GENERAL-LIVE-012 through the reviewed wrapper inside the host collector unit | the lost-GPU verdict chain of `COLLECT-004` / GF-GENERAL-LIVE-012 (processing-chain proof, not a physical loss) | medium | recovers when sampling ends / the window closes |
 | Real GPU drop-off / pulling the EFA | the **false-negative direction** of `COLLECT-004` | **unacceptable** | no |
 
 ⚠ **The "false-negative direction" of `COLLECT-003/004` (really one GPU fewer) has no safe
@@ -16252,10 +16259,12 @@ collector believed "one GPU is missing". Since the GF-GENERAL-LIVE-012 `expectat
 path **no longer reaches a reboot** on a type in the table (p5/p5e/p5en/p6 families): the control
 plane grades it as a configuration contradiction (WARNING `gpu_expected_count_contradicted`,
 evidence only) because the count the node lists agrees with the instance type. The lost-GPU verdict
-chain can only be driven by a reviewed `nvidia-smi` output replay with one real UUID fewer in the
-full query; that too **must be documented in the manual as a substitute**, must not be claimed to
-have verified a real GPU drop-off, and the real, complete inventory must be read back after the
-window closes.
+chain can only be driven by a reviewed `nvidia-smi` listing replay with one real UUID fewer in the
+full query (`COLLECT-004` drops the row inside the isolated collector instance, the expected count
+stays the configured value, and sampling is refused when the real listing does not carry the
+configured number of UUIDs); that too **must be documented in the manual as a substitute**, must not
+be claimed to have verified a real GPU drop-off, and the real, complete inventory must be read back
+after sampling ends / the window closes.
 
 ## 14. E2E: Full closed loop per cluster
 

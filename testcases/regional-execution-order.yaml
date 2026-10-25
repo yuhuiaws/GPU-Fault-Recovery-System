@@ -335,7 +335,7 @@ phases:
       - COLLECT-015 以 COLLECT-017 PASS 为证据前置（run_collector_destructive.py 的链），
         COLLECT-018..020 排在它前面只是为了让 reboot 最后发生。
       - COLLECT-009 的正式前置是 COLLECT-005：COLLECT-006/007 是 pytest 用例，不产出 cases/<id>/<id>.json 证据。
-      - COLLECT-004 的expected-count替代路径会触发真实HyperPod reboot，必须在维护窗口执行。
+      - COLLECT-004 在隔离采集实例的 listing 中删去一个真实 GPU UUID（期望值不改），会触发真实 provider reboot，必须在维护窗口执行。
       - 后六条包含 reset、EFA mutation、workload restart 或 reboot，
         必须在维护窗口执行。
       - COLLECT-018/019/020 在一台空闲节点上开有界采集器窗口（合成 API 注入、nvidia-smi 影子、

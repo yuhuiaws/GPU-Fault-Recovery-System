@@ -654,7 +654,9 @@ def test_kernel_collector_token_does_not_unlock_the_host_collector(
         )
     with pytest.raises(helper.HostSourceReplayError, match=TOKEN):
         controller.open_bind([("meminfo", "/proc/meminfo")])
-    assert not any(call[0] in {"install-wrapper", "open-window"} for call in fake.calls)
+    assert not any(
+        call[0] in {"install-wrapper", "open-window"} for call in fake.calls
+    ), "a refused request never reaches the node"
     with pytest.raises(helper.HostSourceReplayError, match="Node Agent"):
         helper.HostSourceReplay(
             _Regional(),

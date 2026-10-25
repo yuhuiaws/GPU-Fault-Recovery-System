@@ -8110,25 +8110,22 @@ test_cases:
   problem: >-
     INVENTORY_MISMATCH_CONSECUTIVE_SAMPLES 配成 1 会让瞬时抖动变成告警风暴， 配得过大则延迟发现真实掉卡。
   injection: >-
-    维护窗口内以独立Host Collector实例使用baseline+1的expected GPU count，
+    维护窗口内以独立Host Collector实例（expected GPU count即生产配置值，不改）采样，
+    该实例自身的nvidia-smi listing查询经探针内的受检runner删去一个真实GPU UUID所在行
+    （两个tick同一行；真实listing须恰含配置数个UUID，否则拒绝，回放永不掩盖真实掉卡），
     将同一进程的前两个真实采样周期写入不转发的私有sink；采样结束并核验原始批次后，
     只将这两批数据受检投递到真实控制面。该finding会触发REBOOT_NODE，
-    必须按破坏性用例执行；生产collector.env和Host Collector服务不作修改。
+    必须按破坏性用例执行；生产collector.env、Host Collector服务与节点listing不作修改。
   expected:
   - 1 个周期不报事件
   - 2个周期报事件且延迟约为2乘live采集周期；去抖延迟按 collector status/evidence 时间戳测量，不按 runner 本地时钟
+  - 两批均为 expected=配置值、observed=expected-1，回执记被删的真实UUID与两个tick的listing回放摘要
   - RESTART_NODE 工作流 SUCCEEDED 且注入后该节点恰一条工作流
   - 生产collector.env的sha256在采样前后和reboot后均与基线一致
   - 采样阶段不转发且先结束；真实控制面保留的两个批次与隔离采样原文一致
   - 节点reboot后完成DCGM与正式restore，所有自有探针资源完成清理
   evidence:
-    verdict: PASS
-    verified:
-      case_digest: f35b4bc7ba0ca8359f2d67bdf04e7df95fe99f44b00cbc3f9db681ad3550245b
-      components:
-        control_plane: 15dfb9989e311767fe9d8fe29dbe6bcbc163752aa5b78ae1340fc74887b33b45
-        executor: ea81228c66e060bd0c68dc3f7ee64469b996937ef16ab45f7b92463f2ee6afdb
-        node_runtime: 4bcdfcfb5c1921fd1da6ed67cfc1e9d90a4c2e40ce56e222f92849d50e195f09
+    verdict: NOT_RUN
   automation: manual
   procedure: docs/区域模式端到端验收测试用例.md#gf-regional-collect-004
   related_pytest: tests/collectors/test_gpu.py::test_host_collector_reports_persistent_gpu_and_efa_card_loss

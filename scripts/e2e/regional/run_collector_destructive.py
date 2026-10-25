@@ -1277,8 +1277,10 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
         "target_node": settings.node,
         "mutation": {
             "GF-REGIONAL-COLLECT-004": (
-                "publish two completed isolated Collector batches and verify one real reboot; "
-                "production collector configuration and service are not modified"
+                "publish two completed isolated Collector batches whose real nvidia-smi "
+                "listing lacks one real GPU UUID (configured expected count unchanged) "
+                "and verify one real reboot; production collector configuration, "
+                "service and listing are not modified"
             ),
             "GF-REGIONAL-COLLECT-008": "real kmsg XID63+48 and one GPU reset",
             "GF-REGIONAL-COLLECT-013": (
@@ -1315,7 +1317,8 @@ def plan_details(settings: Settings, preflight: dict[str, Any]) -> dict[str, Any
     }
     if settings.case_id == "GF-REGIONAL-COLLECT-004":
         details["verification_layers"] = [
-            "isolated real Collector and private sink",
+            "isolated real Collector with one real GPU UUID dropped from its own "
+            "listing (GF-GENERAL-LIVE-012 drop_row idiom) and a private sink",
             "exact captured batches accepted by the live collector endpoint",
             "one product reboot workflow and complete cleanup",
         ]

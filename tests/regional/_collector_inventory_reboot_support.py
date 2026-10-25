@@ -25,12 +25,19 @@ BASELINE = "a" * 64
 APPLIED = "b" * 64
 INTENT = "c" * 64
 ROLE = "arn:aws:iam::123456789012:role/Executor"
+#: The node's eight real GPUs as the baseline snapshot lists them; the case
+#: drops the highest-indexed one from the isolated collector's listing.
+GPU_UUIDS = [
+    f"GPU-0000000{index}-0000-4000-8000-00000000000{index}" for index in range(8)
+]
+DROPPED = GPU_UUIDS[7]
 
 
 class InventoryHarness:
     def __init__(self, monkeypatch: pytest.MonkeyPatch, case_dir: Path) -> None:
         self.case_dir = case_dir
         self.calls: list[str] = []
+        self.sample_arguments: list[str] = []
         self.clock = Clock()
         self.problem: str | None = None
         self.failure: BaseException | None = None
@@ -131,6 +138,15 @@ class InventoryHarness:
                     "1" if self.problem == "debounce-config" else "2"
                 ),
             },
+            "gpu_inventory": [
+                {
+                    "index": str(index),
+                    "uuid": GPU_UUIDS[index],
+                    "pci_bdf": f"0000:{index + 1:02x}:00.0",
+                    "name": "NVIDIA H200",
+                }
+                for index in range(7 if self.problem == "short-listing" else 8)
+            ],
         }
 
     def node_snapshot(self, node: str) -> dict[str, Any]:
@@ -164,8 +180,8 @@ class InventoryHarness:
                         "value": counter - 1,
                         "device": None,
                         "labels": {
-                            "expected_count": "9",
-                            "observed_count": "8",
+                            "expected_count": "8",
+                            "observed_count": "7",
                             "required_consecutive_samples": "2",
                             "consecutive_mismatch_samples": str(counter),
                             "node_instance_type": "ml.p5en.48xlarge",
@@ -247,6 +263,11 @@ class InventoryHarness:
         run_id = args[args.index("--run-id") + 1]
         if verb == "sample-gpu-inventory":
             self.run_id = run_id
+            self.sample_arguments = list(args)
+            assert "--expected-gpu-count" not in args, (
+                "the expected count is never overridden any more"
+            )
+            assert args[args.index("--drop-gpu-uuid") + 1] == DROPPED
             if self.failure is not None:
                 raise self.failure
             self.sample = self.isolated_sample(run_id)
@@ -310,8 +331,8 @@ class InventoryHarness:
         for index in range(2):
             stamp = ORIGIN + timedelta(seconds=15 * (index + 1))
             labels = {
-                "expected_count": "9",
-                "observed_count": "8",
+                "expected_count": "8",
+                "observed_count": "7",
                 "required_consecutive_samples": "2",
                 "consecutive_mismatch_samples": str(index + 1),
                 "node_instance_type": "ml.p5en.48xlarge",
@@ -328,8 +349,8 @@ class InventoryHarness:
                         name=f"gpu_inventory_{name}", value=value, labels=labels
                     )
                     for name, value in (
-                        ("expected_count", 9),
-                        ("active_count", 8),
+                        ("expected_count", 8),
+                        ("active_count", 7),
                         ("missing_count", 1),
                         ("excess_count", 0),
                         ("mismatch", index),
@@ -357,7 +378,20 @@ class InventoryHarness:
                 },
             },
             "interval_seconds": 15,
-            "expected_gpu_count": 9,
+            "expected_gpu_count": 8,
+            "stimulus": "DROPPED_REAL_GPU_UUID",
+            "dropped_gpu_uuid": DROPPED,
+            "listing_replay": [
+                {
+                    "tick": tick,
+                    "real_uuid_count": 8,
+                    "served_uuid_count": 7,
+                    "real_sha256": "d" * 64,
+                    "served_sha256": "e" * 64,
+                    "returncode": 0,
+                }
+                for tick in (1, 2)
+            ],
             "sampled_at": (ORIGIN + timedelta(seconds=31)).isoformat(),
             "sampler_pid": 456,
             "publication_performed": False,

@@ -21,6 +21,8 @@ from scripts.e2e.regional.regional_live_fixture import RegionalLiveFixture
 from tests.regional._collector_inventory_reboot_support import (
     APPLIED,
     BASELINE,
+    DROPPED,
+    GPU_UUIDS,
     INTENT,
     ORIGIN,
     InventoryHarness,
@@ -44,6 +46,20 @@ def test_inventory_reboot_samples_then_publishes_without_configuration_mutation(
     assert result["production_configuration_modified"] is False
     assert result["production_service_restarted_by_runner"] is False
     assert result["isolated_sampling"]["live_delivery_proven"] is True
+    # The stimulus is one real UUID dropped from the isolated collector's own
+    # listing; the configured expected count is never touched (b174 grades a
+    # baseline+1 expectation on a known type as a configuration finding).
+    arguments = harness.sample_arguments
+    assert arguments[arguments.index("--drop-gpu-uuid") + 1] == DROPPED
+    assert "--expected-gpu-count" not in arguments
+    assert result["stimulus"] == {
+        "kind": "DROPPED_REAL_GPU_UUID",
+        "gpu_uuid": DROPPED,
+        "expected_count": 8,
+        "listed_count": 7,
+        "production_listing_untouched": True,
+    }
+    assert result["sampling_mode"] == "isolated-collector"
     receipt = json.loads((tmp_path / "inventory-operation-a1.json").read_text())
     assert receipt["run_id"] == harness.run_id
     assert len(receipt["owner_nonce"]) == 32
@@ -85,7 +101,7 @@ def test_inventory_reboot_evidence_failures_never_pass(
     assert stored["errors"] or stored["cleanup_errors"]
 
 
-@pytest.mark.parametrize("problem", ["unhealthy", "debounce-config"])
+@pytest.mark.parametrize("problem", ["unhealthy", "debounce-config", "short-listing"])
 def test_inventory_admission_rejection_never_attempts_override_or_restore(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, problem: str
 ) -> None:
@@ -94,12 +110,41 @@ def test_inventory_admission_rejection_never_attempts_override_or_restore(
     with pytest.raises(RegionalFixtureError):
         harness.run()
     assert harness.restores == 0 and not harness.run_id
+    assert "sample-gpu-inventory" not in harness.calls, (
+        "a refused admission never samples: a node already short of a GPU is no replay target"
+    )
     assert not list(tmp_path.glob("inventory-operation-*.json")), (
         'test_inventory_admission_rejection_never_attempts_override_or_restore: expected no list(tmp_path.glob("inventory-operation-*.json"))'
     )
     assert not harness.cleanup.state_readers, (
         "test_inventory_admission_rejection_never_attempts_override_or_restore: expected no harness.cleanup.state_readers"
     )
+
+
+def test_dropped_gpu_uuid_is_the_highest_index_of_a_complete_listing() -> None:
+    listing = [
+        {"index": str(index), "uuid": GPU_UUIDS[index], "name": "NVIDIA H200"}
+        for index in (3, 7, 0, 1, 2, 4, 5, 6)
+    ]
+    assert runner.dropped_gpu_uuid({"gpu_inventory": listing}, 8) == GPU_UUIDS[7], (
+        "the highest index is dropped whatever order nvidia-smi listed"
+    )
+    with pytest.raises(RegionalFixtureError, match="nothing to drop"):
+        runner.dropped_gpu_uuid({"gpu_inventory": listing[:7]}, 8)
+    with pytest.raises(RegionalFixtureError, match="nothing to drop"):
+        runner.dropped_gpu_uuid({}, 8)
+    duplicated = deepcopy(listing)
+    duplicated[0]["uuid"] = duplicated[1]["uuid"]
+    with pytest.raises(RegionalFixtureError, match="distinct UUIDs"):
+        runner.dropped_gpu_uuid({"gpu_inventory": duplicated}, 8)
+    malformed = deepcopy(listing)
+    malformed[0]["uuid"] = "GPU-0"
+    with pytest.raises(RegionalFixtureError, match="distinct UUIDs"):
+        runner.dropped_gpu_uuid({"gpu_inventory": malformed}, 8)
+    unindexed = deepcopy(listing)
+    unindexed[0]["index"] = "N/A"
+    with pytest.raises(RegionalFixtureError, match="indexes"):
+        runner.dropped_gpu_uuid({"gpu_inventory": unindexed}, 8)
 
 
 def test_expired_admission_never_authorizes_a_previous_runs_cleanup(
@@ -231,7 +276,7 @@ def recovery(harness: InventoryHarness) -> runner.InventoryRecovery:
         "d" * 32,
         ORIGIN,
         ORIGIN,
-        9,
+        8,
         BASELINE,
         harness.case_dir,
         1,
@@ -287,7 +332,7 @@ def test_finding_custody_is_not_derived_from_arbitrary_node_activity(
     elif problem == "record":
         rows[-1]["record_id"] = "another-record"
     elif problem == "count":
-        rows[-1]["samples"][0]["labels"]["expected_count"] = "8"
+        rows[-1]["samples"][0]["labels"]["expected_count"] = "9"
     else:
         rows.clear()
     with pytest.raises(RegionalFixtureError, match="finding"):
