@@ -191,8 +191,9 @@ Host Collector 默认正常摘要间隔 300 秒，不足以满足上述恢复窗
 
 复用 Agent 生命周期和已认证的 heartbeat 响应，不新增服务或公网接口。
 控制面给授权 `COLLECT_HUNG_SUMMARY` 的 Agent 下发最多 90 秒的
-`communication-monitor/v1` 租约：绑定 cluster/node/boot/generation、当前 job/attempt
-和非根 cgroup。无新租约不继续采样；清理或终态任务不再续租。
+`communication-monitor/v1` 或 `v2` 租约（按 Agent heartbeat 的 `communication_monitor_version`）：绑定
+cluster/node/boot/generation、当前 job/attempt 和该节点任务容器的 scope（非根 cgroup；v2 另可带运行时容器 ID，见下文）。
+无新租约不继续采样；清理或终态任务不再续租。
 每节点最多 8 个任务，超限在 healthz 显示实际与期望数，不声称覆盖所有任务。
 
 每任务每 30 秒一轮，扫描任务进程、GPU context、已有新鲜 FR 文件与实际 RDMA QP。
@@ -329,8 +330,30 @@ triage 以 `NO_VALID_SURVEY` 一个节点都不请求（`active_requested_node_c
 （`reason=CONTAINER_CGROUP_NOT_FOUND`，扫描被截断时为 `PROCESS_SCAN_INCOMPLETE`），只找到部分时
 `scan_complete=false`。只读 `/proc`，不扩大 attach 范围：其他作业的容器、同一 GPU 上别的进程都不在 scope 内。
 旧 Agent 忽略该参数，行为同修复前；旧 workflow 没有该参数，也同修复前。
-被动通信监测（communication monitor）的目标仍只认显式路径，受管 Pod 上不分配目标；
-给 `CommunicationTarget` 加字段会让旧 Agent 拒收整个计划，需要按 Agent 能力分批下发，未在本批修改。
+被动通信监测（communication monitor）原先同样只认显式路径：受管 Pod 的租约里 `expected_target_count=1`
+却没有 target（Agent healthz `expected_targets=1`、`assigned_targets=0`），从不采样，hung summary 的
+`communication_history` 也就一直是 `UNAVAILABLE`/`INSUFFICIENT_SAMPLES`——只读证据缺失，没有采错进程。
+现在 target 可以带 `container_ids`（该节点上没有显式路径的运行中容器的 64 位十六进制运行时 ID，最多 64 个；
+有一个容器既无显式路径也无可用 ID、路径为根或含 `..`、或 ID 超过 64 个，该节点仍不分配 target）。
+旧 Agent 用 `extra="forbid"` 校验租约，多一个字段就拒收整个计划，所以新字段按 Agent 能力下发：
+升级后的 Agent 在 heartbeat 里通告 `communication_monitor_version=communication-monitor/v2`，
+控制面按 Agent 通告的版本应答——v1 Agent 收到与修复前逐字节相同的计划（空 `container_ids` 不序列化，
+受管 Pod 仍无 target），v2 Agent 收到带 ID 的 v2 计划（计划的 `version` 写明版本），未知版本不给租约。
+Agent config digest 里的 `communication_monitor_version` 仍记 v1（它表示「被动监测在运行」，协议版本逐个 heartbeat 协商），
+控制面的 digest pin 不变。节点上采样进程用同一解析器把 ID 解析成容器 cgroup，进程扫描、RDMA 绑定、RAS 查询都只在这个 scope 内；
+样本文档与结果带 `workload_scope`；只解析到部分容器时 `scan_complete=false`，一个都找不到时结果为 `SCOPE_UNKNOWN`
+且不写历史行，绝不记成空任务。兼容：旧控制面不认识 v2，不给升级后的 Agent 租约，在控制面也升级之前被动监测空转
+（发布先升级控制面再滚 Agent 波次；旧控制面对受管 Pod 本来也不分配 target）。
+
+QUIESCE_GPU_SERVICES 的设备清扫也读同一个缺失的输入：清扫只可 TERM/KILL 目标 GPU 上位于受影响 workload cgroup
+内的持有者，受管 Pod 的 scope 一直为空，停训后仍握着 GPU 的训练进程留在 `unswept_device_holders`
+（`reason=outside_workload_cgroup_and_process_whitelist`），VERIFY_NO_GPU_CLIENTS（以及 reset 自己的预检）
+以 `GPU device clients are still active` 拒绝 reset——fail-closed，不会带着作业进程 reset，只是该恢复的没有恢复。
+现在计划在 QUIESCE 里同样冻结 `workload_container_ids_by_node`，但只在同一计划的 STOP_WORKLOADS 排在该 QUIESCE 之前时才带
+（清扫只会遇到已停 attempt 的残留进程，绝不碰计划未停的作业）；Agent 在 quiesce 开始、任何服务停止之前用同一解析器解析，
+加进清扫 scope；ID 格式不对（非 64 位十六进制、每节点超过 64 个、不是列表/映射）在武装 fail-safe 和停服务之前就拒绝 quiesce。
+没有进程的容器不贡献 scope（STOP_WORKLOADS 之后这是常态），扫描被截断只加入看到的容器；scope 之外的持有者照旧留给 VERIFY 拒绝。
+回执带 `workload_scope`；其他作业的容器、CRI-O 的 `crio-conmon-<id>.scope`、主机进程从不进入 scope。
 
 每轮采两次 `stat/io/status/wchan`，不扫描所有线程，不读 Python 栈、不触发 FR，
 每节点每轮两次有 2 秒命令上限的 nvidia-smi 查询，两轮总计四次，GPU/NIC 信息按设备去重。

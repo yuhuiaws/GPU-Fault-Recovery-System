@@ -1476,6 +1476,21 @@ RESET receipt each reset call's record in `physical_calls` (paired in order with
 targets' `target_persistence` and the other GPUs' `non_target_persistence_modes` as its final permit checkpoint read them.
 Every record is bounded in count and length.
 
+**The sweep's workload scope.** The device sweep TERM/KILLs only three kinds of holders of the target GPU: the process
+whitelist, the affected attempt's workload cgroup and (on `eks-managed` only) a Kubernetes container; any other is listed in
+`unswept_device_holders` and left to VERIFY_NO_GPU_CLIENTS to refuse. The workload cgroup used to come from the
+`gpu-fault.io/cgroup-path` annotation alone (`workload_cgroup_paths_by_node`), which a managed Pod never has, so a training
+process still holding the GPU after the stop could only make VERIFY fail closed. The control plane now also freezes into the
+QUIESCE the runtime ids of the attempt's running containers per node (`workload_container_ids_by_node`, the hung DAG's
+parameter), and only when the same plan has the attempt's STOP_WORKLOADS before that QUIESCE (`evidence.stops_attempt_before`):
+the sweep meets a stopped attempt's survivors, never a job the plan left running. The Agent resolves its node's ids to
+container cgroups with the hung chain's resolver (`/proc/<pid>/cgroup`) at the start of the quiesce, before anything stops,
+and adds them to the sweep scope (`node_agent/operations/workload_scope.quiesce_workload_scope`); a mapping, list or id it cannot
+read (not 64-hex, more than 64 per node) refuses the quiesce before the fail-safe is armed. A container with no process adds
+nothing, a scan cut short adds only what it saw, and the receipt carries `workload_scope`; another job's container,
+`crio-conmon-<id>.scope` and host processes never enter the scope. An older control plane sends no ids and an older Agent ignores
+them: the behavior is the previous one.
+
 **Fabric Manager across the window (`src/gpu_fault/gpu_fabric_window.py`).** Stopping `nvidia-fabricmanager` loses the
 fabric state, and once it runs again every GPU in the NVLink fabric needs a reset (NVIDIA Fabric Manager User Guide,
 "Stopping Fabric Manager"). The quiesce used to stop it in every window, so a window that reset one GPU left the restored
@@ -3517,6 +3532,12 @@ part of it). Summary and triage results carry `workload_scope` (`basis`, resolve
 found is still `SCOPE_UNKNOWN`, some containers found is `scan_complete=false`, never zero processes. Before this every live
 managed job planned `{node: []}`: every HyperPod GF-GENERAL-LIVE-011 variant's summary was `SCOPE_UNKNOWN` and the triage
 sampled no node (`NO_VALID_SURVEY`).
+The same container ids scope the continuous passive communication monitor: `CommunicationTarget.container_ids` goes only to an
+Agent whose heartbeat advertises `communication_monitor_version=communication-monitor/v2` (a v1 Agent validates with
+`extra="forbid"` and would refuse the whole lease, so it keeps receiving byte for byte the v1 plan it accepts, with no target on
+a managed Pod); a v2 Agent resolves them with the same resolver, its samples carry `workload_scope`, a partial resolution is
+`scan_complete=false`, none found is `SCOPE_UNKNOWN` and writes no history. An older control plane does not know v2 and gives an
+upgraded Agent no lease.
 The two active diagnostic waves share a default budget of 8 nodes, explicitly configurable up to 256;
 legacy zero remains 32. A resumable sliding window allows at most 32 nodes in flight, independent of the total budget.
 For 1024 GPUs on 128 nodes, an explicit budget of 128 permits full-node expansion, not guaranteed diagnosis.

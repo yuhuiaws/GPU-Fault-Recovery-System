@@ -3360,7 +3360,18 @@ breach stays a read-only diagnostic. A joined composite names the change event i
 Deciding "did the application crash the GPU, or did the GPU fail on its own" uses a combination of four fields:
 `pod_uid` / `container_id` / `host_pid` / `cgroup_path`, plus
 `workload_identity_source` (stating how the attribution was obtained: Pod annotation, cgroup parsing, or
-exec'd by the completion-watcher). The attribution result decides at which level the action stops:
+exec'd by the completion-watcher). When an event carries `cgroup_path`, a container with an explicit path (the
+`gpu-fault.io/cgroup-path` annotation) is compared by path (equal, or one below the other); a managed Pod's container has no
+such annotation, and is the process's container when a segment of the event's path names its kubelet runtime id the way the
+runtime names a container's cgroup (`cri-containerd-<id>.scope`, `crio-<id>.scope`, `docker-<id>.scope`, the cgroupfs `<id>`)
+(`workload_container_scope.cgroup_in_container`, shared by `WorkloadTopologyService.resolve` and `attempt_observation`); a path
+naming another container, `crio-conmon-<id>.scope`, the Pod-level cgroup or a host unit does not match. Before this a managed
+container never matched: the event found no attempt (`workload_identity_source=NO_ACTIVE_MANAGED_ATTEMPT`), its workload state
+stayed `UNKNOWN`, and the plan went `SAFETY_PENDING` (`node workload state is UNKNOWN`) with only FREEZE_EVIDENCE,
+MARK_UNSCHEDULABLE and QUARANTINE waiting for an operator, instead of the attributed stop, reset and restart -- conservative and
+harmless to the job, but no automatic recovery; the product's own collectors do not fill the field, only an external producer
+that does met it.
+The attribution result decides at which level the action stops:
 
 - Attributable to a specific workload and the XID belongs to the application-inducible class → `RESTART_WORKLOAD` level;
 - XID belongs to the application-inducible class (catalog `RESTART_APP`) but `workload_state` is `IDLE` → the policy engine
