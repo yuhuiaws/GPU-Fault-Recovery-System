@@ -9,6 +9,7 @@ never a missing-device finding or a reboot. Every 014 variant (and the rest of
 from __future__ import annotations
 
 import json
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -164,15 +165,17 @@ def test_013_and_014_cover_every_variant() -> None:
         item.deferred for item in mod.VARIANTS if item.case_id == "GF-GENERAL-LIVE-014"
     ), "014 has no valid replay path; every variant is NOT_RUN"
     for name in ("unknown_inventory", "excess_device", "link_inactive"):
-        assert (
-            SPECS[name].lanes == ("eks", "hp")
-            and SPECS[name].proof_mode == "live-replay"
+        spec = SPECS[name]
+        assert spec.lanes == ("eks", "hp") and spec.proof_mode == "live-replay"
+        assert spec.approvals == (mod.HOST_SOURCE_REPLAY,), (
+            f"{name}: the fixed product reboots on no tree replay; HOST_SOURCE_REPLAY only"
         )
-        assert mod.HOST_SOURCE_REPLAY in SPECS[name].approvals
-    assert SPECS["link_inactive"].approvals == (mod.HOST_SOURCE_REPLAY, mod.NODE_REBOOT)
-    assert SPECS["link_inactive"].expected_outcome == "FAIL"
-    assert "missing_inventory_action_completion" in SPECS["link_inactive"].product_gap
-    assert SPECS["excess_device"].expected_outcome == "PASS"
+        assert spec.expected_outcome == "PASS" and spec.product_gap == "", name
+        assert spec.flags == "S", name
+    assert (
+        SPECS["link_inactive"].risk == "M" and SPECS["link_inactive"].max_minutes <= 30
+    )
+    assert "bounded exposure" in SPECS["link_inactive"].injection
 
 
 # --------------------------------------------------------------------------- #
@@ -317,17 +320,55 @@ def _efa_incident(
     }
 
 
-WAITING = {
+def _soon(seconds: float) -> str:
+    """The product's records lie after the runner's real-clock restore."""
+
+    return (datetime.now(timezone.utc) + timedelta(seconds=seconds)).isoformat()
+
+
+EXPOSURE = mod.bounded_exposure_seconds(15)
+STALE_WAITING = {
     "operation": "VALIDATE_FABRIC",
     "status": "WAITING",
     "details": {"node_pending": {NODE: {"missing_inventory_action_completion": ["x"]}}},
 }
-SUCCEEDED = {"operation": "VALIDATE_FABRIC", "status": "SUCCEEDED", "details": {}}
-FAILED = {
+STALE_FAILED = {
     "operation": "VALIDATE_FABRIC",
     "status": "FAILED",
     "details": {"node_pending": {NODE: {"missing_inventory_action_completion": ["x"]}}},
 }
+FRESH_WAITING = {
+    "operation": "VALIDATE_FABRIC",
+    "status": "WAITING",
+    "details": {
+        "node_pending": {
+            NODE: {"missing_fresh_inventory_metric": ["efa_inventory_active_count"]}
+        }
+    },
+}
+
+
+def fresh_verdict(status: str, *, value: int, observed_at: str) -> dict[str, Any]:
+    """A VALIDATE_FABRIC that judged a fresh reading (batch 175's inventory_evidence)."""
+
+    details: dict[str, Any] = {
+        "inventory_evidence": {
+            NODE: {
+                "efa_inventory_active_count": {
+                    "value": value,
+                    "expected": EXPECTED_EFA,
+                    "observed_at": observed_at,
+                }
+            }
+        }
+    }
+    if status == "FAILED":
+        details["node_failures"] = {
+            NODE: [f"efa_inventory_active_count={value:g},expected={EXPECTED_EFA}"]
+        }
+    return {"operation": "VALIDATE_FABRIC", "status": status, "details": details}
+
+
 REBOOT_WORKFLOW = {
     "request_id": "wf-reboot",
     "incident_id": "inc-efa",
@@ -339,7 +380,9 @@ REBOOT_WORKFLOW = {
         {"operation": "VALIDATE_FABRIC", "parameters": {}},
         {"operation": "RESTORE_SCHEDULING", "parameters": {}},
     ],
-    "step_executions": [SUCCEEDED],
+    "step_executions": [
+        {"operation": "VALIDATE_FABRIC", "status": "SUCCEEDED", "details": {}}
+    ],
 }
 
 
@@ -430,7 +473,10 @@ def test_unknown_inventory_fails_when_a_count_was_reported(tmp_path: Path) -> No
     )
 
 
-def _excess_docs(*, reboot: bool = False) -> list[dict[str, Any]]:
+def _excess_docs(
+    *, verdict: dict[str, Any] | None = None, reboot: bool = False
+) -> list[dict[str, Any]]:
+    verdict = verdict or fresh_verdict("FAILED", value=4, observed_at=_soon(20))
     detection = _base_doc(
         batches=[
             _efa_batch(
@@ -446,7 +492,7 @@ def _excess_docs(*, reboot: bool = False) -> list[dict[str, Any]]:
                 mismatch=1,
             ),
         ],
-        **_efa_incident(workflow_status="RUNNING", executions=[WAITING]),
+        **_efa_incident(workflow_status="RUNNING", executions=[FRESH_WAITING]),
     )
     recovery = _base_doc(
         batches=[
@@ -460,14 +506,16 @@ def _excess_docs(*, reboot: bool = False) -> list[dict[str, Any]]:
     )
     settled = _base_doc(
         batches=recovery["batches"],
-        **_efa_incident(workflow_status="FAILED", executions=[FAILED]),
+        **_efa_incident(workflow_status=verdict["status"], executions=[verdict]),
     )
     if reboot:
         settled["workflows"].append(REBOOT_WORKFLOW)
     return [_base_doc(), detection, recovery, settled]
 
 
-def test_excess_device_diagnoses_only(tmp_path: Path) -> None:
+def test_excess_device_passes_on_a_concluded_diagnostic_either_way(
+    tmp_path: Path,
+) -> None:
     probe = _tree_probe()
     ctx = _tree_ctx(
         "excess_device", docs=_excess_docs(), tmp_path=tmp_path, probe=probe
@@ -484,15 +532,30 @@ def test_excess_device_diagnoses_only(tmp_path: Path) -> None:
         ctx.run_id,
     ), mutated
     assert result["expected_count"] == EXPECTED_EFA
-    assert result["validation_executions"][0]["status"] == "FAILED"
+    assert result["validation_executions"][0]["status"] == "FAILED", (
+        "a fresh excess reading fails the diagnostic; EXCESS_DEVICE escalates nothing"
+    )
     assert any(call[0] == "close-window" for call in probe.calls), (
         "the tree is closed as soon as the finding exists"
     )
+    succeeded = fresh_verdict("SUCCEEDED", value=EXPECTED_EFA, observed_at=_soon(20))
+    ctx = _tree_ctx(
+        "excess_device", docs=_excess_docs(verdict=succeeded), tmp_path=tmp_path
+    )
+    assert mod.excess_device(ctx)["verdict"] == "PASS"
 
 
-def test_excess_device_fails_on_a_reboot_or_without_the_excess_sample(
+def test_excess_device_fails_on_the_stale_gate_a_reboot_or_without_the_sample(
     tmp_path: Path,
 ) -> None:
+    ctx = _tree_ctx(
+        "excess_device", docs=_excess_docs(verdict=STALE_FAILED), tmp_path=tmp_path
+    )
+    result = mod.excess_device(ctx)
+    assert result["verdict"] == "FAIL", result
+    joined = "\n".join(result["errors"])
+    assert "missing_inventory_action_completion" in joined, joined
+    assert "no fresh reading recorded" in joined, joined
     ctx = _tree_ctx("excess_device", docs=_excess_docs(reboot=True), tmp_path=tmp_path)
     result = mod.excess_device(ctx)
     assert result["verdict"] == "FAIL", result
@@ -507,7 +570,16 @@ def test_excess_device_fails_on_a_reboot_or_without_the_excess_sample(
         mod.excess_device(ctx)
 
 
-def _link_docs(*, concluded: bool) -> list[dict[str, Any]]:
+def _link_docs(
+    *,
+    verdict: dict[str, Any] | None = None,
+    reboot: bool = False,
+    detected: bool = True,
+    late_inactive: bool = False,
+) -> list[dict[str, Any]]:
+    verdict = verdict or fresh_verdict(
+        "SUCCEEDED", value=EXPECTED_EFA, observed_at=_soon(EXPOSURE + 20)
+    )
     detection = _base_doc(
         batches=[
             _efa_batch(
@@ -523,7 +595,11 @@ def _link_docs(*, concluded: bool) -> list[dict[str, Any]]:
                 mismatch=1,
             ),
         ],
-        **_efa_incident(workflow_status="RUNNING", executions=[WAITING]),
+        **(
+            _efa_incident(workflow_status="RUNNING", executions=[FRESH_WAITING])
+            if detected
+            else {}
+        ),
     )
     recovery = _base_doc(
         batches=[
@@ -535,27 +611,32 @@ def _link_docs(*, concluded: bool) -> list[dict[str, Any]]:
             )
         ]
     )
-    if concluded:
-        settled = _base_doc(
-            batches=recovery["batches"],
-            **_efa_incident(workflow_status="SUCCEEDED", executions=[SUCCEEDED]),
+    settled = _base_doc(
+        batches=list(recovery["batches"]),
+        **_efa_incident(workflow_status=verdict["status"], executions=[verdict]),
+    )
+    if late_inactive:
+        settled["batches"].append(
+            _efa_batch(
+                _soon(EXPOSURE + 30), failure_mode="LINK_INACTIVE", active=2, mismatch=1
+            )
         )
-    else:
-        settled = _base_doc(
-            batches=recovery["batches"],
-            **_efa_incident(workflow_status="FAILED", executions=[FAILED]),
-        )
+    if reboot:
         settled["workflows"].append(REBOOT_WORKFLOW)
-    return [_base_doc(), detection, recovery, settled]
+    return [_base_doc(), detection, detection, recovery, settled]
 
 
-def test_link_inactive_passes_when_the_diagnosis_concludes_on_the_restored_link(
+def _closing_probe(*, already_closed: bool = True) -> FakeProbe:
+    return _tree_probe(
+        **{"close-window": {"clean": True, "already_closed": already_closed}}
+    )
+
+
+def test_link_inactive_passes_on_a_bounded_exposure_and_a_fresh_verdict(
     tmp_path: Path,
 ) -> None:
-    probe = _tree_probe()
-    ctx = _tree_ctx(
-        "link_inactive", docs=_link_docs(concluded=True), tmp_path=tmp_path, probe=probe
-    )
+    probe = _closing_probe()
+    ctx = _tree_ctx("link_inactive", docs=_link_docs(), tmp_path=tmp_path, probe=probe)
     result = mod.link_inactive(ctx)
     assert result["verdict"] == "PASS", result["errors"]
     _baseline, mutated = _build_calls(probe)
@@ -569,18 +650,88 @@ def test_link_inactive_passes_when_the_diagnosis_concludes_on_the_restored_link(
         "--run-id",
         ctx.run_id,
     ), mutated
+    opened = next(call for call in probe.calls if call[0] == "open-window")
+    assert opened[opened.index("--restore-seconds") + 1] == str(EXPOSURE), (
+        "the window's own deadman is the restore: 1.7 collector intervals"
+    )
+    assert EXPOSURE == 26, "15 s ticks: after the second tick, before the third"
+    names = [call[0] for call in probe.calls]
+    assert names.index("open-window") < names.index("close-window")
+    assert result["closed_by"] == "deadman" and result["exposure_seconds"] == EXPOSURE
     assert result["device"] == "rdmap0s0" and result["port"] == "1"
-
-
-def test_link_inactive_fails_on_the_deadline_reboot_gap(tmp_path: Path) -> None:
+    assert result["stages"]["fresh_evidence"] == [], result["stages"]
+    # A late deadman: the runner's own close restores and says so.
     ctx = _tree_ctx(
-        "link_inactive", docs=_link_docs(concluded=False), tmp_path=tmp_path
+        "link_inactive",
+        docs=_link_docs(),
+        tmp_path=tmp_path,
+        probe=_closing_probe(already_closed=False),
+    )
+    assert mod.link_inactive(ctx)["closed_by"] == "runner"
+
+
+def test_link_inactive_fails_on_the_old_deadline_reboot_gap(tmp_path: Path) -> None:
+    ctx = _tree_ctx(
+        "link_inactive",
+        docs=_link_docs(verdict=STALE_FAILED, reboot=True),
+        tmp_path=tmp_path,
+        probe=_closing_probe(),
     )
     result = mod.link_inactive(ctx)
     assert result["verdict"] == "FAIL", result
     joined = "\n".join(result["errors"])
     assert "never SUCCEEDED" in joined and "RESTART_NODE" in joined, joined
     assert "missing_inventory_action_completion" in joined, joined
+
+
+def test_link_inactive_fails_without_the_fresh_evidence_or_a_stale_reading(
+    tmp_path: Path,
+) -> None:
+    bare = {"operation": "VALIDATE_FABRIC", "status": "SUCCEEDED", "details": {}}
+    ctx = _tree_ctx(
+        "link_inactive",
+        docs=_link_docs(verdict=bare),
+        tmp_path=tmp_path,
+        probe=_closing_probe(),
+    )
+    result = mod.link_inactive(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any("no fresh reading recorded" in e for e in result["errors"]), result[
+        "errors"
+    ]
+    stale = fresh_verdict(
+        "SUCCEEDED", value=EXPECTED_EFA, observed_at="2026-10-24T00:01:05+00:00"
+    )
+    ctx = _tree_ctx(
+        "link_inactive",
+        docs=_link_docs(verdict=stale),
+        tmp_path=tmp_path,
+        probe=_closing_probe(),
+    )
+    result = mod.link_inactive(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any("before the restore" in e for e in result["errors"]), result["errors"]
+
+
+def test_link_inactive_is_inconclusive_when_the_bound_decided_nothing(
+    tmp_path: Path,
+) -> None:
+    ctx = _tree_ctx(
+        "link_inactive",
+        docs=_link_docs(detected=False),
+        tmp_path=tmp_path,
+        probe=_closing_probe(),
+    )
+    with pytest.raises(VariantInconclusive, match="bounded exposure"):
+        mod.link_inactive(ctx)
+    ctx = _tree_ctx(
+        "link_inactive",
+        docs=_link_docs(late_inactive=True),
+        tmp_path=tmp_path,
+        probe=_closing_probe(),
+    )
+    with pytest.raises(VariantInconclusive, match="exposure bound did not hold"):
+        mod.link_inactive(ctx)
 
 
 def test_tree_variants_block_without_an_active_port(tmp_path: Path) -> None:

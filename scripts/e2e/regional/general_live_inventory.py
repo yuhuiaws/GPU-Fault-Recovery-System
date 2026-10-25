@@ -21,20 +21,28 @@ chain cannot be entered by these. PCI_DEVICE_MISSING drives REBOOT on the only
 EKS GPU node, and the driver-binding variants need a reserved native
 unbind/rebind; those stay NOT_RUN.
 
-The product's own design for LINK_INACTIVE is diagnose first, then escalate:
+The product's design for LINK_INACTIVE is diagnose first, then escalate:
 ``families/health.py`` ``_resource_escalation`` tags the diagnostic
-VALIDATE_FABRIC ``failure_escalation_action=REBOOT_NODE``. The same step also
-receives ``inventory_requirements_by_node`` (``_enrich_step``), which
-``adapters/gpu_validation.py`` ``_validate_inventory`` can only satisfy after a
-completed EFA recovery operation the RUN_DIAGNOSTICS plan never contains
-(``missing_inventory_action_completion``), so the step never re-reads the port
-and waits out ``GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS`` (600 s); its deadline
-failure then escalates to RESTART_NODE even when the port is ACTIVE again.
-``link_inactive`` therefore restores the link right after the finding and is
-registered ``expected_outcome="FAIL"`` with that gap: it PASSes once the
-diagnostic validation concludes on fresh evidence. ``excess_device`` has no
-escalation (``reboot_allowed`` is False for EXCESS_DEVICE) and ends diagnostic
-inconclusive after the same deadline; its PASS is the diagnostic-only chain.
+VALIDATE_FABRIC ``failure_escalation_action=REBOOT_NODE``, and since batch 175
+that step judges the *fresh* inventory readings observed after the chain
+reached it (``adapters/gpu_validation.py``): SUCCEEDED when they show the
+expected count, FAILED on a fresh mismatch -- when the reboot is the designed
+answer to a confirmed, still-inactive link -- and the reading it rests on is
+recorded in ``details.inventory_evidence``. ``link_inactive`` therefore shows
+the inactive port for a bounded exposure only
+(``general_live_source_replay.bounded_exposure_seconds``: the window's own
+deadman closes it 1.7 collector intervals after it opened, after the second
+tick that confirms the shortfall and before a third could be read), so the
+diagnostic only ever sees the restored port: PASS is a SUCCEEDED validation
+on fresh evidence, the incident RECOVERED, no RESTART_NODE, under
+HOST_SOURCE_REPLAY alone. An inactive reading the product recorded after the
+restore means the bound did not hold on that node; the designed escalation
+is then right and the variant is INCONCLUSIVE, never a verdict on the product.
+``excess_device`` has no escalation (``reboot_allowed`` is False for
+EXCESS_DEVICE): its validation concludes on fresh evidence either way --
+SUCCEEDED on the restored count, or FAILED on a fresh excess reading with
+``escalate_failed_hardware_remediation`` planning nothing -- and PASS is a
+concluded diagnostic that recorded its evidence, RECOVERED, no reboot.
 
 014: a Kubernetes allocatable shortfall must come from a *real* device-plugin
 registration fault (``collectors/cloud/kubernetes``); the spec is explicit that
@@ -47,7 +55,7 @@ reason. The denominator keeps them all.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
 from scripts.e2e.regional.general_live_common import (
@@ -71,6 +79,7 @@ from scripts.e2e.regional.general_live_source_replay import (
     HOST_SOURCE_REPLAY,
     INFINIBAND_TREE,
     HostSourceReplay,
+    bounded_exposure_seconds,
     host_source_replay,
 )
 from scripts.e2e.regional.general_live_verdicts import (
@@ -82,6 +91,7 @@ from scripts.e2e.regional.general_live_verdicts import (
     isolation_operations,
     node_isolated,
     operations,
+    parse_time,
     samples,
     verdict,
     workflows_of,
@@ -99,7 +109,6 @@ EFA_METRICS = {
     "efa_inventory_discovered_count",
     "rdma_link_down",
 }
-NODE_REBOOT = "NODE_REBOOT"
 INFINIBAND_ROOT = "/sys/class/infiniband"
 #: The duplicated device of ``excess_device``; a name no real EFA device has.
 EXCESS_DEVICE_NAME = "gfrs-excess0"
@@ -109,23 +118,16 @@ INACTIVE_STATE = "1: DOWN"
 INACTIVE_PHYS_STATE = "3: Disabled"
 #: Isolation steps a diagnostic-only EFA chain must not plan.
 ISOLATION_OPERATIONS = frozenset({"MARK_UNSCHEDULABLE", "QUARANTINE", "STOP_WORKLOADS"})
-#: The diagnostic VALIDATE_FABRIC waits out the workflow step deadline
-#: (GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS, 600 s by default) before it ends.
+#: The workflow step deadline (GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS, 600 s by
+#: default): a validation that regressed to waiting for an action completion
+#: fails there, and the settle budget covers it so the FAIL is read off a
+#: settled record.
 STEP_TIMEOUT_SECONDS = 600
-#: The product's REBOOT_NODE escalation (reboot, validations, restore) on top.
-REBOOT_SETTLE_BUDGET = 1800
-LINK_INACTIVE_GAP = (
-    "adapters/gpu_validation.py `_validate_inventory` answers the diagnostic "
-    "VALIDATE_FABRIC of a LINK_INACTIVE efa_inventory_mismatch finding with "
-    "`missing_inventory_action_completion` (its inventory_requirements_by_node, "
-    "set by families/health.py `_enrich_step`, need a completed EFA recovery "
-    "operation the RUN_DIAGNOSTICS plan never contains), so the step never "
-    "re-reads the port state, waits out GPU_FAULT_WORKFLOW_STEP_TIMEOUT_SECONDS "
-    "(600 s) and FAILS; families/health.py `_resource_escalation` tagged that step "
-    "`failure_escalation_action=REBOOT_NODE`, so orchestration/escalation.py "
-    "plans RESTART_NODE even though the port is ACTIVE again -- the spec requires "
-    "diagnose-first with a reboot only on a confirmed, still-inactive link"
-)
+#: The old gate's wait, which must appear in no validation's details any more.
+STALE_GATE = "missing_inventory_action_completion"
+#: Node and control-plane clocks may differ by a few seconds when a host batch
+#: is placed before or after the window's restore.
+RESTORE_CLOCK_TOLERANCE_SECONDS = 5
 
 
 def unreadable_state(ctx: VariantContext) -> dict[str, Any]:
@@ -285,6 +287,89 @@ def _validation_executions(
     ]
 
 
+def stale_gate_errors(validations: list[dict[str, Any]]) -> list[str]:
+    """No VALIDATE_FABRIC waited for an action completion no diagnostic step produces."""
+
+    return [
+        f"VALIDATE_FABRIC of {item.get('request_id')} waited on {STALE_GATE}: the "
+        "diagnostic chain's inventory gate does not judge fresh readings"
+        for item in validations
+        if STALE_GATE in str(item.get("details") or "")
+    ]
+
+
+def fresh_evidence_errors(
+    execution: dict[str, Any],
+    *,
+    node: str,
+    expected: int | None,
+    after: datetime | None,
+) -> list[str]:
+    """The concluded validation recorded the fresh reading it rests on.
+
+    Batch 175 writes ``details.inventory_evidence[node][metric]`` with the
+    value, the expected count and the reading's ``observed_at`` for every
+    verdict of the inventory gate. For a SUCCEEDED diagnostic the reading must
+    be the restored count (``expected``) observed after the restore (``after``).
+    """
+
+    details = execution.get("details") or {}
+    evidence = (details.get("inventory_evidence") or {}).get(node) or {}
+    reading = evidence.get("efa_inventory_active_count")
+    if not isinstance(reading, dict):
+        return [
+            f"VALIDATE_FABRIC {execution.get('status')} without "
+            f"details.inventory_evidence[{node}][efa_inventory_active_count]: no fresh "
+            "reading recorded"
+        ]
+    errors = []
+    if expected is not None and reading.get("value") != expected:
+        errors.append(
+            f"the validation judged efa_inventory_active_count={reading.get('value')}, "
+            f"not the restored {expected}"
+        )
+    observed = parse_time(reading.get("observed_at"))
+    if after is not None and (
+        observed is None
+        or observed < after - timedelta(seconds=RESTORE_CLOCK_TOLERANCE_SECONDS)
+    ):
+        errors.append(
+            f"the validation's reading was observed {reading.get('observed_at')}, "
+            f"before the restore at {after.isoformat()}"
+        )
+    return errors
+
+
+def inactive_after(
+    observed: dict[str, Any],
+    moment: datetime,
+    metric: str = "efa_inventory_missing_count",
+) -> list[dict[str, Any]]:
+    """Shortfall readings the product recorded after ``moment`` (plus tolerance)."""
+
+    cutoff = moment + timedelta(seconds=RESTORE_CLOCK_TOLERANCE_SECONDS)
+    return [
+        item
+        for item in _efa_samples(observed, metric)
+        if item["value"] >= 1
+        and (when := parse_time(item.get("observed_at"))) is not None
+        and when > cutoff
+    ]
+
+
+def _recovered_errors(
+    incidents: list[dict[str, Any]], settled: dict[str, Any]
+) -> list[str]:
+    """Every finding incident of the variant closed RECOVERED once settled."""
+
+    ids = {str(item["incident_id"]) for item in incidents}
+    return [
+        f"incident {item.get('incident_id')} is {item.get('state')}, not RECOVERED"
+        for item in settled.get("incidents") or []
+        if str(item.get("incident_id")) in ids and item.get("state") != "RECOVERED"
+    ]
+
+
 def _await_efa_recovery(
     ctx: VariantContext, since: datetime, expected: int
 ) -> list[str]:
@@ -383,7 +468,16 @@ def unknown_inventory(ctx: VariantContext) -> dict[str, Any]:
 
 
 def excess_device(ctx: VariantContext) -> dict[str, Any]:
-    """One device more than the invariant: EXCESS_DEVICE diagnoses only, no reboot."""
+    """One device more than the invariant: EXCESS_DEVICE diagnoses only, no reboot.
+
+    The tree is closed the moment the finding exists. The diagnostic
+    VALIDATE_FABRIC judges fresh readings (batch 175): SUCCEEDED when the next
+    sample shows the restored count, FAILED when it still shows the excess --
+    EXCESS_DEVICE carries no escalation, so a FAILED diagnostic ends the
+    incident RECOVERED ("diagnostic inconclusive") and plans nothing. Either is
+    a concluded diagnostic; PASS needs its evidence recorded, no stale gate, no
+    hardware or isolation step, RECOVERED, and the healthy count after.
+    """
 
     replay = host_source_replay(ctx)
     _baseline, device, _port, active = _real_tree(ctx, replay)
@@ -429,6 +523,10 @@ def excess_device(ctx: VariantContext) -> dict[str, Any]:
         name="excess-settled",
     )
     observed = settled or activity(ctx, started, metrics=EFA_METRICS)
+    validations = _validation_executions(observed, incidents)
+    concluded = [
+        item for item in validations if item.get("status") in {"SUCCEEDED", "FAILED"}
+    ]
     stages = {
         "failure_mode": efa_failure_mode_errors(detection, "EXCESS_DEVICE"),
         "diagnostic_only": chain_errors(
@@ -440,11 +538,23 @@ def excess_device(ctx: VariantContext) -> dict[str, Any]:
                 single=False,
             ),
         ),
-        "validator_executed": []
-        if _validation_executions(observed, incidents)
-        else ["the diagnostic workflow never executed VALIDATE_FABRIC"],
+        "validation_concluded": []
+        if concluded
+        else [
+            "the diagnostic VALIDATE_FABRIC never concluded (SUCCEEDED or FAILED on "
+            f"fresh evidence): {str(validations)[:400]}"
+        ],
+        "fresh_evidence": [
+            error
+            for item in concluded[-1:]
+            for error in fresh_evidence_errors(
+                item, node=ctx.settings.node, expected=None, after=None
+            )
+        ],
+        "no_stale_gate": stale_gate_errors(validations),
         "no_reboot": hardware_errors(observed),
         "not_isolated": _isolation_errors(ctx, observed),
+        "incident_recovered": _recovered_errors(incidents, observed),
         "recovered": recovered,
     }
     return _result(
@@ -452,14 +562,15 @@ def excess_device(ctx: VariantContext) -> dict[str, Any]:
         notes=[
             f"{device} duplicated as {EXCESS_DEVICE_NAME} in the replayed tree only "
             f"(active {active + 1} > expected {expected}); EXCESS_DEVICE is RUN_DIAGNOSTICS",
-            "the diagnostic VALIDATE_FABRIC waits on missing_inventory_action_completion "
-            "until the step deadline (no recovery action precedes it); no escalation for "
-            "EXCESS_DEVICE",
+            "the diagnostic VALIDATE_FABRIC judges the fresh inventory reading after "
+            "the chain reached it: SUCCEEDED on the restored count, or FAILED on a "
+            "fresh excess reading with no escalation planned (EXCESS_DEVICE authorizes "
+            "no reboot)",
         ],
         extra={
             "device": device,
             "expected_count": expected,
-            "validation_executions": _validation_executions(observed, incidents),
+            "validation_executions": validations,
             "settled": _statuses(observed),
             "proof_scope": "live-replay",
         },
@@ -467,11 +578,16 @@ def excess_device(ctx: VariantContext) -> dict[str, Any]:
 
 
 def link_inactive(ctx: VariantContext) -> dict[str, Any]:
-    """One real port DOWN/Disabled: LINK_INACTIVE diagnoses first; restored at once.
+    """One real port DOWN/Disabled for a bounded exposure: LINK_INACTIVE diagnoses
+    the restored link and concludes SUCCEEDED; no RESTART_NODE.
 
-    The tree is closed the moment the product has the finding, so every later
-    read sees the real ACTIVE/LinkUp port; a diagnosis that concludes on that
-    fresh evidence is the PASS, a RESTART_NODE planned after it is the gap.
+    The window's own deadman closes it :func:`bounded_exposure_seconds` after
+    it opened -- after the collector's second tick, which confirms the
+    shortfall and mints the finding, and before a third could read the port --
+    so the diagnostic VALIDATE_FABRIC (judging fresh readings since batch 175)
+    only ever sees the real, ACTIVE port and the designed REBOOT_NODE
+    escalation has nothing fresh to fire on. The runner never races the
+    product: its own close afterwards finds the window already closed.
     """
 
     replay = host_source_replay(ctx)
@@ -483,49 +599,71 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         phys_state=[(device, port, INACTIVE_PHYS_STATE)],
     )
     ctx.evidence.write("infiniband-fixture", built)
+    exposure = bounded_exposure_seconds(ctx.host_interval)
     started = utc_now()
-    _open_tree(ctx, replay)
+    opened = replay.open_tree(
+        [(INFINIBAND_TREE, INFINIBAND_ROOT)], restore_seconds=exposure
+    )
+    ctx.evidence.write("source-window-open", opened)
+    restore_at = utc_now() + timedelta(seconds=exposure)
     detection = wait_for_incident(
         ctx,
         started,
         "efa_inventory_mismatch",
-        timeout_seconds=DETECTION_BUDGET,
+        timeout_seconds=exposure + ctx.host_interval * 3 + 60,
         metrics=EFA_METRICS,
         name="link-inactive-detection",
     )
+    incidents = finding_incidents(detection, "efa_inventory_mismatch")
     missing = [
         item
         for item in _efa_samples(detection, "efa_inventory_missing_count")
         if item["value"] >= 1
     ]
-    if not missing:
-        raise VariantInconclusive(
-            "the product never reported efa_inventory_missing_count >= 1 from the "
-            "replayed inactive port"
-        )
-    incidents = finding_incidents(detection, "efa_inventory_mismatch")
-    restored_at = utc_now()
-    ctx.evidence.write("source-window-close", replay.close())
+    # The deadman has closed the window by now; the runner's close confirms it
+    # (already_closed) or, should the timer have been late, closes it itself.
+    remaining = (restore_at - utc_now()).total_seconds()
+    if remaining > 0:
+        ctx.hold(remaining + RESTORE_CLOCK_TOLERANCE_SECONDS, name="exposure")
+    closed = replay.close()
+    closed_by = "deadman" if closed.get("already_closed") else "runner"
+    ctx.evidence.write("source-window-close", {**closed, "closed_by": closed_by})
     ctx.evidence.append_oracle(
         [
             {
                 "inactive_port": f"{device}/ports/{port}",
-                "restored_at": restored_at.isoformat(),
+                "exposure_seconds": exposure,
+                "restore_at": restore_at.isoformat(),
+                "closed_by": closed_by,
                 **replay.evidence(device=device),
             }
         ],
         source="infiniband",
     )
-    recovered = _await_efa_recovery(ctx, restored_at, expected)
+    if not incidents or not missing:
+        raise VariantInconclusive(
+            f"the bounded exposure ({exposure} s) ended before the product confirmed "
+            "the inactive port: no efa_inventory_mismatch finding (the collector's "
+            "two confirming ticks did not both fall inside the window)"
+        )
+    recovered = _await_efa_recovery(ctx, restore_at, expected)
     settled = wait_settled(
         ctx,
         started,
         [str(item["incident_id"]) for item in incidents],
-        timeout_seconds=STEP_TIMEOUT_SECONDS + REBOOT_SETTLE_BUDGET,
+        timeout_seconds=STEP_TIMEOUT_SECONDS + 300,
         metrics=EFA_METRICS,
         name="link-inactive-settled",
     )
     observed = settled or activity(ctx, started, metrics=EFA_METRICS)
+    late = inactive_after(observed, restore_at)
+    if late:
+        raise VariantInconclusive(
+            f"the exposure bound did not hold: {len(late)} efa_inventory_missing_count "
+            f"reading(s) after the restore at {restore_at.isoformat()} (first "
+            f"{late[0]['observed_at']}); the product's designed escalation on fresh "
+            "inactive evidence applies and is not a verdict on it"
+        )
     first_workflows = [
         workflows_of(observed, str(item["incident_id"]))[:1] for item in incidents
     ]
@@ -543,7 +681,7 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
                 f"the first workflow plans {banned} before diagnosing"
             )
     # Only the diagnostic (first) workflow may conclude the diagnosis: a
-    # SUCCEEDED VALIDATE_FABRIC inside a later reboot chain is the gap, not proof.
+    # SUCCEEDED VALIDATE_FABRIC inside a later reboot chain is not proof.
     concluded = [
         item
         for found in first_workflows
@@ -551,34 +689,45 @@ def link_inactive(ctx: VariantContext) -> dict[str, Any]:
         for item in executions(workflow, "VALIDATE_FABRIC")
         if item.get("status") == "SUCCEEDED"
     ]
+    validations = _validation_executions(observed, incidents)
     stages = {
         "failure_mode": efa_failure_mode_errors(detection, "LINK_INACTIVE"),
-        "diagnose_first": diagnose_first
-        or ([] if incidents else ["no efa_inventory_mismatch incident was minted"]),
+        "diagnose_first": diagnose_first,
         "validation_concluded": []
         if concluded
         else [
             "VALIDATE_FABRIC never SUCCEEDED on the restored link: "
-            + str(_validation_executions(observed, incidents))[:400]
+            + str(validations)[:400]
         ],
+        "fresh_evidence": [
+            error
+            for item in concluded[-1:]
+            for error in fresh_evidence_errors(
+                item, node=ctx.settings.node, expected=expected, after=restore_at
+            )
+        ],
+        "no_stale_gate": stale_gate_errors(validations),
         "no_reboot_after_recovery": hardware_errors(observed),
         "not_isolated": _isolation_errors(ctx, observed),
+        "incident_recovered": _recovered_errors(incidents, observed),
         "recovered": recovered,
     }
     return _result(
         stages,
         notes=[
             f"{device}/ports/{port} read {INACTIVE_STATE!r}/{INACTIVE_PHYS_STATE!r} in the "
-            "replayed tree only; the real port stayed up and the tree was closed as "
-            "soon as the finding existed",
+            f"replayed tree for a bounded exposure of {exposure} s (closed by "
+            f"{closed_by}); the real port stayed up",
             "rdma_link_down co-fires from the same port (010 link_inactive semantics)",
         ],
         extra={
             "device": device,
             "port": port,
             "expected_count": expected,
-            "restored_at": restored_at.isoformat(),
-            "validation_executions": _validation_executions(observed, incidents),
+            "exposure_seconds": exposure,
+            "restore_at": restore_at.isoformat(),
+            "closed_by": closed_by,
+            "validation_executions": validations,
             "settled": _statuses(observed),
             "proof_scope": "live-replay",
         },
@@ -685,36 +834,38 @@ VARIANTS = [
         "link_inactive",
         injection=(
             "bind a copy of the node's /sys/class/infiniband with one real port's "
-            "state/phys_state '1: DOWN'/'3: Disabled' into the host collector unit; "
-            "closed the moment the LINK_INACTIVE finding exists"
+            "state/phys_state '1: DOWN'/'3: Disabled' into the host collector unit for "
+            "a bounded exposure: the window's deadman closes it 1.7 collector intervals "
+            "after it opened (two confirming ticks, never a third)"
         ),
         expected=(
             "efa_inventory_mismatch failure_mode=LINK_INACTIVE -> RUN_DIAGNOSTICS: "
             "FREEZE_EVIDENCE + VALIDATE_FABRIC first, no isolation; the validation "
-            "concludes on the restored link; no RESTART_NODE after the port is ACTIVE again"
+            "SUCCEEDS on the fresh restored reading (details.inventory_evidence), never "
+            "waits on missing_inventory_action_completion; the incident is RECOVERED; "
+            "no RESTART_NODE; the healthy count reads back"
         ),
         execute=link_inactive,
-        risk="H",
-        flags="X",
-        max_minutes=60,
-        approvals=(HOST_SOURCE_REPLAY, NODE_REBOOT),
-        expected_outcome="FAIL",
-        product_gap=LINK_INACTIVE_GAP,
+        risk="M",
+        max_minutes=30,
         cleanup=(
-            "close the tree window right after the finding (deadman-backed); the "
-            "product's diagnostic -- and, while the gap is present, its REBOOT_NODE "
-            "escalation under NODE_REBOOT -- is waited to settle, never cancelled"
+            "the window closes itself at the exposure bound (deadman); the runner's "
+            "close confirms it and the diagnostic is waited to settle, never cancelled"
         ),
     ),
     _tree_variant(
         "excess_device",
         injection=(
             f"bind a copy of the node's /sys/class/infiniband with one real device "
-            f"duplicated as {EXCESS_DEVICE_NAME} into the host collector unit"
+            f"duplicated as {EXCESS_DEVICE_NAME} into the host collector unit; closed "
+            "the moment the finding exists"
         ),
         expected=(
             "efa_inventory_mismatch failure_mode=EXCESS_DEVICE -> RUN_DIAGNOSTICS with "
-            "VALIDATE_FABRIC executed; no reboot, no isolation; healthy count after"
+            "VALIDATE_FABRIC concluded on fresh evidence (SUCCEEDED on the restored "
+            "count or FAILED on a fresh excess reading, details.inventory_evidence "
+            "recorded, never missing_inventory_action_completion); no escalation, no "
+            "reboot, no isolation; the incident RECOVERED; healthy count after"
         ),
         execute=excess_device,
         max_minutes=25,
