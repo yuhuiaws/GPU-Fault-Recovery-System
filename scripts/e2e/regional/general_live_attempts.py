@@ -688,8 +688,9 @@ def old_terminal(ctx: VariantContext) -> dict[str, Any]:
 API_BLOCK_SETTLE_SECONDS = 150
 #: The watcher's emergency fallback arms 30 s after its first failed POST and
 #: fires on a later pass; the operator then deletes the suspended job's Pods.
-EMERGENCY_WAIT_SECONDS = 240
-PODS_GONE_WAIT_SECONDS = 240
+#: Both waits together stay well inside the block's 540 s deadman.
+EMERGENCY_WAIT_SECONDS = 180
+PODS_GONE_WAIT_SECONDS = 150
 RUNNING_WAIT_SECONDS = 900
 HEARTBEAT_WAIT_SECONDS = 300
 
@@ -1406,7 +1407,7 @@ VARIANTS = [
             "delete the test job and its restart replica; the watcher Deployment has "
             "already replaced its Pod (proven Ready)"
         ),
-        max_minutes=45,
+        max_minutes=60,
         approvals=("CONTROL_PLANE_RESTART",),
         execute=worker_restart,
     ),
