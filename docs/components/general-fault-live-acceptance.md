@@ -633,7 +633,13 @@ decision、restart 预算账本），绝不 POST 预制 finding/workflow。运�
 `preflight.json`、`result.json`、各阶段 timeline 与 `<case>.<variant>.json`。
 判定：有效注入+完整规格链+干净清理为 `PASS`；判定/动作/作用域错误或清理失败为
 `FAIL`（规格明示的已知缺口在有效注入且未被检出时即记 `FAIL`）；缺令牌/能力/夹具
-为 `NOT_RUN(reason)`；站点前提缺失为 `BLOCKED`。
+为 `NOT_RUN(reason)`；站点前提缺失为 `BLOCKED`。夹具自身的失败——`HostProbeError`
+（探针调用失败或超时）与 `RegionalFixtureError`（如 setup 单元未完成）——意味着条件
+从未建立、产品未被判定，记 `INCONCLUSIVE`，`detail` 为 `harness fixture failed: <类>:
+<探针诊断>`，`error` 保留原文；不记 `FAIL`，否则 expected FAIL 变体会把夹具失败读成
+其登记的产品缺口（2026-10-25 第二台 EKS 节点上的 `reference_iostat`：`dm-create`
+`TimeoutExpired`，看板上是一条空备注的 FAIL）。夹具失败之后清理仍未能证明节点干净的，
+按清理失败记 `FAIL`。
 
 ### phase 1 范围与前提
 
@@ -710,8 +716,11 @@ error TimeoutExpired)`，开始约 290 s，清理栈为空）：错误类来自�
 通知 cookie（SysV 信号量，由 `95-dm-notify.rules` 的 `dmsetup udevcomplete $DM_COOKIE`
 完成），而 SysV IPC 按 IPC 命名空间隔离；探针 Pod 是 hostPID/hostNetwork 但有自己的
 IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，create 一直等下去（004 的 loop
-文件系统不调用 `dmsetup`，所以正常）。该诊断依据错误类、时序和这一机制，并非现场跟踪；
-当时节点 journal 应有 systemd-udevd 执行 `dmsetup udevcomplete` 失败的记录。早先
+文件系统不调用 `dmsetup`，所以正常）。两节点 journal 已证实这一机制：Pod 内每次
+`dm-create` 之后几秒，`(udev-worker)` 记录 `dm-N: Process '/usr/sbin/dmsetup
+udevcomplete <cookie>' failed with exit code 1`（ip-10-0-43-5 07:40/07:45/07:51Z，
+ip-10-0-32-162 07:38/07:44/07:49Z，各对应一次 loop 附加），随后每个运行的 deadman
+`cleanup --kind dm-io` 把映射、loop 与后端文件清掉（`clean: true`）。早先
 `sustained_latency` 的 `ProbeError` 符合另一个缺口：变体要求 `KERNEL_MODULE_LOAD`，但
 没有任何步骤加载 `dm_delay`，探针因此拒绝 delay 表。两者都与 `dm_delay` 是否已加载
 无关，故撤销 `sustained_util`/`sustained_latency` 的 `NOT_RUN(FIXTURE_NOT_READY)`。
@@ -728,7 +737,13 @@ IPC 命名空间，udev 在主机命名空间里找不到 Pod 的信号量，cre
 本次运行自身文件为后端的 loop、卸载本次运行加载的 `dm_delay`（`--load-module`，加载前
 先记录），残留不为空即清理失败。`counter_reset` 先停写入单元再删除并重建映射（写入单元
 打开的文件使挂载处于忙状态），之后重新写入。探针失败现在显示
-`error <类> <摘要> at <函数:行>`，不再只有类名。以上仅改测试夹具，尚未真机运行。
+`error <类> <摘要> at <函数:行>`，不再只有类名。修复进入现场代码后首次真机运行
+（2026-10-25）：`sustained_util`、`reference_iostat`、`counter_reset`（ip-10-0-43-5）
+与 `short_flush`、`zero_completed_io`、`recovery`（ip-10-0-32-162）PASS，setup 单元
+约 14 s 建成 `dm-0`；`sustained_latency` 已带 `KERNEL_MODULE_LOAD` 登记为可执行，
+等待一次无未关闭 incident 的窗口。`cleanup`/`dm-destroy`/`fs-destroy` 现在也删除本次
+运行已空的后端目录与挂载根目录（`residue.directories` 列出仍存在者）：之前只有无人
+调用的 `--kind all` 会删，两节点各留下数十个空的 `gfrs-live-<digest>` 目录。
 
 ### phase 2 范围（host/device 扩展）
 

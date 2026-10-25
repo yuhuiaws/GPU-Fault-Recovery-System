@@ -1016,9 +1016,12 @@ the host's systemd-udevd confirms a notification cookie -- a SysV semaphore that
 IPC objects are per IPC namespace. The probe Pod is hostPID/hostNetwork but has
 its own IPC namespace, so udev's completion in the host namespace never finds
 the Pod's semaphore and the create waits forever; 004's loop file system never
-calls `dmsetup`, which is why it worked. The diagnosis rests on the error class,
-the timing and this mechanism, not on a live trace; the nodes' journals should
-show systemd-udevd's failed `dmsetup udevcomplete` runs at those times. The
+calls `dmsetup`, which is why it worked. Both nodes' journals confirm the
+mechanism: seconds after each Pod-side `dm-create`, `(udev-worker)` logged
+`dm-N: Process '/usr/sbin/dmsetup udevcomplete <cookie>' failed with exit code
+1` (ip-10-0-43-5 at 07:40/07:45/07:51Z, ip-10-0-32-162 at 07:38/07:44/07:49Z,
+one per loop attach), and each run's deadman `cleanup --kind dm-io` later
+removed the mapping, loop and backing file (`clean: true`). The
 earlier `sustained_latency` `ProbeError` fits a second gap: the variant requires
 `KERNEL_MODULE_LOAD`, but nothing loaded `dm_delay`, so the probe refused the
 delay table. Neither depends on a loaded `dm_delay`, so the previous
@@ -1043,8 +1046,21 @@ the mapping, detaches only loop devices backed by the run's own file, unloads a
 the cleanup unless the residue is empty. `counter_reset` now stops the writer
 before it removes and recreates the mapping (the writer's open files kept the
 mount busy) and restarts it afterwards. A probe failure now reads `error <class>
-<digest> at <function:line>` instead of a bare class. All of this is
-harness-only and has not yet run live.
+<digest> at <function:line>` instead of a bare class. The first live runs on
+the fixed code (2026-10-25) passed: `sustained_util`, `reference_iostat` and
+`counter_reset` on ip-10-0-43-5, `short_flush`, `zero_completed_io` and
+`recovery` on ip-10-0-32-162, the setup unit building `dm-0` in about 14 s;
+`sustained_latency` is registered as runnable with `KERNEL_MODULE_LOAD` and
+waits for a window without open incidents on the node. Two follow-ups from
+those runs: the runner reads a `HostProbeError`/`RegionalFixtureError` raised
+by its own fixture as `INCONCLUSIVE` (`detail: harness fixture failed: ...`),
+no longer as `FAIL` -- the pre-fix `reference_iostat` on ip-10-0-32-162, an
+expected-FAIL variant, had been shown as its registered product gap with an
+empty note -- while an unclean undo after such a failure still fails the
+variant; and `cleanup`/`dm-destroy`/`fs-destroy` prune the run's emptied
+backing directory and mount root (`residue.directories` names any still
+present) instead of only `--kind all`, which nothing called -- both nodes
+carried dozens of empty `gfrs-live-<digest>` directories.
 
 The native network variants (008 NIC link down, 009 NIC errors/drops) build
 host-local `gfrs<digest><slot>` test interfaces (a `veth` pair, a `dummy`) with
