@@ -293,6 +293,80 @@ print(json.dumps({"attempts": attempts, "restart_budget": budget}, sort_keys=Tru
 """
 
 
+#: Read-only: one managed job's attempt observations as the completion watcher
+#: recorded them (containers with Pod UID, container name, host PID,
+#: termination), the NODE_LOGS entries the node log collector delivered from a
+#: fixture path since a moment, and the node's log incidents (``log-`` event
+#: ids) with their workflows. Never writes.
+APPLOG_PROBE = r"""
+import json
+import sys
+from datetime import datetime
+
+from gpu_fault.app import ApplicationContext
+from gpu_fault.models import IncidentState
+from gpu_fault.store import NotFoundError
+from gpu_fault.telemetry import EvidenceKind
+
+cluster_id, node_id, since_text, job_id, needle = sys.argv[1:6]
+since = datetime.fromisoformat(since_text.replace("Z", "+00:00"))
+store = ApplicationContext.from_environment().store
+
+attempts = [
+    item.model_dump(mode="json")
+    for item in store.list_attempt_observations(cluster_id)
+    if item.job_id == job_id
+]
+entries = []
+for record in store.list_raw_evidence(
+    cluster_id, node_id=node_id, kind=EvidenceKind.NODE_LOGS, limit=2000
+):
+    if record.observed_at < since:
+        continue
+    payload = record.payload if isinstance(record.payload, dict) else {}
+    for entry in payload.get("entries") or []:
+        fields = entry.get("fields") or {}
+        if needle and needle not in str(fields.get("path") or ""):
+            continue
+        entries.append({
+            "record_id": record.record_id,
+            "batch_id": payload.get("batch_id"),
+            "collected_at": payload.get("collected_at"),
+            "entry_id": entry.get("entry_id"),
+            "source": entry.get("source"),
+            "observed_at": entry.get("observed_at"),
+            "message": entry.get("message"),
+            "fields": fields,
+        })
+entries.sort(key=lambda item: (str(item["collected_at"]), str(item["observed_at"])))
+incidents = {}
+for incident in store.list_incidents_by_state(
+    cluster_id, list(IncidentState), node_ids={node_id}
+):
+    if incident.created_at >= since and str(incident.event_id).startswith("log-"):
+        incidents[incident.incident_id] = incident
+workflows = {}
+for incident in incidents.values():
+    if incident.workflow_request_id:
+        try:
+            workflows[incident.workflow_request_id] = store.get_workflow(
+                incident.workflow_request_id
+            ).model_dump(mode="json")
+        except NotFoundError:
+            pass
+print(json.dumps({
+    "since": since.isoformat(),
+    "cluster_id": cluster_id,
+    "node_id": node_id,
+    "job_id": job_id,
+    "attempts": attempts,
+    "entries": entries,
+    "incidents": [item.model_dump(mode="json") for item in incidents.values()],
+    "workflows": workflows,
+}, sort_keys=True, default=str))
+"""
+
+
 def preflight_state(regional: CpuPython, cluster_id: str, node: str) -> dict[str, Any]:
     return regional.cpu_python(PREFLIGHT_PROBE, cluster_id, node)
 
@@ -330,6 +404,31 @@ def attempt_records(
     return regional.cpu_python(ATTEMPT_PROBE, cluster_id, job_id, *attempt_ids)
 
 
+def applog_records(
+    regional: CpuPython,
+    cluster_id: str,
+    node: str,
+    since: datetime,
+    *,
+    job_id: str,
+    path_needle: str,
+) -> dict[str, Any]:
+    """A managed job's attempt observations, the fixture-path log entries and
+    the node's log incidents since ``since`` (``APPLOG_PROBE``)."""
+
+    if not job_id or not path_needle:
+        raise ValueError("applog records need a job id and a path needle")
+    return regional.cpu_python(
+        APPLOG_PROBE,
+        cluster_id,
+        node,
+        since.isoformat(),
+        job_id,
+        path_needle,
+        timeout=240,
+    )
+
+
 def signal_key(
     cluster_id: str,
     node: str,
@@ -347,8 +446,10 @@ def signal_key(
 
 __all__ = [
     "ACTIVITY_PROBE",
+    "APPLOG_PROBE",
     "ATTEMPT_PROBE",
     "PREFLIGHT_PROBE",
+    "applog_records",
     "attempt_records",
     "node_activity",
     "preflight_state",

@@ -951,7 +951,7 @@ def _prove_recovered(ctx: VariantContext, job: ManagedNcclJob, *, name: str) -> 
         )
 
 
-def _stalled_chain(
+def stalled_chain(
     ctx: VariantContext,
     suffix: str,
     *,
@@ -976,7 +976,7 @@ def _stalled_chain(
 # variants
 # --------------------------------------------------------------------------- #
 def active_to_zero(ctx: VariantContext) -> dict[str, Any]:
-    identity, _, stages = _stalled_chain(ctx, "a2z")
+    identity, _, stages = stalled_chain(ctx, "a2z")
     return _result(stages, extra={"attempt": identity})
 
 
@@ -1002,7 +1002,7 @@ def always_low(ctx: VariantContext) -> dict[str, Any]:
 
 
 def write_progress(ctx: VariantContext) -> dict[str, Any]:
-    identity, _, stages = _stalled_chain(ctx, "wp", stall_mode="write")
+    identity, _, stages = stalled_chain(ctx, "wp", stall_mode="write")
     return _result(
         stages,
         notes=[
@@ -1014,7 +1014,7 @@ def write_progress(ctx: VariantContext) -> dict[str, Any]:
 
 
 def phase_progress(ctx: VariantContext) -> dict[str, Any]:
-    identity, _, stages = _stalled_chain(ctx, "pp", stall_mode="phase")
+    identity, _, stages = stalled_chain(ctx, "pp", stall_mode="phase")
     return _result(
         stages,
         notes=[
@@ -1027,7 +1027,7 @@ def phase_progress(ctx: VariantContext) -> dict[str, Any]:
 
 
 def fr_enabled(ctx: VariantContext) -> dict[str, Any]:
-    identity, records, stages = _stalled_chain(ctx, "fron", flight_recorder=True)
+    identity, records, stages = stalled_chain(ctx, "fron", flight_recorder=True)
     stages["fr_dumps"] = fr_errors(records, expect_configured=True)
     return _result(
         stages,
@@ -1037,7 +1037,7 @@ def fr_enabled(ctx: VariantContext) -> dict[str, Any]:
 
 
 def fr_disabled(ctx: VariantContext) -> dict[str, Any]:
-    identity, records, stages = _stalled_chain(ctx, "froff")
+    identity, records, stages = stalled_chain(ctx, "froff")
     stages["fr_dumps"] = fr_errors(records, expect_configured=False)
     return _result(
         stages,
@@ -1049,7 +1049,7 @@ def fr_disabled(ctx: VariantContext) -> dict[str, Any]:
 
 
 def simultaneous_nodes(ctx: VariantContext) -> dict[str, Any]:
-    identity, records, stages = _stalled_chain(ctx, "sim", require_both=True)
+    identity, records, stages = stalled_chain(ctx, "sim", require_both=True)
     stages["both_nodes"] = both_nodes_errors(records, _nodes(ctx))
     return _result(
         stages,

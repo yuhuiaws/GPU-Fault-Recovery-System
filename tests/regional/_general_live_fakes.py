@@ -34,6 +34,7 @@ from scripts.e2e.regional.general_live_registry import VariantSpec
 from scripts.e2e.regional.general_live_restart_budget import BUDGET_PROBE
 from scripts.e2e.regional.general_live_store import (
     ACTIVITY_PROBE,
+    APPLOG_PROBE,
     ATTEMPT_PROBE,
     PREFLIGHT_PROBE,
 )
@@ -224,8 +225,9 @@ def node_probe(ctx: VariantContext, probe: FakeProbe) -> None:
 def store_script(responses: dict[str, Any]) -> Callable[..., dict[str, Any]]:
     """A ``cpu_python`` that answers each probe script by its constant name.
 
-    ``responses`` maps ``"activity"``, ``"preflight"``, ``"attempt"`` to a value
-    or a callable taking the probe arguments; a list is consumed per call.
+    ``responses`` maps ``"activity"``, ``"preflight"``, ``"attempt"``,
+    ``"applog"`` to a value or a callable taking the probe arguments; a list is
+    consumed per call.
     """
 
     iterators: dict[str, Any] = {}
@@ -235,6 +237,7 @@ def store_script(responses: dict[str, Any]) -> Callable[..., dict[str, Any]]:
             ACTIVITY_PROBE: "activity",
             PREFLIGHT_PROBE: "preflight",
             ATTEMPT_PROBE: "attempt",
+            APPLOG_PROBE: "applog",
         }.get(script, "unknown")
         value = responses.get(name, {})
         if callable(value):
