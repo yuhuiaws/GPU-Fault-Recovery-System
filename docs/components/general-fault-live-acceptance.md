@@ -266,6 +266,23 @@ FREEZE_EVIDENCE、VALIDATE_HOST 在该指标上失败、无隔离/硬件步骤�
 放通（GPU 集群内 VPC CNI 的 Pod 共用节点 ENI 安全组，自引用规则通常已覆盖；CPU 集群需 VPC
 可达与显式规则）；kubelet 对内存 `emptyDir` 执行 `sizeLimit`（首个客户端 `statvfs` 校验容量，
 不符记 `NOT_RUN(FIXTURE_NOT_READY)`）。不起受管训练任务，“任务进度”不在本主机类别范围内。
+首次实况运行：两条 EKS 车道的六个单客户端变体全部 INCONCLUSIVE，报
+`host probe failed (exit 1; error ProbeError <digest> at nfs_mount:558); output withheld`。export Pod
+在另一 GPU 节点三秒内 Running+Ready，节点 AMI 自带 `nfs-utils`（`mount.nfs4`）且 `nfsv4` 可加载，客户端
+`mount -t nfs4 <pod ip>:/a` 得到的是服务端答复 `reason given by server: No such file or directory`（六个摘要
+均精确还原为该行）：NFS-Ganesha 对 export 根未初始化（`init_export_root` 失败后 export 被撤回）或客户端
+不可见的伪路径以 NFS4ERR_NOENT 作答；同一镜像、`ganesha.conf`、入口脚本、capabilities 与挂载选项在集群外
+对 AL2023 `nfs-utils` 客户端可正常导出 `/a`，而 Pod 随 LIFO 清理删除、日志一并消失，服务端原因无从读取。
+夹具因此改为：`ganesha.conf` 的 `CONFIG`/`EXPORT` 组件以 INFO 记录，`wait_ready` 在 TCP 就绪之外要求服务端
+日志出现 `Export 1 created at pseudo (/a) with path (/export/a)`（出现 `Lookup failed on path, ExportId=1`、
+`Config File (` 或 `Could not create export` 则以该行报夹具错误；Ready 而日志始终无此行同为夹具错误，不归
+产品）；客户端挂载失败时先把 export Pod 日志存为 `export-<suffix>-log-at-mount-failure.json` 再交清理删除
+Pod，错误写明节点、服务端与文件；探针把 `mount.nfs4` 的 stderr 归类为一句常量（`error_kind: nfs_mount`，如
+`export server answered ENOENT for the export path (export not initialised or hidden; read the export Pod log)`、
+`TCP/2049 connection refused at the export server address`、`TCP/2049 connection to the export server timed out
+(security group or network policy)`），由宿主探针夹具以 `nfs mount failed:` 显示，stderr 原文（服务端地址、
+挂载点）仍不出节点。HyperPod 节点的客户端前提相同（`mount.nfs4`、可加载 `nfsv4`），其 005 将呈现同一服务端
+原因，需从保存的日志读取。
 计划/执行形如：
 
 ```bash

@@ -1503,6 +1503,36 @@ from the node to the Pod IP, and a kubelet that honours memory `emptyDir`
 fakes-based module tests until the live run; the fixture proves the processing
 chain on a real NFS mount, not a production file server's failure modes.
 
+The first live run of 005 ended all six single-client variants on both EKS lanes
+INCONCLUSIVE with `host probe failed (exit 1; error ProbeError <digest> at
+nfs_mount:558); output withheld`: the export Pod was Running and Ready on the
+other GPU node within three seconds, `nfs-utils` (`mount.nfs4`) and the `nfsv4`
+module were present on the AL2023 node AMI, and the client's
+`mount -t nfs4 <pod ip>:/a` got `mount.nfs4: mounting <pod ip>:/a failed, reason
+given by server: No such file or directory` (the six digests decode to exactly
+that line). NFS-Ganesha answers the path walk of a pseudo path with NFS4ERR_NOENT
+when the export's root never initialised (`init_export_root` fails and the export
+is reverted) or when the client may not see it; the same image, `ganesha.conf`,
+entry script, capabilities and mount options serve `/a` to an AL2023 `nfs-utils`
+client off-cluster, and the Pod was deleted with its log, so the server-side
+reason stayed unrecorded. Three harness changes close that gap: `ganesha.conf`
+logs the `CONFIG`/`EXPORT` components at INFO and `wait_ready` requires the
+server's own `Export 1 created at pseudo (/a) with path (/export/a)` line beyond
+the TCP readiness (a `Lookup failed on path, ExportId=1`, `Config File (` or
+`Could not create export` line fails the fixture with that line; a Ready Pod whose
+log never shows the export is a fixture error, not a product one); a failed client
+mount saves the export Pod log as `export-<suffix>-log-at-mount-failure.json`
+before the LIFO cleanup deletes the Pod, and the error names node, server and
+file; and the probe classifies the mount helper's stderr into one constant
+sentence (`error_kind: nfs_mount`, e.g. `export server answered ENOENT for the
+export path (export not initialised or hidden; read the export Pod log)`,
+`TCP/2049 connection refused at the export server address`, `TCP/2049 connection
+to the export server timed out (security group or network policy)`) that the
+host-probe fixture shows under `nfs mount failed:` -- the stderr itself (server
+address, mount point) still never leaves the node. HyperPod nodes carry the same
+client prerequisites (`mount.nfs4`, a loadable `nfsv4`), so their 005 runs show
+the same server-side reason until it is read from the saved log.
+
 004 `probe_error` has its faulting mount: the storage probe's loop +
 device-mapper device carrying FAT16 (`dm-create --fstype vfat`) whose table
 `dm-retarget --target error` swaps to the `error` target built into `dm_mod`
