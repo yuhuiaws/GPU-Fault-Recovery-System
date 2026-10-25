@@ -19,7 +19,6 @@ import pytest
 
 from gpu_fault.host_health import HostMetricSample, efa_inventory_rule
 from gpu_fault.models import RecoveryAction, Severity
-from scripts.e2e.regional import general_live_efa_pci as pci_mod
 from scripts.e2e.regional import general_live_inventory as mod
 from scripts.e2e.regional.general_live_fixture import (
     VariantBlocked,
