@@ -1323,9 +1323,29 @@ kernel-transport records for one node and boot and reads back what the product
 ingested, two ways: a `journalctl` pass-through wrapper on the node log
 collector (journal mode) and a `GPU_FAULT_KMSG_PATH` repoint of the kernel
 collector (kmsg mode). A sibling host-collector source replay
-(`general_live_source_replay.py` / `probes/general_live_source_probe.py`)
-binds one reviewed procfs/sysfs file into the host collector's private mount
-namespace or repoints `GPU_FAULT_PCI_DEVICES_ROOT`. Every replay only replaces
+(`general_live_source_replay.py` / `probes/general_live_source_probe.py`,
+command wrapper `tools/host_command_replay.py`) is the shared raw-source
+fixture of the host/device categories (002/007/010/011/012/013/015/032). It
+changes only the private environment of `gpu-fault-host-collector.service`
+through one `/run` drop-in that cleanup and a deadman (armed before the drop-in)
+remove, with fixture content installed base64 + sha256 under
+`/run/gfrs-live/source-<digest>/`: a reviewed procfs/sysfs *file* bound
+read-only into the unit's mount namespace (`/proc/stat`, `/proc/meminfo`,
+`/proc/driver/nvidia/version`, a `gfrs*` test netdev statistic, an EFA port's
+`hw_counters`/`counters`/`state`/`phys_state`), a whole reviewed *tree*
+(`/sys/class/infiniband` built from the real tree with reviewed mutations,
+`/proc/driver/nvidia`), a reviewed pass-through *command wrapper* first on the
+unit's PATH for `smartctl`, `ipmitool`, `ethtool` and the host collector's
+`nvidia-smi` queries (per-tool, per-query, per-field allow-list; bounded calls
+and deadline; a failed real query is passed through as it failed; every
+catalogued call is journaled), a path or tool binary made *inaccessible* inside
+the unit, an expected GPU/EFA count override, or the `GPU_FAULT_PCI_DEVICES_ROOT`
+repoint. After the unit restarts the probe verifies through `nsenter` that each
+replacement is visible inside the unit and not to PID 1, or closes the window.
+No host binary is replaced, no global mount is made, the Node Agent is never in
+the allow-list and `py-spy` (run only by the Node Agent) is refused by name.
+Everything beyond the phase-1 binds and the PCI-root repoint needs
+`--approve HOST_SOURCE_REPLAY`. Every replay only replaces
 the raw reading; parsing, trust classification, grading, the database and the
 approved node actions stay real, so the evidence is always `proof_scope:
 live-replay` -- it proves the processing chain, never the physical fault.
