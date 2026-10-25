@@ -25,6 +25,7 @@ from gpu_fault.telemetry_models import (
     WorkloadObservationState as WorkloadObservationState,
 )
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
+from gpu_fault.workload_container_scope import cgroup_in_container
 
 LOGGER = logging.getLogger(__name__)
 
@@ -569,16 +570,9 @@ class WorkloadTopologyService:
             if host_pid is not None:
                 matched = [item for item in matched if item.host_pid == host_pid]
             if cgroup_path is not None:
-                expected = cgroup_path.rstrip("/")
+                # A managed container names no cgroup; its runtime id does.
                 matched = [
-                    item
-                    for item in matched
-                    if item.cgroup_path is not None
-                    and (
-                        item.cgroup_path.rstrip("/") == expected
-                        or item.cgroup_path.rstrip("/").startswith(expected + "/")
-                        or expected.startswith(item.cgroup_path.rstrip("/") + "/")
-                    )
+                    item for item in matched if cgroup_in_container(cgroup_path, item)
                 ]
             if not matched:
                 continue

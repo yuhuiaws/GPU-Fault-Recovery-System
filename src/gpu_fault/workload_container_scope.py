@@ -81,3 +81,29 @@ def container_ids_by_node(
     return {
         node: sorted(values)[:MAX_NODE_CONTAINER_IDS] for node, values in result.items()
     }
+
+
+def cgroup_in_container(cgroup_path: str, container: Any) -> bool:
+    """Whether a process in ``cgroup_path`` runs in ``container``.
+
+    An event's ``cgroup_path`` (the faulting process's) against one of an
+    attempt's ``ContainerObservation`` rows. An explicit ``cgroup_path`` (the
+    annotation) is compared as a path, as it always was: equal, or one below
+    the other. A container without one is named by the runtime id the kubelet
+    reports: the path is the container's when one of its segments names that
+    id the way the runtime names a container's cgroup. A path naming another
+    container, CRI-O's monitor or no container at all is not this one's.
+    """
+
+    expected = cgroup_path.rstrip("/")
+    if container.cgroup_path is not None:
+        own = container.cgroup_path.rstrip("/")
+        return (
+            own == expected
+            or own.startswith(expected + "/")
+            or expected.startswith(own + "/")
+        )
+    identifier = runtime_container_id(container.container_id)
+    return identifier is not None and any(
+        segment_container_id(segment) == identifier for segment in expected.split("/")
+    )

@@ -20,6 +20,7 @@ from gpu_fault.store import NotFoundError
 from gpu_fault.watcher import AttemptObservation, WorkloadPhase
 from gpu_fault.workload_container_scope import (
     WORKLOAD_CONTAINER_IDS,
+    cgroup_in_container,
     container_ids_by_node,
 )
 
@@ -231,15 +232,6 @@ class EvidenceOperationService:
                 or left.rsplit("://", 1)[-1] == (right.rsplit("://", 1)[-1])
             )
 
-        def cgroup_matches(left: str, right: str) -> bool:
-            left = left.rstrip("/")
-            right = right.rstrip("/")
-            return (
-                left == right
-                or left.startswith(right + "/")
-                or right.startswith(left + "/")
-            )
-
         candidates = []
         observations = list(self.store.list_attempt_observations(event.cluster_id))
         for observation in observations:
@@ -300,11 +292,11 @@ class EvidenceOperationService:
             if host_pid is not None:
                 containers = [item for item in containers if item.host_pid == host_pid]
             if cgroup_path is not None:
+                # A managed container names no cgroup; its runtime id does.
                 containers = [
                     item
                     for item in containers
-                    if item.cgroup_path is not None
-                    and cgroup_matches(item.cgroup_path, cgroup_path)
+                    if cgroup_in_container(cgroup_path, item)
                 ]
             if (
                 event_gpu_uuids
