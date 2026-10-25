@@ -90,8 +90,8 @@ def test_the_executable_lane_variants_are_the_wired_ones() -> None:
         if spec.number in LANE_CATEGORIES and spec.implemented
     )
     # 005 runs natively on the test export fixture (shared_export_fixture.py +
-    # probes/general_live_shared_probe.py); three of its variants are expected
-    # FAILs that name their product gap.
+    # probes/general_live_shared_probe.py); shared_failure_domain is the one
+    # expected FAIL that names its product gap.
     assert implemented == [
         "GF-GENERAL-LIVE-002.cgroup_only",
         "GF-GENERAL-LIVE-002.memory_pressure",

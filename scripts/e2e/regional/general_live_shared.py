@@ -1,17 +1,24 @@
 """GF-GENERAL-LIVE-005 shared storage unavailable / full.
 
-The host collector grades shared storage in ``collectors/host/system_metrics.py``
-``_shared_filesystems``: every ``nfs``/``nfs4``/``lustre`` mount it finds in its
-own ``/proc/self/mountinfo`` -- there is no shared-filesystem setting; a host
-mount propagates into the unit's namespace -- gets a bounded ``statvfs`` (5 s per
-mount, 15 s per tick) and is reported as ``shared_filesystem_unavailable`` 1
-(CRITICAL RUN_DIAGNOSTICS: FREEZE_EVIDENCE, VALIDATE_HOST) on a timeout or
-error, else 0 plus ``shared_filesystem_used_percent`` (98 % WARNING
-RUN_DIAGNOSTICS). ``GPU_FAULT_FILESYSTEMS`` is deliberately *not* extended with
-the test export: a configured mount runs the local-disk rules
-(``filesystem_used_percent`` 98 % QUARANTINE, MOUNT_MISSING), which would turn a
-shared-storage condition into a bad-node verdict and mask the gaps 005 exists
-to show.
+The host collector grades shared storage in
+``collectors/host/shared_filesystems.py`` ``_shared_filesystems``: every
+``nfs``/``nfs4``/``lustre`` mount of the host's mount table (``/proc/1/mountinfo``;
+there is no shared-filesystem setting -- a host mount propagates into the
+unit's namespace) gets a bounded ``statvfs`` and, when that answers, one bounded
+read-only directory-entry read (5 s per call, 15 s per tick), and is reported as
+``shared_filesystem_unavailable`` 1 (CRITICAL RUN_DIAGNOSTICS: FREEZE_EVIDENCE,
+VALIDATE_HOST) with a ``failure_mode`` label -- ``PROBE_TIMEOUT``/``PROBE_FAILED``
+for statvfs, ``IO_TIMEOUT``/``IO_ERROR`` (+ ``errno``) for the data path -- else 0
+plus ``shared_filesystem_used_percent`` (98 % WARNING RUN_DIAGNOSTICS). A
+node-scoped shared mount the collector has seen that vanishes from the host
+table while its mount point directory remains is ``MOUNT_MISSING`` from a memory
+kept across collector restarts (``collectors/host/shared_mounts.py``); the
+directory removed too is a teardown and forgets the mount. Every shared sample
+names its export (``source`` = the mount table's source field, ``fstype``).
+``GPU_FAULT_FILESYSTEMS`` is deliberately *not* extended with the test export: a
+configured mount runs the local-disk rules (``filesystem_used_percent`` 98 %
+QUARANTINE, MOUNT_MISSING), which would turn a shared-storage condition into a
+bad-node verdict.
 
 The fixture (``shared_export_fixture.TestExportServer`` + the node probe
 ``probes/general_live_shared_probe.py``) stands up a disposable NFSv4 export --
@@ -21,12 +28,14 @@ a userspace server Pod over a size-limited tmpfs -- and mounts it ``soft`` under
 handles. Verdicts read only the product's records; the probe's bounded
 ``statvfs``/I/O readings are the oracle.
 
-Expected FAILs (product gaps, registered as such): ``mount_disappears`` -- the
-collector keeps no memory of shared mounts it discovered, so one that vanishes
-simply stops being sampled and is never reported unavailable;
-``io_only_failure`` -- the mount is judged by ``statvfs`` alone, no bounded
-read/open/fsync probe; ``shared_failure_domain`` -- two nodes on one export mint
-two independent node incidents and nothing records the common failure domain.
+``mount_disappears`` unmounts the export with ``nfs-umount`` *without*
+``--forget``: the mount point directory stays, which is exactly the condition
+the product must report; ``nfs-remount`` is the recovery, and the LIFO
+cleanup's ``cleanup --kind nfs-<name>`` removes the directory, so the product
+forgets the mount once the variant is over. The remaining expected FAIL
+(product gap, registered as such) is ``shared_failure_domain`` -- two nodes on
+one export mint two independent node incidents and nothing records the common
+failure domain.
 """
 
 from __future__ import annotations
@@ -86,19 +95,9 @@ FILL_PERCENT = 99.0
 #: Isolation is never right for a shared-storage condition.
 ISOLATION = frozenset({"STOP_WORKLOADS", "MARK_UNSCHEDULABLE", "QUARANTINE"})
 FORBIDDEN = ISOLATION | HARDWARE_OPERATIONS
-GAP_MOUNT_DISAPPEARS = (
-    "collectors/host/system_metrics.py HostSystemMetricsMixin._shared_filesystems "
-    "rediscovers shared mounts from /proc/self/mountinfo every tick and keeps no "
-    "memory of them: a shared mount that vanishes stops being sampled, "
-    "shared_filesystem_unavailable is never raised for it and its health signal "
-    "keeps the last value 0"
-)
-GAP_IO_ONLY = (
-    "collectors/host/system_metrics.py HostSystemMetricsMixin._shared_filesystems "
-    "judges a shared mount by statvfs alone; there is no bounded read/open/fsync "
-    "probe of the export, so an export whose data path fails while FSSTAT answers "
-    "is reported healthy (shared_filesystem_unavailable 0)"
-)
+#: The ``failure_mode`` label the product puts on each unavailable reading.
+MODE_MOUNT_MISSING = "MOUNT_MISSING"
+IO_MODES = frozenset({"IO_ERROR", "IO_TIMEOUT"})
 GAP_FAILURE_DOMAIN = (
     "host_health.py grades each node's shared_filesystem_unavailable reading into "
     "its own NODE_HEALTH incident; no component correlates the same export path "
@@ -522,6 +521,66 @@ def other_mount_errors(
     )
 
 
+def _labelled_unavailable(activity: dict[str, Any], mount: str) -> list[dict[str, Any]]:
+    return [
+        sample
+        for sample in samples(activity, UNAVAILABLE, device=mount)
+        if sample.get("value") == 1 and isinstance(sample.get("labels"), dict)
+    ]
+
+
+def failure_mode_errors(
+    activity: dict[str, Any], mount: str, modes: Iterable[str]
+) -> list[str]:
+    """The unavailable readings carry one of the variant's ``failure_mode`` labels.
+
+    The product labels every unavailable reading, so an unlabelled one is a
+    regression, not an older build to be lenient with.
+    """
+
+    wanted = set(modes)
+    seen = {
+        str(sample["labels"]["failure_mode"])
+        for sample in _labelled_unavailable(activity, mount)
+        if sample["labels"].get("failure_mode")
+    }
+    if not seen:
+        return [f"no {UNAVAILABLE}=1 reading for {mount} carries a failure_mode label"]
+    if not seen & wanted:
+        return [
+            f"{UNAVAILABLE} on {mount} is labelled {sorted(seen)}, not {sorted(wanted)}"
+        ]
+    return []
+
+
+def export_source_errors(
+    activity: dict[str, Any], mount: str, server: TestExportServer
+) -> list[str]:
+    """The unavailable readings name the export (``source``), not just the path.
+
+    ``source`` is the mount table's source field, ``<server>:<export>``; the
+    control plane's failure-domain correlation keys on it, so it must name the
+    test export's server and export path.
+    """
+
+    ready = server.ready or {}
+    ip, export = str(ready.get("ip") or ""), str(ready.get("export") or "")
+    seen = {
+        str(sample["labels"]["source"])
+        for sample in _labelled_unavailable(activity, mount)
+        if sample["labels"].get("source")
+    }
+    if not seen:
+        return [
+            f"no {UNAVAILABLE}=1 reading for {mount} names its export (source label)"
+        ]
+    if not any(ip and ip in source and export in source for source in seen):
+        return [
+            f"{UNAVAILABLE} on {mount} names export {sorted(seen)}, not {ip}:{export}"
+        ]
+    return []
+
+
 def common_domain_errors(
     activities: dict[str, dict[str, Any]], nodes: tuple[str, str], mount: str
 ) -> list[str]:
@@ -699,30 +758,59 @@ def _await_used_recovery(
 
 
 def mount_disappears(ctx: VariantContext) -> dict[str, Any]:
-    _server, mount, _since = _prepare(ctx)
+    """The export is unmounted; its mount point directory stays (a failure, not a teardown)."""
+
+    server, mount, _since = _prepare(ctx)
     node = ctx.settings.node
     started = utc_now()
     gone = ctx.shared("nfs-umount", "--name", PRIMARY, node=node, timeout=240)
     ctx.evidence.write("umount", gone)
     if gone.get("host_mount") is not None:
         raise VariantInconclusive("the test export is still in the host mount table")
-    observed = wait_quiet(ctx, node, started, mount, name="vanished-window")
+    if gone.get("directory_present") is False:
+        raise VariantInconclusive(
+            f"the mount point {mount} went with the mount: the product reads that as a "
+            "teardown and forgets the mount; the injection must leave the directory"
+        )
+    detection = wait_finding(
+        ctx,
+        node,
+        started,
+        UNAVAILABLE,
+        mount,
+        timeout_seconds=DETECTION_BUDGET,
+        name="vanished-detection",
+    )
     stages = {
         "vanished_reported": []
-        if finding_incidents(observed, UNAVAILABLE, device=mount)
+        if finding_incidents(detection, UNAVAILABLE, device=mount)
         else [
             f"the vanished shared mount {mount} was never reported {UNAVAILABLE}=1 "
-            "(the collector rediscovers shared mounts each tick and forgets one that is gone)"
+            "while its mount point directory remained"
         ],
-        "hardware": hardware_errors(observed),
+        "failure_mode": failure_mode_errors(detection, mount, {MODE_MOUNT_MISSING}),
+        "export_source": export_source_errors(detection, mount, server),
+        "chain": diagnostic_chain(detection, UNAVAILABLE, mount),
+        "hardware": hardware_errors(detection),
     }
-    signal = (observed.get("health_signals") or {}).get(
-        signal_key(ctx.settings.regional.cluster_id, node, UNAVAILABLE, mount)
+    incidents = _incident_ids(detection, UNAVAILABLE, mount)
+    remounted = ctx.shared("nfs-remount", "--name", PRIMARY, node=node, timeout=240)
+    ctx.evidence.write("remount", remounted)
+    if remounted.get("host_mount") is None:
+        raise VariantInconclusive(
+            f"the test export could not be remounted at {mount}: no recovery to prove"
+        )
+    recovered = await_clear(ctx, node, mount, utc_now())
+    stages["recovery"] = list(recovered["errors"])
+    wait_all_settled(ctx, node, started, incidents)
+    return _result(
+        stages, extra={"mount": mount, "umount": gone, "recovery": recovered}
     )
-    return _result(stages, extra={"mount": mount, "last_health_signal": signal})
 
 
 def io_only_failure(ctx: VariantContext) -> dict[str, Any]:
+    """statvfs keeps answering while every open/read on the export is denied."""
+
     server, mount, _since = _prepare(ctx)
     node = ctx.settings.node
     started = utc_now()
@@ -738,17 +826,28 @@ def io_only_failure(ctx: VariantContext) -> dict[str, Any]:
         raise VariantInconclusive(
             f"statvfs {reading} / I/O {io.get('io')}: not a statvfs-OK, I/O-failing export"
         )
-    observed = wait_quiet(ctx, node, started, mount, name="io-failure-window")
+    detection = wait_finding(
+        ctx,
+        node,
+        started,
+        UNAVAILABLE,
+        mount,
+        timeout_seconds=DETECTION_BUDGET,
+        name="io-failure-detection",
+    )
     stages = {
         "io_failure_reported": []
-        if finding_incidents(observed, UNAVAILABLE, device=mount)
+        if finding_incidents(detection, UNAVAILABLE, device=mount)
         else [
             f"no {UNAVAILABLE} finding on {mount} while every read/open failed "
-            f"(errno {(io.get('io') or {}).get('errno')}) and statvfs answered: "
-            "the collector probes shared mounts with statvfs only"
+            f"(errno {(io.get('io') or {}).get('errno')}) and statvfs answered"
         ],
-        "hardware": hardware_errors(observed),
+        "failure_mode": failure_mode_errors(detection, mount, IO_MODES),
+        "export_source": export_source_errors(detection, mount, server),
+        "chain": diagnostic_chain(detection, UNAVAILABLE, mount),
+        "hardware": hardware_errors(detection),
     }
+    incidents = _incident_ids(detection, UNAVAILABLE, mount)
     restored = server.set_export_mode("1777")
     ctx.cleanup.discard("export-a-mode")
     proof = ctx.shared(
@@ -759,8 +858,17 @@ def io_only_failure(ctx: VariantContext) -> dict[str, Any]:
         if (proof.get("io") or {}).get("ok")
         else ["I/O did not recover after chmod 1777"]
     )
+    recovered = await_clear(ctx, node, mount, utc_now())
+    stages["recovery"] = list(recovered["errors"])
+    wait_all_settled(ctx, node, started, incidents)
     return _result(
-        stages, extra={"mount": mount, "restored": restored, "io": io.get("io")}
+        stages,
+        extra={
+            "mount": mount,
+            "restored": restored,
+            "io": io.get("io"),
+            "recovery": recovered,
+        },
     )
 
 
@@ -968,21 +1076,22 @@ VARIANTS = [
     ),
     _spec(
         "mount_disappears",
-        "unmount the discovered test export on the node while the server lives",
-        f"the vanished shared mount is reported {UNAVAILABLE}=1, not silently dropped",
+        "unmount the discovered test export on the node while the server lives, "
+        "leaving the mount point directory in place",
+        f"the vanished shared mount is reported {UNAVAILABLE}=1 failure_mode=MOUNT_MISSING "
+        "naming its export -> FREEZE_EVIDENCE, VALIDATE_HOST failing on it; 0 again once "
+        "remounted",
         mount_disappears,
-        outcome="FAIL",
-        gap=GAP_MOUNT_DISAPPEARS,
-        cleanup="forget the mount, delete the export",
+        cleanup="remount for the recovery; unmount and remove the mount point, delete the export",
     ),
     _spec(
         "io_only_failure",
         "chmod 000 the export root on the server (root-squashed client): statvfs answers, "
         "every open/read/fsync fails EACCES",
-        f"a bounded I/O probe reports the export unusable ({UNAVAILABLE}=1)",
+        f"the bounded directory read reports the export unusable ({UNAVAILABLE}=1 "
+        "failure_mode=IO_ERROR with its errno, or IO_TIMEOUT) -> FREEZE_EVIDENCE, "
+        "VALIDATE_HOST failing on it; 0 again after chmod 1777",
         io_only_failure,
-        outcome="FAIL",
-        gap=GAP_IO_ONLY,
         cleanup="chmod 1777 back, unmount, delete the export",
     ),
     _spec(

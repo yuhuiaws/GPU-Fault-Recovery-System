@@ -5,8 +5,10 @@ A fake test export server stands in for ``shared_export_fixture.TestExportServer
 product's records are scripted documents. The tests pin: the fixture order on
 the LIFO stack, the oracle gates (a pause must really hang statvfs, a fill must
 really reach 98 %), the diagnostic-only chain every shared-storage finding must
-run, and the three expected-FAIL product gaps -- each of which flips to PASS the
-moment the product records what the spec asks for.
+run, the ``failure_mode``/``source`` labels ``mount_disappears`` and
+``io_only_failure`` now demand of the product, and the remaining expected-FAIL
+product gap (``shared_failure_domain``), which flips to PASS the moment the
+product records what the spec asks for.
 """
 
 from __future__ import annotations
@@ -159,7 +161,15 @@ def shared_probe(node: str) -> FakeProbe:
             "nfs-io": io,
             "nfs-fill": {"statvfs": {"used_percent": 99.2, "total_bytes": SIZE}},
             "nfs-unfill": {"statvfs": {"used_percent": 1.0}},
-            "nfs-umount": {"host_mount": None, "unmounted": f"/mnt/x/{node}"},
+            "nfs-umount": {
+                "host_mount": None,
+                "unmounted": f"/mnt/x/{node}",
+                "directory_present": True,
+            },
+            "nfs-remount": {
+                "host_mount": {"fstype": "nfs4"},
+                "statvfs": {"used_percent": 2.0, "total_bytes": SIZE},
+            },
             "cleanup": {"clean": True, "residue": {}},
         }
     )
@@ -198,8 +208,15 @@ def diagnostic(
     return {"incident": inc, "workflow": wf}
 
 
-def sample(name: str, device: str | None, value: float) -> dict[str, Any]:
-    return {"name": name, "device": device, "value": value, "labels": {}}
+def sample(
+    name: str, device: str | None, value: float, labels: dict[str, str] | None = None
+) -> dict[str, Any]:
+    return {
+        "name": name,
+        "device": device,
+        "value": value,
+        "labels": dict(labels or {}),
+    }
 
 
 def batch(minutes: float, *items: dict[str, Any]) -> dict[str, Any]:
@@ -220,8 +237,9 @@ def hang_activity(
     other: str | None = None,
     companion: bool = True,
     node_ids: list[str] | None = None,
+    labels: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Baseline, the hang (two batches), the recovery readings."""
+    """Baseline, the fault (two batches, ``labels`` on them), the recovery readings."""
 
     companion_sample = (
         [sample(shared.COMPANION_METRIC, None, 40.0)] if companion else []
@@ -232,10 +250,16 @@ def hang_activity(
             0, sample(shared.UNAVAILABLE, mount, 0.0), sample(shared.USED, mount, 2.0)
         ),
         batch(
-            2, sample(shared.UNAVAILABLE, mount, 1.0), *companion_sample, *other_samples
+            2,
+            sample(shared.UNAVAILABLE, mount, 1.0, labels),
+            *companion_sample,
+            *other_samples,
         ),
         batch(
-            3, sample(shared.UNAVAILABLE, mount, 1.0), *companion_sample, *other_samples
+            3,
+            sample(shared.UNAVAILABLE, mount, 1.0, labels),
+            *companion_sample,
+            *other_samples,
         ),
         batch(
             9, sample(shared.UNAVAILABLE, mount, 0.0), sample(shared.USED, mount, 2.0)
@@ -323,12 +347,12 @@ def test_every_005_variant_is_native_both_lanes_behind_kernel_module_load() -> N
     gaps = {
         name: spec for name, spec in SPECS.items() if spec.expected_outcome == "FAIL"
     }
-    assert set(gaps) == {"mount_disappears", "io_only_failure", "shared_failure_domain"}
-    for spec in gaps.values():
-        assert (
-            "system_metrics.py" in spec.product_gap
-            or "host_health.py" in spec.product_gap
-        )
+    assert set(gaps) == {"shared_failure_domain"}, (
+        "mount_disappears and io_only_failure are closed in the product"
+    )
+    assert "host_health.py" in gaps["shared_failure_domain"].product_gap
+    for name in ("mount_disappears", "io_only_failure"):
+        assert SPECS[name].product_gap == "", name
     assert SPECS["shared_failure_domain"].flags == "X", "both lane locks on EKS"
     assert all(
         spec.flags == "S"
@@ -555,41 +579,116 @@ def test_capacity_full_is_inconclusive_below_98(tmp_path: Path) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# the expected-FAIL gaps
+# mount_disappears and io_only_failure: closed in the product, labelled
 # --------------------------------------------------------------------------- #
-def test_mount_disappears_records_the_gap_and_passes_once_reported(
-    tmp_path: Path,
-) -> None:
+def export_source() -> str:
+    server = servers_by_suffix()["a"]
+    return f"{server.ready['ip']}:{server.ready['export']}"
+
+
+def labelled(mode: str) -> dict[str, str]:
+    return {"failure_mode": mode, "source": export_source(), "fstype": "nfs4"}
+
+
+def test_mount_disappears_passes_on_mount_missing_and_remounts(tmp_path: Path) -> None:
     spec = SPECS["mount_disappears"]
+    ctx = context("mount_disappears", tmp_path, activity=None)
+    mount = shared.mount_path(ctx, shared.PRIMARY)
+    ctx.regional.cpu_python_responder = store_script(
+        {
+            "activity": lambda _args: hang_activity(
+                mount, labels=labelled("MOUNT_MISSING")
+            )
+        }
+    )
+    result = spec.execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert spec.expected_outcome == "PASS" and spec.product_gap == ""
+    probe = ctx.probes[f"shared@{NODE}"]
+    names = [call[0] for call in probe.calls]
+    umount = next(call for call in probe.calls if call[0] == "nfs-umount")
+    assert "--forget" not in umount, (
+        "the injection must leave the mount point directory"
+    )
+    assert names.index("nfs-umount") < names.index("nfs-remount"), names
+    assert servers_by_suffix()["a"].paused is False, "the server was never paused"
+    # The mount undo (umount + rmdir, which makes the product forget) stays on
+    # the stack above the export delete.
+    assert ctx.cleanup.pending() == ["export-a", f"mount-shared@{NODE}"], (
+        ctx.cleanup.pending()
+    )
+
+
+def test_mount_disappears_fails_when_the_product_stays_quiet(tmp_path: Path) -> None:
     ctx = context("mount_disappears", tmp_path, activity=None)
     mount = shared.mount_path(ctx, shared.PRIMARY)
     ctx.regional.cpu_python_responder = store_script(
         {"activity": quiet_activity(mount)}
     )
-    result = spec.execute(ctx)
+    result = SPECS["mount_disappears"].execute(ctx)
     assert result["verdict"] == "FAIL", result
     assert any("never reported" in error for error in result["errors"]), result[
         "errors"
     ]
-    assert spec.expected_outcome == "FAIL" and "rediscovers" in spec.product_gap
-    probe = ctx.probes[f"shared@{NODE}"]
-    assert any(call[0] == "nfs-umount" for call in probe.calls), probe.calls
-    assert servers_by_suffix()["a"].paused is False, "the server was never paused"
-    ctx = context("mount_disappears", tmp_path / "fixed", activity=None)
-    ctx.regional.cpu_python_responder = store_script({"activity": hang_activity(mount)})
-    assert spec.execute(ctx)["verdict"] == "PASS", "a product that reports it passes"
 
 
-def test_io_only_failure_records_the_gap_and_restores_io(tmp_path: Path) -> None:
+def test_mount_disappears_fails_on_another_failure_mode_or_a_nameless_export(
+    tmp_path: Path,
+) -> None:
+    ctx = context("mount_disappears", tmp_path, activity=None)
+    mount = shared.mount_path(ctx, shared.PRIMARY)
+    ctx.regional.cpu_python_responder = store_script(
+        {
+            "activity": lambda _args: hang_activity(
+                mount, labels=labelled("PROBE_TIMEOUT")
+            )
+        }
+    )
+    result = SPECS["mount_disappears"].execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any("not ['MOUNT_MISSING']" in error for error in result["errors"]), result[
+        "errors"
+    ]
+    ctx = context("mount_disappears", tmp_path / "nameless", activity=None)
+    mount = shared.mount_path(ctx, shared.PRIMARY)
+    ctx.regional.cpu_python_responder = store_script(
+        {"activity": hang_activity(mount, labels={"failure_mode": "MOUNT_MISSING"})}
+    )
+    result = SPECS["mount_disappears"].execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any("source label" in error for error in result["errors"]), result["errors"]
+
+
+def test_mount_disappears_is_inconclusive_when_the_directory_went_too(
+    tmp_path: Path,
+) -> None:
+    probe = shared_probe(NODE)
+    probe.script["nfs-umount"] = {"host_mount": None, "directory_present": False}
+    ctx = context(
+        "mount_disappears", tmp_path, activity=None, probes={f"shared@{NODE}": probe}
+    )
+    mount = shared.mount_path(ctx, shared.PRIMARY)
+    ctx.regional.cpu_python_responder = store_script(
+        {
+            "activity": lambda _args: hang_activity(
+                mount, labels=labelled("MOUNT_MISSING")
+            )
+        }
+    )
+    with pytest.raises(VariantInconclusive, match="teardown"):
+        SPECS["mount_disappears"].execute(ctx)
+
+
+def test_io_only_failure_passes_on_io_error_and_restores_io(tmp_path: Path) -> None:
     spec = SPECS["io_only_failure"]
     ctx = context("io_only_failure", tmp_path, activity=None)
     mount = shared.mount_path(ctx, shared.PRIMARY)
     ctx.regional.cpu_python_responder = store_script(
-        {"activity": quiet_activity(mount)}
+        {"activity": lambda _args: hang_activity(mount, labels=labelled("IO_ERROR"))}
     )
     result = spec.execute(ctx)
-    assert result["verdict"] == "FAIL", result
-    assert any("statvfs only" in error for error in result["errors"]), result["errors"]
+    assert result["verdict"] == "PASS", result["errors"]
+    assert spec.expected_outcome == "PASS" and spec.product_gap == ""
     assert result["stages"]["io_restored"] == [], result["stages"]
     server = servers_by_suffix()["a"]
     assert server.calls == ["create", "wait_ready", "mode-000", "mode-1777"], (
@@ -597,6 +696,28 @@ def test_io_only_failure_records_the_gap_and_restores_io(tmp_path: Path) -> None
     )
     assert "export-a-mode" not in ctx.cleanup.pending(), ctx.cleanup.pending()
     assert result["io"]["errno"] == 13, result["io"]
+
+
+def test_io_only_failure_accepts_a_timed_out_read_but_not_a_quiet_product(
+    tmp_path: Path,
+) -> None:
+    ctx = context("io_only_failure", tmp_path, activity=None)
+    mount = shared.mount_path(ctx, shared.PRIMARY)
+    ctx.regional.cpu_python_responder = store_script(
+        {"activity": lambda _args: hang_activity(mount, labels=labelled("IO_TIMEOUT"))}
+    )
+    assert SPECS["io_only_failure"].execute(ctx)["verdict"] == "PASS"
+    ctx = context("io_only_failure", tmp_path / "quiet", activity=None)
+    mount = shared.mount_path(ctx, shared.PRIMARY)
+    ctx.regional.cpu_python_responder = store_script(
+        {"activity": quiet_activity(mount)}
+    )
+    result = SPECS["io_only_failure"].execute(ctx)
+    assert result["verdict"] == "FAIL", result
+    assert any("statvfs answered" in error for error in result["errors"]), result[
+        "errors"
+    ]
+    assert servers_by_suffix()["a"].mode == "1777", "mode restored after the verdict"
 
 
 def test_io_only_failure_is_inconclusive_when_io_still_works(tmp_path: Path) -> None:

@@ -204,10 +204,12 @@ FAIL）：两节点仍各自产出诊断链（FREEZE_EVIDENCE → VALIDATE_HOST�
 不关联（挂载点不是标识），夹具应对两节点挂载源一致作 `NOT_READY` 前置检查。
 
 本站实现（`general_live_shared.py`）。产品没有共享存储配置项：host collector 的
-`_shared_filesystems` 每个采样周期从自身 `/proc/self/mountinfo` 按文件系统类型
-（`nfs`/`nfs4`/`lustre`）发现共享挂载并做有界 `statvfs`（每挂载 5 s、每周期 15 s），超时或
-出错报 `shared_filesystem_unavailable`=1（CRITICAL RUN_DIAGNOSTICS），否则报 0 与
-`shared_filesystem_used_percent`（98% WARNING RUN_DIAGNOSTICS）。夹具因此**不**把测试 export
+`_shared_filesystems`（`collectors/host/shared_filesystems.py`）每个采样周期从宿主挂载表
+`/proc/1/mountinfo` 按文件系统类型（`nfs`/`nfs4`/`lustre`）发现共享挂载，做有界 `statvfs` 与一次
+有界只读目录项读取（每次调用 5 s、每周期 15 s），超时或出错报 `shared_filesystem_unavailable`=1
+（CRITICAL RUN_DIAGNOSTICS，`failure_mode` PROBE_TIMEOUT/PROBE_FAILED/IO_TIMEOUT/IO_ERROR），否则报 0 与
+`shared_filesystem_used_percent`（98% WARNING RUN_DIAGNOSTICS）；曾见过的节点级共享挂载消失而挂载点目录
+仍在报 MOUNT_MISSING（记忆跨 collector 重启）；每个共享样本带 `source`/`fstype`。夹具因此**不**把测试 export
 追加进 `GPU_FAULT_FILESYSTEMS`——那会按本地盘规则（`filesystem_used_percent` 98% →
 QUARANTINE、MOUNT_MISSING）判定，把共享存储状况变成坏节点结论并掩盖 005 要揭示的缺口。
 测试 export 由 `shared_export_fixture.py` 提供：每个 export 一个 Pod
@@ -224,11 +226,14 @@ deadman 与记录先于挂载，`systemd-run --on-active` deadman 级联 `umount
 FREEZE_EVIDENCE、VALIDATE_HOST 在该指标上失败、无隔离/硬件步骤；挂起期间其他主机指标仍到达
 （≥2 个 batch 带 `memory_used_percent`），另一挂载保持 0 且不建链；恢复后信号清零、新
 `used_percent` 采样与真实写/fsync/回读）和 `capacity_full`（`shared_filesystem_used_percent`
-≥ 98 → 诊断链，不得 QUARANTINE，释放后低于 98）预期 PASS；`mount_disappears`
-（`_shared_filesystems` 不记忆已发现的挂载，消失即停止采样，从不报不可用）、`io_only_failure`
-（服务端 `chmod 000` export 根：statvfs 正常而 open/read/fsync EACCES，产品只用 statvfs 探测）、
-`shared_failure_domain`（两节点各自成独立 NODE_HEALTH incident，无记录把同一 export 关联为
-共同故障域）按产品缺口注册 `expected_outcome=FAIL`，产品补齐后自动转 PASS。全部变体需
+≥ 98 → 诊断链，不得 QUARANTINE，释放后低于 98）预期 PASS；`mount_disappears`（`nfs-umount` 不带
+`--forget`，挂载点目录保留——目录也删掉会被产品读作退役而遗忘，记 INCONCLUSIVE：产品报
+`shared_filesystem_unavailable`=1 `failure_mode=MOUNT_MISSING` 且 `source` 指向测试 export，诊断链后
+`nfs-remount` 清零；清理时 `cleanup --kind nfs-shared` 删除目录使产品遗忘）与 `io_only_failure`
+（服务端 `chmod 000` export 根：statvfs 正常而 open/read/fsync EACCES，产品的目录项读取报
+`IO_ERROR`+errno 或 `IO_TIMEOUT`，`chmod 1777` 后清零）预期 PASS；`shared_failure_domain`（两节点各自成
+独立 NODE_HEALTH incident，无记录把同一 export 关联为共同故障域）仍按产品缺口注册
+`expected_outcome=FAIL`，产品补齐后自动转 PASS。全部变体需
 `--approve KERNEL_MODULE_LOAD`（缺 `nfsv4` 时加载并在清理时卸载）；`shared_failure_domain`
 标志 `X` 并要求 `--node-b`（EKS 的两个 GPU 节点同时作客户端，export 调度到两者之外）。
 站点前提：`--export-image` 或 `GPU_FAULT_GENERAL_LIVE_EXPORT_IMAGE` 指向带 `ganesha.nfsd` 与
