@@ -52,6 +52,20 @@ _SIGNAL_STATE_PAGE = """
     LIMIT %s
 """
 
+# One node's rows by exact prefix (``left(key, n) = prefix``, not a key range:
+# the database default collation is not byte order, see ``core.py``), already
+# filtered to the ones no claim wrote since the bound, so the ingest path
+# decodes only what it may age out (batch 160).
+_STALE_SIGNAL_STATES_WITH_PREFIX = """
+    SELECT key, payload::text
+    FROM gpu_fault_objects
+    WHERE kind = %s
+      AND left(key, %s) = %s
+      AND COALESCE(payload->>'clock_at', payload->>'observed_at') < %s
+    ORDER BY key
+    LIMIT %s
+"""
+
 _DELETE_UNCHANGED_SIGNAL_STATES = """
     WITH unlocked AS MATERIALIZED (
         SELECT batch.key, batch.payload
@@ -113,6 +127,25 @@ class PostgresSignalRetentionMixin:
             last_key=rows[-1][0] if rows else None,
             undecodable=undecodable,
         )
+
+    def _stale_signal_states_with_prefix(
+        self,
+        kind: str,
+        *,
+        prefix: str,
+        stale_before: datetime,
+        limit: int,
+    ) -> tuple[SignalRow, ...]:
+        with self._db.cursor() as cursor:
+            cursor.execute(
+                _STALE_SIGNAL_STATES_WITH_PREFIX,
+                (kind, len(prefix), prefix, _utc_text(stale_before), limit),
+            )
+            rows = cursor.fetchall()
+        stale, _undecodable = decoded_signal_rows(
+            kind, [(key, payload) for key, payload in rows], self._decode, stale_before
+        )
+        return stale
 
     def _delete_unchanged_signal_states(
         self, kind: str, victims: Sequence[SignalRow]

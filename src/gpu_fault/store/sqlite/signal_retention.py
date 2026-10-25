@@ -60,6 +60,34 @@ class SqliteSignalRetentionMixin:
             undecodable=undecodable,
         )
 
+    def _stale_signal_states_with_prefix(
+        self,
+        kind: str,
+        *,
+        prefix: str,
+        stale_before: datetime,
+        limit: int,
+    ) -> tuple[SignalRow, ...]:
+        # ``substr`` is an exact prefix test whatever the collation; the
+        # staleness is judged on the decoded row.
+        with self._lock:
+            rows = self._db.execute(
+                """
+                SELECT key, payload FROM objects
+                WHERE kind=? AND substr(key, 1, ?)=?
+                ORDER BY key
+                LIMIT ?
+                """,
+                (kind, len(prefix), prefix, limit),
+            ).fetchall()
+        stale, _undecodable = decoded_signal_rows(
+            kind,
+            rows,
+            lambda name, payload: self._models[name].model_validate_json(payload),
+            stale_before,
+        )
+        return stale
+
     def _delete_unchanged_signal_states(
         self, kind: str, victims: Sequence[SignalRow]
     ) -> list[str]:

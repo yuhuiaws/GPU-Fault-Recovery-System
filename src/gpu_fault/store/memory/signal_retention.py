@@ -48,6 +48,26 @@ class MemorySignalRetentionMixin:
             last_key=keys[-1] if keys else None,
         )
 
+    def _stale_signal_states_with_prefix(
+        self,
+        kind: str,
+        *,
+        prefix: str,
+        stale_before: datetime,
+        limit: int,
+    ) -> tuple[SignalRow, ...]:
+        with self._lock:
+            rows = self._signal_state_rows(kind)
+            page = [
+                (key, rows[key])
+                for key in sorted(key for key in rows if key.startswith(prefix))[:limit]
+            ]
+        return tuple(
+            SignalRow(key, state, state)
+            for key, state in page
+            if signal_state_clock(state) < stale_before
+        )
+
     def _delete_unchanged_signal_states(
         self, kind: str, victims: Sequence[SignalRow]
     ) -> list[str]:

@@ -242,11 +242,43 @@ class SharedSignalRetentionMixin:
 
     # Attributes supplied by the composed concrete implementation.
     _signal_state_page: Callable[..., SignalPage]
+    _stale_signal_states_with_prefix: Callable[..., tuple[SignalRow, ...]]
     _delete_unchanged_signal_states: Callable[[str, Sequence[SignalRow]], list[str]]
 
     #: Where the next call resumes, per kind. Process-local: the task lease
     #: moving or a restart starts the walk again at the beginning.
     _signal_retention_cursors: dict[str, str]
+
+    def stale_health_signal_states(
+        self, key_prefix: str, *, stale_before: datetime, limit: int = 1000
+    ) -> list[HealthSignalState]:
+        """The health-signal rows under ``key_prefix`` that no claim wrote since
+        ``stale_before`` (on the row's clock, :func:`signal_state_clock`), in
+        key order, active or not.
+
+        An exact prefix match, not a key range: the production database's
+        default collation is not byte order, so the keys of ``cluster/node-a/``
+        are not contiguous with each other there. ``cluster/node/`` names one
+        node's rows (batch 160: the control plane ages out device-scoped
+        signals whose device stopped reporting, ``host_device_signals.py``).
+        At most ``limit`` rows of the prefix are read.
+        """
+
+        if not key_prefix:
+            raise ValueError("health-signal key prefix must not be empty")
+        if limit < 1:
+            raise ValueError("health-signal stale read limit must be positive")
+        rows = self._stale_signal_states_with_prefix(
+            "health_signal_state",
+            prefix=key_prefix,
+            stale_before=_utc(stale_before),
+            limit=limit,
+        )
+        return [
+            row.state
+            for row in sorted(rows, key=lambda row: row.key)
+            if isinstance(row.state, HealthSignalState)
+        ]
 
     def cleanup_health_signal_states(
         self,

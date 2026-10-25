@@ -1072,6 +1072,15 @@ class TelemetryStore(Protocol):
 
     def get_health_signal_state(self, signal_key: str) -> HealthSignalState | None: ...
 
+    def stale_health_signal_states(
+        self, key_prefix: str, *, stale_before: datetime, limit: int = 1000
+    ) -> list[HealthSignalState]:
+        """The rows under an exact key prefix (``cluster/node/``: one node's
+        signals) that no claim wrote since ``stale_before`` on the row's
+        clock, in key order, active or not; at most ``limit`` rows of the
+        prefix are read (batch 160: device-scoped signal age-out)."""
+        ...
+
     def claim_health_signal_transitions(
         self,
         items: Sequence[tuple[str, bool, datetime, float]],

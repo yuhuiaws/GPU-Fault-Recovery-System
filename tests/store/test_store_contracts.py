@@ -75,6 +75,7 @@ MEMORY_SHARED_PUBLIC = frozenset(
         "remote_command_cluster_health",
         "run_wakeup_listener",
         "save_attempt_observations_batch",
+        "stale_health_signal_states",
         "try_enqueue_processor_requests_batch",
     }
 )
@@ -188,6 +189,7 @@ SQLITE_SHARED_PUBLIC = frozenset(
         "save_regional_registry_member",
         "save_workload_coverage_heartbeat",
         "save_xid_policy_decision",
+        "stale_health_signal_states",
         "try_enqueue_processor_requests_batch",
     }
 )
@@ -290,6 +292,7 @@ POSTGRES_SHARED_PUBLIC = frozenset(
         "save_regional_registry_member",
         "save_workload_coverage_heartbeat",
         "save_xid_policy_decision",
+        "stale_health_signal_states",
     }
 )
 
