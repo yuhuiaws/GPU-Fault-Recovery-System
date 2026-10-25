@@ -1283,6 +1283,18 @@ needs three things: a ramp wait timed from the oracle's crossing, as
 `low_available_memory` has; parallel readers over disjoint ranges; and a
 size computed from MemAvailable with headroom above the threshold.
 
+The same review of every diagnostic-only verdict found one more incident
+the matcher could not see: 025 `exporter_timeout`, `sustained_unknown` and
+`post_refresh_success` waited for a `dcgm_field_completeness` incident with
+a host-health event id (`-dcgm_field_completeness-`). The product books a
+failed scrape as one finding per error streak, `<first batch>-dcgm-fields`,
+and hands it to the node-health path as `gpu-<finding id>`, so its incident
+is `inc-gpu-dcgm-<node>-<us>-dcgm-fields`. The metric name is not in it.
+The matcher now knows that shape, and the 025 tests mint the event id
+through the product's own collection-error code. The other diagnostic-only
+waits (001 CPU and load, 002 memory, 004 unusable filesystem, 006 disk I/O,
+009 drops) match event ids the product does mint.
+
 The managed test jobs of 003, 011, 027, 028 and 029 are thin wrappers over
 the image prewarm and the managed workload fixture, and the variant tests
 replace both with fakes, so the live pass was the first to start one: 003

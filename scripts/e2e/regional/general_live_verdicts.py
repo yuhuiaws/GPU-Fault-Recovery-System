@@ -36,6 +36,15 @@ def safe_device(value: str | None) -> str:
     return re.sub(r"[^a-zA-Z0-9_.-]+", "-", value or "node")[:160]
 
 
+#: Findings whose event id does not name their metric, as (prefix, ending).
+#: The DCGM field-completeness finding reaches the node-health path as
+#: ``gpu-<finding id>`` (``app/ingest/gpu_findings.py``) and its finding id is
+#: the error streak's first batch plus ``-dcgm-fields``
+#: (``gpu_collection_errors.py``): ``inc-gpu-dcgm-<node>-<us>-dcgm-fields``,
+#: never ``-dcgm_field_completeness-``. It is node-level, with no rule.
+UNNAMED_FINDINGS = {"dcgm_field_completeness": ("gpu-", "-dcgm-fields")}
+
+
 def _moment(value: Any) -> datetime | None:
     try:
         moment = parse_time(value)
@@ -87,10 +96,14 @@ def finding_incidents(
     runner matched on the family and never saw the LOW_MEMORY_AVAILABLE
     incident the product opened and closed RECOVERED (live 2026-10-25).
     Incidents of any state count; ``minted_in_read`` keeps out the ones the
-    read did not select for itself.
+    read did not select for itself. A finding whose event id does not name
+    its metric is matched on its own shape (``UNNAMED_FINDINGS``).
     """
 
     suffix = f"-{metric}-{safe_device(device)}" if device is not None else f"-{metric}-"
+    unnamed = (
+        UNNAMED_FINDINGS.get(metric) if device is None and rule_id is None else None
+    )
     result = []
     for incident in activity.get("incidents") or []:
         if incident.get("event_type") != "NODE_HEALTH":
@@ -98,6 +111,11 @@ def finding_incidents(
         if not minted_in_read(activity, incident):
             continue
         event_id = str(incident.get("event_id") or "")
+        if unnamed is not None:
+            prefix, ending = unnamed
+            if event_id.startswith(prefix) and event_id.endswith(ending):
+                result.append(incident)
+            continue
         if rule_id is not None:
             if not event_id.endswith(f"-{rule_id.lower()}"):
                 continue
@@ -450,6 +468,7 @@ __all__ = [
     "ChainExpectation",
     "HOST_DIAGNOSTIC_FAILURE",
     "TERMINAL_WORKFLOWS",
+    "UNNAMED_FINDINGS",
     "breaching",
     "chain_errors",
     "detection_seconds",

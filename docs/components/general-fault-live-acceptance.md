@@ -389,6 +389,9 @@ ENV流程，其余字段不在环境代理allowlist内。覆盖45秒窗口内外
 持续错误默认180秒后应执行一次有界snapshot和观测验证，不转reset/reboot。
 必须逐GPU核对完整性，其他GPU有同名字段不能覆盖缺失GPU；现有全批字段检查若漏掉
 目标GPU应FAIL。触发前旧成功不可放行，必须有触发后新完整数据；恢复唯一真实producer。
+判定按产品的事件 id 认采集不完整 incident：`inc-gpu-<错误串首批 batch>-dcgm-fields`
+（GPU finding 以 `gpu-<finding id>` 进入节点健康链路），id 中不含指标名
+`dcgm_field_completeness`。
 
 ### GF-GENERAL-LIVE-026
 

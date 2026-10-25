@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from gpu_fault.app.ingest.gpu_findings import gpu_node_health_findings
+from gpu_fault.gpu_collection_errors import collection_error_finding
+from gpu_fault.gpu_metrics import GpuMetricBatch, GpuMetricSource, GpuMetricsThresholds
 from scripts.e2e.regional import general_live_collectors as col
 from scripts.e2e.regional.general_live_fixture import VariantNotRun
+from scripts.e2e.regional.general_live_verdicts import finding_incidents
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
@@ -76,16 +81,55 @@ def observation(channel: str, state: str) -> dict[str, Any]:
     }
 
 
+def completeness_event(batch: str = f"dcgm-{NODE}-1761363470000000") -> str:
+    """The event id the product gives a failed DCGM scrape's finding.
+
+    Minted by the product's own path -- ``collection_error_finding`` books
+    the streak, ``gpu_node_health_findings`` hands it to the node-health
+    ingest (its context is only read for a finding without an action).
+    """
+
+    errors = ["DCGM exporter scrape failed: timed out"]
+    batch_record = GpuMetricBatch(
+        batch_id=batch,
+        cluster_id="gpu-eks-cluster",
+        node_id=NODE,
+        observed_at=datetime(2026, 10, 25, 3, 0, tzinfo=timezone.utc),
+        source=GpuMetricSource.DCGM_EXPORTER,
+        samples=[],
+        collection_errors=errors,
+    )
+    booked = collection_error_finding(batch_record, None, GpuMetricsThresholds())
+    assert booked is not None, "a scrape with collection errors books a finding"
+    return gpu_node_health_findings(None, [booked[1]])[0].event_id
+
+
+def test_completeness_matcher_takes_the_incident_the_product_mints() -> None:
+    event = completeness_event()
+    product = {"event_id": event, "event_type": "NODE_HEALTH"}
+    host_shaped = {
+        "event_id": f"b-dcgm_field_completeness-{NODE}",
+        "event_type": "NODE_HEALTH",
+    }
+    document = {
+        "incidents": [
+            {**product, "incident_id": f"inc-{event}"},
+            {**host_shaped, "incident_id": "inc-host-shaped"},
+        ]
+    }
+    selected = finding_incidents(document, "dcgm_field_completeness")
+    assert [item["incident_id"] for item in selected] == [f"inc-{event}"], event
+
+
 def dcgm_error_doc(
     *, state: str = "UNKNOWN", with_workflow: bool = True
 ) -> dict[str, Any]:
-    inc = incident(
-        "inc-dcgm",
-        "dcgm_field_completeness",
-        device="node",
-        state="ACTION_PENDING",
-        workflow="wf-dcgm",
-    )
+    event = completeness_event()
+    inc = {
+        **incident("inc-dcgm", "dcgm_field_completeness", workflow="wf-dcgm"),
+        "event_id": event,
+        "incident_id": "inc-dcgm",
+    }
     workflows = []
     if with_workflow:
         workflows = [
