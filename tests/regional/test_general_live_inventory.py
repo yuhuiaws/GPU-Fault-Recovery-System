@@ -146,11 +146,20 @@ def test_unreadable_state_fails_on_a_reboot(tmp_path: Path) -> None:
 
 
 def test_013_and_014_cover_every_variant() -> None:
+    from scripts.e2e.regional import general_live_efa_driver as efa_driver
     from scripts.e2e.regional.general_live_registry import load_registry
 
     registry = load_registry()
-    # 014's native variants live in general_live_device_plugin.py, so coverage is
-    # checked against the whole registry; 013 is this module's own.
+    # 013 bind_failure / post_repair_failure are the reserved native EFA driver
+    # unbind (general_live_efa_driver) and 014's native variants live in
+    # general_live_device_plugin.py, so coverage is checked against the whole registry.
+    assert {
+        item.variant
+        for item in efa_driver.VARIANTS
+        if item.case_id == "GF-GENERAL-LIVE-013"
+    } == {"bind_failure", "post_repair_failure"}, (
+        "efa_driver owns exactly the two bind negatives"
+    )
     for case in ("GF-GENERAL-LIVE-013", "GF-GENERAL-LIVE-014"):
         expected = set(coverage_rows()[case])
         got = {key.split(".", 1)[1] for key in registry if key.startswith(case + ".")}
