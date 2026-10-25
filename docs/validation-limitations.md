@@ -1423,8 +1423,26 @@ whole-group stall are node-local (eight ranks each; the cross-node default
 group is present and its per-rank watermarks are still read); and a D-state
 wait cannot be forced natively, so `fr_plus_process` keeps the write-mode
 checkpoint I/O (`HOST_WRITES_OBSERVED`) as its independent process evidence.
-Variants that need a py-spy fault tool, a role-declaration job, a
-128-node/1024-process scale, or the HyperPod spare-health controller (disabled
+The role, thread, process and attempt-change
+variants of 011 (`general_live_nccl_roles`, registered on both lanes: the
+plain-EKS cluster's second EFA node is `--node-b`) are the same stall on the
+trainer's role modes (`general_live_nccl_role_trainer`): each rank declares
+PP/EP roles and container-native thread roles through its `rank-progress/v1`
+`diagnostic_context`, a keeper thread keeps the snapshot inside the product's
+30 s freshness window while the rank is held or blocked, helper threads exist
+from the start and switch behaviour with the stall, `cpu` adds an unranked GPU
+sharer process and `pyspy` a compiled non-Python CUDA context holder the Node
+Agent's own py-spy legitimately fails on (no tool is shadowed; an image without
+a C compiler makes the variant INCONCLUSIVE). The verdict grades the stored
+triage rows and the `hung_triage_decision` the product bound the bundle step
+with against the trainer's own `ROLES`/`SHARER`/`HOLDER` lines; a same-role
+`ROLE_COHORT_*` lead is legitimate, a cross-role one is the defect.
+`attempt_change` deletes the stalled attempt A once both nodes warned and
+under the hung threshold, resubmits the job as attempt B
+(`--attempt-id <job>-a002`) and reads each node's EFA traffic state row. The
+module tests check these graders against the product's own classification of
+synthetic triage rows, not against live evidence. Variants that need a
+128-node/1024-process scale or the HyperPod spare-health controller (disabled
 in this regional control plane, `GPU_FAULT_ENABLE_HYPERPOD_SPARE_FAILOVER=false`)
 stay `NOT_RUN` with an explicit reason in the denominator rather than being
 dropped. No GF-GENERAL-LIVE case has live evidence yet.

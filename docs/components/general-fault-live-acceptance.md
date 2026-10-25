@@ -876,7 +876,8 @@ inaccessible, env, pci_root)`/`open_command`/`open_tree`/`set_value`/`set_tree_v
 DAG、027 读 `SITE_TRAINING_HEALTH` incident/决策、030 读热备分级与注解），永不
 POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_spares`。
 
-- **011（仅 HyperPod 车道，需 `--node-b`）**：专用受管两节点 NCCL 测试任务
+- **011（HyperPod 车道，需 `--node-b`；角色/线程/进程/换 attempt 变体同时注册
+  plain-EKS 车道，以其第二台 EFA 节点作 `--node-b`）**：专用受管两节点 NCCL 测试任务
   （`scripts/e2e/regional/general_live_nccl_job.py`，由
   `two-node-replace-pytorchjob.yaml` 的 Pod 模板渲染，
   保留镜像、`FI_PROVIDER=efa`、`FI_EFA_USE_DEVICE_RDMA`、`FI_EFA_FORK_SAFE`、GPU duty
@@ -946,11 +947,35 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
   样本、无 ZERO_WARNING/HUNG（无效观察不开始零流量计数，也不是零）；关窗恢复后仍停滞的任务须
   在恢复后不早于 60 s 出 ZERO_WARNING（计数只从真实读数开始），释放后流量恢复、warning
   incident 收敛。
+  角色/线程/进程与换 attempt 变体（`general_live_nccl_roles`）在同一训练程序的角色
+  模式上做同样的停滞（`general_live_nccl_role_trainer`）：每 rank 经 `rank-progress/v1`
+  的 `diagnostic_context` 声明 PP/EP 角色与容器内 native tid 的线程角色，keeper 线程
+  每 10 秒重写快照使其保持在产品 30 秒新鲜窗口内（被阻塞的 rank 0 也是），辅助线程
+  从启动即存在、随停滞切换行为，子进程受 watchdog、stop 文件与父进程退出约束。判定
+  读 triage 各 rank 行（summary codec 信封解码）与产品绑定到 bundle 步骤的
+  `hung_triage_decision`（cohort、process_observations），oracle 为训练程序自己打印的
+  `ROLES`/`SHARER`/`HOLDER` 行；缺声明、子进程未起、持有程序编译失败记
+  `INCONCLUSIVE`，被采样节点缺 rank 记 FAIL。`role_mismatch`：每节点 local 0-3 声明
+  pp0/expert 并在停滞中烧 CPU，4-6 声明 pp1/dense 保持安静，7 不声明；cohort 只含同一
+  声明角色、未声明 rank 不入 cohort、`ROLE_COHORT_*` 线索不得跨角色（同角色线索合法）。
+  `tid_namespace`：容器 native tid 经 NSpid 对应唯一宿主机 tid，训练线程即宿主机 pid，
+  `host_thread_roles`、各次 py-spy 样本的角色与稳定线程的 start ticks 一致；奇数 rank
+  反序启动辅助线程，停滞中不断起止未声明线程。`wchan_zero`：声明的 COMMUNICATION
+  线程自旋、BACKGROUND 线程睡在 futex；wchan 0 不是等待位置，只有睡眠线程有
+  `REPEATED_THREAD_WAIT`，`cpu_cores` = tick 增量 / `SC_CLK_TCK` / 实测秒数。
+  `cpu_interval`：50 % duty 的 CPU 线程；local 6/7 另起无 RANK 的 CUDA 子进程共享其
+  GPU，窗口 elapsed 须与采样时间戳一致、决策 CPU 为窗口加权均值，共享 GPU 读 shared、
+  `DEVICE_NOT_PID` 且不入 cohort。`pyspy_nonzero`：local 7 在训练容器内用镜像自带的
+  gcc 编译并运行非 Python 的 CUDA 上下文持有程序，Node Agent 自己的 py-spy 对其合法
+  失败（"Failed to find python version"，exit 1）；三次栈样本 FAILED、无签名、/proc
+  窗口保留，Python rank 的栈解析为线程 JSON；不影子化任何工具，镜像无编译器则
+  INCONCLUSIVE。`attempt_change`：attempt A 停滞至两节点出 `ZERO_WARNING`，在 hung
+  阈值之下（最晚 540 秒）删除，同一任务以 `--attempt-id <job>-a002` 回到 attempt B
+  并转为活跃；A 不得出 `HUNG_SUSPECTED`，B 不得出任何 warning/hung，各节点 EFA 流量
+  状态行须记 B、首次观测在切换之后、`had_active_traffic` 为真、无零流量 streak。
   延后留分母：规模类 `large_job`/`no_step_no_rank`/
-  `active_window_resume`（`SCALE`，本站无 128 节点任务）、需 py-spy 故障
-  工具的 `pyspy_nonzero`、需角色声明测试任务的 `role_mismatch`/`tid_namespace`/
-  `wchan_zero`/`cpu_interval`（均 `FIXTURE_NOT_READY`）、`attempt_change`（需可控换
-  attempt）、`unreachable_node`（隔离 Agent 通道未授批，`NOT_AUTHORIZED`）。
+  `active_window_resume`（`SCALE`，本站无 128 节点任务）、`unreachable_node`（隔离 Agent
+  通道未授批，`NOT_AUTHORIZED`）。
 - **027（eks 或 hp 车道）**：产品训练进度 reporter 默认关闭、全局周期 monitor 必须
   保持关闭；仅测试任务 Pod 内以 `gpu-fault-collector training-progress` sidecar 启用
   reporter，读测试应用原子写的进度文件（启用 reporter 的源路径）。训练镜像不含产品，
@@ -980,7 +1005,9 @@ POST 预制 finding。类别模块 `general_live_nccl`/`_nccl_fr`/`_progress`/`_
 
 计划/执行形如 `--case GF-GENERAL-LIVE-011 --variant active_to_zero --site-file <F>
 --node-b <N2> --hyperpod-cluster <HP>`（011/030 在 hp 车道，011/030 需 `--site-file`，
-011 需 `--node-b`，030 的热备节点用 `--fault-node`）。
+011 需 `--node-b`，030 的热备节点用 `--fault-node`）；011 的角色/线程/进程/换 attempt
+变体在 eks 车道形如 `--case GF-GENERAL-LIVE-011 --variant role_mismatch --site-file <F>
+--node-b <第二台 EFA 节点>`。
 
 ### phase 2 范围与前提（内核/应用日志、未知错误、EFA 库存）
 
