@@ -278,6 +278,76 @@ def samples(
     return sorted(result, key=lambda item: str(item["observed_at"]))
 
 
+def latest_samples(
+    activity: dict[str, Any],
+    metric: str,
+    *,
+    device: str | None = None,
+) -> list[dict[str, Any]]:
+    """The product's latest record of ``metric`` when it moved inside the read.
+
+    ``host_health.evaluate_metrics`` upserts the latest-wins record of every
+    ``LATEST_METRICS_REQUIRED`` sample from *every* accepted host batch
+    (``store.observe_telemetry_metrics``) -- also from a steady-state batch
+    whose only delivery reason is ``health-summary``, which
+    ``app/ingest/telemetry.py`` by design never writes as raw evidence (no
+    finding, no collection error). In a quiet window that record's moving
+    ``observed_at`` is the product's only per-sample witness that a reading
+    was accepted and graded; its value alone proves nothing (the record always
+    exists), so only a record observed at or after the read's own ``since``
+    counts, and a document that names no ``since`` yields none. Live
+    2026-10-25 002 cgroup_only on both lanes: two summaries landed in the
+    window (the host collector status moved to 16:31:25), no evidence did.
+    """
+
+    since = _moment(activity.get("since"))
+    if since is None:
+        return []
+    result = []
+    for item in activity.get("metric_latest") or []:
+        if item.get("name") != metric:
+            continue
+        if device is not None and item.get("device") != device:
+            continue
+        observed = _moment(item.get("observed_at"))
+        if observed is None or observed < since:
+            continue
+        result.append({**item, "source": "metric_latest"})
+    return sorted(result, key=lambda item: str(item["observed_at"]))
+
+
+def collector_delivery(
+    activity: dict[str, Any],
+    collector: str,
+    *,
+    batch_prefix: str | None = None,
+) -> dict[str, Any] | None:
+    """``collector``'s status when its last successful batch fell inside the read.
+
+    ``_record_collector_status`` upserts the row for every accepted batch,
+    evidence or not, so it is the complete delivery record of a channel.
+    ``batch_prefix`` tells apart the producers that share one channel: the
+    node's host collector posts ``host-`` batches, the control plane's
+    allocatable reader ``k8s-efa-`` batches on HOST_TELEMETRY for the same node
+    (``collectors/cloud/kubernetes.py``).
+    """
+
+    since = _moment(activity.get("since"))
+    if since is None:
+        return None
+    for item in activity.get("collector_statuses") or []:
+        if item.get("collector") != collector:
+            continue
+        batch_id = str(item.get("batch_id") or "")
+        if batch_prefix and not batch_id.startswith(batch_prefix):
+            continue
+        success = _moment(item.get("last_success_at"))
+        if success is None or success < since:
+            continue
+        return dict(item)
+    return None
+
+
 def breaching(
     sample: dict[str, Any], threshold: float, comparison: str = "gte"
 ) -> bool:
@@ -566,6 +636,7 @@ __all__ = [
     "breaching",
     "chain_errors",
     "chain_judgeable",
+    "collector_delivery",
     "detection_seconds",
     "executions",
     "final_execution",
@@ -573,6 +644,7 @@ __all__ = [
     "hardware_errors",
     "isolation_operations",
     "judged_chain",
+    "latest_samples",
     "minted_in_read",
     "node_isolated",
     "notification_errors",

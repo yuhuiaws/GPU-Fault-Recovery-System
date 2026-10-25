@@ -2,29 +2,40 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 import pytest
 
+from gpu_fault.app import ApplicationContext
+from gpu_fault.channel_registry import HOST_TELEMETRY_PATH
 from gpu_fault.host_diagnostics import diagnostic_probe
-from gpu_fault.host_health import HostMetricSample, NodeHealthPolicy
-from gpu_fault.models import RecoveryAction, Severity
+from gpu_fault.host_health import HostMetricSample, HostTelemetryBatch, NodeHealthPolicy
+from gpu_fault.models import RecoveryAction, Severity, WorkloadState
+from gpu_fault.store import InMemoryStore
 from scripts.e2e.regional import general_live_memory as mem
 from scripts.e2e.regional.general_live_fixture import (
     VariantBlocked,
     VariantInconclusive,
     VariantNotRun,
 )
+from scripts.e2e.regional.general_live_verdicts import (
+    collector_delivery,
+    latest_samples,
+    samples,
+)
 from scripts.e2e.regional.probes import general_live_source_probe as probe
-from tests._builders import build_store, host_telemetry_batch
+from tests._builders import asgi_client, build_store, host_telemetry_batch
 from tests.collectors import _cov95_runtime_collect as cov_support
 from tests.collectors import _cov95_runtime_collect_host as cov_host
+from tests.host_health._support import RecordingNotifier
 from tests.regional._general_live_fakes import (
     FakeProbe,
     FakeRegional,
+    activity_read,
     host_batch,
     incident,
     make_context,
@@ -401,6 +412,202 @@ def test_cgroup_only_is_inconclusive_without_a_fresh_host_sample(
     ctx = cgroup_context(tmp_path, quiet_activity(batches=0))
     with pytest.raises(VariantInconclusive, match="silent channel"):
         SPECS["cgroup_only"].execute(ctx)
+
+
+# The quiet window as the product records it (live 2026-10-25, both lanes): a
+# steady-state batch whose only delivery reason is ``health-summary`` is never
+# written as raw evidence (``app/ingest/telemetry.py``); only the latest-wins
+# metric record and the collector status move.
+SINCE = "2026-10-24T00:00:00+00:00"
+IN_WINDOW = "2026-10-24T00:09:00+00:00"
+
+
+def latest_record(
+    metric: str, value: float, observed_at: str = IN_WINDOW
+) -> dict[str, Any]:
+    return {
+        "name": metric,
+        "device": None,
+        "value": value,
+        "observed_at": observed_at,
+        "labels": {},
+    }
+
+
+def host_status(
+    observed_at: str = IN_WINDOW, *, batch_prefix: str = "host-"
+) -> dict[str, Any]:
+    return {
+        "cluster_id": "gpu-eks-cluster",
+        "node_id": NODE,
+        "collector": "HOST_TELEMETRY",
+        "observed_at": observed_at,
+        "ingested_at": observed_at,
+        "last_success_at": observed_at,
+        "last_error_at": None,
+        "batch_id": f"{batch_prefix}{NODE}-1792945285206080",
+        "sample_count": 101,
+        "errors": [],
+    }
+
+
+def summary_only_activity(used: float = 2.6, **overrides: Any) -> dict[str, Any]:
+    document = quiet_activity(batches=0)
+    document.update(
+        {
+            "since": SINCE,
+            "metric_latest": [
+                latest_record("memory_used_percent", used),
+                latest_record("memory_available_percent", 100 - used),
+            ],
+            "collector_statuses": [host_status()],
+        }
+    )
+    document.update(overrides)
+    return document
+
+
+def test_cgroup_only_takes_the_latest_memory_record_as_the_summary_witness(
+    tmp_path: Path,
+) -> None:
+    ctx = cgroup_context(tmp_path, summary_only_activity())
+    result = SPECS["cgroup_only"].execute(ctx)
+    assert result["verdict"] == "PASS", result["errors"]
+    assert [item["source"] for item in result["host_samples"]] == ["metric_latest"]
+    assert result["host_samples"][0]["observed_at"] == IN_WINDOW
+    assert result["host_delivery"]["batch_id"].startswith("host-"), (
+        "the node's host collector, not the control plane's allocatable reader"
+    )
+    window = json.loads((ctx.case_dir / "cgroup-window.json").read_text())
+    assert window["since"] == SINCE and window["batches"] == []
+    assert [item["name"] for item in window["metric_latest"]] == [
+        "memory_used_percent",
+        "memory_available_percent",
+    ]
+    assert window["host_collector"][0]["last_success_at"] == IN_WINDOW
+
+
+def test_cgroup_only_stays_inconclusive_when_the_latest_record_did_not_move(
+    tmp_path: Path,
+) -> None:
+    stale = summary_only_activity(
+        metric_latest=[
+            latest_record("memory_used_percent", 2.6, "2026-10-23T23:59:00+00:00")
+        ],
+        collector_statuses=[host_status("2026-10-23T23:59:00+00:00")],
+    )
+    with pytest.raises(VariantInconclusive) as caught:
+        SPECS["cgroup_only"].execute(cgroup_context(tmp_path, stale))
+    message = str(caught.value)
+    assert "silent channel" in message
+    assert f"since {SINCE}" in message and "no evidence batch" in message
+    assert "latest memory_used_percent observed 2026-10-23T23:59:00+00:00" in message
+    assert "host collector last success none" in message
+    # The control plane's allocatable reader posts on the same channel: its
+    # fresh status is not the node's host collector delivering.
+    other = summary_only_activity(
+        metric_latest=[], collector_statuses=[host_status(batch_prefix="k8s-efa-")]
+    )
+    with pytest.raises(VariantInconclusive, match="host collector last success none"):
+        SPECS["cgroup_only"].execute(cgroup_context(tmp_path, other))
+    # A document that does not name its own since cannot date the record.
+    undated = summary_only_activity()
+    undated.pop("since")
+    with pytest.raises(VariantInconclusive, match="silent channel"):
+        SPECS["cgroup_only"].execute(cgroup_context(tmp_path, undated))
+
+
+def test_cgroup_only_fails_when_the_latest_record_itself_breached(
+    tmp_path: Path,
+) -> None:
+    result = SPECS["cgroup_only"].execute(
+        cgroup_context(tmp_path, summary_only_activity(used=96.0))
+    )
+    assert result["verdict"] == "FAIL"
+    assert any(
+        f"accepted memory_used_percent 96.0 at {IN_WINDOW}" in e
+        for e in result["errors"]
+    ), result["errors"]
+
+
+def test_a_pure_health_summary_is_no_evidence_but_moves_the_latest_record(
+    tmp_path: Path,
+) -> None:
+    """Pins the summary witness on the real ingest and the real activity probe."""
+
+    store = InMemoryStore()
+    context = ApplicationContext(store=store, notification_notifier=RecordingNotifier())
+    since = datetime(2026, 10, 25, 16, 22, 35, tzinfo=timezone.utc)
+
+    def post(batch: HostTelemetryBatch) -> int:
+        async def send() -> int:
+            async with asgi_client(context) as client:
+                response = await client.post(
+                    HOST_TELEMETRY_PATH, json=batch.model_dump(mode="json")
+                )
+                return response.status_code
+
+        return asyncio.run(send())
+
+    def batch(seconds: int, reasons: list[str]) -> HostTelemetryBatch:
+        observed = since + timedelta(seconds=seconds)
+        return host_telemetry_batch(
+            f"host-{NODE}-{int(observed.timestamp() * 1_000_000)}",
+            observed,
+            [
+                HostMetricSample(name="memory_used_percent", value=2.6, unit="percent"),
+                HostMetricSample(
+                    name="memory_available_percent", value=97.4, unit="percent"
+                ),
+            ],
+            cluster_id="gpu-eks-cluster",
+            node_id=NODE,
+            runtime_profile_version="simulated-v1",
+            workload_state=WorkloadState.IDLE,
+            edge_filter_reasons=reasons,
+        )
+
+    arguments = [
+        "gpu-eks-cluster",
+        NODE,
+        since.isoformat(),
+        "memory_available_percent,memory_used_percent",
+        "",
+        "HOST_TELEMETRY,NODE_LOGS",
+    ]
+    # The baseline before the window is evidence, but stale for this read.
+    assert post(batch(-70, ["baseline"])) < 300
+    assert post(batch(230, ["health-summary"])) < 300
+    assert post(batch(530, ["health-summary"])) < 300
+    document = activity_read(store, arguments)
+    assert document["batches"] == [], (
+        "a batch delivered for health-summary alone is not raw evidence"
+    )
+    (latest,) = latest_samples(document, "memory_used_percent")
+    assert latest["observed_at"] == (since + timedelta(seconds=530)).isoformat()
+    assert latest["value"] == 2.6
+    delivery = collector_delivery(document, "HOST_TELEMETRY", batch_prefix="host-")
+    assert delivery is not None and delivery["sample_count"] == 2
+    # The status row renders its own datetime form (``...25.000000Z``).
+    assert datetime.fromisoformat(
+        delivery["last_success_at"].replace("Z", "+00:00")
+    ) == since + timedelta(seconds=530)
+    result = SPECS["cgroup_only"].execute(cgroup_context(tmp_path, document))
+    assert result["verdict"] == "PASS", result["errors"]
+    assert [item["source"] for item in result["host_samples"]] == ["metric_latest"]
+    # An edge inside the window is evidence, and the evidence sample is taken first.
+    assert post(batch(600, ["recovered"])) < 300
+    document = activity_read(store, arguments)
+    assert [item["edge_filter_reasons"] for item in document["batches"]] == [
+        ["recovered"]
+    ]
+    assert len(samples(document, "memory_used_percent")) == 1
+    result = SPECS["cgroup_only"].execute(cgroup_context(tmp_path, document))
+    assert result["verdict"] == "PASS", result["errors"]
+    assert [item["source"] for item in result["host_samples"]] == [
+        "evidence",
+        "metric_latest",
+    ]
 
 
 def test_cgroup_only_fails_when_the_product_minted_a_memory_finding(

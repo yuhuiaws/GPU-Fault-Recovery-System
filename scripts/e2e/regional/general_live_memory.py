@@ -24,7 +24,17 @@ it -- systemd keeps the failed unit and ``memory-status`` reads its
 Repeated across a window longer than the rule's sustain plus a health summary,
 the product must mint no memory finding; an OOM line the (disabled by default)
 node log collector grades is a RUN_DIAGNOSTICS diagnostic at most, never a
-STOP, isolation or hardware step (``log_rules.py``).
+STOP, isolation or hardware step (``log_rules.py``). The proof that the host
+channel was alive while nothing was minted is the product's own record of an
+accepted ``memory_used_percent`` reading inside the window: an evidence batch
+sample where there is one, otherwise the latest-wins metric record the product
+upserts from every accepted host batch -- a quiet window delivers nothing but
+health summaries, and a batch delivered for ``health-summary`` alone is by
+design never written as raw evidence (``app/ingest/telemetry.py``: no finding,
+no collection error). Live 2026-10-25, EKS attempt 5 and HyperPod attempt 4:
+two summaries landed inside the window (the HyperPod node's host collector
+status moved from 16:21:25 to 16:31:25, 101 samples) and the evidence-only read
+saw none, so the variant was INCONCLUSIVE on both lanes.
 
 The spec's swap and read-failure variants are raw ``/proc/meminfo`` replays on
 the shared host source replay (``general_live_source_replay.py``; the spec
@@ -81,9 +91,11 @@ from scripts.e2e.regional.general_live_verdicts import (
     DIAGNOSTIC_ONLY_STATES,
     ChainExpectation,
     chain_errors,
+    collector_delivery,
     finding_incidents,
     hardware_errors,
     isolation_operations,
+    latest_samples,
     minted_in_read,
     node_isolated,
     operations,
@@ -430,6 +442,72 @@ def _log_grading_errors(observed: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _accepted_memory_samples(observed: dict[str, Any]) -> list[dict[str, Any]]:
+    """The product's accepted ``memory_used_percent`` readings inside the read.
+
+    Evidence batch samples first, then the latest-wins record when it moved
+    inside the window: a quiet window delivers health summaries only, which the
+    product by design does not write as evidence (``latest_samples``).
+    """
+
+    evidence = [
+        {**item, "source": "evidence"}
+        for item in samples(observed, "memory_used_percent")
+        if isinstance(item.get("value"), (int, float))
+    ]
+    latest = [
+        item
+        for item in latest_samples(observed, "memory_used_percent")
+        if isinstance(item.get("value"), (int, float))
+    ]
+    return evidence + latest
+
+
+def _window_view(
+    observed: dict[str, Any], delivery: dict[str, Any] | None
+) -> dict[str, Any]:
+    """What the product recorded for the window, kept for reading a verdict later."""
+
+    return {
+        "since": observed.get("since"),
+        "batches": [
+            {
+                key: batch.get(key)
+                for key in (
+                    "observed_at",
+                    "batch_id",
+                    "edge_filter_reasons",
+                    "collection_errors",
+                    "sample_count",
+                    "samples",
+                )
+            }
+            for batch in observed.get("batches") or []
+        ],
+        "metric_latest": list(observed.get("metric_latest") or []),
+        "host_collector": [
+            item
+            for item in observed.get("collector_statuses") or []
+            if item.get("collector") == "HOST_TELEMETRY"
+        ],
+        "host_delivery": delivery,
+        "incidents": [
+            {
+                key: item.get(key)
+                for key in (
+                    "incident_id",
+                    "event_id",
+                    "event_type",
+                    "state",
+                    "effective_action",
+                    "created_at",
+                )
+            }
+            for item in observed.get("incidents") or []
+        ],
+    }
+
+
 def cgroup_only(ctx: VariantContext) -> dict[str, Any]:
     """A cgroup-local OOM is not host pressure: no memory finding, no isolation."""
 
@@ -466,14 +544,21 @@ def cgroup_only(ctx: VariantContext) -> dict[str, Any]:
         metrics={"memory_used_percent", "memory_available_percent"},
         kinds=("HOST_TELEMETRY", "NODE_LOGS"),
     )
-    host_samples = [
-        item
-        for item in samples(observed, "memory_used_percent")
-        if isinstance(item.get("value"), (int, float))
-    ]
+    host_samples = _accepted_memory_samples(observed)
+    delivery = collector_delivery(observed, "HOST_TELEMETRY", batch_prefix="host-")
+    ctx.evidence.write("cgroup-window", _window_view(observed, delivery))
     if not host_samples:
+        latest = [
+            item.get("observed_at")
+            for item in observed.get("metric_latest") or []
+            if item.get("name") == "memory_used_percent"
+        ]
         raise VariantInconclusive(
-            "no accepted host memory sample reached the product during the window; "
+            "no accepted host memory sample reached the product during the window "
+            f"(since {observed.get('since')}: no evidence batch, latest "
+            f"memory_used_percent observed {latest[-1] if latest else 'never'}, "
+            f"host collector last success "
+            f"{(delivery or {}).get('last_success_at') or 'none'}); "
             "a silent channel cannot prove how the OOM was graded"
         )
     isolation = isolation_operations(observed)
@@ -522,6 +607,7 @@ def cgroup_only(ctx: VariantContext) -> dict[str, Any]:
                 "ticks": len(host_used),
             },
             "host_samples": host_samples[-3:],
+            "host_delivery": delivery,
         },
     )
 
@@ -884,7 +970,9 @@ VARIANTS = [
         expected=(
             "no memory_used_percent / memory_available_percent finding; an OOM log "
             "line is RUN_DIAGNOSTICS at most; no STOP, isolation or hardware step; "
-            "the node stays schedulable"
+            "the node stays schedulable; the product's own record of an accepted "
+            "memory_used_percent reading inside the window (an evidence sample or "
+            "the latest record a health summary moved) stays below 95 %"
         ),
         cleanup=(
             "reset the OOM-killed test unit after each cycle, disarm its deadman, "
